@@ -165,6 +165,11 @@ import {
   type PlatformPromptSlotsHandler,
 } from "./http/internalPlatformPromptSlots.js";
 import {
+  MINIMAX_MEDIA_PATH,
+  makeMiniMaxMediaHandler,
+  type MiniMaxMediaHandler,
+} from "./minimax/mediaProxy.js";
+import {
   makeInboundDispatcher,
   type PrepareWechatCodexTurnResult,
 } from "./wechat/inboundDispatcher.js";
@@ -972,6 +977,10 @@ export async function registerCommercial(
         // 2026-05-02 deepseek 接入:cfg 在外层闭包已 loadConfig() 过(line 379),
         // 这里直接读取。未配置 → undefined → proxy 命中 deepseek 模型时 503。
         deepseekApiKey: cfg.DEEPSEEK_API_KEY,
+        // 2026-06-02 MiniMax-M3 Token Plan 接入:同 DeepSeek 是静态 API-key
+        // upstream,但 key 只留在 master,不进用户容器。未配置 → 命中
+        // MiniMax-M3 时 503 MINIMAX_NOT_CONFIGURED。
+        minimaxTokenPlanKey: cfg.MINIMAX_TOKEN_PLAN_KEY,
         // v1.0.207 起 Phase 6 account_uuid 锚定(plan §3.0)+ csap session pin 三态
         // (0072+0073+0074),从 env-only 迁到 `system_settings` 表(admin UI 立即可改,
         // 不需要 systemctl restart)。注入 30s TTL cache 的 getter
@@ -1132,6 +1141,14 @@ export async function registerCommercial(
           identityRepo,
           pricingCache: pricing,
         });
+      // /internal/v3/minimax — 容器内 safe mmx wrapper → master 代持 MiniMax
+      // Token Plan key 调用多模态 API 并记账。Token Plan key 只在 master env,
+      // 不注入容器；鉴权同 anthropicProxy / platform slots 双因子。
+      const minimaxMediaHandler: MiniMaxMediaHandler = makeMiniMaxMediaHandler({
+        identityRepo,
+        pgPool: getPool(),
+        tokenPlanKey: cfg.MINIMAX_TOKEN_PLAN_KEY,
+      });
       const codexRelayHandler: CodexRelayHandler = makeCodexRelayHandler({
         identityRepo,
         db: makeDefaultCodexRelayDb(),
@@ -1146,6 +1163,9 @@ export async function registerCommercial(
         }
         if (path === PLATFORM_PROMPT_SLOTS_PATH) {
           return platformPromptSlotsHandler(req, res, ctx);
+        }
+        if (path === MINIMAX_MEDIA_PATH) {
+          return minimaxMediaHandler(req, res, ctx);
         }
         if (path === CODEX_TOKEN_REFRESH_PATH) {
           return codexTokenRefreshHandler(req, res, ctx);

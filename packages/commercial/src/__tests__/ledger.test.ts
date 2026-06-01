@@ -39,11 +39,12 @@ describe("LEDGER_REASONS (schema sync check)", () => {
       "refund",
       "admin_adjust",
       "promotion",
+      "minimax_media",
     ]) {
       assert.ok(LEDGER_REASONS.includes(r as (typeof LEDGER_REASONS)[number]));
     }
-    // 不允许悄悄加东西而忘了同步 0002_init_billing.sql
-    assert.equal(LEDGER_REASONS.length, 7);
+    // 不允许悄悄加东西而忘了同步 0002_init_billing.sql + 后续约束迁移。
+    assert.equal(LEDGER_REASONS.length, 8);
   });
 });
 

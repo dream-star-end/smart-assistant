@@ -74,6 +74,8 @@ describe('SubprocessRunner.model getter / setModel', () => {
     // isDeepseekModel 命中后切 DEEPSEEK_UPSTREAM_ENDPOINT):
     assert.ok(ALLOWED_INBOUND_MODELS.has('deepseek-v4-flash'))
     assert.ok(ALLOWED_INBOUND_MODELS.has('deepseek-v4-pro'))
+    // MiniMax-M3 Token Plan anthropic-compatible 上游:
+    assert.ok(ALLOWED_INBOUND_MODELS.has('MiniMax-M3'))
   })
 
   it('ALLOWED_INBOUND_MODELS rejects bogus / typo model ids', () => {
@@ -85,6 +87,7 @@ describe('SubprocessRunner.model getter / setModel', () => {
       'claude-opus-4-7-bogus',       // 后缀污染
       'claude-haiku-4-5',            // 协议本支持 Haiku 但 v1.0.4 产品没暴露
       'gpt-5',
+      'minimax-m3',                  // 大小写敏感；产品暴露 canonical MiniMax-M3
       'CLAUDE-OPUS-4-7',             // 大小写敏感 — Anthropic API 也是
       ' claude-opus-4-7',            // 前导空格
     ]) {

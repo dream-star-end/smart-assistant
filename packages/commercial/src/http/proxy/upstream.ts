@@ -6,10 +6,10 @@
  * 把 handler 主流程里"upstream 选择 + dispatcher + refresh + 头注入 + body sanitize +
  * device_id pin + token 零化"等散落跨度收敛进:
  *
- *   - `selectUpstreamRoute(model)`     —— preCheck 前的纯路由判定(deepseek vs oauth)
- *   - `validateUpstreamConfig(...)`    —— preCheck 前的轻校验(deepseek api key 缺失)
+ *   - `selectUpstreamRoute(model)`     —— preCheck 前的纯路由判定(deepseek/minimax/oauth)
+ *   - `validateUpstreamConfig(...)`    —— preCheck 前的轻校验(静态 API key 缺失)
  *   - `pickUpstream(deps, body, route, log)` —— preCheck **后**的真正 session 形成
- *   - `PreparedUpstreamSession`        —— 完整 session 接口,两实现:OAuth pool / DeepSeek
+ *   - `PreparedUpstreamSession`        —— 完整 session 接口:OAuth pool / DeepSeek / MiniMax
  *   - `releaseUpstreamSession(...)`    —— **仅** finalizer 创建前的 case (c) 补偿
  *
  * Release ownership(plan §5.4 4 段铁律):
@@ -23,7 +23,7 @@
  *   - refresh 成功时,**老** pick.token / pick.refresh 立即 fill(0)
  *   - 任何 (b) 失败路径,upstream 层在 release 后 fill(0)
  *   - handler finally 调 session.zeroizeSecrets() 处理 **新** pick(refresh 后的)的 token / refresh
- *   - DeepSeek session zeroizeSecrets 是 noop(apiKey 来自配置注入,不归 session)
+ *   - DeepSeek / MiniMax session zeroizeSecrets 是 noop(apiKey 来自配置注入,不归 session)
  *   - zeroizeSecrets 幂等(内部 zeroized flag)
  *
  * Phase 3 不引 ProxyCore;`releaseUpstreamSession` 是自由函数,Phase 4 会 wrap 进
@@ -55,7 +55,9 @@ import { getDispatcherForAccount } from "../../account-pool/egressDispatcher.js"
 import {
   DEFAULT_UPSTREAM_ENDPOINT,
   DEEPSEEK_UPSTREAM_ENDPOINT,
+  MINIMAX_UPSTREAM_ENDPOINT,
   isDeepseekModel,
+  isMiniMaxM3Model,
   extractSessionId,
   injectPersonaHeaders,
   isUuidLike,
@@ -69,23 +71,27 @@ import {
 
 export type UpstreamRoute =
   | { kind: "oauth" }
-  | { kind: "deepseek" };
+  | { kind: "deepseek" }
+  | { kind: "minimax" };
 
 /**
  * 纯函数,基于 model 决定走哪条 upstream。**preCheck 前**调用。
  *
- * isDeepseekModel(model) 命中 → deepseek;否则 oauth。当前没有 third route。
+ * isDeepseekModel(model) 命中 → deepseek;MiniMax-M3 → minimax;否则 oauth。
  */
 export function selectUpstreamRoute(model: string): UpstreamRoute {
+  if (isMiniMaxM3Model(model)) return { kind: "minimax" };
   return isDeepseekModel(model) ? { kind: "deepseek" } : { kind: "oauth" };
 }
 
 /**
- * 路由配置错误。当前只有一种:deepseek model 但部署未配 `DEEPSEEK_API_KEY`。
+ * 路由配置错误:静态 API-key upstream 未配置。
  *
- * handler 拿到后映射:503 + `proxy_deepseek_not_configured` log + reject `deepseek_config` metric。
+ * handler 拿到后映射:503 + 对应结构化 log + reject metric。
  */
-export type ConfigError = { kind: "deepseek_not_configured" };
+export type ConfigError =
+  | { kind: "deepseek_not_configured" }
+  | { kind: "minimax_not_configured" };
 
 /**
  * preCheck **前**调:路由级早拒绝。返回 null 表示该路由当前部署可走。
@@ -95,10 +101,13 @@ export type ConfigError = { kind: "deepseek_not_configured" };
  */
 export function validateUpstreamConfig(
   route: UpstreamRoute,
-  deps: { deepseekApiKey?: string },
+  deps: { deepseekApiKey?: string; minimaxTokenPlanKey?: string },
 ): ConfigError | null {
   if (route.kind === "deepseek" && !deps.deepseekApiKey) {
     return { kind: "deepseek_not_configured" };
+  }
+  if (route.kind === "minimax" && !deps.minimaxTokenPlanKey) {
+    return { kind: "minimax_not_configured" };
   }
   return null;
 }
@@ -204,6 +213,8 @@ export interface PickUpstreamDeps {
   refreshDeps?: RefreshDeps;
   /** DeepSeek 静态 API key;production 由 wiring 从 config 注入。OAuth route 不消费。 */
   deepseekApiKey?: string;
+  /** MiniMax Token Plan key;production 由 systemd env 注入。OAuth/DeepSeek route 不消费。 */
+  minimaxTokenPlanKey?: string;
   /** OAuth 上游 URL 覆盖;undefined → DEFAULT_UPSTREAM_ENDPOINT。测试 seam。 */
   upstreamEndpoint?: string;
   /**
@@ -281,6 +292,37 @@ function makeDeepSeekUpstream(apiKey: string): PreparedUpstreamSession {
     },
     zeroizeSecrets() {
       /* noop: deepseekApiKey 来自配置注入,不归 session */
+    },
+  };
+}
+
+function makeMiniMaxUpstream(apiKey: string): PreparedUpstreamSession {
+  return {
+    accountId: null,
+    pinnedUserId: null,
+    endpoint: MINIMAX_UPSTREAM_ENDPOINT,
+    dispatcher: undefined,
+    shouldUpdateQuotaFromResponse: false,
+    applyUpstreamAuth(safeHeaders, body, _log) {
+      safeHeaders.authorization = `Bearer ${apiKey}`;
+      // MiniMax 的 Anthropic 兼容层不需要 Anthropic 私有 beta；CCB 在
+      // firstParty+proxy 形态下会带 interleaved/context/effort 等 beta,
+      // 这里和 DeepSeek 一样 fail-closed strip,避免 strict proxy 报未知 beta。
+      delete safeHeaders["anthropic-beta"];
+      // MiniMax-M3 标准档只接普通 messages 参数。CCB 对 unknown firstParty
+      // model 可能默认带 output_config / context_management / thinking /
+      // service_tier;这些不是用户显式输入的业务内容,strip 后保留核心工具调用
+      // / messages / system,避免上游按高价 priority 或未知参数拒绝。
+      delete body.output_config;
+      delete body.context_management;
+      delete body.thinking;
+      delete body.service_tier;
+    },
+    sanitizeMessages(messages, _model, _log) {
+      return messages;
+    },
+    zeroizeSecrets() {
+      /* noop: minimaxTokenPlanKey 来自配置注入,不归 session */
     },
   };
 }
@@ -425,7 +467,7 @@ function makeOAuthPoolUpstream(
  *
  * pool_busy / pool_unavailable(case a)无 account 持有,直接转 PickError 无副作用。
  *
- * DeepSeek 路径:直接返回 `makeDeepSeekUpstream(...)`,无 pool 访问。
+ * DeepSeek / MiniMax 路径:直接返回静态 API-key upstream,无 pool 访问。
  */
 export async function pickUpstream(
   deps: PickUpstreamDeps,
@@ -457,6 +499,11 @@ export async function pickUpstream(
     // validateUpstreamConfig 已保证 deepseekApiKey 非空(handler preCheck 前 gate)。
     // 这里若仍 undefined 是 wiring bug — 退化为空字符串 Bearer 比 throw 安全(让上游 401)。
     return { ok: true, session: makeDeepSeekUpstream(deps.deepseekApiKey ?? "") };
+  }
+  if (route.kind === "minimax") {
+    // validateUpstreamConfig 已保证 minimaxTokenPlanKey 非空(handler preCheck 前 gate)。
+    // 这里若仍 undefined 是 wiring bug — 退化为空字符串 Bearer 比 throw 安全(让上游 401)。
+    return { ok: true, session: makeMiniMaxUpstream(deps.minimaxTokenPlanKey ?? "") };
   }
 
   // Phase 6 flag 在 OAuth 路径开头 await 一次,scheduler.pick + makeOAuthPoolUpstream

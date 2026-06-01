@@ -434,6 +434,12 @@ describe("canonicalizeModelId (边界层防御)", () => {
     assert.equal(canonicalizeModelId(""), "");
   });
 
+  test("MiniMax-M3 normalizes case to DB canonical id", () => {
+    assert.equal(canonicalizeModelId("MiniMax-M3"), "MiniMax-M3");
+    assert.equal(canonicalizeModelId("minimax-m3"), "MiniMax-M3");
+    assert.equal(canonicalizeModelId("MINIMAX-M3"), "MiniMax-M3");
+  });
+
   test("uppercase input is normalized to lowercase canonical", () => {
     assert.equal(
       canonicalizeModelId("CLAUDE-HAIKU-4-5-20251001"),
