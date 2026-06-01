@@ -2379,6 +2379,17 @@ export async function registerCommercial(
           });
         },
       },
+      wechatProcessVisibility: {
+        getShowToolCalls: async (bindingUserId) => {
+          const snap = await getPreferences(BigInt(bindingUserId));
+          return snap.prefs.wechat_show_tool_calls !== false;
+        },
+        setShowToolCalls: async (bindingUserId, show) => {
+          await patchPreferences(BigInt(bindingUserId), {
+            wechat_show_tool_calls: show,
+          });
+        },
+      },
       saveWechatMedia: userMediaResolver
         ? makeSaveWechatMediaToUserUploads({
             resolveUserMediaDirs: userMediaResolver,
