@@ -600,6 +600,64 @@ describe("outboundReceiver — enqueue outcome translation", () => {
     assert.match(String((spy.calls[0]!.payload[0] as { text?: string }).text), /思考过程/)
     assert.match(String((spy.calls[0]!.payload[2] as { text?: string }).text), /读取文件/)
   })
+
+  test("duplicate thinking previews across outbound posts are dropped before enqueue", async () => {
+    const { pool, spy } = makeFakePool({ mode: "enqueue_queued", outboxId: 42 })
+    const handler = makeOutboundReceiverHandler(makeDeps({ pool }))
+    const first = makeRes()
+    await handler(
+      authedReq(
+        validBody({
+          outboundId: "ob-thinking-1",
+          blocks: [{ kind: "thinking", text: "same reasoning text" }],
+        }),
+      ),
+      first.res,
+      CTX,
+    )
+    assert.equal(first.rec.status, 202)
+    assert.equal(spy.calls.length, 1)
+    assert.match(String((spy.calls[0]!.payload[0] as { text?: string }).text), /same reasoning text/)
+
+    const second = makeRes()
+    await handler(
+      authedReq(
+        validBody({
+          outboundId: "ob-thinking-2",
+          blocks: [{ kind: "thinking", text: "same reasoning text" }],
+        }),
+      ),
+      second.res,
+      CTX,
+    )
+    assert.equal(second.rec.status, 200)
+    assert.equal(JSON.parse(second.rec.body).outcome, "empty_render")
+    assert.equal(spy.calls.length, 1, "second duplicate thinking preview should not enqueue")
+  })
+
+  test("normal repeated text across outbound posts is not content-deduped", async () => {
+    const { pool, spy } = makeFakePool({ mode: "enqueue_queued", outboxId: 42 })
+    const handler = makeOutboundReceiverHandler(makeDeps({ pool }))
+    const first = makeRes()
+    await handler(
+      authedReq(validBody({ outboundId: "ob-text-1", blocks: [{ kind: "text", text: "same final text" }] })),
+      first.res,
+      CTX,
+    )
+    const second = makeRes()
+    await handler(
+      authedReq(validBody({ outboundId: "ob-text-2", blocks: [{ kind: "text", text: "same final text" }] })),
+      second.res,
+      CTX,
+    )
+    assert.equal(first.rec.status, 202)
+    assert.equal(second.rec.status, 202)
+    assert.equal(spy.calls.length, 2)
+    assert.deepEqual(spy.calls.map((c) => (c.payload[0] as { text?: string }).text), [
+      "same final text",
+      "same final text",
+    ])
+  })
 })
 
 // ─── render: empty result → no enqueue ─────────────────────────────────────

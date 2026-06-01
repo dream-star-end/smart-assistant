@@ -179,11 +179,27 @@ function makeSoftDelete(opts: { throwFor?: WechatSessionId } = {}): {
  *   - SELECT current_session_id FROM wechat_session_pointer → 返 `activeIds`
  *   - 其他 SQL → 0 rows rowCount=0(housekeeping 等 DELETE/UPDATE 都不会真生效,这是测试期望)
  */
-function makeFakePool(opts: { activeIds?: string[] } = {}): { pool: Pool; calls: string[] } {
+function makeFakePool(opts: {
+  activeIds?: string[]
+  pointerSessionId?: string | null
+  deletePointerRowCount?: number
+} = {}): { pool: Pool; calls: string[] } {
   const calls: string[] = []
   const activeIds = opts.activeIds ?? []
   const respond = (sql: string): { rows: Record<string, unknown>[]; rowCount: number | null } => {
     calls.push(sql)
+    if (/SELECT current_session_id FROM wechat_session_pointer WHERE binding_user_id/i.test(sql)) {
+      if (opts.pointerSessionId) {
+        return { rows: [{ current_session_id: opts.pointerSessionId }], rowCount: 1 }
+      }
+      return { rows: [], rowCount: 0 }
+    }
+    if (/DELETE FROM wechat_session_pointer WHERE binding_user_id/i.test(sql)) {
+      return {
+        rows: [],
+        rowCount: opts.deletePointerRowCount ?? (opts.pointerSessionId ? 1 : 0),
+      }
+    }
     if (/SELECT current_session_id FROM wechat_session_pointer/i.test(sql)) {
       return {
         rows: activeIds.map((id) => ({ current_session_id: id })),
@@ -782,6 +798,72 @@ describe("wechatBroker — onInbound", () => {
     await flushMicrotasks()
     assert.equal(sendSpy.calls.length, 1)
     assert.match(sendSpy.calls[0]!.text, /微信里可以这样用 OpenClaude/)
+  })
+
+  test("broker-local /new deletes commercial pointer, soft-deletes previous master wsess, and skips dispatcher", async () => {
+    const { dispatcher, spy: dispSpy } = makeDispatcher({
+      kind: "dispatched",
+      sessionId: SESSION_B,
+      newSession: false,
+    })
+    const fake = makeFakePool({
+      pointerSessionId: SESSION_A,
+      deletePointerRowCount: 1,
+    })
+    const { sendText, spy: sendSpy } = makeSendText({ ok: true })
+    const soft = makeSoftDelete()
+    const broker = makeWechatBroker(
+      makeDeps({
+        dispatcher,
+        pool: fake.pool,
+        sendText,
+        softDeleteMasterSession: soft.fn,
+      }),
+    )
+    const r = await broker.onInbound(makeEvent({
+      bindingUserId: "c:42",
+      text: "/new",
+      accountId: "acct-new",
+      messageId: "msg-new",
+    }))
+    assert.equal(r.kind, "command_echo")
+    if (r.kind === "command_echo") assert.match(r.reply, /已开启新会话/)
+    assert.equal(dispSpy.calls.length, 0)
+    assert.equal(soft.spy.calls.length, 1)
+    assert.deepEqual(soft.spy.calls[0], { sessionId: SESSION_A, userId: "c:42" })
+    assert.ok(
+      fake.calls.some((sql) => /DELETE FROM wechat_session_pointer WHERE binding_user_id/i.test(sql)),
+      "expected /new to delete commercial session pointer",
+    )
+    await flushMicrotasks()
+    assert.equal(sendSpy.calls.length, 1)
+    assert.equal(sendSpy.calls[0]!.text, "已开启新会话。下一条消息将由全新的 agent 处理。")
+  })
+
+  test("broker-local /new without existing pointer still succeeds and skips soft-delete", async () => {
+    const { dispatcher, spy: dispSpy } = makeDispatcher({
+      kind: "dispatched",
+      sessionId: SESSION_B,
+      newSession: false,
+    })
+    const fake = makeFakePool({ pointerSessionId: null, deletePointerRowCount: 0 })
+    const soft = makeSoftDelete()
+    const broker = makeWechatBroker(
+      makeDeps({
+        dispatcher,
+        pool: fake.pool,
+        softDeleteMasterSession: soft.fn,
+      }),
+    )
+    const r = await broker.onInbound(makeEvent({ text: "/new" }))
+    assert.equal(r.kind, "command_echo")
+    if (r.kind === "command_echo") assert.match(r.reply, /已开启新会话/)
+    assert.equal(dispSpy.calls.length, 0)
+    assert.equal(soft.spy.calls.length, 0)
+    assert.ok(
+      fake.calls.some((sql) => /DELETE FROM wechat_session_pointer WHERE binding_user_id/i.test(sql)),
+      "expected missing pointer path to still issue DELETE",
+    )
   })
 
   test("broker-local /model delegates to model command deps, reflects reply, skips dispatcher", async () => {

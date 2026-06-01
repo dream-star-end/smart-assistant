@@ -4,13 +4,14 @@
  *
  * **Slice 7c contract**(broker override hook):
  *   1. /status 命中 → 只调用 sendText,不进 override / dispatch
- *   2. /new 命中 → 调用 ctx.resetSession + sendText,不进 override / dispatch
- *   3. /help /model + override 已注入 → 只调 override,不调 sendText / ctx.dispatch
- *   4. /help /model + override 未注入 → manager 本地 fallback sendText
- *   5. 普通文本 + override 已注入 → 只调 override,不调 ctx.dispatch
- *   6. 普通文本 + override 未注入 → 走 ctx.dispatch 原路径(行为不变)
- *   7. override 抛错 → catch + ctx.log.error,不重抛,也不回落 ctx.dispatch
- *   8. override 收到的 evt 字段:bindingUserId/senderId/text/idempotencyKey/receivedAt/channel
+ *   2. /new + override 已注入 → 只调 override,让 broker 重置商业版 session pointer
+ *   3. /new + override 未注入 → 调用 ctx.resetSession + sendText,保留 legacy 行为
+ *   4. /help /model + override 已注入 → 只调 override,不调 sendText / ctx.dispatch
+ *   5. /help /model + override 未注入 → manager 本地 fallback sendText
+ *   6. 普通文本 + override 已注入 → 只调 override,不调 ctx.dispatch
+ *   7. 普通文本 + override 未注入 → 走 ctx.dispatch 原路径(行为不变)
+ *   8. override 抛错 → catch + ctx.log.error,不重抛,也不回落 ctx.dispatch
+ *   9. override 收到的 evt 字段:bindingUserId/senderId/text/idempotencyKey/receivedAt/channel
  *
  * Run: npx tsx --test packages/channels/wechat/src/__tests__/wechatChannelOverride.test.ts
  */
@@ -184,9 +185,19 @@ describe('routeWechatInbound — /status command bypasses override and dispatch'
   })
 })
 
-describe('routeWechatInbound — /new command bypasses override and dispatch', () => {
-  it('calls resetSession + sendText success message; no override, no dispatch', async () => {
+describe('routeWechatInbound — /new command routes to the correct session owner', () => {
+  it('forwards to override when broker is present; no local resetSession, no dispatch', async () => {
     const { deps, cap } = makeDeps({ withOverride: true })
+    await routeWechatInbound(makeEvent({ text: '/new' }), deps)
+    assert.equal(cap.overrideCalls.length, 1)
+    assert.equal(cap.overrideCalls[0]!.text, '/new')
+    assert.equal(cap.resetSessionCalls.length, 0)
+    assert.equal(cap.sendTextCalls.length, 0)
+    assert.equal(cap.dispatchCalls.length, 0)
+  })
+
+  it('without override, calls resetSession + sendText success message; no dispatch', async () => {
+    const { deps, cap } = makeDeps({ withOverride: false })
     await routeWechatInbound(makeEvent({ text: '/new' }), deps)
     assert.equal(cap.resetSessionCalls.length, 1)
     assert.deepEqual(cap.resetSessionCalls[0], {
@@ -200,9 +211,9 @@ describe('routeWechatInbound — /new command bypasses override and dispatch', (
     assert.equal(cap.dispatchCalls.length, 0, 'dispatch must not fire for /new')
   })
 
-  it('reports resetSession error back to the WeChat user, still no override', async () => {
+  it('without override, reports resetSession error back to the WeChat user', async () => {
     const { deps, cap } = makeDeps({
-      withOverride: true,
+      withOverride: false,
       resetSessionThrow: new Error('db-down'),
     })
     await routeWechatInbound(makeEvent({ text: '/new' }), deps)
