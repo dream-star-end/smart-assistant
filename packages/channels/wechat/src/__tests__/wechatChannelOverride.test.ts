@@ -20,6 +20,7 @@ import {
   routeWechatInbound,
   type WechatInboundOverrideEvent,
   type WechatInboundRouterDeps,
+  extractIlinkItemTypes,
 } from '../manager.js'
 import type { InboundEvent } from '../worker.js'
 
@@ -175,13 +176,20 @@ describe('routeWechatInbound — override hook precedence over ctx.dispatch', ()
       text: '你好 broker',
       senderId: 'wx-sender-xyz',
       messageId: 'mid-42',
-      binding: makeBinding({ userId: '888' }),
+      binding: makeBinding({ userId: '888', accountId: 'acct-888' }),
+      raw: { item_list: [{ type: 1, text_item: { text: '你好 broker' } }, { type: 3, voice_item: { text: '语音' } }] },
     }), deps)
     assert.equal(cap.overrideCalls.length, 1)
     const evt = cap.overrideCalls[0]!
     assert.equal(evt.bindingUserId, '888')
+    assert.equal(evt.accountId, 'acct-888')
     assert.equal(evt.senderId, 'wx-sender-xyz')
     assert.equal(evt.text, '你好 broker')
+    assert.equal(evt.messageId, 'mid-42')
+    assert.equal(evt.itemTypes, 'text,voice')
+    assert.deepEqual(evt.rawPayload, {
+      item_list: [{ type: 1, text_item: { text: '你好 broker' } }, { type: 3, voice_item: { text: '语音' } }],
+    })
     assert.equal(evt.idempotencyKey, 'wechat:888:wx-sender-xyz:mid-42')
     assert.equal(evt.receivedAt, NOW)
     assert.equal(evt.channel, 'wechat')
@@ -202,6 +210,24 @@ describe('routeWechatInbound — override hook precedence over ctx.dispatch', ()
     assert.equal(peer.displayName, 'wx-sender-abc')
     assert.deepEqual(frame.content, { text: 'legacy dispatch' })
     assert.equal(frame.ts, NOW)
+  })
+})
+
+describe('extractIlinkItemTypes', () => {
+  it('dedupes known item types and falls back for unknown numeric types', () => {
+    assert.equal(extractIlinkItemTypes({
+      item_list: [
+        { type: 1 },
+        { type: 1 },
+        { type: 2 },
+        { type: 99 },
+      ],
+    }), 'text,image,type:99')
+  })
+
+  it('returns unknown for malformed or empty payloads', () => {
+    assert.equal(extractIlinkItemTypes({}), 'unknown')
+    assert.equal(extractIlinkItemTypes(null), 'unknown')
   })
 })
 

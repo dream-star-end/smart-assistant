@@ -46,6 +46,13 @@ export function shouldLogSessionExpired(
   return consecutiveExpired <= 1 || nowMs >= nextLogAtMs
 }
 
+export function shouldMarkSessionExpiredTerminal(
+  consecutiveExpired: number,
+  threshold = 5,
+): boolean {
+  return Math.floor(consecutiveExpired || 0) >= threshold
+}
+
 /**
  * Pure decoder:把 iLink getupdates msg 项变成 worker loop 处理所需的归一
  * 字段;senderId 在此处剥 `@im.wechat` 后缀(上游 SENDER_ID_RE 校验 base64url
@@ -258,14 +265,21 @@ export class WechatWorker {
         this.sessionExpiredCount++
         const nowMs = Date.now()
         const delayMs = sessionExpiredBackoffMs(this.sessionExpiredCount)
+        buf = ''
+        try { await updateWechatBindingCursor(this.userId, '') } catch {}
+        if (shouldMarkSessionExpiredTerminal(this.sessionExpiredCount)) {
+          try { await updateWechatBindingStatus(this.userId, 'expired') } catch {}
+          this.ctx.log.error(
+            `[wechat:${this.userId}] session expired persistently; count=${this.sessionExpiredCount}; marking expired and exiting`,
+          )
+          break
+        }
         if (shouldLogSessionExpired(this.sessionExpiredCount, nowMs, this.nextSessionExpiredLogAt)) {
           this.ctx.log.info(
             `[wechat:${this.userId}] session expired; clearing cursor; count=${this.sessionExpiredCount}; retry in ${delayMs}ms`,
           )
           this.nextSessionExpiredLogAt = nowMs + SESSION_EXPIRED_LOG_INTERVAL_MS
         }
-        buf = ''
-        try { await updateWechatBindingCursor(this.userId, '') } catch {}
         await sleep(delayMs)
         continue
       }

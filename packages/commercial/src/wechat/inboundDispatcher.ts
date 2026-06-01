@@ -98,10 +98,18 @@ const DEFAULT_SESSION_TITLE = "微信会话"
 export interface InboundEvent {
   /** Binding 表 lookup 得来的 commercial uid(stringified)— **不**信任客户端输入。 */
   bindingUserId: string
+  /** Optional iLink bot account id; broker uses it for audit/dedupe before dispatch. */
+  accountId?: string
   /** WeChat openid 衍生(base64url),用于容器侧 peer.meta.senderId。 */
   senderId: string
   /** 入站文字(已 trim / unescape;sanitize markdown 在 outbound 渲染处做)。 */
   text: string
+  /** Optional raw iLink message id; empty string is normalized to NULL by audit. */
+  messageId?: string
+  /** Optional comma-separated raw iLink item kinds for audit. */
+  itemTypes?: string
+  /** Optional full raw iLink payload for audit/debug. */
+  rawPayload?: unknown
   /** = wechatMessageId;容器内 dispatchInbound 用作 idempotency key,重投递安全。 */
   idempotencyKey: string
   /** P1 默认 'main';P3 多 agent / commands 时由 broker 路由确定。 */

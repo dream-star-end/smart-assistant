@@ -51,6 +51,7 @@ import {
   type GetBindingFn,
   type SendTextFn,
 } from "./outboxWorker.js"
+import { DEFAULT_MAX_ATTEMPTS } from "./outboxStore.js"
 import {
   RECONCILE_GRACE_MS_DEFAULT,
   activeWsessIdsFromPg,
@@ -117,6 +118,7 @@ function normalizeDispatcherBindingUserId(input: string): string {
  */
 export type BrokerInboundOutcome =
   | DispatchOutcome
+  | { kind: "duplicate_audit"; reason: string }
   | { kind: "broker_disabled"; reason: string }
   | { kind: "broker_failed"; errMessage: string }
 
@@ -133,6 +135,13 @@ export interface WechatBroker {
    * 永不 throw — caller 不需要 try/catch。
    */
   onInbound(evt: InboundEvent): Promise<BrokerInboundOutcome>
+  /**
+   * Best-effort cleanup when a master SQLite binding is unbound.
+   *
+   * Does not delete outbox rows: queued/sending rows are terminal-failed so
+   * outbound_id idempotency tombstones remain intact.
+   */
+  cleanupBinding(bindingUserId: string): Promise<{ pointerDeleted: boolean; outboxFailed: number }>
   /** 启动 outboxWorker + reconcile + housekeeping 三条 timer。幂等(已 start 再 start 是 no-op)。 */
   start(): void
   /** 平滑停。await 所有 inFlight tick + outboxWorker.stop()。 */
@@ -302,6 +311,17 @@ export function makeWechatBroker(deps: BrokerDeps): WechatBroker {
         ? evt
         : { ...evt, bindingUserId: dispatchBindingUserId }
 
+    const duplicate = await hasCommittedAuditDuplicate(evt)
+    if (duplicate === true) {
+      log.info("audit_duplicate_inbound_dropped", {
+        bindingUserId: evt.bindingUserId,
+        accountId: evt.accountId,
+        messageId: evt.messageId,
+        idempotencyKey: evt.idempotencyKey,
+      })
+      return { kind: "duplicate_audit", reason: "duplicate_message_id" }
+    }
+
     let outcome: DispatchOutcome
     try {
       outcome = await deps.dispatcher.dispatch(dispatchEvt)
@@ -315,6 +335,10 @@ export function makeWechatBroker(deps: BrokerDeps): WechatBroker {
       return { kind: "broker_failed", errMessage }
     }
 
+    if (shouldCommitAudit(outcome)) {
+      await insertCommittedAudit(evt, dispatchBindingUserId)
+    }
+
     // 反射文案直接走 sendText fire-and-forget,**不入 outbox**:
     //   - outbox.session_id NOT NULL,反射没有 wsess(短路在 sessionId allocate 之前)
     //   - 反射性质 = 立刻给用户一个"已收到"信号,不接受 enqueue → drain 的二段延迟
@@ -325,6 +349,109 @@ export function makeWechatBroker(deps: BrokerDeps): WechatBroker {
       fireAndForgetReflection(evt, outcome.coldStartReply, "cold_start")
     }
     return outcome
+  }
+
+  async function hasCommittedAuditDuplicate(evt: InboundEvent): Promise<boolean | "skipped" | "failed"> {
+    const accountId = typeof evt.accountId === "string" ? evt.accountId.trim() : ""
+    if (!accountId) return "skipped"
+    const rawMessageId = typeof evt.messageId === "string" ? evt.messageId.trim() : ""
+    const messageId = rawMessageId ? rawMessageId : null
+    if (!messageId) return "skipped"
+    try {
+      const r = await deps.pgPool.query(
+        "SELECT 1 FROM wechat_audit WHERE account_id = $1 AND message_id = $2 LIMIT 1",
+        [accountId.slice(0, 128), messageId.slice(0, 128)],
+      )
+      return (r.rowCount ?? 0) > 0
+    } catch (err) {
+      log.error("audit_duplicate_check_failed", {
+        bindingUserId: evt.bindingUserId,
+        accountId,
+        messageId,
+        idempotencyKey: evt.idempotencyKey,
+        errMessage: (err as Error)?.message ?? String(err),
+      })
+      return "failed"
+    }
+  }
+
+  function shouldCommitAudit(outcome: DispatchOutcome): boolean {
+    return outcome.kind === "dispatched" || outcome.kind === "command_echo"
+  }
+
+  async function insertCommittedAudit(evt: InboundEvent, dispatchBindingUserId: string): Promise<void> {
+    const accountId = typeof evt.accountId === "string" ? evt.accountId.trim() : ""
+    if (!accountId) return
+    const rawMessageId = typeof evt.messageId === "string" ? evt.messageId.trim() : ""
+    const messageId = rawMessageId ? rawMessageId : null
+    const itemTypes = normalizeAuditItemTypes(evt.itemTypes)
+    const rawPayload =
+      evt.rawPayload !== undefined
+        ? evt.rawPayload
+        : {
+            text: evt.text,
+            idempotencyKey: evt.idempotencyKey,
+          }
+    try {
+      await deps.pgPool.query(
+        `INSERT INTO wechat_audit
+           (binding_user_id, account_id, sender_id, message_id, item_types, raw_payload, received_at)
+         VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7)
+         ON CONFLICT (account_id, message_id) WHERE message_id IS NOT NULL DO NOTHING`,
+        [
+          dispatchBindingUserId,
+          accountId.slice(0, 128),
+          evt.senderId ? evt.senderId.slice(0, 256) : null,
+          messageId ? messageId.slice(0, 128) : null,
+          itemTypes,
+          JSON.stringify(rawPayload),
+          evt.receivedAt || now(),
+        ],
+      )
+    } catch (err) {
+      log.error("audit_insert_failed", {
+        bindingUserId: evt.bindingUserId,
+        accountId,
+        messageId,
+        idempotencyKey: evt.idempotencyKey,
+        errMessage: (err as Error)?.message ?? String(err),
+      })
+    }
+  }
+
+  function normalizeAuditItemTypes(input: unknown): string {
+    const s = typeof input === "string" ? input.trim() : ""
+    return (s || "unknown").slice(0, 256)
+  }
+
+  async function cleanupBinding(
+    bindingUserIdInput: string,
+  ): Promise<{ pointerDeleted: boolean; outboxFailed: number }> {
+    const bindingUserId = normalizeDispatcherBindingUserId(bindingUserIdInput)
+    const pointer = await deps.pgPool.query(
+      "DELETE FROM wechat_session_pointer WHERE binding_user_id = $1",
+      [bindingUserId],
+    )
+    const outbox = await deps.pgPool.query(
+      `UPDATE wechat_outbox
+          SET status = 'failed',
+              attempts = GREATEST(attempts, $2),
+              last_error = $3,
+              locked_at = NULL,
+              updated_at = $4
+        WHERE binding_user_id = $1
+          AND status IN ('queued', 'sending')`,
+      [
+        bindingUserId,
+        deps.outboxWorker?.maxAttempts ?? DEFAULT_MAX_ATTEMPTS,
+        "binding unbound",
+        now(),
+      ],
+    )
+    return {
+      pointerDeleted: (pointer.rowCount ?? 0) > 0,
+      outboxFailed: outbox.rowCount ?? 0,
+    }
   }
 
   /**
@@ -599,5 +726,5 @@ export function makeWechatBroker(deps: BrokerDeps): WechatBroker {
     }
   }
 
-  return { outboundHandler, onInbound, start, stop }
+  return { outboundHandler, onInbound, cleanupBinding, start, stop }
 }

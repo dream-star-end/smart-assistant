@@ -411,13 +411,18 @@ export interface RegisterCommercialResult {
   wechatBroker?: {
     onInbound(evt: {
       bindingUserId: string;
+      accountId?: string;
       senderId: string;
       text: string;
+      messageId?: string;
+      itemTypes?: string;
+      rawPayload?: unknown;
       idempotencyKey: string;
       receivedAt: number;
       channel?: "wechat";
       agentId?: string;
     }): Promise<unknown>;
+    cleanupBinding(bindingUserId: string): Promise<unknown>;
   };
 }
 
@@ -2608,6 +2613,7 @@ export async function registerCommercial(
     wechatBroker: wechatBroker
       ? {
           onInbound: (evt) => wechatBroker!.onInbound(evt),
+          cleanupBinding: (bindingUserId) => wechatBroker!.cleanupBinding(bindingUserId),
         }
       : undefined,
   };
