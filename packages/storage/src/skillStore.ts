@@ -48,6 +48,139 @@ export interface SkillContent extends SkillMetadata {
   rawContent: string // full SKILL.md
 }
 
+export interface SkillSearchResult extends SkillMetadata {
+  score: number
+  matched: string[]
+}
+
+function normalizeSearchText(s: string): string {
+  return s.trim().toLocaleLowerCase()
+}
+
+function compactSearchText(s: string): string {
+  return normalizeSearchText(s).replace(/[^\p{L}\p{N}]+/gu, '')
+}
+
+function searchTokens(query: string): string[] {
+  return [
+    ...new Set(
+      normalizeSearchText(query)
+        .split(/[^\p{L}\p{N}-]+/u)
+        .map((t) => t.trim())
+        .filter(Boolean),
+    ),
+  ]
+}
+
+function boundedSearchLimit(limit: number | undefined): number {
+  if (!Number.isFinite(limit)) return 5
+  return Math.min(Math.max(Math.floor(limit as number), 1), 25)
+}
+
+/**
+ * Deterministic local search over already-visible skill metadata.
+ *
+ * This deliberately searches only metadata (name / description / tags /
+ * related_skills), never SKILL.md bodies. It is meant for tier-1 discovery:
+ * find candidate skills cheaply, then use `skill_view(name)` for full
+ * instructions when a candidate looks relevant.
+ */
+export function searchSkillMetadata(
+  skillList: SkillMetadata[],
+  query: string,
+  limit?: number,
+): SkillSearchResult[] {
+  const q = normalizeSearchText(query)
+  if (!q) return []
+
+  const tokens = searchTokens(q)
+  if (tokens.length === 0) return []
+
+  const compactQuery = compactSearchText(q)
+  const maxResults = boundedSearchLimit(limit)
+  const results: SkillSearchResult[] = []
+
+  for (const skill of skillList) {
+    const name = normalizeSearchText(skill.name)
+    const description = normalizeSearchText(skill.description)
+    const tags = (skill.tags ?? []).map(normalizeSearchText)
+    const related = (skill.related_skills ?? []).map(normalizeSearchText)
+    const matched = new Set<string>()
+    let score = 0
+
+    if (name === q) {
+      score += 100
+      matched.add('name:exact')
+    } else if (name.includes(q)) {
+      score += 70
+      matched.add('name')
+    }
+    if (compactQuery && compactSearchText(name) === compactQuery) {
+      score += 85
+      matched.add('name:compact')
+    }
+    if (description.includes(q)) {
+      score += 45
+      matched.add('description')
+    }
+    if (tags.includes(q)) {
+      score += 55
+      matched.add('tags:exact')
+    } else if (tags.some((tag) => tag.includes(q))) {
+      score += 35
+      matched.add('tags')
+    }
+    if (related.includes(q)) {
+      score += 35
+      matched.add('related_skills:exact')
+    } else if (related.some((r) => r.includes(q))) {
+      score += 20
+      matched.add('related_skills')
+    }
+
+    for (const token of tokens) {
+      if (token === q) continue
+      if (name === token) {
+        score += 60
+        matched.add(`name:${token}`)
+      } else if (name.includes(token)) {
+        score += 30
+        matched.add(`name:${token}`)
+      }
+      if (description.includes(token)) {
+        score += 12
+        matched.add(`description:${token}`)
+      }
+      if (tags.includes(token)) {
+        score += 28
+        matched.add(`tags:${token}`)
+      } else if (tags.some((tag) => tag.includes(token))) {
+        score += 14
+        matched.add(`tags:${token}`)
+      }
+      if (related.includes(token)) {
+        score += 18
+        matched.add(`related_skills:${token}`)
+      } else if (related.some((r) => r.includes(token))) {
+        score += 9
+        matched.add(`related_skills:${token}`)
+      }
+    }
+
+    if (score > 0) {
+      results.push({
+        ...skill,
+        score,
+        matched: [...matched].sort(),
+      })
+    }
+  }
+
+  return results
+    .sort((a, b) => b.score - a.score || a.name.localeCompare(b.name))
+    .slice(0, maxResults)
+}
+
 export function validateSkillName(name: string): { ok: boolean; error?: string } {
   if (!name) return { ok: false, error: 'skill name required' }
   if (name.length > MAX_SKILL_NAME_LENGTH)

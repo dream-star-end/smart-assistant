@@ -44,6 +44,20 @@ export interface PromptSlot {
   content: string
 }
 
+function buildPromptSkillStore(agentId: string): SkillStore {
+  const baselineDir = process.env.OPENCLAUDE_BASELINE_SKILLS_DIR?.trim()
+  if (!baselineDir) return new SkillStore(agentId)
+  try {
+    return new SkillStore(agentId, { baselineDir })
+  } catch (err) {
+    console.warn(
+      '[promptSlots] OPENCLAUDE_BASELINE_SKILLS_DIR invalid, falling back to user-only skills:',
+      err,
+    )
+    return new SkillStore(agentId)
+  }
+}
+
 // ── Individual slot builders ──
 
 export function buildSoulSlot(ctx: PromptSlotContext): PromptSlot | null {
@@ -201,14 +215,21 @@ export async function buildAgentsSlot(ctx: PromptSlotContext): Promise<PromptSlo
 }
 
 export async function buildSkillsSlot(ctx: PromptSlotContext): Promise<PromptSlot | null> {
-  const skillStore = new SkillStore(ctx.agentId)
+  const skillStore = buildPromptSkillStore(ctx.agentId)
   const skillList = await skillStore.list()
   if (skillList.length === 0) return null
   const top = skillList.slice(0, 15)
-  const lines = [`# Skills (${skillList.length})`, '', '可用 `skill_view(name)` 加载完整指令:']
-  for (const s of top) lines.push(`- **${s.name}** — ${s.description}`)
+  const lines = [
+    `# Skills (${skillList.length})`,
+    '',
+    '可用 `skill_search(query)` 查找相关 skill,再用 `skill_view(name)` 加载完整指令:',
+  ]
+  for (const s of top) {
+    const source = s.source === 'platform' ? 'platform' : 'user'
+    lines.push(`- **${s.name}** [${source}] — ${s.description}`)
+  }
   if (skillList.length > 15)
-    lines.push(`- ... 还有 ${skillList.length - 15} 个 (用 skill_list() 查看全部)`)
+    lines.push(`- ... 还有 ${skillList.length - 15} 个 (用 skill_search/skill_list 查看全部)`)
   return { name: 'SKILLS', content: lines.join('\n') }
 }
 
@@ -251,10 +272,13 @@ export function buildToolsSlot(): PromptSlot {
       '',
       '## 技能自生成',
       '',
-      '完成 3+ 工具调用的复杂任务后,**立即**评估:',
-      '1. `skill_list()` 检查是否已有类似 skill',
-      '2. 如果没有且模式可复用 → `skill_save(name, desc, body)`',
-      '3. 好的 skill = 步骤 + 注意事项 + 命令模板',
+      '不要等用户要求才沉淀经验。完成 3+ 工具调用的复杂任务、修复一个反复出现的问题、或验证出可复用流程后,在最终答复前**立即**评估:',
+      '1. 先用 `skill_search(query)` 搜索是否已有类似 skill;必要时再 `skill_list()` 浏览。',
+      '2. 如果已有 skill 但步骤过时/缺关键坑点 → 用同名 `skill_save(...)` 更新它。',
+      '3. 如果没有且模式可复用 → `skill_save(name, desc, body)` 创建新 skill。',
+      '4. 好的 skill = 触发场景 + 前提条件 + 步骤 + 验证方式 + 常见坑 + 命令模板。',
+      '',
+      '创建/更新 skill 时保持泛化,不要把一次性用户隐私、token、短期路径、无复用价值的流水账写进去。',
       '',
       '你是一个持久化、自进化的 agent。主动使用这些工具让自己越来越好。',
     ].join('\n'),

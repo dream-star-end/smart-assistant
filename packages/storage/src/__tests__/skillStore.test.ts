@@ -6,7 +6,7 @@
  *   npx tsx --test packages/storage/src/__tests__/skillStore.test.ts
  */
 import * as assert from 'node:assert/strict'
-import { mkdtemp, mkdir, symlink, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { before, describe, it } from 'node:test'
@@ -15,7 +15,7 @@ import { before, describe, it } from 'node:test'
 const testHome = await mkdtemp(join(tmpdir(), 'oc-skillstore-'))
 process.env.OPENCLAUDE_HOME = testHome
 
-const { SkillStore } = await import('../skillStore.js')
+const { SkillStore, searchSkillMetadata } = await import('../skillStore.js')
 const { paths } = await import('../paths.js')
 
 const AGENT = 'test-agent'
@@ -263,5 +263,57 @@ describe('SkillStore — PR4 safeReadFile cross-root symlink containment', () =>
     // where safeReadFile rejects the symlink escape.
     const v = await store.view('pretend-user')
     assert.equal(v, null)
+  })
+})
+
+describe('searchSkillMetadata — tier-1 skill discovery', () => {
+  const fixtures = [
+    {
+      name: 'skill-search',
+      description: '搜索和发现可用 skills,再决定调用 skill_view',
+      tags: ['system', 'meta', 'learning'],
+      related_skills: ['skill-management'],
+      path: '/platform/skill-search',
+      source: 'platform',
+    },
+    {
+      name: 'scheduled-tasks',
+      description: '定时提醒和 cron 任务创建方法',
+      tags: ['system', 'scheduling', 'cron'],
+      path: '/platform/scheduled-tasks',
+      source: 'platform',
+    },
+    {
+      name: 'deploy-to-vps',
+      description: '部署 Node 服务到 VPS 的完整流程',
+      tags: ['deployment'],
+      path: '/user/deploy-to-vps',
+      source: 'user',
+    },
+  ] as const
+
+  it('matches compact names so "skill search" finds skill-search first', () => {
+    const hits = searchSkillMetadata(fixtures as any, 'skill search', 5)
+    assert.equal(hits[0]?.name, 'skill-search')
+    assert.equal(hits[0]?.source, 'platform')
+    assert.ok(hits[0]?.matched.includes('name:compact'))
+  })
+
+  it('matches Chinese descriptions and preserves source metadata', () => {
+    const hits = searchSkillMetadata(fixtures as any, '定时提醒')
+    assert.equal(hits[0]?.name, 'scheduled-tasks')
+    assert.equal(hits[0]?.source, 'platform')
+    assert.ok(hits[0]?.matched.some((m: string) => m.startsWith('description')))
+  })
+
+  it('matches tags and honors the result limit cap parameter', () => {
+    const hits = searchSkillMetadata(fixtures as any, 'system', 1)
+    assert.equal(hits.length, 1)
+    assert.equal(hits[0]?.source, 'platform')
+    assert.ok(hits[0]?.matched.some((m: string) => m.startsWith('tags')))
+  })
+
+  it('returns [] for blank queries', () => {
+    assert.deepEqual(searchSkillMetadata(fixtures as any, '   '), [])
   })
 })

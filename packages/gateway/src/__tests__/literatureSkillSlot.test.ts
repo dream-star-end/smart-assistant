@@ -27,10 +27,28 @@ const TEST_HOME = mkdtempSync(join(tmpdir(), 'literature-slot-home-'))
 process.env.OPENCLAUDE_HOME = TEST_HOME
 
 const {
+  buildSkillsSlot,
   buildLiteratureSkillSlot,
   buildPromptContext,
   setLiteratureSkillProvider,
 } = await import('../promptSlots.js')
+
+async function withEnv<T>(patch: Record<string, string | undefined>, fn: () => Promise<T> | T) {
+  const old = new Map<string, string | undefined>()
+  for (const [key, value] of Object.entries(patch)) {
+    old.set(key, process.env[key])
+    if (value === undefined) Reflect.deleteProperty(process.env, key)
+    else process.env[key] = value
+  }
+  try {
+    return await fn()
+  } finally {
+    for (const [key, value] of old) {
+      if (value === undefined) Reflect.deleteProperty(process.env, key)
+      else process.env[key] = value
+    }
+  }
+}
 
 afterEach(() => {
   setLiteratureSkillProvider(null)
@@ -213,5 +231,43 @@ describe('buildPromptContext literature slot ordering', () => {
         `provider=${provider ?? 'undefined'} should still receive SKILLS_LITERATURE`,
       )
     }
+  })
+})
+
+describe('buildSkillsSlot baseline overlay', () => {
+  it('includes platform baseline skills when OPENCLAUDE_BASELINE_SKILLS_DIR is set', async () => {
+    const baselineRoot = mkdtempSync(join(tmpdir(), 'prompt-baseline-skills-'))
+    mkdirSync(join(baselineRoot, 'skill-search'), { recursive: true })
+    writeFileSync(
+      join(baselineRoot, 'skill-search', 'SKILL.md'),
+      [
+        '---',
+        'name: skill-search',
+        'description: "搜索和发现可用 skills"',
+        'version: 1.0.0',
+        '---',
+        '',
+        '# skill-search',
+      ].join('\n'),
+      'utf-8',
+    )
+
+    await withEnv({ OPENCLAUDE_BASELINE_SKILLS_DIR: baselineRoot }, async () => {
+      const slot = await buildSkillsSlot({ agentId: 'baseline-slot-test-agent' })
+      assert.ok(slot)
+      assert.match(slot!.content, /\*\*skill-search\*\* \[platform\]/)
+      assert.match(slot!.content, /skill_search\(query\)/)
+    })
+  })
+
+  it('falls back to user-only skills when OPENCLAUDE_BASELINE_SKILLS_DIR is invalid', async () => {
+    await withEnv(
+      { OPENCLAUDE_BASELINE_SKILLS_DIR: '/definitely/not/a/real/baseline' },
+      async () => {
+        await assert.doesNotReject(async () => {
+          await buildSkillsSlot({ agentId: 'invalid-baseline-slot-test-agent' })
+        })
+      },
+    )
   })
 })
