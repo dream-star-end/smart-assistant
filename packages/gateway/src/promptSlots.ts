@@ -68,6 +68,8 @@ export async function buildUserSlot(ctx: PromptSlotContext): Promise<PromptSlot 
 }
 
 export async function buildAgentsSlot(ctx: PromptSlotContext): Promise<PromptSlot> {
+  const provider = ctx.provider
+  const hasUnderstandImageTool = ctx.availableMcpTools?.includes('understand_image') === true
   const lines = [
     '# Platform capabilities',
     '',
@@ -78,6 +80,19 @@ export async function buildAgentsSlot(ctx: PromptSlotContext): Promise<PromptSlo
     '',
     '发送文件给用户: 必须先保存到平台生成目录再回复**绝对路径**;商业版容器优先使用 `/home/agent/.openclaude/generated/`,个人版/宿主机通常是 `/root/.openclaude/generated/`。不要用 `/tmp` 临时目录,不要用 `![]()` 语法。',
     '详细规则见 `skill_view("platform-capabilities")`。',
+    '',
+    '## 微信通道操作技能',
+    '',
+    '如果当前对话来自微信,或用户要求在微信里收发文件、图片、视频、语音/音频、附件,按以下规则操作:',
+    '',
+    hasUnderstandImageTool
+      ? '- 微信收到的图片、视频、语音/音频、文件会以容器内路径提供,通常在 `/home/agent/.openclaude/uploads/<安全文件名>`。看到本地图片路径时,应先调用 `understand_image` 工具识别,不要说“不支持图片/没有上传图片”。'
+      : '- 微信收到的图片、视频、语音/音频、文件会以容器内路径提供,通常在 `/home/agent/.openclaude/uploads/<安全文件名>`。看到本地图片路径时,不要说“不支持图片/没有上传图片”;如果当前工具列表中有图片理解工具,先调用它识别。',
+    '- 要通过微信发回真实附件,不能只读取文件或口头描述。必须先创建或复制资源到 `/home/agent/.openclaude/generated/<安全文件名>`;也可以复用已存在的 `/home/agent/.openclaude/uploads/<安全文件名>`。',
+    '- 最终回复里必须写出精确的绝对路径,例如 `/home/agent/.openclaude/generated/example.txt`;微信网关会把该路径转换成真实附件发送。路径要出现在**最终回答**中,不要只放在思考过程或工具调用说明里。',
+    '- 安全文件名只能匹配 `[A-Za-z0-9._@+=,-]{1,180}`,最长 180 字符;不要使用子目录、`..`、URL 编码、软链接、`/tmp` 或任意系统路径。',
+    '- 可发送的常见扩展名:图片 `png/jpg/jpeg/gif/webp`;视频 `mp4/mov/m4v/webm`;语音/音频 `mp3/wav/ogg/oga/silk/amr`;文件 `pdf/txt/md/csv/json/docx/xlsx/pptx/zip/tar/gz`。',
+    '- 用户说“随便发我一个文件”时,先生成一个小的 `txt` 或 `md` 文件到 generated 目录,再在最终回复给出路径;在路径出现前不要声称已经发给用户。',
     '',
     '## 内联富内容: `chart` / `mermaid` / `htmlpreview` 代码块',
     '',
@@ -147,8 +162,6 @@ export async function buildAgentsSlot(ctx: PromptSlotContext): Promise<PromptSlo
   } catch {}
 
   // Provider-specific tips
-  const provider = ctx.provider
-  const hasUnderstandImageTool = ctx.availableMcpTools?.includes('understand_image') === true
   if (provider === 'minimax') {
     lines.push('')
     lines.push('## MiniMax MCP 参数提示')
