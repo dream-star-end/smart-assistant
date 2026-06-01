@@ -611,6 +611,9 @@ export class CodexRunner extends EventEmitter {
       if (overrides.tokenFile && overrides.tokenContent !== null) {
         writeFileSync(overrides.tokenFile, overrides.tokenContent, { mode: 0o600 })
       }
+      if (overrides.visionTokenFile && overrides.visionTokenContent !== null) {
+        writeFileSync(overrides.visionTokenFile, overrides.visionTokenContent, { mode: 0o600 })
+      }
       this.sessionDir = dir
       this.cachedOverrides = overrides
       return overrides

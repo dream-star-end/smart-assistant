@@ -281,7 +281,9 @@ type RefreshConfig = {
 function commercialRefreshConfig(): RefreshConfig | null {
   if (process.env.OPENCLAUDE_VISION_CODEX_REFRESH_DISABLED === '1') return null
   const base = process.env.OPENCLAUDE_V3_MASTER_BASE_URL?.trim()
-  const token = process.env.OPENCLAUDE_V3_CONTAINER_TOKEN?.trim()
+  const token =
+    process.env.OPENCLAUDE_V3_CONTAINER_TOKEN?.trim() ||
+    readContainerTokenFromFile(process.env.OPENCLAUDE_V3_CONTAINER_TOKEN_FILE)
   if (!base || !token) return null
   const timeoutMs = parseBoundedInt(
     process.env.OPENCLAUDE_VISION_CODEX_REFRESH_TIMEOUT_MS,
@@ -293,6 +295,17 @@ function commercialRefreshConfig(): RefreshConfig | null {
     url: `${base.replace(/\/+$/, '')}${CODEX_TOKEN_REFRESH_PATH}`,
     token,
     timeoutMs,
+  }
+}
+
+function readContainerTokenFromFile(file: string | undefined): string | undefined {
+  const p = file?.trim()
+  if (!p) return undefined
+  try {
+    const token = readFileSync(p, 'utf8').trim()
+    return token || undefined
+  } catch {
+    return undefined
   }
 }
 

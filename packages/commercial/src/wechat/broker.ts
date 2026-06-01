@@ -68,6 +68,9 @@ const DEFAULT_HOUSEKEEPING_INTERVAL_MS = 5 * 60 * 1000
 
 /** 普通微信消息进入调度后立即给用户一个可见反馈,避免长时间无感知。 */
 const PROCESSING_REFLECTION_TEXT = "已收到，正在思考…"
+/** 图片消息需要先在 master 下载/解密/落盘,给用户单独的即时反馈。 */
+const IMAGE_PROCESSING_REFLECTION_TEXT = "收到图片，正在识别…"
+const IMAGE_PREPARE_FAILED_REPLY = "图片下载/识别准备失败，请重新发送图片，或在网页端上传后继续。"
 
 /**
  * v3 commercial canonical user id 接受形式:`c:<digit>` 或裸 `<digit>`。
@@ -183,6 +186,18 @@ export interface BrokerDeps {
     handleModelCommand: (evt: InboundEvent) => Promise<string>
     helpText?: () => string
   }
+  /**
+   * WeChat image bridge: download/decrypt iLink images on master, save them
+   * into the user's container uploads volume, and return text that instructs
+   * the in-container agent to call `understand_image`.
+   */
+  saveWechatImages?: (args: {
+    bindingUserId: string
+    images: NonNullable<InboundEvent["imageAttachments"]>
+    text: string
+    rawPayload?: unknown
+    traceId?: string
+  }) => Promise<{ promptText: string; count: number }>
   /** 读 master sqlite wechat_bindings(per binding 的 botToken + contextTokens)。 */
   getBinding: GetBindingFn
   /**
@@ -336,20 +351,60 @@ export function makeWechatBroker(deps: BrokerDeps): WechatBroker {
       return { kind: "duplicate_audit", reason: "duplicate_message_id" }
     }
 
-    const localOutcome = await tryHandleLocalUxCommand(dispatchEvt)
+    const imageAttachments = dispatchEvt.imageAttachments ?? []
+    const hasImages = imageAttachments.length > 0
+    const isSlashCommand = dispatchEvt.text.trim().startsWith("/")
+    const localOutcome =
+      !hasImages || isSlashCommand ? await tryHandleLocalUxCommand(dispatchEvt) : null
     if (localOutcome) {
       await insertCommittedAudit(evt, dispatchBindingUserId)
       fireAndForgetReflection(evt, localOutcome.reply, "command_echo")
       return localOutcome
     }
 
-    if (shouldSendProcessingReflection(dispatchEvt)) {
+    let effectiveDispatchEvt = dispatchEvt
+    if (hasImages) {
+      fireAndForgetReflection(evt, IMAGE_PROCESSING_REFLECTION_TEXT, "processing")
+      if (!deps.saveWechatImages) {
+        await insertCommittedAudit(evt, dispatchBindingUserId)
+        const outcome: Extract<DispatchOutcome, { kind: "command_echo" }> = {
+          kind: "command_echo",
+          reply: IMAGE_PREPARE_FAILED_REPLY,
+        }
+        fireAndForgetReflection(evt, outcome.reply, "command_echo")
+        return outcome
+      }
+      try {
+        const saved = await deps.saveWechatImages({
+          bindingUserId: dispatchBindingUserId,
+          images: imageAttachments,
+          text: dispatchEvt.text,
+          rawPayload: evt.rawPayload,
+          traceId: evt.traceId,
+        })
+        effectiveDispatchEvt = { ...dispatchEvt, text: saved.promptText }
+      } catch (err) {
+        const errMessage = (err as Error)?.message ?? String(err)
+        log.error("wechat_image_prepare_failed", {
+          bindingUserId: evt.bindingUserId,
+          idempotencyKey: evt.idempotencyKey,
+          errMessage,
+        })
+        await insertCommittedAudit(evt, dispatchBindingUserId)
+        const outcome: Extract<DispatchOutcome, { kind: "command_echo" }> = {
+          kind: "command_echo",
+          reply: IMAGE_PREPARE_FAILED_REPLY,
+        }
+        fireAndForgetReflection(evt, outcome.reply, "command_echo")
+        return outcome
+      }
+    } else if (shouldSendProcessingReflection(dispatchEvt)) {
       fireAndForgetReflection(evt, PROCESSING_REFLECTION_TEXT, "processing")
     }
 
     let outcome: DispatchOutcome
     try {
-      outcome = await deps.dispatcher.dispatch(dispatchEvt)
+      outcome = await deps.dispatcher.dispatch(effectiveDispatchEvt)
     } catch (err) {
       const errMessage = (err as Error)?.message ?? String(err)
       log.error("dispatcher_threw", {
@@ -440,7 +495,7 @@ export function makeWechatBroker(deps: BrokerDeps): WechatBroker {
         .filter(Boolean),
     )
     const labels: string[] = []
-    if (types.has("image")) labels.push("图片")
+    if (types.has("image") && (evt.imageAttachments?.length ?? 0) === 0) labels.push("图片")
     if (types.has("voice")) labels.push("语音")
     if (types.has("video")) labels.push("视频")
     if (labels.length === 0) return null

@@ -92,6 +92,32 @@ describe('processIlinkMessageForWorker — happy path', () => {
     if (result.kind !== 'ok') throw new Error('typeguard')
     assert.equal(result.text, 'voice transcription')
   })
+
+  it('extracts image attachments alongside text', () => {
+    const result = processIlinkMessageForWorker({
+      from_user_id: 'abc@im.wechat',
+      context_token: 'c',
+      seq: 1,
+      item_list: [
+        { type: 1, text_item: { text: '这张图讲了啥' } },
+        {
+          type: 2,
+          image_item: {
+            aeskey: '00112233445566778899aabbccddeeff',
+            media: { full_url: 'https://novac2c.cdn.weixin.qq.com/c2c/download?x=1' },
+          },
+        },
+      ],
+    })
+    assert.equal(result.kind, 'ok')
+    if (result.kind !== 'ok') throw new Error('typeguard')
+    assert.equal(result.text, '这张图讲了啥')
+    assert.equal(result.imageAttachments.length, 1)
+    assert.equal(
+      result.imageAttachments[0]!.fullUrl,
+      'https://novac2c.cdn.weixin.qq.com/c2c/download?x=1',
+    )
+  })
 })
 
 describe('processIlinkMessageForWorker — drop paths', () => {

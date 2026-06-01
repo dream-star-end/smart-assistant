@@ -52,6 +52,7 @@ function makeEvent(over: Partial<InboundEvent> = {}): InboundEvent {
     text: 'hello',
     contextToken: 'ctx-tok',
     messageId: 'msg-1',
+    imageAttachments: [],
     raw: {},
     ...over,
   }
@@ -229,6 +230,12 @@ describe('routeWechatInbound — override hook precedence over ctx.dispatch', ()
       senderId: 'wx-sender-xyz',
       messageId: 'mid-42',
       binding: makeBinding({ userId: '888', accountId: 'acct-888' }),
+      imageAttachments: [
+        {
+          fullUrl: 'https://novac2c.cdn.weixin.qq.com/c2c/download?x=1',
+          aesKeyHex: '00112233445566778899aabbccddeeff',
+        },
+      ],
       raw: { item_list: [{ type: 1, text_item: { text: '你好 broker' } }, { type: 3, voice_item: { text: '语音' } }] },
     }), deps)
     assert.equal(cap.overrideCalls.length, 1)
@@ -239,6 +246,11 @@ describe('routeWechatInbound — override hook precedence over ctx.dispatch', ()
     assert.equal(evt.text, '你好 broker')
     assert.equal(evt.messageId, 'mid-42')
     assert.equal(evt.itemTypes, 'text,voice')
+    assert.equal(evt.imageAttachments?.length, 1)
+    assert.equal(
+      evt.imageAttachments?.[0]?.aesKeyHex,
+      '00112233445566778899aabbccddeeff',
+    )
     assert.deepEqual(evt.rawPayload, {
       item_list: [{ type: 1, text_item: { text: '你好 broker' } }, { type: 3, voice_item: { text: '语音' } }],
     })

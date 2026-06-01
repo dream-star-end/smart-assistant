@@ -18,6 +18,7 @@ import type { ChannelAdapter, ChannelContext } from '@openclaude/plugin-sdk'
 import type { OutboundMessage } from '@openclaude/protocol'
 import type { WechatBinding } from '@openclaude/storage'
 import { listActiveWechatBindings } from '@openclaude/storage'
+import type { WechatImageAttachment } from './iLinkImage.js'
 import { WechatWorker, type InboundEvent } from './worker.js'
 
 /**
@@ -37,6 +38,8 @@ export interface WechatInboundOverrideEvent {
   messageId?: string
   /** Compact comma-separated inbound item kinds, e.g. `text,voice`. */
   itemTypes?: string
+  /** iLink image attachments extracted from rawPayload; URLs/keys are never logged. */
+  imageAttachments?: WechatImageAttachment[]
   /** Full raw iLink message payload for broker audit. */
   rawPayload?: unknown
   /** Stable per-message dedup key: `wechat:${bindingUserId}:${senderId}:${messageId}` */
@@ -304,6 +307,7 @@ export async function routeWechatInbound(
         text,
         messageId,
         itemTypes: extractIlinkItemTypes(evt.raw),
+        ...(evt.imageAttachments.length > 0 ? { imageAttachments: evt.imageAttachments } : {}),
         rawPayload: evt.raw,
         idempotencyKey,
         receivedAt,

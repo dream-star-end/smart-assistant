@@ -25,6 +25,7 @@ import {
   ILINK_SESSION_EXPIRED,
   sendIlinkText,
 } from './iLink.js'
+import { extractIlinkImageAttachments, type WechatImageAttachment } from './iLinkImage.js'
 
 const SESSION_EXPIRED_BASE_BACKOFF_MS = 5_000
 const SESSION_EXPIRED_MAX_BACKOFF_MS = 60_000
@@ -74,6 +75,7 @@ export type ProcessedIlinkMessage =
       contextToken: string
       text: string
       messageId: string
+      imageAttachments: WechatImageAttachment[]
     }
   | { kind: 'drop_no_sender_or_ctx' }
   | {
@@ -89,6 +91,7 @@ export function processIlinkMessageForWorker(msg: any): ProcessedIlinkMessage {
   const senderId = canonicalSenderId(rawSenderId)
   const contextToken = String(msg?.context_token || '').trim()
   const text = extractIlinkText(msg)
+  const imageAttachments = extractIlinkImageAttachments(msg)
   if (!senderId || !contextToken) {
     return { kind: 'drop_no_sender_or_ctx' }
   }
@@ -102,6 +105,7 @@ export function processIlinkMessageForWorker(msg: any): ProcessedIlinkMessage {
     contextToken,
     text,
     messageId: String(idSrc),
+    imageAttachments,
   }
 }
 
@@ -111,6 +115,7 @@ export interface InboundEvent {
   text: string
   contextToken: string
   messageId: string // best-effort unique id from iLink (seq/message_id/client_id)
+  imageAttachments: WechatImageAttachment[]
   raw: any
 }
 
@@ -333,6 +338,7 @@ export class WechatWorker {
             text: result.text,
             contextToken: result.contextToken,
             messageId: result.messageId,
+            imageAttachments: result.imageAttachments,
             raw: msg,
           })
         } catch (err: any) {

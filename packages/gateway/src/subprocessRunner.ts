@@ -4,7 +4,11 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from 'node:os'
 import { dirname, isAbsolute, resolve } from 'node:path'
 import { type McpServerConfig, type OpenClaudeConfig, paths } from '@openclaude/storage'
-import { resolveMcpMemoryEntry, resolveOpenClaudeVisionEntry } from './codexLaunchOverrides.js'
+import {
+  buildOpenClaudeVisionMcpEnv,
+  resolveMcpMemoryEntry,
+  resolveOpenClaudeVisionEntry,
+} from './codexLaunchOverrides.js'
 import { createLogger } from './logger.js'
 import { OPENCLAUDE_VISION_MCP_ID, shouldEnableOpenClaudeVision } from './mcpVisionServer.js'
 import { modelHintAppliedTotal } from './metrics.js'
@@ -77,43 +81,7 @@ export function _buildCcbSpawnTraceEnv(
   return { OPENCLAUDE_TRACE_ID: traceId ?? '' }
 }
 
-export function buildOpenClaudeVisionMcpEnv(agentId: string): Record<string, string> {
-  return {
-    OPENCLAUDE_AGENT_ID: agentId,
-    ...(process.env.OPENCLAUDE_HOME ? { OPENCLAUDE_HOME: process.env.OPENCLAUDE_HOME } : {}),
-    ...(process.env.CODEX_HOME ? { CODEX_HOME: process.env.CODEX_HOME } : {}),
-    OPENCLAUDE_VISION_CODEX_MODEL: process.env.OPENCLAUDE_VISION_CODEX_MODEL ?? 'gpt-5.5',
-    ...(process.env.OPENCLAUDE_VISION_TIMEOUT_MS
-      ? { OPENCLAUDE_VISION_TIMEOUT_MS: process.env.OPENCLAUDE_VISION_TIMEOUT_MS }
-      : {}),
-    ...(process.env.OPENCLAUDE_VISION_MAX_IMAGE_BYTES
-      ? {
-          OPENCLAUDE_VISION_MAX_IMAGE_BYTES: process.env.OPENCLAUDE_VISION_MAX_IMAGE_BYTES,
-        }
-      : {}),
-    ...(process.env.OPENCLAUDE_VISION_MAX_CONCURRENT
-      ? { OPENCLAUDE_VISION_MAX_CONCURRENT: process.env.OPENCLAUDE_VISION_MAX_CONCURRENT }
-      : {}),
-    ...(process.env.OPENCLAUDE_V3_MASTER_BASE_URL
-      ? { OPENCLAUDE_V3_MASTER_BASE_URL: process.env.OPENCLAUDE_V3_MASTER_BASE_URL }
-      : {}),
-    ...(process.env.OPENCLAUDE_V3_CONTAINER_TOKEN
-      ? { OPENCLAUDE_V3_CONTAINER_TOKEN: process.env.OPENCLAUDE_V3_CONTAINER_TOKEN }
-      : {}),
-    ...(process.env.OPENCLAUDE_VISION_CODEX_REFRESH_TIMEOUT_MS
-      ? {
-          OPENCLAUDE_VISION_CODEX_REFRESH_TIMEOUT_MS:
-            process.env.OPENCLAUDE_VISION_CODEX_REFRESH_TIMEOUT_MS,
-        }
-      : {}),
-    ...(process.env.OPENCLAUDE_VISION_CODEX_REFRESH_DISABLED
-      ? {
-          OPENCLAUDE_VISION_CODEX_REFRESH_DISABLED:
-            process.env.OPENCLAUDE_VISION_CODEX_REFRESH_DISABLED,
-        }
-      : {}),
-  }
-}
+export { buildOpenClaudeVisionMcpEnv } from './codexLaunchOverrides.js'
 
 // ───────────────────────────────────────────────
 // SubprocessRunner

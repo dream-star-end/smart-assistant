@@ -169,6 +169,20 @@ export async function buildAgentsSlot(ctx: PromptSlotContext): Promise<PromptSlo
       'DeepSeek 当前按纯文本模型接入。用户上传图片时,先调用 `understand_image` MCP 工具,传 `image_file="绝对路径"`,再基于工具返回的图片描述回答。',
     )
   }
+  if (
+    hasUnderstandImageTool &&
+    (provider === 'codex-native' ||
+      provider === 'codex' ||
+      ctx.model?.startsWith('gpt-') ||
+      ctx.model?.startsWith('codex-'))
+  ) {
+    lines.push('')
+    lines.push('## GPT/Codex 图片理解提示')
+    lines.push('')
+    lines.push(
+      '用户消息中出现本地图片路径时,先调用 `understand_image` MCP 工具,传 `image_file="绝对路径"`,再基于工具返回的图片内容回答。不要声称用户没有上传图片。',
+    )
+  }
 
   return { name: 'AGENTS', content: lines.join('\n') }
 }

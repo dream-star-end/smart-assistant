@@ -45,6 +45,7 @@
  */
 
 import { computeInboundNonce } from "../bridgeSecret.js"
+import type { WechatImageAttachment } from "@openclaude/channel-wechat"
 import { rootLogger, type Logger } from "../logging/logger.js"
 import type { ContainerUnreadyError, ResolveContainerEndpoint } from "../ws/userChatBridge.js"
 import {
@@ -111,6 +112,8 @@ export interface InboundEvent {
   itemTypes?: string
   /** Optional full raw iLink payload for audit/debug. */
   rawPayload?: unknown
+  /** Extracted iLink image attachments; broker may enrich text before dispatch. */
+  imageAttachments?: WechatImageAttachment[]
   /** = wechatMessageId;容器内 dispatchInbound 用作 idempotency key,重投递安全。 */
   idempotencyKey: string
   /** P1 默认 'main';P3 多 agent / commands 时由 broker 路由确定。 */

@@ -209,6 +209,7 @@ interface BaseDepsOverrides {
   outboundReceiver?: OutboundReceiverHandler
   sendText?: SendTextFn
   wechatUxCommands?: BrokerDeps["wechatUxCommands"]
+  saveWechatImages?: BrokerDeps["saveWechatImages"]
   getBinding?: GetBindingFn
   allMasterWsessRows?: BrokerDeps["allMasterWsessRows"]
   softDeleteMasterSession?: BrokerDeps["softDeleteMasterSession"]
@@ -243,6 +244,7 @@ function makeDeps(overrides: BaseDepsOverrides = {}): BrokerDeps {
     softDeleteMasterSession,
     sendText,
     wechatUxCommands: overrides.wechatUxCommands,
+    saveWechatImages: overrides.saveWechatImages,
     getBinding,
     brokerEnabled,
     now: overrides.now ?? (() => FIXED_NOW),
@@ -848,6 +850,100 @@ describe("wechatBroker — onInbound", () => {
       assert.match(r.reply, /主要支持文字对话/)
     }
     assert.equal(dispSpy.calls.length, 0)
+  })
+
+  test("image inbound with extracted attachment is prepared, enriched, and dispatched", async () => {
+    const saveCalls: Parameters<NonNullable<BrokerDeps["saveWechatImages"]>>[0][] = []
+    const { sendText, spy: sendSpy } = makeSendText({ ok: true })
+    const { dispatcher, spy: dispSpy } = makeDispatcher({
+      kind: "dispatched",
+      sessionId: SESSION_A,
+      newSession: false,
+    })
+    const broker = makeWechatBroker(
+      makeDeps({
+        dispatcher,
+        sendText,
+        saveWechatImages: async (args) => {
+          saveCalls.push(args)
+          return {
+            promptText: "请识别图片\n`/home/agent/.openclaude/uploads/wechat-a.jpg`",
+            count: 1,
+          }
+        },
+      }),
+    )
+    const r = await broker.onInbound(makeEvent({
+      text: "",
+      itemTypes: "image",
+      imageAttachments: [
+        {
+          fullUrl: "https://novac2c.cdn.weixin.qq.com/c2c/download?x=1",
+          aesKeyHex: "00112233445566778899aabbccddeeff",
+        },
+      ],
+    }))
+    assert.equal(r.kind, "dispatched")
+    assert.equal(saveCalls.length, 1)
+    assert.equal(saveCalls[0]!.bindingUserId, "42")
+    assert.equal(saveCalls[0]!.images.length, 1)
+    assert.equal(dispSpy.calls.length, 1)
+    assert.match(dispSpy.calls[0]!.text, /understand_image|wechat-a\\.jpg|识别图片/)
+    await flushMicrotasks()
+    assert.equal(sendSpy.calls.length, 1)
+    assert.equal(sendSpy.calls[0]!.text, "收到图片，正在识别…")
+  })
+
+  test("image prepare failure returns retryable friendly message and skips dispatcher", async () => {
+    const inserts: string[] = []
+    const pool = {
+      query: async (sql: string) => {
+        if (/SELECT 1 FROM wechat_audit/i.test(sql)) return { rows: [], rowCount: 0 }
+        if (/INSERT INTO wechat_audit/i.test(sql)) inserts.push(sql)
+        return { rows: [], rowCount: 0 }
+      },
+      connect: async () => ({
+        query: async () => ({ rows: [], rowCount: 0 }),
+        release: () => {},
+      }),
+    } as unknown as Pool
+    const { dispatcher, spy: dispSpy } = makeDispatcher({
+      kind: "dispatched",
+      sessionId: SESSION_A,
+      newSession: false,
+    })
+    const { sendText, spy: sendSpy } = makeSendText({ ok: true })
+    const broker = makeWechatBroker(
+      makeDeps({
+        dispatcher,
+        sendText,
+        pool,
+        saveWechatImages: async () => {
+          throw new Error("cdn rejected")
+        },
+      }),
+    )
+    const r = await broker.onInbound(makeEvent({
+      accountId: "acct-img",
+      messageId: "msg-img",
+      text: "",
+      itemTypes: "image",
+      imageAttachments: [
+        {
+          fullUrl: "https://novac2c.cdn.weixin.qq.com/c2c/download?x=1",
+          aesKeyHex: "00112233445566778899aabbccddeeff",
+        },
+      ],
+    }))
+    assert.equal(r.kind, "command_echo")
+    if (r.kind === "command_echo") assert.match(r.reply, /图片下载\/识别准备失败/)
+    assert.equal(dispSpy.calls.length, 0)
+    assert.equal(inserts.length, 1)
+    await flushMicrotasks()
+    assert.deepEqual(sendSpy.calls.map((c) => c.text), [
+      "收到图片，正在识别…",
+      "图片下载/识别准备失败，请重新发送图片，或在网页端上传后继续。",
+    ])
   })
 
   test("dispatcher failure does not commit audit row, so redelivery can retry", async () => {

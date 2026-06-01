@@ -151,6 +151,49 @@ export function resolveOpenClaudeVisionEntry(claudeCodePath?: string): string | 
   return null
 }
 
+export function buildOpenClaudeVisionMcpEnv(
+  agentId: string,
+  opts: { containerTokenFile?: string } = {},
+): Record<string, string> {
+  return {
+    OPENCLAUDE_AGENT_ID: agentId,
+    ...(process.env.OPENCLAUDE_HOME ? { OPENCLAUDE_HOME: process.env.OPENCLAUDE_HOME } : {}),
+    ...(process.env.CODEX_HOME ? { CODEX_HOME: process.env.CODEX_HOME } : {}),
+    OPENCLAUDE_VISION_CODEX_MODEL: process.env.OPENCLAUDE_VISION_CODEX_MODEL ?? 'gpt-5.5',
+    ...(process.env.OPENCLAUDE_VISION_TIMEOUT_MS
+      ? { OPENCLAUDE_VISION_TIMEOUT_MS: process.env.OPENCLAUDE_VISION_TIMEOUT_MS }
+      : {}),
+    ...(process.env.OPENCLAUDE_VISION_MAX_IMAGE_BYTES
+      ? {
+          OPENCLAUDE_VISION_MAX_IMAGE_BYTES: process.env.OPENCLAUDE_VISION_MAX_IMAGE_BYTES,
+        }
+      : {}),
+    ...(process.env.OPENCLAUDE_VISION_MAX_CONCURRENT
+      ? { OPENCLAUDE_VISION_MAX_CONCURRENT: process.env.OPENCLAUDE_VISION_MAX_CONCURRENT }
+      : {}),
+    ...(process.env.OPENCLAUDE_V3_MASTER_BASE_URL
+      ? { OPENCLAUDE_V3_MASTER_BASE_URL: process.env.OPENCLAUDE_V3_MASTER_BASE_URL }
+      : {}),
+    ...(opts.containerTokenFile
+      ? { OPENCLAUDE_V3_CONTAINER_TOKEN_FILE: opts.containerTokenFile }
+      : process.env.OPENCLAUDE_V3_CONTAINER_TOKEN
+        ? { OPENCLAUDE_V3_CONTAINER_TOKEN: process.env.OPENCLAUDE_V3_CONTAINER_TOKEN }
+        : {}),
+    ...(process.env.OPENCLAUDE_VISION_CODEX_REFRESH_TIMEOUT_MS
+      ? {
+          OPENCLAUDE_VISION_CODEX_REFRESH_TIMEOUT_MS:
+            process.env.OPENCLAUDE_VISION_CODEX_REFRESH_TIMEOUT_MS,
+        }
+      : {}),
+    ...(process.env.OPENCLAUDE_VISION_CODEX_REFRESH_DISABLED
+      ? {
+          OPENCLAUDE_VISION_CODEX_REFRESH_DISABLED:
+            process.env.OPENCLAUDE_VISION_CODEX_REFRESH_DISABLED,
+        }
+      : {}),
+  }
+}
+
 // ── TOML literal encoding for `-c key=value` arguments ──
 
 /** Encode a value as a single-line TOML literal suitable for codex `-c key=value`.
@@ -266,6 +309,10 @@ export interface CodexLaunchOverrides {
   /** Token content the caller must writeFile to tokenFile (mode 0600).
    *  Null when tokenFile is null. */
   tokenContent: string | null
+  /** Optional v3 container token file for openclaude-vision MCP refresh. */
+  visionTokenFile: string | null
+  /** Token content the caller must writeFile to visionTokenFile (mode 0600). */
+  visionTokenContent: string | null
   /** argv fragments to splice into the codex spawn args between the
    *  subcommand (`exec` / `app-server`) and the trailing positional
    *  (`-` / threadId / `--listen`).
@@ -304,6 +351,10 @@ export async function buildCodexLaunchOverrides(
   // because that file is provider-agnostic and shouldn't carry adapter
   // concerns — keeping it here means promptSlots stays clean and the codex
   // adapter can evolve without touching the slot pipeline.
+  const openClaudeVisionEntry =
+    process.env.OPENCLAUDE_VISION_MCP_DISABLED === '1'
+      ? null
+      : resolveOpenClaudeVisionEntry(ctx.claudeCodePath)
   const platformResult = await buildPromptContext({
     agentId: ctx.agentId,
     persona: ctx.persona,
@@ -314,6 +365,7 @@ export async function buildCodexLaunchOverrides(
     // buildLearningContext(repoSnapshot) → buildPromptContext 走通,这里给两个
     // codex 路径补齐,让 codex 子进程也看到 REPO slot(系统提示里的仓库元信息)。
     repoSnapshot: ctx.repoSnapshot ?? undefined,
+    availableMcpTools: openClaudeVisionEntry ? ['understand_image'] : [],
   })
   const instructionsContent = `${CODEX_PREAMBLE}${platformResult.content}`
   const instructionsFile = resolve(ctx.sessionDir, 'extra-prompt.md')
@@ -345,6 +397,8 @@ export async function buildCodexLaunchOverrides(
   const mcpEntry = resolveMcpMemoryEntry(ctx.claudeCodePath)
   let tokenFile: string | null = null
   let tokenContent: string | null = null
+  let visionTokenFile: string | null = null
+  let visionTokenContent: string | null = null
   if (mcpEntry) {
     // v3 hardening: the gateway token NEVER lands in argv. Instead, we point
     // mcp-memory at a 0600 file via OPENCLAUDE_GATEWAY_TOKEN_FILE; the caller
@@ -372,7 +426,35 @@ export async function buildCodexLaunchOverrides(
     )
   }
 
-  return { instructionsFile, instructionsContent, tokenFile, tokenContent, argvOverrides }
+  if (openClaudeVisionEntry) {
+    const rawContainerToken = process.env.OPENCLAUDE_V3_CONTAINER_TOKEN?.trim()
+    if (rawContainerToken) {
+      visionTokenFile = resolve(ctx.sessionDir, 'v3-container-token')
+      visionTokenContent = rawContainerToken
+    }
+    argvOverrides.push(
+      '-c',
+      `mcp_servers.openclaude-vision.command=${tomlValue('npx')}`,
+      '-c',
+      `mcp_servers.openclaude-vision.args=${tomlValue(['tsx', openClaudeVisionEntry])}`,
+      '-c',
+      `mcp_servers.openclaude-vision.env=${tomlValue(buildOpenClaudeVisionMcpEnv(ctx.agentId, {
+        containerTokenFile: visionTokenFile ?? undefined,
+      }))}`,
+      '-c',
+      `mcp_servers.openclaude-vision.default_tools_approval_mode=${tomlValue('approve')}`,
+    )
+  }
+
+  return {
+    instructionsFile,
+    instructionsContent,
+    tokenFile,
+    tokenContent,
+    visionTokenFile,
+    visionTokenContent,
+    argvOverrides,
+  }
 }
 
 // Internal export for tests only — not part of the stable API.
