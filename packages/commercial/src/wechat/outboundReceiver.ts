@@ -91,6 +91,11 @@ const MAX_BLOCKS_PER_OUTBOUND = 4096
 /** WeChat is not a good surface for huge raw thinking transcripts. */
 const MAX_THINKING_PREVIEW_CHARS = 800
 
+/** Cross-request duplicate thinking previews are noisy in WeChat streaming UX. */
+const THINKING_PREVIEW_PREFIX = "💭 思考过程："
+const THINKING_DEDUPE_TTL_MS = 2 * 60 * 1000
+const THINKING_DEDUPE_MAX_ENTRIES = 512
+
 /** traceId 字符集与长度,容器侧 traceId 通常 hex/uuid。 */
 const TRACE_ID_RE = /^[A-Za-z0-9._:-]{1,128}$/
 
@@ -412,6 +417,7 @@ export function makeOutboundReceiverHandler(
 ): OutboundReceiverHandler {
   const log = (deps.logger ?? rootLogger).child({ subsys: "wechatOutboundReceiver" })
   const now = deps.now ?? (() => Date.now())
+  const recentThinkingParts = new Map<string, number>()
   const getWechatShowToolCalls =
     deps.getWechatShowToolCalls ??
     (async (userId: number) => {
@@ -541,8 +547,15 @@ export function makeOutboundReceiverHandler(
       })
     }
     const rendered = renderWechatBlocks(body.blocks, { showToolCalls })
-    const parts = expandRenderedPartsWithWechatMedia(rendered.parts)
-    const dropped = rendered.dropped
+    const expandedParts = expandRenderedPartsWithWechatMedia(rendered.parts)
+    const deduped = dropDuplicateThinkingParts(recentThinkingParts, expandedParts, {
+      userId: bindingUserId,
+      sessionId: body.sessionId,
+      senderId: body.peer.meta.senderId,
+      now: now(),
+    })
+    const parts = deduped.parts
+    const dropped = rendered.dropped + deduped.dropped
     if (parts.length === 0) {
       // 全 drop / 全空文本 — 不入队(避免 worker 走 invalid_payload 路径)。
       // 容器侧 sink 视为 "已接收、无可发内容、勿重试"。
@@ -596,6 +609,46 @@ export function makeOutboundReceiverHandler(
 }
 
 // ─── private helpers ───────────────────────────────────────────────────────
+
+function dropDuplicateThinkingParts(
+  recent: Map<string, number>,
+  parts: IlinkPart[],
+  opts: { userId: string; sessionId: string; senderId: string; now: number },
+): { parts: IlinkPart[]; dropped: number } {
+  pruneRecentThinkingParts(recent, opts.now)
+  const out: IlinkPart[] = []
+  let dropped = 0
+  for (const part of parts) {
+    if (part.type !== "text" || !part.text.startsWith(THINKING_PREVIEW_PREFIX)) {
+      out.push(part)
+      continue
+    }
+    const key = `${opts.userId}\n${opts.sessionId}\n${opts.senderId}\n${part.text}`
+    if (recent.has(key)) {
+      dropped++
+      continue
+    }
+    recent.set(key, opts.now)
+    out.push(part)
+  }
+  if (recent.size > THINKING_DEDUPE_MAX_ENTRIES) {
+    const overflow = recent.size - THINKING_DEDUPE_MAX_ENTRIES
+    let deleted = 0
+    for (const key of recent.keys()) {
+      recent.delete(key)
+      deleted++
+      if (deleted >= overflow) break
+    }
+  }
+  return { parts: out, dropped }
+}
+
+function pruneRecentThinkingParts(recent: Map<string, number>, now: number): void {
+  const cutoff = now - THINKING_DEDUPE_TTL_MS
+  for (const [key, seenAt] of recent) {
+    if (seenAt < cutoff) recent.delete(key)
+  }
+}
 
 function sendOutcomeResponse(
   res: ServerResponse,

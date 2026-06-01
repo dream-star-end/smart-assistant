@@ -65,8 +65,9 @@ export interface WechatChannelConfig {
    * 命中时 handleInbound **替换** `ctx.dispatch` 路径,把事件交给 broker 走自己
    * 的 client_sessions 命名空间 + dispatcher → container 链路(详见 RFC §4.1)。
    *
-   * 不影响 `/status` / `/new` 等用户面板命令 —— 这些保持走 manager 本地处理,
-   * 不进 broker(boss 的诊断 / reset 操作必须始终能用,即使 broker 故障)。
+   * `/status` 仍在 manager 本地处理。`/new` 在 commercial broker 存在时必须
+   * 交给 broker,否则只会重置 legacy ChannelContext session,不会清理 broker 的
+   * `wechat_session_pointer`。
    *
    * 抛错语义:override **不允许抛**;若它内部失败,broker 的 tryCompensation 应
    * 在 master 侧落 compensate;manager 这层只 log 不重抛 —— 重抛会让 worker
@@ -263,12 +264,13 @@ export function wechatChannelFactory(cfg: WechatChannelConfig = {}): ChannelAdap
  *
  * **Invariants**(测试套件 wechatChannelOverride.test.ts 断言):
  *   1. `/status` 命中 → 只调用 `sendText`,**不**进 override / dispatch
- *   2. `/new` 命中 → 调用 `ctx.resetSession` + `sendText` 反馈,**不**进 override / dispatch
- *   3. `/help` / `/model` + `onInboundOverride` 已注入 → 交给 broker 产出商业版友好回复
- *   4. `/help` / `/model` + `onInboundOverride` 未注入 → manager 本地 fallback 回复
- *   5. 普通文本 + `onInboundOverride` 已注入 → **只**调 override,**不**调 `ctx.dispatch`
- *   6. 普通文本 + `onInboundOverride` 未注入 → 走原 `ctx.dispatch` 路径
- *   7. override 抛错 → catch + log,**不**重抛(避免污染 worker long-poll loop),
+ *   2. `/new` + `onInboundOverride` 已注入 → 交给 broker 重置商业版 `wechat_session_pointer`
+ *   3. `/new` + `onInboundOverride` 未注入 → 调 `ctx.resetSession` + `sendText` 保留 legacy 行为
+ *   4. `/help` / `/model` + `onInboundOverride` 已注入 → 交给 broker 产出商业版友好回复
+ *   5. `/help` / `/model` + `onInboundOverride` 未注入 → manager 本地 fallback 回复
+ *   6. 普通文本 + `onInboundOverride` 已注入 → **只**调 override,**不**调 `ctx.dispatch`
+ *   7. 普通文本 + `onInboundOverride` 未注入 → 走原 `ctx.dispatch` 路径
+ *   8. override 抛错 → catch + log,**不**重抛(避免污染 worker long-poll loop),
  *      也**不**回落到 `ctx.dispatch`(broker 失败应由 master tryCompensation 兜底,
  *      不能让消息走两套不同的 session 命名空间造成串场)
  */
@@ -381,6 +383,10 @@ export async function routeWechatInbound(
 
   // ── /new — start a fresh OpenClaude session for this sender ──
   if (/^\s*\/new\s*$/.test(text)) {
+    if (onInboundOverride) {
+      await forwardToOverride()
+      return
+    }
     try {
       if (ctx.resetSession) await ctx.resetSession('wechat', peerId, 'dm')
       sendText(binding.userId, senderId, '已开启新会话。下一条消息将由全新的 agent 处理。')
@@ -394,7 +400,8 @@ export async function routeWechatInbound(
   // 注入)。命中后整条 inbound 改走 broker → dispatcher → container 链路,**不**
   // 再调 ctx.dispatch —— 否则 master 侧 personal-OC session 会和 broker 的
   // wsess-* client_sessions 命名空间打架,boss-self-binding 灰度的会话隔离失效。
-  // /status /new 在上面已经 return,这里到不了,broker 不会被这些控制命令污染。
+  // /status 在上面已经 return；/new 在有 broker override 时由 broker 重置商业会话,
+  // 无 broker override 时仍由 manager 重置 legacy 会话。
   if (onInboundOverride) {
     await forwardToOverride()
     return

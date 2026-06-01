@@ -56,11 +56,14 @@ import { DEFAULT_MAX_ATTEMPTS } from "./outboxStore.js"
 import {
   RECONCILE_GRACE_MS_DEFAULT,
   activeWsessIdsFromPg,
+  deletePointer,
+  getCurrentSessionId,
   listOrphanWechatSessions,
   type PgConn,
 } from "./sessionPointer.js"
 import type { WechatSessionId } from "./types.js"
 import type { ResolveOutboundMediaPartFn } from "./outboundMedia.js"
+import { MASTER_USER_PREFIX } from "./userIds.js"
 
 /** Reconcile 周期默认值。RFC §4.8。 */
 const DEFAULT_RECONCILE_INTERVAL_MS = 30_000
@@ -385,7 +388,9 @@ export function makeWechatBroker(deps: BrokerDeps): WechatBroker {
       hasMedia && effectiveMediaAttachments.every((item) => item.kind === "image")
     const isSlashCommand = dispatchEvt.text.trim().startsWith("/")
     const localOutcome =
-      !hasMedia || isSlashCommand ? await tryHandleLocalUxCommand(dispatchEvt) : null
+      !hasMedia || isSlashCommand
+        ? await tryHandleLocalUxCommand(dispatchEvt, dispatchBindingUserId)
+        : null
     if (localOutcome) {
       await insertCommittedAudit(evt, dispatchBindingUserId)
       fireAndForgetReflection(evt, localOutcome.reply, "command_echo")
@@ -474,11 +479,18 @@ export function makeWechatBroker(deps: BrokerDeps): WechatBroker {
     return outcome
   }
 
-  async function tryHandleLocalUxCommand(evt: InboundEvent): Promise<Extract<DispatchOutcome, { kind: "command_echo" }> | null> {
+  async function tryHandleLocalUxCommand(
+    evt: InboundEvent,
+    dispatchBindingUserId: string,
+  ): Promise<Extract<DispatchOutcome, { kind: "command_echo" }> | null> {
     const mediaReply = friendlyUnsupportedMediaReply(evt)
     if (mediaReply) return { kind: "command_echo", reply: mediaReply }
 
     const text = evt.text.trim()
+    if (/^\/new$/i.test(text)) {
+      return handleNewCommand(evt, dispatchBindingUserId)
+    }
+
     if (/^\/help$/i.test(text)) {
       return {
         kind: "command_echo",
@@ -515,6 +527,50 @@ export function makeWechatBroker(deps: BrokerDeps): WechatBroker {
     }
 
     return null
+  }
+
+  async function handleNewCommand(
+    evt: InboundEvent,
+    dispatchBindingUserId: string,
+  ): Promise<Extract<DispatchOutcome, { kind: "command_echo" }>> {
+    let previousSessionId: WechatSessionId | null = null
+    try {
+      previousSessionId = await getCurrentSessionId(deps.pgPool, dispatchBindingUserId)
+      await deletePointer(deps.pgPool, dispatchBindingUserId)
+    } catch (err) {
+      log.error("wechat_new_command_reset_failed", {
+        bindingUserId: evt.bindingUserId,
+        dispatchBindingUserId,
+        idempotencyKey: evt.idempotencyKey,
+        errMessage: (err as Error)?.message ?? String(err),
+      })
+      return {
+        kind: "command_echo",
+        reply: "/new 失败:暂时无法重置会话,请稍后重试。",
+      }
+    }
+
+    if (previousSessionId) {
+      try {
+        await deps.softDeleteMasterSession(
+          previousSessionId,
+          `${MASTER_USER_PREFIX}${dispatchBindingUserId}`,
+        )
+      } catch (err) {
+        log.warn("wechat_new_command_soft_delete_failed", {
+          bindingUserId: evt.bindingUserId,
+          dispatchBindingUserId,
+          sessionId: previousSessionId,
+          idempotencyKey: evt.idempotencyKey,
+          errMessage: (err as Error)?.message ?? String(err),
+        })
+      }
+    }
+
+    return {
+      kind: "command_echo",
+      reply: "已开启新会话。下一条消息将由全新的 agent 处理。",
+    }
   }
 
   function defaultWechatHelpText(): string {
