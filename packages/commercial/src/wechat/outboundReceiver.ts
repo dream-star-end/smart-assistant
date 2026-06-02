@@ -12,7 +12,7 @@
  *   2) zod 严格 parse;blocks 用 discriminatedUnion(kind),unknown key 拒绝
  *   3) outbound rate-limit 检查(P1 noop,但保留调用便于 P3 切换)
  *   4) renderWechatBlocks 把 5 种 OutboundContentBlock 投影成 IlinkPart[]:
- *        - text         → coalesce adjacent chunks, then renderAssistantText(sanitize + split 1024)
+ *        - text         → coalesce adjacent chunks, then renderAssistantText(preserve Markdown + split 4000)
  *        - tool_use     → renderToolAnnouncement("🔧 X…") unless user hides process
  *        - thinking     → coalesce adjacent chunks, then bounded "💭 思考过程" preview
  *                          unless user hides process
@@ -267,7 +267,7 @@ export interface RenderWechatBlocksOptions {
  *
  * **规则**(详见模块头注释):
  *   - parentToolUseId 非空 → 整块 skip(subagent 内容只在 web Agent card 渲染)
- *   - text → 先合并连续顶层 text,再 renderAssistantText(避免 token chunks 变成多气泡)
+ *   - text → 先合并连续顶层 text,再 renderAssistantText(保留 Markdown;避免 token chunks 变成多气泡)
  *   - tool_use → renderToolAnnouncement("🔧 X…")
  *   - thinking → 先合并连续顶层 thinking,再发有上限的 "💭 思考过程" 摘要
  *   - tool_result / tool_output_tail → drop(P1 不外发)

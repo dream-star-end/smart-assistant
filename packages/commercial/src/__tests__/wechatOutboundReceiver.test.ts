@@ -822,17 +822,17 @@ describe("outboundReceiver — trust boundary", () => {
 // ─── renderWechatBlocks pure function ──────────────────────────────────────
 
 describe("renderWechatBlocks pure function", () => {
-  test("text block → 1 text IlinkPart (under 1024)", () => {
+  test("text block → 1 text IlinkPart (under 4000)", () => {
     const r = renderWechatBlocks([{ kind: "text", text: "hello world" }])
     assert.equal(r.parts.length, 1)
     assert.deepEqual(r.parts[0], { type: "text", text: "hello world" })
     assert.equal(r.dropped, 0)
   })
 
-  test("text block with markdown gets sanitized", () => {
+  test("text block with markdown is preserved for WeChat/iLink rendering", () => {
     const r = renderWechatBlocks([{ kind: "text", text: "**bold** `code`" }])
     assert.equal(r.parts.length, 1)
-    assert.equal(r.parts[0]!.text, "bold code")
+    assert.equal(r.parts[0]!.text, "**bold** `code`")
   })
 
   test("raw UNKNOWN_MODEL API errors are rewritten for WeChat", () => {
@@ -847,12 +847,12 @@ describe("renderWechatBlocks pure function", () => {
     assert.doesNotMatch(r.parts[0]!.text, /request_id|req-secret|UNKNOWN_MODEL|API Error/)
   })
 
-  test("text block > 1024 chars splits into multiple parts", () => {
-    const long = "a".repeat(2050)
+  test("text block > 4000 chars splits into multiple parts", () => {
+    const long = "a".repeat(8050)
     const r = renderWechatBlocks([{ kind: "text", text: long }])
     assert.equal(r.parts.length, 3)
     assert.match(r.parts[0]!.text, /^（1\/3）\n/)
-    assert.ok(r.parts.every((part) => part.text.length <= 1024))
+    assert.ok(r.parts.every((part) => part.text.length <= 4000))
   })
 
   test("consecutive text blocks are coalesced into one WeChat bubble", () => {
@@ -868,15 +868,15 @@ describe("renderWechatBlocks pure function", () => {
 
   test("coalesced long text still splits into WeChat pages", () => {
     const r = renderWechatBlocks([
-      { kind: "text", text: "a".repeat(900) },
-      { kind: "text", text: "b".repeat(900) },
+      { kind: "text", text: "a".repeat(2300) },
+      { kind: "text", text: "b".repeat(2300) },
     ])
     assert.equal(r.parts.length, 2)
     assert.match(r.parts[0]!.text, /^（1\/2）\n/)
     assert.match(r.parts[1]!.text, /^（2\/2）\n/)
     assert.equal(
       r.parts.map((part) => part.text.replace(/^（\d+\/\d+）\n/, "")).join(""),
-      "a".repeat(900) + "b".repeat(900),
+      "a".repeat(2300) + "b".repeat(2300),
     )
   })
 
@@ -979,12 +979,11 @@ describe("renderWechatBlocks pure function", () => {
     assert.equal(r.dropped, 2)
   })
 
-  test("text block with only markdown noise (sanitize → empty) → 0 parts + 1 dropped", () => {
-    // `---` 是 horizontal rule;``` 是 code fence;sanitize 后全剥掉 → cleaned=""
-    // renderAssistantText 见 cleaned.length===0 返 [],case 'text' 走 dropped++ 分支
+  test("markdown syntax-only text is preserved instead of dropped", () => {
     const r = renderWechatBlocks([{ kind: "text", text: "---\n```\n```\n" }])
-    assert.equal(r.parts.length, 0)
-    assert.equal(r.dropped, 1)
+    assert.equal(r.parts.length, 1)
+    assert.equal(r.parts[0]!.text, "---\n```\n```")
+    assert.equal(r.dropped, 0)
   })
 
   test("mixed blocks: text + tool_use + thinking + parentToolUseId text → 3 parts (text + announcement + thinking)", () => {

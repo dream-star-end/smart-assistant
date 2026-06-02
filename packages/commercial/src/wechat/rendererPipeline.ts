@@ -1,10 +1,11 @@
 /**
  * v3 commercial WeChat broker — outbound 渲染管线。
  *
- * 把 v3 master OutboundMessage 文本(可能是 markdown,可能含工具调用)
- * 渲染成微信能正确显示的 IlinkPart[]。三个 helper(`sanitizeForWechat`,
- * `splitText`,`friendlyToolName`)是 packages/channels/wechat/src/manager.ts
- * 私有实现的复制 — **故意复制不复用**:
+ * 把 v3 master OutboundMessage 文本(通常是 Markdown,可能含工具调用)
+ * 渲染成微信能正确显示的 IlinkPart[]。纯文本工具预告仍复用
+ * `sanitizeForWechat`;assistant 最终文本则保留 Markdown 交给 iLink/微信端渲染。
+ * 三个 helper(`sanitizeForWechat`,`splitText`,`friendlyToolName`)最早 fork 自
+ * packages/channels/wechat/src/manager.ts — **故意复制不复用**:
  *
  *   - manager.ts 跑在 v3 master 进程外的 plugin host,broker 在 v3 master 进程内,
  *     依赖图不交叉(commercial 不该 import @openclaude/channels 实现)。
@@ -17,8 +18,8 @@
 
 import type { IlinkPart } from "./types.js"
 
-/** iLink sendText 单条上限。略保守(实际允许更大),便于 WeChat 客户端连贯阅读。 */
-export const WECHAT_MAX_TEXT = 1024
+/** iLink sendText 单条上限。公开 iLink 适配器生态按 4000 characters 做智能分块。 */
+export const WECHAT_MAX_TEXT = 4000
 
 /**
  * 工具名 → 中文友好称呼。未匹配时返回 mcp__ 剥皮后的尾段或原样。
@@ -120,35 +121,165 @@ function safeModelNameForWechat(raw: string | undefined): string {
 }
 
 /**
- * 按 max 长度硬切分;不考虑 word boundary 因为微信主流是 CJK,空格分词无意义。
- * (复制自 packages/channels/wechat/src/manager.ts:327)
+ * 按 max 长度硬切分。用 code point 迭代避免把 emoji / surrogate pair 切坏;
+ * 长度上限仍按 JS string.length(UTF-16 code units)保守计算,保证正常 code point
+ * 不会被拆开。
  */
 export function splitText(text: string, max: number): string[] {
   if (max <= 0) throw new Error(`splitText: max must be > 0, got ${max}`)
   const out: string[] = []
-  let buf = text
-  while (buf.length > max) {
-    out.push(buf.slice(0, max))
-    buf = buf.slice(max)
+  let chunk = ""
+  let chunkLen = 0
+
+  for (const ch of text) {
+    const chLen = ch.length
+    if (chLen > max) {
+      if (chunk) {
+        out.push(chunk)
+        chunk = ""
+        chunkLen = 0
+      }
+      out.push(ch)
+      continue
+    }
+    if (chunkLen > 0 && chunkLen + chLen > max) {
+      out.push(chunk)
+      chunk = ch
+      chunkLen = chLen
+      continue
+    }
+    chunk += ch
+    chunkLen += chLen
+    if (chunkLen === max) {
+      out.push(chunk)
+      chunk = ""
+      chunkLen = 0
+    }
   }
-  if (buf) out.push(buf)
+  if (chunk) out.push(chunk)
   return out
 }
 
+/**
+ * 保留 Markdown 语法,仅做微信阅读友好的轻量规范化。
+ * - 保留 heading / bold / inline code / links / tables / fenced code blocks。
+ * - fenced code block 内原样保留。
+ * - fenced code block 外把连续空行压成一个空行(即最多两个换行)。
+ */
+export function normalizeMarkdownForWechat(raw: string): string {
+  if (!raw) return ""
+  const lines = raw.replace(/\r\n?/g, "\n").split("\n")
+  const out: string[] = []
+  let inFence = false
+  let sawBlank = false
+
+  for (const line of lines) {
+    if (isFenceLine(line)) {
+      out.push(line)
+      inFence = !inFence
+      sawBlank = false
+      continue
+    }
+    if (inFence) {
+      out.push(line)
+      continue
+    }
+    if (line.trim().length === 0) {
+      if (!sawBlank && out.length > 0) out.push("")
+      sawBlank = true
+      continue
+    }
+    out.push(line)
+    sawBlank = false
+  }
+
+  while (out.length > 0 && out[out.length - 1] === "") out.pop()
+  return out.join("\n")
+}
+
 export function splitTextForWechatPages(text: string, max: number): string[] {
-  const firstPass = splitText(text, max)
+  const normalized = normalizeMarkdownForWechat(text)
+  const firstPass = splitMarkdownIntoChunks(normalized, max)
   if (firstPass.length <= 1) return firstPass
 
   let total = firstPass.length
   for (;;) {
     const reserve = pagePrefix(total, total).length
     if (reserve >= max) throw new Error(`splitTextForWechatPages: page prefix exceeds max=${max}`)
-    const chunks = splitText(text, max - reserve)
+    const chunks = splitMarkdownIntoChunks(normalized, max - reserve)
     if (chunks.length === total) {
       return chunks.map((chunk, idx) => `${pagePrefix(idx + 1, total)}${chunk}`)
     }
     total = chunks.length
   }
+}
+
+function splitMarkdownIntoChunks(text: string, max: number): string[] {
+  if (max <= 0) throw new Error(`splitTextForWechatPages: max must be > 0, got ${max}`)
+  if (!text) return []
+  const blocks = splitMarkdownBlocks(text)
+  const chunks: string[] = []
+  let current = ""
+
+  for (const block of blocks) {
+    if (!block) continue
+    if (block.length > max) {
+      if (current) {
+        chunks.push(current)
+        current = ""
+      }
+      chunks.push(...splitText(block, max))
+      continue
+    }
+
+    if (!current) {
+      current = block
+      continue
+    }
+
+    const candidate = `${current}\n\n${block}`
+    if (candidate.length <= max) {
+      current = candidate
+    } else {
+      chunks.push(current)
+      current = block
+    }
+  }
+
+  if (current) chunks.push(current)
+  return chunks
+}
+
+function splitMarkdownBlocks(text: string): string[] {
+  const lines = text.split("\n")
+  const blocks: string[] = []
+  let current: string[] = []
+  let inFence = false
+
+  const flush = () => {
+    if (current.length === 0) return
+    blocks.push(current.join("\n"))
+    current = []
+  }
+
+  for (const line of lines) {
+    if (isFenceLine(line)) {
+      current.push(line)
+      inFence = !inFence
+      continue
+    }
+    if (!inFence && line.trim().length === 0) {
+      flush()
+      continue
+    }
+    current.push(line)
+  }
+  flush()
+  return blocks
+}
+
+function isFenceLine(line: string): boolean {
+  return /^\s*```/.test(line)
 }
 
 function pagePrefix(page: number, total: number): string {
@@ -161,13 +292,13 @@ function pagePrefix(page: number, total: number): string {
  * 签名故意接受 `null | undefined`:v3 OutboundMessage.text 历史允许 undefined,worker
  * drain 时不需要二次 coalesce/cast(Codex slice 2 review non-blocking 建议)。
  *
- * P1 流程:sanitize → split(WECHAT_MAX_TEXT)→ 每段一个 text part。
- * P2 引入图片时,会在此追加附件 part(图片优先,再追加文字)。
+ * 流程:provider error 友好化 → Markdown 规范化/保留 → 智能分块(WECHAT_MAX_TEXT)
+ * → 每段一个 text part。P2 引入图片时,会在此追加附件 part(图片优先,再追加文字)。
  */
 export function renderAssistantText(rawMarkdown: string | null | undefined): IlinkPart[] {
   const raw = rawMarkdown ?? ""
   const displayText = friendlyProviderErrorForWechat(raw) ?? raw
-  const cleaned = sanitizeForWechat(displayText)
+  const cleaned = normalizeMarkdownForWechat(displayText)
   if (cleaned.length === 0) return []
   return splitTextForWechatPages(cleaned, WECHAT_MAX_TEXT).map((text) => ({ type: "text", text }))
 }
