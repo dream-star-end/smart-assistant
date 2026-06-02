@@ -204,6 +204,19 @@ test('dispatchInbound keeps completed WeChat idempotency entries accepted for St
   )
 })
 
+test('WeChat idempotency entries use a long TTL for multi-hour early-ACK retries', () => {
+  assert.match(
+    SERVER_TS,
+    /WECHAT_IDEMPOTENCY_TTL_MS\s*=\s*24\s*\*\s*60\s*\*\s*60_000/,
+    'WeChat Step1 ACKs can precede final by hours; the dedupe cache must outlive the generic 5-minute browser replay TTL',
+  )
+  assert.match(
+    SERVER_TS,
+    /entry\.wechat\s*\?\s*Gateway\.WECHAT_IDEMPOTENCY_TTL_MS\s*:\s*Gateway\.IDEMPOTENCY_TTL_MS/,
+    'idempotency eviction must use the WeChat-specific TTL only for WeChat entries',
+  )
+})
+
 test('WeChat Step1 start callback reports routed sessionKey and agentId', () => {
   assert.match(
     SERVER_TS,

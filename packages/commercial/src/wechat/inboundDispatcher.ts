@@ -686,21 +686,25 @@ export function makeInboundDispatcher(deps: InboundDispatcherDeps): InboundDispa
       }
 
       if (step1Accepted.started !== false && step1Accepted.completed !== true) {
-        try {
-          await markRunningSession(
-            deps.pgPool,
-            evt.bindingUserId,
-            sessionId,
-            step1Accepted.runId,
-            routedAgentId,
-            dispatchNow,
-          )
-        } catch (err) {
-          reqLog.error("mark_running_session_failed", {
-            sessionId,
-            runId: step1Accepted.runId,
-            errMessage: (err as Error)?.message ?? String(err),
-          })
+        if (step1Accepted.runId) {
+          try {
+            await markRunningSession(
+              deps.pgPool,
+              evt.bindingUserId,
+              sessionId,
+              step1Accepted.runId,
+              routedAgentId,
+              dispatchNow,
+            )
+          } catch (err) {
+            reqLog.error("mark_running_session_failed", {
+              sessionId,
+              runId: step1Accepted.runId,
+              errMessage: (err as Error)?.message ?? String(err),
+            })
+          }
+        } else {
+          reqLog.warn("step1_started_without_trace_id_skip_running_session", { sessionId })
         }
       }
 
@@ -1100,8 +1104,8 @@ function parseRetryAfterSec(response: {
 
 function parseStep1Accepted(
   bodyText: string,
-  fallbackRunId: string,
-): { accepted: boolean; started: boolean; completed?: boolean; runId: string; sessionId?: WechatSessionId; agentId?: string } {
+  _fallbackRunId: string,
+): { accepted: boolean; started: boolean; completed?: boolean; runId?: string; sessionId?: WechatSessionId; agentId?: string } {
   try {
     const parsed = JSON.parse(bodyText) as {
       accepted?: unknown
@@ -1115,7 +1119,7 @@ function parseStep1Accepted(
     }
     const traceId = typeof parsed.traceId === "string" && parsed.traceId.length > 0
       ? parsed.traceId
-      : fallbackRunId
+      : undefined
     const explicitSessionId = typeof parsed.sessionId === "string"
       ? parsed.sessionId
       : typeof parsed.peerId === "string"
@@ -1137,12 +1141,17 @@ function parseStep1Accepted(
       accepted: parsed.accepted !== false,
       started: parsed.started !== false,
       ...(parsed.completed === true ? { completed: true } : {}),
-      runId: traceId,
+      ...(traceId ? { runId: traceId } : {}),
       ...(sessionId ? { sessionId } : {}),
       ...(agentId ? { agentId } : {}),
     }
   } catch {
-    return { accepted: true, started: true, runId: fallbackRunId }
+    // Older gateways did not include traceId in the Step1 ACK. Do not invent
+    // a requestId run key here: final cleanup clears by body.traceId, so a
+    // synthetic key would create a stale running row that `/stop` keeps seeing.
+    // Pointer fallback still lets `/stop` scan live wsess runners during a
+    // mixed-version rollout.
+    return { accepted: true, started: true }
   }
 }
 

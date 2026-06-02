@@ -255,7 +255,9 @@ function makeDeps(overrides: Partial<InboundDispatcherDeps> = {}): InboundDispat
     bridgeSecret: BRIDGE_SECRET,
     upsertMasterClientSession: storage.upsertMasterClientSession,
     softDeleteMasterSession: storage.softDeleteMasterSession,
-    transport: makeTransport([{ status: 200, bodyText: '{"ok":true,"dispatched":true}' }]).transport,
+    transport: makeTransport([
+      { status: 200, bodyText: '{"ok":true,"started":true,"traceId":"run-default"}' },
+    ]).transport,
     newSessionId: () => FIXED_SESSION_ID,
     now: () => FIXED_NOW,
     newRequestId: () => "req-fixed",
@@ -572,7 +574,7 @@ describe("inboundDispatcher — tunnel transport", () => {
 describe("inboundDispatcher — happy path", () => {
   test("new session: pointer=null → upsert called, pointer set, outcome dispatched newSession=true", async () => {
     const { transport, spy: tSpy } = makeTransport([
-      { status: 200, bodyText: '{"ok":true,"dispatched":true}' },
+      { status: 200, bodyText: '{"ok":true,"started":true,"traceId":"run-happy"}' },
     ])
     const storage = makeStorageSpies()
     const pg = makeFakePg({ pointer: null })
@@ -609,6 +611,31 @@ describe("inboundDispatcher — happy path", () => {
     assert.equal(pg.spy.setCalls[0]!.now, FIXED_NOW)
     assert.equal(pg.spy.runningSetCalls.length, 1)
     assert.equal(pg.spy.runningSetCalls[0]!.sessionId, FIXED_SESSION_ID)
+  })
+
+  test("Step1 ACK without traceId does not invent a running-session key", async () => {
+    const { transport } = makeTransport([
+      { status: 200, bodyText: '{"ok":true,"started":true}' },
+    ])
+    const storage = makeStorageSpies()
+    const pg = makeFakePg({ pointer: null })
+    const d = makeInboundDispatcher(
+      makeDeps({
+        transport,
+        pgPool: pg.pg,
+        upsertMasterClientSession: storage.upsertMasterClientSession,
+        softDeleteMasterSession: storage.softDeleteMasterSession,
+      }),
+    )
+    const r = await d.dispatch(makeEvent())
+    assert.equal(r.kind, "dispatched")
+    assert.equal(storage.spy.upsertCalls.length, 1)
+    assert.equal(pg.spy.setCalls.length, 1)
+    assert.equal(
+      pg.spy.runningSetCalls.length,
+      0,
+      "without container traceId, final cleanup cannot match a synthetic requestId run key",
+    )
   })
 
   test("deduplicated Step1 response adopts original wsess before master pointer/upsert", async () => {

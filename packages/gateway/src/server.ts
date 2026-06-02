@@ -559,6 +559,10 @@ export class Gateway {
   }>() // key → timestamp + optional WeChat retry metadata
   private static readonly IDEMPOTENCY_MAX_KEYS = 1000
   private static readonly IDEMPOTENCY_TTL_MS = 5 * 60_000 // 5 minutes
+  // WeChat turns now ACK Step 1 as soon as the runner starts and can keep
+  // executing for hours. Keep only WeChat retry metadata long enough for
+  // late Step1 retries to dedupe instead of dispatching a second copy.
+  private static readonly WECHAT_IDEMPOTENCY_TTL_MS = 24 * 60 * 60_000 // 24 hours
 
   /**
    * Check whether an idempotency key has already been processed (read-only).
@@ -586,7 +590,7 @@ export class Gateway {
     // Evict expired entries periodically
     if (this._seenIdempotencyKeys.size > 100) {
       for (const [k, entry] of this._seenIdempotencyKeys) {
-        if (now - entry.ts > Gateway.IDEMPOTENCY_TTL_MS) {
+        if (now - entry.ts > Gateway._idempotencyTtlMs(entry)) {
           this._seenIdempotencyKeys.delete(k)
         }
       }
@@ -594,11 +598,17 @@ export class Gateway {
 
     const entry = this._seenIdempotencyKeys.get(key)
     if (!entry) return null
-    if (now - entry.ts >= Gateway.IDEMPOTENCY_TTL_MS) {
+    if (now - entry.ts >= Gateway._idempotencyTtlMs(entry)) {
       this._seenIdempotencyKeys.delete(key)
       return null
     }
     return entry
+  }
+
+  private static _idempotencyTtlMs(entry: {
+    wechat?: unknown
+  }): number {
+    return entry.wechat ? Gateway.WECHAT_IDEMPOTENCY_TTL_MS : Gateway.IDEMPOTENCY_TTL_MS
   }
 
   /** Record an idempotency key as processed. */
