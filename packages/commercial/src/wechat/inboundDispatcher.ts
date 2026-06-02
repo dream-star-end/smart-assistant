@@ -403,6 +403,7 @@ export function makeInboundDispatcher(deps: InboundDispatcherDeps): InboundDispa
       const newSession = current === null
       let shouldUpsertMasterSession = newSession
       let shouldSetCurrentPointer = true
+      let routedAgentId = agentId
 
       // **稳定时间戳**:Step 2a 的 createdAt / lastAt 用同一 now() pin 住,避免一次 dispatch
       // 内 createdAt / lastAt 错开 1 ms(测试 `createdAt === lastAt` 断言依赖)。
@@ -554,6 +555,9 @@ export function makeInboundDispatcher(deps: InboundDispatcherDeps): InboundDispa
         }
       }
       const step1Accepted = parseStep1Accepted(step1.response.bodyText, requestId)
+      if (step1Accepted.agentId) {
+        routedAgentId = step1Accepted.agentId
+      }
       if (step1Accepted.sessionId && step1Accepted.sessionId !== sessionId) {
         reqLog.warn("step1_adopted_original_session", {
           allocatedSessionId: sessionId,
@@ -577,7 +581,7 @@ export function makeInboundDispatcher(deps: InboundDispatcherDeps): InboundDispa
           await deps.upsertMasterClientSession({
             sessionId,
             userId: MASTER_USER_PREFIX + evt.bindingUserId,
-            agentId,
+            agentId: routedAgentId,
             originChannel: "wechat",
             title: sessionTitle,
             createdAt: dispatchNow,
@@ -614,7 +618,7 @@ export function makeInboundDispatcher(deps: InboundDispatcherDeps): InboundDispa
             evt.bindingUserId,
             sessionId,
             dispatchNow,
-            agentId,
+            routedAgentId,
           )
           if (!applied) {
             // updated_at <= EXCLUDED guard 过滤(stale ts):P1 单进程不会真触发,
@@ -683,7 +687,7 @@ export function makeInboundDispatcher(deps: InboundDispatcherDeps): InboundDispa
             evt.bindingUserId,
             sessionId,
             step1Accepted.runId,
-            agentId,
+            routedAgentId,
             dispatchNow,
           )
         } catch (err) {
@@ -1071,7 +1075,7 @@ function parseRetryAfterSec(response: {
 function parseStep1Accepted(
   bodyText: string,
   fallbackRunId: string,
-): { started: boolean; runId: string; sessionId?: WechatSessionId } {
+): { started: boolean; runId: string; sessionId?: WechatSessionId; agentId?: string } {
   try {
     const parsed = JSON.parse(bodyText) as {
       started?: unknown
@@ -1079,6 +1083,7 @@ function parseStep1Accepted(
       sessionId?: unknown
       peerId?: unknown
       sessionKey?: unknown
+      agentId?: unknown
     }
     const traceId = typeof parsed.traceId === "string" && parsed.traceId.length > 0
       ? parsed.traceId
@@ -1091,18 +1096,28 @@ function parseStep1Accepted(
     let sessionId = explicitSessionId && isWechatSessionId(explicitSessionId)
       ? explicitSessionId
       : undefined
-    if (!sessionId && typeof parsed.sessionKey === "string") {
-      const match = /:webchat:dm:(wsess-[0-9a-f]{16})$/.exec(parsed.sessionKey)
-      if (match?.[1] && isWechatSessionId(match[1])) sessionId = match[1]
+    const explicitAgentId = typeof parsed.agentId === "string" && isSafeAgentId(parsed.agentId)
+      ? parsed.agentId
+      : undefined
+    let agentId = explicitAgentId
+    if (typeof parsed.sessionKey === "string") {
+      const match = /^agent:([^:]+):webchat:dm:(wsess-[0-9a-f]{16})$/.exec(parsed.sessionKey)
+      if (match?.[1] && isSafeAgentId(match[1]) && !agentId) agentId = match[1]
+      if (match?.[2] && isWechatSessionId(match[2]) && !sessionId) sessionId = match[2]
     }
     return {
       started: parsed.started !== false,
       runId: traceId,
       ...(sessionId ? { sessionId } : {}),
+      ...(agentId ? { agentId } : {}),
     }
   } catch {
     return { started: true, runId: fallbackRunId }
   }
+}
+
+function isSafeAgentId(s: string): boolean {
+  return /^[A-Za-z0-9_-]{1,128}$/.test(s)
 }
 
 function clamp(n: number, lo: number, hi: number): number {

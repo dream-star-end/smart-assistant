@@ -563,6 +563,40 @@ describe("inboundDispatcher — happy path", () => {
     })), [{ sessionId: originalSessionId, runId: "orig-run" }])
   })
 
+  test("Step1 routed agentId is persisted for web hello and /stop targets", async () => {
+    const { transport } = makeTransport([
+      {
+        status: 200,
+        bodyText: JSON.stringify({
+          ok: true,
+          started: true,
+          sessionKey: `agent:codex:webchat:dm:${FIXED_SESSION_ID}`,
+          agentId: "codex",
+          traceId: "codex-run",
+        }),
+      },
+    ])
+    const storage = makeStorageSpies()
+    const pg = makeFakePg({ pointer: null })
+    const d = makeInboundDispatcher(
+      makeDeps({
+        transport,
+        pgPool: pg.pg,
+        upsertMasterClientSession: storage.upsertMasterClientSession,
+        softDeleteMasterSession: storage.softDeleteMasterSession,
+      }),
+    )
+    const r = await d.dispatch(makeEvent({ agentId: "main" }))
+    assert.equal(r.kind, "dispatched")
+    assert.equal(storage.spy.upsertCalls[0]!.agentId, "codex")
+    assert.equal(pg.spy.setCalls[0]!.agentId, "codex")
+    assert.deepEqual(pg.spy.runningSetCalls.map((c) => ({
+      sessionId: c.sessionId,
+      runId: c.runId,
+      agentId: c.agentId,
+    })), [{ sessionId: FIXED_SESSION_ID, runId: "codex-run", agentId: "codex" }])
+  })
+
   test("deduplicated older wsess does not move an existing current pointer backwards", async () => {
     const oldDedupedSessionId = FIXED_SESSION_ID
     const currentSessionId = FIXED_SESSION_ID_2

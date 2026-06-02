@@ -202,3 +202,11 @@ test('dispatchInbound marks completed WeChat idempotency entries as no longer st
     'successful final must flip cached WeChat idempotency metadata to started:false so late Step1 retries do not recreate phantom running rows',
   )
 })
+
+test('WeChat Step1 start callback reports routed sessionKey and agentId', () => {
+  assert.match(
+    SERVER_TS,
+    /wechatDispatchStarted\(\{\s*traceId:\s*turnTraceId,\s*sessionKey,\s*agentId:\s*agent\.id,/,
+    'Step1 ACK must expose the post-routing sessionKey/agentId so master stores the same runner tuple used by Web hello and /stop',
+  )
+})

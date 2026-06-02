@@ -535,6 +535,7 @@ export class Gateway {
     wechat?: {
       sessionKey: string
       peerId: string
+      agentId: string
       started: boolean
       traceId?: string
     }
@@ -555,6 +556,7 @@ export class Gateway {
     wechat?: {
       sessionKey: string
       peerId: string
+      agentId: string
       started: boolean
       traceId?: string
     }
@@ -586,6 +588,7 @@ export class Gateway {
     wechat?: {
       sessionKey: string
       peerId: string
+      agentId: string
       started: boolean
       traceId?: string
     },
@@ -595,7 +598,7 @@ export class Gateway {
 
   private _updateWechatIdempotency(
     key: string,
-    patch: Partial<{ started: boolean; traceId: string }>,
+    patch: Partial<{ started: boolean; traceId: string; sessionKey: string; agentId: string }>,
   ): void {
     const entry = this._getIdempotencyEntry(key)
     if (!entry?.wechat) return
@@ -2823,6 +2826,7 @@ export class Gateway {
         started: originalWechat.started,
         sessionKey: originalWechat.sessionKey,
         sessionId: originalWechat.peerId,
+        agentId: originalWechat.agentId,
         ...(originalWechat.traceId ? { traceId: originalWechat.traceId } : {}),
       })
       return
@@ -2830,11 +2834,12 @@ export class Gateway {
     this._markIdempotencyKey(idempotencyKey, {
       sessionKey,
       peerId,
+      agentId: resolvedAgentId,
       started: false,
     })
     ;(frame as any)._idempotencyPreReserved = true
 
-    type WechatStartOutcome = { started: boolean; traceId?: string }
+    type WechatStartOutcome = { started: boolean; traceId?: string; sessionKey?: string; agentId?: string }
     let startSettled = false
     let resolveStart!: (value: WechatStartOutcome) => void
     let rejectStart!: (err: unknown) => void
@@ -2847,12 +2852,19 @@ export class Gateway {
       startSettled = true
       resolveStart(value)
     }
-    ;(frame as any)._wechatDispatchStarted = (info?: { traceId?: string }) => {
+    ;(frame as any)._wechatDispatchStarted = (info?: { traceId?: string; sessionKey?: string; agentId?: string }) => {
       this._updateWechatIdempotency(idempotencyKey, {
         started: true,
         ...(info?.traceId ? { traceId: info.traceId } : {}),
+        ...(info?.sessionKey ? { sessionKey: info.sessionKey } : {}),
+        ...(info?.agentId ? { agentId: info.agentId } : {}),
       })
-      settleStart({ started: true, ...(info?.traceId ? { traceId: info.traceId } : {}) })
+      settleStart({
+        started: true,
+        ...(info?.traceId ? { traceId: info.traceId } : {}),
+        ...(info?.sessionKey ? { sessionKey: info.sessionKey } : {}),
+        ...(info?.agentId ? { agentId: info.agentId } : {}),
+      })
     }
     const logAsyncDispatchFailure = (err: unknown) => {
       // A crash before dispatchInbound reaches its own failure cleanup should
@@ -2896,8 +2908,10 @@ export class Gateway {
       ok: true,
       accepted: true,
       started: startOutcome.started,
+      sessionKey: startOutcome.sessionKey ?? sessionKey,
+      sessionId: peerId,
+      ...(startOutcome.agentId ? { agentId: startOutcome.agentId } : {}),
       ...(startOutcome.traceId ? { traceId: startOutcome.traceId } : {}),
-      sessionKey,
     })
   }
 
@@ -6789,7 +6803,13 @@ export class Gateway {
     })
     const wechatDispatchStarted = (frame as any)._wechatDispatchStarted
     if (typeof wechatDispatchStarted === 'function') {
-      try { wechatDispatchStarted({ traceId: turnTraceId }) } catch {}
+      try {
+        wechatDispatchStarted({
+          traceId: turnTraceId,
+          sessionKey,
+          agentId: agent.id,
+        })
+      } catch {}
       delete (frame as any)._wechatDispatchStarted
     }
     const out: OutboundMessage = {
