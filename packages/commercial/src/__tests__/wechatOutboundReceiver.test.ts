@@ -205,7 +205,7 @@ function makeDeps(overrides: Partial<OutboundReceiverDeps> = {}): OutboundReceiv
     identityRepo: overrides.identityRepo ?? makeRepo(),
     pool: overrides.pool ?? (makeFakePool({ mode: "noop" }).pool),
     rateLimiter: overrides.rateLimiter ?? okRateLimiter,
-    getWechatShowToolCalls: overrides.getWechatShowToolCalls ?? (async () => true),
+    getWechatShowToolCalls: overrides.getWechatShowToolCalls ?? (async () => false),
     now: overrides.now ?? (() => 1_700_000_000_000),
     ...overrides,
   }
@@ -571,7 +571,7 @@ describe("outboundReceiver — enqueue outcome translation", () => {
     assert.deepEqual(spy.calls[0]!.payload, [{ type: "text", text: "查询中。完成。" }])
   })
 
-  test("tool preference lookup failure defaults to showing process blocks", async () => {
+  test("tool preference lookup failure defaults to hiding process blocks", async () => {
     const { pool, spy } = makeFakePool({ mode: "enqueue_queued", outboxId: 42 })
     const handler = makeOutboundReceiverHandler(
       makeDeps({
@@ -597,14 +597,53 @@ describe("outboundReceiver — enqueue outcome translation", () => {
     )
     assert.equal(rec.status, 202)
     assert.equal(spy.calls.length, 1)
-    assert.equal(spy.calls[0]!.payloadLen, 3)
+    assert.deepEqual(spy.calls[0]!.payload, [{ type: "text", text: "查询中。" }])
+  })
+
+  test("process parts are capped when a final answer exists so final text is delivered", async () => {
+    const { pool, spy } = makeFakePool({ mode: "enqueue_queued", outboxId: 42 })
+    const handler = makeOutboundReceiverHandler(
+      makeDeps({
+        pool,
+        getWechatShowToolCalls: async () => true,
+      }),
+    )
+    const { res, rec } = makeRes()
+    await handler(
+      authedReq(
+        validBody({
+          blocks: [
+            { kind: "thinking", text: "step one" },
+            { kind: "tool_use", toolName: "Bash", inputJson: { command: "echo 1" } },
+            { kind: "thinking", text: "step two" },
+            { kind: "tool_use", toolName: "Read", inputJson: { file_path: "/tmp/a" } },
+            { kind: "thinking", text: "step three" },
+            { kind: "tool_use", toolName: "Grep", inputJson: { pattern: "x" } },
+            { kind: "text", text: "🔧 最终答案" },
+          ],
+        }),
+      ),
+      res,
+      CTX,
+    )
+    assert.equal(rec.status, 202)
+    assert.equal(spy.calls.length, 1)
+    assert.equal(spy.calls[0]!.payloadLen, 5)
     assert.match(String((spy.calls[0]!.payload[0] as { text?: string }).text), /思考过程/)
-    assert.match(String((spy.calls[0]!.payload[2] as { text?: string }).text), /读取文件/)
+    assert.match(String((spy.calls[0]!.payload[1] as { text?: string }).text), /执行命令/)
+    assert.match(String((spy.calls[0]!.payload[2] as { text?: string }).text), /思考过程/)
+    assert.match(String((spy.calls[0]!.payload[3] as { text?: string }).text), /读取文件/)
+    assert.equal((spy.calls[0]!.payload[4] as { text?: string }).text, "🔧 最终答案")
   })
 
   test("duplicate thinking previews across outbound posts are dropped before enqueue", async () => {
     const { pool, spy } = makeFakePool({ mode: "enqueue_queued", outboxId: 42 })
-    const handler = makeOutboundReceiverHandler(makeDeps({ pool }))
+    const handler = makeOutboundReceiverHandler(
+      makeDeps({
+        pool,
+        getWechatShowToolCalls: async () => true,
+      }),
+    )
     const first = makeRes()
     await handler(
       authedReq(
