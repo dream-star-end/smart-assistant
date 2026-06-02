@@ -110,6 +110,93 @@ function normForCompare(s: string): string {
   return s.replace(/\s+/g, ' ').trim()
 }
 
+function normalizeLowInformationText(s: string): string {
+  return s
+    .toLowerCase()
+    .replace(/[\s"'`“”‘’「」『』（）()【】\[\]{}<>《》,，.。!！?？;；:：、~～_-]+/g, '')
+}
+
+const LOW_INFORMATION_CONTINUATION_TEXTS = new Set([
+  '继续',
+  '继续吧',
+  '继续做',
+  '继续处理',
+  '继续执行',
+  '继续跑',
+  '继续修',
+  '继续改',
+  '接着',
+  '接着吧',
+  '接着做',
+  '接着处理',
+  '往下',
+  '往下做',
+  '下一步',
+  '咋样',
+  '怎么样',
+  '如何',
+  '啥情况',
+  '什么情况',
+  '进展',
+  '有进展吗',
+  '好了没',
+  '好了么',
+  '好了吗',
+  '改好了吗',
+  '修好了吗',
+  '搞定了吗',
+  '完成了吗',
+  '做完了吗',
+  '行了吗',
+  '可以了吗',
+  'continue',
+  'goon',
+  'keepgoing',
+  'next',
+  'nextstep',
+  'done',
+  'status',
+  'update',
+  'anyupdate',
+  'howsitgoing',
+  'howisitgoing',
+])
+
+export function isLowInformationContinuationText(text: string): boolean {
+  const normalized = normalizeLowInformationText(text)
+  if (!normalized) return false
+
+  return (
+    LOW_INFORMATION_CONTINUATION_TEXTS.has(normalized) ||
+    /^继续(?:一下|下|看看|看下|看一下)$/.test(normalized) ||
+    /^接着(?:一下|下|看看|看下|看一下)$/.test(normalized)
+  )
+}
+
+export function shouldClarifyNonNativeResume(opts: {
+  channel: string
+  turns: number
+  hasNativeResumeId: boolean
+  userText: string
+}): boolean {
+  return (
+    opts.channel === 'webchat' &&
+    opts.turns > 0 &&
+    !opts.hasNativeResumeId &&
+    isLowInformationContinuationText(opts.userText)
+  )
+}
+
+function buildNonNativeResumeClarificationText(): string {
+  return [
+    '⚠️ 这个 Codex 会话刚被重置，当前 runner 不能原生恢复上一轮内部状态。',
+    '',
+    '像“继续 / 咋样 / 改好了吗”这类短指令在这种状态下不安全：模型只能看到一段历史摘要，可能会误把很久前的任务当成当前任务继续跑，前端也会看起来像无响应。',
+    '',
+    '请直接说明要继续的具体事项，例如：“继续修个人版这个会话无响应的问题，从当前 diff 开始”。',
+  ].join('\n')
+}
+
 export function buildHistoricalContextPrompt(
   messages: unknown[],
   currentUserText: string,
@@ -756,13 +843,36 @@ export class SessionManager {
         session.turns = await getMaxTurnIdx(ids)
       }
       let runnerPayload = userTextOrBlocks
-      if (
+      let recoveryNotice: SessionStreamEvent | null = null
+      const nativeResumeId = this._resumeIdFor(session.sessionKey, session.runnerProviderTag)
+      const shouldRecoverFromHistory =
         !session._historicalContextInjected &&
         session.channel === 'webchat' &&
         session.turns > 0 &&
         typeof userTextOrBlocks === 'string' &&
-        !this._resumeIdFor(session.sessionKey, session.runnerProviderTag)
-      ) {
+        !nativeResumeId
+      if (shouldRecoverFromHistory) {
+        if (
+          shouldClarifyNonNativeResume({
+            channel: session.channel,
+            turns: session.turns,
+            hasNativeResumeId: !!nativeResumeId,
+            userText: userTextOrBlocks,
+          })
+        ) {
+          const clarificationText = buildNonNativeResumeClarificationText()
+          log.info('clarified ambiguous non-native resume instead of submitting to runner', {
+            sessionKey: session.sessionKey,
+            provider: session.runnerProviderTag,
+            userText: userTextOrBlocks,
+          })
+          onEvent({
+            kind: 'block',
+            block: { kind: 'text', text: clarificationText },
+          })
+          onEvent({ kind: 'final' })
+          return
+        }
         try {
           const clientSession = await getClientSession(session.peerId, session.userId)
           const historicalPrompt = clientSession
@@ -770,6 +880,13 @@ export class SessionManager {
             : null
           if (historicalPrompt) {
             runnerPayload = historicalPrompt
+            recoveryNotice = {
+              kind: 'block',
+              block: {
+                kind: 'text',
+                text: '🔄 此会话无法原生恢复，正在用最近历史恢复上下文…\n',
+              },
+            }
             session._historicalContextInjected = true
             log.info('injected historical context for provider switch / non-native resume', {
               sessionKey: session.sessionKey,
@@ -825,6 +942,7 @@ export class SessionManager {
           }
         }, CHECK_INTERVAL)
       })
+      if (recoveryNotice) eventGate.emit(recoveryNotice)
       turnPromise = this.runOneTurnWithRetry(session, runnerPayload, eventGate.emit)
       try {
         await Promise.race([turnPromise, livenessPromise])

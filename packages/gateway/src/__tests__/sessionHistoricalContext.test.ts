@@ -10,6 +10,8 @@ import {
   SessionManager,
   buildHistoricalContextPrompt,
   getLivenessIdleTimeoutMs,
+  isLowInformationContinuationText,
+  shouldClarifyNonNativeResume,
 } from '../sessionManager.js'
 import { CodexAppServerRunner } from '../codexAppServerRunner.js'
 
@@ -54,6 +56,82 @@ test('buildHistoricalContextPrompt ignores non-chat/system messages', () => {
   assert.ok(prompt)
   assert.doesNotMatch(prompt!, /hidden|system notice/)
   assert.match(prompt!, /User: visible/)
+})
+
+test('isLowInformationContinuationText detects ambiguous continuation and status prompts', () => {
+  for (const text of [
+    '继续',
+    '继续吧',
+    '接着做',
+    '咋样？',
+    '怎么样',
+    '改好了吗',
+    '修好了吗',
+    'status?',
+    'done?',
+    'keep going',
+  ]) {
+    assert.equal(isLowInformationContinuationText(text), true, text)
+  }
+})
+
+test('isLowInformationContinuationText keeps substantive continuation prompts runnable', () => {
+  for (const text of [
+    '继续修 outbox backoff，从当前 diff 开始',
+    '继续调查 mpvektqt-5a2t6d5c 为什么前端无响应',
+    '修好这个会话无响应的根因',
+    'what is the status of session mpvektqt-5a2t6d5c?',
+  ]) {
+    assert.equal(isLowInformationContinuationText(text), false, text)
+  }
+})
+
+test('shouldClarifyNonNativeResume only guards ambiguous webchat non-native resumes', () => {
+  assert.equal(
+    shouldClarifyNonNativeResume({
+      channel: 'webchat',
+      turns: 12,
+      hasNativeResumeId: false,
+      userText: '继续',
+    }),
+    true,
+  )
+  assert.equal(
+    shouldClarifyNonNativeResume({
+      channel: 'webchat',
+      turns: 12,
+      hasNativeResumeId: true,
+      userText: '继续',
+    }),
+    false,
+  )
+  assert.equal(
+    shouldClarifyNonNativeResume({
+      channel: 'telegram',
+      turns: 12,
+      hasNativeResumeId: false,
+      userText: '继续',
+    }),
+    false,
+  )
+  assert.equal(
+    shouldClarifyNonNativeResume({
+      channel: 'webchat',
+      turns: 0,
+      hasNativeResumeId: false,
+      userText: '继续',
+    }),
+    false,
+  )
+  assert.equal(
+    shouldClarifyNonNativeResume({
+      channel: 'webchat',
+      turns: 12,
+      hasNativeResumeId: false,
+      userText: '继续修 outbox backoff，从当前 diff 开始',
+    }),
+    false,
+  )
 })
 
 test('getLivenessIdleTimeoutMs gives context compaction its own budget', () => {
@@ -231,6 +309,27 @@ test('SessionManager idle timeout hard-resets codex app-server and suppresses la
   } finally {
     mock.timers.reset()
   }
+})
+
+test('SessionManager clarifies ambiguous non-native resume without submitting to runner', async () => {
+  const manager = new SessionManager({} as any)
+  const runner = new HangingCodexAppServerRunner()
+  const session = makeTestSession(runner)
+  session._historicalContextInjected = false
+  const turnsBefore = session.turns
+  const events: any[] = []
+
+  await manager.submit(session, '继续', (e) => events.push(e))
+
+  assert.deepEqual(
+    events.map((e) => e.kind),
+    ['block', 'final'],
+  )
+  assert.match(events[0].block.text, /不能原生恢复上一轮内部状态/)
+  assert.match(events[0].block.text, /请直接说明要继续的具体事项/)
+  assert.deepEqual(runner.submissions, [])
+  assert.equal(session.turns, turnsBefore)
+  assert.equal(session._historicalContextInjected, false)
 })
 
 test('SessionManager codex app-server idle timeout ignores raw internal activity without visible events', async () => {
