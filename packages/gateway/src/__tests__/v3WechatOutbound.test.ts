@@ -670,6 +670,25 @@ describe("makeV3WechatOutboundAdapter — wire payload assembly", () => {
     assert.equal(messagePayload(q.enqueued[0]!).outboundId, "trace_abc123def4567890")
   })
 
+  test("explicit outboundId overrides traceId and preserves traceId in payload", async () => {
+    const q = fakeQueue()
+    const adapter = makeV3WechatOutboundAdapter({
+      config: CFG,
+      retryQueue: q,
+      attemptSendImpl: async () => {
+        throw new V3WechatSinkError("503", "transient", 503)
+      },
+    })
+    await adapter.init!(makeCtx())
+    await adapter.send!(makeOut({
+      traceId: "trace_abc123def4567890",
+      outboundId: "trace_abc123def4567890.wxlive.1.final",
+    } as any))
+    const payload = messagePayload(q.enqueued[0]!)
+    assert.equal(payload.outboundId, "trace_abc123def4567890.wxlive.1.final")
+    assert.equal(payload.traceId, "trace_abc123def4567890")
+  })
+
   test("traceId absent → outboundId derived from sessionId + ts + rand", async () => {
     const q = fakeQueue()
     const adapter = makeV3WechatOutboundAdapter({

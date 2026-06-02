@@ -290,10 +290,15 @@ function buildWirePayload(
     return { error: "blocks must be non-empty" }
   }
 
-  // outboundId:per-call 唯一。优先 traceId(per-turn canonical),否则 sessionId
-  // + ms + rand。两种都满足 OUTBOUND_ID_RE [A-Za-z0-9._:-]{8,128}。
+  // outboundId:per-call 唯一。Live WeChat may send several messages for the
+  // same turn, so gateway can pass an explicit per-message outboundId.  Fall
+  // back to the historical traceId behavior for one-shot final sends, then to
+  // sessionId + ms + rand.  All accepted forms satisfy master's regex.
+  const explicitOutboundId = (out as unknown as { outboundId?: unknown }).outboundId
   let outboundId: string
-  if (out.traceId && OUTBOUND_ID_RE.test(out.traceId)) {
+  if (typeof explicitOutboundId === "string" && OUTBOUND_ID_RE.test(explicitOutboundId)) {
+    outboundId = explicitOutboundId
+  } else if (out.traceId && OUTBOUND_ID_RE.test(out.traceId)) {
     outboundId = out.traceId
   } else {
     const rand = randomBytes(6).toString("hex")

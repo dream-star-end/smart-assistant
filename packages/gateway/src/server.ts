@@ -118,6 +118,10 @@ import type { CodexProviderConfigOverride } from './codexRunner.js'
 // to codex-cli's own internal refresh anyway.
 const CLAUDE_OAUTH_USER_AGENT = `claude-cli/${process.env.OPENCLAUDE_CC_VERSION_FOR_OAUTH || '2.1.888'} (external, cli)`
 
+const V3_WECHAT_OUTBOUND_ADAPTER_ID = 'v3-wechat-outbound'
+const WECHAT_LIVE_THINKING_FLUSH_MS = 2_000
+const WECHAT_LIVE_THINKING_PAYLOAD_CHARS = 4_000
+
 /**
  * 协议级允许的 InboundMessage.model 值(2026-04-26 v1.0.4 加)。
  *
@@ -6571,10 +6575,75 @@ export class Gateway {
     // Private userId stamp for deliver() — must be stripped before sending.
     // Fixed in deliver() via destructure so this never reaches the wire.
     ;(out as any)._userId = activeUserId
-    // Adapters (Telegram/WeChat/Feishu) can't take 30 small messages per second.
-    // Accumulate all blocks and send a single message at final.
-    // WebChat (no adapter) keeps streaming via WS broadcast.
+    // Most adapters (Telegram / Feishu / legacy WeChat) can't take 30 small
+    // messages per second, so they keep the historical "aggregate and send on
+    // final" behavior.  The v3 WeChat broker is special: users expect process
+    // bubbles (thinking/tool announcements) while the agent is still running.
+    // Text still waits for final so Markdown is rendered by the v1.0.254 smart
+    // chunker instead of being split into token-sized WeChat messages.
     const aggregatedBlocks: typeof out.blocks = []
+    const liveWechatAdapter = adapter?.id === V3_WECHAT_OUTBOUND_ADAPTER_ID
+    let liveWechatSendQueue: Promise<void> = Promise.resolve()
+    let liveWechatSeq = 0
+    let liveThinkingBuffer = ''
+    let liveThinkingLastFlushAt = 0
+    const liveToolBlockIdsSent = new Set<string>()
+    const liveOutboundBase =
+      turnTraceId.replace(/[^A-Za-z0-9._:-]/g, '').slice(0, 80) ||
+      `wechat${Date.now().toString(36)}`
+
+    const addAggregatedBlock = (block: (typeof out.blocks)[number]) => {
+      const blockWithId = block as any
+      if (blockWithId.blockId) {
+        const idx = aggregatedBlocks.findIndex((x: any) => x.blockId === blockWithId.blockId)
+        if (idx >= 0) aggregatedBlocks[idx] = block
+        else aggregatedBlocks.push(block)
+      } else {
+        aggregatedBlocks.push(block)
+      }
+    }
+
+    const nextLiveWechatOutboundId = (kind: string): string => {
+      const safeKind = kind.replace(/[^A-Za-z0-9_-]/g, '').slice(0, 24) || 'msg'
+      return `${liveOutboundBase}.wxlive.${(++liveWechatSeq).toString(36)}.${safeKind}`
+    }
+
+    const enqueueLiveWechatMessage = (blocks: typeof out.blocks, isFinal: boolean, kind: string, meta?: any) => {
+      if (!adapter || blocks.length === 0) return
+      const msg = {
+        ...out,
+        blocks: blocks.slice(),
+        isFinal,
+        ...(meta !== undefined ? { meta } : {}),
+        outboundId: nextLiveWechatOutboundId(kind),
+      } as OutboundMessage & { outboundId: string }
+      // `deliver(..., adapter)` is intentionally fire-and-forget.  Live WeChat
+      // sends need stronger ordering: process₁ → process₂ → final must enqueue
+      // at master in that order, otherwise the old "final then replay process"
+      // symptom can still happen under HTTP/DB scheduling jitter.
+      liveWechatSendQueue = liveWechatSendQueue.then(async () => {
+        try {
+          await this._sendAdapterOutboundMessage(msg, adapter)
+        } catch (err) {
+          this.log.error('adapter send failed', { channel: adapter.name }, err)
+        }
+      })
+    }
+
+    const flushLiveThinking = (force = false) => {
+      if (!liveWechatAdapter || liveThinkingBuffer.length === 0) return
+      const now = Date.now()
+      if (!force && liveThinkingLastFlushAt > 0 && now - liveThinkingLastFlushAt < WECHAT_LIVE_THINKING_FLUSH_MS) {
+        return
+      }
+      let text = liveThinkingBuffer
+      liveThinkingBuffer = ''
+      liveThinkingLastFlushAt = now
+      if (text.length > WECHAT_LIVE_THINKING_PAYLOAD_CHARS) {
+        text = `${text.slice(0, WECHAT_LIVE_THINKING_PAYLOAD_CHARS)}…`
+      }
+      enqueueLiveWechatMessage([{ kind: 'thinking' as const, text } as any], false, 'thinking')
+    }
 
     // ── Multimodal handling ──
     // Save all uploaded media to local disk and inject descriptive prompt hints
@@ -6966,15 +7035,42 @@ export class Gateway {
           }
         }
 
-        if (adapter) {
-          // For partial tool_use blocks, replace any prior block with same blockId
-          if (b.blockId) {
-            const idx = aggregatedBlocks.findIndex((x: any) => x.blockId === b.blockId)
-            if (idx >= 0) aggregatedBlocks[idx] = e.block
-            else aggregatedBlocks.push(e.block)
-          } else {
-            aggregatedBlocks.push(e.block)
+        if (liveWechatAdapter) {
+          const parentToolUseId = typeof b.parentToolUseId === 'string' ? b.parentToolUseId : ''
+          if (parentToolUseId.length > 0) {
+            flushLiveThinking(true)
+            return
           }
+          if (b.kind === 'thinking') {
+            liveThinkingBuffer += typeof b.text === 'string' ? b.text : ''
+            flushLiveThinking(false)
+            return
+          }
+          if (b.kind === 'tool_use') {
+            flushLiveThinking(true)
+            const blockId = typeof b.blockId === 'string' ? b.blockId : ''
+            if (blockId.length > 0) {
+              if (liveToolBlockIdsSent.has(blockId)) return
+              liveToolBlockIdsSent.add(blockId)
+            }
+            enqueueLiveWechatMessage([e.block], false, 'tool')
+            return
+          }
+          if (b.kind === 'tool_result') {
+            flushLiveThinking(true)
+            return
+          }
+          if (b.kind === 'text') {
+            flushLiveThinking(true)
+            addAggregatedBlock(e.block)
+            return
+          }
+          // Unknown future top-level block: preserve the historical adapter
+          // behavior by keeping it for the final render rather than dropping it.
+          flushLiveThinking(true)
+          addAggregatedBlock(e.block)
+        } else if (adapter) {
+          addAggregatedBlock(e.block)
         } else {
           // WebChat: stream each block immediately via WS
           out.blocks.push(e.block)
@@ -6993,14 +7089,23 @@ export class Gateway {
           // 也按 failed 记账,idempotency key 释放允许 client retry。
           this._runLog.complete(_run, { status: 'failed', error: _apiErrorText })
           if (frame.idempotencyKey) this._seenIdempotencyKeys.delete(frame.idempotencyKey)
-          this.deliver(
-            {
-              ...out,
-              blocks: [{ kind: 'text', text: `[error] ${_apiErrorText}` }],
-              isFinal: true,
-            },
-            adapter,
-          )
+          flushLiveThinking(true)
+          if (liveWechatAdapter) {
+            enqueueLiveWechatMessage(
+              [{ kind: 'text', text: `[error] ${_apiErrorText}` } as any],
+              true,
+              'error',
+            )
+          } else {
+            this.deliver(
+              {
+                ...out,
+                blocks: [{ kind: 'text', text: `[error] ${_apiErrorText}` }],
+                isFinal: true,
+              },
+              adapter,
+            )
+          }
           // 跨 turn message listener 仍持有这个闭包(供 bg-bash tail 转发),
           // 不清空数组的话,API_ERROR 前已聚合的 block 会被钉到下次 turn 替换 listener。
           out.blocks.length = 0
@@ -7014,7 +7119,15 @@ export class Gateway {
           outputTokens: e.meta?.outputTokens,
           turn: e.meta?.turn,
         })
-        if (adapter) {
+        flushLiveThinking(true)
+        if (liveWechatAdapter) {
+          // Process blocks were already sent live.  Final must contain only the
+          // remaining assistant text/non-live blocks, otherwise WeChat replays
+          // the whole process after the answer.
+          if (aggregatedBlocks.length > 0) {
+            enqueueLiveWechatMessage(aggregatedBlocks.slice(), true, 'final', e.meta)
+          }
+        } else if (adapter) {
           // adapter.send() 是 async,内部可能在 await 之后才读 wire.blocks。
           // 如果直接传 aggregatedBlocks,接着同步清空数组,adapter 读到的就是空。
           // 拷贝一份脱钩本地引用。
@@ -7167,19 +7280,39 @@ export class Gateway {
           }
           this.deliver(errFrame, adapter)
         }
-        this.deliver(
-          {
-            ...out,
-            blocks: [{ kind: 'text', text: `[error] ${e.error}` }],
-            isFinal: true,
-          },
-          adapter,
-        )
+        flushLiveThinking(true)
+        if (liveWechatAdapter) {
+          enqueueLiveWechatMessage(
+            [{ kind: 'text', text: `[error] ${e.error}` } as any],
+            true,
+            'error',
+          )
+        } else {
+          this.deliver(
+            {
+              ...out,
+              blocks: [{ kind: 'text', text: `[error] ${e.error}` }],
+              isFinal: true,
+            },
+            adapter,
+          )
+        }
       }
     }, safeEffortLevel, safeModel, safeRequestId, turnTraceId, effectiveConversationMode, {
       historicalMessages: masterHistoricalMessages,
       codexRoute: safeCodexRoute,
     })
+    if (liveWechatAdapter) {
+      await liveWechatSendQueue
+    }
+  }
+
+  private async _sendAdapterOutboundMessage(
+    out: OutboundMessage,
+    adapter: ChannelAdapter,
+  ): Promise<void> {
+    const { wire } = _stripPrivateRoutingFields(out as unknown as Record<string, unknown>)
+    await adapter.send(wire as unknown as OutboundMessage)
   }
 
   /**
