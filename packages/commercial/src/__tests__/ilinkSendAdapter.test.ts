@@ -16,10 +16,61 @@ import * as assert from "node:assert/strict"
 import { describe, it } from "node:test"
 
 import {
+  classifyIlinkBusinessAck,
   classifyIlinkError,
   makeIlinkSendAdapter,
   makeIlinkSendMediaAdapter,
 } from "../wechat/ilinkSendAdapter.js"
+
+describe("classifyIlinkBusinessAck", () => {
+  it("treats missing business fields as success for backward compatibility", () => {
+    assert.deepEqual(classifyIlinkBusinessAck(undefined), { ok: true })
+    assert.deepEqual(classifyIlinkBusinessAck({ data: { id: "m-1" } }), { ok: true })
+  })
+
+  it("accepts explicit zero and success status values", () => {
+    assert.deepEqual(classifyIlinkBusinessAck({ errno: 0 }), { ok: true })
+    assert.deepEqual(classifyIlinkBusinessAck({ errcode: "0" }), { ok: true })
+    assert.deepEqual(classifyIlinkBusinessAck({ error_code: 0, status: "success" }), { ok: true })
+    assert.deepEqual(classifyIlinkBusinessAck({ result: "ok" }), { ok: true })
+    assert.deepEqual(classifyIlinkBusinessAck({ state: "succeeded" }), { ok: true })
+  })
+
+  it("classifies strict non-zero business error fields as transient failure", () => {
+    const r = classifyIlinkBusinessAck({ errno: 45009, errmsg: "rate limit" })
+    assert.equal(r.ok, false)
+    assert.equal(r.permanent, false)
+    assert.equal(r.errMessage, "rate limit")
+    assert.equal(r.reasonField, "errno")
+    assert.equal(r.reasonValue, 45009)
+  })
+
+  it("classifies explicit failing status strings as transient failure", () => {
+    const r = classifyIlinkBusinessAck({ status: "failed", message: "send rejected" })
+    assert.equal(r.ok, false)
+    assert.equal(r.permanent, false)
+    assert.equal(r.errMessage, "send rejected")
+    assert.equal(r.reasonField, "status")
+  })
+
+  it("does not treat broad code/ret values as failure unless paired with failing status", () => {
+    assert.deepEqual(classifyIlinkBusinessAck({ code: 200, message: "OK" }), { ok: true })
+    assert.deepEqual(classifyIlinkBusinessAck({ ret: 1, message: "queued" }), { ok: true })
+
+    const r = classifyIlinkBusinessAck({ code: 123, status: "error", message: "business rejected" })
+    assert.equal(r.ok, false)
+    assert.equal(r.permanent, false)
+    assert.equal(r.errMessage, "business rejected")
+  })
+
+  it("classifies broad code/ret fields when paired with strong error message fields", () => {
+    const r = classifyIlinkBusinessAck({ ret: "2", errmsg: "send limit reached" })
+    assert.equal(r.ok, false)
+    assert.equal(r.permanent, false)
+    assert.equal(r.errMessage, "send limit reached")
+    assert.equal(r.reasonField, "ret")
+  })
+})
 
 describe("classifyIlinkError", () => {
   it("classifies permanent statuses (401/403/404/410)", () => {
@@ -108,6 +159,26 @@ describe("makeIlinkSendMediaAdapter", () => {
     ])
   })
 
+  it("business error response returns transient failure for media", async () => {
+    const adapter = makeIlinkSendMediaAdapter({
+      sendIlinkMedia: async () => ({ errcode: "93000", errmsg: "media rejected" }),
+    })
+    const r = await adapter({
+      botToken: "x",
+      toUserId: "y",
+      contextToken: "z",
+      media: {
+        kind: "file",
+        filename: "report.pdf",
+        content: Buffer.from("%PDF"),
+      },
+    })
+    assert.equal(r.ok, false)
+    if (r.ok) return
+    assert.equal(r.permanent, false)
+    assert.equal(r.errMessage, "media rejected")
+  })
+
   it("classifies media send errors and never throws upward", async () => {
     const adapter = makeIlinkSendMediaAdapter({
       sendIlinkMedia: async () => {
@@ -154,6 +225,25 @@ describe("makeIlinkSendAdapter", () => {
       contextToken: "ctx-1",
       text: "hello",
     })
+  })
+
+  it("business success response returns {ok:true} for text", async () => {
+    const adapter = makeIlinkSendAdapter({
+      sendIlinkText: async () => ({ errno: "0", status: "success" }),
+    })
+    const r = await adapter({ botToken: "x", toUserId: "y", contextToken: "z", text: "t" })
+    assert.deepEqual(r, { ok: true })
+  })
+
+  it("business error response returns transient failure for text", async () => {
+    const adapter = makeIlinkSendAdapter({
+      sendIlinkText: async () => ({ error_code: 47001, message: "bad request" }),
+    })
+    const r = await adapter({ botToken: "x", toUserId: "y", contextToken: "z", text: "t" })
+    assert.equal(r.ok, false)
+    if (r.ok) return
+    assert.equal(r.permanent, false)
+    assert.equal(r.errMessage, "bad request")
   })
 
   it("permanent error: iLink HTTP 401 → {ok:false, permanent:true}", async () => {
