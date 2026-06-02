@@ -2959,7 +2959,12 @@ export class Gateway {
       }
     }
     const dispatchPromise = this.dispatchInbound(frame as InboundFrame, v3OutboundAdapter)
-      .then(() => settleStart({ started: false }))
+      .then(() => {
+        if (!startSettled) {
+          startSettled = true
+          rejectStart(new Error('dispatch completed before WeChat runner start'))
+        }
+      })
       .catch((err) => {
         if (!startSettled) {
           startSettled = true
@@ -7380,7 +7385,6 @@ export class Gateway {
           if (b.kind === 'text') {
             addAggregatedBlock(e.block)
           }
-          out.blocks.push(e.block)
           this.deliver({ ...out, blocks: [e.block], isFinal: false }, undefined)
         } else if (adapter) {
           addAggregatedBlock(e.block)

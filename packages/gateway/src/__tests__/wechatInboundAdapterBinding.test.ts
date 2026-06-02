@@ -278,6 +278,29 @@ test('duplicate WeChat Step1 ACK returns the cached routed wsess', () => {
   )
 })
 
+test('pre-start dispatch exits reject Step1 instead of creating started:false ghost sessions', () => {
+  assert.doesNotMatch(
+    handleWechatInbound,
+    /\.then\(\(\)\s*=>\s*settleStart\(\{\s*started:\s*false\s*\}\)\s*\)/,
+    'pre-start rate-limit/model rejects must not be acknowledged as accepted wsess sessions',
+  )
+  assert.match(
+    handleWechatInbound,
+    /dispatch completed before WeChat runner start/,
+    'if dispatchInbound returns before the start callback, Step1 must fail so master does not persist a ghost realtime link',
+  )
+})
+
+test('live WeChat stream does not retain every process block until final', () => {
+  const liveBranch = /if \(liveWechatAdapter\) \{([\s\S]*?)\n\s*\} else if \(adapter\)/.exec(SERVER_TS)
+  assert.ok(liveBranch?.[1], 'live WeChat branch must be present in dispatchInbound block handler')
+  assert.doesNotMatch(
+    liveBranch[1],
+    /out\.blocks\.push/,
+    'the realtime-link branch already delivers each block to Web and must not retain the whole stream in out.blocks for multi-hour tasks',
+  )
+})
+
 test('post-start async dispatch failures emit a terminal error to Web and WeChat', () => {
   assert.match(
     handleWechatInbound,
