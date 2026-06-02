@@ -423,6 +423,19 @@ function _isEmptyPristineSession(sess) {
     (!sess.title || sess.title === '新会话')
 }
 
+function _applyBootRequestedSessionIfPresent() {
+  if (!_bootRequestedSessionId) return false
+  if (!state.sessions.has(_bootRequestedSessionId)) return false
+  const requestedSessionId = _bootRequestedSessionId
+  _bootRequestedSessionId = null
+  const currentChanged = state.currentSessionId !== requestedSessionId
+  state.currentSessionId = requestedSessionId
+  try {
+    refreshWebchatHelloForCurrentSession()
+  } catch {}
+  return currentChanged
+}
+
 function _selectSessionAfterServerSync() {
   const current = state.currentSessionId ? state.sessions.get(state.currentSessionId) : null
   const currentIsBootPlaceholder = _isEmptyBootPlaceholder(current)
@@ -436,17 +449,8 @@ function _selectSessionAfterServerSync() {
     !state.currentSessionId ||
     !state.sessions.has(state.currentSessionId)
   let currentChanged = false
-  if (_bootRequestedSessionId && state.sessions.has(_bootRequestedSessionId)) {
-    const requestedSessionId = _bootRequestedSessionId
-    _bootRequestedSessionId = null
-    if (state.currentSessionId !== requestedSessionId) {
-      state.currentSessionId = requestedSessionId
-      currentChanged = true
-      try {
-        refreshWebchatHelloForCurrentSession()
-      } catch {}
-    }
-    return { currentChanged, updated }
+  if (_applyBootRequestedSessionIfPresent()) {
+    return { currentChanged: true, updated }
   }
   if (shouldSelect) {
     // Prefer a real conversation over pre-existing empty "新会话" rows that
@@ -3106,6 +3110,7 @@ async function init() {
   const arr = [...state.sessions.values()].sort((a, b) => b.lastAt - a.lastAt)
   if (arr.length > 0) state.currentSessionId = arr[0].id
   else createSession(undefined, { bootPlaceholder: !!state.token })
+  _applyBootRequestedSessionIfPresent()
 
   // ─────────────────────────────────────────────────────────────────
   // SSO oauthCallback boot 分支 — 必须在 state.token 检查之前

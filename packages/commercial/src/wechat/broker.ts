@@ -610,7 +610,7 @@ export function makeWechatBroker(deps: BrokerDeps): WechatBroker {
           ? "执行环境暂时异常，请稍后重试。"
           : "执行环境拒绝了这条消息，请稍后重试或在网页端查看。"
       case "step2_failed":
-        return "消息处理初始化失败，会话状态没有保存成功。请稍后重试。"
+        return "消息已送到执行环境，但微信会话状态保存失败；请不要重复发送同一任务。若任务完成且回传成功，我会把最终结果发到微信；否则请打开网页端检查。"
       case "tunnel_unsupported":
         return "当前容器连接方式暂不支持微信调度，请在网页端继续。"
       case "command_echo":

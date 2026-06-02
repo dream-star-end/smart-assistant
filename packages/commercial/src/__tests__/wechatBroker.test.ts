@@ -733,6 +733,24 @@ describe("wechatBroker — onInbound", () => {
     assert.doesNotMatch(sendSpy.calls[0]!.text, /实时过程/)
   })
 
+  test("dispatcher step2_failed warns without prompting duplicate retry", async () => {
+    const { sendText, spy: sendSpy } = makeSendText({ ok: true })
+    const { dispatcher } = makeDispatcher({
+      kind: "step2_failed",
+      phase: "pg_pointer",
+      compensation: "skipped_reuse",
+      errMessage: "pg down after container accepted",
+    })
+    const broker = makeWechatBroker(makeDeps({ dispatcher, sendText }))
+    const r = await broker.onInbound(makeEvent({ text: "long task" }))
+    assert.equal(r.kind, "step2_failed")
+    await flushMicrotasks()
+    assert.equal(sendSpy.calls.length, 1)
+    assert.match(sendSpy.calls[0]!.text, /请不要重复发送同一任务/)
+    assert.doesNotMatch(sendSpy.calls[0]!.text, /稍后重试/)
+    assert.doesNotMatch(sendSpy.calls[0]!.text, /实时过程/)
+  })
+
   test("broker-local /stop delegates normalized binding id to dispatcher.stop and reflects result", async () => {
     const { sendText, spy: sendSpy } = makeSendText({ ok: true })
     const { dispatcher, spy: dispSpy } = makeDispatcher({
