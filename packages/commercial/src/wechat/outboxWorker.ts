@@ -36,6 +36,8 @@ import { MASTER_USER_PREFIX } from './userIds.js'
 
 export const DEFAULT_INTER_PART_DELAY_MS = 1000
 export const DEFAULT_INTER_ROW_DELAY_MS = DEFAULT_INTER_PART_DELAY_MS
+export const DEFAULT_TRANSIENT_BACKOFF_BASE_MS = 5000
+export const DEFAULT_TRANSIENT_BACKOFF_MAX_MS = 60_000
 
 /** sendText 实装返回。permanent → broker 立即 force-fail 不复活;否则按 attempts cap 兜底。 */
 export interface SendResult {
@@ -89,6 +91,9 @@ export interface OutboxWorkerOptions {
   delay?: DelayFn
   /** 注入 now 便于测试。默认 Date.now。 */
   now?: () => number
+  /** transient iLink failure backoff. Default: 5s, 10s, 20s, 40s, then 60s cap. */
+  transientBackoffBaseMs?: number
+  transientBackoffMaxMs?: number
 }
 
 /** 单条 outbox row 出站结果分类(测试 & 调用方观测用)。 */
@@ -120,6 +125,7 @@ async function forceFail(
        attempts   = GREATEST(attempts + 1, $1),
        last_error = $2,
        locked_at  = NULL,
+       next_attempt_at = NULL,
        updated_at = $3
      WHERE id = $4 AND status = 'sending'`,
     [maxAttempts, truncErr, now, id],
@@ -143,6 +149,8 @@ export async function drainOne(
     maxAttempts: number
     interPartDelayMs?: number
     delay?: DelayFn
+    transientBackoffBaseMs?: number
+    transientBackoffMaxMs?: number
   },
 ): Promise<DrainOutcome> {
   const { pool, sendText, sendMedia, resolveMediaPart, getBinding, now, maxAttempts } = deps
@@ -211,7 +219,16 @@ export async function drainOne(
           ? { kind: 'failed_permanent', outboxId: row.id, reason: errMsg }
           : { kind: 'noop', outboxId: row.id, reason: 'permanent_fail_but_row_drifted' }
       }
-      const r = await markFailed(pool, row.id, errMsg, now(), maxAttempts)
+      const failureNow = now()
+      const attemptsAfterFailure = row.attempts + 1
+      const nextAttemptAt =
+        attemptsAfterFailure >= maxAttempts
+          ? null
+          : computeTransientNextAttemptAt(failureNow, attemptsAfterFailure, {
+              baseMs: deps.transientBackoffBaseMs,
+              maxMs: deps.transientBackoffMaxMs,
+            })
+      const r = await markFailed(pool, row.id, errMsg, failureNow, maxAttempts, nextAttemptAt)
       if (!r) return { kind: 'noop', outboxId: row.id, reason: 'markFailed_drift' }
       return r.permanent
         ? { kind: 'failed_terminal', outboxId: row.id, attempts: r.attempts, errMessage: errMsg }
@@ -297,6 +314,8 @@ export class OutboxWorker {
       interRowDelayMs: options.interRowDelayMs ?? DEFAULT_INTER_ROW_DELAY_MS,
       delay: options.delay ?? defaultDelay,
       now: options.now ?? Date.now,
+      transientBackoffBaseMs: options.transientBackoffBaseMs ?? DEFAULT_TRANSIENT_BACKOFF_BASE_MS,
+      transientBackoffMaxMs: options.transientBackoffMaxMs ?? DEFAULT_TRANSIENT_BACKOFF_MAX_MS,
     }
   }
 
@@ -398,4 +417,16 @@ function defaultLog(level: 'info' | 'warn' | 'error', message: string): void {
 
 function defaultDelay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+export function computeTransientNextAttemptAt(
+  now: number,
+  attemptsAfterFailure: number,
+  opts: { baseMs?: number; maxMs?: number } = {},
+): number {
+  const baseMs = opts.baseMs ?? DEFAULT_TRANSIENT_BACKOFF_BASE_MS
+  const maxMs = opts.maxMs ?? DEFAULT_TRANSIENT_BACKOFF_MAX_MS
+  const exp = Math.max(0, attemptsAfterFailure - 1)
+  const delayMs = Math.min(maxMs, baseMs * 2 ** exp)
+  return now + delayMs
 }

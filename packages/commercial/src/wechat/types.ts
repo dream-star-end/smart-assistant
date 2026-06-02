@@ -63,6 +63,7 @@ export interface OutboxRow {
   lastError: string | null
   lockedAt: number | null
   sentAt: number | null
+  nextAttemptAt: number | null
   createdAt: number
   updatedAt: number
 }

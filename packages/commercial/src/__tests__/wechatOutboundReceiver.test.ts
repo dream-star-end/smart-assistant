@@ -636,16 +636,19 @@ describe("outboundReceiver — enqueue outcome translation", () => {
     assert.equal(spy.calls.length, 1, "second duplicate thinking preview should not enqueue")
   })
 
-  test("live thinking status placeholder is not deduped across turns", async () => {
+  test("different detailed thinking chunks across outbound posts are not content-deduped", async () => {
     const { pool, spy } = makeFakePool({ mode: "enqueue_queued", outboxId: 42 })
     const handler = makeOutboundReceiverHandler(makeDeps({ pool }))
-    for (const outboundId of ["ob-thinking-status-1", "ob-thinking-status-2"]) {
+    for (const [outboundId, text] of [
+      ["ob-thinking-detail-1", "正在思考第一步"],
+      ["ob-thinking-detail-2", "正在思考第二步"],
+    ] as const) {
       const r = makeRes()
       await handler(
         authedReq(
           validBody({
             outboundId,
-            blocks: [{ kind: "thinking", text: "正在思考…" }],
+            blocks: [{ kind: "thinking", text }],
           }),
         ),
         r.res,
@@ -655,8 +658,8 @@ describe("outboundReceiver — enqueue outcome translation", () => {
     }
     assert.equal(spy.calls.length, 2)
     assert.deepEqual(spy.calls.map((c) => (c.payload[0] as { text?: string }).text), [
-      "💭 思考过程：\n正在思考…",
-      "💭 思考过程：\n正在思考…",
+      "💭 思考过程：\n正在思考第一步",
+      "💭 思考过程：\n正在思考第二步",
     ])
   })
 
@@ -957,24 +960,30 @@ describe("renderWechatBlocks pure function", () => {
     assert.equal(r.dropped, 1)
   })
 
-  test("thinking blocks → coalesced bounded process preview", () => {
+  test("thinking blocks → coalesced detailed process transcript", () => {
     const r = renderWechatBlocks([
       { kind: "thinking", text: "reasoning" },
       { kind: "thinking", text: " with\nsteps" },
       { kind: "text", text: "答案" },
     ])
     assert.equal(r.parts.length, 2)
-    assert.match(r.parts[0]!.text, /^💭 思考过程：\nreasoning with steps/)
+    assert.match(r.parts[0]!.text, /^💭 思考过程：\nreasoning with\nsteps/)
     assert.equal(r.parts[1]!.text, "答案")
     assert.equal(r.dropped, 0)
   })
 
-  test("thinking preview is capped for WeChat", () => {
+  test("thinking transcript is not truncated at the old 800-char preview cap", () => {
     const r = renderWechatBlocks([{ kind: "thinking", text: "a".repeat(900) }])
     assert.equal(r.parts.length, 1)
     assert.match(r.parts[0]!.text, /^💭 思考过程：\n/)
-    assert.ok(r.parts[0]!.text.length < 900)
-    assert.ok(r.parts[0]!.text.endsWith("…"))
+    assert.ok(r.parts[0]!.text.length > 900)
+    assert.ok(!r.parts[0]!.text.endsWith("…"))
+  })
+
+  test("very long thinking transcript is split by renderer instead of preview-truncated", () => {
+    const r = renderWechatBlocks([{ kind: "thinking", text: "a".repeat(4500) }])
+    assert.ok(r.parts.length >= 2)
+    assert.ok(r.parts.every((p) => p.type === "text" && p.text.includes("a")))
   })
 
   test("thinking process can be hidden by user preference", () => {

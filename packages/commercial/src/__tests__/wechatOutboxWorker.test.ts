@@ -10,6 +10,7 @@ import {
   type DrainOutcome,
   type GetBindingFn,
   OutboxWorker,
+  computeTransientNextAttemptAt,
   type SendMediaFn,
   type SendResult,
   type SendTextFn,
@@ -65,6 +66,7 @@ function makeRow(overrides: Partial<OutboxRow> = {}): OutboxRow {
     lastError: null,
     lockedAt: 1000,
     sentAt: null,
+    nextAttemptAt: null,
     createdAt: 500,
     updatedAt: 1000,
     ...overrides,
@@ -187,6 +189,8 @@ describe('outboxWorker.drainOne', () => {
         getBinding,
         now,
         maxAttempts: 10,
+        transientBackoffBaseMs: 5000,
+        transientBackoffMaxMs: 60000,
         interPartDelayMs: 1000,
         delay: async (ms) => {
           delays.push(ms)
@@ -200,6 +204,34 @@ describe('outboxWorker.drainOne', () => {
       errMessage: 'ret=-2',
     })
     assert.deepEqual(delays, [])
+  })
+
+  test('transient failure sets next_attempt_at backoff before retry', async () => {
+    let markFailedParams: ReadonlyArray<unknown> | null = null
+    const { pool } = makeFakePool((sql, params) => {
+      if (/UPDATE wechat_outbox SET[\s\S]+attempts\s*=\s*attempts \+ 1/.test(sql)) {
+        markFailedParams = params
+        return { rows: [{ attempts: 2, status: 'queued' }], rowCount: 1 }
+      }
+      return { rows: [], rowCount: 1 }
+    })
+    const sendText: SendTextFn = async () => ({ ok: false, errMessage: 'ret=-2' })
+    const getBinding: GetBindingFn = async () => ({
+      botToken: 'tok',
+      contextTokens: { s1: 'ctx-s1' },
+    })
+    const outcome = await drainOne(makeRow({ attempts: 1 }), {
+      pool,
+      sendText,
+      getBinding,
+      now,
+      maxAttempts: 10,
+      transientBackoffBaseMs: 5000,
+      transientBackoffMaxMs: 60000,
+    })
+    assert.equal(outcome.kind, 'failed_transient')
+    assert.ok(markFailedParams)
+    assert.equal(markFailedParams![4], 15_000, 'attempt #2 backs off by 10s from now=5000')
   })
 
   test('binding gone → forceFail to terminal failed_permanent (no retry)', async () => {
@@ -847,6 +879,14 @@ describe('OutboxWorker.tick & lifecycle', () => {
     // 再 start/stop 不抛
     activeWorker.start()
     await activeWorker.stop()
+  })
+})
+
+describe('outboxWorker.computeTransientNextAttemptAt', () => {
+  test('uses exponential backoff with max cap', () => {
+    assert.equal(computeTransientNextAttemptAt(1000, 1, { baseMs: 5000, maxMs: 60000 }), 6000)
+    assert.equal(computeTransientNextAttemptAt(1000, 2, { baseMs: 5000, maxMs: 60000 }), 11000)
+    assert.equal(computeTransientNextAttemptAt(1000, 10, { baseMs: 5000, maxMs: 60000 }), 61000)
   })
 })
 

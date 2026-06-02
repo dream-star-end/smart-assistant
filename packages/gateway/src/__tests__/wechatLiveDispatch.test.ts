@@ -122,8 +122,7 @@ test('v3 WeChat streams process blocks live, serializes adapter sends, and final
     [['thinking'], ['tool_use'], ['text']],
   )
   assert.deepEqual(calls.map((out) => out.isFinal), [false, false, true])
-  assert.equal(calls[0]!.blocks[0]!.text, '正在思考…')
-  assert.equal(calls[0]!.blocks[0]!.text.includes('先分析一下'), false)
+  assert.equal(calls[0]!.blocks[0]!.text, '先分析一下')
   assert.equal(calls[2]!.blocks[0]!.text, '**答案**：完成')
   assert.equal(calls[0]!.traceId, calls[1]!.traceId)
   assert.equal(calls[1]!.traceId, calls[2]!.traceId)
@@ -133,7 +132,7 @@ test('v3 WeChat streams process blocks live, serializes adapter sends, and final
   assert.equal(calls.some((out) => '_userId' in out), false, 'private routing fields must not reach adapter')
 })
 
-test('v3 WeChat caps live process bubbles so final answer is not starved', async () => {
+test('v3 WeChat batches detailed thinking and relies on ordered outbox instead of dropping process bubbles', async () => {
   const calls: any[] = []
   const adapter: ChannelAdapter = {
     id: 'v3-wechat-outbound',
@@ -146,8 +145,8 @@ test('v3 WeChat caps live process bubbles so final answer is not starved', async
     },
   }
   const noisyEvents: any[] = [
-    { kind: 'block', block: { kind: 'thinking', text: 'raw internal thought 1' } },
-    { kind: 'block', block: { kind: 'thinking', text: 'raw internal thought 2' } },
+    { kind: 'block', block: { kind: 'thinking', text: 'raw internal thought 1. ' } },
+    { kind: 'block', block: { kind: 'thinking', text: 'raw internal thought 2. ' } },
   ]
   for (let i = 1; i <= 10; i++) {
     noisyEvents.push({
@@ -165,16 +164,40 @@ test('v3 WeChat caps live process bubbles so final answer is not starved', async
 
   assert.deepEqual(
     calls.map((out) => out.blocks[0]!.kind),
-    ['thinking', 'tool_use', 'tool_use', 'tool_use', 'text'],
+    ['thinking', ...Array.from({ length: 10 }, () => 'tool_use'), 'text'],
   )
-  assert.equal(calls[0]!.blocks[0]!.text, '正在思考…')
+  assert.equal(calls[0]!.blocks[0]!.text, 'raw internal thought 1. raw internal thought 2.')
   assert.equal(calls.at(-1)!.isFinal, true)
   assert.equal(calls.at(-1)!.blocks[0]!.text, '最终答案')
-  assert.equal(
-    calls.slice(0, -1).length,
-    4,
-    'live process bubbles stay below the observed iLink burst rejection threshold',
-  )
+  assert.equal(calls.slice(0, -1).length, 11, 'detailed process bubbles are preserved')
+})
+
+test('v3 WeChat batches many small thinking deltas into one live thinking bubble before text', async () => {
+  const calls: any[] = []
+  const adapter: ChannelAdapter = {
+    id: 'v3-wechat-outbound',
+    name: 'v3-wechat-outbound',
+    type: 'channel' as const,
+    async init() {},
+    async shutdown() {},
+    async send(out: OutboundMessage) {
+      calls.push(out)
+    },
+  }
+  const events: any[] = [
+    { kind: 'block', block: { kind: 'thinking', text: 'step 1. ' } },
+    { kind: 'block', block: { kind: 'thinking', text: 'step 2. ' } },
+    { kind: 'block', block: { kind: 'thinking', text: 'step 3. ' } },
+    { kind: 'block', block: { kind: 'text', text: 'final markdown' } },
+    { kind: 'final', meta: { turn: 1 } },
+  ]
+
+  const gateway = makeGateway(events)
+  await gateway.dispatchInbound(makeFrame(), adapter)
+
+  assert.deepEqual(calls.map((out) => out.blocks[0]!.kind), ['thinking', 'text'])
+  assert.equal(calls[0]!.blocks[0]!.text, 'step 1. step 2. step 3.')
+  assert.equal(calls[1]!.blocks[0]!.text, 'final markdown')
 })
 
 test('non-WeChat adapters keep historical aggregate-on-final behavior', async () => {
