@@ -18,9 +18,9 @@
  * `iLink HTTP <status>: <truncated body>`,在 JSON parse 失败时 throw `iLink returned non-JSON: ...`,
  * 所以本 adapter 只需要按这两类前缀识别就够了。
  *
- * **不处理 200+errno 的 iLink 业务码**:iLink 接口当前在 200 + errno!=0 时 ilinkRequest 已经放行
- * (`resp.ok` 是 HTTP-level)。这是 P1 已知留白 — `errno` 业务码语义不稳定(iLink 文档不全),
- * 暂按 success 处理,等 iLink 行为有定论再加一层映射。
+ * **处理 200+业务失败码**:iLink.ts 的 ilinkRequest 只检查 HTTP status / JSON parse。
+ * 如果 HTTP 200 但 body 里有 `errno/errcode/error_code != 0` 或明确失败 status,
+ * adapter 必须返回 ok=false,否则 outbox 会把实际未送达消息标记为 sent。
  */
 
 import { sendIlinkMedia, sendIlinkText } from "../../../channels/wechat/src/iLink.js"
@@ -33,6 +33,13 @@ const ILINK_HTTP_PREFIX = /^iLink HTTP (\d{3})\b/
 
 /** permanent error HTTP status 名单。命中 → SendResult.permanent=true。 */
 const PERMANENT_STATUSES: ReadonlySet<number> = new Set([401, 403, 404, 410])
+
+const STRICT_NUMERIC_BUSINESS_FIELDS = ["errno", "errcode", "error_code"] as const
+const LENIENT_NUMERIC_BUSINESS_FIELDS = ["code", "ret"] as const
+const STATUS_BUSINESS_FIELDS = ["status", "result", "state"] as const
+const FAILURE_VALUE_STRINGS = new Set(["error", "failed", "fail", "failure"])
+const MESSAGE_FIELDS = ["errmsg", "err_msg", "message", "msg", "error", "error_msg", "reason"] as const
+const STRONG_ERROR_MESSAGE_FIELDS = ["errmsg", "err_msg", "error", "error_msg", "reason"] as const
 
 export type SendIlinkTextFn = (
   botToken: string,
@@ -48,6 +55,104 @@ export interface MakeIlinkSendAdapterOptions {
   sendIlinkText?: SendIlinkTextFn
   sendIlinkMedia?: SendIlinkMediaFn
   logger?: Logger
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+}
+
+function fieldNumber(value: unknown): number | null {
+  if (typeof value === "number" && Number.isFinite(value)) return value
+  if (typeof value === "string") {
+    const s = value.trim()
+    if (/^[+-]?\d+$/.test(s)) return Number(s)
+  }
+  return null
+}
+
+function fieldString(value: unknown): string | null {
+  if (typeof value !== "string") return null
+  const s = value.trim().toLowerCase()
+  return s.length > 0 ? s : null
+}
+
+function findErrorMessage(body: Record<string, unknown>, fallback: string): string {
+  for (const field of MESSAGE_FIELDS) {
+    const value = body[field]
+    if (typeof value === "string" && value.trim().length > 0) return value.trim()
+  }
+  return fallback
+}
+
+function hasFailureStatus(body: Record<string, unknown>): boolean {
+  for (const field of STATUS_BUSINESS_FIELDS) {
+    const value = fieldString(body[field])
+    if (value && FAILURE_VALUE_STRINGS.has(value)) return true
+  }
+  return false
+}
+
+function hasStrongErrorMessage(body: Record<string, unknown>): boolean {
+  for (const field of STRONG_ERROR_MESSAGE_FIELDS) {
+    const value = body[field]
+    if (typeof value === "string" && value.trim().length > 0) return true
+  }
+  return false
+}
+
+export function classifyIlinkBusinessAck(body: unknown): SendResult & {
+  reasonField?: string
+  reasonValue?: unknown
+} {
+  // Backward compatibility: old/mocked implementations may return undefined or
+  // bodies without explicit business fields. Only explicit top-level envelope
+  // failures are retried.
+  if (!isRecord(body)) return { ok: true }
+
+  for (const field of STRICT_NUMERIC_BUSINESS_FIELDS) {
+    if (!(field in body)) continue
+    const n = fieldNumber(body[field])
+    if (n !== null && n !== 0) {
+      return {
+        ok: false,
+        permanent: false,
+        errMessage: findErrorMessage(body, `iLink business error: ${field}=${String(body[field])}`),
+        reasonField: field,
+        reasonValue: body[field],
+      }
+    }
+  }
+
+  for (const field of LENIENT_NUMERIC_BUSINESS_FIELDS) {
+    if (!(field in body)) continue
+    const n = fieldNumber(body[field])
+    if (n !== null && n !== 0 && (hasFailureStatus(body) || hasStrongErrorMessage(body))) {
+      return {
+        ok: false,
+        permanent: false,
+        errMessage: findErrorMessage(body, `iLink business error: ${field}=${String(body[field])}`),
+        reasonField: field,
+        reasonValue: body[field],
+      }
+    }
+  }
+
+  if (hasFailureStatus(body)) {
+    for (const field of STATUS_BUSINESS_FIELDS) {
+      const value = fieldString(body[field])
+      if (value && FAILURE_VALUE_STRINGS.has(value)) {
+        return {
+          ok: false,
+          permanent: false,
+          errMessage: findErrorMessage(body, `iLink business error: ${field}=${value}`),
+          reasonField: field,
+          reasonValue: body[field],
+        }
+      }
+    }
+  }
+
+  return { ok: true }
 }
 
 /** 暴露错误分类便于上层(broker / 测试)读取语义。 */
@@ -81,8 +186,19 @@ export function makeIlinkSendAdapter(opts: MakeIlinkSendAdapterOptions = {}): Se
     text: string
   }): Promise<SendResult> => {
     try {
-      await send(params.botToken, params.toUserId, params.contextToken, params.text)
-      return { ok: true }
+      const body = await send(params.botToken, params.toUserId, params.contextToken, params.text)
+      const ack = classifyIlinkBusinessAck(body)
+      if (!ack.ok) {
+        log.warn("ilink_send_business_failed", {
+          toUserId: params.toUserId,
+          permanent: ack.permanent,
+          errMessage: ack.errMessage,
+          reasonField: ack.reasonField,
+          reasonValue: ack.reasonValue,
+          responseKeys: isRecord(body) ? Object.keys(body).slice(0, 20) : [],
+        })
+      }
+      return ack
     } catch (err) {
       const { permanent, errMessage } = classifyIlinkError(err)
       log.warn("ilink_send_failed", {
@@ -101,14 +217,26 @@ export function makeIlinkSendMediaAdapter(opts: MakeIlinkSendAdapterOptions = {}
 
   return async (params): Promise<SendResult> => {
     try {
-      await send(params.botToken, params.toUserId, {
+      const body = await send(params.botToken, params.toUserId, {
         kind: params.media.kind,
         filename: params.media.filename,
         content: params.media.content,
         mimeType: params.media.mimeType,
         contextToken: params.contextToken,
       })
-      return { ok: true }
+      const ack = classifyIlinkBusinessAck(body)
+      if (!ack.ok) {
+        log.warn("ilink_send_media_business_failed", {
+          toUserId: params.toUserId,
+          kind: params.media.kind,
+          permanent: ack.permanent,
+          errMessage: ack.errMessage,
+          reasonField: ack.reasonField,
+          reasonValue: ack.reasonValue,
+          responseKeys: isRecord(body) ? Object.keys(body).slice(0, 20) : [],
+        })
+      }
+      return ack
     } catch (err) {
       const { permanent, errMessage } = classifyIlinkError(err)
       log.warn("ilink_send_media_failed", {
