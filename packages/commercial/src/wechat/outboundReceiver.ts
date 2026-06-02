@@ -90,9 +90,12 @@ const MAX_BLOCKS_PER_OUTBOUND = 4096
 
 /** WeChat is not a good surface for huge raw thinking transcripts. */
 const MAX_THINKING_PREVIEW_CHARS = 800
+/** Keep final answers reachable even when a turn contains many process blocks. */
+const MAX_PROCESS_PARTS_WHEN_ANSWER_EXISTS = 4
 
 /** Cross-request duplicate thinking previews are noisy in WeChat streaming UX. */
 const THINKING_PREVIEW_PREFIX = "💭 思考过程："
+const TOOL_PROCESS_PREFIX = "🔧 "
 const THINKING_DEDUPE_TTL_MS = 2 * 60 * 1000
 const THINKING_DEDUPE_MAX_ENTRIES = 512
 
@@ -255,10 +258,11 @@ const CodexBillingBodySchema = z
 export type WechatCodexBillingBody = z.infer<typeof CodexBillingBodySchema>
 
 /** 渲染结果分类。renderEmpty 时不入队,返 200 + `outcome:"empty_render"`。 */
-type RenderResult = { parts: IlinkPart[]; dropped: number }
+type RenderedPartRole = "answer" | "process"
+type RenderResult = { parts: IlinkPart[]; partRoles: RenderedPartRole[]; dropped: number }
 
 export interface RenderWechatBlocksOptions {
-  /** true(default) → show tool/thinking process; false → hide process in WeChat. */
+  /** true → show tool/thinking process; false(default in production) → hide process in WeChat. */
   showToolCalls?: boolean
 }
 
@@ -279,11 +283,17 @@ export function renderWechatBlocks(
   options: RenderWechatBlocksOptions = {},
 ): RenderResult {
   const parts: IlinkPart[] = []
+  const partRoles: RenderedPartRole[] = []
   let dropped = 0
 
   const showProcess = options.showToolCalls !== false
   let textBuffer = ""
   let thinkingBuffer = ""
+
+  const pushRendered = (part: IlinkPart, role: RenderedPartRole) => {
+    parts.push(part)
+    partRoles.push(role)
+  }
 
   const flushText = () => {
     if (textBuffer.length === 0) return
@@ -293,7 +303,7 @@ export function renderWechatBlocks(
       dropped++
       return
     }
-    for (const p of rendered) parts.push(p)
+    for (const p of rendered) pushRendered(p, "answer")
   }
 
   const flushThinking = () => {
@@ -313,7 +323,7 @@ export function renderWechatBlocks(
       dropped++
       return
     }
-    for (const p of rendered) parts.push(p)
+    for (const p of rendered) pushRendered(p, "process")
   }
 
   for (const b of blocks) {
@@ -337,7 +347,7 @@ export function renderWechatBlocks(
             summary: b.summary,
             inputPreview: b.inputPreview,
             inputJson: b.inputJson,
-          })) parts.push(p)
+          })) pushRendered(p, "process")
         } else {
           dropped++
         }
@@ -360,17 +370,21 @@ export function renderWechatBlocks(
   }
   flushThinking()
   flushText()
-  return { parts, dropped }
+  return { parts, partRoles, dropped }
 }
 
-export function expandRenderedPartsWithWechatMedia(parts: IlinkPart[]): IlinkPart[] {
+export function expandRenderedPartsWithWechatMedia(
+  parts: IlinkPart[],
+  partRoles?: ReadonlyArray<RenderedPartRole>,
+): IlinkPart[] {
   const out: IlinkPart[] = []
-  for (const part of parts) {
+  for (const [idx, part] of parts.entries()) {
     if (part.type !== "text") {
       out.push(part)
       continue
     }
-    if (!shouldExpandWechatMediaFromText(part.text)) {
+    const isProcessPart = partRoles?.[idx] === "process"
+    if (isProcessPart || (partRoles === undefined && !shouldExpandWechatMediaFromText(part.text))) {
       out.push(part)
       continue
     }
@@ -382,7 +396,7 @@ export function expandRenderedPartsWithWechatMedia(parts: IlinkPart[]): IlinkPar
 }
 
 function shouldExpandWechatMediaFromText(text: string): boolean {
-  return !text.startsWith("💭 思考过程：") && !text.startsWith("🔧 ")
+  return !text.startsWith(THINKING_PREVIEW_PREFIX) && !text.startsWith(TOOL_PROCESS_PREFIX)
 }
 
 // ─── handler dependencies ──────────────────────────────────────────────────
@@ -398,7 +412,7 @@ export interface OutboundReceiverDeps {
    */
   handleCodexBilling?: (body: WechatCodexBillingBody, identity: ContainerIdentity) => Promise<void>
   /**
-   * Per-user WeChat UX preference. Missing/throwing defaults to true at call site
+   * Per-user WeChat UX preference. Missing/throwing defaults to false at call site
    * so final answers are never blocked by a preference lookup failure.
    */
   getWechatShowToolCalls?: (userId: number) => Promise<boolean>
@@ -430,7 +444,7 @@ export function makeOutboundReceiverHandler(
     deps.getWechatShowToolCalls ??
     (async (userId: number) => {
       const snap = await getPreferences(String(userId))
-      return snap.prefs.wechat_show_tool_calls !== false
+      return snap.prefs.wechat_show_tool_calls === true
     })
 
   return async function handle(req, res, ctx) {
@@ -544,26 +558,26 @@ export function makeOutboundReceiverHandler(
     }
 
     // 4) Render 5 种 block → IlinkPart[]
-    let showToolCalls = true
+    let showToolCalls = false
     try {
       showToolCalls = await getWechatShowToolCalls(identity.userId)
     } catch (err) {
-      userLog.warn("wechat_tool_call_pref_lookup_failed_default_true", {
+      userLog.warn("wechat_tool_call_pref_lookup_failed_default_false", {
         outboundId: body.outboundId,
         sessionId: body.sessionId,
         err: err as Error,
       })
     }
     const rendered = renderWechatBlocks(body.blocks, { showToolCalls })
-    const expandedParts = expandRenderedPartsWithWechatMedia(rendered.parts)
-    const deduped = dropDuplicateThinkingParts(recentThinkingParts, expandedParts, {
+    const deduped = dropDuplicateThinkingParts(recentThinkingParts, rendered.parts, rendered.partRoles, {
       userId: bindingUserId,
       sessionId: body.sessionId,
       senderId: body.peer.meta.senderId,
       now: now(),
     })
-    const parts = deduped.parts
-    const dropped = rendered.dropped + deduped.dropped
+    const finalProtected = capProcessPartsWhenAnswerExists(deduped.parts, deduped.partRoles)
+    const parts = expandRenderedPartsWithWechatMedia(finalProtected.parts, finalProtected.partRoles)
+    const dropped = rendered.dropped + deduped.dropped + finalProtected.dropped
     if (parts.length === 0) {
       // 全 drop / 全空文本 — 不入队(避免 worker 走 invalid_payload 路径)。
       // 容器侧 sink 视为 "已接收、无可发内容、勿重试"。
@@ -621,14 +635,18 @@ export function makeOutboundReceiverHandler(
 function dropDuplicateThinkingParts(
   recent: Map<string, number>,
   parts: IlinkPart[],
+  partRoles: ReadonlyArray<RenderedPartRole>,
   opts: { userId: string; sessionId: string; senderId: string; now: number },
-): { parts: IlinkPart[]; dropped: number } {
+): { parts: IlinkPart[]; partRoles: RenderedPartRole[]; dropped: number } {
   pruneRecentThinkingParts(recent, opts.now)
   const out: IlinkPart[] = []
+  const outRoles: RenderedPartRole[] = []
   let dropped = 0
-  for (const part of parts) {
-    if (part.type !== "text" || !part.text.startsWith(THINKING_PREVIEW_PREFIX)) {
+  for (const [idx, part] of parts.entries()) {
+    const role = partRoles[idx] ?? "answer"
+    if (role !== "process" || part.type !== "text" || !part.text.startsWith(THINKING_PREVIEW_PREFIX)) {
       out.push(part)
+      outRoles.push(role)
       continue
     }
     const key = `${opts.userId}\n${opts.sessionId}\n${opts.senderId}\n${part.text}`
@@ -638,6 +656,7 @@ function dropDuplicateThinkingParts(
     }
     recent.set(key, opts.now)
     out.push(part)
+    outRoles.push(role)
   }
   if (recent.size > THINKING_DEDUPE_MAX_ENTRIES) {
     const overflow = recent.size - THINKING_DEDUPE_MAX_ENTRIES
@@ -648,7 +667,36 @@ function dropDuplicateThinkingParts(
       if (deleted >= overflow) break
     }
   }
-  return { parts: out, dropped }
+  return { parts: out, partRoles: outRoles, dropped }
+}
+
+function capProcessPartsWhenAnswerExists(
+  parts: IlinkPart[],
+  partRoles: ReadonlyArray<RenderedPartRole>,
+): { parts: IlinkPart[]; partRoles: RenderedPartRole[]; dropped: number } {
+  const hasAnswerPart = partRoles.some((role) => role === "answer")
+  if (!hasAnswerPart) return { parts, partRoles: [...partRoles], dropped: 0 }
+
+  const out: IlinkPart[] = []
+  const outRoles: RenderedPartRole[] = []
+  let processKept = 0
+  let dropped = 0
+  for (const [idx, part] of parts.entries()) {
+    const role = partRoles[idx] ?? "answer"
+    if (role !== "process") {
+      out.push(part)
+      outRoles.push(role)
+      continue
+    }
+    if (processKept < MAX_PROCESS_PARTS_WHEN_ANSWER_EXISTS) {
+      out.push(part)
+      outRoles.push(role)
+      processKept++
+    } else {
+      dropped++
+    }
+  }
+  return { parts: out, partRoles: outRoles, dropped }
 }
 
 function pruneRecentThinkingParts(recent: Map<string, number>, now: number): void {
