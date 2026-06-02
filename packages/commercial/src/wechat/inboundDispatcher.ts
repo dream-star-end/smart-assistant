@@ -870,19 +870,10 @@ export function makeInboundDispatcher(deps: InboundDispatcherDeps): InboundDispa
             }
           }
         } else if (target.runId !== "pointer-fallback") {
-          try {
-            await clearRunningSession(deps.pgPool, evt.bindingUserId, target.sessionId, target.runId)
-            reqLog.info("stop_cleared_stale_running_session", {
-              sessionId: target.sessionId,
-              runId: target.runId,
-            })
-          } catch (err) {
-            reqLog.warn("stop_clear_stale_running_session_failed", {
-              sessionId: target.sessionId,
-              runId: target.runId,
-              errMessage: (err as Error)?.message ?? String(err),
-            })
-          }
+          reqLog.info("stop_not_interrupted_keep_running_session", {
+            sessionId: target.sessionId,
+            runId: target.runId,
+          })
         }
       }
 

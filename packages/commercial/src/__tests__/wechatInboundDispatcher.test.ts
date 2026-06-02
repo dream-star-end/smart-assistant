@@ -401,9 +401,11 @@ describe("inboundDispatcher — stop command bridge", () => {
       { kind: "dm", id: FIXED_SESSION_ID_2 },
       { kind: "dm", id: FIXED_SESSION_ID },
     ])
-    assert.deepEqual(pg.spy.runningClearCalls, [
-      { bindingUserId: "42", sessionId: FIXED_SESSION_ID_2, runId: "run-stale" },
-    ])
+    assert.deepEqual(
+      pg.spy.runningClearCalls,
+      [],
+      "interrupted:false is not proof the runner ended; keep the row so a later /stop can retry the same concrete target",
+    )
   })
 })
 
