@@ -232,15 +232,15 @@ async function loadToolCallPreference() {
   if (status) status.textContent = '加载中…'
   try {
     const prefs = await loadUserPrefs(true)
-    const checked = prefs?.wechat_show_tool_calls === true
+    const checked = prefs?.wechat_show_tool_calls !== false
     checkbox.checked = checked
     checkbox.dataset.saved = checked ? 'true' : 'false'
     if (status) status.textContent = ''
   } catch (e) {
     // loadUserPrefs 自带兜底;这里保留 catch 以防未来实现改为 throw。
-    checkbox.checked = false
-    checkbox.dataset.saved = 'false'
-    if (status) status.textContent = '偏好加载失败，默认隐藏思考 / 工具过程'
+    checkbox.checked = true
+    checkbox.dataset.saved = 'true'
+    if (status) status.textContent = '偏好加载失败，默认显示思考 / 工具过程'
     console.warn('load WeChat process preference failed:', e)
   } finally {
     checkbox.disabled = false
@@ -261,7 +261,7 @@ async function saveToolCallPreference() {
       wechat_show_tool_calls: next,
     })
     const fresh = (resp && typeof resp.prefs === 'object' && resp.prefs !== null) ? resp.prefs : {}
-    const saved = fresh.wechat_show_tool_calls === true
+    const saved = fresh.wechat_show_tool_calls !== false
     checkbox.checked = saved
     checkbox.dataset.saved = saved ? 'true' : 'false'
     setCachedPrefField('wechat_show_tool_calls', saved)
