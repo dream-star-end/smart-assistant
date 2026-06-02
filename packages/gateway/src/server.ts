@@ -2755,6 +2755,10 @@ export class Gateway {
     const safePeerId = peerId.replace(/[^a-zA-Z0-9_-]/g, '_')
     const resolvedAgentId = typeof agentId === 'string' ? agentId : 'main'
     const sessionKey = `agent:${resolvedAgentId}:webchat:dm:${safePeerId}`
+    if (this._shuttingDown) {
+      this.sendJson(res, 503, { error: 'gateway shutting down' })
+      return
+    }
 
     // Long WeChat tasks can run for hours. The master broker's Step 1 HTTP
     // deadline is intentionally short (seconds), so this endpoint must ACK
@@ -2764,13 +2768,29 @@ export class Gateway {
     // ACKs before dispatch finishes, reserve the key synchronously here and
     // tell dispatchInbound not to treat that reservation as a duplicate.
     if (this._isIdempotencyDuplicate(idempotencyKey)) {
-      this.sendJson(res, 200, { ok: true, deduplicated: true, sessionKey })
+      this.sendJson(res, 200, { ok: true, deduplicated: true, started: false, sessionKey })
       return
     }
     this._markIdempotencyKey(idempotencyKey)
     ;(frame as any)._idempotencyPreReserved = true
 
-    void this.dispatchInbound(frame as InboundFrame, v3OutboundAdapter).catch((err) => {
+    type WechatStartOutcome = { started: boolean; traceId?: string }
+    let startSettled = false
+    let resolveStart!: (value: WechatStartOutcome) => void
+    let rejectStart!: (err: unknown) => void
+    const startPromise = new Promise<WechatStartOutcome>((resolve, reject) => {
+      resolveStart = resolve
+      rejectStart = reject
+    })
+    const settleStart = (value: WechatStartOutcome) => {
+      if (startSettled) return
+      startSettled = true
+      resolveStart(value)
+    }
+    ;(frame as any)._wechatDispatchStarted = (info?: { traceId?: string }) => {
+      settleStart({ started: true, ...(info?.traceId ? { traceId: info.traceId } : {}) })
+    }
+    const logAsyncDispatchFailure = (err: unknown) => {
       // A crash before dispatchInbound reaches its own failure cleanup should
       // not pin this idempotency key for 5 minutes and block a user retry.
       this._seenIdempotencyKeys.delete(idempotencyKey)
@@ -2779,12 +2799,40 @@ export class Gateway {
         peerId,
         idempotencyKey,
         sessionKey,
-      }, err)
-    })
+      }, err as Error)
+    }
+    const dispatchPromise = this.dispatchInbound(frame as InboundFrame, v3OutboundAdapter)
+      .then(() => settleStart({ started: false }))
+      .catch((err) => {
+        if (!startSettled) {
+          startSettled = true
+          rejectStart(err)
+          return
+        }
+        logAsyncDispatchFailure(err)
+      })
+
+    let startOutcome: WechatStartOutcome
+    try {
+      startOutcome = await startPromise
+    } catch (err) {
+      this._seenIdempotencyKeys.delete(idempotencyKey)
+      this.log.error('wechat-inbound dispatch failed before start', {
+        userId,
+        peerId,
+        idempotencyKey,
+        sessionKey,
+      }, err as Error)
+      this.sendJson(res, 500, { error: 'dispatch failed before start' })
+      return
+    }
+    void dispatchPromise
 
     this.sendJson(res, 200, {
       ok: true,
       accepted: true,
+      started: startOutcome.started,
+      ...(startOutcome.traceId ? { traceId: startOutcome.traceId } : {}),
       sessionKey,
     })
   }
@@ -6675,6 +6723,11 @@ export class Gateway {
       // (在那里和 turn 入队原子串行,避免并发 submit 之间互相覆盖)。
       effortLevel: safeEffortLevel,
     })
+    const wechatDispatchStarted = (frame as any)._wechatDispatchStarted
+    if (typeof wechatDispatchStarted === 'function') {
+      try { wechatDispatchStarted({ traceId: turnTraceId }) } catch {}
+      delete (frame as any)._wechatDispatchStarted
+    }
     const out: OutboundMessage = {
       type: 'outbound.message',
       sessionKey,

@@ -621,8 +621,9 @@ async function clearRunningIfFinal(
   log: Logger,
 ): Promise<void> {
   if (body.isFinal !== true) return
+  if (!body.traceId) return
   try {
-    await clearRunningSession(pool, bindingUserId, body.sessionId)
+    await clearRunningSession(pool, bindingUserId, body.sessionId, body.traceId)
   } catch (err) {
     log.warn("clear_running_session_failed", {
       outboundId: body.outboundId,

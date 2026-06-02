@@ -2,15 +2,20 @@
 -- This lets `/stop` interrupt the actual long-running task even if the user's
 -- "current session" pointer has moved after `/new` or another inbound turn.
 
+ALTER TABLE wechat_session_pointer
+  ADD COLUMN IF NOT EXISTS current_agent_id TEXT;
+
 CREATE TABLE IF NOT EXISTS wechat_running_sessions (
   binding_user_id TEXT   NOT NULL,
   session_id      TEXT   NOT NULL,
+  run_id          TEXT   NOT NULL,
   agent_id        TEXT,
   started_at      BIGINT NOT NULL,
   updated_at      BIGINT NOT NULL,
-  PRIMARY KEY (binding_user_id, session_id),
+  PRIMARY KEY (binding_user_id, session_id, run_id),
   CONSTRAINT wrs_binding_user_id_chk CHECK (length(binding_user_id) BETWEEN 1 AND 64),
   CONSTRAINT wrs_session_id_chk      CHECK (length(session_id) BETWEEN 8 AND 80),
+  CONSTRAINT wrs_run_id_chk          CHECK (length(run_id) BETWEEN 1 AND 128),
   CONSTRAINT wrs_agent_id_chk        CHECK (agent_id IS NULL OR length(agent_id) BETWEEN 1 AND 128),
   CONSTRAINT wrs_started_at_chk      CHECK (started_at > 0),
   CONSTRAINT wrs_updated_at_chk      CHECK (updated_at > 0)

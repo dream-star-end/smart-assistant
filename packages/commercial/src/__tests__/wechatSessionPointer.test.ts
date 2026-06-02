@@ -148,7 +148,7 @@ describe("wechat sessionPointer.setCurrentSessionId (SQL guard)", () => {
       captured[0]!.sql.replace(/\s+/g, " "),
       /WHERE wechat_session_pointer\.updated_at\s*<=\s*EXCLUDED\.updated_at/,
     )
-    assert.deepEqual(captured[0]!.params, ["u1", "wsess-0123456789abcdef", 1000])
+    assert.deepEqual(captured[0]!.params, ["u1", "wsess-0123456789abcdef", 1000, null])
   })
 
   test("returns true when rowCount > 0 (写入生效)", async () => {

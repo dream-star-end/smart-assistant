@@ -113,7 +113,7 @@ interface EnqueueSpy {
     payload: unknown[]
     now: number
   }>
-  runningClearCalls: Array<{ bindingUserId: string; sessionId: string }>
+  runningClearCalls: Array<{ bindingUserId: string; sessionId: string; runId: string }>
 }
 
 /**
@@ -153,6 +153,7 @@ function makeFakePool(opts: {
       spy.runningClearCalls.push({
         bindingUserId: String(params[0]),
         sessionId: String(params[1]),
+        runId: String(params[2]),
       })
       return { rows: [], rowCount: 1 }
     }
@@ -513,7 +514,7 @@ describe("outboundReceiver — enqueue outcome translation", () => {
     await handler(authedReq(validBody({ isFinal: true })), res, CTX)
     assert.equal(rec.status, 202)
     assert.deepEqual(spy.runningClearCalls, [
-      { bindingUserId: String(VALID_USER_ID), sessionId: VALID_SESSION_ID },
+      { bindingUserId: String(VALID_USER_ID), sessionId: VALID_SESSION_ID, runId: "trc-1" },
     ])
   })
 

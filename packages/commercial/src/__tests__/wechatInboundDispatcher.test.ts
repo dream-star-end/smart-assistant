@@ -104,10 +104,10 @@ function makeTransport(
 
 interface PgSpy {
   getCalls: Array<{ bindingUserId: string }>
-  setCalls: Array<{ bindingUserId: string; sessionId: string; now: number }>
+  setCalls: Array<{ bindingUserId: string; sessionId: string; now: number; agentId: string | null }>
   runningListCalls: Array<{ bindingUserId: string }>
-  runningSetCalls: Array<{ bindingUserId: string; sessionId: string; agentId: string | null; now: number }>
-  runningClearCalls: Array<{ bindingUserId: string; sessionId: string }>
+  runningSetCalls: Array<{ bindingUserId: string; sessionId: string; runId: string; agentId: string | null; now: number }>
+  runningClearCalls: Array<{ bindingUserId: string; sessionId: string; runId: string }>
 }
 
 /**
@@ -120,9 +120,10 @@ interface PgSpy {
 function makeFakePg(opts: {
   /** SELECT 返回的 current_session_id;null = 行不存在 */
   pointer: string | null
+  pointerAgentId?: string
   /** INSERT/UPDATE 是否真生效;false 模拟 stale skip */
   applySet?: boolean
-  runningSessions?: Array<{ sessionId: string; agentId?: string }>
+  runningSessions?: Array<{ sessionId: string; runId: string; agentId?: string }>
   throwOnGet?: Error
   throwOnSet?: Error
 }): { pg: PgConn; spy: PgSpy } {
@@ -132,14 +133,17 @@ function makeFakePg(opts: {
       sql: string,
       params: ReadonlyArray<unknown> = [],
     ): Promise<{ rows: R[]; rowCount: number | null }> {
-      if (/SELECT current_session_id FROM wechat_session_pointer/i.test(sql)) {
+      if (/SELECT current_session_id(?:,\s*current_agent_id)? FROM wechat_session_pointer/i.test(sql)) {
         if (opts.throwOnGet) throw opts.throwOnGet
         spy.getCalls.push({ bindingUserId: String(params[0]) })
         if (opts.pointer === null) {
           return { rows: [] as R[], rowCount: 0 }
         }
         return {
-          rows: [{ current_session_id: opts.pointer } as unknown as R],
+          rows: [{
+            current_session_id: opts.pointer,
+            current_agent_id: opts.pointerAgentId ?? null,
+          } as unknown as R],
           rowCount: 1,
         }
       }
@@ -149,15 +153,17 @@ function makeFakePg(opts: {
           bindingUserId: String(params[0]),
           sessionId: String(params[1]),
           now: Number(params[2]),
+          agentId: params[3] === null ? null : String(params[3]),
         })
         const applied = opts.applySet ?? true
         return { rows: [] as R[], rowCount: applied ? 1 : 0 }
       }
-      if (/SELECT session_id, agent_id\s+FROM wechat_running_sessions/i.test(sql)) {
+      if (/SELECT session_id, run_id, agent_id\s+FROM wechat_running_sessions/i.test(sql)) {
         spy.runningListCalls.push({ bindingUserId: String(params[0]) })
         return {
           rows: (opts.runningSessions ?? []).map((s) => ({
             session_id: s.sessionId,
+            run_id: s.runId,
             agent_id: s.agentId ?? null,
           })) as unknown as R[],
           rowCount: opts.runningSessions?.length ?? 0,
@@ -167,8 +173,9 @@ function makeFakePg(opts: {
         spy.runningSetCalls.push({
           bindingUserId: String(params[0]),
           sessionId: String(params[1]),
-          agentId: params[2] === null ? null : String(params[2]),
-          now: Number(params[3]),
+          runId: String(params[2]),
+          agentId: params[3] === null ? null : String(params[3]),
+          now: Number(params[4]),
         })
         return { rows: [] as R[], rowCount: 1 }
       }
@@ -176,6 +183,7 @@ function makeFakePg(opts: {
         spy.runningClearCalls.push({
           bindingUserId: String(params[0]),
           sessionId: String(params[1]),
+          runId: String(params[2]),
         })
         return { rows: [] as R[], rowCount: 1 }
       }
@@ -347,8 +355,8 @@ describe("inboundDispatcher — stop command bridge", () => {
     const pg = makeFakePg({
       pointer: FIXED_SESSION_ID,
       runningSessions: [
-        { sessionId: FIXED_SESSION_ID_2, agentId: "coder" },
-        { sessionId: FIXED_SESSION_ID, agentId: "main" },
+        { sessionId: FIXED_SESSION_ID_2, runId: "run-2", agentId: "coder" },
+        { sessionId: FIXED_SESSION_ID, runId: "run-1", agentId: "main" },
       ],
     })
     const { transport, spy: tSpy } = makeTransport([

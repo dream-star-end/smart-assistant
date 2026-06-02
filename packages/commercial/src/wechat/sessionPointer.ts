@@ -35,6 +35,12 @@ export type PgConn = Pool | PoolClient | PgRunner
 
 export interface RunningWechatSession {
   sessionId: WechatSessionId
+  runId: string
+  agentId?: string
+}
+
+export interface WechatSessionPointer {
+  sessionId: WechatSessionId
   agentId?: string
 }
 
@@ -79,6 +85,22 @@ export async function getCurrentSessionId(
   return res.rows[0]!.current_session_id
 }
 
+export async function getCurrentSessionPointer(
+  conn: PgConn,
+  bindingUserId: BindingId,
+): Promise<WechatSessionPointer | null> {
+  const res = await (conn as PgRunner).query<{ current_session_id: string; current_agent_id: string | null }>(
+    "SELECT current_session_id, current_agent_id FROM wechat_session_pointer WHERE binding_user_id = $1 LIMIT 1",
+    [bindingUserId],
+  )
+  if (res.rowCount === 0) return null
+  const row = res.rows[0]!
+  return {
+    sessionId: row.current_session_id as WechatSessionId,
+    ...(row.current_agent_id ? { agentId: row.current_agent_id } : {}),
+  }
+}
+
 /**
  * Upsert binding → sessionId 指针;每次入站 / switch / new 都打点 updated_at。
  *
@@ -111,15 +133,17 @@ export async function setCurrentSessionId(
   bindingUserId: BindingId,
   sessionId: WechatSessionId,
   now: number,
+  agentId?: string,
 ): Promise<boolean> {
   const res = await (conn as PgRunner).query(
-    `INSERT INTO wechat_session_pointer (binding_user_id, current_session_id, updated_at)
-     VALUES ($1, $2, $3)
+    `INSERT INTO wechat_session_pointer (binding_user_id, current_session_id, updated_at, current_agent_id)
+     VALUES ($1, $2, $3, $4)
      ON CONFLICT (binding_user_id) DO UPDATE SET
        current_session_id = EXCLUDED.current_session_id,
-       updated_at         = EXCLUDED.updated_at
+       updated_at         = EXCLUDED.updated_at,
+       current_agent_id   = EXCLUDED.current_agent_id
      WHERE wechat_session_pointer.updated_at <= EXCLUDED.updated_at`,
-    [bindingUserId, sessionId, now],
+    [bindingUserId, sessionId, now, agentId ?? null],
   )
   return (res.rowCount ?? 0) > 0
 }
@@ -128,16 +152,17 @@ export async function markRunningSession(
   conn: PgConn,
   bindingUserId: BindingId,
   sessionId: WechatSessionId,
+  runId: string,
   agentId: string | undefined,
   now: number,
 ): Promise<void> {
   await (conn as PgRunner).query(
-    `INSERT INTO wechat_running_sessions (binding_user_id, session_id, agent_id, started_at, updated_at)
-     VALUES ($1, $2, $3, $4, $4)
-     ON CONFLICT (binding_user_id, session_id) DO UPDATE SET
+    `INSERT INTO wechat_running_sessions (binding_user_id, session_id, run_id, agent_id, started_at, updated_at)
+     VALUES ($1, $2, $3, $4, $5, $5)
+     ON CONFLICT (binding_user_id, session_id, run_id) DO UPDATE SET
        agent_id   = EXCLUDED.agent_id,
        updated_at = EXCLUDED.updated_at`,
-    [bindingUserId, sessionId, agentId ?? null, now],
+    [bindingUserId, sessionId, runId, agentId ?? null, now],
   )
 }
 
@@ -146,8 +171,8 @@ export async function listRunningSessions(
   bindingUserId: BindingId,
   limit = 16,
 ): Promise<RunningWechatSession[]> {
-  const res = await (conn as PgRunner).query<{ session_id: string; agent_id: string | null }>(
-    `SELECT session_id, agent_id
+  const res = await (conn as PgRunner).query<{ session_id: string; run_id: string; agent_id: string | null }>(
+    `SELECT session_id, run_id, agent_id
        FROM wechat_running_sessions
       WHERE binding_user_id = $1
       ORDER BY started_at DESC
@@ -156,6 +181,7 @@ export async function listRunningSessions(
   )
   return res.rows.map((row) => ({
     sessionId: row.session_id as WechatSessionId,
+    runId: row.run_id,
     ...(row.agent_id ? { agentId: row.agent_id } : {}),
   }))
 }
@@ -164,10 +190,11 @@ export async function clearRunningSession(
   conn: PgConn,
   bindingUserId: BindingId,
   sessionId: WechatSessionId,
+  runId: string,
 ): Promise<boolean> {
   const res = await (conn as PgRunner).query(
-    "DELETE FROM wechat_running_sessions WHERE binding_user_id = $1 AND session_id = $2",
-    [bindingUserId, sessionId],
+    "DELETE FROM wechat_running_sessions WHERE binding_user_id = $1 AND session_id = $2 AND run_id = $3",
+    [bindingUserId, sessionId, runId],
   )
   return (res.rowCount ?? 0) > 0
 }

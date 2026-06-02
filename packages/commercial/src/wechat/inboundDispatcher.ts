@@ -51,6 +51,7 @@ import type { ContainerUnreadyError, ResolveContainerEndpoint } from "../ws/user
 import {
   clearRunningSession,
   getCurrentSessionId,
+  getCurrentSessionPointer,
   listRunningSessions,
   markRunningSession,
   newWechatSessionId,
@@ -550,6 +551,7 @@ export function makeInboundDispatcher(deps: InboundDispatcherDeps): InboundDispa
           errMessage: truncBody,
         }
       }
+      const step1Accepted = parseStep1Accepted(step1.response.bodyText, requestId)
 
       // ── 4) Step 2a: master sqlite client_sessions 写(仅 newSession) ──
       if (newSession) {
@@ -593,6 +595,7 @@ export function makeInboundDispatcher(deps: InboundDispatcherDeps): InboundDispa
           evt.bindingUserId,
           sessionId,
           dispatchNow,
+          agentId,
         )
         if (!applied) {
           // updated_at <= EXCLUDED guard 过滤(stale ts):P1 单进程不会真触发,
@@ -648,13 +651,23 @@ export function makeInboundDispatcher(deps: InboundDispatcherDeps): InboundDispa
         }
       }
 
-      try {
-        await markRunningSession(deps.pgPool, evt.bindingUserId, sessionId, agentId, dispatchNow)
-      } catch (err) {
-        reqLog.error("mark_running_session_failed", {
-          sessionId,
-          errMessage: (err as Error)?.message ?? String(err),
-        })
+      if (step1Accepted.started !== false) {
+        try {
+          await markRunningSession(
+            deps.pgPool,
+            evt.bindingUserId,
+            sessionId,
+            step1Accepted.runId,
+            agentId,
+            dispatchNow,
+          )
+        } catch (err) {
+          reqLog.error("mark_running_session_failed", {
+            sessionId,
+            runId: step1Accepted.runId,
+            errMessage: (err as Error)?.message ?? String(err),
+          })
+        }
       }
 
       reqLog.info("dispatched", { sessionId, newSession })
@@ -671,7 +684,7 @@ export function makeInboundDispatcher(deps: InboundDispatcherDeps): InboundDispa
         traceId: evt.traceId,
       })
 
-      let targets: Array<{ sessionId: WechatSessionId; agentId?: string }>
+      let targets: Array<{ sessionId: WechatSessionId; runId: string; agentId?: string }>
       try {
         targets = await listRunningSessions(deps.pgPool, evt.bindingUserId)
       } catch (err) {
@@ -686,9 +699,9 @@ export function makeInboundDispatcher(deps: InboundDispatcherDeps): InboundDispa
       }
 
       if (targets.length === 0) {
-        let sessionId: WechatSessionId | null
+        let pointer
         try {
-          sessionId = await getCurrentSessionId(deps.pgPool, evt.bindingUserId)
+          pointer = await getCurrentSessionPointer(deps.pgPool, evt.bindingUserId)
         } catch (err) {
           reqLog.error("stop_pointer_read_failed", {
             errMessage: (err as Error)?.message ?? String(err),
@@ -699,14 +712,14 @@ export function makeInboundDispatcher(deps: InboundDispatcherDeps): InboundDispa
             reply: "暂时无法读取当前微信任务，请稍后重试；也可以打开实时过程链接在网页端停止。",
           }
         }
-        if (!sessionId) {
+        if (!pointer) {
           return {
             kind: "command_echo",
             interrupted: false,
             reply: "当前没有可中断的微信任务。",
           }
         }
-        targets = [{ sessionId, agentId }]
+        targets = [{ sessionId: pointer.sessionId, runId: "pointer-fallback", agentId: pointer.agentId ?? agentId }]
       }
 
       let endpoint
@@ -800,7 +813,7 @@ export function makeInboundDispatcher(deps: InboundDispatcherDeps): InboundDispa
         if (interrupted) {
           interruptedCount++
           try {
-            await clearRunningSession(deps.pgPool, evt.bindingUserId, target.sessionId)
+            await clearRunningSession(deps.pgPool, evt.bindingUserId, target.sessionId, target.runId)
           } catch (err) {
             reqLog.warn("stop_clear_running_session_failed", {
               sessionId: target.sessionId,
@@ -1028,6 +1041,24 @@ function parseRetryAfterSec(response: {
 
   // 3) fallback
   return DEFAULT_COLD_START_RETRY_AFTER_SEC
+}
+
+function parseStep1Accepted(
+  bodyText: string,
+  fallbackRunId: string,
+): { started: boolean; runId: string } {
+  try {
+    const parsed = JSON.parse(bodyText) as { started?: unknown; traceId?: unknown }
+    const traceId = typeof parsed.traceId === "string" && parsed.traceId.length > 0
+      ? parsed.traceId
+      : fallbackRunId
+    return {
+      started: parsed.started !== false,
+      runId: traceId,
+    }
+  } catch {
+    return { started: true, runId: fallbackRunId }
+  }
 }
 
 function clamp(n: number, lo: number, hi: number): number {
