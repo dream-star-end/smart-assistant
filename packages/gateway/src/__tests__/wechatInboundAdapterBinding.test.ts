@@ -66,6 +66,7 @@ function extractMethodBody(source: string, methodName: string): string {
 }
 
 const handleWechatInbound = extractMethodBody(SERVER_TS, 'handleWechatInbound')
+const handleStop = extractMethodBody(SERVER_TS, 'handleStop')
 
 // ── 基础前置:method 抽出来非空、且包含必要 keyword ──
 test('extractMethodBody finds handleWechatInbound and includes core skeleton', () => {
@@ -229,21 +230,21 @@ test('WeChat Step1 ACK returns the routed wsess when dispatch reroutes the runne
   )
 })
 
-test('WeChat realtime-link routing does not erase WeChat channel side effects', () => {
+test('WeChat realtime-link routing keeps rate-limit WeChat-scoped but lastActive webchat-scoped', () => {
   assert.match(
     handleWechatInbound,
     /_rateLimitChannel\s*=\s*['"]wechat['"]/,
     'WeChat inbound must keep a WeChat-scoped rate-limit bucket even though the runner session is webchat',
   )
-  assert.match(
+  assert.doesNotMatch(
     handleWechatInbound,
     /_lastActiveChannel\s*=\s*['"]wechat['"]/,
-    'WeChat inbound must preserve WeChat as last-active channel for proactive pushes',
+    'WeChat inbound must not rewrite lastActive away from webchat; the realtime link relies on webchat/wsess pushes',
   )
-  assert.match(
+  assert.doesNotMatch(
     handleWechatInbound,
-    /_lastActivePeerId\s*=\s*`\$\{userId\.slice\(2\)\}:\$\{peerDisplayName\}`/,
-    'proactive WeChat pushes need the legacy wechat adapter peer id shape <bindingUserId>:<senderId>',
+    /_lastActivePeerId\s*=/,
+    'WeChat inbound must leave lastActive peerId as wsess so cron/webhook/inter-agent pushes hit the linked Web session',
   )
   assert.match(
     SERVER_TS,
@@ -336,5 +337,23 @@ test('post-start async dispatch failures emit a terminal error to Web and WeChat
     handleWechatInbound,
     /_updateWechatIdempotency\(\s*idempotencyKey\s*,\s*\{\s*started:\s*false\s*\}\s*\)/,
     'post-start dispatch rejection must mark cached WeChat idempotency as no longer running',
+  )
+})
+
+test('handleStop scans live webchat sessions when agentId is omitted', () => {
+  assert.match(
+    handleStop,
+    /this\.sessions\.list\(\)/,
+    'agent-less WeChat /stop fallback must enumerate live sessions for upgraded pointers without current_agent_id',
+  )
+  assert.match(
+    handleStop,
+    /\.endsWith\(suffix\)/,
+    'agent-less WeChat /stop fallback must match by channel/kind/wsess suffix across agents',
+  )
+  assert.match(
+    handleStop,
+    /this\.sessions\.interrupt\(live\.sessionKey\)/,
+    'agent-less WeChat /stop fallback must interrupt the matched live runner instead of defaulting to main',
   )
 })

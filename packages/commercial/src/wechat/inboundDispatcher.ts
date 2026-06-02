@@ -750,14 +750,18 @@ export function makeInboundDispatcher(deps: InboundDispatcherDeps): InboundDispa
       }
 
       if (pointer) {
-        const pointerAgentId = pointer.agentId ?? agentId
+        const pointerAgentId = pointer.agentId
         const alreadyTargeted = targets.some(
           (target) =>
             target.sessionId === pointer!.sessionId &&
-            (target.agentId ?? agentId) === pointerAgentId,
+            (!pointerAgentId || !target.agentId || target.agentId === pointerAgentId),
         )
         if (!alreadyTargeted) {
-          targets.push({ sessionId: pointer.sessionId, runId: "pointer-fallback", agentId: pointerAgentId })
+          targets.push({
+            sessionId: pointer.sessionId,
+            runId: "pointer-fallback",
+            ...(pointerAgentId ? { agentId: pointerAgentId } : {}),
+          })
         }
       }
 
@@ -817,10 +821,12 @@ export function makeInboundDispatcher(deps: InboundDispatcherDeps): InboundDispa
       let interruptedCount = 0
       let failureCount = 0
       for (const target of targets) {
+        const targetAgentId =
+          target.agentId ?? (target.runId === "pointer-fallback" ? undefined : agentId)
         const bodyJson = JSON.stringify({
           userId: MASTER_USER_PREFIX + evt.bindingUserId,
           peer: { kind: "dm" as const, id: target.sessionId },
-          agentId: target.agentId ?? agentId,
+          ...(targetAgentId ? { agentId: targetAgentId } : {}),
         })
         const stopRes = await postWithRetry(
           deps.transport,

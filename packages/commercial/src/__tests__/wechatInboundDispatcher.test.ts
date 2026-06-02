@@ -347,8 +347,24 @@ describe("inboundDispatcher — stop command bridge", () => {
     assert.equal(tSpy.posts[0]!.path, WECHAT_STOP_CONTAINER_PATH)
     assert.equal(tSpy.posts[0]!.bodyParsed.userId, "c:42")
     assert.deepEqual(tSpy.posts[0]!.bodyParsed.peer, { kind: "dm", id: FIXED_SESSION_ID })
-    assert.equal(tSpy.posts[0]!.bodyParsed.agentId, "main")
+    assert.equal(
+      "agentId" in tSpy.posts[0]!.bodyParsed,
+      false,
+      "pointer-only fallback without current_agent_id must omit agentId so the container scans the live wsess runner",
+    )
     assert.equal(tSpy.posts[0]!.headers["x-openclaude-inbound-nonce"], expectedNonce())
+  })
+
+  test("stop pointer fallback preserves current_agent_id when present", async () => {
+    const pg = makeFakePg({ pointer: FIXED_SESSION_ID, pointerAgentId: "codex" })
+    const { transport, spy: tSpy } = makeTransport([
+      { status: 200, bodyText: '{"ok":true,"interrupted":true}' },
+    ])
+    const d = makeInboundDispatcher(makeDeps({ pgPool: pg.pg, transport }))
+    const r = await d.stop(makeEvent({ text: "/stop" }))
+    assert.equal(r.interrupted, true)
+    assert.equal(tSpy.posts.length, 1)
+    assert.equal(tSpy.posts[0]!.bodyParsed.agentId, "codex")
   })
 
   test("stop targets running sessions before current pointer and clears interrupted rows", async () => {
@@ -401,6 +417,7 @@ describe("inboundDispatcher — stop command bridge", () => {
       { kind: "dm", id: FIXED_SESSION_ID_2 },
       { kind: "dm", id: FIXED_SESSION_ID },
     ])
+    assert.deepEqual(tSpy.posts.map((p) => p.bodyParsed.agentId), ["coder", undefined])
     assert.deepEqual(
       pg.spy.runningClearCalls,
       [],
