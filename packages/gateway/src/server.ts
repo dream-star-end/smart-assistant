@@ -2917,9 +2917,6 @@ export class Gateway {
       })
     }
     const publishPostStartDispatchFailure = async (err: unknown) => {
-      // A crash before dispatchInbound reaches its own failure cleanup should
-      // not pin this idempotency key for 5 minutes and block a user retry.
-      this._updateWechatIdempotency(idempotencyKey, { started: false })
       const currentWechat = this._getIdempotencyEntry(idempotencyKey)?.wechat
       const errMessage = err instanceof Error ? err.message : String(err)
       const terminalPeer = {
@@ -7421,7 +7418,9 @@ export class Gateway {
           // 决策:错误卡不显示 cost),与 e.kind === 'error' 分支一致;runLog
           // 也按 failed 记账,idempotency key 释放允许 client retry。
           this._runLog.complete(_run, { status: 'failed', error: _apiErrorText })
-          if (frame.idempotencyKey) this._seenIdempotencyKeys.delete(frame.idempotencyKey)
+          if (frame.idempotencyKey && !(frame as any)._idempotencyPreReserved) {
+            this._seenIdempotencyKeys.delete(frame.idempotencyKey)
+          }
           if (liveWechatAdapter) {
             const errBlocks = [{ kind: 'text', text: `[error] ${_apiErrorText}` } as any]
             this.deliver(
@@ -7604,8 +7603,12 @@ export class Gateway {
         // Plan 2 — turn 终态前清 turn_status cache,语义同 final 分支。
         session.currentTurnStatus = null
         this._runLog.complete(_run, { status: 'failed', error: e.error })
-        // Remove idempotency key on failure to allow client retry
-        if (frame.idempotencyKey) this._seenIdempotencyKeys.delete(frame.idempotencyKey)
+        // Remove idempotency key on normal Web failures to allow client retry.
+        // WeChat early-ACK turns keep their metadata for the TTL so a lost
+        // Step1 response can be deduplicated instead of re-dispatching.
+        if (frame.idempotencyKey && !(frame as any)._idempotencyPreReserved) {
+          this._seenIdempotencyKeys.delete(frame.idempotencyKey)
+        }
         // P1-3 — 已识别错误(余额/限流/上游)发结构化 outbound.error 帧 + 紧跟
         // 老的 [error] text bubble (turn 终止器,frameSeq 单调,新客户端按 seq
         // 抑制重复气泡,旧客户端无视 outbound.error,只看到 [error] 文本降级 UX)。

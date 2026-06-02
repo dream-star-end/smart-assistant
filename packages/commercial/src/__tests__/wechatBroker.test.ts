@@ -1384,6 +1384,7 @@ describe("wechatBroker — cleanupBinding", () => {
       query: async (sql: string, params?: ReadonlyArray<unknown>) => {
         queries.push({ sql, params })
         if (/DELETE FROM wechat_session_pointer/i.test(sql)) return { rows: [], rowCount: 1 }
+        if (/DELETE FROM wechat_running_sessions/i.test(sql)) return { rows: [], rowCount: 3 }
         if (/UPDATE wechat_outbox/i.test(sql)) return { rows: [], rowCount: 2 }
         return { rows: [], rowCount: 0 }
       },
@@ -1400,10 +1401,13 @@ describe("wechatBroker — cleanupBinding", () => {
 
     assert.deepEqual(result, { pointerDeleted: true, outboxFailed: 2 })
     const del = queries.find((q) => /DELETE FROM wechat_session_pointer/i.test(q.sql))
+    const runningDel = queries.find((q) => /DELETE FROM wechat_running_sessions/i.test(q.sql))
     const upd = queries.find((q) => /UPDATE wechat_outbox/i.test(q.sql))
     assert.ok(del)
+    assert.ok(runningDel)
     assert.ok(upd)
     assert.equal(del!.params?.[0], "42")
+    assert.equal(runningDel!.params?.[0], "42")
     assert.equal(upd!.params?.[0], "42")
     assert.equal(upd!.params?.[1], 7)
     assert.match(upd!.sql, /status\s+IN\s+\('queued',\s*'sending'\)/i)

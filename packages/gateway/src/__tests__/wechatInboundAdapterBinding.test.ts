@@ -333,10 +333,18 @@ test('post-start async dispatch failures emit a terminal error to Web and WeChat
     /await\s+this\._sendAdapterOutboundMessage\(\s*terminalOut\s*,\s*v3OutboundAdapter\s*\)/,
     'post-start dispatch rejection must also send a final error back through WeChat outbound',
   )
-  assert.match(
+  assert.doesNotMatch(
     handleWechatInbound,
     /_updateWechatIdempotency\(\s*idempotencyKey\s*,\s*\{\s*started:\s*false\s*\}\s*\)/,
-    'post-start dispatch rejection must mark cached WeChat idempotency as no longer running',
+    'post-start dispatch rejection must preserve cached WeChat idempotency metadata so Step1 retries dedupe instead of re-dispatching',
+  )
+})
+
+test('terminal WeChat failure paths preserve idempotency metadata for Step1 retries', () => {
+  assert.match(
+    SERVER_TS,
+    /_seenIdempotencyKeys\.delete\(frame\.idempotencyKey\)[\s\S]+_idempotencyPreReserved/,
+    'terminal failure cleanup must be guarded by _idempotencyPreReserved so WeChat retries remain deduplicated',
   )
 })
 

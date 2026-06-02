@@ -850,6 +850,10 @@ export function makeWechatBroker(deps: BrokerDeps): WechatBroker {
       "DELETE FROM wechat_session_pointer WHERE binding_user_id = $1",
       [bindingUserId],
     )
+    await deps.pgPool.query(
+      "DELETE FROM wechat_running_sessions WHERE binding_user_id = $1",
+      [bindingUserId],
+    )
     const outbox = await deps.pgPool.query(
       `UPDATE wechat_outbox
           SET status = 'failed',
