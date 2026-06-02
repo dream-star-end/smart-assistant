@@ -85,6 +85,7 @@ function liveEvents(): any[] {
     { kind: 'block', block: { kind: 'thinking', text: '先分析一下' } },
     { kind: 'block', block: { kind: 'tool_use', blockId: 'toolu_1', toolName: 'Bash', inputJson: { command: 'pwd' }, partial: true } },
     { kind: 'block', block: { kind: 'tool_use', blockId: 'toolu_1', toolName: 'Bash', inputJson: { command: 'pwd' }, partial: false } },
+    { kind: 'block', block: { kind: 'tool_output_tail', toolUseId: 'toolu_1', text: 'still running...' } },
     { kind: 'block', block: { kind: 'tool_result', toolUseId: 'toolu_1', text: '/tmp' } },
     { kind: 'block', block: { kind: 'text', text: '**答案**：完成' } },
     { kind: 'final', meta: { cost: 0.01, inputTokens: 10, outputTokens: 20, turn: 1 } },
@@ -118,9 +119,17 @@ test('v3 WeChat mirrors only final text to WeChat and streams process to linked 
 
   assert.deepEqual(
     delivered.map((d) => d.out.blocks?.[0]?.kind ?? 'empty-final'),
-    ['thinking', 'tool_use', 'tool_use', 'tool_result', 'text', 'empty-final'],
+    ['thinking', 'tool_use', 'tool_use', 'tool_output_tail', 'tool_result', 'text', 'empty-final'],
   )
-  assert.deepEqual(delivered.map((d) => d.adapter), [undefined, undefined, undefined, undefined, undefined, undefined])
+  assert.deepEqual(delivered.map((d) => d.adapter), [
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+  ])
   assert.equal(delivered.at(-1)!.out.isFinal, true)
 })
 

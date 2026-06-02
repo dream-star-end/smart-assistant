@@ -727,28 +727,40 @@ export function makeInboundDispatcher(deps: InboundDispatcherDeps): InboundDispa
         }
       }
 
-      if (targets.length === 0) {
-        let pointer
-        try {
-          pointer = await getCurrentSessionPointer(deps.pgPool, evt.bindingUserId)
-        } catch (err) {
-          reqLog.error("stop_pointer_read_failed", {
-            errMessage: (err as Error)?.message ?? String(err),
-          })
+      let pointer: Awaited<ReturnType<typeof getCurrentSessionPointer>> | null = null
+      try {
+        pointer = await getCurrentSessionPointer(deps.pgPool, evt.bindingUserId)
+      } catch (err) {
+        reqLog.error("stop_pointer_read_failed", {
+          errMessage: (err as Error)?.message ?? String(err),
+        })
+        if (targets.length === 0) {
           return {
             kind: "command_echo",
             interrupted: false,
             reply: "暂时无法读取当前微信任务，请稍后重试；也可以打开实时过程链接在网页端停止。",
           }
         }
-        if (!pointer) {
-          return {
-            kind: "command_echo",
-            interrupted: false,
-            reply: "当前没有可中断的微信任务。",
-          }
+      }
+
+      if (pointer) {
+        const pointerAgentId = pointer.agentId ?? agentId
+        const alreadyTargeted = targets.some(
+          (target) =>
+            target.sessionId === pointer!.sessionId &&
+            (target.agentId ?? agentId) === pointerAgentId,
+        )
+        if (!alreadyTargeted) {
+          targets.push({ sessionId: pointer.sessionId, runId: "pointer-fallback", agentId: pointerAgentId })
         }
-        targets = [{ sessionId: pointer.sessionId, runId: "pointer-fallback", agentId: pointer.agentId ?? agentId }]
+      }
+
+      if (targets.length === 0) {
+        return {
+          kind: "command_echo",
+          interrupted: false,
+          reply: "当前没有可中断的微信任务。",
+        }
       }
 
       let endpoint
@@ -841,13 +853,15 @@ export function makeInboundDispatcher(deps: InboundDispatcherDeps): InboundDispa
         }
         if (interrupted) {
           interruptedCount++
-          try {
-            await clearRunningSession(deps.pgPool, evt.bindingUserId, target.sessionId, target.runId)
-          } catch (err) {
-            reqLog.warn("stop_clear_running_session_failed", {
-              sessionId: target.sessionId,
-              errMessage: (err as Error)?.message ?? String(err),
-            })
+          if (target.runId !== "pointer-fallback") {
+            try {
+              await clearRunningSession(deps.pgPool, evt.bindingUserId, target.sessionId, target.runId)
+            } catch (err) {
+              reqLog.warn("stop_clear_running_session_failed", {
+                sessionId: target.sessionId,
+                errMessage: (err as Error)?.message ?? String(err),
+              })
+            }
           }
         } else if (target.runId !== "pointer-fallback") {
           try {

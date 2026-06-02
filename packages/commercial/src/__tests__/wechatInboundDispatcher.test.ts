@@ -367,7 +367,7 @@ describe("inboundDispatcher — stop command bridge", () => {
     const r = await d.stop(makeEvent({ text: "/stop" }))
     assert.equal(r.interrupted, true)
     assert.match(r.reply, /2\/2/)
-    assert.equal(pg.spy.getCalls.length, 0)
+    assert.equal(pg.spy.getCalls.length, 1)
     assert.equal(tSpy.posts.length, 2)
     assert.deepEqual(tSpy.posts.map((p) => p.bodyParsed.peer), [
       { kind: "dm", id: FIXED_SESSION_ID_2 },
@@ -380,7 +380,7 @@ describe("inboundDispatcher — stop command bridge", () => {
     ])
   })
 
-  test("stop clears stale tracked running rows when container reports nothing interrupted", async () => {
+  test("stop merges current pointer fallback when stale tracked rows are present", async () => {
     const pg = makeFakePg({
       pointer: FIXED_SESSION_ID,
       runningSessions: [
@@ -389,13 +389,18 @@ describe("inboundDispatcher — stop command bridge", () => {
     })
     const { transport, spy: tSpy } = makeTransport([
       { status: 200, bodyText: '{"ok":true,"interrupted":false}' },
+      { status: 200, bodyText: '{"ok":true,"interrupted":true}' },
     ])
     const d = makeInboundDispatcher(makeDeps({ pgPool: pg.pg, transport }))
     const r = await d.stop(makeEvent({ text: "/stop" }))
-    assert.equal(r.interrupted, false)
-    assert.match(r.reply, /当前没有正在运行的任务/)
-    assert.equal(pg.spy.getCalls.length, 0)
-    assert.equal(tSpy.posts.length, 1)
+    assert.equal(r.interrupted, true)
+    assert.match(r.reply, /1\/2/)
+    assert.equal(pg.spy.getCalls.length, 1)
+    assert.equal(tSpy.posts.length, 2)
+    assert.deepEqual(tSpy.posts.map((p) => p.bodyParsed.peer), [
+      { kind: "dm", id: FIXED_SESSION_ID_2 },
+      { kind: "dm", id: FIXED_SESSION_ID },
+    ])
     assert.deepEqual(pg.spy.runningClearCalls, [
       { bindingUserId: "42", sessionId: FIXED_SESSION_ID_2, runId: "run-stale" },
     ])

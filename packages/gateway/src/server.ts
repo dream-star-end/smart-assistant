@@ -7336,6 +7336,10 @@ export class Gateway {
         // 这里若被 API_ERROR 吞掉,前端会再次卡在第一行——回归到修复前的症状。
         const isTail = b?.kind === 'tool_output_tail'
         if (isTail) {
+          if (liveWechatAdapter) {
+            this.deliver({ ...out, blocks: [e.block], isFinal: false }, undefined)
+            return
+          }
           if (adapter) return
           this.deliver({ ...out, blocks: [e.block], isFinal: false }, undefined)
           return
