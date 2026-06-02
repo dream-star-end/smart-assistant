@@ -566,13 +566,17 @@ describe("wechatBroker — onInbound", () => {
   })
 
   test("dispatcher 抛 → broker_failed,never throw 出 broker", async () => {
+    const { sendText, spy: sendSpy } = makeSendText({ ok: true })
     const { dispatcher } = makeDispatcher({ throw: new Error("dispatcher crashed") })
-    const broker = makeWechatBroker(makeDeps({ dispatcher }))
+    const broker = makeWechatBroker(makeDeps({ dispatcher, sendText }))
     const r = await broker.onInbound(makeEvent())
     assert.equal(r.kind, "broker_failed")
     if (r.kind === "broker_failed") {
       assert.ok(r.errMessage.includes("dispatcher crashed"))
     }
+    await flushMicrotasks()
+    assert.equal(sendSpy.calls.length, 1)
+    assert.match(sendSpy.calls[0]!.text, /没能送到执行环境/)
   })
 
   // ── bindingUserId 归一(commercial canonical `c:N` → dispatcher raw `N`) ──
@@ -694,6 +698,23 @@ describe("wechatBroker — onInbound", () => {
     assert.equal(r.kind, "dispatched")
     await flushMicrotasks()
     assert.equal(sendSpy.calls.length, 0)
+  })
+
+  test("dispatcher pre-dispatch failure sends visible retry hint instead of going silent", async () => {
+    const { sendText, spy: sendSpy } = makeSendText({ ok: true })
+    const { dispatcher } = makeDispatcher({
+      kind: "transport_failed",
+      phase: "step1",
+      retryable: true,
+      errMessage: "connect ECONNREFUSED",
+    })
+    const broker = makeWechatBroker(makeDeps({ dispatcher, sendText }))
+    const r = await broker.onInbound(makeEvent({ text: "hello" }))
+    assert.equal(r.kind, "transport_failed")
+    await flushMicrotasks()
+    assert.equal(sendSpy.calls.length, 1)
+    assert.match(sendSpy.calls[0]!.text, /稍后重试/)
+    assert.doesNotMatch(sendSpy.calls[0]!.text, /实时过程/)
   })
 
   test("broker-local /stop delegates to dispatcher.stop and reflects result", async () => {

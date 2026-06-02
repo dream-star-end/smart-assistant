@@ -493,6 +493,11 @@ export function makeWechatBroker(deps: BrokerDeps): WechatBroker {
         idempotencyKey: evt.idempotencyKey,
         errMessage,
       })
+      fireAndForgetReflection(
+        evt,
+        "消息暂时没能送到执行环境，请稍后重试；如果已经打开实时过程链接，也可以在网页端查看状态。",
+        "command_echo",
+      )
       return { kind: "broker_failed", errMessage }
     }
 
@@ -510,6 +515,8 @@ export function makeWechatBroker(deps: BrokerDeps): WechatBroker {
       fireAndForgetReflection(evt, outcome.coldStartReply, "cold_start")
     } else if (outcome.kind === "dispatched" && outcome.started !== false) {
       fireAndForgetReflection(evt, buildWechatRealtimeStartReply(outcome.sessionId), "processing")
+    } else if (outcome.kind !== "dispatched") {
+      fireAndForgetReflection(evt, buildWechatDispatchFailureReply(outcome), "command_echo")
     }
     return outcome
   }
@@ -588,6 +595,25 @@ export function makeWechatBroker(deps: BrokerDeps): WechatBroker {
 
   function isWechatStopCommand(text: string): boolean {
     return /^(?:\/(?:stop|cancel|abort|停止|中断|取消)|停止|中断|取消|终止)$/i.test(text)
+  }
+
+  function buildWechatDispatchFailureReply(outcome: DispatchOutcome): string {
+    switch (outcome.kind) {
+      case "transport_failed":
+        return "消息暂时没能送到执行环境，请稍后重试。"
+      case "container_rejected":
+        return outcome.retryable
+          ? "执行环境暂时异常，请稍后重试。"
+          : "执行环境拒绝了这条消息，请稍后重试或在网页端查看。"
+      case "step2_failed":
+        return "消息处理初始化失败，会话状态没有保存成功。请稍后重试。"
+      case "tunnel_unsupported":
+        return "当前容器连接方式暂不支持微信调度，请在网页端继续。"
+      case "command_echo":
+      case "cold_start":
+      case "dispatched":
+        return "消息暂时无法处理，请稍后重试。"
+    }
   }
 
   async function handleNewCommand(

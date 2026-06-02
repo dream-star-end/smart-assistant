@@ -2888,16 +2888,45 @@ export class Gateway {
         ...(info?.agentId ? { agentId: info.agentId } : {}),
       })
     }
-    const logAsyncDispatchFailure = (err: unknown) => {
+    const publishPostStartDispatchFailure = async (err: unknown) => {
       // A crash before dispatchInbound reaches its own failure cleanup should
       // not pin this idempotency key for 5 minutes and block a user retry.
-      this._seenIdempotencyKeys.delete(idempotencyKey)
+      this._updateWechatIdempotency(idempotencyKey, { started: false })
+      const currentWechat = this._getIdempotencyEntry(idempotencyKey)?.wechat
+      const errMessage = err instanceof Error ? err.message : String(err)
+      const terminalOut = {
+        type: 'outbound.message' as const,
+        sessionKey: currentWechat?.sessionKey ?? sessionKey,
+        channel: 'webchat' as const,
+        peer: peerOut,
+        agentId: currentWechat?.agentId ?? resolvedAgentId,
+        blocks: [
+          {
+            kind: 'text' as const,
+            text: `[error] 微信任务启动后失败：${errMessage.slice(0, 300) || 'unknown error'}`,
+          },
+        ],
+        isFinal: true,
+        ...(currentWechat?.traceId ? { traceId: currentWechat.traceId } : {}),
+        _userId: userId,
+      }
       this.log.error('wechat-inbound async dispatch failed', {
         userId,
         peerId,
         idempotencyKey,
-        sessionKey,
+        sessionKey: terminalOut.sessionKey,
       }, err as Error)
+      this.deliver(terminalOut, undefined)
+      try {
+        await this._sendAdapterOutboundMessage(terminalOut, v3OutboundAdapter)
+      } catch (sendErr) {
+        this.log.error('wechat-inbound async failure terminal send failed', {
+          userId,
+          peerId,
+          idempotencyKey,
+          sessionKey: terminalOut.sessionKey,
+        }, sendErr as Error)
+      }
     }
     const dispatchPromise = this.dispatchInbound(frame as InboundFrame, v3OutboundAdapter)
       .then(() => settleStart({ started: false }))
@@ -2907,7 +2936,7 @@ export class Gateway {
           rejectStart(err)
           return
         }
-        logAsyncDispatchFailure(err)
+        void publishPostStartDispatchFailure(err)
       })
 
     let startOutcome: WechatStartOutcome

@@ -218,3 +218,26 @@ test('duplicate WeChat Step1 waits for the original start promise before ACK', (
     'deduplicated Step1 requests must wait for the original start result instead of replaying provisional started:false metadata',
   )
 })
+
+test('post-start async dispatch failures emit a terminal error to Web and WeChat', () => {
+  assert.match(
+    handleWechatInbound,
+    /publishPostStartDispatchFailure/,
+    'post-start dispatch rejection must not be log-only after Step1 has already ACKed',
+  )
+  assert.match(
+    handleWechatInbound,
+    /this\.deliver\(\s*terminalOut\s*,\s*undefined\s*\)/,
+    'post-start dispatch rejection must terminate the linked Web realtime session',
+  )
+  assert.match(
+    handleWechatInbound,
+    /await\s+this\._sendAdapterOutboundMessage\(\s*terminalOut\s*,\s*v3OutboundAdapter\s*\)/,
+    'post-start dispatch rejection must also send a final error back through WeChat outbound',
+  )
+  assert.match(
+    handleWechatInbound,
+    /_updateWechatIdempotency\(\s*idempotencyKey\s*,\s*\{\s*started:\s*false\s*\}\s*\)/,
+    'post-start dispatch rejection must mark cached WeChat idempotency as no longer running',
+  )
+})
