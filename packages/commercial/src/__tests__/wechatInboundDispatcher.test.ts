@@ -563,6 +563,46 @@ describe("inboundDispatcher — happy path", () => {
     })), [{ sessionId: originalSessionId, runId: "orig-run" }])
   })
 
+  test("deduplicated older wsess does not move an existing current pointer backwards", async () => {
+    const oldDedupedSessionId = FIXED_SESSION_ID
+    const currentSessionId = FIXED_SESSION_ID_2
+    const { transport } = makeTransport([
+      {
+        status: 200,
+        bodyText: JSON.stringify({
+          ok: true,
+          deduplicated: true,
+          started: true,
+          sessionId: oldDedupedSessionId,
+          traceId: "old-run",
+        }),
+      },
+    ])
+    const storage = makeStorageSpies()
+    const pg = makeFakePg({ pointer: currentSessionId })
+    const d = makeInboundDispatcher(
+      makeDeps({
+        transport,
+        pgPool: pg.pg,
+        upsertMasterClientSession: storage.upsertMasterClientSession,
+        softDeleteMasterSession: storage.softDeleteMasterSession,
+      }),
+    )
+    const r = await d.dispatch(makeEvent())
+    assert.equal(r.kind, "dispatched")
+    if (r.kind === "dispatched") {
+      assert.equal(r.sessionId, oldDedupedSessionId)
+      assert.equal(r.newSession, false)
+    }
+    assert.equal(storage.spy.upsertCalls.length, 1)
+    assert.equal(storage.spy.upsertCalls[0]!.sessionId, oldDedupedSessionId)
+    assert.equal(pg.spy.setCalls.length, 0)
+    assert.deepEqual(pg.spy.runningSetCalls.map((c) => ({
+      sessionId: c.sessionId,
+      runId: c.runId,
+    })), [{ sessionId: oldDedupedSessionId, runId: "old-run" }])
+  })
+
   test("reuse session: pointer=existing → upsert NOT called, pointer touched, dispatched newSession=false", async () => {
     const { transport } = makeTransport([
       { status: 200, bodyText: '{"ok":true}' },

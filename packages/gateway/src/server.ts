@@ -7326,6 +7326,9 @@ export class Gateway {
           outputTokens: e.meta?.outputTokens,
           turn: e.meta?.turn,
         })
+        if (frame.idempotencyKey) {
+          this._updateWechatIdempotency(frame.idempotencyKey, { started: false })
+        }
         if (liveWechatAdapter) {
           // Web gets the normal stream above, then an empty final terminator.
           // WeChat gets exactly one final text message.  If the agent completed

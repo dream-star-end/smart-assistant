@@ -194,3 +194,11 @@ test('handleWechatInbound preserves peer.displayName on the outbound frame', () 
     'peer.displayName carrier 必须被透传(broker senderId 协议依赖此字段)',
   )
 })
+
+test('dispatchInbound marks completed WeChat idempotency entries as no longer started', () => {
+  assert.match(
+    SERVER_TS,
+    /_updateWechatIdempotency\(\s*frame\.idempotencyKey\s*,\s*\{\s*started:\s*false\s*\}\s*\)/,
+    'successful final must flip cached WeChat idempotency metadata to started:false so late Step1 retries do not recreate phantom running rows',
+  )
+})

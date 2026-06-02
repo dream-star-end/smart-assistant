@@ -400,7 +400,9 @@ export function makeInboundDispatcher(deps: InboundDispatcherDeps): InboundDispa
       }
 
       let sessionId: WechatSessionId = current ?? newSessionId()
-      let newSession = current === null
+      const newSession = current === null
+      let shouldUpsertMasterSession = newSession
+      let shouldSetCurrentPointer = true
 
       // **稳定时间戳**:Step 2a 的 createdAt / lastAt 用同一 now() pin 住,避免一次 dispatch
       // 内 createdAt / lastAt 错开 1 ms(测试 `createdAt === lastAt` 断言依赖)。
@@ -558,11 +560,19 @@ export function makeInboundDispatcher(deps: InboundDispatcherDeps): InboundDispa
           acceptedSessionId: step1Accepted.sessionId,
         })
         sessionId = step1Accepted.sessionId
-        newSession = current !== sessionId
+        if (current !== null && current !== sessionId) {
+          // A retry for an older WeChat message may arrive after the user has
+          // already moved the binding pointer to a newer wsess.  Adopt the
+          // original runner's wsess for master row / running-session tracking,
+          // but never use the retry's later timestamp to move the current
+          // pointer backwards.
+          shouldSetCurrentPointer = false
+          shouldUpsertMasterSession = true
+        }
       }
 
       // ── 4) Step 2a: master sqlite client_sessions 写(仅 newSession) ──
-      if (newSession) {
+      if (shouldUpsertMasterSession) {
         try {
           await deps.upsertMasterClientSession({
             sessionId,
@@ -597,66 +607,73 @@ export function makeInboundDispatcher(deps: InboundDispatcherDeps): InboundDispa
       }
 
       // ── 5) Step 2b: PG wechat_session_pointer 写 ──────────────────────
-      try {
-        const applied = await setCurrentSessionId(
-          deps.pgPool,
-          evt.bindingUserId,
-          sessionId,
-          dispatchNow,
-          agentId,
-        )
-        if (!applied) {
-          // updated_at <= EXCLUDED guard 过滤(stale ts):P1 单进程不会真触发,
-          // 但 setCurrentSessionId 已经声明 false 是合法应答 — log warn,outcome 算
-          // dispatched(容器侧 Step 1 已经完成,pointer 没更新仅意味着指向更旧的活会话,
-          // 不算 error)
-          reqLog.warn("pointer_write_stale_skip", { sessionId })
-        }
-      } catch (err) {
-        const errMessage = (err as Error)?.message ?? String(err)
-        reqLog.error("step2b_pg_pointer_failed", { sessionId, errMessage })
-
-        let compensation: "ok" | "failed" | "skipped_reuse"
-        if (newSession) {
-          // newSession 路径:容器侧那条 row 是本次 inbound 才建的,撤回安全
-          compensation = await tryCompensation(
-            deps.transport,
-            endpoint,
-            sessionId,
+      if (shouldSetCurrentPointer) {
+        try {
+          const applied = await setCurrentSessionId(
+            deps.pgPool,
             evt.bindingUserId,
-            nonce,
-            "step2b_failed",
-            requestId,
-            compensateTimeoutMs,
-            reqLog,
+            sessionId,
+            dispatchNow,
+            agentId,
           )
-          // 同时撤 master sqlite Step 2a 写
-          try {
-            await deps.softDeleteMasterSession(
-              sessionId,
-              MASTER_USER_PREFIX + evt.bindingUserId,
-            )
-          } catch (softErr) {
-            reqLog.error("master_softdelete_after_pg_fail_also_failed", {
-              sessionId,
-              errMessage: (softErr as Error)?.message ?? String(softErr),
-            })
-            // 不影响 compensation 字段:dispatcher 已尽力,reconcile 兜底
+          if (!applied) {
+            // updated_at <= EXCLUDED guard 过滤(stale ts):P1 单进程不会真触发,
+            // 但 setCurrentSessionId 已经声明 false 是合法应答 — log warn,outcome 算
+            // dispatched(容器侧 Step 1 已经完成,pointer 没更新仅意味着指向更旧的活会话,
+            // 不算 error)
+            reqLog.warn("pointer_write_stale_skip", { sessionId })
           }
-        } else {
-          // reuseSession 路径:容器侧 row 是合法在用的活会话,撤回会破坏
-          // 未来 dispatchInbound — 跳过 compensation,只 log;pointer 漂移
-          // 由 reconcile 兜底修正
-          reqLog.warn("step2b_compensation_skipped_reuse", { sessionId })
-          compensation = "skipped_reuse"
-        }
+        } catch (err) {
+          const errMessage = (err as Error)?.message ?? String(err)
+          reqLog.error("step2b_pg_pointer_failed", { sessionId, errMessage })
 
-        return {
-          kind: "step2_failed",
-          phase: "pg_pointer",
-          compensation,
-          errMessage,
+          let compensation: "ok" | "failed" | "skipped_reuse"
+          if (newSession) {
+            // newSession 路径:容器侧那条 row 是本次 inbound 才建的,撤回安全
+            compensation = await tryCompensation(
+              deps.transport,
+              endpoint,
+              sessionId,
+              evt.bindingUserId,
+              nonce,
+              "step2b_failed",
+              requestId,
+              compensateTimeoutMs,
+              reqLog,
+            )
+            // 同时撤 master sqlite Step 2a 写
+            try {
+              await deps.softDeleteMasterSession(
+                sessionId,
+                MASTER_USER_PREFIX + evt.bindingUserId,
+              )
+            } catch (softErr) {
+              reqLog.error("master_softdelete_after_pg_fail_also_failed", {
+                sessionId,
+                errMessage: (softErr as Error)?.message ?? String(softErr),
+              })
+              // 不影响 compensation 字段:dispatcher 已尽力,reconcile 兜底
+            }
+          } else {
+            // reuseSession 路径:容器侧 row 是合法在用的活会话,撤回会破坏
+            // 未来 dispatchInbound — 跳过 compensation,只 log;pointer 漂移
+            // 由 reconcile 兜底修正
+            reqLog.warn("step2b_compensation_skipped_reuse", { sessionId })
+            compensation = "skipped_reuse"
+          }
+
+          return {
+            kind: "step2_failed",
+            phase: "pg_pointer",
+            compensation,
+            errMessage,
+          }
         }
+      } else {
+        reqLog.info("pointer_write_skipped_dedup_old_session", {
+          sessionId,
+          currentSessionId: current,
+        })
       }
 
       if (step1Accepted.started !== false) {
