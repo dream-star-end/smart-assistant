@@ -2872,6 +2872,7 @@ export class Gateway {
       this.sendJson(res, 200, {
         ok: true,
         deduplicated: true,
+        accepted: originalWechat.started !== false,
         started: originalWechat.started,
         sessionKey: originalWechat.sessionKey,
         sessionId: originalPeerId,
@@ -2925,11 +2926,15 @@ export class Gateway {
       this._updateWechatIdempotency(idempotencyKey, { started: false })
       const currentWechat = this._getIdempotencyEntry(idempotencyKey)?.wechat
       const errMessage = err instanceof Error ? err.message : String(err)
+      const terminalPeer = {
+        ...peerOut,
+        id: currentWechat?.peerId ?? wechatPeerIdFromSessionKey(currentWechat?.sessionKey) ?? peerId,
+      }
       const terminalOut = {
         type: 'outbound.message' as const,
         sessionKey: currentWechat?.sessionKey ?? sessionKey,
         channel: 'webchat' as const,
-        peer: peerOut,
+        peer: terminalPeer,
         agentId: currentWechat?.agentId ?? resolvedAgentId,
         blocks: [
           {

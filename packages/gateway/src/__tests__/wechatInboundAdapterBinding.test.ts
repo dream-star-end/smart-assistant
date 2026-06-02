@@ -276,6 +276,11 @@ test('duplicate WeChat Step1 ACK returns the cached routed wsess', () => {
     /sessionId:\s*originalPeerId/,
     'duplicate Step1 ACK must return the routed cached wsess as sessionId',
   )
+  assert.match(
+    handleWechatInbound,
+    /accepted:\s*originalWechat\.started\s*!==\s*false/,
+    'duplicates for already-completed turns must be accepted:false so master does not recreate stale session state',
+  )
 })
 
 test('pre-start terminal dispatch exits are ACKed as unaccepted, not ghost sessions', () => {
@@ -316,6 +321,11 @@ test('post-start async dispatch failures emit a terminal error to Web and WeChat
     handleWechatInbound,
     /this\.deliver\(\s*terminalOut\s*,\s*undefined\s*\)/,
     'post-start dispatch rejection must terminate the linked Web realtime session',
+  )
+  assert.match(
+    handleWechatInbound,
+    /const terminalPeer\s*=\s*\{[\s\S]+id:\s*currentWechat\?\.peerId\s*\?\?\s*wechatPeerIdFromSessionKey\(currentWechat\?\.sessionKey\)\s*\?\?\s*peerId/,
+    'post-start dispatch rejection must send its terminal error to the routed wsess, not the provisional Step1 peer',
   )
   assert.match(
     handleWechatInbound,
