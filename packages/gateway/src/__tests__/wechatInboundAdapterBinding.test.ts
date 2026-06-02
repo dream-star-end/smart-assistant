@@ -229,6 +229,34 @@ test('WeChat Step1 ACK returns the routed wsess when dispatch reroutes the runne
   )
 })
 
+test('WeChat realtime-link routing does not erase WeChat channel side effects', () => {
+  assert.match(
+    handleWechatInbound,
+    /_rateLimitChannel\s*=\s*['"]wechat['"]/,
+    'WeChat inbound must keep a WeChat-scoped rate-limit bucket even though the runner session is webchat',
+  )
+  assert.match(
+    handleWechatInbound,
+    /_lastActiveChannel\s*=\s*['"]wechat['"]/,
+    'WeChat inbound must preserve WeChat as last-active channel for proactive pushes',
+  )
+  assert.match(
+    handleWechatInbound,
+    /_lastActivePeerId\s*=\s*`\$\{userId\.slice\(2\)\}:\$\{peerDisplayName\}`/,
+    'proactive WeChat pushes need the legacy wechat adapter peer id shape <bindingUserId>:<senderId>',
+  )
+  assert.match(
+    SERVER_TS,
+    /const rateLimitChannel[\s\S]+_rateLimitChannel[\s\S]+rateLimiter\.check\(frame\.peer\.id,\s*rateLimitChannel\)/,
+    'dispatchInbound must not charge WeChat-originated retries against the linked webchat bucket',
+  )
+  assert.match(
+    SERVER_TS,
+    /const lastActiveChannel[\s\S]+_lastActiveChannel[\s\S]+channel:\s*lastActiveChannel/,
+    'dispatchInbound must record the original channel when a private last-active override is present',
+  )
+})
+
 test('duplicate WeChat Step1 waits for the original start promise before ACK', () => {
   assert.match(
     SERVER_TS,

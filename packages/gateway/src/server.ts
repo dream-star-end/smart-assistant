@@ -2790,6 +2790,15 @@ export class Gateway {
     // _userId 私有 stash,与 WS path(line 4163)同语义:dispatchInbound 内部读
     // (frame as any)._userId 决定 peerKey 命名空间和 client_sessions 归属。
     ;(frame as any)._userId = userId
+    // The turn must run in the `webchat` session namespace so the realtime
+    // link can attach to the same runner, but WeChat remains the ingress
+    // surface for channel-scoped side effects that are not part of session
+    // routing: rate-limit buckets and proactive-push last-active bookkeeping.
+    ;(frame as any)._rateLimitChannel = 'wechat'
+    ;(frame as any)._lastActiveChannel = 'wechat'
+    if (typeof peerDisplayName === 'string' && peerDisplayName.length > 0) {
+      ;(frame as any)._lastActivePeerId = `${userId.slice(2)}:${peerDisplayName}`
+    }
 
     // V3 broker → 容器 outbound 回路。
     //
@@ -6639,7 +6648,11 @@ export class Gateway {
 
     // ── Rate limiting: per-peer sliding window ──
     // Only non-duplicate messages consume rate-limit budget
-    if (!this.rateLimiter.check(frame.peer.id, frame.channel)) {
+    const rateLimitChannel: string =
+      typeof (frame as any)._rateLimitChannel === 'string'
+        ? (frame as any)._rateLimitChannel
+        : frame.channel
+    if (!this.rateLimiter.check(frame.peer.id, rateLimitChannel)) {
       const rlUserId: string =
         typeof (frame as any)._userId === 'string' ? (frame as any)._userId : 'default'
       const rateLimitOut = {
@@ -6801,9 +6814,17 @@ export class Gateway {
     // Track last active channel for proactive push
     const activeUserId: string =
       typeof (frame as any)._userId === 'string' ? (frame as any)._userId : 'default'
+    const lastActiveChannel: string =
+      typeof (frame as any)._lastActiveChannel === 'string'
+        ? (frame as any)._lastActiveChannel
+        : frame.channel
+    const lastActivePeerId: string =
+      typeof (frame as any)._lastActivePeerId === 'string'
+        ? (frame as any)._lastActivePeerId
+        : frame.peer.id
     this.lastActiveChannel.set(agent.id, {
-      channel: frame.channel,
-      peerId: frame.peer.id,
+      channel: lastActiveChannel,
+      peerId: lastActivePeerId,
       sessionKey,
       userId: activeUserId,
       at: Date.now(),
