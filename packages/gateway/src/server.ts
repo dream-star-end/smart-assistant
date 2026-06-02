@@ -505,6 +505,8 @@ export interface GatewayDeps {
   commercial?: CommercialHook
 }
 
+type WechatStartOutcome = { started: boolean; traceId?: string; sessionKey?: string; agentId?: string }
+
 export class Gateway {
   private wss!: WebSocketServer
   private httpServer!: ReturnType<typeof createServer>
@@ -538,6 +540,7 @@ export class Gateway {
       agentId: string
       started: boolean
       traceId?: string
+      startPromise?: Promise<WechatStartOutcome>
     }
   }>() // key → timestamp + optional WeChat retry metadata
   private static readonly IDEMPOTENCY_MAX_KEYS = 1000
@@ -559,6 +562,7 @@ export class Gateway {
       agentId: string
       started: boolean
       traceId?: string
+      startPromise?: Promise<WechatStartOutcome>
     }
   } | null {
     if (!key) return null
@@ -591,6 +595,7 @@ export class Gateway {
       agentId: string
       started: boolean
       traceId?: string
+      startPromise?: Promise<WechatStartOutcome>
     },
   ): void {
     if (key) this._seenIdempotencyKeys.set(key, { ts: Date.now(), ...(wechat ? { wechat } : {}) })
@@ -2815,10 +2820,26 @@ export class Gateway {
     // tell dispatchInbound not to treat that reservation as a duplicate.
     const duplicateEntry = this._getIdempotencyEntry(idempotencyKey)
     if (duplicateEntry) {
-      const originalWechat = duplicateEntry.wechat
+      let originalWechat = duplicateEntry.wechat
       if (!originalWechat) {
         this.sendJson(res, 409, { error: 'duplicate idempotencyKey owned by non-WeChat turn' })
         return
+      }
+      if (!originalWechat.started && !originalWechat.traceId && originalWechat.startPromise) {
+        try {
+          await originalWechat.startPromise
+          originalWechat = this._getIdempotencyEntry(idempotencyKey)?.wechat ?? originalWechat
+        } catch (err) {
+          this._seenIdempotencyKeys.delete(idempotencyKey)
+          this.log.error('wechat-inbound duplicate failed before original start', {
+            userId,
+            peerId,
+            idempotencyKey,
+            sessionKey: originalWechat.sessionKey,
+          }, err as Error)
+          this.sendJson(res, 500, { error: 'dispatch failed before start' })
+          return
+        }
       }
       this.sendJson(res, 200, {
         ok: true,
@@ -2831,15 +2852,7 @@ export class Gateway {
       })
       return
     }
-    this._markIdempotencyKey(idempotencyKey, {
-      sessionKey,
-      peerId,
-      agentId: resolvedAgentId,
-      started: false,
-    })
-    ;(frame as any)._idempotencyPreReserved = true
 
-    type WechatStartOutcome = { started: boolean; traceId?: string; sessionKey?: string; agentId?: string }
     let startSettled = false
     let resolveStart!: (value: WechatStartOutcome) => void
     let rejectStart!: (err: unknown) => void
@@ -2852,6 +2865,15 @@ export class Gateway {
       startSettled = true
       resolveStart(value)
     }
+    this._markIdempotencyKey(idempotencyKey, {
+      sessionKey,
+      peerId,
+      agentId: resolvedAgentId,
+      started: false,
+      startPromise,
+    })
+    ;(frame as any)._idempotencyPreReserved = true
+
     ;(frame as any)._wechatDispatchStarted = (info?: { traceId?: string; sessionKey?: string; agentId?: string }) => {
       this._updateWechatIdempotency(idempotencyKey, {
         started: true,

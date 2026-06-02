@@ -210,3 +210,11 @@ test('WeChat Step1 start callback reports routed sessionKey and agentId', () => 
     'Step1 ACK must expose the post-routing sessionKey/agentId so master stores the same runner tuple used by Web hello and /stop',
   )
 })
+
+test('duplicate WeChat Step1 waits for the original start promise before ACK', () => {
+  assert.match(
+    SERVER_TS,
+    /await\s+originalWechat\.startPromise/,
+    'deduplicated Step1 requests must wait for the original start result instead of replaying provisional started:false metadata',
+  )
+})
