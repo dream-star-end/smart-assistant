@@ -30,6 +30,7 @@ import {
   makeInboundDispatcher,
   WECHAT_INBOUND_COMPENSATE_PATH,
   WECHAT_INBOUND_CONTAINER_PATH,
+  WECHAT_STOP_CONTAINER_PATH,
   type ContainerTransport,
   type DispatchOutcome,
   type InboundDispatcherDeps,
@@ -47,6 +48,7 @@ const CONTAINER_ID = 7
 const BRIDGE_SECRET = "a".repeat(64)
 const FIXED_NOW = 1_700_000_000_000
 const FIXED_SESSION_ID = "wsess-0123456789abcdef" as WechatSessionId
+const FIXED_SESSION_ID_2 = "wsess-fedcba9876543210" as WechatSessionId
 
 function expectedNonce(): string {
   return createHmac("sha256", BRIDGE_SECRET).update(`inbound:${CONTAINER_ID}`).digest("base64url")
@@ -102,7 +104,10 @@ function makeTransport(
 
 interface PgSpy {
   getCalls: Array<{ bindingUserId: string }>
-  setCalls: Array<{ bindingUserId: string; sessionId: string; now: number }>
+  setCalls: Array<{ bindingUserId: string; sessionId: string; now: number; agentId: string | null }>
+  runningListCalls: Array<{ bindingUserId: string }>
+  runningSetCalls: Array<{ bindingUserId: string; sessionId: string; runId: string; agentId: string | null; now: number }>
+  runningClearCalls: Array<{ bindingUserId: string; sessionId: string; runId: string }>
 }
 
 /**
@@ -115,25 +120,31 @@ interface PgSpy {
 function makeFakePg(opts: {
   /** SELECT 返回的 current_session_id;null = 行不存在 */
   pointer: string | null
+  pointerAgentId?: string
   /** INSERT/UPDATE 是否真生效;false 模拟 stale skip */
   applySet?: boolean
+  runningSessions?: Array<{ sessionId: string; runId: string; agentId?: string }>
   throwOnGet?: Error
   throwOnSet?: Error
+  throwOnRunningList?: Error
 }): { pg: PgConn; spy: PgSpy } {
-  const spy: PgSpy = { getCalls: [], setCalls: [] }
+  const spy: PgSpy = { getCalls: [], setCalls: [], runningListCalls: [], runningSetCalls: [], runningClearCalls: [] }
   const pg: PgConn = {
     async query<R extends Record<string, unknown> = Record<string, unknown>>(
       sql: string,
       params: ReadonlyArray<unknown> = [],
     ): Promise<{ rows: R[]; rowCount: number | null }> {
-      if (/SELECT current_session_id FROM wechat_session_pointer/i.test(sql)) {
+      if (/SELECT current_session_id(?:,\s*current_agent_id)? FROM wechat_session_pointer/i.test(sql)) {
         if (opts.throwOnGet) throw opts.throwOnGet
         spy.getCalls.push({ bindingUserId: String(params[0]) })
         if (opts.pointer === null) {
           return { rows: [] as R[], rowCount: 0 }
         }
         return {
-          rows: [{ current_session_id: opts.pointer } as unknown as R],
+          rows: [{
+            current_session_id: opts.pointer,
+            current_agent_id: opts.pointerAgentId ?? null,
+          } as unknown as R],
           rowCount: 1,
         }
       }
@@ -143,9 +154,40 @@ function makeFakePg(opts: {
           bindingUserId: String(params[0]),
           sessionId: String(params[1]),
           now: Number(params[2]),
+          agentId: params[3] === null ? null : String(params[3]),
         })
         const applied = opts.applySet ?? true
         return { rows: [] as R[], rowCount: applied ? 1 : 0 }
+      }
+      if (/SELECT session_id, run_id, agent_id\s+FROM wechat_running_sessions/i.test(sql)) {
+        if (opts.throwOnRunningList) throw opts.throwOnRunningList
+        spy.runningListCalls.push({ bindingUserId: String(params[0]) })
+        return {
+          rows: (opts.runningSessions ?? []).map((s) => ({
+            session_id: s.sessionId,
+            run_id: s.runId,
+            agent_id: s.agentId ?? null,
+          })) as unknown as R[],
+          rowCount: opts.runningSessions?.length ?? 0,
+        }
+      }
+      if (/INSERT INTO wechat_running_sessions/i.test(sql)) {
+        spy.runningSetCalls.push({
+          bindingUserId: String(params[0]),
+          sessionId: String(params[1]),
+          runId: String(params[2]),
+          agentId: params[3] === null ? null : String(params[3]),
+          now: Number(params[4]),
+        })
+        return { rows: [] as R[], rowCount: 1 }
+      }
+      if (/DELETE FROM wechat_running_sessions/i.test(sql)) {
+        spy.runningClearCalls.push({
+          bindingUserId: String(params[0]),
+          sessionId: String(params[1]),
+          runId: String(params[2]),
+        })
+        return { rows: [] as R[], rowCount: 1 }
       }
       throw new Error(`makeFakePg: unhandled SQL: ${sql.slice(0, 80)}`)
     },
@@ -213,7 +255,9 @@ function makeDeps(overrides: Partial<InboundDispatcherDeps> = {}): InboundDispat
     bridgeSecret: BRIDGE_SECRET,
     upsertMasterClientSession: storage.upsertMasterClientSession,
     softDeleteMasterSession: storage.softDeleteMasterSession,
-    transport: makeTransport([{ status: 200, bodyText: '{"ok":true,"dispatched":true}' }]).transport,
+    transport: makeTransport([
+      { status: 200, bodyText: '{"ok":true,"started":true,"traceId":"run-default"}' },
+    ]).transport,
     newSessionId: () => FIXED_SESSION_ID,
     now: () => FIXED_NOW,
     newRequestId: () => "req-fixed",
@@ -268,6 +312,163 @@ describe("inboundDispatcher — command echo", () => {
     )
     const r = await d.dispatch(makeEvent({ text: "  /list" }))
     assert.notEqual(r.kind, "command_echo")
+  })
+})
+
+describe("inboundDispatcher — stop command bridge", () => {
+  test("stop with no current session returns local no-op reply and does not POST", async () => {
+    const { transport, spy: tSpy } = makeTransport([
+      { throw: new Error("transport should not be called") },
+    ])
+    const d = makeInboundDispatcher(
+      makeDeps({
+        pgPool: makeFakePg({ pointer: null }).pg,
+        transport,
+      }),
+    )
+    const r = await d.stop(makeEvent({ text: "/stop" }))
+    assert.equal(r.kind, "command_echo")
+    assert.equal(r.interrupted, false)
+    assert.match(r.reply, /没有可中断/)
+    assert.equal(tSpy.posts.length, 0)
+  })
+
+  test("stop posts current wsess to container stop endpoint", async () => {
+    const pg = makeFakePg({ pointer: FIXED_SESSION_ID })
+    const { transport, spy: tSpy } = makeTransport([
+      { status: 200, bodyText: '{"ok":true,"interrupted":true}' },
+    ])
+    const d = makeInboundDispatcher(
+      makeDeps({
+        pgPool: pg.pg,
+        transport,
+      }),
+    )
+    const r = await d.stop(makeEvent({ text: "/stop" }))
+    assert.equal(r.interrupted, true)
+    assert.match(r.reply, /已发送中断/)
+    assert.equal(tSpy.posts.length, 1)
+    assert.equal(tSpy.posts[0]!.path, WECHAT_STOP_CONTAINER_PATH)
+    assert.equal(tSpy.posts[0]!.bodyParsed.userId, "c:42")
+    assert.deepEqual(tSpy.posts[0]!.bodyParsed.peer, { kind: "dm", id: FIXED_SESSION_ID })
+    assert.equal(
+      "agentId" in tSpy.posts[0]!.bodyParsed,
+      false,
+      "pointer-only fallback without current_agent_id must omit agentId so the container scans the live wsess runner",
+    )
+    assert.equal(tSpy.posts[0]!.headers["x-openclaude-inbound-nonce"], expectedNonce())
+  })
+
+  test("stop pointer fallback preserves current_agent_id when present", async () => {
+    const pg = makeFakePg({ pointer: FIXED_SESSION_ID, pointerAgentId: "codex" })
+    const { transport, spy: tSpy } = makeTransport([
+      { status: 200, bodyText: '{"ok":true,"interrupted":true}' },
+    ])
+    const d = makeInboundDispatcher(makeDeps({ pgPool: pg.pg, transport }))
+    const r = await d.stop(makeEvent({ text: "/stop" }))
+    assert.equal(r.interrupted, true)
+    assert.equal(tSpy.posts.length, 1)
+    assert.equal(tSpy.posts[0]!.bodyParsed.agentId, "codex")
+  })
+
+  test("stop omits agentId for running rows without agent_id so the container scans by wsess", async () => {
+    const pg = makeFakePg({
+      pointer: null,
+      runningSessions: [{ sessionId: FIXED_SESSION_ID, runId: "run-without-agent" }],
+    })
+    const { transport, spy: tSpy } = makeTransport([
+      { status: 200, bodyText: '{"ok":true,"interrupted":true}' },
+    ])
+    const d = makeInboundDispatcher(makeDeps({ pgPool: pg.pg, transport }))
+    const r = await d.stop(makeEvent({ text: "/stop", agentId: "main" }))
+    assert.equal(r.interrupted, true)
+    assert.equal(tSpy.posts.length, 1)
+    assert.deepEqual(tSpy.posts[0]!.bodyParsed.peer, { kind: "dm", id: FIXED_SESSION_ID })
+    assert.equal(
+      "agentId" in tSpy.posts[0]!.bodyParsed,
+      false,
+      "NULL running-session agent_id must omit agentId so Gateway.handleStop can scan live sessions across agents",
+    )
+  })
+
+  test("stop falls back to current pointer when running-session lookup fails", async () => {
+    const pg = makeFakePg({
+      pointer: FIXED_SESSION_ID,
+      throwOnRunningList: new Error("relation wechat_running_sessions does not exist"),
+    })
+    const { transport, spy: tSpy } = makeTransport([
+      { status: 200, bodyText: '{"ok":true,"interrupted":true}' },
+    ])
+    const d = makeInboundDispatcher(makeDeps({ pgPool: pg.pg, transport }))
+    const r = await d.stop(makeEvent({ text: "/stop" }))
+    assert.equal(r.interrupted, true)
+    assert.equal(pg.spy.getCalls.length, 1)
+    assert.equal(tSpy.posts.length, 1)
+    assert.deepEqual(tSpy.posts[0]!.bodyParsed.peer, { kind: "dm", id: FIXED_SESSION_ID })
+    assert.equal(
+      "agentId" in tSpy.posts[0]!.bodyParsed,
+      false,
+      "legacy pointer fallback should still let the container scan live wsess runners",
+    )
+  })
+
+  test("stop targets running sessions before current pointer and keeps rows until terminal final", async () => {
+    const pg = makeFakePg({
+      pointer: FIXED_SESSION_ID,
+      runningSessions: [
+        { sessionId: FIXED_SESSION_ID_2, runId: "run-2", agentId: "coder" },
+        { sessionId: FIXED_SESSION_ID, runId: "run-1", agentId: "main" },
+      ],
+    })
+    const { transport, spy: tSpy } = makeTransport([
+      { status: 200, bodyText: '{"ok":true,"interrupted":true}' },
+      { status: 200, bodyText: '{"ok":true,"interrupted":true}' },
+    ])
+    const d = makeInboundDispatcher(makeDeps({ pgPool: pg.pg, transport }))
+    const r = await d.stop(makeEvent({ text: "/stop" }))
+    assert.equal(r.interrupted, true)
+    assert.match(r.reply, /2\/2/)
+    assert.equal(pg.spy.getCalls.length, 1)
+    assert.equal(tSpy.posts.length, 2)
+    assert.deepEqual(tSpy.posts.map((p) => p.bodyParsed.peer), [
+      { kind: "dm", id: FIXED_SESSION_ID_2 },
+      { kind: "dm", id: FIXED_SESSION_ID },
+    ])
+    assert.deepEqual(tSpy.posts.map((p) => p.bodyParsed.agentId), ["coder", "main"])
+    assert.deepEqual(
+      pg.spy.runningClearCalls,
+      [],
+      "interrupted:true only acknowledges the stop request; keep rows until final clears them so repeated /stop can still target stuck tasks",
+    )
+  })
+
+  test("stop merges current pointer fallback when stale tracked rows are present", async () => {
+    const pg = makeFakePg({
+      pointer: FIXED_SESSION_ID,
+      runningSessions: [
+        { sessionId: FIXED_SESSION_ID_2, runId: "run-stale", agentId: "coder" },
+      ],
+    })
+    const { transport, spy: tSpy } = makeTransport([
+      { status: 200, bodyText: '{"ok":true,"interrupted":false}' },
+      { status: 200, bodyText: '{"ok":true,"interrupted":true}' },
+    ])
+    const d = makeInboundDispatcher(makeDeps({ pgPool: pg.pg, transport }))
+    const r = await d.stop(makeEvent({ text: "/stop" }))
+    assert.equal(r.interrupted, true)
+    assert.match(r.reply, /1\/2/)
+    assert.equal(pg.spy.getCalls.length, 1)
+    assert.equal(tSpy.posts.length, 2)
+    assert.deepEqual(tSpy.posts.map((p) => p.bodyParsed.peer), [
+      { kind: "dm", id: FIXED_SESSION_ID_2 },
+      { kind: "dm", id: FIXED_SESSION_ID },
+    ])
+    assert.deepEqual(tSpy.posts.map((p) => p.bodyParsed.agentId), ["coder", undefined])
+    assert.deepEqual(
+      pg.spy.runningClearCalls,
+      [],
+      "interrupted:false is not proof the runner ended; keep the row so a later /stop can retry the same concrete target",
+    )
   })
 })
 
@@ -373,7 +574,7 @@ describe("inboundDispatcher — tunnel transport", () => {
 describe("inboundDispatcher — happy path", () => {
   test("new session: pointer=null → upsert called, pointer set, outcome dispatched newSession=true", async () => {
     const { transport, spy: tSpy } = makeTransport([
-      { status: 200, bodyText: '{"ok":true,"dispatched":true}' },
+      { status: 200, bodyText: '{"ok":true,"started":true,"traceId":"run-happy"}' },
     ])
     const storage = makeStorageSpies()
     const pg = makeFakePg({ pointer: null })
@@ -408,6 +609,240 @@ describe("inboundDispatcher — happy path", () => {
     assert.equal(pg.spy.setCalls.length, 1)
     assert.equal(pg.spy.setCalls[0]!.sessionId, FIXED_SESSION_ID)
     assert.equal(pg.spy.setCalls[0]!.now, FIXED_NOW)
+    assert.equal(pg.spy.runningSetCalls.length, 1)
+    assert.equal(pg.spy.runningSetCalls[0]!.sessionId, FIXED_SESSION_ID)
+  })
+
+  test("Step1 ACK without traceId does not invent a running-session key", async () => {
+    const { transport } = makeTransport([
+      { status: 200, bodyText: '{"ok":true,"started":true}' },
+    ])
+    const storage = makeStorageSpies()
+    const pg = makeFakePg({ pointer: null })
+    const d = makeInboundDispatcher(
+      makeDeps({
+        transport,
+        pgPool: pg.pg,
+        upsertMasterClientSession: storage.upsertMasterClientSession,
+        softDeleteMasterSession: storage.softDeleteMasterSession,
+      }),
+    )
+    const r = await d.dispatch(makeEvent())
+    assert.equal(r.kind, "dispatched")
+    assert.equal(storage.spy.upsertCalls.length, 1)
+    assert.equal(pg.spy.setCalls.length, 1)
+    assert.equal(
+      pg.spy.runningSetCalls.length,
+      0,
+      "without container traceId, final cleanup cannot match a synthetic requestId run key",
+    )
+  })
+
+  test("deduplicated Step1 response adopts original wsess before master pointer/upsert", async () => {
+    const originalSessionId = FIXED_SESSION_ID
+    const retryAllocatedSessionId = FIXED_SESSION_ID_2
+    const { transport, spy: tSpy } = makeTransport([
+      {
+        status: 200,
+        bodyText: JSON.stringify({
+          ok: true,
+          deduplicated: true,
+          started: true,
+          sessionId: originalSessionId,
+          traceId: "orig-run",
+        }),
+      },
+    ])
+    const storage = makeStorageSpies()
+    const pg = makeFakePg({ pointer: null })
+    const d = makeInboundDispatcher(
+      makeDeps({
+        transport,
+        pgPool: pg.pg,
+        upsertMasterClientSession: storage.upsertMasterClientSession,
+        softDeleteMasterSession: storage.softDeleteMasterSession,
+        newSessionId: () => retryAllocatedSessionId,
+      }),
+    )
+    const r = await d.dispatch(makeEvent())
+    assert.equal(r.kind, "dispatched")
+    if (r.kind === "dispatched") {
+      assert.equal(r.sessionId, originalSessionId)
+      assert.equal(r.newSession, true)
+    }
+    assert.equal(tSpy.posts[0]!.bodyParsed.peer.id, retryAllocatedSessionId)
+    assert.equal(storage.spy.upsertCalls[0]!.sessionId, originalSessionId)
+    assert.equal(pg.spy.setCalls[0]!.sessionId, originalSessionId)
+    assert.deepEqual(pg.spy.runningSetCalls.map((c) => ({
+      sessionId: c.sessionId,
+      runId: c.runId,
+    })), [{ sessionId: originalSessionId, runId: "orig-run" }])
+  })
+
+  test("deduplicated Step1 response for an already completed turn does not re-mark it running", async () => {
+    const { transport } = makeTransport([
+      {
+        status: 200,
+        bodyText: JSON.stringify({
+          ok: true,
+          deduplicated: true,
+          started: true,
+          completed: true,
+          sessionId: FIXED_SESSION_ID,
+          traceId: "completed-run",
+        }),
+      },
+    ])
+    const storage = makeStorageSpies()
+    const pg = makeFakePg({ pointer: null })
+    const d = makeInboundDispatcher(
+      makeDeps({
+        transport,
+        pgPool: pg.pg,
+        upsertMasterClientSession: storage.upsertMasterClientSession,
+        softDeleteMasterSession: storage.softDeleteMasterSession,
+      }),
+    )
+    const r = await d.dispatch(makeEvent())
+    assert.equal(r.kind, "dispatched")
+    if (r.kind === "dispatched") assert.equal(r.completed, true)
+    assert.equal(storage.spy.upsertCalls.length, 1)
+    assert.equal(pg.spy.setCalls.length, 1)
+    assert.equal(pg.spy.runningSetCalls.length, 0)
+  })
+
+  test("Step1 routed agentId is persisted for web hello and /stop targets", async () => {
+    const { transport } = makeTransport([
+      {
+        status: 200,
+        bodyText: JSON.stringify({
+          ok: true,
+          started: true,
+          sessionKey: `agent:codex:webchat:dm:${FIXED_SESSION_ID}`,
+          agentId: "codex",
+          traceId: "codex-run",
+        }),
+      },
+    ])
+    const storage = makeStorageSpies()
+    const pg = makeFakePg({ pointer: null })
+    const d = makeInboundDispatcher(
+      makeDeps({
+        transport,
+        pgPool: pg.pg,
+        upsertMasterClientSession: storage.upsertMasterClientSession,
+        softDeleteMasterSession: storage.softDeleteMasterSession,
+      }),
+    )
+    const r = await d.dispatch(makeEvent({ agentId: "main" }))
+    assert.equal(r.kind, "dispatched")
+    assert.equal(storage.spy.upsertCalls[0]!.agentId, "codex")
+    assert.equal(pg.spy.setCalls[0]!.agentId, "codex")
+    assert.deepEqual(pg.spy.runningSetCalls.map((c) => ({
+      sessionId: c.sessionId,
+      runId: c.runId,
+      agentId: c.agentId,
+    })), [{ sessionId: FIXED_SESSION_ID, runId: "codex-run", agentId: "codex" }])
+  })
+
+  test("Step1 started=false is surfaced and does not mark a running session", async () => {
+    const { transport } = makeTransport([
+      {
+        status: 200,
+        bodyText: JSON.stringify({
+          ok: true,
+          started: false,
+          traceId: "fast-fail-run",
+        }),
+      },
+    ])
+    const storage = makeStorageSpies()
+    const pg = makeFakePg({ pointer: null })
+    const d = makeInboundDispatcher(
+      makeDeps({
+        transport,
+        pgPool: pg.pg,
+        upsertMasterClientSession: storage.upsertMasterClientSession,
+        softDeleteMasterSession: storage.softDeleteMasterSession,
+      }),
+    )
+    const r = await d.dispatch(makeEvent())
+    assert.equal(r.kind, "dispatched")
+    if (r.kind === "dispatched") {
+      assert.equal(r.started, false)
+    }
+    assert.equal(pg.spy.runningSetCalls.length, 0)
+  })
+
+  test("Step1 accepted=false is terminal and skips master session and pointer writes", async () => {
+    const { transport } = makeTransport([
+      {
+        status: 200,
+        bodyText: JSON.stringify({
+          ok: true,
+          accepted: false,
+          started: false,
+        }),
+      },
+    ])
+    const storage = makeStorageSpies()
+    const pg = makeFakePg({ pointer: null })
+    const d = makeInboundDispatcher(
+      makeDeps({
+        transport,
+        pgPool: pg.pg,
+        upsertMasterClientSession: storage.upsertMasterClientSession,
+        softDeleteMasterSession: storage.softDeleteMasterSession,
+      }),
+    )
+    const r = await d.dispatch(makeEvent())
+    assert.equal(r.kind, "dispatched")
+    if (r.kind === "dispatched") {
+      assert.equal(r.started, false)
+    }
+    assert.equal(storage.spy.upsertCalls.length, 0)
+    assert.equal(pg.spy.setCalls.length, 0)
+    assert.equal(pg.spy.runningSetCalls.length, 0)
+  })
+
+  test("deduplicated older wsess does not move an existing current pointer backwards", async () => {
+    const oldDedupedSessionId = FIXED_SESSION_ID
+    const currentSessionId = FIXED_SESSION_ID_2
+    const { transport } = makeTransport([
+      {
+        status: 200,
+        bodyText: JSON.stringify({
+          ok: true,
+          deduplicated: true,
+          started: true,
+          sessionId: oldDedupedSessionId,
+          traceId: "old-run",
+        }),
+      },
+    ])
+    const storage = makeStorageSpies()
+    const pg = makeFakePg({ pointer: currentSessionId })
+    const d = makeInboundDispatcher(
+      makeDeps({
+        transport,
+        pgPool: pg.pg,
+        upsertMasterClientSession: storage.upsertMasterClientSession,
+        softDeleteMasterSession: storage.softDeleteMasterSession,
+      }),
+    )
+    const r = await d.dispatch(makeEvent())
+    assert.equal(r.kind, "dispatched")
+    if (r.kind === "dispatched") {
+      assert.equal(r.sessionId, oldDedupedSessionId)
+      assert.equal(r.newSession, false)
+    }
+    assert.equal(storage.spy.upsertCalls.length, 1)
+    assert.equal(storage.spy.upsertCalls[0]!.sessionId, oldDedupedSessionId)
+    assert.equal(pg.spy.setCalls.length, 0)
+    assert.deepEqual(pg.spy.runningSetCalls.map((c) => ({
+      sessionId: c.sessionId,
+      runId: c.runId,
+    })), [{ sessionId: oldDedupedSessionId, runId: "old-run" }])
   })
 
   test("reuse session: pointer=existing → upsert NOT called, pointer touched, dispatched newSession=false", async () => {
@@ -584,7 +1019,7 @@ describe("inboundDispatcher — Step 1 failure", () => {
 describe("inboundDispatcher — Step 2a master sqlite failure", () => {
   test("upsert throws → compensation called → step2_failed compensation=ok", async () => {
     const { transport, spy: tSpy } = makeTransport([
-      { status: 200, bodyText: "{}" }, // step1
+      { status: 200, bodyText: '{"ok":true,"started":true,"traceId":"step2a-run"}' }, // step1
       { status: 200, bodyText: '{"ok":true}' }, // compensation
     ])
     const storage = makeStorageSpies({ upsertThrows: new Error("disk full") })
@@ -608,6 +1043,10 @@ describe("inboundDispatcher — Step 2a master sqlite failure", () => {
     assert.equal(tSpy.posts[1]!.path, WECHAT_INBOUND_COMPENSATE_PATH)
     // pg pointer NOT written (failed before Step 2b)
     assert.equal(pg.spy.setCalls.length, 0)
+    assert.deepEqual(pg.spy.runningSetCalls.map((c) => ({
+      sessionId: c.sessionId,
+      runId: c.runId,
+    })), [{ sessionId: FIXED_SESSION_ID, runId: "step2a-run" }])
     // softDelete NOT called (Step 2a 失败时还没 upsert 成功,无需撤)
     assert.equal(storage.spy.softDeleteCalls.length, 0)
   })
@@ -672,7 +1111,7 @@ describe("inboundDispatcher — Step 2a master sqlite failure", () => {
 describe("inboundDispatcher — Step 2b PG pointer failure", () => {
   test("newSession: pointer write throws → compensation + softDelete called → step2_failed pg_pointer compensation=ok", async () => {
     const { transport, spy: tSpy } = makeTransport([
-      { status: 200, bodyText: "{}" }, // step1
+      { status: 200, bodyText: '{"ok":true,"started":true,"traceId":"step2b-run"}' }, // step1
       { status: 200, bodyText: '{"ok":true}' }, // compensation
     ])
     const storage = makeStorageSpies()
@@ -693,6 +1132,10 @@ describe("inboundDispatcher — Step 2b PG pointer failure", () => {
     }
     assert.equal(tSpy.posts.length, 2)
     assert.equal(tSpy.posts[1]!.path, WECHAT_INBOUND_COMPENSATE_PATH)
+    assert.deepEqual(pg.spy.runningSetCalls.map((c) => ({
+      sessionId: c.sessionId,
+      runId: c.runId,
+    })), [{ sessionId: FIXED_SESSION_ID, runId: "step2b-run" }])
     // softDelete 调用了
     assert.equal(storage.spy.softDeleteCalls.length, 1)
     assert.equal(storage.spy.softDeleteCalls[0]!.sessionId, FIXED_SESSION_ID)
@@ -701,7 +1144,7 @@ describe("inboundDispatcher — Step 2b PG pointer failure", () => {
 
   test("reuseSession: pointer write throws → SKIP compensation, SKIP softDelete → compensation=skipped_reuse", async () => {
     const { transport, spy: tSpy } = makeTransport([
-      { status: 200, bodyText: "{}" }, // step1 only
+      { status: 200, bodyText: '{"ok":true,"started":true,"traceId":"reuse-pg-fail-run"}' }, // step1 only
       { throw: new Error("should not call compensation on reuse path") }, // safety
     ])
     const storage = makeStorageSpies()
@@ -726,11 +1169,15 @@ describe("inboundDispatcher — Step 2b PG pointer failure", () => {
     // 只有 step1 这一次 POST,无 compensation
     assert.equal(tSpy.posts.length, 1)
     assert.equal(storage.spy.softDeleteCalls.length, 0)
+    assert.deepEqual(pg.spy.runningSetCalls.map((c) => ({
+      sessionId: c.sessionId,
+      runId: c.runId,
+    })), [{ sessionId: "wsess-aaaaaaaaaaaaaaaa", runId: "reuse-pg-fail-run" }])
   })
 
   test("newSession Step 2b fail + softDelete also throws → outcome 仍然是 step2_failed compensation=ok", async () => {
     const { transport } = makeTransport([
-      { status: 200, bodyText: "{}" },
+      { status: 200, bodyText: '{"ok":true,"started":true,"traceId":"soft-delete-fail-run"}' },
       { status: 200, bodyText: '{"ok":true}' },
     ])
     const storage = makeStorageSpies({ softDeleteThrows: new Error("sqlite locked") })
@@ -749,6 +1196,10 @@ describe("inboundDispatcher — Step 2b PG pointer failure", () => {
       // compensation 字段反映容器侧补偿状况(ok),master softDelete 失败仅 log,不改 outcome
       assert.equal(r.compensation, "ok")
     }
+    assert.deepEqual(pg.spy.runningSetCalls.map((c) => ({
+      sessionId: c.sessionId,
+      runId: c.runId,
+    })), [{ sessionId: FIXED_SESSION_ID, runId: "soft-delete-fail-run" }])
   })
 })
 

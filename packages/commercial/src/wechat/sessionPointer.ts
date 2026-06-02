@@ -33,6 +33,36 @@ export interface PgRunner {
 
 export type PgConn = Pool | PoolClient | PgRunner
 
+export interface RunningWechatSession {
+  sessionId: WechatSessionId
+  runId: string
+  agentId?: string
+}
+
+export interface WechatSessionPointer {
+  sessionId: WechatSessionId
+  agentId?: string
+}
+
+const CREATE_RUNNING_SESSIONS_TABLE_SQL = `CREATE TABLE IF NOT EXISTS wechat_running_sessions (
+  binding_user_id TEXT   NOT NULL,
+  session_id      TEXT   NOT NULL,
+  run_id          TEXT   NOT NULL,
+  agent_id        TEXT,
+  started_at      BIGINT NOT NULL,
+  updated_at      BIGINT NOT NULL,
+  PRIMARY KEY (binding_user_id, session_id, run_id),
+  CONSTRAINT wrs_binding_user_id_chk CHECK (length(binding_user_id) BETWEEN 1 AND 64),
+  CONSTRAINT wrs_session_id_chk      CHECK (length(session_id) BETWEEN 8 AND 80),
+  CONSTRAINT wrs_run_id_chk          CHECK (length(run_id) BETWEEN 1 AND 128),
+  CONSTRAINT wrs_agent_id_chk        CHECK (agent_id IS NULL OR length(agent_id) BETWEEN 1 AND 128),
+  CONSTRAINT wrs_started_at_chk      CHECK (started_at > 0),
+  CONSTRAINT wrs_updated_at_chk      CHECK (updated_at > 0)
+)`
+
+const CREATE_RUNNING_SESSIONS_INDEX_SQL =
+  "CREATE INDEX IF NOT EXISTS idx_wrs_binding_started ON wechat_running_sessions(binding_user_id, started_at DESC)"
+
 /**
  * 生成新的 wsess sessionId。rand 默认 16 hex(8 字节 randomBytes)。
  *
@@ -74,6 +104,35 @@ export async function getCurrentSessionId(
   return res.rows[0]!.current_session_id
 }
 
+export async function getCurrentSessionPointer(
+  conn: PgConn,
+  bindingUserId: BindingId,
+): Promise<WechatSessionPointer | null> {
+  let res: { rows: Array<{ current_session_id: string; current_agent_id?: string | null }>; rowCount: number | null }
+  try {
+    res = await (conn as PgRunner).query<{ current_session_id: string; current_agent_id: string | null }>(
+      "SELECT current_session_id, current_agent_id FROM wechat_session_pointer WHERE binding_user_id = $1 LIMIT 1",
+      [bindingUserId],
+    )
+  } catch (err) {
+    if (!isMissingCurrentAgentIdColumn(err)) throw err
+    // Mixed-version deploy compatibility: 0079 adds current_agent_id, but the
+    // app process may briefly run before every node has applied the migration.
+    // Stop still works via container-side live session scan when agentId is
+    // absent, so read the legacy pointer shape instead of failing `/stop`.
+    res = await (conn as PgRunner).query<{ current_session_id: string }>(
+      "SELECT current_session_id FROM wechat_session_pointer WHERE binding_user_id = $1 LIMIT 1",
+      [bindingUserId],
+    )
+  }
+  if (res.rowCount === 0) return null
+  const row = res.rows[0]!
+  return {
+    sessionId: row.current_session_id as WechatSessionId,
+    ...(row.current_agent_id ? { agentId: row.current_agent_id } : {}),
+  }
+}
+
 /**
  * Upsert binding → sessionId 指针;每次入站 / switch / new 都打点 updated_at。
  *
@@ -106,15 +165,134 @@ export async function setCurrentSessionId(
   bindingUserId: BindingId,
   sessionId: WechatSessionId,
   now: number,
+  agentId?: string,
+): Promise<boolean> {
+  let res: { rows: Record<string, unknown>[]; rowCount: number | null }
+  try {
+    res = await (conn as PgRunner).query(
+      `INSERT INTO wechat_session_pointer (binding_user_id, current_session_id, updated_at, current_agent_id)
+       VALUES ($1, $2, $3, $4)
+       ON CONFLICT (binding_user_id) DO UPDATE SET
+         current_session_id = EXCLUDED.current_session_id,
+         updated_at         = EXCLUDED.updated_at,
+         current_agent_id   = EXCLUDED.current_agent_id
+       WHERE wechat_session_pointer.updated_at <= EXCLUDED.updated_at`,
+      [bindingUserId, sessionId, now, agentId ?? null],
+    )
+  } catch (err) {
+    if (!isMissingCurrentAgentIdColumn(err)) throw err
+    // 0079 may not have landed on every deploy target yet. Keep the old
+    // pointer write path alive; losing agentId only weakens `/stop` to the
+    // existing live-session scan fallback and must not downgrade accepted
+    // WeChat turns to step2_failed.
+    res = await (conn as PgRunner).query(
+      `INSERT INTO wechat_session_pointer (binding_user_id, current_session_id, updated_at)
+       VALUES ($1, $2, $3)
+       ON CONFLICT (binding_user_id) DO UPDATE SET
+         current_session_id = EXCLUDED.current_session_id,
+         updated_at         = EXCLUDED.updated_at
+       WHERE wechat_session_pointer.updated_at <= EXCLUDED.updated_at`,
+      [bindingUserId, sessionId, now],
+    )
+  }
+  return (res.rowCount ?? 0) > 0
+}
+
+function isMissingCurrentAgentIdColumn(err: unknown): boolean {
+  const e = err as { code?: unknown; message?: unknown; column?: unknown }
+  if (e?.code !== "42703") return false
+  const msg = typeof e.message === "string" ? e.message : ""
+  const col = typeof e.column === "string" ? e.column : ""
+  return col === "current_agent_id" || msg.includes("current_agent_id")
+}
+
+export async function markRunningSession(
+  conn: PgConn,
+  bindingUserId: BindingId,
+  sessionId: WechatSessionId,
+  runId: string,
+  agentId: string | undefined,
+  now: number,
+): Promise<void> {
+  const runner = conn as PgRunner
+  try {
+    await insertRunningSession(runner, bindingUserId, sessionId, runId, agentId, now)
+  } catch (err) {
+    if (!isMissingWechatRunningSessionsTable(err)) throw err
+    // Deploy script normally applies 0079 before restart, but during staged or
+    // manually recovered rollouts an app process can briefly see old schema.
+    // Create the idempotent table shape and retry so `/stop` remains able to
+    // target older long-running tasks even before the migration runner catches
+    // up. 0079 is still authoritative and will no-op later.
+    await ensureRunningSessionsTable(runner)
+    await insertRunningSession(runner, bindingUserId, sessionId, runId, agentId, now)
+  }
+}
+
+async function insertRunningSession(
+  conn: PgRunner,
+  bindingUserId: BindingId,
+  sessionId: WechatSessionId,
+  runId: string,
+  agentId: string | undefined,
+  now: number,
+): Promise<void> {
+  await conn.query(
+    `INSERT INTO wechat_running_sessions (binding_user_id, session_id, run_id, agent_id, started_at, updated_at)
+     VALUES ($1, $2, $3, $4, $5, $5)
+     ON CONFLICT (binding_user_id, session_id, run_id) DO UPDATE SET
+       agent_id   = EXCLUDED.agent_id,
+       updated_at = EXCLUDED.updated_at`,
+    [bindingUserId, sessionId, runId, agentId ?? null, now],
+  )
+}
+
+async function ensureRunningSessionsTable(conn: PgRunner): Promise<void> {
+  await conn.query(CREATE_RUNNING_SESSIONS_TABLE_SQL)
+  await conn.query(CREATE_RUNNING_SESSIONS_INDEX_SQL)
+}
+
+function isMissingWechatRunningSessionsTable(err: unknown): boolean {
+  const e = err as { code?: unknown; message?: unknown }
+  if (e?.code !== "42P01") return false
+  const msg = typeof e.message === "string" ? e.message : ""
+  return msg.includes("wechat_running_sessions")
+}
+
+export async function listRunningSessions(
+  conn: PgConn,
+  bindingUserId: BindingId,
+  limit?: number,
+): Promise<RunningWechatSession[]> {
+  const params: unknown[] = [bindingUserId]
+  let sql = `SELECT session_id, run_id, agent_id
+       FROM wechat_running_sessions
+      WHERE binding_user_id = $1
+      ORDER BY started_at DESC`
+  if (Number.isInteger(limit) && limit! > 0) {
+    sql += "\n      LIMIT $2"
+    params.push(limit)
+  }
+  const res = await (conn as PgRunner).query<{ session_id: string; run_id: string; agent_id: string | null }>(
+    sql,
+    params,
+  )
+  return res.rows.map((row) => ({
+    sessionId: row.session_id as WechatSessionId,
+    runId: row.run_id,
+    ...(row.agent_id ? { agentId: row.agent_id } : {}),
+  }))
+}
+
+export async function clearRunningSession(
+  conn: PgConn,
+  bindingUserId: BindingId,
+  sessionId: WechatSessionId,
+  runId: string,
 ): Promise<boolean> {
   const res = await (conn as PgRunner).query(
-    `INSERT INTO wechat_session_pointer (binding_user_id, current_session_id, updated_at)
-     VALUES ($1, $2, $3)
-     ON CONFLICT (binding_user_id) DO UPDATE SET
-       current_session_id = EXCLUDED.current_session_id,
-       updated_at         = EXCLUDED.updated_at
-     WHERE wechat_session_pointer.updated_at <= EXCLUDED.updated_at`,
-    [bindingUserId, sessionId, now],
+    "DELETE FROM wechat_running_sessions WHERE binding_user_id = $1 AND session_id = $2 AND run_id = $3",
+    [bindingUserId, sessionId, runId],
   )
   return (res.rowCount ?? 0) > 0
 }

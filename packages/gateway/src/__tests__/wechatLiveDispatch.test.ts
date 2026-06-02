@@ -1,11 +1,10 @@
 /**
- * Regression tests for v3 WeChat live process messages.
+ * Regression tests for v3 WeChat realtime-link dispatch.
  *
- * The commercial WeChat broker path used to aggregate every adapter block and
- * send them only after final. Users saw thinking/tool process bubbles replayed
- * after the assistant had already finished.  v3-wechat-outbound is the one
- * adapter that must stream process blocks live while preserving final Markdown
- * aggregation for assistant text.
+ * Product direction after the iLink 9-message failure: WeChat itself is not an
+ * event-log surface.  A WeChat-originated turn streams detailed thinking/tools
+ * to the linked Web session and sends only the final/error result back through
+ * v3-wechat-outbound.
  */
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
@@ -21,7 +20,7 @@ const SENDER_ID = 'wx-sender-abc'
 function makeFrame(): InboundFrame {
   return {
     type: 'inbound.message',
-    channel: 'wechat',
+    channel: 'webchat',
     peer: { id: SESSION_ID, kind: 'dm', displayName: SENDER_ID } as any,
     content: { text: '用户问题', media: [] },
     _userId: '1',
@@ -44,7 +43,7 @@ function makeGateway(events: any[], delivered: any[] = []): any {
   gateway.rateLimiter = { check: () => true }
   gateway.router = {
     route: () => ({
-      sessionKey: `agent:main:wechat:dm:${SESSION_ID}`,
+      sessionKey: `agent:main:webchat:dm:${SESSION_ID}`,
       agent,
     }),
   }
@@ -85,19 +84,17 @@ function liveEvents(): any[] {
   return [
     { kind: 'block', block: { kind: 'thinking', text: '先分析一下' } },
     { kind: 'block', block: { kind: 'tool_use', blockId: 'toolu_1', toolName: 'Bash', inputJson: { command: 'pwd' }, partial: true } },
-    // The finalized snapshot for the same tool must not create a second WeChat
-    // process bubble. Web can update an existing row; WeChat cannot edit old
-    // bubbles, so one tool_use event maps to one live message.
     { kind: 'block', block: { kind: 'tool_use', blockId: 'toolu_1', toolName: 'Bash', inputJson: { command: 'pwd' }, partial: false } },
+    { kind: 'block', block: { kind: 'tool_output_tail', toolUseId: 'toolu_1', text: 'still running...' } },
+    { kind: 'block', block: { kind: 'tool_result', toolUseId: 'toolu_1', text: '/tmp' } },
     { kind: 'block', block: { kind: 'text', text: '**答案**：完成' } },
     { kind: 'final', meta: { cost: 0.01, inputTokens: 10, outputTokens: 20, turn: 1 } },
   ]
 }
 
-test('v3 WeChat streams process blocks live, serializes adapter sends, and final does not replay process', async () => {
-  const calls: any[] = []
-  let inFlight = 0
-  let maxInFlight = 0
+test('v3 WeChat mirrors only final text to WeChat and streams process to linked Web session', async () => {
+  const wechatCalls: any[] = []
+  const delivered: any[] = []
   const adapter: ChannelAdapter = {
     id: 'v3-wechat-outbound',
     name: 'v3-wechat-outbound',
@@ -105,75 +102,40 @@ test('v3 WeChat streams process blocks live, serializes adapter sends, and final
     async init() {},
     async shutdown() {},
     async send(out: OutboundMessage) {
-      inFlight++
-      maxInFlight = Math.max(maxInFlight, inFlight)
-      calls.push(out)
-      await new Promise((resolve) => setTimeout(resolve, 5))
-      inFlight--
+      wechatCalls.push(out)
     },
   }
 
-  const gateway = makeGateway(liveEvents())
-  await gateway.dispatchInbound(makeFrame(), adapter)
-
-  assert.equal(maxInFlight, 1, 'live WeChat adapter sends must be queued, not fire-and-forget concurrent')
-  assert.deepEqual(
-    calls.map((out) => out.blocks.map((b: any) => b.kind)),
-    [['thinking'], ['tool_use'], ['text']],
-  )
-  assert.deepEqual(calls.map((out) => out.isFinal), [false, false, true])
-  assert.equal(calls[0]!.blocks[0]!.text, '先分析一下')
-  assert.equal(calls[2]!.blocks[0]!.text, '**答案**：完成')
-  assert.equal(calls[0]!.traceId, calls[1]!.traceId)
-  assert.equal(calls[1]!.traceId, calls[2]!.traceId)
-  const outboundIds = calls.map((out) => (out as any).outboundId)
-  assert.equal(new Set(outboundIds).size, 3, 'each live message needs a unique outboundId for master outbox dedup')
-  assert.ok(outboundIds.every((id) => /^[A-Za-z0-9._:-]{8,128}$/.test(id)))
-  assert.equal(calls.some((out) => '_userId' in out), false, 'private routing fields must not reach adapter')
-})
-
-test('v3 WeChat batches detailed thinking and relies on ordered outbox instead of dropping process bubbles', async () => {
-  const calls: any[] = []
-  const adapter: ChannelAdapter = {
-    id: 'v3-wechat-outbound',
-    name: 'v3-wechat-outbound',
-    type: 'channel' as const,
-    async init() {},
-    async shutdown() {},
-    async send(out: OutboundMessage) {
-      calls.push(out)
-    },
-  }
-  const noisyEvents: any[] = [
-    { kind: 'block', block: { kind: 'thinking', text: 'raw internal thought 1. ' } },
-    { kind: 'block', block: { kind: 'thinking', text: 'raw internal thought 2. ' } },
-  ]
-  for (let i = 1; i <= 10; i++) {
-    noisyEvents.push({
-      kind: 'block',
-      block: { kind: 'tool_use', blockId: `toolu_${i}`, toolName: 'Bash', inputJson: { command: `echo ${i}` } },
-    })
-  }
-  noisyEvents.push(
-    { kind: 'block', block: { kind: 'text', text: '最终答案' } },
-    { kind: 'final', meta: { cost: 0.01, inputTokens: 10, outputTokens: 20, turn: 1 } },
-  )
-
-  const gateway = makeGateway(noisyEvents)
+  const gateway = makeGateway(liveEvents(), delivered)
   await gateway.dispatchInbound(makeFrame(), adapter)
 
   assert.deepEqual(
-    calls.map((out) => out.blocks[0]!.kind),
-    ['thinking', ...Array.from({ length: 10 }, () => 'tool_use'), 'text'],
+    wechatCalls.map((out) => out.blocks.map((b: any) => b.kind)),
+    [['text']],
   )
-  assert.equal(calls[0]!.blocks[0]!.text, 'raw internal thought 1. raw internal thought 2.')
-  assert.equal(calls.at(-1)!.isFinal, true)
-  assert.equal(calls.at(-1)!.blocks[0]!.text, '最终答案')
-  assert.equal(calls.slice(0, -1).length, 11, 'detailed process bubbles are preserved')
+  assert.equal(wechatCalls[0]!.isFinal, true)
+  assert.equal(wechatCalls[0]!.blocks[0]!.text, '**答案**：完成')
+  assert.equal(wechatCalls.some((out) => '_userId' in out), false, 'private routing fields must not reach adapter')
+
+  assert.deepEqual(
+    delivered.map((d) => d.out.blocks?.[0]?.kind ?? 'empty-final'),
+    ['thinking', 'tool_use', 'tool_use', 'tool_output_tail', 'tool_result', 'text', 'empty-final'],
+  )
+  assert.deepEqual(delivered.map((d) => d.adapter), [
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+  ])
+  assert.equal(delivered.at(-1)!.out.isFinal, true)
 })
 
-test('v3 WeChat batches many small thinking deltas into one live thinking bubble before text', async () => {
-  const calls: any[] = []
+test('v3 WeChat sends a completion marker when final has no text for WeChat', async () => {
+  const wechatCalls: any[] = []
+  const delivered: any[] = []
   const adapter: ChannelAdapter = {
     id: 'v3-wechat-outbound',
     name: 'v3-wechat-outbound',
@@ -181,23 +143,24 @@ test('v3 WeChat batches many small thinking deltas into one live thinking bubble
     async init() {},
     async shutdown() {},
     async send(out: OutboundMessage) {
-      calls.push(out)
+      wechatCalls.push(out)
     },
   }
-  const events: any[] = [
-    { kind: 'block', block: { kind: 'thinking', text: 'step 1. ' } },
-    { kind: 'block', block: { kind: 'thinking', text: 'step 2. ' } },
-    { kind: 'block', block: { kind: 'thinking', text: 'step 3. ' } },
-    { kind: 'block', block: { kind: 'text', text: 'final markdown' } },
+  const events = [
+    { kind: 'block', block: { kind: 'thinking', text: '只思考不输出文本' } },
     { kind: 'final', meta: { turn: 1 } },
   ]
 
-  const gateway = makeGateway(events)
+  const gateway = makeGateway(events, delivered)
   await gateway.dispatchInbound(makeFrame(), adapter)
 
-  assert.deepEqual(calls.map((out) => out.blocks[0]!.kind), ['thinking', 'text'])
-  assert.equal(calls[0]!.blocks[0]!.text, 'step 1. step 2. step 3.')
-  assert.equal(calls[1]!.blocks[0]!.text, 'final markdown')
+  assert.equal(wechatCalls.length, 1)
+  assert.equal(wechatCalls[0]!.isFinal, true)
+  assert.match(wechatCalls[0]!.blocks[0]!.text, /任务已完成/)
+  assert.deepEqual(
+    delivered.map((d) => d.out.blocks?.[0]?.kind ?? 'empty-final'),
+    ['thinking', 'empty-final'],
+  )
 })
 
 test('non-WeChat adapters keep historical aggregate-on-final behavior', async () => {
@@ -217,5 +180,5 @@ test('non-WeChat adapters keep historical aggregate-on-final behavior', async ()
   assert.equal(delivered[0]!.adapter, adapter)
   const out = delivered[0]!.out
   assert.equal(out.isFinal, true)
-  assert.deepEqual(out.blocks.map((b: any) => b.kind), ['thinking', 'tool_use', 'text'])
+  assert.deepEqual(out.blocks.map((b: any) => b.kind), ['thinking', 'tool_use', 'tool_result', 'text'])
 })

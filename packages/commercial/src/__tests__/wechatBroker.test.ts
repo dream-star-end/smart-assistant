@@ -58,6 +58,7 @@ function makeEvent(overrides: Partial<InboundEvent> = {}): InboundEvent {
 
 interface DispatcherSpy {
   calls: InboundEvent[]
+  stopCalls: InboundEvent[]
 }
 
 function makeDispatcher(
@@ -66,7 +67,7 @@ function makeDispatcher(
     | ((evt: InboundEvent) => DispatchOutcome | Promise<DispatchOutcome>)
     | { throw: Error },
 ): { dispatcher: InboundDispatcher; spy: DispatcherSpy } {
-  const spy: DispatcherSpy = { calls: [] }
+  const spy: DispatcherSpy = { calls: [], stopCalls: [] }
   const dispatcher: InboundDispatcher = {
     async dispatch(evt: InboundEvent): Promise<DispatchOutcome> {
       spy.calls.push(evt)
@@ -77,6 +78,10 @@ function makeDispatcher(
         return await responder(evt)
       }
       return responder
+    },
+    async stop(evt: InboundEvent) {
+      spy.stopCalls.push(evt)
+      return { kind: "command_echo", interrupted: true, reply: "已发送中断指令。" }
     },
   }
   return { dispatcher, spy }
@@ -561,13 +566,17 @@ describe("wechatBroker — onInbound", () => {
   })
 
   test("dispatcher 抛 → broker_failed,never throw 出 broker", async () => {
+    const { sendText, spy: sendSpy } = makeSendText({ ok: true })
     const { dispatcher } = makeDispatcher({ throw: new Error("dispatcher crashed") })
-    const broker = makeWechatBroker(makeDeps({ dispatcher }))
+    const broker = makeWechatBroker(makeDeps({ dispatcher, sendText }))
     const r = await broker.onInbound(makeEvent())
     assert.equal(r.kind, "broker_failed")
     if (r.kind === "broker_failed") {
       assert.ok(r.errMessage.includes("dispatcher crashed"))
     }
+    await flushMicrotasks()
+    assert.equal(sendSpy.calls.length, 1)
+    assert.match(sendSpy.calls[0]!.text, /没能送到执行环境/)
   })
 
   // ── bindingUserId 归一(commercial canonical `c:N` → dispatcher raw `N`) ──
@@ -660,7 +669,7 @@ describe("wechatBroker — onInbound", () => {
     )
   })
 
-  test("dispatcher → dispatched outcome 透传,并立即发送 processing 反射", async () => {
+  test("dispatcher → dispatched outcome 透传,并发送实时过程链接反射", async () => {
     const { sendText, spy: sendSpy } = makeSendText({ ok: true })
     const { dispatcher } = makeDispatcher({
       kind: "dispatched",
@@ -672,7 +681,101 @@ describe("wechatBroker — onInbound", () => {
     assert.equal(r.kind, "dispatched")
     await flushMicrotasks()
     assert.equal(sendSpy.calls.length, 1)
-    assert.equal(sendSpy.calls[0]!.text, "已收到，正在思考…")
+    assert.match(sendSpy.calls[0]!.text, /实时过程：https:\/\/claudeai\.chat\/\?session=wsess-/)
+    assert.match(sendSpy.calls[0]!.text, /\/stop/)
+  })
+
+  test("dispatcher started=false outcome does not send stale realtime process link", async () => {
+    const { sendText, spy: sendSpy } = makeSendText({ ok: true })
+    const { dispatcher } = makeDispatcher({
+      kind: "dispatched",
+      sessionId: SESSION_A,
+      newSession: true,
+      started: false,
+    } as DispatchOutcome)
+    const broker = makeWechatBroker(makeDeps({ dispatcher, sendText }))
+    const r = await broker.onInbound(makeEvent({ text: "会触发快速失败" }))
+    assert.equal(r.kind, "dispatched")
+    await flushMicrotasks()
+    assert.equal(sendSpy.calls.length, 1)
+    assert.doesNotMatch(sendSpy.calls[0]!.text, /已开始执行/)
+    assert.doesNotMatch(sendSpy.calls[0]!.text, /中断任务/)
+    assert.match(sendSpy.calls[0]!.text, /没有启动新的运行任务/)
+    assert.match(sendSpy.calls[0]!.text, /session=wsess-/)
+  })
+
+  test("dispatcher completed=true outcome does not send a stale realtime process link", async () => {
+    const { sendText, spy: sendSpy } = makeSendText({ ok: true })
+    const { dispatcher } = makeDispatcher({
+      kind: "dispatched",
+      sessionId: SESSION_A,
+      newSession: true,
+      started: true,
+      completed: true,
+    } as DispatchOutcome)
+    const broker = makeWechatBroker(makeDeps({ dispatcher, sendText }))
+    const r = await broker.onInbound(makeEvent({ text: "快速完成但 Step1 ACK 丢失后重试" }))
+    assert.equal(r.kind, "dispatched")
+    await flushMicrotasks()
+    assert.equal(sendSpy.calls.length, 1)
+    assert.doesNotMatch(sendSpy.calls[0]!.text, /已开始执行/)
+    assert.doesNotMatch(sendSpy.calls[0]!.text, /中断任务/)
+    assert.match(sendSpy.calls[0]!.text, /已经处理完成/)
+    assert.match(sendSpy.calls[0]!.text, /session=wsess-/)
+  })
+
+  test("dispatcher pre-dispatch failure sends visible retry hint instead of going silent", async () => {
+    const { sendText, spy: sendSpy } = makeSendText({ ok: true })
+    const { dispatcher } = makeDispatcher({
+      kind: "transport_failed",
+      phase: "step1",
+      retryable: true,
+      errMessage: "connect ECONNREFUSED",
+    })
+    const broker = makeWechatBroker(makeDeps({ dispatcher, sendText }))
+    const r = await broker.onInbound(makeEvent({ text: "hello" }))
+    assert.equal(r.kind, "transport_failed")
+    await flushMicrotasks()
+    assert.equal(sendSpy.calls.length, 1)
+    assert.match(sendSpy.calls[0]!.text, /稍后重试/)
+    assert.doesNotMatch(sendSpy.calls[0]!.text, /实时过程/)
+  })
+
+  test("dispatcher step2_failed warns without prompting duplicate retry", async () => {
+    const { sendText, spy: sendSpy } = makeSendText({ ok: true })
+    const { dispatcher } = makeDispatcher({
+      kind: "step2_failed",
+      phase: "pg_pointer",
+      compensation: "skipped_reuse",
+      errMessage: "pg down after container accepted",
+    })
+    const broker = makeWechatBroker(makeDeps({ dispatcher, sendText }))
+    const r = await broker.onInbound(makeEvent({ text: "long task" }))
+    assert.equal(r.kind, "step2_failed")
+    await flushMicrotasks()
+    assert.equal(sendSpy.calls.length, 1)
+    assert.match(sendSpy.calls[0]!.text, /请不要重复发送同一任务/)
+    assert.doesNotMatch(sendSpy.calls[0]!.text, /稍后重试/)
+    assert.doesNotMatch(sendSpy.calls[0]!.text, /实时过程/)
+  })
+
+  test("broker-local /stop delegates normalized binding id to dispatcher.stop and reflects result", async () => {
+    const { sendText, spy: sendSpy } = makeSendText({ ok: true })
+    const { dispatcher, spy: dispSpy } = makeDispatcher({
+      kind: "dispatched",
+      sessionId: SESSION_A,
+      newSession: false,
+    })
+    const broker = makeWechatBroker(makeDeps({ dispatcher, sendText }))
+    const r = await broker.onInbound(makeEvent({ bindingUserId: "c:42", text: "/stop" }))
+    assert.equal(r.kind, "command_echo")
+    if (r.kind === "command_echo") assert.match(r.reply, /已发送中断/)
+    assert.equal(dispSpy.calls.length, 0)
+    assert.equal(dispSpy.stopCalls.length, 1)
+    assert.equal(dispSpy.stopCalls[0]!.bindingUserId, "42")
+    await flushMicrotasks()
+    assert.equal(sendSpy.calls.length, 1)
+    assert.match(sendSpy.calls[0]!.text, /已发送中断/)
   })
 
   test("audit insert sees duplicate (account_id,message_id) → duplicate_audit and dispatcher is skipped", async () => {
@@ -800,7 +903,8 @@ describe("wechatBroker — onInbound", () => {
     await flushMicrotasks()
     assert.equal(sendSpy.calls.length, 1)
     assert.match(sendSpy.calls[0]!.text, /微信里可以这样用 OpenClaude/)
-    assert.match(sendSpy.calls[0]!.text, /\/过程/)
+    assert.match(sendSpy.calls[0]!.text, /\/stop/)
+    assert.match(sendSpy.calls[0]!.text, /实时过程/)
     assert.doesNotMatch(sendSpy.calls[0]!.text, /\/总结/)
     assert.doesNotMatch(sendSpy.calls[0]!.text, /\/status/)
   })
@@ -1122,8 +1226,9 @@ describe("wechatBroker — onInbound", () => {
     assert.equal(dispSpy.calls.length, 1)
     assert.match(dispSpy.calls[0]!.text, /understand_image|wechat-a\\.jpg|识别图片/)
     await flushMicrotasks()
-    assert.equal(sendSpy.calls.length, 1)
+    assert.equal(sendSpy.calls.length, 2)
     assert.equal(sendSpy.calls[0]!.text, "收到图片，正在识别…")
+    assert.match(sendSpy.calls[1]!.text, /实时过程/)
   })
 
   test("image prepare failure returns retryable friendly message and skips dispatcher", async () => {
@@ -1241,9 +1346,8 @@ describe("wechatBroker — onInbound", () => {
     const r = await broker.onInbound(makeEvent())
     assert.equal(r.kind, "cold_start")
     await flushMicrotasks()
-    assert.equal(sendSpy.calls.length, 2)
-    assert.equal(sendSpy.calls[0]!.text, "已收到，正在思考…")
-    assert.equal(sendSpy.calls[1]!.text, "正在唤醒,稍等几秒...")
+    assert.equal(sendSpy.calls.length, 1)
+    assert.equal(sendSpy.calls[0]!.text, "正在唤醒,稍等几秒...")
   })
 
   test("反射:getBinding 返 null → log + drop,sendText 不被调", async () => {
@@ -1322,6 +1426,7 @@ describe("wechatBroker — cleanupBinding", () => {
       query: async (sql: string, params?: ReadonlyArray<unknown>) => {
         queries.push({ sql, params })
         if (/DELETE FROM wechat_session_pointer/i.test(sql)) return { rows: [], rowCount: 1 }
+        if (/DELETE FROM wechat_running_sessions/i.test(sql)) return { rows: [], rowCount: 3 }
         if (/UPDATE wechat_outbox/i.test(sql)) return { rows: [], rowCount: 2 }
         return { rows: [], rowCount: 0 }
       },
@@ -1338,14 +1443,47 @@ describe("wechatBroker — cleanupBinding", () => {
 
     assert.deepEqual(result, { pointerDeleted: true, outboxFailed: 2 })
     const del = queries.find((q) => /DELETE FROM wechat_session_pointer/i.test(q.sql))
+    const runningDel = queries.find((q) => /DELETE FROM wechat_running_sessions/i.test(q.sql))
     const upd = queries.find((q) => /UPDATE wechat_outbox/i.test(q.sql))
     assert.ok(del)
+    assert.ok(runningDel)
     assert.ok(upd)
     assert.equal(del!.params?.[0], "42")
+    assert.equal(runningDel!.params?.[0], "42")
     assert.equal(upd!.params?.[0], "42")
     assert.equal(upd!.params?.[1], 7)
     assert.match(upd!.sql, /status\s+IN\s+\('queued',\s*'sending'\)/i)
     assert.doesNotMatch(upd!.sql, /DELETE\s+FROM\s+wechat_outbox/i)
+  })
+
+  test("ignores missing running-session table during mixed-version deploy cleanup", async () => {
+    const queries: Array<{ sql: string; params?: ReadonlyArray<unknown> }> = []
+    const pool = {
+      query: async (sql: string, params?: ReadonlyArray<unknown>) => {
+        queries.push({ sql, params })
+        if (/DELETE FROM wechat_session_pointer/i.test(sql)) return { rows: [], rowCount: 1 }
+        if (/DELETE FROM wechat_running_sessions/i.test(sql)) {
+          const err = new Error('relation "wechat_running_sessions" does not exist') as Error & { code: string }
+          err.code = "42P01"
+          throw err
+        }
+        if (/UPDATE wechat_outbox/i.test(sql)) return { rows: [], rowCount: 2 }
+        return { rows: [], rowCount: 0 }
+      },
+      connect: async () => ({
+        query: async (sql: string, params?: ReadonlyArray<unknown>) => {
+          queries.push({ sql, params })
+          return { rows: [], rowCount: 0 }
+        },
+        release: () => {},
+      }),
+    } as unknown as Pool
+    const broker = makeWechatBroker(makeDeps({ pool, outboxWorker: { maxAttempts: 7 } }))
+    const result = await broker.cleanupBinding("c:42")
+
+    assert.deepEqual(result, { pointerDeleted: true, outboxFailed: 2 })
+    assert.ok(queries.some((q) => /DELETE FROM wechat_running_sessions/i.test(q.sql)))
+    assert.ok(queries.some((q) => /UPDATE wechat_outbox/i.test(q.sql)))
   })
 
   test("rejects invalid binding ids before touching PG", async () => {

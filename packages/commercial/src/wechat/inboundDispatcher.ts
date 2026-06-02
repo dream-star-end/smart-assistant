@@ -50,15 +50,21 @@ import { rootLogger, type Logger } from "../logging/logger.js"
 import type { ContainerUnreadyError, ResolveContainerEndpoint } from "../ws/userChatBridge.js"
 import {
   getCurrentSessionId,
+  getCurrentSessionPointer,
+  listRunningSessions,
+  markRunningSession,
   newWechatSessionId,
   setCurrentSessionId,
   type PgConn,
 } from "./sessionPointer.js"
-import { type WechatSessionId } from "./types.js"
+import { isWechatSessionId, type WechatSessionId } from "./types.js"
 import { MASTER_USER_PREFIX } from "./userIds.js"
 
 /** 容器侧 inbound handler 路径(master POST → 容器 18789 内 gateway 接)。 */
 export const WECHAT_INBOUND_CONTAINER_PATH = "/internal/v3/wechat-inbound"
+
+/** 容器侧 WeChat stop handler 路径(master POST → 容器内 interrupt)。 */
+export const WECHAT_STOP_CONTAINER_PATH = "/internal/v3/wechat-stop"
 
 /**
  * 容器侧 inbound 补偿(回滚)路径;handler 必须 idempotent + always-200。
@@ -155,7 +161,7 @@ export interface InboundEvent {
  */
 export type DispatchOutcome =
   | { kind: "command_echo"; reply: string }
-  | { kind: "dispatched"; sessionId: WechatSessionId; newSession: boolean }
+  | { kind: "dispatched"; sessionId: WechatSessionId; newSession: boolean; started?: boolean; completed?: boolean }
   | {
       kind: "cold_start"
       reason: string
@@ -181,6 +187,8 @@ export type DispatchOutcome =
       errMessage: string
     }
   | { kind: "tunnel_unsupported"; errMessage: string }
+
+export type StopOutcome = { kind: "command_echo"; reply: string; interrupted: boolean }
 
 /**
  * 容器 endpoint transport 抽象。
@@ -298,6 +306,7 @@ export interface InboundDispatcherDeps {
 
 export interface InboundDispatcher {
   dispatch(evt: InboundEvent): Promise<DispatchOutcome>
+  stop(evt: InboundEvent): Promise<StopOutcome>
 }
 
 // ─── 实现 ──────────────────────────────────────────────────────────────────
@@ -389,8 +398,11 @@ export function makeInboundDispatcher(deps: InboundDispatcherDeps): InboundDispa
         }
       }
 
-      const sessionId: WechatSessionId = current ?? newSessionId()
+      let sessionId: WechatSessionId = current ?? newSessionId()
       const newSession = current === null
+      let shouldUpsertMasterSession = newSession
+      let shouldSetCurrentPointer = true
+      let routedAgentId = agentId
 
       // **稳定时间戳**:Step 2a 的 createdAt / lastAt 用同一 now() pin 住,避免一次 dispatch
       // 内 createdAt / lastAt 错开 1 ms(测试 `createdAt === lastAt` 断言依赖)。
@@ -541,14 +553,63 @@ export function makeInboundDispatcher(deps: InboundDispatcherDeps): InboundDispa
           errMessage: truncBody,
         }
       }
+      const step1Accepted = parseStep1Accepted(step1.response.bodyText, requestId)
+      if (step1Accepted.agentId) {
+        routedAgentId = step1Accepted.agentId
+      }
+      if (step1Accepted.sessionId && step1Accepted.sessionId !== sessionId) {
+        reqLog.warn("step1_adopted_original_session", {
+          allocatedSessionId: sessionId,
+          acceptedSessionId: step1Accepted.sessionId,
+        })
+        sessionId = step1Accepted.sessionId
+        if (current !== null && current !== sessionId) {
+          // A retry for an older WeChat message may arrive after the user has
+          // already moved the binding pointer to a newer wsess.  Adopt the
+          // original runner's wsess for master row / running-session tracking,
+          // but never use the retry's later timestamp to move the current
+          // pointer backwards.
+          shouldSetCurrentPointer = false
+          shouldUpsertMasterSession = true
+        }
+      }
+
+      if (!step1Accepted.accepted) {
+        reqLog.info("step1_terminal_before_runner_start", { sessionId })
+        await failPreparedCodexTurn("wechat_container_terminal_before_start")
+        return { kind: "dispatched", sessionId, newSession, started: false }
+      }
+
+      if (step1Accepted.started !== false && step1Accepted.completed !== true) {
+        if (step1Accepted.runId) {
+          try {
+            await markRunningSession(
+              deps.pgPool,
+              evt.bindingUserId,
+              sessionId,
+              step1Accepted.runId,
+              routedAgentId,
+              dispatchNow,
+            )
+          } catch (err) {
+            reqLog.error("mark_running_session_failed", {
+              sessionId,
+              runId: step1Accepted.runId,
+              errMessage: (err as Error)?.message ?? String(err),
+            })
+          }
+        } else {
+          reqLog.warn("step1_started_without_trace_id_skip_running_session", { sessionId })
+        }
+      }
 
       // ── 4) Step 2a: master sqlite client_sessions 写(仅 newSession) ──
-      if (newSession) {
+      if (shouldUpsertMasterSession) {
         try {
           await deps.upsertMasterClientSession({
             sessionId,
             userId: MASTER_USER_PREFIX + evt.bindingUserId,
-            agentId,
+            agentId: routedAgentId,
             originChannel: "wechat",
             title: sessionTitle,
             createdAt: dispatchNow,
@@ -578,69 +639,262 @@ export function makeInboundDispatcher(deps: InboundDispatcherDeps): InboundDispa
       }
 
       // ── 5) Step 2b: PG wechat_session_pointer 写 ──────────────────────
-      try {
-        const applied = await setCurrentSessionId(
-          deps.pgPool,
-          evt.bindingUserId,
-          sessionId,
-          dispatchNow,
-        )
-        if (!applied) {
-          // updated_at <= EXCLUDED guard 过滤(stale ts):P1 单进程不会真触发,
-          // 但 setCurrentSessionId 已经声明 false 是合法应答 — log warn,outcome 算
-          // dispatched(容器侧 Step 1 已经完成,pointer 没更新仅意味着指向更旧的活会话,
-          // 不算 error)
-          reqLog.warn("pointer_write_stale_skip", { sessionId })
-        }
-      } catch (err) {
-        const errMessage = (err as Error)?.message ?? String(err)
-        reqLog.error("step2b_pg_pointer_failed", { sessionId, errMessage })
-
-        let compensation: "ok" | "failed" | "skipped_reuse"
-        if (newSession) {
-          // newSession 路径:容器侧那条 row 是本次 inbound 才建的,撤回安全
-          compensation = await tryCompensation(
-            deps.transport,
-            endpoint,
-            sessionId,
+      if (shouldSetCurrentPointer) {
+        try {
+          const applied = await setCurrentSessionId(
+            deps.pgPool,
             evt.bindingUserId,
-            nonce,
-            "step2b_failed",
-            requestId,
-            compensateTimeoutMs,
-            reqLog,
+            sessionId,
+            dispatchNow,
+            routedAgentId,
           )
-          // 同时撤 master sqlite Step 2a 写
-          try {
-            await deps.softDeleteMasterSession(
-              sessionId,
-              MASTER_USER_PREFIX + evt.bindingUserId,
-            )
-          } catch (softErr) {
-            reqLog.error("master_softdelete_after_pg_fail_also_failed", {
-              sessionId,
-              errMessage: (softErr as Error)?.message ?? String(softErr),
-            })
-            // 不影响 compensation 字段:dispatcher 已尽力,reconcile 兜底
+          if (!applied) {
+            // updated_at <= EXCLUDED guard 过滤(stale ts):P1 单进程不会真触发,
+            // 但 setCurrentSessionId 已经声明 false 是合法应答 — log warn,outcome 算
+            // dispatched(容器侧 Step 1 已经完成,pointer 没更新仅意味着指向更旧的活会话,
+            // 不算 error)
+            reqLog.warn("pointer_write_stale_skip", { sessionId })
           }
-        } else {
-          // reuseSession 路径:容器侧 row 是合法在用的活会话,撤回会破坏
-          // 未来 dispatchInbound — 跳过 compensation,只 log;pointer 漂移
-          // 由 reconcile 兜底修正
-          reqLog.warn("step2b_compensation_skipped_reuse", { sessionId })
-          compensation = "skipped_reuse"
-        }
+        } catch (err) {
+          const errMessage = (err as Error)?.message ?? String(err)
+          reqLog.error("step2b_pg_pointer_failed", { sessionId, errMessage })
 
-        return {
-          kind: "step2_failed",
-          phase: "pg_pointer",
-          compensation,
-          errMessage,
+          let compensation: "ok" | "failed" | "skipped_reuse"
+          if (newSession) {
+            // newSession 路径:容器侧那条 row 是本次 inbound 才建的,撤回安全
+            compensation = await tryCompensation(
+              deps.transport,
+              endpoint,
+              sessionId,
+              evt.bindingUserId,
+              nonce,
+              "step2b_failed",
+              requestId,
+              compensateTimeoutMs,
+              reqLog,
+            )
+            // 同时撤 master sqlite Step 2a 写
+            try {
+              await deps.softDeleteMasterSession(
+                sessionId,
+                MASTER_USER_PREFIX + evt.bindingUserId,
+              )
+            } catch (softErr) {
+              reqLog.error("master_softdelete_after_pg_fail_also_failed", {
+                sessionId,
+                errMessage: (softErr as Error)?.message ?? String(softErr),
+              })
+              // 不影响 compensation 字段:dispatcher 已尽力,reconcile 兜底
+            }
+          } else {
+            // reuseSession 路径:容器侧 row 是合法在用的活会话,撤回会破坏
+            // 未来 dispatchInbound — 跳过 compensation,只 log;pointer 漂移
+            // 由 reconcile 兜底修正
+            reqLog.warn("step2b_compensation_skipped_reuse", { sessionId })
+            compensation = "skipped_reuse"
+          }
+
+          return {
+            kind: "step2_failed",
+            phase: "pg_pointer",
+            compensation,
+            errMessage,
+          }
+        }
+      } else {
+        reqLog.info("pointer_write_skipped_dedup_old_session", {
+          sessionId,
+          currentSessionId: current,
+        })
+      }
+
+      reqLog.info("dispatched", { sessionId, newSession, started: step1Accepted.started, completed: step1Accepted.completed })
+      return {
+        kind: "dispatched",
+        sessionId,
+        newSession,
+        started: step1Accepted.started,
+        ...(step1Accepted.completed === true ? { completed: true } : {}),
+      }
+    },
+
+    async stop(evt: InboundEvent): Promise<StopOutcome> {
+      const requestId = newRequestId()
+      const reqLog = log.child({
+        requestId,
+        bindingUserId: evt.bindingUserId,
+        idempotencyKey: evt.idempotencyKey,
+        traceId: evt.traceId,
+      })
+
+      let targets: Array<{ sessionId: WechatSessionId; runId: string; agentId?: string }> = []
+      try {
+        targets = await listRunningSessions(deps.pgPool, evt.bindingUserId)
+      } catch (err) {
+        reqLog.error("stop_running_sessions_read_failed", {
+          errMessage: (err as Error)?.message ?? String(err),
+        })
+        // Keep /stop usable during migration or a transient read failure on
+        // the new running-session table: fall back to the legacy current
+        // pointer below and let the container scan live runners by wsess.
+      }
+
+      let pointer: Awaited<ReturnType<typeof getCurrentSessionPointer>> | null = null
+      try {
+        pointer = await getCurrentSessionPointer(deps.pgPool, evt.bindingUserId)
+      } catch (err) {
+        reqLog.error("stop_pointer_read_failed", {
+          errMessage: (err as Error)?.message ?? String(err),
+        })
+        if (targets.length === 0) {
+          return {
+            kind: "command_echo",
+            interrupted: false,
+            reply: "暂时无法读取当前微信任务，请稍后重试；也可以打开实时过程链接在网页端停止。",
+          }
         }
       }
 
-      reqLog.info("dispatched", { sessionId, newSession })
-      return { kind: "dispatched", sessionId, newSession }
+      if (pointer) {
+        const pointerAgentId = pointer.agentId
+        const alreadyTargeted = targets.some(
+          (target) =>
+            target.sessionId === pointer!.sessionId &&
+            (!pointerAgentId || !target.agentId || target.agentId === pointerAgentId),
+        )
+        if (!alreadyTargeted) {
+          targets.push({
+            sessionId: pointer.sessionId,
+            runId: "pointer-fallback",
+            ...(pointerAgentId ? { agentId: pointerAgentId } : {}),
+          })
+        }
+      }
+
+      if (targets.length === 0) {
+        return {
+          kind: "command_echo",
+          interrupted: false,
+          reply: "当前没有可中断的微信任务。",
+        }
+      }
+
+      let endpoint
+      try {
+        endpoint = await deps.resolveContainerEndpoint(BigInt(evt.bindingUserId))
+      } catch (err) {
+        if (isContainerUnreadyError(err)) {
+          return {
+            kind: "command_echo",
+            interrupted: false,
+            reply: "容器正在唤醒中，暂时没有可中断的运行任务。",
+          }
+        }
+        reqLog.error("stop_resolve_endpoint_failed", {
+          errMessage: (err as Error)?.message ?? String(err),
+        })
+        return {
+          kind: "command_echo",
+          interrupted: false,
+          reply: "中断指令暂时发送失败，请稍后重试；也可以打开实时过程链接在网页端停止。",
+        }
+      }
+      if (endpoint.containerId === undefined) {
+        reqLog.error("stop_container_id_missing_from_resolver", {})
+        return {
+          kind: "command_echo",
+          interrupted: false,
+          reply: "中断指令暂时发送失败：容器状态异常。",
+        }
+      }
+      if (endpoint.tunnel !== undefined && !deps.transport.supportsTunnel) {
+        reqLog.warn("stop_tunnel_unsupported", { containerId: endpoint.containerId })
+        return {
+          kind: "command_echo",
+          interrupted: false,
+          reply: "当前容器连接方式暂不支持微信内中断，请打开实时过程链接在网页端停止。",
+        }
+      }
+
+      const nonce = computeInboundNonce(deps.bridgeSecret, endpoint.containerId)
+      const headers: Record<string, string> = {
+        "content-type": "application/json",
+        "x-openclaude-container-id": String(endpoint.containerId),
+        "x-openclaude-inbound-nonce": nonce,
+        "x-request-id": requestId,
+      }
+
+      let interruptedCount = 0
+      let failureCount = 0
+      for (const target of targets) {
+        const targetAgentId = target.agentId
+        const bodyJson = JSON.stringify({
+          userId: MASTER_USER_PREFIX + evt.bindingUserId,
+          peer: { kind: "dm" as const, id: target.sessionId },
+          ...(targetAgentId ? { agentId: targetAgentId } : {}),
+        })
+        const stopRes = await postWithRetry(
+          deps.transport,
+          WECHAT_STOP_CONTAINER_PATH,
+          endpoint,
+          headers,
+          bodyJson,
+          step1TimeoutMs,
+          step1RetryBackoffMs,
+          reqLog,
+        )
+        if (stopRes.kind === "transport_error") {
+          failureCount++
+          reqLog.warn("stop_transport_failed_final", {
+            sessionId: target.sessionId,
+            errMessage: stopRes.errMessage,
+          })
+          continue
+        }
+        if (stopRes.response.status < 200 || stopRes.response.status >= 300) {
+          failureCount++
+          reqLog.warn("stop_container_rejected", {
+            sessionId: target.sessionId,
+            status: stopRes.response.status,
+            bodyText: stopRes.response.bodyText.slice(0, 256),
+          })
+          continue
+        }
+
+        let interrupted = false
+        try {
+          const parsed = JSON.parse(stopRes.response.bodyText) as { interrupted?: unknown }
+          interrupted = parsed.interrupted === true
+        } catch {
+          interrupted = false
+        }
+        if (interrupted) {
+          interruptedCount++
+          reqLog.info("stop_interrupted_keep_running_session_until_final", {
+            sessionId: target.sessionId,
+            runId: target.runId,
+          })
+        } else if (target.runId !== "pointer-fallback") {
+          reqLog.info("stop_not_interrupted_keep_running_session", {
+            sessionId: target.sessionId,
+            runId: target.runId,
+          })
+        }
+      }
+
+      const interrupted = interruptedCount > 0
+      const total = targets.length
+      return {
+        kind: "command_echo",
+        interrupted,
+        reply: interrupted
+          ? total > 1
+            ? `已发送中断指令（${interruptedCount}/${total} 个运行任务）。任务会尽快停止；如需查看状态，请打开实时过程链接。`
+            : "已发送中断指令。正在运行的任务会尽快停止；如需查看状态，请打开实时过程链接。"
+          : failureCount > 0
+            ? "中断指令暂时发送失败，请稍后重试；也可以打开实时过程链接在网页端停止。"
+            : "当前没有正在运行的任务，可能已经结束；如页面仍显示运行中，可在实时过程链接里再点停止。",
+      }
     },
   }
 }
@@ -680,13 +934,35 @@ async function postStep1WithRetry(
   retryBackoffMs: number,
   log: Logger,
 ): Promise<{ kind: "transport_error"; errMessage: string } | { kind: "ok"; response: { status: number; bodyText: string; headers?: Record<string, string> } }> {
+  return postWithRetry(
+    transport,
+    WECHAT_INBOUND_CONTAINER_PATH,
+    endpoint,
+    headers,
+    bodyJson,
+    timeoutMs,
+    retryBackoffMs,
+    log,
+  )
+}
+
+async function postWithRetry(
+  transport: ContainerTransport,
+  path: string,
+  endpoint: { host: string; port: number; tunnel?: unknown },
+  headers: Record<string, string>,
+  bodyJson: string,
+  timeoutMs: number,
+  retryBackoffMs: number,
+  log: Logger,
+): Promise<{ kind: "transport_error"; errMessage: string } | { kind: "ok"; response: { status: number; bodyText: string; headers?: Record<string, string> } }> {
   // 仅 transport 层错(connect refused / timeout / DNS / TLS)走 1 次退避重试;
   // HTTP 应答(任意 status code)即视为"网络已通",由上层按 status code 分流。
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
       const response = await transport.post(
         endpoint,
-        WECHAT_INBOUND_CONTAINER_PATH,
+        path,
         headers,
         bodyJson,
         timeoutMs,
@@ -824,6 +1100,63 @@ function parseRetryAfterSec(response: {
 
   // 3) fallback
   return DEFAULT_COLD_START_RETRY_AFTER_SEC
+}
+
+function parseStep1Accepted(
+  bodyText: string,
+  _fallbackRunId: string,
+): { accepted: boolean; started: boolean; completed?: boolean; runId?: string; sessionId?: WechatSessionId; agentId?: string } {
+  try {
+    const parsed = JSON.parse(bodyText) as {
+      accepted?: unknown
+      started?: unknown
+      completed?: unknown
+      traceId?: unknown
+      sessionId?: unknown
+      peerId?: unknown
+      sessionKey?: unknown
+      agentId?: unknown
+    }
+    const traceId = typeof parsed.traceId === "string" && parsed.traceId.length > 0
+      ? parsed.traceId
+      : undefined
+    const explicitSessionId = typeof parsed.sessionId === "string"
+      ? parsed.sessionId
+      : typeof parsed.peerId === "string"
+        ? parsed.peerId
+        : undefined
+    let sessionId = explicitSessionId && isWechatSessionId(explicitSessionId)
+      ? explicitSessionId
+      : undefined
+    const explicitAgentId = typeof parsed.agentId === "string" && isSafeAgentId(parsed.agentId)
+      ? parsed.agentId
+      : undefined
+    let agentId = explicitAgentId
+    if (typeof parsed.sessionKey === "string") {
+      const match = /^agent:([^:]+):webchat:dm:(wsess-[0-9a-f]{16})$/.exec(parsed.sessionKey)
+      if (match?.[1] && isSafeAgentId(match[1]) && !agentId) agentId = match[1]
+      if (match?.[2] && isWechatSessionId(match[2]) && !sessionId) sessionId = match[2]
+    }
+    return {
+      accepted: parsed.accepted !== false,
+      started: parsed.started !== false,
+      ...(parsed.completed === true ? { completed: true } : {}),
+      ...(traceId ? { runId: traceId } : {}),
+      ...(sessionId ? { sessionId } : {}),
+      ...(agentId ? { agentId } : {}),
+    }
+  } catch {
+    // Older gateways did not include traceId in the Step1 ACK. Do not invent
+    // a requestId run key here: final cleanup clears by body.traceId, so a
+    // synthetic key would create a stale running row that `/stop` keeps seeing.
+    // Pointer fallback still lets `/stop` scan live wsess runners during a
+    // mixed-version rollout.
+    return { accepted: true, started: true }
+  }
+}
+
+function isSafeAgentId(s: string): boolean {
+  return /^[A-Za-z0-9_-]{1,128}$/.test(s)
 }
 
 function clamp(n: number, lo: number, hi: number): number {

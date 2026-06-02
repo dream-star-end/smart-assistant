@@ -170,6 +170,7 @@ import {
   notifyTabVisible,
   resetReplyTracker,
   resetThinkingSafety,
+  refreshWebchatHelloForCurrentSession,
   safeWsSend,
   setProvisioningBanner,
   setWsDeps,
@@ -405,13 +406,43 @@ function _isEmptyBootPlaceholder(sess) {
     _isEmptyPristineSession(sess)
 }
 
+function _requestedSessionIdFromUrl() {
+  try {
+    const sp = new URLSearchParams(window.location.search)
+    const raw = (sp.get('session') || sp.get('sid') || '').trim()
+    if (/^[A-Za-z0-9_-]{1,128}$/.test(raw)) return raw
+  } catch {}
+  return null
+}
+
+let _bootRequestedSessionId = _requestedSessionIdFromUrl()
+
 function _isEmptyPristineSession(sess) {
   return !!sess &&
     (!Array.isArray(sess.messages) || sess.messages.length === 0) &&
     (!sess.title || sess.title === '新会话')
 }
 
+function _applyBootRequestedSessionIfPresent() {
+  if (!_bootRequestedSessionId) return false
+  if (!state.sessions.has(_bootRequestedSessionId)) return false
+  const requestedSessionId = _bootRequestedSessionId
+  _bootRequestedSessionId = null
+  const currentChanged = state.currentSessionId !== requestedSessionId
+  state.currentSessionId = requestedSessionId
+  try {
+    refreshWebchatHelloForCurrentSession()
+  } catch {}
+  return currentChanged
+}
+
 function _selectSessionAfterServerSync() {
+  const requestedPresent = !!_bootRequestedSessionId && state.sessions.has(_bootRequestedSessionId)
+  if (requestedPresent) {
+    const currentChanged = _applyBootRequestedSessionIfPresent()
+    const updated = [...state.sessions.values()].sort((a, b) => b.lastAt - a.lastAt)
+    return { currentChanged, updated }
+  }
   const current = state.currentSessionId ? state.sessions.get(state.currentSessionId) : null
   const currentIsBootPlaceholder = _isEmptyBootPlaceholder(current)
   if (currentIsBootPlaceholder) {
@@ -424,6 +455,9 @@ function _selectSessionAfterServerSync() {
     !state.currentSessionId ||
     !state.sessions.has(state.currentSessionId)
   let currentChanged = false
+  if (_applyBootRequestedSessionIfPresent()) {
+    return { currentChanged: true, updated }
+  }
   if (shouldSelect) {
     // Prefer a real conversation over pre-existing empty "新会话" rows that
     // older builds may have synced before this fix.
@@ -3082,6 +3116,7 @@ async function init() {
   const arr = [...state.sessions.values()].sort((a, b) => b.lastAt - a.lastAt)
   if (arr.length > 0) state.currentSessionId = arr[0].id
   else createSession(undefined, { bootPlaceholder: !!state.token })
+  _applyBootRequestedSessionIfPresent()
 
   // ─────────────────────────────────────────────────────────────────
   // SSO oauthCallback boot 分支 — 必须在 state.token 检查之前
@@ -3241,7 +3276,9 @@ async function init() {
       sp.has('login') ||
       sp.has('register') ||
       sp.has('signin') ||
-      sp.has('signup')
+      sp.has('signup') ||
+      sp.has('session') ||
+      sp.has('sid')
     if (goStraightToAuth) {
       showLogin()
       if (sp.has('register') || sp.has('signup')) {

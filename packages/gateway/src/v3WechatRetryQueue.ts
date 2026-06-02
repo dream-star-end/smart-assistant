@@ -14,6 +14,8 @@
  *   - 单 flight drainer:在内存 boolean 锁 + pendingKick 合并多次 kick
  *   - 周期 30s + boot 时 kick(参 startPeriodic)
  *   - 错误分类:`fatal` → unlink + warn;`transient` / 未知 → 计数 + rewrite
+ *   - 例外:message payload 的 `isFinal:true` 遇到 fatal 时做少量 bounded retry,
+ *     给 master 短暂重启 / migration race 一个补偿窗口,但不能对永久 4xx 无限重试。
  *
  * **broker.send 与 shutdown 的契约**(Codex slice 7c plan v3 reminder):
  *   - shutdown() 只停 periodic 计时器,不阻塞 enqueueDurable —— 即使 adapter
@@ -46,6 +48,12 @@ export const ENTRY_TTL_MS = 24 * 60 * 60 * 1000
 /** Periodic drain interval。30s 同 v3MasterRetryQueue;boot 时也 kick。 */
 export const DEFAULT_DRAIN_INTERVAL_MS = 30_000
 
+/** Final frames are terminal cleanup signals for `wechat_running_sessions`, so a
+ *  short fatal-retry window is useful when master is mid-restart and briefly
+ *  rejects a schema/auth check. Keep it bounded: permanent 4xx (deleted binding,
+ *  auth/config mismatch, stale schema) must not live until TTL. */
+export const FINAL_FATAL_MAX_ATTEMPTS = 3
+
 /** Default queue dir = ${HOME}/v3-wechat-retry.d。与 master sink 的
  *  v3-master-retry.d 严格区分:错混会让两条 retry 链共用 ENOENT-tolerant 路径,
  *  在 ops 重启时数据归错处。 */
@@ -64,6 +72,7 @@ export function defaultQueueDir(): string {
  *   - `outboundId` = turn-level unique id(`[A-Za-z0-9._:-]{8,128}`),audit 表去重
  *   - `peer.kind: 'dm' | 'group'`,`peer.meta.senderId`(微信 openid 衍生)
  *   - `blocks` = OutboundContentBlock[](text / tool_use / tool_result / thinking)
+ *   - `isFinal?` 终态标记(master 用它清 running-session 状态)
  *   - `createdAt?` ms epoch(仅审计,broker outbox 行 createdAt 由 broker 自打)
  *   - `traceId?` 调试用透传
  *
@@ -81,6 +90,7 @@ export interface V3WechatSinkWirePayload {
     meta: { senderId: string; [k: string]: unknown }
   }
   blocks: unknown[]
+  isFinal?: boolean
   createdAt?: number
   traceId?: string
 }
@@ -284,18 +294,47 @@ export function makeV3WechatRetryQueue(deps: MakeV3WechatRetryQueueDeps): V3Wech
         await unlinkIgnoreEnoent(filepath)
       } catch (err) {
         if (err instanceof V3WechatSinkError && err.errorClass === 'fatal') {
-          stats.fatalDropped++
+          if (!isFinalMessagePayload(entry.payload)) {
+            stats.fatalDropped++
+            log.warn(
+              'v3WechatRetryQueue: fatal sink error, unlinking',
+              {
+                name,
+                ...payloadLogContext(entry.payload),
+                httpStatus: err.httpStatus,
+              },
+              err,
+            )
+            await unlinkIgnoreEnoent(filepath)
+            continue
+          }
+          if (entry.attempts >= FINAL_FATAL_MAX_ATTEMPTS) {
+            stats.fatalDropped++
+            log.warn(
+              'v3WechatRetryQueue: fatal final sink error max attempts exceeded, unlinking',
+              {
+                name,
+                ...payloadLogContext(entry.payload),
+                attempts: entry.attempts,
+                maxAttempts: FINAL_FATAL_MAX_ATTEMPTS,
+                httpStatus: err.httpStatus,
+              },
+              err,
+            )
+            await unlinkIgnoreEnoent(filepath)
+            continue
+          }
           log.warn(
-            'v3WechatRetryQueue: fatal sink error, unlinking',
+            'v3WechatRetryQueue: fatal final sink error, retrying terminal cleanup',
             {
               name,
               ...payloadLogContext(entry.payload),
+              attempts: entry.attempts,
+              maxAttempts: FINAL_FATAL_MAX_ATTEMPTS,
               httpStatus: err.httpStatus,
             },
             err,
           )
-          await unlinkIgnoreEnoent(filepath)
-          continue
         }
         stats.retried++
         stats.pending++
@@ -383,6 +422,10 @@ function isCodexBillingPayload(
   return 'type' in payload && payload.type === 'outbound.codex_billing'
 }
 
+function isFinalMessagePayload(payload: V3WechatOutboundPostPayload): payload is V3WechatSinkWirePayload {
+  return !isCodexBillingPayload(payload) && payload.isFinal === true
+}
+
 function isV3WechatRetryEntry(v: unknown): v is V3WechatRetryEntry {
   if (!v || typeof v !== 'object') return false
   const o = v as Record<string, unknown>
@@ -417,5 +460,6 @@ function isV3WechatRetryEntry(v: unknown): v is V3WechatRetryEntry {
   if (!meta || typeof meta !== 'object') return false
   if (typeof meta.senderId !== 'string' || !/^[A-Za-z0-9_-]{1,256}$/.test(meta.senderId)) return false
   if (!Array.isArray(p.blocks) || p.blocks.length === 0) return false
+  if (p.isFinal !== undefined && typeof p.isFinal !== 'boolean') return false
   return true
 }

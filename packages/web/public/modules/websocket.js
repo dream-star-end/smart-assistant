@@ -1163,6 +1163,11 @@ function _sendHelloFrame(ws, opts) {
   return safeWsSend(ws, _buildHelloFrame(opts))
 }
 
+export function refreshWebchatHelloForCurrentSession() {
+  if (!state.ws || state.ws.readyState !== 1) return false
+  return _sendHelloFrame(state.ws, { includeInFlight: false })
+}
+
 // 实际发送一次 bind attempt。仅在 ws.OPEN 且距上次 send >= MIN_GAP 时计 attempt。
 // 返回 'sent' / 'skipped_gap' / 'skipped_offline'。
 //

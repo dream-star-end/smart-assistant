@@ -66,6 +66,7 @@ function extractMethodBody(source: string, methodName: string): string {
 }
 
 const handleWechatInbound = extractMethodBody(SERVER_TS, 'handleWechatInbound')
+const handleStop = extractMethodBody(SERVER_TS, 'handleStop')
 
 // ── 基础前置:method 抽出来非空、且包含必要 keyword ──
 test('extractMethodBody finds handleWechatInbound and includes core skeleton', () => {
@@ -192,5 +193,198 @@ test('handleWechatInbound preserves peer.displayName on the outbound frame', () 
     handleWechatInbound,
     /peerOut\.displayName\s*=\s*peerDisplayName/,
     'peer.displayName carrier 必须被透传(broker senderId 协议依赖此字段)',
+  )
+})
+
+test('dispatchInbound keeps completed WeChat idempotency entries accepted for Step1 retries', () => {
+  assert.doesNotMatch(
+    SERVER_TS,
+    /_updateWechatIdempotency\(\s*frame\.idempotencyKey\s*,\s*\{\s*started:\s*false\s*\}\s*\)/,
+    'successful final must not flip cached WeChat idempotency metadata to started:false; late Step1 retries still need accepted:true so master persists the already-started wsess',
+  )
+})
+
+test('WeChat idempotency entries use a long TTL for multi-hour early-ACK retries', () => {
+  assert.match(
+    SERVER_TS,
+    /WECHAT_IDEMPOTENCY_TTL_MS\s*=\s*24\s*\*\s*60\s*\*\s*60_000/,
+    'WeChat Step1 ACKs can precede final by hours; the dedupe cache must outlive the generic 5-minute browser replay TTL',
+  )
+  assert.match(
+    SERVER_TS,
+    /entry\.wechat\s*\?\s*Gateway\.WECHAT_IDEMPOTENCY_TTL_MS\s*:\s*Gateway\.IDEMPOTENCY_TTL_MS/,
+    'idempotency eviction must use the WeChat-specific TTL only for WeChat entries',
+  )
+})
+
+test('WeChat Step1 start callback reports routed sessionKey and agentId', () => {
+  assert.match(
+    SERVER_TS,
+    /wechatDispatchStarted\(\{\s*traceId:\s*turnTraceId,\s*sessionKey,\s*agentId:\s*agent\.id,/,
+    'Step1 ACK must expose the post-routing sessionKey/agentId so master stores the same runner tuple used by Web hello and /stop',
+  )
+})
+
+test('WeChat Step1 ACK returns the routed wsess when dispatch reroutes the runner', () => {
+  assert.match(
+    SERVER_TS,
+    /function\s+wechatPeerIdFromSessionKey\([\s\S]+webchat:dm:\(wsess-\[0-9a-f\]\{16\}\)/,
+    'gateway must be able to derive the routed wsess from the routed sessionKey',
+  )
+  assert.match(
+    handleWechatInbound,
+    /const routedPeerId\s*=\s*wechatPeerIdFromSessionKey\(info\?\.sessionKey\)/,
+    'Step1 start callback must capture the routed wsess instead of keeping the provisional peer id',
+  )
+  assert.match(
+    handleWechatInbound,
+    /sessionId:\s*startOutcome\.peerId\s*\?\?\s*wechatPeerIdFromSessionKey\(startOutcome\.sessionKey\s*\?\?\s*sessionKey\)\s*\?\?\s*peerId/,
+    'accepted Step1 ACK must serialize the routed wsess as sessionId so master pointers/stop target the real runner',
+  )
+})
+
+test('WeChat realtime-link routing keeps rate-limit WeChat-scoped but lastActive webchat-scoped', () => {
+  assert.match(
+    handleWechatInbound,
+    /_rateLimitChannel\s*=\s*['"]wechat['"]/,
+    'WeChat inbound must keep a WeChat-scoped rate-limit bucket even though the runner session is webchat',
+  )
+  assert.doesNotMatch(
+    handleWechatInbound,
+    /_lastActiveChannel\s*=\s*['"]wechat['"]/,
+    'WeChat inbound must not rewrite lastActive away from webchat; the realtime link relies on webchat/wsess pushes',
+  )
+  assert.doesNotMatch(
+    handleWechatInbound,
+    /_lastActivePeerId\s*=/,
+    'WeChat inbound must leave lastActive peerId as wsess so cron/webhook/inter-agent pushes hit the linked Web session',
+  )
+  assert.match(
+    SERVER_TS,
+    /const rateLimitChannel[\s\S]+_rateLimitChannel[\s\S]+rateLimiter\.check\(frame\.peer\.id,\s*rateLimitChannel\)/,
+    'dispatchInbound must not charge WeChat-originated retries against the linked webchat bucket',
+  )
+  assert.match(
+    SERVER_TS,
+    /const lastActiveChannel[\s\S]+_lastActiveChannel[\s\S]+channel:\s*lastActiveChannel/,
+    'dispatchInbound must record the original channel when a private last-active override is present',
+  )
+})
+
+test('duplicate WeChat Step1 waits for the original start promise before ACK', () => {
+  assert.match(
+    SERVER_TS,
+    /await\s+originalWechat\.startPromise/,
+    'deduplicated Step1 requests must wait for the original start result instead of replaying provisional started:false metadata',
+  )
+})
+
+test('duplicate WeChat Step1 ACK returns the cached routed wsess', () => {
+  assert.match(
+    handleWechatInbound,
+    /const originalPeerId\s*=\s*wechatPeerIdFromSessionKey\(originalWechat\.sessionKey\)\s*\?\?\s*originalWechat\.peerId/,
+    'duplicate Step1 ACK must not leak the retry/provisional wsess when the original turn rerouted to an existing runner',
+  )
+  assert.match(
+    handleWechatInbound,
+    /sessionId:\s*originalPeerId/,
+    'duplicate Step1 ACK must return the routed cached wsess as sessionId',
+  )
+  assert.match(
+    handleWechatInbound,
+    /accepted:\s*originalWechat\.started\s*!==\s*false/,
+    'duplicates for already-started/completed turns must remain accepted:true so master can persist the session after a lost Step1 response',
+  )
+  assert.match(
+    handleWechatInbound,
+    /completed:\s*originalWechat\.completed\s*===\s*true/,
+    'duplicate Step1 ACK must tell master when the cached turn is already terminal so it does not recreate an active running row',
+  )
+})
+
+test('pre-start terminal dispatch exits are ACKed as unaccepted, not ghost sessions', () => {
+  assert.doesNotMatch(
+    handleWechatInbound,
+    /\.then\(\(\)\s*=>\s*settleStart\(\{\s*started:\s*false\s*\}\)\s*\)/,
+    'pre-start rate-limit/model rejects must not be acknowledged as accepted wsess sessions',
+  )
+  assert.match(
+    handleWechatInbound,
+    /settleStart\(\{\s*accepted:\s*false,\s*started:\s*false\s*\}\)/,
+    'if dispatchInbound returns before the start callback, Step1 should be 200 accepted:false: terminal already reached WeChat, but master must not persist it as a real runner',
+  )
+  assert.match(
+    handleWechatInbound,
+    /accepted:\s*startOutcome\.accepted\s*!==\s*false/,
+    'Step1 response must surface accepted:false to master so it can skip client_sessions/pointer upserts',
+  )
+})
+
+test('live WeChat stream does not retain every process block until final', () => {
+  const liveBranch = /if \(liveWechatAdapter\) \{([\s\S]*?)\n\s*\} else if \(adapter\)/.exec(SERVER_TS)
+  assert.ok(liveBranch?.[1], 'live WeChat branch must be present in dispatchInbound block handler')
+  assert.doesNotMatch(
+    liveBranch[1],
+    /out\.blocks\.push/,
+    'the realtime-link branch already delivers each block to Web and must not retain the whole stream in out.blocks for multi-hour tasks',
+  )
+})
+
+test('post-start async dispatch failures emit a terminal error to Web and WeChat', () => {
+  assert.match(
+    handleWechatInbound,
+    /publishPostStartDispatchFailure/,
+    'post-start dispatch rejection must not be log-only after Step1 has already ACKed',
+  )
+  assert.match(
+    handleWechatInbound,
+    /this\.deliver\(\s*terminalOut\s*,\s*undefined\s*\)/,
+    'post-start dispatch rejection must terminate the linked Web realtime session',
+  )
+  assert.match(
+    handleWechatInbound,
+    /const terminalPeer\s*=\s*\{[\s\S]+id:\s*currentWechat\?\.peerId\s*\?\?\s*wechatPeerIdFromSessionKey\(currentWechat\?\.sessionKey\)\s*\?\?\s*peerId/,
+    'post-start dispatch rejection must send its terminal error to the routed wsess, not the provisional Step1 peer',
+  )
+  assert.match(
+    handleWechatInbound,
+    /await\s+this\._sendAdapterOutboundMessage\(\s*terminalOut\s*,\s*v3OutboundAdapter\s*\)/,
+    'post-start dispatch rejection must also send a final error back through WeChat outbound',
+  )
+  assert.doesNotMatch(
+    handleWechatInbound,
+    /_updateWechatIdempotency\(\s*idempotencyKey\s*,\s*\{\s*started:\s*false\s*\}\s*\)/,
+    'post-start dispatch rejection must preserve cached WeChat idempotency metadata so Step1 retries dedupe instead of re-dispatching',
+  )
+})
+
+test('terminal WeChat failure paths preserve idempotency metadata for Step1 retries', () => {
+  assert.match(
+    SERVER_TS,
+    /_seenIdempotencyKeys\.delete\(frame\.idempotencyKey\)[\s\S]+_idempotencyPreReserved/,
+    'terminal failure cleanup must be guarded by _idempotencyPreReserved so WeChat retries remain deduplicated',
+  )
+  assert.match(
+    SERVER_TS,
+    /_updateWechatIdempotency\(\s*frame\.idempotencyKey\s*,\s*\{\s*completed:\s*true\s*\}\s*\)/,
+    'WeChat terminal paths must mark cached idempotency metadata as completed so late Step1 retries skip active-run tracking',
+  )
+})
+
+test('handleStop scans live webchat sessions when agentId is omitted', () => {
+  assert.match(
+    handleStop,
+    /this\.sessions\.list\(\)/,
+    'agent-less WeChat /stop fallback must enumerate live sessions for upgraded pointers without current_agent_id',
+  )
+  assert.match(
+    handleStop,
+    /\.endsWith\(suffix\)/,
+    'agent-less WeChat /stop fallback must match by channel/kind/wsess suffix across agents',
+  )
+  assert.match(
+    handleStop,
+    /this\.sessions\.interrupt\(live\.sessionKey\)/,
+    'agent-less WeChat /stop fallback must interrupt the matched live runner instead of defaulting to main',
   )
 })

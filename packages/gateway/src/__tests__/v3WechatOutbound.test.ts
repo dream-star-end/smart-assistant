@@ -423,6 +423,29 @@ describe("makeV3WechatOutboundAdapter — send orchestration", () => {
     assert.equal(q.enqueued.length, 0)
   })
 
+  test("webchat codex billing frame is accepted when sent through v3 WeChat adapter", async () => {
+    const q = fakeQueue()
+    const captured: any[] = []
+    const adapter = makeV3WechatOutboundAdapter({
+      config: CFG,
+      retryQueue: q,
+      attemptSendImpl: async (payload) => {
+        captured.push(payload)
+      },
+    })
+    await adapter.init!(makeCtx())
+    await adapter.send!({
+      type: "outbound.codex_billing",
+      channel: "webchat",
+      requestId: "0123456789abcdef0123456789abcdef",
+      status: "success",
+      durationMs: 321,
+    } as unknown as OutboundMessage)
+    assert.equal(captured.length, 1)
+    assert.equal(captured[0].type, "outbound.codex_billing")
+    assert.equal(q.enqueued.length, 0)
+  })
+
   test("invalid codex billing requestId is dropped before POST", async () => {
     const q = fakeQueue()
     let attempted = false
@@ -500,8 +523,25 @@ describe("makeV3WechatOutboundAdapter — send orchestration", () => {
       },
     })
     await adapter.init!(makeCtx())
-    await adapter.send!(makeOut())
-    assert.equal(q.enqueued.length, 0, "fatal must NOT enqueue (would just retry-loop until TTL)")
+    await adapter.send!(makeOut({ isFinal: false }))
+    assert.equal(q.enqueued.length, 0, "non-final fatal must NOT enqueue (would just retry-loop until TTL)")
+  })
+
+  test("fatal final error → enqueue terminal retry so master can clear running state", async () => {
+    const q = fakeQueue()
+    const adapter = makeV3WechatOutboundAdapter({
+      config: CFG,
+      retryQueue: q,
+      attemptSendImpl: async () => {
+        throw new V3WechatSinkError("master rejected final 401", "fatal", 401)
+      },
+      now: () => 1_700_000_000_000,
+    })
+    await adapter.init!(makeCtx())
+    await adapter.send!(makeOut({ isFinal: true }))
+    assert.equal(q.enqueued.length, 1)
+    assert.equal(q.enqueued[0]!.lastErrorClass, "fatal")
+    assert.equal(messagePayload(q.enqueued[0]!).isFinal, true)
   })
 
   test("transient error → enqueueDurable", async () => {
@@ -718,5 +758,36 @@ describe("makeV3WechatOutboundAdapter — wire payload assembly", () => {
     await adapter.init!(makeCtx())
     await adapter.send!(makeOut())
     assert.equal("agentId" in q.enqueued[0]!.payload, false)
+  })
+
+  test("final frames carry isFinal marker to master", async () => {
+    const q = fakeQueue()
+    const adapter = makeV3WechatOutboundAdapter({
+      config: CFG,
+      retryQueue: q,
+      attemptSendImpl: async () => {
+        throw new V3WechatSinkError("503", "transient", 503)
+      },
+    })
+    await adapter.init!(makeCtx())
+    await adapter.send!(makeOut({ isFinal: true }))
+    assert.equal(messagePayload(q.enqueued[0]!).isFinal, true)
+  })
+
+  test("webchat message frames are mirrored to WeChat wire channel", async () => {
+    const q = fakeQueue()
+    const adapter = makeV3WechatOutboundAdapter({
+      config: CFG,
+      retryQueue: q,
+      attemptSendImpl: async () => {
+        throw new V3WechatSinkError("503", "transient", 503)
+      },
+    })
+    await adapter.init!(makeCtx())
+    await adapter.send!(makeOut({ channel: "webchat" as any }))
+    const payload = messagePayload(q.enqueued[0]!)
+    assert.equal(payload.channel, "wechat")
+    assert.equal(payload.sessionId, SESSION_ID)
+    assert.equal(payload.peer.meta.senderId, SENDER_ID)
   })
 })

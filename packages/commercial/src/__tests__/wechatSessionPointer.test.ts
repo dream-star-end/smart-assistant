@@ -13,6 +13,9 @@ import {
   newWechatSessionId,
   listOrphanWechatSessions,
   setCurrentSessionId,
+  getCurrentSessionPointer,
+  markRunningSession,
+  listRunningSessions,
   RECONCILE_GRACE_MS_DEFAULT,
   type PgConn,
 } from "../wechat/sessionPointer.js"
@@ -148,7 +151,7 @@ describe("wechat sessionPointer.setCurrentSessionId (SQL guard)", () => {
       captured[0]!.sql.replace(/\s+/g, " "),
       /WHERE wechat_session_pointer\.updated_at\s*<=\s*EXCLUDED\.updated_at/,
     )
-    assert.deepEqual(captured[0]!.params, ["u1", "wsess-0123456789abcdef", 1000])
+    assert.deepEqual(captured[0]!.params, ["u1", "wsess-0123456789abcdef", 1000, null])
   })
 
   test("returns true when rowCount > 0 (写入生效)", async () => {
@@ -169,6 +172,105 @@ describe("wechat sessionPointer.setCurrentSessionId (SQL guard)", () => {
     }
     const ok = await setCurrentSessionId(conn, "u1", "wsess-0123456789abcdef", 500)
     assert.equal(ok, false)
+  })
+
+  test("falls back to legacy pointer write before current_agent_id migration lands", async () => {
+    const captured: { sql: string; params: ReadonlyArray<unknown> }[] = []
+    const conn: PgConn = {
+      query: async (sql: string, params: ReadonlyArray<unknown> = []) => {
+        captured.push({ sql, params })
+        if (captured.length === 1) {
+          const err = new Error('column "current_agent_id" does not exist') as Error & { code: string; column: string }
+          err.code = "42703"
+          err.column = "current_agent_id"
+          throw err
+        }
+        return { rows: [], rowCount: 1 }
+      },
+    }
+    const ok = await setCurrentSessionId(conn, "u1", "wsess-0123456789abcdef", 1000, "main")
+    assert.equal(ok, true)
+    assert.equal(captured.length, 2)
+    assert.match(captured[0]!.sql, /current_agent_id/)
+    assert.doesNotMatch(captured[1]!.sql, /current_agent_id/)
+    assert.deepEqual(captured[1]!.params, ["u1", "wsess-0123456789abcdef", 1000])
+  })
+})
+
+describe("wechat sessionPointer.getCurrentSessionPointer", () => {
+  test("falls back to legacy pointer read before current_agent_id migration lands", async () => {
+    const captured: { sql: string; params: ReadonlyArray<unknown> }[] = []
+    const conn: PgConn = {
+      query: async (sql: string, params: ReadonlyArray<unknown> = []) => {
+        captured.push({ sql, params })
+        if (captured.length === 1) {
+          const err = new Error('column "current_agent_id" does not exist') as Error & { code: string; column: string }
+          err.code = "42703"
+          err.column = "current_agent_id"
+          throw err
+        }
+        return { rows: [{ current_session_id: "wsess-0123456789abcdef" }], rowCount: 1 }
+      },
+    }
+    const pointer = await getCurrentSessionPointer(conn, "u1")
+    assert.deepEqual(pointer, { sessionId: "wsess-0123456789abcdef" })
+    assert.equal(captured.length, 2)
+    assert.match(captured[0]!.sql, /current_agent_id/)
+    assert.doesNotMatch(captured[1]!.sql, /current_agent_id/)
+  })
+})
+
+describe("wechat sessionPointer.listRunningSessions (SQL guard)", () => {
+  function captureConn(): { conn: PgConn; captured: { sql: string; params: ReadonlyArray<unknown> }[] } {
+    const captured: { sql: string; params: ReadonlyArray<unknown> }[] = []
+    const conn: PgConn = {
+      query: async (sql: string, params: ReadonlyArray<unknown> = []) => {
+        captured.push({ sql, params })
+        return { rows: [], rowCount: 0 }
+      },
+    }
+    return { conn, captured }
+  }
+
+  test("default enumeration has no LIMIT so /stop can reach every running task", async () => {
+    const { conn, captured } = captureConn()
+    await listRunningSessions(conn, "u1")
+    assert.equal(captured.length, 1)
+    assert.doesNotMatch(captured[0]!.sql, /\bLIMIT\b/i)
+    assert.deepEqual(captured[0]!.params, ["u1"])
+  })
+
+  test("explicit positive limit still emits LIMIT for diagnostic callers", async () => {
+    const { conn, captured } = captureConn()
+    await listRunningSessions(conn, "u1", 3)
+    assert.equal(captured.length, 1)
+    assert.match(captured[0]!.sql, /\bLIMIT\s+\$2\b/i)
+    assert.deepEqual(captured[0]!.params, ["u1", 3])
+  })
+})
+
+describe("wechat sessionPointer.markRunningSession", () => {
+  test("creates running-session table on demand before retrying insert", async () => {
+    const captured: { sql: string; params: ReadonlyArray<unknown> }[] = []
+    const conn: PgConn = {
+      query: async (sql: string, params: ReadonlyArray<unknown> = []) => {
+        captured.push({ sql, params })
+        if (/INSERT INTO wechat_running_sessions/i.test(sql) && captured.length === 1) {
+          const err = new Error('relation "wechat_running_sessions" does not exist') as Error & { code: string }
+          err.code = "42P01"
+          throw err
+        }
+        return { rows: [], rowCount: 1 }
+      },
+    }
+
+    await markRunningSession(conn, "u1", "wsess-0123456789abcdef", "run-1", "main", 1000)
+
+    assert.match(captured[0]!.sql, /INSERT INTO wechat_running_sessions/i)
+    assert.match(captured[1]!.sql, /CREATE TABLE IF NOT EXISTS wechat_running_sessions/i)
+    assert.match(captured[2]!.sql, /CREATE INDEX IF NOT EXISTS idx_wrs_binding_started/i)
+    assert.match(captured[3]!.sql, /INSERT INTO wechat_running_sessions/i)
+    assert.deepEqual(captured[3]!.params, ["u1", "wsess-0123456789abcdef", "run-1", "main", 1000])
   })
 })
 
