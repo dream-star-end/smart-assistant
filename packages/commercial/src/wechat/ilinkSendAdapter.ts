@@ -40,6 +40,7 @@ const STATUS_BUSINESS_FIELDS = ["status", "result", "state"] as const
 const FAILURE_VALUE_STRINGS = new Set(["error", "failed", "fail", "failure"])
 const MESSAGE_FIELDS = ["errmsg", "err_msg", "message", "msg", "error", "error_msg", "reason"] as const
 const STRONG_ERROR_MESSAGE_FIELDS = ["errmsg", "err_msg", "error", "error_msg", "reason"] as const
+const DEFAULT_ILINK_SEND_TIMEOUT_MS = 20_000
 
 export type SendIlinkTextFn = (
   botToken: string,
@@ -54,6 +55,8 @@ export interface MakeIlinkSendAdapterOptions {
   /** sendIlinkText 注入点(默认 `@openclaude/channel-wechat` 的实现;测试注入 mock)。 */
   sendIlinkText?: SendIlinkTextFn
   sendIlinkMedia?: SendIlinkMediaFn
+  /** Hard wall-clock timeout around the iLink send promise. */
+  sendTimeoutMs?: number
   logger?: Logger
 }
 
@@ -98,6 +101,21 @@ function hasStrongErrorMessage(body: Record<string, unknown>): boolean {
     if (typeof value === "string" && value.trim().length > 0) return true
   }
   return false
+}
+
+async function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) return promise
+  let timer: ReturnType<typeof setTimeout> | null = null
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<T>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error(`iLink send timeout after ${timeoutMs}ms`)), timeoutMs)
+      }),
+    ])
+  } finally {
+    if (timer !== null) clearTimeout(timer)
+  }
 }
 
 export function classifyIlinkBusinessAck(body: unknown): SendResult & {
@@ -178,6 +196,7 @@ export function classifyIlinkError(err: unknown): {
 export function makeIlinkSendAdapter(opts: MakeIlinkSendAdapterOptions = {}): SendTextFn {
   const log = (opts.logger ?? rootLogger).child({ subsys: "wechatIlinkSendAdapter" })
   const send = opts.sendIlinkText ?? sendIlinkText
+  const timeoutMs = opts.sendTimeoutMs ?? DEFAULT_ILINK_SEND_TIMEOUT_MS
 
   return async (params: {
     botToken: string
@@ -186,7 +205,10 @@ export function makeIlinkSendAdapter(opts: MakeIlinkSendAdapterOptions = {}): Se
     text: string
   }): Promise<SendResult> => {
     try {
-      const body = await send(params.botToken, params.toUserId, params.contextToken, params.text)
+      const body = await withTimeout(
+        send(params.botToken, params.toUserId, params.contextToken, params.text),
+        timeoutMs,
+      )
       const ack = classifyIlinkBusinessAck(body)
       if (!ack.ok) {
         log.warn("ilink_send_business_failed", {
@@ -214,16 +236,20 @@ export function makeIlinkSendAdapter(opts: MakeIlinkSendAdapterOptions = {}): Se
 export function makeIlinkSendMediaAdapter(opts: MakeIlinkSendAdapterOptions = {}): SendMediaFn {
   const log = (opts.logger ?? rootLogger).child({ subsys: "wechatIlinkSendAdapter" })
   const send = opts.sendIlinkMedia ?? sendIlinkMedia
+  const timeoutMs = opts.sendTimeoutMs ?? DEFAULT_ILINK_SEND_TIMEOUT_MS
 
   return async (params): Promise<SendResult> => {
     try {
-      const body = await send(params.botToken, params.toUserId, {
-        kind: params.media.kind,
-        filename: params.media.filename,
-        content: params.media.content,
-        mimeType: params.media.mimeType,
-        contextToken: params.contextToken,
-      })
+      const body = await withTimeout(
+        send(params.botToken, params.toUserId, {
+          kind: params.media.kind,
+          filename: params.media.filename,
+          content: params.media.content,
+          mimeType: params.media.mimeType,
+          contextToken: params.contextToken,
+        }),
+        timeoutMs,
+      )
       const ack = classifyIlinkBusinessAck(body)
       if (!ack.ok) {
         log.warn("ilink_send_media_business_failed", {

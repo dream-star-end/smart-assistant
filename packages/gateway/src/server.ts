@@ -119,11 +119,8 @@ import type { CodexProviderConfigOverride } from './codexRunner.js'
 const CLAUDE_OAUTH_USER_AGENT = `claude-cli/${process.env.OPENCLAUDE_CC_VERSION_FOR_OAUTH || '2.1.888'} (external, cli)`
 
 const V3_WECHAT_OUTBOUND_ADAPTER_ID = 'v3-wechat-outbound'
-// WeChat/iLink is sensitive to many tiny messages, but users still expect the
-// detailed process transcript.  Batch raw thinking deltas into larger bubbles;
-// outbox backoff/HOL ordering handles delivery pressure instead of hiding
-// process content.
-const WECHAT_LIVE_THINKING_FLUSH_CHARS = 1800
+const WECHAT_FINAL_EMPTY_TEXT =
+  '✅ 任务已完成，但这轮没有生成可直接发送到微信的文本结果。请打开实时过程链接查看详细过程。'
 
 /**
  * 协议级允许的 InboundMessage.model 值(2026-04-26 v1.0.4 加)。
@@ -1726,6 +1723,26 @@ export class Gateway {
       return
     }
 
+    // v3 WeChat `/stop` bridge. Master broker resolves the current wsess and
+    // POSTs here so the container can interrupt the in-process runner. Same
+    // HMAC gate as `/wechat-inbound`; the endpoint is intentionally internal
+    // and never exposed to browser/client traffic.
+    if (url.pathname === '/internal/v3/wechat-stop' && req.method === 'POST') {
+      if (!this.checkInboundBypass(req, url)) {
+        this.sendJson(res, 401, { error: 'unauthorized' })
+        return
+      }
+      this.handleWechatStop(req, res).catch((err) => {
+        this.log.error('wechat-stop handler crashed', undefined, err)
+        if (!res.headersSent) {
+          try { this.sendJson(res, 500, { error: 'internal' }) } catch {}
+        } else {
+          try { res.end() } catch {}
+        }
+      })
+      return
+    }
+
     // Frontend diagnostic trace sink — receives ring-buffer events from
     // packages/web/public/modules/trace.js for diagnosing the "已读但无回复"
     // class of bug (assistant frame delivered by gateway but never landed in
@@ -2689,7 +2706,11 @@ export class Gateway {
     const frame = {
       type: 'inbound.message' as const,
       idempotencyKey,
-      channel: 'wechat',
+      // WeChat-originated turns run on the normal webchat session key so the
+      // realtime process link can attach to the same runner via WebSocket
+      // hello/auto-resume. We still pass the v3-wechat-outbound adapter below;
+      // that adapter is the only path that mirrors final text back to iLink.
+      channel: 'webchat',
       peer: peerOut,
       ...(typeof agentId === 'string' ? { agentId } : {}),
       ...(typeof model === 'string' ? { model } : {}),
@@ -2731,18 +2752,102 @@ export class Gateway {
       })
       return
     }
-    await this.dispatchInbound(frame as InboundFrame, v3OutboundAdapter)
-
-    // sessionKey 派生(与 server.ts:5185 一致)便于 broker 关联 log / metric。
     const safePeerId = peerId.replace(/[^a-zA-Z0-9_-]/g, '_')
-    const sessionKey =
-      typeof agentId === 'string'
-        ? `agent:${agentId}:wechat:dm:${safePeerId}`
-        : null
+    const resolvedAgentId = typeof agentId === 'string' ? agentId : 'main'
+    const sessionKey = `agent:${resolvedAgentId}:webchat:dm:${safePeerId}`
+
+    // Long WeChat tasks can run for hours. The master broker's Step 1 HTTP
+    // deadline is intentionally short (seconds), so this endpoint must ACK
+    // after validation instead of holding the request open until final.
+    //
+    // Idempotency is normally marked inside dispatchInbound. Because this path
+    // ACKs before dispatch finishes, reserve the key synchronously here and
+    // tell dispatchInbound not to treat that reservation as a duplicate.
+    if (this._isIdempotencyDuplicate(idempotencyKey)) {
+      this.sendJson(res, 200, { ok: true, deduplicated: true, sessionKey })
+      return
+    }
+    this._markIdempotencyKey(idempotencyKey)
+    ;(frame as any)._idempotencyPreReserved = true
+
+    void this.dispatchInbound(frame as InboundFrame, v3OutboundAdapter).catch((err) => {
+      // A crash before dispatchInbound reaches its own failure cleanup should
+      // not pin this idempotency key for 5 minutes and block a user retry.
+      this._seenIdempotencyKeys.delete(idempotencyKey)
+      this.log.error('wechat-inbound async dispatch failed', {
+        userId,
+        peerId,
+        idempotencyKey,
+        sessionKey,
+      }, err)
+    })
+
     this.sendJson(res, 200, {
       ok: true,
-      ...(sessionKey ? { sessionKey } : {}),
+      accepted: true,
+      sessionKey,
     })
+  }
+
+  /**
+   * v3 WeChat `/stop` bridge. Master resolves the current WeChat wsess and
+   * calls this container-local endpoint; the actual runner is keyed as a
+   * webchat session so the Web realtime link and WeChat interrupt hit the
+   * same `agent:<id>:webchat:dm:<wsess>` SessionManager entry.
+   */
+  private async handleWechatStop(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    const MAX_STOP_BODY = 16 * 1024
+    let raw: string
+    try {
+      raw = await this.readBody(req, MAX_STOP_BODY)
+    } catch (err) {
+      const tooLarge = String((err as Error)?.message ?? err).includes('body too large')
+      this.sendJson(res, tooLarge ? 413 : 400, { error: tooLarge ? 'body too large' : 'read failed' })
+      return
+    }
+    let parsed: unknown
+    try {
+      parsed = JSON.parse(raw)
+    } catch {
+      this.sendJson(res, 400, { error: 'invalid json' })
+      return
+    }
+    if (!parsed || typeof parsed !== 'object') {
+      this.sendJson(res, 400, { error: 'body must be a JSON object' })
+      return
+    }
+    const body = parsed as Record<string, unknown>
+    const userId = body.userId
+    if (typeof userId !== 'string' || !/^c:[1-9][0-9]{0,18}$/.test(userId)) {
+      this.sendJson(res, 400, { error: 'userId must match c:<uid>' })
+      return
+    }
+    const peerRaw = body.peer as Record<string, unknown> | undefined
+    if (!peerRaw || typeof peerRaw !== 'object') {
+      this.sendJson(res, 400, { error: 'peer required' })
+      return
+    }
+    if (peerRaw.kind !== 'dm') {
+      this.sendJson(res, 400, { error: 'peer.kind must be dm' })
+      return
+    }
+    const peerId = peerRaw.id
+    if (typeof peerId !== 'string' || !/^wsess-[0-9a-f]{16}$/.test(peerId)) {
+      this.sendJson(res, 400, { error: 'peer.id must be wsess-[0-9a-f]{16}' })
+      return
+    }
+    const agentId = body.agentId
+    if (agentId !== undefined && (typeof agentId !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(agentId))) {
+      this.sendJson(res, 400, { error: 'agentId charset/length invalid' })
+      return
+    }
+    const interrupted = await this.handleStop({
+      type: 'inbound.control.stop',
+      channel: 'webchat',
+      peer: { kind: 'dm', id: peerId },
+      ...(typeof agentId === 'string' ? { agentId } : {}),
+    })
+    this.sendJson(res, 200, { ok: true, interrupted })
   }
 
   /**
@@ -5620,7 +5725,7 @@ export class Gateway {
     peer: { id: string; kind: 'dm' | 'group' }
     agentId?: string
     sessionKey?: string
-  }): Promise<void> {
+  }): Promise<boolean> {
     let sessionKey = frame.sessionKey
     if (!sessionKey) {
       if (frame.agentId) {
@@ -5639,6 +5744,7 @@ export class Gateway {
     }
     const ok = this.sessions.interrupt(sessionKey)
     this.log.info('interrupt', { sessionKey, ok })
+    return ok
   }
 
   /** Handle permission approval/denial from the web frontend */
@@ -6293,7 +6399,12 @@ export class Gateway {
 
     // ── Idempotency dedup (read-only check): skip already-processed messages ──
     // Checked first so duplicates don't consume rate-limit budget
-    if (frame.idempotencyKey && this._isIdempotencyDuplicate(frame.idempotencyKey)) {
+    const idempotencyPreReserved = (frame as any)._idempotencyPreReserved === true
+    if (
+      frame.idempotencyKey &&
+      !idempotencyPreReserved &&
+      this._isIdempotencyDuplicate(frame.idempotencyKey)
+    ) {
       this.log.debug('duplicate idempotencyKey', { key: frame.idempotencyKey })
       const dupUserId: string =
         typeof (frame as any)._userId === 'string' ? (frame as any)._userId : 'default'
@@ -6357,7 +6468,9 @@ export class Gateway {
 
     // Mark idempotency key eagerly so concurrent/reconnect replays are dropped during processing.
     // If processing fails the key is deleted, allowing the client to retry.
-    if (frame.idempotencyKey) this._markIdempotencyKey(frame.idempotencyKey)
+    if (frame.idempotencyKey && !idempotencyPreReserved) {
+      this._markIdempotencyKey(frame.idempotencyKey)
+    }
 
     // Explicit agentId override (web UI per-session selection)
     let sessionKey: string
@@ -6580,16 +6693,16 @@ export class Gateway {
     ;(out as any)._userId = activeUserId
     // Most adapters (Telegram / Feishu / legacy WeChat) can't take 30 small
     // messages per second, so they keep the historical "aggregate and send on
-    // final" behavior.  The v3 WeChat broker is special: users expect process
-    // bubbles (thinking/tool announcements) while the agent is still running.
-    // Text still waits for final so Markdown is rendered by the v1.0.254 smart
-    // chunker instead of being split into token-sized WeChat messages.
+    // final" behavior.  The v3 WeChat broker is now deliberately different:
+    // the WeChat/iLink reply surface is treated as non-streaming because it
+    // empirically stalls around the 10th reply under one context_token.  For a
+    // WeChat-originated turn we stream full process to the linked Web session
+    // (normal webchat channel/ring) and send only the final/error text back
+    // through the v3-wechat-outbound adapter.
     const aggregatedBlocks: typeof out.blocks = []
     const liveWechatAdapter = adapter?.id === V3_WECHAT_OUTBOUND_ADAPTER_ID
     let liveWechatSendQueue: Promise<void> = Promise.resolve()
     let liveWechatSeq = 0
-    let liveWechatThinkingBuffer = ''
-    const liveToolBlockIdsSent = new Set<string>()
     const liveOutboundBase =
       turnTraceId.replace(/[^A-Za-z0-9._:-]/g, '').slice(0, 80) ||
       `wechat${Date.now().toString(36)}`
@@ -6636,18 +6749,6 @@ export class Gateway {
         }
       })
       return true
-    }
-
-    const flushLiveWechatThinking = (): boolean => {
-      if (!liveWechatAdapter || liveWechatThinkingBuffer.length === 0) return false
-      const text = liveWechatThinkingBuffer.trim()
-      liveWechatThinkingBuffer = ''
-      if (text.length === 0) return false
-      return enqueueLiveWechatMessage(
-        [{ kind: 'thinking' as const, text } as any],
-        false,
-        'thinking',
-      )
     }
 
     // ── Multimodal handling ──
@@ -7035,44 +7136,21 @@ export class Gateway {
               detail: _b0.text,
               isFinal: false,
             }
-            this.deliver(errFrame, adapter)
+            this.deliver(errFrame, liveWechatAdapter ? undefined : adapter)
             return
           }
         }
 
         if (liveWechatAdapter) {
-          const parentToolUseId = typeof b.parentToolUseId === 'string' ? b.parentToolUseId : ''
-          if (parentToolUseId.length > 0) {
-            return
-          }
-          if (b.kind === 'thinking') {
-            liveWechatThinkingBuffer += typeof b.text === 'string' ? b.text : ''
-            if (liveWechatThinkingBuffer.length >= WECHAT_LIVE_THINKING_FLUSH_CHARS) {
-              flushLiveWechatThinking()
-            }
-            return
-          }
-          if (b.kind === 'tool_use') {
-            flushLiveWechatThinking()
-            const blockId = typeof b.blockId === 'string' ? b.blockId : ''
-            if (blockId.length > 0) {
-              if (liveToolBlockIdsSent.has(blockId)) return
-              liveToolBlockIdsSent.add(blockId)
-            }
-            enqueueLiveWechatMessage([e.block], false, 'tool')
-            return
-          }
-          if (b.kind === 'tool_result') {
-            return
-          }
+          // WeChat itself only gets final/error text.  The linked Web session
+          // receives the full detailed stream (thinking/tool/tool_result/text)
+          // through the normal webchat path and outbound ring, so multi-hour
+          // tasks remain observable without exercising iLink as an event log.
           if (b.kind === 'text') {
-            flushLiveWechatThinking()
             addAggregatedBlock(e.block)
-            return
           }
-          // Unknown future top-level block: preserve the historical adapter
-          // behavior by keeping it for the final render rather than dropping it.
-          addAggregatedBlock(e.block)
+          out.blocks.push(e.block)
+          this.deliver({ ...out, blocks: [e.block], isFinal: false }, undefined)
         } else if (adapter) {
           addAggregatedBlock(e.block)
         } else {
@@ -7094,9 +7172,17 @@ export class Gateway {
           this._runLog.complete(_run, { status: 'failed', error: _apiErrorText })
           if (frame.idempotencyKey) this._seenIdempotencyKeys.delete(frame.idempotencyKey)
           if (liveWechatAdapter) {
-            flushLiveWechatThinking()
+            const errBlocks = [{ kind: 'text', text: `[error] ${_apiErrorText}` } as any]
+            this.deliver(
+              {
+                ...out,
+                blocks: errBlocks,
+                isFinal: true,
+              },
+              undefined,
+            )
             enqueueLiveWechatMessage(
-              [{ kind: 'text', text: `[error] ${_apiErrorText}` } as any],
+              errBlocks,
               true,
               'error',
             )
@@ -7124,13 +7210,16 @@ export class Gateway {
           turn: e.meta?.turn,
         })
         if (liveWechatAdapter) {
-          flushLiveWechatThinking()
-          // Process blocks were already sent live.  Final must contain only the
-          // remaining assistant text/non-live blocks, otherwise WeChat replays
-          // the whole process after the answer.
-          if (aggregatedBlocks.length > 0) {
-            enqueueLiveWechatMessage(aggregatedBlocks.slice(), true, 'final', e.meta)
-          }
+          // Web gets the normal stream above, then an empty final terminator.
+          // WeChat gets exactly one final text message.  If the agent completed
+          // with no assistant text (tools-only/interrupted edge), still send a
+          // terminal marker so the user is not left with only the start link.
+          this.deliver({ ...out, blocks: [], isFinal: true, meta: e.meta }, undefined)
+          const wechatFinalBlocks =
+            aggregatedBlocks.length > 0
+              ? aggregatedBlocks.slice()
+              : ([{ kind: 'text', text: WECHAT_FINAL_EMPTY_TEXT } as any] as typeof out.blocks)
+          enqueueLiveWechatMessage(wechatFinalBlocks, true, 'final', e.meta)
         } else if (adapter) {
           // adapter.send() 是 async,内部可能在 await 之后才读 wire.blocks。
           // 如果直接传 aggregatedBlocks,接着同步清空数组,adapter 读到的就是空。
@@ -7170,7 +7259,7 @@ export class Gateway {
         }
         // Permission requests only make sense for interactive clients (WebChat)
         // Non-interactive adapters auto-deny.
-        if (adapter) {
+        if (adapter && !liveWechatAdapter) {
           session.runner.sendPermissionResponse(e.request.requestId, {
             behavior: 'deny',
             message: 'Permission prompts not supported on this channel',
@@ -7282,12 +7371,20 @@ export class Gateway {
             detail: e.error,
             isFinal: false,
           }
-          this.deliver(errFrame, adapter)
+          this.deliver(errFrame, liveWechatAdapter ? undefined : adapter)
         }
         if (liveWechatAdapter) {
-          flushLiveWechatThinking()
+          const errBlocks = [{ kind: 'text', text: `[error] ${e.error}` } as any]
+          this.deliver(
+            {
+              ...out,
+              blocks: errBlocks,
+              isFinal: true,
+            },
+            undefined,
+          )
           enqueueLiveWechatMessage(
-            [{ kind: 'text', text: `[error] ${e.error}` } as any],
+            errBlocks,
             true,
             'error',
           )

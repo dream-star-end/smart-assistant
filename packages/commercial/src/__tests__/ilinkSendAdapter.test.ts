@@ -303,6 +303,18 @@ describe("makeIlinkSendAdapter", () => {
     assert.equal(r.permanent, false)
   })
 
+  it("hung text send times out as transient failure", async () => {
+    const adapter = makeIlinkSendAdapter({
+      sendTimeoutMs: 5,
+      sendIlinkText: async () => new Promise(() => {}),
+    })
+    const r = await adapter({ botToken: "x", toUserId: "y", contextToken: "z", text: "t" })
+    assert.equal(r.ok, false)
+    if (r.ok) return
+    assert.equal(r.permanent, false)
+    assert.match(r.errMessage ?? "", /timeout/)
+  })
+
   it("never throws upward (outboxWorker.drainOne contract)", async () => {
     const adapter = makeIlinkSendAdapter({
       sendIlinkText: async () => {

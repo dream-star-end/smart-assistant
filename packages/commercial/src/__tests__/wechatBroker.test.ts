@@ -58,6 +58,7 @@ function makeEvent(overrides: Partial<InboundEvent> = {}): InboundEvent {
 
 interface DispatcherSpy {
   calls: InboundEvent[]
+  stopCalls: InboundEvent[]
 }
 
 function makeDispatcher(
@@ -66,7 +67,7 @@ function makeDispatcher(
     | ((evt: InboundEvent) => DispatchOutcome | Promise<DispatchOutcome>)
     | { throw: Error },
 ): { dispatcher: InboundDispatcher; spy: DispatcherSpy } {
-  const spy: DispatcherSpy = { calls: [] }
+  const spy: DispatcherSpy = { calls: [], stopCalls: [] }
   const dispatcher: InboundDispatcher = {
     async dispatch(evt: InboundEvent): Promise<DispatchOutcome> {
       spy.calls.push(evt)
@@ -77,6 +78,10 @@ function makeDispatcher(
         return await responder(evt)
       }
       return responder
+    },
+    async stop(evt: InboundEvent) {
+      spy.stopCalls.push(evt)
+      return { kind: "command_echo", interrupted: true, reply: "已发送中断指令。" }
     },
   }
   return { dispatcher, spy }
@@ -660,7 +665,7 @@ describe("wechatBroker — onInbound", () => {
     )
   })
 
-  test("dispatcher → dispatched outcome 透传,并立即发送 processing 反射", async () => {
+  test("dispatcher → dispatched outcome 透传,并发送实时过程链接反射", async () => {
     const { sendText, spy: sendSpy } = makeSendText({ ok: true })
     const { dispatcher } = makeDispatcher({
       kind: "dispatched",
@@ -672,7 +677,26 @@ describe("wechatBroker — onInbound", () => {
     assert.equal(r.kind, "dispatched")
     await flushMicrotasks()
     assert.equal(sendSpy.calls.length, 1)
-    assert.equal(sendSpy.calls[0]!.text, "已收到，正在思考…")
+    assert.match(sendSpy.calls[0]!.text, /实时过程：https:\/\/claudeai\.chat\/\?session=wsess-/)
+    assert.match(sendSpy.calls[0]!.text, /\/stop/)
+  })
+
+  test("broker-local /stop delegates to dispatcher.stop and reflects result", async () => {
+    const { sendText, spy: sendSpy } = makeSendText({ ok: true })
+    const { dispatcher, spy: dispSpy } = makeDispatcher({
+      kind: "dispatched",
+      sessionId: SESSION_A,
+      newSession: false,
+    })
+    const broker = makeWechatBroker(makeDeps({ dispatcher, sendText }))
+    const r = await broker.onInbound(makeEvent({ text: "/stop" }))
+    assert.equal(r.kind, "command_echo")
+    if (r.kind === "command_echo") assert.match(r.reply, /已发送中断/)
+    assert.equal(dispSpy.calls.length, 0)
+    assert.equal(dispSpy.stopCalls.length, 1)
+    await flushMicrotasks()
+    assert.equal(sendSpy.calls.length, 1)
+    assert.match(sendSpy.calls[0]!.text, /已发送中断/)
   })
 
   test("audit insert sees duplicate (account_id,message_id) → duplicate_audit and dispatcher is skipped", async () => {
@@ -800,7 +824,8 @@ describe("wechatBroker — onInbound", () => {
     await flushMicrotasks()
     assert.equal(sendSpy.calls.length, 1)
     assert.match(sendSpy.calls[0]!.text, /微信里可以这样用 OpenClaude/)
-    assert.match(sendSpy.calls[0]!.text, /\/过程/)
+    assert.match(sendSpy.calls[0]!.text, /\/stop/)
+    assert.match(sendSpy.calls[0]!.text, /实时过程/)
     assert.doesNotMatch(sendSpy.calls[0]!.text, /\/总结/)
     assert.doesNotMatch(sendSpy.calls[0]!.text, /\/status/)
   })
@@ -1122,8 +1147,9 @@ describe("wechatBroker — onInbound", () => {
     assert.equal(dispSpy.calls.length, 1)
     assert.match(dispSpy.calls[0]!.text, /understand_image|wechat-a\\.jpg|识别图片/)
     await flushMicrotasks()
-    assert.equal(sendSpy.calls.length, 1)
+    assert.equal(sendSpy.calls.length, 2)
     assert.equal(sendSpy.calls[0]!.text, "收到图片，正在识别…")
+    assert.match(sendSpy.calls[1]!.text, /实时过程/)
   })
 
   test("image prepare failure returns retryable friendly message and skips dispatcher", async () => {
@@ -1241,9 +1267,8 @@ describe("wechatBroker — onInbound", () => {
     const r = await broker.onInbound(makeEvent())
     assert.equal(r.kind, "cold_start")
     await flushMicrotasks()
-    assert.equal(sendSpy.calls.length, 2)
-    assert.equal(sendSpy.calls[0]!.text, "已收到，正在思考…")
-    assert.equal(sendSpy.calls[1]!.text, "正在唤醒,稍等几秒...")
+    assert.equal(sendSpy.calls.length, 1)
+    assert.equal(sendSpy.calls[0]!.text, "正在唤醒,稍等几秒...")
   })
 
   test("反射:getBinding 返 null → log + drop,sendText 不被调", async () => {

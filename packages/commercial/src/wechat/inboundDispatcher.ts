@@ -60,6 +60,9 @@ import { MASTER_USER_PREFIX } from "./userIds.js"
 /** 容器侧 inbound handler 路径(master POST → 容器 18789 内 gateway 接)。 */
 export const WECHAT_INBOUND_CONTAINER_PATH = "/internal/v3/wechat-inbound"
 
+/** 容器侧 WeChat stop handler 路径(master POST → 容器内 interrupt)。 */
+export const WECHAT_STOP_CONTAINER_PATH = "/internal/v3/wechat-stop"
+
 /**
  * 容器侧 inbound 补偿(回滚)路径;handler 必须 idempotent + always-200。
  *
@@ -182,6 +185,8 @@ export type DispatchOutcome =
     }
   | { kind: "tunnel_unsupported"; errMessage: string }
 
+export type StopOutcome = { kind: "command_echo"; reply: string; interrupted: boolean }
+
 /**
  * 容器 endpoint transport 抽象。
  *
@@ -298,6 +303,7 @@ export interface InboundDispatcherDeps {
 
 export interface InboundDispatcher {
   dispatch(evt: InboundEvent): Promise<DispatchOutcome>
+  stop(evt: InboundEvent): Promise<StopOutcome>
 }
 
 // ─── 实现 ──────────────────────────────────────────────────────────────────
@@ -642,6 +648,133 @@ export function makeInboundDispatcher(deps: InboundDispatcherDeps): InboundDispa
       reqLog.info("dispatched", { sessionId, newSession })
       return { kind: "dispatched", sessionId, newSession }
     },
+
+    async stop(evt: InboundEvent): Promise<StopOutcome> {
+      const requestId = newRequestId()
+      const agentId = evt.agentId ?? "main"
+      const reqLog = log.child({
+        requestId,
+        bindingUserId: evt.bindingUserId,
+        idempotencyKey: evt.idempotencyKey,
+        traceId: evt.traceId,
+      })
+
+      let sessionId: WechatSessionId | null
+      try {
+        sessionId = await getCurrentSessionId(deps.pgPool, evt.bindingUserId)
+      } catch (err) {
+        reqLog.error("stop_pointer_read_failed", {
+          errMessage: (err as Error)?.message ?? String(err),
+        })
+        return {
+          kind: "command_echo",
+          interrupted: false,
+          reply: "暂时无法读取当前微信任务，请稍后重试；也可以打开实时过程链接在网页端停止。",
+        }
+      }
+      if (!sessionId) {
+        return {
+          kind: "command_echo",
+          interrupted: false,
+          reply: "当前没有可中断的微信任务。",
+        }
+      }
+
+      let endpoint
+      try {
+        endpoint = await deps.resolveContainerEndpoint(BigInt(evt.bindingUserId))
+      } catch (err) {
+        if (isContainerUnreadyError(err)) {
+          return {
+            kind: "command_echo",
+            interrupted: false,
+            reply: "容器正在唤醒中，暂时没有可中断的运行任务。",
+          }
+        }
+        reqLog.error("stop_resolve_endpoint_failed", {
+          errMessage: (err as Error)?.message ?? String(err),
+        })
+        return {
+          kind: "command_echo",
+          interrupted: false,
+          reply: "中断指令暂时发送失败，请稍后重试；也可以打开实时过程链接在网页端停止。",
+        }
+      }
+      if (endpoint.containerId === undefined) {
+        reqLog.error("stop_container_id_missing_from_resolver", {})
+        return {
+          kind: "command_echo",
+          interrupted: false,
+          reply: "中断指令暂时发送失败：容器状态异常。",
+        }
+      }
+      if (endpoint.tunnel !== undefined && !deps.transport.supportsTunnel) {
+        reqLog.warn("stop_tunnel_unsupported", { containerId: endpoint.containerId })
+        return {
+          kind: "command_echo",
+          interrupted: false,
+          reply: "当前容器连接方式暂不支持微信内中断，请打开实时过程链接在网页端停止。",
+        }
+      }
+
+      const nonce = computeInboundNonce(deps.bridgeSecret, endpoint.containerId)
+      const bodyJson = JSON.stringify({
+        userId: MASTER_USER_PREFIX + evt.bindingUserId,
+        peer: { kind: "dm" as const, id: sessionId },
+        agentId,
+      })
+      const headers: Record<string, string> = {
+        "content-type": "application/json",
+        "x-openclaude-container-id": String(endpoint.containerId),
+        "x-openclaude-inbound-nonce": nonce,
+        "x-request-id": requestId,
+      }
+
+      const stopRes = await postWithRetry(
+        deps.transport,
+        WECHAT_STOP_CONTAINER_PATH,
+        endpoint,
+        headers,
+        bodyJson,
+        step1TimeoutMs,
+        step1RetryBackoffMs,
+        reqLog,
+      )
+      if (stopRes.kind === "transport_error") {
+        reqLog.warn("stop_transport_failed_final", { errMessage: stopRes.errMessage })
+        return {
+          kind: "command_echo",
+          interrupted: false,
+          reply: "中断指令暂时发送失败，请稍后重试；也可以打开实时过程链接在网页端停止。",
+        }
+      }
+      if (stopRes.response.status < 200 || stopRes.response.status >= 300) {
+        reqLog.warn("stop_container_rejected", {
+          status: stopRes.response.status,
+          bodyText: stopRes.response.bodyText.slice(0, 256),
+        })
+        return {
+          kind: "command_echo",
+          interrupted: false,
+          reply: "中断指令被容器拒绝，请稍后重试；也可以打开实时过程链接在网页端停止。",
+        }
+      }
+
+      let interrupted = false
+      try {
+        const parsed = JSON.parse(stopRes.response.bodyText) as { interrupted?: unknown }
+        interrupted = parsed.interrupted === true
+      } catch {
+        interrupted = false
+      }
+      return {
+        kind: "command_echo",
+        interrupted,
+        reply: interrupted
+          ? "已发送中断指令。正在运行的任务会尽快停止；如需查看状态，请打开实时过程链接。"
+          : "当前没有正在运行的任务，可能已经结束；如页面仍显示运行中，可在实时过程链接里再点停止。",
+      }
+    },
   }
 }
 
@@ -680,13 +813,35 @@ async function postStep1WithRetry(
   retryBackoffMs: number,
   log: Logger,
 ): Promise<{ kind: "transport_error"; errMessage: string } | { kind: "ok"; response: { status: number; bodyText: string; headers?: Record<string, string> } }> {
+  return postWithRetry(
+    transport,
+    WECHAT_INBOUND_CONTAINER_PATH,
+    endpoint,
+    headers,
+    bodyJson,
+    timeoutMs,
+    retryBackoffMs,
+    log,
+  )
+}
+
+async function postWithRetry(
+  transport: ContainerTransport,
+  path: string,
+  endpoint: { host: string; port: number; tunnel?: unknown },
+  headers: Record<string, string>,
+  bodyJson: string,
+  timeoutMs: number,
+  retryBackoffMs: number,
+  log: Logger,
+): Promise<{ kind: "transport_error"; errMessage: string } | { kind: "ok"; response: { status: number; bodyText: string; headers?: Record<string, string> } }> {
   // 仅 transport 层错(connect refused / timeout / DNS / TLS)走 1 次退避重试;
   // HTTP 应答(任意 status code)即视为"网络已通",由上层按 status code 分流。
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
       const response = await transport.post(
         endpoint,
-        WECHAT_INBOUND_CONTAINER_PATH,
+        path,
         headers,
         bodyJson,
         timeoutMs,

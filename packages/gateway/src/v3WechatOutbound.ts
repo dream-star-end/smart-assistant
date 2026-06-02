@@ -372,7 +372,9 @@ export interface V3WechatOutboundDeps {
  *   - 进程退出后未发完的 entry 留盘,下次 boot drain 接着送
  *
  * Adapter id = "v3-wechat-outbound" — 与 manager.ts 的 "wechat" id 区分;两个 adapter
- * 可以并存(gateway 不会同时把同一 OutboundMessage 派给两个,channel 字段决定路由)。
+ * 可以并存。v3 broker may run the underlying turn as channel "webchat" so the
+ * realtime process link can attach to normal WebSocket/ring machinery; this
+ * adapter is still the explicit opt-in that mirrors selected frames to WeChat.
  */
 export function makeV3WechatOutboundAdapter(deps: V3WechatOutboundDeps): ChannelAdapter {
   const cfg = deps.config
@@ -404,7 +406,7 @@ export function makeV3WechatOutboundAdapter(deps: V3WechatOutboundDeps): Channel
     async send(out: OutboundMessage) {
       const maybeBilling = out as unknown
       if (isCodexBillingFrame(maybeBilling)) {
-        if (maybeBilling.channel !== "wechat") return
+        if (maybeBilling.channel !== "wechat" && maybeBilling.channel !== "webchat") return
         const payload = buildCodexBillingPayload(maybeBilling)
         if ("error" in payload) {
           log.warn("dropped: build codex billing payload failed", { reason: payload.error })
@@ -445,7 +447,7 @@ export function makeV3WechatOutboundAdapter(deps: V3WechatOutboundDeps): Channel
         return
       }
 
-      if (out.channel !== "wechat") return
+      if (out.channel !== "wechat" && out.channel !== "webchat") return
       const payload = buildWirePayload(out, cfg, now())
       if ("error" in payload) {
         // 拍 payload 失败 → 该消息进 retry 也注定 400 fatal,log + drop

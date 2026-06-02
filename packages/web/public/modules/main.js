@@ -405,6 +405,17 @@ function _isEmptyBootPlaceholder(sess) {
     _isEmptyPristineSession(sess)
 }
 
+function _requestedSessionIdFromUrl() {
+  try {
+    const sp = new URLSearchParams(window.location.search)
+    const raw = (sp.get('session') || sp.get('sid') || '').trim()
+    if (/^[A-Za-z0-9_-]{1,128}$/.test(raw)) return raw
+  } catch {}
+  return null
+}
+
+const _bootRequestedSessionId = _requestedSessionIdFromUrl()
+
 function _isEmptyPristineSession(sess) {
   return !!sess &&
     (!Array.isArray(sess.messages) || sess.messages.length === 0) &&
@@ -424,6 +435,13 @@ function _selectSessionAfterServerSync() {
     !state.currentSessionId ||
     !state.sessions.has(state.currentSessionId)
   let currentChanged = false
+  if (_bootRequestedSessionId && state.sessions.has(_bootRequestedSessionId)) {
+    if (state.currentSessionId !== _bootRequestedSessionId) {
+      state.currentSessionId = _bootRequestedSessionId
+      currentChanged = true
+    }
+    return { currentChanged, updated }
+  }
   if (shouldSelect) {
     // Prefer a real conversation over pre-existing empty "新会话" rows that
     // older builds may have synced before this fix.
@@ -3241,7 +3259,9 @@ async function init() {
       sp.has('login') ||
       sp.has('register') ||
       sp.has('signin') ||
-      sp.has('signup')
+      sp.has('signup') ||
+      sp.has('session') ||
+      sp.has('sid')
     if (goStraightToAuth) {
       showLogin()
       if (sp.has('register') || sp.has('signup')) {

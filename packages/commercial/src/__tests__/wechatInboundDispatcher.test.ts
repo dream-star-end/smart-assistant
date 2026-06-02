@@ -30,6 +30,7 @@ import {
   makeInboundDispatcher,
   WECHAT_INBOUND_COMPENSATE_PATH,
   WECHAT_INBOUND_CONTAINER_PATH,
+  WECHAT_STOP_CONTAINER_PATH,
   type ContainerTransport,
   type DispatchOutcome,
   type InboundDispatcherDeps,
@@ -268,6 +269,47 @@ describe("inboundDispatcher — command echo", () => {
     )
     const r = await d.dispatch(makeEvent({ text: "  /list" }))
     assert.notEqual(r.kind, "command_echo")
+  })
+})
+
+describe("inboundDispatcher — stop command bridge", () => {
+  test("stop with no current session returns local no-op reply and does not POST", async () => {
+    const { transport, spy: tSpy } = makeTransport([
+      { throw: new Error("transport should not be called") },
+    ])
+    const d = makeInboundDispatcher(
+      makeDeps({
+        pgPool: makeFakePg({ pointer: null }).pg,
+        transport,
+      }),
+    )
+    const r = await d.stop(makeEvent({ text: "/stop" }))
+    assert.equal(r.kind, "command_echo")
+    assert.equal(r.interrupted, false)
+    assert.match(r.reply, /没有可中断/)
+    assert.equal(tSpy.posts.length, 0)
+  })
+
+  test("stop posts current wsess to container stop endpoint", async () => {
+    const pg = makeFakePg({ pointer: FIXED_SESSION_ID })
+    const { transport, spy: tSpy } = makeTransport([
+      { status: 200, bodyText: '{"ok":true,"interrupted":true}' },
+    ])
+    const d = makeInboundDispatcher(
+      makeDeps({
+        pgPool: pg.pg,
+        transport,
+      }),
+    )
+    const r = await d.stop(makeEvent({ text: "/stop" }))
+    assert.equal(r.interrupted, true)
+    assert.match(r.reply, /已发送中断/)
+    assert.equal(tSpy.posts.length, 1)
+    assert.equal(tSpy.posts[0]!.path, WECHAT_STOP_CONTAINER_PATH)
+    assert.equal(tSpy.posts[0]!.bodyParsed.userId, "c:42")
+    assert.deepEqual(tSpy.posts[0]!.bodyParsed.peer, { kind: "dm", id: FIXED_SESSION_ID })
+    assert.equal(tSpy.posts[0]!.bodyParsed.agentId, "main")
+    assert.equal(tSpy.posts[0]!.headers["x-openclaude-inbound-nonce"], expectedNonce())
   })
 })
 

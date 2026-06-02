@@ -71,8 +71,6 @@ const DEFAULT_RECONCILE_INTERVAL_MS = 30_000
 /** Housekeeping 周期默认值。RFC §4.6 + outboxWorker.runHousekeeping。 */
 const DEFAULT_HOUSEKEEPING_INTERVAL_MS = 5 * 60 * 1000
 
-/** 普通微信消息进入调度后立即给用户一个可见反馈,避免长时间无感知。 */
-const PROCESSING_REFLECTION_TEXT = "已收到，正在思考…"
 /** 图片消息需要先在 master 下载/解密/落盘,给用户单独的即时反馈。 */
 const IMAGE_PROCESSING_REFLECTION_TEXT = "收到图片，正在识别…"
 const IMAGE_PREPARE_FAILED_REPLY = "图片下载/识别准备失败，请重新发送图片，或在网页端上传后继续。"
@@ -89,6 +87,8 @@ const MEDIA_PREPARE_FAILED_REPLY = "附件下载/处理准备失败，请重新�
  * `BigInt()` 抛出 — broker 层 log 直接看到原值,可观测性更好(Codex r-pass 建议)。
  */
 const COMMERCIAL_BINDING_USER_ID_RE = /^(c:)?[1-9][0-9]{0,18}$/
+
+const DEFAULT_PUBLIC_BASE_URL = "https://claudeai.chat"
 
 /**
  * 把 commercial canonical user id 归一为 dispatcher 契约要求的 raw digit。
@@ -114,6 +114,33 @@ function normalizeDispatcherBindingUserId(input: string): string {
     )
   }
   return input.startsWith("c:") ? input.slice(2) : input
+}
+
+export function buildWechatRealtimeSessionLink(
+  sessionId: WechatSessionId,
+  env: NodeJS.ProcessEnv = process.env,
+): string {
+  const base =
+    env.OPENCLAUDE_PUBLIC_BASE_URL?.trim() ||
+    env.OPENCLAUDE_WEB_BASE_URL?.trim() ||
+    DEFAULT_PUBLIC_BASE_URL
+  let url: URL
+  try {
+    url = new URL(base)
+  } catch {
+    url = new URL(DEFAULT_PUBLIC_BASE_URL)
+  }
+  url.searchParams.set("session", sessionId)
+  return url.toString()
+}
+
+export function buildWechatRealtimeStartReply(sessionId: WechatSessionId): string {
+  return [
+    "已开始执行。",
+    `实时过程：${buildWechatRealtimeSessionLink(sessionId)}`,
+    "中断任务：直接回复 /stop 或“停止”。",
+    "完成后我会把最终结果发到微信。",
+  ].join("\n")
 }
 
 // ─── 公开类型 ──────────────────────────────────────────────────────────────
@@ -454,8 +481,6 @@ export function makeWechatBroker(deps: BrokerDeps): WechatBroker {
         fireAndForgetReflection(evt, outcome.reply, "command_echo")
         return outcome
       }
-    } else if (shouldSendProcessingReflection(dispatchEvt)) {
-      fireAndForgetReflection(evt, PROCESSING_REFLECTION_TEXT, "processing")
     }
 
     let outcome: DispatchOutcome
@@ -483,6 +508,8 @@ export function makeWechatBroker(deps: BrokerDeps): WechatBroker {
       fireAndForgetReflection(evt, outcome.reply, "command_echo")
     } else if (outcome.kind === "cold_start") {
       fireAndForgetReflection(evt, outcome.coldStartReply, "cold_start")
+    } else if (outcome.kind === "dispatched") {
+      fireAndForgetReflection(evt, buildWechatRealtimeStartReply(outcome.sessionId), "processing")
     }
     return outcome
   }
@@ -495,6 +522,23 @@ export function makeWechatBroker(deps: BrokerDeps): WechatBroker {
     if (mediaReply) return { kind: "command_echo", reply: mediaReply }
 
     const text = evt.text.trim()
+    if (isWechatStopCommand(text)) {
+      try {
+        return await deps.dispatcher.stop(evt)
+      } catch (err) {
+        log.error("wechat_stop_command_failed", {
+          bindingUserId: evt.bindingUserId,
+          dispatchBindingUserId,
+          idempotencyKey: evt.idempotencyKey,
+          errMessage: (err as Error)?.message ?? String(err),
+        })
+        return {
+          kind: "command_echo",
+          reply: "中断指令暂时发送失败，请稍后重试；也可以打开实时过程链接在网页端停止。",
+        }
+      }
+    }
+
     if (/^\/new$/i.test(text)) {
       return handleNewCommand(evt, dispatchBindingUserId)
     }
@@ -540,6 +584,10 @@ export function makeWechatBroker(deps: BrokerDeps): WechatBroker {
     }
 
     return null
+  }
+
+  function isWechatStopCommand(text: string): boolean {
+    return /^(?:\/(?:stop|cancel|abort|停止|中断|取消)|停止|中断|取消|终止)$/i.test(text)
   }
 
   async function handleNewCommand(
@@ -665,10 +713,11 @@ export function makeWechatBroker(deps: BrokerDeps): WechatBroker {
     return [
       "微信里可以这样用 OpenClaude:",
       "• 直接发消息:继续当前会话",
+      "• /stop 或“停止”:中断正在执行的任务",
       "• /new:开启新会话",
       "• /model:查看可用模型",
       "• /model 2 或 /model <模型ID>:切换默认模型",
-      "• /过程:设置是否显示工具调用/思考过程",
+      "• 实时过程会通过每轮开始时的链接在网页端查看",
     ].join("\n")
   }
 
@@ -874,10 +923,6 @@ export function makeWechatBroker(deps: BrokerDeps): WechatBroker {
         errMessage: result.errMessage ?? "unknown",
       })
     }
-  }
-
-  function shouldSendProcessingReflection(evt: InboundEvent): boolean {
-    return evt.text.length > 0 && !evt.text.startsWith("/")
   }
 
   // ─── reconcile tick:单次 snapshot 内 diff + softDelete ─────────────────────
