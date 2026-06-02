@@ -530,7 +530,15 @@ export class Gateway {
   private _shutdownPromise: Promise<void> | null = null
 
   // ── Idempotency key dedup (prevents duplicate processing on client reconnect replay) ──
-  private _seenIdempotencyKeys = new Map<string, number>() // key → timestamp
+  private _seenIdempotencyKeys = new Map<string, {
+    ts: number
+    wechat?: {
+      sessionKey: string
+      peerId: string
+      started: boolean
+      traceId?: string
+    }
+  }>() // key → timestamp + optional WeChat retry metadata
   private static readonly IDEMPOTENCY_MAX_KEYS = 1000
   private static readonly IDEMPOTENCY_TTL_MS = 5 * 60_000 // 5 minutes
 
@@ -539,25 +547,60 @@ export class Gateway {
    * Returns true if the key is a duplicate (i.e. should be skipped).
    */
   private _isIdempotencyDuplicate(key: string): boolean {
-    if (!key) return false
+    return this._getIdempotencyEntry(key) !== null
+  }
+
+  private _getIdempotencyEntry(key: string): {
+    ts: number
+    wechat?: {
+      sessionKey: string
+      peerId: string
+      started: boolean
+      traceId?: string
+    }
+  } | null {
+    if (!key) return null
     const now = Date.now()
 
     // Evict expired entries periodically
     if (this._seenIdempotencyKeys.size > 100) {
-      for (const [k, ts] of this._seenIdempotencyKeys) {
-        if (now - ts > Gateway.IDEMPOTENCY_TTL_MS) {
+      for (const [k, entry] of this._seenIdempotencyKeys) {
+        if (now - entry.ts > Gateway.IDEMPOTENCY_TTL_MS) {
           this._seenIdempotencyKeys.delete(k)
         }
       }
     }
 
-    const ts = this._seenIdempotencyKeys.get(key)
-    return ts !== undefined && now - ts < Gateway.IDEMPOTENCY_TTL_MS
+    const entry = this._seenIdempotencyKeys.get(key)
+    if (!entry) return null
+    if (now - entry.ts >= Gateway.IDEMPOTENCY_TTL_MS) {
+      this._seenIdempotencyKeys.delete(key)
+      return null
+    }
+    return entry
   }
 
   /** Record an idempotency key as processed. */
-  private _markIdempotencyKey(key: string): void {
-    if (key) this._seenIdempotencyKeys.set(key, Date.now())
+  private _markIdempotencyKey(
+    key: string,
+    wechat?: {
+      sessionKey: string
+      peerId: string
+      started: boolean
+      traceId?: string
+    },
+  ): void {
+    if (key) this._seenIdempotencyKeys.set(key, { ts: Date.now(), ...(wechat ? { wechat } : {}) })
+  }
+
+  private _updateWechatIdempotency(
+    key: string,
+    patch: Partial<{ started: boolean; traceId: string }>,
+  ): void {
+    const entry = this._getIdempotencyEntry(key)
+    if (!entry?.wechat) return
+    entry.ts = Date.now()
+    entry.wechat = { ...entry.wechat, ...patch }
   }
 
   // ── Cached task list for high-frequency eventBus lookups ──
@@ -2767,11 +2810,28 @@ export class Gateway {
     // Idempotency is normally marked inside dispatchInbound. Because this path
     // ACKs before dispatch finishes, reserve the key synchronously here and
     // tell dispatchInbound not to treat that reservation as a duplicate.
-    if (this._isIdempotencyDuplicate(idempotencyKey)) {
-      this.sendJson(res, 200, { ok: true, deduplicated: true, started: false, sessionKey })
+    const duplicateEntry = this._getIdempotencyEntry(idempotencyKey)
+    if (duplicateEntry) {
+      const originalWechat = duplicateEntry.wechat
+      if (!originalWechat) {
+        this.sendJson(res, 409, { error: 'duplicate idempotencyKey owned by non-WeChat turn' })
+        return
+      }
+      this.sendJson(res, 200, {
+        ok: true,
+        deduplicated: true,
+        started: originalWechat.started,
+        sessionKey: originalWechat.sessionKey,
+        sessionId: originalWechat.peerId,
+        ...(originalWechat.traceId ? { traceId: originalWechat.traceId } : {}),
+      })
       return
     }
-    this._markIdempotencyKey(idempotencyKey)
+    this._markIdempotencyKey(idempotencyKey, {
+      sessionKey,
+      peerId,
+      started: false,
+    })
     ;(frame as any)._idempotencyPreReserved = true
 
     type WechatStartOutcome = { started: boolean; traceId?: string }
@@ -2788,6 +2848,10 @@ export class Gateway {
       resolveStart(value)
     }
     ;(frame as any)._wechatDispatchStarted = (info?: { traceId?: string }) => {
+      this._updateWechatIdempotency(idempotencyKey, {
+        started: true,
+        ...(info?.traceId ? { traceId: info.traceId } : {}),
+      })
       settleStart({ started: true, ...(info?.traceId ? { traceId: info.traceId } : {}) })
     }
     const logAsyncDispatchFailure = (err: unknown) => {

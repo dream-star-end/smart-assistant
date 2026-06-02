@@ -58,7 +58,7 @@ import {
   setCurrentSessionId,
   type PgConn,
 } from "./sessionPointer.js"
-import { type WechatSessionId } from "./types.js"
+import { isWechatSessionId, type WechatSessionId } from "./types.js"
 import { MASTER_USER_PREFIX } from "./userIds.js"
 
 /** 容器侧 inbound handler 路径(master POST → 容器 18789 内 gateway 接)。 */
@@ -399,8 +399,8 @@ export function makeInboundDispatcher(deps: InboundDispatcherDeps): InboundDispa
         }
       }
 
-      const sessionId: WechatSessionId = current ?? newSessionId()
-      const newSession = current === null
+      let sessionId: WechatSessionId = current ?? newSessionId()
+      let newSession = current === null
 
       // **稳定时间戳**:Step 2a 的 createdAt / lastAt 用同一 now() pin 住,避免一次 dispatch
       // 内 createdAt / lastAt 错开 1 ms(测试 `createdAt === lastAt` 断言依赖)。
@@ -552,6 +552,14 @@ export function makeInboundDispatcher(deps: InboundDispatcherDeps): InboundDispa
         }
       }
       const step1Accepted = parseStep1Accepted(step1.response.bodyText, requestId)
+      if (step1Accepted.sessionId && step1Accepted.sessionId !== sessionId) {
+        reqLog.warn("step1_adopted_original_session", {
+          allocatedSessionId: sessionId,
+          acceptedSessionId: step1Accepted.sessionId,
+        })
+        sessionId = step1Accepted.sessionId
+        newSession = current !== sessionId
+      }
 
       // ── 4) Step 2a: master sqlite client_sessions 写(仅 newSession) ──
       if (newSession) {
@@ -1046,15 +1054,34 @@ function parseRetryAfterSec(response: {
 function parseStep1Accepted(
   bodyText: string,
   fallbackRunId: string,
-): { started: boolean; runId: string } {
+): { started: boolean; runId: string; sessionId?: WechatSessionId } {
   try {
-    const parsed = JSON.parse(bodyText) as { started?: unknown; traceId?: unknown }
+    const parsed = JSON.parse(bodyText) as {
+      started?: unknown
+      traceId?: unknown
+      sessionId?: unknown
+      peerId?: unknown
+      sessionKey?: unknown
+    }
     const traceId = typeof parsed.traceId === "string" && parsed.traceId.length > 0
       ? parsed.traceId
       : fallbackRunId
+    const explicitSessionId = typeof parsed.sessionId === "string"
+      ? parsed.sessionId
+      : typeof parsed.peerId === "string"
+        ? parsed.peerId
+        : undefined
+    let sessionId = explicitSessionId && isWechatSessionId(explicitSessionId)
+      ? explicitSessionId
+      : undefined
+    if (!sessionId && typeof parsed.sessionKey === "string") {
+      const match = /:webchat:dm:(wsess-[0-9a-f]{16})$/.exec(parsed.sessionKey)
+      if (match?.[1] && isWechatSessionId(match[1])) sessionId = match[1]
+    }
     return {
       started: parsed.started !== false,
       runId: traceId,
+      ...(sessionId ? { sessionId } : {}),
     }
   } catch {
     return { started: true, runId: fallbackRunId }

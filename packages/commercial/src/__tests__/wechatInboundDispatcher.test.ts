@@ -522,6 +522,47 @@ describe("inboundDispatcher — happy path", () => {
     assert.equal(pg.spy.runningSetCalls[0]!.sessionId, FIXED_SESSION_ID)
   })
 
+  test("deduplicated Step1 response adopts original wsess before master pointer/upsert", async () => {
+    const originalSessionId = FIXED_SESSION_ID
+    const retryAllocatedSessionId = FIXED_SESSION_ID_2
+    const { transport, spy: tSpy } = makeTransport([
+      {
+        status: 200,
+        bodyText: JSON.stringify({
+          ok: true,
+          deduplicated: true,
+          started: true,
+          sessionId: originalSessionId,
+          traceId: "orig-run",
+        }),
+      },
+    ])
+    const storage = makeStorageSpies()
+    const pg = makeFakePg({ pointer: null })
+    const d = makeInboundDispatcher(
+      makeDeps({
+        transport,
+        pgPool: pg.pg,
+        upsertMasterClientSession: storage.upsertMasterClientSession,
+        softDeleteMasterSession: storage.softDeleteMasterSession,
+        newSessionId: () => retryAllocatedSessionId,
+      }),
+    )
+    const r = await d.dispatch(makeEvent())
+    assert.equal(r.kind, "dispatched")
+    if (r.kind === "dispatched") {
+      assert.equal(r.sessionId, originalSessionId)
+      assert.equal(r.newSession, true)
+    }
+    assert.equal(tSpy.posts[0]!.bodyParsed.peer.id, retryAllocatedSessionId)
+    assert.equal(storage.spy.upsertCalls[0]!.sessionId, originalSessionId)
+    assert.equal(pg.spy.setCalls[0]!.sessionId, originalSessionId)
+    assert.deepEqual(pg.spy.runningSetCalls.map((c) => ({
+      sessionId: c.sessionId,
+      runId: c.runId,
+    })), [{ sessionId: originalSessionId, runId: "orig-run" }])
+  })
+
   test("reuse session: pointer=existing → upsert NOT called, pointer touched, dispatched newSession=false", async () => {
     const { transport } = makeTransport([
       { status: 200, bodyText: '{"ok":true}' },

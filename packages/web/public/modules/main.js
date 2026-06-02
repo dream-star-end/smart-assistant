@@ -415,7 +415,7 @@ function _requestedSessionIdFromUrl() {
   return null
 }
 
-const _bootRequestedSessionId = _requestedSessionIdFromUrl()
+let _bootRequestedSessionId = _requestedSessionIdFromUrl()
 
 function _isEmptyPristineSession(sess) {
   return !!sess &&
@@ -437,8 +437,10 @@ function _selectSessionAfterServerSync() {
     !state.sessions.has(state.currentSessionId)
   let currentChanged = false
   if (_bootRequestedSessionId && state.sessions.has(_bootRequestedSessionId)) {
-    if (state.currentSessionId !== _bootRequestedSessionId) {
-      state.currentSessionId = _bootRequestedSessionId
+    const requestedSessionId = _bootRequestedSessionId
+    _bootRequestedSessionId = null
+    if (state.currentSessionId !== requestedSessionId) {
+      state.currentSessionId = requestedSessionId
       currentChanged = true
       try {
         refreshWebchatHelloForCurrentSession()
