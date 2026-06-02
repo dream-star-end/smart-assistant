@@ -369,6 +369,26 @@ describe("inboundDispatcher — stop command bridge", () => {
     assert.equal(tSpy.posts[0]!.bodyParsed.agentId, "codex")
   })
 
+  test("stop omits agentId for running rows without agent_id so the container scans by wsess", async () => {
+    const pg = makeFakePg({
+      pointer: null,
+      runningSessions: [{ sessionId: FIXED_SESSION_ID, runId: "run-without-agent" }],
+    })
+    const { transport, spy: tSpy } = makeTransport([
+      { status: 200, bodyText: '{"ok":true,"interrupted":true}' },
+    ])
+    const d = makeInboundDispatcher(makeDeps({ pgPool: pg.pg, transport }))
+    const r = await d.stop(makeEvent({ text: "/stop", agentId: "main" }))
+    assert.equal(r.interrupted, true)
+    assert.equal(tSpy.posts.length, 1)
+    assert.deepEqual(tSpy.posts[0]!.bodyParsed.peer, { kind: "dm", id: FIXED_SESSION_ID })
+    assert.equal(
+      "agentId" in tSpy.posts[0]!.bodyParsed,
+      false,
+      "NULL running-session agent_id must omit agentId so Gateway.handleStop can scan live sessions across agents",
+    )
+  })
+
   test("stop falls back to current pointer when running-session lookup fails", async () => {
     const pg = makeFakePg({
       pointer: FIXED_SESSION_ID,
@@ -629,6 +649,37 @@ describe("inboundDispatcher — happy path", () => {
       sessionId: c.sessionId,
       runId: c.runId,
     })), [{ sessionId: originalSessionId, runId: "orig-run" }])
+  })
+
+  test("deduplicated Step1 response for an already completed turn does not re-mark it running", async () => {
+    const { transport } = makeTransport([
+      {
+        status: 200,
+        bodyText: JSON.stringify({
+          ok: true,
+          deduplicated: true,
+          started: true,
+          completed: true,
+          sessionId: FIXED_SESSION_ID,
+          traceId: "completed-run",
+        }),
+      },
+    ])
+    const storage = makeStorageSpies()
+    const pg = makeFakePg({ pointer: null })
+    const d = makeInboundDispatcher(
+      makeDeps({
+        transport,
+        pgPool: pg.pg,
+        upsertMasterClientSession: storage.upsertMasterClientSession,
+        softDeleteMasterSession: storage.softDeleteMasterSession,
+      }),
+    )
+    const r = await d.dispatch(makeEvent())
+    assert.equal(r.kind, "dispatched")
+    assert.equal(storage.spy.upsertCalls.length, 1)
+    assert.equal(pg.spy.setCalls.length, 1)
+    assert.equal(pg.spy.runningSetCalls.length, 0)
   })
 
   test("Step1 routed agentId is persisted for web hello and /stop targets", async () => {

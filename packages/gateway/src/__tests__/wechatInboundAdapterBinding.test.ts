@@ -282,6 +282,11 @@ test('duplicate WeChat Step1 ACK returns the cached routed wsess', () => {
     /accepted:\s*originalWechat\.started\s*!==\s*false/,
     'duplicates for already-started/completed turns must remain accepted:true so master can persist the session after a lost Step1 response',
   )
+  assert.match(
+    handleWechatInbound,
+    /completed:\s*originalWechat\.completed\s*===\s*true/,
+    'duplicate Step1 ACK must tell master when the cached turn is already terminal so it does not recreate an active running row',
+  )
 })
 
 test('pre-start terminal dispatch exits are ACKed as unaccepted, not ghost sessions', () => {
@@ -345,6 +350,11 @@ test('terminal WeChat failure paths preserve idempotency metadata for Step1 retr
     SERVER_TS,
     /_seenIdempotencyKeys\.delete\(frame\.idempotencyKey\)[\s\S]+_idempotencyPreReserved/,
     'terminal failure cleanup must be guarded by _idempotencyPreReserved so WeChat retries remain deduplicated',
+  )
+  assert.match(
+    SERVER_TS,
+    /_updateWechatIdempotency\(\s*frame\.idempotencyKey\s*,\s*\{\s*completed:\s*true\s*\}\s*\)/,
+    'WeChat terminal paths must mark cached idempotency metadata as completed so late Step1 retries skip active-run tracking',
   )
 })
 

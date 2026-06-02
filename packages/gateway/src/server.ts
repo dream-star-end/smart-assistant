@@ -508,6 +508,7 @@ export interface GatewayDeps {
 type WechatStartOutcome = {
   accepted?: boolean
   started: boolean
+  completed?: boolean
   traceId?: string
   sessionKey?: string
   peerId?: string
@@ -551,6 +552,7 @@ export class Gateway {
       peerId: string
       agentId: string
       started: boolean
+      completed?: boolean
       traceId?: string
       startPromise?: Promise<WechatStartOutcome>
     }
@@ -573,6 +575,7 @@ export class Gateway {
       peerId: string
       agentId: string
       started: boolean
+      completed?: boolean
       traceId?: string
       startPromise?: Promise<WechatStartOutcome>
     }
@@ -606,6 +609,7 @@ export class Gateway {
       peerId: string
       agentId: string
       started: boolean
+      completed?: boolean
       traceId?: string
       startPromise?: Promise<WechatStartOutcome>
     },
@@ -617,6 +621,7 @@ export class Gateway {
     key: string,
     patch: Partial<{
       started: boolean
+      completed: boolean
       traceId: string
       sessionKey: string
       peerId: string
@@ -2870,6 +2875,7 @@ export class Gateway {
         deduplicated: true,
         accepted: originalWechat.started !== false,
         started: originalWechat.started,
+        completed: originalWechat.completed === true,
         sessionKey: originalWechat.sessionKey,
         sessionId: originalPeerId,
         agentId: originalWechat.agentId,
@@ -2917,6 +2923,7 @@ export class Gateway {
       })
     }
     const publishPostStartDispatchFailure = async (err: unknown) => {
+      this._updateWechatIdempotency(idempotencyKey, { completed: true })
       const currentWechat = this._getIdempotencyEntry(idempotencyKey)?.wechat
       const errMessage = err instanceof Error ? err.message : String(err)
       const terminalPeer = {
@@ -7418,6 +7425,9 @@ export class Gateway {
           // 决策:错误卡不显示 cost),与 e.kind === 'error' 分支一致;runLog
           // 也按 failed 记账,idempotency key 释放允许 client retry。
           this._runLog.complete(_run, { status: 'failed', error: _apiErrorText })
+          if (frame.idempotencyKey && (frame as any)._idempotencyPreReserved) {
+            this._updateWechatIdempotency(frame.idempotencyKey, { completed: true })
+          }
           if (frame.idempotencyKey && !(frame as any)._idempotencyPreReserved) {
             this._seenIdempotencyKeys.delete(frame.idempotencyKey)
           }
@@ -7459,6 +7469,9 @@ export class Gateway {
           outputTokens: e.meta?.outputTokens,
           turn: e.meta?.turn,
         })
+        if (frame.idempotencyKey && (frame as any)._idempotencyPreReserved) {
+          this._updateWechatIdempotency(frame.idempotencyKey, { completed: true })
+        }
         if (liveWechatAdapter) {
           // Web gets the normal stream above, then an empty final terminator.
           // WeChat gets exactly one final text message.  If the agent completed
@@ -7603,6 +7616,9 @@ export class Gateway {
         // Plan 2 — turn 终态前清 turn_status cache,语义同 final 分支。
         session.currentTurnStatus = null
         this._runLog.complete(_run, { status: 'failed', error: e.error })
+        if (frame.idempotencyKey && (frame as any)._idempotencyPreReserved) {
+          this._updateWechatIdempotency(frame.idempotencyKey, { completed: true })
+        }
         // Remove idempotency key on normal Web failures to allow client retry.
         // WeChat early-ACK turns keep their metadata for the TTL so a lost
         // Step1 response can be deduplicated instead of re-dispatching.

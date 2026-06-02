@@ -686,7 +686,7 @@ export function makeInboundDispatcher(deps: InboundDispatcherDeps): InboundDispa
         })
       }
 
-      if (step1Accepted.started !== false) {
+      if (step1Accepted.started !== false && step1Accepted.completed !== true) {
         try {
           await markRunningSession(
             deps.pgPool,
@@ -711,7 +711,6 @@ export function makeInboundDispatcher(deps: InboundDispatcherDeps): InboundDispa
 
     async stop(evt: InboundEvent): Promise<StopOutcome> {
       const requestId = newRequestId()
-      const agentId = evt.agentId ?? "main"
       const reqLog = log.child({
         requestId,
         bindingUserId: evt.bindingUserId,
@@ -819,8 +818,7 @@ export function makeInboundDispatcher(deps: InboundDispatcherDeps): InboundDispa
       let interruptedCount = 0
       let failureCount = 0
       for (const target of targets) {
-        const targetAgentId =
-          target.agentId ?? (target.runId === "pointer-fallback" ? undefined : agentId)
+        const targetAgentId = target.agentId
         const bodyJson = JSON.stringify({
           userId: MASTER_USER_PREFIX + evt.bindingUserId,
           peer: { kind: "dm" as const, id: target.sessionId },
@@ -1104,11 +1102,12 @@ function parseRetryAfterSec(response: {
 function parseStep1Accepted(
   bodyText: string,
   fallbackRunId: string,
-): { accepted: boolean; started: boolean; runId: string; sessionId?: WechatSessionId; agentId?: string } {
+): { accepted: boolean; started: boolean; completed?: boolean; runId: string; sessionId?: WechatSessionId; agentId?: string } {
   try {
     const parsed = JSON.parse(bodyText) as {
       accepted?: unknown
       started?: unknown
+      completed?: unknown
       traceId?: unknown
       sessionId?: unknown
       peerId?: unknown
@@ -1138,6 +1137,7 @@ function parseStep1Accepted(
     return {
       accepted: parsed.accepted !== false,
       started: parsed.started !== false,
+      ...(parsed.completed === true ? { completed: true } : {}),
       runId: traceId,
       ...(sessionId ? { sessionId } : {}),
       ...(agentId ? { agentId } : {}),
