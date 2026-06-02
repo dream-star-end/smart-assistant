@@ -505,7 +505,18 @@ export interface GatewayDeps {
   commercial?: CommercialHook
 }
 
-type WechatStartOutcome = { started: boolean; traceId?: string; sessionKey?: string; agentId?: string }
+type WechatStartOutcome = {
+  started: boolean
+  traceId?: string
+  sessionKey?: string
+  peerId?: string
+  agentId?: string
+}
+
+function wechatPeerIdFromSessionKey(sessionKey: string | undefined): string | undefined {
+  if (!sessionKey) return undefined
+  return /^agent:[^:]+:webchat:dm:(wsess-[0-9a-f]{16})$/.exec(sessionKey)?.[1]
+}
 
 export class Gateway {
   private wss!: WebSocketServer
@@ -603,7 +614,13 @@ export class Gateway {
 
   private _updateWechatIdempotency(
     key: string,
-    patch: Partial<{ started: boolean; traceId: string; sessionKey: string; agentId: string }>,
+    patch: Partial<{
+      started: boolean
+      traceId: string
+      sessionKey: string
+      peerId: string
+      agentId: string
+    }>,
   ): void {
     const entry = this._getIdempotencyEntry(key)
     if (!entry?.wechat) return
@@ -2841,12 +2858,13 @@ export class Gateway {
           return
         }
       }
+      const originalPeerId = wechatPeerIdFromSessionKey(originalWechat.sessionKey) ?? originalWechat.peerId
       this.sendJson(res, 200, {
         ok: true,
         deduplicated: true,
         started: originalWechat.started,
         sessionKey: originalWechat.sessionKey,
-        sessionId: originalWechat.peerId,
+        sessionId: originalPeerId,
         agentId: originalWechat.agentId,
         ...(originalWechat.traceId ? { traceId: originalWechat.traceId } : {}),
       })
@@ -2875,16 +2893,19 @@ export class Gateway {
     ;(frame as any)._idempotencyPreReserved = true
 
     ;(frame as any)._wechatDispatchStarted = (info?: { traceId?: string; sessionKey?: string; agentId?: string }) => {
+      const routedPeerId = wechatPeerIdFromSessionKey(info?.sessionKey)
       this._updateWechatIdempotency(idempotencyKey, {
         started: true,
         ...(info?.traceId ? { traceId: info.traceId } : {}),
         ...(info?.sessionKey ? { sessionKey: info.sessionKey } : {}),
+        ...(routedPeerId ? { peerId: routedPeerId } : {}),
         ...(info?.agentId ? { agentId: info.agentId } : {}),
       })
       settleStart({
         started: true,
         ...(info?.traceId ? { traceId: info.traceId } : {}),
         ...(info?.sessionKey ? { sessionKey: info.sessionKey } : {}),
+        ...(routedPeerId ? { peerId: routedPeerId } : {}),
         ...(info?.agentId ? { agentId: info.agentId } : {}),
       })
     }
@@ -2960,7 +2981,8 @@ export class Gateway {
       accepted: true,
       started: startOutcome.started,
       sessionKey: startOutcome.sessionKey ?? sessionKey,
-      sessionId: peerId,
+      sessionId:
+        startOutcome.peerId ?? wechatPeerIdFromSessionKey(startOutcome.sessionKey ?? sessionKey) ?? peerId,
       ...(startOutcome.agentId ? { agentId: startOutcome.agentId } : {}),
       ...(startOutcome.traceId ? { traceId: startOutcome.traceId } : {}),
     })

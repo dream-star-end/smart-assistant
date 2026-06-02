@@ -211,11 +211,42 @@ test('WeChat Step1 start callback reports routed sessionKey and agentId', () => 
   )
 })
 
+test('WeChat Step1 ACK returns the routed wsess when dispatch reroutes the runner', () => {
+  assert.match(
+    SERVER_TS,
+    /function\s+wechatPeerIdFromSessionKey\([\s\S]+webchat:dm:\(wsess-\[0-9a-f\]\{16\}\)/,
+    'gateway must be able to derive the routed wsess from the routed sessionKey',
+  )
+  assert.match(
+    handleWechatInbound,
+    /const routedPeerId\s*=\s*wechatPeerIdFromSessionKey\(info\?\.sessionKey\)/,
+    'Step1 start callback must capture the routed wsess instead of keeping the provisional peer id',
+  )
+  assert.match(
+    handleWechatInbound,
+    /sessionId:\s*startOutcome\.peerId\s*\?\?\s*wechatPeerIdFromSessionKey\(startOutcome\.sessionKey\s*\?\?\s*sessionKey\)\s*\?\?\s*peerId/,
+    'accepted Step1 ACK must serialize the routed wsess as sessionId so master pointers/stop target the real runner',
+  )
+})
+
 test('duplicate WeChat Step1 waits for the original start promise before ACK', () => {
   assert.match(
     SERVER_TS,
     /await\s+originalWechat\.startPromise/,
     'deduplicated Step1 requests must wait for the original start result instead of replaying provisional started:false metadata',
+  )
+})
+
+test('duplicate WeChat Step1 ACK returns the cached routed wsess', () => {
+  assert.match(
+    handleWechatInbound,
+    /const originalPeerId\s*=\s*wechatPeerIdFromSessionKey\(originalWechat\.sessionKey\)\s*\?\?\s*originalWechat\.peerId/,
+    'duplicate Step1 ACK must not leak the retry/provisional wsess when the original turn rerouted to an existing runner',
+  )
+  assert.match(
+    handleWechatInbound,
+    /sessionId:\s*originalPeerId/,
+    'duplicate Step1 ACK must return the routed cached wsess as sessionId',
   )
 })
 
