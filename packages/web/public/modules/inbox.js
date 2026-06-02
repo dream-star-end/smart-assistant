@@ -29,15 +29,24 @@ let _gen = 0
 
 function _bell() { return document.getElementById('inbox-bell') }
 function _badge() { return document.getElementById('inbox-badge') }
+function _unreadPill() { return document.getElementById('inbox-unread-pill') }
 
 function _renderBadge(n) {
   const badge = _badge()
-  if (!badge) return
+  const pill = _unreadPill()
   if (n > 0) {
-    badge.textContent = n > 99 ? '99+' : String(n)
-    badge.hidden = false
+    const text = n > 99 ? '99+' : String(n)
+    if (badge) {
+      badge.textContent = text
+      badge.hidden = false
+    }
+    if (pill) {
+      pill.textContent = `${text} 未读`
+      pill.hidden = false
+    }
   } else {
-    badge.hidden = true
+    if (badge) badge.hidden = true
+    if (pill) pill.hidden = true
   }
 }
 
@@ -115,7 +124,7 @@ export async function openInbox() {
   try {
     r = await apiGet('/api/me/messages?limit=50')
   } catch (e) {
-    listEl.innerHTML = ''
+    listEl.innerHTML = '<div class="empty-state compact">站内信加载失败，请稍后重试</div>'
     toast('加载站内信失败', 'error', toastOptsFromError(e))
     return
   }
@@ -152,11 +161,15 @@ function _renderItem(m) {
   const title = document.createElement('div')
   title.className = 'inbox-title'
   title.textContent = m.title
+  const chip = document.createElement('span')
+  chip.className = 'inbox-level-chip'
+  chip.textContent = _levelLabel(m.level)
   const time = document.createElement('div')
   time.className = 'inbox-time'
   time.textContent = _fmtTime(m.created_at)
   head.appendChild(dot)
   head.appendChild(title)
+  head.appendChild(chip)
   head.appendChild(time)
 
   const body = document.createElement('div')
@@ -167,6 +180,13 @@ function _renderItem(m) {
   wrap.appendChild(head)
   wrap.appendChild(body)
   return wrap
+}
+
+function _levelLabel(level) {
+  if (level === 'warning') return '提醒'
+  if (level === 'promo') return '活动'
+  if (level === 'notice') return '公告'
+  return '通知'
 }
 
 function _fmtTime(iso) {
