@@ -48,6 +48,7 @@ const CONTAINER_ID = 7
 const BRIDGE_SECRET = "a".repeat(64)
 const FIXED_NOW = 1_700_000_000_000
 const FIXED_SESSION_ID = "wsess-0123456789abcdef" as WechatSessionId
+const FIXED_SESSION_ID_2 = "wsess-fedcba9876543210" as WechatSessionId
 
 function expectedNonce(): string {
   return createHmac("sha256", BRIDGE_SECRET).update(`inbound:${CONTAINER_ID}`).digest("base64url")
@@ -104,6 +105,9 @@ function makeTransport(
 interface PgSpy {
   getCalls: Array<{ bindingUserId: string }>
   setCalls: Array<{ bindingUserId: string; sessionId: string; now: number }>
+  runningListCalls: Array<{ bindingUserId: string }>
+  runningSetCalls: Array<{ bindingUserId: string; sessionId: string; agentId: string | null; now: number }>
+  runningClearCalls: Array<{ bindingUserId: string; sessionId: string }>
 }
 
 /**
@@ -118,10 +122,11 @@ function makeFakePg(opts: {
   pointer: string | null
   /** INSERT/UPDATE 是否真生效;false 模拟 stale skip */
   applySet?: boolean
+  runningSessions?: Array<{ sessionId: string; agentId?: string }>
   throwOnGet?: Error
   throwOnSet?: Error
 }): { pg: PgConn; spy: PgSpy } {
-  const spy: PgSpy = { getCalls: [], setCalls: [] }
+  const spy: PgSpy = { getCalls: [], setCalls: [], runningListCalls: [], runningSetCalls: [], runningClearCalls: [] }
   const pg: PgConn = {
     async query<R extends Record<string, unknown> = Record<string, unknown>>(
       sql: string,
@@ -147,6 +152,32 @@ function makeFakePg(opts: {
         })
         const applied = opts.applySet ?? true
         return { rows: [] as R[], rowCount: applied ? 1 : 0 }
+      }
+      if (/SELECT session_id, agent_id\s+FROM wechat_running_sessions/i.test(sql)) {
+        spy.runningListCalls.push({ bindingUserId: String(params[0]) })
+        return {
+          rows: (opts.runningSessions ?? []).map((s) => ({
+            session_id: s.sessionId,
+            agent_id: s.agentId ?? null,
+          })) as unknown as R[],
+          rowCount: opts.runningSessions?.length ?? 0,
+        }
+      }
+      if (/INSERT INTO wechat_running_sessions/i.test(sql)) {
+        spy.runningSetCalls.push({
+          bindingUserId: String(params[0]),
+          sessionId: String(params[1]),
+          agentId: params[2] === null ? null : String(params[2]),
+          now: Number(params[3]),
+        })
+        return { rows: [] as R[], rowCount: 1 }
+      }
+      if (/DELETE FROM wechat_running_sessions/i.test(sql)) {
+        spy.runningClearCalls.push({
+          bindingUserId: String(params[0]),
+          sessionId: String(params[1]),
+        })
+        return { rows: [] as R[], rowCount: 1 }
       }
       throw new Error(`makeFakePg: unhandled SQL: ${sql.slice(0, 80)}`)
     },
@@ -311,6 +342,35 @@ describe("inboundDispatcher — stop command bridge", () => {
     assert.equal(tSpy.posts[0]!.bodyParsed.agentId, "main")
     assert.equal(tSpy.posts[0]!.headers["x-openclaude-inbound-nonce"], expectedNonce())
   })
+
+  test("stop targets running sessions before current pointer and clears interrupted rows", async () => {
+    const pg = makeFakePg({
+      pointer: FIXED_SESSION_ID,
+      runningSessions: [
+        { sessionId: FIXED_SESSION_ID_2, agentId: "coder" },
+        { sessionId: FIXED_SESSION_ID, agentId: "main" },
+      ],
+    })
+    const { transport, spy: tSpy } = makeTransport([
+      { status: 200, bodyText: '{"ok":true,"interrupted":true}' },
+      { status: 200, bodyText: '{"ok":true,"interrupted":true}' },
+    ])
+    const d = makeInboundDispatcher(makeDeps({ pgPool: pg.pg, transport }))
+    const r = await d.stop(makeEvent({ text: "/stop" }))
+    assert.equal(r.interrupted, true)
+    assert.match(r.reply, /2\/2/)
+    assert.equal(pg.spy.getCalls.length, 0)
+    assert.equal(tSpy.posts.length, 2)
+    assert.deepEqual(tSpy.posts.map((p) => p.bodyParsed.peer), [
+      { kind: "dm", id: FIXED_SESSION_ID_2 },
+      { kind: "dm", id: FIXED_SESSION_ID },
+    ])
+    assert.deepEqual(tSpy.posts.map((p) => p.bodyParsed.agentId), ["coder", "main"])
+    assert.deepEqual(pg.spy.runningClearCalls.map((c) => c.sessionId), [
+      FIXED_SESSION_ID_2,
+      FIXED_SESSION_ID,
+    ])
+  })
 })
 
 // ─── 1. cold start / resolver ──────────────────────────────────────────────
@@ -450,6 +510,8 @@ describe("inboundDispatcher — happy path", () => {
     assert.equal(pg.spy.setCalls.length, 1)
     assert.equal(pg.spy.setCalls[0]!.sessionId, FIXED_SESSION_ID)
     assert.equal(pg.spy.setCalls[0]!.now, FIXED_NOW)
+    assert.equal(pg.spy.runningSetCalls.length, 1)
+    assert.equal(pg.spy.runningSetCalls[0]!.sessionId, FIXED_SESSION_ID)
   })
 
   test("reuse session: pointer=existing → upsert NOT called, pointer touched, dispatched newSession=false", async () => {

@@ -49,7 +49,10 @@ import type { WechatImageAttachment, WechatMediaAttachment } from "@openclaude/c
 import { rootLogger, type Logger } from "../logging/logger.js"
 import type { ContainerUnreadyError, ResolveContainerEndpoint } from "../ws/userChatBridge.js"
 import {
+  clearRunningSession,
   getCurrentSessionId,
+  listRunningSessions,
+  markRunningSession,
   newWechatSessionId,
   setCurrentSessionId,
   type PgConn,
@@ -645,6 +648,15 @@ export function makeInboundDispatcher(deps: InboundDispatcherDeps): InboundDispa
         }
       }
 
+      try {
+        await markRunningSession(deps.pgPool, evt.bindingUserId, sessionId, agentId, dispatchNow)
+      } catch (err) {
+        reqLog.error("mark_running_session_failed", {
+          sessionId,
+          errMessage: (err as Error)?.message ?? String(err),
+        })
+      }
+
       reqLog.info("dispatched", { sessionId, newSession })
       return { kind: "dispatched", sessionId, newSession }
     },
@@ -659,11 +671,11 @@ export function makeInboundDispatcher(deps: InboundDispatcherDeps): InboundDispa
         traceId: evt.traceId,
       })
 
-      let sessionId: WechatSessionId | null
+      let targets: Array<{ sessionId: WechatSessionId; agentId?: string }>
       try {
-        sessionId = await getCurrentSessionId(deps.pgPool, evt.bindingUserId)
+        targets = await listRunningSessions(deps.pgPool, evt.bindingUserId)
       } catch (err) {
-        reqLog.error("stop_pointer_read_failed", {
+        reqLog.error("stop_running_sessions_read_failed", {
           errMessage: (err as Error)?.message ?? String(err),
         })
         return {
@@ -672,12 +684,29 @@ export function makeInboundDispatcher(deps: InboundDispatcherDeps): InboundDispa
           reply: "暂时无法读取当前微信任务，请稍后重试；也可以打开实时过程链接在网页端停止。",
         }
       }
-      if (!sessionId) {
-        return {
-          kind: "command_echo",
-          interrupted: false,
-          reply: "当前没有可中断的微信任务。",
+
+      if (targets.length === 0) {
+        let sessionId: WechatSessionId | null
+        try {
+          sessionId = await getCurrentSessionId(deps.pgPool, evt.bindingUserId)
+        } catch (err) {
+          reqLog.error("stop_pointer_read_failed", {
+            errMessage: (err as Error)?.message ?? String(err),
+          })
+          return {
+            kind: "command_echo",
+            interrupted: false,
+            reply: "暂时无法读取当前微信任务，请稍后重试；也可以打开实时过程链接在网页端停止。",
+          }
         }
+        if (!sessionId) {
+          return {
+            kind: "command_echo",
+            interrupted: false,
+            reply: "当前没有可中断的微信任务。",
+          }
+        }
+        targets = [{ sessionId, agentId }]
       }
 
       let endpoint
@@ -718,11 +747,6 @@ export function makeInboundDispatcher(deps: InboundDispatcherDeps): InboundDispa
       }
 
       const nonce = computeInboundNonce(deps.bridgeSecret, endpoint.containerId)
-      const bodyJson = JSON.stringify({
-        userId: MASTER_USER_PREFIX + evt.bindingUserId,
-        peer: { kind: "dm" as const, id: sessionId },
-        agentId,
-      })
       const headers: Record<string, string> = {
         "content-type": "application/json",
         "x-openclaude-container-id": String(endpoint.containerId),
@@ -730,49 +754,74 @@ export function makeInboundDispatcher(deps: InboundDispatcherDeps): InboundDispa
         "x-request-id": requestId,
       }
 
-      const stopRes = await postWithRetry(
-        deps.transport,
-        WECHAT_STOP_CONTAINER_PATH,
-        endpoint,
-        headers,
-        bodyJson,
-        step1TimeoutMs,
-        step1RetryBackoffMs,
-        reqLog,
-      )
-      if (stopRes.kind === "transport_error") {
-        reqLog.warn("stop_transport_failed_final", { errMessage: stopRes.errMessage })
-        return {
-          kind: "command_echo",
-          interrupted: false,
-          reply: "中断指令暂时发送失败，请稍后重试；也可以打开实时过程链接在网页端停止。",
-        }
-      }
-      if (stopRes.response.status < 200 || stopRes.response.status >= 300) {
-        reqLog.warn("stop_container_rejected", {
-          status: stopRes.response.status,
-          bodyText: stopRes.response.bodyText.slice(0, 256),
+      let interruptedCount = 0
+      let failureCount = 0
+      for (const target of targets) {
+        const bodyJson = JSON.stringify({
+          userId: MASTER_USER_PREFIX + evt.bindingUserId,
+          peer: { kind: "dm" as const, id: target.sessionId },
+          agentId: target.agentId ?? agentId,
         })
-        return {
-          kind: "command_echo",
-          interrupted: false,
-          reply: "中断指令被容器拒绝，请稍后重试；也可以打开实时过程链接在网页端停止。",
+        const stopRes = await postWithRetry(
+          deps.transport,
+          WECHAT_STOP_CONTAINER_PATH,
+          endpoint,
+          headers,
+          bodyJson,
+          step1TimeoutMs,
+          step1RetryBackoffMs,
+          reqLog,
+        )
+        if (stopRes.kind === "transport_error") {
+          failureCount++
+          reqLog.warn("stop_transport_failed_final", {
+            sessionId: target.sessionId,
+            errMessage: stopRes.errMessage,
+          })
+          continue
+        }
+        if (stopRes.response.status < 200 || stopRes.response.status >= 300) {
+          failureCount++
+          reqLog.warn("stop_container_rejected", {
+            sessionId: target.sessionId,
+            status: stopRes.response.status,
+            bodyText: stopRes.response.bodyText.slice(0, 256),
+          })
+          continue
+        }
+
+        let interrupted = false
+        try {
+          const parsed = JSON.parse(stopRes.response.bodyText) as { interrupted?: unknown }
+          interrupted = parsed.interrupted === true
+        } catch {
+          interrupted = false
+        }
+        if (interrupted) {
+          interruptedCount++
+          try {
+            await clearRunningSession(deps.pgPool, evt.bindingUserId, target.sessionId)
+          } catch (err) {
+            reqLog.warn("stop_clear_running_session_failed", {
+              sessionId: target.sessionId,
+              errMessage: (err as Error)?.message ?? String(err),
+            })
+          }
         }
       }
 
-      let interrupted = false
-      try {
-        const parsed = JSON.parse(stopRes.response.bodyText) as { interrupted?: unknown }
-        interrupted = parsed.interrupted === true
-      } catch {
-        interrupted = false
-      }
+      const interrupted = interruptedCount > 0
+      const total = targets.length
       return {
         kind: "command_echo",
         interrupted,
         reply: interrupted
-          ? "已发送中断指令。正在运行的任务会尽快停止；如需查看状态，请打开实时过程链接。"
-          : "当前没有正在运行的任务，可能已经结束；如页面仍显示运行中，可在实时过程链接里再点停止。",
+          ? total > 1
+            ? `已发送中断指令（${interruptedCount}/${total} 个运行任务）。任务会尽快停止；如需查看状态，请打开实时过程链接。`
+            : "已发送中断指令。正在运行的任务会尽快停止；如需查看状态，请打开实时过程链接。"
+          : failureCount > 0
+            ? "中断指令暂时发送失败，请稍后重试；也可以打开实时过程链接在网页端停止。"
+            : "当前没有正在运行的任务，可能已经结束；如页面仍显示运行中，可在实时过程链接里再点停止。",
       }
     },
   }

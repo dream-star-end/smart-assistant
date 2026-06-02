@@ -33,6 +33,11 @@ export interface PgRunner {
 
 export type PgConn = Pool | PoolClient | PgRunner
 
+export interface RunningWechatSession {
+  sessionId: WechatSessionId
+  agentId?: string
+}
+
 /**
  * 生成新的 wsess sessionId。rand 默认 16 hex(8 字节 randomBytes)。
  *
@@ -115,6 +120,54 @@ export async function setCurrentSessionId(
        updated_at         = EXCLUDED.updated_at
      WHERE wechat_session_pointer.updated_at <= EXCLUDED.updated_at`,
     [bindingUserId, sessionId, now],
+  )
+  return (res.rowCount ?? 0) > 0
+}
+
+export async function markRunningSession(
+  conn: PgConn,
+  bindingUserId: BindingId,
+  sessionId: WechatSessionId,
+  agentId: string | undefined,
+  now: number,
+): Promise<void> {
+  await (conn as PgRunner).query(
+    `INSERT INTO wechat_running_sessions (binding_user_id, session_id, agent_id, started_at, updated_at)
+     VALUES ($1, $2, $3, $4, $4)
+     ON CONFLICT (binding_user_id, session_id) DO UPDATE SET
+       agent_id   = EXCLUDED.agent_id,
+       updated_at = EXCLUDED.updated_at`,
+    [bindingUserId, sessionId, agentId ?? null, now],
+  )
+}
+
+export async function listRunningSessions(
+  conn: PgConn,
+  bindingUserId: BindingId,
+  limit = 16,
+): Promise<RunningWechatSession[]> {
+  const res = await (conn as PgRunner).query<{ session_id: string; agent_id: string | null }>(
+    `SELECT session_id, agent_id
+       FROM wechat_running_sessions
+      WHERE binding_user_id = $1
+      ORDER BY started_at DESC
+      LIMIT $2`,
+    [bindingUserId, limit],
+  )
+  return res.rows.map((row) => ({
+    sessionId: row.session_id as WechatSessionId,
+    ...(row.agent_id ? { agentId: row.agent_id } : {}),
+  }))
+}
+
+export async function clearRunningSession(
+  conn: PgConn,
+  bindingUserId: BindingId,
+  sessionId: WechatSessionId,
+): Promise<boolean> {
+  const res = await (conn as PgRunner).query(
+    "DELETE FROM wechat_running_sessions WHERE binding_user_id = $1 AND session_id = $2",
+    [bindingUserId, sessionId],
   )
   return (res.rowCount ?? 0) > 0
 }

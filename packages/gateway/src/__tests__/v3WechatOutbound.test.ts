@@ -743,6 +743,20 @@ describe("makeV3WechatOutboundAdapter — wire payload assembly", () => {
     assert.equal("agentId" in q.enqueued[0]!.payload, false)
   })
 
+  test("final frames carry isFinal marker to master", async () => {
+    const q = fakeQueue()
+    const adapter = makeV3WechatOutboundAdapter({
+      config: CFG,
+      retryQueue: q,
+      attemptSendImpl: async () => {
+        throw new V3WechatSinkError("503", "transient", 503)
+      },
+    })
+    await adapter.init!(makeCtx())
+    await adapter.send!(makeOut({ isFinal: true }))
+    assert.equal(messagePayload(q.enqueued[0]!).isFinal, true)
+  })
+
   test("webchat message frames are mirrored to WeChat wire channel", async () => {
     const q = fakeQueue()
     const adapter = makeV3WechatOutboundAdapter({

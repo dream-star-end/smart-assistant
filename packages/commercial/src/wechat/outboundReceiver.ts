@@ -56,6 +56,7 @@ import { enqueue, type EnqueueOutcome } from "./outboxStore.js"
 import { renderAssistantText, renderToolAnnouncement } from "./rendererPipeline.js"
 import { expandTextWithWechatMediaParts } from "./outboundMedia.js"
 import { type RateLimiter } from "./rateLimiter.js"
+import { clearRunningSession } from "./sessionPointer.js"
 import { WECHAT_SESSION_ID_REGEX, type IlinkPart } from "./types.js"
 
 /** Container → master 出站 endpoint。挂在 master:18443 + self-host 18791。 */
@@ -198,6 +199,8 @@ const BodySchema = z
       })
       .strict(),
     blocks: z.array(BlockSchema).min(1).max(MAX_BLOCKS_PER_OUTBOUND),
+    /** Container marks final/error outbound so master can clear running-session state. */
+    isFinal: z.boolean().optional(),
     outboundId: z
       .string()
       .regex(OUTBOUND_ID_RE, {
@@ -566,6 +569,7 @@ export function makeOutboundReceiverHandler(
         blocks: body.blocks.length,
         dropped,
       })
+      await clearRunningIfFinal(body, bindingUserId, deps.pool, userLog)
       sendJsonOk(
         res,
         200,
@@ -605,7 +609,26 @@ export function makeOutboundReceiverHandler(
       return
     }
 
+    await clearRunningIfFinal(body, bindingUserId, deps.pool, userLog)
     sendOutcomeResponse(res, requestId, result.outcome, result.outboxId, userLog, body)
+  }
+}
+
+async function clearRunningIfFinal(
+  body: OutboundReceiverBody,
+  bindingUserId: string,
+  pool: Pool,
+  log: Logger,
+): Promise<void> {
+  if (body.isFinal !== true) return
+  try {
+    await clearRunningSession(pool, bindingUserId, body.sessionId)
+  } catch (err) {
+    log.warn("clear_running_session_failed", {
+      outboundId: body.outboundId,
+      sessionId: body.sessionId,
+      err: err as Error,
+    })
   }
 }
 

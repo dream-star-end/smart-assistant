@@ -170,6 +170,7 @@ import {
   notifyTabVisible,
   resetReplyTracker,
   resetThinkingSafety,
+  refreshWebchatHelloForCurrentSession,
   safeWsSend,
   setProvisioningBanner,
   setWsDeps,
@@ -439,6 +440,9 @@ function _selectSessionAfterServerSync() {
     if (state.currentSessionId !== _bootRequestedSessionId) {
       state.currentSessionId = _bootRequestedSessionId
       currentChanged = true
+      try {
+        refreshWebchatHelloForCurrentSession()
+      } catch {}
     }
     return { currentChanged, updated }
   }

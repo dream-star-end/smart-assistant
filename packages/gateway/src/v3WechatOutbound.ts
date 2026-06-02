@@ -24,6 +24,7 @@
  *                  per-call unique; master uses it as dedup key
  *     peer       = { kind, meta:{ senderId: out.peer.displayName } }
  *     blocks     = out.blocks (passed through; master filters server-side)
+ *     isFinal    = true only for terminal final/error frames
  *     createdAt  = now() ms epoch
  *     traceId    = out.traceId (optional, passed through for audit)
  *
@@ -323,6 +324,9 @@ function buildWirePayload(
   }
   if (cfg.agentId !== undefined) {
     payload.agentId = cfg.agentId
+  }
+  if (out.isFinal === true) {
+    payload.isFinal = true
   }
   if (out.traceId !== undefined) {
     payload.traceId = out.traceId

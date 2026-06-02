@@ -113,6 +113,7 @@ interface EnqueueSpy {
     payload: unknown[]
     now: number
   }>
+  runningClearCalls: Array<{ bindingUserId: string; sessionId: string }>
 }
 
 /**
@@ -141,12 +142,19 @@ function makeFakePool(opts: {
 } | {
   mode: "enqueue_throws"
 }): { pool: Pool; spy: EnqueueSpy } {
-  const spy: EnqueueSpy = { calls: [] }
+  const spy: EnqueueSpy = { calls: [], runningClearCalls: [] }
 
   const respond = (sql: string, params: ReadonlyArray<unknown>): { rows: Record<string, unknown>[]; rowCount: number | null } => {
     const trimmed = sql.trim().toUpperCase()
     if (trimmed === "BEGIN" || trimmed === "COMMIT" || trimmed === "ROLLBACK") {
       return { rows: [], rowCount: 0 }
+    }
+    if (/DELETE FROM wechat_running_sessions/i.test(sql)) {
+      spy.runningClearCalls.push({
+        bindingUserId: String(params[0]),
+        sessionId: String(params[1]),
+      })
+      return { rows: [], rowCount: 1 }
     }
     if (opts.mode === "noop") {
       throw new Error("makeFakePool(noop): handler should not have reached enqueue")
@@ -496,6 +504,17 @@ describe("outboundReceiver — enqueue outcome translation", () => {
     assert.equal(spy.calls.length, 1)
     assert.equal(spy.calls[0]!.outboundId, "ob-12345678")
     assert.equal(spy.calls[0]!.payloadLen, 1) // 单条 "你好" 没超 1024,一个 part
+  })
+
+  test("isFinal clears running session after enqueue", async () => {
+    const { pool, spy } = makeFakePool({ mode: "enqueue_queued", outboxId: 43 })
+    const handler = makeOutboundReceiverHandler(makeDeps({ pool }))
+    const { res, rec } = makeRes()
+    await handler(authedReq(validBody({ isFinal: true })), res, CTX)
+    assert.equal(rec.status, 202)
+    assert.deepEqual(spy.runningClearCalls, [
+      { bindingUserId: String(VALID_USER_ID), sessionId: VALID_SESSION_ID },
+    ])
   })
 
   test("pending → 202 scheduled:true outcome=pending", async () => {
