@@ -43,6 +43,8 @@ export interface LedgerRowView {
   delta: string;
   balance_after: string;
   reason: string;
+  channel: "web" | "wechat" | null;
+  model: string | null;
   ref_type: string | null;
   ref_id: string | null;
   memo: string | null;
@@ -120,18 +122,49 @@ export async function listLedger(input: ListLedgerInput = {}): Promise<ListLedge
   // 优先 SELECT alias(text 类型)做字典序排序("9" > "57" > "6"),线上能复现。
   // 用 `cl.id` 强制走 source 列(bigint),数值降序正确。
   const r = await query<LedgerRowView>(
-    `SELECT cl.id::text            AS id,
-            cl.user_id::text       AS user_id,
-            cl.delta::text         AS delta,
-            cl.balance_after::text AS balance_after,
+    `WITH ledger_page AS (
+       SELECT cl.id                 AS sort_id,
+              cl.id::text           AS id,
+              cl.user_id::text      AS user_id,
+              cl.delta::text        AS delta,
+              cl.balance_after::text AS balance_after,
+              cl.reason,
+              cl.ref_type,
+              cl.ref_id,
+              cl.memo,
+              cl.created_at
+         FROM credit_ledger cl ${whereClause}
+        ORDER BY cl.id DESC
+        LIMIT $${params.length}
+     )
+     SELECT cl.id,
+            cl.user_id,
+            cl.delta,
+            cl.balance_after,
             cl.reason,
+            CASE
+              WHEN ur.id IS NULL THEN NULL
+              WHEN ur.session_id ~ '^wsess-[0-9a-f]{16}$'
+                OR COALESCE(rfj.ctx->>'source', '') LIKE 'wechat%'
+                THEN 'wechat'
+              ELSE 'web'
+            END AS channel,
+            ur.model AS model,
             cl.ref_type,
             cl.ref_id,
             cl.memo,
             cl.created_at
-     FROM credit_ledger cl ${whereClause}
-     ORDER BY cl.id DESC
-     LIMIT $${params.length}`,
+       FROM ledger_page cl
+       LEFT JOIN usage_records ur
+         ON cl.ref_type = 'usage_record'
+        AND ur.id = CASE
+              WHEN cl.ref_id ~ '^[1-9][0-9]{0,18}$'
+               AND (length(cl.ref_id) < 19 OR cl.ref_id <= '9223372036854775807')
+              THEN cl.ref_id::bigint
+              ELSE NULL
+            END
+       LEFT JOIN request_finalize_journal rfj ON rfj.request_id = ur.request_id
+      ORDER BY cl.sort_id DESC`,
     params,
   );
   const rows = r.rows;
@@ -149,6 +182,8 @@ const CSV_HEADER = [
   "delta_cents",
   "balance_after_cents",
   "reason",
+  "channel",
+  "model",
   "ref_type",
   "ref_id",
   "memo",
@@ -174,18 +209,49 @@ export async function buildLedgerCsv(input: BuildLedgerCsvInput = {}): Promise<B
   params.push(LEDGER_CSV_MAX_ROWS);
   // 同 listLedger:qualified `cl.id` 防 SELECT alias 触发字典序排序。
   const r = await query<LedgerRowView>(
-    `SELECT cl.id::text            AS id,
-            cl.user_id::text       AS user_id,
-            cl.delta::text         AS delta,
-            cl.balance_after::text AS balance_after,
+    `WITH ledger_page AS (
+       SELECT cl.id                  AS sort_id,
+              cl.id::text            AS id,
+              cl.user_id::text       AS user_id,
+              cl.delta::text         AS delta,
+              cl.balance_after::text AS balance_after,
+              cl.reason,
+              cl.ref_type,
+              cl.ref_id,
+              cl.memo,
+              cl.created_at
+         FROM credit_ledger cl ${whereClause}
+        ORDER BY cl.id DESC
+        LIMIT $${params.length}
+     )
+     SELECT cl.id,
+            cl.user_id,
+            cl.delta,
+            cl.balance_after,
             cl.reason,
+            CASE
+              WHEN ur.id IS NULL THEN NULL
+              WHEN ur.session_id ~ '^wsess-[0-9a-f]{16}$'
+                OR COALESCE(rfj.ctx->>'source', '') LIKE 'wechat%'
+                THEN 'wechat'
+              ELSE 'web'
+            END AS channel,
+            ur.model AS model,
             cl.ref_type,
             cl.ref_id,
             cl.memo,
             cl.created_at
-     FROM credit_ledger cl ${whereClause}
-     ORDER BY cl.id DESC
-     LIMIT $${params.length}`,
+       FROM ledger_page cl
+       LEFT JOIN usage_records ur
+         ON cl.ref_type = 'usage_record'
+        AND ur.id = CASE
+              WHEN cl.ref_id ~ '^[1-9][0-9]{0,18}$'
+               AND (length(cl.ref_id) < 19 OR cl.ref_id <= '9223372036854775807')
+              THEN cl.ref_id::bigint
+              ELSE NULL
+            END
+       LEFT JOIN request_finalize_journal rfj ON rfj.request_id = ur.request_id
+      ORDER BY cl.sort_id DESC`,
     params,
   );
   const lines: string[] = [CSV_HEADER.join(",")];
@@ -197,6 +263,8 @@ export async function buildLedgerCsv(input: BuildLedgerCsvInput = {}): Promise<B
         row.delta,
         row.balance_after,
         row.reason,
+        row.channel,
+        row.model,
         row.ref_type,
         row.ref_id,
         row.memo,
