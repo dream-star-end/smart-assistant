@@ -13,6 +13,7 @@ import {
   newWechatSessionId,
   listOrphanWechatSessions,
   setCurrentSessionId,
+  listRunningSessions,
   RECONCILE_GRACE_MS_DEFAULT,
   type PgConn,
 } from "../wechat/sessionPointer.js"
@@ -169,6 +170,35 @@ describe("wechat sessionPointer.setCurrentSessionId (SQL guard)", () => {
     }
     const ok = await setCurrentSessionId(conn, "u1", "wsess-0123456789abcdef", 500)
     assert.equal(ok, false)
+  })
+})
+
+describe("wechat sessionPointer.listRunningSessions (SQL guard)", () => {
+  function captureConn(): { conn: PgConn; captured: { sql: string; params: ReadonlyArray<unknown> }[] } {
+    const captured: { sql: string; params: ReadonlyArray<unknown> }[] = []
+    const conn: PgConn = {
+      query: async (sql: string, params: ReadonlyArray<unknown> = []) => {
+        captured.push({ sql, params })
+        return { rows: [], rowCount: 0 }
+      },
+    }
+    return { conn, captured }
+  }
+
+  test("default enumeration has no LIMIT so /stop can reach every running task", async () => {
+    const { conn, captured } = captureConn()
+    await listRunningSessions(conn, "u1")
+    assert.equal(captured.length, 1)
+    assert.doesNotMatch(captured[0]!.sql, /\bLIMIT\b/i)
+    assert.deepEqual(captured[0]!.params, ["u1"])
+  })
+
+  test("explicit positive limit still emits LIMIT for diagnostic callers", async () => {
+    const { conn, captured } = captureConn()
+    await listRunningSessions(conn, "u1", 3)
+    assert.equal(captured.length, 1)
+    assert.match(captured[0]!.sql, /\bLIMIT\s+\$2\b/i)
+    assert.deepEqual(captured[0]!.params, ["u1", 3])
   })
 })
 

@@ -169,15 +169,20 @@ export async function markRunningSession(
 export async function listRunningSessions(
   conn: PgConn,
   bindingUserId: BindingId,
-  limit = 16,
+  limit?: number,
 ): Promise<RunningWechatSession[]> {
-  const res = await (conn as PgRunner).query<{ session_id: string; run_id: string; agent_id: string | null }>(
-    `SELECT session_id, run_id, agent_id
+  const params: unknown[] = [bindingUserId]
+  let sql = `SELECT session_id, run_id, agent_id
        FROM wechat_running_sessions
       WHERE binding_user_id = $1
-      ORDER BY started_at DESC
-      LIMIT $2`,
-    [bindingUserId, limit],
+      ORDER BY started_at DESC`
+  if (Number.isInteger(limit) && limit! > 0) {
+    sql += "\n      LIMIT $2"
+    params.push(limit)
+  }
+  const res = await (conn as PgRunner).query<{ session_id: string; run_id: string; agent_id: string | null }>(
+    sql,
+    params,
   )
   return res.rows.map((row) => ({
     sessionId: row.session_id as WechatSessionId,

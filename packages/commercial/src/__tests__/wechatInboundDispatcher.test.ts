@@ -379,6 +379,27 @@ describe("inboundDispatcher — stop command bridge", () => {
       FIXED_SESSION_ID,
     ])
   })
+
+  test("stop clears stale tracked running rows when container reports nothing interrupted", async () => {
+    const pg = makeFakePg({
+      pointer: FIXED_SESSION_ID,
+      runningSessions: [
+        { sessionId: FIXED_SESSION_ID_2, runId: "run-stale", agentId: "coder" },
+      ],
+    })
+    const { transport, spy: tSpy } = makeTransport([
+      { status: 200, bodyText: '{"ok":true,"interrupted":false}' },
+    ])
+    const d = makeInboundDispatcher(makeDeps({ pgPool: pg.pg, transport }))
+    const r = await d.stop(makeEvent({ text: "/stop" }))
+    assert.equal(r.interrupted, false)
+    assert.match(r.reply, /当前没有正在运行的任务/)
+    assert.equal(pg.spy.getCalls.length, 0)
+    assert.equal(tSpy.posts.length, 1)
+    assert.deepEqual(pg.spy.runningClearCalls, [
+      { bindingUserId: "42", sessionId: FIXED_SESSION_ID_2, runId: "run-stale" },
+    ])
+  })
 })
 
 // ─── 1. cold start / resolver ──────────────────────────────────────────────
