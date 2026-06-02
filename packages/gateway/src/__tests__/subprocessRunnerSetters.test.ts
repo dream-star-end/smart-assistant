@@ -14,7 +14,10 @@
 import * as assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
 import { ALLOWED_INBOUND_MODELS } from '../server.js'
-import { SubprocessRunner } from '../subprocessRunner.js'
+import {
+  SubprocessRunner,
+  _buildStaticProviderSmallFastModelEnv,
+} from '../subprocessRunner.js'
 
 function createRunner(initial: Partial<{ model: string; effortLevel: string }> = {}): SubprocessRunner {
   return new SubprocessRunner({
@@ -106,5 +109,31 @@ describe('SubprocessRunner.model getter / setModel', () => {
     r.setEffortLevel('high')
     assert.equal(r.model, 'claude-sonnet-4-6')
     assert.equal(r.effortLevel, 'high')
+  })
+})
+
+describe('SubprocessRunner static-provider small-fast model env', () => {
+  it('pins MiniMax-M3 hidden secondary calls to MiniMax-M3', () => {
+    assert.deepEqual(_buildStaticProviderSmallFastModelEnv('MiniMax-M3'), {
+      ANTHROPIC_SMALL_FAST_MODEL: 'MiniMax-M3',
+    })
+    assert.deepEqual(_buildStaticProviderSmallFastModelEnv('minimax-m3'), {
+      ANTHROPIC_SMALL_FAST_MODEL: 'minimax-m3',
+    })
+  })
+
+  it('pins DeepSeek hidden secondary calls to the selected DeepSeek model', () => {
+    assert.deepEqual(_buildStaticProviderSmallFastModelEnv('deepseek-v4-flash'), {
+      ANTHROPIC_SMALL_FAST_MODEL: 'deepseek-v4-flash',
+    })
+    assert.deepEqual(_buildStaticProviderSmallFastModelEnv('deepseek-v4-pro'), {
+      ANTHROPIC_SMALL_FAST_MODEL: 'deepseek-v4-pro',
+    })
+  })
+
+  it('does not override small-fast model for Claude/Codex/absent model', () => {
+    assert.deepEqual(_buildStaticProviderSmallFastModelEnv('claude-opus-4-7'), {})
+    assert.deepEqual(_buildStaticProviderSmallFastModelEnv('gpt-5.5'), {})
+    assert.deepEqual(_buildStaticProviderSmallFastModelEnv(undefined), {})
   })
 })

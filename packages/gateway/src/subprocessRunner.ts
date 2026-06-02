@@ -81,6 +81,28 @@ export function _buildCcbSpawnTraceEnv(
   return { OPENCLAUDE_TRACE_ID: traceId ?? '' }
 }
 
+/**
+ * Static-key upstreams (MiniMax / DeepSeek) are selected by commercial master
+ * from the request body model and must not consume the OAuth account pool.
+ *
+ * CCB hidden secondary calls (notably WebFetch's applyPromptToMarkdown via
+ * queryHaiku/getSmallFastModel, plus a few hook/search helpers) normally use
+ * ANTHROPIC_SMALL_FAST_MODEL or fall back to Haiku.  During a MiniMax/DeepSeek
+ * turn that default would become an unrelated Claude OAuth request and can fail
+ * with ACCOUNT_POOL_UNAVAILABLE.  Pin the small-fast model to the same static
+ * provider model for this subprocess only.
+ */
+export function _buildStaticProviderSmallFastModelEnv(
+  model: string | undefined,
+): Record<string, string> {
+  if (!model) return {}
+  const normalized = model.toLowerCase()
+  if (normalized === 'minimax-m3' || normalized.startsWith('deepseek-')) {
+    return { ANTHROPIC_SMALL_FAST_MODEL: model }
+  }
+  return {}
+}
+
 export { buildOpenClaudeVisionMcpEnv } from './codexLaunchOverrides.js'
 
 // ───────────────────────────────────────────────
@@ -622,6 +644,7 @@ export class SubprocessRunner extends EventEmitter {
       // ANTHROPIC_AUTH_TOKEN pointing to the provider's Anthropic-compatible endpoint).
       // This is the "default" path — settings.json controls routing.
     }
+    Object.assign(providerEnv, _buildStaticProviderSmallFastModelEnv(this.opts.model))
 
     let proc: ReturnType<TerminalBackend['spawn']>
     try {
