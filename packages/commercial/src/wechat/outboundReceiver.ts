@@ -14,7 +14,7 @@
  *   4) renderWechatBlocks 把 5 种 OutboundContentBlock 投影成 IlinkPart[]:
  *        - text         → coalesce adjacent chunks, then renderAssistantText(preserve Markdown + split 4000)
  *        - tool_use     → renderToolAnnouncement("🔧 X…") unless user hides process
- *        - thinking     → coalesce adjacent chunks, then bounded "💭 思考过程" preview
+ *        - thinking     → coalesce adjacent chunks, then detailed "💭 思考过程"
  *                          unless user hides process
  *        - tool_result  → P1 drop(voluminous, 用户在 web 看;P2 可考虑短链摘要)
  *        - tool_output_tail → P1 drop(已被 tool_use 公告覆盖)
@@ -88,12 +88,8 @@ const SENDER_ID_RE = /^[A-Za-z0-9_-]{1,256}$/
  */
 const MAX_BLOCKS_PER_OUTBOUND = 4096
 
-/** WeChat is not a good surface for huge raw thinking transcripts. */
-const MAX_THINKING_PREVIEW_CHARS = 800
-
 /** Cross-request duplicate thinking previews are noisy in WeChat streaming UX. */
 const THINKING_PREVIEW_PREFIX = "💭 思考过程："
-const LIVE_THINKING_STATUS_PART = `${THINKING_PREVIEW_PREFIX}\n正在思考…`
 const THINKING_DEDUPE_TTL_MS = 2 * 60 * 1000
 const THINKING_DEDUPE_MAX_ENTRIES = 512
 
@@ -270,7 +266,7 @@ export interface RenderWechatBlocksOptions {
  *   - parentToolUseId 非空 → 整块 skip(subagent 内容只在 web Agent card 渲染)
  *   - text → 先合并连续顶层 text,再 renderAssistantText(保留 Markdown;避免 token chunks 变成多气泡)
  *   - tool_use → renderToolAnnouncement("🔧 X…")
- *   - thinking → 先合并连续顶层 thinking,再发有上限的 "💭 思考过程" 摘要
+ *   - thinking → 先合并连续顶层 thinking,再完整渲染 "💭 思考过程"
  *   - tool_result / tool_output_tail → drop(P1 不外发)
  *
  * 返回 `dropped` 计数仅用于审计 / 测试断言(broker 关心"是否完全空"由 caller 判断)。
@@ -299,17 +295,13 @@ export function renderWechatBlocks(
 
   const flushThinking = () => {
     if (thinkingBuffer.length === 0) return
-    const compact = thinkingBuffer.replace(/\s+/g, " ").trim()
+    const detailed = thinkingBuffer.trim()
     thinkingBuffer = ""
-    if (compact.length === 0) {
+    if (detailed.length === 0) {
       dropped++
       return
     }
-    const preview =
-      compact.length > MAX_THINKING_PREVIEW_CHARS
-        ? `${compact.slice(0, MAX_THINKING_PREVIEW_CHARS)}…`
-        : compact
-    const rendered = renderAssistantText(`💭 思考过程：\n${preview}`)
+    const rendered = renderAssistantText(`💭 思考过程：\n${detailed}`)
     if (rendered.length === 0) {
       dropped++
       return
@@ -629,13 +621,6 @@ function dropDuplicateThinkingParts(
   let dropped = 0
   for (const part of parts) {
     if (part.type !== "text" || !part.text.startsWith(THINKING_PREVIEW_PREFIX)) {
-      out.push(part)
-      continue
-    }
-    // Gateway live mode intentionally sends the same safe status placeholder on
-    // every turn instead of raw thinking text.  The historical thinking-preview
-    // deduper must not hide that status on the next user question.
-    if (part.text === LIVE_THINKING_STATUS_PART) {
       out.push(part)
       continue
     }

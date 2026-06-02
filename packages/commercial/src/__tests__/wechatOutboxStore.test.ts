@@ -227,12 +227,28 @@ describe("outboxStore.pickOne", () => {
     assert.equal(row.id, 100)
     assert.equal(row.status, "sending")
     assert.equal(row.lockedAt, 5000)
+    assert.equal(row.nextAttemptAt, null)
     // SQL contains the locking pattern
     const sql = captured[0]!.sql
     assert.match(sql, /FOR UPDATE SKIP LOCKED/)
     assert.match(sql, /status = 'queued'/)
-    assert.match(sql, /ORDER BY created_at ASC/)
+    assert.match(sql, /next_attempt_at IS NULL OR w\.next_attempt_at <= \$1/)
+    assert.match(sql, /NOT EXISTS/)
+    assert.match(sql, /IS NOT DISTINCT FROM/)
+    assert.match(sql, /older\.created_at < w\.created_at/)
+    assert.match(sql, /ORDER BY w\.created_at ASC, w\.id ASC/)
     assert.match(sql, /UPDATE wechat_outbox SET/)
+  })
+
+  test("head-of-line SQL is NULL-safe and only blocks within the same conversation", async () => {
+    const { pool, captured } = makeFakePool([{ rows: [], rowCount: 0 }])
+    await pickOne(pool, 5000)
+    const sql = captured[0]!.sql
+    assert.match(sql, /older\.binding_user_id IS NOT DISTINCT FROM w\.binding_user_id/)
+    assert.match(sql, /older\.sender_id\s+IS NOT DISTINCT FROM w\.sender_id/)
+    assert.match(sql, /older\.session_id\s+IS NOT DISTINCT FROM w\.session_id/)
+    assert.match(sql, /older\.status IN \('queued', 'sending'\)/)
+    assert.match(sql, /older\.id < w\.id/)
   })
 
   test("empty queue → returns null", async () => {
@@ -278,6 +294,7 @@ describe("outboxStore.markSent", () => {
     assert.equal(ok, true)
     const sql = captured[0]!.sql
     assert.match(sql, /SET[\s\S]+status\s*=\s*'sent'[\s\S]+sent_at\s*=\s*\$1/)
+    assert.match(sql, /next_attempt_at\s*=\s*NULL/)
     assert.match(sql, /WHERE id = \$2 AND status = 'sending'/)
   })
 
@@ -293,11 +310,13 @@ describe("outboxStore.markFailed", () => {
     const { pool, captured } = makeFakePool([
       { rows: [{ attempts: 1, status: "queued" }], rowCount: 1 },
     ])
-    const result = await markFailed(pool, 42, "transient err", 9999, 10)
+    const result = await markFailed(pool, 42, "transient err", 9999, 10, 14_999)
     assert.deepEqual(result, { permanent: false, attempts: 1 })
     const sql = captured[0]!.sql
     assert.match(sql, /attempts\s*=\s*attempts \+ 1/)
     assert.match(sql, /WHEN attempts \+ 1 >= \$1 THEN 'failed' ELSE 'queued'/)
+    assert.match(sql, /next_attempt_at\s*=\s*CASE WHEN attempts \+ 1 >= \$1 THEN NULL ELSE \$5 END/)
+    assert.equal(captured[0]!.params[4], 14_999)
   })
 
   test("attempts + 1 >= maxAttempts → permanent failed, returns permanent=true", async () => {

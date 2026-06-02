@@ -55,6 +55,7 @@ interface RawOutboxRow {
   last_error: string | null
   locked_at: number | string | null
   sent_at: number | string | null
+  next_attempt_at?: number | string | null
   created_at: number | string
   updated_at: number | string
 }
@@ -72,6 +73,7 @@ function rowToOutbox(r: RawOutboxRow): OutboxRow {
     lastError: r.last_error,
     lockedAt: r.locked_at === null ? null : Number(r.locked_at),
     sentAt: r.sent_at === null ? null : Number(r.sent_at),
+    nextAttemptAt: r.next_attempt_at == null ? null : Number(r.next_attempt_at),
     createdAt: Number(r.created_at),
     updatedAt: Number(r.updated_at),
   }
@@ -174,6 +176,7 @@ async function enqueueInTx(
         `UPDATE wechat_outbox
            SET status     = 'queued',
                locked_at  = NULL,
+               next_attempt_at = NULL,
                last_error = NULL,
                updated_at = $1
          WHERE id = $2`,
@@ -198,21 +201,34 @@ async function enqueueInTx(
 export async function pickOne(pool: Pool, now: number): Promise<OutboxRow | null> {
   const res = await pool.query<RawOutboxRow>(
     `WITH picked AS (
-       SELECT id FROM wechat_outbox
-       WHERE status = 'queued'
-       ORDER BY created_at ASC
+       SELECT w.id FROM wechat_outbox w
+       WHERE w.status = 'queued'
+         AND (w.next_attempt_at IS NULL OR w.next_attempt_at <= $1)
+         AND NOT EXISTS (
+           SELECT 1 FROM wechat_outbox older
+           WHERE older.status IN ('queued', 'sending')
+             AND older.binding_user_id IS NOT DISTINCT FROM w.binding_user_id
+             AND older.sender_id       IS NOT DISTINCT FROM w.sender_id
+             AND older.session_id      IS NOT DISTINCT FROM w.session_id
+             AND (
+               older.created_at < w.created_at
+               OR (older.created_at = w.created_at AND older.id < w.id)
+             )
+         )
+       ORDER BY w.created_at ASC, w.id ASC
        LIMIT 1
        FOR UPDATE SKIP LOCKED
      )
      UPDATE wechat_outbox SET
        status     = 'sending',
        locked_at  = $1,
+       next_attempt_at = NULL,
        updated_at = $1
      FROM picked
      WHERE wechat_outbox.id = picked.id
      RETURNING wechat_outbox.id, outbound_id, binding_user_id, sender_id, session_id,
                payload, status, attempts, last_error, locked_at, sent_at,
-               created_at, updated_at`,
+               next_attempt_at, created_at, updated_at`,
     [now],
   )
   if (res.rowCount === 0) return null
@@ -230,6 +246,7 @@ export async function markSent(pool: Pool, id: number, now: number): Promise<boo
        sent_at    = $1,
        last_error = NULL,
        locked_at  = NULL,
+       next_attempt_at = NULL,
        updated_at = $1
      WHERE id = $2 AND status = 'sending'`,
     [now, id],
@@ -258,6 +275,7 @@ export async function markFailed(
   errMessage: string,
   now: number,
   maxAttempts: number = DEFAULT_MAX_ATTEMPTS,
+  nextAttemptAt: number | null = null,
 ): Promise<MarkFailedResult | null> {
   const truncErr = errMessage.length > 1000 ? errMessage.slice(0, 1000) : errMessage
   const res = await pool.query<{ attempts: number; status: OutboxStatus }>(
@@ -266,10 +284,11 @@ export async function markFailed(
        status     = CASE WHEN attempts + 1 >= $1 THEN 'failed' ELSE 'queued' END,
        last_error = $2,
        locked_at  = NULL,
+       next_attempt_at = CASE WHEN attempts + 1 >= $1 THEN NULL ELSE $5 END,
        updated_at = $3
      WHERE id = $4 AND status = 'sending'
      RETURNING attempts, status`,
-    [maxAttempts, truncErr, now, id],
+    [maxAttempts, truncErr, now, id, nextAttemptAt],
   )
   if (res.rowCount === 0) return null
   const r = res.rows[0]!
@@ -290,6 +309,7 @@ export async function releaseStaleSending(
     `UPDATE wechat_outbox SET
        status     = 'queued',
        locked_at  = NULL,
+       next_attempt_at = NULL,
        updated_at = $1
      WHERE status = 'sending' AND locked_at IS NOT NULL AND locked_at < $2`,
     [now, cutoff],
@@ -316,6 +336,7 @@ export async function dropAgedPending(
        attempts   = $1,
        last_error = 'dropped: age cutoff exceeded',
        locked_at  = NULL,
+       next_attempt_at = NULL,
        updated_at = $2
      WHERE status IN ('queued', 'sending') AND created_at < $3`,
     [maxAttempts, now, cutoff],
