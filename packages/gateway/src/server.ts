@@ -80,6 +80,7 @@ import {
   outboundRingSizeBytes,
 } from './metrics.js'
 import { RateLimiter } from './rateLimit.js'
+import { matchBridgeApiAllowlist } from './bridgeApiAllowlist.js'
 import { handleOpenAIRequest } from './openaiCompat.js'
 import { DEFAULT_RING_CONFIG, OutboundRingBuffer, type EvictionStats } from './outboundRing.js'
 import { Router } from './router.js'
@@ -2540,12 +2541,12 @@ export class Gateway {
 
   /**
    * v3 file proxy: check whether this HTTP request is a valid HOST→container
-   * bridge call for /api/file or /api/media/*. When true, the normal
+   * bridge call for the explicit v3 bridge API allowlist. When true, the normal
    * checkHttpAuth() requirement is bypassed.
    *
    * All four conditions MUST hold:
    *  1. remote IP === OPENCLAUDE_TRUST_BRIDGE_IP (host in docker bridge)
-   *  2. method ∈ {GET, HEAD} AND path ∈ {/api/file, /api/media/*}
+   *  2. method + path match `BRIDGE_API_ALLOWLIST`
    *  3. X-OpenClaude-Container-Id === env.OC_CONTAINER_ID (binding)
    *  4. timingSafeEqual(X-OpenClaude-Bridge-Nonce, env.OC_BRIDGE_NONCE)
    *
@@ -2566,9 +2567,8 @@ export class Gateway {
     const remoteIp = req.socket.remoteAddress || ''
     if (remoteIp !== TRUST_BRIDGE_IP && remoteIp !== `::ffff:${TRUST_BRIDGE_IP}`) return false
     const m = req.method || ''
-    if (m !== 'GET' && m !== 'HEAD') return false
     const p = url.pathname
-    if (p !== '/api/file' && !p.startsWith('/api/media/')) return false
+    if (!matchBridgeApiAllowlist(p, m)) return false
     const hdrId = String(req.headers['x-openclaude-container-id'] ?? '').trim()
     if (hdrId !== OC_CONTAINER_ID) return false
     const hdrNonce = String(req.headers['x-openclaude-bridge-nonce'] ?? '').trim()

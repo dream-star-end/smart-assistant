@@ -1437,17 +1437,9 @@ const ICON_SVG = {
 let paletteItems = []
 let paletteSelected = 0
 
-// V3 商用版多租户安全 PR2:这批 palette action 命中 PR1 firewall 的 host-scope
-// 端点,非 admin commercial user 点了只会看到 403。跟 settings-dropdown 同一张
-// 用户体验策略 —— admin 可见,其他人隐藏。isHostAgentAdmin() 默认返 false,
-// refreshBalance 拉到 user.role==='admin' 时置 true。注意:这只是 UX 过滤,
-// 服务端 PR1 仍是真正的安全边界。
-const HOST_SCOPED_PALETTE_IDS = new Set([
-  'open-memory',
-  'open-skills',
-  'open-tasks',
-  'manage-agents',
-])
+// P0/P1 后 Memory/Skills/Tasks 已经安全代理进当前用户容器;完整 Agents 管理
+// 仍然依赖 host-scope collection/create 端点,继续只给 admin 显示。
+const HOST_SCOPED_PALETTE_IDS = new Set(['manage-agents'])
 
 function buildPaletteItems(query) {
   const q = query.trim().toLowerCase()
@@ -3087,10 +3079,6 @@ async function init() {
       createNewChat()
     } else if (key === 'm') {
       e.preventDefault()
-      // PR2: Ctrl/Cmd+M → Memory modal 同样命中 PR1 firewall 会 403 的 host-scope
-      // /api/agents/:id/memory/*,非 admin 直接吞按键不弹 modal(同 palette / slash
-      // / settings 一张表)。
-      if (!isHostAgentAdmin()) return
       openMemoryModal()
     } else if (key === 'b') {
       e.preventDefault()

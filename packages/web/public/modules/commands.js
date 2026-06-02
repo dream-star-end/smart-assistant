@@ -16,12 +16,10 @@ import {
   safeWsSend,
 } from './websocket.js?v=dd5ce5c8'
 
-// V3 商用版多租户安全 PR2:这批 slash 命令打开的是 host-scope 单例端点
-// (/api/agents/:id/memory/*、/api/agents/:id/skills、/api/agents/:id、
-// /api/cron、/api/tasks),PR1 防火墙对非 admin commercial user 403。
-// 非 admin 时拒绝 —— admin 绕防火墙能正常用。服务端 PR1 仍是安全边界,
-// 这里只是避免用户看到 403 困惑。
-const HOST_SCOPED_SLASH_CMDS = new Set(['/memory', '/skills', '/persona', '/tasks'])
+// v3 P0/P1: /memory /skills /persona /tasks are now commercial-safe for normal
+// users because the master gateway proxies those APIs into the caller's own
+// isolated container. Keep only truly host-scope debug commands hidden.
+const HOST_SCOPED_SLASH_CMDS = new Set(['/config'])
 
 // ── Late-binding for circular deps ──
 let _deps = {}
@@ -50,9 +48,7 @@ const slashCommands = [
     cmd: '/help',
     desc: '显示所有可用命令',
     run() {
-      // PR2: 同样过滤 host-scope 命令,避免非 admin 从 /help 里看到
-      // /memory /skills /persona /tasks —— palette/autocomplete 都已隐藏,
-      // 这里漏过就前后不一致。
+      // 过滤仍然 host-scope 的调试命令,避免非 admin 从 /help 里看到。
       const hostAdmin = isHostAgentAdmin()
       const lines = ['**可用命令:**', '']
       for (const c of slashCommands) {
@@ -165,6 +161,24 @@ const slashCommands = [
     },
   },
   {
+    cmd: '/hub',
+    desc: '打开 P0/P1 能力导航',
+    run() {
+      addSystemMessage([
+        '**OpenClaude P0/P1 能力已接入当前账号容器:**',
+        '',
+        '- `Tool Gateway`：搜索、浏览器、图片/TTS、文献等托管工具走平台模型/工具路由；直接在聊天里要求使用对应工具即可。',
+        '- `Skill Hub`：输入 `/skills` 管理当前容器技能；复杂任务后可沉淀自定义 skill。',
+        '- `Scheduled Automation`：输入 `/tasks` 创建/查看定时任务，结果会回到当前渠道。',
+        '- `Memory`：输入 `/memory` 管理 USER/MEMORY；现在读写的是你的独立容器。',
+        '- `MCP Connectors`：在聊天里说明要连接 GitHub/Notion/飞书/数据库，我会引导配置或生成安装命令。',
+        '- `Goal Mode`：发送“持续执行直到……并验证……”这类目标，我会按可验证标准循环推进；需要暂停时用 `/stop`。',
+        '',
+        '快捷入口：`/memory` · `/skills` · `/tasks` · `/persona`',
+      ].join('\n'))
+    },
+  },
+  {
     cmd: '/theme',
     desc: '切换主题',
     run() {
@@ -216,8 +230,7 @@ export function showSlashPopup(filter) {
     document.querySelector('.composer').appendChild(popup)
   }
   const q = filter.toLowerCase().slice(1) // remove leading /
-  // PR2: host-scope 命令(/memory /skills /persona /tasks)在非 admin 商用账号
-  // 隐藏,跟 handleSlashCommand 拦截同一套策略,避免 autocomplete 诱导用户输入。
+  // host-scope 调试命令在非 admin 商用账号隐藏,跟 handleSlashCommand 拦截同一套策略。
   const hostAdmin = isHostAgentAdmin()
   _slashMatches = slashCommands.filter((c) => {
     if (HOST_SCOPED_SLASH_CMDS.has(c.cmd) && !hostAdmin) return false
@@ -266,6 +279,7 @@ export function selectSlashItem(c) {
     '/skills',
     '/persona',
     '/tasks',
+    '/hub',
     '/theme',
     '/config',
   ]

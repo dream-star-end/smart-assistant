@@ -1235,16 +1235,12 @@
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
           </button>
           <div id="settings-dropdown" class="settings-dropdown" hidden>
-            <!-- V3 商用版 P0 多租户安全:Agent/学习 两段入口都命中 host-scope singleton 端点
-                 (/api/agents/*、/api/agents/:id/memory/*、/api/agents/:id/skills、/api/cron、/api/tasks),
-                 PR1 防火墙对非 admin 的 commercial user 一律 403。前端顺势隐藏入口,避免
-                 用户点进去看到空白/错误。两段包裹 <div id="settings-section-*">,默认 hidden,
-                 refreshBalance() 收到 user.role==='admin' 时运维放行(admin DB double-check 后 fall
-                 through 给 gateway 自己 handler)。 -->
+            <!-- V3 P0/P1:Persona/Memory/Skills/Tasks 通过 master 安全代理到当前
+                 用户自己的容器,登录后显示;完整 Agents 管理仍是 host/admin-only。 -->
             <div id="settings-section-agent" hidden>
               <div class="settings-section-label">Agent</div>
               <button class="settings-item" data-settings="persona"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>人格编辑</button>
-              <button class="settings-item" data-settings="agents"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>管理 Agents</button>
+              <button id="settings-manage-agents-entry" class="settings-item" data-settings="agents" hidden><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>管理 Agents</button>
             </div>
             <div id="settings-section-learning" hidden>
               <div class="settings-section-label">学习</div>

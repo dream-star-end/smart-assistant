@@ -54,6 +54,7 @@ import {
   type RequestContext,
 } from './handlers.js'
 import { containerFileProxy } from './containerFileProxy.js'
+import { containerApiProxy, matchContainerApiProxyRoute } from './containerApiProxy.js'
 import { ContainerUnreadyError } from '../ws/userChatBridge.js'
 import { getBearerToken, getSessionCookieToken } from './authHelpers.js'
 import { defaultTunnelFetchHealthz } from './tunnelHealthzProbe.js'
@@ -825,6 +826,12 @@ export function createCommercialHandler(
     '/api/admin/',
     // 匹配 exact `/api/remote-hosts` 与 prefix `/api/remote-hosts/`
     '/api/remote-hosts',
+    // P0/P1:commercial user 的 memory/skills/tasks/agent 管理 API 由 master
+    // 安全代理到用户自己的容器,维护期应统一 503。
+    '/api/agents',
+    '/api/cron',
+    '/api/tasks',
+    '/api/tasks-executions',
     // P1-2 (2026-04-25):commercial 接管 /api/feedback POST,阻止 fall through
     // 到 gateway/server.ts:1325 的文件落盘 handler
     '/api/feedback',
@@ -961,6 +968,92 @@ export function createCommercialHandler(
       }
       incrGatewayRequest('__cc_external__', method, res.statusCode)
       return true
+    }
+
+    // ── P0/P1 v3 user-container API proxy ──────────────────────────────
+    // Host-scope personal-version APIs (/api/agents, /api/cron, /api/tasks)
+    // are dangerous on the master singleton, but are safe and useful when
+    // executed inside the caller's own isolated container. Normal users hit
+    // this proxy; admins deliberately fall through to the existing host/admin
+    // bypass path for operational debugging.
+    if (deps.v3Supervisor && deps.bridgeSecret && matchContainerApiProxyRoute(path, method)) {
+      setSecurityHeaders(res)
+      const requestId = ensureRequestId(req)
+      res.setHeader(REQUEST_ID_HEADER, requestId)
+      const apiProxyLog = (options.logger ?? rootLogger.child({ subsys: 'commercial' })).child({
+        requestId,
+        route: '__container_api_proxy__',
+        method,
+        path,
+        clientIp: clientIpOf(req),
+      })
+      const token = extractTokenFromReq(req)
+      const claims = token ? verifyCommercialJwtSync(token, deps.jwtSecret) : null
+      if (!claims) {
+        // Let BLOCKED_FOR_USER_RULES / gateway auth produce the canonical 401.
+      } else if (claims.role === 'admin') {
+        // Admin keeps host-level debugging semantics; do not silently proxy.
+      } else {
+        const verified = await requireUserVerifyDb(claims.sub, deps.v3Supervisor.pool)
+        if (!verified) {
+          apiProxyLog.warn('container_api_proxy_user_inactive', { sub: claims.sub })
+          sendError(res, 403, 'FORBIDDEN', 'user account not active', requestId)
+          incrGatewayRequest('__container_api_proxy__', method, res.statusCode)
+          return true
+        }
+        if (deps.ensureContainerReady) {
+          try {
+            await deps.ensureContainerReady(BigInt(claims.sub))
+          } catch (err) {
+            if (err instanceof ContainerUnreadyError) {
+              sendError(
+                res,
+                503,
+                'CONTAINER_UNREADY',
+                `container not ready: ${err.reason}`,
+                requestId,
+                undefined,
+                { 'Retry-After': err.retryAfterSec },
+              )
+              incrGatewayRequest('__container_api_proxy__', method, res.statusCode)
+              return true
+            }
+            handleError(err, res, requestId, apiProxyLog)
+            incrGatewayRequest('__container_api_proxy__', method, res.statusCode)
+            return true
+          }
+        }
+        const ctx: RequestContext = {
+          requestId,
+          clientIp: clientIpOf(req),
+          authBoundIp: req.socket.remoteAddress ?? 'unknown',
+          userAgent: userAgentOf(req),
+          log: apiProxyLog,
+        }
+        const startedAt = Date.now()
+        try {
+          const selfHostIdForProxy = deps.v3Supervisor.selfHostId
+          await containerApiProxy(
+            req,
+            res,
+            ctx,
+            {
+              v3: deps.v3Supervisor,
+              bridgeSecret: deps.bridgeSecret,
+              selfHostId: selfHostIdForProxy,
+              getHostById: computePoolGetHostById,
+              tunnelDial: defaultTunnelDial,
+            },
+            BigInt(claims.sub),
+          )
+        } catch (err) {
+          handleError(err, res, requestId, apiProxyLog)
+        }
+        incrGatewayRequest('__container_api_proxy__', method, res.statusCode)
+        apiProxyLog.info('http_request', { status: res.statusCode, durationMs: Date.now() - startedAt })
+        return true
+      }
+      // fall through to BLOCKED_FOR_USER_RULES for admin/no-token cases
     }
 
     // ── v3 file proxy PROXY 路径(Stage 4 feature flag ON 时启用)──
