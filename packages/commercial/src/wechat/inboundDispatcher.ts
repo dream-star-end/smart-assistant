@@ -575,6 +575,12 @@ export function makeInboundDispatcher(deps: InboundDispatcherDeps): InboundDispa
         }
       }
 
+      if (!step1Accepted.accepted) {
+        reqLog.info("step1_terminal_before_runner_start", { sessionId })
+        await failPreparedCodexTurn("wechat_container_terminal_before_start")
+        return { kind: "dispatched", sessionId, newSession, started: false }
+      }
+
       // ── 4) Step 2a: master sqlite client_sessions 写(仅 newSession) ──
       if (shouldUpsertMasterSession) {
         try {
@@ -1103,9 +1109,10 @@ function parseRetryAfterSec(response: {
 function parseStep1Accepted(
   bodyText: string,
   fallbackRunId: string,
-): { started: boolean; runId: string; sessionId?: WechatSessionId; agentId?: string } {
+): { accepted: boolean; started: boolean; runId: string; sessionId?: WechatSessionId; agentId?: string } {
   try {
     const parsed = JSON.parse(bodyText) as {
+      accepted?: unknown
       started?: unknown
       traceId?: unknown
       sessionId?: unknown
@@ -1134,13 +1141,14 @@ function parseStep1Accepted(
       if (match?.[2] && isWechatSessionId(match[2]) && !sessionId) sessionId = match[2]
     }
     return {
+      accepted: parsed.accepted !== false,
       started: parsed.started !== false,
       runId: traceId,
       ...(sessionId ? { sessionId } : {}),
       ...(agentId ? { agentId } : {}),
     }
   } catch {
-    return { started: true, runId: fallbackRunId }
+    return { accepted: true, started: true, runId: fallbackRunId }
   }
 }
 

@@ -506,6 +506,7 @@ export interface GatewayDeps {
 }
 
 type WechatStartOutcome = {
+  accepted?: boolean
   started: boolean
   traceId?: string
   sessionKey?: string
@@ -2961,8 +2962,7 @@ export class Gateway {
     const dispatchPromise = this.dispatchInbound(frame as InboundFrame, v3OutboundAdapter)
       .then(() => {
         if (!startSettled) {
-          startSettled = true
-          rejectStart(new Error('dispatch completed before WeChat runner start'))
+          settleStart({ accepted: false, started: false })
         }
       })
       .catch((err) => {
@@ -2992,7 +2992,7 @@ export class Gateway {
 
     this.sendJson(res, 200, {
       ok: true,
-      accepted: true,
+      accepted: startOutcome.accepted !== false,
       started: startOutcome.started,
       sessionKey: startOutcome.sessionKey ?? sessionKey,
       sessionId:

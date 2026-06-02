@@ -278,7 +278,7 @@ test('duplicate WeChat Step1 ACK returns the cached routed wsess', () => {
   )
 })
 
-test('pre-start dispatch exits reject Step1 instead of creating started:false ghost sessions', () => {
+test('pre-start terminal dispatch exits are ACKed as unaccepted, not ghost sessions', () => {
   assert.doesNotMatch(
     handleWechatInbound,
     /\.then\(\(\)\s*=>\s*settleStart\(\{\s*started:\s*false\s*\}\)\s*\)/,
@@ -286,8 +286,13 @@ test('pre-start dispatch exits reject Step1 instead of creating started:false gh
   )
   assert.match(
     handleWechatInbound,
-    /dispatch completed before WeChat runner start/,
-    'if dispatchInbound returns before the start callback, Step1 must fail so master does not persist a ghost realtime link',
+    /settleStart\(\{\s*accepted:\s*false,\s*started:\s*false\s*\}\)/,
+    'if dispatchInbound returns before the start callback, Step1 should be 200 accepted:false: terminal already reached WeChat, but master must not persist it as a real runner',
+  )
+  assert.match(
+    handleWechatInbound,
+    /accepted:\s*startOutcome\.accepted\s*!==\s*false/,
+    'Step1 response must surface accepted:false to master so it can skip client_sessions/pointer upserts',
   )
 })
 
