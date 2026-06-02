@@ -1019,7 +1019,7 @@ describe("inboundDispatcher — Step 1 failure", () => {
 describe("inboundDispatcher — Step 2a master sqlite failure", () => {
   test("upsert throws → compensation called → step2_failed compensation=ok", async () => {
     const { transport, spy: tSpy } = makeTransport([
-      { status: 200, bodyText: "{}" }, // step1
+      { status: 200, bodyText: '{"ok":true,"started":true,"traceId":"step2a-run"}' }, // step1
       { status: 200, bodyText: '{"ok":true}' }, // compensation
     ])
     const storage = makeStorageSpies({ upsertThrows: new Error("disk full") })
@@ -1043,6 +1043,10 @@ describe("inboundDispatcher — Step 2a master sqlite failure", () => {
     assert.equal(tSpy.posts[1]!.path, WECHAT_INBOUND_COMPENSATE_PATH)
     // pg pointer NOT written (failed before Step 2b)
     assert.equal(pg.spy.setCalls.length, 0)
+    assert.deepEqual(pg.spy.runningSetCalls.map((c) => ({
+      sessionId: c.sessionId,
+      runId: c.runId,
+    })), [{ sessionId: FIXED_SESSION_ID, runId: "step2a-run" }])
     // softDelete NOT called (Step 2a 失败时还没 upsert 成功,无需撤)
     assert.equal(storage.spy.softDeleteCalls.length, 0)
   })
@@ -1107,7 +1111,7 @@ describe("inboundDispatcher — Step 2a master sqlite failure", () => {
 describe("inboundDispatcher — Step 2b PG pointer failure", () => {
   test("newSession: pointer write throws → compensation + softDelete called → step2_failed pg_pointer compensation=ok", async () => {
     const { transport, spy: tSpy } = makeTransport([
-      { status: 200, bodyText: "{}" }, // step1
+      { status: 200, bodyText: '{"ok":true,"started":true,"traceId":"step2b-run"}' }, // step1
       { status: 200, bodyText: '{"ok":true}' }, // compensation
     ])
     const storage = makeStorageSpies()
@@ -1128,6 +1132,10 @@ describe("inboundDispatcher — Step 2b PG pointer failure", () => {
     }
     assert.equal(tSpy.posts.length, 2)
     assert.equal(tSpy.posts[1]!.path, WECHAT_INBOUND_COMPENSATE_PATH)
+    assert.deepEqual(pg.spy.runningSetCalls.map((c) => ({
+      sessionId: c.sessionId,
+      runId: c.runId,
+    })), [{ sessionId: FIXED_SESSION_ID, runId: "step2b-run" }])
     // softDelete 调用了
     assert.equal(storage.spy.softDeleteCalls.length, 1)
     assert.equal(storage.spy.softDeleteCalls[0]!.sessionId, FIXED_SESSION_ID)
@@ -1136,7 +1144,7 @@ describe("inboundDispatcher — Step 2b PG pointer failure", () => {
 
   test("reuseSession: pointer write throws → SKIP compensation, SKIP softDelete → compensation=skipped_reuse", async () => {
     const { transport, spy: tSpy } = makeTransport([
-      { status: 200, bodyText: "{}" }, // step1 only
+      { status: 200, bodyText: '{"ok":true,"started":true,"traceId":"reuse-pg-fail-run"}' }, // step1 only
       { throw: new Error("should not call compensation on reuse path") }, // safety
     ])
     const storage = makeStorageSpies()
@@ -1161,11 +1169,15 @@ describe("inboundDispatcher — Step 2b PG pointer failure", () => {
     // 只有 step1 这一次 POST,无 compensation
     assert.equal(tSpy.posts.length, 1)
     assert.equal(storage.spy.softDeleteCalls.length, 0)
+    assert.deepEqual(pg.spy.runningSetCalls.map((c) => ({
+      sessionId: c.sessionId,
+      runId: c.runId,
+    })), [{ sessionId: "wsess-aaaaaaaaaaaaaaaa", runId: "reuse-pg-fail-run" }])
   })
 
   test("newSession Step 2b fail + softDelete also throws → outcome 仍然是 step2_failed compensation=ok", async () => {
     const { transport } = makeTransport([
-      { status: 200, bodyText: "{}" },
+      { status: 200, bodyText: '{"ok":true,"started":true,"traceId":"soft-delete-fail-run"}' },
       { status: 200, bodyText: '{"ok":true}' },
     ])
     const storage = makeStorageSpies({ softDeleteThrows: new Error("sqlite locked") })
@@ -1184,6 +1196,10 @@ describe("inboundDispatcher — Step 2b PG pointer failure", () => {
       // compensation 字段反映容器侧补偿状况(ok),master softDelete 失败仅 log,不改 outcome
       assert.equal(r.compensation, "ok")
     }
+    assert.deepEqual(pg.spy.runningSetCalls.map((c) => ({
+      sessionId: c.sessionId,
+      runId: c.runId,
+    })), [{ sessionId: FIXED_SESSION_ID, runId: "soft-delete-fail-run" }])
   })
 })
 

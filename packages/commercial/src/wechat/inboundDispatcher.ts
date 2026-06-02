@@ -580,6 +580,29 @@ export function makeInboundDispatcher(deps: InboundDispatcherDeps): InboundDispa
         return { kind: "dispatched", sessionId, newSession, started: false }
       }
 
+      if (step1Accepted.started !== false && step1Accepted.completed !== true) {
+        if (step1Accepted.runId) {
+          try {
+            await markRunningSession(
+              deps.pgPool,
+              evt.bindingUserId,
+              sessionId,
+              step1Accepted.runId,
+              routedAgentId,
+              dispatchNow,
+            )
+          } catch (err) {
+            reqLog.error("mark_running_session_failed", {
+              sessionId,
+              runId: step1Accepted.runId,
+              errMessage: (err as Error)?.message ?? String(err),
+            })
+          }
+        } else {
+          reqLog.warn("step1_started_without_trace_id_skip_running_session", { sessionId })
+        }
+      }
+
       // ── 4) Step 2a: master sqlite client_sessions 写(仅 newSession) ──
       if (shouldUpsertMasterSession) {
         try {
@@ -683,29 +706,6 @@ export function makeInboundDispatcher(deps: InboundDispatcherDeps): InboundDispa
           sessionId,
           currentSessionId: current,
         })
-      }
-
-      if (step1Accepted.started !== false && step1Accepted.completed !== true) {
-        if (step1Accepted.runId) {
-          try {
-            await markRunningSession(
-              deps.pgPool,
-              evt.bindingUserId,
-              sessionId,
-              step1Accepted.runId,
-              routedAgentId,
-              dispatchNow,
-            )
-          } catch (err) {
-            reqLog.error("mark_running_session_failed", {
-              sessionId,
-              runId: step1Accepted.runId,
-              errMessage: (err as Error)?.message ?? String(err),
-            })
-          }
-        } else {
-          reqLog.warn("step1_started_without_trace_id_skip_running_session", { sessionId })
-        }
       }
 
       reqLog.info("dispatched", { sessionId, newSession, started: step1Accepted.started, completed: step1Accepted.completed })

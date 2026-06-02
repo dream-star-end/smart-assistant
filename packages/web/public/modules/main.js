@@ -437,6 +437,12 @@ function _applyBootRequestedSessionIfPresent() {
 }
 
 function _selectSessionAfterServerSync() {
+  const requestedPresent = !!_bootRequestedSessionId && state.sessions.has(_bootRequestedSessionId)
+  if (requestedPresent) {
+    const currentChanged = _applyBootRequestedSessionIfPresent()
+    const updated = [...state.sessions.values()].sort((a, b) => b.lastAt - a.lastAt)
+    return { currentChanged, updated }
+  }
   const current = state.currentSessionId ? state.sessions.get(state.currentSessionId) : null
   const currentIsBootPlaceholder = _isEmptyBootPlaceholder(current)
   if (currentIsBootPlaceholder) {
