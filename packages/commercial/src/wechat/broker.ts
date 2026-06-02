@@ -519,6 +519,8 @@ export function makeWechatBroker(deps: BrokerDeps): WechatBroker {
       outcome.completed !== true
     ) {
       fireAndForgetReflection(evt, buildWechatRealtimeStartReply(outcome.sessionId), "processing")
+    } else if (outcome.kind === "dispatched") {
+      fireAndForgetReflection(evt, buildWechatTerminalDispatchReply(outcome), "command_echo")
     } else if (outcome.kind !== "dispatched") {
       fireAndForgetReflection(evt, buildWechatDispatchFailureReply(outcome), "command_echo")
     }
@@ -618,6 +620,24 @@ export function makeWechatBroker(deps: BrokerDeps): WechatBroker {
       case "dispatched":
         return "消息暂时无法处理，请稍后重试。"
     }
+  }
+
+  function buildWechatTerminalDispatchReply(
+    outcome: Extract<DispatchOutcome, { kind: "dispatched" }>,
+  ): string {
+    const link = buildWechatRealtimeSessionLink(outcome.sessionId)
+    if (outcome.completed === true) {
+      return [
+        "这条任务已经处理完成。",
+        `如微信里没看到最终结果，请打开实时过程查看：${link}`,
+        "如需开始新任务，请直接发送新的指令。",
+      ].join("\n")
+    }
+    return [
+      "这条消息没有启动新的运行任务。",
+      `可打开实时过程查看状态：${link}`,
+      "如需重新执行，请再发送一条具体指令。",
+    ].join("\n")
   }
 
   async function handleNewCommand(

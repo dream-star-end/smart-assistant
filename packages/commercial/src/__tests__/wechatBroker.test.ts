@@ -697,7 +697,11 @@ describe("wechatBroker — onInbound", () => {
     const r = await broker.onInbound(makeEvent({ text: "会触发快速失败" }))
     assert.equal(r.kind, "dispatched")
     await flushMicrotasks()
-    assert.equal(sendSpy.calls.length, 0)
+    assert.equal(sendSpy.calls.length, 1)
+    assert.doesNotMatch(sendSpy.calls[0]!.text, /已开始执行/)
+    assert.doesNotMatch(sendSpy.calls[0]!.text, /中断任务/)
+    assert.match(sendSpy.calls[0]!.text, /没有启动新的运行任务/)
+    assert.match(sendSpy.calls[0]!.text, /session=wsess-/)
   })
 
   test("dispatcher completed=true outcome does not send a stale realtime process link", async () => {
@@ -713,7 +717,11 @@ describe("wechatBroker — onInbound", () => {
     const r = await broker.onInbound(makeEvent({ text: "快速完成但 Step1 ACK 丢失后重试" }))
     assert.equal(r.kind, "dispatched")
     await flushMicrotasks()
-    assert.equal(sendSpy.calls.length, 0)
+    assert.equal(sendSpy.calls.length, 1)
+    assert.doesNotMatch(sendSpy.calls[0]!.text, /已开始执行/)
+    assert.doesNotMatch(sendSpy.calls[0]!.text, /中断任务/)
+    assert.match(sendSpy.calls[0]!.text, /已经处理完成/)
+    assert.match(sendSpy.calls[0]!.text, /session=wsess-/)
   })
 
   test("dispatcher pre-dispatch failure sends visible retry hint instead of going silent", async () => {

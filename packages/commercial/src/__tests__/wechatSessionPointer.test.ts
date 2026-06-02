@@ -14,6 +14,7 @@ import {
   listOrphanWechatSessions,
   setCurrentSessionId,
   getCurrentSessionPointer,
+  markRunningSession,
   listRunningSessions,
   RECONCILE_GRACE_MS_DEFAULT,
   type PgConn,
@@ -245,6 +246,31 @@ describe("wechat sessionPointer.listRunningSessions (SQL guard)", () => {
     assert.equal(captured.length, 1)
     assert.match(captured[0]!.sql, /\bLIMIT\s+\$2\b/i)
     assert.deepEqual(captured[0]!.params, ["u1", 3])
+  })
+})
+
+describe("wechat sessionPointer.markRunningSession", () => {
+  test("creates running-session table on demand before retrying insert", async () => {
+    const captured: { sql: string; params: ReadonlyArray<unknown> }[] = []
+    const conn: PgConn = {
+      query: async (sql: string, params: ReadonlyArray<unknown> = []) => {
+        captured.push({ sql, params })
+        if (/INSERT INTO wechat_running_sessions/i.test(sql) && captured.length === 1) {
+          const err = new Error('relation "wechat_running_sessions" does not exist') as Error & { code: string }
+          err.code = "42P01"
+          throw err
+        }
+        return { rows: [], rowCount: 1 }
+      },
+    }
+
+    await markRunningSession(conn, "u1", "wsess-0123456789abcdef", "run-1", "main", 1000)
+
+    assert.match(captured[0]!.sql, /INSERT INTO wechat_running_sessions/i)
+    assert.match(captured[1]!.sql, /CREATE TABLE IF NOT EXISTS wechat_running_sessions/i)
+    assert.match(captured[2]!.sql, /CREATE INDEX IF NOT EXISTS idx_wrs_binding_started/i)
+    assert.match(captured[3]!.sql, /INSERT INTO wechat_running_sessions/i)
+    assert.deepEqual(captured[3]!.params, ["u1", "wsess-0123456789abcdef", "run-1", "main", 1000])
   })
 })
 

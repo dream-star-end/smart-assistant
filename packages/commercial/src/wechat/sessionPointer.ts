@@ -44,6 +44,25 @@ export interface WechatSessionPointer {
   agentId?: string
 }
 
+const CREATE_RUNNING_SESSIONS_TABLE_SQL = `CREATE TABLE IF NOT EXISTS wechat_running_sessions (
+  binding_user_id TEXT   NOT NULL,
+  session_id      TEXT   NOT NULL,
+  run_id          TEXT   NOT NULL,
+  agent_id        TEXT,
+  started_at      BIGINT NOT NULL,
+  updated_at      BIGINT NOT NULL,
+  PRIMARY KEY (binding_user_id, session_id, run_id),
+  CONSTRAINT wrs_binding_user_id_chk CHECK (length(binding_user_id) BETWEEN 1 AND 64),
+  CONSTRAINT wrs_session_id_chk      CHECK (length(session_id) BETWEEN 8 AND 80),
+  CONSTRAINT wrs_run_id_chk          CHECK (length(run_id) BETWEEN 1 AND 128),
+  CONSTRAINT wrs_agent_id_chk        CHECK (agent_id IS NULL OR length(agent_id) BETWEEN 1 AND 128),
+  CONSTRAINT wrs_started_at_chk      CHECK (started_at > 0),
+  CONSTRAINT wrs_updated_at_chk      CHECK (updated_at > 0)
+)`
+
+const CREATE_RUNNING_SESSIONS_INDEX_SQL =
+  "CREATE INDEX IF NOT EXISTS idx_wrs_binding_started ON wechat_running_sessions(binding_user_id, started_at DESC)"
+
 /**
  * 生成新的 wsess sessionId。rand 默认 16 hex(8 字节 randomBytes)。
  *
@@ -195,7 +214,30 @@ export async function markRunningSession(
   agentId: string | undefined,
   now: number,
 ): Promise<void> {
-  await (conn as PgRunner).query(
+  const runner = conn as PgRunner
+  try {
+    await insertRunningSession(runner, bindingUserId, sessionId, runId, agentId, now)
+  } catch (err) {
+    if (!isMissingWechatRunningSessionsTable(err)) throw err
+    // Deploy script normally applies 0079 before restart, but during staged or
+    // manually recovered rollouts an app process can briefly see old schema.
+    // Create the idempotent table shape and retry so `/stop` remains able to
+    // target older long-running tasks even before the migration runner catches
+    // up. 0079 is still authoritative and will no-op later.
+    await ensureRunningSessionsTable(runner)
+    await insertRunningSession(runner, bindingUserId, sessionId, runId, agentId, now)
+  }
+}
+
+async function insertRunningSession(
+  conn: PgRunner,
+  bindingUserId: BindingId,
+  sessionId: WechatSessionId,
+  runId: string,
+  agentId: string | undefined,
+  now: number,
+): Promise<void> {
+  await conn.query(
     `INSERT INTO wechat_running_sessions (binding_user_id, session_id, run_id, agent_id, started_at, updated_at)
      VALUES ($1, $2, $3, $4, $5, $5)
      ON CONFLICT (binding_user_id, session_id, run_id) DO UPDATE SET
@@ -203,6 +245,18 @@ export async function markRunningSession(
        updated_at = EXCLUDED.updated_at`,
     [bindingUserId, sessionId, runId, agentId ?? null, now],
   )
+}
+
+async function ensureRunningSessionsTable(conn: PgRunner): Promise<void> {
+  await conn.query(CREATE_RUNNING_SESSIONS_TABLE_SQL)
+  await conn.query(CREATE_RUNNING_SESSIONS_INDEX_SQL)
+}
+
+function isMissingWechatRunningSessionsTable(err: unknown): boolean {
+  const e = err as { code?: unknown; message?: unknown }
+  if (e?.code !== "42P01") return false
+  const msg = typeof e.message === "string" ? e.message : ""
+  return msg.includes("wechat_running_sessions")
 }
 
 export async function listRunningSessions(
