@@ -53,9 +53,17 @@ describe("classifyIlinkBusinessAck", () => {
     assert.equal(r.reasonField, "status")
   })
 
-  it("does not treat broad code/ret values as failure unless paired with failing status", () => {
+  it("classifies non-zero ret as transient failure", () => {
+    const r = classifyIlinkBusinessAck({ ret: -2 })
+    assert.equal(r.ok, false)
+    assert.equal(r.permanent, false)
+    assert.match(r.errMessage ?? "", /ret=-2/)
+    assert.equal(r.reasonField, "ret")
+    assert.equal(r.reasonValue, -2)
+  })
+
+  it("does not treat broad code values as failure unless paired with failing status", () => {
     assert.deepEqual(classifyIlinkBusinessAck({ code: 200, message: "OK" }), { ok: true })
-    assert.deepEqual(classifyIlinkBusinessAck({ ret: 1, message: "queued" }), { ok: true })
 
     const r = classifyIlinkBusinessAck({ code: 123, status: "error", message: "business rejected" })
     assert.equal(r.ok, false)
@@ -63,12 +71,12 @@ describe("classifyIlinkBusinessAck", () => {
     assert.equal(r.errMessage, "business rejected")
   })
 
-  it("classifies broad code/ret fields when paired with strong error message fields", () => {
-    const r = classifyIlinkBusinessAck({ ret: "2", errmsg: "send limit reached" })
+  it("classifies broad code fields when paired with strong error message fields", () => {
+    const r = classifyIlinkBusinessAck({ code: "2", errmsg: "send limit reached" })
     assert.equal(r.ok, false)
     assert.equal(r.permanent, false)
     assert.equal(r.errMessage, "send limit reached")
-    assert.equal(r.reasonField, "ret")
+    assert.equal(r.reasonField, "code")
   })
 })
 

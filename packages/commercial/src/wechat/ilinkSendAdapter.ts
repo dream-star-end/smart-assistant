@@ -34,8 +34,8 @@ const ILINK_HTTP_PREFIX = /^iLink HTTP (\d{3})\b/
 /** permanent error HTTP status 名单。命中 → SendResult.permanent=true。 */
 const PERMANENT_STATUSES: ReadonlySet<number> = new Set([401, 403, 404, 410])
 
-const STRICT_NUMERIC_BUSINESS_FIELDS = ["errno", "errcode", "error_code"] as const
-const LENIENT_NUMERIC_BUSINESS_FIELDS = ["code", "ret"] as const
+const STRICT_NUMERIC_BUSINESS_FIELDS = ["errno", "errcode", "error_code", "ret"] as const
+const LENIENT_NUMERIC_BUSINESS_FIELDS = ["code"] as const
 const STATUS_BUSINESS_FIELDS = ["status", "result", "state"] as const
 const FAILURE_VALUE_STRINGS = new Set(["error", "failed", "fail", "failure"])
 const MESSAGE_FIELDS = ["errmsg", "err_msg", "message", "msg", "error", "error_msg", "reason"] as const
