@@ -638,11 +638,119 @@ describe('OutboxWorker.tick & lifecycle', () => {
       getBinding: async () => ({ botToken: 'tok', contextTokens: { s1: 'ctx' } }),
       now,
       maxPerTick: 10,
+      interRowDelayMs: 0,
     })
     await activeWorker.tick()
     // 2 picks succeeded + 1 empty pick to break the loop
     assert.equal(calls, 3)
     assert.deepEqual(sendCalls, ['a', 'b'])
+  })
+
+  test('tick paces successful single-part rows so live outbox rows are not burst-sent', async () => {
+    const queue: Record<string, unknown>[][] = [
+      [
+        {
+          id: 1,
+          outbound_id: 'x',
+          binding_user_id: 'u1',
+          sender_id: 's1',
+          session_id: 'wsess-0123456789abcdef',
+          payload: [{ type: 'text', text: 'a' }],
+          status: 'sending',
+          attempts: 0,
+          last_error: null,
+          locked_at: 1,
+          sent_at: null,
+          created_at: 1,
+          updated_at: 1,
+        },
+      ],
+      [
+        {
+          id: 2,
+          outbound_id: 'y',
+          binding_user_id: 'u1',
+          sender_id: 's1',
+          session_id: 'wsess-0123456789abcdef',
+          payload: [{ type: 'text', text: 'b' }],
+          status: 'sending',
+          attempts: 0,
+          last_error: null,
+          locked_at: 1,
+          sent_at: null,
+          created_at: 2,
+          updated_at: 2,
+        },
+      ],
+    ]
+    const { pool } = buildPool(() => queue.shift() ?? [])
+    const sendCalls: string[] = []
+    const delays: number[] = []
+    activeWorker = new OutboxWorker({
+      pool,
+      sendText: async ({ text }) => {
+        sendCalls.push(text)
+        return { ok: true }
+      },
+      getBinding: async () => ({ botToken: 'tok', contextTokens: { s1: 'ctx' } }),
+      now,
+      maxPerTick: 10,
+      interRowDelayMs: 750,
+      delay: async (ms) => {
+        delays.push(ms)
+      },
+    })
+    await activeWorker.tick()
+    assert.deepEqual(sendCalls, ['a', 'b'])
+    assert.deepEqual(delays, [750])
+  })
+
+  test('tick stops after transient failure instead of immediately retrying the same queued row', async () => {
+    let picks = 0
+    const { pool } = makeFakePool((sql) => {
+      if (/WITH picked AS/.test(sql)) {
+        picks++
+        return {
+          rows: [
+            {
+              id: 1,
+              outbound_id: 'x',
+              binding_user_id: 'u1',
+              sender_id: 's1',
+              session_id: 'wsess-0123456789abcdef',
+              payload: [{ type: 'text', text: 'a' }],
+              status: 'sending',
+              attempts: 0,
+              last_error: null,
+              locked_at: 1,
+              sent_at: null,
+              created_at: 1,
+              updated_at: 1,
+            },
+          ],
+          rowCount: 1,
+        }
+      }
+      if (/UPDATE wechat_outbox SET[\s\S]+attempts\s*=\s*attempts \+ 1/.test(sql)) {
+        return { rows: [{ attempts: 1, status: 'queued' }], rowCount: 1 }
+      }
+      return { rows: [], rowCount: 1 }
+    })
+    let sends = 0
+    activeWorker = new OutboxWorker({
+      pool,
+      sendText: async () => {
+        sends++
+        return { ok: false, errMessage: 'iLink business error: ret=-2' }
+      },
+      getBinding: async () => ({ botToken: 'tok', contextTokens: { s1: 'ctx' } }),
+      now,
+      maxPerTick: 10,
+      interRowDelayMs: 0,
+    })
+    await activeWorker.tick()
+    assert.equal(picks, 1)
+    assert.equal(sends, 1)
   })
 
   test('tick stops at maxPerTick yield (防 event loop block)', async () => {
@@ -673,6 +781,7 @@ describe('OutboxWorker.tick & lifecycle', () => {
       getBinding: async () => ({ botToken: 'tok', contextTokens: { s1: 'ctx' } }),
       now,
       maxPerTick: 3,
+      interRowDelayMs: 0,
     })
     await activeWorker.tick()
     assert.equal(picks, 3, 'tick exits after maxPerTick drains')
@@ -712,6 +821,7 @@ describe('OutboxWorker.tick & lifecycle', () => {
       getBinding: async () => ({ botToken: 'tok', contextTokens: { s1: 'ctx' } }),
       now,
       maxPerTick: 5,
+      interRowDelayMs: 0,
       log: (level, msg) => {
         if (level === 'error') errors.push(msg)
       },
@@ -730,6 +840,7 @@ describe('OutboxWorker.tick & lifecycle', () => {
       getBinding: async () => null,
       now,
       pollIntervalMs: 999_999, // 故意大,确保我们不真等到下次 tick
+      interRowDelayMs: 0,
     })
     activeWorker.start()
     await activeWorker.stop()

@@ -119,8 +119,11 @@ import type { CodexProviderConfigOverride } from './codexRunner.js'
 const CLAUDE_OAUTH_USER_AGENT = `claude-cli/${process.env.OPENCLAUDE_CC_VERSION_FOR_OAUTH || '2.1.888'} (external, cli)`
 
 const V3_WECHAT_OUTBOUND_ADAPTER_ID = 'v3-wechat-outbound'
-const WECHAT_LIVE_THINKING_FLUSH_MS = 2_000
-const WECHAT_LIVE_THINKING_PAYLOAD_CHARS = 4_000
+// iLink has been observed to start returning business `ret=-2` after a burst
+// of about 9 WeChat messages in one turn.  Keep live process bubbles useful
+// but small so the final answer always has room.
+const WECHAT_LIVE_MAX_PROCESS_MESSAGES = 4
+const WECHAT_LIVE_THINKING_STATUS = '正在思考…'
 
 /**
  * 协议级允许的 InboundMessage.model 值(2026-04-26 v1.0.4 加)。
@@ -6585,8 +6588,8 @@ export class Gateway {
     const liveWechatAdapter = adapter?.id === V3_WECHAT_OUTBOUND_ADAPTER_ID
     let liveWechatSendQueue: Promise<void> = Promise.resolve()
     let liveWechatSeq = 0
-    let liveThinkingBuffer = ''
-    let liveThinkingLastFlushAt = 0
+    let liveWechatProcessMessages = 0
+    let liveWechatThinkingAnnounced = false
     const liveToolBlockIdsSent = new Set<string>()
     const liveOutboundBase =
       turnTraceId.replace(/[^A-Za-z0-9._:-]/g, '').slice(0, 80) ||
@@ -6608,8 +6611,18 @@ export class Gateway {
       return `${liveOutboundBase}.wxlive.${(++liveWechatSeq).toString(36)}.${safeKind}`
     }
 
-    const enqueueLiveWechatMessage = (blocks: typeof out.blocks, isFinal: boolean, kind: string, meta?: any) => {
-      if (!adapter || blocks.length === 0) return
+    const enqueueLiveWechatMessage = (
+      blocks: typeof out.blocks,
+      isFinal: boolean,
+      kind: string,
+      meta?: any,
+      opts: { process?: boolean } = {},
+    ): boolean => {
+      if (!adapter || blocks.length === 0) return false
+      if (opts.process) {
+        if (liveWechatProcessMessages >= WECHAT_LIVE_MAX_PROCESS_MESSAGES) return false
+        liveWechatProcessMessages++
+      }
       const msg = {
         ...out,
         blocks: blocks.slice(),
@@ -6628,21 +6641,19 @@ export class Gateway {
           this.log.error('adapter send failed', { channel: adapter.name }, err)
         }
       })
+      return true
     }
 
-    const flushLiveThinking = (force = false) => {
-      if (!liveWechatAdapter || liveThinkingBuffer.length === 0) return
-      const now = Date.now()
-      if (!force && liveThinkingLastFlushAt > 0 && now - liveThinkingLastFlushAt < WECHAT_LIVE_THINKING_FLUSH_MS) {
-        return
-      }
-      let text = liveThinkingBuffer
-      liveThinkingBuffer = ''
-      liveThinkingLastFlushAt = now
-      if (text.length > WECHAT_LIVE_THINKING_PAYLOAD_CHARS) {
-        text = `${text.slice(0, WECHAT_LIVE_THINKING_PAYLOAD_CHARS)}…`
-      }
-      enqueueLiveWechatMessage([{ kind: 'thinking' as const, text } as any], false, 'thinking')
+    const announceLiveThinking = () => {
+      if (!liveWechatAdapter || liveWechatThinkingAnnounced) return
+      liveWechatThinkingAnnounced = true
+      enqueueLiveWechatMessage(
+        [{ kind: 'thinking' as const, text: WECHAT_LIVE_THINKING_STATUS } as any],
+        false,
+        'thinking',
+        undefined,
+        { process: true },
+      )
     }
 
     // ── Multimodal handling ──
@@ -7038,36 +7049,30 @@ export class Gateway {
         if (liveWechatAdapter) {
           const parentToolUseId = typeof b.parentToolUseId === 'string' ? b.parentToolUseId : ''
           if (parentToolUseId.length > 0) {
-            flushLiveThinking(true)
             return
           }
           if (b.kind === 'thinking') {
-            liveThinkingBuffer += typeof b.text === 'string' ? b.text : ''
-            flushLiveThinking(false)
+            announceLiveThinking()
             return
           }
           if (b.kind === 'tool_use') {
-            flushLiveThinking(true)
             const blockId = typeof b.blockId === 'string' ? b.blockId : ''
             if (blockId.length > 0) {
               if (liveToolBlockIdsSent.has(blockId)) return
               liveToolBlockIdsSent.add(blockId)
             }
-            enqueueLiveWechatMessage([e.block], false, 'tool')
+            enqueueLiveWechatMessage([e.block], false, 'tool', undefined, { process: true })
             return
           }
           if (b.kind === 'tool_result') {
-            flushLiveThinking(true)
             return
           }
           if (b.kind === 'text') {
-            flushLiveThinking(true)
             addAggregatedBlock(e.block)
             return
           }
           // Unknown future top-level block: preserve the historical adapter
           // behavior by keeping it for the final render rather than dropping it.
-          flushLiveThinking(true)
           addAggregatedBlock(e.block)
         } else if (adapter) {
           addAggregatedBlock(e.block)
@@ -7089,7 +7094,6 @@ export class Gateway {
           // 也按 failed 记账,idempotency key 释放允许 client retry。
           this._runLog.complete(_run, { status: 'failed', error: _apiErrorText })
           if (frame.idempotencyKey) this._seenIdempotencyKeys.delete(frame.idempotencyKey)
-          flushLiveThinking(true)
           if (liveWechatAdapter) {
             enqueueLiveWechatMessage(
               [{ kind: 'text', text: `[error] ${_apiErrorText}` } as any],
@@ -7119,7 +7123,6 @@ export class Gateway {
           outputTokens: e.meta?.outputTokens,
           turn: e.meta?.turn,
         })
-        flushLiveThinking(true)
         if (liveWechatAdapter) {
           // Process blocks were already sent live.  Final must contain only the
           // remaining assistant text/non-live blocks, otherwise WeChat replays
@@ -7280,7 +7283,6 @@ export class Gateway {
           }
           this.deliver(errFrame, adapter)
         }
-        flushLiveThinking(true)
         if (liveWechatAdapter) {
           enqueueLiveWechatMessage(
             [{ kind: 'text', text: `[error] ${e.error}` } as any],

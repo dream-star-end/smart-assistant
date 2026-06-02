@@ -93,6 +93,7 @@ const MAX_THINKING_PREVIEW_CHARS = 800
 
 /** Cross-request duplicate thinking previews are noisy in WeChat streaming UX. */
 const THINKING_PREVIEW_PREFIX = "💭 思考过程："
+const LIVE_THINKING_STATUS_PART = `${THINKING_PREVIEW_PREFIX}\n正在思考…`
 const THINKING_DEDUPE_TTL_MS = 2 * 60 * 1000
 const THINKING_DEDUPE_MAX_ENTRIES = 512
 
@@ -628,6 +629,13 @@ function dropDuplicateThinkingParts(
   let dropped = 0
   for (const part of parts) {
     if (part.type !== "text" || !part.text.startsWith(THINKING_PREVIEW_PREFIX)) {
+      out.push(part)
+      continue
+    }
+    // Gateway live mode intentionally sends the same safe status placeholder on
+    // every turn instead of raw thinking text.  The historical thinking-preview
+    // deduper must not hide that status on the next user question.
+    if (part.text === LIVE_THINKING_STATUS_PART) {
       out.push(part)
       continue
     }
