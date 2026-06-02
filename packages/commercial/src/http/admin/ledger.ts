@@ -36,6 +36,8 @@ function serializeLedger(r: LedgerRowView): Record<string, unknown> {
     delta: r.delta,
     balance_after: r.balance_after,
     reason: r.reason,
+    channel: r.channel,
+    model: r.model,
     ref_type: r.ref_type,
     ref_id: r.ref_id,
     memo: r.memo,

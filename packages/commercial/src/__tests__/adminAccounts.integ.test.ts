@@ -900,6 +900,38 @@ describe("admin ledger — list + 过滤", () => {
     assert.equal(pageTwo.rows.length, 1);
   });
 
+  test("listLedger exposes chat channel and model from linked usage_record", async (t) => {
+    if (skipIfNoPg(t)) return;
+    const u = await createUser("usage-meta@x.com");
+    await query("UPDATE users SET credits=1000 WHERE id=$1", [u.toString()]);
+    const usage = await query<{ id: string }>(
+      `INSERT INTO usage_records
+         (user_id, mode, account_id, model,
+          input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+          price_snapshot, cost_credits, session_id, request_id, status)
+       VALUES ($1, 'chat', NULL, 'gpt-5.5',
+          10, 20, 0, 0, '{}'::jsonb, 25, 'wsess-0123456789abcdef', 'req-ledger-meta-wechat', 'success')
+       RETURNING id::text AS id`,
+      [u.toString()],
+    );
+    const ledger = await query<{ id: string }>(
+      `INSERT INTO credit_ledger
+         (user_id, delta, balance_after, reason, ref_type, ref_id, memo)
+       VALUES ($1, -25, 975, 'chat', 'usage_record', $2, NULL)
+       RETURNING id::text AS id`,
+      [u.toString(), usage.rows[0].id],
+    );
+    await query("UPDATE usage_records SET ledger_id=$1 WHERE id=$2", [
+      ledger.rows[0].id,
+      usage.rows[0].id,
+    ]);
+
+    const rows = await listLedger({ userId: u.toString() });
+    assert.equal(rows.rows.length, 1);
+    assert.equal(rows.rows[0].model, "gpt-5.5");
+    assert.equal(rows.rows[0].channel, "wechat");
+  });
+
   test("listLedger invalid reason/user_id/before → RangeError", async (t) => {
     if (skipIfNoPg(t)) return;
     await assert.rejects(() => listLedger({ reason: "bad" as never }), (e) => e instanceof RangeError);

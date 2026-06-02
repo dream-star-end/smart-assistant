@@ -16,9 +16,9 @@
 //   - 任何 list 接口 4xx → 提示 + 跳转 /;不要在 admin 页面里"匿名展示空列表"
 //   - PATCH/DELETE 操作前必须有 confirm 提示
 
-import { _clearStoredAccessToken, state } from './state.js?v=9f61db3a'
-import { apiGet, apiJson, apiText, apiFetch, authHeaders, onAuthExpired } from './api.js?v=9f61db3a'
-import { lineChart, barChart, destroyChart, fmt as cfmt } from './charts.js?v=9f61db3a'
+import { _clearStoredAccessToken, state } from './state.js?v=6b7909fa'
+import { apiGet, apiJson, apiText, apiFetch, authHeaders, onAuthExpired } from './api.js?v=6b7909fa'
+import { lineChart, barChart, destroyChart, fmt as cfmt } from './charts.js?v=6b7909fa'
 
 // 与后端 packages/commercial/src/admin/ledger.ts 的 LEDGER_REASONS 枚举严格同步。
 // 新增/删除 reason 必须两端同步改,否则 ledger tab filter 会把错误值发给后端
@@ -35,6 +35,10 @@ const LEDGER_REASON_LABELS = {
   refund:             '退款',
   admin_adjust:       '管理员调整',
   promotion:          '活动赠送',
+}
+const LEDGER_CHANNEL_LABELS = {
+  web:    '网页',
+  wechat: '微信',
 }
 
 // ─── DOM helpers ────────────────────────────────────────────────────
@@ -118,6 +122,13 @@ function statusBadge(status) {
     : status === 'deleting' ? 'warn'
     : 'muted'
   return `<span class="badge ${cls}">${escapeHtml(status)}</span>`
+}
+
+function ledgerChannelBadge(channel) {
+  const label = LEDGER_CHANNEL_LABELS[channel] || '—'
+  if (label === '—') return '<span class="badge muted">—</span>'
+  const cls = channel === 'wechat' ? 'ok' : 'muted'
+  return `<span class="badge ${cls}">${escapeHtml(label)}</span>`
 }
 
 /**
@@ -3778,11 +3789,12 @@ function _renderLedgerTable() {
       <table class="data">
         <thead>
           <tr><th>id</th><th>用户</th><th>delta</th><th>余额</th>
-              <th>reason</th><th>memo</th><th>时间</th></tr>
+              <th>reason</th><th>渠道</th><th>模型</th><th>memo</th><th>时间</th></tr>
         </thead>
         <tbody>
           ${rows.map((r) => {
             const negative = String(r.delta).startsWith('-')
+            const model = r.model || '—'
             return `
             <tr>
               <td class="mono">${escapeHtml(r.id)}</td>
@@ -3792,6 +3804,8 @@ function _renderLedgerTable() {
               </td>
               <td class="num">${fmtCents(r.balance_after)}</td>
               <td><span class="badge muted">${escapeHtml(LEDGER_REASON_LABELS[r.reason] || r.reason)}</span></td>
+              <td>${ledgerChannelBadge(r.channel)}</td>
+              <td class="mono" title="${escapeHtml(model)}">${escapeHtml(model)}</td>
               <td>${escapeHtml(r.memo || '')}</td>
               <td class="mono">${fmtDate(r.created_at)}</td>
             </tr>`
