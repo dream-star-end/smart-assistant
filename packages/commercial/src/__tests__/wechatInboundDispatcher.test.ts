@@ -410,7 +410,7 @@ describe("inboundDispatcher — stop command bridge", () => {
     )
   })
 
-  test("stop targets running sessions before current pointer and clears interrupted rows", async () => {
+  test("stop targets running sessions before current pointer and keeps rows until terminal final", async () => {
     const pg = makeFakePg({
       pointer: FIXED_SESSION_ID,
       runningSessions: [
@@ -433,10 +433,11 @@ describe("inboundDispatcher — stop command bridge", () => {
       { kind: "dm", id: FIXED_SESSION_ID },
     ])
     assert.deepEqual(tSpy.posts.map((p) => p.bodyParsed.agentId), ["coder", "main"])
-    assert.deepEqual(pg.spy.runningClearCalls.map((c) => c.sessionId), [
-      FIXED_SESSION_ID_2,
-      FIXED_SESSION_ID,
-    ])
+    assert.deepEqual(
+      pg.spy.runningClearCalls,
+      [],
+      "interrupted:true only acknowledges the stop request; keep rows until final clears them so repeated /stop can still target stuck tasks",
+    )
   })
 
   test("stop merges current pointer fallback when stale tracked rows are present", async () => {
@@ -677,6 +678,7 @@ describe("inboundDispatcher — happy path", () => {
     )
     const r = await d.dispatch(makeEvent())
     assert.equal(r.kind, "dispatched")
+    if (r.kind === "dispatched") assert.equal(r.completed, true)
     assert.equal(storage.spy.upsertCalls.length, 1)
     assert.equal(pg.spy.setCalls.length, 1)
     assert.equal(pg.spy.runningSetCalls.length, 0)

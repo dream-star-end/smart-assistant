@@ -513,7 +513,11 @@ export function makeWechatBroker(deps: BrokerDeps): WechatBroker {
       fireAndForgetReflection(evt, outcome.reply, "command_echo")
     } else if (outcome.kind === "cold_start") {
       fireAndForgetReflection(evt, outcome.coldStartReply, "cold_start")
-    } else if (outcome.kind === "dispatched" && outcome.started !== false) {
+    } else if (
+      outcome.kind === "dispatched" &&
+      outcome.started !== false &&
+      outcome.completed !== true
+    ) {
       fireAndForgetReflection(evt, buildWechatRealtimeStartReply(outcome.sessionId), "processing")
     } else if (outcome.kind !== "dispatched") {
       fireAndForgetReflection(evt, buildWechatDispatchFailureReply(outcome), "command_echo")

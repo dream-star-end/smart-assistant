@@ -700,6 +700,22 @@ describe("wechatBroker — onInbound", () => {
     assert.equal(sendSpy.calls.length, 0)
   })
 
+  test("dispatcher completed=true outcome does not send a stale realtime process link", async () => {
+    const { sendText, spy: sendSpy } = makeSendText({ ok: true })
+    const { dispatcher } = makeDispatcher({
+      kind: "dispatched",
+      sessionId: SESSION_A,
+      newSession: true,
+      started: true,
+      completed: true,
+    } as DispatchOutcome)
+    const broker = makeWechatBroker(makeDeps({ dispatcher, sendText }))
+    const r = await broker.onInbound(makeEvent({ text: "快速完成但 Step1 ACK 丢失后重试" }))
+    assert.equal(r.kind, "dispatched")
+    await flushMicrotasks()
+    assert.equal(sendSpy.calls.length, 0)
+  })
+
   test("dispatcher pre-dispatch failure sends visible retry hint instead of going silent", async () => {
     const { sendText, spy: sendSpy } = makeSendText({ ok: true })
     const { dispatcher } = makeDispatcher({

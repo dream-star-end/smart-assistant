@@ -49,7 +49,6 @@ import type { WechatImageAttachment, WechatMediaAttachment } from "@openclaude/c
 import { rootLogger, type Logger } from "../logging/logger.js"
 import type { ContainerUnreadyError, ResolveContainerEndpoint } from "../ws/userChatBridge.js"
 import {
-  clearRunningSession,
   getCurrentSessionId,
   getCurrentSessionPointer,
   listRunningSessions,
@@ -162,7 +161,7 @@ export interface InboundEvent {
  */
 export type DispatchOutcome =
   | { kind: "command_echo"; reply: string }
-  | { kind: "dispatched"; sessionId: WechatSessionId; newSession: boolean; started?: boolean }
+  | { kind: "dispatched"; sessionId: WechatSessionId; newSession: boolean; started?: boolean; completed?: boolean }
   | {
       kind: "cold_start"
       reason: string
@@ -705,8 +704,14 @@ export function makeInboundDispatcher(deps: InboundDispatcherDeps): InboundDispa
         }
       }
 
-      reqLog.info("dispatched", { sessionId, newSession, started: step1Accepted.started })
-      return { kind: "dispatched", sessionId, newSession, started: step1Accepted.started }
+      reqLog.info("dispatched", { sessionId, newSession, started: step1Accepted.started, completed: step1Accepted.completed })
+      return {
+        kind: "dispatched",
+        sessionId,
+        newSession,
+        started: step1Accepted.started,
+        ...(step1Accepted.completed === true ? { completed: true } : {}),
+      }
     },
 
     async stop(evt: InboundEvent): Promise<StopOutcome> {
@@ -861,16 +866,10 @@ export function makeInboundDispatcher(deps: InboundDispatcherDeps): InboundDispa
         }
         if (interrupted) {
           interruptedCount++
-          if (target.runId !== "pointer-fallback") {
-            try {
-              await clearRunningSession(deps.pgPool, evt.bindingUserId, target.sessionId, target.runId)
-            } catch (err) {
-              reqLog.warn("stop_clear_running_session_failed", {
-                sessionId: target.sessionId,
-                errMessage: (err as Error)?.message ?? String(err),
-              })
-            }
-          }
+          reqLog.info("stop_interrupted_keep_running_session_until_final", {
+            sessionId: target.sessionId,
+            runId: target.runId,
+          })
         } else if (target.runId !== "pointer-fallback") {
           reqLog.info("stop_not_interrupted_keep_running_session", {
             sessionId: target.sessionId,
