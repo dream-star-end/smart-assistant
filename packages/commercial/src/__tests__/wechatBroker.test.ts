@@ -1448,6 +1448,36 @@ describe("wechatBroker — cleanupBinding", () => {
     assert.doesNotMatch(upd!.sql, /DELETE\s+FROM\s+wechat_outbox/i)
   })
 
+  test("ignores missing running-session table during mixed-version deploy cleanup", async () => {
+    const queries: Array<{ sql: string; params?: ReadonlyArray<unknown> }> = []
+    const pool = {
+      query: async (sql: string, params?: ReadonlyArray<unknown>) => {
+        queries.push({ sql, params })
+        if (/DELETE FROM wechat_session_pointer/i.test(sql)) return { rows: [], rowCount: 1 }
+        if (/DELETE FROM wechat_running_sessions/i.test(sql)) {
+          const err = new Error('relation "wechat_running_sessions" does not exist') as Error & { code: string }
+          err.code = "42P01"
+          throw err
+        }
+        if (/UPDATE wechat_outbox/i.test(sql)) return { rows: [], rowCount: 2 }
+        return { rows: [], rowCount: 0 }
+      },
+      connect: async () => ({
+        query: async (sql: string, params?: ReadonlyArray<unknown>) => {
+          queries.push({ sql, params })
+          return { rows: [], rowCount: 0 }
+        },
+        release: () => {},
+      }),
+    } as unknown as Pool
+    const broker = makeWechatBroker(makeDeps({ pool, outboxWorker: { maxAttempts: 7 } }))
+    const result = await broker.cleanupBinding("c:42")
+
+    assert.deepEqual(result, { pointerDeleted: true, outboxFailed: 2 })
+    assert.ok(queries.some((q) => /DELETE FROM wechat_running_sessions/i.test(q.sql)))
+    assert.ok(queries.some((q) => /UPDATE wechat_outbox/i.test(q.sql)))
+  })
+
   test("rejects invalid binding ids before touching PG", async () => {
     const fake = makeFakePool()
     const broker = makeWechatBroker(makeDeps({ pool: fake.pool }))

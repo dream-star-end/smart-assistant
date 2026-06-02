@@ -854,10 +854,15 @@ export function makeWechatBroker(deps: BrokerDeps): WechatBroker {
       "DELETE FROM wechat_session_pointer WHERE binding_user_id = $1",
       [bindingUserId],
     )
-    await deps.pgPool.query(
-      "DELETE FROM wechat_running_sessions WHERE binding_user_id = $1",
-      [bindingUserId],
-    )
+    try {
+      await deps.pgPool.query(
+        "DELETE FROM wechat_running_sessions WHERE binding_user_id = $1",
+        [bindingUserId],
+      )
+    } catch (err) {
+      if (!isMissingWechatRunningSessionsTable(err)) throw err
+      log.warn("cleanup_running_sessions_table_missing", { bindingUserId })
+    }
     const outbox = await deps.pgPool.query(
       `UPDATE wechat_outbox
           SET status = 'failed',
@@ -878,6 +883,13 @@ export function makeWechatBroker(deps: BrokerDeps): WechatBroker {
       pointerDeleted: (pointer.rowCount ?? 0) > 0,
       outboxFailed: outbox.rowCount ?? 0,
     }
+  }
+
+  function isMissingWechatRunningSessionsTable(err: unknown): boolean {
+    const e = err as { code?: unknown; message?: unknown }
+    if (e?.code !== "42P01") return false
+    const msg = typeof e.message === "string" ? e.message : ""
+    return msg.includes("wechat_running_sessions")
   }
 
   /**

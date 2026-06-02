@@ -13,6 +13,7 @@ import {
   newWechatSessionId,
   listOrphanWechatSessions,
   setCurrentSessionId,
+  getCurrentSessionPointer,
   listRunningSessions,
   RECONCILE_GRACE_MS_DEFAULT,
   type PgConn,
@@ -170,6 +171,51 @@ describe("wechat sessionPointer.setCurrentSessionId (SQL guard)", () => {
     }
     const ok = await setCurrentSessionId(conn, "u1", "wsess-0123456789abcdef", 500)
     assert.equal(ok, false)
+  })
+
+  test("falls back to legacy pointer write before current_agent_id migration lands", async () => {
+    const captured: { sql: string; params: ReadonlyArray<unknown> }[] = []
+    const conn: PgConn = {
+      query: async (sql: string, params: ReadonlyArray<unknown> = []) => {
+        captured.push({ sql, params })
+        if (captured.length === 1) {
+          const err = new Error('column "current_agent_id" does not exist') as Error & { code: string; column: string }
+          err.code = "42703"
+          err.column = "current_agent_id"
+          throw err
+        }
+        return { rows: [], rowCount: 1 }
+      },
+    }
+    const ok = await setCurrentSessionId(conn, "u1", "wsess-0123456789abcdef", 1000, "main")
+    assert.equal(ok, true)
+    assert.equal(captured.length, 2)
+    assert.match(captured[0]!.sql, /current_agent_id/)
+    assert.doesNotMatch(captured[1]!.sql, /current_agent_id/)
+    assert.deepEqual(captured[1]!.params, ["u1", "wsess-0123456789abcdef", 1000])
+  })
+})
+
+describe("wechat sessionPointer.getCurrentSessionPointer", () => {
+  test("falls back to legacy pointer read before current_agent_id migration lands", async () => {
+    const captured: { sql: string; params: ReadonlyArray<unknown> }[] = []
+    const conn: PgConn = {
+      query: async (sql: string, params: ReadonlyArray<unknown> = []) => {
+        captured.push({ sql, params })
+        if (captured.length === 1) {
+          const err = new Error('column "current_agent_id" does not exist') as Error & { code: string; column: string }
+          err.code = "42703"
+          err.column = "current_agent_id"
+          throw err
+        }
+        return { rows: [{ current_session_id: "wsess-0123456789abcdef" }], rowCount: 1 }
+      },
+    }
+    const pointer = await getCurrentSessionPointer(conn, "u1")
+    assert.deepEqual(pointer, { sessionId: "wsess-0123456789abcdef" })
+    assert.equal(captured.length, 2)
+    assert.match(captured[0]!.sql, /current_agent_id/)
+    assert.doesNotMatch(captured[1]!.sql, /current_agent_id/)
   })
 })
 

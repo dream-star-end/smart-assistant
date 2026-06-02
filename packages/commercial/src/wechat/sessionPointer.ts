@@ -89,10 +89,23 @@ export async function getCurrentSessionPointer(
   conn: PgConn,
   bindingUserId: BindingId,
 ): Promise<WechatSessionPointer | null> {
-  const res = await (conn as PgRunner).query<{ current_session_id: string; current_agent_id: string | null }>(
-    "SELECT current_session_id, current_agent_id FROM wechat_session_pointer WHERE binding_user_id = $1 LIMIT 1",
-    [bindingUserId],
-  )
+  let res: { rows: Array<{ current_session_id: string; current_agent_id?: string | null }>; rowCount: number | null }
+  try {
+    res = await (conn as PgRunner).query<{ current_session_id: string; current_agent_id: string | null }>(
+      "SELECT current_session_id, current_agent_id FROM wechat_session_pointer WHERE binding_user_id = $1 LIMIT 1",
+      [bindingUserId],
+    )
+  } catch (err) {
+    if (!isMissingCurrentAgentIdColumn(err)) throw err
+    // Mixed-version deploy compatibility: 0079 adds current_agent_id, but the
+    // app process may briefly run before every node has applied the migration.
+    // Stop still works via container-side live session scan when agentId is
+    // absent, so read the legacy pointer shape instead of failing `/stop`.
+    res = await (conn as PgRunner).query<{ current_session_id: string }>(
+      "SELECT current_session_id FROM wechat_session_pointer WHERE binding_user_id = $1 LIMIT 1",
+      [bindingUserId],
+    )
+  }
   if (res.rowCount === 0) return null
   const row = res.rows[0]!
   return {
@@ -135,17 +148,43 @@ export async function setCurrentSessionId(
   now: number,
   agentId?: string,
 ): Promise<boolean> {
-  const res = await (conn as PgRunner).query(
-    `INSERT INTO wechat_session_pointer (binding_user_id, current_session_id, updated_at, current_agent_id)
-     VALUES ($1, $2, $3, $4)
-     ON CONFLICT (binding_user_id) DO UPDATE SET
-       current_session_id = EXCLUDED.current_session_id,
-       updated_at         = EXCLUDED.updated_at,
-       current_agent_id   = EXCLUDED.current_agent_id
-     WHERE wechat_session_pointer.updated_at <= EXCLUDED.updated_at`,
-    [bindingUserId, sessionId, now, agentId ?? null],
-  )
+  let res: { rows: Record<string, unknown>[]; rowCount: number | null }
+  try {
+    res = await (conn as PgRunner).query(
+      `INSERT INTO wechat_session_pointer (binding_user_id, current_session_id, updated_at, current_agent_id)
+       VALUES ($1, $2, $3, $4)
+       ON CONFLICT (binding_user_id) DO UPDATE SET
+         current_session_id = EXCLUDED.current_session_id,
+         updated_at         = EXCLUDED.updated_at,
+         current_agent_id   = EXCLUDED.current_agent_id
+       WHERE wechat_session_pointer.updated_at <= EXCLUDED.updated_at`,
+      [bindingUserId, sessionId, now, agentId ?? null],
+    )
+  } catch (err) {
+    if (!isMissingCurrentAgentIdColumn(err)) throw err
+    // 0079 may not have landed on every deploy target yet. Keep the old
+    // pointer write path alive; losing agentId only weakens `/stop` to the
+    // existing live-session scan fallback and must not downgrade accepted
+    // WeChat turns to step2_failed.
+    res = await (conn as PgRunner).query(
+      `INSERT INTO wechat_session_pointer (binding_user_id, current_session_id, updated_at)
+       VALUES ($1, $2, $3)
+       ON CONFLICT (binding_user_id) DO UPDATE SET
+         current_session_id = EXCLUDED.current_session_id,
+         updated_at         = EXCLUDED.updated_at
+       WHERE wechat_session_pointer.updated_at <= EXCLUDED.updated_at`,
+      [bindingUserId, sessionId, now],
+    )
+  }
   return (res.rowCount ?? 0) > 0
+}
+
+function isMissingCurrentAgentIdColumn(err: unknown): boolean {
+  const e = err as { code?: unknown; message?: unknown; column?: unknown }
+  if (e?.code !== "42703") return false
+  const msg = typeof e.message === "string" ? e.message : ""
+  const col = typeof e.column === "string" ? e.column : ""
+  return col === "current_agent_id" || msg.includes("current_agent_id")
 }
 
 export async function markRunningSession(
