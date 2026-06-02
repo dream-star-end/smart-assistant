@@ -196,11 +196,11 @@ test('handleWechatInbound preserves peer.displayName on the outbound frame', () 
   )
 })
 
-test('dispatchInbound marks completed WeChat idempotency entries as no longer started', () => {
-  assert.match(
+test('dispatchInbound keeps completed WeChat idempotency entries accepted for Step1 retries', () => {
+  assert.doesNotMatch(
     SERVER_TS,
     /_updateWechatIdempotency\(\s*frame\.idempotencyKey\s*,\s*\{\s*started:\s*false\s*\}\s*\)/,
-    'successful final must flip cached WeChat idempotency metadata to started:false so late Step1 retries do not recreate phantom running rows',
+    'successful final must not flip cached WeChat idempotency metadata to started:false; late Step1 retries still need accepted:true so master persists the already-started wsess',
   )
 })
 
@@ -280,7 +280,7 @@ test('duplicate WeChat Step1 ACK returns the cached routed wsess', () => {
   assert.match(
     handleWechatInbound,
     /accepted:\s*originalWechat\.started\s*!==\s*false/,
-    'duplicates for already-completed turns must be accepted:false so master does not recreate stale session state',
+    'duplicates for already-started/completed turns must remain accepted:true so master can persist the session after a lost Step1 response',
   )
 })
 

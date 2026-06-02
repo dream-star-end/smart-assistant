@@ -717,7 +717,7 @@ describe("wechatBroker — onInbound", () => {
     assert.doesNotMatch(sendSpy.calls[0]!.text, /实时过程/)
   })
 
-  test("broker-local /stop delegates to dispatcher.stop and reflects result", async () => {
+  test("broker-local /stop delegates normalized binding id to dispatcher.stop and reflects result", async () => {
     const { sendText, spy: sendSpy } = makeSendText({ ok: true })
     const { dispatcher, spy: dispSpy } = makeDispatcher({
       kind: "dispatched",
@@ -725,11 +725,12 @@ describe("wechatBroker — onInbound", () => {
       newSession: false,
     })
     const broker = makeWechatBroker(makeDeps({ dispatcher, sendText }))
-    const r = await broker.onInbound(makeEvent({ text: "/stop" }))
+    const r = await broker.onInbound(makeEvent({ bindingUserId: "c:42", text: "/stop" }))
     assert.equal(r.kind, "command_echo")
     if (r.kind === "command_echo") assert.match(r.reply, /已发送中断/)
     assert.equal(dispSpy.calls.length, 0)
     assert.equal(dispSpy.stopCalls.length, 1)
+    assert.equal(dispSpy.stopCalls[0]!.bindingUserId, "42")
     await flushMicrotasks()
     assert.equal(sendSpy.calls.length, 1)
     assert.match(sendSpy.calls[0]!.text, /已发送中断/)

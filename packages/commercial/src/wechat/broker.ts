@@ -531,7 +531,7 @@ export function makeWechatBroker(deps: BrokerDeps): WechatBroker {
     const text = evt.text.trim()
     if (isWechatStopCommand(text)) {
       try {
-        return await deps.dispatcher.stop(evt)
+        return await deps.dispatcher.stop({ ...evt, bindingUserId: dispatchBindingUserId })
       } catch (err) {
         log.error("wechat_stop_command_failed", {
           bindingUserId: evt.bindingUserId,
