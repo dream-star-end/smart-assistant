@@ -719,18 +719,16 @@ export function makeInboundDispatcher(deps: InboundDispatcherDeps): InboundDispa
         traceId: evt.traceId,
       })
 
-      let targets: Array<{ sessionId: WechatSessionId; runId: string; agentId?: string }>
+      let targets: Array<{ sessionId: WechatSessionId; runId: string; agentId?: string }> = []
       try {
         targets = await listRunningSessions(deps.pgPool, evt.bindingUserId)
       } catch (err) {
         reqLog.error("stop_running_sessions_read_failed", {
           errMessage: (err as Error)?.message ?? String(err),
         })
-        return {
-          kind: "command_echo",
-          interrupted: false,
-          reply: "暂时无法读取当前微信任务，请稍后重试；也可以打开实时过程链接在网页端停止。",
-        }
+        // Keep /stop usable during migration or a transient read failure on
+        // the new running-session table: fall back to the legacy current
+        // pointer below and let the container scan live runners by wsess.
       }
 
       let pointer: Awaited<ReturnType<typeof getCurrentSessionPointer>> | null = null

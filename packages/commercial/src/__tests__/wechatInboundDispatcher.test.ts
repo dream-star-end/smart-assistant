@@ -126,6 +126,7 @@ function makeFakePg(opts: {
   runningSessions?: Array<{ sessionId: string; runId: string; agentId?: string }>
   throwOnGet?: Error
   throwOnSet?: Error
+  throwOnRunningList?: Error
 }): { pg: PgConn; spy: PgSpy } {
   const spy: PgSpy = { getCalls: [], setCalls: [], runningListCalls: [], runningSetCalls: [], runningClearCalls: [] }
   const pg: PgConn = {
@@ -159,6 +160,7 @@ function makeFakePg(opts: {
         return { rows: [] as R[], rowCount: applied ? 1 : 0 }
       }
       if (/SELECT session_id, run_id, agent_id\s+FROM wechat_running_sessions/i.test(sql)) {
+        if (opts.throwOnRunningList) throw opts.throwOnRunningList
         spy.runningListCalls.push({ bindingUserId: String(params[0]) })
         return {
           rows: (opts.runningSessions ?? []).map((s) => ({
@@ -365,6 +367,27 @@ describe("inboundDispatcher — stop command bridge", () => {
     assert.equal(r.interrupted, true)
     assert.equal(tSpy.posts.length, 1)
     assert.equal(tSpy.posts[0]!.bodyParsed.agentId, "codex")
+  })
+
+  test("stop falls back to current pointer when running-session lookup fails", async () => {
+    const pg = makeFakePg({
+      pointer: FIXED_SESSION_ID,
+      throwOnRunningList: new Error("relation wechat_running_sessions does not exist"),
+    })
+    const { transport, spy: tSpy } = makeTransport([
+      { status: 200, bodyText: '{"ok":true,"interrupted":true}' },
+    ])
+    const d = makeInboundDispatcher(makeDeps({ pgPool: pg.pg, transport }))
+    const r = await d.stop(makeEvent({ text: "/stop" }))
+    assert.equal(r.interrupted, true)
+    assert.equal(pg.spy.getCalls.length, 1)
+    assert.equal(tSpy.posts.length, 1)
+    assert.deepEqual(tSpy.posts[0]!.bodyParsed.peer, { kind: "dm", id: FIXED_SESSION_ID })
+    assert.equal(
+      "agentId" in tSpy.posts[0]!.bodyParsed,
+      false,
+      "legacy pointer fallback should still let the container scan live wsess runners",
+    )
   })
 
   test("stop targets running sessions before current pointer and clears interrupted rows", async () => {
