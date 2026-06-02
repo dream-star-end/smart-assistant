@@ -162,7 +162,7 @@ export interface InboundEvent {
  */
 export type DispatchOutcome =
   | { kind: "command_echo"; reply: string }
-  | { kind: "dispatched"; sessionId: WechatSessionId; newSession: boolean }
+  | { kind: "dispatched"; sessionId: WechatSessionId; newSession: boolean; started?: boolean }
   | {
       kind: "cold_start"
       reason: string
@@ -699,8 +699,8 @@ export function makeInboundDispatcher(deps: InboundDispatcherDeps): InboundDispa
         }
       }
 
-      reqLog.info("dispatched", { sessionId, newSession })
-      return { kind: "dispatched", sessionId, newSession }
+      reqLog.info("dispatched", { sessionId, newSession, started: step1Accepted.started })
+      return { kind: "dispatched", sessionId, newSession, started: step1Accepted.started }
     },
 
     async stop(evt: InboundEvent): Promise<StopOutcome> {

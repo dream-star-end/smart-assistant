@@ -681,6 +681,21 @@ describe("wechatBroker — onInbound", () => {
     assert.match(sendSpy.calls[0]!.text, /\/stop/)
   })
 
+  test("dispatcher started=false outcome does not send stale realtime process link", async () => {
+    const { sendText, spy: sendSpy } = makeSendText({ ok: true })
+    const { dispatcher } = makeDispatcher({
+      kind: "dispatched",
+      sessionId: SESSION_A,
+      newSession: true,
+      started: false,
+    } as DispatchOutcome)
+    const broker = makeWechatBroker(makeDeps({ dispatcher, sendText }))
+    const r = await broker.onInbound(makeEvent({ text: "会触发快速失败" }))
+    assert.equal(r.kind, "dispatched")
+    await flushMicrotasks()
+    assert.equal(sendSpy.calls.length, 0)
+  })
+
   test("broker-local /stop delegates to dispatcher.stop and reflects result", async () => {
     const { sendText, spy: sendSpy } = makeSendText({ ok: true })
     const { dispatcher, spy: dispSpy } = makeDispatcher({

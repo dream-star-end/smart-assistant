@@ -618,6 +618,35 @@ describe("inboundDispatcher — happy path", () => {
     })), [{ sessionId: FIXED_SESSION_ID, runId: "codex-run", agentId: "codex" }])
   })
 
+  test("Step1 started=false is surfaced and does not mark a running session", async () => {
+    const { transport } = makeTransport([
+      {
+        status: 200,
+        bodyText: JSON.stringify({
+          ok: true,
+          started: false,
+          traceId: "fast-fail-run",
+        }),
+      },
+    ])
+    const storage = makeStorageSpies()
+    const pg = makeFakePg({ pointer: null })
+    const d = makeInboundDispatcher(
+      makeDeps({
+        transport,
+        pgPool: pg.pg,
+        upsertMasterClientSession: storage.upsertMasterClientSession,
+        softDeleteMasterSession: storage.softDeleteMasterSession,
+      }),
+    )
+    const r = await d.dispatch(makeEvent())
+    assert.equal(r.kind, "dispatched")
+    if (r.kind === "dispatched") {
+      assert.equal(r.started, false)
+    }
+    assert.equal(pg.spy.runningSetCalls.length, 0)
+  })
+
   test("deduplicated older wsess does not move an existing current pointer backwards", async () => {
     const oldDedupedSessionId = FIXED_SESSION_ID
     const currentSessionId = FIXED_SESSION_ID_2
