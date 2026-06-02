@@ -13,6 +13,7 @@ import {
   WECHAT_MAX_TEXT,
   friendlyToolName,
   sanitizeForWechat,
+  normalizeMarkdownForWechat,
   splitText,
   splitTextForWechatPages,
   friendlyProviderErrorForWechat,
@@ -51,14 +52,14 @@ describe("rendererPipeline.sanitizeForWechat", () => {
     assert.equal(sanitizeForWechat("   "), "   ")
   })
 
-  test("strips fenced code blocks but keeps content", () => {
+  test("legacy sanitizer strips fenced code blocks but keeps content", () => {
     const md = "前置\n```ts\nconst x = 1\n```\n后置"
     const out = sanitizeForWechat(md)
     assert.ok(out.includes("const x = 1"))
     assert.ok(!out.includes("```"))
   })
 
-  test("strips bold / italic / inline code markup", () => {
+  test("legacy sanitizer strips bold / italic / inline code markup", () => {
     assert.equal(sanitizeForWechat("**粗**"), "粗")
     assert.equal(sanitizeForWechat("__粗__"), "粗")
     assert.equal(sanitizeForWechat("*斜*"), "斜")
@@ -72,10 +73,27 @@ describe("rendererPipeline.sanitizeForWechat", () => {
     )
   })
 
-  test("strips heading hashes / blockquote / horizontal rules", () => {
+  test("legacy sanitizer strips heading hashes / blockquote / horizontal rules", () => {
     assert.equal(sanitizeForWechat("## title"), "title")
     assert.equal(sanitizeForWechat("> quoted"), "quoted")
     assert.equal(sanitizeForWechat("---"), "")
+  })
+})
+
+
+
+describe("rendererPipeline.normalizeMarkdownForWechat", () => {
+  test("preserves Markdown syntax for WeChat/iLink rendering", () => {
+    const md = "# 标题\n\n**粗** `code`\n\n[docs](https://a.com/x)"
+    assert.equal(normalizeMarkdownForWechat(md), md)
+  })
+
+  test("collapses excessive blank lines outside fenced code blocks", () => {
+    const md = "# A\n\n\n\nB\n```ts\nconst x = 1\n\n\nconst y = 2\n```\n\n\nC"
+    assert.equal(
+      normalizeMarkdownForWechat(md),
+      "# A\n\nB\n```ts\nconst x = 1\n\n\nconst y = 2\n```\n\nC",
+    )
   })
 })
 
@@ -120,6 +138,13 @@ describe("rendererPipeline.splitText", () => {
     assert.equal(out.join(""), s)
   })
 
+  test("hard cut is Unicode-safe and does not split surrogate pairs", () => {
+    const s = "a😊b😊c"
+    const out = splitText(s, 3)
+    assert.deepEqual(out, ["a😊", "b😊", "c"])
+    assert.equal(out.join(""), s)
+  })
+
   test("empty input → empty array", () => {
     assert.deepEqual(splitText("", 100), [])
   })
@@ -161,10 +186,10 @@ describe("rendererPipeline.renderAssistantText", () => {
     assert.doesNotMatch(parts[0]!.text, /request_id|req-secret|UNKNOWN_MODEL|API Error/)
   })
 
-  test("markdown is sanitized before splitting", () => {
-    const parts = renderAssistantText("# 标题\n**粗**")
+  test("markdown is preserved before splitting", () => {
+    const parts = renderAssistantText("# 标题\n\n**粗** `code`")
     assert.equal(parts.length, 1)
-    assert.equal(parts[0]!.text, "标题\n粗")
+    assert.equal(parts[0]!.text, "# 标题\n\n**粗** `code`")
   })
 
   test("long text is split into multiple parts honoring WECHAT_MAX_TEXT", () => {
@@ -188,11 +213,24 @@ describe("rendererPipeline.renderAssistantText", () => {
     assert.deepEqual(renderAssistantText(undefined), [])
   })
 
-  test("whitespace-only after sanitize → still emits as single part (not stripped)", () => {
-    // sanitize 不去 leading/trailing space;空白字符串 cleanedLength > 0
-    const parts = renderAssistantText("   ")
+  test("whitespace-only after markdown normalization → empty array", () => {
+    assert.deepEqual(renderAssistantText("   "), [])
+  })
+
+  test("under-4000 multi-paragraph Markdown stays as one bubble", () => {
+    const md = `# 标题\n\n- a\n- b\n\n| A | B |\n| - | - |\n| 1 | 2 |`
+    const parts = renderAssistantText(md)
     assert.equal(parts.length, 1)
-    assert.equal(parts[0]!.text, "   ")
+    assert.equal(parts[0]!.text, md)
+  })
+
+  test("fenced code block stays intact across logical chunking when possible", () => {
+    const md = `${"a".repeat(3980)}\n\n` + "```ts\nconst x = 1\n```\n\n尾巴"
+    const parts = renderAssistantText(md)
+    assert.equal(parts.length, 2)
+    assert.match(parts[0]!.text, /^（1\/2）\n/)
+    assert.match(parts[1]!.text, /^（2\/2）\n```ts\nconst x = 1\n```\n\n尾巴$/)
+    assert.ok(parts.every((part) => part.text.length <= WECHAT_MAX_TEXT))
   })
 })
 
