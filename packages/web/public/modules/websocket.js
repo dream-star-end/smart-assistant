@@ -1,21 +1,21 @@
 // OpenClaude — WebSocket connection, messaging, background tasks
-import { abortInflightRefresh, apiGet, clearProactiveRefresh, silentRefresh } from './api.js?v=dd5ce5c8'
+import { abortInflightRefresh, apiGet, clearProactiveRefresh, silentRefresh } from './api.js?v=a16927cc'
 // V3 file-proxy R4 SHOULD#1:WS 1008 + silentRefresh 失败的 teardown 也要清 oc_session,
 // 否则 UI 已 showLogin 但 HttpOnly cookie 还能让 /api/file GET 到,语义分裂。
-import { clearSessionCookie } from './auth.js?v=dd5ce5c8'
-import { dbPut } from './db.js?v=dd5ce5c8'
-import { $, htmlSafeEscape } from './dom.js?v=dd5ce5c8'
-import { maybeNotify, setTitleBusy } from './notifications.js?v=dd5ce5c8'
-import { _clearStoredAccessToken, getSession, state } from './state.js?v=dd5ce5c8'
-import { maybeSyncNow } from './sync.js?v=dd5ce5c8'
-import { toast } from './ui.js?v=dd5ce5c8'
+import { clearSessionCookie } from './auth.js?v=a16927cc'
+import { dbPut } from './db.js?v=a16927cc'
+import { $, htmlSafeEscape } from './dom.js?v=a16927cc'
+import { maybeNotify, setTitleBusy } from './notifications.js?v=a16927cc'
+import { _clearStoredAccessToken, getSession, state } from './state.js?v=a16927cc'
+import { maybeSyncNow } from './sync.js?v=a16927cc'
+import { toast } from './ui.js?v=a16927cc'
 // 商用 v3 专用:outbound.cost_charged 扣费帧到达后用这个刷左上角余额气泡。
 // 个人版 (master) 不会收到该帧,refreshBalance 里自己判断 _commercialMode 直接 noop。
-import { refreshBalance, _openTopupModal } from './billing.js?v=dd5ce5c8'
+import { refreshBalance, _openTopupModal } from './billing.js?v=a16927cc'
 // Diagnostic trace for the WS → IndexedDB → server PUT persistence chain.
 // trace() is a no-side-effect ring writer; flushTrace happens off the
 // critical path (sessions.js _doSave finally + isFinal+1500ms backup).
-import { trace, flushTrace } from './trace.js?v=dd5ce5c8'
+import { trace, flushTrace } from './trace.js?v=a16927cc'
 
 // ── Late-binding for circular deps (sessions.js, messages.js) ──
 let _deps = {}
