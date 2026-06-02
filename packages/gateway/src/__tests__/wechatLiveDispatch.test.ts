@@ -122,6 +122,8 @@ test('v3 WeChat streams process blocks live, serializes adapter sends, and final
     [['thinking'], ['tool_use'], ['text']],
   )
   assert.deepEqual(calls.map((out) => out.isFinal), [false, false, true])
+  assert.equal(calls[0]!.blocks[0]!.text, '正在思考…')
+  assert.equal(calls[0]!.blocks[0]!.text.includes('先分析一下'), false)
   assert.equal(calls[2]!.blocks[0]!.text, '**答案**：完成')
   assert.equal(calls[0]!.traceId, calls[1]!.traceId)
   assert.equal(calls[1]!.traceId, calls[2]!.traceId)
@@ -129,6 +131,50 @@ test('v3 WeChat streams process blocks live, serializes adapter sends, and final
   assert.equal(new Set(outboundIds).size, 3, 'each live message needs a unique outboundId for master outbox dedup')
   assert.ok(outboundIds.every((id) => /^[A-Za-z0-9._:-]{8,128}$/.test(id)))
   assert.equal(calls.some((out) => '_userId' in out), false, 'private routing fields must not reach adapter')
+})
+
+test('v3 WeChat caps live process bubbles so final answer is not starved', async () => {
+  const calls: any[] = []
+  const adapter: ChannelAdapter = {
+    id: 'v3-wechat-outbound',
+    name: 'v3-wechat-outbound',
+    type: 'channel' as const,
+    async init() {},
+    async shutdown() {},
+    async send(out: OutboundMessage) {
+      calls.push(out)
+    },
+  }
+  const noisyEvents: any[] = [
+    { kind: 'block', block: { kind: 'thinking', text: 'raw internal thought 1' } },
+    { kind: 'block', block: { kind: 'thinking', text: 'raw internal thought 2' } },
+  ]
+  for (let i = 1; i <= 10; i++) {
+    noisyEvents.push({
+      kind: 'block',
+      block: { kind: 'tool_use', blockId: `toolu_${i}`, toolName: 'Bash', inputJson: { command: `echo ${i}` } },
+    })
+  }
+  noisyEvents.push(
+    { kind: 'block', block: { kind: 'text', text: '最终答案' } },
+    { kind: 'final', meta: { cost: 0.01, inputTokens: 10, outputTokens: 20, turn: 1 } },
+  )
+
+  const gateway = makeGateway(noisyEvents)
+  await gateway.dispatchInbound(makeFrame(), adapter)
+
+  assert.deepEqual(
+    calls.map((out) => out.blocks[0]!.kind),
+    ['thinking', 'tool_use', 'tool_use', 'tool_use', 'text'],
+  )
+  assert.equal(calls[0]!.blocks[0]!.text, '正在思考…')
+  assert.equal(calls.at(-1)!.isFinal, true)
+  assert.equal(calls.at(-1)!.blocks[0]!.text, '最终答案')
+  assert.equal(
+    calls.slice(0, -1).length,
+    4,
+    'live process bubbles stay below the observed iLink burst rejection threshold',
+  )
 })
 
 test('non-WeChat adapters keep historical aggregate-on-final behavior', async () => {

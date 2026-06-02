@@ -636,6 +636,30 @@ describe("outboundReceiver — enqueue outcome translation", () => {
     assert.equal(spy.calls.length, 1, "second duplicate thinking preview should not enqueue")
   })
 
+  test("live thinking status placeholder is not deduped across turns", async () => {
+    const { pool, spy } = makeFakePool({ mode: "enqueue_queued", outboxId: 42 })
+    const handler = makeOutboundReceiverHandler(makeDeps({ pool }))
+    for (const outboundId of ["ob-thinking-status-1", "ob-thinking-status-2"]) {
+      const r = makeRes()
+      await handler(
+        authedReq(
+          validBody({
+            outboundId,
+            blocks: [{ kind: "thinking", text: "正在思考…" }],
+          }),
+        ),
+        r.res,
+        CTX,
+      )
+      assert.equal(r.rec.status, 202)
+    }
+    assert.equal(spy.calls.length, 2)
+    assert.deepEqual(spy.calls.map((c) => (c.payload[0] as { text?: string }).text), [
+      "💭 思考过程：\n正在思考…",
+      "💭 思考过程：\n正在思考…",
+    ])
+  })
+
   test("normal repeated text across outbound posts is not content-deduped", async () => {
     const { pool, spy } = makeFakePool({ mode: "enqueue_queued", outboxId: 42 })
     const handler = makeOutboundReceiverHandler(makeDeps({ pool }))

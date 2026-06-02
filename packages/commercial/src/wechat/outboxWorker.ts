@@ -11,8 +11,8 @@
  *   - `log`(broker.ts 注入,P1 简单 console)
  *
  * **关键设计**:
- *   - Worker 不做 in-process retry backoff;失败行 release 回 'queued',下次 tick 自然 retry
- *     (避免 P1 阶段引入 timer table / delay queue 复杂度)
+ *   - Worker 不做 DB 级 retry backoff;失败行 release 回 'queued',但 transient fail
+ *     会结束当前 tick,避免同一 tick 内把 ret=-2 这类 iLink 业务失败重试到 attempts cap。
  *   - 每 tick 拉到 `maxPerTick` 条就 yield(防 event loop 长 block 影响 broker.reconcile / inbound)
  *   - 失败分类:`SendResult.permanent=true` → 立即 force-fail(attempts=maxAttempts,不复活);
  *     否则 attempts+1,< maxAttempts release 'queued',>= maxAttempts 转 'failed' 终态
@@ -35,6 +35,7 @@ import type { ResolveOutboundMediaPartFn, ResolvedWechatOutboundMedia } from './
 import { MASTER_USER_PREFIX } from './userIds.js'
 
 export const DEFAULT_INTER_PART_DELAY_MS = 1000
+export const DEFAULT_INTER_ROW_DELAY_MS = DEFAULT_INTER_PART_DELAY_MS
 
 /** sendText 实装返回。permanent → broker 立即 force-fail 不复活;否则按 attempts cap 兜底。 */
 export interface SendResult {
@@ -82,6 +83,8 @@ export interface OutboxWorkerOptions {
   maxAttempts?: number
   /** 同一 outbox row 内连续 iLink sendmessage 之间的 pacing。默认 1000ms。 */
   interPartDelayMs?: number
+  /** 连续 outbox row 之间的 pacing。live WeChat 每个过程消息是一行,默认 1000ms。 */
+  interRowDelayMs?: number
   /** 注入 delay 便于测试。默认 setTimeout。 */
   delay?: DelayFn
   /** 注入 now 便于测试。默认 Date.now。 */
@@ -291,6 +294,7 @@ export class OutboxWorker {
       pollIntervalMs: options.pollIntervalMs ?? 1000,
       maxAttempts: options.maxAttempts ?? DEFAULT_MAX_ATTEMPTS,
       interPartDelayMs: options.interPartDelayMs ?? DEFAULT_INTER_PART_DELAY_MS,
+      interRowDelayMs: options.interRowDelayMs ?? DEFAULT_INTER_ROW_DELAY_MS,
       delay: options.delay ?? defaultDelay,
       now: options.now ?? Date.now,
     }
@@ -322,13 +326,20 @@ export class OutboxWorker {
   async tick(): Promise<void> {
     if (this.stopFlag) return
     let consumed = 0
+    let shouldDelayBeforeNextSend = false
     while (!this.stopFlag && consumed < this.opts.maxPerTick) {
       const row = await pickOne(this.opts.pool, this.opts.now())
       if (!row) break
       consumed++
+      if (shouldDelayBeforeNextSend && this.opts.interRowDelayMs > 0) {
+        await this.opts.delay(this.opts.interRowDelayMs)
+      }
       try {
-        await drainOne(row, this.opts)
+        const outcome = await drainOne(row, this.opts)
+        shouldDelayBeforeNextSend = outcome.kind === 'sent'
+        if (outcome.kind === 'failed_transient') break
       } catch (err) {
+        shouldDelayBeforeNextSend = false
         // pickOne 已标 'sending'(locked_at 已 stamp);留它给 releaseStaleSending 回收。
         this.opts.log(
           'error',
