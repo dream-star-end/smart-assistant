@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import test, { mock } from 'node:test'
 import {
   createIdleTimeoutEventGate,
+  getLivenessIdleMs,
   shouldHardResetRunnerAfterIdleTimeout,
   LIVENESS_IDLE_TIMEOUT_COMPACTING_MS,
   LIVENESS_IDLE_TIMEOUT_DEFAULT_MS,
@@ -75,6 +76,19 @@ test('shouldHardResetRunnerAfterIdleTimeout only targets codex app-server runner
   assert.equal(shouldHardResetRunnerAfterIdleTimeout({ interrupt() {}, shutdown() {} }), false)
 })
 
+test('getLivenessIdleMs uses visible activity for codex app-server and raw activity for other runners', () => {
+  const now = 10_000
+  const codexRunner = new CodexAppServerRunner({
+    sessionKey: 'test-session',
+    agentId: 'codex',
+    cwd: process.cwd(),
+  })
+  codexRunner.lastActivityAt = 9_500
+
+  assert.equal(getLivenessIdleMs(codexRunner, 1_000, now), 9_000)
+  assert.equal(getLivenessIdleMs({ lastActivityAt: 9_500 }, 1_000, now), 500)
+})
+
 test('createIdleTimeoutEventGate suppresses late events after idle timeout', () => {
   const forwarded: string[] = []
   const suppressed: Array<{ kind: string; count: number }> = []
@@ -102,6 +116,8 @@ class HangingCodexAppServerRunner extends CodexAppServerRunner {
   shutdownFinished = false
   secondStartedAfterShutdown: boolean | null = null
   submissions: string[] = []
+  rawActivityTicks = 0
+  private rawActivityTimer: ReturnType<typeof setInterval> | null = null
 
   constructor() {
     super({
@@ -124,6 +140,14 @@ class HangingCodexAppServerRunner extends CodexAppServerRunner {
       this.lastActivityAt = Date.now() - LIVENESS_IDLE_TIMEOUT_DEFAULT_MS - 1_000
       return new Promise<void>(() => {})
     }
+    if (text === 'first-raw-active') {
+      this.lastActivityAt = Date.now()
+      this.rawActivityTimer = setInterval(() => {
+        this.rawActivityTicks++
+        this.lastActivityAt = Date.now()
+      }, 1_000)
+      return new Promise<void>(() => {})
+    }
 
     this.secondStartedAfterShutdown = this.shutdownFinished
     this.emitFakeResult(false)
@@ -131,6 +155,10 @@ class HangingCodexAppServerRunner extends CodexAppServerRunner {
 
   override async shutdown() {
     this.shutdownCalled = true
+    if (this.rawActivityTimer) {
+      clearInterval(this.rawActivityTimer)
+      this.rawActivityTimer = null
+    }
     this.emitFakeResult(true)
     this.shutdownFinished = true
   }
@@ -176,7 +204,7 @@ function makeTestSession(runner: HangingCodexAppServerRunner): any {
 }
 
 test('SessionManager idle timeout hard-resets codex app-server and suppresses late old-turn events', async () => {
-  mock.timers.enable({ apis: ['setInterval', 'setTimeout'] })
+  mock.timers.enable({ apis: ['Date', 'setInterval', 'setTimeout'] })
   try {
     const manager = new SessionManager({} as any)
     const runner = new HangingCodexAppServerRunner()
@@ -187,7 +215,7 @@ test('SessionManager idle timeout hard-resets codex app-server and suppresses la
     await Promise.resolve()
     const second = manager.submit(session, 'second', (e) => events.push(e))
 
-    mock.timers.tick(15_001)
+    mock.timers.tick(LIVENESS_IDLE_TIMEOUT_DEFAULT_MS + 15_001)
     await first
     await second
 
@@ -195,6 +223,37 @@ test('SessionManager idle timeout hard-resets codex app-server and suppresses la
     assert.equal(runner.shutdownCalled, true)
     assert.equal(runner.secondStartedAfterShutdown, true)
     assert.deepEqual(runner.submissions, ['first', 'second'])
+    assert.deepEqual(
+      events.map((e) => e.kind),
+      ['error', 'final'],
+    )
+    assert.match(events[0].error, /子进程约 5 分钟无输出,已中断。请重试。/)
+  } finally {
+    mock.timers.reset()
+  }
+})
+
+test('SessionManager codex app-server idle timeout ignores raw internal activity without visible events', async () => {
+  mock.timers.enable({ apis: ['Date', 'setInterval', 'setTimeout'] })
+  try {
+    const manager = new SessionManager({} as any)
+    const runner = new HangingCodexAppServerRunner()
+    const session = makeTestSession(runner)
+    const events: any[] = []
+
+    const first = manager.submit(session, 'first-raw-active', (e) => events.push(e))
+    await Promise.resolve()
+    const second = manager.submit(session, 'second', (e) => events.push(e))
+
+    mock.timers.tick(LIVENESS_IDLE_TIMEOUT_DEFAULT_MS + 15_001)
+    await first
+    await second
+
+    assert.ok(runner.rawActivityTicks > 0)
+    assert.equal(runner.interrupted, true)
+    assert.equal(runner.shutdownCalled, true)
+    assert.equal(runner.secondStartedAfterShutdown, true)
+    assert.deepEqual(runner.submissions, ['first-raw-active', 'second'])
     assert.deepEqual(
       events.map((e) => e.kind),
       ['error', 'final'],

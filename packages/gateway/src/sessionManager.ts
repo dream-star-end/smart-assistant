@@ -39,6 +39,21 @@ export function shouldHardResetRunnerAfterIdleTimeout(runner: unknown): boolean 
   return runner instanceof CodexAppServerRunner
 }
 
+export function getLivenessIdleMs(
+  runner: unknown,
+  visibleActivityAt: number,
+  now = Date.now(),
+): number {
+  if (runner instanceof CodexAppServerRunner) {
+    return now - visibleActivityAt
+  }
+  const lastActivityAt =
+    runner && typeof runner === 'object' && typeof (runner as any).lastActivityAt === 'number'
+      ? (runner as any).lastActivityAt
+      : visibleActivityAt
+  return now - lastActivityAt
+}
+
 export function createIdleTimeoutEventGate(
   onEvent: (e: SessionStreamEvent) => void,
   onSuppressed?: (e: SessionStreamEvent, count: number) => void,
@@ -787,7 +802,11 @@ export class SessionManager {
       // turn-level backstop that resets on every stdout message.
       const CHECK_INTERVAL = 15_000 // check every 15s
       let livenessTimer: NodeJS.Timeout | null = null
-      eventGate = createIdleTimeoutEventGate(onEvent, (e, count) => {
+      let visibleActivityAt = Date.now()
+      eventGate = createIdleTimeoutEventGate((e) => {
+        visibleActivityAt = Date.now()
+        onEvent(e)
+      }, (e, count) => {
         if (count <= 3) {
           log.warn('suppressed late event after idle timeout', {
             sessionKey: session.sessionKey,
@@ -798,7 +817,7 @@ export class SessionManager {
       })
       const livenessPromise = new Promise<never>((_, reject) => {
         livenessTimer = setInterval(() => {
-          const idleMs = Date.now() - session.runner.lastActivityAt
+          const idleMs = getLivenessIdleMs(session.runner, visibleActivityAt)
           const parser = session._currentParser
           const threshold = getLivenessIdleTimeoutMs(parser)
           if (idleMs > threshold) {
