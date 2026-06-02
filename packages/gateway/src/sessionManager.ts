@@ -25,6 +25,7 @@ const log = createLogger({ module: 'sessionManager' })
 export const LIVENESS_IDLE_TIMEOUT_TOOL_MS = 15 * 60_000
 export const LIVENESS_IDLE_TIMEOUT_DEFAULT_MS = 5 * 60_000
 export const LIVENESS_IDLE_TIMEOUT_COMPACTING_MS = 20 * 60_000
+export const IDLE_TIMEOUT_TURN_DRAIN_MS = 2_000
 
 export function getLivenessIdleTimeoutMs(
   parser: { pendingToolCalls?: number; isCompacting?: boolean } | null | undefined,
@@ -32,6 +33,36 @@ export function getLivenessIdleTimeoutMs(
   if (parser?.isCompacting) return LIVENESS_IDLE_TIMEOUT_COMPACTING_MS
   if ((parser?.pendingToolCalls ?? 0) > 0) return LIVENESS_IDLE_TIMEOUT_TOOL_MS
   return LIVENESS_IDLE_TIMEOUT_DEFAULT_MS
+}
+
+export function shouldHardResetRunnerAfterIdleTimeout(runner: unknown): boolean {
+  return runner instanceof CodexAppServerRunner
+}
+
+export function createIdleTimeoutEventGate(
+  onEvent: (e: SessionStreamEvent) => void,
+  onSuppressed?: (e: SessionStreamEvent, count: number) => void,
+): {
+  emit: (e: SessionStreamEvent) => void
+  suppress: () => void
+  suppressedCount: () => number
+} {
+  let suppressing = false
+  let suppressed = 0
+  return {
+    emit: (e) => {
+      if (suppressing) {
+        suppressed++
+        onSuppressed?.(e, suppressed)
+        return
+      }
+      onEvent(e)
+    },
+    suppress: () => {
+      suppressing = true
+    },
+    suppressedCount: () => suppressed,
+  }
 }
 
 type ChatHistoryMessage = {
@@ -651,6 +682,8 @@ export class SessionManager {
     const prev = session.lock
     let release!: () => void
     session.lock = new Promise<void>((r) => (release = r))
+    let eventGate: ReturnType<typeof createIdleTimeoutEventGate> | null = null
+    let turnPromise: Promise<void> | null = null
     try {
       await prev
       // effort 应用必须在本 turn 真正启动**之前**完成,且必须在 prev 之后:
@@ -754,6 +787,15 @@ export class SessionManager {
       // turn-level backstop that resets on every stdout message.
       const CHECK_INTERVAL = 15_000 // check every 15s
       let livenessTimer: NodeJS.Timeout | null = null
+      eventGate = createIdleTimeoutEventGate(onEvent, (e, count) => {
+        if (count <= 3) {
+          log.warn('suppressed late event after idle timeout', {
+            sessionKey: session.sessionKey,
+            kind: e.kind,
+            count,
+          })
+        }
+      })
       const livenessPromise = new Promise<never>((_, reject) => {
         livenessTimer = setInterval(() => {
           const idleMs = Date.now() - session.runner.lastActivityAt
@@ -764,20 +806,15 @@ export class SessionManager {
           }
         }, CHECK_INTERVAL)
       })
+      turnPromise = this.runOneTurnWithRetry(session, runnerPayload, eventGate.emit)
       try {
-        await Promise.race([
-          this.runOneTurnWithRetry(session, runnerPayload, onEvent),
-          livenessPromise,
-        ])
+        await Promise.race([turnPromise, livenessPromise])
       } finally {
         if (livenessTimer) clearInterval(livenessTimer)
       }
     } catch (err: any) {
       if (err?.message?.includes('idle timeout')) {
-        // Actually interrupt the runner so the subprocess stops
-        try {
-          session.runner.interrupt()
-        } catch {}
+        if (!eventGate || !turnPromise) throw err
         // Extract idle seconds from the inner error so the user-facing
         // message reflects the actual silence duration (avoids confusing
         // mismatch with the inner 30-min idle timer's fixed wording).
@@ -788,7 +825,69 @@ export class SessionManager {
           kind: 'error',
           error: `子进程${detail},已中断。请重试。`,
         })
-        log.error('idle timeout, interrupted', { sessionKey: session.sessionKey }, err)
+        eventGate.suppress()
+
+        // Actually interrupt the active turn. For codex app-server, an
+        // interrupt can leave the long-lived JSON-RPC process wedged/high-CPU;
+        // hard-reset that runner so the next submit respawns a fresh process
+        // instead of reusing the stuck one. Keep this scoped to app-server:
+        // legacy codex exec is per-turn, and CCB has different interrupt
+        // semantics.
+        let interrupted = false
+        try {
+          interrupted = session.runner.interrupt()
+        } catch (interruptErr) {
+          log.warn('idle timeout interrupt failed', {
+            sessionKey: session.sessionKey,
+            err: (interruptErr as Error).message,
+          })
+        }
+
+        const hardResetRunner = shouldHardResetRunnerAfterIdleTimeout(session.runner)
+        let hardResetDone = false
+        let hardResetError: string | undefined
+        if (hardResetRunner) {
+          try {
+            await session.runner.shutdown()
+            hardResetDone = true
+          } catch (shutdownErr) {
+            hardResetError = (shutdownErr as Error).message
+            log.error('idle timeout hard reset failed', {
+              sessionKey: session.sessionKey,
+              err: hardResetError,
+            })
+          }
+        }
+
+        let oldTurnSettled = false
+        await Promise.race([
+          turnPromise
+            .then(() => {
+              oldTurnSettled = true
+            })
+            .catch((turnErr) => {
+              oldTurnSettled = true
+              log.warn('idle timeout old turn promise rejected after recovery', {
+                sessionKey: session.sessionKey,
+                err: (turnErr as Error).message,
+              })
+            }),
+          new Promise<void>((resolve) => setTimeout(resolve, IDLE_TIMEOUT_TURN_DRAIN_MS)),
+        ])
+
+        log.error(
+          'idle timeout, interrupted',
+          {
+            sessionKey: session.sessionKey,
+            interrupted,
+            hardResetRunner,
+            hardResetDone,
+            ...(hardResetError ? { hardResetError } : {}),
+            oldTurnSettled,
+            suppressedLateEvents: eventGate.suppressedCount(),
+          },
+          err,
+        )
       } else {
         throw err
       }
