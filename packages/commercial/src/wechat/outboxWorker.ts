@@ -34,6 +34,8 @@ import type { IlinkMediaPart, IlinkPart, OutboxRow } from './types.js'
 import type { ResolveOutboundMediaPartFn, ResolvedWechatOutboundMedia } from './outboundMedia.js'
 import { MASTER_USER_PREFIX } from './userIds.js'
 
+export const DEFAULT_INTER_PART_DELAY_MS = 1000
+
 /** sendText 实装返回。permanent → broker 立即 force-fail 不复活;否则按 attempts cap 兜底。 */
 export interface SendResult {
   ok: boolean
@@ -63,6 +65,7 @@ export type GetBindingFn = (bindingUserId: string) => Promise<{
 } | null>
 
 export type LogFn = (level: 'info' | 'warn' | 'error', message: string) => void
+export type DelayFn = (ms: number) => Promise<void>
 
 export interface OutboxWorkerOptions {
   pool: Pool
@@ -77,6 +80,10 @@ export interface OutboxWorkerOptions {
   pollIntervalMs?: number
   /** 重试 cap。默认 DEFAULT_MAX_ATTEMPTS。 */
   maxAttempts?: number
+  /** 同一 outbox row 内连续 iLink sendmessage 之间的 pacing。默认 1000ms。 */
+  interPartDelayMs?: number
+  /** 注入 delay 便于测试。默认 setTimeout。 */
+  delay?: DelayFn
   /** 注入 now 便于测试。默认 Date.now。 */
   now?: () => number
 }
@@ -131,9 +138,13 @@ export async function drainOne(
     getBinding: GetBindingFn
     now: () => number
     maxAttempts: number
+    interPartDelayMs?: number
+    delay?: DelayFn
   },
 ): Promise<DrainOutcome> {
   const { pool, sendText, sendMedia, resolveMediaPart, getBinding, now, maxAttempts } = deps
+  const interPartDelayMs = deps.interPartDelayMs ?? 0
+  const delay = deps.delay ?? defaultDelay
 
   // outbox.binding_user_id 沿 PG-side 命名(raw digit,见 userIds.ts);跨入 master sqlite
   // 读 wechat_bindings 时 prepend `c:` 前缀,与 inboundDispatcher 写 client_sessions 时
@@ -159,7 +170,8 @@ export async function drainOne(
   // 若整行没有任何可发送的 text part(空数组 / 全 unknown part / 全 text-but-empty),
   // 不能静默 markSent 丢消息,转 failed_permanent("invalid_payload")。
   let sentParts = 0
-  for (const part of row.payload) {
+  for (let i = 0; i < row.payload.length; i++) {
+    const part = row.payload[i]!
     let result: SendResult | null = null
     if (isTextPart(part)) {
       result = await sendText({
@@ -203,6 +215,9 @@ export async function drainOne(
         : { kind: 'failed_transient', outboxId: row.id, attempts: r.attempts, errMessage: errMsg }
     }
     sentParts++
+    if (interPartDelayMs > 0 && hasLaterSendablePart(row.payload, i, Boolean(sendMedia && resolveMediaPart))) {
+      await delay(interPartDelayMs)
+    }
   }
 
   if (sentParts === 0) {
@@ -228,6 +243,25 @@ function isMediaPart(p: IlinkPart): p is IlinkMediaPart {
     typeof p.containerPath === 'string' &&
     typeof p.filename === 'string'
   )
+}
+
+function isSendablePart(
+  p: IlinkPart,
+  mediaEnabled: boolean,
+): boolean {
+  if (isTextPart(p)) return true
+  return mediaEnabled && isMediaPart(p)
+}
+
+function hasLaterSendablePart(
+  payload: readonly IlinkPart[],
+  currentIndex: number,
+  mediaEnabled: boolean,
+): boolean {
+  for (let i = currentIndex + 1; i < payload.length; i++) {
+    if (isSendablePart(payload[i]!, mediaEnabled)) return true
+  }
+  return false
 }
 
 /**
@@ -256,6 +290,8 @@ export class OutboxWorker {
       maxPerTick: options.maxPerTick ?? 20,
       pollIntervalMs: options.pollIntervalMs ?? 1000,
       maxAttempts: options.maxAttempts ?? DEFAULT_MAX_ATTEMPTS,
+      interPartDelayMs: options.interPartDelayMs ?? DEFAULT_INTER_PART_DELAY_MS,
+      delay: options.delay ?? defaultDelay,
       now: options.now ?? Date.now,
     }
   }
@@ -347,4 +383,8 @@ export async function runHousekeeping(
 function defaultLog(level: 'info' | 'warn' | 'error', message: string): void {
   const out = level === 'error' ? console.error : level === 'warn' ? console.warn : console.log
   out(`[outboxWorker] ${message}`)
+}
+
+function defaultDelay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms))
 }

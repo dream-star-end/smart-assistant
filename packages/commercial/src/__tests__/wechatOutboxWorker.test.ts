@@ -124,6 +124,84 @@ describe('outboxWorker.drainOne', () => {
     )
   })
 
+  test('pacing: 3 text parts → delay called between successful sends only', async () => {
+    const { pool } = makeFakePool(() => ({ rows: [], rowCount: 1 }))
+    const sendCalls: string[] = []
+    const delays: number[] = []
+    const sendText: SendTextFn = async (p) => {
+      sendCalls.push(p.text)
+      return { ok: true }
+    }
+    const getBinding: GetBindingFn = async () => ({
+      botToken: 'tok',
+      contextTokens: { s1: 'ctx-s1' },
+    })
+    const outcome = await drainOne(
+      makeRow({
+        payload: [
+          { type: 'text', text: 'part-1' },
+          { type: 'text', text: 'part-2' },
+          { type: 'text', text: 'part-3' },
+        ],
+      }),
+      {
+        pool,
+        sendText,
+        getBinding,
+        now,
+        maxAttempts: 10,
+        interPartDelayMs: 1000,
+        delay: async (ms) => {
+          delays.push(ms)
+        },
+      },
+    )
+    assert.deepEqual(outcome, { kind: 'sent', outboxId: 1 })
+    assert.deepEqual(sendCalls, ['part-1', 'part-2', 'part-3'])
+    assert.deepEqual(delays, [1000, 1000])
+  })
+
+  test('pacing: failed first send returns immediately and does not delay', async () => {
+    const { pool } = makeFakePool((sql) => {
+      if (/UPDATE wechat_outbox SET[\s\S]+attempts\s*=\s*attempts \+ 1/.test(sql)) {
+        return { rows: [{ attempts: 1, status: 'queued' }], rowCount: 1 }
+      }
+      return { rows: [], rowCount: 1 }
+    })
+    const delays: number[] = []
+    const sendText: SendTextFn = async () => ({ ok: false, errMessage: 'ret=-2' })
+    const getBinding: GetBindingFn = async () => ({
+      botToken: 'tok',
+      contextTokens: { s1: 'ctx-s1' },
+    })
+    const outcome = await drainOne(
+      makeRow({
+        payload: [
+          { type: 'text', text: 'part-1' },
+          { type: 'text', text: 'part-2' },
+        ],
+      }),
+      {
+        pool,
+        sendText,
+        getBinding,
+        now,
+        maxAttempts: 10,
+        interPartDelayMs: 1000,
+        delay: async (ms) => {
+          delays.push(ms)
+        },
+      },
+    )
+    assert.deepEqual(outcome, {
+      kind: 'failed_transient',
+      outboxId: 1,
+      attempts: 1,
+      errMessage: 'ret=-2',
+    })
+    assert.deepEqual(delays, [])
+  })
+
   test('binding gone → forceFail to terminal failed_permanent (no retry)', async () => {
     const { pool, captured } = makeFakePool(() => ({ rows: [], rowCount: 1 }))
     const getBinding: GetBindingFn = async () => null
