@@ -468,12 +468,39 @@ export function makeV3WechatOutboundAdapter(deps: V3WechatOutboundDeps): Channel
         return
       } catch (err) {
         if (err instanceof V3WechatSinkError && err.errorClass === "fatal") {
-          log.warn("send: fatal sink error, dropping", {
+          if (payload.isFinal !== true) {
+            log.warn("send: fatal sink error, dropping", {
+              sessionId: payload.sessionId,
+              outboundId: payload.outboundId,
+              httpStatus: err.httpStatus,
+              err: err.message,
+            })
+            return
+          }
+          log.warn("send: fatal final sink error, enqueueing terminal retry", {
             sessionId: payload.sessionId,
             outboundId: payload.outboundId,
             httpStatus: err.httpStatus,
             err: err.message,
           })
+          const entry: V3WechatRetryEntry = {
+            schemaVersion: 1,
+            payload,
+            firstSeenAt: now(),
+            attempts: 1,
+            lastErrorClass: "fatal",
+            lastErrorAt: now(),
+            lastErrorMessage: err.message.slice(0, 500),
+          }
+          try {
+            await retryQueue.enqueueDurable(entry)
+          } catch (enqErr) {
+            log.error(
+              "send: enqueueDurable failed after fatal final attempt",
+              { sessionId: payload.sessionId, outboundId: payload.outboundId },
+              enqErr,
+            )
+          }
           return
         }
         // transient / 未知 → enqueue durable retry

@@ -14,6 +14,8 @@
  *   - 单 flight drainer:在内存 boolean 锁 + pendingKick 合并多次 kick
  *   - 周期 30s + boot 时 kick(参 startPeriodic)
  *   - 错误分类:`fatal` → unlink + warn;`transient` / 未知 → 计数 + rewrite
+ *   - 例外:message payload 的 `isFinal:true` 即使遇到 fatal 也保留重试,因为
+ *     master 接受 final 后才会清 wechat_running_sessions。
  *
  * **broker.send 与 shutdown 的契约**(Codex slice 7c plan v3 reminder):
  *   - shutdown() 只停 periodic 计时器,不阻塞 enqueueDurable —— 即使 adapter
@@ -286,9 +288,22 @@ export function makeV3WechatRetryQueue(deps: MakeV3WechatRetryQueueDeps): V3Wech
         await unlinkIgnoreEnoent(filepath)
       } catch (err) {
         if (err instanceof V3WechatSinkError && err.errorClass === 'fatal') {
-          stats.fatalDropped++
+          if (!isFinalMessagePayload(entry.payload)) {
+            stats.fatalDropped++
+            log.warn(
+              'v3WechatRetryQueue: fatal sink error, unlinking',
+              {
+                name,
+                ...payloadLogContext(entry.payload),
+                httpStatus: err.httpStatus,
+              },
+              err,
+            )
+            await unlinkIgnoreEnoent(filepath)
+            continue
+          }
           log.warn(
-            'v3WechatRetryQueue: fatal sink error, unlinking',
+            'v3WechatRetryQueue: fatal final sink error, keeping terminal retry',
             {
               name,
               ...payloadLogContext(entry.payload),
@@ -296,8 +311,6 @@ export function makeV3WechatRetryQueue(deps: MakeV3WechatRetryQueueDeps): V3Wech
             },
             err,
           )
-          await unlinkIgnoreEnoent(filepath)
-          continue
         }
         stats.retried++
         stats.pending++
@@ -383,6 +396,10 @@ function isCodexBillingPayload(
   payload: V3WechatOutboundPostPayload,
 ): payload is V3WechatCodexBillingWirePayload {
   return 'type' in payload && payload.type === 'outbound.codex_billing'
+}
+
+function isFinalMessagePayload(payload: V3WechatOutboundPostPayload): payload is V3WechatSinkWirePayload {
+  return !isCodexBillingPayload(payload) && payload.isFinal === true
 }
 
 function isV3WechatRetryEntry(v: unknown): v is V3WechatRetryEntry {

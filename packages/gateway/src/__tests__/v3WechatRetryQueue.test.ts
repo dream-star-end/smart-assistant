@@ -4,7 +4,8 @@
  * Mirrors v3MasterRetryQueue test scope, with wechat-specific payload schema:
  *   - enqueueDurable writes one .json file (atomic rename)
  *   - drainOnce: 2xx success → unlinks; transient → bumps attempts + rewrites;
- *     fatal V3WechatSinkError → unlinks (terminal); TTL drops; ENOENT-tolerant;
+ *     fatal V3WechatSinkError → unlinks except final message payloads, which
+ *     keep retrying so master can clear running-session state; TTL drops; ENOENT-tolerant;
  *     malformed JSON / schema mismatch drops.
  *   - kick is single-flight (concurrent kicks coalesce to one drain pass)
  *   - pendingCount reflects on-disk state including after rewrites
@@ -193,6 +194,28 @@ describe("drainOnce", () => {
     const stats = await q2.drainOnce()
     assert.equal(stats.fatalDropped, 1)
     assert.equal(await q.pendingCount(), 0, "fatal entry must be unlinked")
+  })
+
+  test("fatal final message → keep retrying so final can clear running state", async () => {
+    const q = makeV3WechatRetryQueue({ dir, attemptSend: neverResolves() })
+    await q.enqueueDurable(entry(basePayload({ isFinal: true })))
+    const q2 = makeV3WechatRetryQueue({
+      dir,
+      attemptSend: async () => {
+        throw new V3WechatSinkError("master final 401", "fatal", 401)
+      },
+    })
+    const stats = await q2.drainOnce()
+    assert.equal(stats.fatalDropped, 0)
+    assert.equal(stats.retried, 1)
+    assert.equal(stats.pending, 1)
+    assert.equal(await q.pendingCount(), 1, "final entry stays on disk")
+    const names = await readdir(dir)
+    const fname = names.find((n) => n.endsWith(".json"))!
+    const raw = JSON.parse(await readFile(join(dir, fname), "utf8")) as V3WechatRetryEntry
+    assert.equal(raw.attempts, 2)
+    assert.equal(raw.lastErrorClass, "fatal")
+    assert.equal((raw.payload as V3WechatSinkWirePayload).isFinal, true)
   })
 
   test("TTL exceeded → drop + warn", async () => {

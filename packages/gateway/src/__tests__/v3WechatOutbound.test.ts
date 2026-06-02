@@ -523,8 +523,25 @@ describe("makeV3WechatOutboundAdapter — send orchestration", () => {
       },
     })
     await adapter.init!(makeCtx())
-    await adapter.send!(makeOut())
-    assert.equal(q.enqueued.length, 0, "fatal must NOT enqueue (would just retry-loop until TTL)")
+    await adapter.send!(makeOut({ isFinal: false }))
+    assert.equal(q.enqueued.length, 0, "non-final fatal must NOT enqueue (would just retry-loop until TTL)")
+  })
+
+  test("fatal final error → enqueue terminal retry so master can clear running state", async () => {
+    const q = fakeQueue()
+    const adapter = makeV3WechatOutboundAdapter({
+      config: CFG,
+      retryQueue: q,
+      attemptSendImpl: async () => {
+        throw new V3WechatSinkError("master rejected final 401", "fatal", 401)
+      },
+      now: () => 1_700_000_000_000,
+    })
+    await adapter.init!(makeCtx())
+    await adapter.send!(makeOut({ isFinal: true }))
+    assert.equal(q.enqueued.length, 1)
+    assert.equal(q.enqueued[0]!.lastErrorClass, "fatal")
+    assert.equal(messagePayload(q.enqueued[0]!).isFinal, true)
   })
 
   test("transient error → enqueueDurable", async () => {
