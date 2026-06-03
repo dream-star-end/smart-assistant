@@ -77,6 +77,7 @@ import {
   handlePutSessionGithubSelection,
   handleDeleteSessionGithubSelection,
 } from './githubApi.js'
+import { handleWechatLivePage, handleWechatLiveSnapshot } from './wechatLive.js'
 import { requireUserVerifyDb } from './requireUser.js'
 import { handleListPlans, handleCreateHupi, handleHupiCallback, handleGetOrder } from './payment.js'
 import { handleAgentOpen, handleAgentStatus, handleAgentCancel } from './agent.js'
@@ -494,6 +495,8 @@ export function createCommercialHandler(
     // 详见 handlers.ts handleMediaSign / handleMediaSigned 注释。
     { method: 'POST', path: '/api/media-sign', handler: handleMediaSign },
     { method: 'GET', path: '/api/media-signed', handler: handleMediaSigned },
+    { method: 'GET', path: '/wx/live', handler: handleWechatLivePage },
+    { method: 'GET', path: '/api/wechat/live', handler: handleWechatLiveSnapshot },
     { method: 'GET', path: '/api/me', handler: handleMe },
     // V3 Phase 2 Task 2G: 用户偏好(主题/默认模型/effort/通知/快捷键)
     { method: 'GET', path: '/api/me/preferences', handler: handleGetMyPreferences },
@@ -839,6 +842,9 @@ export function createCommercialHandler(
     // 用户仍能通过签好的 URL drain 容器文件
     '/api/media-sign',
     '/api/media-signed',
+    // WeChat 免登录实时过程页 + 对应只读 JSON 快照 API。
+    '/wx/live',
+    '/api/wechat/',
     // V3 CC 外接 plan Phase 3(2026-05-18)— public-facing
     // `POST /api/anthropic/v1/messages`。必须列在这里,让:
     //   - maintenance gate(L802 起)能把维护期请求统一 503;

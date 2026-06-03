@@ -34,35 +34,33 @@
 import type { IncomingMessage, ServerResponse } from "node:http"
 import type { Pool } from "pg"
 
-import { rootLogger, type Logger } from "../logging/logger.js"
+import { type Logger, rootLogger } from "../logging/logger.js"
 import {
   REQUEST_ID_HEADER,
   ensureRequestId,
   setSecurityHeaders,
 } from "./../http/util.js"
-import { type InboundDispatcher, type DispatchOutcome, type InboundEvent } from "./inboundDispatcher.js"
-import {
-  type OutboundReceiverCtx,
-  type OutboundReceiverHandler,
-} from "./outboundReceiver.js"
-import {
-  OutboxWorker,
-  runHousekeeping,
-  type GetBindingFn,
-  type SendMediaFn,
-  type SendTextFn,
-} from "./outboxWorker.js"
+import type { DispatchOutcome, InboundDispatcher, InboundEvent } from "./inboundDispatcher.js"
+import { buildWechatLiveToken } from "./liveShare.js"
+import type { ResolveOutboundMediaPartFn } from "./outboundMedia.js"
+import type { OutboundReceiverCtx, OutboundReceiverHandler } from "./outboundReceiver.js"
 import { DEFAULT_MAX_ATTEMPTS } from "./outboxStore.js"
 import {
+  type GetBindingFn,
+  OutboxWorker,
+  type SendMediaFn,
+  type SendTextFn,
+  runHousekeeping,
+} from "./outboxWorker.js"
+import {
+  type PgConn,
   RECONCILE_GRACE_MS_DEFAULT,
   activeWsessIdsFromPg,
   deletePointer,
   getCurrentSessionId,
   listOrphanWechatSessions,
-  type PgConn,
 } from "./sessionPointer.js"
 import type { WechatSessionId } from "./types.js"
-import type { ResolveOutboundMediaPartFn } from "./outboundMedia.js"
 import { MASTER_USER_PREFIX } from "./userIds.js"
 
 /** Reconcile 周期默认值。RFC §4.8。 */
@@ -116,10 +114,22 @@ function normalizeDispatcherBindingUserId(input: string): string {
   return input.startsWith("c:") ? input.slice(2) : input
 }
 
+interface WechatRealtimeSessionLinkOptions {
+  env?: NodeJS.ProcessEnv
+  wechatLiveLinkKey?: Buffer
+  userId?: string
+  nowMs?: number
+  ttlMs?: number
+}
+
 export function buildWechatRealtimeSessionLink(
   sessionId: WechatSessionId,
-  env: NodeJS.ProcessEnv = process.env,
+  envOrOptions: NodeJS.ProcessEnv | WechatRealtimeSessionLinkOptions = process.env,
 ): string {
+  const opts: WechatRealtimeSessionLinkOptions = isRealtimeLinkOptions(envOrOptions)
+    ? envOrOptions
+    : { env: envOrOptions }
+  const env = opts.env ?? process.env
   const base =
     env.OPENCLAUDE_PUBLIC_BASE_URL?.trim() ||
     env.OPENCLAUDE_WEB_BASE_URL?.trim() ||
@@ -130,17 +140,51 @@ export function buildWechatRealtimeSessionLink(
   } catch {
     url = new URL(DEFAULT_PUBLIC_BASE_URL)
   }
+  if (opts.wechatLiveLinkKey && opts.userId) {
+    try {
+      const { token } = buildWechatLiveToken(opts.wechatLiveLinkKey, {
+        sessionId,
+        userId: opts.userId,
+        nowMs: opts.nowMs,
+        ttlMs: opts.ttlMs,
+      })
+      url.pathname = "/wx/live"
+      url.search = ""
+      url.hash = ""
+      url.searchParams.set("t", token)
+      return url.toString()
+    } catch {
+      // Keep the broker's reflection path non-throwing; invalid signing
+      // inputs fall back to the authenticated web session URL.
+    }
+  }
   url.searchParams.set("session", sessionId)
   return url.toString()
 }
 
-export function buildWechatRealtimeStartReply(sessionId: WechatSessionId): string {
+export function buildWechatRealtimeStartReply(
+  sessionId: WechatSessionId,
+  linkOptions?: Parameters<typeof buildWechatRealtimeSessionLink>[1],
+): string {
   return [
     "已开始执行。",
-    `实时过程：${buildWechatRealtimeSessionLink(sessionId)}`,
+    `实时过程：${buildWechatRealtimeSessionLink(sessionId, linkOptions ?? process.env)}`,
     "中断任务：直接回复 /stop 或“停止”。",
     "完成后我会把最终结果发到微信。",
   ].join("\n")
+}
+
+function isRealtimeLinkOptions(
+  input: NodeJS.ProcessEnv | WechatRealtimeSessionLinkOptions,
+): input is WechatRealtimeSessionLinkOptions {
+  const obj = input as Record<string, unknown>
+  return (
+    "wechatLiveLinkKey" in obj ||
+    "userId" in obj ||
+    "nowMs" in obj ||
+    "ttlMs" in obj ||
+    typeof obj.env === "object"
+  )
 }
 
 // ─── 公开类型 ──────────────────────────────────────────────────────────────
@@ -213,6 +257,11 @@ export interface BrokerDeps {
   sendMedia?: SendMediaFn
   /** 将安全 containerPath 解析为当前用户 own volume 中的字节。 */
   resolveOutboundMediaPart?: ResolveOutboundMediaPartFn
+  /**
+   * 微信免登录实时过程页的 HMAC key。注入时,WeChat 反射链接使用
+   * `/wx/live?t=<token>`;未注入时保留旧的登录态 `/ ?session=` URL。
+   */
+  wechatLiveLinkKey?: Buffer
   /**
    * WeChat-local UX commands handled at broker layer.
    *
@@ -518,10 +567,18 @@ export function makeWechatBroker(deps: BrokerDeps): WechatBroker {
       outcome.started !== false &&
       outcome.completed !== true
     ) {
-      fireAndForgetReflection(evt, buildWechatRealtimeStartReply(outcome.sessionId), "processing")
+      fireAndForgetReflection(
+        evt,
+        buildWechatRealtimeStartReply(outcome.sessionId, liveLinkOptions(dispatchBindingUserId)),
+        "processing",
+      )
     } else if (outcome.kind === "dispatched") {
-      fireAndForgetReflection(evt, buildWechatTerminalDispatchReply(outcome), "command_echo")
-    } else if (outcome.kind !== "dispatched") {
+      fireAndForgetReflection(
+        evt,
+        buildWechatTerminalDispatchReply(outcome, liveLinkOptions(dispatchBindingUserId)),
+        "command_echo",
+      )
+    } else {
       fireAndForgetReflection(evt, buildWechatDispatchFailureReply(outcome), "command_echo")
     }
     return outcome
@@ -624,8 +681,9 @@ export function makeWechatBroker(deps: BrokerDeps): WechatBroker {
 
   function buildWechatTerminalDispatchReply(
     outcome: Extract<DispatchOutcome, { kind: "dispatched" }>,
+    linkOptions?: Parameters<typeof buildWechatRealtimeSessionLink>[1],
   ): string {
-    const link = buildWechatRealtimeSessionLink(outcome.sessionId)
+    const link = buildWechatRealtimeSessionLink(outcome.sessionId, linkOptions ?? process.env)
     if (outcome.completed === true) {
       return [
         "这条任务已经处理完成。",
@@ -638,6 +696,13 @@ export function makeWechatBroker(deps: BrokerDeps): WechatBroker {
       `可打开实时过程查看状态：${link}`,
       "如需重新执行，请再发送一条具体指令。",
     ].join("\n")
+  }
+
+  function liveLinkOptions(dispatchBindingUserId: string): Parameters<typeof buildWechatRealtimeSessionLink>[1] {
+    return {
+      wechatLiveLinkKey: deps.wechatLiveLinkKey,
+      userId: `${MASTER_USER_PREFIX}${dispatchBindingUserId}`,
+    }
   }
 
   async function handleNewCommand(

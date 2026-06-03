@@ -25,6 +25,7 @@ import {
   type BrokerDeps,
   type BrokerInboundOutcome,
 } from "../wechat/broker.js"
+import { deriveWechatLiveLinkKey } from "../wechat/liveShare.js"
 import type {
   DispatchOutcome,
   InboundDispatcher,
@@ -235,6 +236,7 @@ interface BaseDepsOverrides {
   getBinding?: GetBindingFn
   allMasterWsessRows?: BrokerDeps["allMasterWsessRows"]
   softDeleteMasterSession?: BrokerDeps["softDeleteMasterSession"]
+  wechatLiveLinkKey?: Buffer
   brokerEnabled?: () => boolean
   pool?: Pool
   now?: () => number
@@ -265,6 +267,7 @@ function makeDeps(overrides: BaseDepsOverrides = {}): BrokerDeps {
     allMasterWsessRows,
     softDeleteMasterSession,
     sendText,
+    wechatLiveLinkKey: overrides.wechatLiveLinkKey,
     wechatUxCommands: overrides.wechatUxCommands,
     wechatProcessVisibility: overrides.wechatProcessVisibility,
     saveWechatImages: overrides.saveWechatImages,
@@ -683,6 +686,28 @@ describe("wechatBroker — onInbound", () => {
     assert.equal(sendSpy.calls.length, 1)
     assert.match(sendSpy.calls[0]!.text, /实时过程：https:\/\/claudeai\.chat\/\?session=wsess-/)
     assert.match(sendSpy.calls[0]!.text, /\/stop/)
+  })
+
+  test("dispatcher → dispatched outcome uses signed no-login /wx/live link when key is injected", async () => {
+    const { sendText, spy: sendSpy } = makeSendText({ ok: true })
+    const { dispatcher } = makeDispatcher({
+      kind: "dispatched",
+      sessionId: SESSION_A,
+      newSession: true,
+    })
+    const broker = makeWechatBroker(
+      makeDeps({
+        dispatcher,
+        sendText,
+        wechatLiveLinkKey: deriveWechatLiveLinkKey("b".repeat(64)),
+      }),
+    )
+    const r = await broker.onInbound(makeEvent())
+    assert.equal(r.kind, "dispatched")
+    await flushMicrotasks()
+    assert.equal(sendSpy.calls.length, 1)
+    assert.match(sendSpy.calls[0]!.text, /实时过程：https:\/\/claudeai\.chat\/wx\/live\?t=/)
+    assert.doesNotMatch(sendSpy.calls[0]!.text, /\?session=/)
   })
 
   test("dispatcher started=false outcome does not send stale realtime process link", async () => {

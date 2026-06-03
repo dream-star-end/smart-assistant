@@ -670,7 +670,8 @@ describe("inboundDispatcher — happy path", () => {
       assert.equal(r.sessionId, originalSessionId)
       assert.equal(r.newSession, true)
     }
-    assert.equal(tSpy.posts[0]!.bodyParsed.peer.id, retryAllocatedSessionId)
+    const retryBody = tSpy.posts[0]!.bodyParsed as { peer: { id: string } }
+    assert.equal(retryBody.peer.id, retryAllocatedSessionId)
     assert.equal(storage.spy.upsertCalls[0]!.sessionId, originalSessionId)
     assert.equal(pg.spy.setCalls[0]!.sessionId, originalSessionId)
     assert.deepEqual(pg.spy.runningSetCalls.map((c) => ({
@@ -1458,12 +1459,16 @@ describe("inboundDispatcher — wire correctness", () => {
     assert.equal(failCalls, 0)
   })
 
-  test("body content === { text } (no kind / no rawItemTypes / no sessionMeta)", async () => {
+  test("body content contains original text plus WeChat channel hint, and no extra wire fields", async () => {
     const { transport, spy } = makeTransport([{ status: 200, bodyText: "{}" }])
     const d = makeInboundDispatcher(makeDeps({ transport }))
     await d.dispatch(makeEvent({ text: "你好" }))
     const body = spy.posts[0]!.bodyParsed as Record<string, unknown>
-    assert.deepEqual(body.content, { text: "你好" })
+    const content = body.content as { text: string }
+    assert.match(content.text, /^你好/)
+    assert.match(content.text, /OpenClaude 微信通道系统提示/)
+    assert.match(content.text, /当前这一轮用户正在微信里与你对话/)
+    assert.doesNotMatch(content.text, /微信通道系统提示：发送附件/)
     assert.equal("rawItemTypes" in body, false)
     assert.equal("sessionMeta" in body, false)
     assert.equal("wechatBindingUserId" in body, false)
@@ -1480,6 +1485,7 @@ describe("inboundDispatcher — wire correctness", () => {
     const body = spy.posts[0]!.bodyParsed as Record<string, unknown>
     const content = body.content as { text: string }
     assert.match(content.text, /^随便发我一个文件/)
+    assert.match(content.text, /OpenClaude 微信通道系统提示/)
     assert.match(content.text, /微信通道系统提示：发送附件/)
     assert.match(content.text, /\/home\/agent\/\.openclaude\/generated\/<安全文件名\.ext>/)
     assert.match(content.text, /example\.txt/)
@@ -1491,7 +1497,21 @@ describe("inboundDispatcher — wire correctness", () => {
     const d = makeInboundDispatcher(makeDeps({ transport }))
     await d.dispatch(makeEvent({ text: "发散思维一下，讲讲产品设计" }))
     const body = spy.posts[0]!.bodyParsed as Record<string, unknown>
-    assert.deepEqual(body.content, { text: "发散思维一下，讲讲产品设计" })
+    const content = body.content as { text: string }
+    assert.match(content.text, /^发散思维一下，讲讲产品设计/)
+    assert.match(content.text, /OpenClaude 微信通道系统提示/)
+    assert.doesNotMatch(content.text, /微信通道系统提示：发送附件/)
+  })
+
+  test("near-limit inbound text is truncated but still preserves WeChat channel hint", async () => {
+    const { transport, spy } = makeTransport([{ status: 200, bodyText: "{}" }])
+    const d = makeInboundDispatcher(makeDeps({ transport }))
+    await d.dispatch(makeEvent({ text: "x".repeat(70_000) }))
+    const body = spy.posts[0]!.bodyParsed as Record<string, unknown>
+    const content = body.content as { text: string }
+    assert.equal(content.text.length, 65_536)
+    assert.match(content.text, /OpenClaude 微信通道系统提示/)
+    assert.match(content.text, /当前这一轮用户正在微信里与你对话/)
   })
 
   test("agentId defaults to 'main' when omitted", async () => {

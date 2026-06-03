@@ -28,6 +28,7 @@ import { stubMailer, createResendMailer } from "./auth/mail.js";
 import { wrapIoredis } from "./middleware/rateLimit.js";
 import { createCommercialHandler, type CommercialHandler } from "./http/router.js";
 import { deriveMediaSignKey } from "./http/mediaSign.js";
+import { deriveWechatLiveLinkKey } from "./wechat/liveShare.js";
 import { rootLogger } from "./logging/logger.js";
 import { warmupLoginDummyHash } from "./auth/login.js";
 import { secretToKey } from "./auth/jwt.js";
@@ -1431,6 +1432,7 @@ export async function registerCommercial(
   // cookie 的根因,绕回去等于把 bug 重新放出来。bridgeSecret 缺失通常意味整个
   // file proxy 都没装配(单租户 personal 版),本来也用不到 commercial 媒体渲染。
   let mediaSignKey: Buffer | undefined;
+  let wechatLiveLinkKey: Buffer | undefined;
   if (bridgeSecret) {
     try {
       mediaSignKey = deriveMediaSignKey(bridgeSecret);
@@ -1442,6 +1444,17 @@ export async function registerCommercial(
         error: (err as Error)?.message ?? String(err),
       });
       mediaSignKey = undefined;
+    }
+    try {
+      wechatLiveLinkKey = deriveWechatLiveLinkKey(bridgeSecret);
+      // eslint-disable-next-line no-console
+      console.log("[commercial] v3 wechat live link key derived");
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.error("[commercial] wechat live key derivation failed; live links DISABLED", {
+        error: (err as Error)?.message ?? String(err),
+      });
+      wechatLiveLinkKey = undefined;
     }
   }
 
@@ -1857,6 +1870,7 @@ export async function registerCommercial(
     // agentCwds + realpathSync + isFileAllowed) 把权威,master 侧只做 sanity check
     // (isContainerPathAllowed)。
     mediaSignKey,
+    wechatLiveLinkKey,
     // v1.0.120 feat/codex-disable-rebind:透传给 admin/accounts handler 的
     // adminPatchAccount ctx,active→disabled 转移触发 fanout actor。
     triggerCodexDisableFanout,
@@ -2378,6 +2392,7 @@ export async function registerCommercial(
       sendText: ilinkSendText,
       sendMedia: ilinkSendMedia,
       resolveOutboundMediaPart: resolveWechatOutboundMedia,
+      wechatLiveLinkKey,
       wechatUxCommands: {
         handleModelCommand: async (evt) => {
           const uid = BigInt(evt.bindingUserId);

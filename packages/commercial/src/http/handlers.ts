@@ -214,6 +214,11 @@ export interface CommercialHttpDeps {
    */
   mediaSignKey?: Buffer;
   /**
+   * WeChat read-only live-process bearer link key. Derived from bridgeSecret
+   * with a separate HKDF info string; absent means `/wx/live` API returns 503.
+   */
+  wechatLiveLinkKey?: Buffer;
+  /**
    * v1.0.191 — `/api/media-signed` 冷启动护栏。
    *
    * 用户 idle 超过 idleSweep 阈值 → 容器被 stop。用户回来 reload 页面时:
