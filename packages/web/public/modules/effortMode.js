@@ -241,6 +241,15 @@ function getMenu() {
   return $('effort-menu')
 }
 
+// Keep the fixed-position popup out of .composer-inner. The refreshed glass
+// composer uses overflow/backdrop filters, which can make fixed descendants
+// behave like they are clipped by the composer instead of the viewport.
+function ensureMenuPortal(menu) {
+  if (!menu || !document.body || menu.parentElement === document.body) return
+  menu.dataset.composerMenuPortal = 'true'
+  document.body.appendChild(menu)
+}
+
 function isMenuOpen() {
   const m = getMenu()
   return !!m && !m.hidden
@@ -279,6 +288,7 @@ function openMenu(focusFirst = false) {
   document.dispatchEvent(
     new CustomEvent('composer-popup-opening', { detail: { source: POPUP_SOURCE } }),
   )
+  ensureMenuPortal(menu)
   positionMenu()
   menu.hidden = false
   trigger.setAttribute('aria-expanded', 'true')
@@ -310,9 +320,11 @@ function closeMenu(returnFocusToTrigger = true) {
 function attachGlobalListeners() {
   if (outsideClickListener) return
   outsideClickListener = (ev) => {
-    const wrap = $('composer-modes')
-    if (!wrap) return
-    if (!wrap.contains(ev.target)) closeMenu(false)
+    const trigger = getTrigger()
+    const menu = getMenu()
+    if (!trigger || !menu) return
+    if (trigger.contains(ev.target) || menu.contains(ev.target)) return
+    closeMenu(false)
   }
   keydownListener = (ev) => {
     if (!isMenuOpen()) return
