@@ -39,6 +39,11 @@ const allowedDownloadHostSuffixes = [
   "minimaxi.com",
   "minimax.io",
   "hailuoai.com",
+  // MiniMax Hailuo video files currently come back from a public Alibaba OSS
+  // bucket, e.g. public-cdn-video-data-algeng.oss-cn-wulanchabu.aliyuncs.com.
+  // Keep this scoped to the observed OSS region instead of allowing all
+  // aliyuncs.com hosts.
+  "oss-cn-wulanchabu.aliyuncs.com",
 ];
 
 const OutputFormatSchema = z.enum(["mp3", "wav", "flac", "pcm"]).default("mp3");
@@ -196,18 +201,39 @@ function hexToBase64(hex: string): string {
   return Buffer.from(hex, "hex").toString("base64");
 }
 
+class MiniMaxDownloadUrlError extends HttpError {
+  readonly downloadHost?: string;
+
+  constructor(message: string, downloadHost?: string) {
+    super(502, "MINIMAX_BAD_DOWNLOAD_URL", message);
+    this.name = "MiniMaxDownloadUrlError";
+    this.downloadHost = downloadHost;
+  }
+}
+
+function normalizeDownloadHost(hostname: string): string {
+  return hostname.trim().toLowerCase().replace(/\.$/, "");
+}
+
+export function isAllowedMiniMaxDownloadHost(hostname: string): boolean {
+  const host = normalizeDownloadHost(hostname);
+  if (!host) return false;
+  return allowedDownloadHostSuffixes.some((suffix) => host === suffix || host.endsWith(`.${suffix}`));
+}
+
 function ensureAllowedDownloadUrl(raw: string): URL {
   const url = new URL(raw);
   if (url.protocol !== "https:") {
-    throw new HttpError(502, "MINIMAX_BAD_DOWNLOAD_URL", "minimax returned non-HTTPS download URL");
+    throw new MiniMaxDownloadUrlError("minimax returned non-HTTPS download URL", normalizeDownloadHost(url.hostname));
   }
-  const host = url.hostname.toLowerCase();
-  const allowed = allowedDownloadHostSuffixes.some((suffix) => host === suffix || host.endsWith(`.${suffix}`));
-  if (!allowed) {
-    throw new HttpError(502, "MINIMAX_BAD_DOWNLOAD_URL", "minimax returned unexpected download host");
+  const host = normalizeDownloadHost(url.hostname);
+  if (!isAllowedMiniMaxDownloadHost(host)) {
+    throw new MiniMaxDownloadUrlError("minimax returned unexpected download host", host);
   }
   return url;
 }
+
+export const __internal_minimaxDownloadUrl = { ensureAllowedDownloadUrl };
 
 async function downloadFile(fetchFn: typeof fetch, rawUrl: string): Promise<{ base64: string; contentType: string; bytes: number }> {
   const url = ensureAllowedDownloadUrl(rawUrl);
@@ -536,7 +562,11 @@ export function makeMiniMaxMediaHandler(deps: MiniMaxMediaHandlerDeps): MiniMaxM
       }
     } catch (err) {
       if (err instanceof HttpError) {
-        reqLog.warn("minimax_request_failed", { code: err.code, status: err.status });
+        reqLog.warn("minimax_request_failed", {
+          code: err.code,
+          status: err.status,
+          ...(err instanceof MiniMaxDownloadUrlError && err.downloadHost ? { downloadHost: err.downloadHost } : {}),
+        });
         sendError(res, err.status, err.code, err.message, requestId);
         return;
       }
