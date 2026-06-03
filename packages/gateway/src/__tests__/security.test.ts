@@ -439,6 +439,9 @@ describe('T07: v3 trusted-backend mode (OC_V3_TRUSTED_FILE_SERVE=1)', () => {
     it('allows /home/agent/.codex/generated_images/x.png (Codex media outputs)', () => {
       assert.ok(isFileAllowed('/home/agent/.codex/generated_images/x.png'))
     })
+    it('allows ScanSci downloaded PDFs under ~/.local/share/scansci-pdf/papers', () => {
+      assert.ok(isFileAllowed('/home/agent/.local/share/scansci-pdf/papers/10.1000-example.pdf'))
+    })
     it('allows /tmp/openclaude-abc/x.png (temp prefix carve-in)', () => {
       assert.ok(isFileAllowed('/tmp/openclaude-abc/x.png'))
     })
@@ -569,6 +572,22 @@ describe('T07: v3 trusted-backend mode (OC_V3_TRUSTED_FILE_SERVE=1)', () => {
     })
     it('denies ~/.git-credentials (git store credential helper)', () => {
       assert.ok(!isFileAllowed('/home/agent/.git-credentials'))
+    })
+
+    // ScanSci PDF config/cookies/browser state
+    it('denies ScanSci config.json (API keys / source settings)', () => {
+      assert.ok(!isFileAllowed('/home/agent/.local/share/scansci-pdf/config.json'))
+    })
+    it('denies ScanSci browser_state.json', () => {
+      assert.ok(!isFileAllowed('/home/agent/.local/share/scansci-pdf/cache/browser_state.json'))
+    })
+    it('denies ScanSci cookie files in cache', () => {
+      assert.ok(!isFileAllowed('/home/agent/.local/share/scansci-pdf/cache/vpnsci-cookies.json'))
+      assert.ok(!isFileAllowed('/home/agent/.local/share/scansci-pdf/cache/publisher-cookies.txt'))
+    })
+    it('denies ScanSci root-level cookie/token state files', () => {
+      assert.ok(!isFileAllowed('/home/agent/.local/share/scansci-pdf/vpnsci-cookies.txt'))
+      assert.ok(!isFileAllowed('/home/agent/.local/share/scansci-pdf/openalex-token.json'))
     })
 
     // Persistent XDG config volume — Codex review demanded the **whole subtree**

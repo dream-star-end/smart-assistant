@@ -217,6 +217,7 @@ describe('T04: Critical IDs always present', () => {
     'memory-modal',
     'skills-modal',
     'tasks-modal',
+    'papers-modal',
     'add-task-modal',
     'oauth-modal',
   ]

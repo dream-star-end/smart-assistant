@@ -172,4 +172,33 @@ describe("openclaude-runtime entrypoint env-scrub policy", () => {
       "entrypoint.ts 必须强制 OPENCLAUDE_HOME 指 volume 挂载点",
     );
   });
+
+  test("entrypoint.ts wires ScanSci PDF data dir and array-shaped MCP server config", () => {
+    const src = readFileSync(ENTRYPOINT_TS_PATH, "utf-8");
+    assert.match(
+      src,
+      /const SCANSCI_PDF_DATA_DIR\s*=\s*"\/home\/agent\/\.local\/share\/scansci-pdf"/,
+      "ScanSci PDF data dir must be under the per-user persistent .local volume",
+    );
+    assert.match(
+      src,
+      /cleanEnv\.SCANSCI_PDF_DATA_DIR\s*=\s*SCANSCI_PDF_DATA_DIR/,
+      "entrypoint must pass SCANSCI_PDF_DATA_DIR to gateway/MCP subprocesses",
+    );
+    assert.match(
+      src,
+      /mcpServers:\s*\[cloneScanSciPdfMcpServer\(\)\]/,
+      "minimal openclaude.json must use array-shaped mcpServers, not a keyed object",
+    );
+    assert.match(
+      src,
+      /command:\s*"scansci-pdf"[\s\S]*args:\s*\["run"\]/,
+      "ScanSci MCP server should launch `scansci-pdf run` over stdio",
+    );
+    assert.doesNotMatch(
+      src,
+      /"scansci_pdf_config_get"/,
+      "commercial default ScanSci tool list must not expose raw config dumps",
+    );
+  });
 });

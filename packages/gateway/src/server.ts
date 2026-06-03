@@ -8402,6 +8402,13 @@ export const FILE_BLOCKED_PATTERNS = [
   /\/\.openclaude\/git-creds\//,
   /\/\.git-credentials$/,
 
+  // ScanSci PDF persistent state. PDFs under `papers/` are user work products
+  // and remain allowed in v3 trusted mode; config/cookies/browser state are
+  // credential-bearing runtime state and must never be served as files.
+  /\/\.local\/share\/scansci-pdf\/config\.json$/,
+  /\/\.local\/share\/scansci-pdf\/cache\/browser_state\.json$/,
+  /\/\.local\/share\/scansci-pdf\/(?:cache\/)?[^/]*(cookie|cookies|token|secret|key)[^/]*\.(json|txt|db|sqlite)$/i,
+
   // Persistent XDG user config volume (mounted by v3supervisor V3_USER_CONFIG_MOUNT).
   // Carries credential-bearing config for gh / git scoped / npm / pip /
   // vscode-server / arbitrary user dotfiles — see v3supervisor.ts comment on
