@@ -237,6 +237,9 @@ setMessageDeps({
   scheduleSaveFromUserEdit,
   clearTurnTiming,
   resetReplyTracker,
+  openMemoryModal,
+  openSkillsModal,
+  openTasksModal,
 })
 
 setWsDeps({
@@ -1338,7 +1341,7 @@ const paletteActions = [
   },
   {
     id: 'open-memory',
-    label: '查看 / 编辑 Memory',
+    label: '学习中心 · 记忆',
     kbd: `${_mod}M`,
     section: '学习循环',
     icon: 'brain',
@@ -1349,7 +1352,7 @@ const paletteActions = [
   },
   {
     id: 'open-skills',
-    label: '查看 / 管理 Skills',
+    label: '学习中心 · 技能库',
     section: '学习循环',
     icon: 'bot',
     run: () => {
@@ -1359,7 +1362,7 @@ const paletteActions = [
   },
   {
     id: 'open-tasks',
-    label: '定时任务 / 提醒',
+    label: '学习中心 · 定时任务',
     section: '学习循环',
     icon: 'clock',
     run: () => {

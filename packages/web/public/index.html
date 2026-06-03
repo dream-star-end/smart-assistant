@@ -1495,6 +1495,143 @@
   </div>
 </div>
 
+
+<!-- Context Hub modal: Memory / Skills / Automation -->
+<div id="context-hub-modal" class="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="context-hub-heading">
+  <div class="modal settings-modal context-hub-modal">
+    <div class="modal-head context-hub-head">
+      <div class="modal-title-block">
+        <div class="modal-title-row"><span class="modal-icon" aria-hidden="true">✨</span><h3 id="context-hub-heading">学习与自动化中心</h3><span id="context-hub-agent" class="modal-count-pill">main</span></div>
+        <p class="modal-subtitle">把记忆、技能和提醒做成可视化控制台，让 Agent 越用越懂你。</p>
+      </div>
+      <button class="modal-close" data-close-modal="context-hub-modal" aria-label="关闭">×</button>
+    </div>
+    <div class="context-hub-shell">
+      <aside class="context-hub-nav" aria-label="学习与自动化导航">
+        <button type="button" class="context-nav-card active" data-context-tab="memory">
+          <span class="context-nav-icon">🧠</span><strong>记忆</strong><small>长期偏好与事实</small>
+        </button>
+        <button type="button" class="context-nav-card" data-context-tab="skills">
+          <span class="context-nav-icon">🛠️</span><strong>技能</strong><small>可复用工作流</small>
+        </button>
+        <button type="button" class="context-nav-card" data-context-tab="tasks">
+          <span class="context-nav-icon">⏰</span><strong>任务</strong><small>提醒与自动化</small>
+        </button>
+      </aside>
+      <div class="context-hub-content">
+        <section id="context-panel-memory" class="context-panel">
+          <div class="context-panel-hero memory-hero">
+            <div>
+              <span class="context-kicker">Persistent Context</span>
+              <h4>让 Agent 记住真正重要的事</h4>
+              <p>卡片化维护长期记忆；复杂格式随时切回原文模式。</p>
+            </div>
+            <span id="memory-count-pill" class="context-stat-pill">0 chars</span>
+          </div>
+          <div class="context-toolbar">
+            <div class="context-segmented" role="tablist" aria-label="记忆类型">
+              <button type="button" class="active" data-memory-target="memory">助手观察</button>
+              <button type="button" data-memory-target="user">用户画像</button>
+            </div>
+            <div class="context-toolbar-actions">
+              <span id="memory-entry-count" class="mini-badge">0 条</span>
+              <button id="memory-raw-toggle" type="button" class="btn btn-ghost btn-sm">高级原文编辑</button>
+              <button id="memory-add-entry" type="button" class="btn btn-secondary btn-sm">新增条目</button>
+            </div>
+          </div>
+          <p id="memory-mode-note" class="context-note">卡片模式只在你保存时重新序列化条目；复杂格式请切到原文模式。</p>
+          <div id="memory-card-panel">
+            <label class="sr-only" for="memory-entry-search">搜索记忆</label>
+            <input id="memory-entry-search" class="context-search" placeholder="搜索记忆条目…" />
+            <div id="memory-entries" class="memory-entry-grid"></div>
+          </div>
+          <div id="memory-raw-panel" hidden>
+            <label for="memory-raw-text">记忆原文</label>
+            <textarea id="memory-raw-text" class="context-raw-text" spellcheck="false"></textarea>
+          </div>
+          <div class="context-panel-foot">
+            <span>条目分隔符为单独一行 <code>§</code>。若条目正文包含该分隔符，请使用原文模式。</span>
+            <button id="context-memory-save" type="button" class="btn btn-primary">保存记忆</button>
+          </div>
+        </section>
+
+        <section id="context-panel-skills" class="context-panel" hidden>
+          <div class="context-panel-hero skills-hero">
+            <div>
+              <span class="context-kicker">Skill Library</span>
+              <h4>把好用的方法沉淀成能力</h4>
+              <p>查看平台基线技能，管理你的自建 skill，减少重复说明。</p>
+            </div>
+            <span id="skills-count-pill" class="context-stat-pill">0 skills</span>
+          </div>
+          <div class="skills-layout">
+            <div class="skills-list-pane">
+              <div class="context-toolbar compact">
+                <label class="sr-only" for="skills-search">搜索技能</label>
+                <input id="skills-search" class="context-search" placeholder="搜索技能、标签或描述…" />
+                <button id="skill-new-btn" type="button" class="btn btn-secondary btn-sm">新建技能</button>
+              </div>
+              <div id="context-skills-list" class="skills-card-list"></div>
+            </div>
+            <div class="skills-detail-pane">
+              <div id="skill-detail" class="skill-detail"></div>
+              <div id="skill-editor" class="skill-editor" hidden>
+                <h4 id="skill-editor-title">新建技能</h4>
+                <div class="form-row"><label for="skill-editor-name">技能名称</label><input id="skill-editor-name" placeholder="lowercase-skill-name" /></div>
+                <div class="form-row"><label for="skill-editor-description">一句话描述</label><input id="skill-editor-description" placeholder="什么时候应该使用这个技能" /></div>
+                <div class="form-row"><label for="skill-editor-tags">标签</label><input id="skill-editor-tags" placeholder="frontend, ui, workflow" /></div>
+                <div class="form-row"><label for="skill-editor-body">技能正文</label><textarea id="skill-editor-body" spellcheck="false" placeholder="写清步骤、注意事项和验证方式"></textarea></div>
+                <div class="context-inline-actions">
+                  <button id="skill-editor-cancel" type="button" class="btn btn-ghost">取消</button>
+                  <button id="skill-editor-save" type="button" class="btn btn-primary">保存技能</button>
+                </div>
+              </div>
+              <div class="context-panel-foot right-only">
+                <button id="skill-delete-btn" type="button" class="btn btn-ghost danger-soft" hidden>删除当前技能</button>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section id="context-panel-tasks" class="context-panel" hidden>
+          <div class="context-panel-hero tasks-hero">
+            <div>
+              <span class="context-kicker">Automation</span>
+              <h4>不用记 Cron，也能创建提醒</h4>
+              <p>用常用时间表达创建一次性提醒或重复任务；高级用户仍可直接写 Cron。</p>
+            </div>
+            <span id="tasks-count-pill" class="context-stat-pill">0 tasks</span>
+          </div>
+          <div class="reminder-composer-card">
+            <div class="reminder-grid">
+              <div class="form-row wide"><label for="reminder-message">提醒内容</label><input id="reminder-message" placeholder="例如：提醒我检查论文投稿状态" /></div>
+              <div class="form-row"><label for="reminder-mode">时间类型</label><select id="reminder-mode"><option value="after">几分钟后</option><option value="today">今天某时</option><option value="tomorrow">明天某时</option><option value="daily">每天</option><option value="weekly">每周</option><option value="advanced">高级 Cron</option></select></div>
+              <div class="form-row" data-reminder-fields="after"><label for="reminder-minutes">分钟后</label><input id="reminder-minutes" type="number" min="1" value="10" /></div>
+              <div class="form-row" data-reminder-fields="today,tomorrow,daily,weekly"><label for="reminder-time">时间</label><input id="reminder-time" type="time" value="09:00" /></div>
+              <div class="form-row" data-reminder-fields="weekly"><label for="reminder-weekday">星期</label><select id="reminder-weekday"><option value="1">周一</option><option value="2">周二</option><option value="3">周三</option><option value="4">周四</option><option value="5">周五</option><option value="6">周六</option><option value="0">周日</option></select></div>
+              <div class="form-row wide" data-reminder-fields="advanced"><label for="reminder-cron">Cron 表达式</label><input id="reminder-cron" placeholder="分 时 日 月 周，例如：0 9 * * *" /></div>
+            </div>
+            <div class="reminder-footer-row">
+              <label class="context-checkbox"><input type="checkbox" id="reminder-oneshot" checked /> 一次性任务</label>
+              <div id="reminder-preview" class="reminder-preview">填写提醒信息后自动生成 Cron</div>
+              <button id="context-task-save" type="button" class="btn btn-primary">创建提醒</button>
+            </div>
+            <p class="context-note">提示：Cron 由浏览器时间生成，执行时按你的容器本地时区匹配。</p>
+          </div>
+          <div class="context-tabs" role="tablist" aria-label="任务视图">
+            <button type="button" class="active" data-context-task-tab="cron">定时任务</button>
+            <button type="button" data-context-task-tab="bg">后台任务</button>
+            <button type="button" data-context-task-tab="log">执行记录</button>
+          </div>
+          <div id="context-tasks-cron" class="task-tab-panel"><div id="context-cron-list" class="automation-list"></div></div>
+          <div id="context-tasks-bg" class="task-tab-panel" hidden><div id="context-bg-list" class="automation-list"></div></div>
+          <div id="context-tasks-log" class="task-tab-panel" hidden><div id="context-log-list" class="execution-list"></div></div>
+        </section>
+      </div>
+    </div>
+  </div>
+</div>
+
 <!-- Memory modal -->
 <div id="memory-modal" class="modal-backdrop" role="dialog" aria-modal="true">
   <div class="modal settings-modal">
