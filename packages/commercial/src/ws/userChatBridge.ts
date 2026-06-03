@@ -14,8 +14,9 @@
  *                       │       throw 503 → 关 ws + close code 4503 + retryAfter 给前端
  *                       └─ 内部 fetch ws://<host>:<port>/ws → 双向 pipe(text + binary)
  *
- * 协议透明:本模块**不解析也不修改**任何 chat / agent / tool 帧 — 只做 byte-exact
- * 帧透传。个人版 `/ws` 协议可演进而无需 commercial 配合。
+ * 协议透明为默认路径:非业务控制帧保持 byte-exact 透传；`inbound.message`
+ * 会由 master 注入 trace / 授权 / 历史 / 平台能力提示等私有上下文,再转发给容器。
+ * 个人版 `/ws` 协议可演进而无需 commercial 配合。
  *
  * 失败语义:
  *   - JWT 失败  → ws 立刻 send {type:'error',code:'UNAUTHORIZED'} + close(1008)
@@ -80,6 +81,7 @@ import {
   parseStatusFrame,
   parseUnbindRequest,
 } from "./sessionRepoBindBridge.js";
+import { appendScanSciPaperIntentHintToFrame } from "./paperIntentHint.js";
 
 // ---------- 协议 / 常量 -----------------------------------------------------
 
@@ -1700,7 +1702,10 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 delete sanitizedParsed.__oc_codex_route;
               }
             }
-            inboundParsedFrame = sanitizedParsed;
+            // Chat-native paper integration: keep browser/session text unchanged,
+            // but enrich the master→container frame with a bounded ScanSci PDF
+            // usage hint when the user's message is clearly a paper task.
+            inboundParsedFrame = appendScanSciPaperIntentHintToFrame(sanitizedParsed);
             // CG2b — turnLog 派生:traceId 钉进 bindings,后续 turn 内 log 自动带上
             turnLogForFrame = bridgeLog?.child({ traceId: turnTraceIdForFrame }) ?? null;
             turnLogForFrame?.info("user-chat-bridge: inbound turn start", clientTraceFields);

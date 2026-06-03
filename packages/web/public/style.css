@@ -2462,6 +2462,34 @@ a:hover {
   line-height: 1.35;
   margin-top: 3px;
 }
+.scansci-result-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+}
+.scansci-result-action {
+  border: 1px solid color-mix(in srgb, var(--accent) 22%, var(--border));
+  background: color-mix(in srgb, var(--accent-soft) 48%, var(--bg-raised));
+  color: var(--accent);
+  border-radius: var(--radius-full);
+  padding: 5px 9px;
+  font: inherit;
+  font-size: 11px;
+  font-weight: 720;
+  line-height: 1;
+  cursor: pointer;
+  transition: background 120ms ease, border-color 120ms ease, transform 120ms ease;
+}
+.scansci-result-action:hover {
+  background: color-mix(in srgb, var(--accent-soft) 78%, var(--bg-hover));
+  border-color: color-mix(in srgb, var(--accent) 36%, var(--border));
+  transform: translateY(-1px);
+}
+.scansci-result-action:focus-visible {
+  outline: none;
+  box-shadow: var(--ring);
+}
 .scansci-file-card {
   margin: 6px 0;
 }
@@ -4153,7 +4181,7 @@ a:hover {
   font-size: var(--text-sm);
 }
 
-/* ScanSci PDF paper assistant */
+/* ScanSci PDF paper library (passive, chat-native) */
 .papers-modal {
   max-width: 760px;
 }
@@ -4208,6 +4236,9 @@ a:hover {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: var(--space-3);
+}
+.papers-grid-library {
+  align-items: stretch;
 }
 .papers-card {
   display: flex;

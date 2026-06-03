@@ -1247,7 +1247,6 @@
               <button class="settings-item" data-settings="memory"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5a3 3 0 1 0-5.997.125 4 4 0 0 0-2.526 5.77 4 4 0 0 0 .556 6.588A4 4 0 1 0 12 18Z"/><path d="M12 5a3 3 0 1 1 5.997.125 4 4 0 0 1 2.526 5.77 4 4 0 0 1-.556 6.588A4 4 0 1 1 12 18Z"/></svg>记忆管理</button>
               <button class="settings-item" data-settings="skills"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="7" width="16" height="12" rx="2"/><line x1="12" y1="3" x2="12" y2="7"/><circle cx="9" cy="13" r="1"/><circle cx="15" cy="13" r="1"/></svg>技能管理</button>
               <button class="settings-item" data-settings="tasks"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>定时任务</button>
-              <button class="settings-item" data-settings="papers"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><path d="M10 13h4"/><path d="M10 17h6"/><circle cx="8" cy="13" r=".6"/></svg>论文助手</button>
             </div>
             <div class="settings-section-label">信息</div>
             <button class="settings-item" data-settings="changelog"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><line x1="10" y1="9" x2="8" y2="9"/></svg>更新日志<span id="changelog-badge" class="changelog-badge" hidden></span></button>
@@ -1549,105 +1548,70 @@
   </div>
 </div>
 
-<!-- ScanSci PDF Paper Assistant modal -->
+<!-- ScanSci PDF Paper Library modal (passive, chat-native) -->
 <div id="papers-modal" class="modal-backdrop" role="dialog" aria-modal="true">
   <div class="modal settings-modal papers-modal">
     <div class="modal-head">
       <div class="modal-title-block">
-        <div class="modal-title-row"><span class="modal-icon" aria-hidden="true">📚</span><h3>论文助手</h3></div>
-        <p class="modal-subtitle">搜索论文、下载 DOI/arXiv PDF、批量处理阅读清单并导出引用。</p>
+        <div class="modal-title-row"><span class="modal-icon" aria-hidden="true">📚</span><h3>论文库与下载记录</h3></div>
+        <p class="modal-subtitle">论文搜索、下载和引用已经无感接入聊天；这里用于查看产物说明、状态和后续记录。</p>
       </div>
       <button class="modal-close" data-close-modal="papers-modal" aria-label="关闭">×</button>
     </div>
     <div class="modal-body">
       <div class="papers-hero">
         <div>
-          <div class="papers-hero-kicker">ScanSci PDF 已接入当前 Agent</div>
-          <div class="papers-hero-title">把论文任务交给 Agent</div>
-          <div class="papers-hero-desc">输入 DOI、arXiv ID、题名或关键词，系统会生成清晰任务并调用 MCP 工具完成。</div>
+          <div class="papers-hero-kicker">Chat-native ScanSci PDF</div>
+          <div class="papers-hero-title">直接在聊天里粘 DOI、arXiv 或论文题名</div>
+          <div class="papers-hero-desc">Agent 会自动判断论文任务并调用 ScanSci PDF。搜索结果、PDF 文件卡、引用和失败诊断都会回到当前对话中。</div>
         </div>
-        <div class="papers-hero-badge">MCP</div>
+        <div class="papers-hero-badge">无感</div>
       </div>
 
-      <div class="papers-grid">
-        <section class="papers-card papers-card-primary">
+      <div class="papers-grid papers-grid-library">
+        <section class="papers-card papers-card-primary papers-card-compact">
           <div class="papers-card-head">
-            <div class="papers-card-icon">↓</div>
+            <div class="papers-card-icon">⌁</div>
             <div>
-              <h4>下载单篇 PDF</h4>
-              <p>支持 DOI、arXiv ID、论文 URL 或精确标题。</p>
+              <h4>聊天即入口</h4>
+              <p>发送 “10.1038/nature12373”、arXiv 链接、论文题名或 “搜索某主题论文”，无需先打开任何工具面板。</p>
             </div>
           </div>
-          <input id="papers-download-input" class="papers-input" placeholder="如 10.1038/nature12373 或 2301.00001" />
-          <button class="btn btn-primary papers-card-btn" data-paper-action="download">开始下载</button>
         </section>
 
-        <section class="papers-card">
+        <section class="papers-card papers-card-compact">
           <div class="papers-card-head">
-            <div class="papers-card-icon">⌕</div>
+            <div class="papers-card-icon">▣</div>
             <div>
-              <h4>关键词搜索</h4>
-              <p>先列候选论文，避免误下不相关结果。</p>
+              <h4>结果留在对话里</h4>
+              <p>下载成功后会显示 PDF 路径和文件卡；搜索结果卡片上可以直接继续“下载 PDF”或“生成引用”。</p>
             </div>
           </div>
-          <input id="papers-search-input" class="papers-input" placeholder="如 foundation model drug discovery" />
-          <button class="btn btn-secondary papers-card-btn" data-paper-action="search">搜索论文</button>
-        </section>
-
-        <section class="papers-card">
-          <div class="papers-card-head">
-            <div class="papers-card-icon">☷</div>
-            <div>
-              <h4>批量下载</h4>
-              <p>每行一篇，适合 reading list 或 BibTeX 摘出的 DOI。</p>
-            </div>
-          </div>
-          <textarea id="papers-batch-input" class="papers-input papers-textarea" placeholder="每行一个 DOI / arXiv ID / 标题"></textarea>
-          <button class="btn btn-secondary papers-card-btn" data-paper-action="batch">批量处理</button>
-        </section>
-
-        <section class="papers-card">
-          <div class="papers-card-head">
-            <div class="papers-card-icon">❝</div>
-            <div>
-              <h4>引用导出</h4>
-              <p>生成 BibTeX / RIS / EndNote 引用。</p>
-            </div>
-          </div>
-          <input id="papers-citation-input" class="papers-input" placeholder="输入 DOI 或 arXiv ID" />
-          <select id="papers-citation-format" class="papers-input">
-            <option value="bibtex">BibTeX</option>
-            <option value="ris">RIS</option>
-            <option value="endnote">EndNote</option>
-          </select>
-          <button class="btn btn-secondary papers-card-btn" data-paper-action="citation">生成引用</button>
         </section>
 
         <section class="papers-card papers-card-compact">
           <div class="papers-card-head">
             <div class="papers-card-icon">✓</div>
             <div>
-              <h4>健康检查</h4>
-              <p>检查 OpenAlex、Crossref、Unpaywall、Sci-Hub、Tor 等通道。</p>
+              <h4>状态与诊断</h4>
+              <p>需要检查论文源、网络、WebVPN 或隐身浏览器时，直接在聊天里说“检查论文下载通道状态”。</p>
             </div>
           </div>
-          <button class="btn btn-ghost papers-card-btn" data-paper-action="health">检查可用性</button>
         </section>
 
         <section class="papers-card papers-card-compact papers-card-muted">
           <div class="papers-card-head">
-            <div class="papers-card-icon">◐</div>
+            <div class="papers-card-icon">…</div>
             <div>
-              <h4>隐身浏览器 / 机构登录</h4>
-              <p>当前先提供状态检测和清晰引导；交互式远程浏览器需后续启用隔离 sidecar。</p>
+              <h4>记录即将接入</h4>
+              <p>当前以会话内文件卡和绝对路径为准；后续会在这里汇总跨会话论文库、下载历史和引用记录。</p>
             </div>
           </div>
-          <button class="btn btn-ghost papers-card-btn" data-paper-action="browser">检查状态</button>
         </section>
       </div>
     </div>
     <div class="modal-foot modal-foot-split">
-      <span class="papers-foot-note">提示：如果输入框已有草稿，任务会填入输入框等待你确认。</span>
+      <span class="papers-foot-note">提示：不用从这里启动任务；回到聊天直接描述论文需求即可。</span>
       <button class="btn btn-ghost" data-close-modal="papers-modal">关闭</button>
     </div>
   </div>

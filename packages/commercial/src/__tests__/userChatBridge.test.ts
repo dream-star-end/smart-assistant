@@ -6,7 +6,8 @@
  * 集成场景(真起 ws server + 客户端 + mock 容器 ws server):
  *   - JWT 失败 → close(1008)
  *   - ensureRunning throw ContainerUnreadyError → close(4503) + reason JSON
- *   - 正常路径:用户帧 → 容器,容器帧 → 用户(双向 byte-exact)
+ *   - 正常路径:非 inbound.message 用户帧 → 容器,容器帧 → 用户(双向 byte-exact);
+ *     inbound.message 会被 master 注入 trace/history/platform hints 后转发
  *   - 容器 send back 与早到帧的顺序保证
  *   - binary 帧支持
  *   - 任一侧 close → 另一侧也 close
@@ -33,6 +34,10 @@ import {
   type ResolveContainerEndpoint,
   type UserChatBridgeHandler,
 } from "../ws/userChatBridge.js";
+import {
+  detectScanSciPaperIntent,
+  SCANSCI_PAPER_HINT_MARKER,
+} from "../ws/paperIntentHint.js";
 
 // ------- 测试夹具:bridge gateway + mock 容器 ws server ------------------
 
@@ -189,6 +194,20 @@ describe("rawDataLen", () => {
   });
   test("array of buffers", () => {
     assert.equal(_rawDataLen([Buffer.alloc(3), Buffer.alloc(7)]), 10);
+  });
+});
+
+describe("detectScanSciPaperIntent", () => {
+  test("detects DOI/arXiv and terse Chinese paper topics", () => {
+    assert.equal(detectScanSciPaperIntent("10.1038/nature12373")?.kind, "download");
+    assert.equal(detectScanSciPaperIntent("arXiv:2301.00001")?.kind, "download");
+    assert.equal(detectScanSciPaperIntent("CRISPR prime editing 论文")?.kind, "search");
+    assert.equal(detectScanSciPaperIntent("请给这篇论文生成 BibTeX: 10.1038/nature12373")?.kind, "citation");
+  });
+
+  test("does not trigger generic non-paper PDF/chat text", () => {
+    assert.equal(detectScanSciPaperIntent("晚上吃什么？"), null);
+    assert.equal(detectScanSciPaperIntent("帮我把这个 PDF 转成 Word"), null);
   });
 });
 
@@ -931,6 +950,75 @@ describe("userChatBridge — model authorization", () => {
         { id: "u-old", role: "user", text: "之前问了什么项目", ts: 1 },
         { id: "srv-sess-history-main-t1", role: "assistant", text: "DeepSeek 的回答", ts: 2 },
       ]);
+
+      ws.close();
+      await waitClose(ws);
+    } finally {
+      await stopRig(rig);
+    }
+  });
+
+  test("paper DOI inbound.message gets hidden ScanSci hint only in forwarded frame", async () => {
+    const rig = await startRig();
+    try {
+      const containerOpenP = waitNextContainerSocket(rig);
+      const token = await makeJwt("205");
+      const ws = openClient(rig.gatewayPort, token);
+      await new Promise<void>((r) => ws.once("open", () => r()));
+      const containerWs = await containerOpenP;
+
+      const seenP = new Promise<Buffer | string>((r) => {
+        containerWs.once("message", (d) => {
+          r(typeof d === "string" ? d : Buffer.isBuffer(d) ? d : Buffer.concat(d as Buffer[]));
+        });
+      });
+      ws.send(JSON.stringify({
+        type: "inbound.message",
+        channel: "webchat",
+        peer: { id: "sess-paper", kind: "dm" },
+        content: { text: "10.1038/nature12373" },
+      }));
+      const got = await seenP;
+      const forwarded = JSON.parse(
+        typeof got === "string" ? got : got.toString("utf8"),
+      ) as { content?: { text?: string }; traceId?: string };
+      assert.match(forwarded.traceId ?? "", /^[a-f0-9]{32}$/);
+      assert.ok(forwarded.content?.text?.startsWith("10.1038/nature12373"));
+      assert.ok((forwarded.content?.text ?? "").includes(SCANSCI_PAPER_HINT_MARKER));
+      assert.match(forwarded.content?.text ?? "", /scansci-pdf/);
+
+      ws.close();
+      await waitClose(ws);
+    } finally {
+      await stopRig(rig);
+    }
+  });
+
+  test("ordinary inbound.message content.text is not paper-hinted", async () => {
+    const rig = await startRig();
+    try {
+      const containerOpenP = waitNextContainerSocket(rig);
+      const token = await makeJwt("206");
+      const ws = openClient(rig.gatewayPort, token);
+      await new Promise<void>((r) => ws.once("open", () => r()));
+      const containerWs = await containerOpenP;
+
+      const seenP = new Promise<Buffer | string>((r) => {
+        containerWs.once("message", (d) => {
+          r(typeof d === "string" ? d : Buffer.isBuffer(d) ? d : Buffer.concat(d as Buffer[]));
+        });
+      });
+      ws.send(JSON.stringify({
+        type: "inbound.message",
+        channel: "webchat",
+        peer: { id: "sess-normal", kind: "dm" },
+        content: { text: "晚上吃什么？" },
+      }));
+      const got = await seenP;
+      const forwarded = JSON.parse(
+        typeof got === "string" ? got : got.toString("utf8"),
+      ) as { content?: { text?: string } };
+      assert.equal(forwarded.content?.text, "晚上吃什么？");
 
       ws.close();
       await waitClose(ws);

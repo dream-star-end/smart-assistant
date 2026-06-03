@@ -161,13 +161,6 @@ const slashCommands = [
     },
   },
   {
-    cmd: '/papers',
-    desc: '打开论文助手',
-    run() {
-      _deps.openPapersModal()
-    },
-  },
-  {
     cmd: '/hub',
     desc: '打开 P0/P1 能力导航',
     run() {
