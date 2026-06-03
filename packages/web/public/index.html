@@ -1357,6 +1357,15 @@
             <svg class="mode-pill-caret" viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="6 9 12 15 18 9"/></svg>
           </button>
           <div id="effort-menu" class="effort-menu" role="listbox" aria-labelledby="effort-trigger" hidden></div>
+          <select
+            id="team-select"
+            class="mode-pill team-select"
+            title="选择 Agent 团队。开启后本条消息会由团队队长分派给成员协作。"
+            aria-label="选择 Agent 团队"
+            hidden
+          >
+            <option value="">团队: 关闭</option>
+          </select>
         </div>
         <div class="composer-input-row">
           <textarea id="input" placeholder="发消息给 agent…" rows="1" aria-label="输入消息"></textarea>
@@ -1397,6 +1406,62 @@
       <div class="form-row">
         <label for="new-agent-id">新建 Agent</label>
         <input id="new-agent-id" placeholder="agent id (只能 a-z 0-9 _ -)" maxlength="48" />
+      </div>
+      <hr class="agents-divider" />
+      <div class="team-section-head">
+        <div>
+          <label>Agent Teams</label>
+          <p>把多个专业 Agent 组成团队；发送时由队长使用 delegate_task 分派成员并汇总。</p>
+        </div>
+        <button id="new-team-btn" class="btn btn-secondary" type="button">新建团队</button>
+      </div>
+      <div id="teams-list-wrap"></div>
+      <div id="team-editor" class="team-editor" hidden>
+        <div class="persona-section-label" id="team-editor-title">新建团队</div>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:var(--space-3);margin-bottom:var(--space-3)">
+          <div class="form-row" style="margin:0">
+            <label for="team-id">团队 ID</label>
+            <input id="team-id" placeholder="如: dev_team" maxlength="48" />
+          </div>
+          <div class="form-row" style="margin:0">
+            <label for="team-name">名称</label>
+            <input id="team-name" placeholder="如: 研发小队" maxlength="80" />
+          </div>
+        </div>
+        <div class="form-row">
+          <label for="team-description">说明</label>
+          <input id="team-description" placeholder="团队擅长的任务与边界" maxlength="300" />
+        </div>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:var(--space-3);margin-bottom:var(--space-3)">
+          <div class="form-row" style="margin:0">
+            <label for="team-leader">队长 Agent</label>
+            <select id="team-leader"></select>
+          </div>
+          <div class="form-row" style="margin:0">
+            <label for="team-max-parallel">最大并行</label>
+            <select id="team-max-parallel">
+              <option value="1">1</option>
+              <option value="2">2</option>
+              <option value="3" selected>3</option>
+              <option value="4">4</option>
+              <option value="5">5</option>
+            </select>
+          </div>
+        </div>
+        <div class="form-row">
+          <label for="team-members">成员列表</label>
+          <textarea id="team-members" placeholder="每行一个: agentId | 角色 | 职责&#10;researcher | 调研 | 搜集资料并列出处&#10;reviewer | 审阅 | 检查风险和遗漏" style="min-height:96px"></textarea>
+        </div>
+        <div class="team-policy-row">
+          <label><input id="team-require-review" type="checkbox" /> 需要复核</label>
+          <select id="team-review-agent" title="复核 Agent"></select>
+        </div>
+        <div class="team-editor-actions">
+          <button id="team-delete-btn" class="btn btn-danger" type="button" hidden>删除</button>
+          <div style="flex:1"></div>
+          <button id="team-cancel-btn" class="btn btn-ghost" type="button">取消</button>
+          <button id="team-save-btn" class="btn btn-primary" type="button">保存团队</button>
+        </div>
       </div>
     </div>
     <div class="modal-foot">

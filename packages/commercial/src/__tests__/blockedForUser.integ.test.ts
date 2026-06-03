@@ -201,6 +201,12 @@ describe("BLOCKED_FOR_USER_RULES — user role → 403", () => {
     { path: "/api/agents/main/skills", method: "POST" },
     { path: "/api/agents/main/skills/my-skill", method: "GET" },
     { path: "/api/agents/main/skills/my-skill", method: "DELETE" },
+    // host agent teams(写 host singleton agents.yaml;用户只能走 container proxy)
+    { path: "/api/agent-teams", method: "GET" },
+    { path: "/api/agent-teams", method: "POST" },
+    { path: "/api/agent-teams/dev_team", method: "GET" },
+    { path: "/api/agent-teams/dev_team", method: "PUT" },
+    { path: "/api/agent-teams/dev_team", method: "DELETE" },
     // host cron / tasks / webhooks(prompt 注入 = RCE)
     { path: "/api/cron", method: "GET" },
     { path: "/api/cron", method: "POST" },

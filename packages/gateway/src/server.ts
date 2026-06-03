@@ -39,6 +39,7 @@ import {
 import { classifyRunError } from './errorClassify.js'
 import {
   type AgentDef,
+  type AgentTeamDef,
   type AgentsConfig,
   MemoryStore,
   type OpenClaudeConfig,
@@ -60,6 +61,7 @@ import {
   listUnclaimedSessions,
   claimSession,
 } from '@openclaude/storage'
+import { normalizeAgentTeamInput, TEAM_ID_RE } from './agentTeams.js'
 import { type WebSocket, WebSocketServer } from 'ws'
 import { checkToken, verifyPassword, signJwt, verifyJwt, type JwtPayload } from './auth.js'
 import { CronScheduler } from './cron.js'
@@ -2178,6 +2180,19 @@ export class Gateway {
     }
     if (url.pathname === '/api/agents') {
       this.handleAgentsCollection(req, res).catch((err) => this.sendError(res, 500, String(err)))
+      return
+    }
+    if (url.pathname === '/api/agent-teams') {
+      this.handleAgentTeamsCollection(req, res).catch((err) =>
+        this.sendError(res, 500, String(err)),
+      )
+      return
+    }
+    const agentTeamIdMatch = url.pathname.match(/^\/api\/agent-teams\/([a-zA-Z0-9_-]+)$/)
+    if (agentTeamIdMatch) {
+      this.handleAgentTeamItem(req, res, agentTeamIdMatch[1]).catch((err) =>
+        this.sendError(res, 500, String(err)),
+      )
       return
     }
     const agentIdMatch = url.pathname.match(/^\/api\/agents\/([a-zA-Z0-9_-]+)$/)
@@ -4391,6 +4406,80 @@ export class Gateway {
       // 热更新路由
       this.router.reload(cfg)
       this.sendJson(res, 201, { agent })
+      return
+    }
+    this.sendError(res, 405, 'method not allowed')
+  }
+
+  // GET /api/agent-teams         → { teams }
+  // POST /api/agent-teams        → create team
+  private async handleAgentTeamsCollection(
+    req: IncomingMessage,
+    res: ServerResponse,
+  ): Promise<void> {
+    const cfg = await readAgentsConfig()
+    const teams: AgentTeamDef[] = cfg.teams ?? []
+    if (req.method === 'GET') {
+      this.sendJson(res, 200, { teams })
+      return
+    }
+    if (req.method === 'POST') {
+      const body = await this.readJsonBody<Partial<AgentTeamDef>>(req)
+      let team: AgentTeamDef
+      try {
+        team = normalizeAgentTeamInput(body, cfg.agents, teams)
+      } catch (err: any) {
+        this.sendError(res, 400, err?.message ?? String(err))
+        return
+      }
+      cfg.teams = [...teams, team]
+      await writeAgentsConfig(cfg)
+      this.deps.agentsConfig = cfg
+      this.sendJson(res, 201, { team })
+      return
+    }
+    this.sendError(res, 405, 'method not allowed')
+  }
+
+  // GET /api/agent-teams/:id    → { team }
+  // PUT /api/agent-teams/:id    → update team
+  // DELETE /api/agent-teams/:id → remove team
+  private async handleAgentTeamItem(
+    req: IncomingMessage,
+    res: ServerResponse,
+    id: string,
+  ): Promise<void> {
+    if (!TEAM_ID_RE.test(id)) return this.sendError(res, 404, 'team not found')
+    const cfg = await readAgentsConfig()
+    const teams: AgentTeamDef[] = cfg.teams ?? []
+    const idx = teams.findIndex((t) => t.id === id)
+    if (idx < 0) return this.sendError(res, 404, 'team not found')
+    if (req.method === 'GET') {
+      this.sendJson(res, 200, { team: teams[idx] })
+      return
+    }
+    if (req.method === 'PUT') {
+      const body = await this.readJsonBody<Partial<AgentTeamDef>>(req)
+      let team: AgentTeamDef
+      try {
+        team = normalizeAgentTeamInput({ ...body, id }, cfg.agents, teams, { currentId: id })
+      } catch (err: any) {
+        this.sendError(res, 400, err?.message ?? String(err))
+        return
+      }
+      const nextTeams = teams.slice()
+      nextTeams[idx] = team
+      cfg.teams = nextTeams
+      await writeAgentsConfig(cfg)
+      this.deps.agentsConfig = cfg
+      this.sendJson(res, 200, { team })
+      return
+    }
+    if (req.method === 'DELETE') {
+      cfg.teams = teams.filter((t) => t.id !== id)
+      await writeAgentsConfig(cfg)
+      this.deps.agentsConfig = cfg
+      this.sendJson(res, 200, { ok: true })
       return
     }
     this.sendError(res, 405, 'method not allowed')

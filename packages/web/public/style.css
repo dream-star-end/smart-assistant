@@ -4644,6 +4644,59 @@ a:hover {
   border: none;
   border-top: 1px solid color-mix(in srgb, var(--border-subtle) 72%, transparent);
 }
+.team-select {
+  width: auto;
+  max-width: 180px;
+  min-height: 34px;
+  padding: 0 28px 0 12px;
+  color: var(--fg);
+  cursor: pointer;
+}
+.team-section-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-3);
+  margin-bottom: var(--space-3);
+}
+.team-section-head label {
+  display: block;
+  font-weight: 700;
+  color: var(--fg);
+  margin-bottom: 4px;
+}
+.team-section-head p {
+  margin: 0;
+  color: var(--fg-muted);
+  font-size: var(--text-sm);
+  line-height: 1.5;
+}
+.team-editor {
+  margin-top: var(--space-4);
+  padding: var(--space-4);
+  border: 1px solid color-mix(in srgb, var(--border) 72%, transparent);
+  border-radius: var(--radius-xl);
+  background: color-mix(in srgb, var(--bg-raised) 52%, transparent);
+}
+.team-policy-row,
+.team-editor-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+}
+.team-policy-row {
+  margin: var(--space-3) 0;
+}
+.team-policy-row label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--fg);
+  font-size: var(--text-sm);
+}
+.team-policy-row select {
+  flex: 1;
+}
 
 /* ══════════════════════════════════════════════════════════════════
  *  Command palette
@@ -9416,7 +9469,8 @@ textarea:focus-visible,
 .github-row,
 .key-row,
 .task-row,
-.agent-row {
+.agent-row,
+.team-editor {
   border-radius: var(--radius-xl) !important;
   border-color: var(--oc-hairline-strong) !important;
   background: var(--oc-panel-bg) !important;

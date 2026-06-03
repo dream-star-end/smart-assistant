@@ -40,6 +40,12 @@ export const BRIDGE_API_ALLOWLIST: readonly BridgeApiAllowRule[] = [
   // only when served by the master singleton; proxied to a user's own container they
   // operate on that user's isolated volume/session state.
   {
+    label: '/api/agents',
+    re: /^\/api\/agents$/,
+    methods: M('GET', 'POST'),
+    proxyFromCommercial: true,
+  },
+  {
     label: '/api/agents/:id',
     re: /^\/api\/agents\/[^/]+$/,
     methods: M('GET', 'PUT', 'DELETE'),
@@ -66,6 +72,18 @@ export const BRIDGE_API_ALLOWLIST: readonly BridgeApiAllowRule[] = [
   {
     label: '/api/agents/:id/skills/:name',
     re: /^\/api\/agents\/[^/]+\/skills\/[^/]+$/,
+    methods: M('GET', 'PUT', 'DELETE'),
+    proxyFromCommercial: true,
+  },
+  {
+    label: '/api/agent-teams',
+    re: /^\/api\/agent-teams$/,
+    methods: M('GET', 'POST'),
+    proxyFromCommercial: true,
+  },
+  {
+    label: '/api/agent-teams/:id',
+    re: /^\/api\/agent-teams\/[A-Za-z0-9_-]+$/,
     methods: M('GET', 'PUT', 'DELETE'),
     proxyFromCommercial: true,
   },

@@ -208,8 +208,9 @@ function _setApiKeysLinkVisible(visible) {
 
 /**
  * V3 P0/P1 起,人格/记忆/技能/定时任务不再打 host singleton,而是由 master
- * 安全代理进当前用户自己的容器,所以登录成功即可显示。完整 Agents 管理仍
- * 涉及 `/api/agents` collection / agent create,先保留 admin-only。
+ * 安全代理进当前用户自己的容器,所以登录成功即可显示。团队协作需要用户
+ * 能创建/组合自己的容器内 agents；`/api/agents` collection 也已进入同一
+ * container proxy allowlist,因此管理 Agents 对登录用户开放。
  *
  * 个人版:refreshBalance 404 走 catch 路径保持隐藏,不影响,因为个人版
  * 前端 (/opt/openclaude/openclaude/packages/web/) 是单独的 index.html,
@@ -224,7 +225,7 @@ function _setHostAgentEntriesVisible(visible, admin = false) {
   }
   const manageAgents = document.getElementById('settings-manage-agents-entry')
   if (manageAgents) {
-    if (visible && admin) manageAgents.removeAttribute('hidden')
+    if (visible) manageAgents.removeAttribute('hidden')
     else manageAgents.setAttribute('hidden', '')
   }
 }

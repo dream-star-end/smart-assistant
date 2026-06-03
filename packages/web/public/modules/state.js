@@ -103,6 +103,8 @@ export const state = {
   sendingInFlight: false,
   agentsList: [],
   defaultAgentId: 'main',
+  agentTeams: [],
+  selectedTeamId: '',
   attachments: [],
   recognition: null,
   recognizing: false,

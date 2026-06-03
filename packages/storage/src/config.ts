@@ -170,10 +170,33 @@ export interface RouteRule {
   agent: string
 }
 
+export interface AgentTeamMemberDef {
+  agentId: string
+  role?: string
+  responsibility?: string
+}
+
+export interface AgentTeamPolicy {
+  maxParallel?: number
+  requireReview?: boolean
+  reviewAgentId?: string
+}
+
+export interface AgentTeamDef {
+  id: string
+  name: string
+  description?: string
+  leaderAgentId: string
+  members: AgentTeamMemberDef[]
+  policy?: AgentTeamPolicy
+  updatedAt?: string
+}
+
 export interface AgentsConfig {
   agents: AgentDef[]
   routes: RouteRule[]
   default: string
+  teams?: AgentTeamDef[]
 }
 
 export async function readAgentsConfig(): Promise<AgentsConfig> {
