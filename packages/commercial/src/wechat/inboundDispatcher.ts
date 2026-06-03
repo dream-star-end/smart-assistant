@@ -100,6 +100,15 @@ const DEFAULT_SESSION_TITLE = "微信会话"
 /** 容器侧 handleWechatInbound 对 content.text 的 schema 上限。 */
 const WECHAT_INBOUND_TEXT_MAX_CHARS = 65_536
 
+const WECHAT_CHANNEL_CONTEXT_HINT = [
+  "",
+  "---",
+  "【OpenClaude 微信通道系统提示】",
+  "当前这一轮用户正在微信里与你对话；平台会把最终回复发回微信。",
+  "如果需要发文件、图片或附件，请在最终回复里单独写出 `/home/agent/.openclaude/generated/<安全文件名.ext>` 或 `/home/agent/.openclaude/uploads/<安全文件名.ext>` 绝对路径，平台会自动转成微信附件。",
+  "不要让用户截图、点击容器本地路径，或改去“截链接下载”。",
+].join("\n")
+
 const WECHAT_OUTBOUND_MEDIA_HINT = [
   "",
   "---",
@@ -476,7 +485,7 @@ export function makeInboundDispatcher(deps: InboundDispatcherDeps): InboundDispa
       // 不传:sessionMeta(容器侧 client_sessions 由 sessionManager.handleResult 路径
       // 自己写;master 侧 client_sessions 是 dispatcher Step 2a 直接 upsertMasterClient
       // Session,不经 wire body),traceId(用 x-request-id header 关联)。
-      const dispatchText = withWechatOutboundMediaHint(evt.text)
+      const dispatchText = withWechatChannelHints(evt.text)
       const wireBody = {
         userId: MASTER_USER_PREFIX + evt.bindingUserId,
         peer: { kind: "dm" as const, id: sessionId, displayName: evt.senderId },
@@ -1181,11 +1190,20 @@ function deriveSessionTitle(text: string): string {
   return codePoints.slice(0, 30).join("")
 }
 
-function withWechatOutboundMediaHint(text: string): string {
-  if (!shouldIncludeWechatOutboundMediaHint(text)) return text
-  const hinted = `${text}${WECHAT_OUTBOUND_MEDIA_HINT}`
-  if (hinted.length > WECHAT_INBOUND_TEXT_MAX_CHARS) return text
-  return hinted
+function withWechatChannelHints(text: string): string {
+  let suffix = WECHAT_CHANNEL_CONTEXT_HINT
+  if (shouldIncludeWechatOutboundMediaHint(text)) {
+    const withMedia = `${suffix}${WECHAT_OUTBOUND_MEDIA_HINT}`
+    if (withMedia.length < WECHAT_INBOUND_TEXT_MAX_CHARS) suffix = withMedia
+  }
+  return appendWithReservedSuffix(text, suffix)
+}
+
+function appendWithReservedSuffix(text: string, suffix: string): string {
+  const maxTextLen = WECHAT_INBOUND_TEXT_MAX_CHARS - suffix.length
+  if (maxTextLen <= 0) return suffix.slice(0, WECHAT_INBOUND_TEXT_MAX_CHARS)
+  if (text.length <= maxTextLen) return `${text}${suffix}`
+  return `${text.slice(0, maxTextLen)}${suffix}`
 }
 
 function shouldIncludeWechatOutboundMediaHint(text: string): boolean {
