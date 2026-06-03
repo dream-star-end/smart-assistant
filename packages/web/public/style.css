@@ -10274,3 +10274,78 @@ textarea:focus-visible,
     gap: 6px;
   }
 }
+
+/* v3-opacity-polish-20260604: make credits/settings chrome readable over chat */
+.balance-pill {
+  background:
+    linear-gradient(
+      135deg,
+      color-mix(in srgb, var(--bg-elevated) 92%, var(--accent) 8%),
+      color-mix(in srgb, var(--bg-raised) 90%, var(--accent) 10%)
+    );
+  border-color: color-mix(in srgb, var(--accent) 42%, var(--border-strong));
+  color: var(--accent-active);
+  box-shadow:
+    0 1px 0 color-mix(in srgb, var(--fg-inverse) 16%, transparent) inset,
+    0 14px 30px -24px color-mix(in srgb, var(--accent) 72%, transparent);
+}
+.balance-pill:hover {
+  background:
+    linear-gradient(
+      135deg,
+      color-mix(in srgb, var(--bg-elevated) 88%, var(--accent) 12%),
+      color-mix(in srgb, var(--bg-raised) 86%, var(--accent) 14%)
+    );
+  border-color: color-mix(in srgb, var(--accent) 54%, var(--border-strong));
+}
+.balance-pill svg {
+  opacity: 0.88;
+}
+
+.settings-dropdown {
+  background: color-mix(in srgb, var(--bg-elevated) 98%, var(--bg) 2%);
+  border-color: color-mix(in srgb, var(--border-strong) 90%, var(--fg) 10%);
+  box-shadow:
+    0 1px 0 color-mix(in srgb, var(--fg-inverse) 14%, transparent) inset,
+    0 22px 56px -26px rgba(0, 0, 0, 0.42),
+    0 8px 24px -18px color-mix(in srgb, var(--accent) 55%, transparent);
+}
+.settings-section-label {
+  color: color-mix(in srgb, var(--fg-muted) 78%, var(--fg) 22%);
+}
+.settings-item {
+  color: var(--fg-strong);
+}
+.settings-item:hover {
+  background: color-mix(in srgb, var(--bg-hover) 92%, var(--bg-elevated) 8%);
+}
+.settings-item svg {
+  color: color-mix(in srgb, var(--fg-muted) 84%, var(--fg) 16%);
+}
+
+[data-theme="dark"] .balance-pill {
+  color: var(--accent-hover);
+  background:
+    linear-gradient(
+      135deg,
+      color-mix(in srgb, var(--bg-elevated) 88%, var(--accent) 12%),
+      color-mix(in srgb, var(--bg-raised) 88%, var(--accent) 12%)
+    );
+  border-color: color-mix(in srgb, var(--accent) 48%, var(--border-strong));
+}
+[data-theme="dark"] .settings-dropdown {
+  background: color-mix(in srgb, var(--bg-elevated) 96%, var(--bg) 4%);
+  box-shadow:
+    0 1px 0 color-mix(in srgb, white 6%, transparent) inset,
+    0 24px 64px -24px rgba(0, 0, 0, 0.72),
+    0 8px 26px -20px color-mix(in srgb, var(--accent) 64%, transparent);
+}
+
+@media (max-width: 860px) {
+  .settings-dropdown {
+    background: color-mix(in srgb, var(--bg-elevated) 99%, var(--bg) 1%);
+  }
+  [data-theme="dark"] .settings-dropdown {
+    background: color-mix(in srgb, var(--bg-elevated) 97%, var(--bg) 3%);
+  }
+}
