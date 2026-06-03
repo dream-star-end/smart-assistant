@@ -21,18 +21,18 @@
  */
 
 import { spawn } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import {
   copyFileSync,
   cpSync,
   existsSync,
   mkdirSync,
-  readdirSync,
   readFileSync,
+  readdirSync,
   symlinkSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { randomBytes } from "node:crypto";
 import { createRequire } from "node:module";
 import { join } from "node:path";
 import { isProviderManagedEnvVar } from "/opt/openclaude/claude-code-best/src/utils/managedEnvConstants.ts";
@@ -88,6 +88,128 @@ cleanEnv.CLAUDE_CONFIG_DIR = "/run/oc/claude-config";
 // 修复配对:packages/gateway/src/subprocessRunner.ts 里 `OPENCLAUDE_HOME ?? ''` 改成
 // 存在才传,空串视作 undefined。
 cleanEnv.OPENCLAUDE_HOME = "/home/agent/.openclaude";
+
+// ScanSci PDF stores downloader config/cache/output under one explicit
+// per-user persistent path.  Keep it out of ~/.config (blocked wholesale by
+// the trusted file ACL) so downloaded PDFs can still be served, while gateway
+// blocks the sensitive config/cookie/browser-state files by exact patterns.
+const SCANSCI_PDF_DATA_DIR = "/home/agent/.local/share/scansci-pdf";
+cleanEnv.SCANSCI_PDF_DATA_DIR = SCANSCI_PDF_DATA_DIR;
+
+const SCANSCI_PDF_MCP_ID = "scansci-pdf";
+const SCANSCI_PDF_MCP_TOOLS = [
+  "scansci_pdf_download",
+  "scansci_pdf_batch_download",
+  "scansci_pdf_search",
+  "scansci_pdf_health_check",
+  "scansci_pdf_source_scores",
+  "scansci_pdf_network_diagnose",
+  // Do not expose config_get in the commercial default toolset: downloader
+  // config may contain institution/browser cookies, proxy tokens or other
+  // credentials.  Users can still update settings through config_set, but the
+  // model/UI should never receive a raw config dump by default.
+  "scansci_pdf_config_set",
+  "scansci_pdf_cache_clear",
+  "scansci_pdf_import_bib",
+  "scansci_pdf_citation",
+  "scansci_pdf_zotero_push",
+  "scansci_pdf_vpnsci_login",
+  "scansci_pdf_vpnsci_test",
+  "scansci_pdf_vpnsci_status",
+  "scansci_pdf_vpnsci_schools",
+  "scansci_pdf_vpnsci_set_school",
+  "scansci_pdf_parse_list",
+  "scansci_pdf_resolve_and_download",
+  "scansci_pdf_setup_check",
+  "scansci_pdf_tor_install",
+  "scansci_pdf_tor_start",
+  "scansci_pdf_tor_stop",
+] as const;
+
+function cloneScanSciPdfMcpServer() {
+  return {
+    id: SCANSCI_PDF_MCP_ID,
+    label: "ScanSci PDF",
+    command: "scansci-pdf",
+    args: ["run"],
+    env: {
+      SCANSCI_PDF_DATA_DIR,
+    },
+    tools: [...SCANSCI_PDF_MCP_TOOLS],
+    enabled: true,
+  };
+}
+
+function isRecord(v: unknown): v is Record<string, unknown> {
+  return v !== null && typeof v === "object" && !Array.isArray(v);
+}
+
+function sameStringArray(a: unknown, b: readonly string[]): boolean {
+  return Array.isArray(a) && a.length === b.length && a.every((v, i) => v === b[i]);
+}
+
+function isDesiredScanSciPdfMcpServer(v: unknown): boolean {
+  if (!isRecord(v)) return false;
+  if (v.id !== SCANSCI_PDF_MCP_ID) return false;
+  if (v.label !== "ScanSci PDF") return false;
+  if (v.command !== "scansci-pdf") return false;
+  if (v.enabled !== true) return false;
+  if (!sameStringArray(v.args, ["run"])) return false;
+  if (!sameStringArray(v.tools, SCANSCI_PDF_MCP_TOOLS)) return false;
+  return isRecord(v.env) && v.env.SCANSCI_PDF_DATA_DIR === SCANSCI_PDF_DATA_DIR;
+}
+
+function appendUniqueString(arr: unknown, value: string): { value: string[]; mutated: boolean } {
+  const next = Array.isArray(arr) ? arr.filter((v): v is string => typeof v === "string") : [];
+  if (next.includes(value)) return { value: next, mutated: false };
+  next.push(value);
+  return { value: next, mutated: true };
+}
+
+function upsertScanSciPdfIntegration(config: Record<string, unknown>): boolean {
+  let mutated = false;
+
+  const existingServers = Array.isArray(config.mcpServers) ? [...config.mcpServers] : [];
+  const desiredServer = cloneScanSciPdfMcpServer();
+  const idx = existingServers.findIndex((srv) => isRecord(srv) && srv.id === SCANSCI_PDF_MCP_ID);
+  if (idx < 0) {
+    existingServers.push(desiredServer);
+    mutated = true;
+  } else if (!isDesiredScanSciPdfMcpServer(existingServers[idx])) {
+    // Platform-owned server id: keep the runtime command/env/tool metadata
+    // authoritative so image upgrades repair stale user-volume config.
+    existingServers[idx] = desiredServer;
+    mutated = true;
+  }
+  if (!Array.isArray(config.mcpServers) || mutated) {
+    config.mcpServers = existingServers;
+  }
+
+  // If the install uses toolset filtering, include scansci-pdf in the user's
+  // effective default toolsets so existing filtered agents can see it.  Also
+  // seed the named "research" toolset for users who opt into research later.
+  const toolsets = isRecord(config.toolsets) ? { ...config.toolsets } : {};
+  let toolsetsMutated = !isRecord(config.toolsets);
+  const research = appendUniqueString(toolsets.research, SCANSCI_PDF_MCP_ID);
+  toolsets.research = research.value;
+  toolsetsMutated = toolsetsMutated || research.mutated;
+
+  const defaults = isRecord(config.defaults) ? config.defaults : null;
+  const defaultToolsets = defaults && Array.isArray(defaults.toolsets)
+    ? defaults.toolsets.filter((v): v is string => typeof v === "string")
+    : [];
+  for (const name of defaultToolsets) {
+    const merged = appendUniqueString(toolsets[name], SCANSCI_PDF_MCP_ID);
+    toolsets[name] = merged.value;
+    toolsetsMutated = toolsetsMutated || merged.mutated;
+  }
+  if (toolsetsMutated) {
+    config.toolsets = toolsets;
+    mutated = true;
+  }
+
+  return mutated;
+}
 
 // Codex CLI 默认从 $CODEX_HOME/auth.json 读 OAuth token。CODEX_HOME 还是 codex CLI 的
 // 状态/日志目录(`.personality_migration` / `logs_*.sqlite` / `state_*.sqlite` /
@@ -184,6 +306,16 @@ try {
   );
 }
 
+try {
+  mkdirSync(SCANSCI_PDF_DATA_DIR, { recursive: true });
+  mkdirSync(join(SCANSCI_PDF_DATA_DIR, "papers"), { recursive: true });
+  mkdirSync(join(SCANSCI_PDF_DATA_DIR, "cache"), { recursive: true });
+} catch (e) {
+  console.error(
+    `[entrypoint] WARN: bootstrap ScanSci PDF data dir failed (non-fatal): ${(e as Error).message}`,
+  );
+}
+
 // ── codex system skills seed(image_gen / document-writing 等内建 tool 必需)──
 // codex 0.125 把 image_gen 等内建工具实现成 `~/.codex/skills/.system/imagegen/`
 // system skill。codex CLI 启动时会 populate 这个目录,但实测耗时 1-2s,
@@ -269,6 +401,10 @@ try {
         model: "claude-opus-4-7",
         permissionMode: "acceptEdits",
       },
+      toolsets: {
+        research: [SCANSCI_PDF_MCP_ID],
+      },
+      mcpServers: [cloneScanSciPdfMcpServer()],
       // 必填占位:个人版 gateway.ts 在启动时直接读 config.channels.wechat / .telegram
       // 不存在会 TypeError。容器场景下我们不开任何外部 channel —— webchat 由商用版
       // userChatBridge 走 docker bridge 直连容器 18789(WS upgrade),无需 channel adapter。
@@ -279,6 +415,22 @@ try {
     };
     writeFileSync(ocConfigPath, JSON.stringify(minimalConfig, null, 2), { mode: 0o600 });
     console.error(`[entrypoint] bootstrapped minimal openclaude.json at ${ocConfigPath}`);
+  } else {
+    try {
+      const rawConfig = readFileSync(ocConfigPath, "utf8");
+      const parsedConfig = JSON.parse(rawConfig) as unknown;
+      if (isRecord(parsedConfig) && upsertScanSciPdfIntegration(parsedConfig)) {
+        writeFileSync(ocConfigPath, JSON.stringify(parsedConfig, null, 2), { mode: 0o600 });
+        console.error("[entrypoint] openclaude.json: ensured ScanSci PDF MCP integration");
+      }
+    } catch (configErr) {
+      // Existing config parse failures should not be silently repaired here:
+      // gateway startup will surface the real onboarding/config error.  Keep
+      // this integration best-effort so a bad user config is not overwritten.
+      console.error(
+        `[entrypoint] WARN: openclaude.json ScanSci PDF merge skipped: ${(configErr as Error).message}`,
+      );
+    }
   }
 
   // 个人版 SessionManager 也需要 agents.yaml 才能解析 opts.agent。两件事:

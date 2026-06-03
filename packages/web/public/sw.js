@@ -1,16 +1,16 @@
 // OpenClaude Service Worker
 // App-shell caching only. Never intercept /ws, /api/*, or external CDN requests.
-const VERSION = 'openclaude-a8fb5d75'
+const VERSION = 'openclaude-auto'
 const SHELL = [
   '/',
   '/index.html',
   '/style.css',
-  '/style.css?v=a8fb5d75',  // versioned URL used in index.html
+  '/style.css?v=auto',  // versioned URL used in index.html
   '/manifest.json',
   '/icon.svg',
   // ES modules
   '/modules/main.js',
-  '/modules/main.js?v=a8fb5d75',  // versioned URL used in index.html
+  '/modules/main.js?v=auto',  // versioned URL used in index.html
   '/modules/auth.js',
   '/modules/auth.js?v=a8fb5d75',  // versioned URL used in main.js import (session cookie mint/clear)
   '/modules/billing.js',
@@ -33,6 +33,8 @@ const SHELL = [
   '/modules/oauth.js',
   '/modules/memory.js',
   '/modules/tasks.js',
+  '/modules/papers.js',
+  '/modules/papers.js?v=auto',
   '/modules/agents.js',
   '/modules/agents.js?v=a8fb5d75',  // 版本化 URL(main.js import 带 ?v=)
   '/modules/effortMode.js',
@@ -45,8 +47,10 @@ const SHELL = [
   '/modules/sessions.js',
   '/modules/sync.js',
   '/modules/messages.js',
+  '/modules/messages.js?v=auto',
   '/modules/websocket.js',
   '/modules/commands.js',
+  '/modules/commands.js?v=auto',
   '/modules/trace.js',
   '/modules/wechat.js',
   '/modules/inbox.js',

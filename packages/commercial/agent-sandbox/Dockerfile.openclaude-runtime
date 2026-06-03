@@ -90,6 +90,15 @@ RUN apt-get update \
         | xargs -r chmod u-s \
     && find / -xdev -perm -2000 -type f 2>/dev/null | xargs -r chmod g-s
 
+# ScanSci PDF — academic paper download/search MCP server.
+# Pin to the current PyPI release verified for this integration. `fast` gives
+# lxml parsing; `vpnsci` installs the crypto/selenium bits for institutional
+# WebVPN status/login tools, while the UI still keeps interactive browser
+# login as an explicit future sidecar flow rather than claiming it is ready.
+RUN python3 -m pip install --break-system-packages --no-cache-dir \
+      'scansci-pdf[fast,vpnsci]==1.3.1' \
+    && scansci-pdf check
+
 # ------------------------------------------------------------
 # Document generation toolchain — Pandoc/Quarto -> DOCX
 # ------------------------------------------------------------

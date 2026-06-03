@@ -11,6 +11,7 @@ import {
   embedMediaUrls,
   processRichBlocks,
   renderMarkdown,
+  _renderLocalMedia,
   renderStreamingMarkdown,
 } from './markdown.js?v=a8fb5d75'
 import { getSession, state, tryEnqueueOffline, MAX_OFFLINE_QUEUE } from './state.js?v=a8fb5d75'
@@ -316,6 +317,7 @@ const _MCP_SERVER_META = {
   'minimax-vision': { icon: _ICON_EYE, label: '视觉理解' },
   'openclaude-vision': { icon: _ICON_EYE, label: '视觉理解' },
   'openclaude-memory': { icon: _ICON_BRAIN, label: '记忆' },
+  'scansci-pdf': { icon: _ICON_FILE_TEXT, label: '论文助手' },
   codex: { icon: _ICON_BOT, label: 'Codex' },
   'quant-system': { icon: _ICON_CHART, label: '量化' },
 }
@@ -403,6 +405,19 @@ const _MCP_OP_META = {
   'openclaude-memory:skill_view': { icon: _ICON_SPARKLE, label: '查看技能' },
   'openclaude-memory:skill_save': { icon: _ICON_SPARKLE, label: '保存技能' },
   'openclaude-memory:skill_delete': { icon: _ICON_SPARKLE, label: '删除技能' },
+  // scansci-pdf
+  'scansci-pdf:scansci_pdf_download': { icon: _ICON_FILE_TEXT, label: '下载论文 PDF' },
+  'scansci-pdf:scansci_pdf_batch_download': { icon: _ICON_FILE_PLUS, label: '批量下载论文' },
+  'scansci-pdf:scansci_pdf_search': { icon: _ICON_SEARCH, label: '搜索论文' },
+  'scansci-pdf:scansci_pdf_citation': { icon: _ICON_FILE_TEXT, label: '生成引用' },
+  'scansci-pdf:scansci_pdf_health_check': { icon: _ICON_CHECK_LIST, label: '论文源健康检查' },
+  'scansci-pdf:scansci_pdf_network_diagnose': { icon: _ICON_GLOBE, label: '论文网络诊断' },
+  'scansci-pdf:scansci_pdf_source_scores': { icon: _ICON_CHART, label: '论文源评分' },
+  'scansci-pdf:scansci_pdf_vpnsci_status': { icon: _ICON_BROWSER, label: '机构登录状态' },
+  'scansci-pdf:scansci_pdf_vpnsci_login': { icon: _ICON_BROWSER, label: '机构登录' },
+  'scansci-pdf:scansci_pdf_vpnsci_test': { icon: _ICON_BROWSER, label: '测试机构访问' },
+  'scansci-pdf:scansci_pdf_parse_list': { icon: _ICON_FILE_TEXT, label: '解析论文列表' },
+  'scansci-pdf:scansci_pdf_resolve_and_download': { icon: _ICON_FILE_PLUS, label: '解析并下载' },
   // codex
   'codex:codex': { icon: _ICON_BOT, label: 'Codex 审查' },
   'codex:codex-reply': { icon: _ICON_BOT, label: 'Codex 回复' },
@@ -832,6 +847,7 @@ function _renderToolBody(body, name, input, msg) {
     if (mcp.server === 'minimax-media') return _renderMedia(body, mcp.op, input, msg)
     if (mcp.server === 'minimax-vision') return _renderVision(body, mcp.op, input, msg)
     if (mcp.server === 'openclaude-memory') return _renderMemory(body, mcp.op, input, msg)
+    if (mcp.server === 'scansci-pdf') return _renderScanSci(body, mcp.op, input, msg)
   }
   return _renderGeneric(body, input, msg)
 }
@@ -1008,6 +1024,24 @@ function _mcpSummary(server, op, input) {
       return `${tgt}${(input.goal || input.message || input.prompt || '').slice(0, 60)}`
     }
     if (op === 'skill_view' || op === 'skill_delete' || op === 'skill_save') return input.name || ''
+    return op
+  }
+  if (server === 'scansci-pdf') {
+    if (op === 'scansci_pdf_search') return (input.query || '').slice(0, 60)
+    if (op === 'scansci_pdf_batch_download') {
+      const ids = Array.isArray(input.identifiers) ? input.identifiers : []
+      return ids.length ? `${ids.length} 篇` : ''
+    }
+    if (
+      op === 'scansci_pdf_download' ||
+      op === 'scansci_pdf_citation' ||
+      op === 'scansci_pdf_resolve_and_download'
+    ) {
+      return (input.identifier || input.file_path || '').slice(0, 70)
+    }
+    if (op === 'scansci_pdf_parse_list') return _shortPath(input.file_path)
+    if (op.includes('health') || op.includes('diagnose') || op.includes('source')) return op
+    if (op.includes('vpnsci')) return input.school || input.query || input.doi || ''
     return op
   }
   if (server === 'codex') {
@@ -1407,6 +1441,164 @@ function _renderMemory(body, op, input, msg) {
   _renderOutput(body, msg.output)
 }
 
+function _parseToolJson(output) {
+  if (!output) return null
+  if (typeof output === 'object') return output
+  const text = String(output).trim()
+  if (!text || !/^[\[{]/.test(text)) return null
+  try {
+    return JSON.parse(text)
+  } catch {
+    return null
+  }
+}
+
+function _findPdfPath(v) {
+  if (typeof v === 'string') {
+    const m = v.match(/\/[^\s"'<>]+\.pdf\b/i)
+    return m ? m[0] : ''
+  }
+  if (Array.isArray(v)) {
+    for (const x of v) {
+      const p = _findPdfPath(x)
+      if (p) return p
+    }
+    return ''
+  }
+  if (v && typeof v === 'object') {
+    for (const key of ['file', 'pdf', 'pdf_path', 'path', 'output_file']) {
+      const p = _findPdfPath(v[key])
+      if (p) return p
+    }
+    for (const value of Object.values(v)) {
+      const p = _findPdfPath(value)
+      if (p) return p
+    }
+  }
+  return ''
+}
+
+function _renderScanSciResults(body, results) {
+  if (!Array.isArray(results) || results.length === 0) return false
+  const list = document.createElement('div')
+  list.className = 'scansci-result-list'
+  for (const r of results.slice(0, 8)) {
+    if (!r || typeof r !== 'object') continue
+    const item = document.createElement('div')
+    item.className = 'scansci-result-item'
+    const title = document.createElement('div')
+    title.className = 'scansci-result-title'
+    title.textContent = r.title || r.display_name || r.identifier || r.doi || 'Untitled paper'
+    const meta = document.createElement('div')
+    meta.className = 'scansci-result-meta'
+    const authors = Array.isArray(r.authors) ? r.authors.slice(0, 3).join(', ') : r.authors
+    const parts = [r.year || r.publication_year, authors, r.doi || r.arxiv || r.arxiv_id, r.source]
+      .filter(Boolean)
+      .map(String)
+    meta.textContent = parts.join(' · ')
+    item.appendChild(title)
+    if (parts.length) item.appendChild(meta)
+    list.appendChild(item)
+  }
+  if (list.children.length === 0) return false
+  body.appendChild(list)
+  return true
+}
+
+function _renderScanSciChecks(body, checks) {
+  if (!checks || typeof checks !== 'object') return false
+  const list = document.createElement('div')
+  list.className = 'scansci-check-grid'
+  for (const [name, info] of Object.entries(checks).slice(0, 12)) {
+    const pill = document.createElement('div')
+    const status = info && typeof info === 'object' ? info.status : info
+    pill.className = `scansci-check-pill ${status === 'ok' ? 'ok' : 'warn'}`
+    const label = document.createElement('span')
+    label.textContent = name
+    const val = document.createElement('strong')
+    val.textContent = status ? String(status) : '—'
+    pill.appendChild(label)
+    pill.appendChild(val)
+    list.appendChild(pill)
+  }
+  if (list.children.length === 0) return false
+  body.appendChild(list)
+  return true
+}
+
+// ── MCP ScanSci PDF: paper-oriented rendering ──
+const _SCANSCI_SENSITIVE_OPS = new Set(['scansci_pdf_config_get', 'scansci_pdf_config_set'])
+
+function _renderScanSci(body, op, input, msg) {
+  if (_SCANSCI_SENSITIVE_OPS.has(op)) {
+    const status = document.createElement('div')
+    status.className = 'tool-status-ok'
+    status.textContent = '配置类工具已执行；为保护机构登录、代理、Cookie 或 Token 等敏感信息，参数与输出已隐藏。'
+    body.appendChild(status)
+    return
+  }
+
+  if (input) {
+    const promptVal = input.identifier || input.query || input.file_path || ''
+    if (promptVal) {
+      const p = document.createElement('div')
+      p.className = 'tool-prompt'
+      p.textContent = String(promptVal)
+      body.appendChild(p)
+    }
+    _renderKvList(body, input, { skip: ['identifier', 'query', 'file_path'] })
+  }
+
+  const data = _parseToolJson(msg.output)
+  if (!data || typeof data !== 'object') {
+    _renderOutput(body, msg.output)
+    return
+  }
+
+  const renderedResults = _renderScanSciResults(body, data.results || data.items)
+  if (renderedResults && op === 'scansci_pdf_search') return
+
+  const statusText = data.success === true
+    ? '完成'
+    : data.success === false
+      ? (data.error || '失败')
+      : data.overall || data.status || ''
+  if (statusText) {
+    const status = document.createElement('div')
+    status.className = data.success === false ? 'tool-status-err' : 'tool-status-ok'
+    status.textContent = String(statusText).slice(0, 200)
+    body.appendChild(status)
+  }
+
+  const pdfPath = _findPdfPath(data)
+  if (pdfPath) {
+    const file = document.createElement('div')
+    file.className = 'scansci-file-card'
+    file.innerHTML = _renderLocalMedia(pdfPath)
+    body.appendChild(file)
+  }
+
+  if (data.citation) {
+    const cite = document.createElement('pre')
+    cite.className = 'tool-output scansci-citation'
+    cite.textContent = String(data.citation).slice(0, 2000)
+    body.appendChild(cite)
+  }
+
+  if (_renderScanSciChecks(body, data.checks)) return
+
+  _renderKvList(body, {
+    title: data.title,
+    doi: data.doi,
+    source: data.source,
+    file: data.file || data.pdf_path || data.path,
+    strategy: data.strategy,
+    batch: data.batch_id,
+  })
+
+  if (!pdfPath && !data.citation) _renderOutput(body, msg.output, { max: 900 })
+}
+
 // ── Generic fallback: key-value list (no raw JSON dump) ──
 function _renderGeneric(body, input, msg) {
   if (input && typeof input === 'object') _renderKvList(body, input)
@@ -1569,6 +1761,7 @@ function _renderCodexMcpToolCall(body, input, msg) {
     if (server === 'minimax-media') return _renderMedia(body, tool, args, msg)
     if (server === 'minimax-vision') return _renderVision(body, tool, args, msg)
     if (server === 'openclaude-memory') return _renderMemory(body, tool, args, msg)
+    if (server === 'scansci-pdf') return _renderScanSci(body, tool, args, msg)
   }
   // Unknown server (custom user MCP) — render the args dict directly so the
   // user still sees structured info, not raw JSON.
@@ -1607,6 +1800,7 @@ function _renderCodexDynamicToolCall(body, input, msg) {
       if (mcp.server === 'minimax-media') return _renderMedia(body, mcp.op, args, msg)
       if (mcp.server === 'minimax-vision') return _renderVision(body, mcp.op, args, msg)
       if (mcp.server === 'openclaude-memory') return _renderMemory(body, mcp.op, args, msg)
+      if (mcp.server === 'scansci-pdf') return _renderScanSci(body, mcp.op, args, msg)
     }
   }
   // Unknown tool — kv list fallback.

@@ -2438,6 +2438,62 @@ a:hover {
   word-break: break-word;
 }
 
+.scansci-result-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 4px 0 8px;
+}
+.scansci-result-item {
+  padding: 8px 10px;
+  border-radius: var(--radius-md);
+  background: color-mix(in srgb, var(--bg-raised) 70%, transparent);
+  border: 1px solid color-mix(in srgb, var(--border) 72%, transparent);
+}
+.scansci-result-title {
+  color: var(--fg);
+  font-size: 12px;
+  font-weight: 650;
+  line-height: 1.35;
+}
+.scansci-result-meta {
+  color: var(--fg-muted);
+  font-size: 11px;
+  line-height: 1.35;
+  margin-top: 3px;
+}
+.scansci-file-card {
+  margin: 6px 0;
+}
+.scansci-citation {
+  max-height: 180px;
+}
+.scansci-check-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 4px 0 8px;
+}
+.scansci-check-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 8px;
+  border-radius: var(--radius-full);
+  border: 1px solid color-mix(in srgb, var(--warning) 24%, var(--border));
+  background: color-mix(in srgb, var(--warning) 10%, transparent);
+  color: var(--fg-muted);
+  font-size: 11px;
+}
+.scansci-check-pill.ok {
+  border-color: color-mix(in srgb, var(--success) 28%, var(--border));
+  background: color-mix(in srgb, var(--success) 12%, transparent);
+}
+.scansci-check-pill strong {
+  color: var(--fg);
+  font-weight: 750;
+}
+
 /* URL card (browser_navigate) */
 .tool-url-card {
   display: inline-block;
@@ -4096,6 +4152,147 @@ a:hover {
   border-radius: var(--radius-md);
   font-size: var(--text-sm);
 }
+
+/* ScanSci PDF paper assistant */
+.papers-modal {
+  max-width: 760px;
+}
+.papers-hero {
+  display: flex;
+  justify-content: space-between;
+  gap: var(--space-4);
+  align-items: center;
+  padding: var(--space-5);
+  margin-bottom: var(--space-4);
+  border-radius: var(--radius-2xl);
+  border: 1px solid color-mix(in srgb, var(--accent) 18%, var(--border));
+  background:
+    radial-gradient(circle at top left, color-mix(in srgb, var(--accent) 18%, transparent), transparent 42%),
+    color-mix(in srgb, var(--bg-raised) 72%, transparent);
+}
+.papers-hero-kicker {
+  color: var(--accent);
+  font-size: var(--text-xs);
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  margin-bottom: var(--space-1);
+}
+.papers-hero-title {
+  color: var(--fg);
+  font-size: 20px;
+  font-weight: 750;
+  letter-spacing: -0.02em;
+}
+.papers-hero-desc {
+  color: var(--fg-muted);
+  font-size: var(--text-sm);
+  line-height: 1.55;
+  margin-top: var(--space-1);
+}
+.papers-hero-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 54px;
+  height: 54px;
+  flex-shrink: 0;
+  border-radius: var(--radius-2xl);
+  background: var(--accent-soft);
+  color: var(--accent);
+  border: 1px solid var(--accent-border);
+  font-weight: 850;
+  letter-spacing: 0.04em;
+}
+.papers-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--space-3);
+}
+.papers-card {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  padding: var(--space-4);
+  min-height: 210px;
+  border-radius: var(--radius-xl);
+  border: 1px solid color-mix(in srgb, var(--border) 74%, transparent);
+  background: color-mix(in srgb, var(--bg-raised) 68%, transparent);
+  box-shadow: 0 1px 0 color-mix(in srgb, var(--fg) 3%, transparent) inset;
+}
+.papers-card-primary {
+  border-color: color-mix(in srgb, var(--accent) 30%, var(--border));
+  background:
+    linear-gradient(180deg, color-mix(in srgb, var(--accent-soft) 38%, transparent), transparent 72%),
+    color-mix(in srgb, var(--bg-raised) 74%, transparent);
+}
+.papers-card-compact {
+  min-height: 150px;
+}
+.papers-card-muted {
+  border-style: dashed;
+}
+.papers-card-head {
+  display: flex;
+  gap: var(--space-3);
+  align-items: flex-start;
+}
+.papers-card-icon {
+  width: 34px;
+  height: 34px;
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--radius-lg);
+  background: color-mix(in srgb, var(--accent-soft) 62%, var(--bg-hover));
+  color: var(--accent);
+  border: 1px solid color-mix(in srgb, var(--accent) 20%, transparent);
+  font-weight: 800;
+}
+.papers-card h4 {
+  margin: 0;
+  color: var(--fg);
+  font-size: var(--text-base);
+  font-weight: 700;
+}
+.papers-card p {
+  margin: 3px 0 0;
+  color: var(--fg-muted);
+  font-size: var(--text-sm);
+  line-height: 1.45;
+}
+.papers-input {
+  width: 100%;
+  min-height: 42px;
+  padding: 10px 12px;
+  border-radius: var(--radius-md);
+  border: 1px solid color-mix(in srgb, var(--border) 84%, var(--fg) 12%);
+  background: color-mix(in srgb, var(--bg-elevated) 76%, var(--bg-raised));
+  color: var(--fg);
+  font: inherit;
+  font-size: var(--text-sm);
+}
+.papers-input:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: var(--ring);
+}
+.papers-textarea {
+  min-height: 86px;
+  resize: vertical;
+  line-height: 1.45;
+}
+.papers-card-btn {
+  margin-top: auto;
+  width: 100%;
+  justify-content: center;
+}
+.papers-foot-note {
+  color: var(--fg-muted);
+  font-size: var(--text-xs);
+}
+
 @media (max-width: 860px) {
   .modal-head {
     padding: calc(env(safe-area-inset-top, 0) + var(--space-4)) var(--space-4) var(--space-3);
@@ -4117,6 +4314,16 @@ a:hover {
   .modal-tabs {
     padding: var(--space-3) var(--space-4) 0;
     overflow-x: auto;
+  }
+  .papers-grid {
+    grid-template-columns: 1fr;
+  }
+  .papers-hero {
+    align-items: flex-start;
+  }
+  .papers-hero-badge {
+    width: 46px;
+    height: 46px;
   }
 }
 
