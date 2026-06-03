@@ -1,13 +1,4 @@
 {
   "currentVersion": "v1.0.264",
-  "releases": [
-    {
-      "version": "PENDING",
-      "date": "2026-06-03",
-      "title": "MiniMax M3 全量开放",
-      "items": [
-        "MiniMax-M3 已向所有用户开放，可在模型列表中直接选择使用。"
-      ]
-    }
-  ]
+  "releases": []
 }
