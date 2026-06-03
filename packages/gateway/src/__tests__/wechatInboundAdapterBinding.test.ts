@@ -220,7 +220,7 @@ test('WeChat idempotency entries use a long TTL for multi-hour early-ACK retries
 test('WeChat Step1 start callback reports routed sessionKey and agentId', () => {
   assert.match(
     SERVER_TS,
-    /wechatDispatchStarted\(\{\s*traceId:\s*turnTraceId,\s*sessionKey,\s*agentId:\s*agent\.id,/,
+    /wechatDispatchStarted\(\{\s*traceId:\s*turnTraceId,\s*sessionKey,\s*agentId:\s*effectiveAgent\.id,/,
     'Step1 ACK must expose the post-routing sessionKey/agentId so master stores the same runner tuple used by Web hello and /stop',
   )
 })

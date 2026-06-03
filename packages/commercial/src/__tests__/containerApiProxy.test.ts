@@ -87,8 +87,13 @@ describe('containerApiProxy', () => {
   it('matches only commercial-safe container routes', () => {
     assert.equal(matchContainerApiProxyRoute('/api/tasks', 'POST'), true)
     assert.equal(matchContainerApiProxyRoute('/api/tasks-executions', 'GET'), true)
+    assert.equal(matchContainerApiProxyRoute('/api/agents', 'GET'), true)
+    assert.equal(matchContainerApiProxyRoute('/api/agents', 'POST'), true)
     assert.equal(matchContainerApiProxyRoute('/api/agents/main/memory/user', 'PUT'), true)
-    assert.equal(matchContainerApiProxyRoute('/api/agents', 'GET'), false)
+    assert.equal(matchContainerApiProxyRoute('/api/agents/main/message', 'POST'), false)
+    assert.equal(matchContainerApiProxyRoute('/api/agent-teams', 'GET'), true)
+    assert.equal(matchContainerApiProxyRoute('/api/agent-teams/dev_team', 'DELETE'), true)
+    assert.equal(matchContainerApiProxyRoute('/api/agent-teams/a%2Fb', 'GET'), false)
     assert.equal(matchContainerApiProxyRoute('/api/tasks-executions', 'POST'), false)
   })
 

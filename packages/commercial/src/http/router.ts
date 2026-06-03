@@ -319,6 +319,10 @@ const BLOCKED_FOR_USER_RULES: readonly BlockedForUserRule[] = [
   // 内存 / 技能(host singleton 存储)
   { re: /^\/api\/agents\/[^/]+\/memory\/(memory|user)$/, label: '/api/agents/:id/memory/*' },
   { re: /^\/api\/agents\/[^/]+\/skills(\/[A-Za-z0-9_\-]+)?$/, label: '/api/agents/:id/skills' },
+  // Agent teams 也写 host singleton agents.yaml；付费用户只能通过 container proxy
+  // 操作自己容器内的 teams，不能落到 master host。
+  { re: /^\/api\/agent-teams$/, label: '/api/agent-teams' },
+  { re: /^\/api\/agent-teams\/[A-Za-z0-9_-]+$/, label: '/api/agent-teams/:id' },
 
   // ─── host cron / tasks / webhooks(所有方法,prompt 注入 = RCE)───
   { re: /^\/api\/cron(\/[^/]+)?$/, label: '/api/cron' },

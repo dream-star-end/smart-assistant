@@ -125,6 +125,13 @@ import {
   renderAgentDropdown,
   setRenderModelPill,
 } from './agents.js?v=9660750f' // 2026-04-22 fix: 非 admin 用户 /api/agents 403 兜底 + 隐藏 agent-select
+import {
+  buildTeamRunPrompt,
+  getSelectedTeamForSend,
+  initAgentTeams,
+  reloadAgentTeams,
+  teamDisplayPrefix,
+} from './agentTeams.js?v=auto'
 
 // ── Sessions ──
 import {
@@ -1087,6 +1094,7 @@ initPlanPanel()
 // 同时把 renderModelPill 注入回 agents.js,让 reloadAgents 完成后能刷新 pill。
 initModelPicker({ reload: reloadAgents })
 setRenderModelPill(renderModelPill)
+initAgentTeams()
 
 // 2026-04-26 v1.0.4 — prefs modal 保存成功后回调:同时刷 model + effort pill,
 // 避免用户在「偏好」里改 default_model / default_effort 后 composer 还显示旧值
@@ -1203,12 +1211,17 @@ function send() {
   }
   const sess = getSession()
   if (!sess) return
+  const teamForSend = getSelectedTeamForSend()
+  if (teamForSend === false) return
+  const displayPrefix = teamForSend ? `${teamDisplayPrefix(teamForSend)}\n\n` : ''
   const displayText =
+    displayPrefix +
     (text || '(文件上传)') +
     (state.attachments.length > 0
       ? `\n\n📎 ${state.attachments.map((a) => a.name).join(', ')}`
       : '')
-  const modelText = buildMessageText(text, state.attachments)
+  const rawModelText = buildMessageText(text, state.attachments)
+  const modelText = teamForSend ? buildTeamRunPrompt(teamForSend, rawModelText) : rawModelText
   // Plan B:_media 里只放 url,不再放 base64。url 来自 _uploadOne 的服务端响应。
   // server.ts dispatchInbound 的 url 分支会做 traversal/realpath 校验后落到
   // savedMedia,落库的 messages JSON 永远只包含 url 引用,不再有 base64。
@@ -1231,7 +1244,7 @@ function send() {
     idempotencyKey: `web-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
     channel: 'webchat',
     peer: { id: sess.id, kind: 'dm' },
-    agentId: sess.agentId || state.defaultAgentId,
+    agentId: teamForSend?.leaderAgentId || sess.agentId || state.defaultAgentId,
     content: { text: modelText, media: media.length > 0 ? media : undefined },
     // string='xhigh'/'max' → 切到该 effort;null → 显式清除回模型默认;
     // undefined → 不参与 effort 协商(非 Opus 4.7 agent 走这条)。
@@ -2618,7 +2631,7 @@ async function runPostLoginPipeline({ accessToken, accessExp, remember }) {
   renderSidebar()
   renderMessages()
   connect()
-  reloadAgents()
+  void reloadAgents().then(() => reloadAgentTeams())
   loadChangelog()
   refreshBalance()
     .then((r) => {
@@ -2981,6 +2994,7 @@ async function init() {
       $('new-agent-id').value = ''
       toast(`已创建 ${id}`, 'success')
       await reloadAgents()
+      await reloadAgentTeams()
     } catch (err) {
       toast(String(err), 'error', toastOptsFromError(err))
     }
@@ -3221,7 +3235,7 @@ async function init() {
     // 在 server 上的真实 selection。sid 为空时 refreshGithubPill 内部会清空 pill。
     refreshGithubPill(state.currentSessionId)
     connect()
-    reloadAgents()
+    void reloadAgents().then(() => reloadAgentTeams())
     loadChangelog()
     refreshBalance()
       .then((r) => {
