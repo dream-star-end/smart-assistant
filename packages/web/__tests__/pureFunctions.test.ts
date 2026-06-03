@@ -1252,15 +1252,52 @@ describe('T-MATH-FILL-CONTRACT: replacement works regardless of attribute order'
   //   - innerHTML get/set reads/writes the backing store
   //   - querySelector('#id') scans `_html` with a regex that matches an empty
   //     `<div|span ...></div|span>` carrying `id="id"` in ANY attribute slot
-  //     → returns a stub element whose `outerHTML` setter splices the new
-  //     HTML into `_html` over the original empty-element substring.
+  //   - querySelectorAll('.math-block, .math-inline') returns empty math shells
+  //     in source order for the production ordered fallback path
+  //   - returned stub elements expose classList.contains, container.contains,
+  //     and an outerHTML setter that splices the rendered KaTeX HTML into `_html`.
   //
   // Critical: this regex deliberately accepts both attribute orderings (and
   // the single-`id` no-class case) so the contract test really proves that
   // the production impl doesn't care about ordering.
   function makeStubContainer() {
-    const container: { _html: string; querySelector: (sel: string) => unknown; innerHTML: string } =
-      {
+    type StubEl = {
+      _fullMatch: string
+      classList: { contains: (cls: string) => boolean }
+      outerHTML: string
+    }
+    const attrRe = /([a-zA-Z-]+)=("[^"]*"|'[^']*')/g
+    function parseAttrs(rawAttrs: string) {
+      const attrs: Record<string, string> = {}
+      for (const m of rawAttrs.matchAll(attrRe)) {
+        attrs[m[1]] = m[2].slice(1, -1)
+      }
+      return attrs
+    }
+    function makeEl(container: { _html: string }, fullMatch: string, className = ''): StubEl {
+      return {
+        _fullMatch: fullMatch,
+        classList: {
+          contains(cls: string) {
+            return className.split(/\s+/).includes(cls)
+          },
+        },
+        get outerHTML() {
+          return this._fullMatch
+        },
+        set outerHTML(newHtml: string) {
+          // Use split/join — `fullMatch` is unique per id in our test inputs.
+          container._html = container._html.split(this._fullMatch).join(newHtml)
+        },
+      }
+    }
+    const container: {
+      _html: string
+      querySelector: (sel: string) => StubEl | null
+      querySelectorAll: (sel: string) => StubEl[]
+      contains: (el: StubEl) => boolean
+      innerHTML: string
+    } = {
         _html: '',
         querySelector(selector: string) {
           if (!selector.startsWith('#')) return null
@@ -1273,15 +1310,24 @@ describe('T-MATH-FILL-CONTRACT: replacement works regardless of attribute order'
           const m = re.exec(this._html)
           if (!m) return null
           const fullMatch = m[0]
-          const self = this
-          const el = {
-            _fullMatch: fullMatch,
-            set outerHTML(newHtml: string) {
-              // Use split/join — `fullMatch` is unique per id in our test inputs.
-              self._html = self._html.split(this._fullMatch).join(newHtml)
-            },
+          const attrs = parseAttrs(m[2] || '')
+          return makeEl(this, fullMatch, attrs.class || '')
+        },
+        querySelectorAll(selector: string) {
+          if (selector !== '.math-block, .math-inline') return []
+          const out: StubEl[] = []
+          const re = /<(div|span)\b((?:\s+[a-zA-Z-]+=(?:"[^"]*"|'[^']*'))*)\s*><\/\1>/g
+          for (const m of this._html.matchAll(re)) {
+            const attrs = parseAttrs(m[2] || '')
+            const classes = (attrs.class || '').split(/\s+/)
+            if (classes.includes('math-block') || classes.includes('math-inline')) {
+              out.push(makeEl(this, m[0], attrs.class || ''))
+            }
           }
-          return el
+          return out
+        },
+        contains(el: StubEl) {
+          return this._html.includes(el._fullMatch)
         },
         get innerHTML() {
           return this._html
@@ -1383,19 +1429,20 @@ describe('T-MATH-FILL-CONTRACT: replacement works regardless of attribute order'
     const out = fill(html, [])
     assert.equal(out, html)
   })
-  it('querySelector finds nothing for an id → item is skipped, rest still replaced', () => {
-    // Simulates DOMPurify (somehow) dropping a placeholder node. The function
-    // must not throw, and must still process the other items.
+  it('missing later id is skipped after earlier id match replaces its shell', () => {
+    // The production function has an ordered fallback for sanitizer id drift.
+    // A truly missing placeholder is skipped only once no surviving math shell
+    // remains; it must not throw or corrupt the already-replaced item.
     const win = { katex: stubKatex() }
     const fill = makeFill(win, makeStubDocument(), stubHtmlSafeEscape)
     const html = '<p>only <span id="math-here" class="math-inline"></span></p>'
     const out = fill(html, [
-      { id: 'math-gone', tex: 'g', display: false }, // not in html
       { id: 'math-here', tex: 'h', display: false }, // in html
+      { id: 'math-gone', tex: 'g', display: false }, // no surviving shell
     ])
     assert.ok(out.includes('>h<'), 'present placeholder must still be replaced')
     assert.ok(!out.includes('math-here'), 'present placeholder gone')
-    // 'math-gone' simply has no effect — no throw, no stray markup.
+    assert.ok(!out.includes('>g<'), 'missing placeholder simply has no effect')
   })
   it('KaTeX throws → error placeholder with htmlSafeEscape-d message', () => {
     // The catch branch must (a) not propagate the throw, (b) emit math-error

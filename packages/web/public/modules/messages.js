@@ -97,6 +97,9 @@ let _setTitleBusy
 let _scheduleSaveFromUserEdit
 let _clearTurnTiming
 let _resetReplyTracker
+let _openMemoryModal
+let _openSkillsModal
+let _openTasksModal
 export function setMessageDeps(deps) {
   _updateSendEnabled = deps.updateSendEnabled
   _showTypingIndicator = deps.showTypingIndicator
@@ -105,6 +108,9 @@ export function setMessageDeps(deps) {
   _scheduleSaveFromUserEdit = deps.scheduleSaveFromUserEdit
   _clearTurnTiming = deps.clearTurnTiming
   _resetReplyTracker = deps.resetReplyTracker
+  _openMemoryModal = deps.openMemoryModal
+  _openSkillsModal = deps.openSkillsModal
+  _openTasksModal = deps.openTasksModal
 }
 
 // ── Closure-stale msg ref helpers (sync server-wins guard) ──
@@ -1439,6 +1445,24 @@ function _renderMemory(body, op, input, msg) {
     }
   }
   _renderOutput(body, msg.output)
+  _appendContextToolActions(body, op)
+}
+
+function _appendContextToolActions(body, op) {
+  const actions = document.createElement('div')
+  actions.className = 'context-tool-actions'
+  const add = (label, fn) => {
+    const btn = document.createElement('button')
+    btn.type = 'button'
+    btn.className = 'btn btn-ghost btn-sm'
+    btn.textContent = label
+    btn.addEventListener('click', fn)
+    actions.appendChild(btn)
+  }
+  if (op === 'memory' || op === 'archival_add' || op === 'archival_search' || op === 'session_search') add('打开记忆中心', () => _openMemoryModal?.())
+  if (op === 'skill_list' || op === 'skill_view' || op === 'skill_save' || op === 'skill_delete' || op === 'skill_search') add('打开技能库', () => _openSkillsModal?.())
+  if (op === 'create_reminder') add('查看定时任务', () => _openTasksModal?.())
+  if (actions.children.length > 0) body.appendChild(actions)
 }
 
 function _parseToolJson(output) {
@@ -2954,6 +2978,22 @@ export function renderMessages() {
       grid.appendChild(card)
     }
     empty.appendChild(grid)
+    const contextGrid = document.createElement('div')
+    contextGrid.className = 'empty-context-grid'
+    const contextCards = [
+      { icon: '🧠', title: '建立长期记忆', text: '告诉 Agent 你的偏好、项目和常用约束', run: () => _openMemoryModal?.() },
+      { icon: '🛠️', title: '沉淀可复用技能', text: '管理工作流，让复杂任务少重复解释', run: () => _openSkillsModal?.() },
+      { icon: '⏰', title: '创建提醒任务', text: '几分钟后、每天、每周，都可以可视化创建', run: () => _openTasksModal?.() },
+    ]
+    for (const item of contextCards) {
+      const card = document.createElement('button')
+      card.type = 'button'
+      card.className = 'empty-context-card'
+      card.innerHTML = `<span>${item.icon}</span><strong>${htmlSafeEscape(item.title)}</strong><small>${htmlSafeEscape(item.text)}</small>`
+      card.addEventListener('click', item.run)
+      contextGrid.appendChild(card)
+    }
+    empty.appendChild(contextGrid)
     main.appendChild(empty)
     _renderedSessionId = s.id
     _renderedHadOverflow = hasOverflow
