@@ -95,6 +95,7 @@ import { WebhookRouter } from './webhooks.js'
 import { syncCodexAuthFiles } from './codexAuthSync.js'
 import { resolveCodexConversationMode } from './codexAutoPlanMode.js'
 import { inferAgentForModel } from './inferAgentForModel.js'
+import { mergeOnDemandToolsets } from './toolsetIntent.js'
 import { resolveOpenClaudeVisionEntry } from './codexLaunchOverrides.js'
 import {
   OPENCLAUDE_VISION_MCP_ID,
@@ -6910,9 +6911,20 @@ export class Gateway {
       rawRoute: (frame as any).__oc_codex_route,
     })
 
+    const baseToolsets = agent.toolsets ?? this.deps.config.defaults.toolsets
+    const effectiveToolsets = mergeOnDemandToolsets(
+      baseToolsets,
+      this.deps.config,
+      frame.content.text ?? '',
+    )
+    const effectiveAgent =
+      effectiveToolsets === undefined
+        ? agent
+        : { ...agent, toolsets: effectiveToolsets }
+
     const session = await this.sessions.getOrCreate({
       sessionKey,
-      agent,
+      agent: effectiveAgent,
       channel: frame.channel,
       peerId: frame.peer.id,
       // Phase 0.4 P1-3: carry the authenticated userId onto the session so
@@ -6932,7 +6944,7 @@ export class Gateway {
         wechatDispatchStarted({
           traceId: turnTraceId,
           sessionKey,
-          agentId: agent.id,
+          agentId: effectiveAgent.id,
         })
       } catch {}
       delete (frame as any)._wechatDispatchStarted
@@ -7217,7 +7229,7 @@ export class Gateway {
 
     let finalText = text
     if (savedMedia.length > 0) {
-      const activeMcpTools = collectAvailableMcpToolNames(this.deps.config, agent, safeModel)
+      const activeMcpTools = collectAvailableMcpToolNames(this.deps.config, effectiveAgent, safeModel)
       const hasUnderstandImage = activeMcpTools.includes('understand_image')
 
       const images = savedMedia.filter((m) => m.kind === 'image')
@@ -7682,6 +7694,7 @@ export class Gateway {
     }, safeEffortLevel, safeModel, safeRequestId, turnTraceId, effectiveConversationMode, {
       historicalMessages: masterHistoricalMessages,
       codexRoute: safeCodexRoute,
+      ...(effectiveToolsets !== undefined ? { toolsets: effectiveToolsets } : {}),
     })
     if (liveWechatAdapter) {
       await liveWechatSendQueue

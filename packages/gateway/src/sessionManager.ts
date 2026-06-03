@@ -35,6 +35,26 @@ import type { RepoSnapshot } from './sessionRepoWorkspace.js'
 
 const log = createLogger({ module: 'sessionManager' })
 
+function normalizeToolsetListForCompare(toolsets: unknown): string[] | undefined {
+  if (!Array.isArray(toolsets) || toolsets.length === 0) return undefined
+  const out: string[] = []
+  for (const value of toolsets) {
+    if (typeof value !== 'string') continue
+    const trimmed = value.trim()
+    if (!trimmed || out.includes(trimmed)) continue
+    out.push(trimmed)
+  }
+  return out.length > 0 ? out.sort() : undefined
+}
+
+function sameToolsetsForCompare(a: unknown, b: unknown): boolean {
+  const left = normalizeToolsetListForCompare(a)
+  const right = normalizeToolsetListForCompare(b)
+  if (!left && !right) return true
+  if (!left || !right) return false
+  return left.length === right.length && left.every((value, idx) => value === right[idx])
+}
+
 type ChatHistoryMessage = {
   role?: unknown
   text?: unknown
@@ -1433,7 +1453,11 @@ export class SessionManager {
     /** Codex-native app-server only. Omitted means default mode so a previous
      *  plan-only turn cannot leak into ordinary follow-up turns. */
     conversationMode?: 'default' | 'plan',
-    opts?: { historicalMessages?: unknown[]; codexRoute?: CodexProviderConfigOverride | null },
+    opts?: {
+      historicalMessages?: unknown[]
+      codexRoute?: CodexProviderConfigOverride | null
+      toolsets?: string[]
+    },
   ): Promise<void> {
     // 闭包捕获:即便后面再有 submit 也不会改这个常量
     const desiredEffort: string | undefined =
@@ -1441,6 +1465,8 @@ export class SessionManager {
     const callerSpecifiedEffort = effortLevel !== undefined
     const desiredModel: string | undefined = model
     const callerSpecifiedModel = model !== undefined
+    const callerSpecifiedToolsets = Object.prototype.hasOwnProperty.call(opts ?? {}, 'toolsets')
+    const desiredToolsets = normalizeToolsetListForCompare(opts?.toolsets)
 
     const prev = session.lock
     let release!: () => void
@@ -1482,6 +1508,12 @@ export class SessionManager {
       const effortChanged =
         callerSpecifiedEffort && session.runner.effortLevel !== desiredEffort
       const modelChanged = callerSpecifiedModel && session.runner.model !== desiredModel
+      const runnerToolsets = (session.runner as any).toolsets
+      const maybeSetToolsets = (session.runner as any).setToolsets
+      const toolsetsChanged =
+        callerSpecifiedToolsets &&
+        typeof maybeSetToolsets === 'function' &&
+        !sameToolsetsForCompare(runnerToolsets, desiredToolsets)
       if (effortChanged) session.runner.setEffortLevel(desiredEffort)
       if (modelChanged) {
         session.runner.setModel(desiredModel)
@@ -1490,18 +1522,27 @@ export class SessionManager {
         // 已让 runner 死,窗口期内不会产生新 metrics —— session.model 提前对齐安全。
         session.model = desiredModel ?? this.config.defaults.model ?? 'claude-opus-4-7'
       }
-      if (effortChanged || modelChanged) {
+      if (toolsetsChanged) {
+        maybeSetToolsets.call(session.runner, desiredToolsets)
+      }
+      if (effortChanged || modelChanged || toolsetsChanged) {
         try {
           await session.runner.shutdown()
           // Delta tracker reset happens automatically on the next 'spawn' event
           // when SubprocessRunner auto-respawns on the next submit().
         } catch (err) {
           log.warn(
-            'effort/model-change shutdown failed',
+            'effort/model/toolsets-change shutdown failed',
             // CG7 — traceId tagged so submit-layer failures join the turn's
             // outbound trace; ...(traceId ? ... : {}) keeps legacy callers
             // (no traceId arg) from inserting a `traceId: undefined` key.
-            { sessionKey: session.sessionKey, effortChanged, modelChanged, ...(traceId ? { traceId } : {}) },
+            {
+              sessionKey: session.sessionKey,
+              effortChanged,
+              modelChanged,
+              toolsetsChanged,
+              ...(traceId ? { traceId } : {}),
+            },
             err,
           )
         }

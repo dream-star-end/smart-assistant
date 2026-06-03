@@ -84,4 +84,36 @@ describe('collectAvailableMcpToolNames', () => {
     const tools = collectAvailableMcpToolNames(config, { id: 'main' } as any)
     assert.equal(tools.includes('understand_image'), false)
   })
+
+  it('core toolset excludes optional browser and research MCP tools', () => {
+    const config = {
+      ...baseConfig,
+      provider: 'anthropic',
+      defaults: { ...baseConfig.defaults, model: 'claude-opus-4-7', toolsets: ['core'] },
+      toolsets: { core: [], browser: ['browser'], research: ['scansci-pdf'] },
+      mcpServers: [
+        { id: 'browser', tools: ['browser_navigate', 'browser_click'] },
+        { id: 'scansci-pdf', tools: ['scansci_pdf_download'] },
+      ],
+    }
+    const tools = collectAvailableMcpToolNames(config, { id: 'main' } as any)
+    assert.equal(tools.includes('browser_navigate'), false)
+    assert.equal(tools.includes('scansci_pdf_download'), false)
+  })
+
+  it('browser toolset exposes browser tools without research tools', () => {
+    const config = {
+      ...baseConfig,
+      provider: 'anthropic',
+      defaults: { ...baseConfig.defaults, model: 'claude-opus-4-7', toolsets: ['core'] },
+      toolsets: { core: [], browser: ['browser'], research: ['scansci-pdf'] },
+      mcpServers: [
+        { id: 'browser', tools: ['browser_navigate', 'browser_click'] },
+        { id: 'scansci-pdf', tools: ['scansci_pdf_download'] },
+      ],
+    }
+    const tools = collectAvailableMcpToolNames(config, { id: 'main', toolsets: ['core', 'browser'] } as any)
+    assert.ok(tools.includes('browser_navigate'))
+    assert.equal(tools.includes('scansci_pdf_download'), false)
+  })
 })

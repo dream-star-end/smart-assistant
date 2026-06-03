@@ -10,7 +10,11 @@ import {
   resolveOpenClaudeVisionEntry,
 } from './codexLaunchOverrides.js'
 import { createLogger } from './logger.js'
-import { OPENCLAUDE_VISION_MCP_ID, shouldEnableOpenClaudeVision } from './mcpVisionServer.js'
+import {
+  OPENCLAUDE_VISION_MCP_ID,
+  OPENCLAUDE_VISION_TOOLS,
+  shouldEnableOpenClaudeVision,
+} from './mcpVisionServer.js'
 import { modelHintAppliedTotal } from './metrics.js'
 import { buildPromptContext } from './promptSlots.js'
 import type { ExecutionTarget } from './remoteTarget.js'
@@ -439,6 +443,19 @@ export class SubprocessRunner extends EventEmitter {
    *  effect — model is only passed as `--model` cli arg at spawn time. */
   setModel(model: string | undefined): void {
     this.opts.model = model
+  }
+
+  /** Current resolved toolsets. Toolsets are consumed only when writing the
+   *  MCP config before subprocess spawn, so callers must restart the runner
+   *  after changing this value. */
+  get toolsets(): string[] | undefined {
+    return this.opts.agentToolsets
+  }
+
+  /** Update resolved toolsets for the next spawn. Pure opts mutator, parallel
+   *  to setModel / setEffortLevel; no subprocess side effects. */
+  setToolsets(toolsets: string[] | undefined): void {
+    this.opts.agentToolsets = toolsets
   }
 
   /** Current execution target (used by sessionManager to detect changes). */
@@ -1012,6 +1029,23 @@ export class SubprocessRunner extends EventEmitter {
     const openClaudeVisionEntry = openClaudeVisionAllowed
       ? resolveOpenClaudeVisionEntry(this.opts.config.auth.claudeCodePath)
       : null
+    const availableMcpTools = new Set<string>()
+    const addAvailableTools = (tools?: readonly string[]) => {
+      for (const tool of tools ?? []) availableMcpTools.add(tool)
+    }
+    if (openClaudeVisionEntry) {
+      addAvailableTools(OPENCLAUDE_VISION_TOOLS)
+    }
+    for (const srv of this.opts.config.mcpServers ?? []) {
+      if (srv.enabled === false) continue
+      if (srv.provider && srv.provider !== effectiveProvider) continue
+      if (allowedMcpIds && !allowedMcpIds.has(srv.id)) continue
+      addAvailableTools(srv.tools)
+    }
+    for (const srv of this.opts.agentMcpServers ?? []) {
+      if (srv.enabled === false) continue
+      addAvailableTools(srv.tools)
+    }
 
     // Build merged extra system prompt via structured prompt slots
     try {
@@ -1020,7 +1054,7 @@ export class SubprocessRunner extends EventEmitter {
         persona: this.opts.persona,
         provider: effectiveProvider,
         model: this.opts.model,
-        availableMcpTools: openClaudeVisionEntry ? ['understand_image'] : [],
+        availableMcpTools: [...availableMcpTools],
         // 把当前 effort 传进 slot builder 决定是否注入"科研模式守则"。
         // effort 切换本就会 recycle subprocess,新 runner 启动时会重建 extra-prompt.md。
         effortLevel: this.opts.effortLevel,

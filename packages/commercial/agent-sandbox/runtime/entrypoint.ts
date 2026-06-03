@@ -96,6 +96,32 @@ cleanEnv.OPENCLAUDE_HOME = "/home/agent/.openclaude";
 const SCANSCI_PDF_DATA_DIR = "/home/agent/.local/share/scansci-pdf";
 cleanEnv.SCANSCI_PDF_DATA_DIR = SCANSCI_PDF_DATA_DIR;
 
+const CORE_TOOLSET_ID = "core";
+const BROWSER_TOOLSET_ID = "browser";
+const RESEARCH_TOOLSET_ID = "research";
+
+const BROWSER_MCP_ID = "browser";
+const BROWSER_MCP_TOOLS = [
+  "browser_navigate",
+  "browser_snapshot",
+  "browser_click",
+  "browser_type",
+  "browser_press_key",
+  "browser_take_screenshot",
+  "browser_wait_for",
+] as const;
+
+function cloneBrowserMcpServer() {
+  return {
+    id: BROWSER_MCP_ID,
+    label: "Playwright Browser",
+    command: "npx",
+    args: ["-y", "@playwright/mcp@latest", "--headless", "--no-sandbox"],
+    tools: [...BROWSER_MCP_TOOLS],
+    enabled: true,
+  };
+}
+
 const SCANSCI_PDF_MCP_ID = "scansci-pdf";
 const SCANSCI_PDF_MCP_TOOLS = [
   "scansci_pdf_download",
@@ -148,6 +174,28 @@ function sameStringArray(a: unknown, b: readonly string[]): boolean {
   return Array.isArray(a) && a.length === b.length && a.every((v, i) => v === b[i]);
 }
 
+function normalizeStringArray(v: unknown): string[] {
+  if (!Array.isArray(v)) return [];
+  const out: string[] = [];
+  for (const item of v) {
+    if (typeof item !== "string") continue;
+    const trimmed = item.trim();
+    if (!trimmed || out.includes(trimmed)) continue;
+    out.push(trimmed);
+  }
+  return out;
+}
+
+function isDesiredBrowserMcpServer(v: unknown): boolean {
+  if (!isRecord(v)) return false;
+  if (v.id !== BROWSER_MCP_ID) return false;
+  if (v.label !== "Playwright Browser") return false;
+  if (v.command !== "npx") return false;
+  if (v.enabled !== true) return false;
+  if (!sameStringArray(v.args, ["-y", "@playwright/mcp@latest", "--headless", "--no-sandbox"])) return false;
+  return sameStringArray(v.tools, BROWSER_MCP_TOOLS);
+}
+
 function isDesiredScanSciPdfMcpServer(v: unknown): boolean {
   if (!isRecord(v)) return false;
   if (v.id !== SCANSCI_PDF_MCP_ID) return false;
@@ -159,52 +207,80 @@ function isDesiredScanSciPdfMcpServer(v: unknown): boolean {
   return isRecord(v.env) && v.env.SCANSCI_PDF_DATA_DIR === SCANSCI_PDF_DATA_DIR;
 }
 
-function appendUniqueString(arr: unknown, value: string): { value: string[]; mutated: boolean } {
-  const next = Array.isArray(arr) ? arr.filter((v): v is string => typeof v === "string") : [];
-  if (next.includes(value)) return { value: next, mutated: false };
-  next.push(value);
-  return { value: next, mutated: true };
+function upsertPlatformMcpServer(
+  servers: unknown[],
+  id: string,
+  desired: Record<string, unknown>,
+  isDesired: (value: unknown) => boolean,
+): boolean {
+  const idx = servers.findIndex((srv) => isRecord(srv) && srv.id === id);
+  if (idx < 0) {
+    servers.push(desired);
+    return true;
+  }
+  if (!isDesired(servers[idx])) {
+    // Platform-owned server ids: keep runtime command/env/tool metadata
+    // authoritative so image upgrades repair stale user-volume config.
+    servers[idx] = desired;
+    return true;
+  }
+  return false;
 }
 
-function upsertScanSciPdfIntegration(config: Record<string, unknown>): boolean {
+function setToolset(
+  toolsets: Record<string, unknown>,
+  name: string,
+  ids: readonly string[],
+): boolean {
+  if (sameStringArray(toolsets[name], ids)) return false;
+  toolsets[name] = [...ids];
+  return true;
+}
+
+function ensureCoreDefaults(defaults: Record<string, unknown>): boolean {
+  const normalized = normalizeStringArray(defaults.toolsets);
+  const next = normalized.length > 0 ? normalized : [CORE_TOOLSET_ID];
+  if (sameStringArray(defaults.toolsets, next)) return false;
+  defaults.toolsets = next;
+  return true;
+}
+
+function upsertPlatformMcpIntegrations(config: Record<string, unknown>): boolean {
   let mutated = false;
 
   const existingServers = Array.isArray(config.mcpServers) ? [...config.mcpServers] : [];
-  const desiredServer = cloneScanSciPdfMcpServer();
-  const idx = existingServers.findIndex((srv) => isRecord(srv) && srv.id === SCANSCI_PDF_MCP_ID);
-  if (idx < 0) {
-    existingServers.push(desiredServer);
-    mutated = true;
-  } else if (!isDesiredScanSciPdfMcpServer(existingServers[idx])) {
-    // Platform-owned server id: keep the runtime command/env/tool metadata
-    // authoritative so image upgrades repair stale user-volume config.
-    existingServers[idx] = desiredServer;
-    mutated = true;
-  }
+  mutated =
+    upsertPlatformMcpServer(existingServers, BROWSER_MCP_ID, cloneBrowserMcpServer(), isDesiredBrowserMcpServer) ||
+    mutated;
+  mutated =
+    upsertPlatformMcpServer(
+      existingServers,
+      SCANSCI_PDF_MCP_ID,
+      cloneScanSciPdfMcpServer(),
+      isDesiredScanSciPdfMcpServer,
+    ) || mutated;
   if (!Array.isArray(config.mcpServers) || mutated) {
     config.mcpServers = existingServers;
   }
 
-  // If the install uses toolset filtering, include scansci-pdf in the user's
-  // effective default toolsets so existing filtered agents can see it.  Also
-  // seed the named "research" toolset for users who opt into research later.
+  // v3 runtime default is deliberately lightweight: `core` mounts no optional
+  // global MCPs. Browser and ScanSci remain named opt-in toolsets; never append
+  // ScanSci or browser into defaults/core, otherwise CCB can exceed the
+  // Anthropic-compatible 64-tool proxy schema limit again.
   const toolsets = isRecord(config.toolsets) ? { ...config.toolsets } : {};
   let toolsetsMutated = !isRecord(config.toolsets);
-  const research = appendUniqueString(toolsets.research, SCANSCI_PDF_MCP_ID);
-  toolsets.research = research.value;
-  toolsetsMutated = toolsetsMutated || research.mutated;
-
-  const defaults = isRecord(config.defaults) ? config.defaults : null;
-  const defaultToolsets = defaults && Array.isArray(defaults.toolsets)
-    ? defaults.toolsets.filter((v): v is string => typeof v === "string")
-    : [];
-  for (const name of defaultToolsets) {
-    const merged = appendUniqueString(toolsets[name], SCANSCI_PDF_MCP_ID);
-    toolsets[name] = merged.value;
-    toolsetsMutated = toolsetsMutated || merged.mutated;
-  }
+  toolsetsMutated = setToolset(toolsets, CORE_TOOLSET_ID, []) || toolsetsMutated;
+  toolsetsMutated = setToolset(toolsets, BROWSER_TOOLSET_ID, [BROWSER_MCP_ID]) || toolsetsMutated;
+  toolsetsMutated = setToolset(toolsets, RESEARCH_TOOLSET_ID, [SCANSCI_PDF_MCP_ID]) || toolsetsMutated;
   if (toolsetsMutated) {
     config.toolsets = toolsets;
+    mutated = true;
+  }
+
+  if (!isRecord(config.defaults)) {
+    config.defaults = { model: "claude-opus-4-7", permissionMode: "acceptEdits", toolsets: [CORE_TOOLSET_ID] };
+    mutated = true;
+  } else if (ensureCoreDefaults(config.defaults)) {
     mutated = true;
   }
 
@@ -400,11 +476,14 @@ try {
       defaults: {
         model: "claude-opus-4-7",
         permissionMode: "acceptEdits",
+        toolsets: [CORE_TOOLSET_ID],
       },
       toolsets: {
-        research: [SCANSCI_PDF_MCP_ID],
+        [CORE_TOOLSET_ID]: [],
+        [BROWSER_TOOLSET_ID]: [BROWSER_MCP_ID],
+        [RESEARCH_TOOLSET_ID]: [SCANSCI_PDF_MCP_ID],
       },
-      mcpServers: [cloneScanSciPdfMcpServer()],
+      mcpServers: [cloneBrowserMcpServer(), cloneScanSciPdfMcpServer()],
       // 必填占位:个人版 gateway.ts 在启动时直接读 config.channels.wechat / .telegram
       // 不存在会 TypeError。容器场景下我们不开任何外部 channel —— webchat 由商用版
       // userChatBridge 走 docker bridge 直连容器 18789(WS upgrade),无需 channel adapter。
@@ -419,16 +498,16 @@ try {
     try {
       const rawConfig = readFileSync(ocConfigPath, "utf8");
       const parsedConfig = JSON.parse(rawConfig) as unknown;
-      if (isRecord(parsedConfig) && upsertScanSciPdfIntegration(parsedConfig)) {
+      if (isRecord(parsedConfig) && upsertPlatformMcpIntegrations(parsedConfig)) {
         writeFileSync(ocConfigPath, JSON.stringify(parsedConfig, null, 2), { mode: 0o600 });
-        console.error("[entrypoint] openclaude.json: ensured ScanSci PDF MCP integration");
+        console.error("[entrypoint] openclaude.json: ensured core/browser/research MCP toolsets");
       }
     } catch (configErr) {
       // Existing config parse failures should not be silently repaired here:
       // gateway startup will surface the real onboarding/config error.  Keep
       // this integration best-effort so a bad user config is not overwritten.
       console.error(
-        `[entrypoint] WARN: openclaude.json ScanSci PDF merge skipped: ${(configErr as Error).message}`,
+        `[entrypoint] WARN: openclaude.json MCP toolset merge skipped: ${(configErr as Error).message}`,
       );
     }
   }

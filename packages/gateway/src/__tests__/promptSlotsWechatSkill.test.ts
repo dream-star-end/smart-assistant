@@ -32,6 +32,23 @@ describe('WeChat channel operation skill prompt', () => {
     assert.match(slot.content, /txt` 或 `md/)
   })
 
+  it('keeps browser instructions lightweight until browser tools are mounted', async () => {
+    const slot = await buildAgentsSlot({ agentId: 'main', availableMcpTools: [] })
+    assert.match(slot.content, /浏览器\/研究 MCP 按需挂载/)
+    assert.match(slot.content, /不要假设可调用 `browser_\*` 或 `scansci_pdf_\*`/)
+    assert.doesNotMatch(slot.content, /browser_navigate/)
+  })
+
+  it('adds detailed Playwright instructions when browser tools are mounted', async () => {
+    const slot = await buildAgentsSlot({
+      agentId: 'main',
+      availableMcpTools: ['browser_navigate', 'browser_snapshot'],
+    })
+    assert.match(slot.content, /当前 `browser_\*` MCP 工具已挂载/)
+    assert.match(slot.content, /browser_navigate/)
+    assert.match(slot.content, /browser_snapshot/)
+  })
+
   it('is injected into DeepSeek/CCB prompt context', async () => {
     await withoutRemotePlatformSlots(async () => {
       const result = await buildPromptContext({
