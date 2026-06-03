@@ -1,7 +1,7 @@
 // OpenClaude — ScanSci PDF paper assistant modal
-import { $ } from './dom.js?v=auto'
-import { state } from './state.js?v=auto'
-import { closeModal, openModal, toast } from './ui.js?v=auto'
+import { $ } from './dom.js?v=7889832b'
+import { state } from './state.js?v=7889832b'
+import { closeModal, openModal, toast } from './ui.js?v=7889832b'
 
 const DEFAULT_LIMIT = 8
 
