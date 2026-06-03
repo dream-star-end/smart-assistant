@@ -2945,13 +2945,11 @@ export function renderMessages() {
     // 首次会话引导:starter prompt 卡片(2026-04-30)
     // 数据观察:赠送积分后的真实用户里 ~60% 进了 chat 页但没发任何消息,
     // 容器拉起后停留几十秒到几十分钟再离开 — 主因是面对空白输入框不知道
-    // 说什么。给 4 个示例 prompt 卡片,点击后填入 input(不直接发送),
-    // 用户可改可发,降低首句门槛。
+    // 说什么。用户反馈首屏太杂后,这里只保留 2 个轻量示例;学习循环入口
+    // 收到下面一行低调快捷按钮里,避免空会话像“功能广告墙”。
     const _STARTERS = [
       { title: '写代码', text: '用 Python 写一个简单的脚本,读取 CSV 并按某一列分组求和' },
-      { title: '调试报错', text: '我有段 JavaScript 报 "TypeError: cannot read property of undefined",帮我列举常见原因和排查步骤' },
       { title: '解释概念', text: '用通俗语言解释一下 React 的 useEffect 是干嘛的' },
-      { title: '帮写文字', text: '帮我写一封专业的离职邮件,语气得体,不到 200 字' },
     ]
     const grid = document.createElement('div')
     grid.className = 'empty-starter-grid'
@@ -2978,22 +2976,25 @@ export function renderMessages() {
       grid.appendChild(card)
     }
     empty.appendChild(grid)
-    const contextGrid = document.createElement('div')
-    contextGrid.className = 'empty-context-grid'
-    const contextCards = [
-      { icon: '🧠', title: '建立长期记忆', text: '告诉 Agent 你的偏好、项目和常用约束', run: () => _openMemoryModal?.() },
-      { icon: '🛠️', title: '沉淀可复用技能', text: '管理工作流，让复杂任务少重复解释', run: () => _openSkillsModal?.() },
-      { icon: '⏰', title: '创建提醒任务', text: '几分钟后、每天、每周，都可以可视化创建', run: () => _openTasksModal?.() },
+    const contextStrip = document.createElement('div')
+    contextStrip.className = 'empty-context-strip'
+    const stripLabel = document.createElement('span')
+    stripLabel.textContent = '更多'
+    contextStrip.appendChild(stripLabel)
+    const contextActions = [
+      { label: '记忆', run: () => _openMemoryModal?.() },
+      { label: '技能', run: () => _openSkillsModal?.() },
+      { label: '提醒', run: () => _openTasksModal?.() },
     ]
-    for (const item of contextCards) {
+    for (const item of contextActions) {
       const card = document.createElement('button')
       card.type = 'button'
-      card.className = 'empty-context-card'
-      card.innerHTML = `<span>${item.icon}</span><strong>${htmlSafeEscape(item.title)}</strong><small>${htmlSafeEscape(item.text)}</small>`
+      card.className = 'empty-context-link'
+      card.textContent = item.label
       card.addEventListener('click', item.run)
-      contextGrid.appendChild(card)
+      contextStrip.appendChild(card)
     }
-    empty.appendChild(contextGrid)
+    empty.appendChild(contextStrip)
     main.appendChild(empty)
     _renderedSessionId = s.id
     _renderedHadOverflow = hasOverflow
