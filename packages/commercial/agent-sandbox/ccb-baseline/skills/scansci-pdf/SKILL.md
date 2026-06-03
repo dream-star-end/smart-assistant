@@ -8,6 +8,8 @@ tags: [research, papers, pdf, citation]
 
 Use this skill when the user asks to find papers, download a paper PDF, batch download a reading list, resolve DOI/arXiv/title identifiers, check paper-source health, or generate citations.
 
+The commercial web UI is chat-native: infer paper tasks directly from the user's message. Do **not** ask the user to open Settings or a separate paper-assistant entry. If the user pastes a DOI/arXiv/title/URL without much wording, treat it as a request to resolve/download or inspect that paper unless they clearly ask for something else.
+
 ## Default behavior
 
 - Prefer `scansci_pdf_search` for vague topics, title fragments, or when multiple papers may match. Ask the user to choose before downloading many ambiguous results.
@@ -15,6 +17,7 @@ Use this skill when the user asks to find papers, download a paper PDF, batch do
 - Prefer `scansci_pdf_batch_download` for a user-provided DOI/arXiv/title list. Keep batches small unless the user explicitly asks for a large run.
 - Use `scansci_pdf_citation` when the user asks for BibTeX, RIS, APA, MLA, Vancouver, or citation metadata.
 - Use `scansci_pdf_health_check` or `scansci_pdf_network_diagnose` when downloads repeatedly fail.
+- Keep all follow-up choices in the chat. For search results, present short numbered candidates and ask which one to download; if the UI shows result cards, the user may click a card action that sends the follow-up prompt.
 
 ## User-facing response rules
 
@@ -26,6 +29,8 @@ After a successful download, always include:
 4. Citation/BibTeX if the user asked for it or if it helps the task.
 
 Keep replies concise and actionable. If a PDF path is available, print the path directly so OpenClaude can render it as a file card.
+
+When returning search results, include enough identifiers for chat follow-up actions to work: title, year, first authors, DOI or arXiv ID when available. When returning downloads, include the exact PDF path on its own line or in a simple sentence.
 
 ## Safety and privacy
 

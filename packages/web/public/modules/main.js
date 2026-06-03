@@ -116,7 +116,7 @@ import {
 
 // ── Scheduled tasks ──
 import { initTasksListeners, openTasksModal } from './tasks.js?v=7889832b'
-import { initPapersAssistant, openPapersModal } from './papers.js?v=7889832b'
+import { initPapersAssistant } from './papers.js?v=7889832b'
 
 // ── Agents ──
 import {
@@ -270,7 +270,6 @@ setCommandDeps({
   openSkillsModal,
   openPersonaEditor,
   openTasksModal,
-  openPapersModal,
   cycleTheme,
   send: () => send(),
 })
@@ -1366,16 +1365,6 @@ const paletteActions = [
     run: () => {
       closePalette()
       openTasksModal()
-    },
-  },
-  {
-    id: 'open-papers',
-    label: '论文助手 / PDF 下载',
-    section: '科研工具',
-    icon: 'doc',
-    run: () => {
-      closePalette()
-      openPapersModal()
     },
   },
   {
@@ -2850,7 +2839,6 @@ async function init() {
     else if (action === 'memory') openMemoryModal()
     else if (action === 'skills') openSkillsModal()
     else if (action === 'tasks') openTasksModal()
-    else if (action === 'papers') openPapersModal()
     else if (action === 'theme') cycleTheme()
     else if (action === 'config') {
       ;(async () => {

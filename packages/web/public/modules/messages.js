@@ -317,7 +317,7 @@ const _MCP_SERVER_META = {
   'minimax-vision': { icon: _ICON_EYE, label: '视觉理解' },
   'openclaude-vision': { icon: _ICON_EYE, label: '视觉理解' },
   'openclaude-memory': { icon: _ICON_BRAIN, label: '记忆' },
-  'scansci-pdf': { icon: _ICON_FILE_TEXT, label: '论文助手' },
+  'scansci-pdf': { icon: _ICON_FILE_TEXT, label: '论文检索' },
   codex: { icon: _ICON_BOT, label: 'Codex' },
   'quant-system': { icon: _ICON_CHART, label: '量化' },
 }
@@ -1478,6 +1478,35 @@ function _findPdfPath(v) {
   return ''
 }
 
+function _scanSciResultIdentifier(r) {
+  if (!r || typeof r !== 'object') return ''
+  const val = r.doi || r.arxiv || r.arxiv_id || r.identifier || r.url || r.title || r.display_name
+  return typeof val === 'string' ? val.trim().slice(0, 320) : ''
+}
+
+function _appendScanSciResultActions(item, r) {
+  const identifier = _scanSciResultIdentifier(r)
+  if (!identifier) return
+  const actions = document.createElement('div')
+  actions.className = 'scansci-result-actions'
+  const download = document.createElement('button')
+  download.type = 'button'
+  download.className = 'scansci-result-action'
+  download.dataset.paperChatAction = 'download'
+  download.dataset.paperIdentifier = identifier
+  download.textContent = '下载 PDF'
+  actions.appendChild(download)
+
+  const citation = document.createElement('button')
+  citation.type = 'button'
+  citation.className = 'scansci-result-action'
+  citation.dataset.paperChatAction = 'citation'
+  citation.dataset.paperIdentifier = identifier
+  citation.textContent = '生成引用'
+  actions.appendChild(citation)
+  item.appendChild(actions)
+}
+
 function _renderScanSciResults(body, results) {
   if (!Array.isArray(results) || results.length === 0) return false
   const list = document.createElement('div')
@@ -1498,6 +1527,7 @@ function _renderScanSciResults(body, results) {
     meta.textContent = parts.join(' · ')
     item.appendChild(title)
     if (parts.length) item.appendChild(meta)
+    _appendScanSciResultActions(item, r)
     list.appendChild(item)
   }
   if (list.children.length === 0) return false
