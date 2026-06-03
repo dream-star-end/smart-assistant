@@ -8,9 +8,9 @@ import { query } from "../db/queries.js";
 import { runMigrations } from "../db/migrate.js";
 
 /**
- * T-03 集成测试:完整跑一次所有内置迁移(0001-0007),验证
- *   - 所有业务表和索引都落地
- *   - 种子数据:model_pricing 2 条,topup_plans 4 条
+ * T-03 集成测试:完整跑一次所有内置迁移,验证
+ *   - 关键业务表和索引都落地
+ *   - 关键种子数据存在且不会重复
  *   - usage_records.account_id 的 FK 在 0004 之后挂上
  *   - credit_ledger 的 append-only RULE 仍生效(回归)
  *   - admin_audit 的 append-only RULE 生效(新增)
@@ -28,31 +28,18 @@ const REQUIRE_TEST_DB =
 
 let pgAvailable = false;
 
-/** 涉及的所有商业化表,按 FK 依赖的逆序 DROP(child 在前)。 */
-const COMMERCIAL_TABLES = [
-  "rate_limit_events",
-  "admin_audit",
-  "agent_audit",
-  "agent_containers",
-  "agent_subscriptions",
-  "user_preferences",
-  "request_finalize_journal",
-  "orders",
-  "topup_plans",
-  "usage_records",
-  "credit_ledger",
-  "model_pricing",
-  "claude_accounts",
-  "refresh_tokens",
-  "email_verifications",
-  "users",
-  "schema_migrations",
-];
-
 async function cleanCommercialSchema(): Promise<void> {
-  // DROP CASCADE 一条搞定(即使 FK 顺序反了也会被 CASCADE 拉平)
-  const sql = `DROP TABLE IF EXISTS ${COMMERCIAL_TABLES.join(", ")} CASCADE`;
-  await query(sql);
+  const rows = await query<{ table_name: string }>(
+    `SELECT table_name
+       FROM information_schema.tables
+      WHERE table_schema = 'public'
+        AND table_type = 'BASE TABLE'`,
+  );
+  if (rows.rows.length === 0) return;
+  const quoted = rows.rows
+    .map((r) => `"${r.table_name.replaceAll('"', '""')}"`)
+    .join(", ");
+  await query(`DROP TABLE IF EXISTS ${quoted} CASCADE`);
 }
 
 async function probe(): Promise<boolean> {
@@ -107,7 +94,7 @@ function skipIfNoPg(t: { skip: (reason: string) => void }): boolean {
   return false;
 }
 
-describe("full migration suite 0001-0007", () => {
+describe("full migration suite", () => {
   test("all expected tables exist after running built-in migrations", async (t) => {
     if (skipIfNoPg(t)) return;
     await runMigrations();
@@ -137,13 +124,17 @@ describe("full migration suite 0001-0007", () => {
     }
   });
 
-  test("seed: model_pricing=2 rows, topup_plans=4 rows", async (t) => {
+  test("seed: key model pricing and topup rows exist", async (t) => {
     if (skipIfNoPg(t)) return;
     await runMigrations();
-    const mp = await query<{ cnt: string }>(
-      "SELECT COUNT(*)::text AS cnt FROM model_pricing",
+    const duplicatedModels = await query<{ model_id: string; cnt: string }>(
+      `SELECT model_id, COUNT(*)::text AS cnt
+         FROM model_pricing
+        GROUP BY model_id
+       HAVING COUNT(*) > 1`,
     );
-    assert.equal(mp.rows[0].cnt, "2");
+    assert.equal(duplicatedModels.rows.length, 0, "model_pricing must not duplicate model_id rows");
+
     const tp = await query<{ cnt: string }>(
       "SELECT COUNT(*)::text AS cnt FROM topup_plans",
     );
@@ -157,6 +148,14 @@ describe("full migration suite 0001-0007", () => {
     assert.equal(sonnet.rows.length, 1);
     assert.equal(sonnet.rows[0].input_per_mtok, "300");
     assert.equal(sonnet.rows[0].multiplier, "2.000");
+
+    const minimax = await query<{ enabled: boolean; visibility: string }>(
+      "SELECT enabled, visibility FROM model_pricing WHERE model_id=$1",
+      ["MiniMax-M3"],
+    );
+    assert.equal(minimax.rows.length, 1);
+    assert.equal(minimax.rows[0].enabled, true);
+    assert.equal(minimax.rows[0].visibility, "public");
 
     const plan1000 = await query<{ amount_cents: string; credits: string }>(
       "SELECT amount_cents::text AS amount_cents, credits::text AS credits FROM topup_plans WHERE code=$1",
@@ -188,16 +187,30 @@ describe("full migration suite 0001-0007", () => {
     const here = path.dirname(fileURLToPath(import.meta.url));
     const seedSqlPath = path.resolve(here, "../db/migrations/0007_seed_pricing.sql");
     const seedSql = await readFile(seedSqlPath, "utf8");
+    const beforeMp = await query<{ cnt: string }>(
+      "SELECT COUNT(*)::text AS cnt FROM model_pricing",
+    );
+    const beforeTp = await query<{ cnt: string }>(
+      "SELECT COUNT(*)::text AS cnt FROM topup_plans",
+    );
     await query(seedSql);
 
     const mp = await query<{ cnt: string }>(
       "SELECT COUNT(*)::text AS cnt FROM model_pricing",
     );
-    assert.equal(mp.rows[0].cnt, "2", "model_pricing must not have duplicates");
+    assert.equal(mp.rows[0].cnt, beforeMp.rows[0].cnt, "0007 re-run must not add model_pricing rows");
+    const duplicatedModels = await query<{ model_id: string; cnt: string }>(
+      `SELECT model_id, COUNT(*)::text AS cnt
+         FROM model_pricing
+        GROUP BY model_id
+       HAVING COUNT(*) > 1`,
+    );
+    assert.equal(duplicatedModels.rows.length, 0, "model_pricing must not have duplicate model_id rows");
+
     const tp = await query<{ cnt: string }>(
       "SELECT COUNT(*)::text AS cnt FROM topup_plans",
     );
-    assert.equal(tp.rows[0].cnt, "4", "topup_plans must not have duplicates");
+    assert.equal(tp.rows[0].cnt, beforeTp.rows[0].cnt, "0007 re-run must not add topup_plans rows");
   });
 
   test("FK: usage_records.account_id references claude_accounts after 0004 + SET NULL after 0044", async (t) => {
