@@ -9793,3 +9793,43 @@ textarea:focus-visible,
     transition-duration: 1ms !important;
   }
 }
+
+/* ══════════════════════════════════════════════════════════════════
+ *  Settings dropdown hotfix — keep menu above chat scroll layers
+ *
+ *  v1.0.269 added `.main > * { z-index: 1 }` for the refreshed app
+ *  surface. Later siblings such as `.messages` and `.composer` then painted
+ *  over the header stacking context, making the settings dropdown visible but
+ *  not clickable. Keep the header/menu in a higher stacking layer and make the
+ *  mobile dropdown a bounded fixed sheet.
+ * ══════════════════════════════════════════════════════════════════ */
+.main-head {
+  z-index: 80;
+}
+.settings-dropdown-wrap {
+  z-index: 90;
+}
+.settings-dropdown {
+  z-index: 1000;
+  pointer-events: auto;
+}
+
+@media (max-width: 860px) {
+  .settings-dropdown {
+    position: fixed;
+    top: calc(env(safe-area-inset-top, 0px) + 70px);
+    right: max(12px, env(safe-area-inset-right, 0px));
+    left: auto;
+    width: min(320px, calc(100vw - 24px));
+    max-width: calc(100vw - 24px);
+    max-height: calc(100dvh - env(safe-area-inset-top, 0px) - 92px);
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    -webkit-overflow-scrolling: touch;
+  }
+  .settings-item {
+    min-height: 44px;
+    padding-top: 10px;
+    padding-bottom: 10px;
+  }
+}
