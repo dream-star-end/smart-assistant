@@ -173,7 +173,7 @@ describe("openclaude-runtime entrypoint env-scrub policy", () => {
     );
   });
 
-  test("entrypoint.ts wires ScanSci PDF data dir and array-shaped MCP server config", () => {
+  test("entrypoint.ts wires lightweight default toolsets plus browser/research MCP configs", () => {
     const src = readFileSync(ENTRYPOINT_TS_PATH, "utf-8");
     assert.match(
       src,
@@ -187,13 +187,43 @@ describe("openclaude-runtime entrypoint env-scrub policy", () => {
     );
     assert.match(
       src,
-      /mcpServers:\s*\[cloneScanSciPdfMcpServer\(\)\]/,
+      /toolsets:\s*\[CORE_TOOLSET_ID\]/,
+      "minimal openclaude.json must default to core toolset only",
+    );
+    assert.match(
+      src,
+      /\[CORE_TOOLSET_ID\]:\s*\[\]/,
+      "core toolset must be empty so default turns stay lightweight",
+    );
+    assert.match(
+      src,
+      /\[BROWSER_TOOLSET_ID\]:\s*\[BROWSER_MCP_ID\]/,
+      "browser tools must be opt-in via the browser toolset",
+    );
+    assert.match(
+      src,
+      /\[RESEARCH_TOOLSET_ID\]:\s*\[SCANSCI_PDF_MCP_ID\]/,
+      "ScanSci tools must be opt-in via the research toolset",
+    );
+    assert.match(
+      src,
+      /mcpServers:\s*\[cloneBrowserMcpServer\(\),\s*cloneScanSciPdfMcpServer\(\)\]/,
       "minimal openclaude.json must use array-shaped mcpServers, not a keyed object",
+    );
+    assert.match(
+      src,
+      /command:\s*"npx"[\s\S]*args:\s*\["-y",\s*"@playwright\/mcp@latest",\s*"--headless",\s*"--no-sandbox"\]/,
+      "browser MCP server should launch Playwright MCP over stdio",
     );
     assert.match(
       src,
       /command:\s*"scansci-pdf"[\s\S]*args:\s*\["run"\]/,
       "ScanSci MCP server should launch `scansci-pdf run` over stdio",
+    );
+    assert.doesNotMatch(
+      src,
+      /for\s*\(\s*const\s+name\s+of\s+defaultToolsets\s*\)/,
+      "entrypoint must not append ScanSci into every default toolset",
     );
     assert.doesNotMatch(
       src,

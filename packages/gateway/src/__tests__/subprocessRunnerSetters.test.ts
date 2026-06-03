@@ -19,7 +19,9 @@ import {
   _buildStaticProviderSmallFastModelEnv,
 } from '../subprocessRunner.js'
 
-function createRunner(initial: Partial<{ model: string; effortLevel: string }> = {}): SubprocessRunner {
+function createRunner(
+  initial: Partial<{ model: string; effortLevel: string; agentToolsets: string[] }> = {},
+): SubprocessRunner {
   return new SubprocessRunner({
     sessionKey: 'test',
     agentId: 'test',
@@ -109,6 +111,18 @@ describe('SubprocessRunner.model getter / setModel', () => {
     r.setEffortLevel('high')
     assert.equal(r.model, 'claude-sonnet-4-6')
     assert.equal(r.effortLevel, 'high')
+  })
+
+  it('toolsets getter / setToolsets follows the same pure-mutator contract', () => {
+    const r = createRunner({ agentToolsets: ['core'] })
+    assert.deepEqual(r.toolsets, ['core'])
+    let spawned = false
+    r.on('spawn' as any, () => { spawned = true })
+    r.setToolsets(['core', 'browser'])
+    assert.deepEqual(r.toolsets, ['core', 'browser'])
+    r.setToolsets(undefined)
+    assert.equal(r.toolsets, undefined)
+    assert.equal(spawned, false, 'setToolsets must not spawn — caller owns restart via shutdown()')
   })
 })
 
