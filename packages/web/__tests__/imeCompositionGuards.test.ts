@@ -146,4 +146,25 @@ describe('波次 4 — Dual menu cross-close (effortMode ⇄ modelPicker)', () =
         `effort=${effortSourceMatch[1]}, model=${modelSourceMatch[1]}`,
     )
   })
+
+  it('G. modelPicker + effortMode 都把菜单 portal 到 document.body 以逃离 composer 裁剪', () => {
+    assert.match(
+      MODEL,
+      /document\.body\.appendChild\(\s*menu\s*\)/,
+      'modelPicker.js 打开菜单前必须把 #model-menu 移到 body,避免 .composer-inner glass/overflow 裁剪 fixed 菜单',
+    )
+    assert.match(
+      EFFORT,
+      /document\.body\.appendChild\(\s*menu\s*\)/,
+      'effortMode.js 打开菜单前必须把 #effort-menu 移到 body,避免 .composer-inner glass/overflow 裁剪 fixed 菜单',
+    )
+  })
+
+  it('H. effortMode 外部点击判断必须把 body-ported menu 本身视为内部点击', () => {
+    assert.match(
+      EFFORT,
+      /trigger\.contains\(ev\.target\)\s*\|\|\s*menu\.contains\(ev\.target\)/,
+      'effortMode.js pointerdown capture 不能只看 composer-modes.contains,否则 body portal 后点选项会先被关掉',
+    )
+  })
 })

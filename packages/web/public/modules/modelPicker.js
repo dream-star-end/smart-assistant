@@ -71,6 +71,15 @@ function modelDisplayName(modelId) {
 function getTrigger() { return $('model-trigger') }
 function getMenu() { return $('model-menu') }
 
+// Keep the fixed-position popup out of .composer-inner. The refreshed glass
+// composer uses overflow/backdrop filters, which can make fixed descendants
+// behave like they are clipped by the composer instead of the viewport.
+function ensureMenuPortal(menu) {
+  if (!menu || !document.body || menu.parentElement === document.body) return
+  menu.dataset.composerMenuPortal = 'true'
+  document.body.appendChild(menu)
+}
+
 function isMenuOpen() {
   const m = getMenu()
   return !!m && !m.hidden
@@ -153,6 +162,7 @@ async function openMenu(focusFirst = false) {
     new CustomEvent('composer-popup-opening', { detail: { source: POPUP_SOURCE } }),
   )
   await ensureMenuRendered()
+  ensureMenuPortal(menu)
   positionMenu()
   menu.hidden = false
   trigger.setAttribute('aria-expanded', 'true')
