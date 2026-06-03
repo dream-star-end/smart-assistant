@@ -1,20 +1,20 @@
 // OpenClaude — Slash Commands
-import { apiGet } from './api.js?v=bdbc6afe'
+import { apiGet } from './api.js?v=2d879c6a'
 // `?v=...` 必须跟 main.js / websocket.js 的 billing import 用同一版本,不然
 // 浏览器把 `./billing.js` 和 `./billing.js?v=...` 当两个独立 ES module 实例,
 // `_hostAgentAdmin` 模块状态不共享,admin 登录后本模块永远读到 false。
 // 版本号由 scripts/deploy-v3.sh 跟其它 ?v= 一起 bump。
-import { isHostAgentAdmin } from './billing.js?v=bdbc6afe'
-import { $, _mod } from './dom.js?v=bdbc6afe'
-import { getSession, state } from './state.js?v=bdbc6afe'
-import { toast } from './ui.js?v=bdbc6afe'
+import { isHostAgentAdmin } from './billing.js?v=2d879c6a'
+import { $, _mod } from './dom.js?v=2d879c6a'
+import { getSession, state } from './state.js?v=2d879c6a'
+import { toast } from './ui.js?v=2d879c6a'
 import {
   addSystemMessage,
   localStopTeardown,
   nudgeDrain,
   resetReplyTracker,
   safeWsSend,
-} from './websocket.js?v=bdbc6afe'
+} from './websocket.js?v=2d879c6a'
 
 // v3 P0/P1: /memory /skills /persona /tasks are now commercial-safe for normal
 // users because the master gateway proxies those APIs into the caller's own
