@@ -9833,3 +9833,444 @@ textarea:focus-visible,
     padding-bottom: 10px;
   }
 }
+
+/* ══════════════════════════════════════════════════════════════════
+ *  Mobile UI polish — compact chrome, safe cards, bounded menus
+ *
+ *  CSS-only follow-up to the commercial refresh. Keep this layer scoped to
+ *  mobile surfaces: no DOM/JS hooks, no global stacking changes, and no
+ *  broad pointer-event overrides so existing click wiring remains intact.
+ * ══════════════════════════════════════════════════════════════════ */
+@media (max-width: 860px) {
+  .main-head {
+    gap: 8px;
+    min-height: calc(56px + env(safe-area-inset-top, 0));
+    padding-left: max(10px, env(safe-area-inset-left, 0px));
+    padding-right: max(10px, env(safe-area-inset-right, 0px));
+  }
+  .session-info {
+    flex: 1 1 auto;
+    min-width: 0;
+    gap: 0;
+  }
+  .session-info h3 {
+    max-width: 100%;
+    font-size: clamp(15px, 4vw, 18px);
+    line-height: 1.25;
+  }
+  .head-actions {
+    flex: 0 1 auto;
+    min-width: 0;
+    gap: 4px;
+    justify-content: flex-end;
+  }
+  .settings-dropdown-wrap {
+    z-index: 1000;
+  }
+  .settings-dropdown {
+    z-index: 1001;
+  }
+  .head-actions .icon-btn,
+  .settings-dropdown-wrap > .icon-btn {
+    flex: 0 0 38px;
+    width: 38px;
+    height: 38px;
+    min-width: 38px;
+  }
+  .head-actions .icon-btn svg,
+  .settings-dropdown-wrap > .icon-btn svg {
+    width: 18px;
+    height: 18px;
+  }
+  .head-actions .balance-pill {
+    min-width: 0;
+    max-width: min(150px, 30vw);
+    height: 36px;
+    padding: 0 9px;
+    gap: 5px;
+  }
+  #balance-text {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .agent-select {
+    flex: 0 1 auto;
+    min-width: 0;
+    max-width: min(34vw, 148px);
+    min-height: 36px;
+    padding-left: 10px;
+    padding-right: 28px;
+    background-position: right 10px center;
+  }
+
+  .tasks-panel {
+    position: fixed;
+    top: calc(env(safe-area-inset-top, 0px) + 70px);
+    right: max(12px, env(safe-area-inset-right, 0px));
+    left: auto;
+    width: min(340px, calc(100vw - 24px));
+    min-width: 0;
+    max-width: calc(100vw - 24px);
+    max-height: calc(100dvh - env(safe-area-inset-top, 0px) - 92px);
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    -webkit-overflow-scrolling: touch;
+    z-index: 950;
+    border-radius: 22px;
+    padding: 6px;
+  }
+  .tasks-panel-item {
+    align-items: flex-start;
+    min-height: 44px;
+    padding: 10px 12px;
+    border-radius: var(--radius-md);
+  }
+  .tasks-panel-desc {
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+
+  .messages {
+    padding-top: clamp(14px, 3vh, 24px);
+  }
+  .messages-inner {
+    max-width: 100%;
+    min-width: 0;
+  }
+  .msg,
+  .msg-body,
+  .msg.user,
+  .msg.tool,
+  .tool-card,
+  .tool-call,
+  .tool-result,
+  .tool-message,
+  .permission-card,
+  .ask-user-question-card,
+  .paper-result-card,
+  .plan-card,
+  .context-tool-card {
+    min-width: 0;
+    max-width: 100%;
+  }
+  .msg.user {
+    max-width: min(92%, calc(100vw - 32px));
+    overflow-wrap: anywhere;
+  }
+  .msg.assistant .msg-body,
+  .msg.permission .msg-body,
+  .msg.plan .msg-body,
+  .tool-card-body,
+  .tool-body,
+  .tool-prompt,
+  .tool-kv,
+  .tool-status-ok,
+  .tool-status-err,
+  .paper-result-card,
+  .scansci-file-card,
+  .context-tool-card {
+    min-width: 0;
+    max-width: 100%;
+    overflow-wrap: anywhere;
+  }
+  .tool-card-header,
+  .tool-card-header-left,
+  .paper-result-head,
+  .paper-result-main,
+  .doc-card,
+  .scansci-file-card {
+    min-width: 0;
+    max-width: 100%;
+  }
+  .tool-card-summary,
+  .tool-card-label,
+  .paper-result-title,
+  .paper-result-meta,
+  .repo-banner-name,
+  .attach-name {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .doc-card {
+    display: inline-flex;
+    width: auto;
+  }
+  .doc-card-name,
+  .media-filename,
+  .scansci-file-card .doc-card-name {
+    overflow-wrap: anywhere;
+    word-break: break-word;
+  }
+  .msg.assistant .msg-body pre,
+  .msg.assistant .msg-body table,
+  .html-preview-wrap,
+  .tool-terminal,
+  .tool-output,
+  .skill-body-preview {
+    max-width: 100%;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+  .msg.assistant .msg-body pre,
+  .tool-terminal {
+    white-space: pre;
+    word-break: normal;
+  }
+  .tool-output,
+  .skill-body-preview {
+    overflow-wrap: anywhere;
+    word-break: break-word;
+  }
+  .msg.assistant .msg-body table {
+    display: block;
+    width: max-content;
+  }
+
+  .composer {
+    padding-top: var(--space-2);
+    padding-left: max(var(--space-2), env(safe-area-inset-left, 0px));
+    padding-right: max(var(--space-2), env(safe-area-inset-right, 0px));
+    padding-bottom: calc(var(--space-2) + env(safe-area-inset-bottom, 0));
+  }
+  .composer::before {
+    margin-bottom: var(--space-2);
+  }
+  .repo-bar,
+  .composer-inner {
+    width: 100%;
+    max-width: 100%;
+  }
+  .composer-inner {
+    border-radius: 20px;
+  }
+  .composer-modes,
+  .attachments {
+    min-width: 0;
+  }
+  .composer-input-row {
+    gap: 4px;
+    padding: 7px;
+  }
+  .composer-input-row textarea {
+    min-width: 0;
+    min-height: 44px;
+    max-height: min(32dvh, 220px);
+    padding: 10px 6px 9px;
+    line-height: 1.5;
+  }
+  .composer-actions {
+    gap: 2px;
+  }
+  .input-btn {
+    flex: 0 0 36px;
+    width: 36px;
+    height: 36px;
+    min-width: 36px;
+  }
+  .send-btn {
+    flex: 0 0 40px;
+    width: 40px;
+    height: 40px;
+    min-width: 40px;
+  }
+  .attach-item {
+    min-width: 0;
+    max-width: calc(100vw - 48px);
+  }
+  .repo-banner {
+    min-width: 0;
+  }
+
+  .modal-backdrop.open {
+    align-items: stretch;
+  }
+  .modal {
+    width: 100%;
+    max-width: 100%;
+    height: 100dvh;
+    max-height: 100dvh;
+    border-radius: 0;
+  }
+  .modal-head,
+  .modal-foot {
+    flex: 0 0 auto;
+  }
+  .modal-body,
+  .modal-body-scroll {
+    min-height: 0;
+    overflow-y: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+  .modal-foot {
+    gap: 8px;
+  }
+}
+
+@media (max-width: 520px) {
+  .main-head {
+    gap: 6px;
+    min-height: calc(52px + env(safe-area-inset-top, 0));
+    padding-top: calc(8px + env(safe-area-inset-top, 0));
+    padding-bottom: 8px;
+  }
+  .head-actions {
+    gap: 3px;
+  }
+  .head-actions .icon-btn,
+  .settings-dropdown-wrap > .icon-btn {
+    flex-basis: 34px;
+    width: 34px;
+    height: 34px;
+    min-width: 34px;
+  }
+  .head-actions .balance-pill {
+    max-width: min(96px, 24vw);
+    height: 34px;
+    padding: 0 8px;
+    font-size: 12px;
+  }
+  .head-actions .balance-pill svg {
+    width: 13px;
+    height: 13px;
+  }
+  .agent-select {
+    max-width: min(92px, 26vw);
+    min-height: 34px;
+    font-size: 12px;
+  }
+  .settings-dropdown,
+  .tasks-panel {
+    top: calc(env(safe-area-inset-top, 0px) + 60px);
+    right: max(8px, env(safe-area-inset-right, 0px));
+    width: calc(100vw - 16px);
+    max-width: calc(100vw - 16px);
+    max-height: calc(100dvh - env(safe-area-inset-top, 0px) - 76px);
+  }
+  .settings-item {
+    gap: 9px;
+    padding-left: 12px;
+    padding-right: 12px;
+  }
+
+  .messages-inner {
+    padding-left: 12px;
+    padding-right: 12px;
+    gap: var(--space-4);
+  }
+  .msg.user {
+    max-width: min(94%, calc(100vw - 24px));
+    padding: 11px 13px;
+    border-radius: 18px 18px 6px 18px;
+  }
+  .msg.assistant {
+    grid-template-columns: 28px minmax(0, 1fr);
+    column-gap: 9px;
+  }
+  .msg.assistant .avatar {
+    width: 28px;
+    height: 28px;
+    border-radius: 9px;
+  }
+  .msg.assistant .msg-body {
+    font-size: 14px;
+    line-height: 1.68;
+  }
+  .tool-card-header {
+    align-items: flex-start;
+    padding: 9px 10px;
+  }
+  .tool-card-header-left {
+    flex-wrap: wrap;
+    row-gap: 3px;
+  }
+  .tool-card-summary {
+    flex-basis: 100%;
+  }
+  .tool-card-body {
+    padding-left: 10px;
+    padding-right: 10px;
+  }
+  .doc-card {
+    padding: 9px 11px;
+    font-size: 12px;
+  }
+  .scansci-result-actions,
+  .context-tool-actions,
+  .memory-entry-actions,
+  .automation-actions,
+  .modal-foot-split,
+  .modal-foot {
+    align-items: stretch;
+  }
+  .scansci-result-action,
+  .context-tool-actions .btn,
+  .memory-entry-actions .btn,
+  .automation-actions .btn,
+  .modal-foot .btn {
+    min-height: 38px;
+  }
+
+  .composer-modes {
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    scrollbar-width: none;
+    padding: 7px 8px 0;
+  }
+  .composer-modes::-webkit-scrollbar {
+    display: none;
+  }
+  .mode-pill {
+    flex: 0 0 auto;
+    min-height: 32px;
+    padding-left: 10px;
+    padding-right: 10px;
+  }
+  .composer-input-row {
+    padding: 6px;
+  }
+  .input-btn {
+    flex-basis: 34px;
+    width: 34px;
+    height: 34px;
+    min-width: 34px;
+  }
+  .send-btn {
+    flex-basis: 38px;
+    width: 38px;
+    height: 38px;
+    min-width: 38px;
+  }
+  .repo-bar {
+    padding-left: 8px;
+    padding-right: 8px;
+  }
+  .repo-banner {
+    max-width: 100%;
+  }
+  .repo-banner-status {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .context-hub-nav {
+    grid-template-columns: 1fr;
+  }
+  .context-toolbar.compact,
+  .context-toolbar-actions,
+  .skill-detail-head,
+  .automation-card,
+  .context-panel-hero,
+  .execution-row {
+    display: flex;
+    flex-direction: column;
+    align-items: stretch;
+  }
+  .execution-row {
+    gap: 6px;
+  }
+}
