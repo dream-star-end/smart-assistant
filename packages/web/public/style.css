@@ -3447,6 +3447,17 @@ a:hover {
   max-width: 100%;
   height: auto;
 }
+.mermaid-block svg text,
+.mermaid-block svg tspan {
+  fill: var(--text-primary) !important;
+  opacity: 1 !important;
+}
+.mermaid-block .nodeLabel,
+.mermaid-block .edgeLabel,
+.mermaid-block .label {
+  color: var(--text-primary) !important;
+  opacity: 1 !important;
+}
 .mermaid-error {
   background: rgba(224, 108, 108, 0.06);
   border: 1px solid rgba(224, 108, 108, 0.3);
