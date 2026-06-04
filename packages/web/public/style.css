@@ -9647,6 +9647,21 @@ textarea:focus-visible,
   border-color: var(--accent-border) !important;
   box-shadow: var(--ring), inset 0 1px 0 color-mix(in srgb, var(--fg) 4%, transparent) !important;
 }
+
+/* v3-github-modal-selected-fix-20260604: generic card polish gives .github-row
+ * a pale !important panel background; selected rows need their own selected
+ * surface or the inherited white selected text becomes unreadable. */
+#github-modal .github-row[aria-selected='true'] {
+  background: linear-gradient(135deg, var(--accent), var(--accent-active)) !important;
+  border-color: color-mix(in srgb, var(--accent-active) 74%, var(--border-strong)) !important;
+  color: var(--accent-fg) !important;
+  box-shadow:
+    0 1px 0 color-mix(in srgb, white 18%, transparent) inset,
+    0 10px 22px -18px color-mix(in srgb, var(--accent) 70%, transparent);
+}
+#github-modal .github-row[aria-selected='true'] .github-row-sub {
+  color: color-mix(in srgb, var(--accent-fg) 86%, transparent) !important;
+}
 .plan-grid,
 .usage-summary {
   gap: var(--space-3);
