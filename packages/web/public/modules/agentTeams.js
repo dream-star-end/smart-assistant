@@ -4,8 +4,12 @@ import { state } from './state.js?v=ab410ebc'
 import { toast, toastOptsFromError } from './ui.js?v=ab410ebc'
 
 const TEAM_ID_RE = /^[a-zA-Z0-9_-]+$/
-const SELECTED_TEAM_KEY = 'openclaude_selected_team'
+export const SELECTED_TEAM_KEY = 'openclaude_selected_team'
 let _editingTeamId = ''
+
+function _emitTeamSelectionChanged() {
+  document.dispatchEvent(new CustomEvent('agent-team-selection-changed'))
+}
 
 const TEAM_TEMPLATES = [
   {
@@ -264,46 +268,57 @@ export async function reloadAgentTeams() {
     }
   })()
   state.selectedTeamId = state.agentTeams.some((t) => t.id === stored) ? stored : ''
+  _emitTeamSelectionChanged()
   renderTeamDropdown()
   renderTeamsManagementList()
 }
 
+export function selectAgentTeam(teamId = '') {
+  const nextTeamId = teamId && (state.agentTeams || []).some((t) => t.id === teamId) ? teamId : ''
+  state.selectedTeamId = nextTeamId
+  try {
+    if (state.selectedTeamId) localStorage.setItem(SELECTED_TEAM_KEY, state.selectedTeamId)
+    else localStorage.removeItem(SELECTED_TEAM_KEY)
+  } catch {}
+  _emitTeamSelectionChanged()
+}
+
+export function clearSelectedAgentTeam() {
+  selectAgentTeam('')
+}
+
+export function getAgentTeamById(teamId = '') {
+  return _teamById(teamId)
+}
+
 export function renderTeamDropdown() {
-  const sel = $('team-select')
-  if (!sel) return
-  sel.innerHTML = ''
-  const off = document.createElement('option')
-  off.value = ''
-  off.textContent = '团队: 关闭'
-  sel.appendChild(off)
-  for (const t of state.agentTeams || []) {
-    const opt = document.createElement('option')
-    opt.value = t.id
-    opt.textContent = `团队: ${t.name || t.id}`
-    sel.appendChild(opt)
-  }
-  sel.value = state.selectedTeamId || ''
-  sel.hidden = (state.agentTeams || []).length === 0
+  // Legacy no-op: the composer no longer has a standalone #team-select.
 }
 
 export function renderTeamsManagementList() {
   const wrap = $('teams-list-wrap')
   if (!wrap) return
   wrap.innerHTML = ''
+
+  const templateCard = document.createElement('div')
+  templateCard.className = 'team-empty-card team-template-showcase'
+  templateCard.innerHTML = `
+    <div class="team-empty-title">推荐团队模板</div>
+    <p>内置科研协作团队和编程协作团队，可直接预填并按需修改每个 Agent 的团队角色提示词。</p>
+    <div class="team-template-grid" data-team-template-grid></div>`
+  wrap.appendChild(templateCard)
+  _renderTemplateButtons(templateCard.querySelector('[data-team-template-grid]'))
+
   if (!state.agentTeams || state.agentTeams.length === 0) {
     const empty = document.createElement('div')
     empty.className = 'team-empty-card'
-    empty.innerHTML = `
-      <div class="team-empty-title">还没有团队</div>
-      <p>可以从推荐模板开始,系统会预填队长、成员、复核策略;确认后再保存。</p>
-      <div class="team-template-grid" data-team-template-grid></div>`
+    empty.innerHTML = '<div class="team-empty-title">还没有保存的团队</div><p>点击上方模板或“新建团队”开始。</p>'
     wrap.appendChild(empty)
-    _renderTemplateButtons(empty.querySelector('[data-team-template-grid]'))
     return
   }
   for (const t of state.agentTeams) {
     const row = document.createElement('div')
-    row.className = 'agent-row team-row'
+    row.className = 'agent-row team-row agent-card-row'
     row.innerHTML = `
       <div class="agent-row-info">
         <div class="agent-row-title">👥 ${htmlSafeEscape(t.name || t.id)}</div>
@@ -318,9 +333,6 @@ export function renderTeamsManagementList() {
       </div>`
     const editBtn = document.createElement('button')
     editBtn.className = 'btn btn-secondary'
-    editBtn.style.padding = '8px 16px'
-    editBtn.style.minHeight = '38px'
-    editBtn.style.fontSize = 'var(--text-sm)'
     editBtn.textContent = '编辑'
     editBtn.onclick = () => openTeamEditor(t.id)
     row.appendChild(editBtn)
@@ -507,6 +519,7 @@ async function _deleteTeamEditor() {
       try {
         localStorage.removeItem(SELECTED_TEAM_KEY)
       } catch {}
+      _emitTeamSelectionChanged()
     }
     toast('团队已删除', 'success')
     _closeTeamEditor()
@@ -517,13 +530,6 @@ async function _deleteTeamEditor() {
 }
 
 export function initAgentTeams() {
-  $('team-select')?.addEventListener('change', (e) => {
-    state.selectedTeamId = e.target.value || ''
-    try {
-      if (state.selectedTeamId) localStorage.setItem(SELECTED_TEAM_KEY, state.selectedTeamId)
-      else localStorage.removeItem(SELECTED_TEAM_KEY)
-    } catch {}
-  })
   $('new-team-btn')?.addEventListener('click', () => openTeamEditor(''))
   $('team-cancel-btn')?.addEventListener('click', _closeTeamEditor)
   $('team-save-btn')?.addEventListener('click', _saveTeamEditor)

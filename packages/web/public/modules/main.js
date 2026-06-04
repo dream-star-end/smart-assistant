@@ -1070,6 +1070,39 @@ function _installSignedMediaErrorRetry() {
 _installMediaSignResolver()
 _installSignedMediaErrorRetry()
 
+
+function switchCurrentSessionAgent(agentId) {
+  const sess = getSession()
+  if (!sess || !agentId) return
+  if (sess.agentId === agentId) {
+    toast(`已选择 ${agentId}`)
+    renderAgentDropdown()
+    return
+  }
+  // Stop in-flight request before switching to prevent late tokens from old agent.
+  if (state.sendingInFlight) stopCurrentTurn()
+  sess.agentId = agentId
+  // Mark switch time — handleOutbound will ignore frames arriving before this.
+  sess._agentSwitchedAt = Date.now()
+  // Reset streaming state to prevent cross-agent message contamination.
+  sess._streamingAssistant = null
+  sess._streamingThinking = null
+  sess._sendingInFlight = false
+  resetReplyTracker(sess)
+  clearTurnTiming(sess)
+  if (sess._regenSafetyTimer) {
+    clearTimeout(sess._regenSafetyTimer)
+    sess._regenSafetyTimer = null
+  }
+  state.sendingInFlight = false
+  hideTypingIndicator()
+  updateSendEnabled()
+  setTitleBusy(false)
+  scheduleSaveFromUserEdit(sess)
+  renderAgentDropdown()
+  toast(`已切换到 ${sess.agentId}`)
+}
+
 // ── Tasks: tab switching + add-task wiring ──
 initTasksListeners()
 initPapersAssistant()
@@ -1088,11 +1121,10 @@ handleBootGithubParams()
 initModePills()
 initPlanPanel()
 
-// ── 模型选择器(v1.0.4 新增): bind once + 注入 reloadAgents 回调 ──
-// 切换成功后内部会调 _reloadAgents() 拉最新 agent.model 进 state,然后再
-// renderModelPill / renderModePills。直接传 reloadAgents 避免循环依赖。
-// 同时把 renderModelPill 注入回 agents.js,让 reloadAgents 完成后能刷新 pill。
-initModelPicker({ reload: reloadAgents })
+// ── 统一助手选择器: bind once + 注入单 Agent 切换回调 ──
+// 右上角 #agent-select 已移除;composer 的 #model-trigger 现在同时承载
+// 单 Agent / 模型 / 多 Agent 团队选择。
+initModelPicker({ onSwitchAgent: switchCurrentSessionAgent })
 setRenderModelPill(renderModelPill)
 initAgentTeams()
 
@@ -2816,36 +2848,6 @@ async function init() {
   $('sidebar-backdrop').onclick = () => {
     $('sidebar').classList.remove('open')
     $('sidebar-backdrop').classList.remove('open')
-  }
-  $('agent-select').onchange = (e) => {
-    const sess = getSession()
-    if (!sess) return
-    // Stop in-flight request before switching to prevent late tokens from old agent
-    if (state.sendingInFlight) stopCurrentTurn()
-    sess.agentId = e.target.value
-    // 思考深度选择器跟着新 agent 的 model 走 — 切到非 Opus 4.7 自动隐藏,
-    // 选中态按新 agent 的 localStorage 读。
-    renderModePills()
-    // Mark switch time — handleOutbound will ignore frames arriving before this
-    sess._agentSwitchedAt = Date.now()
-    // Reset streaming state to prevent cross-agent message contamination
-    sess._streamingAssistant = null
-    sess._streamingThinking = null
-    sess._sendingInFlight = false
-    // Drop reply tracker so a late isFinal from the old agent doesn't bind to
-    // a new user message on the switched-to agent.
-    resetReplyTracker(sess)
-    clearTurnTiming(sess)
-    if (sess._regenSafetyTimer) {
-      clearTimeout(sess._regenSafetyTimer)
-      sess._regenSafetyTimer = null
-    }
-    state.sendingInFlight = false
-    hideTypingIndicator()
-    updateSendEnabled()
-    setTitleBusy(false)
-    scheduleSaveFromUserEdit(sess)
-    toast(`已切换到 ${sess.agentId}`)
   }
   // Settings dropdown
   $('manage-agents-btn').onclick = (e) => {

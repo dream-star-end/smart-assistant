@@ -86,9 +86,6 @@ export async function reloadAgents() {
       state.agentsList = agents
       state.agentsListIsFallback = false
     }
-    // commercial admin 才能切 agent — 普通用户即便成功也只有 main,没意义就隐藏。
-    const sel = $('agent-select')
-    if (sel) sel.hidden = state.agentsListIsFallback || state.agentsList.length <= 1
   } catch (err) {
     // v3 商用版 P0 防火墙对非 admin 用户把 /api/agents 403 掉了(见
     // packages/commercial/src/http/router.ts BLOCKED_FOR_USER_RULES)。前端
@@ -100,31 +97,15 @@ export async function reloadAgents() {
     state.agentsList = _mergeCommercialFallbackAgents()
     state.agentsListIsFallback = true
     state.defaultAgentId = 'main'
-    const sel = $('agent-select')
-    if (sel) sel.hidden = true
   }
   renderAgentDropdown()
   renderAgentsManagementList()
 }
 
 export function renderAgentDropdown() {
-  const sel = $('agent-select')
-  if (!sel) return
-  sel.innerHTML = ''
-  for (const a of state.agentsList) {
-    const opt = document.createElement('option')
-    opt.value = a.id
-    const name = a.displayName ? `${a.displayName} (${a.id})` : a.id
-    const label = (a.avatarEmoji ? `${a.avatarEmoji} ` : '') + name
-    opt.textContent = label + (a.id === state.defaultAgentId ? ' (default)' : '')
-    sel.appendChild(opt)
-  }
-  const sess = getSession()
-  if (sess) sel.value = sess.agentId || state.defaultAgentId
-  // 思考深度选择器可见性依赖当前 agent 的 model — 任何 agent 列表/会话切换后都要刷新一次。
+  // Legacy name kept for existing call sites. The header #agent-select was removed;
+  // refreshing mode/model pills is still required after session-agent changes.
   renderModePills()
-  // 模型 pill 也跟着 agent 当前 model 走;late-binding setter 在 modelPicker
-  // 注入前是 noop,不会炸。
   _renderModelPill()
 }
 
@@ -145,7 +126,7 @@ export function renderAgentsManagementList() {
   }
   for (const a of state.agentsList) {
     const row = document.createElement('div')
-    row.className = 'agent-row'
+    row.className = 'agent-row agent-card-row'
     const info = document.createElement('div')
     info.className = 'agent-row-info'
     const title = document.createElement('div')
@@ -154,19 +135,16 @@ export function renderAgentsManagementList() {
     if (a.id === state.defaultAgentId) {
       const badge = document.createElement('span')
       badge.className = 'badge'
-      badge.textContent = 'default'
+      badge.textContent = '默认'
       title.appendChild(badge)
     }
     const sub = document.createElement('div')
     sub.className = 'agent-row-sub'
-    sub.textContent = a.model || '—'
+    sub.textContent = `${a.id} · ${a.model || '未配置模型'}`
     info.appendChild(title)
     info.appendChild(sub)
     const editBtn = document.createElement('button')
     editBtn.className = 'btn btn-secondary'
-    editBtn.style.padding = '8px 16px'
-    editBtn.style.minHeight = '38px'
-    editBtn.style.fontSize = 'var(--text-sm)'
     editBtn.textContent = '编辑'
     if (state.agentsListIsFallback) {
       editBtn.disabled = true

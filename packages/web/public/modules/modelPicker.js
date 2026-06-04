@@ -1,43 +1,32 @@
-// OpenClaude — composer 模型选择器(2026-04-26 v1.0.4 重写为 C 方案)
+// OpenClaude — composer unified assistant picker
 //
-// 模型选择是 per-user(走 user_preferences.default_model),不是 per-agent。
-// 切换路径:
-//   1. PATCH /api/me/preferences { default_model: '<model-id>' }
-//   2. 写回 state.userPrefs(setCachedPrefField),prefs modal / effortMode 同步
-//   3. 后续 sendMessage 帧里塞 frame.model = state.userPrefs.default_model
-//      → server.ts WS 入口经静态白名单后透传给 sessionManager.submit(model)
-//      → runner setModel + shutdown,下次 spawn 用新模型(anthropicProxy 自动改计费)
-//
-// 真相源:state.userPrefs.default_model(由 main.js 在登录 + 冷启动两条路径
-//   prefetch,失败 fallback {})。pill 文案展示"用户偏好 || agent 默认"。
-//
-// 列表来源:GET /api/models(getEnabledModels 缓存,与 prefs modal 共用)。
-//   admin 把某模型下线后,菜单不再列;若 prefs.default_model 仍指向已下线模型
-//   pill 仍显示该 id(便于让用户知道并主动改),发出去由 server 静态白名单兜底。
-//
-// 弹窗 / 键盘导航 / position:fixed 完全照旧,只换数据源。
-//
-// 之前的 PUT /api/agents/:id { model } 路径被 v3 多租户防火墙 BLOCKED_FOR_USER
-// 拦截(只有 host admin 能改 agent 配置),因此切换不到这条路。
+// The composer no longer exposes a separate header agent selector or team pill.
+// This menu is the single target picker:
+//   - 单 Agent: switch session agent and adjust the per-user default_model.
+//   - 多 Agent: select a saved team; sendMessage routes through the team leader.
 
 import { apiJson } from './api.js?v=ab410ebc'
 import { $ } from './dom.js?v=ab410ebc'
 import { renderModePills } from './effortMode.js?v=ab410ebc'
+import { openPersonaEditor } from './agents.js?v=ab410ebc'
+import {
+  clearSelectedAgentTeam,
+  getAgentTeamById,
+  openTeamEditor,
+  selectAgentTeam,
+  teamDisplayPrefix,
+} from './agentTeams.js?v=ab410ebc'
 import { getSession, state } from './state.js?v=ab410ebc'
-import { toast, toastOptsFromError } from './ui.js?v=ab410ebc'
+import { openModal, toast, toastOptsFromError } from './ui.js?v=ab410ebc'
 import { getEnabledModels, setCachedPrefField } from './userPrefs.js?v=ab410ebc'
-
-// ── 当前选择(prefs 优先,否则 agent.model)─────────────────────────
 
 function getCurrentAgent() {
   const sess = getSession()
-  if (!sess) return null
-  const agentId = sess.agentId || state.defaultAgentId
+  const agentId = sess?.agentId || state.defaultAgentId
   if (!agentId) return null
   return (state.agentsList || []).find((a) => a.id === agentId) || null
 }
 
-/** 当前生效模型 id:用户偏好 > agent 默认 > ''。 */
 function getEffectiveModel() {
   const pref = state.userPrefs?.default_model
   if (typeof pref === 'string' && pref) return pref
@@ -51,13 +40,9 @@ async function _ensureModels() {
 }
 
 function modelDisplayName(modelId) {
-  if (!modelId) return '—'
+  if (!modelId) return '未配置模型'
   const m = (_modelsCache || []).find((x) => x.id === modelId)
-  if (m && m.display_name) {
-    // 把"Claude Opus 4.7" → "Opus 4.7"(去品牌前缀,pill 紧凑)
-    return String(m.display_name).replace(/^Claude\s+/i, '')
-  }
-  // fallback: 从 id 推 e.g. claude-opus-4-7 → Opus 4.7
+  if (m && m.display_name) return String(m.display_name).replace(/^Claude\s+/i, '')
   const m2 = /^claude-(opus|sonnet|haiku)-(\d+)-(\d+)/i.exec(modelId)
   if (m2) {
     const cap = m2[1].charAt(0).toUpperCase() + m2[1].slice(1).toLowerCase()
@@ -66,14 +51,20 @@ function modelDisplayName(modelId) {
   return modelId
 }
 
-// ── 弹窗位置(原样)─────────────────────────────────────────────────
+function agentLabel(agent) {
+  if (!agent) return '默认 Agent'
+  return `${agent.avatarEmoji ? `${agent.avatarEmoji} ` : ''}${agent.displayName || agent.id}`
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, (c) => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+  })[c])
+}
 
 function getTrigger() { return $('model-trigger') }
 function getMenu() { return $('model-menu') }
 
-// Keep the fixed-position popup out of .composer-inner. The refreshed glass
-// composer uses overflow/backdrop filters, which can make fixed descendants
-// behave like they are clipped by the composer instead of the viewport.
 function ensureMenuPortal(menu) {
   if (!menu || !document.body || menu.parentElement === document.body) return
   menu.dataset.composerMenuPortal = 'true'
@@ -92,7 +83,7 @@ function positionMenu() {
   const rect = trigger.getBoundingClientRect()
   menu.style.position = 'fixed'
   menu.style.bottom = `${Math.max(0, window.innerHeight - rect.top + 6)}px`
-  const menuMinWidth = 240
+  const menuMinWidth = 360
   const maxLeft = Math.max(8, window.innerWidth - menuMinWidth - 8)
   menu.style.left = `${Math.min(rect.left, maxLeft)}px`
   menu.style.right = 'auto'
@@ -102,6 +93,7 @@ function positionMenu() {
 let outsideClickListener = null
 let keydownListener = null
 let reflowListener = null
+let switchAgentHandler = null
 
 function attachGlobalListeners() {
   if (outsideClickListener) return
@@ -157,7 +149,6 @@ async function openMenu(focusFirst = false) {
   const trigger = getTrigger()
   const menu = getMenu()
   if (!trigger || !menu) return
-  // 通知 composer 同栏其他 popup(effortMode)先关闭,避免双开重叠
   document.dispatchEvent(
     new CustomEvent('composer-popup-opening', { detail: { source: POPUP_SOURCE } }),
   )
@@ -168,8 +159,14 @@ async function openMenu(focusFirst = false) {
   trigger.setAttribute('aria-expanded', 'true')
   const items = Array.from(menu.querySelectorAll('[role="option"]'))
   if (items.length > 0) {
-    const cur = getEffectiveModel()
-    const target = items.find((el) => el.dataset.modelId === cur) || items[0]
+    const selectedTeamId = state.selectedTeamId || ''
+    const currentAgentId = getSession()?.agentId || state.defaultAgentId
+    const currentModel = getEffectiveModel()
+    const target =
+      (selectedTeamId && items.find((el) => el.dataset.teamId === selectedTeamId)) ||
+      items.find((el) => el.dataset.agentId === currentAgentId) ||
+      items.find((el) => el.dataset.modelId === currentModel) ||
+      items[0]
     for (const it of items) it.setAttribute('tabindex', it === target ? '0' : '-1')
     if (focusFirst) target.focus()
   }
@@ -187,62 +184,143 @@ function closeMenu(returnFocusToTrigger = true) {
   detachGlobalListeners()
 }
 
-// ── 渲染 ───────────────────────────────────────────────────────────
+function section(title, hint) {
+  const el = document.createElement('div')
+  el.className = 'target-menu-section'
+  el.innerHTML = `<div class="target-menu-section-title">${escapeHtml(title)}</div><div class="target-menu-section-hint">${escapeHtml(hint)}</div>`
+  return el
+}
+
+function optionButton({ type, id, title, hint, meta, selected, icon = '🤖' }) {
+  const btn = document.createElement('div')
+  btn.className = 'effort-menu-item target-menu-item'
+  btn.setAttribute('role', 'option')
+  btn.dataset.targetType = type
+  if (type === 'agent') btn.dataset.agentId = id
+  if (type === 'model') btn.dataset.modelId = id
+  if (type === 'team') btn.dataset.teamId = id
+  btn.tabIndex = -1
+  btn.setAttribute('aria-selected', selected ? 'true' : 'false')
+  if (selected) btn.classList.add('effort-menu-item--selected', 'target-menu-item--selected')
+  btn.innerHTML = `
+    <span class="target-menu-icon" aria-hidden="true">${escapeHtml(icon)}</span>
+    <span class="target-menu-copy">
+      <span class="effort-menu-label">${escapeHtml(title)}</span>
+      <span class="effort-menu-hint">${escapeHtml(hint || '')}</span>
+      ${meta ? `<span class="target-menu-meta">${escapeHtml(meta)}</span>` : ''}
+    </span>`
+  return btn
+}
 
 async function ensureMenuRendered() {
   const menu = getMenu()
   if (!menu) return
   await _ensureModels()
-  const cur = getEffectiveModel()
+  const sess = getSession()
+  const currentAgentId = sess?.agentId || state.defaultAgentId
+  const currentModel = getEffectiveModel()
+  const currentTeamId = state.selectedTeamId || ''
   menu.innerHTML = ''
-  const frag = document.createDocumentFragment()
+  menu.classList.add('target-menu')
+
+  menu.appendChild(section('单 Agent', '选择当前对话的 Agent；也可以在这里切换单 Agent 使用的模型。'))
+  const agents = state.agentsList || []
+  if (agents.length > 0) {
+    for (const agent of agents) {
+      const row = optionButton({
+        type: 'agent',
+        id: agent.id,
+        icon: agent.avatarEmoji || '🤖',
+        title: agent.displayName || agent.id,
+        hint: `${agent.id}${agent.id === state.defaultAgentId ? ' · 默认' : ''}`,
+        meta: `默认模型: ${modelDisplayName(agent.model || '')}`,
+        selected: !currentTeamId && agent.id === currentAgentId,
+      })
+      const edit = document.createElement('button')
+      edit.type = 'button'
+      edit.className = 'target-menu-edit'
+      edit.textContent = '编辑'
+      edit.setAttribute('aria-label', `编辑 Agent ${agent.displayName || agent.id}`)
+      edit.disabled = Boolean(state.agentsListIsFallback)
+      edit.addEventListener('click', (ev) => {
+        ev.preventDefault()
+        ev.stopPropagation()
+        closeMenu(false)
+        openPersonaEditor(agent.id)
+      })
+      row.appendChild(edit)
+      menu.appendChild(row)
+    }
+  } else {
+    const empty = document.createElement('div')
+    empty.className = 'target-menu-empty'
+    empty.textContent = '暂无 Agent。请到管理 Agents 创建。'
+    menu.appendChild(empty)
+  }
+
+  const modelHead = document.createElement('div')
+  modelHead.className = 'target-menu-subhead'
+  modelHead.textContent = `运行模型 · ${agentLabel(getCurrentAgent())}`
+  menu.appendChild(modelHead)
   for (const m of (_modelsCache || [])) {
     if (!m.id) continue
-    const btn = document.createElement('button')
-    btn.type = 'button'
-    btn.className = 'effort-menu-item'
-    btn.setAttribute('role', 'option')
-    btn.dataset.modelId = String(m.id)
-    btn.tabIndex = -1
-    const sel = m.id === cur
-    btn.setAttribute('aria-selected', sel ? 'true' : 'false')
-    if (sel) btn.classList.add('effort-menu-item--selected')
     const dn = String(m.display_name || m.id)
     const hint = m.id === 'claude-opus-4-7'
       ? '深度推理 · 默认推荐'
       : m.id === 'claude-sonnet-4-6'
         ? '更便宜 · 适合常规任务'
-        : ''
-    btn.innerHTML =
-      `<span class="effort-menu-label">${escapeHtml(dn)}</span>` +
-      `<span class="effort-menu-hint">${escapeHtml(hint)}</span>`
-    frag.appendChild(btn)
+        : '切换后应用到单 Agent 发送'
+    menu.appendChild(optionButton({
+      type: 'model',
+      id: String(m.id),
+      icon: '◈',
+      title: dn,
+      hint,
+      meta: String(m.id),
+      selected: !currentTeamId && m.id === currentModel,
+    }))
   }
-  if (frag.childElementCount === 0) {
+
+  menu.appendChild(section('多 Agent', '选择团队后，本条消息会由队长分派成员协作并汇总。'))
+  const teams = state.agentTeams || []
+  if (teams.length === 0) {
     const empty = document.createElement('div')
-    empty.className = 'effort-menu-item'
-    empty.style.opacity = '0.6'
-    empty.style.pointerEvents = 'none'
-    empty.innerHTML = '<span class="effort-menu-label">无可用模型</span>'
-    frag.appendChild(empty)
+    empty.className = 'target-menu-empty'
+    empty.innerHTML = '<span>还没有团队。到“管理 Agents”使用科研/编程模板创建。</span>'
+    menu.appendChild(empty)
+  } else {
+    for (const team of teams) {
+      const members = (team.members || []).map((m) => m.role || m.agentId).join(' / ')
+      const row = optionButton({
+        type: 'team',
+        id: team.id,
+        icon: '👥',
+        title: team.name || team.id,
+        hint: `队长: ${team.leaderAgentId} · ${team.leaderRole || '团队协调者'}`,
+        meta: members ? `成员: ${members}` : '未配置成员',
+        selected: currentTeamId === team.id,
+      })
+      const edit = document.createElement('button')
+      edit.type = 'button'
+      edit.className = 'target-menu-edit'
+      edit.textContent = '编辑'
+      edit.setAttribute('aria-label', `编辑团队 ${team.name || team.id}`)
+      edit.addEventListener('click', (ev) => {
+        ev.preventDefault()
+        ev.stopPropagation()
+        closeMenu(false)
+        openModal('agents-modal')
+        openTeamEditor(team.id)
+      })
+      row.appendChild(edit)
+      menu.appendChild(row)
+    }
   }
-  menu.appendChild(frag)
 }
 
-function escapeHtml(s) {
-  return String(s).replace(/[&<>"']/g, (c) => ({
-    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
-  })[c])
-}
-
-/** 渲染 model pill 的可见性 + label。
- *  - state.userPrefs===null(未拉取)→ 隐藏整个 composer-modes,避免"Opus → Sonnet"闪烁
- *  - 没有当前 agent → 隐藏(冷启动 race 等)
- *  - 否则展示 effective model */
 export function renderModelPill() {
   const wrap = $('composer-modes')
   if (!wrap) return
-  // prefs 还在拉取 → 暂时不暴露 pill,给后台 prefetch 收尾
   if (state.userPrefs === null) {
     wrap.hidden = true
     if (isMenuOpen()) closeMenu(false)
@@ -258,41 +336,56 @@ export function renderModelPill() {
   const trigger = getTrigger()
   if (!trigger) return
   const labelEl = $('model-label')
-  if (labelEl) labelEl.textContent = `模型: ${modelDisplayName(getEffectiveModel())}`
+  const team = state.selectedTeamId ? getAgentTeamById(state.selectedTeamId) : null
+  if (labelEl) {
+    labelEl.textContent = team
+      ? `团队: ${teamDisplayPrefix(team).replace(/^👥\s*/, '')}`
+      : `助手: ${(agent.displayName || agent.id)} · ${modelDisplayName(getEffectiveModel())}`
+  }
+  trigger.setAttribute('aria-pressed', team ? 'true' : 'false')
 }
-
-// ── 提交切换 ───────────────────────────────────────────────────────
 
 async function _commitModel(modelId) {
   const cur = getEffectiveModel()
-  if (modelId === cur) return  // 无变化
+  clearSelectedAgentTeam()
+  if (modelId === cur) {
+    renderModelPill()
+    return
+  }
   const trigger = getTrigger()
   if (trigger) trigger.disabled = true
   try {
     await apiJson('PATCH', '/api/me/preferences', { default_model: modelId })
     setCachedPrefField('default_model', modelId)
-    // 切到 / 离开 Opus 4.7 时 effort pill 可见性会变,要刷新
     renderModePills()
     renderModelPill()
     toast(`已切换到 ${modelDisplayName(modelId)}`, 'success')
   } catch (err) {
     toast('切换模型失败: ' + (err?.message || err), 'error', toastOptsFromError(err))
-    // 失败 → state.userPrefs 没变,UI 由 renderModelPill 自洽
     renderModelPill()
   } finally {
     if (trigger) trigger.disabled = false
   }
 }
 
-// ── Bind ───────────────────────────────────────────────────────────
+function _commitAgent(agentId) {
+  clearSelectedAgentTeam()
+  if (typeof switchAgentHandler === 'function') switchAgentHandler(agentId)
+  renderModelPill()
+}
+
+function _commitTeam(teamId) {
+  selectAgentTeam(teamId)
+  renderModelPill()
+  const team = getAgentTeamById(teamId)
+  toast(`已切换到团队: ${team?.name || teamId}`, 'success')
+}
 
 let _wired = false
 
-/** 一次性绑定 trigger 点击 + 菜单键盘导航。
- *  v1.0.4 起 opts.reload 不再使用(无 agent 写,不需要刷 agents.js 缓存),
- *  保留参数签名兼容 main.js 老调用。 */
-export function initModelPicker(_opts = {}) {
+export function initModelPicker(opts = {}) {
   if (_wired) return
+  switchAgentHandler = typeof opts.onSwitchAgent === 'function' ? opts.onSwitchAgent : null
   const trigger = getTrigger()
   const menu = getMenu()
   if (!trigger || !menu) return
@@ -311,12 +404,13 @@ export function initModelPicker(_opts = {}) {
     }
   })
   menu.addEventListener('click', (e) => {
+    if (e.target.closest('.target-menu-edit')) return
     const btn = e.target.closest('[role="option"]')
     if (!btn || !menu.contains(btn)) return
-    const id = btn.dataset.modelId
-    if (!id) return
     closeMenu(true)
-    _commitModel(id)
+    if (btn.dataset.targetType === 'agent') _commitAgent(btn.dataset.agentId)
+    else if (btn.dataset.targetType === 'model') _commitModel(btn.dataset.modelId)
+    else if (btn.dataset.targetType === 'team') _commitTeam(btn.dataset.teamId)
   })
   menu.addEventListener('keydown', (e) => {
     const items = Array.from(menu.querySelectorAll('[role="option"]'))
@@ -347,17 +441,19 @@ export function initModelPicker(_opts = {}) {
       e.preventDefault()
       const btn = items[idx]
       if (btn) {
-        const id = btn.dataset.modelId
-        if (id) {
-          closeMenu(true)
-          _commitModel(id)
-        }
+        closeMenu(true)
+        if (btn.dataset.targetType === 'agent') _commitAgent(btn.dataset.agentId)
+        else if (btn.dataset.targetType === 'model') _commitModel(btn.dataset.modelId)
+        else if (btn.dataset.targetType === 'team') _commitTeam(btn.dataset.teamId)
       }
     }
   })
-  // 同栏其他 popup 打开时,关闭本菜单(B4 dual menu 修复)
   document.addEventListener('composer-popup-opening', (e) => {
     if (e.detail?.source !== POPUP_SOURCE && isMenuOpen()) closeMenu(false)
+  })
+  document.addEventListener('agent-team-selection-changed', () => {
+    renderModelPill()
+    if (isMenuOpen()) void ensureMenuRendered()
   })
   _wired = true
   renderModelPill()
