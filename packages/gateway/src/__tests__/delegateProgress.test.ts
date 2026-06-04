@@ -1,6 +1,7 @@
 import * as assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
 import {
+  makeDelegateProgressBlock,
   sanitizeDelegateProgressText,
   summarizeDelegateProgressEvent,
 } from '../delegateProgress.js'
@@ -84,5 +85,16 @@ describe('delegate progress sanitization', () => {
     )
     assert.match(block?.text || '', /调用工具 Read/)
     assert.doesNotMatch(JSON.stringify(block), /nope/)
+  })
+
+  it('allows delegate completion summaries to use a larger explicit limit', () => {
+    const block = makeDelegateProgressBlock({
+      runId: 'run-1',
+      agentId: 'reviewer',
+      phase: 'done',
+      text: 'x'.repeat(1200),
+      maxLen: 1200,
+    })
+    assert.equal(block.text?.length, 1200)
   })
 })

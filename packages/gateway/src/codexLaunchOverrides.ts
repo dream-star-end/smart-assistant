@@ -247,6 +247,30 @@ function tomlValue(v: string | string[] | Record<string, string>): string {
   throw new TypeError(`tomlValue: unsupported value type (${typeof v})`)
 }
 
+const DEFAULT_CODEX_MCP_TOOL_TIMEOUT_SEC = 600
+const MIN_CODEX_MCP_TOOL_TIMEOUT_SEC = 60
+const MAX_CODEX_MCP_TOOL_TIMEOUT_SEC = 3600
+
+function normalizePositiveInt(
+  raw: string | undefined,
+  fallback: number,
+  min: number,
+  max: number,
+): number {
+  const n = Number.parseInt(String(raw ?? ''), 10)
+  if (!Number.isFinite(n) || n <= 0) return fallback
+  return Math.min(max, Math.max(min, n))
+}
+
+function codexMcpToolTimeoutSec(env: NodeJS.ProcessEnv = process.env): number {
+  return normalizePositiveInt(
+    env.OPENCLAUDE_CODEX_MCP_TOOL_TIMEOUT_SEC,
+    DEFAULT_CODEX_MCP_TOOL_TIMEOUT_SEC,
+    MIN_CODEX_MCP_TOOL_TIMEOUT_SEC,
+    MAX_CODEX_MCP_TOOL_TIMEOUT_SEC,
+  )
+}
+
 // ── Public API ──
 
 export interface CodexLaunchOverridesContext {
@@ -435,6 +459,8 @@ export async function buildCodexLaunchOverrides(
       `mcp_servers.openclaude_memory.env=${tomlValue(mcpEnv)}`,
       '-c',
       `mcp_servers.openclaude_memory.default_tools_approval_mode=${tomlValue('approve')}`,
+      '-c',
+      `mcp_servers.openclaude_memory.tool_timeout_sec=${codexMcpToolTimeoutSec()}`,
     )
   }
 
@@ -470,4 +496,4 @@ export async function buildCodexLaunchOverrides(
 }
 
 // Internal export for tests only — not part of the stable API.
-export const _internals = { tomlValue, CODEX_PREAMBLE }
+export const _internals = { tomlValue, CODEX_PREAMBLE, codexMcpToolTimeoutSec }

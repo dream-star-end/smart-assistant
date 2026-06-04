@@ -31,7 +31,7 @@ import { afterEach, beforeEach, describe, it } from 'node:test'
  */
 import { _internals, resolveMcpMemoryEntry } from '../codexLaunchOverrides.js'
 
-const { tomlValue, CODEX_PREAMBLE } = _internals
+const { tomlValue, CODEX_PREAMBLE, codexMcpToolTimeoutSec } = _internals
 
 async function withEnv<T>(patch: Record<string, string | undefined>, fn: () => Promise<T> | T) {
   const old = new Map<string, string | undefined>()
@@ -245,8 +245,31 @@ describe('buildCodexLaunchOverrides', () => {
         'mcp_servers.openclaude_memory.args',
         'mcp_servers.openclaude_memory.env',
         'mcp_servers.openclaude_memory.default_tools_approval_mode',
+        'mcp_servers.openclaude_memory.tool_timeout_sec',
       ])
     }
+  })
+
+  it('extends codex MCP tool timeout so long delegate_task calls can finish', async () => {
+    assert.equal(codexMcpToolTimeoutSec({}), 600)
+    assert.equal(codexMcpToolTimeoutSec({ OPENCLAUDE_CODEX_MCP_TOOL_TIMEOUT_SEC: '900' }), 900)
+    assert.equal(codexMcpToolTimeoutSec({ OPENCLAUDE_CODEX_MCP_TOOL_TIMEOUT_SEC: '5' }), 60)
+    assert.equal(codexMcpToolTimeoutSec({ OPENCLAUDE_CODEX_MCP_TOOL_TIMEOUT_SEC: '99999' }), 3600)
+
+    await withEnv({ OPENCLAUDE_CODEX_MCP_TOOL_TIMEOUT_SEC: '900' }, async () => {
+      const { buildCodexLaunchOverrides } = await import('../codexLaunchOverrides.js')
+      const out = await buildCodexLaunchOverrides({
+        agentId: 'test-agent',
+        sessionKey: 'agent:test-agent:webchat:dm:sess_123',
+        sessionDir: dir,
+        gatewayPort: 18789,
+        gatewayToken: 'tok',
+      })
+      assert.ok(
+        out.argvOverrides.includes('mcp_servers.openclaude_memory.tool_timeout_sec=900'),
+        `argv must include tool_timeout_sec override; got ${out.argvOverrides.join(' ')}`,
+      )
+    })
   })
 
   it('mcp env injection points at OPENCLAUDE_GATEWAY_TOKEN_FILE; argv MUST NOT contain token literal', async () => {

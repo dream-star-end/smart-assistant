@@ -71,6 +71,10 @@ import {
   summarizeDelegateProgressEvent,
   type DelegateProgressBlock,
 } from './delegateProgress.js'
+import {
+  getDelegateTimeoutReason,
+  resolveDelegateTimeoutConfig,
+} from './delegateTimeout.js'
 import { eventBus, createEvent } from './eventBus.js'
 import { startEventPersistence } from './eventPersist.js'
 import { createLogger, type Logger } from './logger.js'
@@ -4837,21 +4841,53 @@ export class Gateway {
     const _dlgRun = this._runLog.start({ agentId: targetAgentId, sessionKey, taskType: 'delegate' })
     let output = ''
     let error = ''
-    try {
-      await this.sessions.submit(session, prompt, (e) => {
+    let timedOut = false
+    const streamProgress = progressTarget && parsed.streamProgress === true
+    const timeoutConfig = resolveDelegateTimeoutConfig()
+    const startedAt = Date.now()
+    let lastChildActivityAt = startedAt
+    const markChildActivity = () => {
+      lastChildActivityAt = Date.now()
+    }
+    let timeoutTimer: NodeJS.Timeout | null = null
+    const clearTimeoutTimer = () => {
+      if (timeoutTimer) clearInterval(timeoutTimer)
+      timeoutTimer = null
+    }
+    const timeoutPromise = new Promise<never>((_, reject) => {
+      timeoutTimer = setInterval(() => {
+        const reason = getDelegateTimeoutReason(
+          Date.now(),
+          startedAt,
+          lastChildActivityAt,
+          timeoutConfig,
+        )
+        if (!reason) return
+        clearTimeoutTimer()
+        const err = new Error(reason.message)
+        err.name = 'DelegateTimeoutError'
+        reject(err)
+      }, timeoutConfig.checkIntervalMs)
+    })
+    const submitPromise = this.sessions.submit(session, prompt, (e) => {
+      const progressBlock = summarizeDelegateProgressEvent(e, progressRunId, targetAgentId)
+      if (progressBlock || e.kind === 'block' || e.kind === 'error') markChildActivity()
+      if (!timedOut) {
         if (e.kind === 'block' && e.block.kind === 'text') output += e.block.text
         if (e.kind === 'error') error = e.error
-        if (progressTarget && parsed.streamProgress === true) {
-          emitProgress(summarizeDelegateProgressEvent(e, progressRunId, targetAgentId))
-        }
-      })
+        if (streamProgress) emitProgress(progressBlock)
+      }
+    })
+    try {
+      await Promise.race([submitPromise, timeoutPromise])
+      clearTimeoutTimer()
       if (!error) {
         const delegatedApiError = classifyDelegateOutputError(output)
         if (delegatedApiError) {
           error = `${delegatedApiError.message}\n\n${delegatedApiError.detail}`
         }
       }
-      if (progressTarget && parsed.streamProgress === true) {
+      if (streamProgress) {
         emitProgress(
           makeDelegateProgressBlock({
             runId: progressRunId,
@@ -4859,6 +4895,7 @@ export class Gateway {
             phase: error ? 'error' : 'done',
             isError: Boolean(error),
             text: error || output || '子 agent 已完成,无文本输出。',
+            maxLen: error ? 2_000 : 4_000,
           }),
         )
       }
@@ -4867,8 +4904,22 @@ export class Gateway {
         error: error || undefined,
       })
     } catch (err: any) {
-      error = error || String(err)
-      if (progressTarget && parsed.streamProgress === true) {
+      error = error || err?.message || String(err)
+      if (err?.name === 'DelegateTimeoutError') {
+        timedOut = true
+        clearTimeoutTimer()
+        try {
+          session.runner.interrupt()
+        } catch {}
+        void submitPromise.catch((lateErr) => {
+          this.log.warn('delegate submit settled after timeout with error', {
+            targetAgentId,
+            sessionKey,
+            error: lateErr?.message ?? String(lateErr),
+          })
+        })
+      }
+      if (streamProgress) {
         emitProgress(
           makeDelegateProgressBlock({
             runId: progressRunId,
@@ -4876,11 +4927,13 @@ export class Gateway {
             phase: 'error',
             isError: true,
             text: error,
+            maxLen: 2_000,
           }),
         )
       }
       this._runLog.complete(_dlgRun, { status: 'failed', error })
     } finally {
+      clearTimeoutTimer()
       this._activeDelegations--
     }
 
