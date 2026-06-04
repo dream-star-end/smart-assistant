@@ -1229,7 +1229,6 @@
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83"/></svg>
           <span id="tasks-badge" class="tasks-badge">0</span>
         </button>
-        <select id="agent-select" class="agent-select" title="切换 agent" aria-label="选择 agent"></select>
         <div class="settings-dropdown-wrap">
           <button id="manage-agents-btn" class="icon-btn" title="设置" aria-label="设置">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
@@ -1335,10 +1334,10 @@
             aria-expanded="false"
             aria-controls="model-menu"
             aria-pressed="false"
-            title="切换该 agent 使用的模型。注意:切换会影响该 agent 的所有会话。"
+            title="选择单 Agent 模型或多 Agent 团队。"
           >
             <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="3"/><path d="M9 9h6v6H9z"/></svg>
-            <span id="model-label">模型: Opus 4.7</span>
+            <span id="model-label">助手: Opus 4.7</span>
             <svg class="mode-pill-caret" viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="6 9 12 15 18 9"/></svg>
           </button>
           <div id="model-menu" class="effort-menu" role="listbox" aria-labelledby="model-trigger" hidden></div>
@@ -1357,15 +1356,6 @@
             <svg class="mode-pill-caret" viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="6 9 12 15 18 9"/></svg>
           </button>
           <div id="effort-menu" class="effort-menu" role="listbox" aria-labelledby="effort-trigger" hidden></div>
-          <select
-            id="team-select"
-            class="mode-pill team-select"
-            title="选择 Agent 团队。开启后本条消息会由团队队长分派给成员协作。"
-            aria-label="选择 Agent 团队"
-            hidden
-          >
-            <option value="">团队: 关闭</option>
-          </select>
         </div>
         <div class="composer-input-row">
           <textarea id="input" placeholder="发消息给 agent…" rows="1" aria-label="输入消息"></textarea>
@@ -1400,31 +1390,50 @@
       </div>
       <button class="modal-close" data-close-modal="agents-modal" aria-label="关闭">×</button>
     </div>
-    <div class="modal-body">
-      <div id="agents-list-wrap"></div>
-      <hr class="agents-divider" />
-      <div class="agent-create-card">
-        <div class="agent-create-head">
-          <div>
-            <label for="new-agent-id">新建 Agent</label>
-            <p>输入 agent id 后创建；默认使用当前商业版支持模型，创建后可点“编辑”配置名称、模型和提示词。</p>
-          </div>
-        </div>
-        <div class="agent-create-row">
-          <input id="new-agent-id" placeholder="如: analyst / writer / qa_bot" maxlength="48" />
-          <button id="create-agent-btn" class="btn btn-primary" type="button">创建 Agent</button>
-        </div>
-      </div>
-      <hr class="agents-divider" />
-      <div class="team-section-head">
+    <div class="modal-body agent-manager-body">
+      <div class="agent-manager-hero">
         <div>
-          <label>Agent Teams</label>
-          <p>把多个专业 Agent 组成团队；发送时由队长使用 delegate_task 分派成员并汇总。</p>
+          <span class="agent-manager-eyebrow">Agents Console</span>
+          <h4>把常用角色和协作团队整理在一个地方</h4>
+          <p>单 Agent 负责日常对话和专业人格；多 Agent 团队用于科研、编程等需要分工与复核的任务。</p>
         </div>
-        <button id="new-team-btn" class="btn btn-secondary" type="button">新建团队</button>
+        <button id="new-team-btn" class="btn btn-primary" type="button">新建团队</button>
       </div>
-      <div id="teams-list-wrap"></div>
-      <div id="team-editor" class="team-editor" hidden>
+      <div class="agent-manager-grid">
+        <section class="agent-manager-panel">
+          <div class="agent-manager-panel-head">
+            <div>
+              <span class="agent-manager-eyebrow">Single Agent</span>
+              <h4>单 Agent</h4>
+              <p>配置名称、模型和人格提示词。</p>
+            </div>
+          </div>
+          <div class="agent-create-card">
+            <div class="agent-create-head">
+              <div>
+                <label for="new-agent-id">新建 Agent</label>
+                <p>输入 agent id 后创建；之后可编辑名称、模型和提示词。</p>
+              </div>
+            </div>
+            <div class="agent-create-row">
+              <input id="new-agent-id" placeholder="如: analyst / writer / qa_bot" maxlength="48" />
+              <button id="create-agent-btn" class="btn btn-primary" type="button">创建 Agent</button>
+            </div>
+          </div>
+          <div id="agents-list-wrap" class="agent-card-list"></div>
+        </section>
+        <section class="agent-manager-panel">
+          <div class="agent-manager-panel-head">
+            <div>
+              <span class="agent-manager-eyebrow">Multi Agent</span>
+              <h4>多 Agent 团队</h4>
+              <p>从科研/编程模板开始，给同一个 Agent 配置不同团队角色。</p>
+            </div>
+          </div>
+          <div id="teams-list-wrap" class="agent-card-list"></div>
+        </section>
+      </div>
+      <div id="team-editor" class="team-editor team-editor-panel" hidden>
         <div class="persona-section-label" id="team-editor-title">新建团队</div>
         <div id="team-template-strip" class="team-template-strip" aria-label="推荐团队模板" hidden></div>
         <div style="display:grid;grid-template-columns:1fr 1fr;gap:var(--space-3);margin-bottom:var(--space-3)">
@@ -1497,25 +1506,32 @@
       </div>
       <button class="modal-close" data-close-modal="persona-modal" aria-label="关闭">×</button>
     </div>
-    <div class="modal-body" style="max-height:60vh;overflow-y:auto">
-      <!-- Identity -->
-      <div class="persona-section-label">身份</div>
-      <div style="display:grid;grid-template-columns:1fr 72px;gap:var(--space-3);margin-bottom:var(--space-3)">
-        <div class="form-row" style="margin:0">
-          <label for="persona-display-name">显示名称</label>
-          <input id="persona-display-name" placeholder="如: 小克、Aria" maxlength="20" />
+    <div class="modal-body persona-editor-body">
+      <section class="persona-card persona-card--identity">
+        <div class="persona-card-title">
+          <span>身份</span>
+          <small>用户会在选择器和会话里看到这些信息</small>
         </div>
-        <div class="form-row" style="margin:0">
-          <label for="persona-avatar-emoji">头像</label>
-          <input id="persona-avatar-emoji" placeholder="🤖" maxlength="2" style="text-align:center;font-size:20px" />
+        <div class="persona-identity-grid">
+          <div class="form-row">
+            <label for="persona-display-name">显示名称</label>
+            <input id="persona-display-name" placeholder="如: 小克、Aria" maxlength="20" />
+          </div>
+          <div class="form-row">
+            <label for="persona-avatar-emoji">头像</label>
+            <input id="persona-avatar-emoji" class="persona-avatar-input" placeholder="🤖" maxlength="2" />
+          </div>
         </div>
-      </div>
-      <div class="form-row">
-        <label for="persona-greeting">问候语</label>
-        <input id="persona-greeting" placeholder="新会话时自动发送的第一条消息" />
-      </div>
-      <!-- Model & Provider -->
-      <div class="persona-section-label">模型</div>
+        <div class="form-row">
+          <label for="persona-greeting">问候语</label>
+          <input id="persona-greeting" placeholder="新会话时自动发送的第一条消息" />
+        </div>
+      </section>
+      <section class="persona-card">
+        <div class="persona-card-title">
+          <span>模型</span>
+          <small>决定这个 Agent 默认使用的商业版模型</small>
+        </div>
       <!-- 商用版: 模型列表来自管理后台 model_pricing 表(/api/models),
            agents.js openPersonaEditor 打开时动态填充 #persona-model-preset。
            Provider 选项已对用户隐藏 — 商用环境后端统一走管理员配置的 anthropic 通道。
@@ -1538,12 +1554,16 @@
           <input id="persona-model" placeholder="自定义模型" />
         </div>
       </div>
+      </section>
       <!-- 旧 agents.js 兼容: 隐藏 select,保留 id 让 .value=... 不爆 -->
       <select id="persona-provider" hidden aria-hidden="true">
         <option value=""></option>
       </select>
-      <!-- Behavior -->
-      <div class="persona-section-label">行为</div>
+      <section class="persona-card">
+        <div class="persona-card-title">
+          <span>行为与工具</span>
+          <small>控制权限、工作目录和可用工具集</small>
+        </div>
       <div class="form-row">
         <label for="persona-permission">权限模式</label>
         <select id="persona-permission">
@@ -1562,11 +1582,16 @@
         <label for="persona-toolsets">工具集</label>
         <input id="persona-toolsets" placeholder="如: research,coding,browser (逗号分隔,留空=全部)" />
       </div>
-      <!-- Persona -->
-      <div class="persona-section-label">人格指令</div>
-      <div class="form-row">
-        <textarea id="persona-text" placeholder="# 你是一个乐于助人的AI助手&#10;&#10;用简洁的中文回答用户问题..." style="min-height:120px"></textarea>
-      </div>
+      </section>
+      <section class="persona-card persona-card--prompt">
+        <div class="persona-card-title">
+          <span>人格指令</span>
+          <small>写清角色边界、输出风格和必须遵守的工作方式</small>
+        </div>
+        <div class="form-row">
+          <textarea id="persona-text" placeholder="# 你是一个乐于助人的AI助手&#10;&#10;用简洁的中文回答用户问题..." style="min-height:160px"></textarea>
+        </div>
+      </section>
     </div>
     <div class="modal-foot">
       <button id="delete-agent-btn" class="btn btn-danger">删除</button>

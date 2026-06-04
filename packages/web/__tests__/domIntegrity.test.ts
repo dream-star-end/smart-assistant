@@ -205,7 +205,8 @@ describe('T04: Critical IDs always present', () => {
     'session-title',
     'session-sub',
     'sessions-body',
-    'agent-select',
+    'model-trigger',
+    'model-menu',
     'settings-dropdown',
     'lightbox',
     'palette-backdrop',
@@ -230,19 +231,32 @@ describe('T04: Critical IDs always present', () => {
 })
 
 describe('T04b: Agent create UI is visible and unambiguous', () => {
-  it('create-agent button lives in the in-body create card before Agent Teams', () => {
+  it('create-agent button lives in the single-agent management panel before teams list', () => {
     const cardIdx = html.indexOf('class="agent-create-card"')
     const inputIdx = html.indexOf('id="new-agent-id"')
     const buttonIdx = html.indexOf('id="create-agent-btn"')
-    const teamsIdx = html.indexOf('class="team-section-head"')
+    const teamsIdx = html.indexOf('id="teams-list-wrap"')
     const footIdx = html.indexOf('<div class="modal-foot">', html.indexOf('id="agents-modal"'))
     assert.ok(cardIdx >= 0, 'missing .agent-create-card')
     assert.ok(inputIdx > cardIdx, '#new-agent-id should be inside/after create card')
     assert.ok(buttonIdx > cardIdx, '#create-agent-btn should be inside/after create card')
-    assert.ok(teamsIdx > buttonIdx, 'Agent create UI should appear before Agent Teams')
+    assert.ok(teamsIdx > buttonIdx, 'Agent create UI should appear before teams management list')
     assert.ok(footIdx < 0 || buttonIdx < footIdx, '#create-agent-btn must not live in modal footer')
     assert.match(html.slice(buttonIdx, buttonIdx + 220), />创建 Agent<\/button>/)
     assert.match(html.slice(buttonIdx, buttonIdx + 160), /type="button"/)
+  })
+})
+
+describe('T04c: Unified assistant picker replaces redundant controls', () => {
+  it('header agent selector and standalone team select are removed', () => {
+    assert.equal(html.includes('id="agent-select"'), false)
+    assert.equal(html.includes('id="team-select"'), false)
+  })
+
+  it('management modal has single-agent and multi-agent language', () => {
+    assert.match(html, /Single Agent/)
+    assert.match(html, /Multi Agent/)
+    assert.match(html, /多 Agent 团队/)
   })
 })
 
