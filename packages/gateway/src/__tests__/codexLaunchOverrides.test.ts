@@ -259,6 +259,7 @@ describe('buildCodexLaunchOverrides', () => {
     const TOKEN = 'tok-secret-MUST-NOT-LEAK-INTO-ARGV'
     const out = await buildCodexLaunchOverrides({
       agentId: 'test-agent',
+      sessionKey: 'agent:test-agent:webchat:dm:sess_123',
       sessionDir: dir,
       gatewayPort: 18789,
       gatewayToken: TOKEN,
@@ -273,6 +274,14 @@ describe('buildCodexLaunchOverrides', () => {
       assert.ok(
         envKey.includes(`${dir}/gateway-token`),
         `env must reference the token file under sessionDir; got: ${envKey}`,
+      )
+      assert.ok(
+        envKey.includes('OPENCLAUDE_SESSION_KEY'),
+        `env must carry parent session key for delegate progress routing; got: ${envKey}`,
+      )
+      assert.ok(
+        envKey.includes('agent:test-agent:webchat:dm:sess_123'),
+        `env must carry the exact parent session key; got: ${envKey}`,
       )
       // Hard invariant: NO override value may contain the token literal.
       assert.ok(

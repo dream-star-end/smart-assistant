@@ -1120,6 +1120,7 @@ export class SubprocessRunner extends EventEmitter {
             ...(process.env.OPENCLAUDE_HOME
               ? { OPENCLAUDE_HOME: process.env.OPENCLAUDE_HOME }
               : {}),
+            OPENCLAUDE_SESSION_KEY: this.opts.sessionKey,
             OPENCLAUDE_GATEWAY_PORT: String(this.opts.config.gateway.port),
             OPENCLAUDE_GATEWAY_TOKEN: this.opts.config.gateway.accessToken,
             OPENCLAUDE_DELEGATION_DEPTH: String(this.opts.delegationDepth ?? 0),

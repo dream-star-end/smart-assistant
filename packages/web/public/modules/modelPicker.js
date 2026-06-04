@@ -296,7 +296,9 @@ async function ensureMenuRendered() {
 
   const modelHead = document.createElement('div')
   modelHead.className = 'target-menu-subhead target-menu-subhead--models'
-  modelHead.textContent = `运行模型 · ${agentLabel(getCurrentAgent())}`
+  modelHead.textContent = currentTeamId
+    ? '运行模型 · 当前团队由队长配置决定'
+    : `运行模型 · ${agentLabel(getCurrentAgent())}`
   menu.appendChild(modelHead)
   for (const m of (_modelsCache || [])) {
     if (!m.id) continue
@@ -305,7 +307,9 @@ async function ensureMenuRendered() {
       ? '深度推理 · 默认推荐'
       : m.id === 'claude-sonnet-4-6'
         ? '更便宜 · 适合常规任务'
-        : '切换后应用到单 Agent 发送'
+        : currentTeamId
+          ? '切换后会退出团队模式并应用到单 Agent 发送'
+          : '切换后应用到单 Agent 发送'
     menu.appendChild(optionButton({
       type: 'model',
       id: String(m.id),

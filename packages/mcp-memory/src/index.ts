@@ -868,6 +868,7 @@ async function handleDelegateTaskToAgent(
   const gatewayPort = process.env.OPENCLAUDE_GATEWAY_PORT || '18789'
   const gatewayToken = readGatewayToken()
   const sourceAgent = process.env.OPENCLAUDE_AGENT_ID || 'unknown'
+  const parentSessionKey = process.env.OPENCLAUDE_SESSION_KEY || ''
   try {
     // Pass delegation depth so gateway can enforce recursion limit
     const currentDepth = Number.parseInt(process.env.OPENCLAUDE_DELEGATION_DEPTH || '0', 10)
@@ -885,6 +886,9 @@ async function handleDelegateTaskToAgent(
           context: args.context,
           sourceAgent,
           toolsets: args.toolsets,
+          ...(parentSessionKey
+            ? { streamProgress: true, parentSessionKey }
+            : {}),
         }),
       },
     )

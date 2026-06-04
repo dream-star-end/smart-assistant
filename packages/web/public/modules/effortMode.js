@@ -148,10 +148,29 @@ function writeStore(obj) {
  *  自愈:store 里如果留有协议非法值或旧版 '',顺手清掉,下次读直接 fallback。
  *  注:这只清协议非法值;对"协议合法但当前 model 不支持"的值(如 Opus 'low'
  *  切到 DeepSeek)不清,跨模型保留语义见顶部契约说明。 */
-export function getCurrentEffort() {
+export function getEffortOwnerAgentId() {
+  if (state.selectedTeamId) {
+    const team = (state.agentTeams || []).find((t) => t.id === state.selectedTeamId)
+    return team?.leaderAgentId || ''
+  }
   const sess = getSession()
-  if (!sess) return undefined
-  const agentId = sess.agentId || state.defaultAgentId
+  return sess?.agentId || state.defaultAgentId || ''
+}
+
+function getSelectedTeamLeaderModel() {
+  if (!state.selectedTeamId) return ''
+  const team = (state.agentTeams || []).find((t) => t.id === state.selectedTeamId)
+  if (!team?.leaderAgentId) return ''
+  const leader = (state.agentsList || []).find((a) => a.id === team.leaderAgentId)
+  return leader?.model || ''
+}
+
+function isTeamModeActive() {
+  return Boolean(state.selectedTeamId)
+}
+
+function getCurrentEffort() {
+  const agentId = getEffortOwnerAgentId()
   if (!agentId) return undefined
   const store = readStore()
   const v = store[agentId]
@@ -193,9 +212,7 @@ export function getEffortForSubmit() {
  *  注意:这里用 effective model 的默认值判定 delete,而不是固定 'medium'。
  *  所以 DeepSeek 用户选"高"会 delete entry,Opus 用户选"中"也会 delete entry。 */
 function setCurrentEffort(level) {
-  const sess = getSession()
-  if (!sess) return
-  const agentId = sess.agentId || state.defaultAgentId
+  const agentId = getEffortOwnerAgentId()
   if (!agentId) return
   if (!VALID.has(level)) return
   const modelDefault = getDefaultEffortForModel(getEffectiveModel())
@@ -221,6 +238,7 @@ function getCurrentAgentModel() {
  *  注意 `state.userPrefs===null` 表示尚未拉取 — 调用方应单独处理(返回空串
  *  让 `shouldShowEffortControl` 判 false,但 `renderModePills` 会显式隐藏避免闪烁)。 */
 function getEffectiveModel() {
+  if (isTeamModeActive()) return getSelectedTeamLeaderModel()
   const pref = state.userPrefs?.default_model
   if (typeof pref === 'string' && pref) return pref
   return getCurrentAgentModel()
@@ -376,7 +394,8 @@ function labelForCurrent() {
   const model = getEffectiveModel()
   const cur = getLegalCurrentEffort()
   const opt = getEffortOptionsForModel(model).find((o) => o.value === cur)
-  return `思考深度: ${opt?.label || '高'}`
+  const prefix = isTeamModeActive() ? '队长思考深度' : '思考深度'
+  return `${prefix}: ${opt?.label || '高'}`
 }
 
 /** 模块级:上次渲染菜单 DOM 时用的 options 集合 key。
@@ -420,9 +439,18 @@ export function renderModePills() {
   trigger.hidden = !visible
   if (!visible) {
     menu.hidden = true
+    trigger.removeAttribute('title')
+    trigger.removeAttribute('aria-label')
     if (isMenuOpen()) closeMenu(false)
     return
   }
+
+  const teamMode = isTeamModeActive()
+  const title = teamMode
+    ? '选择队长思考深度。仅影响本次团队运行的队长模型,不会改变成员 agent 的模型或思考深度。'
+    : '选择思考深度。可选档位与默认值随当前模型变化。'
+  trigger.title = title
+  trigger.setAttribute('aria-label', title)
 
   const current = getLegalCurrentEffort()
   const modelDefault = getDefaultEffortForModel(model)
@@ -527,6 +555,9 @@ export function initModePills() {
   // 同栏其他 popup 打开时,关闭本菜单(B4 dual menu 修复)
   document.addEventListener('composer-popup-opening', (e) => {
     if (e.detail?.source !== POPUP_SOURCE && isMenuOpen()) closeMenu(false)
+  })
+  document.addEventListener('agent-team-selection-changed', () => {
+    renderModePills()
   })
   menuEventsBound = true
   renderModePills()

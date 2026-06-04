@@ -710,6 +710,64 @@ function _appendSubagentBlock(sess, groupMsg, block, blockText) {
   }
 }
 
+function _findDelegateProgressMsg(sess, runId) {
+  if (!runId) return null
+  return (sess.messages || []).find((m) => m?.role === 'delegate-progress' && m.runId === runId) || null
+}
+
+function _appendDelegateProgressEntry(msg, block) {
+  if (!Array.isArray(msg.entries)) msg.entries = []
+  const text = typeof block.text === 'string' ? block.text : ''
+  if (!text) return
+  const entry = {
+    phase: block.phase || 'text',
+    text,
+    toolName: block.toolName || '',
+    isError: !!block.isError,
+    ts: Date.now(),
+  }
+  const last = msg.entries[msg.entries.length - 1]
+  if (
+    last &&
+    (entry.phase === 'text' || entry.phase === 'thinking') &&
+    last.phase === entry.phase &&
+    !last.isError &&
+    !entry.isError
+  ) {
+    last.text = `${last.text || ''}${entry.text}`
+    last.ts = entry.ts
+  } else {
+    msg.entries.push(entry)
+  }
+  if (msg.entries.length > 120) msg.entries.splice(0, msg.entries.length - 120)
+}
+
+function _handleDelegateProgressBlock(sess, block) {
+  if (!block.runId) return
+  let msg = _findDelegateProgressMsg(sess, block.runId)
+  if (!msg) {
+    msg = addMessage(sess, 'delegate-progress', '', {
+      runId: block.runId,
+      agentId: block.agentId || '',
+      entries: [],
+      _completed: false,
+    })
+  }
+  if (block.agentId) msg.agentId = block.agentId
+  if (block.phase === 'done' || block.phase === 'error') {
+    msg._completed = true
+    msg.completedAt = Date.now()
+    msg.error = block.phase === 'error' || !!block.isError
+    if (block.text) msg.summary = block.text
+  } else {
+    _appendDelegateProgressEntry(msg, block)
+  }
+  if (sess.id === state.currentSessionId) {
+    _deps.updateMessageEl(msg, false)
+    _deps.scrollBottom()
+  }
+}
+
 // 2026-05-06 §4.5 改动 9 — setMeta 退役为 setUsage。
 // 历史:setMeta(sess, msg, metaText) 把已格式化字符串塞 msg.metaText,渲染层读字串。
 // 新版:setUsage(sess, msg, usagePartial) 在 msg 上 in-place 合并结构化 usage,
@@ -2220,7 +2278,7 @@ export function handleOutbound(frame) {
       // content-bearing message get added AFTER the target user message?
       // This is more robust than relying on transient streaming pointers.
       // Roles considered content: assistant, thinking, tool, agent-group,
-      // and permission (permission prompts are visible cards that count as
+      // delegate-progress, and permission (permission prompts are visible cards that count as
       // real turn output).
       let producedContent = false
       const targetIdx = sess.messages.findIndex((m) => m.id === _targetMsg.id)
@@ -2232,6 +2290,7 @@ export function handleOutbound(frame) {
             r === 'thinking' ||
             r === 'tool' ||
             r === 'agent-group' ||
+            r === 'delegate-progress' ||
             r === 'plan' ||
             r === 'permission'
           ) {
@@ -2281,6 +2340,7 @@ export function handleOutbound(frame) {
             r === 'thinking' ||
             r === 'tool' ||
             r === 'agent-group' ||
+            r === 'delegate-progress' ||
             r === 'plan' ||
             r === 'permission'
           ) {
@@ -2374,6 +2434,11 @@ export function handleOutbound(frame) {
         : block.text != null
           ? JSON.stringify(block.text)
           : ''
+
+    if (block.kind === 'delegate_progress') {
+      _handleDelegateProgressBlock(sess, block)
+      continue
+    }
 
     // ── Subagent block routing ──
     // Blocks carrying parentToolUseId were produced inside a subagent
@@ -2889,7 +2954,7 @@ export function handleOutbound(frame) {
       for (let i = _targetIdx + 1; i < sess.messages.length; i++) {
         const m = sess.messages[i]
         if (m.role === 'assistant' || m.role === 'thinking' || m.role === 'tool' ||
-            m.role === 'agent-group' || m.role === 'plan' || m.role === 'permission') {
+            m.role === 'agent-group' || m.role === 'delegate-progress' || m.role === 'plan' || m.role === 'permission') {
           _producedContent = true
         }
         if (m.role === 'assistant' && typeof m.text === 'string') {

@@ -269,6 +269,26 @@ export const OutboundContentBlock = Type.Union([
     partial: Type.Optional(Type.Boolean()),
     parentToolUseId: Type.Optional(Type.String()),
   }),
+  // Live progress from the synchronous delegate_task bridge. These blocks are
+  // rendered as a dedicated delegate-progress card on WebChat and are never
+  // treated as assistant final-answer content.
+  Type.Object({
+    kind: Type.Literal('delegate_progress'),
+    runId: Type.String(),
+    agentId: Type.String(),
+    phase: Type.Union([
+      Type.Literal('start'),
+      Type.Literal('text'),
+      Type.Literal('thinking'),
+      Type.Literal('plan'),
+      Type.Literal('tool'),
+      Type.Literal('done'),
+      Type.Literal('error'),
+    ]),
+    text: Type.Optional(Type.String()),
+    toolName: Type.Optional(Type.String()),
+    isError: Type.Optional(Type.Boolean()),
+  }),
   // Snapshot of a long-running bash command's tail output. Snapshot
   // semantics: the consumer REPLACES its prior tail buffer with `tail`
   // rather than appending — the polling cadence is deliberately lossy

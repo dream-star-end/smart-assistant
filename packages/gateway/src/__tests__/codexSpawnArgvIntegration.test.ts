@@ -145,6 +145,14 @@ describe('CodexRunner runTurn → spawn argv', () => {
         `env override must use TOKEN_FILE; got: ${envOverride}`,
       )
       assert.ok(
+        envOverride.includes('OPENCLAUDE_SESSION_KEY'),
+        `env override must include OPENCLAUDE_SESSION_KEY for delegate progress routing; got: ${envOverride}`,
+      )
+      assert.ok(
+        envOverride.includes('spawn-fresh'),
+        `env override must include the runner session key; got: ${envOverride}`,
+      )
+      assert.ok(
         !/"OPENCLAUDE_GATEWAY_TOKEN"\s*=/.test(envOverride),
         `env override must NOT carry bare OPENCLAUDE_GATEWAY_TOKEN= (would defeat hardening); got: ${envOverride}`,
       )

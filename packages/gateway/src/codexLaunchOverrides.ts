@@ -251,6 +251,10 @@ function tomlValue(v: string | string[] | Record<string, string>): string {
 
 export interface CodexLaunchOverridesContext {
   agentId: string
+  /** Current gateway AgentSession key. Forwarded only to mcp-memory so
+   *  delegate_task can stream progress back to the exact parent WebChat
+   *  session without falling back to last-active routing. */
+  sessionKey?: string
   /** Path to agent's CLAUDE.md / SOUL.md persona file (forwarded to
    *  buildPromptContext; unused for codex preamble itself). */
   persona?: string
@@ -414,6 +418,7 @@ export async function buildCodexLaunchOverrides(
     const mcpEnv: Record<string, string> = {
       OPENCLAUDE_AGENT_ID: ctx.agentId,
       OPENCLAUDE_HOME: ctx.openclaudeHome ?? process.env.OPENCLAUDE_HOME ?? '',
+      ...(ctx.sessionKey ? { OPENCLAUDE_SESSION_KEY: ctx.sessionKey } : {}),
       OPENCLAUDE_GATEWAY_PORT: String(ctx.gatewayPort),
       OPENCLAUDE_GATEWAY_TOKEN_FILE: tokenFile,
       OPENCLAUDE_DELEGATION_DEPTH: String(ctx.delegationDepth ?? 0),

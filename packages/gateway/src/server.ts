@@ -66,6 +66,11 @@ import { type WebSocket, WebSocketServer } from 'ws'
 import { checkToken, verifyPassword, signJwt, verifyJwt, type JwtPayload } from './auth.js'
 import { CronScheduler } from './cron.js'
 import { parseDocument } from './documentParser.js'
+import {
+  makeDelegateProgressBlock,
+  summarizeDelegateProgressEvent,
+  type DelegateProgressBlock,
+} from './delegateProgress.js'
 import { eventBus, createEvent } from './eventBus.js'
 import { startEventPersistence } from './eventPersist.js'
 import { createLogger, type Logger } from './logger.js'
@@ -4718,6 +4723,25 @@ export class Gateway {
   private _activeDelegations = 0
   private static MAX_CONCURRENT_DELEGATIONS = 5
 
+  private _resolveDelegateProgressTarget(args: {
+    parentSessionKey?: unknown
+    sourceAgent?: unknown
+  }): { sessionKey: string; channel: string; peerId: string; userId?: string } | null {
+    if (typeof args.parentSessionKey !== 'string' || !args.parentSessionKey) return null
+    const parent = this.sessions.getByKey(args.parentSessionKey)
+    if (!parent) return null
+    if (parent.channel !== 'webchat') return null
+    if (typeof args.sourceAgent === 'string' && args.sourceAgent && parent.agentId !== args.sourceAgent) {
+      return null
+    }
+    return {
+      sessionKey: parent.sessionKey,
+      channel: parent.channel,
+      peerId: parent.peerId,
+      userId: parent.userId,
+    }
+  }
+
   private async handleDelegateTask(
     req: IncomingMessage,
     res: ServerResponse,
@@ -4775,6 +4799,35 @@ export class Gateway {
       delegationDepth: depth + 1,
     })
 
+    const progressTarget = this._resolveDelegateProgressTarget({
+      parentSessionKey: parsed.parentSessionKey,
+      sourceAgent,
+    })
+    const progressRunId = `dlg-${Date.now().toString(36)}-${randomBytes(4).toString('hex')}`
+    const emitProgress = (block: DelegateProgressBlock | null) => {
+      if (!progressTarget || !block) return
+      const out = {
+        type: 'outbound.message' as const,
+        sessionKey: progressTarget.sessionKey,
+        channel: progressTarget.channel,
+        peer: { id: progressTarget.peerId, kind: 'dm' as const },
+        blocks: [block as any],
+        isFinal: false,
+        _userId: progressTarget.userId,
+      }
+      this.deliver(out as OutboundMessage & { _userId?: string })
+    }
+    if (progressTarget && parsed.streamProgress === true) {
+      emitProgress(
+        makeDelegateProgressBlock({
+          runId: progressRunId,
+          agentId: targetAgentId,
+          phase: 'start',
+          text: `开始委派给 ${targetAgentId}: ${goal}`,
+        }),
+      )
+    }
+
     // Build prompt with context
     const prompt = context
       ? `[委派任务]\n\n目标: ${goal}\n\n上下文:\n${context}\n\n请完成上述任务并返回结果摘要。`
@@ -4788,6 +4841,9 @@ export class Gateway {
       await this.sessions.submit(session, prompt, (e) => {
         if (e.kind === 'block' && e.block.kind === 'text') output += e.block.text
         if (e.kind === 'error') error = e.error
+        if (progressTarget && parsed.streamProgress === true) {
+          emitProgress(summarizeDelegateProgressEvent(e, progressRunId, targetAgentId))
+        }
       })
       if (!error) {
         const delegatedApiError = classifyDelegateOutputError(output)
@@ -4795,12 +4851,34 @@ export class Gateway {
           error = `${delegatedApiError.message}\n\n${delegatedApiError.detail}`
         }
       }
+      if (progressTarget && parsed.streamProgress === true) {
+        emitProgress(
+          makeDelegateProgressBlock({
+            runId: progressRunId,
+            agentId: targetAgentId,
+            phase: error ? 'error' : 'done',
+            isError: Boolean(error),
+            text: error || output || '子 agent 已完成,无文本输出。',
+          }),
+        )
+      }
       this._runLog.complete(_dlgRun, {
         status: error ? 'failed' : 'completed',
         error: error || undefined,
       })
     } catch (err: any) {
       error = error || String(err)
+      if (progressTarget && parsed.streamProgress === true) {
+        emitProgress(
+          makeDelegateProgressBlock({
+            runId: progressRunId,
+            agentId: targetAgentId,
+            phase: 'error',
+            isError: true,
+            text: error,
+          }),
+        )
+      }
       this._runLog.complete(_dlgRun, { status: 'failed', error })
     } finally {
       this._activeDelegations--
