@@ -34,6 +34,17 @@ const ENTRYPOINT_TS_PATH = join(
   "entrypoint.ts",
 );
 
+const WEB_AGENTS_MODULE_PATH = join(
+  __dirname,
+  "..",
+  "..",
+  "..",
+  "web",
+  "public",
+  "modules",
+  "agents.js",
+);
+
 /**
  * personal-version 的 PROVIDER_MANAGED_ENV_VARS 源码 — 跨仓引用 .ts 源码会让 commercial
  * composite TS project 把外部源码纳入编译图,触发 rootDir/include 边界问题(S12a 三审 MAJOR 2)。
@@ -229,6 +240,93 @@ describe("openclaude-runtime entrypoint env-scrub policy", () => {
       src,
       /"scansci_pdf_config_get"/,
       "commercial default ScanSci tool list must not expose raw config dumps",
+    );
+  });
+
+  test("entrypoint.ts seeds commercial-supported default agents instead of Claude defaults", () => {
+    const src = readFileSync(ENTRYPOINT_TS_PATH, "utf-8");
+    assert.match(
+      src,
+      /const COMMERCIAL_DEFAULT_MODEL\s*=\s*"MiniMax-M3"/,
+      "commercial runtime default model must be MiniMax-M3",
+    );
+    assert.match(
+      src,
+      /const COMMERCIAL_DEFAULT_PROVIDER\s*=\s*"minimax"/,
+      "commercial runtime default provider must be minimax",
+    );
+    assert.doesNotMatch(
+      src,
+      /model:\s*"claude-opus-4-7"/,
+      "entrypoint must not seed Claude Opus as an agent/openclaude default",
+    );
+    assert.doesNotMatch(
+      src,
+      /provider:\s*"claude-subscription"/,
+      "entrypoint must not seed Claude subscription provider for default commercial agents",
+    );
+    for (const id of ["main", "researcher", "coder", "reviewer", "codex"]) {
+      assert.match(src, new RegExp(`id:\\s*"${id}"`), `entrypoint must seed ${id} agent`);
+    }
+    assert.match(
+      src,
+      /const desiredMiniMaxSeedAgents\s*=\s*\[[\s\S]*desiredMainAgent[\s\S]*desiredResearcherAgent[\s\S]*desiredCoderAgent[\s\S]*desiredReviewerAgent[\s\S]*\]/,
+      "MiniMax seed list should include the non-codex collaboration agents",
+    );
+    assert.match(
+      src,
+      /const desiredSeedAgents\s*=\s*\[\.\.\.desiredMiniMaxSeedAgents,\s*desiredCodexAgent\]/,
+      "initial agents.yaml should contain MiniMax seed agents plus the canonical codex agent",
+    );
+  });
+
+  test("entrypoint.ts keeps the canonical codex agent as the only GPT seed", () => {
+    const src = readFileSync(ENTRYPOINT_TS_PATH, "utf-8");
+    assert.match(src, /const COMMERCIAL_CODEX_MODEL\s*=\s*"gpt-5\.5"/);
+    assert.match(
+      src,
+      /const desiredCodexAgent\s*=\s*\{[\s\S]*id:\s*"codex"[\s\S]*model:\s*COMMERCIAL_CODEX_MODEL[\s\S]*provider:\s*"codex-native"[\s\S]*runnerKind:\s*"app-server"[\s\S]*\}/,
+      "gpt-5.5 must remain bound to canonical id='codex' with app-server runner",
+    );
+    assert.doesNotMatch(
+      src,
+      /id:\s*"(?!codex")[^"]+"[\s\S]{0,160}provider:\s*"codex-native"/,
+      "entrypoint must not seed extra codex-native agents with non-canonical ids",
+    );
+  });
+
+  test("entrypoint.ts repairs legacy Claude main without replacing custom fields wholesale", () => {
+    const src = readFileSync(ENTRYPOINT_TS_PATH, "utf-8");
+    assert.match(
+      src,
+      /function patchLegacyMainAgent\([\s\S]*const next = \{ \.\.\.agent \}/,
+      "legacy main repair must start from a copy of the existing agent to preserve custom fields",
+    );
+    assert.match(
+      src,
+      /isLegacyClaudeModel\(rawModel\)/,
+      "legacy main repair must detect Claude model ids",
+    );
+    assert.match(
+      src,
+      /backupAgentsYamlOnce\("修复 legacy main agent"\)/,
+      "legacy main repair must back up agents.yaml before mutating existing user config",
+    );
+    assert.doesNotMatch(
+      src,
+      /agents\[idx\]\s*=\s*desiredMainAgent/,
+      "legacy main repair must not wholesale replace the existing main agent",
+    );
+  });
+
+  test("web agents fallback also uses MiniMax instead of an unsupported Claude default", () => {
+    const src = readFileSync(WEB_AGENTS_MODULE_PATH, "utf-8");
+    assert.match(src, /model:\s*'MiniMax-M3'/, "web fallback main must use MiniMax-M3");
+    assert.match(src, /provider:\s*'minimax'/, "web fallback main must use minimax provider");
+    assert.doesNotMatch(
+      src,
+      /model:\s*'claude-opus-4-7'/,
+      "web fallback must not show Claude Opus as the only main agent",
     );
   });
 });
