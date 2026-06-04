@@ -1,8 +1,8 @@
 // OpenClaude — Markdown rendering, media embedding, rich blocks
-import { htmlSafeEscape } from './dom.js?v=61219e54'
-import { TRANSPARENT_PIXEL_DATA_URL, getCachedSignedUrl } from './mediaSign.js?v=61219e54'
-import { effectiveTheme } from './theme.js?v=61219e54'
-import { _basename } from './util.js?v=61219e54'
+import { htmlSafeEscape } from './dom.js?v=6dc9dd96'
+import { TRANSPARENT_PIXEL_DATA_URL, getCachedSignedUrl } from './mediaSign.js?v=6dc9dd96'
+import { effectiveTheme } from './theme.js?v=6dc9dd96'
+import { _basename } from './util.js?v=6dc9dd96'
 
 // ── Mermaid lazy loader ──
 // A single shared promise prevents concurrent callers from each injecting a <script>.
