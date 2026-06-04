@@ -1,7 +1,7 @@
-import { apiGet, apiJson } from './api.js?v=b9adb66b'
-import { $, htmlSafeEscape } from './dom.js?v=b9adb66b'
-import { state } from './state.js?v=b9adb66b'
-import { toast, toastOptsFromError } from './ui.js?v=b9adb66b'
+import { apiGet, apiJson } from './api.js?v=f47ac7ee'
+import { $, htmlSafeEscape } from './dom.js?v=f47ac7ee'
+import { state } from './state.js?v=f47ac7ee'
+import { toast, toastOptsFromError } from './ui.js?v=f47ac7ee'
 
 const TEAM_ID_RE = /^[a-zA-Z0-9_-]+$/
 export const SELECTED_TEAM_KEY = 'openclaude_selected_team'
