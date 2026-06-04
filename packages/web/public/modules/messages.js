@@ -777,6 +777,58 @@ function _renderAgentGroup(el, msg) {
   }
 }
 
+function _renderDelegateProgress(el, msg) {
+  el.innerHTML = ''
+  el.className = 'agent-group delegate-progress'
+  if (msg._completed) el.classList.add('collapsed')
+  if (msg.error) el.classList.add('error')
+  el.dataset.msgId = msg.id
+
+  const statusHtml = msg.error
+    ? '<span class="agent-group-status" style="color:var(--danger)">失败</span>'
+    : msg._completed
+      ? '<span class="agent-group-status" style="color:var(--success)">完成</span>'
+      : '<span class="agent-group-status">运行中…</span>'
+
+  const header = document.createElement('div')
+  header.className = 'agent-group-header'
+  header.innerHTML = `${_SVG_BOT_AGENT}<span class="agent-group-title">委派过程: ${htmlSafeEscape(msg.agentId || 'agent')}</span>${statusHtml}${_SVG_CHEVRON_AGENT}`
+  header.onclick = () => el.classList.toggle('collapsed')
+  el.appendChild(header)
+
+  const body = document.createElement('div')
+  body.className = 'agent-group-body'
+  const entries = Array.isArray(msg.entries) ? msg.entries : []
+  for (const entry of entries) {
+    const text = String(entry?.text || '').trim()
+    if (!text) continue
+    const p = document.createElement('div')
+    p.className =
+      entry.phase === 'thinking'
+        ? 'agent-group-child-thinking'
+        : entry.phase === 'tool'
+          ? 'agent-group-child-tool msg tool'
+          : 'agent-group-child-text'
+    if (entry.isError) p.classList.add('error')
+    p.textContent = text
+    body.appendChild(p)
+  }
+  if (msg.summary) {
+    const preview = document.createElement('div')
+    preview.className = 'agent-group-result'
+    preview.textContent = msg.summary
+    body.appendChild(preview)
+  }
+  if (entries.length === 0 && !msg.summary) {
+    const empty = document.createElement('div')
+    empty.className = 'agent-group-empty'
+    empty.textContent = '等待子 agent 输出…'
+    body.appendChild(empty)
+  }
+  el.appendChild(body)
+  _appendMsgTime(el, msg.completedAt || msg.ts)
+}
+
 function _buildToolCard(el, msg) {
   const name = msg.toolName || 'unknown'
   // `input` is computed before `_toolMeta` so codex mcpToolCall /
@@ -2526,6 +2578,8 @@ export function _buildMessageEl(msg) {
     _appendMsgTime(el, msg.completedAt || msg.ts)
   } else if (msg.role === 'agent-group') {
     _renderAgentGroup(el, msg)
+  } else if (msg.role === 'delegate-progress') {
+    _renderDelegateProgress(el, msg)
   } else if (msg.role === 'plan') {
     _buildPlanCard(el, msg)
   } else if (msg.role === 'thinking') {
@@ -2700,6 +2754,8 @@ export function updateMessageEl(msg, streaming) {
     _refreshMsgTime(el, msg)
   } else if (msg.role === 'agent-group') {
     _renderAgentGroup(el, msg)
+  } else if (msg.role === 'delegate-progress') {
+    _renderDelegateProgress(el, msg)
   } else if (msg.role === 'plan') {
     el.innerHTML = ''
     el.className = 'msg plan'

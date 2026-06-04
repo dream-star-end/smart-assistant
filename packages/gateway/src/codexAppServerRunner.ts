@@ -891,6 +891,7 @@ export class CodexAppServerRunner extends EventEmitter {
     try {
       const overrides = await buildCodexLaunchOverrides({
         agentId: this.opts.agentId,
+        sessionKey: this.opts.sessionKey,
         persona: this.opts.persona,
         provider: this.opts.agentProvider,
         model: this.opts.model,

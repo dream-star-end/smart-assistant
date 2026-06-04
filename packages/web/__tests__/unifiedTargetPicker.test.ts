@@ -19,6 +19,14 @@ const WEBSOCKET = readFileSync(
   resolve(import.meta.dirname, '..', 'public', 'modules', 'websocket.js'),
   'utf-8',
 )
+const EFFORT = readFileSync(
+  resolve(import.meta.dirname, '..', 'public', 'modules', 'effortMode.js'),
+  'utf-8',
+)
+const MESSAGES = readFileSync(
+  resolve(import.meta.dirname, '..', 'public', 'modules', 'messages.js'),
+  'utf-8',
+)
 
 describe('unified assistant picker wiring', () => {
   it('renders single-agent and multi-agent sections', () => {
@@ -54,5 +62,16 @@ describe('unified assistant picker wiring', () => {
     assert.match(WEBSOCKET, /sess\?\._activeTeamRun/)
     assert.match(WEBSOCKET, /团队: \$\{team\.name \|\| team\.id\}/)
     assert.match(WEBSOCKET, /sess\._activeTeamRun = null/)
+  })
+
+  it('team mode scopes effort to the leader and renders delegate progress separately', () => {
+    assert.match(EFFORT, /getSelectedTeamLeaderModel/)
+    assert.match(EFFORT, /队长思考深度/)
+    assert.match(EFFORT, /agent-team-selection-changed/)
+    assert.match(MODEL, /当前团队由队长配置决定/)
+    assert.match(WEBSOCKET, /block\.kind === 'delegate_progress'/)
+    assert.match(WEBSOCKET, /delegate-progress/)
+    assert.match(MESSAGES, /function _renderDelegateProgress/)
+    assert.match(MESSAGES, /委派过程/)
   })
 })
