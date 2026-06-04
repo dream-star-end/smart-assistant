@@ -270,13 +270,23 @@ describe("openclaude-runtime entrypoint env-scrub policy", () => {
     }
     assert.match(
       src,
-      /const desiredMiniMaxSeedAgents\s*=\s*\[[\s\S]*desiredMainAgent[\s\S]*desiredResearcherAgent[\s\S]*desiredCoderAgent[\s\S]*desiredReviewerAgent[\s\S]*\]/,
-      "MiniMax seed list should include the non-codex collaboration agents",
+      /const COMMERCIAL_CODER_MODEL\s*=\s*"deepseek-v4-pro"/,
+      "commercial coder seed must use DeepSeek V4 Pro",
     );
     assert.match(
       src,
-      /const desiredSeedAgents\s*=\s*\[\.\.\.desiredMiniMaxSeedAgents,\s*desiredCodexAgent\]/,
-      "initial agents.yaml should contain MiniMax seed agents plus the canonical codex agent",
+      /const COMMERCIAL_CODER_PROVIDER\s*=\s*"deepseek"/,
+      "commercial coder seed must use the deepseek provider",
+    );
+    assert.match(
+      src,
+      /const desiredCollaborationSeedAgents\s*=\s*\[[\s\S]*desiredMainAgent[\s\S]*desiredResearcherAgent[\s\S]*desiredCoderAgent[\s\S]*desiredReviewerAgent[\s\S]*\]/,
+      "collaboration seed list should include the non-codex default agents",
+    );
+    assert.match(
+      src,
+      /const desiredSeedAgents\s*=\s*\[\.\.\.desiredCollaborationSeedAgents,\s*desiredCodexAgent\]/,
+      "initial agents.yaml should contain collaboration seed agents plus the canonical codex agent",
     );
   });
 
@@ -295,34 +305,45 @@ describe("openclaude-runtime entrypoint env-scrub policy", () => {
     );
   });
 
-  test("entrypoint.ts repairs legacy Claude main without replacing custom fields wholesale", () => {
+  test("entrypoint.ts repairs reserved seed agents without replacing custom fields wholesale", () => {
     const src = readFileSync(ENTRYPOINT_TS_PATH, "utf-8");
     assert.match(
       src,
-      /function patchLegacyMainAgent\([\s\S]*const next = \{ \.\.\.agent \}/,
-      "legacy main repair must start from a copy of the existing agent to preserve custom fields",
+      /function patchPlatformSeedAgent\([\s\S]*const next = \{ \.\.\.agent \}/,
+      "seed repair must start from a copy of the existing agent to preserve custom fields",
     );
     assert.match(
       src,
-      /isLegacyClaudeModel\(rawModel\)/,
-      "legacy main repair must detect Claude model ids",
+      /"GPT 5\.5 \(default\)"/,
+      "main drift to the old GPT 5.5 default display must be recognized as a platform seed",
     );
     assert.match(
       src,
-      /backupAgentsYamlOnce\("修复 legacy main agent"\)/,
-      "legacy main repair must back up agents.yaml before mutating existing user config",
+      /backupAgentsYamlOnce\(`修复 \$\{desiredAgent\.id\} seed agent`\)/,
+      "seed repair must back up agents.yaml before mutating existing config",
     );
     assert.doesNotMatch(
       src,
       /agents\[idx\]\s*=\s*desiredMainAgent/,
-      "legacy main repair must not wholesale replace the existing main agent",
+      "seed repair must not wholesale replace the existing main agent",
     );
+  });
+
+  test("entrypoint.ts pre-seeds the two default teams with codex as leader", () => {
+    const src = readFileSync(ENTRYPOINT_TS_PATH, "utf-8");
+    assert.match(src, /const desiredSeedTeams\s*=\s*\[desiredScienceTeam,\s*desiredProgrammingTeam\]/);
+    assert.match(src, /id:\s*"science_research_team"[\s\S]*leaderAgentId:\s*"codex"/);
+    assert.match(src, /id:\s*"programming_team"[\s\S]*leaderAgentId:\s*"codex"/);
+    assert.match(src, /teams:\s*desiredSeedTeams\.map\(cloneSeedTeam\)/);
+    assert.match(src, /patchPlatformSeedTeam/);
   });
 
   test("web agents fallback also uses MiniMax instead of an unsupported Claude default", () => {
     const src = readFileSync(WEB_AGENTS_MODULE_PATH, "utf-8");
     assert.match(src, /model:\s*'MiniMax-M3'/, "web fallback main must use MiniMax-M3");
     assert.match(src, /provider:\s*'minimax'/, "web fallback main must use minimax provider");
+    assert.match(src, /model:\s*'deepseek-v4-pro'/, "web fallback coder must use DeepSeek V4 Pro");
+    assert.match(src, /provider:\s*'deepseek'/, "web fallback coder must use the deepseek provider");
     assert.doesNotMatch(
       src,
       /model:\s*'claude-opus-4-7'/,

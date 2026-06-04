@@ -16,10 +16,10 @@ const TEAM_TEMPLATES = [
     id: 'science_research_team',
     name: '科研协作团队',
     description: '适合文献调研、实验/数据分析、论文思路和证据复核',
-    leaderAgentId: 'main',
+    leaderAgentId: 'codex',
     leaderRole: '科研项目负责人',
     leaderPrompt:
-      '先把研究问题拆成可验证子问题，明确证据标准和交付物。只把需要外部资料、数据脚本或独立复核的任务委派出去，要求成员返回来源、方法、局限和不确定性。最终按研究结论、证据链、局限和下一步实验组织输出。',
+      '你是科研协作队长。先把研究问题拆成可验证子问题，定义证据标准和交付物；优先把资料检索交给 researcher，把数据/复现交给 coder，把证据链复核交给 reviewer。最终按结论、证据、局限和下一步组织输出。',
     members: [
       {
         agentId: 'researcher',
@@ -50,10 +50,10 @@ const TEAM_TEMPLATES = [
     id: 'programming_team',
     name: '编程协作团队',
     description: '适合需求拆解、技术调研、代码实现、测试和审查闭环',
-    leaderAgentId: 'main',
+    leaderAgentId: 'codex',
     leaderRole: '技术负责人',
     leaderPrompt:
-      '先确认需求、约束、影响范围和验收标准，再把可并行的调研、实现、审查任务委派给合适成员。保持最小改动和可验证交付，避免过度工程。最终说明改动点、验证结果、风险和后续建议。',
+      '你是编程协作队长。先确认需求、约束、影响范围和验收标准；把技术调研交给 researcher，把实现交给 coder，把质量审查交给 reviewer。保持最小改动和可验证交付，最终说明改动点、验证结果、风险和后续建议。',
     members: [
       {
         agentId: 'researcher',
