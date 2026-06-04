@@ -102,6 +102,8 @@ const RESEARCH_TOOLSET_ID = "research";
 
 const COMMERCIAL_DEFAULT_MODEL = "MiniMax-M3";
 const COMMERCIAL_DEFAULT_PROVIDER = "minimax";
+const COMMERCIAL_CODER_MODEL = "deepseek-v4-pro";
+const COMMERCIAL_CODER_PROVIDER = "deepseek";
 const COMMERCIAL_CODEX_MODEL = "gpt-5.5";
 
 const BROWSER_MCP_ID = "browser";
@@ -192,6 +194,13 @@ function normalizeStringArray(v: unknown): string[] {
 
 function isLegacyClaudeModel(model: unknown): boolean {
   return typeof model === "string" && /^claude-/i.test(model.trim());
+}
+
+function sameStringSet(a: unknown, b: readonly string[]): boolean {
+  if (!Array.isArray(a)) return false;
+  const av = a.filter((v): v is string => typeof v === "string").sort();
+  const bv = [...b].sort();
+  return av.length === bv.length && av.every((v, i) => v === bv[i]);
 }
 
 function isDesiredBrowserMcpServer(v: unknown): boolean {
@@ -533,12 +542,11 @@ try {
 
   // 个人版 SessionManager 也需要 agents.yaml 才能解析 opts.agent。两件事:
   //
-  //   (a) volume 空 → bootstrap MiniMax main/协作角色 + 固定 id `codex`
+  //   (a) volume 空 → bootstrap 商业版 seed agents + 固定 id `codex` + 两个团队
   //   (b) volume 已有 yaml(用户/旧版镜像写过)→ merge 平台 seed:
-  //       - 旧版 main 如果还指向 Claude 默认,只修 model/provider 等必要字段,保留用户自定义
-  //       - 缺少 researcher/coder/reviewer → append
-  //       - 不存在 codex agent → append
-  //       - 存在但 provider/runnerKind/model 不匹配 → 覆盖并日志告警(原文件先 .bak)
+  //       - 保留用户自建 agent,但规范化 main/researcher/coder/reviewer/codex 这些平台保留 id
+  //       - 修复 main 被旧配置污染成 gpt-5.5/codex-native 导致前端出现两个 GPT 5.5
+  //       - 缺少 science_research_team/programming_team → append;旧默认形态 → 迁移为 codex 队长
   //       - 解析失败 → 备份原文件到 .bak.<rand>,重新写一份平台 seed yaml
   //
   // **安全边界放在后端 canUseModel + inferAgentForModel(fail-closed),agents.yaml
@@ -562,52 +570,70 @@ try {
     return isRecord(value) && value.id === id;
   }
 
-  function patchLegacyMainAgent(
+  const PLATFORM_SEED_DISPLAY_NAMES = new Set([
+    "main",
+    "MiniMax M3 助手",
+    "资料研究员",
+    "代码工程师",
+    "审阅员",
+    "GPT 5.5 (Codex)",
+    "GPT 5.5 (default)",
+    "GPT 5.5 队长",
+  ]);
+
+  function patchPlatformSeedAgent(
     agent: Record<string, unknown>,
     desired: Record<string, unknown>,
   ): Record<string, unknown> | null {
-    const rawModel = typeof agent.model === "string" ? agent.model.trim() : "";
-    const provider = typeof agent.provider === "string" ? agent.provider : "";
-    const needsModelRepair = rawModel === "" || isLegacyClaudeModel(rawModel);
     const next = { ...agent };
     let patched = false;
+    const displayNameBefore = typeof agent.displayName === "string" ? agent.displayName.trim() : "";
+    const shouldRefreshDisplay = displayNameBefore === "" || displayNameBefore === desired.id || PLATFORM_SEED_DISPLAY_NAMES.has(displayNameBefore);
 
-    if (needsModelRepair && next.model !== COMMERCIAL_DEFAULT_MODEL) {
-      next.model = COMMERCIAL_DEFAULT_MODEL;
+    const setField = (key: string, value: unknown) => {
+      if (next[key] !== value) {
+        next[key] = value;
+        patched = true;
+      }
+    };
+
+    setField("model", desired.model);
+    setField("provider", desired.provider);
+
+    if (desired.runnerKind !== undefined) {
+      setField("runnerKind", desired.runnerKind);
+    } else if (next.runnerKind !== undefined) {
+      delete next.runnerKind;
       patched = true;
     }
 
-    const modelAfter = typeof next.model === "string" ? next.model : "";
-    if (
-      modelAfter === COMMERCIAL_DEFAULT_MODEL &&
-      (needsModelRepair || provider === "" || provider === "claude-subscription") &&
-      next.provider !== COMMERCIAL_DEFAULT_PROVIDER
-    ) {
-      next.provider = COMMERCIAL_DEFAULT_PROVIDER;
-      patched = true;
+    if (typeof next.persona !== "string" || next.persona.trim() === "") {
+      if (desired.persona !== undefined) setField("persona", desired.persona);
     }
-
-    if (!patched) return null;
-
-    if (typeof next.persona !== "string" || next.persona.trim() === "") next.persona = desired.persona;
-    if (typeof next.displayName !== "string" || next.displayName.trim() === "" || next.displayName === "main") {
-      next.displayName = desired.displayName;
+    if (shouldRefreshDisplay) {
+      if (desired.displayName !== undefined) setField("displayName", desired.displayName);
+      if (desired.avatarEmoji !== undefined) setField("avatarEmoji", desired.avatarEmoji);
+    } else if (typeof next.avatarEmoji !== "string" || next.avatarEmoji.trim() === "") {
+      if (desired.avatarEmoji !== undefined) setField("avatarEmoji", desired.avatarEmoji);
     }
-    if (typeof next.avatarEmoji !== "string" || next.avatarEmoji.trim() === "") next.avatarEmoji = desired.avatarEmoji;
     if (typeof next.permissionMode !== "string" || next.permissionMode.trim() === "") {
-      next.permissionMode = desired.permissionMode;
+      if (desired.permissionMode !== undefined) setField("permissionMode", desired.permissionMode);
     }
-    return next;
+    if (Array.isArray(desired.toolsets) && !Array.isArray(next.toolsets)) {
+      setField("toolsets", desired.toolsets);
+    }
+
+    return patched ? next : null;
   }
 
-  // 期望的 codex agent 配置 —— 任何字段不匹配都覆盖
+  // 期望的 codex agent 配置 —— 固定 GPT 5.5 的唯一 seed 入口。
   const desiredCodexAgent = {
     id: "codex",
     model: COMMERCIAL_CODEX_MODEL,
     permissionMode: "bypassPermissions",
     provider: "codex-native",
     runnerKind: "app-server",
-    displayName: "GPT 5.5 (Codex)",
+    displayName: "GPT 5.5 队长",
     avatarEmoji: "🤖",
   };
 
@@ -637,13 +663,13 @@ try {
 
   const desiredCoderAgent = {
     id: "coder",
-    model: COMMERCIAL_DEFAULT_MODEL,
+    model: COMMERCIAL_CODER_MODEL,
     persona: ensureAgentPersona(
       "coder",
-      "你是代码工程师。先读代码和现有约束,再做最小必要修改,验证结果后用简洁中文汇报。\n",
+      "你是 DeepSeek V4 Pro 代码工程师。先读代码和现有约束,再做最小必要修改,验证结果后用简洁中文汇报。\n",
     ),
     permissionMode: "bypassPermissions",
-    provider: COMMERCIAL_DEFAULT_PROVIDER,
+    provider: COMMERCIAL_CODER_PROVIDER,
     displayName: "代码工程师",
     avatarEmoji: "🛠️",
     toolsets: [CORE_TOOLSET_ID, BROWSER_TOOLSET_ID],
@@ -663,19 +689,138 @@ try {
     toolsets: [CORE_TOOLSET_ID],
   };
 
-  const desiredMiniMaxSeedAgents = [
+  const desiredCollaborationSeedAgents = [
     desiredMainAgent,
     desiredResearcherAgent,
     desiredCoderAgent,
     desiredReviewerAgent,
   ];
-  const desiredSeedAgents = [...desiredMiniMaxSeedAgents, desiredCodexAgent];
+  const desiredSeedAgents = [...desiredCollaborationSeedAgents, desiredCodexAgent];
+
+  const desiredScienceTeam = {
+    id: "science_research_team",
+    name: "科研协作团队",
+    description: "适合文献调研、实验/数据分析、论文思路和证据复核",
+    leaderAgentId: "codex",
+    leaderRole: "科研项目负责人",
+    leaderPrompt:
+      "你是科研协作队长。先把研究问题拆成可验证子问题,定义证据标准和交付物;优先把资料检索交给 researcher,把数据/复现交给 coder,把证据链复核交给 reviewer。最终按结论、证据、局限和下一步组织输出。",
+    members: [
+      {
+        agentId: "researcher",
+        role: "文献研究员",
+        responsibility: "检索资料、阅读论文/文档并列出可靠来源",
+        rolePrompt:
+          "围绕研究问题检索和筛选高可信资料,区分已证实结论、假设和争议。输出必须包含来源线索、关键证据、适用边界和仍需验证的问题。",
+      },
+      {
+        agentId: "coder",
+        role: "数据与图表工程师",
+        responsibility: "处理数据、设计分析脚本或复现实验步骤",
+        rolePrompt:
+          "把研究问题转成可执行的数据处理、统计分析、可视化或复现实验步骤。优先给出最小可验证脚本、输入输出说明、指标含义和失败风险。",
+      },
+      {
+        agentId: "reviewer",
+        role: "证据审稿人",
+        responsibility: "复核证据链、方法漏洞、夸大结论和遗漏",
+        rolePrompt:
+          "像严格审稿人一样检查证据是否支撑结论,指出样本、方法、因果、统计和引用层面的弱点。优先列出阻塞性问题和可信度判断。",
+      },
+    ],
+    policy: { maxParallel: 3, requireReview: true, reviewAgentId: "reviewer" },
+  };
+
+  const desiredProgrammingTeam = {
+    id: "programming_team",
+    name: "编程协作团队",
+    description: "适合需求拆解、技术调研、代码实现、测试和审查闭环",
+    leaderAgentId: "codex",
+    leaderRole: "技术负责人",
+    leaderPrompt:
+      "你是编程协作队长。先确认需求、约束、影响范围和验收标准;把技术调研交给 researcher,把实现交给 coder,把质量审查交给 reviewer。保持最小改动和可验证交付,最终说明改动点、验证结果、风险和后续建议。",
+    members: [
+      {
+        agentId: "researcher",
+        role: "技术调研工程师",
+        responsibility: "查官方文档、现有实现、依赖约束和可选方案",
+        rolePrompt:
+          "优先查官方文档、仓库现有模式和真实约束,给出可执行方案对比。输出要包含推荐方案、关键依据、兼容性风险和不建议采用的方案理由。",
+      },
+      {
+        agentId: "coder",
+        role: "实现工程师",
+        responsibility: "按既有架构做最小必要代码修改并自测",
+        rolePrompt:
+          "先读相关代码和测试,再按项目约定做最小必要实现。不要扩大需求或重构无关模块。输出改动文件、核心逻辑、已跑验证和未覆盖风险。",
+      },
+      {
+        agentId: "reviewer",
+        role: "质量审查工程师",
+        responsibility: "检查正确性、边界、回归风险和测试覆盖",
+        rolePrompt:
+          "从正确性、回归风险、安全边界、测试覆盖和过度工程角度审查。区分阻塞问题和非阻塞建议,避免提出与需求无关的范围扩张。",
+      },
+    ],
+    policy: { maxParallel: 3, requireReview: true, reviewAgentId: "reviewer" },
+  };
+
+  const desiredSeedTeams = [desiredScienceTeam, desiredProgrammingTeam];
+
+  function cloneSeedTeam(team: Record<string, unknown>): Record<string, unknown> {
+    return {
+      ...team,
+      members: Array.isArray(team.members)
+        ? team.members.map((m) => (isRecord(m) ? { ...m } : m))
+        : [],
+      policy: isRecord(team.policy) ? { ...team.policy } : undefined,
+      updatedAt: new Date().toISOString(),
+    };
+  }
+
+  function teamMemberIds(team: unknown): string[] {
+    if (!isRecord(team) || !Array.isArray(team.members)) return [];
+    return team.members
+      .map((m) => (isRecord(m) && typeof m.agentId === "string" ? m.agentId : ""))
+      .filter(Boolean);
+  }
+
+  function isDefaultSeedTeamShape(team: unknown, desired: Record<string, unknown>): boolean {
+    if (!isRecord(team)) return false;
+    const name = typeof team.name === "string" ? team.name : "";
+    const leader = typeof team.leaderAgentId === "string" ? team.leaderAgentId : "";
+    const memberIds = teamMemberIds(team);
+    const desiredMemberIds = teamMemberIds(desired);
+    const defaultName = name === "" || name === desired.name;
+    const defaultLeader = leader === "" || leader === "main" || leader === "codex";
+    const defaultMembers = memberIds.length === 0 || sameStringSet(memberIds, desiredMemberIds);
+    return defaultName && defaultLeader && defaultMembers;
+  }
+
+  function patchPlatformSeedTeam(
+    team: Record<string, unknown>,
+    desired: Record<string, unknown>,
+  ): Record<string, unknown> | null {
+    if (!isDefaultSeedTeamShape(team, desired)) return null;
+    const next = cloneSeedTeam(desired);
+    const currentLeader = typeof team.leaderAgentId === "string" ? team.leaderAgentId : "";
+    const currentMembers = teamMemberIds(team);
+    if (
+      currentLeader === desired.leaderAgentId &&
+      sameStringSet(currentMembers, teamMemberIds(desired)) &&
+      team.name === desired.name
+    ) {
+      return null;
+    }
+    return next;
+  }
 
   if (!existsSync(agentsPath)) {
     const initialDoc = {
       agents: desiredSeedAgents,
       routes: [],
       default: "main",
+      teams: desiredSeedTeams.map(cloneSeedTeam),
     };
     writeFileSync(agentsPath, YAML.stringify(initialDoc), { mode: 0o644 });
     console.error(`[entrypoint] bootstrapped agents.yaml at ${agentsPath}`);
@@ -708,11 +853,12 @@ try {
         agents: desiredSeedAgents,
         routes: [],
         default: "main",
+        teams: desiredSeedTeams.map(cloneSeedTeam),
       };
       writeFileSync(agentsPath, YAML.stringify(initialDoc), { mode: 0o644 });
       console.error(`[entrypoint] rewrote agents.yaml at ${agentsPath} (parse failed or empty)`);
     } else {
-      const doc = parsed as { agents?: unknown; routes?: unknown; default?: unknown };
+      const doc = parsed as { agents?: unknown; routes?: unknown; default?: unknown; teams?: unknown };
       const agents = Array.isArray(doc.agents) ? [...(doc.agents as unknown[])] : [];
       let mutated = false;
 
@@ -731,7 +877,7 @@ try {
         return backupPath;
       };
 
-      for (const desiredAgent of desiredMiniMaxSeedAgents) {
+      for (const desiredAgent of desiredSeedAgents) {
         const idx = agents.findIndex((a) => isAgentWithId(a, desiredAgent.id));
         if (idx < 0) {
           if (desiredAgent.id === "main") agents.unshift(desiredAgent);
@@ -740,40 +886,39 @@ try {
           console.error(`[entrypoint] agents.yaml: appended ${desiredAgent.id} agent`);
           continue;
         }
-        if (desiredAgent.id === "main" && isRecord(agents[idx])) {
-          const patchedMain = patchLegacyMainAgent(agents[idx], desiredAgent);
-          if (patchedMain) {
-            backupAgentsYamlOnce("修复 legacy main agent");
-            agents[idx] = patchedMain;
-            mutated = true;
-            console.error(
-              `[entrypoint] agents.yaml: main agent 从 legacy Claude 默认修复为 ${COMMERCIAL_DEFAULT_MODEL}/${COMMERCIAL_DEFAULT_PROVIDER}`,
-            );
-          }
-        }
-      }
-
-      const codexIndex = agents.findIndex((a) => isAgentWithId(a, "codex"));
-      if (codexIndex < 0) {
-        agents.push(desiredCodexAgent);
-        mutated = true;
-        console.error(`[entrypoint] agents.yaml: appended codex agent`);
-      } else {
-        const existing = agents[codexIndex] as Record<string, unknown>;
-        const mismatch =
-          existing.provider !== desiredCodexAgent.provider ||
-          existing.runnerKind !== desiredCodexAgent.runnerKind ||
-          existing.model !== desiredCodexAgent.model;
-        if (mismatch) {
-          // 备份后覆盖(用户 / 旧镜像污染了 codex 条目)
-          const bakPath = backupAgentsYamlOnce("覆盖 codex");
-          agents[codexIndex] = desiredCodexAgent;
+        if (!isRecord(agents[idx])) continue;
+        const patchedAgent = patchPlatformSeedAgent(agents[idx], desiredAgent);
+        if (patchedAgent) {
+          const bakPath = backupAgentsYamlOnce(`修复 ${desiredAgent.id} seed agent`);
+          agents[idx] = patchedAgent;
           mutated = true;
           console.error(
-            `[entrypoint] agents.yaml: codex agent 字段不匹配,已覆盖(原文件备份到 ${bakPath})`,
+            `[entrypoint] agents.yaml: normalized ${desiredAgent.id} seed agent (原文件备份到 ${bakPath})`,
           );
         }
       }
+
+      const teams = Array.isArray(doc.teams) ? [...(doc.teams as unknown[])] : [];
+      for (const desiredTeam of desiredSeedTeams) {
+        const idx = teams.findIndex((t) => isRecord(t) && t.id === desiredTeam.id);
+        if (idx < 0) {
+          teams.push(cloneSeedTeam(desiredTeam));
+          mutated = true;
+          console.error(`[entrypoint] agents.yaml: appended ${desiredTeam.id} team`);
+          continue;
+        }
+        if (!isRecord(teams[idx])) continue;
+        const patchedTeam = patchPlatformSeedTeam(teams[idx], desiredTeam);
+        if (patchedTeam) {
+          const bakPath = backupAgentsYamlOnce(`修复 ${desiredTeam.id} team`);
+          teams[idx] = patchedTeam;
+          mutated = true;
+          console.error(
+            `[entrypoint] agents.yaml: normalized ${desiredTeam.id} team (原文件备份到 ${bakPath})`,
+          );
+        }
+      }
+
       const agentIds = new Set(
         agents
           .filter((a): a is Record<string, unknown> => isRecord(a))
@@ -788,6 +933,7 @@ try {
           agents,
           routes: Array.isArray(doc.routes) ? doc.routes : [],
           default: nextDefault,
+          teams,
         };
         writeFileSync(agentsPath, YAML.stringify(newDoc), { mode: 0o644 });
       }

@@ -32,8 +32,8 @@ const COMMERCIAL_FALLBACK_AGENTS = Object.freeze([
     id: 'coder',
     displayName: '代码工程师',
     avatarEmoji: '🛠️',
-    model: 'MiniMax-M3',
-    provider: 'minimax',
+    model: 'deepseek-v4-pro',
+    provider: 'deepseek',
   },
   {
     id: 'reviewer',
@@ -44,7 +44,7 @@ const COMMERCIAL_FALLBACK_AGENTS = Object.freeze([
   },
   {
     id: 'codex',
-    displayName: 'GPT 5.5 (Codex)',
+    displayName: 'GPT 5.5 队长',
     avatarEmoji: '🤖',
     model: 'gpt-5.5',
     provider: 'codex-native',
