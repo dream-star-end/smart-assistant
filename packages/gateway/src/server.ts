@@ -4726,6 +4726,7 @@ export class Gateway {
   /** Active delegation count for recursion/concurrency limits */
   private _activeDelegations = 0
   private static MAX_CONCURRENT_DELEGATIONS = 5
+  private _activeDelegationsByParent = new Map<string, Set<string>>()
 
   private _resolveDelegateProgressTarget(args: {
     parentSessionKey?: unknown
@@ -4744,6 +4745,48 @@ export class Gateway {
       peerId: parent.peerId,
       userId: parent.userId,
     }
+  }
+
+  private _registerActiveDelegation(
+    parentSessionKey: string | undefined,
+    childSessionKey: string,
+  ): (() => void) | null {
+    if (!parentSessionKey) return null
+    let set = this._activeDelegationsByParent.get(parentSessionKey)
+    if (!set) {
+      set = new Set<string>()
+      this._activeDelegationsByParent.set(parentSessionKey, set)
+    }
+    set.add(childSessionKey)
+    return () => {
+      const current = this._activeDelegationsByParent.get(parentSessionKey)
+      if (!current) return
+      current.delete(childSessionKey)
+      if (current.size === 0) this._activeDelegationsByParent.delete(parentSessionKey)
+    }
+  }
+
+  private _interruptDelegationsForParent(parentSessionKey: string): boolean {
+    const childSessionKeys = this._activeDelegationsByParent.get(parentSessionKey)
+    if (!childSessionKeys || childSessionKeys.size === 0) return false
+
+    let interrupted = false
+    let attempted = 0
+    for (const childSessionKey of [...childSessionKeys]) {
+      if (!this.sessions.getByKey(childSessionKey)) {
+        childSessionKeys.delete(childSessionKey)
+        continue
+      }
+      attempted++
+      interrupted = this.sessions.interrupt(childSessionKey) || interrupted
+    }
+    if (childSessionKeys.size === 0) this._activeDelegationsByParent.delete(parentSessionKey)
+    this.log.info('interrupt_delegations', {
+      parentSessionKey,
+      attempted,
+      ok: interrupted,
+    })
+    return interrupted
   }
 
   private async handleDelegateTask(
@@ -4794,19 +4837,20 @@ export class Gateway {
       depth,
     })
 
+    const progressTarget = this._resolveDelegateProgressTarget({
+      parentSessionKey: parsed.parentSessionKey,
+      sourceAgent,
+    })
     const session = await this.sessions.getOrCreate({
       sessionKey,
       agent: delegatedAgent,
       channel: 'delegate',
       peerId: sourceAgent || 'system',
+      repoSessionId: progressTarget?.peerId,
       title: `[delegate] ${goal.slice(0, 40)}`,
       delegationDepth: depth + 1,
     })
 
-    const progressTarget = this._resolveDelegateProgressTarget({
-      parentSessionKey: parsed.parentSessionKey,
-      sourceAgent,
-    })
     const progressRunId = `dlg-${Date.now().toString(36)}-${randomBytes(4).toString('hex')}`
     const emitProgress = (block: DelegateProgressBlock | null) => {
       if (!progressTarget || !block) return
@@ -4838,6 +4882,10 @@ export class Gateway {
       : `[委派任务]\n\n目标: ${goal}\n\n请完成上述任务并返回结果摘要。`
 
     this._activeDelegations++
+    const unregisterDelegation = this._registerActiveDelegation(
+      progressTarget?.sessionKey,
+      sessionKey,
+    )
     const _dlgRun = this._runLog.start({ agentId: targetAgentId, sessionKey, taskType: 'delegate' })
     let output = ''
     let error = ''
@@ -4934,6 +4982,7 @@ export class Gateway {
       this._runLog.complete(_dlgRun, { status: 'failed', error })
     } finally {
       clearTimeoutTimer()
+      unregisterDelegation?.()
       this._activeDelegations--
     }
 
@@ -6191,7 +6240,9 @@ export class Gateway {
         let interrupted = false
         for (const live of this.sessions.list()) {
           if (!live.sessionKey.endsWith(suffix)) continue
-          interrupted = this.sessions.interrupt(live.sessionKey) || interrupted
+          const selfInterrupted = this.sessions.interrupt(live.sessionKey)
+          const delegateInterrupted = this._interruptDelegationsForParent(live.sessionKey)
+          interrupted = selfInterrupted || delegateInterrupted || interrupted
         }
         if (interrupted) {
           this.log.info('interrupt', { sessionKey: `*${suffix}`, ok: true })
@@ -6208,7 +6259,9 @@ export class Gateway {
         sessionKey = routed.sessionKey
       }
     }
-    const ok = this.sessions.interrupt(sessionKey)
+    const selfInterrupted = this.sessions.interrupt(sessionKey)
+    const delegateInterrupted = this._interruptDelegationsForParent(sessionKey)
+    const ok = selfInterrupted || delegateInterrupted
     this.log.info('interrupt', { sessionKey, ok })
     return ok
   }
