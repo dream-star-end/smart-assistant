@@ -7,6 +7,46 @@ const TEAM_ID_RE = /^[a-zA-Z0-9_-]+$/
 const SELECTED_TEAM_KEY = 'openclaude_selected_team'
 let _editingTeamId = ''
 
+const TEAM_TEMPLATES = [
+  {
+    id: 'dev_team',
+    name: '研发协作队',
+    description: '适合代码实现、调研和审阅闭环',
+    leaderAgentId: 'main',
+    members: [
+      { agentId: 'coder', role: '实现', responsibility: '阅读代码、做最小必要修改并说明改动文件' },
+      { agentId: 'reviewer', role: '审阅', responsibility: '检查正确性、边界条件和过度工程风险' },
+    ],
+    policy: { maxParallel: 2, requireReview: true, reviewAgentId: 'reviewer' },
+    badge: '代码任务',
+  },
+  {
+    id: 'research_team',
+    name: '研究分析队',
+    description: '适合资料搜集、论文/PDF 分析和结论复核',
+    leaderAgentId: 'main',
+    members: [
+      { agentId: 'researcher', role: '调研', responsibility: '搜集资料、阅读文档/PDF 并列出来源' },
+      { agentId: 'reviewer', role: '复核', responsibility: '检查论证链、遗漏和不确定性' },
+    ],
+    policy: { maxParallel: 2, requireReview: true, reviewAgentId: 'reviewer' },
+    badge: '研究任务',
+  },
+  {
+    id: 'full_stack_team',
+    name: '全栈协作队',
+    description: '适合从需求拆解到实现、验证、复盘的完整任务',
+    leaderAgentId: 'main',
+    members: [
+      { agentId: 'researcher', role: '调研', responsibility: '确认背景、约束和可复用资料' },
+      { agentId: 'coder', role: '实现', responsibility: '落地修改或生成交付物' },
+      { agentId: 'reviewer', role: '复核', responsibility: '最终审阅风险、验证和下一步' },
+    ],
+    policy: { maxParallel: 3, requireReview: true, reviewAgentId: 'reviewer' },
+    badge: '端到端',
+  },
+]
+
 function _cleanPromptText(value, maxLen = 1000) {
   return String(value || '')
     .replace(/[\u0000-\u001f\u007f]/g, ' ')
@@ -23,13 +63,48 @@ function _agentExists(id) {
   return (state.agentsList || []).some((a) => a.id === id)
 }
 
+function _missingAgentIds(ids) {
+  const missing = []
+  for (const id of ids) {
+    if (!id || missing.includes(id) || _agentExists(id)) continue
+    missing.push(id)
+  }
+  return missing
+}
+
+function _templateRequiredAgentIds(template) {
+  return [
+    template.leaderAgentId,
+    ...(template.members || []).map((m) => m.agentId),
+    template.policy?.reviewAgentId,
+  ].filter(Boolean)
+}
+
+function _nextAvailableTeamId(baseId) {
+  if (!_teamById(baseId)) return baseId
+  for (let i = 2; i <= 99; i++) {
+    const candidate = `${baseId}_${i}`
+    if (!_teamById(candidate)) return candidate
+  }
+  return `${baseId}_${Date.now().toString(36)}`
+}
+
 function _agentLabel(agentId) {
   const agent = (state.agentsList || []).find((a) => a.id === agentId)
   return agent?.displayName ? `${agent.displayName} (${agentId})` : agentId
 }
 
 function _memberLines(team) {
-  return (team.members || [])
+  const members = [...(team.members || [])]
+  const reviewAgentId = team?.policy?.requireReview ? team?.policy?.reviewAgentId : ''
+  if (reviewAgentId && !members.some((m) => m.agentId === reviewAgentId)) {
+    members.push({
+      agentId: reviewAgentId,
+      role: '复核',
+      responsibility: '检查草案的遗漏、风险和错误',
+    })
+  }
+  return members
     .map((m) => {
       const role = _cleanPromptText(m.role, 40) || '成员'
       const resp = _cleanPromptText(m.responsibility, 200)
@@ -61,11 +136,13 @@ export function buildTeamRunPrompt(team, userText) {
     members || '- (无成员配置 — 请说明团队配置不完整)',
     '',
     '## 协作规则',
-    '- 先给出简短任务拆解,再开始执行。',
+    '- 先给出简短任务拆解和任务账本,再开始执行。',
     `- 只允许委派给上面列出的 agentId;不要编造不存在的 agent。`,
-    `- 需要成员产出时,使用 delegate_task(goal=..., agentId=..., context=...)；可并行思考,但最多同时推进 ${maxParallel} 条子任务。`,
+    `- 需要成员产出时,使用 delegate_task(goal=..., agentId=..., context=...),并在 context 里交代用户目标、相关附件/代码/约束、期望输出。`,
+    `- 可以把独立子任务分批推进,但最多同时推进 ${maxParallel} 条子任务;不要重复委派同一问题。`,
     reviewLine,
-    '- 汇总时保留每个成员的关键结论、风险和未完成事项。',
+    '- 如果需要复核,先产出草案,再请复核 agent 检查遗漏、风险和错误,最后再汇总。',
+    '- 汇总时保留实际参与的 agent、每个成员的关键结论、风险和未完成事项。',
     '- 不要把协作过程写成聊天剧本;用任务账本呈现真实进度。',
     '',
     '## 最终输出格式',
@@ -94,6 +171,16 @@ export function getSelectedTeamForSend() {
   }
   if (!_agentExists(team.leaderAgentId)) {
     toast(`团队队长 agent 不存在: ${team.leaderAgentId}`, 'error')
+    return false
+  }
+  const missingMembers = _missingAgentIds((team.members || []).map((m) => m.agentId))
+  if (missingMembers.length > 0) {
+    toast(`团队成员 agent 不存在: ${missingMembers.join(', ')}`, 'error')
+    return false
+  }
+  const reviewAgentId = team.policy?.requireReview ? team.policy?.reviewAgentId : ''
+  if (reviewAgentId && !_agentExists(reviewAgentId)) {
+    toast(`团队复核 agent 不存在: ${reviewAgentId}`, 'error')
     return false
   }
   return team
@@ -146,8 +233,14 @@ export function renderTeamsManagementList() {
   if (!wrap) return
   wrap.innerHTML = ''
   if (!state.agentTeams || state.agentTeams.length === 0) {
-    wrap.innerHTML =
-      '<p style="color:var(--fg-muted);font-size:var(--text-sm);margin:0">还没有团队。先创建几个 Agent,再把它们组成团队。</p>'
+    const empty = document.createElement('div')
+    empty.className = 'team-empty-card'
+    empty.innerHTML = `
+      <div class="team-empty-title">还没有团队</div>
+      <p>可以从推荐模板开始,系统会预填队长、成员、复核策略;确认后再保存。</p>
+      <div class="team-template-grid" data-team-template-grid></div>`
+    wrap.appendChild(empty)
+    _renderTemplateButtons(empty.querySelector('[data-team-template-grid]'))
     return
   }
   for (const t of state.agentTeams) {
@@ -169,6 +262,30 @@ export function renderTeamsManagementList() {
     editBtn.onclick = () => openTeamEditor(t.id)
     row.appendChild(editBtn)
     wrap.appendChild(row)
+  }
+}
+
+function _renderTemplateButtons(container) {
+  if (!container) return
+  container.innerHTML = ''
+  for (const template of TEAM_TEMPLATES) {
+    const missing = _missingAgentIds(_templateRequiredAgentIds(template))
+    const btn = document.createElement('button')
+    btn.type = 'button'
+    btn.className = 'team-template-card'
+    btn.disabled = missing.length > 0
+    btn.title = missing.length > 0 ? `缺少 agent: ${missing.join(', ')}` : `使用模板: ${template.name}`
+    btn.innerHTML = `
+      <span class="team-template-badge">${htmlSafeEscape(template.badge)}</span>
+      <strong>${htmlSafeEscape(template.name)}</strong>
+      <span>${htmlSafeEscape(template.description)}</span>
+      ${
+        missing.length > 0
+          ? `<small>缺少: ${htmlSafeEscape(missing.join(', '))}</small>`
+          : '<small>点击预填,保存前可修改</small>'
+      }`
+    btn.addEventListener('click', () => _openTemplate(template))
+    container.appendChild(btn)
   }
 }
 
@@ -216,6 +333,11 @@ export function openTeamEditor(teamId = '') {
   _editingTeamId = team?.id || ''
   $('team-editor').hidden = false
   $('team-editor-title').textContent = team ? `编辑团队: ${team.name || team.id}` : '新建团队'
+  const strip = $('team-template-strip')
+  if (strip) {
+    strip.hidden = Boolean(team)
+    if (!team) _renderTemplateButtons(strip)
+  }
   $('team-id').value = team?.id || ''
   $('team-id').disabled = Boolean(team)
   $('team-name').value = team?.name || ''
@@ -228,9 +350,29 @@ export function openTeamEditor(teamId = '') {
   $('team-delete-btn').hidden = !team
 }
 
+function _openTemplate(template) {
+  const missing = _missingAgentIds(_templateRequiredAgentIds(template))
+  if (missing.length > 0) {
+    toast(`模板不可用,缺少 agent: ${missing.join(', ')}`, 'warning')
+    return
+  }
+  openTeamEditor('')
+  $('team-id').value = _nextAvailableTeamId(template.id)
+  $('team-name').value = template.name
+  $('team-description').value = template.description || ''
+  _fillAgentSelect($('team-leader'), template.leaderAgentId)
+  $('team-members').value = _membersToText(template.members)
+  $('team-max-parallel').value = String(template.policy?.maxParallel || 3)
+  $('team-require-review').checked = Boolean(template.policy?.requireReview)
+  _fillAgentSelect($('team-review-agent'), template.policy?.reviewAgentId || '')
+  toast(`已预填「${template.name}」,确认后点击保存团队`, 'success')
+}
+
 function _closeTeamEditor() {
   _editingTeamId = ''
   $('team-editor').hidden = true
+  const strip = $('team-template-strip')
+  if (strip) strip.hidden = true
 }
 
 async function _saveTeamEditor() {

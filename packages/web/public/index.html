@@ -1418,6 +1418,7 @@
       <div id="teams-list-wrap"></div>
       <div id="team-editor" class="team-editor" hidden>
         <div class="persona-section-label" id="team-editor-title">新建团队</div>
+        <div id="team-template-strip" class="team-template-strip" aria-label="推荐团队模板" hidden></div>
         <div style="display:grid;grid-template-columns:1fr 1fr;gap:var(--space-3);margin-bottom:var(--space-3)">
           <div class="form-row" style="margin:0">
             <label for="team-id">团队 ID</label>
@@ -1451,6 +1452,7 @@
         <div class="form-row">
           <label for="team-members">成员列表</label>
           <textarea id="team-members" placeholder="每行一个: agentId | 角色 | 职责&#10;researcher | 调研 | 搜集资料并列出处&#10;reviewer | 审阅 | 检查风险和遗漏" style="min-height:96px"></textarea>
+          <p class="prefs-hint">每行一个成员。团队运行时只会提示队长委派给这里列出的 agentId。</p>
         </div>
         <div class="team-policy-row">
           <label><input id="team-require-review" type="checkbox" /> 需要复核</label>

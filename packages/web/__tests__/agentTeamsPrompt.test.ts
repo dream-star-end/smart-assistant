@@ -4,6 +4,7 @@ import { resolve } from 'node:path'
 import { describe, it } from 'node:test'
 
 const src = readFileSync(resolve(import.meta.dirname, '..', 'public/modules/agentTeams.js'), 'utf-8')
+const mainSrc = readFileSync(resolve(import.meta.dirname, '..', 'public/modules/main.js'), 'utf-8')
 
 function extractFunction(source: string, name: string): string {
   const lines = source.split('\n')
@@ -27,6 +28,19 @@ const buildTeamRunPrompt = new Function(
   ].join('\n'),
 )() as (team: any, userText: string) => string
 
+const getModelOverrideForSend = new Function(
+  [extractFunction(mainSrc, 'getModelOverrideForSend'), 'return getModelOverrideForSend;'].join('\n'),
+)() as (teamForSend: any, userPrefs: any, agentsList?: any[]) => string | undefined
+
+const missingAgentIds = new Function(
+  [
+    'let existingIds = []',
+    'function _agentExists(id) { return existingIds.includes(id) }',
+    extractFunction(src, '_missingAgentIds'),
+    'return (ids, existing) => { existingIds = existing; return _missingAgentIds(ids) }',
+  ].join('\n'),
+)() as (ids: string[], existing: string[]) => string[]
+
 describe('agent team prompt builder', () => {
   it('includes only configured leader and members and preserves the user goal', () => {
     const prompt = buildTeamRunPrompt(
@@ -49,7 +63,59 @@ describe('agent team prompt builder', () => {
     assert.match(prompt, /- reviewer: 审阅 — 检查风险/)
     assert.match(prompt, /最多同时推进 2 条子任务/)
     assert.match(prompt, /优先请 reviewer 复核/)
+    assert.match(prompt, /任务账本/)
+    assert.match(prompt, /goal=\.\.\., agentId=\.\.\., context=\.\.\./)
+    assert.match(prompt, /实际参与的 agent/)
     assert.match(prompt, /给仓库加一个导出 PDF 功能/)
     assert.doesNotMatch(prompt, /researcher/)
+  })
+
+  it('suppresses user default model override during team runs so leader routing is preserved', () => {
+    assert.equal(
+      getModelOverrideForSend(
+        { id: 'dev_team', leaderAgentId: 'main' },
+        { default_model: 'gpt-5.5' },
+        [{ id: 'main', provider: 'minimax', model: 'MiniMax-M3' }],
+      ),
+      undefined,
+    )
+    assert.equal(getModelOverrideForSend(null, { default_model: 'gpt-5.5' }), 'gpt-5.5')
+    assert.equal(getModelOverrideForSend(null, { default_model: '' }), undefined)
+    assert.equal(
+      getModelOverrideForSend(
+        { id: 'codex_team', leaderAgentId: 'codex' },
+        { default_model: 'MiniMax-M3' },
+        [{ id: 'codex', provider: 'codex-native', model: 'gpt-5.5' }],
+      ),
+      'gpt-5.5',
+    )
+  })
+
+  it('adds a configured review agent to the allowed delegation list when it is not a member', () => {
+    const prompt = buildTeamRunPrompt(
+      {
+        id: 'review_team',
+        name: '复核队',
+        leaderAgentId: 'main',
+        members: [{ agentId: 'coder', role: '实现', responsibility: '产出草案' }],
+        policy: { maxParallel: 1, requireReview: true, reviewAgentId: 'reviewer' },
+      },
+      '写一个说明',
+    )
+
+    assert.match(prompt, /- coder: 实现 — 产出草案/)
+    assert.match(prompt, /- reviewer: 复核 — 检查草案的遗漏、风险和错误/)
+    assert.match(prompt, /优先请 reviewer 复核/)
+  })
+
+  it('tracks stale team members/review agents and exposes disabled template affordances', () => {
+    assert.deepEqual(
+      missingAgentIds(['main', 'coder', 'coder', 'reviewer'], ['main', 'reviewer']),
+      ['coder'],
+    )
+    assert.match(src, /团队成员 agent 不存在/)
+    assert.match(src, /团队复核 agent 不存在/)
+    assert.match(src, /TEAM_TEMPLATES/)
+    assert.match(src, /btn\.disabled = missing\.length > 0/)
   })
 })

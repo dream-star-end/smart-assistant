@@ -1191,6 +1191,29 @@ function buildMessageText(userText, attachments) {
 }
 
 // ── send ──
+export function getModelOverrideForSend(
+  teamForSend,
+  userPrefs = state.userPrefs,
+  agentsList,
+) {
+  // Team mode is agent-owned routing: the selected team's leaderAgentId must
+  // decide the runner/model. If we also send the user's global default_model
+  // (e.g. gpt-5.5), gateway model inference can reroute the turn to `codex`
+  // and bypass the leader entirely. Non-team sends keep the normal model
+  // picker behavior unchanged. Exception: a codex-native leader must still
+  // carry an explicit GPT model because gateway rejects codex-native turns
+  // without a model authz signal.
+  if (teamForSend) {
+    const leader = (agentsList || state.agentsList || []).find((a) => a.id === teamForSend.leaderAgentId)
+    if (leader?.provider === 'codex-native' || leader?.id === 'codex') {
+      return leader?.model || 'gpt-5.5'
+    }
+    return undefined
+  }
+  const prefModel = userPrefs?.default_model
+  return typeof prefModel === 'string' && prefModel ? prefModel : undefined
+}
+
 function send() {
   const text = $('input').value.trim()
   if (!text && state.attachments.length === 0) return
@@ -1235,10 +1258,10 @@ function send() {
     }))
   const effortLevel = getEffortForSubmit()
   const conversationMode = getConversationModeForSubmit(text, state.attachments)
-  // v1.0.4 — frame.model 从 user prefs 取(C 方案)。空字符串视同未设。
-  // server.ts WS 入口对此值做静态白名单兜底,前端无需 validate。
-  const _prefModel = state.userPrefs?.default_model
-  const modelOverride = typeof _prefModel === 'string' && _prefModel ? _prefModel : undefined
+  // v1.0.4 — 非团队消息的 frame.model 从 user prefs 取(C 方案)。团队消息
+  // 必须让 leader agent 的配置决定模型,否则 default_model=gpt-5.5 会被
+  // inferAgentForModel 重路由到 codex,绕过 team.leaderAgentId。
+  const modelOverride = getModelOverrideForSend(teamForSend)
   const wsPayload = {
     type: 'inbound.message',
     idempotencyKey: `web-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
