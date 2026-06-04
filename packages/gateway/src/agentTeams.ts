@@ -14,6 +14,20 @@ export function sanitizeTeamText(value: unknown, maxLen: number): string | undef
   return text || undefined
 }
 
+export function sanitizeTeamPrompt(value: unknown, maxLen: number): string | undefined {
+  if (typeof value !== 'string') return undefined
+  const text = value
+    .replace(/\r\n?/g, '\n')
+    .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, ' ')
+    .split('\n')
+    .map((line) => line.replace(/\s+/g, ' ').trim())
+    .join('\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim()
+    .slice(0, maxLen)
+  return text || undefined
+}
+
 export function normalizeTeamPolicy(input: any, agentIds: Set<string>): AgentTeamPolicy | undefined {
   if (!input || typeof input !== 'object') return undefined
   const policy: AgentTeamPolicy = {}
@@ -75,8 +89,10 @@ export function normalizeAgentTeamInput(
     const member: AgentTeamMemberDef = { agentId }
     const role = sanitizeTeamText(m?.role, 40)
     const responsibility = sanitizeTeamText(m?.responsibility, 200)
+    const rolePrompt = sanitizeTeamPrompt(m?.rolePrompt, 1200)
     if (role) member.role = role
     if (responsibility) member.responsibility = responsibility
+    if (rolePrompt) member.rolePrompt = rolePrompt
     return member
   })
 
@@ -89,6 +105,10 @@ export function normalizeAgentTeamInput(
   }
   const description = sanitizeTeamText(input.description, 300)
   if (description) team.description = description
+  const leaderRole = sanitizeTeamText(input.leaderRole, 40)
+  if (leaderRole) team.leaderRole = leaderRole
+  const leaderPrompt = sanitizeTeamPrompt(input.leaderPrompt, 1200)
+  if (leaderPrompt) team.leaderPrompt = leaderPrompt
   const policy = normalizeTeamPolicy(input.policy, agentIds)
   if (policy) team.policy = policy
   return team

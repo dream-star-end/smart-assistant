@@ -1441,6 +1441,14 @@
           <label for="team-description">说明</label>
           <input id="team-description" placeholder="团队擅长的任务与边界" maxlength="300" />
         </div>
+        <div class="form-row">
+          <label for="team-leader-role">队长角色</label>
+          <input id="team-leader-role" placeholder="如: 科研项目负责人 / 技术负责人" maxlength="40" />
+        </div>
+        <div class="form-row">
+          <label for="team-leader-prompt">队长角色提示词</label>
+          <textarea id="team-leader-prompt" placeholder="定义队长如何拆解任务、何时委派、如何汇总和复核" maxlength="1200" style="min-height:88px"></textarea>
+        </div>
         <div style="display:grid;grid-template-columns:1fr 1fr;gap:var(--space-3);margin-bottom:var(--space-3)">
           <div class="form-row" style="margin:0">
             <label for="team-leader">队长 Agent</label>
@@ -1459,8 +1467,8 @@
         </div>
         <div class="form-row">
           <label for="team-members">成员列表</label>
-          <textarea id="team-members" placeholder="每行一个: agentId | 角色 | 职责&#10;researcher | 调研 | 搜集资料并列出处&#10;reviewer | 审阅 | 检查风险和遗漏" style="min-height:96px"></textarea>
-          <p class="prefs-hint">每行一个成员。团队运行时只会提示队长委派给这里列出的 agentId。</p>
+          <textarea id="team-members" placeholder="每行一个: agentId | 角色 | 职责 | 角色提示词&#10;researcher | 文献研究员 | 检索资料并列出处 | 区分已证实结论、假设和争议&#10;reviewer | 证据审稿人 | 检查风险和遗漏 | 只列阻塞问题和可信度判断" style="min-height:132px"></textarea>
+          <p class="prefs-hint">每行一个成员。第四段是该 Agent 在当前团队里的专属角色提示词，同一 Agent 在不同团队可以不同。</p>
         </div>
         <div class="team-policy-row">
           <label><input id="team-require-review" type="checkbox" /> 需要复核</label>

@@ -4720,7 +4720,7 @@ a:hover {
 .team-template-grid,
 .team-template-strip {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: var(--space-2);
 }
 .team-template-card {
@@ -4757,6 +4757,7 @@ a:hover {
 }
 .team-template-card strong,
 .team-template-card span,
+.team-template-card em,
 .team-template-card small {
   display: block;
 }
@@ -4769,6 +4770,13 @@ a:hover {
   color: var(--fg-muted);
   font-size: var(--text-xs);
   line-height: 1.35;
+}
+.team-template-card em {
+  margin-top: 8px;
+  color: color-mix(in srgb, var(--fg) 78%, var(--fg-muted));
+  font-size: 11px;
+  font-style: normal;
+  line-height: 1.4;
 }
 .team-template-card small {
   margin-top: 8px;
