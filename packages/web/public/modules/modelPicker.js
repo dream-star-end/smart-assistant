@@ -83,8 +83,8 @@ function positionMenu() {
   const rect = trigger.getBoundingClientRect()
   menu.style.position = 'fixed'
   menu.style.bottom = `${Math.max(0, window.innerHeight - rect.top + 6)}px`
-  const menuMinWidth = 360
-  const maxLeft = Math.max(8, window.innerWidth - menuMinWidth - 8)
+  const menuWidth = Math.max(360, Math.min(menu.getBoundingClientRect().width || 560, window.innerWidth - 16))
+  const maxLeft = Math.max(8, window.innerWidth - menuWidth - 8)
   menu.style.left = `${Math.min(rect.left, maxLeft)}px`
   menu.style.right = 'auto'
   menu.style.top = 'auto'
@@ -258,29 +258,6 @@ async function ensureMenuRendered() {
     menu.appendChild(empty)
   }
 
-  const modelHead = document.createElement('div')
-  modelHead.className = 'target-menu-subhead'
-  modelHead.textContent = `运行模型 · ${agentLabel(getCurrentAgent())}`
-  menu.appendChild(modelHead)
-  for (const m of (_modelsCache || [])) {
-    if (!m.id) continue
-    const dn = String(m.display_name || m.id)
-    const hint = m.id === 'claude-opus-4-7'
-      ? '深度推理 · 默认推荐'
-      : m.id === 'claude-sonnet-4-6'
-        ? '更便宜 · 适合常规任务'
-        : '切换后应用到单 Agent 发送'
-    menu.appendChild(optionButton({
-      type: 'model',
-      id: String(m.id),
-      icon: '◈',
-      title: dn,
-      hint,
-      meta: String(m.id),
-      selected: !currentTeamId && m.id === currentModel,
-    }))
-  }
-
   menu.appendChild(section('多 Agent', '选择团队后，本条消息会由队长分派成员协作并汇总。'))
   const teams = state.agentTeams || []
   if (teams.length === 0) {
@@ -315,6 +292,29 @@ async function ensureMenuRendered() {
       row.appendChild(edit)
       menu.appendChild(row)
     }
+  }
+
+  const modelHead = document.createElement('div')
+  modelHead.className = 'target-menu-subhead target-menu-subhead--models'
+  modelHead.textContent = `运行模型 · ${agentLabel(getCurrentAgent())}`
+  menu.appendChild(modelHead)
+  for (const m of (_modelsCache || [])) {
+    if (!m.id) continue
+    const dn = String(m.display_name || m.id)
+    const hint = m.id === 'claude-opus-4-7'
+      ? '深度推理 · 默认推荐'
+      : m.id === 'claude-sonnet-4-6'
+        ? '更便宜 · 适合常规任务'
+        : '切换后应用到单 Agent 发送'
+    menu.appendChild(optionButton({
+      type: 'model',
+      id: String(m.id),
+      icon: '',
+      title: dn,
+      hint,
+      meta: String(m.id),
+      selected: !currentTeamId && m.id === currentModel,
+    }))
   }
 }
 
