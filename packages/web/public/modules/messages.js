@@ -1,11 +1,11 @@
 // OpenClaude — Message rendering and display
-import { _openTopupModal } from './billing.js?v=524e815a'
-import { $, _mod, fallbackCopy, htmlSafeEscape } from './dom.js?v=524e815a'
-import { getEffortForSubmit } from './effortMode.js?v=524e815a'
-import { refreshPlanPanel } from './planPanel.js?v=524e815a'
-import { getConversationModeForSubmit, requestDefaultNextSubmit } from './planMode.js?v=524e815a'
-import { exportMessageDocx } from './export-docx.js?v=524e815a'
-import { exportMessageTex } from './export-tex.js?v=524e815a'
+import { _openTopupModal } from './billing.js?v=d957336c'
+import { $, _mod, fallbackCopy, htmlSafeEscape } from './dom.js?v=d957336c'
+import { getEffortForSubmit } from './effortMode.js?v=d957336c'
+import { refreshPlanPanel } from './planPanel.js?v=d957336c'
+import { getConversationModeForSubmit, requestDefaultNextSubmit } from './planMode.js?v=d957336c'
+import { exportMessageDocx } from './export-docx.js?v=d957336c'
+import { exportMessageTex } from './export-tex.js?v=d957336c'
 import {
   clearChartInstances,
   embedMediaUrls,
@@ -13,12 +13,12 @@ import {
   renderMarkdown,
   _renderLocalMedia,
   renderStreamingMarkdown,
-} from './markdown.js?v=524e815a'
-import { getSession, state, tryEnqueueOffline, MAX_OFFLINE_QUEUE } from './state.js?v=524e815a'
-import { toast } from './ui.js?v=524e815a'
-import { parsePartialJson } from './partialJson.js?v=524e815a'
-import { msgTimeLabel, shortTime } from './util.js?v=524e815a'
-import { formatMeta, safeWsSend, _resetTurnBillingState } from './websocket.js?v=524e815a'
+} from './markdown.js?v=d957336c'
+import { getSession, state, tryEnqueueOffline, MAX_OFFLINE_QUEUE } from './state.js?v=d957336c'
+import { toast } from './ui.js?v=d957336c'
+import { parsePartialJson } from './partialJson.js?v=d957336c'
+import { msgTimeLabel, shortTime } from './util.js?v=d957336c'
+import { formatMeta, safeWsSend, _resetTurnBillingState } from './websocket.js?v=d957336c'
 
 // ── Export helpers for save-as feature ──
 const _EXPORT_CSS =
