@@ -5,6 +5,7 @@ import { describe, it } from 'node:test'
 
 const src = readFileSync(resolve(import.meta.dirname, '..', 'public/modules/agentTeams.js'), 'utf-8')
 const mainSrc = readFileSync(resolve(import.meta.dirname, '..', 'public/modules/main.js'), 'utf-8')
+const agentsSrc = readFileSync(resolve(import.meta.dirname, '..', 'public/modules/agents.js'), 'utf-8')
 
 function extractFunction(source: string, name: string): string {
   const lines = source.split('\n')
@@ -108,7 +109,7 @@ describe('agent team prompt builder', () => {
     assert.match(prompt, /优先请 reviewer 复核/)
   })
 
-  it('tracks stale team members/review agents and exposes disabled template affordances', () => {
+  it('tracks stale team members/review agents while keeping templates prefillable', () => {
     assert.deepEqual(
       missingAgentIds(['main', 'coder', 'coder', 'reviewer'], ['main', 'reviewer']),
       ['coder'],
@@ -116,6 +117,22 @@ describe('agent team prompt builder', () => {
     assert.match(src, /团队成员 agent 不存在/)
     assert.match(src, /团队复核 agent 不存在/)
     assert.match(src, /TEAM_TEMPLATES/)
-    assert.match(src, /btn\.disabled = missing\.length > 0/)
+    assert.doesNotMatch(src, /btn\.disabled = missing\.length > 0/)
+    assert.match(src, /仍可点击预填/)
+    assert.doesNotMatch(src, /模板不可用,缺少 agent/)
+  })
+
+  it('commercial fallback agents include the seeded collaboration agents', () => {
+    assert.match(agentsSrc, /COMMERCIAL_FALLBACK_AGENTS/)
+    assert.match(agentsSrc, /id: 'researcher'/)
+    assert.match(agentsSrc, /id: 'coder'/)
+    assert.match(agentsSrc, /id: 'reviewer'/)
+    assert.match(agentsSrc, /id: 'codex'/)
+    assert.match(agentsSrc, /provider: 'minimax'/)
+    assert.match(agentsSrc, /provider: 'codex-native'/)
+    assert.match(agentsSrc, /_isLimitedCommercialAgentList/)
+    assert.match(agentsSrc, /_mergeCommercialFallbackAgents/)
+    assert.match(agentsSrc, /state\.agentsListIsFallback = true/)
+    assert.match(src, /state\.agentsListIsFallback/)
   })
 })

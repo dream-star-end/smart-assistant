@@ -13,29 +13,92 @@ export function setRenderModelPill(fn) {
   if (typeof fn === 'function') _renderModelPill = fn
 }
 
+const COMMERCIAL_FALLBACK_AGENTS = Object.freeze([
+  {
+    id: 'main',
+    displayName: 'MiniMax M3 助手',
+    avatarEmoji: '🧠',
+    model: 'MiniMax-M3',
+    provider: 'minimax',
+  },
+  {
+    id: 'researcher',
+    displayName: '资料研究员',
+    avatarEmoji: '🔎',
+    model: 'MiniMax-M3',
+    provider: 'minimax',
+  },
+  {
+    id: 'coder',
+    displayName: '代码工程师',
+    avatarEmoji: '🛠️',
+    model: 'MiniMax-M3',
+    provider: 'minimax',
+  },
+  {
+    id: 'reviewer',
+    displayName: '审阅员',
+    avatarEmoji: '🧪',
+    model: 'MiniMax-M3',
+    provider: 'minimax',
+  },
+  {
+    id: 'codex',
+    displayName: 'GPT 5.5 (Codex)',
+    avatarEmoji: '🤖',
+    model: 'gpt-5.5',
+    provider: 'codex-native',
+  },
+])
+
+function _mergeCommercialFallbackAgents(agents = []) {
+  const byId = new Map()
+  for (const agent of Array.isArray(agents) ? agents : []) {
+    if (agent?.id) byId.set(agent.id, agent)
+  }
+  for (const fallback of COMMERCIAL_FALLBACK_AGENTS) {
+    if (!byId.has(fallback.id)) byId.set(fallback.id, { ...fallback })
+  }
+  return Array.from(byId.values())
+}
+
+function _isLimitedCommercialAgentList(agents = [], defaultAgentId = 'main') {
+  return (
+    defaultAgentId === 'main' &&
+    Array.isArray(agents) &&
+    agents.length <= 1 &&
+    (agents.length === 0 || agents[0]?.id === 'main')
+  )
+}
+
 export async function reloadAgents() {
   try {
     const data = await apiGet('/api/agents')
-    state.agentsList = data.agents || []
     state.defaultAgentId = data.default || 'main'
+    const agents = Array.isArray(data.agents) ? data.agents : []
+    if (_isLimitedCommercialAgentList(agents, state.defaultAgentId)) {
+      // Some commercial user paths still return only `main` even though the
+      // runtime seeds collaboration agents. Keep team templates usable and let
+      // backend save/send validation remain authoritative.
+      state.agentsList = _mergeCommercialFallbackAgents(agents)
+      state.agentsListIsFallback = true
+    } else {
+      state.agentsList = agents
+      state.agentsListIsFallback = false
+    }
     // commercial admin 才能切 agent — 普通用户即便成功也只有 main,没意义就隐藏。
     const sel = $('agent-select')
-    if (sel) sel.hidden = state.agentsList.length <= 1
+    if (sel) sel.hidden = state.agentsListIsFallback || state.agentsList.length <= 1
   } catch (err) {
     // v3 商用版 P0 防火墙对非 admin 用户把 /api/agents 403 掉了(见
     // packages/commercial/src/http/router.ts BLOCKED_FOR_USER_RULES)。前端
-    // 拿不到列表时必须回落一个 main agent,否则 state.agentsList.find(...) 全 undefined:
+    // 拿不到列表时必须回落到商业版 seed agents,否则 state.agentsList.find(...) 全 undefined:
     //   - effortMode.getCurrentAgentModel() → '' → 思考深度 pill 一直隐藏
     //   - renderAgentDropdown / setCurrentSessionId / websocket.restoreTurnState
-    //     拿 agentInfo 都会失败。顶栏那个切换下拉同时隐掉 —— 只有 main 没得切。
-    console.warn('load agents failed (commercial non-admin → fallback main):', err)
-    state.agentsList = [{
-      id: 'main',
-      displayName: 'MiniMax M3 助手',
-      avatarEmoji: '🧠',
-      model: 'MiniMax-M3',
-      provider: 'minimax',
-    }]
+    //     拿 agentInfo 都会失败。顶栏那个切换下拉仍隐掉,避免把占位列表当成可编辑真列表。
+    console.warn('load agents failed (commercial non-admin → fallback seeded agents):', err)
+    state.agentsList = _mergeCommercialFallbackAgents()
+    state.agentsListIsFallback = true
     state.defaultAgentId = 'main'
     const sel = $('agent-select')
     if (sel) sel.hidden = true
@@ -69,6 +132,12 @@ export function renderAgentsManagementList() {
   const wrap = $('agents-list-wrap')
   if (!wrap) return
   wrap.innerHTML = ''
+  if (state.agentsListIsFallback) {
+    const hint = document.createElement('p')
+    hint.className = 'prefs-hint'
+    hint.textContent = 'Agent 列表暂用商业版默认占位；团队保存和运行仍以后端实际配置为准。'
+    wrap.appendChild(hint)
+  }
   if (state.agentsList.length === 0) {
     wrap.innerHTML =
       '<p style="color:var(--fg-muted);font-size:var(--text-sm);margin:0">没有 agents</p>'
@@ -99,7 +168,12 @@ export function renderAgentsManagementList() {
     editBtn.style.minHeight = '38px'
     editBtn.style.fontSize = 'var(--text-sm)'
     editBtn.textContent = '编辑'
-    editBtn.onclick = () => openPersonaEditor(a.id)
+    if (state.agentsListIsFallback) {
+      editBtn.disabled = true
+      editBtn.title = '当前是默认占位列表，暂不能编辑'
+    } else {
+      editBtn.onclick = () => openPersonaEditor(a.id)
+    }
     row.appendChild(info)
     row.appendChild(editBtn)
     wrap.appendChild(row)
