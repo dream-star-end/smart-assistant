@@ -278,6 +278,11 @@ export function clearTurnTiming(sess) {
   if (!sess) return
   sess._turnStartedAt = null
   sess._lastFrameAt = null
+  // Team selection is a turn-scoped execution target.  The global picker can
+  // change while a turn is running, so typing labels read this session field
+  // instead of state.selectedTeamId and must clear it with the rest of turn
+  // timing state.
+  sess._activeTeamRun = null
   // 2026-04-30 v1.0.54 — cold-start hint 也是 turn 级状态:turn 收尾(isFinal/stop/stuck)
   // 必须清掉,避免下一轮没必要地继续显示 "容器首次加载中"。挂在这里覆盖所有 teardown
   // 路径(handleOutbound isFinal / outbound.error / sendStop / handleResumeFailed)。
@@ -295,6 +300,19 @@ function _coldHintSuffix(sess) {
   return sess && sess._isFirstTurnAfterReady ? ' · 容器首次加载中,稍候' : ''
 }
 
+function _typingDisplayTarget(sess) {
+  const team = sess?._activeTeamRun
+  if (team && (team.name || team.id)) {
+    return { avatar: '👥', name: `团队: ${team.name || team.id}` }
+  }
+  const agentId = sess?.agentId || state.defaultAgentId
+  const agentInfo = state.agentsList.find((a) => a.id === agentId)
+  return {
+    avatar: agentInfo?.avatarEmoji || 'O',
+    name: agentInfo?.displayName || agentId || 'AI',
+  }
+}
+
 export function showTypingIndicator() {
   const inner = _deps.ensureInner()
   if (inner.querySelector('.typing-indicator')) return
@@ -302,9 +320,9 @@ export function showTypingIndicator() {
   el.className = 'typing-indicator'
   el.id = '__typing'
   const sess = getSession()
-  const agentInfo = state.agentsList.find((a) => a.id === (sess?.agentId || state.defaultAgentId))
-  const av = htmlSafeEscape(agentInfo?.avatarEmoji || 'O')
-  const name = agentInfo?.displayName || sess?.agentId || 'AI'
+  const target = _typingDisplayTarget(sess)
+  const av = htmlSafeEscape(target.avatar)
+  const name = target.name
   const hint = _coldHintSuffix(sess)
   el.innerHTML = `<div class="avatar">${av}</div><div class="typing-dots"><span></span><span></span><span></span></div><span class="typing-label">${htmlSafeEscape(name)} 思考中${htmlSafeEscape(hint)}</span>`
   // Bind to the session that owned the current view when the indicator was created,
@@ -319,6 +337,10 @@ export function showTypingIndicator() {
     const startedAt = _sess?._turnStartedAt || Date.now()
     const lastFrame = _sess?._lastFrameAt || Date.now()
     const secs = Math.round((Date.now() - startedAt) / 1000)
+    const target = _typingDisplayTarget(_sess)
+    const name = target.name
+    const avatar = el.querySelector('.avatar')
+    if (avatar) avatar.textContent = target.avatar
     const label = el.querySelector('.typing-label')
     if (!label) return
     const silenceMs = Date.now() - lastFrame
@@ -3187,8 +3209,7 @@ function handleColdStart(_frame) {
   if (!label) return
   // 已进入长思考态(stale-warn / stale-danger)时文案已有自己的语义,不再叠 cold-hint。
   if (el.classList.contains('stale-warn') || el.classList.contains('stale-danger')) return
-  const agentInfo = state.agentsList.find((a) => a.id === (sess.agentId || state.defaultAgentId))
-  const name = agentInfo?.displayName || sess.agentId || 'AI'
+  const name = _typingDisplayTarget(sess).name
   const startedAt = sess._turnStartedAt || Date.now()
   const secs = Math.round((Date.now() - startedAt) / 1000)
   label.textContent = secs >= 5
@@ -3240,8 +3261,7 @@ function handleOutboundTurnStatus(frame) {
   if (!el) return
   const label = el.querySelector('.typing-label')
   if (!label) return
-  const agentInfo = state.agentsList.find((a) => a.id === (sess.agentId || state.defaultAgentId))
-  const name = agentInfo?.displayName || sess.agentId || 'AI'
+  const name = _typingDisplayTarget(sess).name
   const startedAt = sess._turnStartedAt || Date.now()
   const secs = Math.round((Date.now() - startedAt) / 1000)
   if (status === 'compacting') {

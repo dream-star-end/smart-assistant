@@ -5,7 +5,7 @@
  */
 import * as assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
-import { classifyRunError } from '../errorClassify.js'
+import { classifyDelegateOutputError, classifyRunError } from '../errorClassify.js'
 
 describe('classifyRunError', () => {
   it('insufficient_credits: anthropicProxy 402 INSUFFICIENT_CREDITS', () => {
@@ -62,5 +62,27 @@ describe('classifyRunError', () => {
     // 同时包含的字符串以最先匹配的为准 —— PATTERNS 顺序定义优先级
     const r = classifyRunError('something something INSUFFICIENT_CREDITS something')
     assert.equal(r.code, 'insufficient_credits')
+  })
+
+  it('delegate output: API Error 402 is treated as a failed delegation', () => {
+    const r = classifyDelegateOutputError(
+      'API Error: 402 {"error":{"code":"INSUFFICIENT_CREDITS","message":"insufficient credits: balance=284 required=293"}}',
+    )
+    assert.ok(r)
+    assert.equal(r.code, 'insufficient_credits')
+    assert.equal(r.message, '余额不足,请充值后继续')
+  })
+
+  it('delegate output: API Error 400 BAD_BODY is treated as bad_request', () => {
+    const r = classifyDelegateOutputError(
+      'API Error: 400 {"error":{"code":"BAD_BODY","message":"invalid request body"}}',
+    )
+    assert.ok(r)
+    assert.equal(r.code, 'bad_request')
+    assert.equal(r.message, '子 agent 请求体无效,请降低思考深度或稍后重试')
+  })
+
+  it('delegate output: ordinary prose mentioning API Error is not classified', () => {
+    assert.equal(classifyDelegateOutputError('请在文档里解释 API Error 这个概念'), null)
   })
 })
