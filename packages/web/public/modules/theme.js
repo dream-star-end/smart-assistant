@@ -15,6 +15,16 @@ export function effectiveTheme() {
   return saved
 }
 
+export function mermaidConfigForTheme(theme = effectiveTheme()) {
+  return {
+    startOnLoad: false,
+    theme: theme === 'light' ? 'default' : 'dark',
+    securityLevel: 'strict',
+    htmlLabels: false,
+    flowchart: { htmlLabels: false },
+  }
+}
+
 export function applyTheme() {
   const theme = effectiveTheme()
   document.documentElement.dataset.theme = theme
@@ -44,11 +54,7 @@ export function applyTheme() {
   // Re-init mermaid for theme
   if (window.mermaid) {
     try {
-      mermaid.initialize({
-        startOnLoad: false,
-        theme: theme === 'light' ? 'default' : 'dark',
-        securityLevel: 'strict',
-      })
+      mermaid.initialize(mermaidConfigForTheme(theme))
     } catch {}
   }
 }

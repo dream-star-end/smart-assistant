@@ -1,7 +1,7 @@
 // OpenClaude — Markdown rendering, media embedding, rich blocks
 import { htmlSafeEscape } from './dom.js?v=9a682922'
 import { TRANSPARENT_PIXEL_DATA_URL, getCachedSignedUrl } from './mediaSign.js?v=9a682922'
-import { effectiveTheme } from './theme.js?v=9a682922'
+import { effectiveTheme, mermaidConfigForTheme } from './theme.js?v=9a682922'
 import { _basename } from './util.js?v=9a682922'
 
 // ── Mermaid lazy loader ──
@@ -16,11 +16,7 @@ async function ensureMermaid() {
   _mermaidLoadPromise = new Promise((resolve, reject) => {
     const _doInit = () => {
       try {
-        mermaid.initialize({
-          startOnLoad: false,
-          theme: effectiveTheme() === 'light' ? 'default' : 'dark',
-          securityLevel: 'strict',
-        })
+        mermaid.initialize(mermaidConfigForTheme(effectiveTheme()))
         _mermaidInitialized = true
         resolve()
       } catch (err) {
