@@ -174,6 +174,7 @@ export interface AgentTeamMemberDef {
   agentId: string
   role?: string
   responsibility?: string
+  rolePrompt?: string
 }
 
 export interface AgentTeamPolicy {
@@ -187,6 +188,8 @@ export interface AgentTeamDef {
   name: string
   description?: string
   leaderAgentId: string
+  leaderRole?: string
+  leaderPrompt?: string
   members: AgentTeamMemberDef[]
   policy?: AgentTeamPolicy
   updatedAt?: string

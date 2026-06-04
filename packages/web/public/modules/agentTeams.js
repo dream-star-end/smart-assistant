@@ -9,41 +9,72 @@ let _editingTeamId = ''
 
 const TEAM_TEMPLATES = [
   {
-    id: 'dev_team',
-    name: '研发协作队',
-    description: '适合代码实现、调研和审阅闭环',
+    id: 'science_research_team',
+    name: '科研协作团队',
+    description: '适合文献调研、实验/数据分析、论文思路和证据复核',
     leaderAgentId: 'main',
+    leaderRole: '科研项目负责人',
+    leaderPrompt:
+      '先把研究问题拆成可验证子问题，明确证据标准和交付物。只把需要外部资料、数据脚本或独立复核的任务委派出去，要求成员返回来源、方法、局限和不确定性。最终按研究结论、证据链、局限和下一步实验组织输出。',
     members: [
-      { agentId: 'coder', role: '实现', responsibility: '阅读代码、做最小必要修改并说明改动文件' },
-      { agentId: 'reviewer', role: '审阅', responsibility: '检查正确性、边界条件和过度工程风险' },
-    ],
-    policy: { maxParallel: 2, requireReview: true, reviewAgentId: 'reviewer' },
-    badge: '代码任务',
-  },
-  {
-    id: 'research_team',
-    name: '研究分析队',
-    description: '适合资料搜集、论文/PDF 分析和结论复核',
-    leaderAgentId: 'main',
-    members: [
-      { agentId: 'researcher', role: '调研', responsibility: '搜集资料、阅读文档/PDF 并列出来源' },
-      { agentId: 'reviewer', role: '复核', responsibility: '检查论证链、遗漏和不确定性' },
-    ],
-    policy: { maxParallel: 2, requireReview: true, reviewAgentId: 'reviewer' },
-    badge: '研究任务',
-  },
-  {
-    id: 'full_stack_team',
-    name: '全栈协作队',
-    description: '适合从需求拆解到实现、验证、复盘的完整任务',
-    leaderAgentId: 'main',
-    members: [
-      { agentId: 'researcher', role: '调研', responsibility: '确认背景、约束和可复用资料' },
-      { agentId: 'coder', role: '实现', responsibility: '落地修改或生成交付物' },
-      { agentId: 'reviewer', role: '复核', responsibility: '最终审阅风险、验证和下一步' },
+      {
+        agentId: 'researcher',
+        role: '文献研究员',
+        responsibility: '检索资料、阅读论文/文档并列出可靠来源',
+        rolePrompt:
+          '围绕研究问题检索和筛选高可信资料，区分已证实结论、假设和争议。输出必须包含来源线索、关键证据、适用边界和仍需验证的问题。',
+      },
+      {
+        agentId: 'coder',
+        role: '数据与图表工程师',
+        responsibility: '处理数据、设计分析脚本或复现实验步骤',
+        rolePrompt:
+          '把研究问题转成可执行的数据处理、统计分析、可视化或复现实验步骤。优先给出最小可验证脚本、输入输出说明、指标含义和失败风险。',
+      },
+      {
+        agentId: 'reviewer',
+        role: '证据审稿人',
+        responsibility: '复核证据链、方法漏洞、夸大结论和遗漏',
+        rolePrompt:
+          '像严格审稿人一样检查证据是否支撑结论，指出样本、方法、因果、统计和引用层面的弱点。不要重写答案，优先列出阻塞性问题和可信度判断。',
+      },
     ],
     policy: { maxParallel: 3, requireReview: true, reviewAgentId: 'reviewer' },
-    badge: '端到端',
+    badge: '科研',
+  },
+  {
+    id: 'programming_team',
+    name: '编程协作团队',
+    description: '适合需求拆解、技术调研、代码实现、测试和审查闭环',
+    leaderAgentId: 'main',
+    leaderRole: '技术负责人',
+    leaderPrompt:
+      '先确认需求、约束、影响范围和验收标准，再把可并行的调研、实现、审查任务委派给合适成员。保持最小改动和可验证交付，避免过度工程。最终说明改动点、验证结果、风险和后续建议。',
+    members: [
+      {
+        agentId: 'researcher',
+        role: '技术调研工程师',
+        responsibility: '查官方文档、现有实现、依赖约束和可选方案',
+        rolePrompt:
+          '优先查官方文档、仓库现有模式和真实约束，给出可执行方案对比。输出要包含推荐方案、关键依据、兼容性风险和不建议采用的方案理由。',
+      },
+      {
+        agentId: 'coder',
+        role: '实现工程师',
+        responsibility: '按既有架构做最小必要代码修改并自测',
+        rolePrompt:
+          '先读相关代码和测试，再按项目约定做最小必要实现。不要扩大需求或重构无关模块。输出改动文件、核心逻辑、已跑验证和未覆盖风险。',
+      },
+      {
+        agentId: 'reviewer',
+        role: '质量审查工程师',
+        responsibility: '检查正确性、边界、回归风险和测试覆盖',
+        rolePrompt:
+          '从正确性、回归风险、安全边界、测试覆盖和过度工程角度审查。区分阻塞问题和非阻塞建议，避免提出与需求无关的范围扩张。',
+      },
+    ],
+    policy: { maxParallel: 3, requireReview: true, reviewAgentId: 'reviewer' },
+    badge: '编程',
   },
 ]
 
@@ -51,6 +82,18 @@ function _cleanPromptText(value, maxLen = 1000) {
   return String(value || '')
     .replace(/[\u0000-\u001f\u007f]/g, ' ')
     .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, maxLen)
+}
+
+function _cleanBlockText(value, maxLen = 1200) {
+  return String(value || '')
+    .replace(/\r\n?/g, '\n')
+    .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, ' ')
+    .split('\n')
+    .map((line) => line.replace(/\s+/g, ' ').trim())
+    .join('\n')
+    .replace(/\n{3,}/g, '\n\n')
     .trim()
     .slice(0, maxLen)
 }
@@ -78,6 +121,12 @@ function _templateRequiredAgentIds(template) {
     ...(template.members || []).map((m) => m.agentId),
     template.policy?.reviewAgentId,
   ].filter(Boolean)
+}
+
+function _templateRoleSummary(template) {
+  return (template.members || [])
+    .map((m) => `${m.agentId}/${m.role || '成员'}`)
+    .join(' · ')
 }
 
 function _nextAvailableTeamId(baseId) {
@@ -108,7 +157,9 @@ function _memberLines(team) {
     .map((m) => {
       const role = _cleanPromptText(m.role, 40) || '成员'
       const resp = _cleanPromptText(m.responsibility, 200)
-      return `- ${m.agentId}: ${role}${resp ? ` — ${resp}` : ''}`
+      const rolePrompt = _cleanBlockText(m.rolePrompt, 1200)
+      const promptLine = rolePrompt ? `\n  角色提示词: ${rolePrompt.replace(/\n/g, '\n  ')}` : ''
+      return `- ${m.agentId}: ${role}${resp ? ` — ${resp}` : ''}${promptLine}`
     })
     .join('\n')
 }
@@ -117,6 +168,8 @@ export function buildTeamRunPrompt(team, userText) {
   const name = _cleanPromptText(team?.name, 80) || team?.id || '未命名团队'
   const description = _cleanPromptText(team?.description, 300)
   const leader = _cleanPromptText(team?.leaderAgentId, 48)
+  const leaderRole = _cleanPromptText(team?.leaderRole, 40) || '团队协调者'
+  const leaderPrompt = _cleanBlockText(team?.leaderPrompt, 1200)
   const members = _memberLines(team)
   const policy = team?.policy || {}
   const maxParallel = Number.isInteger(policy.maxParallel) ? policy.maxParallel : 3
@@ -132,13 +185,18 @@ export function buildTeamRunPrompt(team, userText) {
     `你是本次团队协作的队长/coordinator: ${leader}。`,
     `团队: ${name}${description ? ` — ${description}` : ''}`,
     '',
+    '## 队长角色定义',
+    `- 角色: ${leaderRole}`,
+    leaderPrompt ? `- 提示词: ${leaderPrompt.replace(/\n/g, '\n  ')}` : '- 提示词: 先拆解任务,再按成员专长委派,最后汇总证据、风险和下一步。',
+    '',
     '## 可委派成员',
     members || '- (无成员配置 — 请说明团队配置不完整)',
     '',
     '## 协作规则',
     '- 先给出简短任务拆解和任务账本,再开始执行。',
     `- 只允许委派给上面列出的 agentId;不要编造不存在的 agent。`,
-    `- 需要成员产出时,使用 delegate_task(goal=..., agentId=..., context=...),并在 context 里交代用户目标、相关附件/代码/约束、期望输出。`,
+    `- 需要成员产出时,使用 delegate_task(goal=..., agentId=..., context=...),并在 context 里交代用户目标、相关附件/代码/约束、成员角色提示词、期望输出和交接摘要。`,
+    `- 同一个 agent 在不同团队可能有不同角色;委派时必须按本团队列出的角色定义和角色提示词要求成员工作。`,
     `- 可以把独立子任务分批推进,但最多同时推进 ${maxParallel} 条子任务;不要重复委派同一问题。`,
     reviewLine,
     '- 如果需要复核,先产出草案,再请复核 agent 检查遗漏、风险和错误,最后再汇总。',
@@ -252,6 +310,11 @@ export function renderTeamsManagementList() {
         <div class="agent-row-sub">队长: ${htmlSafeEscape(t.leaderAgentId)} · 成员: ${
           (t.members || []).map((m) => htmlSafeEscape(m.agentId)).join(', ') || '—'
         }</div>
+        <div class="agent-row-sub">角色: ${htmlSafeEscape(t.leaderRole || '团队协调者')} · ${
+          (t.members || [])
+            .map((m) => htmlSafeEscape(m.role || m.agentId))
+            .join(' / ') || '—'
+        }</div>
       </div>`
     const editBtn = document.createElement('button')
     editBtn.className = 'btn btn-secondary'
@@ -281,10 +344,11 @@ function _renderTemplateButtons(container) {
       <span class="team-template-badge">${htmlSafeEscape(template.badge)}</span>
       <strong>${htmlSafeEscape(template.name)}</strong>
       <span>${htmlSafeEscape(template.description)}</span>
+      <em>${htmlSafeEscape(_templateRoleSummary(template))}</em>
       ${
         missing.length > 0
           ? `<small>当前列表暂未看到: ${htmlSafeEscape(missing.join(', '))}；仍可预填</small>`
-          : '<small>点击预填,保存前可修改</small>'
+          : '<small>已内置团队角色提示词,点击预填后可修改</small>'
       }`
     btn.addEventListener('click', () => _openTemplate(template))
     container.appendChild(btn)
@@ -320,7 +384,9 @@ function _fillAgentSelect(el, selected) {
 function _membersToText(members = []) {
   return members
     .map((m) =>
-      [m.agentId, m.role || '', m.responsibility || ''].join(' | ').replace(/\s+\|\s+$/, ''),
+      [m.agentId, m.role || '', m.responsibility || '', m.rolePrompt || '']
+        .join(' | ')
+        .replace(/(\s+\|\s*)+$/, ''),
     )
     .join('\n')
 }
@@ -332,7 +398,13 @@ function _parseMembers(text) {
     .filter(Boolean)
     .map((line) => {
       const [agentId, role, ...rest] = line.split('|').map((p) => p.trim())
-      return { agentId, role: role || undefined, responsibility: rest.join(' | ') || undefined }
+      const responsibility = rest.shift()
+      return {
+        agentId,
+        role: role || undefined,
+        responsibility: responsibility || undefined,
+        rolePrompt: rest.join(' | ') || undefined,
+      }
     })
 }
 
@@ -350,6 +422,8 @@ export function openTeamEditor(teamId = '') {
   $('team-id').disabled = Boolean(team)
   $('team-name').value = team?.name || ''
   $('team-description').value = team?.description || ''
+  $('team-leader-role').value = team?.leaderRole || ''
+  $('team-leader-prompt').value = team?.leaderPrompt || ''
   _fillAgentSelect($('team-leader'), team?.leaderAgentId)
   $('team-members').value = _membersToText(team?.members || [])
   $('team-max-parallel').value = String(team?.policy?.maxParallel || 3)
@@ -364,6 +438,8 @@ function _openTemplate(template) {
   $('team-id').value = _nextAvailableTeamId(template.id)
   $('team-name').value = template.name
   $('team-description').value = template.description || ''
+  $('team-leader-role').value = template.leaderRole || ''
+  $('team-leader-prompt').value = template.leaderPrompt || ''
   _fillAgentSelect($('team-leader'), template.leaderAgentId)
   $('team-members').value = _membersToText(template.members)
   $('team-max-parallel').value = String(template.policy?.maxParallel || 3)
@@ -393,6 +469,8 @@ async function _saveTeamEditor() {
     name: $('team-name').value.trim(),
     description: $('team-description').value.trim() || undefined,
     leaderAgentId: $('team-leader').value,
+    leaderRole: $('team-leader-role').value.trim() || undefined,
+    leaderPrompt: $('team-leader-prompt').value.trim() || undefined,
     members: _parseMembers($('team-members').value),
     policy: {
       maxParallel: Number($('team-max-parallel').value || 3),

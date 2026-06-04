@@ -16,8 +16,15 @@ describe('agent team validation', () => {
         name: '  研发\n小队  ',
         description: '代码\t协作',
         leaderAgentId: 'main',
+        leaderRole: ' 科研\n负责人 ',
+        leaderPrompt: '先拆解问题。\n\n\n再分派任务。',
         members: [
-          { agentId: 'researcher', role: '调研\n员', responsibility: '找资料\r\n列出处' },
+          {
+            agentId: 'researcher',
+            role: '调研\n员',
+            responsibility: '找资料\r\n列出处',
+            rolePrompt: '区分事实\r\n假设和争议',
+          },
           { agentId: 'reviewer', role: '审阅', responsibility: '检查风险' },
         ],
         policy: { maxParallel: 3, requireReview: true, reviewAgentId: 'reviewer' },
@@ -30,12 +37,15 @@ describe('agent team validation', () => {
     assert.equal(team.name, '研发 小队')
     assert.equal(team.description, '代码 协作')
     assert.equal(team.leaderAgentId, 'main')
+    assert.equal(team.leaderRole, '科研 负责人')
+    assert.equal(team.leaderPrompt, '先拆解问题。\n\n再分派任务。')
     assert.deepEqual(team.members.map((m: { agentId: string }) => m.agentId), [
       'researcher',
       'reviewer',
     ])
     assert.equal(team.members[0]!.role, '调研 员')
     assert.equal(team.members[0]!.responsibility, '找资料 列出处')
+    assert.equal(team.members[0]!.rolePrompt, '区分事实\n假设和争议')
     assert.equal(team.policy?.maxParallel, 3)
     assert.equal(team.policy?.requireReview, true)
     assert.equal(team.policy?.reviewAgentId, 'reviewer')

@@ -23,6 +23,7 @@ function extractFunction(source: string, name: string): string {
 const buildTeamRunPrompt = new Function(
   [
     extractFunction(src, '_cleanPromptText'),
+    extractFunction(src, '_cleanBlockText'),
     extractFunction(src, '_memberLines'),
     extractFunction(src, 'buildTeamRunPrompt'),
     'return buildTeamRunPrompt;',
@@ -68,6 +69,7 @@ describe('agent team prompt builder', () => {
     assert.match(prompt, /goal=\.\.\., agentId=\.\.\., context=\.\.\./)
     assert.match(prompt, /实际参与的 agent/)
     assert.match(prompt, /给仓库加一个导出 PDF 功能/)
+    assert.match(prompt, /队长角色定义/)
     assert.doesNotMatch(prompt, /researcher/)
   })
 
@@ -109,6 +111,35 @@ describe('agent team prompt builder', () => {
     assert.match(prompt, /优先请 reviewer 复核/)
   })
 
+  it('includes team-specific leader and member role prompts', () => {
+    const prompt = buildTeamRunPrompt(
+      {
+        id: 'science_research_team',
+        name: '科研协作团队',
+        leaderAgentId: 'main',
+        leaderRole: '科研项目负责人',
+        leaderPrompt: '先把研究问题拆成可验证子问题。\n最终输出证据链和局限。',
+        members: [
+          {
+            agentId: 'researcher',
+            role: '文献研究员',
+            responsibility: '检索资料并列出处',
+            rolePrompt: '区分已证实结论、假设和争议。',
+          },
+        ],
+        policy: { maxParallel: 2, requireReview: false },
+      },
+      '分析一个论文方向',
+    )
+
+    assert.match(prompt, /角色: 科研项目负责人/)
+    assert.match(prompt, /先把研究问题拆成可验证子问题/)
+    assert.match(prompt, /- researcher: 文献研究员 — 检索资料并列出处/)
+    assert.match(prompt, /角色提示词: 区分已证实结论、假设和争议/)
+    assert.match(prompt, /同一个 agent 在不同团队可能有不同角色/)
+    assert.match(prompt, /成员角色提示词/)
+  })
+
   it('tracks stale team members/review agents while keeping templates prefillable', () => {
     assert.deepEqual(
       missingAgentIds(['main', 'coder', 'coder', 'reviewer'], ['main', 'reviewer']),
@@ -117,6 +148,13 @@ describe('agent team prompt builder', () => {
     assert.match(src, /团队成员 agent 不存在/)
     assert.match(src, /团队复核 agent 不存在/)
     assert.match(src, /TEAM_TEMPLATES/)
+    assert.match(src, /id: 'science_research_team'/)
+    assert.match(src, /name: '科研协作团队'/)
+    assert.match(src, /id: 'programming_team'/)
+    assert.match(src, /name: '编程协作团队'/)
+    assert.doesNotMatch(src, /id: 'full_stack_team'/)
+    assert.match(src, /rolePrompt/)
+    assert.match(src, /team-leader-prompt/)
     assert.doesNotMatch(src, /btn\.disabled = missing\.length > 0/)
     assert.match(src, /仍可点击预填/)
     assert.doesNotMatch(src, /模板不可用,缺少 agent/)
