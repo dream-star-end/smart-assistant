@@ -23,6 +23,14 @@ export interface ClassifiedError {
   message: string
 }
 
+export interface DelegateOutputError {
+  code: ClassifiedErrorCode | 'bad_request'
+  /** 用户可见的简短文案 */
+  message: string
+  /** 原始 CCB/API 错误文本,用于日志和 tool detail */
+  detail: string
+}
+
 const PATTERNS: Array<{
   re: RegExp
   code: Exclude<ClassifiedErrorCode, 'unknown'>
@@ -56,4 +64,34 @@ export function classifyRunError(raw: string | undefined | null): ClassifiedErro
     if (p.re.test(s)) return { code: p.code, message: p.message }
   }
   return { code: 'unknown', message: '' }
+}
+
+export function classifyDelegateOutputError(
+  raw: string | undefined | null,
+): DelegateOutputError | null {
+  const detail = String(raw ?? '').trim()
+  if (!detail) return null
+  // CCB's createAssistantAPIErrorMessage emits upstream API failures as a
+  // normal assistant text block that starts with this prefix.  Do not classify
+  // arbitrary prose that merely mentions "API Error".
+  if (!/^API Error:\s*(?:\d{3}\b|\{)/i.test(detail)) return null
+
+  const cls = classifyRunError(detail)
+  if (cls.code !== 'unknown') {
+    return { code: cls.code, message: cls.message, detail }
+  }
+
+  if (
+    /\b400\b[\s\S]{0,200}\bBAD_BODY\b|\bBAD_BODY\b[\s\S]{0,200}\binvalid request body\b|"code"\s*:\s*"BAD_BODY"/i.test(
+      detail,
+    )
+  ) {
+    return {
+      code: 'bad_request',
+      message: '子 agent 请求体无效,请降低思考深度或稍后重试',
+      detail,
+    }
+  }
+
+  return null
 }

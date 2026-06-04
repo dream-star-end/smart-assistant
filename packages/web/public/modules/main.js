@@ -1316,6 +1316,13 @@ function send() {
     _media: media.length > 0 ? media : undefined,
     _modelText: modelText !== text ? modelText : undefined, // Full text with attachments for replay
   })
+  sess._activeTeamRun = teamForSend
+    ? {
+        id: teamForSend.id,
+        name: teamForSend.name || teamForSend.id,
+        leaderAgentId: teamForSend.leaderAgentId || '',
+      }
+    : null
   sess._streamingAssistant = null
   sess._streamingThinking = null
   sess._blockIdToMsgId = new Map()
@@ -1351,6 +1358,7 @@ function send() {
     // P2-24 软上限 — 超过 200 直接拒收避免无限堆积。
     const enqueued = tryEnqueueOffline({ sessId: sess.id, payload: wsPayload, msgId: userMsg.id })
     if (!enqueued) {
+      sess._activeTeamRun = null
       userMsg.status = 'error'
       updateMsgStatus(userMsg)
       toast(`离线缓冲已满 (${MAX_OFFLINE_QUEUE} 条),请恢复网络后重试`, 'danger')

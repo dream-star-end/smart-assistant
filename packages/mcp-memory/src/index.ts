@@ -893,13 +893,23 @@ async function handleDelegateTaskToAgent(
       return toolError(`委派失败: ${err}`)
     }
     const data = (await res.json()) as any
-    if (data.error) {
-      return toolError(`子 agent 执行出错: ${data.error}`)
+    if (data.error || data.ok === false) {
+      return toolError(`子 agent 执行出错: ${data.error || data.output || 'unknown error'}`)
     }
-    return toolOk(`✅ 委派完成 (agent: ${args.label})\n\n${data.output || '(无输出)'}`)
+    const output = data.output || ''
+    if (looksLikeDelegateApiError(output)) {
+      return toolError(`子 agent 执行出错: ${output}`)
+    }
+    return toolOk(`✅ 委派完成 (agent: ${args.label})\n\n${output || '(无输出)'}`)
   } catch (err: any) {
     return toolError(`委派失败: ${err?.message ?? String(err)}`)
   }
+}
+
+function looksLikeDelegateApiError(raw: unknown): boolean {
+  const s = String(raw ?? '').trim()
+  if (!s) return false
+  return /^API Error:\s*(?:\d{3}\b|\{)/i.test(s)
 }
 
 async function handleCreateReminder(args: {

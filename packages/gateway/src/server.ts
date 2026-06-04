@@ -36,7 +36,7 @@ import {
   newTraceId,
   parseTraceIdCandidate,
 } from '@openclaude/protocol'
-import { classifyRunError } from './errorClassify.js'
+import { classifyDelegateOutputError, classifyRunError } from './errorClassify.js'
 import {
   type AgentDef,
   type AgentTeamDef,
@@ -4789,6 +4789,12 @@ export class Gateway {
         if (e.kind === 'block' && e.block.kind === 'text') output += e.block.text
         if (e.kind === 'error') error = e.error
       })
+      if (!error) {
+        const delegatedApiError = classifyDelegateOutputError(output)
+        if (delegatedApiError) {
+          error = `${delegatedApiError.message}\n\n${delegatedApiError.detail}`
+        }
+      }
       this._runLog.complete(_dlgRun, {
         status: error ? 'failed' : 'completed',
         error: error || undefined,
