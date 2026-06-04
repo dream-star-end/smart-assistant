@@ -100,6 +100,10 @@ const CORE_TOOLSET_ID = "core";
 const BROWSER_TOOLSET_ID = "browser";
 const RESEARCH_TOOLSET_ID = "research";
 
+const COMMERCIAL_DEFAULT_MODEL = "MiniMax-M3";
+const COMMERCIAL_DEFAULT_PROVIDER = "minimax";
+const COMMERCIAL_CODEX_MODEL = "gpt-5.5";
+
 const BROWSER_MCP_ID = "browser";
 const BROWSER_MCP_TOOLS = [
   "browser_navigate",
@@ -186,6 +190,10 @@ function normalizeStringArray(v: unknown): string[] {
   return out;
 }
 
+function isLegacyClaudeModel(model: unknown): boolean {
+  return typeof model === "string" && /^claude-/i.test(model.trim());
+}
+
 function isDesiredBrowserMcpServer(v: unknown): boolean {
   if (!isRecord(v)) return false;
   if (v.id !== BROWSER_MCP_ID) return false;
@@ -238,11 +246,22 @@ function setToolset(
 }
 
 function ensureCoreDefaults(defaults: Record<string, unknown>): boolean {
+  let mutated = false;
   const normalized = normalizeStringArray(defaults.toolsets);
   const next = normalized.length > 0 ? normalized : [CORE_TOOLSET_ID];
-  if (sameStringArray(defaults.toolsets, next)) return false;
-  defaults.toolsets = next;
-  return true;
+  if (!sameStringArray(defaults.toolsets, next)) {
+    defaults.toolsets = next;
+    mutated = true;
+  }
+  if (
+    typeof defaults.model !== "string" ||
+    defaults.model.trim() === "" ||
+    isLegacyClaudeModel(defaults.model)
+  ) {
+    defaults.model = COMMERCIAL_DEFAULT_MODEL;
+    mutated = true;
+  }
+  return mutated;
 }
 
 function upsertPlatformMcpIntegrations(config: Record<string, unknown>): boolean {
@@ -278,7 +297,7 @@ function upsertPlatformMcpIntegrations(config: Record<string, unknown>): boolean
   }
 
   if (!isRecord(config.defaults)) {
-    config.defaults = { model: "claude-opus-4-7", permissionMode: "acceptEdits", toolsets: [CORE_TOOLSET_ID] };
+    config.defaults = { model: COMMERCIAL_DEFAULT_MODEL, permissionMode: "acceptEdits", toolsets: [CORE_TOOLSET_ID] };
     mutated = true;
   } else if (ensureCoreDefaults(config.defaults)) {
     mutated = true;
@@ -474,7 +493,7 @@ try {
       // 历史 incident 2026-04-21:漏写本字段,boss 在 claudeai.chat 发消息容器接到
       // 但永远不回包。
       defaults: {
-        model: "claude-opus-4-7",
+        model: COMMERCIAL_DEFAULT_MODEL,
         permissionMode: "acceptEdits",
         toolsets: [CORE_TOOLSET_ID],
       },
@@ -514,46 +533,147 @@ try {
 
   // 个人版 SessionManager 也需要 agents.yaml 才能解析 opts.agent。两件事:
   //
-  //   (a) volume 空 → bootstrap "main" + "codex" 两个 agent
-  //   (b) volume 已有 yaml(用户/旧版镜像写过)→ **强制 merge 固定 id `codex`**:
+  //   (a) volume 空 → bootstrap MiniMax main/协作角色 + 固定 id `codex`
+  //   (b) volume 已有 yaml(用户/旧版镜像写过)→ merge 平台 seed:
+  //       - 旧版 main 如果还指向 Claude 默认,只修 model/provider 等必要字段,保留用户自定义
+  //       - 缺少 researcher/coder/reviewer → append
   //       - 不存在 codex agent → append
   //       - 存在但 provider/runnerKind/model 不匹配 → 覆盖并日志告警(原文件先 .bak)
-  //       - 解析失败 → 备份原文件到 .bak.<rand>,重新写一份双 agent yaml
+  //       - 解析失败 → 备份原文件到 .bak.<rand>,重新写一份平台 seed yaml
   //
   // **安全边界放在后端 canUseModel + inferAgentForModel(fail-closed),agents.yaml
-  // 不当权限系统**。这里 merge 的目的只是确保 `id:codex` agent 一定存在 + 配置正确,
-  // 让 SessionManager 路由 gpt-5.5 时能找到 runnerKind:'app-server' 的目标。
-  // 用户哪怕手改 yaml 加了别的 codex agent,后端 canUseModel 不放行也无意义。
+  // 不当权限系统**。这里 merge 的目的只是确保默认商业版 agent 不再落到不可用 Claude,
+  // 同时保证 `id:codex` agent 一定存在 + 配置正确,让 SessionManager 路由 gpt-5.5
+  // 时能找到 runnerKind:'app-server' 的目标。用户哪怕手改 yaml 加了别的 codex agent,
+  // 后端 canUseModel 不放行也无意义。
   const agentsPath = join(ocConfigDir, "agents.yaml");
-  const personaDir = join(ocConfigDir, "agents", "main");
-  const personaPath = join(personaDir, "CLAUDE.md");
-  mkdirSync(personaDir, { recursive: true });
-  if (!existsSync(personaPath)) {
-    writeFileSync(personaPath, "你是 OpenClaude 上的助手,简洁中文回答。\n", { mode: 0o644 });
+
+  function ensureAgentPersona(agentId: string, content: string): string {
+    const personaDir = join(ocConfigDir, "agents", agentId);
+    const personaPath = join(personaDir, "CLAUDE.md");
+    mkdirSync(personaDir, { recursive: true });
+    if (!existsSync(personaPath)) {
+      writeFileSync(personaPath, content, { mode: 0o644 });
+    }
+    return personaPath;
+  }
+
+  function isAgentWithId(value: unknown, id: string): value is Record<string, unknown> {
+    return isRecord(value) && value.id === id;
+  }
+
+  function patchLegacyMainAgent(
+    agent: Record<string, unknown>,
+    desired: Record<string, unknown>,
+  ): Record<string, unknown> | null {
+    const rawModel = typeof agent.model === "string" ? agent.model.trim() : "";
+    const provider = typeof agent.provider === "string" ? agent.provider : "";
+    const needsModelRepair = rawModel === "" || isLegacyClaudeModel(rawModel);
+    const next = { ...agent };
+    let patched = false;
+
+    if (needsModelRepair && next.model !== COMMERCIAL_DEFAULT_MODEL) {
+      next.model = COMMERCIAL_DEFAULT_MODEL;
+      patched = true;
+    }
+
+    const modelAfter = typeof next.model === "string" ? next.model : "";
+    if (
+      modelAfter === COMMERCIAL_DEFAULT_MODEL &&
+      (needsModelRepair || provider === "" || provider === "claude-subscription") &&
+      next.provider !== COMMERCIAL_DEFAULT_PROVIDER
+    ) {
+      next.provider = COMMERCIAL_DEFAULT_PROVIDER;
+      patched = true;
+    }
+
+    if (!patched) return null;
+
+    if (typeof next.persona !== "string" || next.persona.trim() === "") next.persona = desired.persona;
+    if (typeof next.displayName !== "string" || next.displayName.trim() === "" || next.displayName === "main") {
+      next.displayName = desired.displayName;
+    }
+    if (typeof next.avatarEmoji !== "string" || next.avatarEmoji.trim() === "") next.avatarEmoji = desired.avatarEmoji;
+    if (typeof next.permissionMode !== "string" || next.permissionMode.trim() === "") {
+      next.permissionMode = desired.permissionMode;
+    }
+    return next;
   }
 
   // 期望的 codex agent 配置 —— 任何字段不匹配都覆盖
   const desiredCodexAgent = {
     id: "codex",
-    model: "gpt-5.5",
+    model: COMMERCIAL_CODEX_MODEL,
     permissionMode: "bypassPermissions",
     provider: "codex-native",
     runnerKind: "app-server",
     displayName: "GPT 5.5 (Codex)",
+    avatarEmoji: "🤖",
   };
 
   const desiredMainAgent = {
     id: "main",
-    model: "claude-opus-4-7",
-    persona: personaPath,
+    model: COMMERCIAL_DEFAULT_MODEL,
+    persona: ensureAgentPersona("main", "你是 OpenClaude 商业版的默认 MiniMax M3 助手,用简洁中文直接回答。\n"),
     permissionMode: "bypassPermissions",
-    provider: "claude-subscription",
-    displayName: "main",
+    provider: COMMERCIAL_DEFAULT_PROVIDER,
+    displayName: "MiniMax M3 助手",
+    avatarEmoji: "🧠",
   };
+
+  const desiredResearcherAgent = {
+    id: "researcher",
+    model: COMMERCIAL_DEFAULT_MODEL,
+    persona: ensureAgentPersona(
+      "researcher",
+      "你是资料研究员。先澄清问题范围,善用浏览器和论文/PDF工具查证,最后给出来源清楚的中文结论。\n",
+    ),
+    permissionMode: "bypassPermissions",
+    provider: COMMERCIAL_DEFAULT_PROVIDER,
+    displayName: "资料研究员",
+    avatarEmoji: "🔎",
+    toolsets: [CORE_TOOLSET_ID, BROWSER_TOOLSET_ID, RESEARCH_TOOLSET_ID],
+  };
+
+  const desiredCoderAgent = {
+    id: "coder",
+    model: COMMERCIAL_DEFAULT_MODEL,
+    persona: ensureAgentPersona(
+      "coder",
+      "你是代码工程师。先读代码和现有约束,再做最小必要修改,验证结果后用简洁中文汇报。\n",
+    ),
+    permissionMode: "bypassPermissions",
+    provider: COMMERCIAL_DEFAULT_PROVIDER,
+    displayName: "代码工程师",
+    avatarEmoji: "🛠️",
+    toolsets: [CORE_TOOLSET_ID, BROWSER_TOOLSET_ID],
+  };
+
+  const desiredReviewerAgent = {
+    id: "reviewer",
+    model: COMMERCIAL_DEFAULT_MODEL,
+    persona: ensureAgentPersona(
+      "reviewer",
+      "你是审阅员。重点检查正确性、边界条件、安全性和是否过度工程,只提出可执行的问题和建议。\n",
+    ),
+    permissionMode: "bypassPermissions",
+    provider: COMMERCIAL_DEFAULT_PROVIDER,
+    displayName: "审阅员",
+    avatarEmoji: "🧪",
+    toolsets: [CORE_TOOLSET_ID],
+  };
+
+  const desiredMiniMaxSeedAgents = [
+    desiredMainAgent,
+    desiredResearcherAgent,
+    desiredCoderAgent,
+    desiredReviewerAgent,
+  ];
+  const desiredSeedAgents = [...desiredMiniMaxSeedAgents, desiredCodexAgent];
 
   if (!existsSync(agentsPath)) {
     const initialDoc = {
-      agents: [desiredMainAgent, desiredCodexAgent],
+      agents: desiredSeedAgents,
       routes: [],
       default: "main",
     };
@@ -583,9 +703,9 @@ try {
     }
 
     if (parseFailed || parsed === null || typeof parsed !== "object") {
-      // 重新写一份完整的双 agent yaml(保险)
+      // 重新写一份完整的平台 seed yaml(保险)
       const initialDoc = {
-        agents: [desiredMainAgent, desiredCodexAgent],
+        agents: desiredSeedAgents,
         routes: [],
         default: "main",
       };
@@ -594,10 +714,46 @@ try {
     } else {
       const doc = parsed as { agents?: unknown; routes?: unknown; default?: unknown };
       const agents = Array.isArray(doc.agents) ? [...(doc.agents as unknown[])] : [];
-      const codexIndex = agents.findIndex(
-        (a) => a !== null && typeof a === "object" && (a as { id?: unknown }).id === "codex",
-      );
       let mutated = false;
+
+      let backupPath: string | null = null;
+      const backupAgentsYamlOnce = (reason: string): string => {
+        if (backupPath) return backupPath;
+        const bakSuffix = randomBytes(4).toString("hex");
+        backupPath = `${agentsPath}.bak.${bakSuffix}`;
+        try {
+          copyFileSync(agentsPath, backupPath);
+        } catch (bakErr) {
+          console.error(
+            `[entrypoint] WARN: agents.yaml ${reason} 前 .bak 备份失败: ${(bakErr as Error).message}`,
+          );
+        }
+        return backupPath;
+      };
+
+      for (const desiredAgent of desiredMiniMaxSeedAgents) {
+        const idx = agents.findIndex((a) => isAgentWithId(a, desiredAgent.id));
+        if (idx < 0) {
+          if (desiredAgent.id === "main") agents.unshift(desiredAgent);
+          else agents.push(desiredAgent);
+          mutated = true;
+          console.error(`[entrypoint] agents.yaml: appended ${desiredAgent.id} agent`);
+          continue;
+        }
+        if (desiredAgent.id === "main" && isRecord(agents[idx])) {
+          const patchedMain = patchLegacyMainAgent(agents[idx], desiredAgent);
+          if (patchedMain) {
+            backupAgentsYamlOnce("修复 legacy main agent");
+            agents[idx] = patchedMain;
+            mutated = true;
+            console.error(
+              `[entrypoint] agents.yaml: main agent 从 legacy Claude 默认修复为 ${COMMERCIAL_DEFAULT_MODEL}/${COMMERCIAL_DEFAULT_PROVIDER}`,
+            );
+          }
+        }
+      }
+
+      const codexIndex = agents.findIndex((a) => isAgentWithId(a, "codex"));
       if (codexIndex < 0) {
         agents.push(desiredCodexAgent);
         mutated = true;
@@ -610,15 +766,7 @@ try {
           existing.model !== desiredCodexAgent.model;
         if (mismatch) {
           // 备份后覆盖(用户 / 旧镜像污染了 codex 条目)
-          const bakSuffix = randomBytes(4).toString("hex");
-          const bakPath = `${agentsPath}.bak.${bakSuffix}`;
-          try {
-            copyFileSync(agentsPath, bakPath);
-          } catch (bakErr) {
-            console.error(
-              `[entrypoint] WARN: agents.yaml 覆盖 codex 前 .bak 备份失败: ${(bakErr as Error).message}`,
-            );
-          }
+          const bakPath = backupAgentsYamlOnce("覆盖 codex");
           agents[codexIndex] = desiredCodexAgent;
           mutated = true;
           console.error(
@@ -626,12 +774,20 @@ try {
           );
         }
       }
+      const agentIds = new Set(
+        agents
+          .filter((a): a is Record<string, unknown> => isRecord(a))
+          .map((a) => a.id)
+          .filter((id): id is string => typeof id === "string"),
+      );
+      const nextDefault = typeof doc.default === "string" && agentIds.has(doc.default) ? doc.default : "main";
+      if (doc.default !== nextDefault) mutated = true;
       if (mutated) {
         const newDoc = {
           ...doc,
           agents,
           routes: Array.isArray(doc.routes) ? doc.routes : [],
-          default: typeof doc.default === "string" ? doc.default : "main",
+          default: nextDefault,
         };
         writeFileSync(agentsPath, YAML.stringify(newDoc), { mode: 0o644 });
       }

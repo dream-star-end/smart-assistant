@@ -31,9 +31,10 @@ export async function reloadAgents() {
     console.warn('load agents failed (commercial non-admin → fallback main):', err)
     state.agentsList = [{
       id: 'main',
-      displayName: 'main',
-      model: 'claude-opus-4-7',
-      provider: 'claude-subscription',
+      displayName: 'MiniMax M3 助手',
+      avatarEmoji: '🧠',
+      model: 'MiniMax-M3',
+      provider: 'minimax',
     }]
     state.defaultAgentId = 'main'
     const sel = $('agent-select')
