@@ -1403,9 +1403,17 @@
     <div class="modal-body">
       <div id="agents-list-wrap"></div>
       <hr class="agents-divider" />
-      <div class="form-row">
-        <label for="new-agent-id">新建 Agent</label>
-        <input id="new-agent-id" placeholder="agent id (只能 a-z 0-9 _ -)" maxlength="48" />
+      <div class="agent-create-card">
+        <div class="agent-create-head">
+          <div>
+            <label for="new-agent-id">新建 Agent</label>
+            <p>输入 agent id 后创建；默认使用当前商业版支持模型，创建后可点“编辑”配置名称、模型和提示词。</p>
+          </div>
+        </div>
+        <div class="agent-create-row">
+          <input id="new-agent-id" placeholder="如: analyst / writer / qa_bot" maxlength="48" />
+          <button id="create-agent-btn" class="btn btn-primary" type="button">创建 Agent</button>
+        </div>
       </div>
       <hr class="agents-divider" />
       <div class="team-section-head">
@@ -1468,7 +1476,6 @@
     </div>
     <div class="modal-foot">
       <button class="btn btn-ghost" data-close-modal="agents-modal">关闭</button>
-      <button id="create-agent-btn" class="btn btn-primary">新建</button>
     </div>
   </div>
 </div>

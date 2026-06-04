@@ -3005,7 +3005,7 @@ async function init() {
     else send()
   }
   // Agents modal
-  $('create-agent-btn').onclick = async () => {
+  const createAgentFromInput = async () => {
     const id = $('new-agent-id').value.trim()
     if (!id) return
     if (!/^[a-zA-Z0-9_-]+$/.test(id)) {
@@ -3022,6 +3022,12 @@ async function init() {
       toast(String(err), 'error', toastOptsFromError(err))
     }
   }
+  $('create-agent-btn').onclick = createAgentFromInput
+  $('new-agent-id')?.addEventListener('keydown', (e) => {
+    if (e.key !== 'Enter') return
+    e.preventDefault()
+    void createAgentFromInput()
+  })
   // Persona model preset syncs to free-text field
   $('persona-model-preset')?.addEventListener('change', (e) => {
     if (e.target.value) $('persona-model').value = e.target.value

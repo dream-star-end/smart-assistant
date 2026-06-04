@@ -4594,6 +4594,32 @@ a:hover {
 .settings-modal .prefs-select:hover {
   border-color: var(--border-strong);
 }
+.agent-create-card {
+  padding: var(--space-4);
+  border: 1px solid color-mix(in srgb, var(--accent) 18%, var(--border));
+  border-radius: var(--radius-xl);
+  background:
+    linear-gradient(135deg, color-mix(in srgb, var(--accent-soft) 26%, transparent), transparent 58%),
+    color-mix(in srgb, var(--bg-raised) 62%, transparent);
+}
+.agent-create-head label {
+  display: block;
+  color: var(--fg);
+  font-weight: 800;
+  margin-bottom: 4px;
+}
+.agent-create-head p {
+  margin: 0 0 var(--space-3);
+  color: var(--fg-muted);
+  font-size: var(--text-sm);
+  line-height: 1.5;
+}
+.agent-create-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: var(--space-3);
+  align-items: center;
+}
 
 .agent-row {
   display: flex;
@@ -10377,6 +10403,12 @@ textarea:focus-visible,
   }
   .team-template-card {
     min-height: 86px;
+  }
+  .agent-create-row {
+    grid-template-columns: 1fr;
+  }
+  .agent-create-row .btn {
+    width: 100%;
   }
   .composer-input-row {
     padding: 6px;
