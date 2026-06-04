@@ -23,10 +23,10 @@
 //   - 字段从 X → 同 X → 跳过
 //   - 没有任何改动 → 不发请求,直接 close + toast"无变化"
 
-import { apiGet, apiJson } from './api.js?v=cf4db237'
-import { formatCredits } from './billing.js?v=cf4db237'
-import { state } from './state.js?v=cf4db237'
-import { closeModal, openModal, toast } from './ui.js?v=cf4db237'
+import { apiGet, apiJson } from './api.js?v=524e815a'
+import { formatCredits } from './billing.js?v=524e815a'
+import { state } from './state.js?v=524e815a'
+import { closeModal, openModal, toast } from './ui.js?v=524e815a'
 
 let _wired = false
 let _lastSnapshot = null   // 最近一次从后端拿到的 prefs 对象(diff base)
