@@ -102,6 +102,7 @@ export const state = {
   reconnectTimer: null,
   sendingInFlight: false,
   agentsList: [],
+  agentsListIsFallback: false,
   defaultAgentId: 'main',
   agentTeams: [],
   selectedTeamId: '',

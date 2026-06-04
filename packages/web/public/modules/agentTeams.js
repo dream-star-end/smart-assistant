@@ -169,17 +169,17 @@ export function getSelectedTeamForSend() {
     toast('团队配置不存在,已关闭团队模式', 'warning')
     return null
   }
-  if (!_agentExists(team.leaderAgentId)) {
+  if (!_agentExists(team.leaderAgentId) && !state.agentsListIsFallback) {
     toast(`团队队长 agent 不存在: ${team.leaderAgentId}`, 'error')
     return false
   }
   const missingMembers = _missingAgentIds((team.members || []).map((m) => m.agentId))
-  if (missingMembers.length > 0) {
+  if (missingMembers.length > 0 && !state.agentsListIsFallback) {
     toast(`团队成员 agent 不存在: ${missingMembers.join(', ')}`, 'error')
     return false
   }
   const reviewAgentId = team.policy?.requireReview ? team.policy?.reviewAgentId : ''
-  if (reviewAgentId && !_agentExists(reviewAgentId)) {
+  if (reviewAgentId && !_agentExists(reviewAgentId) && !state.agentsListIsFallback) {
     toast(`团队复核 agent 不存在: ${reviewAgentId}`, 'error')
     return false
   }
@@ -272,16 +272,18 @@ function _renderTemplateButtons(container) {
     const missing = _missingAgentIds(_templateRequiredAgentIds(template))
     const btn = document.createElement('button')
     btn.type = 'button'
-    btn.className = 'team-template-card'
-    btn.disabled = missing.length > 0
-    btn.title = missing.length > 0 ? `缺少 agent: ${missing.join(', ')}` : `使用模板: ${template.name}`
+    btn.className = `team-template-card${missing.length > 0 ? ' is-warning' : ''}`
+    btn.title =
+      missing.length > 0
+        ? `当前列表暂未看到: ${missing.join(', ')}；仍可点击预填`
+        : `使用模板: ${template.name}`
     btn.innerHTML = `
       <span class="team-template-badge">${htmlSafeEscape(template.badge)}</span>
       <strong>${htmlSafeEscape(template.name)}</strong>
       <span>${htmlSafeEscape(template.description)}</span>
       ${
         missing.length > 0
-          ? `<small>缺少: ${htmlSafeEscape(missing.join(', '))}</small>`
+          ? `<small>当前列表暂未看到: ${htmlSafeEscape(missing.join(', '))}；仍可预填</small>`
           : '<small>点击预填,保存前可修改</small>'
       }`
     btn.addEventListener('click', () => _openTemplate(template))
@@ -302,6 +304,12 @@ function _fillAgentSelect(el, selected) {
     const opt = document.createElement('option')
     opt.value = a.id
     opt.textContent = _agentLabel(a.id)
+    el.appendChild(opt)
+  }
+  if (selected && !Array.from(el.options).some((opt) => opt.value === selected)) {
+    const opt = document.createElement('option')
+    opt.value = selected
+    opt.textContent = `${selected} (当前列表不可见)`
     el.appendChild(opt)
   }
   el.value =
@@ -352,10 +360,6 @@ export function openTeamEditor(teamId = '') {
 
 function _openTemplate(template) {
   const missing = _missingAgentIds(_templateRequiredAgentIds(template))
-  if (missing.length > 0) {
-    toast(`模板不可用,缺少 agent: ${missing.join(', ')}`, 'warning')
-    return
-  }
   openTeamEditor('')
   $('team-id').value = _nextAvailableTeamId(template.id)
   $('team-name').value = template.name
@@ -365,7 +369,14 @@ function _openTemplate(template) {
   $('team-max-parallel').value = String(template.policy?.maxParallel || 3)
   $('team-require-review').checked = Boolean(template.policy?.requireReview)
   _fillAgentSelect($('team-review-agent'), template.policy?.reviewAgentId || '')
-  toast(`已预填「${template.name}」,确认后点击保存团队`, 'success')
+  if (missing.length > 0) {
+    toast(
+      `已预填「${template.name}」。当前列表暂未看到: ${missing.join(', ')};如保存失败,请先刷新或创建对应 agent。`,
+      'warning',
+    )
+  } else {
+    toast(`已预填「${template.name}」,确认后点击保存团队`, 'success')
+  }
 }
 
 function _closeTeamEditor() {

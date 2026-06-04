@@ -4722,6 +4722,13 @@ a:hover {
   cursor: not-allowed;
   opacity: 0.58;
 }
+.team-template-card.is-warning {
+  border-color: color-mix(in srgb, var(--warning) 34%, var(--border));
+  background: color-mix(in srgb, var(--warning) 8%, var(--bg-elevated));
+}
+.team-template-card.is-warning small {
+  color: var(--warning);
+}
 .team-template-card strong,
 .team-template-card span,
 .team-template-card small {
