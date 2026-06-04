@@ -1143,6 +1143,13 @@ export class SessionManager {
      * cron/webhook/pre-warm callers that don't have a user context can omit it.
      */
     userId?: string
+    /**
+     * Optional repo/workspace lookup key used only by runner getRepoSnapshot().
+     * Keep AgentSession.peerId and _sessionIdToKey keyed by opts.peerId; delegate
+     * sessions use this to inherit a parent webchat repo binding without
+     * impersonating that parent session identity.
+     */
+    repoSessionId?: string
     title?: string
     delegationDepth?: number
     /** 仅用于**新建** runner 时初始化 CLAUDE_CODE_EFFORT_LEVEL:
@@ -1197,6 +1204,7 @@ export class SessionManager {
     }
     const cwd = opts.agent.cwd ?? process.cwd()
     const persona = opts.agent.persona ?? paths.agentClaudeMd(opts.agent.id)
+    const repoSessionId = opts.repoSessionId ?? opts.peerId
     // provider=codex-native routes to `codex` CLI instead of CCB; runner shape
     // (EventEmitter with start/submit/shutdown + same events) is compatible,
     // so upstream session bookkeeping works unchanged.
@@ -1228,10 +1236,10 @@ export class SessionManager {
           effortLevel: initialEffort,
           config: this.config,
           delegationDepth: opts.delegationDepth,
-          // Phase 5:与 SubprocessRunner 对称 — peerId(== sessionId)+
+          // Phase 5:与 SubprocessRunner 对称 — repoSessionId(默认 peerId)+
           // 全局 snapshot provider。runner 在每轮 turn 顶部 capture 一次,
           // 决定 thread/start.cwd / thread/resume.cwd / spawn cwd。
-          sessionId: opts.peerId,
+          sessionId: repoSessionId,
           getRepoSnapshot: this._getRepoSnapshot,
         }) as unknown as SubprocessRunner
       } else {
@@ -1248,7 +1256,7 @@ export class SessionManager {
           delegationDepth: opts.delegationDepth,
           // Phase 5:同上(per-turn `codex exec` 也需要按 repo binding
           // 切 spawn cwd)。
-          sessionId: opts.peerId,
+          sessionId: repoSessionId,
           getRepoSnapshot: this._getRepoSnapshot,
         }) as unknown as SubprocessRunner
       }
@@ -1270,9 +1278,10 @@ export class SessionManager {
         // was wiped (pre-2026-04-22 v3 containers' tmpfs was ephemeral).
         resumeSessionId: this._resumeIdFor(opts.sessionKey, providerTag),
         effortLevel: initialEffort,
-        // Phase 5:peerId 即 sessionId(协议约定);getRepoSnapshot 由 Gateway 构造器
-        // 注入 _repoWorkspace.getRepoSnapshot,sessionManager 透传给 runner。
-        sessionId: opts.peerId,
+        // Phase 5:repoSessionId 默认等于 peerId;delegate_task 可传父 webchat
+        // session id 作为 repo lookup key,但不改变 delegate 自己的 peerId。
+        // getRepoSnapshot 由 Gateway 构造器注入。
+        sessionId: repoSessionId,
         getRepoSnapshot: this._getRepoSnapshot,
         workload: opts.workload,
       })
