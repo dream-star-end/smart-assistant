@@ -173,9 +173,16 @@ export const SIZE_LIMITS = {
 /** 总 body 上限(JSON 全文 byteLength)。超过 → 413。 */
 export const MAX_BODY_BYTES_DEFAULT = 16 * 1024 * 1024;
 
-/** messages / tools 数量上限(对齐 R3 §3.3 注解)。 */
+/** messages / tools 数量上限。
+ *
+ * tools 不能沿用 Anthropic 文档里的 64 个窄限:商业版团队委派时,CCB native
+ * tools + openclaude-memory + browser + research/scansci-pdf 这类 MCP toolsets
+ * 会自然超过 64。这里的 128 只是本代理层的容忍上限,不代表所有上游模型都承诺
+ * 支持 128 个工具；DoS 防护主要仍靠 tools 字段 2MB byte budget 和总 body
+ * 16MB budget。
+ */
 export const MAX_MESSAGES_COUNT = 2000;
-export const MAX_TOOLS_COUNT = 64;
+export const MAX_TOOLS_COUNT = 128;
 
 /** 估算 input token 时的字符 → token 经验比(保守:chars/4 即 1 token = 4 chars)。 */
 export const CHARS_PER_TOKEN_ESTIMATE = 4;

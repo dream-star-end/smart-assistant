@@ -36,6 +36,7 @@ import {
   ALLOWED_BETA_VALUES,
   ANTHROPIC_VERSION,
   SIZE_LIMITS,
+  MAX_TOOLS_COUNT,
   _UsageObserver,
   type ProxyBody,
 } from "../http/anthropicProxy.js";
@@ -157,6 +158,36 @@ describe("proxyBodySchema — 数值/数组边界", () => {
       model: "claude-sonnet-4-6",
       max_tokens: 1024,
       messages: msgs,
+    });
+    assert.equal(r.success, false);
+  });
+
+  test("tools 允许商业版团队委派常见的 80 个小工具", () => {
+    const tools = Array.from({ length: 80 }, (_, i) => ({
+      name: `tool_${i}`,
+      description: "small tool",
+      input_schema: { type: "object" },
+    }));
+    const r = proxyBodySchema.safeParse({
+      model: "claude-sonnet-4-6",
+      max_tokens: 1024,
+      messages: [{ role: "user", content: "hi" }],
+      tools,
+    });
+    assert.equal(r.success, true);
+  });
+
+  test("tools 超过 MAX_TOOLS_COUNT → fail", () => {
+    const tools = Array.from({ length: MAX_TOOLS_COUNT + 1 }, (_, i) => ({
+      name: `tool_${i}`,
+      description: "small tool",
+      input_schema: { type: "object" },
+    }));
+    const r = proxyBodySchema.safeParse({
+      model: "claude-sonnet-4-6",
+      max_tokens: 1024,
+      messages: [{ role: "user", content: "hi" }],
+      tools,
     });
     assert.equal(r.success, false);
   });
