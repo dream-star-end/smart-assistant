@@ -45,6 +45,17 @@ const WEB_AGENTS_MODULE_PATH = join(
   "agents.js",
 );
 
+const WEB_AGENT_TEAMS_MODULE_PATH = join(
+  __dirname,
+  "..",
+  "..",
+  "..",
+  "web",
+  "public",
+  "modules",
+  "agentTeams.js",
+);
+
 /**
  * personal-version 的 PROVIDER_MANAGED_ENV_VARS 源码 — 跨仓引用 .ts 源码会让 commercial
  * composite TS project 把外部源码纳入编译图,触发 rootDir/include 边界问题(S12a 三审 MAJOR 2)。
@@ -96,6 +107,12 @@ function readRetainKeysFromSource(): Set<string> {
     keys.add(lit[1]!);
   }
   return keys;
+}
+
+function extractConstObjectFromSource(src: string, name: string): string {
+  const m = src.match(new RegExp(String.raw`const ${name} = \{([\s\S]*?)\n  \};`));
+  if (!m) throw new Error(`${name} object not found in entrypoint.ts`);
+  return m[0]!;
 }
 
 const expect = (actual: unknown) => ({
@@ -290,6 +307,50 @@ describe("openclaude-runtime entrypoint env-scrub policy", () => {
     );
   });
 
+  test("entrypoint.ts seeds researcher/coder with core-only toolsets", () => {
+    const src = readFileSync(ENTRYPOINT_TS_PATH, "utf-8");
+    const researcher = extractConstObjectFromSource(src, "desiredResearcherAgent");
+    const coder = extractConstObjectFromSource(src, "desiredCoderAgent");
+
+    assert.match(
+      researcher,
+      /toolsets:\s*\[CORE_TOOLSET_ID\]/,
+      "researcher must default to core only",
+    );
+    assert.doesNotMatch(
+      researcher,
+      /BROWSER_TOOLSET_ID|RESEARCH_TOOLSET_ID/,
+      "researcher must not mount browser/research MCP toolsets by default",
+    );
+    assert.match(
+      src,
+      /const RESEARCHER_PERSONA\s*=[\s\S]*不要假设浏览器或 ScanSci\/PDF 工具已挂载/,
+      "researcher persona must not imply optional MCP tools are always available",
+    );
+    assert.match(
+      src,
+      /LEGACY_RESEARCHER_PERSONAS[\s\S]*善用浏览器和论文\/PDF工具查证[\s\S]*ensureAgentPersona\("researcher", RESEARCHER_PERSONA, LEGACY_RESEARCHER_PERSONAS\)/,
+      "existing exact legacy researcher persona files must be refreshed safely",
+    );
+
+    assert.match(coder, /toolsets:\s*\[CORE_TOOLSET_ID\]/, "coder must default to core only");
+    assert.doesNotMatch(
+      coder,
+      /BROWSER_TOOLSET_ID|RESEARCH_TOOLSET_ID/,
+      "coder must not mount optional MCP toolsets by default",
+    );
+    assert.match(
+      src,
+      /const CODER_PERSONA\s*=[\s\S]*不要假设浏览器工具已挂载/,
+      "coder persona must not imply browser tools are always available",
+    );
+    assert.match(
+      src,
+      /LEGACY_CODER_PERSONAS[\s\S]*再做最小必要修改,验证结果后用简洁中文汇报[\s\S]*ensureAgentPersona\("coder", CODER_PERSONA, LEGACY_CODER_PERSONAS\)/,
+      "existing exact legacy coder persona files must be refreshed safely",
+    );
+  });
+
   test("entrypoint.ts keeps the canonical codex agent as the only GPT seed", () => {
     const src = readFileSync(ENTRYPOINT_TS_PATH, "utf-8");
     assert.match(src, /const COMMERCIAL_CODEX_MODEL\s*=\s*"gpt-5\.5"/);
@@ -329,6 +390,70 @@ describe("openclaude-runtime entrypoint env-scrub policy", () => {
     );
   });
 
+  test("entrypoint.ts migrates only exact legacy platform seed toolsets", () => {
+    const src = readFileSync(ENTRYPOINT_TS_PATH, "utf-8");
+    const patchBody = src.match(
+      /function patchPlatformSeedAgent\([\s\S]*?return patched \? next : null;\n  \}/,
+    )?.[0];
+    assert.ok(patchBody, "patchPlatformSeedAgent body must be present");
+
+    assert.match(
+      src,
+      /const LEGACY_RESEARCHER_TOOLSETS\s*=\s*\[\s*CORE_TOOLSET_ID,\s*BROWSER_TOOLSET_ID,\s*RESEARCH_TOOLSET_ID,\s*\]\s*as const/,
+      "researcher legacy migration must be locked to the exact old platform default",
+    );
+    assert.match(
+      src,
+      /const LEGACY_CODER_TOOLSETS\s*=\s*\[CORE_TOOLSET_ID,\s*BROWSER_TOOLSET_ID\]\s*as const/,
+      "coder legacy migration must be locked to the exact old platform default",
+    );
+    assert.match(
+      src,
+      /function isLegacyPlatformSeedToolsets\([\s\S]*sameStringArray\(toolsets,\s*legacy\)/,
+      "legacy detection must use ordered sameStringArray exact-match, not set matching",
+    );
+    assert.match(
+      patchBody,
+      /!Array\.isArray\(next\.toolsets\)[\s\S]*setField\("toolsets", desired\.toolsets\)/,
+      "seed repair must still fill missing toolsets from desired defaults",
+    );
+    assert.match(
+      patchBody,
+      /isLegacyPlatformSeedToolsets\(desired\.id, next\.toolsets\)[\s\S]*!sameStringArray\(next\.toolsets, desired\.toolsets\)[\s\S]*setField\("toolsets", desired\.toolsets\)/,
+      "seed repair must migrate exact legacy researcher/coder defaults back to core-only",
+    );
+    assert.doesNotMatch(
+      patchBody,
+      /sameStringSet/,
+      "seed repair must not use set matching; reordered or custom toolsets should remain untouched",
+    );
+
+    const exactLegacyMigrationCases = [
+      { id: "researcher", current: ["core", "browser", "research"], shouldMigrate: true },
+      { id: "coder", current: ["core", "browser"], shouldMigrate: true },
+      { id: "researcher", current: ["core", "browser"], shouldMigrate: false },
+      { id: "researcher", current: ["browser", "core", "research"], shouldMigrate: false },
+      { id: "coder", current: ["core", "research"], shouldMigrate: false },
+      { id: "coder", current: ["core", "browser", "custom"], shouldMigrate: false },
+    ];
+    for (const c of exactLegacyMigrationCases) {
+      const legacy =
+        c.id === "researcher"
+          ? [["core", "browser", "research"]]
+          : c.id === "coder"
+            ? [["core", "browser"]]
+            : [];
+      const wouldMigrate = legacy.some(
+        (ids) => ids.length === c.current.length && ids.every((id, i) => id === c.current[i]),
+      );
+      assert.equal(
+        wouldMigrate,
+        c.shouldMigrate,
+        `legacy migration spec mismatch for ${c.id} ${JSON.stringify(c.current)}`,
+      );
+    }
+  });
+
   test("entrypoint.ts pre-seeds the two default teams with codex as leader", () => {
     const src = readFileSync(ENTRYPOINT_TS_PATH, "utf-8");
     assert.match(src, /const desiredSeedTeams\s*=\s*\[desiredScienceTeam,\s*desiredProgrammingTeam\]/);
@@ -336,6 +461,50 @@ describe("openclaude-runtime entrypoint env-scrub policy", () => {
     assert.match(src, /id:\s*"programming_team"[\s\S]*leaderAgentId:\s*"codex"/);
     assert.match(src, /teams:\s*desiredSeedTeams\.map\(cloneSeedTeam\)/);
     assert.match(src, /patchPlatformSeedTeam/);
+  });
+
+  test("seeded team prompts do not assume optional browser/research toolsets are mounted", () => {
+    const entrypoint = readFileSync(ENTRYPOINT_TS_PATH, "utf-8");
+    const entrypointTeamDefaults = [
+      extractConstObjectFromSource(entrypoint, "desiredScienceTeam"),
+      extractConstObjectFromSource(entrypoint, "desiredProgrammingTeam"),
+    ].join("\n");
+    const sources = [
+      ["entrypoint", entrypointTeamDefaults],
+      ["web agentTeams", readFileSync(WEB_AGENT_TEAMS_MODULE_PATH, "utf-8")],
+    ] as const;
+    for (const [label, src] of sources) {
+      assert.match(
+        src,
+        /默认不假设(?: browser\/research MCP|浏览器工具|浏览器或 PDF 工具)/,
+        `${label} team prompts should state optional MCP tools are not assumed`,
+      );
+      assert.match(
+        src,
+        /当前工具列表/,
+        `${label} team prompts should gate optional external tools on the currently mounted tools`,
+      );
+      assert.doesNotMatch(
+        src,
+        /善用浏览器和论文\/PDF工具查证/,
+        `${label} must not keep the old researcher persona that assumed browser/PDF tools`,
+      );
+      assert.doesNotMatch(
+        src,
+        /优先查官方文档、仓库现有模式/,
+        `${label} must not keep the old programming researcher prompt that assumed external docs`,
+      );
+    }
+    assert.match(
+      entrypoint,
+      /function hasLegacyPlatformSeedTeamPrompt\([\s\S]*优先把资料检索交给 researcher[\s\S]*查官方文档、现有实现、依赖约束和可选方案/,
+      "entrypoint must detect old default team prompt text so existing seed teams are migrated",
+    );
+    assert.match(
+      entrypoint,
+      /!hasLegacyPlatformSeedTeamPrompt\(team, desired\.id\)/,
+      "seed team repair must not skip teams that still contain legacy default prompts",
+    );
   });
 
   test("web agents fallback also uses MiniMax instead of an unsupported Claude default", () => {

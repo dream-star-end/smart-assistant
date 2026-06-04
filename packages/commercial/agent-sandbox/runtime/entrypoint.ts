@@ -556,12 +556,28 @@ try {
   // 后端 canUseModel 不放行也无意义。
   const agentsPath = join(ocConfigDir, "agents.yaml");
 
-  function ensureAgentPersona(agentId: string, content: string): string {
+  function ensureAgentPersona(
+    agentId: string,
+    content: string,
+    legacyContents: readonly string[] = [],
+  ): string {
     const personaDir = join(ocConfigDir, "agents", agentId);
     const personaPath = join(personaDir, "CLAUDE.md");
     mkdirSync(personaDir, { recursive: true });
     if (!existsSync(personaPath)) {
       writeFileSync(personaPath, content, { mode: 0o644 });
+    } else if (legacyContents.length > 0) {
+      try {
+        const current = readFileSync(personaPath, "utf8");
+        if (legacyContents.some((legacy) => current === legacy)) {
+          writeFileSync(personaPath, content, { mode: 0o644 });
+          console.error(`[entrypoint] agents.yaml: refreshed legacy ${agentId} persona`);
+        }
+      } catch (personaErr) {
+        console.error(
+          `[entrypoint] WARN: ${agentId} persona refresh skipped: ${(personaErr as Error).message}`,
+        );
+      }
     }
     return personaPath;
   }
@@ -580,6 +596,28 @@ try {
     "GPT 5.5 (default)",
     "GPT 5.5 队长",
   ]);
+
+  const LEGACY_RESEARCHER_TOOLSETS = [
+    CORE_TOOLSET_ID,
+    BROWSER_TOOLSET_ID,
+    RESEARCH_TOOLSET_ID,
+  ] as const;
+  const LEGACY_CODER_TOOLSETS = [CORE_TOOLSET_ID, BROWSER_TOOLSET_ID] as const;
+
+  function legacyPlatformToolsetsForSeed(id: unknown): readonly (readonly string[])[] {
+    switch (id) {
+      case "researcher":
+        return [LEGACY_RESEARCHER_TOOLSETS];
+      case "coder":
+        return [LEGACY_CODER_TOOLSETS];
+      default:
+        return [];
+    }
+  }
+
+  function isLegacyPlatformSeedToolsets(id: unknown, toolsets: unknown): boolean {
+    return legacyPlatformToolsetsForSeed(id).some((legacy) => sameStringArray(toolsets, legacy));
+  }
 
   function patchPlatformSeedAgent(
     agent: Record<string, unknown>,
@@ -619,8 +657,15 @@ try {
     if (typeof next.permissionMode !== "string" || next.permissionMode.trim() === "") {
       if (desired.permissionMode !== undefined) setField("permissionMode", desired.permissionMode);
     }
-    if (Array.isArray(desired.toolsets) && !Array.isArray(next.toolsets)) {
-      setField("toolsets", desired.toolsets);
+    if (Array.isArray(desired.toolsets)) {
+      if (!Array.isArray(next.toolsets)) {
+        setField("toolsets", desired.toolsets);
+      } else if (
+        isLegacyPlatformSeedToolsets(desired.id, next.toolsets) &&
+        !sameStringArray(next.toolsets, desired.toolsets)
+      ) {
+        setField("toolsets", desired.toolsets);
+      }
     }
 
     return patched ? next : null;
@@ -647,32 +692,37 @@ try {
     avatarEmoji: "🧠",
   };
 
+  const RESEARCHER_PERSONA =
+    "你是资料研究员。先澄清问题范围,优先基于当前上下文、平台文献/搜索入口和已加载 skill 描述整理证据;不要假设浏览器或 ScanSci/PDF 工具已挂载,只有当前工具列表明确包含相关工具时才调用。最后给出来源线索清楚的中文结论。\n";
+  const LEGACY_RESEARCHER_PERSONAS = [
+    "你是资料研究员。先澄清问题范围,善用浏览器和论文/PDF工具查证,最后给出来源清楚的中文结论。\n",
+  ] as const;
+  const CODER_PERSONA =
+    "你是 DeepSeek V4 Pro 代码工程师。先读代码和现有约束,再做最小必要修改;不要假设浏览器工具已挂载,需要外部资料时先说明依据,只有当前工具列表明确包含浏览器工具时才调用。验证结果后用简洁中文汇报。\n";
+  const LEGACY_CODER_PERSONAS = [
+    "你是 DeepSeek V4 Pro 代码工程师。先读代码和现有约束,再做最小必要修改,验证结果后用简洁中文汇报。\n",
+  ] as const;
+
   const desiredResearcherAgent = {
     id: "researcher",
     model: COMMERCIAL_DEFAULT_MODEL,
-    persona: ensureAgentPersona(
-      "researcher",
-      "你是资料研究员。先澄清问题范围,善用浏览器和论文/PDF工具查证,最后给出来源清楚的中文结论。\n",
-    ),
+    persona: ensureAgentPersona("researcher", RESEARCHER_PERSONA, LEGACY_RESEARCHER_PERSONAS),
     permissionMode: "bypassPermissions",
     provider: COMMERCIAL_DEFAULT_PROVIDER,
     displayName: "资料研究员",
     avatarEmoji: "🔎",
-    toolsets: [CORE_TOOLSET_ID, BROWSER_TOOLSET_ID, RESEARCH_TOOLSET_ID],
+    toolsets: [CORE_TOOLSET_ID],
   };
 
   const desiredCoderAgent = {
     id: "coder",
     model: COMMERCIAL_CODER_MODEL,
-    persona: ensureAgentPersona(
-      "coder",
-      "你是 DeepSeek V4 Pro 代码工程师。先读代码和现有约束,再做最小必要修改,验证结果后用简洁中文汇报。\n",
-    ),
+    persona: ensureAgentPersona("coder", CODER_PERSONA, LEGACY_CODER_PERSONAS),
     permissionMode: "bypassPermissions",
     provider: COMMERCIAL_CODER_PROVIDER,
     displayName: "代码工程师",
     avatarEmoji: "🛠️",
-    toolsets: [CORE_TOOLSET_ID, BROWSER_TOOLSET_ID],
+    toolsets: [CORE_TOOLSET_ID],
   };
 
   const desiredReviewerAgent = {
@@ -704,14 +754,14 @@ try {
     leaderAgentId: "codex",
     leaderRole: "科研项目负责人",
     leaderPrompt:
-      "你是科研协作队长。先把研究问题拆成可验证子问题,定义证据标准和交付物;优先把资料检索交给 researcher,把数据/复现交给 coder,把证据链复核交给 reviewer。最终按结论、证据、局限和下一步组织输出。",
+      "你是科研协作队长。先把研究问题拆成可验证子问题,定义证据标准和交付物;优先把资料整理交给 researcher,把数据/复现交给 coder,把证据链复核交给 reviewer。默认不假设 browser/research MCP 已挂载,需要外部检索或论文工具时只要求成员在当前工具列表可用时使用。最终按结论、证据、局限和下一步组织输出。",
     members: [
       {
         agentId: "researcher",
         role: "文献研究员",
-        responsibility: "检索资料、阅读论文/文档并列出可靠来源",
+        responsibility: "整理资料、阅读论文/文档并列出可靠来源",
         rolePrompt:
-          "围绕研究问题检索和筛选高可信资料,区分已证实结论、假设和争议。输出必须包含来源线索、关键证据、适用边界和仍需验证的问题。",
+          "围绕研究问题整理和筛选高可信资料,区分已证实结论、假设和争议。默认不假设浏览器或 PDF 工具可用;若当前工具列表没有 browser/research,就基于已有上下文、平台文献/搜索入口和可追溯来源线索输出。输出必须包含来源线索、关键证据、适用边界和仍需验证的问题。",
       },
       {
         agentId: "coder",
@@ -738,14 +788,14 @@ try {
     leaderAgentId: "codex",
     leaderRole: "技术负责人",
     leaderPrompt:
-      "你是编程协作队长。先确认需求、约束、影响范围和验收标准;把技术调研交给 researcher,把实现交给 coder,把质量审查交给 reviewer。保持最小改动和可验证交付,最终说明改动点、验证结果、风险和后续建议。",
+      "你是编程协作队长。先确认需求、约束、影响范围和验收标准;把技术调研交给 researcher,把实现交给 coder,把质量审查交给 reviewer。默认不假设浏览器工具已挂载,需要外部官方资料时只要求成员在当前工具列表可用时使用。保持最小改动和可验证交付,最终说明改动点、验证结果、风险和后续建议。",
     members: [
       {
         agentId: "researcher",
         role: "技术调研工程师",
-        responsibility: "查官方文档、现有实现、依赖约束和可选方案",
+        responsibility: "整理官方资料、现有实现、依赖约束和可选方案",
         rolePrompt:
-          "优先查官方文档、仓库现有模式和真实约束,给出可执行方案对比。输出要包含推荐方案、关键依据、兼容性风险和不建议采用的方案理由。",
+          "优先阅读仓库现有模式、README/锁文件、已提供资料和真实约束,给出可执行方案对比。不要假设浏览器工具可用;只有当前工具列表明确包含 browser/WebFetch 等外部访问工具时才查外部官方文档。输出要包含推荐方案、关键依据、兼容性风险和不建议采用的方案理由。",
       },
       {
         agentId: "coder",
@@ -785,6 +835,26 @@ try {
       .filter(Boolean);
   }
 
+  function hasLegacyPlatformSeedTeamPrompt(team: Record<string, unknown>, desiredId: unknown): boolean {
+    const serialized = JSON.stringify(team);
+    if (desiredId === "science_research_team") {
+      return (
+        serialized.includes("优先把资料检索交给 researcher") ||
+        serialized.includes("检索资料、阅读论文/文档并列出可靠来源") ||
+        serialized.includes("围绕研究问题检索和筛选高可信资料")
+      );
+    }
+    if (desiredId === "programming_team") {
+      return (
+        serialized.includes("默认不假设浏览器工具已挂载") === false &&
+        (serialized.includes("把技术调研交给 researcher,把实现交给 coder") ||
+          serialized.includes("查官方文档、现有实现、依赖约束和可选方案") ||
+          serialized.includes("优先查官方文档、仓库现有模式和真实约束"))
+      );
+    }
+    return false;
+  }
+
   function isDefaultSeedTeamShape(team: unknown, desired: Record<string, unknown>): boolean {
     if (!isRecord(team)) return false;
     const name = typeof team.name === "string" ? team.name : "";
@@ -808,7 +878,8 @@ try {
     if (
       currentLeader === desired.leaderAgentId &&
       sameStringSet(currentMembers, teamMemberIds(desired)) &&
-      team.name === desired.name
+      team.name === desired.name &&
+      !hasLegacyPlatformSeedTeamPrompt(team, desired.id)
     ) {
       return null;
     }
