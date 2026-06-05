@@ -204,6 +204,19 @@ describe('wechat live public page', () => {
   })
 })
 
+describe('gateway-owned wechat binding routes', () => {
+  test('binding and pairing API fall through to gateway instead of commercial 404', async () => {
+    for (const [method, path] of [
+      ['GET', '/api/wechat/binding'],
+      ['POST', '/api/wechat/pair/start'],
+    ] as const) {
+      const { handled, out } = await call(method, path)
+      assert.equal(handled, false, `${method} ${path} should be handled by gateway`)
+      assert.equal(out.body, '')
+    }
+  })
+})
+
 describe('wechat live snapshot API', () => {
   test('valid token strips c: for active DB check and returns sanitized messages', async () => {
     await seedSession()

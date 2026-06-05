@@ -847,8 +847,10 @@ export function createCommercialHandler(
     '/api/media-sign',
     '/api/media-signed',
     // WeChat 免登录实时过程页 + 对应只读 JSON 快照 API。
+    // 注意:绑定/配对接口(`/api/wechat/binding`, `/api/wechat/pair/*`)
+    // 仍由 gateway 自己处理,必须 fall through；这里不能写成 `/api/wechat/`。
     '/wx/live',
-    '/api/wechat/',
+    '/api/wechat/live',
     // V3 CC 外接 plan Phase 3(2026-05-18)— public-facing
     // `POST /api/anthropic/v1/messages`。必须列在这里,让:
     //   - maintenance gate(L802 起)能把维护期请求统一 503;
