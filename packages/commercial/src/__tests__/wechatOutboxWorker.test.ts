@@ -16,6 +16,7 @@ import {
   type SendTextFn,
   drainOne,
   runHousekeeping,
+  stableIlinkClientId,
 } from '../wechat/outboxWorker.js'
 import type { OutboxRow } from '../wechat/types.js'
 
@@ -123,6 +124,37 @@ describe('outboxWorker.drainOne', () => {
     // markSent UPDATE happened
     assert.ok(
       captured.some((c) => /UPDATE wechat_outbox SET[\s\S]+status\s*=\s*'sent'/.test(c.sql)),
+    )
+  })
+
+  test('sendText receives stable iLink client_id derived from outbound id and part index', async () => {
+    const { pool } = makeFakePool(() => ({ rows: [], rowCount: 1 }))
+    const sendCalls: Parameters<SendTextFn>[0][] = []
+    const sendText: SendTextFn = async (p) => {
+      sendCalls.push(p)
+      return { ok: true }
+    }
+    const getBinding: GetBindingFn = async () => ({
+      botToken: 'tok',
+      contextTokens: { s1: 'ctx-s1' },
+    })
+    const row = makeRow({
+      outboundId: 'outbound:retry-key-1',
+      payload: [
+        { type: 'text', text: 'part-1' },
+        { type: 'text', text: 'part-2' },
+      ],
+    })
+
+    await drainOne(row, { pool, sendText, getBinding, now, maxAttempts: 10 })
+    await drainOne(row, { pool, sendText, getBinding, now, maxAttempts: 10 })
+
+    const expected0 = stableIlinkClientId('outbound:retry-key-1', 0)
+    const expected1 = stableIlinkClientId('outbound:retry-key-1', 1)
+    assert.notEqual(expected0, expected1)
+    assert.deepEqual(
+      sendCalls.map((c) => c.clientId),
+      [expected0, expected1, expected0, expected1],
     )
   })
 
@@ -454,6 +486,8 @@ describe('outboxWorker.drainOne', () => {
     assert.equal(sendMediaCalls[0]!.botToken, 'tok')
     assert.equal(sendMediaCalls[0]!.contextToken, 'ctx')
     assert.equal(sendMediaCalls[0]!.media.kind, 'image')
+    assert.equal(sendMediaCalls[0]!.clientId, stableIlinkClientId('ob-1', 0))
+    assert.equal(sendMediaCalls[0]!.captionClientId, stableIlinkClientId('ob-1', 0, 'cap'))
     const markSentQs = captured.filter((c) => /status\s*=\s*'sent'/.test(c.sql))
     assert.equal(markSentQs.length, 1)
   })

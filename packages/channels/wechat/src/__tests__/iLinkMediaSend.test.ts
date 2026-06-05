@@ -61,6 +61,7 @@ describe('sendIlinkMedia', () => {
       filename: 'out.png',
       content: Buffer.from([0x89, 0x50, 0x4e, 0x47, 1, 2, 3, 4]),
       contextToken: 'ctx',
+      clientId: 'oc-media-stable',
     })
 
     assert.equal(captured.length, 3)
@@ -72,6 +73,7 @@ describe('sendIlinkMedia', () => {
     assert.ok(captured[1]!.body instanceof Uint8Array)
     assert.match(captured[2]!.url, /\/ilink\/bot\/sendmessage$/)
     assert.equal(captured[2]!.body.msg.context_token, 'ctx')
+    assert.equal(captured[2]!.body.msg.client_id, 'oc-media-stable')
     const item = captured[2]!.body.msg.item_list[0]
     assert.equal(item.type, 2)
     assert.equal(item.image_item.media.encrypt_query_param, 'download-param')
@@ -147,5 +149,24 @@ describe('sendIlinkMedia', () => {
     item = captured.at(-1)!.body.msg.item_list[0]
     assert.equal(item.type, 3)
     assert.equal(item.voice_item.encode_type, 7)
+  })
+
+  it('uses separate stable client_id values for caption text and media ref', async () => {
+    await sendIlinkMedia('bot-token', 'wx-user', {
+      kind: 'file',
+      filename: 'report.pdf',
+      content: Buffer.from('%PDF-1.7'),
+      contextToken: 'ctx-file',
+      caption: 'caption text',
+      captionClientId: 'oc-caption-stable',
+      clientId: 'oc-file-stable',
+    })
+
+    const sendMessages = captured.filter((req) => /\/ilink\/bot\/sendmessage$/.test(req.url))
+    assert.equal(sendMessages.length, 2)
+    assert.equal(sendMessages[0]!.body.msg.client_id, 'oc-caption-stable')
+    assert.equal(sendMessages[0]!.body.msg.item_list[0].text_item.text, 'caption text')
+    assert.equal(sendMessages[1]!.body.msg.client_id, 'oc-file-stable')
+    assert.equal(sendMessages[1]!.body.msg.item_list[0].type, 4)
   })
 })

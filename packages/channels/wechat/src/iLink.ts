@@ -34,9 +34,18 @@ export interface IlinkSendMediaInput {
   filename: string
   content: Buffer
   contextToken: string
+  /** Optional stable iLink message id for retry idempotency. */
+  clientId?: string
+  /** Optional stable iLink message id for the caption text send. */
+  captionClientId?: string
   caption?: string
   mimeType?: string
   voiceEncodeType?: number
+}
+
+export interface IlinkSendTextOptions {
+  /** Optional stable iLink message id for retry idempotency. */
+  clientId?: string
 }
 
 interface IlinkUploadedMedia {
@@ -156,12 +165,13 @@ export async function sendIlinkText(
   toUserId: string,
   contextToken: string,
   text: string,
+  opts: IlinkSendTextOptions = {},
 ): Promise<any> {
   // Boundary: 上游(broker / outboxWorker / manager)按 canonical base64url
   // 形态持有 senderId,iLink wire 要求 "<canonical>@im.wechat";幂等,
   // 已是 wire 形态时不重复加后缀。
   const wireToUserId = toIlinkUserId(toUserId)
-  const clientId = `cid-${Date.now()}-${randomBytes(4).toString('hex')}`
+  const clientId = opts.clientId?.trim() || randomIlinkClientId()
   return ilinkRequest('/ilink/bot/sendmessage', {
     method: 'POST',
     token,
@@ -189,12 +199,15 @@ export async function sendIlinkMedia(
   const kind = normalizeOutboundMediaKind(input.kind, input.filename)
   const uploaded = await uploadIlinkMedia(token, wireToUserId, kind, input.content)
   if (input.caption?.trim()) {
-    await sendIlinkText(token, wireToUserId, input.contextToken, input.caption.trim())
+    await sendIlinkText(token, wireToUserId, input.contextToken, input.caption.trim(), {
+      clientId: input.captionClientId,
+    })
   }
   return sendIlinkMediaRef(token, wireToUserId, input.contextToken, {
     kind,
     filename: input.filename,
     uploaded,
+    clientId: input.clientId,
     voiceEncodeType: input.voiceEncodeType ?? inferVoiceEncodeType(input.filename, input.mimeType),
   })
 }
@@ -207,10 +220,11 @@ async function sendIlinkMediaRef(
     kind: IlinkMediaKind
     filename: string
     uploaded: IlinkUploadedMedia
+    clientId?: string
     voiceEncodeType?: number
   },
 ): Promise<any> {
-  const clientId = `cid-${Date.now()}-${randomBytes(4).toString('hex')}`
+  const clientId = args.clientId?.trim() || randomIlinkClientId()
   const media = {
     encrypt_query_param: args.uploaded.downloadEncryptedQueryParam,
     // iLink media refs use base64(hex-string) in Tencent/openclaw examples.
@@ -413,6 +427,10 @@ function inferVoiceEncodeType(filename: string, mimeType?: string): number | und
 function safeIlinkFilename(filename: string): string {
   const base = filename.split(/[\\/]/).pop()?.trim() || 'file'
   return base.length > 120 ? base.slice(0, 120) : base
+}
+
+function randomIlinkClientId(): string {
+  return `cid-${Date.now()}-${randomBytes(4).toString('hex')}`
 }
 
 /** Extract a plain-text string from an inbound msg.item_list. */

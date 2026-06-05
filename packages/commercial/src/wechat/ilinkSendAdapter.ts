@@ -46,6 +46,7 @@ export type SendIlinkTextFn = (
   toUserId: string,
   contextToken: string,
   text: string,
+  opts?: { clientId?: string },
 ) => Promise<unknown>
 
 export type SendIlinkMediaFn = typeof sendIlinkMedia
@@ -186,7 +187,9 @@ export function makeIlinkSendAdapter(opts: MakeIlinkSendAdapterOptions = {}): Se
     text: string
   }): Promise<SendResult> => {
     try {
-      const body = await send(params.botToken, params.toUserId, params.contextToken, params.text)
+      const body = await send(params.botToken, params.toUserId, params.contextToken, params.text, {
+        clientId: params.clientId,
+      })
       const ack = classifyIlinkBusinessAck(body)
       if (!ack.ok) {
         log.warn("ilink_send_business_failed", {
@@ -223,6 +226,8 @@ export function makeIlinkSendMediaAdapter(opts: MakeIlinkSendAdapterOptions = {}
         content: params.media.content,
         mimeType: params.media.mimeType,
         contextToken: params.contextToken,
+        clientId: params.clientId,
+        captionClientId: params.captionClientId,
       })
       const ack = classifyIlinkBusinessAck(body)
       if (!ack.ok) {
