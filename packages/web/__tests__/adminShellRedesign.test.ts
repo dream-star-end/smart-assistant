@@ -51,7 +51,7 @@ describe('admin commercial redesign shell', () => {
     assert.match(adminHtml, /role="presentation" aria-hidden="true">经营驾驶舱/, 'group labels should be hidden from tablist semantics')
   })
 
-  it('keeps TABS, ADMIN_TAB_META, and static nav in sync', () => {
+  it('keeps TABS, ADMIN_TAB_META, ADMIN_TAB_VISUALS, and static nav in sync', () => {
     const tabsBlock = adminJs.slice(adminJs.indexOf('const TABS = {'), adminJs.indexOf('const ADMIN_TAB_META = {'))
     const tabsKeys = [...tabsBlock.matchAll(/^\s{2}([A-Za-z0-9_]+):\s+render/gm)].map((m) => m[1])
     assert.deepEqual(tabsKeys, EXPECTED_TABS)
@@ -59,6 +59,10 @@ describe('admin commercial redesign shell', () => {
     const metaBlock = adminJs.slice(adminJs.indexOf('const ADMIN_TAB_META = {'), adminJs.indexOf('function decorateAdminShell'))
     const metaKeys = [...metaBlock.matchAll(/^\s{2}([A-Za-z0-9_]+):\s+\{/gm)].map((m) => m[1])
     assert.deepEqual(metaKeys, EXPECTED_TABS)
+
+    const visualBlock = adminJs.slice(adminJs.indexOf('const ADMIN_TAB_VISUALS = {'), adminJs.indexOf('let _adminViewObserver'))
+    const visualKeys = [...visualBlock.matchAll(/^\s{2}([A-Za-z0-9_]+):\s+\{/gm)].map((m) => m[1])
+    assert.deepEqual(visualKeys, EXPECTED_TABS)
   })
 
   it('decorates tabs without changing routing contracts', () => {
@@ -66,5 +70,16 @@ describe('admin commercial redesign shell', () => {
     assert.match(adminJs, /querySelectorAll\('#tabs button\[data-tab\]'\)/, 'tab event binding should target only tab buttons')
     assert.match(adminJs, /btn\.setAttribute\('aria-selected', isActive \? 'true' : 'false'\)/, 'applyHash should keep aria-selected in sync')
     assert.match(adminJs, /document\.body\.dataset\.adminTab = tab/, 'active tab dataset hook missing')
+  })
+
+  it('keeps card/chart decoration resilient across direct tab rerenders', () => {
+    assert.match(adminJs, /function startAdminViewDecorator\(\)/, 'MutationObserver decorator bootstrap missing')
+    assert.match(adminJs, /new MutationObserver\(\(\) => scheduleAdminViewDecoration\(\)\)/, 'view mutation observer should reschedule card decoration')
+    assert.match(adminJs, /function decorateAdminView\(tab\)/, 'decorateAdminView helper missing')
+    assert.match(adminJs, /function wrapAdminTables\(root\)/, 'table wrapper helper missing')
+    assert.match(adminJs, /wrap\.appendChild\(table\)/, 'table wrapper must move existing table node, not rewrite/clone HTML')
+    assert.match(adminJs, /escapeHtml\(visual\.title\)/, 'visual title should be escaped before insertion')
+    assert.match(adminJs, /aria-hidden="true"/, 'decorative mini charts should be aria-hidden')
+    assert.match(adminJs, /admin-table-card/, 'admin table card class missing')
   })
 })
