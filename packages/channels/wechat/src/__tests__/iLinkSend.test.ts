@@ -70,6 +70,7 @@ describe('sendIlinkText — canonical → wire conversion on outbound', () => {
     assert.equal(req.headers.Authorization, 'Bearer bot-token-A')
     assert.equal(req.body.msg.to_user_id, 'o9cq803RaiYffHD5475dcduJaDgg@im.wechat')
     assert.equal(req.body.msg.context_token, 'ctx-tok-1')
+    assert.match(req.body.msg.client_id, /^cid-\d+-[0-9a-f]{8}$/)
     assert.equal(req.body.msg.message_type, 2)
     assert.equal(req.body.msg.item_list[0].text_item.text, 'hello')
   })
@@ -84,5 +85,11 @@ describe('sendIlinkText — canonical → wire conversion on outbound', () => {
   it('outbound preserves base_info channel_version sentinel', async () => {
     await sendIlinkText('tok', 'sender', 'ctx', 'msg')
     assert.equal(captured[0]!.body.base_info.channel_version, 'openclaude-0.0.1')
+  })
+
+  it('uses caller-supplied stable client_id when provided', async () => {
+    await sendIlinkText('tok', 'sender', 'ctx', 'msg', { clientId: 'oc-stable-123' })
+    assert.equal(captured.length, 1)
+    assert.equal(captured[0]!.body.msg.client_id, 'oc-stable-123')
   })
 })

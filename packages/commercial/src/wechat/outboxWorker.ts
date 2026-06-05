@@ -20,6 +20,7 @@
  */
 
 import type { Pool } from 'pg'
+import { createHash } from 'node:crypto'
 import {
   DEFAULT_MAX_ATTEMPTS,
   dropAgedPending,
@@ -52,6 +53,7 @@ export type SendTextFn = (params: {
   toUserId: string
   contextToken: string
   text: string
+  clientId?: string
 }) => Promise<SendResult>
 
 export type SendMediaFn = (params: {
@@ -59,6 +61,8 @@ export type SendMediaFn = (params: {
   toUserId: string
   contextToken: string
   media: ResolvedWechatOutboundMedia
+  clientId?: string
+  captionClientId?: string
 }) => Promise<SendResult>
 
 /** 读 master sqlite wechat_bindings 当前快照(broker.ts 注入)。 */
@@ -104,6 +108,24 @@ export type DrainOutcome =
   | { kind: 'failed_terminal'; outboxId: number; attempts: number; errMessage: string }
   /** markSent / markFailed 命中 0 row(状态机漂移,真正罕见);broker 只 log 不 throw。 */
   | { kind: 'noop'; outboxId: number; reason: string }
+
+export function stableIlinkClientId(
+  outboundId: string,
+  partIndex: number,
+  suffix?: string,
+): string {
+  const safeIndex = Math.max(0, Math.trunc(partIndex))
+  const safeSuffix = suffix?.replace(/[^A-Za-z0-9_-]/g, '').slice(0, 16) ?? ''
+  const hash = createHash('sha256')
+    .update(outboundId)
+    .update('\0')
+    .update(String(safeIndex))
+    .update('\0')
+    .update(safeSuffix)
+    .digest('hex')
+    .slice(0, 32)
+  return safeSuffix ? `oc-${hash}-${safeIndex}-${safeSuffix}` : `oc-${hash}-${safeIndex}`
+}
 
 /**
  * 强制把一行翻成 'failed' 终态(attempts = maxAttempts,后续 enqueue 永走 already_failed)。
@@ -190,6 +212,7 @@ export async function drainOne(
         toUserId: row.senderId,
         contextToken,
         text: part.text,
+        clientId: stableIlinkClientId(row.outboundId, i),
       })
     } else if (isMediaPart(part) && sendMedia && resolveMediaPart) {
       try {
@@ -202,6 +225,8 @@ export async function drainOne(
           toUserId: row.senderId,
           contextToken,
           media,
+          clientId: stableIlinkClientId(row.outboundId, i),
+          captionClientId: stableIlinkClientId(row.outboundId, i, 'cap'),
         })
       } catch (err) {
         result = {

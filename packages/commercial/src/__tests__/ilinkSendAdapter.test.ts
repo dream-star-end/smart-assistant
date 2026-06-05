@@ -128,6 +128,8 @@ describe("makeIlinkSendMediaAdapter", () => {
       kind: string
       filename: string
       contextToken: string
+      clientId?: string
+      captionClientId?: string
       bytes: number
     }> = []
     const adapter = makeIlinkSendMediaAdapter({
@@ -138,6 +140,8 @@ describe("makeIlinkSendMediaAdapter", () => {
           kind: input.kind,
           filename: input.filename,
           contextToken: input.contextToken,
+          clientId: input.clientId,
+          captionClientId: input.captionClientId,
           bytes: input.content.length,
         })
         return { ok: 1 }
@@ -147,6 +151,8 @@ describe("makeIlinkSendMediaAdapter", () => {
       botToken: "tok-1",
       toUserId: "wxid_alice",
       contextToken: "ctx-1",
+      clientId: "oc-media-1",
+      captionClientId: "oc-media-1-cap",
       media: {
         kind: "image",
         filename: "result.png",
@@ -162,6 +168,8 @@ describe("makeIlinkSendMediaAdapter", () => {
         kind: "image",
         filename: "result.png",
         contextToken: "ctx-1",
+        clientId: "oc-media-1",
+        captionClientId: "oc-media-1-cap",
         bytes: 3,
       },
     ])
@@ -212,10 +220,16 @@ describe("makeIlinkSendMediaAdapter", () => {
 
 describe("makeIlinkSendAdapter", () => {
   it("happy path: returns {ok:true} on successful send + forwards args correctly", async () => {
-    const calls: Array<{ token: string; toUserId: string; contextToken: string; text: string }> = []
+    const calls: Array<{
+      token: string
+      toUserId: string
+      contextToken: string
+      text: string
+      clientId?: string
+    }> = []
     const adapter = makeIlinkSendAdapter({
-      sendIlinkText: async (token, toUserId, contextToken, text) => {
-        calls.push({ token, toUserId, contextToken, text })
+      sendIlinkText: async (token, toUserId, contextToken, text, opts) => {
+        calls.push({ token, toUserId, contextToken, text, clientId: opts?.clientId })
         return { ok: 1 }
       },
     })
@@ -224,6 +238,7 @@ describe("makeIlinkSendAdapter", () => {
       toUserId: "wxid_alice",
       contextToken: "ctx-1",
       text: "hello",
+      clientId: "oc-text-1",
     })
     assert.deepEqual(r, { ok: true })
     assert.equal(calls.length, 1)
@@ -232,6 +247,7 @@ describe("makeIlinkSendAdapter", () => {
       toUserId: "wxid_alice",
       contextToken: "ctx-1",
       text: "hello",
+      clientId: "oc-text-1",
     })
   })
 
