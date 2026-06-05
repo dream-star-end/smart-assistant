@@ -300,9 +300,10 @@ async function bootstrap() {
     return
   }
   $('who').innerHTML = `<strong>${escapeHtml(user.email || '')}</strong>`
+  decorateAdminShell()
   $('logout').addEventListener('click', logout)
   // Tabs
-  for (const btn of document.querySelectorAll('#tabs button')) {
+  for (const btn of document.querySelectorAll('#tabs button[data-tab]')) {
     btn.addEventListener('click', () => navigate(btn.dataset.tab))
   }
   window.addEventListener('hashchange', applyHash)
@@ -352,6 +353,46 @@ const TABS = {
   audit: renderAuditTab,
   health: renderHealthTab,
   alerts: renderAlertsTab,
+}
+
+const ADMIN_TAB_META = {
+  dashboard: { label: '总览', desc: '收入、用量、资源和告警', key: '01' },
+  users: { label: '用户', desc: '增长、留存、余额和详情', key: '02' },
+  accounts: { label: '账号池', desc: 'Claude / Codex 账号健康', key: '03' },
+  accountGroups: { label: '账号分组', desc: '容量、权重和调度边界', key: '04' },
+  egressProxies: { label: '代理池', desc: '出口线路和失败冷却', key: '05' },
+  containers: { label: 'Agent 容器', desc: '运行态、日志和重启动作', key: '06' },
+  hosts: { label: '虚机池', desc: '磁盘、容量和调度状态', key: '07' },
+  ledger: { label: '积分流水', desc: '账务明细和 CSV 导出', key: '08' },
+  orders: { label: '订单', desc: '支付状态和回调详情', key: '09' },
+  pricing: { label: '定价', desc: '模型倍率和启用策略', key: '10' },
+  plans: { label: '充值套餐', desc: '金额、积分和排序', key: '11' },
+  modelGrants: { label: '用户模型授权', desc: '按用户放行特殊模型', key: '12' },
+  feedback: { label: '反馈', desc: '用户问题、优先级和确认', key: '13' },
+  inbox: { label: '站内信', desc: '发送、历史和触达记录', key: '14' },
+  literature: { label: '文献检索', desc: '检索服务连接和配额', key: '15' },
+  settings: { label: '系统设置', desc: '开关、阈值和 JSON 配置', key: '16' },
+  audit: { label: '审计日志', desc: '操作者、对象和配置变更', key: '17' },
+  health: { label: '健康面板', desc: '服务依赖和探针状态', key: '18' },
+  alerts: { label: '告警', desc: '风险确认、静默和处理', key: '19' },
+}
+
+function decorateAdminShell() {
+  for (const btn of document.querySelectorAll('#tabs button[data-tab]')) {
+    const tab = btn.dataset.tab
+    const meta = ADMIN_TAB_META[tab]
+    if (!meta) continue
+    btn.setAttribute('role', 'tab')
+    btn.setAttribute('aria-controls', 'view')
+    btn.setAttribute('aria-label', `${meta.label}: ${meta.desc}`)
+    btn.title = meta.desc
+    if (!btn.querySelector('.tab-label')) {
+      btn.innerHTML = `
+        <span class="tab-label">${escapeHtml(meta.label)}</span>
+        <span class="tab-key">${escapeHtml(meta.key)}</span>
+        <span class="tab-desc">${escapeHtml(meta.desc)}</span>`
+    }
+  }
 }
 
 // pendingDeeplink:cross-tab 跳转时,把 query 暂存到这个一次性 token。
@@ -444,8 +485,11 @@ function applyHash() {
     try { TAB_CLEANUPS[_currentTab]?.() } catch {}
   }
   _currentTab = tab
-  for (const btn of document.querySelectorAll('#tabs button')) {
-    btn.classList.toggle('active', btn.dataset.tab === tab)
+  document.body.dataset.adminTab = tab
+  for (const btn of document.querySelectorAll('#tabs button[data-tab]')) {
+    const isActive = btn.dataset.tab === tab
+    btn.classList.toggle('active', isActive)
+    btn.setAttribute('aria-selected', isActive ? 'true' : 'false')
   }
   setLoading()
   TABS[tab]().catch((e) => showError(`加载失败: ${e.message}`, e))
