@@ -37,6 +37,21 @@ describe("WeChat outbound media path expansion", () => {
     );
     assert.deepEqual(expanded.media.map((m) => m.type), ["video", "voice", "file"]);
   });
+
+  test("extracts Unicode generated file basenames", () => {
+    const expanded = expandTextWithWechatMediaParts(
+      "有，generated/ 目录里有：`/home/agent/.openclaude/generated/自媒体运营入门.pptx`。要我发给你吗？",
+    );
+    assert.equal(expanded.media.length, 1);
+    assert.equal(expanded.media[0]!.type, "file");
+    assert.equal(expanded.media[0]!.filename, "自媒体运营入门.pptx");
+    assert.equal(
+      expanded.media[0]!.containerPath,
+      "/home/agent/.openclaude/generated/自媒体运营入门.pptx",
+    );
+    assert.ok(!expanded.text.includes("/home/agent/.openclaude/generated/自媒体运营入门.pptx"));
+    assert.match(expanded.text, /有，generated\/ 目录里有：。要我发给你吗？/);
+  });
 });
 
 describe("WeChat outbound media resolver", () => {
@@ -101,6 +116,37 @@ describe("WeChat outbound media resolver", () => {
     });
     assert.equal(media.kind, "file");
     assert.equal(media.mimeType, "application/pdf");
+  });
+
+  test("reads current user's local generated Unicode filename", async () => {
+    const root = await mkdtemp(join(tmpdir(), "oc-wechat-media-"));
+    try {
+      const uploads = join(root, "uploads");
+      const generated = join(root, "generated");
+      await mkdir(generated, { recursive: true });
+      await mkdir(uploads, { recursive: true });
+      await writeFile(join(generated, "自媒体运营入门.pptx"), Buffer.from("pptx bytes"));
+      const resolve = makeWechatOutboundMediaResolver({
+        resolveUserMediaDirs: async () => ({ kind: "ok", uid: 42, uploads, generated }),
+      });
+      const media = await resolve({
+        bindingUserId: "42",
+        part: {
+          type: "file",
+          containerPath: "/home/agent/.openclaude/generated/自媒体运营入门.pptx",
+          filename: "自媒体运营入门.pptx",
+        },
+      });
+      assert.equal(media.kind, "file");
+      assert.equal(
+        media.mimeType,
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+      );
+      assert.equal(media.filename, "自媒体运营入门.pptx");
+      assert.equal(media.content.toString("utf8"), "pptx bytes");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
 
   test("rejects local symlink media paths instead of following them", async () => {

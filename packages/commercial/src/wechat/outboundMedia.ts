@@ -9,8 +9,8 @@ export const WECHAT_OUTBOUND_MEDIA_MAX_ATTACHMENTS = 5;
 export const WECHAT_OUTBOUND_MEDIA_MAX_BYTES = 100 * 1024 * 1024;
 
 const CONTAINER_MEDIA_RE =
-  /(?:`)?(\/home\/agent\/\.openclaude\/(uploads|generated)\/[A-Za-z0-9._@+=,-]{1,180})(?:`)?/g;
-const SAFE_BASENAME_RE = /^[A-Za-z0-9._@+=,-]{1,180}$/;
+  /(?:`)?(\/home\/agent\/\.openclaude\/(uploads|generated)\/([^\s`"'<>/\\]{1,260}\.(?:png|jpe?g|gif|webp|mp4|mov|m4v|webm|mp3|wav|ogg|oga|silk|amr|pdf|txt|md|csv|json|docx|xlsx|pptx|zip|tar|gz)))(?:`)?(?=$|[\s`"'<>，。！？、；：,.!?;:)）\]}】])/giu;
+const MAX_SAFE_BASENAME_CODEPOINTS = 180;
 
 export interface ResolvedWechatOutboundMedia {
   kind: IlinkMediaPart["type"];
@@ -56,7 +56,7 @@ export function expandTextWithWechatMediaParts(
       continue;
     }
     const file = basename(containerPath);
-    if (!SAFE_BASENAME_RE.test(file) || file === "." || file === "..") {
+    if (!isSafeWechatMediaBasename(file)) {
       out += raw;
       continue;
     }
@@ -152,7 +152,7 @@ function hostPathForContainerPath(
   if (!m) throw new Error("invalid outbound media container path");
   const dir = m[1]!;
   const file = m[2]!;
-  if (!SAFE_BASENAME_RE.test(file) || file === "." || file === "..") {
+  if (!isSafeWechatMediaBasename(file)) {
     throw new Error("invalid outbound media filename");
   }
   const baseDir = dir === "uploads" ? loc.uploads : loc.generated;
@@ -238,6 +238,13 @@ function canonicalCommercialUserId(input: string): string {
 function assertMediaSize(bytes: number): void {
   if (!Number.isFinite(bytes) || bytes <= 0) throw new Error("empty outbound media");
   if (bytes > WECHAT_OUTBOUND_MEDIA_MAX_BYTES) throw new Error("outbound media exceeds size limit");
+}
+
+function isSafeWechatMediaBasename(filename: string): boolean {
+  if (filename === "." || filename === "..") return false;
+  if (Array.from(filename).length > MAX_SAFE_BASENAME_CODEPOINTS) return false;
+  if (/[\u0000-\u001f\u007f/\\]/u.test(filename)) return false;
+  return true;
 }
 
 function compactTextAfterMediaRemoval(text: string): string {
