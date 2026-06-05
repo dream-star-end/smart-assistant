@@ -1461,6 +1461,571 @@
         .form-actions .btn { width: 100%; }
       }
 
+
+      /* ══════════ 2026 Admin command-center redesign ══════════ */
+      body.admin-shell-body {
+        min-height: 100dvh;
+        display: grid;
+        grid-template-columns: 292px minmax(0, 1fr);
+        grid-template-rows: 72px minmax(0, 1fr);
+        grid-template-areas:
+          "admin-header admin-header"
+          "admin-nav admin-main";
+        overflow: hidden;
+        background:
+          radial-gradient(ellipse 900px 420px at 16% -160px, var(--accent-soft), transparent 62%),
+          radial-gradient(ellipse 700px 360px at 84% -140px, rgba(181, 148, 239, 0.10), transparent 58%),
+          linear-gradient(180deg, var(--bg) 0%, color-mix(in srgb, var(--bg) 92%, #000 8%) 100%);
+      }
+      body.admin-shell-body::before {
+        content: "";
+        position: fixed;
+        inset: 0;
+        pointer-events: none;
+        background-image:
+          linear-gradient(rgba(255,255,255,0.025) 1px, transparent 1px),
+          linear-gradient(90deg, rgba(255,255,255,0.018) 1px, transparent 1px);
+        background-size: 42px 42px;
+        mask-image: linear-gradient(to bottom, rgba(0,0,0,0.65), transparent 72%);
+      }
+      body.admin-shell-body header.app {
+        grid-area: admin-header;
+        position: relative;
+        top: auto;
+        z-index: 60;
+        min-height: 72px;
+        padding: 12px 22px;
+        border-bottom: 1px solid var(--border-subtle);
+        background: color-mix(in srgb, var(--bg) 80%, transparent);
+        box-shadow: 0 12px 34px rgba(0,0,0,0.18);
+      }
+      body.admin-shell-body header.app .brand {
+        min-width: 236px;
+        gap: 12px;
+      }
+      body.admin-shell-body header.app .brand-mark {
+        width: 42px;
+        height: 42px;
+        border-radius: 15px;
+        border-color: var(--accent-border);
+        background: linear-gradient(135deg, var(--accent-hover), var(--accent-active));
+        box-shadow: 0 16px 34px color-mix(in srgb, var(--accent) 22%, transparent);
+      }
+      body.admin-shell-body header.app .brand-mark img { width: 26px; height: 26px; }
+      body.admin-shell-body .brand-copy { display: grid; gap: 1px; }
+      body.admin-shell-body .brand-name {
+        font-size: 15px;
+        font-weight: 800;
+        letter-spacing: -0.025em;
+      }
+      body.admin-shell-body header.app .brand small {
+        margin: 0;
+        color: var(--muted);
+        font-family: var(--font-sans);
+        font-size: 11.5px;
+        letter-spacing: 0.02em;
+      }
+      .admin-topline {
+        color: var(--muted);
+        font-size: 12px;
+        padding: 7px 12px;
+        border: 1px solid var(--border-subtle);
+        border-radius: var(--r-pill);
+        background: var(--bg-subtle);
+      }
+      body.admin-shell-body header.app .who,
+      body.admin-shell-body header.app .theme-toggle,
+      body.admin-shell-body header.app .btn-logout {
+        background: color-mix(in srgb, var(--panel) 88%, transparent);
+        border-color: var(--border-subtle);
+        box-shadow: var(--shadow-sm);
+      }
+      body.admin-shell-body .tabs {
+        grid-area: admin-nav;
+        position: relative;
+        z-index: 10;
+        display: flex;
+        flex-direction: column;
+        align-items: stretch;
+        gap: 4px;
+        width: 100%;
+        max-width: none;
+        height: calc(100dvh - 72px);
+        margin: 0;
+        padding: 18px 14px 22px;
+        overflow-y: auto;
+        overflow-x: hidden;
+        scrollbar-width: thin;
+        border-right: 1px solid var(--border-subtle);
+        background: color-mix(in srgb, var(--bg) 70%, transparent);
+        backdrop-filter: blur(18px) saturate(155%);
+        -webkit-backdrop-filter: blur(18px) saturate(155%);
+      }
+      body.admin-shell-body .tabs::-webkit-scrollbar { width: 8px; height: 8px; }
+      body.admin-shell-body .tabs::-webkit-scrollbar-thumb { background: var(--border-strong); }
+      .tab-group-label {
+        display: block;
+        margin: 15px 10px 6px;
+        color: var(--dim);
+        font-size: 10.5px;
+        font-weight: 800;
+        letter-spacing: 0.13em;
+        text-transform: uppercase;
+      }
+      .tab-group-label:first-child { margin-top: 2px; }
+      body.admin-shell-body .tabs button {
+        position: relative;
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) auto;
+        grid-template-areas:
+          "label key"
+          "desc desc";
+        gap: 2px 10px;
+        width: 100%;
+        min-height: 54px;
+        padding: 10px 12px 10px 14px;
+        border: 1px solid transparent;
+        border-radius: 16px;
+        color: var(--text-soft);
+        text-align: left;
+        background: transparent;
+      }
+      body.admin-shell-body .tabs button::before {
+        content: "";
+        position: absolute;
+        left: 7px;
+        top: 13px;
+        bottom: 13px;
+        width: 3px;
+        border-radius: var(--r-pill);
+        background: transparent;
+      }
+      body.admin-shell-body .tabs button:hover {
+        color: var(--text-strong);
+        background: var(--panel-2);
+        border-color: var(--border-subtle);
+      }
+      body.admin-shell-body .tabs button.active {
+        color: var(--text-strong);
+        background: linear-gradient(135deg, var(--accent-soft), color-mix(in srgb, var(--panel) 84%, transparent));
+        border-color: var(--accent-border);
+        box-shadow: 0 10px 26px color-mix(in srgb, var(--accent) 13%, transparent);
+      }
+      body.admin-shell-body .tabs button.active::before { background: var(--accent); }
+      .tab-label {
+        grid-area: label;
+        min-width: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        font-size: 13px;
+        font-weight: 750;
+        letter-spacing: -0.01em;
+      }
+      .tab-desc {
+        grid-area: desc;
+        min-width: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        color: var(--muted);
+        font-size: 11.5px;
+        font-weight: 500;
+      }
+      .tab-key {
+        grid-area: key;
+        align-self: center;
+        padding: 2px 7px;
+        border-radius: var(--r-pill);
+        border: 1px solid var(--border-subtle);
+        background: var(--bg-subtle);
+        color: var(--dim);
+        font: 600 10px/1.4 var(--font-mono);
+      }
+      body.admin-shell-body main.content {
+        grid-area: admin-main;
+        position: relative;
+        width: 100%;
+        max-width: none;
+        height: calc(100dvh - 72px);
+        margin: 0;
+        overflow: auto;
+        padding: 28px clamp(18px, 3vw, 42px) 72px;
+      }
+      body.admin-shell-body main.content > * { max-width: 1480px; margin-left: auto; margin-right: auto; }
+      body.admin-shell-body .dash,
+      body.admin-shell-body .panel,
+      body.admin-shell-body .admin-card,
+      body.admin-shell-body .chart-card {
+        border-color: var(--border-subtle);
+        background: color-mix(in srgb, var(--panel) 88%, transparent);
+        backdrop-filter: blur(12px);
+        -webkit-backdrop-filter: blur(12px);
+      }
+      body.admin-shell-body .panel,
+      body.admin-shell-body .admin-card,
+      body.admin-shell-body .chart-card,
+      body.admin-shell-body .stat-card {
+        border-radius: var(--r-xl);
+        box-shadow: var(--shadow-sm);
+      }
+      body.admin-shell-body .panel { padding: 22px; }
+      body.admin-shell-body .panel h1,
+      body.admin-shell-body .panel h2,
+      body.admin-shell-body .dash-h1 h2 {
+        font-size: clamp(20px, 2vw, 28px);
+        font-weight: 800;
+        letter-spacing: -0.045em;
+      }
+      body.admin-shell-body .dash-h1 {
+        padding: 20px;
+        border: 1px solid var(--border-subtle);
+        border-radius: 24px;
+        background:
+          radial-gradient(circle at 8% 0%, var(--accent-soft), transparent 32%),
+          color-mix(in srgb, var(--panel) 86%, transparent);
+      }
+      body.admin-shell-body .dash-sub { color: var(--muted); font-weight: 500; }
+      body.admin-shell-body .stat-grid { gap: 14px; }
+      body.admin-shell-body .stat-card {
+        position: relative;
+        overflow: hidden;
+        min-height: 112px;
+        padding: 16px 18px;
+        background: color-mix(in srgb, var(--panel) 90%, transparent);
+      }
+      body.admin-shell-body .stat-card::after {
+        content: "";
+        position: absolute;
+        inset: auto 18px 14px auto;
+        width: 42px;
+        height: 42px;
+        border-radius: 16px;
+        background: linear-gradient(135deg, var(--accent-soft), transparent);
+        opacity: .75;
+      }
+      body.admin-shell-body .stat-value { font-size: clamp(24px, 3vw, 34px); letter-spacing: -0.055em; }
+      body.admin-shell-body .toolbar {
+        padding: 12px;
+        border: 1px solid var(--border-subtle);
+        border-radius: 18px;
+        background: var(--bg-subtle);
+      }
+      body.admin-shell-body .toolbar input[type="text"],
+      body.admin-shell-body .toolbar select,
+      body.admin-shell-body .toolbar input[type="number"],
+      body.admin-shell-body .form-row input,
+      body.admin-shell-body .form-row select,
+      body.admin-shell-body .form-row textarea {
+        border-radius: 14px;
+        background: color-mix(in srgb, var(--bg-subtle) 88%, transparent);
+      }
+      body.admin-shell-body .btn,
+      body.admin-shell-body .btn-primary,
+      body.admin-shell-body table.data td.actions button,
+      body.admin-shell-body .modal .form-actions button {
+        border-radius: 14px;
+      }
+      body.admin-shell-body .btn-primary {
+        background: linear-gradient(135deg, var(--accent-hover), var(--accent-active));
+        box-shadow: 0 12px 26px color-mix(in srgb, var(--accent) 22%, transparent);
+      }
+      body.admin-shell-body .table-scroll {
+        margin: 0;
+        border: 1px solid var(--border-subtle);
+        border-radius: 18px;
+        background: color-mix(in srgb, var(--bg-subtle) 72%, transparent);
+      }
+      body.admin-shell-body table.data th {
+        position: sticky;
+        top: 0;
+        z-index: 1;
+        background: color-mix(in srgb, var(--bg-subtle) 94%, transparent);
+      }
+      body.admin-shell-body table.data tbody tr:hover td {
+        background: color-mix(in srgb, var(--accent-soft) 58%, var(--panel-2));
+      }
+      body.admin-shell-body .badge,
+      body.admin-shell-body .chip {
+        border-radius: var(--r-pill);
+      }
+      body.admin-shell-body .empty,
+      body.admin-shell-body .loading,
+      body.admin-shell-body .placeholder {
+        border-radius: 20px;
+        background: color-mix(in srgb, var(--bg-subtle) 72%, transparent);
+        border: 1px solid var(--border-subtle);
+      }
+      body.admin-shell-body .modal {
+        border-radius: 26px;
+        border-color: var(--border-subtle);
+        background: color-mix(in srgb, var(--panel) 94%, transparent);
+        box-shadow: var(--shadow-xl, var(--shadow-lg));
+      }
+      body.admin-shell-body .toast-wrap {
+        top: calc(84px + env(safe-area-inset-top, 0));
+      }
+      body.admin-shell-body .login-gate {
+        grid-column: 1 / -1;
+        grid-row: 1 / -1;
+        min-height: 100dvh;
+      }
+      @media (max-width: 1080px) {
+        body.admin-shell-body {
+          display: block;
+          overflow: auto;
+        }
+        body.admin-shell-body header.app {
+          position: sticky;
+          top: 0;
+        }
+        .admin-topline { display: none; }
+        body.admin-shell-body .tabs {
+          position: sticky;
+          top: 72px;
+          z-index: 50;
+          flex-direction: row;
+          gap: 6px;
+          height: auto;
+          padding: 10px 12px;
+          overflow-x: auto;
+          overflow-y: hidden;
+          border-right: 0;
+          border-bottom: 1px solid var(--border-subtle);
+          scrollbar-width: none;
+        }
+        body.admin-shell-body .tabs::-webkit-scrollbar { height: 0; }
+        body.admin-shell-body .tabs .tab-group-label { display: none; }
+        body.admin-shell-body .tabs button {
+          display: inline-flex;
+          width: auto;
+          min-width: max-content;
+          min-height: 40px;
+          padding: 8px 12px;
+        }
+        body.admin-shell-body .tabs button::before,
+        body.admin-shell-body .tabs .tab-desc,
+        body.admin-shell-body .tabs .tab-key { display: none; }
+        body.admin-shell-body .tabs .tab-label { font-size: 12.5px; }
+        body.admin-shell-body main.content {
+          height: auto;
+          min-height: calc(100dvh - 128px);
+          overflow: visible;
+          padding: 18px 14px 56px;
+        }
+      }
+      @media (max-width: 620px) {
+        body.admin-shell-body header.app { min-height: 64px; padding: 10px 12px; }
+        body.admin-shell-body header.app .brand { min-width: 0; }
+        body.admin-shell-body header.app .brand-mark { width: 34px; height: 34px; border-radius: 12px; }
+        body.admin-shell-body .brand-copy small,
+        body.admin-shell-body header.app .who { display: none; }
+        body.admin-shell-body .panel { padding: 16px; }
+        body.admin-shell-body .dash-h1 { padding: 16px; }
+      }
+
+
+      /* ── Admin feature visualization pass: cards + decorative mini charts ── */
+      body.admin-shell-body main.content.admin-visualized {
+        display: flex;
+        flex-direction: column;
+        gap: 18px;
+      }
+      body.admin-shell-body .admin-page-hero {
+        display: grid;
+        grid-template-columns: minmax(260px, 0.85fr) minmax(420px, 1.15fr);
+        gap: 18px;
+        align-items: stretch;
+        padding: 20px;
+        border: 1px solid var(--border-subtle);
+        border-radius: 28px;
+        background:
+          radial-gradient(circle at 10% -10%, var(--accent-soft), transparent 42%),
+          linear-gradient(135deg, color-mix(in srgb, var(--panel) 92%, transparent), color-mix(in srgb, var(--bg-subtle) 74%, transparent));
+        box-shadow: var(--shadow-sm);
+      }
+      .admin-page-hero-copy {
+        min-width: 0;
+        display: flex;
+        flex-direction: column;
+        justify-content: center;
+        gap: 8px;
+        padding: 4px 2px;
+      }
+      .admin-page-kicker {
+        width: fit-content;
+        padding: 5px 10px;
+        border-radius: var(--r-pill);
+        border: 1px solid var(--accent-border);
+        background: var(--accent-soft);
+        color: var(--accent-hover);
+        font-size: 11px;
+        font-weight: 850;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+      }
+      .admin-page-hero h1 {
+        margin: 0;
+        color: var(--text-strong);
+        font-size: clamp(24px, 3vw, 38px);
+        line-height: 1.02;
+        font-weight: 850;
+        letter-spacing: -0.06em;
+      }
+      .admin-page-hero p {
+        margin: 0;
+        max-width: 680px;
+        color: var(--muted);
+        font-size: 13.5px;
+      }
+      .admin-visual-card-grid {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 12px;
+      }
+      .admin-visual-card {
+        position: relative;
+        min-height: 164px;
+        overflow: hidden;
+        padding: 15px;
+        border: 1px solid var(--border-subtle);
+        border-radius: 22px;
+        background: color-mix(in srgb, var(--panel) 84%, transparent);
+        box-shadow: 0 10px 24px rgba(0,0,0,0.10);
+      }
+      .admin-visual-card::before {
+        content: "";
+        position: absolute;
+        inset: auto -24px -34px auto;
+        width: 112px;
+        height: 112px;
+        border-radius: 40px;
+        background: linear-gradient(135deg, var(--accent-soft), transparent 68%);
+        transform: rotate(18deg);
+      }
+      .admin-visual-card-label {
+        color: var(--dim);
+        font-size: 10.5px;
+        font-weight: 800;
+        letter-spacing: 0.1em;
+        text-transform: uppercase;
+      }
+      .admin-visual-card strong {
+        position: relative;
+        z-index: 1;
+        display: block;
+        margin-top: 7px;
+        color: var(--text-strong);
+        font-size: 16px;
+        line-height: 1.2;
+        letter-spacing: -0.025em;
+      }
+      .admin-visual-card p {
+        position: relative;
+        z-index: 1;
+        margin: 7px 0 0;
+        color: var(--muted);
+        font-size: 12px;
+        line-height: 1.45;
+      }
+      .admin-mini-chart {
+        position: absolute;
+        left: 15px;
+        right: 15px;
+        bottom: 14px;
+        height: 42px;
+        display: flex;
+        align-items: end;
+        gap: 7px;
+      }
+      .admin-mini-chart span {
+        flex: 1;
+        min-height: 8px;
+        border-radius: 999px 999px 4px 4px;
+        background: linear-gradient(180deg, var(--accent-hover), var(--accent-active));
+        opacity: 0.82;
+        box-shadow: 0 8px 18px color-mix(in srgb, var(--accent) 18%, transparent);
+      }
+      .admin-mini-chart span:nth-child(2) {
+        background: linear-gradient(180deg, color-mix(in srgb, var(--accent-hover) 72%, var(--warn)), var(--accent));
+        opacity: 0.68;
+      }
+      .admin-mini-chart span:nth-child(3) {
+        background: linear-gradient(180deg, color-mix(in srgb, var(--accent-hover) 70%, var(--info)), var(--accent-active));
+        opacity: 0.58;
+      }
+      body.admin-shell-body .admin-panel-card {
+        position: relative;
+        overflow: hidden;
+      }
+      body.admin-shell-body .admin-panel-card::before {
+        content: "";
+        position: absolute;
+        inset: 0 0 auto 0;
+        height: 1px;
+        background: linear-gradient(90deg, transparent, var(--accent-border), transparent);
+        opacity: .75;
+      }
+      body.admin-shell-body .admin-stat-card {
+        display: flex;
+        flex-direction: column;
+        justify-content: space-between;
+      }
+      body.admin-shell-body .admin-stat-card .stat-label::before {
+        content: "";
+        display: inline-block;
+        width: 7px;
+        height: 7px;
+        margin-right: 7px;
+        border-radius: 50%;
+        background: var(--accent);
+        box-shadow: 0 0 10px var(--accent-border);
+        vertical-align: 1px;
+      }
+      body.admin-shell-body .admin-toolbar-card {
+        box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--border-subtle) 70%, transparent);
+      }
+      body.admin-shell-body .admin-table-card {
+        margin-top: 12px;
+        border: 1px solid var(--border-subtle);
+        border-radius: 22px;
+        background:
+          linear-gradient(180deg, color-mix(in srgb, var(--panel) 70%, transparent), color-mix(in srgb, var(--bg-subtle) 58%, transparent));
+        box-shadow: var(--shadow-sm);
+      }
+      body.admin-shell-body .admin-table-card table.data {
+        min-width: 100%;
+      }
+      body.admin-shell-body .admin-table-card table.data th:first-child,
+      body.admin-shell-body .admin-table-card table.data td:first-child {
+        padding-left: 18px;
+      }
+      body.admin-shell-body .admin-table-card table.data th:last-child,
+      body.admin-shell-body .admin-table-card table.data td:last-child {
+        padding-right: 18px;
+      }
+      body.admin-shell-body .admin-table-card table.data tbody tr:last-child td:first-child { border-bottom-left-radius: 18px; }
+      body.admin-shell-body .admin-table-card table.data tbody tr:last-child td:last-child { border-bottom-right-radius: 18px; }
+      body.admin-shell-body .h-grid,
+      body.admin-shell-body .chart-grid,
+      body.admin-shell-body .admin-two-col {
+        gap: 16px;
+      }
+      body.admin-shell-body .h-card {
+        border-radius: 22px;
+        border-color: var(--border-subtle);
+        background: color-mix(in srgb, var(--panel) 86%, transparent);
+        box-shadow: var(--shadow-sm);
+      }
+      @media (max-width: 1180px) {
+        body.admin-shell-body .admin-page-hero { grid-template-columns: 1fr; }
+      }
+      @media (max-width: 760px) {
+        body.admin-shell-body .admin-visual-card-grid { grid-template-columns: 1fr; }
+        body.admin-shell-body .admin-page-hero { padding: 16px; border-radius: 22px; }
+        body.admin-shell-body .admin-visual-card { min-height: 142px; }
+      }
+
       /* Reduced motion */
       @media (prefers-reduced-motion: reduce) {
         *, *::before, *::after {
@@ -1471,12 +2036,16 @@
       }
     </style>
   </head>
-  <body>
+  <body class="admin-shell-body">
     <header class="app">
       <span class="brand">
         <span class="brand-mark"><img src="/icon.svg" alt="OpenClaude" /></span>
-        OpenClaude<small>/ admin</small>
+        <span class="brand-copy">
+          <span class="brand-name">OpenClaude</span>
+          <small>商业版管理后台</small>
+        </span>
       </span>
+      <span class="admin-topline" aria-hidden="true">经营 · 账号池 · 资源 · 财务 · 系统健康</span>
       <span class="spacer"></span>
       <span class="who" id="who">—</span>
       <button class="theme-toggle" id="theme-toggle" title="切换主题" aria-label="切换主题">
@@ -1485,28 +2054,34 @@
       <a href="/" class="btn-logout" id="back-to-app" title="返回用户端">返回应用</a>
       <button class="btn-logout" id="logout">退出</button>
     </header>
-    <nav class="tabs" id="tabs" role="tablist">
-      <button data-tab="dashboard" class="active">总览</button>
-      <button data-tab="users">用户</button>
-      <button data-tab="accounts">账号池</button>
-      <button data-tab="accountGroups">账号分组</button>
-      <button data-tab="egressProxies">代理池</button>
-      <button data-tab="containers">容器</button>
-      <button data-tab="hosts">虚机池</button>
-      <button data-tab="ledger">积分流水</button>
-      <button data-tab="orders">订单</button>
-      <button data-tab="pricing">定价</button>
-      <button data-tab="plans">充值套餐</button>
-      <button data-tab="modelGrants">用户模型授权</button>
-      <button data-tab="feedback">反馈</button>
-      <button data-tab="inbox">站内信</button>
-      <button data-tab="literature">文献检索</button>
-      <button data-tab="settings">系统设置</button>
-      <button data-tab="audit">审计日志</button>
-      <button data-tab="health">健康面板</button>
-      <button data-tab="alerts">告警</button>
+    <nav class="tabs" id="tabs" role="tablist" aria-label="超管后台导航">
+      <span class="tab-group-label" role="presentation" aria-hidden="true">经营驾驶舱</span>
+      <button data-tab="dashboard" class="active" role="tab" aria-selected="true">总览</button>
+      <button data-tab="users" role="tab" aria-selected="false">用户</button>
+      <span class="tab-group-label" role="presentation" aria-hidden="true">账号与调度</span>
+      <button data-tab="accounts" role="tab" aria-selected="false">账号池</button>
+      <button data-tab="accountGroups" role="tab" aria-selected="false">账号分组</button>
+      <button data-tab="egressProxies" role="tab" aria-selected="false">代理池</button>
+      <span class="tab-group-label" role="presentation" aria-hidden="true">运行资源</span>
+      <button data-tab="containers" role="tab" aria-selected="false">容器</button>
+      <button data-tab="hosts" role="tab" aria-selected="false">虚机池</button>
+      <span class="tab-group-label" role="presentation" aria-hidden="true">财务与商业</span>
+      <button data-tab="ledger" role="tab" aria-selected="false">积分流水</button>
+      <button data-tab="orders" role="tab" aria-selected="false">订单</button>
+      <button data-tab="pricing" role="tab" aria-selected="false">定价</button>
+      <button data-tab="plans" role="tab" aria-selected="false">充值套餐</button>
+      <button data-tab="modelGrants" role="tab" aria-selected="false">用户模型授权</button>
+      <span class="tab-group-label" role="presentation" aria-hidden="true">用户触达</span>
+      <button data-tab="feedback" role="tab" aria-selected="false">反馈</button>
+      <button data-tab="inbox" role="tab" aria-selected="false">站内信</button>
+      <span class="tab-group-label" role="presentation" aria-hidden="true">系统运营</span>
+      <button data-tab="literature" role="tab" aria-selected="false">文献检索</button>
+      <button data-tab="settings" role="tab" aria-selected="false">系统设置</button>
+      <button data-tab="audit" role="tab" aria-selected="false">审计日志</button>
+      <button data-tab="health" role="tab" aria-selected="false">健康面板</button>
+      <button data-tab="alerts" role="tab" aria-selected="false">告警</button>
     </nav>
-    <main class="content" id="view">
+    <main class="content" id="view" role="tabpanel" tabindex="0">
       <div class="loading">加载中…</div>
     </main>
     <div class="toast-wrap" id="toasts"></div>
