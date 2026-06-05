@@ -21,7 +21,10 @@ import {
 import type { UserMediaLocation } from "../agent-sandbox/userMedia.js";
 
 const CONTAINER_UPLOADS_DIR = "/home/agent/.openclaude/uploads";
-const DOWNLOAD_TIMEOUT_MS = 15_000;
+export const WECHAT_MEDIA_DOWNLOAD_MIN_TIMEOUT_MS = 60_000;
+export const WECHAT_MEDIA_DOWNLOAD_MAX_TIMEOUT_MS = 10 * 60_000;
+const WECHAT_MEDIA_DOWNLOAD_BASELINE_MS = 60_000;
+const WECHAT_MEDIA_DOWNLOAD_FLOOR_BYTES_PER_SECOND = 192 * 1024;
 const MAX_DOWNLOAD_REDIRECTS = 3;
 const ALLOWED_WECHAT_MEDIA_HOSTS = [
   "cdn.weixin.qq.com",
@@ -141,7 +144,13 @@ export async function saveWechatMediaToUserUploads(
   const media = args.media.slice(0, WECHAT_MEDIA_MAX_ATTACHMENTS);
   const saved: SavedWechatMedia[] = [];
   for (const item of media) {
-    const encrypted = await downloadWechatMediaEncrypted(item.fullUrl, fetchFn);
+    const encrypted = await downloadWechatMediaEncrypted(
+      item.fullUrl,
+      fetchFn,
+      WECHAT_MEDIA_MAX_BYTES,
+      "media",
+      computeWechatMediaDownloadTimeoutMs(item.size, WECHAT_MEDIA_MAX_BYTES),
+    );
     const decrypted = decryptIlinkMediaBuffer(encrypted, item.aesKeyHex, item);
     saved.push(await writeWechatMedia(loc, decrypted, item, deps.pushRemoteHostUpload));
   }
@@ -191,10 +200,11 @@ export async function downloadWechatMediaEncrypted(
   fetchFn: typeof fetch = fetch,
   maxBytes = WECHAT_MEDIA_MAX_BYTES,
   label = "media",
+  timeoutMs = computeWechatMediaDownloadTimeoutMs(undefined, maxBytes),
 ): Promise<Buffer> {
   let currentUrl = assertAllowedWechatMediaUrl(fullUrl);
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), DOWNLOAD_TIMEOUT_MS);
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     for (let redirects = 0; redirects <= MAX_DOWNLOAD_REDIRECTS; redirects++) {
       const res = await fetchFn(currentUrl, {
@@ -231,6 +241,23 @@ export async function downloadWechatMediaEncrypted(
   } finally {
     clearTimeout(timer);
   }
+}
+
+export function computeWechatMediaDownloadTimeoutMs(
+  expectedBytes: number | undefined,
+  maxBytes = WECHAT_MEDIA_MAX_BYTES,
+): number {
+  const boundedMaxBytes =
+    Number.isFinite(maxBytes) && maxBytes > 0 ? maxBytes : WECHAT_MEDIA_MAX_BYTES;
+  const bytes =
+    expectedBytes !== undefined && Number.isFinite(expectedBytes) && expectedBytes > 0
+      ? Math.min(expectedBytes, boundedMaxBytes)
+      : boundedMaxBytes;
+  const transferMs = Math.ceil((bytes / WECHAT_MEDIA_DOWNLOAD_FLOOR_BYTES_PER_SECOND) * 1000);
+  return Math.max(
+    WECHAT_MEDIA_DOWNLOAD_MIN_TIMEOUT_MS,
+    Math.min(WECHAT_MEDIA_DOWNLOAD_MAX_TIMEOUT_MS, WECHAT_MEDIA_DOWNLOAD_BASELINE_MS + transferMs),
+  );
 }
 
 function isRedirectStatus(status: number): boolean {
