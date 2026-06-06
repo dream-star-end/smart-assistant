@@ -23,6 +23,10 @@ import { loadUserPrefs, setCachedPrefField } from './userPrefs.js?v=4fbd5498'
 let _pollAbort = null
 let _currentQrcode = null
 let _toolPrefSaving = false
+let _workerRefreshTimer = null
+
+const WORKER_START_GRACE_MS = 45_000
+const WORKER_REFRESH_DELAY_MS = 2_000
 
 function setError(msg) {
   const el = $('wechat-error')
@@ -43,11 +47,39 @@ function showState(name) {
   }
 }
 
+function clearWorkerRefreshTimer() {
+  if (!_workerRefreshTimer) return
+  clearTimeout(_workerRefreshTimer)
+  _workerRefreshTimer = null
+}
+
+function bindingCreatedRecently(binding) {
+  const createdAt = Number(binding?.createdAt || 0)
+  if (!Number.isFinite(createdAt) || createdAt <= 0) return false
+  const ageMs = Date.now() - createdAt
+  return ageMs >= 0 && ageMs <= WORKER_START_GRACE_MS
+}
+
+function isWorkerStarting(binding) {
+  return binding?.status === 'active' &&
+    binding.worker_running === false &&
+    bindingCreatedRecently(binding)
+}
+
+function scheduleWorkerRefresh() {
+  if (_workerRefreshTimer) return
+  _workerRefreshTimer = setTimeout(() => {
+    _workerRefreshTimer = null
+    void loadBinding()
+  }, WORKER_REFRESH_DELAY_MS)
+}
+
 async function loadBinding() {
   try {
     const resp = await apiGet('/api/wechat/binding')
     const { binding, channel_enabled } = resp || {}
     if (!binding) {
+      clearWorkerRefreshTimer()
       showState('unbound')
       // 2026-04-25 audit P0-1:生产 channels.wechat.enabled=false 时用户点"开始"
       // 会被 409。提前给一行提示让其别白扫。
@@ -62,11 +94,21 @@ async function loadBinding() {
     const statusColor = binding.status === 'active' ? 'var(--success, #22c55e)'
       : binding.status === 'expired' ? 'var(--danger, #ef4444)'
       : 'var(--fg-muted)'
+    const workerStarting = isWorkerStarting(binding)
+    if (workerStarting) {
+      scheduleWorkerRefresh()
+    } else {
+      clearWorkerRefreshTimer()
+    }
     // worker_running=false 但 status=active:DB 记录在,但 manager 没起 worker
     // (config.enabled=false / 新绑定还没 reconcile / init 失败)。告诉用户消息收不到,
     // 避免看到绿色 active 以为一切正常(生产 2026-04-25 踩过坑)。
+    // 刚绑定成功后,worker 由 manager 下一个 reconcile 启动;首个 GET 可能早于
+    // worker start 几百毫秒到数秒。新绑定短暂显示"启动中"并自动刷新,避免误报。
     const workerWarn = (binding.worker_running === false)
-      ? ` <span style="color:var(--danger, #ef4444);margin-left:8px">· 通道未启用,消息收不到</span>`
+      ? workerStarting
+        ? ` <span style="color:var(--warning, #f59e0b);margin-left:8px">· 通道启动中,稍后自动刷新</span>`
+        : ` <span style="color:var(--danger, #ef4444);margin-left:8px">· 通道未启用,消息收不到</span>`
       : ''
     $('wechat-status').innerHTML = `<span style="color:${statusColor}">${binding.status}</span>` +
       (binding.lastEventAt ? ` · 最近消息 ${new Date(binding.lastEventAt).toLocaleString()}` : '') +
@@ -215,6 +257,7 @@ async function pollLoop(qrcode) {
 
 async function unbind() {
   if (!confirm('确定解绑?该微信号将无法再与此 OC 用户对话。')) return
+  clearWorkerRefreshTimer()
   try {
     await apiJson('DELETE', '/api/wechat/binding')
     toast('已解绑', 'success')
@@ -279,6 +322,7 @@ async function saveToolCallPreference() {
 
 export function openWechatModal() {
   setError('')
+  clearWorkerRefreshTimer()
   showState('unbound')
   openModal('wechat-modal')
   loadBinding()
@@ -297,6 +341,7 @@ export function initWechatListeners() {
     if (!close) return
     if (_pollAbort) _pollAbort.abort()
     _currentQrcode = null
+    clearWorkerRefreshTimer()
     closeModal('wechat-modal')
   })
 }
