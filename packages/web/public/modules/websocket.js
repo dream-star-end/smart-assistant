@@ -1260,8 +1260,8 @@ export function handleOutbound(frame) {
       // content-bearing message get added AFTER the target user message?
       // This is more robust than relying on transient streaming pointers.
       // Roles considered content: assistant, thinking, tool, agent-group,
-      // and permission (permission prompts are visible cards that count as
-      // real turn output).
+      // plan, goal, and permission (permission prompts are visible cards
+      // that count as real turn output).
       let producedContent = false
       const targetIdx = sess.messages.findIndex((m) => m.id === _targetMsg.id)
       if (targetIdx >= 0) {
@@ -1273,6 +1273,7 @@ export function handleOutbound(frame) {
             r === 'tool' ||
             r === 'agent-group' ||
             r === 'plan' ||
+            r === 'goal' ||
             r === 'permission'
           ) {
             producedContent = true
@@ -1322,6 +1323,7 @@ export function handleOutbound(frame) {
             r === 'tool' ||
             r === 'agent-group' ||
             r === 'plan' ||
+            r === 'goal' ||
             r === 'permission'
           ) {
             priorTurnHadContent = true
@@ -1502,6 +1504,36 @@ export function handleOutbound(frame) {
         if (sess.id === state.currentSessionId) _deps.updateMessageEl(planMsg, !!planMsg._partial)
       }
       sess._streamingPlan = planMsg._partial ? planMsg : null
+    } else if (block.kind === 'goal') {
+      const goalId = block.blockId || 'codex-goal'
+      let goalMsg = null
+      if (goalId && sess._blockIdToMsgId?.has(goalId)) {
+        const mid = sess._blockIdToMsgId.get(goalId)
+        goalMsg = sess.messages.find((m) => m.id === mid && m.role === 'goal') || null
+      }
+      const objective = typeof block.objective === 'string' ? block.objective : ''
+      const goalFields = {
+        blockId: goalId,
+        status: typeof block.status === 'string' ? block.status : '',
+        tokenBudget:
+          typeof block.tokenBudget === 'number' || block.tokenBudget === null
+            ? block.tokenBudget
+            : undefined,
+        tokensUsed: typeof block.tokensUsed === 'number' ? block.tokensUsed : undefined,
+        timeUsedSeconds:
+          typeof block.timeUsedSeconds === 'number' ? block.timeUsedSeconds : undefined,
+        updatedAt: typeof block.updatedAt === 'number' ? block.updatedAt : undefined,
+        cleared: !!block.cleared,
+        completedAt: Date.now(),
+      }
+      if (!goalMsg) {
+        goalMsg = addMessage(sess, 'goal', objective, goalFields)
+        if (goalId) sess._blockIdToMsgId.set(goalId, goalMsg.id)
+      } else {
+        goalMsg.text = objective || goalMsg.text || ''
+        Object.assign(goalMsg, goalFields)
+        if (sess.id === state.currentSessionId) _deps.updateMessageEl(goalMsg)
+      }
     } else if (block.kind === 'tool_use') {
       // The assistant text (and thinking) segment just ended — next turn
       // content will go into a new message. Stamp completion time BEFORE
@@ -1523,8 +1555,14 @@ export function handleOutbound(frame) {
       if (isAgent) {
         // Sub-agent: create a collapsible group card + register as bg task
         if (!sess._agentGroups) sess._agentGroups = new Map()
+        const input =
+          block.inputJson && typeof block.inputJson === 'object' ? block.inputJson : null
+        const desc =
+          (input && typeof input.description === 'string' && input.description) ||
+          (input && typeof input.prompt === 'string' && input.prompt.slice(0, 80)) ||
+          (block.inputPreview || '').replace(/[{}"]/g, '').slice(0, 80) ||
+          '子任务'
         if (block.blockId && !sess._agentGroups.has(block.blockId)) {
-          const desc = (block.inputPreview || '').replace(/[{}"]/g, '').slice(0, 80) || '子任务'
           const groupMsg = addMessage(sess, 'agent-group', desc, {
             blockId: block.blockId,
             toolName: 'Agent',
@@ -1534,6 +1572,13 @@ export function handleOutbound(frame) {
           sess._agentGroups.set(block.blockId, groupMsg.id)
           if (block.blockId) sess._blockIdToMsgId.set(block.blockId, groupMsg.id)
           addBgTask(block.blockId, desc)
+        } else if (block.blockId && sess._agentGroups.has(block.blockId)) {
+          const groupMsgId = sess._agentGroups.get(block.blockId)
+          const groupMsg = sess.messages.find((m) => m.id === groupMsgId)
+          if (groupMsg && desc && groupMsg.text !== desc) {
+            groupMsg.text = desc
+            if (sess.id === state.currentSessionId) _deps.updateMessageEl(groupMsg)
+          }
         }
       } else if (block.blockId && sess._blockIdToMsgId.has(block.blockId)) {
         // Update existing tool card (streaming partial → final)
@@ -1583,8 +1628,11 @@ export function handleOutbound(frame) {
 
       // Check if this result belongs to a sub-agent group
       const isAgentResult = /^Agent$/i.test(block.toolName || '')
-      if (isAgentResult && block.blockId && sess._agentGroups?.has(block.blockId)) {
-        const groupMsgId = sess._agentGroups.get(block.blockId)
+      const agentToolUseId =
+        block.toolUseBlockId ||
+        (block.blockId ? String(block.blockId).replace(/:result$/, '') : null)
+      if (isAgentResult && agentToolUseId && sess._agentGroups?.has(agentToolUseId)) {
+        const groupMsgId = sess._agentGroups.get(agentToolUseId)
         const groupMsg = sess.messages.find((m) => m.id === groupMsgId)
         if (groupMsg) {
           groupMsg._completed = true
@@ -1592,7 +1640,7 @@ export function handleOutbound(frame) {
           groupMsg._resultPreview = (block.preview || '').slice(0, 200)
           groupMsg._isError = !!block.isError
           if (sess.id === state.currentSessionId) _deps.updateMessageEl(groupMsg)
-          completeBgTask(block.blockId, block.isError ? 'failed' : 'done', {
+          completeBgTask(agentToolUseId, block.isError ? 'failed' : 'done', {
             preview: (block.preview || '').slice(0, 100),
           })
         }

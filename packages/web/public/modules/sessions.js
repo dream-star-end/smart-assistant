@@ -8,7 +8,7 @@ import { getSession, state } from './state.js'
 import { deleteSessionFromServer, pushSessionToServer } from './sync.js?v=1'
 import { toast } from './ui.js'
 import { GROUP_ORDER, sessionGroup, shortTime, uuid } from './util.js'
-import { nudgeDrain } from './websocket.js?v=38'
+import { nudgeDrain } from './websocket.js?v=39'
 
 // Late-bound references set by main.js
 let _renderMessages

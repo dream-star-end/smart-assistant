@@ -2130,6 +2130,75 @@ a:hover {
   margin-bottom: 0;
 }
 
+/* ── Codex goal card ── */
+.msg.goal {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: 12px 14px;
+  border: 1px solid var(--border-subtle);
+  border-left: 3px solid var(--accent);
+  border-radius: var(--radius-md);
+  background: rgba(191, 122, 80, 0.04);
+  max-width: 100%;
+}
+.goal-card-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+}
+.goal-card-title {
+  color: var(--fg);
+  font-weight: 600;
+  font-size: var(--text-sm);
+}
+.goal-card-state {
+  color: var(--fg-muted);
+  font-size: var(--text-xs);
+}
+.goal-card-state.active {
+  color: var(--info);
+}
+.goal-card-state.complete {
+  color: var(--success);
+}
+.goal-card-state.blocked,
+.goal-card-state.usageLimited,
+.goal-card-state.budgetLimited {
+  color: var(--danger);
+}
+.goal-card-body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+.goal-card-objective {
+  color: var(--fg);
+  font-size: var(--text-sm);
+  line-height: 1.55;
+  white-space: pre-wrap;
+  overflow-wrap: break-word;
+}
+.goal-card-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  color: var(--fg-muted);
+  font-size: var(--text-xs);
+}
+.goal-card-progress {
+  height: 5px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: var(--bg-raised);
+}
+.goal-card-progress-fill {
+  height: 100%;
+  border-radius: inherit;
+  background: var(--accent);
+}
+
 /* Current-session plan / task drawer */
 .plan-panel-btn {
   position: relative;
