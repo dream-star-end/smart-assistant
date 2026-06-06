@@ -231,6 +231,27 @@ export class CcbMessageParser {
       return
     }
 
+    // Codex app-server thread goals are session/thread state, not assistant
+    // prose. Surface them as first-class goal blocks without polluting the
+    // assistant text buffer used for transcript persistence.
+    if (raw.type === 'openclaude_goal') {
+      const goal = raw.goal && typeof raw.goal === 'object' ? raw.goal : {}
+      const block: Record<string, unknown> = { kind: 'goal' }
+      if (typeof goal.blockId === 'string') block.blockId = goal.blockId
+      if (typeof goal.objective === 'string') block.objective = goal.objective
+      if (typeof goal.status === 'string') block.status = goal.status
+      if (typeof goal.tokenBudget === 'number' || goal.tokenBudget === null) {
+        block.tokenBudget = goal.tokenBudget
+      }
+      if (typeof goal.tokensUsed === 'number') block.tokensUsed = goal.tokensUsed
+      if (typeof goal.timeUsedSeconds === 'number') block.timeUsedSeconds = goal.timeUsedSeconds
+      if (typeof goal.updatedAt === 'number') block.updatedAt = goal.updatedAt
+      if (typeof goal.cleared === 'boolean') block.cleared = goal.cleared
+      if (parentToolUseId) block.parentToolUseId = parentToolUseId
+      this.onEvent({ kind: 'block', block: block as OutboundContentBlock })
+      return
+    }
+
     // ── system messages ──
     // Most system subtypes (init / success / error / task_*) are ignored by
     // the gateway; CCB emits them for SDK consumers like VS Code and Scuttle

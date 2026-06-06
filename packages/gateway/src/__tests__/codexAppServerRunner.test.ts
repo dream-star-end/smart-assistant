@@ -603,6 +603,388 @@ describe('handleNotification — plan and reasoning deltas', () => {
   })
 })
 
+describe('handleNotification — goals', () => {
+  it('thread/goal/updated emits an openclaude_goal payload with forward-compatible status', async () => {
+    const h = await makeHarness()
+    ;(h.runner as any).threadId = 'thr-goal'
+
+    feed(h.runner, {
+      jsonrpc: '2.0',
+      method: 'thread/goal/updated',
+      params: {
+        threadId: 'thr-goal',
+        goal: {
+          objective: 'Ship goals support',
+          status: 'usageLimited',
+          tokenBudget: 1000,
+          tokensUsed: 125,
+          timeUsedSeconds: 8,
+          updatedAt: 1780000000,
+        },
+      },
+    })
+
+    assert.equal(h.messages.length, 1)
+    assert.equal(h.messages[0].type, 'openclaude_goal')
+    assert.deepEqual(h.messages[0].goal, {
+      blockId: 'codex-goal',
+      objective: 'Ship goals support',
+      status: 'usageLimited',
+      tokenBudget: 1000,
+      tokensUsed: 125,
+      timeUsedSeconds: 8,
+      updatedAt: 1780000000,
+    })
+    assert.equal((h.runner as any).currentAssistantBuf, '')
+    await h.cleanup()
+  })
+
+  it('thread/goal/cleared upserts the stable goal block as cleared', async () => {
+    const h = await makeHarness()
+    ;(h.runner as any).threadId = 'thr-goal'
+
+    feed(h.runner, {
+      jsonrpc: '2.0',
+      method: 'thread/goal/cleared',
+      params: { threadId: 'thr-goal' },
+    })
+
+    assert.equal(h.messages.length, 1)
+    assert.equal(h.messages[0].type, 'openclaude_goal')
+    assert.deepEqual(h.messages[0].goal, {
+      blockId: 'codex-goal',
+      cleared: true,
+    })
+    await h.cleanup()
+  })
+})
+
+describe('handleNotification — collabAgentToolCall', () => {
+  it('spawnAgent creates an Agent group but completed spawn does not close it', async () => {
+    const h = await makeHarness()
+    ;(h.runner as any).activeTurnId = 't-collab'
+
+    feed(h.runner, {
+      jsonrpc: '2.0',
+      method: 'item/started',
+      params: {
+        threadId: 'thr',
+        turnId: 't-collab',
+        item: {
+          id: 'spawn-1',
+          type: 'collabAgentToolCall',
+          tool: 'spawnAgent',
+          status: 'inProgress',
+          receiverThreadIds: ['child-1'],
+          prompt: 'inspect auth flow',
+          model: 'gpt-5.5',
+          reasoningEffort: 'high',
+          agentsStates: {},
+        },
+      },
+    })
+    feed(h.runner, {
+      jsonrpc: '2.0',
+      method: 'item/completed',
+      params: {
+        threadId: 'thr',
+        turnId: 't-collab',
+        item: {
+          id: 'spawn-1',
+          type: 'collabAgentToolCall',
+          tool: 'spawnAgent',
+          status: 'completed',
+          receiverThreadIds: ['child-1'],
+          prompt: 'inspect auth flow',
+          agentsStates: { 'child-1': { status: 'running', message: null } },
+        },
+      },
+    })
+
+    await new Promise((r) => setImmediate(r))
+    assert.equal(h.messages.length, 1)
+    assert.equal(h.messages[0].message.content[0].type, 'tool_use')
+    assert.equal(h.messages[0].message.content[0].name, 'Agent')
+    assert.equal(
+      h.messages.some((m) => m.type === 'user' && m.message.content[0]?.tool_use_id === 'spawn-1'),
+      false,
+    )
+    await h.cleanup()
+  })
+
+  it('spawnAgent completed with terminal agentsStates closes the Agent group', async () => {
+    const h = await makeHarness()
+    ;(h.runner as any).activeTurnId = 't-collab'
+
+    feed(h.runner, {
+      jsonrpc: '2.0',
+      method: 'item/started',
+      params: {
+        threadId: 'thr',
+        turnId: 't-collab',
+        item: {
+          id: 'spawn-fast',
+          type: 'collabAgentToolCall',
+          tool: 'spawnAgent',
+          status: 'inProgress',
+          receiverThreadIds: ['child-fast'],
+          prompt: 'fast job',
+          agentsStates: {},
+        },
+      },
+    })
+    feed(h.runner, {
+      jsonrpc: '2.0',
+      method: 'item/completed',
+      params: {
+        threadId: 'thr',
+        turnId: 't-collab',
+        item: {
+          id: 'spawn-fast',
+          type: 'collabAgentToolCall',
+          tool: 'spawnAgent',
+          status: 'completed',
+          receiverThreadIds: ['child-fast'],
+          prompt: 'fast job',
+          agentsStates: { 'child-fast': { status: 'completed', message: 'done' } },
+        },
+      },
+    })
+
+    await new Promise((r) => setImmediate(r))
+    const agentResult = h.messages.find(
+      (m) => m.type === 'user' && m.message.content[0]?.tool_use_id === 'spawn-fast',
+    )
+    assert.ok(agentResult)
+    assert.equal(agentResult.message.content[0].is_error, false)
+    assert.match(agentResult.message.content[0].content, /completed/)
+    await h.cleanup()
+  })
+
+  it('failed spawnAgent closes the Agent group with an error result', async () => {
+    const h = await makeHarness()
+    ;(h.runner as any).activeTurnId = 't-collab'
+
+    feed(h.runner, {
+      jsonrpc: '2.0',
+      method: 'item/started',
+      params: {
+        threadId: 'thr',
+        turnId: 't-collab',
+        item: {
+          id: 'spawn-fail',
+          type: 'collabAgentToolCall',
+          tool: 'spawnAgent',
+          status: 'inProgress',
+          receiverThreadIds: [],
+          prompt: 'spawn fails',
+          agentsStates: {},
+        },
+      },
+    })
+    feed(h.runner, {
+      jsonrpc: '2.0',
+      method: 'item/completed',
+      params: {
+        threadId: 'thr',
+        turnId: 't-collab',
+        item: {
+          id: 'spawn-fail',
+          type: 'collabAgentToolCall',
+          tool: 'spawnAgent',
+          status: 'failed',
+          receiverThreadIds: [],
+          prompt: 'spawn fails',
+          agentsStates: {},
+        },
+      },
+    })
+
+    await new Promise((r) => setImmediate(r))
+    const result = h.messages.find(
+      (m) => m.type === 'user' && m.message.content[0]?.tool_use_id === 'spawn-fail',
+    )
+    assert.ok(result)
+    assert.equal(result.message.content[0].is_error, true)
+    await h.cleanup()
+  })
+
+  it('wait with running agent stays as Codex:multiAgent and does not close spawn group', async () => {
+    const h = await makeHarness()
+    ;(h.runner as any).activeTurnId = 't-collab'
+
+    feed(h.runner, {
+      jsonrpc: '2.0',
+      method: 'item/started',
+      params: {
+        threadId: 'thr',
+        turnId: 't-collab',
+        item: {
+          id: 'spawn-2',
+          type: 'collabAgentToolCall',
+          tool: 'spawnAgent',
+          status: 'inProgress',
+          receiverThreadIds: ['child-2'],
+          prompt: 'long job',
+          agentsStates: {},
+        },
+      },
+    })
+    feed(h.runner, {
+      jsonrpc: '2.0',
+      method: 'item/completed',
+      params: {
+        threadId: 'thr',
+        turnId: 't-collab',
+        item: {
+          id: 'spawn-2',
+          type: 'collabAgentToolCall',
+          tool: 'spawnAgent',
+          status: 'completed',
+          receiverThreadIds: ['child-2'],
+          prompt: 'long job',
+          agentsStates: {},
+        },
+      },
+    })
+    feed(h.runner, {
+      jsonrpc: '2.0',
+      method: 'item/started',
+      params: {
+        threadId: 'thr',
+        turnId: 't-collab',
+        item: {
+          id: 'wait-1',
+          type: 'collabAgentToolCall',
+          tool: 'wait',
+          status: 'inProgress',
+          receiverThreadIds: ['child-2'],
+          agentsStates: { 'child-2': { status: 'running', message: 'still working' } },
+        },
+      },
+    })
+    feed(h.runner, {
+      jsonrpc: '2.0',
+      method: 'item/completed',
+      params: {
+        threadId: 'thr',
+        turnId: 't-collab',
+        item: {
+          id: 'wait-1',
+          type: 'collabAgentToolCall',
+          tool: 'wait',
+          status: 'completed',
+          receiverThreadIds: ['child-2'],
+          agentsStates: { 'child-2': { status: 'running', message: 'still working' } },
+        },
+      },
+    })
+
+    await new Promise((r) => setImmediate(r))
+    const toolUses = h.messages
+      .filter((m) => m.type === 'assistant')
+      .map((m) => m.message.content[0])
+    assert.equal(
+      toolUses.some((c) => c.name === 'Codex:multiAgent'),
+      true,
+    )
+    assert.equal(
+      h.messages.some((m) => m.type === 'user' && m.message.content[0]?.tool_use_id === 'spawn-2'),
+      false,
+    )
+    assert.equal(
+      h.messages.some((m) => m.type === 'user' && m.message.content[0]?.tool_use_id === 'wait-1'),
+      true,
+    )
+    await h.cleanup()
+  })
+
+  it('wait with terminal agentsStates completes the original Agent group', async () => {
+    const h = await makeHarness()
+    ;(h.runner as any).activeTurnId = 't-collab'
+
+    feed(h.runner, {
+      jsonrpc: '2.0',
+      method: 'item/started',
+      params: {
+        threadId: 'thr',
+        turnId: 't-collab',
+        item: {
+          id: 'spawn-3',
+          type: 'collabAgentToolCall',
+          tool: 'spawnAgent',
+          status: 'inProgress',
+          receiverThreadIds: ['child-3'],
+          prompt: 'finish job',
+          agentsStates: {},
+        },
+      },
+    })
+    feed(h.runner, {
+      jsonrpc: '2.0',
+      method: 'item/completed',
+      params: {
+        threadId: 'thr',
+        turnId: 't-collab',
+        item: {
+          id: 'spawn-3',
+          type: 'collabAgentToolCall',
+          tool: 'spawnAgent',
+          status: 'completed',
+          receiverThreadIds: ['child-3'],
+          prompt: 'finish job',
+          agentsStates: {},
+        },
+      },
+    })
+    feed(h.runner, {
+      jsonrpc: '2.0',
+      method: 'item/started',
+      params: {
+        threadId: 'thr',
+        turnId: 't-collab',
+        item: {
+          id: 'wait-2',
+          type: 'collabAgentToolCall',
+          tool: 'wait',
+          status: 'inProgress',
+          receiverThreadIds: ['child-3'],
+          agentsStates: { 'child-3': { status: 'running', message: null } },
+        },
+      },
+    })
+    feed(h.runner, {
+      jsonrpc: '2.0',
+      method: 'item/completed',
+      params: {
+        threadId: 'thr',
+        turnId: 't-collab',
+        item: {
+          id: 'wait-2',
+          type: 'collabAgentToolCall',
+          tool: 'wait',
+          status: 'completed',
+          receiverThreadIds: ['child-3'],
+          agentsStates: { 'child-3': { status: 'completed', message: 'done' } },
+        },
+      },
+    })
+
+    await new Promise((r) => setImmediate(r))
+    const controlResult = h.messages.find(
+      (m) => m.type === 'user' && m.message.content[0]?.tool_use_id === 'wait-2',
+    )
+    const agentResult = h.messages.find(
+      (m) => m.type === 'user' && m.message.content[0]?.tool_use_id === 'spawn-3',
+    )
+    assert.ok(controlResult)
+    assert.ok(agentResult)
+    assert.equal(agentResult.message.content[0].is_error, false)
+    assert.match(agentResult.message.content[0].content, /completed/)
+    await h.cleanup()
+  })
+})
+
 describe('handleNotification — item/completed', () => {
   it('commandExecution → tool_result with exit code 0 (no error)', async () => {
     const h = await makeHarness()

@@ -161,6 +161,18 @@ export const OutboundContentBlock = Type.Union([
     partial: Type.Optional(Type.Boolean()),
     parentToolUseId: Type.Optional(Type.String()),
   }),
+  Type.Object({
+    kind: Type.Literal('goal'),
+    blockId: Type.Optional(Type.String()),
+    objective: Type.Optional(Type.String()),
+    status: Type.Optional(Type.String()),
+    tokenBudget: Type.Optional(Type.Union([Type.Number(), Type.Null()])),
+    tokensUsed: Type.Optional(Type.Number()),
+    timeUsedSeconds: Type.Optional(Type.Number()),
+    updatedAt: Type.Optional(Type.Number()),
+    cleared: Type.Optional(Type.Boolean()),
+    parentToolUseId: Type.Optional(Type.String()),
+  }),
   // Snapshot of a long-running bash command's tail output. Snapshot
   // semantics: the consumer REPLACES its prior tail buffer with `tail`
   // rather than appending — the polling cadence is deliberately lossy

@@ -110,7 +110,7 @@ import {
   showContextMenu,
   startInlineRename,
   switchSession,
-} from './sessions.js?v=1'
+} from './sessions.js?v=2'
 
 // ── Messages ──
 import {
@@ -125,7 +125,7 @@ import {
   setMessageDeps,
   updateMessageEl,
   updateSessionSub,
-} from './messages.js?v=37'
+} from './messages.js?v=38'
 
 // ── WebSocket ──
 import {
@@ -153,7 +153,7 @@ import {
   updateMessage,
   updateMsgStatus,
   updateSendEnabled,
-} from './websocket.js?v=38'
+} from './websocket.js?v=39'
 
 // ── Slash commands ──
 import {

@@ -103,6 +103,40 @@ describe('CcbMessageParser: text streaming', () => {
       assert.equal(b.partial, true)
     }
   })
+
+  it('emits goal blocks from codex openclaude_goal payloads', () => {
+    const { parser, events } = createParser()
+
+    parser.parse({
+      type: 'openclaude_goal',
+      goal: {
+        blockId: 'codex-goal',
+        objective: 'adapt goals',
+        status: 'blocked',
+        tokenBudget: null,
+        tokensUsed: 42,
+        timeUsedSeconds: 7,
+        updatedAt: 1780000000,
+        cleared: false,
+      },
+    } as any)
+
+    assert.equal(events.length, 1)
+    assert.equal(events[0].kind, 'block')
+    if (events[0].kind === 'block') {
+      const b = events[0].block as any
+      assert.equal(b.kind, 'goal')
+      assert.equal(b.blockId, 'codex-goal')
+      assert.equal(b.objective, 'adapt goals')
+      assert.equal(b.status, 'blocked')
+      assert.equal(b.tokenBudget, null)
+      assert.equal(b.tokensUsed, 42)
+      assert.equal(b.timeUsedSeconds, 7)
+      assert.equal(b.updatedAt, 1780000000)
+      assert.equal(b.cleared, false)
+    }
+    assert.equal(parser.assistantBuf, '')
+  })
 })
 
 // ── System status ──
