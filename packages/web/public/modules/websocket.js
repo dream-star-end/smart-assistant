@@ -2,7 +2,7 @@
 import { $, htmlSafeEscape } from './dom.js'
 import { maybeNotify, setTitleBusy } from './notifications.js'
 import { getSession, state } from './state.js'
-import { maybeSyncNow } from './sync.js?v=1'
+import { maybeSyncNow } from './sync.js?v=2'
 import { toast } from './ui.js'
 
 // ── Late-binding for circular deps (sessions.js, messages.js) ──
@@ -587,6 +587,14 @@ export function setStatus(label, klass) {
 export function updateSendEnabled() {
   const btn = $('send')
   const svg = btn.querySelector('svg')
+  const sess = getSession()
+  if (sess?._needsFetch || sess?._hydrating) {
+    btn.disabled = true
+    btn.classList.remove('stopping')
+    if (svg)
+      svg.innerHTML = '<line x1="12" y1="19" x2="12" y2="5"/><polyline points="5 12 12 5 19 12"/>'
+    return
+  }
   // Allow sending even when disconnected — messages will be queued offline
   // (matching Enter-key behavior which already queues)
   if (state.wsStatus !== 'connected' && !state.sendingInFlight) {
@@ -606,6 +614,22 @@ export function updateSendEnabled() {
     if (svg)
       svg.innerHTML = '<line x1="12" y1="19" x2="12" y2="5"/><polyline points="5 12 12 5 19 12"/>'
   }
+}
+
+export function buildHelloPeers() {
+  const peers = []
+  for (const [id, s] of state.sessions) {
+    const isCurrent = id === state.currentSessionId
+    const hasCursor = typeof s._lastFrameSeq === 'number' && s._lastFrameSeq > 0
+    if (!isCurrent && !s._sendingInFlight && !hasCursor) continue
+    peers.push({
+      peerId: id,
+      agentId: s.agentId || state.defaultAgentId,
+      inFlight: !!s._sendingInFlight,
+      lastFrameSeq: s._lastFrameSeq || 0,
+    })
+  }
+  return peers
 }
 // Clears per-turn reply tracker state so the next incoming frame re-binds fresh.
 // Must be called from any path that abandons an in-flight turn locally (/clear,
@@ -861,15 +885,7 @@ export function connect() {
     // outbound frames the client missed during the disconnect window. 0 means
     // "I've never received a frameSeq'd frame" (fresh tab or legacy client).
     try {
-      const peers = []
-      for (const [id, s] of state.sessions) {
-        peers.push({
-          peerId: id,
-          agentId: s.agentId || state.defaultAgentId,
-          inFlight: !!s._sendingInFlight,
-          lastFrameSeq: s._lastFrameSeq || 0,
-        })
-      }
+      const peers = buildHelloPeers()
       ws.send(JSON.stringify({ type: 'inbound.hello', channel: 'webchat', peers }))
     } catch {}
     // Flush offline queue — delay drain start to let hello/resume isFinals arrive first.
