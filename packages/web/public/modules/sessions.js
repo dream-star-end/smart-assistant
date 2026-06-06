@@ -5,10 +5,10 @@ import { exportSessionDocx } from './export-docx.js'
 import { exportSessionTex } from './export-tex.js'
 import { setTitleBusy } from './notifications.js'
 import { getSession, state } from './state.js'
-import { deleteSessionFromServer, pushSessionToServer } from './sync.js?v=1'
+import { deleteSessionFromServer, hydrateSession, pushSessionToServer } from './sync.js?v=2'
 import { toast } from './ui.js'
 import { GROUP_ORDER, sessionGroup, shortTime, uuid } from './util.js'
-import { nudgeDrain } from './websocket.js?v=39'
+import { nudgeDrain } from './websocket.js?v=40'
 
 // Late-bound references set by main.js
 let _renderMessages
@@ -73,6 +73,22 @@ export function switchSession(id) {
   if (state.sendingInFlight) {
     _showTypingIndicator()
     setTitleBusy(true)
+  }
+  if (newSess?._needsFetch && !newSess._hydrating) {
+    hydrateSession(id)
+      .then((hydrated) => {
+        if (!hydrated || state.currentSessionId !== id) return
+        state.sendingInFlight = hydrated._sendingInFlight || false
+        _updateSendEnabled()
+        renderSidebar()
+        _renderMessages()
+        _renderAgentDropdown()
+        if (state.sendingInFlight) {
+          _showTypingIndicator()
+          setTitleBusy(true)
+        }
+      })
+      .catch(() => toast('完整历史加载失败，请稍后重试', 'error'))
   }
   $('sidebar').classList.remove('open')
   $('sidebar-backdrop').classList.remove('open')
@@ -159,6 +175,10 @@ const _deletedIds = new Set()
 export function scheduleSave(s, immediate) {
   const sess = s || getSession()
   if (!sess) return
+  if (sess._needsFetch && sess._syncedAt) {
+    console.warn('[sessions] refused to save placeholder before hydration', sess.id)
+    return
+  }
   sess.lastAt = Date.now()
   sess._dirty = true // mark as having unsaved local changes
   _rebuildSearchIndex(sess)
@@ -215,6 +235,10 @@ export function enqueueSaveForRetry(sessId) {
 
 function _enqueueSave(sess) {
   if (_deletedIds.has(sess.id)) return
+  if (sess._needsFetch && sess._syncedAt) {
+    console.warn('[sessions] refused to enqueue placeholder save before hydration', sess.id)
+    return
+  }
   // Chain onto any in-flight save for this session to serialize both the
   // local dbPut AND the server PUT. Serializing the PUT is what prevents the
   // 409 storm: the next _doSave starts only after the prior PUT's response
@@ -301,6 +325,10 @@ async function _doSave(sess) {
     _streamRafPending,
     _thinkRafPending,
     _searchText,
+    _needsFetch,
+    _messageCount,
+    _hydratePromise,
+    _hydrating,
     _regenSafetyTimer,
     ...persist
   } = sess
@@ -564,15 +592,29 @@ export function _buildSessionItem(s) {
       },
       {
         label: s.pinned ? '取消置顶' : '置顶',
-        run: () => {
-          s.pinned = !s.pinned
-          scheduleSaveFromUserEdit(s)
+        run: async () => {
+          const sess = await _ensureHydratedForAction(s)
+          if (!sess) return
+          sess.pinned = !sess.pinned
+          scheduleSaveFromUserEdit(sess)
           renderSidebar()
         },
       },
       { label: '导出 Markdown', run: () => exportSessionMd(s) },
-      { label: '导出 Word (.docx)', run: () => exportSessionDocx(s) },
-      { label: '导出 LaTeX (.tex)', run: () => exportSessionTex(s) },
+      {
+        label: '导出 Word (.docx)',
+        run: async () => {
+          const sess = await _ensureHydratedForAction(s)
+          if (sess) exportSessionDocx(sess)
+        },
+      },
+      {
+        label: '导出 LaTeX (.tex)',
+        run: async () => {
+          const sess = await _ensureHydratedForAction(s)
+          if (sess) exportSessionTex(sess)
+        },
+      },
       { divider: true },
       {
         label: '删除',
@@ -594,15 +636,29 @@ export function _buildSessionItem(s) {
         { label: '重命名', run: () => startInlineRename(title, s) },
         {
           label: s.pinned ? '取消置顶' : '置顶',
-          run: () => {
-            s.pinned = !s.pinned
-            scheduleSaveFromUserEdit(s)
+          run: async () => {
+            const sess = await _ensureHydratedForAction(s)
+            if (!sess) return
+            sess.pinned = !sess.pinned
+            scheduleSaveFromUserEdit(sess)
             renderSidebar()
           },
         },
         { label: '导出 Markdown', run: () => exportSessionMd(s) },
-        { label: '导出 Word (.docx)', run: () => exportSessionDocx(s) },
-        { label: '导出 LaTeX (.tex)', run: () => exportSessionTex(s) },
+        {
+          label: '导出 Word (.docx)',
+          run: async () => {
+            const sess = await _ensureHydratedForAction(s)
+            if (sess) exportSessionDocx(sess)
+          },
+        },
+        {
+          label: '导出 LaTeX (.tex)',
+          run: async () => {
+            const sess = await _ensureHydratedForAction(s)
+            if (sess) exportSessionTex(sess)
+          },
+        },
         { divider: true },
         {
           label: '删除',
@@ -623,6 +679,10 @@ export function _buildSessionItem(s) {
 
 // ── Inline rename ──
 export function startInlineRename(titleEl, sess) {
+  if (sess?._needsFetch) {
+    _ensureHydratedForAction(sess).then(() => renderSidebar())
+    return
+  }
   const input = document.createElement('input')
   input.className = 'session-rename-input'
   input.value = sess.title
@@ -652,7 +712,9 @@ export function startInlineRename(titleEl, sess) {
 }
 
 // ── Export session as markdown ──
-export function exportSessionMd(sess) {
+export async function exportSessionMd(sess) {
+  sess = await _ensureHydratedForAction(sess)
+  if (!sess) return
   const lines = [
     `# ${sess.title}`,
     '',
@@ -671,6 +733,29 @@ export function exportSessionMd(sess) {
   a.click()
   URL.revokeObjectURL(a.href)
   toast('已导出')
+}
+
+async function _ensureHydratedForAction(sess) {
+  if (!sess) return null
+  if (!sess._needsFetch) return sess
+  toast('正在加载完整历史，完成后再执行操作')
+  try {
+    const hydrated = await hydrateSession(sess.id)
+    if (!hydrated || hydrated._needsFetch) {
+      toast('完整历史加载失败，请稍后重试', 'error')
+      return null
+    }
+    if (hydrated.id === state.currentSessionId) {
+      state.sendingInFlight = hydrated._sendingInFlight || false
+      _updateSendEnabled?.()
+      _renderMessages?.()
+      _renderAgentDropdown?.()
+    }
+    return hydrated
+  } catch {
+    toast('完整历史加载失败，请稍后重试', 'error')
+    return null
+  }
 }
 
 // ── Context menu ──

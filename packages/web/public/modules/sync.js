@@ -4,7 +4,7 @@
 
 import { apiFetch, apiGet, apiJson, authHeaders } from './api.js'
 import { dbDelete, dbGetAll, dbPut } from './db.js'
-import { _rebuildSearchIndex, clearDeleteTombstone, isDeletePending } from './sessions.js?v=1'
+import { _rebuildSearchIndex, clearDeleteTombstone, isDeletePending } from './sessions.js?v=3'
 import { state } from './state.js'
 
 // Dep-injected callback: fired when a push hits a 409 conflict and we
@@ -43,6 +43,7 @@ function _emitSyncStatus(status) {
 // advances _syncedAt, so a handful of retries is normal — capping at 3
 // bounced real saves into "leaving dirty" and the warning spammed console.
 const CONFLICT_RETRY_MAX = 10
+const AUTO_HYDRATE_RECENT_LIMIT = 1
 
 /**
  * Stable JSON serialization with sorted keys — used to compare two
@@ -215,6 +216,134 @@ function _rebindStreamingPointers(sess) {
   }
 }
 
+function _copyLocalSessionRuntimeState(sess, existingLocal) {
+  if (!sess || !existingLocal) return sess
+  if (existingLocal._sendingInFlight) sess._sendingInFlight = true
+  if (existingLocal._turnStartedAt) sess._turnStartedAt = existingLocal._turnStartedAt
+  if (existingLocal._lastFrameAt) sess._lastFrameAt = existingLocal._lastFrameAt
+  if (typeof existingLocal._lastFrameSeq === 'number') sess._lastFrameSeq = existingLocal._lastFrameSeq
+  if (existingLocal._liveStreamBroken) sess._liveStreamBroken = true
+  if (existingLocal._tokenUsage) sess._tokenUsage = existingLocal._tokenUsage
+  return sess
+}
+
+export function _buildSessionFromRemote(remote, existingLocal, { placeholder = false } = {}) {
+  const remoteMessageCount =
+    typeof remote?.messageCount === 'number'
+      ? remote.messageCount
+      : Array.isArray(remote?.messages)
+        ? remote.messages.length
+        : undefined
+  const existingMessages = Array.isArray(existingLocal?.messages) ? existingLocal.messages : []
+  const fullMessages = Array.isArray(remote?.messages) ? remote.messages : []
+  const messages = placeholder ? existingMessages : fullMessages
+  const messageCount =
+    typeof remoteMessageCount === 'number' ? remoteMessageCount : messages.length || 0
+  const sess = {
+    id: remote.id,
+    title: remote.title || existingLocal?.title || '新会话',
+    createdAt: remote.createdAt || existingLocal?.createdAt || Date.now(),
+    lastAt: remote.lastAt || existingLocal?.lastAt || Date.now(),
+    messages,
+    agentId: remote.agentId || existingLocal?.agentId || 'main',
+    pinned: !!remote.pinned,
+    _syncedAt: remote.updatedAt,
+    _messageCount: messageCount,
+  }
+  if (
+    placeholder &&
+    (messageCount > messages.length ||
+      (existingLocal?._syncedAt && remote.updatedAt && existingLocal._syncedAt !== remote.updatedAt))
+  )
+    sess._needsFetch = true
+  _copyLocalSessionRuntimeState(sess, existingLocal)
+  return sess
+}
+
+function _sessionDbSnapshot(sess, extra = {}) {
+  const {
+    _streamingAssistant,
+    _streamingThinking,
+    _streamingPlan,
+    _blockIdToMsgId,
+    _replyingToMsgId,
+    _agentGroups,
+    _streamRafPending,
+    _thinkRafPending,
+    _searchText,
+    _hydratePromise,
+    _hydrating,
+    ...persist
+  } = sess || {}
+  return { ...persist, ...extra }
+}
+
+function _canHydrateNow(id, sess) {
+  if (!id) return false
+  if (!sess) return true
+  if (sess._sendingInFlight && !sess._liveStreamBroken) return false
+  return true
+}
+
+export async function hydrateSession(id, { force = false } = {}) {
+  if (!id || !state.token) return state.sessions.get(id) || null
+  const existing = state.sessions.get(id)
+  if (existing?._dirty) return existing
+  if (existing && !existing._needsFetch && !force) return existing
+  if (existing?._hydratePromise) return existing._hydratePromise
+  if (!_canHydrateNow(id, existing)) return existing || null
+
+  const hydration = (async () => {
+    const started = state.sessions.get(id)
+    if (started) {
+      started._hydrating = true
+      try {
+        _emitSyncStatus({
+          state: 'syncing',
+          label: '正在加载完整历史',
+          detail: started.title || '正在拉取会话内容',
+        })
+      } catch {}
+    }
+    const remote = await apiGet(`/api/sessions/${id}`)
+    if (!remote?.id) return state.sessions.get(id) || null
+    const live = state.sessions.get(id)
+    if (!_canHydrateNow(id, live)) return live || null
+    if (live?._dirty) return live
+    const sess = _buildSessionFromRemote(remote, live, { placeholder: false })
+    sess._needsFetch = false
+    sess._hydrating = false
+    _rebindStreamingPointers(sess)
+    _rebuildSearchIndex(sess)
+    clearDeleteTombstone(sess.id)
+    state.sessions.set(sess.id, sess)
+    try {
+      await dbPut(_sessionDbSnapshot(sess, { _syncedAt: remote.updatedAt }))
+    } catch {}
+    try {
+      _emitSyncStatus({
+        state: 'synced',
+        label: '完整历史已加载',
+        detail: sess.title || '会话内容已就绪',
+      })
+    } catch {}
+    return sess
+  })()
+
+  const trackedHydration = hydration.finally(() => {
+    const live = state.sessions.get(id)
+    if (live) {
+      delete live._hydratePromise
+      live._hydrating = false
+    }
+  })
+  if (existing) {
+    existing._hydratePromise = trackedHydration
+    existing._hydrating = true
+  }
+  return trackedHydration
+}
+
 /**
  * Pull session list from server, merge with local IndexedDB.
  * Server wins on conflict (newer updatedAt / lastAt).
@@ -268,12 +397,25 @@ export async function syncSessionsFromServer() {
 
   const serverIds = new Set(serverList.map((s) => s.id))
 
-  // Find sessions on server but not locally, or newer on server
-  const toFetch = []
+  // Merge list metadata first. Missing / stale sessions become lightweight
+  // placeholders instead of triggering a full-body cold-start fan-out.
+  let currentSessionUpdated = false
+  let fetchedCount = 0
+  let metadataCount = 0
+  const hydrateIds = new Set()
+  const fallbackCurrentId = state.currentSessionId || serverList[0]?.id || null
   for (const meta of serverList) {
-    const local = localMap.get(meta.id)
+    const local = state.sessions.get(meta.id) || localMap.get(meta.id)
     if (!local) {
-      toFetch.push(meta.id)
+      const sess = _buildSessionFromRemote(meta, null, { placeholder: true })
+      _rebuildSearchIndex(sess)
+      clearDeleteTombstone(sess.id)
+      state.sessions.set(sess.id, sess)
+      metadataCount++
+      if (meta.id === fallbackCurrentId) hydrateIds.add(meta.id)
+      try {
+        await dbPut(_sessionDbSnapshot(sess, { _syncedAt: meta.updatedAt }))
+      } catch {}
     } else if (local._syncedAt && meta.updatedAt > local._syncedAt) {
       // Server has a newer version than our last sync point (server clock only).
       // Normally we skip the current in-flight session to avoid stomping a
@@ -282,66 +424,39 @@ export async function syncSessionsFromServer() {
       // `_liveStreamBroken = true`), we MUST refetch: the whole point of
       // the force sync is to reconcile from the server-authored tape.
       const live = state.sessions.get(meta.id)
+      if (local._dirty || live?._dirty) continue
       if (meta.id === state.currentSessionId && state.sendingInFlight && !live?._liveStreamBroken)
         continue
-      toFetch.push(meta.id)
+      if (meta.id === fallbackCurrentId || live?._liveStreamBroken) {
+        hydrateIds.add(meta.id)
+      } else {
+        const sess = _buildSessionFromRemote(meta, live || local, { placeholder: true })
+        _rebuildSearchIndex(sess)
+        clearDeleteTombstone(sess.id)
+        state.sessions.set(sess.id, sess)
+        metadataCount++
+        try {
+          await dbPut(_sessionDbSnapshot(sess, { _syncedAt: meta.updatedAt }))
+        } catch {}
+      }
+    } else if (local._needsFetch && meta.id === fallbackCurrentId) {
+      hydrateIds.add(meta.id)
     }
   }
 
-  // Fetch missing/newer sessions from server (batch, max 10 concurrent)
-  const fetched = []
-  for (let i = 0; i < toFetch.length; i += 10) {
-    const batch = toFetch.slice(i, i + 10)
-    const results = await Promise.allSettled(batch.map((id) => apiGet(`/api/sessions/${id}`)))
-    for (const r of results) {
-      if (r.status === 'fulfilled' && r.value?.id) fetched.push(r.value)
+  // Hydrate only the active/fallback session on cold start. This keeps mobile
+  // startup bounded even with hundreds of historical sessions on the server.
+  let hydrated = 0
+  for (const id of hydrateIds) {
+    if (hydrated >= AUTO_HYDRATE_RECENT_LIMIT) break
+    const before = state.sessions.get(id)
+    if (!_canHydrateNow(id, before)) continue
+    const full = await hydrateSession(id)
+    if (full && !full._needsFetch) {
+      hydrated++
+      fetchedCount++
+      if (id === state.currentSessionId || id === fallbackCurrentId) currentSessionUpdated = true
     }
-  }
-
-  // Merge fetched sessions into local state + IDB (skip dirty local sessions)
-  let currentSessionUpdated = false
-  let fetchedCount = 0
-  for (const remote of fetched) {
-    if (isDeletePending(remote.id)) continue // locally deleted, pending server confirmation
-    const existingLocal = state.sessions.get(remote.id)
-    if (existingLocal?._dirty) continue // local has unsynced edits, don't overwrite
-    const sess = {
-      id: remote.id,
-      title: remote.title,
-      createdAt: remote.createdAt,
-      lastAt: remote.lastAt,
-      messages: remote.messages || [],
-      agentId: remote.agentId || 'main',
-      pinned: remote.pinned || false,
-      _syncedAt: remote.updatedAt,
-    }
-    // Preserve local turn-state across the server-merge — the server
-    // deliberately strips _sendingInFlight / _turnStartedAt / _lastFrameAt
-    // on push (see pushSessionToServer strip list below), so a naive replace
-    // would wipe out the in-flight marker for a non-current session the
-    // user has mid-turn. Keeping these locally-owned fields lets the hello
-    // handshake keep reporting inFlight=true and lets sanitizeLoadedTurnState
-    // continue to govern staleness.
-    if (existingLocal?._sendingInFlight) sess._sendingInFlight = true
-    if (existingLocal?._turnStartedAt) sess._turnStartedAt = existingLocal._turnStartedAt
-    if (existingLocal?._lastFrameAt) sess._lastFrameAt = existingLocal._lastFrameAt
-    // Phase 0.4: preserve the frameSeq cursor across a sync-driven session
-    // replacement. If we drop it, the next hello would claim `lastFrameSeq: 0`
-    // and the gateway would replay every frame still in its ring — delivering
-    // the same assistant deltas a second time to handleOutbound, which
-    // dedupes by frameSeq; with the cursor reset those deltas look like
-    // "new" frames and would be appended again. Keep the cursor aligned to
-    // whatever we had last processed so dedupe stays authoritative.
-    if (typeof existingLocal?._lastFrameSeq === 'number')
-      sess._lastFrameSeq = existingLocal._lastFrameSeq
-    _rebuildSearchIndex(sess)
-    clearDeleteTombstone(sess.id) // Allow saving if session was previously deleted locally
-    state.sessions.set(sess.id, sess)
-    fetchedCount++
-    if (sess.id === state.currentSessionId) currentSessionUpdated = true
-    try {
-      await dbPut({ ...sess, _syncedAt: remote.updatedAt })
-    } catch {}
   }
 
   // Remove locally-synced sessions that were deleted on server
@@ -382,7 +497,7 @@ export async function syncSessionsFromServer() {
     if (!serverIds.has(id) && isDeletePending(id)) clearDeleteTombstone(id)
   }
 
-  const changedCount = fetchedCount + removedCount
+  const changedCount = fetchedCount + removedCount + metadataCount
   clearTimeout(_syncingDelay)
   if (changedCount > 0) {
     // Meaningful update — tell the user what changed. Worth the 1.8s toast.
@@ -405,6 +520,10 @@ export async function syncSessionsFromServer() {
  */
 export function pushSessionToServer(sess) {
   if (!sess?.id || !state.token) return Promise.resolve()
+  if (sess._needsFetch && sess._syncedAt) {
+    console.warn('[sync] refused to push placeholder session before hydration', sess.id)
+    return Promise.resolve()
+  }
   const {
     _streamingAssistant,
     _streamingThinking,
@@ -416,6 +535,10 @@ export function pushSessionToServer(sess) {
     _streamRafPending,
     _thinkRafPending,
     _searchText,
+    _needsFetch,
+    _messageCount,
+    _hydratePromise,
+    _hydrating,
     _syncedAt,
     _dirty,
     ...clean
@@ -541,6 +664,8 @@ export function pushSessionToServer(sess) {
             agentId: server.agentId,
             _syncedAt: server.updatedAt,
             _dirty: false,
+            _needsFetch: false,
+            _messageCount: Array.isArray(server.messages) ? server.messages.length : 0,
           })
           // Invalidate runtime maps so they get rebuilt from new messages on next handleOutbound
           target._blockIdToMsgId = null
@@ -549,7 +674,7 @@ export function pushSessionToServer(sess) {
           _rebindStreamingPointers(target)
           _rebuildSearchIndex(target)
           try {
-            await dbPut({ ...target, _syncedAt: server.updatedAt })
+            await dbPut(_sessionDbSnapshot(target, { _syncedAt: server.updatedAt }))
           } catch {}
           // Notify UI so the user sees the new messages / title instead of
           // a stale view. Without this, the session object is updated but

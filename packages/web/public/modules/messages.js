@@ -2058,6 +2058,26 @@ export function renderMessages() {
   }
   $('session-title').textContent = s.title
   updateSessionSub(s)
+  if (s._needsFetch) {
+    const empty = document.createElement('div')
+    empty.className = 'empty-state'
+    const count =
+      typeof s._messageCount === 'number' && s._messageCount > 0
+        ? `约 ${s._messageCount} 条消息`
+        : '完整历史'
+    const label = s._hydrating ? '正在加载完整历史…' : '完整历史尚未加载'
+    empty.innerHTML = `<div class="empty-brand">↻</div><h1>${label}</h1><p>为避免移动端一次性拉取过多历史，已先加载会话列表。${htmlSafeEscape(count)} 将按需加载。</p><button class="btn btn-primary" type="button" data-hydrate-current>加载完整历史</button>`
+    const btn = empty.querySelector('[data-hydrate-current]')
+    if (btn) {
+      btn.disabled = !!s._hydrating
+      btn.addEventListener('click', () => {
+        window.dispatchEvent(new CustomEvent('openclaude:hydrate-current-session'))
+      })
+    }
+    main.appendChild(empty)
+    refreshPlanPanel()
+    return
+  }
   if (s.messages.length === 0) {
     const empty = document.createElement('div')
     empty.className = 'empty-state'
@@ -2137,7 +2157,13 @@ export function updateSessionSub(s) {
   }
   const n = s.messages.filter((m) => m.role === 'user').length
   const shortId = s.id.replace(/^web-/, '')
-  el.textContent = `${(n > 0 ? `${n} 轮 · ` : '') + shortTime(s.lastAt)} · ${shortId}`
+  const countHint =
+    s._needsFetch && typeof s._messageCount === 'number' && s._messageCount > 0
+      ? `历史 ${s._messageCount} 条 · `
+      : n > 0
+        ? `${n} 轮 · `
+        : ''
+  el.textContent = `${countHint + shortTime(s.lastAt)} · ${shortId}`
   el.title = s.id // full ID on hover
   updateTokenUsageDisplay(s._tokenUsage)
 }

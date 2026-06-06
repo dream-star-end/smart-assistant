@@ -27,7 +27,7 @@ import { apiFetch, apiGet, apiJson, authHeaders, onAuthExpired, resetAuthExpired
 import { dbDelete, dbGetAll, dbPut, onIdbUnavailable, openDB } from './db.js'
 
 // ── Cross-device sync ──
-import { maybeSyncNow, setSyncDeps, syncSessionsFromServer } from './sync.js?v=1'
+import { hydrateSession, maybeSyncNow, setSyncDeps, syncSessionsFromServer } from './sync.js?v=2'
 
 // ── Theme ──
 import { applyTheme, cycleTheme, effectiveTheme, setToastFn } from './theme.js'
@@ -110,7 +110,7 @@ import {
   showContextMenu,
   startInlineRename,
   switchSession,
-} from './sessions.js?v=2'
+} from './sessions.js?v=3'
 
 // ── Messages ──
 import {
@@ -125,7 +125,7 @@ import {
   setMessageDeps,
   updateMessageEl,
   updateSessionSub,
-} from './messages.js?v=38'
+} from './messages.js?v=39'
 
 // ── WebSocket ──
 import {
@@ -153,7 +153,7 @@ import {
   updateMessage,
   updateMsgStatus,
   updateSendEnabled,
-} from './websocket.js?v=39'
+} from './websocket.js?v=40'
 
 // ── Slash commands ──
 import {
@@ -310,6 +310,15 @@ window.addEventListener('pageshow', () => {
 // (it likely failed because we were offline).
 window.addEventListener('online', () => {
   maybeSyncNow({ force: true, onResult: _applySyncResult })
+})
+
+window.addEventListener('openclaude:hydrate-current-session', async () => {
+  const sess = getSession()
+  if (!sess?._needsFetch) return
+  const hydrated = await hydrateSession(sess.id).catch(() => null)
+  if (!hydrated || hydrated.id !== state.currentSessionId) return
+  renderSidebar()
+  renderMessages()
 })
 
 // Post-sync re-render for the background triggers (visibilitychange / focus /
@@ -713,7 +722,7 @@ function buildMessageText(userText, attachments) {
 }
 
 // ── send ──
-function send() {
+async function send() {
   const text = $('input').value.trim()
   if (!text && state.attachments.length === 0) return
   // Intercept slash commands
@@ -725,8 +734,20 @@ function send() {
       return
     }
   }
-  const sess = getSession()
+  let sess = getSession()
   if (!sess) return
+  if (sess._needsFetch) {
+    toast('正在加载完整历史，加载完成后发送')
+    const hydrated = await hydrateSession(sess.id)
+    if (!hydrated || hydrated._needsFetch) {
+      toast('完整历史加载失败，请稍后重试', 'error')
+      return
+    }
+    if (state.currentSessionId !== hydrated.id) return
+    sess = hydrated
+    renderSidebar()
+    renderMessages()
+  }
   const displayText =
     (text || '(文件上传)') +
     (state.attachments.length > 0
