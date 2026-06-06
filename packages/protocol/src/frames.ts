@@ -269,6 +269,18 @@ export const OutboundContentBlock = Type.Union([
     partial: Type.Optional(Type.Boolean()),
     parentToolUseId: Type.Optional(Type.String()),
   }),
+  Type.Object({
+    kind: Type.Literal('goal'),
+    blockId: Type.Optional(Type.String()),
+    objective: Type.Optional(Type.String()),
+    status: Type.Optional(Type.String()),
+    tokenBudget: Type.Optional(Type.Union([Type.Number(), Type.Null()])),
+    tokensUsed: Type.Optional(Type.Number()),
+    timeUsedSeconds: Type.Optional(Type.Number()),
+    updatedAt: Type.Optional(Type.Number()),
+    cleared: Type.Optional(Type.Boolean()),
+    parentToolUseId: Type.Optional(Type.String()),
+  }),
   // Live progress from the synchronous delegate_task bridge. These blocks are
   // rendered as a dedicated delegate-progress card on WebChat and are never
   // treated as assistant final-answer content.

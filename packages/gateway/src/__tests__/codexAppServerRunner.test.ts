@@ -1836,6 +1836,307 @@ describe('handleItemStarted — suppression + lowercase prefix (PR1 v1.0.65 A.1)
   })
 })
 
+describe('handleNotification — goals', () => {
+  it('thread/goal/updated emits an OpenClaude-native goal message', async () => {
+    const h = await makeHarness()
+    ;(h.runner as any).activeTurnId = 't-goal'
+    feed(h.runner, {
+      jsonrpc: '2.0',
+      method: 'thread/goal/updated',
+      params: {
+        threadId: 'thr',
+        turnId: 't-goal',
+        goal: {
+          objective: 'ship commercial goals',
+          status: 'active',
+          tokenBudget: 1200,
+          tokensUsed: 99,
+          timeUsedSeconds: 12,
+          updatedAt: 1780000000,
+        },
+      },
+    })
+    assert.equal(h.messages.length, 1)
+    assert.equal(h.messages[0].type, 'openclaude_goal')
+    assert.deepEqual(h.messages[0].goal, {
+      blockId: 'codex-goal-t-goal',
+      objective: 'ship commercial goals',
+      status: 'active',
+      tokenBudget: 1200,
+      tokensUsed: 99,
+      timeUsedSeconds: 12,
+      updatedAt: 1780000000,
+    })
+    await h.cleanup()
+  })
+
+  it('thread/goal/cleared emits a cleared goal card', async () => {
+    const h = await makeHarness()
+    ;(h.runner as any).activeTurnId = 't-goal-clear'
+    feed(h.runner, {
+      jsonrpc: '2.0',
+      method: 'thread/goal/cleared',
+      params: { threadId: 'thr', turnId: 't-goal-clear' },
+    })
+    assert.equal(h.messages.length, 1)
+    assert.equal(h.messages[0].type, 'openclaude_goal')
+    assert.deepEqual(h.messages[0].goal, { blockId: 'codex-goal-t-goal-clear', cleared: true })
+    await h.cleanup()
+  })
+})
+
+describe('handleNotification — collabAgentToolCall', () => {
+  function collabFrame(method: 'item/started' | 'item/completed', turnId: string, item: any) {
+    return {
+      jsonrpc: '2.0',
+      method,
+      params: { threadId: 'thr', turnId, item },
+    }
+  }
+
+  async function flushItemCompleted(): Promise<void> {
+    await new Promise((r) => setImmediate(r))
+  }
+
+  it('spawnAgent started renders an Agent group tool_use', async () => {
+    const h = await makeHarness()
+    ;(h.runner as any).activeTurnId = 't-collab'
+    feed(
+      h.runner,
+      collabFrame('item/started', 't-collab', {
+        id: 'spawn-1',
+        type: 'collabAgentToolCall',
+        tool: 'spawnAgent',
+        prompt: 'inspect gateway',
+        receiverThreadIds: ['thread-child-1'],
+        model: 'gpt-5.5',
+      }),
+    )
+    assert.equal(h.messages.length, 1)
+    const c = h.messages[0].message.content[0]
+    assert.equal(c.type, 'tool_use')
+    assert.equal(c.id, 'spawn-1')
+    assert.equal(c.name, 'Agent')
+    assert.equal(c.input.description, 'inspect gateway')
+    assert.deepEqual(c.input.receiverThreadIds, ['thread-child-1'])
+    await h.cleanup()
+  })
+
+  it('spawnAgent running completion records receivers but does not close the Agent group', async () => {
+    const h = await makeHarness()
+    ;(h.runner as any).activeTurnId = 't-collab-running'
+    feed(
+      h.runner,
+      collabFrame('item/started', 't-collab-running', {
+        id: 'spawn-1',
+        type: 'collabAgentToolCall',
+        tool: 'spawnAgent',
+        prompt: 'inspect gateway',
+      }),
+    )
+    feed(
+      h.runner,
+      collabFrame('item/completed', 't-collab-running', {
+        id: 'spawn-1',
+        type: 'collabAgentToolCall',
+        tool: 'spawnAgent',
+        status: 'running',
+        receiverThreadIds: ['child-a'],
+      }),
+    )
+    await flushItemCompleted()
+    assert.equal(h.messages.length, 1)
+    assert.equal(h.messages[0].message.content[0].name, 'Agent')
+    await h.cleanup()
+  })
+
+  it('spawnAgent failed completion closes the Agent group with an error result', async () => {
+    const h = await makeHarness()
+    ;(h.runner as any).activeTurnId = 't-collab-fail'
+    feed(
+      h.runner,
+      collabFrame('item/started', 't-collab-fail', {
+        id: 'spawn-1',
+        type: 'collabAgentToolCall',
+        tool: 'spawnAgent',
+        prompt: 'inspect gateway',
+      }),
+    )
+    feed(
+      h.runner,
+      collabFrame('item/completed', 't-collab-fail', {
+        id: 'spawn-1',
+        type: 'collabAgentToolCall',
+        tool: 'spawnAgent',
+        status: 'failed',
+        receiverThreadIds: ['child-a'],
+      }),
+    )
+    await flushItemCompleted()
+    const result = h.messages.find((m) => m.type === 'user')
+    assert.ok(result)
+    assert.equal(result.message.content[0].tool_use_id, 'spawn-1')
+    assert.equal(result.message.content[0].is_error, true)
+    assert.match(result.message.content[0].content, /spawnAgent: failed/)
+    await h.cleanup()
+  })
+
+  it('wait control item emits Codex:multiAgent result and closes original spawn when children terminal', async () => {
+    const h = await makeHarness()
+    ;(h.runner as any).activeTurnId = 't-collab-wait'
+    feed(
+      h.runner,
+      collabFrame('item/started', 't-collab-wait', {
+        id: 'spawn-1',
+        type: 'collabAgentToolCall',
+        tool: 'spawnAgent',
+        prompt: 'inspect gateway',
+        receiverThreadIds: ['child-a', 'child-b'],
+      }),
+    )
+    feed(
+      h.runner,
+      collabFrame('item/started', 't-collab-wait', {
+        id: 'wait-1',
+        type: 'collabAgentToolCall',
+        tool: 'wait',
+        receiverThreadIds: ['child-a', 'child-b'],
+      }),
+    )
+    feed(
+      h.runner,
+      collabFrame('item/completed', 't-collab-wait', {
+        id: 'wait-1',
+        type: 'collabAgentToolCall',
+        tool: 'wait',
+        status: 'completed',
+        receiverThreadIds: ['child-a', 'child-b'],
+        agentsStates: {
+          'child-a': { status: 'completed', message: 'done A' },
+          'child-b': { status: 'errored', message: 'boom' },
+        },
+      }),
+    )
+    await flushItemCompleted()
+    const toolUses = h.messages
+      .filter((m) => m.type === 'assistant')
+      .map((m) => m.message.content[0].name)
+    assert.deepEqual(toolUses, ['Agent', 'Codex:multiAgent'])
+    const results = h.messages.filter((m) => m.type === 'user').map((m) => m.message.content[0])
+    assert.equal(results.length, 2)
+    assert.equal(results[0].tool_use_id, 'wait-1')
+    assert.equal(results[0].is_error, false)
+    assert.equal(results[1].tool_use_id, 'spawn-1')
+    assert.equal(results[1].is_error, true)
+    assert.match(results[1].content, /child-a: completed/)
+    assert.match(results[1].content, /child-b: errored/)
+    await h.cleanup()
+  })
+
+  it('running wait control item does not close the original spawn', async () => {
+    const h = await makeHarness()
+    ;(h.runner as any).activeTurnId = 't-collab-wait-running'
+    feed(
+      h.runner,
+      collabFrame('item/started', 't-collab-wait-running', {
+        id: 'spawn-1',
+        type: 'collabAgentToolCall',
+        tool: 'spawnAgent',
+        prompt: 'inspect gateway',
+        receiverThreadIds: ['child-a'],
+      }),
+    )
+    feed(
+      h.runner,
+      collabFrame('item/completed', 't-collab-wait-running', {
+        id: 'wait-1',
+        type: 'collabAgentToolCall',
+        tool: 'wait',
+        status: 'running',
+        receiverThreadIds: ['child-a'],
+        agentsStates: { 'child-a': { status: 'running' } },
+      }),
+    )
+    await flushItemCompleted()
+    const results = h.messages.filter((m) => m.type === 'user').map((m) => m.message.content[0])
+    assert.equal(results.length, 1)
+    assert.equal(results[0].tool_use_id, 'wait-1')
+    assert.equal(results[0].is_error, false)
+    await h.cleanup()
+  })
+
+  it('dedupes duplicate terminal child-state frames for a spawn', async () => {
+    const h = await makeHarness()
+    ;(h.runner as any).activeTurnId = 't-collab-dedupe'
+    feed(
+      h.runner,
+      collabFrame('item/started', 't-collab-dedupe', {
+        id: 'spawn-1',
+        type: 'collabAgentToolCall',
+        tool: 'spawnAgent',
+        prompt: 'inspect gateway',
+        receiverThreadIds: ['child-a'],
+      }),
+    )
+    const completedItem = {
+      id: 'wait-1',
+      type: 'collabAgentToolCall',
+      tool: 'wait',
+      status: 'completed',
+      receiverThreadIds: ['child-a'],
+      agentsStates: { 'child-a': { status: 'completed' } },
+    }
+    feed(h.runner, collabFrame('item/completed', 't-collab-dedupe', completedItem))
+    feed(h.runner, collabFrame('item/completed', 't-collab-dedupe', { ...completedItem, id: 'wait-2' }))
+    await flushItemCompleted()
+    const spawnResults = h.messages
+      .filter((m) => m.type === 'user')
+      .map((m) => m.message.content[0])
+      .filter((c) => c.tool_use_id === 'spawn-1')
+    assert.equal(spawnResults.length, 1)
+    await h.cleanup()
+  })
+
+  it('treats shutdown and notFound child states as terminal, with notFound as error', async () => {
+    const h = await makeHarness()
+    ;(h.runner as any).activeTurnId = 't-collab-terminal'
+    feed(
+      h.runner,
+      collabFrame('item/started', 't-collab-terminal', {
+        id: 'spawn-1',
+        type: 'collabAgentToolCall',
+        tool: 'spawnAgent',
+        prompt: 'inspect gateway',
+        receiverThreadIds: ['child-a', 'child-b'],
+      }),
+    )
+    feed(
+      h.runner,
+      collabFrame('item/completed', 't-collab-terminal', {
+        id: 'wait-1',
+        type: 'collabAgentToolCall',
+        tool: 'wait',
+        status: 'completed',
+        receiverThreadIds: ['child-a', 'child-b'],
+        agentsStates: {
+          'child-a': { status: 'shutdown' },
+          'child-b': { status: 'notFound' },
+        },
+      }),
+    )
+    await flushItemCompleted()
+    const spawnResult = h.messages
+      .filter((m) => m.type === 'user')
+      .map((m) => m.message.content[0])
+      .find((c) => c.tool_use_id === 'spawn-1')
+    assert.ok(spawnResult)
+    assert.equal(spawnResult.is_error, true)
+    assert.match(spawnResult.content, /child-a: shutdown/)
+    assert.match(spawnResult.content, /child-b: notFound/)
+    await h.cleanup()
+  })
+})
+
 describe('handleNotification — thread/tokenUsage/updated (PR1 v1.0.65 A.2)', () => {
   it('refreshes activeTurnTotal and computes baseline on first notification (no priorTurnTotal)', async () => {
     // First-ever notification on a fresh runner. priorTurnTotal is null so

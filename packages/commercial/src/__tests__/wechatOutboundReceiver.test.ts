@@ -6,7 +6,7 @@
  *   - identity gate(401 bad auth / bad host / bad secret)
  *   - body schema(empty / invalid JSON / 缺字段 / 错正则 / 未知 block kind / hard-cap blocks)
  *   - rate-limit gate(429 当 checkOutbound 返 false)
- *   - renderWechatBlocks 纯函数:text/tool_use/tool_result/thinking/tool_output_tail/parentToolUseId
+ *   - renderWechatBlocks 纯函数:text/tool_use/tool_result/thinking/goal/tool_output_tail/parentToolUseId
  *   - render → 空 IlinkPart[] → 200 empty_render, **不**调 enqueue
  *   - enqueue 4 种 outcome 翻 HTTP:queued/pending → 202 scheduled:true;already_sent/already_failed → 200 scheduled:false
  *   - enqueue throws → 500 STORAGE_ERROR
@@ -372,6 +372,39 @@ describe("outboundReceiver — body schema", () => {
       CTX,
     )
     assert.equal(rec.status, 400)
+  })
+
+  test("accepts goal blocks and enqueues rendered goal text", async () => {
+    const { pool, spy } = makeFakePool({ mode: "enqueue_queued", outboxId: 65 })
+    const handler = makeOutboundReceiverHandler(makeDeps({ pool }))
+    const { res, rec } = makeRes()
+    await handler(
+      authedReq(
+        validBody({
+          blocks: [
+            {
+              kind: "goal",
+              blockId: "codex-goal",
+              objective: "adapt goals",
+              status: "active",
+              tokenBudget: null,
+              tokensUsed: 42,
+              timeUsedSeconds: 7,
+              updatedAt: 1780000000,
+              cleared: false,
+            },
+          ],
+        }),
+      ),
+      res,
+      CTX,
+    )
+    assert.equal(rec.status, 202)
+    assert.equal(spy.calls.length, 1)
+    assert.equal(spy.calls[0]!.payload.length, 1)
+    const payloadText = (spy.calls[0]!.payload[0] as { text: string }).text
+    assert.match(payloadText, /🎯 目标更新/)
+    assert.match(payloadText, /adapt goals/)
   })
 
   test("400 on unknown top-level key (strict)", async () => {
@@ -1015,6 +1048,33 @@ describe("renderWechatBlocks pure function", () => {
     assert.equal(r.dropped, 1)
   })
 
+  test("goal block renders a top-level Codex goal update", () => {
+    const r = renderWechatBlocks([
+      {
+        kind: "goal",
+        objective: "adapt goals",
+        status: "active",
+        tokenBudget: 100,
+        tokensUsed: 42,
+        timeUsedSeconds: 7,
+      },
+    ])
+    assert.equal(r.parts.length, 1)
+    const text = (r.parts[0] as { type: "text"; text: string }).text
+    assert.match(text, /🎯 目标更新/)
+    assert.match(text, /adapt goals/)
+    assert.match(text, /状态：active/)
+    assert.match(text, /Tokens：42\/100/)
+    assert.equal(r.dropped, 0)
+  })
+
+  test("cleared goal block renders a clear notice and ignores tool-call preference", () => {
+    const r = renderWechatBlocks([{ kind: "goal", cleared: true }], { showToolCalls: false })
+    assert.equal(r.parts.length, 1)
+    assert.match((r.parts[0] as { type: "text"; text: string }).text, /已清除/)
+    assert.equal(r.dropped, 0)
+  })
+
   test("tool_output_tail block → dropped (P1)", () => {
     const r = renderWechatBlocks([
       { kind: "tool_output_tail", toolUseBlockId: "blk-1", tail: "...", totalBytes: 100, truncatedHead: false },
@@ -1027,9 +1087,10 @@ describe("renderWechatBlocks pure function", () => {
     const r = renderWechatBlocks([
       { kind: "text", text: "from subagent", parentToolUseId: "agent-1" },
       { kind: "tool_use", toolName: "Bash", parentToolUseId: "agent-1" },
+      { kind: "goal", objective: "child goal", parentToolUseId: "agent-1" },
     ])
     assert.equal(r.parts.length, 0)
-    assert.equal(r.dropped, 2)
+    assert.equal(r.dropped, 3)
   })
 
   test("markdown syntax-only text is preserved instead of dropped", () => {

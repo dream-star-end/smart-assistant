@@ -11,11 +11,12 @@
  *      **绝不**从 body 取 — 防止 compromised container 跨用户写他人 outbox
  *   2) zod 严格 parse;blocks 用 discriminatedUnion(kind),unknown key 拒绝
  *   3) outbound rate-limit 检查(P1 noop,但保留调用便于 P3 切换)
- *   4) renderWechatBlocks 把 5 种 OutboundContentBlock 投影成 IlinkPart[]:
+ *   4) renderWechatBlocks 把 OutboundContentBlock 投影成 IlinkPart[]:
  *        - text         → coalesce adjacent chunks, then renderAssistantText(preserve Markdown + split 4000)
  *        - tool_use     → renderToolAnnouncement("🔧 X…") unless user hides process
  *        - thinking     → coalesce adjacent chunks, then detailed "💭 思考过程"
  *                          unless user hides process
+ *        - goal         → top-level Codex goal update/clear notice
  *        - tool_result  → P1 drop(voluminous, 用户在 web 看;P2 可考虑短链摘要)
  *        - tool_output_tail → P1 drop(已被 tool_use 公告覆盖)
  *        - parentToolUseId 非空 → 子 agent 内容,WeChat 不上抛(SoC:Agent card 是 web-only)
@@ -146,6 +147,21 @@ const ThinkingBlock = z
   })
   .strict()
 
+const GoalBlock = z
+  .object({
+    kind: z.literal("goal"),
+    blockId: z.string().optional(),
+    objective: z.string().optional(),
+    status: z.string().optional(),
+    tokenBudget: z.union([z.number(), z.null()]).optional(),
+    tokensUsed: z.number().optional(),
+    timeUsedSeconds: z.number().optional(),
+    updatedAt: z.number().optional(),
+    cleared: z.boolean().optional(),
+    parentToolUseId: z.string().optional(),
+  })
+  .strict()
+
 const ToolOutputTailBlock = z
   .object({
     kind: z.literal("tool_output_tail"),
@@ -162,6 +178,7 @@ const BlockSchema = z.discriminatedUnion("kind", [
   ToolUseBlock,
   ToolResultBlock,
   ThinkingBlock,
+  GoalBlock,
   ToolOutputTailBlock,
 ])
 
@@ -262,14 +279,32 @@ export interface RenderWechatBlocksOptions {
   showToolCalls?: boolean
 }
 
+function formatGoalBlock(block: z.infer<typeof GoalBlock>): string {
+  if (block.cleared) return "🎯 当前 Codex goal 已清除。"
+  const lines = ["🎯 目标更新：", block.objective || "Codex goal 已更新。"]
+  if (block.status) lines.push(`状态：${block.status}`)
+  if (typeof block.tokensUsed === "number") {
+    lines.push(
+      typeof block.tokenBudget === "number"
+        ? `Tokens：${block.tokensUsed}/${block.tokenBudget}`
+        : `Tokens：${block.tokensUsed}`,
+    )
+  }
+  if (typeof block.timeUsedSeconds === "number" && Number.isFinite(block.timeUsedSeconds)) {
+    lines.push(`用时：${Math.max(0, Math.round(block.timeUsedSeconds))}s`)
+  }
+  return lines.join("\n")
+}
+
 /**
- * 把 5 种 OutboundContentBlock 投影成 IlinkPart[]。
+ * 把 OutboundContentBlock 投影成 IlinkPart[]。
  *
  * **规则**(详见模块头注释):
  *   - parentToolUseId 非空 → 整块 skip(subagent 内容只在 web Agent card 渲染)
  *   - text → 先合并连续顶层 text,再 renderAssistantText(保留 Markdown;避免 token chunks 变成多气泡)
  *   - tool_use → renderToolAnnouncement("🔧 X…")
  *   - thinking → 先合并连续顶层 thinking,再完整渲染 "💭 思考过程"
+ *   - goal → renderAssistantText("🎯 目标更新/清除")
  *   - tool_result / tool_output_tail → drop(P1 不外发)
  *
  * 返回 `dropped` 计数仅用于审计 / 测试断言(broker 关心"是否完全空"由 caller 判断)。
@@ -348,6 +383,17 @@ export function renderWechatBlocks(
         }
         break
       }
+      case "goal": {
+        flushThinking()
+        flushText()
+        const rendered = renderAssistantText(formatGoalBlock(b))
+        if (rendered.length === 0) {
+          dropped++
+          break
+        }
+        for (const p of rendered) parts.push(p)
+        break
+      }
       case "tool_result":
       case "tool_output_tail":
         dropped++
@@ -378,7 +424,11 @@ export function expandRenderedPartsWithWechatMedia(parts: IlinkPart[]): IlinkPar
 }
 
 function shouldExpandWechatMediaFromText(text: string): boolean {
-  return !text.startsWith("💭 思考过程：") && !text.startsWith("🔧 ")
+  return (
+    !text.startsWith("💭 思考过程：") &&
+    !text.startsWith("🔧 ") &&
+    !text.startsWith("🎯 ")
+  )
 }
 
 // ─── handler dependencies ──────────────────────────────────────────────────
@@ -539,7 +589,7 @@ export function makeOutboundReceiverHandler(
       return
     }
 
-    // 4) Render 5 种 block → IlinkPart[]
+    // 4) Render OutboundContentBlock → IlinkPart[]
     let showToolCalls = true
     try {
       showToolCalls = await getWechatShowToolCalls(identity.userId)
