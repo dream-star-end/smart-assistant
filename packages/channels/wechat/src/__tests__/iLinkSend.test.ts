@@ -14,7 +14,7 @@
 import * as assert from 'node:assert/strict'
 import { afterEach, beforeEach, describe, it } from 'node:test'
 
-import { sendIlinkText } from '../iLink.js'
+import { extractConfirmed, sendIlinkText } from '../iLink.js'
 
 interface CapturedRequest {
   url: string
@@ -91,5 +91,39 @@ describe('sendIlinkText — canonical → wire conversion on outbound', () => {
     await sendIlinkText('tok', 'sender', 'ctx', 'msg', { clientId: 'oc-stable-123' })
     assert.equal(captured.length, 1)
     assert.equal(captured[0]!.body.msg.client_id, 'oc-stable-123')
+  })
+})
+
+describe('extractConfirmed — optional QR context token', () => {
+  it('trims context_token from confirmed qrcode response', () => {
+    const confirmed = extractConfirmed({
+      status: 'confirmed',
+      bot_token: 'bot-token',
+      ilink_bot_id: 'acct-1',
+      ilink_user_id: 'wx-user-1',
+      context_token: '  ctx-from-qr  ',
+    })
+
+    assert.deepEqual(confirmed, {
+      bot_token: 'bot-token',
+      account_id: 'acct-1',
+      login_user_id: 'wx-user-1',
+      context_token: 'ctx-from-qr',
+    })
+  })
+
+  it('keeps old confirmed qrcode responses valid when no context token is present', () => {
+    const confirmed = extractConfirmed({
+      status: 'confirmed',
+      bot_token: 'bot-token',
+      account_id: 'acct-2',
+      login_user_id: 'wx-user-2',
+    })
+
+    assert.deepEqual(confirmed, {
+      bot_token: 'bot-token',
+      account_id: 'acct-2',
+      login_user_id: 'wx-user-2',
+    })
   })
 })

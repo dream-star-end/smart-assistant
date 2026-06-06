@@ -65,6 +65,8 @@ export interface IlinkConfirmed {
   bot_token: string
   account_id: string // mapped from ilink_bot_id
   login_user_id: string // mapped from ilink_user_id
+  /** Optional token needed to proactively send the first bound-user message. */
+  context_token?: string
 }
 
 interface RequestOpts {
@@ -145,7 +147,27 @@ export function extractConfirmed(resp: any): IlinkConfirmed | null {
   const loginUserId = String(resp?.ilink_user_id || resp?.login_user_id || '')
   const status = String(resp?.status || '').toLowerCase()
   if (!botToken || !accountId || status !== 'confirmed') return null
-  return { bot_token: botToken, account_id: accountId, login_user_id: loginUserId }
+  const contextToken = extractOptionalString(
+    resp?.context_token,
+    resp?.contextToken,
+    resp?.login_context_token,
+    resp?.msg?.context_token,
+  )
+  return {
+    bot_token: botToken,
+    account_id: accountId,
+    login_user_id: loginUserId,
+    ...(contextToken ? { context_token: contextToken } : {}),
+  }
+}
+
+function extractOptionalString(...values: unknown[]): string | undefined {
+  for (const value of values) {
+    if (typeof value !== 'string') continue
+    const trimmed = value.trim()
+    if (trimmed) return trimmed
+  }
+  return undefined
 }
 
 export async function getIlinkUpdates(token: string, getUpdatesBuf: string): Promise<any> {
