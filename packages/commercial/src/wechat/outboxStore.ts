@@ -284,7 +284,7 @@ export async function markFailed(
        status     = CASE WHEN attempts + 1 >= $1 THEN 'failed' ELSE 'queued' END,
        last_error = $2,
        locked_at  = NULL,
-       next_attempt_at = CASE WHEN attempts + 1 >= $1 THEN NULL ELSE $5 END,
+       next_attempt_at = CASE WHEN attempts + 1 >= $1 THEN NULL ELSE $5::bigint END,
        updated_at = $3
      WHERE id = $4 AND status = 'sending'
      RETURNING attempts, status`,
