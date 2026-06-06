@@ -306,6 +306,7 @@ const _TOOL_ICONS = {
   NotebookEdit: _ICON_NOTEBOOK,
   Task: _ICON_BOT,
   Agent: _ICON_BOT,
+  'Codex:multiAgent': _ICON_BOT,
   _default: _ICON_GEAR,
 }
 
@@ -313,6 +314,7 @@ const _TOOL_LABELS = {
   Bash: '终端', Read: '读取文件', Edit: '编辑文件', Write: '写入文件',
   Grep: '搜索内容', Glob: '搜索文件', WebFetch: '网页抓取', WebSearch: '网页搜索',
   TodoWrite: '任务列表', NotebookEdit: '笔记本', Task: '子任务', Agent: '子任务',
+  'Codex:multiAgent': '多 Agent 控制',
 }
 
 // ── MCP server prefix → friendly meta (icon + base label) ──
@@ -928,6 +930,8 @@ function _toolSummary(name, input, msg) {
     }
     case 'NotebookEdit': return _shortPath(input.notebook_path)
     case 'Task': case 'Agent': return (input.description || input.prompt || '').slice(0, 60)
+    case 'Codex:multiAgent':
+      return (input.description || input.codexTool || input.prompt || '').slice(0, 60)
   }
   // codex:<itemType> summaries
   const codexType = _parseCodexTypeName(name)
@@ -2107,6 +2111,110 @@ function _buildPlanCard(el, msg) {
   _appendMsgTime(el, msg.completedAt || msg.ts)
 }
 
+function _goalStatusLabel(status) {
+  switch (status) {
+    case 'active':
+      return '进行中'
+    case 'paused':
+      return '已暂停'
+    case 'blocked':
+      return '阻塞'
+    case 'usageLimited':
+      return '用量受限'
+    case 'budgetLimited':
+      return '预算受限'
+    case 'complete':
+      return '完成'
+    default:
+      return status || '未设置'
+  }
+}
+
+function _formatGoalDuration(seconds) {
+  if (typeof seconds !== 'number' || !Number.isFinite(seconds) || seconds < 0) return ''
+  if (seconds < 60) return `${Math.round(seconds)}s`
+  const mins = Math.floor(seconds / 60)
+  const secs = Math.round(seconds % 60)
+  if (mins < 60) return secs ? `${mins}m ${secs}s` : `${mins}m`
+  const hours = Math.floor(mins / 60)
+  const rem = mins % 60
+  return rem ? `${hours}h ${rem}m` : `${hours}h`
+}
+
+function _buildGoalCard(el, msg) {
+  el.innerHTML = ''
+  el.className = 'msg goal'
+  if (msg.error) el.classList.add('error')
+  el.dataset.msgId = msg.id
+
+  const header = document.createElement('div')
+  header.className = 'goal-card-header'
+  const title = document.createElement('div')
+  title.className = 'goal-card-title'
+  title.textContent = '目标'
+  const state = document.createElement('div')
+  state.className = `goal-card-state ${msg.status || ''}`
+  state.textContent = msg.cleared ? '已清除' : _goalStatusLabel(msg.status)
+  header.appendChild(title)
+  header.appendChild(state)
+  el.appendChild(header)
+
+  const body = document.createElement('div')
+  body.className = 'goal-card-body'
+  const objective = document.createElement('div')
+  objective.className = 'goal-card-objective'
+  objective.textContent = msg.cleared
+    ? '当前 Codex goal 已清除。'
+    : msg.text || 'Codex goal 已更新。'
+  body.appendChild(objective)
+
+  const meta = document.createElement('div')
+  meta.className = 'goal-card-meta'
+  if (typeof msg.tokensUsed === 'number') {
+    const token = document.createElement('span')
+    token.textContent =
+      typeof msg.tokenBudget === 'number'
+        ? `Tokens ${msg.tokensUsed}/${msg.tokenBudget}`
+        : `Tokens ${msg.tokensUsed}`
+    meta.appendChild(token)
+  }
+  const duration = _formatGoalDuration(msg.timeUsedSeconds)
+  if (duration) {
+    const dur = document.createElement('span')
+    dur.textContent = `用时 ${duration}`
+    meta.appendChild(dur)
+  }
+  if (typeof msg.updatedAt === 'number' && Number.isFinite(msg.updatedAt)) {
+    const updated = document.createElement('span')
+    try {
+      const ts = msg.updatedAt < 1000000000000 ? msg.updatedAt * 1000 : msg.updatedAt
+      updated.textContent = `更新 ${new Date(ts).toLocaleTimeString('zh-CN')}`
+    } catch {
+      updated.textContent = ''
+    }
+    if (updated.textContent) meta.appendChild(updated)
+  }
+  if (meta.childNodes.length > 0) body.appendChild(meta)
+
+  if (
+    typeof msg.tokensUsed === 'number' &&
+    typeof msg.tokenBudget === 'number' &&
+    msg.tokenBudget > 0
+  ) {
+    const pct = Math.max(0, Math.min(100, (msg.tokensUsed / msg.tokenBudget) * 100))
+    const bar = document.createElement('div')
+    bar.className = 'goal-card-progress'
+    const fill = document.createElement('div')
+    fill.className = 'goal-card-progress-fill'
+    fill.style.width = `${pct}%`
+    bar.appendChild(fill)
+    body.appendChild(bar)
+  }
+
+  el.appendChild(body)
+  _appendMsgTime(el, msg.completedAt || msg.ts)
+}
+
 export function _buildMessageEl(msg) {
   const el = document.createElement('div')
   el.className = `msg ${msg.role}`
@@ -2582,6 +2690,8 @@ export function _buildMessageEl(msg) {
     _renderDelegateProgress(el, msg)
   } else if (msg.role === 'plan') {
     _buildPlanCard(el, msg)
+  } else if (msg.role === 'goal') {
+    _buildGoalCard(el, msg)
   } else if (msg.role === 'thinking') {
     const header = document.createElement('div')
     header.className = 'thinking-header'
@@ -2762,6 +2872,8 @@ export function updateMessageEl(msg, streaming) {
     if (msg.error) el.classList.add('error')
     el.dataset.msgId = msg.id
     _buildPlanCard(el, msg)
+  } else if (msg.role === 'goal') {
+    _buildGoalCard(el, msg)
   } else if (msg.role === 'thinking') {
     const body = el.querySelector('.thinking-body') || el.querySelector('.msg-body')
     if (body) body.textContent = msg.text || ''

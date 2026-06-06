@@ -71,7 +71,7 @@ export function defaultQueueDir(): string {
  *   - `agentId?` = container agent id([A-Za-z0-9_-]{1,64})
  *   - `outboundId` = turn-level unique id(`[A-Za-z0-9._:-]{8,128}`),audit 表去重
  *   - `peer.kind: 'dm' | 'group'`,`peer.meta.senderId`(微信 openid 衍生)
- *   - `blocks` = OutboundContentBlock[](text / tool_use / tool_result / thinking)
+ *   - `blocks` = OutboundContentBlock[](text / tool_use / tool_result / thinking / goal / ...)
  *   - `isFinal?` 终态标记(master 用它清 running-session 状态)
  *   - `createdAt?` ms epoch(仅审计,broker outbox 行 createdAt 由 broker 自打)
  *   - `traceId?` 调试用透传

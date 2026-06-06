@@ -135,6 +135,129 @@ interface PendingRequest {
   method: string
 }
 
+type CodexGoalBlock = {
+  blockId: string
+  objective?: string
+  status?: string
+  tokenBudget?: number | null
+  tokensUsed?: number
+  timeUsedSeconds?: number
+  updatedAt?: number
+  cleared?: boolean
+}
+
+type CollabAgentStateSummary = { status: string; message?: string }
+
+function finiteNumber(raw: unknown): number | undefined {
+  return typeof raw === 'number' && Number.isFinite(raw) ? raw : undefined
+}
+
+function normalizeCodexGoal(raw: unknown, cleared = false, blockId = 'codex-goal'): CodexGoalBlock {
+  const obj = raw && typeof raw === 'object' ? (raw as Record<string, unknown>) : {}
+  const goal: CodexGoalBlock = { blockId }
+  if (typeof obj.objective === 'string') goal.objective = obj.objective
+  if (typeof obj.status === 'string') goal.status = obj.status
+  if (obj.tokenBudget === null) {
+    goal.tokenBudget = null
+  } else {
+    const tokenBudget = finiteNumber(obj.tokenBudget)
+    if (tokenBudget !== undefined) goal.tokenBudget = tokenBudget
+  }
+  const tokensUsed = finiteNumber(obj.tokensUsed)
+  if (tokensUsed !== undefined) goal.tokensUsed = tokensUsed
+  const timeUsedSeconds = finiteNumber(obj.timeUsedSeconds)
+  if (timeUsedSeconds !== undefined) goal.timeUsedSeconds = timeUsedSeconds
+  const updatedAt = finiteNumber(obj.updatedAt)
+  if (updatedAt !== undefined) goal.updatedAt = updatedAt
+  if (cleared) goal.cleared = true
+  return goal
+}
+
+function collabReceiverThreadIds(item: Record<string, unknown>): string[] {
+  return Array.isArray(item.receiverThreadIds)
+    ? item.receiverThreadIds.filter((v): v is string => typeof v === 'string' && v.length > 0)
+    : []
+}
+
+function collabAgentsStates(
+  item: Record<string, unknown>,
+): Record<string, CollabAgentStateSummary> {
+  const raw = item.agentsStates
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {}
+  const out: Record<string, CollabAgentStateSummary> = {}
+  for (const [threadId, stateUnk] of Object.entries(raw as Record<string, unknown>)) {
+    const state =
+      stateUnk && typeof stateUnk === 'object' ? (stateUnk as Record<string, unknown>) : {}
+    const status = typeof state.status === 'string' ? state.status : ''
+    if (!threadId || !status) continue
+    const message = typeof state.message === 'string' && state.message ? state.message : undefined
+    out[threadId] = message ? { status, message } : { status }
+  }
+  return out
+}
+
+function collabTool(item: Record<string, unknown>): string {
+  return typeof item.tool === 'string' && item.tool ? item.tool : 'unknown'
+}
+
+function collabStatus(item: Record<string, unknown>): string {
+  return typeof item.status === 'string' && item.status ? item.status : 'unknown'
+}
+
+function collabPrompt(item: Record<string, unknown>): string {
+  return typeof item.prompt === 'string' ? item.prompt : ''
+}
+
+function shortThreadId(threadId: string): string {
+  return threadId.length > 12 ? `${threadId.slice(0, 6)}…${threadId.slice(-4)}` : threadId
+}
+
+function collabAgentInput(
+  item: Record<string, unknown>,
+  description: string,
+): Record<string, unknown> {
+  const prompt = collabPrompt(item)
+  const receivers = collabReceiverThreadIds(item)
+  const input: Record<string, unknown> = {
+    description: description || prompt || 'Codex 子 Agent',
+    codexTool: collabTool(item),
+  }
+  if (prompt) input.prompt = prompt
+  if (receivers.length > 0) input.receiverThreadIds = receivers
+  if (typeof item.model === 'string' && item.model) input.model = item.model
+  if (typeof item.reasoningEffort === 'string' && item.reasoningEffort) {
+    input.reasoningEffort = item.reasoningEffort
+  }
+  const states = collabAgentsStates(item)
+  if (Object.keys(states).length > 0) input.agentsStates = states
+  return input
+}
+
+function summarizeCollabControl(item: Record<string, unknown>): string {
+  const tool = collabTool(item)
+  const status = collabStatus(item)
+  const receivers = collabReceiverThreadIds(item)
+  const states = collabAgentsStates(item)
+  const parts = [`${tool}: ${status}`]
+  if (receivers.length > 0) parts.push(`receivers: ${receivers.map(shortThreadId).join(', ')}`)
+  const stateLines = Object.entries(states).map(([threadId, state]) => {
+    const msg = state.message ? ` — ${state.message}` : ''
+    return `${shortThreadId(threadId)}: ${state.status}${msg}`
+  })
+  if (stateLines.length > 0) parts.push(stateLines.join('\n'))
+  return parts.join('\n')
+}
+
+function isTerminalCollabAgentStatus(status: string): boolean {
+  return (
+    status === 'completed' || status === 'errored' || status === 'shutdown' || status === 'notFound'
+  )
+}
+
+function isErrorCollabAgentStatus(status: string): boolean {
+  return status === 'errored' || status === 'notFound'
+}
+
 /** Structured error produced by `sendRequest` when codex replies with a
  *  JSON-RPC error frame. Callers can branch on `rpcCode` / `rpcMessage` /
  *  `rpcMethod` without re-parsing `message`; the human-readable `message`
@@ -667,6 +790,14 @@ export class CodexAppServerRunner extends EventEmitter {
     string,
     { mode: 'summary' | 'text' | null; sawContent: boolean }
   > = new Map()
+  /** Codex 0.137 collaboration APIs model subagents as thread receivers.
+   *  The web UI, however, already has a stable Agent-card contract keyed by
+   *  the spawning tool_use id. Keep a small per-turn reverse index so later
+   *  wait/join control items can close the original Agent card when every
+   *  receiver thread reaches a terminal state. */
+  private collabReceiverToSpawnId = new Map<string, string>()
+  private collabSpawnReceivers = new Map<string, Set<string>>()
+  private completedCollabSpawnResults = new Set<string>()
 
   /** mkdtempSync'd dir holding the per-spawn `extra-prompt.md`. Created lazily
    *  in `ensureSpawned()` whenever a fresh app-server process needs platform
@@ -1510,6 +1641,14 @@ export class CodexAppServerRunner extends EventEmitter {
     } as unknown as RunnerMessage)
   }
 
+  private emitGoalBlock(goal: CodexGoalBlock): void {
+    this.emit('message', {
+      type: 'openclaude_goal',
+      session_id: this.threadId,
+      goal,
+    } as unknown as RunnerMessage)
+  }
+
   private codexReasoningEffort(): 'low' | 'medium' | 'high' | 'xhigh' | null {
     switch (this.effortLevel) {
       case 'low':
@@ -1589,6 +1728,18 @@ export class CodexAppServerRunner extends EventEmitter {
       }
     }
 
+    if (method === 'thread/goal/updated') {
+      this.emitGoalBlock(
+        normalizeCodexGoal(p.goal, false, `codex-goal-${this.activeTurnId ?? 'pending'}`),
+      )
+      return
+    }
+    if (method === 'thread/goal/cleared') {
+      this.emitGoalBlock(
+        normalizeCodexGoal(undefined, true, `codex-goal-${this.activeTurnId ?? 'pending'}`),
+      )
+      return
+    }
     if (method === 'item/agentMessage/delta') {
       const delta = typeof p.delta === 'string' ? p.delta : ''
       if (!delta) return
@@ -1836,6 +1987,97 @@ export class CodexAppServerRunner extends EventEmitter {
     this.emitTurnStatus(null)
   }
 
+  private rememberCollabSpawnReceivers(spawnId: string, receiverThreadIds: string[]): void {
+    if (receiverThreadIds.length === 0) return
+    let receivers = this.collabSpawnReceivers.get(spawnId)
+    if (!receivers) {
+      receivers = new Set<string>()
+      this.collabSpawnReceivers.set(spawnId, receivers)
+    }
+    for (const receiverId of receiverThreadIds) {
+      receivers.add(receiverId)
+      this.collabReceiverToSpawnId.set(receiverId, spawnId)
+    }
+  }
+
+  private handleCollabAgentToolStarted(itemId: string, item: Record<string, unknown>): void {
+    const tool = collabTool(item)
+    if (tool === 'spawnAgent') {
+      const receivers = collabReceiverThreadIds(item)
+      this.rememberCollabSpawnReceivers(itemId, receivers)
+      const prompt = collabPrompt(item)
+      this.emitAssistantToolUse(
+        itemId,
+        'Agent',
+        collabAgentInput(item, prompt || '启动 Codex 子 Agent'),
+      )
+      return
+    }
+
+    this.emitAssistantToolUse(
+      itemId,
+      'Codex:multiAgent',
+      collabAgentInput(item, `Codex multi-agent: ${tool}`),
+    )
+  }
+
+  private maybeEmitCompletedCollabAgentGroups(item: Record<string, unknown>): void {
+    const states = collabAgentsStates(item)
+    if (Object.keys(states).length === 0) return
+
+    const touchedReceivers = new Set([...collabReceiverThreadIds(item), ...Object.keys(states)])
+    const touchedSpawnIds = new Set<string>()
+    for (const receiverId of touchedReceivers) {
+      const spawnId = this.collabReceiverToSpawnId.get(receiverId)
+      if (spawnId) touchedSpawnIds.add(spawnId)
+    }
+
+    for (const spawnId of touchedSpawnIds) {
+      if (this.completedCollabSpawnResults.has(spawnId)) continue
+      const receivers = this.collabSpawnReceivers.get(spawnId)
+      if (!receivers || receivers.size === 0) continue
+      const receiverList = [...receivers]
+      const allTerminal = receiverList.every((receiverId) =>
+        isTerminalCollabAgentStatus(states[receiverId]?.status || ''),
+      )
+      if (!allTerminal) continue
+
+      const isError = receiverList.some((receiverId) =>
+        isErrorCollabAgentStatus(states[receiverId]?.status || ''),
+      )
+      const lines = receiverList.map((receiverId) => {
+        const state = states[receiverId]
+        const msg = state?.message ? ` — ${state.message}` : ''
+        return `${shortThreadId(receiverId)}: ${state?.status || 'unknown'}${msg}`
+      })
+      this.completedCollabSpawnResults.add(spawnId)
+      this.emitToolResult(spawnId, lines.join('\n') || 'Codex child agent completed', isError)
+    }
+  }
+
+  private handleCollabAgentToolCompleted(itemId: string, item: Record<string, unknown>): void {
+    const tool = collabTool(item)
+    const status = collabStatus(item)
+
+    if (tool === 'spawnAgent') {
+      this.rememberCollabSpawnReceivers(itemId, collabReceiverThreadIds(item))
+      if (status === 'failed' || status === 'errored') {
+        this.completedCollabSpawnResults.add(itemId)
+        this.emitToolResult(itemId, summarizeCollabControl(item), true)
+      } else {
+        this.maybeEmitCompletedCollabAgentGroups(item)
+      }
+      return
+    }
+
+    this.emitToolResult(
+      itemId,
+      summarizeCollabControl(item),
+      status === 'failed' || status === 'errored',
+    )
+    this.maybeEmitCompletedCollabAgentGroups(item)
+  }
+
   private handleItemStarted(itemUnk: unknown): void {
     if (!itemUnk || typeof itemUnk !== 'object') return
     const item = itemUnk as Record<string, unknown>
@@ -1860,6 +2102,10 @@ export class CodexAppServerRunner extends EventEmitter {
         kind,
         changes,
       })
+      return
+    }
+    if (itemType === 'collabAgentToolCall') {
+      this.handleCollabAgentToolStarted(itemId, item)
       return
     }
     // agentMessage / reasoning are streamed via deltas; nothing to surface
@@ -1904,6 +2150,10 @@ export class CodexAppServerRunner extends EventEmitter {
         })
         .join('\n')
       this.emitToolResult(itemId, summary || 'file changes applied', false)
+      return
+    }
+    if (itemType === 'collabAgentToolCall') {
+      this.handleCollabAgentToolCompleted(itemId, item)
       return
     }
     if (itemType === 'imageGeneration') {
@@ -2073,6 +2323,13 @@ export class CodexAppServerRunner extends EventEmitter {
     // turn) — clear at turn-start so the summary/mode lock and first-part
     // skip flag don't bleed across turns.
     this.reasoningItemState.clear()
+    // Collaboration receiver ids are scoped to the current Codex turn's
+    // spawn/wait control items. Clear them up front so a recycled runner does
+    // not close a stale Agent card from a previous turn when receiver thread
+    // ids happen to repeat in later protocol frames.
+    this.collabReceiverToSpawnId.clear()
+    this.collabSpawnReceivers.clear()
+    this.completedCollabSpawnResults.clear()
     // Per-turn token state: cleared at turn-start so a partial state from a
     // crashed prior turn never bleeds into this turn's billing. priorTurnTotal
     // is intentionally NOT cleared — it's the cumulative-thread baseline that

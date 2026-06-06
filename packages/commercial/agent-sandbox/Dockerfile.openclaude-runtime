@@ -142,19 +142,16 @@ RUN set -eux; \
 # v3 容器复用同一份 codex CLI 二进制,gateway 选到 gpt-5.5 时,sessionManager 通过
 # `runnerKind:'app-server'` 路由到 CodexAppServerRunner,长驻一个 codex app-server 子进程。
 #
-# 版本 pin 0.133.0(2026-05-25 升级,从 0.130 → 0.133):codex 当前最新 stable。
-# 升级原因 (1):0.131-0.133 区间含 TurnContextItem trim / MCP tool_call plugin id /
-#                app-server schema 微调等改动(详见 GitHub release page),拿 patch
-#                修拉到最新。(2):同批 ship 前端 todo_list 兼容(packages/web/public/
-#                modules/messages.js,_normalizeCodexPlanInput),解决 0.130 起 plan
-#                item 改名为 todo_list 导致前端"任务列表"卡片空白的问题。
-# Protocol 兼容性: 实测 0.133 仍 emit `{type:'todo_list', items:[{text, completed}]}`
-# 与 0.130 一致 — 前端 normalizer 已同步两种 schema。其他 thread item type
-# (mcpToolCall / webSearch / imageGeneration / commandExecution / fileChange) 字段
-# 增量(如 mcpToolCall.plugin_id)被前端 server/tool/args 三件套自然忽略,不破坏
-# 现有渲染。**真正 e2e 行为验证仍是发布门槛**: 镜像 build 完后必须在 dev 环境
-# 跑一次 GPT 5.5 真 turn(包含 image_gen + plan 调用)再 ship 生产。出现协议
-# 漂移则把版本回滚到 0.130 并重 build。
+# 版本 pin 0.137.0(2026-06-07 升级,从 0.133 → 0.137):npm latest stable。
+# 升级原因:(1) 拉取 0.133 之后的 app-server / collaboration / tool protocol 修复;
+#          (2) 同批 ship goals + collabAgentToolCall 适配,让商业版跟个人版
+#              Codex goals / 多 Agent UI 行为对齐。
+# Protocol 兼容性: 前端 normalizer 继续兼容 `{type:'plan'}` 与 0.130+ `todo_list`;
+# 0.137 新增 goal / collaboration 通知由 gateway 显式降级成 OpenClaude
+# `goal` / `Agent` / `Codex:multiAgent` blocks。**真正 e2e 行为验证仍是发布门槛**:
+# 镜像 build 完后必须在 dev 环境跑一次 GPT 5.5 真 turn(包含 image_gen + plan/goal
+# + multi-agent 调用)再 ship 生产。出现协议
+# 漂移则把版本回滚到上一已验证 pin(0.133.0)并重 build。
 #
 # 全局装到 /usr/local/lib/node_modules/@openai/codex,二进制 symlink 在 /usr/local/bin/codex。
 # 容器内 USER=agent 走默认 PATH 即可命中。
@@ -164,7 +161,7 @@ RUN set -eux; \
 # entrypoint.ts 在 CODEX_HOME 下建 symlink auth.json → /run/oc/codex-auth/auth.json,
 # 后者是 supervisor 把 host 剥离 refresh_token 的 auth.json 目录 ro bind-mount 进来的源。
 # 详见 packages/gateway/src/codexAuthSync.ts + v3supervisor.ts 的 V3_CODEX_AUTH_RO_MOUNT。
-RUN npm install -g @openai/codex@0.133.0 --no-audit --no-fund \
+RUN npm install -g @openai/codex@0.137.0 --no-audit --no-fund \
     && npm cache clean --force \
     && rm -rf /root/.npm
 
