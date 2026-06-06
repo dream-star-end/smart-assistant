@@ -315,7 +315,7 @@ describe("outboxStore.markFailed", () => {
     const sql = captured[0]!.sql
     assert.match(sql, /attempts\s*=\s*attempts \+ 1/)
     assert.match(sql, /WHEN attempts \+ 1 >= \$1 THEN 'failed' ELSE 'queued'/)
-    assert.match(sql, /next_attempt_at\s*=\s*CASE WHEN attempts \+ 1 >= \$1 THEN NULL ELSE \$5 END/)
+    assert.match(sql, /next_attempt_at\s*=\s*CASE WHEN attempts \+ 1 >= \$1 THEN NULL ELSE \$5::bigint END/)
     assert.equal(captured[0]!.params[4], 14_999)
   })
 
