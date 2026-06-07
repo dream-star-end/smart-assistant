@@ -2496,6 +2496,13 @@ export class SessionManager {
       // Listen for subprocess crash mid-turn. Defer slightly to let remaining
       // stdout data drain (exit can fire before stdout 'end' in Node.js).
       const handleExit = (info: { code: number | null; signal: string | null; crashed: boolean }) => {
+        // Normal lifecycle restarts (model/effort/toolset swaps and Codex
+        // app-server route-token respawns) emit a clean `exit` before the turn
+        // continues on the replacement process. Do not finalize/detach the
+        // parser for that expected code=0/no-signal shape; real signal/non-zero
+        // exits still take the existing partial-drain/error path below.
+        if (!info.crashed && info.code === 0 && info.signal == null) return
+
         // The setTimeout body is wrapped in `flushP` and registered with the
         // pending-persistence set IMMEDIATELY (synchronously, on this exit
         // event). That way `SessionManager.awaitPendingPersistence` — called
