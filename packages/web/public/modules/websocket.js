@@ -55,6 +55,9 @@ const OFFLINE_LATCH_GRACE_MS = 60_000
 // can fire visibilitychange rapidly and we don't want to spam connect().
 let _lastVisibilityReconnectAt = 0
 const VISIBILITY_RECONNECT_COOLDOWN_MS = 2000
+const FOREGROUND_HELLO_COOLDOWN_MS = 5000
+const HELLO_PEERS_LIMIT = 50
+let _lastForegroundHelloAt = 0
 
 // ── Application-layer ping/pong watchdog ──
 // iOS Safari (and some mobile carrier proxies) can leave a backgrounded WS in
@@ -70,7 +73,7 @@ const VISIBILITY_RECONNECT_COOLDOWN_MS = 2000
 // arrives). This keeps visibility/focus/pageshow + keepalive timer overlap
 // from stacking watchdogs.
 let _pingNonce = 0
-let _pendingPing = null // { id, ws, timeoutId, label } when a probe is in flight
+let _pendingPing = null // { id, ws, timeoutId, label, onPong } when a probe is in flight
 const PROBE_TIMEOUT_VISIBILITY_MS = 5000
 const PROBE_TIMEOUT_KEEPALIVE_MS = 10000
 
@@ -81,7 +84,7 @@ const PROBE_TIMEOUT_KEEPALIVE_MS = 10000
  * track lastPongAt as a side effect — the pong handler in `onmessage` clears
  * `_pendingPing` directly when its id matches.
  */
-function _probeWsAlive(ws, timeoutMs, label) {
+function _probeWsAlive(ws, timeoutMs, label, onPong) {
   if (!ws || ws.readyState !== 1) return
   if (state.ws !== ws) return
   if (_pendingPing) return // already probing — let existing watchdog finish
@@ -107,7 +110,7 @@ function _probeWsAlive(ws, timeoutMs, label) {
       ws.close(code, `${label} ping timeout`)
     } catch {}
   }, timeoutMs)
-  _pendingPing = { id, ws, timeoutId, label }
+  _pendingPing = { id, ws, timeoutId, label, onPong }
 }
 
 const _bgTasks = new Map() // id -> { desc, status, startTime, duration, error }
@@ -617,19 +620,46 @@ export function updateSendEnabled() {
 }
 
 export function buildHelloPeers() {
-  const peers = []
-  for (const [id, s] of state.sessions) {
-    const isCurrent = id === state.currentSessionId
-    const hasCursor = typeof s._lastFrameSeq === 'number' && s._lastFrameSeq > 0
-    if (!isCurrent && !s._sendingInFlight && !hasCursor) continue
-    peers.push({
+  return [...state.sessions.entries()]
+    .filter(([id, s]) => {
+      const isCurrent = id === state.currentSessionId
+      const hasCursor = typeof s._lastFrameSeq === 'number' && s._lastFrameSeq > 0
+      return isCurrent || s._sendingInFlight || hasCursor || s._liveStreamBroken
+    })
+    .sort((a, b) => {
+      const pa =
+        (a[0] === state.currentSessionId ? 4 : 0) +
+        (a[1]._sendingInFlight ? 2 : 0) +
+        (a[1]._liveStreamBroken ? 1 : 0)
+      const pb =
+        (b[0] === state.currentSessionId ? 4 : 0) +
+        (b[1]._sendingInFlight ? 2 : 0) +
+        (b[1]._liveStreamBroken ? 1 : 0)
+      return pb - pa || (b[1].lastAt || 0) - (a[1].lastAt || 0)
+    })
+    .slice(0, HELLO_PEERS_LIMIT)
+    .map(([id, s]) => ({
       peerId: id,
       agentId: s.agentId || state.defaultAgentId,
       inFlight: !!s._sendingInFlight,
       lastFrameSeq: s._lastFrameSeq || 0,
-    })
-  }
-  return peers
+    }))
+}
+
+function _sendHello(ws, reason) {
+  if (!ws || ws.readyState !== 1) return
+  if (state.ws !== ws) return
+  try {
+    const peers = buildHelloPeers()
+    ws.send(
+      JSON.stringify({
+        type: 'inbound.hello',
+        channel: 'webchat',
+        peers,
+        reason,
+      }),
+    )
+  } catch {}
 }
 // Clears per-turn reply tracker state so the next incoming frame re-binds fresh.
 // Must be called from any path that abandons an in-flight turn locally (/clear,
@@ -799,8 +829,15 @@ export function notifyTabVisible() {
     connect()
     return
   }
-  // ws OPEN but possibly half-open — probe to be sure.
-  _probeWsAlive(state.ws, PROBE_TIMEOUT_VISIBILITY_MS, 'visibility')
+  // ws OPEN but possibly half-open — probe to be sure. If it responds,
+  // send a throttled foreground hello so Redis/ring replay can fill any tail
+  // the backgrounded tab missed without waiting for a full reconnect.
+  _probeWsAlive(state.ws, PROBE_TIMEOUT_VISIBILITY_MS, 'visibility', () => {
+    const now = Date.now()
+    if (now - _lastForegroundHelloAt < FOREGROUND_HELLO_COOLDOWN_MS) return
+    _lastForegroundHelloAt = now
+    _sendHello(state.ws, 'foreground')
+  })
 }
 
 export function connect() {
@@ -884,10 +921,7 @@ export function connect() {
     // Phase 0.4: include lastFrameSeq per peer so gateway can replay buffered
     // outbound frames the client missed during the disconnect window. 0 means
     // "I've never received a frameSeq'd frame" (fresh tab or legacy client).
-    try {
-      const peers = buildHelloPeers()
-      ws.send(JSON.stringify({ type: 'inbound.hello', channel: 'webchat', peers }))
-    } catch {}
+    _sendHello(ws, 'open')
     // Flush offline queue — delay drain start to let hello/resume isFinals arrive first.
     // This prevents a resumed turn's isFinal from being mistaken for a drain response.
     if (state._offlineDrainTimer) clearTimeout(state._offlineDrainTimer)
@@ -1027,8 +1061,12 @@ export function connect() {
       // watchdog by accident.
       if (f.type === 'pong') {
         if (_pendingPing && _pendingPing.ws === ws && _pendingPing.id === f.id) {
+          const onPong = _pendingPing.onPong
           clearTimeout(_pendingPing.timeoutId)
           _pendingPing = null
+          try {
+            onPong?.()
+          } catch {}
         }
         return
       }
@@ -1723,7 +1761,13 @@ export function handleOutbound(frame) {
     // Accumulate token usage for session-level tracking
     if (frame.meta) {
       if (!sess._tokenUsage)
-        sess._tokenUsage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 }
+        sess._tokenUsage = {
+          input: 0,
+          output: 0,
+          cacheRead: 0,
+          cacheWrite: 0,
+          cost: 0,
+        }
       if (typeof frame.meta.inputTokens === 'number')
         sess._tokenUsage.input += frame.meta.inputTokens
       if (typeof frame.meta.outputTokens === 'number')
@@ -2086,7 +2130,11 @@ function _showPermissionModal(frame, sess, msg) {
   })
 
   // Store reference for cleanup
-  _pendingPermissions.set(frame.requestId, { frame, el: overlay, timer: countdown })
+  _pendingPermissions.set(frame.requestId, {
+    frame,
+    el: overlay,
+    timer: countdown,
+  })
 }
 
 function _resolvePermission(frame, behavior, message, sess, msg, overlay, extras) {
@@ -2369,7 +2417,11 @@ function _showAskUserQuestionModal(frame, sess, msg) {
     })
   })
 
-  _pendingPermissions.set(frame.requestId, { frame, el: overlay, timer: countdown })
+  _pendingPermissions.set(frame.requestId, {
+    frame,
+    el: overlay,
+    timer: countdown,
+  })
 }
 
 /**

@@ -205,7 +205,11 @@ export function buildHistoricalContextPrompt(
   const maxChars = opts?.maxChars ?? 14_000
   const maxMessages = opts?.maxMessages ?? 40
   const currentNorm = normForCompare(currentUserText)
-  const rows: Array<{ role: 'user' | 'assistant'; text: string; status?: unknown }> = []
+  const rows: Array<{
+    role: 'user' | 'assistant'
+    text: string
+    status?: unknown
+  }> = []
   for (const raw of messages) {
     if (!raw || typeof raw !== 'object') continue
     const msg = raw as ChatHistoryMessage
@@ -328,6 +332,8 @@ export class SessionManager {
   public onCronBridge?: (event: CronBridgeEvent) => Promise<void>
   /** Called when a 401 auth error is detected — gateway should trigger immediate token refresh */
   public onAuthError?: () => Promise<void>
+  /** Called after server-authored assistant text mutates a client_sessions row. */
+  public onClientSessionMutated?: (sessionId: string, userId: string) => void
 
   private resumeMapPath = join(paths.home, 'resume-map.json')
 
@@ -440,7 +446,12 @@ export class SessionManager {
   private _saveResumeMap(): void {
     // Merge: start from the loaded resume-map (includes sessions not yet re-activated),
     // then overlay with live sessions (which may have updated ccbSessionIds after resume).
-    type ResumeEntry = { id: string; ts: number; lastCost?: number; provider?: string }
+    type ResumeEntry = {
+      id: string
+      ts: number
+      lastCost?: number
+      provider?: string
+    }
     const obj: Record<string, ResumeEntry> = {}
     const now = Date.now()
     for (const [key, val] of this._resumeMap) {
@@ -920,18 +931,21 @@ export class SessionManager {
       const CHECK_INTERVAL = 15_000 // check every 15s
       let livenessTimer: NodeJS.Timeout | null = null
       let visibleActivityAt = Date.now()
-      eventGate = createIdleTimeoutEventGate((e) => {
-        visibleActivityAt = Date.now()
-        onEvent(e)
-      }, (e, count) => {
-        if (count <= 3) {
-          log.warn('suppressed late event after idle timeout', {
-            sessionKey: session.sessionKey,
-            kind: e.kind,
-            count,
-          })
-        }
-      })
+      eventGate = createIdleTimeoutEventGate(
+        (e) => {
+          visibleActivityAt = Date.now()
+          onEvent(e)
+        },
+        (e, count) => {
+          if (count <= 3) {
+            log.warn('suppressed late event after idle timeout', {
+              sessionKey: session.sessionKey,
+              kind: e.kind,
+              count,
+            })
+          }
+        },
+      )
       const livenessPromise = new Promise<never>((_, reject) => {
         livenessTimer = setInterval(() => {
           const idleMs = getLivenessIdleMs(session.runner, visibleActivityAt)
@@ -1194,7 +1208,10 @@ export class SessionManager {
           try {
             runner.interrupt()
           } catch {}
-          onEvent({ kind: 'error', error: '单轮对话空闲超时 (30 分钟无输出),已中断。请重试。' })
+          onEvent({
+            kind: 'error',
+            error: '单轮对话空闲超时 (30 分钟无输出),已中断。请重试。',
+          })
           detach()
           settle(() => resolve())
         }
@@ -1494,27 +1511,32 @@ export class SessionManager {
               const directWrite = async () => {
                 if (session.userId) {
                   const messageId = `srv-${peerId}-t${turnIndex}`
-                  return appendServerAuthoredMessageDurable(peerId, session.userId, {
+                  const r = await appendServerAuthoredMessageDurable(peerId, session.userId, {
                     id: messageId,
                     role: 'assistant',
                     text: assistantText,
                     ts: Date.now(),
                     status: 'completed',
                   })
+                  return { r, userId: session.userId }
                 }
                 const existing = await getClientSession(peerId)
                 if (!existing) return undefined // cron-style pre-UI, no owner
                 const messageId = `srv-${peerId}-t${turnIndex}`
-                return appendServerAuthoredMessageDurable(peerId, existing.userId, {
+                const r = await appendServerAuthoredMessageDurable(peerId, existing.userId, {
                   id: messageId,
                   role: 'assistant',
                   text: assistantText,
                   ts: Date.now(),
                   status: 'completed',
                 })
+                return { r, userId: existing.userId }
               }
               directWrite()
-                .then((r) => {
+                .then((writeResult) => {
+                  const r = writeResult?.r
+                  if (r?.applied && writeResult?.userId)
+                    this.onClientSessionMutated?.(peerId, writeResult.userId)
                   if (r && !r.applied && r.reason !== 'already_exists') {
                     // 'queued_to_outbox' is an expected degraded-mode outcome
                     // (DB unavailable); log as warn not error so we don't spam
@@ -1664,26 +1686,32 @@ export class SessionManager {
               const flushPartial = async () => {
                 const uid = session.userId ?? (await getClientSession(peerId))?.userId
                 if (!uid) return undefined // no owner, nothing to persist to
-                return appendServerAuthoredMessageDurable(peerId, uid, {
+                const r = await appendServerAuthoredMessageDurable(peerId, uid, {
                   id: `srv-${peerId}-t${turnIndex}`,
                   role: 'assistant',
                   text: partial,
                   ts: Date.now(),
                   status,
                 })
+                return { r, userId: uid }
               }
-              flushPartial().catch((err) => {
-                log.error(
-                  'partial assistant flush failed',
-                  {
-                    sessionKey: session.sessionKey,
-                    peerId,
-                    turnIndex,
-                    status,
-                  },
-                  err as Error,
-                )
-              })
+              flushPartial()
+                .then((writeResult) => {
+                  if (writeResult?.r.applied && writeResult.userId)
+                    this.onClientSessionMutated?.(peerId, writeResult.userId)
+                })
+                .catch((err) => {
+                  log.error(
+                    'partial assistant flush failed',
+                    {
+                      sessionKey: session.sessionKey,
+                      peerId,
+                      turnIndex,
+                      status,
+                    },
+                    err as Error,
+                  )
+                })
             }
             onEvent({ kind: 'error', error: reason })
             detach()
