@@ -105,8 +105,20 @@ describe('RedisSessionBus', () => {
     assert.equal(await bus.reserveFrameSeq('s1'), 1)
     assert.equal(await bus.reserveFrameSeq('s1'), 2)
     assert.equal(await bus.advanceFrameSeq('s1', 2, 10), 11)
-    bus.publishFrame({ sessionKey: 's1', peerKey: 'default:webchat:p1', frameSeq: 1, ts: 1001, data: frameData(1) })
-    bus.publishFrame({ sessionKey: 's1', peerKey: 'default:webchat:p1', frameSeq: 2, ts: 1002, data: frameData(2) })
+    bus.publishFrame({
+      sessionKey: 's1',
+      peerKey: 'default:webchat:p1',
+      frameSeq: 1,
+      ts: 1001,
+      data: frameData(1),
+    })
+    bus.publishFrame({
+      sessionKey: 's1',
+      peerKey: 'default:webchat:p1',
+      frameSeq: 2,
+      ts: 1002,
+      data: frameData(2),
+    })
     await Promise.resolve()
 
     const replay = await bus.replay('s1', 0)
@@ -116,6 +128,105 @@ describe('RedisSessionBus', () => {
       replay.frames.map((f) => f.seq),
       [1, 2],
     )
+    await bus.close()
+  })
+
+  it('caches client session lists and validates user-scoped envelopes', async () => {
+    const broker = createFakeRedisBroker()
+    const bus = new RedisSessionBus({
+      config: {
+        enabled: true,
+        keyPrefix: 'testprefix',
+        sessionCacheTtlMs: 10_000,
+      },
+      createClient: broker.createClient,
+    })
+    await bus.start(() => {})
+    const list = [
+      {
+        id: 'sess-1',
+        agentId: 'main',
+        title: 'T',
+        pinned: false,
+        createdAt: 1,
+        lastAt: 2,
+        messageCount: 3,
+        updatedAt: 4,
+      },
+    ]
+    bus.setSessionList('user-A', list)
+    await Promise.resolve()
+
+    assert.deepEqual(await bus.getSessionList('user-A'), list)
+    assert.equal(await bus.getSessionList('user-B'), null)
+
+    await bus.close()
+  })
+
+  it('caches full client sessions, skips oversized snapshots, and invalidates', async () => {
+    const broker = createFakeRedisBroker()
+    const bus = new RedisSessionBus({
+      config: {
+        enabled: true,
+        keyPrefix: 'testprefix',
+        maxSessionSnapshotBytes: 1024,
+      },
+      createClient: broker.createClient,
+    })
+    await bus.start(() => {})
+    const session = {
+      id: 'sess-1',
+      userId: 'user-A',
+      agentId: 'main',
+      title: 'T',
+      pinned: false,
+      createdAt: 1,
+      lastAt: 2,
+      messages: [{ id: 'm1', role: 'user', text: 'hi' }],
+      updatedAt: 4,
+    }
+    bus.setClientSession('user-A', session)
+    await Promise.resolve()
+    assert.deepEqual(await bus.getClientSession('user-A', 'sess-1'), session)
+    assert.equal(await bus.getClientSession('user-B', 'sess-1'), null)
+
+    bus.invalidateClientSession('user-A', 'sess-1')
+    await Promise.resolve()
+    assert.equal(await bus.getClientSession('user-A', 'sess-1'), null)
+
+    bus.setClientSession('user-A', {
+      ...session,
+      id: 'big',
+      messages: [{ text: 'x'.repeat(2000) }],
+    })
+    await Promise.resolve()
+    assert.equal(await bus.getClientSession('user-A', 'big'), null)
+    await bus.close()
+  })
+
+  it('clears client session cache keys without touching frame replay keys', async () => {
+    const broker = createFakeRedisBroker()
+    const bus = new RedisSessionBus({
+      config: { enabled: true, keyPrefix: 'testprefix' },
+      createClient: broker.createClient,
+    })
+    await bus.start(() => {})
+    bus.setSessionList('user-A', [])
+    bus.publishFrame({
+      sessionKey: 's1',
+      peerKey: 'default:webchat:p1',
+      frameSeq: 1,
+      ts: 1001,
+      data: frameData(1),
+    })
+    await Promise.resolve()
+    bus.clearClientSessionCache()
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    assert.equal(await bus.getSessionList('user-A'), null)
+    const replay = await bus.replay('s1', 0)
+    assert.equal(replay.ok, true)
+    if (!replay.ok) return
+    assert.equal(replay.frames.length, 1)
     await bus.close()
   })
 
@@ -150,6 +261,7 @@ function createFakeRedisBroker() {
   const lists = new Map<string, string[]>()
   const counters = new Map<string, number>()
   const channels = new Map<string, (message: string) => void>()
+  const strings = new Map<string, string>()
   const createClient = () => ({
     isOpen: true,
     on() {},
@@ -177,6 +289,24 @@ function createFakeRedisBroker() {
       return next
     },
     async pExpire() {},
+    async pSetEx(key: string, _ttlMs: number, value: string) {
+      strings.set(key, value)
+    },
+    async get(key: string) {
+      return strings.get(key) ?? null
+    },
+    async del(keys: string[] | string) {
+      for (const key of Array.isArray(keys) ? keys : [keys]) {
+        strings.delete(key)
+        lists.delete(key)
+      }
+    },
+    async *scanIterator(opts: { MATCH?: string } = {}) {
+      const prefix = opts.MATCH?.endsWith('*') ? opts.MATCH.slice(0, -1) : opts.MATCH
+      for (const key of [...strings.keys(), ...lists.keys()]) {
+        if (!prefix || key.startsWith(prefix)) yield key
+      }
+    },
     async rPush(key: string, value: string) {
       const list = lists.get(key) ?? []
       list.push(value)

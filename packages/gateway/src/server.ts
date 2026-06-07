@@ -228,7 +228,13 @@ export class Gateway {
   // Track last active channel + session for proactive push (reminders, heartbeat, etc.)
   private lastActiveChannel = new Map<
     string,
-    { channel: string; peerId: string; sessionKey: string; at: number; userId: string }
+    {
+      channel: string
+      peerId: string
+      sessionKey: string
+      at: number
+      userId: string
+    }
   >()
 
   // ── Phase 0.3: outbound frame ring buffer (short-term replay) ──
@@ -264,6 +270,9 @@ export class Gateway {
       env: process.env,
       log: this.log,
     })
+    this.sessions.onClientSessionMutated = (sessionId, userId) => {
+      this._redisSessionBus.invalidateClientSession(userId, sessionId)
+    }
   }
 
   /** Feed `prune()` eviction counts into Prometheus counters. Called from
@@ -294,7 +303,8 @@ export class Gateway {
       return
     }
     this._drainRedisPendingFrames(frame.sessionKey)
-    if (this._redisPendingFrames.has(frame.sessionKey)) this._scheduleRedisGapTimeout(frame.sessionKey)
+    if (this._redisPendingFrames.has(frame.sessionKey))
+      this._scheduleRedisGapTimeout(frame.sessionKey)
   }
 
   private _drainRedisPendingFrames(sessionKey: string): void {
@@ -305,7 +315,12 @@ export class Gateway {
       const frame = pending.get(nextSeq)
       if (!frame) break
       pending.delete(nextSeq)
-      const evicted = this._outboundRing.storeExternal(frame.sessionKey, frame.frameSeq, frame.ts, frame.data)
+      const evicted = this._outboundRing.storeExternal(
+        frame.sessionKey,
+        frame.frameSeq,
+        frame.ts,
+        frame.data,
+      )
       this._recordRingEvictions(evicted)
       this._sendRedisFrameToLocalClients(frame)
     }
@@ -345,9 +360,19 @@ export class Gateway {
     if (!pending || pending.size === 0) return
     const frames = [...pending.values()].sort((a, b) => a.frameSeq - b.frameSeq)
     const first = frames[0]
-    this._sendRedisResumeFailed(first, this._outboundRing.lastFrameSeq(sessionKey), first.frameSeq, 'buffer_miss')
+    this._sendRedisResumeFailed(
+      first,
+      this._outboundRing.lastFrameSeq(sessionKey),
+      first.frameSeq,
+      'buffer_miss',
+    )
     for (const frame of frames) {
-      const evicted = this._outboundRing.storeExternal(frame.sessionKey, frame.frameSeq, frame.ts, frame.data)
+      const evicted = this._outboundRing.storeExternal(
+        frame.sessionKey,
+        frame.frameSeq,
+        frame.ts,
+        frame.data,
+      )
       this._recordRingEvictions(evicted)
     }
     pending.clear()
@@ -361,7 +386,10 @@ export class Gateway {
     reason: 'no_buffer' | 'buffer_miss' | 'sequence_mismatch',
   ): void {
     try {
-      const wire = JSON.parse(frame.data) as { channel?: string; peer?: { id?: string; kind?: 'dm' | 'group' } }
+      const wire = JSON.parse(frame.data) as {
+        channel?: string
+        peer?: { id?: string; kind?: 'dm' | 'group' }
+      }
       if (!wire.channel || !wire.peer?.id || !wire.peer.kind) return
       const data = JSON.stringify({
         type: 'outbound.resume_failed',
@@ -383,12 +411,18 @@ export class Gateway {
     } catch {}
   }
 
-  private async _allocateFrameSeq(sessionKey: string): Promise<{ seq: number; redisBacked: boolean }> {
+  private async _allocateFrameSeq(
+    sessionKey: string,
+  ): Promise<{ seq: number; redisBacked: boolean }> {
     const redisSeq = await this._redisSessionBus.reserveFrameSeq(sessionKey)
     const localLast = this._outboundRing.lastFrameSeq(sessionKey)
     if (redisSeq && redisSeq > localLast) return { seq: redisSeq, redisBacked: true }
     if (redisSeq && redisSeq <= localLast) {
-      const advancedSeq = await this._redisSessionBus.advanceFrameSeq(sessionKey, redisSeq, localLast)
+      const advancedSeq = await this._redisSessionBus.advanceFrameSeq(
+        sessionKey,
+        redisSeq,
+        localLast,
+      )
       if (advancedSeq && advancedSeq > localLast) return { seq: advancedSeq, redisBacked: true }
     }
     return { seq: this._outboundRing.nextSeq(sessionKey), redisBacked: false }
@@ -402,12 +436,14 @@ export class Gateway {
     // full, crash mid-write, etc.). Runs before the WS endpoint opens so
     // catch-up writes precede live traffic. Failures here must not block
     // startup — we'd rather serve with a retryable queue than refuse boot.
+    let clearClientSessionCacheAfterRedisStart = false
     try {
       const { replayMsgOutbox } = await import('@openclaude/storage')
       const summary = await replayMsgOutbox()
       if (summary.processed > 0) {
         this.log.info('msg-outbox replay', summary)
       }
+      clearClientSessionCacheAfterRedisStart = summary.applied > 0
     } catch (err) {
       this.log.error('msg-outbox replay failed (continuing startup)', undefined, err as Error)
     }
@@ -415,6 +451,7 @@ export class Gateway {
     this.httpServer = createServer((req, res) => this.handleHttp(req, res))
     this.wss = new WebSocketServer({ server: this.httpServer, path: '/ws' })
     await this._redisSessionBus.start((frame) => this._handleRedisSessionFrame(frame))
+    if (clearClientSessionCacheAfterRedisStart) this._redisSessionBus.clearClientSessionCache()
 
     // WS keepalive: ping every 25s, terminate if no pong in 35s
     this._wsKeepaliveTimer = setInterval(() => {
@@ -504,9 +541,18 @@ export class Gateway {
         sessionKey: sessionKey || `agent:${agentId}:cron:dm:${job.id}`,
         channel: 'webchat' as const,
         peer: { id: peerId, kind: 'dm' as const },
-        blocks: [{ kind: 'text' as const, text: `${icon} ${job.label || job.id}\n\n${text}` }],
+        blocks: [
+          {
+            kind: 'text' as const,
+            text: `${icon} ${job.label || job.id}\n\n${text}`,
+          },
+        ],
         isFinal: true,
-        cronJob: { id: job.id, heartbeat: !!job.heartbeat, label: job.label || job.id },
+        cronJob: {
+          id: job.id,
+          heartbeat: !!job.heartbeat,
+          label: job.label || job.id,
+        },
       })
 
       let delivered = false
@@ -595,7 +641,11 @@ export class Gateway {
           oneshot: ev.oneshot ?? true,
           label: ev.prompt.slice(0, 50),
         })
-        .then(() => this.log.info('eventBus task.created → gateway job', { taskId: ev.taskId }))
+        .then(() =>
+          this.log.info('eventBus task.created → gateway job', {
+            taskId: ev.taskId,
+          }),
+        )
         .catch((err) => this.log.warn('eventBus task.created failed', { taskId: ev.taskId }, err))
     })
     eventBus.on('task.deleted', (ev) => {
@@ -614,7 +664,9 @@ export class Gateway {
     // Start webhook router
     this.webhookRouter = new WebhookRouter()
     await this.webhookRouter.load()
-    this.log.info('webhooks loaded', { count: this.webhookRouter.list().length })
+    this.log.info('webhooks loaded', {
+      count: this.webhookRouter.list().length,
+    })
 
     // EventBus: route webhook.received → agent execution + delivery
     eventBus.on('webhook.received', (ev) => {
@@ -635,7 +687,11 @@ export class Gateway {
           peerId: webhookId,
           title: `[webhook] ${webhookId}`,
         })
-        const _whRun = this._runLog.start({ agentId, sessionKey, taskType: 'webhook' })
+        const _whRun = this._runLog.start({
+          agentId,
+          sessionKey,
+          taskType: 'webhook',
+        })
         let output = ''
         let _whError = ''
         try {
@@ -665,7 +721,10 @@ export class Gateway {
               channel: 'webchat' as const,
               peer: { id: lastActive.peerId, kind: 'dm' as const },
               blocks: [
-                { kind: 'text' as const, text: `🔔 **Webhook ${webhookId}**\n\n${output.trim()}` },
+                {
+                  kind: 'text' as const,
+                  text: `🔔 **Webhook ${webhookId}**\n\n${output.trim()}`,
+                },
               ],
               isFinal: true,
               _userId: lastActive.userId,
@@ -781,7 +840,10 @@ export class Gateway {
     await new Promise<void>((res) => {
       this.httpServer.listen(config.gateway.port, config.gateway.bind, () => res())
     })
-    this.log.info('server started', { bind: config.gateway.bind, port: config.gateway.port })
+    this.log.info('server started', {
+      bind: config.gateway.bind,
+      port: config.gateway.port,
+    })
 
     // Auto-resume: proactively continue interrupted webchat sessions after gateway restart
     this.bootAutoResume().catch((err) => this.log.error('auto-resume boot failed', undefined, err))
@@ -955,7 +1017,10 @@ export class Gateway {
       const duration = Date.now() - reqStart
       const status = String(res.statusCode)
       httpRequestsTotal.inc({ method, path: normalizePath(path), status })
-      httpRequestDuration.observe(duration, { method, path: normalizePath(path) })
+      httpRequestDuration.observe(duration, {
+        method,
+        path: normalizePath(path),
+      })
       // Log non-static requests (skip static assets to reduce noise)
       if (
         path.startsWith('/api/') ||
@@ -963,7 +1028,12 @@ export class Gateway {
         path === '/healthz' ||
         path === '/metrics'
       ) {
-        this.log.info('http', { method, path, status: res.statusCode, durationMs: duration })
+        this.log.info('http', {
+          method,
+          path,
+          status: res.statusCode,
+          durationMs: duration,
+        })
       }
     })
 
@@ -972,7 +1042,9 @@ export class Gateway {
       // Use socket address only — X-Forwarded-For is client-spoofable; cloudflared connects locally
       const clientIp = req.socket.remoteAddress || 'unknown'
       if (!this.rateLimiter.check(clientIp, 'login')) {
-        this.sendJson(res, 429, { error: 'too many login attempts, try again later' })
+        this.sendJson(res, 429, {
+          error: 'too many login attempts, try again later',
+        })
         return
       }
       this.readBody(req)
@@ -998,17 +1070,26 @@ export class Gateway {
             }
             if (checkToken(password, this.deps.config.gateway.accessToken)) {
               const token = signJwt(
-                { userId: 'default', exp: Math.floor(Date.now() / 1000) + Gateway.JWT_TTL_SECONDS },
+                {
+                  userId: 'default',
+                  exp: Math.floor(Date.now() / 1000) + Gateway.JWT_TTL_SECONDS,
+                },
                 this.deps.config.gateway.accessToken,
               )
-              this.sendJson(res, 200, { token, userId: 'default', name: 'Default' })
+              this.sendJson(res, 200, {
+                token,
+                userId: 'default',
+                name: 'Default',
+              })
             } else {
               this.sendJson(res, 401, { error: 'invalid credentials' })
             }
             return
           }
           if (typeof username !== 'string' || typeof password !== 'string') {
-            this.sendJson(res, 400, { error: 'username and password must be strings' })
+            this.sendJson(res, 400, {
+              error: 'username and password must be strings',
+            })
             return
           }
           const user = users.find((u) => u.id === username)
@@ -1017,7 +1098,10 @@ export class Gateway {
             return
           }
           const token = signJwt(
-            { userId: user.id, exp: Math.floor(Date.now() / 1000) + Gateway.JWT_TTL_SECONDS },
+            {
+              userId: user.id,
+              exp: Math.floor(Date.now() / 1000) + Gateway.JWT_TTL_SECONDS,
+            },
             this.deps.config.gateway.accessToken,
           )
           this.sendJson(res, 200, { token, userId: user.id, name: user.name })
@@ -1093,7 +1177,9 @@ export class Gateway {
     }
     if (path === '/metrics') {
       sessionsActive.value = this.sessions.list().length
-      res.writeHead(200, { 'Content-Type': 'text/plain; version=0.0.4; charset=utf-8' })
+      res.writeHead(200, {
+        'Content-Type': 'text/plain; version=0.0.4; charset=utf-8',
+      })
       res.end(serializeMetrics())
       return
     }
@@ -1123,7 +1209,13 @@ export class Gateway {
       }
       Promise.all([
         getUsageSummary({ agentId, sessionId, since }),
-        queryEvents({ type: 'cost.recorded', agentId, sessionKey: sessionId, since, limit: 50 }),
+        queryEvents({
+          type: 'cost.recorded',
+          agentId,
+          sessionKey: sessionId,
+          since,
+          limit: 50,
+        }),
       ])
         .then(([summary, events]) => {
           this.sendJson(res, 200, { summary, recentCostEvents: events })
@@ -1176,7 +1268,7 @@ export class Gateway {
     // ── Client session sync (cross-device, multi-user) ──
     if (url.pathname === '/api/sessions/list' && req.method === 'GET') {
       const userId = this.getUserId(req)
-      listClientSessions(userId)
+      this._getClientSessionListCached(userId)
         .then((list) => this.sendJson(res, 200, { sessions: list }))
         .catch(() => this.sendJson(res, 500, { error: 'list failed' }))
       return
@@ -1200,6 +1292,11 @@ export class Gateway {
           const results: Record<string, boolean> = {}
           for (const sid of sessionIds) {
             results[sid] = await claimSession(sid, userId)
+            if (results[sid]) {
+              this._redisSessionBus.invalidateSessionList(userId)
+              this._redisSessionBus.invalidateSessionList('default')
+              this._redisSessionBus.deleteClientSessionCache('default', sid)
+            }
           }
           this.sendJson(res, 200, { ok: true, results })
         })
@@ -1211,7 +1308,7 @@ export class Gateway {
       const sessId = clientSessMatch[1]
       const userId = this.getUserId(req)
       if (req.method === 'GET') {
-        getClientSession(sessId, userId)
+        this._getClientSessionCached(userId, sessId)
           .then((s) =>
             s ? this.sendJson(res, 200, s) : this.sendJson(res, 404, { error: 'not found' }),
           )
@@ -1240,6 +1337,12 @@ export class Gateway {
             if (!applied) {
               this.sendJson(res, 409, { error: 'conflict' })
             } else {
+              this._redisSessionBus.invalidateSessionList(userId)
+              getClientSession(sessId, userId)
+                .then((merged) => {
+                  if (merged) this._redisSessionBus.setClientSession(userId, merged)
+                })
+                .catch(() => {})
               this.sendJson(res, 200, { ok: true, applied: true, updatedAt })
             }
           })
@@ -1248,7 +1351,11 @@ export class Gateway {
       }
       if (req.method === 'DELETE') {
         deleteClientSession(sessId, userId)
-          .then(() => this.sendJson(res, 200, { ok: true }))
+          .then(() => {
+            this._redisSessionBus.deleteClientSessionCache(userId, sessId)
+            this._redisSessionBus.invalidateSessionList(userId)
+            this.sendJson(res, 200, { ok: true })
+          })
           .catch(() => this.sendJson(res, 500, { error: 'delete failed' }))
         return
       }
@@ -1263,15 +1370,26 @@ export class Gateway {
         return
       }
       res.writeHead(200, { 'Content-Type': 'application/json' })
-      const activeMcps: Array<{ id: string; label?: string; provider?: string; tools?: string[] }> =
-        []
+      const activeMcps: Array<{
+        id: string
+        label?: string
+        provider?: string
+        tools?: string[]
+      }> = []
       const activeProvider = this.deps.config.provider
       for (const srv of this.deps.config.mcpServers ?? []) {
         if (srv.enabled === false) continue
         if (srv.provider && srv.provider !== activeProvider) continue
-        activeMcps.push({ id: srv.id, label: srv.label, provider: srv.provider, tools: srv.tools })
+        activeMcps.push({
+          id: srv.id,
+          label: srv.label,
+          provider: srv.provider,
+          tools: srv.tools,
+        })
       }
-      const authInfo: Record<string, any> = { mode: this.deps.config.auth.mode }
+      const authInfo: Record<string, any> = {
+        mode: this.deps.config.auth.mode,
+      }
       if (this.deps.config.auth.claudeOAuth?.accessToken) {
         authInfo.claudeOAuth = {
           active: true,
@@ -1286,7 +1404,10 @@ export class Gateway {
       }
       res.end(
         JSON.stringify({
-          gateway: { bind: this.deps.config.gateway.bind, port: this.deps.config.gateway.port },
+          gateway: {
+            bind: this.deps.config.gateway.bind,
+            port: this.deps.config.gateway.port,
+          },
           defaults: this.deps.config.defaults,
           channels: Object.keys(this.deps.config.channels),
           provider: activeProvider,
@@ -1696,7 +1817,11 @@ export class Gateway {
               const firstKey = this._staticFileCache.keys().next().value
               if (firstKey !== undefined) this._staticFileCache.delete(firstKey)
             }
-            this._staticFileCache.set(indexPath, { content, mime: 'text/html', etag })
+            this._staticFileCache.set(indexPath, {
+              content,
+              mime: 'text/html',
+              etag,
+            })
             if (req.headers['if-none-match'] === etag) {
               res.writeHead(304)
               res.end()
@@ -2164,7 +2289,11 @@ export class Gateway {
         tags?: string[]
       }>(req)
       const r = await store.save(
-        { name: skillName, description: body.description ?? '', tags: body.tags },
+        {
+          name: skillName,
+          description: body.description ?? '',
+          tags: body.tags,
+        },
         body.body ?? '',
       )
       if (!r.ok) return this.sendError(res, 400, r.error ?? 'save failed')
@@ -2241,14 +2370,21 @@ export class Gateway {
         channel: 'webchat' as const,
         peer: { id: lastActive.peerId, kind: 'dm' as const },
         blocks: [
-          { kind: 'text' as const, text: `📨 **${targetAgentId}** 回复:\n\n${output.trim()}` },
+          {
+            kind: 'text' as const,
+            text: `📨 **${targetAgentId}** 回复:\n\n${output.trim()}`,
+          },
         ],
         isFinal: true,
         _userId: lastActive.userId,
       } as OutboundMessage)
     }
 
-    this.sendJson(res, 200, { ok: true, agentId: targetAgentId, outputLength: output.length })
+    this.sendJson(res, 200, {
+      ok: true,
+      agentId: targetAgentId,
+      outputLength: output.length,
+    })
   }
 
   /** Active delegation count for recursion/concurrency limits */
@@ -2318,7 +2454,11 @@ export class Gateway {
       : `[委派任务]\n\n目标: ${goal}\n\n请完成上述任务并返回结果摘要。`
 
     this._activeDelegations++
-    const _dlgRun = this._runLog.start({ agentId: targetAgentId, sessionKey, taskType: 'delegate' })
+    const _dlgRun = this._runLog.start({
+      agentId: targetAgentId,
+      sessionKey,
+      taskType: 'delegate',
+    })
     let output = ''
     let error = ''
     try {
@@ -2605,7 +2745,11 @@ export class Gateway {
       peerId: taskId,
       title: `[task] ${task.title}`,
     })
-    const runEntry = this._runLog.start({ agentId: task.agent, sessionKey, taskType: 'task' })
+    const runEntry = this._runLog.start({
+      agentId: task.agent,
+      sessionKey,
+      taskType: 'task',
+    })
     let output = ''
     let error = ''
     try {
@@ -2764,7 +2908,11 @@ export class Gateway {
       const oldest = this.oauthPending.keys().next().value
       if (oldest) this.oauthPending.delete(oldest)
     }
-    this.oauthPending.set(state, { codeVerifier, createdAt: Date.now(), provider: providerKey })
+    this.oauthPending.set(state, {
+      codeVerifier,
+      createdAt: Date.now(),
+      provider: providerKey,
+    })
     setTimeout(() => this.oauthPending.delete(state), 10 * 60_000)
 
     const params = new URLSearchParams({
@@ -2804,7 +2952,10 @@ export class Gateway {
     const providerKey = (pending as any).provider || 'claude'
     const prov = this.OAUTH_PROVIDERS[providerKey]
     if (!prov) return this.sendError(res, 400, 'unknown provider')
-    this.log.info('oauth exchanging code', { provider: providerKey, codeLen: cleanCode.length })
+    this.log.info('oauth exchanging code', {
+      provider: providerKey,
+      codeLen: cleanCode.length,
+    })
 
     try {
       const tokenRes = await fetch(prov.tokenUrl, {
@@ -3033,7 +3184,10 @@ export class Gateway {
       })
 
       if (!tokenRes.ok) {
-        this.log.error('oauth refresh failed', { provider: providerKey, status: tokenRes.status })
+        this.log.error('oauth refresh failed', {
+          provider: providerKey,
+          status: tokenRes.status,
+        })
         return
       }
 
@@ -3274,7 +3428,10 @@ export class Gateway {
                     type: 'outbound.message',
                     sessionKey,
                     channel: 'webchat',
-                    peer: { id: sessionKey.split(':')[4] || '__compact__', kind: 'dm' },
+                    peer: {
+                      id: sessionKey.split(':')[4] || '__compact__',
+                      kind: 'dm',
+                    },
                     blocks: [e.block],
                     isFinal: false,
                   }
@@ -3299,18 +3456,44 @@ export class Gateway {
               },
             )
           } catch (err: any) {
-            ws.send(JSON.stringify({ type: 'error', error: `compact failed: ${err?.message}` }))
+            ws.send(
+              JSON.stringify({
+                type: 'error',
+                error: `compact failed: ${err?.message}`,
+              }),
+            )
           }
         }
       } catch (err: any) {
         this.log.error('ws-message unhandled error', undefined, err)
         try {
-          ws.send(JSON.stringify({ type: 'error', error: `internal error: ${err?.message}` }))
+          ws.send(
+            JSON.stringify({
+              type: 'error',
+              error: `internal error: ${err?.message}`,
+            }),
+          )
         } catch {
           /* ws may already be closed */
         }
       }
     })
+  }
+
+  private async _getClientSessionListCached(userId: string) {
+    const cached = await this._redisSessionBus.getSessionList(userId)
+    if (cached) return cached
+    const list = await listClientSessions(userId)
+    this._redisSessionBus.setSessionList(userId, list)
+    return list
+  }
+
+  private async _getClientSessionCached(userId: string, sessId: string) {
+    const cached = await this._redisSessionBus.getClientSession(userId, sessId)
+    if (cached) return cached
+    const session = await getClientSession(sessId, userId)
+    if (session) this._redisSessionBus.setClientSession(userId, session)
+    return session
   }
 
   private async handleStop(frame: {
@@ -3408,7 +3591,9 @@ export class Gateway {
 
     const session = this.sessions.getByKey(pending.sessionKey)
     if (!session) {
-      this.log.warn('permission response for dead session', { sessionKey: pending.sessionKey })
+      this.log.warn('permission response for dead session', {
+        sessionKey: pending.sessionKey,
+      })
       // Session is gone, but tabs still hold the modal — clear them.
       // Record the authoritative deny so any late duplicate rebroadcasts deny.
       // Use pending.* (server-trusted) instead of frame.* (client-supplied).
@@ -3472,7 +3657,11 @@ export class Gateway {
     }
     const response =
       effectiveBehavior === 'allow'
-        ? { behavior: 'allow' as const, updatedInput: forwardedInput, toolUseID: pending.toolUseId }
+        ? {
+            behavior: 'allow' as const,
+            updatedInput: forwardedInput,
+            toolUseID: pending.toolUseId,
+          }
         : {
             behavior: 'deny' as const,
             message: effectiveMessage || 'User denied',
@@ -3612,7 +3801,14 @@ export class Gateway {
       ? this._outboundRing.storeExternal(sessionKey, frameSeq, now, data)
       : this._outboundRing.store(sessionKey, frameSeq, now, data)
     this._recordRingEvictions(evicted)
-    if (redisBacked) this._redisSessionBus.publishFrame({ sessionKey, peerKey, frameSeq, ts: now, data })
+    if (redisBacked)
+      this._redisSessionBus.publishFrame({
+        sessionKey,
+        peerKey,
+        frameSeq,
+        ts: now,
+        data,
+      })
     const set = this.clientsByPeer.get(peerKey)
     if (!set) return
     for (const ws of set) {
@@ -3737,7 +3933,10 @@ export class Gateway {
    *  evicted or destroyed without going through the crash event path). */
   private _sweepStalePendingPermissions(): void {
     const now = Date.now()
-    const toExpire: Array<{ requestId: string; reason: 'timeout' | 'crashed' }> = []
+    const toExpire: Array<{
+      requestId: string
+      reason: 'timeout' | 'crashed'
+    }> = []
     for (const [requestId, pending] of this._pendingPermissions) {
       if (now >= pending.expiresAt) {
         toExpire.push({ requestId, reason: 'timeout' })
@@ -3791,7 +3990,12 @@ export class Gateway {
   }
 
   private async autoResumeFromHello(
-    peers: Array<{ peerId: string; agentId: string; inFlight?: boolean; lastFrameSeq?: number }>,
+    peers: Array<{
+      peerId: string
+      agentId: string
+      inFlight?: boolean
+      lastFrameSeq?: number
+    }>,
     ws: WebSocket,
   ): Promise<void> {
     // Register the reconnected WS client for each peer that has an active/resumable session.
@@ -3805,6 +4009,12 @@ export class Gateway {
       const aid = agentId || 'main'
       const safeId = peerId.replace(/[^a-zA-Z0-9_-]/g, '_')
       const sessionKey = `agent:${aid}:webchat:dm:${safeId}`
+
+      // Verify this authenticated WS owns the client session before registering
+      // or replaying Redis/ring frames. Hello peers are client-supplied; the
+      // access token authenticates the user, not arbitrary peerIds.
+      const ownedSession = await getClientSession(peerId, helloUserId)
+      if (!ownedSession) continue
 
       // Check active session first
       let session = this.sessions.getByKey(sessionKey)
@@ -3879,7 +4089,9 @@ export class Gateway {
         // process with a stale but internally-consistent local ring from
         // silently suppressing frames that another process published.
         const redisEnabled = this._redisSessionBus?.enabled === true
-        const redisReplay = redisEnabled ? await this._redisSessionBus.replay(sessionKey, clientLastSeq) : null
+        const redisReplay = redisEnabled
+          ? await this._redisSessionBus.replay(sessionKey, clientLastSeq)
+          : null
         if (redisReplay?.ok && redisReplay.frames.length > 0) {
           replayServed = true
           outboundRingReplayHitTotal.inc()
@@ -4009,7 +4221,9 @@ export class Gateway {
             ts: Date.now(),
           })
           ws.send(interruptFrame)
-          this.log.info('auto-resume pushed turn-interrupted isFinal', { sessionKey })
+          this.log.info('auto-resume pushed turn-interrupted isFinal', {
+            sessionKey,
+          })
         } catch {}
       }
     }
@@ -4096,7 +4310,9 @@ export class Gateway {
     let agent: AgentDef
     if (frame.agentId) {
       const cfg = await this._getAgentsConfig()
-      const ag = cfg.agents.find((a) => a.id === frame.agentId) ?? { id: frame.agentId }
+      const ag = cfg.agents.find((a) => a.id === frame.agentId) ?? {
+        id: frame.agentId,
+      }
       agent = ag
       // Include agentId in sessionKey so different agents get isolated subprocesses
       sessionKey = `agent:${frame.agentId}:${frame.channel}:${frame.peer.kind}:${frame.peer.id.replace(/[^a-zA-Z0-9_-]/g, '_')}`
@@ -4211,7 +4427,11 @@ export class Gateway {
       const byteLen = Math.ceil(rawLen * 0.75) // base64 → bytes approx
       if (byteLen > MAX_SINGLE_FILE) {
         const errMsg = `附件超过 ${MAX_SINGLE_FILE / 1024 / 1024}MB 限制 (${(byteLen / 1024 / 1024).toFixed(1)}MB)`
-        this.log.warn('upload rejected', { reason: errMsg, byteLen, sessionKey })
+        this.log.warn('upload rejected', {
+          reason: errMsg,
+          byteLen,
+          sessionKey,
+        })
         this.deliver(
           {
             type: 'outbound.message',
@@ -4228,7 +4448,11 @@ export class Gateway {
       totalMediaSize += byteLen
       if (totalMediaSize > MAX_TOTAL_MEDIA) {
         const errMsg = `总附件超过 ${MAX_TOTAL_MEDIA / 1024 / 1024}MB 限制`
-        this.log.warn('upload rejected', { reason: errMsg, totalMediaSize, sessionKey })
+        this.log.warn('upload rejected', {
+          reason: errMsg,
+          totalMediaSize,
+          sessionKey,
+        })
         this.deliver(
           {
             type: 'outbound.message',
@@ -4423,7 +4647,10 @@ export class Gateway {
         for (let i = 0; i < files.length; i += PARSE_CONCURRENCY) {
           const batch = files.slice(i, i + PARSE_CONCURRENCY)
           const results = await Promise.all(
-            batch.map(async (f) => ({ file: f, result: await parseDocument(f.path, f.mimeType) })),
+            batch.map(async (f) => ({
+              file: f,
+              result: await parseDocument(f.path, f.mimeType),
+            })),
           )
           for (const { file: f, result } of results) {
             if (result) parsedDocs.push({ file: f, ...result })
@@ -4474,7 +4701,11 @@ export class Gateway {
         : sessionKey.includes(':inter:')
           ? ('inter-agent' as const)
           : ('chat' as const)
-    const _run = this._runLog.start({ agentId: session.agentId, sessionKey, taskType })
+    const _run = this._runLog.start({
+      agentId: session.agentId,
+      sessionKey,
+      taskType,
+    })
     await this.sessions.submit(
       session,
       payload,
@@ -4514,7 +4745,12 @@ export class Gateway {
             // 如果直接传 aggregatedBlocks,接着同步清空数组,adapter 读到的就是空。
             // 拷贝一份脱钩本地引用。
             this.deliver(
-              { ...out, blocks: aggregatedBlocks.slice(), isFinal: true, meta: e.meta },
+              {
+                ...out,
+                blocks: aggregatedBlocks.slice(),
+                isFinal: true,
+                meta: e.meta,
+              },
               adapter,
             )
           } else {
@@ -4688,7 +4924,14 @@ export class Gateway {
     this._recordRingEvictions(evicted)
     // Publish before local-client early return so another gateway process can
     // fan out even when this process has no matching WS connected.
-    if (redisBacked) this._redisSessionBus.publishFrame({ sessionKey, peerKey, frameSeq, ts: now, data })
+    if (redisBacked)
+      this._redisSessionBus.publishFrame({
+        sessionKey,
+        peerKey,
+        frameSeq,
+        ts: now,
+        data,
+      })
     const set = this.clientsByPeer.get(peerKey)
     if (!set) return
     for (const ws of set) {

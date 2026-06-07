@@ -73,6 +73,10 @@ export interface OpenClaudeConfig {
       replayTtlMs?: number
       maxReplayFrames?: number
       reserveTimeoutMs?: number
+      /** Short-lived Redis cache for client session list/full snapshots. */
+      sessionCacheTtlMs?: number
+      /** Skip caching oversized full-session snapshots. */
+      maxSessionSnapshotBytes?: number
     }
   }
   // 接入方式三选一(实际 token 由 CCB 自己存,这里只记录类型)
@@ -222,7 +226,11 @@ export interface AgentDef {
 }
 
 export interface RouteRule {
-  match: { channel?: string; peerKind?: 'dm' | 'group'; peerIdPattern?: string }
+  match: {
+    channel?: string
+    peerKind?: 'dm' | 'group'
+    peerIdPattern?: string
+  }
   agent: string
 }
 
