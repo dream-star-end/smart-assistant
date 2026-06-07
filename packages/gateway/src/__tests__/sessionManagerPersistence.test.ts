@@ -21,9 +21,11 @@
 
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
 
 import { SessionManager, type AgentSession } from "../sessionManager.js";
 import { buildCodexProviderConfigArgs, type CodexProviderConfigOverride } from "../codexRunner.js";
+import type { SessionStreamEvent } from "../ccbMessageParser.js";
 import { _buildSafeCodexRouteOverride } from "../server.js";
 import type { OpenClaudeConfig } from "@openclaude/storage";
 
@@ -56,6 +58,94 @@ function deferred<T>(): {
     reject = rej;
   });
   return { promise, resolve, reject };
+}
+
+type FakeExitInfo = { code: number | null; signal: string | null; crashed: boolean };
+
+class FakeTurnRunner extends EventEmitter {
+  lastActivityAt = Date.now();
+
+  constructor(
+    private readonly onSubmit: (runner: FakeTurnRunner, requestId?: string) => void,
+  ) {
+    super();
+  }
+
+  interrupt(): boolean {
+    return false;
+  }
+
+  async submit(
+    _textOrBlocks: string | Array<{ type: string; [key: string]: unknown }>,
+    requestId?: string,
+  ): Promise<void> {
+    this.onSubmit(this, requestId);
+  }
+
+  emitExit(info: FakeExitInfo): void {
+    this.emit("exit", info);
+  }
+
+  emitAssistantText(text: string): void {
+    this.emit("message", {
+      type: "stream_event",
+      event: {
+        type: "content_block_delta",
+        delta: { type: "text_delta", text },
+      },
+    });
+  }
+
+  emitResult(requestId?: string): void {
+    this.emit("message", {
+      type: "result",
+      total_cost_usd: 0.01,
+      usage: { input_tokens: 10, output_tokens: 5 },
+      ...(requestId ? { requestId } : {}),
+    });
+  }
+}
+
+function makeTurnSession(runner: FakeTurnRunner): AgentSession {
+  return {
+    sessionKey: "agent:codex:webchat:dm:unit-peer",
+    agentId: "codex",
+    channel: "unit",
+    peerId: "unit-peer",
+    title: "Codex Unit",
+    startedAt: Date.now(),
+    runner,
+    ccbSessionId: null,
+    lock: Promise.resolve(),
+    lastUsedAt: 0,
+    totalCostUSD: 0,
+    totalInputTokens: 0,
+    totalOutputTokens: 0,
+    totalCacheReadTokens: 0,
+    totalCacheCreationTokens: 0,
+    turns: 0,
+    _lastCcbCumulativeCost: 0,
+    toolUseIdToName: new Map(),
+    executionTarget: { kind: "local" },
+    providerTag: "codex-native",
+    agentProvider: "codex-native",
+    _currentMessageListener: null,
+  } as unknown as AgentSession;
+}
+
+async function runPrivateOneTurn(
+  sm: SessionManager,
+  session: AgentSession,
+  events: SessionStreamEvent[],
+): Promise<void> {
+  await (sm as unknown as {
+    _runOneTurn: (
+      session: AgentSession,
+      input: string,
+      onEvent: (e: SessionStreamEvent) => void,
+      requestId?: string,
+    ) => Promise<void>;
+  })._runOneTurn(session, "hello", (e) => events.push(e), "req-unit");
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────
@@ -176,6 +266,60 @@ describe("SessionManager pending-persistence tracking", () => {
     b.resolve();
     await second;
     assert.equal(bResolved, true);
+  });
+});
+
+describe("SessionManager turn-scoped runner exits", () => {
+  test("clean lifecycle exit during Codex app-server respawn does not finalize the turn", async () => {
+    const sm = new SessionManager(makeConfigStub());
+    const events: SessionStreamEvent[] = [];
+    const runner = new FakeTurnRunner((r, requestId) => {
+      setImmediate(() => {
+        r.emitExit({ code: 0, signal: null, crashed: false });
+        setImmediate(() => {
+          r.emitAssistantText("answer after route respawn");
+          r.emitResult(requestId);
+        });
+      });
+    });
+    const session = makeTurnSession(runner);
+
+    await runPrivateOneTurn(sm, session, events);
+
+    assert.equal(
+      events.some((e) => e.kind === "error"),
+      false,
+      "code=0/no-signal lifecycle exit must not produce a visible error",
+    );
+    assert.ok(
+      events.some(
+        (e) =>
+          e.kind === "block" &&
+          e.block.kind === "text" &&
+          typeof e.block.text === "string" &&
+          e.block.text.includes("answer after route respawn"),
+      ),
+      "assistant text after the respawn should still be parsed",
+    );
+    assert.ok(events.some((e) => e.kind === "final"), "final event should still arrive");
+  });
+
+  test("unexpected signal exit still surfaces the existing child-exit error", async () => {
+    const sm = new SessionManager(makeConfigStub());
+    const events: SessionStreamEvent[] = [];
+    const runner = new FakeTurnRunner((r) => {
+      setImmediate(() => {
+        r.emitExit({ code: null, signal: "SIGKILL", crashed: false });
+      });
+    });
+    const session = makeTurnSession(runner);
+
+    await runPrivateOneTurn(sm, session, events);
+
+    assert.ok(
+      events.some((e) => e.kind === "error" && e.error.includes("SIGKILL")),
+      "signal exits must keep the old visible error path",
+    );
   });
 });
 
