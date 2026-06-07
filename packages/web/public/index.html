@@ -16,7 +16,7 @@
 <link rel="apple-touch-icon" href="/icon.svg" />
 <link rel="stylesheet" href="/vendor/github-dark.min.css" />
 <link rel="stylesheet" href="/vendor/katex/katex.min.css" />
-<link rel="stylesheet" href="/style.css?v=33" />
+<link rel="stylesheet" href="/style.css?v=34" />
 <style>/* Inline styles removed — see style.css */
 </style>
 </head>
@@ -119,6 +119,9 @@
         <span id="token-usage-text">0 tokens</span>
       </div>
       <div class="head-actions">
+        <button id="builtin-browser-btn" class="icon-btn" title="内置浏览器" aria-label="内置浏览器">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>
+        </button>
         <button id="tasks-btn" class="icon-btn tasks-btn" title="后台任务" aria-label="后台任务" hidden>
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83"/></svg>
           <span id="tasks-badge" class="tasks-badge">0</span>
@@ -279,6 +282,39 @@
     </footer>
   </main>
 </div>
+
+<!-- Built-in browser drawer -->
+<div id="builtin-browser-backdrop" class="builtin-browser-backdrop" aria-hidden="true"></div>
+<aside id="builtin-browser-drawer" class="builtin-browser-drawer" aria-label="内置浏览器" aria-hidden="true">
+  <div class="builtin-browser-head">
+    <div>
+      <h3>内置浏览器</h3>
+      <p>点击访问链接后在这里预览，选择元素并把修改要求发给 AI。</p>
+    </div>
+    <button id="builtin-browser-close" class="icon-btn" title="关闭" aria-label="关闭内置浏览器">×</button>
+  </div>
+  <div class="builtin-browser-toolbar">
+    <input id="builtin-browser-url" type="url" placeholder="https://example.com 或 localhost:3000" autocomplete="off" />
+    <button id="builtin-browser-open" class="btn btn-secondary btn-sm" type="button">打开</button>
+    <button id="builtin-browser-reload" class="btn btn-ghost btn-sm" type="button">刷新</button>
+    <button id="builtin-browser-external" class="btn btn-ghost btn-sm" type="button">外部打开</button>
+    <button id="builtin-browser-select" class="btn btn-primary btn-sm" type="button">选择元素</button>
+  </div>
+  <div id="builtin-browser-status" class="builtin-browser-status" aria-live="polite"></div>
+  <div class="builtin-browser-frame-wrap">
+    <iframe id="builtin-browser-frame" title="内置浏览器预览" sandbox="allow-scripts allow-forms allow-same-origin" referrerpolicy="no-referrer"></iframe>
+    <div id="builtin-browser-overlay" class="builtin-browser-overlay" hidden></div>
+  </div>
+  <div class="builtin-browser-request-panel">
+    <div id="builtin-browser-selection" class="builtin-browser-selection" hidden></div>
+    <textarea id="builtin-browser-request" rows="3" placeholder="选中元素后输入你的要求，例如：把这个按钮改成更醒目的主按钮，并调整文案"></textarea>
+    <div class="builtin-browser-request-actions">
+      <button id="builtin-browser-clear" class="btn btn-ghost btn-sm" type="button">清除选择</button>
+      <span>⌘/Ctrl + Enter 发送</span>
+      <button id="builtin-browser-send" class="btn btn-primary btn-sm" type="button">发给 AI 调整</button>
+    </div>
+  </div>
+</aside>
 
 <!-- ═══════════════ MODALS ═══════════════ -->
 <div id="agents-modal" class="modal-backdrop" role="dialog" aria-modal="true">
@@ -740,6 +776,6 @@
 <script src="/vendor/katex/katex.min.js" defer></script>
 <script src="/vendor/qrcode.min.js"></script>
 <div id="toast" class="toast"></div>
-<script type="module" src="/modules/main.js?v=40"></script>
+<script type="module" src="/modules/main.js?v=41"></script>
 </body>
 </html>

@@ -70,6 +70,9 @@ import {
 import { initOAuthListeners, openOAuthModal } from './oauth.js'
 import { initWechatListeners, openWechatModal } from './wechat.js'
 
+// ── Built-in browser ──
+import { initBuiltinBrowser } from './builtinBrowser.js?v=1'
+
 // ── Memory & Skills ──
 import { loadMemoryTab, openMemoryModal, openSkillsModal, saveMemory } from './memory.js'
 
@@ -231,6 +234,11 @@ setCommandDeps({
 
 // Inject autoResize into speech module so voice input can resize the textarea
 setAutoResize(() => autoResize())
+
+initBuiltinBrowser({
+  sendBrowserContext: (text) => sendBrowserContext(text),
+  toast,
+})
 
 // ═══════════════════════════════════════════════════════════
 // 2. Side effects from modules
@@ -719,6 +727,29 @@ function buildMessageText(userText, attachments) {
     )
   }
   return parts.join('\n')
+}
+
+async function sendBrowserContext(text) {
+  const input = $('input')
+  const existing = input.value.trim()
+  const hasAttachments = Array.isArray(state.attachments) && state.attachments.length > 0
+  const canAutoSend =
+    !existing && !hasAttachments && !state.sendingInFlight && !slashPopupVisible && !text.startsWith('/')
+
+  if (!canAutoSend) {
+    input.value = existing ? `${existing}
+
+${text}` : text
+    input.dispatchEvent(new Event('input', { bubbles: true }))
+    input.focus()
+    input.setSelectionRange(input.value.length, input.value.length)
+    return { sent: false }
+  }
+
+  input.value = text
+  input.dispatchEvent(new Event('input', { bubbles: true }))
+  await send()
+  return { sent: true }
 }
 
 // ── send ──
