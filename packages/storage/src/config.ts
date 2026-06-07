@@ -60,6 +60,20 @@ export interface OpenClaudeConfig {
       maxAgeMs?: number
       maxBytes?: number
     }
+    /**
+     * Optional Redis acceleration layer for WebChat outbound frames.
+     * SQLite remains the source of truth; Redis is only used for short-lived
+     * pub/sub fanout and replay cache. Keep disabled unless a local/private
+     * Redis is available (personal deployments should bind Redis to 127.0.0.1).
+     */
+    redis?: {
+      enabled?: boolean
+      url?: string
+      keyPrefix?: string
+      replayTtlMs?: number
+      maxReplayFrames?: number
+      reserveTimeoutMs?: number
+    }
   }
   // 接入方式三选一(实际 token 由 CCB 自己存,这里只记录类型)
   auth: {

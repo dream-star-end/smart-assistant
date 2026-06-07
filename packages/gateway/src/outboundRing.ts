@@ -83,6 +83,24 @@ export class OutboundRingBuffer {
    * evicted by this call so the caller can feed metrics.
    */
   store(sessionKey: string, seq: number, now: number, data: string): EvictionStats {
+    return this._store(sessionKey, seq, now, data)
+  }
+
+  /**
+   * Store a frame whose sequence was assigned by an external monotonic source
+   * (currently Redis INCR). This keeps the in-process cursor in sync so later
+   * local `nextSeq()` calls and `peekReplay()` decisions do not move
+   * backwards after a cross-process pub/sub delivery or Redis-backed send.
+   */
+  storeExternal(sessionKey: string, seq: number, now: number, data: string): EvictionStats {
+    if (!Number.isFinite(seq) || seq <= 0) return { ...ZERO_EVICTION }
+    const current = this.lastSeq.get(sessionKey) ?? 0
+    if (seq <= current) return { ...ZERO_EVICTION }
+    if (seq > current) this.lastSeq.set(sessionKey, seq)
+    return this._store(sessionKey, seq, now, data)
+  }
+
+  private _store(sessionKey: string, seq: number, now: number, data: string): EvictionStats {
     let ring = this.rings.get(sessionKey)
     if (!ring) {
       ring = { frames: [], totalBytes: 0 }

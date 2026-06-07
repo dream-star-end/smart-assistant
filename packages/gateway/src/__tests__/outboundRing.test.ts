@@ -35,6 +35,20 @@ describe('OutboundRingBuffer.nextSeq / store', () => {
     assert.equal(r.bytes('s1'), Buffer.byteLength(data, 'utf8'))
     assert.equal(r.lastFrameSeq('s1'), 1)
   })
+
+  it('storeExternal() advances lastSeq for redis-assigned frames', () => {
+    const r = new OutboundRingBuffer()
+    r.storeExternal('s1', 10, 1000, frame(10))
+    assert.equal(r.lastFrameSeq('s1'), 10)
+    assert.equal(r.nextSeq('s1'), 11)
+    const rep = r.peekReplay('s1', 9, 1000)
+    assert.equal(rep.ok, true)
+    if (!rep.ok) return
+    assert.deepEqual(
+      rep.sent.map((f) => f.seq),
+      [10],
+    )
+  })
 })
 
 describe('OutboundRingBuffer.peekReplay', () => {
