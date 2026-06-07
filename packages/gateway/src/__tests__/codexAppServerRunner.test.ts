@@ -11,11 +11,17 @@ import * as assert from 'node:assert/strict'
  * Run: npx tsx --test packages/gateway/src/__tests__/codexAppServerRunner.test.ts
  */
 import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { EventEmitter } from 'node:events'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { describe, it } from 'node:test'
+import { PassThrough } from 'node:stream'
+import { afterEach, describe, it } from 'node:test'
 import { paths } from '@openclaude/storage'
-import { CodexAppServerRunner, _classifyJsonRpcLine } from '../codexAppServerRunner.js'
+import {
+  CodexAppServerRunner,
+  __setCodexAppServerSpawnForTests,
+  _classifyJsonRpcLine,
+} from '../codexAppServerRunner.js'
 
 // ── helpers ─────────────────────────────────────────────────────────────────
 
@@ -103,6 +109,35 @@ function feed(runner: CodexAppServerRunner, frame: unknown): void {
   ;(runner as any).handleLine(JSON.stringify(frame))
 }
 
+function makeSpawnedFakeProc(written: string[], opts: { replyInitialize?: boolean } = {}): any {
+  const ee = new EventEmitter() as any
+  ee.killed = false
+  ee.pid = 12345
+  ee.stdin = new PassThrough()
+  ee.stdout = new PassThrough()
+  ee.stderr = new PassThrough()
+  ee.stdin.on('data', (chunk: Buffer) => {
+    for (const raw of chunk.toString('utf8').split('\n')) {
+      const line = raw.trim()
+      if (!line) continue
+      written.push(line)
+      const req = JSON.parse(line)
+      if (opts.replyInitialize !== false && req.method === 'initialize') {
+        ee.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: req.id, result: {} }) + '\n')
+      }
+    }
+  })
+  ee.kill = (sig?: string) => {
+    ee.killed = true
+    setImmediate(() => ee.emit('close', null, sig ?? 'SIGTERM'))
+  }
+  return ee
+}
+
+afterEach(() => {
+  __setCodexAppServerSpawnForTests(null)
+})
+
 /** Poll until predicate is true or timeout. Async copies (fs work) can take
  *  >100ms on slow hosts so a fixed sleep is flaky; this is the robust pattern. */
 async function waitFor(pred: () => boolean, timeoutMs = 2000): Promise<void> {
@@ -188,6 +223,64 @@ describe('CodexAppServerRunner.start', () => {
     const h = await makeHarness({ resumeSessionId: 'thr-z' })
     await h.runner.start()
     assert.equal(h.spawns[0].resumed, true)
+    await h.cleanup()
+  })
+
+  it('does not double-emit spawn when submit follows start', async () => {
+    const h = await makeHarness()
+    await h.runner.start()
+    await h.runner.start()
+    assert.equal(h.spawns.length, 1)
+    await h.cleanup()
+  })
+})
+
+describe('CodexAppServerRunner.warmup', () => {
+  it('spawns and initializes without attaching a thread or starting a turn', async () => {
+    const h = await makeHarness()
+    const captured: { cmd: string; args: string[]; opts: unknown }[] = []
+    __setCodexAppServerSpawnForTests(((cmd: string, args: string[], opts: unknown) => {
+      captured.push({ cmd, args, opts })
+      return makeSpawnedFakeProc(h.written)
+    }) as any)
+
+    assert.equal(await h.runner.warmup(500), true)
+    assert.equal(captured.length, 1)
+    assert.equal(h.spawns.length, 1)
+    assert.deepEqual(
+      h.written.map((line) => JSON.parse(line).method),
+      ['initialize'],
+    )
+    assert.equal((h.runner as any).initialized, true)
+    assert.equal((h.runner as any).attached, false)
+
+    await h.runner.shutdown()
+    await h.cleanup()
+  })
+
+  it('does not double-emit spawn when start ran before warmup', async () => {
+    const h = await makeHarness()
+    __setCodexAppServerSpawnForTests((() => makeSpawnedFakeProc(h.written)) as any)
+
+    await h.runner.start()
+    assert.equal(await h.runner.warmup(500), true)
+    assert.equal(h.spawns.length, 1)
+
+    await h.runner.shutdown()
+    await h.cleanup()
+  })
+
+  it('times out a stuck initialize and clears the partial proc/pending request', async () => {
+    const h = await makeHarness()
+    __setCodexAppServerSpawnForTests((() =>
+      makeSpawnedFakeProc(h.written, { replyInitialize: false })) as any)
+
+    assert.equal(await h.runner.warmup(10), false)
+    assert.equal(h.written.length, 1)
+    assert.equal(JSON.parse(h.written[0]).method, 'initialize')
+    assert.equal((h.runner as any).proc, null)
+    assert.equal((h.runner as any).pending.size, 0)
+
     await h.cleanup()
   })
 })

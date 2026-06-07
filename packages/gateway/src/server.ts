@@ -60,6 +60,11 @@ import { WebhookRouter } from './webhooks.js'
 
 type WechatChannelModule = typeof import('@openclaude/channel-wechat')
 
+function clampNumber(value: number, min: number, max: number): number {
+  if (!Number.isFinite(value)) return min
+  return Math.min(max, Math.max(min, value))
+}
+
 // User-Agent for gateway-internal Claude OAuth fetch (token exchange + refresh).
 // Default Node fetch sends `undici` which is an obvious non-CC fingerprint to
 // Anthropic's OAuth endpoint. Mimic the Claude Code CLI UA pattern instead.
@@ -94,6 +99,7 @@ export class Gateway {
   private _taskSchedulerTimer: ReturnType<typeof setInterval> | null = null
   private _oauthRefreshTimer: ReturnType<typeof setInterval> | null = null
   private _pendingPermissionSweepTimer: ReturnType<typeof setInterval> | null = null
+  private _bootWarmPoolTimer: ReturnType<typeof setTimeout> | null = null
   private _stopEviction: (() => void) | null = null
   private _shuttingDown = false
   private _shutdownPromise: Promise<void> | null = null
@@ -845,8 +851,10 @@ export class Gateway {
       port: config.gateway.port,
     })
 
-    // Auto-resume: proactively continue interrupted webchat sessions after gateway restart
-    this.bootAutoResume().catch((err) => this.log.error('auto-resume boot failed', undefined, err))
+    // Auto-resume / optional warm pool after gateway restart. If warmPool is
+    // enabled, delay it so the HTTP server becomes healthy before we spend CPU
+    // spawning Codex app-servers.
+    this.scheduleBootAutoResume()
   }
 
   /**
@@ -921,6 +929,10 @@ export class Gateway {
     if (this._pendingPermissionSweepTimer !== null) {
       clearInterval(this._pendingPermissionSweepTimer)
       this._pendingPermissionSweepTimer = null
+    }
+    if (this._bootWarmPoolTimer !== null) {
+      clearTimeout(this._bootWarmPoolTimer)
+      this._bootWarmPoolTimer = null
     }
     for (const timer of this._redisGapTimers.values()) clearTimeout(timer)
     this._redisGapTimers.clear()
@@ -3957,27 +3969,54 @@ export class Gateway {
     })
   }
 
-  /** Pre-warm webchat sessions on boot so they respond instantly to the first user message */
+  private scheduleBootAutoResume(): void {
+    const warmCfg = this.deps.config.gateway.warmPool
+    const delayMs =
+      warmCfg?.enabled === true ? clampNumber(warmCfg.startupDelayMs ?? 3000, 0, 60_000) : 0
+    this._bootWarmPoolTimer = setTimeout(() => {
+      this._bootWarmPoolTimer = null
+      this.bootAutoResume().catch((err) =>
+        this.log.error('auto-resume boot failed', undefined, err),
+      )
+    }, delayMs)
+  }
+
+  /** Materialize resumable webchat sessions and, when configured, warm bounded Codex app-servers. */
   private async bootAutoResume(): Promise<void> {
+    const warmCfg = this.deps.config.gateway.warmPool
+    const warmEnabled = warmCfg?.enabled === true
+    const maxWarm = clampNumber(warmCfg?.maxWebchatSessions ?? 1, 0, 5)
+
     const resumableKeys = this.sessions.getResumableKeys((k) => k.includes(':webchat:'))
     if (resumableKeys.length === 0) return
 
-    for (const sessionKey of resumableKeys) {
-      if (this.sessions.getByKey(sessionKey)) continue
+    const agentsConfig = await this._getAgentsConfig()
+    const recentRanks = warmEnabled
+      ? await this.getWarmPoolRecentRanks()
+      : new Map<string, number>()
+    const candidates = resumableKeys
+      .map((sessionKey) => this.parseWebchatSessionKey(sessionKey))
+      .filter((x): x is { sessionKey: string; agentId: string; peerId: string } => !!x)
+      .sort((a, b) => (recentRanks.get(b.peerId) ?? 0) - (recentRanks.get(a.peerId) ?? 0))
 
-      const parts = sessionKey.split(':')
-      const agentId = parts[1]
-      const peerId = parts.slice(4).join(':')
-
-      this.log.info('auto-resume pre-warming', { sessionKey })
-      const cfg = await this._getAgentsConfig()
-      const agent = cfg.agents.find((a) => a.id === agentId) ?? ({ id: agentId } as AgentDef)
-      await this.sessions.getOrCreate({
-        sessionKey,
-        agent,
-        channel: 'webchat',
-        peerId,
-      })
+    let warmAttempts = 0
+    let warmed = 0
+    let materialized = 0
+    for (const { sessionKey, agentId, peerId } of candidates) {
+      const agent =
+        agentsConfig.agents.find((a) => a.id === agentId) ?? ({ id: agentId } as AgentDef)
+      if (this.sessions.getByKey(sessionKey)) {
+        // Already materialized; still eligible for warmup below.
+      } else {
+        this.log.info('auto-resume materializing webchat session', { sessionKey })
+        await this.sessions.getOrCreate({
+          sessionKey,
+          agent,
+          channel: 'webchat',
+          peerId,
+        })
+        materialized++
+      }
       this.lastActiveChannel.set(agentId, {
         channel: 'webchat',
         peerId,
@@ -3985,8 +4024,58 @@ export class Gateway {
         userId: 'default',
         at: Date.now(),
       })
-      this.log.info('auto-resume pre-warmed', { sessionKey })
+      if (!warmEnabled) continue
+      if (warmAttempts >= maxWarm) continue
+      if (warmCfg.codexAppServerOnly ?? true) {
+        if (agent.provider !== 'codex-native' || agent.runnerKind !== 'app-server') continue
+      }
+      warmAttempts++
+      const ok = await this.sessions.warmupSession(
+        sessionKey,
+        clampNumber(warmCfg.warmupTimeoutMs ?? 15_000, 1000, 60_000),
+      )
+      if (ok) warmed++
+      this.log.info('warm pool session warmup finished', { sessionKey, ok })
     }
+    this.log.info('boot auto-resume complete', {
+      candidates: candidates.length,
+      materialized,
+      warmEnabled,
+      warmAttempts,
+      warmed,
+    })
+  }
+
+  private parseWebchatSessionKey(
+    sessionKey: string,
+  ): { sessionKey: string; agentId: string; peerId: string } | null {
+    const parts = sessionKey.split(':')
+    if (parts.length < 5 || parts[0] !== 'agent' || parts[2] !== 'webchat') return null
+    const agentId = parts[1]
+    const peerId = parts.slice(4).join(':')
+    if (!agentId || !peerId) return null
+    return { sessionKey, agentId, peerId }
+  }
+
+  private async getWarmPoolRecentRanks(): Promise<Map<string, number>> {
+    const out = new Map<string, number>()
+    const includeUsers = this.deps.config.gateway.warmPool?.includeUsers
+    const configuredUsers = this.deps.config.gateway.users?.map((u) => u.id) ?? []
+    const users =
+      includeUsers && includeUsers.length > 0
+        ? includeUsers
+        : ['default', ...configuredUsers.filter(Boolean)]
+    for (const userId of new Set(users.filter((u) => typeof u === 'string' && u.length > 0))) {
+      try {
+        const sessions = await listClientSessions(userId)
+        for (const s of sessions) {
+          out.set(s.id, Math.max(out.get(s.id) ?? 0, s.lastAt ?? 0))
+        }
+      } catch (err) {
+        this.log.debug('warm pool recent-rank lookup failed', { userId, error: String(err) })
+      }
+    }
+    return out
   }
 
   private async autoResumeFromHello(
