@@ -332,6 +332,42 @@ test('SessionManager clarifies ambiguous non-native resume without submitting to
   assert.equal(session._historicalContextInjected, false)
 })
 
+test('SessionManager warmupSession runs through the per-session lock', async () => {
+  const manager = new SessionManager({} as any)
+  const runner = new HangingCodexAppServerRunner() as any
+  const session = makeTestSession(runner)
+  let release!: () => void
+  let warmed = false
+  session.lock = new Promise<void>((resolve) => {
+    release = resolve
+  })
+  runner.warmup = async () => {
+    warmed = true
+    return true
+  }
+  ;(manager as any).sessions.set(session.sessionKey, session)
+
+  const warm = manager.warmupSession(session.sessionKey, 123)
+  await Promise.resolve()
+  assert.equal(warmed, false)
+  release()
+  assert.equal(await warm, true)
+  assert.equal(warmed, true)
+})
+
+test('SessionManager warmupSession swallows runner warmup failure', async () => {
+  const manager = new SessionManager({} as any)
+  const runner = new HangingCodexAppServerRunner() as any
+  const session = makeTestSession(runner)
+  runner.warmup = async () => {
+    throw new Error('warmup boom')
+  }
+  ;(manager as any).sessions.set(session.sessionKey, session)
+
+  assert.equal(await manager.warmupSession(session.sessionKey, 123), false)
+  await session.lock
+})
+
 test('SessionManager codex app-server idle timeout ignores raw internal activity without visible events', async () => {
   mock.timers.enable({ apis: ['Date', 'setInterval', 'setTimeout'] })
   try {

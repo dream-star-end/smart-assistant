@@ -587,6 +587,12 @@ export class CodexAppServerRunner extends EventEmitter {
     // the freshly spawned proc.
   }
 
+  private emitSpawnOnce(): void {
+    if (this.spawnEmitted) return
+    this.spawnEmitted = true
+    this.emit('spawn', { resumed: this.threadId != null })
+  }
+
   /** Lazy-build codex launch overrides for the next `app-server` spawn. The
    *  overrides outlive a single turn (the proc is long-lived), so the cache
    *  is only invalidated in `shutdown()` / proc close / `updateConfig()`.
@@ -668,15 +674,58 @@ export class CodexAppServerRunner extends EventEmitter {
     // semantics — sessionManager polls isRunning and wires up runner.on()
     // listeners between start and submit, so emitting spawn synchronously is
     // expected). The actual `codex app-server` proc starts on first runTurn.
-    this.emit('spawn', { resumed: this.threadId != null })
+    this.emitSpawnOnce()
+  }
+
+  async warmup(timeoutMs = 15_000): Promise<boolean> {
+    if (this.processing || this.shuttingDown) return false
+    if (this.proc && !this.proc.killed && this.initialized) return true
+    this.lastActivityAt = Date.now()
+    this.emitSpawnOnce()
+
+    let timedOut = false
+    let timer: ReturnType<typeof setTimeout> | null = null
+    const warm = this.ensureSpawned()
+      .then(() => true)
+      .catch((err) => {
+        if (!timedOut) {
+          log.warn('codex app-server warmup failed', {
+            sessionKey: this.opts.sessionKey,
+            err: (err as Error).message,
+          })
+        }
+        return false
+      })
+    const timeout = new Promise<'timeout'>((resolve) => {
+      timer = setTimeout(() => resolve('timeout'), Math.max(1, timeoutMs))
+    })
+    const result = await Promise.race([warm, timeout])
+    if (timer) clearTimeout(timer)
+    if (result === 'timeout') {
+      timedOut = true
+      log.warn('codex app-server warmup timed out', {
+        sessionKey: this.opts.sessionKey,
+        timeoutMs,
+      })
+      // `ensureSpawned()` may be stuck awaiting the initialize response.
+      // Shutdown rejects pending JSON-RPC requests and kills the partial proc
+      // so the next real submit can cold-start instead of waiting forever
+      // behind a poisoned warmup.
+      warm.catch(() => {})
+      await this.shutdown().catch((err) =>
+        log.warn('codex app-server warmup timeout cleanup failed', {
+          sessionKey: this.opts.sessionKey,
+          err: (err as Error).message,
+        }),
+      )
+      return false
+    }
+    return result
   }
 
   async submit(textOrBlocks: string | Array<{ type: string; text?: string }>): Promise<void> {
     this.lastActivityAt = Date.now()
-    if (!this.spawnEmitted) {
-      this.spawnEmitted = true
-      this.emit('spawn', { resumed: this.threadId != null })
-    }
+    this.emitSpawnOnce()
     const prompt = normalisePrompt(textOrBlocks)
     return new Promise((resolve, reject) => {
       this.queue.push({ prompt, resolve, reject })

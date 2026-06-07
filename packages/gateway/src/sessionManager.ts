@@ -1759,6 +1759,35 @@ export class SessionManager {
     return this.sessions.get(sessionKey)
   }
 
+  async warmupSession(sessionKey: string, timeoutMs = 15_000): Promise<boolean> {
+    const session = this.sessions.get(sessionKey)
+    if (!session) return false
+    const warmup = (
+      session.runner as unknown as { warmup?: (timeoutMs?: number) => Promise<boolean> }
+    ).warmup
+    if (typeof warmup !== 'function') return false
+
+    let ok = false
+    const prev = session.lock
+    const run = prev
+      .catch(() => undefined)
+      .then(async () => {
+        if (this.sessions.get(sessionKey) !== session) return
+        try {
+          ok = await warmup.call(session.runner, timeoutMs)
+        } catch (err) {
+          log.warn('session warmup failed', { sessionKey }, err)
+          ok = false
+        }
+      })
+    session.lock = run.then(
+      () => undefined,
+      () => undefined,
+    )
+    await session.lock
+    return ok
+  }
+
   /** Destroy a single session: kill subprocess + remove from map + clear resume mapping.
    *  Also clears resume-map even if the session was already evicted from memory. */
   async destroySession(sessionKey: string): Promise<void> {

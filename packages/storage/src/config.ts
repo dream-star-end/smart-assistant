@@ -78,6 +78,24 @@ export interface OpenClaudeConfig {
       /** Skip caching oversized full-session snapshots. */
       maxSessionSnapshotBytes?: number
     }
+    /**
+     * Optional startup warm pool for frequently resumed WebChat sessions.
+     * This is intentionally opt-in and bounded because each warmed Codex
+     * app-server is a real subprocess with platform-context MCP wiring.
+     */
+    warmPool?: {
+      enabled?: boolean
+      /** Number of recent webchat sessions to warm. Clamped by gateway. */
+      maxWebchatSessions?: number
+      /** Delay after HTTP server start before warming, so /healthz is fast. */
+      startupDelayMs?: number
+      /** Per-session warmup timeout; timed-out warmups are torn down. */
+      warmupTimeoutMs?: number
+      /** Keep true for the safe first pass: only codex app-server supports no-turn warmup. */
+      codexAppServerOnly?: boolean
+      /** Optional owner allowlist used only for ranking recent client sessions. */
+      includeUsers?: string[]
+    }
   }
   // 接入方式三选一(实际 token 由 CCB 自己存,这里只记录类型)
   auth: {
