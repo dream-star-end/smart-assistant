@@ -32,12 +32,15 @@ function createMockWs(): { send: (data: string) => void; sent: string[] } {
 // describe the test surface independently and `any`-cast through.
 type TestHarness = {
   _outboundRing: OutboundRingBuffer
+  _redisPendingFrames: Map<string, Map<number, unknown>>
+  _redisGapTimers: Map<string, ReturnType<typeof setTimeout>>
   clientsByPeer: Map<string, Set<unknown>>
   _sendStampedSessionFrame: (
     sessionKey: string,
     peerKey: string,
     wireFrame: Record<string, unknown>,
   ) => void
+  _handleRedisSessionFrame: (frame: Record<string, unknown>) => void
 }
 
 // Create a Gateway instance without invoking its constructor — we only need
@@ -47,6 +50,8 @@ type TestHarness = {
 function harness(): TestHarness {
   const gw = Object.create(Gateway.prototype) as any
   gw._outboundRing = new OutboundRingBuffer()
+  gw._redisPendingFrames = new Map()
+  gw._redisGapTimers = new Map()
   gw.clientsByPeer = new Map()
   return gw as TestHarness
 }
@@ -185,5 +190,70 @@ describe('permission frame ring replay', () => {
     assert.equal(typeof live.ts, 'number')
     // No frameSeq when sessionKey is empty.
     assert.equal(live.frameSeq, undefined)
+  })
+
+  it('redis pub/sub fanout waits for contiguous frameSeq before ws.send', () => {
+    const gw = harness()
+    const ws = createMockWs()
+    const peerKey = 'default:webchat:p1'
+    const sessionKey = 'agent:main:webchat:dm:p1'
+    gw.clientsByPeer.set(peerKey, new Set([ws]))
+
+    const redisFrame = (seq: number) => ({
+      originId: 'other',
+      sessionKey,
+      peerKey,
+      frameSeq: seq,
+      ts: 1000 + seq,
+      data: JSON.stringify({
+        type: 'outbound.message',
+        sessionKey,
+        channel: 'webchat',
+        peer: { id: 'p1', kind: 'dm' },
+        frameSeq: seq,
+      }),
+    })
+
+    gw._handleRedisSessionFrame(redisFrame(2))
+    assert.equal(ws.sent.length, 0, 'seq=2 must wait for missing seq=1')
+    assert.equal(gw._outboundRing.lastFrameSeq(sessionKey), 0)
+
+    gw._handleRedisSessionFrame(redisFrame(1))
+    assert.equal(ws.sent.length, 2)
+    assert.deepEqual(
+      ws.sent.map((raw) => JSON.parse(raw).frameSeq),
+      [1, 2],
+    )
+    assert.equal(gw._outboundRing.lastFrameSeq(sessionKey), 2)
+  })
+
+  it('redis pub/sub gap timeout signals resume_failed and advances cursor', async () => {
+    const gw = harness()
+    const ws = createMockWs()
+    const peerKey = 'default:webchat:p1'
+    const sessionKey = 'agent:main:webchat:dm:p1'
+    gw.clientsByPeer.set(peerKey, new Set([ws]))
+
+    gw._handleRedisSessionFrame({
+      originId: 'other',
+      sessionKey,
+      peerKey,
+      frameSeq: 2,
+      ts: 1002,
+      data: JSON.stringify({
+        type: 'outbound.message',
+        sessionKey,
+        channel: 'webchat',
+        peer: { id: 'p1', kind: 'dm' },
+        frameSeq: 2,
+      }),
+    })
+
+    await new Promise((resolve) => setTimeout(resolve, 150))
+    assert.equal(ws.sent.length, 1)
+    const failed = JSON.parse(ws.sent[0])
+    assert.equal(failed.type, 'outbound.resume_failed')
+    assert.equal(failed.reason, 'buffer_miss')
+    assert.equal(gw._outboundRing.lastFrameSeq(sessionKey), 2)
   })
 })

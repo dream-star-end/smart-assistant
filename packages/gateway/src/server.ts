@@ -52,6 +52,7 @@ import { handleOpenAIRequest } from './openaiCompat.js'
 import { DEFAULT_RING_CONFIG, type EvictionStats, OutboundRingBuffer } from './outboundRing.js'
 import { looksRedactedProxyUrl, maskProxyUrl, normalizeProxyUrl } from './proxyEnv.js'
 import { RateLimiter } from './rateLimit.js'
+import { RedisSessionBus, type RedisFrameEnvelope } from './redisSessionBus.js'
 import { Router } from './router.js'
 import { RunLog } from './runLog.js'
 import { SessionManager } from './sessionManager.js'
@@ -241,6 +242,11 @@ export class Gateway {
   // instances (long backgrounded sessions) can extend the age window past
   // the default 10min without rebuilding.
   private _outboundRing!: OutboundRingBuffer
+  private _redisSessionBus!: RedisSessionBus
+  private _redisPendingFrames = new Map<string, Map<number, RedisFrameEnvelope>>()
+  private _redisGapTimers = new Map<string, ReturnType<typeof setTimeout>>()
+  private static readonly REDIS_PENDING_FRAMES_MAX = 1000
+  private static readonly REDIS_GAP_GRACE_MS = 100
 
   constructor(private deps: GatewayDeps) {
     this.router = new Router(deps.agentsConfig)
@@ -253,6 +259,11 @@ export class Gateway {
       maxAgeMs: ringCfg.maxAgeMs ?? DEFAULT_RING_CONFIG.maxAgeMs,
       maxBytes: ringCfg.maxBytes ?? DEFAULT_RING_CONFIG.maxBytes,
     })
+    this._redisSessionBus = new RedisSessionBus({
+      config: deps.config.gateway.redis,
+      env: process.env,
+      log: this.log,
+    })
   }
 
   /** Feed `prune()` eviction counts into Prometheus counters. Called from
@@ -264,6 +275,123 @@ export class Gateway {
     if (stats.age) outboundRingEvictedTotal.inc({ cause: 'age' }, stats.age)
     if (stats.bytes) outboundRingEvictedTotal.inc({ cause: 'bytes' }, stats.bytes)
     outboundRingSizeBytes.value = this._outboundRing.totalBytes()
+  }
+
+  private _handleRedisSessionFrame(frame: RedisFrameEnvelope): void {
+    if (frame.frameSeq <= this._outboundRing.lastFrameSeq(frame.sessionKey)) return
+    let pending = this._redisPendingFrames.get(frame.sessionKey)
+    if (!pending) {
+      pending = new Map()
+      this._redisPendingFrames.set(frame.sessionKey, pending)
+    }
+    pending.set(frame.frameSeq, frame)
+    if (pending.size > Gateway.REDIS_PENDING_FRAMES_MAX) {
+      this.log.warn('redis pending frame buffer overflow; dropping buffered frames', {
+        sessionKey: frame.sessionKey,
+        size: pending.size,
+      })
+      pending.clear()
+      return
+    }
+    this._drainRedisPendingFrames(frame.sessionKey)
+    if (this._redisPendingFrames.has(frame.sessionKey)) this._scheduleRedisGapTimeout(frame.sessionKey)
+  }
+
+  private _drainRedisPendingFrames(sessionKey: string): void {
+    const pending = this._redisPendingFrames.get(sessionKey)
+    if (!pending) return
+    while (true) {
+      const nextSeq = this._outboundRing.lastFrameSeq(sessionKey) + 1
+      const frame = pending.get(nextSeq)
+      if (!frame) break
+      pending.delete(nextSeq)
+      const evicted = this._outboundRing.storeExternal(frame.sessionKey, frame.frameSeq, frame.ts, frame.data)
+      this._recordRingEvictions(evicted)
+      this._sendRedisFrameToLocalClients(frame)
+    }
+    if (pending.size === 0) {
+      this._redisPendingFrames.delete(sessionKey)
+      this._clearRedisGapTimer(sessionKey)
+    }
+  }
+
+  private _sendRedisFrameToLocalClients(frame: RedisFrameEnvelope): void {
+    const set = this.clientsByPeer.get(frame.peerKey)
+    if (!set) return
+    for (const ws of set) {
+      try {
+        ws.send(frame.data)
+      } catch {}
+    }
+  }
+
+  private _scheduleRedisGapTimeout(sessionKey: string): void {
+    if (this._redisGapTimers.has(sessionKey)) return
+    const timer = setTimeout(() => {
+      this._redisGapTimers.delete(sessionKey)
+      this._flushRedisGap(sessionKey)
+    }, Gateway.REDIS_GAP_GRACE_MS)
+    this._redisGapTimers.set(sessionKey, timer)
+  }
+
+  private _clearRedisGapTimer(sessionKey: string): void {
+    const timer = this._redisGapTimers.get(sessionKey)
+    if (timer) clearTimeout(timer)
+    this._redisGapTimers.delete(sessionKey)
+  }
+
+  private _flushRedisGap(sessionKey: string): void {
+    const pending = this._redisPendingFrames.get(sessionKey)
+    if (!pending || pending.size === 0) return
+    const frames = [...pending.values()].sort((a, b) => a.frameSeq - b.frameSeq)
+    const first = frames[0]
+    this._sendRedisResumeFailed(first, this._outboundRing.lastFrameSeq(sessionKey), first.frameSeq, 'buffer_miss')
+    for (const frame of frames) {
+      const evicted = this._outboundRing.storeExternal(frame.sessionKey, frame.frameSeq, frame.ts, frame.data)
+      this._recordRingEvictions(evicted)
+    }
+    pending.clear()
+    this._redisPendingFrames.delete(sessionKey)
+  }
+
+  private _sendRedisResumeFailed(
+    frame: RedisFrameEnvelope,
+    from: number,
+    to: number,
+    reason: 'no_buffer' | 'buffer_miss' | 'sequence_mismatch',
+  ): void {
+    try {
+      const wire = JSON.parse(frame.data) as { channel?: string; peer?: { id?: string; kind?: 'dm' | 'group' } }
+      if (!wire.channel || !wire.peer?.id || !wire.peer.kind) return
+      const data = JSON.stringify({
+        type: 'outbound.resume_failed',
+        sessionKey: frame.sessionKey,
+        channel: wire.channel,
+        peer: wire.peer,
+        from,
+        to,
+        reason,
+        ts: Date.now(),
+      })
+      const set = this.clientsByPeer.get(frame.peerKey)
+      if (!set) return
+      for (const ws of set) {
+        try {
+          ws.send(data)
+        } catch {}
+      }
+    } catch {}
+  }
+
+  private async _allocateFrameSeq(sessionKey: string): Promise<{ seq: number; redisBacked: boolean }> {
+    const redisSeq = await this._redisSessionBus.reserveFrameSeq(sessionKey)
+    const localLast = this._outboundRing.lastFrameSeq(sessionKey)
+    if (redisSeq && redisSeq > localLast) return { seq: redisSeq, redisBacked: true }
+    if (redisSeq && redisSeq <= localLast) {
+      const advancedSeq = await this._redisSessionBus.advanceFrameSeq(sessionKey, redisSeq, localLast)
+      if (advancedSeq && advancedSeq > localLast) return { seq: advancedSeq, redisBacked: true }
+    }
+    return { seq: this._outboundRing.nextSeq(sessionKey), redisBacked: false }
   }
 
   async start(): Promise<void> {
@@ -286,6 +414,7 @@ export class Gateway {
 
     this.httpServer = createServer((req, res) => this.handleHttp(req, res))
     this.wss = new WebSocketServer({ server: this.httpServer, path: '/ws' })
+    await this._redisSessionBus.start((frame) => this._handleRedisSessionFrame(frame))
 
     // WS keepalive: ping every 25s, terminate if no pong in 35s
     this._wsKeepaliveTimer = setInterval(() => {
@@ -329,6 +458,8 @@ export class Gateway {
               await this.sessions.destroySession(k)
             } catch {}
             this._outboundRing.clear(k)
+            this._redisPendingFrames.delete(k)
+            this._clearRedisGapTimer(k)
           }
           // Refresh size_bytes gauge — without this, a Prometheus scrape after
           // a wipe still reports the pre-clear bytes until the next store/peek.
@@ -728,6 +859,13 @@ export class Gateway {
     if (this._pendingPermissionSweepTimer !== null) {
       clearInterval(this._pendingPermissionSweepTimer)
       this._pendingPermissionSweepTimer = null
+    }
+    for (const timer of this._redisGapTimers.values()) clearTimeout(timer)
+    this._redisGapTimers.clear()
+    try {
+      await this._redisSessionBus.close()
+    } catch (err) {
+      this.log.warn('redis session bus close error', undefined, err)
     }
     try {
       this.cron?.stop()
@@ -3112,6 +3250,8 @@ export class Gateway {
           // frames around for a now-meaningless sessionKey would be wasteful
           // and could mislead a future reconnect.
           this._outboundRing.clear(sessionKey)
+          this._redisPendingFrames.delete(sessionKey)
+          this._clearRedisGapTimer(sessionKey)
           outboundRingSizeBytes.value = this._outboundRing.totalBytes()
           this.log.info('reset destroyed session', { sessionKey })
         } else if ((frame as any).type === 'control.session.compact') {
@@ -3435,6 +3575,12 @@ export class Gateway {
     peerKey: string,
     wireFrame: Record<string, unknown>,
   ): void {
+    if (sessionKey && this._redisSessionBus?.enabled) {
+      void this._sendStampedSessionFrameAsync(sessionKey, peerKey, wireFrame).catch((err) =>
+        this.log.warn('redis-backed stamped frame failed', { sessionKey }, err),
+      )
+      return
+    }
     const now = Date.now()
     let data: string
     if (sessionKey) {
@@ -3445,6 +3591,28 @@ export class Gateway {
     } else {
       data = JSON.stringify({ ...wireFrame, ts: now })
     }
+    const set = this.clientsByPeer.get(peerKey)
+    if (!set) return
+    for (const ws of set) {
+      try {
+        ws.send(data)
+      } catch {}
+    }
+  }
+
+  private async _sendStampedSessionFrameAsync(
+    sessionKey: string,
+    peerKey: string,
+    wireFrame: Record<string, unknown>,
+  ): Promise<void> {
+    const now = Date.now()
+    const { seq: frameSeq, redisBacked } = await this._allocateFrameSeq(sessionKey)
+    const data = JSON.stringify({ ...wireFrame, ts: now, frameSeq })
+    const evicted = redisBacked
+      ? this._outboundRing.storeExternal(sessionKey, frameSeq, now, data)
+      : this._outboundRing.store(sessionKey, frameSeq, now, data)
+    this._recordRingEvictions(evicted)
+    if (redisBacked) this._redisSessionBus.publishFrame({ sessionKey, peerKey, frameSeq, ts: now, data })
     const set = this.clientsByPeer.get(peerKey)
     if (!set) return
     for (const ws of set) {
@@ -3705,12 +3873,61 @@ export class Gateway {
         // cause is severely under-counted for idle sessions whose ring is
         // only ever pruned on resume.
         this._recordRingEvictions(replay.evicted)
-        if (replay.ok) {
+        let replayServed = false
+        // Redis, when enabled, owns the cross-process/restart tail. Check it
+        // even if the local in-memory ring says "caught up"; this prevents a
+        // process with a stale but internally-consistent local ring from
+        // silently suppressing frames that another process published.
+        const redisEnabled = this._redisSessionBus?.enabled === true
+        const redisReplay = redisEnabled ? await this._redisSessionBus.replay(sessionKey, clientLastSeq) : null
+        if (redisReplay?.ok && redisReplay.frames.length > 0) {
+          replayServed = true
+          outboundRingReplayHitTotal.inc()
+          for (const f of redisReplay.frames) {
+            try {
+              ws.send(f.data)
+              const evicted = this._outboundRing.storeExternal(sessionKey, f.seq, f.ts, f.data)
+              this._recordRingEvictions(evicted)
+            } catch {
+              break
+            }
+          }
+          this.log.info('redis resume replay served', {
+            sessionKey,
+            from: clientLastSeq,
+            to: redisReplay.to,
+            sent: redisReplay.frames.length,
+          })
+          const localTail = this._outboundRing.peekReplay(sessionKey, redisReplay.to)
+          this._recordRingEvictions(localTail.evicted)
+          if (localTail.ok) {
+            if (localTail.sent.length > 0) {
+              for (const f of localTail.sent) {
+                try {
+                  ws.send(f.data)
+                } catch {
+                  break
+                }
+              }
+              this.log.info('local tail replay served after redis replay', {
+                sessionKey,
+                from: redisReplay.to,
+                to: localTail.to,
+                sent: localTail.sent.length,
+              })
+            }
+          } else {
+            replayServed = false
+          }
+        }
+        const redisUnavailable = redisReplay && !redisReplay.ok && redisReplay.reason === 'disabled'
+        if (!replayServed && (!redisEnabled || redisReplay?.ok || redisUnavailable) && replay.ok) {
           // Only count as "hit" when the ring actually rescued frames.
           // `ok` with empty sent means the client was already caught up
           // (fromSeq === currentLast) — the ring did nothing useful, and
           // counting it would inflate hit-rate against ordinary fresh
           // hellos and skew the replay-effectiveness signal.
+          replayServed = true
           if (replay.sent.length > 0) {
             outboundRingReplayHitTotal.inc()
             for (const f of replay.sent) {
@@ -3727,8 +3944,21 @@ export class Gateway {
               sent: replay.sent.length,
             })
           }
-        } else {
-          outboundRingReplayMissTotal.inc({ reason: replay.reason })
+        }
+        if (!replayServed && redisReplay?.ok) {
+          // Redis has a complete view and says the client is caught up, even
+          // though this process's local ring missed. Trust Redis and avoid a
+          // needless REST sync.
+          replayServed = true
+        }
+        if (!replayServed) {
+          const redisMissReason =
+            redisReplay && !redisReplay.ok && redisReplay.reason !== 'disabled'
+              ? redisReplay.reason
+              : 'no_buffer'
+          const missReason = replay.ok ? redisMissReason : replay.reason
+          const missTo = replay.ok ? (redisReplay?.to ?? replay.to) : replay.to
+          outboundRingReplayMissTotal.inc({ reason: missReason })
           try {
             ws.send(
               JSON.stringify({
@@ -3737,16 +3967,16 @@ export class Gateway {
                 channel: 'webchat',
                 peer: { id: peerId, kind: 'dm' },
                 from: clientLastSeq,
-                to: replay.to,
-                reason: replay.reason,
+                to: missTo,
+                reason: missReason,
                 ts: Date.now(),
               }),
             )
             this.log.warn('resume replay miss — signalled resume_failed', {
               sessionKey,
               from: clientLastSeq,
-              to: replay.to,
-              reason: replay.reason,
+              to: missTo,
+              reason: missReason,
             })
           } catch {}
         }
@@ -4409,6 +4639,13 @@ export class Gateway {
     // all non-stamped call sites will need updating to route correctly.
     const deliverUserId: string = typeof stampedUserId === 'string' ? stampedUserId : 'default'
     const peerKey = Gateway.makePeerKey(deliverUserId, wire.channel, wire.peer.id)
+    const sessionKey = (wire as { sessionKey?: string }).sessionKey
+    if (sessionKey && this._redisSessionBus?.enabled) {
+      void this._deliverWebchatAsync(wire, peerKey, sessionKey).catch((err) =>
+        this.log.warn('redis-backed webchat deliver failed', { sessionKey }, err),
+      )
+      return
+    }
     // ── Phase 0.3: stamp frameSeq + push to ring buffer ──
     // We stamp + store even if no clients are currently connected — that's
     // the whole point: a later autoResumeFromHello for this sessionKey needs
@@ -4419,7 +4656,6 @@ export class Gateway {
     // or agent switches. Schema keeps `ts` unvalidated (extra field is
     // tolerated), so no protocol version bump is required.
     const now = Date.now()
-    const sessionKey = (wire as { sessionKey?: string }).sessionKey
     let data: string
     if (sessionKey) {
       const frameSeq = this._outboundRing.nextSeq(sessionKey)
@@ -4429,6 +4665,30 @@ export class Gateway {
     } else {
       data = JSON.stringify({ ...wire, ts: now })
     }
+    const set = this.clientsByPeer.get(peerKey)
+    if (!set) return
+    for (const ws of set) {
+      try {
+        ws.send(data)
+      } catch {}
+    }
+  }
+
+  private async _deliverWebchatAsync(
+    wire: OutboundMessage,
+    peerKey: string,
+    sessionKey: string,
+  ): Promise<void> {
+    const now = Date.now()
+    const { seq: frameSeq, redisBacked } = await this._allocateFrameSeq(sessionKey)
+    const data = JSON.stringify({ ...wire, ts: now, frameSeq })
+    const evicted = redisBacked
+      ? this._outboundRing.storeExternal(sessionKey, frameSeq, now, data)
+      : this._outboundRing.store(sessionKey, frameSeq, now, data)
+    this._recordRingEvictions(evicted)
+    // Publish before local-client early return so another gateway process can
+    // fan out even when this process has no matching WS connected.
+    if (redisBacked) this._redisSessionBus.publishFrame({ sessionKey, peerKey, frameSeq, ts: now, data })
     const set = this.clientsByPeer.get(peerKey)
     if (!set) return
     for (const ws of set) {
