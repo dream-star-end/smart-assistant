@@ -33,14 +33,28 @@ describe('commercial voice input', () => {
     assert.match(speechJs, /if \(!run\.ready \|\| !rec\) \{[\s\S]*?cancelServerVoice\('已取消语音输入'\)/, 'pre-ready stop should cancel instead of starting recording later')
   })
 
-  it('renders a Feishu-style voice overlay and wires the voice button through the speech module', () => {
+  it('renders a compact voice overlay and wires the voice button through the speech module', () => {
     assert.match(indexHtml, /id="voice-overlay"/, 'voice overlay should be present in the shell')
     assert.match(indexHtml, /id="voice-transcript-text"/, 'voice overlay should include transcript text')
     assert.match(indexHtml, /id="voice-waveform"/, 'voice overlay should include waveform feedback')
     assert.match(indexHtml, /id="voice-cancel-btn"/, 'voice overlay should include cancel action')
     assert.match(indexHtml, /id="voice-confirm-btn"/, 'voice overlay should include confirm action')
+    assert.doesNotMatch(indexHtml, /松开转文字|上滑取消|voice-gesture-hint|voice-mic-dock|voice-text-btn/, 'voice overlay should not expose unsupported hold/swipe controls')
     assert.match(mainJs, /import \{ bindVoiceButton, setAutoResize \} from '\.\/speech\.js\?v=/, 'main should delegate voice button wiring to speech.js')
     assert.match(mainJs, /bindVoiceButton\(\$\('voice-btn'\)\)/, 'voice button should use bindVoiceButton')
+  })
+
+  it('requests microphone immediately and stops stale streams after cancel', () => {
+    assert.match(speechJs, /run\.streamPromise = requestMicStream\(run\)/, 'voice flow should request microphone before waiting for Deepgram ready')
+    assert.match(speechJs, /navigator\.mediaDevices\.getUserMedia\(\{ audio: true \}\)/, 'voice flow should use browser microphone permission API')
+    assert.match(speechJs, /voiceRun !== run \|\| run\.cleaned \|\| run\.seq !== voiceSeq/, 'late microphone stream should be checked against the active run')
+    assert.match(speechJs, /stream\.getTracks\(\)\.forEach\(\(t\) => t\.stop\(\)\)/, 'stale microphone streams should be stopped')
+    assert.match(speechJs, /const stream = await run\.streamPromise/, 'recorder should reuse the early microphone request')
+  })
+
+  it('uses simple tap controls without hold-to-record or swipe-cancel gestures', () => {
+    assert.doesNotMatch(speechJs, /holdGesture|ignoreNextVoiceClick|pointerdown|pointermove|pointerup|pointercancel/, 'voice button should not use unsupported hold/swipe gestures')
+    assert.match(speechJs, /btn\.addEventListener\('click', \(\) => toggleVoice\(\)\)/, 'voice button should use simple click/tap toggle')
   })
 
   it('keeps realtime transcript inside the overlay until final polish is applied', () => {

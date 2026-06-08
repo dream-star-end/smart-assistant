@@ -33,15 +33,12 @@ let voiceSeq = 0
 let undoSnapshot = null
 let undoInstalled = false
 let voiceUiBound = false
-let ignoreNextVoiceClick = false
-let holdGesture = null
 
 function inputEl() { return $('input') }
 function voiceBtn() { return $('voice-btn') }
 function voiceOverlay() { return $('voice-overlay') }
 function voiceTranscriptText() { return $('voice-transcript-text') }
 function voiceTranscriptDots() { return $('voice-transcript-dots') }
-function voiceGestureHint() { return $('voice-gesture-hint') }
 
 function setVoiceButton(mode) {
   const btn = voiceBtn()
@@ -65,27 +62,17 @@ function setVoiceOverlay(mode, text = '') {
   if (!overlay) return
   const label = voiceTranscriptText()
   const dots = voiceTranscriptDots()
-  const hint = voiceGestureHint()
   overlay.hidden = mode === 'hidden'
   overlay.setAttribute('aria-hidden', mode === 'hidden' ? 'true' : 'false')
   document.body.classList.toggle('voice-overlay-open', mode !== 'hidden')
-  overlay.classList.toggle('cancel-intent', mode === 'cancel')
   if (label) {
     label.textContent = text || (
-      mode === 'connecting' ? '正在准备语音输入…'
+      mode === 'connecting' ? '正在打开麦克风…'
         : mode === 'polishing' ? '正在优化转写…'
-          : mode === 'cancel' ? '松开取消'
-            : '正在听…'
+          : '正在听…'
     )
   }
-  if (dots) dots.hidden = Boolean(text) || mode === 'cancel'
-  if (hint) {
-    hint.textContent = mode === 'cancel'
-      ? '松开取消'
-      : mode === 'polishing'
-        ? '正在根据上下文优化'
-        : '松开转文字，上滑取消'
-  }
+  if (dots) dots.hidden = Boolean(text)
 }
 
 function updateVoiceOverlayText(run, text) {
@@ -121,6 +108,25 @@ function applyVoiceText(run, text, opts = {}) {
 function stopTracks(run) {
   try { run.stream?.getTracks?.().forEach((t) => t.stop()) } catch {}
   run.stream = null
+}
+
+function requestMicStream(run) {
+  return navigator.mediaDevices.getUserMedia({ audio: true })
+    .then((stream) => {
+      if (voiceRun !== run || run.cleaned || run.seq !== voiceSeq) {
+        try { stream.getTracks().forEach((t) => t.stop()) } catch {}
+        return null
+      }
+      run.stream = stream
+      return stream
+    })
+    .catch(() => {
+      if (voiceRun === run && !run.cleaned && run.seq === voiceSeq) {
+        cleanupServerVoice(run)
+        toast('无法访问麦克风，请检查浏览器权限', 'error')
+      }
+      return null
+    })
 }
 
 function cleanupServerVoice(run) {
@@ -269,7 +275,7 @@ function installUndoShortcut() {
 function startLegacySpeech() {
   if (!legacyRecognition) legacyRecognition = initLegacySpeech()
   if (!legacyRecognition) {
-    toast('浏览器不支持语音识别 (建议 Chrome/Edge)', 'error')
+    toast('当前浏览器不支持语音转文字，建议使用最新版 Safari/Chrome/Edge', 'error')
     return false
   }
   state.recognition = legacyRecognition
@@ -283,15 +289,9 @@ function startLegacySpeech() {
 
 async function startRecorderAfterReady(run) {
   if (!run || run.seq !== voiceSeq) return
-  let stream
-  try {
-    stream = await navigator.mediaDevices.getUserMedia({ audio: true })
-  } catch {
-    cleanupServerVoice(run)
-    toast('无法访问麦克风，请检查浏览器权限', 'error')
-    return
-  }
-  if (run.seq !== voiceSeq || run.cleaned) {
+  const stream = await run.streamPromise
+  if (!stream) return
+  if (voiceRun !== run || run.seq !== voiceSeq || run.cleaned) {
     try { stream.getTracks().forEach((t) => t.stop()) } catch {}
     return
   }
@@ -347,6 +347,7 @@ function startServerVoice() {
     ws,
     recorder: null,
     stream: null,
+    streamPromise: null,
     mimeType,
     sessionId,
     initialValue,
@@ -362,9 +363,10 @@ function startServerVoice() {
     readyTimeout: null,
   }
   voiceRun = run
+  run.streamPromise = requestMicStream(run)
   state.recognizing = false
   setVoiceButton('polishing')
-  setVoiceOverlay('connecting', '正在准备语音输入…')
+  setVoiceOverlay('connecting', '正在打开麦克风…')
 
   run.readyTimeout = setTimeout(() => {
     if (run.ready) return
@@ -487,57 +489,13 @@ function bindVoiceUi() {
   voiceUiBound = true
   $('voice-cancel-btn')?.addEventListener('click', () => cancelServerVoice())
   $('voice-confirm-btn')?.addEventListener('click', () => stopServerVoice())
-  $('voice-text-btn')?.addEventListener('click', () => stopServerVoice())
 }
 
 export function bindVoiceButton(btn = voiceBtn()) {
   bindVoiceUi()
   if (!btn || btn.dataset.voiceBound === '1') return
   btn.dataset.voiceBound = '1'
-  btn.addEventListener('click', (e) => {
-    if (ignoreNextVoiceClick) {
-      ignoreNextVoiceClick = false
-      e.preventDefault()
-      e.stopPropagation()
-      return
-    }
-    toggleVoice()
-  })
-  btn.addEventListener('pointerdown', (e) => {
-    if (e.pointerType === 'mouse' || voiceRun || state.recognizing) return
-    holdGesture = {
-      id: e.pointerId,
-      startX: e.clientX,
-      startY: e.clientY,
-      started: false,
-      cancel: false,
-      timer: setTimeout(() => {
-        if (!holdGesture || holdGesture.id !== e.pointerId) return
-        holdGesture.started = true
-        ignoreNextVoiceClick = true
-        try { btn.setPointerCapture?.(e.pointerId) } catch {}
-        startServerVoice()
-      }, 180),
-    }
-  })
-  btn.addEventListener('pointermove', (e) => {
-    if (!holdGesture || holdGesture.id !== e.pointerId || !holdGesture.started) return
-    const cancel = e.clientY - holdGesture.startY < -70 || Math.abs(e.clientX - holdGesture.startX) > 110
-    holdGesture.cancel = cancel
-    setVoiceOverlay(cancel ? 'cancel' : (voiceRun?.polishing ? 'polishing' : 'recording'), voiceRun?.rawText || '')
-  })
-  const finishHold = (e) => {
-    if (!holdGesture || holdGesture.id !== e.pointerId) return
-    const g = holdGesture
-    holdGesture = null
-    if (g.timer) clearTimeout(g.timer)
-    if (!g.started) return
-    ignoreNextVoiceClick = true
-    if (g.cancel) cancelServerVoice()
-    else stopServerVoice()
-  }
-  btn.addEventListener('pointerup', finishHold)
-  btn.addEventListener('pointercancel', finishHold)
+  btn.addEventListener('click', () => toggleVoice())
 }
 
 export function toggleVoice() {
