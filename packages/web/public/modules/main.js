@@ -64,7 +64,7 @@ import {
 import { addFiles, clearAttachments } from './attachments.js?v=b08e5286'
 
 // ── Speech recognition ──
-import { setAutoResize, toggleVoice } from './speech.js?v=b08e5286'
+import { bindVoiceButton, setAutoResize } from './speech.js?v=auto'
 
 // ── Notifications ──
 import { refreshDocumentTitle, setTitleBusy } from './notifications.js?v=b08e5286'
@@ -2985,7 +2985,7 @@ async function init() {
   // Phase 6 GitHub repo pill + modal
   $('github-trigger').onclick = () => openGithubModal(getSession()?.id)
   wireGithubModalButtons()
-  $('voice-btn').onclick = toggleVoice
+  bindVoiceButton($('voice-btn'))
   $('upload-btn').onclick = () => $('file-input').click()
   $('file-input').addEventListener('change', (e) => {
     if (e.target.files && e.target.files.length > 0) addFiles(e.target.files)
