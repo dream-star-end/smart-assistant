@@ -17,7 +17,7 @@ const TOKEN_PART_RE = /^[A-Za-z0-9_-]+$/
 const SIG_LEN_BYTES = 32
 const MAX_TOKEN_LEN = 2048
 
-export const DEFAULT_WECHAT_LIVE_TTL_MS = 24 * 60 * 60 * 1000
+export const DEFAULT_WECHAT_LIVE_TTL_MS = 60 * 60 * 1000
 
 export type VerifyWechatLiveTokenResult =
   | { kind: 'ok'; sessionId: WechatSessionId; userId: string; expMs: number }

@@ -47,6 +47,16 @@
 
 <body>
 
+<div id="boot-restore" class="boot-restore" hidden>
+  <div class="boot-restore-card">
+    <div class="boot-spinner" aria-hidden="true"></div>
+    <div>
+      <div class="boot-restore-title">正在恢复登录状态…</div>
+      <div class="boot-restore-sub">如果会话已过期，会自动回到首页。</div>
+    </div>
+  </div>
+</div>
+
 <!-- ═══════════════ LANDING VIEW (cold visitor) ═══════════════ -->
 <div id="landing-view" class="landing" hidden>
   <header class="landing-nav">
@@ -1270,11 +1280,15 @@
 
     <div id="messages" class="messages" aria-live="polite"></div>
 
+    <div id="offline-banner" class="provisioning-banner offline-banner" hidden role="status" aria-live="polite">
+      <span class="provisioning-banner-text">当前离线，消息会排队并在重连后自动发送。</span>
+    </div>
+
     <!-- 容器初始化期 banner:仅在 ws close 4503 reason=provisioning 时显示;
          ws.onopen / 离线 / logout / auth teardown 任一路径都会清除。文案保持单行。 -->
     <div id="provisioning-banner" class="provisioning-banner" hidden role="status" aria-live="polite">
       <span class="provisioning-banner-spinner" aria-hidden="true"></span>
-      <span class="provisioning-banner-text">环境初始化中,首次启动约 5-10 秒…</span>
+      <span class="provisioning-banner-text">环境初始化中，你可以先写需求；环境就绪后会自动发送…</span>
     </div>
 
     <footer class="composer">

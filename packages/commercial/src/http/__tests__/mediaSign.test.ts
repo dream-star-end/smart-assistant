@@ -4,6 +4,7 @@ import { describe, test } from 'node:test'
 import { extractRawQueryParam } from '../handlers.js'
 import {
   MEDIA_SIGN_BATCH_MAX,
+  buildOpaqueSignedUrl,
   buildSignedUrl,
   computeSignature,
   deriveMediaSignKey,
@@ -169,6 +170,38 @@ describe('buildSignedUrl + verifySignedUrl roundtrip', () => {
       nowMs: 1_000_000, // expMs <= now → gone
     })
     assert.equal(after.kind, 'gone')
+  })
+})
+
+describe('buildOpaqueSignedUrl + verifySignedUrl roundtrip', () => {
+  const key = deriveMediaSignKey(VALID_BRIDGE_SECRET)
+
+  test('opaque URL hides path/user in query and verifies', () => {
+    const path = '/home/agent/.openclaude/uploads/中文 & secret.png'
+    const { url, expMs } = buildOpaqueSignedUrl(key, path, 'c:42')
+    const usp = new URLSearchParams(url.slice(url.indexOf('?') + 1))
+    const t = usp.get('t')
+    assert.ok(t, 'opaque token is present')
+    assert.ok(!url.includes('/home/agent'), 'URL must not expose path')
+    assert.ok(!url.includes('u='), 'URL must not expose userId query')
+    assert.ok(!url.includes('p='), 'URL must not expose path query')
+
+    const r = verifySignedUrl(key, { t })
+    assert.equal(r.kind, 'ok')
+    if (r.kind === 'ok') {
+      assert.equal(r.userId, 'c:42')
+      assert.equal(r.expMs, expMs)
+      assert.equal(r.decodedPath, path)
+    }
+  })
+
+  test('tampered opaque token → forbidden', () => {
+    const { url } = buildOpaqueSignedUrl(key, '/a/b.png', 'c:1')
+    const usp = new URLSearchParams(url.slice(url.indexOf('?') + 1))
+    const t = usp.get('t') ?? ''
+    const flipped = `${t.slice(0, -1)}${t.endsWith('A') ? 'B' : 'A'}`
+    const r = verifySignedUrl(key, { t: flipped })
+    assert.equal(r.kind, 'forbidden')
   })
 })
 

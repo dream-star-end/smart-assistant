@@ -8,9 +8,10 @@
  *
  * 修法:抽出
  *   - `_onopenSetInitialStatus(offlineQueueLen)`:纯函数,onopen 替换硬编码
- *   - `_maybePromoteToConnected()`:5 条 predicate 真终态判定,4 个收口点调用
- *     (nudgeDrain else / _drainNextOfflineItem 入口空 / 120s timeout else /
- *      handleOutbound isFinal)
+ *   - `_maybePromoteToConnected()`:5 条 predicate 真终态判定,收口点调用
+ *     (nudgeDrain else / _drainNextOfflineItem 入口空 / handleOutbound isFinal)。
+ *     2026-06 UX 修正后 120s timeout 不再放弃当前项,只提示继续等待,避免
+ *     长任务被墙钟误判为丢失。
  *
  * 本测试覆盖:
  *   1. _onopenSetInitialStatus pure-fn 决策表
@@ -289,11 +290,11 @@ describe('wiring regression — helper called at the right collapse points', () 
     assert.deepEqual(mock.calls[0], { label: '已连接', klass: 'connected' })
   })
 
-  // ── 120s safety timeout else 分支接线回归(Codex Round 2 要求) ──
-  // _handleDrainTimeout(item) 被设计为可挖出的 named helper(替代原 inline arrow),
-  // 这样测试能直接调它、断言"_offlineQueuePending=[] && _offlineDrainingCurrent===item
-  // 时 timeout 内部走 else 分支并 promote"。
-  it('_handleDrainTimeout last-item-abandoned (pending empty) → promote', () => {
+  // ── 120s safety timeout UX 回归 ──
+  // 旧行为会在 pending empty 且 current=item 时直接放弃当前项并 promote,
+  // 商业版长任务/弱网下这会误导用户重复发送。新行为保留 current item,
+  // 继续等待后端 final/error 或用户 stop。
+  it('_handleDrainTimeout keeps current item and does NOT promote', () => {
     const mock = makeSetStatusMock()
     const item = { sessId: 's1', msgId: 'm-stuck' }
     const state: any = {
@@ -308,11 +309,10 @@ describe('wiring regression — helper called at the right collapse points', () 
     }
     const helpers = makeWiringHelpers(state, mock.fn)
     helpers._handleDrainTimeout(item)
-    assert.equal(state._offlineDrainingCurrent, null)
-    assert.equal(state._offlineQueueDraining, false)
-    assert.equal(mock.calls.length, 1,
-      '_handleDrainTimeout else 必须接 _maybePromoteToConnected')
-    assert.deepEqual(mock.calls[0], { label: '已连接', klass: 'connected' })
+    assert.equal(state._offlineDrainingCurrent, item)
+    assert.equal(state._offlineQueueDraining, true)
+    assert.equal(mock.calls.length, 0,
+      '_handleDrainTimeout 不应 promote；否则长任务会被误判结束')
   })
 
   it('_handleDrainTimeout no-op when current item changed (raced past) → NO promote', () => {

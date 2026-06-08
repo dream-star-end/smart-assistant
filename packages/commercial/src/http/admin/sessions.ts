@@ -9,10 +9,9 @@
  *     不能仅靠 JWT TTL 内还有效就放行 —— 万一 admin 已被降权,
  *     必须靠 DB 反查拦截
  *
- * 审计语义("3 不留痕"):
- *   - **不写 admin_audit 表** (boss 明确指示)
- *   - 仅保留 nginx access log / request_id 这类基础 trace
- *   - 不打 message 内容到 logger
+ * 审计语义:
+ *   - 读取完整用户会话也写低敏 admin_audit,但只记录谁看了哪个 session /
+ *     分页范围 / requestId,不记录 message 内容。
  *
  * user_id scope:
  *   - 不带 ?user_id= → admin override,任何 session 都能拿
@@ -47,6 +46,8 @@ import { requireAdminVerifyDb } from "../../admin/requireAdmin.js";
 import type { CommercialHttpDeps, RequestContext } from "../handlers.js";
 import { getClientSession } from "@openclaude/storage";
 import { parseBigintIdParam } from "./_shared.js";
+import { getPool } from "../../db/index.js";
+import { writeAdminAudit } from "../../admin/audit.js";
 
 // session id 在 client_sessions 表是 TEXT PRIMARY KEY,
 // 实际格式有 UUID / web-... / nanoid 等,统一收口为字母数字 + '-_',
@@ -93,10 +94,10 @@ function parsePagingParams(url: URL): { offset: number; limit: number } {
 export async function handleAdminGetSession(
   req: IncomingMessage,
   res: ServerResponse,
-  _ctx: RequestContext,
+  ctx: RequestContext,
   deps: CommercialHttpDeps,
 ): Promise<void> {
-  await requireAdminVerifyDb(req, deps.jwtSecret);
+  const admin = await requireAdminVerifyDb(req, deps.jwtSecret);
   const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "x.invalid"}`);
   const sessionId = parseSessionIdFromUrl(url);
   // 可选 user_id scope —— 带就走 cross-check 路径(避免点 A 用户行看到 B 用户 session)。
@@ -113,6 +114,24 @@ export async function handleAdminGetSession(
   // offset >= total 时返回空数组 + has_more=false,不报错(前端"加载更多"竞争 + 临界 50 等场景需要友好兜底)
   const slice = offset >= total ? [] : allMessages.slice(offset, offset + limit);
   const has_more = offset + slice.length < total;
+  await writeAdminAudit(getPool(), {
+    adminId: admin.id,
+    action: "sessions.read",
+    target: `session:${sessionId}`,
+    before: null,
+    after: {
+      session_id: sessionId,
+      target_user_id: s.userId,
+      scoped_user_id: scopedUserId ?? null,
+      offset,
+      limit,
+      returned_messages: slice.length,
+      total_messages: total,
+      request_id: ctx.requestId,
+    },
+    ip: ctx.clientIp,
+    userAgent: ctx.userAgent,
+  });
   sendJson(res, 200, {
     session: {
       id: s.id,

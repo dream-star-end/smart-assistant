@@ -8,8 +8,8 @@
  *     - dataHost ready + 满 → NodePoolBusyError(不 fallback,数据完整性优先)
  *     - dataHost ready + cooldown → NodePoolBusyError(同上)
  *     - dataHost status=draining → NodePoolBusyError(admin 主动状态,数据仍在)
- *     - dataHost status=quarantined/broken → fall through(被动故障,host 真坏)
- *     - dataHost status=bootstrapping → fall through(过渡态)
+ *     - dataHost status=quarantined/broken → DataHostUnavailableError(不写空 workspace)
+ *     - dataHost status=bootstrapping → DataHostUnavailableError(等待数据 host 恢复)
  *     - vanished 命中(idle sweep 后重连场景)
  *     - 多个 host 都有 vanished → 取最近一次 created_at
  *     - 最少负载选择(多 host 从 activeContainers 最少挑)
@@ -38,6 +38,7 @@ import {
   _clearHostCooldownForTests,
 } from "../compute-pool/nodeScheduler.js";
 import {
+  DataHostUnavailableError,
   NodePoolBusyError,
   NodePoolUnavailableError,
   type ComputeHostRow,
@@ -368,15 +369,17 @@ describe("nodeScheduler.pickHost", () => {
     await assert.rejects(pickHost({ userId: 42 }), NodePoolBusyError);
   });
 
-  // v1.0.17 关键策略:dataHost 被动故障(quarantined/broken)→ fall through 到
-  // least-loaded(host 真坏,数据救不回来,优先可用性)。draining 是 admin 主动
-  // 状态,**不**走 fall through 而是 throw busy(见上方独立 test)。
-  test("dataHost status=quarantined → fall through 到 least-loaded(数据丢失 trade-off:host 真坏)", async () => {
+  // v1.0.18 关键策略:dataHost 不可用(quarantined/broken/bootstrapping)→ 明确报
+  // DataHostUnavailableError,上层转成可重试 unready。即使 host 真坏,也不能自动
+  // fall-through 到新 host 写空 workspace；迁移/修复要走显式运维动作。
+  test("dataHost status=quarantined → 抛 DataHostUnavailableError(不 fallback 写空 workspace)", async () => {
     fp.addHost(mkHost({ id: "hData", name: "self", status: "quarantined", created_at: new Date(2026, 3, 1) }));
     fp.addHost(mkHost({ id: "hOther", name: "tk-01", status: "ready", max_containers: 5, created_at: new Date(2026, 3, 2) }));
     fp.addContainer({ user_id: 42, host_uuid: "hData", bound_ip: "172.30.0.10", state: "vanished" });
-    const r = await pickHost({ userId: 42 });
-    assert.equal(r.row.id, "hOther");
+    await assert.rejects(
+      pickHost({ userId: 42 }),
+      (e) => e instanceof DataHostUnavailableError && e.hostId === "hData" && e.hostStatus === "quarantined",
+    );
   });
 
   // v1.0.17 — draining 是 admin **主动**状态(预备下架),数据 volume 仍在
@@ -389,22 +392,27 @@ describe("nodeScheduler.pickHost", () => {
     await assert.rejects(pickHost({ userId: 42 }), NodePoolBusyError);
   });
 
-  // v1.0.17 — broken(被动故障:bootstrap 失败) → fall through(host 真挂,优先可用)
-  test("dataHost status=broken → fall through 到 least-loaded(被动故障,host 真挂)", async () => {
+  // v1.0.18 — broken(被动故障:bootstrap 失败) 也不自动 fallback,避免给用户
+  // 展示一个新空环境造成"数据丢了"的最差体验。
+  test("dataHost status=broken → 抛 DataHostUnavailableError(不 fallback 写空 workspace)", async () => {
     fp.addHost(mkHost({ id: "hData", name: "self", status: "broken", created_at: new Date(2026, 3, 1) }));
     fp.addHost(mkHost({ id: "hOther", name: "tk-01", status: "ready", max_containers: 5, created_at: new Date(2026, 3, 2) }));
     fp.addContainer({ user_id: 42, host_uuid: "hData", bound_ip: "172.30.0.10", state: "vanished" });
-    const r = await pickHost({ userId: 42 });
-    assert.equal(r.row.id, "hOther");
+    await assert.rejects(
+      pickHost({ userId: 42 }),
+      (e) => e instanceof DataHostUnavailableError && e.hostId === "hData" && e.hostStatus === "broken",
+    );
   });
 
-  // v1.0.17 — bootstrapping(过渡态)→ fall through(host 还没就绪)
-  test("dataHost status=bootstrapping → fall through 到 least-loaded", async () => {
+  // v1.0.18 — bootstrapping 是临时不可用,应等原数据 host 恢复而不是切新空盘。
+  test("dataHost status=bootstrapping → 抛 DataHostUnavailableError", async () => {
     fp.addHost(mkHost({ id: "hData", name: "self", status: "bootstrapping", created_at: new Date(2026, 3, 1) }));
     fp.addHost(mkHost({ id: "hOther", name: "tk-01", status: "ready", max_containers: 5, created_at: new Date(2026, 3, 2) }));
     fp.addContainer({ user_id: 42, host_uuid: "hData", bound_ip: "172.30.0.10", state: "vanished" });
-    const r = await pickHost({ userId: 42 });
-    assert.equal(r.row.id, "hOther");
+    await assert.rejects(
+      pickHost({ userId: 42 }),
+      (e) => e instanceof DataHostUnavailableError && e.hostId === "hData" && e.hostStatus === "bootstrapping",
+    );
   });
 
   test("无 dataHost(全新 user)→ least-loaded", async () => {

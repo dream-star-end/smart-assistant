@@ -10,7 +10,7 @@
 //   - sessions 按 MAX(created_at) 降序 + offset 分页,`has_more` 来自 LIMIT+1 探测
 //   - ledger 用 id 游标 keyset,next_before=null 表示到底
 //   - cache_hit_rate = cache_read / (input + cache_read);cache_write 单独展示
-//   - 本地 formatYuan,不 import billing.js(避免双 ES module 实例)
+//   - 本地 formatCredits,不 import billing.js(避免双 ES module 实例)
 
 import { apiGet } from './api.js?v=4642b238'
 import { closeModal, openModal, toast } from './ui.js?v=4642b238'
@@ -29,18 +29,16 @@ let _st = {
 function $(id) { return document.getElementById(id) }
 
 // ── 本地格式化(不 import billing.js,避免带 ?v= 和不带两个 ES module 实例) ──
-// 分 → ¥X.XX;BigInt-safe(不走 Number)
-function formatYuan(cents) {
-  if (cents == null) return '¥0.00'
-  const s = String(cents)
-  if (!/^-?\d+$/.test(s)) return '¥0.00'
+// 积分(= 分) → "X,XXX 积分";BigInt-safe(不走 Number)。
+// 使用消耗页统一显示积分,避免同一产品里一会儿 ¥ 一会儿 credits 的认知切换。
+function formatCredits(credits) {
+  if (credits == null) return '0 积分'
+  const s = String(credits)
+  if (!/^-?\d+$/.test(s)) return '0 积分'
   const negative = s.startsWith('-')
   const digits = negative ? s.slice(1) : s
-  const padded = digits.padStart(3, '0')
-  const yuan = padded.slice(0, -2)
-  const fen = padded.slice(-2)
-  const yuanFmt = yuan.replace(/\B(?=(\d{3})+(?!\d))/g, ',')
-  return (negative ? '-' : '') + '¥' + yuanFmt + '.' + fen
+  const fmt = digits.replace(/\B(?=(\d{3})+(?!\d))/g, ',')
+  return `${negative ? '-' : ''}${fmt} 积分`
 }
 
 // BigInt-safe token 千分位
@@ -128,14 +126,14 @@ function _render(data) {
   // 总览
   const billed = s.billed_credits || '0'
   const debited = s.debited_credits || '0'
-  $('usage-cost').textContent = formatYuan(debited)
+  $('usage-cost').textContent = formatCredits(debited)
   const clampHint = $('usage-cost-clamp-hint')
   if (billed !== debited) {
     try {
       const diff = BigInt(billed) - BigInt(debited)
       if (diff > 0n) {
         clampHint.hidden = false
-        clampHint.textContent = `(名义账单 ${formatYuan(billed)},其中 ${formatYuan(diff.toString())} 因余额不足未扣)`
+        clampHint.textContent = `(名义账单 ${formatCredits(billed)},其中 ${formatCredits(diff.toString())} 因余额不足未扣)`
       } else {
         clampHint.hidden = true
       }
@@ -157,7 +155,7 @@ function _render(data) {
     savEl.textContent = '—'
     savHint.textContent = '数据量较大(>10000 条),暂不显示精确节省。'
   } else {
-    savEl.textContent = formatYuan(savings.savings_credits || '0')
+    savEl.textContent = formatCredits(savings.savings_credits || '0')
     let hint = '按每次请求的价格快照精算,仅计算 cache_read 维度的差价(clamp 至 0)。'
     if (savings.savings_is_estimate && savings.savings_rows_skipped > 0) {
       hint += ` 有 ${savings.savings_rows_skipped} 条价格快照异常被跳过。`
@@ -194,7 +192,7 @@ function _render(data) {
         fmtTokens(r.input_tokens),
         fmtTokens(r.output_tokens),
         fmtTokens(r.cache_read_tokens),
-        formatYuan(r.billed_credits),
+        formatCredits(r.billed_credits),
         fmtTime(r.last_used_at),
       ]
       for (const c of cells) {
@@ -214,7 +212,7 @@ function _render(data) {
   if (legReq > 0n) {
     legEl.hidden = false
     legEl.innerHTML = `<span class="usage-legacy-label">历史未归属会话(cutoff 前)</span>
-      <span>${fmtTokens(legacy.requests)} 次请求 · 名义 ${formatYuan(legacy.billed_credits)} · 输入 ${fmtTokens(legacy.input_tokens)} / 输出 ${fmtTokens(legacy.output_tokens)}</span>`
+      <span>${fmtTokens(legacy.requests)} 次请求 · 名义 ${formatCredits(legacy.billed_credits)} · 输入 ${fmtTokens(legacy.input_tokens)} / 输出 ${fmtTokens(legacy.output_tokens)}</span>`
   } else {
     legEl.hidden = true
   }
@@ -243,8 +241,8 @@ function _render(data) {
     const cells = [
       { text: fmtTime(r.created_at) },
       { text: reasonZh },
-      { text: formatYuan(delta), cls: deltaCls },
-      { text: formatYuan(r.balance_after) },
+      { text: formatCredits(delta), cls: deltaCls },
+      { text: formatCredits(r.balance_after) },
       { text: r.memo || '—' },
     ]
     for (const c of cells) {

@@ -36,7 +36,7 @@ import {
 } from "../auth/jwtSync.js";
 import { requireActiveAccountVerifyDb } from "./requireUser.js";
 import {
-  buildSignedUrl,
+  buildOpaqueSignedUrl,
   verifySignedUrl,
   normalizeSignBatchInput,
   isContainerPathAllowed,
@@ -1579,7 +1579,8 @@ export async function handleReadAllInbox(
 //
 // 路径分工:
 //   - `POST /api/media-sign`(Bearer JWT 鉴权) → 输入路径数组,输出 path→signedUrl map
-//   - `GET  /api/media-signed?p=&u=&e=&s=` → 验签 + DB active(user/admin)+ 容器路径
+//   - `GET  /api/media-signed?t=` → 验签 + DB active(user/admin)+ 容器路径
+//     (旧 `p=&u=&e=&s=` URL 仍兼容校验到过期)
 //     sanity check(isContainerPathAllowed) → req.url 改成 /api/file?path= + 调
 //     containerFileProxy(真正 ACL 由容器内 handleApiFile 把权威)
 //
@@ -1883,23 +1884,23 @@ export async function handleMediaSign(
     if (!isContainerPathAllowed(resolved)) continue;
     // sign 用 raw 输入 path(handler 端 decoded 后做 HMAC,verify 端
     // decodeURIComponent 后再算 HMAC,canonicalization 一致)
-    const { url } = buildSignedUrl(deps.mediaSignKey, p, userId, DEFAULT_SIGN_TTL_MS);
+    const { url } = buildOpaqueSignedUrl(deps.mediaSignKey, p, userId, DEFAULT_SIGN_TTL_MS);
     urls[p] = url;
   }
   sendJson(res, 200, { urls, expMs });
 }
 
 /**
- * GET /api/media-signed?p=&u=&e=&s=
+ * GET /api/media-signed?t=<opaque>
  *
- * 公开端点(无需 cookie / Bearer),由 HMAC 签名 + 过期戳自证身份。
+ * 公开端点(无需 cookie / Bearer),由 opaque 加密 token + 过期戳自证身份。
  * 验签通过 → 当作 `/api/file?path=<decodedPath>` 走 containerFileProxy。
  *
  * 不查 DB?——查。即使签 URL 时是 active,签后可能被 ban → 不能因 signed URL 还
  * 在 TTL 内就漏放。`requireActiveAccountVerifyDb(sub, ['user','admin'], pool)`
  * 双检 role 与 status=active。
  *
- * Cache-Control:仅当上游容器返 200/206 + 签名未过期 → public, max-age=剩余 TTL。
+ * Cache-Control:仅当上游容器返 200/206 + 签名未过期 → private, max-age=剩余 TTL。
  * 4xx/5xx 维持 no-store(避免 CDN 缓存错误响应导致 token rotate 后无法刷新)。
  */
 export async function handleMediaSigned(
@@ -1923,12 +1924,13 @@ export async function handleMediaSigned(
   // u/e/s 是 ASCII 安全字段(`c:<digits>`、十进制毫秒戳、hex sig),once-decoded 后形态
   // 不变,继续用 URLSearchParams 取无副作用。
   const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "x.invalid"}`);
+  const t = url.searchParams.get("t");
   const u = url.searchParams.get("u");
   const e = url.searchParams.get("e");
   const s = url.searchParams.get("s");
   const pRaw = extractRawQueryParam(req.url ?? "", "p");
 
-  const result = verifySignedUrl(deps.mediaSignKey, { pRaw, u, e, s });
+  const result = verifySignedUrl(deps.mediaSignKey, { t, pRaw, u, e, s });
   switch (result.kind) {
     case "bad-request":
       throw new HttpError(400, "BAD_REQUEST", `signed URL: ${result.reason}`);
@@ -2025,7 +2027,7 @@ export async function handleMediaSigned(
   req.url = newPath;
   try {
     const selfHostIdForProxy = deps.v3Supervisor.selfHostId;
-    // Cache-Control 覆盖:仅 200/206 → public, max-age = min(剩余 TTL, 240s)。
+    // Cache-Control 覆盖:仅 200/206 → private, max-age = min(剩余 TTL, 240s)。
     // 240 上限避免 expMs 离现在仍很远时 CDN 大段缓存(虽然签名 TTL 由 sign 端
     // 控制 5min,这里再 clamp 一遍是 defense-in-depth)。
     const cacheControlOverride = (upstreamStatus: number): string | null => {
@@ -2033,7 +2035,7 @@ export async function handleMediaSigned(
       const remainSec = Math.max(0, Math.floor((expMs - Date.now()) / 1000));
       const ageSec = Math.min(240, remainSec);
       if (ageSec <= 0) return null;
-      return `public, max-age=${ageSec}`;
+      return `private, max-age=${ageSec}`;
     };
     await containerFileProxy(
       req,

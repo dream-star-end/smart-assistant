@@ -3607,6 +3607,21 @@ a:hover {
   font-size: var(--text-xs);
   font-variant-numeric: tabular-nums;          /* 数字等宽,防 chip 宽度抖动 */
 }
+.attach-item.attach-error {
+  border-color: color-mix(in srgb, var(--danger) 45%, var(--border));
+  background: color-mix(in srgb, var(--danger) 8%, var(--bg-raised));
+}
+.attach-item .attach-error-text {
+  color: var(--danger);
+}
+.attach-item .attach-retry {
+  padding: 1px 6px;
+  border-radius: var(--radius-sm);
+  border: 1px solid color-mix(in srgb, var(--danger) 45%, var(--border));
+  color: var(--danger);
+  background: transparent;
+  font-size: var(--text-xs);
+}
 .attach-item .attach-progress-bar {
   position: absolute;
   left: 0;
@@ -7286,6 +7301,45 @@ body.body-landing {
   }
 }
 
+.boot-restore {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  display: grid;
+  place-items: center;
+  background: var(--bg);
+}
+.boot-restore[hidden] {
+  display: none;
+}
+.boot-restore-card {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  max-width: min(420px, calc(100vw - 40px));
+  padding: 18px 20px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 16px;
+  background: var(--bg-raised);
+  box-shadow: var(--shadow-lg);
+}
+.boot-spinner {
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  border: 3px solid var(--accent-border);
+  border-top-color: var(--accent);
+  animation: sync-orbit 0.9s linear infinite;
+}
+.boot-restore-title {
+  font-weight: 700;
+}
+.boot-restore-sub {
+  margin-top: 4px;
+  color: var(--fg-muted);
+  font-size: 13px;
+}
+
 /* ─────────────────────────────────────────────
    Provisioning banner — shows above composer when ws closed 4503
    reason="provisioning". Single-line preferred; allow wrap on narrow
@@ -7308,6 +7362,10 @@ body.body-landing {
   line-height: 1.4;
   /* 让 banner 出现/消失更平滑,但不要喧宾夺主 */
   animation: provisioning-banner-in 180ms ease-out;
+}
+.offline-banner {
+  background: color-mix(in srgb, var(--warning) 10%, var(--bg-raised));
+  border-color: color-mix(in srgb, var(--warning) 35%, var(--border-subtle));
 }
 .provisioning-banner[hidden] {
   display: none;

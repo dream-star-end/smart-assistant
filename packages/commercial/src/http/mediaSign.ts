@@ -5,8 +5,10 @@
  * HttpOnly `oc_session` cookie。但 iOS Safari 在 Cloudflare CDN + cross-hop 场景下经常
  * drop 这个 cookie(SameSite=Strict + CDN edge 转发),导致用户看到 `[?]` 破图。
  *
- * 业界标准:S3/GCS 风格的 signed URL —— URL 自带 HMAC 签名 + 过期戳 + 用户标识,
- * 无需 cookie/Bearer 即可访问。本模块提供 sign/verify primitives。
+ * 业界标准:S3/GCS 风格的 signed URL —— URL 自带签名/加密 token + 过期戳,
+ * 无需 cookie/Bearer 即可访问。本模块提供 sign/verify primitives。新版默认
+ * 生成 opaque token,避免在浏览器/CDN 日志中暴露容器 path / user id；旧版
+ * p/u/e/s HMAC URL 仍兼容校验。
  *
  * **Key derivation**:
  *   MEDIA_SIGN_KEY = HKDF-SHA256(bridgeSecretBytes, salt=zero, info="oc-media-sign-v1", L=32)
@@ -35,14 +37,16 @@
  * 见 handlers.ts `extractRawQueryParam`。
  */
 
-import { createHmac, hkdfSync, timingSafeEqual } from 'node:crypto'
+import { createCipheriv, createDecipheriv, createHmac, hkdfSync, randomBytes, timingSafeEqual } from 'node:crypto'
 
 /** info bytes for HKDF — 改值即 rotate key,旧 URL 全部失效 */
 const HKDF_INFO = Buffer.from('oc-media-sign-v1')
+const AEAD_KEY_INFO = Buffer.from('oc-media-sign-aead-v2')
 
 /** 签名结果固定 sha256 hex = 64 字符 */
 const SIG_LEN_HEX = 64
 const SIG_HEX_RE = /^[0-9a-f]{64}$/
+const OPAQUE_TOKEN_RE = /^[A-Za-z0-9_-]+$/
 
 /**
  * Commercial JWT 用户的 userId 形:`c:<digits>` 1-19 位正整数。
@@ -127,6 +131,10 @@ export function deriveMediaSignKey(bridgeSecret: string): Buffer {
   return Buffer.from(ab)
 }
 
+function deriveOpaqueAeadKey(signKey: Buffer): Buffer {
+  return Buffer.from(hkdfSync('sha256', signKey, Buffer.alloc(0), AEAD_KEY_INFO, 32))
+}
+
 /**
  * 计算签名 hex。
  *
@@ -166,19 +174,22 @@ export type VerifyResult =
   | { kind: 'gone'; reason: string }
 
 export interface VerifySignatureInput {
+  /** Opaque encrypted token used by new URLs. If present, p/u/e/s are ignored. */
+  t?: string | null
   /** Raw URL-encoded p query param */
-  pRaw: string | null
+  pRaw?: string | null
   /** userId, e.g. "c:42" — 已经从 query 拿过来,但还没校验 */
-  u: string | null
+  u?: string | null
   /** expMs 字符串形式(query string 都是 string) */
-  e: string | null
+  e?: string | null
   /** 签名 hex */
-  s: string | null
+  s?: string | null
   /** 用于过期判定的 now,可注入便于测试 */
   nowMs?: number
 }
 
 export function verifySignedUrl(key: Buffer, input: VerifySignatureInput): VerifyResult {
+  if (input.t) return verifyOpaqueSignedUrl(key, input.t, input.nowMs)
   const { pRaw, u, e, s } = input
   if (!pRaw || !u || !e || !s) {
     return { kind: 'bad-request', reason: 'missing-param' }
@@ -222,6 +233,60 @@ export function verifySignedUrl(key: Buffer, input: VerifySignatureInput): Verif
   return { kind: 'ok', userId: u, expMs, decodedPath }
 }
 
+interface OpaqueMediaPayload {
+  v: 2
+  p: string
+  u: string
+  e: number
+}
+
+function verifyOpaqueSignedUrl(key: Buffer, token: string, nowMs?: number): VerifyResult {
+  if (token.length > 8192 || !OPAQUE_TOKEN_RE.test(token)) {
+    return { kind: 'bad-request', reason: 'bad-token' }
+  }
+  let raw: Buffer
+  try {
+    raw = Buffer.from(token, 'base64url')
+  } catch {
+    return { kind: 'bad-request', reason: 'bad-token' }
+  }
+  if (raw.length <= 12 + 16) return { kind: 'bad-request', reason: 'bad-token' }
+  const iv = raw.subarray(0, 12)
+  const tag = raw.subarray(12, 28)
+  const ct = raw.subarray(28)
+  let payloadRaw: string
+  try {
+    const decipher = createDecipheriv('aes-256-gcm', deriveOpaqueAeadKey(key), iv)
+    decipher.setAuthTag(tag)
+    payloadRaw = Buffer.concat([decipher.update(ct), decipher.final()]).toString('utf8')
+  } catch {
+    return { kind: 'forbidden', reason: 'bad-token' }
+  }
+  let payload: unknown
+  try {
+    payload = JSON.parse(payloadRaw)
+  } catch {
+    return { kind: 'bad-request', reason: 'bad-token-payload' }
+  }
+  if (!payload || typeof payload !== 'object') return { kind: 'bad-request', reason: 'bad-token-payload' }
+  const p = (payload as OpaqueMediaPayload).p
+  const u = (payload as OpaqueMediaPayload).u
+  const expMs = (payload as OpaqueMediaPayload).e
+  if ((payload as OpaqueMediaPayload).v !== 2) return { kind: 'bad-request', reason: 'bad-token-version' }
+  if (typeof p !== 'string' || p.length === 0 || p.length > MAX_PATH_LEN) {
+    return { kind: 'bad-request', reason: 'path-too-long' }
+  }
+  if (typeof u !== 'string' || !USER_ID_RE.test(u)) {
+    return { kind: 'bad-request', reason: 'bad-user-id' }
+  }
+  if (!Number.isSafeInteger(expMs)) {
+    return { kind: 'bad-request', reason: 'bad-exp' }
+  }
+  const now = nowMs ?? Date.now()
+  if (expMs <= now) return { kind: 'gone', reason: 'expired' }
+  return { kind: 'ok', userId: u, expMs, decodedPath: p }
+}
+
 /**
  * 用 path + userId + ttlMs 构造一个 signed URL(URL-encoded p 形式,直接可作为 `<img src>`)。
  *
@@ -242,6 +307,27 @@ export function buildSignedUrl(
   const u = encodeURIComponent(userId)
   const url = `/api/media-signed?p=${p}&u=${u}&e=${expMs}&s=${sig}`
   return { url, expMs }
+}
+
+/**
+ * New privacy-preserving signed URL form. The browser/CDN log sees only an
+ * opaque AES-GCM token; container path and user id stay encrypted.
+ * Legacy p/u/e/s URLs remain accepted by verifySignedUrl for already-issued URLs.
+ */
+export function buildOpaqueSignedUrl(
+  key: Buffer,
+  decodedPath: string,
+  userId: string,
+  ttlMs: number = DEFAULT_SIGN_TTL_MS,
+): { url: string; expMs: number } {
+  const expMs = Date.now() + ttlMs
+  const payload: OpaqueMediaPayload = { v: 2, p: decodedPath, u: userId, e: expMs }
+  const iv = randomBytes(12)
+  const cipher = createCipheriv('aes-256-gcm', deriveOpaqueAeadKey(key), iv)
+  const ct = Buffer.concat([cipher.update(JSON.stringify(payload), 'utf8'), cipher.final()])
+  const tag = cipher.getAuthTag()
+  const token = Buffer.concat([iv, tag, ct]).toString('base64url')
+  return { url: `/api/media-signed?t=${encodeURIComponent(token)}`, expMs }
 }
 
 /**

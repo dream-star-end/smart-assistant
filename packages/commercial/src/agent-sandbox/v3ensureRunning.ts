@@ -59,7 +59,7 @@ import {
   markHostCooldown,
   type SchedulePlacement,
 } from "../compute-pool/nodeScheduler.js";
-import { NodePoolBusyError, NodePoolUnavailableError } from "../compute-pool/types.js";
+import { DataHostUnavailableError, NodePoolBusyError, NodePoolUnavailableError } from "../compute-pool/types.js";
 import { getHostById, setQuarantined } from "../compute-pool/queries.js";
 import { hostRowToTarget, type NodeAgentTarget } from "../compute-pool/nodeAgentClient.js";
 import { promoteOnce } from "../compute-pool/imagePromote.js";
@@ -386,6 +386,9 @@ export function makeV3EnsureRunning(
       try {
         placement = await schedulePlacement({ userId: uid });
       } catch (err) {
+        if (err instanceof DataHostUnavailableError) {
+          throw new ContainerUnreadyError(RETRY_AFTER_HOST_FULL_SEC, "data_host_unavailable");
+        }
         if (err instanceof NodePoolBusyError || err instanceof NodePoolUnavailableError) {
           throw new ContainerUnreadyError(RETRY_AFTER_HOST_FULL_SEC, "host_full");
         }

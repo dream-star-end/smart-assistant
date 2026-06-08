@@ -20,6 +20,7 @@ import { getPool } from "../db/index.js";
 import { rootLogger } from "../logging/logger.js";
 import * as queries from "./queries.js";
 import {
+  DataHostUnavailableError,
   NodePoolBusyError,
   NodePoolUnavailableError,
   type ComputeHostRow,
@@ -181,13 +182,9 @@ export async function pickHost(opts: ScheduleOptions = {}): Promise<SchedulableH
   //   - dataHost status=draining → 抛 busy。draining 是 admin **主动**状态
   //     (预备下架),数据 volume 仍在 host 本地,fall-through 会创建空 volume,
   //     完全是本次修复要避免的事。等 admin 完成迁移流程后再恢复
-  //   - dataHost status=quarantined/broken 或 host 行 missing → fall through。
-  //     这是**被动**故障状态(健康探针 3 连 fail / bootstrap 失败 / host 行被
-  //     删的极罕见 race),host 真出问题,数据救不回来,优先让用户能登录。
-  //     可用性 vs 数据完整性 trade-off,由运维介入 / R6.8 freeze+rsync 处理
-  //   - dataHost status=bootstrapping(其他过渡态)→ fall through。host 还
-  //     没就绪,fall-through 让用户先用别的 host;ready 后用户再回来时 sticky
-  //     命中
+  //   - dataHost status=quarantined/broken/missing/bootstrapping → 抛
+  //     DataHostUnavailableError。商业版默认不能把"可登录空环境"置于"用户以为
+  //     数据丢了"之上;等运维恢复/迁移,或后续显式做"临时空环境"用户选择。
   //   - dataHost 为 null (user 全新,从未 provision) → fall through 到
   //     least-loaded(首次落点不影响数据完整性,因为还没有数据)
   if (typeof opts.userId === "number") {
@@ -195,14 +192,17 @@ export async function pickHost(opts: ScheduleOptions = {}): Promise<SchedulableH
     if (dataHost) {
       const row = await queries.getHostById(dataHost.hostUuid);
       if (!row || row.status === "quarantined" || row.status === "broken") {
-        // 被动故障 / host 行 missing(ON DELETE RESTRICT 下罕见)→ fall through
-        log.warn("data host in passive failure, falling through (user volume may not load)", {
+        log.warn("data host unavailable, refusing fallback to preserve user data", {
           userId: opts.userId,
           hostId: dataHost.hostUuid,
           status: row?.status ?? "missing",
           containerState: dataHost.containerState,
         });
-        // fall through → least-loaded
+        throw new DataHostUnavailableError(
+          `data host ${dataHost.hostUuid} unavailable (${row?.status ?? "missing"}) for uid=${opts.userId}`,
+          dataHost.hostUuid,
+          row?.status ?? "missing",
+        );
       } else if (row.status === "draining") {
         // draining 不 fallback:admin 主动状态,数据仍在 host 本地。
         log.info("data host in draining, throwing busy to preserve user data", {
@@ -214,14 +214,17 @@ export async function pickHost(opts: ScheduleOptions = {}): Promise<SchedulableH
           `data host ${row.id} in draining for uid=${opts.userId}`,
         );
       } else if (row.status !== "ready") {
-        // 兜底其他过渡态(bootstrapping)。
-        log.warn("data host not ready, falling through", {
+        log.warn("data host not ready, refusing fallback to preserve user data", {
           userId: opts.userId,
           hostId: dataHost.hostUuid,
           status: row.status,
           containerState: dataHost.containerState,
         });
-        // fall through → least-loaded
+        throw new DataHostUnavailableError(
+          `data host ${dataHost.hostUuid} not ready (${row.status}) for uid=${opts.userId}`,
+          dataHost.hostUuid,
+          row.status,
+        );
       } else if (isHostInCooldown(dataHost.hostUuid)) {
         // cooldown 不 fallback:host 通常 60s 后恢复,fallback 会写空 volume
         log.info("data host in cooldown, throwing busy to preserve user data", {

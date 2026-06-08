@@ -254,11 +254,45 @@ async function withBtnLoading(btn, fn) {
 
 // ─── Modal ──────────────────────────────────────────────────────────
 
+let _modalCloseHook = null
+let _modalFocusReturn = null
+let _modalFocusTrap = null
+
+function _modalFocusable() {
+  return Array.from($('modal-body').querySelectorAll('button:not([disabled]),input:not([disabled]),select:not([disabled]),textarea:not([disabled]),a[href],[tabindex]:not([tabindex="-1"])'))
+}
+
 function openModal(html) {
+  _modalFocusReturn = document.activeElement
   $('modal-body').innerHTML = html
+  $('modal-body').setAttribute('role', 'dialog')
+  $('modal-body').setAttribute('aria-modal', 'true')
+  $('modal-body').setAttribute('tabindex', '-1')
   $('modal-bg').hidden = false
+  if (_modalFocusTrap) document.removeEventListener('keydown', _modalFocusTrap)
+  _modalFocusTrap = (e) => {
+    if (e.key !== 'Tab' || $('modal-bg').hidden) return
+    const nodes = _modalFocusable()
+    if (nodes.length === 0) return
+    const first = nodes[0]
+    const last = nodes[nodes.length - 1]
+    if (e.shiftKey && document.activeElement === first) {
+      e.preventDefault()
+      last.focus?.()
+    } else if (!e.shiftKey && document.activeElement === last) {
+      e.preventDefault()
+      first.focus?.()
+    }
+  }
+  document.addEventListener('keydown', _modalFocusTrap)
+  setTimeout(() => {
+    const first = $('modal-body').querySelector('button,input,select,textarea,a[href]')
+    ;(first || $('modal-body')).focus?.()
+  }, 0)
 }
 function closeModal() {
+  const closeHook = _modalCloseHook
+  _modalCloseHook = null
   $('modal-bg').hidden = true
   $('modal-body').innerHTML = ''
   // Abort any in-flight long-poll loops tied to the modal (e.g. iLink QR poll).
@@ -267,10 +301,44 @@ function closeModal() {
   if (ALERTS_STATE && ALERTS_STATE.qrAbortFlag) {
     ALERTS_STATE.qrAbortFlag.aborted = true
   }
+  if (_modalFocusTrap) {
+    document.removeEventListener('keydown', _modalFocusTrap)
+    _modalFocusTrap = null
+  }
+  try { _modalFocusReturn?.focus?.() } catch {}
+  _modalFocusReturn = null
+  closeHook?.()
 }
 $('modal-bg').addEventListener('click', (e) => {
   if (e.target === $('modal-bg')) closeModal()
 })
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && !$('modal-bg').hidden) closeModal()
+})
+
+function typedConfirm({ title, body, confirmText, danger = true }) {
+  return new Promise((resolve) => {
+    const expected = String(confirmText || '').trim()
+    openModal(`
+      <h3>${escapeHtml(title || '确认操作')}</h3>
+      <div class="muted" style="white-space:pre-line;margin:8px 0 12px;">${escapeHtml(body || '')}</div>
+      <label class="muted">请输入 <code>${escapeHtml(expected)}</code> 确认</label>
+      <input id="typed-confirm-input" class="input" autocomplete="off" style="width:100%;margin:8px 0;" />
+      <div class="modal-actions">
+        <button class="btn" id="typed-confirm-cancel">取消</button>
+        <button class="btn ${danger ? 'btn-danger' : 'btn-primary'}" id="typed-confirm-ok" disabled>确认</button>
+      </div>
+    `)
+    const input = $('typed-confirm-input')
+    const ok = $('typed-confirm-ok')
+    const cancel = $('typed-confirm-cancel')
+    _modalCloseHook = () => resolve(false)
+    const finish = (v) => { _modalCloseHook = null; closeModal(); resolve(v) }
+    input?.addEventListener('input', () => { ok.disabled = input.value.trim() !== expected })
+    ok?.addEventListener('click', () => finish(true))
+    cancel?.addEventListener('click', () => finish(false))
+  })
+}
 
 // ─── Bootstrap ──────────────────────────────────────────────────────
 
@@ -2308,7 +2376,12 @@ function _renderAccountGroupsTable(rows) {
   }
   for (const b of el.querySelectorAll('button[data-act="grp-delete"]')) {
     b.addEventListener('click', async () => {
-      if (!confirm(`删除分组 #${b.dataset.id} (${b.dataset.label})?\n关联模型/中转站凭据会一起删除;Claude 账号会解绑。`)) return
+      const ok = await typedConfirm({
+        title: `删除账号分组 #${b.dataset.id}`,
+        body: `分组: ${b.dataset.label || ''}\n影响: 关联模型/中转站凭据会一起删除，Claude 账号会解绑。`,
+        confirmText: `delete group ${b.dataset.id}`,
+      })
+      if (!ok) return
       try { await apiJson('DELETE', `/api/admin/account-groups/${encodeURIComponent(b.dataset.id)}`); toast('已删除'); renderAccountGroupsTab() }
       catch (e) { toast(`删除失败:${e.message}`, 'danger', toastOptsFromError(e)) }
     })
@@ -2361,7 +2434,12 @@ async function openRelayCredentialsModal(groupId, groupLabel) {
       }
       for (const b of box.querySelectorAll('button[data-act="relay-del"]')) {
         b.addEventListener('click', async () => {
-          if (!confirm(`删除凭据 #${b.dataset.id}?`)) return
+          const ok = await typedConfirm({
+            title: `删除中转站凭据 #${b.dataset.id}`,
+            body: '删除后该 API key 将不再参与调度；正在使用该凭据的请求不会被前端自动迁移。',
+            confirmText: `delete credential ${b.dataset.id}`,
+          })
+          if (!ok) return
           try { await apiJson('DELETE', `/api/admin/account-groups/relay-credentials/${encodeURIComponent(b.dataset.id)}`); toast('已删除'); render() }
           catch (e) { toast(`删除失败:${e.message}`, 'danger', toastOptsFromError(e)) }
         })
@@ -2817,7 +2895,13 @@ function _renderAccountRow(a) {
 }
 
 async function resetAccountCooldown(id, label, btn) {
-  if (!confirm(`释放账号 #${id} (${label}) 的冷却并清 last_error?\n不会修改 status。`)) return
+  const ok = await typedConfirm({
+    title: `释放账号冷却 #${id}`,
+    body: `账号: ${label}\n影响: 清除 cooldown 与 last_error，不修改 status。`,
+    confirmText: `reset cooldown ${id}`,
+    danger: false,
+  })
+  if (!ok) return
   await withBtnLoading(btn, async () => {
     try {
       await apiJson('POST', `/api/admin/accounts/${encodeURIComponent(id)}/reset-cooldown`)
@@ -3220,7 +3304,12 @@ async function openEditAccountModal(id) {
 }
 
 async function deleteAccount(id, label, btn) {
-  if (!confirm(`确认删除账号 #${id} (${label})?\n此操作不可恢复;若有运行中容器仍在用此账号会失败。`)) return
+  const ok = await typedConfirm({
+    title: `删除账号 #${id}`,
+    body: `账号: ${label}\n影响: 不可恢复；若有运行中容器仍在使用该账号，后端会拒绝。`,
+    confirmText: `delete ${id}`,
+  })
+  if (!ok) return
   await withBtnLoading(btn, async () => {
     try {
       await apiJson('DELETE', `/api/admin/accounts/${encodeURIComponent(id)}`)
@@ -3428,7 +3517,12 @@ async function openEditEgressProxyModal(id) {
 async function deleteEgressProxy(id, label, btn) {
   // 0055: 被绑账号 → 后端 409 PROXY_IN_USE,admin 必须先迁。前端不预查 count,
   // 直接发请求让后端权威判定;失败 toast 把 issues.bound_account_count 透出。
-  if (!confirm(`确认删除代理 "${label}"?\n\n注: 若仍有账号绑定该代理,后端会拒绝;请先在"账号"页把绑定的账号改到其他代理。`)) return
+  const ok = await typedConfirm({
+    title: `删除代理 ${label}`,
+    body: `若仍有账号绑定该代理，后端会拒绝；请先在「账号」页把绑定账号迁到其他代理。`,
+    confirmText: `delete proxy ${id}`,
+  })
+  if (!ok) return
   await withBtnLoading(btn, async () => {
     try {
       await apiJson('DELETE', `/api/admin/egress-proxies/${encodeURIComponent(id)}`, null)
@@ -3625,7 +3719,7 @@ function _renderContainersTable() {
     b.addEventListener('click', () => openContainerLogsModal(b.dataset.id, b.dataset.label))
   }
   for (const b of el.querySelectorAll('button[data-act="ct-action"]')) {
-    b.addEventListener('click', (ev) => containerAction(b.dataset.id, b.dataset.action, ev.currentTarget))
+    b.addEventListener('click', (ev) => containerAction(b.dataset.id, b.dataset.action, ev.currentTarget, b.dataset.label || ''))
   }
   // 链跳:虚机列 → hosts tab + focus
   for (const a of el.querySelectorAll('a[data-nav]')) {
@@ -3684,14 +3778,19 @@ function _renderContainerRow(c) {
       <td class="mono">${fmtRelative(c.last_stopped_at)}</td>
       <td class="actions">
         <button data-act="ct-logs" data-id="${idStr}" data-label="${escapeHtml(label)}">日志</button>
-        <button data-act="ct-action" data-action="restart" data-id="${idStr}">重启</button>
-        <button data-act="ct-action" data-action="stop" data-id="${idStr}">停止</button>
+        <button data-act="ct-action" data-action="restart" data-id="${idStr}" data-label="${escapeHtml(label)}">重启</button>
+        <button data-act="ct-action" data-action="stop" data-id="${idStr}" data-label="${escapeHtml(label)}">停止</button>
       </td>
     </tr>`
 }
 
-async function containerAction(id, action, btn) {
-  if (!confirm(`确定 ${action} 容器 #${id}?`)) return
+async function containerAction(id, action, btn, label = '') {
+  const ok = await typedConfirm({
+    title: `${action === 'restart' ? '重启' : '停止'}容器 #${id}`,
+    body: `对象: ${label || `#${id}`}\n影响: 当前用户正在运行的任务可能中断，环境会在下次访问时恢复或重建。`,
+    confirmText: `${action} ${id}`,
+  })
+  if (!ok) return
   await withBtnLoading(btn, async () => {
     try {
       await apiJson('POST', `/api/admin/agent-containers/${encodeURIComponent(id)}/${action}`)
@@ -5146,7 +5245,12 @@ async function _loadInboxList() {
   for (const b of view().querySelectorAll('button[data-act="del-inbox"]')) {
     b.addEventListener('click', async (ev) => {
       const id = b.dataset.id
-      if (!confirm(`确认删除站内信 #${id}?所有用户的已读记录会一起清除。`)) return
+      const ok = await typedConfirm({
+        title: `删除站内信 #${id}`,
+        body: '所有用户的已读记录会一起清除；此操作不可恢复。',
+        confirmText: `delete inbox ${id}`,
+      })
+      if (!ok) return
       try {
         await withBtnLoading(ev.currentTarget, () =>
           apiJson('DELETE', `/api/admin/messages/${encodeURIComponent(id)}`, null))
@@ -5818,11 +5922,35 @@ function _histogramByLabel(metrics, baseName, labelName) {
   return out
 }
 
+function _renderDiagnosticsSummary(d) {
+  if (!d) return '<div class="notice warn">/api/admin/diagnostics 加载失败；metrics 仍可查看。</div>'
+  const version = d.server?.version || {}
+  const db = d.db || {}
+  const alerts = d.alerts || {}
+  const accountPool = d.account_pool || {}
+  return `
+    <div class="panel">
+      <h2>运维排障快照 <small>来自 /api/admin/diagnostics</small></h2>
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px;">
+        ${_kpiCard('版本', escapeHtml(version.tag || 'unknown'), `commit ${escapeHtml(version.commit || '—')} · built ${escapeHtml(version.builtAt || '—')}`)}
+        ${_kpiCard('DB Pool', `${escapeHtml(db.pool_idle ?? '—')} idle / ${escapeHtml(db.pool_total ?? '—')} total`, `waiting ${escapeHtml(db.pool_waiting ?? '—')}`)}
+        ${_kpiCard('告警', `${escapeHtml(alerts.open ?? alerts.firing ?? '—')}`, '当前待处理 / firing')}
+        ${_kpiCard('账号池', `${escapeHtml(accountPool.active ?? accountPool.total_active ?? '—')}`, `busy ${escapeHtml(accountPool.busy ?? '—')} · cooldown ${escapeHtml(accountPool.cooldown ?? '—')}`)}
+      </div>
+      <details style="margin-top:12px;"><summary>查看原始 diagnostics JSON</summary><pre class="raw-metrics">${escapeHtml(JSON.stringify(d, null, 2))}</pre></details>
+    </div>
+  `
+}
+
 async function renderHealthTab() {
   view().innerHTML = `<div class="loading">正在抓取 /api/admin/metrics …</div>`
   let text
+  let diagnostics = null
   try {
-    text = await apiText('/api/admin/metrics')
+    ;[text, diagnostics] = await Promise.all([
+      apiText('/api/admin/metrics'),
+      apiGet('/api/admin/diagnostics').catch(() => null),
+    ])
   } catch (e) {
     showError(`拉取 metrics 失败: ${e.message}`, e)
     return
@@ -5868,6 +5996,8 @@ async function renderHealthTab() {
   const fmtKB = (bytes) => bytes > 0 ? `${(bytes / 1024).toFixed(1)} KB` : '—'
 
   view().innerHTML = `
+    ${_renderDiagnosticsSummary(diagnostics)}
+
     <div class="panel">
       <h2>健康面板 <small>聚合自 /api/admin/metrics · 实时快照,刷新看变化</small></h2>
       <div class="toolbar">
@@ -6361,7 +6491,12 @@ async function _handleChannelAction(act, id, btn) {
       toast('测试已入队,数秒后检查微信 / outbox')
       setTimeout(_refreshAlertOutbox, 3000)
     } else if (act === 'delete') {
-      if (!confirm(`确认删除通道 #${id}?此操作会立刻停止发送,但历史 outbox 会保留。`)) return
+      const ok = await typedConfirm({
+        title: `删除告警通道 #${id}`,
+        body: '此操作会立刻停止发送；历史 outbox 会保留。',
+        confirmText: `delete channel ${id}`,
+      })
+      if (!ok) return
       await withBtnLoading(btn, () => apiJson('DELETE', `/api/admin/alerts/channels/${id}`, null))
       toast('已删除')
       _refreshAlertChannels()
@@ -6832,7 +6967,13 @@ function _renderSilenceRow(s) {
 }
 
 async function _deleteSilence(id, btn) {
-  if (!confirm(`撤销静默 #${id}?被它压制的事件会立即恢复告警。`)) return
+  const ok = await typedConfirm({
+    title: `撤销静默 #${id}`,
+    body: '被它压制的事件会立即恢复告警。',
+    confirmText: `delete silence ${id}`,
+    danger: false,
+  })
+  if (!ok) return
   try {
     await withBtnLoading(btn, () => apiJson('DELETE', `/api/admin/alerts/silences/${id}`, null))
     toast('已撤销')
@@ -7269,6 +7410,9 @@ function _renderHostsTable() {
   for (const b of el.querySelectorAll('button[data-act="h-log"]')) {
     b.addEventListener('click', () => openBootstrapLogModal(b.dataset.id, b.dataset.name))
   }
+  for (const b of el.querySelectorAll('button[data-act="h-diag"]')) {
+    b.addEventListener('click', () => openHostDiagnosticModal(b.dataset.id, b.dataset.name))
+  }
   for (const b of el.querySelectorAll('button[data-act="h-drain"]')) {
     b.addEventListener('click', (ev) => drainHost(b.dataset.id, b.dataset.name, ev.currentTarget))
   }
@@ -7324,6 +7468,7 @@ function _renderHostRow(h) {
   const idAttr = escapeHtml(h.id)
   const btns = []
   btns.push(`<button data-act="h-log" data-id="${idAttr}" data-name="${nameAttr}">日志</button>`)
+  btns.push(`<button data-act="h-diag" data-id="${idAttr}" data-name="${nameAttr}">诊断</button>`)
   if (canClearQ) btns.push(`<button data-act="h-clearq" data-id="${idAttr}" data-name="${nameAttr}">解除隔离</button>`)
   if (canDrain) btns.push(`<button data-act="h-drain" data-id="${idAttr}" data-name="${nameAttr}">排空</button>`)
   if (canRemove) btns.push(`<button data-act="h-remove" data-id="${idAttr}" data-name="${nameAttr}" style="color:var(--danger)">删除</button>`)
@@ -7509,6 +7654,64 @@ function openBootstrapLogModal(hostId, name) {
   _bootstrapLogTimer = setInterval(tick, 3000)
 }
 
+// ─── Hosts: diagnostic modal ────────────────────────────────────────
+
+async function openHostDiagnosticModal(hostId, name) {
+  openModal(`
+    <h3>Host 诊断 · ${escapeHtml(name)}</h3>
+    <div id="hd-body"><div class="loading">加载中…</div></div>
+    <div class="form-actions">
+      <button id="hd-close">关闭</button>
+    </div>
+  `)
+  $('hd-close')?.addEventListener('click', closeModal)
+  let data
+  try {
+    data = await apiGet(`/api/admin/v3/compute-hosts/${encodeURIComponent(hostId)}/diagnostic?limit=80`)
+  } catch (e) {
+    if ($('hd-body')) $('hd-body').innerHTML = `<div class="error">读取失败: ${escapeHtml(e.message)}</div>`
+    return
+  }
+  if (!$('hd-body')) return
+  const h = data?.host || {}
+  const pool = data?.pool || {}
+  const audit = Array.isArray(data?.audit) ? data.audit : []
+  const gate = h.placement_gate_open === true ? 'open' : h.placement_gate_open === false ? 'closed' : 'unknown'
+  const auditRows = audit.slice(0, 20).map((a) => {
+    const details = JSON.stringify(a.details ?? a.after ?? a.before ?? {}, null, 0)
+    return `
+      <tr>
+        <td class="mono">${escapeHtml(a.created_at || a.createdAt || '')}</td>
+        <td>${escapeHtml(a.action || a.event || '')}</td>
+        <td class="mono">${escapeHtml(details.slice(0, 500))}</td>
+      </tr>
+    `
+  }).join('') || '<tr><td colspan="3" style="color:var(--muted)">暂无 audit</td></tr>'
+  $('hd-body').innerHTML = `
+    <div class="grid2" style="gap:10px;margin-bottom:12px">
+      <div class="panel" style="padding:10px">
+        <div class="muted">调度状态</div>
+        <div style="font-size:18px;margin-top:4px">${_hostStatusBadge(h.status || 'unknown')} <span class="chip ${gate === 'open' ? 'chip-ok' : gate === 'closed' ? 'chip-warn' : 'chip-muted'}">gate ${escapeHtml(gate)}</span></div>
+        <div class="mono" style="margin-top:8px;font-size:12px">${escapeHtml(h.id || hostId)}</div>
+      </div>
+      <div class="panel" style="padding:10px">
+        <div class="muted">运行镜像</div>
+        <div class="mono" style="font-size:12px;margin-top:6px">desired: ${escapeHtml(pool.desiredImageId || h.desired_image_id || '—')}</div>
+        <div class="mono" style="font-size:12px;margin-top:4px">loaded: ${escapeHtml(h.loaded_image_id || '—')}</div>
+      </div>
+    </div>
+    <div class="muted" style="margin:8px 0">最近 host audit（最多 20 条）</div>
+    <table class="data">
+      <thead><tr><th>时间</th><th>事件</th><th>详情</th></tr></thead>
+      <tbody>${auditRows}</tbody>
+    </table>
+    <details style="margin-top:12px">
+      <summary>原始诊断 JSON</summary>
+      <pre style="max-height:320px;overflow:auto;background:var(--panel-2);padding:10px;border-radius:6px;white-space:pre-wrap;word-break:break-word">${escapeHtml(JSON.stringify(data, null, 2))}</pre>
+    </details>
+  `
+}
+
 // ─── Hosts: 0041 set expires_at modal ────────────────────────────────
 
 function openSetExpiresModal(hostId, name, currentIso) {
@@ -7556,7 +7759,12 @@ function openSetExpiresModal(hostId, name, currentIso) {
 // ─── Hosts: drain / remove / clearQuarantine ─────────────────────────
 
 async function drainHost(id, name, btn) {
-  if (!window.confirm(`排空虚机 ${name}?新容器不会再调度到它,但已有容器继续跑。`)) return
+  const ok = await typedConfirm({
+    title: `排空虚机 ${name}`,
+    body: `Host: ${name}\n影响: 新容器不会再调度到它，已有容器继续运行。`,
+    confirmText: `drain ${name}`,
+  })
+  if (!ok) return
   await withBtnLoading(btn, async () => {
     try {
       await apiJson('POST', `/api/admin/v3/compute-hosts/${encodeURIComponent(id)}/drain`, {})
@@ -7569,7 +7777,12 @@ async function drainHost(id, name, btn) {
 }
 
 async function removeHost(id, name, btn) {
-  if (!window.confirm(`从虚机池删除 ${name}?要求 draining + active=0,不可逆。`)) return
+  const ok = await typedConfirm({
+    title: `删除虚机 ${name}`,
+    body: `Host: ${name}\n要求: draining 且 active=0。\n影响: 不可逆，删除后不能再调度到该虚机。`,
+    confirmText: `remove ${name}`,
+  })
+  if (!ok) return
   await withBtnLoading(btn, async () => {
     try {
       await apiJson('POST', `/api/admin/v3/compute-hosts/${encodeURIComponent(id)}/remove`, {})
@@ -7582,7 +7795,13 @@ async function removeHost(id, name, btn) {
 }
 
 async function clearHostQuarantine(id, name, btn) {
-  if (!window.confirm(`解除 ${name} 的隔离状态?之后新容器可能调度到它。`)) return
+  const ok = await typedConfirm({
+    title: `解除隔离 ${name}`,
+    body: `Host: ${name}\n影响: 之后新容器可能重新调度到它。请确认故障已恢复。`,
+    confirmText: `clear ${name}`,
+    danger: false,
+  })
+  if (!ok) return
   await withBtnLoading(btn, async () => {
     try {
       await apiJson('POST', `/api/admin/v3/compute-hosts/${encodeURIComponent(id)}/quarantine-clear`, {})

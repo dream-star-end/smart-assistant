@@ -20,7 +20,7 @@ const MAX_MESSAGE_TEXT_CHARS = 12_000
 
 interface PublicWechatLiveMessage {
   id: string
-  role: 'user' | 'assistant' | 'thinking' | 'tool' | 'event'
+  role: 'user' | 'assistant' | 'thinking' | 'event'
   text: string
   ts?: number
   toolName?: string
@@ -147,21 +147,44 @@ function sanitizeMessages(messages: unknown[]): PublicWechatLiveMessage[] {
   return messages.slice(-MAX_MESSAGES).map((message, idx) => {
     const obj = isObj(message) ? message : {}
     const id = typeof obj.id === 'string' && obj.id ? obj.id : `m-${idx}`
+    const normalizedRole = normalizeRole(obj.role ?? obj.type)
+    const redact = normalizedRole === 'event' || hasToolPayload(message)
+    const role = redact ? 'event' : normalizedRole
     return {
       id,
-      role: normalizeRole(obj.role ?? obj.type),
-      text: truncate(extractText(message)),
+      role,
+      text: truncate(redact ? '工具调用细节已隐藏（请回到 OpenClaude 查看完整过程）。' : extractText(message)),
       ...extractTs(obj),
-      ...extractToolName(obj),
+      ...(redact ? extractToolName(obj) : {}),
     }
   })
 }
 
 function normalizeRole(role: unknown): PublicWechatLiveMessage['role'] {
-  if (role === 'user' || role === 'assistant' || role === 'thinking' || role === 'tool') {
+  if (role === 'user' || role === 'assistant' || role === 'thinking') {
     return role
   }
   return 'event'
+}
+
+function hasToolPayload(message: unknown): boolean {
+  if (!isObj(message)) return false
+  const role = String(message.role ?? message.type ?? '').toLowerCase()
+  if (role.includes('tool')) return true
+  for (const key of ['tool_calls', 'toolCalls', 'tool_call', 'toolCall', 'tool_result', 'toolResult', 'tool_use_id', 'toolUseId']) {
+    if (message[key] !== undefined) return true
+  }
+  if (message.input !== undefined || message.output !== undefined) return true
+  const content = message.content
+  if (Array.isArray(content)) {
+    return content.some((part) => {
+      if (!isObj(part)) return false
+      const partKind = String(part.role ?? part.type ?? part.kind ?? '').toLowerCase()
+      if (partKind.includes('tool')) return true
+      return part.input !== undefined || part.output !== undefined || part.tool_calls !== undefined || part.toolCalls !== undefined
+    })
+  }
+  return false
 }
 
 function extractText(message: unknown): string {
@@ -176,15 +199,13 @@ function extractText(message: unknown): string {
         if (!isObj(part)) return ''
         if (typeof part.text === 'string') return part.text
         if (typeof part.content === 'string') return part.content
-        if (typeof part.input === 'string') return part.input
-        if (typeof part.output === 'string') return part.output
         return ''
       })
       .filter(Boolean)
     if (parts.length > 0) return parts.join('\n')
   }
   if (typeof message.summary === 'string') return message.summary
-  return JSON.stringify(message)
+  return '消息内容暂无法预览，请回到 OpenClaude 查看完整过程。'
 }
 
 function extractTs(obj: Record<string, unknown>): { ts?: number } {
@@ -221,7 +242,7 @@ function renderWechatLivePage(nonce: string): string {
     .actions{display:flex;gap:8px;margin-top:10px}.actions a{display:none;padding:7px 10px;border:1px solid #d7dae2;border-radius:8px;color:#1f4f8f;text-decoration:none;background:#fff;font-size:13px}
     .msg{margin:10px 0;padding:11px 12px;border:1px solid #e1e4ea;border-radius:10px;background:#fff;box-shadow:0 1px 2px rgba(10,20,40,.04)}
     .role{font-size:12px;color:#697180;margin-bottom:6px}.text{white-space:pre-wrap;word-break:break-word;font-size:14px;line-height:1.58}
-    .thinking{background:#fffaf0;border-color:#eadfc7}.tool{background:#f3f7ff;border-color:#d8e4fb}.assistant{background:#fff}.user{background:#f7fff9;border-color:#d8eadc}
+    .thinking{background:#fffaf0;border-color:#eadfc7}.event{background:#f3f7ff;border-color:#d8e4fb}.assistant{background:#fff}.user{background:#f7fff9;border-color:#d8eadc}
     .empty,.error{padding:18px 12px;border:1px dashed #ccd2dd;border-radius:10px;color:#697180;background:#fff;text-align:center}.error{color:#9a3412;border-color:#fed7aa;background:#fff7ed}
   </style>
 </head>
@@ -241,7 +262,7 @@ function renderWechatLivePage(nonce: string): string {
     const list = document.getElementById('list');
     const full = document.getElementById('full');
     let since = '';
-    function label(role){return role === 'user' ? '你' : role === 'assistant' ? '助手' : role === 'thinking' ? '思考' : role === 'tool' ? '工具' : '事件'}
+    function label(role){return role === 'user' ? '你' : role === 'assistant' ? '助手' : role === 'thinking' ? '思考' : '事件'}
     function setState(text){state.textContent = text}
     function render(messages){
       list.textContent = '';

@@ -42,6 +42,7 @@ import { state } from './state.js?v=4642b238'
 const POLL_INTERVAL_MS = 3000
 const POLL_MAX_FAILURES = 5
 const SUCCESS_AUTOCLOSE_MS = 2000
+const SLOW_POLL_INTERVAL_MS = 15000
 // sessionStorage key,手机 H5 支付路径上把订单状态持久化 —— location.href 同 tab
 // 跨站导航会卸载 JS context,原来 in-memory 的 _activeOrderNo / setInterval 不可指望。
 // 用户从微信/虎皮椒 H5 返回时,本模块 initBilling 会检查此 key 并恢复 qr stage + 轮询。
@@ -309,6 +310,16 @@ function _escape(s) {
   ))
 }
 
+function _friendlyPaymentError(err) {
+  const code = err?.code || err?.error?.code
+  const req = err?.requestId ? `（请求 ${_escape(err.requestId)}）` : ''
+  if (code === 'FIRST_TOPUP_USED') return `首充优惠已使用，请选择其他套餐${req}`
+  if (code === 'PLAN_NOT_FOUND') return `套餐不存在或已下架，请返回重新选择${req}`
+  if (code === 'PAYMENT_NOT_READY') return `支付通道暂不可用，请稍后重试或联系管理员${req}`
+  if (code && /^UPSTREAM|HUPI|PAYMENT_/i.test(code)) return `支付通道暂时异常，请稍后重试${req}`
+  return `${err?.message || err || '未知错误'}${req}`
+}
+
 // ── 创建订单 + 进入 QR stage ────────────────────────────────────────
 
 async function _onPlanSelected(plan) {
@@ -324,7 +335,7 @@ async function _onPlanSelected(plan) {
   try {
     resp = await apiJson('POST', '/api/payment/hupi/create', { plan_code: plan.code })
   } catch (err) {
-    if (statusEl) statusEl.textContent = '创建订单失败: ' + (err?.message || err)
+    if (statusEl) statusEl.textContent = '创建订单失败: ' + _friendlyPaymentError(err)
     return
   }
   const data = resp?.data
@@ -466,9 +477,19 @@ function _setPollStatus(msg) {
   if (el) el.textContent = msg
 }
 
+function _setPollStatusHtml(html) {
+  const el = $('topup-qr-status')
+  if (el) el.innerHTML = html
+}
+
 function _startPolling(orderNo) {
   _stopPolling()
   _pollTimer = setInterval(() => _pollOnce(orderNo), POLL_INTERVAL_MS)
+}
+
+function _startSlowPolling(orderNo) {
+  _stopPolling()
+  _pollTimer = setInterval(() => _pollOnce(orderNo), SLOW_POLL_INTERVAL_MS)
 }
 
 function _stopPolling() {
@@ -502,15 +523,28 @@ async function _pollOnce(orderNo) {
       // 清 _activeOrderNo 后,visibilitychange/initBilling 不会再把这个终态订单
       // 重新捞回来反复查(codex review MINOR: 原代码只 stopPolling,下次切回 tab 又触发)。
       _activeOrderNo = null
-      _setPollStatus(`订单${status === 'expired' ? '已过期' : status === 'canceled' ? '已取消' : '已退款'},请返回重新选择套餐`)
+      _setPollStatusHtml(
+        `订单${status === 'expired' ? '已过期' : status === 'canceled' ? '已取消' : '已退款'}，请返回重新选择套餐。` +
+        `<br><span class="muted">如果微信/支付宝已扣款，请复制订单号 <code>${_escape(orderNo)}</code> 联系客服核对。</span>`,
+      )
       return
     }
     // pending — 继续等
   } catch (err) {
     _pollFailures += 1
     if (_pollFailures >= POLL_MAX_FAILURES) {
-      _stopPolling()
-      _setPollStatus('查询订单失败次数过多,请稍后手动刷新')
+      _startSlowPolling(orderNo)
+      _setPollStatusHtml(
+        `查询订单暂时失败，已改为慢速重试。订单号 <code>${_escape(orderNo)}</code>` +
+        ` <button type="button" id="topup-retry-poll-btn" class="btn btn-secondary btn-sm">重新查询</button>` +
+        `<br><span class="muted">如果已付款但未到账，请复制订单号联系客服。</span>`,
+      )
+      document.getElementById('topup-retry-poll-btn')?.addEventListener('click', () => {
+        _pollFailures = 0
+        _setPollStatus('正在重新查询订单状态…')
+        _pollOnce(orderNo).catch(() => {})
+        _startPolling(orderNo)
+      })
     }
   }
 }
@@ -523,6 +557,11 @@ function _onOrderPaid(orderData) {
     el.innerHTML = `支付成功!积分已增加 <strong>${_escape(got)}</strong>`
   }
   refreshBalance().catch(() => {})
+  try {
+    window.dispatchEvent(new CustomEvent('openclaude:billing-paid', {
+      detail: { orderNo: orderData.order_no || orderData.orderNo || '' },
+    }))
+  } catch {}
   // 订单已终态(paid)—— 清 _activeOrderNo 避免 visibilitychange/pageshow
   // 在 autoclose 的 2s 窗口内再次触发 _pollOnce 重复查询已支付订单
   // (codex review MINOR: 原代码只 stopPolling,下次切回 tab 又拉一次)。
@@ -539,11 +578,12 @@ function _onOrderPaid(orderData) {
 // ── 模态打开 / 关闭 ─────────────────────────────────────────────────
 
 // P1-3: 也由 messages.js 的 outbound.error CTA 调用,export 出去。
-export function _openTopupModal() {
-  if (!_commercialMode) {
+export function _openTopupModal(opts = {}) {
+  if (!_commercialMode && !opts.force) {
     toast('充值功能未启用', 'error')
     return
   }
+  if (opts.force && _commercialMode !== true) _commercialMode = true
   _activeOrderNo = null
   _setStage('plans')
   openModal('topup-modal')

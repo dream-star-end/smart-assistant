@@ -1264,6 +1264,10 @@ function send() {
     toast('附件还在上传中，请稍候', 'warning')
     return
   }
+  if (state.attachments.some((a) => a._uploadFailed)) {
+    toast('有附件上传失败，请先重试或移除', 'warning')
+    return
+  }
   const sess = getSession()
   if (!sess) return
   const teamForSend = getSelectedTeamForSend()
@@ -1775,6 +1779,7 @@ function _syncPath(target, { replace = false } = {}) {
 
 function showLogin() {
   _syncPath('/login')
+  if ($('boot-restore')) $('boot-restore').hidden = true
   // Close landing-only modals (contact) — view 切换时 modal-backdrop 仍是顶层
   // fixed,不随 landing-view hidden 消失,会卡在新 view 上面。无脑调安全(closeModal
   // 内部 short-circuit 已关闭的 modal)。
@@ -1873,6 +1878,7 @@ async function showApp() {
   // going back from a logged-in session should land on wherever the user
   // came from (landing), not on a login form they no longer need.
   _syncPath('/', { replace: true })
+  if ($('boot-restore')) $('boot-restore').hidden = true
   // 关闭 landing-only modals(同 showLogin 里的注释)。
   closeModal('contact-modal')
   $('login-view').hidden = true
@@ -2011,6 +2017,7 @@ function showLanding() {
     return
   }
   _syncPath('/')
+  if ($('boot-restore')) $('boot-restore').hidden = true
   $('landing-view').hidden = false
   $('login-view').hidden = true
   $('app-view').hidden = true
@@ -2024,6 +2031,16 @@ function showLanding() {
   } catch {
     window.scrollTo(0, 0)
   }
+}
+
+function showBootRestore() {
+  const el = $('boot-restore')
+  if (!el) return
+  el.hidden = false
+  $('landing-view') && ($('landing-view').hidden = true)
+  $('login-view').hidden = true
+  $('app-view').hidden = true
+  document.body.classList.remove('body-landing')
 }
 function _wireLandingButtons() {
   const lv = $('landing-view')
@@ -2730,6 +2747,48 @@ async function runPostLoginPipeline({ accessToken, accessExp, remember }) {
   return mintOk
 }
 
+async function runExistingSessionBootPipeline() {
+  resetAuthExpired()
+  state.refreshToken = ''
+  try {
+    localStorage.removeItem('openclaude_refresh_token')
+    localStorage.removeItem('openclaude_token')
+  } catch {}
+  // V3 file-proxy:冷启动只有 HttpOnly refresh cookie 或 sessionStorage access
+  // 时,oc_session cookie 可能不存在。这里是"同一浏览器会话恢复",不能走
+  // runPostLoginPipeline 的清 IDB 逻辑,否则会删掉未同步/离线本地历史。
+  await mintSessionCookie(state.token, state.authEpoch || 0)
+  scheduleProactiveRefresh()
+  await loadUserPrefs(true)
+  await showApp()
+  renderSidebar()
+  renderMessages()
+  restoreCurrentSessionInFlightUI()
+  refreshGithubPill(state.currentSessionId)
+  connect()
+  void reloadAgents().then(() => reloadAgentTeams())
+  loadChangelog()
+  refreshBalance()
+    .then((r) => {
+      if (r?.shown) startInbox()
+      else stopInbox()
+      maybeShowWelcomeModal()
+    })
+    .catch(() => {})
+  syncSessionsFromServer()
+    .then((result) => {
+      const { currentChanged } = _selectSessionAfterServerSync()
+      if (currentChanged) renderMessages()
+      else if (result?.needsRenderMessages) renderMessages()
+      if (currentChanged || result?.needsRenderMessages) {
+        restoreCurrentSessionInFlightUI()
+      }
+      renderSidebar()
+      refreshGithubPill(state.currentSessionId)
+    })
+    .catch(() => {})
+}
+
 // ═══════════════════════════════════════════════════════════
 // 5. init() -- THE application bootstrap
 // ═══════════════════════════════════════════════════════════
@@ -3246,74 +3305,15 @@ async function init() {
         return
       }
     }
-    // V3 file-proxy:冷启动 state.token 从 localStorage 恢复,但 oc_session cookie
-    // 可能已过期(或跨浏览器清理),renderMessages 里 <img src="/api/file?..."> 会
-    // 因没 cookie 被 firewall 403。await mint —— 小概率 renderMessages 会立刻用到
-    // 图片 src,先把 cookie 种上再展示,避免首次 paint 里的 403 闪红。
-    // 传 state.authEpoch 做 self-heal:冷启动瞬间 epoch 一般不会变,兜底处理。
-    await mintSessionCookie(state.token, state.authEpoch || 0)
-    // 启动后台 timer:access token 到期前 2min 主动续期,只要 tab 活着就不掉线。
-    scheduleProactiveRefresh()
-    // 2026-04-26 v1.0.4 — 冷启动 prefetch 用户偏好(同登录路径)。必须在 connect()
-    // 之前完成,sendMessage 才能把 default_model 塞进首帧。失败兜底见 loadUserPrefs。
-    await loadUserPrefs(true)
-    // Await so the HttpOnly session cookie is in place before any
-    // <img>/<audio>/<video> tags get their src set by renderMessages.
-    await showApp()
-    renderSidebar()
-    renderMessages()
-    // Restore in-flight UI for the selected session before ws connects.
-    // sanitizeLoadedTurnState() above already cleared stale flags; anything
-    // surviving here is a turn interrupted within the freshness window.
-    // Without this, users would see a blank window until ws.onopen fires
-    // (websocket.js:423 only restores state for the then-current session).
-    restoreCurrentSessionInFlightUI()
-    // 2026-05-07 v1.0.94 — 冷启动同步当前会话的 GitHub repo pill / banner。
-    // sessions.js 的 selectSession 只在用户点击侧栏切会话时调用 refreshGithubPill,
-    // 浏览器刷新没有那次点击 → 之前 pill 永远空。调一次让 pill 反映当前 session
-    // 在 server 上的真实 selection。sid 为空时 refreshGithubPill 内部会清空 pill。
-    refreshGithubPill(state.currentSessionId)
-    connect()
-    void reloadAgents().then(() => reloadAgentTeams())
-    loadChangelog()
-    refreshBalance()
-      .then((r) => {
-        if (r?.shown) startInbox()
-        else stopInbox()
-        // 冷启动也走一遍欢迎判定。已弹过的 localStorage 标志会拦下重复弹窗。
-        maybeShowWelcomeModal()
-      })
-      .catch(() => {})
-    // Cross-device sync: pull sessions from server in background
-    syncSessionsFromServer()
-      .then((result) => {
-        // Re-render if sessions changed (added or removed) or current session was updated
-        const { currentChanged } = _selectSessionAfterServerSync()
-        if (currentChanged) renderMessages()
-        else if (result?.needsRenderMessages) renderMessages()
-        // Sync the typing indicator / title-busy state if the current session
-        // was swapped or re-fetched (sync may have replaced the session object
-        // with a fresh one whose persisted turn-state differs from what the
-        // UI is showing). This is the sync-path counterpart to the initial
-        // boot-time restore above.
-        if (currentChanged || result?.needsRenderMessages) {
-          restoreCurrentSessionInFlightUI()
-        }
-        renderSidebar()
-        // 2026-05-08 v1.0.94 — 冷启动 server sync 也补一次 refreshGithubPill。
-        // 跨设备场景:tab A 选了仓库,tab B 冷启动 IDB 里没有这条 selection,
-        // server sync 后 currentSessionId 换到 A,但 init() 早调过的
-        // refreshGithubPill 用的是 IDB 旧 sid → pill 仍是空。无条件刷一次。
-        // GET 成本低,与 login 路径(runPostLoginPipeline)语义对齐。
-        refreshGithubPill(state.currentSessionId)
-      })
-      .catch(() => {})
+    await runExistingSessionBootPipeline()
   } else {
     // Cold visitor (no token):
     //  - URL-driven flows (?verify_email / ?reset_password / explicit ?login=1)
     //    skip landing and jump straight into the auth view.
     //  - Pathname `/login` (shareable URL 2026-04-21+) also forces the auth view.
-    //  - Otherwise show the marketing landing page; user clicks CTA → login-view.
+    //  - Otherwise first try HttpOnly refresh-cookie resume. Since access JWT is
+    //    no longer persisted in localStorage, a remembered browser session may
+    //    legitimately have no JS-readable token at cold start.
     const sp = new URLSearchParams(window.location.search)
     const goStraightToAuth =
       window.location.pathname === '/login' ||
@@ -3322,10 +3322,23 @@ async function init() {
       sp.has('login') ||
       sp.has('register') ||
       sp.has('signin') ||
-      sp.has('signup') ||
-      sp.has('session') ||
-      sp.has('sid')
-    if (goStraightToAuth) {
+      sp.has('signup')
+    const sessionDeepLink = sp.has('session') || sp.has('sid')
+    if (!goStraightToAuth) {
+      let resumed = false
+      showBootRestore()
+      try {
+        resumed = await silentRefresh({ skipSessionCookieMint: true })
+      } catch {
+        resumed = false
+      }
+      if (resumed && state.token) {
+        await runExistingSessionBootPipeline()
+      } else {
+        if (sessionDeepLink) showLogin()
+        else showLanding()
+      }
+    } else {
       showLogin()
       if (sp.has('register') || sp.has('signup')) {
         try {
@@ -3361,8 +3374,6 @@ async function init() {
           window.history.replaceState({}, '', cleanUrl.toString())
         } catch {}
       }
-    } else {
-      showLanding()
     }
   }
 

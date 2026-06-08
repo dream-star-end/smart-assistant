@@ -99,6 +99,14 @@ export const CLOSE_BRIDGE = {
   /** V3 Phase 4H+ maintenance_mode=true 时非 admin 的 close code。前端按 retryAfter 重连,
    *  但在维护期内会持续被拒,直到管理员关闭开关。 */
   MAINTENANCE: 4504,
+  /** 同一用户连接数超限踢旧连接。不要用 1008,否则前端会误判为登录过期。 */
+  TOO_MANY_CONNECTIONS: 4505,
+  /** 计费/余额类策略拒绝。 */
+  BILLING_POLICY: 4506,
+  /** 用户可调整的产品策略(如模型未授权),不是 access token 失效。 */
+  PRODUCT_POLICY: 4507,
+  /** GPT/Codex 环境被回收/重建,提示刷新重试。 */
+  ENV_RECYCLED: 4508,
 } as const;
 
 /** 入站 / 出站 帧的最大字节数(单帧)。
@@ -1309,7 +1317,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       opened_at: startedAt,
       close: (reason) => {
         sendErrorFrame(userWs, "ERR_CONN_KICKED", reason);
-        try { userWs.close(CLOSE_BRIDGE.POLICY, "kicked"); } catch { /* */ }
+        try { userWs.close(CLOSE_BRIDGE.TOO_MANY_CONNECTIONS, "too_many_connections"); } catch { /* */ }
       },
     };
     const { unregister } = registry.register(conn);
@@ -1647,7 +1655,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 "UNAUTHORIZED_MODEL",
                 `model not authorized for current user: ${effectiveModel}`,
               );
-              try { userWs.close(CLOSE_BRIDGE.POLICY, "unauthorized_model"); } catch { /* */ }
+              try { userWs.close(CLOSE_BRIDGE.PRODUCT_POLICY, "unauthorized_model"); } catch { /* */ }
               // 策略拒绝 → force final;此前无 codex inflight(本帧才进 acquire 路径),无 drain 价值
               cleanup("client_close", true);
               return;
@@ -1972,7 +1980,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                       "ERR_INSUFFICIENT_CREDITS",
                       `insufficient credits: balance=${err.balance} required=${err.required}`,
                     );
-                    try { userWs.close(CLOSE_BRIDGE.POLICY, "insufficient_credits"); } catch { /* */ }
+                    try { userWs.close(CLOSE_BRIDGE.BILLING_POLICY, "insufficient_credits"); } catch { /* */ }
                   }
                 } else {
                   turnLogCapture?.error("user-chat-bridge: preCheckWithCost failed", { err });
@@ -2167,7 +2175,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                   "CODEX_CONTAINER_RECYCLED",
                   "GPT 账号配置已变更,容器已自动重建,请刷新页面后重发",
                 );
-                try { userWs.close(CLOSE_BRIDGE.POLICY, "codex_container_recycled"); } catch { /* */ }
+                try { userWs.close(CLOSE_BRIDGE.ENV_RECYCLED, "codex_container_recycled"); } catch { /* */ }
               }
             } else if (errName === "CodexRouteUnavailable") {
               turnLogCapture?.info("user-chat-bridge: codex api relay route unavailable");
