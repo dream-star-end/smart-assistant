@@ -3882,6 +3882,11 @@ a:hover {
   color: var(--danger);
   animation: pulse-mic 1.2s infinite;
 }
+.input-btn.polishing {
+  background: color-mix(in srgb, var(--accent) 16%, transparent);
+  color: var(--accent);
+  animation: pulse-mic 1.2s infinite;
+}
 @keyframes pulse-mic {
   0%,
   100% {

@@ -405,6 +405,22 @@ export const commercialConfigSchema = z
      */
     DEEPSEEK_API_KEY: z.string().trim().min(1).max(256).optional(),
     /**
+     * Deepgram Nova-3 streaming ASR key for browser voice input.
+     *
+     * - 只在 master-side `/ws/voice-transcribe` 使用,前端永远不见 key。
+     * - 连接 Deepgram 时通过 `Authorization: Token <DEEPGRAM_API_KEY>` header,
+     *   绝不放 URL query,避免 access log / browser history 泄漏。
+     * - 未配置时语音 WS 返回 VOICE_NOT_CONFIGURED,前端回退浏览器内置
+     *   SpeechRecognition。
+     */
+    DEEPGRAM_API_KEY: z.string().trim().min(1).max(512).optional(),
+    VOICE_ASR_MODEL: z.string().trim().min(1).max(64).optional(),
+    VOICE_ASR_LANGUAGE: z.string().trim().min(2).max(16).optional(),
+    VOICE_POLISH_MODEL: z.string().trim().min(1).max(64).optional(),
+    VOICE_MAX_SECONDS: positiveInt(300),
+    VOICE_MAX_PER_USER: positiveInt(10),
+    VOICE_MAX_GLOBAL: positiveInt(500),
+    /**
      * MiniMax Token Plan 订阅 key(2026-06-02 接入)。
      * - 配置时 anthropicProxy 收到 model=MiniMax-M3 的请求 → forward
      *   到 https://api.minimaxi.com/anthropic/v1/messages,Authorization: Bearer

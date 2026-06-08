@@ -196,6 +196,10 @@ import {
   type CodexBindingHandle,
 } from "./ws/userChatBridge.js";
 import {
+  createVoiceTranscribeHandler,
+  type VoiceTranscribeHandler,
+} from "./ws/voiceTranscribe.js";
+import {
   composeMultiplier,
   getAgentCostMultiplier,
 } from "./billing/agentMultiplier.js";
@@ -2766,6 +2770,22 @@ export async function registerCommercial(
     userChatBridge.broadcastToUser(uid, payload);
   };
 
+  // Browser voice input: MediaRecorder → master WS → Deepgram Nova-3 streaming,
+  // then one-shot DeepSeek V4 Flash context polish after stop.
+  // Master-only commercial path: no runtime image rebuild required.
+  const voiceTranscribeHandler: VoiceTranscribeHandler = createVoiceTranscribeHandler({
+    jwtSecret,
+    deepgramApiKey: cfg.DEEPGRAM_API_KEY,
+    deepseekApiKey: cfg.DEEPSEEK_API_KEY,
+    asrModel: cfg.VOICE_ASR_MODEL,
+    asrLanguage: cfg.VOICE_ASR_LANGUAGE,
+    voicePolishModel: cfg.VOICE_POLISH_MODEL,
+    maxSeconds: cfg.VOICE_MAX_SECONDS,
+    maxPerUser: cfg.VOICE_MAX_PER_USER,
+    maxGlobal: cfg.VOICE_MAX_GLOBAL,
+    logger: rootLogger.child({ subsys: "commercial", module: "voiceTranscribe" }),
+  });
+
   // T-62 告警调度器 —— 默认 60s tick,不在启动时立刻跑(避免冷启动误报)
   let alertScheduler: AlertScheduler | undefined;
   if (process.env.COMMERCIAL_ALERTS_DISABLED !== "1") {
@@ -2855,7 +2875,8 @@ export async function registerCommercial(
   return {
     handle: handler,
     handleWsUpgrade: (req, socket, head) => {
-      // V3: 优先匹配 /ws/user-chat-bridge(2E),其次 /ws/agent(legacy)。
+      // V3: 优先匹配 voice input,再 /ws/user-chat-bridge(2E),其次 /ws/agent(legacy)。
+      if (voiceTranscribeHandler.handleUpgrade(req, socket, head)) return true;
       if (userChatBridge.handleUpgrade(req, socket, head)) return true;
       if (agentWsHandler && agentWsHandler.handleUpgrade(req, socket, head)) return true;
       return false;
@@ -2868,6 +2889,7 @@ export async function registerCommercial(
       if (wechatBroker) {
         try { await wechatBroker.stop(); } catch { /* ignore */ }
       }
+      try { await voiceTranscribeHandler.shutdown(); } catch { /* ignore */ }
       try { await userChatBridge.shutdown(); } catch { /* ignore */ }
       if (agentWsHandler) {
         try { await agentWsHandler.shutdown(); } catch { /* ignore */ }
