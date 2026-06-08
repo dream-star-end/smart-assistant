@@ -17,7 +17,7 @@
 //   - PATCH/DELETE 操作前必须有 confirm 提示
 
 import { _clearStoredAccessToken, state } from './state.js?v=88b3da4b'
-import { apiGet, apiJson, apiText, apiFetch, authHeaders, onAuthExpired } from './api.js?v=88b3da4b'
+import { apiGet, apiJson, apiText, apiFetch, authHeaders, onAuthExpired, silentRefresh } from './api.js?v=88b3da4b'
 import { lineChart, barChart, destroyChart, fmt as cfmt } from './charts.js?v=88b3da4b'
 
 // 与后端 packages/commercial/src/admin/ledger.ts 的 LEDGER_REASONS 枚举严格同步。
@@ -344,8 +344,13 @@ function typedConfirm({ title, body, confirmText, danger = true }) {
 
 async function bootstrap() {
   if (!state.token) {
-    renderGate('未登录')
-    return
+    const root = view()
+    if (root) root.innerHTML = '<div class="loading">正在恢复登录状态…</div>'
+    const refreshed = await silentRefresh()
+    if (!refreshed || !state.token) {
+      renderGate('未登录')
+      return
+    }
   }
   let me
   try {
