@@ -246,17 +246,21 @@ describe('lazy session hydration', () => {
   it('hello peer filter includes current placeholder and active sessions only', () => {
     const buildHelloPeers = new Function(
       'state',
+      'HELLO_PEERS_LIMIT',
       `${extractTopLevelFn(WS_SRC, 'buildHelloPeers')}; return buildHelloPeers;`,
-    )({
-      currentSessionId: 'web-current-placeholder',
-      defaultAgentId: 'main',
-      sessions: new Map([
-        ['web-current-placeholder', { agentId: 'codex', _needsFetch: true }],
-        ['web-inactive-placeholder', { agentId: 'codex', _needsFetch: true }],
-        ['web-active', { agentId: 'main', _sendingInFlight: true }],
-        ['web-cursor', { agentId: 'codex', _lastFrameSeq: 7 }],
-      ]),
-    }) as () => Array<{ peerId: string; lastFrameSeq: number; inFlight: boolean }>
+    )(
+      {
+        currentSessionId: 'web-current-placeholder',
+        defaultAgentId: 'main',
+        sessions: new Map([
+          ['web-current-placeholder', { agentId: 'codex', _needsFetch: true }],
+          ['web-inactive-placeholder', { agentId: 'codex', _needsFetch: true }],
+          ['web-active', { agentId: 'main', _sendingInFlight: true }],
+          ['web-cursor', { agentId: 'codex', _lastFrameSeq: 7 }],
+        ]),
+      },
+      50,
+    ) as () => Array<{ peerId: string; lastFrameSeq: number; inFlight: boolean }>
 
     const peers = buildHelloPeers()
     assert.deepEqual(
