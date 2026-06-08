@@ -345,7 +345,136 @@ function buildPolishPrompt(input: {
   ].join("\n");
 }
 
-async function polishTranscript(input: {
+function buildStreamingPolishPrompt(input: {
+  transcript: string;
+  context: VoiceContextMessage[];
+  keyterms: string[];
+}): string {
+  const context = input.context
+    .map((m) => `${m.role}: ${m.text}`)
+    .join("\n");
+  const terms = input.keyterms.join("、");
+  return [
+    "你是 OpenClaude 的语音输入转写修正器。",
+    "根据最近上下文和术语表，修正语音识别文本里的同音/近音错误、英文大小写、专业术语、数字格式和标点。",
+    "只输出修正后的最终文本本身，不要 JSON、不要 Markdown、不要解释。",
+    "不要改写用户意图，不要扩写，不要总结。",
+    "",
+    `术语表: ${terms || "(无)"}`,
+    "最近上下文:",
+    context || "(无)",
+    "",
+    "语音识别原文:",
+    input.transcript,
+  ].join("\n");
+}
+
+function parseSseDeltaText(block: string): string {
+  const dataLines: string[] = [];
+  for (const line of block.split(/\r?\n/)) {
+    if (line.startsWith("data:")) dataLines.push(line.slice(5).trimStart());
+  }
+  const data = dataLines.join("\n").trim();
+  if (!data || data === "[DONE]") return "";
+  let parsed: unknown;
+  try { parsed = JSON.parse(data); } catch { return ""; }
+  if (!parsed || typeof parsed !== "object") return "";
+  const obj = parsed as Record<string, unknown>;
+  const delta = obj.delta && typeof obj.delta === "object" ? obj.delta as Record<string, unknown> : null;
+  const text = delta && typeof delta.text === "string" ? delta.text : "";
+  return text;
+}
+
+async function polishTranscriptStream(input: {
+  transcript: string;
+  context: VoiceContextMessage[];
+  keyterms: string[];
+  apiKey?: string;
+  model: string;
+  fetchImpl: FetchLike;
+  signal: AbortSignal;
+  onDelta?: (text: string) => void;
+}): Promise<VoicePolishResult | null> {
+  const transcript = input.transcript.trim();
+  if (!transcript || !input.apiKey) return null;
+
+  const body = {
+    model: input.model,
+    max_tokens: 512,
+    temperature: 0,
+    thinking: { type: "disabled" },
+    stream: true,
+    system: "你只输出修正后的最终文本，不输出 JSON、Markdown 或解释。",
+    messages: [
+      { role: "user", content: buildStreamingPolishPrompt(input) },
+    ],
+  };
+
+  let res: Response;
+  try {
+    res = await input.fetchImpl(DEEPSEEK_UPSTREAM_ENDPOINT, {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${input.apiKey}`,
+        "Content-Type": "application/json",
+        "Accept": "text/event-stream",
+      },
+      body: JSON.stringify(body),
+      signal: input.signal,
+    });
+  } catch {
+    return null;
+  }
+  if (!res.ok || !res.body) return null;
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffered = "";
+  let accumulated = "";
+  let lastSent = "";
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffered += decoder.decode(value, { stream: true }).replace(/\r\n/g, "\n");
+      let idx = buffered.indexOf("\n\n");
+      while (idx >= 0) {
+        const block = buffered.slice(0, idx);
+        buffered = buffered.slice(idx + 2);
+        const delta = parseSseDeltaText(block);
+        if (delta) {
+          accumulated += delta;
+          const visible = accumulated.replace(/^\s+/, "");
+          if (visible && visible !== lastSent) {
+            lastSent = visible;
+            input.onDelta?.(visible);
+          }
+        }
+        idx = buffered.indexOf("\n\n");
+      }
+    }
+    const tail = decoder.decode().replace(/\r\n/g, "\n");
+    if (tail) buffered += tail;
+    if (buffered.trim()) {
+      const delta = parseSseDeltaText(buffered);
+      if (delta) accumulated += delta;
+    }
+  } catch {
+    return null;
+  } finally {
+    try { reader.releaseLock(); } catch { /* noop */ }
+  }
+
+  const text = trimOneLine(accumulated);
+  if (!text) return null;
+  return {
+    text: text.slice(0, Math.max(4000, transcript.length * 2)),
+    changed: text !== transcript,
+    confidence: 0.5,
+  };
+}
+
+async function polishTranscriptOnce(input: {
   transcript: string;
   context: VoiceContextMessage[];
   keyterms: string[];
@@ -389,6 +518,21 @@ async function polishTranscript(input: {
   const text = extractContentText(json);
   if (!text) return { text: transcript, changed: false, confidence: 0, skipped: true };
   return parseVoicePolishText(text, transcript);
+}
+
+async function polishTranscript(input: {
+  transcript: string;
+  context: VoiceContextMessage[];
+  keyterms: string[];
+  apiKey?: string;
+  model: string;
+  fetchImpl: FetchLike;
+  signal: AbortSignal;
+  onDelta?: (text: string) => void;
+}): Promise<VoicePolishResult> {
+  const streamed = await polishTranscriptStream(input);
+  if (streamed) return streamed;
+  return polishTranscriptOnce(input);
 }
 
 class ActiveVoiceLimiter {
@@ -498,6 +642,7 @@ export function createVoiceTranscribeHandler(deps: VoiceTranscribeDeps): VoiceTr
         model: deps.voicePolishModel || DEFAULT_POLISH_MODEL,
         fetchImpl,
         signal: polishAbort.signal,
+        onDelta: (text) => sendJson(ws, { type: "polish_delta", text, rawText }),
       }).finally(() => clearTimeout(timeout));
       sendJson(ws, {
         type: "polish",
