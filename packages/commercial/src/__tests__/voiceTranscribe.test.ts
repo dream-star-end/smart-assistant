@@ -49,6 +49,16 @@ function recvJson(ws: WebSocket): Promise<Record<string, unknown>> {
   });
 }
 
+function streamResponse(chunks: string[]): Response {
+  const enc = new TextEncoder();
+  return new Response(new ReadableStream({
+    start(ctrl) {
+      for (const chunk of chunks) ctrl.enqueue(enc.encode(chunk));
+      ctrl.close();
+    },
+  }), { status: 200, headers: { "content-type": "text/event-stream" } });
+}
+
 describe("voiceTranscribe helpers", () => {
   test("sanitizes context and keyterms within bounded budgets", () => {
     const raw = {
@@ -153,5 +163,67 @@ describe("voiceTranscribe websocket", () => {
     assert.equal(url.searchParams.get("keyterm"), "OpenClaude");
     assert.equal(url.searchParams.has("encoding"), false);
     ws.close();
+  });
+
+  test("streams plain polish_delta frames before the final authoritative polish", async () => {
+    class FakeDeepgram extends EventEmitter {
+      readyState: number = WebSocket.CONNECTING;
+      send(data?: unknown) {
+        if (typeof data !== "string" || !data.includes("CloseStream")) return;
+        this.emit("message", JSON.stringify({
+          type: "Results",
+          is_final: true,
+          speech_final: true,
+          start: 0,
+          channel: { alternatives: [{ transcript: "晚上好亚，你在干什么", confidence: 0.87 }] },
+        }));
+        this.close();
+      }
+      close() { this.readyState = WebSocket.CLOSED; this.emit("close"); }
+    }
+
+    const h = createVoiceTranscribeHandler({
+      jwtSecret: SECRET,
+      deepgramApiKey: "dg_secret",
+      deepseekApiKey: "ds_secret",
+      createDeepgramSocket: () => {
+        const fake = new FakeDeepgram();
+        setImmediate(() => { fake.readyState = WebSocket.OPEN; fake.emit("open"); });
+        return fake as unknown as WebSocket;
+      },
+      fetchImpl: async (_url, init) => {
+        const body = JSON.parse(String(init?.body || "{}"));
+        assert.equal(body.stream, true);
+        assert.match(body.system, /不输出 JSON/);
+        return streamResponse([
+          `event: content_block_delta\r\ndata: ${JSON.stringify({ type: "content_block_delta", delta: { type: "text_delta", text: "晚上好呀" } })}\r\n\r\n`,
+          `event: content_block_delta\r\ndata: ${JSON.stringify({ type: "content_block_delta", delta: { type: "text_delta", text: "，你在干什么？" } })}\r\n\r\n`,
+          "event: message_stop\r\ndata: {\"type\":\"message_stop\"}\r\n\r\n",
+        ]);
+      },
+    });
+    const base = await listenWith(h);
+    const ws = new WebSocket(`${base}${VOICE_WS_PATH}`, ["bearer", await makeToken()]);
+    ws.on("open", () => ws.send(JSON.stringify({ type: "start", mimeType: "audio/webm;codecs=opus" })));
+    assert.equal((await recvJson(ws)).type, "ready");
+    const framesP = new Promise<Record<string, unknown>[]>((resolve) => {
+      const frames: Record<string, unknown>[] = [];
+      ws.on("message", (data) => {
+        const msg = JSON.parse(String(data)) as Record<string, unknown>;
+        frames.push(msg);
+        if (msg.type === "polish") resolve(frames);
+      });
+    });
+    ws.send(JSON.stringify({ type: "stop" }));
+
+    const frames = await framesP;
+    const deltas = frames.filter((m) => m.type === "polish_delta");
+    assert.ok(deltas.length >= 1, "expected at least one streaming polish_delta frame");
+    assert.equal(deltas.at(-1)?.text, "晚上好呀，你在干什么？");
+    assert.doesNotMatch(String(deltas.at(-1)?.text), /[{}]/, "polish_delta must not expose JSON fragments");
+    const final = frames.at(-1);
+    assert.equal(final?.type, "polish");
+    assert.equal(final?.text, "晚上好呀，你在干什么？");
+    assert.equal(final?.changed, true);
   });
 });

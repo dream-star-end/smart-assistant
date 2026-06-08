@@ -3848,6 +3848,66 @@ a:hover {
 .composer-input-row textarea::placeholder {
   color: var(--fg-dim);
 }
+.voice-keyboard-btn,
+.voice-hold-btn {
+  display: none;
+}
+.composer-input-row.voice-mode {
+  align-items: center;
+  gap: 8px;
+  padding: 8px;
+}
+.composer-input-row.voice-mode textarea,
+.composer-input-row.voice-mode .composer-actions {
+  display: none;
+}
+.composer-input-row.voice-mode .voice-keyboard-btn,
+.composer-input-row.voice-mode .voice-hold-btn {
+  display: inline-flex;
+}
+.voice-keyboard-btn {
+  align-items: center;
+  justify-content: center;
+  width: 46px;
+  height: 46px;
+  border-radius: 14px;
+  background: var(--bg-elevated);
+  color: var(--fg-muted);
+  box-shadow: inset 0 0 0 1px var(--border);
+}
+.voice-keyboard-btn svg {
+  width: 24px;
+  height: 24px;
+}
+.voice-hold-btn {
+  flex: 1;
+  align-items: center;
+  justify-content: center;
+  min-height: 46px;
+  border-radius: 14px;
+  background: var(--bg-elevated);
+  color: var(--fg);
+  font-size: 18px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  box-shadow: inset 0 0 0 1px var(--border);
+  user-select: none;
+  touch-action: none;
+}
+.voice-hold-btn.is-ready {
+  color: var(--fg);
+}
+.voice-hold-btn.is-warming {
+  color: var(--accent);
+}
+.voice-hold-btn.is-pressed {
+  background: color-mix(in srgb, var(--accent) 15%, var(--bg-elevated));
+  color: var(--accent);
+}
+.voice-hold-btn.is-cancel {
+  background: rgba(224, 108, 108, 0.14);
+  color: var(--danger);
+}
 
 .composer-actions {
   display: flex;
@@ -3906,10 +3966,13 @@ body.voice-overlay-open {
   background: rgba(16, 18, 24, 0.74);
   backdrop-filter: blur(1.5px);
 }
+.voice-overlay-cancel .voice-overlay-backdrop {
+  background: rgba(40, 18, 18, 0.78);
+}
 .voice-sheet {
   position: absolute;
   left: 50%;
-  bottom: calc(18px + env(safe-area-inset-bottom, 0));
+  bottom: calc(32px + env(safe-area-inset-bottom, 0));
   width: min(calc(100% - 24px), 620px);
   transform: translateX(-50%);
   display: flex;
@@ -3977,9 +4040,23 @@ body.voice-overlay-open {
 .voice-waveform i:nth-child(6) { animation-delay: 400ms; height: 17px; }
 .voice-waveform i:nth-child(7) { animation-delay: 480ms; height: 14px; }
 .voice-waveform i:nth-child(8) { animation-delay: 560ms; height: 12px; }
+.voice-gesture-hint {
+  margin-top: 24px;
+  color: rgba(255, 255, 255, 0.82);
+  font-size: 16px;
+  font-weight: 650;
+  text-align: center;
+}
+.voice-overlay-cancel .voice-gesture-hint,
+.voice-overlay-cancel .voice-transcript-bubble {
+  color: #991b1b;
+}
+.voice-overlay-polishing .voice-waveform {
+  color: #7c3aed;
+}
 .voice-actions {
   width: 100%;
-  margin-top: 24px;
+  margin-top: 26px;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -4016,7 +4093,7 @@ body.voice-overlay-open {
 }
 @media (max-width: 680px) {
   .voice-sheet {
-    bottom: calc(16px + env(safe-area-inset-bottom, 0));
+    bottom: calc(28px + env(safe-area-inset-bottom, 0));
     width: min(calc(100% - 20px), 620px);
   }
   .voice-transcript-bubble {
