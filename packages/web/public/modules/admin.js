@@ -357,25 +357,25 @@ const TABS = {
 }
 
 const ADMIN_TAB_META = {
-  dashboard: { label: '总览', desc: '收入、用量、资源和告警', key: '01' },
-  users: { label: '用户', desc: '增长、留存、余额和详情', key: '02' },
-  accounts: { label: '账号池', desc: 'Claude / Codex 账号健康', key: '03' },
-  accountGroups: { label: '账号分组', desc: '容量、权重和调度边界', key: '04' },
-  egressProxies: { label: '代理池', desc: '出口线路和失败冷却', key: '05' },
-  containers: { label: 'Agent 容器', desc: '运行态、日志和重启动作', key: '06' },
-  hosts: { label: '虚机池', desc: '磁盘、容量和调度状态', key: '07' },
-  ledger: { label: '积分流水', desc: '账务明细和 CSV 导出', key: '08' },
-  orders: { label: '订单', desc: '支付状态和回调详情', key: '09' },
-  pricing: { label: '定价', desc: '模型倍率和启用策略', key: '10' },
-  plans: { label: '充值套餐', desc: '金额、积分和排序', key: '11' },
-  modelGrants: { label: '用户模型授权', desc: '按用户放行特殊模型', key: '12' },
-  feedback: { label: '反馈', desc: '用户问题、优先级和确认', key: '13' },
-  inbox: { label: '站内信', desc: '发送、历史和触达记录', key: '14' },
-  literature: { label: '文献检索', desc: '检索服务连接和配额', key: '15' },
-  settings: { label: '系统设置', desc: '开关、阈值和 JSON 配置', key: '16' },
-  audit: { label: '审计日志', desc: '操作者、对象和配置变更', key: '17' },
-  health: { label: '健康面板', desc: '服务依赖和探针状态', key: '18' },
-  alerts: { label: '告警', desc: '风险确认、静默和处理', key: '19' },
+  dashboard: { group: '经营驾驶舱', label: '总览', desc: '收入、用量、资源和告警', key: '01', chips: [{ label: '优先看', value: '异常 / 收入 / 资源' }, { label: '刷新', value: '30s 自动' }, { label: '下一步', value: '告警与账号池' }] },
+  users: { group: '经营驾驶舱', label: '用户', desc: '增长、留存、余额和详情', key: '02', chips: [{ label: '定位', value: '邮箱 / UID' }, { label: '动作', value: '详情 / 余额' }, { label: '联动', value: '容器与流水' }] },
+  accounts: { group: '账号与调度', label: '账号池', desc: 'Claude / Codex 账号健康', key: '03', chips: [{ label: '排查', value: 'active / cooldown' }, { label: '凭据', value: 'UUID / Token' }, { label: '风险', value: 'no_uuid / expired' }] },
+  accountGroups: { group: '账号与调度', label: '账号分组', desc: '容量、权重和调度边界', key: '04', chips: [{ label: '路由', value: 'provider / model' }, { label: '策略', value: 'priority' }, { label: '边界', value: 'allowlist' }] },
+  egressProxies: { group: '账号与调度', label: '代理池', desc: '出口线路和失败冷却', key: '05', chips: [{ label: '状态', value: 'active / disabled' }, { label: '冷却', value: 'recent failures' }, { label: '资产', value: 'region / owner' }] },
+  containers: { group: '运行资源', label: '容器', desc: '运行态、日志和重启动作', key: '06', chips: [{ label: '筛选', value: '用户 / Host' }, { label: '动作', value: '日志 / 重启' }, { label: '版本', value: 'runtime image' }] },
+  hosts: { group: '运行资源', label: '虚机池', desc: '磁盘、容量和调度状态', key: '07', chips: [{ label: '水位', value: 'Disk / Mem / Load' }, { label: '调度', value: 'slots / drain' }, { label: '维护', value: 'bootstrap / 到期' }] },
+  ledger: { group: '财务与商业', label: '积分流水', desc: '账务明细和 CSV 导出', key: '08', chips: [{ label: '过滤', value: 'reason / 时间' }, { label: '方向', value: '扣减 / 入账' }, { label: '导出', value: 'CSV 审计' }] },
+  orders: { group: '财务与商业', label: '订单', desc: '支付状态和回调详情', key: '09', chips: [{ label: '状态', value: 'paid / pending' }, { label: '金额', value: '订单 / 积分' }, { label: '异常', value: '回调详情' }] },
+  pricing: { group: '财务与商业', label: '定价', desc: '模型倍率和启用策略', key: '10', chips: [{ label: '成本', value: 'input / output' }, { label: '缓存', value: 'read / write' }, { label: '策略', value: 'multiplier' }] },
+  plans: { group: '财务与商业', label: '充值套餐', desc: '金额、积分和排序', key: '11', chips: [{ label: '金额', value: 'CNY' }, { label: '权益', value: 'credits' }, { label: '展示', value: 'sort / active' }] },
+  modelGrants: { group: '财务与商业', label: '用户模型授权', desc: '按用户放行特殊模型', key: '12', chips: [{ label: '用户', value: 'email / uid' }, { label: '模型', value: 'admin only' }, { label: '动作', value: 'grant / revoke' }] },
+  feedback: { group: '用户触达', label: '反馈', desc: '用户问题、优先级和确认', key: '13', chips: [{ label: '队列', value: 'open / acked' }, { label: '上下文', value: '用户详情' }, { label: '动作', value: '确认处理' }] },
+  inbox: { group: '用户触达', label: '站内信', desc: '发送、历史和触达记录', key: '14', chips: [{ label: '范围', value: '全员 / 单人' }, { label: '级别', value: 'info / warning' }, { label: '历史', value: 'sent / deleted' }] },
+  literature: { group: '系统运营', label: '文献检索', desc: '检索服务连接和配额', key: '15', chips: [{ label: '连接', value: 'base_url / token' }, { label: '配额', value: 'daily cap' }, { label: '验证', value: 'test connection' }] },
+  settings: { group: '系统运营', label: '系统设置', desc: '开关、阈值和 JSON 配置', key: '16', chips: [{ label: '类型', value: 'bool / enum / JSON' }, { label: '默认', value: '继承 / 覆盖' }, { label: '审计', value: '保存留痕' }] },
+  audit: { group: '系统运营', label: '审计日志', desc: '操作者、对象和配置变更', key: '17', chips: [{ label: '过滤', value: 'admin / action' }, { label: '对象', value: 'target' }, { label: '详情', value: 'before / after' }] },
+  health: { group: '系统运营', label: '健康面板', desc: '服务依赖和探针状态', key: '18', chips: [{ label: 'HTTP', value: '2xx / 5xx' }, { label: '延迟', value: 'TTFT' }, { label: '依赖', value: 'bridge / billing' }] },
+  alerts: { group: '系统运营', label: '告警', desc: '风险确认、静默和处理', key: '19', chips: [{ label: '响应', value: 'ack / silence' }, { label: '通道', value: 'iLink / Telegram' }, { label: '历史', value: 'sent / failed' }] },
 }
 
 function decorateAdminShell() {
@@ -383,10 +383,11 @@ function decorateAdminShell() {
     const tab = btn.dataset.tab
     const meta = ADMIN_TAB_META[tab]
     if (!meta) continue
+    btn.dataset.group = meta.group
     btn.setAttribute('role', 'tab')
     btn.setAttribute('aria-controls', 'view')
-    btn.setAttribute('aria-label', `${meta.label}: ${meta.desc}`)
-    btn.title = meta.desc
+    btn.setAttribute('aria-label', `${meta.group} / ${meta.label}: ${meta.desc}`)
+    btn.title = `${meta.group} · ${meta.desc}`
     if (!btn.querySelector('.tab-label')) {
       btn.innerHTML = `
         <span class="tab-label">${escapeHtml(meta.label)}</span>
@@ -394,161 +395,6 @@ function decorateAdminShell() {
         <span class="tab-desc">${escapeHtml(meta.desc)}</span>`
     }
   }
-}
-
-const ADMIN_TAB_VISUALS = {
-  dashboard: {
-    group: '经营驾驶舱', title: '全局经营态势', desc: '把收入、请求、账号池、容器和告警压缩成可行动的管理视图。',
-    cards: [
-      { label: '运营漏斗', value: 'DAU → 付费 → 请求', note: '关注增长、转化和返场', bars: [86, 64, 48] },
-      { label: '资源热区', value: '账号 / 容器 / 虚机', note: '优先处理影响调度的风险', bars: [72, 88, 55] },
-      { label: '异常队列', value: '告警 → 负责人 → 动作', note: '把 P0/P1 从图表变成待办', bars: [38, 58, 82] },
-    ],
-  },
-  users: {
-    group: '经营驾驶舱', title: '用户增长与留存', desc: '把注册、验证、充值、请求和反馈放在同一条用户旅程里。',
-    cards: [
-      { label: '增长漏斗', value: '注册 / 验证 / 首充', note: '快速定位漏斗断点', bars: [88, 67, 42] },
-      { label: '用户价值', value: '余额 / 消耗 / 模型', note: '优先服务高价值用户', bars: [58, 74, 90] },
-      { label: '操作入口', value: '详情 / 余额 / 容器', note: '从列表直达下一步', bars: [76, 61, 84] },
-    ],
-  },
-  accounts: {
-    group: '账号与调度', title: '账号池健康', desc: '展示账号可用性、OAuth 风险、冷却原因和真实使用方。',
-    cards: [
-      { label: '可用容量', value: 'active vs cooldown', note: '看清可调度余量', bars: [92, 54, 34] },
-      { label: '凭据风险', value: 'uuid / token / expiry', note: '优先处理 no_uuid 和过期', bars: [42, 72, 88] },
-      { label: '使用归因', value: '近 24h 用户', note: '排查异常消耗和封控', bars: [66, 80, 50] },
-    ],
-  },
-  accountGroups: {
-    group: '账号与调度', title: '账号分组与路由', desc: '用卡片表达 provider、权重、模型边界和启停状态。',
-    cards: [
-      { label: '路由权重', value: 'priority', note: '按组控制调度偏好', bars: [70, 52, 88] },
-      { label: '模型覆盖', value: 'models allowlist', note: '避免模型误路由', bars: [48, 78, 64] },
-      { label: '中转凭据', value: 'relay credentials', note: '把凭据动作收进卡片', bars: [58, 62, 44] },
-    ],
-  },
-  egressProxies: {
-    group: '账号与调度', title: '代理池线路', desc: '把出口线路从纯表格变成状态、风险和关联账号的卡片。',
-    cards: [
-      { label: '线路状态', value: 'active / disabled', note: '快速看可用出口', bars: [82, 18, 0] },
-      { label: '失败冷却', value: 'recent failures', note: '定位 403 / 超时线路', bars: [32, 56, 72] },
-      { label: '备注资产', value: 'region / ISP / owner', note: '保留运维上下文', bars: [44, 60, 78] },
-    ],
-  },
-  containers: {
-    group: '运行资源', title: 'Agent 容器运行态', desc: '按用户、host、镜像和日志动作呈现容器生命周期。',
-    cards: [
-      { label: '运行态分布', value: 'running / stopped / stale', note: '先看是否影响用户会话', bars: [84, 24, 18] },
-      { label: '镜像版本', value: 'runtime image', note: '确认新版本是否生效', bars: [76, 68, 90] },
-      { label: '运维动作', value: 'logs / restart / stop', note: '操作按钮保持右侧可扫读', bars: [58, 74, 66] },
-    ],
-  },
-  hosts: {
-    group: '运行资源', title: '虚机池容量', desc: '把磁盘、容器数、bootstrap、到期和隔离状态合成资源看板。',
-    cards: [
-      { label: '容量水位', value: 'CPU / disk / slots', note: '优先发现磁盘与槽位风险', bars: [64, 76, 48] },
-      { label: '基线版本', value: 'baseline runtime', note: '确认 host 与 master 协议一致', bars: [80, 80, 80] },
-      { label: '生命周期', value: 'expires / drain / quarantine', note: '把运维状态前置', bars: [40, 62, 72] },
-    ],
-  },
-  ledger: {
-    group: '财务与商业', title: '积分流水账本', desc: '按 reason、时间和用户过滤，支持审计和 CSV 导出。',
-    cards: [
-      { label: '账务方向', value: 'debit / credit', note: '区分充值、消耗和补偿', bars: [68, 42, 82] },
-      { label: '时间窗口', value: 'from → to', note: '把长流水变成范围分析', bars: [30, 60, 90] },
-      { label: '导出审计', value: 'CSV 50k', note: '财务复核保持可追溯', bars: [74, 66, 58] },
-    ],
-  },
-  orders: {
-    group: '财务与商业', title: '支付订单', desc: '把支付状态、金额、回调和异常订单卡片化。',
-    cards: [
-      { label: '订单状态', value: 'paid / pending / failed', note: '异常优先级一眼可见', bars: [78, 34, 16] },
-      { label: '收入贡献', value: 'amount / credits', note: '金额与到账余额并排', bars: [48, 72, 92] },
-      { label: '回调详情', value: 'notify payload', note: '失败排查从卡片进入', bars: [44, 58, 76] },
-    ],
-  },
-  pricing: {
-    group: '财务与商业', title: '模型定价矩阵', desc: '按模型展示输入、输出、缓存和倍率，减少横向扫表成本。',
-    cards: [
-      { label: 'Token 成本', value: 'input / output', note: '区分模型成本结构', bars: [52, 88, 40] },
-      { label: '缓存价格', value: 'read / write', note: '突出低成本优势', bars: [18, 32, 72] },
-      { label: '倍率策略', value: 'multiplier', note: '商业策略可快速调整', bars: [66, 66, 66] },
-    ],
-  },
-  plans: {
-    group: '财务与商业', title: '充值套餐', desc: '把金额、到账积分、排序和启用态变成可比较卡片。',
-    cards: [
-      { label: '套餐梯度', value: '¥50 / ¥200 / ¥500', note: '突出推荐购买路径', bars: [36, 68, 92] },
-      { label: '赠送策略', value: 'credits - amount', note: '快速核对权益', bars: [28, 48, 78] },
-      { label: '展示排序', value: 'sort_order', note: '控制用户端呈现顺序', bars: [72, 54, 36] },
-    ],
-  },
-  modelGrants: {
-    group: '财务与商业', title: '用户模型授权', desc: '用用户搜索、授权矩阵和灰度范围管理隐藏模型。',
-    cards: [
-      { label: '用户定位', value: 'email / uid', note: '先选用户再授权', bars: [60, 80, 40] },
-      { label: '灰度模型', value: 'admin / hidden', note: '控制特殊能力开放', bars: [44, 76, 92] },
-      { label: '授权结果', value: 'grant / revoke', note: '操作后立即可见', bars: [70, 52, 70] },
-    ],
-  },
-  feedback: {
-    group: '用户触达', title: '用户反馈处理', desc: '把反馈状态、用户、内容和确认动作组成工单卡片。',
-    cards: [
-      { label: '处理队列', value: 'open / acked', note: '未确认反馈优先', bars: [62, 38, 0] },
-      { label: '用户上下文', value: 'user_id', note: '直连用户详情与会话', bars: [56, 68, 84] },
-      { label: '严重度感知', value: 'P0/P1/P2', note: '危险反馈高亮处理', bars: [24, 52, 76] },
-    ],
-  },
-  inbox: {
-    group: '用户触达', title: '站内信与广播', desc: '将发送表单、邮件推送和历史消息分成触达卡片。',
-    cards: [
-      { label: '触达范围', value: 'all / user', note: '全员广播或定向发送', bars: [90, 42, 0] },
-      { label: '消息级别', value: 'info / warning', note: '影响通知视觉强度', bars: [72, 34, 18] },
-      { label: '历史追踪', value: 'sent / deleted', note: '每次触达可复核', bars: [66, 50, 74] },
-    ],
-  },
-  literature: {
-    group: '系统运营', title: '文献检索服务', desc: '把上游连接、token、cap、超时和测试连接做成配置卡片。',
-    cards: [
-      { label: '连接状态', value: 'base_url / token', note: '先确认上游可用', bars: [80, 44, 64] },
-      { label: '配额限制', value: 'daily cap / size', note: '控制成本与滥用', bars: [58, 72, 48] },
-      { label: '自检动作', value: 'test connection', note: '保存前后都能验证', bars: [42, 70, 88] },
-    ],
-  },
-  settings: {
-    group: '系统运营', title: '系统设置', desc: '把开关、枚举、数字和 JSON 配置按风险等级展示。',
-    cards: [
-      { label: '默认值识别', value: 'default badge', note: '区分继承值和持久化值', bars: [60, 60, 60] },
-      { label: '类型化编辑', value: 'boolean / enum / json', note: '减少配置误输入', bars: [52, 74, 88] },
-      { label: '审计写入', value: 'admin_audit', note: '每次保存可追踪', bars: [84, 70, 54] },
-    ],
-  },
-  audit: {
-    group: '系统运营', title: '审计日志', desc: '按操作者、action、target 和 diff 检索管理动作。',
-    cards: [
-      { label: '责任链', value: 'admin → action', note: '每个改动能定位人', bars: [78, 62, 46] },
-      { label: 'Diff 查看', value: 'before / after', note: '变更详情弹窗化', bars: [40, 72, 92] },
-      { label: '安全过滤', value: 'ip / target', note: '快速排查异常操作', bars: [58, 76, 64] },
-    ],
-  },
-  health: {
-    group: '系统运营', title: '健康指标', desc: '把 Prometheus 文本转成请求、结算、账号、桥接和延迟卡片。',
-    cards: [
-      { label: 'HTTP 水位', value: '2xx / 5xx', note: '先看用户可用性', bars: [92, 18, 8] },
-      { label: '代理延迟', value: 'TTFT / stream', note: '定位体验瓶颈', bars: [48, 70, 86] },
-      { label: '桥接缓冲', value: 'ws bridge', note: '监控流式链路健康', bars: [36, 54, 72] },
-    ],
-  },
-  alerts: {
-    group: '系统运营', title: '告警中心', desc: '把事件覆盖、通道、订阅和投递历史变成响应矩阵。',
-    cards: [
-      { label: '覆盖矩阵', value: 'event × channel', note: '找出没人收的事件', bars: [82, 66, 44] },
-      { label: '通道健康', value: 'iLink / Telegram', note: '绑定和失败状态可见', bars: [74, 38, 58] },
-      { label: '投递结果', value: 'sent / failed / suppressed', note: '抑制和失败分开处理', bars: [68, 24, 12] },
-    ],
-  },
 }
 
 let _adminViewObserver = null
@@ -572,15 +418,15 @@ function scheduleAdminViewDecoration() {
 
 function decorateAdminView(tab) {
   const root = view()
-  const visual = ADMIN_TAB_VISUALS[tab]
-  if (!root || !visual || _adminDecoratingView) return
+  const meta = ADMIN_TAB_META[tab]
+  if (!root || !meta || _adminDecoratingView) return
   const only = root.children.length === 1 ? root.firstElementChild : null
   if (only?.classList?.contains('loading')) return
   _adminDecoratingView = true
   try {
-    root.classList.add('admin-visualized')
-    root.dataset.visualTab = tab
-    ensureAdminPageHero(root, tab, visual)
+    root.classList.add('admin-view-ready')
+    root.dataset.adminTab = tab
+    ensureAdminContextHeader(root, tab, meta)
     markAdminCards(root)
     wrapAdminTables(root)
   } finally {
@@ -588,36 +434,33 @@ function decorateAdminView(tab) {
   }
 }
 
-function ensureAdminPageHero(root, tab, visual) {
-  const existing = root.querySelector(':scope > .admin-page-hero')
+function ensureAdminContextHeader(root, tab, meta) {
+  const existing = root.querySelector(':scope > .admin-context-header')
   if (existing?.dataset?.tab === tab) return
   existing?.remove()
-  const hero = document.createElement('section')
-  hero.className = 'admin-page-hero'
-  hero.dataset.tab = tab
-  hero.innerHTML = `
-    <div class="admin-page-hero-copy">
-      <span class="admin-page-kicker">${escapeHtml(visual.group)}</span>
-      <h1>${escapeHtml(visual.title)}</h1>
-      <p>${escapeHtml(visual.desc)}</p>
+  const header = document.createElement('section')
+  header.className = 'admin-context-header'
+  header.dataset.tab = tab
+  const chips = Array.isArray(meta.chips) ? meta.chips : []
+  header.innerHTML = `
+    <div class="admin-context-copy">
+      <div class="admin-breadcrumb"><span>${escapeHtml(meta.group)}</span><span>${escapeHtml(meta.key)}</span></div>
+      <h1>${escapeHtml(meta.label)}</h1>
+      <p>${escapeHtml(meta.desc)}</p>
     </div>
-    <div class="admin-visual-card-grid">
-      ${visual.cards.map((card) => `
-        <article class="admin-visual-card">
-          <div class="admin-visual-card-label">${escapeHtml(card.label)}</div>
-          <strong>${escapeHtml(card.value)}</strong>
-          <p>${escapeHtml(card.note)}</p>
-          <div class="admin-mini-chart" aria-hidden="true">
-            ${card.bars.map((bar) => `<span style="height:${Math.max(8, Math.min(100, Number(bar) || 0))}%"></span>`).join('')}
-          </div>
-        </article>`).join('')}
+    <div class="admin-context-chips" aria-label="页面重点">
+      ${chips.map((chip) => `
+        <span class="admin-context-chip">
+          <span class="admin-context-chip-label">${escapeHtml(chip.label)}</span>
+          <strong>${escapeHtml(chip.value)}</strong>
+        </span>`).join('')}
     </div>`
-  root.insertBefore(hero, root.firstChild)
+  root.insertBefore(header, root.firstChild)
 }
 
 function markAdminCards(root) {
   for (const el of root.querySelectorAll('.panel, .admin-card, .chart-card')) {
-    if (!el.closest('.admin-page-hero')) el.classList.add('admin-panel-card')
+    if (!el.closest('.admin-context-header')) el.classList.add('admin-panel-card')
   }
   for (const el of root.querySelectorAll('.stat-card')) el.classList.add('admin-stat-card')
   for (const el of root.querySelectorAll('.toolbar')) el.classList.add('admin-toolbar-card')
@@ -625,7 +468,7 @@ function markAdminCards(root) {
 
 function wrapAdminTables(root) {
   for (const table of root.querySelectorAll('table.data')) {
-    if (table.closest('.admin-page-hero')) continue
+    if (table.closest('.admin-context-header')) continue
     const parent = table.parentElement
     if (!parent || parent.classList.contains('admin-table-card')) continue
     if (parent.classList.contains('table-scroll')) {
