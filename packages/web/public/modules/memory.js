@@ -1,9 +1,9 @@
-import { apiGet, apiJson } from './api.js?v=b08e5286'
+import { apiGet, apiJson } from './api.js?v=e3860157'
 // OpenClaude — Context Hub: Memory + Skills + Automation
-import { $, htmlSafeEscape } from './dom.js?v=b08e5286'
-import { getSession, state } from './state.js?v=b08e5286'
-import { openModal, toast, toastOptsFromError } from './ui.js?v=b08e5286'
-import { _cronHuman } from './util.js?v=b08e5286'
+import { $, htmlSafeEscape } from './dom.js?v=e3860157'
+import { getSession, state } from './state.js?v=e3860157'
+import { openModal, toast, toastOptsFromError } from './ui.js?v=e3860157'
+import { _cronHuman } from './util.js?v=e3860157'
 
 const MEMORY_DELIMITER = '\n§\n'
 const CONTEXT_TABS = ['memory', 'skills', 'tasks']
