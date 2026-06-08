@@ -30,7 +30,7 @@ describe('commercial voice input', () => {
     assert.match(speechJs, /recorder\.onstop = \(\) => sendStopAfterAudio\(run\)/, 'recorder stop should wait for queued chunks before stop')
     assert.doesNotMatch(speechJs, /recorder\.onstop = \(\) => sendStop\(run\)/, 'stop frame must not race final dataavailable chunks')
     assert.match(speechJs, /if \(!run\.ws \|\| run\.ws\.readyState !== WebSocket\.OPEN\) \{[\s\S]*?cleanupServerVoice\(run\)/, 'stop control must not be marked sent before the voice WS is open')
-    assert.match(speechJs, /if \(!run\.ready \|\| !rec\) return cancelServerVoice\('说话时间太短'\)/, 'pre-ready release should cancel instead of starting recording later')
+    assert.match(speechJs, /if \(!run\.ready \|\| !rec\) return cancelCurrentSegment\(run, '说话时间太短'\)/, 'pre-ready release should cancel instead of starting recording later')
   })
 
   it('renders hold-to-talk voice mode and wires the voice button through the speech module', () => {
@@ -38,8 +38,10 @@ describe('commercial voice input', () => {
     assert.match(indexHtml, /id="voice-hold-btn"[\s\S]*按住说话/, 'voice mode should include a hold-to-talk button')
     assert.match(indexHtml, /id="voice-overlay"/, 'voice overlay should be present in the shell')
     assert.match(indexHtml, /id="voice-transcript-text"/, 'voice overlay should include transcript text')
+    assert.match(indexHtml, /id="voice-draft-input"/, 'voice overlay should include editable transcript draft')
     assert.match(indexHtml, /id="voice-waveform"/, 'voice overlay should include waveform feedback')
     assert.match(indexHtml, /id="voice-cancel-btn"/, 'voice overlay should include cancel action')
+    assert.match(indexHtml, /id="voice-continue-btn"[\s\S]*按住继续说/, 'voice overlay should allow continuing the draft')
     assert.match(indexHtml, /id="voice-confirm-btn"/, 'voice overlay should include confirm action')
     assert.match(indexHtml, /上划取消，松开转文字/, 'hold overlay should explain swipe-up cancel and release-to-transcribe')
     assert.doesNotMatch(indexHtml, /voice-mic-dock|voice-text-btn|仅发语音/, 'voice overlay should not expose the unsupported voice-message mode')
@@ -50,29 +52,40 @@ describe('commercial voice input', () => {
   it('prewarms microphone in visible voice mode and stops stale streams after cancel', () => {
     assert.match(speechJs, /const PREWARM_IDLE_MS = 20_000/, 'prewarmed mic should have a bounded idle lifetime')
     assert.match(speechJs, /setVoiceMode\(true, '正在打开麦克风…'\)/, 'voice button should enter visible mic prewarm mode')
-    assert.match(speechJs, /run\.streamPromise = requestMicStream\(run\)/, 'voice flow should request microphone before waiting for Deepgram ready')
+    assert.match(speechJs, /prepareVoicePrewarm\(run, '正在打开麦克风…'\)/, 'voice mode should prewarm microphone and voice websocket before hold')
+    assert.match(speechJs, /if \(!run\.streamPromise\) \{[\s\S]*run\.streamPromise = requestMicStream\(run\)/, 'voice flow should request microphone during prewarm')
+    assert.match(speechJs, /if \(!wsOpenOrConnecting\) attachVoiceSocket\(run\)/, 'voice flow should preconnect the voice websocket during prewarm')
     assert.match(speechJs, /navigator\.mediaDevices\.getUserMedia\(\{ audio: true \}\)/, 'voice flow should use browser microphone permission API')
     assert.match(speechJs, /voiceRun === run && !run\.cleaned && run\.seq === voiceSeq/, 'late microphone stream should be checked against the active run')
     assert.match(speechJs, /stream\.getTracks\(\)\.forEach\(\(t\) => t\.stop\(\)\)/, 'stale microphone streams should be stopped')
+    assert.match(speechJs, /if \(!isCurrentRun\(run\) \|\| run\.pressed \|\| run\.recorder \|\| run\.polishing\) return/, 'prewarm idle cleanup should not be skipped just because a websocket exists')
     assert.match(speechJs, /if \(document\.hidden && voiceRun\) cleanupServerVoice\(voiceRun\)/, 'page backgrounding should release microphone resources')
   })
 
   it('uses hold-to-talk controls with swipe-up cancel guards', () => {
-    assert.match(speechJs, /hold\?\.addEventListener\('pointerdown'/, 'hold button should start on pointerdown')
-    assert.match(speechJs, /hold\?\.addEventListener\('pointermove'/, 'hold button should monitor swipe intent')
-    assert.match(speechJs, /hold\?\.addEventListener\('pointerup'/, 'hold button should finish on release')
+    assert.match(speechJs, /target\.addEventListener\('pointerdown'/, 'hold button should start on pointerdown')
+    assert.match(speechJs, /target\.addEventListener\('pointermove'/, 'hold button should monitor swipe intent')
+    assert.match(speechJs, /target\.addEventListener\('pointerup'/, 'hold button should finish on release')
     assert.match(speechJs, /const SWIPE_CANCEL_PX = 70/, 'swipe-up cancel threshold should be explicit')
     assert.match(speechJs, /dy < -SWIPE_CANCEL_PX/, 'swipe-up should enter cancel intent')
     assert.match(speechJs, /!run\.pressed \|\| run\.cancelIntent \|\| !voiceMode \|\| !run\.ready/, 'late recorder start should require still-pressed active state')
+    assert.match(speechJs, /for \(const evt of \['contextmenu', 'selectstart', 'dragstart'\]\)/, 'mobile long-press selection/copy menus should be suppressed')
+    assert.match(readFileSync(resolve(import.meta.dirname, '..', 'public', 'style.css'), 'utf-8'), /-webkit-touch-callout:\s*none/, 'mobile callout should be disabled for voice controls')
   })
 
-  it('keeps realtime transcript inside the overlay until final polish is applied', () => {
-    assert.match(speechJs, /updateVoiceOverlayText\(run, run\.rawText\)/, 'realtime transcript should update the overlay')
+  it('keeps realtime transcript and final polish inside an editable overlay draft', () => {
+    assert.match(speechJs, /updateVoiceOverlayText\(run, mergeVoiceDraft\(run\.segmentBase, run\.rawText\)\)/, 'realtime transcript should update the overlay')
     assert.doesNotMatch(speechJs, /applyVoiceText\(run, run\.rawText\)/, 'realtime transcript should not mutate the composer textarea')
     assert.match(speechJs, /msg\.type === 'polish_delta'/, 'context polish should stream visible deltas before final apply')
     assert.doesNotMatch(speechJs, /applyVoiceText\(run, run\.polishedText/, 'polish deltas should not mutate the composer textarea')
-    assert.match(speechJs, /const before = run\.initialValue/, 'undo should restore the pre-recording composer text')
-    assert.match(speechJs, /el\.value === run\.lastAppliedValue \|\| el\.value === run\.initialValue/, 'final polish should only apply when the input is unchanged')
+    assert.match(speechJs, /showVoiceDraft\(run, mergeVoiceDraft\(run\.segmentBase, polished\)/, 'final polish should stop in the voice draft UI instead of auto-applying')
+    assert.doesNotMatch(speechJs, /const applied = applyVoiceText\(run, polished/, 'final polish must not auto-write into the composer')
+    assert.match(speechJs, /function currentDraftValue\(run\)[\s\S]*return draft\.value/, 'draft actions should read the user-edited textarea value')
+    assert.match(speechJs, /const text = currentDraftValue\(run\)\.trim\(\)/, 'insert should use the current editable draft value')
+    assert.match(speechJs, /const draft = currentDraftValue\(run\)\.trim\(\)/, 'continue should use the current editable draft value')
+    assert.match(speechJs, /function detachVoiceSocket\(run\)[\s\S]*run\.ws = null[\s\S]*run\.ready = false/, 'finished voice sockets should be detached before draft continuation can start')
+    assert.match(speechJs, /if \(run\.ws !== ws\) return/, 'stale websocket callbacks should not clean up a newer continue recording')
+    assert.match(speechJs, /recorder\.onstop = null/, 'canceling a continued segment should not let recorder.onstop clear the restored draft')
   })
 
   it('keeps ESM imports cache-busted', () => {
