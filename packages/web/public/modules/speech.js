@@ -32,9 +32,16 @@ let voiceRun = null
 let voiceSeq = 0
 let undoSnapshot = null
 let undoInstalled = false
+let voiceUiBound = false
+let ignoreNextVoiceClick = false
+let holdGesture = null
 
 function inputEl() { return $('input') }
 function voiceBtn() { return $('voice-btn') }
+function voiceOverlay() { return $('voice-overlay') }
+function voiceTranscriptText() { return $('voice-transcript-text') }
+function voiceTranscriptDots() { return $('voice-transcript-dots') }
+function voiceGestureHint() { return $('voice-gesture-hint') }
 
 function setVoiceButton(mode) {
   const btn = voiceBtn()
@@ -53,6 +60,44 @@ function setVoiceButton(mode) {
   }
 }
 
+function setVoiceOverlay(mode, text = '') {
+  const overlay = voiceOverlay()
+  if (!overlay) return
+  const label = voiceTranscriptText()
+  const dots = voiceTranscriptDots()
+  const hint = voiceGestureHint()
+  overlay.hidden = mode === 'hidden'
+  overlay.setAttribute('aria-hidden', mode === 'hidden' ? 'true' : 'false')
+  document.body.classList.toggle('voice-overlay-open', mode !== 'hidden')
+  overlay.classList.toggle('cancel-intent', mode === 'cancel')
+  if (label) {
+    label.textContent = text || (
+      mode === 'connecting' ? '正在准备语音输入…'
+        : mode === 'polishing' ? '正在优化转写…'
+          : mode === 'cancel' ? '松开取消'
+            : '正在听…'
+    )
+  }
+  if (dots) dots.hidden = Boolean(text) || mode === 'cancel'
+  if (hint) {
+    hint.textContent = mode === 'cancel'
+      ? '松开取消'
+      : mode === 'polishing'
+        ? '正在根据上下文优化'
+        : '松开转文字，上滑取消'
+  }
+}
+
+function updateVoiceOverlayText(run, text) {
+  if (!run || run.seq !== voiceSeq) return
+  const value = String(text || '').trim()
+  setVoiceOverlay(run.polishing ? 'polishing' : 'recording', value || '正在听…')
+}
+
+function hideVoiceOverlay() {
+  setVoiceOverlay('hidden')
+}
+
 function normalizePrefix(value) {
   if (!value) return ''
   return /[\s\n]$/.test(value) ? value : `${value} `
@@ -64,7 +109,7 @@ function applyVoiceText(run, text, opts = {}) {
   const el = inputEl()
   const next = normalizePrefix(run.initialValue) + (text || '')
   if (opts.requireUnchanged) {
-    const allowed = el.value === run.lastAppliedValue || el.value === run.expectedRawValue
+    const allowed = el.value === run.lastAppliedValue || el.value === run.initialValue
     if (!allowed) return false
   }
   el.value = next
@@ -87,14 +132,20 @@ function cleanupServerVoice(run) {
   if (voiceRun === run) voiceRun = null
   state.recognizing = false
   setVoiceButton('idle')
+  hideVoiceOverlay()
 }
 
 function sendStop(run) {
   if (!run || run.stopSent) return
+  if (!run.ws || run.ws.readyState !== WebSocket.OPEN) {
+    cleanupServerVoice(run)
+    return
+  }
   run.stopSent = true
   run.polishing = true
   state.recognizing = false
   setVoiceButton('polishing')
+  setVoiceOverlay('polishing', run.rawText || '正在优化转写…')
   try { run.ws?.send(JSON.stringify({ type: 'stop' })) } catch {}
 }
 
@@ -103,19 +154,29 @@ function sendStopAfterAudio(run) {
   void (run.audioChain || Promise.resolve()).then(() => sendStop(run))
 }
 
+function cancelServerVoice(reason = '已取消语音输入') {
+  const run = voiceRun
+  if (!run) return false
+  try { run.ws?.send(JSON.stringify({ type: 'cancel' })) } catch {}
+  cleanupServerVoice(run)
+  toast(reason, 'warn')
+  return true
+}
+
 function stopServerVoice() {
   const run = voiceRun
   if (!run) return false
   if (run.polishing) {
-    try { run.ws?.send(JSON.stringify({ type: 'cancel' })) } catch {}
-    cleanupServerVoice(run)
-    toast('已取消语音优化', 'warn')
-    return true
+    return cancelServerVoice('已取消语音优化')
   }
   run.stopping = true
   state.recognizing = false
   setVoiceButton('polishing')
+  setVoiceOverlay('polishing', run.rawText || '正在转文字…')
   const rec = run.recorder
+  if (!run.ready || !rec) {
+    return cancelServerVoice('已取消语音输入')
+  }
   if (rec && rec.state === 'recording') {
     try { rec.requestData?.() } catch {}
     try { rec.stop() } catch { sendStopAfterAudio(run) }
@@ -261,6 +322,7 @@ async function startRecorderAfterReady(run) {
   }
   state.recognizing = true
   setVoiceButton('recording')
+  setVoiceOverlay('recording', run.rawText || '正在听…')
 }
 
 function startServerVoice() {
@@ -302,6 +364,7 @@ function startServerVoice() {
   voiceRun = run
   state.recognizing = false
   setVoiceButton('polishing')
+  setVoiceOverlay('connecting', '正在准备语音输入…')
 
   run.readyTimeout = setTimeout(() => {
     if (run.ready) return
@@ -328,16 +391,17 @@ function startServerVoice() {
       const raw = msg.finalText || msg.text || ''
       run.rawText = raw || run.rawText
       run.expectedRawValue = normalizePrefix(run.initialValue) + run.rawText
-      if (!run.stopping) applyVoiceText(run, run.rawText)
+      updateVoiceOverlayText(run, run.rawText)
       return
     }
     if (msg.type === 'stopping' || msg.type === 'polish_start') {
       run.polishing = true
       setVoiceButton('polishing')
+      setVoiceOverlay('polishing', msg.rawText || run.rawText || '正在优化转写…')
       return
     }
     if (msg.type === 'polish') {
-      const before = run.expectedRawValue || (normalizePrefix(run.initialValue) + (msg.rawText || run.rawText || ''))
+      const before = run.initialValue
       const polished = msg.text || msg.rawText || run.rawText || ''
       const applied = applyVoiceText(run, polished, { requireUnchanged: true })
       if (applied) {
@@ -418,7 +482,66 @@ export function initSpeech() {
   return legacyRecognition
 }
 
+function bindVoiceUi() {
+  if (voiceUiBound) return
+  voiceUiBound = true
+  $('voice-cancel-btn')?.addEventListener('click', () => cancelServerVoice())
+  $('voice-confirm-btn')?.addEventListener('click', () => stopServerVoice())
+  $('voice-text-btn')?.addEventListener('click', () => stopServerVoice())
+}
+
+export function bindVoiceButton(btn = voiceBtn()) {
+  bindVoiceUi()
+  if (!btn || btn.dataset.voiceBound === '1') return
+  btn.dataset.voiceBound = '1'
+  btn.addEventListener('click', (e) => {
+    if (ignoreNextVoiceClick) {
+      ignoreNextVoiceClick = false
+      e.preventDefault()
+      e.stopPropagation()
+      return
+    }
+    toggleVoice()
+  })
+  btn.addEventListener('pointerdown', (e) => {
+    if (e.pointerType === 'mouse' || voiceRun || state.recognizing) return
+    holdGesture = {
+      id: e.pointerId,
+      startX: e.clientX,
+      startY: e.clientY,
+      started: false,
+      cancel: false,
+      timer: setTimeout(() => {
+        if (!holdGesture || holdGesture.id !== e.pointerId) return
+        holdGesture.started = true
+        ignoreNextVoiceClick = true
+        try { btn.setPointerCapture?.(e.pointerId) } catch {}
+        startServerVoice()
+      }, 180),
+    }
+  })
+  btn.addEventListener('pointermove', (e) => {
+    if (!holdGesture || holdGesture.id !== e.pointerId || !holdGesture.started) return
+    const cancel = e.clientY - holdGesture.startY < -70 || Math.abs(e.clientX - holdGesture.startX) > 110
+    holdGesture.cancel = cancel
+    setVoiceOverlay(cancel ? 'cancel' : (voiceRun?.polishing ? 'polishing' : 'recording'), voiceRun?.rawText || '')
+  })
+  const finishHold = (e) => {
+    if (!holdGesture || holdGesture.id !== e.pointerId) return
+    const g = holdGesture
+    holdGesture = null
+    if (g.timer) clearTimeout(g.timer)
+    if (!g.started) return
+    ignoreNextVoiceClick = true
+    if (g.cancel) cancelServerVoice()
+    else stopServerVoice()
+  }
+  btn.addEventListener('pointerup', finishHold)
+  btn.addEventListener('pointercancel', finishHold)
+}
+
 export function toggleVoice() {
+  bindVoiceUi()
   if (voiceRun) {
     stopServerVoice()
     return

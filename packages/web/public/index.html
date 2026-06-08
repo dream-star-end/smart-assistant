@@ -1394,6 +1394,38 @@
   </main>
 </div>
 
+<div id="voice-overlay" class="voice-overlay" hidden aria-hidden="true">
+  <div class="voice-overlay-backdrop" aria-hidden="true"></div>
+  <section class="voice-sheet" role="dialog" aria-modal="true" aria-label="语音转文字">
+    <div class="voice-transcript-bubble" role="status" aria-live="polite" aria-atomic="true">
+      <span id="voice-transcript-text" class="voice-transcript-text">正在准备语音输入…</span>
+      <span id="voice-transcript-dots" class="voice-transcript-dots" aria-hidden="true">··</span>
+      <span id="voice-waveform" class="voice-waveform" aria-hidden="true">
+        <i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i>
+      </span>
+    </div>
+    <div id="voice-gesture-hint" class="voice-gesture-hint">松开转文字，上滑取消</div>
+    <div class="voice-actions">
+      <button id="voice-cancel-btn" type="button" class="voice-action" aria-label="取消语音输入">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 14l-4-4 4-4"/><path d="M5 10h10a4 4 0 0 1 0 8h-1"/></svg>
+        <span>取消</span>
+      </button>
+      <button id="voice-confirm-btn" type="button" class="voice-primary" aria-label="转为文字">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6L9 17l-5-5"/></svg>
+      </button>
+      <button id="voice-text-btn" type="button" class="voice-action" aria-label="结束录音并转文字">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 18h16"/><path d="M7 6h10"/><path d="M12 6v12"/></svg>
+        <span>转文字</span>
+      </button>
+    </div>
+    <div class="voice-mic-dock" aria-hidden="true">
+      <div class="voice-mic-dome">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3a3 3 0 0 0-3 3v6a3 3 0 0 0 6 0V6a3 3 0 0 0-3-3z"/><path d="M19 11v1a7 7 0 0 1-14 0v-1"/><path d="M12 19v3"/></svg>
+      </div>
+    </div>
+  </section>
+</div>
+
 <!-- ═══════════════ MODALS ═══════════════ -->
 <div id="agents-modal" class="modal-backdrop" role="dialog" aria-modal="true">
   <div class="modal settings-modal">
