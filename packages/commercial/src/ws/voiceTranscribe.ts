@@ -22,6 +22,7 @@ const DEFAULT_MAX_KEYTERM_CHARS = 80;
 const DEFAULT_FINAL_WAIT_MS = 4_000;
 const DEFAULT_DEEPGRAM_OPEN_TIMEOUT_MS = 8_000;
 const DEFAULT_START_TIMEOUT_MS = 10_000;
+const DEFAULT_NO_AUDIO_TIMEOUT_MS = 20_000;
 const DEFAULT_MAX_PER_USER = 1;
 const DEFAULT_MAX_GLOBAL = 50;
 
@@ -68,6 +69,7 @@ export interface VoiceTranscribeDeps {
   maxAudioFrameBytes?: number;
   finalWaitMs?: number;
   deepgramOpenTimeoutMs?: number;
+  noAudioTimeoutMs?: number;
   logger?: Logger;
   fetchImpl?: FetchLike;
   createDeepgramSocket?: DeepgramSocketFactory;
@@ -576,6 +578,7 @@ export function createVoiceTranscribeHandler(deps: VoiceTranscribeDeps): VoiceTr
   const maxAudioFrameBytes = deps.maxAudioFrameBytes ?? DEFAULT_MAX_AUDIO_FRAME_BYTES;
   const finalWaitMs = clampInt(deps.finalWaitMs, DEFAULT_FINAL_WAIT_MS, 500, 15_000);
   const deepgramOpenTimeoutMs = clampInt(deps.deepgramOpenTimeoutMs, DEFAULT_DEEPGRAM_OPEN_TIMEOUT_MS, 1000, 30_000);
+  const noAudioTimeoutMs = clampInt(deps.noAudioTimeoutMs, DEFAULT_NO_AUDIO_TIMEOUT_MS, 5_000, 60_000);
   const fetchImpl = deps.fetchImpl ?? fetch;
   const createDeepgramSocket = deps.createDeepgramSocket ?? ((url, options) => new WebSocket(url, options));
 
@@ -599,8 +602,11 @@ export function createVoiceTranscribeHandler(deps: VoiceTranscribeDeps): VoiceTr
     let openTimer: NodeJS.Timeout | null = null;
     let maxTimer: NodeJS.Timeout | null = null;
     let finalTimer: NodeJS.Timeout | null = null;
+    let noAudioTimer: NodeJS.Timeout | null = null;
     let polishAbort: AbortController | null = null;
     let lastTranscript = "";
+    let receivedAudio = false;
+    let noAudioTimedOut = false;
     const finalSegments = new Map<number, string>();
 
     const currentFinalText = (): string => {
@@ -620,6 +626,7 @@ export function createVoiceTranscribeHandler(deps: VoiceTranscribeDeps): VoiceTr
       if (openTimer) clearTimeout(openTimer);
       if (maxTimer) clearTimeout(maxTimer);
       if (finalTimer) clearTimeout(finalTimer);
+      if (noAudioTimer) clearTimeout(noAudioTimer);
       try { polishAbort?.abort(); } catch { /* noop */ }
       if (dg && dg.readyState < WebSocket.CLOSING) {
         try { dg.close(); } catch { /* noop */ }
@@ -656,6 +663,17 @@ export function createVoiceTranscribeHandler(deps: VoiceTranscribeDeps): VoiceTr
       try { ws.close(CLOSE_VOICE.NORMAL, "done"); } catch { /* noop */ }
     };
 
+    const startMaxTimer = (): void => {
+      if (maxTimer) return;
+      maxTimer = setTimeout(() => {
+        sendErrorFrame(ws, "VOICE_MAX_DURATION", "单次语音输入时间过长");
+        try { ws.close(CLOSE_VOICE.POLICY, "voice max duration"); } catch { /* noop */ }
+        if (dg && dg.readyState === WebSocket.OPEN) {
+          try { dg.send(JSON.stringify({ type: "CloseStream" })); } catch { /* noop */ }
+        }
+      }, maxSeconds * 1000);
+    };
+
     const scheduleFinalFallback = (): void => {
       if (finalTimer) clearTimeout(finalTimer);
       finalTimer = setTimeout(() => {
@@ -685,13 +703,15 @@ export function createVoiceTranscribeHandler(deps: VoiceTranscribeDeps): VoiceTr
 
       dg.on("open", () => {
         if (openTimer) clearTimeout(openTimer);
-        maxTimer = setTimeout(() => {
-          sendErrorFrame(ws, "VOICE_MAX_DURATION", "单次语音输入时间过长");
-          try { ws.close(CLOSE_VOICE.POLICY, "voice max duration"); } catch { /* noop */ }
-          if (dg && dg.readyState === WebSocket.OPEN) {
-            try { dg.send(JSON.stringify({ type: "CloseStream" })); } catch { /* noop */ }
+        noAudioTimer = setTimeout(() => {
+          if (receivedAudio || stopping || finalized) return;
+          noAudioTimedOut = true;
+          sendErrorFrame(ws, "VOICE_NO_AUDIO_TIMEOUT", "语音输入待机超时");
+          try { ws.close(CLOSE_VOICE.POLICY, "voice no audio timeout"); } catch { /* noop */ }
+          if (dg && dg.readyState < WebSocket.CLOSING) {
+            try { dg.close(); } catch { /* noop */ }
           }
-        }, maxSeconds * 1000);
+        }, noAudioTimeoutMs);
         sendJson(ws, {
           type: "ready",
           model: deps.asrModel || DEFAULT_ASR_MODEL,
@@ -723,6 +743,7 @@ export function createVoiceTranscribeHandler(deps: VoiceTranscribeDeps): VoiceTr
       });
 
       dg.on("close", () => {
+        if (noAudioTimedOut) return;
         if (stopping) void finish("deepgram_close");
         else if (!finalized) {
           sendErrorFrame(ws, "VOICE_UPSTREAM_CLOSED", "语音识别服务已断开");
@@ -741,6 +762,8 @@ export function createVoiceTranscribeHandler(deps: VoiceTranscribeDeps): VoiceTr
       if (stopping) return;
       stopping = true;
       if (maxTimer) clearTimeout(maxTimer);
+      if (noAudioTimer) clearTimeout(noAudioTimer);
+      noAudioTimer = null;
       sendJson(ws, { type: "stopping", rawText: currentFinalText() });
       if (dg?.readyState === WebSocket.OPEN) {
         try { dg.send(JSON.stringify({ type: "CloseStream" })); } catch { /* noop */ }
@@ -792,6 +815,12 @@ export function createVoiceTranscribeHandler(deps: VoiceTranscribeDeps): VoiceTr
           sendErrorFrame(ws, "VOICE_FRAME_TOO_BIG", "audio frame too large");
           try { ws.close(CLOSE_VOICE.TOO_BIG, "audio frame too large"); } catch { /* noop */ }
           return;
+        }
+        if (!receivedAudio) {
+          receivedAudio = true;
+          if (noAudioTimer) clearTimeout(noAudioTimer);
+          noAudioTimer = null;
+          startMaxTimer();
         }
         try { dg.send(rawDataToBuffer(data), { binary: true }); } catch { /* noop */ }
         return;

@@ -1408,11 +1408,16 @@
         <i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i>
       </span>
     </div>
+    <textarea id="voice-draft-input" class="voice-draft-input" rows="4" aria-label="语音转文字草稿" hidden></textarea>
     <div id="voice-gesture-hint" class="voice-gesture-hint">上划取消，松开转文字</div>
     <div class="voice-actions">
       <button id="voice-cancel-btn" type="button" class="voice-action" aria-label="取消语音输入">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 14l-4-4 4-4"/><path d="M5 10h10a4 4 0 0 1 0 8h-1"/></svg>
         <span>取消</span>
+      </button>
+      <button id="voice-continue-btn" type="button" class="voice-action voice-action-continue" aria-label="按住继续说" hidden>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 1a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v1a7 7 0 0 1-14 0v-1"/><path d="M12 19v4"/><path d="M8 23h8"/></svg>
+        <span>按住继续说</span>
       </button>
       <button id="voice-confirm-btn" type="button" class="voice-action voice-action-primary" aria-label="完成录音并转为文字">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6L9 17l-5-5"/></svg>

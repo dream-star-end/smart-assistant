@@ -1,6 +1,8 @@
 import * as assert from "node:assert/strict";
 import { createServer } from "node:http";
 import { EventEmitter } from "node:events";
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import { afterEach, describe, test } from "node:test";
 import { WebSocket } from "ws";
 
@@ -15,6 +17,7 @@ import {
 } from "../ws/voiceTranscribe.js";
 
 const SECRET = "voice-test-secret-voice-test-secret-32";
+const voiceSource = readFileSync(resolve(import.meta.dirname, "..", "ws", "voiceTranscribe.ts"), "utf-8");
 const openHandlers: Array<{ shutdown(): Promise<void> }> = [];
 const servers: Array<ReturnType<typeof createServer>> = [];
 
@@ -102,6 +105,13 @@ describe("voiceTranscribe helpers", () => {
     assert.equal(joinTranscriptSegments(["DeepSeek", "V4 Flash", "模型"]), "DeepSeek V4 Flash 模型");
     assert.equal(joinTranscriptSegments(["你好", "，", "OpenClaude"]), "你好，OpenClaude");
   });
+
+  test("guards prewarmed Deepgram sessions before first audio", () => {
+    assert.match(voiceSource, /const DEFAULT_NO_AUDIO_TIMEOUT_MS = 20_000/, "prewarmed upstream sessions should have a bounded no-audio lifetime");
+    assert.match(voiceSource, /const noAudioTimeoutMs = clampInt\(deps\.noAudioTimeoutMs, DEFAULT_NO_AUDIO_TIMEOUT_MS, 5_000, 60_000\)/, "no-audio timeout should be configurable but bounded");
+    assert.match(voiceSource, /noAudioTimer = setTimeout\(\(\) => \{[\s\S]*VOICE_NO_AUDIO_TIMEOUT/, "Deepgram ready should arm a no-audio timeout");
+    assert.match(voiceSource, /if \(!receivedAudio\) \{[\s\S]*startMaxTimer\(\)/, "recording max duration should start on the first audio frame");
+  });
 });
 
 describe("voiceTranscribe websocket", () => {
@@ -163,6 +173,36 @@ describe("voiceTranscribe websocket", () => {
     assert.equal(url.searchParams.get("keyterm"), "OpenClaude");
     assert.equal(url.searchParams.has("encoding"), false);
     ws.close();
+  });
+
+  test("closes prewarmed Deepgram sockets when no audio arrives", async () => {
+    class FakeDeepgram extends EventEmitter {
+      readyState: number = WebSocket.CONNECTING;
+      send() {}
+      close() {
+        if (this.readyState === WebSocket.CLOSED) return;
+        this.readyState = WebSocket.CLOSED;
+        this.emit("close");
+      }
+    }
+    const h = createVoiceTranscribeHandler({
+      jwtSecret: SECRET,
+      deepgramApiKey: "dg_secret",
+      deepseekApiKey: "ds_secret",
+      noAudioTimeoutMs: 5_000,
+      createDeepgramSocket: () => {
+        const fake = new FakeDeepgram();
+        setImmediate(() => { fake.readyState = WebSocket.OPEN; fake.emit("open"); });
+        return fake as unknown as WebSocket;
+      },
+    });
+    const base = await listenWith(h);
+    const ws = new WebSocket(`${base}${VOICE_WS_PATH}`, ["bearer", await makeToken()]);
+    ws.on("open", () => ws.send(JSON.stringify({ type: "start", mimeType: "audio/webm;codecs=opus" })));
+    assert.equal((await recvJson(ws)).type, "ready");
+    const msg = await recvJson(ws);
+    assert.equal(msg.type, "error");
+    assert.equal(msg.code, "VOICE_NO_AUDIO_TIMEOUT");
   });
 
   test("streams plain polish_delta frames before the final authoritative polish", async () => {
