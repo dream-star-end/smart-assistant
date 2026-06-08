@@ -2,7 +2,7 @@
 import { $, htmlSafeEscape } from './dom.js'
 import { maybeNotify, setTitleBusy } from './notifications.js'
 import { getSession, state } from './state.js'
-import { maybeSyncNow } from './sync.js?v=2'
+import { maybeSyncNow } from './sync.js?v=3'
 import { toast } from './ui.js'
 
 // ── Late-binding for circular deps (sessions.js, messages.js) ──
@@ -1894,8 +1894,11 @@ export function handleOutbound(frame) {
     }
   }
   if (sess.id === state.currentSessionId) _deps.updateSessionSub(sess)
-  // Save immediately on isFinal to prevent data loss on refresh; debounce during streaming
-  _deps.scheduleSave(sess, !!frame.isFinal)
+  // Save immediately on isFinal to prevent data loss on refresh; debounce during streaming.
+  // Streaming deltas can arrive many times per second; avoid rebuilding the full
+  // sidebar search index for each partial chunk. `_searchText` is runtime-only,
+  // and the final frame rebuilds it before the immediate save/renderSidebar path.
+  _deps.scheduleSave(sess, !!frame.isFinal, { rebuildSearchIndex: !!frame.isFinal })
   // Only rebuild sidebar on final message (not every streaming delta)
   if (frame.isFinal) _deps.renderSidebar()
 }

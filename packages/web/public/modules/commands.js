@@ -3,7 +3,7 @@ import { apiGet } from './api.js'
 import { $, _mod } from './dom.js'
 import { getSession, state } from './state.js'
 import { toast } from './ui.js'
-import { addSystemMessage, localStopTeardown, nudgeDrain, resetReplyTracker } from './websocket.js'
+import { addSystemMessage, localStopTeardown, nudgeDrain, resetReplyTracker } from './websocket.js?v=41'
 
 // ── Late-binding for circular deps ──
 let _deps = {}

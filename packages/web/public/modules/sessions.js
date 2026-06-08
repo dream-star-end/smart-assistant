@@ -5,10 +5,10 @@ import { exportSessionDocx } from './export-docx.js'
 import { exportSessionTex } from './export-tex.js'
 import { setTitleBusy } from './notifications.js'
 import { getSession, state } from './state.js'
-import { deleteSessionFromServer, hydrateSession, pushSessionToServer } from './sync.js?v=2'
+import { deleteSessionFromServer, hydrateSession, pushSessionToServer } from './sync.js?v=3'
 import { toast } from './ui.js'
 import { GROUP_ORDER, sessionGroup, shortTime, uuid } from './util.js'
-import { nudgeDrain } from './websocket.js?v=40'
+import { nudgeDrain } from './websocket.js?v=41'
 
 // Late-bound references set by main.js
 let _renderMessages
@@ -172,7 +172,7 @@ const _chainTail = new Map() // sessId -> Promise<void> (resolves when _doSave f
 // Sessions that have been deleted — prevents in-flight saves from resurrecting them
 const _deletedIds = new Set()
 
-export function scheduleSave(s, immediate) {
+export function scheduleSave(s, immediate, opts = {}) {
   const sess = s || getSession()
   if (!sess) return
   if (sess._needsFetch && sess._syncedAt) {
@@ -181,7 +181,7 @@ export function scheduleSave(s, immediate) {
   }
   sess.lastAt = Date.now()
   sess._dirty = true // mark as having unsaved local changes
-  _rebuildSearchIndex(sess)
+  if (opts.rebuildSearchIndex !== false) _rebuildSearchIndex(sess)
   const prev = _saveTimers.get(sess.id)
   if (prev) clearTimeout(prev)
   if (immediate) {
