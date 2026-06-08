@@ -589,7 +589,7 @@ async function _doLogin() {
     // refresh_exp 仍保留作为"会话剩余时间"展示用。
     // 2026-04-24:回传 remember 让 main.js 决定 access token 用 sessionStorage
     // 还是 localStorage(与后端 cookie 生命周期对齐)。
-    _onLoginSuccess?.({
+    await _onLoginSuccess?.({
       user: data.user,
       access_token: data.access_token,
       access_exp: data.access_exp,
@@ -632,6 +632,12 @@ async function _doRegister() {
     // 不再需要跨设备 polling —— 用户在同一页面输 code 就完成验证。
     _verifyEmail = email
     setMode('verify')
+    const status = $('auth-verify-status')
+    if (status) {
+      status.textContent = `验证码已发送到 ${email}，30 分钟内有效；没收到请检查垃圾邮件箱，或稍后重发。`
+      status.hidden = false
+      status.style.color = 'var(--success, #2da44e)'
+    }
   })
 }
 

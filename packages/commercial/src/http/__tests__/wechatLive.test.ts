@@ -233,6 +233,92 @@ describe('wechat live snapshot API', () => {
     )
   })
 
+  test('tool messages are redacted to event cards', async () => {
+    const sessionId = 'wsess-deadbeefcafebabe'
+    await storage.upsertMasterClientSession({
+      sessionId,
+      userId: USER_ID,
+      agentId: 'main',
+      originChannel: 'wechat',
+      title: '微信实时任务',
+      createdAt: NOW,
+      lastAt: NOW,
+    })
+    const db = await storage.getSessionsDb()
+    db.prepare(
+      'UPDATE client_sessions SET messages = ?, message_count = ?, updated_at = ?, last_at = ? WHERE id = ? AND user_id = ?',
+    ).run(
+      JSON.stringify([
+        { id: 'u1', role: 'user', text: '帮我查一下', ts: NOW },
+        {
+          id: 't1',
+          role: 'tool',
+          name: 'web_fetch',
+          content: [{ input: 'secret token', output: 'private result' }],
+          ts: NOW + 1,
+        },
+        { id: 'a1', role: 'assistant', text: '完成', ts: NOW + 2 },
+      ]),
+      3,
+      NOW + 10,
+      NOW + 10,
+      sessionId,
+      USER_ID,
+    )
+    const token = makeToken({ sessionId })
+    const { out } = await call('GET', `/api/wechat/live?t=${token}`)
+    assert.equal(out.statusCode, 200)
+    const body = parseJson(out) as { messages: Array<{ role: string; text: string; toolName?: string }> }
+    assert.equal(body.messages[1]!.role, 'event')
+    assert.equal(body.messages[1]!.toolName, 'web_fetch')
+    assert.match(body.messages[1]!.text, /工具调用细节已隐藏/)
+    assert.ok(!JSON.stringify(body).includes('secret token'))
+    assert.ok(!JSON.stringify(body).includes('private result'))
+  })
+
+  test('assistant messages with tool payload are redacted and never JSON-stringified', async () => {
+    const sessionId = 'wsess-3333333333333333'
+    await storage.upsertMasterClientSession({
+      sessionId,
+      userId: USER_ID,
+      agentId: 'main',
+      originChannel: 'wechat',
+      title: '微信实时任务',
+      createdAt: NOW,
+      lastAt: NOW,
+    })
+    const db = await storage.getSessionsDb()
+    db.prepare(
+      'UPDATE client_sessions SET messages = ?, message_count = ?, updated_at = ?, last_at = ? WHERE id = ? AND user_id = ?',
+    ).run(
+      JSON.stringify([
+        { id: 'u1', role: 'user', text: '继续', ts: NOW },
+        {
+          id: 'a-tool',
+          role: 'assistant',
+          tool_calls: [{ function: { name: 'secret_tool', arguments: '{\"apiKey\":\"sk-secret\"}' } }],
+          content: [{ kind: 'tool_result', output: 'private output' }],
+          ts: NOW + 1,
+        },
+      ]),
+      2,
+      NOW + 11,
+      NOW + 11,
+      sessionId,
+      USER_ID,
+    )
+    const token = makeToken({ sessionId })
+    const { out } = await call('GET', `/api/wechat/live?t=${token}`)
+    assert.equal(out.statusCode, 200)
+    const body = parseJson(out) as { messages: Array<{ role: string; text: string }> }
+    assert.equal(body.messages[1]!.role, 'event')
+    assert.match(body.messages[1]!.text, /工具调用细节已隐藏/)
+    const json = JSON.stringify(body)
+    assert.ok(!json.includes('sk-secret'))
+    assert.ok(!json.includes('private output'))
+    assert.ok(!json.includes('tool_calls'))
+  })
+
   test('since equal to updatedAt returns unchanged', async () => {
     const updatedAt = await seedSession('wsess-fedcba9876543210', USER_ID)
     const token = makeToken({ sessionId: 'wsess-fedcba9876543210' })

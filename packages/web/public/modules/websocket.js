@@ -186,6 +186,85 @@ function _probeWsAlive(ws, timeoutMs, label) {
   _pendingPing = { id, ws, timeoutId, label }
 }
 
+function _parseWsCloseReason(reason) {
+  if (typeof reason !== 'string' || !reason) return { raw: '' }
+  try {
+    const parsed = JSON.parse(reason)
+    if (parsed && typeof parsed === 'object') {
+      return { raw: reason, reason: String(parsed.reason || ''), retryAfterSec: Number(parsed.retryAfterSec) || 0 }
+    }
+  } catch {}
+  return { raw: reason, reason }
+}
+
+function _nonAuthPolicyCloseInfo(code, reason) {
+  const parsed = _parseWsCloseReason(reason)
+  const r = parsed.reason || parsed.raw || ''
+  if (code === 4505 || r === 'kicked' || r === 'too_many_connections') {
+    return { status: '连接数超限', toast: '连接数已达上限，请关闭其他标签页或设备后再试。' }
+  }
+  if (code === 4506 || r === 'insufficient_credits') {
+    return { status: '余额不足', toast: '余额不足，请充值后继续。', billing: true }
+  }
+  if (code === 4507 || r === 'unauthorized_model') {
+    return { status: '模型未开通', toast: '当前账号尚未开通该模型，请切换模型或联系管理员。' }
+  }
+  if (code === 4508 || r === 'codex_container_recycled') {
+    return { status: '环境已重建', toast: 'GPT 环境已重建，请刷新页面后重发。' }
+  }
+  return null
+}
+
+export function retryConnectNow(label = '重新连接中…') {
+  if (!state.token) return false
+  if (_wsAuthRefreshInFlight) return false
+  if (state.ws && state.ws.readyState < 2) return false
+  if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+    _isBrowserOnline = false
+    setStatus('离线', 'disconnected')
+    return false
+  }
+  _isBrowserOnline = true
+  _pendingBrowserOfflineAt = 0
+  _reconnectAttempts = 0
+  if (state.reconnectTimer) { clearTimeout(state.reconnectTimer); state.reconnectTimer = null }
+  if (state.reconnectCountdown) { clearInterval(state.reconnectCountdown); state.reconnectCountdown = null }
+  setStatus(label, 'connecting')
+  connect()
+  return true
+}
+
+function _schedulePolicyReconnect(info) {
+  const delay = Number(info?.retryAfterMs) || 0
+  if (delay <= 0 || !state.token) return
+  if (state.reconnectTimer) { clearTimeout(state.reconnectTimer); state.reconnectTimer = null }
+  if (state.reconnectCountdown) { clearInterval(state.reconnectCountdown); state.reconnectCountdown = null }
+  let remaining = Math.ceil(delay / 1000)
+  setStatus(`${info.status} · ${remaining} 秒后重试…`, 'disconnected')
+  state.reconnectCountdown = setInterval(() => {
+    remaining--
+    if (remaining > 0) {
+      setStatus(`${info.status} · ${remaining} 秒后重试…`, 'disconnected')
+    } else if (state.reconnectCountdown) {
+      clearInterval(state.reconnectCountdown)
+      state.reconnectCountdown = null
+    }
+  }, 1000)
+  state.reconnectTimer = setTimeout(() => {
+    state.reconnectTimer = null
+    retryConnectNow()
+  }, delay)
+}
+
+if (typeof window !== 'undefined') {
+  window.addEventListener('openclaude:billing-paid', () => {
+    retryConnectNow('充值成功，正在重新连接…')
+  })
+  window.addEventListener('openclaude:model-policy-fixed', () => {
+    retryConnectNow('模型已切换，正在重新连接…')
+  })
+}
+
 // ── Per-session thinking safety timer ──
 // Clears stuck _sendingInFlight if no outbound frame arrives within 10 minutes.
 // Must be longer than backend's idle timeout (5min default, 15min for tool calls)
@@ -902,30 +981,20 @@ export function nudgeDrain() {
 function _handleDrainTimeout(item) {
   if (state._offlineDrainingCurrent !== item) return
   console.warn('[ws] Drain isFinal timeout for session', item.sessId)
-  // Clear stale sending state for this session
+  // 不再把 120s 当作"本轮已失败"的最终判定。商业版长任务/冷启动/弱网下,
+  // 后端可能仍在执行;静默清掉 _sendingInFlight 会让用户误以为任务丢了并重复发送。
+  // 保持队列停在当前项,给出可见状态,由后端 final/error 或用户 stop 来收口。
   const stuckSess = state.sessions.get(item.sessId)
   if (stuckSess) {
-    stuckSess._sendingInFlight = false
-    clearTurnTiming(stuckSess)
-    // Drain timeout is abandoning this turn; drop the reply tracker so a
-    // belated isFinal can't flag the user message as empty or attach to
-    // the next turn that the user kicks off.
-    resetReplyTracker(stuckSess)
     if (stuckSess.id === state.currentSessionId) {
-      state.sendingInFlight = false
       updateSendEnabled()
-      hideTypingIndicator()
-      setTitleBusy(false)
+      showTypingIndicator()
+      setTitleBusy(true)
+      setStatus('仍在等待回复…', 'connecting')
+      toast('这条离线消息已发出，但暂未收到回复；系统会继续等待，避免重复发送。', 'warning')
     }
   }
-  state._offlineDrainingCurrent = null
-  if (state._offlineQueuePending?.length > 0) {
-    _drainNextOfflineItem()
-  } else {
-    state._offlineQueueDraining = false
-    // drain 自然终态(最后一项 120s timeout 放弃) → promote status pill
-    _maybePromoteToConnected()
-  }
+  state._drainTimeout = setTimeout(() => _handleDrainTimeout(item), 5 * 60_000)
 }
 
 function _drainNextOfflineItem() {
@@ -1035,7 +1104,7 @@ function _drainNextOfflineItem() {
 //   index.html 是源头)。
 let _provisioningHint = false
 const _ORIGINAL_INPUT_PLACEHOLDER = '发消息给 agent…'
-const _PROVISIONING_PLACEHOLDER = '环境初始化中,稍候片刻…'
+const _PROVISIONING_PLACEHOLDER = '环境启动中，可先写需求；就绪后会自动发送…'
 export function setProvisioningBanner(visible) {
   // 短路:状态未变就不动 DOM,避免 reconnect 风暴期间反复刷
   if (_provisioningHint === !!visible) return
@@ -1048,10 +1117,8 @@ export function setProvisioningBanner(visible) {
   const input = $('input')
   if (input) {
     if (_provisioningHint) {
-      input.disabled = true
       input.placeholder = _PROVISIONING_PLACEHOLDER
     } else {
-      input.disabled = false
       input.placeholder = _ORIGINAL_INPUT_PLACEHOLDER
     }
   }
@@ -1062,28 +1129,33 @@ export function setProvisioningBanner(visible) {
 export function setStatus(label, klass) {
   state.wsStatus = klass
   const el = $('status')
-  if (!el) return
-  el.className = `status-pill ${klass}`
-  $('status-text').textContent = label
+  if (el) {
+    el.className = `status-pill ${klass}`
+    $('status-text').textContent = label
+  }
+  setOfflineBanner(klass === 'disconnected', label === '离线'
+    ? '当前离线，消息会排队并在重连后自动发送。'
+    : '连接已断开，消息会排队并在重连后自动发送。')
   updateSendEnabled()
+}
+function setOfflineBanner(visible, text) {
+  const banner = $('offline-banner')
+  if (!banner) return
+  const label = banner.querySelector('.provisioning-banner-text')
+  if (label && text) label.textContent = text
+  if (visible) banner.removeAttribute('hidden')
+  else banner.setAttribute('hidden', '')
 }
 export function updateSendEnabled() {
   const btn = $('send')
   const svg = btn.querySelector('svg')
-  // Provisioning 期间硬禁:输入框已 disabled,但发送按钮也明确 disabled+灰态,
-  // 避免视觉上"按钮亮但点不动"造成混淆。优先级最高,放最前。
-  if (_provisioningHint) {
-    btn.disabled = true
-    btn.classList.remove('stopping')
-    if (svg)
-      svg.innerHTML = '<line x1="12" y1="19" x2="12" y2="5"/><polyline points="5 12 12 5 19 12"/>'
-    return
-  }
   // Allow sending even when disconnected — messages will be queued offline
   // (matching Enter-key behavior which already queues)
   if (state.wsStatus !== 'connected' && !state.sendingInFlight) {
     btn.disabled = false
     btn.classList.remove('stopping')
+    btn.title = _provisioningHint ? '环境启动中，点击后会排队发送' : '发送（离线时会排队）'
+    btn.setAttribute('aria-label', btn.title)
     if (svg)
       svg.innerHTML = '<line x1="12" y1="19" x2="12" y2="5"/><polyline points="5 12 12 5 19 12"/>'
     return
@@ -1091,10 +1163,14 @@ export function updateSendEnabled() {
   if (state.sendingInFlight) {
     btn.disabled = false
     btn.classList.add('stopping')
+    btn.title = '停止生成'
+    btn.setAttribute('aria-label', '停止生成')
     if (svg) svg.innerHTML = '<rect x="6" y="6" width="12" height="12" rx="1"/>'
   } else {
     btn.disabled = false
     btn.classList.remove('stopping')
+    btn.title = '发送'
+    btn.setAttribute('aria-label', '发送')
     if (svg)
       svg.innerHTML = '<line x1="12" y1="19" x2="12" y2="5"/><polyline points="5 12 12 5 19 12"/>'
   }
@@ -1145,9 +1221,12 @@ export function localStopTeardown(sess) {
 
 export function stopCurrentTurn() {
   if (!state.sendingInFlight) return
-  if (!state.ws || state.ws.readyState !== 1) return
   const sess = getSession()
   if (!sess) return
+  if (!state.ws || state.ws.readyState !== 1) {
+    toast('当前已断线，停止指令会在重连后由服务端恢复状态；如需取消请等待重连后再试。', 'warning')
+    return
+  }
   safeWsSend(state.ws, JSON.stringify({
     type: 'inbound.control.stop',
     channel: 'webchat',
@@ -1579,10 +1658,11 @@ export function connect() {
       showTypingIndicator()
       setTitleBusy(true)
     }
-    // Safety timeout: if sessions that were in-flight BEFORE this reconnect still
-    // have _sendingInFlight after 30s, auto-clear them. The snapshot Set is stored
-    // in state so that isFinal handlers can remove resolved sessions — preventing
-    // the timer from accidentally clearing a NEW turn started after reconnect.
+    // Safety notice: if sessions that were in-flight BEFORE this reconnect still
+    // have _sendingInFlight after 30s, do NOT auto-clear them. The backend may
+    // still be running a long turn; clearing locally makes users repeat work.
+    // Instead surface a visible "still waiting" state and let final/error/stop
+    // close the turn.
     if (state._reconnectInFlightTimer) clearTimeout(state._reconnectInFlightTimer)
     state._reconnectInFlightSet = new Set()
     for (const [id, s] of state.sessions) {
@@ -1597,19 +1677,13 @@ export function connect() {
         for (const sessId of snapped) {
           const s = state.sessions.get(sessId)
           if (s && s._sendingInFlight) {
-            console.warn('[ws] Clearing stuck _sendingInFlight for session', s.id)
-            s._sendingInFlight = false
-            clearTurnTiming(s)
-            // Reconnect safety cleared the turn locally — drop the reply
-            // tracker so any isFinal the gateway eventually delivers cannot
-            // retroactively flag the abandoned turn as empty or mis-attach
-            // to a later user message.
-            resetReplyTracker(s)
+            console.warn('[ws] Session still in-flight after reconnect wait', s.id)
             if (s.id === state.currentSessionId) {
-              state.sendingInFlight = false
               updateSendEnabled()
-              hideTypingIndicator()
-              setTitleBusy(false)
+              showTypingIndicator()
+              setTitleBusy(true)
+              setStatus('正在恢复上一轮…', 'connecting')
+              toast('上一轮任务仍在恢复中；未收到最终状态前不会自动清空。', 'warning')
             }
           }
         }
@@ -1701,6 +1775,17 @@ export function connect() {
     state._offlineQueueDraining = false
     updateSendEnabled()
     hideTypingIndicator()
+    const nonAuthPolicy = _nonAuthPolicyCloseInfo(e.code, e.reason)
+    if (nonAuthPolicy) {
+      setProvisioningBanner(false)
+      setStatus(nonAuthPolicy.status, 'disconnected')
+      toast(nonAuthPolicy.toast, nonAuthPolicy.billing ? 'warning' : 'info')
+      if (nonAuthPolicy.billing) {
+        try { refreshBalance() } catch {}
+      }
+      _schedulePolicyReconnect(nonAuthPolicy)
+      return
+    }
     if (e.code === 1008) {
       // 最常见成因:WS 握手用的 state.token(= access JWT)已过期 —— 切后台>15min
       // 回来首次 reconnect 会中招。refresh cookie(30 天)通常还在,先 silentRefresh
@@ -1807,7 +1892,17 @@ export function connect() {
     // 'stopped' 已废弃(v1.0.117 起后端 stopped/missing 直接走 stopAndRemove +
     //   reprovision,落到 'provisioning' reason,前端无需再单独识别 stopped)。
     const PROVISIONING_REASONS = ['provisioning', 'starting']
+    const CLOSE_REASON_LABELS = {
+      host_full: '资源繁忙，正在排队重试',
+      migration_in_progress: '环境迁移中，稍后自动重试',
+      image_missing: '运行镜像未就绪，管理员处理中',
+      image_outdated: '运行镜像更新中，稍后自动重试',
+      baseline_missing: '基础环境未就绪，管理员处理中',
+      data_host_unavailable: '数据节点暂不可用，正在保护你的工作区',
+      supervisor_error: '环境启动异常，稍后自动重试',
+    }
     let isProvisioning = false
+    let closeReasonLabel = ''
     if ((e.code === 4503 || e.code === 4504) && typeof e.reason === 'string' && e.reason.length > 0) {
       try {
         const parsed = JSON.parse(e.reason)
@@ -1820,6 +1915,9 @@ export function connect() {
         }
         if (e.code === 4503 && PROVISIONING_REASONS.includes(parsed?.reason)) {
           isProvisioning = true
+        }
+        if (typeof parsed?.reason === 'string' && CLOSE_REASON_LABELS[parsed.reason]) {
+          closeReasonLabel = CLOSE_REASON_LABELS[parsed.reason]
         }
       } catch { /* 不是 JSON / 非法格式 → 走 fallback backoff */ }
     }
@@ -1835,16 +1933,18 @@ export function connect() {
     if (serverHintedDelay === 0) _reconnectAttempts++
     if (delay >= 4000) {
       let remaining = Math.ceil(delay / 1000)
-      setStatus(`${remaining} 秒后重连…`, 'disconnected')
+      setStatus(closeReasonLabel ? `${closeReasonLabel} · ${remaining} 秒后重试…` : `${remaining} 秒后重连…`, 'disconnected')
       state.reconnectCountdown = setInterval(() => {
         remaining--
         if (remaining > 0) {
-          setStatus(`${remaining} 秒后重连…`, 'disconnected')
+          setStatus(closeReasonLabel ? `${closeReasonLabel} · ${remaining} 秒后重试…` : `${remaining} 秒后重连…`, 'disconnected')
         } else {
           clearInterval(state.reconnectCountdown)
           state.reconnectCountdown = null
         }
       }, 1000)
+    } else if (closeReasonLabel) {
+      setStatus(closeReasonLabel, 'connecting')
     }
     state.reconnectTimer = setTimeout(connect, delay)
   }
@@ -1900,6 +2000,7 @@ export function connect() {
       if (f.type === 'outbound.message') handleOutbound(f)
       else if (f.type === 'outbound.turn_status') handleOutboundTurnStatus(f)
       else if (f.type === 'outbound.error') handleOutboundError(f)
+      else if (f.type === 'error') handleLegacyBridgeError(f)
       else if (f.type === 'outbound.permission_request') handlePermissionRequest(f)
       else if (f.type === 'outbound.permission_settled') handlePermissionSettled(f)
       else if (f.type === 'outbound.resume_failed') handleResumeFailed(f)
@@ -3391,6 +3492,88 @@ function handleOutboundTurnStatus(frame) {
   }
 }
 
+function _normalizeBridgeErrorCode(code) {
+  const raw = String(code || '').trim()
+  const upper = raw.toUpperCase()
+  if (upper === 'ERR_INSUFFICIENT_CREDITS' || upper === 'INSUFFICIENT_CREDITS') {
+    return 'insufficient_credits'
+  }
+  if (upper === 'CODEX_TURN_BUSY') return 'codex_turn_busy'
+  if (upper === 'CODEX_POOL_BUSY') return 'codex_pool_busy'
+  if (upper === 'CODEX_ROUTE_UNAVAILABLE') return 'codex_route_unavailable'
+  if (upper === 'UNAUTHORIZED_MODEL') return 'unauthorized_model'
+  if (upper === 'CODEX_CONTAINER_RECYCLED') return 'codex_container_recycled'
+  if (upper === 'MAINTENANCE') return 'maintenance'
+  return raw ? raw.toLowerCase() : 'unknown'
+}
+
+function _friendlyBridgeErrorMessage(code, message) {
+  const normalized = _normalizeBridgeErrorCode(code)
+  if (normalized === 'insufficient_credits') return '余额不足，充值后即可继续使用。'
+  if (normalized === 'codex_turn_busy') return '上一轮 GPT/Codex 任务仍在运行，请等它结束后再发送。'
+  if (normalized === 'codex_pool_busy') return 'GPT/Codex 账号池繁忙，请稍后重试。'
+  if (normalized === 'codex_route_unavailable') return '当前模型的 GPT/Codex 通道暂不可用，请换模型或稍后重试。'
+  if (normalized === 'unauthorized_model') return '当前账号尚未开通这个模型，请切换模型或联系管理员。'
+  if (normalized === 'codex_container_recycled') return 'GPT 账号配置已变更，环境已重建，请刷新页面后重发。'
+  if (normalized === 'maintenance') return '服务正在维护中，请稍后再试。'
+  return message || '系统暂时不可用，请稍后重试。'
+}
+
+function _markLatestPendingUserMessageErrored(sess) {
+  if (!sess?.messages) return
+  for (let i = sess.messages.length - 1; i >= 0; i--) {
+    const m = sess.messages[i]
+    if (m?.role === 'user' && (m.status === 'sending' || m.status === 'sent' || m.status === 'queued')) {
+      m.status = 'error'
+      updateMsgStatus(m, sess)
+      return
+    }
+  }
+}
+
+function _finishErroredTurn(sess) {
+  if (!sess) return
+  sess._sendingInFlight = false
+  clearTurnTiming(sess)
+  resetReplyTracker(sess)
+  _markLatestPendingUserMessageErrored(sess)
+  if (sess.id === state.currentSessionId) {
+    state.sendingInFlight = false
+    updateSendEnabled()
+    hideTypingIndicator()
+    setTitleBusy(false)
+  }
+}
+
+function handleLegacyBridgeError(frame) {
+  const normalized = _normalizeBridgeErrorCode(frame?.code)
+  const sess = frame?.peer?.id ? state.sessions.get(frame.peer.id) : getSession()
+  if (!sess) return
+  const text = _friendlyBridgeErrorMessage(frame?.code, frame?.message)
+  if (normalized === 'codex_turn_busy' && sess._sendingInFlight) {
+    if (sess.id === state.currentSessionId) {
+      toast(text, 'warning')
+      updateSendEnabled()
+      showTypingIndicator()
+      setTitleBusy(true)
+    }
+    return
+  }
+  addMessage(sess, 'assistant', text, {
+    _errorCode: normalized,
+    _errorDetail: typeof frame?.message === 'string' ? frame.message : '',
+  })
+  // Legacy `type:error` frames do not have a following final frame, so the
+  // frontend must close local turn UI itself. For CODEX_TURN_BUSY this may be
+  // rejecting a duplicate send while another turn is running; showing an error
+  // and leaving the UI stuck is worse, and backend single-flight still protects
+  // actual execution.
+  _finishErroredTurn(sess)
+  if (normalized === 'insufficient_credits') {
+    try { refreshBalance() } catch {}
+  }
+}
+
 function handleOutboundError(frame) {
   const peerId = frame.peer?.id
   const sess = peerId ? state.sessions.get(peerId) : null
@@ -3400,11 +3583,12 @@ function handleOutboundError(frame) {
     if (!_acceptFrameSeq(sess, frame)) return
     sess._suppressErrorBubbleAtSeq = frame.frameSeq + 1
   }
-  addMessage(sess, 'assistant', frame.message || '出错了', {
-    _errorCode: frame.code,
+  const normalized = _normalizeBridgeErrorCode(frame.code)
+  addMessage(sess, 'assistant', _friendlyBridgeErrorMessage(frame.code, frame.message || '出错了'), {
+    _errorCode: normalized,
     _errorDetail: typeof frame.detail === 'string' ? frame.detail : '',
   })
-  if (frame.code === 'insufficient_credits') {
+  if (normalized === 'insufficient_credits') {
     try { refreshBalance() } catch {}
   }
 }

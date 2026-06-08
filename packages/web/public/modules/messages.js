@@ -2270,7 +2270,7 @@ export function _buildMessageEl(msg) {
         cta.textContent = '去充值'
         cta.addEventListener('click', () => {
           try {
-            _openTopupModal()
+            _openTopupModal({ force: true })
           } catch (e) {
             toast('打开充值失败', 'error')
             console.error('[msg-error-cta] _openTopupModal failed', e)

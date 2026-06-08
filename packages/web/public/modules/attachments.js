@@ -57,6 +57,16 @@ const TEXT_EXTS = /\.(txt|md|json|yaml|yml|csv|log|xml|html|js|ts|tsx|py|go|rs|j
 // 默认行为决定;若未来要明确允许或拒绝可执行文件,需在前端或后端加 denylist/allowlist。
 const ARCHIVE_EXTS_OCTET_FALLBACK = /\.(rar|7z|tar|gz|tgz|bz2|xz|zst)$/i
 
+function _shortUploadError(message) {
+  const raw = String(message || '').trim()
+  if (!raw) return '上传失败'
+  if (/too large|payload|size|413|文件.*大|超出/i.test(raw)) return '文件过大'
+  if (/401|403|unauth|登录|token/i.test(raw)) return '登录已失效'
+  if (/timeout|timed? out|超时/i.test(raw)) return '网络超时'
+  if (/network|fetch|连接|离线/i.test(raw)) return '网络失败'
+  return raw.length > 18 ? `${raw.slice(0, 18)}…` : raw
+}
+
 export function classifyFile(file) {
   const t = (file.type || '').toLowerCase()
   const name = (file.name || '').toLowerCase()
@@ -250,6 +260,9 @@ async function _uploadOne(att, file) {
     if (data.serverPath) att.serverPath = data.serverPath
     if (data.size) att.size = data.size
     att._uploading = false
+    att._uploadFailed = false
+    att._uploadError = ''
+    att._file = null
     att._progress = 1
     att._abort = null
     if (att._objectUrl) {
@@ -260,12 +273,10 @@ async function _uploadOne(att, file) {
   } catch (err) {
     // AbortError = 用户主动 remove/clear,不要再 toast(removeAttachment 已处理)
     if (err && err.name === 'AbortError') return
-    const idx = state.attachments.indexOf(att)
-    if (idx >= 0) state.attachments.splice(idx, 1)
-    if (att._objectUrl) {
-      try { URL.revokeObjectURL(att._objectUrl) } catch {}
-      att._objectUrl = null
-    }
+    att._uploading = false
+    att._uploadFailed = true
+    att._uploadError = err && err.message ? err.message : String(err)
+    att._abort = null
     toast(`上传 ${att.name} 失败: ${err && err.message ? err.message : err}`, 'error')
     renderAttachments()
   }
@@ -309,6 +320,7 @@ export async function addFiles(fileList) {
         // image/audio/video/file 走 /api/uploads。先 push,后异步上传 — 这样多个
         // 文件能并行起飞,UI 即时显示 _uploading 占位,不阻塞用户继续添加。
         att._uploading = true
+        att._file = f
         if (kind === 'image') {
           // 图片预览用 objectURL(transient,不进 messages),上传成功后切回 att.url
           try {
@@ -375,6 +387,7 @@ export function renderAttachments() {
     const item = document.createElement('div')
     item.className = 'attach-item'
     if (a._uploading) item.classList.add('attach-uploading')
+    if (a._uploadFailed) item.classList.add('attach-error')
     if (a.kind === 'image' && (a._objectUrl || a.url)) {
       const img = document.createElement('img')
       img.className = 'attach-thumb'
@@ -411,6 +424,28 @@ export function renderAttachments() {
       fill.style.width = `${pct}%`
       bar.appendChild(fill)
       item.appendChild(bar)
+    } else if (a._uploadFailed) {
+      const err = document.createElement('span')
+      err.className = 'attach-progress-text attach-error-text'
+      err.textContent = _shortUploadError(a._uploadError)
+      err.title = a._uploadError || '上传失败'
+      item.appendChild(err)
+      if (a._file) {
+        const retry = document.createElement('button')
+        retry.className = 'attach-retry'
+        retry.type = 'button'
+        retry.textContent = '重试'
+        retry.title = '重新上传'
+        retry.onclick = () => {
+          a._uploadFailed = false
+          a._uploadError = ''
+          a._uploading = true
+          a._progress = 0
+          renderAttachments()
+          _uploadOne(a, a._file)
+        }
+        item.appendChild(retry)
+      }
     }
     const rm = document.createElement('button')
     rm.className = 'attach-remove'

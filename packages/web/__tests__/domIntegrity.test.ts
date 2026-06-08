@@ -79,6 +79,8 @@ const DYNAMIC_IDS = new Set([
   'plan-panel',
   'plan-panel-close',
   'plan-panel-content',
+  // billing.js 在支付轮询失败后动态注入重查按钮。
+  'topup-retry-poll-btn',
 ])
 
 // ── Template-literal dynamic IDs: $(`prefix-${var}`) ──

@@ -70,6 +70,20 @@ export function softReasonPriority(code: QuarantineReasonCode): number {
   }
 }
 
+/** Existing user volume is pinned to a host that is currently unavailable.
+ * Do not silently fall back to another host, because that creates an empty
+ * workspace and looks like data loss to the user. */
+export class DataHostUnavailableError extends Error {
+  constructor(
+    message: string,
+    public readonly hostId: string,
+    public readonly hostStatus: string,
+  ) {
+    super(message);
+    this.name = "DataHostUnavailableError";
+  }
+}
+
 export interface ComputeHostRow {
   id: string;
   name: string;
