@@ -56,7 +56,7 @@ import {
 } from './attachments.js'
 
 // ── Speech recognition ──
-import { initSpeech, setAutoResize, toggleVoice } from './speech.js'
+import { bindVoiceButton, setAutoResize } from './speech.js'
 
 // ── Notifications ──
 import {
@@ -1721,7 +1721,7 @@ async function init() {
     await loadMemoryTab('user')
   }
   $('save-memory-btn').onclick = saveMemory
-  $('voice-btn').onclick = toggleVoice
+  bindVoiceButton($('voice-btn'))
   $('upload-btn').onclick = () => $('file-input').click()
   $('file-input').addEventListener('change', (e) => {
     if (e.target.files && e.target.files.length > 0) addFiles(e.target.files)

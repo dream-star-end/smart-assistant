@@ -4,6 +4,7 @@ import { mkdir, readFile, rename, unlink, writeFile } from 'node:fs/promises'
 import { type IncomingMessage, type ServerResponse, createServer } from 'node:http'
 import { homedir } from 'node:os'
 import { basename, dirname, extname, join, relative, resolve } from 'node:path'
+import type { Duplex } from 'node:stream'
 import type { ChannelAdapter, ChannelContext } from '@openclaude/plugin-sdk'
 import type { InboundFrame, InboundMessage, OutboundMessage } from '@openclaude/protocol'
 import {
@@ -52,10 +53,15 @@ import { handleOpenAIRequest } from './openaiCompat.js'
 import { DEFAULT_RING_CONFIG, type EvictionStats, OutboundRingBuffer } from './outboundRing.js'
 import { looksRedactedProxyUrl, maskProxyUrl, normalizeProxyUrl } from './proxyEnv.js'
 import { RateLimiter } from './rateLimit.js'
-import { RedisSessionBus, type RedisFrameEnvelope } from './redisSessionBus.js'
+import { type RedisFrameEnvelope, RedisSessionBus } from './redisSessionBus.js'
 import { Router } from './router.js'
 import { RunLog } from './runLog.js'
 import { SessionManager } from './sessionManager.js'
+import {
+  VOICE_WS_PATH,
+  type VoiceTranscribeHandler,
+  createVoiceTranscribeHandler,
+} from './voiceTranscribe.js'
 import { WebhookRouter } from './webhooks.js'
 
 type WechatChannelModule = typeof import('@openclaude/channel-wechat')
@@ -63,6 +69,13 @@ type WechatChannelModule = typeof import('@openclaude/channel-wechat')
 function clampNumber(value: number, min: number, max: number): number {
   if (!Number.isFinite(value)) return min
   return Math.min(max, Math.max(min, value))
+}
+
+function envNumber(name: string): number | undefined {
+  const raw = process.env[name]
+  if (!raw) return undefined
+  const n = Number(raw)
+  return Number.isFinite(n) ? n : undefined
 }
 
 // User-Agent for gateway-internal Claude OAuth fetch (token exchange + refresh).
@@ -85,6 +98,7 @@ export interface GatewayDeps {
 
 export class Gateway {
   private wss!: WebSocketServer
+  private voiceTranscribe: VoiceTranscribeHandler | null = null
   private httpServer!: ReturnType<typeof createServer>
   private router: Router
   private sessions: SessionManager
@@ -455,7 +469,30 @@ export class Gateway {
     }
 
     this.httpServer = createServer((req, res) => this.handleHttp(req, res))
-    this.wss = new WebSocketServer({ server: this.httpServer, path: '/ws' })
+    this.wss = new WebSocketServer({ noServer: true })
+    this.voiceTranscribe = createVoiceTranscribeHandler({
+      accessToken: config.gateway.accessToken,
+      deepgramApiKey: process.env.DEEPGRAM_API_KEY,
+      deepseekApiKey: process.env.DEEPSEEK_API_KEY,
+      asrModel: process.env.VOICE_ASR_MODEL,
+      asrLanguage: process.env.VOICE_ASR_LANGUAGE,
+      voicePolishModel: process.env.VOICE_POLISH_MODEL,
+      maxSeconds: envNumber('VOICE_MAX_SECONDS'),
+      maxPerUser: envNumber('VOICE_MAX_PER_USER'),
+      maxGlobal: envNumber('VOICE_MAX_GLOBAL'),
+      maxAudioFrameBytes: envNumber('VOICE_MAX_AUDIO_FRAME_BYTES'),
+      finalWaitMs: envNumber('VOICE_FINAL_WAIT_MS'),
+      deepgramOpenTimeoutMs: envNumber('VOICE_DEEPGRAM_OPEN_TIMEOUT_MS'),
+      noAudioTimeoutMs:
+        envNumber('VOICE_NO_AUDIO_TIMEOUT_MS') ?? envNumber('VOICE_NO_AUDIO_TIMEOUT'),
+      logger: createLogger({ module: 'voice-transcribe' }),
+    })
+    this.log.info('voice transcribe ws ready', {
+      path: VOICE_WS_PATH,
+      asrConfigured: Boolean(process.env.DEEPGRAM_API_KEY),
+      polishConfigured: Boolean(process.env.DEEPSEEK_API_KEY),
+    })
+    this.httpServer.on('upgrade', (req, socket, head) => this.handleHttpUpgrade(req, socket, head))
     await this._redisSessionBus.start((frame) => this._handleRedisSessionFrame(frame))
     if (clearClientSessionCacheAfterRedisStart) this._redisSessionBus.clearClientSessionCache()
 
@@ -972,6 +1009,13 @@ export class Gateway {
     // WS: terminate remaining clients so `wss.close()` callback fires promptly.
     // HTTP: `closeAllConnections()` destroys active sockets (e.g. SSE streams)
     //       that would otherwise block the Stage 1 `close()` callback.
+    const voiceCloseDone = this.voiceTranscribe
+      ? this.voiceTranscribe
+          .shutdown('shutdown')
+          .catch((err) => this.log.warn('voice transcribe shutdown error', undefined, err))
+      : Promise.resolve()
+    this.voiceTranscribe = null
+
     if (this.httpServer) {
       try {
         const closeAll = (this.httpServer as any).closeAllConnections
@@ -997,7 +1041,7 @@ export class Gateway {
         resolveClose()
       }
     })
-    await Promise.allSettled([httpCloseDone, wssCloseDone])
+    await Promise.allSettled([httpCloseDone, wssCloseDone, voiceCloseDone])
     this.log.info('shutdown complete')
     if (exit) process.exit(0)
   }
@@ -1022,7 +1066,7 @@ export class Gateway {
     res.setHeader('X-Content-Type-Options', 'nosniff')
     res.setHeader('X-Frame-Options', 'DENY')
     res.setHeader('Referrer-Policy', 'no-referrer')
-    res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=()')
+    res.setHeader('Permissions-Policy', 'camera=(), microphone=(self), geolocation=()')
 
     // Instrument response — record metrics after response finishes
     res.on('finish', () => {
@@ -3267,6 +3311,30 @@ export class Gateway {
       req.on('end', () => resolve(Buffer.concat(chunks).toString()))
       req.on('error', reject)
     })
+  }
+
+  private handleHttpUpgrade(req: IncomingMessage, socket: Duplex, head: Buffer): void {
+    if (this._shuttingDown) {
+      try {
+        socket.destroy()
+      } catch {}
+      return
+    }
+    if (this.voiceTranscribe?.handleUpgrade(req, socket, head)) return
+
+    let pathname = ''
+    try {
+      pathname = new URL(req.url ?? '/', 'http://placeholder').pathname
+    } catch {}
+    if (pathname === '/ws') {
+      this.wss.handleUpgrade(req, socket, head, (ws) => {
+        this.wss.emit('connection', ws, req)
+      })
+      return
+    }
+    try {
+      socket.destroy()
+    } catch {}
   }
 
   private wsClients = new Set<WebSocket>()
