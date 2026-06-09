@@ -4,7 +4,7 @@
 
 import { apiFetch, apiGet, apiJson, authHeaders } from './api.js'
 import { dbDelete, dbGetAll, dbPut } from './db.js'
-import { _rebuildSearchIndex, clearDeleteTombstone, isDeletePending } from './sessions.js?v=5'
+import { _rebuildSearchIndex, clearDeleteTombstone, isDeletePending } from './sessions.js?v=6'
 import { state } from './state.js'
 
 // Dep-injected callback: fired when a push hits a 409 conflict and we
@@ -339,7 +339,8 @@ function _copyLocalSessionRuntimeState(sess, existingLocal) {
   if (existingLocal._sendingInFlight) sess._sendingInFlight = true
   if (existingLocal._turnStartedAt) sess._turnStartedAt = existingLocal._turnStartedAt
   if (existingLocal._lastFrameAt) sess._lastFrameAt = existingLocal._lastFrameAt
-  if (typeof existingLocal._lastFrameSeq === 'number') sess._lastFrameSeq = existingLocal._lastFrameSeq
+  if (typeof existingLocal._lastFrameSeq === 'number')
+    sess._lastFrameSeq = existingLocal._lastFrameSeq
   if (existingLocal._liveStreamBroken) sess._liveStreamBroken = true
   if (existingLocal._tokenUsage) sess._tokenUsage = existingLocal._tokenUsage
   return sess
@@ -371,7 +372,9 @@ export function _buildSessionFromRemote(remote, existingLocal, { placeholder = f
   if (
     placeholder &&
     (messageCount > messages.length ||
-      (existingLocal?._syncedAt && remote.updatedAt && existingLocal._syncedAt !== remote.updatedAt))
+      (existingLocal?._syncedAt &&
+        remote.updatedAt &&
+        existingLocal._syncedAt !== remote.updatedAt))
   )
     sess._needsFetch = true
   _copyLocalSessionRuntimeState(sess, existingLocal)
@@ -451,7 +454,7 @@ export async function hydrateSession(id, { force = false } = {}) {
   const trackedHydration = hydration.finally(() => {
     const live = state.sessions.get(id)
     if (live) {
-      delete live._hydratePromise
+      live._hydratePromise = undefined
       live._hydrating = false
     }
   })

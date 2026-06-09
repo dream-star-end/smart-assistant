@@ -122,6 +122,7 @@ type CodexGoalBlock = {
   tokenBudget?: number | null
   tokensUsed?: number
   timeUsedSeconds?: number
+  createdAt?: number
   updatedAt?: number
   cleared?: boolean
 }
@@ -170,6 +171,8 @@ function normalizeCodexGoal(raw: unknown, cleared = false): CodexGoalBlock {
   if (tokensUsed !== undefined) goal.tokensUsed = tokensUsed
   const timeUsedSeconds = finiteNumber(obj.timeUsedSeconds)
   if (timeUsedSeconds !== undefined) goal.timeUsedSeconds = timeUsedSeconds
+  const createdAt = finiteNumber(obj.createdAt)
+  if (createdAt !== undefined) goal.createdAt = createdAt
   const updatedAt = finiteNumber(obj.updatedAt)
   if (updatedAt !== undefined) goal.updatedAt = updatedAt
   if (cleared) goal.cleared = true
@@ -501,6 +504,10 @@ export class CodexAppServerRunner extends EventEmitter {
   private collabSpawnReceivers = new Map<string, Set<string>>()
   private completedCollabSpawnResults = new Set<string>()
   private conversationMode: 'default' | 'plan' = 'default'
+  /** Serializes cold thread attach for both turns and out-of-band controls
+   *  (goals). Without this, a first user turn and a simultaneous goal action
+   *  could both issue thread/start or thread/resume against the same proc. */
+  private attachPromise: Promise<void> | null = null
   /** In-flight `handleItemCompleted` promises for the current turn. codex
    *  emits `item/completed` then `turn/completed` back-to-back; the
    *  per-item handler is async (file IO for imageGeneration base64 decode,
@@ -1610,6 +1617,107 @@ export class CodexAppServerRunner extends EventEmitter {
     this.emit('session_id', tid)
   }
 
+  private async attachThreadOnce(): Promise<void> {
+    if (this.attached) return
+    if (!this.threadId) {
+      await this._startNewThread()
+    } else {
+      try {
+        await this.sendRequest('thread/resume', {
+          threadId: this.threadId,
+          approvalPolicy: 'never',
+          sandbox: 'danger-full-access',
+          cwd: this.opts.cwd,
+          ...(this.opts.model ? { model: this.opts.model } : {}),
+        })
+      } catch (err) {
+        // Self-heal "no rollout found for thread id" (-32600). Caused by
+        // master sessionManager persisting `thread_id` across container
+        // rebuilds while the codex `~/.codex/sessions/...` rollout JSONL
+        // lives only in the per-container ephemeral layer. Without this,
+        // every fresh container's first GPT turn ended in a 31ms empty
+        // result frame and the user saw "未收到回复" (Codex review
+        // #019e0b72 BLOCKER 1, root cause confirmed by user).
+        //
+        // Trade-off: we lose conversation context for that one turn since
+        // the rollout really is gone. emit('session_id') feeds the new
+        // tid back into sessionManager → resume-map, so subsequent turns
+        // recover normally. Any other thread/resume error (proc died,
+        // schema drift, etc.) re-throws so the outer catch surfaces it
+        // as ok=false rather than masking it with a fresh thread.
+        if (!isMissingRolloutError(err)) throw err
+        log.warn('codex thread/resume missing rollout — restarting fresh', {
+          sessionKey: this.opts.sessionKey,
+          staleThreadId: this.threadId,
+          rpcMessage: (err as JsonRpcCallError).rpcMessage,
+        })
+        this.threadId = null
+        await this._startNewThread()
+      }
+    }
+    this.attached = true
+  }
+
+  /** Ensure the JSON-RPC proc is initialized and attached to a thread.
+   *  Shared by ordinary turns and out-of-band goal controls. */
+  private async ensureThreadAttached(): Promise<void> {
+    if (this.attached) return
+    if (!this.attachPromise) {
+      this.attachPromise = (async () => {
+        await this.ensureSpawned()
+        await this.attachThreadOnce()
+      })().finally(() => {
+        this.attachPromise = null
+      })
+    }
+    await this.attachPromise
+  }
+
+  async getGoal(): Promise<CodexGoalBlock | null> {
+    await this.ensureThreadAttached()
+    const res = (await this.sendRequest('thread/goal/get', {
+      threadId: this.threadId,
+    })) as { goal?: unknown } | undefined
+    const rawGoal = res?.goal ?? null
+    if (!rawGoal) {
+      const cleared = normalizeCodexGoal(undefined, true)
+      this.emitGoalBlock(cleared)
+      return null
+    }
+    const goal = normalizeCodexGoal(rawGoal)
+    this.emitGoalBlock(goal)
+    return goal
+  }
+
+  async setGoal(input: {
+    objective?: string | null
+    status?: string | null
+    tokenBudget?: number | null
+  }): Promise<CodexGoalBlock> {
+    await this.ensureThreadAttached()
+    const params: Record<string, unknown> = { threadId: this.threadId }
+    if (input.objective !== undefined) params.objective = input.objective
+    if (input.status !== undefined) params.status = input.status
+    if (input.tokenBudget !== undefined) params.tokenBudget = input.tokenBudget
+
+    const res = (await this.sendRequest('thread/goal/set', params)) as
+      | { goal?: unknown }
+      | undefined
+    const goal = normalizeCodexGoal(res?.goal)
+    this.emitGoalBlock(goal)
+    return goal
+  }
+
+  async clearGoal(): Promise<boolean> {
+    await this.ensureThreadAttached()
+    const res = (await this.sendRequest('thread/goal/clear', {
+      threadId: this.threadId,
+    })) as { cleared?: boolean } | undefined
+    const cleared = res?.cleared !== false
+    if (cleared) this.emitGoalBlock(normalizeCodexGoal(undefined, true))
+    return cleared
+  }
+
   private async runTurn(prompt: string): Promise<void> {
     const startedAt = Date.now()
     log.info('codex app-server turn start', {
@@ -1623,54 +1731,7 @@ export class CodexAppServerRunner extends EventEmitter {
     this.reasoningItemsWithDeltas.clear()
 
     try {
-      await this.ensureSpawned()
-
-      // Each fresh app-server proc must explicitly attach a thread before
-      // turn/start. `attached` is per-proc (cleared on close/error), so this
-      // fires correctly on:
-      //   1. first turn after construction (no threadId → thread/start)
-      //   2. first turn after construction with resumeSessionId (thread/resume)
-      //   3. first turn after proc respawn (shutdown / crash) — re-attach via
-      //      thread/resume against the captured threadId.
-      if (!this.attached) {
-        if (!this.threadId) {
-          await this._startNewThread()
-        } else {
-          try {
-            await this.sendRequest('thread/resume', {
-              threadId: this.threadId,
-              approvalPolicy: 'never',
-              sandbox: 'danger-full-access',
-              cwd: this.opts.cwd,
-              ...(this.opts.model ? { model: this.opts.model } : {}),
-            })
-          } catch (err) {
-            // Self-heal "no rollout found for thread id" (-32600). Caused by
-            // master sessionManager persisting `thread_id` across container
-            // rebuilds while the codex `~/.codex/sessions/...` rollout JSONL
-            // lives only in the per-container ephemeral layer. Without this,
-            // every fresh container's first GPT turn ended in a 31ms empty
-            // result frame and the user saw "未收到回复" (Codex review
-            // #019e0b72 BLOCKER 1, root cause confirmed by user).
-            //
-            // Trade-off: we lose conversation context for that one turn since
-            // the rollout really is gone. emit('session_id') feeds the new
-            // tid back into sessionManager → resume-map, so subsequent turns
-            // recover normally. Any other thread/resume error (proc died,
-            // schema drift, etc.) re-throws so the outer catch surfaces it
-            // as ok=false rather than masking it with a fresh thread.
-            if (!isMissingRolloutError(err)) throw err
-            log.warn('codex thread/resume missing rollout — restarting fresh', {
-              sessionKey: this.opts.sessionKey,
-              staleThreadId: this.threadId,
-              rpcMessage: (err as JsonRpcCallError).rpcMessage,
-            })
-            this.threadId = null
-            await this._startNewThread()
-          }
-        }
-        this.attached = true
-      }
+      await this.ensureThreadAttached()
 
       // Set up the completion box BEFORE turn/start so a fast turn/completed
       // notification (rare but possible) doesn't slip past us.

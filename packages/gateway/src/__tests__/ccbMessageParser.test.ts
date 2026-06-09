@@ -116,6 +116,7 @@ describe('CcbMessageParser: text streaming', () => {
         tokenBudget: null,
         tokensUsed: 42,
         timeUsedSeconds: 7,
+        createdAt: 1779999999,
         updatedAt: 1780000000,
         cleared: false,
       },
@@ -132,6 +133,7 @@ describe('CcbMessageParser: text streaming', () => {
       assert.equal(b.tokenBudget, null)
       assert.equal(b.tokensUsed, 42)
       assert.equal(b.timeUsedSeconds, 7)
+      assert.equal(b.createdAt, 1779999999)
       assert.equal(b.updatedAt, 1780000000)
       assert.equal(b.cleared, false)
     }
