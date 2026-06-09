@@ -111,6 +111,10 @@ const getLatestPlanAndTodos = new Function(
 ${extractFunction(appJs, 'getLatestPlanAndTodos').replace(/^export\s+/, '')}; return getLatestPlanAndTodos;`,
 )() as (sess: any) => { plan: any; todo: any }
 
+const parseGoalCommand = makeCallable<(args?: string) => any>(
+  extractFunction(appJs, 'parseGoalCommand'),
+)
+
 // Note: effectiveTheme() and isSending() depend on browser APIs (localStorage, state).
 // htmlSafeEscape is a one-line arrow function — hard to extract with indent matching.
 // All three will be directly importable after Phase 2 module extraction.
@@ -441,14 +445,10 @@ describe('T-LATEX-INTEGRATION: codexDisplayMath / codexInlineMath wiring', () =>
   })
 })
 
-
 // ── T-AUTO-PLAN: automatic plan-first routing heuristic ──
 describe('T-AUTO-PLAN: shouldAutoPlan heuristic', () => {
   it('routes complex multi-step code work to plan mode', () => {
-    assert.equal(
-      shouldAutoPlan('修复 gateway 认证问题，然后补测试并保证前端缓存兼容'),
-      true,
-    )
+    assert.equal(shouldAutoPlan('修复 gateway 认证问题，然后补测试并保证前端缓存兼容'), true)
   })
   it('keeps simple one-step requests in default mode', () => {
     assert.equal(shouldAutoPlan('把按钮文案改成保存'), false)
@@ -492,7 +492,12 @@ describe('T-PLAN-PANEL: plan markdown rendering and quick panel wiring', () => {
     )
   })
   it('keeps the generated plan document while using later steps as task progress', () => {
-    const docPlan = { id: 'plan-doc', role: 'plan', text: '# Plan\n\nDo the work.', _partial: false }
+    const docPlan = {
+      id: 'plan-doc',
+      role: 'plan',
+      text: '# Plan\n\nDo the work.',
+      _partial: false,
+    }
     const progressPlan = {
       id: 'plan-progress',
       role: 'plan',
@@ -519,6 +524,57 @@ describe('T-PLAN-PANEL: plan markdown rendering and quick panel wiring', () => {
       styleCss.includes('.plan-panel-btn') && styleCss.includes('.plan-panel-badge'),
       'style.css should style the plan panel trigger and badge',
     )
+  })
+})
+
+// ── T-GOAL-CONTROL: Codex persistent goal slash command parsing ──
+describe('T-GOAL-CONTROL: /goal command parser', () => {
+  it('maps empty/status requests to get', () => {
+    assert.deepEqual(parseGoalCommand(''), { action: 'get' })
+    assert.deepEqual(parseGoalCommand('status'), { action: 'get' })
+  })
+  it('maps clear aliases to clear', () => {
+    assert.deepEqual(parseGoalCommand('clear'), { action: 'clear' })
+    assert.deepEqual(parseGoalCommand('delete'), { action: 'clear' })
+    assert.deepEqual(parseGoalCommand('remove'), { action: 'clear' })
+  })
+  it('maps lifecycle shortcuts to status-only set operations', () => {
+    assert.deepEqual(parseGoalCommand('pause'), {
+      action: 'set',
+      fields: { status: 'paused' },
+    })
+    assert.deepEqual(parseGoalCommand('resume'), {
+      action: 'set',
+      fields: { status: 'active' },
+    })
+    assert.deepEqual(parseGoalCommand('complete'), {
+      action: 'set',
+      fields: { status: 'complete' },
+    })
+  })
+  it('parses numeric token budgets and budget clearing', () => {
+    assert.deepEqual(parseGoalCommand('budget 12,345'), {
+      action: 'set',
+      fields: { tokenBudget: 12345 },
+    })
+    assert.deepEqual(parseGoalCommand('budget none'), {
+      action: 'set',
+      fields: { tokenBudget: null },
+    })
+  })
+  it('parses objectives with optional trailing --budget', () => {
+    assert.deepEqual(parseGoalCommand('修复 Codex goals UI --budget 2,000'), {
+      action: 'set',
+      fields: {
+        objective: '修复 Codex goals UI',
+        status: 'active',
+        tokenBudget: 2000,
+      },
+    })
+  })
+  it('rejects invalid budget values', () => {
+    const result = parseGoalCommand('budget nope')
+    assert.equal(result.error, '预算必须是正数，或使用 `/goal budget none` 清除预算。')
   })
 })
 

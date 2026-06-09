@@ -1,4 +1,5 @@
 import * as assert from 'node:assert/strict'
+import { EventEmitter } from 'node:events'
 /**
  * Tests for CodexAppServerRunner — the JSON-RPC 2.0 client over
  * `codex app-server --listen stdio://` that replaces the legacy
@@ -11,7 +12,6 @@ import * as assert from 'node:assert/strict'
  * Run: npx tsx --test packages/gateway/src/__tests__/codexAppServerRunner.test.ts
  */
 import { mkdtemp, rm, writeFile } from 'node:fs/promises'
-import { EventEmitter } from 'node:events'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { PassThrough } from 'node:stream'
@@ -123,7 +123,7 @@ function makeSpawnedFakeProc(written: string[], opts: { replyInitialize?: boolea
       written.push(line)
       const req = JSON.parse(line)
       if (opts.replyInitialize !== false && req.method === 'initialize') {
-        ee.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: req.id, result: {} }) + '\n')
+        ee.stdout.write(`${JSON.stringify({ jsonrpc: '2.0', id: req.id, result: {} })}\n`)
       }
     }
   })
@@ -712,6 +712,7 @@ describe('handleNotification — goals', () => {
           tokenBudget: 1000,
           tokensUsed: 125,
           timeUsedSeconds: 8,
+          createdAt: 1779999999,
           updatedAt: 1780000000,
         },
       },
@@ -726,6 +727,7 @@ describe('handleNotification — goals', () => {
       tokenBudget: 1000,
       tokensUsed: 125,
       timeUsedSeconds: 8,
+      createdAt: 1779999999,
       updatedAt: 1780000000,
     })
     assert.equal((h.runner as any).currentAssistantBuf, '')
@@ -748,6 +750,96 @@ describe('handleNotification — goals', () => {
       blockId: 'codex-goal',
       cleared: true,
     })
+    await h.cleanup()
+  })
+
+  it('setGoal cold-starts a thread, sends thread/goal/set, and emits a goal block', async () => {
+    const h = await makeHarness({ withFakeProc: true })
+
+    const p = h.runner.setGoal({
+      objective: 'Ship UI controls',
+      status: 'active',
+      tokenBudget: 500,
+    })
+
+    await waitFor(() => h.written.length === 1)
+    const startReq = JSON.parse(h.written[0])
+    assert.equal(startReq.method, 'thread/start')
+    feed(h.runner, {
+      jsonrpc: '2.0',
+      id: startReq.id,
+      result: { thread: { id: 'thr-goal-set' } },
+    })
+
+    await waitFor(() => h.written.length === 2)
+    const setReq = JSON.parse(h.written[1])
+    assert.equal(setReq.method, 'thread/goal/set')
+    assert.deepEqual(setReq.params, {
+      threadId: 'thr-goal-set',
+      objective: 'Ship UI controls',
+      status: 'active',
+      tokenBudget: 500,
+    })
+    feed(h.runner, {
+      jsonrpc: '2.0',
+      id: setReq.id,
+      result: {
+        goal: {
+          objective: 'Ship UI controls',
+          status: 'active',
+          tokenBudget: 500,
+          tokensUsed: 0,
+          timeUsedSeconds: 0,
+          updatedAt: 1780000000,
+        },
+      },
+    })
+
+    const goal = await p
+    assert.equal(goal.objective, 'Ship UI controls')
+    assert.equal(h.sessionIds[0], 'thr-goal-set')
+    assert.equal(h.messages.at(-1).type, 'openclaude_goal')
+    assert.equal(h.messages.at(-1).goal.objective, 'Ship UI controls')
+    await h.cleanup()
+  })
+
+  it('getGoal emits a cleared goal block when Codex reports no goal', async () => {
+    const h = await makeHarness({ withFakeProc: true, resumeSessionId: 'thr-goal-get' })
+
+    const p = h.runner.getGoal()
+
+    await waitFor(() => h.written.length === 1)
+    const resumeReq = JSON.parse(h.written[0])
+    assert.equal(resumeReq.method, 'thread/resume')
+    feed(h.runner, { jsonrpc: '2.0', id: resumeReq.id, result: {} })
+
+    await waitFor(() => h.written.length === 2)
+    const getReq = JSON.parse(h.written[1])
+    assert.equal(getReq.method, 'thread/goal/get')
+    assert.deepEqual(getReq.params, { threadId: 'thr-goal-get' })
+    feed(h.runner, { jsonrpc: '2.0', id: getReq.id, result: { goal: null } })
+
+    assert.equal(await p, null)
+    assert.equal(h.messages.at(-1).type, 'openclaude_goal')
+    assert.deepEqual(h.messages.at(-1).goal, { blockId: 'codex-goal', cleared: true })
+    await h.cleanup()
+  })
+
+  it('clearGoal sends thread/goal/clear and emits a cleared goal block', async () => {
+    const h = await makeHarness({ withFakeProc: true, resumeSessionId: 'thr-goal-clear' })
+    ;(h.runner as any).attached = true
+
+    const p = h.runner.clearGoal()
+
+    await waitFor(() => h.written.length === 1)
+    const clearReq = JSON.parse(h.written[0])
+    assert.equal(clearReq.method, 'thread/goal/clear')
+    assert.deepEqual(clearReq.params, { threadId: 'thr-goal-clear' })
+    feed(h.runner, { jsonrpc: '2.0', id: clearReq.id, result: { cleared: true } })
+
+    assert.equal(await p, true)
+    assert.equal(h.messages.at(-1).type, 'openclaude_goal')
+    assert.deepEqual(h.messages.at(-1).goal, { blockId: 'codex-goal', cleared: true })
     await h.cleanup()
   })
 })

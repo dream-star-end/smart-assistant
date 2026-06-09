@@ -6,7 +6,12 @@ import { homedir } from 'node:os'
 import { basename, dirname, extname, join, relative, resolve } from 'node:path'
 import type { Duplex } from 'node:stream'
 import type { ChannelAdapter, ChannelContext } from '@openclaude/plugin-sdk'
-import type { InboundFrame, InboundMessage, OutboundMessage } from '@openclaude/protocol'
+import type {
+  InboundFrame,
+  InboundGoalControl,
+  InboundMessage,
+  OutboundMessage,
+} from '@openclaude/protocol'
 import {
   type AgentDef,
   type AgentsConfig,
@@ -3464,6 +3469,9 @@ export class Gateway {
           // (the only path where we have no server-trusted user identity).
           ;(frame as any)._userId = this.getWsUserId(ws)
           await this.handlePermissionResponse(frame as any)
+        } else if ((frame as any).type === 'inbound.control.goal') {
+          ;(frame as any)._userId = this.getWsUserId(ws)
+          await this.handleGoalControl(frame as InboundGoalControl, ws)
         } else if ((frame as any).type === 'inbound.control.reset') {
           // Reset: kill the CCB subprocess AND remove session from manager,
           // so next message creates an entirely fresh session with no history
@@ -3574,6 +3582,165 @@ export class Gateway {
     const session = await getClientSession(sessId, userId)
     if (session) this._redisSessionBus.setClientSession(userId, session)
     return session
+  }
+
+  private _sessionKeyForAgentPeer(
+    agentId: string,
+    channel: string,
+    peer: { id: string; kind: 'dm' | 'group' },
+  ): string {
+    return `agent:${agentId}:${channel}:${peer.kind}:${peer.id.replace(/[^a-zA-Z0-9_-]/g, '_')}`
+  }
+
+  private _registerWsPeer(
+    ws: WebSocket,
+    userId: string,
+    channel: string,
+    peer: { id: string; kind: 'dm' | 'group' },
+  ): string {
+    const peerKey = Gateway.makePeerKey(userId, channel, peer.id)
+    let set = this.clientsByPeer.get(peerKey)
+    if (!set) {
+      set = new Set()
+      this.clientsByPeer.set(peerKey, set)
+    }
+    if (!set.has(ws)) {
+      set.add(ws)
+      ws.once('close', () => {
+        set?.delete(ws)
+        if (set?.size === 0) {
+          this.clientsByPeer.delete(peerKey)
+          this._autoDenyPendingPermissions(peerKey)
+        }
+      })
+    }
+    return peerKey
+  }
+
+  private _sendGoalStatus(
+    sessionKey: string,
+    peerKey: string,
+    payload: {
+      channel: string
+      peer: { id: string; kind: 'dm' | 'group' }
+      action: 'get' | 'set' | 'clear'
+      ok: boolean
+      error?: string
+      goal?: unknown
+    },
+  ): void {
+    this._sendStampedSessionFrame(sessionKey, peerKey, {
+      type: 'outbound.goal_status',
+      sessionKey,
+      channel: payload.channel,
+      peer: payload.peer,
+      action: payload.action,
+      ok: payload.ok,
+      ...(payload.error ? { error: payload.error } : {}),
+      ...(payload.goal !== undefined ? { goal: payload.goal } : {}),
+    })
+  }
+
+  private async handleGoalControl(frame: InboundGoalControl, ws: WebSocket): Promise<void> {
+    const userId = typeof (frame as any)._userId === 'string' ? (frame as any)._userId : 'default'
+    const peerKey = this._registerWsPeer(ws, userId, frame.channel, frame.peer)
+    const routed = this.router.route({
+      type: 'inbound.message',
+      idempotencyKey: '',
+      channel: frame.channel,
+      peer: frame.peer,
+      agentId: frame.agentId,
+      content: { text: '' },
+      ts: Date.now(),
+    } as any)
+    const agentId = frame.agentId || routed.agent.id
+    const sessionKey = this._sessionKeyForAgentPeer(agentId, frame.channel, frame.peer)
+    const rawAction = (frame as any).action
+    const action: 'get' | 'set' | 'clear' | null =
+      rawAction === 'get' || rawAction === 'set' || rawAction === 'clear' ? rawAction : null
+
+    if (!action) {
+      this._sendGoalStatus(sessionKey, peerKey, {
+        channel: frame.channel,
+        peer: frame.peer,
+        action: 'get',
+        ok: false,
+        error: 'invalid goal action',
+      })
+      return
+    }
+
+    try {
+      const cfg = await this._getAgentsConfig()
+      const agent =
+        cfg.agents.find((a) => a.id === agentId) ??
+        (routed.agent.id === agentId ? routed.agent : undefined) ??
+        ({ id: agentId } as AgentDef)
+      if (agent.provider !== 'codex-native' || agent.runnerKind !== 'app-server') {
+        throw new Error('Codex goals require a codex-native app-server agent')
+      }
+      await this.sessions.getOrCreate({
+        sessionKey,
+        agent,
+        channel: frame.channel,
+        peerId: frame.peer.id,
+        userId,
+      })
+      this.lastActiveChannel.set(agentId, {
+        channel: frame.channel,
+        peerId: frame.peer.id,
+        sessionKey,
+        userId,
+        at: Date.now(),
+      })
+
+      let goal: unknown
+      if (action === 'get') {
+        goal = await this.sessions.getGoal(sessionKey)
+      } else if (action === 'clear') {
+        const cleared = await this.sessions.clearGoal(sessionKey)
+        goal = cleared ? { cleared: true } : { cleared: false }
+      } else {
+        const objective =
+          typeof frame.objective === 'string' || frame.objective === null
+            ? frame.objective
+            : undefined
+        const status =
+          typeof frame.status === 'string' || frame.status === null ? frame.status : undefined
+        const tokenBudget =
+          typeof frame.tokenBudget === 'number' || frame.tokenBudget === null
+            ? frame.tokenBudget
+            : undefined
+        if (objective !== undefined && objective !== null && objective.trim().length === 0) {
+          throw new Error('goal objective must not be empty')
+        }
+        goal = await this.sessions.setGoal(sessionKey, {
+          objective,
+          status,
+          tokenBudget,
+        })
+      }
+      this._sendGoalStatus(sessionKey, peerKey, {
+        channel: frame.channel,
+        peer: frame.peer,
+        action,
+        ok: true,
+        ...(goal !== undefined ? { goal } : {}),
+      })
+    } catch (err) {
+      this.log.warn('goal control failed', {
+        sessionKey,
+        action,
+        err: (err as Error).message,
+      })
+      this._sendGoalStatus(sessionKey, peerKey, {
+        channel: frame.channel,
+        peer: frame.peer,
+        action,
+        ok: false,
+        error: (err as Error).message,
+      })
+    }
   }
 
   private async handleStop(frame: {

@@ -245,6 +245,7 @@ export class CcbMessageParser {
       }
       if (typeof goal.tokensUsed === 'number') block.tokensUsed = goal.tokensUsed
       if (typeof goal.timeUsedSeconds === 'number') block.timeUsedSeconds = goal.timeUsedSeconds
+      if (typeof goal.createdAt === 'number') block.createdAt = goal.createdAt
       if (typeof goal.updatedAt === 'number') block.updatedAt = goal.updatedAt
       if (typeof goal.cleared === 'boolean') block.cleared = goal.cleared
       if (parentToolUseId) block.parentToolUseId = parentToolUseId

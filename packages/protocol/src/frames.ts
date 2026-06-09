@@ -91,10 +91,31 @@ export const InboundPermissionResponse = Type.Object({
 })
 export type InboundPermissionResponse = Static<typeof InboundPermissionResponse>
 
+export const InboundGoalControl = Type.Object({
+  type: Type.Literal('inbound.control.goal'),
+  action: Type.Union([Type.Literal('get'), Type.Literal('set'), Type.Literal('clear')]),
+  channel: Type.String(),
+  peer: Peer,
+  agentId: Type.Optional(Type.String()),
+  objective: Type.Optional(Type.Union([Type.String(), Type.Null()])),
+  status: Type.Optional(
+    Type.Union([
+      Type.Literal('active'),
+      Type.Literal('paused'),
+      Type.Literal('budgetLimited'),
+      Type.Literal('complete'),
+      Type.Null(),
+    ]),
+  ),
+  tokenBudget: Type.Optional(Type.Union([Type.Number(), Type.Null()])),
+})
+export type InboundGoalControl = Static<typeof InboundGoalControl>
+
 export const InboundFrame = Type.Union([
   InboundMessage,
   InboundControlStop,
   InboundPermissionResponse,
+  InboundGoalControl,
 ])
 export type InboundFrame = Static<typeof InboundFrame>
 
@@ -169,6 +190,7 @@ export const OutboundContentBlock = Type.Union([
     tokenBudget: Type.Optional(Type.Union([Type.Number(), Type.Null()])),
     tokensUsed: Type.Optional(Type.Number()),
     timeUsedSeconds: Type.Optional(Type.Number()),
+    createdAt: Type.Optional(Type.Number()),
     updatedAt: Type.Optional(Type.Number()),
     cleared: Type.Optional(Type.Boolean()),
     parentToolUseId: Type.Optional(Type.String()),
@@ -305,6 +327,29 @@ export const OutboundResumeFailed = Type.Object({
 })
 export type OutboundResumeFailed = Static<typeof OutboundResumeFailed>
 
+export const OutboundGoalStatus = Type.Object({
+  type: Type.Literal('outbound.goal_status'),
+  sessionKey: Type.String(),
+  channel: Type.String(),
+  peer: Peer,
+  action: Type.Union([Type.Literal('get'), Type.Literal('set'), Type.Literal('clear')]),
+  ok: Type.Boolean(),
+  error: Type.Optional(Type.String()),
+  goal: Type.Optional(
+    Type.Object({
+      objective: Type.Optional(Type.String()),
+      status: Type.Optional(Type.String()),
+      tokenBudget: Type.Optional(Type.Union([Type.Number(), Type.Null()])),
+      tokensUsed: Type.Optional(Type.Number()),
+      timeUsedSeconds: Type.Optional(Type.Number()),
+      createdAt: Type.Optional(Type.Number()),
+      updatedAt: Type.Optional(Type.Number()),
+      cleared: Type.Optional(Type.Boolean()),
+    }),
+  ),
+})
+export type OutboundGoalStatus = Static<typeof OutboundGoalStatus>
+
 // ───────────────────────────────────────────────
 // Control plane
 // ───────────────────────────────────────────────
@@ -325,10 +370,12 @@ export type ControlFrame = Static<typeof ControlFrame>
 export const AnyFrame = Type.Union([
   InboundMessage,
   InboundPermissionResponse,
+  InboundGoalControl,
   OutboundMessage,
   OutboundPermissionRequest,
   OutboundPermissionSettled,
   OutboundResumeFailed,
+  OutboundGoalStatus,
   ControlFrame,
 ])
 export type AnyFrame = Static<typeof AnyFrame>

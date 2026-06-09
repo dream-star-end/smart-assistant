@@ -3,6 +3,7 @@ import { $, _mod, fallbackCopy, htmlSafeEscape } from './dom.js'
 import { getEffortForSubmit } from './effortMode.js'
 import { exportMessageDocx } from './export-docx.js'
 import { exportMessageTex } from './export-tex.js'
+import { focusGoalComposer, sendGoalControl } from './goalControl.js?v=1'
 import {
   clearChartInstances,
   embedMediaUrls,
@@ -1367,6 +1368,39 @@ function _buildGoalCard(el, msg) {
     bar.appendChild(fill)
     body.appendChild(bar)
   }
+
+  const actions = document.createElement('div')
+  actions.className = 'goal-card-actions'
+  const addAction = (label, title, onClick) => {
+    const btn = document.createElement('button')
+    btn.type = 'button'
+    btn.className = 'goal-card-action'
+    btn.textContent = label
+    if (title) btn.title = title
+    btn.addEventListener('click', (e) => {
+      e.preventDefault()
+      e.stopPropagation()
+      onClick()
+    })
+    actions.appendChild(btn)
+  }
+  if (msg.cleared) {
+    addAction('设置目标', '在输入框中创建新的 Codex goal', () => focusGoalComposer())
+  } else {
+    if (msg.status === 'paused') {
+      addAction('继续', '恢复当前 Codex goal', () => sendGoalControl('set', { status: 'active' }))
+    } else if (msg.status !== 'complete') {
+      addAction('暂停', '暂停当前 Codex goal', () => sendGoalControl('set', { status: 'paused' }))
+    }
+    if (msg.status !== 'complete') {
+      addAction('完成', '标记当前 Codex goal 完成', () =>
+        sendGoalControl('set', { status: 'complete' }),
+      )
+    }
+    addAction('刷新', '读取当前 Codex goal 状态', () => sendGoalControl('get'))
+    addAction('清除', '清除当前 Codex goal', () => sendGoalControl('clear'))
+  }
+  if (actions.childNodes.length > 0) body.appendChild(actions)
 
   el.appendChild(body)
 }

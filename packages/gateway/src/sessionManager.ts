@@ -22,6 +22,15 @@ import { type OcTelemetryEvent, TelemetryChannel } from './telemetryChannel.js'
 
 const log = createLogger({ module: 'sessionManager' })
 
+const CODEX_GOAL_STATUSES = new Set(['active', 'paused', 'budgetLimited', 'complete'])
+
+export type CodexGoalControlAction = 'get' | 'set' | 'clear'
+export type CodexGoalControlInput = {
+  objective?: string | null
+  status?: string | null
+  tokenBudget?: number | null
+}
+
 export const LIVENESS_IDLE_TIMEOUT_TOOL_MS = 15 * 60_000
 export const LIVENESS_IDLE_TIMEOUT_DEFAULT_MS = 5 * 60_000
 export const LIVENESS_IDLE_TIMEOUT_COMPACTING_MS = 20 * 60_000
@@ -1753,6 +1762,42 @@ export class SessionManager {
     const s = this.sessions.get(sessionKey)
     if (!s) return false
     return s.runner.interrupt()
+  }
+
+  async getGoal(sessionKey: string): Promise<unknown | null> {
+    const s = this.sessions.get(sessionKey)
+    if (!s) throw new Error('session not found')
+    const getGoal = (s.runner as unknown as { getGoal?: () => Promise<unknown | null> }).getGoal
+    if (typeof getGoal !== 'function') throw new Error('current runner does not support goals')
+    s.lastUsedAt = Date.now()
+    return getGoal.call(s.runner)
+  }
+
+  async setGoal(sessionKey: string, input: CodexGoalControlInput): Promise<unknown> {
+    const s = this.sessions.get(sessionKey)
+    if (!s) throw new Error('session not found')
+    const setGoal = (
+      s.runner as unknown as { setGoal?: (input: CodexGoalControlInput) => Promise<unknown> }
+    ).setGoal
+    if (typeof setGoal !== 'function') throw new Error('current runner does not support goals')
+    if (
+      input.status !== undefined &&
+      input.status !== null &&
+      !CODEX_GOAL_STATUSES.has(input.status)
+    ) {
+      throw new Error(`unsupported goal status: ${input.status}`)
+    }
+    s.lastUsedAt = Date.now()
+    return setGoal.call(s.runner, input)
+  }
+
+  async clearGoal(sessionKey: string): Promise<boolean> {
+    const s = this.sessions.get(sessionKey)
+    if (!s) throw new Error('session not found')
+    const clearGoal = (s.runner as unknown as { clearGoal?: () => Promise<boolean> }).clearGoal
+    if (typeof clearGoal !== 'function') throw new Error('current runner does not support goals')
+    s.lastUsedAt = Date.now()
+    return clearGoal.call(s.runner)
   }
 
   getByKey(sessionKey: string): AgentSession | undefined {

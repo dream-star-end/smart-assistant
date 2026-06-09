@@ -2,7 +2,7 @@
 import { $, htmlSafeEscape } from './dom.js'
 import { maybeNotify, setTitleBusy } from './notifications.js'
 import { getSession, state } from './state.js'
-import { maybeSyncNow } from './sync.js?v=4'
+import { maybeSyncNow } from './sync.js?v=5'
 import { toast } from './ui.js'
 
 // ── Late-binding for circular deps (sessions.js, messages.js) ──
@@ -1090,6 +1090,7 @@ export function connect() {
       else if (f.type === 'outbound.turn_status') handleOutboundTurnStatus(f)
       else if (f.type === 'outbound.permission_request') handlePermissionRequest(f)
       else if (f.type === 'outbound.permission_settled') handlePermissionSettled(f)
+      else if (f.type === 'outbound.goal_status') handleGoalStatus(f)
       else if (f.type === 'outbound.resume_failed') handleResumeFailed(f)
       else if (f.type === 'outbound.ack' && f.deduplicated) {
         // Server already processed this message; clear drain state so queue continues
@@ -1576,6 +1577,7 @@ export function handleOutbound(frame) {
         tokensUsed: typeof block.tokensUsed === 'number' ? block.tokensUsed : undefined,
         timeUsedSeconds:
           typeof block.timeUsedSeconds === 'number' ? block.timeUsedSeconds : undefined,
+        createdAt: typeof block.createdAt === 'number' ? block.createdAt : undefined,
         updatedAt: typeof block.updatedAt === 'number' ? block.updatedAt : undefined,
         cleared: !!block.cleared,
         completedAt: Date.now(),
@@ -1925,6 +1927,22 @@ function handleOutboundTurnStatus(frame) {
     el.classList.add('compacting')
   } else {
     el.classList.remove('compacting')
+  }
+}
+
+function handleGoalStatus(frame) {
+  if (frame.ok) {
+    if (frame.action === 'get' && frame.goal?.cleared) {
+      toast('当前没有 Codex goal')
+    } else if (frame.action === 'get') {
+      toast('Codex goal 状态已刷新')
+    } else if (frame.action === 'clear') {
+      toast('Codex goal 已清除')
+    } else {
+      toast('Codex goal 已更新')
+    }
+  } else {
+    toast(`Codex goal 操作失败: ${frame.error || 'unknown error'}`, 'error')
   }
 }
 
