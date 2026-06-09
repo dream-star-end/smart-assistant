@@ -52,9 +52,24 @@ function makeCallable<T extends (...args: any[]) => any>(src: string): T {
   return new Function(`${src}; return ${m[1]};`)() as T
 }
 
-// _localDominates calls _localMessageSupersedes which in turn calls
-// _stableStringify. Compile the whole closure together in one `new Function`.
-const _combined = `${extractTopLevelFn(SYNC_SRC, '_stableStringify')}\n${extractTopLevelFn(SYNC_SRC, '_localMessageSupersedes')}\n${extractTopLevelFn(SYNC_SRC, '_localDominates')}`
+// _localDominates calls _localMessageSupersedes which in turn calls the
+// structural local-dominates helpers. Compile the whole closure together in
+// one `new Function` so tests execute production-equivalent logic.
+const _syncHelperNames = [
+  '_stableStringify',
+  '_hasOwn',
+  '_sameIfServerHas',
+  '_stringPrefixSupersedes',
+  '_jsonSupersedesIfServerHas',
+  '_booleanProgressSupersedes',
+  '_errorFieldSupersedes',
+  '_bashTailSupersedes',
+  '_toolLikeSupersedes',
+  '_childBlockSupersedes',
+  '_agentGroupSupersedes',
+]
+const _syncHelperSrc = _syncHelperNames.map((name) => extractTopLevelFn(SYNC_SRC, name)).join('\n')
+const _combined = `${_syncHelperSrc}\n${extractTopLevelFn(SYNC_SRC, '_localMessageSupersedes')}\n${extractTopLevelFn(SYNC_SRC, '_localDominates')}`
 const _helpers = new Function(
   `${_combined}; return { _stableStringify, _localMessageSupersedes, _localDominates };`,
 )() as {
@@ -185,11 +200,90 @@ describe('_localMessageSupersedes — role whitelist', () => {
     )
   })
 
-  it('tool role, diverging fields → false (Layer 1 fails, not whitelisted for Layer 2)', () => {
+  it('tool role, partial server → completed local output supersedes', () => {
     assert.equal(
       _localMessageSupersedes(
-        { id: 't1', role: 'tool', text: 'Bash', _completed: true, output: 'done' },
-        { id: 't1', role: 'tool', text: 'Bash', _completed: false },
+        {
+          id: 't1',
+          role: 'tool',
+          text: 'Bash',
+          toolName: 'Bash',
+          blockId: 'tool-1',
+          _partial: false,
+          _completed: true,
+          output: 'done',
+          error: false,
+        },
+        {
+          id: 't1',
+          role: 'tool',
+          text: 'Bash',
+          toolName: 'Bash',
+          blockId: 'tool-1',
+          _partial: true,
+          _completed: false,
+          error: false,
+        },
+      ),
+      true,
+    )
+  })
+
+  it('tool role, server output missing locally → false', () => {
+    assert.equal(
+      _localMessageSupersedes(
+        {
+          id: 't1',
+          role: 'tool',
+          text: 'Bash',
+          toolName: 'Bash',
+          blockId: 'tool-1',
+          _partial: false,
+          _completed: true,
+          output: '',
+          error: false,
+        },
+        {
+          id: 't1',
+          role: 'tool',
+          text: 'Bash',
+          toolName: 'Bash',
+          blockId: 'tool-1',
+          _partial: false,
+          _completed: true,
+          output: 'server result',
+          error: false,
+        },
+      ),
+      false,
+    )
+  })
+
+  it('tool role, completed server success must not be replaced by local error', () => {
+    assert.equal(
+      _localMessageSupersedes(
+        {
+          id: 't1',
+          role: 'tool',
+          text: 'Bash',
+          toolName: 'Bash',
+          blockId: 'tool-1',
+          _partial: false,
+          _completed: true,
+          output: 'failed',
+          error: true,
+        },
+        {
+          id: 't1',
+          role: 'tool',
+          text: 'Bash',
+          toolName: 'Bash',
+          blockId: 'tool-1',
+          _partial: false,
+          _completed: true,
+          output: 'done',
+          error: false,
+        },
       ),
       false,
     )
@@ -233,6 +327,92 @@ describe('_localMessageSupersedes — role whitelist', () => {
       _localMessageSupersedes(
         { id: 'g1', role: 'agent-group', text: 'agent-v2' },
         { id: 'g1', role: 'agent-group', text: 'agent-v1' },
+      ),
+      false,
+    )
+  })
+
+  it('agent-group role, ordered childBlocks prefix can grow locally', () => {
+    assert.equal(
+      _localMessageSupersedes(
+        {
+          id: 'g1',
+          role: 'agent-group',
+          text: 'agent',
+          blockId: 'agent-1',
+          toolName: 'Agent',
+          childBlocks: [
+            { kind: 'text', text: 'partial answer complete' },
+            {
+              kind: 'tool_use',
+              blockId: 'child-tool',
+              toolName: 'Bash',
+              _partial: false,
+              _completed: true,
+              output: 'ok',
+              error: false,
+            },
+            { kind: 'text', text: 'extra local child' },
+          ],
+        },
+        {
+          id: 'g1',
+          role: 'agent-group',
+          text: 'agent',
+          blockId: 'agent-1',
+          toolName: 'Agent',
+          childBlocks: [
+            { kind: 'text', text: 'partial answer' },
+            {
+              kind: 'tool_use',
+              blockId: 'child-tool',
+              toolName: 'Bash',
+              _partial: true,
+              _completed: false,
+              error: false,
+            },
+          ],
+        },
+      ),
+      true,
+    )
+  })
+
+  it('agent-group role, server child output missing locally → false', () => {
+    assert.equal(
+      _localMessageSupersedes(
+        {
+          id: 'g1',
+          role: 'agent-group',
+          text: 'agent',
+          childBlocks: [
+            {
+              kind: 'tool_use',
+              blockId: 'child-tool',
+              toolName: 'Bash',
+              _partial: false,
+              _completed: true,
+              output: '',
+              error: false,
+            },
+          ],
+        },
+        {
+          id: 'g1',
+          role: 'agent-group',
+          text: 'agent',
+          childBlocks: [
+            {
+              kind: 'tool_use',
+              blockId: 'child-tool',
+              toolName: 'Bash',
+              _partial: false,
+              _completed: true,
+              output: 'server-only',
+              error: false,
+            },
+          ],
+        },
       ),
       false,
     )
@@ -359,13 +539,35 @@ describe('_localDominates — local clean-superset judge', () => {
     assert.equal(_localDominates(server, local), false)
   })
 
-  it('shared prefix has tool with diverging state → false (Layer 1 fails, Layer 2 not whitelisted)', () => {
-    const server = [u('u1', 'run'), { id: 't1', role: 'tool', text: 'Bash', _partial: true }]
+  it('shared prefix has running tool that completed locally → true', () => {
+    const server = [
+      u('u1', 'run'),
+      {
+        id: 't1',
+        role: 'tool',
+        text: 'Bash',
+        toolName: 'Bash',
+        blockId: 'tool-1',
+        _partial: true,
+        _completed: false,
+        error: false,
+      },
+    ]
     const local = [
       u('u1', 'run'),
-      { id: 't1', role: 'tool', text: 'Bash', _completed: true, output: 'done' },
+      {
+        id: 't1',
+        role: 'tool',
+        text: 'Bash',
+        toolName: 'Bash',
+        blockId: 'tool-1',
+        _partial: false,
+        _completed: true,
+        output: 'done',
+        error: false,
+      },
     ]
-    assert.equal(_localDominates(server, local), false)
+    assert.equal(_localDominates(server, local), true)
   })
 
   it('shared prefix has IDENTICAL historical tool + tail assistant streaming extension → true (primary bug fix)', () => {
@@ -403,6 +605,98 @@ describe('_localDominates — local clean-superset judge', () => {
     const server = [u('u1', 'hi'), { ...group }]
     const local = [u('u1', 'hi'), { ...group }, u('u2', 'follow up')]
     assert.equal(_localDominates(server, local), true)
+  })
+
+  it('shared prefix has agent-group childBlocks that completed locally → true', () => {
+    const server = [
+      u('u1', 'delegate'),
+      {
+        id: 'g1',
+        role: 'agent-group',
+        text: 'worker',
+        blockId: 'agent-1',
+        toolName: 'Agent',
+        childBlocks: [
+          { kind: 'thinking', text: 'inspect' },
+          {
+            kind: 'tool_use',
+            blockId: 'child-tool',
+            toolName: 'Read',
+            _partial: true,
+            _completed: false,
+            error: false,
+          },
+        ],
+      },
+      a('a1', 'tail'),
+    ]
+    const local = [
+      u('u1', 'delegate'),
+      {
+        id: 'g1',
+        role: 'agent-group',
+        text: 'worker',
+        blockId: 'agent-1',
+        toolName: 'Agent',
+        childBlocks: [
+          { kind: 'thinking', text: 'inspecting carefully' },
+          {
+            kind: 'tool_use',
+            blockId: 'child-tool',
+            toolName: 'Read',
+            _partial: false,
+            _completed: true,
+            output: 'file contents',
+            error: false,
+          },
+          { kind: 'text', text: 'done' },
+        ],
+      },
+      a('a1', 'tail plus final tokens'),
+    ]
+    assert.equal(_localDominates(server, local), true)
+  })
+
+  it('shared prefix has server-only agent child output → false', () => {
+    const server = [
+      u('u1', 'delegate'),
+      {
+        id: 'g1',
+        role: 'agent-group',
+        text: 'worker',
+        childBlocks: [
+          {
+            kind: 'tool_use',
+            blockId: 'child-tool',
+            toolName: 'Read',
+            _partial: false,
+            _completed: true,
+            output: 'server-only',
+            error: false,
+          },
+        ],
+      },
+    ]
+    const local = [
+      u('u1', 'delegate'),
+      {
+        id: 'g1',
+        role: 'agent-group',
+        text: 'worker',
+        childBlocks: [
+          {
+            kind: 'tool_use',
+            blockId: 'child-tool',
+            toolName: 'Read',
+            _partial: false,
+            _completed: true,
+            output: '',
+            error: false,
+          },
+        ],
+      },
+    ]
+    assert.equal(_localDominates(server, local), false)
   })
 
   it('shared prefix has identical permission → does not block dominance', () => {
@@ -450,7 +744,7 @@ describe('_localDominates — local clean-superset judge', () => {
 // This way we exercise the real production code path without pulling in
 // the browser-global deps in sync.js's own imports.
 
-const _pushFnSrc = `${extractTopLevelFn(SYNC_SRC, '_stableStringify')}\n${extractTopLevelFn(SYNC_SRC, '_localMessageSupersedes')}\n${extractTopLevelFn(SYNC_SRC, '_mergeServerPlanFields')}\n${extractTopLevelFn(SYNC_SRC, '_localDominates')}\n${extractTopLevelFn(SYNC_SRC, '_rebindStreamingPointers')}\n${extractTopLevelFn(SYNC_SRC, 'pushSessionToServer')}`
+const _pushFnSrc = `${_syncHelperSrc}\n${extractTopLevelFn(SYNC_SRC, '_localMessageSupersedes')}\n${extractTopLevelFn(SYNC_SRC, '_mergeServerPlanFields')}\n${extractTopLevelFn(SYNC_SRC, '_localDominates')}\n${extractTopLevelFn(SYNC_SRC, '_rebindStreamingPointers')}\n${extractTopLevelFn(SYNC_SRC, 'pushSessionToServer')}`
 
 type PushDeps = {
   apiFetch: (url: string, opts: any) => Promise<any>
@@ -603,6 +897,88 @@ describe('pushSessionToServer — 409 local-dominates', () => {
     assert.equal(deps.retryCb[0], sessId)
     // dbPut persisted
     assert.equal(deps.dbCalls.length, 1)
+  })
+
+  it('agent/tool structural case: preserves completed local childBlocks on 409', async () => {
+    const sessId = 'sess-agent-struct'
+    const userMsg = { id: 'u1', role: 'user', text: 'delegate' }
+    const serverGroup = {
+      id: 'g1',
+      role: 'agent-group',
+      text: 'worker',
+      blockId: 'agent-1',
+      toolName: 'Agent',
+      childBlocks: [
+        { kind: 'thinking', text: 'inspect' },
+        {
+          kind: 'tool_use',
+          blockId: 'child-tool',
+          toolName: 'Bash',
+          inputPreview: 'ls',
+          _partial: true,
+          _completed: false,
+          error: false,
+        },
+      ],
+    }
+    const localGroup = {
+      id: 'g1',
+      role: 'agent-group',
+      text: 'worker',
+      blockId: 'agent-1',
+      toolName: 'Agent',
+      childBlocks: [
+        { kind: 'thinking', text: 'inspecting carefully' },
+        {
+          kind: 'tool_use',
+          blockId: 'child-tool',
+          toolName: 'Bash',
+          inputPreview: 'ls -la',
+          _partial: false,
+          _completed: true,
+          output: 'total 8',
+          error: false,
+        },
+        { kind: 'text', text: 'done' },
+      ],
+    }
+    const serverAsst = { id: 'a1', role: 'assistant', text: 'partial' }
+    const localAsst = { id: 'a1', role: 'assistant', text: 'partial final answer' }
+    const sess: any = {
+      id: sessId,
+      title: 'local',
+      messages: [userMsg, localGroup, localAsst],
+      lastAt: 1000,
+      pinned: false,
+      agentId: 'codex',
+      _dirty: true,
+      _syncedAt: 500,
+    }
+    const deps = baseDeps({
+      _apiFetchImpl: () => conflict(),
+      _apiGetImpl: () => ({
+        id: sessId,
+        title: 'server',
+        messages: [userMsg, serverGroup, serverAsst],
+        lastAt: 1100,
+        pinned: false,
+        agentId: 'codex',
+        updatedAt: 2000,
+      }),
+    } as any)
+    deps.state.sessions.set(sessId, sess)
+
+    await makePush(deps)(sess)
+
+    assert.equal(sess.messages[1].childBlocks[1]._completed, true)
+    assert.equal(sess.messages[1].childBlocks[1].output, 'total 8')
+    assert.equal(sess.messages[1].childBlocks[2].text, 'done')
+    assert.equal(sess.messages[2].text, 'partial final answer')
+    assert.equal(sess.title, 'server')
+    assert.equal(sess._dirty, true)
+    assert.equal(sess._syncedAt, 2000)
+    assert.equal(deps.conflictCb[0].mode, 'local-dominates')
+    assert.equal(deps.retryCb.length, 1)
   })
 
   it('Codex plan doc case: preserves local text and fills server steps on 409', async () => {
