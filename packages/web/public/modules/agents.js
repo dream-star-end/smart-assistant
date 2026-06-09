@@ -2,6 +2,7 @@ import { apiGet, apiJson } from './api.js'
 // OpenClaude — Agents
 import { $, htmlSafeEscape } from './dom.js'
 import { renderModePills } from './effortMode.js'
+import { renderGoalModePanel } from './goalMode.js?v=1'
 import { renderResearchTools } from './researchTools.js'
 import { getSession, state } from './state.js'
 import { closeModal, openModal, toast } from './ui.js'
@@ -36,6 +37,8 @@ export function renderAgentDropdown() {
   renderModePills()
   // 科研工具条的可见性同样取决于 effort pill 当前选中值,跟随 agent 切换一起刷新。
   renderResearchTools()
+  // Goal 模式只对 codex-native app-server agent 可见。
+  renderGoalModePanel({ autoRefresh: true })
 }
 
 function syncRunnerKindVisibility() {

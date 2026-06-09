@@ -3,7 +3,7 @@ import { $, _mod, fallbackCopy, htmlSafeEscape } from './dom.js'
 import { getEffortForSubmit } from './effortMode.js'
 import { exportMessageDocx } from './export-docx.js'
 import { exportMessageTex } from './export-tex.js'
-import { focusGoalComposer, sendGoalControl } from './goalControl.js?v=1'
+import { openGoalPanel, sendGoalControl } from './goalControl.js?v=2'
 import {
   clearChartInstances,
   embedMediaUrls,
@@ -1385,7 +1385,7 @@ function _buildGoalCard(el, msg) {
     actions.appendChild(btn)
   }
   if (msg.cleared) {
-    addAction('设置目标', '在输入框中创建新的 Codex goal', () => focusGoalComposer())
+    addAction('设置目标', '打开可视化 Goal 模式面板', () => openGoalPanel())
   } else {
     if (msg.status === 'paused') {
       addAction('继续', '恢复当前 Codex goal', () => sendGoalControl('set', { status: 'active' }))

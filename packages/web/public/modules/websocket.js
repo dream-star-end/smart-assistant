@@ -1,8 +1,10 @@
 // OpenClaude — WebSocket connection, messaging, background tasks
 import { $, htmlSafeEscape } from './dom.js'
+import { shouldSuppressGoalStatusToast } from './goalControl.js?v=2'
+import { renderGoalModePanel, settleGoalModePanel } from './goalMode.js?v=1'
 import { maybeNotify, setTitleBusy } from './notifications.js'
 import { getSession, state } from './state.js'
-import { maybeSyncNow } from './sync.js?v=5'
+import { maybeSyncNow } from './sync.js?v=6'
 import { toast } from './ui.js'
 
 // ── Late-binding for circular deps (sessions.js, messages.js) ──
@@ -922,6 +924,7 @@ export function connect() {
     // outbound frames the client missed during the disconnect window. 0 means
     // "I've never received a frameSeq'd frame" (fresh tab or legacy client).
     _sendHello(ws, 'open')
+    renderGoalModePanel({ autoRefresh: true })
     // Flush offline queue — delay drain start to let hello/resume isFinals arrive first.
     // This prevents a resumed turn's isFinal from being mistaken for a drain response.
     if (state._offlineDrainTimer) clearTimeout(state._offlineDrainTimer)
@@ -1590,6 +1593,7 @@ export function handleOutbound(frame) {
         Object.assign(goalMsg, goalFields)
         if (sess.id === state.currentSessionId) _deps.updateMessageEl(goalMsg)
       }
+      if (sess.id === state.currentSessionId) renderGoalModePanel()
     } else if (block.kind === 'tool_use') {
       // The assistant text (and thinking) segment just ended — next turn
       // content will go into a new message. Stamp completion time BEFORE
@@ -1931,7 +1935,8 @@ function handleOutboundTurnStatus(frame) {
 }
 
 function handleGoalStatus(frame) {
-  if (frame.ok) {
+  const silent = shouldSuppressGoalStatusToast(frame)
+  if (frame.ok && !silent) {
     if (frame.action === 'get' && frame.goal?.cleared) {
       toast('当前没有 Codex goal')
     } else if (frame.action === 'get') {
@@ -1941,9 +1946,10 @@ function handleGoalStatus(frame) {
     } else {
       toast('Codex goal 已更新')
     }
-  } else {
+  } else if (!frame.ok) {
     toast(`Codex goal 操作失败: ${frame.error || 'unknown error'}`, 'error')
   }
+  settleGoalModePanel()
 }
 
 // ── Phase 0.4: gateway-initiated resume failure ──

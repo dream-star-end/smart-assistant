@@ -27,7 +27,7 @@ import { apiFetch, apiGet, apiJson, authHeaders, onAuthExpired, resetAuthExpired
 import { dbDelete, dbGetAll, dbPut, onIdbUnavailable, openDB } from './db.js'
 
 // ── Cross-device sync ──
-import { hydrateSession, maybeSyncNow, setSyncDeps, syncSessionsFromServer } from './sync.js?v=5'
+import { hydrateSession, maybeSyncNow, setSyncDeps, syncSessionsFromServer } from './sync.js?v=6'
 
 // ── Theme ──
 import { applyTheme, cycleTheme, effectiveTheme, setToastFn } from './theme.js'
@@ -88,7 +88,7 @@ import {
   reloadAgents,
   renderAgentDropdown,
   renderAgentsManagementList,
-} from './agents.js?v=1'
+} from './agents.js?v=2'
 
 // ── Sessions ──
 import {
@@ -110,7 +110,7 @@ import {
   showContextMenu,
   startInlineRename,
   switchSession,
-} from './sessions.js?v=6'
+} from './sessions.js?v=7'
 
 // ── Messages ──
 import {
@@ -125,7 +125,7 @@ import {
   setMessageDeps,
   updateMessageEl,
   updateSessionSub,
-} from './messages.js?v=40'
+} from './messages.js?v=41'
 
 // ── WebSocket ──
 import {
@@ -153,7 +153,7 @@ import {
   updateMessage,
   updateMsgStatus,
   updateSendEnabled,
-} from './websocket.js?v=43'
+} from './websocket.js?v=44'
 
 // ── Slash commands ──
 import {
@@ -166,8 +166,9 @@ import {
   setSlashSelected,
   showSlashPopup,
   slashPopupVisible,
-} from './commands.js?v=3'
+} from './commands.js?v=4'
 import { getEffortForSubmit, initModePills, renderModePills } from './effortMode.js'
+import { initGoalModePanel, renderGoalModePanel } from './goalMode.js?v=1'
 import { getConversationModeForSubmit } from './planMode.js?v=4'
 import { initPlanPanel } from './planPanel.js?v=3'
 import { initResearchTools, renderResearchTools } from './researchTools.js'
@@ -189,6 +190,7 @@ setSessionUIDeps({
   showTypingIndicator,
   hideTypingIndicator,
   renderAgentDropdown,
+  renderGoalModePanel,
 })
 
 setMessageDeps({
@@ -633,6 +635,7 @@ initWechatListeners()
 // 再触发一次;这里只是绑定点击事件并把初始隐藏态打上去。
 initModePills()
 initPlanPanel()
+initGoalModePanel()
 // 科研模式工具条 — 仅在用户选中 effort=max 时显示,提供受众切换 + 浓缩模板。
 initResearchTools()
 
@@ -1555,6 +1558,7 @@ async function init() {
         // local-dominates mutate it), so we always re-run it on the current
         // session — renderMessages() does NOT sync #agent-select.
         renderAgentDropdown()
+        renderGoalModePanel({ autoRefresh: true })
         // Browser tab title tracks sess.title but must not clobber the
         // "思考中..." indicator if the turn is still in flight.
         refreshDocumentTitle()
@@ -1618,6 +1622,7 @@ async function init() {
     // Pill 跟着新 agent 的 model 走 — 切到非 Opus 4.7 自动隐藏,选中态按新 agent 的存储读。
     renderModePills()
     renderResearchTools()
+    renderGoalModePanel({ autoRefresh: true })
     // Mark switch time — handleOutbound will ignore frames arriving before this
     sess._agentSwitchedAt = Date.now()
     // Reset streaming state to prevent cross-agent message contamination

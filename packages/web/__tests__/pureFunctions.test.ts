@@ -111,9 +111,10 @@ const getLatestPlanAndTodos = new Function(
 ${extractFunction(appJs, 'getLatestPlanAndTodos').replace(/^export\s+/, '')}; return getLatestPlanAndTodos;`,
 )() as (sess: any) => { plan: any; todo: any }
 
-const parseGoalCommand = makeCallable<(args?: string) => any>(
-  extractFunction(appJs, 'parseGoalCommand'),
-)
+const getLatestGoalFromMessages = new Function(
+  `${extractFunction(appJs, '_num')}
+${extractFunction(appJs, 'getLatestGoalFromMessages').replace(/^export\s+/, '')}; return getLatestGoalFromMessages;`,
+)() as (messages?: any[]) => any
 
 // Note: effectiveTheme() and isSending() depend on browser APIs (localStorage, state).
 // htmlSafeEscape is a one-line arrow function — hard to extract with indent matching.
@@ -527,54 +528,44 @@ describe('T-PLAN-PANEL: plan markdown rendering and quick panel wiring', () => {
   })
 })
 
-// ── T-GOAL-CONTROL: Codex persistent goal slash command parsing ──
-describe('T-GOAL-CONTROL: /goal command parser', () => {
-  it('maps empty/status requests to get', () => {
-    assert.deepEqual(parseGoalCommand(''), { action: 'get' })
-    assert.deepEqual(parseGoalCommand('status'), { action: 'get' })
+// ── T-GOAL-MODE: visual Codex Goal mode state derivation ──
+describe('T-GOAL-MODE: visual goal mode derives current goal from messages', () => {
+  it('returns null when no goal message exists', () => {
+    assert.equal(getLatestGoalFromMessages([{ role: 'user', text: 'hi' }]), null)
   })
-  it('maps clear aliases to clear', () => {
-    assert.deepEqual(parseGoalCommand('clear'), { action: 'clear' })
-    assert.deepEqual(parseGoalCommand('delete'), { action: 'clear' })
-    assert.deepEqual(parseGoalCommand('remove'), { action: 'clear' })
-  })
-  it('maps lifecycle shortcuts to status-only set operations', () => {
-    assert.deepEqual(parseGoalCommand('pause'), {
-      action: 'set',
-      fields: { status: 'paused' },
-    })
-    assert.deepEqual(parseGoalCommand('resume'), {
-      action: 'set',
-      fields: { status: 'active' },
-    })
-    assert.deepEqual(parseGoalCommand('complete'), {
-      action: 'set',
-      fields: { status: 'complete' },
-    })
-  })
-  it('parses numeric token budgets and budget clearing', () => {
-    assert.deepEqual(parseGoalCommand('budget 12,345'), {
-      action: 'set',
-      fields: { tokenBudget: 12345 },
-    })
-    assert.deepEqual(parseGoalCommand('budget none'), {
-      action: 'set',
-      fields: { tokenBudget: null },
-    })
-  })
-  it('parses objectives with optional trailing --budget', () => {
-    assert.deepEqual(parseGoalCommand('修复 Codex goals UI --budget 2,000'), {
-      action: 'set',
-      fields: {
-        objective: '修复 Codex goals UI',
-        status: 'active',
+  it('uses the latest goal message and normalizes numeric fields', () => {
+    const goal = getLatestGoalFromMessages([
+      { role: 'goal', objective: 'old', status: 'active', tokenBudget: 100 },
+      { role: 'assistant', text: 'ok' },
+      {
+        role: 'goal',
+        text: 'new from text',
+        status: 'paused',
         tokenBudget: 2000,
+        tokensUsed: 120,
+        timeUsedSeconds: 60,
       },
+    ])
+    assert.deepEqual(goal, {
+      cleared: false,
+      objective: 'new from text',
+      status: 'paused',
+      tokenBudget: 2000,
+      tokensUsed: 120,
+      timeUsedSeconds: 60,
+      updatedAt: null,
     })
   })
-  it('rejects invalid budget values', () => {
-    const result = parseGoalCommand('budget nope')
-    assert.equal(result.error, '预算必须是正数，或使用 `/goal budget none` 清除预算。')
+  it('treats cleared goal messages as an empty current goal', () => {
+    assert.deepEqual(getLatestGoalFromMessages([{ role: 'goal', cleared: true }]), {
+      cleared: true,
+      objective: '',
+      status: 'cleared',
+      tokenBudget: null,
+      tokensUsed: null,
+      timeUsedSeconds: null,
+      updatedAt: null,
+    })
   })
 })
 
