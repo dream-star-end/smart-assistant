@@ -91,6 +91,9 @@ function _ensureRoot() {
     </div>
     <div id="goal-mode-panel" class="goal-mode-panel" hidden>
       <div id="goal-mode-current" class="goal-mode-current" hidden></div>
+      <div class="goal-mode-hint">
+        Goal 只是对后续正常消息的持续约束；设置后继续在下方输入框发送任务，执行过程会照常显示。
+      </div>
       <label class="goal-mode-field">
         <span>目标</span>
         <textarea id="goal-mode-objective" rows="2" placeholder="例如：把当前功能完整做完、测试通过并上线"></textarea>
@@ -122,6 +125,11 @@ function _setExpanded(next) {
   }
 }
 
+export function collapseGoalModePanel() {
+  if (!_expanded) return
+  _setExpanded(false)
+}
+
 function _fillForm(goal) {
   const objective = $('goal-mode-objective')
   const budget = $('goal-mode-budget')
@@ -149,6 +157,8 @@ function _send(action, fields = {}, opts = {}) {
   if (ok) {
     _setPending(true)
     setTimeout(() => _setPending(false), 6000)
+    if (opts.collapse !== false) _expanded = false
+    renderGoalModePanel()
   }
   return ok
 }
@@ -184,7 +194,7 @@ function _bindRoot() {
     if (!_expanded && goal && !goal.cleared) _fillForm(goal)
     _setExpanded(!_expanded)
   })
-  $('goal-mode-refresh')?.addEventListener('click', () => _send('get'))
+  $('goal-mode-refresh')?.addEventListener('click', () => _send('get', {}, { collapse: false }))
   $('goal-mode-save')?.addEventListener('click', _saveGoal)
   $('goal-mode-pause')?.addEventListener('click', () => {
     const goal = _currentGoal()
@@ -256,17 +266,17 @@ export function renderGoalModePanel({ autoRefresh = false } = {}) {
   const save = $('goal-mode-save')
 
   root.classList.toggle('has-goal', hasGoal)
-  root.classList.toggle('expanded', _expanded || hasGoal)
+  root.classList.toggle('expanded', _expanded)
   if (toggle) {
-    toggle.setAttribute('aria-expanded', _expanded || hasGoal ? 'true' : 'false')
+    toggle.setAttribute('aria-expanded', _expanded ? 'true' : 'false')
     toggle.setAttribute('aria-pressed', hasGoal ? 'true' : 'false')
   }
   if (summary) {
     summary.textContent = hasGoal
       ? `${_statusLabel(goal)} · ${goal.objective || '未命名目标'}`
-      : '给 Codex 设置一个持续目标，后续消息自动围绕它推进'
+      : '设置后，后续正常消息会带着这个目标约束推进'
   }
-  if (panel) panel.hidden = !(_expanded || hasGoal)
+  if (panel) panel.hidden = !_expanded
 
   _renderCurrentGoal(root, goal)
   if (_expanded && hasGoal) _fillForm(goal)

@@ -4,6 +4,7 @@ import { getEffortForSubmit } from './effortMode.js'
 import { exportMessageDocx } from './export-docx.js'
 import { exportMessageTex } from './export-tex.js'
 import { openGoalPanel, sendGoalControl } from './goalControl.js?v=2'
+import { collapseGoalModePanel } from './goalMode.js?v=2'
 import {
   clearChartInstances,
   embedMediaUrls,
@@ -1299,6 +1300,12 @@ function _formatGoalDuration(seconds) {
   return rem ? `${hours}h ${rem}m` : `${hours}h`
 }
 
+function _sendGoalCardControl(action, fields = {}, opts = {}) {
+  const ok = sendGoalControl(action, fields, opts)
+  if (ok && action !== 'get' && opts.collapse !== false) collapseGoalModePanel()
+  return ok
+}
+
 function _buildGoalCard(el, msg) {
   el.innerHTML = ''
   el.className = 'msg goal'
@@ -1388,17 +1395,21 @@ function _buildGoalCard(el, msg) {
     addAction('设置目标', '打开可视化 Goal 模式面板', () => openGoalPanel())
   } else {
     if (msg.status === 'paused') {
-      addAction('继续', '恢复当前 Codex goal', () => sendGoalControl('set', { status: 'active' }))
+      addAction('继续', '恢复当前 Codex goal', () =>
+        _sendGoalCardControl('set', { status: 'active' }),
+      )
     } else if (msg.status !== 'complete') {
-      addAction('暂停', '暂停当前 Codex goal', () => sendGoalControl('set', { status: 'paused' }))
+      addAction('暂停', '暂停当前 Codex goal', () =>
+        _sendGoalCardControl('set', { status: 'paused' }),
+      )
     }
     if (msg.status !== 'complete') {
       addAction('完成', '标记当前 Codex goal 完成', () =>
-        sendGoalControl('set', { status: 'complete' }),
+        _sendGoalCardControl('set', { status: 'complete' }),
       )
     }
     addAction('刷新', '读取当前 Codex goal 状态', () => sendGoalControl('get'))
-    addAction('清除', '清除当前 Codex goal', () => sendGoalControl('clear'))
+    addAction('清除', '清除当前 Codex goal', () => _sendGoalCardControl('clear'))
   }
   if (actions.childNodes.length > 0) body.appendChild(actions)
 

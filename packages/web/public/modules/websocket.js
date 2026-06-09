@@ -1,10 +1,10 @@
 // OpenClaude — WebSocket connection, messaging, background tasks
 import { $, htmlSafeEscape } from './dom.js'
 import { shouldSuppressGoalStatusToast } from './goalControl.js?v=2'
-import { renderGoalModePanel, settleGoalModePanel } from './goalMode.js?v=1'
+import { renderGoalModePanel, settleGoalModePanel } from './goalMode.js?v=2'
 import { maybeNotify, setTitleBusy } from './notifications.js'
 import { getSession, state } from './state.js'
-import { maybeSyncNow } from './sync.js?v=6'
+import { maybeSyncNow } from './sync.js?v=7'
 import { toast } from './ui.js'
 
 // ── Late-binding for circular deps (sessions.js, messages.js) ──

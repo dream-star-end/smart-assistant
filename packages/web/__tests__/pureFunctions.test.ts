@@ -567,6 +567,28 @@ describe('T-GOAL-MODE: visual goal mode derives current goal from messages', () 
       updatedAt: null,
     })
   })
+  it('keeps the visual editor collapsed while an active goal constrains normal chat', () => {
+    assert.ok(
+      appJs.includes('if (panel) panel.hidden = !_expanded'),
+      'Goal editor panel should only depend on explicit expansion',
+    )
+    assert.ok(
+      !appJs.includes('panel.hidden = !(_expanded || hasGoal)'),
+      'Active goals must not force the full editor to stay open',
+    )
+    assert.ok(
+      appJs.includes('执行过程会照常显示'),
+      'Expanded editor should explain that normal execution remains visible',
+    )
+    assert.ok(
+      appJs.includes('function _sendGoalCardControl') && appJs.includes('collapseGoalModePanel()'),
+      'Goal card actions in the normal transcript should also collapse the editor',
+    )
+    assert.ok(
+      /addAction\('刷新'[\s\S]*?sendGoalControl\('get'\)/.test(appJs),
+      'Refresh remains a non-collapsing status read',
+    )
+  })
 })
 
 // ── T10: Function extractor sanity ──
