@@ -4,7 +4,7 @@
 
 import { apiFetch, apiGet, apiJson, authHeaders } from './api.js'
 import { dbDelete, dbGetAll, dbPut } from './db.js'
-import { _rebuildSearchIndex, clearDeleteTombstone, isDeletePending } from './sessions.js?v=4'
+import { _rebuildSearchIndex, clearDeleteTombstone, isDeletePending } from './sessions.js?v=5'
 import { state } from './state.js'
 
 // Dep-injected callback: fired when a push hits a 409 conflict and we
@@ -68,6 +68,117 @@ function _stableStringify(v) {
   }
 }
 
+function _hasOwn(obj, key) {
+  return !!obj && Object.prototype.hasOwnProperty.call(obj, key)
+}
+
+function _sameIfServerHas(localObj, serverObj, key) {
+  if (!_hasOwn(serverObj, key) || serverObj[key] == null) return true
+  if (!_hasOwn(localObj, key) || localObj[key] == null) return false
+  return String(localObj[key]) === String(serverObj[key])
+}
+
+function _stringPrefixSupersedes(localObj, serverObj, key) {
+  const sText = typeof serverObj?.[key] === 'string' ? serverObj[key] : ''
+  if (!sText) return true
+  const lText = typeof localObj?.[key] === 'string' ? localObj[key] : ''
+  return !!lText && lText.startsWith(sText)
+}
+
+function _jsonSupersedesIfServerHas(localObj, serverObj, key) {
+  if (!_hasOwn(serverObj, key) || serverObj[key] == null) return true
+  if (!_hasOwn(localObj, key) || localObj[key] == null) return false
+  const ls = _stableStringify(localObj[key])
+  const ss = _stableStringify(serverObj[key])
+  return ls !== null && ss !== null && ls === ss
+}
+
+function _booleanProgressSupersedes(localVal, serverVal, doneValue) {
+  if (typeof serverVal !== 'boolean') return true
+  if (typeof localVal !== 'boolean') return false
+  if (localVal === serverVal) return true
+  return localVal === doneValue && serverVal !== doneValue
+}
+
+function _errorFieldSupersedes(localObj, serverObj, key) {
+  const serverCompleted = serverObj?._completed === true
+  const serverErr = !!serverObj?.[key]
+  const localErr = !!localObj?.[key]
+  if (serverErr && !localErr) return false
+  if (serverCompleted && serverErr !== localErr) return false
+  return true
+}
+
+function _bashTailSupersedes(localMsg, serverMsg) {
+  const sTail = serverMsg?.bashTail
+  if (!sTail || typeof sTail !== 'object') return true
+  // A completed tool result dominates a running tail preview: _renderBash
+  // prefers msg.output once present, so retaining local output does not
+  // erase a visible server-only final state.
+  if (
+    localMsg?._completed === true &&
+    typeof localMsg.output === 'string' &&
+    localMsg.output.length > 0
+  ) {
+    return true
+  }
+  const lTail = localMsg?.bashTail
+  if (!lTail || typeof lTail !== 'object') return false
+  const sBytes = typeof sTail.totalBytes === 'number' ? sTail.totalBytes : 0
+  const lBytes = typeof lTail.totalBytes === 'number' ? lTail.totalBytes : 0
+  if (lBytes < sBytes) return false
+  const sText = typeof sTail.tail === 'string' ? sTail.tail : ''
+  const lText = typeof lTail.tail === 'string' ? lTail.tail : ''
+  if (sText && !lText) return false
+  if (sText && lText !== sText && !lText.startsWith(sText) && !lText.includes(sText)) return false
+  if (lBytes === sBytes && !!lTail.truncatedHead !== !!sTail.truncatedHead) return false
+  return true
+}
+
+function _toolLikeSupersedes(localMsg, serverMsg) {
+  if (!_sameIfServerHas(localMsg, serverMsg, 'text')) return false
+  if (!_sameIfServerHas(localMsg, serverMsg, 'toolName')) return false
+  if (!_sameIfServerHas(localMsg, serverMsg, 'blockId')) return false
+  if (!_booleanProgressSupersedes(localMsg?._completed, serverMsg?._completed, true)) return false
+  if (!_booleanProgressSupersedes(localMsg?._partial, serverMsg?._partial, false)) return false
+  if (!_errorFieldSupersedes(localMsg, serverMsg, 'error')) return false
+  if (!_stringPrefixSupersedes(localMsg, serverMsg, 'inputPreview')) return false
+  if (!_jsonSupersedesIfServerHas(localMsg, serverMsg, 'inputJson')) return false
+  if (!_stringPrefixSupersedes(localMsg, serverMsg, 'output')) return false
+  if (!_bashTailSupersedes(localMsg, serverMsg)) return false
+  return true
+}
+
+function _childBlockSupersedes(localChild, serverChild) {
+  if (!localChild || !serverChild) return false
+  const kind = serverChild.kind
+  if (!kind || localChild.kind !== kind) return false
+  if (kind === 'text' || kind === 'thinking') {
+    return _stringPrefixSupersedes(localChild, serverChild, 'text')
+  }
+  if (kind === 'tool_use') return _toolLikeSupersedes(localChild, serverChild)
+  // Unknown child block kinds may carry structural state we cannot compare
+  // safely. Fall back to server-wins unless Layer 1 stable equality matched.
+  return false
+}
+
+function _agentGroupSupersedes(localMsg, serverMsg) {
+  if (!_sameIfServerHas(localMsg, serverMsg, 'blockId')) return false
+  if (!_sameIfServerHas(localMsg, serverMsg, 'toolName')) return false
+  if (!_stringPrefixSupersedes(localMsg, serverMsg, 'text')) return false
+  if (!_booleanProgressSupersedes(localMsg?._completed, serverMsg?._completed, true)) return false
+  if (!_errorFieldSupersedes(localMsg, serverMsg, '_isError')) return false
+  if (!_stringPrefixSupersedes(localMsg, serverMsg, '_resultPreview')) return false
+  const serverChildren = Array.isArray(serverMsg?.childBlocks) ? serverMsg.childBlocks : []
+  if (serverChildren.length === 0) return true
+  const localChildren = Array.isArray(localMsg?.childBlocks) ? localMsg.childBlocks : []
+  if (localChildren.length < serverChildren.length) return false
+  for (let i = 0; i < serverChildren.length; i++) {
+    if (!_childBlockSupersedes(localChildren[i], serverChildren[i])) return false
+  }
+  return true
+}
+
 /**
  * Conservative "local is at least as current as server" judge for a
  * same-id message pair. Used to detect whether pushing local with a
@@ -90,6 +201,10 @@ function _stableStringify(v) {
  *       - user: exact text equality (status drift tolerated, see below)
  *       - plan: local non-empty text is the durable plan document; it can
  *         dominate a server snapshot that only has structured steps.
+ *       - tool / agent-group: monotonic structural updates only (partial
+ *         cards becoming completed, childBlocks growing as an ordered
+ *         prefix). Unknown or divergent structure still falls back to
+ *         server-wins.
  *     Rows with childBlocks are excluded from Layer 2: their in-place
  *     mutations (_partial/_completed/output) can't be judged by text
  *     alone, and if Layer 1 already failed they aren't equal anyway,
@@ -114,6 +229,9 @@ export function _localMessageSupersedes(localMsg, serverMsg) {
   const ls = _stableStringify(localMsg)
   const ss = _stableStringify(serverMsg)
   if (ls !== null && ss !== null && ls === ss) return true
+
+  if (role === 'tool') return _toolLikeSupersedes(localMsg, serverMsg)
+  if (role === 'agent-group') return _agentGroupSupersedes(localMsg, serverMsg)
 
   // Layer 2: text-level judgement, roles whitelist only.
   if (role !== 'assistant' && role !== 'thinking' && role !== 'user' && role !== 'plan')

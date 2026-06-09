@@ -5,10 +5,10 @@ import { exportSessionDocx } from './export-docx.js'
 import { exportSessionTex } from './export-tex.js'
 import { setTitleBusy } from './notifications.js'
 import { getSession, state } from './state.js'
-import { deleteSessionFromServer, hydrateSession, pushSessionToServer } from './sync.js?v=3'
+import { deleteSessionFromServer, hydrateSession, pushSessionToServer } from './sync.js?v=4'
 import { toast } from './ui.js'
 import { GROUP_ORDER, sessionGroup, shortTime, uuid } from './util.js'
-import { nudgeDrain } from './websocket.js?v=41'
+import { nudgeDrain } from './websocket.js?v=42'
 
 // Late-bound references set by main.js
 let _renderMessages

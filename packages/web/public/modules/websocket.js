@@ -2,7 +2,7 @@
 import { $, htmlSafeEscape } from './dom.js'
 import { maybeNotify, setTitleBusy } from './notifications.js'
 import { getSession, state } from './state.js'
-import { maybeSyncNow } from './sync.js?v=3'
+import { maybeSyncNow } from './sync.js?v=4'
 import { toast } from './ui.js'
 
 // ── Late-binding for circular deps (sessions.js, messages.js) ──
