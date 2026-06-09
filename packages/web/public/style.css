@@ -3321,7 +3321,7 @@ a:hover {
   user-select: none;
 }
 
-/* ── Codex Goal 模式：完整前台控制面板 ── */
+/* ── Codex Goal 模式：紧凑约束条 + 按需编辑面板 ── */
 .goal-mode {
   display: flex;
   flex-direction: column;
@@ -3341,6 +3341,11 @@ a:hover {
 }
 .goal-mode-toggle {
   flex-shrink: 0;
+}
+.goal-mode-toggle[aria-pressed="true"] {
+  border-color: var(--accent-border);
+  color: var(--accent);
+  background: var(--accent-soft);
 }
 .goal-mode-dot {
   line-height: 1;
@@ -3388,8 +3393,18 @@ a:hover {
   display: none;
 }
 .goal-mode-current,
+.goal-mode-hint,
 .goal-mode-actions {
   grid-column: 1 / -1;
+}
+.goal-mode-hint {
+  padding: 8px 10px;
+  border: 1px dashed var(--border-subtle);
+  border-radius: var(--radius-md);
+  color: var(--fg-muted);
+  background: var(--bg-elevated);
+  font-size: var(--text-xs);
+  line-height: 1.45;
 }
 .goal-mode-current {
   display: flex;
