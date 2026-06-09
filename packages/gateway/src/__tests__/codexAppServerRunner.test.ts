@@ -247,12 +247,41 @@ describe('CodexAppServerRunner.warmup', () => {
     assert.equal(await h.runner.warmup(500), true)
     assert.equal(captured.length, 1)
     assert.equal(h.spawns.length, 1)
+    assert.deepEqual(captured[0].args, ['app-server', '--enable', 'goals', '--listen', 'stdio://'])
+    const requests = h.written.map((line) => JSON.parse(line))
     assert.deepEqual(
-      h.written.map((line) => JSON.parse(line).method),
+      requests.map((req) => req.method),
       ['initialize'],
     )
     assert.equal((h.runner as any).initialized, true)
     assert.equal((h.runner as any).attached, false)
+
+    await h.runner.shutdown()
+    await h.cleanup()
+  })
+
+  it('keeps launch overrides before the goals flag and --listen', async () => {
+    const h = await makeHarness()
+    ;(h.runner as any).ensureLaunchOverrides = async () => ({
+      argvOverrides: ['-c', 'model="gpt-5-codex"'],
+    })
+    const captured: { cmd: string; args: string[]; opts: unknown }[] = []
+    __setCodexAppServerSpawnForTests(((cmd: string, args: string[], opts: unknown) => {
+      captured.push({ cmd, args, opts })
+      return makeSpawnedFakeProc(h.written)
+    }) as any)
+
+    assert.equal(await h.runner.warmup(500), true)
+
+    assert.deepEqual(captured[0].args, [
+      'app-server',
+      '-c',
+      'model="gpt-5-codex"',
+      '--enable',
+      'goals',
+      '--listen',
+      'stdio://',
+    ])
 
     await h.runner.shutdown()
     await h.cleanup()

@@ -849,10 +849,15 @@ export class CodexAppServerRunner extends EventEmitter {
         },
       )
     }
-    // `codex app-server` accepts `-c key=value` overrides (verified via
-    // `codex app-server --help`). They must precede `--listen` to keep
-    // clap's positional/option parser happy.
-    const args = ['app-server', ...argvOverrides, '--listen', 'stdio://']
+    // `codex app-server` accepts `-c key=value` and `--enable <feature>`
+    // overrides (verified via `codex app-server --help`). They must precede
+    // `--listen` to keep clap's positional/option parser happy.
+    //
+    // Codex exposes goal RPCs in the experimental schema, but the runtime
+    // `goals` beta feature is disabled by default. It must be enabled at
+    // process startup (`--enable goals` / `features.goals=true`); Codex 0.130
+    // rejects trying to enable it later via `experimentalFeature/enablement/set`.
+    const args = ['app-server', ...argvOverrides, '--enable', 'goals', '--listen', 'stdio://']
     const proc = _spawnFn('codex', args, {
       cwd: this.opts.cwd,
       stdio: ['pipe', 'pipe', 'pipe'],
