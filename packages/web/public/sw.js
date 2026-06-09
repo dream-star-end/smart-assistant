@@ -5,7 +5,7 @@ const SHELL = [
   '/',
   '/index.html',
   '/style.css',
-  '/style.css?v=33', // versioned URL used in index.html
+  '/style.css?v=34', // versioned URL used in index.html
   '/manifest.json',
   '/icon.svg',
   // ES modules
