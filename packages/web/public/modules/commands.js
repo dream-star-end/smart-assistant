@@ -1,7 +1,6 @@
 // OpenClaude — Slash Commands
 import { apiGet } from './api.js'
 import { $, _mod } from './dom.js'
-import { parseGoalCommand, sendGoalControl } from './goalControl.js?v=1'
 import { getSession, state } from './state.js'
 import { toast } from './ui.js'
 import {
@@ -9,7 +8,7 @@ import {
   localStopTeardown,
   nudgeDrain,
   resetReplyTracker,
-} from './websocket.js?v=43'
+} from './websocket.js?v=44'
 
 // ── Late-binding for circular deps ──
 let _deps = {}
@@ -138,20 +137,6 @@ const slashCommands = [
     desc: '管理定时任务',
     run() {
       _deps.openTasksModal()
-    },
-  },
-  {
-    cmd: '/goal',
-    desc: '管理 Codex goal: status / clear / pause / resume / complete / budget N / 目标文本',
-    run(args) {
-      const parsed = parseGoalCommand(args)
-      if (parsed.error) {
-        toast(parsed.error, 'error')
-        return
-      }
-      if (sendGoalControl(parsed.action, parsed.fields || {})) {
-        toast('已发送 Codex goal 操作')
-      }
     },
   },
   {

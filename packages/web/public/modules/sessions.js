@@ -5,10 +5,10 @@ import { exportSessionDocx } from './export-docx.js'
 import { exportSessionTex } from './export-tex.js'
 import { setTitleBusy } from './notifications.js'
 import { getSession, state } from './state.js'
-import { deleteSessionFromServer, hydrateSession, pushSessionToServer } from './sync.js?v=5'
+import { deleteSessionFromServer, hydrateSession, pushSessionToServer } from './sync.js?v=6'
 import { toast } from './ui.js'
 import { GROUP_ORDER, sessionGroup, shortTime, uuid } from './util.js'
-import { nudgeDrain } from './websocket.js?v=43'
+import { nudgeDrain } from './websocket.js?v=44'
 
 // Late-bound references set by main.js
 let _renderMessages
@@ -26,10 +26,12 @@ export function setSessionDeps(deps) {
 let _showTypingIndicator
 let _hideTypingIndicator
 let _renderAgentDropdown
+let _renderGoalModePanel
 export function setSessionUIDeps(deps) {
   _showTypingIndicator = deps.showTypingIndicator
   _hideTypingIndicator = deps.hideTypingIndicator
   _renderAgentDropdown = deps.renderAgentDropdown
+  _renderGoalModePanel = deps.renderGoalModePanel
 }
 
 // ═══════════════ SESSIONS ═══════════════
@@ -69,6 +71,7 @@ export function switchSession(id) {
   renderSidebar()
   _renderMessages()
   _renderAgentDropdown()
+  _renderGoalModePanel?.({ autoRefresh: true })
   // After DOM rebuild, show typing indicator + title busy for the new session if in-flight
   if (state.sendingInFlight) {
     _showTypingIndicator()
@@ -83,6 +86,7 @@ export function switchSession(id) {
         renderSidebar()
         _renderMessages()
         _renderAgentDropdown()
+        _renderGoalModePanel?.({ autoRefresh: true })
         if (state.sendingInFlight) {
           _showTypingIndicator()
           setTitleBusy(true)

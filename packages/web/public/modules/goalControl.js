@@ -1,9 +1,9 @@
 // OpenClaude — Codex persistent goal controls
-import { $ } from './dom.js'
 import { getSession, state } from './state.js'
 import { toast } from './ui.js'
 
 const VALID_STATUSES = new Set(['active', 'paused', 'budgetLimited', 'complete'])
+let _suppressNextGoalGetToastUntil = 0
 
 function _currentAgent() {
   const sess = getSession()
@@ -33,13 +33,14 @@ function _goalFrame(action, fields = {}) {
   return frame
 }
 
-export function sendGoalControl(action, fields = {}) {
+export function sendGoalControl(action, fields = {}, opts = {}) {
+  const notify = !opts.silent
   if (!currentAgentSupportsGoals()) {
-    toast('当前 agent 不支持 Codex goals', 'error')
+    if (notify) toast('当前 agent 不支持 Codex goals', 'error')
     return false
   }
   if (!state.ws || state.ws.readyState !== 1) {
-    toast('WebSocket 未连接，无法操作 Codex goal', 'error')
+    if (notify) toast('WebSocket 未连接，无法操作 Codex goal', 'error')
     return false
   }
   if (action !== 'get' && action !== 'set' && action !== 'clear') {
@@ -52,62 +53,24 @@ export function sendGoalControl(action, fields = {}) {
   }
   const frame = _goalFrame(action, fields)
   if (!frame) return false
+  if (opts.silent && action === 'get') {
+    _suppressNextGoalGetToastUntil = Date.now() + 5000
+  }
   state.ws.send(JSON.stringify(frame))
   return true
 }
 
-export function focusGoalComposer(prefill = '') {
-  const input = $('input')
-  if (!input) return
-  input.value = `/goal ${prefill || ''}`
-  input.focus()
-  const pos = input.value.length
-  try {
-    input.setSelectionRange(pos, pos)
-  } catch {}
+export function shouldSuppressGoalStatusToast(frame) {
+  if (!frame || frame.action !== 'get') return false
+  if (Date.now() > _suppressNextGoalGetToastUntil) return false
+  _suppressNextGoalGetToastUntil = 0
+  return true
 }
 
-export function parseGoalCommand(args = '') {
-  const raw = String(args || '').trim()
-  if (!raw || raw === 'status') return { action: 'get' }
-  const lower = raw.toLowerCase()
-  if (lower === 'clear' || lower === 'delete' || lower === 'remove') return { action: 'clear' }
-  if (lower === 'pause' || lower === 'paused') {
-    return { action: 'set', fields: { status: 'paused' } }
-  }
-  if (lower === 'resume' || lower === 'active' || lower === 'continue') {
-    return { action: 'set', fields: { status: 'active' } }
-  }
-  if (lower === 'complete' || lower === 'done' || lower === 'finish') {
-    return { action: 'set', fields: { status: 'complete' } }
-  }
-  const budgetMatch = raw.match(/^budget\s+(.+)$/i)
-  if (budgetMatch) {
-    const val = budgetMatch[1].trim()
-    if (/^(none|null|clear|off)$/i.test(val)) {
-      return { action: 'set', fields: { tokenBudget: null } }
-    }
-    const n = Number(val.replace(/,/g, ''))
-    if (!Number.isFinite(n) || n <= 0) {
-      return { error: '预算必须是正数，或使用 `/goal budget none` 清除预算。' }
-    }
-    return { action: 'set', fields: { tokenBudget: Math.floor(n) } }
-  }
-
-  let objective = raw
-  let tokenBudget
-  const budgetFlag = objective.match(/\s+--budget(?:=|\s+)([0-9][0-9,]*)\s*$/i)
-  if (budgetFlag) {
-    tokenBudget = Math.floor(Number(budgetFlag[1].replace(/,/g, '')))
-    objective = objective.slice(0, budgetFlag.index).trim()
-  }
-  if (!objective) return { error: '目标不能为空。' }
-  return {
-    action: 'set',
-    fields: {
-      objective,
-      status: 'active',
-      ...(typeof tokenBudget === 'number' && tokenBudget > 0 ? { tokenBudget } : {}),
-    },
-  }
+export function openGoalPanel(prefill = '') {
+  window.dispatchEvent(
+    new CustomEvent('openclaude:goal-panel-open', {
+      detail: { prefill: String(prefill || '') },
+    }),
+  )
 }
