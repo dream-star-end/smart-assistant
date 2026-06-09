@@ -27,7 +27,7 @@ import { apiFetch, apiGet, apiJson, authHeaders, onAuthExpired, resetAuthExpired
 import { dbDelete, dbGetAll, dbPut, onIdbUnavailable, openDB } from './db.js'
 
 // ── Cross-device sync ──
-import { hydrateSession, maybeSyncNow, setSyncDeps, syncSessionsFromServer } from './sync.js?v=7'
+import { hydrateSession, maybeSyncNow, setSyncDeps, syncSessionsFromServer } from './sync.js?v=8'
 
 // ── Theme ──
 import { applyTheme, cycleTheme, effectiveTheme, setToastFn } from './theme.js'
@@ -110,7 +110,7 @@ import {
   showContextMenu,
   startInlineRename,
   switchSession,
-} from './sessions.js?v=8'
+} from './sessions.js?v=9'
 
 // ── Messages ──
 import {
@@ -125,7 +125,7 @@ import {
   setMessageDeps,
   updateMessageEl,
   updateSessionSub,
-} from './messages.js?v=42'
+} from './messages.js?v=43'
 
 // ── WebSocket ──
 import {
@@ -153,7 +153,7 @@ import {
   updateMessage,
   updateMsgStatus,
   updateSendEnabled,
-} from './websocket.js?v=45'
+} from './websocket.js?v=46'
 
 // ── Slash commands ──
 import {
@@ -166,7 +166,7 @@ import {
   setSlashSelected,
   showSlashPopup,
   slashPopupVisible,
-} from './commands.js?v=5'
+} from './commands.js?v=6'
 import { getEffortForSubmit, initModePills, renderModePills } from './effortMode.js'
 import { initGoalModePanel, renderGoalModePanel } from './goalMode.js?v=2'
 import { getConversationModeForSubmit } from './planMode.js?v=4'

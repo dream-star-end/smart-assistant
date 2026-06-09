@@ -588,6 +588,44 @@ describe('T-GOAL-MODE: visual goal mode derives current goal from messages', () 
       /addAction\('刷新'[\s\S]*?sendGoalControl\('get'\)/.test(appJs),
       'Refresh remains a non-collapsing status read',
     )
+    assert.ok(
+      /function _isTranscriptMessage\(msg\) \{\s*return msg\?\.role !== 'goal'\s*\}/.test(appJs),
+      'Goal status messages should be kept in data but filtered out of the main transcript',
+    )
+    assert.ok(
+      /export function renderMessage\(msg[\s\S]*?!_isTranscriptMessage\(msg\)[\s\S]*?renderGoalModePanel\(\)[\s\S]*?return/.test(
+        appJs,
+      ),
+      'New goal updates should refresh the compact bar instead of appending a transcript card',
+    )
+    assert.ok(
+      /export function updateMessageEl\(msg[\s\S]*?msg\.role === 'goal'[\s\S]*?el\?\.remove\(\)[\s\S]*?renderGoalModePanel\(\)[\s\S]*?return/.test(
+        appJs,
+      ),
+      'Existing legacy goal cards should be removed on the next goal update',
+    )
+    assert.ok(
+      appJs.includes('const msgs = s.messages.filter(_isTranscriptMessage)'),
+      'Full transcript renders should paginate only visible conversation messages',
+    )
+    assert.ok(
+      !/else if \(msg\.role === 'goal'\) \{\s*_buildGoalCard\(el, msg\)/.test(appJs),
+      'Role=goal should no longer render as a large in-chat card',
+    )
+    assert.ok(
+      /function applyGoalStatusFrame\(frame\)[\s\S]*?addMessage\(sess, 'goal'[\s\S]*?_deps\.scheduleSave\(sess, true, \{ rebuildSearchIndex: false \}\)/.test(
+        appJs,
+      ),
+      'Goal control status frames should update the hidden message-backed Goal state',
+    )
+    assert.ok(
+      appJs.includes('if (frame.ok) applyGoalStatusFrame(frame)'),
+      'Goal status frames should be applied before settling the compact panel',
+    )
+    assert.ok(
+      !appJs.includes("r === 'goal' ||"),
+      'Hidden goal status should not count as visible turn output',
+    )
   })
 })
 
