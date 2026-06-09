@@ -225,17 +225,22 @@ describe("openclaude-runtime entrypoint env-scrub policy", () => {
     );
     assert.match(
       src,
-      /\[BROWSER_TOOLSET_ID\]:\s*\[BROWSER_MCP_ID\]/,
+      /setToolset\(toolsets,\s*BROWSER_TOOLSET_ID,\s*\[BROWSER_MCP_ID\]\)/,
       "browser tools must be opt-in via the browser toolset",
     );
     assert.match(
       src,
-      /\[RESEARCH_TOOLSET_ID\]:\s*\[SCANSCI_PDF_MCP_ID\]/,
+      /setToolset\(toolsets,\s*WEB_CONTEXT_TOOLSET_ID,\s*\[WEB_CONTEXT_MCP_ID\]\)/,
+      "web-context tools must also have a narrow standalone opt-in toolset",
+    );
+    assert.match(
+      src,
+      /setToolset\(toolsets,\s*RESEARCH_TOOLSET_ID,\s*\[SCANSCI_PDF_MCP_ID,\s*WEB_CONTEXT_MCP_ID\]\)/,
       "ScanSci tools must be opt-in via the research toolset",
     );
     assert.match(
       src,
-      /mcpServers:\s*\[cloneBrowserMcpServer\(\),\s*cloneScanSciPdfMcpServer\(\)\]/,
+      /mcpServers:\s*\[cloneBrowserMcpServer\(\),\s*cloneScanSciPdfMcpServer\(\),\s*cloneWebContextMcpServer\(\)\]/,
       "minimal openclaude.json must use array-shaped mcpServers, not a keyed object",
     );
     assert.match(
@@ -247,6 +252,11 @@ describe("openclaude-runtime entrypoint env-scrub policy", () => {
       src,
       /command:\s*"scansci-pdf"[\s\S]*args:\s*\["run"\]/,
       "ScanSci MCP server should launch `scansci-pdf run` over stdio",
+    );
+    assert.match(
+      src,
+      /args:\s*\["tsx",\s*"\/opt\/openclaude\/packages\/gateway\/src\/mcpWebContextServer\.ts"\]/,
+      "web-context MCP server should launch the built-in TS stdio server",
     );
     assert.doesNotMatch(
       src,

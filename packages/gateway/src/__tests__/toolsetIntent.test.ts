@@ -1,22 +1,47 @@
 import * as assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
-import { detectBrowserToolsetIntent, mergeOnDemandToolsets } from '../toolsetIntent.js'
+import {
+  detectBrowserToolsetIntent,
+  detectWebContextToolsetIntent,
+  mergeOnDemandToolsets,
+} from '../toolsetIntent.js'
 
 const config: any = {
   toolsets: {
     core: [],
     browser: ['browser'],
-    research: ['scansci-pdf'],
+    research: ['scansci-pdf', 'web-context'],
+    web_context: ['web-context'],
   },
 }
 
 describe('toolset on-demand intent', () => {
   it('adds browser toolset for explicit interactive browser intent', () => {
     assert.equal(detectBrowserToolsetIntent('打开网页 https://example.com 并点击登录'), true)
+    assert.equal(detectWebContextToolsetIntent('打开网页 https://example.com 并点击登录'), true)
     assert.deepEqual(
       mergeOnDemandToolsets(['core'], config, '打开网页 https://example.com 并点击登录'),
       ['core', 'browser'],
     )
+  })
+
+  it('adds web_context for URL/data extraction intent without mounting browser', () => {
+    assert.equal(detectBrowserToolsetIntent('帮我读取这个链接 https://example.com/report'), false)
+    assert.equal(detectWebContextToolsetIntent('帮我读取这个链接 https://example.com/report'), true)
+    assert.deepEqual(
+      mergeOnDemandToolsets(['core'], config, '帮我读取这个链接 https://example.com/report'),
+      ['core', 'web_context'],
+    )
+  })
+
+  it('falls back to research toolset when web_context is not configured', () => {
+    const oldConfig: any = {
+      toolsets: { core: [], browser: ['browser'], research: ['scansci-pdf', 'web-context'] },
+    }
+    assert.deepEqual(mergeOnDemandToolsets(['core'], oldConfig, '爬取 https://example.com/data'), [
+      'core',
+      'research',
+    ])
   })
 
   it('does not auto-enable research or browser for generic search/paper requests', () => {
@@ -42,7 +67,10 @@ describe('toolset on-demand intent', () => {
   })
 
   it('preserves legacy all-tools behavior when no base toolsets are configured', () => {
-    assert.equal(mergeOnDemandToolsets(undefined, config, '打开网页 https://example.com'), undefined)
+    assert.equal(
+      mergeOnDemandToolsets(undefined, config, '打开网页 https://example.com'),
+      undefined,
+    )
     assert.equal(mergeOnDemandToolsets([], config, '打开网页 https://example.com'), undefined)
   })
 })
