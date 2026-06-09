@@ -4,7 +4,7 @@ import { shouldSuppressGoalStatusToast } from './goalControl.js?v=2'
 import { renderGoalModePanel, settleGoalModePanel } from './goalMode.js?v=2'
 import { maybeNotify, setTitleBusy } from './notifications.js'
 import { getSession, state } from './state.js'
-import { maybeSyncNow } from './sync.js?v=7'
+import { maybeSyncNow } from './sync.js?v=8'
 import { toast } from './ui.js'
 
 // ── Late-binding for circular deps (sessions.js, messages.js) ──
@@ -1317,9 +1317,10 @@ export function handleOutbound(frame) {
       // Detect empty-turn by directly inspecting the message array: did any
       // content-bearing message get added AFTER the target user message?
       // This is more robust than relying on transient streaming pointers.
-      // Roles considered content: assistant, thinking, tool, agent-group,
-      // plan, goal, and permission (permission prompts are visible cards
-      // that count as real turn output).
+      // Roles considered visible content: assistant, thinking, tool, agent-group,
+      // plan, and permission (permission prompts are visible cards that count as
+      // real turn output). Goal status is intentionally excluded because it now
+      // lives in the compact Goal bar, not the transcript.
       let producedContent = false
       const targetIdx = sess.messages.findIndex((m) => m.id === _targetMsg.id)
       if (targetIdx >= 0) {
@@ -1331,7 +1332,6 @@ export function handleOutbound(frame) {
             r === 'tool' ||
             r === 'agent-group' ||
             r === 'plan' ||
-            r === 'goal' ||
             r === 'permission'
           ) {
             producedContent = true
@@ -1370,7 +1370,7 @@ export function handleOutbound(frame) {
         // previous turn contains any content-bearing block, treat as the
         // "likely model preference" variant. Role set here mirrors the
         // producedContent check above (including 'permission') so the two
-        // classifiers agree on what counts as "content".
+        // classifiers agree on what counts as visible content.
         let priorTurnHadContent = false
         for (let i = targetIdx - 1; i >= 0; i--) {
           const r = sess.messages[i].role
@@ -1381,7 +1381,6 @@ export function handleOutbound(frame) {
             r === 'tool' ||
             r === 'agent-group' ||
             r === 'plan' ||
-            r === 'goal' ||
             r === 'permission'
           ) {
             priorTurnHadContent = true
@@ -1934,7 +1933,69 @@ function handleOutboundTurnStatus(frame) {
   }
 }
 
+function _ensureBlockIdMap(sess) {
+  if (sess._blockIdToMsgId) return
+  sess._blockIdToMsgId = new Map()
+  for (const m of sess.messages || []) {
+    if (m.blockId) sess._blockIdToMsgId.set(m.blockId, m.id)
+  }
+}
+
+function _goalNumber(v) {
+  return typeof v === 'number' && Number.isFinite(v) ? v : undefined
+}
+
+function applyGoalStatusFrame(frame) {
+  const peerId = frame.peer?.id
+  const sess = peerId ? state.sessions.get(peerId) : null
+  if (!sess || !frame.ok) return
+
+  const raw = frame.goal && typeof frame.goal === 'object' ? frame.goal : {}
+  const goalId = typeof raw.blockId === 'string' ? raw.blockId : 'codex-goal'
+  _ensureBlockIdMap(sess)
+  const mid = sess._blockIdToMsgId.get(goalId)
+  let goalMsg = mid ? sess.messages.find((m) => m.id === mid && m.role === 'goal') : null
+  if (!goalMsg) goalMsg = sess.messages.find((m) => m.role === 'goal' && m.blockId === goalId)
+
+  const cleared = frame.action === 'clear' || !frame.goal || raw.cleared === true
+  const objective = cleared
+    ? ''
+    : typeof raw.objective === 'string'
+      ? raw.objective
+      : goalMsg?.text || ''
+  const goalFields = {
+    blockId: goalId,
+    status: cleared
+      ? 'cleared'
+      : typeof raw.status === 'string'
+        ? raw.status
+        : goalMsg?.status || 'active',
+    tokenBudget:
+      typeof raw.tokenBudget === 'number' || raw.tokenBudget === null ? raw.tokenBudget : undefined,
+    tokensUsed: _goalNumber(raw.tokensUsed),
+    timeUsedSeconds: _goalNumber(raw.timeUsedSeconds),
+    createdAt: _goalNumber(raw.createdAt) ?? goalMsg?.createdAt,
+    updatedAt: _goalNumber(raw.updatedAt) ?? Date.now(),
+    cleared,
+    completedAt: Date.now(),
+  }
+
+  if (!goalMsg) {
+    goalMsg = addMessage(sess, 'goal', objective, goalFields)
+    sess._blockIdToMsgId.set(goalId, goalMsg.id)
+  } else {
+    goalMsg.text = objective
+    Object.assign(goalMsg, goalFields)
+    sess.lastAt = Date.now()
+    if (sess.id === state.currentSessionId) _deps.updateMessageEl(goalMsg)
+  }
+
+  _deps.scheduleSave(sess, true, { rebuildSearchIndex: false })
+  if (sess.id === state.currentSessionId) renderGoalModePanel()
+}
+
 function handleGoalStatus(frame) {
+  if (frame.ok) applyGoalStatusFrame(frame)
   const silent = shouldSuppressGoalStatusToast(frame)
   if (frame.ok && !silent) {
     if (frame.action === 'get' && frame.goal?.cleared) {

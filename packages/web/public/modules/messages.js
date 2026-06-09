@@ -4,7 +4,7 @@ import { getEffortForSubmit } from './effortMode.js'
 import { exportMessageDocx } from './export-docx.js'
 import { exportMessageTex } from './export-tex.js'
 import { openGoalPanel, sendGoalControl } from './goalControl.js?v=2'
-import { collapseGoalModePanel } from './goalMode.js?v=2'
+import { collapseGoalModePanel, renderGoalModePanel } from './goalMode.js?v=2'
 import {
   clearChartInstances,
   embedMediaUrls,
@@ -1300,6 +1300,10 @@ function _formatGoalDuration(seconds) {
   return rem ? `${hours}h ${rem}m` : `${hours}h`
 }
 
+function _isTranscriptMessage(msg) {
+  return msg?.role !== 'goal'
+}
+
 function _sendGoalCardControl(action, fields = {}, opts = {}) {
   const ok = sendGoalControl(action, fields, opts)
   if (ok && action !== 'get' && opts.collapse !== false) collapseGoalModePanel()
@@ -1857,7 +1861,9 @@ export function _buildMessageEl(msg) {
   } else if (msg.role === 'plan') {
     _buildPlanCard(el, msg)
   } else if (msg.role === 'goal') {
-    _buildGoalCard(el, msg)
+    el.className = 'msg goal'
+    el.dataset.msgId = msg.id
+    el.hidden = true
   } else if (msg.role === 'agent-group') {
     _renderAgentGroup(el, msg)
   } else if (msg.role === 'thinking') {
@@ -1951,6 +1957,10 @@ function _refreshMsgTime(el, msg) {
 }
 
 export function renderMessage(msg, skipRichBlocks = false) {
+  if (!_isTranscriptMessage(msg)) {
+    renderGoalModePanel()
+    return
+  }
   const main = ensureInner()
   const el = _buildMessageEl(msg)
   // Keep the typing indicator pinned at the bottom — if it is currently visible,
@@ -1964,6 +1974,11 @@ export function renderMessage(msg, skipRichBlocks = false) {
 
 export function updateMessageEl(msg, streaming) {
   const el = document.querySelector(`[data-msg-id="${msg.id}"]`)
+  if (msg.role === 'goal') {
+    el?.remove()
+    renderGoalModePanel()
+    return
+  }
   if (!el) return
   if (msg.role === 'assistant') {
     const body = el.querySelector('.msg-body')
@@ -2036,8 +2051,6 @@ export function updateMessageEl(msg, streaming) {
     if (msg.error) el.classList.add('error')
     el.dataset.msgId = msg.id
     _buildPlanCard(el, msg)
-  } else if (msg.role === 'goal') {
-    _buildGoalCard(el, msg)
   } else if (msg.role === 'thinking') {
     const body = el.querySelector('.thinking-body') || el.querySelector('.msg-body')
     if (body) body.textContent = msg.text || ''
@@ -2103,6 +2116,7 @@ export function renderMessages() {
   }
   $('session-title').textContent = s.title
   updateSessionSub(s)
+  renderGoalModePanel()
   if (s._needsFetch) {
     const empty = document.createElement('div')
     empty.className = 'empty-state'
@@ -2123,7 +2137,8 @@ export function renderMessages() {
     refreshPlanPanel()
     return
   }
-  if (s.messages.length === 0) {
+  const msgs = s.messages.filter(_isTranscriptMessage)
+  if (msgs.length === 0) {
     const empty = document.createElement('div')
     empty.className = 'empty-state'
     const _ai = state.agentsList.find((a) => a.id === (s.agentId || state.defaultAgentId))
@@ -2139,7 +2154,6 @@ export function renderMessages() {
   main.appendChild(inner)
   // Performance: only render last 100 messages; show "load more" for older ones
   const MAX_INITIAL = 100
-  const msgs = s.messages
   if (msgs.length > MAX_INITIAL) {
     const LOAD_BATCH = 50
     let _loadedUpTo = msgs.length - MAX_INITIAL // index: messages before this are not yet rendered
