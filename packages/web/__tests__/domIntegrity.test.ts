@@ -68,18 +68,7 @@ const DYNAMIC_IDS = new Set([
   'plan-panel', // initPlanPanel() creates aside#plan-panel on demand
   'plan-panel-close', // initPlanPanel() creates the drawer close button on demand
   'plan-panel-content', // initPlanPanel() creates the drawer content mount on demand
-  'goal-mode-objective', // initGoalModePanel() creates the composer goal mode panel
-  'goal-mode-budget',
-  'goal-mode-toggle',
-  'goal-mode-refresh',
-  'goal-mode-save',
-  'goal-mode-pause',
-  'goal-mode-complete',
-  'goal-mode-clear',
-  'goal-mode-collapse',
-  'goal-mode-current',
-  'goal-mode-panel',
-  'goal-mode-summary',
+  'goal-mode-toggle', // initGoalModePanel() creates the simple composer Goal toggle
   'slash-popup', // showSlashPopup() creates div#slash-popup
   'permission-modal', // permission prompts are created on demand in websocket.js
 ])

@@ -3,7 +3,7 @@ import { getSession, state } from './state.js'
 import { toast } from './ui.js'
 
 const VALID_STATUSES = new Set(['active', 'paused', 'budgetLimited', 'complete'])
-let _suppressNextGoalGetToastUntil = 0
+const _suppressGoalStatusToastUntil = new Map()
 
 function _currentAgent() {
   const sess = getSession()
@@ -53,17 +53,18 @@ export function sendGoalControl(action, fields = {}, opts = {}) {
   }
   const frame = _goalFrame(action, fields)
   if (!frame) return false
-  if (opts.silent && action === 'get') {
-    _suppressNextGoalGetToastUntil = Date.now() + 5000
+  if (opts.silent) {
+    _suppressGoalStatusToastUntil.set(action, Date.now() + 5000)
   }
   state.ws.send(JSON.stringify(frame))
   return true
 }
 
 export function shouldSuppressGoalStatusToast(frame) {
-  if (!frame || frame.action !== 'get') return false
-  if (Date.now() > _suppressNextGoalGetToastUntil) return false
-  _suppressNextGoalGetToastUntil = 0
+  if (!frame || typeof frame.action !== 'string') return false
+  const until = _suppressGoalStatusToastUntil.get(frame.action) || 0
+  if (Date.now() > until) return false
+  _suppressGoalStatusToastUntil.delete(frame.action)
   return true
 }
 

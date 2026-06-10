@@ -4677,6 +4677,10 @@ export class Gateway {
       _frameConversationMode === 'default' || _frameConversationMode === 'plan'
         ? _frameConversationMode
         : undefined
+    const safeGoalMode =
+      (frame as any).goalMode === true &&
+      agent.provider === 'codex-native' &&
+      agent.runnerKind === 'app-server'
 
     const session = await this.sessions.getOrCreate({
       sessionKey,
@@ -5018,6 +5022,13 @@ export class Gateway {
     }
     // Pass as plain text. No image content blocks — safer for non-multimodal providers.
     const payload: string = finalText
+    let goalObjective: string | undefined
+    if (safeGoalMode) {
+      const direct = text.trim()
+      const fallback = payload.replace(/\s+/g, ' ').trim()
+      const rawGoal = direct || fallback
+      if (rawGoal) goalObjective = rawGoal.slice(0, 2000)
+    }
     const taskType = sessionKey.includes(':cron:')
       ? ('cron' as const)
       : sessionKey.includes(':delegate:')
@@ -5173,6 +5184,7 @@ export class Gateway {
       },
       safeEffortLevel,
       safeConversationMode,
+      goalObjective,
     )
   }
 

@@ -528,12 +528,12 @@ describe('T-PLAN-PANEL: plan markdown rendering and quick panel wiring', () => {
   })
 })
 
-// ── T-GOAL-MODE: visual Codex Goal mode state derivation ──
-describe('T-GOAL-MODE: visual goal mode derives current goal from messages', () => {
+// ── T-GOAL-MODE: simple Codex Goal toggle state derivation ──
+describe('T-GOAL-MODE: simple goal toggle keeps transcript normal', () => {
   it('returns null when no goal message exists', () => {
     assert.equal(getLatestGoalFromMessages([{ role: 'user', text: 'hi' }]), null)
   })
-  it('uses the latest goal message and normalizes numeric fields', () => {
+  it('uses the latest hidden goal message and normalizes numeric fields', () => {
     const goal = getLatestGoalFromMessages([
       { role: 'goal', objective: 'old', status: 'active', tokenBudget: 100 },
       { role: 'assistant', text: 'ok' },
@@ -567,64 +567,53 @@ describe('T-GOAL-MODE: visual goal mode derives current goal from messages', () 
       updatedAt: null,
     })
   })
-  it('keeps the visual editor collapsed while an active goal constrains normal chat', () => {
+  it('renders only a one-shot composer switch, not a Goal editor/status surface', () => {
     assert.ok(
-      appJs.includes('if (panel) panel.hidden = !_expanded'),
-      'Goal editor panel should only depend on explicit expansion',
+      appJs.includes('goalModeEnabled') && appJs.includes('goalModeSeeded'),
+      'Goal toggle should use explicit enabled/seeded session state',
     )
     assert.ok(
-      !appJs.includes('panel.hidden = !(_expanded || hasGoal)'),
-      'Active goals must not force the full editor to stay open',
+      /export function getGoalModeForSubmit\(\)[\s\S]*?enabled && !seeded \? true : undefined/.test(
+        appJs,
+      ),
+      'Goal mode submit flag should be one-shot and not overwrite every follow-up',
     )
     assert.ok(
-      appJs.includes('执行过程会照常显示'),
-      'Expanded editor should explain that normal execution remains visible',
+      appJs.includes('if (goalMode === true) markGoalModeSeeded()'),
+      'Sending the seed message should mark the active Goal as seeded',
     )
     assert.ok(
-      appJs.includes('function _sendGoalCardControl') && appJs.includes('collapseGoalModePanel()'),
-      'Goal card actions in the normal transcript should also collapse the editor',
+      appJs.includes('openclaude:goal-mode-state-changed') &&
+        appJs.includes('scheduleSaveFromUserEdit(sess, true)'),
+      'Goal toggle/seed state should be persisted immediately, not only after another message',
     )
     assert.ok(
-      /addAction\('刷新'[\s\S]*?sendGoalControl\('get'\)/.test(appJs),
-      'Refresh remains a non-collapsing status read',
+      appJs.includes("sendGoalControl('clear', {}, { silent: true })"),
+      'Turning the switch off should silently clear the persistent thread goal',
+    )
+    assert.ok(
+      appJs.includes('const _suppressGoalStatusToastUntil = new Map()') &&
+        appJs.includes('_suppressGoalStatusToastUntil.set(action'),
+      'Silent goal controls should suppress status toasts for all actions, not just get',
+    )
+    assert.ok(
+      !appJs.includes('goal-mode-objective') &&
+        !appJs.includes('goal-mode-budget') &&
+        !appJs.includes('goal-mode-refresh') &&
+        !appJs.includes('goal-mode-panel'),
+      'Goal mode should not render the old editor, budget, refresh, or status panel UI',
     )
     assert.ok(
       /function _isTranscriptMessage\(msg\) \{\s*return msg\?\.role !== 'goal'\s*\}/.test(appJs),
-      'Goal status messages should be kept in data but filtered out of the main transcript',
-    )
-    assert.ok(
-      /export function renderMessage\(msg[\s\S]*?!_isTranscriptMessage\(msg\)[\s\S]*?renderGoalModePanel\(\)[\s\S]*?return/.test(
-        appJs,
-      ),
-      'New goal updates should refresh the compact bar instead of appending a transcript card',
-    )
-    assert.ok(
-      /export function updateMessageEl\(msg[\s\S]*?msg\.role === 'goal'[\s\S]*?el\?\.remove\(\)[\s\S]*?renderGoalModePanel\(\)[\s\S]*?return/.test(
-        appJs,
-      ),
-      'Existing legacy goal cards should be removed on the next goal update',
+      'Goal status messages should stay hidden from the main transcript',
     )
     assert.ok(
       appJs.includes('const msgs = s.messages.filter(_isTranscriptMessage)'),
       'Full transcript renders should paginate only visible conversation messages',
     )
     assert.ok(
-      !/else if \(msg\.role === 'goal'\) \{\s*_buildGoalCard\(el, msg\)/.test(appJs),
-      'Role=goal should no longer render as a large in-chat card',
-    )
-    assert.ok(
-      /function applyGoalStatusFrame\(frame\)[\s\S]*?addMessage\(sess, 'goal'[\s\S]*?_deps\.scheduleSave\(sess, true, \{ rebuildSearchIndex: false \}\)/.test(
-        appJs,
-      ),
-      'Goal control status frames should update the hidden message-backed Goal state',
-    )
-    assert.ok(
-      appJs.includes('if (frame.ok) applyGoalStatusFrame(frame)'),
-      'Goal status frames should be applied before settling the compact panel',
-    )
-    assert.ok(
-      !appJs.includes("r === 'goal' ||"),
-      'Hidden goal status should not count as visible turn output',
+      !appJs.includes('function _buildGoalCard') && !appJs.includes('.goal-card-'),
+      'Role=goal should no longer have in-chat card rendering code',
     )
   })
 })

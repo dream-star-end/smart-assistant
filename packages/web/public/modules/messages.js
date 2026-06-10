@@ -3,8 +3,7 @@ import { $, _mod, fallbackCopy, htmlSafeEscape } from './dom.js'
 import { getEffortForSubmit } from './effortMode.js'
 import { exportMessageDocx } from './export-docx.js'
 import { exportMessageTex } from './export-tex.js'
-import { openGoalPanel, sendGoalControl } from './goalControl.js?v=2'
-import { collapseGoalModePanel, renderGoalModePanel } from './goalMode.js?v=2'
+import { renderGoalModePanel } from './goalMode.js?v=3'
 import {
   clearChartInstances,
   embedMediaUrls,
@@ -1270,154 +1269,8 @@ function _renderPlanMarkdownInto(el, text, streaming = false) {
   el.style.whiteSpace = ''
 }
 
-function _goalStatusLabel(status) {
-  switch (status) {
-    case 'active':
-      return '进行中'
-    case 'paused':
-      return '已暂停'
-    case 'blocked':
-      return '阻塞'
-    case 'usageLimited':
-      return '用量受限'
-    case 'budgetLimited':
-      return '预算受限'
-    case 'complete':
-      return '完成'
-    default:
-      return status || '未设置'
-  }
-}
-
-function _formatGoalDuration(seconds) {
-  if (typeof seconds !== 'number' || !Number.isFinite(seconds) || seconds < 0) return ''
-  if (seconds < 60) return `${Math.round(seconds)}s`
-  const mins = Math.floor(seconds / 60)
-  const secs = Math.round(seconds % 60)
-  if (mins < 60) return secs ? `${mins}m ${secs}s` : `${mins}m`
-  const hours = Math.floor(mins / 60)
-  const rem = mins % 60
-  return rem ? `${hours}h ${rem}m` : `${hours}h`
-}
-
 function _isTranscriptMessage(msg) {
   return msg?.role !== 'goal'
-}
-
-function _sendGoalCardControl(action, fields = {}, opts = {}) {
-  const ok = sendGoalControl(action, fields, opts)
-  if (ok && action !== 'get' && opts.collapse !== false) collapseGoalModePanel()
-  return ok
-}
-
-function _buildGoalCard(el, msg) {
-  el.innerHTML = ''
-  el.className = 'msg goal'
-  if (msg.error) el.classList.add('error')
-  el.dataset.msgId = msg.id
-
-  const header = document.createElement('div')
-  header.className = 'goal-card-header'
-  const title = document.createElement('div')
-  title.className = 'goal-card-title'
-  title.textContent = '目标'
-  const state = document.createElement('div')
-  state.className = `goal-card-state ${msg.status || ''}`
-  state.textContent = msg.cleared ? '已清除' : _goalStatusLabel(msg.status)
-  header.appendChild(title)
-  header.appendChild(state)
-  el.appendChild(header)
-
-  const body = document.createElement('div')
-  body.className = 'goal-card-body'
-  const objective = document.createElement('div')
-  objective.className = 'goal-card-objective'
-  objective.textContent = msg.cleared
-    ? '当前 Codex goal 已清除。'
-    : msg.text || 'Codex goal 已更新。'
-  body.appendChild(objective)
-
-  const meta = document.createElement('div')
-  meta.className = 'goal-card-meta'
-  if (typeof msg.tokensUsed === 'number') {
-    const token = document.createElement('span')
-    token.textContent =
-      typeof msg.tokenBudget === 'number'
-        ? `Tokens ${msg.tokensUsed}/${msg.tokenBudget}`
-        : `Tokens ${msg.tokensUsed}`
-    meta.appendChild(token)
-  }
-  const duration = _formatGoalDuration(msg.timeUsedSeconds)
-  if (duration) {
-    const dur = document.createElement('span')
-    dur.textContent = `用时 ${duration}`
-    meta.appendChild(dur)
-  }
-  if (typeof msg.updatedAt === 'number' && Number.isFinite(msg.updatedAt)) {
-    const updated = document.createElement('span')
-    try {
-      const ts = msg.updatedAt < 1000000000000 ? msg.updatedAt * 1000 : msg.updatedAt
-      updated.textContent = `更新 ${new Date(ts).toLocaleTimeString('zh-CN')}`
-    } catch {
-      updated.textContent = ''
-    }
-    if (updated.textContent) meta.appendChild(updated)
-  }
-  if (meta.childNodes.length > 0) body.appendChild(meta)
-
-  if (
-    typeof msg.tokensUsed === 'number' &&
-    typeof msg.tokenBudget === 'number' &&
-    msg.tokenBudget > 0
-  ) {
-    const pct = Math.max(0, Math.min(100, (msg.tokensUsed / msg.tokenBudget) * 100))
-    const bar = document.createElement('div')
-    bar.className = 'goal-card-progress'
-    const fill = document.createElement('div')
-    fill.className = 'goal-card-progress-fill'
-    fill.style.width = `${pct}%`
-    bar.appendChild(fill)
-    body.appendChild(bar)
-  }
-
-  const actions = document.createElement('div')
-  actions.className = 'goal-card-actions'
-  const addAction = (label, title, onClick) => {
-    const btn = document.createElement('button')
-    btn.type = 'button'
-    btn.className = 'goal-card-action'
-    btn.textContent = label
-    if (title) btn.title = title
-    btn.addEventListener('click', (e) => {
-      e.preventDefault()
-      e.stopPropagation()
-      onClick()
-    })
-    actions.appendChild(btn)
-  }
-  if (msg.cleared) {
-    addAction('设置目标', '打开可视化 Goal 模式面板', () => openGoalPanel())
-  } else {
-    if (msg.status === 'paused') {
-      addAction('继续', '恢复当前 Codex goal', () =>
-        _sendGoalCardControl('set', { status: 'active' }),
-      )
-    } else if (msg.status !== 'complete') {
-      addAction('暂停', '暂停当前 Codex goal', () =>
-        _sendGoalCardControl('set', { status: 'paused' }),
-      )
-    }
-    if (msg.status !== 'complete') {
-      addAction('完成', '标记当前 Codex goal 完成', () =>
-        _sendGoalCardControl('set', { status: 'complete' }),
-      )
-    }
-    addAction('刷新', '读取当前 Codex goal 状态', () => sendGoalControl('get'))
-    addAction('清除', '清除当前 Codex goal', () => _sendGoalCardControl('clear'))
-  }
-  if (actions.childNodes.length > 0) body.appendChild(actions)
-
-  el.appendChild(body)
 }
 
 function _buildPlanCard(el, msg) {

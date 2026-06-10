@@ -88,7 +88,7 @@ import {
   reloadAgents,
   renderAgentDropdown,
   renderAgentsManagementList,
-} from './agents.js?v=3'
+} from './agents.js?v=4'
 
 // ── Sessions ──
 import {
@@ -125,7 +125,7 @@ import {
   setMessageDeps,
   updateMessageEl,
   updateSessionSub,
-} from './messages.js?v=43'
+} from './messages.js?v=44'
 
 // ── WebSocket ──
 import {
@@ -153,7 +153,7 @@ import {
   updateMessage,
   updateMsgStatus,
   updateSendEnabled,
-} from './websocket.js?v=46'
+} from './websocket.js?v=47'
 
 // ── Slash commands ──
 import {
@@ -166,9 +166,14 @@ import {
   setSlashSelected,
   showSlashPopup,
   slashPopupVisible,
-} from './commands.js?v=6'
+} from './commands.js?v=7'
 import { getEffortForSubmit, initModePills, renderModePills } from './effortMode.js'
-import { initGoalModePanel, renderGoalModePanel } from './goalMode.js?v=2'
+import {
+  getGoalModeForSubmit,
+  initGoalModePanel,
+  markGoalModeSeeded,
+  renderGoalModePanel,
+} from './goalMode.js?v=3'
 import { getConversationModeForSubmit } from './planMode.js?v=4'
 import { initPlanPanel } from './planPanel.js?v=3'
 import { initResearchTools, renderResearchTools } from './researchTools.js'
@@ -178,6 +183,10 @@ import { initResearchTools, renderResearchTools } from './researchTools.js'
 // ═══════════════════════════════════════════════════════════
 
 setToastFn(toast)
+window.addEventListener('openclaude:goal-mode-state-changed', () => {
+  const sess = getSession()
+  if (sess) scheduleSaveFromUserEdit(sess, true)
+})
 
 setSessionDeps({
   renderMessages,
@@ -767,6 +776,7 @@ async function send() {
     }))
   const effortLevel = getEffortForSubmit()
   const conversationMode = getConversationModeForSubmit(text, state.attachments)
+  const goalMode = getGoalModeForSubmit()
   const wsPayload = {
     type: 'inbound.message',
     idempotencyKey: `web-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
@@ -778,8 +788,10 @@ async function send() {
     // undefined → 不参与 effort 协商(非 Opus 4.7 agent 走这条)。
     ...(effortLevel !== undefined ? { effortLevel } : {}),
     ...(conversationMode !== undefined ? { conversationMode } : {}),
+    ...(goalMode !== undefined ? { goalMode } : {}),
     ts: Date.now(),
   }
+  if (goalMode === true) markGoalModeSeeded()
   // Add user message with status tracking + persist media & full text for regen
   const userMsg = addMessage(sess, 'user', displayText, {
     status: 'sending',

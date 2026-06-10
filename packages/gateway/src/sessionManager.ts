@@ -796,6 +796,7 @@ export class SessionManager {
     /** Codex-native app-server only. Omitted means default mode so a previous
      *  plan-first turn cannot leak into ordinary follow-up turns. */
     conversationMode?: 'default' | 'plan',
+    goalObjective?: string,
   ): Promise<void> {
     // 闭包捕获:即便后面再有 submit 也不会改这个常量
     const desiredEffort: string | undefined = effortLevel === null ? undefined : effortLevel
@@ -820,6 +821,33 @@ export class SessionManager {
           // when SubprocessRunner auto-respawns on the next submit().
         } catch (err) {
           log.warn('effort-change shutdown failed', { sessionKey: session.sessionKey }, err)
+        }
+      }
+      const cleanGoalObjective =
+        typeof goalObjective === 'string' && goalObjective.trim().length > 0
+          ? goalObjective.trim()
+          : undefined
+      if (cleanGoalObjective) {
+        const maybeSetGoal = (session.runner as any).setGoal
+        if (typeof maybeSetGoal !== 'function') {
+          onEvent({ kind: 'error', error: '当前 Codex runner 不支持 goals' })
+          return
+        }
+        try {
+          await maybeSetGoal.call(session.runner, {
+            objective: cleanGoalObjective,
+            status: 'active',
+          })
+        } catch (err) {
+          log.warn('goal-mode setGoal failed', {
+            sessionKey: session.sessionKey,
+            err: (err as Error).message,
+          })
+          onEvent({
+            kind: 'error',
+            error: `Codex goal 启用失败: ${(err as Error).message}`,
+          })
+          return
         }
       }
       const maybeSetConversationMode = (session.runner as any).setConversationMode
