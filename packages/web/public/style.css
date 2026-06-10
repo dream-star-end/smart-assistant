@@ -9537,21 +9537,29 @@ textarea:focus-visible,
   background: linear-gradient(135deg, color-mix(in srgb, var(--accent) 92%, white 8%), color-mix(in srgb, var(--accent-active) 90%, black 10%));
   box-shadow: 0 1px 0 rgba(255, 255, 255, 0.14) inset, var(--shadow-sm);
 }
+/* New chat = the sidebar's primary action — give it real affordance */
 .new-chat-btn {
   min-height: 44px;
   border-radius: var(--radius-lg);
-  background:
-    linear-gradient(180deg, color-mix(in srgb, var(--bg-elevated) 92%, transparent), color-mix(in srgb, var(--bg-raised) 88%, transparent));
-  border-color: var(--oc-hairline-strong);
+  background: var(--accent);
+  border-color: transparent;
+  color: var(--accent-fg);
+  font-weight: 650;
   box-shadow: var(--shadow-sm);
 }
 .new-chat-btn:hover {
+  background: var(--accent-hover);
   transform: translateY(-1px);
-  box-shadow: var(--shadow-md), var(--oc-glow-soft);
-  border-color: var(--accent-border);
+  box-shadow: 0 6px 18px -10px color-mix(in srgb, var(--accent) 60%, transparent);
+  border-color: transparent;
 }
 .new-chat-btn:active {
   transform: translateY(0);
+}
+.new-chat-btn .kbd {
+  color: color-mix(in srgb, var(--accent-fg) 72%, transparent);
+  background: color-mix(in srgb, var(--accent-fg) 14%, transparent);
+  border-color: transparent;
 }
 .sidebar-search {
   padding: var(--space-3) var(--space-4) 0;
@@ -9697,8 +9705,18 @@ textarea:focus-visible,
   box-shadow: 0 1px 0 rgba(255,255,255,0.12) inset;
 }
 .msg.assistant .msg-body {
-  font-size: 14.5px;
-  line-height: 1.74;
+  font-size: 15px;
+  line-height: 1.75;
+}
+.msg.assistant .msg-body h1,
+.msg.assistant .msg-body h2,
+.msg.assistant .msg-body h3 {
+  letter-spacing: -0.02em;
+  color: var(--fg-strong);
+}
+.msg.user .msg-body {
+  font-size: 15px;
+  line-height: 1.65;
 }
 .msg.assistant .msg-body pre,
 .tool-output,
@@ -9787,10 +9805,21 @@ textarea:focus-visible,
   background: var(--oc-panel-bg);
   border-color: var(--oc-hairline-strong);
   box-shadow: var(--shadow-sm);
+  padding: var(--space-4) var(--space-5);
+  gap: var(--space-2);
+}
+.empty-starter-card .empty-starter-title {
+  font-size: var(--text-base);
+  color: var(--fg-strong);
 }
 .empty-starter-card:hover {
   border-color: var(--accent-border);
-  box-shadow: var(--shadow-md), var(--oc-glow-soft);
+  background: color-mix(in srgb, var(--accent-soft) 36%, var(--bg-elevated));
+  transform: translateY(-2px);
+  box-shadow: var(--shadow-md);
+}
+.empty-starter-card:hover .empty-starter-title {
+  color: var(--accent);
 }
 .empty-context-strip {
   padding: var(--space-2) var(--space-3);
@@ -9799,18 +9828,13 @@ textarea:focus-visible,
   border: 1px solid var(--oc-hairline);
 }
 
-/* ───── Composer ───── */
+/* ───── Composer — two-tier layout: input on top, mode controls docked
+ * at the bottom of the card (modern AI-chat pattern). Pure CSS `order`
+ * re-flow; DOM stays untouched so voice-mode toggling and the
+ * effort/model menus keep working. ───── */
 .composer {
-  padding: var(--space-4) clamp(var(--space-3), 3vw, var(--space-8)) calc(var(--space-5) + env(safe-area-inset-bottom, 0));
+  padding: var(--space-3) clamp(var(--space-3), 3vw, var(--space-8)) calc(var(--space-4) + env(safe-area-inset-bottom, 0));
   background: linear-gradient(180deg, transparent 0%, color-mix(in srgb, var(--bg) 80%, transparent) 30%, var(--bg) 76%);
-}
-.composer::before {
-  content: "";
-  display: block;
-  max-width: var(--oc-app-max);
-  height: 1px;
-  margin: 0 auto var(--space-3);
-  background: linear-gradient(90deg, transparent, var(--oc-hairline), transparent);
 }
 .repo-bar,
 .composer-inner {
@@ -9825,37 +9849,65 @@ textarea:focus-visible,
   box-shadow: var(--shadow-sm);
 }
 .composer-inner {
-  border-radius: 24px;
-  background:
-    linear-gradient(180deg, color-mix(in srgb, var(--bg-elevated) 96%, white 4%), var(--oc-panel-bg));
+  display: flex;
+  flex-direction: column;
+  border-radius: 22px;
+  background: var(--bg-elevated);
   border-color: var(--oc-hairline-strong);
   box-shadow: var(--oc-shadow-float);
-  backdrop-filter: var(--oc-surface-blur);
-  -webkit-backdrop-filter: var(--oc-surface-blur);
 }
 .composer-inner:focus-within {
   border-color: var(--accent-border);
-  box-shadow: var(--oc-shadow-float), 0 0 0 4px color-mix(in srgb, var(--accent) 18%, transparent);
+  box-shadow: var(--oc-shadow-float), 0 0 0 3px color-mix(in srgb, var(--accent) 16%, transparent);
 }
 .attachments {
+  order: 0;
   border-bottom-color: var(--oc-hairline);
+}
+.composer-inner .composer-input-row {
+  order: 1;
+}
+.composer-inner .composer-modes {
+  order: 2;
+  padding: 0 var(--space-3) var(--space-2);
 }
 .attach-item,
 .mode-pill {
   background: color-mix(in srgb, var(--bg-raised) 72%, transparent);
   border-color: var(--oc-hairline-strong);
 }
+/* Mode pills as quiet ghost controls — visible but not shouting */
+.composer-modes .mode-pill {
+  background: transparent;
+  border-color: transparent;
+  color: var(--fg-muted);
+  padding: 5px 9px;
+}
+.composer-modes .mode-pill:hover:not(:disabled) {
+  background: var(--bg-hover);
+  border-color: transparent;
+  color: var(--fg);
+}
+.composer-modes .mode-pill[aria-pressed='true'] {
+  background: var(--accent-soft);
+  color: var(--accent);
+  border-color: transparent;
+}
 .mode-pill:hover:not(:disabled) {
   border-color: var(--accent-border);
   background: color-mix(in srgb, var(--accent-soft) 42%, var(--bg-raised));
 }
 .composer-input-row {
-  padding: var(--space-2) 10px var(--space-2) var(--space-3);
+  padding: var(--space-2) 10px 4px var(--space-3);
   gap: var(--space-2);
 }
+/* When the mode row is hidden (personal builds), restore the bottom inset */
+.composer-modes[hidden] ~ .composer-input-row {
+  padding-bottom: var(--space-2);
+}
 .composer-input-row textarea {
-  min-height: 48px;
-  padding: 11px 8px 10px;
+  min-height: 44px;
+  padding: 10px 8px 8px;
 }
 .send-btn {
   width: 44px;
@@ -9870,8 +9922,14 @@ textarea:focus-visible,
 .send-btn:active:not(:disabled) {
   transform: translateY(0) scale(0.96);
 }
+/* Keyboard hints only matter while typing — fade in on focus, keep the
+ * resting frame quiet (space is reserved, no layout shift) */
 .composer-hint {
-  opacity: 0.78;
+  opacity: 0;
+  transition: opacity var(--transition-base);
+}
+.composer:focus-within .composer-hint {
+  opacity: 0.8;
 }
 .effort-menu,
 .model-menu,
