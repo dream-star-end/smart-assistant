@@ -4708,3 +4708,106 @@ body.voice-overlay-open {
   color: var(--fg-primary, #e0e0e0);
   font-weight: 500;
 }
+
+/* ══════════════════════════════════════════════════════════════════
+ *  Official Claude Code terminal
+ * ══════════════════════════════════════════════════════════════════ */
+.claude-terminal-modal {
+  max-width: min(1120px, calc(100vw - 32px));
+  height: min(780px, calc(100dvh - 64px));
+}
+.claude-terminal-head {
+  align-items: flex-start;
+  gap: var(--space-4);
+}
+.claude-terminal-head p {
+  margin: var(--space-1) 0 0;
+  color: var(--fg-muted);
+  font-size: var(--text-sm);
+  line-height: 1.45;
+}
+.claude-terminal-head code,
+.claude-terminal-hint code {
+  font-family: var(--font-mono);
+  font-size: 0.92em;
+  background: var(--inline-code-bg);
+  border-radius: var(--radius-sm);
+  padding: 1px 5px;
+}
+.claude-terminal-body {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  gap: var(--space-3);
+  overflow: hidden;
+}
+.claude-terminal-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  flex-wrap: wrap;
+}
+.claude-terminal-status {
+  display: inline-flex;
+  align-items: center;
+  min-height: 28px;
+  padding: 4px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-full);
+  background: var(--bg-raised);
+  color: var(--fg-muted);
+  font-size: var(--text-sm);
+  font-family: var(--font-mono);
+}
+.claude-terminal-status[data-state="running"] {
+  color: var(--success);
+  border-color: color-mix(in srgb, var(--success) 45%, var(--border));
+  background: color-mix(in srgb, var(--success) 10%, var(--bg-raised));
+}
+.claude-terminal-status[data-state="connecting"] {
+  color: var(--accent);
+  border-color: var(--accent-border);
+  background: color-mix(in srgb, var(--accent) 10%, var(--bg-raised));
+}
+.claude-terminal-status[data-state="error"],
+.claude-terminal-status[data-state="disabled"] {
+  color: var(--danger);
+  border-color: color-mix(in srgb, var(--danger) 50%, var(--border));
+  background: color-mix(in srgb, var(--danger) 10%, var(--bg-raised));
+}
+.claude-terminal-hint {
+  color: var(--fg-muted);
+  font-size: var(--text-sm);
+}
+.claude-terminal-container {
+  flex: 1;
+  min-height: 320px;
+  overflow: hidden;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-xl);
+  background: var(--bg);
+  padding: var(--space-3);
+  box-shadow: inset 0 0 0 1px var(--border-subtle);
+}
+.claude-terminal-container .xterm {
+  height: 100%;
+}
+.claude-terminal-container .xterm-viewport,
+.claude-terminal-container .xterm-screen {
+  border-radius: var(--radius-md);
+}
+.claude-terminal-foot .btn-danger {
+  color: var(--danger);
+}
+@media (max-width: 860px) {
+  .claude-terminal-modal {
+    max-width: 100%;
+    height: 100dvh;
+  }
+  .claude-terminal-container {
+    min-height: 280px;
+    padding: var(--space-2);
+    border-radius: var(--radius-lg);
+  }
+}

@@ -12,6 +12,7 @@
     "@openclaude/protocol": "*",
     "@openclaude/storage": "*",
     "mammoth": "^1.12.0",
+    "node-pty": "^1.1.0",
     "pdf-parse": "^2.4.5",
     "redis": "^4.7.1",
     "ws": "^8.18.0",

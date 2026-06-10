@@ -36,6 +36,13 @@ import {
 } from '@openclaude/storage'
 import { type WebSocket, WebSocketServer } from 'ws'
 import { type JwtPayload, checkToken, signJwt, verifyJwt, verifyPassword } from './auth.js'
+import {
+  CLAUDE_TERMINAL_MAX_CLIENT_MESSAGE_BYTES,
+  CLAUDE_TERMINAL_WS_PATH,
+  type ClaudeTerminalManager,
+  createClaudeTerminalManager,
+  isAllowedClaudeTerminalOrigin,
+} from './claudeTerminal.js'
 import { syncCodexAuthFile } from './codexAuthSync.js'
 import { CronScheduler } from './cron.js'
 import { parseDocument } from './documentParser.js'
@@ -104,6 +111,8 @@ export interface GatewayDeps {
 export class Gateway {
   private wss!: WebSocketServer
   private voiceTranscribe: VoiceTranscribeHandler | null = null
+  private claudeTerminalWss: WebSocketServer | null = null
+  private claudeTerminal: ClaudeTerminalManager | null = null
   private httpServer!: ReturnType<typeof createServer>
   private router: Router
   private sessions: SessionManager
@@ -475,6 +484,13 @@ export class Gateway {
 
     this.httpServer = createServer((req, res) => this.handleHttp(req, res))
     this.wss = new WebSocketServer({ noServer: true })
+    this.claudeTerminalWss = new WebSocketServer({
+      noServer: true,
+      maxPayload: CLAUDE_TERMINAL_MAX_CLIENT_MESSAGE_BYTES,
+    })
+    this.claudeTerminal = createClaudeTerminalManager({
+      logger: createLogger({ module: 'claudeTerminal' }),
+    })
     this.voiceTranscribe = createVoiceTranscribeHandler({
       accessToken: config.gateway.accessToken,
       deepgramApiKey: process.env.DEEPGRAM_API_KEY,
@@ -514,6 +530,9 @@ export class Gateway {
     }, 25_000)
 
     this.wss.on('connection', (ws, req) => this.handleWsConnection(ws, req))
+    this.claudeTerminalWss.on('connection', (ws, req) =>
+      this.handleClaudeTerminalConnection(ws, req),
+    )
 
     // 启动渠道
     for (const factory of this.deps.channelFactories ?? []) {
@@ -1014,6 +1033,28 @@ export class Gateway {
     // WS: terminate remaining clients so `wss.close()` callback fires promptly.
     // HTTP: `closeAllConnections()` destroys active sockets (e.g. SSE streams)
     //       that would otherwise block the Stage 1 `close()` callback.
+    const terminalCloseDone = new Promise<void>((resolveClose) => {
+      try {
+        this.claudeTerminal?.shutdown('shutdown')
+        if (!this.claudeTerminalWss) return resolveClose()
+        for (const ws of this.claudeTerminalWss.clients) {
+          try {
+            ws.terminate()
+          } catch {}
+        }
+        this.claudeTerminalWss.close((err) => {
+          if (err) this.log.warn('claude terminal wss.close error', undefined, err)
+          resolveClose()
+        })
+      } catch (err) {
+        this.log.warn('claude terminal shutdown error', undefined, err)
+        resolveClose()
+      } finally {
+        this.claudeTerminal = null
+        this.claudeTerminalWss = null
+      }
+    })
+
     const voiceCloseDone = this.voiceTranscribe
       ? this.voiceTranscribe
           .shutdown('shutdown')
@@ -1046,7 +1087,7 @@ export class Gateway {
         resolveClose()
       }
     })
-    await Promise.allSettled([httpCloseDone, wssCloseDone, voiceCloseDone])
+    await Promise.allSettled([httpCloseDone, wssCloseDone, voiceCloseDone, terminalCloseDone])
     this.log.info('shutdown complete')
     if (exit) process.exit(0)
   }
@@ -3337,12 +3378,46 @@ export class Gateway {
       })
       return
     }
+    if (pathname === CLAUDE_TERMINAL_WS_PATH && this.claudeTerminalWss) {
+      this.claudeTerminalWss.handleUpgrade(req, socket, head, (ws) => {
+        this.claudeTerminalWss?.emit('connection', ws, req)
+      })
+      return
+    }
     try {
       socket.destroy()
     } catch {}
   }
 
   private wsClients = new Set<WebSocket>()
+
+  private handleClaudeTerminalConnection(ws: WebSocket, req: IncomingMessage): void {
+    if (this._shuttingDown) {
+      try {
+        ws.close(1001, 'shutting down')
+      } catch {}
+      return
+    }
+    if (
+      !isAllowedClaudeTerminalOrigin(
+        req.headers.origin,
+        req.headers.host,
+        this.isHttps(req) ? 'https:' : 'http:',
+      )
+    ) {
+      this.log.warn('blocked claude terminal websocket origin', {
+        origin: req.headers.origin,
+        host: req.headers.host,
+      })
+      ws.close(1008, 'bad origin')
+      return
+    }
+    if (!this.checkHttpAuth(req)) {
+      ws.close(1008, 'unauthorized')
+      return
+    }
+    this.claudeTerminal?.handleConnection(ws, this.getUserId(req))
+  }
 
   // ───────── WS ─────────
   private handleWsConnection(ws: WebSocket, req: IncomingMessage): void {
