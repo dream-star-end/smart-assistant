@@ -1,19 +1,19 @@
 import assert from 'node:assert/strict'
 import test, { mock } from 'node:test'
+import { CodexAppServerRunner } from '../codexAppServerRunner.js'
 import {
-  createIdleTimeoutEventGate,
-  getLivenessIdleMs,
-  shouldHardResetRunnerAfterIdleTimeout,
   LIVENESS_IDLE_TIMEOUT_COMPACTING_MS,
   LIVENESS_IDLE_TIMEOUT_DEFAULT_MS,
   LIVENESS_IDLE_TIMEOUT_TOOL_MS,
   SessionManager,
   buildHistoricalContextPrompt,
+  createIdleTimeoutEventGate,
+  getLivenessIdleMs,
   getLivenessIdleTimeoutMs,
   isLowInformationContinuationText,
   shouldClarifyNonNativeResume,
+  shouldHardResetRunnerAfterIdleTimeout,
 } from '../sessionManager.js'
-import { CodexAppServerRunner } from '../codexAppServerRunner.js'
 
 test('buildHistoricalContextPrompt includes prior user/assistant turns and wraps current message', () => {
   const prompt = buildHistoricalContextPrompt(
@@ -194,6 +194,11 @@ class HangingCodexAppServerRunner extends CodexAppServerRunner {
   shutdownFinished = false
   secondStartedAfterShutdown: boolean | null = null
   submissions: string[] = []
+  goalInputs: Array<{
+    objective?: string | null
+    status?: string | null
+    tokenBudget?: number | null
+  }> = []
   rawActivityTicks = 0
   private rawActivityTimer: ReturnType<typeof setInterval> | null = null
 
@@ -208,6 +213,15 @@ class HangingCodexAppServerRunner extends CodexAppServerRunner {
   override interrupt(): boolean {
     this.interrupted = true
     return true
+  }
+
+  override async setGoal(input: {
+    objective?: string | null
+    status?: string | null
+    tokenBudget?: number | null
+  }): Promise<any> {
+    this.goalInputs.push(input)
+    return { blockId: 'codex-goal', ...input }
   }
 
   override async submit(textOrBlocks: string | Array<{ type: string; text?: string }>) {
@@ -330,6 +344,29 @@ test('SessionManager clarifies ambiguous non-native resume without submitting to
   assert.deepEqual(runner.submissions, [])
   assert.equal(session.turns, turnsBefore)
   assert.equal(session._historicalContextInjected, false)
+})
+
+test('SessionManager seeds Codex goal under the submit lock before the normal turn', async () => {
+  const manager = new SessionManager({} as any)
+  const runner = new HangingCodexAppServerRunner()
+  const session = makeTestSession(runner)
+  const events: any[] = []
+
+  await manager.submit(
+    session,
+    'Ship the UI normally',
+    (e) => events.push(e),
+    undefined,
+    'default',
+    'Ship the Goal UI',
+  )
+
+  assert.deepEqual(runner.goalInputs, [{ objective: 'Ship the Goal UI', status: 'active' }])
+  assert.deepEqual(runner.submissions, ['Ship the UI normally'])
+  assert.deepEqual(
+    events.map((e) => e.kind),
+    ['final'],
+  )
 })
 
 test('SessionManager warmupSession runs through the per-session lock', async () => {

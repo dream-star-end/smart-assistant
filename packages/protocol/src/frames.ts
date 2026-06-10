@@ -58,6 +58,9 @@ export const InboundMessage = Type.Object({
   // Codex-native app-server conversation mode. plan asks Codex to first
   // produce a reviewable plan; default runs the implementation turn.
   conversationMode: Type.Optional(Type.Union([Type.Literal('default'), Type.Literal('plan')])),
+  // Simple Codex Goal toggle. true means this normal message should seed the
+  // thread goal before the turn starts; omitted keeps ordinary chat behavior.
+  goalMode: Type.Optional(Type.Boolean()),
   ts: Type.Number(),
 })
 export type InboundMessage = Static<typeof InboundMessage>
