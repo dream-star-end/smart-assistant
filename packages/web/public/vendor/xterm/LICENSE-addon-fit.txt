@@ -1,0 +1,4 @@
+@xterm/addon-fit is licensed under the MIT License.
+Copyright (c) 2014-2024 The xterm.js authors.
+
+Bundled from npm package @xterm/addon-fit for OpenClaude app-shell use.

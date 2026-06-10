@@ -174,6 +174,7 @@ import {
   markGoalModeSeeded,
   renderGoalModePanel,
 } from './goalMode.js?v=3'
+import { initOfficialClaudeTerminal, openOfficialClaudeTerminal } from './officialTerminal.js'
 import { getConversationModeForSubmit } from './planMode.js?v=4'
 import { initPlanPanel } from './planPanel.js?v=3'
 import { initResearchTools, renderResearchTools } from './researchTools.js'
@@ -638,6 +639,7 @@ initTasksListeners()
 // ── OAuth: button click listeners ──
 initOAuthListeners()
 initWechatListeners()
+initOfficialClaudeTerminal()
 
 // ── Effort pills (编码模式 / 科研模式): bind once + render initial visibility ──
 // 完整可见性由 agent.model 决定,真正的渲染会在 reloadAgents → renderAgentDropdown 内
@@ -1702,7 +1704,9 @@ async function init() {
     else if (action === 'changelog') openChangelog()
     else if (action === 'feedback') openFeedbackModal()
     else if (action === 'claude-oauth') openOAuthModal()
-    else if (action === 'wechat') openWechatModal()
+    else if (action === 'claude-terminal') {
+      openOfficialClaudeTerminal().catch(() => toast('加载 Claude Code 终端失败', 'error'))
+    } else if (action === 'wechat') openWechatModal()
     else if (action === 'logout') $('logout-btn').click()
   })
   // Proxy modal — Save handler (dirty-tracking against the initial value so a

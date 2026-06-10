@@ -2,5 +2,9 @@
   "name": "@openclaude/web",
   "version": "0.1.0",
   "type": "module",
-  "main": "./public/index.html"
+  "main": "./public/index.html",
+  "dependencies": {
+    "@xterm/addon-fit": "^0.11.0",
+    "@xterm/xterm": "^6.0.0"
+  }
 }

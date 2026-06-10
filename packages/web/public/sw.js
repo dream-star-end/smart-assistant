@@ -1,16 +1,16 @@
 // OpenClaude Service Worker
 // App-shell caching only. Never intercept /ws, /api/*, or external CDN requests.
-const VERSION = 'openclaude-v62'
+const VERSION = 'openclaude-v63'
 const SHELL = [
   '/',
   '/index.html',
   '/style.css',
-  '/style.css?v=38', // versioned URL used in index.html
+  '/style.css?v=39', // versioned URL used in index.html
   '/manifest.json',
   '/icon.svg',
   // ES modules
   '/modules/main.js',
-  '/modules/main.js?v=49', // versioned URL used in index.html
+  '/modules/main.js?v=50', // versioned URL used in index.html
   '/modules/dom.js',
   '/modules/util.js',
   '/modules/state.js',
@@ -48,6 +48,7 @@ const SHELL = [
   '/modules/goalMode.js?v=3',
   '/modules/wechat.js',
   '/modules/researchTools.js',
+  '/modules/officialTerminal.js',
   '/modules/export-docx.js',
   '/modules/export-tex.js',
   // Vendored dependencies
@@ -58,6 +59,9 @@ const SHELL = [
   '/vendor/chart.umd.min.js',
   '/vendor/github-dark.min.css',
   '/vendor/github.min.css',
+  '/vendor/xterm/xterm.css?v=1',
+  '/vendor/xterm/xterm.js',
+  '/vendor/xterm/addon-fit.js',
   '/vendor/katex/katex.min.js',
   '/vendor/katex/katex.min.css',
 ]

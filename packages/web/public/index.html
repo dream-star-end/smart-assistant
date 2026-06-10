@@ -16,7 +16,8 @@
 <link rel="apple-touch-icon" href="/icon.svg" />
 <link rel="stylesheet" href="/vendor/github-dark.min.css" />
 <link rel="stylesheet" href="/vendor/katex/katex.min.css" />
-<link rel="stylesheet" href="/style.css?v=38" />
+<link rel="stylesheet" href="/style.css?v=39" />
+<link rel="stylesheet" href="/vendor/xterm/xterm.css?v=1" />
 <style>/* Inline styles removed — see style.css */
 </style>
 </head>
@@ -144,6 +145,7 @@
             <button class="settings-item" data-settings="config"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg>查看配置</button>
             <button class="settings-item" data-settings="proxy"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M2 12h20"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>出站代理</button>
             <button class="settings-item" data-settings="claude-oauth"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4"/><polyline points="10 17 15 12 10 7"/><line x1="15" y1="12" x2="3" y2="12"/></svg>OAuth 认证</button>
+            <button class="settings-item" data-settings="claude-terminal"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>Claude Code 终端</button>
             <button class="settings-item" data-settings="wechat"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 10h.01"/><path d="M12 10h.01"/><path d="M16 10h.01"/><path d="M21 12a9 9 0 1 0-3.39 7.06l3.06.94-.94-3.06A8.96 8.96 0 0 0 21 12z"/></svg>微信绑定</button>
             <button class="settings-item danger" data-settings="logout"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>退出登录</button>
           </div>
@@ -727,6 +729,31 @@
   </div>
 </div>
 
+<!-- Official Claude Code terminal -->
+<div id="claude-terminal-modal" class="modal-backdrop" role="dialog" aria-modal="true" aria-label="Claude Code 终端">
+  <div class="modal claude-terminal-modal">
+    <div class="modal-head claude-terminal-head">
+      <div>
+        <h3>Claude Code 终端</h3>
+        <p>官方最新版 <code>claude</code> CLI，运行在服务器 PTY 中。</p>
+      </div>
+      <button class="modal-close" data-claude-terminal-close aria-label="关闭">&times;</button>
+    </div>
+    <div class="modal-body claude-terminal-body">
+      <div class="claude-terminal-toolbar">
+        <span id="claude-terminal-status" class="claude-terminal-status" data-state="idle">未连接</span>
+        <span class="claude-terminal-hint">默认工作目录为服务器用户 Home，可通过 <code>OPENCLAUDE_OFFICIAL_CLAUDE_CWD</code> 覆盖。</span>
+      </div>
+      <div id="claude-terminal-container" class="claude-terminal-container" aria-label="Claude Code terminal"></div>
+    </div>
+    <div class="modal-foot claude-terminal-foot">
+      <button id="claude-terminal-reconnect-btn" class="btn btn-ghost">重连</button>
+      <button id="claude-terminal-kill-btn" class="btn btn-danger">终止</button>
+      <button class="btn btn-primary" data-claude-terminal-close>关闭</button>
+    </div>
+  </div>
+</div>
+
 <!-- Lightbox for image/video zoom -->
 <div id="lightbox" class="lightbox-backdrop" hidden>
   <button class="lightbox-close" aria-label="关闭">&times;</button>
@@ -752,7 +779,7 @@
 <!-- Force SW cache refresh (one-time, remove after all clients updated) -->
 <script>
 (function(){
-  var V='sw-flush-v11';
+  var V='sw-flush-v12';
   if(localStorage.getItem(V))return;
   if('serviceWorker' in navigator){
     navigator.serviceWorker.getRegistrations().then(function(regs){
@@ -774,6 +801,6 @@
 <script src="/vendor/katex/katex.min.js" defer></script>
 <script src="/vendor/qrcode.min.js"></script>
 <div id="toast" class="toast"></div>
-<script type="module" src="/modules/main.js?v=49"></script>
+<script type="module" src="/modules/main.js?v=50"></script>
 </body>
 </html>
