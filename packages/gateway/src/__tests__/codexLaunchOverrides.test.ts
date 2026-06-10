@@ -29,7 +29,11 @@ import { afterEach, beforeEach, describe, it } from 'node:test'
  *      instruction; without this the codex agent would silently fork its
  *      memory state into codex's private store.
  */
-import { _internals, resolveMcpMemoryEntry } from '../codexLaunchOverrides.js'
+import {
+  _internals,
+  resolveMcpMemoryEntry,
+  resolveOpenClaudeWebContextBin,
+} from '../codexLaunchOverrides.js'
 
 const { tomlValue, CODEX_PREAMBLE, codexMcpToolTimeoutSec } = _internals
 
@@ -171,6 +175,62 @@ describe('resolveMcpMemoryEntry', () => {
     const out = resolveMcpMemoryEntry(undefined)
     if (out !== null) {
       assert.ok(existsSync(out))
+    }
+  })
+})
+
+describe('resolveOpenClaudeWebContextBin', () => {
+  it('returns null when the helper binary is absent in source/dev environments', async () => {
+    await withEnv({ OPENCLAUDE_WEB_CONTEXT_BIN: '/tmp/definitely-missing-oc-web-context' }, () => {
+      assert.equal(resolveOpenClaudeWebContextBin(), null)
+    })
+  })
+
+  it('honors OPENCLAUDE_WEB_CONTEXT_BIN when it points at an existing helper', async () => {
+    const helper = join(
+      tmpdir(),
+      `oc-web-context-test-bin-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+    )
+    const { writeFileSync, rmSync } = await import('node:fs')
+    writeFileSync(helper, '#!/bin/sh\n')
+    try {
+      await withEnv({ OPENCLAUDE_WEB_CONTEXT_BIN: helper }, () => {
+        assert.equal(resolveOpenClaudeWebContextBin(), helper)
+      })
+    } finally {
+      rmSync(helper, { force: true })
+    }
+  })
+
+  it('passes a custom helper path into Codex web-context MCP env', async () => {
+    const helper = join(
+      tmpdir(),
+      `oc-web-context-test-bin-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+    )
+    const { writeFileSync, rmSync } = await import('node:fs')
+    writeFileSync(helper, '#!/bin/sh\n')
+    const sessionDir = mkdtempSync(join(tmpdir(), 'oc-codex-webctx-test-'))
+    try {
+      await withEnv({ OPENCLAUDE_WEB_CONTEXT_BIN: helper }, async () => {
+        const { buildCodexLaunchOverrides } = await import('../codexLaunchOverrides.js')
+        const out = await buildCodexLaunchOverrides({
+          agentId: 'test-agent',
+          provider: 'codex-native',
+          model: 'gpt-5.5',
+          sessionDir,
+          gatewayPort: 18789,
+          gatewayToken: 'tok',
+        })
+        const envKey = out.argvOverrides.find((s) =>
+          s.startsWith('mcp_servers.web-context.env='),
+        )
+        assert.ok(envKey, `expected web-context env override; got ${out.argvOverrides.join(' ')}`)
+        assert.ok(envKey!.includes('OPENCLAUDE_WEB_CONTEXT_BIN'), envKey)
+        assert.ok(envKey!.includes(helper), envKey)
+      })
+    } finally {
+      rmSync(helper, { force: true })
+      rmSync(sessionDir, { recursive: true, force: true })
     }
   })
 })

@@ -99,6 +99,7 @@ cleanEnv.SCANSCI_PDF_DATA_DIR = SCANSCI_PDF_DATA_DIR;
 const CORE_TOOLSET_ID = "core";
 const BROWSER_TOOLSET_ID = "browser";
 const RESEARCH_TOOLSET_ID = "research";
+const WEB_CONTEXT_TOOLSET_ID = "web_context";
 
 const COMMERCIAL_DEFAULT_MODEL = "MiniMax-M3";
 const COMMERCIAL_DEFAULT_PROVIDER = "minimax";
@@ -172,6 +173,24 @@ function cloneScanSciPdfMcpServer() {
   };
 }
 
+const WEB_CONTEXT_MCP_ID = "web-context";
+const WEB_CONTEXT_MCP_TOOLS = [
+  "web_context_extract_url",
+  "web_context_parse_file",
+  "web_context_health_check",
+] as const;
+
+function cloneWebContextMcpServer() {
+  return {
+    id: WEB_CONTEXT_MCP_ID,
+    label: "Web Context",
+    command: "npx",
+    args: ["tsx", "/opt/openclaude/packages/gateway/src/mcpWebContextServer.ts"],
+    tools: [...WEB_CONTEXT_MCP_TOOLS],
+    enabled: true,
+  };
+}
+
 function isRecord(v: unknown): v is Record<string, unknown> {
   return v !== null && typeof v === "object" && !Array.isArray(v);
 }
@@ -222,6 +241,16 @@ function isDesiredScanSciPdfMcpServer(v: unknown): boolean {
   if (!sameStringArray(v.args, ["run"])) return false;
   if (!sameStringArray(v.tools, SCANSCI_PDF_MCP_TOOLS)) return false;
   return isRecord(v.env) && v.env.SCANSCI_PDF_DATA_DIR === SCANSCI_PDF_DATA_DIR;
+}
+
+function isDesiredWebContextMcpServer(v: unknown): boolean {
+  if (!isRecord(v)) return false;
+  if (v.id !== WEB_CONTEXT_MCP_ID) return false;
+  if (v.label !== "Web Context") return false;
+  if (v.command !== "npx") return false;
+  if (v.enabled !== true) return false;
+  if (!sameStringArray(v.args, ["tsx", "/opt/openclaude/packages/gateway/src/mcpWebContextServer.ts"])) return false;
+  return sameStringArray(v.tools, WEB_CONTEXT_MCP_TOOLS);
 }
 
 function upsertPlatformMcpServer(
@@ -287,6 +316,13 @@ function upsertPlatformMcpIntegrations(config: Record<string, unknown>): boolean
       cloneScanSciPdfMcpServer(),
       isDesiredScanSciPdfMcpServer,
     ) || mutated;
+  mutated =
+    upsertPlatformMcpServer(
+      existingServers,
+      WEB_CONTEXT_MCP_ID,
+      cloneWebContextMcpServer(),
+      isDesiredWebContextMcpServer,
+    ) || mutated;
   if (!Array.isArray(config.mcpServers) || mutated) {
     config.mcpServers = existingServers;
   }
@@ -299,7 +335,8 @@ function upsertPlatformMcpIntegrations(config: Record<string, unknown>): boolean
   let toolsetsMutated = !isRecord(config.toolsets);
   toolsetsMutated = setToolset(toolsets, CORE_TOOLSET_ID, []) || toolsetsMutated;
   toolsetsMutated = setToolset(toolsets, BROWSER_TOOLSET_ID, [BROWSER_MCP_ID]) || toolsetsMutated;
-  toolsetsMutated = setToolset(toolsets, RESEARCH_TOOLSET_ID, [SCANSCI_PDF_MCP_ID]) || toolsetsMutated;
+  toolsetsMutated = setToolset(toolsets, RESEARCH_TOOLSET_ID, [SCANSCI_PDF_MCP_ID, WEB_CONTEXT_MCP_ID]) || toolsetsMutated;
+  toolsetsMutated = setToolset(toolsets, WEB_CONTEXT_TOOLSET_ID, [WEB_CONTEXT_MCP_ID]) || toolsetsMutated;
   if (toolsetsMutated) {
     config.toolsets = toolsets;
     mutated = true;
@@ -509,9 +546,10 @@ try {
       toolsets: {
         [CORE_TOOLSET_ID]: [],
         [BROWSER_TOOLSET_ID]: [BROWSER_MCP_ID],
-        [RESEARCH_TOOLSET_ID]: [SCANSCI_PDF_MCP_ID],
+        [RESEARCH_TOOLSET_ID]: [SCANSCI_PDF_MCP_ID, WEB_CONTEXT_MCP_ID],
+        [WEB_CONTEXT_TOOLSET_ID]: [WEB_CONTEXT_MCP_ID],
       },
-      mcpServers: [cloneBrowserMcpServer(), cloneScanSciPdfMcpServer()],
+      mcpServers: [cloneBrowserMcpServer(), cloneScanSciPdfMcpServer(), cloneWebContextMcpServer()],
       // 必填占位:个人版 gateway.ts 在启动时直接读 config.channels.wechat / .telegram
       // 不存在会 TypeError。容器场景下我们不开任何外部 channel —— webchat 由商用版
       // userChatBridge 走 docker bridge 直连容器 18789(WS upgrade),无需 channel adapter。

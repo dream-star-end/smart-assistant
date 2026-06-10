@@ -90,15 +90,22 @@ describe('collectAvailableMcpToolNames', () => {
       ...baseConfig,
       provider: 'anthropic',
       defaults: { ...baseConfig.defaults, model: 'claude-opus-4-7', toolsets: ['core'] },
-      toolsets: { core: [], browser: ['browser'], research: ['scansci-pdf'] },
+      toolsets: {
+        core: [],
+        browser: ['browser'],
+        research: ['scansci-pdf', 'web-context'],
+        web_context: ['web-context'],
+      },
       mcpServers: [
         { id: 'browser', tools: ['browser_navigate', 'browser_click'] },
         { id: 'scansci-pdf', tools: ['scansci_pdf_download'] },
+        { id: 'web-context', tools: ['web_context_extract_url'] },
       ],
     }
     const tools = collectAvailableMcpToolNames(config, { id: 'main' } as any)
     assert.equal(tools.includes('browser_navigate'), false)
     assert.equal(tools.includes('scansci_pdf_download'), false)
+    assert.equal(tools.includes('web_context_extract_url'), false)
   })
 
   it('browser toolset exposes browser tools without research tools', () => {
@@ -106,14 +113,50 @@ describe('collectAvailableMcpToolNames', () => {
       ...baseConfig,
       provider: 'anthropic',
       defaults: { ...baseConfig.defaults, model: 'claude-opus-4-7', toolsets: ['core'] },
-      toolsets: { core: [], browser: ['browser'], research: ['scansci-pdf'] },
+      toolsets: {
+        core: [],
+        browser: ['browser'],
+        research: ['scansci-pdf', 'web-context'],
+        web_context: ['web-context'],
+      },
       mcpServers: [
         { id: 'browser', tools: ['browser_navigate', 'browser_click'] },
         { id: 'scansci-pdf', tools: ['scansci_pdf_download'] },
+        { id: 'web-context', tools: ['web_context_extract_url'] },
       ],
     }
-    const tools = collectAvailableMcpToolNames(config, { id: 'main', toolsets: ['core', 'browser'] } as any)
+    const tools = collectAvailableMcpToolNames(config, {
+      id: 'main',
+      toolsets: ['core', 'browser'],
+    } as any)
     assert.ok(tools.includes('browser_navigate'))
+    assert.equal(tools.includes('scansci_pdf_download'), false)
+    assert.equal(tools.includes('web_context_extract_url'), false)
+  })
+
+  it('web_context toolset exposes web-context without browser or ScanSci', () => {
+    const config = {
+      ...baseConfig,
+      provider: 'anthropic',
+      defaults: { ...baseConfig.defaults, model: 'claude-opus-4-7', toolsets: ['core'] },
+      toolsets: {
+        core: [],
+        browser: ['browser'],
+        research: ['scansci-pdf', 'web-context'],
+        web_context: ['web-context'],
+      },
+      mcpServers: [
+        { id: 'browser', tools: ['browser_navigate', 'browser_click'] },
+        { id: 'scansci-pdf', tools: ['scansci_pdf_download'] },
+        { id: 'web-context', tools: ['web_context_extract_url'] },
+      ],
+    }
+    const tools = collectAvailableMcpToolNames(config, {
+      id: 'main',
+      toolsets: ['core', 'web_context'],
+    } as any)
+    assert.ok(tools.includes('web_context_extract_url'))
+    assert.equal(tools.includes('browser_navigate'), false)
     assert.equal(tools.includes('scansci_pdf_download'), false)
   })
 })
