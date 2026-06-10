@@ -496,7 +496,7 @@
       </div>
     </div>
     <div class="chatgpt-web-warning">
-      这是直接反代 ChatGPT 网页的预览版：请求会走 OpenClaude 的全局出站代理，并运行在隔离沙箱中以避免第三方页面读取 OpenClaude。ChatGPT 的登录风控、反自动化、WebSocket/Service Worker 或沙箱限制仍可能导致空白或无法登录。
+      这是直接反代 ChatGPT 网页的功能优先预览版：请求会走 OpenClaude 的全局出站代理，并放开 iframe 的 same-origin、弹窗和跳转能力以提高兼容性。ChatGPT 的登录风控、反自动化或 WebSocket/Service Worker 限制仍可能导致空白或无法登录。
     </div>
     <iframe
       id="chatgpt-web-iframe"
@@ -504,7 +504,7 @@
       src="about:blank"
       title="ChatGPT Web via OpenClaude proxy"
       referrerpolicy="no-referrer"
-      sandbox="allow-forms allow-modals allow-popups allow-scripts"
+      sandbox="allow-downloads allow-forms allow-modals allow-popups allow-popups-to-escape-sandbox allow-same-origin allow-scripts allow-top-navigation-by-user-activation"
     ></iframe>
   </div>
 </div>

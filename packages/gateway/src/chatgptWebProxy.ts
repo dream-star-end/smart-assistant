@@ -351,8 +351,25 @@ function proxifyProtocolRelativeUrls(text: string, base: ChatGptProxyTarget): st
 
 function proxifyRootRelativeStrings(text: string, target: ChatGptProxyTarget): string {
   return text
-    .replace(/\b(url\(\s*["']?)\/(?!\/|api\/chatgpt-web\b)/gi, `$1${target.routeBase}/`)
-    .replace(/(["'`])\/(?!\/|api\/chatgpt-web\b)/g, `$1${target.routeBase}/`)
+    .replace(
+      /\b(url\(\s*["']?)\/(?!\/|api\/chatgpt-web\b|[$&?!~]["']?\s*\))/gi,
+      `$1${target.routeBase}/`,
+    )
+    .replace(/(["'`])\/(?!\/|api\/chatgpt-web\b|[$&?!~]\1)/g, `$1${target.routeBase}/`)
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
+function restoreReactStreamingMarkers(text: string, target: ChatGptProxyTarget): string {
+  const routeBase = escapeRegExp(target.routeBase)
+  return text
+    .replace(new RegExp(`(["'\`])${routeBase}/([$&?!~])\\1`, 'g'), '$1/$2$1')
+    .replace(
+      /(["'`])\/api\/chatgpt-web\/(?:_session\/[A-Za-z0-9._~-]{16,2048}\/)?https\/chatgpt\.com\/([$&?!~])\1/g,
+      '$1/$2$1',
+    )
 }
 
 function chatGptProxyBootstrap(target: ChatGptProxyTarget): string {
@@ -455,6 +472,7 @@ export function rewriteChatGptProxyText(text: string, target: ChatGptProxyTarget
   let rewritten = proxifyAbsoluteUrls(text, target)
   rewritten = proxifyProtocolRelativeUrls(rewritten, target)
   rewritten = proxifyRootRelativeStrings(rewritten, target)
+  rewritten = restoreReactStreamingMarkers(rewritten, target)
   if (/<\s*html[\s>]/i.test(rewritten) || /<\s*head[\s>]/i.test(rewritten)) {
     rewritten = rewritten.replace(/\s+integrity=(["']).*?\1/gi, '')
     const bootstrap = chatGptProxyBootstrap(target)

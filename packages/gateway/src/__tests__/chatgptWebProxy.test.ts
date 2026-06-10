@@ -156,6 +156,29 @@ describe('ChatGPT web proxy text rewriting', () => {
     assert.match(rewritten, /data-openclaude-chatgpt-proxy/)
     assert.match(rewritten, /mappedToProxy = isProxyUrl\(mapped\);/)
   })
+
+  it('preserves React streaming marker strings while rewriting real root-relative paths', () => {
+    const base = target('/api/chatgpt-web/https/chatgpt.com/')
+    const rewritten = rewriteChatGptProxyText(
+      '<script>if("/$"===d||"/&"===d){}; fetch("/backend-api/conversation")</script>',
+      base,
+    )
+
+    assert.match(rewritten, /"\/\$"===d/)
+    assert.match(rewritten, /"\/&"===d/)
+    assert.doesNotMatch(rewritten, /https\/chatgpt\.com\/[$&]/)
+    assert.match(
+      rewritten,
+      /fetch\("\/api\/chatgpt-web\/https\/chatgpt\.com\/backend-api\/conversation"\)/,
+    )
+
+    const restored = rewriteChatGptProxyText(
+      '<script>if("/api/chatgpt-web/https/chatgpt.com/$"===d||"/api/chatgpt-web/https/chatgpt.com/&"===d){};</script>',
+      base,
+    )
+    assert.match(restored, /"\/\$"===d/)
+    assert.match(restored, /"\/&"===d/)
+  })
 })
 
 describe('ChatGPT web proxy opaque iframe CORS', () => {
