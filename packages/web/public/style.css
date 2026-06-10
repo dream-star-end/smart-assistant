@@ -276,27 +276,23 @@ a:hover {
   z-index: 0;
 }
 .login-stage-centered .aurora-1 {
-  width: 420px; height: 420px;
-  top: -80px; left: -80px;
-  background: rgba(217, 119, 87, 0.35);
+  width: 520px; height: 520px;
+  top: -120px; left: -120px;
+  background: rgba(217, 119, 87, 0.12);
   animation: aurora-float 20s ease-in-out infinite;
 }
 .login-stage-centered .aurora-2 {
-  width: 360px; height: 360px;
-  bottom: -60px; right: -100px;
-  background: rgba(181, 148, 239, 0.25);
+  width: 440px; height: 440px;
+  bottom: -100px; right: -140px;
+  background: rgba(181, 148, 239, 0.08);
   animation: aurora-float 22s ease-in-out infinite reverse;
 }
 .login-stage-centered .aurora-3 {
-  width: 260px; height: 260px;
-  top: 40%; left: 50%;
-  background: rgba(122, 175, 230, 0.18);
-  animation: aurora-float 18s ease-in-out infinite;
+  display: none;
 }
 /* Light theme: softer, warmer auroras */
-:root[data-theme="light"] .login-stage-centered .aurora-1 { background: rgba(217, 119, 87, 0.22); }
-:root[data-theme="light"] .login-stage-centered .aurora-2 { background: rgba(181, 148, 239, 0.18); }
-:root[data-theme="light"] .login-stage-centered .aurora-3 { background: rgba(122, 175, 230, 0.14); }
+:root[data-theme="light"] .login-stage-centered .aurora-1 { background: rgba(217, 119, 87, 0.10); }
+:root[data-theme="light"] .login-stage-centered .aurora-2 { background: rgba(181, 148, 239, 0.07); }
 
 /* Centered card */
 .login-stage-centered .login-card {
@@ -4221,29 +4217,23 @@ body.voice-overlay-open {
   display: none;
   position: fixed;
   inset: 0;
-  background:
-    radial-gradient(circle at 50% 18%, color-mix(in srgb, var(--accent) 16%, transparent) 0, transparent 34%),
-    rgba(0, 0, 0, 0.54);
+  background: rgba(0, 0, 0, 0.5);
   z-index: 200;
-  backdrop-filter: blur(16px) saturate(120%);
-  -webkit-backdrop-filter: blur(16px) saturate(120%);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
   align-items: flex-start;
   justify-content: center;
   padding: clamp(28px, 7vh, 72px) var(--space-5) var(--space-5);
 }
 [data-theme="light"] .modal-backdrop {
-  background:
-    radial-gradient(circle at 50% 18%, color-mix(in srgb, var(--accent) 12%, transparent) 0, transparent 34%),
-    rgba(60, 50, 30, 0.34);
+  background: rgba(60, 50, 30, 0.3);
 }
 .modal-backdrop.open {
   display: flex;
   animation: fade-in var(--transition-base);
 }
 .modal {
-  background:
-    linear-gradient(180deg, color-mix(in srgb, var(--bg-elevated) 94%, var(--accent) 6%) 0%, var(--bg-elevated) 120px),
-    var(--bg-elevated);
+  background: var(--bg-elevated);
   border: 1px solid color-mix(in srgb, var(--border) 82%, var(--fg) 18%);
   border-radius: var(--radius-2xl);
   max-width: 620px;
@@ -9092,8 +9082,7 @@ body.body-landing {
 }
 .context-hub-head {
   background:
-    radial-gradient(circle at 12% 20%, color-mix(in srgb, var(--accent) 24%, transparent), transparent 34%),
-    linear-gradient(135deg, color-mix(in srgb, var(--accent) 13%, transparent), transparent 58%),
+    linear-gradient(135deg, color-mix(in srgb, var(--accent) 8%, transparent), transparent 58%),
     color-mix(in srgb, var(--bg-elevated) 86%, transparent);
 }
 .context-hub-shell {
@@ -9130,10 +9119,8 @@ body.body-landing {
   border-color: color-mix(in srgb, var(--accent) 22%, var(--border));
 }
 .context-nav-card.active {
-  background:
-    linear-gradient(135deg, color-mix(in srgb, var(--accent) 16%, transparent), color-mix(in srgb, var(--bg-raised) 80%, transparent));
+  background: var(--accent-soft);
   border-color: var(--accent-border);
-  box-shadow: 0 18px 40px -30px var(--accent);
 }
 .context-nav-icon {
   width: 34px;
@@ -9152,9 +9139,7 @@ body.body-landing {
   min-width: 0;
   overflow: auto;
   padding: var(--space-5);
-  background:
-    radial-gradient(circle at 80% 0%, color-mix(in srgb, var(--accent) 10%, transparent), transparent 28%),
-    linear-gradient(180deg, color-mix(in srgb, var(--bg-subtle) 24%, transparent), transparent 260px);
+  background: linear-gradient(180deg, color-mix(in srgb, var(--bg-subtle) 24%, transparent), transparent 260px);
 }
 .context-panel { display: flex; flex-direction: column; gap: var(--space-4); }
 .context-panel[hidden], .task-tab-panel[hidden], #memory-card-panel[hidden], #memory-raw-panel[hidden], #skill-editor[hidden], [data-reminder-fields][hidden] { display: none !important; }
@@ -9166,12 +9151,10 @@ body.body-landing {
   justify-content: space-between;
   gap: var(--space-4);
   padding: var(--space-5);
-  border: 1px solid color-mix(in srgb, var(--accent) 22%, var(--border));
+  border: 1px solid color-mix(in srgb, var(--accent) 18%, var(--border));
   border-radius: var(--radius-2xl);
-  background:
-    radial-gradient(circle at 100% 0%, color-mix(in srgb, var(--accent) 24%, transparent), transparent 34%),
-    linear-gradient(135deg, color-mix(in srgb, var(--bg-elevated) 70%, var(--accent) 8%), color-mix(in srgb, var(--bg-raised) 72%, transparent));
-  box-shadow: 0 22px 70px -54px var(--accent);
+  background: linear-gradient(135deg, color-mix(in srgb, var(--bg-elevated) 80%, var(--accent) 5%), color-mix(in srgb, var(--bg-raised) 72%, transparent));
+  box-shadow: var(--shadow-sm);
 }
 .context-panel-hero h4 { margin: 4px 0 4px; font-size: 22px; letter-spacing: -0.03em; color: var(--fg-strong); }
 .context-panel-hero p { margin: 0; color: var(--fg-muted); line-height: 1.5; max-width: 560px; }
@@ -9468,16 +9451,17 @@ body.body-landing {
   --oc-hairline-strong: color-mix(in srgb, var(--border-strong) 78%, transparent);
   --oc-accent-wash: color-mix(in srgb, var(--accent) 12%, transparent);
   --oc-accent-wash-strong: color-mix(in srgb, var(--accent) 20%, transparent);
-  --oc-glow-soft: 0 18px 54px -28px color-mix(in srgb, var(--accent) 58%, transparent);
-  --oc-shadow-float: 0 1px 0 color-mix(in srgb, var(--fg) 6%, transparent), 0 18px 48px -30px rgba(0, 0, 0, 0.78);
+  --oc-glow-soft: 0 10px 32px -24px color-mix(in srgb, var(--accent) 30%, transparent);
+  --oc-shadow-float: 0 1px 0 color-mix(in srgb, var(--fg) 5%, transparent), 0 12px 36px -26px rgba(0, 0, 0, 0.6);
   --shadow: var(--shadow-md);
 }
 
 [data-theme="dark"] {
+  /* Clean near-flat backdrop — a whisper of warmth at the very top, no
+   * colored blobs. The content (messages, cards) carries the visual
+   * interest; the canvas stays calm. */
   --oc-app-backdrop:
-    radial-gradient(circle at 16% 0%, color-mix(in srgb, var(--accent) 16%, transparent), transparent 34%),
-    radial-gradient(circle at 84% 10%, color-mix(in srgb, var(--thinking) 12%, transparent), transparent 30%),
-    linear-gradient(180deg, #1d1b1d 0%, var(--bg) 42%, #171719 100%);
+    linear-gradient(180deg, color-mix(in srgb, var(--accent) 3%, var(--bg)) 0%, var(--bg) 220px);
   --oc-panel-bg: color-mix(in srgb, var(--bg-elevated) var(--oc-panel-alpha), transparent);
   --oc-sidebar-bg: color-mix(in srgb, var(--bg-subtle) 88%, transparent);
   --oc-topbar-bg: color-mix(in srgb, var(--bg) 78%, transparent);
@@ -9486,9 +9470,7 @@ body.body-landing {
 
 [data-theme="light"] {
   --oc-app-backdrop:
-    radial-gradient(circle at 14% -4%, color-mix(in srgb, var(--accent) 16%, transparent), transparent 34%),
-    radial-gradient(circle at 86% 8%, color-mix(in srgb, var(--thinking) 10%, transparent), transparent 30%),
-    linear-gradient(180deg, #fffdf8 0%, var(--bg) 48%, #f4f1ea 100%);
+    linear-gradient(180deg, color-mix(in srgb, var(--accent) 3%, var(--bg)) 0%, var(--bg) 220px);
   --oc-panel-bg: color-mix(in srgb, var(--bg-elevated) 90%, transparent);
   --oc-sidebar-bg: color-mix(in srgb, var(--bg-subtle) 88%, transparent);
   --oc-topbar-bg: color-mix(in srgb, var(--bg) 80%, transparent);
@@ -9517,33 +9499,12 @@ textarea:focus-visible,
   position: relative;
   isolation: isolate;
 }
-.app::before {
-  content: "";
-  position: absolute;
-  inset: 0;
-  z-index: -1;
-  pointer-events: none;
-  background:
-    linear-gradient(color-mix(in srgb, var(--fg) 3%, transparent) 1px, transparent 1px),
-    linear-gradient(90deg, color-mix(in srgb, var(--fg) 3%, transparent) 1px, transparent 1px);
-  background-size: 72px 72px;
-  mask-image: radial-gradient(circle at 50% 0%, black, transparent 64%);
-  -webkit-mask-image: radial-gradient(circle at 50% 0%, black, transparent 64%);
-  opacity: 0.42;
-}
+/* Grid texture + accent washes removed — they read as visual noise on
+ * large viewports. Keep .main children layered for the settings dropdown
+ * stacking fix below. */
 .main {
   background: transparent;
   position: relative;
-}
-.main::before {
-  content: "";
-  position: absolute;
-  inset: 0;
-  pointer-events: none;
-  z-index: 0;
-  background:
-    radial-gradient(circle at 50% 0%, color-mix(in srgb, var(--accent) 7%, transparent), transparent 34%),
-    linear-gradient(90deg, color-mix(in srgb, var(--bg) 36%, transparent), transparent 12%, transparent 88%, color-mix(in srgb, var(--bg) 32%, transparent));
 }
 .main > * {
   position: relative;
@@ -9573,10 +9534,8 @@ textarea:focus-visible,
 .landing-brand-mark,
 .login-brand-mark,
 .empty-brand {
-  background:
-    radial-gradient(circle at 30% 22%, rgba(255, 255, 255, 0.30), transparent 38%),
-    linear-gradient(135deg, color-mix(in srgb, var(--accent) 92%, white 8%), color-mix(in srgb, var(--accent-active) 90%, black 10%));
-  box-shadow: 0 1px 0 rgba(255, 255, 255, 0.14) inset, 0 12px 26px -14px color-mix(in srgb, var(--accent) 80%, transparent);
+  background: linear-gradient(135deg, color-mix(in srgb, var(--accent) 92%, white 8%), color-mix(in srgb, var(--accent-active) 90%, black 10%));
+  box-shadow: 0 1px 0 rgba(255, 255, 255, 0.14) inset, var(--shadow-sm);
 }
 .new-chat-btn {
   min-height: 44px;
@@ -9622,10 +9581,9 @@ textarea:focus-visible,
   border-color: var(--oc-hairline);
 }
 .session-item.active {
-  background: linear-gradient(135deg, var(--accent-soft), color-mix(in srgb, var(--bg-raised) 70%, transparent));
+  background: var(--accent-soft);
   border-color: var(--accent-border);
   color: var(--fg-strong);
-  box-shadow: 0 10px 28px -24px color-mix(in srgb, var(--accent) 70%, transparent);
 }
 .session-item.active::before {
   left: 5px;
@@ -9691,9 +9649,8 @@ textarea:focus-visible,
 }
 .balance-pill {
   border: 1px solid var(--accent-border);
-  background: linear-gradient(135deg, var(--accent-soft), color-mix(in srgb, var(--bg-elevated) 74%, transparent));
+  background: var(--accent-soft);
   color: var(--accent);
-  box-shadow: 0 12px 28px -24px color-mix(in srgb, var(--accent) 80%, transparent);
 }
 .settings-dropdown {
   border-radius: var(--radius-xl);
@@ -9723,10 +9680,9 @@ textarea:focus-visible,
 .msg.user {
   max-width: min(78%, 680px);
   padding: 12px 16px;
-  border-radius: 20px 20px 7px 20px;
-  background:
-    linear-gradient(180deg, color-mix(in srgb, var(--user-bubble) 96%, var(--accent) 4%), var(--user-bubble));
-  border-color: color-mix(in srgb, var(--border-subtle) 72%, var(--accent) 12%);
+  border-radius: 18px 18px 6px 18px;
+  background: var(--user-bubble);
+  border-color: var(--border-subtle);
   box-shadow: var(--shadow-sm);
 }
 .msg.assistant {
@@ -9737,10 +9693,8 @@ textarea:focus-visible,
   width: 34px;
   height: 34px;
   border-radius: 12px;
-  background:
-    radial-gradient(circle at 30% 20%, rgba(255, 255, 255, 0.30), transparent 38%),
-    linear-gradient(135deg, var(--accent-hover), var(--accent-active));
-  box-shadow: 0 1px 0 rgba(255,255,255,0.16) inset, 0 14px 30px -18px color-mix(in srgb, var(--accent) 88%, transparent);
+  background: linear-gradient(135deg, var(--accent-hover), var(--accent-active));
+  box-shadow: 0 1px 0 rgba(255,255,255,0.12) inset;
 }
 .msg.assistant .msg-body {
   font-size: 14.5px;
@@ -9812,7 +9766,7 @@ textarea:focus-visible,
   width: 64px;
   height: 64px;
   border-radius: 22px;
-  box-shadow: 0 1px 0 rgba(255,255,255,0.18) inset, 0 22px 52px -26px color-mix(in srgb, var(--accent) 95%, transparent);
+  box-shadow: 0 1px 0 rgba(255,255,255,0.18) inset, var(--shadow-md);
 }
 .empty-state h1 {
   color: var(--fg-strong);
@@ -9907,11 +9861,11 @@ textarea:focus-visible,
   width: 44px;
   height: 44px;
   border-radius: 15px;
-  box-shadow: 0 12px 26px -18px color-mix(in srgb, var(--accent) 90%, transparent);
+  box-shadow: var(--shadow-sm);
 }
 .send-btn:hover:not(:disabled) {
   transform: translateY(-1px);
-  box-shadow: 0 18px 34px -20px color-mix(in srgb, var(--accent) 95%, transparent);
+  box-shadow: 0 6px 16px -8px color-mix(in srgb, var(--accent) 55%, transparent);
 }
 .send-btn:active:not(:disabled) {
   transform: translateY(0) scale(0.96);
@@ -9935,16 +9889,12 @@ textarea:focus-visible,
 
 /* ───── Modals and settings surfaces ───── */
 .modal-backdrop {
-  background:
-    radial-gradient(circle at 50% 18%, color-mix(in srgb, var(--accent) 10%, transparent), transparent 32%),
-    rgba(0, 0, 0, 0.54);
-  backdrop-filter: blur(10px) saturate(1.15);
-  -webkit-backdrop-filter: blur(10px) saturate(1.15);
+  background: rgba(0, 0, 0, 0.5);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
 }
 [data-theme="light"] .modal-backdrop {
-  background:
-    radial-gradient(circle at 50% 18%, color-mix(in srgb, var(--accent) 12%, transparent), transparent 32%),
-    rgba(42, 34, 24, 0.30);
+  background: rgba(42, 34, 24, 0.28);
 }
 .modal {
   border-radius: 26px;
@@ -10086,10 +10036,10 @@ textarea:focus-visible,
   background: var(--oc-app-backdrop);
 }
 .login-stage-centered .login-card {
-  border-radius: 28px;
+  border-radius: 24px;
   background: var(--oc-panel-bg);
   border: 1px solid var(--oc-hairline-strong);
-  box-shadow: var(--shadow-xl), var(--oc-glow-soft);
+  box-shadow: var(--shadow-lg);
   backdrop-filter: var(--oc-surface-blur);
   -webkit-backdrop-filter: var(--oc-surface-blur);
 }
@@ -10107,7 +10057,7 @@ textarea:focus-visible,
 .login-card .btn-primary.btn-full {
   min-height: 46px;
   border-radius: var(--radius-lg);
-  box-shadow: 0 16px 34px -22px color-mix(in srgb, var(--accent) 90%, transparent);
+  box-shadow: var(--shadow-sm);
 }
 .login-error-banner,
 .login-notice,
@@ -10245,12 +10195,13 @@ textarea:focus-visible,
   transition: background var(--transition-fast), color var(--transition-fast), border-color var(--transition-fast), transform var(--transition-fast), box-shadow var(--transition-fast);
 }
 .btn-primary {
-  background: linear-gradient(135deg, var(--accent-hover), var(--accent-active));
-  box-shadow: 0 14px 28px -20px color-mix(in srgb, var(--accent) 90%, transparent);
+  background: var(--accent);
+  box-shadow: var(--shadow-sm);
 }
 .btn-primary:hover:not(:disabled) {
+  background: var(--accent-hover);
   transform: translateY(-1px);
-  box-shadow: 0 20px 38px -22px color-mix(in srgb, var(--accent) 95%, transparent);
+  box-shadow: 0 6px 18px -10px color-mix(in srgb, var(--accent) 60%, transparent);
 }
 .btn-primary:active:not(:disabled) {
   transform: translateY(0);
