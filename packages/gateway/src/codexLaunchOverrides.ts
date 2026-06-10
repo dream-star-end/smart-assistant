@@ -283,9 +283,9 @@ function tomlValue(v: string | string[] | Record<string, string>): string {
   throw new TypeError(`tomlValue: unsupported value type (${typeof v})`)
 }
 
-const DEFAULT_CODEX_MCP_TOOL_TIMEOUT_SEC = 600
+const DEFAULT_CODEX_MCP_TOOL_TIMEOUT_SEC = 3600
 const MIN_CODEX_MCP_TOOL_TIMEOUT_SEC = 60
-const MAX_CODEX_MCP_TOOL_TIMEOUT_SEC = 3600
+const MAX_CODEX_MCP_TOOL_TIMEOUT_SEC = 7200
 
 function normalizePositiveInt(
   raw: string | undefined,

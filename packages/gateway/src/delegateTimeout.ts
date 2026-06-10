@@ -12,7 +12,7 @@ export type DelegateTimeoutReason = {
 }
 
 const DEFAULT_IDLE_TIMEOUT_MS = 300_000
-const DEFAULT_HARD_TIMEOUT_MS = 15 * 60_000
+const DEFAULT_HARD_TIMEOUT_MS = 45 * 60_000
 const DEFAULT_CHECK_INTERVAL_MS = 5_000
 
 function normalizeMs(
