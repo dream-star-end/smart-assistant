@@ -125,7 +125,7 @@ export function chatGptProxyHostToken(host: string): string {
 }
 
 function cookiePrefixForHost(host: string): string {
-  return `oc_cgpt_${chatGptProxyHostToken(host)}__`
+  return `oc_cgpt_v2_${chatGptProxyHostToken(host)}__`
 }
 
 export function resolveChatGptProxyTarget(reqUrl: URL): ChatGptProxyTarget | null {
