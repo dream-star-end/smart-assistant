@@ -806,6 +806,24 @@ function _appendDelegateProgressEntry(msg, block) {
     ts: Date.now(),
   }
   const last = msg.entries[msg.entries.length - 1]
+  const lastToolPreview = _delegateToolCallPreviewInfo(last)
+  const entryToolPreview = _delegateToolCallPreviewInfo(entry)
+  if (
+    last &&
+    lastToolPreview &&
+    entryToolPreview &&
+    lastToolPreview.toolName === entryToolPreview.toolName &&
+    !last.isError &&
+    !entry.isError
+  ) {
+    const lastText = String(last.text || '')
+    const entryText = String(entry.text || '')
+    if (entryText === lastText || entryText.startsWith(lastText) || lastText.startsWith(entryText)) {
+      if (entryText.length >= lastText.length) last.text = entry.text
+      last.ts = entry.ts
+      return
+    }
+  }
   if (
     last &&
     (entry.phase === 'text' || entry.phase === 'thinking') &&
@@ -819,6 +837,22 @@ function _appendDelegateProgressEntry(msg, block) {
     msg.entries.push(entry)
   }
   if (msg.entries.length > 120) msg.entries.splice(0, msg.entries.length - 120)
+}
+
+function _delegateToolCallPreviewInfo(entry) {
+  if (!entry || entry.phase !== 'tool' || entry.isError) return null
+  const text = String(entry.text || '').trim()
+  if (!text) return null
+  const toolName = String(entry.toolName || '').trim()
+  if (toolName) {
+    const prefix = `调用工具 ${toolName}`
+    if (text === prefix || text.startsWith(`${prefix}:`) || text.startsWith(`${prefix}：`)) {
+      return { toolName }
+    }
+    return null
+  }
+  const m = text.match(/^调用工具\s+([^:：\s]+)(?:\s*[:：]|$)/)
+  return m ? { toolName: m[1] } : null
 }
 
 function _handleDelegateProgressBlock(sess, block) {

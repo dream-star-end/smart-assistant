@@ -178,6 +178,11 @@ const buildToolUseLabel = makeCallable<(block: any) => string>(
   extractFunction(appJs, 'buildToolUseLabel'),
 )
 
+const _appendDelegateProgressEntry = new Function(
+  `${extractFunction(appJs, '_delegateToolCallPreviewInfo')}
+${extractFunction(appJs, '_appendDelegateProgressEntry')}; return _appendDelegateProgressEntry;`,
+)() as (msg: any, block: any) => void
+
 const shouldAutoPlan = new Function(
   `${extractFunction(appJs, '_hasAny')}
 ${extractFunction(appJs, 'shouldAutoPlan').replace(/^export\s+/, '')}; return shouldAutoPlan;`,
@@ -1971,6 +1976,60 @@ describe('T11: Codex tool-card UI unification', () => {
 
   it('_codexSummary webSearch returns query', () => {
     assert.equal(_codexSummary('webSearch', { query: 'foo bar' }), 'foo bar')
+  })
+
+  it('delegate-progress coalesces streaming tool_use previews instead of appending prefixes', () => {
+    const msg: any = { entries: [] }
+    _appendDelegateProgressEntry(msg, {
+      phase: 'tool',
+      toolName: 'Bash',
+      text: '调用工具 Bash: {"command"',
+    })
+    _appendDelegateProgressEntry(msg, {
+      phase: 'tool',
+      toolName: 'Bash',
+      text: '调用工具 Bash: {"command": "sudo apt-get install',
+    })
+    _appendDelegateProgressEntry(msg, {
+      phase: 'tool',
+      toolName: 'Bash',
+      text: '调用工具 Bash: {"command": "sudo apt-get install -y -qq poppler-utils 2>&1 | tail -3"}',
+    })
+
+    assert.equal(msg.entries.length, 1)
+    assert.equal(
+      msg.entries[0].text,
+      '调用工具 Bash: {"command": "sudo apt-get install -y -qq poppler-utils 2>&1 | tail -3"}',
+    )
+
+    _appendDelegateProgressEntry(msg, {
+      phase: 'tool',
+      toolName: 'Bash',
+      text: 'Bash 执行完成',
+    })
+    assert.equal(msg.entries.length, 2)
+    assert.equal(msg.entries[1].text, 'Bash 执行完成')
+  })
+
+  it('delegate-progress does not merge distinct tool previews', () => {
+    const msg: any = { entries: [] }
+    _appendDelegateProgressEntry(msg, {
+      phase: 'tool',
+      toolName: 'Bash',
+      text: '调用工具 Bash: {"command": "pwd"}',
+    })
+    _appendDelegateProgressEntry(msg, {
+      phase: 'tool',
+      toolName: 'Bash',
+      text: '调用工具 Bash: {"command": "ls"}',
+    })
+    _appendDelegateProgressEntry(msg, {
+      phase: 'tool',
+      toolName: 'Read',
+      text: '调用工具 Read: {"file_path": "/tmp/a"}',
+    })
+
+    assert.equal(msg.entries.length, 3)
   })
 
   it('_CODEX_TYPE_META labels no longer carry "Codex" prefix (label-unification invariant)', () => {
