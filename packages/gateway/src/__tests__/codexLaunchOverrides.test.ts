@@ -34,6 +34,7 @@ import {
   resolveMcpMemoryEntry,
   resolveOpenClaudeWebContextBin,
 } from '../codexLaunchOverrides.js'
+import { resolveDelegateTimeoutConfig } from '../delegateTimeout.js'
 
 const { tomlValue, CODEX_PREAMBLE, codexMcpToolTimeoutSec } = _internals
 
@@ -311,10 +312,14 @@ describe('buildCodexLaunchOverrides', () => {
   })
 
   it('extends codex MCP tool timeout so long delegate_task calls can finish', async () => {
-    assert.equal(codexMcpToolTimeoutSec({}), 600)
+    assert.equal(codexMcpToolTimeoutSec({}), 3600)
     assert.equal(codexMcpToolTimeoutSec({ OPENCLAUDE_CODEX_MCP_TOOL_TIMEOUT_SEC: '900' }), 900)
     assert.equal(codexMcpToolTimeoutSec({ OPENCLAUDE_CODEX_MCP_TOOL_TIMEOUT_SEC: '5' }), 60)
-    assert.equal(codexMcpToolTimeoutSec({ OPENCLAUDE_CODEX_MCP_TOOL_TIMEOUT_SEC: '99999' }), 3600)
+    assert.equal(codexMcpToolTimeoutSec({ OPENCLAUDE_CODEX_MCP_TOOL_TIMEOUT_SEC: '99999' }), 7200)
+    assert.ok(
+      codexMcpToolTimeoutSec({}) * 1000 > resolveDelegateTimeoutConfig({}).hardTimeoutMs,
+      'default Codex MCP tool timeout must exceed gateway delegate hard timeout so gateway returns structured errors before MCP aborts',
+    )
 
     await withEnv({ OPENCLAUDE_CODEX_MCP_TOOL_TIMEOUT_SEC: '900' }, async () => {
       const { buildCodexLaunchOverrides } = await import('../codexLaunchOverrides.js')
