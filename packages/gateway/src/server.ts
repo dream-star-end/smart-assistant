@@ -52,6 +52,14 @@ import {
 import { syncCodexAuthFile } from './codexAuthSync.js'
 import { CronScheduler } from './cron.js'
 import { parseDocument } from './documentParser.js'
+import {
+  EgressHttpError,
+  getEgressProxyStatus,
+  redactEgressError,
+  refreshEgressNodes,
+  selectEgressNode,
+  testEgressProxy,
+} from './egressSubscription.js'
 import { createEvent, eventBus } from './eventBus.js'
 import { startEventPersistence } from './eventPersist.js'
 import { createLogger } from './logger.js'
@@ -1351,6 +1359,13 @@ export class Gateway {
       })
       return
     }
+    if (url.pathname === '/api/egress-proxy' || url.pathname.startsWith('/api/egress-proxy/')) {
+      this.handleEgressProxy(req, res, url).catch((err) => {
+        const status = err instanceof EgressHttpError ? err.statusCode : 500
+        this.sendError(res, status, redactEgressError(err))
+      })
+      return
+    }
     if (url.pathname === '/api/doctor') {
       const summary = this._runLog.summary()
       const recentRuns = this._runLog.recent(20)
@@ -2183,6 +2198,73 @@ export class Gateway {
     if (!agent.proxyUrl) return agent
     const redacted = maskProxyUrl(agent.proxyUrl)
     return { ...agent, proxyUrl: redacted }
+  }
+
+  // Authenticated local sing-box subscription proxy management.
+  // Deliberately separate from /api/config's raw proxyUrl editor: this surface
+  // never returns the subscription URL or per-node credentials, only sanitized
+  // node metadata and health probes.
+  private async handleEgressProxy(
+    req: IncomingMessage,
+    res: ServerResponse,
+    url: URL,
+  ): Promise<void> {
+    const opts = { gatewayPort: this.deps.config.gateway.port }
+    if (url.pathname === '/api/egress-proxy/status') {
+      if (req.method !== 'GET') {
+        this.sendError(res, 405, 'method not allowed')
+        return
+      }
+      this.sendJson(res, 200, await getEgressProxyStatus(opts))
+      return
+    }
+    if (url.pathname === '/api/egress-proxy/refresh') {
+      if (req.method !== 'POST') {
+        this.sendError(res, 405, 'method not allowed')
+        return
+      }
+      this.sendJson(res, 200, await refreshEgressNodes(opts))
+      return
+    }
+    if (url.pathname === '/api/egress-proxy/test') {
+      if (req.method !== 'POST') {
+        this.sendError(res, 405, 'method not allowed')
+        return
+      }
+      let body: { idxs?: unknown }
+      try {
+        body = await this.readJsonBody<{ idxs?: unknown }>(req)
+      } catch {
+        this.sendError(res, 400, 'invalid json body')
+        return
+      }
+      if (body === null || typeof body !== 'object' || Array.isArray(body)) {
+        this.sendError(res, 400, 'body must be a JSON object')
+        return
+      }
+      this.sendJson(res, 200, await testEgressProxy(body.idxs, opts))
+      return
+    }
+    if (url.pathname === '/api/egress-proxy/select') {
+      if (req.method !== 'POST') {
+        this.sendError(res, 405, 'method not allowed')
+        return
+      }
+      let body: { idx?: unknown }
+      try {
+        body = await this.readJsonBody<{ idx?: unknown }>(req)
+      } catch {
+        this.sendError(res, 400, 'invalid json body')
+        return
+      }
+      if (body === null || typeof body !== 'object' || Array.isArray(body)) {
+        this.sendError(res, 400, 'body must be a JSON object')
+        return
+      }
+      this.sendJson(res, 200, await selectEgressNode(body.idx, opts))
+      return
+    }
+    this.sendError(res, 404, 'unknown egress proxy endpoint')
   }
 
   // GET /api/agents         → { agents, default }

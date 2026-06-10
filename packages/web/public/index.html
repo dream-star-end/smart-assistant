@@ -16,7 +16,7 @@
 <link rel="apple-touch-icon" href="/icon.svg" />
 <link rel="stylesheet" href="/vendor/github-dark.min.css" />
 <link rel="stylesheet" href="/vendor/katex/katex.min.css" />
-<link rel="stylesheet" href="/style.css?v=40" />
+<link rel="stylesheet" href="/style.css?v=41" />
 <link rel="stylesheet" href="/vendor/xterm/xterm.css?v=1" />
 <style>/* Inline styles removed — see style.css */
 </style>
@@ -459,20 +459,51 @@
 
 <!-- Global outbound proxy modal -->
 <div id="proxy-modal" class="modal-backdrop" role="dialog" aria-modal="true">
-  <div class="modal" style="max-width:520px">
+  <div class="modal proxy-modal">
     <div class="modal-head">
-      <h3>🌐 全局出站代理</h3>
+      <h3>🌐 出站代理</h3>
       <button class="modal-close" data-close-modal="proxy-modal" aria-label="关闭">×</button>
     </div>
     <div class="modal-body">
-      <div class="form-row">
-        <label>代理 URL</label>
-        <input id="proxy-url-input" placeholder="例: http://user:pass@host:port" autocomplete="off" />
-        <p class="form-hint" style="margin:6px 0 0 0;font-size:var(--text-xs);color:var(--fg-muted);line-height:1.5">
-          作用于所有 provider 子进程的出站请求。留空 = 继承 gateway 进程环境(通常是 systemd 设置的 HTTPS_PROXY)。<br>
-          每个 Agent 还可在"编辑 Agent"里单独覆盖此值。改动**下次会话**起生效;codex app-server 等长驻进程要重启才会换。<br>
-          为安全起见,展示时会把 <code>user:pass</code> 显示为 <code>***</code>;要保留原密码请直接关闭对话框,不要按保存。
-        </p>
+      <section class="proxy-section">
+        <div class="proxy-section-head">
+          <div>
+            <h4>本机订阅节点</h4>
+            <p>管理 <code>127.0.0.1:18991</code> sing-box 代理：刷新订阅、测速、切换节点。</p>
+          </div>
+          <div class="proxy-actions">
+            <button id="egress-refresh-btn" class="btn btn-secondary" type="button">更新订阅 / 刷新列表</button>
+            <button id="egress-test-active-btn" class="btn btn-ghost" type="button">测速当前</button>
+            <button id="egress-test-list-btn" class="btn btn-ghost" type="button">测速列表前 20</button>
+          </div>
+        </div>
+        <div id="egress-readonly-hint" class="proxy-readonly-hint" hidden></div>
+        <div class="proxy-status-grid">
+          <div><span>服务</span><strong id="egress-service-state">—</strong></div>
+          <div><span>本地代理</span><strong id="egress-local-proxy">—</strong></div>
+          <div><span>当前节点</span><strong id="egress-active-node">—</strong></div>
+          <div><span>服务器</span><strong id="egress-active-server">—</strong></div>
+          <div><span>最近更新</span><strong id="egress-updated-at">—</strong></div>
+          <div><span>切换权限</span><strong id="egress-mutation-state">—</strong></div>
+          <div><span>当前测速</span><strong id="egress-active-health">未测速</strong></div>
+        </div>
+        <div class="proxy-node-toolbar">
+          <input id="egress-node-filter" placeholder="搜索节点名 / 序号 / server" autocomplete="off" />
+          <span id="egress-node-count">0/0 个节点</span>
+        </div>
+        <div id="egress-node-list" class="proxy-node-list" aria-live="polite"></div>
+      </section>
+
+      <div class="proxy-section proxy-manual-section">
+        <div class="form-row">
+          <label>全局代理 URL</label>
+          <input id="proxy-url-input" placeholder="例: http://user:pass@host:port" autocomplete="off" />
+          <p class="form-hint">
+            作用于所有 provider 子进程的出站请求。当前个人版通常填 <code>http://127.0.0.1:18991</code>，也就是上面的本机订阅代理。<br>
+            每个 Agent 还可在“编辑 Agent”里单独覆盖此值。改动下次会话起生效；codex app-server 等长驻进程要重启才会换。<br>
+            为安全起见，展示时会把 <code>user:pass</code> 显示为 <code>***</code>；要保留原密码请直接关闭对话框，不要按保存。
+          </p>
+        </div>
       </div>
     </div>
     <div class="modal-foot">
@@ -828,6 +859,6 @@
 <script src="/vendor/katex/katex.min.js" defer></script>
 <script src="/vendor/qrcode.min.js"></script>
 <div id="toast" class="toast"></div>
-<script type="module" src="/modules/main.js?v=51"></script>
+<script type="module" src="/modules/main.js?v=52"></script>
 </body>
 </html>
