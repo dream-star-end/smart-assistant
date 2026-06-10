@@ -1450,6 +1450,46 @@ async function openProxyModal() {
   setTimeout(() => input.focus(), 50)
 }
 
+async function loadChatGptWebFrame(force = false) {
+  const status = $('chatgpt-web-proxy-status')
+  const iframe = $('chatgpt-web-iframe')
+  if (!force && iframe.getAttribute('src') !== 'about:blank') return
+  status.textContent = '创建 ChatGPT 网页隔离访问令牌…'
+  iframe.src = 'about:blank'
+  try {
+    const session = await apiGet('/api/chatgpt-web/session')
+    if (!session?.entryUrl) throw new Error('missing ChatGPT proxy entryUrl')
+    iframe.src = session.entryUrl
+  } catch (err) {
+    status.textContent = 'ChatGPT 网页入口创建失败，请重新登录或刷新后再试。'
+    toast(String(err), 'error')
+    throw err
+  }
+}
+
+function refreshChatGptWebFrame() {
+  loadChatGptWebFrame(true).catch(() => {})
+}
+
+async function openChatGptWebModal() {
+  const status = $('chatgpt-web-proxy-status')
+  status.textContent = '读取代理配置中…'
+  openModal('chatgpt-web-modal')
+  const loaded = await loadChatGptWebFrame(false).then(
+    () => true,
+    () => false,
+  )
+  if (!loaded) return
+  try {
+    const cfg = await apiGet('/api/config')
+    status.textContent = cfg.proxyUrl
+      ? `出站代理：${cfg.proxyUrl}`
+      : '未配置全局代理：将使用 gateway 环境代理 fallback；若环境也未设置则直连。'
+  } catch {
+    status.textContent = '代理配置读取失败：仍会尝试通过 gateway 代理入口加载。'
+  }
+}
+
 function openFeedbackModal() {
   $('feedback-desc').value = ''
   $('feedback-category').value = 'bug'
@@ -1701,6 +1741,7 @@ async function init() {
         }
       })()
     } else if (action === 'proxy') openProxyModal()
+    else if (action === 'chatgpt-web') openChatGptWebModal()
     else if (action === 'changelog') openChangelog()
     else if (action === 'feedback') openFeedbackModal()
     else if (action === 'claude-oauth') openOAuthModal()
@@ -1730,6 +1771,7 @@ async function init() {
       toast(String(err), 'error')
     }
   }
+  $('chatgpt-web-refresh-btn').onclick = refreshChatGptWebFrame
   // Memory modal events
   $('memory-tab-memory').onclick = async () => {
     $('memory-tab-memory').className = 'btn btn-secondary'
