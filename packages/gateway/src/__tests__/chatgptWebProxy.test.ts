@@ -94,17 +94,18 @@ describe('ChatGPT web proxy cookies', () => {
     )
     assert.equal(
       rewritten,
-      'oc_cgpt_chatgpt_com__session=abc; Path=/api/chatgpt-web/; Secure; HttpOnly; SameSite=None',
+      'oc_cgpt_v2_chatgpt_com__session=abc; Path=/api/chatgpt-web/; Secure; HttpOnly; SameSite=None',
     )
   })
 
-  it('forwards only current-host prefixed cookies and drops oc_session / unrelated cookies', () => {
+  it('forwards only current-host v2 prefixed cookies and drops oc_session / unrelated / v1 cookies', () => {
     const forwarded = filterChatGptProxyCookieHeader(
       [
         'oc_session=platform-jwt',
         'theme=dark',
-        'oc_cgpt_chatgpt_com__session=abc',
-        'oc_cgpt_auth_openai_com__session=wrong-host',
+        'oc_cgpt_chatgpt_com__session=old-blocked-cookie',
+        'oc_cgpt_v2_chatgpt_com__session=abc',
+        'oc_cgpt_v2_auth_openai_com__session=wrong-host',
       ].join('; '),
       'chatgpt.com',
     )
@@ -119,7 +120,7 @@ describe('ChatGPT web proxy request headers', () => {
       authorization: 'Bearer openai-access-token',
       cookie: [
         'oc_session=platform-jwt',
-        'oc_cgpt_chatgpt_com__session=chatgpt-cookie',
+        'oc_cgpt_v2_chatgpt_com__session=chatgpt-cookie',
         'theme=dark',
       ].join('; '),
       host: 'oc.local',
