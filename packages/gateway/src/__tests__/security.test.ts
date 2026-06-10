@@ -6,6 +6,7 @@ import { resolve } from 'node:path'
  * Run: npx tsx --test packages/gateway/src/__tests__/security.test.ts
  */
 import { describe, it } from 'node:test'
+import { signJwt, verifyJwt } from '../auth.js'
 import {
   FILE_ALLOWED_DIRS,
   FILE_BLOCKED_PATTERNS,
@@ -14,9 +15,24 @@ import {
   UPLOAD_MIME_PREFIXES,
   isFileAllowed,
   isFileBlocked,
+  isFullAccessGatewayJwtPayload,
   isUploadMimeAllowed,
   shouldServeInline,
 } from '../server.js'
+
+describe('T00: scoped JWTs are not full gateway auth', () => {
+  it('accepts normal login JWT payloads but rejects ChatGPT proxy scoped JWT payloads', () => {
+    const secret = 'test-secret'
+    const exp = Math.floor(Date.now() / 1000) + 60
+    const normal = signJwt({ userId: 'u1', exp }, secret)
+    const scopedPayload = { userId: 'u1', exp, scope: 'chatgpt-web', nonce: 'n1' }
+    const scoped = signJwt(scopedPayload, secret)
+
+    assert.equal(isFullAccessGatewayJwtPayload(verifyJwt(normal, secret)), true)
+    assert.equal(isFullAccessGatewayJwtPayload(verifyJwt(scoped, secret)), false)
+    assert.equal(isFullAccessGatewayJwtPayload(null), false)
+  })
+})
 
 // ── T01: /api/file blacklist — tests the REAL isFileBlocked function ──
 describe('T01: isFileBlocked — sensitive file blocking', () => {

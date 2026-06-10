@@ -37,6 +37,12 @@ import {
 import { type WebSocket, WebSocketServer } from 'ws'
 import { type JwtPayload, checkToken, signJwt, verifyJwt, verifyPassword } from './auth.js'
 import {
+  CHATGPT_PROXY_CORS_HEADERS,
+  chatGptProxySessionEntryPath,
+  extractChatGptProxySessionToken,
+  handleChatGptWebProxy,
+} from './chatgptWebProxy.js'
+import {
   CLAUDE_TERMINAL_MAX_CLIENT_MESSAGE_BYTES,
   CLAUDE_TERMINAL_WS_PATH,
   type ClaudeTerminalManager,
@@ -88,6 +94,10 @@ function envNumber(name: string): number | undefined {
   if (!raw) return undefined
   const n = Number(raw)
   return Number.isFinite(n) ? n : undefined
+}
+
+export function isFullAccessGatewayJwtPayload(payload: JwtPayload | null): payload is JwtPayload {
+  return !!payload && (payload as JwtPayload & { scope?: unknown }).scope === undefined
 }
 
 // User-Agent for gateway-internal Claude OAuth fetch (token exchange + refresh).
@@ -1212,13 +1222,32 @@ export class Gateway {
       return
     }
 
+    if (
+      (url.pathname === '/api/chatgpt-web' || url.pathname.startsWith('/api/chatgpt-web/')) &&
+      req.method === 'OPTIONS'
+    ) {
+      res.removeHeader('X-Frame-Options')
+      res.writeHead(204, {
+        ...CHATGPT_PROXY_CORS_HEADERS,
+        'Cache-Control': 'no-store',
+        'Access-Control-Allow-Headers':
+          req.headers['access-control-request-headers'] ||
+          CHATGPT_PROXY_CORS_HEADERS['Access-Control-Allow-Headers'],
+      })
+      res.end()
+      return
+    }
+
     // Routes that need auth
     // All /api/*, /v1/*, and /metrics endpoints require auth except healthz
+    const isChatGptWebRoute =
+      url.pathname === '/api/chatgpt-web' || url.pathname.startsWith('/api/chatgpt-web/')
+    const hasChatGptWebScopedAuth = isChatGptWebRoute && this.checkChatGptWebScopedAuth(url)
     const needsAuth =
       (url.pathname.startsWith('/api/') && url.pathname !== '/api/healthz') ||
       url.pathname.startsWith('/v1/') ||
       url.pathname === '/metrics'
-    if (needsAuth && !this.checkHttpAuth(req)) {
+    if (needsAuth && !this.checkHttpAuth(req) && !hasChatGptWebScopedAuth) {
       res.writeHead(401, { 'Content-Type': 'application/json' })
       res.end(JSON.stringify({ error: 'unauthorized' }))
       return
@@ -1283,6 +1312,43 @@ export class Gateway {
         'Content-Type': 'text/plain; version=0.0.4; charset=utf-8',
       })
       res.end(serializeMetrics())
+      return
+    }
+    if (url.pathname === '/api/chatgpt-web/session') {
+      if (req.method !== 'GET') {
+        this.sendError(res, 405, 'method not allowed')
+        return
+      }
+      const exp = Math.floor(Date.now() / 1000) + Gateway.CHATGPT_WEB_TOKEN_TTL_SECONDS
+      const token = this.signChatGptWebScopedToken(req, exp)
+      this.sendJson(res, 200, {
+        entryUrl: chatGptProxySessionEntryPath(token),
+        expiresAt: exp,
+      })
+      return
+    }
+    if (isChatGptWebRoute) {
+      const chatGptProxyUrl =
+        this.deps.config.proxyUrl ||
+        process.env.HTTPS_PROXY ||
+        process.env.HTTP_PROXY ||
+        process.env.https_proxy ||
+        process.env.http_proxy
+      handleChatGptWebProxy(req, res, url, {
+        proxyUrl: chatGptProxyUrl,
+        forwardAuthorization: hasChatGptWebScopedAuth && !this.isOpenClaudeAuthorizationHeader(req),
+        log: this.log,
+      }).catch((err) => {
+        this.log.warn('chatgpt proxy failed', undefined, err)
+        if (!res.headersSent) {
+          res.removeHeader('X-Frame-Options')
+          res.writeHead(502, {
+            'Content-Type': 'text/plain; charset=utf-8',
+            'Cache-Control': 'no-store',
+          })
+        }
+        if (!res.writableEnded) res.end('ChatGPT proxy failed')
+      })
       return
     }
     if (url.pathname === '/api/doctor') {
@@ -1966,7 +2032,7 @@ export class Gateway {
     const t = this.extractToken(req)
     // Try JWT first (multi-user mode)
     const jwt = verifyJwt(t, this.deps.config.gateway.accessToken)
-    if (jwt) return true
+    if (isFullAccessGatewayJwtPayload(jwt)) return true
     // Fall back to legacy single token
     return checkToken(t, this.deps.config.gateway.accessToken)
   }
@@ -1975,7 +2041,16 @@ export class Gateway {
   private getUserId(req: IncomingMessage): string {
     const t = this.extractToken(req)
     const jwt = verifyJwt(t, this.deps.config.gateway.accessToken)
-    return jwt?.userId ?? 'default'
+    return isFullAccessGatewayJwtPayload(jwt) ? jwt.userId : 'default'
+  }
+
+  private isOpenClaudeAuthorizationHeader(req: IncomingMessage): boolean {
+    const raw = req.headers.authorization
+    if (!raw) return false
+    const token = raw.replace(/^Bearer\s+/i, '').trim()
+    if (!token) return false
+    if (checkToken(token, this.deps.config.gateway.accessToken)) return true
+    return !!verifyJwt(token, this.deps.config.gateway.accessToken)
   }
 
   /** Get userId stashed on a WS at handshake time. Falls back to 'default' if
@@ -2010,6 +2085,26 @@ export class Gateway {
   /** Session token lifetime — used for JWT issuance and legacy-mode cookie cap.
    *  Kept in one place so JWT TTL and cookie Max-Age can't drift. */
   private static readonly JWT_TTL_SECONDS = 30 * 86400 // 30 days
+  private static readonly CHATGPT_WEB_TOKEN_TTL_SECONDS = 30 * 60 // 30 minutes
+
+  private signChatGptWebScopedToken(req: IncomingMessage, exp: number): string {
+    const payload = {
+      userId: this.getUserId(req),
+      exp,
+      scope: 'chatgpt-web',
+      nonce: randomBytes(16).toString('base64url'),
+    }
+    return signJwt(payload, this.deps.config.gateway.accessToken)
+  }
+
+  private checkChatGptWebScopedAuth(url: URL): boolean {
+    const token = extractChatGptProxySessionToken(url)
+    if (!token) return false
+    const payload = verifyJwt(token, this.deps.config.gateway.accessToken) as
+      | (JwtPayload & { scope?: string })
+      | null
+    return payload?.scope === 'chatgpt-web'
+  }
 
   /** Set HttpOnly session cookie on response — stores the verified auth token so
    *  <img src="/api/file/...">, <audio>, <video> can access protected media on
@@ -2033,7 +2128,7 @@ export class Gateway {
     const secure = this.isHttps(req) ? '; Secure' : ''
 
     const jwt = verifyJwt(t, this.deps.config.gateway.accessToken)
-    if (jwt && typeof jwt.exp === 'number') {
+    if (isFullAccessGatewayJwtPayload(jwt) && typeof jwt.exp === 'number') {
       // Clamp remaining seconds to [60, JWT_TTL_SECONDS]. Max-Age=0 semantically
       // means "delete cookie"; a positive floor keeps the cookie alive long
       // enough for the client to renew or get a clean 401 on the next request.
@@ -5708,6 +5803,7 @@ const KNOWN_ROUTES = [
   '/api/runs',
   '/api/sessions',
   '/api/config',
+  '/api/chatgpt-web',
   '/api/agents',
   '/api/search',
   '/api/cron',
@@ -5741,6 +5837,7 @@ function normalizePath(p: string): string {
     .replace(/\/api\/cron\/[a-zA-Z0-9_-]+/, '/api/cron/:id')
     .replace(/\/api\/tasks\/[a-zA-Z0-9_-]+/, '/api/tasks/:id')
     .replace(/\/api\/webhooks\/[a-zA-Z0-9_-]+/, '/api/webhooks/:id')
+    .replace(/\/api\/chatgpt-web\/.+/, '/api/chatgpt-web/:target')
     .replace(/\/api\/media\/.+/, '/api/media/:file')
   if (normalized !== p) return normalized
   // OpenAI compat

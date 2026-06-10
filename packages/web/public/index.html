@@ -16,7 +16,7 @@
 <link rel="apple-touch-icon" href="/icon.svg" />
 <link rel="stylesheet" href="/vendor/github-dark.min.css" />
 <link rel="stylesheet" href="/vendor/katex/katex.min.css" />
-<link rel="stylesheet" href="/style.css?v=39" />
+<link rel="stylesheet" href="/style.css?v=40" />
 <link rel="stylesheet" href="/vendor/xterm/xterm.css?v=1" />
 <style>/* Inline styles removed — see style.css */
 </style>
@@ -144,6 +144,7 @@
             <button class="settings-item" data-settings="theme"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="5"/><path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg>切换主题</button>
             <button class="settings-item" data-settings="config"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg>查看配置</button>
             <button class="settings-item" data-settings="proxy"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M2 12h20"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>出站代理</button>
+            <button class="settings-item" data-settings="chatgpt-web"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H8l-5 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/><path d="M8 10h8"/><path d="M8 14h5"/></svg>ChatGPT 网页</button>
             <button class="settings-item" data-settings="claude-oauth"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4"/><polyline points="10 17 15 12 10 7"/><line x1="15" y1="12" x2="3" y2="12"/></svg>OAuth 认证</button>
             <button class="settings-item" data-settings="claude-terminal"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>Claude Code 终端</button>
             <button class="settings-item" data-settings="wechat"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 10h.01"/><path d="M12 10h.01"/><path d="M16 10h.01"/><path d="M21 12a9 9 0 1 0-3.39 7.06l3.06.94-.94-3.06A8.96 8.96 0 0 0 21 12z"/></svg>微信绑定</button>
@@ -481,6 +482,32 @@
     </div>
   </div>
 </div>
+<!-- ChatGPT web embed modal -->
+<div id="chatgpt-web-modal" class="modal-backdrop chatgpt-web-backdrop" role="dialog" aria-modal="true">
+  <div class="modal chatgpt-web-modal">
+    <div class="modal-head chatgpt-web-head">
+      <div>
+        <h3>ChatGPT 网页</h3>
+        <p id="chatgpt-web-proxy-status" class="chatgpt-web-status">读取代理配置中…</p>
+      </div>
+      <div class="chatgpt-web-actions">
+        <button id="chatgpt-web-refresh-btn" class="btn btn-ghost btn-sm" type="button">刷新</button>
+        <button class="modal-close" data-close-modal="chatgpt-web-modal" aria-label="关闭">×</button>
+      </div>
+    </div>
+    <div class="chatgpt-web-warning">
+      这是直接反代 ChatGPT 网页的预览版：请求会走 OpenClaude 的全局出站代理，并运行在隔离沙箱中以避免第三方页面读取 OpenClaude。ChatGPT 的登录风控、反自动化、WebSocket/Service Worker 或沙箱限制仍可能导致空白或无法登录。
+    </div>
+    <iframe
+      id="chatgpt-web-iframe"
+      class="chatgpt-web-iframe"
+      src="about:blank"
+      title="ChatGPT Web via OpenClaude proxy"
+      referrerpolicy="no-referrer"
+      sandbox="allow-forms allow-modals allow-popups allow-scripts"
+    ></iframe>
+  </div>
+</div>
 
 <!-- Memory modal -->
 <div id="memory-modal" class="modal-backdrop" role="dialog" aria-modal="true">
@@ -801,6 +828,6 @@
 <script src="/vendor/katex/katex.min.js" defer></script>
 <script src="/vendor/qrcode.min.js"></script>
 <div id="toast" class="toast"></div>
-<script type="module" src="/modules/main.js?v=50"></script>
+<script type="module" src="/modules/main.js?v=51"></script>
 </body>
 </html>
