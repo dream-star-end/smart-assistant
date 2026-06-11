@@ -17,7 +17,11 @@ import {
   isFileBlocked,
   isFullAccessGatewayJwtPayload,
   isUploadMimeAllowed,
+  parseSingleRangeHeader,
+  resolveTerminalFilePathInput,
+  sanitizeTerminalFileName,
   shouldServeInline,
+  terminalContentDisposition,
 } from '../server.js'
 
 describe('T00: scoped JWTs are not full gateway auth', () => {
@@ -205,6 +209,41 @@ describe('T01c: shouldServeInline — file disposition policy', () => {
     assert.ok(
       !shouldServeInline('application/vnd.openxmlformats-officedocument.wordprocessingml.document'),
     )
+  })
+})
+
+describe('T01d: terminal file helpers — arbitrary authenticated file access utilities', () => {
+  it('resolves terminal download paths without an allowlist', () => {
+    assert.equal(
+      resolveTerminalFilePathInput('/etc/passwd', '/work/project', '/root'),
+      '/etc/passwd',
+    )
+    assert.equal(
+      resolveTerminalFilePathInput('dist/output.zip', '/work/project', '/root'),
+      '/work/project/dist/output.zip',
+    )
+    assert.equal(
+      resolveTerminalFilePathInput('~/notes.txt', '/work/project', '/root'),
+      '/root/notes.txt',
+    )
+  })
+
+  it('sanitizes upload filenames but keeps readable unicode names', () => {
+    assert.equal(sanitizeTerminalFileName('../报告 1.png'), '报告 1.png')
+    assert.equal(sanitizeTerminalFileName('..'), 'upload.bin')
+  })
+
+  it('parses single byte ranges for large terminal downloads', () => {
+    assert.deepEqual(parseSingleRangeHeader('bytes=0-99', 1000), { start: 0, end: 99 })
+    assert.deepEqual(parseSingleRangeHeader('bytes=900-', 1000), { start: 900, end: 999 })
+    assert.deepEqual(parseSingleRangeHeader('bytes=-100', 1000), { start: 900, end: 999 })
+    assert.equal(parseSingleRangeHeader('bytes=1000-1001', 1000), 'invalid')
+  })
+
+  it('emits safe content-disposition for non-ascii names', () => {
+    const disposition = terminalContentDisposition('attachment', '报告 1.pdf')
+    assert.match(disposition, /^attachment; filename="_+ 1\.pdf"; filename\*=UTF-8''/)
+    assert.match(disposition, /%E6%8A%A5%E5%91%8A%201\.pdf$/)
   })
 })
 

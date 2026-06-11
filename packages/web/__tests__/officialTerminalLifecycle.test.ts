@@ -145,12 +145,12 @@ describe('official Claude terminal lifecycle', () => {
   it('cache-busts terminal module when adding mobile controls', () => {
     assert.match(INDEX, /claude-terminal-history-prev-btn" type="button" tabindex="-1" disabled/)
     assert.match(INDEX, /claude-terminal-history-next-btn" type="button" tabindex="-1" disabled/)
-    assert.match(MAIN, /from '\.\/officialTerminal\.js\?v=3'/)
-    assert.match(SW, /\/modules\/officialTerminal\.js\?v=3/)
-    assert.match(INDEX, /\/modules\/main\.js\?v=55/)
-    assert.match(INDEX, /\/style\.css\?v=47/)
-    assert.match(INDEX, /sw-flush-v17/)
-    assert.match(SW, /openclaude-v75/)
+    assert.match(MAIN, /from '\.\/officialTerminal\.js\?v=4'/)
+    assert.match(SW, /\/modules\/officialTerminal\.js\?v=4/)
+    assert.match(INDEX, /\/modules\/main\.js\?v=56/)
+    assert.match(INDEX, /\/style\.css\?v=48/)
+    assert.match(INDEX, /sw-flush-v18/)
+    assert.match(SW, /openclaude-v76/)
   })
 
   it('mobile wake lock is optional and gated by modal visibility', () => {

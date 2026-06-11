@@ -254,6 +254,12 @@ export class ClaudeTerminalManager {
     return true
   }
 
+  workingDirectory(userId: string): string {
+    const session = this.sessions.get(userId)
+    if (session && !session.closed) return session.cwd
+    return resolveOfficialClaudeCwd(this.env)
+  }
+
   shutdown(reason = 'shutdown'): void {
     for (const session of [...this.sessions.values()])
       this.closeSession(session, reason, true, true)

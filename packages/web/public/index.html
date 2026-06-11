@@ -16,7 +16,7 @@
 <link rel="apple-touch-icon" href="/icon.svg" />
 <link rel="stylesheet" href="/vendor/github-dark.min.css" />
 <link rel="stylesheet" href="/vendor/katex/katex.min.css" />
-<link rel="stylesheet" href="/style.css?v=47" />
+<link rel="stylesheet" href="/style.css?v=48" />
 <link rel="stylesheet" href="/vendor/xterm/xterm.css?v=1" />
 <style>/* Inline styles removed — see style.css */
 </style>
@@ -800,11 +800,46 @@
     <div class="modal-body claude-terminal-body">
       <div class="claude-terminal-toolbar">
         <span id="claude-terminal-status" class="claude-terminal-status" data-state="idle">未连接</span>
-        <span class="claude-terminal-hint">关闭=隐藏会话；终止=结束 Claude。</span>
+        <div class="claude-terminal-toolbar-actions">
+          <input id="claude-terminal-file-input" type="file" multiple hidden />
+          <button id="claude-terminal-upload-btn" class="btn btn-ghost" type="button">上传</button>
+          <button id="claude-terminal-files-btn" class="btn btn-ghost" type="button">文件</button>
+          <span class="claude-terminal-hint">关闭=隐藏会话；终止=结束 Claude。</span>
+        </div>
+      </div>
+      <div id="claude-terminal-file-panel" class="claude-terminal-file-panel" hidden>
+        <div class="claude-terminal-file-tabs" role="tablist" aria-label="终端文件">
+          <button type="button" data-terminal-file-tab="recent" data-active="true">最近</button>
+          <button type="button" data-terminal-file-tab="uploads" data-active="false">上传</button>
+          <button type="button" data-terminal-file-tab="browse" data-active="false">浏览</button>
+          <button type="button" data-terminal-file-tab="path" data-active="false">路径下载</button>
+        </div>
+        <div class="claude-terminal-file-pane" data-terminal-file-pane="recent">
+          <div id="claude-terminal-recent-list" class="claude-terminal-file-list"></div>
+        </div>
+        <div class="claude-terminal-file-pane" data-terminal-file-pane="uploads" hidden>
+          <div id="claude-terminal-upload-list" class="claude-terminal-file-list"></div>
+        </div>
+        <div class="claude-terminal-file-pane" data-terminal-file-pane="browse" hidden>
+          <div class="claude-terminal-path-row">
+            <input id="claude-terminal-browse-path" type="text" placeholder="目录路径；留空=终端初始 cwd" autocomplete="off" spellcheck="false" />
+            <button id="claude-terminal-browse-open-btn" class="btn btn-ghost" type="button">打开</button>
+          </div>
+          <div id="claude-terminal-browse-list" class="claude-terminal-file-list"></div>
+        </div>
+        <div class="claude-terminal-file-pane" data-terminal-file-pane="path" hidden>
+          <div class="claude-terminal-path-row">
+            <input id="claude-terminal-path-input" type="text" placeholder="输入任意服务器文件路径，如 /tmp/result.zip 或 ./report.pdf" autocomplete="off" spellcheck="false" />
+            <button id="claude-terminal-download-btn" class="btn btn-primary" type="button">下载</button>
+            <button id="claude-terminal-preview-btn" class="btn btn-ghost" type="button">预览</button>
+          </div>
+          <p class="claude-terminal-file-note">下载路径按你的要求不做目录 allowlist；相对路径按终端初始工作目录解析。</p>
+        </div>
       </div>
       <div class="claude-terminal-terminal-wrap">
         <div id="claude-terminal-container" class="claude-terminal-container" aria-label="Claude Code terminal"></div>
         <div id="claude-terminal-scroll-capture" class="claude-terminal-scroll-capture" aria-hidden="true"></div>
+        <div id="claude-terminal-drop-hint" class="claude-terminal-drop-hint" hidden>松手上传到终端可读路径</div>
         <button id="claude-terminal-new-output-btn" class="claude-terminal-new-output" type="button" hidden aria-hidden="true">有新输出 · 到底部</button>
       </div>
       <div class="claude-terminal-mobile-dock" aria-label="移动端终端输入">
@@ -864,7 +899,7 @@
 <!-- Force SW cache refresh (one-time, remove after all clients updated) -->
 <script>
 (function(){
-  var V='sw-flush-v17';
+  var V='sw-flush-v18';
   if(localStorage.getItem(V))return;
   if('serviceWorker' in navigator){
     navigator.serviceWorker.getRegistrations().then(function(regs){
@@ -886,6 +921,6 @@
 <script src="/vendor/katex/katex.min.js" defer></script>
 <script src="/vendor/qrcode.min.js"></script>
 <div id="toast" class="toast"></div>
-<script type="module" src="/modules/main.js?v=55"></script>
+<script type="module" src="/modules/main.js?v=56"></script>
 </body>
 </html>

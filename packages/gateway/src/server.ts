@@ -1,6 +1,13 @@
 import { createHash, randomBytes } from 'node:crypto'
-import { createReadStream, existsSync, readFileSync, readdirSync, statSync } from 'node:fs'
-import { mkdir, readFile, rename, unlink, writeFile } from 'node:fs/promises'
+import {
+  createReadStream,
+  existsSync,
+  readFileSync,
+  readdirSync,
+  realpathSync,
+  statSync,
+} from 'node:fs'
+import { appendFile, mkdir, readFile, rename, unlink, writeFile } from 'node:fs/promises'
 import { type IncomingMessage, type ServerResponse, createServer } from 'node:http'
 import { homedir } from 'node:os'
 import { basename, dirname, extname, join, relative, resolve } from 'node:path'
@@ -118,6 +125,32 @@ export function isFullAccessGatewayJwtPayload(payload: JwtPayload | null): paylo
 // regime, no evidence of risk, and the gateway _refreshToken path is a backup
 // to codex-cli's own internal refresh anyway.
 const CLAUDE_OAUTH_USER_AGENT = `claude-cli/${process.env.OPENCLAUDE_CC_VERSION_FOR_OAUTH || '2.1.888'} (external, cli)`
+const TERMINAL_UPLOAD_CHUNK_BYTES = 768 * 1024
+const TERMINAL_UPLOAD_CHUNK_JSON_MAX_BYTES = 2 * 1024 * 1024
+const TERMINAL_UPLOAD_MAX_SINGLE_BYTES = 512 * 1024 * 1024
+const TERMINAL_UPLOAD_STALE_MS = 6 * 60 * 60_000
+const TERMINAL_LIST_MAX_ENTRIES = 1000
+
+interface TerminalUploadState {
+  id: string
+  userId: string
+  name: string
+  safeName: string
+  mimeType: string
+  size: number
+  dir: string
+  tmpPath: string
+  finalPath: string
+  receivedBytes: number
+  createdAt: number
+  updatedAt: number
+  writing: boolean
+}
+
+interface HttpByteRange {
+  start: number
+  end: number
+}
 
 export interface GatewayDeps {
   config: OpenClaudeConfig
@@ -149,6 +182,8 @@ export class Gateway {
   private _stopEviction: (() => void) | null = null
   private _shuttingDown = false
   private _shutdownPromise: Promise<void> | null = null
+  private _terminalUploads = new Map<string, TerminalUploadState>()
+  private _lastTerminalUploadCleanupAt = 0
 
   // ── Idempotency key dedup (prevents duplicate processing on client reconnect replay) ──
   private _seenIdempotencyKeys = new Map<string, number>() // key → timestamp
@@ -1390,6 +1425,20 @@ export class Gateway {
       this.sendJson(res, 200, { ok: true, terminated })
       return
     }
+    if (url.pathname.startsWith('/api/claude-terminal/upload/')) {
+      this.handleClaudeTerminalUpload(req, res, url).catch((err) => {
+        this.sendError(res, 400, err instanceof Error ? err.message : String(err))
+      })
+      return
+    }
+    if (url.pathname === '/api/claude-terminal/list') {
+      this.handleClaudeTerminalList(req, res, url)
+      return
+    }
+    if (url.pathname === '/api/claude-terminal/download') {
+      this.handleClaudeTerminalDownload(req, res, url)
+      return
+    }
     if (url.pathname === '/api/usage' && req.method === 'GET') {
       const agentId = url.searchParams.get('agentId') ?? undefined
       const sessionId = url.searchParams.get('sessionId') ?? undefined
@@ -2184,9 +2233,21 @@ export class Gateway {
   private sendError(res: ServerResponse, code: number, message: string): void {
     this.sendJson(res, code, { error: message })
   }
-  private async readJsonBody<T = any>(req: IncomingMessage): Promise<T> {
+  private async readJsonBody<T = any>(
+    req: IncomingMessage,
+    maxBytes = 10 * 1024 * 1024,
+  ): Promise<T> {
     const chunks: Buffer[] = []
-    for await (const chunk of req) chunks.push(chunk as Buffer)
+    let size = 0
+    for await (const chunk of req) {
+      const buf = chunk as Buffer
+      size += buf.length
+      if (size > maxBytes) {
+        req.destroy()
+        throw new Error('body too large')
+      }
+      chunks.push(buf)
+    }
     const raw = Buffer.concat(chunks).toString('utf-8')
     if (!raw) return {} as T
     try {
@@ -3543,6 +3604,329 @@ export class Gateway {
       req.on('end', () => resolve(Buffer.concat(chunks).toString()))
       req.on('error', reject)
     })
+  }
+
+  private terminalWorkingDirectory(userId: string): string {
+    return this.claudeTerminal?.workingDirectory(userId) ?? homedir()
+  }
+
+  private resolveClaudeTerminalFilePath(userId: string, rawPath: string): string {
+    return resolveTerminalFilePathInput(rawPath, this.terminalWorkingDirectory(userId), homedir())
+  }
+
+  private terminalUploadPayload(upload: TerminalUploadState) {
+    const downloadUrl = `/api/claude-terminal/download?path=${encodeURIComponent(upload.finalPath)}`
+    return {
+      id: upload.id,
+      name: upload.name,
+      size: upload.size,
+      mimeType: upload.mimeType,
+      path: upload.finalPath,
+      downloadUrl,
+      previewUrl: `${downloadUrl}&disposition=inline`,
+      isPreviewable: shouldServeInline(upload.mimeType || mimeFor(upload.finalPath)),
+    }
+  }
+
+  private cleanupTerminalUploads(): void {
+    const now = Date.now()
+    if (now - this._lastTerminalUploadCleanupAt < 60_000) return
+    this._lastTerminalUploadCleanupAt = now
+    for (const [id, upload] of this._terminalUploads) {
+      if (now - upload.updatedAt < TERMINAL_UPLOAD_STALE_MS) continue
+      this._terminalUploads.delete(id)
+      unlink(upload.tmpPath).catch(() => {})
+    }
+  }
+
+  private getTerminalUpload(userId: string, rawId: unknown): TerminalUploadState {
+    if (typeof rawId !== 'string' || !rawId) throw new Error('missing uploadId')
+    const upload = this._terminalUploads.get(rawId)
+    if (!upload || upload.userId !== userId) throw new Error('upload not found')
+    return upload
+  }
+
+  private async handleClaudeTerminalUpload(
+    req: IncomingMessage,
+    res: ServerResponse,
+    url: URL,
+  ): Promise<void> {
+    if (req.method !== 'POST') {
+      this.sendError(res, 405, 'method not allowed')
+      return
+    }
+    this.cleanupTerminalUploads()
+    const action = basename(url.pathname)
+    const maxBodyBytes = action === 'chunk' ? TERMINAL_UPLOAD_CHUNK_JSON_MAX_BYTES : 256 * 1024
+    const body = await this.readJsonBody<Record<string, unknown>>(req, maxBodyBytes)
+    if (body === null || typeof body !== 'object' || Array.isArray(body)) {
+      this.sendError(res, 400, 'body must be a JSON object')
+      return
+    }
+    const userId = this.getUserId(req)
+
+    if (action === 'start') {
+      const originalName =
+        typeof body.name === 'string' && body.name.trim() ? body.name : 'upload.bin'
+      const safeName = sanitizeTerminalFileName(originalName)
+      const size = typeof body.size === 'number' ? body.size : Number(body.size)
+      if (!Number.isFinite(size) || size < 0) throw new Error('invalid file size')
+      if (size > TERMINAL_UPLOAD_MAX_SINGLE_BYTES) {
+        throw new Error(
+          `file exceeds ${Math.round(TERMINAL_UPLOAD_MAX_SINGLE_BYTES / 1024 / 1024)}MB limit`,
+        )
+      }
+      const id = randomBytes(18).toString('base64url')
+      const safeUserId = sanitizeTerminalPathSegment(userId || 'default')
+      const dir = join(paths.uploadsDir, 'terminal', safeUserId, id)
+      const mimeType =
+        typeof body.mimeType === 'string' && body.mimeType.trim()
+          ? body.mimeType.trim().slice(0, 200)
+          : 'application/octet-stream'
+      await mkdir(dir, { recursive: true })
+      const tmpPath = join(dir, `.${safeName}.partial`)
+      const finalPath = join(dir, safeName)
+      await writeFile(tmpPath, Buffer.alloc(0), { flag: 'wx' })
+      const upload: TerminalUploadState = {
+        id,
+        userId,
+        name: originalName,
+        safeName,
+        mimeType,
+        size,
+        dir,
+        tmpPath,
+        finalPath,
+        receivedBytes: 0,
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        writing: false,
+      }
+      this._terminalUploads.set(id, upload)
+      this.sendJson(res, 200, {
+        ok: true,
+        uploadId: id,
+        chunkSize: TERMINAL_UPLOAD_CHUNK_BYTES,
+        maxFileSize: TERMINAL_UPLOAD_MAX_SINGLE_BYTES,
+      })
+      return
+    }
+
+    if (action === 'chunk') {
+      const upload = this.getTerminalUpload(userId, body.uploadId)
+      const offset = typeof body.offset === 'number' ? body.offset : Number(body.offset)
+      if (!Number.isFinite(offset) || offset < 0) throw new Error('invalid chunk offset')
+      if (typeof body.data !== 'string' || !body.data) throw new Error('missing chunk data')
+      const chunk = Buffer.from(body.data, 'base64')
+      if (chunk.length === 0 && upload.size > 0) throw new Error('empty chunk')
+      if (chunk.length > TERMINAL_UPLOAD_CHUNK_BYTES) throw new Error('chunk too large')
+
+      if (offset < upload.receivedBytes && offset + chunk.length <= upload.receivedBytes) {
+        upload.updatedAt = Date.now()
+        this.sendJson(res, 200, {
+          ok: true,
+          receivedBytes: upload.receivedBytes,
+          duplicate: true,
+        })
+        return
+      }
+      if (upload.writing) {
+        this.sendJson(res, 409, {
+          ok: false,
+          error: 'upload write in progress',
+          expectedOffset: upload.receivedBytes,
+        })
+        return
+      }
+      if (offset !== upload.receivedBytes) {
+        this.sendJson(res, 409, {
+          ok: false,
+          error: 'unexpected chunk offset',
+          expectedOffset: upload.receivedBytes,
+        })
+        return
+      }
+      if (upload.receivedBytes + chunk.length > upload.size) throw new Error('chunk exceeds size')
+      upload.writing = true
+      try {
+        await appendFile(upload.tmpPath, chunk)
+        upload.receivedBytes += chunk.length
+        upload.updatedAt = Date.now()
+      } finally {
+        upload.writing = false
+      }
+      this.sendJson(res, 200, { ok: true, receivedBytes: upload.receivedBytes })
+      return
+    }
+
+    if (action === 'finish') {
+      const upload = this.getTerminalUpload(userId, body.uploadId)
+      if (upload.writing) {
+        this.sendJson(res, 409, {
+          ok: false,
+          error: 'upload write in progress',
+          receivedBytes: upload.receivedBytes,
+          size: upload.size,
+        })
+        return
+      }
+      if (upload.receivedBytes !== upload.size) {
+        this.sendJson(res, 409, {
+          ok: false,
+          error: 'upload incomplete',
+          receivedBytes: upload.receivedBytes,
+          size: upload.size,
+        })
+        return
+      }
+      await rename(upload.tmpPath, upload.finalPath)
+      this._terminalUploads.delete(upload.id)
+      this.sendJson(res, 200, { ok: true, file: this.terminalUploadPayload(upload) })
+      return
+    }
+
+    if (action === 'cancel') {
+      const upload = this.getTerminalUpload(userId, body.uploadId)
+      if (upload.writing) {
+        this.sendJson(res, 409, { ok: false, error: 'upload write in progress' })
+        return
+      }
+      this._terminalUploads.delete(upload.id)
+      await unlink(upload.tmpPath).catch(() => {})
+      this.sendJson(res, 200, { ok: true })
+      return
+    }
+
+    this.sendError(res, 404, 'unknown terminal upload action')
+  }
+
+  private handleClaudeTerminalList(req: IncomingMessage, res: ServerResponse, url: URL): void {
+    if (req.method !== 'GET') {
+      this.sendError(res, 405, 'method not allowed')
+      return
+    }
+    const userId = this.getUserId(req)
+    const rawPath = url.searchParams.get('path') || ''
+    let resolved = this.resolveClaudeTerminalFilePath(userId, rawPath)
+    try {
+      resolved = realpathSync(resolved)
+      const dirStat = statSync(resolved)
+      if (!dirStat.isDirectory()) {
+        this.sendError(res, 400, 'path is not a directory')
+        return
+      }
+      const rawEntries = readdirSync(resolved, { withFileTypes: true }).slice(
+        0,
+        TERMINAL_LIST_MAX_ENTRIES,
+      )
+      const entries = rawEntries
+        .map((entry) => {
+          const entryPath = join(resolved, entry.name)
+          try {
+            const s = statSync(entryPath)
+            const mimeType = s.isFile() ? mimeFor(entryPath) : ''
+            return {
+              name: entry.name,
+              path: entryPath,
+              isDirectory: s.isDirectory(),
+              size: s.isFile() ? s.size : null,
+              mtimeMs: s.mtimeMs,
+              mimeType,
+              isPreviewable: s.isFile() ? shouldServeInline(mimeType) : false,
+              isActiveContent: s.isFile() ? isActiveContentType(mimeType) : false,
+            }
+          } catch {
+            return null
+          }
+        })
+        .filter((entry): entry is NonNullable<typeof entry> => entry !== null)
+        .sort((a, b) => {
+          if (a.isDirectory !== b.isDirectory) return a.isDirectory ? -1 : 1
+          return a.name.localeCompare(b.name)
+        })
+      this.sendJson(res, 200, {
+        ok: true,
+        path: resolved,
+        parent: dirname(resolved),
+        cwd: this.terminalWorkingDirectory(userId),
+        truncated: rawEntries.length >= TERMINAL_LIST_MAX_ENTRIES,
+        entries,
+      })
+    } catch {
+      this.sendError(res, 404, 'path not found')
+    }
+  }
+
+  private handleClaudeTerminalDownload(req: IncomingMessage, res: ServerResponse, url: URL): void {
+    if (req.method !== 'GET') {
+      this.sendError(res, 405, 'method not allowed')
+      return
+    }
+    const rawPath = url.searchParams.get('path')
+    if (!rawPath) {
+      this.sendError(res, 400, 'missing ?path=')
+      return
+    }
+
+    const userId = this.getUserId(req)
+    let resolved = this.resolveClaudeTerminalFilePath(userId, rawPath)
+    let fileStat: ReturnType<typeof statSync>
+    try {
+      resolved = realpathSync(resolved)
+      fileStat = statSync(resolved)
+    } catch {
+      this.sendError(res, 404, 'not found')
+      return
+    }
+    if (!fileStat.isFile()) {
+      this.sendError(res, 404, 'not a file')
+      return
+    }
+
+    const contentType = mimeFor(resolved)
+    const requestedInline = url.searchParams.get('disposition') === 'inline'
+    const dispositionMode =
+      requestedInline && shouldServeInline(contentType) ? 'inline' : 'attachment'
+    const range = parseSingleRangeHeader(req.headers.range, fileStat.size)
+    if (range === 'invalid') {
+      res.writeHead(416, {
+        'Content-Range': `bytes */${fileStat.size}`,
+        'Cache-Control': 'no-store',
+      })
+      res.end()
+      return
+    }
+
+    const headers: Record<string, string | number> = {
+      'Content-Type': contentType,
+      'Cache-Control': 'private, no-store',
+      'Accept-Ranges': 'bytes',
+      'Content-Disposition': terminalContentDisposition(
+        dispositionMode,
+        basename(resolved) || 'file',
+      ),
+    }
+    const streamOpts: { start?: number; end?: number } = {}
+    if (range) {
+      headers['Content-Range'] = `bytes ${range.start}-${range.end}/${fileStat.size}`
+      headers['Content-Length'] = range.end - range.start + 1
+      streamOpts.start = range.start
+      streamOpts.end = range.end
+      res.writeHead(206, headers)
+    } else {
+      headers['Content-Length'] = fileStat.size
+      res.writeHead(200, headers)
+    }
+    const stream = createReadStream(resolved, streamOpts)
+    stream.on('error', (err) => {
+      this.log.warn('terminal download stream failed', { path: resolved }, err)
+      if (!res.headersSent) {
+        this.sendError(res, 500, 'download failed')
+      } else {
+        res.destroy(err)
+      }
+    })
+    stream.pipe(res)
   }
 
   private handleHttpUpgrade(req: IncomingMessage, socket: Duplex, head: Buffer): void {
@@ -5849,6 +6233,13 @@ const MIME_MAP: Record<string, string> = {
   '.csv': 'text/csv; charset=utf-8',
   '.xml': 'application/xml',
   '.zip': 'application/zip',
+  '.tar': 'application/x-tar',
+  '.gz': 'application/gzip',
+  '.tgz': 'application/gzip',
+  '.bz2': 'application/x-bzip2',
+  '.xz': 'application/x-xz',
+  '.7z': 'application/x-7z-compressed',
+  '.rar': 'application/vnd.rar',
 }
 
 function mimeFor(p: string): string {
@@ -5885,11 +6276,76 @@ export function shouldServeInline(mime: string): boolean {
   return new Set(['application/pdf', 'text/plain', 'text/markdown', 'text/csv']).has(base)
 }
 
+export function sanitizeTerminalPathSegment(value: string): string {
+  const safe = value.replace(/[^a-zA-Z0-9._-]/g, '_').replace(/^\.+$/, '')
+  return safe.slice(0, 80) || 'default'
+}
+
+export function sanitizeTerminalFileName(value: string): string {
+  const normalized = value.replace(/\\/g, '/')
+  const base = basename(normalized)
+    .replace(/[^\p{L}\p{N} ._-]/gu, '_')
+    .trim()
+  if (!base || base === '.' || base === '..') return 'upload.bin'
+  return base.slice(0, 180)
+}
+
+export function resolveTerminalFilePathInput(
+  rawPath: string,
+  cwd: string,
+  homeDir: string,
+): string {
+  const trimmed = rawPath.trim()
+  if (!trimmed || trimmed === '.') return resolve(cwd)
+  if (trimmed === '~') return resolve(homeDir)
+  if (trimmed.startsWith('~/')) return resolve(homeDir, trimmed.slice(2))
+  if (trimmed.startsWith('/')) return resolve(trimmed)
+  return resolve(cwd, trimmed)
+}
+
+export function parseSingleRangeHeader(
+  value: string | string[] | undefined,
+  size: number,
+): HttpByteRange | null | 'invalid' {
+  const header = Array.isArray(value) ? value[0] : value
+  if (!header) return null
+  const match = /^bytes=(\d*)-(\d*)$/.exec(header.trim())
+  if (!match) return 'invalid'
+  if (!Number.isFinite(size) || size < 0) return 'invalid'
+  const [, startRaw, endRaw] = match
+  if (!startRaw && !endRaw) return 'invalid'
+  let start: number
+  let end: number
+  if (!startRaw) {
+    const suffix = Number(endRaw)
+    if (!Number.isFinite(suffix) || suffix <= 0) return 'invalid'
+    start = Math.max(0, size - suffix)
+    end = size - 1
+  } else {
+    start = Number(startRaw)
+    end = endRaw ? Number(endRaw) : size - 1
+    if (!Number.isFinite(start) || !Number.isFinite(end)) return 'invalid'
+  }
+  if (start < 0 || end < start || start >= size) return 'invalid'
+  return { start, end: Math.min(end, size - 1) }
+}
+
+export function terminalContentDisposition(
+  mode: 'inline' | 'attachment',
+  filename: string,
+): string {
+  const safeFallback = (filename || 'file').replace(/[^\x20-\x7E]/g, '_').replace(/["\\]/g, '_')
+  return `${mode}; filename="${safeFallback || 'file'}"; filename*=UTF-8''${encodeURIComponent(filename || 'file')}`
+}
+
 /** Known route prefixes for metrics normalization (avoids high-cardinality labels). */
 const KNOWN_ROUTES = [
   '/api/healthz',
   '/api/doctor',
   '/api/claude-terminal/terminate',
+  '/api/claude-terminal/upload',
+  '/api/claude-terminal/list',
+  '/api/claude-terminal/download',
   '/api/usage',
   '/api/usage/events',
   '/api/runs',
