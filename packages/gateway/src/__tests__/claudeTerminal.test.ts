@@ -191,6 +191,7 @@ describe('ClaudeTerminalManager lifecycle', () => {
     const ws = new FakeWs()
     manager.handleConnection(asWs(ws), 'user-a')
     assert.equal(manager.activeCount(), 1)
+    assert.equal(manager.workingDirectory('user-a'), '/tmp')
     assert.equal(messages(ws).at(-1)?.type, 'status')
 
     ptys[0]!.emitData('hello')
@@ -209,6 +210,7 @@ describe('ClaudeTerminalManager lifecycle', () => {
     assert.equal(manager.terminate('user-a'), true)
     assert.equal(manager.activeCount(), 0)
     assert.equal(ptys[0]!.kills.length, 1)
+    assert.equal(manager.workingDirectory('user-a'), '/tmp')
     assert.equal(manager.terminate('user-a'), false)
   })
 
