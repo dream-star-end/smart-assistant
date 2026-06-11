@@ -1,11 +1,11 @@
 // OpenClaude Service Worker
 // App-shell caching only. Never intercept /ws, /api/*, or external CDN requests.
-const VERSION = 'openclaude-v68'
+const VERSION = 'openclaude-v69'
 const SHELL = [
   '/',
   '/index.html',
   '/style.css',
-  '/style.css?v=43', // versioned URL used in index.html
+  '/style.css?v=44', // versioned URL used in index.html
   '/manifest.json',
   '/icon.svg',
   // ES modules
