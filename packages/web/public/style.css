@@ -5169,6 +5169,21 @@ body.voice-overlay-open {
     padding: var(--space-2);
     border-radius: var(--radius-lg);
   }
+  .claude-terminal-scroll-capture {
+    display: block;
+    position: absolute;
+    inset: 0;
+    z-index: 1;
+    background: transparent;
+    cursor: grab;
+    overscroll-behavior: contain;
+    touch-action: none;
+    -webkit-user-select: none;
+    user-select: none;
+  }
+  .claude-terminal-scroll-capture:active {
+    cursor: grabbing;
+  }
   .claude-terminal-new-output {
     bottom: var(--space-2);
     min-height: 40px;
@@ -5206,21 +5221,9 @@ body.voice-overlay-open {
     padding-inline: 12px;
   }
 }
-@media (max-width: 860px) and (pointer: coarse) {
+@media (max-width: 860px) and (hover: hover) and (pointer: fine) {
   .claude-terminal-scroll-capture {
-    display: block;
-    position: absolute;
-    inset: 0;
-    z-index: 1;
-    background: transparent;
-    cursor: grab;
-    overscroll-behavior: contain;
-    touch-action: none;
-    -webkit-user-select: none;
-    user-select: none;
-  }
-  .claude-terminal-scroll-capture:active {
-    cursor: grabbing;
+    display: none;
   }
 }
 

@@ -16,7 +16,7 @@
 <link rel="apple-touch-icon" href="/icon.svg" />
 <link rel="stylesheet" href="/vendor/github-dark.min.css" />
 <link rel="stylesheet" href="/vendor/katex/katex.min.css" />
-<link rel="stylesheet" href="/style.css?v=48" />
+<link rel="stylesheet" href="/style.css?v=49" />
 <link rel="stylesheet" href="/vendor/xterm/xterm.css?v=1" />
 <style>/* Inline styles removed — see style.css */
 </style>
@@ -848,21 +848,12 @@
           <button id="claude-terminal-mobile-send-btn" class="btn btn-primary" type="button">发送</button>
           <button id="claude-terminal-mobile-focus-btn" class="btn btn-ghost" type="button">键盘</button>
         </div>
-        <div class="claude-terminal-mobile-tools" aria-label="移动端输入辅助">
-          <button id="claude-terminal-history-prev-btn" type="button" tabindex="-1" disabled>上一条</button>
-          <button id="claude-terminal-history-next-btn" type="button" tabindex="-1" disabled>下一条</button>
-          <button id="claude-terminal-wake-lock-btn" type="button" tabindex="-1" hidden>亮屏</button>
-        </div>
         <div class="claude-terminal-mobile-keys" aria-label="终端快捷键">
-          <button type="button" tabindex="-1" data-claude-terminal-action="page-up">Pg↑</button>
-          <button type="button" tabindex="-1" data-claude-terminal-action="page-down">Pg↓</button>
           <button type="button" tabindex="-1" data-claude-terminal-action="bottom">底部</button>
           <button type="button" tabindex="-1" data-claude-terminal-key="enter">Enter</button>
           <button type="button" tabindex="-1" data-claude-terminal-key="tab">Tab</button>
           <button type="button" tabindex="-1" data-claude-terminal-key="ctrl-c">Ctrl-C</button>
           <button type="button" tabindex="-1" data-claude-terminal-key="esc">Esc</button>
-          <button type="button" tabindex="-1" data-claude-terminal-key="up">↑</button>
-          <button type="button" tabindex="-1" data-claude-terminal-key="down">↓</button>
         </div>
       </div>
     </div>
@@ -899,7 +890,7 @@
 <!-- Force SW cache refresh (one-time, remove after all clients updated) -->
 <script>
 (function(){
-  var V='sw-flush-v18';
+  var V='sw-flush-v19';
   if(localStorage.getItem(V))return;
   if('serviceWorker' in navigator){
     navigator.serviceWorker.getRegistrations().then(function(regs){
@@ -921,6 +912,6 @@
 <script src="/vendor/katex/katex.min.js" defer></script>
 <script src="/vendor/qrcode.min.js"></script>
 <div id="toast" class="toast"></div>
-<script type="module" src="/modules/main.js?v=56"></script>
+<script type="module" src="/modules/main.js?v=57"></script>
 </body>
 </html>
