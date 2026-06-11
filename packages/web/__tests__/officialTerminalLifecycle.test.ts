@@ -112,13 +112,13 @@ describe('official Claude terminal lifecycle', () => {
     assert.match(quickKeySrc, /button\?\.blur\?\.\(\)/)
   })
 
-  it('mobile scroll buttons use xterm scrollback actions instead of textarea focus', () => {
+  it('mobile bottom button uses xterm scrollback action instead of textarea focus', () => {
     const scrollSrc = extractFunction(SRC, 'scrollTerminal')
     const controlSrc = extractFunction(SRC, 'runMobileControl')
 
-    assert.match(INDEX, /data-claude-terminal-action="page-up"/)
-    assert.match(INDEX, /data-claude-terminal-action="page-down"/)
     assert.match(INDEX, /data-claude-terminal-action="bottom"/)
+    assert.doesNotMatch(INDEX, /data-claude-terminal-action="page-up"/)
+    assert.doesNotMatch(INDEX, /data-claude-terminal-action="page-down"/)
     assert.match(scrollSrc, /terminal\.scrollPages\(-1\)/)
     assert.match(scrollSrc, /terminal\.scrollPages\(1\)/)
     assert.match(scrollSrc, /scrollTerminalToBottom\(\)/)
@@ -126,39 +126,45 @@ describe('official Claude terminal lifecycle', () => {
     assert.doesNotMatch(controlSrc, /focusMobileInput/)
   })
 
-  it('mobile composer keeps reusable command history separate from terminal arrow keys', () => {
+  it('mobile composer stores command history without exposing extra history buttons', () => {
     const rememberSrc = extractFunction(SRC, 'rememberMobileCommand')
     const loadSrc = extractFunction(SRC, 'loadMobileCommandHistory')
-    const prevSrc = extractFunction(SRC, 'showPreviousMobileCommand')
-    const nextSrc = extractFunction(SRC, 'showNextMobileCommand')
 
-    assert.match(INDEX, /claude-terminal-history-prev-btn/)
-    assert.match(INDEX, /claude-terminal-history-next-btn/)
+    assert.doesNotMatch(INDEX, /claude-terminal-history-prev-btn/)
+    assert.doesNotMatch(INDEX, /claude-terminal-history-next-btn/)
     assert.match(loadSrc, /MOBILE_COMMAND_HISTORY_KEY/)
     assert.match(rememberSrc, /MAX_MOBILE_COMMAND_HISTORY/)
-    assert.match(prevSrc, /setMobileCommandText/)
-    assert.match(nextSrc, /mobileCommandHistoryDraft/)
-    assert.doesNotMatch(prevSrc, /sendTerminalInput/)
-    assert.doesNotMatch(nextSrc, /sendTerminalInput/)
   })
 
-  it('cache-busts terminal module when adding mobile controls', () => {
-    assert.match(INDEX, /claude-terminal-history-prev-btn" type="button" tabindex="-1" disabled/)
-    assert.match(INDEX, /claude-terminal-history-next-btn" type="button" tabindex="-1" disabled/)
-    assert.match(MAIN, /from '\.\/officialTerminal\.js\?v=4'/)
-    assert.match(SW, /\/modules\/officialTerminal\.js\?v=4/)
-    assert.match(INDEX, /\/modules\/main\.js\?v=56/)
-    assert.match(INDEX, /\/style\.css\?v=48/)
-    assert.match(INDEX, /sw-flush-v18/)
-    assert.match(SW, /openclaude-v76/)
+  it('mobile quick controls are reduced to the essential set', () => {
+    assert.match(INDEX, /claude-terminal-mobile-input/)
+    assert.match(INDEX, /claude-terminal-mobile-send-btn/)
+    assert.match(INDEX, /claude-terminal-mobile-focus-btn/)
+    assert.match(INDEX, /data-claude-terminal-action="bottom"/)
+    assert.match(INDEX, /data-claude-terminal-key="enter"/)
+    assert.match(INDEX, /data-claude-terminal-key="tab"/)
+    assert.match(INDEX, /data-claude-terminal-key="ctrl-c"/)
+    assert.match(INDEX, /data-claude-terminal-key="esc"/)
+    assert.doesNotMatch(INDEX, /data-claude-terminal-key="up"/)
+    assert.doesNotMatch(INDEX, /data-claude-terminal-key="down"/)
+    assert.doesNotMatch(INDEX, /claude-terminal-wake-lock-btn/)
   })
 
-  it('mobile wake lock is optional and gated by modal visibility', () => {
+  it('cache-busts terminal module when changing mobile controls', () => {
+    assert.match(MAIN, /from '\.\/officialTerminal\.js\?v=5'/)
+    assert.match(SW, /\/modules\/officialTerminal\.js\?v=5/)
+    assert.match(INDEX, /\/modules\/main\.js\?v=57/)
+    assert.match(INDEX, /\/style\.css\?v=49/)
+    assert.match(INDEX, /sw-flush-v19/)
+    assert.match(SW, /openclaude-v77/)
+  })
+
+  it('wake lock helper remains gated even though the mobile shortcut is hidden', () => {
     const requestSrc = extractFunction(SRC, 'requestWakeLock')
     const releaseSrc = extractFunction(SRC, 'releaseWakeLock')
     const initSrc = extractFunction(SRC, 'initOfficialClaudeTerminal')
 
-    assert.match(INDEX, /claude-terminal-wake-lock-btn/)
+    assert.doesNotMatch(INDEX, /claude-terminal-wake-lock-btn/)
     assert.match(requestSrc, /navigator\.wakeLock\.request\('screen'\)/)
     assert.match(requestSrc, /!isModalOpen\(\)/)
     assert.match(requestSrc, /!terminal/)
@@ -182,10 +188,14 @@ describe('official Claude terminal lifecycle', () => {
     const bindCaptureSrc = extractFunction(SRC, 'bindTerminalScrollCapture')
     const cleanupCaptureSrc = extractFunction(SRC, 'cleanupTerminalScrollCapture')
     const pointerMoveSrc = extractFunction(SRC, 'handleScrollCapturePointerMove')
+    const fallbackSrc = extractFunction(SRC, 'fallbackScrollTerminalViewport')
 
     assert.match(moveSrc, /terminal\.scrollLines\(lines\)/)
+    assert.match(moveSrc, /terminalViewportY\(\)/)
+    assert.match(moveSrc, /fallbackScrollTerminalViewport\(lines, lineHeight\)/)
     assert.match(moveSrc, /terminalTouchScrollRemainder/)
     assert.match(moveSrc, /event\?\.cancelable/)
+    assert.match(fallbackSrc, /viewport\.scrollTop = next/)
     assert.match(bindTouchSrc, /'touchmove'/)
     assert.match(bindTouchSrc, /passive:\s*false/)
     assert.match(cleanupTouchSrc, /removeEventListener\('touchmove'/)
@@ -209,7 +219,11 @@ describe('official Claude terminal lifecycle', () => {
     assert.match(STYLE, /\.claude-terminal-scroll-capture\s*{\s*display:\s*none;/)
     assert.match(
       STYLE,
-      /@media \(max-width: 860px\) and \(pointer: coarse\) {[\s\S]*?\.claude-terminal-scroll-capture\s*{[\s\S]*?display:\s*block;[\s\S]*?z-index:\s*1;[\s\S]*?overscroll-behavior:\s*contain;[\s\S]*?touch-action:\s*none;/,
+      /@media \(max-width: 860px\) {[\s\S]*?\.claude-terminal-scroll-capture\s*{[\s\S]*?display:\s*block;[\s\S]*?z-index:\s*1;[\s\S]*?overscroll-behavior:\s*contain;[\s\S]*?touch-action:\s*none;/,
+    )
+    assert.match(
+      STYLE,
+      /@media \(max-width: 860px\) and \(hover: hover\) and \(pointer: fine\) {[\s\S]*?\.claude-terminal-scroll-capture\s*{[\s\S]*?display:\s*none;/,
     )
     assert.match(STYLE, /\.claude-terminal-new-output\s*{[\s\S]*?z-index:\s*3;/)
   })

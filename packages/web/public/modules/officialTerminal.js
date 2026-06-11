@@ -817,12 +817,32 @@ function writeTerminalOutput(data) {
   }
 }
 
+function terminalViewportElement() {
+  return $(CONTAINER_ID)?.querySelector?.('.xterm-viewport') || null
+}
+
 function terminalLineHeight() {
-  const viewport = $(CONTAINER_ID)?.querySelector?.('.xterm-viewport')
+  const viewport = terminalViewportElement()
   if (viewport?.clientHeight && terminal?.rows) {
     return Math.max(8, viewport.clientHeight / terminal.rows)
   }
   return 16
+}
+
+function terminalViewportY() {
+  const buffer = activeTerminalBuffer()
+  return Number.isFinite(buffer?.viewportY) ? buffer.viewportY : null
+}
+
+function fallbackScrollTerminalViewport(lines, lineHeight) {
+  const viewport = terminalViewportElement()
+  if (!viewport || !Number.isFinite(lines) || lines === 0) return false
+  const before = viewport.scrollTop
+  const max = Math.max(0, viewport.scrollHeight - viewport.clientHeight)
+  const next = Math.max(0, Math.min(max, before + lines * lineHeight))
+  if (next === before) return false
+  viewport.scrollTop = next
+  return true
 }
 
 function resetTerminalTouchScroll() {
@@ -844,15 +864,21 @@ function beginTerminalTouchScroll(clientY) {
 
 function moveTerminalTouchScroll(clientY, event = null) {
   if (terminalTouchScrollY == null || !terminal || !Number.isFinite(clientY)) return false
+  if (event?.cancelable) event.preventDefault()
+  event?.stopPropagation?.()
+
   const currentY = clientY
   const rawDelta = terminalTouchScrollY - currentY + terminalTouchScrollRemainder
   const lineHeight = terminalLineHeight()
   const lines = rawDelta > 0 ? Math.floor(rawDelta / lineHeight) : Math.ceil(rawDelta / lineHeight)
-  if (lines === 0) return false
+  if (lines === 0) return true
 
-  if (event?.cancelable) event.preventDefault()
-  event?.stopPropagation?.()
+  const beforeViewportY = terminalViewportY()
   terminal.scrollLines(lines)
+  const afterViewportY = terminalViewportY()
+  if (beforeViewportY == null || afterViewportY == null || beforeViewportY === afterViewportY) {
+    fallbackScrollTerminalViewport(lines, lineHeight)
+  }
   terminalTouchScrollY = currentY
   terminalTouchScrollRemainder = rawDelta - lines * lineHeight
   updateNewOutputButton()
