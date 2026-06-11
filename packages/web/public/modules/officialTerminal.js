@@ -9,8 +9,19 @@ const CONTAINER_ID = 'claude-terminal-container'
 const STATUS_ID = 'claude-terminal-status'
 const KILL_BTN_ID = 'claude-terminal-kill-btn'
 const RECONNECT_BTN_ID = 'claude-terminal-reconnect-btn'
+const MOBILE_INPUT_ID = 'claude-terminal-mobile-input'
+const MOBILE_SEND_BTN_ID = 'claude-terminal-mobile-send-btn'
+const MOBILE_FOCUS_BTN_ID = 'claude-terminal-mobile-focus-btn'
 const CLOSE_SELECTOR = '[data-claude-terminal-close]'
 const MAX_TERMINAL_INPUT_BYTES = 32 * 1024
+const QUICK_KEYS = {
+  enter: '\r',
+  tab: '\t',
+  'ctrl-c': '\x03',
+  esc: '\x1b',
+  up: '\x1b[A',
+  down: '\x1b[B',
+}
 
 let TerminalCtor = null
 let FitAddonCtor = null
@@ -91,12 +102,7 @@ function createTerminal() {
   fitAddon = new FitAddonCtor()
   terminal.loadAddon(fitAddon)
   terminal.onData((data) => {
-    if (!socket || socket.readyState !== WebSocket.OPEN) return
-    if (byteLength(data) > MAX_TERMINAL_INPUT_BYTES) {
-      toast('终端输入过大，已拦截', 'error')
-      return
-    }
-    send({ type: 'input', data })
+    sendTerminalInput(data, false)
   })
   terminal.onResize(({ cols, rows }) => send({ type: 'resize', cols, rows }))
 }
@@ -138,6 +144,51 @@ function fitTerminal() {
 function send(payload) {
   if (!socket || socket.readyState !== WebSocket.OPEN) return
   socket.send(JSON.stringify(payload))
+}
+
+function sendTerminalInput(data, notifyDisconnected = true) {
+  if (!socket || socket.readyState !== WebSocket.OPEN) {
+    if (notifyDisconnected) toast('终端尚未连接', 'error')
+    return false
+  }
+  if (byteLength(data) > MAX_TERMINAL_INPUT_BYTES) {
+    toast('终端输入过大，已拦截', 'error')
+    return false
+  }
+  send({ type: 'input', data })
+  return true
+}
+
+function normalizedMobileCommand(text) {
+  const normalized = text.replace(/\r?\n/g, '\r')
+  return normalized.endsWith('\r') ? normalized : `${normalized}\r`
+}
+
+function focusMobileInput() {
+  const input = $(MOBILE_INPUT_ID)
+  input?.focus()
+}
+
+function sendMobileCommand() {
+  const input = $(MOBILE_INPUT_ID)
+  if (!input) return
+  const text = input.value
+  if (!text.trim()) {
+    focusMobileInput()
+    return
+  }
+  if (sendTerminalInput(normalizedMobileCommand(text))) {
+    input.value = ''
+    input.style.height = ''
+  }
+  focusMobileInput()
+}
+
+function autoGrowMobileInput() {
+  const input = $(MOBILE_INPUT_ID)
+  if (!input) return
+  input.style.height = 'auto'
+  input.style.height = `${Math.min(input.scrollHeight, 120)}px`
 }
 
 async function readMessageData(data) {
@@ -264,6 +315,14 @@ export function initOfficialClaudeTerminal() {
     setStatus('closed', '已发送终止信号')
   })
   $(RECONNECT_BTN_ID)?.addEventListener('click', () => reconnectTerminal())
+  $(MOBILE_SEND_BTN_ID)?.addEventListener('click', () => sendMobileCommand())
+  $(MOBILE_FOCUS_BTN_ID)?.addEventListener('click', () => focusMobileInput())
+  $(MOBILE_INPUT_ID)?.addEventListener('input', () => autoGrowMobileInput())
+  $(MOBILE_INPUT_ID)?.addEventListener('keydown', (event) => {
+    if (event.key !== 'Enter' || event.shiftKey || event.isComposing) return
+    event.preventDefault()
+    sendMobileCommand()
+  })
   window.addEventListener('resize', () => fitTerminal())
 
   document.addEventListener(
@@ -276,6 +335,14 @@ export function initOfficialClaudeTerminal() {
         event.preventDefault()
         event.stopPropagation()
         closeOfficialClaudeTerminal()
+        return
+      }
+      const key = target?.closest?.('[data-claude-terminal-key]')?.dataset.claudeTerminalKey
+      if (key && QUICK_KEYS[key]) {
+        event.preventDefault()
+        event.stopPropagation()
+        sendTerminalInput(QUICK_KEYS[key])
+        focusMobileInput()
       }
     },
     true,
