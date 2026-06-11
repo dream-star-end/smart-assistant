@@ -61,6 +61,9 @@ interface EgressNodeInternal extends EgressNodePublic {
   wsHost?: string
   path?: string
   fingerprint?: string
+  flow?: string
+  realityPublicKey?: string
+  realityShortId?: string
 }
 
 export interface EgressHealth {
@@ -220,6 +223,12 @@ export function redactEgressError(err: unknown): string {
 function redactSecrets(msg: string): string {
   return msg
     .replace(/vless:\/\/\S+/gi, '[redacted-node-uri]')
+    .replace(/([?&](?:pbk|sid|sni)=)[^&\s)]+/gi, '$1[redacted]')
+    .replace(
+      /("?(?:public_key|short_id|server_name|sni)"?\s*[:=]\s*")([^"]+)(")/gi,
+      '$1[redacted]$3',
+    )
+    .replace(/((?:public_key|short_id|server_name|sni)\s*[:=]\s*)([^\s,}]+)/gi, '$1[redacted]')
     .replace(/https?:\/\/[^\s)]+/gi, '[redacted-url]')
     .replace(
       /\b[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\b/gi,
@@ -269,8 +278,9 @@ function parseNode(uri: string, idx: number): EgressNodeInternal {
   const name = decodeURIComponent(parsed.hash ? parsed.hash.slice(1) : `节点 ${idx}`)
   const server = parsed.hostname || undefined
   const port = parsed.port ? Number(parsed.port) : undefined
-  const transport = one(parsed.searchParams, 'type') || undefined
+  const rawTransport = one(parsed.searchParams, 'type') || undefined
   const security = one(parsed.searchParams, 'security') || undefined
+  const transport = rawTransport || (security === 'reality' ? 'tcp' : undefined)
   const node: EgressNodeInternal = {
     idx,
     uri,
@@ -290,6 +300,27 @@ function parseNode(uri: string, idx: number): EgressNodeInternal {
   const uuid = decodeURIComponent(parsed.username || '')
   if (!uuid || !server) {
     node.error = 'missing uuid or server'
+    return node
+  }
+  if (security === 'reality') {
+    if (transport !== 'tcp') {
+      node.error = `unsupported transport/security: ${transport || '-'}+${security}`
+      return node
+    }
+    const sni = one(parsed.searchParams, 'sni')
+    const realityPublicKey = one(parsed.searchParams, 'pbk')
+    if (!sni || !realityPublicKey) {
+      node.error = 'missing reality sni or public key'
+      return node
+    }
+    node.supported = true
+    node.uuid = uuid
+    node.port = port || 443
+    node.sni = sni
+    node.fingerprint = one(parsed.searchParams, 'fp') || 'chrome'
+    node.flow = one(parsed.searchParams, 'flow') || undefined
+    node.realityPublicKey = realityPublicKey
+    node.realityShortId = one(parsed.searchParams, 'sid') || undefined
     return node
   }
   if (transport !== 'ws' || security !== 'tls') {
@@ -343,41 +374,53 @@ export function buildSingBoxConfig(
   port = DEFAULT_PORT,
 ): { config: any; meta: EgressMeta } {
   const internal = node as EgressNodeInternal
-  if (
-    !internal.supported ||
-    !internal.uuid ||
-    !internal.server ||
-    !internal.sni ||
-    !internal.wsHost
-  ) {
+  const isWsTls = internal.transport === 'ws' && internal.security === 'tls'
+  const isTcpReality = internal.transport === 'tcp' && internal.security === 'reality'
+  if (!internal.supported || !internal.uuid || !internal.server || !internal.sni) {
     throw new EgressHttpError(400, `node #${internal.idx} is not supported`)
+  }
+  if (isWsTls && !internal.wsHost) {
+    throw new EgressHttpError(400, `node #${internal.idx} is not supported`)
+  }
+  if (isTcpReality && !internal.realityPublicKey) {
+    throw new EgressHttpError(400, `node #${internal.idx} is not supported`)
+  }
+  if (!isWsTls && !isTcpReality) {
+    throw new EgressHttpError(400, `node #${internal.idx} is not supported`)
+  }
+  const outbound: Record<string, any> = {
+    type: 'vless',
+    tag: 'proxy',
+    server: internal.server,
+    server_port: internal.port || 443,
+    uuid: internal.uuid,
+    tls: {
+      enabled: true,
+      server_name: internal.sni,
+      utls: {
+        enabled: true,
+        fingerprint: internal.fingerprint || 'chrome',
+      },
+    },
+  }
+  if (internal.flow) outbound.flow = internal.flow
+  if (isWsTls) {
+    outbound.transport = {
+      type: 'ws',
+      path: internal.path || '/',
+      headers: { Host: internal.wsHost },
+    }
+  } else {
+    outbound.tls.reality = {
+      enabled: true,
+      public_key: internal.realityPublicKey,
+    }
+    if (internal.realityShortId) outbound.tls.reality.short_id = internal.realityShortId
   }
   const cfg = {
     log: { level: 'warn', timestamp: true },
     inbounds: [{ type: 'mixed', tag: 'mixed-in', listen, listen_port: port }],
-    outbounds: [
-      {
-        type: 'vless',
-        tag: 'proxy',
-        server: internal.server,
-        server_port: internal.port || 443,
-        uuid: internal.uuid,
-        tls: {
-          enabled: true,
-          server_name: internal.sni,
-          utls: {
-            enabled: true,
-            fingerprint: internal.fingerprint || 'chrome',
-          },
-        },
-        transport: {
-          type: 'ws',
-          path: internal.path || '/',
-          headers: { Host: internal.wsHost },
-        },
-      },
-      { type: 'direct', tag: 'direct' },
-    ],
+    outbounds: [outbound, { type: 'direct', tag: 'direct' }],
     route: { final: 'proxy' },
   }
   const meta: EgressMeta = {
@@ -385,9 +428,11 @@ export function buildSingBoxConfig(
     name: internal.name,
     server: `${internal.server}:${internal.port || 443}`,
     sni: internal.sni,
-    ws_host: internal.wsHost,
-    path: internal.path || '/',
     updated_at: nowIso(),
+  }
+  if (isWsTls) {
+    meta.ws_host = internal.wsHost
+    meta.path = internal.path || '/'
   }
   return { config: cfg, meta }
 }
