@@ -7,6 +7,7 @@ import { closeModal, openModal, toast } from './ui.js'
 
 const MODAL_ID = 'claude-terminal-modal'
 const CONTAINER_ID = 'claude-terminal-container'
+const SCROLL_CAPTURE_ID = 'claude-terminal-scroll-capture'
 const STATUS_ID = 'claude-terminal-status'
 const KILL_BTN_ID = 'claude-terminal-kill-btn'
 const RECONNECT_BTN_ID = 'claude-terminal-reconnect-btn'
@@ -44,6 +45,9 @@ let lastMobileControlPointerAt = 0
 let terminalTouchScrollY = null
 let terminalTouchScrollRemainder = 0
 let terminalTouchScrollTargets = []
+let terminalScrollCaptureCleanup = null
+let terminalScrollPointerId = null
+let terminalScrollPointerTarget = null
 let terminateInFlight = false
 let lastReconnectAttemptAt = 0
 let mobileCommandHistory = []
@@ -150,6 +154,7 @@ function attachTerminal() {
   container.innerHTML = ''
   terminal.open(container)
   bindTerminalTouchScrollTargets()
+  bindTerminalScrollCapture()
   fitTerminal()
   focusTerminalIfDesktop()
   resizeObserver = new ResizeObserver(() => fitTerminal())
@@ -159,6 +164,7 @@ function attachTerminal() {
 function disposeTerminal() {
   releaseWakeLock()
   hideNewOutputButton()
+  cleanupTerminalScrollCapture()
   cleanupTerminalTouchScrollTargets()
   if (terminalScrollDisposable) {
     try {
@@ -291,32 +297,154 @@ function terminalLineHeight() {
 function resetTerminalTouchScroll() {
   terminalTouchScrollY = null
   terminalTouchScrollRemainder = 0
+  terminalScrollPointerId = null
+  terminalScrollPointerTarget = null
 }
 
-function handleTerminalTouchStart(event) {
-  if (!terminal || event.touches.length !== 1) {
+function beginTerminalTouchScroll(clientY) {
+  if (!terminal || !Number.isFinite(clientY)) {
     resetTerminalTouchScroll()
-    return
+    return false
   }
-  terminalTouchScrollY = event.touches[0].clientY
+  terminalTouchScrollY = clientY
   terminalTouchScrollRemainder = 0
+  return true
 }
 
-function handleTerminalTouchMove(event) {
-  if (terminalTouchScrollY == null || !terminal || event.touches.length !== 1) return
-
-  const currentY = event.touches[0].clientY
+function moveTerminalTouchScroll(clientY, event = null) {
+  if (terminalTouchScrollY == null || !terminal || !Number.isFinite(clientY)) return false
+  const currentY = clientY
   const rawDelta = terminalTouchScrollY - currentY + terminalTouchScrollRemainder
   const lineHeight = terminalLineHeight()
   const lines = rawDelta > 0 ? Math.floor(rawDelta / lineHeight) : Math.ceil(rawDelta / lineHeight)
-  if (lines === 0) return
+  if (lines === 0) return false
 
-  if (event.cancelable) event.preventDefault()
-  event.stopPropagation()
+  if (event?.cancelable) event.preventDefault()
+  event?.stopPropagation?.()
   terminal.scrollLines(lines)
   terminalTouchScrollY = currentY
   terminalTouchScrollRemainder = rawDelta - lines * lineHeight
   updateNewOutputButton()
+  return true
+}
+
+function endTerminalTouchScroll() {
+  if (terminalScrollPointerTarget && terminalScrollPointerId != null) {
+    try {
+      terminalScrollPointerTarget.releasePointerCapture?.(terminalScrollPointerId)
+    } catch {}
+  }
+  resetTerminalTouchScroll()
+}
+
+function handleTerminalTouchStart(event) {
+  if (event.touches.length !== 1) {
+    resetTerminalTouchScroll()
+    return
+  }
+  beginTerminalTouchScroll(event.touches[0].clientY)
+}
+
+function handleTerminalTouchMove(event) {
+  if (event.touches.length !== 1) return
+  moveTerminalTouchScroll(event.touches[0].clientY, event)
+}
+
+function isTerminalScrollPointer(event) {
+  return event.pointerType === 'touch' || event.pointerType === 'pen'
+}
+
+function handleScrollCapturePointerDown(event) {
+  if (!isTerminalScrollPointer(event)) return
+  if (!beginTerminalTouchScroll(event.clientY)) return
+  terminalScrollPointerId = event.pointerId
+  terminalScrollPointerTarget = event.currentTarget
+  try {
+    event.currentTarget?.setPointerCapture?.(event.pointerId)
+  } catch {}
+  if (event.cancelable) event.preventDefault()
+  event.stopPropagation()
+}
+
+function handleScrollCapturePointerMove(event) {
+  if (terminalScrollPointerId !== event.pointerId || !isTerminalScrollPointer(event)) return
+  moveTerminalTouchScroll(event.clientY, event)
+}
+
+function handleScrollCapturePointerEnd(event) {
+  if (terminalScrollPointerId != null && event.pointerId !== terminalScrollPointerId) return
+  if (event?.cancelable) event.preventDefault()
+  event?.stopPropagation?.()
+  endTerminalTouchScroll()
+}
+
+function handleScrollCaptureLostPointer(event) {
+  if (terminalScrollPointerId != null && event.pointerId !== terminalScrollPointerId) return
+  resetTerminalTouchScroll()
+}
+
+function handleScrollCaptureTouchStart(event) {
+  if (event.touches.length !== 1) {
+    resetTerminalTouchScroll()
+    return
+  }
+  if (!beginTerminalTouchScroll(event.touches[0].clientY)) return
+  if (event.cancelable) event.preventDefault()
+  event.stopPropagation()
+}
+
+function handleScrollCaptureTouchMove(event) {
+  if (event.touches.length !== 1) return
+  moveTerminalTouchScroll(event.touches[0].clientY, event)
+}
+
+function handleScrollCaptureTouchEnd(event) {
+  if (event?.cancelable) event.preventDefault()
+  event?.stopPropagation?.()
+  endTerminalTouchScroll()
+}
+
+function cleanupTerminalScrollCapture() {
+  endTerminalTouchScroll()
+  if (!terminalScrollCaptureCleanup) return
+  try {
+    terminalScrollCaptureCleanup()
+  } catch {}
+  terminalScrollCaptureCleanup = null
+}
+
+function bindTerminalScrollCapture() {
+  cleanupTerminalScrollCapture()
+  const overlay = $(SCROLL_CAPTURE_ID)
+  if (!overlay) return
+
+  const cleanup = []
+  const add = (target, type, handler, options) => {
+    target.addEventListener(type, handler, options)
+    cleanup.push(() => target.removeEventListener(type, handler, options))
+  }
+
+  if (window.PointerEvent) {
+    add(overlay, 'pointerdown', handleScrollCapturePointerDown, { passive: false })
+    add(overlay, 'pointermove', handleScrollCapturePointerMove, { passive: false })
+    add(overlay, 'pointerup', handleScrollCapturePointerEnd, { passive: false })
+    add(overlay, 'pointercancel', handleScrollCapturePointerEnd, { passive: false })
+    add(overlay, 'lostpointercapture', handleScrollCaptureLostPointer)
+  } else {
+    add(overlay, 'touchstart', handleScrollCaptureTouchStart, { passive: false })
+    add(overlay, 'touchmove', handleScrollCaptureTouchMove, { passive: false })
+    add(overlay, 'touchend', handleScrollCaptureTouchEnd, { passive: false })
+    add(overlay, 'touchcancel', handleScrollCaptureTouchEnd, { passive: false })
+  }
+  add(window, 'blur', endTerminalTouchScroll)
+
+  terminalScrollCaptureCleanup = () => {
+    for (const dispose of cleanup) {
+      try {
+        dispose()
+      } catch {}
+    }
+  }
 }
 
 function terminalTouchScrollTargetElements() {
@@ -334,11 +462,11 @@ function cleanupTerminalTouchScrollTargets() {
   for (const target of terminalTouchScrollTargets) {
     target.removeEventListener('touchstart', handleTerminalTouchStart, true)
     target.removeEventListener('touchmove', handleTerminalTouchMove, true)
-    target.removeEventListener('touchend', resetTerminalTouchScroll, true)
-    target.removeEventListener('touchcancel', resetTerminalTouchScroll, true)
+    target.removeEventListener('touchend', endTerminalTouchScroll, true)
+    target.removeEventListener('touchcancel', endTerminalTouchScroll, true)
   }
   terminalTouchScrollTargets = []
-  resetTerminalTouchScroll()
+  endTerminalTouchScroll()
 }
 
 function bindTerminalTouchScrollTargets() {
@@ -353,11 +481,11 @@ function bindTerminalTouchScrollTargets() {
       capture: true,
       passive: false,
     })
-    target.addEventListener('touchend', resetTerminalTouchScroll, {
+    target.addEventListener('touchend', endTerminalTouchScroll, {
       capture: true,
       passive: true,
     })
-    target.addEventListener('touchcancel', resetTerminalTouchScroll, {
+    target.addEventListener('touchcancel', endTerminalTouchScroll, {
       capture: true,
       passive: true,
     })
