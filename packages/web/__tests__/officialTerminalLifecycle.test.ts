@@ -8,6 +8,7 @@ const SRC = readFileSync(
   'utf-8',
 )
 const STYLE = readFileSync(resolve(import.meta.dirname, '..', 'public', 'style.css'), 'utf-8')
+const INDEX = readFileSync(resolve(import.meta.dirname, '..', 'public', 'index.html'), 'utf-8')
 
 function extractFunction(source: string, name: string): string {
   const lines = source.split('\n')
@@ -50,6 +51,20 @@ describe('official Claude terminal lifecycle', () => {
     assert.match(quickKeySrc, /button\?\.blur\?\.\(\)/)
   })
 
+  it('mobile scroll buttons use xterm scrollback actions instead of textarea focus', () => {
+    const scrollSrc = extractFunction(SRC, 'scrollTerminal')
+    const controlSrc = extractFunction(SRC, 'runMobileControl')
+
+    assert.match(INDEX, /data-claude-terminal-action="page-up"/)
+    assert.match(INDEX, /data-claude-terminal-action="page-down"/)
+    assert.match(INDEX, /data-claude-terminal-action="bottom"/)
+    assert.match(scrollSrc, /terminal\.scrollPages\(-1\)/)
+    assert.match(scrollSrc, /terminal\.scrollPages\(1\)/)
+    assert.match(scrollSrc, /terminal\.scrollToBottom\(\)/)
+    assert.match(controlSrc, /scrollTerminal\(button\.dataset\.claudeTerminalAction\)/)
+    assert.doesNotMatch(controlSrc, /focusMobileInput/)
+  })
+
   it('mobile input dock is hidden on desktop and shown on narrow screens only', () => {
     assert.match(STYLE, /\.claude-terminal-mobile-dock\s*{\s*display:\s*none;/)
     assert.match(
@@ -60,12 +75,14 @@ describe('official Claude terminal lifecycle', () => {
 
   it('touch dragging the terminal maps to xterm scrollback lines', () => {
     const moveSrc = extractFunction(SRC, 'handleTerminalTouchMove')
-    const initSrc = extractFunction(SRC, 'initTerminalTouchScroll')
+    const bindSrc = extractFunction(SRC, 'bindTerminalTouchScrollTargets')
+    const cleanupSrc = extractFunction(SRC, 'cleanupTerminalTouchScrollTargets')
 
     assert.match(moveSrc, /terminal\.scrollLines\(lines\)/)
     assert.match(moveSrc, /terminalTouchScrollRemainder/)
-    assert.match(moveSrc, /event\.preventDefault\(\)/)
-    assert.match(initSrc, /'touchmove'/)
-    assert.match(initSrc, /passive:\s*false/)
+    assert.match(moveSrc, /event\.cancelable/)
+    assert.match(bindSrc, /'touchmove'/)
+    assert.match(bindSrc, /passive:\s*false/)
+    assert.match(cleanupSrc, /removeEventListener\('touchmove'/)
   })
 })

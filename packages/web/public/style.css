@@ -4858,6 +4858,11 @@ body.voice-overlay-open {
   font-family: var(--font-mono);
   font-size: var(--text-sm);
 }
+.claude-terminal-mobile-keys button[data-claude-terminal-action] {
+  border-color: var(--accent-border);
+  background: var(--accent-soft);
+  color: var(--accent);
+}
 .claude-terminal-mobile-keys button:active {
   transform: scale(0.97);
   background: var(--bg-hover);
@@ -4869,15 +4874,38 @@ body.voice-overlay-open {
   .claude-terminal-modal {
     max-width: 100%;
     height: 100dvh;
+    max-height: 100dvh;
+  }
+  .claude-terminal-head {
+    align-items: center;
+    gap: var(--space-2);
+    padding: var(--space-3) var(--space-4);
+  }
+  .claude-terminal-head p {
+    display: none;
+  }
+  .claude-terminal-body {
+    max-height: none !important;
+    gap: var(--space-2);
+    padding: var(--space-2) var(--space-3) calc(var(--space-2) + env(safe-area-inset-bottom, 0));
+  }
+  .claude-terminal-toolbar {
+    gap: var(--space-2);
+  }
+  .claude-terminal-status {
+    min-height: 24px;
+    padding: 3px 8px;
+    font-size: var(--text-xs);
+  }
+  .claude-terminal-hint {
+    font-size: var(--text-xs);
+    line-height: 1.35;
   }
   .claude-terminal-container {
     flex: 1 1 180px;
     min-height: 0;
     padding: var(--space-2);
     border-radius: var(--radius-lg);
-  }
-  .claude-terminal-body {
-    padding-bottom: calc(var(--space-3) + env(safe-area-inset-bottom, 0));
   }
   .claude-terminal-mobile-dock {
     display: flex;
@@ -4889,6 +4917,22 @@ body.voice-overlay-open {
   }
   .claude-terminal-mobile-input-row .btn {
     min-height: 42px;
+    padding-inline: 12px;
+  }
+  .claude-terminal-mobile-keys {
+    gap: var(--space-1);
+  }
+  .claude-terminal-mobile-keys button {
+    min-height: 32px;
+    padding: 5px 9px;
+    font-size: var(--text-xs);
+  }
+  .claude-terminal-foot {
+    padding: var(--space-2) var(--space-3) calc(var(--space-2) + env(safe-area-inset-bottom, 0));
+    gap: var(--space-2);
+  }
+  .claude-terminal-foot .btn {
+    min-height: 36px;
     padding-inline: 12px;
   }
 }
