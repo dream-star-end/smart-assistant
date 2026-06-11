@@ -4816,11 +4816,14 @@ body.voice-overlay-open {
 .claude-terminal-container .xterm-screen {
   touch-action: pan-y;
 }
+.claude-terminal-scroll-capture {
+  display: none;
+}
 .claude-terminal-new-output {
   position: absolute;
   left: 50%;
   bottom: var(--space-4);
-  z-index: 2;
+  z-index: 3;
   min-height: 38px;
   padding: 8px 14px;
   border: 1px solid var(--accent-border);
@@ -5000,6 +5003,23 @@ body.voice-overlay-open {
   .claude-terminal-foot .btn {
     min-height: 36px;
     padding-inline: 12px;
+  }
+}
+@media (max-width: 860px) and (pointer: coarse) {
+  .claude-terminal-scroll-capture {
+    display: block;
+    position: absolute;
+    inset: 0;
+    z-index: 1;
+    background: transparent;
+    cursor: grab;
+    overscroll-behavior: contain;
+    touch-action: none;
+    -webkit-user-select: none;
+    user-select: none;
+  }
+  .claude-terminal-scroll-capture:active {
+    cursor: grabbing;
   }
 }
 

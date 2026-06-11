@@ -145,10 +145,12 @@ describe('official Claude terminal lifecycle', () => {
   it('cache-busts terminal module when adding mobile controls', () => {
     assert.match(INDEX, /claude-terminal-history-prev-btn" type="button" tabindex="-1" disabled/)
     assert.match(INDEX, /claude-terminal-history-next-btn" type="button" tabindex="-1" disabled/)
-    assert.match(MAIN, /from '\.\/officialTerminal\.js\?v=2'/)
-    assert.match(SW, /\/modules\/officialTerminal\.js\?v=2/)
-    assert.match(INDEX, /\/modules\/main\.js\?v=54/)
-    assert.match(SW, /openclaude-v74/)
+    assert.match(MAIN, /from '\.\/officialTerminal\.js\?v=3'/)
+    assert.match(SW, /\/modules\/officialTerminal\.js\?v=3/)
+    assert.match(INDEX, /\/modules\/main\.js\?v=55/)
+    assert.match(INDEX, /\/style\.css\?v=47/)
+    assert.match(INDEX, /sw-flush-v17/)
+    assert.match(SW, /openclaude-v75/)
   })
 
   it('mobile wake lock is optional and gated by modal visibility', () => {
@@ -174,15 +176,41 @@ describe('official Claude terminal lifecycle', () => {
   })
 
   it('touch dragging the terminal maps to xterm scrollback lines', () => {
-    const moveSrc = extractFunction(SRC, 'handleTerminalTouchMove')
-    const bindSrc = extractFunction(SRC, 'bindTerminalTouchScrollTargets')
-    const cleanupSrc = extractFunction(SRC, 'cleanupTerminalTouchScrollTargets')
+    const moveSrc = extractFunction(SRC, 'moveTerminalTouchScroll')
+    const bindTouchSrc = extractFunction(SRC, 'bindTerminalTouchScrollTargets')
+    const cleanupTouchSrc = extractFunction(SRC, 'cleanupTerminalTouchScrollTargets')
+    const bindCaptureSrc = extractFunction(SRC, 'bindTerminalScrollCapture')
+    const cleanupCaptureSrc = extractFunction(SRC, 'cleanupTerminalScrollCapture')
+    const pointerMoveSrc = extractFunction(SRC, 'handleScrollCapturePointerMove')
 
     assert.match(moveSrc, /terminal\.scrollLines\(lines\)/)
     assert.match(moveSrc, /terminalTouchScrollRemainder/)
-    assert.match(moveSrc, /event\.cancelable/)
-    assert.match(bindSrc, /'touchmove'/)
-    assert.match(bindSrc, /passive:\s*false/)
-    assert.match(cleanupSrc, /removeEventListener\('touchmove'/)
+    assert.match(moveSrc, /event\?\.cancelable/)
+    assert.match(bindTouchSrc, /'touchmove'/)
+    assert.match(bindTouchSrc, /passive:\s*false/)
+    assert.match(cleanupTouchSrc, /removeEventListener\('touchmove'/)
+    assert.match(bindCaptureSrc, /window\.PointerEvent/)
+    assert.match(bindCaptureSrc, /'pointerdown'/)
+    assert.match(bindCaptureSrc, /'pointermove'/)
+    assert.match(bindCaptureSrc, /'lostpointercapture'/)
+    assert.match(bindCaptureSrc, /'touchmove'/)
+    assert.match(bindCaptureSrc, /terminalScrollCaptureCleanup/)
+    assert.match(cleanupCaptureSrc, /endTerminalTouchScroll\(\)/)
+    assert.match(cleanupCaptureSrc, /terminalScrollCaptureCleanup/)
+    assert.match(pointerMoveSrc, /terminalScrollPointerId !== event\.pointerId/)
+  })
+
+  it('mobile terminal exposes a dedicated scroll capture overlay', () => {
+    assert.match(INDEX, /id="claude-terminal-scroll-capture"/)
+    assert.match(
+      INDEX,
+      /claude-terminal-container[\s\S]*claude-terminal-scroll-capture[\s\S]*claude-terminal-new-output-btn/,
+    )
+    assert.match(STYLE, /\.claude-terminal-scroll-capture\s*{\s*display:\s*none;/)
+    assert.match(
+      STYLE,
+      /@media \(max-width: 860px\) and \(pointer: coarse\) {[\s\S]*?\.claude-terminal-scroll-capture\s*{[\s\S]*?display:\s*block;[\s\S]*?z-index:\s*1;[\s\S]*?overscroll-behavior:\s*contain;[\s\S]*?touch-action:\s*none;/,
+    )
+    assert.match(STYLE, /\.claude-terminal-new-output\s*{[\s\S]*?z-index:\s*3;/)
   })
 })

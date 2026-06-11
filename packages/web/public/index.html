@@ -16,7 +16,7 @@
 <link rel="apple-touch-icon" href="/icon.svg" />
 <link rel="stylesheet" href="/vendor/github-dark.min.css" />
 <link rel="stylesheet" href="/vendor/katex/katex.min.css" />
-<link rel="stylesheet" href="/style.css?v=46" />
+<link rel="stylesheet" href="/style.css?v=47" />
 <link rel="stylesheet" href="/vendor/xterm/xterm.css?v=1" />
 <style>/* Inline styles removed — see style.css */
 </style>
@@ -804,6 +804,7 @@
       </div>
       <div class="claude-terminal-terminal-wrap">
         <div id="claude-terminal-container" class="claude-terminal-container" aria-label="Claude Code terminal"></div>
+        <div id="claude-terminal-scroll-capture" class="claude-terminal-scroll-capture" aria-hidden="true"></div>
         <button id="claude-terminal-new-output-btn" class="claude-terminal-new-output" type="button" hidden aria-hidden="true">有新输出 · 到底部</button>
       </div>
       <div class="claude-terminal-mobile-dock" aria-label="移动端终端输入">
@@ -863,7 +864,7 @@
 <!-- Force SW cache refresh (one-time, remove after all clients updated) -->
 <script>
 (function(){
-  var V='sw-flush-v16';
+  var V='sw-flush-v17';
   if(localStorage.getItem(V))return;
   if('serviceWorker' in navigator){
     navigator.serviceWorker.getRegistrations().then(function(regs){
@@ -885,6 +886,6 @@
 <script src="/vendor/katex/katex.min.js" defer></script>
 <script src="/vendor/qrcode.min.js"></script>
 <div id="toast" class="toast"></div>
-<script type="module" src="/modules/main.js?v=54"></script>
+<script type="module" src="/modules/main.js?v=55"></script>
 </body>
 </html>
