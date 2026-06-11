@@ -16,7 +16,7 @@
 <link rel="apple-touch-icon" href="/icon.svg" />
 <link rel="stylesheet" href="/vendor/github-dark.min.css" />
 <link rel="stylesheet" href="/vendor/katex/katex.min.css" />
-<link rel="stylesheet" href="/style.css?v=44" />
+<link rel="stylesheet" href="/style.css?v=45" />
 <link rel="stylesheet" href="/vendor/xterm/xterm.css?v=1" />
 <style>/* Inline styles removed — see style.css */
 </style>
@@ -800,7 +800,7 @@
     <div class="modal-body claude-terminal-body">
       <div class="claude-terminal-toolbar">
         <span id="claude-terminal-status" class="claude-terminal-status" data-state="idle">未连接</span>
-        <span class="claude-terminal-hint">默认工作目录为服务器用户 Home，可通过 <code>OPENCLAUDE_OFFICIAL_CLAUDE_CWD</code> 覆盖。</span>
+        <span class="claude-terminal-hint">关闭=隐藏会话；终止=结束 Claude。</span>
       </div>
       <div id="claude-terminal-container" class="claude-terminal-container" aria-label="Claude Code terminal"></div>
       <div class="claude-terminal-mobile-dock" aria-label="移动端终端输入">
@@ -810,6 +810,9 @@
           <button id="claude-terminal-mobile-focus-btn" class="btn btn-ghost" type="button">键盘</button>
         </div>
         <div class="claude-terminal-mobile-keys" aria-label="终端快捷键">
+          <button type="button" tabindex="-1" data-claude-terminal-action="page-up">Pg↑</button>
+          <button type="button" tabindex="-1" data-claude-terminal-action="page-down">Pg↓</button>
+          <button type="button" tabindex="-1" data-claude-terminal-action="bottom">底部</button>
           <button type="button" tabindex="-1" data-claude-terminal-key="enter">Enter</button>
           <button type="button" tabindex="-1" data-claude-terminal-key="tab">Tab</button>
           <button type="button" tabindex="-1" data-claude-terminal-key="ctrl-c">Ctrl-C</button>
@@ -874,6 +877,6 @@
 <script src="/vendor/katex/katex.min.js" defer></script>
 <script src="/vendor/qrcode.min.js"></script>
 <div id="toast" class="toast"></div>
-<script type="module" src="/modules/main.js?v=52"></script>
+<script type="module" src="/modules/main.js?v=53"></script>
 </body>
 </html>

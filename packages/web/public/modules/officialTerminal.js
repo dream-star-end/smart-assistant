@@ -31,9 +31,10 @@ let socket = null
 let resizeObserver = null
 let reconnectRequested = false
 let initialized = false
-let lastQuickKeyPointerAt = 0
+let lastMobileControlPointerAt = 0
 let terminalTouchScrollY = null
 let terminalTouchScrollRemainder = 0
+let terminalTouchScrollTargets = []
 
 function byteLength(text) {
   return new TextEncoder().encode(text).length
@@ -127,6 +128,7 @@ function attachTerminal() {
   if (!container || !terminal) return
   container.innerHTML = ''
   terminal.open(container)
+  bindTerminalTouchScrollTargets()
   fitTerminal()
   focusTerminalIfDesktop()
   resizeObserver = new ResizeObserver(() => fitTerminal())
@@ -134,6 +136,7 @@ function attachTerminal() {
 }
 
 function disposeTerminal() {
+  cleanupTerminalTouchScrollTargets()
   if (resizeObserver) {
     resizeObserver.disconnect()
     resizeObserver = null
@@ -191,8 +194,6 @@ function handleTerminalTouchStart(event) {
 
 function handleTerminalTouchMove(event) {
   if (terminalTouchScrollY == null || !terminal || event.touches.length !== 1) return
-  event.preventDefault()
-  event.stopPropagation()
 
   const currentY = event.touches[0].clientY
   const rawDelta = terminalTouchScrollY - currentY + terminalTouchScrollRemainder
@@ -200,27 +201,67 @@ function handleTerminalTouchMove(event) {
   const lines = rawDelta > 0 ? Math.floor(rawDelta / lineHeight) : Math.ceil(rawDelta / lineHeight)
   if (lines === 0) return
 
+  if (event.cancelable) event.preventDefault()
+  event.stopPropagation()
   terminal.scrollLines(lines)
   terminalTouchScrollY = currentY
   terminalTouchScrollRemainder = rawDelta - lines * lineHeight
 }
 
-function initTerminalTouchScroll() {
+function terminalTouchScrollTargetElements() {
   const container = $(CONTAINER_ID)
-  if (!container) return
-  container.addEventListener('touchstart', handleTerminalTouchStart, {
-    capture: true,
-    passive: true,
-  })
-  container.addEventListener('touchmove', handleTerminalTouchMove, {
-    capture: true,
-    passive: false,
-  })
-  container.addEventListener('touchend', resetTerminalTouchScroll, { capture: true, passive: true })
-  container.addEventListener('touchcancel', resetTerminalTouchScroll, {
-    capture: true,
-    passive: true,
-  })
+  if (!container) return []
+  return [
+    container,
+    container.querySelector('.xterm'),
+    container.querySelector('.xterm-viewport'),
+    container.querySelector('.xterm-screen'),
+  ].filter(Boolean)
+}
+
+function cleanupTerminalTouchScrollTargets() {
+  for (const target of terminalTouchScrollTargets) {
+    target.removeEventListener('touchstart', handleTerminalTouchStart, true)
+    target.removeEventListener('touchmove', handleTerminalTouchMove, true)
+    target.removeEventListener('touchend', resetTerminalTouchScroll, true)
+    target.removeEventListener('touchcancel', resetTerminalTouchScroll, true)
+  }
+  terminalTouchScrollTargets = []
+  resetTerminalTouchScroll()
+}
+
+function bindTerminalTouchScrollTargets() {
+  cleanupTerminalTouchScrollTargets()
+  terminalTouchScrollTargets = [...new Set(terminalTouchScrollTargetElements())]
+  for (const target of terminalTouchScrollTargets) {
+    target.addEventListener('touchstart', handleTerminalTouchStart, {
+      capture: true,
+      passive: true,
+    })
+    target.addEventListener('touchmove', handleTerminalTouchMove, {
+      capture: true,
+      passive: false,
+    })
+    target.addEventListener('touchend', resetTerminalTouchScroll, {
+      capture: true,
+      passive: true,
+    })
+    target.addEventListener('touchcancel', resetTerminalTouchScroll, {
+      capture: true,
+      passive: true,
+    })
+  }
+}
+
+function scrollTerminal(action) {
+  if (!terminal) return
+  if (action === 'page-up') {
+    terminal.scrollPages(-1)
+  } else if (action === 'page-down') {
+    terminal.scrollPages(1)
+  } else if (action === 'bottom') {
+    terminal.scrollToBottom()
+  }
 }
 
 function send(payload) {
@@ -397,6 +438,7 @@ function reconnectTerminal() {
     attachTerminal()
   } else {
     terminal.reset()
+    terminal.scrollToBottom()
   }
   connectTerminal()
 }
@@ -405,6 +447,15 @@ function sendQuickKey(key, button) {
   if (!key || !QUICK_KEYS[key]) return
   sendTerminalInput(QUICK_KEYS[key])
   button?.blur?.()
+}
+
+function runMobileControl(button) {
+  if (button.dataset.claudeTerminalKey) {
+    sendQuickKey(button.dataset.claudeTerminalKey, button)
+  } else if (button.dataset.claudeTerminalAction) {
+    scrollTerminal(button.dataset.claudeTerminalAction)
+    button.blur?.()
+  }
 }
 
 export function initOfficialClaudeTerminal() {
@@ -421,27 +472,28 @@ export function initOfficialClaudeTerminal() {
     sendMobileCommand()
   })
   window.addEventListener('resize', () => fitTerminal())
-  initTerminalTouchScroll()
 
-  document.querySelectorAll('[data-claude-terminal-key]').forEach((button) => {
-    button.tabIndex = -1
-    button.addEventListener(
-      'pointerdown',
-      (event) => {
+  document
+    .querySelectorAll('[data-claude-terminal-key], [data-claude-terminal-action]')
+    .forEach((button) => {
+      button.tabIndex = -1
+      button.addEventListener(
+        'pointerdown',
+        (event) => {
+          event.preventDefault()
+          event.stopPropagation()
+          lastMobileControlPointerAt = Date.now()
+          runMobileControl(button)
+        },
+        { passive: false },
+      )
+      button.addEventListener('click', (event) => {
         event.preventDefault()
         event.stopPropagation()
-        lastQuickKeyPointerAt = Date.now()
-        sendQuickKey(button.dataset.claudeTerminalKey, button)
-      },
-      { passive: false },
-    )
-    button.addEventListener('click', (event) => {
-      event.preventDefault()
-      event.stopPropagation()
-      if (Date.now() - lastQuickKeyPointerAt < 500) return
-      sendQuickKey(button.dataset.claudeTerminalKey, button)
+        if (Date.now() - lastMobileControlPointerAt < 500) return
+        runMobileControl(button)
+      })
     })
-  })
 
   document.addEventListener(
     'click',
