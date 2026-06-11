@@ -21,6 +21,8 @@ const WAKE_LOCK_BTN_ID = 'claude-terminal-wake-lock-btn'
 const FILE_INPUT_ID = 'claude-terminal-file-input'
 const FILE_UPLOAD_BTN_ID = 'claude-terminal-upload-btn'
 const FILE_PANEL_BTN_ID = 'claude-terminal-files-btn'
+const FILE_MODAL_ID = 'claude-terminal-files-modal'
+const FILE_MODAL_UPLOAD_BTN_ID = 'claude-terminal-file-modal-upload-btn'
 const FILE_PANEL_ID = 'claude-terminal-file-panel'
 const FILE_DROP_HINT_ID = 'claude-terminal-drop-hint'
 const FILE_UPLOAD_LIST_ID = 'claude-terminal-upload-list'
@@ -32,6 +34,7 @@ const FILE_PATH_INPUT_ID = 'claude-terminal-path-input'
 const FILE_DOWNLOAD_BTN_ID = 'claude-terminal-download-btn'
 const FILE_PREVIEW_BTN_ID = 'claude-terminal-preview-btn'
 const CLOSE_SELECTOR = '[data-claude-terminal-close]'
+const FILE_MODAL_CLOSE_SELECTOR = '[data-claude-terminal-files-close]'
 const MAX_TERMINAL_INPUT_BYTES = 32 * 1024
 const RECONNECT_ATTEMPT_MIN_MS = 1500
 const MOBILE_COMMAND_HISTORY_KEY = 'openclaude:claude-terminal:mobile-command-history'
@@ -420,16 +423,28 @@ function setTerminalFilePanelTab(name) {
   if (name === 'browse' && !terminalBrowsePath) void loadTerminalBrowse('')
 }
 
+function isTerminalFileModalOpen() {
+  return $(FILE_MODAL_ID)?.classList.contains('open') === true
+}
+
+function closeTerminalFileModal() {
+  closeModal(FILE_MODAL_ID)
+}
+
 function toggleTerminalFilePanel(forceOpen = null) {
   const panel = $(FILE_PANEL_ID)
-  if (!panel) return
-  const open = forceOpen ?? panel.hidden
-  panel.hidden = !open
-  if (open) {
-    setTerminalFilePanelTab('recent')
-    renderTerminalRecentFiles()
-    renderTerminalUploads()
+  const modal = $(FILE_MODAL_ID)
+  if (!panel || !modal) return
+  const open = forceOpen ?? !isTerminalFileModalOpen()
+  if (!open) {
+    closeTerminalFileModal()
+    return
   }
+  panel.hidden = false
+  openModal(FILE_MODAL_ID)
+  setTerminalFilePanelTab('recent')
+  renderTerminalRecentFiles()
+  renderTerminalUploads()
 }
 
 function arrayBufferToBase64(buffer) {
@@ -1405,6 +1420,7 @@ export function hideOfficialClaudeTerminal() {
   releaseWakeLock()
   terminalFileDragDepth = 0
   setTerminalFileDropActive(false)
+  closeTerminalFileModal()
   closeModal(MODAL_ID)
 }
 
@@ -1517,6 +1533,7 @@ export function initOfficialClaudeTerminal() {
   $(RECONNECT_BTN_ID)?.addEventListener('click', () => reconnectTerminal())
   $(NEW_OUTPUT_BTN_ID)?.addEventListener('click', () => scrollTerminalToBottom())
   $(FILE_UPLOAD_BTN_ID)?.addEventListener('click', () => $(FILE_INPUT_ID)?.click())
+  $(FILE_MODAL_UPLOAD_BTN_ID)?.addEventListener('click', () => $(FILE_INPUT_ID)?.click())
   $(FILE_PANEL_BTN_ID)?.addEventListener('click', () => toggleTerminalFilePanel())
   $(FILE_INPUT_ID)?.addEventListener('change', (event) => {
     if (event.target.files?.length) void uploadTerminalFiles(event.target.files)
@@ -1600,9 +1617,18 @@ export function initOfficialClaudeTerminal() {
   document.addEventListener(
     'click',
     (event) => {
+      const fileModal = $(FILE_MODAL_ID)
+      const target = event.target
+      if (fileModal?.classList.contains('open')) {
+        if (target?.id === FILE_MODAL_ID || target?.closest?.(FILE_MODAL_CLOSE_SELECTOR)) {
+          event.preventDefault()
+          event.stopPropagation()
+          closeTerminalFileModal()
+          return
+        }
+      }
       const modal = $(MODAL_ID)
       if (!modal?.classList.contains('open')) return
-      const target = event.target
       if (target?.id === MODAL_ID || target?.closest?.(CLOSE_SELECTOR)) {
         event.preventDefault()
         event.stopPropagation()
@@ -1616,6 +1642,12 @@ export function initOfficialClaudeTerminal() {
     'keydown',
     (event) => {
       if (event.key !== 'Escape') return
+      if (isTerminalFileModalOpen()) {
+        event.preventDefault()
+        event.stopPropagation()
+        closeTerminalFileModal()
+        return
+      }
       const modal = $(MODAL_ID)
       if (!modal?.classList.contains('open')) return
       event.preventDefault()
