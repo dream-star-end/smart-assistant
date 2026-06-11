@@ -57,4 +57,15 @@ describe('official Claude terminal lifecycle', () => {
       /@media \(max-width: 860px\) {[\s\S]*?\.claude-terminal-mobile-dock\s*{[\s\S]*?display:\s*flex;/,
     )
   })
+
+  it('touch dragging the terminal maps to xterm scrollback lines', () => {
+    const moveSrc = extractFunction(SRC, 'handleTerminalTouchMove')
+    const initSrc = extractFunction(SRC, 'initTerminalTouchScroll')
+
+    assert.match(moveSrc, /terminal\.scrollLines\(lines\)/)
+    assert.match(moveSrc, /terminalTouchScrollRemainder/)
+    assert.match(moveSrc, /event\.preventDefault\(\)/)
+    assert.match(initSrc, /'touchmove'/)
+    assert.match(initSrc, /passive:\s*false/)
+  })
 })
