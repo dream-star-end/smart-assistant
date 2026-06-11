@@ -16,7 +16,7 @@
 <link rel="apple-touch-icon" href="/icon.svg" />
 <link rel="stylesheet" href="/vendor/github-dark.min.css" />
 <link rel="stylesheet" href="/vendor/katex/katex.min.css" />
-<link rel="stylesheet" href="/style.css?v=42" />
+<link rel="stylesheet" href="/style.css?v=43" />
 <link rel="stylesheet" href="/vendor/xterm/xterm.css?v=1" />
 <style>/* Inline styles removed — see style.css */
 </style>
@@ -793,7 +793,7 @@
     <div class="modal-head claude-terminal-head">
       <div>
         <h3>Claude Code 终端</h3>
-        <p>官方最新版 <code>claude</code> CLI，运行在服务器 PTY 中。</p>
+        <p>官方最新版 <code>claude</code> CLI，运行在服务器 PTY 中；关闭只隐藏窗口，点“终止”才结束进程。</p>
       </div>
       <button class="modal-close" data-claude-terminal-close aria-label="关闭">&times;</button>
     </div>
@@ -810,12 +810,12 @@
           <button id="claude-terminal-mobile-focus-btn" class="btn btn-ghost" type="button">键盘</button>
         </div>
         <div class="claude-terminal-mobile-keys" aria-label="终端快捷键">
-          <button type="button" data-claude-terminal-key="enter">Enter</button>
-          <button type="button" data-claude-terminal-key="tab">Tab</button>
-          <button type="button" data-claude-terminal-key="ctrl-c">Ctrl-C</button>
-          <button type="button" data-claude-terminal-key="esc">Esc</button>
-          <button type="button" data-claude-terminal-key="up">↑</button>
-          <button type="button" data-claude-terminal-key="down">↓</button>
+          <button type="button" tabindex="-1" data-claude-terminal-key="enter">Enter</button>
+          <button type="button" tabindex="-1" data-claude-terminal-key="tab">Tab</button>
+          <button type="button" tabindex="-1" data-claude-terminal-key="ctrl-c">Ctrl-C</button>
+          <button type="button" tabindex="-1" data-claude-terminal-key="esc">Esc</button>
+          <button type="button" tabindex="-1" data-claude-terminal-key="up">↑</button>
+          <button type="button" tabindex="-1" data-claude-terminal-key="down">↓</button>
         </div>
       </div>
     </div>
@@ -852,7 +852,7 @@
 <!-- Force SW cache refresh (one-time, remove after all clients updated) -->
 <script>
 (function(){
-  var V='sw-flush-v13';
+  var V='sw-flush-v14';
   if(localStorage.getItem(V))return;
   if('serviceWorker' in navigator){
     navigator.serviceWorker.getRegistrations().then(function(regs){

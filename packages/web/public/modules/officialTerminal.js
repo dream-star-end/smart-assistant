@@ -31,6 +31,7 @@ let socket = null
 let resizeObserver = null
 let reconnectRequested = false
 let initialized = false
+let lastQuickKeyPointerAt = 0
 
 function byteLength(text) {
   return new TextEncoder().encode(text).length
@@ -107,13 +108,25 @@ function createTerminal() {
   terminal.onResize(({ cols, rows }) => send({ type: 'resize', cols, rows }))
 }
 
+function isModalOpen() {
+  return Boolean($(MODAL_ID)?.classList.contains('open'))
+}
+
+function shouldFocusTerminal() {
+  return !window.matchMedia?.('(pointer: coarse)')?.matches
+}
+
+function focusTerminalIfDesktop() {
+  if (shouldFocusTerminal()) terminal?.focus()
+}
+
 function attachTerminal() {
   const container = $(CONTAINER_ID)
   if (!container || !terminal) return
   container.innerHTML = ''
   terminal.open(container)
   fitTerminal()
-  terminal.focus()
+  focusTerminalIfDesktop()
   resizeObserver = new ResizeObserver(() => fitTerminal())
   resizeObserver.observe(container)
 }
@@ -136,9 +149,20 @@ function disposeTerminal() {
 
 function fitTerminal() {
   if (!terminal || !fitAddon) return
+  if (!isModalOpen()) return
   try {
     fitAddon.fit()
   } catch {}
+}
+
+function fitVisibleTerminalSoon(focus = false) {
+  requestAnimationFrame(() => {
+    fitTerminal()
+    if (terminal && socket?.readyState === WebSocket.OPEN) {
+      send({ type: 'resize', cols: terminal.cols, rows: terminal.rows })
+    }
+    if (focus) focusTerminalIfDesktop()
+  })
 }
 
 function send(payload) {
@@ -233,9 +257,8 @@ function connectTerminal() {
   ws.onopen = () => {
     if (socket !== ws) return
     setStatus('running', '官方 Claude Code 已连接')
-    fitTerminal()
+    fitVisibleTerminalSoon(true)
     if (terminal) send({ type: 'resize', cols: terminal.cols, rows: terminal.rows })
-    terminal?.focus()
   }
 
   ws.onmessage = async (event) => {
@@ -270,7 +293,8 @@ function connectTerminal() {
   }
 
   ws.onclose = () => {
-    if (socket === ws) socket = null
+    if (socket !== ws) return
+    socket = null
     if (reconnectRequested) return
     const current = $(STATUS_ID)?.dataset.state
     if (current !== 'exited' && current !== 'error' && current !== 'disabled') setStatus('closed')
@@ -280,19 +304,31 @@ function connectTerminal() {
 export async function openOfficialClaudeTerminal() {
   await ensureTerminalDeps()
   openModal(MODAL_ID)
+  if (terminal) {
+    fitVisibleTerminalSoon(true)
+    return
+  }
   createTerminal()
   attachTerminal()
   terminal?.writeln('OpenClaude official Claude Code terminal')
-  terminal?.writeln('Starting `claude` in a server-side PTY...\r\n')
+  terminal?.writeln('Starting `claude` in a server-side PTY...')
+  terminal?.writeln('关闭只隐藏窗口，点“终止”才结束进程。\r\n')
   connectTerminal()
 }
 
+export function hideOfficialClaudeTerminal() {
+  closeModal(MODAL_ID)
+}
+
 export function closeOfficialClaudeTerminal() {
-  reconnectRequested = false
+  hideOfficialClaudeTerminal()
+}
+
+export function terminateOfficialClaudeTerminal() {
   closeSocket(true)
   disposeTerminal()
-  setStatus('closed')
-  closeModal(MODAL_ID)
+  reconnectRequested = false
+  setStatus('closed', '已终止，重新打开会新建终端')
 }
 
 function reconnectTerminal() {
@@ -307,13 +343,16 @@ function reconnectTerminal() {
   connectTerminal()
 }
 
+function sendQuickKey(key, button) {
+  if (!key || !QUICK_KEYS[key]) return
+  sendTerminalInput(QUICK_KEYS[key])
+  button?.blur?.()
+}
+
 export function initOfficialClaudeTerminal() {
   if (initialized) return
   initialized = true
-  $(KILL_BTN_ID)?.addEventListener('click', () => {
-    send({ type: 'kill' })
-    setStatus('closed', '已发送终止信号')
-  })
+  $(KILL_BTN_ID)?.addEventListener('click', () => terminateOfficialClaudeTerminal())
   $(RECONNECT_BTN_ID)?.addEventListener('click', () => reconnectTerminal())
   $(MOBILE_SEND_BTN_ID)?.addEventListener('click', () => sendMobileCommand())
   $(MOBILE_FOCUS_BTN_ID)?.addEventListener('click', () => focusMobileInput())
@@ -325,6 +364,26 @@ export function initOfficialClaudeTerminal() {
   })
   window.addEventListener('resize', () => fitTerminal())
 
+  document.querySelectorAll('[data-claude-terminal-key]').forEach((button) => {
+    button.tabIndex = -1
+    button.addEventListener(
+      'pointerdown',
+      (event) => {
+        event.preventDefault()
+        event.stopPropagation()
+        lastQuickKeyPointerAt = Date.now()
+        sendQuickKey(button.dataset.claudeTerminalKey, button)
+      },
+      { passive: false },
+    )
+    button.addEventListener('click', (event) => {
+      event.preventDefault()
+      event.stopPropagation()
+      if (Date.now() - lastQuickKeyPointerAt < 500) return
+      sendQuickKey(button.dataset.claudeTerminalKey, button)
+    })
+  })
+
   document.addEventListener(
     'click',
     (event) => {
@@ -334,15 +393,7 @@ export function initOfficialClaudeTerminal() {
       if (target?.id === MODAL_ID || target?.closest?.(CLOSE_SELECTOR)) {
         event.preventDefault()
         event.stopPropagation()
-        closeOfficialClaudeTerminal()
-        return
-      }
-      const key = target?.closest?.('[data-claude-terminal-key]')?.dataset.claudeTerminalKey
-      if (key && QUICK_KEYS[key]) {
-        event.preventDefault()
-        event.stopPropagation()
-        sendTerminalInput(QUICK_KEYS[key])
-        focusMobileInput()
+        hideOfficialClaudeTerminal()
       }
     },
     true,
@@ -356,7 +407,7 @@ export function initOfficialClaudeTerminal() {
       if (!modal?.classList.contains('open')) return
       event.preventDefault()
       event.stopPropagation()
-      closeOfficialClaudeTerminal()
+      hideOfficialClaudeTerminal()
     },
     true,
   )

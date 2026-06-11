@@ -4784,6 +4784,8 @@ body.voice-overlay-open {
   flex: 1;
   min-height: 320px;
   overflow: hidden;
+  overscroll-behavior: contain;
+  touch-action: pan-y;
   border: 1px solid var(--border-strong);
   border-radius: var(--radius-xl);
   background: var(--bg);
@@ -4796,6 +4798,15 @@ body.voice-overlay-open {
 .claude-terminal-container .xterm-viewport,
 .claude-terminal-container .xterm-screen {
   border-radius: var(--radius-md);
+}
+.claude-terminal-container .xterm-viewport {
+  overflow-y: auto !important;
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior: contain;
+  touch-action: pan-y;
+}
+.claude-terminal-container .xterm-screen {
+  touch-action: pan-y;
 }
 .claude-terminal-mobile-dock {
   display: flex;
@@ -4860,7 +4871,8 @@ body.voice-overlay-open {
     height: 100dvh;
   }
   .claude-terminal-container {
-    min-height: 280px;
+    flex: 1 1 180px;
+    min-height: 0;
     padding: var(--space-2);
     border-radius: var(--radius-lg);
   }
