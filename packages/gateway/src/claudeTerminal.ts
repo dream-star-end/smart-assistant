@@ -16,6 +16,9 @@ const MIN_COLS = 20
 const MAX_COLS = 240
 const MIN_ROWS = 5
 const MAX_ROWS = 80
+const OUTPUT_REPLAY_MAX_BYTES = 1024 * 1024
+const DEFAULT_DETACHED_TTL_MS = 6 * 60 * 60_000
+const MAX_DETACHED_TTL_MS = 24 * 60 * 60_000
 
 const EXTRA_PROXY_ENV_KEYS = ['ALL_PROXY', 'all_proxy', 'NO_PROXY', 'no_proxy']
 const LOCALE_ENV_KEYS = ['LANG', 'LC_ALL', 'LC_CTYPE', 'LC_MESSAGES']
@@ -55,11 +58,23 @@ export interface ClaudeTerminalManagerOptions {
   env?: NodeJS.ProcessEnv
 }
 
+interface OutputChunk {
+  data: string
+  bytes: number
+}
+
 interface ActiveTerminalSession {
   userId: string
-  ws: WebSocket
+  ws: WebSocket | null
   pty: PtyLike
-  close(reason: string): void
+  cwd: string
+  command: string
+  outputChunks: OutputChunk[]
+  outputBytes: number
+  cleanupTimer: ReturnType<typeof setTimeout> | null
+  dataDisposable: PtyDisposable
+  exitDisposable: PtyDisposable
+  closed: boolean
 }
 
 function isTruthyDisabled(value: string | undefined): boolean {
@@ -78,6 +93,14 @@ export function clampTerminalSize(cols: unknown, rows: unknown): { cols: number;
     cols: Math.max(MIN_COLS, Math.min(MAX_COLS, c)),
     rows: Math.max(MIN_ROWS, Math.min(MAX_ROWS, r)),
   }
+}
+
+export function resolveDetachedTerminalTtlMs(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = env.OPENCLAUDE_OFFICIAL_CLAUDE_TERMINAL_DETACHED_TTL_MS?.trim()
+  if (!raw) return DEFAULT_DETACHED_TTL_MS
+  const n = Number(raw)
+  if (!Number.isFinite(n) || n < 0) return DEFAULT_DETACHED_TTL_MS
+  return Math.min(MAX_DETACHED_TTL_MS, Math.trunc(n))
 }
 
 function firstHeader(value: string | string[] | undefined): string {
@@ -175,6 +198,12 @@ function sendJson(ws: WebSocket, payload: unknown): void {
   ws.send(JSON.stringify(payload))
 }
 
+function safeClose(ws: WebSocket, code?: number, reason?: string): void {
+  try {
+    if (ws.readyState === 0 || ws.readyState === 1) ws.close(code, reason)
+  } catch {}
+}
+
 export class ClaudeTerminalManager {
   private readonly spawn: PtySpawn
   private readonly env: NodeJS.ProcessEnv
@@ -196,90 +225,108 @@ export class ClaudeTerminalManager {
       return
     }
 
-    this.sessions.get(userId)?.close('replaced')
-
-    let proc: PtyLike
-    let cwd: string
-    let command: string
-    try {
-      command = resolveOfficialClaudePath(this.env)
-      if (command.startsWith('/') && !existsSync(command)) {
-        throw new Error(`Claude executable not found: ${command}`)
+    let session = this.sessions.get(userId)
+    if (!session || session.closed) {
+      try {
+        session = this.createSession(userId)
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err)
+        this.opts.logger.warn('official claude terminal spawn failed', { userId, message })
+        sendJson(ws, { type: 'status', state: 'error', message })
+        ws.close(1011, 'spawn failed')
+        return
       }
-      cwd = resolveOfficialClaudeCwd(this.env)
-      proc = this.spawn(command, [], {
-        name: 'xterm-256color',
-        cols: DEFAULT_COLS,
-        rows: DEFAULT_ROWS,
-        cwd,
-        env: buildOfficialClaudeEnv(this.env),
+      this.sessions.set(userId, session)
+      this.opts.logger.info('official claude terminal started', {
+        userId,
+        cwd: session.cwd,
+        command: session.command,
       })
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err)
-      this.opts.logger.warn('official claude terminal spawn failed', { userId, message })
-      sendJson(ws, { type: 'status', state: 'error', message })
-      ws.close(1011, 'spawn failed')
-      return
     }
 
-    this.opts.logger.info('official claude terminal started', { userId, cwd, command })
-    sendJson(ws, {
-      type: 'status',
-      state: 'running',
-      message: `Claude Code terminal started in ${cwd}`,
-    })
+    this.attachClient(session, ws)
+  }
 
-    let closed = false
-    let closeSession: (reason: string, killProcess: boolean) => void = () => {}
-    const dataDisposable = proc.onData((data) => {
-      sendJson(ws, { type: 'output', data })
-    })
-    const exitDisposable = proc.onExit((event) => {
-      sendJson(ws, { type: 'exit', code: event.exitCode ?? null, signal: event.signal ?? null })
-      closeSession('exit', false)
-      try {
-        ws.close(1000, 'process exited')
-      } catch {}
-    })
+  terminate(userId: string): boolean {
+    const session = this.sessions.get(userId)
+    if (!session || session.closed) return false
+    this.closeSession(session, 'client terminate', true, true)
+    return true
+  }
 
-    closeSession = (reason: string, killProcess: boolean) => {
-      if (closed) return
-      closed = true
-      this.sessions.delete(userId)
-      try {
-        dataDisposable.dispose()
-      } catch {}
-      try {
-        exitDisposable.dispose()
-      } catch {}
-      if (killProcess) {
-        try {
-          proc.kill()
-        } catch (err) {
-          this.opts.logger.warn('official claude terminal kill failed', { userId, reason }, err)
-        }
-      }
-      this.opts.logger.info('official claude terminal closed', { userId, reason })
+  shutdown(reason = 'shutdown'): void {
+    for (const session of [...this.sessions.values()])
+      this.closeSession(session, reason, true, true)
+    this.sessions.clear()
+  }
+
+  activeCount(): number {
+    return this.sessions.size
+  }
+
+  private createSession(userId: string): ActiveTerminalSession {
+    const command = resolveOfficialClaudePath(this.env)
+    if (command.startsWith('/') && !existsSync(command)) {
+      throw new Error(`Claude executable not found: ${command}`)
     }
+    const cwd = resolveOfficialClaudeCwd(this.env)
+    const proc = this.spawn(command, [], {
+      name: 'xterm-256color',
+      cols: DEFAULT_COLS,
+      rows: DEFAULT_ROWS,
+      cwd,
+      env: buildOfficialClaudeEnv(this.env),
+    })
 
     const session: ActiveTerminalSession = {
       userId,
-      ws,
+      ws: null,
       pty: proc,
-      close: (reason) => {
-        sendJson(ws, { type: 'status', state: 'closed', message: reason })
-        closeSession(reason, true)
-        try {
-          ws.close(1000, reason)
-        } catch {}
-      },
+      cwd,
+      command,
+      outputChunks: [],
+      outputBytes: 0,
+      cleanupTimer: null,
+      dataDisposable: { dispose: () => {} },
+      exitDisposable: { dispose: () => {} },
+      closed: false,
     }
-    this.sessions.set(userId, session)
+
+    session.dataDisposable = proc.onData((data) => {
+      this.appendOutput(session, data)
+      const client = session.ws
+      if (!session.closed && client?.readyState === 1) sendJson(client, { type: 'output', data })
+    })
+    session.exitDisposable = proc.onExit((event) => {
+      const client = session.ws
+      if (!session.closed && client?.readyState === 1) {
+        sendJson(client, {
+          type: 'exit',
+          code: event.exitCode ?? null,
+          signal: event.signal ?? null,
+        })
+      }
+      this.closeSession(session, 'exit', false, true)
+    })
+
+    return session
+  }
+
+  private attachClient(session: ActiveTerminalSession, ws: WebSocket): void {
+    this.clearCleanupTimer(session)
+
+    const previous = session.ws
+    if (previous && previous !== ws) {
+      session.ws = null
+      sendJson(previous, { type: 'status', state: 'closed', message: 'replaced' })
+      safeClose(previous, 1000, 'replaced')
+    }
 
     ws.on('message', (raw) => {
+      if (!this.isActiveClient(session, ws)) return
       if (rawDataBytes(raw) > CLAUDE_TERMINAL_MAX_CLIENT_MESSAGE_BYTES) {
         sendJson(ws, { type: 'status', state: 'error', message: 'Terminal message too large' })
-        ws.close(1009, 'message too large')
+        safeClose(ws, 1009, 'message too large')
         return
       }
       let message: TerminalClientMessage | null = null
@@ -293,25 +340,131 @@ export class ClaudeTerminalManager {
         sendJson(ws, { type: 'status', state: 'error', message: 'Unsupported terminal message' })
         return
       }
-      if (message.type === 'input') proc.write(message.data)
-      else if (message.type === 'resize') proc.resize(message.cols, message.rows)
-      else if (message.type === 'kill') session.close('client kill')
+      if (message.type === 'input') session.pty.write(message.data)
+      else if (message.type === 'resize') session.pty.resize(message.cols, message.rows)
+      else if (message.type === 'kill') this.closeSession(session, 'client kill', true, true)
     })
 
-    ws.once('close', () => closeSession('ws close', true))
+    ws.once('close', () => {
+      if (!this.isActiveClient(session, ws)) return
+      this.detachClient(session, ws, 'ws close')
+    })
     ws.once('error', (err) => {
-      this.opts.logger.warn('official claude terminal websocket error', { userId }, err)
-      closeSession('ws error', true)
+      if (!this.isActiveClient(session, ws)) return
+      this.opts.logger.warn(
+        'official claude terminal websocket error',
+        { userId: session.userId },
+        err,
+      )
+      this.detachClient(session, ws, 'ws error')
     })
+
+    sendJson(ws, {
+      type: 'status',
+      state: 'running',
+      message: `Claude Code terminal ${session.outputBytes > 0 ? 'resumed' : 'started'} in ${session.cwd}`,
+    })
+    const replay = this.replayOutput(session)
+    if (replay) sendJson(ws, { type: 'replay', data: replay })
+    session.ws = ws
   }
 
-  shutdown(reason = 'shutdown'): void {
-    for (const session of [...this.sessions.values()]) session.close(reason)
-    this.sessions.clear()
+  private isActiveClient(session: ActiveTerminalSession, ws: WebSocket): boolean {
+    return this.sessions.get(session.userId) === session && session.ws === ws && !session.closed
   }
 
-  activeCount(): number {
-    return this.sessions.size
+  private detachClient(session: ActiveTerminalSession, ws: WebSocket, reason: string): void {
+    if (!this.isActiveClient(session, ws)) return
+    session.ws = null
+    this.opts.logger.info('official claude terminal detached', { userId: session.userId, reason })
+    this.scheduleDetachedCleanup(session)
+  }
+
+  private scheduleDetachedCleanup(session: ActiveTerminalSession): void {
+    this.clearCleanupTimer(session)
+    const ttlMs = resolveDetachedTerminalTtlMs(this.env)
+    if (ttlMs <= 0) {
+      this.closeSession(session, 'detached timeout', true, false)
+      return
+    }
+    const timer = setTimeout(() => {
+      if (this.sessions.get(session.userId) !== session) return
+      if (session.cleanupTimer !== timer || session.ws !== null || session.closed) return
+      session.cleanupTimer = null
+      this.closeSession(session, 'detached timeout', true, false)
+    }, ttlMs)
+    session.cleanupTimer = timer
+    ;(timer as ReturnType<typeof setTimeout> & { unref?: () => void }).unref?.()
+  }
+
+  private clearCleanupTimer(session: ActiveTerminalSession): void {
+    if (!session.cleanupTimer) return
+    clearTimeout(session.cleanupTimer)
+    session.cleanupTimer = null
+  }
+
+  private closeSession(
+    session: ActiveTerminalSession,
+    reason: string,
+    killProcess: boolean,
+    closeClient: boolean,
+  ): void {
+    if (session.closed) return
+    session.closed = true
+    this.clearCleanupTimer(session)
+    if (this.sessions.get(session.userId) === session) this.sessions.delete(session.userId)
+
+    const client = session.ws
+    session.ws = null
+    try {
+      session.dataDisposable.dispose()
+    } catch {}
+    try {
+      session.exitDisposable.dispose()
+    } catch {}
+
+    if (closeClient && client?.readyState === 1) {
+      if (reason !== 'exit') sendJson(client, { type: 'status', state: 'closed', message: reason })
+      safeClose(client, 1000, reason)
+    }
+
+    if (killProcess) {
+      try {
+        session.pty.kill()
+      } catch (err) {
+        this.opts.logger.warn(
+          'official claude terminal kill failed',
+          { userId: session.userId, reason },
+          err,
+        )
+      }
+    }
+    this.opts.logger.info('official claude terminal closed', { userId: session.userId, reason })
+  }
+
+  private appendOutput(session: ActiveTerminalSession, data: string): void {
+    if (!data) return
+    let chunk = data
+    let bytes = Buffer.byteLength(chunk)
+    if (bytes > OUTPUT_REPLAY_MAX_BYTES) {
+      chunk = Buffer.from(chunk)
+        .subarray(bytes - OUTPUT_REPLAY_MAX_BYTES)
+        .toString('utf8')
+      bytes = Buffer.byteLength(chunk)
+      session.outputChunks = []
+      session.outputBytes = 0
+    }
+    session.outputChunks.push({ data: chunk, bytes })
+    session.outputBytes += bytes
+    while (session.outputBytes > OUTPUT_REPLAY_MAX_BYTES && session.outputChunks.length > 1) {
+      const removed = session.outputChunks.shift()
+      if (removed) session.outputBytes -= removed.bytes
+    }
+  }
+
+  private replayOutput(session: ActiveTerminalSession): string {
+    if (session.outputChunks.length === 0) return ''
+    return session.outputChunks.map((chunk) => chunk.data).join('')
   }
 }
 

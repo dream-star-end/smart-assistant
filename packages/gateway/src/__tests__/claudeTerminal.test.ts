@@ -1,6 +1,8 @@
 import * as assert from 'node:assert/strict'
 import { EventEmitter } from 'node:events'
+import { readFileSync } from 'node:fs'
 import { homedir } from 'node:os'
+import { resolve } from 'node:path'
 import { describe, test } from 'node:test'
 import type { WebSocket } from 'ws'
 
@@ -11,9 +13,12 @@ import {
   clampTerminalSize,
   isAllowedClaudeTerminalOrigin,
   isClaudeTerminalEnabled,
+  resolveDetachedTerminalTtlMs,
   resolveOfficialClaudeCwd,
 } from '../claudeTerminal.js'
 import type { Logger } from '../logger.js'
+
+const SERVER_SRC = readFileSync(resolve(import.meta.dirname, '..', 'server.ts'), 'utf-8')
 
 const logger: Logger = {
   debug: () => {},
@@ -123,10 +128,18 @@ describe('official Claude terminal helpers', () => {
     assert.equal('OPENCLAUDE_GATEWAY_TOKEN' in env, false)
   })
 
-  test('clamps terminal dimensions', () => {
+  test('clamps terminal dimensions and detached ttl override', () => {
     assert.deepEqual(clampTerminalSize(999, 999), { cols: 240, rows: 80 })
     assert.deepEqual(clampTerminalSize(1, 1), { cols: 20, rows: 5 })
     assert.deepEqual(clampTerminalSize('bad', Number.NaN), { cols: 100, rows: 30 })
+    assert.equal(
+      resolveDetachedTerminalTtlMs({ OPENCLAUDE_OFFICIAL_CLAUDE_TERMINAL_DETACHED_TTL_MS: '0' }),
+      0,
+    )
+    assert.equal(
+      resolveDetachedTerminalTtlMs({ OPENCLAUDE_OFFICIAL_CLAUDE_TERMINAL_DETACHED_TTL_MS: 'bad' }),
+      6 * 60 * 60_000,
+    )
   })
 
   test('allows no-origin websocket clients but rejects cross-origin browsers', () => {
@@ -147,7 +160,13 @@ describe('official Claude terminal helpers', () => {
 })
 
 describe('ClaudeTerminalManager lifecycle', () => {
-  test('spawns per user, forwards output/input, clamps resize, and kills on close', () => {
+  test('server exposes an authenticated HTTP terminate route', () => {
+    assert.match(SERVER_SRC, /url\.pathname === '\/api\/claude-terminal\/terminate'/)
+    assert.match(SERVER_SRC, /req\.method !== 'POST'/)
+    assert.match(SERVER_SRC, /claudeTerminal\?\.terminate\(this\.getUserId\(req\)\)/)
+  })
+
+  test('spawns per user, forwards output/input, clamps resize, detaches on close, and terminates explicitly', () => {
     const ptys: FakePty[] = []
     const manager = new ClaudeTerminalManager({
       logger,
@@ -184,11 +203,55 @@ describe('ClaudeTerminalManager lifecycle', () => {
     assert.deepEqual(ptys[0]!.resizes.at(-1), { cols: 240, rows: 80 })
 
     ws.emit('close')
+    assert.equal(manager.activeCount(), 1)
+    assert.equal(ptys[0]!.kills.length, 0)
+
+    assert.equal(manager.terminate('user-a'), true)
     assert.equal(manager.activeCount(), 0)
     assert.equal(ptys[0]!.kills.length, 1)
+    assert.equal(manager.terminate('user-a'), false)
   })
 
-  test('replaces an existing session for the same user without touching another user', () => {
+  test('reconnects the same user to the same pty, replays output, and fences stale sockets', () => {
+    const ptys: FakePty[] = []
+    const manager = new ClaudeTerminalManager({
+      logger,
+      env: {
+        OPENCLAUDE_OFFICIAL_CLAUDE_PATH: '/bin/echo',
+        OPENCLAUDE_OFFICIAL_CLAUDE_CWD: '/tmp',
+      },
+      spawn: () => {
+        const fake = new FakePty()
+        ptys.push(fake)
+        return fake
+      },
+    })
+
+    const ws1 = new FakeWs()
+    manager.handleConnection(asWs(ws1), 'user-a')
+    ptys[0]!.emitData('first')
+    ws1.emit('close')
+
+    const ws2 = new FakeWs()
+    manager.handleConnection(asWs(ws2), 'user-a')
+    assert.equal(ptys.length, 1)
+    assert.equal(manager.activeCount(), 1)
+    assert.deepEqual(messages(ws2).at(-1), { type: 'replay', data: 'first' })
+
+    ws1.emit('message', Buffer.from(JSON.stringify({ type: 'input', data: 'stale\n' })))
+    ws1.emit('message', Buffer.from(JSON.stringify({ type: 'resize', cols: 20, rows: 5 })))
+    ws1.emit('message', Buffer.from(JSON.stringify({ type: 'kill' })))
+    assert.deepEqual(ptys[0]!.writes, [])
+    assert.deepEqual(ptys[0]!.resizes, [])
+    assert.equal(ptys[0]!.kills.length, 0)
+
+    ws2.emit('message', Buffer.from(JSON.stringify({ type: 'input', data: 'fresh\n' })))
+    assert.deepEqual(ptys[0]!.writes, ['fresh\n'])
+    ptys[0]!.emitData(' live')
+    assert.deepEqual(messages(ws2).at(-1), { type: 'output', data: ' live' })
+  })
+
+  test('replaces an active websocket for the same user without killing the pty or touching another user', () => {
     const ptys: FakePty[] = []
     const manager = new ClaudeTerminalManager({
       logger,
@@ -212,24 +275,68 @@ describe('ClaudeTerminalManager lifecycle', () => {
     const wsA2 = new FakeWs()
     manager.handleConnection(asWs(wsA2), 'user-a')
     assert.equal(manager.activeCount(), 2)
-    assert.equal(ptys[0]!.kills.length, 1)
+    assert.equal(ptys.length, 2)
+    assert.equal(ptys[0]!.kills.length, 0)
     assert.equal(ptys[1]!.kills.length, 0)
     assert.equal(wsA1.closes.at(-1)?.reason, 'replaced')
+
+    wsA1.emit('message', Buffer.from(JSON.stringify({ type: 'kill' })))
+    assert.equal(ptys[0]!.kills.length, 0)
+    assert.equal(ptys[1]!.kills.length, 0)
   })
 
-  test('rejects oversized websocket messages before parsing JSON', () => {
+  test('explicit websocket kill still closes and deletes the session', () => {
+    const pty = new FakePty()
     const manager = new ClaudeTerminalManager({
       logger,
       env: {
         OPENCLAUDE_OFFICIAL_CLAUDE_PATH: '/bin/echo',
         OPENCLAUDE_OFFICIAL_CLAUDE_CWD: '/tmp',
       },
-      spawn: () => new FakePty(),
+      spawn: () => pty,
+    })
+    const ws = new FakeWs()
+    manager.handleConnection(asWs(ws), 'user-a')
+    ws.emit('message', Buffer.from(JSON.stringify({ type: 'kill' })))
+    assert.equal(manager.activeCount(), 0)
+    assert.equal(pty.kills.length, 1)
+  })
+
+  test('detached sessions are killed after the configured ttl with timer ownership checks', async () => {
+    const pty = new FakePty()
+    const manager = new ClaudeTerminalManager({
+      logger,
+      env: {
+        OPENCLAUDE_OFFICIAL_CLAUDE_PATH: '/bin/echo',
+        OPENCLAUDE_OFFICIAL_CLAUDE_CWD: '/tmp',
+        OPENCLAUDE_OFFICIAL_CLAUDE_TERMINAL_DETACHED_TTL_MS: '1',
+      },
+      spawn: () => pty,
+    })
+    const ws = new FakeWs()
+    manager.handleConnection(asWs(ws), 'user-a')
+    ws.emit('close')
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    assert.equal(manager.activeCount(), 0)
+    assert.equal(pty.kills.length, 1)
+  })
+
+  test('rejects oversized websocket messages before parsing JSON without killing the detached pty', () => {
+    const pty = new FakePty()
+    const manager = new ClaudeTerminalManager({
+      logger,
+      env: {
+        OPENCLAUDE_OFFICIAL_CLAUDE_PATH: '/bin/echo',
+        OPENCLAUDE_OFFICIAL_CLAUDE_CWD: '/tmp',
+      },
+      spawn: () => pty,
     })
     const ws = new FakeWs()
     manager.handleConnection(asWs(ws), 'user-a')
     ws.emit('message', Buffer.alloc(CLAUDE_TERMINAL_MAX_CLIENT_MESSAGE_BYTES + 1, 'x'))
     assert.equal(ws.closes.at(-1)?.code, 1009)
+    assert.equal(manager.activeCount(), 1)
+    assert.equal(pty.kills.length, 0)
   })
 
   test('honors the runtime disabled switch', () => {

@@ -1381,6 +1381,15 @@ export class Gateway {
       })
       return
     }
+    if (url.pathname === '/api/claude-terminal/terminate') {
+      if (req.method !== 'POST') {
+        this.sendError(res, 405, 'method not allowed')
+        return
+      }
+      const terminated = this.claudeTerminal?.terminate(this.getUserId(req)) ?? false
+      this.sendJson(res, 200, { ok: true, terminated })
+      return
+    }
     if (url.pathname === '/api/usage' && req.method === 'GET') {
       const agentId = url.searchParams.get('agentId') ?? undefined
       const sessionId = url.searchParams.get('sessionId') ?? undefined
@@ -5880,6 +5889,7 @@ export function shouldServeInline(mime: string): boolean {
 const KNOWN_ROUTES = [
   '/api/healthz',
   '/api/doctor',
+  '/api/claude-terminal/terminate',
   '/api/usage',
   '/api/usage/events',
   '/api/runs',

@@ -1,5 +1,6 @@
 // Official Claude Code terminal modal.
 // Runs the official `claude` CLI inside a gateway-owned PTY over /ws/claude-terminal.
+import { apiJson } from './api.js'
 import { $ } from './dom.js'
 import { state } from './state.js'
 import { closeModal, openModal, toast } from './ui.js'
@@ -35,6 +36,7 @@ let lastMobileControlPointerAt = 0
 let terminalTouchScrollY = null
 let terminalTouchScrollRemainder = 0
 let terminalTouchScrollTargets = []
+let terminateInFlight = false
 
 function byteLength(text) {
   return new TextEncoder().encode(text).length
@@ -326,7 +328,7 @@ function writeLine(text) {
   terminal.writeln(`\r\n${text}`)
 }
 
-function closeSocket(kill = true) {
+function closeSocket(kill = false) {
   const ws = socket
   socket = null
   if (!ws) return
@@ -343,7 +345,7 @@ function connectTerminal() {
     toast('请先登录 OpenClaude', 'error')
     return
   }
-  closeSocket(true)
+  closeSocket(false)
   reconnectRequested = false
   setStatus('connecting')
   const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:'
@@ -370,6 +372,12 @@ function connectTerminal() {
     if (!payload || typeof payload !== 'object') return
     if (payload.type === 'output' && typeof payload.data === 'string') {
       terminal?.write(payload.data)
+      return
+    }
+    if (payload.type === 'replay' && typeof payload.data === 'string') {
+      terminal?.reset()
+      if (payload.data) terminal?.write(payload.data)
+      fitVisibleTerminalSoon(true)
       return
     }
     if (payload.type === 'status') {
@@ -405,6 +413,13 @@ export async function openOfficialClaudeTerminal() {
   openModal(MODAL_ID)
   if (terminal) {
     fitVisibleTerminalSoon(true)
+    if (
+      !socket ||
+      socket.readyState === WebSocket.CLOSED ||
+      socket.readyState === WebSocket.CLOSING
+    ) {
+      connectTerminal()
+    }
     return
   }
   createTerminal()
@@ -424,15 +439,42 @@ export function closeOfficialClaudeTerminal() {
 }
 
 export function terminateOfficialClaudeTerminal() {
-  closeSocket(true)
-  disposeTerminal()
-  reconnectRequested = false
-  setStatus('closed', '已终止，重新打开会新建终端')
+  void terminateOfficialClaudeTerminalAsync()
+}
+
+async function terminateOfficialClaudeTerminalAsync() {
+  if (terminateInFlight) return
+  if (!state.token) {
+    toast('请先登录 OpenClaude', 'error')
+    return
+  }
+  terminateInFlight = true
+  setStatus('connecting', '正在终止 Claude Code')
+  try {
+    await apiJson('POST', '/api/claude-terminal/terminate', {})
+    closeSocket(false)
+    disposeTerminal()
+    reconnectRequested = false
+    setStatus('closed', '已终止，重新打开会新建终端')
+  } catch (err) {
+    if (socket?.readyState === WebSocket.OPEN) {
+      closeSocket(true)
+      disposeTerminal()
+      reconnectRequested = false
+      setStatus('closed', '已通过当前连接发送终止')
+      return
+    }
+    const message = err instanceof Error ? err.message : String(err)
+    setStatus('error', '终止失败')
+    toast(message || '终止 Claude Code 失败', 'error')
+  } finally {
+    terminateInFlight = false
+  }
 }
 
 function reconnectTerminal() {
   reconnectRequested = true
-  closeSocket(true)
+  closeSocket(false)
   if (!terminal) {
     createTerminal()
     attachTerminal()

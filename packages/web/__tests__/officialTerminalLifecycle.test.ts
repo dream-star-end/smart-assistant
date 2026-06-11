@@ -13,7 +13,7 @@ const INDEX = readFileSync(resolve(import.meta.dirname, '..', 'public', 'index.h
 function extractFunction(source: string, name: string): string {
   const lines = source.split('\n')
   const fnLineIdx = lines.findIndex((line) =>
-    new RegExp(`^(?:export\\s+)?function\\s+${name}\\s*\\(`).test(line),
+    new RegExp(`^(?:export\\s+)?(?:async\\s+)?function\\s+${name}\\s*\\(`).test(line),
   )
   if (fnLineIdx === -1) throw new Error(`Function "${name}" not found`)
 
@@ -38,8 +38,34 @@ describe('official Claude terminal lifecycle', () => {
   it('terminate remains the explicit path that closes and disposes the terminal', () => {
     const terminateSrc = extractFunction(SRC, 'terminateOfficialClaudeTerminal')
 
-    assert.match(terminateSrc, /closeSocket\(true\)/)
-    assert.match(terminateSrc, /disposeTerminal\(\)/)
+    assert.match(terminateSrc, /terminateOfficialClaudeTerminalAsync\(\)/)
+    assert.doesNotMatch(terminateSrc, /closeSocket\(true\)/)
+    assert.match(SRC, /apiJson\('POST', '\/api\/claude-terminal\/terminate', \{\}\)/)
+    assert.match(SRC, /closeSocket\(false\)/)
+    assert.match(SRC, /closeSocket\(true\)/)
+    assert.match(SRC, /已通过当前连接发送终止/)
+    assert.match(SRC, /disposeTerminal\(\)/)
+    assert.match(SRC, /终止失败/)
+  })
+
+  it('reconnect and reopen keep the server-side PTY instead of sending kill', () => {
+    const connectSrc = extractFunction(SRC, 'connectTerminal')
+    const reconnectSrc = extractFunction(SRC, 'reconnectTerminal')
+    const openSrc = extractFunction(SRC, 'openOfficialClaudeTerminal')
+
+    assert.match(connectSrc, /closeSocket\(false\)/)
+    assert.match(reconnectSrc, /closeSocket\(false\)/)
+    assert.doesNotMatch(reconnectSrc, /closeSocket\(true\)/)
+    assert.match(openSrc, /socket\.readyState === WebSocket\.CLOSED/)
+    assert.match(openSrc, /connectTerminal\(\)/)
+  })
+
+  it('replay frames reset and restore the terminal buffer on resume', () => {
+    const connectSrc = extractFunction(SRC, 'connectTerminal')
+
+    assert.match(connectSrc, /payload\.type === 'replay'/)
+    assert.match(connectSrc, /terminal\?\.reset\(\)/)
+    assert.match(connectSrc, /terminal\?\.write\(payload\.data\)/)
   })
 
   it('quick terminal keys send bytes without focusing the mobile textarea', () => {
