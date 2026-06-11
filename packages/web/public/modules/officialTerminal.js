@@ -10,11 +10,18 @@ const CONTAINER_ID = 'claude-terminal-container'
 const STATUS_ID = 'claude-terminal-status'
 const KILL_BTN_ID = 'claude-terminal-kill-btn'
 const RECONNECT_BTN_ID = 'claude-terminal-reconnect-btn'
+const NEW_OUTPUT_BTN_ID = 'claude-terminal-new-output-btn'
 const MOBILE_INPUT_ID = 'claude-terminal-mobile-input'
 const MOBILE_SEND_BTN_ID = 'claude-terminal-mobile-send-btn'
 const MOBILE_FOCUS_BTN_ID = 'claude-terminal-mobile-focus-btn'
+const MOBILE_HISTORY_PREV_BTN_ID = 'claude-terminal-history-prev-btn'
+const MOBILE_HISTORY_NEXT_BTN_ID = 'claude-terminal-history-next-btn'
+const WAKE_LOCK_BTN_ID = 'claude-terminal-wake-lock-btn'
 const CLOSE_SELECTOR = '[data-claude-terminal-close]'
 const MAX_TERMINAL_INPUT_BYTES = 32 * 1024
+const RECONNECT_ATTEMPT_MIN_MS = 1500
+const MOBILE_COMMAND_HISTORY_KEY = 'openclaude:claude-terminal:mobile-command-history'
+const MAX_MOBILE_COMMAND_HISTORY = 20
 const QUICK_KEYS = {
   enter: '\r',
   tab: '\t',
@@ -30,6 +37,7 @@ let terminal = null
 let fitAddon = null
 let socket = null
 let resizeObserver = null
+let terminalScrollDisposable = null
 let reconnectRequested = false
 let initialized = false
 let lastMobileControlPointerAt = 0
@@ -37,6 +45,12 @@ let terminalTouchScrollY = null
 let terminalTouchScrollRemainder = 0
 let terminalTouchScrollTargets = []
 let terminateInFlight = false
+let lastReconnectAttemptAt = 0
+let mobileCommandHistory = []
+let mobileCommandHistoryCursor = null
+let mobileCommandHistoryDraft = ''
+let wakeLockSentinel = null
+let wakeLockWanted = false
 
 function byteLength(text) {
   return new TextEncoder().encode(text).length
@@ -57,6 +71,10 @@ function setStatus(stateName, message = '') {
   if (!el) return
   el.dataset.state = stateName || 'idle'
   el.textContent = message ? `${statusLabel(stateName)} · ${message}` : statusLabel(stateName)
+}
+
+function terminalStatusState() {
+  return $(STATUS_ID)?.dataset.state || 'idle'
 }
 
 async function ensureTerminalDeps() {
@@ -111,6 +129,7 @@ function createTerminal() {
     sendTerminalInput(data, false)
   })
   terminal.onResize(({ cols, rows }) => send({ type: 'resize', cols, rows }))
+  terminalScrollDisposable = terminal.onScroll?.(() => updateNewOutputButton())
 }
 
 function isModalOpen() {
@@ -138,7 +157,15 @@ function attachTerminal() {
 }
 
 function disposeTerminal() {
+  releaseWakeLock()
+  hideNewOutputButton()
   cleanupTerminalTouchScrollTargets()
+  if (terminalScrollDisposable) {
+    try {
+      terminalScrollDisposable.dispose()
+    } catch {}
+    terminalScrollDisposable = null
+  }
   if (resizeObserver) {
     resizeObserver.disconnect()
     resizeObserver = null
@@ -170,6 +197,87 @@ function fitVisibleTerminalSoon(focus = false) {
     }
     if (focus) focusTerminalIfDesktop()
   })
+}
+
+function activeTerminalBuffer() {
+  try {
+    return terminal?.buffer?.active || null
+  } catch {
+    return null
+  }
+}
+
+function terminalAtBottom() {
+  const buffer = activeTerminalBuffer()
+  if (!buffer) return true
+  return buffer.viewportY >= buffer.baseY
+}
+
+function showNewOutputButton() {
+  const button = $(NEW_OUTPUT_BTN_ID)
+  if (!button) return
+  button.hidden = false
+  button.setAttribute('aria-hidden', 'false')
+  button.classList.add('is-visible')
+}
+
+function hideNewOutputButton() {
+  const button = $(NEW_OUTPUT_BTN_ID)
+  if (!button) return
+  button.classList.remove('is-visible')
+  button.setAttribute('aria-hidden', 'true')
+  button.hidden = true
+}
+
+function updateNewOutputButton() {
+  if (!terminal || terminalAtBottom()) {
+    hideNewOutputButton()
+  }
+}
+
+function scrollTerminalToBottom() {
+  if (!terminal) return
+  terminal.scrollToBottom()
+  hideNewOutputButton()
+}
+
+function restoreTerminalViewport(line) {
+  if (!terminal || typeof terminal.scrollToLine !== 'function') return
+  const buffer = activeTerminalBuffer()
+  const maxLine = Number.isFinite(buffer?.baseY) ? buffer.baseY : line
+  const targetLine = Math.max(0, Math.min(line, maxLine))
+  terminal.scrollToLine(targetLine)
+}
+
+function writeTerminalOutput(data) {
+  if (!terminal) return
+  const buffer = activeTerminalBuffer()
+  const wasAtBottom = terminalAtBottom()
+  const previousViewportY = Number.isFinite(buffer?.viewportY) ? buffer.viewportY : 0
+  let finished = false
+  const afterWrite = () => {
+    if (finished || !terminal) return
+    finished = true
+    if (!wasAtBottom) {
+      restoreTerminalViewport(previousViewportY)
+      showNewOutputButton()
+      return
+    }
+    hideNewOutputButton()
+  }
+  try {
+    if (terminal.write.length >= 2) {
+      terminal.write(data, afterWrite)
+    } else {
+      terminal.write(data)
+      requestAnimationFrame(afterWrite)
+    }
+  } catch {
+    try {
+      terminal.write(data)
+    } catch {}
+    requestAnimationFrame(afterWrite)
+  }
 }
 
 function terminalLineHeight() {
@@ -208,6 +316,7 @@ function handleTerminalTouchMove(event) {
   terminal.scrollLines(lines)
   terminalTouchScrollY = currentY
   terminalTouchScrollRemainder = rawDelta - lines * lineHeight
+  updateNewOutputButton()
 }
 
 function terminalTouchScrollTargetElements() {
@@ -262,8 +371,9 @@ function scrollTerminal(action) {
   } else if (action === 'page-down') {
     terminal.scrollPages(1)
   } else if (action === 'bottom') {
-    terminal.scrollToBottom()
+    scrollTerminalToBottom()
   }
+  updateNewOutputButton()
 }
 
 function send(payload) {
@@ -289,6 +399,159 @@ function normalizedMobileCommand(text) {
   return normalized.endsWith('\r') ? normalized : `${normalized}\r`
 }
 
+function loadMobileCommandHistory() {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(MOBILE_COMMAND_HISTORY_KEY) || '[]')
+    if (!Array.isArray(parsed)) return []
+    return parsed
+      .filter((item) => typeof item === 'string' && item.trim())
+      .slice(0, MAX_MOBILE_COMMAND_HISTORY)
+  } catch {
+    return []
+  }
+}
+
+function saveMobileCommandHistory() {
+  try {
+    localStorage.setItem(MOBILE_COMMAND_HISTORY_KEY, JSON.stringify(mobileCommandHistory))
+  } catch {}
+}
+
+function updateMobileHistoryButtons() {
+  const prev = $(MOBILE_HISTORY_PREV_BTN_ID)
+  const next = $(MOBILE_HISTORY_NEXT_BTN_ID)
+  if (prev) prev.disabled = mobileCommandHistory.length === 0
+  if (next) next.disabled = mobileCommandHistoryCursor == null
+}
+
+function resetMobileHistoryCursor() {
+  mobileCommandHistoryCursor = null
+  mobileCommandHistoryDraft = ''
+  updateMobileHistoryButtons()
+}
+
+function setMobileCommandText(text) {
+  const input = $(MOBILE_INPUT_ID)
+  if (!input) return
+  input.value = text
+  autoGrowMobileInput()
+}
+
+function rememberMobileCommand(text) {
+  const command = text.trim()
+  if (!command) return
+  mobileCommandHistory = [
+    command,
+    ...mobileCommandHistory.filter((item) => item !== command),
+  ].slice(0, MAX_MOBILE_COMMAND_HISTORY)
+  saveMobileCommandHistory()
+  resetMobileHistoryCursor()
+}
+
+function showPreviousMobileCommand() {
+  if (!mobileCommandHistory.length) {
+    toast('还没有移动端输入历史', 'info')
+    return
+  }
+  const input = $(MOBILE_INPUT_ID)
+  if (!input) return
+  if (mobileCommandHistoryCursor == null) {
+    mobileCommandHistoryDraft = input.value
+    mobileCommandHistoryCursor = 0
+  } else {
+    mobileCommandHistoryCursor = Math.min(
+      mobileCommandHistoryCursor + 1,
+      mobileCommandHistory.length - 1,
+    )
+  }
+  setMobileCommandText(mobileCommandHistory[mobileCommandHistoryCursor] || '')
+  updateMobileHistoryButtons()
+}
+
+function showNextMobileCommand() {
+  const input = $(MOBILE_INPUT_ID)
+  if (!input || mobileCommandHistoryCursor == null) return
+  if (mobileCommandHistoryCursor <= 0) {
+    setMobileCommandText(mobileCommandHistoryDraft)
+    resetMobileHistoryCursor()
+    return
+  }
+  mobileCommandHistoryCursor -= 1
+  setMobileCommandText(mobileCommandHistory[mobileCommandHistoryCursor] || '')
+  updateMobileHistoryButtons()
+}
+
+function wakeLockSupported() {
+  return Boolean(navigator.wakeLock?.request)
+}
+
+function updateWakeLockButton() {
+  const button = $(WAKE_LOCK_BTN_ID)
+  if (!button) return
+  const supported = wakeLockSupported()
+  button.hidden = !supported
+  button.disabled = !supported
+  button.dataset.active = wakeLockSentinel ? 'true' : 'false'
+  button.textContent = wakeLockSentinel ? '亮屏中' : '亮屏'
+}
+
+async function requestWakeLock() {
+  if (
+    !wakeLockWanted ||
+    wakeLockSentinel ||
+    !wakeLockSupported() ||
+    !isModalOpen() ||
+    !terminal ||
+    document.visibilityState !== 'visible'
+  ) {
+    updateWakeLockButton()
+    return
+  }
+  try {
+    const sentinel = await navigator.wakeLock.request('screen')
+    wakeLockSentinel = sentinel
+    sentinel.addEventListener?.('release', () => {
+      if (wakeLockSentinel === sentinel) wakeLockSentinel = null
+      updateWakeLockButton()
+      if (wakeLockWanted && isModalOpen() && terminal && document.visibilityState === 'visible') {
+        setTimeout(() => void requestWakeLock(), 500)
+      }
+    })
+    updateWakeLockButton()
+    toast('已开启亮屏保持', 'success')
+  } catch (err) {
+    wakeLockWanted = false
+    wakeLockSentinel = null
+    updateWakeLockButton()
+    const message = err instanceof Error ? err.message : String(err)
+    toast(message || '当前浏览器不允许保持亮屏', 'error')
+  }
+}
+
+function releaseWakeLock({ keepWanted = false } = {}) {
+  if (!keepWanted) wakeLockWanted = false
+  const sentinel = wakeLockSentinel
+  wakeLockSentinel = null
+  updateWakeLockButton()
+  try {
+    void sentinel?.release?.()
+  } catch {}
+}
+
+function toggleWakeLock() {
+  if (!wakeLockSupported()) {
+    toast('当前浏览器不支持保持亮屏', 'error')
+    return
+  }
+  if (wakeLockWanted || wakeLockSentinel) {
+    releaseWakeLock()
+    toast('已关闭亮屏保持', 'success')
+    return
+  }
+  wakeLockWanted = true
+  void requestWakeLock()
+}
+
 function focusMobileInput() {
   const input = $(MOBILE_INPUT_ID)
   input?.focus()
@@ -303,6 +566,7 @@ function sendMobileCommand() {
     return
   }
   if (sendTerminalInput(normalizedMobileCommand(text))) {
+    rememberMobileCommand(text)
     input.value = ''
     input.style.height = ''
   }
@@ -340,14 +604,30 @@ function closeSocket(kill = false) {
   } catch {}
 }
 
-function connectTerminal() {
+function socketIsConnectingOrOpen() {
+  return socket?.readyState === WebSocket.CONNECTING || socket?.readyState === WebSocket.OPEN
+}
+
+function ensureTerminalConnected(reason = '') {
+  if (!isModalOpen() || !terminal || !state.token) return false
+  if (socketIsConnectingOrOpen()) return false
+  const status = terminalStatusState()
+  if (status === 'exited' || status === 'disabled') return false
+  const now = Date.now()
+  if (now - lastReconnectAttemptAt < RECONNECT_ATTEMPT_MIN_MS) return false
+  lastReconnectAttemptAt = now
+  connectTerminal(reason)
+  return true
+}
+
+function connectTerminal(reason = '') {
   if (!state.token) {
     toast('请先登录 OpenClaude', 'error')
     return
   }
   closeSocket(false)
   reconnectRequested = false
-  setStatus('connecting')
+  setStatus('connecting', reason)
   const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:'
   const ws = new WebSocket(`${protocol}//${location.host}/ws/claude-terminal`, [
     'bearer',
@@ -371,12 +651,13 @@ function connectTerminal() {
     }
     if (!payload || typeof payload !== 'object') return
     if (payload.type === 'output' && typeof payload.data === 'string') {
-      terminal?.write(payload.data)
+      writeTerminalOutput(payload.data)
       return
     }
     if (payload.type === 'replay' && typeof payload.data === 'string') {
       terminal?.reset()
       if (payload.data) terminal?.write(payload.data)
+      hideNewOutputButton()
       fitVisibleTerminalSoon(true)
       return
     }
@@ -411,8 +692,10 @@ function connectTerminal() {
 export async function openOfficialClaudeTerminal() {
   await ensureTerminalDeps()
   openModal(MODAL_ID)
+  updateWakeLockButton()
   if (terminal) {
     fitVisibleTerminalSoon(true)
+    if (wakeLockWanted) void requestWakeLock()
     if (
       !socket ||
       socket.readyState === WebSocket.CLOSED ||
@@ -428,9 +711,11 @@ export async function openOfficialClaudeTerminal() {
   terminal?.writeln('Starting `claude` in a server-side PTY...')
   terminal?.writeln('关闭只隐藏窗口，点“终止”才结束进程。\r\n')
   connectTerminal()
+  if (wakeLockWanted) void requestWakeLock()
 }
 
 export function hideOfficialClaudeTerminal() {
+  releaseWakeLock()
   closeModal(MODAL_ID)
 }
 
@@ -474,6 +759,7 @@ async function terminateOfficialClaudeTerminalAsync() {
 
 function reconnectTerminal() {
   reconnectRequested = true
+  lastReconnectAttemptAt = 0
   closeSocket(false)
   if (!terminal) {
     createTerminal()
@@ -481,6 +767,7 @@ function reconnectTerminal() {
   } else {
     terminal.reset()
     terminal.scrollToBottom()
+    hideNewOutputButton()
   }
   connectTerminal()
 }
@@ -500,20 +787,69 @@ function runMobileControl(button) {
   }
 }
 
+function bindNoFocusButton(id, handler) {
+  const button = $(id)
+  if (!button) return
+  button.tabIndex = -1
+  button.addEventListener(
+    'pointerdown',
+    (event) => {
+      event.preventDefault()
+      event.stopPropagation()
+      lastMobileControlPointerAt = Date.now()
+      handler()
+      button.blur?.()
+    },
+    { passive: false },
+  )
+  button.addEventListener('click', (event) => {
+    event.preventDefault()
+    event.stopPropagation()
+    if (Date.now() - lastMobileControlPointerAt < 500) return
+    handler()
+    button.blur?.()
+  })
+}
+
+function handleTerminalVisibilityResume(reason) {
+  ensureTerminalConnected(reason)
+  if (wakeLockWanted) void requestWakeLock()
+  fitVisibleTerminalSoon(false)
+}
+
 export function initOfficialClaudeTerminal() {
   if (initialized) return
   initialized = true
+  mobileCommandHistory = loadMobileCommandHistory()
+  updateMobileHistoryButtons()
+  updateWakeLockButton()
   $(KILL_BTN_ID)?.addEventListener('click', () => terminateOfficialClaudeTerminal())
   $(RECONNECT_BTN_ID)?.addEventListener('click', () => reconnectTerminal())
+  $(NEW_OUTPUT_BTN_ID)?.addEventListener('click', () => scrollTerminalToBottom())
   $(MOBILE_SEND_BTN_ID)?.addEventListener('click', () => sendMobileCommand())
   $(MOBILE_FOCUS_BTN_ID)?.addEventListener('click', () => focusMobileInput())
-  $(MOBILE_INPUT_ID)?.addEventListener('input', () => autoGrowMobileInput())
+  bindNoFocusButton(MOBILE_HISTORY_PREV_BTN_ID, showPreviousMobileCommand)
+  bindNoFocusButton(MOBILE_HISTORY_NEXT_BTN_ID, showNextMobileCommand)
+  bindNoFocusButton(WAKE_LOCK_BTN_ID, toggleWakeLock)
+  $(MOBILE_INPUT_ID)?.addEventListener('input', () => {
+    autoGrowMobileInput()
+    resetMobileHistoryCursor()
+  })
   $(MOBILE_INPUT_ID)?.addEventListener('keydown', (event) => {
     if (event.key !== 'Enter' || event.shiftKey || event.isComposing) return
     event.preventDefault()
     sendMobileCommand()
   })
   window.addEventListener('resize', () => fitTerminal())
+  window.addEventListener('focus', () => handleTerminalVisibilityResume('窗口恢复，正在重连'))
+  window.addEventListener('online', () => handleTerminalVisibilityResume('网络恢复，正在重连'))
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') {
+      handleTerminalVisibilityResume('从后台恢复，正在重连')
+      return
+    }
+    releaseWakeLock({ keepWanted: true })
+  })
 
   document
     .querySelectorAll('[data-claude-terminal-key], [data-claude-terminal-action]')

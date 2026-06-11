@@ -4780,9 +4780,17 @@ body.voice-overlay-open {
   color: var(--fg-muted);
   font-size: var(--text-sm);
 }
-.claude-terminal-container {
+.claude-terminal-terminal-wrap {
   flex: 1;
   min-height: 320px;
+  min-width: 0;
+  position: relative;
+  display: flex;
+}
+.claude-terminal-container {
+  flex: 1;
+  min-height: 0;
+  min-width: 0;
   overflow: hidden;
   overscroll-behavior: contain;
   touch-action: pan-y;
@@ -4807,6 +4815,36 @@ body.voice-overlay-open {
 }
 .claude-terminal-container .xterm-screen {
   touch-action: pan-y;
+}
+.claude-terminal-new-output {
+  position: absolute;
+  left: 50%;
+  bottom: var(--space-4);
+  z-index: 2;
+  min-height: 38px;
+  padding: 8px 14px;
+  border: 1px solid var(--accent-border);
+  border-radius: var(--radius-full);
+  background: color-mix(in srgb, var(--accent) 14%, var(--bg-elevated));
+  color: var(--accent);
+  font-size: var(--text-sm);
+  font-weight: 600;
+  box-shadow: var(--shadow-lg);
+  opacity: 0;
+  pointer-events: none;
+  transform: translate(-50%, 8px);
+  transition: opacity 160ms ease, transform 160ms ease, background 120ms ease;
+  touch-action: manipulation;
+  user-select: none;
+}
+.claude-terminal-new-output.is-visible {
+  opacity: 1;
+  pointer-events: auto;
+  transform: translate(-50%, 0);
+}
+.claude-terminal-new-output:active {
+  background: var(--accent-soft);
+  transform: translate(-50%, 1px) scale(0.98);
 }
 .claude-terminal-mobile-dock {
   display: none;
@@ -4841,12 +4879,14 @@ body.voice-overlay-open {
   border-color: var(--accent);
   box-shadow: var(--ring);
 }
+.claude-terminal-mobile-tools,
 .claude-terminal-mobile-keys {
   display: flex;
   gap: var(--space-2);
   overflow-x: auto;
   padding-bottom: 2px;
 }
+.claude-terminal-mobile-tools button,
 .claude-terminal-mobile-keys button {
   flex: 0 0 auto;
   min-height: 34px;
@@ -4857,12 +4897,28 @@ body.voice-overlay-open {
   color: var(--fg);
   font-family: var(--font-mono);
   font-size: var(--text-sm);
+  touch-action: manipulation;
+  user-select: none;
+}
+.claude-terminal-mobile-tools button {
+  font-family: inherit;
+  color: var(--fg-muted);
+}
+.claude-terminal-mobile-tools button[data-active="true"] {
+  border-color: var(--accent-border);
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+.claude-terminal-mobile-tools button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
 }
 .claude-terminal-mobile-keys button[data-claude-terminal-action] {
   border-color: var(--accent-border);
   background: var(--accent-soft);
   color: var(--accent);
 }
+.claude-terminal-mobile-tools button:active,
 .claude-terminal-mobile-keys button:active {
   transform: scale(0.97);
   background: var(--bg-hover);
@@ -4901,11 +4957,19 @@ body.voice-overlay-open {
     font-size: var(--text-xs);
     line-height: 1.35;
   }
-  .claude-terminal-container {
+  .claude-terminal-terminal-wrap {
     flex: 1 1 180px;
     min-height: 0;
+  }
+  .claude-terminal-container {
     padding: var(--space-2);
     border-radius: var(--radius-lg);
+  }
+  .claude-terminal-new-output {
+    bottom: var(--space-2);
+    min-height: 40px;
+    padding: 8px 14px;
+    font-size: var(--text-xs);
   }
   .claude-terminal-mobile-dock {
     display: flex;
@@ -4919,9 +4983,11 @@ body.voice-overlay-open {
     min-height: 42px;
     padding-inline: 12px;
   }
+  .claude-terminal-mobile-tools,
   .claude-terminal-mobile-keys {
     gap: var(--space-1);
   }
+  .claude-terminal-mobile-tools button,
   .claude-terminal-mobile-keys button {
     min-height: 32px;
     padding: 5px 9px;
