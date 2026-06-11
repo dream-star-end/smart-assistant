@@ -4791,11 +4791,35 @@ body.voice-overlay-open {
   color: var(--fg-muted);
   font-size: var(--text-sm);
 }
+.claude-terminal-files-backdrop {
+  z-index: 260;
+  padding-top: min(6vh, var(--space-8));
+}
+.claude-terminal-files-modal {
+  max-width: min(1080px, calc(100vw - 32px));
+  height: min(86dvh, 820px);
+  max-height: 86dvh;
+}
+.claude-terminal-files-head p {
+  margin: var(--space-1) 0 0;
+  color: var(--fg-muted);
+  font-size: var(--text-sm);
+  line-height: 1.45;
+}
+.claude-terminal-files-body {
+  display: flex;
+  min-height: 0;
+  overflow: hidden;
+}
+.claude-terminal-files-foot {
+  justify-content: space-between;
+}
 .claude-terminal-file-panel {
   display: flex;
+  flex: 1;
   flex-direction: column;
+  min-height: 0;
   gap: var(--space-3);
-  max-height: min(340px, 42dvh);
   padding: var(--space-3);
   border: 1px solid var(--border);
   border-radius: var(--radius-xl);
@@ -4823,14 +4847,20 @@ body.voice-overlay-open {
   color: var(--accent);
 }
 .claude-terminal-file-pane {
+  flex: 1;
   min-height: 0;
   overflow: hidden;
 }
-.claude-terminal-file-list {
+.claude-terminal-file-pane:not([hidden]) {
   display: flex;
   flex-direction: column;
+}
+.claude-terminal-file-list {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
   gap: var(--space-2);
-  max-height: 240px;
+  min-height: 0;
   overflow: auto;
 }
 .claude-terminal-file-row {
@@ -5142,13 +5172,34 @@ body.voice-overlay-open {
     font-size: var(--text-xs);
     line-height: 1.35;
   }
+  .claude-terminal-files-backdrop {
+    padding: 0;
+  }
+  .claude-terminal-files-modal {
+    max-width: 100%;
+    height: 100dvh;
+    max-height: 100dvh;
+  }
+  .claude-terminal-files-head {
+    padding: var(--space-3) var(--space-4);
+  }
+  .claude-terminal-files-head p {
+    display: none;
+  }
+  .claude-terminal-files-body {
+    max-height: none !important;
+    padding: var(--space-3);
+  }
+  .claude-terminal-files-foot {
+    padding: var(--space-3) var(--space-4) calc(var(--space-3) + env(safe-area-inset-bottom, 0));
+  }
   .claude-terminal-file-panel {
-    max-height: 36dvh;
+    max-height: none;
     padding: var(--space-2);
     border-radius: var(--radius-lg);
   }
   .claude-terminal-file-list {
-    max-height: 28dvh;
+    max-height: none;
   }
   .claude-terminal-file-row {
     grid-template-columns: auto minmax(0, 1fr);

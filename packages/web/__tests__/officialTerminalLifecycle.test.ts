@@ -151,12 +151,33 @@ describe('official Claude terminal lifecycle', () => {
   })
 
   it('cache-busts terminal module when changing mobile controls', () => {
-    assert.match(MAIN, /from '\.\/officialTerminal\.js\?v=5'/)
-    assert.match(SW, /\/modules\/officialTerminal\.js\?v=5/)
-    assert.match(INDEX, /\/modules\/main\.js\?v=57/)
-    assert.match(INDEX, /\/style\.css\?v=49/)
-    assert.match(INDEX, /sw-flush-v19/)
-    assert.match(SW, /openclaude-v77/)
+    assert.match(MAIN, /from '\.\/officialTerminal\.js\?v=6'/)
+    assert.match(SW, /\/modules\/officialTerminal\.js\?v=6/)
+    assert.match(INDEX, /\/modules\/main\.js\?v=58/)
+    assert.match(INDEX, /\/style\.css\?v=50/)
+    assert.match(INDEX, /sw-flush-v20/)
+    assert.match(SW, /openclaude-v78/)
+  })
+
+  it('terminal files live in a separate wide modal with Escape closing files first', () => {
+    const toggleSrc = extractFunction(SRC, 'toggleTerminalFilePanel')
+    const hideSrc = extractFunction(SRC, 'hideOfficialClaudeTerminal')
+    const initSrc = extractFunction(SRC, 'initOfficialClaudeTerminal')
+
+    assert.match(INDEX, /id="claude-terminal-files-modal"/)
+    assert.match(INDEX, /claude-terminal-files-modal[\s\S]*id="claude-terminal-file-panel"/)
+    assert.doesNotMatch(
+      INDEX,
+      /claude-terminal-body[\s\S]*id="claude-terminal-file-panel"[\s\S]*claude-terminal-terminal-wrap/,
+    )
+    assert.match(STYLE, /\.claude-terminal-files-modal\s*{[\s\S]*?max-width:\s*min\(1080px/)
+    assert.match(toggleSrc, /openModal\(FILE_MODAL_ID\)/)
+    assert.match(toggleSrc, /closeTerminalFileModal\(\)/)
+    assert.match(hideSrc, /closeTerminalFileModal\(\)/)
+    assert.match(
+      initSrc,
+      /isTerminalFileModalOpen\(\)[\s\S]*?closeTerminalFileModal\(\)[\s\S]*?return/,
+    )
   })
 
   it('wake lock helper remains gated even though the mobile shortcut is hidden', () => {
