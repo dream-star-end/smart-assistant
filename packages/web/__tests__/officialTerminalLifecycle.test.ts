@@ -9,6 +9,11 @@ const SRC = readFileSync(
 )
 const STYLE = readFileSync(resolve(import.meta.dirname, '..', 'public', 'style.css'), 'utf-8')
 const INDEX = readFileSync(resolve(import.meta.dirname, '..', 'public', 'index.html'), 'utf-8')
+const MAIN = readFileSync(
+  resolve(import.meta.dirname, '..', 'public', 'modules', 'main.js'),
+  'utf-8',
+)
+const SW = readFileSync(resolve(import.meta.dirname, '..', 'public', 'sw.js'), 'utf-8')
 
 function extractFunction(source: string, name: string): string {
   const lines = source.split('\n')
@@ -66,6 +71,36 @@ describe('official Claude terminal lifecycle', () => {
     assert.match(connectSrc, /payload\.type === 'replay'/)
     assert.match(connectSrc, /terminal\?\.reset\(\)/)
     assert.match(connectSrc, /terminal\?\.write\(payload\.data\)/)
+    assert.match(connectSrc, /hideNewOutputButton\(\)/)
+  })
+
+  it('auto-reconnects on mobile resume without treating transient errors as fatal', () => {
+    const ensureSrc = extractFunction(SRC, 'ensureTerminalConnected')
+    const initSrc = extractFunction(SRC, 'initOfficialClaudeTerminal')
+
+    assert.match(ensureSrc, /socketIsConnectingOrOpen\(\)/)
+    assert.match(ensureSrc, /RECONNECT_ATTEMPT_MIN_MS/)
+    assert.match(ensureSrc, /status === 'exited' \|\| status === 'disabled'/)
+    assert.doesNotMatch(ensureSrc, /status === 'error'/)
+    assert.match(initSrc, /visibilitychange/)
+    assert.match(initSrc, /window\.addEventListener\('focus'/)
+    assert.match(initSrc, /window\.addEventListener\('online'/)
+    assert.match(initSrc, /handleTerminalVisibilityResume\('从后台恢复，正在重连'\)/)
+  })
+
+  it('preserves scrollback reading position and exposes a new-output jump chip', () => {
+    const writeSrc = extractFunction(SRC, 'writeTerminalOutput')
+    const bottomSrc = extractFunction(SRC, 'scrollTerminalToBottom')
+
+    assert.match(INDEX, /claude-terminal-new-output-btn/)
+    assert.match(STYLE, /\.claude-terminal-new-output/)
+    assert.match(writeSrc, /terminalAtBottom\(\)/)
+    assert.match(writeSrc, /previousViewportY/)
+    assert.match(writeSrc, /terminal\.write\(data, afterWrite\)/)
+    assert.match(writeSrc, /restoreTerminalViewport\(previousViewportY\)/)
+    assert.match(writeSrc, /showNewOutputButton\(\)/)
+    assert.match(bottomSrc, /terminal\.scrollToBottom\(\)/)
+    assert.match(bottomSrc, /hideNewOutputButton\(\)/)
   })
 
   it('quick terminal keys send bytes without focusing the mobile textarea', () => {
@@ -86,9 +121,48 @@ describe('official Claude terminal lifecycle', () => {
     assert.match(INDEX, /data-claude-terminal-action="bottom"/)
     assert.match(scrollSrc, /terminal\.scrollPages\(-1\)/)
     assert.match(scrollSrc, /terminal\.scrollPages\(1\)/)
-    assert.match(scrollSrc, /terminal\.scrollToBottom\(\)/)
+    assert.match(scrollSrc, /scrollTerminalToBottom\(\)/)
     assert.match(controlSrc, /scrollTerminal\(button\.dataset\.claudeTerminalAction\)/)
     assert.doesNotMatch(controlSrc, /focusMobileInput/)
+  })
+
+  it('mobile composer keeps reusable command history separate from terminal arrow keys', () => {
+    const rememberSrc = extractFunction(SRC, 'rememberMobileCommand')
+    const loadSrc = extractFunction(SRC, 'loadMobileCommandHistory')
+    const prevSrc = extractFunction(SRC, 'showPreviousMobileCommand')
+    const nextSrc = extractFunction(SRC, 'showNextMobileCommand')
+
+    assert.match(INDEX, /claude-terminal-history-prev-btn/)
+    assert.match(INDEX, /claude-terminal-history-next-btn/)
+    assert.match(loadSrc, /MOBILE_COMMAND_HISTORY_KEY/)
+    assert.match(rememberSrc, /MAX_MOBILE_COMMAND_HISTORY/)
+    assert.match(prevSrc, /setMobileCommandText/)
+    assert.match(nextSrc, /mobileCommandHistoryDraft/)
+    assert.doesNotMatch(prevSrc, /sendTerminalInput/)
+    assert.doesNotMatch(nextSrc, /sendTerminalInput/)
+  })
+
+  it('cache-busts terminal module when adding mobile controls', () => {
+    assert.match(INDEX, /claude-terminal-history-prev-btn" type="button" tabindex="-1" disabled/)
+    assert.match(INDEX, /claude-terminal-history-next-btn" type="button" tabindex="-1" disabled/)
+    assert.match(MAIN, /from '\.\/officialTerminal\.js\?v=2'/)
+    assert.match(SW, /\/modules\/officialTerminal\.js\?v=2/)
+    assert.match(INDEX, /\/modules\/main\.js\?v=54/)
+    assert.match(SW, /openclaude-v74/)
+  })
+
+  it('mobile wake lock is optional and gated by modal visibility', () => {
+    const requestSrc = extractFunction(SRC, 'requestWakeLock')
+    const releaseSrc = extractFunction(SRC, 'releaseWakeLock')
+    const initSrc = extractFunction(SRC, 'initOfficialClaudeTerminal')
+
+    assert.match(INDEX, /claude-terminal-wake-lock-btn/)
+    assert.match(requestSrc, /navigator\.wakeLock\.request\('screen'\)/)
+    assert.match(requestSrc, /!isModalOpen\(\)/)
+    assert.match(requestSrc, /!terminal/)
+    assert.match(requestSrc, /document\.visibilityState !== 'visible'/)
+    assert.match(releaseSrc, /keepWanted = false/)
+    assert.match(initSrc, /releaseWakeLock\(\{ keepWanted: true \}\)/)
   })
 
   it('mobile input dock is hidden on desktop and shown on narrow screens only', () => {

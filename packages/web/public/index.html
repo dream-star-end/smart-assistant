@@ -16,7 +16,7 @@
 <link rel="apple-touch-icon" href="/icon.svg" />
 <link rel="stylesheet" href="/vendor/github-dark.min.css" />
 <link rel="stylesheet" href="/vendor/katex/katex.min.css" />
-<link rel="stylesheet" href="/style.css?v=45" />
+<link rel="stylesheet" href="/style.css?v=46" />
 <link rel="stylesheet" href="/vendor/xterm/xterm.css?v=1" />
 <style>/* Inline styles removed — see style.css */
 </style>
@@ -802,12 +802,20 @@
         <span id="claude-terminal-status" class="claude-terminal-status" data-state="idle">未连接</span>
         <span class="claude-terminal-hint">关闭=隐藏会话；终止=结束 Claude。</span>
       </div>
-      <div id="claude-terminal-container" class="claude-terminal-container" aria-label="Claude Code terminal"></div>
+      <div class="claude-terminal-terminal-wrap">
+        <div id="claude-terminal-container" class="claude-terminal-container" aria-label="Claude Code terminal"></div>
+        <button id="claude-terminal-new-output-btn" class="claude-terminal-new-output" type="button" hidden aria-hidden="true">有新输出 · 到底部</button>
+      </div>
       <div class="claude-terminal-mobile-dock" aria-label="移动端终端输入">
         <div class="claude-terminal-mobile-input-row">
           <textarea id="claude-terminal-mobile-input" rows="1" placeholder="移动端输入命令，点发送会自动回车" autocomplete="off" autocapitalize="none" autocorrect="off" spellcheck="false"></textarea>
           <button id="claude-terminal-mobile-send-btn" class="btn btn-primary" type="button">发送</button>
           <button id="claude-terminal-mobile-focus-btn" class="btn btn-ghost" type="button">键盘</button>
+        </div>
+        <div class="claude-terminal-mobile-tools" aria-label="移动端输入辅助">
+          <button id="claude-terminal-history-prev-btn" type="button" tabindex="-1" disabled>上一条</button>
+          <button id="claude-terminal-history-next-btn" type="button" tabindex="-1" disabled>下一条</button>
+          <button id="claude-terminal-wake-lock-btn" type="button" tabindex="-1" hidden>亮屏</button>
         </div>
         <div class="claude-terminal-mobile-keys" aria-label="终端快捷键">
           <button type="button" tabindex="-1" data-claude-terminal-action="page-up">Pg↑</button>
@@ -877,6 +885,6 @@
 <script src="/vendor/katex/katex.min.js" defer></script>
 <script src="/vendor/qrcode.min.js"></script>
 <div id="toast" class="toast"></div>
-<script type="module" src="/modules/main.js?v=53"></script>
+<script type="module" src="/modules/main.js?v=54"></script>
 </body>
 </html>
