@@ -32,6 +32,8 @@ let resizeObserver = null
 let reconnectRequested = false
 let initialized = false
 let lastQuickKeyPointerAt = 0
+let terminalTouchScrollY = null
+let terminalTouchScrollRemainder = 0
 
 function byteLength(text) {
   return new TextEncoder().encode(text).length
@@ -162,6 +164,62 @@ function fitVisibleTerminalSoon(focus = false) {
       send({ type: 'resize', cols: terminal.cols, rows: terminal.rows })
     }
     if (focus) focusTerminalIfDesktop()
+  })
+}
+
+function terminalLineHeight() {
+  const viewport = $(CONTAINER_ID)?.querySelector?.('.xterm-viewport')
+  if (viewport?.clientHeight && terminal?.rows) {
+    return Math.max(8, viewport.clientHeight / terminal.rows)
+  }
+  return 16
+}
+
+function resetTerminalTouchScroll() {
+  terminalTouchScrollY = null
+  terminalTouchScrollRemainder = 0
+}
+
+function handleTerminalTouchStart(event) {
+  if (!terminal || event.touches.length !== 1) {
+    resetTerminalTouchScroll()
+    return
+  }
+  terminalTouchScrollY = event.touches[0].clientY
+  terminalTouchScrollRemainder = 0
+}
+
+function handleTerminalTouchMove(event) {
+  if (terminalTouchScrollY == null || !terminal || event.touches.length !== 1) return
+  event.preventDefault()
+  event.stopPropagation()
+
+  const currentY = event.touches[0].clientY
+  const rawDelta = terminalTouchScrollY - currentY + terminalTouchScrollRemainder
+  const lineHeight = terminalLineHeight()
+  const lines = rawDelta > 0 ? Math.floor(rawDelta / lineHeight) : Math.ceil(rawDelta / lineHeight)
+  if (lines === 0) return
+
+  terminal.scrollLines(lines)
+  terminalTouchScrollY = currentY
+  terminalTouchScrollRemainder = rawDelta - lines * lineHeight
+}
+
+function initTerminalTouchScroll() {
+  const container = $(CONTAINER_ID)
+  if (!container) return
+  container.addEventListener('touchstart', handleTerminalTouchStart, {
+    capture: true,
+    passive: true,
+  })
+  container.addEventListener('touchmove', handleTerminalTouchMove, {
+    capture: true,
+    passive: false,
+  })
+  container.addEventListener('touchend', resetTerminalTouchScroll, { capture: true, passive: true })
+  container.addEventListener('touchcancel', resetTerminalTouchScroll, {
+    capture: true,
+    passive: true,
   })
 }
 
@@ -363,6 +421,7 @@ export function initOfficialClaudeTerminal() {
     sendMobileCommand()
   })
   window.addEventListener('resize', () => fitTerminal())
+  initTerminalTouchScroll()
 
   document.querySelectorAll('[data-claude-terminal-key]').forEach((button) => {
     button.tabIndex = -1
