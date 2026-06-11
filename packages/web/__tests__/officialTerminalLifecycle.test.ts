@@ -7,6 +7,7 @@ const SRC = readFileSync(
   resolve(import.meta.dirname, '..', 'public', 'modules', 'officialTerminal.js'),
   'utf-8',
 )
+const STYLE = readFileSync(resolve(import.meta.dirname, '..', 'public', 'style.css'), 'utf-8')
 
 function extractFunction(source: string, name: string): string {
   const lines = source.split('\n')
@@ -47,5 +48,13 @@ describe('official Claude terminal lifecycle', () => {
     assert.match(initSrc, /pointerdown/)
     assert.doesNotMatch(quickKeySrc, /focusMobileInput/)
     assert.match(quickKeySrc, /button\?\.blur\?\.\(\)/)
+  })
+
+  it('mobile input dock is hidden on desktop and shown on narrow screens only', () => {
+    assert.match(STYLE, /\.claude-terminal-mobile-dock\s*{\s*display:\s*none;/)
+    assert.match(
+      STYLE,
+      /@media \(max-width: 860px\) {[\s\S]*?\.claude-terminal-mobile-dock\s*{[\s\S]*?display:\s*flex;/,
+    )
   })
 })
