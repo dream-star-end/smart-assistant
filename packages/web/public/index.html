@@ -16,7 +16,7 @@
 <link rel="apple-touch-icon" href="/icon.svg" />
 <link rel="stylesheet" href="/vendor/github-dark.min.css" />
 <link rel="stylesheet" href="/vendor/katex/katex.min.css" />
-<link rel="stylesheet" href="/style.css?v=41" />
+<link rel="stylesheet" href="/style.css?v=42" />
 <link rel="stylesheet" href="/vendor/xterm/xterm.css?v=1" />
 <style>/* Inline styles removed — see style.css */
 </style>
@@ -803,6 +803,21 @@
         <span class="claude-terminal-hint">默认工作目录为服务器用户 Home，可通过 <code>OPENCLAUDE_OFFICIAL_CLAUDE_CWD</code> 覆盖。</span>
       </div>
       <div id="claude-terminal-container" class="claude-terminal-container" aria-label="Claude Code terminal"></div>
+      <div class="claude-terminal-mobile-dock" aria-label="移动端终端输入">
+        <div class="claude-terminal-mobile-input-row">
+          <textarea id="claude-terminal-mobile-input" rows="1" placeholder="移动端输入命令，点发送会自动回车" autocomplete="off" autocapitalize="none" autocorrect="off" spellcheck="false"></textarea>
+          <button id="claude-terminal-mobile-send-btn" class="btn btn-primary" type="button">发送</button>
+          <button id="claude-terminal-mobile-focus-btn" class="btn btn-ghost" type="button">键盘</button>
+        </div>
+        <div class="claude-terminal-mobile-keys" aria-label="终端快捷键">
+          <button type="button" data-claude-terminal-key="enter">Enter</button>
+          <button type="button" data-claude-terminal-key="tab">Tab</button>
+          <button type="button" data-claude-terminal-key="ctrl-c">Ctrl-C</button>
+          <button type="button" data-claude-terminal-key="esc">Esc</button>
+          <button type="button" data-claude-terminal-key="up">↑</button>
+          <button type="button" data-claude-terminal-key="down">↓</button>
+        </div>
+      </div>
     </div>
     <div class="modal-foot claude-terminal-foot">
       <button id="claude-terminal-reconnect-btn" class="btn btn-ghost">重连</button>
@@ -837,7 +852,7 @@
 <!-- Force SW cache refresh (one-time, remove after all clients updated) -->
 <script>
 (function(){
-  var V='sw-flush-v12';
+  var V='sw-flush-v13';
   if(localStorage.getItem(V))return;
   if('serviceWorker' in navigator){
     navigator.serviceWorker.getRegistrations().then(function(regs){
