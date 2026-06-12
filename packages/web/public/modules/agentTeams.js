@@ -1,14 +1,76 @@
 import { apiGet, apiJson } from './api.js?v=17cf8f69'
 import { $, htmlSafeEscape } from './dom.js?v=17cf8f69'
+import { scheduleSaveFromUserEdit } from './sessions.js?v=17cf8f69'
 import { state } from './state.js?v=17cf8f69'
 import { toast, toastOptsFromError } from './ui.js?v=17cf8f69'
 
 const TEAM_ID_RE = /^[a-zA-Z0-9_-]+$/
 export const SELECTED_TEAM_KEY = 'openclaude_selected_team'
+const SELECTED_TEAM_USER_PREFIX = `${SELECTED_TEAM_KEY}:user:`
 let _editingTeamId = ''
+let _agentTeamsLoaded = false
+let _agentTeamsOwnerUserId = ''
 
 function _emitTeamSelectionChanged() {
   document.dispatchEvent(new CustomEvent('agent-team-selection-changed'))
+}
+
+function _currentSession() {
+  return state.sessions?.get?.(state.currentSessionId) || null
+}
+
+function _selectedTeamStorageKey() {
+  const userId = _currentUserId()
+  return userId ? `${SELECTED_TEAM_USER_PREFIX}${userId}` : SELECTED_TEAM_KEY
+}
+
+function _currentUserId() {
+  return state.userId ? String(state.userId) : ''
+}
+
+function _readStoredSelectedTeamId() {
+  try {
+    const key = _selectedTeamStorageKey()
+    const scoped = localStorage.getItem(key) || ''
+    if (scoped || key === SELECTED_TEAM_KEY) return scoped
+    // Upgrade path: preserve the user's existing browser choice once, then
+    // future writes go to the user-scoped key and logout clears both forms.
+    return localStorage.getItem(SELECTED_TEAM_KEY) || ''
+  } catch {
+    return ''
+  }
+}
+
+function _selectedTeamCandidateForSession(sess) {
+  if (sess && Object.prototype.hasOwnProperty.call(sess, '_selectedTeamId')) {
+    return sess._selectedTeamId || ''
+  }
+  return _readStoredSelectedTeamId()
+}
+
+function _writeStoredSelectedTeamId(teamId = '') {
+  try {
+    const key = _selectedTeamStorageKey()
+    if (teamId) localStorage.setItem(key, teamId)
+    else localStorage.removeItem(key)
+    if (key !== SELECTED_TEAM_KEY) localStorage.removeItem(SELECTED_TEAM_KEY)
+  } catch {}
+}
+
+export function clearStoredAgentTeamSelection() {
+  state.selectedTeamId = ''
+  state.agentTeams = []
+  _agentTeamsLoaded = false
+  _agentTeamsOwnerUserId = ''
+  const sess = _currentSession()
+  if (sess) sess._selectedTeamId = ''
+  try {
+    // Clear the legacy cross-user key so the next login never inherits this
+    // user's picker state. Keep user-scoped keys: they are isolated by
+    // state.userId and preserve convenience when the same user logs in again.
+    localStorage.removeItem(SELECTED_TEAM_KEY)
+  } catch {}
+  _emitTeamSelectionChanged()
 }
 
 const TEAM_TEMPLATES = [
@@ -229,9 +291,9 @@ export function getSelectedTeamForSend() {
   const team = _teamById(id)
   if (!team) {
     state.selectedTeamId = ''
-    try {
-      localStorage.removeItem(SELECTED_TEAM_KEY)
-    } catch {}
+    const sess = _currentSession()
+    if (sess) sess._selectedTeamId = ''
+    _writeStoredSelectedTeamId('')
     renderTeamDropdown()
     toast('团队配置不存在,已关闭团队模式', 'warning')
     return null
@@ -258,21 +320,32 @@ export function teamDisplayPrefix(team) {
 }
 
 export async function reloadAgentTeams() {
+  const ownerUserId = _currentUserId()
   try {
     const data = await apiGet('/api/agent-teams')
     state.agentTeams = Array.isArray(data.teams) ? data.teams : []
+    _agentTeamsLoaded = true
+    _agentTeamsOwnerUserId = ownerUserId
   } catch (err) {
     console.warn('load agent teams failed:', err)
-    state.agentTeams = []
-  }
-  const stored = (() => {
-    try {
-      return localStorage.getItem(SELECTED_TEAM_KEY) || ''
-    } catch {
-      return ''
+    // Transient reload failures should not erase the current user's selected
+    // team. Preserve the previously loaded same-user list; clear only if the
+    // list belongs to a different/unknown user to avoid cross-account leakage.
+    if (!_agentTeamsLoaded || _agentTeamsOwnerUserId !== ownerUserId) {
+      state.agentTeams = []
+      _agentTeamsLoaded = false
+      _agentTeamsOwnerUserId = ''
     }
-  })()
+    _emitTeamSelectionChanged()
+    renderTeamDropdown()
+    renderTeamsManagementList()
+    return
+  }
+  const sess = _currentSession()
+  const stored = _selectedTeamCandidateForSession(sess)
   state.selectedTeamId = state.agentTeams.some((t) => t.id === stored) ? stored : ''
+  if (sess) sess._selectedTeamId = state.selectedTeamId
+  if (state.selectedTeamId) _writeStoredSelectedTeamId(state.selectedTeamId)
   _emitTeamSelectionChanged()
   renderTeamDropdown()
   renderTeamsManagementList()
@@ -281,15 +354,29 @@ export async function reloadAgentTeams() {
 export function selectAgentTeam(teamId = '') {
   const nextTeamId = teamId && (state.agentTeams || []).some((t) => t.id === teamId) ? teamId : ''
   state.selectedTeamId = nextTeamId
-  try {
-    if (state.selectedTeamId) localStorage.setItem(SELECTED_TEAM_KEY, state.selectedTeamId)
-    else localStorage.removeItem(SELECTED_TEAM_KEY)
-  } catch {}
+  const sess = _currentSession()
+  if (sess) {
+    sess._selectedTeamId = nextTeamId
+    scheduleSaveFromUserEdit(sess)
+  }
+  _writeStoredSelectedTeamId(nextTeamId)
   _emitTeamSelectionChanged()
 }
 
 export function clearSelectedAgentTeam() {
   selectAgentTeam('')
+}
+
+export function syncSelectedTeamForCurrentSession() {
+  if (!_agentTeamsLoaded) return
+  const sess = _currentSession()
+  const stored = _selectedTeamCandidateForSession(sess)
+  const nextTeamId = stored && (state.agentTeams || []).some((t) => t.id === stored) ? stored : ''
+  state.selectedTeamId = nextTeamId
+  if (sess) sess._selectedTeamId = nextTeamId
+  if (nextTeamId) _writeStoredSelectedTeamId(nextTeamId)
+  _emitTeamSelectionChanged()
+  renderTeamDropdown()
 }
 
 export function getAgentTeamById(teamId = '') {
@@ -520,11 +607,7 @@ async function _deleteTeamEditor() {
   try {
     await apiJson('DELETE', `/api/agent-teams/${encodeURIComponent(id)}`)
     if (state.selectedTeamId === id) {
-      state.selectedTeamId = ''
-      try {
-        localStorage.removeItem(SELECTED_TEAM_KEY)
-      } catch {}
-      _emitTeamSelectionChanged()
+      clearSelectedAgentTeam()
     }
     toast('团队已删除', 'success')
     _closeTeamEditor()

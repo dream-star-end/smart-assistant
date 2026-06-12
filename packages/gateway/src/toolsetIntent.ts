@@ -33,18 +33,28 @@ function normalizeToolsetList(toolsets: string[] | undefined): string[] | undefi
   return out.length > 0 ? out : undefined
 }
 
-export function detectBrowserToolsetIntent(text: string): boolean {
+function stripPaperSystemHint(text: string): string {
+  return text.split('【OpenClaude 论文任务系统提示】')[0].trim()
+}
+
+export function extractToolsetIntentText(text: string): string {
   const raw = typeof text === 'string' ? text.trim() : ''
-  if (!raw) return false
-  const userText = raw.split('【OpenClaude 论文任务系统提示】')[0].trim()
+  if (!raw) return ''
+  if (/^# Agent Team Run\b/.test(raw)) {
+    const match = raw.match(/\n## 用户目标\n([\s\S]*)$/)
+    if (match) return stripPaperSystemHint(match[1] || '')
+  }
+  return stripPaperSystemHint(raw)
+}
+
+export function detectBrowserToolsetIntent(text: string): boolean {
+  const userText = extractToolsetIntentText(text)
   if (!userText) return false
   return BROWSER_INTENT_PATTERNS.some((pattern) => pattern.test(userText))
 }
 
 export function detectWebContextToolsetIntent(text: string): boolean {
-  const raw = typeof text === 'string' ? text.trim() : ''
-  if (!raw) return false
-  const userText = raw.split('【OpenClaude 论文任务系统提示】')[0].trim()
+  const userText = extractToolsetIntentText(text)
   if (!userText) return false
   return WEB_CONTEXT_INTENT_PATTERNS.some((pattern) => pattern.test(userText))
 }

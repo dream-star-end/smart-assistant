@@ -677,7 +677,7 @@ const CLIENT_PUT_ALLOWED_FIELDS: ReadonlySet<string> = new Set<string>([
   // empty-turn / cron metadata
   '_emptyTurn', '_emptyTurnSoft', '_emptyTurnStopReason', 'cronJob',
   // client-persistent private fields (server treats opaquely)
-  '_media', '_modelText',
+  '_media', '_modelText', '_teamRun',
 ])
 
 const CLIENT_PUT_ALLOWED_STATUSES: ReadonlySet<string> = new Set<string>([

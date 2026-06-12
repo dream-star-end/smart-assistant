@@ -10,6 +10,7 @@ import { getSession, state } from './state.js?v=17cf8f69'
 import { toast } from './ui.js?v=17cf8f69'
 import {
   addSystemMessage,
+  getActiveStopAgentId,
   localStopTeardown,
   nudgeDrain,
   resetReplyTracker,
@@ -125,7 +126,7 @@ const slashCommands = [
         type: 'inbound.control.stop',
         channel: 'webchat',
         peer: { id: sess.id, kind: 'dm' },
-        agentId: sess.agentId || state.defaultAgentId,
+        agentId: getActiveStopAgentId(sess),
       }))
       localStopTeardown(sess)
       toast('已发送停止信号')

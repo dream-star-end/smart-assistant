@@ -27,6 +27,14 @@ const MESSAGES = readFileSync(
   resolve(import.meta.dirname, '..', 'public', 'modules', 'messages.js'),
   'utf-8',
 )
+const SYNC = readFileSync(
+  resolve(import.meta.dirname, '..', 'public', 'modules', 'sync.js'),
+  'utf-8',
+)
+const COMMANDS = readFileSync(
+  resolve(import.meta.dirname, '..', 'public', 'modules', 'commands.js'),
+  'utf-8',
+)
 
 describe('unified assistant picker wiring', () => {
   it('renders single-agent and multi-agent sections', () => {
@@ -47,7 +55,23 @@ describe('unified assistant picker wiring', () => {
     assert.match(MODEL, /clearSelectedAgentTeam\(\)/)
     assert.match(MODEL, /selectAgentTeam\(teamId\)/)
     assert.match(TEAMS, /export function selectAgentTeam/)
-    assert.match(TEAMS, /localStorage\.setItem\(SELECTED_TEAM_KEY/)
+    assert.match(TEAMS, /SELECTED_TEAM_USER_PREFIX/)
+    assert.match(TEAMS, /localStorage\.setItem\(key, teamId\)/)
+    assert.match(TEAMS, /sess\._selectedTeamId = nextTeamId/)
+    assert.match(TEAMS, /scheduleSaveFromUserEdit\(sess\)/)
+    assert.match(TEAMS, /hasOwnProperty\.call\(sess, '_selectedTeamId'\)/)
+    assert.match(TEAMS, /let _agentTeamsLoaded = false/)
+    assert.match(TEAMS, /let _agentTeamsOwnerUserId = ''/)
+    assert.match(TEAMS, /if \(!_agentTeamsLoaded\) return/)
+    assert.match(TEAMS, /Transient reload failures should not erase/)
+    assert.match(TEAMS, /_agentTeamsOwnerUserId !== ownerUserId/)
+    assert.match(MAIN, /clearStoredAgentTeamSelection\(\)/)
+    assert.match(MAIN, /newSess\._selectedTeamId = teamId/)
+    assert.match(MAIN, /syncAgentTeamSelectionForSession: syncSelectedTeamForCurrentSession/)
+    assert.match(MAIN, /const identityReady = refreshBalance\(\)/)
+    assert.match(MAIN, /then\(\(\) => identityReady\)/)
+    assert.match(SYNC, /hasOwnProperty\.call\(existingLocal, '_selectedTeamId'\)/)
+    assert.match(SYNC, /_activeTeamRun\) sess\._activeTeamRun = \{ \.\.\.existingLocal\._activeTeamRun \}/)
   })
 
   it('main injects agent switching callback instead of binding #agent-select', () => {
@@ -56,12 +80,27 @@ describe('unified assistant picker wiring', () => {
   })
 
   it('team runs keep a turn-scoped typing label instead of showing the default agent', () => {
-    assert.match(MAIN, /sess\._activeTeamRun\s*=\s*teamForSend/)
-    assert.match(MAIN, /leaderAgentId:\s*teamForSend\.leaderAgentId/)
+    assert.match(MAIN, /const teamRunMeta = teamForSend/)
+    assert.match(MAIN, /_teamRun: teamRunMeta/)
+    assert.match(MAIN, /setActiveTeamRunForSession\(sess, teamRunMeta\)/)
+    assert.match(MAIN, /tryEnqueueOffline\(\{[\s\S]*teamRun: teamRunMeta/)
     assert.match(WEBSOCKET, /function _typingDisplayTarget/)
     assert.match(WEBSOCKET, /sess\?\._activeTeamRun/)
     assert.match(WEBSOCKET, /团队: \$\{team\.name \|\| team\.id\}/)
     assert.match(WEBSOCKET, /sess\._activeTeamRun = null/)
+  })
+
+  it('team stop and regen route to the active team leader instead of the session agent', () => {
+    assert.match(WEBSOCKET, /export function getActiveStopAgentId/)
+    assert.match(WEBSOCKET, /agentId: getActiveStopAgentId\(s\)/)
+    assert.match(WEBSOCKET, /agentId: getActiveStopAgentId\(sess\)/)
+    assert.match(WEBSOCKET, /function _offlineItemTeamRun/)
+    assert.match(WEBSOCKET, /setActiveTeamRunForSession\(sess, _offlineItemTeamRun\(sess, item\)\)/)
+    assert.match(MESSAGES, /getActiveStopAgentId/)
+    assert.match(COMMANDS, /getActiveStopAgentId/)
+    assert.match(MESSAGES, /const _regenTeamRun = lastUserMsg\._teamRun/)
+    assert.match(MESSAGES, /agentId: _regenAgentId/)
+    assert.match(MESSAGES, /tryEnqueueOffline\(\{[\s\S]*teamRun: _regenTeamRun/)
   })
 
   it('team mode scopes effort to the leader and renders delegate progress separately', () => {

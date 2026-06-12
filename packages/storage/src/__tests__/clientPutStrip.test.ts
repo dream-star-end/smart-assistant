@@ -84,7 +84,7 @@ describe('_stripClientPutMessage allow-list (T1, T2)', () => {
     })
   })
 
-  it('preserves _media / _modelText (client-persistent private fields)', () => {
+  it('preserves _media / _modelText / _teamRun (client-persistent private fields)', () => {
     const cleaned = _stripClientPutMessage({
       id: 'm-1',
       role: 'user',
@@ -92,9 +92,21 @@ describe('_stripClientPutMessage allow-list (T1, T2)', () => {
       ts: 1,
       _media: [{ kind: 'image', url: 'blob:foo' }],
       _modelText: 'photo! [image]',
+      _teamRun: {
+        id: 'programming_team',
+        name: '编程协作团队',
+        leaderAgentId: 'codex',
+        modelOverride: 'gpt-5.5',
+      },
     })
     assert.deepEqual(cleaned?._media, [{ kind: 'image', url: 'blob:foo' }])
     assert.equal(cleaned?._modelText, 'photo! [image]')
+    assert.deepEqual(cleaned?._teamRun, {
+      id: 'programming_team',
+      name: '编程协作团队',
+      leaderAgentId: 'codex',
+      modelOverride: 'gpt-5.5',
+    })
   })
 
   it('preserves codex plan fields for refresh-stable plan cards', () => {

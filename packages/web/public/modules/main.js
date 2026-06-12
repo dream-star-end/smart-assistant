@@ -127,9 +127,11 @@ import {
 } from './agents.js?v=17cf8f69' // 2026-04-22 fix: 非 admin 用户 /api/agents 403 兜底 + 隐藏 agent-select
 import {
   buildTeamRunPrompt,
+  clearStoredAgentTeamSelection,
   getSelectedTeamForSend,
   initAgentTeams,
   reloadAgentTeams,
+  syncSelectedTeamForCurrentSession,
   teamDisplayPrefix,
 } from './agentTeams.js?v=17cf8f69'
 
@@ -180,6 +182,7 @@ import {
   resetThinkingSafety,
   refreshWebchatHelloForCurrentSession,
   safeWsSend,
+  setActiveTeamRunForSession,
   setProvisioningBanner,
   setWsDeps,
   showTypingIndicator,
@@ -233,6 +236,7 @@ setSessionUIDeps({
   showTypingIndicator,
   hideTypingIndicator,
   renderAgentDropdown,
+  syncAgentTeamSelectionForSession: syncSelectedTeamForCurrentSession,
 })
 
 setMessageDeps({
@@ -1298,6 +1302,14 @@ function send() {
   // 必须让 leader agent 的配置决定模型,否则 default_model=gpt-5.5 会被
   // inferAgentForModel 重路由到 codex,绕过 team.leaderAgentId。
   const modelOverride = getModelOverrideForSend(teamForSend)
+  const teamRunMeta = teamForSend
+    ? {
+        id: teamForSend.id || '',
+        name: teamForSend.name || teamForSend.id || '',
+        leaderAgentId: teamForSend.leaderAgentId || '',
+        ...(modelOverride !== undefined ? { modelOverride } : {}),
+      }
+    : null
   const wsPayload = {
     type: 'inbound.message',
     idempotencyKey: `web-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
@@ -1319,14 +1331,8 @@ function send() {
     status: 'sending',
     _media: media.length > 0 ? media : undefined,
     _modelText: modelText !== text ? modelText : undefined, // Full text with attachments for replay
+    _teamRun: teamRunMeta || undefined,
   })
-  sess._activeTeamRun = teamForSend
-    ? {
-        id: teamForSend.id,
-        name: teamForSend.name || teamForSend.id,
-        leaderAgentId: teamForSend.leaderAgentId || '',
-      }
-    : null
   sess._streamingAssistant = null
   sess._streamingThinking = null
   sess._blockIdToMsgId = new Map()
@@ -1346,6 +1352,7 @@ function send() {
     _sentNow = safeWsSend(state.ws, JSON.stringify(wsPayload))
   }
   if (_sentNow) {
+    setActiveTeamRunForSession(sess, teamRunMeta)
     userMsg.status = 'sent'
     updateMsgStatus(userMsg)
     setSending(true)
@@ -1360,9 +1367,13 @@ function send() {
     //   (c) safeWsSend 返回 false → 背压触发 close,正在 reconnect
     // 统统 push offlineQueue + status='queued',reconnect 后 drain 按序重发。
     // P2-24 软上限 — 超过 200 直接拒收避免无限堆积。
-    const enqueued = tryEnqueueOffline({ sessId: sess.id, payload: wsPayload, msgId: userMsg.id })
+    const enqueued = tryEnqueueOffline({
+      sessId: sess.id,
+      payload: wsPayload,
+      msgId: userMsg.id,
+      teamRun: teamRunMeta || undefined,
+    })
     if (!enqueued) {
-      sess._activeTeamRun = null
       userMsg.status = 'error'
       updateMsgStatus(userMsg)
       toast(`离线缓冲已满 (${MAX_OFFLINE_QUEUE} 条),请恢复网络后重试`, 'danger')
@@ -1693,6 +1704,8 @@ async function _forceLogout({ serverLogout, broadcast = Boolean(serverLogout) } 
   clearUserPrefsCache()
   // 站内信 polling / 铃铛在登出后停掉,避免下一身份冷启动时短暂看到上一身份未读。
   stopInbox()
+  // 团队选择属于用户/会话偏好,登出时清掉当前状态和 legacy 共享缓存,避免串到下个账号。
+  clearStoredAgentTeamSelection()
   state.token = '' // Clear token BEFORE close so onclose handler won't auto-reconnect
   state.refreshToken = ''
   state.tokenExp = 0
@@ -2336,7 +2349,10 @@ function createNewChat() {
   // only clear the global UI state below.
   const oldSess = getSession()
   const agentId = oldSess?.agentId || state.defaultAgentId
-  createSession(agentId)
+  const newSess = createSession(agentId)
+  const teamId = state.selectedTeamId || oldSess?._selectedTeamId || ''
+  newSess._selectedTeamId = teamId
+  syncSelectedTeamForCurrentSession()
   // New session is never sending — reset UI state
   state.sendingInFlight = false
   hideTypingIndicator()
@@ -2711,9 +2727,8 @@ async function runPostLoginPipeline({ accessToken, accessExp, remember }) {
   renderSidebar()
   renderMessages()
   connect()
-  void reloadAgents().then(() => reloadAgentTeams())
   loadChangelog()
-  refreshBalance()
+  const identityReady = refreshBalance()
     .then((r) => {
       if (r?.shown) startInbox()
       else stopInbox()
@@ -2722,6 +2737,13 @@ async function runPostLoginPipeline({ accessToken, accessExp, remember }) {
       // gating 字段已就位,不会因 race 漏弹/误弹。
       maybeShowWelcomeModal()
     })
+    .catch(() => {})
+  // 团队选择使用 userId-scoped localStorage。agents 可以马上加载,但 teams
+  // 必须等 /api/me 写入 state.userId 后再恢复,否则会把 scoped 选择误清空。
+  void reloadAgents()
+    .then(() => identityReady)
+    .then(() => reloadAgentTeams())
+    .then(() => syncSelectedTeamForCurrentSession())
     .catch(() => {})
   syncSessionsFromServer()
     .then((result) => {
@@ -2741,6 +2763,7 @@ async function runPostLoginPipeline({ accessToken, accessExp, remember }) {
       // 2026-05-07 v1.0.94 — login 后第一次 sync 拿到 currentSessionId 时也刷一次
       // GitHub repo pill,避免新登录看到空 pill 直到用户手动切会话。
       refreshGithubPill(state.currentSessionId)
+      syncSelectedTeamForCurrentSession()
     })
     .catch(() => {})
   checkUnclaimedSessions()
@@ -2766,14 +2789,19 @@ async function runExistingSessionBootPipeline() {
   restoreCurrentSessionInFlightUI()
   refreshGithubPill(state.currentSessionId)
   connect()
-  void reloadAgents().then(() => reloadAgentTeams())
   loadChangelog()
-  refreshBalance()
+  const identityReady = refreshBalance()
     .then((r) => {
       if (r?.shown) startInbox()
       else stopInbox()
       maybeShowWelcomeModal()
     })
+    .catch(() => {})
+  // 同登录流程:先让 /api/me 稳定 userId,再恢复用户级团队选择。
+  void reloadAgents()
+    .then(() => identityReady)
+    .then(() => reloadAgentTeams())
+    .then(() => syncSelectedTeamForCurrentSession())
     .catch(() => {})
   syncSessionsFromServer()
     .then((result) => {
@@ -2785,6 +2813,7 @@ async function runExistingSessionBootPipeline() {
       }
       renderSidebar()
       refreshGithubPill(state.currentSessionId)
+      syncSelectedTeamForCurrentSession()
     })
     .catch(() => {})
 }

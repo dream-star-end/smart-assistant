@@ -858,6 +858,13 @@ export async function syncSessionsFromServer() {
           if (existingLocal._sendingInFlight) sess._sendingInFlight = true
           if (existingLocal._turnStartedAt) sess._turnStartedAt = existingLocal._turnStartedAt
           if (existingLocal._lastFrameAt) sess._lastFrameAt = existingLocal._lastFrameAt
+          if (existingLocal._activeTeamRun) sess._activeTeamRun = { ...existingLocal._activeTeamRun }
+          // Team picker selection is local/session-scoped metadata. The server
+          // session payload is intentionally schema-light and does not echo it
+          // back, so preserve the local value across sync-shaped replacements.
+          if (Object.prototype.hasOwnProperty.call(existingLocal, '_selectedTeamId')) {
+            sess._selectedTeamId = existingLocal._selectedTeamId || ''
+          }
           if (typeof existingLocal._lastFrameSeq === 'number') sess._lastFrameSeq = existingLocal._lastFrameSeq
           // _mergePartialTail may have preserved local refs (streaming
           // tail rows, supersede-winning tool-overlay rows). Rebuild the
@@ -1002,6 +1009,14 @@ export async function syncSessionsFromServer() {
     if (existingLocal?._sendingInFlight) sess._sendingInFlight = true
     if (existingLocal?._turnStartedAt) sess._turnStartedAt = existingLocal._turnStartedAt
     if (existingLocal?._lastFrameAt) sess._lastFrameAt = existingLocal._lastFrameAt
+    if (existingLocal?._activeTeamRun) sess._activeTeamRun = { ...existingLocal._activeTeamRun }
+    // Same local/session-scoped metadata preservation as the partial-sync
+    // path above. Without this, server-wins refreshes erase the explicit
+    // per-session team choice and the UI falls back to last user-scoped
+    // localStorage selection, collapsing different sessions to one team.
+    if (existingLocal && Object.prototype.hasOwnProperty.call(existingLocal, '_selectedTeamId')) {
+      sess._selectedTeamId = existingLocal._selectedTeamId || ''
+    }
     // Phase 0.4: preserve the frameSeq cursor across a sync-driven session
     // replacement. If we drop it, the next hello would claim `lastFrameSeq: 0`
     // and the gateway would replay every frame still in its ring — delivering
