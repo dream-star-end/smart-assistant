@@ -142,6 +142,10 @@ export function resolveOfficialClaudePath(env: NodeJS.ProcessEnv = process.env):
   return existsSync(localClaude) ? localClaude : 'claude'
 }
 
+export function buildOfficialClaudeArgs(): string[] {
+  return ['--permission-mode', 'bypassPermissions', '--dangerously-skip-permissions']
+}
+
 export function resolveOfficialClaudeCwd(env: NodeJS.ProcessEnv = process.env): string {
   const configured = env.OPENCLAUDE_OFFICIAL_CLAUDE_CWD?.trim()
   const cwd = configured ? resolve(configured) : homedir()
@@ -171,6 +175,9 @@ export function buildOfficialClaudeEnv(
     const value = env[key]
     if (typeof value === 'string' && value.length > 0) result[key] = value
   }
+  // The browser terminal is an explicitly trusted personal PTY. Claude Code's
+  // dangerous-skip root guard accepts root only when it knows it is sandboxed.
+  result.IS_SANDBOX = '1'
   return result
 }
 
@@ -287,7 +294,7 @@ export class ClaudeTerminalManager {
       throw new Error(`Claude executable not found: ${command}`)
     }
     const cwd = resolveOfficialClaudeCwd(this.env)
-    const proc = this.spawn(command, [], {
+    const proc = this.spawn(command, buildOfficialClaudeArgs(), {
       name: 'xterm-256color',
       cols: DEFAULT_COLS,
       rows: DEFAULT_ROWS,

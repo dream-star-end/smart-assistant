@@ -175,7 +175,7 @@ import {
   markGoalModeSeeded,
   renderGoalModePanel,
 } from './goalMode.js?v=3'
-import { initOfficialClaudeTerminal, openOfficialClaudeTerminal } from './officialTerminal.js?v=6'
+import { initOfficialClaudeTerminal, openOfficialClaudeTerminal } from './officialTerminal.js?v=7'
 import { getConversationModeForSubmit } from './planMode.js?v=4'
 import { initPlanPanel } from './planPanel.js?v=3'
 import { initResearchTools, renderResearchTools } from './researchTools.js'
