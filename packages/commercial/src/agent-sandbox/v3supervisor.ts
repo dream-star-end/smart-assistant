@@ -590,11 +590,13 @@ const V3_IP_ALLOC_MAX_ATTEMPTS = 30;
  *     v2 的 384MB 对 v3 场景不够;Opus 4.7 长上下文 + 多图附件实测峰值破 2GB
  *     被 cgroup OOM 反复杀(uid=1/4/75 多次记录),4GB 给上下文 + 编译 + 缓存留余量
  *   - CPUs 1.0 核:交互式 agent 够用;峰值由 idle sweep 30min 回收兜底
- *   - PidsLimit 1024:防 fork bomb;正常进程树 < 100,1024 有 10× 缓冲
+ *   - PidsLimit 4096:防 fork bomb,同时给团队模式留出余量。Codex 队长并发
+ *     delegate_task + browser/vision/Node worker 线程曾在 1024 下触发 cgroup
+ *     fork rejected,4096 仍由 4GB memory + 1 CPU 共同约束资源滥用。
  */
 export const DEFAULT_V3_MEMORY_MB = 4096;
 export const DEFAULT_V3_CPUS = 1.0;
-export const DEFAULT_V3_PIDS_LIMIT = 1024;
+export const DEFAULT_V3_PIDS_LIMIT = 4096;
 
 /**
  * 解析 v3 容器资源限额。env 覆盖 + 非法值回退默认。
