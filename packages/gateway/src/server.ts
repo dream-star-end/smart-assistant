@@ -55,6 +55,7 @@ import {
   type ClaudeTerminalManager,
   createClaudeTerminalManager,
   isAllowedClaudeTerminalOrigin,
+  resolveClaudeTerminalUserIdForAuth,
 } from './claudeTerminal.js'
 import { syncCodexAuthFile } from './codexAuthSync.js'
 import { CronScheduler } from './cron.js'
@@ -1421,7 +1422,12 @@ export class Gateway {
         this.sendError(res, 405, 'method not allowed')
         return
       }
-      const terminated = this.claudeTerminal?.terminate(this.getUserId(req)) ?? false
+      const userId = this.getClaudeTerminalUserId(req)
+      if (!userId) {
+        this.sendError(res, 401, 'Claude terminal requires a user login')
+        return
+      }
+      const terminated = this.claudeTerminal?.terminate(userId) ?? false
       this.sendJson(res, 200, { ok: true, terminated })
       return
     }
@@ -2115,6 +2121,21 @@ export class Gateway {
     const t = this.extractToken(req)
     const jwt = verifyJwt(t, this.deps.config.gateway.accessToken)
     return isFullAccessGatewayJwtPayload(jwt) ? jwt.userId : 'default'
+  }
+
+  private getClaudeTerminalUserId(req: IncomingMessage): string | null {
+    const t = this.extractToken(req)
+    const jwt = verifyJwt(t, this.deps.config.gateway.accessToken)
+    const jwtUserId = isFullAccessGatewayJwtPayload(jwt) ? jwt.userId : null
+    const configuredUsers = this.deps.config.gateway.users ?? []
+    const hasConfiguredUsers = configuredUsers.length > 0
+    return resolveClaudeTerminalUserIdForAuth({
+      jwtUserId,
+      jwtUserAllowed:
+        !!jwtUserId && (!hasConfiguredUsers || configuredUsers.some((u) => u.id === jwtUserId)),
+      rawTokenValid: checkToken(t, this.deps.config.gateway.accessToken),
+      hasConfiguredUsers,
+    })
   }
 
   private isOpenClaudeAuthorizationHeader(req: IncomingMessage): boolean {
@@ -3655,6 +3676,11 @@ export class Gateway {
       this.sendError(res, 405, 'method not allowed')
       return
     }
+    const userId = this.getClaudeTerminalUserId(req)
+    if (!userId) {
+      this.sendError(res, 401, 'Claude terminal requires a user login')
+      return
+    }
     this.cleanupTerminalUploads()
     const action = basename(url.pathname)
     const maxBodyBytes = action === 'chunk' ? TERMINAL_UPLOAD_CHUNK_JSON_MAX_BYTES : 256 * 1024
@@ -3663,7 +3689,6 @@ export class Gateway {
       this.sendError(res, 400, 'body must be a JSON object')
       return
     }
-    const userId = this.getUserId(req)
 
     if (action === 'start') {
       const originalName =
@@ -3805,7 +3830,11 @@ export class Gateway {
       this.sendError(res, 405, 'method not allowed')
       return
     }
-    const userId = this.getUserId(req)
+    const userId = this.getClaudeTerminalUserId(req)
+    if (!userId) {
+      this.sendError(res, 401, 'Claude terminal requires a user login')
+      return
+    }
     const rawPath = url.searchParams.get('path') || ''
     let resolved = this.resolveClaudeTerminalFilePath(userId, rawPath)
     try {
@@ -3868,7 +3897,11 @@ export class Gateway {
       return
     }
 
-    const userId = this.getUserId(req)
+    const userId = this.getClaudeTerminalUserId(req)
+    if (!userId) {
+      this.sendError(res, 401, 'Claude terminal requires a user login')
+      return
+    }
     let resolved = this.resolveClaudeTerminalFilePath(userId, rawPath)
     let fileStat: ReturnType<typeof statSync>
     try {
@@ -3982,11 +4015,21 @@ export class Gateway {
       ws.close(1008, 'bad origin')
       return
     }
-    if (!this.checkHttpAuth(req)) {
+    const userId = this.getClaudeTerminalUserId(req)
+    if (!userId) {
+      try {
+        ws.send(
+          JSON.stringify({
+            type: 'status',
+            state: 'error',
+            message: 'Claude terminal requires a user login',
+          }),
+        )
+      } catch {}
       ws.close(1008, 'unauthorized')
       return
     }
-    this.claudeTerminal?.handleConnection(ws, this.getUserId(req))
+    this.claudeTerminal?.handleConnection(ws, userId)
   }
 
   // ───────── WS ─────────
