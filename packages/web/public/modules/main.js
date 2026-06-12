@@ -210,6 +210,7 @@ import {
   renderModePills,
 } from './effortMode.js?v=870d33c6'
 import { initModelPicker, renderModelPill } from './modelPicker.js?v=870d33c6'
+import { getSingleAgentModelOverride } from './modelPolicy.js?v=auto'
 import { getConversationModeForSubmit } from './planMode.js?v=870d33c6'
 import { initPlanPanel } from './planPanel.js?v=870d33c6'
 
@@ -1231,6 +1232,7 @@ export function getModelOverrideForSend(
   teamForSend,
   userPrefs = state.userPrefs,
   agentsList,
+  options = {},
 ) {
   // Team mode is agent-owned routing: the selected team's leaderAgentId must
   // decide the runner/model. If we also send the user's global default_model
@@ -1238,7 +1240,9 @@ export function getModelOverrideForSend(
   // and bypass the leader entirely. Non-team sends keep the normal model
   // picker behavior unchanged. Exception: a codex-native leader must still
   // carry an explicit GPT model because gateway rejects codex-native turns
-  // without a model authz signal.
+  // without a model authz signal. Single-agent sends share modelPolicy.js:
+  // explicit non-codex specialists ignore stale gpt-* global defaults so the
+  // backend does not reject `scientist + gpt-5.5` as a mismatch.
   if (teamForSend) {
     const leader = (agentsList || state.agentsList || []).find((a) => a.id === teamForSend.leaderAgentId)
     if (leader?.provider === 'codex-native' || leader?.id === 'codex') {
@@ -1246,8 +1250,16 @@ export function getModelOverrideForSend(
     }
     return undefined
   }
-  const prefModel = userPrefs?.default_model
-  return typeof prefModel === 'string' && prefModel ? prefModel : undefined
+  const list = agentsList || (typeof state !== 'undefined' ? state.agentsList : [])
+  const sess = typeof getSession === 'function' ? getSession() : null
+  const defaultAgentId = options.defaultAgentId || (typeof state !== 'undefined' ? state.defaultAgentId : 'main')
+  const agentId = options.agentId || sess?.agentId || defaultAgentId
+  return getSingleAgentModelOverride({
+    userPrefs,
+    agentId,
+    defaultAgentId,
+    agentsList: list,
+  })
 }
 
 function send() {

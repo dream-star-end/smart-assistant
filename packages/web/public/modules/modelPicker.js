@@ -19,18 +19,26 @@ import {
 import { getSession, state } from './state.js?v=870d33c6'
 import { closeModal, openModal, toast, toastOptsFromError } from './ui.js?v=870d33c6'
 import { getEnabledModels, setCachedPrefField } from './userPrefs.js?v=870d33c6'
+import { getEffectiveSingleAgentModel } from './modelPolicy.js?v=auto'
+
+function getCurrentAgentId() {
+  const sess = getSession()
+  return sess?.agentId || state.defaultAgentId || ''
+}
 
 function getCurrentAgent() {
-  const sess = getSession()
-  const agentId = sess?.agentId || state.defaultAgentId
+  const agentId = getCurrentAgentId()
   if (!agentId) return null
   return (state.agentsList || []).find((a) => a.id === agentId) || null
 }
 
 function getEffectiveModel() {
-  const pref = state.userPrefs?.default_model
-  if (typeof pref === 'string' && pref) return pref
-  return getCurrentAgent()?.model || ''
+  return getEffectiveSingleAgentModel({
+    userPrefs: state.userPrefs,
+    agentId: getCurrentAgentId(),
+    defaultAgentId: state.defaultAgentId,
+    agentsList: state.agentsList,
+  })
 }
 
 let _modelsCache = null

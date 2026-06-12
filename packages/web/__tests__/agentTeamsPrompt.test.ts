@@ -6,6 +6,7 @@ import { describe, it } from 'node:test'
 const src = readFileSync(resolve(import.meta.dirname, '..', 'public/modules/agentTeams.js'), 'utf-8')
 const mainSrc = readFileSync(resolve(import.meta.dirname, '..', 'public/modules/main.js'), 'utf-8')
 const agentsSrc = readFileSync(resolve(import.meta.dirname, '..', 'public/modules/agents.js'), 'utf-8')
+const modelPolicySrc = readFileSync(resolve(import.meta.dirname, '..', 'public/modules/modelPolicy.js'), 'utf-8')
 
 function extractFunction(source: string, name: string): string {
   const lines = source.split('\n')
@@ -31,8 +32,15 @@ const buildTeamRunPrompt = new Function(
 )() as (team: any, userText: string) => string
 
 const getModelOverrideForSend = new Function(
-  [extractFunction(mainSrc, 'getModelOverrideForSend'), 'return getModelOverrideForSend;'].join('\n'),
-)() as (teamForSend: any, userPrefs: any, agentsList?: any[]) => string | undefined
+  [
+    extractFunction(modelPolicySrc, 'isGptModel'),
+    extractFunction(modelPolicySrc, 'isCodexNativeAgent'),
+    extractFunction(modelPolicySrc, 'findAgent'),
+    extractFunction(modelPolicySrc, 'getSingleAgentModelOverride'),
+    extractFunction(mainSrc, 'getModelOverrideForSend'),
+    'return getModelOverrideForSend;',
+  ].join('\n'),
+)() as (teamForSend: any, userPrefs: any, agentsList?: any[], options?: any) => string | undefined
 
 const missingAgentIds = new Function(
   [
@@ -99,6 +107,35 @@ describe('agent team prompt builder', () => {
         { default_model: 'MiniMax-M3' },
         [{ id: 'codex', provider: 'codex-native', model: 'gpt-5.5' }],
       ),
+      'gpt-5.5',
+    )
+  })
+
+  it('suppresses stale GPT default model for explicit non-codex specialist agents', () => {
+    const agents = [
+      { id: 'main', provider: 'minimax', model: 'MiniMax-M3' },
+      { id: 'scientist', provider: 'minimax', model: 'MiniMax-M3' },
+      { id: 'codex', provider: 'codex-native', model: 'gpt-5.5' },
+    ]
+    assert.equal(
+      getModelOverrideForSend(null, { default_model: 'gpt-5.5' }, agents, {
+        agentId: 'scientist',
+        defaultAgentId: 'main',
+      }),
+      undefined,
+    )
+    assert.equal(
+      getModelOverrideForSend(null, { default_model: 'gpt-5.5' }, agents, {
+        agentId: 'main',
+        defaultAgentId: 'main',
+      }),
+      'gpt-5.5',
+    )
+    assert.equal(
+      getModelOverrideForSend(null, { default_model: 'gpt-5.5' }, agents, {
+        agentId: 'codex',
+        defaultAgentId: 'main',
+      }),
       'gpt-5.5',
     )
   })

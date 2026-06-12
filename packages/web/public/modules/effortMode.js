@@ -33,6 +33,7 @@
 //    effort 的模型接入时建议升级到模型元数据 / model-scoped store。
 
 import { $ } from './dom.js?v=870d33c6'
+import { getEffectiveSingleAgentModel } from './modelPolicy.js?v=auto'
 import { getSession, state } from './state.js?v=870d33c6'
 
 const STORAGE_KEY = 'openclaude_effort_by_agent'
@@ -226,22 +227,22 @@ function setCurrentEffort(level) {
   renderModePills()
 }
 
-function getCurrentAgentModel() {
+function getCurrentAgentId() {
   const sess = getSession()
-  if (!sess) return ''
-  const agentId = sess.agentId || state.defaultAgentId
-  const a = (state.agentsList || []).find((x) => x.id === agentId)
-  return a?.model || ''
+  return sess?.agentId || state.defaultAgentId || ''
 }
 
-/** 当前生效模型 id:`state.userPrefs.default_model` 优先,否则 agent.model。
+/** 当前生效模型 id:兼容当前 agent 的 `default_model` 优先,否则 agent.model。
  *  注意 `state.userPrefs===null` 表示尚未拉取 — 调用方应单独处理(返回空串
  *  让 `shouldShowEffortControl` 判 false,但 `renderModePills` 会显式隐藏避免闪烁)。 */
 function getEffectiveModel() {
   if (isTeamModeActive()) return getSelectedTeamLeaderModel()
-  const pref = state.userPrefs?.default_model
-  if (typeof pref === 'string' && pref) return pref
-  return getCurrentAgentModel()
+  return getEffectiveSingleAgentModel({
+    userPrefs: state.userPrefs,
+    agentId: getCurrentAgentId(),
+    defaultAgentId: state.defaultAgentId,
+    agentsList: state.agentsList,
+  })
 }
 
 // ── Menu open/close ────────────────────────────────────────────────
