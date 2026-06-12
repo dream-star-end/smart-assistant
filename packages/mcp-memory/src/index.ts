@@ -12,6 +12,7 @@
  *   • `skill_save`     — distill a successful task into a reusable skill
  *   • `skill_delete`
  *   • `skill_train_auto` — fully automatic SkillOpt-style training run
+ *   • `skill_train_auto_status` — check a background training run
  *
  * Configuration: the server is spawned per-session by the gateway with
  *   env OPENCLAUDE_AGENT_ID=<id>   (which agent this subprocess belongs to)
@@ -48,6 +49,8 @@ import {
 import {
   type SkillAutoTrainArgs,
   createSkillAutoTrainDelegateRequest,
+  formatSkillAutoTrainAcceptedRun,
+  formatSkillAutoTrainStatus,
   isNestedSkillAutoTrainBlocked,
 } from './skillAutoTrain.js'
 
@@ -210,6 +213,7 @@ const TOOLS = [
     description: [
       'Run a fully automatic SkillOpt-style self-training pass for agent skills.',
       'The tool delegates to an isolated agent session that mines recent sessions, validates candidate skill changes, and applies skill_save/skill_delete by default.',
+      'By default it starts a background job and returns immediately with a runId; call skill_train_auto_status to check completion.',
       'For recursion safety, this tool is only available from top-level sessions; delegated sessions are rejected and should use direct skill tools instead.',
       'Use this when the user asks for automatic skill training/evolution, or from scheduled learning jobs.',
     ].join('\n'),
@@ -240,9 +244,30 @@ const TOOLS = [
           default: true,
           description: 'When true (default), apply accepted changes automatically.',
         },
+        waitForCompletion: {
+          type: 'boolean',
+          default: false,
+          description:
+            'When true, wait for the delegated training to finish. Default false starts a background job to avoid MCP timeouts.',
+        },
         focus: {
           type: 'string',
           description: 'Optional focus area, e.g. "OpenClaude release workflow".',
+        },
+      },
+    },
+  },
+  {
+    name: 'skill_train_auto_status',
+    description:
+      'Check a background skill_train_auto run by runId or sessionKey. Use after skill_train_auto returns a runId.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        runId: { type: 'string', description: 'Run ID returned by skill_train_auto.' },
+        sessionKey: {
+          type: 'string',
+          description: 'Delegated session key returned by skill_train_auto.',
         },
       },
     },
@@ -425,6 +450,8 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
         return await handleSkillDelete(args as any)
       case 'skill_train_auto':
         return await handleSkillTrainAuto(args as any)
+      case 'skill_train_auto_status':
+        return await handleSkillTrainAutoStatus(args as any)
       case 'archival_add':
         return await handleArchivalAdd(args as any)
       case 'archival_search':
@@ -611,11 +638,41 @@ async function handleSkillTrainAuto(args: SkillAutoTrainArgs) {
     )
   }
   const request = createSkillAutoTrainDelegateRequest(args, AGENT_ID)
+  if (!request.waitForCompletion) {
+    return handleDelegateTaskToAgentAsync(request.targetAgentId, {
+      goal: request.prompt,
+      context: request.context,
+      label: `skill_train_auto:${request.targetAgentId}`,
+    })
+  }
   return handleDelegateTaskToAgent(request.targetAgentId, {
     goal: request.prompt,
     context: request.context,
     label: `skill_train_auto:${request.targetAgentId}`,
   })
+}
+
+async function handleSkillTrainAutoStatus(args: { runId?: string; sessionKey?: string }) {
+  const runId = cleanString(args?.runId)
+  const sessionKey = cleanString(args?.sessionKey)
+  if (!runId && !sessionKey) return toolError('runId or sessionKey required')
+
+  const gatewayPort = process.env.OPENCLAUDE_GATEWAY_PORT || '18789'
+  const gatewayToken = process.env.OPENCLAUDE_GATEWAY_TOKEN || ''
+  const params = new URLSearchParams()
+  if (runId) params.set('runId', runId)
+  else if (sessionKey) params.set('sessionKey', sessionKey)
+
+  try {
+    const res = await fetch(`http://127.0.0.1:${gatewayPort}/api/runs?${params}`, {
+      headers: { Authorization: `Bearer ${gatewayToken}` },
+    })
+    const data = (await res.json()) as any
+    if (!res.ok) return toolError(data?.error ?? `status lookup failed (${res.status})`)
+    return toolOk(formatSkillAutoTrainStatus(data.run))
+  } catch (err: any) {
+    return toolError(`status lookup failed: ${err?.message ?? String(err)}`)
+  }
 }
 
 // ── Archival Memory handlers ──
@@ -810,6 +867,53 @@ async function handleDelegateTaskToAgent(
   }
 }
 
+async function handleDelegateTaskToAgentAsync(
+  targetAgent: string,
+  args: {
+    goal: string
+    context?: string
+    toolsets?: string[]
+    label: string
+  },
+) {
+  const gatewayPort = process.env.OPENCLAUDE_GATEWAY_PORT || '18789'
+  const gatewayToken = process.env.OPENCLAUDE_GATEWAY_TOKEN || ''
+  const sourceAgent = process.env.OPENCLAUDE_AGENT_ID || 'unknown'
+  try {
+    const currentDepth = Number.parseInt(process.env.OPENCLAUDE_DELEGATION_DEPTH || '0', 10)
+    const res = await fetch(
+      `http://127.0.0.1:${gatewayPort}/api/agents/${encodeURIComponent(targetAgent)}/delegate`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${gatewayToken}`,
+          'x-delegation-depth': String(currentDepth),
+        },
+        body: JSON.stringify({
+          goal: args.goal,
+          context: args.context,
+          sourceAgent,
+          toolsets: args.toolsets,
+          async: true,
+        }),
+      },
+    )
+    const data = (await res.json()) as any
+    if (!res.ok) return toolError(`委派启动失败: ${data?.error ?? JSON.stringify(data)}`)
+    if (data.error) return toolError(`子 agent 启动出错: ${data.error}`)
+    return toolOk(
+      formatSkillAutoTrainAcceptedRun({
+        targetAgentId: data.agentId ?? targetAgent,
+        runId: data.runId ?? '(unknown)',
+        sessionKey: data.sessionKey ?? '(unknown)',
+      }),
+    )
+  } catch (err: any) {
+    return toolError(`委派启动失败: ${err?.message ?? String(err)}`)
+  }
+}
+
 async function handleCreateReminder(args: {
   schedule: string
   message: string
@@ -851,6 +955,12 @@ function toolOk(msg: string) {
 }
 function toolError(msg: string) {
   return { content: [{ type: 'text', text: `error: ${msg}` }], isError: true }
+}
+
+function cleanString(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined
+  const trimmed = value.trim()
+  return trimmed || undefined
 }
 
 // ─────────────────────────────────────────────────────────────

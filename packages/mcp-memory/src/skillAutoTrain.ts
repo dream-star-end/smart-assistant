@@ -5,6 +5,7 @@ export interface SkillAutoTrainArgs {
   maxSkillEdits?: number
   apply?: boolean
   focus?: string
+  waitForCompletion?: boolean
 }
 
 export interface NormalizedSkillAutoTrainArgs {
@@ -14,12 +15,20 @@ export interface NormalizedSkillAutoTrainArgs {
   maxSkillEdits: number
   apply: boolean
   focus?: string
+  waitForCompletion: boolean
 }
 
 export interface SkillAutoTrainDelegateRequest {
   targetAgentId: string
   prompt: string
   context: string
+  waitForCompletion: boolean
+}
+
+export interface SkillAutoTrainAcceptedRun {
+  targetAgentId: string
+  runId: string
+  sessionKey: string
 }
 
 const HOUR_MS = 60 * 60 * 1000
@@ -37,6 +46,7 @@ export function normalizeSkillAutoTrainArgs(
     maxSessions: boundedInt(args.maxSessions, 8, 1, 20),
     maxSkillEdits: boundedInt(args.maxSkillEdits, 3, 1, 10),
     apply: args.apply !== false,
+    waitForCompletion: args.waitForCompletion === true,
     ...(focus ? { focus } : {}),
   }
 }
@@ -108,10 +118,12 @@ export function createSkillAutoTrainDelegateRequest(
       `lookbackHours=${opts.lookbackHours}`,
       `maxSessions=${opts.maxSessions}`,
       `maxSkillEdits=${opts.maxSkillEdits}`,
+      `waitForCompletion=${opts.waitForCompletion}`,
       opts.focus ? `focus=${opts.focus}` : '',
     ]
       .filter(Boolean)
       .join('\n'),
+    waitForCompletion: opts.waitForCompletion,
   }
 }
 
@@ -130,4 +142,35 @@ function cleanString(value: unknown): string | undefined {
   if (typeof value !== 'string') return undefined
   const trimmed = value.trim()
   return trimmed || undefined
+}
+
+export function formatSkillAutoTrainAcceptedRun(run: SkillAutoTrainAcceptedRun): string {
+  return [
+    '✅ skill_train_auto 已启动后台训练，不再等待长任务完成。',
+    `Agent: ${run.targetAgentId}`,
+    `Run ID: ${run.runId}`,
+    `Session: ${run.sessionKey}`,
+    '',
+    '稍后查看状态：',
+    `skill_train_auto_status({ "runId": "${run.runId}" })`,
+  ].join('\n')
+}
+
+export function formatSkillAutoTrainStatus(run: any): string {
+  const status = String(run?.status ?? 'unknown')
+  const startedAt =
+    typeof run?.startedAt === 'number' ? new Date(run.startedAt).toISOString() : 'unknown'
+  const duration =
+    typeof run?.durationMs === 'number' ? `${Math.round(run.durationMs / 1000)}s` : 'running'
+  const lines = [
+    `skill_train_auto status: ${status}`,
+    `Run ID: ${run?.id ?? 'unknown'}`,
+    `Session: ${run?.sessionKey ?? 'unknown'}`,
+    `Started: ${startedAt}`,
+    `Duration: ${duration}`,
+  ]
+  if (run?.error) lines.push(`Error: ${run.error}`)
+  const output = typeof run?.outputPreview === 'string' ? run.outputPreview.trim() : ''
+  if (output) lines.push('', 'Output preview:', output)
+  return lines.join('\n')
 }

@@ -59,6 +59,7 @@ import {
 } from './claudeTerminal.js'
 import { syncCodexAuthFile } from './codexAuthSync.js'
 import { CronScheduler } from './cron.js'
+import { runDelegateExecution } from './delegateExecution.js'
 import { parseDocument } from './documentParser.js'
 import {
   EgressHttpError,
@@ -90,6 +91,7 @@ import { RateLimiter } from './rateLimit.js'
 import { type RedisFrameEnvelope, RedisSessionBus } from './redisSessionBus.js'
 import { Router } from './router.js'
 import { RunLog } from './runLog.js'
+import { selectRunLogResponse } from './runLogApi.js'
 import { SessionManager } from './sessionManager.js'
 import {
   VOICE_WS_PATH,
@@ -1489,7 +1491,8 @@ export class Gateway {
       return
     }
     if (url.pathname === '/api/runs' && req.method === 'GET') {
-      this.sendJson(res, 200, { runs: this._runLog.recent(50) })
+      const result = selectRunLogResponse(this._runLog, url.searchParams)
+      this.sendJson(res, result.status, result.body)
       return
     }
     if (url.pathname === '/api/sessions') {
@@ -2775,7 +2778,15 @@ export class Gateway {
       return this.sendError(res, 400, 'invalid JSON')
     }
     const { goal, context, sourceAgent, toolsets } = parsed
+    const runAsync = parsed.async === true
     if (!goal) return this.sendError(res, 400, 'goal required')
+
+    // Recursion guard: check delegation depth via header
+    const depthHeader = req.headers['x-delegation-depth']
+    const depth = depthHeader ? Number.parseInt(String(depthHeader), 10) : 0
+    if (depth >= 3) {
+      return this.sendError(res, 400, 'delegation depth limit exceeded (max 3)')
+    }
 
     // Concurrency guard
     if (this._activeDelegations >= Gateway.MAX_CONCURRENT_DELEGATIONS) {
@@ -2785,23 +2796,32 @@ export class Gateway {
         `too many concurrent delegations (max ${Gateway.MAX_CONCURRENT_DELEGATIONS})`,
       )
     }
-
-    // Recursion guard: check delegation depth via header
-    const depthHeader = req.headers['x-delegation-depth']
-    const depth = depthHeader ? Number.parseInt(String(depthHeader), 10) : 0
-    if (depth >= 3) {
-      return this.sendError(res, 400, 'delegation depth limit exceeded (max 3)')
+    this._activeDelegations++
+    let activeReleased = false
+    const releaseActive = () => {
+      if (activeReleased) return
+      activeReleased = true
+      this._activeDelegations--
     }
 
     // Find target agent
-    const cfg = await this._getAgentsConfig()
-    const targetAgent = cfg.agents.find((a) => a.id === targetAgentId)
-    if (!targetAgent) return this.sendError(res, 404, `agent "${targetAgentId}" not found`)
+    let targetAgent: AgentDef | undefined
+    try {
+      const cfg = await this._getAgentsConfig()
+      targetAgent = cfg.agents.find((a) => a.id === targetAgentId)
+    } catch (err) {
+      releaseActive()
+      throw err
+    }
+    if (!targetAgent) {
+      releaseActive()
+      return this.sendError(res, 404, `agent "${targetAgentId}" not found`)
+    }
 
     // Apply toolset restriction if specified
     const delegatedAgent = toolsets ? { ...targetAgent, toolsets } : targetAgent
 
-    const sessionKey = `agent:${targetAgentId}:delegate:${sourceAgent || 'system'}:${Date.now()}`
+    const sessionKey = `agent:${targetAgentId}:delegate:${sourceAgent || 'system'}:${Date.now()}:${randomBytes(4).toString('hex')}`
     this.log.info('delegate', {
       sourceAgent,
       targetAgentId,
@@ -2809,52 +2829,68 @@ export class Gateway {
       depth,
     })
 
-    const session = await this.sessions.getOrCreate({
-      sessionKey,
-      agent: delegatedAgent,
-      channel: 'delegate',
-      peerId: sourceAgent || 'system',
-      title: `[delegate] ${goal.slice(0, 40)}`,
-      delegationDepth: depth + 1,
-    })
+    let session: Awaited<ReturnType<SessionManager['getOrCreate']>>
+    try {
+      session = await this.sessions.getOrCreate({
+        sessionKey,
+        agent: delegatedAgent,
+        channel: 'delegate',
+        peerId: sourceAgent || 'system',
+        title: `[delegate] ${goal.slice(0, 40)}`,
+        delegationDepth: depth + 1,
+      })
+    } catch (err) {
+      releaseActive()
+      throw err
+    }
 
     // Build prompt with context
     const prompt = context
       ? `[委派任务]\n\n目标: ${goal}\n\n上下文:\n${context}\n\n请完成上述任务并返回结果摘要。`
       : `[委派任务]\n\n目标: ${goal}\n\n请完成上述任务并返回结果摘要。`
 
-    this._activeDelegations++
     const _dlgRun = this._runLog.start({
       agentId: targetAgentId,
       sessionKey,
       taskType: 'delegate',
     })
-    let output = ''
-    let error = ''
-    try {
-      await this.sessions.submit(session, prompt, (e) => {
-        if (e.kind === 'block' && e.block.kind === 'text') output += e.block.text
-        if (e.kind === 'error') error = e.error
+
+    const runExecution = () =>
+      runDelegateExecution({
+        agentId: targetAgentId,
+        sessionKey,
+        runLog: this._runLog,
+        runEntry: _dlgRun,
+        submit: (onEvent) => this.sessions.submit(session, prompt, onEvent),
+        emitCompleted: ({ output, error }) => {
+          eventBus.emit(
+            'agent.completed',
+            createEvent('agent.completed', targetAgentId, {
+              sessionKey,
+              output: output.trim(),
+              error: error || undefined,
+            }),
+          )
+        },
+        releaseActive,
       })
-      this._runLog.complete(_dlgRun, {
-        status: error ? 'failed' : 'completed',
-        error: error || undefined,
+
+    if (runAsync) {
+      runExecution().catch((err) =>
+        this.log.error('async delegate execution failed', { targetAgentId, sessionKey }, err),
+      )
+      this.sendJson(res, 202, {
+        ok: true,
+        accepted: true,
+        async: true,
+        agentId: targetAgentId,
+        sessionKey,
+        runId: _dlgRun.id,
       })
-    } catch (err: any) {
-      error = error || String(err)
-      this._runLog.complete(_dlgRun, { status: 'failed', error })
-    } finally {
-      this._activeDelegations--
+      return
     }
 
-    eventBus.emit(
-      'agent.completed',
-      createEvent('agent.completed', targetAgentId, {
-        sessionKey,
-        output: output.trim(),
-        error: error || undefined,
-      }),
-    )
+    const { output, error } = await runExecution()
 
     this.sendJson(res, 200, {
       ok: !error,
