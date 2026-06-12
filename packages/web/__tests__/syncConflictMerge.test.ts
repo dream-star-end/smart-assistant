@@ -66,19 +66,33 @@ const _syncHelperNames = [
   '_bashTailSupersedes',
   '_toolLikeSupersedes',
   '_childBlockSupersedes',
+  '_childBlocksPrefixSupersedes',
+  '_assistantChildBlocksSupersedes',
   '_agentGroupSupersedes',
+  '_activeStreamEntries',
+  '_activeStreamIds',
+  '_serverMessageCoversLocalVisible',
+  '_activeStreamLoss',
+  '_localDominatesAllowingMissingActive',
+  '_activeStreamLogPayload',
 ]
 const _syncHelperSrc = _syncHelperNames.map((name) => extractTopLevelFn(SYNC_SRC, name)).join('\n')
 const _combined = `${_syncHelperSrc}\n${extractTopLevelFn(SYNC_SRC, '_localMessageSupersedes')}\n${extractTopLevelFn(SYNC_SRC, '_localDominates')}`
 const _helpers = new Function(
-  `${_combined}; return { _stableStringify, _localMessageSupersedes, _localDominates };`,
+  `${_combined}; return { _stableStringify, _localMessageSupersedes, _localDominates, _activeStreamLoss, _activeStreamIds, _localDominatesAllowingMissingActive };`,
 )() as {
   _stableStringify: (v: any) => string | null
   _localMessageSupersedes: (l: any, s: any) => boolean
   _localDominates: (s: any, l: any) => boolean
+  _activeStreamLoss: (sess: any, serverMessages: any[]) => any
+  _activeStreamIds: (sess: any) => Set<string>
+  _localDominatesAllowingMissingActive: (s: any, l: any, activeIds: Set<string>) => boolean
 }
 const _localMessageSupersedes = _helpers._localMessageSupersedes
 const _localDominates = _helpers._localDominates
+const _activeStreamLoss = _helpers._activeStreamLoss
+const _activeStreamIds = _helpers._activeStreamIds
+const _localDominatesAllowingMissingActive = _helpers._localDominatesAllowingMissingActive
 
 // ═══════════════════════════════════════════════════════════════════
 // _localMessageSupersedes
@@ -439,11 +453,75 @@ describe('_localMessageSupersedes — role whitelist', () => {
     )
   })
 
-  it('assistant with childBlocks locally but not on server → false (Layer 2 also refused)', () => {
+  it('assistant with childBlocks locally but not on server → true when text is preserved', () => {
     assert.equal(
       _localMessageSupersedes(
-        { id: 'a1', role: 'assistant', text: 'hello', childBlocks: [] },
+        { id: 'a1', role: 'assistant', text: 'hello', childBlocks: [{ kind: 'text', text: 'x' }] },
         { id: 'a1', role: 'assistant', text: 'hello' },
+      ),
+      true,
+    )
+  })
+
+  it('assistant with childBlocks can grow as an ordered structural prefix', () => {
+    assert.equal(
+      _localMessageSupersedes(
+        {
+          id: 'a1',
+          role: 'assistant',
+          text: 'hello world',
+          childBlocks: [
+            { kind: 'thinking', text: 'inspect carefully' },
+            {
+              kind: 'tool_use',
+              blockId: 'tool-1',
+              toolName: 'Bash',
+              inputPreview: 'ls -la',
+              _partial: false,
+              _completed: true,
+              output: 'total 8',
+              error: false,
+            },
+            { kind: 'text', text: 'done' },
+          ],
+        },
+        {
+          id: 'a1',
+          role: 'assistant',
+          text: 'hello',
+          childBlocks: [
+            { kind: 'thinking', text: 'inspect' },
+            {
+              kind: 'tool_use',
+              blockId: 'tool-1',
+              toolName: 'Bash',
+              inputPreview: 'ls',
+              _partial: true,
+              _completed: false,
+              error: false,
+            },
+          ],
+        },
+      ),
+      true,
+    )
+  })
+
+  it('assistant with unknown child block kind still refuses structural judgement', () => {
+    assert.equal(
+      _localMessageSupersedes(
+        {
+          id: 'a1',
+          role: 'assistant',
+          text: 'hello world',
+          childBlocks: [{ kind: 'mystery', text: 'local' }],
+        },
+        {
+          id: 'a1',
+          role: 'assistant',
+          text: 'hello',
+          childBlocks: [{ kind: 'mystery', text: 'server' }],
+        },
       ),
       false,
     )
@@ -731,6 +809,39 @@ describe('_localDominates — local clean-superset judge', () => {
     const server: any[] = [{ role: 'user', text: 'hi' }, a('a1', 'x')]
     const local = [u('u1', 'hi'), a('a1', 'x')]
     assert.equal(_localDominates(server, local), false)
+  })
+})
+
+describe('active-stream conflict helpers', () => {
+  const u = (id: string, text: string) => ({ id, role: 'user', text })
+  const a = (id: string, text: string) => ({ id, role: 'assistant', text })
+
+  it('detects active message loss when the server snapshot lacks the streaming row', () => {
+    const active = a('a-live', 'streaming')
+    const sess = { id: 's1', messages: [u('u1', 'hi'), active], _streamingAssistant: active }
+    const loss = _activeStreamLoss(sess, [u('u1', 'hi')])
+
+    assert.equal(loss?.reason, 'missing-active-message')
+    assert.equal(loss?.id, 'a-live')
+  })
+
+  it('allows walking past a missing active local row only when all server rows are represented', () => {
+    const active = a('a-live', 'streaming')
+    const server = [u('u1', 'hi'), { id: 't1', role: 'tool', text: 'Bash' }]
+    const local = [u('u1', 'hi'), active, { id: 't1', role: 'tool', text: 'Bash' }]
+    const sess = { messages: local, _streamingAssistant: active }
+
+    assert.equal(_localDominates(server, local), false)
+    assert.equal(_localDominatesAllowingMissingActive(server, local, _activeStreamIds(sess)), true)
+  })
+
+  it('does not allow skipping active rows when the server has separate divergent data', () => {
+    const active = a('a-live', 'streaming')
+    const server = [u('u1', 'hi'), { id: 'server-only', role: 'assistant', text: 'remote' }]
+    const local = [u('u1', 'hi'), active, { id: 't1', role: 'tool', text: 'Bash' }]
+    const sess = { messages: local, _streamingAssistant: active }
+
+    assert.equal(_localDominatesAllowingMissingActive(server, local, _activeStreamIds(sess)), false)
   })
 })
 
@@ -1197,6 +1308,141 @@ describe('pushSessionToServer — 409 local-dominates', () => {
     assert.equal(sess.pinned, true)
     assert.equal(sess.agentId, 'local-agent')
     assert.equal(sess.lastAt, 2500)
+  })
+})
+
+describe('pushSessionToServer — active-stream safe deferral', () => {
+  it('defers server-wins when the only gap is a missing active local message', async () => {
+    const sessId = 'sess-active-defer'
+    const userMsg = { id: 'u1', role: 'user', text: 'hi' }
+    const activeAsst = { id: 'a-live', role: 'assistant', text: 'streaming answer' }
+    const toolMsg = { id: 't1', role: 'tool', text: 'Bash' }
+    const sess: any = {
+      id: sessId,
+      title: 'local',
+      messages: [userMsg, activeAsst, toolMsg],
+      lastAt: 1000,
+      pinned: false,
+      agentId: 'codex',
+      _dirty: true,
+      _syncedAt: 500,
+      _streamingAssistant: activeAsst,
+    }
+    const deps = baseDeps({
+      _apiFetchImpl: () => conflict(),
+      _apiGetImpl: () => ({
+        id: sessId,
+        title: 'server',
+        messages: [userMsg, toolMsg],
+        lastAt: 1100,
+        pinned: true,
+        agentId: 'codex',
+        updatedAt: 2000,
+      }),
+    } as any)
+    deps.state.sessions.set(sessId, sess)
+
+    await makePush(deps)(sess)
+
+    assert.deepEqual(
+      sess.messages.map((m: any) => m.id),
+      ['u1', 'a-live', 't1'],
+      'local active row stays visible',
+    )
+    assert.equal(sess.title, 'server')
+    assert.equal(sess.pinned, true)
+    assert.equal(sess._syncedAt, 2000)
+    assert.equal(sess._dirty, true)
+    assert.equal(sess._conflictRetryCount, 1)
+    assert.equal(deps.dbCalls.length, 1)
+    assert.equal(deps.conflictCb[0].mode, 'local-dominates')
+    assert.deepEqual(deps.retryCb, [sessId])
+  })
+
+  it('does not defer when the server has a separate divergent row', async () => {
+    const sessId = 'sess-active-diverged'
+    const userMsg = { id: 'u1', role: 'user', text: 'hi' }
+    const activeAsst = { id: 'a-live', role: 'assistant', text: 'streaming answer' }
+    const toolMsg = { id: 't1', role: 'tool', text: 'Bash' }
+    const remoteAsst = { id: 'a-remote', role: 'assistant', text: 'remote-only' }
+    const sess: any = {
+      id: sessId,
+      title: 'local',
+      messages: [userMsg, activeAsst, toolMsg],
+      lastAt: 1000,
+      pinned: false,
+      agentId: 'codex',
+      _dirty: true,
+      _syncedAt: 500,
+      _streamingAssistant: activeAsst,
+    }
+    const deps = baseDeps({
+      _apiFetchImpl: () => conflict(),
+      _apiGetImpl: () => ({
+        id: sessId,
+        title: 'server',
+        messages: [userMsg, remoteAsst, toolMsg],
+        lastAt: 1100,
+        pinned: false,
+        agentId: 'codex',
+        updatedAt: 2000,
+      }),
+    } as any)
+    deps.state.sessions.set(sessId, sess)
+
+    await makePush(deps)(sess)
+
+    assert.deepEqual(
+      sess.messages.map((m: any) => m.id),
+      ['u1', 'a-remote', 't1'],
+      'server-only divergent row wins',
+    )
+    assert.equal(sess._dirty, false)
+    assert.equal(sess._conflictRetryCount, 0)
+    assert.equal(sess._streamingAssistant, null)
+    assert.equal(deps.conflictCb[0].mode, 'server-wins')
+    assert.equal(deps.retryCb.length, 0)
+  })
+
+  it('deferral obeys the retry cap and leaves the session dirty', async () => {
+    const sessId = 'sess-active-cap'
+    const userMsg = { id: 'u1', role: 'user', text: 'hi' }
+    const activeAsst = { id: 'a-live', role: 'assistant', text: 'streaming answer' }
+    const toolMsg = { id: 't1', role: 'tool', text: 'Bash' }
+    const sess: any = {
+      id: sessId,
+      title: 'local',
+      messages: [userMsg, activeAsst, toolMsg],
+      lastAt: 1000,
+      pinned: false,
+      agentId: 'codex',
+      _dirty: true,
+      _syncedAt: 500,
+      _conflictRetryCount: 1,
+      _streamingAssistant: activeAsst,
+    }
+    const deps = baseDeps({
+      _apiFetchImpl: () => conflict(),
+      _apiGetImpl: () => ({
+        id: sessId,
+        title: 'server',
+        messages: [userMsg, toolMsg],
+        lastAt: 1100,
+        pinned: false,
+        agentId: 'codex',
+        updatedAt: 2000,
+      }),
+    } as any)
+    deps.state.sessions.set(sessId, sess)
+
+    await makePush(deps, 1)(sess)
+
+    assert.equal(sess._dirty, true)
+    assert.equal(sess._syncedAt, 2000)
+    assert.equal(sess._conflictRetryCount, 2)
+    assert.equal(deps.dbCalls.length, 1)
+    assert.equal(deps.conflictCb[0].mode, 'local-dominates')
+    assert.equal(deps.retryCb.length, 0)
   })
 })
 

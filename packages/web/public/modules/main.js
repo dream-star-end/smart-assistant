@@ -27,7 +27,7 @@ import { apiFetch, apiGet, apiJson, authHeaders, onAuthExpired, resetAuthExpired
 import { dbDelete, dbGetAll, dbPut, onIdbUnavailable, openDB } from './db.js'
 
 // ── Cross-device sync ──
-import { hydrateSession, maybeSyncNow, setSyncDeps, syncSessionsFromServer } from './sync.js?v=8'
+import { hydrateSession, maybeSyncNow, setSyncDeps, syncSessionsFromServer } from './sync.js?v=9'
 
 // ── Theme ──
 import { applyTheme, cycleTheme, effectiveTheme, setToastFn } from './theme.js'
@@ -111,7 +111,7 @@ import {
   showContextMenu,
   startInlineRename,
   switchSession,
-} from './sessions.js?v=9'
+} from './sessions.js?v=10'
 
 // ── Messages ──
 import {
@@ -154,7 +154,7 @@ import {
   updateMessage,
   updateMsgStatus,
   updateSendEnabled,
-} from './websocket.js?v=47'
+} from './websocket.js?v=48'
 
 // ── Slash commands ──
 import {
@@ -167,7 +167,7 @@ import {
   setSlashSelected,
   showSlashPopup,
   slashPopupVisible,
-} from './commands.js?v=7'
+} from './commands.js?v=8'
 import { getEffortForSubmit, initModePills, renderModePills } from './effortMode.js'
 import {
   getGoalModeForSubmit,

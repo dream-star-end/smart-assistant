@@ -4,7 +4,7 @@ import { shouldSuppressGoalStatusToast } from './goalControl.js?v=3'
 import { renderGoalModePanel, settleGoalModePanel } from './goalMode.js?v=3'
 import { maybeNotify, setTitleBusy } from './notifications.js'
 import { getSession, state } from './state.js'
-import { maybeSyncNow } from './sync.js?v=8'
+import { maybeSyncNow } from './sync.js?v=9'
 import { toast } from './ui.js'
 
 // ── Late-binding for circular deps (sessions.js, messages.js) ──

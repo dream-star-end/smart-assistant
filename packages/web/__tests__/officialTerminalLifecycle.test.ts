@@ -185,10 +185,10 @@ describe('official Claude terminal lifecycle', () => {
   it('cache-busts terminal module when changing mobile controls', () => {
     assert.match(MAIN, /from '\.\/officialTerminal\.js\?v=8'/)
     assert.match(SW, /\/modules\/officialTerminal\.js\?v=8/)
-    assert.match(INDEX, /\/modules\/main\.js\?v=60/)
+    assert.match(INDEX, /\/modules\/main\.js\?v=61/)
     assert.match(INDEX, /\/style\.css\?v=52/)
     assert.match(INDEX, /sw-flush-v22/)
-    assert.match(SW, /openclaude-v80/)
+    assert.match(SW, /openclaude-v81/)
   })
 
   it('terminal files live in a separate wide modal with Escape closing files first', () => {
