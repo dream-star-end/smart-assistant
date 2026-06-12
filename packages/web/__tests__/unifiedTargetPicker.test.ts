@@ -27,6 +27,10 @@ const MESSAGES = readFileSync(
   resolve(import.meta.dirname, '..', 'public', 'modules', 'messages.js'),
   'utf-8',
 )
+const MODEL_POLICY = readFileSync(
+  resolve(import.meta.dirname, '..', 'public', 'modules', 'modelPolicy.js'),
+  'utf-8',
+)
 const SYNC = readFileSync(
   resolve(import.meta.dirname, '..', 'public', 'modules', 'sync.js'),
   'utf-8',
@@ -112,5 +116,14 @@ describe('unified assistant picker wiring', () => {
     assert.match(WEBSOCKET, /delegate-progress/)
     assert.match(MESSAGES, /function _renderDelegateProgress/)
     assert.match(MESSAGES, /委派过程/)
+  })
+
+  it('single-agent model policy is shared by send, regen, picker label, and effort controls', () => {
+    assert.match(MODEL_POLICY, /getSingleAgentModelOverride/)
+    assert.match(MODEL_POLICY, /isGptModel/)
+    assert.match(MAIN, /getSingleAgentModelOverride/)
+    assert.match(MESSAGES, /getSingleAgentModelOverride/)
+    assert.match(MODEL, /getEffectiveSingleAgentModel/)
+    assert.match(EFFORT, /getEffectiveSingleAgentModel/)
   })
 })

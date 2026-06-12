@@ -38,6 +38,8 @@ const SHELL = [
   '/modules/agents.js',
   '/modules/agents.js?v=870d33c6',  // 版本化 URL(main.js import 带 ?v=)
   '/modules/effortMode.js',
+  '/modules/modelPolicy.js',
+  '/modules/modelPolicy.js?v=auto',
   '/modules/modelPicker.js',
   '/modules/modelPicker.js?v=870d33c6',  // 版本化 URL(main.js import 带 ?v=)
   '/modules/planMode.js',

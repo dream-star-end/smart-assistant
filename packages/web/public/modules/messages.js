@@ -16,6 +16,7 @@ import {
 } from './markdown.js?v=870d33c6'
 import { getSession, state, tryEnqueueOffline, MAX_OFFLINE_QUEUE } from './state.js?v=870d33c6'
 import { toast } from './ui.js?v=870d33c6'
+import { getSingleAgentModelOverride } from './modelPolicy.js?v=auto'
 import { parsePartialJson } from './partialJson.js?v=870d33c6'
 import { msgTimeLabel, shortTime } from './util.js?v=870d33c6'
 import {
@@ -2522,13 +2523,17 @@ export function _buildMessageEl(msg) {
           lastUserMsg._modelText || lastUserMsg.text || '',
           lastUserMsg._media || [],
         )
-        // 普通 regen 仍走当前 user prefs;团队 regen 必须复用原团队队长和原团队
+        // 普通 regen 与 main.js send() 共享 model policy;团队 regen 必须复用原团队队长和原团队
         // model override,否则会从团队协作退回单 Agent/default model。
-        const _regenPrefModel = state.userPrefs?.default_model
+        const _regenAgentId = _regenTeamRun?.leaderAgentId || sess.agentId || state.defaultAgentId
         const _regenModelOverride = _regenTeamRun
           ? _regenTeamRun.modelOverride
-          : (typeof _regenPrefModel === 'string' && _regenPrefModel) ? _regenPrefModel : undefined
-        const _regenAgentId = _regenTeamRun?.leaderAgentId || sess.agentId || state.defaultAgentId
+          : getSingleAgentModelOverride({
+              userPrefs: state.userPrefs,
+              agentId: _regenAgentId,
+              defaultAgentId: state.defaultAgentId,
+              agentsList: state.agentsList,
+            })
         const wsPayload = {
           type: 'inbound.message',
           idempotencyKey: `regen-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
