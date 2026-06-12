@@ -76,16 +76,46 @@ describe('official Claude terminal lifecycle', () => {
 
   it('auto-reconnects on mobile resume without treating transient errors as fatal', () => {
     const ensureSrc = extractFunction(SRC, 'ensureTerminalConnected')
+    const canReconnectSrc = extractFunction(SRC, 'terminalCanReconnect')
     const initSrc = extractFunction(SRC, 'initOfficialClaudeTerminal')
 
     assert.match(ensureSrc, /socketIsConnectingOrOpen\(\)/)
     assert.match(ensureSrc, /RECONNECT_ATTEMPT_MIN_MS/)
-    assert.match(ensureSrc, /status === 'exited' \|\| status === 'disabled'/)
-    assert.doesNotMatch(ensureSrc, /status === 'error'/)
+    assert.match(canReconnectSrc, /status !== 'exited' && status !== 'disabled'/)
+    assert.doesNotMatch(canReconnectSrc, /status !== 'error'|status === 'error'/)
     assert.match(initSrc, /visibilitychange/)
     assert.match(initSrc, /window\.addEventListener\('focus'/)
     assert.match(initSrc, /window\.addEventListener\('online'/)
     assert.match(initSrc, /handleTerminalVisibilityResume\('从后台恢复，正在重连'\)/)
+  })
+
+  it('forces a fresh websocket after long mobile background without killing the PTY', () => {
+    const handleSrc = extractFunction(SRC, 'handleTerminalVisibilityResume')
+    const forceSrc = extractFunction(SRC, 'forceReconnectTerminal')
+    const initSrc = extractFunction(SRC, 'initOfficialClaudeTerminal')
+
+    assert.match(SRC, /STALE_BACKGROUND_RECONNECT_MS = 30 \* 1000/)
+    assert.match(initSrc, /terminalHiddenAt = Date\.now\(\)/)
+    assert.match(handleSrc, /const hiddenAt = terminalHiddenAt/)
+    assert.match(handleSrc, /terminalHiddenAt = null/)
+    assert.match(handleSrc, /hiddenMs >= STALE_BACKGROUND_RECONNECT_MS/)
+    assert.match(handleSrc, /forceReconnectTerminal\(reason\)/)
+    assert.match(forceSrc, /connectTerminal\(reason\)/)
+    assert.doesNotMatch(forceSrc, /type:\s*['"]kill|closeSocket\(true\)/)
+  })
+
+  it('clears failed websocket handles and schedules a throttled retry', () => {
+    const connectSrc = extractFunction(SRC, 'connectTerminal')
+    const scheduleSrc = extractFunction(SRC, 'scheduleTerminalReconnect')
+
+    assert.match(connectSrc, /ws\.onerror/)
+    assert.match(connectSrc, /socket = null/)
+    assert.match(connectSrc, /ws\.close\(\)/)
+    assert.match(connectSrc, /scheduleTerminalReconnect\('WebSocket 连接失败，正在重连'\)/)
+    assert.match(scheduleSrc, /terminalReconnectTimer/)
+    assert.match(scheduleSrc, /RECONNECT_ATTEMPT_MIN_MS/)
+    assert.match(scheduleSrc, /document\.visibilityState === 'hidden'/)
+    assert.match(scheduleSrc, /!socketIsConnectingOrOpen\(\)/)
   })
 
   it('preserves scrollback reading position and exposes a new-output jump chip', () => {
@@ -153,12 +183,12 @@ describe('official Claude terminal lifecycle', () => {
   })
 
   it('cache-busts terminal module when changing mobile controls', () => {
-    assert.match(MAIN, /from '\.\/officialTerminal\.js\?v=7'/)
-    assert.match(SW, /\/modules\/officialTerminal\.js\?v=7/)
-    assert.match(INDEX, /\/modules\/main\.js\?v=59/)
-    assert.match(INDEX, /\/style\.css\?v=51/)
-    assert.match(INDEX, /sw-flush-v21/)
-    assert.match(SW, /openclaude-v79/)
+    assert.match(MAIN, /from '\.\/officialTerminal\.js\?v=8'/)
+    assert.match(SW, /\/modules\/officialTerminal\.js\?v=8/)
+    assert.match(INDEX, /\/modules\/main\.js\?v=60/)
+    assert.match(INDEX, /\/style\.css\?v=52/)
+    assert.match(INDEX, /sw-flush-v22/)
+    assert.match(SW, /openclaude-v80/)
   })
 
   it('terminal files live in a separate wide modal with Escape closing files first', () => {
