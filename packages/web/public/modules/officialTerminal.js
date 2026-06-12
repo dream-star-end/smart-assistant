@@ -37,6 +37,7 @@ const CLOSE_SELECTOR = '[data-claude-terminal-close]'
 const FILE_MODAL_CLOSE_SELECTOR = '[data-claude-terminal-files-close]'
 const MAX_TERMINAL_INPUT_BYTES = 32 * 1024
 const RECONNECT_ATTEMPT_MIN_MS = 1500
+const STALE_BACKGROUND_RECONNECT_MS = 30 * 1000
 const MOBILE_COMMAND_HISTORY_KEY = 'openclaude:claude-terminal:mobile-command-history'
 const MAX_MOBILE_COMMAND_HISTORY = 20
 const TERMINAL_RECENT_FILES_KEY = 'openclaude:claude-terminal:recent-files'
@@ -74,6 +75,8 @@ let mobileCommandHistoryCursor = null
 let mobileCommandHistoryDraft = ''
 let wakeLockSentinel = null
 let wakeLockWanted = false
+let terminalHiddenAt = null
+let terminalReconnectTimer = null
 let terminalRecentFiles = []
 const terminalUploads = []
 let terminalBrowsePath = ''
@@ -1304,18 +1307,48 @@ function closeSocket(kill = false) {
   } catch {}
 }
 
+function terminalCanReconnect() {
+  if (!isModalOpen() || !terminal || !state.token) return false
+  const status = terminalStatusState()
+  return status !== 'exited' && status !== 'disabled'
+}
+
 function socketIsConnectingOrOpen() {
   return socket?.readyState === WebSocket.CONNECTING || socket?.readyState === WebSocket.OPEN
 }
 
 function ensureTerminalConnected(reason = '') {
-  if (!isModalOpen() || !terminal || !state.token) return false
+  if (!terminalCanReconnect()) return false
   if (socketIsConnectingOrOpen()) return false
-  const status = terminalStatusState()
-  if (status === 'exited' || status === 'disabled') return false
   const now = Date.now()
   if (now - lastReconnectAttemptAt < RECONNECT_ATTEMPT_MIN_MS) return false
   lastReconnectAttemptAt = now
+  connectTerminal(reason)
+  return true
+}
+
+function clearTerminalReconnectTimer() {
+  if (!terminalReconnectTimer) return
+  clearTimeout(terminalReconnectTimer)
+  terminalReconnectTimer = null
+}
+
+function scheduleTerminalReconnect(reason = '') {
+  if (!terminalCanReconnect() || document.visibilityState === 'hidden') return false
+  if (terminalReconnectTimer) return true
+  const delay = Math.max(0, RECONNECT_ATTEMPT_MIN_MS - (Date.now() - lastReconnectAttemptAt))
+  terminalReconnectTimer = setTimeout(() => {
+    terminalReconnectTimer = null
+    if (!terminalCanReconnect() || document.visibilityState === 'hidden') return
+    if (!socketIsConnectingOrOpen()) ensureTerminalConnected(reason)
+  }, delay)
+  return true
+}
+
+function forceReconnectTerminal(reason = '') {
+  if (!terminalCanReconnect()) return false
+  clearTerminalReconnectTimer()
+  lastReconnectAttemptAt = Date.now()
   connectTerminal(reason)
   return true
 }
@@ -1325,6 +1358,8 @@ function connectTerminal(reason = '') {
     toast('请先登录 OpenClaude', 'error')
     return
   }
+  clearTerminalReconnectTimer()
+  lastReconnectAttemptAt = Date.now()
   closeSocket(false)
   reconnectRequested = false
   setStatus('connecting', reason)
@@ -1378,6 +1413,11 @@ function connectTerminal(reason = '') {
   ws.onerror = () => {
     if (socket !== ws) return
     setStatus('error', 'WebSocket 连接失败')
+    socket = null
+    try {
+      if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) ws.close()
+    } catch {}
+    scheduleTerminalReconnect('WebSocket 连接失败，正在重连')
   }
 
   ws.onclose = () => {
@@ -1465,6 +1505,7 @@ async function terminateOfficialClaudeTerminalAsync() {
 function reconnectTerminal() {
   reconnectRequested = true
   lastReconnectAttemptAt = 0
+  clearTerminalReconnectTimer()
   closeSocket(false)
   if (!terminal) {
     createTerminal()
@@ -1517,7 +1558,14 @@ function bindNoFocusButton(id, handler) {
 }
 
 function handleTerminalVisibilityResume(reason) {
-  ensureTerminalConnected(reason)
+  const hiddenAt = terminalHiddenAt
+  terminalHiddenAt = null
+  const hiddenMs = Number.isFinite(hiddenAt) ? Date.now() - hiddenAt : 0
+  if (hiddenMs >= STALE_BACKGROUND_RECONNECT_MS) {
+    forceReconnectTerminal(reason)
+  } else {
+    ensureTerminalConnected(reason)
+  }
   if (wakeLockWanted) void requestWakeLock()
   fitVisibleTerminalSoon(false)
 }
@@ -1589,6 +1637,7 @@ export function initOfficialClaudeTerminal() {
       handleTerminalVisibilityResume('从后台恢复，正在重连')
       return
     }
+    terminalHiddenAt = Date.now()
     releaseWakeLock({ keepWanted: true })
   })
 
