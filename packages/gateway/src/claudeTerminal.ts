@@ -86,6 +86,17 @@ export function isClaudeTerminalEnabled(env: NodeJS.ProcessEnv = process.env): b
   return !isTruthyDisabled(env.OPENCLAUDE_OFFICIAL_CLAUDE_TERMINAL)
 }
 
+export function resolveClaudeTerminalUserIdForAuth(input: {
+  jwtUserId: string | null
+  jwtUserAllowed: boolean
+  rawTokenValid: boolean
+  hasConfiguredUsers: boolean
+}): string | null {
+  if (input.jwtUserId && input.jwtUserAllowed) return input.jwtUserId
+  if (!input.hasConfiguredUsers && input.rawTokenValid) return 'default'
+  return null
+}
+
 export function clampTerminalSize(cols: unknown, rows: unknown): { cols: number; rows: number } {
   const c = typeof cols === 'number' && Number.isFinite(cols) ? Math.trunc(cols) : DEFAULT_COLS
   const r = typeof rows === 'number' && Number.isFinite(rows) ? Math.trunc(rows) : DEFAULT_ROWS

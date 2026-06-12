@@ -13,6 +13,7 @@ import {
   clampTerminalSize,
   isAllowedClaudeTerminalOrigin,
   isClaudeTerminalEnabled,
+  resolveClaudeTerminalUserIdForAuth,
   resolveDetachedTerminalTtlMs,
   resolveOfficialClaudeCwd,
 } from '../claudeTerminal.js'
@@ -157,13 +158,75 @@ describe('official Claude terminal helpers', () => {
       false,
     )
   })
+
+  test('requires a user-scoped JWT principal for terminal auth in multi-user mode', () => {
+    assert.equal(
+      resolveClaudeTerminalUserIdForAuth({
+        jwtUserId: 'dx1',
+        jwtUserAllowed: true,
+        rawTokenValid: false,
+        hasConfiguredUsers: true,
+      }),
+      'dx1',
+    )
+    assert.equal(
+      resolveClaudeTerminalUserIdForAuth({
+        jwtUserId: 'default',
+        jwtUserAllowed: false,
+        rawTokenValid: false,
+        hasConfiguredUsers: true,
+      }),
+      null,
+    )
+    assert.equal(
+      resolveClaudeTerminalUserIdForAuth({
+        jwtUserId: null,
+        jwtUserAllowed: false,
+        rawTokenValid: true,
+        hasConfiguredUsers: false,
+      }),
+      'default',
+    )
+    assert.equal(
+      resolveClaudeTerminalUserIdForAuth({
+        jwtUserId: null,
+        jwtUserAllowed: false,
+        rawTokenValid: true,
+        hasConfiguredUsers: true,
+      }),
+      null,
+    )
+    assert.equal(
+      resolveClaudeTerminalUserIdForAuth({
+        jwtUserId: null,
+        jwtUserAllowed: false,
+        rawTokenValid: false,
+        hasConfiguredUsers: false,
+      }),
+      null,
+    )
+  })
 })
 
 describe('ClaudeTerminalManager lifecycle', () => {
   test('server exposes an authenticated HTTP terminate route', () => {
     assert.match(SERVER_SRC, /url\.pathname === '\/api\/claude-terminal\/terminate'/)
     assert.match(SERVER_SRC, /req\.method !== 'POST'/)
-    assert.match(SERVER_SRC, /claudeTerminal\?\.terminate\(this\.getUserId\(req\)\)/)
+    assert.match(SERVER_SRC, /const userId = this\.getClaudeTerminalUserId\(req\)/)
+    assert.match(SERVER_SRC, /claudeTerminal\?\.terminate\(userId\)/)
+  })
+
+  test('server terminal routes use the terminal-specific principal', () => {
+    assert.match(SERVER_SRC, /private getClaudeTerminalUserId\(req: IncomingMessage\)/)
+    assert.match(SERVER_SRC, /configuredUsers\.some\(\(u\) => u\.id === jwtUserId\)/)
+    assert.match(
+      SERVER_SRC,
+      /handleClaudeTerminalConnection[\s\S]*const userId = this\.getClaudeTerminalUserId\(req\)[\s\S]*handleConnection\(ws, userId\)/,
+    )
+    assert.doesNotMatch(
+      SERVER_SRC,
+      /claudeTerminal\?\.handleConnection\(ws, this\.getUserId\(req\)\)/,
+    )
   })
 
   test('spawns per user, forwards output/input, clamps resize, detaches on close, and terminates explicitly', () => {
