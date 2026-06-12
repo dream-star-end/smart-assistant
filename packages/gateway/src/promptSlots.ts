@@ -237,6 +237,7 @@ export function buildToolsSlot(): PromptSlot {
       '1. `skill_list()` 检查是否已有类似 skill',
       '2. 如果没有且模式可复用 → `skill_save(name, desc, body)`',
       '3. 好的 skill = 步骤 + 注意事项 + 命令模板',
+      '4. 用户明确要求“全自动训练 / 自动优化 skill”时,优先调用 `skill_train_auto(apply=true)`,不要只写人工审查计划。',
       '',
       '你是一个持久化、自进化的 agent。主动使用这些工具让自己越来越好。',
     ].join('\n'),
