@@ -1,11 +1,11 @@
 // OpenClaude — Message rendering and display
-import { _openTopupModal } from './billing.js?v=0bc3409a'
-import { $, _mod, fallbackCopy, htmlSafeEscape } from './dom.js?v=0bc3409a'
-import { getEffortForSubmit } from './effortMode.js?v=0bc3409a'
-import { refreshPlanPanel } from './planPanel.js?v=0bc3409a'
-import { getConversationModeForSubmit, requestDefaultNextSubmit } from './planMode.js?v=0bc3409a'
-import { exportMessageDocx } from './export-docx.js?v=0bc3409a'
-import { exportMessageTex } from './export-tex.js?v=0bc3409a'
+import { _openTopupModal } from './billing.js?v=870d33c6'
+import { $, _mod, fallbackCopy, htmlSafeEscape } from './dom.js?v=870d33c6'
+import { getEffortForSubmit } from './effortMode.js?v=870d33c6'
+import { refreshPlanPanel } from './planPanel.js?v=870d33c6'
+import { getConversationModeForSubmit, requestDefaultNextSubmit } from './planMode.js?v=870d33c6'
+import { exportMessageDocx } from './export-docx.js?v=870d33c6'
+import { exportMessageTex } from './export-tex.js?v=870d33c6'
 import {
   clearChartInstances,
   embedMediaUrls,
@@ -13,18 +13,18 @@ import {
   renderMarkdown,
   _renderLocalMedia,
   renderStreamingMarkdown,
-} from './markdown.js?v=0bc3409a'
-import { getSession, state, tryEnqueueOffline, MAX_OFFLINE_QUEUE } from './state.js?v=0bc3409a'
-import { toast } from './ui.js?v=0bc3409a'
-import { parsePartialJson } from './partialJson.js?v=0bc3409a'
-import { msgTimeLabel, shortTime } from './util.js?v=0bc3409a'
+} from './markdown.js?v=870d33c6'
+import { getSession, state, tryEnqueueOffline, MAX_OFFLINE_QUEUE } from './state.js?v=870d33c6'
+import { toast } from './ui.js?v=870d33c6'
+import { parsePartialJson } from './partialJson.js?v=870d33c6'
+import { msgTimeLabel, shortTime } from './util.js?v=870d33c6'
 import {
   formatMeta,
   getActiveStopAgentId,
   safeWsSend,
   setActiveTeamRunForSession,
   _resetTurnBillingState,
-} from './websocket.js?v=0bc3409a'
+} from './websocket.js?v=870d33c6'
 
 // ── Export helpers for save-as feature ──
 const _EXPORT_CSS =
