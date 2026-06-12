@@ -5,21 +5,21 @@
 //   - 单 Agent: switch session agent and adjust the per-user default_model.
 //   - 多 Agent: select a saved team; sendMessage routes through the team leader.
 
-import { apiJson } from './api.js?v=870d33c6'
-import { $ } from './dom.js?v=870d33c6'
-import { renderModePills } from './effortMode.js?v=870d33c6'
-import { openPersonaEditor } from './agents.js?v=870d33c6'
+import { apiJson } from './api.js?v=85ec6dff'
+import { $ } from './dom.js?v=85ec6dff'
+import { renderModePills } from './effortMode.js?v=85ec6dff'
+import { openPersonaEditor } from './agents.js?v=85ec6dff'
 import {
   clearSelectedAgentTeam,
   getAgentTeamById,
   openTeamEditor,
   selectAgentTeam,
   teamDisplayPrefix,
-} from './agentTeams.js?v=870d33c6'
-import { getSession, state } from './state.js?v=870d33c6'
-import { closeModal, openModal, toast, toastOptsFromError } from './ui.js?v=870d33c6'
-import { getEnabledModels, setCachedPrefField } from './userPrefs.js?v=870d33c6'
-import { getEffectiveSingleAgentModel } from './modelPolicy.js?v=auto'
+} from './agentTeams.js?v=85ec6dff'
+import { getSession, state } from './state.js?v=85ec6dff'
+import { closeModal, openModal, toast, toastOptsFromError } from './ui.js?v=85ec6dff'
+import { getEnabledModels, setCachedPrefField } from './userPrefs.js?v=85ec6dff'
+import { getEffectiveSingleAgentModel } from './modelPolicy.js?v=85ec6dff'
 
 function getCurrentAgentId() {
   const sess = getSession()

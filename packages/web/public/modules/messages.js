@@ -1,11 +1,11 @@
 // OpenClaude — Message rendering and display
-import { _openTopupModal } from './billing.js?v=870d33c6'
-import { $, _mod, fallbackCopy, htmlSafeEscape } from './dom.js?v=870d33c6'
-import { getEffortForSubmit } from './effortMode.js?v=870d33c6'
-import { refreshPlanPanel } from './planPanel.js?v=870d33c6'
-import { getConversationModeForSubmit, requestDefaultNextSubmit } from './planMode.js?v=870d33c6'
-import { exportMessageDocx } from './export-docx.js?v=870d33c6'
-import { exportMessageTex } from './export-tex.js?v=870d33c6'
+import { _openTopupModal } from './billing.js?v=85ec6dff'
+import { $, _mod, fallbackCopy, htmlSafeEscape } from './dom.js?v=85ec6dff'
+import { getEffortForSubmit } from './effortMode.js?v=85ec6dff'
+import { refreshPlanPanel } from './planPanel.js?v=85ec6dff'
+import { getConversationModeForSubmit, requestDefaultNextSubmit } from './planMode.js?v=85ec6dff'
+import { exportMessageDocx } from './export-docx.js?v=85ec6dff'
+import { exportMessageTex } from './export-tex.js?v=85ec6dff'
 import {
   clearChartInstances,
   embedMediaUrls,
@@ -13,19 +13,19 @@ import {
   renderMarkdown,
   _renderLocalMedia,
   renderStreamingMarkdown,
-} from './markdown.js?v=870d33c6'
-import { getSession, state, tryEnqueueOffline, MAX_OFFLINE_QUEUE } from './state.js?v=870d33c6'
-import { toast } from './ui.js?v=870d33c6'
-import { getSingleAgentModelOverride } from './modelPolicy.js?v=auto'
-import { parsePartialJson } from './partialJson.js?v=870d33c6'
-import { msgTimeLabel, shortTime } from './util.js?v=870d33c6'
+} from './markdown.js?v=85ec6dff'
+import { getSession, state, tryEnqueueOffline, MAX_OFFLINE_QUEUE } from './state.js?v=85ec6dff'
+import { toast } from './ui.js?v=85ec6dff'
+import { getSingleAgentModelOverride } from './modelPolicy.js?v=85ec6dff'
+import { parsePartialJson } from './partialJson.js?v=85ec6dff'
+import { msgTimeLabel, shortTime } from './util.js?v=85ec6dff'
 import {
   formatMeta,
   getActiveStopAgentId,
   safeWsSend,
   setActiveTeamRunForSession,
   _resetTurnBillingState,
-} from './websocket.js?v=870d33c6'
+} from './websocket.js?v=85ec6dff'
 
 // ── Export helpers for save-as feature ──
 const _EXPORT_CSS =
