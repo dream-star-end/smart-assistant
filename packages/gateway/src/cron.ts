@@ -50,7 +50,32 @@ export interface CronFile {
   jobs: CronJob[]
 }
 
+export const SKILL_AUTOTRAIN_JOB_ID = 'skill-autotrain'
+const NEW_AUTO_APPEND_DEFAULT_JOB_IDS = new Set([SKILL_AUTOTRAIN_JOB_ID])
+
 const DEFAULT_JOBS: CronJob[] = [
+  {
+    id: SKILL_AUTOTRAIN_JOB_ID,
+    schedule: '52 2 * * *', // 2:52 AM user local time (Asia/Shanghai by default)
+    agent: 'main',
+    enabled: true,
+    deliver: 'local',
+    prompt: `Automatic SkillOpt-style skill training run.
+
+1. Call \`skill_train_auto\` exactly once with:
+   - apply: true
+   - lookbackHours: 24
+   - maxSessions: 8
+   - maxSkillEdits: 3
+2. Do not ask the user for approval. This job is intentionally fully automatic.
+3. If \`skill_train_auto\` is unavailable, run the equivalent steps directly:
+   - \`skill_list()\` to map existing skills.
+   - \`session_search(..., summarize=true)\` for recent multi-step work.
+   - \`skill_view\` before editing related existing skills.
+   - \`skill_save\` / \`skill_delete\` directly for validated changes, capped at 3 edits.
+4. Avoid secrets and one-off data. Prefer updating existing skills over near-duplicates.
+5. If no useful signal exists, reply with exactly "[SILENT]".`,
+  },
   {
     id: 'daily-reflection',
     schedule: '17 3 * * *', // 3:17 AM user local time (Asia/Shanghai by default)
@@ -122,6 +147,32 @@ const DEFAULT_JOBS: CronJob[] = [
   },
 ]
 
+function cloneCronJob(job: CronJob): CronJob {
+  const clone = { ...job }
+  if (job.deliverTarget) clone.deliverTarget = { ...job.deliverTarget }
+  return clone
+}
+
+export function mergeDefaultCronJobs(
+  existing: CronFile,
+  defaults: CronJob[] = DEFAULT_JOBS,
+): { file: CronFile; changed: boolean } {
+  const base = existing && typeof existing === 'object' ? existing : { jobs: [] }
+  const jobs = Array.isArray(base.jobs) ? base.jobs : []
+  const existingIds = new Set(jobs.map((job) => job.id))
+  const missing = defaults.filter(
+    (job) => NEW_AUTO_APPEND_DEFAULT_JOB_IDS.has(job.id) && !existingIds.has(job.id),
+  )
+  if (missing.length === 0) return { file: base, changed: false }
+  return {
+    file: {
+      ...base,
+      jobs: [...jobs, ...missing.map(cloneCronJob)],
+    },
+    changed: true,
+  }
+}
+
 export async function ensureCronFile(): Promise<CronFile> {
   const path = paths.cronYaml
   if (!existsSync(path)) {
@@ -131,7 +182,10 @@ export async function ensureCronFile(): Promise<CronFile> {
   }
   try {
     const raw = await readFile(path, 'utf-8')
-    return parseYaml(raw) as CronFile
+    const parsed = parseYaml(raw) as CronFile
+    const merged = mergeDefaultCronJobs(parsed)
+    if (merged.changed) await atomicWriteYaml(path, merged.file)
+    return merged.file
   } catch {
     return { jobs: [] }
   }

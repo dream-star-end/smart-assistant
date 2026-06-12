@@ -11,6 +11,7 @@
  *   • `skill_view`     — load a skill's full instructions (tier-2/3)
  *   • `skill_save`     — distill a successful task into a reusable skill
  *   • `skill_delete`
+ *   • `skill_train_auto` — fully automatic SkillOpt-style training run
  *
  * Configuration: the server is spawned per-session by the gateway with
  *   env OPENCLAUDE_AGENT_ID=<id>   (which agent this subprocess belongs to)
@@ -44,6 +45,11 @@ import {
   upsertArchivalVector,
   upsertSessionMeta,
 } from '@openclaude/storage'
+import {
+  type SkillAutoTrainArgs,
+  createSkillAutoTrainDelegateRequest,
+  isNestedSkillAutoTrainBlocked,
+} from './skillAutoTrain.js'
 
 const AGENT_ID = process.env.OPENCLAUDE_AGENT_ID ?? 'main'
 
@@ -197,6 +203,48 @@ const TOOLS = [
       type: 'object',
       properties: { name: { type: 'string' } },
       required: ['name'],
+    },
+  },
+  {
+    name: 'skill_train_auto',
+    description: [
+      'Run a fully automatic SkillOpt-style self-training pass for agent skills.',
+      'The tool delegates to an isolated agent session that mines recent sessions, validates candidate skill changes, and applies skill_save/skill_delete by default.',
+      'For recursion safety, this tool is only available from top-level sessions; delegated sessions are rejected and should use direct skill tools instead.',
+      'Use this when the user asks for automatic skill training/evolution, or from scheduled learning jobs.',
+    ].join('\n'),
+    inputSchema: {
+      type: 'object',
+      properties: {
+        targetAgentId: {
+          type: 'string',
+          description: 'Agent whose skill library should be trained. Defaults to current agent.',
+        },
+        lookbackHours: {
+          type: 'number',
+          default: 24,
+          description: 'How many recent hours to mine for training signal. Clamped 1..168.',
+        },
+        maxSessions: {
+          type: 'number',
+          default: 8,
+          description: 'Maximum candidate sessions to inspect. Clamped 1..20.',
+        },
+        maxSkillEdits: {
+          type: 'number',
+          default: 3,
+          description: 'Maximum skill_save/skill_delete changes in one run. Clamped 1..10.',
+        },
+        apply: {
+          type: 'boolean',
+          default: true,
+          description: 'When true (default), apply accepted changes automatically.',
+        },
+        focus: {
+          type: 'string',
+          description: 'Optional focus area, e.g. "OpenClaude release workflow".',
+        },
+      },
     },
   },
   // ── Archival Memory (Letta-inspired tier-3 long-term storage) ──
@@ -375,6 +423,8 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
         return await handleSkillSave(args as any)
       case 'skill_delete':
         return await handleSkillDelete(args as any)
+      case 'skill_train_auto':
+        return await handleSkillTrainAuto(args as any)
       case 'archival_add':
         return await handleArchivalAdd(args as any)
       case 'archival_search':
@@ -552,6 +602,20 @@ async function handleSkillDelete(args: { name: string }) {
   const r = await skills.delete(args.name)
   if (!r.ok) return toolError(r.error ?? 'delete failed')
   return toolOk(`Deleted skill "${args.name}".`)
+}
+
+async function handleSkillTrainAuto(args: SkillAutoTrainArgs) {
+  if (isNestedSkillAutoTrainBlocked(process.env.OPENCLAUDE_DELEGATION_DEPTH)) {
+    return toolError(
+      'skill_train_auto is disabled inside delegated sessions to prevent recursive auto-training; use session_search/skill_list/skill_view/skill_save directly.',
+    )
+  }
+  const request = createSkillAutoTrainDelegateRequest(args, AGENT_ID)
+  return handleDelegateTaskToAgent(request.targetAgentId, {
+    goal: request.prompt,
+    context: request.context,
+    label: `skill_train_auto:${request.targetAgentId}`,
+  })
 }
 
 // ── Archival Memory handlers ──
