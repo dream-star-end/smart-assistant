@@ -292,7 +292,7 @@ describe("openclaude-runtime entrypoint env-scrub policy", () => {
       /provider:\s*"claude-subscription"/,
       "entrypoint must not seed Claude subscription provider for default commercial agents",
     );
-    for (const id of ["main", "researcher", "coder", "reviewer", "codex"]) {
+    for (const id of ["main", "researcher", "scientist", "coder", "reviewer", "codex"]) {
       assert.match(src, new RegExp(`id:\\s*"${id}"`), `entrypoint must seed ${id} agent`);
     }
     assert.match(
@@ -312,14 +312,20 @@ describe("openclaude-runtime entrypoint env-scrub policy", () => {
     );
     assert.match(
       src,
+      /const desiredCollaborationSeedAgents\s*=\s*\[[\s\S]*desiredResearcherAgent[\s\S]*desiredScientistAgent[\s\S]*desiredCoderAgent[\s\S]*\]/,
+      "collaboration seed list should include the dedicated scientist agent between researcher and coder",
+    );
+    assert.match(
+      src,
       /const desiredSeedAgents\s*=\s*\[\.\.\.desiredCollaborationSeedAgents,\s*desiredCodexAgent\]/,
       "initial agents.yaml should contain collaboration seed agents plus the canonical codex agent",
     );
   });
 
-  test("entrypoint.ts seeds researcher/coder with core-only toolsets", () => {
+  test("entrypoint.ts seeds researcher/scientist/coder with core-only toolsets", () => {
     const src = readFileSync(ENTRYPOINT_TS_PATH, "utf-8");
     const researcher = extractConstObjectFromSource(src, "desiredResearcherAgent");
+    const scientist = extractConstObjectFromSource(src, "desiredScientistAgent");
     const coder = extractConstObjectFromSource(src, "desiredCoderAgent");
 
     assert.match(
@@ -343,6 +349,22 @@ describe("openclaude-runtime entrypoint env-scrub policy", () => {
       "existing exact legacy researcher persona files must be refreshed safely",
     );
 
+    assert.match(scientist, /id:\s*"scientist"/, "scientist seed id must be stable");
+    assert.match(scientist, /displayName:\s*"科研分析师"/, "scientist display name must be distinct");
+    assert.match(scientist, /provider:\s*COMMERCIAL_DEFAULT_PROVIDER/, "scientist must use the default minimax provider");
+    assert.match(scientist, /model:\s*COMMERCIAL_DEFAULT_MODEL/, "scientist must use MiniMax-M3");
+    assert.match(scientist, /toolsets:\s*\[CORE_TOOLSET_ID\]/, "scientist must default to core only");
+    assert.doesNotMatch(
+      scientist,
+      /BROWSER_TOOLSET_ID|RESEARCH_TOOLSET_ID/,
+      "scientist must not mount optional browser/research MCP toolsets by default",
+    );
+    assert.match(
+      src,
+      /const SCIENTIST_PERSONA\s*=[\s\S]*科研分析师[\s\S]*不要假设浏览器、PDF 或外部数据库工具已挂载[\s\S]*外部服务前必须征得用户同意/,
+      "scientist persona must advertise scientific scope without assuming optional external tools",
+    );
+
     assert.match(coder, /toolsets:\s*\[CORE_TOOLSET_ID\]/, "coder must default to core only");
     assert.doesNotMatch(
       coder,
@@ -359,6 +381,45 @@ describe("openclaude-runtime entrypoint env-scrub policy", () => {
       /LEGACY_CODER_PERSONAS[\s\S]*再做最小必要修改,验证结果后用简洁中文汇报[\s\S]*ensureAgentPersona\("coder", CODER_PERSONA, LEGACY_CODER_PERSONAS\)/,
       "existing exact legacy coder persona files must be refreshed safely",
     );
+  });
+
+  test("entrypoint.ts seeds curated scientific skills only under scientist agent skills", () => {
+    const src = readFileSync(ENTRYPOINT_TS_PATH, "utf-8");
+    assert.match(
+      src,
+      /const KDENSE_SCIENTIFIC_SOURCE_COMMIT\s*=\s*"dab7aa672944a77f20cda3f2a672a6f1582adab6"/,
+      "scientific skill seed must pin the audited upstream commit",
+    );
+    assert.match(
+      src,
+      /join\(ocConfigDir,\s*"agents",\s*agentId,\s*"skills",\s*name\)/,
+      "scientific skills must be written to the per-agent SkillStore namespace",
+    );
+    assert.match(
+      src,
+      /ensureAgentSkill\("scientist",\s*seed\.name,\s*scientificSkillContent\(seed\)\)/,
+      "scientific seed loop must target only the scientist agent",
+    );
+    assert.match(src, /if \(existsSync\(skillPath\)\) return/, "skill seed must not overwrite existing skills");
+    assert.doesNotMatch(
+      src,
+      /ccb-baseline\/skills|agent-sandbox\/ccb-baseline\/skills/,
+      "scientific skills must not be added to global platform baseline",
+    );
+    for (const name of [
+      "matplotlib",
+      "statistical-analysis",
+      "statsmodels",
+      "scikit-learn",
+      "sympy",
+      "pymc",
+      "pymoo",
+      "aeon",
+      "scanpy",
+      "scvi-tools",
+    ]) {
+      assert.match(src, new RegExp(`name:\\s*"${name}"`), `scientist curated skill missing: ${name}`);
+    }
   });
 
   test("entrypoint.ts keeps the canonical codex agent as the only GPT seed", () => {
@@ -468,9 +529,52 @@ describe("openclaude-runtime entrypoint env-scrub policy", () => {
     const src = readFileSync(ENTRYPOINT_TS_PATH, "utf-8");
     assert.match(src, /const desiredSeedTeams\s*=\s*\[desiredScienceTeam,\s*desiredProgrammingTeam\]/);
     assert.match(src, /id:\s*"science_research_team"[\s\S]*leaderAgentId:\s*"codex"/);
+    assert.match(
+      src,
+      /id:\s*"science_research_team"[\s\S]*agentId:\s*"scientist"[\s\S]*role:\s*"科研数据分析师"[\s\S]*policy:\s*\{\s*maxParallel:\s*4,\s*requireReview:\s*true,\s*reviewAgentId:\s*"reviewer"\s*\}/,
+      "science team must include scientist and allow four-way collaboration",
+    );
     assert.match(src, /id:\s*"programming_team"[\s\S]*leaderAgentId:\s*"codex"/);
     assert.match(src, /teams:\s*desiredSeedTeams\.map\(cloneSeedTeam\)/);
     assert.match(src, /patchPlatformSeedTeam/);
+  });
+
+  test("entrypoint.ts migrates only exact old default science team to scientist member set", () => {
+    const src = readFileSync(ENTRYPOINT_TS_PATH, "utf-8");
+    assert.match(
+      src,
+      /const LEGACY_SCIENCE_TEAM_MEMBER_IDS\s*=\s*\["researcher",\s*"coder",\s*"reviewer"\]\s*as const/,
+      "old default science team member set must be explicit",
+    );
+    assert.match(
+      src,
+      /const legacyScienceMembers\s*=[\s\S]*desired\.id === "science_research_team"[\s\S]*sameStringSet\(memberIds,\s*LEGACY_SCIENCE_TEAM_MEMBER_IDS\)[\s\S]*hasLegacyPlatformSeedTeamPrompt\(team,\s*desired\.id\)/,
+      "old science migration must require exact old members plus legacy prompt markers",
+    );
+    assert.match(
+      src,
+      /return defaultName && defaultLeader && \(defaultMembers \|\| legacyScienceMembers\)/,
+      "seed team repair must include the explicit old science-team migration branch",
+    );
+
+    const cases = [
+      { current: ["researcher", "coder", "reviewer"], legacyPrompt: true, shouldMigrate: true },
+      { current: ["reviewer", "researcher", "coder"], legacyPrompt: true, shouldMigrate: true },
+      { current: ["researcher", "scientist", "coder", "reviewer"], legacyPrompt: true, shouldMigrate: false },
+      { current: ["researcher", "coder"], legacyPrompt: true, shouldMigrate: false },
+      { current: ["researcher", "coder", "reviewer", "custom"], legacyPrompt: true, shouldMigrate: false },
+      { current: ["researcher", "coder", "reviewer"], legacyPrompt: false, shouldMigrate: false },
+    ];
+    const oldSet = ["researcher", "coder", "reviewer"];
+    for (const c of cases) {
+      const sameSet =
+        c.current.length === oldSet.length && oldSet.every((id) => c.current.includes(id));
+      assert.equal(
+        sameSet && c.legacyPrompt,
+        c.shouldMigrate,
+        `science team migration spec mismatch for ${JSON.stringify(c.current)}`,
+      );
+    }
   });
 
   test("seeded team prompts do not assume optional browser/research toolsets are mounted", () => {
@@ -521,6 +625,8 @@ describe("openclaude-runtime entrypoint env-scrub policy", () => {
     const src = readFileSync(WEB_AGENTS_MODULE_PATH, "utf-8");
     assert.match(src, /model:\s*'MiniMax-M3'/, "web fallback main must use MiniMax-M3");
     assert.match(src, /provider:\s*'minimax'/, "web fallback main must use minimax provider");
+    assert.match(src, /id:\s*'scientist'/, "web fallback must include the scientist agent");
+    assert.match(src, /displayName:\s*'科研分析师'/, "web fallback scientist display name must match runtime seed");
     assert.match(src, /model:\s*'deepseek-v4-pro'/, "web fallback coder must use DeepSeek V4 Pro");
     assert.match(src, /provider:\s*'deepseek'/, "web fallback coder must use the deepseek provider");
     assert.doesNotMatch(
