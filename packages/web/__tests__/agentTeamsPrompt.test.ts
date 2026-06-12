@@ -25,6 +25,7 @@ const buildTeamRunPrompt = new Function(
   [
     extractFunction(src, '_cleanPromptText'),
     extractFunction(src, '_cleanBlockText'),
+    extractFunction(src, '_effectiveMaxParallel'),
     extractFunction(src, '_memberLines'),
     extractFunction(src, 'buildTeamRunPrompt'),
     'return buildTeamRunPrompt;',
@@ -88,6 +89,27 @@ describe('agent team prompt builder', () => {
     assert.match(prompt, /给仓库加一个导出 PDF 功能/)
     assert.match(prompt, /队长角色定义/)
     assert.doesNotMatch(prompt, /researcher/)
+  })
+
+  it('caps team delegate fanout at two even when a persisted team asks for more', () => {
+    const prompt = buildTeamRunPrompt(
+      {
+        id: 'heavy_science_team',
+        name: '重型科研队',
+        leaderAgentId: 'codex',
+        members: [
+          { agentId: 'researcher', role: '研究', responsibility: '查证资料' },
+          { agentId: 'scientist', role: '分析', responsibility: '数据分析' },
+          { agentId: 'coder', role: '实现', responsibility: '计算脚本' },
+          { agentId: 'reviewer', role: '复核', responsibility: '审查风险' },
+        ],
+        policy: { maxParallel: 4, requireReview: true, reviewAgentId: 'reviewer' },
+      },
+      '分析一个复杂科研问题',
+    )
+
+    assert.match(prompt, /最多同时推进 2 条子任务/)
+    assert.doesNotMatch(prompt, /最多同时推进 4 条子任务/)
   })
 
   it('suppresses user default model override during team runs so leader routing is preserved', () => {
@@ -199,7 +221,7 @@ describe('agent team prompt builder', () => {
     assert.match(src, /leaderAgentId: 'codex'/)
     assert.match(src, /agentId: 'scientist'/)
     assert.match(src, /role: '科研数据分析师'/)
-    assert.match(src, /policy: \{ maxParallel: 4, requireReview: true, reviewAgentId: 'reviewer' \}/)
+    assert.match(src, /policy: \{ maxParallel: 2, requireReview: true, reviewAgentId: 'reviewer' \}/)
     assert.match(src, /id: 'programming_team'/)
     assert.match(src, /name: '编程协作团队'/)
     assert.doesNotMatch(src, /id: 'full_stack_team'/)

@@ -112,7 +112,7 @@ const TEAM_TEMPLATES = [
           '像严格审稿人一样检查证据是否支撑结论，指出样本、方法、因果、统计和引用层面的弱点。不要重写答案，优先列出阻塞性问题和可信度判断。',
       },
     ],
-    policy: { maxParallel: 4, requireReview: true, reviewAgentId: 'reviewer' },
+    policy: { maxParallel: 2, requireReview: true, reviewAgentId: 'reviewer' },
     badge: '科研',
   },
   {
@@ -216,6 +216,11 @@ function _agentLabel(agentId) {
   return agent?.displayName ? `${agent.displayName} (${agentId})` : agentId
 }
 
+function _effectiveMaxParallel(value) {
+  const parsed = Number.isInteger(value) ? value : 2
+  return Math.max(1, Math.min(parsed, 2))
+}
+
 function _memberLines(team) {
   const members = [...(team.members || [])]
   const reviewAgentId = team?.policy?.requireReview ? team?.policy?.reviewAgentId : ''
@@ -245,7 +250,7 @@ export function buildTeamRunPrompt(team, userText) {
   const leaderPrompt = _cleanBlockText(team?.leaderPrompt, 1200)
   const members = _memberLines(team)
   const policy = team?.policy || {}
-  const maxParallel = Number.isInteger(policy.maxParallel) ? policy.maxParallel : 3
+  const maxParallel = _effectiveMaxParallel(policy.maxParallel)
   const reviewLine = policy.requireReview
     ? `- 需要复核: 是${
         policy.reviewAgentId ? `,优先请 ${_cleanPromptText(policy.reviewAgentId, 48)} 复核` : ''
