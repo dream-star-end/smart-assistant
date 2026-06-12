@@ -160,6 +160,9 @@ describe('agent team prompt builder', () => {
     assert.match(src, /id: 'science_research_team'/)
     assert.match(src, /name: '科研协作团队'/)
     assert.match(src, /leaderAgentId: 'codex'/)
+    assert.match(src, /agentId: 'scientist'/)
+    assert.match(src, /role: '科研数据分析师'/)
+    assert.match(src, /policy: \{ maxParallel: 4, requireReview: true, reviewAgentId: 'reviewer' \}/)
     assert.match(src, /id: 'programming_team'/)
     assert.match(src, /name: '编程协作团队'/)
     assert.doesNotMatch(src, /id: 'full_stack_team'/)
@@ -173,6 +176,7 @@ describe('agent team prompt builder', () => {
   it('commercial fallback agents include the seeded collaboration agents', () => {
     assert.match(agentsSrc, /COMMERCIAL_FALLBACK_AGENTS/)
     assert.match(agentsSrc, /id: 'researcher'/)
+    assert.match(agentsSrc, /id: 'scientist'/)
     assert.match(agentsSrc, /id: 'coder'/)
     assert.match(agentsSrc, /id: 'reviewer'/)
     assert.match(agentsSrc, /id: 'codex'/)

@@ -26,6 +26,7 @@ import {
   copyFileSync,
   cpSync,
   existsSync,
+  lstatSync,
   mkdirSync,
   readFileSync,
   readdirSync,
@@ -582,7 +583,7 @@ try {
   //
   //   (a) volume 空 → bootstrap 商业版 seed agents + 固定 id `codex` + 两个团队
   //   (b) volume 已有 yaml(用户/旧版镜像写过)→ merge 平台 seed:
-  //       - 保留用户自建 agent,但规范化 main/researcher/coder/reviewer/codex 这些平台保留 id
+  //       - 保留用户自建 agent,但规范化 main/researcher/scientist/coder/reviewer/codex 这些平台保留 id
   //       - 修复 main 被旧配置污染成 gpt-5.5/codex-native 导致前端出现两个 GPT 5.5
   //       - 缺少 science_research_team/programming_team → append;旧默认形态 → 迁移为 codex 队长
   //       - 解析失败 → 备份原文件到 .bak.<rand>,重新写一份平台 seed yaml
@@ -620,6 +621,355 @@ try {
     return personaPath;
   }
 
+  const KDENSE_SCIENTIFIC_SOURCE_COMMIT = "dab7aa672944a77f20cda3f2a672a6f1582adab6";
+
+  type ScientificSkillSeed = {
+    name: string;
+    description: string;
+    tags: readonly string[];
+    related?: readonly string[];
+    license: string;
+    title: string;
+    useWhen: readonly string[];
+    workflow: readonly string[];
+    pitfalls: readonly string[];
+  };
+
+  function scientificSkillContent(seed: ScientificSkillSeed): string {
+    const related = seed.related && seed.related.length > 0
+      ? [`related_skills: [${seed.related.join(", ")}]`]
+      : [];
+    return [
+      "---",
+      `name: ${seed.name}`,
+      `description: ${JSON.stringify(seed.description)}`,
+      "version: 1.0.0",
+      `tags: [${seed.tags.join(", ")}]`,
+      ...related,
+      `license: ${seed.license}`,
+      "source: K-Dense-AI/scientific-agent-skills adapted static subset",
+      `source_commit: ${KDENSE_SCIENTIFIC_SOURCE_COMMIT}`,
+      "---",
+      "",
+      `# ${seed.title}`,
+      "",
+      "## OpenClaude 商业版安全边界",
+      "",
+      "本 skill 是 OpenClaude 从 K-Dense Scientific Agent Skills 精选并改写成**单文件、无脚本、无密钥要求**的静态指南。使用时必须遵守:",
+      "",
+      "- 只在用户明确做科研、数据分析、建模、绘图或相关代码任务时调用;不要因为关键词偶然出现就接管普通对话。",
+      "- 不读取、打印、转发 `ANTHROPIC_AUTH_TOKEN`、`OPENCLAUDE_*`、API key、cookie、SSH key 或任何环境密钥。",
+      "- 默认在用户工作区本地处理数据;把私有数据上传到外部 API、云平台或公共数据库前,必须先说明目的并征得用户同意。",
+      "- 生物医学/临床相关输出只作为研究和教育辅助,不能当作诊断、治疗或合规结论。",
+      "- 需要安装依赖时,先检查环境;只安装当前任务必要包,避免全局污染和大规模无关下载。",
+      "",
+      "## 什么时候用",
+      "",
+      ...seed.useWhen.map((line) => `- ${line}`),
+      "",
+      "## 推荐流程",
+      "",
+      ...seed.workflow.map((line, i) => `${i + 1}. ${line}`),
+      "",
+      "## 防错要点",
+      "",
+      ...seed.pitfalls.map((line) => `- ${line}`),
+      "",
+      "## 来源与许可",
+      "",
+      `- Adapted from https://github.com/K-Dense-AI/scientific-agent-skills at commit \`${KDENSE_SCIENTIFIC_SOURCE_COMMIT}\`.`,
+      "- Upstream repository is MIT-licensed; this commercial runtime ships a rewritten static guidance subset only, with no upstream scripts/assets/env hooks.",
+      `- Package/library license noted in frontmatter: ${seed.license}.`,
+      "",
+    ].join("\n");
+  }
+
+  const SCIENTIST_SKILL_SEEDS: readonly ScientificSkillSeed[] = [
+    {
+      name: "matplotlib",
+      description:
+        "Publication-quality Python plotting with matplotlib when fine-grained control over axes, typography, layout, annotations, and export format is needed.",
+      tags: ["science", "plotting", "visualization", "python", "figures"],
+      related: ["statistical-analysis"],
+      license: "Matplotlib license",
+      title: "matplotlib scientific plotting",
+      useWhen: [
+        "用户要论文图、报告图、复杂坐标轴、多 panel figure、误差条、注释或出版级 PDF/SVG/PNG。",
+        "需要精确控制字体、线宽、颜色、legend、ticks、子图布局或导出尺寸。",
+        "seaborn/plotly 默认图不够可控时,回到 matplotlib。",
+      ],
+      workflow: [
+        "先明确图要证明什么结论,再选择 line/scatter/bar/box/violin/heatmap/contour/image 等图型。",
+        "整理 tidy data 或明确 x/y/error/group columns;图前先检查缺失值、单位和样本量。",
+        "写可复现脚本,把数据读取、统计汇总、绘图和导出放在同一文件或 notebook 中。",
+        "导出至少一个矢量格式(PDF/SVG)和一个预览 PNG;按目标媒介设置尺寸、DPI 和字体大小。",
+        "交付前检查文件存在、尺寸合理、无截断、legend 不遮挡数据。",
+      ],
+      pitfalls: [
+        "默认使用色盲友好 palette,不要只靠颜色区分类别;必要时配合线型/marker。",
+        "坐标轴必须有 label 和单位;科学图优先展示 CI、IQR、error bar、raw points 或样本量。",
+        "避免 3D、渐变、双 y 轴等容易误导的视觉效果,除非用户明确需要且解释清楚。",
+      ],
+    },
+    {
+      name: "statistical-analysis",
+      description:
+        "Choose and report appropriate statistical tests: assumptions, effect sizes, confidence intervals, multiple testing, power, and reproducible analysis decisions.",
+      tags: ["science", "statistics", "hypothesis-testing", "analysis"],
+      related: ["statsmodels", "pymc", "matplotlib"],
+      license: "MIT license",
+      title: "Statistical analysis decision guide",
+      useWhen: [
+        "用户问该用什么统计检验/模型、结果是否显著、怎么报告 p 值/置信区间/效应量。",
+        "需要选择 t-test/ANOVA/nonparametric/chi-square/regression/mixed model/survival/time-series 等方法。",
+        "需要检查假设、样本量、多重比较或结果报告质量。",
+      ],
+      workflow: [
+        "明确研究问题、变量类型、配对/独立、组数、重复测量、层级结构和样本量。",
+        "先画图和做描述性统计,检查异常值、缺失机制、分布和方差结构。",
+        "根据研究设计选方法,而不是根据哪个 p 值小选方法。",
+        "同时报告效应量、置信区间、样本量、检验假设和多重校正策略。",
+        "不满足假设时考虑变换、稳健方法、非参数方法、bootstrap 或模型化替代。",
+      ],
+      pitfalls: [
+        "p 值不是效应大小;“不显著”不是“无效应”。",
+        "多指标/多基因/多模型比较要控制 FDR/FWER 或明确探索性。",
+        "预注册/confirmatory 与 exploratory 分析要分开写;医学统计需领域专家和伦理/监管审阅。",
+      ],
+    },
+    {
+      name: "statsmodels",
+      description:
+        "Statistical modeling with statsmodels: OLS/GLM, logistic regression, mixed models, time series, diagnostics, robust covariance, and interpretable summaries.",
+      tags: ["science", "statistics", "regression", "econometrics", "python"],
+      related: ["statistical-analysis", "pymc"],
+      license: "BSD-3-Clause license",
+      title: "statsmodels statistical modeling",
+      useWhen: [
+        "用户需要可解释统计模型:线性/广义线性模型、Logit/Probit、计量模型、时间序列、诊断检验或标准误。",
+        "需要类似 R 公式语法、系数表、置信区间、假设检验和模型摘要。",
+        "scikit-learn 偏预测,而用户更关心推断和解释时,优先考虑 statsmodels。",
+      ],
+      workflow: [
+        "明确 outcome、predictors、confounders、固定/随机效应、link function 和误差结构。",
+        "用公式接口保持模型定义可读;对 categorical variables 明确 reference level。",
+        "检查残差、异方差、多重共线性、影响点、自相关和模型拟合优度。",
+        "根据数据结构选择稳健/clustered standard errors、mixed model 或 time-series model。",
+        "输出系数时解释单位、方向、效应大小和置信区间,不要只贴 summary。",
+      ],
+      pitfalls: [
+        "缺失值处理要显式;statsmodels 可能静默 drop rows,必须报告样本数变化。",
+        "分类变量编码和交互项解释容易出错,必要时用边际效应或预测曲线辅助说明。",
+        "时间序列模型要检查平稳性、季节性、滞后阶数和 out-of-sample 验证。",
+      ],
+    },
+    {
+      name: "scikit-learn",
+      description:
+        "Classical machine learning in Python with scikit-learn: preprocessing, pipelines, model selection, classification, regression, clustering, and evaluation.",
+      tags: ["science", "machine-learning", "sklearn", "python", "modeling"],
+      related: ["statistical-analysis", "matplotlib"],
+      license: "BSD-3-Clause license",
+      title: "scikit-learn machine learning",
+      useWhen: [
+        "用户要做结构化数据的分类、回归、聚类、降维、特征工程、模型选择或评估。",
+        "需要可复现、可解释的传统 ML baseline,而不是直接上深度学习。",
+        "需要 pipeline 防止数据泄漏。",
+      ],
+      workflow: [
+        "明确预测目标、样本粒度、特征可用时间点和评价指标。",
+        "先切分数据,再在 training split 内 fit preprocessing;使用 Pipeline/ColumnTransformer 防泄漏。",
+        "建立 dummy/linear/tree baseline,再做交叉验证和调参。",
+        "分类任务检查 class imbalance、calibration、confusion matrix、ROC/PR;回归任务检查残差和误差分布。",
+        "报告验证策略、随机种子、数据切分、指标置信范围和限制。",
+      ],
+      pitfalls: [
+        "时间序列、同一患者/用户/样本多行数据不能随机打散;用 GroupKFold/TimeSeriesSplit 等合适切分。",
+        "不在测试集上做特征选择、缺失值填补参数学习或阈值调优。",
+        "高准确率不等于可部署;检查偏差、漂移、解释性和科研合理性。",
+      ],
+    },
+    {
+      name: "sympy",
+      description:
+        "Exact symbolic math in Python with SymPy: algebra, calculus, equation solving, symbolic linear algebra, mechanics, simplification, and code generation.",
+      tags: ["science", "symbolic-math", "algebra", "calculus", "python"],
+      license: "SymPy license",
+      title: "SymPy symbolic mathematics",
+      useWhen: [
+        "用户需要精确代数、微积分、方程求解、矩阵符号运算、级数、符号推导或生成可执行公式代码。",
+        "浮点数值计算会丢精度,或需要展示推导过程而不仅是数值答案。",
+        "需要把论文公式、模型方程或物理推导转成可验证 Python 代码。",
+      ],
+      workflow: [
+        "用 symbols() 明确变量和假设(positive, real, integer 等),减少歧义。",
+        "先保留 exact rational/symbolic 表达式,最后才 evalf() 转数值。",
+        "对方程求解同时检查解析解和数值解;验证代回原方程。",
+        "复杂表达式使用 simplify/factor/expand/collect 要有目标,不要盲目 simplify。",
+        "需要高性能时用 lambdify 或 codegen,并用数值点测试等价性。",
+      ],
+      pitfalls: [
+        "符号假设影响积分、求解和化简结果;结果异常时先检查 assumptions。",
+        "多值函数、分段函数、复数域和奇点要明确说明。",
+        "不要把符号结果当成实验结论;它只是数学推导或模型辅助。",
+      ],
+    },
+    {
+      name: "pymc",
+      description:
+        "Bayesian modeling with PyMC: hierarchical models, MCMC/NUTS, posterior predictive checks, LOO/WAIC comparison, and uncertainty-aware inference.",
+      tags: ["science", "bayesian", "statistics", "pymc", "uncertainty"],
+      related: ["statistical-analysis", "statsmodels"],
+      license: "Apache License, Version 2.0",
+      title: "PyMC Bayesian modeling",
+      useWhen: [
+        "用户需要贝叶斯回归、层级模型、部分池化、先验建模、后验不确定性或 posterior predictive checks。",
+        "频率学模型无法自然表达层级结构、缺失机制、测量误差或先验知识。",
+        "需要比较模型并解释不确定性,而不是只给点估计和 p 值。",
+      ],
+      workflow: [
+        "写清楚生成过程:观测变量、潜变量、层级、噪声分布、先验和待估参数。",
+        "从最小模型开始,确认采样稳定后再加层级/交互/非线性。",
+        "检查 MCMC 诊断:R-hat、ESS、divergences、trace plot、energy/BFMI。",
+        "用 posterior predictive check 看模型是否能复现实测数据的关键统计特征。",
+        "模型比较用 LOO/WAIC 时同时报告不确定性,不要机械选择分数略高的模型。",
+      ],
+      pitfalls: [
+        "解释先验选择和敏感性;不要把默认 weakly-informative prior 当作无先验。",
+        "报告 posterior mean/median、HDI/credible interval、关键概率陈述。",
+        "如果采样失败,优先重参数化、标准化变量、检查模型结构,不要盲目加 draws。",
+      ],
+    },
+    {
+      name: "pymoo",
+      description:
+        "Multi-objective and constrained optimization with pymoo: NSGA-II/III, MOEA/D, Pareto fronts, decision making, and benchmark problems.",
+      tags: ["science", "optimization", "pareto", "multi-objective"],
+      license: "Apache-2.0 license",
+      title: "pymoo optimization",
+      useWhen: [
+        "用户有单目标或多目标优化问题,尤其需要 Pareto front、约束处理、设计变量边界和决策权衡。",
+        "目标函数来自仿真、实验、ML 代理模型或昂贵黑盒函数。",
+        "需要比较不同优化算法或把优化结果可视化。",
+      ],
+      workflow: [
+        "明确定义变量、上下界、目标方向(min/max)、约束和不可行条件。",
+        "先用小规模样例/已知 benchmark 验证问题编码,再跑真实昂贵目标。",
+        "对随机算法固定 seed,记录 population size、generations、termination 条件。",
+        "多目标结果必须展示 Pareto front,并解释 trade-off;不要只选一个点不说明偏好。",
+        "对昂贵目标设置预算、checkpoint 和中间结果保存。",
+      ],
+      pitfalls: [
+        "检查目标函数符号:pymoo 常以 minimize 表达,最大化需要取负或转换。",
+        "约束方向要统一,避免 g(x) <= 0 / >= 0 写反。",
+        "对 noisy objective,重复评估或使用稳健指标,不要过度解读单次最优。",
+      ],
+    },
+    {
+      name: "aeon",
+      description:
+        "Time-series machine learning with aeon: classification, regression, clustering, forecasting, anomaly detection, segmentation, distances, and benchmarking.",
+      tags: ["science", "time-series", "machine-learning", "forecasting"],
+      license: "BSD-3-Clause license",
+      title: "aeon time-series machine learning",
+      useWhen: [
+        "用户有时间序列、传感器、金融/业务序列、实验过程曲线,想做分类、回归、聚类、预测、异常检测或相似性搜索。",
+        "需要比较多个 time-series 模型、构造 benchmark、选择距离度量或评估切分策略。",
+        "需要把非结构化序列问题转成可重复的 Python 分析流程。",
+      ],
+      workflow: [
+        "明确任务类型:forecasting / classification / regression / clustering / anomaly detection / segmentation。",
+        "检查数据形状:单变量还是多变量;等长还是不等长;采样频率是否规则;是否有缺失值。",
+        "建立基线:先用简单模型或 naive forecast,再引入 aeon 的专用 estimator。",
+        "使用时间感知验证:forecasting 用 rolling/temporal split;分类回归避免随机打乱造成泄漏。",
+        "汇报指标时同时给 baseline、模型指标、置信区间或重复实验方差。",
+      ],
+      pitfalls: [
+        "先检查是否已安装 aeon;缺失时只为当前任务安装必要依赖。",
+        "数据预处理要保留时间顺序;不要在全量数据上先 fit scaler 再切分。",
+        "对小样本或强自相关序列,优先做简单可解释模型和误差可视化。",
+      ],
+    },
+    {
+      name: "scanpy",
+      description:
+        "Single-cell RNA-seq analysis with Scanpy: QC, normalization, highly variable genes, PCA/UMAP, clustering, marker genes, and trajectory-ready preprocessing.",
+      tags: ["science", "bioinformatics", "single-cell", "rnaseq", "scanpy"],
+      related: ["scvi-tools", "statistical-analysis"],
+      license: "BSD-3-Clause license",
+      title: "Scanpy single-cell RNA-seq analysis",
+      useWhen: [
+        "用户要分析 scRNA-seq / single-cell omics 数据,包括 QC、过滤、归一化、降维、聚类、marker gene 和可视化。",
+        "输入是 .h5ad、10x mtx、AnnData 或表达矩阵。",
+        "需要构建可复现的单细胞分析 notebook/script。",
+      ],
+      workflow: [
+        "确认数据来源、物种、批次、样本设计、是否含临床/隐私信息。",
+        "QC:检查每个细胞 UMI/genes、线粒体比例、双细胞风险、空 droplets;记录过滤阈值理由。",
+        "标准流程:normalize/log1p → HVG → scale/PCA → neighbors → UMAP/tSNE → Leiden/Louvain clustering。",
+        "marker 分析要结合 batch/sample composition,不要把 cluster marker 直接解释成因果或诊断结论。",
+        "保存中间 .h5ad、图和参数;图上标注样本、批次、cluster、已知 marker。",
+      ],
+      pitfalls: [
+        "不做诊断、治疗或患者级结论;若数据可能含 PHI,先确认本地处理和脱敏要求。",
+        "外部数据库注释或上传分析前必须征得用户同意。",
+        "对小样本/强批次效应结果要明确不确定性和验证需求。",
+      ],
+    },
+    {
+      name: "scvi-tools",
+      description:
+        "Deep generative modeling for single-cell omics with scvi-tools: batch correction, latent representations, transfer learning, multimodal/spatial models, and differential expression.",
+      tags: ["science", "bioinformatics", "single-cell", "scvi", "deep-learning"],
+      related: ["scanpy", "statistical-analysis"],
+      license: "BSD-3-Clause license",
+      title: "scvi-tools single-cell generative models",
+      useWhen: [
+        "用户需要 scVI/scANVI/TOTALVI/MultiVI 等模型做 batch correction、latent embedding、label transfer 或多组学整合。",
+        "Scanpy 标准流程不足以处理强批次效应、半监督注释、多模态数据或 probabilistic differential expression。",
+        "用户希望在单细胞任务中量化模型不确定性。",
+      ],
+      workflow: [
+        "先用 Scanpy 完成基本 QC,确认 AnnData 字段、batch key、label key、layer/raw counts 是否正确。",
+        "只把原始 counts 或合适 layer 交给模型;不要把 log-normalized 数据误当 count 输入。",
+        "设置并记录 batch covariates、categorical/continuous covariates、模型版本、seed、训练轮数和硬件。",
+        "训练后检查 latent space、batch mixing、biological signal 保留、reconstruction/ELBO 趋势。",
+        "差异表达和 label transfer 输出要结合实验设计和验证数据解释,不要给临床结论。",
+      ],
+      pitfalls: [
+        "深度模型可能过度校正或抹掉真实生物差异;必须比较校正前后 marker/condition 信号。",
+        "大数据训练耗 CPU/GPU/内存;先估算资源,必要时抽样 smoke test。",
+        "私有生物医学数据默认本地处理;外部模型/云训练前先征得用户同意。",
+      ],
+    },
+  ] as const;
+
+  function ensureAgentSkill(agentId: string, name: string, content: string): void {
+    try {
+      const skillDir = join(ocConfigDir, "agents", agentId, "skills", name);
+      const skillPath = join(skillDir, "SKILL.md");
+      if (existsSync(skillPath)) return;
+      if (existsSync(skillDir)) {
+        const st = lstatSync(skillDir);
+        if (!st.isDirectory() || st.isSymbolicLink()) {
+          console.error(`[entrypoint] WARN: scientist skill seed skipped for ${name}: non-directory or symlinked skill dir`);
+          return;
+        }
+      } else {
+        mkdirSync(skillDir, { recursive: true });
+      }
+      if (!existsSync(skillPath)) writeFileSync(skillPath, content, { mode: 0o644 });
+    } catch (skillErr) {
+      console.error(
+        `[entrypoint] WARN: scientist skill seed skipped for ${name}: ${(skillErr as Error).message}`,
+      );
+    }
+  }
+
+  for (const seed of SCIENTIST_SKILL_SEEDS) {
+    ensureAgentSkill("scientist", seed.name, scientificSkillContent(seed));
+  }
+
   function isAgentWithId(value: unknown, id: string): value is Record<string, unknown> {
     return isRecord(value) && value.id === id;
   }
@@ -628,6 +978,7 @@ try {
     "main",
     "MiniMax M3 助手",
     "资料研究员",
+    "科研分析师",
     "代码工程师",
     "审阅员",
     "GPT 5.5 (Codex)",
@@ -740,6 +1091,8 @@ try {
   const LEGACY_CODER_PERSONAS = [
     "你是 DeepSeek V4 Pro 代码工程师。先读代码和现有约束,再做最小必要修改,验证结果后用简洁中文汇报。\n",
   ] as const;
+  const SCIENTIST_PERSONA =
+    "你是科研分析师。专注统计建模、科学计算、可视化、生信/单细胞和可复现实验分析;优先使用当前已加载的科研 skills,但不要假设浏览器、PDF 或外部数据库工具已挂载。先确认数据来源、变量、假设和成功标准,本地优先处理数据;上传私有数据或调用外部服务前必须征得用户同意。生物医学/临床内容只给研究辅助和证据边界,不提供诊断、治疗或合规结论。\n";
 
   const desiredResearcherAgent = {
     id: "researcher",
@@ -749,6 +1102,17 @@ try {
     provider: COMMERCIAL_DEFAULT_PROVIDER,
     displayName: "资料研究员",
     avatarEmoji: "🔎",
+    toolsets: [CORE_TOOLSET_ID],
+  };
+
+  const desiredScientistAgent = {
+    id: "scientist",
+    model: COMMERCIAL_DEFAULT_MODEL,
+    persona: ensureAgentPersona("scientist", SCIENTIST_PERSONA),
+    permissionMode: "bypassPermissions",
+    provider: COMMERCIAL_DEFAULT_PROVIDER,
+    displayName: "科研分析师",
+    avatarEmoji: "🔬",
     toolsets: [CORE_TOOLSET_ID],
   };
 
@@ -780,6 +1144,7 @@ try {
   const desiredCollaborationSeedAgents = [
     desiredMainAgent,
     desiredResearcherAgent,
+    desiredScientistAgent,
     desiredCoderAgent,
     desiredReviewerAgent,
   ];
@@ -792,7 +1157,7 @@ try {
     leaderAgentId: "codex",
     leaderRole: "科研项目负责人",
     leaderPrompt:
-      "你是科研协作队长。先把研究问题拆成可验证子问题,定义证据标准和交付物;优先把资料整理交给 researcher,把数据/复现交给 coder,把证据链复核交给 reviewer。默认不假设 browser/research MCP 已挂载,需要外部检索或论文工具时只要求成员在当前工具列表可用时使用。最终按结论、证据、局限和下一步组织输出。",
+      "你是科研协作队长。先把研究问题拆成可验证子问题,定义证据标准和交付物;优先把资料整理交给 researcher,把统计建模/科学计算/可视化/生信分析交给 scientist,把工程实现或复现实验脚本交给 coder,把证据链复核交给 reviewer。默认不假设 browser/research MCP 已挂载,需要外部检索或论文工具时只要求成员在当前工具列表可用时使用。最终按结论、证据、局限和下一步组织输出。",
     members: [
       {
         agentId: "researcher",
@@ -802,11 +1167,18 @@ try {
           "围绕研究问题整理和筛选高可信资料,区分已证实结论、假设和争议。默认不假设浏览器或 PDF 工具可用;若当前工具列表没有 browser/research,就基于已有上下文、平台文献/搜索入口和可追溯来源线索输出。输出必须包含来源线索、关键证据、适用边界和仍需验证的问题。",
       },
       {
-        agentId: "coder",
-        role: "数据与图表工程师",
-        responsibility: "处理数据、设计分析脚本或复现实验步骤",
+        agentId: "scientist",
+        role: "科研数据分析师",
+        responsibility: "负责统计建模、科学计算、论文级可视化、生信/单细胞分析和方法选择",
         rolePrompt:
-          "把研究问题转成可执行的数据处理、统计分析、可视化或复现实验步骤。优先给出最小可验证脚本、输入输出说明、指标含义和失败风险。",
+          "把研究问题转成可验证的数据分析、统计建模、科学计算、可视化或生信流程。优先使用已加载科研 skills,先确认变量、假设、样本量、评价指标和数据边界;默认本地处理数据,外部上传或数据库调用前先征得用户同意。输出方法选择、最小可复现实验、指标解释、图表建议、局限和验证风险。",
+      },
+      {
+        agentId: "coder",
+        role: "复现工程师",
+        responsibility: "把分析方案落成可运行脚本、数据处理管线或复现实验步骤",
+        rolePrompt:
+          "根据 researcher/scientist 的方案做最小可运行实现,明确输入输出、依赖、运行命令和失败风险。不要扩大成无关重构;代码交付必须可复现并便于 scientist/reviewer 复核。",
       },
       {
         agentId: "reviewer",
@@ -816,7 +1188,7 @@ try {
           "像严格审稿人一样检查证据是否支撑结论,指出样本、方法、因果、统计和引用层面的弱点。优先列出阻塞性问题和可信度判断。",
       },
     ],
-    policy: { maxParallel: 3, requireReview: true, reviewAgentId: "reviewer" },
+    policy: { maxParallel: 4, requireReview: true, reviewAgentId: "reviewer" },
   };
 
   const desiredProgrammingTeam = {
@@ -873,12 +1245,15 @@ try {
       .filter(Boolean);
   }
 
+  const LEGACY_SCIENCE_TEAM_MEMBER_IDS = ["researcher", "coder", "reviewer"] as const;
+
   function hasLegacyPlatformSeedTeamPrompt(team: Record<string, unknown>, desiredId: unknown): boolean {
     const serialized = JSON.stringify(team);
     if (desiredId === "science_research_team") {
       return (
         serialized.includes("优先把资料检索交给 researcher") ||
-        serialized.includes("检索资料、阅读论文/文档并列出可靠来源") ||
+        serialized.includes("把数据/复现交给 coder") ||
+        serialized.includes("数据与图表工程师") ||
         serialized.includes("围绕研究问题检索和筛选高可信资料")
       );
     }
@@ -902,7 +1277,11 @@ try {
     const defaultName = name === "" || name === desired.name;
     const defaultLeader = leader === "" || leader === "main" || leader === "codex";
     const defaultMembers = memberIds.length === 0 || sameStringSet(memberIds, desiredMemberIds);
-    return defaultName && defaultLeader && defaultMembers;
+    const legacyScienceMembers =
+      desired.id === "science_research_team" &&
+      sameStringSet(memberIds, LEGACY_SCIENCE_TEAM_MEMBER_IDS) &&
+      hasLegacyPlatformSeedTeamPrompt(team, desired.id);
+    return defaultName && defaultLeader && (defaultMembers || legacyScienceMembers);
   }
 
   function patchPlatformSeedTeam(

@@ -81,7 +81,7 @@ const TEAM_TEMPLATES = [
     leaderAgentId: 'codex',
     leaderRole: '科研项目负责人',
     leaderPrompt:
-      '你是科研协作队长。先把研究问题拆成可验证子问题，定义证据标准和交付物；优先把资料整理交给 researcher，把数据/复现交给 coder，把证据链复核交给 reviewer。默认不假设 browser/research MCP 已挂载，需要外部检索或论文工具时只要求成员在当前工具列表可用时使用。最终按结论、证据、局限和下一步组织输出。',
+      '你是科研协作队长。先把研究问题拆成可验证子问题，定义证据标准和交付物；优先把资料整理交给 researcher，把统计建模/科学计算/可视化/生信分析交给 scientist，把工程实现或复现实验脚本交给 coder，把证据链复核交给 reviewer。默认不假设 browser/research MCP 已挂载，需要外部检索或论文工具时只要求成员在当前工具列表可用时使用。最终按结论、证据、局限和下一步组织输出。',
     members: [
       {
         agentId: 'researcher',
@@ -91,11 +91,18 @@ const TEAM_TEMPLATES = [
           '围绕研究问题整理和筛选高可信资料，区分已证实结论、假设和争议。默认不假设浏览器或 PDF 工具可用；若当前工具列表没有 browser/research，就基于已有上下文、平台文献/搜索入口和可追溯来源线索输出。输出必须包含来源线索、关键证据、适用边界和仍需验证的问题。',
       },
       {
-        agentId: 'coder',
-        role: '数据与图表工程师',
-        responsibility: '处理数据、设计分析脚本或复现实验步骤',
+        agentId: 'scientist',
+        role: '科研数据分析师',
+        responsibility: '负责统计建模、科学计算、论文级可视化、生信/单细胞分析和方法选择',
         rolePrompt:
-          '把研究问题转成可执行的数据处理、统计分析、可视化或复现实验步骤。优先给出最小可验证脚本、输入输出说明、指标含义和失败风险。',
+          '把研究问题转成可验证的数据分析、统计建模、科学计算、可视化或生信流程。优先使用已加载科研 skills，先确认变量、假设、样本量、评价指标和数据边界；默认本地处理数据，外部上传或数据库调用前先征得用户同意。输出方法选择、最小可复现实验、指标解释、图表建议、局限和验证风险。',
+      },
+      {
+        agentId: 'coder',
+        role: '复现工程师',
+        responsibility: '把分析方案落成可运行脚本、数据处理管线或复现实验步骤',
+        rolePrompt:
+          '根据 researcher/scientist 的方案做最小可运行实现，明确输入输出、依赖、运行命令和失败风险。不要扩大成无关重构；代码交付必须可复现并便于 scientist/reviewer 复核。',
       },
       {
         agentId: 'reviewer',
@@ -105,7 +112,7 @@ const TEAM_TEMPLATES = [
           '像严格审稿人一样检查证据是否支撑结论，指出样本、方法、因果、统计和引用层面的弱点。不要重写答案，优先列出阻塞性问题和可信度判断。',
       },
     ],
-    policy: { maxParallel: 3, requireReview: true, reviewAgentId: 'reviewer' },
+    policy: { maxParallel: 4, requireReview: true, reviewAgentId: 'reviewer' },
     badge: '科研',
   },
   {

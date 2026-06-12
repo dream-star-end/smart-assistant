@@ -29,6 +29,13 @@ const COMMERCIAL_FALLBACK_AGENTS = Object.freeze([
     provider: 'minimax',
   },
   {
+    id: 'scientist',
+    displayName: '科研分析师',
+    avatarEmoji: '🔬',
+    model: 'MiniMax-M3',
+    provider: 'minimax',
+  },
+  {
     id: 'coder',
     displayName: '代码工程师',
     avatarEmoji: '🛠️',
