@@ -18,7 +18,13 @@ import { getSession, state, tryEnqueueOffline, MAX_OFFLINE_QUEUE } from './state
 import { toast } from './ui.js?v=17cf8f69'
 import { parsePartialJson } from './partialJson.js?v=17cf8f69'
 import { msgTimeLabel, shortTime } from './util.js?v=17cf8f69'
-import { formatMeta, safeWsSend, _resetTurnBillingState } from './websocket.js?v=17cf8f69'
+import {
+  formatMeta,
+  getActiveStopAgentId,
+  safeWsSend,
+  setActiveTeamRunForSession,
+  _resetTurnBillingState,
+} from './websocket.js?v=17cf8f69'
 
 // ── Export helpers for save-as feature ──
 const _EXPORT_CSS =
@@ -2463,7 +2469,7 @@ export function _buildMessageEl(msg) {
               type: 'inbound.control.stop',
               channel: 'webchat',
               peer: { id: sess.id, kind: 'dm' },
-              agentId: sess.agentId || state.defaultAgentId,
+              agentId: getActiveStopAgentId(sess),
             }))
           }
           sess._sendingInFlight = false
@@ -2496,6 +2502,16 @@ export function _buildMessageEl(msg) {
           toast('没有找到可重发的用户消息', 'error')
           return
         }
+        const _regenTeamRun = lastUserMsg._teamRun?.leaderAgentId
+          ? {
+              id: lastUserMsg._teamRun.id || '',
+              name: lastUserMsg._teamRun.name || lastUserMsg._teamRun.id || '',
+              leaderAgentId: lastUserMsg._teamRun.leaderAgentId || '',
+              ...(lastUserMsg._teamRun.modelOverride !== undefined
+                ? { modelOverride: lastUserMsg._teamRun.modelOverride }
+                : {}),
+            }
+          : null
         // Remove messages from this one onwards (snapshot for restore on enqueue-full)
         const _regenSnapshot = sess.messages.slice(idx)
         sess.messages.splice(idx)
@@ -2506,16 +2522,19 @@ export function _buildMessageEl(msg) {
           lastUserMsg._modelText || lastUserMsg.text || '',
           lastUserMsg._media || [],
         )
-        // v1.0.4 — regen 也走当前 user prefs 的 model(可能跟原消息不同;
-        // 用户重发就是想换条件再试)。语义见 main.js send()。
+        // 普通 regen 仍走当前 user prefs;团队 regen 必须复用原团队队长和原团队
+        // model override,否则会从团队协作退回单 Agent/default model。
         const _regenPrefModel = state.userPrefs?.default_model
-        const _regenModelOverride = (typeof _regenPrefModel === 'string' && _regenPrefModel) ? _regenPrefModel : undefined
+        const _regenModelOverride = _regenTeamRun
+          ? _regenTeamRun.modelOverride
+          : (typeof _regenPrefModel === 'string' && _regenPrefModel) ? _regenPrefModel : undefined
+        const _regenAgentId = _regenTeamRun?.leaderAgentId || sess.agentId || state.defaultAgentId
         const wsPayload = {
           type: 'inbound.message',
           idempotencyKey: `regen-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
           channel: 'webchat',
           peer: { id: sess.id, kind: 'dm' },
-          agentId: sess.agentId || state.defaultAgentId,
+          agentId: _regenAgentId,
           content: {
             text: lastUserMsg._modelText || lastUserMsg.text || '',
             media: lastUserMsg._media || undefined,
@@ -2536,6 +2555,7 @@ export function _buildMessageEl(msg) {
           _regenSentNow = safeWsSend(state.ws, JSON.stringify(wsPayload))
         }
         if (_regenSentNow) {
+          setActiveTeamRunForSession(sess, _regenTeamRun)
           sess._sendingInFlight = true
           // 新 turn 开始(regen 路径):清跨 turn cost-charged 归因状态。
           // 跟普通 send 路径(websocket.js:541)对齐。
@@ -2552,7 +2572,7 @@ export function _buildMessageEl(msg) {
                   type: 'inbound.control.stop',
                   channel: 'webchat',
                   peer: { id: sess.id, kind: 'dm' },
-                  agentId: sess.agentId || state.defaultAgentId,
+                  agentId: getActiveStopAgentId(sess),
                 }))
               }
               sess._sendingInFlight = false
@@ -2580,6 +2600,7 @@ export function _buildMessageEl(msg) {
             sessId: sess.id,
             payload: wsPayload,
             msgId: lastUserMsg.id,
+            teamRun: _regenTeamRun || undefined,
           })
           if (!enqueued) {
             // P2-24 数据保护:enqueue 失败必须恢复 splice 掉的消息,否则 regen 操作

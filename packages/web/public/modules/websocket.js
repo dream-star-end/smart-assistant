@@ -273,6 +273,38 @@ if (typeof window !== 'undefined') {
 const THINKING_SAFETY_MS = 10 * 60_000
 const _thinkingTimers = new Map() // sessId -> timeoutId
 
+function _normalizeActiveTeamRun(teamRun) {
+  if (!teamRun || typeof teamRun !== 'object') return null
+  const leaderAgentId = typeof teamRun.leaderAgentId === 'string' ? teamRun.leaderAgentId.trim() : ''
+  if (!leaderAgentId) return null
+  const id = typeof teamRun.id === 'string' ? teamRun.id : ''
+  const name = typeof teamRun.name === 'string' ? teamRun.name : id
+  return { id, name: name || id, leaderAgentId }
+}
+
+export function setActiveTeamRunForSession(sess, teamRun) {
+  if (!sess) return
+  sess._activeTeamRun = _normalizeActiveTeamRun(teamRun)
+}
+
+function _offlineItemTeamRun(sess, item) {
+  const queuedRun = _normalizeActiveTeamRun(item?.teamRun)
+  if (queuedRun) return queuedRun
+  const msgId = item?.msgId
+  if (!msgId || !Array.isArray(sess?.messages)) return null
+  const msg = sess.messages.find((m) => m?.id === msgId)
+  return _normalizeActiveTeamRun(msg?._teamRun)
+}
+
+export function getActiveStopAgentId(sess) {
+  const drainingItem = state._offlineDrainingCurrent
+  const drainingTeamRun =
+    sess && drainingItem?.sessId === sess.id ? _offlineItemTeamRun(sess, drainingItem) : null
+  const leaderAgentId = drainingTeamRun?.leaderAgentId || sess?._activeTeamRun?.leaderAgentId
+  if (typeof leaderAgentId === 'string' && leaderAgentId.trim()) return leaderAgentId.trim()
+  return sess?.agentId || state.defaultAgentId
+}
+
 function _resetThinkingSafety(sessId) {
   if (_thinkingTimers.has(sessId)) clearTimeout(_thinkingTimers.get(sessId))
   const tid = setTimeout(() => {
@@ -288,7 +320,7 @@ function _resetThinkingSafety(sessId) {
         type: 'inbound.control.stop',
         channel: 'webchat',
         peer: { id: sessId, kind: 'dm' },
-        agentId: s.agentId || state.defaultAgentId,
+        agentId: getActiveStopAgentId(s),
       }))
       s._sendingInFlight = false
       clearTurnTiming(s)
@@ -1099,6 +1131,7 @@ function _drainNextOfflineItem() {
       msg.status = 'sent'
       updateMsgStatus(msg, sess)
     }
+    setActiveTeamRunForSession(sess, _offlineItemTeamRun(sess, item))
     sess._sendingInFlight = true
     // 新 turn 开始:防御性清理上一 turn 的 cost-charged 归因状态。
     // 串行性保证此处 pending 应该是 0(上一 turn isFinal 已 drain),非 0
@@ -1265,7 +1298,7 @@ export function stopCurrentTurn() {
     type: 'inbound.control.stop',
     channel: 'webchat',
     peer: { id: sess.id, kind: 'dm' },
-    agentId: sess.agentId || state.defaultAgentId,
+    agentId: getActiveStopAgentId(sess),
   }))
   // Immediately tear down local UI state so typing indicator / stop button / title spinner
   // clear without waiting for the backend's isFinal (which can take seconds to minutes,

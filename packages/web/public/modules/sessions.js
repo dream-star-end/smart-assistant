@@ -29,10 +29,12 @@ export function setSessionDeps(deps) {
 let _showTypingIndicator
 let _hideTypingIndicator
 let _renderAgentDropdown
+let _syncAgentTeamSelectionForSession
 export function setSessionUIDeps(deps) {
   _showTypingIndicator = deps.showTypingIndicator
   _hideTypingIndicator = deps.hideTypingIndicator
   _renderAgentDropdown = deps.renderAgentDropdown
+  _syncAgentTeamSelectionForSession = deps.syncAgentTeamSelectionForSession
 }
 
 // ═══════════════ SESSIONS ═══════════════
@@ -93,6 +95,7 @@ export function switchSession(id) {
   renderSidebar()
   _renderMessages()
   _renderAgentDropdown()
+  _syncAgentTeamSelectionForSession?.()
   // After DOM rebuild, show typing indicator + title busy for the new session if in-flight
   if (state.sendingInFlight) {
     _showTypingIndicator()
@@ -150,6 +153,7 @@ export async function deleteSession(id) {
     } else {
       createSession()
     }
+    _syncAgentTeamSelectionForSession?.()
     _renderMessages()
   }
   renderSidebar()
