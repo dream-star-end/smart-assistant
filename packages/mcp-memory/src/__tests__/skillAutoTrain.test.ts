@@ -4,6 +4,8 @@ import { describe, it } from 'node:test'
 import {
   buildSkillAutoTrainPrompt,
   createSkillAutoTrainDelegateRequest,
+  formatSkillAutoTrainAcceptedRun,
+  formatSkillAutoTrainStatus,
   isNestedSkillAutoTrainBlocked,
   normalizeSkillAutoTrainArgs,
 } from '../skillAutoTrain.js'
@@ -20,6 +22,7 @@ describe('normalizeSkillAutoTrainArgs', () => {
       maxSessions: 8,
       maxSkillEdits: 3,
       apply: true,
+      waitForCompletion: false,
     })
   })
 
@@ -32,6 +35,7 @@ describe('normalizeSkillAutoTrainArgs', () => {
         maxSkillEdits: 11,
         apply: false,
         focus: ' OpenClaude release ',
+        waitForCompletion: true,
       },
       'main',
     )
@@ -43,6 +47,7 @@ describe('normalizeSkillAutoTrainArgs', () => {
       maxSkillEdits: 10,
       apply: false,
       focus: 'OpenClaude release',
+      waitForCompletion: true,
     })
   })
 })
@@ -57,6 +62,7 @@ describe('buildSkillAutoTrainPrompt', () => {
         maxSkillEdits: 2,
         apply: true,
         focus: 'terminal UX',
+        waitForCompletion: false,
       },
       NOW,
     )
@@ -78,6 +84,7 @@ describe('buildSkillAutoTrainPrompt', () => {
         maxSessions: 8,
         maxSkillEdits: 3,
         apply: false,
+        waitForCompletion: false,
       },
       NOW,
     )
@@ -125,5 +132,36 @@ describe('createSkillAutoTrainDelegateRequest', () => {
     assert.match(request.context, /lookbackHours=12/)
     assert.match(request.context, /maxSessions=5/)
     assert.match(request.context, /maxSkillEdits=4/)
+    assert.match(request.context, /waitForCompletion=false/)
+    assert.equal(request.waitForCompletion, false)
+  })
+})
+
+describe('skill_train_auto formatting helpers', () => {
+  it('formats the accepted background run with a status command', () => {
+    const text = formatSkillAutoTrainAcceptedRun({
+      targetAgentId: 'main',
+      runId: 'run-abc',
+      sessionKey: 'agent:main:delegate:test:1',
+    })
+
+    assert.match(text, /后台训练/)
+    assert.match(text, /Run ID: run-abc/)
+    assert.match(text, /skill_train_auto_status/)
+  })
+
+  it('formats run status with output preview', () => {
+    const text = formatSkillAutoTrainStatus({
+      id: 'run-abc',
+      sessionKey: 'agent:main:delegate:test:1',
+      status: 'completed',
+      startedAt: Date.parse('2026-06-12T16:00:00.000Z'),
+      durationMs: 123_000,
+      outputPreview: 'updated release checklist',
+    })
+
+    assert.match(text, /status: completed/)
+    assert.match(text, /Duration: 123s/)
+    assert.match(text, /updated release checklist/)
   })
 })

@@ -26,6 +26,8 @@ export interface RunLogEntry {
   toolCalls?: string[] // tool names used in this run
   // Error info
   error?: string
+  // Small human-facing completion summary, used by async status lookups.
+  outputPreview?: string
 }
 
 const MAX_ENTRIES = 200
@@ -60,6 +62,7 @@ export class RunLog {
       turn?: number
       toolCalls?: string[]
       error?: string
+      outputPreview?: string
     },
   ): void {
     entry.completedAt = Date.now()
@@ -71,6 +74,12 @@ export class RunLog {
     entry.turn = result.turn
     entry.toolCalls = result.toolCalls
     entry.error = result.error
+    entry.outputPreview = result.outputPreview
+  }
+
+  /** Find a run by its stable run id. */
+  get(id: string): RunLogEntry | undefined {
+    return this.entries.find((entry) => entry.id === id)
   }
 
   /** Get recent entries (newest first). */
