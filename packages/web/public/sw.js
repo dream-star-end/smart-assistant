@@ -1,6 +1,6 @@
 // OpenClaude Service Worker
 // App-shell caching only. Never intercept /ws, /api/*, or external CDN requests.
-const VERSION = 'openclaude-v80'
+const VERSION = 'openclaude-v81'
 const SHELL = [
   '/',
   '/index.html',
@@ -10,7 +10,7 @@ const SHELL = [
   '/icon.svg',
   // ES modules
   '/modules/main.js',
-  '/modules/main.js?v=60', // versioned URL used in index.html
+  '/modules/main.js?v=61', // versioned URL used in index.html
   '/modules/dom.js',
   '/modules/util.js',
   '/modules/state.js',
@@ -33,17 +33,17 @@ const SHELL = [
   '/modules/planMode.js',
   '/modules/planMode.js?v=4',
   '/modules/sessions.js',
-  '/modules/sessions.js?v=9',
+  '/modules/sessions.js?v=10',
   '/modules/sync.js',
-  '/modules/sync.js?v=8',
+  '/modules/sync.js?v=9',
   '/modules/messages.js',
   '/modules/messages.js?v=44',
   '/modules/planPanel.js',
   '/modules/planPanel.js?v=3',
   '/modules/websocket.js',
-  '/modules/websocket.js?v=47',
+  '/modules/websocket.js?v=48',
   '/modules/commands.js',
-  '/modules/commands.js?v=7',
+  '/modules/commands.js?v=8',
   '/modules/goalControl.js',
   '/modules/goalControl.js?v=3',
   '/modules/goalMode.js',

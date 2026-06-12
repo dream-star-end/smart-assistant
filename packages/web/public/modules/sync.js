@@ -4,7 +4,7 @@
 
 import { apiFetch, apiGet, apiJson, authHeaders } from './api.js'
 import { dbDelete, dbGetAll, dbPut } from './db.js'
-import { _rebuildSearchIndex, clearDeleteTombstone, isDeletePending } from './sessions.js?v=9'
+import { _rebuildSearchIndex, clearDeleteTombstone, isDeletePending } from './sessions.js?v=10'
 import { state } from './state.js'
 
 // Dep-injected callback: fired when a push hits a 409 conflict and we
@@ -162,13 +162,7 @@ function _childBlockSupersedes(localChild, serverChild) {
   return false
 }
 
-function _agentGroupSupersedes(localMsg, serverMsg) {
-  if (!_sameIfServerHas(localMsg, serverMsg, 'blockId')) return false
-  if (!_sameIfServerHas(localMsg, serverMsg, 'toolName')) return false
-  if (!_stringPrefixSupersedes(localMsg, serverMsg, 'text')) return false
-  if (!_booleanProgressSupersedes(localMsg?._completed, serverMsg?._completed, true)) return false
-  if (!_errorFieldSupersedes(localMsg, serverMsg, '_isError')) return false
-  if (!_stringPrefixSupersedes(localMsg, serverMsg, '_resultPreview')) return false
+function _childBlocksPrefixSupersedes(localMsg, serverMsg) {
   const serverChildren = Array.isArray(serverMsg?.childBlocks) ? serverMsg.childBlocks : []
   if (serverChildren.length === 0) return true
   const localChildren = Array.isArray(localMsg?.childBlocks) ? localMsg.childBlocks : []
@@ -177,6 +171,21 @@ function _agentGroupSupersedes(localMsg, serverMsg) {
     if (!_childBlockSupersedes(localChildren[i], serverChildren[i])) return false
   }
   return true
+}
+
+function _assistantChildBlocksSupersedes(localMsg, serverMsg) {
+  if (!_stringPrefixSupersedes(localMsg, serverMsg, 'text')) return false
+  return _childBlocksPrefixSupersedes(localMsg, serverMsg)
+}
+
+function _agentGroupSupersedes(localMsg, serverMsg) {
+  if (!_sameIfServerHas(localMsg, serverMsg, 'blockId')) return false
+  if (!_sameIfServerHas(localMsg, serverMsg, 'toolName')) return false
+  if (!_stringPrefixSupersedes(localMsg, serverMsg, 'text')) return false
+  if (!_booleanProgressSupersedes(localMsg?._completed, serverMsg?._completed, true)) return false
+  if (!_errorFieldSupersedes(localMsg, serverMsg, '_isError')) return false
+  if (!_stringPrefixSupersedes(localMsg, serverMsg, '_resultPreview')) return false
+  return _childBlocksPrefixSupersedes(localMsg, serverMsg)
 }
 
 /**
@@ -205,10 +214,9 @@ function _agentGroupSupersedes(localMsg, serverMsg) {
  *         cards becoming completed, childBlocks growing as an ordered
  *         prefix). Unknown or divergent structure still falls back to
  *         server-wins.
- *     Rows with childBlocks are excluded from Layer 2: their in-place
- *     mutations (_partial/_completed/output) can't be judged by text
- *     alone, and if Layer 1 already failed they aren't equal anyway,
- *     so server-wins is the safe fallback.
+ *     Assistant rows with childBlocks use the same ordered-prefix
+ *     structural rule as agent-group rows; unknown child kinds still fall
+ *     back to server-wins unless Layer 1 stable equality matched.
  *
  * ACCEPTED DIVERGENCE (documented, not guarded by Layer 2):
  *   - user.status ('sending'→'sent'→'read'): client-managed UI flag.
@@ -232,11 +240,19 @@ export function _localMessageSupersedes(localMsg, serverMsg) {
 
   if (role === 'tool') return _toolLikeSupersedes(localMsg, serverMsg)
   if (role === 'agent-group') return _agentGroupSupersedes(localMsg, serverMsg)
+  if (
+    role === 'assistant' &&
+    (Array.isArray(localMsg.childBlocks) || Array.isArray(serverMsg.childBlocks))
+  ) {
+    return _assistantChildBlocksSupersedes(localMsg, serverMsg)
+  }
 
   // Layer 2: text-level judgement, roles whitelist only.
   if (role !== 'assistant' && role !== 'thinking' && role !== 'user' && role !== 'plan')
     return false
-  // Any childBlocks on either side → structural, refuse text-level judgement.
+  // Non-assistant childBlocks are structural; if Layer 1 did not prove
+  // equality and no role-specific structural rule exists, fall back to
+  // server-wins rather than guessing from text alone.
   if (Array.isArray(localMsg.childBlocks) || Array.isArray(serverMsg.childBlocks)) return false
   const lText = typeof localMsg.text === 'string' ? localMsg.text : ''
   const sText = typeof serverMsg.text === 'string' ? serverMsg.text : ''
@@ -306,6 +322,131 @@ export function _localDominates(serverMessages, localMessages) {
     if (!_localMessageSupersedes(l, s)) return false
   }
   return true
+}
+
+function _activeStreamEntries(sess) {
+  const entries = []
+  const seen = new Set()
+  const add = (kind, msg) => {
+    if (!msg || typeof msg.id !== 'string' || seen.has(msg.id)) return
+    seen.add(msg.id)
+    entries.push({ kind, msg })
+  }
+  add('streamingAssistant', sess?._streamingAssistant)
+  add('streamingThinking', sess?._streamingThinking)
+  add('streamingPlan', sess?._streamingPlan)
+  if (typeof sess?._replyingToMsgId === 'string') {
+    const msg = Array.isArray(sess.messages)
+      ? sess.messages.find((m) => m?.id === sess._replyingToMsgId)
+      : null
+    add('replyingToMsgId', msg)
+  }
+  return entries
+}
+
+function _activeStreamIds(sess) {
+  return new Set(_activeStreamEntries(sess).map((entry) => entry.msg.id))
+}
+
+function _serverMessageCoversLocalVisible(serverMsg, localMsg) {
+  if (!serverMsg) return { reason: 'missing-active-message' }
+  if (!localMsg) return null
+  if (serverMsg.role !== localMsg.role) return { reason: 'active-role-mismatch' }
+
+  const localText = typeof localMsg.text === 'string' ? localMsg.text : ''
+  const serverText = typeof serverMsg.text === 'string' ? serverMsg.text : ''
+  if (localText && !serverText.startsWith(localText)) {
+    return {
+      reason: serverText.length < localText.length ? 'active-text-shorter' : 'active-text-diverged',
+      localTextLength: localText.length,
+      serverTextLength: serverText.length,
+    }
+  }
+
+  const localChildren = Array.isArray(localMsg.childBlocks) ? localMsg.childBlocks : []
+  if (localChildren.length === 0) return null
+  const serverChildren = Array.isArray(serverMsg.childBlocks) ? serverMsg.childBlocks : []
+  if (serverChildren.length < localChildren.length) {
+    return {
+      reason: 'active-childblocks-shorter',
+      localChildBlocks: localChildren.length,
+      serverChildBlocks: serverChildren.length,
+    }
+  }
+  for (let i = 0; i < localChildren.length; i++) {
+    const ls = _stableStringify(localChildren[i])
+    const ss = _stableStringify(serverChildren[i])
+    if (ls !== null && ss !== null && ls === ss) continue
+    if (!_childBlockSupersedes(serverChildren[i], localChildren[i])) {
+      return {
+        reason: 'active-childblock-regressed',
+        childIndex: i,
+        childKind: localChildren[i]?.kind || serverChildren[i]?.kind || null,
+      }
+    }
+  }
+  return null
+}
+
+function _activeStreamLoss(sess, serverMessages) {
+  const entries = _activeStreamEntries(sess)
+  if (entries.length === 0) return null
+  const byId = new Map()
+  for (const msg of Array.isArray(serverMessages) ? serverMessages : []) {
+    if (msg?.id && !byId.has(msg.id)) byId.set(msg.id, msg)
+  }
+  for (const entry of entries) {
+    const loss = _serverMessageCoversLocalVisible(byId.get(entry.msg.id), entry.msg)
+    if (loss) {
+      return {
+        ...loss,
+        kind: entry.kind,
+        id: entry.msg.id,
+        role: entry.msg.role || null,
+      }
+    }
+  }
+  return null
+}
+
+function _localDominatesAllowingMissingActive(serverMessages, localMessages, activeIds) {
+  const server = Array.isArray(serverMessages) ? serverMessages : []
+  const local = Array.isArray(localMessages) ? localMessages : []
+  if (!activeIds || activeIds.size === 0) return false
+  let localIdx = 0
+  for (const serverMsg of server) {
+    if (!serverMsg?.id) return false
+    while (
+      localIdx < local.length &&
+      activeIds.has(local[localIdx]?.id) &&
+      local[localIdx]?.id !== serverMsg.id
+    ) {
+      localIdx++
+    }
+    const localMsg = local[localIdx]
+    if (!localMsg?.id || localMsg.id !== serverMsg.id) return false
+    if (!_localMessageSupersedes(localMsg, serverMsg)) return false
+    localIdx++
+  }
+  return true
+}
+
+function _activeStreamLogPayload(sess, serverMessages, loss) {
+  const activeEntries = _activeStreamEntries(sess)
+  return {
+    sessionId: sess?.id || null,
+    reason: loss?.reason || null,
+    activeKind: loss?.kind || null,
+    activeId: loss?.id || null,
+    activeRole: loss?.role || null,
+    localMessageCount: Array.isArray(sess?.messages) ? sess.messages.length : 0,
+    serverMessageCount: Array.isArray(serverMessages) ? serverMessages.length : 0,
+    activeIds: activeEntries.map((entry) => entry.msg.id),
+    activeHasChildBlocks: activeEntries.some((entry) => Array.isArray(entry.msg.childBlocks)),
+    serverHasChildBlocks: Array.isArray(serverMessages)
+      ? serverMessages.some((msg) => Array.isArray(msg?.childBlocks))
+      : false,
+  }
 }
 
 /**
@@ -703,12 +844,14 @@ export function pushSessionToServer(sess) {
           if (!live) return
           const target = live
 
-          if (_localDominates(server.messages, live.messages)) {
-            // (a) LOCAL DOMINATES — keep local messages, adopt server metadata.
+          const keepLocalAfterConflict = async (activeLoss = null) => {
+            // LOCAL DOMINATES — keep local messages, adopt server metadata.
             //
             // Messages: local is a clean superset, so we retain it (the
             // primary bug: streaming assistant prefix extension gets dropped
-            // if we overwrite).
+            // if we overwrite). The active-stream deferred branch only calls
+            // this helper after proving every server row is represented
+            // locally, allowing a missing local-only active row to stay visible.
             //
             // Metadata (title/pinned/agentId/lastAt): we ADOPT server's
             // values. Another tab may have renamed the session, pinned it,
@@ -746,6 +889,12 @@ export function pushSessionToServer(sess) {
             try {
               await dbPut({ ...target })
             } catch {}
+            if (activeLoss) {
+              console.warn(
+                '[sync] server-wins-deferred-active-stream',
+                _activeStreamLogPayload(target, server.messages, activeLoss),
+              )
+            }
             // Pass 'local-dominates' so the UI can skip renderMessages() — local
             // messages are preserved in this branch, only sidebar metadata may
             // have shifted. Without this tag, every 409 in a long streaming
@@ -766,6 +915,23 @@ export function pushSessionToServer(sess) {
                 '— leaving dirty; next user action or save-cycle will retry',
               )
             }
+          }
+
+          if (_localDominates(server.messages, live.messages)) {
+            await keepLocalAfterConflict()
+            return
+          }
+
+          const activeLoss = _activeStreamLoss(live, server.messages)
+          if (
+            activeLoss &&
+            _localDominatesAllowingMissingActive(
+              server.messages,
+              live.messages,
+              _activeStreamIds(live),
+            )
+          ) {
+            await keepLocalAfterConflict(activeLoss)
             return
           }
 
@@ -776,6 +942,13 @@ export function pushSessionToServer(sess) {
           // a superset of server, so equal lastAt means no new user edit
           // and server really has data we don't.
           if (live._dirty && live.lastAt > preFlightLastAt) return
+
+          if (activeLoss) {
+            console.warn(
+              '[sync] server-wins-active-stream-loss',
+              _activeStreamLogPayload(target, server.messages, activeLoss),
+            )
+          }
 
           Object.assign(target, {
             title: server.title,
