@@ -136,27 +136,29 @@ describe('official Claude terminal lifecycle', () => {
     assert.match(rememberSrc, /MAX_MOBILE_COMMAND_HISTORY/)
   })
 
-  it('mobile quick controls are reduced to the essential set', () => {
+  it('mobile quick controls include prompt navigation keys', () => {
     assert.match(INDEX, /claude-terminal-mobile-input/)
     assert.match(INDEX, /claude-terminal-mobile-send-btn/)
     assert.match(INDEX, /claude-terminal-mobile-focus-btn/)
     assert.match(INDEX, /data-claude-terminal-action="bottom"/)
+    assert.match(INDEX, /data-claude-terminal-key="up"/)
+    assert.match(INDEX, /data-claude-terminal-key="down"/)
     assert.match(INDEX, /data-claude-terminal-key="enter"/)
     assert.match(INDEX, /data-claude-terminal-key="tab"/)
     assert.match(INDEX, /data-claude-terminal-key="ctrl-c"/)
     assert.match(INDEX, /data-claude-terminal-key="esc"/)
-    assert.doesNotMatch(INDEX, /data-claude-terminal-key="up"/)
-    assert.doesNotMatch(INDEX, /data-claude-terminal-key="down"/)
+    assert.match(SRC, /up:\s*'\\x1b\[A'/)
+    assert.match(SRC, /down:\s*'\\x1b\[B'/)
     assert.doesNotMatch(INDEX, /claude-terminal-wake-lock-btn/)
   })
 
   it('cache-busts terminal module when changing mobile controls', () => {
-    assert.match(MAIN, /from '\.\/officialTerminal\.js\?v=6'/)
-    assert.match(SW, /\/modules\/officialTerminal\.js\?v=6/)
-    assert.match(INDEX, /\/modules\/main\.js\?v=58/)
-    assert.match(INDEX, /\/style\.css\?v=50/)
-    assert.match(INDEX, /sw-flush-v20/)
-    assert.match(SW, /openclaude-v78/)
+    assert.match(MAIN, /from '\.\/officialTerminal\.js\?v=7'/)
+    assert.match(SW, /\/modules\/officialTerminal\.js\?v=7/)
+    assert.match(INDEX, /\/modules\/main\.js\?v=59/)
+    assert.match(INDEX, /\/style\.css\?v=51/)
+    assert.match(INDEX, /sw-flush-v21/)
+    assert.match(SW, /openclaude-v79/)
   })
 
   it('terminal files live in a separate wide modal with Escape closing files first', () => {

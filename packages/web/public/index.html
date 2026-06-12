@@ -16,7 +16,7 @@
 <link rel="apple-touch-icon" href="/icon.svg" />
 <link rel="stylesheet" href="/vendor/github-dark.min.css" />
 <link rel="stylesheet" href="/vendor/katex/katex.min.css" />
-<link rel="stylesheet" href="/style.css?v=50" />
+<link rel="stylesheet" href="/style.css?v=51" />
 <link rel="stylesheet" href="/vendor/xterm/xterm.css?v=1" />
 <style>/* Inline styles removed — see style.css */
 </style>
@@ -821,6 +821,8 @@
         </div>
         <div class="claude-terminal-mobile-keys" aria-label="终端快捷键">
           <button type="button" tabindex="-1" data-claude-terminal-action="bottom">底部</button>
+          <button type="button" tabindex="-1" data-claude-terminal-key="up">↑</button>
+          <button type="button" tabindex="-1" data-claude-terminal-key="down">↓</button>
           <button type="button" tabindex="-1" data-claude-terminal-key="enter">Enter</button>
           <button type="button" tabindex="-1" data-claude-terminal-key="tab">Tab</button>
           <button type="button" tabindex="-1" data-claude-terminal-key="ctrl-c">Ctrl-C</button>
@@ -909,7 +911,7 @@
 <!-- Force SW cache refresh (one-time, remove after all clients updated) -->
 <script>
 (function(){
-  var V='sw-flush-v20';
+  var V='sw-flush-v21';
   if(localStorage.getItem(V))return;
   if('serviceWorker' in navigator){
     navigator.serviceWorker.getRegistrations().then(function(regs){
@@ -931,6 +933,6 @@
 <script src="/vendor/katex/katex.min.js" defer></script>
 <script src="/vendor/qrcode.min.js"></script>
 <div id="toast" class="toast"></div>
-<script type="module" src="/modules/main.js?v=58"></script>
+<script type="module" src="/modules/main.js?v=59"></script>
 </body>
 </html>

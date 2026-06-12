@@ -9,6 +9,7 @@ import type { WebSocket } from 'ws'
 import {
   CLAUDE_TERMINAL_MAX_CLIENT_MESSAGE_BYTES,
   ClaudeTerminalManager,
+  buildOfficialClaudeArgs,
   buildOfficialClaudeEnv,
   clampTerminalSize,
   isAllowedClaudeTerminalOrigin,
@@ -123,10 +124,19 @@ describe('official Claude terminal helpers', () => {
     assert.equal(env.LANG, 'en_US.UTF-8')
     assert.equal(env.HTTPS_PROXY, 'http://proxy.example:8080')
     assert.equal(env.ALL_PROXY, 'socks5://proxy.example:1080')
+    assert.equal(env.IS_SANDBOX, '1')
     assert.equal(env.PATH.startsWith('/home/tester/.local/bin:'), true)
     assert.equal('ANTHROPIC_API_KEY' in env, false)
     assert.equal('CLAUDE_CODE_OAUTH_TOKEN' in env, false)
     assert.equal('OPENCLAUDE_GATEWAY_TOKEN' in env, false)
+  })
+
+  test('builds full-permission Claude Code terminal args by default', () => {
+    assert.deepEqual(buildOfficialClaudeArgs(), [
+      '--permission-mode',
+      'bypassPermissions',
+      '--dangerously-skip-permissions',
+    ])
   })
 
   test('clamps terminal dimensions and detached ttl override', () => {
@@ -241,9 +251,10 @@ describe('ClaudeTerminalManager lifecycle', () => {
       },
       spawn: (file, args, opts) => {
         assert.equal(file, '/bin/echo')
-        assert.deepEqual(args, [])
+        assert.deepEqual(args, buildOfficialClaudeArgs())
         assert.equal(opts.cwd, '/tmp')
         assert.equal(opts.env.HOME, '/root')
+        assert.equal(opts.env.IS_SANDBOX, '1')
         assert.equal('ANTHROPIC_API_KEY' in opts.env, false)
         const fake = new FakePty()
         ptys.push(fake)
