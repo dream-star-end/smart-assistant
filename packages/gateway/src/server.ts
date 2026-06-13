@@ -533,6 +533,84 @@ function wechatPeerIdFromSessionKey(sessionKey: string | undefined): string | un
   return /^agent:[^:]+:webchat:dm:(wsess-[0-9a-f]{16})$/.exec(sessionKey)?.[1]
 }
 
+const DELEGATE_MEMORY_PRESSURE_DEFAULT_RATIO = 0.85
+const DELEGATE_MEMORY_CURRENT_FILES = [
+  '/sys/fs/cgroup/memory.current',
+  '/sys/fs/cgroup/memory/memory.usage_in_bytes',
+]
+const DELEGATE_MEMORY_MAX_FILES = [
+  '/sys/fs/cgroup/memory.max',
+  '/sys/fs/cgroup/memory/memory.limit_in_bytes',
+]
+
+function parseDelegateMemoryPressureRatio(): number {
+  const raw = Number(process.env.OPENCLAUDE_DELEGATE_MEMORY_PRESSURE_RATIO)
+  return Number.isFinite(raw) && raw > 0 && raw < 1
+    ? raw
+    : DELEGATE_MEMORY_PRESSURE_DEFAULT_RATIO
+}
+
+function readFirstCgroupByteValue(files: readonly string[]): number | null {
+  for (const file of files) {
+    try {
+      const text = readFileSync(file, 'utf8').trim()
+      if (!text || text === 'max') continue
+      const n = Number(text)
+      if (Number.isFinite(n) && n > 0) return n
+    } catch {}
+  }
+  return null
+}
+
+function readDelegateMemoryPressure(): { current: number; max: number; ratio: number } | null {
+  const current = readFirstCgroupByteValue(DELEGATE_MEMORY_CURRENT_FILES)
+  const max = readFirstCgroupByteValue(DELEGATE_MEMORY_MAX_FILES)
+  if (!current || !max) return null
+  // Docker/cgroup v1 sometimes reports a huge sentinel for "unlimited".
+  if (max > Number.MAX_SAFE_INTEGER / 4) return null
+  return { current, max, ratio: current / max }
+}
+
+function normalizeDelegateToolsetList(value: unknown): string[] | null {
+  if (!Array.isArray(value)) return null
+  const out: string[] = []
+  for (const item of value) {
+    if (typeof item !== 'string') continue
+    const trimmed = item.trim()
+    if (!trimmed || out.includes(trimmed)) continue
+    out.push(trimmed)
+  }
+  return out
+}
+
+function effectiveDelegateToolsets(
+  targetAgent: AgentDef,
+  defaultToolsets: readonly string[] | undefined,
+  requestedRaw: unknown,
+): { ok: true; toolsets: string[] } | { ok: false; error: string } {
+  const requested = normalizeDelegateToolsetList(requestedRaw)
+  if (requested === null) return { ok: false, error: 'delegate toolsets must be an array' }
+  if (requested.length === 0) {
+    return { ok: false, error: 'delegate toolsets must include at least one valid toolset' }
+  }
+
+  const ceiling = Array.isArray(targetAgent.toolsets)
+    ? targetAgent.toolsets
+    : Array.isArray(defaultToolsets)
+      ? defaultToolsets
+      : undefined
+  if (!ceiling || ceiling.length === 0) return { ok: true, toolsets: requested }
+
+  const allowed = requested.filter((toolset) => ceiling.includes(toolset))
+  if (allowed.length === 0) {
+    return {
+      ok: false,
+      error: `delegate toolsets not allowed for agent "${targetAgent.id}"`,
+    }
+  }
+  return { ok: true, toolsets: allowed }
+}
+
 export class Gateway {
   private wss!: WebSocketServer
   private httpServer!: ReturnType<typeof createServer>
@@ -4747,6 +4825,23 @@ export class Gateway {
     }
   }
 
+  private _resolveDelegateParent(args: {
+    parentSessionKey?: unknown
+    sourceAgent?: unknown
+  }): { sessionKey: string; repoSessionId?: string } | null {
+    if (typeof args.parentSessionKey !== 'string' || !args.parentSessionKey) return null
+    const parent = this.sessions.getByKey(args.parentSessionKey)
+    if (!parent) return null
+    if (parent.channel !== 'webchat' && parent.channel !== 'delegate') return null
+    if (typeof args.sourceAgent === 'string' && args.sourceAgent && parent.agentId !== args.sourceAgent) {
+      return null
+    }
+    return {
+      sessionKey: parent.sessionKey,
+      repoSessionId: parent.repoSessionId ?? parent.peerId,
+    }
+  }
+
   private _registerActiveDelegation(
     parentSessionKey: string | undefined,
     childSessionKey: string,
@@ -4766,19 +4861,26 @@ export class Gateway {
     }
   }
 
-  private _interruptDelegationsForParent(parentSessionKey: string): boolean {
+  private _interruptDelegationsForParent(
+    parentSessionKey: string,
+    visited = new Set<string>(),
+  ): boolean {
+    if (visited.has(parentSessionKey)) return false
+    visited.add(parentSessionKey)
     const childSessionKeys = this._activeDelegationsByParent.get(parentSessionKey)
     if (!childSessionKeys || childSessionKeys.size === 0) return false
 
     let interrupted = false
     let attempted = 0
     for (const childSessionKey of [...childSessionKeys]) {
+      attempted++
+      const descendantInterrupted = this._interruptDelegationsForParent(childSessionKey, visited)
       if (!this.sessions.getByKey(childSessionKey)) {
         childSessionKeys.delete(childSessionKey)
+        interrupted = descendantInterrupted || interrupted
         continue
       }
-      attempted++
-      interrupted = this.sessions.interrupt(childSessionKey) || interrupted
+      interrupted = this.sessions.interrupt(childSessionKey) || descendantInterrupted || interrupted
     }
     if (childSessionKeys.size === 0) this._activeDelegationsByParent.delete(parentSessionKey)
     this.log.info('interrupt_delegations', {
@@ -4826,8 +4928,38 @@ export class Gateway {
     const targetAgent = cfg.agents.find((a) => a.id === targetAgentId)
     if (!targetAgent) return this.sendError(res, 404, `agent "${targetAgentId}" not found`)
 
-    // Apply toolset restriction if specified
-    const delegatedAgent = toolsets ? { ...targetAgent, toolsets } : targetAgent
+    // Apply requested toolset restriction as an intersection with the target
+    // agent's configured ceiling. Never let a delegator replace a core-only
+    // specialist with broader browser/research toolsets.
+    const hasRequestedToolsets = Object.prototype.hasOwnProperty.call(parsed, 'toolsets')
+    let delegatedAgent = targetAgent
+    if (hasRequestedToolsets) {
+      const resolvedToolsets = effectiveDelegateToolsets(
+        targetAgent,
+        this.deps.config.defaults.toolsets,
+        toolsets,
+      )
+      if (!resolvedToolsets.ok) return this.sendError(res, 400, resolvedToolsets.error)
+      delegatedAgent = { ...targetAgent, toolsets: resolvedToolsets.toolsets }
+    }
+
+    const memoryPressure = readDelegateMemoryPressure()
+    const memoryPressureLimit = parseDelegateMemoryPressureRatio()
+    if (memoryPressure && memoryPressure.ratio >= memoryPressureLimit) {
+      const pct = Math.round(memoryPressure.ratio * 100)
+      this.log.warn('delegate_resource_pressure', {
+        targetAgentId,
+        current: memoryPressure.current,
+        max: memoryPressure.max,
+        ratio: memoryPressure.ratio,
+        limit: memoryPressureLimit,
+      })
+      return this.sendError(
+        res,
+        503,
+        `delegate resource pressure: memory ${pct}% >= ${Math.round(memoryPressureLimit * 100)}%; please retry later`,
+      )
+    }
 
     const sessionKey = `agent:${targetAgentId}:delegate:${sourceAgent || 'system'}:${Date.now()}`
     this.log.info('delegate', {
@@ -4841,12 +4973,16 @@ export class Gateway {
       parentSessionKey: parsed.parentSessionKey,
       sourceAgent,
     })
+    const delegateParent = this._resolveDelegateParent({
+      parentSessionKey: parsed.parentSessionKey,
+      sourceAgent,
+    })
     const session = await this.sessions.getOrCreate({
       sessionKey,
       agent: delegatedAgent,
       channel: 'delegate',
       peerId: sourceAgent || 'system',
-      repoSessionId: progressTarget?.peerId,
+      repoSessionId: progressTarget?.peerId ?? delegateParent?.repoSessionId,
       title: `[delegate] ${goal.slice(0, 40)}`,
       delegationDepth: depth + 1,
     })
@@ -4883,7 +5019,7 @@ export class Gateway {
 
     this._activeDelegations++
     const unregisterDelegation = this._registerActiveDelegation(
-      progressTarget?.sessionKey,
+      delegateParent?.sessionKey,
       sessionKey,
     )
     const _dlgRun = this._runLog.start({ agentId: targetAgentId, sessionKey, taskType: 'delegate' })

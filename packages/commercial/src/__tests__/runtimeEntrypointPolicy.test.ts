@@ -531,8 +531,8 @@ describe("openclaude-runtime entrypoint env-scrub policy", () => {
     assert.match(src, /id:\s*"science_research_team"[\s\S]*leaderAgentId:\s*"codex"/);
     assert.match(
       src,
-      /id:\s*"science_research_team"[\s\S]*agentId:\s*"scientist"[\s\S]*role:\s*"科研数据分析师"[\s\S]*policy:\s*\{\s*maxParallel:\s*4,\s*requireReview:\s*true,\s*reviewAgentId:\s*"reviewer"\s*\}/,
-      "science team must include scientist and allow four-way collaboration",
+      /id:\s*"science_research_team"[\s\S]*agentId:\s*"scientist"[\s\S]*role:\s*"科研数据分析师"[\s\S]*policy:\s*\{\s*maxParallel:\s*2,\s*requireReview:\s*true,\s*reviewAgentId:\s*"reviewer"\s*\}/,
+      "science team must include scientist and cap collaboration fanout at two",
     );
     assert.match(src, /id:\s*"programming_team"[\s\S]*leaderAgentId:\s*"codex"/);
     assert.match(src, /teams:\s*desiredSeedTeams\.map\(cloneSeedTeam\)/);

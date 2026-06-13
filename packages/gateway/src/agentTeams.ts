@@ -2,6 +2,7 @@ import type { AgentDef, AgentTeamDef, AgentTeamMemberDef, AgentTeamPolicy } from
 
 export const MAX_AGENT_TEAMS = 16
 export const MAX_TEAM_MEMBERS = 8
+export const TEAM_MAX_PARALLEL_CAP = 2
 export const TEAM_ID_RE = /^[a-zA-Z0-9_-]+$/
 
 export function sanitizeTeamText(value: unknown, maxLen: number): string | undefined {
@@ -33,10 +34,10 @@ export function normalizeTeamPolicy(input: any, agentIds: Set<string>): AgentTea
   const policy: AgentTeamPolicy = {}
   if (input.maxParallel !== undefined) {
     const n = Number(input.maxParallel)
-    if (!Number.isInteger(n) || n < 1 || n > 5) {
-      throw new Error('policy.maxParallel must be an integer between 1 and 5')
+    if (!Number.isInteger(n) || n < 1) {
+      throw new Error('policy.maxParallel must be an integer >= 1')
     }
-    policy.maxParallel = n
+    policy.maxParallel = Math.min(n, TEAM_MAX_PARALLEL_CAP)
   }
   if (input.requireReview !== undefined) policy.requireReview = Boolean(input.requireReview)
   const reviewAgentId = sanitizeTeamText(input.reviewAgentId, 48)

@@ -277,6 +277,12 @@ export interface AgentSession {
    * fall back to the old `getClientSession` lookup in that case.
    */
   userId?: string
+  /**
+   * Repo/workspace lookup key used by runner getRepoSnapshot(). Delegate
+   * sessions keep their real peerId for identity, but inherit the originating
+   * webchat peerId here so nested delegate_task calls stay in the same repo.
+   */
+  repoSessionId?: string
   title: string
   startedAt: number
   runner: SubprocessRunner
@@ -1199,6 +1205,7 @@ export class SessionManager {
         // Never *overwrite* an already-set userId — doing so would enable a
         // different authenticated user to redirect another user's persistence.
         if (opts.userId && !existing.userId) existing.userId = opts.userId
+        if (opts.repoSessionId && !existing.repoSessionId) existing.repoSessionId = opts.repoSessionId
         return existing
       }
     }
@@ -1293,6 +1300,7 @@ export class SessionManager {
       channel: opts.channel ?? 'webchat',
       peerId: opts.peerId ?? 'unknown',
       userId: opts.userId,
+      repoSessionId,
       title: opts.title ?? 'New conversation',
       startedAt: now,
       runner,

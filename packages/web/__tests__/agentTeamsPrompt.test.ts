@@ -4,6 +4,9 @@ import { resolve } from 'node:path'
 import { describe, it } from 'node:test'
 
 const src = readFileSync(resolve(import.meta.dirname, '..', 'public/modules/agentTeams.js'), 'utf-8')
+const indexSrc = readFileSync(resolve(import.meta.dirname, '..', 'public/index.html'), 'utf-8')
+const teamMaxParallelSelect =
+  indexSrc.match(/<select id="team-max-parallel">[\s\S]*?<\/select>/)?.[0] || ''
 const mainSrc = readFileSync(resolve(import.meta.dirname, '..', 'public/modules/main.js'), 'utf-8')
 const agentsSrc = readFileSync(resolve(import.meta.dirname, '..', 'public/modules/agents.js'), 'utf-8')
 const modelPolicySrc = readFileSync(resolve(import.meta.dirname, '..', 'public/modules/modelPolicy.js'), 'utf-8')
@@ -222,6 +225,8 @@ describe('agent team prompt builder', () => {
     assert.match(src, /agentId: 'scientist'/)
     assert.match(src, /role: '科研数据分析师'/)
     assert.match(src, /policy: \{ maxParallel: 2, requireReview: true, reviewAgentId: 'reviewer' \}/)
+    assert.match(teamMaxParallelSelect, /<option value="2" selected>2<\/option>/)
+    assert.doesNotMatch(teamMaxParallelSelect, /<option value="3"/)
     assert.match(src, /id: 'programming_team'/)
     assert.match(src, /name: '编程协作团队'/)
     assert.doesNotMatch(src, /id: 'full_stack_team'/)

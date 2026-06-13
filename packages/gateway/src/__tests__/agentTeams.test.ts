@@ -27,7 +27,7 @@ describe('agent team validation', () => {
           },
           { agentId: 'reviewer', role: '审阅', responsibility: '检查风险' },
         ],
-        policy: { maxParallel: 3, requireReview: true, reviewAgentId: 'reviewer' },
+        policy: { maxParallel: 5, requireReview: true, reviewAgentId: 'reviewer' },
       },
       agents,
       [],
@@ -46,13 +46,13 @@ describe('agent team validation', () => {
     assert.equal(team.members[0]!.role, '调研 员')
     assert.equal(team.members[0]!.responsibility, '找资料 列出处')
     assert.equal(team.members[0]!.rolePrompt, '区分事实\n假设和争议')
-    assert.equal(team.policy?.maxParallel, 3)
+    assert.equal(team.policy?.maxParallel, 2)
     assert.equal(team.policy?.requireReview, true)
     assert.equal(team.policy?.reviewAgentId, 'reviewer')
     assert.match(team.updatedAt!, /^\d{4}-\d{2}-\d{2}T/)
   })
 
-  it('rejects unknown leader, unknown member, duplicate members and bad policy bounds', () => {
+  it('rejects unknown leader, unknown member, duplicate members and invalid policy bounds', () => {
     assert.throws(
       () =>
         normalizeAgentTeamInput(
@@ -93,13 +93,26 @@ describe('agent team validation', () => {
             name: 'X',
             leaderAgentId: 'main',
             members: [{ agentId: 'reviewer' }],
-            policy: { maxParallel: 6 },
+            policy: { maxParallel: 0 },
           },
           agents,
           [],
         ),
       /maxParallel/,
     )
+
+    const capped = normalizeAgentTeamInput(
+      {
+        id: 'cap',
+        name: 'Cap',
+        leaderAgentId: 'main',
+        members: [{ agentId: 'reviewer' }],
+        policy: { maxParallel: 6 },
+      },
+      agents,
+      [],
+    )
+    assert.equal(capped.policy?.maxParallel, 2)
   })
 
   it('enforces ids, duplicate team ids and the per-user team cap', () => {

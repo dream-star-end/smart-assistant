@@ -1188,7 +1188,7 @@ try {
           "像严格审稿人一样检查证据是否支撑结论,指出样本、方法、因果、统计和引用层面的弱点。优先列出阻塞性问题和可信度判断。",
       },
     ],
-    policy: { maxParallel: 4, requireReview: true, reviewAgentId: "reviewer" },
+    policy: { maxParallel: 2, requireReview: true, reviewAgentId: "reviewer" },
   };
 
   const desiredProgrammingTeam = {
@@ -1222,7 +1222,7 @@ try {
           "从正确性、回归风险、安全边界、测试覆盖和过度工程角度审查。区分阻塞问题和非阻塞建议,避免提出与需求无关的范围扩张。",
       },
     ],
-    policy: { maxParallel: 3, requireReview: true, reviewAgentId: "reviewer" },
+    policy: { maxParallel: 2, requireReview: true, reviewAgentId: "reviewer" },
   };
 
   const desiredSeedTeams = [desiredScienceTeam, desiredProgrammingTeam];
