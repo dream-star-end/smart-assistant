@@ -28,7 +28,7 @@ test('delegate sessions inherit repo lookup without rewriting delegate peer iden
   assert.match(
     SESSION_MANAGER_TS,
     /repoSessionId\?:\s*string/,
-    'SessionManager.getOrCreate must expose a separate repo lookup key',
+    'SessionManager must expose and retain a separate repo lookup key',
   )
   assert.match(
     getOrCreate,
@@ -39,6 +39,16 @@ test('delegate sessions inherit repo lookup without rewriting delegate peer iden
     SESSION_MANAGER_TS,
     /sessionId:\s*repoSessionId/,
     'runner repo snapshot lookup must use repoSessionId',
+  )
+  assert.match(
+    SESSION_MANAGER_TS,
+    /repoSessionId,\s*\n\s*title:/,
+    'AgentSession must store repoSessionId so nested delegates can inherit the same repo binding',
+  )
+  assert.match(
+    SESSION_MANAGER_TS,
+    /opts\.repoSessionId && !existing\.repoSessionId/,
+    'existing sessions should adopt a first repoSessionId without overwriting it',
   )
   assert.match(
     SESSION_MANAGER_TS,
@@ -57,8 +67,8 @@ test('delegate sessions inherit repo lookup without rewriting delegate peer iden
   )
   assert.match(
     handleDelegateTask,
-    /repoSessionId:\s*progressTarget\?\.peerId/,
-    'validated parent webchat peerId must be passed only as repoSessionId',
+    /repoSessionId:\s*progressTarget\?\.peerId\s*\?\?\s*delegateParent\?\.repoSessionId/,
+    'validated parent webchat peerId or parent delegate repo binding must be passed only as repoSessionId',
   )
   assert.doesNotMatch(
     handleDelegateTask,
@@ -87,13 +97,23 @@ test('stop interrupts active delegate children for the stopped parent session', 
   )
   assert.match(
     SERVER_TS,
-    /private\s+_interruptDelegationsForParent\(/,
-    'gateway must expose a helper to interrupt active delegate children',
+    /private\s+_interruptDelegationsForParent\([\s\S]*visited = new Set<string>/,
+    'gateway must expose a recursive helper to interrupt active delegate children',
   )
   assert.match(
     handleDelegateTask,
-    /const\s+unregisterDelegation\s*=\s*this\._registerActiveDelegation\([\s\S]*progressTarget\?\.sessionKey[\s\S]*sessionKey[\s\S]*\)/,
-    'validated webchat parent delegates must be registered while submit is in flight',
+    /const\s+delegateParent\s*=\s*this\._resolveDelegateParent/,
+    'delegate runs must resolve a parent session key and repo binding separately from webchat progress',
+  )
+  assert.match(
+    SERVER_TS,
+    /parent\.channel !== 'webchat' && parent\.channel !== 'delegate'/,
+    'nested delegate children must be allowed to register under delegate parent sessions',
+  )
+  assert.match(
+    handleDelegateTask,
+    /const\s+unregisterDelegation\s*=\s*this\._registerActiveDelegation\([\s\S]*delegateParent\?\.sessionKey[\s\S]*sessionKey[\s\S]*\)/,
+    'validated parent delegates must be registered while submit is in flight',
   )
   assert.match(
     handleDelegateTask,
@@ -111,8 +131,53 @@ test('stop interrupts active delegate children for the stopped parent session', 
     'direct stop must propagate stop to child delegates',
   )
   assert.match(
+    SERVER_TS,
+    /this\._interruptDelegationsForParent\(childSessionKey, visited\)/,
+    'delegate stop must recurse into descendant delegate sessions',
+  )
+  assert.match(
     handleStop,
     /const\s+ok\s*=\s*selfInterrupted\s*\|\|\s*delegateInterrupted/,
     'stop should report success when either parent or child delegate was interrupted',
+  )
+})
+
+test('delegate toolset restrictions are intersected with target agent ceiling', () => {
+  assert.match(
+    SERVER_TS,
+    /function\s+effectiveDelegateToolsets\(/,
+    'gateway must use a helper for delegate toolset intersection',
+  )
+  assert.match(
+    SERVER_TS,
+    /targetAgent\.toolsets[\s\S]*this\.deps\.config\.defaults\.toolsets/,
+    'delegate toolset ceiling must use target agent toolsets or global config defaults',
+  )
+  assert.match(
+    SERVER_TS,
+    /requested\.filter\(\(toolset\) => ceiling\.includes\(toolset\)\)/,
+    'requested delegate toolsets must be intersected with the target ceiling',
+  )
+  assert.match(
+    SERVER_TS,
+    /delegate toolsets not allowed for agent/,
+    'empty delegate toolset intersection must be rejected instead of falling back to all tools',
+  )
+  assert.doesNotMatch(
+    handleDelegateTask,
+    /toolsets \? \{ \.\.\.targetAgent, toolsets \} : targetAgent/,
+    'delegate toolsets must not blindly replace target agent configuration',
+  )
+})
+
+test('delegate admission has a best-effort cgroup memory pressure guard', () => {
+  assert.match(SERVER_TS, /OPENCLAUDE_DELEGATE_MEMORY_PRESSURE_RATIO/)
+  assert.match(SERVER_TS, /DELEGATE_MEMORY_PRESSURE_DEFAULT_RATIO\s*=\s*0\.85/)
+  assert.match(SERVER_TS, /\/sys\/fs\/cgroup\/memory\.current/)
+  assert.match(SERVER_TS, /\/sys\/fs\/cgroup\/memory\.max/)
+  assert.match(handleDelegateTask, /readDelegateMemoryPressure\(\)/)
+  assert.match(
+    handleDelegateTask,
+    /this\.sendError\(\s*res,\s*503,[\s\S]*delegate resource pressure/,
   )
 })

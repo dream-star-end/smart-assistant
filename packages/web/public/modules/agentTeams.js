@@ -146,7 +146,7 @@ const TEAM_TEMPLATES = [
           '从正确性、回归风险、安全边界、测试覆盖和过度工程角度审查。区分阻塞问题和非阻塞建议，避免提出与需求无关的范围扩张。',
       },
     ],
-    policy: { maxParallel: 3, requireReview: true, reviewAgentId: 'reviewer' },
+    policy: { maxParallel: 2, requireReview: true, reviewAgentId: 'reviewer' },
     badge: '编程',
   },
 ]
@@ -542,7 +542,7 @@ export function openTeamEditor(teamId = '') {
   $('team-leader-prompt').value = team?.leaderPrompt || ''
   _fillAgentSelect($('team-leader'), team?.leaderAgentId)
   $('team-members').value = _membersToText(team?.members || [])
-  $('team-max-parallel').value = String(team?.policy?.maxParallel || 3)
+  $('team-max-parallel').value = String(_effectiveMaxParallel(team?.policy?.maxParallel))
   $('team-require-review').checked = Boolean(team?.policy?.requireReview)
   _fillAgentSelect($('team-review-agent'), team?.policy?.reviewAgentId || '')
   $('team-delete-btn').hidden = !team
@@ -558,7 +558,7 @@ function _openTemplate(template) {
   $('team-leader-prompt').value = template.leaderPrompt || ''
   _fillAgentSelect($('team-leader'), template.leaderAgentId)
   $('team-members').value = _membersToText(template.members)
-  $('team-max-parallel').value = String(template.policy?.maxParallel || 3)
+  $('team-max-parallel').value = String(_effectiveMaxParallel(template.policy?.maxParallel))
   $('team-require-review').checked = Boolean(template.policy?.requireReview)
   _fillAgentSelect($('team-review-agent'), template.policy?.reviewAgentId || '')
   if (missing.length > 0) {
@@ -589,7 +589,7 @@ async function _saveTeamEditor() {
     leaderPrompt: $('team-leader-prompt').value.trim() || undefined,
     members: _parseMembers($('team-members').value),
     policy: {
-      maxParallel: Number($('team-max-parallel').value || 3),
+      maxParallel: _effectiveMaxParallel(Number($('team-max-parallel').value || 2)),
       requireReview: $('team-require-review').checked,
       reviewAgentId: $('team-review-agent').value || undefined,
     },
