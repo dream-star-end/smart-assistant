@@ -3,11 +3,11 @@
 // 走 POST /api/uploads → 服务端 sha256-named 落盘 → 拿到 url。message 里只存 url 引用。
 // Text 仍按阈值二分:≤64KB 内联为 kind:'text'(走 buildMessageText),>64KB 重分类为
 // 'file' 同样上传。任何 _media[i].base64 字段都不应再产生。
-import { notifyAuthExpired, silentRefresh } from './api.js?v=17c56e6d'
-import { $ } from './dom.js?v=17c56e6d'
-import { state } from './state.js?v=17c56e6d'
-import { toast } from './ui.js?v=17c56e6d'
-import { _basename, formatSize } from './util.js?v=17c56e6d'
+import { notifyAuthExpired, silentRefresh } from './api.js?v=3995b71a'
+import { $ } from './dom.js?v=3995b71a'
+import { state } from './state.js?v=3995b71a'
+import { toast } from './ui.js?v=3995b71a'
+import { _basename, formatSize } from './util.js?v=3995b71a'
 
 // 与 gateway server.ts 的 MAX_UPLOAD_SINGLE / MAX_UPLOAD_TOTAL 对齐。
 // 单文件 100MB,会话内总附件预算 300MB(服务端 dispatchInbound 也按这个聚合校验)。
