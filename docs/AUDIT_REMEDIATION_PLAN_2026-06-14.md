@@ -29,7 +29,7 @@
 
 | ID | 任务 | 类别 | 严重度 | 价值优先级 | 执行波次 | 易用性影响 | 状态 |
 |----|------|------|--------|-----------|---------|-----------|------|
-| **A2** | egress fail-closed 泛化到 Claude 聊天+刷新 | 安全/架构 | P0 | 1 | **W1** | 无（后端） | ⬜ 计划中 |
+| **A2** | egress fail-closed 泛化到 Claude 聊天+刷新 | 安全/架构 | P0 | 1 | **W1** | 无（后端） | ✅ Codex PASS, 已 commit (worktree) |
 | U1 | `makeDisclosure` 折叠组件 a11y | UI | P1 | 6 | W1 | ↑ 提升 | ⬜ |
 | U3 | `confirmDialog` 替换 12 处原生 confirm | UI | P2 | 8 | W1 | ↑ 提升 | ⬜ |
 | U5 | escape helper 去重 + wechat.js:113 转义 | 安全/质量 | P2/P3 | 12 | W1 | 无 | ⬜ |
@@ -140,4 +140,15 @@
 
 ## 4. 进度日志（每项完成后追加：日期 / commit / Codex 结论 / 验证结论）
 
-- 2026-06-14：创建 worktree `chore/audit-remediation`、本计划文档。下一步：A2 实现计划 → Codex 计划审。
+- 2026-06-14：创建 worktree `chore/audit-remediation`、本计划文档。
+- 2026-06-14：**A2 完成**（commit `aaef2c02`）。Codex 双审 PASS（计划 v3 PASS → 代码 PASS）。
+  - 根因：`getDispatcherForAccount` 的 undefined 语义重载（未绑 vs 已绑解析失败）。
+  - 改法：绑定权威源 `egress_proxy_id`/`egress_host_uuid` 贯通 AccountToken→PickResult；
+    新增 `resolveAccountEgressDispatcher` 优先级状态机；chat 路径已绑但解析失败 → fail-closed
+    (release transient_network + pool_unavailable 503 + 独立 metric label)。
+  - 验证：tsc src 0 错（测试文件预存错误已对比 canonical 确认无新增）；biome 0 新增；
+    egressDispatcher+proxyUpstream 单测 80/80 通过。
+  - 关键复审收获：Codex 抓出 ① 仅按已解析 egress 判定会漏掉"proxy 被 disabled"这个最常见泄露
+    场景（必须用权威源列）② proxy 失败不能回落 mTLS host（IP 分叉）③ refresh rebind 丢字段。
+  - **未部署**：等 boss 批准后按 v3-commercial-deploy 合并 canonical + deploy-v3.sh。
+- 下一步：W1 剩余项（U1 折叠 a11y / U3 confirmDialog / U4 对比度 / U5 escape 去重）。
