@@ -30,10 +30,10 @@
 | ID | 任务 | 类别 | 严重度 | 价值优先级 | 执行波次 | 易用性影响 | 状态 |
 |----|------|------|--------|-----------|---------|-----------|------|
 | **A2** | egress fail-closed 泛化到 Claude 聊天+刷新 | 安全/架构 | P0 | 1 | **W1** | 无（后端） | ✅ Codex PASS, 已 commit (worktree) |
-| U1 | `makeDisclosure` 折叠组件 a11y | UI | P1 | 6 | W1 | ↑ 提升 | ⬜ |
-| U3 | `confirmDialog` 替换 12 处原生 confirm | UI | P2 | 8 | W1 | ↑ 提升 | ⬜ |
-| U5 | escape helper 去重 + wechat.js:113 转义 | 安全/质量 | P2/P3 | 12 | W1 | 无 | ⬜ |
-| U4 | `--fg-dim` 对比度达 WCAG AA | UI | P2 | 9 | W1 | ↑ 提升 | ⬜ |
+| U1 | `makeDisclosure` 折叠组件 a11y | UI | P1 | 6 | W1 | ↑ 提升 | ✅ Codex PASS, commit `753633b3` |
+| U3 | `confirmDialog` 替换 12 处原生 confirm | UI | P2 | 8 | W1 | ↑ 提升 | ✅ Codex PASS, commit `3ad5b96f` |
+| U5 | escape helper 去重 + wechat.js:113 转义 | 安全/质量 | P2/P3 | 12 | W1 | 无 | ✅ Codex PASS, commit `62ac2835` |
+| U4 | `--fg-dim` 对比度达 WCAG AA | UI | P2 | 9 | W1 | ↑ 提升 | ✅ Codex PASS, commit `1d431a06` |
 | B1 | `request_finalize_journal` 对账器+GC | 资金 | P1 | 4 | W2 | 无 | ⬜ |
 | B2 | admin 路由层声明式鉴权 | 安全 | P1 | 5 | W2 | 无 | ⬜ |
 | B3 | codex disable drift reconciler | 安全 | P1 | 5 | W2 | 无 | ⬜ |
@@ -151,4 +151,10 @@
   - 关键复审收获：Codex 抓出 ① 仅按已解析 egress 判定会漏掉"proxy 被 disabled"这个最常见泄露
     场景（必须用权威源列）② proxy 失败不能回落 mTLS host（IP 分叉）③ refresh rebind 丢字段。
   - **未部署**：等 boss 批准后按 v3-commercial-deploy 合并 canonical + deploy-v3.sh。
-- 下一步：W1 剩余项（U1 折叠 a11y / U3 confirmDialog / U4 对比度 / U5 escape 去重）。
+- 2026-06-14：**W1 全部完成**（A2 + U5 `62ac2835` + U1 `753633b3` + U3 `3ad5b96f` + U4 `1d431a06`），逐项 Codex 计划审+代码审 PASS。
+  - U5：转义原语单一来源（admin 保留 null-guard 包装），wechat status 转义。
+  - U1：`makeDisclosure`（role/tabindex/aria-expanded/键盘），4 处折叠卡；含 tool-card 重渲染 aria 同步 + inset 焦点环（overflow:hidden 裁外环）。
+  - U3：`confirmDialog`（Promise，复用 modal+焦点陷阱，capture 阶段 Escape 防嵌套双关，串行化），替换 12 处 confirm + 收编 modelPicker confirmExitTeam。
+  - U4：`--fg-dim` 提对比度达 AA（--bg/elevated/subtle），raised/tinted 次要文字降级 --fg-muted。
+  - 验证：全程 node --check + biome 0 新增 + test:web 993/993；前端 cache-bust 由 deploy-v3.sh 自动处理。
+- 下一步：**W2 后端安全/资金**（B1 finalize journal 对账器 / B2 admin 路由声明式鉴权 / B3 codex disable drift / B4 node-agent 真 404 / A3 host 吊销+B8 / B5 只读 admin verify-db）。
