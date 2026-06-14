@@ -6,7 +6,7 @@
 //   - 多 Agent: select a saved team; sendMessage routes through the team leader.
 
 import { apiJson } from './api.js?v=0c9e5665'
-import { $ } from './dom.js?v=0c9e5665'
+import { $, htmlSafeEscape } from './dom.js?v=0c9e5665'
 import { renderModePills } from './effortMode.js?v=0c9e5665'
 import { openPersonaEditor } from './agents.js?v=0c9e5665'
 import {
@@ -62,12 +62,6 @@ function modelDisplayName(modelId) {
 function agentLabel(agent) {
   if (!agent) return '默认 Agent'
   return `${agent.avatarEmoji ? `${agent.avatarEmoji} ` : ''}${agent.displayName || agent.id}`
-}
-
-function escapeHtml(s) {
-  return String(s).replace(/[&<>"']/g, (c) => ({
-    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
-  })[c])
 }
 
 const TEAM_CONFIRM_MODAL_ID = 'model-team-confirm-modal'
@@ -267,7 +261,7 @@ function closeMenu(returnFocusToTrigger = true) {
 function section(title, hint) {
   const el = document.createElement('div')
   el.className = 'target-menu-section'
-  el.innerHTML = `<div class="target-menu-section-title">${escapeHtml(title)}</div><div class="target-menu-section-hint">${escapeHtml(hint)}</div>`
+  el.innerHTML = `<div class="target-menu-section-title">${htmlSafeEscape(title)}</div><div class="target-menu-section-hint">${htmlSafeEscape(hint)}</div>`
   return el
 }
 
@@ -283,11 +277,11 @@ function optionButton({ type, id, title, hint, meta, selected, icon = '🤖' }) 
   btn.setAttribute('aria-selected', selected ? 'true' : 'false')
   if (selected) btn.classList.add('effort-menu-item--selected', 'target-menu-item--selected')
   btn.innerHTML = `
-    <span class="target-menu-icon" aria-hidden="true">${escapeHtml(icon)}</span>
+    <span class="target-menu-icon" aria-hidden="true">${htmlSafeEscape(icon)}</span>
     <span class="target-menu-copy">
-      <span class="effort-menu-label">${escapeHtml(title)}</span>
-      <span class="effort-menu-hint">${escapeHtml(hint || '')}</span>
-      ${meta ? `<span class="target-menu-meta">${escapeHtml(meta)}</span>` : ''}
+      <span class="effort-menu-label">${htmlSafeEscape(title)}</span>
+      <span class="effort-menu-hint">${htmlSafeEscape(hint || '')}</span>
+      ${meta ? `<span class="target-menu-meta">${htmlSafeEscape(meta)}</span>` : ''}
     </span>`
   return btn
 }

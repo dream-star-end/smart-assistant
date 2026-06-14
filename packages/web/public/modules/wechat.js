@@ -16,7 +16,7 @@
 // handshake, so we never leave the page with that value.
 
 import { apiGet, apiJson } from './api.js?v=0c9e5665'
-import { $ } from './dom.js?v=0c9e5665'
+import { $, htmlSafeEscape } from './dom.js?v=0c9e5665'
 import { closeModal, openModal, toast } from './ui.js?v=0c9e5665'
 import { loadUserPrefs, setCachedPrefField } from './userPrefs.js?v=0c9e5665'
 
@@ -110,7 +110,7 @@ async function loadBinding() {
         ? ` <span style="color:var(--warning, #f59e0b);margin-left:8px">· 通道启动中,稍后自动刷新</span>`
         : ` <span style="color:var(--danger, #ef4444);margin-left:8px">· 通道未启用,消息收不到</span>`
       : ''
-    $('wechat-status').innerHTML = `<span style="color:${statusColor}">${binding.status}</span>` +
+    $('wechat-status').innerHTML = `<span style="color:${statusColor}">${htmlSafeEscape(binding.status)}</span>` +
       (binding.lastEventAt ? ` · 最近消息 ${new Date(binding.lastEventAt).toLocaleString()}` : '') +
       workerWarn
     showState('bound')

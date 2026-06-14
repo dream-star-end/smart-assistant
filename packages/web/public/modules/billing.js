@@ -34,7 +34,7 @@
 //                          返回 Promise<{ shown: boolean, credits: string|null }>
 
 import { apiGet, apiJson } from './api.js?v=0c9e5665'
-import { _isMobileUA } from './dom.js?v=0c9e5665'
+import { _isMobileUA, htmlSafeEscape } from './dom.js?v=0c9e5665'
 import { closeModal, openModal, toast } from './ui.js?v=0c9e5665'
 import { state } from './state.js?v=0c9e5665'
 
@@ -292,7 +292,7 @@ async function _loadPlans() {
       // 积分口径下始终展示「到账 X 积分」,让用户看到面值等价关系(¥10 → 1,000 积分)。
       const bonusHtml = `<div class="plan-card-bonus">到账 ${credits}</div>`
       card.innerHTML = `
-        <div class="plan-card-label">${_escape(String(p.label || p.code || ''))}</div>
+        <div class="plan-card-label">${htmlSafeEscape(String(p.label || p.code || ''))}</div>
         <div class="plan-card-price">${amount}</div>
         ${bonusHtml}
       `
@@ -300,19 +300,13 @@ async function _loadPlans() {
       wrap.appendChild(card)
     }
   } catch (err) {
-    wrap.innerHTML = `<div class="topup-error">加载失败: ${_escape(String(err?.message || err))}</div>`
+    wrap.innerHTML = `<div class="topup-error">加载失败: ${htmlSafeEscape(String(err?.message || err))}</div>`
   }
-}
-
-function _escape(s) {
-  return String(s).replace(/[&<>"']/g, (c) => (
-    { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
-  ))
 }
 
 function _friendlyPaymentError(err) {
   const code = err?.code || err?.error?.code
-  const req = err?.requestId ? `（请求 ${_escape(err.requestId)}）` : ''
+  const req = err?.requestId ? `（请求 ${htmlSafeEscape(err.requestId)}）` : ''
   if (code === 'FIRST_TOPUP_USED') return `首充优惠已使用，请选择其他套餐${req}`
   if (code === 'PLAN_NOT_FOUND') return `套餐不存在或已下架，请返回重新选择${req}`
   if (code === 'PAYMENT_NOT_READY') return `支付通道暂不可用，请稍后重试或联系管理员${req}`
@@ -348,7 +342,7 @@ async function _onPlanSelected(plan) {
     const amt = formatYuan(data.amount_cents)
     const got = formatCredits(data.credits)
     // 订单摘要:付款金额 ¥ 仍保留(微信支付需要让用户知道实际扣款),到账换成积分口径。
-    orderInfo.innerHTML = `<strong>${_escape(plan.label || plan.code)}</strong> · 支付 ${_escape(amt)} <span class="topup-bonus">(到账 ${_escape(got)})</span> · 订单号 <code>${_escape(data.order_no)}</code>`
+    orderInfo.innerHTML = `<strong>${htmlSafeEscape(plan.label || plan.code)}</strong> · 支付 ${htmlSafeEscape(amt)} <span class="topup-bonus">(到账 ${htmlSafeEscape(got)})</span> · 订单号 <code>${htmlSafeEscape(data.order_no)}</code>`
   }
 
   // 分支:手机 UA 且后端给了合法 mobile_url → 持久化订单状态到 sessionStorage,
@@ -525,7 +519,7 @@ async function _pollOnce(orderNo) {
       _activeOrderNo = null
       _setPollStatusHtml(
         `订单${status === 'expired' ? '已过期' : status === 'canceled' ? '已取消' : '已退款'}，请返回重新选择套餐。` +
-        `<br><span class="muted">如果微信/支付宝已扣款，请复制订单号 <code>${_escape(orderNo)}</code> 联系客服核对。</span>`,
+        `<br><span class="muted">如果微信/支付宝已扣款，请复制订单号 <code>${htmlSafeEscape(orderNo)}</code> 联系客服核对。</span>`,
       )
       return
     }
@@ -535,7 +529,7 @@ async function _pollOnce(orderNo) {
     if (_pollFailures >= POLL_MAX_FAILURES) {
       _startSlowPolling(orderNo)
       _setPollStatusHtml(
-        `查询订单暂时失败，已改为慢速重试。订单号 <code>${_escape(orderNo)}</code>` +
+        `查询订单暂时失败，已改为慢速重试。订单号 <code>${htmlSafeEscape(orderNo)}</code>` +
         ` <button type="button" id="topup-retry-poll-btn" class="btn btn-secondary btn-sm">重新查询</button>` +
         `<br><span class="muted">如果已付款但未到账，请复制订单号联系客服。</span>`,
       )
@@ -554,7 +548,7 @@ function _onOrderPaid(orderData) {
   const el = $('topup-done-summary')
   if (el) {
     const got = formatCredits(orderData.credits)
-    el.innerHTML = `支付成功!积分已增加 <strong>${_escape(got)}</strong>`
+    el.innerHTML = `支付成功!积分已增加 <strong>${htmlSafeEscape(got)}</strong>`
   }
   refreshBalance().catch(() => {})
   try {

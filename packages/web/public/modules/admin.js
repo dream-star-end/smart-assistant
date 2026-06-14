@@ -10,13 +10,15 @@
 // 与 SPA(/index.html)分离:
 //   - 不跑 service worker(<link rel="serviceworker"> 没注册)
 //   - 复用 state.js + api.js(共享 access token 与 silent refresh 逻辑)
-//   - 自带 CSS + 极简 toast/modal,不依赖 SPA 的 dom.js / theme.js
+//   - 自带 CSS + 极简 toast/modal,不依赖 SPA 的 theme.js
+//   - 仅从 dom.js 复用 htmlSafeEscape(单一来源的 XSS 转义原语,见下方 escapeHtml 包装)
 //
 // 安全:
 //   - 任何 list 接口 4xx → 提示 + 跳转 /;不要在 admin 页面里"匿名展示空列表"
 //   - PATCH/DELETE 操作前必须有 confirm 提示
 
 import { _clearStoredAccessToken, state } from './state.js?v=0c9e5665'
+import { htmlSafeEscape } from './dom.js?v=0c9e5665'
 import { apiGet, apiJson, apiText, apiFetch, authHeaders, onAuthExpired, silentRefresh } from './api.js?v=0c9e5665'
 import { lineChart, barChart, destroyChart, fmt as cfmt } from './charts.js?v=0c9e5665'
 
@@ -46,11 +48,11 @@ const LEDGER_CHANNEL_LABELS = {
 const $ = (id) => document.getElementById(id)
 const view = () => $('view')
 
+// 单一来源:转义正则/映射只存在于 dom.js 的 htmlSafeEscape。这里仅保留 admin 的
+// null/undefined → '' 便利语义(避免渲染 "null"/"undefined"),417 处调用点与行为不变。
+// 用 function 声明保留 hoisting(调用点可能在定义之前)。
 function escapeHtml(s) {
-  if (s == null) return ''
-  return String(s).replace(/[&<>"']/g, (c) => (
-    { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
-  ))
+  return s == null ? '' : htmlSafeEscape(s)
 }
 
 function fmtCents(cents) {
