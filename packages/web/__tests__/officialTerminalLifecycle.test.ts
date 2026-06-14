@@ -238,13 +238,54 @@ describe('official Claude terminal lifecycle', () => {
     assert.match(hideSrc, /hideTerminalContextMenu\(\)/)
   })
 
-  it('cache-busts terminal module when changing mobile controls', () => {
-    assert.match(MAIN, /from '\.\/officialTerminal\.js\?v=13'/)
-    assert.match(SW, /\/modules\/officialTerminal\.js\?v=13/)
-    assert.match(INDEX, /\/modules\/main\.js\?v=66/)
-    assert.match(INDEX, /\/style\.css\?v=55/)
+  it('cache-busts terminal assets consistently across index/sw/main', () => {
+    assert.match(MAIN, /from '\.\/officialTerminal\.js\?v=14'/)
+    assert.match(SW, /\/modules\/officialTerminal\.js\?v=14/)
+    assert.match(INDEX, /\/modules\/main\.js\?v=67/)
+    assert.match(INDEX, /\/style\.css\?v=56/)
     assert.match(INDEX, /sw-flush-v23/)
-    assert.match(SW, /openclaude-v86/)
+    assert.match(SW, /openclaude-v87/)
+  })
+
+  it('caches xterm selection (TTL + consume + new-interaction bounded) so TUI redraws do not drop copy', () => {
+    // 选区一出现就缓存，复制兜底用缓存，TTL/消费/dispose 三重边界防陈旧。
+    assert.match(SRC, /onSelectionChange\?\.\(/)
+    assert.match(SRC, /lastTerminalSelection\s*=\s*selected/)
+    const selSrc = extractFunction(SRC, 'cachedTerminalSelection')
+    assert.match(selSrc, /TERMINAL_SELECTION_CACHE_TTL_MS/)
+    const copySrc = extractFunction(SRC, 'copyTerminalContent')
+    assert.match(copySrc, /clearTerminalSelectionCache\(\)/)
+    const disposeSrc = extractFunction(SRC, 'disposeTerminal')
+    assert.match(disposeSrc, /clearTerminalSelectionCache\(\)/)
+  })
+
+  it('drag/paste auto-uploads and writes the resulting path into the terminal input', () => {
+    const dropSrc = extractFunction(SRC, 'handleTerminalDrop')
+    assert.match(dropSrc, /insertPaths:\s*true/)
+    const pasteSrc = extractFunction(SRC, 'handleTerminalPaste')
+    assert.match(pasteSrc, /insertPaths:\s*true/)
+    // 粘贴兼容 clipboardData.items 的截图，而不仅是 .files
+    const clipSrc = extractFunction(SRC, 'clipboardFilesFromEvent')
+    assert.match(clipSrc, /clipboardData\?\.items/)
+    // 手动上传仍不写路径（保留原 uploads 面板行为）
+    const upSrc = extractFunction(SRC, 'uploadTerminalFiles')
+    assert.match(upSrc, /insertPaths\s*=\s*false/)
+    assert.match(upSrc, /if \(insertPaths && path\) pasteTerminalFilePath\(path\)/)
+  })
+
+  it('re-fits terminal after web fonts load so the last row is not clipped', () => {
+    const attachSrc = extractFunction(SRC, 'attachTerminal')
+    assert.match(attachSrc, /document\.fonts\?\.ready/)
+    assert.match(attachSrc, /fitTerminal\(\)/)
+  })
+
+  it('positions the sessions menu inside the viewport on both desktop and mobile', () => {
+    // 桌面贴右缘向左展开，移动端覆盖回贴左缘；都限宽视口内。
+    assert.match(STYLE, /\.claude-terminal-sessions-menu\s*\{[^}]*right:\s*0/)
+    assert.match(
+      STYLE,
+      /\.claude-terminal-sessions-menu\s*\{[^}]*width:\s*min\(340px,\s*calc\(100vw/,
+    )
   })
 
   it('terminal files live in a separate wide modal with Escape closing files first', () => {
