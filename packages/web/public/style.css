@@ -6,6 +6,10 @@
     "Segoe UI", Roboto, sans-serif;
   --font-mono: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, Monaco, Consolas, monospace;
   --font-serif: "Source Serif Pro", "Noto Serif SC", ui-serif, Georgia, serif;
+  /* Mobile keyboard/layout fallback.
+     JS overwrites this with visualViewport.height on old Android where 100dvh
+     either is unsupported or does not shrink when the IME overlays the page. */
+  --oc-visual-viewport-height: 100vh;
 
   --text-xs: 11px;
   --text-sm: 12.5px;
@@ -38,6 +42,11 @@
   --transition-base: 180ms cubic-bezier(0.4, 0, 0.2, 1);
   --transition-slow: 280ms cubic-bezier(0.4, 0, 0.2, 1);
   --ease-spring: cubic-bezier(0.34, 1.56, 0.64, 1);
+}
+@supports (height: 100dvh) {
+  :root {
+    --oc-visual-viewport-height: 100dvh;
+  }
 }
 
 /* ────── Dark theme (warm, not pure black) ────── */
@@ -172,7 +181,9 @@ html,
 body {
   margin: 0;
   height: 100%;
+  height: 100vh;
   height: 100dvh;
+  height: var(--oc-visual-viewport-height, 100dvh);
   overscroll-behavior: none;
   -webkit-text-size-adjust: 100%;
 }
@@ -1196,7 +1207,9 @@ a:hover {
 .app {
   display: grid;
   grid-template-columns: 272px 1fr;
+  height: 100vh;
   height: 100dvh;
+  height: var(--oc-visual-viewport-height, 100dvh);
 }
 .sidebar-backdrop {
   display: none;
@@ -6498,6 +6511,7 @@ body.voice-overlay-open {
 body.body-landing {
   overflow: auto;
   height: auto;
+  min-height: 100vh;
   min-height: 100dvh;
 }
 .landing {

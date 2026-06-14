@@ -312,6 +312,41 @@ window.addEventListener('focus', () => {
 window.addEventListener('blur', () => {
   state.windowFocused = false
 })
+
+// ── Mobile visual viewport height ─────────────────────────────────
+// Old Android browsers can keep 100vh/100dvh tied to the layout viewport while
+// the virtual keyboard overlays the visual viewport. The chat SPA has body
+// overflow hidden and a bottom composer in flex flow, so the composer can land
+// behind the keyboard and the user cannot tap Send. Keep the app shell height
+// synced to the visible viewport when the browser exposes it; CSS keeps pure
+// 100vh/100dvh fallbacks for browsers that do not.
+let _visualViewportRaf = 0
+function _getVisibleViewportHeight() {
+  const vv = window.visualViewport
+  const raw = vv?.height || window.innerHeight || document.documentElement.clientHeight || 0
+  return Number.isFinite(raw) && raw > 0 ? raw : 0
+}
+function _syncVisualViewportHeight() {
+  if (_visualViewportRaf) return
+  _visualViewportRaf = requestAnimationFrame(() => {
+    _visualViewportRaf = 0
+    const height = _getVisibleViewportHeight()
+    if (height > 0) {
+      document.documentElement.style.setProperty('--oc-visual-viewport-height', `${Math.round(height)}px`)
+    }
+    autoResize()
+  })
+}
+function _initVisualViewportHeightSync() {
+  _syncVisualViewportHeight()
+  const opts = { passive: true }
+  window.visualViewport?.addEventListener('resize', _syncVisualViewportHeight, opts)
+  window.visualViewport?.addEventListener('scroll', _syncVisualViewportHeight, opts)
+  window.addEventListener('resize', _syncVisualViewportHeight, opts)
+  window.addEventListener('orientationchange', _syncVisualViewportHeight)
+  $('input')?.addEventListener('focus', _syncVisualViewportHeight)
+  $('input')?.addEventListener('blur', () => setTimeout(_syncVisualViewportHeight, 120))
+}
 // Flush pending saves before page unload to prevent data loss on refresh.
 // iOS Safari + modern Chromium bfcache don't fire beforeunload reliably,
 // so we also hook pagehide (which IS fired under bfcache) and
@@ -1412,8 +1447,10 @@ function send() {
 // ── autoResize ──
 function autoResize() {
   const el = $('input')
+  if (el.getClientRects().length === 0) return
   el.style.height = 'auto'
-  el.style.height = `${Math.min(window.innerHeight * 0.35, el.scrollHeight)}px`
+  const viewportHeight = _getVisibleViewportHeight() || window.innerHeight
+  el.style.height = `${Math.min(viewportHeight * 0.35, el.scrollHeight)}px`
 }
 
 // ═══════════════ COMMAND PALETTE ═══════════════
@@ -2835,6 +2872,7 @@ async function runExistingSessionBootPipeline() {
 // ═══════════════════════════════════════════════════════════
 
 async function init() {
+  _initVisualViewportHeightSync()
   // Global retry-once for <img>/<audio>/<video> that 401 before the session
   // cookie handshake lands (e.g. the cookie fetch was slow on first boot).
   _installMediaErrorRetry()
