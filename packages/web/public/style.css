@@ -4831,10 +4831,12 @@ body.voice-overlay-open {
   position: absolute;
   z-index: 280;
   top: calc(100% + 6px);
-  left: 0;
+  /* 动作簇在桌面右对齐，菜单贴按钮右缘向左展开，避免溢出视口右边。移动端见下方覆盖。 */
+  right: 0;
+  left: auto;
   display: flex;
   flex-direction: column;
-  width: min(340px, 86vw);
+  width: min(340px, calc(100vw - var(--space-6)));
   max-height: min(420px, 60vh);
   padding: var(--space-1);
   border: 1px solid var(--border);
@@ -4842,7 +4844,7 @@ body.voice-overlay-open {
   background: var(--bg-elevated);
   box-shadow: var(--shadow-lg);
   overflow: hidden;
-  transform-origin: top left;
+  transform-origin: top right;
   animation: saveMenuIn var(--transition-base);
 }
 .claude-terminal-sessions-menu[hidden] {
@@ -5357,6 +5359,13 @@ body.voice-overlay-open {
     min-height: 26px;
     padding: 3px 10px 3px 9px;
     font-size: var(--text-xs);
+  }
+  /* 窄屏动作簇左对齐，菜单改为贴按钮左缘向右展开并限宽在视口内。 */
+  .claude-terminal-sessions-menu {
+    right: auto;
+    left: 0;
+    width: min(340px, calc(100vw - var(--space-6)));
+    transform-origin: top left;
   }
   .claude-terminal-hint {
     font-size: var(--text-xs);
