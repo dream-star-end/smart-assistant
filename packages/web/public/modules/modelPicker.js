@@ -17,7 +17,7 @@ import {
   teamDisplayPrefix,
 } from './agentTeams.js?v=0c9e5665'
 import { getSession, state } from './state.js?v=0c9e5665'
-import { closeModal, openModal, toast, toastOptsFromError } from './ui.js?v=0c9e5665'
+import { openModal, toast, toastOptsFromError, confirmDialog } from './ui.js?v=0c9e5665'
 import { getEnabledModels, setCachedPrefField } from './userPrefs.js?v=0c9e5665'
 import { getEffectiveSingleAgentModel } from './modelPolicy.js?v=0c9e5665'
 
@@ -64,69 +64,13 @@ function agentLabel(agent) {
   return `${agent.avatarEmoji ? `${agent.avatarEmoji} ` : ''}${agent.displayName || agent.id}`
 }
 
-const TEAM_CONFIRM_MODAL_ID = 'model-team-confirm-modal'
-
-function ensureTeamConfirmModal() {
-  let modal = document.querySelector(`#${TEAM_CONFIRM_MODAL_ID}`)
-  if (modal) return modal
-  modal = document.createElement('div')
-  modal.id = TEAM_CONFIRM_MODAL_ID
-  modal.className = 'modal-backdrop'
-  modal.setAttribute('role', 'dialog')
-  modal.setAttribute('aria-modal', 'true')
-  modal.innerHTML = `
-    <div class="modal settings-modal" style="max-width:420px">
-      <div class="modal-head">
-        <div class="modal-title-block">
-          <div class="modal-title-row"><span class="modal-icon" aria-hidden="true">👥</span><h3>退出团队模式?</h3></div>
-          <p class="modal-subtitle" id="model-team-confirm-text"></p>
-        </div>
-        <button class="modal-close" data-close-model-team-confirm aria-label="关闭">×</button>
-      </div>
-      <div class="modal-foot">
-        <button class="btn btn-ghost" data-close-model-team-confirm>取消</button>
-        <button class="btn btn-primary" id="model-team-confirm-ok">继续切换</button>
-      </div>
-    </div>
-  `
-  document.body.appendChild(modal)
-  for (const b of modal.querySelectorAll('[data-close-model-team-confirm]')) {
-    b.addEventListener('click', () => closeModal(TEAM_CONFIRM_MODAL_ID))
-  }
-  return modal
-}
-
+// 退出团队模式确认 —— 委派给共享 confirmDialog(单一确认弹窗来源,U3)。
 function confirmExitTeam(teamLabel) {
-  return new Promise((resolve) => {
-    const modal = ensureTeamConfirmModal()
-    const text = modal.querySelector('#model-team-confirm-text')
-    if (text) {
-      text.textContent = `当前正在使用团队「${teamLabel}」。切换模型会退出团队模式，本次之后将只发送给单 Agent。`
-    }
-    const ok = modal.querySelector('#model-team-confirm-ok')
-    let settled = false
-    const cancelButtons = Array.from(modal.querySelectorAll('[data-close-model-team-confirm]'))
-    const finish = (value) => {
-      if (settled) return
-      settled = true
-      ok?.removeEventListener('click', onOk)
-      for (const b of cancelButtons) b.removeEventListener('click', onCancel)
-      modal.removeEventListener('click', onBackdrop)
-      document.removeEventListener('keydown', onKey, true)
-      closeModal(TEAM_CONFIRM_MODAL_ID)
-      resolve(value)
-    }
-    const onOk = () => finish(true)
-    const onCancel = () => finish(false)
-    const onBackdrop = (e) => { if (e.target === modal) finish(false) }
-    const onKey = (e) => {
-      if (e.key === 'Escape' && modal.classList.contains('open')) finish(false)
-    }
-    ok?.addEventListener('click', onOk, { once: true })
-    for (const b of cancelButtons) b.addEventListener('click', onCancel)
-    modal.addEventListener('click', onBackdrop)
-    document.addEventListener('keydown', onKey, true)
-    openModal(TEAM_CONFIRM_MODAL_ID)
+  return confirmDialog({
+    title: '退出团队模式?',
+    body: `当前正在使用团队「${teamLabel}」。切换模型会退出团队模式,本次之后将只发送给单 Agent。`,
+    confirmText: '继续切换',
+    icon: '👥',
   })
 }
 

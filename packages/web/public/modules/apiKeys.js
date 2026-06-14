@@ -15,7 +15,7 @@
 
 import { $ } from './dom.js?v=0c9e5665'
 import { apiGet, apiJson } from './api.js?v=0c9e5665'
-import { openModal, closeModal, toast, toastOptsFromError } from './ui.js?v=0c9e5665'
+import { openModal, closeModal, toast, toastOptsFromError, confirmDialog } from './ui.js?v=0c9e5665'
 import { shortTime } from './util.js?v=0c9e5665'
 
 let _wired = false
@@ -289,12 +289,15 @@ function _clearSecret() {
 // ── 撤销 ─────────────────────────────────────────────────────────────────
 
 async function _onRevoke(id, label) {
-  // confirm 文案里的 label 由 browser 原生 confirm 渲染,本身不解释 HTML
-  // 但若 label 含换行会破坏可读性;trim 一下保险。
+  // confirmDialog 用 textContent 渲染 body,不解释 HTML;label 仍 trim + 截断
+  // 避免换行/超长破坏弹窗可读性。
   const safeLabel = (label || '').replace(/\s+/g, ' ').slice(0, 60)
-  const ok = window.confirm(
-    `撤销 "${safeLabel}" 后该 key 立即失效,使用此 key 的客户端会立刻断连。确认撤销?`,
-  )
+  const ok = await confirmDialog({
+    title: '撤销 API Key?',
+    body: `撤销 "${safeLabel}" 后该 key 立即失效,使用此 key 的客户端会立刻断连。`,
+    confirmText: '撤销',
+    danger: true,
+  })
   if (!ok) return
   try {
     await apiJson('DELETE', `/api/me/api-keys/${encodeURIComponent(id)}`)

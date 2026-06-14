@@ -2,7 +2,7 @@ import { apiGet, apiJson } from './api.js?v=0c9e5665'
 // OpenClaude — Context Hub: Memory + Skills + Automation
 import { $, htmlSafeEscape } from './dom.js?v=0c9e5665'
 import { getSession, state } from './state.js?v=0c9e5665'
-import { openModal, toast, toastOptsFromError } from './ui.js?v=0c9e5665'
+import { confirmDialog, openModal, toast, toastOptsFromError } from './ui.js?v=0c9e5665'
 import { _cronHuman } from './util.js?v=0c9e5665'
 
 const MEMORY_DELIMITER = '\n§\n'
@@ -250,7 +250,16 @@ export async function switchContextHubTab(tab) {
 export async function loadMemoryTab(target, agentId) {
   _hubAgentId = _activeAgentId(agentId || _hubAgentId)
   const nextTarget = target === 'user' ? 'user' : 'memory'
-  if (nextTarget !== _memoryTarget && _memoryDirty && !confirm('当前记忆有未保存改动，切换会丢弃这些改动。继续切换？')) {
+  if (
+    nextTarget !== _memoryTarget &&
+    _memoryDirty &&
+    !(await confirmDialog({
+      title: '放弃未保存改动?',
+      body: '当前记忆有未保存改动,切换会丢弃这些改动。',
+      confirmText: '继续切换',
+      danger: true,
+    }))
+  ) {
     return
   }
   _syncMemoryEditorState()
@@ -486,10 +495,11 @@ async function _saveSkillEditor() {
 }
 
 async function _deleteSelectedSkill() {
-  if (!_selectedSkill) return
-  if (!confirm(`删除 skill "${_selectedSkill}"？`)) return
+  const skill = _selectedSkill
+  if (!skill) return
+  if (!(await confirmDialog({ title: '删除 Skill?', body: `删除 skill "${skill}"?`, confirmText: '删除', danger: true }))) return
   try {
-    await apiJson('DELETE', `/api/agents/${encodeURIComponent(_activeAgentId(_hubAgentId))}/skills/${encodeURIComponent(_selectedSkill)}`)
+    await apiJson('DELETE', `/api/agents/${encodeURIComponent(_activeAgentId(_hubAgentId))}/skills/${encodeURIComponent(skill)}`)
     toast('技能已删除')
     await _loadSkills()
   } catch (err) {
@@ -562,7 +572,7 @@ function _cronJobCard(job) {
   del.className = 'btn btn-ghost btn-sm danger-soft'
   del.textContent = '删除'
   del.addEventListener('click', async () => {
-    if (!confirm(`删除任务 "${job.label || job.id}"?`)) return
+    if (!(await confirmDialog({ title: '删除任务?', body: `删除任务 "${job.label || job.id}"?`, confirmText: '删除', danger: true }))) return
     try {
       await apiJson('DELETE', `/api/cron/${encodeURIComponent(job.id)}`)
       toast('已删除')

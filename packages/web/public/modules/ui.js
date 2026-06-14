@@ -138,6 +138,106 @@ export function closeModal(id) {
   }
 }
 
+// ── confirmDialog ────────────────────────────────────────────────────────
+// 可访问的应用内确认弹窗,替代原生 confirm()(原生弹窗无暗色/无焦点陷阱,且可被
+// 浏览器"阻止此页弹窗"压制 → 危险操作无确认直接执行)。返回 Promise<boolean>。
+// 复用 openModal/closeModal(焦点陷阱栈 + 焦点归还),内容用 textContent(无 XSS)。
+const _CONFIRM_MODAL_ID = 'oc-confirm-modal'
+let _confirmChain = Promise.resolve()
+
+function _ensureConfirmModal() {
+  let modal = $(_CONFIRM_MODAL_ID)
+  if (modal) return modal
+  modal = document.createElement('div')
+  modal.id = _CONFIRM_MODAL_ID
+  modal.className = 'modal-backdrop'
+  modal.setAttribute('role', 'dialog')
+  modal.setAttribute('aria-modal', 'true')
+  modal.setAttribute('aria-labelledby', 'oc-confirm-title')
+  modal.innerHTML = `
+    <div class="modal settings-modal" style="max-width:420px">
+      <div class="modal-head">
+        <div class="modal-title-block">
+          <div class="modal-title-row"><span class="modal-icon" aria-hidden="true" data-c-icon></span><h3 id="oc-confirm-title" data-c-title></h3></div>
+          <p class="modal-subtitle" id="oc-confirm-body" data-c-body></p>
+        </div>
+        <button class="modal-close" data-c-cancel aria-label="关闭">×</button>
+      </div>
+      <div class="modal-foot">
+        <button class="btn btn-ghost" data-c-cancel></button>
+        <button class="btn" data-c-ok></button>
+      </div>
+    </div>`
+  document.body.appendChild(modal)
+  return modal
+}
+
+export function confirmDialog(opts = {}) {
+  const {
+    title = '',
+    body = '',
+    confirmText = '确定',
+    cancelText = '取消',
+    danger = false,
+    icon = '',
+  } = opts
+  // 串行化:并发调用时排队,避免第二次 clobber 共享弹窗的内容/监听器。
+  const run = () =>
+    new Promise((resolve) => {
+      const modal = _ensureConfirmModal()
+      const iconEl = modal.querySelector('[data-c-icon]')
+      const titleEl = modal.querySelector('[data-c-title]')
+      const bodyEl = modal.querySelector('[data-c-body]')
+      const okBtn = modal.querySelector('[data-c-ok]')
+      const cancelBtns = Array.from(modal.querySelectorAll('[data-c-cancel]'))
+      const ghostCancel = modal.querySelector('.btn[data-c-cancel]')
+      iconEl.textContent = icon || ''
+      iconEl.style.display = icon ? '' : 'none'
+      titleEl.textContent = title || ''
+      bodyEl.textContent = body || ''
+      bodyEl.style.display = body ? '' : 'none'
+      // aria-describedby 仅在有正文时指向正文节点
+      if (body) modal.setAttribute('aria-describedby', 'oc-confirm-body')
+      else modal.removeAttribute('aria-describedby')
+      okBtn.textContent = confirmText
+      okBtn.className = `btn ${danger ? 'btn-danger' : 'btn-primary'}`
+      if (ghostCancel) ghostCancel.textContent = cancelText // × 保持 "×"
+      let settled = false
+      const finish = (value) => {
+        if (settled) return
+        settled = true
+        okBtn.removeEventListener('click', onOk)
+        for (const b of cancelBtns) b.removeEventListener('click', onCancel)
+        modal.removeEventListener('click', onBackdrop)
+        document.removeEventListener('keydown', onKey, true)
+        closeModal(_CONFIRM_MODAL_ID)
+        resolve(value)
+      }
+      const onOk = () => finish(true)
+      const onCancel = () => finish(false)
+      const onBackdrop = (e) => {
+        if (e.target === modal) finish(false)
+      }
+      const onKey = (e) => {
+        if (e.key === 'Escape' && modal.classList.contains('open')) {
+          // capture 阶段 + stopImmediatePropagation:阻止全局 Escape(bubble)把
+          // 底层 modal 一起关掉(嵌套确认场景)。只关确认弹窗本身。
+          e.preventDefault()
+          e.stopImmediatePropagation()
+          finish(false)
+        }
+      }
+      okBtn.addEventListener('click', onOk)
+      for (const b of cancelBtns) b.addEventListener('click', onCancel)
+      modal.addEventListener('click', onBackdrop)
+      document.addEventListener('keydown', onKey, true)
+      openModal(_CONFIRM_MODAL_ID)
+    })
+  const p = _confirmChain.then(run, run)
+  _confirmChain = p.catch(() => {})
+  return p
+}
+
 export function openLightbox(el) {
   const lb = $('lightbox')
   const body = lb.querySelector('.lightbox-body')

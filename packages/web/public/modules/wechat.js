@@ -17,7 +17,7 @@
 
 import { apiGet, apiJson } from './api.js?v=0c9e5665'
 import { $, htmlSafeEscape } from './dom.js?v=0c9e5665'
-import { closeModal, openModal, toast } from './ui.js?v=0c9e5665'
+import { closeModal, confirmDialog, openModal, toast } from './ui.js?v=0c9e5665'
 import { loadUserPrefs, setCachedPrefField } from './userPrefs.js?v=0c9e5665'
 
 let _pollAbort = null
@@ -256,7 +256,15 @@ async function pollLoop(qrcode) {
 }
 
 async function unbind() {
-  if (!confirm('确定解绑?该微信号将无法再与此 OC 用户对话。')) return
+  if (
+    !(await confirmDialog({
+      title: '解绑微信?',
+      body: '该微信号将无法再与此 OC 用户对话。',
+      confirmText: '解绑',
+      danger: true,
+    }))
+  )
+    return
   clearWorkerRefreshTimer()
   try {
     await apiJson('DELETE', '/api/wechat/binding')
