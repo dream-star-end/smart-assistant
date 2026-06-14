@@ -749,6 +749,65 @@ function cssVar(name, fallback) {
   return value || fallback
 }
 
+// 终端配色随全局明暗主题切换：背景/前景/光标取实时 CSS 变量，ANSI 调色板按
+// 明暗各备一套（深色面板沿用原值；浅色下另调一套更深、对比更足的色，避免发灰）。
+function buildTerminalTheme() {
+  const isLight = document.documentElement.dataset.theme === 'light'
+  const surface = cssVar('--code-bg', isLight ? '#ffffff' : '#141418')
+  const base = {
+    background: surface,
+    foreground: cssVar('--fg', isLight ? '#1a1a1d' : '#f2f2f2'),
+    cursor: cssVar('--accent', '#d97757'),
+    cursorAccent: surface,
+    selectionBackground: cssVar('--accent-border', 'rgba(217,119,87,0.35)'),
+  }
+  const dark = {
+    black: '#000000',
+    red: '#d14d41',
+    green: '#5ca66b',
+    yellow: '#c99a2e',
+    blue: '#4f8fd9',
+    magenta: '#b46ad8',
+    cyan: '#4fa7a8',
+    white: '#d7d7d7',
+    brightBlack: '#666666',
+    brightRed: '#e06c64',
+    brightGreen: '#7cc386',
+    brightYellow: '#e0b84a',
+    brightBlue: '#6aa6e8',
+    brightMagenta: '#c98df0',
+    brightCyan: '#72c6c8',
+    brightWhite: '#ffffff',
+  }
+  const light = {
+    black: '#2a2a30',
+    red: '#c0392b',
+    green: '#3f7e4e',
+    yellow: '#9a6b00',
+    blue: '#2d6fc0',
+    magenta: '#9b3dbd',
+    cyan: '#2a8385',
+    white: '#5a5750',
+    brightBlack: '#8a8780',
+    brightRed: '#d14d41',
+    brightGreen: '#4e9a63',
+    brightYellow: '#b5832a',
+    brightBlue: '#3f8fd9',
+    brightMagenta: '#b46ad8',
+    brightCyan: '#3fa7a8',
+    brightWhite: '#1a1a1d',
+  }
+  return { ...base, ...(isLight ? light : dark) }
+}
+
+// 主题切换后由 main.js 经 late-bound 回调调用，让已打开的终端实时重着色。
+export function applyTerminalTheme() {
+  if (!terminal) return
+  try {
+    terminal.options.theme = buildTerminalTheme()
+  } catch {}
+}
+
 function createTerminal() {
   disposeTerminal()
   terminal = new TerminalCtor({
@@ -757,28 +816,7 @@ function createTerminal() {
     fontFamily: cssVar('--font-mono', 'ui-monospace, SFMono-Regular, Menlo, monospace'),
     fontSize: 13,
     scrollback: 4000,
-    theme: {
-      background: cssVar('--bg', '#111111'),
-      foreground: cssVar('--fg', '#f2f2f2'),
-      cursor: cssVar('--accent', '#d97757'),
-      selectionBackground: cssVar('--accent-border', 'rgba(217,119,87,0.35)'),
-      black: '#000000',
-      red: '#d14d41',
-      green: '#5ca66b',
-      yellow: '#c99a2e',
-      blue: '#4f8fd9',
-      magenta: '#b46ad8',
-      cyan: '#4fa7a8',
-      white: '#d7d7d7',
-      brightBlack: '#666666',
-      brightRed: '#e06c64',
-      brightGreen: '#7cc386',
-      brightYellow: '#e0b84a',
-      brightBlue: '#6aa6e8',
-      brightMagenta: '#c98df0',
-      brightCyan: '#72c6c8',
-      brightWhite: '#ffffff',
-    },
+    theme: buildTerminalTheme(),
   })
   fitAddon = new FitAddonCtor()
   terminal.loadAddon(fitAddon)

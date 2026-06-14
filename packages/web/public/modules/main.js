@@ -30,7 +30,7 @@ import { dbDelete, dbGetAll, dbPut, onIdbUnavailable, openDB } from './db.js'
 import { hydrateSession, maybeSyncNow, setSyncDeps, syncSessionsFromServer } from './sync.js?v=9'
 
 // ── Theme ──
-import { applyTheme, cycleTheme, effectiveTheme, setToastFn } from './theme.js'
+import { applyTheme, cycleTheme, effectiveTheme, setThemeAppliedFn, setToastFn } from './theme.js'
 
 // ── Markdown / rich rendering ──
 import {
@@ -175,7 +175,11 @@ import {
   markGoalModeSeeded,
   renderGoalModePanel,
 } from './goalMode.js?v=3'
-import { initOfficialClaudeTerminal, openOfficialClaudeTerminal } from './officialTerminal.js?v=12'
+import {
+  applyTerminalTheme,
+  initOfficialClaudeTerminal,
+  openOfficialClaudeTerminal,
+} from './officialTerminal.js?v=13'
 import { getConversationModeForSubmit } from './planMode.js?v=4'
 import { initPlanPanel } from './planPanel.js?v=3'
 import { initResearchTools, renderResearchTools } from './researchTools.js'
@@ -185,6 +189,8 @@ import { initResearchTools, renderResearchTools } from './researchTools.js'
 // ═══════════════════════════════════════════════════════════
 
 setToastFn(toast)
+// 全局明暗切换后，让已打开的官方 Claude Code 终端实时重着色。
+setThemeAppliedFn(applyTerminalTheme)
 window.addEventListener('openclaude:goal-mode-state-changed', () => {
   const sess = getSession()
   if (sess) scheduleSaveFromUserEdit(sess, true)

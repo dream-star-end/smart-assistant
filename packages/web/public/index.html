@@ -16,7 +16,7 @@
 <link rel="apple-touch-icon" href="/icon.svg" />
 <link rel="stylesheet" href="/vendor/github-dark.min.css" />
 <link rel="stylesheet" href="/vendor/katex/katex.min.css" />
-<link rel="stylesheet" href="/style.css?v=54" />
+<link rel="stylesheet" href="/style.css?v=55" />
 <link rel="stylesheet" href="/vendor/xterm/xterm.css?v=1" />
 <style>/* Inline styles removed — see style.css */
 </style>
@@ -810,9 +810,9 @@
               <div id="claude-terminal-sessions-list" class="claude-terminal-sessions-list"></div>
             </div>
           </div>
-          <button id="claude-terminal-copy-btn" class="btn btn-ghost" type="button" title="复制选中内容；未选中时复制当前可见输出" aria-label="复制终端内容">复制</button>
-          <button id="claude-terminal-upload-btn" class="btn btn-ghost" type="button">上传</button>
-          <button id="claude-terminal-files-btn" class="btn btn-ghost" type="button">文件</button>
+          <button id="claude-terminal-copy-btn" class="icon-btn" type="button" title="复制选中内容；未选中时复制当前可见输出" aria-label="复制终端内容"><svg viewBox="0 0 24 24" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button>
+          <button id="claude-terminal-upload-btn" class="icon-btn" type="button" title="上传文件给 Claude Code 读取" aria-label="上传文件"><svg viewBox="0 0 24 24" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg></button>
+          <button id="claude-terminal-files-btn" class="icon-btn" type="button" title="浏览 / 下载终端文件" aria-label="终端文件"><svg viewBox="0 0 24 24" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg></button>
           <span class="claude-terminal-hint">关闭=隐藏会话；终止=结束 Claude。</span>
         </div>
       </div>
@@ -957,6 +957,6 @@
 <script src="/vendor/katex/katex.min.js" defer></script>
 <script src="/vendor/qrcode.min.js"></script>
 <div id="toast" class="toast"></div>
-<script type="module" src="/modules/main.js?v=65"></script>
+<script type="module" src="/modules/main.js?v=66"></script>
 </body>
 </html>

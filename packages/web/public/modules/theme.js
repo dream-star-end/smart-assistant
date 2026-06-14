@@ -6,6 +6,13 @@ export function setToastFn(fn) {
   _toast = fn
 }
 
+// late-bound, set by main.js — lets surfaces with their own canvas/theme (e.g. the
+// official Claude Code terminal) re-color themselves when the global theme changes.
+let _onThemeApplied = () => {}
+export function setThemeAppliedFn(fn) {
+  _onThemeApplied = fn
+}
+
 const THEME_KEY = 'openclaude_theme'
 
 export function effectiveTheme() {
@@ -51,6 +58,10 @@ export function applyTheme() {
       })
     } catch {}
   }
+  // Notify late-bound listeners (terminal re-theme, etc.) after data-theme is set.
+  try {
+    _onThemeApplied(theme)
+  } catch {}
 }
 
 export function cycleTheme() {
