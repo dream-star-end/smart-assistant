@@ -16,7 +16,7 @@
 <link rel="apple-touch-icon" href="/icon.svg" />
 <link rel="stylesheet" href="/vendor/github-dark.min.css" />
 <link rel="stylesheet" href="/vendor/katex/katex.min.css" />
-<link rel="stylesheet" href="/style.css?v=53" />
+<link rel="stylesheet" href="/style.css?v=54" />
 <link rel="stylesheet" href="/vendor/xterm/xterm.css?v=1" />
 <style>/* Inline styles removed — see style.css */
 </style>
@@ -799,9 +799,17 @@
     </div>
     <div class="modal-body claude-terminal-body">
       <div class="claude-terminal-toolbar">
-        <span id="claude-terminal-status" class="claude-terminal-status" data-state="idle">未连接</span>
+        <span id="claude-terminal-status" class="claude-terminal-status" role="status" aria-live="polite" data-state="idle">未连接</span>
         <div class="claude-terminal-toolbar-actions">
           <input id="claude-terminal-file-input" type="file" multiple hidden />
+          <div class="claude-terminal-sessions-wrap">
+            <button id="claude-terminal-sessions-btn" class="btn btn-ghost" type="button" aria-haspopup="menu" aria-expanded="false" aria-controls="claude-terminal-sessions-menu">会话 ▾</button>
+            <div id="claude-terminal-sessions-menu" class="claude-terminal-sessions-menu" role="menu" aria-label="Claude 会话" hidden>
+              <button id="claude-terminal-sessions-new-btn" class="claude-terminal-session-new" type="button" role="menuitem" tabindex="-1">+ 新建会话</button>
+              <div class="claude-terminal-sessions-divider" role="separator"></div>
+              <div id="claude-terminal-sessions-list" class="claude-terminal-sessions-list"></div>
+            </div>
+          </div>
           <button id="claude-terminal-copy-btn" class="btn btn-ghost" type="button" title="复制选中内容；未选中时复制当前可见输出" aria-label="复制终端内容">复制</button>
           <button id="claude-terminal-upload-btn" class="btn btn-ghost" type="button">上传</button>
           <button id="claude-terminal-files-btn" class="btn btn-ghost" type="button">文件</button>
@@ -840,15 +848,15 @@
 </div>
 
 <div id="claude-terminal-context-menu" class="claude-terminal-context-menu" role="menu" hidden>
-  <button type="button" role="menuitem" data-claude-terminal-menu-action="copy-selection">
+  <button type="button" role="menuitem" tabindex="-1" data-claude-terminal-menu-action="copy-selection">
     <span>复制选中内容</span>
     <kbd>Ctrl/⌘+C</kbd>
   </button>
-  <button type="button" role="menuitem" data-claude-terminal-menu-action="copy-visible">
+  <button type="button" role="menuitem" tabindex="-1" data-claude-terminal-menu-action="copy-visible">
     <span>复制当前可见输出</span>
     <kbd>Ctrl/⌘+Shift+C</kbd>
   </button>
-  <button type="button" role="menuitem" data-claude-terminal-menu-action="paste">
+  <button type="button" role="menuitem" tabindex="-1" data-claude-terminal-menu-action="paste">
     <span>粘贴</span>
     <kbd>Ctrl/⌘+V</kbd>
   </button>
@@ -867,31 +875,31 @@
     <div class="modal-body claude-terminal-files-body">
       <div id="claude-terminal-file-panel" class="claude-terminal-file-panel">
         <div class="claude-terminal-file-tabs" role="tablist" aria-label="终端文件">
-          <button type="button" data-terminal-file-tab="recent" data-active="true">最近</button>
-          <button type="button" data-terminal-file-tab="uploads" data-active="false">上传</button>
-          <button type="button" data-terminal-file-tab="browse" data-active="false">浏览</button>
-          <button type="button" data-terminal-file-tab="path" data-active="false">路径下载</button>
+          <button type="button" id="ct-file-tab-recent" role="tab" aria-selected="true" aria-controls="ct-file-pane-recent" data-terminal-file-tab="recent" data-active="true">最近</button>
+          <button type="button" id="ct-file-tab-uploads" role="tab" aria-selected="false" aria-controls="ct-file-pane-uploads" data-terminal-file-tab="uploads" data-active="false">上传</button>
+          <button type="button" id="ct-file-tab-browse" role="tab" aria-selected="false" aria-controls="ct-file-pane-browse" data-terminal-file-tab="browse" data-active="false">浏览</button>
+          <button type="button" id="ct-file-tab-path" role="tab" aria-selected="false" aria-controls="ct-file-pane-path" data-terminal-file-tab="path" data-active="false">路径下载</button>
         </div>
-        <div class="claude-terminal-file-pane" data-terminal-file-pane="recent">
+        <div class="claude-terminal-file-pane" id="ct-file-pane-recent" role="tabpanel" aria-labelledby="ct-file-tab-recent" data-terminal-file-pane="recent">
           <div id="claude-terminal-recent-list" class="claude-terminal-file-list"></div>
         </div>
-        <div class="claude-terminal-file-pane" data-terminal-file-pane="uploads" hidden>
+        <div class="claude-terminal-file-pane" id="ct-file-pane-uploads" role="tabpanel" aria-labelledby="ct-file-tab-uploads" data-terminal-file-pane="uploads" hidden>
           <div id="claude-terminal-upload-list" class="claude-terminal-file-list"></div>
         </div>
-        <div class="claude-terminal-file-pane" data-terminal-file-pane="browse" hidden>
+        <div class="claude-terminal-file-pane" id="ct-file-pane-browse" role="tabpanel" aria-labelledby="ct-file-tab-browse" data-terminal-file-pane="browse" hidden>
           <div class="claude-terminal-path-row">
             <input id="claude-terminal-browse-path" type="text" placeholder="目录路径；留空=终端初始 cwd" autocomplete="off" spellcheck="false" />
             <button id="claude-terminal-browse-open-btn" class="btn btn-ghost" type="button">打开</button>
           </div>
           <div id="claude-terminal-browse-list" class="claude-terminal-file-list"></div>
         </div>
-        <div class="claude-terminal-file-pane" data-terminal-file-pane="path" hidden>
+        <div class="claude-terminal-file-pane" id="ct-file-pane-path" role="tabpanel" aria-labelledby="ct-file-tab-path" data-terminal-file-pane="path" hidden>
           <div class="claude-terminal-path-row">
             <input id="claude-terminal-path-input" type="text" placeholder="输入任意服务器文件路径，如 /tmp/result.zip 或 ./report.pdf" autocomplete="off" spellcheck="false" />
             <button id="claude-terminal-download-btn" class="btn btn-primary" type="button">下载</button>
             <button id="claude-terminal-preview-btn" class="btn btn-ghost" type="button">预览</button>
           </div>
-          <p class="claude-terminal-file-note">下载路径按你的要求不做目录 allowlist；相对路径按终端初始工作目录解析。</p>
+          <p class="claude-terminal-file-note">可下载/预览服务器任意路径文件（不限目录）；相对路径按终端初始工作目录解析。</p>
         </div>
       </div>
     </div>
@@ -949,6 +957,6 @@
 <script src="/vendor/katex/katex.min.js" defer></script>
 <script src="/vendor/qrcode.min.js"></script>
 <div id="toast" class="toast"></div>
-<script type="module" src="/modules/main.js?v=64"></script>
+<script type="module" src="/modules/main.js?v=65"></script>
 </body>
 </html>
