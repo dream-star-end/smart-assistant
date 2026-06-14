@@ -16,7 +16,7 @@
 <link rel="apple-touch-icon" href="/icon.svg" />
 <link rel="stylesheet" href="/vendor/github-dark.min.css" />
 <link rel="stylesheet" href="/vendor/katex/katex.min.css" />
-<link rel="stylesheet" href="/style.css?v=52" />
+<link rel="stylesheet" href="/style.css?v=53" />
 <link rel="stylesheet" href="/vendor/xterm/xterm.css?v=1" />
 <style>/* Inline styles removed — see style.css */
 </style>
@@ -839,6 +839,21 @@
   </div>
 </div>
 
+<div id="claude-terminal-context-menu" class="claude-terminal-context-menu" role="menu" hidden>
+  <button type="button" role="menuitem" data-claude-terminal-menu-action="copy-selection">
+    <span>复制选中内容</span>
+    <kbd>Ctrl/⌘+C</kbd>
+  </button>
+  <button type="button" role="menuitem" data-claude-terminal-menu-action="copy-visible">
+    <span>复制当前可见输出</span>
+    <kbd>Ctrl/⌘+Shift+C</kbd>
+  </button>
+  <button type="button" role="menuitem" data-claude-terminal-menu-action="paste">
+    <span>粘贴</span>
+    <kbd>Ctrl/⌘+V</kbd>
+  </button>
+</div>
+
 <!-- Claude Code terminal files -->
 <div id="claude-terminal-files-modal" class="modal-backdrop claude-terminal-files-backdrop" role="dialog" aria-modal="true" aria-label="终端文件">
   <div class="modal claude-terminal-files-modal">
@@ -912,7 +927,7 @@
 <!-- Force SW cache refresh (one-time, remove after all clients updated) -->
 <script>
 (function(){
-  var V='sw-flush-v22';
+  var V='sw-flush-v23';
   if(localStorage.getItem(V))return;
   if('serviceWorker' in navigator){
     navigator.serviceWorker.getRegistrations().then(function(regs){
@@ -934,6 +949,6 @@
 <script src="/vendor/katex/katex.min.js" defer></script>
 <script src="/vendor/qrcode.min.js"></script>
 <div id="toast" class="toast"></div>
-<script type="module" src="/modules/main.js?v=63"></script>
+<script type="module" src="/modules/main.js?v=64"></script>
 </body>
 </html>

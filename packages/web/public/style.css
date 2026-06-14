@@ -5004,6 +5004,52 @@ body.voice-overlay-open {
 .claude-terminal-scroll-capture {
   display: none;
 }
+.claude-terminal-context-menu {
+  position: fixed;
+  z-index: 320;
+  min-width: 220px;
+  padding: var(--space-1);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--bg-elevated);
+  box-shadow: var(--shadow-lg);
+}
+.claude-terminal-context-menu[hidden] {
+  display: none;
+}
+.claude-terminal-context-menu button {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+  min-height: 34px;
+  gap: var(--space-3);
+  padding: 7px 9px;
+  border: 0;
+  border-radius: var(--radius-md);
+  background: transparent;
+  color: var(--fg);
+  font-size: var(--text-sm);
+  text-align: left;
+}
+.claude-terminal-context-menu button:hover,
+.claude-terminal-context-menu button:focus-visible {
+  background: var(--bg-hover);
+  outline: none;
+}
+.claude-terminal-context-menu button:disabled {
+  color: var(--fg-dim);
+  cursor: not-allowed;
+}
+.claude-terminal-context-menu button:disabled:hover {
+  background: transparent;
+}
+.claude-terminal-context-menu kbd {
+  color: var(--fg-muted);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  white-space: nowrap;
+}
 .claude-terminal-drop-hint {
   position: absolute;
   inset: var(--space-4);
