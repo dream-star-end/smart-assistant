@@ -1,4 +1,12 @@
-import { existsSync, statSync } from 'node:fs'
+import {
+  closeSync,
+  existsSync,
+  openSync,
+  readFileSync,
+  readSync,
+  readdirSync,
+  statSync,
+} from 'node:fs'
 import { homedir } from 'node:os'
 import { join, resolve } from 'node:path'
 import * as pty from 'node-pty'
@@ -142,8 +150,147 @@ export function resolveOfficialClaudePath(env: NodeJS.ProcessEnv = process.env):
   return existsSync(localClaude) ? localClaude : 'claude'
 }
 
-export function buildOfficialClaudeArgs(): string[] {
-  return ['--permission-mode', 'bypassPermissions', '--dangerously-skip-permissions']
+const CLAUDE_SESSION_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+const MAX_LISTED_CLAUDE_SESSIONS = 60
+const MAX_SESSION_TITLE_CHARS = 80
+const SESSION_TITLE_SCAN_BYTES = 128 * 1024
+
+export function isValidClaudeSessionId(id: unknown): id is string {
+  return typeof id === 'string' && CLAUDE_SESSION_ID_RE.test(id.trim())
+}
+
+export function buildOfficialClaudeArgs(resumeSessionId?: string): string[] {
+  const base = ['--permission-mode', 'bypassPermissions', '--dangerously-skip-permissions']
+  if (isValidClaudeSessionId(resumeSessionId)) return ['--resume', resumeSessionId.trim(), ...base]
+  return base
+}
+
+export interface ClaudeSessionSummary {
+  sessionId: string
+  title: string
+  cwd: string
+  mtimeMs: number
+  live: boolean
+}
+
+// Claude Code stores per-cwd session transcripts under ~/.claude/projects/<encoded-cwd>/<id>.jsonl,
+// where the cwd is encoded by replacing `/` and `.` with `-` (e.g. /root -> -root).
+function encodeClaudeProjectDir(cwd: string): string {
+  return cwd.replace(/[/.]/g, '-')
+}
+
+function readFileHead(filePath: string, maxBytes: number): string {
+  let fd: number | null = null
+  try {
+    fd = openSync(filePath, 'r')
+    const buf = Buffer.alloc(maxBytes)
+    const n = readSync(fd, buf, 0, maxBytes, 0)
+    return buf.subarray(0, n).toString('utf8')
+  } catch {
+    return ''
+  } finally {
+    if (fd != null) {
+      try {
+        closeSync(fd)
+      } catch {}
+    }
+  }
+}
+
+function cleanSessionTitle(text: string): string {
+  const trimmed = text.replace(/\s+/g, ' ').trim()
+  if (!trimmed) return ''
+  // Skip Claude Code's synthetic first messages: slash-command wrappers and caveats.
+  if (trimmed.startsWith('<') || trimmed.startsWith('Caveat:')) return ''
+  return trimmed.length > MAX_SESSION_TITLE_CHARS
+    ? `${trimmed.slice(0, MAX_SESSION_TITLE_CHARS - 1)}…`
+    : trimmed
+}
+
+function extractSessionTitle(filePath: string): string {
+  const head = readFileHead(filePath, SESSION_TITLE_SCAN_BYTES)
+  if (!head) return ''
+  for (const line of head.split('\n')) {
+    if (!line.trim()) continue
+    let record: Record<string, unknown>
+    try {
+      record = JSON.parse(line) as Record<string, unknown>
+    } catch {
+      // Last line may be truncated by the bounded read; skip and keep scanning earlier lines.
+      continue
+    }
+    if (record.type !== 'user' || record.isMeta === true) continue
+    const content = (record.message as { content?: unknown } | undefined)?.content
+    let text = ''
+    if (typeof content === 'string') text = content
+    else if (Array.isArray(content)) {
+      for (const block of content) {
+        if (block && typeof block === 'object' && (block as { type?: unknown }).type === 'text') {
+          text = String((block as { text?: unknown }).text ?? '')
+          break
+        }
+      }
+    }
+    const title = cleanSessionTitle(text)
+    if (title) return title
+  }
+  return ''
+}
+
+function readLiveClaudeSessionIds(home: string): Set<string> {
+  const ids = new Set<string>()
+  const dir = join(home, '.claude', 'sessions')
+  let names: string[] = []
+  try {
+    names = readdirSync(dir)
+  } catch {
+    return ids
+  }
+  for (const name of names) {
+    if (!name.endsWith('.json')) continue
+    try {
+      const record = JSON.parse(readFileSync(join(dir, name), 'utf8')) as Record<string, unknown>
+      if (isValidClaudeSessionId(record.sessionId)) ids.add(record.sessionId.trim())
+    } catch {}
+  }
+  return ids
+}
+
+export function listClaudeSessions(env: NodeJS.ProcessEnv = process.env): ClaudeSessionSummary[] {
+  const home = env.HOME || homedir()
+  let cwd: string
+  try {
+    cwd = resolveOfficialClaudeCwd(env)
+  } catch {
+    return []
+  }
+  const projectDir = join(home, '.claude', 'projects', encodeClaudeProjectDir(cwd))
+  let files: string[] = []
+  try {
+    files = readdirSync(projectDir).filter((name) => name.endsWith('.jsonl'))
+  } catch {
+    return []
+  }
+  // Stat is cheap; pick the newest N first, then only read transcript titles for those —
+  // avoids reading head bytes for every historical session when there are many.
+  const candidates: Array<{ sessionId: string; filePath: string; mtimeMs: number }> = []
+  for (const file of files) {
+    const sessionId = file.slice(0, -'.jsonl'.length)
+    if (!isValidClaudeSessionId(sessionId)) continue
+    const filePath = join(projectDir, file)
+    try {
+      candidates.push({ sessionId, filePath, mtimeMs: statSync(filePath).mtimeMs })
+    } catch {}
+  }
+  candidates.sort((a, b) => b.mtimeMs - a.mtimeMs)
+  const liveIds = readLiveClaudeSessionIds(home)
+  return candidates.slice(0, MAX_LISTED_CLAUDE_SESSIONS).map((c) => ({
+    sessionId: c.sessionId,
+    title: extractSessionTitle(c.filePath) || '(无标题会话)',
+    cwd,
+    mtimeMs: c.mtimeMs,
+    live: liveIds.has(c.sessionId),
+  }))
 }
 
 export function resolveOfficialClaudeCwd(env: NodeJS.ProcessEnv = process.env): string {
@@ -232,7 +379,11 @@ export class ClaudeTerminalManager {
     this.env = opts.env ?? process.env
   }
 
-  handleConnection(ws: WebSocket, userId: string): void {
+  handleConnection(
+    ws: WebSocket,
+    userId: string,
+    opts: { action?: 'new' | 'resume'; resumeSessionId?: string } = {},
+  ): void {
     if (!isClaudeTerminalEnabled(this.env)) {
       sendJson(ws, {
         type: 'status',
@@ -243,10 +394,24 @@ export class ClaudeTerminalManager {
       return
     }
 
+    const action = opts.action
+    if (action === 'resume' && !isValidClaudeSessionId(opts.resumeSessionId)) {
+      sendJson(ws, { type: 'status', state: 'error', message: 'Invalid Claude session id' })
+      ws.close(1008, 'invalid session id')
+      return
+    }
+
+    // Plain reconnects reuse the live PTY; an explicit new/resume always replaces it so the
+    // user gets a fresh process (or a `claude --resume` of the chosen historical session).
+    if (action === 'new' || action === 'resume') {
+      const existing = this.sessions.get(userId)
+      if (existing) this.closeSession(existing, `switch:${action}`, true, true)
+    }
+
     let session = this.sessions.get(userId)
     if (!session || session.closed) {
       try {
-        session = this.createSession(userId)
+        session = this.createSession(userId, action === 'resume' ? opts.resumeSessionId : undefined)
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err)
         this.opts.logger.warn('official claude terminal spawn failed', { userId, message })
@@ -259,6 +424,7 @@ export class ClaudeTerminalManager {
         userId,
         cwd: session.cwd,
         command: session.command,
+        resume: action === 'resume' ? opts.resumeSessionId : undefined,
       })
     }
 
@@ -288,13 +454,13 @@ export class ClaudeTerminalManager {
     return this.sessions.size
   }
 
-  private createSession(userId: string): ActiveTerminalSession {
+  private createSession(userId: string, resumeSessionId?: string): ActiveTerminalSession {
     const command = resolveOfficialClaudePath(this.env)
     if (command.startsWith('/') && !existsSync(command)) {
       throw new Error(`Claude executable not found: ${command}`)
     }
     const cwd = resolveOfficialClaudeCwd(this.env)
-    const proc = this.spawn(command, buildOfficialClaudeArgs(), {
+    const proc = this.spawn(command, buildOfficialClaudeArgs(resumeSessionId), {
       name: 'xterm-256color',
       cols: DEFAULT_COLS,
       rows: DEFAULT_ROWS,

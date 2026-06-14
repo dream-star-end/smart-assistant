@@ -55,6 +55,7 @@ import {
   type ClaudeTerminalManager,
   createClaudeTerminalManager,
   isAllowedClaudeTerminalOrigin,
+  listClaudeSessions,
   resolveClaudeTerminalUserIdForAuth,
 } from './claudeTerminal.js'
 import { syncCodexAuthFile } from './codexAuthSync.js'
@@ -1437,6 +1438,10 @@ export class Gateway {
       this.handleClaudeTerminalUpload(req, res, url).catch((err) => {
         this.sendError(res, 400, err instanceof Error ? err.message : String(err))
       })
+      return
+    }
+    if (url.pathname === '/api/claude-terminal/sessions') {
+      this.handleClaudeTerminalSessions(req, res)
       return
     }
     if (url.pathname === '/api/claude-terminal/list') {
@@ -3861,6 +3866,23 @@ export class Gateway {
     this.sendError(res, 404, 'unknown terminal upload action')
   }
 
+  private handleClaudeTerminalSessions(req: IncomingMessage, res: ServerResponse): void {
+    if (req.method !== 'GET') {
+      this.sendError(res, 405, 'method not allowed')
+      return
+    }
+    const userId = this.getClaudeTerminalUserId(req)
+    if (!userId) {
+      this.sendError(res, 401, 'Claude terminal requires a user login')
+      return
+    }
+    try {
+      this.sendJson(res, 200, { sessions: listClaudeSessions() })
+    } catch (err) {
+      this.sendError(res, 500, err instanceof Error ? err.message : String(err))
+    }
+  }
+
   private handleClaudeTerminalList(req: IncomingMessage, res: ServerResponse, url: URL): void {
     if (req.method !== 'GET') {
       this.sendError(res, 405, 'method not allowed')
@@ -4065,7 +4087,15 @@ export class Gateway {
       ws.close(1008, 'unauthorized')
       return
     }
-    this.claudeTerminal?.handleConnection(ws, userId)
+    let action: 'new' | 'resume' | undefined
+    let resumeSessionId: string | undefined
+    try {
+      const params = new URL(req.url ?? '/', 'http://placeholder').searchParams
+      const requested = params.get('action')
+      if (requested === 'new' || requested === 'resume') action = requested
+      resumeSessionId = params.get('sessionId') ?? undefined
+    } catch {}
+    this.claudeTerminal?.handleConnection(ws, userId, { action, resumeSessionId })
   }
 
   // ───────── WS ─────────
@@ -6423,6 +6453,7 @@ const KNOWN_ROUTES = [
   '/api/doctor',
   '/api/claude-terminal/terminate',
   '/api/claude-terminal/upload',
+  '/api/claude-terminal/sessions',
   '/api/claude-terminal/list',
   '/api/claude-terminal/download',
   '/api/usage',

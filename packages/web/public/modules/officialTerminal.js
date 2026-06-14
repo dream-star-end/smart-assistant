@@ -16,10 +16,11 @@ const NEW_OUTPUT_BTN_ID = 'claude-terminal-new-output-btn'
 const MOBILE_INPUT_ID = 'claude-terminal-mobile-input'
 const MOBILE_SEND_BTN_ID = 'claude-terminal-mobile-send-btn'
 const MOBILE_FOCUS_BTN_ID = 'claude-terminal-mobile-focus-btn'
-const MOBILE_HISTORY_PREV_BTN_ID = 'claude-terminal-history-prev-btn'
-const MOBILE_HISTORY_NEXT_BTN_ID = 'claude-terminal-history-next-btn'
-const WAKE_LOCK_BTN_ID = 'claude-terminal-wake-lock-btn'
 const COPY_BTN_ID = 'claude-terminal-copy-btn'
+const SESSIONS_BTN_ID = 'claude-terminal-sessions-btn'
+const SESSIONS_MENU_ID = 'claude-terminal-sessions-menu'
+const SESSIONS_LIST_ID = 'claude-terminal-sessions-list'
+const SESSIONS_NEW_BTN_ID = 'claude-terminal-sessions-new-btn'
 const FILE_INPUT_ID = 'claude-terminal-file-input'
 const FILE_UPLOAD_BTN_ID = 'claude-terminal-upload-btn'
 const FILE_PANEL_BTN_ID = 'claude-terminal-files-btn'
@@ -41,8 +42,6 @@ const CONTEXT_MENU_ACTION_SELECTOR = '[data-claude-terminal-menu-action]'
 const MAX_TERMINAL_INPUT_BYTES = 32 * 1024
 const RECONNECT_ATTEMPT_MIN_MS = 1500
 const STALE_BACKGROUND_RECONNECT_MS = 30 * 1000
-const MOBILE_COMMAND_HISTORY_KEY = 'openclaude:claude-terminal:mobile-command-history'
-const MAX_MOBILE_COMMAND_HISTORY = 20
 const TERMINAL_RECENT_FILES_KEY = 'openclaude:claude-terminal:recent-files'
 const MAX_RECENT_TERMINAL_FILES = 40
 const TERMINAL_UPLOAD_RETRY_LIMIT = 3
@@ -74,11 +73,10 @@ let terminalScrollPointerId = null
 let terminalScrollPointerTarget = null
 let terminateInFlight = false
 let lastReconnectAttemptAt = 0
-let mobileCommandHistory = []
-let mobileCommandHistoryCursor = null
-let mobileCommandHistoryDraft = ''
-let wakeLockSentinel = null
-let wakeLockWanted = false
+let pendingConnectIntent = null
+let terminalSessions = []
+let sessionsLoading = false
+let sessionsMenuOpen = false
 let terminalHiddenAt = null
 let terminalReconnectTimer = null
 let terminalRecentFiles = []
@@ -510,7 +508,9 @@ function setTerminalFilePanelTab(name) {
   const panel = $(FILE_PANEL_ID)
   if (!panel) return
   panel.querySelectorAll('[data-terminal-file-tab]').forEach((button) => {
-    button.dataset.active = button.dataset.terminalFileTab === name ? 'true' : 'false'
+    const active = button.dataset.terminalFileTab === name
+    button.dataset.active = active ? 'true' : 'false'
+    button.setAttribute('aria-selected', active ? 'true' : 'false')
   })
   panel.querySelectorAll('[data-terminal-file-pane]').forEach((pane) => {
     pane.hidden = pane.dataset.terminalFilePane !== name
@@ -718,10 +718,20 @@ function setStatus(stateName, message = '') {
   if (!el) return
   el.dataset.state = stateName || 'idle'
   el.textContent = message ? `${statusLabel(stateName)} · ${message}` : statusLabel(stateName)
+  updateTerminalBusyButtons()
 }
 
 function terminalStatusState() {
   return $(STATUS_ID)?.dataset.state || 'idle'
+}
+
+// Give clear feedback while a connect/terminate is in flight instead of silently swallowing clicks.
+function updateTerminalBusyButtons() {
+  const connecting = terminalStatusState() === 'connecting'
+  const kill = $(KILL_BTN_ID)
+  const reconnect = $(RECONNECT_BTN_ID)
+  if (kill) kill.disabled = terminateInFlight
+  if (reconnect) reconnect.disabled = connecting || terminateInFlight
 }
 
 async function ensureTerminalDeps() {
@@ -808,7 +818,6 @@ function attachTerminal() {
 }
 
 function disposeTerminal() {
-  releaseWakeLock()
   hideNewOutputButton()
   hideTerminalContextMenu()
   cleanupTerminalScrollCapture()
@@ -1200,159 +1209,6 @@ function normalizedMobileCommand(text) {
   return normalized.endsWith('\r') ? normalized : `${normalized}\r`
 }
 
-function loadMobileCommandHistory() {
-  try {
-    const parsed = JSON.parse(localStorage.getItem(MOBILE_COMMAND_HISTORY_KEY) || '[]')
-    if (!Array.isArray(parsed)) return []
-    return parsed
-      .filter((item) => typeof item === 'string' && item.trim())
-      .slice(0, MAX_MOBILE_COMMAND_HISTORY)
-  } catch {
-    return []
-  }
-}
-
-function saveMobileCommandHistory() {
-  try {
-    localStorage.setItem(MOBILE_COMMAND_HISTORY_KEY, JSON.stringify(mobileCommandHistory))
-  } catch {}
-}
-
-function updateMobileHistoryButtons() {
-  const prev = $(MOBILE_HISTORY_PREV_BTN_ID)
-  const next = $(MOBILE_HISTORY_NEXT_BTN_ID)
-  if (prev) prev.disabled = mobileCommandHistory.length === 0
-  if (next) next.disabled = mobileCommandHistoryCursor == null
-}
-
-function resetMobileHistoryCursor() {
-  mobileCommandHistoryCursor = null
-  mobileCommandHistoryDraft = ''
-  updateMobileHistoryButtons()
-}
-
-function setMobileCommandText(text) {
-  const input = $(MOBILE_INPUT_ID)
-  if (!input) return
-  input.value = text
-  autoGrowMobileInput()
-}
-
-function rememberMobileCommand(text) {
-  const command = text.trim()
-  if (!command) return
-  mobileCommandHistory = [
-    command,
-    ...mobileCommandHistory.filter((item) => item !== command),
-  ].slice(0, MAX_MOBILE_COMMAND_HISTORY)
-  saveMobileCommandHistory()
-  resetMobileHistoryCursor()
-}
-
-function showPreviousMobileCommand() {
-  if (!mobileCommandHistory.length) {
-    toast('还没有移动端输入历史', 'info')
-    return
-  }
-  const input = $(MOBILE_INPUT_ID)
-  if (!input) return
-  if (mobileCommandHistoryCursor == null) {
-    mobileCommandHistoryDraft = input.value
-    mobileCommandHistoryCursor = 0
-  } else {
-    mobileCommandHistoryCursor = Math.min(
-      mobileCommandHistoryCursor + 1,
-      mobileCommandHistory.length - 1,
-    )
-  }
-  setMobileCommandText(mobileCommandHistory[mobileCommandHistoryCursor] || '')
-  updateMobileHistoryButtons()
-}
-
-function showNextMobileCommand() {
-  const input = $(MOBILE_INPUT_ID)
-  if (!input || mobileCommandHistoryCursor == null) return
-  if (mobileCommandHistoryCursor <= 0) {
-    setMobileCommandText(mobileCommandHistoryDraft)
-    resetMobileHistoryCursor()
-    return
-  }
-  mobileCommandHistoryCursor -= 1
-  setMobileCommandText(mobileCommandHistory[mobileCommandHistoryCursor] || '')
-  updateMobileHistoryButtons()
-}
-
-function wakeLockSupported() {
-  return Boolean(navigator.wakeLock?.request)
-}
-
-function updateWakeLockButton() {
-  const button = $(WAKE_LOCK_BTN_ID)
-  if (!button) return
-  const supported = wakeLockSupported()
-  button.hidden = !supported
-  button.disabled = !supported
-  button.dataset.active = wakeLockSentinel ? 'true' : 'false'
-  button.textContent = wakeLockSentinel ? '亮屏中' : '亮屏'
-}
-
-async function requestWakeLock() {
-  if (
-    !wakeLockWanted ||
-    wakeLockSentinel ||
-    !wakeLockSupported() ||
-    !isModalOpen() ||
-    !terminal ||
-    document.visibilityState !== 'visible'
-  ) {
-    updateWakeLockButton()
-    return
-  }
-  try {
-    const sentinel = await navigator.wakeLock.request('screen')
-    wakeLockSentinel = sentinel
-    sentinel.addEventListener?.('release', () => {
-      if (wakeLockSentinel === sentinel) wakeLockSentinel = null
-      updateWakeLockButton()
-      if (wakeLockWanted && isModalOpen() && terminal && document.visibilityState === 'visible') {
-        setTimeout(() => void requestWakeLock(), 500)
-      }
-    })
-    updateWakeLockButton()
-    toast('已开启亮屏保持', 'success')
-  } catch (err) {
-    wakeLockWanted = false
-    wakeLockSentinel = null
-    updateWakeLockButton()
-    const message = err instanceof Error ? err.message : String(err)
-    toast(message || '当前浏览器不允许保持亮屏', 'error')
-  }
-}
-
-function releaseWakeLock({ keepWanted = false } = {}) {
-  if (!keepWanted) wakeLockWanted = false
-  const sentinel = wakeLockSentinel
-  wakeLockSentinel = null
-  updateWakeLockButton()
-  try {
-    void sentinel?.release?.()
-  } catch {}
-}
-
-function toggleWakeLock() {
-  if (!wakeLockSupported()) {
-    toast('当前浏览器不支持保持亮屏', 'error')
-    return
-  }
-  if (wakeLockWanted || wakeLockSentinel) {
-    releaseWakeLock()
-    toast('已关闭亮屏保持', 'success')
-    return
-  }
-  wakeLockWanted = true
-  void requestWakeLock()
-}
-
 function focusMobileInput() {
   const input = $(MOBILE_INPUT_ID)
   input?.focus()
@@ -1367,7 +1223,6 @@ function sendMobileCommand() {
     return
   }
   if (sendTerminalInput(normalizedMobileCommand(text))) {
-    rememberMobileCommand(text)
     input.value = ''
     input.style.height = ''
   }
@@ -1460,12 +1315,24 @@ function connectTerminal(reason = '') {
   lastReconnectAttemptAt = Date.now()
   closeSocket(false)
   reconnectRequested = false
-  setStatus('connecting', reason)
+  // A pending intent (new/resume) applies to this connect only; auto-reconnects reuse the live PTY.
+  const intent = pendingConnectIntent
+  pendingConnectIntent = null
+  const intentReason =
+    intent?.action === 'resume'
+      ? '正在恢复历史会话'
+      : intent?.action === 'new'
+        ? '正在新建会话'
+        : ''
+  setStatus('connecting', reason || intentReason)
   const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:'
-  const ws = new WebSocket(`${protocol}//${location.host}/ws/claude-terminal`, [
-    'bearer',
-    state.token,
-  ])
+  let wsUrl = `${protocol}//${location.host}/ws/claude-terminal`
+  if (intent?.action === 'new') {
+    wsUrl += '?action=new'
+  } else if (intent?.action === 'resume' && intent.sessionId) {
+    wsUrl += `?action=resume&sessionId=${encodeURIComponent(intent.sessionId)}`
+  }
+  const ws = new WebSocket(wsUrl, ['bearer', state.token])
   socket = ws
 
   ws.onopen = () => {
@@ -1530,12 +1397,11 @@ function connectTerminal(reason = '') {
 export async function openOfficialClaudeTerminal() {
   await ensureTerminalDeps()
   openModal(MODAL_ID)
-  updateWakeLockButton()
   renderTerminalRecentFiles()
   renderTerminalUploads()
+  void refreshTerminalSessions()
   if (terminal) {
     fitVisibleTerminalSoon(true)
-    if (wakeLockWanted) void requestWakeLock()
     if (
       !socket ||
       socket.readyState === WebSocket.CLOSED ||
@@ -1551,11 +1417,10 @@ export async function openOfficialClaudeTerminal() {
   terminal?.writeln('Starting `claude` in a server-side PTY...')
   terminal?.writeln('关闭只隐藏窗口，点“终止”才结束进程。\r\n')
   connectTerminal()
-  if (wakeLockWanted) void requestWakeLock()
 }
 
 export function hideOfficialClaudeTerminal() {
-  releaseWakeLock()
+  closeSessionsMenu()
   terminalFileDragDepth = 0
   setTerminalFileDropActive(false)
   closeTerminalFileModal()
@@ -1574,6 +1439,7 @@ export function terminateOfficialClaudeTerminal() {
 async function terminateOfficialClaudeTerminalAsync() {
   if (terminateInFlight) return
   hideTerminalContextMenu()
+  closeSessionsMenu()
   if (!state.token) {
     toast('请先登录 OpenClaude', 'error')
     return
@@ -1599,14 +1465,16 @@ async function terminateOfficialClaudeTerminalAsync() {
     toast(message || '终止 Claude Code 失败', 'error')
   } finally {
     terminateInFlight = false
+    updateTerminalBusyButtons()
   }
 }
 
-function reconnectTerminal() {
+function reconnectTerminal(intent = null) {
   reconnectRequested = true
   lastReconnectAttemptAt = 0
   clearTerminalReconnectTimer()
   closeSocket(false)
+  pendingConnectIntent = intent
   if (!terminal) {
     createTerminal()
     attachTerminal()
@@ -1616,6 +1484,187 @@ function reconnectTerminal() {
     hideNewOutputButton()
   }
   connectTerminal()
+}
+
+function startNewClaudeSession() {
+  closeSessionsMenu()
+  if (!state.token) {
+    toast('请先登录 OpenClaude', 'error')
+    return
+  }
+  reconnectTerminal({ action: 'new' })
+  toast('正在新建 Claude 会话', 'info')
+}
+
+function resumeClaudeSession(sessionId) {
+  if (!sessionId) return
+  closeSessionsMenu()
+  if (!state.token) {
+    toast('请先登录 OpenClaude', 'error')
+    return
+  }
+  reconnectTerminal({ action: 'resume', sessionId })
+  toast('正在恢复历史会话', 'info')
+}
+
+function formatSessionTime(ms) {
+  if (!Number.isFinite(ms)) return ''
+  const diff = Date.now() - ms
+  if (diff < 60_000) return '刚刚'
+  if (diff < 3_600_000) return `${Math.floor(diff / 60_000)} 分钟前`
+  if (diff < 86_400_000) return `${Math.floor(diff / 3_600_000)} 小时前`
+  if (diff < 7 * 86_400_000) return `${Math.floor(diff / 86_400_000)} 天前`
+  try {
+    return new Date(ms).toLocaleDateString()
+  } catch {
+    return ''
+  }
+}
+
+function renderTerminalSessions() {
+  const list = $(SESSIONS_LIST_ID)
+  if (!list) return
+  list.innerHTML = ''
+  if (sessionsLoading) {
+    const empty = document.createElement('div')
+    empty.className = 'claude-terminal-session-empty'
+    empty.textContent = '加载中…'
+    list.appendChild(empty)
+    return
+  }
+  if (!terminalSessions.length) {
+    const empty = document.createElement('div')
+    empty.className = 'claude-terminal-session-empty'
+    empty.textContent = '暂无历史会话'
+    list.appendChild(empty)
+    return
+  }
+  for (const session of terminalSessions) {
+    const item = document.createElement('button')
+    item.type = 'button'
+    item.className = 'claude-terminal-session-item'
+    item.setAttribute('role', 'menuitem')
+    item.tabIndex = -1
+    item.dataset.sessionId = session.sessionId
+    const title = document.createElement('span')
+    title.className = 'claude-terminal-session-title'
+    // Title is derived from user content — render as text only.
+    title.textContent = session.title || '(无标题会话)'
+    item.appendChild(title)
+    const meta = document.createElement('span')
+    meta.className = 'claude-terminal-session-meta'
+    meta.textContent = formatSessionTime(session.mtimeMs)
+    if (session.live) {
+      const badge = document.createElement('span')
+      badge.className = 'claude-terminal-session-live'
+      badge.textContent = '运行中'
+      meta.appendChild(badge)
+    }
+    item.appendChild(meta)
+    item.addEventListener('click', () => resumeClaudeSession(session.sessionId))
+    list.appendChild(item)
+  }
+}
+
+async function refreshTerminalSessions() {
+  if (!state.token) {
+    terminalSessions = []
+    renderTerminalSessions()
+    return
+  }
+  sessionsLoading = true
+  renderTerminalSessions()
+  try {
+    const res = await apiFetch('/api/claude-terminal/sessions', {
+      headers: authHeaders(),
+      timeout: 15000,
+    })
+    const data = await res.json().catch(() => ({}))
+    if (!res.ok) throw new Error(data?.error || '加载历史会话失败')
+    terminalSessions = Array.isArray(data.sessions) ? data.sessions : []
+  } catch {
+    terminalSessions = []
+  } finally {
+    sessionsLoading = false
+    renderTerminalSessions()
+  }
+}
+
+function sessionsMenuFocusables() {
+  const menu = $(SESSIONS_MENU_ID)
+  if (!menu) return []
+  return [...menu.querySelectorAll('button:not([disabled])')]
+}
+
+function openSessionsMenu() {
+  const menu = $(SESSIONS_MENU_ID)
+  if (!menu) return
+  menu.hidden = false
+  sessionsMenuOpen = true
+  $(SESSIONS_BTN_ID)?.setAttribute('aria-expanded', 'true')
+  void refreshTerminalSessions()
+  requestAnimationFrame(() => sessionsMenuFocusables()[0]?.focus())
+}
+
+function closeSessionsMenu() {
+  sessionsMenuOpen = false
+  const menu = $(SESSIONS_MENU_ID)
+  $(SESSIONS_BTN_ID)?.setAttribute('aria-expanded', 'false')
+  if (menu && !menu.hidden) menu.hidden = true
+}
+
+function toggleSessionsMenu() {
+  if (sessionsMenuOpen) closeSessionsMenu()
+  else openSessionsMenu()
+}
+
+function handleSessionsMenuKeydown(event) {
+  if (event.key === 'Escape') {
+    event.preventDefault()
+    event.stopPropagation()
+    closeSessionsMenu()
+    $(SESSIONS_BTN_ID)?.focus()
+    return
+  }
+  if (event.key === 'Tab') {
+    closeSessionsMenu()
+    return
+  }
+  const items = sessionsMenuFocusables()
+  if (!items.length) return
+  const idx = items.indexOf(document.activeElement)
+  if (event.key === 'ArrowDown') {
+    event.preventDefault()
+    items[idx < 0 ? 0 : (idx + 1) % items.length]?.focus()
+  } else if (event.key === 'ArrowUp') {
+    event.preventDefault()
+    items[idx < 0 ? items.length - 1 : (idx - 1 + items.length) % items.length]?.focus()
+  } else if (event.key === 'Home') {
+    event.preventDefault()
+    items[0]?.focus()
+  } else if (event.key === 'End') {
+    event.preventDefault()
+    items[items.length - 1]?.focus()
+  }
+}
+
+function handleSessionsMenuOutsidePointer(event) {
+  if (!sessionsMenuOpen) return
+  const menu = $(SESSIONS_MENU_ID)
+  const button = $(SESSIONS_BTN_ID)
+  if (menu?.contains(event.target) || button?.contains(event.target)) return
+  closeSessionsMenu()
+}
+
+function bindTerminalSessionsControls() {
+  $(SESSIONS_BTN_ID)?.addEventListener('click', (event) => {
+    event.preventDefault()
+    event.stopPropagation()
+    toggleSessionsMenu()
+  })
+  $(SESSIONS_NEW_BTN_ID)?.addEventListener('click', () => startNewClaudeSession())
+  $(SESSIONS_MENU_ID)?.addEventListener('keydown', handleSessionsMenuKeydown)
+  document.addEventListener('pointerdown', handleSessionsMenuOutsidePointer, true)
 }
 
 function sendQuickKey(key, button) {
@@ -1631,30 +1680,6 @@ function runMobileControl(button) {
     scrollTerminal(button.dataset.claudeTerminalAction)
     button.blur?.()
   }
-}
-
-function bindNoFocusButton(id, handler) {
-  const button = $(id)
-  if (!button) return
-  button.tabIndex = -1
-  button.addEventListener(
-    'pointerdown',
-    (event) => {
-      event.preventDefault()
-      event.stopPropagation()
-      lastMobileControlPointerAt = Date.now()
-      handler()
-      button.blur?.()
-    },
-    { passive: false },
-  )
-  button.addEventListener('click', (event) => {
-    event.preventDefault()
-    event.stopPropagation()
-    if (Date.now() - lastMobileControlPointerAt < 500) return
-    handler()
-    button.blur?.()
-  })
 }
 
 function bindTerminalCopyButton() {
@@ -1714,6 +1739,35 @@ function showTerminalContextMenu(clientX, clientY) {
   )
   if (copySelectionButton) copySelectionButton.disabled = !terminalContextSelectionText.trim()
   positionTerminalContextMenu(menu, clientX, clientY)
+  // Move focus into the menu so it is keyboard-operable (matches the sessions popover).
+  requestAnimationFrame(() => contextMenuFocusables()[0]?.focus())
+}
+
+function contextMenuFocusables() {
+  const menu = $(CONTEXT_MENU_ID)
+  if (!menu) return []
+  return [...menu.querySelectorAll('button[role="menuitem"]:not([disabled])')]
+}
+
+function handleTerminalContextMenuKeydown(event) {
+  if (!isTerminalContextMenuOpen()) return
+  if (event.key === 'Escape') return // handled by the global Escape priority chain
+  const items = contextMenuFocusables()
+  if (!items.length) return
+  const idx = items.indexOf(document.activeElement)
+  if (event.key === 'ArrowDown') {
+    event.preventDefault()
+    items[idx < 0 ? 0 : (idx + 1) % items.length]?.focus()
+  } else if (event.key === 'ArrowUp') {
+    event.preventDefault()
+    items[idx < 0 ? items.length - 1 : (idx - 1 + items.length) % items.length]?.focus()
+  } else if (event.key === 'Home') {
+    event.preventDefault()
+    items[0]?.focus()
+  } else if (event.key === 'End') {
+    event.preventDefault()
+    items[items.length - 1]?.focus()
+  }
 }
 
 function isTerminalOutputEventTarget(target) {
@@ -1805,17 +1859,13 @@ function handleTerminalVisibilityResume(reason) {
   } else {
     ensureTerminalConnected(reason)
   }
-  if (wakeLockWanted) void requestWakeLock()
   fitVisibleTerminalSoon(false)
 }
 
 export function initOfficialClaudeTerminal() {
   if (initialized) return
   initialized = true
-  mobileCommandHistory = loadMobileCommandHistory()
   terminalRecentFiles = loadTerminalRecentFiles()
-  updateMobileHistoryButtons()
-  updateWakeLockButton()
   $(KILL_BTN_ID)?.addEventListener('click', () => terminateOfficialClaudeTerminal())
   $(RECONNECT_BTN_ID)?.addEventListener('click', () => reconnectTerminal())
   $(NEW_OUTPUT_BTN_ID)?.addEventListener('click', () => scrollTerminalToBottom())
@@ -1852,12 +1902,9 @@ export function initOfficialClaudeTerminal() {
   })
   $(MOBILE_SEND_BTN_ID)?.addEventListener('click', () => sendMobileCommand())
   $(MOBILE_FOCUS_BTN_ID)?.addEventListener('click', () => focusMobileInput())
-  bindNoFocusButton(MOBILE_HISTORY_PREV_BTN_ID, showPreviousMobileCommand)
-  bindNoFocusButton(MOBILE_HISTORY_NEXT_BTN_ID, showNextMobileCommand)
-  bindNoFocusButton(WAKE_LOCK_BTN_ID, toggleWakeLock)
+  bindTerminalSessionsControls()
   $(MOBILE_INPUT_ID)?.addEventListener('input', () => {
     autoGrowMobileInput()
-    resetMobileHistoryCursor()
   })
   $(MOBILE_INPUT_ID)?.addEventListener('keydown', (event) => {
     if (event.key !== 'Enter' || event.shiftKey || event.isComposing) return
@@ -1867,6 +1914,7 @@ export function initOfficialClaudeTerminal() {
   window.addEventListener('resize', () => {
     fitTerminal()
     hideTerminalContextMenu()
+    closeSessionsMenu()
   })
   document.addEventListener('dragenter', handleTerminalDragEnter)
   document.addEventListener('dragover', handleTerminalDragOver)
@@ -1876,6 +1924,7 @@ export function initOfficialClaudeTerminal() {
   document.addEventListener('contextmenu', handleTerminalContextMenu, true)
   document.addEventListener('pointerdown', handleTerminalContextMenuPointerDown, true)
   $(CONTEXT_MENU_ID)?.addEventListener('click', handleTerminalContextMenuAction)
+  $(CONTEXT_MENU_ID)?.addEventListener('keydown', handleTerminalContextMenuKeydown)
   document.addEventListener('keydown', handleTerminalClipboardShortcut, true)
   window.addEventListener('focus', () => handleTerminalVisibilityResume('窗口恢复，正在重连'))
   window.addEventListener('online', () => handleTerminalVisibilityResume('网络恢复，正在重连'))
@@ -1885,7 +1934,6 @@ export function initOfficialClaudeTerminal() {
       return
     }
     terminalHiddenAt = Date.now()
-    releaseWakeLock({ keepWanted: true })
   })
 
   document
@@ -1942,6 +1990,13 @@ export function initOfficialClaudeTerminal() {
         event.preventDefault()
         event.stopPropagation()
         hideTerminalContextMenu()
+        return
+      }
+      if (sessionsMenuOpen) {
+        event.preventDefault()
+        event.stopPropagation()
+        closeSessionsMenu()
+        $(SESSIONS_BTN_ID)?.focus()
         return
       }
       if (isTerminalFileModalOpen()) {

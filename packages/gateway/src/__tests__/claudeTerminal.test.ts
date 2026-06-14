@@ -1,8 +1,8 @@
 import * as assert from 'node:assert/strict'
 import { EventEmitter } from 'node:events'
-import { readFileSync } from 'node:fs'
-import { homedir } from 'node:os'
-import { resolve } from 'node:path'
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs'
+import { homedir, tmpdir } from 'node:os'
+import { join, resolve } from 'node:path'
 import { describe, test } from 'node:test'
 import type { WebSocket } from 'ws'
 
@@ -14,6 +14,8 @@ import {
   clampTerminalSize,
   isAllowedClaudeTerminalOrigin,
   isClaudeTerminalEnabled,
+  isValidClaudeSessionId,
+  listClaudeSessions,
   resolveClaudeTerminalUserIdForAuth,
   resolveDetachedTerminalTtlMs,
   resolveOfficialClaudeCwd,
@@ -231,7 +233,7 @@ describe('ClaudeTerminalManager lifecycle', () => {
     assert.match(SERVER_SRC, /configuredUsers\.some\(\(u\) => u\.id === jwtUserId\)/)
     assert.match(
       SERVER_SRC,
-      /handleClaudeTerminalConnection[\s\S]*const userId = this\.getClaudeTerminalUserId\(req\)[\s\S]*handleConnection\(ws, userId\)/,
+      /handleClaudeTerminalConnection[\s\S]*const userId = this\.getClaudeTerminalUserId\(req\)[\s\S]*handleConnection\(ws, userId/,
     )
     assert.doesNotMatch(
       SERVER_SRC,
@@ -429,5 +431,151 @@ describe('ClaudeTerminalManager lifecycle', () => {
     assert.equal(messages(ws)[0]?.type, 'status')
     assert.equal(messages(ws)[0]?.state, 'disabled')
     assert.equal(ws.closes.at(-1)?.code, 1013)
+  })
+})
+
+const SAMPLE_SESSION_ID = '4b062d84-12bf-46b0-929b-5c1f8738655d'
+
+describe('Claude session listing + resume', () => {
+  test('isValidClaudeSessionId only accepts UUIDs', () => {
+    assert.equal(isValidClaudeSessionId(SAMPLE_SESSION_ID), true)
+    assert.equal(isValidClaudeSessionId(`  ${SAMPLE_SESSION_ID}  `), true)
+    assert.equal(isValidClaudeSessionId('not-a-uuid'), false)
+    assert.equal(isValidClaudeSessionId('../../etc/passwd'), false)
+    assert.equal(isValidClaudeSessionId(''), false)
+    assert.equal(isValidClaudeSessionId(undefined), false)
+  })
+
+  test('buildOfficialClaudeArgs prepends --resume only for valid ids', () => {
+    assert.deepEqual(buildOfficialClaudeArgs(), [
+      '--permission-mode',
+      'bypassPermissions',
+      '--dangerously-skip-permissions',
+    ])
+    assert.deepEqual(buildOfficialClaudeArgs(SAMPLE_SESSION_ID), [
+      '--resume',
+      SAMPLE_SESSION_ID,
+      '--permission-mode',
+      'bypassPermissions',
+      '--dangerously-skip-permissions',
+    ])
+    // Injection / garbage ids are ignored, never passed to the shell.
+    assert.deepEqual(buildOfficialClaudeArgs('; rm -rf /'), buildOfficialClaudeArgs())
+  })
+
+  test('listClaudeSessions reads transcripts for the terminal cwd, newest first', () => {
+    const home = mkdtempSync(join(tmpdir(), 'oc-claude-home-'))
+    try {
+      const cwd = home // resolveOfficialClaudeCwd resolves to this dir
+      // Encoded project dir: replace `/` and `.` with `-`.
+      const projectDir = join(home, '.claude', 'projects', cwd.replace(/[/.]/g, '-'))
+      mkdirSync(projectDir, { recursive: true })
+      const olderId = '11111111-1111-4111-8111-111111111111'
+      const newerId = '22222222-2222-4222-8222-222222222222'
+      writeFileSync(
+        join(projectDir, `${olderId}.jsonl`),
+        `${JSON.stringify({ type: 'mode', sessionId: olderId })}\n${JSON.stringify({
+          type: 'user',
+          message: { content: 'first real question' },
+        })}\n`,
+      )
+      // First user record is a synthetic slash-command wrapper that must be skipped.
+      writeFileSync(
+        join(projectDir, `${newerId}.jsonl`),
+        `${JSON.stringify({
+          type: 'user',
+          isMeta: true,
+          message: { content: '<command-name>/foo</command-name>' },
+        })}\n${JSON.stringify({
+          type: 'user',
+          message: { content: [{ type: 'text', text: 'newest session topic' }] },
+        })}\n`,
+      )
+      // Non-uuid file is ignored.
+      writeFileSync(join(projectDir, 'notes.jsonl'), 'garbage\n')
+      // Pin distinct mtimes so ordering is deterministic (fs mtime resolution is coarse).
+      utimesSync(join(projectDir, `${olderId}.jsonl`), new Date(1000), new Date(1000))
+      utimesSync(join(projectDir, `${newerId}.jsonl`), new Date(5000), new Date(5000))
+
+      const env = { HOME: home, OPENCLAUDE_OFFICIAL_CLAUDE_CWD: cwd }
+      const sessions = listClaudeSessions(env)
+      assert.equal(sessions.length, 2)
+      assert.equal(sessions[0]?.sessionId, newerId, 'newest mtime first')
+      assert.equal(sessions[0]?.title, 'newest session topic')
+      assert.equal(sessions[1]?.sessionId, olderId)
+      assert.equal(sessions[1]?.title, 'first real question')
+      assert.equal(sessions[0]?.cwd, cwd)
+    } finally {
+      rmSync(home, { recursive: true, force: true })
+    }
+  })
+
+  test('listClaudeSessions returns [] when the project dir is absent', () => {
+    const home = mkdtempSync(join(tmpdir(), 'oc-claude-empty-'))
+    try {
+      assert.deepEqual(listClaudeSessions({ HOME: home, OPENCLAUDE_OFFICIAL_CLAUDE_CWD: home }), [])
+    } finally {
+      rmSync(home, { recursive: true, force: true })
+    }
+  })
+
+  test('handleConnection action=new replaces the live PTY with a fresh process', () => {
+    const ptys: FakePty[] = []
+    const spawnArgs: string[][] = []
+    const manager = new ClaudeTerminalManager({
+      logger,
+      env: { OPENCLAUDE_OFFICIAL_CLAUDE_PATH: '/bin/echo', OPENCLAUDE_OFFICIAL_CLAUDE_CWD: '/tmp' },
+      spawn: (_file, args) => {
+        spawnArgs.push(args)
+        const fake = new FakePty()
+        ptys.push(fake)
+        return fake
+      },
+    })
+
+    manager.handleConnection(asWs(new FakeWs()), 'user-a')
+    assert.equal(ptys.length, 1)
+    manager.handleConnection(asWs(new FakeWs()), 'user-a', { action: 'new' })
+    assert.equal(ptys.length, 2, 'a second PTY is spawned')
+    assert.equal(ptys[0]!.kills.length, 1, 'old PTY is killed')
+    assert.deepEqual(spawnArgs[1], buildOfficialClaudeArgs(), 'fresh process, no --resume')
+    assert.equal(manager.activeCount(), 1)
+  })
+
+  test('handleConnection action=resume spawns claude --resume <id>', () => {
+    const spawnArgs: string[][] = []
+    const manager = new ClaudeTerminalManager({
+      logger,
+      env: { OPENCLAUDE_OFFICIAL_CLAUDE_PATH: '/bin/echo', OPENCLAUDE_OFFICIAL_CLAUDE_CWD: '/tmp' },
+      spawn: (_file, args) => {
+        spawnArgs.push(args)
+        return new FakePty()
+      },
+    })
+
+    manager.handleConnection(asWs(new FakeWs()), 'user-a', {
+      action: 'resume',
+      resumeSessionId: SAMPLE_SESSION_ID,
+    })
+    assert.deepEqual(spawnArgs[0], buildOfficialClaudeArgs(SAMPLE_SESSION_ID))
+  })
+
+  test('handleConnection action=resume rejects invalid session ids without spawning', () => {
+    let spawned = false
+    const manager = new ClaudeTerminalManager({
+      logger,
+      env: { OPENCLAUDE_OFFICIAL_CLAUDE_PATH: '/bin/echo', OPENCLAUDE_OFFICIAL_CLAUDE_CWD: '/tmp' },
+      spawn: () => {
+        spawned = true
+        return new FakePty()
+      },
+    })
+
+    const ws = new FakeWs()
+    manager.handleConnection(asWs(ws), 'user-a', { action: 'resume', resumeSessionId: 'bogus' })
+    assert.equal(spawned, false)
+    assert.equal(manager.activeCount(), 0)
+    assert.equal(messages(ws).at(-1)?.state, 'error')
+    assert.equal(ws.closes.at(-1)?.code, 1008)
   })
 })

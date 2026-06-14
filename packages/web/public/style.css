@@ -4791,6 +4791,101 @@ body.voice-overlay-open {
   color: var(--fg-muted);
   font-size: var(--text-sm);
 }
+/* The modal header already explains close-vs-terminate on desktop; avoid duplicating it there. */
+@media (min-width: 861px) {
+  .claude-terminal-hint {
+    display: none;
+  }
+}
+.claude-terminal-sessions-wrap {
+  position: relative;
+  display: inline-flex;
+}
+.claude-terminal-sessions-menu {
+  position: absolute;
+  z-index: 280;
+  top: calc(100% + 6px);
+  left: 0;
+  display: flex;
+  flex-direction: column;
+  width: min(340px, 86vw);
+  max-height: min(420px, 60vh);
+  padding: var(--space-1);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--bg-elevated);
+  box-shadow: var(--shadow-lg);
+  overflow: hidden;
+}
+.claude-terminal-sessions-menu[hidden] {
+  display: none;
+}
+.claude-terminal-sessions-divider {
+  height: 1px;
+  margin: var(--space-1) 0;
+  background: var(--border-subtle);
+}
+.claude-terminal-sessions-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  overflow-y: auto;
+}
+.claude-terminal-session-new,
+.claude-terminal-session-item {
+  display: flex;
+  align-items: center;
+  width: 100%;
+  gap: var(--space-2);
+  min-height: 36px;
+  padding: 7px 9px;
+  border: 0;
+  border-radius: var(--radius-md);
+  background: transparent;
+  color: var(--fg);
+  font-size: var(--text-sm);
+  text-align: left;
+}
+.claude-terminal-session-new {
+  color: var(--accent);
+  font-weight: 600;
+}
+.claude-terminal-session-item {
+  justify-content: space-between;
+}
+.claude-terminal-session-new:hover,
+.claude-terminal-session-new:focus-visible,
+.claude-terminal-session-item:hover,
+.claude-terminal-session-item:focus-visible {
+  background: var(--bg-hover);
+  outline: none;
+}
+.claude-terminal-session-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.claude-terminal-session-meta {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex: 0 0 auto;
+  color: var(--fg-muted);
+  font-size: var(--text-xs);
+}
+.claude-terminal-session-live {
+  padding: 1px 6px;
+  border-radius: var(--radius-full);
+  background: color-mix(in srgb, var(--success) 16%, var(--bg-raised));
+  color: var(--success);
+  font-size: var(--text-xs);
+}
+.claude-terminal-session-empty {
+  padding: var(--space-3);
+  color: var(--fg-muted);
+  font-size: var(--text-sm);
+  text-align: center;
+}
 .claude-terminal-files-backdrop {
   z-index: 260;
   padding-top: min(6vh, var(--space-8));
@@ -5131,14 +5226,12 @@ body.voice-overlay-open {
   border-color: var(--accent);
   box-shadow: var(--ring);
 }
-.claude-terminal-mobile-tools,
 .claude-terminal-mobile-keys {
   display: flex;
   gap: var(--space-2);
   overflow-x: auto;
   padding-bottom: 2px;
 }
-.claude-terminal-mobile-tools button,
 .claude-terminal-mobile-keys button {
   flex: 0 0 auto;
   min-height: 34px;
@@ -5152,25 +5245,11 @@ body.voice-overlay-open {
   touch-action: manipulation;
   user-select: none;
 }
-.claude-terminal-mobile-tools button {
-  font-family: inherit;
-  color: var(--fg-muted);
-}
-.claude-terminal-mobile-tools button[data-active="true"] {
-  border-color: var(--accent-border);
-  background: var(--accent-soft);
-  color: var(--accent);
-}
-.claude-terminal-mobile-tools button:disabled {
-  opacity: 0.45;
-  cursor: not-allowed;
-}
 .claude-terminal-mobile-keys button[data-claude-terminal-action] {
   border-color: var(--accent-border);
   background: var(--accent-soft);
   color: var(--accent);
 }
-.claude-terminal-mobile-tools button:active,
 .claude-terminal-mobile-keys button:active {
   transform: scale(0.97);
   background: var(--bg-hover);
@@ -5299,11 +5378,9 @@ body.voice-overlay-open {
     min-height: 42px;
     padding-inline: 12px;
   }
-  .claude-terminal-mobile-tools,
   .claude-terminal-mobile-keys {
     gap: var(--space-1);
   }
-  .claude-terminal-mobile-tools button,
   .claude-terminal-mobile-keys button {
     min-height: 32px;
     padding: 5px 9px;

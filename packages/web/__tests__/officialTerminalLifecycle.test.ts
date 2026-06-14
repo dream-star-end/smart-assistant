@@ -156,14 +156,12 @@ describe('official Claude terminal lifecycle', () => {
     assert.doesNotMatch(controlSrc, /focusMobileInput/)
   })
 
-  it('mobile composer stores command history without exposing extra history buttons', () => {
-    const rememberSrc = extractFunction(SRC, 'rememberMobileCommand')
-    const loadSrc = extractFunction(SRC, 'loadMobileCommandHistory')
-
+  it('mobile command history feature is fully removed, leaving no orphan code', () => {
     assert.doesNotMatch(INDEX, /claude-terminal-history-prev-btn/)
     assert.doesNotMatch(INDEX, /claude-terminal-history-next-btn/)
-    assert.match(loadSrc, /MOBILE_COMMAND_HISTORY_KEY/)
-    assert.match(rememberSrc, /MAX_MOBILE_COMMAND_HISTORY/)
+    assert.doesNotMatch(SRC, /MOBILE_COMMAND_HISTORY_KEY/)
+    assert.doesNotMatch(SRC, /rememberMobileCommand|mobileCommandHistory/)
+    assert.doesNotMatch(STYLE, /claude-terminal-mobile-tools/)
   })
 
   it('mobile quick controls include prompt navigation keys', () => {
@@ -241,12 +239,12 @@ describe('official Claude terminal lifecycle', () => {
   })
 
   it('cache-busts terminal module when changing mobile controls', () => {
-    assert.match(MAIN, /from '\.\/officialTerminal\.js\?v=11'/)
-    assert.match(SW, /\/modules\/officialTerminal\.js\?v=11/)
-    assert.match(INDEX, /\/modules\/main\.js\?v=64/)
-    assert.match(INDEX, /\/style\.css\?v=53/)
+    assert.match(MAIN, /from '\.\/officialTerminal\.js\?v=12'/)
+    assert.match(SW, /\/modules\/officialTerminal\.js\?v=12/)
+    assert.match(INDEX, /\/modules\/main\.js\?v=65/)
+    assert.match(INDEX, /\/style\.css\?v=54/)
     assert.match(INDEX, /sw-flush-v23/)
-    assert.match(SW, /openclaude-v84/)
+    assert.match(SW, /openclaude-v85/)
   })
 
   it('terminal files live in a separate wide modal with Escape closing files first', () => {
@@ -270,18 +268,10 @@ describe('official Claude terminal lifecycle', () => {
     )
   })
 
-  it('wake lock helper remains gated even though the mobile shortcut is hidden', () => {
-    const requestSrc = extractFunction(SRC, 'requestWakeLock')
-    const releaseSrc = extractFunction(SRC, 'releaseWakeLock')
-    const initSrc = extractFunction(SRC, 'initOfficialClaudeTerminal')
-
+  it('wake lock feature is fully removed, leaving no orphan code', () => {
     assert.doesNotMatch(INDEX, /claude-terminal-wake-lock-btn/)
-    assert.match(requestSrc, /navigator\.wakeLock\.request\('screen'\)/)
-    assert.match(requestSrc, /!isModalOpen\(\)/)
-    assert.match(requestSrc, /!terminal/)
-    assert.match(requestSrc, /document\.visibilityState !== 'visible'/)
-    assert.match(releaseSrc, /keepWanted = false/)
-    assert.match(initSrc, /releaseWakeLock\(\{ keepWanted: true \}\)/)
+    assert.doesNotMatch(SRC, /wakeLock|WAKE_LOCK_BTN_ID/)
+    assert.doesNotMatch(STYLE, /claude-terminal-mobile-tools/)
   })
 
   it('mobile input dock is hidden on desktop and shown on narrow screens only', () => {
@@ -337,5 +327,60 @@ describe('official Claude terminal lifecycle', () => {
       /@media \(max-width: 860px\) and \(hover: hover\) and \(pointer: fine\) {[\s\S]*?\.claude-terminal-scroll-capture\s*{[\s\S]*?display:\s*none;/,
     )
     assert.match(STYLE, /\.claude-terminal-new-output\s*{[\s\S]*?z-index:\s*3;/)
+  })
+
+  it('exposes a sessions popover with new + history controls in the toolbar', () => {
+    assert.match(INDEX, /id="claude-terminal-sessions-btn"[\s\S]*aria-haspopup="menu"/)
+    assert.match(INDEX, /id="claude-terminal-sessions-menu"[\s\S]*role="menu"/)
+    assert.match(INDEX, /id="claude-terminal-sessions-new-btn"[\s\S]*role="menuitem"/)
+    assert.match(INDEX, /id="claude-terminal-sessions-list"/)
+    assert.match(STYLE, /\.claude-terminal-sessions-menu\s*{/)
+  })
+
+  it('new and resume intents reach the gateway via WS action query params', () => {
+    const connectSrc = extractFunction(SRC, 'connectTerminal')
+    assert.match(connectSrc, /action=new/)
+    assert.match(
+      connectSrc,
+      /action=resume&sessionId=\$\{encodeURIComponent\(intent\.sessionId\)\}/,
+    )
+    const newSrc = extractFunction(SRC, 'startNewClaudeSession')
+    assert.match(newSrc, /reconnectTerminal\(\{ action: 'new' \}\)/)
+    const resumeSrc = extractFunction(SRC, 'resumeClaudeSession')
+    assert.match(resumeSrc, /reconnectTerminal\(\{ action: 'resume', sessionId \}\)/)
+  })
+
+  it('renders session titles as untrusted text, not innerHTML', () => {
+    const renderSrc = extractFunction(SRC, 'renderTerminalSessions')
+    assert.match(renderSrc, /\.textContent = session\.title/)
+    assert.doesNotMatch(renderSrc, /innerHTML\s*=\s*[^']*session\.title/)
+  })
+
+  it('connection status is announced to assistive tech via aria-live', () => {
+    assert.match(INDEX, /id="claude-terminal-status"[\s\S]*aria-live="polite"/)
+  })
+
+  it('file tabs use valid tab/tabpanel ARIA roles', () => {
+    assert.match(
+      INDEX,
+      /id="ct-file-tab-recent"\s+role="tab"\s+aria-selected="true"\s+aria-controls="ct-file-pane-recent"/,
+    )
+    assert.match(
+      INDEX,
+      /id="ct-file-pane-recent"\s+role="tabpanel"\s+aria-labelledby="ct-file-tab-recent"/,
+    )
+    const tabSrc = extractFunction(SRC, 'setTerminalFilePanelTab')
+    assert.match(tabSrc, /setAttribute\('aria-selected'/)
+  })
+
+  it('context menu is keyboard navigable and busy buttons are disabled in flight', () => {
+    const showSrc = extractFunction(SRC, 'showTerminalContextMenu')
+    assert.match(showSrc, /contextMenuFocusables\(\)\[0\]\?\.focus\(\)/)
+    const keySrc = extractFunction(SRC, 'handleTerminalContextMenuKeydown')
+    assert.match(keySrc, /ArrowDown/)
+    assert.match(keySrc, /ArrowUp/)
+    const busySrc = extractFunction(SRC, 'updateTerminalBusyButtons')
+    assert.match(busySrc, /reconnect\.disabled = connecting \|\| terminateInFlight/)
+    assert.match(busySrc, /kill\.disabled = terminateInFlight/)
   })
 })
