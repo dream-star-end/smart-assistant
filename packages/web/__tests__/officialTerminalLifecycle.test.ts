@@ -217,7 +217,10 @@ describe('official Claude terminal lifecycle', () => {
     assert.match(INDEX, /data-claude-terminal-menu-action="paste"/)
     assert.match(STYLE, /\.claude-terminal-context-menu\s*{[\s\S]*?position:\s*fixed;/)
     assert.match(showMenuSrc, /terminalContextSelectionText = selectedTerminalText\(\)/)
-    assert.match(showMenuSrc, /copySelectionButton\.disabled = !terminalContextSelectionText\.trim\(\)/)
+    assert.match(
+      showMenuSrc,
+      /copySelectionButton\.disabled = !terminalContextSelectionText\.trim\(\)/,
+    )
     assert.match(actionSrc, /const selection = terminalContextSelectionText/)
     assert.match(actionSrc, /copyTerminalContent\(\{ mode: 'selection', selection \}\)/)
     assert.match(actionSrc, /copyTerminalContent\(\{ mode: 'visible' \}\)/)
@@ -226,8 +229,14 @@ describe('official Claude terminal lifecycle', () => {
     assert.match(pasteSrc, /sendTerminalInput\(normalized\)/)
     assert.match(shortcutSrc, /if \(!event\.shiftKey && !selection\.trim\(\)\) return/)
     assert.match(shortcutSrc, /key === 'v' && navigator\.clipboard\?\.readText/)
-    assert.match(initSrc, /document\.addEventListener\('contextmenu', handleTerminalContextMenu, true\)/)
-    assert.match(initSrc, /document\.addEventListener\('keydown', handleTerminalClipboardShortcut, true\)/)
+    assert.match(
+      initSrc,
+      /document\.addEventListener\('contextmenu', handleTerminalContextMenu, true\)/,
+    )
+    assert.match(
+      initSrc,
+      /document\.addEventListener\('keydown', handleTerminalClipboardShortcut, true\)/,
+    )
     assert.match(hideSrc, /hideTerminalContextMenu\(\)/)
   })
 
