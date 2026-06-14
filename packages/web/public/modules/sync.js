@@ -672,6 +672,110 @@ export function _mergePartialTail(localMessages, tail, expectedCount, expectedMa
   return _mergeServerAuthoredIntoLocal(serverVisible, local)
 }
 
+export function _serverTimelineSettlesLocalInFlight(existingLocal, mergedMessages) {
+  if (!existingLocal?._sendingInFlight) return false
+  if (!Array.isArray(mergedMessages)) return false
+  const localMessages = Array.isArray(existingLocal.messages) ? existingLocal.messages : []
+  if (localMessages.length === 0) return false
+
+  const mergedIndexById = new Map()
+  for (let i = 0; i < mergedMessages.length; i++) {
+    const id = mergedMessages[i]?.id
+    if (typeof id === 'string' && !mergedIndexById.has(id)) mergedIndexById.set(id, i)
+  }
+
+  let anchorIdx = -1
+  const trackerId = typeof existingLocal._replyingToMsgId === 'string'
+    ? existingLocal._replyingToMsgId
+    : ''
+  if (trackerId && mergedIndexById.has(trackerId)) {
+    const idx = mergedIndexById.get(trackerId)
+    if (mergedMessages[idx]?.role === 'user') anchorIdx = idx
+  }
+
+  if (anchorIdx < 0) {
+    const latestLocalUser = [...localMessages].reverse().find((m) => m?.role === 'user')
+    if (!latestLocalUser) return false
+    const runningStatuses = ['sending', 'sent', 'read']
+    if (!runningStatuses.includes(latestLocalUser.status)) return false
+    const idx = typeof latestLocalUser.id === 'string'
+      ? mergedIndexById.get(latestLocalUser.id)
+      : undefined
+    if (idx === undefined || mergedMessages[idx]?.role !== 'user') return false
+    anchorIdx = idx
+  }
+
+  for (let i = anchorIdx + 1; i < mergedMessages.length; i++) {
+    const m = mergedMessages[i]
+    if (m?.role === 'user') break
+    const isTerminalTurnRow =
+      m?._source === 'server' &&
+      (
+        (m.role === 'assistant' && ['completed', 'interrupted', 'crashed'].includes(m.status)) ||
+        ((m.role === 'thinking' || m.role === 'tool') && ['interrupted', 'crashed'].includes(m.status))
+      )
+    if (
+      isTerminalTurnRow
+    ) {
+      return true
+    }
+  }
+  return false
+}
+
+export function _shouldFetchSessionMetaForSync(meta, local, live) {
+  if (!local) return true
+  if (live?._liveStreamBroken) return true
+  return !!(local._syncedAt && meta?.updatedAt > local._syncedAt)
+}
+
+export function _clearLocalInFlightAfterServerSettle(sess, now = Date.now()) {
+  if (!sess) return false
+  const hadTurnState = !!(
+    sess._sendingInFlight ||
+    sess._turnStartedAt ||
+    sess._lastFrameAt ||
+    sess._activeTeamRun ||
+    sess._replyingToMsgId ||
+    sess._streamingAssistant ||
+    sess._streamingThinking
+  )
+  sess._sendingInFlight = false
+  sess._streamingAssistant = null
+  sess._streamingThinking = null
+  sess._turnStartedAt = null
+  sess._lastFrameAt = null
+  sess._activeTeamRun = null
+  sess._isFirstTurnAfterReady = false
+  sess._turnStatus = null
+  sess._replyingToMsgId = null
+  sess._currentTurnBlockCount = 0
+  sess._trackerResetAt = now
+  return hadTurnState
+}
+
+export function _settleSyncedSessionInFlight(sess, now = Date.now()) {
+  _clearLocalInFlightAfterServerSettle(sess, now)
+  if (sess?.id === state.currentSessionId) state.sendingInFlight = false
+}
+
+export function _preserveLocalInFlightRuntime(existingLocal, sess) {
+  if (!existingLocal?._sendingInFlight || !sess) return
+  sess._sendingInFlight = true
+  if (existingLocal._turnStartedAt) sess._turnStartedAt = existingLocal._turnStartedAt
+  if (existingLocal._lastFrameAt) sess._lastFrameAt = existingLocal._lastFrameAt
+  if (existingLocal._activeTeamRun) sess._activeTeamRun = { ...existingLocal._activeTeamRun }
+  if (existingLocal._streamingAssistant) sess._streamingAssistant = existingLocal._streamingAssistant
+  if (existingLocal._streamingThinking) sess._streamingThinking = existingLocal._streamingThinking
+  if (existingLocal._replyingToMsgId) sess._replyingToMsgId = existingLocal._replyingToMsgId
+  if (existingLocal._currentTurnBlockCount) sess._currentTurnBlockCount = existingLocal._currentTurnBlockCount
+  if (existingLocal._isFirstTurnAfterReady) sess._isFirstTurnAfterReady = true
+  if (existingLocal._turnStatus) sess._turnStatus = existingLocal._turnStatus
+  if (existingLocal._pendingCostCredits) sess._pendingCostCredits = existingLocal._pendingCostCredits
+  if (existingLocal._lastFinaledAssistantId) sess._lastFinaledAssistantId = existingLocal._lastFinaledAssistantId
+  if (existingLocal._lastFinaledAt) sess._lastFinaledAt = existingLocal._lastFinaledAt
+}
+
 /**
  * Pull session list from server, merge with local IndexedDB.
  * Server wins on conflict (newer updatedAt / lastAt).
@@ -730,37 +834,11 @@ export async function syncSessionsFromServer() {
   for (const meta of serverList) {
     const local = localMap.get(meta.id)
     const live = state.sessions.get(meta.id)
-    if (!local) {
-      toFetch.push(meta.id)
-    } else if (live?._liveStreamBroken) {
-      // Phase 0.4 P1-1: force-fetch any session whose live stream is flagged
-      // known-broken, REGARDLESS of server `updatedAt`. Two cases the normal
-      // `updatedAt > _syncedAt` gate would miss:
-      //   1. Server restart (resume_failed.to=0): the on-disk tape hasn't
-      //      necessarily grown since our last sync, so `updatedAt` can be
-      //      unchanged. Without a fetch the merge never runs, the merged
-      //      `sess` object is never persisted, and the synchronously-
-      //      advanced `_lastFrameSeq` (websocket.js handleResumeFailed)
-      //      stays only in memory for THIS tab — reload resurrects the
-      //      stale cursor and loops on the next reconnect.
-      //   2. `_liveStreamBroken` itself must be cleaned out of IDB. It's
-      //      written by the synchronous `dbPut` in handleResumeFailed as
-      //      a belt for case 1; if the sync never rewrites the session,
-      //      that flag persists to a future boot, where it would bypass
-      //      the in-flight skip guard for unrelated syncs.
-      // Force-fetch guarantees both concerns are resolved by the normal
-      // merge path at sync.js:~260 (which builds `sess` WITHOUT
-      // `_liveStreamBroken`, carries forward `_lastFrameSeq` via existingLocal,
-      // and dbPuts the clean version).
-      toFetch.push(meta.id)
-    } else if (local._syncedAt && meta.updatedAt > local._syncedAt) {
-      // Server has a newer version than our last sync point (server clock only).
-      // Normal in-flight guard still applies here — only the resume_failed
-      // flag unconditionally forces a fetch (branch above).
-      if (
-        meta.id === state.currentSessionId &&
-        state.sendingInFlight
-      ) continue
+    if (_shouldFetchSessionMetaForSync(meta, local, live)) {
+      // Do NOT skip the current session merely because state.sendingInFlight
+      // is true. A missed isFinal leaves exactly that flag stuck; fetching the
+      // newer server tape lets the merge below either preserve a live turn or
+      // clear a turn that already reached a server-authored terminal row.
       toFetch.push(meta.id)
     }
   }
@@ -855,10 +933,13 @@ export async function syncSessionsFromServer() {
             pinned: remote.pinned || false,
             _syncedAt: remote.updatedAt,
           }
-          if (existingLocal._sendingInFlight) sess._sendingInFlight = true
-          if (existingLocal._turnStartedAt) sess._turnStartedAt = existingLocal._turnStartedAt
-          if (existingLocal._lastFrameAt) sess._lastFrameAt = existingLocal._lastFrameAt
-          if (existingLocal._activeTeamRun) sess._activeTeamRun = { ...existingLocal._activeTeamRun }
+          const settledByServer = _serverTimelineSettlesLocalInFlight(existingLocal, sess.messages)
+          if (existingLocal._sendingInFlight && !settledByServer) {
+            _preserveLocalInFlightRuntime(existingLocal, sess)
+          } else if (settledByServer) {
+            _settleSyncedSessionInFlight(sess)
+            trace('sync.inflight.settled_by_server', { sess: sess.id, mode: 'partial' })
+          }
           // Team picker selection is local/session-scoped metadata. The server
           // session payload is intentionally schema-light and does not echo it
           // back, so preserve the local value across sync-shaped replacements.
@@ -928,6 +1009,14 @@ export async function syncSessionsFromServer() {
     const PENDING_SEND_STATUSES = new Set(['sending', 'queued', 'sent', 'read'])
     let mergedMessages = null
     let hasPreservedPending = false
+    let dirtyServerSettled = false
+    if (existingLocal?._dirty && existingLocal?._sendingInFlight) {
+      const tentativeMerge = _mergeServerAuthoredIntoLocal(
+        remote.messages || [],
+        existingLocal.messages || [],
+      )
+      dirtyServerSettled = _serverTimelineSettlesLocalInFlight(existingLocal, tentativeMerge)
+    }
     if (existingLocal?._liveStreamBroken && existingLocal?._dirty) {
       const serverById = new Map()
       for (const m of remote.messages || []) if (m?.id) serverById.set(m.id, m)
@@ -966,7 +1055,25 @@ export async function syncSessionsFromServer() {
       // we kill on the main path would otherwise re-emerge on the
       // resume_failed recovery path.
       mergedMessages = out
-    } else if (existingLocal?._dirty && !existingLocal?._liveStreamBroken) {
+    } else if (existingLocal?._dirty) {
+      if (dirtyServerSettled) {
+        // Keep the long-standing dirty-session protection: unsynced local
+        // edits (rename/pin/agent switch/message delete/etc.) must not be
+        // overwritten by a background REST pull. Still clear the local
+        // in-flight UI flags when the server-authored tape proves the turn
+        // already reached a terminal row; this is the missed-isFinal recovery
+        // path for dirty sessions.
+        const live = state.sessions.get(remote.id)
+        if (live) _settleSyncedSessionInFlight(live)
+        if (existingLocal && existingLocal !== live) _clearLocalInFlightAfterServerSettle(existingLocal)
+        if (remote.id === state.currentSessionId) {
+          state.sendingInFlight = false
+          currentSessionUpdated = true
+        }
+        fetchedCount++
+        trace('sync.inflight.settled_by_server', { sess: remote.id, mode: 'dirty-skip' })
+        try { await dbPut({ ...(live || existingLocal) }) } catch {}
+      }
       continue
     }
     // When the _liveStreamBroken+_dirty branch above already produced a
@@ -999,17 +1106,17 @@ export async function syncSessionsFromServer() {
       // 409 loop).
       sess._dirty = true
     }
-    // Preserve local turn-state across the server-merge — the server
-    // deliberately strips _sendingInFlight / _turnStartedAt / _lastFrameAt
-    // on push (see pushSessionToServer strip list below), so a naive replace
-    // would wipe out the in-flight marker for a non-current session the
-    // user has mid-turn. Keeping these locally-owned fields lets the hello
-    // handshake keep reporting inFlight=true and lets sanitizeLoadedTurnState
-    // continue to govern staleness.
-    if (existingLocal?._sendingInFlight) sess._sendingInFlight = true
-    if (existingLocal?._turnStartedAt) sess._turnStartedAt = existingLocal._turnStartedAt
-    if (existingLocal?._lastFrameAt) sess._lastFrameAt = existingLocal._lastFrameAt
-    if (existingLocal?._activeTeamRun) sess._activeTeamRun = { ...existingLocal._activeTeamRun }
+    // Preserve local turn-state across the server-merge only while the REST
+    // tape has not already proven the same turn reached a server-authored
+    // terminal row. This keeps mobile/weak-network recovery from re-wedging
+    // `_sendingInFlight` after the client missed the live isFinal frame.
+    const settledByServer = _serverTimelineSettlesLocalInFlight(existingLocal, sess.messages)
+    if (existingLocal?._sendingInFlight && !settledByServer) {
+      _preserveLocalInFlightRuntime(existingLocal, sess)
+    } else if (settledByServer) {
+      _settleSyncedSessionInFlight(sess)
+      trace('sync.inflight.settled_by_server', { sess: sess.id, mode: 'full' })
+    }
     // Same local/session-scoped metadata preservation as the partial-sync
     // path above. Without this, server-wins refreshes erase the explicit
     // per-session team choice and the UI falls back to last user-scoped
