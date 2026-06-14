@@ -66,8 +66,12 @@ let initialized = false
 let lastMobileControlPointerAt = 0
 let lastTerminalCopyPointerAt = 0
 // Claude Code 是持续重绘的 TUI，xterm 会在重绘时清掉选区；这里缓存「最近一次非空选区」，
-// 让用户选完到点复制之间即便发生重绘也仍能复制到刚选的内容。新交互(终端内 pointerdown)时清空。
+// 让用户选完到点复制之间即便发生重绘也仍能复制到刚选的内容。
+// 为避免陈旧选区误导（如选后只用键盘、稍后 Ctrl+C 本应透传 SIGINT），缓存有三重边界：
+// ①TTL 过期失效 ②被一次复制消费后清空 ③终端内左键起新交互/dispose 时清空。
 let lastTerminalSelection = ''
+let lastTerminalSelectionAt = 0
+const TERMINAL_SELECTION_CACHE_TTL_MS = 4000
 let terminalTouchScrollY = null
 let terminalTouchScrollRemainder = 0
 let terminalTouchScrollTargets = []
@@ -150,11 +154,27 @@ function visibleTerminalText() {
   return lines.join('\n')
 }
 
+function clearTerminalSelectionCache() {
+  lastTerminalSelection = ''
+  lastTerminalSelectionAt = 0
+}
+
+// TTL 内的缓存选区才有效，避免长时间后的陈旧选区误导复制/Ctrl+C。
+function cachedTerminalSelection() {
+  if (!lastTerminalSelection.trim()) return ''
+  if (Date.now() - lastTerminalSelectionAt > TERMINAL_SELECTION_CACHE_TTL_MS) {
+    clearTerminalSelectionCache()
+    return ''
+  }
+  return lastTerminalSelection
+}
+
 function selectedTerminalText() {
   const xtermSelection = terminal?.hasSelection?.() ? terminal.getSelection() : ''
   if (xtermSelection.trim()) return xtermSelection
-  // 实时选区已被 TUI 重绘清掉时，用最近捕获的选区兜底（新交互时已清空，不会发陈旧值）。
-  if (lastTerminalSelection.trim()) return lastTerminalSelection
+  // 实时选区已被 TUI 重绘清掉时，用最近捕获的选区兜底（TTL/消费/新交互三重边界，不发陈旧值）。
+  const cached = cachedTerminalSelection()
+  if (cached.trim()) return cached
 
   const selection = window.getSelection?.()
   const text = selection?.toString() || ''
@@ -184,12 +204,10 @@ async function copyTerminalContent({ mode = 'auto', selection = selectedTerminal
     toast('复制失败，请检查浏览器剪贴板权限', 'error')
     return
   }
-  toast(
-    mode === 'selection' || (mode === 'auto' && hasSelection)
-      ? '已复制选中内容'
-      : '已复制当前可见终端内容',
-    'success',
-  )
+  const copiedSelection = mode === 'selection' || (mode === 'auto' && hasSelection)
+  // 选区已被这次复制消费，清空缓存：后续 Ctrl+C 应恢复透传 SIGINT，复制按钮应回到复制可见内容。
+  if (copiedSelection) clearTerminalSelectionCache()
+  toast(copiedSelection ? '已复制选中内容' : '已复制当前可见终端内容', 'success')
 }
 
 async function pasteClipboardToTerminal() {
@@ -854,7 +872,10 @@ function createTerminal() {
   // 选区一出现就捕获，避免 TUI 重绘把它清掉后复制取不到（见 lastTerminalSelection 注释）。
   terminal.onSelectionChange?.(() => {
     const selected = terminal?.getSelection?.() || ''
-    if (selected.trim()) lastTerminalSelection = selected
+    if (selected.trim()) {
+      lastTerminalSelection = selected
+      lastTerminalSelectionAt = Date.now()
+    }
   })
   terminalScrollDisposable = terminal.onScroll?.(() => {
     updateNewOutputButton()
@@ -901,7 +922,7 @@ function attachTerminal() {
 function disposeTerminal() {
   hideNewOutputButton()
   hideTerminalContextMenu()
-  lastTerminalSelection = ''
+  clearTerminalSelectionCache()
   cleanupTerminalScrollCapture()
   cleanupTerminalTouchScrollTargets()
   if (terminalScrollDisposable) {
@@ -2009,7 +2030,7 @@ export function initOfficialClaudeTerminal() {
   // 只在主键(button 0)清空：右键是为了开上下文菜单复制选区，不能把缓存提前清掉。
   // 绑定在持久容器上一次即可（attachTerminal 可能多次执行，避免重复叠加监听）。
   $(CONTAINER_ID)?.addEventListener('pointerdown', (event) => {
-    if (event.button === 0) lastTerminalSelection = ''
+    if (event.button === 0) clearTerminalSelectionCache()
   })
   $(CONTEXT_MENU_ID)?.addEventListener('click', handleTerminalContextMenuAction)
   $(CONTEXT_MENU_ID)?.addEventListener('keydown', handleTerminalContextMenuKeydown)
