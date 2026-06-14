@@ -4752,24 +4752,46 @@ body.voice-overlay-open {
   display: flex;
   align-items: center;
   justify-content: flex-end;
-  gap: var(--space-2);
+  gap: var(--space-1);
   flex-wrap: wrap;
 }
+/* 会话 ▾ 保留文字标签（下拉触发器）；复制/上传/文件 走图标按钮 */
 .claude-terminal-toolbar-actions .btn {
-  min-height: 32px;
-  padding: 5px 10px;
+  min-height: 34px;
+  padding: 5px 12px;
+  border-radius: var(--radius-md);
+}
+.claude-terminal-toolbar-actions .icon-btn {
+  width: 34px;
+  height: 34px;
+  border: 1px solid transparent;
+}
+.claude-terminal-toolbar-actions .icon-btn:hover:not(:disabled) {
+  border-color: var(--border);
 }
 .claude-terminal-status {
   display: inline-flex;
   align-items: center;
-  min-height: 28px;
-  padding: 4px 10px;
+  gap: var(--space-2);
+  min-height: 30px;
+  padding: 4px 12px 4px 11px;
   border: 1px solid var(--border);
   border-radius: var(--radius-full);
   background: var(--bg-raised);
   color: var(--fg-muted);
   font-size: var(--text-sm);
   font-family: var(--font-mono);
+  transition: color var(--transition-base), border-color var(--transition-base), background
+    var(--transition-base);
+}
+/* live 状态点：随 data-state 变色，连接/运行中呼吸（pulse 复用全局 keyframe） */
+.claude-terminal-status::before {
+  content: "";
+  flex: 0 0 auto;
+  width: 7px;
+  height: 7px;
+  border-radius: var(--radius-full);
+  background: currentColor;
 }
 .claude-terminal-status[data-state="running"] {
   color: var(--success);
@@ -4780,6 +4802,10 @@ body.voice-overlay-open {
   color: var(--accent);
   border-color: var(--accent-border);
   background: color-mix(in srgb, var(--accent) 10%, var(--bg-raised));
+}
+.claude-terminal-status[data-state="running"]::before,
+.claude-terminal-status[data-state="connecting"]::before {
+  animation: pulse 1.6s ease-in-out infinite;
 }
 .claude-terminal-status[data-state="error"],
 .claude-terminal-status[data-state="disabled"] {
@@ -4816,6 +4842,8 @@ body.voice-overlay-open {
   background: var(--bg-elevated);
   box-shadow: var(--shadow-lg);
   overflow: hidden;
+  transform-origin: top left;
+  animation: saveMenuIn var(--transition-base);
 }
 .claude-terminal-sessions-menu[hidden] {
   display: none;
@@ -4949,6 +4977,7 @@ body.voice-overlay-open {
 .claude-terminal-file-pane:not([hidden]) {
   display: flex;
   flex-direction: column;
+  animation: fade-in var(--transition-base);
 }
 .claude-terminal-file-list {
   display: flex;
@@ -5076,9 +5105,10 @@ body.voice-overlay-open {
   touch-action: pan-y;
   border: 1px solid var(--border-strong);
   border-radius: var(--radius-xl);
-  background: var(--bg);
+  /* 与 xterm theme.background(--code-bg) 一致，营造「真终端」深色面板质感 */
+  background: var(--code-bg);
   padding: var(--space-3);
-  box-shadow: inset 0 0 0 1px var(--border-subtle);
+  box-shadow: var(--shadow-md), inset 0 1px 0 color-mix(in srgb, var(--fg) 7%, transparent);
 }
 .claude-terminal-container .xterm {
   height: 100%;
@@ -5092,6 +5122,21 @@ body.voice-overlay-open {
   -webkit-overflow-scrolling: touch;
   overscroll-behavior: contain;
   touch-action: pan-y;
+  scrollbar-width: thin;
+  scrollbar-color: var(--scrollbar) transparent;
+}
+.claude-terminal-container .xterm-viewport::-webkit-scrollbar {
+  width: 10px;
+}
+.claude-terminal-container .xterm-viewport::-webkit-scrollbar-thumb {
+  border: 2px solid transparent;
+  border-radius: var(--radius-full);
+  background: var(--scrollbar);
+  background-clip: padding-box;
+}
+.claude-terminal-container .xterm-viewport::-webkit-scrollbar-thumb:hover {
+  background: var(--scrollbar-hover);
+  background-clip: padding-box;
 }
 .claude-terminal-container .xterm-screen {
   touch-action: pan-y;
@@ -5200,7 +5245,10 @@ body.voice-overlay-open {
   padding: var(--space-3);
   border: 1px solid var(--border);
   border-radius: var(--radius-xl);
-  background: var(--bg-raised);
+  background: var(--glass-bg);
+  -webkit-backdrop-filter: blur(12px);
+  backdrop-filter: blur(12px);
+  box-shadow: var(--shadow-md), inset 0 1px 0 color-mix(in srgb, var(--fg) 6%, transparent);
 }
 .claude-terminal-mobile-input-row {
   display: flex;
@@ -5220,6 +5268,7 @@ body.voice-overlay-open {
   font-family: var(--font-mono);
   font-size: 16px;
   line-height: 1.35;
+  transition: border-color var(--transition-fast), box-shadow var(--transition-fast);
 }
 .claude-terminal-mobile-input-row textarea:focus {
   outline: none;
@@ -5231,11 +5280,16 @@ body.voice-overlay-open {
   gap: var(--space-2);
   overflow-x: auto;
   padding-bottom: 2px;
+  scrollbar-width: none;
+  -webkit-overflow-scrolling: touch;
+}
+.claude-terminal-mobile-keys::-webkit-scrollbar {
+  display: none;
 }
 .claude-terminal-mobile-keys button {
   flex: 0 0 auto;
-  min-height: 34px;
-  padding: 6px 10px;
+  min-height: 36px;
+  padding: 6px 12px;
   border: 1px solid var(--border);
   border-radius: var(--radius-md);
   background: var(--bg-elevated);
@@ -5244,14 +5298,17 @@ body.voice-overlay-open {
   font-size: var(--text-sm);
   touch-action: manipulation;
   user-select: none;
+  transition: background var(--transition-fast), border-color var(--transition-fast), transform
+    var(--transition-fast);
 }
 .claude-terminal-mobile-keys button[data-claude-terminal-action] {
   border-color: var(--accent-border);
   background: var(--accent-soft);
   color: var(--accent);
+  font-weight: 600;
 }
 .claude-terminal-mobile-keys button:active {
-  transform: scale(0.97);
+  transform: scale(0.95);
   background: var(--bg-hover);
 }
 .claude-terminal-foot .btn-danger {
@@ -5284,13 +5341,21 @@ body.voice-overlay-open {
     justify-content: flex-start;
   }
   .claude-terminal-toolbar-actions .btn {
-    min-height: 30px;
-    padding: 4px 9px;
+    min-height: 32px;
+    padding: 4px 11px;
     font-size: var(--text-xs);
   }
+  .claude-terminal-toolbar-actions .icon-btn {
+    width: 32px;
+    height: 32px;
+  }
+  .claude-terminal-toolbar-actions .icon-btn svg {
+    width: 17px;
+    height: 17px;
+  }
   .claude-terminal-status {
-    min-height: 24px;
-    padding: 3px 8px;
+    min-height: 26px;
+    padding: 3px 10px 3px 9px;
     font-size: var(--text-xs);
   }
   .claude-terminal-hint {
@@ -5398,6 +5463,17 @@ body.voice-overlay-open {
 @media (max-width: 860px) and (hover: hover) and (pointer: fine) {
   .claude-terminal-scroll-capture {
     display: none;
+  }
+}
+/* 尊重系统「减少动态效果」：关闭终端新增的循环/入场动画 */
+@media (prefers-reduced-motion: reduce) {
+  .claude-terminal-status::before,
+  .claude-terminal-sessions-menu,
+  .claude-terminal-file-pane:not([hidden]) {
+    animation: none;
+  }
+  .claude-terminal-new-output {
+    transition: opacity var(--transition-fast);
   }
 }
 

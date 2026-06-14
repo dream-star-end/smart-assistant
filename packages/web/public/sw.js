@@ -1,16 +1,16 @@
 // OpenClaude Service Worker
 // App-shell caching only. Never intercept /ws, /api/*, or external CDN requests.
-const VERSION = 'openclaude-v85'
+const VERSION = 'openclaude-v86'
 const SHELL = [
   '/',
   '/index.html',
   '/style.css',
-  '/style.css?v=54', // versioned URL used in index.html
+  '/style.css?v=55', // versioned URL used in index.html
   '/manifest.json',
   '/icon.svg',
   // ES modules
   '/modules/main.js',
-  '/modules/main.js?v=65', // versioned URL used in index.html
+  '/modules/main.js?v=66', // versioned URL used in index.html
   '/modules/dom.js',
   '/modules/util.js',
   '/modules/state.js',
@@ -51,7 +51,7 @@ const SHELL = [
   '/modules/wechat.js',
   '/modules/researchTools.js',
   '/modules/officialTerminal.js',
-  '/modules/officialTerminal.js?v=12',
+  '/modules/officialTerminal.js?v=13',
   '/modules/export-docx.js',
   '/modules/export-tex.js',
   // Vendored dependencies
