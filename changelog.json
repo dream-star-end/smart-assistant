@@ -1,13 +1,4 @@
 {
-  "currentVersion": "v1.0.319",
-  "releases": [
-    {
-      "version": "PENDING",
-      "date": "",
-      "title": "修复旧安卓键盘遮挡输入框",
-      "items": [
-        "- 优化移动端键盘弹出时的可视高度计算，避免消息输入框和发送按钮被键盘挡住。"
-      ]
-    }
-  ]
+  "currentVersion": "v1.0.320",
+  "releases": []
 }
