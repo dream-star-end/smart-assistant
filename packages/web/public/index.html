@@ -802,6 +802,7 @@
         <span id="claude-terminal-status" class="claude-terminal-status" data-state="idle">未连接</span>
         <div class="claude-terminal-toolbar-actions">
           <input id="claude-terminal-file-input" type="file" multiple hidden />
+          <button id="claude-terminal-copy-btn" class="btn btn-ghost" type="button" title="复制选中内容；未选中时复制当前可见输出" aria-label="复制终端内容">复制</button>
           <button id="claude-terminal-upload-btn" class="btn btn-ghost" type="button">上传</button>
           <button id="claude-terminal-files-btn" class="btn btn-ghost" type="button">文件</button>
           <span class="claude-terminal-hint">关闭=隐藏会话；终止=结束 Claude。</span>
@@ -933,6 +934,6 @@
 <script src="/vendor/katex/katex.min.js" defer></script>
 <script src="/vendor/qrcode.min.js"></script>
 <div id="toast" class="toast"></div>
-<script type="module" src="/modules/main.js?v=61"></script>
+<script type="module" src="/modules/main.js?v=62"></script>
 </body>
 </html>

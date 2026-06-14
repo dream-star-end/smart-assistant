@@ -18,6 +18,7 @@ const MOBILE_FOCUS_BTN_ID = 'claude-terminal-mobile-focus-btn'
 const MOBILE_HISTORY_PREV_BTN_ID = 'claude-terminal-history-prev-btn'
 const MOBILE_HISTORY_NEXT_BTN_ID = 'claude-terminal-history-next-btn'
 const WAKE_LOCK_BTN_ID = 'claude-terminal-wake-lock-btn'
+const COPY_BTN_ID = 'claude-terminal-copy-btn'
 const FILE_INPUT_ID = 'claude-terminal-file-input'
 const FILE_UPLOAD_BTN_ID = 'claude-terminal-upload-btn'
 const FILE_PANEL_BTN_ID = 'claude-terminal-files-btn'
@@ -96,25 +97,68 @@ function formatBytes(bytes) {
 }
 
 function copyText(text) {
-  if (!text) return
-  if (navigator.clipboard?.writeText) {
-    navigator.clipboard.writeText(text).catch(() => fallbackCopyText(text))
-    return
-  }
-  fallbackCopyText(text)
+  void copyTextToClipboard(text)
 }
 
 function fallbackCopyText(text) {
+  if (!text) return false
   const ta = document.createElement('textarea')
   ta.value = text
   ta.style.position = 'fixed'
+  ta.style.left = '0'
+  ta.style.top = '0'
   ta.style.opacity = '0'
+  ta.setAttribute('readonly', '')
   document.body.appendChild(ta)
+  ta.focus({ preventScroll: true })
   ta.select()
+  ta.setSelectionRange(0, ta.value.length)
+  let ok = false
   try {
-    document.execCommand('copy')
+    ok = document.execCommand('copy')
   } catch {}
   ta.remove()
+  return ok
+}
+
+async function copyTextToClipboard(text) {
+  if (!text) return false
+  if (navigator.clipboard?.writeText) {
+    try {
+      await navigator.clipboard.writeText(text)
+      return true
+    } catch {}
+  }
+  return fallbackCopyText(text)
+}
+
+function visibleTerminalText() {
+  if (!terminal) return ''
+  const buffer = terminal.buffer.active
+  const start = Number.isFinite(buffer.viewportY) ? buffer.viewportY : 0
+  const end = Math.min(buffer.length, start + terminal.rows)
+  const lines = []
+  for (let i = start; i < end; i += 1) {
+    lines.push(buffer.getLine(i)?.translateToString(true) || '')
+  }
+  while (lines.length && lines[lines.length - 1] === '') lines.pop()
+  return lines.join('\n')
+}
+
+async function copyTerminalContent() {
+  const selection = terminal?.hasSelection?.() ? terminal.getSelection() : ''
+  const hasSelection = Boolean(selection.trim())
+  const text = hasSelection ? selection : visibleTerminalText()
+  if (!text.trim()) {
+    toast('没有可复制的终端内容', 'warning')
+    return
+  }
+  const ok = await copyTextToClipboard(text)
+  if (!ok) {
+    toast('复制失败，请检查浏览器剪贴板权限', 'error')
+    return
+  }
+  toast(hasSelection ? '已复制选中内容' : '已复制当前可见终端内容', 'success')
 }
 
 function shellQuotePath(path) {
@@ -1580,6 +1624,7 @@ export function initOfficialClaudeTerminal() {
   $(KILL_BTN_ID)?.addEventListener('click', () => terminateOfficialClaudeTerminal())
   $(RECONNECT_BTN_ID)?.addEventListener('click', () => reconnectTerminal())
   $(NEW_OUTPUT_BTN_ID)?.addEventListener('click', () => scrollTerminalToBottom())
+  $(COPY_BTN_ID)?.addEventListener('click', () => void copyTerminalContent())
   $(FILE_UPLOAD_BTN_ID)?.addEventListener('click', () => $(FILE_INPUT_ID)?.click())
   $(FILE_MODAL_UPLOAD_BTN_ID)?.addEventListener('click', () => $(FILE_INPUT_ID)?.click())
   $(FILE_PANEL_BTN_ID)?.addEventListener('click', () => toggleTerminalFilePanel())
