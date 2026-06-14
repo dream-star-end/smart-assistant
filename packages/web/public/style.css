@@ -232,6 +232,17 @@ a:hover {
   border-radius: var(--radius-sm);
 }
 
+/* Disclosure 头(JS makeDisclosure 赋了 role=button + tabindex)的键盘焦点环。
+   父卡片 .msg.tool / .agent-group / .msg.thinking 是 overflow:hidden,会裁掉全局
+   :focus-visible 的**外**阴影 ring,所以这里用 **inset** 阴影画在头内部,保证
+   键盘聚焦时可见(鼠标点击不受影响)。 */
+.agent-group-header:focus-visible,
+.tool-card-header:focus-visible,
+.thinking-header:focus-visible {
+  outline: none;
+  box-shadow: inset 0 0 0 2px var(--accent);
+}
+
 /* ══════════════════════════════════════════════════════════════════
  *  Scrollbars
  * ══════════════════════════════════════════════════════════════════ */
