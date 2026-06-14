@@ -8,6 +8,7 @@ import { closeModal, openModal, toast } from './ui.js'
 const MODAL_ID = 'claude-terminal-modal'
 const CONTAINER_ID = 'claude-terminal-container'
 const SCROLL_CAPTURE_ID = 'claude-terminal-scroll-capture'
+const CONTEXT_MENU_ID = 'claude-terminal-context-menu'
 const STATUS_ID = 'claude-terminal-status'
 const KILL_BTN_ID = 'claude-terminal-kill-btn'
 const RECONNECT_BTN_ID = 'claude-terminal-reconnect-btn'
@@ -36,6 +37,7 @@ const FILE_DOWNLOAD_BTN_ID = 'claude-terminal-download-btn'
 const FILE_PREVIEW_BTN_ID = 'claude-terminal-preview-btn'
 const CLOSE_SELECTOR = '[data-claude-terminal-close]'
 const FILE_MODAL_CLOSE_SELECTOR = '[data-claude-terminal-files-close]'
+const CONTEXT_MENU_ACTION_SELECTOR = '[data-claude-terminal-menu-action]'
 const MAX_TERMINAL_INPUT_BYTES = 32 * 1024
 const RECONNECT_ATTEMPT_MIN_MS = 1500
 const STALE_BACKGROUND_RECONNECT_MS = 30 * 1000
@@ -80,6 +82,7 @@ let wakeLockWanted = false
 let terminalHiddenAt = null
 let terminalReconnectTimer = null
 let terminalRecentFiles = []
+let terminalContextSelectionText = ''
 const terminalUploads = []
 let terminalBrowsePath = ''
 let terminalBrowseRequestSeq = 0
@@ -159,12 +162,18 @@ function selectedTerminalText() {
   return ''
 }
 
-async function copyTerminalContent() {
-  const selection = selectedTerminalText()
+async function copyTerminalContent({ mode = 'auto', selection = selectedTerminalText() } = {}) {
   const hasSelection = Boolean(selection.trim())
-  const text = hasSelection ? selection : visibleTerminalText()
+  let text = ''
+  if (mode === 'selection') {
+    text = selection
+  } else if (mode === 'visible') {
+    text = visibleTerminalText()
+  } else {
+    text = hasSelection ? selection : visibleTerminalText()
+  }
   if (!text.trim()) {
-    toast('没有可复制的终端内容', 'warning')
+    toast(mode === 'selection' ? '没有选中的终端内容' : '没有可复制的终端内容', 'warning')
     return
   }
   const ok = await copyTextToClipboard(text)
@@ -172,7 +181,29 @@ async function copyTerminalContent() {
     toast('复制失败，请检查浏览器剪贴板权限', 'error')
     return
   }
-  toast(hasSelection ? '已复制选中内容' : '已复制当前可见终端内容', 'success')
+  toast(mode === 'selection' || (mode === 'auto' && hasSelection) ? '已复制选中内容' : '已复制当前可见终端内容', 'success')
+}
+
+async function pasteClipboardToTerminal() {
+  if (!terminal) return
+  if (!navigator.clipboard?.readText) {
+    toast('浏览器不允许读取剪贴板，请用系统粘贴快捷键', 'error')
+    return
+  }
+  let text = ''
+  try {
+    text = await navigator.clipboard.readText()
+  } catch {
+    toast('读取剪贴板失败，请检查浏览器权限', 'error')
+    return
+  }
+  if (!text) {
+    toast('剪贴板没有可粘贴文本', 'warning')
+    return
+  }
+  const normalized = text.replace(/\r?\n/g, '\r')
+  sendTerminalInput(normalized)
+  focusTerminalIfDesktop()
 }
 
 function shellQuotePath(path) {
@@ -740,7 +771,10 @@ function createTerminal() {
     sendTerminalInput(data, false)
   })
   terminal.onResize(({ cols, rows }) => send({ type: 'resize', cols, rows }))
-  terminalScrollDisposable = terminal.onScroll?.(() => updateNewOutputButton())
+  terminalScrollDisposable = terminal.onScroll?.(() => {
+    updateNewOutputButton()
+    hideTerminalContextMenu()
+  })
 }
 
 function isModalOpen() {
@@ -771,6 +805,7 @@ function attachTerminal() {
 function disposeTerminal() {
   releaseWakeLock()
   hideNewOutputButton()
+  hideTerminalContextMenu()
   cleanupTerminalScrollCapture()
   cleanupTerminalTouchScrollTargets()
   if (terminalScrollDisposable) {
@@ -1519,6 +1554,7 @@ export function hideOfficialClaudeTerminal() {
   terminalFileDragDepth = 0
   setTerminalFileDropActive(false)
   closeTerminalFileModal()
+  hideTerminalContextMenu()
   closeModal(MODAL_ID)
 }
 
@@ -1532,6 +1568,7 @@ export function terminateOfficialClaudeTerminal() {
 
 async function terminateOfficialClaudeTerminalAsync() {
   if (terminateInFlight) return
+  hideTerminalContextMenu()
   if (!state.token) {
     toast('请先登录 OpenClaude', 'error')
     return
@@ -1637,6 +1674,126 @@ function bindTerminalCopyButton() {
   })
 }
 
+function isTerminalContextMenuOpen() {
+  const menu = $(CONTEXT_MENU_ID)
+  return Boolean(menu && !menu.hidden)
+}
+
+function hideTerminalContextMenu() {
+  const menu = $(CONTEXT_MENU_ID)
+  if (!menu) return
+  menu.hidden = true
+  terminalContextSelectionText = ''
+}
+
+function positionTerminalContextMenu(menu, clientX, clientY) {
+  menu.hidden = false
+  menu.style.visibility = 'hidden'
+  menu.style.left = '0px'
+  menu.style.top = '0px'
+  const rect = menu.getBoundingClientRect()
+  const margin = 8
+  const left = Math.max(margin, Math.min(clientX, window.innerWidth - rect.width - margin))
+  const top = Math.max(margin, Math.min(clientY, window.innerHeight - rect.height - margin))
+  menu.style.left = `${left}px`
+  menu.style.top = `${top}px`
+  menu.style.visibility = ''
+}
+
+function showTerminalContextMenu(clientX, clientY) {
+  const menu = $(CONTEXT_MENU_ID)
+  if (!menu) return
+  terminalContextSelectionText = selectedTerminalText()
+  const copySelectionButton = menu.querySelector(
+    '[data-claude-terminal-menu-action="copy-selection"]',
+  )
+  if (copySelectionButton) copySelectionButton.disabled = !terminalContextSelectionText.trim()
+  positionTerminalContextMenu(menu, clientX, clientY)
+}
+
+function isTerminalOutputEventTarget(target) {
+  const container = $(CONTAINER_ID)
+  const overlay = $(SCROLL_CAPTURE_ID)
+  return Boolean(
+    target &&
+      ((container && container.contains(target)) || (overlay && overlay.contains(target))),
+  )
+}
+
+function handleTerminalContextMenu(event) {
+  if (!isModalOpen() || !isTerminalOutputEventTarget(event.target)) return
+  event.preventDefault()
+  event.stopPropagation()
+  showTerminalContextMenu(event.clientX, event.clientY)
+}
+
+function handleTerminalContextMenuPointerDown(event) {
+  const menu = $(CONTEXT_MENU_ID)
+  if (!menu || menu.hidden) return
+  if (menu.contains(event.target)) return
+  hideTerminalContextMenu()
+}
+
+function handleTerminalContextMenuAction(event) {
+  const button = event.target?.closest?.(CONTEXT_MENU_ACTION_SELECTOR)
+  if (!button) return
+  event.preventDefault()
+  event.stopPropagation()
+  const action = button.dataset.claudeTerminalMenuAction
+  const selection = terminalContextSelectionText
+  hideTerminalContextMenu()
+  if (action === 'copy-selection') {
+    void copyTerminalContent({ mode: 'selection', selection })
+  } else if (action === 'copy-visible') {
+    void copyTerminalContent({ mode: 'visible' })
+  } else if (action === 'paste') {
+    void pasteClipboardToTerminal()
+  }
+}
+
+function isEditableTerminalUiTarget(target) {
+  if (!target?.matches?.('input, textarea, select')) return false
+  return !target.classList?.contains('xterm-helper-textarea')
+}
+
+function shouldHandleTerminalClipboardShortcut(event) {
+  if (!isModalOpen() || isTerminalFileModalOpen()) return false
+  const modal = $(MODAL_ID)
+  if (!modal) return false
+  const target = event.target
+  if (isEditableTerminalUiTarget(target)) return false
+  return Boolean(
+    (target && modal.contains(target)) ||
+      (document.activeElement && modal.contains(document.activeElement)),
+  )
+}
+
+function handleTerminalClipboardShortcut(event) {
+  if (!shouldHandleTerminalClipboardShortcut(event)) return
+  const key = String(event.key || '').toLowerCase()
+  if ((!event.ctrlKey && !event.metaKey) || event.altKey) return
+
+  if (key === 'c') {
+    const selection = selectedTerminalText()
+    if (!event.shiftKey && !selection.trim()) return
+    event.preventDefault()
+    event.stopPropagation()
+    hideTerminalContextMenu()
+    void copyTerminalContent({
+      mode: event.shiftKey ? 'auto' : 'selection',
+      selection,
+    })
+    return
+  }
+
+  if (key === 'v' && navigator.clipboard?.readText) {
+    event.preventDefault()
+    event.stopPropagation()
+    hideTerminalContextMenu()
+    void pasteClipboardToTerminal()
+  }
+}
+
 function handleTerminalVisibilityResume(reason) {
   const hiddenAt = terminalHiddenAt
   terminalHiddenAt = null
@@ -1705,12 +1862,19 @@ export function initOfficialClaudeTerminal() {
     event.preventDefault()
     sendMobileCommand()
   })
-  window.addEventListener('resize', () => fitTerminal())
+  window.addEventListener('resize', () => {
+    fitTerminal()
+    hideTerminalContextMenu()
+  })
   document.addEventListener('dragenter', handleTerminalDragEnter)
   document.addEventListener('dragover', handleTerminalDragOver)
   document.addEventListener('dragleave', handleTerminalDragLeave)
   document.addEventListener('drop', handleTerminalDrop)
   document.addEventListener('paste', handleTerminalPaste)
+  document.addEventListener('contextmenu', handleTerminalContextMenu, true)
+  document.addEventListener('pointerdown', handleTerminalContextMenuPointerDown, true)
+  $(CONTEXT_MENU_ID)?.addEventListener('click', handleTerminalContextMenuAction)
+  document.addEventListener('keydown', handleTerminalClipboardShortcut, true)
   window.addEventListener('focus', () => handleTerminalVisibilityResume('窗口恢复，正在重连'))
   window.addEventListener('online', () => handleTerminalVisibilityResume('网络恢复，正在重连'))
   document.addEventListener('visibilitychange', () => {
@@ -1772,6 +1936,12 @@ export function initOfficialClaudeTerminal() {
     'keydown',
     (event) => {
       if (event.key !== 'Escape') return
+      if (isTerminalContextMenuOpen()) {
+        event.preventDefault()
+        event.stopPropagation()
+        hideTerminalContextMenu()
+        return
+      }
       if (isTerminalFileModalOpen()) {
         event.preventDefault()
         event.stopPropagation()
