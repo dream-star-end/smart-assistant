@@ -141,8 +141,12 @@ function _proxyHostForLog(proxyUrl: string): string {
  * 旧 entry 后建新 entry。
  *
  * 失败(URL 解析挂 / PSK 解密挂 / master TLS 加载挂)→ 返 undefined 并 warn。
- * **不抛**:chat 路径不应因为出口配置烂直接 502;退化到默认出口让请求过,Anthropic
- * 看到异常 IP 自然会触发 health 扣分,运维感知后修。
+ * **不抛**:这是个低层工厂,返 undefined 表示"造不出 dispatcher",由调用方决定语义。
+ *
+ * ⚠️ A2:**chat 路径不再直接用本函数**(返 undefined 会去匿名化泄露到默认出口),
+ * 改用 `resolveAccountEgressDispatcher`,它用绑定权威源把"已绑但解析失败"升级为
+ * `unavailable` 并 fail-closed。本函数的 undefined-软退化仅供 **admin 探活** 等
+ * 非 fail-closed 调用方使用(且 admin 自己已在调用点对 undefined 做 fail-hard)。
  */
 export async function getDispatcherForAccount(
   accountId: bigint | string,
@@ -159,6 +163,92 @@ export async function getDispatcherForAccount(
   // 都空 → 切回默认出口,清掉旧 entry 防漏 FD
   _evictByAccount(accountId);
   return undefined;
+}
+
+/**
+ * 出口解析的三态结果(A2)。
+ *
+ *   - `unbound`     —— 账号无任何出口绑定 → 走默认出口是**正确**的
+ *   - `ready`       —— 账号已绑 + dispatcher 构造成功
+ *   - `unavailable` —— 账号**已绑但解析失败**(proxy 被 disabled / host 未 ready /
+ *                      URL 烂 / PSK 解密挂 / master TLS 不可用)→ 调用方必须 **fail-closed**,
+ *                      绝不退默认/全局出口(否则该账号流量去匿名化泄露到共享 IP)
+ */
+export type EgressResolution =
+  | { kind: "unbound" }
+  | { kind: "ready"; dispatcher: Dispatcher }
+  | { kind: "unavailable"; reason: string };
+
+/**
+ * 出口绑定输入。`egressProxy`/`egressTarget` 是**已解析**值(池/host 不可用时为 null);
+ * `egressProxyId`/`egressHostUuid` 是**绑定权威源**(account 自身列,不被 active-filter 清空)。
+ */
+export interface EgressBinding {
+  /** 已解析的明文 proxy URL(active 池 > legacy raw);disabled/缺失 → null */
+  egressProxy: string | null | undefined;
+  /** 已解析的 mTLS target;host 未 ready → null */
+  egressTarget: EgressTarget | null | undefined;
+  /** 权威源:claude_accounts.egress_proxy_id */
+  egressProxyId: bigint | string | null;
+  /** 权威源:claude_accounts.egress_host_uuid */
+  egressHostUuid: string | null;
+}
+
+/**
+ * 账号出口 dispatcher 解析(A2 fail-closed)—— **优先级状态机**:绑定权威源决定走哪一种
+ * 出口,且**只**解析那一种,绝不在该种不可用时回落到另一种(避免 profile/chat IP 分叉)。
+ *
+ *   1. proxy-pool 绑定优先(0055 起 claude 账号 egress_proxy_id 恒非 null;legacy raw
+ *      egress_proxy 即使 id 为 null 也算 proxy-bound)。已绑 proxy 但解析 URL 为空
+ *      (被 disabled/删除)→ `unavailable`(fail-closed),**不**回落 mTLS host。
+ *   2. 否则 mTLS host 绑定(0038):host 未 ready → `unavailable`。
+ *   3. 全空(真正未绑)→ `unbound`,走默认出口。
+ *
+ * 与 `getDispatcherForAccount` 的区别:后者把"未绑"与"已绑但解析失败"都返 undefined
+ * (语义重载,是 fail-open 泄露的根因);本函数用权威源消歧,把后者升级为 `unavailable`。
+ */
+export async function resolveAccountEgressDispatcher(
+  accountId: bigint | string,
+  binding: EgressBinding,
+  getDispatcher: typeof getDispatcherForAccount = getDispatcherForAccount,
+): Promise<EgressResolution> {
+  const proxyBound =
+    binding.egressProxyId != null ||
+    (binding.egressProxy != null && binding.egressProxy.length > 0);
+
+  // 1. proxy 权威:只解析 proxy,target 强制传 null(不回落 mTLS)
+  if (proxyBound) {
+    if (binding.egressProxy == null || binding.egressProxy.length === 0) {
+      // 提前 fail-closed:不会调 getDispatcher → 主动清掉该账号的旧 entry,防止
+      // 之前缓存的 ProxyAgent/FD 在 proxy 被 disabled 后仍驻留。
+      _evictByAccount(accountId);
+      return {
+        kind: "unavailable",
+        reason: "bound egress proxy unresolved (disabled/missing)",
+      };
+    }
+    const dispatcher = await getDispatcher(accountId, binding.egressProxy, null);
+    return dispatcher !== undefined
+      ? { kind: "ready", dispatcher }
+      : { kind: "unavailable", reason: "egress proxy dispatcher unavailable" };
+  }
+
+  // 2. mTLS host 权威:只解析 mTLS,proxy 强制传 null
+  if (binding.egressHostUuid != null) {
+    if (binding.egressTarget == null) {
+      _evictByAccount(accountId); // 同上:提前 fail-closed 也要清旧 entry
+      return { kind: "unavailable", reason: "bound egress host not ready" };
+    }
+    const dispatcher = await getDispatcher(accountId, null, binding.egressTarget);
+    return dispatcher !== undefined
+      ? { kind: "ready", dispatcher }
+      : { kind: "unavailable", reason: "egress mtls dispatcher unavailable" };
+  }
+
+  // 3. 真正未绑:走默认出口。仍调一次 getDispatcher(...,null,null) 以 evict 旧 entry
+  //    (与原 chat 路径行为对齐,防止切到未绑后旧 ProxyAgent/FD 泄漏)。
+  await getDispatcher(accountId, null, null);
+  return { kind: "unbound" };
 }
 
 function _getPlainDispatcher(

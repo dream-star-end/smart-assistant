@@ -58,6 +58,8 @@ function makePick(over: Partial<PickResult> = {}): PickResult {
     expires_at: null,
     egress_proxy: null,
     egress_target: null,
+    egress_proxy_id: null, // A2 默认未绑;bound case 通过 over 覆盖
+    egress_host_uuid: null,
     pinned_user_id: PINNED_OK,
     account_uuid: null, // Phase 6 默认 null;具体 case 通过 over 覆盖
     persona: null, // v3 反关联根治 0073/0074 默认 null;具体 case 通过 over 覆盖
@@ -453,7 +455,12 @@ describe("pickUpstream — OAuth account groups", () => {
 
 describe("pickUpstream — OAuth happy path", () => {
   test("不到期 → 不调 refresh;session.accountId/pinnedUserId/dispatcher/quota 正确", async () => {
-    const pick = makePick({ expires_at: null });
+    // A2:dispatcher 传播只对**已绑**账号有意义 → 绑 egress 让 stub dispatcher 落到 session
+    const pick = makePick({
+      expires_at: null,
+      egress_proxy: "http://egress.test:8080",
+      egress_proxy_id: 1n,
+    });
     const sched = makeScheduler({ pickResult: pick });
     const stubDispatcher = { kind: "stub-dispatcher" };
     let getDispatcherCalls = 0;
@@ -781,6 +788,9 @@ describe("pickUpstream — refresh 成功 + HIGH#5 同出口锚定", () => {
       token: oldToken,
       refresh: oldRefresh,
       expires_at: new Date(Date.now() - 1000), // 已过期 → 触发 refresh
+      // A2:HIGH#5 同出口锚定只对已绑账号有意义 → 绑 egress
+      egress_proxy: "http://egress.test:8080",
+      egress_proxy_id: 1n,
     });
     const sched = makeScheduler({ pickResult: pick });
 
@@ -956,6 +966,132 @@ describe("pickUpstream — refresh 失败 release kind 分流", () => {
     // 关键:即使 release throw 也必须把 secret 清干净
     assert.ok(pick.token.every((b) => b === 0), "token 应被零化即使 release throw");
     assert.ok(pick.refresh!.every((b) => b === 0), "refresh 应被零化即使 release throw");
+  });
+});
+
+// ─── pickUpstream — A2 出口 fail-closed ──────────────────────────────────
+
+describe("pickUpstream — A2 egress fail-closed", () => {
+  test("已绑 proxy 但 dispatcher 解析失败 → pool_unavailable(egress_unavailable) + release(transient_network) + zero token", async () => {
+    const pick = makePick({
+      egress_proxy: "http://broken.test:8080",
+      egress_proxy_id: 1n,
+    });
+    const sched = makeScheduler({ pickResult: pick });
+    let getDispatcherCalls = 0;
+    const res = await pickUpstream(
+      {
+        scheduler: sched.scheduler,
+        getDispatcher: (async () => {
+          getDispatcherCalls += 1;
+          return undefined;
+        }) as PickUpstreamDeps["getDispatcher"],
+      },
+      bodyFor("claude-sonnet-4-6"),
+      { kind: "oauth" },
+      log,
+    );
+    assert.equal(res.ok, false);
+    if (res.ok) return;
+    assert.equal(res.error.kind, "pool_unavailable");
+    if (res.error.kind !== "pool_unavailable") return;
+    assert.equal((res.error.err as { reason?: string }).reason, "egress_unavailable");
+    assert.equal(getDispatcherCalls, 1);
+    assert.equal(sched.releaseCalls.length, 1);
+    assert.equal(sched.releaseCalls[0].result.kind, "transient_network");
+    assert.ok(pick.token.every((b) => b === 0), "token 必须零化");
+    assert.ok(pick.refresh!.every((b) => b === 0), "refresh 必须零化");
+  });
+
+  test("已绑 proxy 但 proxy 被 disabled(egress_proxy=null)+ host ready → 仍 fail-closed,绝不回落 mTLS host", async () => {
+    const pick = makePick({
+      egress_proxy: null, // 池 entry 被 disabled → 解析为 null
+      egress_proxy_id: 1n, // 但绑定权威源仍在(0055:claude 恒非 null)
+      egress_target: {
+        kind: "mtls",
+        hostUuid: "h-1",
+        host: "10.0.0.1",
+        port: 9444,
+        fingerprint: "ab".repeat(32),
+        pskNonce: Buffer.alloc(12),
+        pskCt: Buffer.alloc(16),
+      },
+      egress_host_uuid: "h-1",
+    });
+    const sched = makeScheduler({ pickResult: pick });
+    let getDispatcherCalls = 0;
+    const res = await pickUpstream(
+      {
+        scheduler: sched.scheduler,
+        getDispatcher: (async () => {
+          getDispatcherCalls += 1;
+          return { kind: "host-dispatcher" } as unknown as undefined;
+        }) as PickUpstreamDeps["getDispatcher"],
+      },
+      bodyFor("claude-sonnet-4-6"),
+      { kind: "oauth" },
+      log,
+    );
+    assert.equal(res.ok, false);
+    if (res.ok) return;
+    assert.equal(res.error.kind, "pool_unavailable");
+    // 关键:proxy 权威优先 → proxy 解析为空即 fail-closed,绝不调 dispatcher 回落 host
+    assert.equal(getDispatcherCalls, 0, "绝不回落到 mTLS host(否则 profile/chat IP 分叉)");
+    assert.equal(sched.releaseCalls[0].result.kind, "transient_network");
+  });
+
+  test("仅绑 mTLS host 但 host 未 ready(egress_target=null)→ fail-closed", async () => {
+    const pick = makePick({
+      egress_proxy: null,
+      egress_proxy_id: null, // 无 proxy 绑定
+      egress_target: null, // host 未 ready
+      egress_host_uuid: "h-2", // 绑定权威源在
+    });
+    const sched = makeScheduler({ pickResult: pick });
+    let getDispatcherCalls = 0;
+    const res = await pickUpstream(
+      {
+        scheduler: sched.scheduler,
+        getDispatcher: (async () => {
+          getDispatcherCalls += 1;
+          return undefined;
+        }) as PickUpstreamDeps["getDispatcher"],
+      },
+      bodyFor("claude-sonnet-4-6"),
+      { kind: "oauth" },
+      log,
+    );
+    assert.equal(res.ok, false);
+    if (res.ok) return;
+    assert.equal(res.error.kind, "pool_unavailable");
+    assert.equal(getDispatcherCalls, 0);
+  });
+
+  test("真正未绑 + dispatcher undefined → 照常放行(default 出口,行为不变)", async () => {
+    const pick = makePick({
+      egress_proxy: null,
+      egress_proxy_id: null,
+      egress_host_uuid: null,
+    });
+    const sched = makeScheduler({ pickResult: pick });
+    let getDispatcherCalls = 0;
+    const res = await pickUpstream(
+      {
+        scheduler: sched.scheduler,
+        getDispatcher: (async () => {
+          getDispatcherCalls += 1;
+          return undefined;
+        }) as PickUpstreamDeps["getDispatcher"],
+      },
+      bodyFor("claude-sonnet-4-6"),
+      { kind: "oauth" },
+      log,
+    );
+    assert.equal(res.ok, true);
+    if (!res.ok) return;
+    assert.equal(res.session.dispatcher, undefined);
+    assert.equal(getDispatcherCalls, 1, "未绑分支仍调一次 getDispatcher(null,null) 做 evict 清理");
+    assert.equal(sched.releaseCalls.length, 0);
   });
 });
 

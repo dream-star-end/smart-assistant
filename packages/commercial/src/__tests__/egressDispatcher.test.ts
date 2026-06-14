@@ -9,10 +9,13 @@ import { describe, test, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import {
   getDispatcherForAccount,
+  resolveAccountEgressDispatcher,
   _clearEgressDispatcherCacheForTest,
   _egressDispatcherCacheSizeForTest,
   EGRESS_DISPATCHER_CACHE_MAX,
+  type EgressTarget,
 } from "../account-pool/egressDispatcher.js";
+import type { Dispatcher } from "undici";
 
 beforeEach(() => {
   _clearEgressDispatcherCacheForTest();
@@ -110,5 +113,115 @@ describe("egressDispatcher (plain proxy)", () => {
     );
     assert.ok(d, "plain proxy must be used when egressProxy is non-empty");
     assert.equal(_egressDispatcherCacheSizeForTest(), 1);
+  });
+});
+
+// ─── resolveAccountEgressDispatcher (A2 优先级状态机 + fail-closed) ─────────
+describe("resolveAccountEgressDispatcher", () => {
+  const STUB = { stub: "dispatcher" } as unknown as Dispatcher;
+  const mtlsTarget: EgressTarget = {
+    kind: "mtls",
+    hostUuid: "h-1",
+    host: "10.0.0.1",
+    port: 9444,
+    fingerprint: "ab".repeat(32),
+    pskNonce: Buffer.alloc(12),
+    pskCt: Buffer.alloc(16),
+  };
+  // 记录 getDispatcher 调用参数的 stub 工厂
+  function spy(ret: Dispatcher | undefined) {
+    const calls: Array<{ proxy: unknown; target: unknown }> = [];
+    const fn = (async (
+      _id: bigint | string,
+      proxy: string | null | undefined,
+      target: EgressTarget | null | undefined,
+    ) => {
+      calls.push({ proxy, target });
+      return ret;
+    }) as typeof getDispatcherForAccount;
+    return { fn, calls };
+  }
+
+  test("全空(真正未绑)→ unbound;仍调一次 getDispatcher(null,null) 做 evict", async () => {
+    const s = spy(undefined);
+    const r = await resolveAccountEgressDispatcher(
+      1n,
+      { egressProxy: null, egressTarget: null, egressProxyId: null, egressHostUuid: null },
+      s.fn,
+    );
+    assert.deepEqual(r, { kind: "unbound" });
+    assert.equal(s.calls.length, 1);
+    assert.deepEqual(s.calls[0], { proxy: null, target: null });
+  });
+
+  test("proxy 绑定 + 解析成功 → ready;只传 proxy,target 强制 null", async () => {
+    const s = spy(STUB);
+    const r = await resolveAccountEgressDispatcher(
+      1n,
+      { egressProxy: "http://p:8080", egressTarget: mtlsTarget, egressProxyId: 9n, egressHostUuid: "h-1" },
+      s.fn,
+    );
+    assert.equal(r.kind, "ready");
+    if (r.kind !== "ready") return;
+    assert.equal(r.dispatcher, STUB);
+    assert.equal(s.calls.length, 1);
+    assert.equal(s.calls[0].proxy, "http://p:8080");
+    assert.equal(s.calls[0].target, null); // 绝不把 target 传下去
+  });
+
+  test("proxy 绑定 + 解析失败(undefined)→ unavailable", async () => {
+    const s = spy(undefined);
+    const r = await resolveAccountEgressDispatcher(
+      1n,
+      { egressProxy: "http://p:8080", egressTarget: null, egressProxyId: 9n, egressHostUuid: null },
+      s.fn,
+    );
+    assert.equal(r.kind, "unavailable");
+  });
+
+  test("proxy 权威(id 在)但 proxy 被 disabled(URL=null)+ host ready → unavailable,绝不回落 host", async () => {
+    const s = spy(STUB);
+    const r = await resolveAccountEgressDispatcher(
+      1n,
+      { egressProxy: null, egressTarget: mtlsTarget, egressProxyId: 9n, egressHostUuid: "h-1" },
+      s.fn,
+    );
+    assert.equal(r.kind, "unavailable");
+    assert.equal(s.calls.length, 0, "proxy 解析为空即 fail-closed,绝不调 getDispatcher 走 host");
+  });
+
+  test("legacy raw(egressProxy 有 + id=null)→ 视作 proxy 绑定 → ready", async () => {
+    const s = spy(STUB);
+    const r = await resolveAccountEgressDispatcher(
+      1n,
+      { egressProxy: "http://raw:8080", egressTarget: null, egressProxyId: null, egressHostUuid: null },
+      s.fn,
+    );
+    assert.equal(r.kind, "ready");
+    assert.equal(s.calls[0].proxy, "http://raw:8080");
+  });
+
+  test("仅 mTLS 绑定 + target ready → ready;只传 target,proxy 强制 null", async () => {
+    const s = spy(STUB);
+    const r = await resolveAccountEgressDispatcher(
+      1n,
+      { egressProxy: null, egressTarget: mtlsTarget, egressProxyId: null, egressHostUuid: "h-1" },
+      s.fn,
+    );
+    assert.equal(r.kind, "ready");
+    assert.equal(s.calls.length, 1);
+    assert.equal(s.calls[0].proxy, null);
+    assert.equal(s.calls[0].target, mtlsTarget);
+  });
+
+  test("仅 mTLS 绑定 + host 未 ready(target=null)→ unavailable,不调 getDispatcher", async () => {
+    const s = spy(undefined);
+    const r = await resolveAccountEgressDispatcher(
+      1n,
+      { egressProxy: null, egressTarget: null, egressProxyId: null, egressHostUuid: "h-2" },
+      s.fn,
+    );
+    assert.equal(r.kind, "unavailable");
+    assert.equal(s.calls.length, 0);
   });
 });

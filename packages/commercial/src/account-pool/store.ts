@@ -156,6 +156,18 @@ export interface AccountToken {
     pskNonce: Buffer;
     pskCt: Buffer;
   } | null;
+  /**
+   * 出口绑定**权威源**(account 自身列,不被 JOIN 的 active-filter 清空)。
+   *
+   * 与上面的 `egress_proxy`/`egress_target`(已解析、池/host 不可用时被 SQL 置 null)
+   * 区分:`egress_proxy_id`/`egress_host_uuid` 表示"这个账号*应该*绑了出口",
+   * 即使绑的 proxy 被 disabled / host 未 ready 也仍非 null。
+   *
+   * 用途:出口 fail-closed 判定(A2)。已绑账号若解析不出 dispatcher 必须拒发,
+   * 绝不退默认出口(去匿名化泄露)。0055 起 claude 账号 egress_proxy_id 恒 NOT NULL。
+   */
+  egress_proxy_id: bigint | null;
+  egress_host_uuid: string | null;
 }
 
 export interface CreateAccountInput {
@@ -320,6 +332,9 @@ interface RawSecretRow extends QueryResultRow {
   oauth_refresh_nonce: Buffer | null;
   oauth_expires_at: Date | null;
   egress_proxy: string | null;
+  // A2 — 出口绑定权威源(account 自身列,不受 JOIN active-filter 影响)
+  egress_proxy_id: string | null;
+  egress_host_uuid: string | null;
   // 0038 — JOIN compute_hosts 取的字段;LEFT JOIN + 全字段非 NULL 才落地
   egress_host_id: string | null;
   egress_host: string | null;
@@ -570,14 +585,20 @@ export async function getTokenForUse(
   //     decrypt 后**覆盖** legacy a.egress_proxy 列(优先级:池 > raw 列)
   //   - egress_proxy_id IS NULL / entry status='disabled' / entry 被删 →
   //     ep.* 字段全 NULL,落到 a.egress_proxy(legacy raw 列)。意味着 disabled
-  //     的 proxy 对已绑账号 = 视作未绑(等同 master 默认出口),与
-  //     getEgressProxyUrlPlaintext() 语义一致(disabled → 不可用)。
+  //     的 proxy 对已绑账号 → 解析出的 egress_proxy 为 null。
+  //
+  //   ⚠️ A2:此处"解析为 null"**不再等于走默认出口**。chat 路径用
+  //   resolveAccountEgressDispatcher,凭权威源 egress_proxy_id/egress_host_uuid 判定
+  //   "账号本应有出口",解析为 null → fail-closed 拒发,绝不退默认出口(去匿名化)。
+  //   因此本 JOIN 额外取出 a.egress_proxy_id / a.egress_host_uuid 两个权威列。
   const res = await query<RawSecretRow>(
     `SELECT a.id::text AS id, a.plan,
        a.oauth_token_enc, a.oauth_nonce,
        a.oauth_refresh_enc, a.oauth_refresh_nonce,
        a.oauth_expires_at,
        a.egress_proxy,
+       a.egress_proxy_id::text              AS egress_proxy_id,
+       a.egress_host_uuid::text             AS egress_host_uuid,
        ch.id::text                          AS egress_host_id,
        ch.host                              AS egress_host,
        ch.agent_cert_fingerprint_sha256     AS egress_host_fp,
@@ -650,6 +671,11 @@ export async function getTokenForUse(
       expires_at: row.oauth_expires_at,
       egress_proxy: resolvedEgressProxy,
       egress_target: egressTarget,
+      // A2 — 绑定权威源:直接来自 account 列,不经 active-filter。
+      // 用 `!= null` 同时挡 null 与 undefined(prod PG 恒返该列;undefined 仅出现在
+      // 省略字段的测试 mock,按"未绑"处理而非 BigInt(undefined) 抛错)。
+      egress_proxy_id: row.egress_proxy_id != null ? BigInt(row.egress_proxy_id) : null,
+      egress_host_uuid: row.egress_host_uuid ?? null,
     };
     // 成功路径:token/refresh 交给调用方,不在 finally 清零
     token = null;

@@ -259,6 +259,8 @@ function buildFakePool(override: FakePoolOverride = {}) {
           oauth_refresh_nonce: refreshEnc ? refreshEnc.nonce : null,
           oauth_expires_at: acc.expiresAt,
           egress_proxy: null,
+          egress_proxy_id: null,
+          egress_host_uuid: null,
           egress_host_id: null,
           egress_host: null,
           egress_host_fp: null,
@@ -400,6 +402,8 @@ function buildFakeScheduler(initialSpec: PickSpec | null = {}, releaseOrder?: st
         expires_at: pickSpec.expires_at ?? null, // null → 不触发 refresh
         egress_proxy: null,
         egress_target: null,
+        egress_proxy_id: null,
+        egress_host_uuid: null,
         pinned_user_id: pinned,
         account_uuid: null,
         persona: null,
