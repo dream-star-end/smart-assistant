@@ -181,7 +181,12 @@ async function copyTerminalContent({ mode = 'auto', selection = selectedTerminal
     toast('复制失败，请检查浏览器剪贴板权限', 'error')
     return
   }
-  toast(mode === 'selection' || (mode === 'auto' && hasSelection) ? '已复制选中内容' : '已复制当前可见终端内容', 'success')
+  toast(
+    mode === 'selection' || (mode === 'auto' && hasSelection)
+      ? '已复制选中内容'
+      : '已复制当前可见终端内容',
+    'success',
+  )
 }
 
 async function pasteClipboardToTerminal() {
@@ -1714,10 +1719,7 @@ function showTerminalContextMenu(clientX, clientY) {
 function isTerminalOutputEventTarget(target) {
   const container = $(CONTAINER_ID)
   const overlay = $(SCROLL_CAPTURE_ID)
-  return Boolean(
-    target &&
-      ((container && container.contains(target)) || (overlay && overlay.contains(target))),
-  )
+  return Boolean(target && (container?.contains(target) || overlay?.contains(target)))
 }
 
 function handleTerminalContextMenu(event) {
