@@ -182,13 +182,26 @@ describe('official Claude terminal lifecycle', () => {
     assert.doesNotMatch(INDEX, /claude-terminal-wake-lock-btn/)
   })
 
+  it('terminal exposes an explicit copy path for selection or visible output', () => {
+    assert.match(INDEX, /id="claude-terminal-copy-btn"/)
+    assert.match(INDEX, /复制选中内容；未选中时复制当前可见输出/)
+    assert.match(SRC, /const COPY_BTN_ID = 'claude-terminal-copy-btn'/)
+    assert.match(SRC, /\$\(COPY_BTN_ID\)\?\.addEventListener\('click', \(\) => void copyTerminalContent\(\)\)/)
+    assert.match(SRC, /terminal\?\.hasSelection\?\.\(\) \? terminal\.getSelection\(\) : ''/)
+    assert.match(SRC, /const buffer = terminal\.buffer\.active/)
+    assert.match(SRC, /buffer\.viewportY/)
+    assert.match(SRC, /translateToString\(true\)/)
+    assert.match(SRC, /已复制选中内容/)
+    assert.match(SRC, /已复制当前可见终端内容/)
+  })
+
   it('cache-busts terminal module when changing mobile controls', () => {
-    assert.match(MAIN, /from '\.\/officialTerminal\.js\?v=8'/)
-    assert.match(SW, /\/modules\/officialTerminal\.js\?v=8/)
-    assert.match(INDEX, /\/modules\/main\.js\?v=61/)
+    assert.match(MAIN, /from '\.\/officialTerminal\.js\?v=9'/)
+    assert.match(SW, /\/modules\/officialTerminal\.js\?v=9/)
+    assert.match(INDEX, /\/modules\/main\.js\?v=62/)
     assert.match(INDEX, /\/style\.css\?v=52/)
     assert.match(INDEX, /sw-flush-v22/)
-    assert.match(SW, /openclaude-v81/)
+    assert.match(SW, /openclaude-v82/)
   })
 
   it('terminal files live in a separate wide modal with Escape closing files first', () => {
