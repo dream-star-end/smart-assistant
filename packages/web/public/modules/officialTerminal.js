@@ -63,6 +63,7 @@ let terminalScrollDisposable = null
 let reconnectRequested = false
 let initialized = false
 let lastMobileControlPointerAt = 0
+let lastTerminalCopyPointerAt = 0
 let terminalTouchScrollY = null
 let terminalTouchScrollRemainder = 0
 let terminalTouchScrollTargets = []
@@ -145,8 +146,21 @@ function visibleTerminalText() {
   return lines.join('\n')
 }
 
+function selectedTerminalText() {
+  const xtermSelection = terminal?.hasSelection?.() ? terminal.getSelection() : ''
+  if (xtermSelection.trim()) return xtermSelection
+
+  const selection = window.getSelection?.()
+  const text = selection?.toString() || ''
+  const container = $(CONTAINER_ID)
+  if (!text.trim() || !container || !selection?.rangeCount) return ''
+  if (selection.anchorNode && container.contains(selection.anchorNode)) return text
+  if (selection.focusNode && container.contains(selection.focusNode)) return text
+  return ''
+}
+
 async function copyTerminalContent() {
-  const selection = terminal?.hasSelection?.() ? terminal.getSelection() : ''
+  const selection = selectedTerminalText()
   const hasSelection = Boolean(selection.trim())
   const text = hasSelection ? selection : visibleTerminalText()
   if (!text.trim()) {
@@ -1601,6 +1615,28 @@ function bindNoFocusButton(id, handler) {
   })
 }
 
+function bindTerminalCopyButton() {
+  const button = $(COPY_BTN_ID)
+  if (!button) return
+  button.addEventListener(
+    'pointerdown',
+    (event) => {
+      event.preventDefault()
+      event.stopPropagation()
+      lastTerminalCopyPointerAt = Date.now()
+      void copyTerminalContent()
+      button.blur?.()
+    },
+    { passive: false },
+  )
+  button.addEventListener('click', (event) => {
+    event.preventDefault()
+    event.stopPropagation()
+    if (Date.now() - lastTerminalCopyPointerAt < 500) return
+    void copyTerminalContent()
+  })
+}
+
 function handleTerminalVisibilityResume(reason) {
   const hiddenAt = terminalHiddenAt
   terminalHiddenAt = null
@@ -1624,7 +1660,7 @@ export function initOfficialClaudeTerminal() {
   $(KILL_BTN_ID)?.addEventListener('click', () => terminateOfficialClaudeTerminal())
   $(RECONNECT_BTN_ID)?.addEventListener('click', () => reconnectTerminal())
   $(NEW_OUTPUT_BTN_ID)?.addEventListener('click', () => scrollTerminalToBottom())
-  $(COPY_BTN_ID)?.addEventListener('click', () => void copyTerminalContent())
+  bindTerminalCopyButton()
   $(FILE_UPLOAD_BTN_ID)?.addEventListener('click', () => $(FILE_INPUT_ID)?.click())
   $(FILE_MODAL_UPLOAD_BTN_ID)?.addEventListener('click', () => $(FILE_INPUT_ID)?.click())
   $(FILE_PANEL_BTN_ID)?.addEventListener('click', () => toggleTerminalFilePanel())
