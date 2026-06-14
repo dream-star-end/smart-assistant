@@ -186,7 +186,10 @@ describe('official Claude terminal lifecycle', () => {
     assert.match(INDEX, /id="claude-terminal-copy-btn"/)
     assert.match(INDEX, /复制选中内容；未选中时复制当前可见输出/)
     assert.match(SRC, /const COPY_BTN_ID = 'claude-terminal-copy-btn'/)
-    assert.match(SRC, /\$\(COPY_BTN_ID\)\?\.addEventListener\('click', \(\) => void copyTerminalContent\(\)\)/)
+    assert.match(
+      SRC,
+      /\$\(COPY_BTN_ID\)\?\.addEventListener\('click', \(\) => void copyTerminalContent\(\)\)/,
+    )
     assert.match(SRC, /terminal\?\.hasSelection\?\.\(\) \? terminal\.getSelection\(\) : ''/)
     assert.match(SRC, /const buffer = terminal\.buffer\.active/)
     assert.match(SRC, /buffer\.viewportY/)
