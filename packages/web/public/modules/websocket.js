@@ -3574,6 +3574,10 @@ function _normalizeBridgeErrorCode(code) {
   return raw ? raw.toLowerCase() : 'unknown'
 }
 
+export function _isBridgeAuthControlError(code) {
+  return _normalizeBridgeErrorCode(code) === 'unauthorized'
+}
+
 function _friendlyBridgeErrorMessage(code, message) {
   const normalized = _normalizeBridgeErrorCode(code)
   if (normalized === 'insufficient_credits') return '余额不足，充值后即可继续使用。'
@@ -3614,6 +3618,14 @@ function _finishErroredTurn(sess) {
 
 function handleLegacyBridgeError(frame) {
   const normalized = _normalizeBridgeErrorCode(frame?.code)
+  if (_isBridgeAuthControlError(frame?.code)) {
+    // `/ws/user-chat-bridge` emits this auth-control frame immediately before
+    // close(1008) when the access JWT used for the WS handshake is stale.
+    // The close handler owns silentRefresh() + reconnect, and only shows login
+    // if refresh fails. Rendering this as an assistant error leaks a transient
+    // transport auth detail into the conversation.
+    return
+  }
   const sess = frame?.peer?.id ? state.sessions.get(frame.peer.id) : getSession()
   if (!sess) return
   const text = _friendlyBridgeErrorMessage(frame?.code, frame?.message)
