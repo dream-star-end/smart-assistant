@@ -249,5 +249,140 @@ export async function runWithConcurrency<T>(
   await Promise.all(workers)
 }
 
+// ─── B3 — codex disable drift reconciler(fanout 的兜底)────────────────────
+//
+// fanout 是 fire-and-forget:单容器 migrate 失败只 log + ROLLBACK,无重试;恢复
+// actor(codexAccountActor)只扫 status='active' 账号,看不到"已绑在 disabled 账号
+// 上的容器" → DB 与容器漂移会永久存在(容器仍指向 disabled 账号,CLI 继续用旧
+// token,不报 401 也就不触发 M1 自愈)。本 reconciler 周期性扫出这类漂移并复用
+// 同一条强一致 rebind(migrateOneCodexContainer)兜底,把 fanout 降级为延迟优化。
+
+export const DEFAULT_DRIFT_RECONCILE_INTERVAL_MS = 300_000 // 5min(兜底,即时由 fanout 处理)
+export const MIN_DRIFT_RECONCILE_INTERVAL_MS = 30_000
+
+export interface CodexDriftRow {
+  containerId: number
+  accountId: bigint
+}
+
+/**
+ * 扫出 codex 账号禁用漂移:state='active' 的容器,绑在 provider='codex' 且
+ * status<>'active'(disabled/banned/cooldown)的账号上。codex_account_id 必须非 null。
+ * 抽成独立函数,便于直接 integ 测这条 SELECT。
+ */
+export async function findCodexDisableDrift(
+  queryFn: typeof defaultQuery = defaultQuery,
+): Promise<CodexDriftRow[]> {
+  const res = await queryFn<{ container_id: string; account_id: string }>(
+    `SELECT ac.id::text AS container_id, ac.codex_account_id::text AS account_id
+       FROM agent_containers ac
+       JOIN claude_accounts ca ON ca.id = ac.codex_account_id
+      WHERE ac.state = 'active'
+        AND ac.codex_account_id IS NOT NULL
+        AND ca.provider = 'codex'
+        AND ca.status <> 'active'
+      ORDER BY ac.id`,
+  )
+  return res.rows.map((r) => ({ containerId: Number(r.container_id), accountId: BigInt(r.account_id) }))
+}
+
+/**
+ * 兜底对账一轮:扫漂移 → 限流复用 migrateOneCodexContainer 强一致 rebind。
+ *
+ * 注意 `{ failed }` 只计**抛错**的 migrate;若无可用 active 账号(acquire 返
+ * pool_empty / 非 rebound),migrate 不抛、漂移留到有 active 账号时下一轮再处理。
+ * migrateOne 默认走真实 fn,可注入便于测试(只验 drift SELECT,不重测 rebind)。
+ */
+export async function reconcileCodexDisableDrift(
+  deps: CodexDisableFanoutDeps,
+  migrateOne: (
+    containerId: number,
+    oldAccountId: bigint,
+    deps: CodexDisableFanoutDeps,
+  ) => Promise<void> = migrateOneCodexContainer,
+): Promise<{ found: number; failed: number }> {
+  const queryFn = deps.queryFn ?? defaultQuery
+  const logger = deps.logger
+  const rows = await findCodexDisableDrift(queryFn)
+  if (rows.length === 0) return { found: 0, failed: 0 }
+  logger?.info?.('codex_drift_reconcile_start', { driftCount: rows.length })
+  let failed = 0
+  const N = Math.max(1, deps.concurrency ?? 4)
+  await runWithConcurrency(rows, N, async (row) => {
+    try {
+      await migrateOne(row.containerId, row.accountId, deps)
+    } catch (err) {
+      failed += 1
+      logger?.warn?.('codex_drift_reconcile_one_failed', {
+        containerId: row.containerId,
+        accountId: String(row.accountId),
+        err: (err as Error)?.message ?? String(err),
+      })
+    }
+  })
+  logger?.info?.('codex_drift_reconcile_done', { found: rows.length, failed })
+  return { found: rows.length, failed }
+}
+
+export interface CodexDriftReconcilerHandle {
+  stop(): void
+  runNow(): Promise<{ found: number; failed: number }>
+}
+
+export interface CodexDriftReconcilerOptions {
+  deps: CodexDisableFanoutDeps
+  intervalMs?: number
+  runOnStart?: boolean
+  onError?: (err: unknown) => void
+  /** test 注入:覆盖默认 reconcile。 */
+  reconcileFn?: () => Promise<{ found: number; failed: number }>
+}
+
+function defaultDriftOnError(err: unknown): void {
+  // eslint-disable-next-line no-console
+  console.warn('[codexDisableDriftReconciler] tick failed:', err)
+}
+
+export function startCodexDisableDriftReconciler(
+  opts: CodexDriftReconcilerOptions,
+): CodexDriftReconcilerHandle {
+  const interval = Math.max(
+    MIN_DRIFT_RECONCILE_INTERVAL_MS,
+    opts.intervalMs ?? DEFAULT_DRIFT_RECONCILE_INTERVAL_MS,
+  )
+  const reconcileFn = opts.reconcileFn ?? (() => reconcileCodexDisableDrift(opts.deps))
+  const onError = opts.onError ?? defaultDriftOnError
+  const runOnStart = opts.runOnStart ?? true
+  let stopped = false
+  let running = false
+
+  async function runOneTick(): Promise<{ found: number; failed: number }> {
+    if (running) return { found: 0, failed: 0 } // 跳过重叠 tick
+    running = true
+    try {
+      return await reconcileFn()
+    } catch (err) {
+      onError(err)
+      return { found: 0, failed: 0 }
+    } finally {
+      running = false
+    }
+  }
+
+  const timer = setInterval(() => {
+    if (!stopped) void runOneTick()
+  }, interval)
+  if (typeof timer.unref === 'function') timer.unref()
+  if (runOnStart) void runOneTick()
+
+  return {
+    stop() {
+      stopped = true
+      clearInterval(timer)
+    },
+    runNow: runOneTick,
+  }
+}
+
 /** test-only:断言 helper 类型不被意外漂移。 */
 export type { QueryRunner }

@@ -436,6 +436,17 @@ type RouteHandler = (
   deps: CommercialHttpDeps,
 ) => Promise<void>
 
+/**
+ * B2 — `/api/admin/*` 路由层 admin gate 的**例外白名单**(method-aware,`"METHOD path"`)。
+ * 仅列自带鉴权、不能被 requireAdminVerifyDb 拦的机器路由:
+ *   - `GET /api/admin/metrics`:Prometheus 抓取,走 COMMERCIAL_METRICS_BEARER 或 admin JWT
+ *     (见 http/admin/metrics.ts;其 JWT 回落已升级为 requireAdminVerifyDb)。
+ * method-aware:非 GET 的 /api/admin/metrics(如 POST,method-mismatch)**不**在白名单内,
+ * 仍先过 admin gate → 不向非 admin 泄露该路由/method 存在性。
+ * 新增 admin 路由默认被 gate;要豁免必须显式进此白名单(可见、可审)。
+ */
+const ADMIN_SELF_AUTH_ROUTES = new Set<string>(['GET /api/admin/metrics'])
+
 interface Route {
   method: string
   /**
@@ -1317,6 +1328,19 @@ export function createCommercialHandler(
     try {
       if (candidates.length === 0) {
         throw new HttpError(404, 'NOT_FOUND', 'endpoint not found')
+      }
+      // B2 — 路由层 admin 鉴权边界(根因:此前每个 admin handler 自觉调 requireAdmin,
+      // 新增路由漏调即静默裸奔)。凡 /api/admin/* 一律先过 requireAdminVerifyDb
+      // (JWT + DB role/status 复核),让"未鉴权的 admin 路由"在结构上不可表达;
+      // 顺带把只读 admin 路由也升级到 DB 复核(关闭降权后 JWT 未过期仍可读的窗口,B5)。
+      // 放在 405 之前:对 /api/admin/* 的错误 method 也先要 admin 身份,不向非 admin
+      // 泄露路由/method 存在性。例外:自带鉴权的机器路由用 method-aware 白名单跳过
+      // (GET /api/admin/metrics 走 COMMERCIAL_METRICS_BEARER / JWT,见 http/admin/metrics.ts)。
+      if (
+        labelRoute.startsWith('/api/admin/') &&
+        !ADMIN_SELF_AUTH_ROUTES.has(`${route?.method ?? method} ${labelRoute}`)
+      ) {
+        await requireAdminVerifyDb(req, deps.jwtSecret)
       }
       if (!route) {
         // method mismatch:返合并后的 Allow 头(该 path 下所有已定义 method)

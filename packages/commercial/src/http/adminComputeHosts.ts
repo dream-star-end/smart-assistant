@@ -32,6 +32,7 @@ import {
   getBootstrapLog,
   drainComputeHost,
   removeComputeHost,
+  revokeComputeHost,
   clearQuarantineForHost,
   updateComputeHostExpiresAt,
   getBaselineVersions,
@@ -189,6 +190,11 @@ export async function handleAdminComputeHostAction(
     case "quarantine-clear":
       await clearQuarantineForHost(id, auditCtx);
       sendJson(res, 200, { id, status: "ready" });
+      return;
+    case "revoke":
+      // A3 kill-switch:终态吊销 + 清 pinned fingerprint(立即断,不等证书过期)。
+      await revokeComputeHost(id, auditCtx);
+      sendJson(res, 200, { id, status: "revoked" });
       return;
     case "distribute-image": {
       // 同步等待 stream 完成。3.5GB 慢链路最长约 30 分钟,前端/反代 timeout 要够长。

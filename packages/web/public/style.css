@@ -42,6 +42,54 @@
   --transition-base: 180ms cubic-bezier(0.4, 0, 0.2, 1);
   --transition-slow: 280ms cubic-bezier(0.4, 0, 0.2, 1);
   --ease-spring: cubic-bezier(0.34, 1.56, 0.64, 1);
+
+  /* U2 — 主应用里散落着一套"旧别名"token(permission/askUserQuestion 模态、
+     api-keys 面板等),从未在 :root/主题块定义,只靠使用点 `var(别名,#硬编码)`
+     续命:在亮色主题里渲染深色/浅灰硬编码 fallback(模态主题错乱、浅灰字几乎不可见),
+     无 fallback 的(--text/--radius/--brand/--error)则直接失效(方角、无 outline)。
+     这里把全部别名一次性映射到设计系统 canonical token(主题感知 —— 自定义属性
+     lazy 解析,resolve 时取当前主题下的 --bg/--fg 等),根治整类"双 token"不对称。
+     定义点 fallback 用 dark canonical 值(品牌安全默认),杜绝"变量失效即跑偏"。
+     注:admin.html 自带独立 token 体系(--panel/--text/--s-N…),不在此处统一。 */
+  --bg-primary: var(--bg, #1a1a1d);
+  --bg-secondary: var(--bg-elevated, #212125);
+  --bg-tertiary: var(--bg-raised, #2a2a30);
+  --bg-base: var(--bg-subtle, #1e1e22);
+  --bg-soft: var(--bg-subtle, #1e1e22);
+  --bg-muted: var(--bg-subtle, #1e1e22);
+  --text-primary: var(--fg, #eceae6);
+  --fg-primary: var(--fg, #eceae6);
+  --text: var(--fg, #eceae6);
+  --fg-secondary: var(--fg-muted, #9f9c96);
+  --text-secondary: var(--fg-muted, #9f9c96);
+  --brand: var(--accent, #d97757);
+  --error: var(--danger, #e06c6c);
+  --accent-danger: var(--danger, #e06c6c);
+  --radius: var(--radius-md, 10px);
+  --mono: var(--font-mono, ui-monospace, monospace);
+
+  /* U6 — 全局 z-index 层级标度。此前 41 处 z-index 散落硬编码(出现过 9999/10000
+     这类"层级战争"魔数),新增 overlay 无从得知该用什么值。这里把跨组件的全局层级
+     集中成命名 token —— **值保持现状,不改任何层级关系**(仅集中+命名+文档化,
+     维护性提升)。纯组件内局部 stacking(-1/0/1/2/5/10)不属全局层级,保持裸值。 */
+  --z-menu: 20;             /* 行内菜单:msg-save / effort */
+  --z-sticky: 50;          /* 吸顶:landing-nav / boot-restore */
+  --z-head: 80;            /* 主头部 */
+  --z-head-dropdown: 90;   /* 头部 settings-dropdown-wrap */
+  --z-sidebar-backdrop: 99;
+  --z-sidebar: 100;        /* 侧栏 / slash-popup */
+  --z-panel: 200;          /* tasks-panel / settings-dropdown(基) / modal-backdrop */
+  --z-banner: 240;         /* sync-banner */
+  --z-plan-backdrop: 260;
+  --z-plan-panel: 270;
+  --z-palette: 300;        /* 命令面板 backdrop */
+  --z-toast: 400;
+  --z-tasks-mobile: 950;   /* tasks-panel(窄屏覆盖) */
+  --z-dropdown: 1000;      /* settings-dropdown(刷新版/窄屏) */
+  --z-dropdown-raised: 1001;
+  --z-voice: 1200;         /* 语音全屏 overlay */
+  --z-lightbox: 9999;
+  --z-top: 10000;          /* 最顶层:ctx-menu / permission-modal */
 }
 @supports (height: 100dvh) {
   :root {
@@ -1242,7 +1290,7 @@ a:hover {
     top: 0;
     bottom: 0;
     width: min(88vw, 320px);
-    z-index: 100;
+    z-index: var(--z-sidebar);
     transform: translateX(-100%);
     transition: transform var(--transition-slow);
     padding-top: env(safe-area-inset-top, 0);
@@ -1258,7 +1306,7 @@ a:hover {
     position: fixed;
     inset: 0;
     background: rgba(0, 0, 0, 0.5);
-    z-index: 99;
+    z-index: var(--z-sidebar-backdrop);
     backdrop-filter: blur(6px);
     -webkit-backdrop-filter: blur(6px);
   }
@@ -1869,7 +1917,7 @@ a:hover {
   border-radius: var(--radius-md);
   box-shadow: var(--shadow-lg, 0 8px 24px rgba(0,0,0,.25));
   padding: 4px;
-  z-index: 20;
+  z-index: var(--z-menu);
   min-width: 170px;
   display: flex;
   flex-direction: column;
@@ -3061,7 +3109,7 @@ a:hover {
   box-shadow: 0 -4px 24px rgba(0, 0, 0, 0.12);
   max-height: 340px;
   overflow-y: auto;
-  z-index: 100;
+  z-index: var(--z-sidebar);
   margin-bottom: 6px;
   padding: 6px 0;
   backdrop-filter: blur(12px);
@@ -3134,7 +3182,7 @@ a:hover {
 /* ── Context menu ── */
 .ctx-menu {
   position: fixed;
-  z-index: 10000;
+  z-index: var(--z-top);
   background: var(--bg);
   border: 1px solid var(--border);
   border-radius: var(--radius-lg);
@@ -3232,7 +3280,7 @@ a:hover {
   max-height: 400px;
   overflow-y: auto;
   padding: 8px 0;
-  z-index: 200;
+  z-index: var(--z-panel);
 }
 .tasks-panel[hidden] {
   display: none;
@@ -3305,7 +3353,7 @@ a:hover {
   box-shadow: 0 8px 32px rgba(0, 0, 0, 0.18);
   min-width: 200px;
   padding: 6px 0;
-  z-index: 200;
+  z-index: var(--z-panel);
   animation: fade-in 0.12s;
 }
 .settings-dropdown[hidden] {
@@ -3358,7 +3406,7 @@ a:hover {
 .lightbox-backdrop {
   position: fixed;
   inset: 0;
-  z-index: 9999;
+  z-index: var(--z-lightbox);
   background: rgba(0, 0, 0, 0.88);
   backdrop-filter: blur(8px);
   display: flex;
@@ -3767,7 +3815,7 @@ a:hover {
 .repo-status-dot[data-state='pending'] { background: var(--fg-muted); }
 .repo-status-dot[data-state='cloning'] { background: var(--accent); animation: repo-dot-pulse 1.2s ease-in-out infinite; }
 .repo-status-dot[data-state='ready']   { background: #22c55e; }
-.repo-status-dot[data-state='failed']  { background: var(--danger, #ef4444); }
+.repo-status-dot[data-state='failed']  { background: var(--danger); }
 @keyframes repo-dot-pulse {
   0%, 100% { opacity: 1; }
   50%      { opacity: 0.35; }
@@ -3805,7 +3853,7 @@ a:hover {
   border: 1px solid var(--border);
   border-radius: var(--radius-md, 10px);
   box-shadow: 0 10px 30px rgba(0, 0, 0, 0.18);
-  z-index: 20;
+  z-index: var(--z-menu);
 }
 .effort-menu[hidden] {
   display: none;
@@ -3991,7 +4039,7 @@ body.voice-overlay-open {
 .voice-overlay {
   position: fixed;
   inset: 0;
-  z-index: 1200;
+  z-index: var(--z-voice);
   pointer-events: auto;
 }
 .voice-overlay[hidden] {
@@ -4254,7 +4302,7 @@ body.voice-overlay-open {
   background:
     radial-gradient(circle at 50% 18%, color-mix(in srgb, var(--accent) 16%, transparent) 0, transparent 34%),
     rgba(0, 0, 0, 0.54);
-  z-index: 200;
+  z-index: var(--z-panel);
   backdrop-filter: blur(16px) saturate(120%);
   -webkit-backdrop-filter: blur(16px) saturate(120%);
   align-items: flex-start;
@@ -5157,7 +5205,7 @@ body.voice-overlay-open {
   position: fixed;
   inset: 0;
   background: rgba(0, 0, 0, 0.55);
-  z-index: 300;
+  z-index: var(--z-palette);
   backdrop-filter: blur(10px);
   -webkit-backdrop-filter: blur(10px);
   align-items: flex-start;
@@ -5299,7 +5347,7 @@ body.voice-overlay-open {
   border-radius: var(--radius-full);
   border: 1px solid var(--border);
   box-shadow: var(--shadow-lg);
-  z-index: 400;
+  z-index: var(--z-toast);
   font-size: var(--text-sm);
   font-weight: 500;
   opacity: 0;
@@ -5506,7 +5554,7 @@ body.voice-overlay-open {
 .permission-modal-overlay {
   position: fixed;
   inset: 0;
-  z-index: 10000;
+  z-index: var(--z-top);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -5519,7 +5567,7 @@ body.voice-overlay-open {
   to { opacity: 1; }
 }
 .permission-modal {
-  background: var(--bg-primary, #1a1a2e);
+  background: var(--bg-primary);
   border: 1px solid var(--border, #333);
   border-radius: var(--radius-lg, 12px);
   padding: var(--space-5, 24px);
@@ -5546,15 +5594,15 @@ body.voice-overlay-open {
   text-align: center;
   font-size: var(--text-lg, 18px);
   font-weight: 600;
-  color: var(--fg-primary, #e0e0e0);
+  color: var(--fg-primary);
   margin-bottom: var(--space-2, 8px);
 }
 .permission-modal-tool {
   text-align: center;
   font-family: var(--font-mono, monospace);
   font-size: var(--text-base, 15px);
-  color: var(--accent, #7c3aed);
-  background: color-mix(in srgb, var(--accent, #7c3aed) 12%, transparent);
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
   border-radius: var(--radius-sm, 6px);
   padding: var(--space-1, 4px) var(--space-3, 12px);
   display: inline-block;
@@ -5563,11 +5611,11 @@ body.voice-overlay-open {
 }
 .permission-modal-desc {
   font-size: var(--text-sm, 13px);
-  color: var(--fg-secondary, #aaa);
+  color: var(--fg-secondary);
   word-break: break-all;
   margin-bottom: var(--space-3, 12px);
   padding: var(--space-2, 8px);
-  background: var(--bg-secondary, #222);
+  background: var(--bg-secondary);
   border-radius: var(--radius-sm, 6px);
   font-family: var(--font-mono, monospace);
 }
@@ -5584,7 +5632,7 @@ body.voice-overlay-open {
 .permission-modal-details pre {
   max-height: 120px;
   overflow: auto;
-  background: var(--bg-secondary, #222);
+  background: var(--bg-secondary);
   border-radius: var(--radius-sm, 6px);
   padding: var(--space-2, 8px);
   white-space: pre-wrap;
@@ -5617,12 +5665,12 @@ body.voice-overlay-open {
   opacity: 0.85;
 }
 .permission-btn-deny {
-  background: var(--bg-tertiary, #333);
-  color: var(--fg-primary, #e0e0e0);
+  background: var(--bg-tertiary);
+  color: var(--fg-primary);
   border: 1px solid var(--border, #444);
 }
 .permission-btn-deny:hover {
-  background: color-mix(in srgb, var(--danger, #ef4444) 15%, var(--bg-tertiary, #333));
+  background: color-mix(in srgb, var(--danger) 15%, var(--bg-tertiary));
 }
 .permission-modal-timer {
   text-align: center;
@@ -5643,8 +5691,8 @@ body.voice-overlay-open {
   background: color-mix(in srgb, var(--success, #22c55e) 8%, transparent);
 }
 .msg.permission .msg-body.resolved-deny {
-  border-color: color-mix(in srgb, var(--danger, #ef4444) 40%, transparent);
-  background: color-mix(in srgb, var(--danger, #ef4444) 8%, transparent);
+  border-color: color-mix(in srgb, var(--danger) 40%, transparent);
+  background: color-mix(in srgb, var(--danger) 8%, transparent);
 }
 
 /* ═══════════════ AskUserQuestion modal ═══════════════ */
@@ -5672,18 +5720,18 @@ body.voice-overlay-open {
   width: 36px;
   height: 36px;
   border-radius: 50%;
-  background: color-mix(in srgb, var(--accent, #7c3aed) 18%, transparent);
+  background: color-mix(in srgb, var(--accent) 18%, transparent);
 }
 .aq-header-icon svg {
   width: 22px;
   height: 22px;
-  color: var(--accent, #7c3aed);
+  color: var(--accent);
 }
 .aq-header-title {
   flex: 0 0 auto;
   font-size: var(--text-lg, 18px);
   font-weight: 600;
-  color: var(--fg-primary, #e0e0e0);
+  color: var(--fg-primary);
 }
 .aq-header-sub {
   flex: 1 1 auto;
@@ -5706,25 +5754,25 @@ body.voice-overlay-open {
   padding: var(--space-3, 12px);
   border: 1px solid var(--border, #333);
   border-radius: var(--radius-md, 8px);
-  background: var(--bg-secondary, #222);
+  background: var(--bg-secondary);
   transition: border-color 0.2s, box-shadow 0.2s;
 }
 .aq-question.aq-flash {
-  border-color: var(--danger, #ef4444);
-  box-shadow: 0 0 0 2px color-mix(in srgb, var(--danger, #ef4444) 30%, transparent);
+  border-color: var(--danger);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--danger) 30%, transparent);
 }
 .aq-chip {
   align-self: flex-start;
   font-size: var(--text-xs, 12px);
   font-family: var(--font-mono, monospace);
-  color: var(--accent, #7c3aed);
-  background: color-mix(in srgb, var(--accent, #7c3aed) 14%, transparent);
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
   padding: 2px var(--space-2, 8px);
   border-radius: var(--radius-sm, 6px);
 }
 .aq-qtext {
   font-size: var(--text-base, 15px);
-  color: var(--fg-primary, #e0e0e0);
+  color: var(--fg-primary);
   font-weight: 500;
 }
 .aq-options {
@@ -5737,24 +5785,24 @@ body.voice-overlay-open {
   align-items: flex-start;
   gap: var(--space-2, 8px);
   padding: var(--space-2, 8px) var(--space-3, 12px);
-  background: var(--bg-primary, #1a1a2e);
+  background: var(--bg-primary);
   border: 1px solid var(--border, #333);
   border-radius: var(--radius-sm, 6px);
-  color: var(--fg-primary, #e0e0e0);
+  color: var(--fg-primary);
   text-align: left;
   cursor: pointer;
   transition: background 0.15s, border-color 0.15s, transform 0.1s;
 }
 .aq-option:hover {
-  background: var(--bg-tertiary, #2a2a3e);
-  border-color: color-mix(in srgb, var(--accent, #7c3aed) 50%, var(--border, #333));
+  background: var(--bg-tertiary);
+  border-color: color-mix(in srgb, var(--accent) 50%, var(--border, #333));
 }
 .aq-option:active {
   transform: scale(0.98);
 }
 .aq-option.selected {
-  border-color: var(--accent, #7c3aed);
-  background: color-mix(in srgb, var(--accent, #7c3aed) 12%, var(--bg-primary, #1a1a2e));
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 12%, var(--bg-primary));
 }
 .aq-option-marker {
   flex: 0 0 auto;
@@ -5772,8 +5820,8 @@ body.voice-overlay-open {
   border-radius: 4px;
 }
 .aq-option.selected .aq-option-marker {
-  background: var(--accent, #7c3aed);
-  border-color: var(--accent, #7c3aed);
+  background: var(--accent);
+  border-color: var(--accent);
   position: relative;
 }
 .aq-option.selected .aq-option-marker::after {
@@ -5802,7 +5850,7 @@ body.voice-overlay-open {
 .aq-option-label {
   font-size: var(--text-sm, 14px);
   font-weight: 500;
-  color: var(--fg-primary, #e0e0e0);
+  color: var(--fg-primary);
 }
 .aq-option-desc {
   font-size: var(--text-xs, 12px);
@@ -5812,10 +5860,10 @@ body.voice-overlay-open {
 .aq-other-input {
   margin-top: var(--space-2, 8px);
   padding: var(--space-2, 8px) var(--space-3, 12px);
-  background: var(--bg-primary, #1a1a2e);
-  border: 1px solid var(--accent, #7c3aed);
+  background: var(--bg-primary);
+  border: 1px solid var(--accent);
   border-radius: var(--radius-sm, 6px);
-  color: var(--fg-primary, #e0e0e0);
+  color: var(--fg-primary);
   font-size: var(--text-sm, 14px);
   font-family: inherit;
   outline: none;
@@ -5823,7 +5871,7 @@ body.voice-overlay-open {
   box-sizing: border-box;
 }
 .aq-other-input:focus {
-  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent, #7c3aed) 25%, transparent);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 25%, transparent);
 }
 .aq-hidden {
   display: none !important;
@@ -5831,14 +5879,14 @@ body.voice-overlay-open {
 .aq-preview-pane {
   margin-top: var(--space-2, 8px);
   padding: var(--space-3, 12px);
-  background: var(--bg-primary, #1a1a2e);
+  background: var(--bg-primary);
   border: 1px dashed var(--border, #333);
   border-radius: var(--radius-sm, 6px);
   max-height: 160px;
   overflow: auto;
   font-family: var(--font-mono, monospace);
   font-size: var(--text-xs, 12px);
-  color: var(--fg-secondary, #aaa);
+  color: var(--fg-secondary);
   white-space: pre-wrap;
   word-break: break-word;
 }
@@ -5854,7 +5902,7 @@ body.voice-overlay-open {
   gap: var(--space-3, 12px);
   padding: var(--space-3, 12px) var(--space-5, 24px);
   border-top: 1px solid var(--border, #333);
-  background: var(--bg-primary, #1a1a2e);
+  background: var(--bg-primary);
 }
 .aq-footer-timer {
   font-size: var(--text-xs, 12px);
@@ -5885,7 +5933,7 @@ body.voice-overlay-open {
 }
 .aq-card-title {
   font-weight: 600;
-  color: var(--fg-primary, #e0e0e0);
+  color: var(--fg-primary);
 }
 .aq-card-status {
   margin-left: auto;
@@ -5902,15 +5950,15 @@ body.voice-overlay-open {
   flex-direction: column;
   gap: 2px;
   padding-left: var(--space-3, 12px);
-  border-left: 2px solid color-mix(in srgb, var(--accent, #7c3aed) 40%, transparent);
+  border-left: 2px solid color-mix(in srgb, var(--accent) 40%, transparent);
 }
 .aq-card-q {
   font-size: var(--text-sm, 14px);
-  color: var(--fg-secondary, #aaa);
+  color: var(--fg-secondary);
 }
 .aq-card-a {
   font-size: var(--text-sm, 14px);
-  color: var(--fg-primary, #e0e0e0);
+  color: var(--fg-primary);
   font-weight: 500;
 }
 
@@ -5965,7 +6013,7 @@ body.voice-overlay-open {
 }
 .plan-card:hover {
   background: var(--bg-hover);
-  border-color: var(--accent, #7c3aed);
+  border-color: var(--accent);
   transform: translateY(-1px);
 }
 .plan-card-label {
@@ -5980,7 +6028,7 @@ body.voice-overlay-open {
 }
 .plan-card-bonus {
   font-size: var(--text-xs);
-  color: color-mix(in srgb, var(--accent, #7c3aed) 80%, var(--fg) 20%);
+  color: color-mix(in srgb, var(--accent) 80%, var(--fg) 20%);
   font-variant-numeric: tabular-nums;
 }
 
@@ -6007,7 +6055,7 @@ body.voice-overlay-open {
   color: var(--fg-muted);
 }
 .topup-bonus {
-  color: color-mix(in srgb, var(--accent, #7c3aed) 80%, var(--fg) 20%);
+  color: color-mix(in srgb, var(--accent) 80%, var(--fg) 20%);
 }
 
 /* 充值面板顶部的注册赠送营销 banner — 静态文案,与套餐列表区分开。 */
@@ -6016,9 +6064,9 @@ body.voice-overlay-open {
   padding: var(--space-2) var(--space-3);
   margin: 0 0 var(--space-3);
   border-radius: var(--radius-sm, 6px);
-  background: color-mix(in srgb, var(--accent, #7c3aed) 12%, transparent);
-  color: color-mix(in srgb, var(--accent, #7c3aed) 80%, var(--fg) 20%);
-  border: 1px solid color-mix(in srgb, var(--accent, #7c3aed) 24%, transparent);
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+  color: color-mix(in srgb, var(--accent) 80%, var(--fg) 20%);
+  border: 1px solid color-mix(in srgb, var(--accent) 24%, transparent);
 }
 
 /* 充值模态底部的客服联系方式 — 三个 stage 通用,刻意低调避免喧宾夺主。 */
@@ -6098,9 +6146,9 @@ body.voice-overlay-open {
 .topup-pay-guide {
   margin-top: var(--space-4);
   padding: var(--space-3) var(--space-4);
-  background: color-mix(in srgb, var(--accent, #7c3aed) 10%, transparent);
-  border: 1px solid color-mix(in srgb, var(--accent, #7c3aed) 30%, transparent);
-  border-left: 3px solid var(--accent, #7c3aed);
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+  border: 1px solid color-mix(in srgb, var(--accent) 30%, transparent);
+  border-left: 3px solid var(--accent);
   border-radius: var(--radius-md);
 }
 .topup-pay-guide-title {
@@ -6122,12 +6170,12 @@ body.voice-overlay-open {
 }
 .topup-pay-guide-steps li { margin-bottom: 2px; }
 .topup-pay-guide-steps li strong {
-  color: color-mix(in srgb, var(--accent, #7c3aed) 80%, var(--fg) 20%);
+  color: color-mix(in srgb, var(--accent) 80%, var(--fg) 20%);
 }
 .topup-pay-guide-desktop {
   margin-top: var(--space-2);
   padding-top: var(--space-2);
-  border-top: 1px dashed color-mix(in srgb, var(--accent, #7c3aed) 25%, transparent);
+  border-top: 1px dashed color-mix(in srgb, var(--accent) 25%, transparent);
   font-size: var(--text-xs);
   color: var(--fg-muted);
 }
@@ -6298,14 +6346,14 @@ body.voice-overlay-open {
 }
 .prefs-effort-pill:has(input:checked) {
   background: var(--bg);
-  color: var(--accent, #7c3aed);
+  color: var(--accent);
   font-weight: 600;
   box-shadow:
-    0 0 0 1px color-mix(in srgb, var(--accent, #7c3aed) 35%, transparent),
+    0 0 0 1px color-mix(in srgb, var(--accent) 35%, transparent),
     0 1px 3px rgba(0, 0, 0, 0.08);
 }
 .prefs-effort-pill:has(input:focus-visible) {
-  outline: 2px solid color-mix(in srgb, var(--accent, #7c3aed) 60%, transparent);
+  outline: 2px solid color-mix(in srgb, var(--accent) 60%, transparent);
   outline-offset: 1px;
 }
 
@@ -6367,13 +6415,13 @@ body.voice-overlay-open {
   box-shadow: 0 1px 2px rgba(0, 0, 0, 0.2);
 }
 .prefs-switch input:checked + .prefs-switch-slider {
-  background: var(--accent, #7c3aed);
+  background: var(--accent);
 }
 .prefs-switch input:checked + .prefs-switch-slider::before {
   transform: translateX(18px);
 }
 .prefs-switch input:focus-visible + .prefs-switch-slider {
-  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent, #7c3aed) 30%, transparent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 30%, transparent);
 }
 
 .prefs-status {
@@ -6393,7 +6441,7 @@ body.voice-overlay-open {
   color: var(--fg-muted);
   font-size: var(--text-sm);
 }
-.usage-error { color: var(--danger, #ef4444); }
+.usage-error { color: var(--danger); }
 .usage-summary {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
@@ -6494,7 +6542,7 @@ body.voice-overlay-open {
   padding: var(--space-4) !important;
 }
 .usage-delta-pos { color: var(--success, #10b981); }
-.usage-delta-neg { color: var(--danger, #ef4444); }
+.usage-delta-neg { color: var(--danger); }
 .usage-legacy-row {
   margin-top: var(--space-2);
   padding: var(--space-2) var(--space-3);
@@ -6548,7 +6596,7 @@ body.body-landing {
 .landing-nav {
   position: sticky;
   top: 0;
-  z-index: 50;
+  z-index: var(--z-sticky);
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -7466,7 +7514,7 @@ body.body-landing {
   width: min(440px, calc(100vw - 32px));
   min-height: 58px;
   transform: translate(-50%, -18px);
-  z-index: 240;
+  z-index: var(--z-banner);
   display: flex;
   align-items: center;
   gap: var(--space-3);
@@ -7609,7 +7657,7 @@ body.body-landing {
 .boot-restore {
   position: fixed;
   inset: 0;
-  z-index: 50;
+  z-index: var(--z-sticky);
   display: grid;
   place-items: center;
   background: var(--bg);
@@ -7767,7 +7815,7 @@ body.body-landing {
   animation: sync-orbit 0.9s linear infinite;
 }
 .repo-banner-icon[data-state='ready']  { background: #22c55e; border: 0; }
-.repo-banner-icon[data-state='failed'] { background: var(--danger, #ef4444); border: 0; }
+.repo-banner-icon[data-state='failed'] { background: var(--danger); border: 0; }
 
 /* repo 名:可省略;不要 flex:1,免得吃光进度条空间 */
 .repo-banner-name {
@@ -7785,7 +7833,7 @@ body.body-landing {
   color: var(--fg-muted);
   font-size: 12px;
 }
-.repo-banner[data-state='failed'] .repo-banner-status { color: var(--danger, #ef4444); }
+.repo-banner[data-state='failed'] .repo-banner-status { color: var(--danger); }
 .repo-banner[data-state='ready']  .repo-banner-status { color: #16a34a; }
 
 .repo-banner-progress {
@@ -8920,7 +8968,7 @@ body.body-landing {
   opacity: 0;
   pointer-events: none;
   transition: opacity var(--transition-fast);
-  z-index: 260;
+  z-index: var(--z-plan-backdrop);
 }
 .plan-panel-backdrop.open {
   opacity: 1;
@@ -8939,7 +8987,7 @@ body.body-landing {
   box-shadow: -18px 0 40px rgba(0, 0, 0, 0.18);
   transform: translateX(100%);
   transition: transform var(--transition-fast);
-  z-index: 270;
+  z-index: var(--z-plan-panel);
 }
 .plan-panel.open {
   transform: translateX(0);
@@ -10442,13 +10490,13 @@ textarea:focus-visible,
  *  mobile dropdown a bounded fixed sheet.
  * ══════════════════════════════════════════════════════════════════ */
 .main-head {
-  z-index: 80;
+  z-index: var(--z-head);
 }
 .settings-dropdown-wrap {
-  z-index: 90;
+  z-index: var(--z-head-dropdown);
 }
 .settings-dropdown {
-  z-index: 1000;
+  z-index: var(--z-dropdown);
   pointer-events: auto;
 }
 
@@ -10503,10 +10551,10 @@ textarea:focus-visible,
     justify-content: flex-end;
   }
   .settings-dropdown-wrap {
-    z-index: 1000;
+    z-index: var(--z-dropdown);
   }
   .settings-dropdown {
-    z-index: 1001;
+    z-index: var(--z-dropdown-raised);
   }
   .head-actions .icon-btn,
   .settings-dropdown-wrap > .icon-btn {
@@ -10555,7 +10603,7 @@ textarea:focus-visible,
     overflow-y: auto;
     overscroll-behavior: contain;
     -webkit-overflow-scrolling: touch;
-    z-index: 950;
+    z-index: var(--z-tasks-mobile);
     border-radius: 22px;
     padding: 6px;
   }

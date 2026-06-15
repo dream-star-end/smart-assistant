@@ -218,6 +218,8 @@ export class BaselineServer {
 
     const row = await queries.getHostById(hostUuid);
     if (!row) return { ok: false, reason: "host_not_found" };
+    // A3 — 终态 revoked host(被入侵/下线)不得再拉 baseline。
+    if (row.status === "revoked") return { ok: false, reason: "host_revoked" };
     if (isSelfPlaceholder(row.agent_psk_nonce, row.agent_psk_ct)) {
       // self host 不应通过 baselineServer 拉自己的 baseline
       return { ok: false, reason: "self_host_no_psk" };

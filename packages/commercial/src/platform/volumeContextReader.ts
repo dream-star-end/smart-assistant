@@ -245,7 +245,12 @@ export function makeRemoteVolumeReader(deps: {
         // host 行不存在 — 数据库层异常状态,抛错而非 silent null
         throw new Error(`makeRemoteVolumeReader: hostUuid ${deps.hostUuid} not found in compute_hosts`);
       }
+      // A3 — 终态 revoked host 不再做 volume context RPC(deny)。
+      if (row.status === "revoked") {
+        throw new Error(`makeRemoteVolumeReader: hostUuid ${deps.hostUuid} revoked`);
+      }
       const target = toTarget(row);
+      target.requireFingerprint = true;
       try {
         const resp = await rpc(target, userId);
         return mapResponseToContext(resp);

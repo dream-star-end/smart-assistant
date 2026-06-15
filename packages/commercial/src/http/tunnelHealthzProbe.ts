@@ -58,7 +58,12 @@ export async function defaultTunnelFetchHealthz(
   if (!row) {
     throw new Error(`tunnelFetchHealthz: compute_host ${hostId} not found`);
   }
+  // A3 — 终态 revoked host 不再探活/建 tunnel(deny;caller catch → false)。
+  if (row.status === "revoked") {
+    throw new Error(`tunnelFetchHealthz: compute_host ${hostId} revoked`);
+  }
   const target = (deps.rowToTarget ?? hostRowToTarget)(row);
+  target.requireFingerprint = true;
   let socket: Awaited<ReturnType<typeof dialTunnelSocket>> | null = null;
   try {
     socket = await (deps.dial ?? dialTunnelSocket)({

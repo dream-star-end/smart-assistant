@@ -448,12 +448,17 @@ export async function updateStatus(
   status: ComputeHostStatus,
   err?: string | null,
 ): Promise<void> {
+  // A3 — 终态 revoked 守卫:通用 status 写入器不得把 revoked 拉回任何非-revoked
+  // 状态。WHERE 谓词让 revoked 行仅当目标仍是 'revoked' 时可写(idempotent),
+  // 否则 no-op(rowCount 0)。当前无生产 caller,但函数是 exported 通用入口,
+  // 在状态机源头封住"无声 un-revoke"这一类风险(对齐 setQuarantined/setDraining)。
   await getPool().query(
     `UPDATE compute_hosts
         SET status = $2,
             last_bootstrap_err = COALESCE($3, last_bootstrap_err),
             updated_at = NOW()
-      WHERE id = $1`,
+      WHERE id = $1
+        AND (status <> 'revoked' OR $2 = 'revoked')`,
     [id, status, err ?? null],
   );
 }
@@ -487,6 +492,17 @@ export async function markBootstrapResult(
   const client = await getPool().connect();
   try {
     await client.query("BEGIN");
+    // A3 — 终态 revoked 守卫:bootstrapHost 入口已拒 revoked,markBootstrapResult 当前
+    // 只在该已 gated 流程内被调;此处 FOR UPDATE 预检是防"未来有人绕过入口直接调"的
+    // 无声 un-revoke(与 setQuarantined/setDraining/updateStatus 终态守卫对齐)。
+    const curBoot = await client.query<{ status: ComputeHostStatus }>(
+      `SELECT status FROM compute_hosts WHERE id = $1 FOR UPDATE`,
+      [id],
+    );
+    if (curBoot.rows[0]?.status === "revoked") {
+      await client.query("ROLLBACK");
+      return { status: "revoked" };
+    }
     let nextStatus: ComputeHostStatus;
     let reasonCode: string | null = null;
     let reasonDetail: string | null = null;
@@ -916,6 +932,10 @@ export interface UpdateCertInput {
 }
 
 export async function updateCert(input: UpdateCertInput): Promise<void> {
+  // A3 — 终态 revoked 守卫(原子):setRevoked 把 fingerprint 置 NULL 立即断,但
+  // maybeRenewCert 可能持有 revoke 之前读到的旧 row,续签会把 fingerprint 写回 →
+  // defeat kill-switch + B8。WHERE 谓词让 revoked host 的 cert 写入直接 no-op
+  // (按已提交的最新 status 原子判定,不吃旧 row;无 TOCTOU 窗口)。
   await getPool().query(
     `UPDATE compute_hosts
         SET agent_cert_pem = $2,
@@ -923,7 +943,8 @@ export async function updateCert(input: UpdateCertInput): Promise<void> {
             agent_cert_not_before = $4,
             agent_cert_not_after = $5,
             updated_at = NOW()
-      WHERE id = $1`,
+      WHERE id = $1
+        AND status <> 'revoked'`,
     [input.id, input.certPem, input.fingerprintSha256, input.notBefore, input.notAfter],
   );
 }
@@ -1013,6 +1034,60 @@ export async function setDraining(
     try {
       await client.query("ROLLBACK");
     } catch { /* swallow */ }
+    throw e;
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * A3 — 吊销 host(终态 kill-switch)。从任意非 self 状态 → 'revoked',同时把
+ * agent_cert_fingerprint_sha256 置 NULL(立即断,不等证书过期 + 配合 B8 fail-closed)。
+ * idempotent(已 revoked 再 revoke 仍返 true)。返 false:host 不存在 或 name='self'
+ * (master 自身不可吊销)。
+ */
+export async function setRevoked(
+  id: string,
+  audit: { actor: string; operationId?: string },
+): Promise<boolean> {
+  const client = await getPool().connect();
+  try {
+    await client.query("BEGIN");
+    const cur = await client.query<{ status: ComputeHostStatus; name: string }>(
+      `SELECT status, name FROM compute_hosts WHERE id = $1 FOR UPDATE`,
+      [id],
+    );
+    if (cur.rowCount === 0) {
+      await client.query("ROLLBACK");
+      return false;
+    }
+    if (cur.rows[0]!.name === "self") {
+      await client.query("ROLLBACK");
+      return false;
+    }
+    const previousStatus = cur.rows[0]!.status;
+    await client.query(
+      `UPDATE compute_hosts
+          SET status = 'revoked', agent_cert_fingerprint_sha256 = NULL, updated_at = NOW()
+        WHERE id = $1`,
+      [id],
+    );
+    await writeAuditInTx(client, {
+      hostId: id,
+      operation: "admin.revoke",
+      operationId: audit.operationId,
+      reasonCode: null,
+      detail: { from: previousStatus, to: "revoked", fingerprintCleared: true },
+      actor: audit.actor,
+    });
+    await client.query("COMMIT");
+    return true;
+  } catch (e) {
+    try {
+      await client.query("ROLLBACK");
+    } catch {
+      /* swallow */
+    }
     throw e;
   } finally {
     client.release();
@@ -1185,11 +1260,14 @@ export async function setQuarantined(
     }
     const { status: previousStatus, reason: previousReason } = cur.rows[0]!;
 
-    // 不动 status 的状态:bootstrapping/draining/broken
+    // 不动 status 的状态:bootstrapping/draining/broken/revoked
+    // A3 — revoked 是终态:health 自愈 / auto-heal / 任何 quarantine 触发都不得
+    // 把它拉回 quarantined(否则等于无声 un-revoke,kill-switch 被绕过)。
     if (
       previousStatus === "bootstrapping" ||
       previousStatus === "draining" ||
-      previousStatus === "broken"
+      previousStatus === "broken" ||
+      previousStatus === "revoked"
     ) {
       await writeAuditInTx(client, {
         hostId: id,

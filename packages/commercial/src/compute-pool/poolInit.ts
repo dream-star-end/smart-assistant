@@ -121,9 +121,9 @@ export async function initComputePool(opts: InitOptions = {}): Promise<InitResul
     });
   }
 
-  // Step 4: backfill — 拉一遍非 self host 的 /health
+  // Step 4: backfill — 拉一遍非 self host 的 /health(A3:跳过 revoked,终态不探活)
   const allRows = await queries.listAllHosts();
-  const targets = allRows.filter((r) => r.name !== "self");
+  const targets = allRows.filter((r) => r.name !== "self" && r.status !== "revoked");
   result.backfillHosts = targets.length;
 
   if (targets.length > 0) {

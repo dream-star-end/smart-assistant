@@ -14,7 +14,10 @@ export type ComputeHostStatus =
   | "ready"
   | "quarantined"
   | "draining"
-  | "broken";
+  | "broken"
+  // A3 — 终态安全 kill-switch:被入侵/下线的 host。永不服务、永不 health 轮询/续签;
+  // 与 quarantined(可恢复)区分。revoke 时同时清 agent_cert_fingerprint_sha256 立即断。
+  | "revoked";
 
 /**
  * 0042 — quarantine reason 分类。soft = host 内部状态可自愈,等下一轮 probe;

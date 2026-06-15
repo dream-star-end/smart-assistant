@@ -250,7 +250,13 @@ async function dispatchTunnel(
     sendJsonError(res, 502, 'BAD_GATEWAY', 'host not found', ctx.requestId)
     return
   }
+  // A3 — 终态 revoked host 不再走 container API tunnel(deny)。
+  if (row.status === 'revoked') {
+    sendJsonError(res, 502, 'BAD_GATEWAY', 'host revoked', ctx.requestId)
+    return
+  }
   const target = (deps.rowToTarget ?? hostRowToTarget)(row)
+  target.requireFingerprint = true
   try {
     const host = req.headers.host ?? 'x.invalid'
     const reqUrl = new URL(req.url ?? '/', `http://${host}`)

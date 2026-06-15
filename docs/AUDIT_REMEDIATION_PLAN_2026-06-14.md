@@ -35,13 +35,13 @@
 | U5 | escape helper 去重 + wechat.js:113 转义 | 安全/质量 | P2/P3 | 12 | W1 | 无 | ✅ Codex PASS, commit `62ac2835` |
 | U4 | `--fg-dim` 对比度达 WCAG AA | UI | P2 | 9 | W1 | ↑ 提升 | ✅ Codex PASS, commit `1d431a06` |
 | B1 | `request_finalize_journal` 对账器+GC | 资金 | P1 | 4 | W2 | 无 | ✅ Codex PASS, commit `ef2022db` |
-| B2 | admin 路由层声明式鉴权 | 安全 | P1 | 5 | W2 | 无 | ⬜ |
-| B3 | codex disable drift reconciler | 安全 | P1 | 5 | W2 | 无 | ⬜ |
-| B4 | node-agent 缺失容器返真 404 | 正确性 | P1 | 5 | W2 | ↑（少卡死） | ⬜ |
-| A3 | compute-host 吊销 kill-switch（+B8 NULL fingerprint fail-closed） | 安全/架构 | P0 | 3 | W2 | 无 | ⬜ 需先复核 |
-| B5 | 只读 admin 路由升 `requireAdminVerifyDb` | 安全 | P2 | 10 | W2 | 无 | ⬜ |
-| U2 | CSS 双 token 词汇统一 + 品牌色 fallback | UI | P1 | 7 | **W3** | 须严防视觉回归 | ⬜ |
-| U6 | `--z-*` 分层 token + 聊天流骨架屏一致性 | UI | P3 | 13 | W3 | ↑/中性 | ⬜ |
+| B2 | admin 路由层声明式鉴权 | 安全 | P1 | 5 | W2 | 无 | ✅ Codex PASS, commit `67a4b8f8`(含 B5) |
+| B3 | codex disable drift reconciler | 安全 | P1 | 5 | W2 | 无 | ✅ Codex PASS, commit `4faea489` |
+| B4 | node-agent 缺失容器返真 404 | 正确性 | P1 | 5 | W2 | ↑（少卡死） | ✅ Codex PASS, commit `d214d57a`（**Go node-agent rollout 线,非 deploy-v3.sh**) |
+| A3 | compute-host 吊销 kill-switch（+B8 NULL fingerprint fail-closed） | 安全/架构 | P0 | 3 | W2 | 无 | ✅ PASS（Codex 2 轮） |
+| B5 | 只读 admin 路由升 `requireAdminVerifyDb` | 安全 | P2 | 10 | W2 | 无 | ✅ 由 B2 router gate 收编(所有 admin 走 verify-db) |
+| U2 | CSS 双 token 词汇统一 + 品牌色 fallback | UI | P1 | 7 | **W3** | 须严防视觉回归 | ✅ PASS（Codex 2 轮） |
+| U6 | `--z-*` 分层 token + 聊天流骨架屏一致性 | UI | P3 | 13 | W3 | ↑/中性 | 🟡 z-index ✅(Codex PASS);骨架屏 defer |
 | **A1** | turn 生命周期单一权威源 + server `turnId` | 架构 | P0 | 1 | **W4** | 须严防流式 UI 回归 | ⬜ design-doc 先行 |
 | R1 | 多标签页协调（leader/广播 turn_settled） | 实时 | P1 | 7 | W4 | ↑（消幽灵态） | ⬜ 随 A1 |
 | R2 | IndexedDB 迁移框架 | 实时 | P1 | 8 | W4 | 中性 | ⬜ 随 A1 |
@@ -158,4 +158,38 @@
   - U4：`--fg-dim` 提对比度达 AA（--bg/elevated/subtle），raised/tinted 次要文字降级 --fg-muted。
   - 验证：全程 node --check + biome 0 新增 + test:web 993/993；前端 cache-bust 由 deploy-v3.sh 自动处理。
 - 2026-06-15：**B1 完成**（commit `ef2022db`，Codex 计划审+代码审 PASS）。terminalizer（非 replay,journal 无观测用量不可重算）:有 usage_records→committed 回填,无→aborted 不退不扣;7d GC 批量删。阈值根治:不用 0015 字面 30s（journal 不心跳、codex 600s,会误 abort 活流）,默认 30min/env 向上夹 max(codexMax*3,30min)/24h 上限+isSafeInteger 防 ::bigint 打挂。接进 index.ts 调度+关停;单测 14/14;SQL integ 留批量部署阶段验。
-- 下一步 W2 剩余:**B2 admin 路由声明式鉴权 / B3 codex disable drift / B4 node-agent 真 404 / A3 host 吊销+B8 / B5 只读 admin verify-db**。
+- 2026-06-15:**W1+B1 已部署上线**(v1.0.322,commit `e0a1ff99`)。deploy-v3.sh --force,smoke 5/5,无错误;B1 对账器 boot 即清掉生产 40 条卡死 inflight 行(0 残留),A2+B1 已对本地真 PG integ 验证。changelog 本次不写(currentVersion 仅 v1.0.321→322)。
+- 2026-06-15:**B2 完成**(commit `67a4b8f8`,Codex 计划审+代码审 PASS,**含 B5**)。router dispatch 对 /api/admin/* 一律 requireAdminVerifyDb(放 405 之前;method-aware 白名单仅 `GET /api/admin/metrics` 走自带 bearer 鉴权);metrics JWT 回落也升 verify-db。整组 admin(含只读)关闭降权 stale-role 窗口。adminRouteGate.integ 7/7,apiKeyAdmin 7/7 无回归。
+- 2026-06-15:**B3 完成**(`4faea489`,Codex PASS,unit 19/19 + integ 2/2)。**B4 完成**(`d214d57a`,Codex PASS,go build/test 通过;Go node-agent rollout 线,与 master deploy 分开)。
+- 2026-06-15:**A3 host-connect 调用点复核完成**(改前必做)。~20 处 host 解析跨 5 文件,分三类语义:
+  - **service**(容器文件 IO putRemoteCodexAuth/getRemoteFile、容器生命周期 RPC run/stop/remove/inspect、tunnel)→ **应**被吊销 gate。index.ts 406/427/551/1114/1499/1512/1534/1744/1830/2348/3073、codexLazyMigrate、v3readiness。
+  - **bootstrap/provisioning**(nodeBootstrap.ts 140/660/700/740/783)→ **不可** gate(新 host 尚未 ready,gate 会断 onboarding)。
+  - **health/cert**(nodeHealth.ts 96/154 maybeRenewCert)→ **不可**全 gate(health 要能探 quarantined/broken 去恢复;但 maybeRenewCert 需对 revoked 跳过,否则续签 defeat 吊销)。
+  - 结论:A3 需 **category-aware** `resolveServiceableHostTarget`(只 gate service 路径)+ 加 `revoked` 状态(migration)+ maybeRenewCert 对 revoked 跳过 + 吊销时清/换 pinned fingerprint + B8(RPC NULL fingerprint fail-closed)。本机无第二 host/node-agent,**无法多机 integ**,故 A3 走 Codex 计划审 + 单元测 + 部署阶段多机 smoke。
+- 2026-06-15:**A3(+B8)设计已锁定**(Codex 计划审 PASS,3 轮)。**仅加终态 `revoked` kill-switch,不动 quarantined/broken/draining 现有 service 语义**(零回归)。实现清单:
+  1. migration:DO 块按 pg_constraint 发现匿名 status CHECK 名 → DROP → ADD `compute_hosts_status_check`(超集 `bootstrapping/ready/quarantined/draining/broken/revoked`,不删任何现行)。
+  2. types.ts:`ComputeHostStatus` 加 `revoked`。
+  3. `resolveServiceableHostTarget(hostId)`:getHostById → null/revoked/**fingerprint NULL** 任一即 throw HostNotServiceableError → hostRowToTarget{requireFingerprint:true}。service 非 withTarget 路径(index.ts 容器文件 IO、codexLazyMigrate putRemote、v3readiness tunnel)改走它。
+  4. lifecycle RPC:gate 放 `RemoteNodeAgentBackend.withTarget`(containerService.ts:391,共享 choke point,重查不吃 60s 行缓存);**排除 self/local**(本机 docker 不需 node-agent fingerprint)。
+  5. B8:NodeAgentTarget 加 `requireFingerprint`;verifyServerCert `if(requireFingerprint && !expectedFingerprint) throw` + 原 compare。bootstrap target 不带该 flag → 不受影响(bootstrap 合法无 fingerprint)。
+  6. nodeHealth.pollHost:re-read 后 hostRowToTarget 前 recheck `status==='revoked'` → skip(防 revoke 与 poll 的 race);maybeRenewCert 加 `if revoked return`。
+  7. 非 service 控制面也 gate:poolInit backfill(:125 skip)、admin baseline-version(:571 skip)、tunnelHealthzProbe(:9 deny)、baselineServer 入站鉴权(:219 加 status deny)。
+  8. admin:`revokeComputeHost(id,ctx)` → 拒 self → `setRevoked`(status='revoked' + agent_cert_fingerprint_sha256=NULL 立即断)+ audit;路由 `POST /api/admin/v3/compute-hosts/:id/revoke`(走 B2 router admin gate)。un-revoke 需 re-bootstrap(可接受,终态)。
+  9. 验收:patch 后**重审所有直用 hostRowToTarget 的生产路径** —— 任何可能 RPC/tunnel/file/baseline/egress 接触终态 host 的路径,必须经 resolveServiceableHostTarget / withTarget / 显式 skip-deny。
+  - 单测(本地 PG):resolver {revoked/null-fp→throw, ready+fp→ok}、verifyServerCert requireFingerprint fail-closed、setRevoked SQL+audit、pollHost race recheck、≥1 非 service caller skip/deny、migration 超集保行。多机 smoke 留部署阶段。
+- 2026-06-15:**A3(+B8)实现完成,Codex code review PASS(2 轮:FAIL→修复→PASS)**。
+  - 状态机/DB:migration 0081(发现谓词从 `%status%IN%` 硬化为 `%status%`,按引用 status 列唯一匹配,不依赖枚举值子串/IN 归一化);`setRevoked`(tx FOR UPDATE,清 fingerprint,admin.revoke audit,self/不存在→false,幂等);types.ts `revoked`。
+  - **终态不变量(防无声 un-revoke,DB 层统一封)**:`setQuarantined` 跳过表 +revoked;`updateStatus` WHERE `AND (status<>'revoked' OR $2='revoked')`;`markBootstrapResult` 事务内 FOR UPDATE 预检 revoked→ROLLBACK;`updateCert` WHERE `AND status<>'revoked'`(**原子消除 revoke/renew 竞态** —— Codex Finding 2:maybeRenewCert 持旧 row 续签会写回 fingerprint,WHERE 守卫按 committed status 判定,无 TOCTOU);既有 setDraining/clearQuarantine(ByReason)/applyHealthSnapshot 经核已不外迁 revoked。
+  - 解析器+B8:`assertHostServiceable`(self 豁免/revoked/null-fp,revoked 优先)+ `resolveServiceableHostTarget`(requireFingerprint=true);`verifyServerCert` 加 requireFingerprint 形参,3 个 TLS 建连点(request/file-stream/dialTunnelSocket)透传。
+  - service 路径全 gate(重审闭合):withTarget(lifecycle RPC+inspectImage)、index.ts 远端 file-IO put/pull×2/**delete**(Codex Finding 1:漏的 deleteRemoteCodexAuth 已补)/inbound file-proxy/sshMux resolvePlacement、tunnelHealthzProbe/v3readiness/v3ensureRunning bridge/containerApiProxy/containerFileProxy/volumeContextReader、nodeBootstrap 入口/adminDistributeImageToHost(SSH)、nodeHealth poll+renew、poolInit/baselineServer/getBaselineVersions。`grep hostRowToTarget( index.ts` 仅余 sshMux 一处(已 gated)。
+  - 验证:tsc 改动文件 0 error;biome 0 new(工作树 32≤HEAD 35);测试 hostServiceable 5/5 + computeHostRevoke.integ 15/15(真 PG octest);回归 queriesAtomicLifecycle 62/62、v3EnsureRunning 21/21、v3Readiness 20/20、containerApiProxy 5/5。
+  - **已知 tech-debt(Codex 同意为 A3 边界,后续单独硬化)**:① revoked host 上活跃用户的 deny 是 retryable 形态(ContainerUnreadyError/502)→ 会被无意义重试(安全无损:每次重试重查 DB 再 deny,host 永不被接触);根治需 caller re-placement + data-host 迁移语义。② in-flight egress CONNECT / 已建 tunnel / bootstrap 进行中的 step 不被同步 teardown(revoke 只切新接触+清 fp+新 egress fail-closed);根治需 per-host active-socket/dispatcher 追踪与主动 kill。
+- 2026-06-15:**U2(CSS 双 token 统一)实现完成,Codex PASS(2 轮)**。审计发现主应用散落整套"旧别名"词汇(permission/askUserQuestion 模态、api-keys 面板等),从未在 :root/主题定义,只靠 `var(别名,#硬编码)` 续命 → **亮色主题下模态错乱**(深底+浅灰字几乎不可见)、无 fallback 的 `--radius/--brand/--error/--text` 直接失效(方角/无 outline)。
+  - 按"看一类问题"原则**一次性**把 16 个别名全部映射到 canonical token(base :root 定义,主题感知 lazy 解析;fallback 用 dark canonical 品牌安全值):--bg-primary/secondary/tertiary/base/soft/muted→--bg*;--text/-primary、--fg-primary→--fg;--text-secondary、--fg-secondary→--fg-muted;--brand→--accent;--error、--accent-danger→--danger;--radius→--radius-md;--mono→--font-mono。
+  - 同步删坏 fallback:30×`var(--accent,#7c3aed)`(禁用紫)、10×`var(--danger,#ef4444)`、6+3+3×`--bg-*` 偏蓝深色、9×`--fg-primary,#e0e0e0`、3×`--fg-secondary,#aaa`、3+1×`--accent-danger,#d33`。
+  - 净效果:dark 主题 sub-perceptual 微调(近黑/浅灰几无变化);light 主题 + mermaid label = 真 bug 修复(模态/文字恢复主题感知与可读对比)。审计脚本确认**主应用未定义别名 = 空**(整类消除)。admin.html 自带独立 token 体系,不在此统一。
+  - defer(后续 stylelint + 硬编码 hex 清扫):1×standalone `#7c3aed`(voice 字面量)、53×死 `var(--tok,#hex)` fallback(token 均已定义,5×已是品牌色)。
+  - 验证:brace 1960/1960;`git diff --check` 干净;web 测试 styleThemeConsistency 4/4、mermaidRenderingConfig 3/3、githubModalStyles 2/2;node --check apiKeys.js OK。
+- 2026-06-15:**U6 z-index token 化完成,Codex PASS**。style.css 41 处散落 z-index 魔数(含 9999/10000"层级战争")→ base :root 新增全局 `--z-*` 标度(18 token),把 25 处跨组件全局层级 decl 换成 token。**严格保值**:每 token 值=原 raw 值,层级关系 byte 级不变(纯命名+集中+文档化);局部 stacking(-1/0/1/2/5/10)保留裸值。验证:无残留裸 ≥20;token 引用 25=原 decl 数;brace 1960/1960;web 测试 4/4+3/3+2/2 全绿。
+  - **骨架屏一致性 defer**:主应用无 `.skeleton-*`(仅 admin.html 自带),聊天流/会话列表加骨架屏属**新增 UX 功能**(需 DOM 接线 + 视觉设计 + 浏览器验证),非纯维护性重构,留作独立 UX 项(同 U2/U6 的 stylelint 禁裸 hex/裸 z-index 一并做)。
+- 下一步:批量部署本波次(W2 的 A2/U1/U3/U4/U5/B1/B2/B3/B5/A3 + W3 的 U2/U6-z;B4 经 Go node-agent rollout)→ 再 W4(A1+R1/R2/R3、A5、A4 — design-doc 先行)、W5(B6/B7/B9)。

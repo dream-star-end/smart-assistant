@@ -351,7 +351,11 @@ export async function waitContainerReady(
         (async (hostId: string) => {
           const row = await queries.getHostById(hostId);
           if (!row) throw new Error(`unknown hostId: ${hostId}`);
-          return hostRowToTarget(row);
+          // A3 — 终态 revoked host 不再探活/建 readiness tunnel(deny)。
+          if (row.status === "revoked") throw new Error(`hostId ${hostId} revoked`);
+          const target = hostRowToTarget(row);
+          target.requireFingerprint = true;
+          return target;
         });
       tunnelTarget = await resolveTarget(endpoint.hostId);
     }

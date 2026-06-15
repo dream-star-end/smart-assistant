@@ -49,6 +49,7 @@ import {
   type ComputeHostRow,
 } from "./types.js";
 import { decryptAgentPsk, isSelfPlaceholder } from "./crypto.js";
+import { getHostById } from "./queries.js";
 import { promises as fs } from "node:fs";
 import {
   TRACE_ID_HEADER,
@@ -174,6 +175,7 @@ async function verifyServerCert(
   socket: TLSSocket,
   expectedHostUuid: string,
   expectedFingerprint: string | null,
+  requireFingerprint = false,
 ): Promise<void> {
   const peerCert = socket.getPeerCertificate(true);
   if (!peerCert || Object.keys(peerCert).length === 0) {
@@ -194,6 +196,11 @@ async function verifyServerCert(
 
   if (!fpNode) {
     throw new CertVerifyError("server cert fingerprint unavailable");
+  }
+
+  // B8 — service 路径要求必须有 pin。NULL fingerprint 不再静默跳过 pin(MITM 风险)。
+  if (requireFingerprint && !expectedFingerprint) {
+    throw new CertVerifyError("no pinned fingerprint for host (fail-closed)");
   }
 
   if (expectedFingerprint) {
@@ -242,6 +249,12 @@ export interface NodeAgentTarget {
   expectedFingerprint: string | null;
   /** 已解密的 psk(调用方负责清零);self host 是 null。 */
   psk: Buffer | null;
+  /**
+   * A3/B8 — service 路径(经 resolveServiceableHostTarget / withTarget 产生)置 true:
+   * 要求必须有 pinned fingerprint,缺失即 fail-closed。bootstrap target(裸 hostRowToTarget)
+   * 不置(undefined)→ 保留旧行为(初次发证前合法无 fingerprint)。
+   */
+  requireFingerprint?: boolean;
 }
 
 /**
@@ -260,6 +273,49 @@ export function hostRowToTarget(row: ComputeHostRow): NodeAgentTarget {
     expectedFingerprint: row.agent_cert_fingerprint_sha256,
     psk,
   };
+}
+
+/** A3 — host 不可服务(终态 revoked / 未完成 provision 缺 fingerprint)。 */
+export class HostNotServiceableError extends Error {
+  readonly code = "HOST_NOT_SERVICEABLE";
+  constructor(
+    readonly hostId: string,
+    readonly reason: string,
+  ) {
+    super(`compute host ${hostId} not serviceable: ${reason}`);
+    this.name = "HostNotServiceableError";
+  }
+}
+
+/**
+ * A3 — service 路径(RPC / tunnel / file)对 host 的可服务断言。self/local 豁免
+ * (本机不经 node-agent fingerprint)。revoked = kill-switch;fingerprint NULL =
+ * 未完成 provision,fail-closed(B8)。维护/恢复/bootstrap 路径**不**调本函数。
+ */
+export function assertHostServiceable(row: ComputeHostRow): void {
+  if (row.name === "self") return;
+  if (row.status === "revoked") {
+    throw new HostNotServiceableError(row.id, "revoked");
+  }
+  if (!row.agent_cert_fingerprint_sha256) {
+    throw new HostNotServiceableError(row.id, "no pinned fingerprint");
+  }
+}
+
+/**
+ * A3 — 解析"可服务"的 host target:getHostById → assertHostServiceable → target
+ * (requireFingerprint=true)。任何会对 host 发起 RPC/tunnel/file 的 service 路径
+ * (非 withTarget 走的)都应经此,不要再裸 getHostById + hostRowToTarget。
+ */
+export async function resolveServiceableHostTarget(hostId: string): Promise<NodeAgentTarget> {
+  const row = await getHostById(hostId);
+  if (!row) {
+    throw new HostNotServiceableError(hostId, "host not found");
+  }
+  assertHostServiceable(row);
+  const target = hostRowToTarget(row);
+  target.requireFingerprint = true;
+  return target;
 }
 
 // ─── 基础 RPC ────────────────────────────────────────────────────────
@@ -387,7 +443,7 @@ async function rpcCall<T>(target: NodeAgentTarget, opts: RpcOptions): Promise<T>
             return;
           }
           try {
-            await verifyServerCert(sock, target.hostId, target.expectedFingerprint);
+            await verifyServerCert(sock, target.hostId, target.expectedFingerprint, target.requireFingerprint ?? false);
           } catch (e) {
             settle(e instanceof Error ? e : new Error(String(e)));
             return;
@@ -526,7 +582,7 @@ async function rpcCallBinary(target: NodeAgentTarget, opts: RpcOptions): Promise
             return;
           }
           try {
-            await verifyServerCert(sock, target.hostId, target.expectedFingerprint);
+            await verifyServerCert(sock, target.hostId, target.expectedFingerprint, target.requireFingerprint ?? false);
           } catch (e) {
             settle(e instanceof Error ? e : new Error(String(e)));
             return;
@@ -1110,7 +1166,7 @@ export async function dialNodeAgentVerifiedTls(
   });
 
   try {
-    await verifyServerCert(socket, target.hostId, target.expectedFingerprint);
+    await verifyServerCert(socket, target.hostId, target.expectedFingerprint, target.requireFingerprint ?? false);
   } catch (e) {
     try { socket.destroy(); } catch { /* */ }
     throw e;

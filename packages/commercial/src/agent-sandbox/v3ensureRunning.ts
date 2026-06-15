@@ -197,7 +197,13 @@ async function defaultResolveBridgeTunnelTarget(hostId: string): Promise<NodeAge
   if (!row) {
     throw new ContainerUnreadyError(RETRY_AFTER_PROVISIONING_SEC, "host_gone");
   }
-  return hostRowToTarget(row);
+  // A3 — 终态 revoked host 不再建 bridge tunnel(deny;caller 视为暂不可用)。
+  if (row.status === "revoked") {
+    throw new ContainerUnreadyError(RETRY_AFTER_PROVISIONING_SEC, "host_revoked");
+  }
+  const target = hostRowToTarget(row);
+  target.requireFingerprint = true;
+  return target;
 }
 
 /**
