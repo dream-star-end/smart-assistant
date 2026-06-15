@@ -164,6 +164,12 @@ import {
   makeOutboundReceiverHandler,
   type WechatCodexBillingBody,
 } from "./wechat/outboundReceiver.js";
+import {
+  WECHAT_PROACTIVE_PATH,
+  makeProactiveReceiverHandler,
+  type ProactiveReceiverHandler,
+} from "./wechat/proactiveReceiver.js";
+import { getCurrentSessionId } from "./wechat/sessionPointer.js";
 import { MASTER_USER_PREFIX } from "./wechat/userIds.js";
 import {
   LITERATURE_SEARCH_PATH,
@@ -890,6 +896,9 @@ export async function registerCommercial(
   // 这层 ref 把"路由表"(dispatchInternal)与"broker 实例"装配顺序解耦,与
   // bridgeBroadcastRef 同型:proxy 闭包总读 ref.current,broker 未就绪时短路 404 不 throw。
   const wechatBrokerRef: { current: WechatBroker | null } = { current: null };
+  // 主动微信投递接收点(cron/提醒 → master 权威解析收件人 → outbox)。与 broker 同生命周期,
+  // 同条件块内装配;未装配时 dispatchInternal 显式 404(同 wechat-outbound 语义)。
+  const wechatProactiveRef: { current: ProactiveReceiverHandler | null } = { current: null };
   // v1.0.120 feat/codex-disable-rebind:fanoutDeps 依赖 v3Deps.putRemoteCodexAuth,
   // 必须在 v3Deps 装配后(line ~1067)才能赋值;但 proxy / codex token refresh
   // handler / commercialHttpDeps 在更早就要拿到 trigger 闭包,故用 ref 打破先后。
@@ -1216,6 +1225,20 @@ export async function registerCommercial(
             return Promise.resolve();
           }
           return broker.outboundHandler(req, res, ctx);
+        }
+        if (path === WECHAT_PROACTIVE_PATH) {
+          // 主动微信投递(cron/提醒)。未装配 → 404(同 wechat-outbound:容器侧分类为 fatal 直接 drop,
+          // 不污染 retryQueue)。装配条件与 broker 一致,故复用 broker null 判定即可。
+          const proactive = wechatProactiveRef.current;
+          if (!proactive) {
+            res.statusCode = 404;
+            res.setHeader("Content-Type", "application/json; charset=utf-8");
+            res.end(JSON.stringify({
+              error: { code: "WECHAT_BROKER_NOT_ASSEMBLED", message: "wechat broker not assembled" },
+            }));
+            return Promise.resolve();
+          }
+          return proactive(req, res, ctx);
         }
         return internalProxyHandler!(req, res, ctx);
       };
@@ -2407,6 +2430,26 @@ export async function registerCommercial(
       pool: getPool(),
       rateLimiter: createNoopRateLimiter(),
       handleCodexBilling: handleWechatCodexBilling,
+    });
+
+    // 主动微信投递接收点 —— 权威解析收件人(senderId = binding.loginUserId),
+    // 不接受 body 指定收件人。绑微信默认开(prefs.wechat_proactive_push !== false)。
+    wechatProactiveRef.current = makeProactiveReceiverHandler({
+      identityRepo,
+      pool: getPool(),
+      resolveRecipient: async (bindingUserId) => {
+        // SQLite wechat_bindings.user_id 是 `c:<digit>`(MASTER_USER_PREFIX),而容器身份
+        // bindingUserId 是裸数字 —— 与 outboxWorker.getBinding(MASTER_USER_PREFIX + …) 同源约定。
+        // 漏前缀会永远查不到(no_binding),且可能误命中 legacy 裸 id 行破坏 trust boundary。
+        const b = await getWechatBindingByUserId(MASTER_USER_PREFIX + bindingUserId);
+        if (!b || b.status !== "active" || !b.loginUserId) return null;
+        return { senderId: b.loginUserId, contextTokens: b.contextTokens };
+      },
+      isProactiveEnabled: async (userId) => {
+        const snap = await getPreferences(BigInt(userId));
+        return snap.prefs.wechat_proactive_push !== false;
+      },
+      getSessionId: getCurrentSessionId,
     });
 
     wechatBroker = makeWechatBroker({

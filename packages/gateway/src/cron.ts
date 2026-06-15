@@ -249,7 +249,7 @@ export class CronScheduler {
   constructor(
     private config: OpenClaudeConfig,
     private sessions: SessionManager,
-    private onDeliver: (text: string, job: CronJob) => void,
+    private onDeliver: (text: string, job: CronJob) => void | Promise<void>,
   ) {}
 
   async start(): Promise<void> {
@@ -396,7 +396,7 @@ export class CronScheduler {
       // local = just log, don't push to any channel
     } else {
       logger.info(`delivering job ${job.id} to ${job.deliver}`, { jobId: job.id, deliver: job.deliver })
-      this.onDeliver(trimmed, job)
+      await this.onDeliver(trimmed, job)
     }
   }
 
