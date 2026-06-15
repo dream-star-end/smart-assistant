@@ -635,6 +635,9 @@ export function makeAnthropicProxyHandler(
           // 2026-05-02:deepseek 路径无 OAuth 池,session.accountId=null。
           // settleUsageAndLedger / runFinalizeAndRelease 已支持 nullable。
           accountId: session.accountId,
+          // B7 per-slot 租约:slotId 随 session 带到 finalize → 权威 release 精确还槽。
+          // OAuth 非 null;DeepSeek/MiniMax null(与 accountId 同生死,finalize 跳过 release)。
+          slotId: session.slotId,
           model: body.model,
           pricing,
           precheckCredits: pre.maxCost,

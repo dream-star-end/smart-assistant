@@ -306,6 +306,7 @@ function buildFakeScheduler(): AccountScheduler {
     async pick(): Promise<PickResult> {
       return {
         account_id: 1001n,
+        slotId: "slot-test",
         plan: "pro",
         token: Buffer.from("FAKE-TOKEN-VALUE"),
         refresh: null,

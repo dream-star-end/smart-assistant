@@ -308,6 +308,7 @@ function buildFakeScheduler(opts: FakeSchedulerOpts = {}): SchedulerSpy {
       }
       return {
         account_id: FIXED_ACCOUNT_ID,
+        slotId: "slot-test",
         plan: "pro",
         token: Buffer.from("FAKE-TOKEN-VALUE"),
         refresh: null,

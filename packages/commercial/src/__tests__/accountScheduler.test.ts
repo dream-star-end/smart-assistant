@@ -8,16 +8,22 @@
 
 import assert from 'node:assert/strict'
 import { describe, test } from 'node:test'
+import type { AccountHealthTracker } from '../account-pool/health.js'
 import {
   AccountPoolBusyError,
   AccountPoolUnavailableError,
+  AccountScheduler,
   DEFAULT_MAX_CONCURRENT_PER_ACCOUNT,
+  DEFAULT_SLOT_LEASE_TTL_MS,
   ERR_ACCOUNT_POOL_BUSY,
   ERR_ACCOUNT_POOL_UNAVAILABLE,
+  SLOT_LEASE_TTL_CEIL_MS,
   computeAccountWeight,
   defaultHash,
   parseMaxConcurrentEnv,
+  parseSlotLeaseTtlEnv,
   pickWRH,
+  sanitizeSlotLeaseTtl,
 } from '../account-pool/scheduler.js'
 import type { CandidateRow } from '../account-pool/scheduler.js'
 
@@ -576,5 +582,167 @@ describe('WRH drift properties', () => {
       ratio >= 1.1 && ratio <= 1.4,
       `subscription 2d→2d-1s drift ratio=${ratio.toFixed(3)}, expected ~1.25 [1.1,1.4]`,
     )
+  })
+})
+
+// ─── B6/B7 per-slot 租约(slot 内存方法不触 DB/health,可纯单元测) ──────────
+
+const stubHealth = {
+  onSuccess: async () => null,
+  onFailure: async () => null,
+} as unknown as AccountHealthTracker
+
+/** 构造仅用于 slot 内存方法测试的 scheduler。 */
+function mkSlotScheduler(
+  opts: {
+    slotIds?: string[]
+    nowRef?: { ms: number }
+    maxConcurrent?: number
+    slotLeaseTtlMs?: number
+    ephemeralKey?: () => string
+  } = {},
+): AccountScheduler {
+  let i = 0
+  const slotIdFn = opts.slotIds ? () => opts.slotIds?.[i++] ?? `auto-${i}` : undefined
+  const now = opts.nowRef ? () => new Date(opts.nowRef?.ms ?? 0) : undefined
+  return new AccountScheduler({
+    health: stubHealth,
+    slotIdFn,
+    now,
+    ephemeralKey: opts.ephemeralKey,
+    maxConcurrent: opts.maxConcurrent,
+    slotLeaseTtlMs: opts.slotLeaseTtlMs,
+  })
+}
+
+describe('per-slot 租约:精确 acquire/release', () => {
+  test('同账号两槽互不干扰:release 其一,另一仍在', () => {
+    const s = mkSlotScheduler({ slotIds: ['s1', 's2'] })
+    const a = s.acquireCodexSlot('100')
+    const b = s.acquireCodexSlot('100')
+    assert.equal(a, 's1')
+    assert.equal(b, 's2')
+    assert.equal(s.getInflight('100'), 2)
+    s.releaseCodexSlot('100', a)
+    assert.equal(s.getInflight('100'), 1) // s2 仍在
+    s.releaseCodexSlot('100', b)
+    assert.equal(s.getInflight('100'), 0) // 归 0,account entry 删除
+  })
+
+  test('双重 release / 未知 slotId / 未知 account 幂等:不变负', () => {
+    const s = mkSlotScheduler({ slotIds: ['s1'] })
+    const a = s.acquireCodexSlot('100')
+    s.releaseCodexSlot('100', a)
+    s.releaseCodexSlot('100', a) // 二次还同 slot
+    s.releaseCodexSlot('100', 'never') // 未知 slot
+    s.releaseCodexSlot('999', 'never') // 未知 account
+    assert.equal(s.getInflight('100'), 0)
+  })
+
+  test('错配 release 不误伤同账号其它活跃槽(精度根因)', () => {
+    const s = mkSlotScheduler({ slotIds: ['s1', 's2'] })
+    s.acquireCodexSlot('100') // s1
+    const b = s.acquireCodexSlot('100') // s2
+    s.releaseCodexSlot('100', 'bogus') // 不属于该账号的 slotId → 不扣任何槽
+    assert.equal(s.getInflight('100'), 2)
+    s.releaseCodexSlot('100', b)
+    assert.equal(s.getInflight('100'), 1)
+  })
+})
+
+describe('per-slot 租约:cap 与 slotId 唯一性', () => {
+  test('cap 到达 acquireCodexSlot 抛 AccountPoolBusyError', () => {
+    const s = mkSlotScheduler({ maxConcurrent: 2 })
+    s.acquireCodexSlot('100')
+    s.acquireCodexSlot('100')
+    assert.throws(() => s.acquireCodexSlot('100'), AccountPoolBusyError)
+    assert.equal(s.getInflight('100'), 2)
+  })
+
+  test('slotId 唯一性独立于 ephemeralKey:ephemeralKey 固定也不互相覆盖', () => {
+    const s = mkSlotScheduler({ ephemeralKey: () => 'FIXED' }) // slotIdFn 默认 randomUUID
+    s.acquireCodexSlot('100')
+    s.acquireCodexSlot('100')
+    assert.equal(s.getInflight('100'), 2)
+  })
+
+  test('slotIdFn 退化为非唯一时 acquireSlot 防御性抛错(不 under-count)', () => {
+    const s = new AccountScheduler({ health: stubHealth, slotIdFn: () => 'DUP' })
+    s.acquireCodexSlot('100') // 第一个 'DUP' ok
+    assert.throws(() => s.acquireCodexSlot('100'), /colliding ids/)
+  })
+})
+
+describe('reapExpiredSlots(B7)', () => {
+  test('回收超 TTL 的槽,保留新槽', () => {
+    const nowRef = { ms: 0 }
+    const s = mkSlotScheduler({ slotIds: ['old', 'fresh'], nowRef })
+    const ttl = s.slotLeaseTtlMs
+    s.acquireCodexSlot('100') // acquiredAt=0
+    nowRef.ms = ttl - 100
+    s.acquireCodexSlot('100') // fresh, acquiredAt=ttl-100
+    assert.equal(s.getInflight('100'), 2)
+    // 在 ttl+1 时刻 reap:old 龄=ttl+1>ttl 回收;fresh 龄=101<ttl 保留
+    const reaped = s.reapExpiredSlots(ttl + 1)
+    assert.equal(reaped, 1)
+    assert.equal(s.getInflight('100'), 1)
+  })
+
+  test('全部未过期:reap 不回收,返回 0', () => {
+    const nowRef = { ms: 1000 }
+    const s = mkSlotScheduler({ nowRef })
+    s.acquireCodexSlot('100')
+    assert.equal(s.reapExpiredSlots(1000 + 5), 0)
+    assert.equal(s.getInflight('100'), 1)
+  })
+
+  test('nowMs 默认用注入 now()', () => {
+    const nowRef = { ms: 0 }
+    const s = mkSlotScheduler({ nowRef })
+    s.acquireCodexSlot('100') // acquiredAt=0
+    nowRef.ms = s.slotLeaseTtlMs + 10 // now() 推进过 TTL
+    assert.equal(s.reapExpiredSlots(), 1) // 默认 nowMs=now()
+    assert.equal(s.getInflight('100'), 0)
+  })
+})
+
+describe('sanitizeSlotLeaseTtl / parseSlotLeaseTtlEnv', () => {
+  const codex600 = 600_000
+  test('默认 30min(codex floor 600s < 30min)', () => {
+    assert.equal(sanitizeSlotLeaseTtl(undefined, codex600), DEFAULT_SLOT_LEASE_TTL_MS)
+  })
+  test('低于 floor → 抬到 floor(30min)', () => {
+    assert.equal(sanitizeSlotLeaseTtl(1000, codex600), DEFAULT_SLOT_LEASE_TTL_MS)
+  })
+  test('floor=max(codex,30min):codex>30min 时下界=codex', () => {
+    const codex40 = 40 * 60_000
+    assert.equal(sanitizeSlotLeaseTtl(1000, codex40), codex40)
+  })
+  test('高于 ceil(24h)→ 夹到 ceil', () => {
+    assert.equal(
+      sanitizeSlotLeaseTtl(SLOT_LEASE_TTL_CEIL_MS + 1_000_000, codex600),
+      SLOT_LEASE_TTL_CEIL_MS,
+    )
+  })
+  test('codex floor>24h → ceil 抬到 floor,ttl≥floor≥codex 恒成立(Blocking 4)', () => {
+    const codex25h = 25 * 60 * 60_000
+    assert.equal(sanitizeSlotLeaseTtl(1000, codex25h), codex25h) // 抬到 floor=25h
+    assert.equal(sanitizeSlotLeaseTtl(SLOT_LEASE_TTL_CEIL_MS, codex25h), codex25h) // 24h<floor → 25h
+  })
+  test('非法/非 SafeInteger → 默认 30min', () => {
+    assert.equal(sanitizeSlotLeaseTtl(-5, codex600), DEFAULT_SLOT_LEASE_TTL_MS)
+    assert.equal(
+      sanitizeSlotLeaseTtl(Number.MAX_SAFE_INTEGER + 10, codex600),
+      DEFAULT_SLOT_LEASE_TTL_MS,
+    )
+  })
+  test('parseSlotLeaseTtlEnv:正整数采用,非法 undefined', () => {
+    assert.equal(parseSlotLeaseTtlEnv('1800000'), 1_800_000)
+    assert.equal(parseSlotLeaseTtlEnv('0'), undefined)
+    assert.equal(parseSlotLeaseTtlEnv('-1'), undefined)
+    assert.equal(parseSlotLeaseTtlEnv('1.5'), undefined)
+    assert.equal(parseSlotLeaseTtlEnv('abc'), undefined)
+    assert.equal(parseSlotLeaseTtlEnv(undefined), undefined)
+    assert.equal(parseSlotLeaseTtlEnv(''), undefined)
   })
 })

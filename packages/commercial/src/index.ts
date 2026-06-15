@@ -105,6 +105,10 @@ import {
   type SweeperHandle as PendingOrdersExpirerHandle,
 } from "./payment/pendingOrdersExpirer.js";
 import {
+  startAccountSlotReaper,
+  type SlotReaperHandle,
+} from "./account-pool/accountSlotReaper.js";
+import {
   startFinalizeJournalReconciler,
   resolveStuckThresholdMs,
   DEFAULT_RECONCILE_INTERVAL_MS,
@@ -2499,7 +2503,7 @@ export async function registerCommercial(
   //   - acquireCodexSlot 在 tx **外**调,避免 commit 失败造成的 in-process slot 永久泄漏:
   //     已经持有 slot 但 UPDATE 回滚 → 调用方拿到错误 → bridge.acquiredCodexAccountId
   //     未被赋值 → cleanup() 与 G6 timer 都不知道哪个 account 该 release → 永久泄漏。
-  //   - release(account_id):dec inflight,幂等。
+  //   - release(account_id, slotId):按 slotId 精确还槽,幂等。
   //   - v3Deps 未注入(测试 / 早期 boot 路径)→ codexBinding=undefined,bridge 退化为不做并发管控
   // 闭包外 capture v3Deps 给 stale recycle fire-and-forget 路径用(必须非空)。
   const v3DepsForCodex = v3Deps;
@@ -2712,11 +2716,11 @@ export async function registerCommercial(
           }
           // tx 已 commit;现在尝试占 in-process per-account slot。Busy → 抛 AccountPoolBusyError
           // (bridge 转 CODEX_POOL_BUSY)。lazy migrate 已落盘不会回滚,Busy 只影响本 turn。
-          scheduler.acquireCodexSlot(result.account_id);
-          return { account_id: result.account_id };
+          const slotId = scheduler.acquireCodexSlot(result.account_id);
+          return { account_id: result.account_id, slotId };
         },
-        release(account_id: bigint): void {
-          try { scheduler.releaseCodexSlot(account_id); } catch { /* */ }
+        release(account_id: bigint, slotId: string): void {
+          try { scheduler.releaseCodexSlot(account_id, slotId); } catch { /* */ }
         },
       }
     : undefined;
@@ -2860,6 +2864,16 @@ export async function registerCommercial(
     pendingOrdersExpirer = startPendingOrdersExpirer({ intervalMs });
   }
 
+  // B7 — account-pool per-slot 租约泄漏回收 sweeper(60s tick)。回收进程存活期间
+  // release 路径丢失/未执行的孤儿 slot,防虚假 429。TTL 在 scheduler 内夹到
+  // max(CODEX_SESSION_MAX_MS,30min) 下界,不抢 Codex bridge timer。纯进程内、无 DB。
+  let accountSlotReaper: SlotReaperHandle | undefined;
+  if (process.env.COMMERCIAL_ACCOUNT_SLOT_REAPER_DISABLED !== "1") {
+    const raw = Number(process.env.COMMERCIAL_ACCOUNT_SLOT_REAPER_INTERVAL_MS);
+    const intervalMs = Number.isFinite(raw) && raw >= 1000 ? raw : 60_000;
+    accountSlotReaper = startAccountSlotReaper({ scheduler, intervalMs });
+  }
+
   // B1 — request_finalize_journal reconciler + GC(migration 0015 承诺、之前漏接)。
   // 把崩溃后卡 inflight/finalizing 的 journal 行终态化(有结算记录→committed,无→aborted),
   // 并 GC 老终态行。stuck 阈值对 env 向上夹到 max(CODEX_SESSION_MAX_MS*3, 30min),
@@ -2962,6 +2976,9 @@ export async function registerCommercial(
       }
       if (pendingOrdersExpirer) {
         try { pendingOrdersExpirer.stop(); } catch { /* ignore */ }
+      }
+      if (accountSlotReaper) {
+        try { accountSlotReaper.stop(); } catch { /* ignore */ }
       }
       if (finalizeJournalReconciler) {
         try { finalizeJournalReconciler.stop(); } catch { /* ignore */ }

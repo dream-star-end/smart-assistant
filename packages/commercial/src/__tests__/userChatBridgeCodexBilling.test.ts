@@ -221,9 +221,9 @@ async function startRig(opts: {
         throw new ContainerStaleBindingError(_containerId);
       }
       if (acquireResult === "legacy") return null;
-      return { account_id: 7n };
+      return { account_id: 7n, slotId: "slot-codex-test" };
     },
-    release(_aid: bigint) { bindingState.releaseCalls += 1; },
+    release(_aid: bigint, _slotId: string) { bindingState.releaseCalls += 1; },
   };
 
   // ResolveContainerEndpoint 必须返回 containerId 才能让 codex 路径走 IIFE

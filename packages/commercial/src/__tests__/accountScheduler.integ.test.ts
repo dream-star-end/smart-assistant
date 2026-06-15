@@ -308,7 +308,7 @@ describe('release', () => {
     const a = await createAccount({ label: 'r1', plan: 'pro', token: 'T', egress_proxy_id: TEST_EGRESS_PROXY_ID }, keyFn)
     const { tracker, redis } = mkTracker()
     const s = mkScheduler(tracker)
-    await s.release({ account_id: a.id, result: { kind: 'success' } })
+    await s.release({ account_id: a.id, slotId: 'slot-x', result: { kind: 'success' } })
     const row = await getAccount(a.id)
     assert.equal(row!.success_count, 1n)
     assert.equal(row!.last_error, null)
@@ -322,6 +322,7 @@ describe('release', () => {
     const s = mkScheduler(tracker)
     await s.release({
       account_id: a.id,
+      slotId: 'slot-x',
       result: { kind: 'failure', error: 'rate-limited 429' },
     })
     const row = await getAccount(a.id)
@@ -337,7 +338,7 @@ describe('release', () => {
     await updateAccount(a.id, { last_error: 'previous' }, keyFn)
     const { tracker } = mkTracker()
     const s = mkScheduler(tracker)
-    await s.release({ account_id: a.id, result: { kind: 'failure' } })
+    await s.release({ account_id: a.id, slotId: 'slot-x', result: { kind: 'failure' } })
     const row = await getAccount(a.id)
     assert.equal(row!.last_error, 'previous')
   })
@@ -356,6 +357,7 @@ describe('release', () => {
     p.token.fill(0)
     await s.release({
       account_id: a.id,
+      slotId: p.slotId,
       result: { kind: 'client_error', error: 'invalid_request_error: thinking signature' },
     })
     const row = await getAccount(a.id)
@@ -469,7 +471,7 @@ describe('per-account 并发上限', () => {
     const p1 = await s.pick({ mode: 'chat' })
     assert.equal(s.getInflight(a.id), 1)
     await assert.rejects(s.pick({ mode: 'chat' }), AccountPoolBusyError)
-    await s.release({ account_id: a.id, result: { kind: 'success' } })
+    await s.release({ account_id: a.id, slotId: p1.slotId, result: { kind: 'success' } })
     assert.equal(s.getInflight(a.id), 0)
     const p2 = await s.pick({ mode: 'chat' })
     assert.equal(p2.account_id, a.id)
@@ -485,6 +487,7 @@ describe('per-account 并发上限', () => {
     const p1 = await s.pick({ mode: 'chat' })
     await s.release({
       account_id: a.id,
+      slotId: p1.slotId,
       result: { kind: 'failure', error: 'e' },
     })
     assert.equal(s.getInflight(a.id), 0)
@@ -496,9 +499,9 @@ describe('per-account 并发上限', () => {
     const a = await createAccount({ label: 'idem', plan: 'pro', token: 'T', egress_proxy_id: TEST_EGRESS_PROXY_ID }, keyFn)
     const { tracker } = mkTracker()
     const s = mkScheduler(tracker)
-    // 没 pick 过就 release(例如 finalize 被调两次)
-    await s.release({ account_id: a.id, result: { kind: 'success' } })
-    await s.release({ account_id: a.id, result: { kind: 'success' } })
+    // 没 pick 过就 release(例如 finalize 被调两次)— 未知 slotId 还槽是幂等 no-op
+    await s.release({ account_id: a.id, slotId: 'slot-x', result: { kind: 'success' } })
+    await s.release({ account_id: a.id, slotId: 'slot-x', result: { kind: 'success' } })
     assert.equal(s.getInflight(a.id), 0)
   })
 
@@ -508,8 +511,8 @@ describe('per-account 并发上限', () => {
     const { tracker } = mkTracker()
     const s = mkScheduler(tracker)
     const p = await s.pick({ mode: 'chat' })
-    await s.release({ account_id: a.id, result: { kind: 'success' } })
-    // Map 不暴露,但 getInflight 为 0 说明 key 已删(dec 的归 0 分支)
+    await s.release({ account_id: a.id, slotId: p.slotId, result: { kind: 'success' } })
+    // Map 不暴露,但 getInflight 为 0 说明 key 已删(归 0 分支)
     assert.equal(s.getInflight(a.id), 0)
     p.token.fill(0)
   })
