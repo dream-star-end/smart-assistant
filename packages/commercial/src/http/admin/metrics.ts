@@ -6,7 +6,7 @@
  */
 
 import type { IncomingMessage, ServerResponse } from "node:http";
-import { requireAdmin } from "../../admin/requireAdmin.js";
+import { requireAdminVerifyDb } from "../../admin/requireAdmin.js";
 import { renderPrometheus } from "../../admin/metrics.js";
 import type { CommercialHttpDeps, RequestContext } from "../handlers.js";
 
@@ -49,8 +49,10 @@ export async function handleAdminMetrics(
     }
   }
   if (!authorized) {
-    // 回落 admin JWT:失败会抛 HttpError(401/403),由 router 统一翻译
-    await requireAdmin(req, deps.jwtSecret);
+    // 回落 admin JWT:失败会抛 HttpError(401/403),由 router 统一翻译。
+    // B5:用 verify-db(JWT + DB role/status 复核),降权/封停的 admin 即使 JWT 未过期
+    // 也读不到 metrics(此路由在 router 层走 self-auth 白名单,DB 复核只能在这里做)。
+    await requireAdminVerifyDb(req, deps.jwtSecret);
   }
   const body = await renderPrometheus();
   res.statusCode = 200;
