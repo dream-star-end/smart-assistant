@@ -67,6 +67,29 @@
   --accent-danger: var(--danger, #e06c6c);
   --radius: var(--radius-md, 10px);
   --mono: var(--font-mono, ui-monospace, monospace);
+
+  /* U6 — 全局 z-index 层级标度。此前 41 处 z-index 散落硬编码(出现过 9999/10000
+     这类"层级战争"魔数),新增 overlay 无从得知该用什么值。这里把跨组件的全局层级
+     集中成命名 token —— **值保持现状,不改任何层级关系**(仅集中+命名+文档化,
+     维护性提升)。纯组件内局部 stacking(-1/0/1/2/5/10)不属全局层级,保持裸值。 */
+  --z-menu: 20;             /* 行内菜单:msg-save / effort */
+  --z-sticky: 50;          /* 吸顶:landing-nav / boot-restore */
+  --z-head: 80;            /* 主头部 */
+  --z-head-dropdown: 90;   /* 头部 settings-dropdown-wrap */
+  --z-sidebar-backdrop: 99;
+  --z-sidebar: 100;        /* 侧栏 / slash-popup */
+  --z-panel: 200;          /* tasks-panel / settings-dropdown(基) / modal-backdrop */
+  --z-banner: 240;         /* sync-banner */
+  --z-plan-backdrop: 260;
+  --z-plan-panel: 270;
+  --z-palette: 300;        /* 命令面板 backdrop */
+  --z-toast: 400;
+  --z-tasks-mobile: 950;   /* tasks-panel(窄屏覆盖) */
+  --z-dropdown: 1000;      /* settings-dropdown(刷新版/窄屏) */
+  --z-dropdown-raised: 1001;
+  --z-voice: 1200;         /* 语音全屏 overlay */
+  --z-lightbox: 9999;
+  --z-top: 10000;          /* 最顶层:ctx-menu / permission-modal */
 }
 @supports (height: 100dvh) {
   :root {
@@ -1267,7 +1290,7 @@ a:hover {
     top: 0;
     bottom: 0;
     width: min(88vw, 320px);
-    z-index: 100;
+    z-index: var(--z-sidebar);
     transform: translateX(-100%);
     transition: transform var(--transition-slow);
     padding-top: env(safe-area-inset-top, 0);
@@ -1283,7 +1306,7 @@ a:hover {
     position: fixed;
     inset: 0;
     background: rgba(0, 0, 0, 0.5);
-    z-index: 99;
+    z-index: var(--z-sidebar-backdrop);
     backdrop-filter: blur(6px);
     -webkit-backdrop-filter: blur(6px);
   }
@@ -1894,7 +1917,7 @@ a:hover {
   border-radius: var(--radius-md);
   box-shadow: var(--shadow-lg, 0 8px 24px rgba(0,0,0,.25));
   padding: 4px;
-  z-index: 20;
+  z-index: var(--z-menu);
   min-width: 170px;
   display: flex;
   flex-direction: column;
@@ -3086,7 +3109,7 @@ a:hover {
   box-shadow: 0 -4px 24px rgba(0, 0, 0, 0.12);
   max-height: 340px;
   overflow-y: auto;
-  z-index: 100;
+  z-index: var(--z-sidebar);
   margin-bottom: 6px;
   padding: 6px 0;
   backdrop-filter: blur(12px);
@@ -3159,7 +3182,7 @@ a:hover {
 /* ── Context menu ── */
 .ctx-menu {
   position: fixed;
-  z-index: 10000;
+  z-index: var(--z-top);
   background: var(--bg);
   border: 1px solid var(--border);
   border-radius: var(--radius-lg);
@@ -3257,7 +3280,7 @@ a:hover {
   max-height: 400px;
   overflow-y: auto;
   padding: 8px 0;
-  z-index: 200;
+  z-index: var(--z-panel);
 }
 .tasks-panel[hidden] {
   display: none;
@@ -3330,7 +3353,7 @@ a:hover {
   box-shadow: 0 8px 32px rgba(0, 0, 0, 0.18);
   min-width: 200px;
   padding: 6px 0;
-  z-index: 200;
+  z-index: var(--z-panel);
   animation: fade-in 0.12s;
 }
 .settings-dropdown[hidden] {
@@ -3383,7 +3406,7 @@ a:hover {
 .lightbox-backdrop {
   position: fixed;
   inset: 0;
-  z-index: 9999;
+  z-index: var(--z-lightbox);
   background: rgba(0, 0, 0, 0.88);
   backdrop-filter: blur(8px);
   display: flex;
@@ -3830,7 +3853,7 @@ a:hover {
   border: 1px solid var(--border);
   border-radius: var(--radius-md, 10px);
   box-shadow: 0 10px 30px rgba(0, 0, 0, 0.18);
-  z-index: 20;
+  z-index: var(--z-menu);
 }
 .effort-menu[hidden] {
   display: none;
@@ -4016,7 +4039,7 @@ body.voice-overlay-open {
 .voice-overlay {
   position: fixed;
   inset: 0;
-  z-index: 1200;
+  z-index: var(--z-voice);
   pointer-events: auto;
 }
 .voice-overlay[hidden] {
@@ -4279,7 +4302,7 @@ body.voice-overlay-open {
   background:
     radial-gradient(circle at 50% 18%, color-mix(in srgb, var(--accent) 16%, transparent) 0, transparent 34%),
     rgba(0, 0, 0, 0.54);
-  z-index: 200;
+  z-index: var(--z-panel);
   backdrop-filter: blur(16px) saturate(120%);
   -webkit-backdrop-filter: blur(16px) saturate(120%);
   align-items: flex-start;
@@ -5182,7 +5205,7 @@ body.voice-overlay-open {
   position: fixed;
   inset: 0;
   background: rgba(0, 0, 0, 0.55);
-  z-index: 300;
+  z-index: var(--z-palette);
   backdrop-filter: blur(10px);
   -webkit-backdrop-filter: blur(10px);
   align-items: flex-start;
@@ -5324,7 +5347,7 @@ body.voice-overlay-open {
   border-radius: var(--radius-full);
   border: 1px solid var(--border);
   box-shadow: var(--shadow-lg);
-  z-index: 400;
+  z-index: var(--z-toast);
   font-size: var(--text-sm);
   font-weight: 500;
   opacity: 0;
@@ -5531,7 +5554,7 @@ body.voice-overlay-open {
 .permission-modal-overlay {
   position: fixed;
   inset: 0;
-  z-index: 10000;
+  z-index: var(--z-top);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -6573,7 +6596,7 @@ body.body-landing {
 .landing-nav {
   position: sticky;
   top: 0;
-  z-index: 50;
+  z-index: var(--z-sticky);
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -7491,7 +7514,7 @@ body.body-landing {
   width: min(440px, calc(100vw - 32px));
   min-height: 58px;
   transform: translate(-50%, -18px);
-  z-index: 240;
+  z-index: var(--z-banner);
   display: flex;
   align-items: center;
   gap: var(--space-3);
@@ -7634,7 +7657,7 @@ body.body-landing {
 .boot-restore {
   position: fixed;
   inset: 0;
-  z-index: 50;
+  z-index: var(--z-sticky);
   display: grid;
   place-items: center;
   background: var(--bg);
@@ -8945,7 +8968,7 @@ body.body-landing {
   opacity: 0;
   pointer-events: none;
   transition: opacity var(--transition-fast);
-  z-index: 260;
+  z-index: var(--z-plan-backdrop);
 }
 .plan-panel-backdrop.open {
   opacity: 1;
@@ -8964,7 +8987,7 @@ body.body-landing {
   box-shadow: -18px 0 40px rgba(0, 0, 0, 0.18);
   transform: translateX(100%);
   transition: transform var(--transition-fast);
-  z-index: 270;
+  z-index: var(--z-plan-panel);
 }
 .plan-panel.open {
   transform: translateX(0);
@@ -10467,13 +10490,13 @@ textarea:focus-visible,
  *  mobile dropdown a bounded fixed sheet.
  * ══════════════════════════════════════════════════════════════════ */
 .main-head {
-  z-index: 80;
+  z-index: var(--z-head);
 }
 .settings-dropdown-wrap {
-  z-index: 90;
+  z-index: var(--z-head-dropdown);
 }
 .settings-dropdown {
-  z-index: 1000;
+  z-index: var(--z-dropdown);
   pointer-events: auto;
 }
 
@@ -10528,10 +10551,10 @@ textarea:focus-visible,
     justify-content: flex-end;
   }
   .settings-dropdown-wrap {
-    z-index: 1000;
+    z-index: var(--z-dropdown);
   }
   .settings-dropdown {
-    z-index: 1001;
+    z-index: var(--z-dropdown-raised);
   }
   .head-actions .icon-btn,
   .settings-dropdown-wrap > .icon-btn {
@@ -10580,7 +10603,7 @@ textarea:focus-visible,
     overflow-y: auto;
     overscroll-behavior: contain;
     -webkit-overflow-scrolling: touch;
-    z-index: 950;
+    z-index: var(--z-tasks-mobile);
     border-radius: 22px;
     padding: 6px;
   }

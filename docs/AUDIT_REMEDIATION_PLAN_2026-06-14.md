@@ -41,7 +41,7 @@
 | A3 | compute-host 吊销 kill-switch（+B8 NULL fingerprint fail-closed） | 安全/架构 | P0 | 3 | W2 | 无 | ✅ PASS（Codex 2 轮） |
 | B5 | 只读 admin 路由升 `requireAdminVerifyDb` | 安全 | P2 | 10 | W2 | 无 | ✅ 由 B2 router gate 收编(所有 admin 走 verify-db) |
 | U2 | CSS 双 token 词汇统一 + 品牌色 fallback | UI | P1 | 7 | **W3** | 须严防视觉回归 | ✅ PASS（Codex 2 轮） |
-| U6 | `--z-*` 分层 token + 聊天流骨架屏一致性 | UI | P3 | 13 | W3 | ↑/中性 | ⬜ |
+| U6 | `--z-*` 分层 token + 聊天流骨架屏一致性 | UI | P3 | 13 | W3 | ↑/中性 | 🟡 z-index ✅(Codex PASS);骨架屏 defer |
 | **A1** | turn 生命周期单一权威源 + server `turnId` | 架构 | P0 | 1 | **W4** | 须严防流式 UI 回归 | ⬜ design-doc 先行 |
 | R1 | 多标签页协调（leader/广播 turn_settled） | 实时 | P1 | 7 | W4 | ↑（消幽灵态） | ⬜ 随 A1 |
 | R2 | IndexedDB 迁移框架 | 实时 | P1 | 8 | W4 | 中性 | ⬜ 随 A1 |
@@ -190,4 +190,6 @@
   - 净效果:dark 主题 sub-perceptual 微调(近黑/浅灰几无变化);light 主题 + mermaid label = 真 bug 修复(模态/文字恢复主题感知与可读对比)。审计脚本确认**主应用未定义别名 = 空**(整类消除)。admin.html 自带独立 token 体系,不在此统一。
   - defer(后续 stylelint + 硬编码 hex 清扫):1×standalone `#7c3aed`(voice 字面量)、53×死 `var(--tok,#hex)` fallback(token 均已定义,5×已是品牌色)。
   - 验证:brace 1960/1960;`git diff --check` 干净;web 测试 styleThemeConsistency 4/4、mermaidRenderingConfig 3/3、githubModalStyles 2/2;node --check apiKeys.js OK。
-- 下一步:U6(z-index token + 骨架屏)→ 批量部署本波次(W2 的 A2/U1/U3/U4/U5/B1/B2/B3/B5/A3 + W3 的 U2/U6;B4 经 Go node-agent rollout)→ 再 W4(A1+R1/R2/R3、A5、A4 — design-doc 先行)、W5(B6/B7/B9)。
+- 2026-06-15:**U6 z-index token 化完成,Codex PASS**。style.css 41 处散落 z-index 魔数(含 9999/10000"层级战争")→ base :root 新增全局 `--z-*` 标度(18 token),把 25 处跨组件全局层级 decl 换成 token。**严格保值**:每 token 值=原 raw 值,层级关系 byte 级不变(纯命名+集中+文档化);局部 stacking(-1/0/1/2/5/10)保留裸值。验证:无残留裸 ≥20;token 引用 25=原 decl 数;brace 1960/1960;web 测试 4/4+3/3+2/2 全绿。
+  - **骨架屏一致性 defer**:主应用无 `.skeleton-*`(仅 admin.html 自带),聊天流/会话列表加骨架屏属**新增 UX 功能**(需 DOM 接线 + 视觉设计 + 浏览器验证),非纯维护性重构,留作独立 UX 项(同 U2/U6 的 stylelint 禁裸 hex/裸 z-index 一并做)。
+- 下一步:批量部署本波次(W2 的 A2/U1/U3/U4/U5/B1/B2/B3/B5/A3 + W3 的 U2/U6-z;B4 经 Go node-agent rollout)→ 再 W4(A1+R1/R2/R3、A5、A4 — design-doc 先行)、W5(B6/B7/B9)。
