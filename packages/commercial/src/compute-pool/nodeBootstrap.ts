@@ -144,6 +144,16 @@ export async function bootstrapHost(params: BootstrapParams): Promise<BootstrapR
   if (row.name === "self") {
     return { kind: "fail", step: "ssh_connect", message: "cannot SSH-bootstrap self host" };
   }
+  // A3 — revoked 是终态:不允许再 bootstrap(避免"复活"被吊销/入侵的主机)。
+  // bootstrapHost 是 SSH+install 的唯一入口,verify/baseline/egress 子步骤都在其内,
+  // 这里一处拦截即覆盖整条 bootstrap 链路。复用机器请新建 host 行。
+  if (row.status === "revoked") {
+    return {
+      kind: "fail",
+      step: "ssh_connect",
+      message: `host ${params.hostId} revoked (terminal; create a new host row to reuse the machine)`,
+    };
+  }
 
   let password: Buffer;
   try {

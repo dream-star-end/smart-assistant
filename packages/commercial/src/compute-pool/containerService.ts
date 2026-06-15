@@ -38,6 +38,7 @@ import {
   inspectContainer as agentInspectContainer,
   inspectImage as agentInspectImage,
   hostRowToTarget,
+  assertHostServiceable,
   AgentAppError,
   type NodeAgentTarget,
 } from "./nodeAgentClient.js";
@@ -389,7 +390,11 @@ export class RemoteNodeAgentBackend {
     fn: (target: NodeAgentTarget) => Promise<T>,
   ): Promise<T> {
     const row = await this.getRow(hostId);
+    // A3 — 远端 lifecycle RPC 的共享 choke point:终态 revoked / 缺 fingerprint 的 host
+    // 一律拒绝(self/local 豁免)。getRow 每次重查,不吃上层 60s 行缓存。
+    assertHostServiceable(row);
     const target = hostRowToTarget(row);
+    target.requireFingerprint = true;
     try {
       return await fn(target);
     } finally {

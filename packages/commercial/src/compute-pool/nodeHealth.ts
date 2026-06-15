@@ -95,6 +95,9 @@ export class HealthPoller {
   private async pollHost(hostId: string): Promise<void> {
     const row = await queries.getHostById(hostId);
     if (!row) return;
+    // A3 — revoke 与 poll 之间的 race:re-read 后、建 target 前再判一次,
+    // revoked host 不再发出任何 RPC(也不续签)。
+    if (row.status === "revoked") return;
     const target = hostRowToTarget(row);
     const operationId = randomUUID();
     const actor = "system:healthPoller";
@@ -153,6 +156,8 @@ export class HealthPoller {
   /** cert notAfter 距今 < 30d → 触发续期 RPC。 */
   private async maybeRenewCert(row: Awaited<ReturnType<typeof queries.getHostById>>): Promise<void> {
     if (!row || !row.agent_cert_not_after) return;
+    // A3 — 绝不给 revoked host 续签(否则续签会 defeat 吊销;revoked 也 ∉ 轮询目标)。
+    if (row.status === "revoked") return;
     const notAfter = row.agent_cert_not_after;
     const daysLeft = (notAfter.getTime() - Date.now()) / 86_400_000;
     if (daysLeft > RENEW_WINDOW_DAYS) return;

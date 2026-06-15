@@ -550,7 +550,15 @@ async function dispatchViaTunnel(
     hooks.release();
     return;
   }
+  // A3 — 终态 revoked host 不再走 container file tunnel(deny)。
+  if (row.status === "revoked") {
+    ctx.log.warn("container_file_proxy_host_revoked", { uid: uidStr, hostId: status.hostId });
+    sendJsonError(res, 502, "BAD_GATEWAY", "host revoked", ctx.requestId);
+    hooks.release();
+    return;
+  }
   const target = (deps.rowToTarget ?? hostRowToTarget)(row);
+  target.requireFingerprint = true;
 
   const host = req.headers.host ?? "x.invalid";
   const reqUrl = new URL(req.url ?? "/", `http://${host}`);

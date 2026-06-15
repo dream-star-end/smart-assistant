@@ -253,6 +253,7 @@ import { RemoteHostError } from "./remoteHosts/service.js";
 import * as computeQueries from "./compute-pool/queries.js";
 import {
   hostRowToTarget,
+  resolveServiceableHostTarget,
   startSshControlMaster,
   stopSshControlMaster,
   putFile as nodeAgentPutFile,
@@ -551,6 +552,13 @@ async function handleExternalMtls(
   const row = await computeQueries.getHostById(hostUuid);
   if (!row) {
     sendMtlsError(res, 403, "HOST_NOT_FOUND");
+    return;
+  }
+  // A3 — 终态 revoked host(被入侵/下线)不得再用 file-proxy。setRevoked 已把
+  // agent_cert_fingerprint_sha256 置 NULL,下面 expectedFp 检查本就会 fail-closed;
+  // 这里显式拒一遍,给出明确 reason code + 不依赖"fp 一定被清"的隐式不变量。
+  if (row.status === "revoked") {
+    sendMtlsError(res, 403, "HOST_REVOKED");
     return;
   }
   const expectedFp = row.agent_cert_fingerprint_sha256;
@@ -1117,13 +1125,8 @@ export async function registerCommercial(
           // dispatchInternal block; we don't want to depend on declaration
           // order. The handler only invokes this when row.host_uuid !== self.
           async writeRemote(hostUuid, containerId, accessToken, lastRefreshIso) {
-            const row = await computeQueries.getHostById(hostUuid);
-            if (!row) {
-              throw new Error(
-                `internalCodexTokenRefresh.writeRemote: compute_host ${hostUuid} not found`,
-              );
-            }
-            const target = hostRowToTarget(row);
+            // A3 — service file-IO:revoked / 缺 fingerprint 的 host 直接拒(不写 codex auth 到终态 host)。
+            const target = await resolveServiceableHostTarget(hostUuid);
             try {
               await putRemoteCodexContainerAuth(
                 target,
@@ -1509,13 +1512,8 @@ export async function registerCommercial(
               accessToken: string,
               lastRefreshIso: string,
             ) => {
-              const row = await computeQueries.getHostById(hostUuid);
-              if (!row) {
-                throw new Error(
-                  `putRemoteCodexAuth: compute_host ${hostUuid} not found`,
-                );
-              }
-              const target = hostRowToTarget(row);
+              // A3 — service file-IO:revoked / 缺 fingerprint 的 host 直接拒。
+              const target = await resolveServiceableHostTarget(hostUuid);
               try {
                 await putRemoteCodexContainerAuth(
                   target,
@@ -1531,13 +1529,9 @@ export async function registerCommercial(
               hostUuid: string,
               containerId: string,
             ) => {
-              const row = await computeQueries.getHostById(hostUuid);
-              if (!row) {
-                throw new Error(
-                  `deleteRemoteCodexAuth: compute_host ${hostUuid} not found`,
-                );
-              }
-              const target = hostRowToTarget(row);
+              // A3 — service file-IO:revoked / 缺 fingerprint 的 host 直接拒
+              // (与 put/pull 对称;清 codex auth 也是 node-agent file 接触)。
+              const target = await resolveServiceableHostTarget(hostUuid);
               try {
                 await deleteRemoteCodexContainerAuth(target, containerId);
               } finally {
@@ -1756,7 +1750,17 @@ export async function registerCommercial(
         resolvedName: hostRow.name,
       });
       if (hostRow.name === "self") return { kind: "self" };
-      return { kind: "remote", target: hostRowToTarget(hostRow) };
+      // A3 — 终态 revoked host 不再做 SSH 远端文件操作(deny)。setRevoked 已清
+      // fingerprint;requireFingerprint=true 让缺 pin 的 host 也在 TLS 层 fail-closed。
+      if (hostRow.status === "revoked") {
+        throw new RemoteHostError(
+          "INTERNAL",
+          `compute_host ${sticky.hostUuid} revoked (userId=${userId} hostId=${hostId})`,
+        );
+      }
+      const target = hostRowToTarget(hostRow);
+      target.requireFingerprint = true;
+      return { kind: "remote", target };
     },
     startSshControlMaster,
     stopSshControlMaster,
@@ -1827,13 +1831,8 @@ export async function registerCommercial(
     remotePath: string;
     content: Buffer;
   }) => {
-    const row = await computeQueries.getHostById(args.hostUuid);
-    if (!row) {
-      throw new Error(
-        `pushRemoteHostUpload: compute_host ${args.hostUuid} not found`,
-      );
-    }
-    const target = hostRowToTarget(row);
+    // A3 — service file-IO:revoked / 缺 fingerprint 的 host 直接拒。
+    const target = await resolveServiceableHostTarget(args.hostUuid);
     try {
       await nodeAgentPutFile(
         target,
@@ -2345,13 +2344,8 @@ export async function registerCommercial(
         ? makeWechatOutboundMediaResolver({
             resolveUserMediaDirs: userMediaResolver,
             pullRemoteHostMedia: async (args) => {
-              const row = await computeQueries.getHostById(args.hostUuid);
-              if (!row) {
-                throw new Error(
-                  `pullRemoteHostMedia: compute_host ${args.hostUuid} not found`,
-                );
-              }
-              const target = hostRowToTarget(row);
+              // A3 — service file-IO:revoked / 缺 fingerprint 的 host 直接拒。
+              const target = await resolveServiceableHostTarget(args.hostUuid);
               try {
                 return await nodeAgentGetFile(target, args.remotePath);
               } finally {
@@ -3070,13 +3064,8 @@ export async function registerCommercial(
       hostUuid: string;
       remotePath: string;
     }) => {
-      const row = await computeQueries.getHostById(args.hostUuid);
-      if (!row) {
-        throw new Error(
-          `pullRemoteHostMedia: compute_host ${args.hostUuid} not found`,
-        );
-      }
-      const target = hostRowToTarget(row);
+      // A3 — service file-IO:revoked / 缺 fingerprint 的 host 直接拒。
+      const target = await resolveServiceableHostTarget(args.hostUuid);
       try {
         return await nodeAgentGetFile(target, args.remotePath);
       } finally {

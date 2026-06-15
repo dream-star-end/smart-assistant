@@ -444,6 +444,27 @@ export async function drainComputeHost(id: string, ctx: AdminAuditCtx): Promise<
   await bestEffortAudit(ctx, "compute_host.drain", `compute_host:${id}`, { status: row.status }, { status: "draining" });
 }
 
+/**
+ * A3 — 吊销 host(终态 kill-switch)。标 'revoked' + 清 pinned fingerprint,立即切断
+ * 控制面/RPC/tunnel/file(不等证书过期)。可从任意状态吊销;self 拒。与 drain(可恢复)
+ * 不同 —— revoke 是终态,un-revoke 需 re-bootstrap。
+ */
+export async function revokeComputeHost(id: string, ctx: AdminAuditCtx): Promise<void> {
+  const row = await queries.getHostById(id);
+  if (!row) throw new HttpError(404, "NOT_FOUND", `compute host ${id} not found`);
+  if (row.name === "self") {
+    throw new HttpError(403, "FORBIDDEN", "cannot revoke self host");
+  }
+  const ok = await queries.setRevoked(id, {
+    actor: `admin:${ctx.adminId}`,
+    operationId: randomUUID(),
+  });
+  if (!ok) {
+    throw new HttpError(409, "NOT_REVOCABLE", `host ${id} cannot be revoked`);
+  }
+  await bestEffortAudit(ctx, "compute_host.revoke", `compute_host:${id}`, { status: row.status }, { status: "revoked" });
+}
+
 export async function removeComputeHost(id: string, ctx: AdminAuditCtx): Promise<void> {
   // queries.deleteHost 已包含:self 拒、draining 检查、active=0 检查、ID 存在性
   // throw message 我们按文案 map 成 HttpError code/status
@@ -571,10 +592,14 @@ export async function getBaselineVersions(): Promise<BaselineVersionView> {
   const hosts = await queries.listAllHosts();
   const perHostResults = await Promise.allSettled(
     hosts
-      .filter((h) => h.name !== "self") // self host 不跑 node-agent
+      .filter((h) => h.name !== "self" && h.status !== "revoked") // self 不跑 node-agent;A3:跳过 revoked
       .map(async (row): Promise<BaselineVersionPerHost> => {
         try {
-          const v = await rpcGetBaselineVersion(hostRowToTarget(row), { timeoutMs: 5000 });
+          // A3/B8 — 已在上面 filter 掉 revoked;这里再 requireFingerprint 保证缺 pin 的 host
+          // 也 fail-closed(与 service 路径对齐:任何 outbound node-agent 接触都要求 pinned fp)。
+          const target = hostRowToTarget(row);
+          target.requireFingerprint = true;
+          const v = await rpcGetBaselineVersion(target, { timeoutMs: 5000 });
           return { host_id: row.id, name: row.name, remote_version: v || null, err: null };
         } catch (e) {
           return {
@@ -655,6 +680,11 @@ export async function adminDistributeImageToHost(
   if (!row) throw new HttpError(404, "NOT_FOUND", `compute host ${hostId} not found`);
   if (row.name === "self") {
     throw new HttpError(403, "FORBIDDEN", "cannot distribute image to self host (use local docker)");
+  }
+  // A3 — 终态 revoked host 不再分发镜像(SSH 推送到被吊销/入侵主机是 service 接触)。
+  // 自动 promoteOnce 已经只遍历 ready/quarantined;这里堵住手动 admin 触发的入口。
+  if (row.status === "revoked") {
+    throw new HttpError(403, "FORBIDDEN", `host ${hostId} revoked`);
   }
   log.info("admin distribute-image to host", {
     adminId: String(ctx.adminId), hostId, hostName: row.name, image,

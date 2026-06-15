@@ -38,7 +38,7 @@
 | B2 | admin 路由层声明式鉴权 | 安全 | P1 | 5 | W2 | 无 | ✅ Codex PASS, commit `67a4b8f8`(含 B5) |
 | B3 | codex disable drift reconciler | 安全 | P1 | 5 | W2 | 无 | ✅ Codex PASS, commit `4faea489` |
 | B4 | node-agent 缺失容器返真 404 | 正确性 | P1 | 5 | W2 | ↑（少卡死） | ✅ Codex PASS, commit `d214d57a`（**Go node-agent rollout 线,非 deploy-v3.sh**) |
-| A3 | compute-host 吊销 kill-switch（+B8 NULL fingerprint fail-closed） | 安全/架构 | P0 | 3 | W2 | 无 | ⬜ 需先复核 |
+| A3 | compute-host 吊销 kill-switch（+B8 NULL fingerprint fail-closed） | 安全/架构 | P0 | 3 | W2 | 无 | ✅ PASS（Codex 2 轮） |
 | B5 | 只读 admin 路由升 `requireAdminVerifyDb` | 安全 | P2 | 10 | W2 | 无 | ✅ 由 B2 router gate 收编(所有 admin 走 verify-db) |
 | U2 | CSS 双 token 词汇统一 + 品牌色 fallback | UI | P1 | 7 | **W3** | 须严防视觉回归 | ⬜ |
 | U6 | `--z-*` 分层 token + 聊天流骨架屏一致性 | UI | P3 | 13 | W3 | ↑/中性 | ⬜ |
@@ -177,4 +177,11 @@
   8. admin:`revokeComputeHost(id,ctx)` → 拒 self → `setRevoked`(status='revoked' + agent_cert_fingerprint_sha256=NULL 立即断)+ audit;路由 `POST /api/admin/v3/compute-hosts/:id/revoke`(走 B2 router admin gate)。un-revoke 需 re-bootstrap(可接受,终态)。
   9. 验收:patch 后**重审所有直用 hostRowToTarget 的生产路径** —— 任何可能 RPC/tunnel/file/baseline/egress 接触终态 host 的路径,必须经 resolveServiceableHostTarget / withTarget / 显式 skip-deny。
   - 单测(本地 PG):resolver {revoked/null-fp→throw, ready+fp→ok}、verifyServerCert requireFingerprint fail-closed、setRevoked SQL+audit、pollHost race recheck、≥1 非 service caller skip/deny、migration 超集保行。多机 smoke 留部署阶段。
-- 下一步:**实现 A3(+B8)** → 再 W3(U2/U6)、W4(A1+R1/R2/R3、A5、A4 — design-doc 先行)、W5(B6/B7/B9)。
+- 2026-06-15:**A3(+B8)实现完成,Codex code review PASS(2 轮:FAIL→修复→PASS)**。
+  - 状态机/DB:migration 0081(发现谓词从 `%status%IN%` 硬化为 `%status%`,按引用 status 列唯一匹配,不依赖枚举值子串/IN 归一化);`setRevoked`(tx FOR UPDATE,清 fingerprint,admin.revoke audit,self/不存在→false,幂等);types.ts `revoked`。
+  - **终态不变量(防无声 un-revoke,DB 层统一封)**:`setQuarantined` 跳过表 +revoked;`updateStatus` WHERE `AND (status<>'revoked' OR $2='revoked')`;`markBootstrapResult` 事务内 FOR UPDATE 预检 revoked→ROLLBACK;`updateCert` WHERE `AND status<>'revoked'`(**原子消除 revoke/renew 竞态** —— Codex Finding 2:maybeRenewCert 持旧 row 续签会写回 fingerprint,WHERE 守卫按 committed status 判定,无 TOCTOU);既有 setDraining/clearQuarantine(ByReason)/applyHealthSnapshot 经核已不外迁 revoked。
+  - 解析器+B8:`assertHostServiceable`(self 豁免/revoked/null-fp,revoked 优先)+ `resolveServiceableHostTarget`(requireFingerprint=true);`verifyServerCert` 加 requireFingerprint 形参,3 个 TLS 建连点(request/file-stream/dialTunnelSocket)透传。
+  - service 路径全 gate(重审闭合):withTarget(lifecycle RPC+inspectImage)、index.ts 远端 file-IO put/pull×2/**delete**(Codex Finding 1:漏的 deleteRemoteCodexAuth 已补)/inbound file-proxy/sshMux resolvePlacement、tunnelHealthzProbe/v3readiness/v3ensureRunning bridge/containerApiProxy/containerFileProxy/volumeContextReader、nodeBootstrap 入口/adminDistributeImageToHost(SSH)、nodeHealth poll+renew、poolInit/baselineServer/getBaselineVersions。`grep hostRowToTarget( index.ts` 仅余 sshMux 一处(已 gated)。
+  - 验证:tsc 改动文件 0 error;biome 0 new(工作树 32≤HEAD 35);测试 hostServiceable 5/5 + computeHostRevoke.integ 15/15(真 PG octest);回归 queriesAtomicLifecycle 62/62、v3EnsureRunning 21/21、v3Readiness 20/20、containerApiProxy 5/5。
+  - **已知 tech-debt(Codex 同意为 A3 边界,后续单独硬化)**:① revoked host 上活跃用户的 deny 是 retryable 形态(ContainerUnreadyError/502)→ 会被无意义重试(安全无损:每次重试重查 DB 再 deny,host 永不被接触);根治需 caller re-placement + data-host 迁移语义。② in-flight egress CONNECT / 已建 tunnel / bootstrap 进行中的 step 不被同步 teardown(revoke 只切新接触+清 fp+新 egress fail-closed);根治需 per-host active-socket/dispatcher 追踪与主动 kill。
+- 下一步:批量部署本波次(A2/U1/U3/U4/U5/B1/B2/B3/B5/A3 + B4 经 Go node-agent rollout)→ 再 W3(U2/U6)、W4(A1+R1/R2/R3、A5、A4 — design-doc 先行)、W5(B6/B7/B9)。
