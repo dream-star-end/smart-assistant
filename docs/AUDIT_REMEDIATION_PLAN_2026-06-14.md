@@ -35,11 +35,11 @@
 | U5 | escape helper 去重 + wechat.js:113 转义 | 安全/质量 | P2/P3 | 12 | W1 | 无 | ✅ Codex PASS, commit `62ac2835` |
 | U4 | `--fg-dim` 对比度达 WCAG AA | UI | P2 | 9 | W1 | ↑ 提升 | ✅ Codex PASS, commit `1d431a06` |
 | B1 | `request_finalize_journal` 对账器+GC | 资金 | P1 | 4 | W2 | 无 | ✅ Codex PASS, commit `ef2022db` |
-| B2 | admin 路由层声明式鉴权 | 安全 | P1 | 5 | W2 | 无 | ⬜ |
+| B2 | admin 路由层声明式鉴权 | 安全 | P1 | 5 | W2 | 无 | ✅ Codex PASS, commit `67a4b8f8`(含 B5) |
 | B3 | codex disable drift reconciler | 安全 | P1 | 5 | W2 | 无 | ⬜ |
 | B4 | node-agent 缺失容器返真 404 | 正确性 | P1 | 5 | W2 | ↑（少卡死） | ⬜ |
 | A3 | compute-host 吊销 kill-switch（+B8 NULL fingerprint fail-closed） | 安全/架构 | P0 | 3 | W2 | 无 | ⬜ 需先复核 |
-| B5 | 只读 admin 路由升 `requireAdminVerifyDb` | 安全 | P2 | 10 | W2 | 无 | ⬜ |
+| B5 | 只读 admin 路由升 `requireAdminVerifyDb` | 安全 | P2 | 10 | W2 | 无 | ✅ 由 B2 router gate 收编(所有 admin 走 verify-db) |
 | U2 | CSS 双 token 词汇统一 + 品牌色 fallback | UI | P1 | 7 | **W3** | 须严防视觉回归 | ⬜ |
 | U6 | `--z-*` 分层 token + 聊天流骨架屏一致性 | UI | P3 | 13 | W3 | ↑/中性 | ⬜ |
 | **A1** | turn 生命周期单一权威源 + server `turnId` | 架构 | P0 | 1 | **W4** | 须严防流式 UI 回归 | ⬜ design-doc 先行 |
@@ -158,4 +158,6 @@
   - U4：`--fg-dim` 提对比度达 AA（--bg/elevated/subtle），raised/tinted 次要文字降级 --fg-muted。
   - 验证：全程 node --check + biome 0 新增 + test:web 993/993；前端 cache-bust 由 deploy-v3.sh 自动处理。
 - 2026-06-15：**B1 完成**（commit `ef2022db`，Codex 计划审+代码审 PASS）。terminalizer（非 replay,journal 无观测用量不可重算）:有 usage_records→committed 回填,无→aborted 不退不扣;7d GC 批量删。阈值根治:不用 0015 字面 30s（journal 不心跳、codex 600s,会误 abort 活流）,默认 30min/env 向上夹 max(codexMax*3,30min)/24h 上限+isSafeInteger 防 ::bigint 打挂。接进 index.ts 调度+关停;单测 14/14;SQL integ 留批量部署阶段验。
-- 下一步 W2 剩余:**B2 admin 路由声明式鉴权 / B3 codex disable drift / B4 node-agent 真 404 / A3 host 吊销+B8 / B5 只读 admin verify-db**。
+- 2026-06-15:**W1+B1 已部署上线**(v1.0.322,commit `e0a1ff99`)。deploy-v3.sh --force,smoke 5/5,无错误;B1 对账器 boot 即清掉生产 40 条卡死 inflight 行(0 残留),A2+B1 已对本地真 PG integ 验证。changelog 本次不写(currentVersion 仅 v1.0.321→322)。
+- 2026-06-15:**B2 完成**(commit `67a4b8f8`,Codex 计划审+代码审 PASS,**含 B5**)。router dispatch 对 /api/admin/* 一律 requireAdminVerifyDb(放 405 之前;method-aware 白名单仅 `GET /api/admin/metrics` 走自带 bearer 鉴权);metrics JWT 回落也升 verify-db。整组 admin(含只读)关闭降权 stale-role 窗口。adminRouteGate.integ 7/7,apiKeyAdmin 7/7 无回归。
+- 下一步 W2 剩余:**B3 codex disable drift / B4 node-agent 真 404(Go node-agent rollout 线)/ A3 host 吊销+B8(P0,改前聚焦复核)**。
