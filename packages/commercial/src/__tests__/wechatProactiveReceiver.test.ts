@@ -26,6 +26,7 @@ import type { Pool } from "pg"
 
 import {
   makeProactiveReceiverHandler,
+  canonicalWechatSenderId,
   WECHAT_PROACTIVE_PATH,
   type ProactiveReceiverDeps,
 } from "../wechat/proactiveReceiver.js"
@@ -216,5 +217,17 @@ describe("proactiveReceiver", () => {
     assert.equal(inserts[0]!.senderId, LOGIN_USER_ID)
     assert.equal(inserts[0]!.bindingUserId, String(VALID_USER_ID))
     assert.equal(inserts[0]!.sessionId, VALID_SESSION_ID)
+  })
+})
+
+describe("canonicalWechatSenderId", () => {
+  test("strips @im.wechat wire suffix → canonical (matches contextTokens key)", () => {
+    assert.equal(canonicalWechatSenderId("o9cq803RaiYffHD5475dcduJaDgg@im.wechat"), "o9cq803RaiYffHD5475dcduJaDgg")
+  })
+  test("idempotent on already-canonical id", () => {
+    assert.equal(canonicalWechatSenderId("o9cq803RaiYffHD5475dcduJaDgg"), "o9cq803RaiYffHD5475dcduJaDgg")
+  })
+  test("does not strip other suffixes (e.g. @im.bot)", () => {
+    assert.equal(canonicalWechatSenderId("abc@im.bot"), "abc@im.bot")
   })
 })

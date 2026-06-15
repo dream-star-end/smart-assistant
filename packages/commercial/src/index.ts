@@ -167,6 +167,7 @@ import {
 import {
   WECHAT_PROACTIVE_PATH,
   makeProactiveReceiverHandler,
+  canonicalWechatSenderId,
   type ProactiveReceiverHandler,
 } from "./wechat/proactiveReceiver.js";
 import { getCurrentSessionId } from "./wechat/sessionPointer.js";
@@ -2443,7 +2444,10 @@ export async function registerCommercial(
         // 漏前缀会永远查不到(no_binding),且可能误命中 legacy 裸 id 行破坏 trust boundary。
         const b = await getWechatBindingByUserId(MASTER_USER_PREFIX + bindingUserId);
         if (!b || b.status !== "active" || !b.loginUserId) return null;
-        return { senderId: b.loginUserId, contextTokens: b.contextTokens };
+        // loginUserId 是 wire 形态(<base64url>@im.wechat),但 contextTokens 的 key 是
+        // canonical(剥后缀)。senderId 必须 canonical 才能命中 contextTokens(否则永久
+        // no_context_token),且与既有 outbound 路径的 canonical senderId 一致。
+        return { senderId: canonicalWechatSenderId(b.loginUserId), contextTokens: b.contextTokens };
       },
       isProactiveEnabled: async (userId) => {
         const snap = await getPreferences(BigInt(userId));

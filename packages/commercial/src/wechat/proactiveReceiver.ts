@@ -44,6 +44,25 @@ import { renderAssistantText } from "./rendererPipeline.js"
 /** 容器 → master 主动投递 endpoint。挂在 master:18443 + self-host:18791。 */
 export const WECHAT_PROACTIVE_PATH = "/internal/v3/wechat-proactive"
 
+const IM_WECHAT_SUFFIX = "@im.wechat"
+
+/**
+ * 剥 iLink wire 后缀 `@im.wechat` → canonical senderId。
+ *
+ * 关键不变量:`wechat_bindings.login_user_id` 以 wire 形态 `<base64url>@im.wechat` 存,
+ * 但 `binding.contextTokens` 的 key 是 canonical(rowToBinding 对 context_tokens 做了
+ * canonicalize 剥后缀)。因此用 raw loginUserId 去 `contextTokens[senderId]` 永远 miss →
+ * 永久 no_context_token。发送目标 senderId 必须是 canonical,才能命中 contextTokens,
+ * 并与既有 outbound 路径(inboundDispatcher 的 senderId 为 canonical)一致。
+ *
+ * 本地实现而非 import `@openclaude/channel-wechat`.canonicalSenderId:该包 index 未
+ * re-export 它,且本修复限定 master-only(避免触发 runtime image rebuild)—— 与
+ * `storage/wechatBindings.ts` 的 stripImWechatSuffix 同款本地剥后缀先例(包层级倒挂回避)。
+ */
+export function canonicalWechatSenderId(raw: string): string {
+  return raw.endsWith(IM_WECHAT_SUFFIX) ? raw.slice(0, -IM_WECHAT_SUFFIX.length) : raw
+}
+
 /** outboundId charset/长度,与 outboundReceiver 对齐(URL/log safe)。 */
 const OUTBOUND_ID_RE = /^[A-Za-z0-9._:-]{8,128}$/
 /** agentId charset 与 internalServerAuthored 对齐(`main` / `codex` 等)。 */
