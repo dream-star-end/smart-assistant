@@ -17,10 +17,10 @@
 //   - 任何 list 接口 4xx → 提示 + 跳转 /;不要在 admin 页面里"匿名展示空列表"
 //   - PATCH/DELETE 操作前必须有 confirm 提示
 
-import { _clearStoredAccessToken, state } from './state.js?v=c056e806'
-import { htmlSafeEscape } from './dom.js?v=c056e806'
-import { apiGet, apiJson, apiText, apiFetch, authHeaders, onAuthExpired, silentRefresh } from './api.js?v=c056e806'
-import { lineChart, barChart, destroyChart, fmt as cfmt } from './charts.js?v=c056e806'
+import { _clearStoredAccessToken, state } from './state.js?v=a16701f9'
+import { htmlSafeEscape } from './dom.js?v=a16701f9'
+import { apiGet, apiJson, apiText, apiFetch, authHeaders, onAuthExpired, silentRefresh } from './api.js?v=a16701f9'
+import { lineChart, barChart, destroyChart, fmt as cfmt } from './charts.js?v=a16701f9'
 
 // 与后端 packages/commercial/src/admin/ledger.ts 的 LEDGER_REASONS 枚举严格同步。
 // 新增/删除 reason 必须两端同步改,否则 ledger tab filter 会把错误值发给后端
