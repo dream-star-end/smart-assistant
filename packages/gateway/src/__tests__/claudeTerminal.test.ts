@@ -228,6 +228,26 @@ describe('ClaudeTerminalManager lifecycle', () => {
     assert.match(SERVER_SRC, /claudeTerminal\?\.terminate\(userId\)/)
   })
 
+  test('server exposes narrow path-bound tickets for browser terminal downloads', () => {
+    assert.match(SERVER_SRC, /const TERMINAL_DOWNLOAD_TICKET_TTL_MS = 5 \* 60_000/)
+    assert.match(
+      SERVER_SRC,
+      /private _terminalDownloadTickets = new Map<string, TerminalDownloadTicketState>\(\)/,
+    )
+    assert.match(SERVER_SRC, /url\.pathname === '\/api\/claude-terminal\/download-ticket'/)
+    assert.match(SERVER_SRC, /randomBytes\(32\)\.toString\('base64url'\)/)
+    assert.match(SERVER_SRC, /entry\.path !== rawPath/)
+    assert.match(
+      SERVER_SRC,
+      /url\.pathname === '\/api\/claude-terminal\/download'[\s\S]*getClaudeTerminalDownloadTicketUserId\(url\) !== null/,
+    )
+    assert.match(
+      SERVER_SRC,
+      /this\.getClaudeTerminalUserId\(req\) \|\| this\.getClaudeTerminalDownloadTicketUserId\(url\)/,
+    )
+    assert.doesNotMatch(SERVER_SRC, /searchParams\.get\(['"]token['"]\)/)
+  })
+
   test('server terminal routes use the terminal-specific principal', () => {
     assert.match(SERVER_SRC, /private getClaudeTerminalUserId\(req: IncomingMessage\)/)
     assert.match(SERVER_SRC, /configuredUsers\.some\(\(u\) => u\.id === jwtUserId\)/)
