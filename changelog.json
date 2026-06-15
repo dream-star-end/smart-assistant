@@ -2,7 +2,7 @@
   "currentVersion": "v1.0.331",
   "releases": [
     {
-      "version": "PENDING",
+      "version": "v1.0.331",
       "date": "PENDING",
       "title": "团队模式：队长默认改用 GLM-5.1、修复委派失败、委派过程更清爽",
       "items": [
