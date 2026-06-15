@@ -221,7 +221,10 @@ describe('agent team prompt builder', () => {
     assert.match(src, /TEAM_TEMPLATES/)
     assert.match(src, /id: 'science_research_team'/)
     assert.match(src, /name: '科研协作团队'/)
-    assert.match(src, /leaderAgentId: 'codex'/)
+    // 队长默认走 glm-5.1：模板 leaderAgentId 用 main（GLM-5.1 助手），不再是
+    // codex（GPT-5.5）。codex-native runner 无法运行 glm-5.1。
+    assert.match(src, /leaderAgentId: 'main'/)
+    assert.doesNotMatch(src, /leaderAgentId: 'codex'/)
     assert.match(src, /agentId: 'scientist'/)
     assert.match(src, /role: '科研数据分析师'/)
     assert.match(src, /policy: \{ maxParallel: 2, requireReview: true, reviewAgentId: 'reviewer' \}/)

@@ -21,6 +21,7 @@
  */
 
 import { readFileSync } from 'node:fs'
+import { request as httpRequest } from 'node:http'
 import { Server } from '@modelcontextprotocol/sdk/server/index.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js'
@@ -856,6 +857,69 @@ async function handleAskGpt55Codex(args: { goal: string; context?: string; tools
   })
 }
 
+/**
+ * The captain's HTTP client must wait strictly longer than the gateway's
+ * authoritative delegate lifetime. The gateway runs the child up to its hard
+ * timeout — delegateTimeout.ts clamps that to at most 2h — and ALWAYS sends an
+ * HTTP response (on completion / idle timeout / hard timeout). It only writes
+ * that response after the child finishes; progress streams over a separate WS,
+ * so nothing flows on this socket until the very end. The original code used
+ * global fetch, whose undici default 5min headersTimeout aborted any non-trivial
+ * delegation mid-run → "委派失败: fetch failed", while the orphaned child kept
+ * burning tokens.
+ *
+ * The gateway is the single authority on delegate lifetime; the client only has
+ * to outlast the gateway's maximum possible hold time. Since that ceiling is a
+ * fixed 2h (delegateTimeout.ts hard-timeout clamp), wait 2h + a margin — this
+ * never re-splits the two sides regardless of any OPENCLAUDE_DELEGATE_HARD_*
+ * env tuning (the gateway can never exceed its own clamp).
+ */
+const DELEGATE_CLIENT_TIMEOUT_MS = 2 * 60 * 60_000 + 60_000
+
+/**
+ * node:http surfaces the real transport failure on `err.code` (ECONNREFUSED,
+ * ECONNRESET, socket timeout…). Fold the code into the message so delegation
+ * failures are diagnosable instead of the opaque dead-end the old fetch path
+ * produced.
+ */
+function describeDelegateTransportError(err: any): string {
+  const code = err?.code || err?.cause?.code
+  const base = err?.message ?? String(err)
+  return code ? `${base} (${code})` : base
+}
+
+/**
+ * POST JSON to the in-container gateway over node:http. We deliberately avoid
+ * global fetch / undici here: the only knob we need is "wait long enough for the
+ * gateway to answer", and a socket-inactivity timeout gives exactly that without
+ * pulling in undici's separate 5min headersTimeout (the original bug) or a new
+ * runtime dependency for this spawned MCP subprocess. Nothing flows on the
+ * socket until the gateway finishes the whole child run, so the inactivity timer
+ * acts as the total client wait cap.
+ */
+function postJsonToGateway(
+  url: string,
+  opts: { headers: Record<string, string>; body: string; timeoutMs: number },
+): Promise<{ statusCode: number; body: string }> {
+  return new Promise((resolve, reject) => {
+    const req = httpRequest(url, { method: 'POST', headers: opts.headers }, (res) => {
+      const chunks: Buffer[] = []
+      res.on('data', (chunk) => chunks.push(chunk as Buffer))
+      res.on('end', () =>
+        resolve({ statusCode: res.statusCode ?? 0, body: Buffer.concat(chunks).toString('utf8') }),
+      )
+      res.on('error', reject)
+    })
+    req.on('error', reject)
+    req.setTimeout(opts.timeoutMs, () => {
+      const err: any = new Error(`delegate client timeout after ${Math.round(opts.timeoutMs / 1000)}s`)
+      err.code = 'ETIMEDOUT'
+      req.destroy(err)
+    })
+    req.end(opts.body)
+  })
+}
+
 async function handleDelegateTaskToAgent(
   targetAgent: string,
   args: {
@@ -872,10 +936,9 @@ async function handleDelegateTaskToAgent(
   try {
     // Pass delegation depth so gateway can enforce recursion limit
     const currentDepth = Number.parseInt(process.env.OPENCLAUDE_DELEGATION_DEPTH || '0', 10)
-    const res = await fetch(
+    const res = await postJsonToGateway(
       `http://127.0.0.1:${gatewayPort}/api/agents/${encodeURIComponent(targetAgent)}/delegate`,
       {
-        method: 'POST',
         headers: {
           'Content-Type': 'application/json',
           Authorization: `Bearer ${gatewayToken}`,
@@ -886,17 +949,15 @@ async function handleDelegateTaskToAgent(
           context: args.context,
           sourceAgent,
           toolsets: args.toolsets,
-          ...(parentSessionKey
-            ? { streamProgress: true, parentSessionKey }
-            : {}),
+          ...(parentSessionKey ? { streamProgress: true, parentSessionKey } : {}),
         }),
+        timeoutMs: DELEGATE_CLIENT_TIMEOUT_MS,
       },
     )
-    if (!res.ok) {
-      const err = await res.text()
-      return toolError(`委派失败: ${err}`)
+    if (res.statusCode < 200 || res.statusCode >= 300) {
+      return toolError(`委派失败: ${res.body}`)
     }
-    const data = (await res.json()) as any
+    const data = JSON.parse(res.body) as any
     if (data.error || data.ok === false) {
       return toolError(`子 agent 执行出错: ${data.error || data.output || 'unknown error'}`)
     }
@@ -906,7 +967,7 @@ async function handleDelegateTaskToAgent(
     }
     return toolOk(`✅ 委派完成 (agent: ${args.label})\n\n${output || '(无输出)'}`)
   } catch (err: any) {
-    return toolError(`委派失败: ${err?.message ?? String(err)}`)
+    return toolError(`委派失败: ${describeDelegateTransportError(err)}`)
   }
 }
 

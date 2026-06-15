@@ -27,6 +27,15 @@ describe('delegate progress sanitization', () => {
     })
   })
 
+  it('drops chain-of-thought so the delegate card is not a wall of reasoning', () => {
+    const block = summarizeDelegateProgressEvent(
+      { kind: 'block', block: { kind: 'thinking', text: 'let me reason about this privately' } },
+      'run-1',
+      'researcher',
+    )
+    assert.equal(block, null)
+  })
+
   it('preserves text delta edge whitespace so browser merging keeps word boundaries', () => {
     const block = summarizeDelegateProgressEvent(
       { kind: 'block', block: { kind: 'text', text: ' world' } },

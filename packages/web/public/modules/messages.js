@@ -788,6 +788,68 @@ function _renderAgentGroup(el, msg) {
   }
 }
 
+// Keys worth surfacing from a tool's (possibly truncated) JSON arg preview, in
+// priority order, so a delegate tool chip reads like "father involvement…"
+// instead of '{"query":"…"}'.
+const _DELEGATE_ARG_KEYS = [
+  'query', 'command', 'cmd', 'prompt', 'pattern', 'url', 'file_path', 'path', 'goal', 'description', 'content',
+]
+
+function _delegateClip(s, n) {
+  const str = String(s)
+  return str.length > n ? `${str.slice(0, n - 1)}…` : str
+}
+
+function _readableToolArg(arg) {
+  const trimmed = String(arg).trim()
+  if (!trimmed) return ''
+  try {
+    const obj = JSON.parse(trimmed)
+    if (obj && typeof obj === 'object' && !Array.isArray(obj)) {
+      for (const k of _DELEGATE_ARG_KEYS) {
+        if (typeof obj[k] === 'string' && obj[k].trim()) return _delegateClip(obj[k].trim(), 96)
+      }
+      const firstStr = Object.values(obj).find((v) => typeof v === 'string' && v.trim())
+      return firstStr ? _delegateClip(String(firstStr).trim(), 96) : ''
+    }
+  } catch {
+    // Truncated/invalid JSON preview — pull the first interesting quoted value.
+    for (const k of _DELEGATE_ARG_KEYS) {
+      const mm = trimmed.match(new RegExp(`"${k}"\\s*:\\s*"([^"]+)"`))
+      if (mm) return _delegateClip(mm[1].trim(), 96)
+    }
+    const any = trimmed.match(/"([^"]{3,})"/)
+    if (any) return _delegateClip(any[1].trim(), 96)
+  }
+  return _delegateClip(trimmed.replace(/^[{[]\s*/, '').replace(/\s*[}\]]$/, ''), 96)
+}
+
+function _delegateToolArgPreview(text) {
+  // Backend tool_use text: "调用工具 <name>: <preview>" | "调用工具 <name>".
+  const m = String(text).match(/^调用工具\s+\S+\s*[:：]\s*([\s\S]+)$/)
+  return m ? _readableToolArg(m[1]) : ''
+}
+
+// Render a delegate tool entry as a compact icon+name chip with a one-line arg
+// preview, instead of raw "调用工具 X: {json}" debug text. Successful
+// tool_result / output-tail entries are redundant with the call chip and are
+// dropped; failures still surface.
+function _buildDelegateToolChip(entry, text) {
+  const isCall = text.startsWith('调用工具')
+  if (!isCall && !entry.isError) return null
+  const toolName = String(entry.toolName || '').trim() || 'tool'
+  const meta = _toolMeta(toolName, null)
+  const chip = document.createElement('div')
+  chip.className = 'delegate-tool-chip'
+  if (entry.isError) chip.classList.add('error')
+  const arg = entry.isError ? '执行出错' : _delegateToolArgPreview(text)
+  chip.innerHTML =
+    `<span class="delegate-tool-chip-icon">${meta.icon}</span>` +
+    `<span class="delegate-tool-chip-name">${htmlSafeEscape(meta.label || toolName)}</span>` +
+    (arg ? `<span class="delegate-tool-chip-arg">${htmlSafeEscape(arg)}</span>` : '')
+  return chip
+}
+
 function _renderDelegateProgress(el, msg) {
   el.innerHTML = ''
   el.className = 'agent-group delegate-progress'
@@ -813,13 +875,16 @@ function _renderDelegateProgress(el, msg) {
   for (const entry of entries) {
     const text = String(entry?.text || '').trim()
     if (!text) continue
+    // Chain-of-thought is hidden (also dropped server-side); skip any that
+    // survive in persisted history so old cards read cleanly too.
+    if (entry.phase === 'thinking') continue
+    if (entry.phase === 'tool') {
+      const chip = _buildDelegateToolChip(entry, text)
+      if (chip) body.appendChild(chip)
+      continue
+    }
     const p = document.createElement('div')
-    p.className =
-      entry.phase === 'thinking'
-        ? 'agent-group-child-thinking'
-        : entry.phase === 'tool'
-          ? 'agent-group-child-tool msg tool'
-          : 'agent-group-child-text'
+    p.className = 'agent-group-child-text'
     if (entry.isError) p.classList.add('error')
     p.textContent = text
     body.appendChild(p)

@@ -1158,7 +1158,11 @@ try {
     id: "science_research_team",
     name: "科研协作团队",
     description: "适合文献调研、实验/数据分析、论文思路和证据复核",
-    leaderAgentId: "codex",
+    // 队长默认走 glm-5.1：codex-native runner 跑不了 glm-5.1，故队长用
+    // main（GLM-5.1 助手）+ 队长提示词，而非 codex（GPT-5.5）。这是团队队长
+    // 模型的权威源；patchPlatformSeedTeam 会据此把用户未定制的旧 codex 队长
+    // 团队在容器启动时迁移到 main。
+    leaderAgentId: "main",
     leaderRole: "科研项目负责人",
     leaderPrompt:
       "你是科研协作队长。先把研究问题拆成可验证子问题,定义证据标准和交付物;优先把资料整理交给 researcher,把统计建模/科学计算/可视化/生信分析交给 scientist,把工程实现或复现实验脚本交给 coder,把证据链复核交给 reviewer。默认不假设 browser/research MCP 已挂载,需要外部检索或论文工具时只要求成员在当前工具列表可用时使用。最终按结论、证据、局限和下一步组织输出。",
@@ -1199,7 +1203,8 @@ try {
     id: "programming_team",
     name: "编程协作团队",
     description: "适合需求拆解、技术调研、代码实现、测试和审查闭环",
-    leaderAgentId: "codex",
+    // 队长默认走 glm-5.1（同上：main 而非 codex/GPT-5.5）。
+    leaderAgentId: "main",
     leaderRole: "技术负责人",
     leaderPrompt:
       "你是编程协作队长。先确认需求、约束、影响范围和验收标准;把技术调研交给 researcher,把实现交给 coder,把质量审查交给 reviewer。默认不假设浏览器工具已挂载,需要外部官方资料时只要求成员在当前工具列表可用时使用。保持最小改动和可验证交付,最终说明改动点、验证结果、风险和后续建议。",

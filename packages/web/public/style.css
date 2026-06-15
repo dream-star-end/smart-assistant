@@ -2805,6 +2805,47 @@ a:hover {
   white-space: pre-wrap;
   word-break: break-word;
 }
+/* Delegate tool call: compact one-line chip (icon + name + arg preview) instead
+ * of the raw "调用工具 X: {json}" debug text. */
+.delegate-tool-chip {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 10px;
+  font-size: 12px;
+  color: var(--fg-muted);
+  min-width: 0;
+}
+.delegate-tool-chip-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 14px;
+  height: 14px;
+  flex-shrink: 0;
+  color: var(--accent);
+}
+.delegate-tool-chip-icon svg {
+  width: 14px;
+  height: 14px;
+}
+.delegate-tool-chip-name {
+  font-weight: 600;
+  color: var(--fg);
+  flex-shrink: 0;
+}
+.delegate-tool-chip-arg {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--fg-muted);
+}
+.delegate-tool-chip.error .delegate-tool-chip-icon,
+.delegate-tool-chip.error .delegate-tool-chip-name,
+.delegate-tool-chip.error .delegate-tool-chip-arg {
+  color: var(--danger);
+}
 /* Collapsed: show a one-line summary so the card isn't just a blank header */
 .agent-group-collapsed-summary {
   display: none;

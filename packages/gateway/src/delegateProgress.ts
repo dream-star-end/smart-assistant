@@ -99,13 +99,12 @@ export function summarizeDelegateProgressEvent(
         preserveWhitespace: true,
       })
     case 'thinking':
-      return makeDelegateProgressBlock({
-        runId,
-        agentId,
-        phase: 'thinking',
-        text: block.text,
-        preserveWhitespace: true,
-      })
+      // Chain-of-thought is internal scratch. Streaming the raw reasoning
+      // monologue turned the delegate card into a wall of italic text (and
+      // leaks the member's private reasoning). Drop it from the progress feed —
+      // the card still carries real text output, tool chips and the final
+      // result, which is enough live signal.
+      return null
     case 'plan':
       return makeDelegateProgressBlock({ runId, agentId, phase: 'plan', text: planText(block) })
     case 'tool_use': {

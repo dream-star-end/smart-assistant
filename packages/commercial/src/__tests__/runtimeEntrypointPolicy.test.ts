@@ -525,18 +525,22 @@ describe("openclaude-runtime entrypoint env-scrub policy", () => {
     }
   });
 
-  test("entrypoint.ts pre-seeds the two default teams with codex as leader", () => {
+  test("entrypoint.ts pre-seeds the two default teams with the glm-5.1 main captain", () => {
     const src = readFileSync(ENTRYPOINT_TS_PATH, "utf-8");
     assert.match(src, /const desiredSeedTeams\s*=\s*\[desiredScienceTeam,\s*desiredProgrammingTeam\]/);
-    assert.match(src, /id:\s*"science_research_team"[\s\S]*leaderAgentId:\s*"codex"/);
+    // 队长默认 glm-5.1：seed team leader 为 main（GLM-5.1），不再是 codex（GPT-5.5）。
+    assert.match(src, /id:\s*"science_research_team"[\s\S]*leaderAgentId:\s*"main"/);
+    assert.doesNotMatch(src, /id:\s*"science_research_team"[\s\S]*leaderAgentId:\s*"codex"/);
     assert.match(
       src,
       /id:\s*"science_research_team"[\s\S]*agentId:\s*"scientist"[\s\S]*role:\s*"科研数据分析师"[\s\S]*policy:\s*\{\s*maxParallel:\s*2,\s*requireReview:\s*true,\s*reviewAgentId:\s*"reviewer"\s*\}/,
       "science team must include scientist and cap collaboration fanout at two",
     );
-    assert.match(src, /id:\s*"programming_team"[\s\S]*leaderAgentId:\s*"codex"/);
+    assert.match(src, /id:\s*"programming_team"[\s\S]*leaderAgentId:\s*"main"/);
     assert.match(src, /teams:\s*desiredSeedTeams\.map\(cloneSeedTeam\)/);
     assert.match(src, /patchPlatformSeedTeam/);
+    // 旧的 codex 队长默认团队仍被识别为可迁移的默认 seed 形态，启动时切到 main。
+    assert.match(src, /const defaultLeader\s*=\s*leader === ""\s*\|\|\s*leader === "main"\s*\|\|\s*leader === "codex"/);
   });
 
   test("entrypoint.ts migrates only exact old default science team to scientist member set", () => {
