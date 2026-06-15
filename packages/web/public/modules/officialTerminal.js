@@ -236,36 +236,30 @@ function shellQuotePath(path) {
   return `'${String(path || '').replace(/'/g, `'\\''`)}'`
 }
 
-function terminalFileUrl(path, disposition = 'attachment') {
-  const q = new URLSearchParams({ path })
-  if (disposition === 'inline') q.set('disposition', 'inline')
-  return `/api/claude-terminal/download?${q.toString()}`
-}
-
-async function ensureSessionCookieForTerminalFiles() {
-  if (!state.token) return false
-  try {
-    const res = await apiFetch('/api/auth/session', {
-      method: 'POST',
-      headers: authHeaders(),
-      timeout: 5000,
-      suppressAuthRedirect: true,
-    })
-    return res.ok
-  } catch {
-    return false
-  }
+async function createTerminalFileDownloadUrl(path, disposition = 'attachment') {
+  if (!state.token) throw new Error('请先登录 OpenClaude')
+  const data = await apiJson(
+    'POST',
+    '/api/claude-terminal/download-ticket',
+    { path, disposition },
+    { timeout: 5000, suppressAuthRedirect: true },
+  )
+  if (!data?.url || typeof data.url !== 'string') throw new Error('下载链接生成失败')
+  return data.url
 }
 
 async function openTerminalFilePath(path, disposition = 'attachment', name = '') {
   if (!path) return
-  const cookieOk = await ensureSessionCookieForTerminalFiles()
-  if (!cookieOk) {
-    toast('文件下载认证失败，请刷新或重新登录', 'error')
+  let url = ''
+  try {
+    url = await createTerminalFileDownloadUrl(path, disposition)
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err)
+    toast(message || '文件下载认证失败，请刷新或重新登录', 'error')
     return
   }
   const a = document.createElement('a')
-  a.href = terminalFileUrl(path, disposition)
+  a.href = url
   if (disposition === 'inline') {
     a.target = '_blank'
     a.rel = 'noopener noreferrer'

@@ -239,12 +239,12 @@ describe('official Claude terminal lifecycle', () => {
   })
 
   it('cache-busts terminal assets consistently across index/sw/main', () => {
-    assert.match(MAIN, /from '\.\/officialTerminal\.js\?v=14'/)
-    assert.match(SW, /\/modules\/officialTerminal\.js\?v=14/)
-    assert.match(INDEX, /\/modules\/main\.js\?v=67/)
+    assert.match(MAIN, /from '\.\/officialTerminal\.js\?v=15'/)
+    assert.match(SW, /\/modules\/officialTerminal\.js\?v=15/)
+    assert.match(INDEX, /\/modules\/main\.js\?v=68/)
     assert.match(INDEX, /\/style\.css\?v=56/)
-    assert.match(INDEX, /sw-flush-v23/)
-    assert.match(SW, /openclaude-v87/)
+    assert.match(INDEX, /sw-flush-v24/)
+    assert.match(SW, /openclaude-v88/)
   })
 
   it('caches xterm selection (TTL + consume + new-interaction bounded) so TUI redraws do not drop copy', () => {
@@ -286,6 +286,15 @@ describe('official Claude terminal lifecycle', () => {
       STYLE,
       /\.claude-terminal-sessions-menu\s*\{[^}]*width:\s*min\(340px,\s*calc\(100vw/,
     )
+  })
+
+  it('terminal file downloads use short-lived ticket URLs instead of cookie-only navigation', () => {
+    assert.match(SRC, /createTerminalFileDownloadUrl/)
+    assert.match(SRC, /apiJson\(\s*'POST',\s*'\/api\/claude-terminal\/download-ticket'/)
+    assert.match(SRC, /a\.href = url/)
+    assert.doesNotMatch(SRC, /ensureSessionCookieForTerminalFiles/)
+    assert.doesNotMatch(SRC, /\/api\/auth\/session/)
+    assert.doesNotMatch(SRC, /state\.token[\s\S]*new URLSearchParams/)
   })
 
   it('terminal files live in a separate wide modal with Escape closing files first', () => {

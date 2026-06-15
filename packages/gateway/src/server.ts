@@ -134,6 +134,7 @@ const TERMINAL_UPLOAD_CHUNK_JSON_MAX_BYTES = 2 * 1024 * 1024
 const TERMINAL_UPLOAD_MAX_SINGLE_BYTES = 512 * 1024 * 1024
 const TERMINAL_UPLOAD_STALE_MS = 6 * 60 * 60_000
 const TERMINAL_LIST_MAX_ENTRIES = 1000
+const TERMINAL_DOWNLOAD_TICKET_TTL_MS = 5 * 60_000
 
 interface TerminalUploadState {
   id: string
@@ -149,6 +150,12 @@ interface TerminalUploadState {
   createdAt: number
   updatedAt: number
   writing: boolean
+}
+
+interface TerminalDownloadTicketState {
+  userId: string
+  path: string
+  expiresAt: number
 }
 
 interface HttpByteRange {
@@ -188,6 +195,8 @@ export class Gateway {
   private _shutdownPromise: Promise<void> | null = null
   private _terminalUploads = new Map<string, TerminalUploadState>()
   private _lastTerminalUploadCleanupAt = 0
+  private _terminalDownloadTickets = new Map<string, TerminalDownloadTicketState>()
+  private _lastTerminalDownloadTicketCleanupAt = 0
 
   // ── Idempotency key dedup (prevents duplicate processing on client reconnect replay) ──
   private _seenIdempotencyKeys = new Map<string, number>() // key → timestamp
@@ -1290,11 +1299,19 @@ export class Gateway {
     const isChatGptWebRoute =
       url.pathname === '/api/chatgpt-web' || url.pathname.startsWith('/api/chatgpt-web/')
     const hasChatGptWebScopedAuth = isChatGptWebRoute && this.checkChatGptWebScopedAuth(url)
+    const hasTerminalDownloadTicketAuth =
+      url.pathname === '/api/claude-terminal/download' &&
+      this.getClaudeTerminalDownloadTicketUserId(url) !== null
     const needsAuth =
       (url.pathname.startsWith('/api/') && url.pathname !== '/api/healthz') ||
       url.pathname.startsWith('/v1/') ||
       url.pathname === '/metrics'
-    if (needsAuth && !this.checkHttpAuth(req) && !hasChatGptWebScopedAuth) {
+    if (
+      needsAuth &&
+      !this.checkHttpAuth(req) &&
+      !hasChatGptWebScopedAuth &&
+      !hasTerminalDownloadTicketAuth
+    ) {
       res.writeHead(401, { 'Content-Type': 'application/json' })
       res.end(JSON.stringify({ error: 'unauthorized' }))
       return
@@ -1446,6 +1463,12 @@ export class Gateway {
     }
     if (url.pathname === '/api/claude-terminal/list') {
       this.handleClaudeTerminalList(req, res, url)
+      return
+    }
+    if (url.pathname === '/api/claude-terminal/download-ticket') {
+      this.handleClaudeTerminalDownloadTicket(req, res).catch((err) => {
+        this.sendError(res, 400, err instanceof Error ? err.message : String(err))
+      })
       return
     }
     if (url.pathname === '/api/claude-terminal/download') {
@@ -3701,6 +3724,52 @@ export class Gateway {
     }
   }
 
+  private cleanupTerminalDownloadTickets(): void {
+    const now = Date.now()
+    if (now - this._lastTerminalDownloadTicketCleanupAt < 60_000) return
+    this._lastTerminalDownloadTicketCleanupAt = now
+    for (const [ticket, entry] of this._terminalDownloadTickets) {
+      if (entry.expiresAt > now) continue
+      this._terminalDownloadTickets.delete(ticket)
+    }
+  }
+
+  private getClaudeTerminalDownloadTicketUserId(url: URL): string | null {
+    const ticket = url.searchParams.get('ticket') || ''
+    const rawPath = url.searchParams.get('path')
+    if (!ticket || !rawPath) return null
+    this.cleanupTerminalDownloadTickets()
+    const entry = this._terminalDownloadTickets.get(ticket)
+    if (!entry) return null
+    if (entry.expiresAt <= Date.now()) {
+      this._terminalDownloadTickets.delete(ticket)
+      return null
+    }
+    if (entry.path !== rawPath) return null
+    return entry.userId
+  }
+
+  private createClaudeTerminalDownloadTicket(userId: string, path: string): string {
+    this.cleanupTerminalDownloadTickets()
+    const ticket = randomBytes(32).toString('base64url')
+    this._terminalDownloadTickets.set(ticket, {
+      userId,
+      path,
+      expiresAt: Date.now() + TERMINAL_DOWNLOAD_TICKET_TTL_MS,
+    })
+    return ticket
+  }
+
+  private terminalDownloadUrl(
+    path: string,
+    ticket: string,
+    disposition: 'attachment' | 'inline',
+  ): string {
+    const q = new URLSearchParams({ path, ticket })
+    if (disposition === 'inline') q.set('disposition', 'inline')
+    return `/api/claude-terminal/download?${q.toString()}`
+  }
+
   private getTerminalUpload(userId: string, rawId: unknown): TerminalUploadState {
     if (typeof rawId !== 'string' || !rawId) throw new Error('missing uploadId')
     const upload = this._terminalUploads.get(rawId)
@@ -3944,6 +4013,34 @@ export class Gateway {
     }
   }
 
+  private async handleClaudeTerminalDownloadTicket(
+    req: IncomingMessage,
+    res: ServerResponse,
+  ): Promise<void> {
+    if (req.method !== 'POST') {
+      this.sendError(res, 405, 'method not allowed')
+      return
+    }
+    const userId = this.getClaudeTerminalUserId(req)
+    if (!userId) {
+      this.sendError(res, 401, 'Claude terminal requires a user login')
+      return
+    }
+    const body = await this.readJsonBody<Record<string, unknown>>(req, 16 * 1024)
+    const rawPath = typeof body.path === 'string' ? body.path : ''
+    if (!rawPath) {
+      this.sendError(res, 400, 'missing path')
+      return
+    }
+    const disposition = body.disposition === 'inline' ? 'inline' : 'attachment'
+    const ticket = this.createClaudeTerminalDownloadTicket(userId, rawPath)
+    this.sendJson(res, 200, {
+      ok: true,
+      url: this.terminalDownloadUrl(rawPath, ticket, disposition),
+      expiresInMs: TERMINAL_DOWNLOAD_TICKET_TTL_MS,
+    })
+  }
+
   private handleClaudeTerminalDownload(req: IncomingMessage, res: ServerResponse, url: URL): void {
     if (req.method !== 'GET') {
       this.sendError(res, 405, 'method not allowed')
@@ -3955,7 +4052,8 @@ export class Gateway {
       return
     }
 
-    const userId = this.getClaudeTerminalUserId(req)
+    const userId =
+      this.getClaudeTerminalUserId(req) || this.getClaudeTerminalDownloadTicketUserId(url)
     if (!userId) {
       this.sendError(res, 401, 'Claude terminal requires a user login')
       return
@@ -6456,6 +6554,7 @@ const KNOWN_ROUTES = [
   '/api/claude-terminal/sessions',
   '/api/claude-terminal/list',
   '/api/claude-terminal/download',
+  '/api/claude-terminal/download-ticket',
   '/api/usage',
   '/api/usage/events',
   '/api/runs',
