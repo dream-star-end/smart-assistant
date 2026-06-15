@@ -102,8 +102,12 @@ const BROWSER_TOOLSET_ID = "browser";
 const RESEARCH_TOOLSET_ID = "research";
 const WEB_CONTEXT_TOOLSET_ID = "web_context";
 
-const COMMERCIAL_DEFAULT_MODEL = "MiniMax-M3";
-const COMMERCIAL_DEFAULT_PROVIDER = "minimax";
+// 平台全局默认模型(2026-06-15 起 glm-5.1 / 火山方舟 Ark)。
+// 注意:本文件由 Dockerfile 单独 COPY 进 runtime 镜像,无法 import packages/commercial/src,
+// 故这里**本地维护**该常量;master 侧权威常量在 src/platformDefaults.ts。两源一致性由
+// src/__tests__/runtimeEntrypointPolicy.test.ts 文本断言守护 —— 改这里必须同步改 platformDefaults.ts。
+const COMMERCIAL_DEFAULT_MODEL = "glm-5.1";
+const COMMERCIAL_DEFAULT_PROVIDER = "ark";
 const COMMERCIAL_CODER_MODEL = "deepseek-v4-pro";
 const COMMERCIAL_CODER_PROVIDER = "deepseek";
 const COMMERCIAL_CODEX_MODEL = "gpt-5.5";

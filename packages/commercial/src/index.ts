@@ -123,6 +123,7 @@ import {
   makeAnthropicProxyHandler,
   type AnthropicProxyHandler,
 } from "./http/anthropicProxy.js";
+import { assertPlatformDefaultModelConfigured } from "./http/proxy/staticProviderMeta.js";
 import { makePlatformContextLoader } from "./platform/platformContextLoader.js";
 import { makeDefaultVolumeContextReader } from "./platform/volumeContextReader.js";
 import {
@@ -955,6 +956,13 @@ export async function registerCommercial(
     proxyPort !== undefined &&
     selfHostUuid
   ) {
+    // fail-closed guard(Codex plan review #4 + diff review Blocker):平台全局默认模型 glm-5.1
+    // 路由到静态 provider ark,若 ARK_CODING_PLAN_KEY 未配 → throw,loud fail 拒绝启动。
+    // **必须放在下面 try 之外** —— 该 try 的 catch 只会打印 "internal proxy ... disabling" 并把
+    // internalProxyHandler 置空后让 master 继续跑;若 guard 在 try 内,缺 key 会被降级吞成
+    // "internal proxy 禁用但 master 照跑",违反 loud-fail。放 try 外则异常直接冒泡崩 master boot。
+    // 触发面仅此 internal-proxy/agent-runtime 启动路径;unit test / external proxy harness 不进此分支。
+    assertPlatformDefaultModelConfigured(cfg);
     try {
       const identityRepo = createPgIdentityRepo();
       const rateLimitRedis = sharedRateLimitRedis;
@@ -996,13 +1004,16 @@ export async function registerCommercial(
         // and falls back to `pending_usage_patches` when the assistant sink
         // POST hasn't landed yet.
         appendCostCredits,
-        // 2026-05-02 deepseek 接入:cfg 在外层闭包已 loadConfig() 过(line 379),
-        // 这里直接读取。未配置 → undefined → proxy 命中 deepseek 模型时 503。
-        deepseekApiKey: cfg.DEEPSEEK_API_KEY,
-        // 2026-06-02 MiniMax-M3 Token Plan 接入:同 DeepSeek 是静态 API-key
-        // upstream,但 key 只留在 master,不进用户容器。未配置 → 命中
-        // MiniMax-M3 时 503 MINIMAX_NOT_CONFIGURED。
-        minimaxTokenPlanKey: cfg.MINIMAX_TOKEN_PLAN_KEY,
+        // 静态 key 文本 provider 的 key 解析表(deepseek/minimax/ark)。cfg 在外层闭包已
+        // loadConfig() 过,这里直接读取;某 provider 未配 → 命中其模型时 503(各自 reject reason)。
+        // 这是 internal proxy(容器/agent runtime 走的上游),三个 provider 全注入。
+        // key 只留 master,不进用户容器。glm-5.1(ark)是平台全局默认模型,其 key 缺失已由下方
+        // assertPlatformDefaultModelConfigured guard 在装配前 loud-fail。
+        staticProviderKeys: {
+          deepseek: cfg.DEEPSEEK_API_KEY,
+          minimax: cfg.MINIMAX_TOKEN_PLAN_KEY,
+          ark: cfg.ARK_CODING_PLAN_KEY,
+        },
         // v1.0.207 起 Phase 6 account_uuid 锚定(plan §3.0)+ csap session pin 三态
         // (0072+0073+0074),从 env-only 迁到 `system_settings` 表(admin UI 立即可改,
         // 不需要 systemctl restart)。注入 30s TTL cache 的 getter
@@ -1311,7 +1322,9 @@ export async function registerCommercial(
         // bridge 之前是正常顺序(请求期 bridge 必已就绪)。
         broadcastToUser: (uid, payload) => bridgeBroadcastRef.current(uid, payload),
         appendCostCredits,
-        deepseekApiKey: cfg.DEEPSEEK_API_KEY,
+        // external API-key proxy **故意只注入 deepseek**(保持现有能力面,不拓宽 minimax/ark)。
+        // 该 proxy 上 minimax/ark 模型请求维持 not_configured 503,与历史行为一致。
+        staticProviderKeys: { deepseek: cfg.DEEPSEEK_API_KEY },
         platformContextLoader,
         platformServerSecret: cfg.PLATFORM_HMAC_SECRET,
         // v1.0.207 — external ApiKey proxy 与 internal proxy 共用 runtime flag getter,

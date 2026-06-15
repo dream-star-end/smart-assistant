@@ -274,13 +274,13 @@ describe("openclaude-runtime entrypoint env-scrub policy", () => {
     const src = readFileSync(ENTRYPOINT_TS_PATH, "utf-8");
     assert.match(
       src,
-      /const COMMERCIAL_DEFAULT_MODEL\s*=\s*"MiniMax-M3"/,
-      "commercial runtime default model must be MiniMax-M3",
+      /const COMMERCIAL_DEFAULT_MODEL\s*=\s*"glm-5\.1"/,
+      "commercial runtime default model must be glm-5.1 (2026-06-15 起平台全局默认)",
     );
     assert.match(
       src,
-      /const COMMERCIAL_DEFAULT_PROVIDER\s*=\s*"minimax"/,
-      "commercial runtime default provider must be minimax",
+      /const COMMERCIAL_DEFAULT_PROVIDER\s*=\s*"ark"/,
+      "commercial runtime default provider must be ark",
     );
     assert.doesNotMatch(
       src,
@@ -351,8 +351,8 @@ describe("openclaude-runtime entrypoint env-scrub policy", () => {
 
     assert.match(scientist, /id:\s*"scientist"/, "scientist seed id must be stable");
     assert.match(scientist, /displayName:\s*"科研分析师"/, "scientist display name must be distinct");
-    assert.match(scientist, /provider:\s*COMMERCIAL_DEFAULT_PROVIDER/, "scientist must use the default minimax provider");
-    assert.match(scientist, /model:\s*COMMERCIAL_DEFAULT_MODEL/, "scientist must use MiniMax-M3");
+    assert.match(scientist, /provider:\s*COMMERCIAL_DEFAULT_PROVIDER/, "scientist must use the platform default provider (ark)");
+    assert.match(scientist, /model:\s*COMMERCIAL_DEFAULT_MODEL/, "scientist must use the platform default model (glm-5.1)");
     assert.match(scientist, /toolsets:\s*\[CORE_TOOLSET_ID\]/, "scientist must default to core only");
     assert.doesNotMatch(
       scientist,
@@ -621,10 +621,10 @@ describe("openclaude-runtime entrypoint env-scrub policy", () => {
     );
   });
 
-  test("web agents fallback also uses MiniMax instead of an unsupported Claude default", () => {
+  test("web agents fallback uses glm-5.1 (platform default) instead of an unsupported Claude default", () => {
     const src = readFileSync(WEB_AGENTS_MODULE_PATH, "utf-8");
-    assert.match(src, /model:\s*'MiniMax-M3'/, "web fallback main must use MiniMax-M3");
-    assert.match(src, /provider:\s*'minimax'/, "web fallback main must use minimax provider");
+    assert.match(src, /model:\s*'glm-5\.1'/, "web fallback main must use glm-5.1 (平台默认)");
+    assert.match(src, /provider:\s*'ark'/, "web fallback main must use ark provider");
     assert.match(src, /id:\s*'scientist'/, "web fallback must include the scientist agent");
     assert.match(src, /displayName:\s*'科研分析师'/, "web fallback scientist display name must match runtime seed");
     assert.match(src, /model:\s*'deepseek-v4-pro'/, "web fallback coder must use DeepSeek V4 Pro");
@@ -634,5 +634,39 @@ describe("openclaude-runtime entrypoint env-scrub policy", () => {
       /model:\s*'claude-opus-4-7'/,
       "web fallback must not show Claude Opus as the only main agent",
     );
+  });
+});
+
+// 平台全局默认模型单一权威源守护:entrypoint.ts(runtime 镜像里本地常量,无法 import master src)
+// 必须与 master 侧 platformDefaults.ts 的 PLATFORM_DEFAULT_MODEL/PROVIDER 一致。改一处忘改另一处 → 这里 fail。
+describe("platform default model — entrypoint ↔ platformDefaults 一致性", () => {
+  function extractConst(src: string, name: string): string {
+    const m = src.match(new RegExp(`${name}\\s*=\\s*"([^"]+)"`));
+    if (!m) throw new Error(`${name} not found in entrypoint.ts`);
+    return m[1];
+  }
+
+  test("entrypoint COMMERCIAL_DEFAULT_MODEL/PROVIDER == platformDefaults 常量", async () => {
+    const src = readFileSync(ENTRYPOINT_TS_PATH, "utf-8");
+    const epModel = extractConst(src, "COMMERCIAL_DEFAULT_MODEL");
+    const epProvider = extractConst(src, "COMMERCIAL_DEFAULT_PROVIDER");
+
+    const { PLATFORM_DEFAULT_MODEL, PLATFORM_DEFAULT_PROVIDER } = await import(
+      "../platformDefaults.js"
+    );
+
+    assert.equal(
+      epModel,
+      PLATFORM_DEFAULT_MODEL,
+      "entrypoint.ts COMMERCIAL_DEFAULT_MODEL 与 platformDefaults.PLATFORM_DEFAULT_MODEL 漂移 —— 两处都要改",
+    );
+    assert.equal(
+      epProvider,
+      PLATFORM_DEFAULT_PROVIDER,
+      "entrypoint.ts COMMERCIAL_DEFAULT_PROVIDER 与 platformDefaults.PLATFORM_DEFAULT_PROVIDER 漂移",
+    );
+    // 当前期望值(2026-06-15 起 glm-5.1 / ark)
+    assert.equal(PLATFORM_DEFAULT_MODEL, "glm-5.1");
+    assert.equal(PLATFORM_DEFAULT_PROVIDER, "ark");
   });
 });

@@ -12,7 +12,7 @@
  *   5b) strategy.authorize(role + grants + canUseModel)
  *   5c) selectUpstreamRoute + validateUpstreamConfig
  *   6) preCheckWithCost(estimated_input + max_output)
- *   7) pickUpstream(scheduler.pick + refresh / DeepSeek 合成 session)
+ *   7) pickUpstream(scheduler.pick + refresh / 静态 key 合成 session)
  *   8) startInflightJournal(case (c) release ownership 在这里 fail-only)
  *   9) makeFinalizer(从此 release 唯一调用点 = finalize)
  *
@@ -48,6 +48,7 @@ import {
   validateUpstreamConfig,
   type PreparedUpstreamSession,
 } from "./upstream.js";
+import { STATIC_PROVIDER_META } from "./staticProviderMeta.js";
 import {
   incrAnthropicProxyReject,
   incrPrecheckCapped,
@@ -65,7 +66,6 @@ import {
   DEFAULT_PROXY_RATE_LIMIT,
   DEFAULT_MAX_CONCURRENT_PER_UID,
   MAX_BODY_BYTES_DEFAULT,
-  MINIMAX_M3_MAX_INPUT_TOKENS,
   proxyBodySchema,
   enforceFieldByteBudgets,
   estimateInputTokens,
@@ -290,38 +290,28 @@ export function makeAnthropicProxyHandler(
 
       // 5c) Upstream route 选择 + 配置早拒绝(2026-05-18 Phase 3 §3.4 切出)。
       //
-      // **必须在 preCheck 之前**:deepseek 路由缺 key 直接 503,不能 reserve credits 再 rollback。
+      // **必须在 preCheck 之前**:静态 provider 路由缺 key 直接 503,不能 reserve credits 再 rollback。
       // 详见 `proxy/upstream.ts` selectUpstreamRoute / validateUpstreamConfig 注释 + plan 行为锁。
       const route = selectUpstreamRoute(body.model);
       const cfgErr = validateUpstreamConfig(route, {
-        deepseekApiKey: deps.deepseekApiKey,
-        minimaxTokenPlanKey: deps.minimaxTokenPlanKey,
+        staticProviderKeys: deps.staticProviderKeys,
       });
       if (cfgErr) {
-        switch (cfgErr.kind) {
-          case "deepseek_not_configured":
-            userLog.warn("proxy_deepseek_not_configured", { model: body.model });
-            incrAnthropicProxyReject("deepseek_config");
-            sendJsonError(
-              res,
-              503,
-              "DEEPSEEK_NOT_CONFIGURED",
-              "deepseek upstream not configured",
-              requestId,
-            );
-            return;
-          case "minimax_not_configured":
-            userLog.warn("proxy_minimax_not_configured", { model: body.model });
-            incrAnthropicProxyReject("minimax_config");
-            sendJsonError(
-              res,
-              503,
-              "MINIMAX_NOT_CONFIGURED",
-              "minimax upstream not configured",
-              requestId,
-            );
-            return;
-        }
+        // cfgErr.kind === "static_not_configured" —— 由 provider 的 commercial 语义映射决定
+        // 503 错误码 + reject metric(deepseek/minimax/ark 各自一套，新增 provider 零改本处)。
+        const meta = STATIC_PROVIDER_META[cfgErr.providerId];
+        userLog.warn("proxy_static_provider_not_configured", {
+          provider: cfgErr.providerId,
+          model: body.model,
+        });
+        incrAnthropicProxyReject(meta.rejectMetricLabel);
+        sendJsonError(
+          res,
+          503,
+          meta.notConfiguredHttpCode,
+          `${cfgErr.providerId} upstream not configured`,
+          requestId,
+        );
         return;
       }
 
@@ -330,9 +320,9 @@ export function makeAnthropicProxyHandler(
       // 已整合删除)。
       //
       // 仅"外接 ApiKey 路径(containerId===null)+ OAuth 上游(route.kind==='oauth')"
-      // 双重命中才走。容器路径(containerId !== null)/ DeepSeek 路径(route.kind ===
-      // 'deepseek')绝不触发 —— 容器内 CCB 已构造好 body,deepseek 用独立 API key 无
-      // OAuth 池无 anti-abuse 反风控,任一注入只浪费 token 或破坏既有缓存。
+      // 双重命中才走。容器路径(containerId !== null)/ 静态 key 路径(route.kind==='static',
+      // deepseek/minimax/ark)绝不触发 —— 容器内 CCB 已构造好 body,静态 provider 用独立 API key
+      // 无 OAuth 池无 anti-abuse 反风控,任一注入只浪费 token 或破坏既有缓存。
       //
       // **必须在 `estimateInputTokens(body)` 之前** + `selectUpstreamRoute` 之后
       // (Phase 7 §3.5.2 行为锁):注入的 sysprompt prefix + platform context
@@ -382,11 +372,19 @@ export function makeAnthropicProxyHandler(
 
       // 6) 双侧 cost 估算 + preCheck(原子预留:Lua 一次完成 余额比对 + 写入)
       const inputTokens = estimateInputTokens(body);
-      if (route.kind === "minimax" && inputTokens > MINIMAX_M3_MAX_INPUT_TOKENS) {
-        userLog.warn("proxy_minimax_input_tokens_too_large", {
+      // 静态 provider input 上限 guard(注册表 spec.maxInputTokens；deepseek 无 cap=undefined)。
+      // 注意 inputTokens 是 estimateInputTokens 的**估算值**(JSON.length/4，非真 tokenizer)，
+      // 故此 cap 是粗 guardrail：防超模型上下文窗(如 glm-5.1 200k / MiniMax-M3 512k)无声进更贵档。
+      if (
+        route.kind === "static" &&
+        route.provider.maxInputTokens != null &&
+        inputTokens > route.provider.maxInputTokens
+      ) {
+        userLog.warn("proxy_static_provider_input_tokens_too_large", {
+          provider: route.provider.id,
           model: body.model,
           estimatedInputTokens: inputTokens,
-          limit: MINIMAX_M3_MAX_INPUT_TOKENS,
+          limit: route.provider.maxInputTokens,
         });
         incrAnthropicProxyReject("too_large");
         sendJsonError(res, 413, "BODY_FIELD_TOO_LARGE", "request body too large", requestId);
@@ -440,7 +438,7 @@ export function makeAnthropicProxyHandler(
       //   refresh_failed     → 502 UPSTREAM_AUTH_REFRESH_FAILED reject upstream_auth
       //   preparation_failed → 502 UPSTREAM_PREPARATION_FAILED  reject upstream_auth
       //
-      // DeepSeek 路径:pickUpstream 直接合成 session(无 pool 访问)。
+      // 静态 key 路径(route.kind==='static'):pickUpstream 直接合成 session(无 pool 访问)。
       // v3 反关联根治 UX 闭环 — 解析客户端 force_repin 头:
       //   `x-force-repin: 1` → 客户端在收到 409 SessionPinUnbound 后选择"保留对话历史"
       //   路径,要求 scheduler 在同 session 上覆盖原 unbound pin 选新账号。仅在
@@ -456,8 +454,7 @@ export function makeAnthropicProxyHandler(
         {
           scheduler: deps.scheduler,
           refreshDeps: deps.refreshDeps,
-          deepseekApiKey: deps.deepseekApiKey,
-          minimaxTokenPlanKey: deps.minimaxTokenPlanKey,
+          staticProviderKeys: deps.staticProviderKeys,
           upstreamEndpoint: deps.upstreamEndpoint,
           // Phase 6 account_uuid 锚定 flag(plan §3.0)— v1.0.207 起从 system_settings
           // 表读取的 getter,handler 透传给 pickUpstream;入口 await 一次冻结到

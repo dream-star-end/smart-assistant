@@ -1,0 +1,29 @@
+{
+  "_comment": "静态 key 文本 provider 跨包一致性快照。CANONICAL 路由元数据源 = packages/protocol/src/staticKeyProviders.ts；CCB 本地镜像 = claude-code-best/src/utils/model/staticKeyModels.ts。protocol 测试断言 protocol-owned 字段(id/inboundModelIds/maxInputTokens/upstreamEndpoint)，CCB 测试断言 CCB-owned 字段(capabilityZero/contextWindow)。任一侧改了 provider 集或这些值而未同步本快照 → 测试 fail。",
+  "providers": [
+    {
+      "id": "deepseek",
+      "inboundModelIds": ["deepseek-v4-flash", "deepseek-v4-pro"],
+      "maxInputTokens": null,
+      "upstreamEndpoint": "https://api.deepseek.com/anthropic/v1/messages",
+      "capabilityZero": false,
+      "contextWindow": null
+    },
+    {
+      "id": "minimax",
+      "inboundModelIds": ["MiniMax-M3"],
+      "maxInputTokens": 512000,
+      "upstreamEndpoint": "https://api.minimaxi.com/anthropic/v1/messages",
+      "capabilityZero": true,
+      "contextWindow": 512000
+    },
+    {
+      "id": "ark",
+      "inboundModelIds": ["glm-5.1"],
+      "maxInputTokens": 200000,
+      "upstreamEndpoint": "https://ark.cn-beijing.volces.com/api/coding/v1/messages",
+      "capabilityZero": true,
+      "contextWindow": 200000
+    }
+  ]
+}

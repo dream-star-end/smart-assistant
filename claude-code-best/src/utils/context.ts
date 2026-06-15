@@ -5,7 +5,7 @@ import { isEnvTruthy } from './envUtils.js'
 import { getCanonicalName } from './model/model.js'
 import { resolveAntModel } from './model/antModels.js'
 import { getModelCapability } from './model/modelCapabilities.js'
-import { isMiniMaxM3Model } from './model/minimax.js'
+import { getStaticModelContextWindow } from './model/staticKeyModels.js'
 
 // Model context window size (200k tokens for all models right now)
 export const MODEL_CONTEXT_WINDOW_DEFAULT = 200_000
@@ -73,12 +73,12 @@ export function getContextWindowForModel(
     return 1_000_000
   }
 
-  // Commercial v3 MiniMax-M3 Token Plan: standard tier supports <=512k input
-  // tokens. Keep this as an internal context/auto-compact limit rather than a
-  // user-facing model label so normal users don't see a guardrail unless they
-  // deliberately bypass the UI and send an oversized raw request.
-  if (isMiniMaxM3Model(model)) {
-    return 512_000
+  // Commercial v3 静态 key provider context/auto-compact 上限(MiniMax-M3=512k、
+  // Ark glm-5.1=200k)。作为内部 guardrail 而非 user-facing label,普通用户看不到,除非
+  // 绕过 UI 发超大 raw request。deepseek 不在此表 → 落 MODEL_CONTEXT_WINDOW_DEFAULT(等价现状)。
+  const staticCtx = getStaticModelContextWindow(model)
+  if (staticCtx !== undefined) {
+    return staticCtx
   }
 
   const cap = getModelCapability(model)

@@ -35,6 +35,7 @@ import {
   type Peer,
   newTraceId,
   parseTraceIdCandidate,
+  STATIC_KEY_INBOUND_MODEL_IDS,
 } from '@openclaude/protocol'
 import { classifyDelegateOutputError, classifyRunError } from './errorClassify.js'
 import {
@@ -152,14 +153,17 @@ const WECHAT_FINAL_EMPTY_TEXT =
  *     在 claude-subscription agent 上跑就够,不需要切 agent
  *   - MiniMax-M3 — master 侧切到 MiniMax Token Plan Anthropic 兼容端点,
  *     同样跑 claude-subscription/non-codex agent,不进 codex-native
+ *   - glm-5.1 — master 侧切到火山方舟 Ark Coding Plan Anthropic 兼容端点,同 non-codex,
+ *     且是**平台全局默认模型**
+ *
+ * 静态 key 文本 provider 的字面量(deepseek-v4-flash/pro, MiniMax-M3, glm-5.1)从
+ * @openclaude/protocol 注册表 STATIC_KEY_INBOUND_MODEL_IDS 注入,新增 provider 零改本处。
  */
 export const ALLOWED_INBOUND_MODELS = new Set([
   'claude-opus-4-7',
   'claude-sonnet-4-6',
   'gpt-5.5',
-  'deepseek-v4-flash',
-  'deepseek-v4-pro',
-  'MiniMax-M3',
+  ...STATIC_KEY_INBOUND_MODEL_IDS,
 ])
 
 /** Mirror SubprocessRunner's MCP merge rules for prompt/upload hints.

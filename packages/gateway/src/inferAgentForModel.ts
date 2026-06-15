@@ -1,4 +1,5 @@
 import type { AgentDef } from '@openclaude/storage'
+import { findRouteProviderForModel } from '@openclaude/protocol'
 
 /**
  * Pure routing helper: given an inbound model id and requested agent id,
@@ -47,16 +48,11 @@ function isClaudeModel(model: string): boolean {
   return /^claude-/.test(model)
 }
 
-function isDeepseekModel(model: string): boolean {
-  return /^deepseek-/.test(model)
-}
-
-function isMiniMaxModel(model: string): boolean {
-  return model.toLowerCase() === 'minimax-m3'
-}
-
 function isNonCodexModel(model: string): boolean {
-  return isClaudeModel(model) || isDeepseekModel(model) || isMiniMaxModel(model)
+  // 静态 key 文本 provider(deepseek/minimax/ark[glm-5.1])一律 non-codex,跑 claude-subscription
+  // 类 agent。判定走 @openclaude/protocol 注册表 matchesRoute(deepseek 大小写敏感前缀、
+  // minimax/ark 精确),与历史 /^deepseek-/ + minimax-m3 逐字节等价,新增 provider 零改本处。
+  return isClaudeModel(model) || findRouteProviderForModel(model) !== undefined
 }
 
 function isCodexNative(agent: AgentDef | undefined): boolean {

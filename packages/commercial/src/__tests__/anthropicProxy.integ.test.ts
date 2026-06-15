@@ -639,7 +639,8 @@ function buildHarness(opts: HarnessOpts = {}) {
     upstreamEndpoint: "https://upstream.test/v1/messages",
     refreshDeps,
     logger: testLogger,
-    deepseekApiKey: opts.deepseekApiKey,
+    // 静态 provider key:harness 只注入 deepseek(测试只覆盖 deepseek+claude),保持现有 scope。
+    staticProviderKeys: { deepseek: opts.deepseekApiKey },
     appendCostCredits: opts.appendCostCreditsImpl
       ?? (async (requestId, userIdArg, costCredits) => {
         appendCostCreditsCalls.push({ requestId, userId: userIdArg, costCredits });

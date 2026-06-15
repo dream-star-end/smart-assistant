@@ -81,6 +81,8 @@ describe('SubprocessRunner.model getter / setModel', () => {
     assert.ok(ALLOWED_INBOUND_MODELS.has('deepseek-v4-pro'))
     // MiniMax-M3 Token Plan anthropic-compatible 上游:
     assert.ok(ALLOWED_INBOUND_MODELS.has('MiniMax-M3'))
+    // glm-5.1 火山方舟 Ark Coding Plan anthropic-compatible 上游(平台全局默认模型):
+    assert.ok(ALLOWED_INBOUND_MODELS.has('glm-5.1'))
   })
 
   it('ALLOWED_INBOUND_MODELS rejects bogus / typo model ids', () => {
@@ -142,6 +144,23 @@ describe('SubprocessRunner static-provider small-fast model env', () => {
     })
     assert.deepEqual(_buildStaticProviderSmallFastModelEnv('deepseek-v4-pro'), {
       ANTHROPIC_SMALL_FAST_MODEL: 'deepseek-v4-pro',
+    })
+  })
+
+  it('pins Ark glm-5.1 hidden secondary calls to glm-5.1', () => {
+    assert.deepEqual(_buildStaticProviderSmallFastModelEnv('glm-5.1'), {
+      ANTHROPIC_SMALL_FAST_MODEL: 'glm-5.1',
+    })
+    assert.deepEqual(_buildStaticProviderSmallFastModelEnv('GLM-5.1'), {
+      ANTHROPIC_SMALL_FAST_MODEL: 'GLM-5.1',
+    })
+  })
+
+  it('small-fast 匹配大小写不敏感(等价回归:不复用 case-sensitive route matcher)', () => {
+    // 故意保留本地 case-insensitive 逻辑:DeepSeek-v4-pro(大写 D)仍命中 pin。
+    // 若误用 protocol route matcher(deepseek 大小写敏感),这条会从 pin 变不 pin。
+    assert.deepEqual(_buildStaticProviderSmallFastModelEnv('DeepSeek-v4-pro'), {
+      ANTHROPIC_SMALL_FAST_MODEL: 'DeepSeek-v4-pro',
     })
   })
 

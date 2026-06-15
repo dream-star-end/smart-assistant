@@ -433,6 +433,20 @@ export const commercialConfigSchema = z
      */
     MINIMAX_TOKEN_PLAN_KEY: z.string().trim().min(1).max(512).optional(),
     /**
+     * 火山方舟 Ark Coding Plan key(2026-06-15 接入)。默认模型 glm-5.1，且 glm-5.1 是
+     * **平台全局默认模型**(见 platformDefaults.ts / entrypoint COMMERCIAL_DEFAULT_MODEL)。
+     * - 配置时 anthropicProxy 收到 model 命中 ark(glm-5.1) 的请求 → forward 到
+     *   https://ark.cn-beijing.volces.com/api/coding/v1/messages,Authorization: Bearer
+     *   <ARK_CODING_PLAN_KEY>;不占 claude_accounts 池
+     * - key 只在 master 进程环境变量中存在,**绝不注入用户容器**(用户容器只拿 oc-v3 container bearer)
+     * - 未配置 → 命中 glm-5.1 的文本路由 503 ARK_NOT_CONFIGURED + reject 'ark_config'
+     * - **因 glm-5.1 是全局默认模型**:master 装配 internal proxy 的启动路径会硬校验本 key 存在,
+     *   缺失则**拒绝启动**(loud fail，避免全员默认模型静默 503)。故部署须先写 prod env 再 rollout。
+     * - 不入 git;由 systemd EnvironmentFile 注入。**用户已在聊天里暴露过的 key 上线前必须在火山方舟
+     *   控制台旋转后再写入生产 env。**
+     */
+    ARK_CODING_PLAN_KEY: z.string().trim().min(1).max(512).optional(),
+    /**
      * Platform HMAC secret(Phase 5 envelope rewriter,2026-05-21)。
      *
      * 用途:HMAC-SHA256(secret, "fp3:"|userId)派生外接 ApiKey 路径 outbound envelope

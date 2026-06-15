@@ -336,3 +336,19 @@ describe("MiniMax-M3 effort support", () => {
     if (saved !== undefined) process.env.CLAUDE_CODE_EFFORT_LEVEL = saved;
   });
 });
+
+// glm-5.1(Ark)与 MiniMax-M3 同属"firstParty 能力全关"静态模型集
+// (isCapabilityZeroStaticModel),effort 全部不生成。**注意 deepseek 不在此集**:
+// deepseek-v4-pro 的 effort=max 仍保留(见上方 "modelSupportsMaxEffort — deepseek-v4" 测试)。
+describe("glm-5.1 (Ark) effort support", () => {
+  test("does not advertise or send effort parameters (大小写不敏感)", () => {
+    const saved = process.env.CLAUDE_CODE_EFFORT_LEVEL;
+    delete process.env.CLAUDE_CODE_EFFORT_LEVEL;
+    for (const m of ["glm-5.1", "GLM-5.1"]) {
+      expect(modelSupportsEffort(m)).toBe(false);
+      expect(modelSupportsMaxEffort(m)).toBe(false);
+      expect(resolveAppliedEffort(m, "max")).toBeUndefined();
+    }
+    if (saved !== undefined) process.env.CLAUDE_CODE_EFFORT_LEVEL = saved;
+  });
+});

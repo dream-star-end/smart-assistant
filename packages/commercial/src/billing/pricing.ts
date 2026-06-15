@@ -19,6 +19,7 @@
  */
 
 import { Client } from "pg";
+import { STATIC_KEY_PROVIDERS } from "@openclaude/protocol";
 import { query } from "../db/queries.js";
 import { loadConfig } from "../config.js";
 
@@ -170,10 +171,17 @@ const CANONICAL_MODEL_IDS = [
  * 这类前缀垃圾输入被误匹配。
  *
  * 未识别(非 4.x 系列 / 未列入)→ 原样返回,让上层 `get()` 自然 miss → null。
+ *
+ * 静态 key provider(minimax/ark)的归一委托给 @openclaude/protocol 注册表 canonicalizeForPricing:
+ * minimax→"MiniMax-M3"、ark(glm-5.1)→"glm-5.1";deepseek 恒返回 null(原样透传,与历史一致 — deepseek
+ * 不在 DB canonical 短名表里,靠原样 model_id 直查)。新增静态 provider 零改本函数。
  */
 export function canonicalizeModelId(modelId: string): string {
+  for (const provider of STATIC_KEY_PROVIDERS) {
+    const canonical = provider.canonicalizeForPricing(modelId);
+    if (canonical) return canonical;
+  }
   const name = modelId.toLowerCase();
-  if (name === "minimax-m3") return "MiniMax-M3";
   return CANONICAL_MODEL_IDS.find((id) => name === id || name.startsWith(`${id}-`)) ?? modelId;
 }
 

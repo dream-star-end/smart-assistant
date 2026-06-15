@@ -7,7 +7,7 @@ import { get3PModelCapabilityOverride } from './model/modelSupportOverrides.js'
 import { getAPIProvider } from './model/providers.js'
 import { getSettingsWithErrors } from './settings/settings.js'
 import { resolveAntModel } from './model/antModels.js'
-import { isMiniMaxM3Model } from './model/minimax.js'
+import { isCapabilityZeroStaticModel } from './model/staticKeyModels.js'
 
 export type ThinkingConfig =
   | { type: 'adaptive' }
@@ -90,7 +90,7 @@ export function getRainbowColor(
 // TODO(inigo): add support for probing unknown models via API error detection
 // Provider-aware thinking support detection (aligns with modelSupportsISP in betas.ts)
 export function modelSupportsThinking(model: string): boolean {
-  if (isMiniMaxM3Model(model)) {
+  if (isCapabilityZeroStaticModel(model)) {
     return false
   }
   const supported3P = get3PModelCapabilityOverride(model, 'thinking')
@@ -116,7 +116,7 @@ export function modelSupportsThinking(model: string): boolean {
 
 // @[MODEL LAUNCH]: Add the new model to the allowlist if it supports adaptive thinking.
 export function modelSupportsAdaptiveThinking(model: string): boolean {
-  if (isMiniMaxM3Model(model)) {
+  if (isCapabilityZeroStaticModel(model)) {
     return false
   }
   const supported3P = get3PModelCapabilityOverride(model, 'adaptive_thinking')

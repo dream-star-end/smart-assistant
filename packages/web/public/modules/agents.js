@@ -16,24 +16,24 @@ export function setRenderModelPill(fn) {
 const COMMERCIAL_FALLBACK_AGENTS = Object.freeze([
   {
     id: 'main',
-    displayName: 'MiniMax M3 助手',
+    displayName: 'GLM-5.1 助手',
     avatarEmoji: '🧠',
-    model: 'MiniMax-M3',
-    provider: 'minimax',
+    model: 'glm-5.1',
+    provider: 'ark',
   },
   {
     id: 'researcher',
     displayName: '资料研究员',
     avatarEmoji: '🔎',
-    model: 'MiniMax-M3',
-    provider: 'minimax',
+    model: 'glm-5.1',
+    provider: 'ark',
   },
   {
     id: 'scientist',
     displayName: '科研分析师',
     avatarEmoji: '🔬',
-    model: 'MiniMax-M3',
-    provider: 'minimax',
+    model: 'glm-5.1',
+    provider: 'ark',
   },
   {
     id: 'coder',
@@ -46,8 +46,8 @@ const COMMERCIAL_FALLBACK_AGENTS = Object.freeze([
     id: 'reviewer',
     displayName: '审阅员',
     avatarEmoji: '🧪',
-    model: 'MiniMax-M3',
-    provider: 'minimax',
+    model: 'glm-5.1',
+    provider: 'ark',
   },
   {
     id: 'codex',

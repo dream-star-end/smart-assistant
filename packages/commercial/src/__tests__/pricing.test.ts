@@ -440,6 +440,18 @@ describe("canonicalizeModelId (边界层防御)", () => {
     assert.equal(canonicalizeModelId("MINIMAX-M3"), "MiniMax-M3");
   });
 
+  test("glm-5.1(Ark)normalizes case to lowercase DB canonical id", () => {
+    assert.equal(canonicalizeModelId("glm-5.1"), "glm-5.1");
+    assert.equal(canonicalizeModelId("GLM-5.1"), "glm-5.1");
+    assert.equal(canonicalizeModelId("Glm-5.1"), "glm-5.1");
+  });
+
+  test("deepseek 原样透传(不经 registry 归一,与历史等价)", () => {
+    // deepseek.canonicalizeForPricing 恒 null → 不改写,靠原样 model_id 直查 DB。
+    assert.equal(canonicalizeModelId("deepseek-v4-pro"), "deepseek-v4-pro");
+    assert.equal(canonicalizeModelId("deepseek-v4-flash"), "deepseek-v4-flash");
+  });
+
   test("uppercase input is normalized to lowercase canonical", () => {
     assert.equal(
       canonicalizeModelId("CLAUDE-HAIKU-4-5-20251001"),

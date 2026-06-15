@@ -27,7 +27,7 @@ import { isEnvDefinedFalsy, isEnvTruthy } from './envUtils.js'
 import { getCanonicalName } from './model/model.js'
 import { get3PModelCapabilityOverride } from './model/modelSupportOverrides.js'
 import { getAPIProvider } from './model/providers.js'
-import { isMiniMaxM3Model } from './model/minimax.js'
+import { isCapabilityZeroStaticModel } from './model/staticKeyModels.js'
 import { getInitialSettings } from './settings/settings.js'
 
 /**
@@ -90,7 +90,7 @@ export function filterAllowedSdkBetas(
 // however out of an abundance of caution, we do not enable any which are behind an experiment
 
 export function modelSupportsISP(model: string): boolean {
-  if (isMiniMaxM3Model(model)) {
+  if (isCapabilityZeroStaticModel(model)) {
     return false
   }
   const supported3P = get3PModelCapabilityOverride(
@@ -126,7 +126,7 @@ function vertexModelSupportsWebSearch(model: string): boolean {
 
 // Context management is supported on Claude 4+ models
 export function modelSupportsContextManagement(model: string): boolean {
-  if (isMiniMaxM3Model(model)) {
+  if (isCapabilityZeroStaticModel(model)) {
     return false
   }
   const canonical = getCanonicalName(model)
@@ -146,7 +146,7 @@ export function modelSupportsContextManagement(model: string): boolean {
 
 // @[MODEL LAUNCH]: Add the new model ID to this list if it supports structured outputs.
 export function modelSupportsStructuredOutputs(model: string): boolean {
-  if (isMiniMaxM3Model(model)) {
+  if (isCapabilityZeroStaticModel(model)) {
     return false
   }
   const canonical = getCanonicalName(model)

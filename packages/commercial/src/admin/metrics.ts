@@ -378,6 +378,7 @@ export const anthropicProxySettle = new Counter({
  *   - bad_headers     header allowlist 失败
  *   - upstream_auth   refresh token 失败
  *   - minimax_config  MiniMax-M3 命中但 MINIMAX_TOKEN_PLAN_KEY 未配置
+ *   - ark_config      glm-5.1 命中但 ARK_CODING_PLAN_KEY 未配置
  */
 export const anthropicProxyReject = new Counter({
   name: "anthropic_proxy_reject_total",
@@ -521,6 +522,8 @@ export type ProxyRejectReason =
   | "upstream_auth"
   | "deepseek_config"
   | "minimax_config"
+  // glm-5.1 命中但 ARK_CODING_PLAN_KEY 未配置(火山方舟 Coding Plan 文本路由 503)
+  | "ark_config"
   // Phase 5 platform envelope rewriter:**handler-level** deps.platformContextLoader
   // 或 deps.platformServerSecret 任一为 undefined,external ApiKey 触发条件命中时
   // fail-closed 返 503 PLATFORM_ENVELOPE_UNAVAILABLE。

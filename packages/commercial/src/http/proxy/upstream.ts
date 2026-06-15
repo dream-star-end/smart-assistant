@@ -6,7 +6,7 @@
  * 把 handler 主流程里"upstream 选择 + dispatcher + refresh + 头注入 + body sanitize +
  * device_id pin + token 零化"等散落跨度收敛进:
  *
- *   - `selectUpstreamRoute(model)`     —— preCheck 前的纯路由判定(deepseek/minimax/oauth)
+ *   - `selectUpstreamRoute(model)`     —— preCheck 前的纯路由判定(static[deepseek/minimax/ark]/oauth)
  *   - `validateUpstreamConfig(...)`    —— preCheck 前的轻校验(静态 API key 缺失)
  *   - `pickUpstream(deps, body, route, log)` —— preCheck **后**的真正 session 形成
  *   - `PreparedUpstreamSession`        —— 完整 session 接口:OAuth pool / DeepSeek / MiniMax
@@ -56,11 +56,17 @@ import {
   resolveAccountEgressDispatcher,
 } from "../../account-pool/egressDispatcher.js";
 import {
+  findRouteProviderForModel,
+  type StaticKeyProviderSpec,
+  type StaticProviderId,
+  type StaticProviderKeys,
+} from "@openclaude/protocol";
+
+// 历史导入兼容:StaticProviderKeys 已上移到 @openclaude/protocol,这里 re-export 供仍从
+// upstream.js 取该类型的 caller/测试使用。
+export type { StaticProviderKeys };
+import {
   DEFAULT_UPSTREAM_ENDPOINT,
-  DEEPSEEK_UPSTREAM_ENDPOINT,
-  MINIMAX_UPSTREAM_ENDPOINT,
-  isDeepseekModel,
-  isMiniMaxM3Model,
   extractSessionId,
   injectPersonaHeaders,
   isUuidLike,
@@ -74,43 +80,39 @@ import {
 
 export type UpstreamRoute =
   | { kind: "oauth" }
-  | { kind: "deepseek" }
-  | { kind: "minimax" };
+  | { kind: "static"; provider: StaticKeyProviderSpec };
 
 /**
  * 纯函数,基于 model 决定走哪条 upstream。**preCheck 前**调用。
  *
- * isDeepseekModel(model) 命中 → deepseek;MiniMax-M3 → minimax;否则 oauth。
+ * 命中任一静态 key provider(@openclaude/protocol 注册表的 matchesRoute) → static;否则 oauth。
+ * deepseek 大小写敏感前缀 / minimax,ark 精确(大小写不敏感) —— 判定逻辑在注册表里,与现状逐字节等价。
  */
 export function selectUpstreamRoute(model: string): UpstreamRoute {
-  if (isMiniMaxM3Model(model)) return { kind: "minimax" };
-  return isDeepseekModel(model) ? { kind: "deepseek" } : { kind: "oauth" };
+  const provider = findRouteProviderForModel(model);
+  return provider ? { kind: "static", provider } : { kind: "oauth" };
 }
 
 /**
  * 路由配置错误:静态 API-key upstream 未配置。
  *
- * handler 拿到后映射:503 + 对应结构化 log + reject metric。
+ * handler 拿到后映射:503(STATIC_PROVIDER_META[providerId].notConfiguredHttpCode)
+ * + 对应结构化 log + reject metric。
  */
-export type ConfigError =
-  | { kind: "deepseek_not_configured" }
-  | { kind: "minimax_not_configured" };
+export type ConfigError = { kind: "static_not_configured"; providerId: StaticProviderId };
 
 /**
  * preCheck **前**调:路由级早拒绝。返回 null 表示该路由当前部署可走。
  *
- * 行为锁(对应原 handler L1262-1272):deepseek 缺 key 必须**在 preCheck 之前**返回,
+ * 行为锁(对应原 handler L1262-1272):静态 provider 缺 key 必须**在 preCheck 之前**返回,
  * 不能让请求先 reserve credits 再 rollback。
  */
 export function validateUpstreamConfig(
   route: UpstreamRoute,
-  deps: { deepseekApiKey?: string; minimaxTokenPlanKey?: string },
+  deps: { staticProviderKeys?: StaticProviderKeys },
 ): ConfigError | null {
-  if (route.kind === "deepseek" && !deps.deepseekApiKey) {
-    return { kind: "deepseek_not_configured" };
-  }
-  if (route.kind === "minimax" && !deps.minimaxTokenPlanKey) {
-    return { kind: "minimax_not_configured" };
+  if (route.kind === "static" && !deps.staticProviderKeys?.[route.provider.id]) {
+    return { kind: "static_not_configured", providerId: route.provider.id };
   }
   return null;
 }
@@ -126,15 +128,15 @@ export function validateUpstreamConfig(
  *   - `zeroizeSecrets` mutate 内部持有的 token / refresh Buffer,idempotent
  */
 export interface PreparedUpstreamSession {
-  /** account_pool account_id;`null` = DeepSeek 路径(无 OAuth 池) */
+  /** account_pool account_id;`null` = 静态 key 路径(deepseek/minimax/ark,无 OAuth 池) */
   readonly accountId: bigint | null;
-  /** 反风控锚定 device_id;`null` = DeepSeek */
+  /** 反风控锚定 device_id;`null` = 静态 key 路径 */
   readonly pinnedUserId: string | null;
-  /** 上游 URL;OAuth = `deps.upstreamEndpoint ?? DEFAULT`;DeepSeek = `DEEPSEEK_UPSTREAM_ENDPOINT` */
+  /** 上游 URL;OAuth = `deps.upstreamEndpoint ?? DEFAULT`;静态 = `spec.upstreamEndpoint` */
   readonly endpoint: string;
-  /** undici dispatcher;OAuth 绑账号 egress IP;DeepSeek = undefined(默认出口) */
+  /** undici dispatcher;OAuth 绑账号 egress IP;静态 = undefined(默认出口) */
   readonly dispatcher: Dispatcher | undefined;
-  /** 上游响应是否值得抓 quota(OAuth=true;DeepSeek=false) */
+  /** 上游响应是否值得抓 quota(OAuth=true;静态=false) */
   readonly shouldUpdateQuotaFromResponse: boolean;
 
   /**
@@ -146,13 +148,14 @@ export interface PreparedUpstreamSession {
    *   - `body.metadata.user_id` rewrite via `rewriteMetadataDeviceId`(pinned hex 合法时);
    *     pinned schema breach 时 fail-open + log.warn `pinned_user_id_invariant_breach`。
    *
-   * DeepSeek:
-   *   - `safeHeaders.authorization = Bearer ${deepseekApiKey}`
-   *   - `delete safeHeaders["anthropic-beta"]`(DeepSeek 兼容端点不识别该头)
-   *   - 不动 body.metadata
+   * 静态 key(deepseek/minimax/ark,见 makeStaticKeyUpstream):
+   *   - `safeHeaders.authorization = Bearer ${apiKey}`
+   *   - `delete` spec.stripHeaders(永含 `anthropic-beta`,第三方兼容端点不识别该头)
+   *   - `delete` spec.stripBodyFields(firstParty-only 字段;deepseek 无,minimax/ark 有 4 个)
+   *   - 不动 body.metadata、不注入 oauth beta
    *
    * @param safeHeaders 已经过 `buildSafeUpstreamHeaders` 白名单的 fetch headers,mutate in-place
-   * @param body fetch body 的解析后视图;OAuth path 可能 mutate `body.metadata`
+   * @param body fetch body 的解析后视图;OAuth path 可能 mutate `body.metadata`;静态 path 可能 strip body 字段
    * @param log scoped logger(uid/containerId 等已 child)
    */
   applyUpstreamAuth(
@@ -166,7 +169,7 @@ export interface PreparedUpstreamSession {
    *
    * OAuth:`stripMalformedThinkingBlocks` 清掉 signature 不足的 thinking / redacted_thinking
    *        block(Anthropic 风控会拒)。strip > 0 → log.warn `proxy_malformed_thinking_blocks_stripped`。
-   * DeepSeek:返回原引用(DeepSeek 兼容端点不校验 Anthropic signature,strip 无收益)。
+   * 静态 key:返回原引用(第三方兼容端点不校验 Anthropic signature,strip 无收益)。
    */
   sanitizeMessages(messages: unknown[], model: string, log: Logger): unknown[];
 
@@ -175,7 +178,7 @@ export interface PreparedUpstreamSession {
    * 失败路径上游层也会调,二次调用安全。
    *
    * OAuth:`pick.token.fill(0)` + `pick.refresh?.fill(0)`(若 refresh 不为 null)。
-   * DeepSeek:noop(`deepseekApiKey` 是配置注入,生命周期归配置不归 session)。
+   * 静态 key:noop(apiKey 是配置注入,生命周期归配置不归 session)。
    */
   zeroizeSecrets(): void;
 }
@@ -214,10 +217,11 @@ export interface PickUpstreamDeps {
   scheduler: Pick<AccountScheduler, "pick" | "release">;
   /** refreshAccountToken 内部 http+pg 依赖。undefined → 即使到期也不刷(测试场景)。 */
   refreshDeps?: RefreshDeps;
-  /** DeepSeek 静态 API key;production 由 wiring 从 config 注入。OAuth route 不消费。 */
-  deepseekApiKey?: string;
-  /** MiniMax Token Plan key;production 由 systemd env 注入。OAuth/DeepSeek route 不消费。 */
-  minimaxTokenPlanKey?: string;
+  /**
+   * 静态 key provider 的 key 解析表(deepseek/minimax/ark)。production 由 wiring 从 config 注入,
+   * 各装配点可只注入自己支持的子集(如 external API-key proxy 只放 deepseek)。OAuth route 不消费。
+   */
+  staticProviderKeys?: StaticProviderKeys;
   /** OAuth 上游 URL 覆盖;undefined → DEFAULT_UPSTREAM_ENDPOINT。测试 seam。 */
   upstreamEndpoint?: string;
   /**
@@ -279,53 +283,43 @@ type Phase6AccountUuidEnforce = "off" | "fail_open" | "fail_closed";
 // 也走 pickUpstream(plan Codex round 1 反馈:测试覆盖统一走 pickUpstream,避免测试触达
 // 内部工厂导致"抽象信号"与"被测内部"边界混淆)。
 
-function makeDeepSeekUpstream(apiKey: string): PreparedUpstreamSession {
+/**
+ * 泛化静态 key upstream 工厂。把原 makeDeepSeekUpstream / makeMiniMaxUpstream 收敛为一处:
+ * endpoint / strip 规则全部由 @openclaude/protocol 注册表 spec 驱动,新增 provider 零改本函数。
+ *
+ * 等价保证(与原两工厂逐字节一致):
+ *   - accountId/pinnedUserId=null、dispatcher=undefined、shouldUpdateQuota=false(不占 OAuth 池)
+ *   - applyUpstreamAuth: Authorization Bearer + strip spec.stripHeaders(永含 anthropic-beta)
+ *     + strip spec.stripBodyFields(deepseek:[];minimax/ark:output_config/context_management/
+ *     thinking/service_tier) —— 避免第三方 strict 兼容层报未知 beta/参数
+ *   - 不注入 oauth-2025-04-20、不动 metadata、不做 persona/device_id pin(那些是 OAuth 专属)
+ *   - sanitizeMessages 原样返回、zeroizeSecrets noop(apiKey 来自配置注入,不归 session)
+ */
+function makeStaticKeyUpstream(
+  spec: StaticKeyProviderSpec,
+  apiKey: string,
+): PreparedUpstreamSession {
   return {
     accountId: null,
     pinnedUserId: null,
-    endpoint: DEEPSEEK_UPSTREAM_ENDPOINT,
-    dispatcher: undefined,
-    shouldUpdateQuotaFromResponse: false,
-    applyUpstreamAuth(safeHeaders, _body, _log) {
-      safeHeaders.authorization = `Bearer ${apiKey}`;
-      delete safeHeaders["anthropic-beta"];
-    },
-    sanitizeMessages(messages, _model, _log) {
-      return messages;
-    },
-    zeroizeSecrets() {
-      /* noop: deepseekApiKey 来自配置注入,不归 session */
-    },
-  };
-}
-
-function makeMiniMaxUpstream(apiKey: string): PreparedUpstreamSession {
-  return {
-    accountId: null,
-    pinnedUserId: null,
-    endpoint: MINIMAX_UPSTREAM_ENDPOINT,
+    endpoint: spec.upstreamEndpoint,
     dispatcher: undefined,
     shouldUpdateQuotaFromResponse: false,
     applyUpstreamAuth(safeHeaders, body, _log) {
       safeHeaders.authorization = `Bearer ${apiKey}`;
-      // MiniMax 的 Anthropic 兼容层不需要 Anthropic 私有 beta；CCB 在
-      // firstParty+proxy 形态下会带 interleaved/context/effort 等 beta,
-      // 这里和 DeepSeek 一样 fail-closed strip,避免 strict proxy 报未知 beta。
-      delete safeHeaders["anthropic-beta"];
-      // MiniMax-M3 标准档只接普通 messages 参数。CCB 对 unknown firstParty
-      // model 可能默认带 output_config / context_management / thinking /
-      // service_tier;这些不是用户显式输入的业务内容,strip 后保留核心工具调用
-      // / messages / system,避免上游按高价 priority 或未知参数拒绝。
-      delete body.output_config;
-      delete body.context_management;
-      delete body.thinking;
-      delete body.service_tier;
+      for (const header of spec.stripHeaders) {
+        delete safeHeaders[header];
+      }
+      const mutableBody = body as Record<string, unknown>;
+      for (const field of spec.stripBodyFields) {
+        delete mutableBody[field];
+      }
     },
     sanitizeMessages(messages, _model, _log) {
       return messages;
     },
     zeroizeSecrets() {
-      /* noop: minimaxTokenPlanKey 来自配置注入,不归 session */
+      /* noop: 静态 provider key 来自配置注入,不归 session */
     },
   };
 }
@@ -470,7 +464,7 @@ function makeOAuthPoolUpstream(
  *
  * pool_busy / pool_unavailable(case a)无 account 持有,直接转 PickError 无副作用。
  *
- * DeepSeek / MiniMax 路径:直接返回静态 API-key upstream,无 pool 访问。
+ * 静态 key 路径(route.kind==="static",deepseek/minimax/ark):直接返回静态 API-key upstream,无 pool 访问。
  */
 export async function pickUpstream(
   deps: PickUpstreamDeps,
@@ -480,7 +474,7 @@ export async function pickUpstream(
   /**
    * v3 反关联根治 — 已认证用户 id。csap pin 强制锚定到 (userId, sessionId);
    * runtime flag `session_pin_mode='off'` 时调用方可省略,但建议**始终传**(灰度切到
-   * observe 不需要改 handler)。route='deepseek' 路径完全不消费 — 透传 undefined 安全。
+   * observe 不需要改 handler)。route.kind==="static" 路径完全不消费 — 透传 undefined 安全。
    */
   userId?: bigint,
   /**
@@ -498,15 +492,11 @@ export async function pickUpstream(
   | { ok: true; session: PreparedUpstreamSession }
   | { ok: false; error: PickError }
 > {
-  if (route.kind === "deepseek") {
-    // validateUpstreamConfig 已保证 deepseekApiKey 非空(handler preCheck 前 gate)。
+  if (route.kind === "static") {
+    // validateUpstreamConfig 已保证该 provider 的 key 非空(handler preCheck 前 gate)。
     // 这里若仍 undefined 是 wiring bug — 退化为空字符串 Bearer 比 throw 安全(让上游 401)。
-    return { ok: true, session: makeDeepSeekUpstream(deps.deepseekApiKey ?? "") };
-  }
-  if (route.kind === "minimax") {
-    // validateUpstreamConfig 已保证 minimaxTokenPlanKey 非空(handler preCheck 前 gate)。
-    // 这里若仍 undefined 是 wiring bug — 退化为空字符串 Bearer 比 throw 安全(让上游 401)。
-    return { ok: true, session: makeMiniMaxUpstream(deps.minimaxTokenPlanKey ?? "") };
+    const apiKey = deps.staticProviderKeys?.[route.provider.id] ?? "";
+    return { ok: true, session: makeStaticKeyUpstream(route.provider, apiKey) };
   }
 
   // Phase 6 flag 在 OAuth 路径开头 await 一次,scheduler.pick + makeOAuthPoolUpstream
@@ -818,7 +808,7 @@ export async function pickUpstream(
  *
  * 行为:
  *   - OAuth session(`accountId !== null`)→ `scheduler.release({account_id, result})`
- *   - DeepSeek session(`accountId === null`)→ noop(无 pool 状态可释放)
+ *   - 静态 key session(`accountId === null`,deepseek/minimax/ark)→ noop(无 pool 状态可释放)
  *   - scheduler.release 失败 → 不抛,log `proxy_release_upstream_failed`(原 `.catch(() => {})` + 等价 log)
  *
  * **不**调 `session.zeroizeSecrets()` —— token 生命周期归 session 内部 + handler finally,

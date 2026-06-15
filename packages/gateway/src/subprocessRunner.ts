@@ -86,22 +86,33 @@ export function _buildCcbSpawnTraceEnv(
 }
 
 /**
- * Static-key upstreams (MiniMax / DeepSeek) are selected by commercial master
- * from the request body model and must not consume the OAuth account pool.
+ * Static-key upstreams (MiniMax / DeepSeek / Ark glm-5.1) are selected by
+ * commercial master from the request body model and must not consume the OAuth
+ * account pool.
  *
  * CCB hidden secondary calls (notably WebFetch's applyPromptToMarkdown via
  * queryHaiku/getSmallFastModel, plus a few hook/search helpers) normally use
- * ANTHROPIC_SMALL_FAST_MODEL or fall back to Haiku.  During a MiniMax/DeepSeek
+ * ANTHROPIC_SMALL_FAST_MODEL or fall back to Haiku.  During a static-provider
  * turn that default would become an unrelated Claude OAuth request and can fail
  * with ACCOUNT_POOL_UNAVAILABLE.  Pin the small-fast model to the same static
  * provider model for this subprocess only.
+ *
+ * NOTE: intentionally a **local** case-insensitive match, NOT the protocol
+ * registry's `matchesRoute` (which is case-SENSITIVE for deepseek). Reusing the
+ * route matcher would stop pinning `DeepSeek-v4-pro`-style mixed-case values that
+ * currently pin. Kept case-insensitive for byte-equivalence; see equivalence test
+ * for `DeepSeek-v4-pro` in subprocessRunnerSetters.test.ts.
  */
 export function _buildStaticProviderSmallFastModelEnv(
   model: string | undefined,
 ): Record<string, string> {
   if (!model) return {}
   const normalized = model.toLowerCase()
-  if (normalized === 'minimax-m3' || normalized.startsWith('deepseek-')) {
+  if (
+    normalized === 'minimax-m3' ||
+    normalized.startsWith('deepseek-') ||
+    normalized === 'glm-5.1'
+  ) {
     return { ANTHROPIC_SMALL_FAST_MODEL: model }
   }
   return {}

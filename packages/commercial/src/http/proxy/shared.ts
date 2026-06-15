@@ -29,6 +29,7 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { z } from "zod";
 import type { Pool } from "pg";
+import { getStaticProvider, type StaticProviderKeys } from "@openclaude/protocol";
 
 import { type Logger } from "../../logging/logger.js";
 import {
@@ -65,48 +66,33 @@ export type { Logger };
 /** 上游 endpoint。可被 deps 覆盖(测试)。 */
 export const DEFAULT_UPSTREAM_ENDPOINT = "https://api.anthropic.com/v1/messages";
 
-/**
- * DeepSeek 的 anthropic 兼容端点(2026-05-02 接入)。
- *
- * 命中条件:`body.model.startsWith('deepseek-')`。命中后:
- *   - endpoint 切到这里
- *   - Authorization: Bearer <DEEPSEEK_API_KEY>(deps.deepseekApiKey)
- *   - 跳过 scheduler.pick / refresh / dispatcher / quota(deepseek 用 API key,无 OAuth 池)
- *   - **strip anthropic-beta header** — DeepSeek 文档没列支持哪些 anthropic-beta,
- *     CCB 默认带 effort / task-budgets / redact-thinking 等 ~10 个 beta,strip 避免
- *     未知 beta 被 strict 拒;后续按 deepseek 实际行为再加白名单
- *   - **不注入 oauth-2025-04-20**(那是 anthropic OAuth 账号专用)
- *
- * 1M context 默认开,output 最大 384K(本期 proxy max_tokens schema 仍 cap 200K,
- * 不动;CCB 内默认 max_tokens 远低于 200K,实际不会触发)。
- */
-export const DEEPSEEK_UPSTREAM_ENDPOINT =
-  "https://api.deepseek.com/anthropic/v1/messages";
+// ─── 静态 key provider 常量/匹配器:thin re-export ────────────────────────────
+//
+// 路由元数据(endpoint / matchesRoute / strip / maxInputTokens)的**单一权威源**已上移到
+// @openclaude/protocol 的 STATIC_KEY_PROVIDERS 注册表(commercial+gateway 共享)。
+// 下面这些导出仅为**保护现有 caller**(如 ws/voiceTranscribe.ts import DEEPSEEK_UPSTREAM_ENDPOINT)
+// 而保留的 thin re-export,值从注册表派生、与历史逐字节一致。新代码请直接用注册表。
 
-/** 模型 id 是否走 deepseek 路径。 */
+/**
+ * DeepSeek 的 anthropic 兼容端点。命中 `isDeepseekModel`(大小写敏感前缀)后切到这里,
+ * Bearer <DEEPSEEK_API_KEY>,strip anthropic-beta,不占 OAuth 池。详见注册表 spec。
+ */
+export const DEEPSEEK_UPSTREAM_ENDPOINT = getStaticProvider("deepseek").upstreamEndpoint;
+
+/** 模型 id 是否走 deepseek 路径(大小写敏感前缀 `deepseek-`)。 */
 export function isDeepseekModel(modelId: string): boolean {
-  return modelId.startsWith("deepseek-");
+  return getStaticProvider("deepseek").matchesRoute(modelId);
 }
 
-/**
- * MiniMax Token Plan 的 Anthropic 兼容端点。
- *
- * 官方 Claude Code 文档把 base URL 配成 `https://api.minimaxi.com/anthropic`；
- * 本 proxy/core.ts 持有的是完整 `/v1/messages` endpoint,所以这里补齐 path。
- *
- * 仅精确支持 MiniMax-M3(大小写不敏感匹配,转发仍保留 caller 原 model 字段)。
- * MiniMax-M3 当前只按 <=512k input token 标准档计费；>512k 能力文档标注为
- * 限时限量/需联系销售,本平台不走该档,避免无声进入更贵价格。
- */
-export const MINIMAX_UPSTREAM_ENDPOINT =
-  "https://api.minimaxi.com/anthropic/v1/messages";
+/** MiniMax Token Plan 的 Anthropic 兼容端点(完整 /v1/messages)。 */
+export const MINIMAX_UPSTREAM_ENDPOINT = getStaticProvider("minimax").upstreamEndpoint;
 
 /** MiniMax-M3 只支持 <=512k input tokens 的标准档。 */
-export const MINIMAX_M3_MAX_INPUT_TOKENS = 512_000;
+export const MINIMAX_M3_MAX_INPUT_TOKENS = getStaticProvider("minimax").maxInputTokens ?? 512_000;
 
-/** 模型 id 是否走 MiniMax Token Plan 路径。 */
+/** 模型 id 是否走 MiniMax Token Plan 路径(精确 minimax-m3,大小写不敏感)。 */
 export function isMiniMaxM3Model(modelId: string): boolean {
-  return modelId.toLowerCase() === "minimax-m3";
+  return getStaticProvider("minimax").matchesRoute(modelId);
 }
 
 /** anthropic-version 唯一允许值。OAuth 管理账号路径与 v2 / 个人版一致。 */
@@ -1102,29 +1088,21 @@ export interface AnthropicProxyDeps {
     costCredits: string,
   ) => Promise<unknown>;
   /**
-   * DeepSeek API key(2026-05-02 接入)。
+   * 静态 key 文本 provider(deepseek/minimax/ark)的 key 解析表。
    *
-   * 配置时 anthropicProxy 收到 model 命中 isDeepseekModel() 的请求 → forward 到
-   * DEEPSEEK_UPSTREAM_ENDPOINT,Authorization: Bearer <deepseekApiKey>。
+   * 配置时 anthropicProxy 收到 model 命中某 provider matchesRoute 的请求 → forward 到该 provider
+   * 上游(spec.upstreamEndpoint),Authorization: Bearer <对应 key>,不占 OAuth 池。
    *
-   * 未配置(undefined)→ 命中 deepseek 模型的请求返回 503 +
-   * reject reason `'deepseek_config'`(独立指标,不混入 claude account_pool)。
+   * 某 provider 未配 key → 命中其模型的请求在 preCheck 前返回 503 +
+   * reject reason(STATIC_PROVIDER_META[id].rejectMetricLabel,如 'deepseek_config'/'ark_config')。
    *
-   * 与 process.env.DEEPSEEK_API_KEY 完全解耦:wiring 在 index.ts 显式从
-   * loadConfig().DEEPSEEK_API_KEY 取并注入,proxy 内不读 process.env。
+   * 各装配点可只注入自己支持的子集:internal proxy 注全(deepseek+minimax+ark),external API-key
+   * proxy 只注 deepseek。key 只在 master 进程环境变量中存在,**绝不注入用户容器**,避免商业版用户
+   * 通过 shell/日志拿到平台订阅 key。
+   *
+   * 与 process.env 完全解耦:wiring 在 index.ts 显式从 loadConfig() 取对应字段并注入,proxy 内不读 process.env。
    */
-  deepseekApiKey?: string;
-  /**
-   * MiniMax Token Plan key(2026-06-02 接入)。
-   *
-   * 配置时 anthropicProxy 收到 model=MiniMax-M3 的请求 → forward 到
-   * MINIMAX_UPSTREAM_ENDPOINT,Authorization: Bearer <minimaxTokenPlanKey>。
-   *
-   * 未配置(undefined)→ 命中 MiniMax-M3 的请求返回 503 +
-   * reject reason `'minimax_config'`。key 只在 master 进程环境变量中存在,
-   * 不注入用户容器,避免商业版用户通过 shell/日志拿到平台订阅 key。
-   */
-  minimaxTokenPlanKey?: string;
+  staticProviderKeys?: StaticProviderKeys;
   /**
    * Phase 5 platform envelope rewriter(2026-05-21,取代 Phase 7 v1 envelope)。
    *

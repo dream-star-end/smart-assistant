@@ -157,6 +157,34 @@ describe("full migration suite", () => {
     assert.equal(minimax.rows[0].enabled, true);
     assert.equal(minimax.rows[0].visibility, "public");
 
+    // 0082: glm-5.1(火山方舟 Ark,平台全局默认模型)定价 + 一步到位 public/enabled。
+    const glm = await query<{
+      enabled: boolean;
+      visibility: string;
+      input_per_mtok: string;
+      output_per_mtok: string;
+      cache_read_per_mtok: string;
+      cache_write_per_mtok: string;
+      multiplier: string;
+    }>(
+      `SELECT enabled, visibility,
+              input_per_mtok::text AS input_per_mtok,
+              output_per_mtok::text AS output_per_mtok,
+              cache_read_per_mtok::text AS cache_read_per_mtok,
+              cache_write_per_mtok::text AS cache_write_per_mtok,
+              multiplier::text AS multiplier
+         FROM model_pricing WHERE model_id=$1`,
+      ["glm-5.1"],
+    );
+    assert.equal(glm.rows.length, 1);
+    assert.equal(glm.rows[0].enabled, true);
+    assert.equal(glm.rows[0].visibility, "public");
+    assert.equal(glm.rows[0].input_per_mtok, "600");
+    assert.equal(glm.rows[0].output_per_mtok, "2400");
+    assert.equal(glm.rows[0].cache_read_per_mtok, "120");
+    assert.equal(glm.rows[0].cache_write_per_mtok, "0");
+    assert.equal(glm.rows[0].multiplier, "1.000");
+
     const plan1000 = await query<{ amount_cents: string; credits: string }>(
       "SELECT amount_cents::text AS amount_cents, credits::text AS credits FROM topup_plans WHERE code=$1",
       ["plan-1000"],

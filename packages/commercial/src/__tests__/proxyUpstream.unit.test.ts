@@ -25,6 +25,7 @@
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
 
+import { getStaticProvider } from "@openclaude/protocol";
 import {
   selectUpstreamRoute,
   validateUpstreamConfig,
@@ -32,6 +33,11 @@ import {
   releaseUpstreamSession,
   type PickUpstreamDeps,
 } from "../http/proxy/upstream.js";
+
+// 静态 provider route 构造助手:registry spec → UpstreamRoute。
+const DEEPSEEK_ROUTE = { kind: "static" as const, provider: getStaticProvider("deepseek") };
+const MINIMAX_ROUTE = { kind: "static" as const, provider: getStaticProvider("minimax") };
+const ARK_ROUTE = { kind: "static" as const, provider: getStaticProvider("ark") };
 import {
   AccountPoolBusyError,
   AccountPoolUnavailableError,
@@ -110,70 +116,95 @@ function bodyFor(model: string): {
 // ─── selectUpstreamRoute ─────────────────────────────────────────────────
 
 describe("selectUpstreamRoute", () => {
-  test("model 以 deepseek- 开头 → kind=deepseek", () => {
-    assert.deepEqual(selectUpstreamRoute("deepseek-v4-pro"), { kind: "deepseek" });
-    assert.deepEqual(selectUpstreamRoute("deepseek-chat"), { kind: "deepseek" });
+  test("model 以 deepseek- 开头(大小写敏感) → static/deepseek", () => {
+    for (const m of ["deepseek-v4-pro", "deepseek-chat"]) {
+      const r = selectUpstreamRoute(m);
+      assert.equal(r.kind, "static");
+      if (r.kind === "static") assert.equal(r.provider.id, "deepseek");
+    }
   });
-  test("MiniMax-M3(大小写不敏感) → kind=minimax", () => {
-    assert.deepEqual(selectUpstreamRoute("MiniMax-M3"), { kind: "minimax" });
-    assert.deepEqual(selectUpstreamRoute("minimax-m3"), { kind: "minimax" });
+  test("MiniMax-M3(大小写不敏感) → static/minimax", () => {
+    for (const m of ["MiniMax-M3", "minimax-m3"]) {
+      const r = selectUpstreamRoute(m);
+      assert.equal(r.kind, "static");
+      if (r.kind === "static") assert.equal(r.provider.id, "minimax");
+    }
+  });
+  test("glm-5.1(大小写不敏感) → static/ark", () => {
+    for (const m of ["glm-5.1", "GLM-5.1"]) {
+      const r = selectUpstreamRoute(m);
+      assert.equal(r.kind, "static");
+      if (r.kind === "static") assert.equal(r.provider.id, "ark");
+    }
   });
   test("其它 model → kind=oauth", () => {
     assert.deepEqual(selectUpstreamRoute("claude-sonnet-4-6"), { kind: "oauth" });
     assert.deepEqual(selectUpstreamRoute("gpt-5"), { kind: "oauth" });
     assert.deepEqual(selectUpstreamRoute(""), { kind: "oauth" });
+    // 大小写敏感等价回归:DeepSeek-foo(大写 D)不命中 deepseek route → oauth
+    assert.deepEqual(selectUpstreamRoute("DeepSeek-v4-pro"), { kind: "oauth" });
   });
 });
 
 // ─── validateUpstreamConfig ──────────────────────────────────────────────
 
 describe("validateUpstreamConfig", () => {
-  test("deepseek 路由 + 缺 key → deepseek_not_configured", () => {
+  test("static 路由 + 缺 key → static_not_configured(带 providerId)", () => {
+    assert.deepEqual(validateUpstreamConfig(DEEPSEEK_ROUTE, {}), {
+      kind: "static_not_configured",
+      providerId: "deepseek",
+    });
     assert.deepEqual(
-      validateUpstreamConfig({ kind: "deepseek" }, {}),
-      { kind: "deepseek_not_configured" },
+      validateUpstreamConfig(DEEPSEEK_ROUTE, { staticProviderKeys: { deepseek: "" } }),
+      { kind: "static_not_configured", providerId: "deepseek" },
     );
-    assert.deepEqual(
-      validateUpstreamConfig({ kind: "deepseek" }, { deepseekApiKey: "" }),
-      { kind: "deepseek_not_configured" },
-    );
+    assert.deepEqual(validateUpstreamConfig(ARK_ROUTE, {}), {
+      kind: "static_not_configured",
+      providerId: "ark",
+    });
   });
-  test("deepseek 路由 + 有 key → null(放行)", () => {
+  test("static 路由 + 有自己的 key → null(放行)", () => {
     assert.equal(
-      validateUpstreamConfig({ kind: "deepseek" }, { deepseekApiKey: "ds-key" }),
+      validateUpstreamConfig(DEEPSEEK_ROUTE, { staticProviderKeys: { deepseek: "ds-key" } }),
+      null,
+    );
+    assert.equal(
+      validateUpstreamConfig(MINIMAX_ROUTE, { staticProviderKeys: { minimax: "sk-cp-xxx" } }),
+      null,
+    );
+    assert.equal(
+      validateUpstreamConfig(ARK_ROUTE, { staticProviderKeys: { ark: "ark-key" } }),
       null,
     );
   });
-  test("oauth 路由 → 任何 deepseekApiKey 都返回 null", () => {
-    assert.equal(validateUpstreamConfig({ kind: "oauth" }, {}), null);
-    assert.equal(validateUpstreamConfig({ kind: "oauth" }, { deepseekApiKey: "" }), null);
-    assert.equal(validateUpstreamConfig({ kind: "oauth" }, { deepseekApiKey: "k" }), null);
-  });
-  test("minimax 路由缺 key → minimax_not_configured;有 key → null", () => {
+  test("static 路由只认自己 provider 的 key(注入了别家 key 仍 not_configured)", () => {
     assert.deepEqual(
-      validateUpstreamConfig({ kind: "minimax" }, {}),
-      { kind: "minimax_not_configured" },
+      validateUpstreamConfig(ARK_ROUTE, { staticProviderKeys: { deepseek: "ds-key" } }),
+      { kind: "static_not_configured", providerId: "ark" },
     );
-    assert.deepEqual(
-      validateUpstreamConfig({ kind: "minimax" }, { minimaxTokenPlanKey: "" }),
-      { kind: "minimax_not_configured" },
+  });
+  test("oauth 路由 → 任何 key 都返回 null", () => {
+    assert.equal(validateUpstreamConfig({ kind: "oauth" }, {}), null);
+    assert.equal(
+      validateUpstreamConfig({ kind: "oauth" }, { staticProviderKeys: { deepseek: "" } }),
+      null,
     );
     assert.equal(
-      validateUpstreamConfig({ kind: "minimax" }, { minimaxTokenPlanKey: "sk-cp-xxx" }),
+      validateUpstreamConfig({ kind: "oauth" }, { staticProviderKeys: { ark: "k" } }),
       null,
     );
   });
 });
 
-// ─── pickUpstream — DeepSeek 路径 ────────────────────────────────────────
+// ─── pickUpstream — DeepSeek 路径(等价回归)──────────────────────────────
 
 describe("pickUpstream — DeepSeek route", () => {
-  test("不调 scheduler;session.endpoint = deepseek 端点;applyUpstreamAuth 用 deepseekApiKey + strip beta", async () => {
+  test("不调 scheduler;session.endpoint = deepseek 端点;applyUpstreamAuth Bearer + strip beta(不 strip body)", async () => {
     const sched = makeScheduler({});
     const res = await pickUpstream(
-      { scheduler: sched.scheduler, deepseekApiKey: "DS-KEY" },
+      { scheduler: sched.scheduler, staticProviderKeys: { deepseek: "DS-KEY" } },
       bodyFor("deepseek-v4-pro"),
-      { kind: "deepseek" },
+      DEEPSEEK_ROUTE,
       log,
     );
     assert.equal(res.ok, true);
@@ -189,9 +220,11 @@ describe("pickUpstream — DeepSeek route", () => {
     const safeHeaders: Record<string, string> = {
       "anthropic-beta": "interleaved-thinking-2025-05-14",
     };
-    const body = { metadata: { user_id: "client-original" } } as unknown as Parameters<
-      typeof session.applyUpstreamAuth
-    >[1];
+    // deepseek stripBodyFields=[]，故 body 上的 thinking 等字段应被保留(等价回归)。
+    const body = {
+      metadata: { user_id: "client-original" },
+      thinking: { type: "enabled" },
+    } as unknown as Parameters<typeof session.applyUpstreamAuth>[1];
     session.applyUpstreamAuth(safeHeaders, body, log);
     assert.equal(safeHeaders.authorization, "Bearer DS-KEY");
     assert.equal(
@@ -199,58 +232,43 @@ describe("pickUpstream — DeepSeek route", () => {
       undefined,
       "DeepSeek 路径必须显式 delete anthropic-beta(不是 noop)",
     );
-    // metadata 不应被改
+    assert.deepEqual(
+      (body as { thinking?: unknown }).thinking,
+      { type: "enabled" },
+      "DeepSeek stripBodyFields=[]，不应 strip body 字段(与历史等价)",
+    );
     assert.equal(
       (body as { metadata?: { user_id?: unknown } }).metadata?.user_id,
       "client-original",
     );
   });
 
-  test("sanitizeMessages 返回原 messages 引用(无 strip 操作)", async () => {
+  test("sanitizeMessages 返回原 messages 引用;zeroizeSecrets noop 幂等", async () => {
     const sched = makeScheduler({});
     const res = await pickUpstream(
-      { scheduler: sched.scheduler, deepseekApiKey: "k" },
+      { scheduler: sched.scheduler, staticProviderKeys: { deepseek: "k" } },
       bodyFor("deepseek-v4-pro"),
-      { kind: "deepseek" },
+      DEEPSEEK_ROUTE,
       log,
     );
     assert.equal(res.ok, true);
     if (!res.ok) return;
     const messages = [{ role: "user", content: "hi" }];
-    const out = res.session.sanitizeMessages(messages, "deepseek-v4-pro", log);
-    assert.equal(out, messages, "DeepSeek 路径必须 return 同一数组引用,无 strip");
-  });
-
-  test("zeroizeSecrets 是 noop(deepseekApiKey 来自配置,不归 session)", async () => {
-    const sched = makeScheduler({});
-    const res = await pickUpstream(
-      { scheduler: sched.scheduler, deepseekApiKey: "k" },
-      bodyFor("deepseek-v4-pro"),
-      { kind: "deepseek" },
-      log,
-    );
-    assert.equal(res.ok, true);
-    if (!res.ok) return;
-    res.session.zeroizeSecrets(); // 调一次不抛
-    res.session.zeroizeSecrets(); // 二次也不抛
+    assert.equal(res.session.sanitizeMessages(messages, "deepseek-v4-pro", log), messages);
+    res.session.zeroizeSecrets();
+    res.session.zeroizeSecrets();
   });
 });
 
-// ─── pickUpstream — MiniMax 路径 ────────────────────────────────────────
+// ─── pickUpstream — MiniMax 路径(等价回归)───────────────────────────────
 
 describe("pickUpstream — MiniMax route", () => {
-  test("不调 scheduler;session.endpoint = minimax 端点;applyUpstreamAuth 用 Token Plan key + strip beta/body extras", async () => {
+  test("不调 scheduler;endpoint=minimax;Bearer Token Plan key + strip beta/4 body extras", async () => {
     const sched = makeScheduler({});
     const res = await pickUpstream(
-      { scheduler: sched.scheduler, minimaxTokenPlanKey: "MM-KEY" },
-      {
-        ...bodyFor("MiniMax-M3"),
-        output_config: { effort: "max" },
-        context_management: { edits: [] },
-        thinking: { type: "enabled", budget_tokens: 1024 },
-        service_tier: "priority",
-      } as never,
-      { kind: "minimax" },
+      { scheduler: sched.scheduler, staticProviderKeys: { minimax: "MM-KEY" } },
+      bodyFor("MiniMax-M3"),
+      MINIMAX_ROUTE,
       log,
     );
     assert.equal(res.ok, true);
@@ -258,8 +276,6 @@ describe("pickUpstream — MiniMax route", () => {
     const { session } = res;
     assert.equal(sched.pickCalls, 0, "MiniMax 路径绝不调 scheduler.pick");
     assert.equal(session.accountId, null);
-    assert.equal(session.pinnedUserId, null);
-    assert.equal(session.dispatcher, undefined);
     assert.equal(session.shouldUpdateQuotaFromResponse, false);
     assert.ok(session.endpoint.includes("api.minimaxi.com/anthropic/v1/messages"));
 
@@ -285,19 +301,67 @@ describe("pickUpstream — MiniMax route", () => {
       "client-original",
     );
   });
+});
 
-  test("sanitizeMessages 返回原 messages 引用;zeroizeSecrets noop", async () => {
+// ─── pickUpstream — Ark(glm-5.1)路径(新增)──────────────────────────────
+
+describe("pickUpstream — Ark glm-5.1 route", () => {
+  test("不调 scheduler;endpoint=ark coding;Bearer ARK key + strip beta/4 body extras;保留 metadata", async () => {
     const sched = makeScheduler({});
     const res = await pickUpstream(
-      { scheduler: sched.scheduler, minimaxTokenPlanKey: "k" },
-      bodyFor("MiniMax-M3"),
-      { kind: "minimax" },
+      { scheduler: sched.scheduler, staticProviderKeys: { ark: "ARK-KEY" } },
+      bodyFor("glm-5.1"),
+      ARK_ROUTE,
+      log,
+    );
+    assert.equal(res.ok, true);
+    if (!res.ok) return;
+    const { session } = res;
+    assert.equal(sched.pickCalls, 0, "Ark 路径绝不调 scheduler.pick");
+    assert.equal(session.accountId, null);
+    assert.equal(session.pinnedUserId, null);
+    assert.equal(session.dispatcher, undefined);
+    assert.equal(session.shouldUpdateQuotaFromResponse, false);
+    assert.ok(
+      session.endpoint.includes("ark.cn-beijing.volces.com/api/coding/v1/messages"),
+      `unexpected ark endpoint: ${session.endpoint}`,
+    );
+
+    const safeHeaders: Record<string, string> = {
+      "anthropic-beta": "interleaved-thinking-2025-05-14",
+    };
+    const body = {
+      metadata: { user_id: "client-original" },
+      output_config: { effort: "max" },
+      context_management: { edits: [] },
+      thinking: { type: "enabled" },
+      service_tier: "priority",
+    } as unknown as Parameters<typeof session.applyUpstreamAuth>[1];
+    session.applyUpstreamAuth(safeHeaders, body, log);
+    assert.equal(safeHeaders.authorization, "Bearer ARK-KEY");
+    assert.equal(safeHeaders["anthropic-beta"], undefined);
+    assert.equal((body as { output_config?: unknown }).output_config, undefined);
+    assert.equal((body as { context_management?: unknown }).context_management, undefined);
+    assert.equal((body as { thinking?: unknown }).thinking, undefined);
+    assert.equal((body as { service_tier?: unknown }).service_tier, undefined);
+    assert.equal(
+      (body as { metadata?: { user_id?: unknown } }).metadata?.user_id,
+      "client-original",
+    );
+  });
+
+  test("sanitizeMessages 返回原引用;zeroizeSecrets noop 幂等", async () => {
+    const sched = makeScheduler({});
+    const res = await pickUpstream(
+      { scheduler: sched.scheduler, staticProviderKeys: { ark: "k" } },
+      bodyFor("glm-5.1"),
+      ARK_ROUTE,
       log,
     );
     assert.equal(res.ok, true);
     if (!res.ok) return;
     const messages = [{ role: "user", content: "hi" }];
-    assert.equal(res.session.sanitizeMessages(messages, "MiniMax-M3", log), messages);
+    assert.equal(res.session.sanitizeMessages(messages, "glm-5.1", log), messages);
     res.session.zeroizeSecrets();
     res.session.zeroizeSecrets();
   });
@@ -1173,11 +1237,11 @@ describe("pickUpstream — upstreamEndpoint override", () => {
     const ds = await pickUpstream(
       {
         scheduler: dsSched.scheduler,
-        deepseekApiKey: "k",
+        staticProviderKeys: { deepseek: "k" },
         upstreamEndpoint: "https://override.test/v1/messages",
       },
       bodyFor("deepseek-v4-pro"),
-      { kind: "deepseek" },
+      DEEPSEEK_ROUTE,
       log,
     );
     assert.equal(ds.ok, true);
@@ -1185,7 +1249,7 @@ describe("pickUpstream — upstreamEndpoint override", () => {
     assert.match(
       ds.session.endpoint,
       /deepseek/i,
-      "DeepSeek endpoint 由内部常量决定,不受 upstreamEndpoint 覆盖影响",
+      "DeepSeek endpoint 由 registry spec 决定,不受 upstreamEndpoint 覆盖影响",
     );
   });
 
@@ -1244,9 +1308,9 @@ describe("releaseUpstreamSession (case c — finalizer-pre window)", () => {
       },
     };
     const res = await pickUpstream(
-      { scheduler, deepseekApiKey: "k" },
+      { scheduler, staticProviderKeys: { deepseek: "k" } },
       bodyFor("deepseek-v4-pro"),
-      { kind: "deepseek" },
+      DEEPSEEK_ROUTE,
       log,
     );
     assert.equal(res.ok, true);

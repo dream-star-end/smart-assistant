@@ -308,3 +308,25 @@ describe('inferAgentForModel — MiniMax model routing', () => {
     assert.equal(r.error, 'no_compatible_agent')
   })
 })
+
+describe('inferAgentForModel — Ark glm-5.1 model routing', () => {
+  it('keeps default non-codex agent for glm-5.1(平台默认)', () => {
+    const r = inferAgentForModel({
+      model: 'glm-5.1',
+      requestedAgentId: 'main',
+      defaultAgentId: 'main',
+      agents: fullAgents,
+    })
+    assert.deepEqual(r, { agentId: 'main' })
+  })
+
+  it('routes codex agent + glm-5.1 back to default non-codex agent', () => {
+    const r = inferAgentForModel({
+      model: 'glm-5.1',
+      requestedAgentId: 'codex',
+      defaultAgentId: 'main',
+      agents: fullAgents,
+    })
+    assert.deepEqual(r, { agentId: 'main' })
+  })
+})
