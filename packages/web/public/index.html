@@ -2370,7 +2370,7 @@
       <div class="modal-callout">
         用于 Claude Code 客户端外接调用:配置 <code style="font-family:var(--font-mono,ui-monospace,monospace)">ANTHROPIC_BASE_URL=https://claudeai.chat/api/anthropic</code> +
         <code style="font-family:var(--font-mono,ui-monospace,monospace)">ANTHROPIC_API_KEY=&lt;此处生成&gt;</code>。
-        <br><strong style="color:var(--accent-danger,#d33)">⚠️ 新建后明文仅显示一次,请立即妥善保管。</strong>
+        <br><strong style="color:var(--accent-danger)">⚠️ 新建后明文仅显示一次,请立即妥善保管。</strong>
       </div>
 
       <!-- Panel A:列表态 -->
@@ -2390,9 +2390,9 @@
       </div>
 
       <!-- Panel C:secret 一次性展示态 -->
-      <div id="api-keys-secret-panel" hidden style="display:flex;flex-direction:column;gap:10px;padding:14px;border:2px solid var(--accent-danger,#d33);border-radius:var(--radius);background:var(--bg-secondary)">
+      <div id="api-keys-secret-panel" hidden style="display:flex;flex-direction:column;gap:10px;padding:14px;border:2px solid var(--accent-danger);border-radius:var(--radius);background:var(--bg-secondary)">
         <div style="font-size:13px;font-weight:600">已创建:<span id="api-keys-secret-label" style="font-weight:400;color:var(--text-secondary)"></span></div>
-        <div style="font-size:12px;color:var(--accent-danger,#d33);font-weight:600">⚠️ 该明文仅此一次显示,关闭后将无法再次获取。请立即复制保存。</div>
+        <div style="font-size:12px;color:var(--accent-danger);font-weight:600">⚠️ 该明文仅此一次显示,关闭后将无法再次获取。请立即复制保存。</div>
         <input id="api-keys-secret-input" type="text" readonly autocomplete="off" spellcheck="false" style="padding:8px 10px;border:1px solid var(--border);border-radius:var(--radius);background:var(--bg);color:var(--text);font-family:var(--font-mono,ui-monospace,monospace);font-size:12px;word-break:break-all">
         <div style="display:flex;gap:8px;justify-content:flex-end">
           <button id="api-keys-secret-copy" type="button" class="btn btn-secondary" style="font-size:12px">复制</button>

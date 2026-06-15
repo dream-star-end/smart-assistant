@@ -186,7 +186,7 @@ function _renderRow(k) {
   const revokeBtn = document.createElement('button')
   revokeBtn.type = 'button'
   revokeBtn.className = 'btn btn-ghost'
-  revokeBtn.style.cssText = 'font-size:12px;flex-shrink:0;color:var(--accent-danger,#d33)'
+  revokeBtn.style.cssText = 'font-size:12px;flex-shrink:0;color:var(--accent-danger)'
   revokeBtn.textContent = '撤销'
   revokeBtn.setAttribute('data-revoke-id', String(k.id))
   revokeBtn.setAttribute('data-revoke-label', String(k.label || ''))

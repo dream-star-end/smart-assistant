@@ -42,6 +42,31 @@
   --transition-base: 180ms cubic-bezier(0.4, 0, 0.2, 1);
   --transition-slow: 280ms cubic-bezier(0.4, 0, 0.2, 1);
   --ease-spring: cubic-bezier(0.34, 1.56, 0.64, 1);
+
+  /* U2 — 主应用里散落着一套"旧别名"token(permission/askUserQuestion 模态、
+     api-keys 面板等),从未在 :root/主题块定义,只靠使用点 `var(别名,#硬编码)`
+     续命:在亮色主题里渲染深色/浅灰硬编码 fallback(模态主题错乱、浅灰字几乎不可见),
+     无 fallback 的(--text/--radius/--brand/--error)则直接失效(方角、无 outline)。
+     这里把全部别名一次性映射到设计系统 canonical token(主题感知 —— 自定义属性
+     lazy 解析,resolve 时取当前主题下的 --bg/--fg 等),根治整类"双 token"不对称。
+     定义点 fallback 用 dark canonical 值(品牌安全默认),杜绝"变量失效即跑偏"。
+     注:admin.html 自带独立 token 体系(--panel/--text/--s-N…),不在此处统一。 */
+  --bg-primary: var(--bg, #1a1a1d);
+  --bg-secondary: var(--bg-elevated, #212125);
+  --bg-tertiary: var(--bg-raised, #2a2a30);
+  --bg-base: var(--bg-subtle, #1e1e22);
+  --bg-soft: var(--bg-subtle, #1e1e22);
+  --bg-muted: var(--bg-subtle, #1e1e22);
+  --text-primary: var(--fg, #eceae6);
+  --fg-primary: var(--fg, #eceae6);
+  --text: var(--fg, #eceae6);
+  --fg-secondary: var(--fg-muted, #9f9c96);
+  --text-secondary: var(--fg-muted, #9f9c96);
+  --brand: var(--accent, #d97757);
+  --error: var(--danger, #e06c6c);
+  --accent-danger: var(--danger, #e06c6c);
+  --radius: var(--radius-md, 10px);
+  --mono: var(--font-mono, ui-monospace, monospace);
 }
 @supports (height: 100dvh) {
   :root {
@@ -3767,7 +3792,7 @@ a:hover {
 .repo-status-dot[data-state='pending'] { background: var(--fg-muted); }
 .repo-status-dot[data-state='cloning'] { background: var(--accent); animation: repo-dot-pulse 1.2s ease-in-out infinite; }
 .repo-status-dot[data-state='ready']   { background: #22c55e; }
-.repo-status-dot[data-state='failed']  { background: var(--danger, #ef4444); }
+.repo-status-dot[data-state='failed']  { background: var(--danger); }
 @keyframes repo-dot-pulse {
   0%, 100% { opacity: 1; }
   50%      { opacity: 0.35; }
@@ -5519,7 +5544,7 @@ body.voice-overlay-open {
   to { opacity: 1; }
 }
 .permission-modal {
-  background: var(--bg-primary, #1a1a2e);
+  background: var(--bg-primary);
   border: 1px solid var(--border, #333);
   border-radius: var(--radius-lg, 12px);
   padding: var(--space-5, 24px);
@@ -5546,15 +5571,15 @@ body.voice-overlay-open {
   text-align: center;
   font-size: var(--text-lg, 18px);
   font-weight: 600;
-  color: var(--fg-primary, #e0e0e0);
+  color: var(--fg-primary);
   margin-bottom: var(--space-2, 8px);
 }
 .permission-modal-tool {
   text-align: center;
   font-family: var(--font-mono, monospace);
   font-size: var(--text-base, 15px);
-  color: var(--accent, #7c3aed);
-  background: color-mix(in srgb, var(--accent, #7c3aed) 12%, transparent);
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
   border-radius: var(--radius-sm, 6px);
   padding: var(--space-1, 4px) var(--space-3, 12px);
   display: inline-block;
@@ -5563,11 +5588,11 @@ body.voice-overlay-open {
 }
 .permission-modal-desc {
   font-size: var(--text-sm, 13px);
-  color: var(--fg-secondary, #aaa);
+  color: var(--fg-secondary);
   word-break: break-all;
   margin-bottom: var(--space-3, 12px);
   padding: var(--space-2, 8px);
-  background: var(--bg-secondary, #222);
+  background: var(--bg-secondary);
   border-radius: var(--radius-sm, 6px);
   font-family: var(--font-mono, monospace);
 }
@@ -5584,7 +5609,7 @@ body.voice-overlay-open {
 .permission-modal-details pre {
   max-height: 120px;
   overflow: auto;
-  background: var(--bg-secondary, #222);
+  background: var(--bg-secondary);
   border-radius: var(--radius-sm, 6px);
   padding: var(--space-2, 8px);
   white-space: pre-wrap;
@@ -5617,12 +5642,12 @@ body.voice-overlay-open {
   opacity: 0.85;
 }
 .permission-btn-deny {
-  background: var(--bg-tertiary, #333);
-  color: var(--fg-primary, #e0e0e0);
+  background: var(--bg-tertiary);
+  color: var(--fg-primary);
   border: 1px solid var(--border, #444);
 }
 .permission-btn-deny:hover {
-  background: color-mix(in srgb, var(--danger, #ef4444) 15%, var(--bg-tertiary, #333));
+  background: color-mix(in srgb, var(--danger) 15%, var(--bg-tertiary));
 }
 .permission-modal-timer {
   text-align: center;
@@ -5643,8 +5668,8 @@ body.voice-overlay-open {
   background: color-mix(in srgb, var(--success, #22c55e) 8%, transparent);
 }
 .msg.permission .msg-body.resolved-deny {
-  border-color: color-mix(in srgb, var(--danger, #ef4444) 40%, transparent);
-  background: color-mix(in srgb, var(--danger, #ef4444) 8%, transparent);
+  border-color: color-mix(in srgb, var(--danger) 40%, transparent);
+  background: color-mix(in srgb, var(--danger) 8%, transparent);
 }
 
 /* ═══════════════ AskUserQuestion modal ═══════════════ */
@@ -5672,18 +5697,18 @@ body.voice-overlay-open {
   width: 36px;
   height: 36px;
   border-radius: 50%;
-  background: color-mix(in srgb, var(--accent, #7c3aed) 18%, transparent);
+  background: color-mix(in srgb, var(--accent) 18%, transparent);
 }
 .aq-header-icon svg {
   width: 22px;
   height: 22px;
-  color: var(--accent, #7c3aed);
+  color: var(--accent);
 }
 .aq-header-title {
   flex: 0 0 auto;
   font-size: var(--text-lg, 18px);
   font-weight: 600;
-  color: var(--fg-primary, #e0e0e0);
+  color: var(--fg-primary);
 }
 .aq-header-sub {
   flex: 1 1 auto;
@@ -5706,25 +5731,25 @@ body.voice-overlay-open {
   padding: var(--space-3, 12px);
   border: 1px solid var(--border, #333);
   border-radius: var(--radius-md, 8px);
-  background: var(--bg-secondary, #222);
+  background: var(--bg-secondary);
   transition: border-color 0.2s, box-shadow 0.2s;
 }
 .aq-question.aq-flash {
-  border-color: var(--danger, #ef4444);
-  box-shadow: 0 0 0 2px color-mix(in srgb, var(--danger, #ef4444) 30%, transparent);
+  border-color: var(--danger);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--danger) 30%, transparent);
 }
 .aq-chip {
   align-self: flex-start;
   font-size: var(--text-xs, 12px);
   font-family: var(--font-mono, monospace);
-  color: var(--accent, #7c3aed);
-  background: color-mix(in srgb, var(--accent, #7c3aed) 14%, transparent);
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
   padding: 2px var(--space-2, 8px);
   border-radius: var(--radius-sm, 6px);
 }
 .aq-qtext {
   font-size: var(--text-base, 15px);
-  color: var(--fg-primary, #e0e0e0);
+  color: var(--fg-primary);
   font-weight: 500;
 }
 .aq-options {
@@ -5737,24 +5762,24 @@ body.voice-overlay-open {
   align-items: flex-start;
   gap: var(--space-2, 8px);
   padding: var(--space-2, 8px) var(--space-3, 12px);
-  background: var(--bg-primary, #1a1a2e);
+  background: var(--bg-primary);
   border: 1px solid var(--border, #333);
   border-radius: var(--radius-sm, 6px);
-  color: var(--fg-primary, #e0e0e0);
+  color: var(--fg-primary);
   text-align: left;
   cursor: pointer;
   transition: background 0.15s, border-color 0.15s, transform 0.1s;
 }
 .aq-option:hover {
-  background: var(--bg-tertiary, #2a2a3e);
-  border-color: color-mix(in srgb, var(--accent, #7c3aed) 50%, var(--border, #333));
+  background: var(--bg-tertiary);
+  border-color: color-mix(in srgb, var(--accent) 50%, var(--border, #333));
 }
 .aq-option:active {
   transform: scale(0.98);
 }
 .aq-option.selected {
-  border-color: var(--accent, #7c3aed);
-  background: color-mix(in srgb, var(--accent, #7c3aed) 12%, var(--bg-primary, #1a1a2e));
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 12%, var(--bg-primary));
 }
 .aq-option-marker {
   flex: 0 0 auto;
@@ -5772,8 +5797,8 @@ body.voice-overlay-open {
   border-radius: 4px;
 }
 .aq-option.selected .aq-option-marker {
-  background: var(--accent, #7c3aed);
-  border-color: var(--accent, #7c3aed);
+  background: var(--accent);
+  border-color: var(--accent);
   position: relative;
 }
 .aq-option.selected .aq-option-marker::after {
@@ -5802,7 +5827,7 @@ body.voice-overlay-open {
 .aq-option-label {
   font-size: var(--text-sm, 14px);
   font-weight: 500;
-  color: var(--fg-primary, #e0e0e0);
+  color: var(--fg-primary);
 }
 .aq-option-desc {
   font-size: var(--text-xs, 12px);
@@ -5812,10 +5837,10 @@ body.voice-overlay-open {
 .aq-other-input {
   margin-top: var(--space-2, 8px);
   padding: var(--space-2, 8px) var(--space-3, 12px);
-  background: var(--bg-primary, #1a1a2e);
-  border: 1px solid var(--accent, #7c3aed);
+  background: var(--bg-primary);
+  border: 1px solid var(--accent);
   border-radius: var(--radius-sm, 6px);
-  color: var(--fg-primary, #e0e0e0);
+  color: var(--fg-primary);
   font-size: var(--text-sm, 14px);
   font-family: inherit;
   outline: none;
@@ -5823,7 +5848,7 @@ body.voice-overlay-open {
   box-sizing: border-box;
 }
 .aq-other-input:focus {
-  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent, #7c3aed) 25%, transparent);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 25%, transparent);
 }
 .aq-hidden {
   display: none !important;
@@ -5831,14 +5856,14 @@ body.voice-overlay-open {
 .aq-preview-pane {
   margin-top: var(--space-2, 8px);
   padding: var(--space-3, 12px);
-  background: var(--bg-primary, #1a1a2e);
+  background: var(--bg-primary);
   border: 1px dashed var(--border, #333);
   border-radius: var(--radius-sm, 6px);
   max-height: 160px;
   overflow: auto;
   font-family: var(--font-mono, monospace);
   font-size: var(--text-xs, 12px);
-  color: var(--fg-secondary, #aaa);
+  color: var(--fg-secondary);
   white-space: pre-wrap;
   word-break: break-word;
 }
@@ -5854,7 +5879,7 @@ body.voice-overlay-open {
   gap: var(--space-3, 12px);
   padding: var(--space-3, 12px) var(--space-5, 24px);
   border-top: 1px solid var(--border, #333);
-  background: var(--bg-primary, #1a1a2e);
+  background: var(--bg-primary);
 }
 .aq-footer-timer {
   font-size: var(--text-xs, 12px);
@@ -5885,7 +5910,7 @@ body.voice-overlay-open {
 }
 .aq-card-title {
   font-weight: 600;
-  color: var(--fg-primary, #e0e0e0);
+  color: var(--fg-primary);
 }
 .aq-card-status {
   margin-left: auto;
@@ -5902,15 +5927,15 @@ body.voice-overlay-open {
   flex-direction: column;
   gap: 2px;
   padding-left: var(--space-3, 12px);
-  border-left: 2px solid color-mix(in srgb, var(--accent, #7c3aed) 40%, transparent);
+  border-left: 2px solid color-mix(in srgb, var(--accent) 40%, transparent);
 }
 .aq-card-q {
   font-size: var(--text-sm, 14px);
-  color: var(--fg-secondary, #aaa);
+  color: var(--fg-secondary);
 }
 .aq-card-a {
   font-size: var(--text-sm, 14px);
-  color: var(--fg-primary, #e0e0e0);
+  color: var(--fg-primary);
   font-weight: 500;
 }
 
@@ -5965,7 +5990,7 @@ body.voice-overlay-open {
 }
 .plan-card:hover {
   background: var(--bg-hover);
-  border-color: var(--accent, #7c3aed);
+  border-color: var(--accent);
   transform: translateY(-1px);
 }
 .plan-card-label {
@@ -5980,7 +6005,7 @@ body.voice-overlay-open {
 }
 .plan-card-bonus {
   font-size: var(--text-xs);
-  color: color-mix(in srgb, var(--accent, #7c3aed) 80%, var(--fg) 20%);
+  color: color-mix(in srgb, var(--accent) 80%, var(--fg) 20%);
   font-variant-numeric: tabular-nums;
 }
 
@@ -6007,7 +6032,7 @@ body.voice-overlay-open {
   color: var(--fg-muted);
 }
 .topup-bonus {
-  color: color-mix(in srgb, var(--accent, #7c3aed) 80%, var(--fg) 20%);
+  color: color-mix(in srgb, var(--accent) 80%, var(--fg) 20%);
 }
 
 /* 充值面板顶部的注册赠送营销 banner — 静态文案,与套餐列表区分开。 */
@@ -6016,9 +6041,9 @@ body.voice-overlay-open {
   padding: var(--space-2) var(--space-3);
   margin: 0 0 var(--space-3);
   border-radius: var(--radius-sm, 6px);
-  background: color-mix(in srgb, var(--accent, #7c3aed) 12%, transparent);
-  color: color-mix(in srgb, var(--accent, #7c3aed) 80%, var(--fg) 20%);
-  border: 1px solid color-mix(in srgb, var(--accent, #7c3aed) 24%, transparent);
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+  color: color-mix(in srgb, var(--accent) 80%, var(--fg) 20%);
+  border: 1px solid color-mix(in srgb, var(--accent) 24%, transparent);
 }
 
 /* 充值模态底部的客服联系方式 — 三个 stage 通用,刻意低调避免喧宾夺主。 */
@@ -6098,9 +6123,9 @@ body.voice-overlay-open {
 .topup-pay-guide {
   margin-top: var(--space-4);
   padding: var(--space-3) var(--space-4);
-  background: color-mix(in srgb, var(--accent, #7c3aed) 10%, transparent);
-  border: 1px solid color-mix(in srgb, var(--accent, #7c3aed) 30%, transparent);
-  border-left: 3px solid var(--accent, #7c3aed);
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+  border: 1px solid color-mix(in srgb, var(--accent) 30%, transparent);
+  border-left: 3px solid var(--accent);
   border-radius: var(--radius-md);
 }
 .topup-pay-guide-title {
@@ -6122,12 +6147,12 @@ body.voice-overlay-open {
 }
 .topup-pay-guide-steps li { margin-bottom: 2px; }
 .topup-pay-guide-steps li strong {
-  color: color-mix(in srgb, var(--accent, #7c3aed) 80%, var(--fg) 20%);
+  color: color-mix(in srgb, var(--accent) 80%, var(--fg) 20%);
 }
 .topup-pay-guide-desktop {
   margin-top: var(--space-2);
   padding-top: var(--space-2);
-  border-top: 1px dashed color-mix(in srgb, var(--accent, #7c3aed) 25%, transparent);
+  border-top: 1px dashed color-mix(in srgb, var(--accent) 25%, transparent);
   font-size: var(--text-xs);
   color: var(--fg-muted);
 }
@@ -6298,14 +6323,14 @@ body.voice-overlay-open {
 }
 .prefs-effort-pill:has(input:checked) {
   background: var(--bg);
-  color: var(--accent, #7c3aed);
+  color: var(--accent);
   font-weight: 600;
   box-shadow:
-    0 0 0 1px color-mix(in srgb, var(--accent, #7c3aed) 35%, transparent),
+    0 0 0 1px color-mix(in srgb, var(--accent) 35%, transparent),
     0 1px 3px rgba(0, 0, 0, 0.08);
 }
 .prefs-effort-pill:has(input:focus-visible) {
-  outline: 2px solid color-mix(in srgb, var(--accent, #7c3aed) 60%, transparent);
+  outline: 2px solid color-mix(in srgb, var(--accent) 60%, transparent);
   outline-offset: 1px;
 }
 
@@ -6367,13 +6392,13 @@ body.voice-overlay-open {
   box-shadow: 0 1px 2px rgba(0, 0, 0, 0.2);
 }
 .prefs-switch input:checked + .prefs-switch-slider {
-  background: var(--accent, #7c3aed);
+  background: var(--accent);
 }
 .prefs-switch input:checked + .prefs-switch-slider::before {
   transform: translateX(18px);
 }
 .prefs-switch input:focus-visible + .prefs-switch-slider {
-  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent, #7c3aed) 30%, transparent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 30%, transparent);
 }
 
 .prefs-status {
@@ -6393,7 +6418,7 @@ body.voice-overlay-open {
   color: var(--fg-muted);
   font-size: var(--text-sm);
 }
-.usage-error { color: var(--danger, #ef4444); }
+.usage-error { color: var(--danger); }
 .usage-summary {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
@@ -6494,7 +6519,7 @@ body.voice-overlay-open {
   padding: var(--space-4) !important;
 }
 .usage-delta-pos { color: var(--success, #10b981); }
-.usage-delta-neg { color: var(--danger, #ef4444); }
+.usage-delta-neg { color: var(--danger); }
 .usage-legacy-row {
   margin-top: var(--space-2);
   padding: var(--space-2) var(--space-3);
@@ -7767,7 +7792,7 @@ body.body-landing {
   animation: sync-orbit 0.9s linear infinite;
 }
 .repo-banner-icon[data-state='ready']  { background: #22c55e; border: 0; }
-.repo-banner-icon[data-state='failed'] { background: var(--danger, #ef4444); border: 0; }
+.repo-banner-icon[data-state='failed'] { background: var(--danger); border: 0; }
 
 /* repo 名:可省略;不要 flex:1,免得吃光进度条空间 */
 .repo-banner-name {
@@ -7785,7 +7810,7 @@ body.body-landing {
   color: var(--fg-muted);
   font-size: 12px;
 }
-.repo-banner[data-state='failed'] .repo-banner-status { color: var(--danger, #ef4444); }
+.repo-banner[data-state='failed'] .repo-banner-status { color: var(--danger); }
 .repo-banner[data-state='ready']  .repo-banner-status { color: #16a34a; }
 
 .repo-banner-progress {

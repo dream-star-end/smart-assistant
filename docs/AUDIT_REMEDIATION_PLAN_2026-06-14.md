@@ -40,7 +40,7 @@
 | B4 | node-agent 缺失容器返真 404 | 正确性 | P1 | 5 | W2 | ↑（少卡死） | ✅ Codex PASS, commit `d214d57a`（**Go node-agent rollout 线,非 deploy-v3.sh**) |
 | A3 | compute-host 吊销 kill-switch（+B8 NULL fingerprint fail-closed） | 安全/架构 | P0 | 3 | W2 | 无 | ✅ PASS（Codex 2 轮） |
 | B5 | 只读 admin 路由升 `requireAdminVerifyDb` | 安全 | P2 | 10 | W2 | 无 | ✅ 由 B2 router gate 收编(所有 admin 走 verify-db) |
-| U2 | CSS 双 token 词汇统一 + 品牌色 fallback | UI | P1 | 7 | **W3** | 须严防视觉回归 | ⬜ |
+| U2 | CSS 双 token 词汇统一 + 品牌色 fallback | UI | P1 | 7 | **W3** | 须严防视觉回归 | ✅ PASS（Codex 2 轮） |
 | U6 | `--z-*` 分层 token + 聊天流骨架屏一致性 | UI | P3 | 13 | W3 | ↑/中性 | ⬜ |
 | **A1** | turn 生命周期单一权威源 + server `turnId` | 架构 | P0 | 1 | **W4** | 须严防流式 UI 回归 | ⬜ design-doc 先行 |
 | R1 | 多标签页协调（leader/广播 turn_settled） | 实时 | P1 | 7 | W4 | ↑（消幽灵态） | ⬜ 随 A1 |
@@ -184,4 +184,10 @@
   - service 路径全 gate(重审闭合):withTarget(lifecycle RPC+inspectImage)、index.ts 远端 file-IO put/pull×2/**delete**(Codex Finding 1:漏的 deleteRemoteCodexAuth 已补)/inbound file-proxy/sshMux resolvePlacement、tunnelHealthzProbe/v3readiness/v3ensureRunning bridge/containerApiProxy/containerFileProxy/volumeContextReader、nodeBootstrap 入口/adminDistributeImageToHost(SSH)、nodeHealth poll+renew、poolInit/baselineServer/getBaselineVersions。`grep hostRowToTarget( index.ts` 仅余 sshMux 一处(已 gated)。
   - 验证:tsc 改动文件 0 error;biome 0 new(工作树 32≤HEAD 35);测试 hostServiceable 5/5 + computeHostRevoke.integ 15/15(真 PG octest);回归 queriesAtomicLifecycle 62/62、v3EnsureRunning 21/21、v3Readiness 20/20、containerApiProxy 5/5。
   - **已知 tech-debt(Codex 同意为 A3 边界,后续单独硬化)**:① revoked host 上活跃用户的 deny 是 retryable 形态(ContainerUnreadyError/502)→ 会被无意义重试(安全无损:每次重试重查 DB 再 deny,host 永不被接触);根治需 caller re-placement + data-host 迁移语义。② in-flight egress CONNECT / 已建 tunnel / bootstrap 进行中的 step 不被同步 teardown(revoke 只切新接触+清 fp+新 egress fail-closed);根治需 per-host active-socket/dispatcher 追踪与主动 kill。
-- 下一步:批量部署本波次(A2/U1/U3/U4/U5/B1/B2/B3/B5/A3 + B4 经 Go node-agent rollout)→ 再 W3(U2/U6)、W4(A1+R1/R2/R3、A5、A4 — design-doc 先行)、W5(B6/B7/B9)。
+- 2026-06-15:**U2(CSS 双 token 统一)实现完成,Codex PASS(2 轮)**。审计发现主应用散落整套"旧别名"词汇(permission/askUserQuestion 模态、api-keys 面板等),从未在 :root/主题定义,只靠 `var(别名,#硬编码)` 续命 → **亮色主题下模态错乱**(深底+浅灰字几乎不可见)、无 fallback 的 `--radius/--brand/--error/--text` 直接失效(方角/无 outline)。
+  - 按"看一类问题"原则**一次性**把 16 个别名全部映射到 canonical token(base :root 定义,主题感知 lazy 解析;fallback 用 dark canonical 品牌安全值):--bg-primary/secondary/tertiary/base/soft/muted→--bg*;--text/-primary、--fg-primary→--fg;--text-secondary、--fg-secondary→--fg-muted;--brand→--accent;--error、--accent-danger→--danger;--radius→--radius-md;--mono→--font-mono。
+  - 同步删坏 fallback:30×`var(--accent,#7c3aed)`(禁用紫)、10×`var(--danger,#ef4444)`、6+3+3×`--bg-*` 偏蓝深色、9×`--fg-primary,#e0e0e0`、3×`--fg-secondary,#aaa`、3+1×`--accent-danger,#d33`。
+  - 净效果:dark 主题 sub-perceptual 微调(近黑/浅灰几无变化);light 主题 + mermaid label = 真 bug 修复(模态/文字恢复主题感知与可读对比)。审计脚本确认**主应用未定义别名 = 空**(整类消除)。admin.html 自带独立 token 体系,不在此统一。
+  - defer(后续 stylelint + 硬编码 hex 清扫):1×standalone `#7c3aed`(voice 字面量)、53×死 `var(--tok,#hex)` fallback(token 均已定义,5×已是品牌色)。
+  - 验证:brace 1960/1960;`git diff --check` 干净;web 测试 styleThemeConsistency 4/4、mermaidRenderingConfig 3/3、githubModalStyles 2/2;node --check apiKeys.js OK。
+- 下一步:U6(z-index token + 骨架屏)→ 批量部署本波次(W2 的 A2/U1/U3/U4/U5/B1/B2/B3/B5/A3 + W3 的 U2/U6;B4 经 Go node-agent rollout)→ 再 W4(A1+R1/R2/R3、A5、A4 — design-doc 先行)、W5(B6/B7/B9)。
