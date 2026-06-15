@@ -398,6 +398,7 @@ export const V3_CCB_BASELINE_SKILL_NAMES = [
   "memory-management",
   "platform-capabilities",
   "scheduled-tasks",
+  "wechat-notify",
   "skill-management",
   "skill-search",
   "scansci-pdf",
