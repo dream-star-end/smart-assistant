@@ -3,7 +3,7 @@ import { apiGet, apiJson } from './api.js?v=0c9e5665'
 import { $, htmlSafeEscape } from './dom.js?v=0c9e5665'
 import { renderModePills } from './effortMode.js?v=0c9e5665'
 import { getSession, state } from './state.js?v=0c9e5665'
-import { closeModal, openModal, toast, toastOptsFromError } from './ui.js?v=0c9e5665'
+import { closeModal, confirmDialog, openModal, toast, toastOptsFromError } from './ui.js?v=0c9e5665'
 
 // modelPicker.renderModelPill 的 late-binding setter — 避免 modelPicker.js
 // (依赖本模块的 reloadAgents)与本模块互相 import 形成循环。
@@ -216,7 +216,15 @@ export async function openPersonaEditor(agentId) {
     delBtn.disabled = agentId === state.defaultAgentId
     delBtn.style.display = agentId === state.defaultAgentId ? 'none' : ''
     delBtn.onclick = async () => {
-      if (!confirm(`删除 agent "${agentId}"?`)) return
+      if (
+        !(await confirmDialog({
+          title: '删除 Agent?',
+          body: `删除 agent "${agentId}"?`,
+          confirmText: '删除',
+          danger: true,
+        }))
+      )
+        return
       try {
         await apiJson('DELETE', `/api/agents/${encodeURIComponent(agentId)}`)
         toast('agent 已删除', 'success')

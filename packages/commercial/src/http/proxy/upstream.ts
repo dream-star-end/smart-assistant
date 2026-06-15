@@ -51,7 +51,10 @@ import {
   DEFAULT_REFRESH_SKEW_MS,
   type RefreshDeps,
 } from "../../account-pool/refresh.js";
-import { getDispatcherForAccount } from "../../account-pool/egressDispatcher.js";
+import {
+  getDispatcherForAccount,
+  resolveAccountEgressDispatcher,
+} from "../../account-pool/egressDispatcher.js";
 import {
   DEFAULT_UPSTREAM_ENDPOINT,
   DEEPSEEK_UPSTREAM_ENDPOINT,
@@ -637,11 +640,52 @@ export async function pickUpstream(
   // (b₂) dispatcher 或其他 preparation throw —— outer guard 统一 release(failure)。
   try {
     const getDispatcher = deps.getDispatcher ?? getDispatcherForAccount;
-    const dispatcher = await getDispatcher(
+    // A2 fail-closed:已绑账号若解析不出 dispatcher,绝不退默认/全局出口(去匿名化泄露)。
+    // resolver 用绑定权威源(egress_proxy_id/egress_host_uuid)消歧"未绑"与"已绑但解析失败"。
+    const egress = await resolveAccountEgressDispatcher(
       pick.account_id,
-      pick.egress_proxy,
-      pick.egress_target,
+      {
+        egressProxy: pick.egress_proxy,
+        egressTarget: pick.egress_target,
+        egressProxyId: pick.egress_proxy_id,
+        egressHostUuid: pick.egress_host_uuid,
+      },
+      getDispatcher,
     );
+    if (egress.kind === "unavailable") {
+      // 已绑但出口不可用 → fail-closed。release(transient_network):纯出口/网络层
+      // 故障不扣账号健康分(避免"代理一抖烧全池"),仅 dec inflight 槽位。
+      log.warn("proxy_egress_unavailable", {
+        accountId: pick.account_id.toString(),
+        reason: egress.reason,
+      });
+      await deps.scheduler
+        .release({
+          account_id: pick.account_id,
+          result: { kind: "transient_network", error: "egress_unavailable" },
+        })
+        .catch(() => {
+          /* best-effort, swallow */
+        });
+      try {
+        pick.token.fill(0);
+      } catch {
+        /* ignore */
+      }
+      try {
+        pick.refresh?.fill(0);
+      } catch {
+        /* ignore */
+      }
+      return {
+        ok: false,
+        error: {
+          kind: "pool_unavailable",
+          err: new AccountPoolUnavailableError("egress_unavailable"),
+        },
+      };
+    }
+    const dispatcher = egress.kind === "ready" ? egress.dispatcher : undefined;
 
     if (
       deps.refreshDeps &&
@@ -676,6 +720,10 @@ export async function pickUpstream(
           expires_at: r.expires_at,
           egress_proxy: pick.egress_proxy,
           egress_target: pick.egress_target,
+          // A2 — refresh rebind 必须保留出口绑定权威源,否则续期后 pick 丢失
+          // egress_proxy_id/egress_host_uuid(类型不完整 + 下游若再判定 fail-closed 会误判未绑)。
+          egress_proxy_id: pick.egress_proxy_id,
+          egress_host_uuid: pick.egress_host_uuid,
           pinned_user_id: pick.pinned_user_id,
           // Phase 6 H6.D — refresh rebind 必须显式带 account_uuid。仅依赖
           // PickResult 字段约束不够,测试 mock/`as` 容易绕过去(Codex round 2 反馈)。

@@ -65,7 +65,10 @@
   --fg: #eceae6;
   --fg-strong: #faf9f6;
   --fg-muted: #9f9c96;
-  --fg-dim: #6a6862;
+  /* U4: 旧 #6a6862 对 --bg 仅 3.12:1(WCAG AA 不达标)。提亮到 #8d8a82:对
+     --bg 5.0:1 / --bg-elevated 4.6:1(AA 达标),--bg-raised 4.1:1(AA-large 达标)。
+     仍明显比 --fg-muted 暗,层级保留。 */
+  --fg-dim: #8d8a82;
   --fg-inverse: #1a1a1d;
 
   --accent: #d97757;
@@ -124,7 +127,10 @@
   --fg: #1a1a1d;
   --fg-strong: #000;
   --fg-muted: #6a6862;
-  --fg-dim: #9f9c96;
+  /* U4: 旧 #9f9c96 对 --bg 仅 2.60:1(WCAG AA 不达标)。压暗到 #726f67:对
+     --bg 4.7:1 / --bg-elevated(#fff) 5.0:1(AA 达标),--bg-raised 4.5:1。
+     仍比 --fg-muted 浅,层级保留。 */
+  --fg-dim: #726f67;
   --fg-inverse: #faf9f6;
 
   --accent: #bc4f22;
@@ -230,6 +236,17 @@ a:hover {
   outline: none;
   box-shadow: var(--ring);
   border-radius: var(--radius-sm);
+}
+
+/* Disclosure 头(JS makeDisclosure 赋了 role=button + tabindex)的键盘焦点环。
+   父卡片 .msg.tool / .agent-group / .msg.thinking 是 overflow:hidden,会裁掉全局
+   :focus-visible 的**外**阴影 ring,所以这里用 **inset** 阴影画在头内部,保证
+   键盘聚焦时可见(鼠标点击不受影响)。 */
+.agent-group-header:focus-visible,
+.tool-card-header:focus-visible,
+.thinking-header:focus-visible {
+  outline: none;
+  box-shadow: inset 0 0 0 2px var(--accent);
 }
 
 /* ══════════════════════════════════════════════════════════════════
@@ -5238,7 +5255,9 @@ body.voice-overlay-open {
 }
 .palette-item-hint {
   font-size: var(--text-xs);
-  color: var(--fg-dim);
+  /* U4: hover/active 时行底色变 --accent-soft,--fg-dim 仅 ~3.8:1。改 --fg-muted:
+     普通态(--bg-elevated)5.9:1、hover(accent-soft)4.8:1,均达 AA。 */
+  color: var(--fg-muted);
   font-family: var(--font-mono);
 }
 .palette-footer {
@@ -8470,7 +8489,7 @@ body.body-landing {
   white-space: pre;
   overflow-x: auto;
 }
-.landing-demo-code .cm  { color: var(--fg-dim, var(--fg-muted)); }
+.landing-demo-code .cm  { color: var(--fg-muted); } /* U4: 在 accent-tinted 代码块底色上 --fg-dim 仅 ~4.4:1;注释文字用 --fg-muted 达 AA */
 .landing-demo-code .kw  { color: #c678dd; font-weight: 600; }
 .landing-demo-code .fn  { color: #61afef; }
 .landing-demo-code .num { color: #d19a66; }
@@ -8745,7 +8764,8 @@ body.body-landing {
   background: var(--bg-raised);
 }
 .plan-step-status {
-  color: var(--fg-dim);
+  /* U4: 在 --bg-raised 上 --fg-dim 仅 4.1:1(<AA);此处次要文字改用 --fg-muted(5.2:1)。 */
+  color: var(--fg-muted);
   font-size: var(--text-xs);
   font-family: var(--font-mono);
 }
@@ -9007,7 +9027,8 @@ body.body-landing {
 .plan-panel-step-mark,
 .plan-panel-todo-mark {
   flex: 0 0 18px;
-  color: var(--fg-dim);
+  /* U4: 在 --bg-raised 上用 --fg-muted 保证 AA(--fg-dim 仅 4.1:1)。 */
+  color: var(--fg-muted);
   font-family: var(--font-mono);
   font-weight: 700;
   text-align: center;
@@ -9036,7 +9057,8 @@ body.body-landing {
   overflow-wrap: anywhere;
 }
 .plan-panel-todo.completed .plan-panel-todo-text {
-  color: var(--fg-dim);
+  /* U4: --bg-raised 上次要文字用 --fg-muted 达 AA。 */
+  color: var(--fg-muted);
   text-decoration: line-through;
 }
 .plan-panel-progress {

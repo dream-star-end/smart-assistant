@@ -368,6 +368,7 @@ export const anthropicProxySettle = new Counter({
  *   - concurrency     per-uid 并发上限
  *   - account_pool    池空 / 全 down
  *   - account_pool_no_uuid  Phase 6 fail_closed:候选池 account_uuid 未回填导致空(503)
+ *   - account_pool_egress_unavailable  A2 fail_closed:已绑账号出口(代理/host)解析失败被拒发(503)
  *   - account_pool_busy  所有账号都到达 per-account 并发上限(瞬时过载,429)
  *   - unknown_model   定价表缺
  *   - bad_body        zod parse 失败
@@ -506,6 +507,9 @@ export type ProxyRejectReason =
   // 分支按 reason 拆这个独立 label,让运维仪表盘把"backfill 没跑完"和
   // "账号全爆"(account_pool)分开看。
   | "account_pool_no_uuid"
+  // A2 fail-closed:已绑账号出口(代理/host)解析失败被拒发(reason='egress_unavailable'),
+  // 与"账号全爆"(account_pool)分开,让运维仪表盘单独看"出口/代理坏了"。
+  | "account_pool_egress_unavailable"
   | "account_pool_busy"
   | "unknown_model"
   | "unauthorized_model"

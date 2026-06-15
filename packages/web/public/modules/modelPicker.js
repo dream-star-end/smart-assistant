@@ -6,7 +6,7 @@
 //   - 多 Agent: select a saved team; sendMessage routes through the team leader.
 
 import { apiJson } from './api.js?v=0c9e5665'
-import { $ } from './dom.js?v=0c9e5665'
+import { $, htmlSafeEscape } from './dom.js?v=0c9e5665'
 import { renderModePills } from './effortMode.js?v=0c9e5665'
 import { openPersonaEditor } from './agents.js?v=0c9e5665'
 import {
@@ -17,7 +17,7 @@ import {
   teamDisplayPrefix,
 } from './agentTeams.js?v=0c9e5665'
 import { getSession, state } from './state.js?v=0c9e5665'
-import { closeModal, openModal, toast, toastOptsFromError } from './ui.js?v=0c9e5665'
+import { openModal, toast, toastOptsFromError, confirmDialog } from './ui.js?v=0c9e5665'
 import { getEnabledModels, setCachedPrefField } from './userPrefs.js?v=0c9e5665'
 import { getEffectiveSingleAgentModel } from './modelPolicy.js?v=0c9e5665'
 
@@ -64,75 +64,13 @@ function agentLabel(agent) {
   return `${agent.avatarEmoji ? `${agent.avatarEmoji} ` : ''}${agent.displayName || agent.id}`
 }
 
-function escapeHtml(s) {
-  return String(s).replace(/[&<>"']/g, (c) => ({
-    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
-  })[c])
-}
-
-const TEAM_CONFIRM_MODAL_ID = 'model-team-confirm-modal'
-
-function ensureTeamConfirmModal() {
-  let modal = document.querySelector(`#${TEAM_CONFIRM_MODAL_ID}`)
-  if (modal) return modal
-  modal = document.createElement('div')
-  modal.id = TEAM_CONFIRM_MODAL_ID
-  modal.className = 'modal-backdrop'
-  modal.setAttribute('role', 'dialog')
-  modal.setAttribute('aria-modal', 'true')
-  modal.innerHTML = `
-    <div class="modal settings-modal" style="max-width:420px">
-      <div class="modal-head">
-        <div class="modal-title-block">
-          <div class="modal-title-row"><span class="modal-icon" aria-hidden="true">👥</span><h3>退出团队模式?</h3></div>
-          <p class="modal-subtitle" id="model-team-confirm-text"></p>
-        </div>
-        <button class="modal-close" data-close-model-team-confirm aria-label="关闭">×</button>
-      </div>
-      <div class="modal-foot">
-        <button class="btn btn-ghost" data-close-model-team-confirm>取消</button>
-        <button class="btn btn-primary" id="model-team-confirm-ok">继续切换</button>
-      </div>
-    </div>
-  `
-  document.body.appendChild(modal)
-  for (const b of modal.querySelectorAll('[data-close-model-team-confirm]')) {
-    b.addEventListener('click', () => closeModal(TEAM_CONFIRM_MODAL_ID))
-  }
-  return modal
-}
-
+// 退出团队模式确认 —— 委派给共享 confirmDialog(单一确认弹窗来源,U3)。
 function confirmExitTeam(teamLabel) {
-  return new Promise((resolve) => {
-    const modal = ensureTeamConfirmModal()
-    const text = modal.querySelector('#model-team-confirm-text')
-    if (text) {
-      text.textContent = `当前正在使用团队「${teamLabel}」。切换模型会退出团队模式，本次之后将只发送给单 Agent。`
-    }
-    const ok = modal.querySelector('#model-team-confirm-ok')
-    let settled = false
-    const cancelButtons = Array.from(modal.querySelectorAll('[data-close-model-team-confirm]'))
-    const finish = (value) => {
-      if (settled) return
-      settled = true
-      ok?.removeEventListener('click', onOk)
-      for (const b of cancelButtons) b.removeEventListener('click', onCancel)
-      modal.removeEventListener('click', onBackdrop)
-      document.removeEventListener('keydown', onKey, true)
-      closeModal(TEAM_CONFIRM_MODAL_ID)
-      resolve(value)
-    }
-    const onOk = () => finish(true)
-    const onCancel = () => finish(false)
-    const onBackdrop = (e) => { if (e.target === modal) finish(false) }
-    const onKey = (e) => {
-      if (e.key === 'Escape' && modal.classList.contains('open')) finish(false)
-    }
-    ok?.addEventListener('click', onOk, { once: true })
-    for (const b of cancelButtons) b.addEventListener('click', onCancel)
-    modal.addEventListener('click', onBackdrop)
-    document.addEventListener('keydown', onKey, true)
-    openModal(TEAM_CONFIRM_MODAL_ID)
+  return confirmDialog({
+    title: '退出团队模式?',
+    body: `当前正在使用团队「${teamLabel}」。切换模型会退出团队模式,本次之后将只发送给单 Agent。`,
+    confirmText: '继续切换',
+    icon: '👥',
   })
 }
 
@@ -267,7 +205,7 @@ function closeMenu(returnFocusToTrigger = true) {
 function section(title, hint) {
   const el = document.createElement('div')
   el.className = 'target-menu-section'
-  el.innerHTML = `<div class="target-menu-section-title">${escapeHtml(title)}</div><div class="target-menu-section-hint">${escapeHtml(hint)}</div>`
+  el.innerHTML = `<div class="target-menu-section-title">${htmlSafeEscape(title)}</div><div class="target-menu-section-hint">${htmlSafeEscape(hint)}</div>`
   return el
 }
 
@@ -283,11 +221,11 @@ function optionButton({ type, id, title, hint, meta, selected, icon = '🤖' }) 
   btn.setAttribute('aria-selected', selected ? 'true' : 'false')
   if (selected) btn.classList.add('effort-menu-item--selected', 'target-menu-item--selected')
   btn.innerHTML = `
-    <span class="target-menu-icon" aria-hidden="true">${escapeHtml(icon)}</span>
+    <span class="target-menu-icon" aria-hidden="true">${htmlSafeEscape(icon)}</span>
     <span class="target-menu-copy">
-      <span class="effort-menu-label">${escapeHtml(title)}</span>
-      <span class="effort-menu-hint">${escapeHtml(hint || '')}</span>
-      ${meta ? `<span class="target-menu-meta">${escapeHtml(meta)}</span>` : ''}
+      <span class="effort-menu-label">${htmlSafeEscape(title)}</span>
+      <span class="effort-menu-hint">${htmlSafeEscape(hint || '')}</span>
+      ${meta ? `<span class="target-menu-meta">${htmlSafeEscape(meta)}</span>` : ''}
     </span>`
   return btn
 }

@@ -502,7 +502,11 @@ export function makeAnthropicProxyHandler(
             const label =
               reason === "no_uuid" || reason === "no_uuid_post_scheduler"
                 ? "account_pool_no_uuid"
-                : "account_pool";
+                : reason === "egress_unavailable"
+                  ? // A2 — 已绑账号出口解析失败被 fail-closed 拒发(非账号池耗尽),
+                    // 单独打标签让运维仪表盘区分"出口/代理坏了"与"账号全爆"。
+                    "account_pool_egress_unavailable"
+                  : "account_pool";
             userLog.warn("proxy_account_pool_unavailable", {
               msg: pickRes.error.err.message,
               reason,

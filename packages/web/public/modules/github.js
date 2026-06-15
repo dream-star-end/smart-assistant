@@ -18,7 +18,7 @@
 import { apiGet, apiJson } from './api.js?v=0c9e5665'
 import { $, htmlSafeEscape } from './dom.js?v=0c9e5665'
 import { getSession, state } from './state.js?v=0c9e5665'
-import { closeModal, openModal, toast, toastOptsFromError } from './ui.js?v=0c9e5665'
+import { closeModal, confirmDialog, openModal, toast, toastOptsFromError } from './ui.js?v=0c9e5665'
 import {
   clearRepoBindQueue,
   queueRepoBindFrame,
@@ -275,7 +275,15 @@ export async function linkGithub() {
 }
 
 export async function unlinkGithub() {
-  if (!confirm('解绑 GitHub 账号?所有会话的仓库选择会清空,正在克隆的会话会停止。')) return
+  if (
+    !(await confirmDialog({
+      title: '解绑 GitHub 账号?',
+      body: '所有会话的仓库选择会清空,正在克隆的会话会停止。',
+      confirmText: '解绑',
+      danger: true,
+    }))
+  )
+    return
   try {
     const res = await apiJson('DELETE', '/api/me/github')
     toast(`已解绑${res && res.sessionsCleared ? ` · ${res.sessionsCleared} 个会话已清空` : ''}`, 'success')
@@ -431,21 +439,33 @@ export async function confirmSelectRepo() {
 }
 
 export async function unbindCurrent() {
-  if (!_currentSid || !_existingSelection) return
-  if (!confirm(`解除当前会话与 ${_existingSelection.owner}/${_existingSelection.repo} @ ${_existingSelection.branch} 的绑定?`)) return
-  const ver = _existingSelection.selection_version
+  // U3:确认弹窗是 async,先把会话/选择快照下来,避免 await 期间模块态(切会话等)
+  // 改变后用到 stale 的 _currentSid / _existingSelection。
+  const sid = _currentSid
+  const sel = _existingSelection
+  if (!sid || !sel) return
+  if (
+    !(await confirmDialog({
+      title: '解除仓库绑定?',
+      body: `解除当前会话与 ${sel.owner}/${sel.repo} @ ${sel.branch} 的绑定?`,
+      confirmText: '解除绑定',
+      danger: true,
+    }))
+  )
+    return
+  const ver = sel.selection_version
   try {
-    await apiJson('DELETE', `/api/me/sessions/${encodeURIComponent(_currentSid)}/github-selection`)
+    await apiJson('DELETE', `/api/me/sessions/${encodeURIComponent(sid)}/github-selection`)
     // v1.0.94:DELETE 之后先清待确认队列,避免后续 status 帧迟到时 stale entry 被错配。
-    clearRepoBindQueue(_currentSid)
-    sendRepoUnbindFrame(_currentSid, ver)
+    clearRepoBindQueue(sid)
+    sendRepoUnbindFrame(sid, ver)
     // unbind 后任何延迟到达的旧版本 status/error 帧都不该再生效。
     // 后端 DELETE 不返回新版本号 —— 用 +Infinity 哨兵把已知版本封顶,
     // 直到下一次 PUT/GET 用真实版本覆盖。
-    _knownVersion.set(_currentSid, Number.POSITIVE_INFINITY)
+    _knownVersion.set(sid, Number.POSITIVE_INFINITY)
     closeModal('github-modal')
-    applyPillFromSelection({ selected: false }, _currentSid)
-    applyBannerFromState({ selected: false }, _currentSid)
+    applyPillFromSelection({ selected: false }, sid)
+    applyBannerFromState({ selected: false }, sid)
   } catch (err) {
     toast(String(err?.message || err), 'error', toastOptsFromError(err))
   }

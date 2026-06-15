@@ -8,7 +8,7 @@ import { refreshGithubPill } from './github.js?v=0c9e5665'
 import { setTitleBusy } from './notifications.js?v=0c9e5665'
 import { getSession, state } from './state.js?v=0c9e5665'
 import { pushSessionToServer, deleteSessionFromServer } from './sync.js?v=0c9e5665'
-import { toast } from './ui.js?v=0c9e5665'
+import { confirmDialog, toast } from './ui.js?v=0c9e5665'
 import { GROUP_ORDER, sessionGroup, shortTime, uuid } from './util.js?v=0c9e5665'
 import { nudgeDrain } from './websocket.js?v=0c9e5665'
 import { trace, flushTrace } from './trace.js?v=0c9e5665'
@@ -586,7 +586,7 @@ export function _buildSessionItem(s) {
     '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6M14 11v6M9 6V4a2 2 0 0 1 2-2h2a2 2 0 0 1 2 2v2"/></svg>'
   del.onclick = async (e) => {
     e.stopPropagation()
-    if (!confirm(`删除会话 "${s.title}"?`)) return
+    if (!(await confirmDialog({ title: '删除会话?', body: `删除会话 "${s.title}"?`, confirmText: '删除', danger: true }))) return
     await deleteSession(s.id)
   }
 
@@ -625,7 +625,7 @@ export function _buildSessionItem(s) {
         label: '删除',
         danger: true,
         run: async () => {
-          if (!confirm(`删除会话 "${s.title}"?`)) return
+          if (!(await confirmDialog({ title: '删除会话?', body: `删除会话 "${s.title}"?`, confirmText: '删除', danger: true }))) return
           await deleteSession(s.id)
         },
       },
@@ -655,7 +655,7 @@ export function _buildSessionItem(s) {
           label: '删除',
           danger: true,
           run: async () => {
-            if (!confirm('删除?')) return
+            if (!(await confirmDialog({ title: '删除会话?', confirmText: '删除', danger: true }))) return
             await deleteSession(s.id)
           },
         },

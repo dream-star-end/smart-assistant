@@ -349,6 +349,14 @@ export interface PickResult {
    */
   egress_target: import('./store.js').AccountToken['egress_target']
   /**
+   * 出口绑定**权威源**(account 自身列,不受 JOIN active-filter 影响)。A2 fail-closed:
+   * 已绑账号(egress_proxy_id 或 egress_host_uuid 非 null)若解析不出 dispatcher,
+   * upstream 必须拒发,绝不退默认出口。区别于上面已被 active-filter 置 null 的
+   * egress_proxy/egress_target(解析结果)。0055 起 claude 账号 egress_proxy_id 恒非 null。
+   */
+  egress_proxy_id: bigint | null
+  egress_host_uuid: string | null
+  /**
    * 反风控锚定:该账号永久绑定的客户端 device_id(64 字符小写 hex)。
    * 由 0067 migration 注入 schema DEFAULT + NOT NULL + CHECK + UNIQUE。
    * anthropicProxy 选号后用此值重写出站 body.metadata.user_id.device_id,
@@ -1066,6 +1074,8 @@ export class AccountScheduler {
             expires_at: tok.expires_at,
             egress_proxy: tok.egress_proxy,
             egress_target: tok.egress_target,
+            egress_proxy_id: tok.egress_proxy_id,
+            egress_host_uuid: tok.egress_host_uuid,
             pinned_user_id: chosen.pinned_user_id,
             account_uuid: chosen.account_uuid,
             persona: chosen.persona,
@@ -1192,6 +1202,8 @@ export class AccountScheduler {
         expires_at: tok.expires_at,
         egress_proxy: tok.egress_proxy,
         egress_target: tok.egress_target,
+        egress_proxy_id: tok.egress_proxy_id,
+        egress_host_uuid: tok.egress_host_uuid,
         pinned_user_id: chosen.pinned_user_id,
         account_uuid: chosen.account_uuid,
         persona: chosen.persona,

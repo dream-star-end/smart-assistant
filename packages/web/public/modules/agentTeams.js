@@ -2,7 +2,7 @@ import { apiGet, apiJson } from './api.js?v=0c9e5665'
 import { $, htmlSafeEscape } from './dom.js?v=0c9e5665'
 import { scheduleSaveFromUserEdit } from './sessions.js?v=0c9e5665'
 import { state } from './state.js?v=0c9e5665'
-import { toast, toastOptsFromError } from './ui.js?v=0c9e5665'
+import { confirmDialog, toast, toastOptsFromError } from './ui.js?v=0c9e5665'
 
 const TEAM_ID_RE = /^[a-zA-Z0-9_-]+$/
 export const SELECTED_TEAM_KEY = 'openclaude_selected_team'
@@ -615,7 +615,15 @@ async function _saveTeamEditor() {
 async function _deleteTeamEditor() {
   const id = $('team-id').value.trim()
   if (!id || !_teamById(id)) return
-  if (!confirm(`删除团队 "${id}"?`)) return
+  if (
+    !(await confirmDialog({
+      title: '删除团队?',
+      body: `删除团队 "${id}"?`,
+      confirmText: '删除',
+      danger: true,
+    }))
+  )
+    return
   try {
     await apiJson('DELETE', `/api/agent-teams/${encodeURIComponent(id)}`)
     if (state.selectedTeamId === id) {

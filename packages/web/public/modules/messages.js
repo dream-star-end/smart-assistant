@@ -1,6 +1,6 @@
 // OpenClaude — Message rendering and display
 import { _openTopupModal } from './billing.js?v=0c9e5665'
-import { $, _mod, fallbackCopy, htmlSafeEscape } from './dom.js?v=0c9e5665'
+import { $, _mod, fallbackCopy, htmlSafeEscape, makeDisclosure } from './dom.js?v=0c9e5665'
 import { getEffortForSubmit } from './effortMode.js?v=0c9e5665'
 import { refreshPlanPanel } from './planPanel.js?v=0c9e5665'
 import { getConversationModeForSubmit, requestDefaultNextSubmit } from './planMode.js?v=0c9e5665'
@@ -748,10 +748,12 @@ function _renderAgentGroup(el, msg) {
   const header = document.createElement('div')
   header.className = 'agent-group-header'
   header.innerHTML = `${_SVG_BOT_AGENT}<span class="agent-group-title">子任务: ${htmlSafeEscape(msg.text || '')}</span>${statusHtml}${_SVG_CHEVRON_AGENT}`
-  header.onclick = () => {
-    msg._userCollapsed = !el.classList.contains('collapsed')
-    el.classList.toggle('collapsed', msg._userCollapsed)
-  }
+  makeDisclosure(header, el, {
+    onToggle: () => {
+      msg._userCollapsed = !el.classList.contains('collapsed')
+      el.classList.toggle('collapsed', msg._userCollapsed)
+    },
+  })
   el.appendChild(header)
 
   const body = document.createElement('div')
@@ -802,7 +804,7 @@ function _renderDelegateProgress(el, msg) {
   const header = document.createElement('div')
   header.className = 'agent-group-header'
   header.innerHTML = `${_SVG_BOT_AGENT}<span class="agent-group-title">委派过程: ${htmlSafeEscape(msg.agentId || 'agent')}</span>${statusHtml}${_SVG_CHEVRON_AGENT}`
-  header.onclick = () => el.classList.toggle('collapsed')
+  makeDisclosure(header, el)
   el.appendChild(header)
 
   const body = document.createElement('div')
@@ -884,7 +886,7 @@ function _buildToolCard(el, msg) {
     badge.classList.add('badge-done')
   }
   header.appendChild(badge)
-  header.onclick = () => el.classList.toggle('collapsed')
+  makeDisclosure(header, el)
   el.appendChild(header)
 
   // ── Body (collapsible) ──
@@ -2722,7 +2724,7 @@ export function _buildMessageEl(msg) {
     const header = document.createElement('div')
     header.className = 'thinking-header'
     header.innerHTML = '<span class="thinking-label">💭 思考中…</span>'
-    header.onclick = () => el.classList.toggle('collapsed')
+    makeDisclosure(header, el)
     el.appendChild(header)
     const body = document.createElement('div')
     body.className = 'msg-body thinking-body'
@@ -2907,7 +2909,11 @@ export function updateMessageEl(msg, streaming) {
     const label = el.querySelector('.thinking-label')
     if (label) label.textContent = streaming ? '💭 思考中…' : '💭 思考过程'
     // Auto-collapse when streaming ends
-    if (!streaming) el.classList.add('collapsed')
+    if (!streaming) {
+      el.classList.add('collapsed')
+      // 头不重建,手动同步 aria-expanded(makeDisclosure 的 syncAria 在此拿不到引用)
+      el.querySelector('.thinking-header')?.setAttribute('aria-expanded', 'false')
+    }
   } else if (msg.role === 'permission') {
     el.innerHTML = ''
     el.className = 'msg permission'
@@ -2919,14 +2925,16 @@ export function updateMessageEl(msg, streaming) {
       const body = el.querySelector('.tool-body-legacy')
       if (body) body.textContent = msg.text || ''
     } else {
-      // Preserve collapsed state across re-renders
+      // Preserve collapsed state across re-renders. Restore `collapsed`
+      // BEFORE _buildToolCard so makeDisclosure's initial aria-expanded sync
+      // reads the correct state (else a collapsed card gets aria-expanded=true).
       const wasCollapsed = el.classList.contains('collapsed')
       el.innerHTML = ''
       el.className = `msg tool`
       if (msg.error) el.classList.add('error')
+      if (wasCollapsed) el.classList.add('collapsed')
       el.dataset.msgId = msg.id
       _buildToolCard(el, msg)
-      if (wasCollapsed) el.classList.add('collapsed')
     }
   } else {
     const body = el.querySelector('.msg-body')

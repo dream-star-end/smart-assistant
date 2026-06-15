@@ -157,6 +157,13 @@ export interface RefreshDeps {
   /**
    * 出口 dispatcher(undici ProxyAgent 等)。给则刷 token 也走该代理,
    * 否则走默认出口。chat orchestrator 应该按账号 egress_proxy 构造后透传进来。
+   *
+   * ⚠️ A2 不变式(fail-closed):**claude refresh 当前唯一调用方是 chat 路径**
+   * (upstream.ts pickUpstream,已用 resolveAccountEgressDispatcher 把"已绑但解析失败"
+   * 在调 refresh **之前** fail-closed,因此传进来的 dispatcher 要么是绑定出口、要么账号
+   * 真正未绑)。若将来新增**无 dispatcher**的 claude refresh 调用方(如后台主动刷新),
+   * 它**必须**像 codex(refreshCodexAccountTokenInner)那样自行 fail-closed 解析出口,
+   * 否则已绑账号的 token 刷新会泄漏到默认/全局出口(去匿名化)。
    */
   dispatcher?: unknown
   /**

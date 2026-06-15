@@ -314,6 +314,8 @@ function buildFakeScheduler(opts: FakeSchedulerOpts = {}): SchedulerSpy {
         expires_at: null,
         egress_proxy: null,
         egress_target: null,
+        egress_proxy_id: null,
+        egress_host_uuid: null,
         pinned_user_id: FIXED_PINNED_USER_ID,
         account_uuid: accountUuid,
         persona: null,

@@ -25,6 +25,7 @@
 
 import { apiGet, apiJson } from './api.js?v=0c9e5665'
 import { formatCredits } from './billing.js?v=0c9e5665'
+import { htmlSafeEscape } from './dom.js?v=0c9e5665'
 import { state } from './state.js?v=0c9e5665'
 import { closeModal, openModal, toast } from './ui.js?v=0c9e5665'
 
@@ -179,14 +180,14 @@ function _renderAccountInfo(user) {
   }
   card.innerHTML = ''
   const rows = [
-    { label: '邮箱', html: `<span class="profile-row-value">${_escape(email)}</span>` +
+    { label: '邮箱', html: `<span class="profile-row-value">${htmlSafeEscape(email)}</span>` +
         (verified
           ? '<span class="profile-verified" title="已验证">✓ 已验证</span>'
           : '<span class="profile-unverified" title="未验证">未验证</span>') },
     { label: '身份', html: `<span class="profile-badge profile-badge--${user.role === 'admin' ? 'admin' : 'user'}">${role}</span>` },
-    { label: '积分余额', html: `<span class="profile-row-value">${_escape(credits)}</span>` },
-    { label: '用户 ID', html: `<span class="profile-row-value profile-mono">${_escape(userId)}</span>` },
-    { label: '注册时间', html: `<span class="profile-row-value">${_escape(createdText || '—')}</span>` },
+    { label: '积分余额', html: `<span class="profile-row-value">${htmlSafeEscape(credits)}</span>` },
+    { label: '用户 ID', html: `<span class="profile-row-value profile-mono">${htmlSafeEscape(userId)}</span>` },
+    { label: '注册时间', html: `<span class="profile-row-value">${htmlSafeEscape(createdText || '—')}</span>` },
   ]
   for (const r of rows) {
     const row = document.createElement('div')
@@ -199,13 +200,7 @@ function _renderAccountInfo(user) {
 function _renderAccountFallback(message) {
   const card = $('profile-account-card')
   if (!card) return
-  card.innerHTML = `<div class="profile-row profile-row-fallback">${_escape(message)}</div>`
-}
-
-function _escape(s) {
-  return String(s).replace(/[&<>"']/g, (c) => (
-    { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
-  ))
+  card.innerHTML = `<div class="profile-row profile-row-fallback">${htmlSafeEscape(message)}</div>`
 }
 
 async function _loadAccountInfo() {
