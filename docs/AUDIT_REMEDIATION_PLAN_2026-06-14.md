@@ -192,4 +192,6 @@
   - 验证:brace 1960/1960;`git diff --check` 干净;web 测试 styleThemeConsistency 4/4、mermaidRenderingConfig 3/3、githubModalStyles 2/2;node --check apiKeys.js OK。
 - 2026-06-15:**U6 z-index token 化完成,Codex PASS**。style.css 41 处散落 z-index 魔数(含 9999/10000"层级战争")→ base :root 新增全局 `--z-*` 标度(18 token),把 25 处跨组件全局层级 decl 换成 token。**严格保值**:每 token 值=原 raw 值,层级关系 byte 级不变(纯命名+集中+文档化);局部 stacking(-1/0/1/2/5/10)保留裸值。验证:无残留裸 ≥20;token 引用 25=原 decl 数;brace 1960/1960;web 测试 4/4+3/3+2/2 全绿。
   - **骨架屏一致性 defer**:主应用无 `.skeleton-*`(仅 admin.html 自带),聊天流/会话列表加骨架屏属**新增 UX 功能**(需 DOM 接线 + 视觉设计 + 浏览器验证),非纯维护性重构,留作独立 UX 项(同 U2/U6 的 stylelint 禁裸 hex/裸 z-index 一并做)。
-- 下一步:批量部署本波次(W2 的 A2/U1/U3/U4/U5/B1/B2/B3/B5/A3 + W3 的 U2/U6-z;B4 经 Go node-agent rollout)→ 再 W4(A1+R1/R2/R3、A5、A4 — design-doc 先行)、W5(B6/B7/B9)。
+- 2026-06-15:**第二批已部署上线 v1.0.323**(commit 81b3a369)。canonical v3 merge 38b8d65b(B2/B3/B4/A3/U2/U6-z)→ `deploy-v3.sh --force`(6 活跃用户已确认 --force)。smoke 5/5;前端 38/47 文件 cache-bust 重写;migration 0081 已在生产 schema_migrations,`compute_hosts_status_check` 已含 `revoked`;`/version`=v1.0.323;origin/v3 已推。⚠ 唯一警告:trace propagation found 2<3(warn-only,HTTP logger traceId 子绑定,**与本批无关**,留观)。
+  - **仍待办:B4(Go node-agent)单独 rollout** —— deploy-v3.sh 只部署 master;B4 改的是 `packages/commercial/node-agent/**`(Go),需另走 node-agent build+distribute+restart 流水线(非 P0,容器 stop/remove/inspect 缺失返真 404 的正确性修复),建议作为独立 ops 操作或与下次 node-agent 改动合并。
+- 下一步:**W4**(A1 turn 生命周期单一权威源 + server turnId,**design-doc 先行** → R1/R2/R3、A5、A4)、再 **W5**(B6/B7/B9)。
