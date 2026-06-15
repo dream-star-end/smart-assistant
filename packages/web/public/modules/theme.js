@@ -1,5 +1,5 @@
 // OpenClaude — Theme management
-import { $ } from './dom.js?v=063d22ba'
+import { $ } from './dom.js?v=5fc56ec3'
 
 let _toast = () => {} // late-bound, set by main.js after ui.js loads
 export function setToastFn(fn) {
