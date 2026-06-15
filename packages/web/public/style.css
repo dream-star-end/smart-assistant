@@ -9598,7 +9598,17 @@ textarea:focus-visible,
 .app {
   grid-template-columns: 286px minmax(0, 1fr);
   background: var(--oc-app-backdrop);
-  position: relative;
+  /* iOS 软键盘修复(boss 报修):键盘弹出时 iOS Safari 不缩 layout、而是把 visual
+     viewport 下移(offsetTop>0)。上面 .app 只同步 height、锚在 layout 顶 → 被顶到键盘
+     上方留白,composer 顶部出屏、思考深度选择行切到屏外。改用 position:fixed 把整个
+     chat shell 钉到可见 visual viewport:top=offsetTop(main.js 同步)、height=visual
+     height。offsetTop=0(桌面/无键盘)时 = 满视口 fixed grid,与原 relative 满视口布局
+     视觉一致(纯加法,不回归);仍保留 isolation 形成独立 stacking context。
+     #app-view 的 modal/landing 是兄弟节点,position:fixed 不波及。 */
+  position: fixed;
+  top: var(--oc-visual-viewport-offset-top, 0px);
+  left: 0;
+  right: 0;
   isolation: isolate;
 }
 .app::before {

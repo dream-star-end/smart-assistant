@@ -330,10 +330,16 @@ function _syncVisualViewportHeight() {
   if (_visualViewportRaf) return
   _visualViewportRaf = requestAnimationFrame(() => {
     _visualViewportRaf = 0
+    const vv = window.visualViewport
     const height = _getVisibleViewportHeight()
     if (height > 0) {
       document.documentElement.style.setProperty('--oc-visual-viewport-height', `${Math.round(height)}px`)
     }
+    // iOS Safari 软键盘弹出时把 visual viewport 下移(offsetTop>0)而不缩 layout viewport;
+    // 仅同步 height 会让 .app(原锚 layout 顶)被顶到键盘上方留白、composer 顶部出屏。
+    // 同步 offsetTop → CSS 用 position:fixed top=offsetTop 把 .app 钉到可见 visual viewport。
+    const offsetTop = vv && Number.isFinite(vv.offsetTop) ? Math.max(0, Math.round(vv.offsetTop)) : 0
+    document.documentElement.style.setProperty('--oc-visual-viewport-offset-top', `${offsetTop}px`)
     autoResize()
   })
 }
