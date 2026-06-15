@@ -65,7 +65,7 @@ import {
 import { normalizeAgentTeamInput, TEAM_ID_RE } from './agentTeams.js'
 import { type WebSocket, WebSocketServer } from 'ws'
 import { checkToken, verifyPassword, signJwt, verifyJwt, type JwtPayload } from './auth.js'
-import { CronScheduler } from './cron.js'
+import { CronScheduler, isUserInitiatedCronJob } from './cron.js'
 import { sendV3WechatProactive, readV3WechatProactiveConfig } from './v3WechatProactive.js'
 import { parseDocument } from './documentParser.js'
 import {
@@ -1161,12 +1161,13 @@ export class Gateway {
     this.cron = new CronScheduler(config, this.sessions, async (text, job) => {
       const agentId = job.agent
       // ── 根治:主动微信投递(定时任务/提醒推送到微信)──
-      // 仅对用户定时任务(cron-bridge job,id 形如 ccb-…),排除系统 heartbeat/reflection。
+      // 对所有用户发起的提醒/定时任务(remind-/ccb-/未来入口),排除系统 heartbeat/reflection
+      // (见 isUserInitiatedCronJob —— 反向排除系统,避免白名单漏掉 remind- 这类入口)。
       // master 权威解析收件人(senderId = binding.loginUserId)+ 偏好 + context_token;
       // 据结果决定:微信接管→不重复 web;绑定但会话过期→回退 web 并标注;其它→正常 web。
       // 刻意不读 lastActiveChannel(其纯内存、重启即失、微信条目永不恢复)。
       let deliverText = text
-      if (wechatProactiveCfg && !job.heartbeat && job.id.startsWith('ccb-')) {
+      if (wechatProactiveCfg && isUserInitiatedCronJob(job)) {
         const result = await sendV3WechatProactive({
           config: wechatProactiveCfg,
           text,

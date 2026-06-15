@@ -14,7 +14,7 @@ import { describe, it, before, after, beforeEach } from 'node:test'
 import * as assert from 'node:assert/strict'
 import { parse as parseYaml } from 'yaml'
 
-const { ensureCronFile } = await import('../cron.js')
+const { ensureCronFile, isUserInitiatedCronJob } = await import('../cron.js')
 const { paths } = await import('@openclaude/storage')
 
 describe('ensureCronFile — OC_SEED_DEFAULT_CRON gate', () => {
@@ -73,5 +73,19 @@ describe('ensureCronFile — OC_SEED_DEFAULT_CRON gate', () => {
     delete process.env.OC_SEED_DEFAULT_CRON
     const file = await ensureCronFile()
     assert.equal(file.jobs.length, 0, 'existing cron.yaml must be preserved regardless of env')
+  })
+})
+
+describe('isUserInitiatedCronJob — proactive wechat eligibility', () => {
+  it('user reminders (remind-) and tool-created (ccb-) are user-initiated', () => {
+    assert.equal(isUserInitiatedCronJob({ id: 'remind-mqfc31wr-swii' }), true)
+    assert.equal(isUserInitiatedCronJob({ id: 'ccb-abc123-def4' }), true)
+    assert.equal(isUserInitiatedCronJob({ id: 'some-future-user-entry' }), true)
+  })
+  it('system reflection/skill/heartbeat jobs are excluded', () => {
+    assert.equal(isUserInitiatedCronJob({ id: 'heartbeat', heartbeat: true }), false)
+    assert.equal(isUserInitiatedCronJob({ id: 'daily-reflection' }), false)
+    assert.equal(isUserInitiatedCronJob({ id: 'weekly-curation' }), false)
+    assert.equal(isUserInitiatedCronJob({ id: 'skill-check' }), false)
   })
 })

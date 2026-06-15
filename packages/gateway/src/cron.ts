@@ -46,6 +46,27 @@ export interface CronJob {
   heartbeat?: boolean
 }
 
+/**
+ * 用户发起的提醒/定时任务 vs 系统自省 job 的判定。
+ *
+ * 用户 cron 入口(都该可推送到微信):
+ *   - `POST /api/cron`  → `remind-<ts>-<rand>`(server.ts)
+ *   - CronCreate tool_use bridge → `ccb-<ts>-<rand>`(sessionManager)
+ * 系统自省 job(personal DEFAULT_JOBS;commercial OC_SEED_DEFAULT_CRON=0 不 seed,绝不外发到微信):
+ *   - heartbeat(job.heartbeat=true)
+ *   - daily-reflection / weekly-curation / skill-check 及任何含 reflection/skill 的变体
+ *
+ * 采用「反向排除系统」而非「白名单用户前缀」:任何新增的用户 cron 入口都自动获得微信投递,
+ * 不会像 startsWith('ccb-') 那样漏掉 remind-(本类 bug 的根因)。系统 job 是封闭已知集。
+ */
+export function isUserInitiatedCronJob(job: Pick<CronJob, 'id' | 'heartbeat'>): boolean {
+  if (job.heartbeat) return false
+  const id = job.id
+  if (id === 'daily-reflection' || id === 'weekly-curation' || id === 'skill-check') return false
+  if (id.includes('reflection') || id.includes('skill')) return false
+  return true
+}
+
 export interface CronFile {
   jobs: CronJob[]
 }
