@@ -103,6 +103,13 @@ import {
   type SweeperHandle as PendingOrdersExpirerHandle,
 } from "./payment/pendingOrdersExpirer.js";
 import {
+  startFinalizeJournalReconciler,
+  resolveStuckThresholdMs,
+  DEFAULT_RECONCILE_INTERVAL_MS,
+  MIN_INTERVAL_MS as FINALIZE_RECONCILER_MIN_INTERVAL_MS,
+  type ReconcilerHandle as FinalizeJournalReconcilerHandle,
+} from "./billing/finalizeJournalReconciler.js";
+import {
   startOnboardingScheduler,
   type OnboardingSchedulerHandle,
 } from "./inbox/onboarding.js";
@@ -2848,6 +2855,25 @@ export async function registerCommercial(
     pendingOrdersExpirer = startPendingOrdersExpirer({ intervalMs });
   }
 
+  // B1 — request_finalize_journal reconciler + GC(migration 0015 承诺、之前漏接)。
+  // 把崩溃后卡 inflight/finalizing 的 journal 行终态化(有结算记录→committed,无→aborted),
+  // 并 GC 老终态行。stuck 阈值对 env 向上夹到 max(CODEX_SESSION_MAX_MS*3, 30min),
+  // 因为 journal 不心跳、不能把存活长流误判成 stuck。
+  let finalizeJournalReconciler: FinalizeJournalReconcilerHandle | undefined;
+  if (process.env.COMMERCIAL_FINALIZE_RECONCILER_DISABLED !== "1") {
+    const rawInterval = Number(process.env.COMMERCIAL_FINALIZE_RECONCILER_INTERVAL_MS);
+    const intervalMs =
+      Number.isFinite(rawInterval) && rawInterval >= FINALIZE_RECONCILER_MIN_INTERVAL_MS
+        ? rawInterval
+        : DEFAULT_RECONCILE_INTERVAL_MS;
+    const rawCodexMax = Number(process.env.CODEX_SESSION_MAX_MS);
+    const thresholdMs = resolveStuckThresholdMs(
+      process.env.COMMERCIAL_FINALIZE_RECONCILER_THRESHOLD_MS,
+      Number.isFinite(rawCodexMax) ? rawCodexMax : undefined,
+    );
+    finalizeJournalReconciler = startFinalizeJournalReconciler({ intervalMs, thresholdMs });
+  }
+
   // Onboarding inbox scheduler — 由 system_settings.onboarding_enabled 决定是否真发,
   // 默认 false 上线即静默,boss 显式开启后才触达用户。详见 inbox/onboarding.ts。
   let onboardingScheduler: OnboardingSchedulerHandle | undefined;
@@ -2931,6 +2957,9 @@ export async function registerCommercial(
       }
       if (pendingOrdersExpirer) {
         try { pendingOrdersExpirer.stop(); } catch { /* ignore */ }
+      }
+      if (finalizeJournalReconciler) {
+        try { finalizeJournalReconciler.stop(); } catch { /* ignore */ }
       }
       if (onboardingScheduler) {
         try { onboardingScheduler.stop(); } catch { /* ignore */ }
