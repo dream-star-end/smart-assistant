@@ -8,7 +8,8 @@
 #      —— 排除 node_modules / .git / dist / cache / *.log / 各种生成产物
 #   2. 把 Dockerfile + runtime/ 也搬过去
 #   3. docker build -t openclaude/openclaude-runtime:<tag>
-#   4. docker save | gzip > /var/lib/openclaude-v3/images/openclaude-runtime-<tag>.tar.gz
+#   4. docker save | pigz(无则 gzip)> /var/lib/openclaude-v3/images/openclaude-runtime-<tag>.tar.gz
+#      —— 该 tar 仅用于跨 host 分发/备份;单机池可 OC_BUILD_SKIP_TAR=1 跳过这步(省 ~55s)
 #   5. 打印 summary(tag / sha256 / size / load 提示),给 5A deploy-to-remote-v3.sh 抄
 #
 # 注意:
@@ -233,16 +234,38 @@ echo "[build-image] image size: ${IMAGE_SIZE_MB} MiB"
 # ───────────────────────────────────────────────
 # 3. docker save → gzip → tar.gz
 # ───────────────────────────────────────────────
-TAR_TMP="${TAR_PATH}.partial"
-rm -f "$TAR_TMP" "$TAR_PATH"
-echo "[build-image] docker save | gzip → $TAR_PATH"
-docker save "$IMAGE_FULL" | gzip -c > "$TAR_TMP"
-mv "$TAR_TMP" "$TAR_PATH"
-chmod 0644 "$TAR_PATH"
+# OC_BUILD_SKIP_TAR=1 → **跳过整个 docker save + 压缩**(本步实测约占构建 ~55s,瓶颈是
+#   docker save 读 1.4GB 镜像,不是压缩)。该 tar.gz 唯一硬用途是 **跨 compute host 分发**
+#   (distribute-image-explicit.ts 读它传镜像);**单机池**(distribute 0 远端目标)用不到它,
+#   镜像 build 完已在本地 docker store 直接可用,回滚走 OC_RUNTIME_IMAGE flip 回上一 tag
+#   (image-gc 保留 last-3,本地 store 里仍在)。
+#   ⚠️ **多机池 / 即将新增 compute host 时绝不要设此开关** —— 否则 distribute 无 tar 可传。
+#   默认(不设)= 保持原行为,产出 tar(安全)。
+if [ "${OC_BUILD_SKIP_TAR:-0}" = "1" ]; then
+  echo "[build-image] OC_BUILD_SKIP_TAR=1 → 跳过 docker save|压缩(单机池;镜像已在本地 store,省 ~55s)"
+  rm -f "${TAR_PATH}.partial" "$TAR_PATH"
+  TAR_SIZE_MB="skipped"
+  TAR_SHA256="skipped(OC_BUILD_SKIP_TAR=1)"
+else
+  TAR_TMP="${TAR_PATH}.partial"
+  rm -f "$TAR_TMP" "$TAR_PATH"
+  # 并行压缩:单线程 gzip 压 1.4GB 是可压缩耗时点(本机多核)。pigz 用满多核,**输出仍是
+  # 标准 gzip 格式** —— 分发/回滚侧的 `gunzip -c | docker load` 完全不用改,零兼容风险。
+  # pigz 不在则回退单线程 gzip。set -o pipefail 下 docker save 失败仍让整条管道失败(与原等价)。
+  if command -v pigz >/dev/null 2>&1; then
+    echo "[build-image] docker save | pigz(并行 $(nproc) 核)→ $TAR_PATH"
+    docker save "$IMAGE_FULL" | pigz -c > "$TAR_TMP"
+  else
+    echo "[build-image] docker save | gzip(无 pigz,单线程回退)→ $TAR_PATH"
+    docker save "$IMAGE_FULL" | gzip -c > "$TAR_TMP"
+  fi
+  mv "$TAR_TMP" "$TAR_PATH"
+  chmod 0644 "$TAR_PATH"
 
-TAR_SIZE_BYTES="$(stat -c%s "$TAR_PATH")"
-TAR_SIZE_MB="$(( TAR_SIZE_BYTES / 1024 / 1024 ))"
-TAR_SHA256="$(sha256sum "$TAR_PATH" | awk '{print $1}')"
+  TAR_SIZE_BYTES="$(stat -c%s "$TAR_PATH")"
+  TAR_SIZE_MB="$(( TAR_SIZE_BYTES / 1024 / 1024 ))"
+  TAR_SHA256="$(sha256sum "$TAR_PATH" | awk '{print $1}')"
+fi
 
 # ───────────────────────────────────────────────
 # 4. master-side image GC (保留最新 N 个 + latest + 当前在用 + 本次 build)
@@ -359,6 +382,16 @@ cat <<EOF
 [build-image]   tar size   : ${TAR_SIZE_MB} MiB
 [build-image]   tar sha256 : $TAR_SHA256
 [build-image] ====================================================================
+EOF
+if [ "${OC_BUILD_SKIP_TAR:-0}" = "1" ]; then
+  cat <<EOF
+[build-image]   tar 已跳过(OC_BUILD_SKIP_TAR=1)—— 镜像仅在本机 docker store。
+[build-image]   单机池无需跨 host 传输;若要分发到其它 compute host,请去掉该开关重新 build。
+[build-image] ====================================================================
+
+EOF
+else
+  cat <<EOF
 [build-image]   远端部署 (商用版 v3 生产 primary = 154.193.246.236 / ssh alias kl-mirror):
 [build-image]     scp $TAR_PATH kl-mirror:/var/lib/openclaude-v3/images/
 [build-image]     ssh kl-mirror "gunzip -c /var/lib/openclaude-v3/images/openclaude-runtime-${TAG}.tar.gz | docker load"
@@ -366,3 +399,4 @@ cat <<EOF
 [build-image] ====================================================================
 
 EOF
+fi
