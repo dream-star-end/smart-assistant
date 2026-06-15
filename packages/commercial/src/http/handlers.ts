@@ -48,12 +48,13 @@ import { getBearerToken, getSessionCookieToken } from "./authHelpers.js";
 import { defaultTunnelFetchHealthz } from "./tunnelHealthzProbe.js";
 import { getHostById as computePoolGetHostById } from "../compute-pool/queries.js";
 import { dialTunnelSocket as defaultTunnelDial } from "../compute-pool/nodeAgentClient.js";
-import { checkRateLimit, recordRateLimitEvent, type RateLimitConfig, type RateLimitRedis } from "../middleware/rateLimit.js";
+import { checkRateLimit, recordRateLimitEvent, type RateLimitConfig, type RateLimitDecision, type RateLimitRedis } from "../middleware/rateLimit.js";
+import { FallbackRateLimiter } from "./proxy/shared.js";
 import { getSystemSetting } from "../admin/systemSettings.js";
 import type { Mailer } from "../auth/mail.js";
 import type { PricingCache } from "../billing/pricing.js";
 import type { PreCheckRedis } from "../billing/preCheck.js";
-import type { Logger } from "../logging/logger.js";
+import { rootLogger, type Logger } from "../logging/logger.js";
 import type { HupijiaoClient, HupijiaoConfig } from "../payment/hupijiao/client.js";
 import type { AgentHttpDeps } from "./agent.js";
 import type { V3SupervisorDeps } from "../agent-sandbox/v3supervisor.js";
@@ -351,16 +352,70 @@ export function hashEmailForRateLimit(email: string): string {
   return createHash("sha256").update(normalized).digest("hex").slice(0, 16);
 }
 
+// B9 — Redis 挂时鉴权/支付限流的 per-process 兜底。
+// 此前 checkRateLimit 内 `redis.incr` 无兜底:Redis 不可用即 throw → enforceRateLimit
+// 透出 → register/login/reset/refresh/... 全 500(鉴权整体宕机)。聊天代理早有
+// FallbackRateLimiter,鉴权端却没接。这里在唯一 choke point 接同一兜底:每个
+// (scope+window+max) 一个固定窗口限流器,cap 取 Redis 配额的 ~1/3(下限 1)——
+// "降级而非开闸":Redis 盲时收紧挡放大攻击,但鉴权仍可用。per-process(蓝绿不汇总)
+// 是可接受降级面;Redis 恢复后自动回到分布式精确限流。
+const _rlFallbacks = new Map<string, FallbackRateLimiter>();
+let _lastRlFallbackWarnAt = 0;
+function _fallbackLimiterFor(cfg: RateLimitConfig): FallbackRateLimiter {
+  // 按 scope+window+max+keyPrefix 建键:配置变更则用新限流器,不沿用旧窗口/阈值;
+  // 纳入 keyPrefix 与 Redis key 隔离语义对齐(只差 keyPrefix 的配置不共享兜底桶)。
+  const key = `${cfg.scope}:${cfg.windowSeconds}:${cfg.max}:${cfg.keyPrefix ?? ""}`;
+  let limiter = _rlFallbacks.get(key);
+  if (!limiter) {
+    const cap = Math.max(1, Math.ceil(cfg.max / 3));
+    limiter = new FallbackRateLimiter(cfg.windowSeconds, cap);
+    _rlFallbacks.set(key, limiter);
+  }
+  return limiter;
+}
+
 /**
  * 限流帮助:超限抛 HttpError(429),并写一行 rate_limit_events。
  * 导出给 payment / chat 等路由复用。
+ * Redis 不可用时降级到 per-process FallbackRateLimiter(B9),不再整体 500。
  */
 export async function enforceRateLimit(
   deps: CommercialHttpDeps,
   cfg: RateLimitConfig,
   identifier: string,
 ): Promise<void> {
-  const decision = await checkRateLimit(deps.redis, cfg, identifier);
+  // Codex B9 Finding 1:identifier 是运行时可变入参(clientIp / user:id / email-hash),
+  // 非法(空/超长)是上游 bug,应直接抛、不被下面的 Redis 兜底 catch 掩盖。先于 try 校验
+  // (与 checkRateLimit 同口径),使 catch 只可能捕获 redis.incr 的连接/命令错误。
+  // cfg 来自固定 DEFAULT_RATE_LIMITS/deps(启动期有效),不在此重复 schema 校验。
+  if (typeof identifier !== "string" || identifier.length === 0 || identifier.length > 256) {
+    throw new Error(
+      `enforceRateLimit: invalid identifier (length=${typeof identifier === "string" ? identifier.length : "non-string"})`,
+    );
+  }
+  let decision: RateLimitDecision;
+  try {
+    decision = await checkRateLimit(deps.redis, cfg, identifier);
+  } catch (err) {
+    // 到此基本只可能是 Redis 不可用(incr 连接/命令错误)→ per-process 兜底,保鉴权可用。
+    const limiter = _fallbackLimiterFor(cfg);
+    const allowed = limiter.tryAcquire(identifier);
+    decision = {
+      allowed,
+      count: 0,
+      limit: limiter.maxPerKey,
+      retryAfterSeconds: cfg.windowSeconds,
+      key: `fallback:${cfg.scope}`,
+    };
+    const now = Date.now();
+    if (now - _lastRlFallbackWarnAt > 30_000) {
+      _lastRlFallbackWarnAt = now;
+      rootLogger.warn("rate-limit Redis unavailable; using per-process fallback (degraded, blue-green not aggregated)", {
+        scope: cfg.scope,
+        err: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
   if (!decision.allowed) {
     // 不 await — 记录失败不应阻塞响应
     void recordRateLimitEvent(cfg.scope, identifier, true);

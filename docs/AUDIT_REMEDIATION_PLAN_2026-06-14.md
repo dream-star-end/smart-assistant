@@ -50,7 +50,7 @@
 | A4 | god-file 拆分（websocket/handleOutbound 注册表/admin） | 架构 | P1 | 5 | W4 | 无（纯重构） | ⬜ A5 之后 |
 | B6 | per-account 并发上限改分布式租约 | 正确性 | P2 | 11 | W5 | 无 | ⬜ |
 | B7 | Claude inflight slot TTL reaper | 正确性 | P2 | 11 | W5 | ↑（少误 429） | ⬜ |
-| B9 | auth rate-limiter Redis down 优雅降级 | 可用性 | P3 | 14 | W5 | ↑ | ⬜ |
+| B9 | auth rate-limiter Redis down 优雅降级 | 可用性 | P3 | 14 | W5 | ↑ | ✅ PASS（Codex 2 轮） |
 
 状态图例：⬜ 未开始 / 🟡 进行中(含子状态) / 🔵 待 Codex / ✅ PASS 已合并。
 
@@ -196,6 +196,9 @@
   - **仍待办:B4(Go node-agent)单独 rollout** —— deploy-v3.sh 只部署 master;B4 改的是 `packages/commercial/node-agent/**`(Go),需另走 node-agent build+distribute+restart 流水线(非 P0,容器 stop/remove/inspect 缺失返真 404 的正确性修复),建议作为独立 ops 操作或与下次 node-agent 改动合并。
 - 2026-06-15:**A1 设计文档完成,Codex 计划审 APPROVE(3 轮 REVISE→APPROVE)**,见 `docs/A1_TURN_LIFECYCLE_DESIGN.md`。Explore agent 实测映射:3 套并行 in-flight 表示(`sess._sendingInFlight` 17R/16W、被独立赋值的派生量 `state.sendingInFlight` 16R/14W、`_reconnectInFlightSet`)+ teardown 复制 11 处(仅 isFinal 完整)+ 帧↔turn 靠跨时钟域 ts 比较(自承认设备钟快>5s 丢 final)。设计:客户端 `turnLifecycle.js` `sess.turn` 单一真相 + `beginTurn/endTurn(reason,{finalize})` reason 策略 + UI/transport 读点分层(非一刀切派生 getter);server `clientTurnId`(client-mint 全链路 echo,含商业 bridge)+ per-turn binding mode(capability 协商,未确证→legacy,杜绝混用)。Codex 关键修正已纳入:派生 getter 会破坏 reconnect UI 抑制(1829)→改分层 + 镜像过渡;非 final 不得自动定稿流式行→finalize 三策略(full/flushOnly/none);bridge echo + 合成帧 turnId 规则;full finalize 须抽完整有序阶段(2441+2997)。
   - **实现待办(本环境无法 headless 完成的硬前置)**:A1 验收门是**dev 起站 + 浏览器逐条流式 smoke**(P1-P6:打字指示器/停止按钮/流式增量/重连恢复/切会话/弱网),headless 无法验证可见流式体验。按 Codex 建议 Phase 1 起(1a facade+镜像零行为变 → 1b reason 策略 teardown → 1c UI getter 分层),每子步浏览器 smoke。**留待具备 dev/浏览器的会话实现,或由用户在每子步跑 smoke。**
+- 2026-06-15:**移动端紧急修复 + 上线 v1.0.324**(`81b3a369`→`dc9e4d68`)。boss 报修:iOS 软键盘弹出 → 输入框被顶到屏顶、思考深度选择行切出屏外、下方留白。根因:iOS Safari 键盘 overlay/pan(`visualViewport.offsetTop>0`)不缩 layout,原代码只同步 height、shell 锚 layout 顶 → 跑到可见区上方。修复:main.js 同步 `--oc-visual-viewport-offset-top`,style.css 权威 `.app`(refreshed-app 块)`position:relative→fixed; top=offsetTop`,把 chat shell 钉到可见 visual viewport(offsetTop=0 桌面态等价原布局,纯加法)。Codex PASS;web 测全绿;待 boss iOS 真机确认(本环境无 iOS Safari)。
+- 2026-06-15:**B9(auth rate-limiter Redis-down 优雅降级)完成,Codex PASS(2 轮)**。根因:`enforceRateLimit`(唯一 choke point,register/login/reset/refresh/verify/feedback/payment/oauth 共用)调 `checkRateLimit` 内 `redis.incr` 无兜底 → Redis 挂即 throw → 鉴权全 500。修复:try/catch 包 checkRateLimit,Redis 错误 → 降级到 per-process `FallbackRateLimiter`(复用聊天代理同类;cap=ceil(max/3)"降级而非开闸";键 scope+window+max+keyPrefix);Redis 正常路径逐字节不变。Codex 修正:identifier 校验前置到 try 外(非法即抛、不被兜底掩盖)、keyPrefix 纳入键。测试 enforceRateLimitFallback 5/5 + rateLimit 12/12;authRateLimit.integ 2/4 失败经 baseline 对比确认为预存在环境问题(非本改动)。master-only,无需 runtime image。
 - 下一步(按"可否 headless 完成"分流):
-  - **headless 可完成**(同 A3/B1/B3 范式,有 PG/Redis 可 integ 测):**W5 B6**(per-account 并发分布式租约)、**B7**(Claude inflight slot TTL reaper)、**B9**(auth rate-limiter Redis-down 降级);**A5**(前端 checkJs 消环,tsc 可验)、**A4**(god-file 拆分,单测可验)。
+  - **headless 可完成**(同 A3/B1/B3 范式,有 PG/Redis 可 integ 测):**W5 B7**(Claude inflight slot TTL reaper)、**B6**(per-account 并发分布式租约,hot-path 高风险,拟 design-doc + Codex plan 先行,可与 B7 合为分布式 TTL 租约统一根治);**A5**(前端 checkJs 消环,tsc 可验)、**A4**(god-file 拆分,单测可验)。
   - **需 dev/浏览器验证**(流式/多标签/IDB 可见行为):**A1 实现**、**R1/R2/R3**(多标签协调 / IDB 迁移 / 客户端幂等)。
+  - **独立 ops**:B4 Go node-agent rollout(非 P0)。
