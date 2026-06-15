@@ -1,7 +1,7 @@
 // OpenClaude — Current-session plan / TodoWrite quick panel
-import { $, htmlSafeEscape } from './dom.js?v=cb18d789'
-import { processRichBlocks, renderMarkdown, renderStreamingMarkdown } from './markdown.js?v=cb18d789'
-import { getSession } from './state.js?v=cb18d789'
+import { $, htmlSafeEscape } from './dom.js?v=c056e806'
+import { processRichBlocks, renderMarkdown, renderStreamingMarkdown } from './markdown.js?v=c056e806'
+import { getSession } from './state.js?v=c056e806'
 
 let _open = false
 let _initialized = false
