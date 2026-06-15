@@ -23,6 +23,7 @@ import { loadUserPrefs, setCachedPrefField } from './userPrefs.js?v=532fa896'
 let _pollAbort = null
 let _currentQrcode = null
 let _toolPrefSaving = false
+let _proactivePrefSaving = false
 let _workerRefreshTimer = null
 
 const WORKER_START_GRACE_MS = 45_000
@@ -115,6 +116,7 @@ async function loadBinding() {
       workerWarn
     showState('bound')
     void loadToolCallPreference()
+    void loadProactivePreference()
     return binding
   } catch (e) {
     setError(`加载绑定失败: ${e?.message || e}`)
@@ -328,6 +330,58 @@ async function saveToolCallPreference() {
   }
 }
 
+async function loadProactivePreference() {
+  const checkbox = $('wechat-proactive-push')
+  const status = $('wechat-proactive-status')
+  if (!checkbox) return
+  checkbox.disabled = true
+  if (status) status.textContent = '加载中…'
+  try {
+    const prefs = await loadUserPrefs(true)
+    const checked = prefs?.wechat_proactive_push !== false // 绑微信默认开
+    checkbox.checked = checked
+    checkbox.dataset.saved = checked ? 'true' : 'false'
+    if (status) status.textContent = ''
+  } catch (e) {
+    checkbox.checked = true
+    checkbox.dataset.saved = 'true'
+    if (status) status.textContent = '偏好加载失败，默认推送到微信'
+    console.warn('load WeChat proactive preference failed:', e)
+  } finally {
+    checkbox.disabled = false
+  }
+}
+
+async function saveProactivePreference() {
+  const checkbox = $('wechat-proactive-push')
+  const status = $('wechat-proactive-status')
+  if (!checkbox || _proactivePrefSaving) return
+  const previous = checkbox.dataset.saved === 'false' ? false : true
+  const next = checkbox.checked === true
+  _proactivePrefSaving = true
+  checkbox.disabled = true
+  if (status) status.textContent = '保存中…'
+  try {
+    const resp = await apiJson('PATCH', '/api/me/preferences', {
+      wechat_proactive_push: next,
+    })
+    const fresh = (resp && typeof resp.prefs === 'object' && resp.prefs !== null) ? resp.prefs : {}
+    const saved = fresh.wechat_proactive_push !== false
+    checkbox.checked = saved
+    checkbox.dataset.saved = saved ? 'true' : 'false'
+    setCachedPrefField('wechat_proactive_push', saved)
+    if (status) status.textContent = ''
+    toast(saved ? '定时任务 / 提醒将推送到微信' : '定时任务 / 提醒不再推送到微信', 'success')
+  } catch (e) {
+    checkbox.checked = previous
+    if (status) status.textContent = `保存失败: ${e?.message || e}`
+    toast('微信主动推送设置保存失败', 'error')
+  } finally {
+    checkbox.disabled = false
+    _proactivePrefSaving = false
+  }
+}
+
 export function openWechatModal() {
   setError('')
   clearWorkerRefreshTimer()
@@ -342,6 +396,8 @@ export function initWechatListeners() {
   $('wechat-unbind-btn').onclick = unbind
   const toolPref = $('wechat-show-tool-calls')
   if (toolPref) toolPref.onchange = saveToolCallPreference
+  const proactivePref = $('wechat-proactive-push')
+  if (proactivePref) proactivePref.onchange = saveProactivePreference
 
   // Abort any in-flight pairing poll when the modal closes.
   document.addEventListener('click', (e) => {

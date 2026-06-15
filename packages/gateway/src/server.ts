@@ -66,6 +66,7 @@ import { normalizeAgentTeamInput, TEAM_ID_RE } from './agentTeams.js'
 import { type WebSocket, WebSocketServer } from 'ws'
 import { checkToken, verifyPassword, signJwt, verifyJwt, type JwtPayload } from './auth.js'
 import { CronScheduler } from './cron.js'
+import { sendV3WechatProactive, readV3WechatProactiveConfig } from './v3WechatProactive.js'
 import { parseDocument } from './documentParser.js'
 import {
   makeDelegateProgressBlock,
@@ -1156,8 +1157,28 @@ export class Gateway {
 
     // Start cron scheduler for reflection jobs (L3)
     // Smart delivery: push to last active channel, fallback to all webchat clients
-    this.cron = new CronScheduler(config, this.sessions, (text, job) => {
+    const wechatProactiveCfg = readV3WechatProactiveConfig()
+    this.cron = new CronScheduler(config, this.sessions, async (text, job) => {
       const agentId = job.agent
+      // ── 根治:主动微信投递(定时任务/提醒推送到微信)──
+      // 仅对用户定时任务(cron-bridge job,id 形如 ccb-…),排除系统 heartbeat/reflection。
+      // master 权威解析收件人(senderId = binding.loginUserId)+ 偏好 + context_token;
+      // 据结果决定:微信接管→不重复 web;绑定但会话过期→回退 web 并标注;其它→正常 web。
+      // 刻意不读 lastActiveChannel(其纯内存、重启即失、微信条目永不恢复)。
+      let deliverText = text
+      if (wechatProactiveCfg && !job.heartbeat && job.id.startsWith('ccb-')) {
+        const result = await sendV3WechatProactive({
+          config: wechatProactiveCfg,
+          text,
+          // 分钟粒度稳定幂等键:同一 fire(同分钟)被重跑→同 outboundId→outbox UNIQUE 去重,
+          // 避免崩溃/重试窗口重复发微信(cron 调度本身也是分钟粒度去重)。
+          outboundId: `${job.id}.wxproactive.${Math.floor(Date.now() / 60000)}`,
+        }).catch(() => ({ kind: 'fallback', marked: false }) as const)
+        if (result.kind === 'delivered') return
+        if (result.marked) {
+          deliverText = `⚠️ 微信因会话过期/未激活未送达(发条微信即可恢复推送)\n\n${text}`
+        }
+      }
       const lastActive = this.lastActiveChannel.get(agentId)
       const icon =
         job.id === 'heartbeat'
@@ -1175,7 +1196,7 @@ export class Gateway {
         sessionKey: sessionKey || `agent:${agentId}:cron:dm:${job.id}`,
         channel: 'webchat' as const,
         peer: { id: peerId, kind: 'dm' as const },
-        blocks: [{ kind: 'text' as const, text: `${icon} ${job.label || job.id}\n\n${text}` }],
+        blocks: [{ kind: 'text' as const, text: `${icon} ${job.label || job.id}\n\n${deliverText}` }],
         isFinal: true,
         cronJob: { id: job.id, heartbeat: !!job.heartbeat, label: job.label || job.id },
       })

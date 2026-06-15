@@ -2092,6 +2092,14 @@
           </div>
           <div id="wechat-tool-calls-status" style="color:var(--fg-muted);font-size:var(--text-xs);margin-top:4px"></div>
         </div>
+        <div class="form-row">
+          <label for="wechat-proactive-push">定时任务 / 提醒推送到微信</label>
+          <div style="display:flex;align-items:center;gap:var(--space-2);font-size:var(--text-sm)">
+            <input id="wechat-proactive-push" type="checkbox" checked />
+            <span style="color:var(--fg-muted)">开启后，定时任务和提醒会主动推送到微信(需会话活跃；过期会回退网页并提示发条微信恢复)。</span>
+          </div>
+          <div id="wechat-proactive-status" style="color:var(--fg-muted);font-size:var(--text-xs);margin-top:4px"></div>
+        </div>
         <p style="margin:var(--space-2) 0 0;color:var(--fg-muted);font-size:var(--text-xs)">
           任何能联系到本 bot 的微信账号都可直接对话(无白名单限制)。访问控制由微信好友关系本身决定。
         </p>
