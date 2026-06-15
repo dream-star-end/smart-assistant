@@ -34,7 +34,7 @@
 | U3 | `confirmDialog` 替换 12 处原生 confirm | UI | P2 | 8 | W1 | ↑ 提升 | ✅ Codex PASS, commit `3ad5b96f` |
 | U5 | escape helper 去重 + wechat.js:113 转义 | 安全/质量 | P2/P3 | 12 | W1 | 无 | ✅ Codex PASS, commit `62ac2835` |
 | U4 | `--fg-dim` 对比度达 WCAG AA | UI | P2 | 9 | W1 | ↑ 提升 | ✅ Codex PASS, commit `1d431a06` |
-| B1 | `request_finalize_journal` 对账器+GC | 资金 | P1 | 4 | W2 | 无 | ⬜ |
+| B1 | `request_finalize_journal` 对账器+GC | 资金 | P1 | 4 | W2 | 无 | ✅ Codex PASS, commit `ef2022db` |
 | B2 | admin 路由层声明式鉴权 | 安全 | P1 | 5 | W2 | 无 | ⬜ |
 | B3 | codex disable drift reconciler | 安全 | P1 | 5 | W2 | 无 | ⬜ |
 | B4 | node-agent 缺失容器返真 404 | 正确性 | P1 | 5 | W2 | ↑（少卡死） | ⬜ |
@@ -157,4 +157,5 @@
   - U3：`confirmDialog`（Promise，复用 modal+焦点陷阱，capture 阶段 Escape 防嵌套双关，串行化），替换 12 处 confirm + 收编 modelPicker confirmExitTeam。
   - U4：`--fg-dim` 提对比度达 AA（--bg/elevated/subtle），raised/tinted 次要文字降级 --fg-muted。
   - 验证：全程 node --check + biome 0 新增 + test:web 993/993；前端 cache-bust 由 deploy-v3.sh 自动处理。
-- 下一步：**W2 后端安全/资金**（B1 finalize journal 对账器 / B2 admin 路由声明式鉴权 / B3 codex disable drift / B4 node-agent 真 404 / A3 host 吊销+B8 / B5 只读 admin verify-db）。
+- 2026-06-15：**B1 完成**（commit `ef2022db`，Codex 计划审+代码审 PASS）。terminalizer（非 replay,journal 无观测用量不可重算）:有 usage_records→committed 回填,无→aborted 不退不扣;7d GC 批量删。阈值根治:不用 0015 字面 30s（journal 不心跳、codex 600s,会误 abort 活流）,默认 30min/env 向上夹 max(codexMax*3,30min)/24h 上限+isSafeInteger 防 ::bigint 打挂。接进 index.ts 调度+关停;单测 14/14;SQL integ 留批量部署阶段验。
+- 下一步 W2 剩余:**B2 admin 路由声明式鉴权 / B3 codex disable drift / B4 node-agent 真 404 / A3 host 吊销+B8 / B5 只读 admin verify-db**。
