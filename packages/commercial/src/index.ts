@@ -62,7 +62,9 @@ import {
 } from "./account-pool/codexLazyMigrate.js";
 import {
   type CodexDisableFanoutDeps,
+  type CodexDriftReconcilerHandle,
   enqueueCodexDisableFanout,
+  startCodexDisableDriftReconciler,
 } from "./account-pool/codexDisableFanout.js";
 import { AccountHealthTracker, wrapIoredisForHealth } from "./account-pool/health.js";
 import { writeCodexContainerAuthFile } from "./codex-auth/codexAuthFile.js";
@@ -1651,6 +1653,8 @@ export async function registerCommercial(
   // 单机 / v3Deps 未装(测试 / 无 docker)时 putRemoteCodexAuth 为 undefined,
   // 走本地 fs 写;若实际 row.host_uuid 是远端但 helper 未注入,
   // fetchSnapshotAndWriteContainerAuth 会抛错 → tx ROLLBACK,符合强一致语义。
+  // 句柄声明在 block 外,shutdown 才能 stop(fanoutDeps 是 block-local)。
+  let codexDriftReconciler: CodexDriftReconcilerHandle | undefined;
   {
     const codexContainerDirForFanout =
       process.env.OC_V3_CODEX_CONTAINER_DIR?.trim() || DEFAULT_V3_CODEX_CONTAINER_DIR;
@@ -1671,6 +1675,13 @@ export async function registerCommercial(
     triggerCodexDisableFanoutRef.current = (accountId: bigint) => {
       enqueueCodexDisableFanout(accountId, fanoutDeps);
     };
+    // B3 — fanout 是 fire-and-forget,单容器 rebind 失败无重试且恢复 actor 看不到
+    // disabled 账号的残留绑定 → 周期性兜底对账,复用同一强一致 rebind。
+    if (process.env.COMMERCIAL_CODEX_DRIFT_RECONCILER_DISABLED !== "1") {
+      const raw = Number(process.env.COMMERCIAL_CODEX_DRIFT_RECONCILER_INTERVAL_MS);
+      const intervalMs = Number.isFinite(raw) && raw >= 30_000 ? raw : 300_000;
+      codexDriftReconciler = startCodexDisableDriftReconciler({ deps: fanoutDeps, intervalMs });
+    }
   }
 
   // V3 多机路由:启动 BaselineServer,给远端 node-agent 提供
@@ -2960,6 +2971,9 @@ export async function registerCommercial(
       }
       if (finalizeJournalReconciler) {
         try { finalizeJournalReconciler.stop(); } catch { /* ignore */ }
+      }
+      if (codexDriftReconciler) {
+        try { codexDriftReconciler.stop(); } catch { /* ignore */ }
       }
       if (onboardingScheduler) {
         try { onboardingScheduler.stop(); } catch { /* ignore */ }
