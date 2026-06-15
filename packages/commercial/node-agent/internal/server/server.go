@@ -290,6 +290,10 @@ func (s *Server) handleContainerSub(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if err := s.runner.Stop(ctx, cid); err != nil {
+			if errors.Is(err, containers.ErrContainerNotFound) {
+				writeContainerNotFound(w)
+				return
+			}
 			http.Error(w, fmt.Sprintf(`{"code":"STOP_FAIL","error":%q}`, err.Error()), http.StatusInternalServerError)
 			return
 		}
@@ -301,6 +305,10 @@ func (s *Server) handleContainerSub(w http.ResponseWriter, r *http.Request) {
 		}
 		force := r.URL.Query().Get("force") == "1"
 		if err := s.runner.Remove(ctx, cid, force); err != nil {
+			if errors.Is(err, containers.ErrContainerNotFound) {
+				writeContainerNotFound(w)
+				return
+			}
 			http.Error(w, fmt.Sprintf(`{"code":"REMOVE_FAIL","error":%q}`, err.Error()), http.StatusInternalServerError)
 			return
 		}
@@ -312,6 +320,10 @@ func (s *Server) handleContainerSub(w http.ResponseWriter, r *http.Request) {
 		}
 		ii, err := s.runner.Inspect(ctx, cid)
 		if err != nil {
+			if errors.Is(err, containers.ErrContainerNotFound) {
+				writeContainerNotFound(w)
+				return
+			}
 			http.Error(w, fmt.Sprintf(`{"code":"INSPECT_FAIL","error":%q}`, err.Error()), http.StatusInternalServerError)
 			return
 		}
@@ -320,6 +332,13 @@ func (s *Server) handleContainerSub(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.NotFound(w, r)
 	}
+}
+
+// writeContainerNotFound — B4:容器在本 host 不存在时统一回 404 CONTAINER_NOT_FOUND。
+// master 的 isNotFound(httpStatus===404)据此把行判为 vanished 并清理,而不是把
+// 缺失容器当 500 失败反复重试。
+func writeContainerNotFound(w http.ResponseWriter) {
+	http.Error(w, `{"code":"CONTAINER_NOT_FOUND","error":"container not found on this host"}`, http.StatusNotFound)
 }
 
 // handleImageInspect — POST /image/inspect { tag } → {id, repoTags, labels}

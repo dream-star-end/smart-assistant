@@ -55,10 +55,10 @@ var (
 	// 容器 name (master 传来 /containers/run 的 Name 字段):oc-v3-u<uid>
 	reName = regexp.MustCompile(`^oc-v3-[a-zA-Z0-9_-]{1,48}$`)
 	// docker 内部 id(stop/remove/inspect URL 里 master 传回来):64-hex 或 12-hex short
-	reDockerId  = regexp.MustCompile(`^[a-f0-9]{12,64}$`)
-	reImage     = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._:/@-]{0,255}$`)
-	reLabelKey  = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$`)
-	reEnvKey    = regexp.MustCompile(`^[A-Z_][A-Z0-9_]{0,63}$`)
+	reDockerId = regexp.MustCompile(`^[a-f0-9]{12,64}$`)
+	reImage    = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._:/@-]{0,255}$`)
+	reLabelKey = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$`)
+	reEnvKey   = regexp.MustCompile(`^[A-Z_][A-Z0-9_]{0,63}$`)
 	// 与 volumes.go reVolumeName 严格同步;5 个前缀对应 D2 全套持久化 volume。
 	reVolumeSrc = regexp.MustCompile(`^oc-v3-(data|proj|codex|userlocal|userconfig)-u[1-9][0-9]{0,15}$`)
 )
@@ -146,8 +146,8 @@ var MountRoots = []string{
 	"/var/lib/openclaude/containers", // 容器 workdir 上层
 	"/var/lib/openclaude/skills",
 	"/var/lib/openclaude/user-data",
-	"/var/lib/openclaude/baseline",                  // CCB baseline(由 baseline poller 拉到本地,容器 ro 挂载)
-	"/var/lib/openclaude-v3/codex-container-auth",   // 远端 codex auth(per-container 子目录,master 通过 PUT /files 写入)
+	"/var/lib/openclaude/baseline",                // CCB baseline(由 baseline poller 拉到本地,容器 ro 挂载)
+	"/var/lib/openclaude-v3/codex-container-auth", // 远端 codex auth(per-container 子目录,master 通过 PUT /files 写入)
 }
 
 // ─── 请求结构 ──────────────────────────────────────────────────────
@@ -157,8 +157,8 @@ var MountRoots = []string{
 // 严格对齐。改动这里要同步审视 TS 侧。**
 
 type Bind struct {
-	Source   string `json:"source"`   // docker named volume 名 或 host abs path
-	Target   string `json:"target"`   // 容器内 abs path
+	Source   string `json:"source"` // docker named volume 名 或 host abs path
+	Target   string `json:"target"` // 容器内 abs path
 	ReadOnly bool   `json:"readonly"`
 }
 
@@ -169,7 +169,7 @@ type RunRequest struct {
 	BoundIP       string            `json:"boundIp"`
 	InternalPort  int               `json:"internalPort"` // master 记录,node-agent 不落地
 	Env           map[string]string `json:"env"`
-	Labels        map[string]string `json:"labels"`       // master 已 merge managed=1
+	Labels        map[string]string `json:"labels"` // master 已 merge managed=1
 	Binds         []Bind            `json:"binds"`
 	MemoryBytes   int64             `json:"memoryBytes"`
 	NanoCpus      int64             `json:"nanoCpus"`
@@ -364,8 +364,9 @@ func (r *Runner) Stop(ctx context.Context, cid string) error {
 	defer l.Unlock()
 	release := acquire()
 	defer release()
+	// assertOwned 已把"已不存在"归一;这里覆盖 assertOwned 通过后到 stop 之间消失的 race。
 	_, err := r.exec(ctx, "stop", "-t", "10", cid)
-	return err
+	return mapNotFound(err)
 }
 
 func (r *Runner) Remove(ctx context.Context, cid string, force bool) error {
@@ -386,7 +387,7 @@ func (r *Runner) Remove(ctx context.Context, cid string, force bool) error {
 	}
 	args = append(args, cid)
 	_, err := r.exec(ctx, args...)
-	return err
+	return mapNotFound(err)
 }
 
 // Inspect 查单容器状态。cid 可以是 master 记的 docker internal id 或容器 name。
@@ -399,7 +400,7 @@ func (r *Runner) Inspect(ctx context.Context, cid string) (*InspectResponse, err
 	}
 	out, err := r.exec(ctx, "inspect", cid)
 	if err != nil {
-		return nil, err
+		return nil, mapNotFound(err)
 	}
 	var arr []struct {
 		ID    string `json:"Id"`
@@ -420,7 +421,8 @@ func (r *Runner) Inspect(ctx context.Context, cid string) (*InspectResponse, err
 		return nil, fmt.Errorf("parse inspect: %w", err)
 	}
 	if len(arr) == 0 {
-		return nil, errors.New("no inspect result")
+		// inspect 返回空数组 = 容器不存在 → 归一到 ErrContainerNotFound(404)。
+		return nil, ErrContainerNotFound
 	}
 	i := arr[0]
 	state := normalizeState(i.State.Status)
@@ -507,7 +509,8 @@ func (r *Runner) List(ctx context.Context) ([]*InspectResponse, error) {
 func (r *Runner) assertOwned(ctx context.Context, cid string) error {
 	out, err := r.exec(ctx, "inspect", "-f", "{{index .Config.Labels \""+LabelKey+"\"}}", cid)
 	if err != nil {
-		return err
+		// 缺失容器(inspect 报 "No such object")归一到 ErrContainerNotFound → 404。
+		return mapNotFound(err)
 	}
 	if strings.TrimSpace(out) != LabelValue {
 		return fmt.Errorf("container %s not owned by openclaude.v3 (label %q)", cid, LabelKey)
@@ -615,3 +618,28 @@ func (r *Runner) InspectImage(ctx context.Context, tag string) (*ImageInspectRes
 // ErrImageNotFound 表示 `docker image inspect <tag>` 未命中(image 不存在 /
 // docker daemon 不可达且 stderr 含 No such image)。HTTP 层翻成 404。
 var ErrImageNotFound = errors.New("image not found")
+
+// ErrContainerNotFound 表示目标容器在本 host 不存在(B4)。HTTP 层翻成 404
+// CONTAINER_NOT_FOUND,master 的 nodeAgentClient → AgentAppError(httpStatus=404)
+// → v3supervisor isNotFound 识别为 vanished 并清 DB 行(否则 500 会让行卡 active、
+// slot/IP 泄漏、用户重连死循环)。
+var ErrContainerNotFound = errors.New("container not found")
+
+// isDockerNotFound:docker CLI 对缺失容器的 stderr —— stop/rm 报 "No such
+// container",inspect / inspect -f 报 "No such object"。两者都认。
+func isDockerNotFound(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	return strings.Contains(s, "No such container") || strings.Contains(s, "No such object")
+}
+
+// mapNotFound:把"缺失容器"类错误归一到 ErrContainerNotFound(用 %w 包裹以便
+// errors.Is 命中,同时保留底层 detail);其它错误原样透传(仍走 500)。
+func mapNotFound(err error) error {
+	if isDockerNotFound(err) {
+		return fmt.Errorf("%w: %v", ErrContainerNotFound, err)
+	}
+	return err
+}
