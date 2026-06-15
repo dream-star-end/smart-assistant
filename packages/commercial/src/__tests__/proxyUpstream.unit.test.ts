@@ -334,7 +334,7 @@ describe("pickUpstream — Ark glm-5.1 route", () => {
       metadata: { user_id: "client-original" },
       output_config: { effort: "max" },
       context_management: { edits: [] },
-      thinking: { type: "enabled" },
+      thinking: { type: "enabled", budget_tokens: 1024 },
       service_tier: "priority",
     } as unknown as Parameters<typeof session.applyUpstreamAuth>[1];
     session.applyUpstreamAuth(safeHeaders, body, log);
@@ -342,8 +342,13 @@ describe("pickUpstream — Ark glm-5.1 route", () => {
     assert.equal(safeHeaders["anthropic-beta"], undefined);
     assert.equal((body as { output_config?: unknown }).output_config, undefined);
     assert.equal((body as { context_management?: unknown }).context_management, undefined);
-    assert.equal((body as { thinking?: unknown }).thinking, undefined);
     assert.equal((body as { service_tier?: unknown }).service_tier, undefined);
+    // **glm-5.1 是 thinking 模型:thinking 必须被保留(不 strip)**,透传给 Ark。
+    assert.deepEqual(
+      (body as { thinking?: unknown }).thinking,
+      { type: "enabled", budget_tokens: 1024 },
+      "Ark 路径必须保留 thinking 参数(与 MiniMax 不同)",
+    );
     assert.equal(
       (body as { metadata?: { user_id?: unknown } }).metadata?.user_id,
       "client-original",

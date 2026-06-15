@@ -105,19 +105,27 @@ describe('staticKeyProviders — strip / endpoint', () => {
     assert.deepEqual([...ds.stripBodyFields], [])
     assert.equal(ds.maxInputTokens, undefined)
   })
-  it('minimax/ark strip anthropic-beta + 4 body 字段', () => {
-    for (const id of ['minimax', 'ark'] as const) {
-      const p = getStaticProvider(id)
-      assert.deepEqual([...p.stripHeaders], ['anthropic-beta'])
-      assert.deepEqual([...p.stripBodyFields], [
-        'output_config',
-        'context_management',
-        'thinking',
-        'service_tier',
-      ])
-    }
-    assert.equal(getStaticProvider('minimax').maxInputTokens, 512_000)
-    assert.equal(getStaticProvider('ark').maxInputTokens, 200_000)
+  it('minimax strip anthropic-beta + 4 body 字段(含 thinking)', () => {
+    const mm = getStaticProvider('minimax')
+    assert.deepEqual([...mm.stripHeaders], ['anthropic-beta'])
+    assert.deepEqual([...mm.stripBodyFields], [
+      'output_config',
+      'context_management',
+      'thinking',
+      'service_tier',
+    ])
+    assert.equal(mm.maxInputTokens, 512_000)
+  })
+  it('ark strip anthropic-beta + 3 body 字段(**保留 thinking** —— glm-5.1 是 thinking 模型)', () => {
+    const ark = getStaticProvider('ark')
+    assert.deepEqual([...ark.stripHeaders], ['anthropic-beta'])
+    assert.deepEqual([...ark.stripBodyFields], [
+      'output_config',
+      'context_management',
+      'service_tier',
+    ])
+    assert.equal(ark.stripBodyFields.includes('thinking'), false, 'ark 必须不 strip thinking')
+    assert.equal(ark.maxInputTokens, 200_000)
   })
   it('ark endpoint = 火山方舟 coding plan /v1/messages', () => {
     assert.equal(

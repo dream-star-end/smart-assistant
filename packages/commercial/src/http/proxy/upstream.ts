@@ -151,7 +151,7 @@ export interface PreparedUpstreamSession {
    * 静态 key(deepseek/minimax/ark,见 makeStaticKeyUpstream):
    *   - `safeHeaders.authorization = Bearer ${apiKey}`
    *   - `delete` spec.stripHeaders(永含 `anthropic-beta`,第三方兼容端点不识别该头)
-   *   - `delete` spec.stripBodyFields(firstParty-only 字段;deepseek 无,minimax/ark 有 4 个)
+   *   - `delete` spec.stripBodyFields(firstParty-only 字段;deepseek 无,minimax 4 个,ark 3 个=保留 thinking)
    *   - 不动 body.metadata、不注入 oauth beta
    *
    * @param safeHeaders 已经过 `buildSafeUpstreamHeaders` 白名单的 fetch headers,mutate in-place
@@ -290,8 +290,9 @@ type Phase6AccountUuidEnforce = "off" | "fail_open" | "fail_closed";
  * 等价保证(与原两工厂逐字节一致):
  *   - accountId/pinnedUserId=null、dispatcher=undefined、shouldUpdateQuota=false(不占 OAuth 池)
  *   - applyUpstreamAuth: Authorization Bearer + strip spec.stripHeaders(永含 anthropic-beta)
- *     + strip spec.stripBodyFields(deepseek:[];minimax/ark:output_config/context_management/
- *     thinking/service_tier) —— 避免第三方 strict 兼容层报未知 beta/参数
+ *     + strip spec.stripBodyFields(deepseek:[];minimax:output_config/context_management/thinking/
+ *     service_tier;ark:output_config/context_management/service_tier —— **保留 thinking**,glm-5.1 是
+ *     thinking 模型) —— 避免第三方 strict 兼容层报未知 beta/参数
  *   - 不注入 oauth-2025-04-20、不动 metadata、不做 persona/device_id pin(那些是 OAuth 专属)
  *   - sanitizeMessages 原样返回、zeroizeSecrets noop(apiKey 来自配置注入,不归 session)
  */

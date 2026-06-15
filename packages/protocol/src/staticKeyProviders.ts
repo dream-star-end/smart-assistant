@@ -100,8 +100,11 @@ const ARK: StaticKeyProviderSpec = {
     return modelId.toLowerCase() === 'glm-5.1' ? 'glm-5.1' : null
   },
   stripHeaders: ['anthropic-beta'],
-  // glm-5.1 经 Ark Anthropic 兼容层，strip 与 MiniMax 同样的 4 个 firstParty-only body 字段。
-  stripBodyFields: ['output_config', 'context_management', 'thinking', 'service_tier'],
+  // **与 MiniMax 不同:不 strip `thinking`**。glm-5.1 是 thinking 模型，火山 Ark Anthropic 兼容层
+  // 实测支持 `thinking:{type:enabled,budget_tokens}` / `{type:disabled}`(2026-06-15 直连验证)。
+  // CCB 对 glm-5.1 modelSupportsThinking=true，会按用户设置发 thinking(默认 enabled)，故必须放行。
+  // 其余 3 个 firstParty-only 字段仍 strip(Ark 不识别/可能拒)。
+  stripBodyFields: ['output_config', 'context_management', 'service_tier'],
   // glm-5.1 上下文窗口 200k(公开规格)。input cap 是估算 guard(JSON.length/4)，防超窗。
   maxInputTokens: 200_000,
 }
