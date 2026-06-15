@@ -42,7 +42,7 @@
 | B5 | 只读 admin 路由升 `requireAdminVerifyDb` | 安全 | P2 | 10 | W2 | 无 | ✅ 由 B2 router gate 收编(所有 admin 走 verify-db) |
 | U2 | CSS 双 token 词汇统一 + 品牌色 fallback | UI | P1 | 7 | **W3** | 须严防视觉回归 | ✅ PASS（Codex 2 轮） |
 | U6 | `--z-*` 分层 token + 聊天流骨架屏一致性 | UI | P3 | 13 | W3 | ↑/中性 | 🟡 z-index ✅(Codex PASS);骨架屏 defer |
-| **A1** | turn 生命周期单一权威源 + server `turnId` | 架构 | P0 | 1 | **W4** | 须严防流式 UI 回归 | ⬜ design-doc 先行 |
+| **A1** | turn 生命周期单一权威源 + server `clientTurnId` | 架构 | P0 | 1 | **W4** | 须严防流式 UI 回归 | 🟡 design-doc ✅ Codex APPROVE(3 轮);实现待 dev/浏览器流式 smoke |
 | R1 | 多标签页协调（leader/广播 turn_settled） | 实时 | P1 | 7 | W4 | ↑（消幽灵态） | ⬜ 随 A1 |
 | R2 | IndexedDB 迁移框架 | 实时 | P1 | 8 | W4 | 中性 | ⬜ 随 A1 |
 | R3 | 客户端 idempotencyKey 防重放重复计费 | 实时/资金 | P1 | 6 | W4 | 无 | ⬜ 随 A1 |
@@ -194,4 +194,8 @@
   - **骨架屏一致性 defer**:主应用无 `.skeleton-*`(仅 admin.html 自带),聊天流/会话列表加骨架屏属**新增 UX 功能**(需 DOM 接线 + 视觉设计 + 浏览器验证),非纯维护性重构,留作独立 UX 项(同 U2/U6 的 stylelint 禁裸 hex/裸 z-index 一并做)。
 - 2026-06-15:**第二批已部署上线 v1.0.323**(commit 81b3a369)。canonical v3 merge 38b8d65b(B2/B3/B4/A3/U2/U6-z)→ `deploy-v3.sh --force`(6 活跃用户已确认 --force)。smoke 5/5;前端 38/47 文件 cache-bust 重写;migration 0081 已在生产 schema_migrations,`compute_hosts_status_check` 已含 `revoked`;`/version`=v1.0.323;origin/v3 已推。⚠ 唯一警告:trace propagation found 2<3(warn-only,HTTP logger traceId 子绑定,**与本批无关**,留观)。
   - **仍待办:B4(Go node-agent)单独 rollout** —— deploy-v3.sh 只部署 master;B4 改的是 `packages/commercial/node-agent/**`(Go),需另走 node-agent build+distribute+restart 流水线(非 P0,容器 stop/remove/inspect 缺失返真 404 的正确性修复),建议作为独立 ops 操作或与下次 node-agent 改动合并。
-- 下一步:**W4**(A1 turn 生命周期单一权威源 + server turnId,**design-doc 先行** → R1/R2/R3、A5、A4)、再 **W5**(B6/B7/B9)。
+- 2026-06-15:**A1 设计文档完成,Codex 计划审 APPROVE(3 轮 REVISE→APPROVE)**,见 `docs/A1_TURN_LIFECYCLE_DESIGN.md`。Explore agent 实测映射:3 套并行 in-flight 表示(`sess._sendingInFlight` 17R/16W、被独立赋值的派生量 `state.sendingInFlight` 16R/14W、`_reconnectInFlightSet`)+ teardown 复制 11 处(仅 isFinal 完整)+ 帧↔turn 靠跨时钟域 ts 比较(自承认设备钟快>5s 丢 final)。设计:客户端 `turnLifecycle.js` `sess.turn` 单一真相 + `beginTurn/endTurn(reason,{finalize})` reason 策略 + UI/transport 读点分层(非一刀切派生 getter);server `clientTurnId`(client-mint 全链路 echo,含商业 bridge)+ per-turn binding mode(capability 协商,未确证→legacy,杜绝混用)。Codex 关键修正已纳入:派生 getter 会破坏 reconnect UI 抑制(1829)→改分层 + 镜像过渡;非 final 不得自动定稿流式行→finalize 三策略(full/flushOnly/none);bridge echo + 合成帧 turnId 规则;full finalize 须抽完整有序阶段(2441+2997)。
+  - **实现待办(本环境无法 headless 完成的硬前置)**:A1 验收门是**dev 起站 + 浏览器逐条流式 smoke**(P1-P6:打字指示器/停止按钮/流式增量/重连恢复/切会话/弱网),headless 无法验证可见流式体验。按 Codex 建议 Phase 1 起(1a facade+镜像零行为变 → 1b reason 策略 teardown → 1c UI getter 分层),每子步浏览器 smoke。**留待具备 dev/浏览器的会话实现,或由用户在每子步跑 smoke。**
+- 下一步(按"可否 headless 完成"分流):
+  - **headless 可完成**(同 A3/B1/B3 范式,有 PG/Redis 可 integ 测):**W5 B6**(per-account 并发分布式租约)、**B7**(Claude inflight slot TTL reaper)、**B9**(auth rate-limiter Redis-down 降级);**A5**(前端 checkJs 消环,tsc 可验)、**A4**(god-file 拆分,单测可验)。
+  - **需 dev/浏览器验证**(流式/多标签/IDB 可见行为):**A1 实现**、**R1/R2/R3**(多标签协调 / IDB 迁移 / 客户端幂等)。
