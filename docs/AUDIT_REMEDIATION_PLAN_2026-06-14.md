@@ -166,4 +166,15 @@
   - **bootstrap/provisioning**(nodeBootstrap.ts 140/660/700/740/783)→ **不可** gate(新 host 尚未 ready,gate 会断 onboarding)。
   - **health/cert**(nodeHealth.ts 96/154 maybeRenewCert)→ **不可**全 gate(health 要能探 quarantined/broken 去恢复;但 maybeRenewCert 需对 revoked 跳过,否则续签 defeat 吊销)。
   - 结论:A3 需 **category-aware** `resolveServiceableHostTarget`(只 gate service 路径)+ 加 `revoked` 状态(migration)+ maybeRenewCert 对 revoked 跳过 + 吊销时清/换 pinned fingerprint + B8(RPC NULL fingerprint fail-closed)。本机无第二 host/node-agent,**无法多机 integ**,故 A3 走 Codex 计划审 + 单元测 + 部署阶段多机 smoke。
-- 下一步:**A3(+B8)** 按上述 category-aware 设计走 Codex 计划审→实现;再 W3(U2/U6)、W4(A1+R1/R2/R3、A5、A4)、W5(B6/B7/B9)。
+- 2026-06-15:**A3(+B8)设计已锁定**(Codex 计划审 PASS,3 轮)。**仅加终态 `revoked` kill-switch,不动 quarantined/broken/draining 现有 service 语义**(零回归)。实现清单:
+  1. migration:DO 块按 pg_constraint 发现匿名 status CHECK 名 → DROP → ADD `compute_hosts_status_check`(超集 `bootstrapping/ready/quarantined/draining/broken/revoked`,不删任何现行)。
+  2. types.ts:`ComputeHostStatus` 加 `revoked`。
+  3. `resolveServiceableHostTarget(hostId)`:getHostById → null/revoked/**fingerprint NULL** 任一即 throw HostNotServiceableError → hostRowToTarget{requireFingerprint:true}。service 非 withTarget 路径(index.ts 容器文件 IO、codexLazyMigrate putRemote、v3readiness tunnel)改走它。
+  4. lifecycle RPC:gate 放 `RemoteNodeAgentBackend.withTarget`(containerService.ts:391,共享 choke point,重查不吃 60s 行缓存);**排除 self/local**(本机 docker 不需 node-agent fingerprint)。
+  5. B8:NodeAgentTarget 加 `requireFingerprint`;verifyServerCert `if(requireFingerprint && !expectedFingerprint) throw` + 原 compare。bootstrap target 不带该 flag → 不受影响(bootstrap 合法无 fingerprint)。
+  6. nodeHealth.pollHost:re-read 后 hostRowToTarget 前 recheck `status==='revoked'` → skip(防 revoke 与 poll 的 race);maybeRenewCert 加 `if revoked return`。
+  7. 非 service 控制面也 gate:poolInit backfill(:125 skip)、admin baseline-version(:571 skip)、tunnelHealthzProbe(:9 deny)、baselineServer 入站鉴权(:219 加 status deny)。
+  8. admin:`revokeComputeHost(id,ctx)` → 拒 self → `setRevoked`(status='revoked' + agent_cert_fingerprint_sha256=NULL 立即断)+ audit;路由 `POST /api/admin/v3/compute-hosts/:id/revoke`(走 B2 router admin gate)。un-revoke 需 re-bootstrap(可接受,终态)。
+  9. 验收:patch 后**重审所有直用 hostRowToTarget 的生产路径** —— 任何可能 RPC/tunnel/file/baseline/egress 接触终态 host 的路径,必须经 resolveServiceableHostTarget / withTarget / 显式 skip-deny。
+  - 单测(本地 PG):resolver {revoked/null-fp→throw, ready+fp→ok}、verifyServerCert requireFingerprint fail-closed、setRevoked SQL+audit、pollHost race recheck、≥1 非 service caller skip/deny、migration 超集保行。多机 smoke 留部署阶段。
+- 下一步:**实现 A3(+B8)** → 再 W3(U2/U6)、W4(A1+R1/R2/R3、A5、A4 — design-doc 先行)、W5(B6/B7/B9)。
