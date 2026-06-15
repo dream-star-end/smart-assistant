@@ -36,8 +36,8 @@
 | U4 | `--fg-dim` 对比度达 WCAG AA | UI | P2 | 9 | W1 | ↑ 提升 | ✅ Codex PASS, commit `1d431a06` |
 | B1 | `request_finalize_journal` 对账器+GC | 资金 | P1 | 4 | W2 | 无 | ✅ Codex PASS, commit `ef2022db` |
 | B2 | admin 路由层声明式鉴权 | 安全 | P1 | 5 | W2 | 无 | ✅ Codex PASS, commit `67a4b8f8`(含 B5) |
-| B3 | codex disable drift reconciler | 安全 | P1 | 5 | W2 | 无 | ⬜ |
-| B4 | node-agent 缺失容器返真 404 | 正确性 | P1 | 5 | W2 | ↑（少卡死） | ⬜ |
+| B3 | codex disable drift reconciler | 安全 | P1 | 5 | W2 | 无 | ✅ Codex PASS, commit `4faea489` |
+| B4 | node-agent 缺失容器返真 404 | 正确性 | P1 | 5 | W2 | ↑（少卡死） | ✅ Codex PASS, commit `d214d57a`（**Go node-agent rollout 线,非 deploy-v3.sh**) |
 | A3 | compute-host 吊销 kill-switch（+B8 NULL fingerprint fail-closed） | 安全/架构 | P0 | 3 | W2 | 无 | ⬜ 需先复核 |
 | B5 | 只读 admin 路由升 `requireAdminVerifyDb` | 安全 | P2 | 10 | W2 | 无 | ✅ 由 B2 router gate 收编(所有 admin 走 verify-db) |
 | U2 | CSS 双 token 词汇统一 + 品牌色 fallback | UI | P1 | 7 | **W3** | 须严防视觉回归 | ⬜ |
@@ -160,4 +160,10 @@
 - 2026-06-15：**B1 完成**（commit `ef2022db`，Codex 计划审+代码审 PASS）。terminalizer（非 replay,journal 无观测用量不可重算）:有 usage_records→committed 回填,无→aborted 不退不扣;7d GC 批量删。阈值根治:不用 0015 字面 30s（journal 不心跳、codex 600s,会误 abort 活流）,默认 30min/env 向上夹 max(codexMax*3,30min)/24h 上限+isSafeInteger 防 ::bigint 打挂。接进 index.ts 调度+关停;单测 14/14;SQL integ 留批量部署阶段验。
 - 2026-06-15:**W1+B1 已部署上线**(v1.0.322,commit `e0a1ff99`)。deploy-v3.sh --force,smoke 5/5,无错误;B1 对账器 boot 即清掉生产 40 条卡死 inflight 行(0 残留),A2+B1 已对本地真 PG integ 验证。changelog 本次不写(currentVersion 仅 v1.0.321→322)。
 - 2026-06-15:**B2 完成**(commit `67a4b8f8`,Codex 计划审+代码审 PASS,**含 B5**)。router dispatch 对 /api/admin/* 一律 requireAdminVerifyDb(放 405 之前;method-aware 白名单仅 `GET /api/admin/metrics` 走自带 bearer 鉴权);metrics JWT 回落也升 verify-db。整组 admin(含只读)关闭降权 stale-role 窗口。adminRouteGate.integ 7/7,apiKeyAdmin 7/7 无回归。
-- 下一步 W2 剩余:**B3 codex disable drift / B4 node-agent 真 404(Go node-agent rollout 线)/ A3 host 吊销+B8(P0,改前聚焦复核)**。
+- 2026-06-15:**B3 完成**(`4faea489`,Codex PASS,unit 19/19 + integ 2/2)。**B4 完成**(`d214d57a`,Codex PASS,go build/test 通过;Go node-agent rollout 线,与 master deploy 分开)。
+- 2026-06-15:**A3 host-connect 调用点复核完成**(改前必做)。~20 处 host 解析跨 5 文件,分三类语义:
+  - **service**(容器文件 IO putRemoteCodexAuth/getRemoteFile、容器生命周期 RPC run/stop/remove/inspect、tunnel)→ **应**被吊销 gate。index.ts 406/427/551/1114/1499/1512/1534/1744/1830/2348/3073、codexLazyMigrate、v3readiness。
+  - **bootstrap/provisioning**(nodeBootstrap.ts 140/660/700/740/783)→ **不可** gate(新 host 尚未 ready,gate 会断 onboarding)。
+  - **health/cert**(nodeHealth.ts 96/154 maybeRenewCert)→ **不可**全 gate(health 要能探 quarantined/broken 去恢复;但 maybeRenewCert 需对 revoked 跳过,否则续签 defeat 吊销)。
+  - 结论:A3 需 **category-aware** `resolveServiceableHostTarget`(只 gate service 路径)+ 加 `revoked` 状态(migration)+ maybeRenewCert 对 revoked 跳过 + 吊销时清/换 pinned fingerprint + B8(RPC NULL fingerprint fail-closed)。本机无第二 host/node-agent,**无法多机 integ**,故 A3 走 Codex 计划审 + 单元测 + 部署阶段多机 smoke。
+- 下一步:**A3(+B8)** 按上述 category-aware 设计走 Codex 计划审→实现;再 W3(U2/U6)、W4(A1+R1/R2/R3、A5、A4)、W5(B6/B7/B9)。
