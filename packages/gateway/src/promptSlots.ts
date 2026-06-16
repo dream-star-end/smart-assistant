@@ -13,7 +13,7 @@
  *   6. TOOLS      — Tool usage hints, learning system instructions (static reference)
  *   7. MODEL_HINT — Per-model behavioral patch via provider hook (commercial only;
  *                   personal 不注册 provider → 始终 noop)
- *   8. RESEARCH   — User-explicit 科研模式 (effortLevel === 'max')
+ *   8. RESEARCH   — 高严谨度守则 (effortLevel === 'max')
  *   9. REPO       — Session GitHub repo binding snapshot (provided via ctx.repoSnapshot;
  *                   personal caller 不传 → 始终 null)
  *
@@ -50,8 +50,8 @@ export interface PromptSlotContext {
   persona?: string // path to CLAUDE.md / SOUL.md
   provider?: string
   model?: string
-  /** CCB effort level — 'xhigh' / 'max' 触发科研守则 slot,其它值(含 undefined)不触发。
-   *  仅在 Opus 4.7 + 用户选了"科研模式"pill 时会是 xhigh/max。 */
+  /** CCB effort level — 'max' 触发高严谨度守则 slot,其它值(含 undefined)不触发。
+   *  来源:Opus 模型 + 用户在 composer 选中 max 档。 */
   effortLevel?: string
   /** Phase 5 — 当前会话的 GitHub repo 绑定快照(来自 SessionRepoWorkspaceManager.getRepoSnapshot(sessionId))。
    *  null = 没绑定;否则按 status 三态生成 repo slot。
@@ -244,20 +244,20 @@ export function buildToolsSlot(): PromptSlot {
   }
 }
 
-// ── 科研模式 slot ──
-// 仅在 effortLevel = 'xhigh' / 'max' 时注入,驱动 agent 在涉及数值/公式/跨领域
-// 表达时更严谨。这不是对话 preamble(不注入 user text),而是 extra-prompt 里
-// 一条常驻守则,下一次 CCB 启动(effort 切换本来就会 recycle runner)自动生效。
+// ── 高严谨度守则 slot(代码常量保留 RESEARCH 命名,内部 stable surface)──
+// 仅在 effortLevel === 'max' 时注入,驱动 agent 在涉及数值/公式/跨领域表达时更
+// 严谨。这不是对话 preamble(不注入 user text),而是 extra-prompt 里一条常驻
+// 守则,下一次 CCB 启动(effort 切换本来就会 recycle runner)自动生效。
 //
 // 设计原则:只写 agent 能直接执行的行为规则,不写空泛倡导。alice(科研用户)
 // 历史对话里暴露的 6 类问题是这条 slot 的直接动机 —— 参见 memory
 // `feedback_scientific_numbers` 及 alice 5 条会话的真实痛点。
 //
-// 触发条件**仅** effortLevel === 'max'(UI 上叫"科研模式")。xhigh 是"编码模式",
-// 它也需要高 effort 但语义不同,不应继承这套科学严谨度守则(否则用户在
-// 编码模式下也会被"数值保守 / 公式前提 / 误差分类"污染)。
-// 未来如果要把"模式"和"effort"解耦,应在 PromptSlotContext 里新增
-// conversationMode 字段,不复用 effortLevel。
+// 触发条件**仅** effortLevel === 'max'。前 UI 曾把 max 叫"科研模式"、xhigh 叫
+// "编码模式",2026-06 起改为纯档位命名(低/中/高/极高/最高),但行为分层不变:
+// 只有 max(最高)继承本守则;xhigh(极高)不继承,避免把"数值保守 / 公式前提
+// / 误差分类"污染到编码类长链路任务。未来如要把"语义"和"档位"解耦,应在
+// PromptSlotContext 里新增 conversationMode 字段,不复用 effortLevel。
 const RESEARCH_EFFORT_LEVELS = new Set(['max'])
 
 export function buildResearchSlot(ctx: PromptSlotContext): PromptSlot | null {
@@ -265,9 +265,9 @@ export function buildResearchSlot(ctx: PromptSlotContext): PromptSlot | null {
   return {
     name: 'RESEARCH',
     content: [
-      '# 科研模式守则',
+      '# 高严谨度守则',
       '',
-      '当前会话已由用户切到高思考档位,按**科研严谨度**标准作答。以下守则对本会话的',
+      '当前会话已由用户切到最高思考档位,按**高严谨度**标准作答。以下守则对本会话的',
       '所有数值结论、公式推导、跨领域表达生效。不要在回答里复述这段守则,只执行。',
       '',
       '## 1. 数值结论默认保守',
@@ -549,13 +549,13 @@ export async function buildPromptContext(ctx: PromptSlotContext): Promise<Prompt
 
   // Layer 4: per-model 行为补丁。位于 TOOLS 之后、RESEARCH 之前 —
   // 比工具说明更靠后(更"贴近"user message,不被工具说明稀释),
-  // 但低于 RESEARCH(用户显式选择"科研模式"应优先级最高)。
+  // 但低于 RESEARCH(用户显式选 max 档应优先级最高)。
   // ModelHintSlot 携带 canonicalId,稍后塞进 PromptSlotApplied.meta 给 runner 打 metric。
   const modelHint = buildModelHintSlot(ctx)
   if (modelHint) slots.push(modelHint)
 
-  // Layer 5: 用户显式选中的模式(科研模式等)。放在模型补丁之后,
-  // 体现 user-explicit > model-default 的优先级。不选就不注入。
+  // Layer 5: 用户显式选中的最高思考档(max)守则。放在模型补丁之后,
+  // 体现 user-explicit > model-default 的优先级。未选就不注入。
   const research = buildResearchSlot(ctx)
   if (research) slots.push(research)
 
