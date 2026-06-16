@@ -26,8 +26,8 @@ const runnerLog = createLogger({ module: 'subprocessRunner' })
 //     [--model <model>] [--effort <level>] \
 //     [--resume <sessionId>] \
 //     [--append-system-prompt-file <persona>] \
-//     [--mcp-config <file>] [--add-dir <cwd>] \
-//     [--permission-mode <mode>] [--setting-sources <sources>]
+//     [--mcp-config <file>] [--permission-mode <mode>] \
+//     [--add-dir <cwd>]   (variadic — kept last)
 //
 // 我们写入 stdin 一行 JSON(SDK user message),从 stdout 读流式 JSONL(SDK 消息流)。
 // 官方 claude 自己处理 auth(订阅 OAuth / API key)、工具循环、压缩、CLAUDE.md。
@@ -115,13 +115,6 @@ export interface ClaudeCliArgsInput {
   mcpConfigFile?: string
   addDir?: string
   resumeSessionId?: string | null
-  /**
-   * Comma-separated setting sources for official `--setting-sources`. Set when
-   * the gateway owns provider routing (host-managed subscription token) so the
-   * user's `~/.claude/settings.json` can't redirect requests to another
-   * provider. Undefined → claude uses its default setting sources.
-   */
-  settingSources?: string
 }
 
 /**
@@ -143,7 +136,6 @@ export function buildClaudeCliArgs(input: ClaudeCliArgsInput): string[] {
     mcpConfigFile,
     addDir,
     resumeSessionId,
-    settingSources,
   } = input
   const args: string[] = [
     '-p',
@@ -168,9 +160,6 @@ export function buildClaudeCliArgs(input: ClaudeCliArgsInput): string[] {
   // to the web frontend. Required even under bypassPermissions for
   // interactive tools like AskUserQuestion.
   args.push('--permission-prompt-tool', 'stdio')
-  // Host owns provider routing — restrict setting sources so a user
-  // settings.json can't override the host-injected provider/auth.
-  if (settingSources) args.push('--setting-sources', settingSources)
   // Single merged prompt file: persona + identity + platform + skills + memory
   // (Cannot pass --append-system-prompt-file twice; Commander takes last value only)
   if (extraPromptFile) args.push('--append-system-prompt-file', extraPromptFile)
@@ -326,24 +315,25 @@ export class SubprocessRunner extends EventEmitter {
       // provider so claude routes to the correct API.
       const providerEnv: Record<string, string> = {}
       const effectiveProvider = this.opts.agentProvider ?? this.opts.config.provider
-      // When the gateway injects a host-managed subscription token we also
-      // restrict claude's setting sources so the user's ~/.claude/settings.json
-      // can't redirect requests to another provider (the official replacement
-      // for CCB's CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST flag).
-      let hostManagedProvider = false
 
       if (effectiveProvider === 'claude-subscription') {
         // Claude subscription: inject OAuth token, route to Anthropic API.
         if (this.opts.config.auth.claudeOAuth?.accessToken) {
           // Official claude reads CLAUDE_CODE_OAUTH_TOKEN from env. A gateway-side
-          // token refresh now takes effect on the next subprocess (re)start
-          // (sessionManager recycles on config change) — we no longer ship the
-          // CCB-only OPENCLAUDE_CLAUDE_OAUTH_TOKEN_FILE hot-reload sidecar.
+          // token refresh is materialised into config; a running subprocess keeps
+          // its spawn-time token until it restarts — the 401/AUTH_ERROR retry path
+          // (sessionManager) recycles it when the old token expires mid-turn.
+          // (We no longer ship the CCB-only OPENCLAUDE_CLAUDE_OAUTH_TOKEN_FILE
+          // hot-reload sidecar; a token refresh costs at most one 401 round-trip.)
           providerEnv.CLAUDE_CODE_OAUTH_TOKEN = this.opts.config.auth.claudeOAuth.accessToken
-          hostManagedProvider = true
         }
         // Clear any inherited provider vars so nothing redirects Claude requests
-        // away from Anthropic.
+        // away from Anthropic. Provider isolation relies on (a) this env clearing
+        // and (b) the host's ~/.claude/settings.json carrying no provider `env`
+        // block. (We previously passed `--setting-sources project,local` to mimic
+        // CCB's PROVIDER_MANAGED_BY_HOST, but that both excluded legitimate user
+        // settings AND collapsed to a no-op when the agent cwd equals $HOME — so
+        // project settings == user settings. Dropped as a fragile half-measure.)
         providerEnv.ANTHROPIC_BASE_URL = ''
         providerEnv.ANTHROPIC_AUTH_TOKEN = ''
         providerEnv.ANTHROPIC_MODEL = ''
@@ -370,8 +360,6 @@ export class SubprocessRunner extends EventEmitter {
         mcpConfigFile: learningContext.mcpConfigFile,
         addDir: this.opts.cwd,
         resumeSessionId: this.currentSessionId,
-        // Exclude the user settings source when the host owns provider routing.
-        settingSources: hostManagedProvider ? 'project,local' : undefined,
       })
 
       // Per-agent / global egress proxy override. Non-empty wins over any
@@ -382,6 +370,21 @@ export class SubprocessRunner extends EventEmitter {
       const proxyEnv: Record<string, string> = {}
       if (this.opts.proxyUrl) {
         for (const key of PROXY_ENV_KEYS) proxyEnv[key] = this.opts.proxyUrl
+      }
+
+      // Fail fast on the Docker terminal backend: its volume-mount + command
+      // semantics were designed around the vendored CCB install dir (mounting the
+      // source tree at /opt/ccb and running `bun`/`node` against it). The official
+      // `claude` binary isn't present in that container layout, so spawning it via
+      // DockerBackend would silently break. Local backend is the supported path;
+      // re-enable Docker only once the mount/command semantics are redefined for
+      // the official binary.
+      if (this.opts.config.terminal?.type === 'docker') {
+        this.starting = false
+        throw new Error(
+          'Docker terminal backend is not supported with the official Claude Code engine yet ' +
+            "(its /opt/ccb mount assumed the removed in-repo fork). Use terminal.type 'local'.",
+        )
       }
 
       let proc: ReturnType<TerminalBackend['spawn']>

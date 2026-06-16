@@ -3484,11 +3484,12 @@ export class Gateway {
         await writeConfig(config)
         this.deps.config = config
         this.sessions.updateConfig(config)
-        // CCB subprocesses prefer the runtime token file over the spawn-time
-        // CLAUDE_CODE_OAUTH_TOKEN snapshot. Without writing it here, a stale
-        // file from before this /login would override the freshly-saved token.
+        // Official claude reads CLAUDE_CODE_OAUTH_TOKEN from the spawn env (set
+        // from config at spawn time), not a runtime sidecar file. Purge any
+        // legacy CCB-era runtime token file so a stale sensitive token can't
+        // linger on disk after this /login.
         if (providerKey === 'claude') {
-          await this.writeRuntimeOauthToken(oauthData)
+          await this.removeRuntimeOauthToken()
         } else if (providerKey === 'codex') {
           // Mirror the new token into ~/.codex/auth.json so codex CLI / MCP
           // sees the new account. Force-write since user just explicitly
@@ -3518,43 +3519,13 @@ export class Gateway {
   }
 
   /**
-   * Runtime token file: gateway is the **sole writer**, ccb subprocess is the
-   * sole reader. Every claude OAuth refresh atomically writes the new access
-   * token here so long-running ccb subprocesses can pick it up without restart
-   * (they mtime-watch this file). See ccb's `getClaudeAIOAuthTokens`.
+   * Best-effort delete of the legacy runtime OAuth token file.
    *
-   * The file is mode 0600. Format: `{accessToken, expiresAt, scope}` JSON.
-   * Path is `$OPENCLAUDE_HOME/runtime/claude_oauth_token.json`.
-   */
-  private async writeRuntimeOauthToken(state: {
-    accessToken: string
-    expiresAt: number
-    scope: string
-  }): Promise<void> {
-    const file = paths.runtimeClaudeOauthToken
-    try {
-      // 0o700 on the dir matches the credential-runtime semantics; 0o600 on the
-      // file itself is the load-bearing protection.
-      await mkdir(dirname(file), { recursive: true, mode: 0o700 })
-      // Random suffix avoids a same-millisecond tmp collision between two
-      // concurrent writers (eg. callback + boot refresh racing on /login).
-      const tmp = `${file}.tmp-${process.pid}-${Date.now()}-${randomBytes(6).toString('hex')}`
-      const data = JSON.stringify({
-        accessToken: state.accessToken,
-        expiresAt: state.expiresAt,
-        scope: state.scope,
-      })
-      await writeFile(tmp, data, { mode: 0o600 })
-      await rename(tmp, file)
-    } catch (err) {
-      this.log.warn('failed to write runtime oauth token file', { file }, err as Error)
-    }
-  }
-
-  /**
-   * Best-effort delete of the runtime token file. Called when the gateway
-   * config has no claude OAuth token, to make sure a stale file from a prior
-   * /login can't "revive" old auth in a freshly-spawned ccb subprocess.
+   * History: the in-repo CCB fork mtime-watched `runtime/claude_oauth_token.json`
+   * for hot token reloads. The official `claude` engine reads
+   * CLAUDE_CODE_OAUTH_TOKEN from the spawn env instead, so this file is no longer
+   * written or read — we only purge any leftover from the CCB era so a stale
+   * sensitive token can't linger on disk.
    */
   private async removeRuntimeOauthToken(): Promise<void> {
     try {
@@ -3572,21 +3543,12 @@ export class Gateway {
   }
 
   /**
-   * Idempotent: materialize current claude OAuth token to the runtime file
-   * if present, otherwise delete any stale runtime file. Called at startup
-   * so freshly-spawned subprocesses see fresh state, not leftovers.
+   * Called at startup: purge any legacy CCB-era runtime OAuth token file. The
+   * official `claude` engine takes its token from the spawn env, so the sidecar
+   * file is obsolete — we only ensure no stale sensitive token is left on disk.
    */
   private async syncRuntimeOauthTokenFromConfig(): Promise<void> {
-    const claudeOAuth = this.deps.config.auth.claudeOAuth
-    if (!claudeOAuth?.accessToken) {
-      await this.removeRuntimeOauthToken()
-      return
-    }
-    await this.writeRuntimeOauthToken({
-      accessToken: claudeOAuth.accessToken,
-      expiresAt: claudeOAuth.expiresAt,
-      scope: claudeOAuth.scope,
-    })
+    await this.removeRuntimeOauthToken()
   }
 
   // Token auto-refresh (called periodically and on-demand after 401).
@@ -3676,11 +3638,10 @@ export class Gateway {
         await writeConfig(config)
         this.deps.config = config
         this.sessions.updateConfig(config)
-        // Hot-reload: long-running ccb subprocesses watch this file's mtime
-        // and pick up the new access token without restart.
-        if (providerKey === 'claude') {
-          await this.writeRuntimeOauthToken(refreshed)
-        } else if (providerKey === 'codex') {
+        // The refreshed claude token is now in config; a running subprocess keeps
+        // its spawn-time token until it restarts (401/AUTH_ERROR retry path picks
+        // up the fresh one). No runtime sidecar file is written anymore.
+        if (providerKey === 'codex') {
           // Sync to ~/.codex/auth.json with ownership check: only overwrite
           // if the file's refresh_token matches the one we just consumed.
           // If the user has run `codex login` directly since our last write,

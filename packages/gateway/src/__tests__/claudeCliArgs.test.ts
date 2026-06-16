@@ -80,13 +80,6 @@ describe('buildClaudeCliArgs', () => {
     }
   })
 
-  it('passes --setting-sources only when provided (host-managed provider)', () => {
-    const without = buildClaudeCliArgs({})
-    assert.equal(without.includes('--setting-sources'), false)
-    const withSrc = buildClaudeCliArgs({ settingSources: 'project,local' })
-    assert.ok(hasFlagWithValue(withSrc, '--setting-sources', 'project,local'))
-  })
-
   it('appends optional flags as adjacent flag/value pairs when provided', () => {
     const args = buildClaudeCliArgs({
       model: 'claude-opus-4-6',
@@ -96,14 +89,12 @@ describe('buildClaudeCliArgs', () => {
       mcpConfigFile: '/tmp/mcp.json',
       addDir: '/var/data/agents/main',
       resumeSessionId: 'sess-abc123',
-      settingSources: 'project,local',
     })
     assert.ok(hasFlagWithValue(args, '--model', 'claude-opus-4-6'))
     assert.ok(hasFlagWithValue(args, '--effort', 'max'))
     assert.ok(hasFlagWithValue(args, '--permission-mode', 'bypassPermissions'))
     assert.ok(args.includes('--dangerously-skip-permissions'))
     assert.ok(hasFlagWithValue(args, '--permission-prompt-tool', 'stdio'))
-    assert.ok(hasFlagWithValue(args, '--setting-sources', 'project,local'))
     assert.ok(hasFlagWithValue(args, '--append-system-prompt-file', '/tmp/prompt.md'))
     assert.ok(hasFlagWithValue(args, '--mcp-config', '/tmp/mcp.json'))
     assert.ok(hasFlagWithValue(args, '--add-dir', '/var/data/agents/main'))
@@ -126,7 +117,6 @@ describe('buildClaudeCliArgs', () => {
       '--effort',
       '--permission-mode',
       '--dangerously-skip-permissions',
-      '--setting-sources',
       '--append-system-prompt-file',
       '--mcp-config',
       '--add-dir',

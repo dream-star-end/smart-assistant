@@ -24,7 +24,7 @@ git push origin master
 
 ## Provider 路由
 
-- `provider: claude-subscription` → 注入 CLAUDE_CODE_OAUTH_TOKEN + `--setting-sources project,local`(host 管理 provider,屏蔽 user settings 改写), 清空 ANTHROPIC_BASE_URL
+- `provider: claude-subscription` → 注入 CLAUDE_CODE_OAUTH_TOKEN + 清空 ANTHROPIC_BASE_URL/AUTH_TOKEN/MODEL(provider 隔离依赖此 env 清空 + settings.json 不含 provider env)
 - `provider: minimax` 或无 → 不注入 token, 官方 claude fallback 到 `~/.claude/.credentials.json` / settings.json
 - 每个 agent 有独立的 Chrome profile (`/tmp/openclaude-browser-<agentId>`)
 
