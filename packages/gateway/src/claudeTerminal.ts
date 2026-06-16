@@ -12,9 +12,12 @@ import { homedir } from 'node:os'
 import { join, resolve } from 'node:path'
 import * as pty from 'node-pty'
 import type { RawData, WebSocket } from 'ws'
+import { resolveOfficialClaudePath } from './claudeCli.js'
 import { ClaudeTerminalOwners, resolveClaudeTerminalOwnersPath } from './claudeTerminalOwners.js'
 import type { Logger } from './logger.js'
 import { PROXY_ENV_KEYS } from './proxyEnv.js'
+
+export { resolveOfficialClaudePath } from './claudeCli.js'
 
 export const CLAUDE_TERMINAL_WS_PATH = '/ws/claude-terminal'
 export const CLAUDE_TERMINAL_MAX_CLIENT_MESSAGE_BYTES = 64 * 1024
@@ -168,13 +171,6 @@ export function isAllowedClaudeTerminalOrigin(
   } catch {
     return false
   }
-}
-
-export function resolveOfficialClaudePath(env: NodeJS.ProcessEnv = process.env): string {
-  const configured = env.OPENCLAUDE_OFFICIAL_CLAUDE_PATH?.trim()
-  if (configured) return configured
-  const localClaude = join(homedir(), '.local/bin/claude')
-  return existsSync(localClaude) ? localClaude : 'claude'
 }
 
 const CLAUDE_SESSION_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i

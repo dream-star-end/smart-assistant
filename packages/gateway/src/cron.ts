@@ -396,13 +396,10 @@ export class CronScheduler {
       channel: 'cron',
       peerId: job.id,
       title: job.heartbeat ? '[heartbeat]' : `[cron] ${job.id}`,
-      // Tag this run as a cron workload so CCB stamps
-      // `cc_workload=cron;` into the attribution billing-header.
-      // Lets Anthropic serve scheduled jobs at lower QoS and keeps
-      // automation traffic from competing with interactive turns for
-      // the user's rate-limit headroom — directly mitigates the
-      // "automation abuse" ban trigger documented in the Feishu doc.
-      workload: 'cron',
+      // (The old in-repo fork supported a `--workload cron` QoS billing tag;
+      // official Claude Code has no such flag, and on the personal version the
+      // user runs their own subscription, so there's no shared-pool QoS routing
+      // to tag for. Cron runs are plain turns.)
     })
     let output = ''
     try {

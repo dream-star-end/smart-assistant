@@ -103,18 +103,19 @@ const PROJECT_RULE_MAX_BYTES = 96 * 1024
 // ── Path resolution for the bundled mcp-memory entry ──
 
 /** Three-candidate fallback for resolving the bundled `openclaude-memory`
- *  MCP server entry path. Both subprocessRunner (ccb) and codex runners need
- *  the *same* resolution to stay in sync — extracting it here is the only
- *  way to guarantee both paths agree on which `mcp-memory/src/index.ts` they
- *  point npx at.
+ *  MCP server entry path. Both the chat-engine subprocessRunner and the codex
+ *  runners need the *same* resolution to stay in sync — extracting it here is
+ *  the only way to guarantee both paths agree on which `mcp-memory/src/index.ts`
+ *  they point npx at.
  *
  *  Returns the first existing absolute path, or `null` if none exist (caller
  *  decides whether to log+skip or fall back to no MCP at all).
  *
- *  @param claudeCodePath Optional CCB install root. Used to construct the
- *    third candidate (`<claudeCodePath>/../openclaude/packages/mcp-memory/...`)
- *    which is the path inside the v3 commercial container image. Pass
- *    `undefined` outside ccb-aware contexts to skip that candidate. */
+ *  @param claudeCodePath Optional legacy install-root hint (the deprecated
+ *    `auth.claudeCodePath`). Used to construct the third candidate
+ *    (`<claudeCodePath>/../openclaude/packages/mcp-memory/...`), the layout used
+ *    inside the v3 commercial container image. Normally `undefined`; the first
+ *    two candidates resolve in standard installs. */
 export function resolveMcpMemoryEntry(claudeCodePath?: string): string | null {
   const moduleDir = new URL('.', import.meta.url).pathname.replace(/^\/([A-Za-z]):/, '$1:')
   const candidates: string[] = [

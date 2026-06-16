@@ -178,7 +178,7 @@ describe('T01b: isFileAllowed — allowlist directory check', () => {
   })
   it('denies broad source roots that are not explicit agent cwds', () => {
     assert.ok(!isFileAllowed(resolve('/opt/openclaude/openclaude/packages/gateway/src/server.ts')))
-    assert.ok(!isFileAllowed(resolve('/opt/openclaude/claude-code-best/src/main.tsx')))
+    assert.ok(!isFileAllowed(resolve('/opt/openclaude/some-other-repo/src/main.tsx')))
   })
   it('denies executable HTML under dynamic agent cwd', () => {
     assert.ok(
