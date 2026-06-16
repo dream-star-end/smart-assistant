@@ -8,6 +8,7 @@ import { getAPIProvider } from './model/providers.js'
 import { getSettingsWithErrors } from './settings/settings.js'
 import { resolveAntModel } from './model/antModels.js'
 import { isArkGlmModel, isCapabilityZeroStaticModel } from './model/staticKeyModels.js'
+import { isMiniMaxM3Model } from './model/minimax.js'
 
 export type ThinkingConfig =
   | { type: 'adaptive' }
@@ -95,6 +96,13 @@ export function modelSupportsThinking(model: string): boolean {
   // 实测支持 thinking:{type:enabled,budget_tokens}。故先判，让 CCB 默认发 enabled(claude.ts
   // 因 modelSupportsAdaptiveThinking=false 走 enabled+budget 分支，正是 Ark 接受的格式)。
   if (isArkGlmModel(model)) {
+    return true
+  }
+  // MiniMax-M3 是思考模型 —— 它在 isCapabilityZeroStaticModel 集合里(betas/effort/adaptive-thinking
+  // 仍全关),但 thinking 是例外:2026-06-16 直连验证 https://api.minimaxi.com/anthropic/v1/messages
+  // 接受 thinking:{type:enabled,budget_tokens} 并返回带 signature 的 thinking block(同 glm-5.1 走
+  // enabled+budget 分支)。故先判,放行 thinking。master 侧 minimax stripBodyFields 已去掉 'thinking'。
+  if (isMiniMaxM3Model(model)) {
     return true
   }
   if (isCapabilityZeroStaticModel(model)) {

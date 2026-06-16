@@ -60,17 +60,17 @@ function isCodexModel(modelId) {
 
 const OPUS_47_OPTIONS = [
   { value: 'low', label: '低', hint: '快速响应' },
-  { value: 'medium', label: '中', hint: '均衡(默认)' },
+  { value: 'medium', label: '中', hint: '均衡' },
   { value: 'high', label: '高', hint: '更彻底' },
   { value: 'xhigh', label: '更高', hint: '长链路 / 复杂编码' },
-  { value: 'max', label: '最高', hint: '深度推理(token 消耗显著上升)' },
+  { value: 'max', label: '最高', hint: '深度推理(默认,token 消耗显著上升)' },
 ]
 
 // DeepSeek 真实只有 high / max 两档(其他档位自动映射,见上方注释)。
-// 默认 high(对齐 DeepSeek docs:常规请求默认 high)。
+// 2026-06-16 起默认 max(boss:可调思考默认拉满)。
 const DEEPSEEK_OPTIONS = [
-  { value: 'high', label: '高', hint: '标准推理(默认)' },
-  { value: 'max', label: '最高', hint: '深度推理' },
+  { value: 'high', label: '高', hint: '标准推理' },
+  { value: 'max', label: '最高', hint: '深度推理(默认)' },
 ]
 
 // gpt-5.5 (codex) 暴露四档,与 codex CLI 接受值集合的子集对齐
@@ -93,11 +93,13 @@ function getEffortOptionsForModel(modelId) {
   return []
 }
 
-/** 该 model 在该会话冷启动 / store 缺失时的默认档位。 */
+/** 该 model 在该会话冷启动 / store 缺失时的默认档位。
+ *  2026-06-16 boss 决策:可调思考等级的模型默认拉满(最高),gpt-5.5(codex) 例外用中等。
+ *  注意 getEffortForSubmit 永远显式带 effort(缺省即取本默认),故改这里即真正改变下发档位。 */
 function getDefaultEffortForModel(modelId) {
-  if (isDeepseekModel(modelId)) return 'high'
-  if (isCodexModel(modelId)) return 'medium' // codex CLI 自身默认
-  return 'medium' // Opus 4.7 现状
+  if (isDeepseekModel(modelId)) return 'max'
+  if (isCodexModel(modelId)) return 'medium' // gpt-5.5:boss 指定默认中等
+  return 'max' // Opus 4.7 等可调思考模型:默认最高
 }
 
 function getAllowedEffortsForModel(modelId) {

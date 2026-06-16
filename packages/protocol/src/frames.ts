@@ -300,6 +300,9 @@ export const OutboundContentBlock = Type.Union([
     text: Type.Optional(Type.String()),
     toolName: Type.Optional(Type.String()),
     isError: Type.Optional(Type.Boolean()),
+    // 完整子 agent block payload(text/thinking/tool_use/tool_result/tool_output_tail),
+    // 供新前端复用主聊天富渲染。gateway 已 sanitize,前端按子块 kind 渲染;旧前端忽略此字段。
+    block: Type.Optional(Type.Unknown()),
   }),
   // Snapshot of a long-running bash command's tail output. Snapshot
   // semantics: the consumer REPLACES its prior tail buffer with `tail`

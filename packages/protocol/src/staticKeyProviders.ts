@@ -83,7 +83,10 @@ const MINIMAX: StaticKeyProviderSpec = {
     return modelId.toLowerCase() === 'minimax-m3' ? 'MiniMax-M3' : null
   },
   stripHeaders: ['anthropic-beta'],
-  stripBodyFields: ['output_config', 'context_management', 'thinking', 'service_tier'],
+  // **保留 thinking**(2026-06-16):MiniMax-M3 是思考模型,直连验证其 Anthropic 兼容端点接受
+  // thinking:{type:enabled,budget_tokens} 并返回带 signature 的 thinking block(同 ark/glm-5.1)。
+  // CCB modelSupportsThinking(MiniMax-M3)=true 会发 thinking,故不能 strip。其余 firstParty-only 字段仍 strip。
+  stripBodyFields: ['output_config', 'context_management', 'service_tier'],
   maxInputTokens: 512_000,
 }
 

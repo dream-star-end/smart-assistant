@@ -295,15 +295,27 @@ describe("openclaude-runtime entrypoint env-scrub policy", () => {
     for (const id of ["main", "researcher", "scientist", "coder", "reviewer", "codex"]) {
       assert.match(src, new RegExp(`id:\\s*"${id}"`), `entrypoint must seed ${id} agent`);
     }
+    // 2026-06-16 boss 重配:按角色多样化(WS2)。researcher=MiniMax-M3、scientist/reviewer=deepseek-v4-pro、
+    // coder=glm-5.1(=DEFAULT)、main/codex 不变。
     assert.match(
       src,
-      /const COMMERCIAL_CODER_MODEL\s*=\s*"deepseek-v4-pro"/,
-      "commercial coder seed must use DeepSeek V4 Pro",
+      /const COMMERCIAL_RESEARCHER_MODEL\s*=\s*"MiniMax-M3"/,
+      "researcher seed must use MiniMax-M3 (512k long context)",
     );
     assert.match(
       src,
-      /const COMMERCIAL_CODER_PROVIDER\s*=\s*"deepseek"/,
-      "commercial coder seed must use the deepseek provider",
+      /const COMMERCIAL_RESEARCHER_PROVIDER\s*=\s*"minimax"/,
+      "researcher seed must use the minimax provider",
+    );
+    assert.match(
+      src,
+      /const COMMERCIAL_DEEPSEEK_PRO_MODEL\s*=\s*"deepseek-v4-pro"/,
+      "scientist/reviewer seed must use DeepSeek V4 Pro",
+    );
+    assert.match(
+      src,
+      /const COMMERCIAL_DEEPSEEK_PRO_PROVIDER\s*=\s*"deepseek"/,
+      "scientist/reviewer seed must use the deepseek provider",
     );
     assert.match(
       src,
@@ -351,9 +363,17 @@ describe("openclaude-runtime entrypoint env-scrub policy", () => {
 
     assert.match(scientist, /id:\s*"scientist"/, "scientist seed id must be stable");
     assert.match(scientist, /displayName:\s*"科研分析师"/, "scientist display name must be distinct");
-    assert.match(scientist, /provider:\s*COMMERCIAL_DEFAULT_PROVIDER/, "scientist must use the platform default provider (ark)");
-    assert.match(scientist, /model:\s*COMMERCIAL_DEFAULT_MODEL/, "scientist must use the platform default model (glm-5.1)");
+    assert.match(scientist, /provider:\s*COMMERCIAL_DEEPSEEK_PRO_PROVIDER/, "scientist must use deepseek (WS2 swap)");
+    assert.match(scientist, /model:\s*COMMERCIAL_DEEPSEEK_PRO_MODEL/, "scientist must use deepseek-v4-pro (WS2 swap with coder)");
     assert.match(scientist, /toolsets:\s*\[CORE_TOOLSET_ID\]/, "scientist must default to core only");
+    // per-agent model assignment (WS2)
+    assert.match(researcher, /model:\s*COMMERCIAL_RESEARCHER_MODEL/, "researcher must use MiniMax-M3");
+    assert.match(researcher, /provider:\s*COMMERCIAL_RESEARCHER_PROVIDER/, "researcher must use minimax");
+    assert.match(coder, /model:\s*COMMERCIAL_DEFAULT_MODEL/, "coder must use glm-5.1 (WS2 swap with scientist)");
+    assert.match(coder, /provider:\s*COMMERCIAL_DEFAULT_PROVIDER/, "coder must use ark");
+    const reviewer = extractConstObjectFromSource(src, "desiredReviewerAgent");
+    assert.match(reviewer, /model:\s*COMMERCIAL_DEEPSEEK_PRO_MODEL/, "reviewer must use deepseek-v4-pro (heterogeneous review)");
+    assert.match(reviewer, /provider:\s*COMMERCIAL_DEEPSEEK_PRO_PROVIDER/, "reviewer must use deepseek");
     assert.doesNotMatch(
       scientist,
       /BROWSER_TOOLSET_ID|RESEARCH_TOOLSET_ID/,

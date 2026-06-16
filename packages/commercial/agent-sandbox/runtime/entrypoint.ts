@@ -108,8 +108,16 @@ const WEB_CONTEXT_TOOLSET_ID = "web_context";
 // src/__tests__/runtimeEntrypointPolicy.test.ts 文本断言守护 —— 改这里必须同步改 platformDefaults.ts。
 const COMMERCIAL_DEFAULT_MODEL = "glm-5.1";
 const COMMERCIAL_DEFAULT_PROVIDER = "ark";
-const COMMERCIAL_CODER_MODEL = "deepseek-v4-pro";
-const COMMERCIAL_CODER_PROVIDER = "deepseek";
+// 2026-06-16 boss 重配:内置 agent 按角色多样化分配模型(方案 WS2)。改这里必须同步改
+// 前端 fallback packages/web/public/modules/agents.js 与本测试 runtimeEntrypointPolicy.test.ts。
+//   - researcher → MiniMax-M3(512k 超长上下文吃文献;MiniMax 默认思考模型)
+//   - scientist / reviewer → deepseek-v4-pro(分析 + 异构独立复核)
+//   - coder → glm-5.1(火山 Coding Plan 代码模型,自带 thinking)= COMMERCIAL_DEFAULT_*
+//   - main / codex 不变
+const COMMERCIAL_RESEARCHER_MODEL = "MiniMax-M3";
+const COMMERCIAL_RESEARCHER_PROVIDER = "minimax";
+const COMMERCIAL_DEEPSEEK_PRO_MODEL = "deepseek-v4-pro";
+const COMMERCIAL_DEEPSEEK_PRO_PROVIDER = "deepseek";
 const COMMERCIAL_CODEX_MODEL = "gpt-5.5";
 
 const BROWSER_MCP_ID = "browser";
@@ -1090,20 +1098,23 @@ try {
   const LEGACY_RESEARCHER_PERSONAS = [
     "你是资料研究员。先澄清问题范围,善用浏览器和论文/PDF工具查证,最后给出来源清楚的中文结论。\n",
   ] as const;
+  // 2026-06-16 WS2:coder 改用 glm-5.1(火山 Coding Plan),persona 去掉具体模型品牌,
+  // 改为模型中立,避免自我身份与实际模型漂移。旧 DeepSeek 文案进 LEGACY 供存量迁移。
   const CODER_PERSONA =
-    "你是 DeepSeek V4 Pro 代码工程师。先读代码和现有约束,再做最小必要修改;不要假设浏览器工具已挂载,需要外部资料时先说明依据,只有当前工具列表明确包含浏览器工具时才调用。验证结果后用简洁中文汇报。\n";
+    "你是代码工程师。先读代码和现有约束,再做最小必要修改;不要假设浏览器工具已挂载,需要外部资料时先说明依据,只有当前工具列表明确包含浏览器工具时才调用。验证结果后用简洁中文汇报。\n";
   const LEGACY_CODER_PERSONAS = [
     "你是 DeepSeek V4 Pro 代码工程师。先读代码和现有约束,再做最小必要修改,验证结果后用简洁中文汇报。\n",
+    "你是 DeepSeek V4 Pro 代码工程师。先读代码和现有约束,再做最小必要修改;不要假设浏览器工具已挂载,需要外部资料时先说明依据,只有当前工具列表明确包含浏览器工具时才调用。验证结果后用简洁中文汇报。\n",
   ] as const;
   const SCIENTIST_PERSONA =
     "你是科研分析师。专注统计建模、科学计算、可视化、生信/单细胞和可复现实验分析;优先使用当前已加载的科研 skills,但不要假设浏览器、PDF 或外部数据库工具已挂载。先确认数据来源、变量、假设和成功标准,本地优先处理数据;上传私有数据或调用外部服务前必须征得用户同意。生物医学/临床内容只给研究辅助和证据边界,不提供诊断、治疗或合规结论。\n";
 
   const desiredResearcherAgent = {
     id: "researcher",
-    model: COMMERCIAL_DEFAULT_MODEL,
+    model: COMMERCIAL_RESEARCHER_MODEL,
     persona: ensureAgentPersona("researcher", RESEARCHER_PERSONA, LEGACY_RESEARCHER_PERSONAS),
     permissionMode: "bypassPermissions",
-    provider: COMMERCIAL_DEFAULT_PROVIDER,
+    provider: COMMERCIAL_RESEARCHER_PROVIDER,
     displayName: "资料研究员",
     avatarEmoji: "🔎",
     toolsets: [CORE_TOOLSET_ID],
@@ -1111,10 +1122,10 @@ try {
 
   const desiredScientistAgent = {
     id: "scientist",
-    model: COMMERCIAL_DEFAULT_MODEL,
+    model: COMMERCIAL_DEEPSEEK_PRO_MODEL,
     persona: ensureAgentPersona("scientist", SCIENTIST_PERSONA),
     permissionMode: "bypassPermissions",
-    provider: COMMERCIAL_DEFAULT_PROVIDER,
+    provider: COMMERCIAL_DEEPSEEK_PRO_PROVIDER,
     displayName: "科研分析师",
     avatarEmoji: "🔬",
     toolsets: [CORE_TOOLSET_ID],
@@ -1122,10 +1133,10 @@ try {
 
   const desiredCoderAgent = {
     id: "coder",
-    model: COMMERCIAL_CODER_MODEL,
+    model: COMMERCIAL_DEFAULT_MODEL,
     persona: ensureAgentPersona("coder", CODER_PERSONA, LEGACY_CODER_PERSONAS),
     permissionMode: "bypassPermissions",
-    provider: COMMERCIAL_CODER_PROVIDER,
+    provider: COMMERCIAL_DEFAULT_PROVIDER,
     displayName: "代码工程师",
     avatarEmoji: "🛠️",
     toolsets: [CORE_TOOLSET_ID],
@@ -1133,13 +1144,13 @@ try {
 
   const desiredReviewerAgent = {
     id: "reviewer",
-    model: COMMERCIAL_DEFAULT_MODEL,
+    model: COMMERCIAL_DEEPSEEK_PRO_MODEL,
     persona: ensureAgentPersona(
       "reviewer",
       "你是审阅员。重点检查正确性、边界条件、安全性和是否过度工程,只提出可执行的问题和建议。\n",
     ),
     permissionMode: "bypassPermissions",
-    provider: COMMERCIAL_DEFAULT_PROVIDER,
+    provider: COMMERCIAL_DEEPSEEK_PRO_PROVIDER,
     displayName: "审阅员",
     avatarEmoji: "🧪",
     toolsets: [CORE_TOOLSET_ID],

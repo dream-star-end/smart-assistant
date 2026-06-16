@@ -904,6 +904,7 @@ function _handleDelegateProgressBlock(sess, block) {
       runId: block.runId,
       agentId: block.agentId || '',
       entries: [],
+      childBlocks: [],
       _completed: false,
     })
   }
@@ -913,7 +914,15 @@ function _handleDelegateProgressBlock(sess, block) {
     msg.completedAt = Date.now()
     msg.error = block.phase === 'error' || !!block.isError
     if (block.text) msg.summary = block.text
+  } else if (block.block && typeof block.block === 'object') {
+    // 富透传帧:复用主聊天嵌套 agent 的 coalescer,让委派卡按 childBlocks 渲染
+    // 工具调用/思考/文本,样式与主聊天一致。
+    if (!Array.isArray(msg.childBlocks)) msg.childBlocks = []
+    const child = block.block
+    const childText = typeof child.text === 'string' ? child.text : ''
+    _appendSubagentBlock(sess, msg, child, childText)
   } else {
+    // 旧降级帧(旧 gateway / 升级过渡):保留 entries 视图回落。
     _appendDelegateProgressEntry(msg, block)
   }
   if (sess.id === state.currentSessionId) {

@@ -70,7 +70,7 @@ import { sendV3WechatProactive, readV3WechatProactiveConfig } from './v3WechatPr
 import { parseDocument } from './documentParser.js'
 import {
   makeDelegateProgressBlock,
-  summarizeDelegateProgressEvent,
+  makeDelegateBlockPassthrough,
   type DelegateProgressBlock,
 } from './delegateProgress.js'
 import {
@@ -5080,7 +5080,7 @@ export class Gateway {
       }, timeoutConfig.checkIntervalMs)
     })
     const submitPromise = this.sessions.submit(session, prompt, (e) => {
-      const progressBlock = summarizeDelegateProgressEvent(e, progressRunId, targetAgentId)
+      const progressBlock = makeDelegateBlockPassthrough(e, progressRunId, targetAgentId)
       if (progressBlock || e.kind === 'block' || e.kind === 'error') markChildActivity()
       if (!timedOut) {
         if (e.kind === 'block' && e.block.kind === 'text') output += e.block.text

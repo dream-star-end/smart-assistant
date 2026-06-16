@@ -105,15 +105,15 @@ describe('staticKeyProviders — strip / endpoint', () => {
     assert.deepEqual([...ds.stripBodyFields], [])
     assert.equal(ds.maxInputTokens, undefined)
   })
-  it('minimax strip anthropic-beta + 4 body 字段(含 thinking)', () => {
+  it('minimax strip anthropic-beta + 3 body 字段(**保留 thinking** —— MiniMax-M3 是思考模型,2026-06-16)', () => {
     const mm = getStaticProvider('minimax')
     assert.deepEqual([...mm.stripHeaders], ['anthropic-beta'])
     assert.deepEqual([...mm.stripBodyFields], [
       'output_config',
       'context_management',
-      'thinking',
       'service_tier',
     ])
+    assert.equal(mm.stripBodyFields.includes('thinking'), false, 'minimax 不能 strip thinking(直连验证支持)')
     assert.equal(mm.maxInputTokens, 512_000)
   })
   it('ark strip anthropic-beta + 3 body 字段(**保留 thinking** —— glm-5.1 是 thinking 模型)', () => {

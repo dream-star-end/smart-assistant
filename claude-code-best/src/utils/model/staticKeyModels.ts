@@ -10,7 +10,8 @@ import { isMiniMaxM3Model } from './minimax.js'
 // CCB 只需两件事:
 //   1) 哪些静态模型「firstParty 能力基本全关」—— 这些模型 effort/betas/context-management/
 //      structured-output/adaptive-thinking 不生成(与 master proxy 的 strip 呼应:CCB 不生成是根治,
-//      master strip 是兜底)。**例外:glm-5.1 支持 thinking**(见 isCapabilityZeroStaticModel 注释)。
+//      master strip 是兜底)。**例外:glm-5.1 与 MiniMax-M3 都支持 thinking**(2026-06-16 起;见
+//      isCapabilityZeroStaticModel 注释)。
 //      **deepseek 不在此集**:deepseek-v4-flash/pro 仍保留 effort='max'(走默认路径,见 effort.ts),
 //      betas/thinking 也走默认路径,本次一字不动。
 //   2) 静态模型的 context window(auto-compact 上限)。deepseek 无特判 → 落 MODEL_CONTEXT_WINDOW_DEFAULT。
@@ -24,9 +25,10 @@ export function isArkGlmModel(model: string): boolean {
  * 「firstParty 能力基本全关」静态模型集 = MiniMax-M3 + glm-5.1(**不含 deepseek**)。
  * 命中 → effort/betas/context-management/structured-output/adaptive-thinking 全部不生成。
  *
- * **例外:thinking**。glm-5.1 虽在本集合(上述能力仍关)，但它是 thinking 模型 ——
- * `thinking.ts` 的 modelSupportsThinking 对 glm-5.1 先判 isArkGlmModel→true，单独放行 thinking。
- * MiniMax-M3 则 thinking 也关。所以"是否在本集合"不直接等于"是否支持 thinking"。
+ * **例外:thinking**。glm-5.1 与 MiniMax-M3 虽在本集合(上述能力仍关)，但都是 thinking 模型 ——
+ * `thinking.ts` 的 modelSupportsThinking 对 glm-5.1(isArkGlmModel)/MiniMax-M3(isMiniMaxM3Model)
+ * 先判→true，单独放行 thinking(2026-06-16 直连验证 MiniMax 端点接受 thinking 参数)。
+ * 所以"是否在本集合"不直接等于"是否支持 thinking"。
  */
 export function isCapabilityZeroStaticModel(model: string): boolean {
   return isMiniMaxM3Model(model) || isArkGlmModel(model)

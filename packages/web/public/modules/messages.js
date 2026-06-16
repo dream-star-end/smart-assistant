@@ -701,7 +701,8 @@ function _appendAgentChildBlock(body, child) {
     if (!child.text) return
     const p = document.createElement('div')
     p.className = 'agent-group-child-text'
-    p.textContent = child.text
+    // 与主聊天一致:文本走 markdown 渲染(主聊天 assistant 文本同款 renderMarkdown)。
+    p.innerHTML = renderMarkdown(child.text)
     body.appendChild(p)
   } else if (child.kind === 'thinking') {
     if (!child.text) return
@@ -853,7 +854,9 @@ function _buildDelegateToolChip(entry, text) {
 function _renderDelegateProgress(el, msg) {
   el.innerHTML = ''
   el.className = 'agent-group delegate-progress'
-  if (msg._completed) el.classList.add('collapsed')
+  // 折叠语义与子任务卡(agent-group)统一:运行中展开看实时进度、完成自动折叠,
+  // 用户手动 toggle 后永久尊重其选择(_userCollapsed)。
+  if (_resolveAgentGroupCollapsed(msg)) el.classList.add('collapsed')
   if (msg.error) el.classList.add('error')
   el.dataset.msgId = msg.id
 
@@ -866,36 +869,48 @@ function _renderDelegateProgress(el, msg) {
   const header = document.createElement('div')
   header.className = 'agent-group-header'
   header.innerHTML = `${_SVG_BOT_AGENT}<span class="agent-group-title">委派过程: ${htmlSafeEscape(msg.agentId || 'agent')}</span>${statusHtml}${_SVG_CHEVRON_AGENT}`
-  makeDisclosure(header, el)
+  makeDisclosure(header, el, {
+    onToggle: () => {
+      msg._userCollapsed = !el.classList.contains('collapsed')
+      el.classList.toggle('collapsed', msg._userCollapsed)
+    },
+  })
   el.appendChild(header)
 
   const body = document.createElement('div')
   body.className = 'agent-group-body'
-  const entries = Array.isArray(msg.entries) ? msg.entries : []
-  for (const entry of entries) {
-    const text = String(entry?.text || '').trim()
-    if (!text) continue
-    // Chain-of-thought is hidden (also dropped server-side); skip any that
-    // survive in persisted history so old cards read cleanly too.
-    if (entry.phase === 'thinking') continue
-    if (entry.phase === 'tool') {
-      const chip = _buildDelegateToolChip(entry, text)
-      if (chip) body.appendChild(chip)
-      continue
+
+  // 新富透传:childBlocks 走主聊天同款渲染(工具卡 / 思考 / markdown 文本)。
+  const childBlocks = Array.isArray(msg.childBlocks) ? msg.childBlocks : []
+  if (childBlocks.length > 0) {
+    for (const ch of childBlocks) _appendAgentChildBlock(body, ch)
+  } else {
+    // 旧降级帧(历史卡 / 升级过渡):保留 entries chip/纯文本视图。
+    const entries = Array.isArray(msg.entries) ? msg.entries : []
+    for (const entry of entries) {
+      const text = String(entry?.text || '').trim()
+      if (!text) continue
+      if (entry.phase === 'thinking') continue
+      if (entry.phase === 'tool') {
+        const chip = _buildDelegateToolChip(entry, text)
+        if (chip) body.appendChild(chip)
+        continue
+      }
+      const p = document.createElement('div')
+      p.className = 'agent-group-child-text'
+      if (entry.isError) p.classList.add('error')
+      p.textContent = text
+      body.appendChild(p)
     }
-    const p = document.createElement('div')
-    p.className = 'agent-group-child-text'
-    if (entry.isError) p.classList.add('error')
-    p.textContent = text
-    body.appendChild(p)
   }
+
   if (msg.summary) {
     const preview = document.createElement('div')
     preview.className = 'agent-group-result'
     preview.textContent = msg.summary
     body.appendChild(preview)
   }
-  if (entries.length === 0 && !msg.summary) {
+  if (childBlocks.length === 0 && (!Array.isArray(msg.entries) || msg.entries.length === 0) && !msg.summary) {
     const empty = document.createElement('div')
     empty.className = 'agent-group-empty'
     empty.textContent = '等待子 agent 输出…'

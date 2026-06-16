@@ -1,6 +1,7 @@
 import * as assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
 import {
+  makeDelegateBlockPassthrough,
   makeDelegateProgressBlock,
   sanitizeDelegateProgressText,
   summarizeDelegateProgressEvent,
@@ -105,5 +106,68 @@ describe('delegate progress sanitization', () => {
       maxLen: 1200,
     })
     assert.equal(block.text?.length, 1200)
+  })
+})
+
+describe('makeDelegateBlockPassthrough (rich forward for main-chat-style rendering)', () => {
+  it('forwards full text block + keeps legacy phase/text', () => {
+    const out = makeDelegateBlockPassthrough(
+      { kind: 'block', block: { kind: 'text', text: 'hi there' } },
+      'r1',
+      'researcher',
+    ) as any
+    assert.equal(out.kind, 'delegate_progress')
+    assert.equal(out.phase, 'text')
+    assert.equal(out.text, 'hi there') // legacy fallback for old clients
+    assert.deepEqual(out.block, { kind: 'text', text: 'hi there' }) // rich payload
+  })
+
+  it('forwards thinking (no longer dropped) as a frame with block + phase=thinking', () => {
+    const out = makeDelegateBlockPassthrough(
+      { kind: 'block', block: { kind: 'thinking', text: 'let me reason' } },
+      'r1',
+      'researcher',
+    ) as any
+    assert.notEqual(out, null)
+    assert.equal(out.phase, 'thinking')
+    assert.deepEqual(out.block, { kind: 'thinking', text: 'let me reason' })
+  })
+
+  it('forwards tool_use with full inputJson (not truncated to 180) + preserves whitespace', () => {
+    const code = 'def f():\n    return  1' // double space + indent must survive
+    const out = makeDelegateBlockPassthrough(
+      {
+        kind: 'block',
+        block: { kind: 'tool_use', blockId: 'b1', toolName: 'Write', inputPreview: 'x', inputJson: code, partial: false },
+      },
+      'r1',
+      'coder',
+    ) as any
+    assert.equal(out.phase, 'tool')
+    assert.equal(out.block.kind, 'tool_use')
+    assert.equal(out.block.blockId, 'b1')
+    assert.equal(out.block.inputJson, code) // whitespace/indent preserved, not collapsed
+  })
+
+  it('forwards tool_result with preview/isError; returns null for non-renderable / non-block', () => {
+    const tr = makeDelegateBlockPassthrough(
+      { kind: 'block', block: { kind: 'tool_result', blockId: 'b1:result', toolUseBlockId: 'b1', toolName: 'Bash', isError: true, preview: 'boom' } },
+      'r1',
+      'coder',
+    ) as any
+    assert.equal(tr.block.kind, 'tool_result')
+    assert.equal(tr.block.isError, true)
+    assert.equal(tr.block.preview, 'boom')
+    assert.equal(makeDelegateBlockPassthrough({ kind: 'block', block: { kind: 'plan' } }, 'r1', 'a'), null)
+    assert.equal(makeDelegateBlockPassthrough({ kind: 'error', error: 'x' }, 'r1', 'a'), null)
+  })
+
+  it('strips dangerous control chars in rich text but keeps tabs/newlines', () => {
+    const out = makeDelegateBlockPassthrough(
+      { kind: 'block', block: { kind: 'text', text: 'a b\u0007c\td\ne' } },
+      'r1',
+      'a',
+    ) as any
+    assert.equal(out.block.text, 'a b c\td\ne') // bell(\u0007) -> space; \t and \n preserved
   })
 })

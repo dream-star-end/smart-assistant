@@ -18,6 +18,12 @@ export type DelegateProgressBlock = {
   text?: string
   toolName?: string
   isError?: boolean
+  /**
+   * 完整子 agent block payload(text/thinking/tool_use/tool_result/tool_output_tail),供新前端
+   * 复用主聊天富渲染(`_appendSubagentBlock`)。旧前端不读此字段、走 `text`/`phase` 降级,两侧兼容。
+   * 仅「透传模式」(makeDelegateBlockPassthrough)产生;start/done/error/plan 仍是纯摘要帧无 block。
+   */
+  block?: unknown
 }
 
 export function sanitizeDelegateProgressText(
@@ -139,5 +145,71 @@ export function summarizeDelegateProgressEvent(
       })
     default:
       return null
+  }
+}
+
+// 透传模式每个 string 字段的上限。解析层已对各字段硬截(inputPreview 500 / inputJson 8000 /
+// tool_result preview 3000),这里只是兜底防御,不做语义截断,故给宽上限。
+const DELEGATE_PASSTHROUGH_FIELD_CAP = 16_000
+
+/**
+ * 富渲染文本清洗:剥危险控制字符(保留 \t/\n)、归一 \r\n,**不折叠空白**(否则破坏代码缩进/diff)、
+ * 不 trim,超 cap 截断。区别于 sanitizeDelegateProgressText(那个会折叠多空格,适合摘要 chip 不适合富渲染)。
+ */
+function sanitizeRichTextForDelegate(raw: unknown, cap = DELEGATE_PASSTHROUGH_FIELD_CAP): string {
+  // biome-ignore lint/suspicious/noControlCharactersInRegex: 故意匹配并剥离危险控制字符(保留 \t=09/\n=0a),富文本清洗
+  const controlStripped = String(raw ?? '').replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, ' ')
+  const s = controlStripped.replace(/\r\n?/g, '\n')
+  if (s.length <= cap) return s
+  return `${s.slice(0, Math.max(0, cap - 1))}…`
+}
+
+/**
+ * 浅拷贝子 agent block,仅对已知自由文本字段做富文本清洗(保留缩进/换行),不丢字段、不语义截断。
+ * 透传给前端 `_appendSubagentBlock` 复用主聊天富渲染。
+ */
+function sanitizeBlockForDelegate(block: any): any {
+  if (!block || typeof block !== 'object') return block
+  const out: Record<string, unknown> = { ...block }
+  for (const f of ['text', 'inputPreview', 'inputJson', 'preview', 'tail']) {
+    if (typeof out[f] === 'string') out[f] = sanitizeRichTextForDelegate(out[f])
+  }
+  return out
+}
+
+/**
+ * 把子 agent 的执行 block 以**完整 payload** 透传成 delegate_progress 帧(取代 summarize 的降级):
+ *   - `block` 字段携带完整子 block(thinking 不再 drop、tool 输入/输出不再砍 180/800),供**新前端**
+ *     复用主聊天富渲染。
+ *   - 同时保留 `phase`/`text`/`toolName`/`isError`(复用 summarizeDelegateProgressEvent)给**旧前端**
+ *     降级显示;thinking 走 summarize 返回 null → 这里补一个 phase='thinking' 的最小帧(旧前端按
+ *     phase 跳过 thinking,行为与旧版一致;新前端用 block 渲染)。
+ * 只透传可渲染的 5 类块;其它(plan/start/done/error 由 caller 单独发摘要帧)返回 null。
+ */
+export function makeDelegateBlockPassthrough(
+  event: any,
+  runId: string,
+  agentId: string,
+): DelegateProgressBlock | null {
+  if (!event || event.kind !== 'block' || !event.block) return null
+  const b = event.block as any
+  const RENDERABLE = new Set(['text', 'thinking', 'tool_use', 'tool_result', 'tool_output_tail'])
+  if (!RENDERABLE.has(b.kind)) return null
+  const legacy = summarizeDelegateProgressEvent(event, runId, agentId)
+  const phase: DelegateProgressPhase =
+    legacy?.phase ?? (b.kind === 'thinking' ? 'thinking' : b.kind === 'text' ? 'text' : 'tool')
+  const base: DelegateProgressBlock = legacy ?? {
+    kind: 'delegate_progress',
+    runId,
+    agentId,
+    phase,
+  }
+  return {
+    ...base,
+    kind: 'delegate_progress',
+    runId,
+    agentId,
+    phase,
+    block: sanitizeBlockForDelegate(b),
   }
 }
