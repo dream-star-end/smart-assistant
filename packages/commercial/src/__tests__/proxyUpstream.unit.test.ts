@@ -264,7 +264,7 @@ describe("pickUpstream — DeepSeek route", () => {
 // ─── pickUpstream — MiniMax 路径(等价回归)───────────────────────────────
 
 describe("pickUpstream — MiniMax route", () => {
-  test("不调 scheduler;endpoint=minimax;Bearer Token Plan key + strip beta/4 body extras", async () => {
+  test("不调 scheduler;endpoint=minimax;Bearer Token Plan key + strip beta/3 body extras(**保留 thinking**,MiniMax-M3 是思考模型)", async () => {
     const sched = makeScheduler({});
     const res = await pickUpstream(
       { scheduler: sched.scheduler, staticProviderKeys: { minimax: "MM-KEY" } },
@@ -295,7 +295,8 @@ describe("pickUpstream — MiniMax route", () => {
     assert.equal(safeHeaders["anthropic-beta"], undefined);
     assert.equal((body as { output_config?: unknown }).output_config, undefined);
     assert.equal((body as { context_management?: unknown }).context_management, undefined);
-    assert.equal((body as { thinking?: unknown }).thinking, undefined);
+    // 2026-06-16:minimax 不再 strip thinking(MiniMax-M3 是思考模型,端点接受 thinking 参数)。
+    assert.deepEqual((body as { thinking?: unknown }).thinking, { type: "enabled" });
     assert.equal((body as { service_tier?: unknown }).service_tier, undefined);
     assert.equal(
       (body as { metadata?: { user_id?: unknown } }).metadata?.user_id,
