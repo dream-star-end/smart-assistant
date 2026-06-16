@@ -89,7 +89,7 @@ import {
   reloadAgents,
   renderAgentDropdown,
   renderAgentsManagementList,
-} from './agents.js?v=4'
+} from './agents.js?v=5'
 
 // ── Sessions ──
 import {
@@ -126,7 +126,7 @@ import {
   setMessageDeps,
   updateMessageEl,
   updateSessionSub,
-} from './messages.js?v=44'
+} from './messages.js?v=45'
 
 // ── WebSocket ──
 import {
@@ -168,13 +168,14 @@ import {
   showSlashPopup,
   slashPopupVisible,
 } from './commands.js?v=8'
-import { getEffortForSubmit, initModePills, renderModePills } from './effortMode.js'
+import { getEffortForSubmit, initModePills, renderModePills } from './effortMode.js?v=1'
 import {
   getGoalModeForSubmit,
   initGoalModePanel,
   markGoalModeSeeded,
   renderGoalModePanel,
 } from './goalMode.js?v=3'
+import { getModelForSubmit, initModelPicker, renderModelPicker } from './modelMode.js'
 import {
   applyTerminalTheme,
   initOfficialClaudeTerminal,
@@ -182,7 +183,7 @@ import {
 } from './officialTerminal.js?v=16'
 import { getConversationModeForSubmit } from './planMode.js?v=4'
 import { initPlanPanel } from './planPanel.js?v=3'
-import { initResearchTools, renderResearchTools } from './researchTools.js'
+import { initResearchTools, renderResearchTools } from './researchTools.js?v=1'
 
 // ═══════════════════════════════════════════════════════════
 // 1. Wire late-bound dependencies
@@ -652,6 +653,8 @@ initOfficialClaudeTerminal()
 // 完整可见性由 agent.model 决定,真正的渲染会在 reloadAgents → renderAgentDropdown 内
 // 再触发一次;这里只是绑定点击事件并把初始隐藏态打上去。
 initModePills()
+// 模型选择器:绑定一次。onChange 在切换 model 后联动重渲 effort 档位(model 决定可调档位)。
+initModelPicker({ onChange: renderModePills })
 initPlanPanel()
 initGoalModePanel()
 // 科研模式工具条 — 仅在用户选中 effort=max 时显示,提供受众切换 + 浓缩模板。
@@ -784,6 +787,7 @@ async function send() {
       filename: a.name,
     }))
   const effortLevel = getEffortForSubmit()
+  const model = getModelForSubmit()
   const conversationMode = getConversationModeForSubmit(text, state.attachments)
   const goalMode = getGoalModeForSubmit()
   const wsPayload = {
@@ -796,6 +800,8 @@ async function send() {
     // string='xhigh'/'max' → 切到该 effort;null → 显式清除回模型默认;
     // undefined → 不参与 effort 协商(非 Opus 4.7 agent 走这条)。
     ...(effortLevel !== undefined ? { effortLevel } : {}),
+    // model 仅在用户选了模型覆盖时带上;否则省略,runner 用 agent 默认 model。
+    ...(model !== undefined ? { model } : {}),
     ...(conversationMode !== undefined ? { conversationMode } : {}),
     ...(goalMode !== undefined ? { goalMode } : {}),
     ts: Date.now(),
@@ -1658,7 +1664,9 @@ async function init() {
     // Stop in-flight request before switching to prevent late tokens from old agent
     if (state.sendingInFlight) stopCurrentTurn()
     sess.agentId = e.target.value
-    // Pill 跟着新 agent 的 model 走 — 切到非 Opus 4.7 自动隐藏,选中态按新 agent 的存储读。
+    // 模型选择器先刷(切 agent → 默认 model/可选项变);effort 再刷(档位依赖生效 model)。
+    renderModelPicker()
+    // Pill 跟着新 agent 的生效 model 走 — 不支持思考深度的 model 自动隐藏。
     renderModePills()
     renderResearchTools()
     renderGoalModePanel({ autoRefresh: true })

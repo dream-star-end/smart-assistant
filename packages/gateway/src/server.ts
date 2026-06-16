@@ -27,6 +27,7 @@ import {
   SkillStore,
   TaskStore,
   claimSession,
+  defaultModels,
   deleteClientSession,
   getClientSession,
   getUsageSummary,
@@ -2490,6 +2491,9 @@ export class Gateway {
         agents: cfg.agents.map((a) => this.redactAgentForApi(a)),
         default: cfg.default,
         routes: cfg.routes,
+        // Model registry for the composer's model picker (per-session override).
+        // config.models when set, else the Claude-family seed.
+        models: this.deps.config.models ?? defaultModels(),
       })
       return
     }
@@ -5538,6 +5542,21 @@ export class Gateway {
       agent.provider === 'codex-native' &&
       agent.runnerKind === 'app-server'
 
+    // Per-session model override. WS frames are JSON-cast (no typebox runtime
+    // check), so whitelist against the configured model registry plus the
+    // agent's own default (so "revert to default" — which sends the agent model
+    // id — is accepted). Anything else is ignored, never passed raw to --model.
+    const _frameModel = (frame as any).model
+    const _allowedModels = new Set(
+      [
+        ...(this.deps.config.models ?? defaultModels()).map((m) => m.id),
+        agent.model,
+        this.deps.config.defaults.model,
+      ].filter((x): x is string => typeof x === 'string' && x.length > 0),
+    )
+    const safeModel: string | undefined =
+      typeof _frameModel === 'string' && _allowedModels.has(_frameModel) ? _frameModel : undefined
+
     const session = await this.sessions.getOrCreate({
       sessionKey,
       agent,
@@ -6041,6 +6060,7 @@ export class Gateway {
       safeEffortLevel,
       safeConversationMode,
       goalObjective,
+      safeModel,
     )
   }
 

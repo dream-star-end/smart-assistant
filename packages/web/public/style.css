@@ -3207,6 +3207,85 @@ a:hover {
 .mode-pill[aria-pressed="true"] svg {
   opacity: 1;
 }
+
+/* ── 模型选择器(composer popover, per-session 覆盖) ── */
+.composer-model {
+  position: relative; /* 菜单的定位锚 */
+  padding: var(--space-2) var(--space-3) 0;
+}
+.composer-model[hidden] {
+  display: none;
+}
+.mode-pill--trigger[aria-expanded="true"] {
+  background: var(--bg-hover);
+  color: var(--fg);
+}
+.mode-pill-caret {
+  transition: transform var(--transition-fast);
+}
+.mode-pill--trigger[aria-expanded="true"] .mode-pill-caret {
+  transform: rotate(180deg);
+}
+.mode-pill:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+.model-menu {
+  position: absolute;
+  bottom: calc(100% + 6px); /* composer 在底部 → 菜单往上弹 */
+  left: var(--space-3);
+  min-width: 240px;
+  max-height: 50vh;
+  overflow-y: auto;
+  padding: var(--space-1);
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.28);
+  z-index: 20;
+}
+.model-menu[hidden] {
+  display: none;
+}
+.model-menu-item {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 1px;
+  width: 100%;
+  padding: var(--space-2) var(--space-3);
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--fg);
+  text-align: left;
+  cursor: pointer;
+}
+.model-menu-item:hover {
+  background: var(--bg-hover);
+}
+.model-menu-item:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+.model-menu-item--selected {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+.model-menu-item .label {
+  font-size: var(--text-sm);
+  line-height: 1.3;
+}
+.model-menu-item .hint {
+  font-size: var(--text-xs);
+  color: var(--fg-dim);
+  font-family: var(--font-mono);
+}
+.model-menu-item--selected .hint {
+  color: var(--accent);
+  opacity: 0.8;
+}
+
 /* ── 科研模式工具条(仅当选中 max effort 时显示) ── */
 .research-tools {
   display: flex;

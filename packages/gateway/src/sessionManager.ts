@@ -784,6 +784,11 @@ export class SessionManager {
      *  plan-first turn cannot leak into ordinary follow-up turns. */
     conversationMode?: 'default' | 'plan',
     goalObjective?: string,
+    /** 来自 InboundMessage.model,per-session 模型覆盖。提供且与 runner 当前 model
+     *  不同时,在本 turn 启动前 setModel + shutdown(下次 submit 自动用新 model 重启),
+     *  与 effort 同机制、同 lock chain。缺省则不动(用 agent 默认 model)。
+     *  仅对支持 setModel 的 runner(SubprocessRunner)生效;codex runner 无则忽略。 */
+    model?: string,
   ): Promise<void> {
     // 闭包捕获:即便后面再有 submit 也不会改这个常量
     const desiredEffort: string | undefined = effortLevel === null ? undefined : effortLevel
@@ -808,6 +813,20 @@ export class SessionManager {
           // when SubprocessRunner auto-respawns on the next submit().
         } catch (err) {
           log.warn('effort-change shutdown failed', { sessionKey: session.sessionKey }, err)
+        }
+      }
+      // Per-session model override (same recycle mechanism as effort, same lock
+      // chain). Only applies to runners that expose setModel — codex-native
+      // runners don't (model semantics differ), so the override is ignored there
+      // rather than throwing. The new model is read by buildClaudeCliArgs on the
+      // next spawn, so we must shutdown the current subprocess for it to apply.
+      const setModel = (session.runner as { setModel?: (m?: string) => void }).setModel
+      if (model && typeof setModel === 'function' && session.runner.model !== model) {
+        try {
+          setModel.call(session.runner, model)
+          await session.runner.shutdown()
+        } catch (err) {
+          log.warn('model-change shutdown failed', { sessionKey: session.sessionKey }, err)
         }
       }
       const cleanGoalObjective =
