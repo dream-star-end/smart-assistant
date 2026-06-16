@@ -744,6 +744,9 @@ function buildMessageText(userText, attachments) {
 }
 
 // ── send ──
+// True while attachment bytes are uploading over the HTTP channel; blocks a
+// second send() from re-entering mid-upload (see usage in send()).
+let _attachmentUploadInFlight = false
 async function send() {
   const text = $('input').value.trim()
   if (!text && state.attachments.length === 0) return
@@ -785,13 +788,13 @@ async function send() {
   const mediaAtts = state.attachments.filter((a) => a.kind !== 'text')
   let media = []
   if (mediaAtts.length > 0) {
-    // Lock the composer for the duration of the upload await — without this,
-    // pressing Enter again mid-upload re-enters send() and double-uploads /
-    // double-sends the same message. Released synchronously after upload (no
-    // await before ws.send, so re-entry is impossible past this point); the
-    // send branches below re-assert the lock as needed.
-    setSending(true)
-    updateSendEnabled()
+    // Dedicated re-entry guard for the upload await. We deliberately do NOT
+    // reuse setSending() here: that flag turns the send button into a "stop"
+    // button whose teardown clears the lock, which would reopen re-entry and
+    // could double-upload / double-send. A plain module flag blocks a second
+    // send() outright while bytes are in flight, independent of turn state.
+    if (_attachmentUploadInFlight) return
+    _attachmentUploadInFlight = true
     try {
       media = await Promise.all(
         mediaAtts.map((a) =>
@@ -809,14 +812,16 @@ async function send() {
     } catch (err) {
       for (const a of mediaAtts) a._uploadPct = undefined
       renderAttachments()
-      setSending(false)
-      updateSendEnabled()
+      _attachmentUploadInFlight = false
       toast(`附件上传失败：${err?.message || err}`, 'error')
       return // keep input + attachments for retry
     }
+    _attachmentUploadInFlight = false
     for (const a of mediaAtts) a._uploadPct = undefined
-    setSending(false)
-    updateSendEnabled()
+    // Session may have changed while bytes were uploading — don't send the
+    // captured `sess`'s message into whatever session is now active (mirrors
+    // the hydrateSession guard above). Attachments stay in the composer.
+    if (state.currentSessionId !== sess.id) return
   }
   const effortLevel = getEffortForSubmit()
   const model = getModelForSubmit()
