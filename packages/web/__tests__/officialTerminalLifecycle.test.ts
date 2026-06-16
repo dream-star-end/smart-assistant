@@ -244,10 +244,10 @@ describe('official Claude terminal lifecycle', () => {
   it('cache-busts terminal assets consistently across index/sw/main', () => {
     assert.match(MAIN, /from '\.\/officialTerminal\.js\?v=16'/)
     assert.match(SW, /\/modules\/officialTerminal\.js\?v=16/)
-    assert.match(INDEX, /\/modules\/main\.js\?v=71/)
-    assert.match(INDEX, /\/style\.css\?v=59/)
-    assert.match(INDEX, /sw-flush-v24/)
-    assert.match(SW, /openclaude-v91/)
+    assert.match(INDEX, /\/modules\/main\.js\?v=72/)
+    assert.match(INDEX, /\/style\.css\?v=60/)
+    assert.match(INDEX, /sw-flush-v25/)
+    assert.match(SW, /openclaude-v92/)
   })
 
   it('caches xterm selection (TTL + consume + new-interaction bounded) so TUI redraws do not drop copy', () => {

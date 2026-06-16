@@ -19,8 +19,8 @@ describe('effortsForModel: capability authority', () => {
   })
 
   it('Claude family depths', () => {
-    assert.deepEqual(effortsForModel('claude-opus-4-8'), ['high', 'xhigh', 'max'])
-    assert.deepEqual(effortsForModel('claude-opus-4-7'), ['xhigh', 'max'])
+    assert.deepEqual(effortsForModel('claude-opus-4-8'), ['low', 'medium', 'high', 'xhigh', 'max'])
+    assert.deepEqual(effortsForModel('claude-opus-4-7'), ['low', 'medium', 'high', 'xhigh', 'max'])
     assert.deepEqual(effortsForModel('claude-sonnet-4-6'), ['high', 'xhigh'])
   })
 

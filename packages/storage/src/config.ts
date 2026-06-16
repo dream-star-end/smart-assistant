@@ -56,10 +56,10 @@ export function effortsForModel(modelId: string | undefined): EffortLevel[] {
   // Codex / GPT-5.5 reasoning depth. Maps to codex `model_reasoning_effort`
   // (low/medium/high/xhigh — codex exposes no `max`); see codexLaunchOverrides.
   if (/(^|[/_-])gpt[-_]?5\.5($|[/_-])/.test(id)) return ['low', 'medium', 'high', 'xhigh']
-  // Claude Opus 4.8 — full depth incl. 科研模式 (max).
-  if (/opus[-_]?4[-_]?8/.test(id)) return ['high', 'xhigh', 'max']
-  // Claude Opus 4.7 — legacy 编码/科研模式 (xhigh/max).
-  if (/opus[-_]?4[-_]?7/.test(id)) return ['xhigh', 'max']
+  // Claude Opus 4.8 — full ladder. max 仍触发 buildResearchSlot 高严谨度守则。
+  if (/opus[-_]?4[-_]?8/.test(id)) return ['low', 'medium', 'high', 'xhigh', 'max']
+  // Claude Opus 4.7 — 同样全档,picker 切到 4.7 时档位行为不抖动。
+  if (/opus[-_]?4[-_]?7/.test(id)) return ['low', 'medium', 'high', 'xhigh', 'max']
   // Claude Sonnet 4.6.
   if (/sonnet[-_]?4[-_]?6/.test(id)) return ['high', 'xhigh']
   // Haiku / MiniMax / anything else — no extra thinking-depth control.
@@ -74,9 +74,7 @@ export function effortsForModel(modelId: string | undefined): EffortLevel[] {
 export function defaultModels(): ModelChoice[] {
   return [
     { id: 'claude-opus-4-8', label: 'Opus 4.8' },
-    // Opus 4.7 is the current default agent model on this install — keep it in
-    // the seed so the picker lists it AND the thinking-depth control stays
-    // available (preserves the legacy 编码/科研模式 = xhigh/max).
+    // Opus 4.7 仍保留,供想退回前一代模型的会话覆盖使用。
     { id: 'claude-opus-4-7', label: 'Opus 4.7' },
     { id: 'claude-sonnet-4-6', label: 'Sonnet 4.6' },
     { id: 'claude-haiku-4-5', label: 'Haiku 4.5' },

@@ -89,7 +89,7 @@ import {
   reloadAgents,
   renderAgentDropdown,
   renderAgentsManagementList,
-} from './agents.js?v=6'
+} from './agents.js?v=7'
 
 // ── Sessions ──
 import {
@@ -183,7 +183,6 @@ import {
 } from './officialTerminal.js?v=16'
 import { getConversationModeForSubmit } from './planMode.js?v=4'
 import { initPlanPanel } from './planPanel.js?v=3'
-import { initResearchTools, renderResearchTools } from './researchTools.js?v=2'
 
 // ═══════════════════════════════════════════════════════════
 // 1. Wire late-bound dependencies
@@ -649,7 +648,7 @@ initOAuthListeners()
 initWechatListeners()
 initOfficialClaudeTerminal()
 
-// ── Effort pills (编码模式 / 科研模式): bind once + render initial visibility ──
+// ── 思考深度 pills: bind once + render initial visibility ──
 // 完整可见性由 agent.model 决定,真正的渲染会在 reloadAgents → renderAgentDropdown 内
 // 再触发一次;这里只是绑定点击事件并把初始隐藏态打上去。
 initModePills()
@@ -657,8 +656,6 @@ initModePills()
 initModelPicker({ onChange: renderModePills })
 initPlanPanel()
 initGoalModePanel()
-// 科研模式工具条 — 仅在用户选中 effort=max 时显示,提供受众切换 + 浓缩模板。
-initResearchTools()
 
 // ── Feedback: submit wiring ──
 $('feedback-submit-btn').onclick = submitFeedback
@@ -1668,7 +1665,6 @@ async function init() {
     renderModelPicker()
     // Pill 跟着新 agent 的生效 model 走 — 不支持思考深度的 model 自动隐藏。
     renderModePills()
-    renderResearchTools()
     renderGoalModePanel({ autoRefresh: true })
     // Mark switch time — handleOutbound will ignore frames arriving before this
     sess._agentSwitchedAt = Date.now()

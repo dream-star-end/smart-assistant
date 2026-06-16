@@ -4,7 +4,6 @@ import { $, htmlSafeEscape } from './dom.js'
 import { renderModePills } from './effortMode.js?v=2'
 import { renderGoalModePanel } from './goalMode.js?v=3'
 import { renderModelPicker } from './modelMode.js?v=1'
-import { renderResearchTools } from './researchTools.js?v=2'
 import { getSession, state } from './state.js'
 import { closeModal, openModal, toast } from './ui.js'
 
@@ -40,8 +39,6 @@ export function renderAgentDropdown() {
   renderModelPicker()
   // Pill 可见性依赖当前生效 model — 任何 agent 列表/会话切换后都要刷新一次。
   renderModePills()
-  // 科研工具条的可见性同样取决于 effort pill 当前选中值,跟随 agent 切换一起刷新。
-  renderResearchTools()
   // Goal 模式只对 codex-native app-server agent 可见。
   renderGoalModePanel({ autoRefresh: true })
 }

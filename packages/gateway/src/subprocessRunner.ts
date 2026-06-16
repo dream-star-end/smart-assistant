@@ -690,7 +690,7 @@ export class SubprocessRunner extends EventEmitter {
         persona: this.opts.persona,
         provider: this.opts.agentProvider ?? this.opts.config.provider,
         model: this.opts.model,
-        // 把当前 effort 传进 slot builder 决定是否注入"科研模式守则"。
+        // 把当前 effort 传进 slot builder 决定是否注入高严谨度守则(仅 max 触发)。
         // effort 切换本就会 recycle subprocess,新 runner 启动时会重建 extra-prompt.md。
         effortLevel: this.opts.effortLevel,
       })
