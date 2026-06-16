@@ -45,7 +45,10 @@ describe('official Claude terminal lifecycle', () => {
 
     assert.match(terminateSrc, /terminateOfficialClaudeTerminalAsync\(\)/)
     assert.doesNotMatch(terminateSrc, /closeSocket\(true\)/)
-    assert.match(SRC, /apiJson\('POST', '\/api\/claude-terminal\/terminate', \{\}\)/)
+    assert.match(
+      SRC,
+      /api\/claude-terminal\/terminate\?sessionId=\$\{encodeURIComponent\(sessionId\)\}/,
+    )
     assert.match(SRC, /closeSocket\(false\)/)
     assert.match(SRC, /closeSocket\(true\)/)
     assert.match(SRC, /已通过当前连接发送终止/)
@@ -239,12 +242,12 @@ describe('official Claude terminal lifecycle', () => {
   })
 
   it('cache-busts terminal assets consistently across index/sw/main', () => {
-    assert.match(MAIN, /from '\.\/officialTerminal\.js\?v=15'/)
-    assert.match(SW, /\/modules\/officialTerminal\.js\?v=15/)
-    assert.match(INDEX, /\/modules\/main\.js\?v=68/)
-    assert.match(INDEX, /\/style\.css\?v=56/)
+    assert.match(MAIN, /from '\.\/officialTerminal\.js\?v=16'/)
+    assert.match(SW, /\/modules\/officialTerminal\.js\?v=16/)
+    assert.match(INDEX, /\/modules\/main\.js\?v=69/)
+    assert.match(INDEX, /\/style\.css\?v=57/)
     assert.match(INDEX, /sw-flush-v24/)
-    assert.match(SW, /openclaude-v88/)
+    assert.match(SW, /openclaude-v89/)
   })
 
   it('caches xterm selection (TTL + consume + new-interaction bounded) so TUI redraws do not drop copy', () => {
@@ -387,17 +390,32 @@ describe('official Claude terminal lifecycle', () => {
     assert.match(STYLE, /\.claude-terminal-sessions-menu\s*{/)
   })
 
-  it('new and resume intents reach the gateway via WS action query params', () => {
+  it('new and attach intents reach the gateway via WS action query params', () => {
     const connectSrc = extractFunction(SRC, 'connectTerminal')
     assert.match(connectSrc, /action=new/)
     assert.match(
       connectSrc,
-      /action=resume&sessionId=\$\{encodeURIComponent\(intent\.sessionId\)\}/,
+      /action=attach&sessionId=\$\{encodeURIComponent\(intent\.sessionId\)\}/,
     )
+    // Auto-reconnects re-attach to the session being viewed.
+    assert.match(connectSrc, /action=attach&sessionId=\$\{encodeURIComponent\(currentSessionId\)\}/)
     const newSrc = extractFunction(SRC, 'startNewClaudeSession')
     assert.match(newSrc, /reconnectTerminal\(\{ action: 'new' \}\)/)
-    const resumeSrc = extractFunction(SRC, 'resumeClaudeSession')
-    assert.match(resumeSrc, /reconnectTerminal\(\{ action: 'resume', sessionId \}\)/)
+    const attachSrc = extractFunction(SRC, 'attachClaudeSession')
+    assert.match(attachSrc, /reconnectTerminal\(\{ action: 'attach', sessionId \}\)/)
+  })
+
+  it('renders a per-session delete control wired to the DELETE route', () => {
+    const renderSrc = extractFunction(SRC, 'renderTerminalSessions')
+    assert.match(renderSrc, /claude-terminal-session-delete/)
+    assert.match(renderSrc, /deleteClaudeSession\(session\.sessionId\)/)
+    assert.match(renderSrc, /stopPropagation\(\)/)
+    const deleteSrc = extractFunction(SRC, 'deleteClaudeSession')
+    assert.match(
+      deleteSrc,
+      /apiJson\(\s*'DELETE',\s*`\/api\/claude-terminal\/session\?sessionId=\$\{encodeURIComponent\(sessionId\)\}`/,
+    )
+    assert.match(STYLE, /\.claude-terminal-session-delete\s*{/)
   })
 
   it('renders session titles as untrusted text, not innerHTML', () => {

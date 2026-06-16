@@ -4910,6 +4910,49 @@ body.voice-overlay-open {
   color: var(--success);
   font-size: var(--text-xs);
 }
+.claude-terminal-session-row {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  border-radius: var(--radius-md);
+}
+.claude-terminal-session-row .claude-terminal-session-item {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.claude-terminal-session-row.is-current {
+  background: var(--bg-hover);
+}
+.claude-terminal-session-row.is-current .claude-terminal-session-title {
+  font-weight: 600;
+}
+.claude-terminal-session-delete {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  min-height: 30px;
+  padding: 0;
+  border: 0;
+  border-radius: var(--radius-md);
+  background: transparent;
+  color: var(--fg-muted);
+  font-size: var(--text-sm);
+  opacity: 0;
+  cursor: pointer;
+}
+.claude-terminal-session-row:hover .claude-terminal-session-delete,
+.claude-terminal-session-row:focus-within .claude-terminal-session-delete,
+.claude-terminal-session-delete:focus-visible {
+  opacity: 1;
+}
+.claude-terminal-session-delete:hover,
+.claude-terminal-session-delete:focus-visible {
+  background: color-mix(in srgb, var(--danger) 16%, var(--bg-raised));
+  color: var(--danger);
+  outline: none;
+}
 .claude-terminal-session-empty {
   padding: var(--space-3);
   color: var(--fg-muted);

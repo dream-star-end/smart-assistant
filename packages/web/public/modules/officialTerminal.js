@@ -84,6 +84,11 @@ let pendingConnectIntent = null
 let terminalSessions = []
 let sessionsLoading = false
 let sessionsMenuOpen = false
+// The session id the terminal pane is currently viewing. Auto-reconnects
+// re-attach to it; the sessions list highlights it. Set from the server's
+// `status: running` frame.
+let currentSessionId = null
+let sessionDeleteInFlight = false
 let terminalHiddenAt = null
 let terminalReconnectTimer = null
 let terminalRecentFiles = []
@@ -1412,22 +1417,22 @@ function connectTerminal(reason = '') {
   lastReconnectAttemptAt = Date.now()
   closeSocket(false)
   reconnectRequested = false
-  // A pending intent (new/resume) applies to this connect only; auto-reconnects reuse the live PTY.
+  // A pending intent (new/attach) applies to this connect only. Auto-reconnects
+  // with no intent re-attach to the session being viewed (currentSessionId);
+  // a cold open with neither lets the server pick the user's most recent live one.
   const intent = pendingConnectIntent
   pendingConnectIntent = null
   const intentReason =
-    intent?.action === 'resume'
-      ? '正在恢复历史会话'
-      : intent?.action === 'new'
-        ? '正在新建会话'
-        : ''
+    intent?.action === 'attach' ? '正在打开会话' : intent?.action === 'new' ? '正在新建会话' : ''
   setStatus('connecting', reason || intentReason)
   const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:'
   let wsUrl = `${protocol}//${location.host}/ws/claude-terminal`
   if (intent?.action === 'new') {
     wsUrl += '?action=new'
-  } else if (intent?.action === 'resume' && intent.sessionId) {
-    wsUrl += `?action=resume&sessionId=${encodeURIComponent(intent.sessionId)}`
+  } else if (intent?.action === 'attach' && intent.sessionId) {
+    wsUrl += `?action=attach&sessionId=${encodeURIComponent(intent.sessionId)}`
+  } else if (currentSessionId) {
+    wsUrl += `?action=attach&sessionId=${encodeURIComponent(currentSessionId)}`
   }
   const ws = new WebSocket(wsUrl, ['bearer', state.token])
   socket = ws
@@ -1461,7 +1466,14 @@ function connectTerminal(reason = '') {
     if (payload.type === 'status') {
       const message = typeof payload.message === 'string' ? payload.message : ''
       setStatus(payload.state || 'idle', message)
-      if (payload.state === 'error' || payload.state === 'disabled') writeLine(message)
+      if (payload.state === 'running' && typeof payload.sessionId === 'string') {
+        currentSessionId = payload.sessionId
+        renderTerminalSessions()
+      }
+      if (payload.state === 'error' || payload.state === 'disabled') {
+        writeLine(message)
+        if (message) toast(message, 'error')
+      }
       return
     }
     if (payload.type === 'exit') {
@@ -1543,12 +1555,26 @@ async function terminateOfficialClaudeTerminalAsync() {
   }
   terminateInFlight = true
   setStatus('connecting', '正在终止 Claude Code')
+  const sessionId = currentSessionId
   try {
-    await apiJson('POST', '/api/claude-terminal/terminate', {})
+    if (!sessionId) {
+      closeSocket(true)
+      disposeTerminal()
+      reconnectRequested = false
+      setStatus('closed', '已终止，重新打开会新建终端')
+      return
+    }
+    await apiJson(
+      'POST',
+      `/api/claude-terminal/terminate?sessionId=${encodeURIComponent(sessionId)}`,
+      {},
+    )
     closeSocket(false)
     disposeTerminal()
     reconnectRequested = false
+    currentSessionId = null
     setStatus('closed', '已终止，重新打开会新建终端')
+    void refreshTerminalSessions()
   } catch (err) {
     if (socket?.readyState === WebSocket.OPEN) {
       closeSocket(true)
@@ -1593,15 +1619,46 @@ function startNewClaudeSession() {
   toast('正在新建 Claude 会话', 'info')
 }
 
-function resumeClaudeSession(sessionId) {
+// Open a session: re-attach if it's running, resume it from disk otherwise.
+function attachClaudeSession(sessionId) {
   if (!sessionId) return
   closeSessionsMenu()
   if (!state.token) {
     toast('请先登录 OpenClaude', 'error')
     return
   }
-  reconnectTerminal({ action: 'resume', sessionId })
-  toast('正在恢复历史会话', 'info')
+  reconnectTerminal({ action: 'attach', sessionId })
+  toast('正在打开会话', 'info')
+}
+
+async function deleteClaudeSession(sessionId) {
+  if (!sessionId || sessionDeleteInFlight) return
+  if (!state.token) {
+    toast('请先登录 OpenClaude', 'error')
+    return
+  }
+  if (!confirm('删除该会话？将终止运行中的进程并删除会话记录，不可恢复。')) return
+  sessionDeleteInFlight = true
+  try {
+    await apiJson(
+      'DELETE',
+      `/api/claude-terminal/session?sessionId=${encodeURIComponent(sessionId)}`,
+    )
+    if (sessionId === currentSessionId) {
+      currentSessionId = null
+      closeSocket(false)
+      disposeTerminal()
+      reconnectRequested = false
+      setStatus('closed', '会话已删除')
+    }
+    toast('会话已删除', 'info')
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err)
+    toast(message || '删除会话失败', 'error')
+  } finally {
+    sessionDeleteInFlight = false
+    void refreshTerminalSessions()
+  }
 }
 
 function formatSessionTime(ms) {
@@ -1637,6 +1694,10 @@ function renderTerminalSessions() {
     return
   }
   for (const session of terminalSessions) {
+    const row = document.createElement('div')
+    row.className = 'claude-terminal-session-row'
+    if (session.sessionId === currentSessionId) row.classList.add('is-current')
+
     const item = document.createElement('button')
     item.type = 'button'
     item.className = 'claude-terminal-session-item'
@@ -1658,8 +1719,24 @@ function renderTerminalSessions() {
       meta.appendChild(badge)
     }
     item.appendChild(meta)
-    item.addEventListener('click', () => resumeClaudeSession(session.sessionId))
-    list.appendChild(item)
+    item.addEventListener('click', () => attachClaudeSession(session.sessionId))
+    row.appendChild(item)
+
+    const del = document.createElement('button')
+    del.type = 'button'
+    del.className = 'claude-terminal-session-delete'
+    del.tabIndex = -1
+    del.title = '删除会话'
+    del.setAttribute('aria-label', '删除会话')
+    del.textContent = '🗑'
+    del.addEventListener('click', (event) => {
+      event.preventDefault()
+      event.stopPropagation()
+      void deleteClaudeSession(session.sessionId)
+    })
+    row.appendChild(del)
+
+    list.appendChild(row)
   }
 }
 

@@ -1,16 +1,18 @@
+import { randomUUID } from 'node:crypto'
 import {
   closeSync,
   existsSync,
   openSync,
-  readFileSync,
   readSync,
   readdirSync,
   statSync,
+  unlinkSync,
 } from 'node:fs'
 import { homedir } from 'node:os'
 import { join, resolve } from 'node:path'
 import * as pty from 'node-pty'
 import type { RawData, WebSocket } from 'ws'
+import { ClaudeTerminalOwners, resolveClaudeTerminalOwnersPath } from './claudeTerminalOwners.js'
 import type { Logger } from './logger.js'
 import { PROXY_ENV_KEYS } from './proxyEnv.js'
 
@@ -27,9 +29,21 @@ const MAX_ROWS = 80
 const OUTPUT_REPLAY_MAX_BYTES = 1024 * 1024
 const DEFAULT_DETACHED_TTL_MS = 6 * 60 * 60_000
 const MAX_DETACHED_TTL_MS = 24 * 60 * 60_000
+const DEFAULT_MAX_SESSIONS_PER_USER = 5
+
+// Thrown when a user targets a session they don't own (and that isn't legacy).
+// Mapped to HTTP 403 / a WS error frame at the call site.
+export class ClaudeTerminalForbiddenError extends Error {
+  constructor(message = 'forbidden') {
+    super(message)
+    this.name = 'ClaudeTerminalForbiddenError'
+  }
+}
 
 const EXTRA_PROXY_ENV_KEYS = ['ALL_PROXY', 'all_proxy', 'NO_PROXY', 'no_proxy']
 const LOCALE_ENV_KEYS = ['LANG', 'LC_ALL', 'LC_CTYPE', 'LC_MESSAGES']
+
+export type ClaudeTerminalConnectAction = 'new' | 'attach'
 
 type TerminalClientMessage =
   | { type: 'input'; data: string }
@@ -64,6 +78,9 @@ export interface ClaudeTerminalManagerOptions {
   logger: Logger
   spawn?: PtySpawn
   env?: NodeJS.ProcessEnv
+  // Path to the ownership registry. Defaults to <OPENCLAUDE_HOME>/cc-terminal-owners.json.
+  // Tests inject a tmp path.
+  ownersPath?: string
 }
 
 interface OutputChunk {
@@ -72,7 +89,9 @@ interface OutputChunk {
 }
 
 interface ActiveTerminalSession {
+  sessionId: string
   userId: string
+  createdAt: number
   ws: WebSocket | null
   pty: PtyLike
   cwd: string
@@ -122,6 +141,14 @@ export function resolveDetachedTerminalTtlMs(env: NodeJS.ProcessEnv = process.en
   return Math.min(MAX_DETACHED_TTL_MS, Math.trunc(n))
 }
 
+export function resolveMaxSessionsPerUser(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = env.OPENCLAUDE_OFFICIAL_CLAUDE_TERMINAL_MAX_SESSIONS?.trim()
+  if (!raw) return DEFAULT_MAX_SESSIONS_PER_USER
+  const n = Number(raw)
+  if (!Number.isFinite(n) || n < 1) return DEFAULT_MAX_SESSIONS_PER_USER
+  return Math.trunc(n)
+}
+
 function firstHeader(value: string | string[] | undefined): string {
   return Array.isArray(value) ? (value[0] ?? '') : (value ?? '')
 }
@@ -159,9 +186,16 @@ export function isValidClaudeSessionId(id: unknown): id is string {
   return typeof id === 'string' && CLAUDE_SESSION_ID_RE.test(id.trim())
 }
 
-export function buildOfficialClaudeArgs(resumeSessionId?: string): string[] {
+export function buildOfficialClaudeArgs(
+  opts: { newSessionId?: string; resumeSessionId?: string } = {},
+): string[] {
   const base = ['--permission-mode', 'bypassPermissions', '--dangerously-skip-permissions']
-  if (isValidClaudeSessionId(resumeSessionId)) return ['--resume', resumeSessionId.trim(), ...base]
+  if (isValidClaudeSessionId(opts.resumeSessionId))
+    return ['--resume', opts.resumeSessionId.trim(), ...base]
+  // New session: pin the id we generated so the gateway knows it up front and
+  // can record ownership before the `<id>.jsonl` transcript even exists.
+  if (isValidClaudeSessionId(opts.newSessionId))
+    return ['--session-id', opts.newSessionId.trim(), ...base]
   return base
 }
 
@@ -171,6 +205,9 @@ export interface ClaudeSessionSummary {
   cwd: string
   mtimeMs: number
   live: boolean
+  // true when the requesting user owns this session; false for legacy (unowned)
+  // sessions that are shown to everyone during the transition window.
+  owned: boolean
 }
 
 // Claude Code stores per-cwd session transcripts under ~/.claude/projects/<encoded-cwd>/<id>.jsonl,
@@ -237,34 +274,41 @@ function extractSessionTitle(filePath: string): string {
   return ''
 }
 
-function readLiveClaudeSessionIds(home: string): Set<string> {
-  const ids = new Set<string>()
-  const dir = join(home, '.claude', 'sessions')
-  let names: string[] = []
-  try {
-    names = readdirSync(dir)
-  } catch {
-    return ids
-  }
-  for (const name of names) {
-    if (!name.endsWith('.json')) continue
-    try {
-      const record = JSON.parse(readFileSync(join(dir, name), 'utf8')) as Record<string, unknown>
-      if (isValidClaudeSessionId(record.sessionId)) ids.add(record.sessionId.trim())
-    } catch {}
-  }
-  return ids
+function resolveClaudeProjectDir(env: NodeJS.ProcessEnv): string {
+  const home = env.HOME || homedir()
+  const cwd = resolveOfficialClaudeCwd(env)
+  return join(home, '.claude', 'projects', encodeClaudeProjectDir(cwd))
 }
 
-export function listClaudeSessions(env: NodeJS.ProcessEnv = process.env): ClaudeSessionSummary[] {
-  const home = env.HOME || homedir()
+// Absolute path of a session transcript. sessionId is validated against the
+// UUID whitelist before it touches the filesystem, so it can never traverse.
+export function resolveClaudeSessionTranscriptPath(
+  sessionId: string,
+  env: NodeJS.ProcessEnv = process.env,
+): string {
+  if (!isValidClaudeSessionId(sessionId)) throw new Error('invalid Claude session id')
+  return join(resolveClaudeProjectDir(env), `${sessionId.trim()}.jsonl`)
+}
+
+export interface ListClaudeSessionsParams {
+  userId: string
+  // sessionId -> owner userId, or undefined for legacy/unowned (visible to all).
+  ownerOf: (sessionId: string) => string | undefined
+  // Session ids the gateway currently runs a live PTY for (already owner-scoped).
+  liveIds: Set<string>
+  env?: NodeJS.ProcessEnv
+}
+
+export function listClaudeSessions(params: ListClaudeSessionsParams): ClaudeSessionSummary[] {
+  const env = params.env ?? process.env
   let cwd: string
+  let projectDir: string
   try {
     cwd = resolveOfficialClaudeCwd(env)
+    projectDir = resolveClaudeProjectDir(env)
   } catch {
     return []
   }
-  const projectDir = join(home, '.claude', 'projects', encodeClaudeProjectDir(cwd))
   let files: string[] = []
   try {
     files = readdirSync(projectDir).filter((name) => name.endsWith('.jsonl'))
@@ -273,23 +317,36 @@ export function listClaudeSessions(env: NodeJS.ProcessEnv = process.env): Claude
   }
   // Stat is cheap; pick the newest N first, then only read transcript titles for those —
   // avoids reading head bytes for every historical session when there are many.
-  const candidates: Array<{ sessionId: string; filePath: string; mtimeMs: number }> = []
+  const candidates: Array<{
+    sessionId: string
+    filePath: string
+    mtimeMs: number
+    owned: boolean
+  }> = []
   for (const file of files) {
     const sessionId = file.slice(0, -'.jsonl'.length)
     if (!isValidClaudeSessionId(sessionId)) continue
+    const owner = params.ownerOf(sessionId)
+    // Show owned sessions to their owner and legacy (unowned) sessions to all.
+    if (owner !== undefined && owner !== params.userId) continue
     const filePath = join(projectDir, file)
     try {
-      candidates.push({ sessionId, filePath, mtimeMs: statSync(filePath).mtimeMs })
+      candidates.push({
+        sessionId,
+        filePath,
+        mtimeMs: statSync(filePath).mtimeMs,
+        owned: owner === params.userId,
+      })
     } catch {}
   }
   candidates.sort((a, b) => b.mtimeMs - a.mtimeMs)
-  const liveIds = readLiveClaudeSessionIds(home)
   return candidates.slice(0, MAX_LISTED_CLAUDE_SESSIONS).map((c) => ({
     sessionId: c.sessionId,
     title: extractSessionTitle(c.filePath) || '(无标题会话)',
     cwd,
     mtimeMs: c.mtimeMs,
-    live: liveIds.has(c.sessionId),
+    live: params.liveIds.has(c.sessionId),
+    owned: c.owned,
   }))
 }
 
@@ -372,17 +429,24 @@ function safeClose(ws: WebSocket, code?: number, reason?: string): void {
 export class ClaudeTerminalManager {
   private readonly spawn: PtySpawn
   private readonly env: NodeJS.ProcessEnv
+  private readonly owners: ClaudeTerminalOwners
+  // Keyed by sessionId: a user may hold several concurrent sessions (up to the
+  // per-user cap), so userId can no longer be the key.
   private readonly sessions = new Map<string, ActiveTerminalSession>()
 
   constructor(private readonly opts: ClaudeTerminalManagerOptions) {
     this.spawn = opts.spawn ?? (pty.spawn as unknown as PtySpawn)
     this.env = opts.env ?? process.env
+    this.owners = new ClaudeTerminalOwners(
+      opts.ownersPath ?? resolveClaudeTerminalOwnersPath(this.env),
+      opts.logger,
+    )
   }
 
   handleConnection(
     ws: WebSocket,
     userId: string,
-    opts: { action?: 'new' | 'resume'; resumeSessionId?: string } = {},
+    opts: { action?: ClaudeTerminalConnectAction; sessionId?: string } = {},
   ): void {
     if (!isClaudeTerminalEnabled(this.env)) {
       sendJson(ws, {
@@ -394,53 +458,183 @@ export class ClaudeTerminalManager {
       return
     }
 
-    const action = opts.action
-    if (action === 'resume' && !isValidClaudeSessionId(opts.resumeSessionId)) {
+    let action = opts.action
+    const sessionId = opts.sessionId
+
+    // Cold start (no action, no target): re-attach the user's most recent live
+    // session if any, otherwise start a fresh one.
+    if (!action && !sessionId) {
+      const recent = this.mostRecentLiveSession(userId)
+      if (recent) {
+        this.attachClient(recent, ws)
+        return
+      }
+      action = 'new'
+    }
+
+    if (action === 'attach' || (!action && sessionId)) {
+      this.handleAttach(ws, userId, sessionId)
+      return
+    }
+    this.handleNew(ws, userId)
+  }
+
+  // Attach to a session: re-attach if it has a live PTY, otherwise `claude --resume` it.
+  private handleAttach(ws: WebSocket, userId: string, sessionId: string | undefined): void {
+    if (!isValidClaudeSessionId(sessionId)) {
       sendJson(ws, { type: 'status', state: 'error', message: 'Invalid Claude session id' })
       ws.close(1008, 'invalid session id')
       return
     }
-
-    // Plain reconnects reuse the live PTY; an explicit new/resume always replaces it so the
-    // user gets a fresh process (or a `claude --resume` of the chosen historical session).
-    if (action === 'new' || action === 'resume') {
-      const existing = this.sessions.get(userId)
-      if (existing) this.closeSession(existing, `switch:${action}`, true, true)
-    }
-
-    let session = this.sessions.get(userId)
-    if (!session || session.closed) {
-      try {
-        session = this.createSession(userId, action === 'resume' ? opts.resumeSessionId : undefined)
-      } catch (err) {
-        const message = err instanceof Error ? err.message : String(err)
-        this.opts.logger.warn('official claude terminal spawn failed', { userId, message })
-        sendJson(ws, { type: 'status', state: 'error', message })
-        ws.close(1011, 'spawn failed')
+    const id = sessionId.trim()
+    const existing = this.sessions.get(id)
+    if (existing && !existing.closed) {
+      // A live PTY is held by whoever spawned it; only that user may re-attach,
+      // otherwise two users would share one process writing one transcript.
+      if (existing.userId !== userId) {
+        sendJson(ws, { type: 'status', state: 'error', message: '该会话正被其他用户使用' })
+        ws.close(1008, 'forbidden')
         return
       }
-      this.sessions.set(userId, session)
-      this.opts.logger.info('official claude terminal started', {
-        userId,
-        cwd: session.cwd,
-        command: session.command,
-        resume: action === 'resume' ? opts.resumeSessionId : undefined,
-      })
+      this.attachClient(existing, ws)
+      return
     }
-
-    this.attachClient(session, ws)
+    // Resume from disk — allowed for the owner or any legacy (unowned) session.
+    if (!this.owners.isVisibleTo(id, userId)) {
+      sendJson(ws, { type: 'status', state: 'error', message: '无权访问该会话' })
+      ws.close(1008, 'forbidden')
+      return
+    }
+    if (!this.underCap(userId)) {
+      this.rejectCap(ws, userId)
+      return
+    }
+    const session = this.startSession(ws, userId, { resumeSessionId: id })
+    if (session) this.attachClient(session, ws)
   }
 
-  terminate(userId: string): boolean {
-    const session = this.sessions.get(userId)
+  private handleNew(ws: WebSocket, userId: string): void {
+    if (!this.underCap(userId)) {
+      this.rejectCap(ws, userId)
+      return
+    }
+    const session = this.startSession(ws, userId, { newSessionId: randomUUID() })
+    if (session) this.attachClient(session, ws)
+  }
+
+  private rejectCap(ws: WebSocket, userId: string): void {
+    const max = resolveMaxSessionsPerUser(this.env)
+    this.opts.logger.info('official claude terminal session cap reached', { userId, max })
+    sendJson(ws, {
+      type: 'status',
+      state: 'error',
+      message: `最多同时运行 ${max} 个会话，请先终止或删除一个`,
+    })
+    ws.close(1013, 'session limit')
+  }
+
+  // Spawn + register a session; on failure send an error frame and return null.
+  private startSession(
+    ws: WebSocket,
+    userId: string,
+    spawnOpts: { newSessionId?: string; resumeSessionId?: string },
+  ): ActiveTerminalSession | null {
+    try {
+      const session = this.createSession(userId, spawnOpts)
+      this.sessions.set(session.sessionId, session)
+      this.opts.logger.info('official claude terminal started', {
+        userId,
+        sessionId: session.sessionId,
+        cwd: session.cwd,
+        command: session.command,
+        resume: spawnOpts.resumeSessionId,
+      })
+      return session
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err)
+      this.opts.logger.warn('official claude terminal spawn failed', { userId, message })
+      sendJson(ws, { type: 'status', state: 'error', message })
+      ws.close(1011, 'spawn failed')
+      return null
+    }
+  }
+
+  terminate(userId: string, sessionId: string): boolean {
+    if (!isValidClaudeSessionId(sessionId)) return false
+    const session = this.sessions.get(sessionId.trim())
     if (!session || session.closed) return false
+    if (session.userId !== userId) return false
     this.closeSession(session, 'client terminate', true, true)
     return true
   }
 
-  workingDirectory(userId: string): string {
-    const session = this.sessions.get(userId)
-    if (session && !session.closed) return session.cwd
+  // Kill any live PTY and delete the on-disk transcript + ownership record.
+  deleteSession(userId: string, sessionId: string): { deleted: boolean; terminated: boolean } {
+    if (!isValidClaudeSessionId(sessionId)) throw new Error('invalid Claude session id')
+    const id = sessionId.trim()
+    const live = this.sessions.get(id)
+    const isLive = !!live && !live.closed
+    if (isLive) {
+      // A running session belongs to whoever spawned it.
+      if (live.userId !== userId) throw new ClaudeTerminalForbiddenError()
+    } else if (!this.owners.isVisibleTo(id, userId)) {
+      throw new ClaudeTerminalForbiddenError()
+    }
+    let terminated = false
+    if (isLive) {
+      this.closeSession(live, 'client delete', true, true)
+      terminated = true
+    }
+    try {
+      unlinkSync(resolveClaudeSessionTranscriptPath(id, this.env))
+    } catch (err) {
+      // Only a missing file counts as "already gone"; any other error must NOT
+      // drop ownership, or an owned session would silently downgrade to legacy.
+      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err
+    }
+    this.owners.remove(id)
+    this.opts.logger.info('official claude terminal deleted', { userId, sessionId: id, terminated })
+    return { deleted: true, terminated }
+  }
+
+  ownerOf(sessionId: string): string | undefined {
+    return this.owners.ownerOf(sessionId)
+  }
+
+  // Session ids with a live PTY, optionally scoped to one owner.
+  liveSessionIds(userId?: string): Set<string> {
+    const ids = new Set<string>()
+    for (const session of this.sessions.values()) {
+      if (session.closed) continue
+      if (userId !== undefined && session.userId !== userId) continue
+      ids.add(session.sessionId)
+    }
+    return ids
+  }
+
+  private liveCountForUser(userId: string): number {
+    let n = 0
+    for (const session of this.sessions.values()) {
+      if (!session.closed && session.userId === userId) n++
+    }
+    return n
+  }
+
+  private underCap(userId: string): boolean {
+    return this.liveCountForUser(userId) < resolveMaxSessionsPerUser(this.env)
+  }
+
+  private mostRecentLiveSession(userId: string): ActiveTerminalSession | null {
+    let best: ActiveTerminalSession | null = null
+    for (const session of this.sessions.values()) {
+      if (session.closed || session.userId !== userId) continue
+      if (!best || session.createdAt > best.createdAt) best = session
+    }
+    return best
+  }
+
+  workingDirectory(_userId: string): string {
+    // All terminals share one cwd, so the result is the same for every user.
     return resolveOfficialClaudeCwd(this.env)
   }
 
@@ -454,13 +648,21 @@ export class ClaudeTerminalManager {
     return this.sessions.size
   }
 
-  private createSession(userId: string, resumeSessionId?: string): ActiveTerminalSession {
+  private createSession(
+    userId: string,
+    spawnOpts: { newSessionId?: string; resumeSessionId?: string },
+  ): ActiveTerminalSession {
+    const sessionId = (spawnOpts.newSessionId ?? spawnOpts.resumeSessionId ?? '').trim()
+    if (!isValidClaudeSessionId(sessionId)) throw new Error('missing Claude session id')
     const command = resolveOfficialClaudePath(this.env)
     if (command.startsWith('/') && !existsSync(command)) {
       throw new Error(`Claude executable not found: ${command}`)
     }
     const cwd = resolveOfficialClaudeCwd(this.env)
-    const proc = this.spawn(command, buildOfficialClaudeArgs(resumeSessionId), {
+    // Record ownership of a NEW session BEFORE spawning: if the registry write
+    // fails we abort here rather than leave a live, unowned (world-visible) PTY.
+    if (spawnOpts.newSessionId) this.owners.record(sessionId, userId)
+    const proc = this.spawn(command, buildOfficialClaudeArgs(spawnOpts), {
       name: 'xterm-256color',
       cols: DEFAULT_COLS,
       rows: DEFAULT_ROWS,
@@ -469,7 +671,9 @@ export class ClaudeTerminalManager {
     })
 
     const session: ActiveTerminalSession = {
+      sessionId,
       userId,
+      createdAt: Date.now(),
       ws: null,
       pty: proc,
       cwd,
@@ -552,6 +756,7 @@ export class ClaudeTerminalManager {
     sendJson(ws, {
       type: 'status',
       state: 'running',
+      sessionId: session.sessionId,
       message: `Claude Code terminal ${session.outputBytes > 0 ? 'resumed' : 'started'} in ${session.cwd}`,
     })
     const replay = this.replayOutput(session)
@@ -560,7 +765,7 @@ export class ClaudeTerminalManager {
   }
 
   private isActiveClient(session: ActiveTerminalSession, ws: WebSocket): boolean {
-    return this.sessions.get(session.userId) === session && session.ws === ws && !session.closed
+    return this.sessions.get(session.sessionId) === session && session.ws === ws && !session.closed
   }
 
   private detachClient(session: ActiveTerminalSession, ws: WebSocket, reason: string): void {
@@ -578,7 +783,7 @@ export class ClaudeTerminalManager {
       return
     }
     const timer = setTimeout(() => {
-      if (this.sessions.get(session.userId) !== session) return
+      if (this.sessions.get(session.sessionId) !== session) return
       if (session.cleanupTimer !== timer || session.ws !== null || session.closed) return
       session.cleanupTimer = null
       this.closeSession(session, 'detached timeout', true, false)
@@ -602,7 +807,9 @@ export class ClaudeTerminalManager {
     if (session.closed) return
     session.closed = true
     this.clearCleanupTimer(session)
-    if (this.sessions.get(session.userId) === session) this.sessions.delete(session.userId)
+    // Drop the live PTY; ownership of the on-disk transcript persists (only
+    // deleteSession removes it) so the session stays listable as history.
+    if (this.sessions.get(session.sessionId) === session) this.sessions.delete(session.sessionId)
 
     const client = session.ws
     session.ws = null
@@ -624,12 +831,16 @@ export class ClaudeTerminalManager {
       } catch (err) {
         this.opts.logger.warn(
           'official claude terminal kill failed',
-          { userId: session.userId, reason },
+          { userId: session.userId, sessionId: session.sessionId, reason },
           err,
         )
       }
     }
-    this.opts.logger.info('official claude terminal closed', { userId: session.userId, reason })
+    this.opts.logger.info('official claude terminal closed', {
+      userId: session.userId,
+      sessionId: session.sessionId,
+      reason,
+    })
   }
 
   private appendOutput(session: ActiveTerminalSession, data: string): void {

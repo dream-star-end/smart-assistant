@@ -52,6 +52,8 @@ import {
 import {
   CLAUDE_TERMINAL_MAX_CLIENT_MESSAGE_BYTES,
   CLAUDE_TERMINAL_WS_PATH,
+  type ClaudeTerminalConnectAction,
+  ClaudeTerminalForbiddenError,
   type ClaudeTerminalManager,
   createClaudeTerminalManager,
   isAllowedClaudeTerminalOrigin,
@@ -1447,8 +1449,43 @@ export class Gateway {
         this.sendError(res, 401, 'Claude terminal requires a user login')
         return
       }
-      const terminated = this.claudeTerminal?.terminate(userId) ?? false
+      const sessionId = url.searchParams.get('sessionId') ?? ''
+      if (!sessionId) {
+        this.sendError(res, 400, 'sessionId required')
+        return
+      }
+      const terminated = this.claudeTerminal?.terminate(userId, sessionId) ?? false
       this.sendJson(res, 200, { ok: true, terminated })
+      return
+    }
+    if (url.pathname === '/api/claude-terminal/session') {
+      if (req.method !== 'DELETE') {
+        this.sendError(res, 405, 'method not allowed')
+        return
+      }
+      const userId = this.getClaudeTerminalUserId(req)
+      if (!userId) {
+        this.sendError(res, 401, 'Claude terminal requires a user login')
+        return
+      }
+      const sessionId = url.searchParams.get('sessionId') ?? ''
+      if (!sessionId) {
+        this.sendError(res, 400, 'sessionId required')
+        return
+      }
+      try {
+        const result = this.claudeTerminal?.deleteSession(userId, sessionId) ?? {
+          deleted: false,
+          terminated: false,
+        }
+        this.sendJson(res, 200, { ok: true, ...result })
+      } catch (err) {
+        if (err instanceof ClaudeTerminalForbiddenError) {
+          this.sendError(res, 403, 'forbidden')
+          return
+        }
+        this.sendError(res, 400, err instanceof Error ? err.message : String(err))
+      }
       return
     }
     if (url.pathname.startsWith('/api/claude-terminal/upload/')) {
@@ -3945,8 +3982,16 @@ export class Gateway {
       this.sendError(res, 401, 'Claude terminal requires a user login')
       return
     }
+    const manager = this.claudeTerminal
     try {
-      this.sendJson(res, 200, { sessions: listClaudeSessions() })
+      const sessions = manager
+        ? listClaudeSessions({
+            userId,
+            ownerOf: (id) => manager.ownerOf(id),
+            liveIds: manager.liveSessionIds(userId),
+          })
+        : []
+      this.sendJson(res, 200, { sessions })
     } catch (err) {
       this.sendError(res, 500, err instanceof Error ? err.message : String(err))
     }
@@ -4185,15 +4230,15 @@ export class Gateway {
       ws.close(1008, 'unauthorized')
       return
     }
-    let action: 'new' | 'resume' | undefined
-    let resumeSessionId: string | undefined
+    let action: ClaudeTerminalConnectAction | undefined
+    let sessionId: string | undefined
     try {
       const params = new URL(req.url ?? '/', 'http://placeholder').searchParams
       const requested = params.get('action')
-      if (requested === 'new' || requested === 'resume') action = requested
-      resumeSessionId = params.get('sessionId') ?? undefined
+      if (requested === 'new' || requested === 'attach') action = requested
+      sessionId = params.get('sessionId') ?? undefined
     } catch {}
-    this.claudeTerminal?.handleConnection(ws, userId, { action, resumeSessionId })
+    this.claudeTerminal?.handleConnection(ws, userId, { action, sessionId })
   }
 
   // ───────── WS ─────────
