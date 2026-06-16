@@ -53,6 +53,7 @@ import {
   fileToText,
   removeAttachment,
   renderAttachments,
+  uploadAttachment,
 } from './attachments.js'
 
 // ── Speech recognition ──
@@ -743,6 +744,9 @@ function buildMessageText(userText, attachments) {
 }
 
 // ── send ──
+// True while attachment bytes are uploading over the HTTP channel; blocks a
+// second send() from re-entering mid-upload (see usage in send()).
+let _attachmentUploadInFlight = false
 async function send() {
   const text = $('input').value.trim()
   if (!text && state.attachments.length === 0) return
@@ -775,14 +779,51 @@ async function send() {
       ? `\n\n📎 ${state.attachments.map((a) => a.name).join(', ')}`
       : '')
   const modelText = buildMessageText(text, state.attachments)
-  const media = state.attachments
-    .filter((a) => a.kind !== 'text')
-    .map((a) => ({
-      kind: a.kind,
-      base64: a.dataUrl,
-      mimeType: a.type,
-      filename: a.name,
-    }))
+  // Upload non-text attachments over the independent HTTP channel BEFORE the WS
+  // send, so the message frame carries only `upload:<ref>` tokens instead of
+  // base64. This keeps the frame tiny (instant send) and surfaces real upload
+  // progress on the attachment chips — root fix for the "send image → long
+  // silent stall" problem. On any failure we abort and keep the input +
+  // attachments so the user can retry; we never half-send.
+  const mediaAtts = state.attachments.filter((a) => a.kind !== 'text')
+  let media = []
+  if (mediaAtts.length > 0) {
+    // Dedicated re-entry guard for the upload await. We deliberately do NOT
+    // reuse setSending() here: that flag turns the send button into a "stop"
+    // button whose teardown clears the lock, which would reopen re-entry and
+    // could double-upload / double-send. A plain module flag blocks a second
+    // send() outright while bytes are in flight, independent of turn state.
+    if (_attachmentUploadInFlight) return
+    _attachmentUploadInFlight = true
+    try {
+      media = await Promise.all(
+        mediaAtts.map((a) =>
+          uploadAttachment(a, (pct) => {
+            a._uploadPct = pct
+            renderAttachments()
+          }).then((r) => ({
+            kind: a.kind,
+            url: r.ref,
+            mimeType: a.type,
+            filename: a.name,
+          })),
+        ),
+      )
+    } catch (err) {
+      for (const a of mediaAtts) a._uploadPct = undefined
+      renderAttachments()
+      _attachmentUploadInFlight = false
+      toast(`附件上传失败：${err?.message || err}`, 'error')
+      return // keep input + attachments for retry
+    }
+    _attachmentUploadInFlight = false
+    for (const a of mediaAtts) a._uploadPct = undefined
+    renderAttachments()
+    // Session may have changed while bytes were uploading — don't send the
+    // captured `sess`'s message into whatever session is now active (mirrors
+    // the hydrateSession guard above). Attachments stay in the composer.
+    if (state.currentSessionId !== sess.id) return
+  }
   const effortLevel = getEffortForSubmit()
   const model = getModelForSubmit()
   const conversationMode = getConversationModeForSubmit(text, state.attachments)

@@ -73,7 +73,12 @@ export async function addFiles(fileList) {
       if (kind === 'text') {
         att.text = await fileToText(f)
       } else {
+        // dataUrl is kept only for the local thumbnail preview; the bytes are
+        // sent over the independent HTTP channel via the original File ref
+        // (att.file) — NOT inlined into the WS message frame. att.file is
+        // transient (lives only in state.attachments) and is never persisted.
         att.dataUrl = await fileToDataURL(f)
+        att.file = f
       }
       state.attachments.push(att)
     } catch (err) {
@@ -85,6 +90,36 @@ export async function addFiles(fileList) {
 export function removeAttachment(idx) {
   state.attachments.splice(idx, 1)
   renderAttachments()
+}
+
+// Upload one non-text attachment over the independent HTTP channel.
+// Resolves to the server's `{ ok, ref, mimeType, name, sizeHint }`; the caller
+// puts `ref` (an `upload:<file>` token) on the WS media frame instead of base64.
+// onProgress(pct) is called with an integer 0–100 as bytes go out.
+export function uploadAttachment(att, onProgress) {
+  return new Promise((resolve, reject) => {
+    const qs = new URLSearchParams({ name: att.name, mime: att.type, kind: att.kind })
+    const xhr = new XMLHttpRequest()
+    xhr.open('POST', `/api/attachments?${qs}`)
+    if (state.token) xhr.setRequestHeader('Authorization', `Bearer ${state.token}`)
+    xhr.setRequestHeader('Content-Type', 'application/octet-stream')
+    xhr.upload.onprogress = (e) => {
+      if (e.lengthComputable && onProgress) onProgress(Math.round((e.loaded / e.total) * 100))
+    }
+    xhr.onload = () => {
+      let body = null
+      try {
+        body = JSON.parse(xhr.responseText)
+      } catch {}
+      if (xhr.status >= 200 && xhr.status < 300 && body?.ok) {
+        resolve(body)
+      } else {
+        reject(new Error(body?.error || `上传失败 (${xhr.status})`))
+      }
+    }
+    xhr.onerror = () => reject(new Error('网络错误'))
+    xhr.send(att.file)
+  })
 }
 export function renderAttachments() {
   const wrap = $('attachments')
@@ -117,7 +152,7 @@ export function renderAttachments() {
     item.appendChild(name)
     const size = document.createElement('span')
     size.className = 'attach-size'
-    size.textContent = formatSize(a.size)
+    size.textContent = a._uploadPct != null ? `上传 ${a._uploadPct}%` : formatSize(a.size)
     item.appendChild(size)
     const rm = document.createElement('button')
     rm.className = 'attach-remove'

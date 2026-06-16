@@ -13,12 +13,15 @@ import {
   MAX_UPLOAD_SINGLE,
   MAX_UPLOAD_TOTAL,
   UPLOAD_MIME_PREFIXES,
+  UPLOAD_MIME_TO_EXT,
   isFileAllowed,
   isFileBlocked,
   isFullAccessGatewayJwtPayload,
+  isPathInsideDir,
   isUploadMimeAllowed,
   parseSingleRangeHeader,
   resolveTerminalFilePathInput,
+  resolveUploadRefPath,
   sanitizeTerminalFileName,
   shouldServeInline,
   terminalContentDisposition,
@@ -355,6 +358,53 @@ describe('T06: Authentication — no query token leak', () => {
     const url = new URL(req.url, 'http://localhost')
     const queryToken = url.searchParams.get('token')
     assert.ok(queryToken !== null, 'query param exists but should be ignored by server')
+  })
+})
+
+describe('T20: chat attachment upload ref resolution', () => {
+  const ROOT = '/root/.openclaude/uploads'
+
+  it('isPathInsideDir uses a segment boundary (no sibling-prefix match)', () => {
+    assert.equal(isPathInsideDir(ROOT, ROOT), true)
+    assert.equal(isPathInsideDir(ROOT, `${ROOT}/a.png`), true)
+    assert.equal(isPathInsideDir(ROOT, `${ROOT}/sub/dir/a.png`), true)
+    // Sibling dir that merely shares the prefix string must NOT pass.
+    assert.equal(isPathInsideDir(ROOT, `${ROOT}2/a.png`), false)
+    assert.equal(isPathInsideDir(ROOT, '/etc/passwd'), false)
+  })
+
+  it('resolveUploadRefPath accepts a plain filename ref under uploadsRoot', () => {
+    assert.equal(
+      resolveUploadRefPath(ROOT, 'upload:1700-abc-image.png'),
+      `${ROOT}/1700-abc-image.png`,
+    )
+  })
+
+  it('resolveUploadRefPath defuses path traversal via basename()', () => {
+    // basename() strips the dirs, so these collapse to an in-dir filename
+    // (which then fails the caller's stat() — never escapes uploadsRoot).
+    assert.equal(resolveUploadRefPath(ROOT, 'upload:../../etc/passwd'), `${ROOT}/passwd`)
+    assert.equal(resolveUploadRefPath(ROOT, 'upload:/etc/shadow'), `${ROOT}/shadow`)
+  })
+
+  it('resolveUploadRefPath rejects non-refs and degenerate names', () => {
+    assert.equal(resolveUploadRefPath(ROOT, 'https://evil.com/x.png'), null)
+    assert.equal(resolveUploadRefPath(ROOT, '/root/.openclaude/uploads/x.png'), null)
+    assert.equal(resolveUploadRefPath(ROOT, 'upload:'), null)
+    assert.equal(resolveUploadRefPath(ROOT, 'upload:..'), null)
+    assert.equal(resolveUploadRefPath(ROOT, 'upload:.'), null)
+  })
+
+  it('isUploadMimeAllowed gates the /api/attachments endpoint MIME', () => {
+    assert.equal(isUploadMimeAllowed('image/png'), true)
+    assert.equal(isUploadMimeAllowed('application/octet-stream'), true)
+    assert.equal(isUploadMimeAllowed('application/x-msdownload'), false)
+  })
+
+  it('UPLOAD_MIME_TO_EXT maps common chat image types', () => {
+    assert.equal(UPLOAD_MIME_TO_EXT['image/png'], 'png')
+    assert.equal(UPLOAD_MIME_TO_EXT['image/jpeg'], 'jpg')
+    assert.equal(UPLOAD_MIME_TO_EXT['application/pdf'], 'pdf')
   })
 })
 
