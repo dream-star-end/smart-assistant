@@ -209,7 +209,7 @@
   - Codex 计划审 Blocking(已修):①slotId 不复用 ephemeralKey ②finalizer 在 proxyBilling.ts:359 非 core.ts ③漏 pickPinnedAccount 直接 inflight 路径 ④TTL clamp 矛盾。代码审 PASS(0 blocking;3 处旧签名注释已顺手更新)。
   - 验证:tsc 改动文件 0 error(全部剩余 commercial/src 错误经核在未触碰文件且无一引用本改动类型=0 新增);biome 逐文件 base-vs-worktree 全相等=0 新增;单测 accountScheduler+accountSlotReaper 62/62、proxyUpstream+anthropicProxy(含 finalizer slotId 透传断言)181/181;**真 PG integ accountScheduler.integ 46/46**(release(slotId)/cap/health 全用例)+ anthropicProxy/apiKeyAdmin.integ 通过;ccExternalEndpoint H1.2 与 userChatBridgeCodexBilling close-code 两处失败经 stash 复核**在 base 上失败完全相同=预存,与本改动无关**。
   - **B6 技术债登记**:双 master 真实上限 N×cap 仅 hot-standby 切机瞬时窗口出现,靠切换 SOP quiesce 账号池兜底;`slots` 字段注释已标 + design-doc §6;偿还触发=未来转常态双活(届时把 slot 后端做 Redis SETNX+TTL,slotId 即天然分布式租约 key)。
-  - **未部署**:worktree commit,等 boss 批准后按 v3-commercial-deploy 合并 canonical + deploy-v3.sh(master-only,无需 runtime image)。
+  - **第三批已部署上线 v1.0.332**(2026-06-16,commit `dcf96884`)。canonical v3 merge `282c3f2d`(B9 `6b744743` + B6+B7 `d3d1f7af`;upstream.ts 与 v325 静态 key 重构 1 处结构冲突已解——取 makeStaticKeyUpstream + 保 slotId)→ `deploy-v3.sh`(BOSS_APPROVED_CHANGELOG=1,backend-only 无新 changelog 条目,currentVersion v1.0.331→332)。runtime image rebuild required: **NO**(全 packages/commercial/src master-only)。smoke 5/5;cache-bust 38/47 文件;trace propagation 3/3(本批已达标);`/version`=v1.0.332;origin/v3 + tag 已推。无需 --force(活跃用户检查未 abort)。
 - 下一步(按"可否 headless 完成"分流):
   - **headless 可完成但属大型重构**:**A5**(前端 checkJs 消环——实测 45 模块/36k 行/10 处 DI 注入环/开 checkJs 暴露 578 类型错误,需 6-8 会话分阶段,A4 前置)、**A4**(god-file 拆分,单测可验,大面积移动)。
   - **需 dev/浏览器验证**(流式/多标签/IDB 可见行为):**A1 实现**、**R1/R2/R3**(多标签协调 / IDB 迁移 / 客户端幂等)。
