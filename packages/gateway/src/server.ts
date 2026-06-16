@@ -149,81 +149,14 @@ const TERMINAL_UPLOAD_STALE_MS = 6 * 60 * 60_000
 const TERMINAL_LIST_MAX_ENTRIES = 1000
 const TERMINAL_DOWNLOAD_TICKET_TTL_MS = 5 * 60_000
 
-// ── Chat attachment (multimodal) limits — single source of truth ──
-// Shared by the HTTP upload endpoint (/api/attachments) and the inbound media
-// save path (dispatchInbound) so the two channels can't drift apart.
-const MEDIA_MAX_SINGLE_FILE = 25 * 1024 * 1024 // 25MB per file
-const MEDIA_MAX_TOTAL = 50 * 1024 * 1024 // 50MB total per message
-const MEDIA_ALLOWED_MIME_PREFIXES = [
-  'image/',
-  'audio/',
-  'video/',
-  'application/pdf',
-  'text/',
-  'application/vnd.openxmlformats-officedocument.', // docx, xlsx, pptx
-  'application/vnd.ms-', // doc, xls, ppt
-  'application/msword', // .doc
-  'application/zip',
-  'application/x-zip', // zip archives
-  'application/gzip',
-  'application/x-gzip', // .gz, .tar.gz
-  'application/x-tar',
-  'application/x-compressed-tar',
-  'application/x-gtar', // .tar / tarball variants
-  'application/x-7z-compressed', // .7z
-  'application/vnd.rar',
-  'application/x-rar-compressed', // .rar
-  'application/x-bzip',
-  'application/x-bzip2', // .bz2
-  'application/x-xz', // .xz
-  'application/json', // json files
-  'application/xml', // xml files
-]
-const MEDIA_MIME_TO_EXT: Record<string, string> = {
-  'image/jpeg': 'jpg',
-  'image/png': 'png',
-  'image/gif': 'gif',
-  'image/webp': 'webp',
-  'image/bmp': 'bmp',
-  'image/svg+xml': 'svg',
-  'audio/mpeg': 'mp3',
-  'audio/wav': 'wav',
-  'audio/ogg': 'ogg',
-  'audio/aac': 'aac',
-  'audio/flac': 'flac',
-  'audio/mp4': 'm4a',
-  'video/mp4': 'mp4',
-  'video/webm': 'webm',
-  'video/quicktime': 'mov',
-  'application/pdf': 'pdf',
-  'application/msword': 'doc',
-  'application/vnd.openxmlformats-officedocument.wordprocessingml.document': 'docx',
-  'application/vnd.ms-excel': 'xls',
-  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': 'xlsx',
-  'application/zip': 'zip',
-  'application/x-zip': 'zip',
-  'application/x-zip-compressed': 'zip',
-  'application/gzip': 'gz',
-  'application/x-gzip': 'gz',
-  'application/x-tar': 'tar',
-  'application/x-compressed-tar': 'tar.gz',
-  'application/x-gtar': 'tar',
-  'application/x-7z-compressed': '7z',
-  'application/vnd.rar': 'rar',
-  'application/x-rar-compressed': 'rar',
-  'application/x-bzip': 'bz2',
-  'application/x-bzip2': 'bz2',
-  'application/x-xz': 'xz',
-  'text/html': 'html',
-}
-const MEDIA_MIME_ALLOWED = (mime: string): boolean =>
-  !mime ||
-  mime === 'application/octet-stream' ||
-  MEDIA_ALLOWED_MIME_PREFIXES.some((p) => mime.startsWith(p))
 // WS media `url` prefix marking an already-uploaded local attachment (vs an
 // external http(s) URL). The HTTP endpoint returns `upload:<filename>`; the
 // inbound path resolves it back to a file under uploadsDir. Keeps the existing
 // `url` = external-link semantics intact for any non-prefixed value.
+// Upload size/MIME limits live with the other UPLOAD_* exports lower in this
+// file (MAX_UPLOAD_SINGLE / MAX_UPLOAD_TOTAL / isUploadMimeAllowed /
+// UPLOAD_MIME_TO_EXT) — single source of truth, shared by the HTTP endpoint and
+// the inbound media save path.
 const UPLOAD_REF_PREFIX = 'upload:'
 
 interface TerminalUploadState {
@@ -3834,26 +3767,26 @@ export class Gateway {
     const name = url.searchParams.get('name') || 'file'
     const mime = (url.searchParams.get('mime') || 'application/octet-stream').slice(0, 200)
     const kind = url.searchParams.get('kind') || 'file'
-    if (!MEDIA_MIME_ALLOWED(mime)) {
+    if (!isUploadMimeAllowed(mime)) {
       this.sendJson(res, 415, { ok: false, error: `不支持的文件类型: ${mime}` })
       return
     }
     // Fast-reject oversized uploads before reading the body.
     const contentLength = Number(req.headers['content-length'])
-    if (Number.isFinite(contentLength) && contentLength > MEDIA_MAX_SINGLE_FILE) {
+    if (Number.isFinite(contentLength) && contentLength > MAX_UPLOAD_SINGLE) {
       this.sendJson(res, 413, {
         ok: false,
-        error: `附件超过 ${MEDIA_MAX_SINGLE_FILE / 1024 / 1024}MB 限制`,
+        error: `附件超过 ${MAX_UPLOAD_SINGLE / 1024 / 1024}MB 限制`,
       })
       return
     }
     let buf: Buffer
     try {
-      buf = await this.readBinaryBody(req, MEDIA_MAX_SINGLE_FILE)
+      buf = await this.readBinaryBody(req, MAX_UPLOAD_SINGLE)
     } catch {
       this.sendJson(res, 413, {
         ok: false,
-        error: `附件超过 ${MEDIA_MAX_SINGLE_FILE / 1024 / 1024}MB 限制`,
+        error: `附件超过 ${MAX_UPLOAD_SINGLE / 1024 / 1024}MB 限制`,
       })
       return
     }
@@ -3861,7 +3794,8 @@ export class Gateway {
       this.sendJson(res, 400, { ok: false, error: 'empty upload' })
       return
     }
-    const ext = MEDIA_MIME_TO_EXT[mime] ?? mime.split('/')[1]?.replace(/[^a-zA-Z0-9]/g, '') ?? 'bin'
+    const ext =
+      UPLOAD_MIME_TO_EXT[mime] ?? mime.split('/')[1]?.replace(/[^a-zA-Z0-9]/g, '') ?? 'bin'
     const defaultName =
       kind === 'image' ? 'image' : kind === 'audio' ? 'audio' : kind === 'video' ? 'video' : 'file'
     const safeBase = (name || defaultName).replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 40)
@@ -5800,11 +5734,12 @@ export class Gateway {
       this.deliver(failFrame, adapter)
     }
 
-    // Server-side upload validation (limits/allowlist live at module scope —
-    // see MEDIA_* — so the HTTP /api/attachments endpoint stays in lockstep).
-    const MAX_SINGLE_FILE = MEDIA_MAX_SINGLE_FILE
-    const MAX_TOTAL_MEDIA = MEDIA_MAX_TOTAL
-    const ALLOWED_MIME_PREFIXES = MEDIA_ALLOWED_MIME_PREFIXES
+    // Server-side upload validation. Limits/allowlist are the exported
+    // MAX_UPLOAD_* / UPLOAD_MIME_PREFIXES (single source of truth, also used by
+    // the HTTP /api/attachments endpoint and covered by security.test.ts).
+    const MAX_SINGLE_FILE = MAX_UPLOAD_SINGLE
+    const MAX_TOTAL_MEDIA = MAX_UPLOAD_TOTAL
+    const ALLOWED_MIME_PREFIXES = UPLOAD_MIME_PREFIXES
     let totalMediaSize = 0
     for (const m of media) {
       if (!m.base64) continue
@@ -5889,10 +5824,8 @@ export class Gateway {
       // Resolve it to the existing path instead of re-decoding base64 in-band.
       if (!m.base64 && m.url?.startsWith(UPLOAD_REF_PREFIX)) {
         const refName = basename(m.url.slice(UPLOAD_REF_PREFIX.length))
-        const candidate = resolve(join(uploadsRoot, refName))
-        const insideUploads = (p: string): boolean =>
-          p === uploadsRoot || p.startsWith(uploadsRoot + sep)
-        if (!insideUploads(candidate)) {
+        const candidate = resolveUploadRefPath(uploadsRoot, m.url)
+        if (!candidate) {
           failUpload('附件引用非法')
           return
         }
@@ -5900,7 +5833,7 @@ export class Gateway {
         let realPath: string
         try {
           realPath = await realpath(candidate) // resolves symlinks before the boundary check
-          if (!insideUploads(realPath)) {
+          if (!isPathInsideDir(uploadsRoot, realPath)) {
             failUpload('附件引用非法')
             return
           }
@@ -5941,7 +5874,9 @@ export class Gateway {
       const mimeType = prefixMatch ? prefixMatch[1] : (m.mimeType ?? 'application/octet-stream')
       if (prefixMatch) base64 = prefixMatch[2]
       const ext =
-        MEDIA_MIME_TO_EXT[mimeType] ?? mimeType.split('/')[1]?.replace(/[^a-zA-Z0-9]/g, '') ?? 'bin'
+        UPLOAD_MIME_TO_EXT[mimeType] ??
+        mimeType.split('/')[1]?.replace(/[^a-zA-Z0-9]/g, '') ??
+        'bin'
       const defaultName =
         m.kind === 'image'
           ? 'image'
@@ -6615,6 +6550,65 @@ export const MAX_UPLOAD_TOTAL = 50 * 1024 * 1024
 export function isUploadMimeAllowed(mime: string): boolean {
   if (!mime) return true
   return UPLOAD_MIME_PREFIXES.some((p) => mime.startsWith(p)) || mime === 'application/octet-stream'
+}
+
+/** True iff `p` is `root` itself or lives strictly under it. Uses a path-segment
+ *  boundary (root + sep) so a sibling like `/uploads2` does not pass `/uploads`. */
+export function isPathInsideDir(root: string, p: string): boolean {
+  return p === root || p.startsWith(root + sep)
+}
+
+/** Resolve an `upload:<filename>` WS media ref to an absolute path inside
+ *  uploadsRoot, or null if it isn't a valid in-directory ref. basename() strips
+ *  any path components (defusing `../` traversal); the boundary check is
+ *  defense-in-depth. Callers still apply realpath()+stat() to defeat symlink
+ *  escape and confirm the file exists. */
+export function resolveUploadRefPath(uploadsRoot: string, ref: string): string | null {
+  if (!ref.startsWith(UPLOAD_REF_PREFIX)) return null
+  const name = basename(ref.slice(UPLOAD_REF_PREFIX.length))
+  if (!name || name === '.' || name === '..') return null
+  const candidate = resolve(join(uploadsRoot, name))
+  return isPathInsideDir(uploadsRoot, candidate) ? candidate : null
+}
+
+/** MIME → file extension for saving uploaded attachments. Unknown types fall
+ *  back to the MIME subtype (then 'bin') at the call site. */
+export const UPLOAD_MIME_TO_EXT: Record<string, string> = {
+  'image/jpeg': 'jpg',
+  'image/png': 'png',
+  'image/gif': 'gif',
+  'image/webp': 'webp',
+  'image/bmp': 'bmp',
+  'image/svg+xml': 'svg',
+  'audio/mpeg': 'mp3',
+  'audio/wav': 'wav',
+  'audio/ogg': 'ogg',
+  'audio/aac': 'aac',
+  'audio/flac': 'flac',
+  'audio/mp4': 'm4a',
+  'video/mp4': 'mp4',
+  'video/webm': 'webm',
+  'video/quicktime': 'mov',
+  'application/pdf': 'pdf',
+  'application/msword': 'doc',
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document': 'docx',
+  'application/vnd.ms-excel': 'xls',
+  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': 'xlsx',
+  'application/zip': 'zip',
+  'application/x-zip': 'zip',
+  'application/x-zip-compressed': 'zip',
+  'application/gzip': 'gz',
+  'application/x-gzip': 'gz',
+  'application/x-tar': 'tar',
+  'application/x-compressed-tar': 'tar.gz',
+  'application/x-gtar': 'tar',
+  'application/x-7z-compressed': '7z',
+  'application/vnd.rar': 'rar',
+  'application/x-rar-compressed': 'rar',
+  'application/x-bzip': 'bz2',
+  'application/x-bzip2': 'bz2',
+  'application/x-xz': 'xz',
+  'text/html': 'html',
 }
 
 const MIME_MAP: Record<string, string> = {
