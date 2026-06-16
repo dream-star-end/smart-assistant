@@ -15,6 +15,7 @@ let onChangeCb = null
 let globalListenersBound = false
 let outsideListener = null
 let keydownListener = null
+let repositionListener = null
 
 function readStore() {
   try {
@@ -47,6 +48,16 @@ function agentDefaultModel() {
   return (typeof a?.model === 'string' && a.model) || ''
 }
 
+/** 当前 agent 是否接受 per-session 模型覆盖。codex-native runner(CodexAppServerRunner)
+ *  没有 setModel,gateway 会静默忽略覆盖(sessionManager.submit 的 typeof setModel 守卫),
+ *  所以给这类 agent 显示一个"选了不生效"的模型选择器是误导 — 直接隐藏。effort(思考深度)
+ *  对 codex 仍经 setEffortLevel 生效,不受影响。 */
+function currentAgentSupportsOverride() {
+  const id = currentAgentId()
+  const a = (state.agentsList || []).find((x) => x.id === id)
+  return !!a && a.provider !== 'codex-native'
+}
+
 function labelFor(id) {
   const list = Array.isArray(state.modelsList) ? state.modelsList : []
   const m = list.find((x) => x && x.id === id)
@@ -75,7 +86,9 @@ function modelOptions() {
 export function getEffectiveModel() {
   const id = currentAgentId()
   const def = agentDefaultModel()
-  if (!id) return def
+  // 不支持覆盖的 agent(codex-native)恒为 agent 默认 model — 即便存了陈旧覆盖值,
+  // 也不能让它污染 effort 档位判定(否则 codex 会按错的 model 算思考深度)。
+  if (!id || !currentAgentSupportsOverride()) return def
   const v = readStore()[id]
   return modelOptions().some((o) => o.id === v) ? v : def
 }
@@ -84,7 +97,7 @@ export function getEffectiveModel() {
  *  无选择→undefined(调用方省略字段,runner 用 agent 默认 model spawn)。 */
 export function getModelForSubmit() {
   const id = currentAgentId()
-  if (!id) return undefined
+  if (!id || !currentAgentSupportsOverride()) return undefined
   const v = readStore()[id]
   return modelOptions().some((o) => o.id === v) ? v : undefined
 }
@@ -111,6 +124,22 @@ function isMenuOpen() {
   return !!menu && !menu.hidden
 }
 
+/** 把菜单定位到 trigger 正上方(向上弹)。菜单用 position:fixed(见 style.css),
+ *  锚点是视口坐标 — 这样它能逃出 .composer-inner 的 overflow:hidden(否则上弹的菜单
+ *  会被裁成不可见,正是"点了不显示"的根因)。每次打开 + resize/scroll 时重算。 */
+function positionMenu() {
+  const menu = $('model-menu')
+  const trigger = $('model-trigger')
+  if (!menu || !trigger || menu.hidden) return
+  const r = trigger.getBoundingClientRect()
+  const gap = 6
+  // 水平左对齐 trigger,夹在视口内(menu 已 visible,offsetWidth 可测)。
+  const maxLeft = window.innerWidth - menu.offsetWidth - 8
+  menu.style.left = `${Math.max(8, Math.min(r.left, maxLeft))}px`
+  // 向上弹:菜单底边落在 trigger 顶边上方 gap 处。
+  menu.style.bottom = `${Math.max(8, window.innerHeight - r.top + gap)}px`
+}
+
 function openMenu() {
   const menu = $('model-menu')
   const trigger = $('model-trigger')
@@ -118,7 +147,13 @@ function openMenu() {
   menu.hidden = false
   trigger.setAttribute('aria-expanded', 'true')
   const items = [...menu.querySelectorAll('[role="option"]')]
-  if (items.length === 0) return
+  if (items.length === 0) {
+    // 没有选项 — 别留一个空浮层;直接收起。
+    menu.hidden = true
+    trigger.setAttribute('aria-expanded', 'false')
+    return
+  }
+  positionMenu()
   const cur = getEffectiveModel()
   const target = items.find((el) => el.dataset.model === cur) ?? items[0]
   for (const it of items) it.setAttribute('tabindex', it === target ? '0' : '-1')
@@ -153,9 +188,14 @@ function attachGlobalListeners() {
       closeMenu(false) // 非 modal:Tab 跳出不还焦
     }
   }
+  // fixed 定位的菜单锚在 trigger 视口坐标,窗口 resize / 祖先滚动会让 trigger 移位,
+  // 需跟随重算。scroll 用 capture 以捕获任意可滚动祖先(消息区滚动)。
+  repositionListener = () => positionMenu()
   // pointerdown(capture)覆盖 mouse/touch/pen,早于 menu click,保证移动端外点也能关。
   document.addEventListener('pointerdown', outsideListener, true)
   document.addEventListener('keydown', keydownListener, true)
+  window.addEventListener('resize', repositionListener)
+  window.addEventListener('scroll', repositionListener, true)
 }
 
 function detachGlobalListeners() {
@@ -163,8 +203,13 @@ function detachGlobalListeners() {
   globalListenersBound = false
   if (outsideListener) document.removeEventListener('pointerdown', outsideListener, true)
   if (keydownListener) document.removeEventListener('keydown', keydownListener, true)
+  if (repositionListener) {
+    window.removeEventListener('resize', repositionListener)
+    window.removeEventListener('scroll', repositionListener, true)
+  }
   outsideListener = null
   keydownListener = null
+  repositionListener = null
 }
 
 /** 重渲选项 + 同步 trigger 标签/选中态。agent/session 切换、models 加载后调用,幂等。 */
@@ -175,8 +220,8 @@ export function renderModelPicker() {
   const menu = $('model-menu')
   if (!wrap || !trigger || !labelEl || !menu) return
   const opts = modelOptions()
-  // 没有可选 model(列表为空且无 agent 默认)→ 整个控件隐藏。
-  if (opts.length === 0) {
+  // 不接受覆盖的 agent(codex-native)或没有可选 model → 整个控件隐藏。
+  if (!currentAgentSupportsOverride() || opts.length === 0) {
     wrap.hidden = true
     if (isMenuOpen()) closeMenu(false)
     return

@@ -44,11 +44,15 @@ const MODELS = [
   { id: 'claude-haiku-4-5', label: 'Haiku 4.5' },
 ]
 
-function makeModelMode(opts: { agentModel?: string; override?: string } = {}) {
+function makeModelMode(
+  opts: { agentModel?: string; override?: string; provider?: string } = {},
+) {
   const ls = makeLocalStorage()
   if (opts.override !== undefined) ls._seed('openclaude_model_by_agent', { main: opts.override })
   const state = {
-    agentsList: [{ id: 'main', model: opts.agentModel ?? 'claude-opus-4-7' }],
+    agentsList: [
+      { id: 'main', model: opts.agentModel ?? 'claude-opus-4-7', provider: opts.provider },
+    ],
     modelsList: MODELS,
     defaultAgentId: 'main',
   }
@@ -90,12 +94,29 @@ describe('modelMode: effective model + submit value', () => {
     assert.equal(m.getEffectiveModel(), 'claude-opus-4-7')
     assert.equal(m.getModelForSubmit(), undefined)
   })
+
+  it('codex-native agent ignores override entirely — effective = agent default, submit omitted', () => {
+    // codex runner has no setModel; gateway silently ignores the override. A
+    // stored override must NOT leak into effective model (else effort gating
+    // would key off the wrong model) and must NOT be sent.
+    const m = makeModelMode({
+      agentModel: 'gpt-5.5',
+      provider: 'codex-native',
+      override: 'claude-haiku-4-5',
+    })
+    assert.equal(m.getEffectiveModel(), 'gpt-5.5')
+    assert.equal(m.getModelForSubmit(), undefined)
+  })
 })
 
-function makeEffortMode(effectiveModel: string, override?: string) {
+function makeEffortMode(
+  effectiveModel: string,
+  override?: string,
+  agentsList: unknown[] = [{ id: 'main' }],
+) {
   const ls = makeLocalStorage()
   if (override !== undefined) ls._seed('openclaude_effort_by_agent', { main: override })
-  const state = { agentsList: [{ id: 'main' }], modelsList: MODELS, defaultAgentId: 'main' }
+  const state = { agentsList, modelsList: MODELS, defaultAgentId: 'main' }
   return loadModule(
     'effortMode.js',
     ['getSupportedEfforts', 'modelSupportsExtraEffort', 'getCurrentEffort', 'getEffortForSubmit'],
@@ -116,6 +137,22 @@ describe('effortMode: capability-driven gating', () => {
     assert.deepEqual(e.getSupportedEfforts('claude-opus-4-8'), ['high', 'xhigh', 'max'])
     assert.deepEqual(e.getSupportedEfforts('claude-haiku-4-5'), [])
     assert.deepEqual(e.getSupportedEfforts('unknown-model'), [])
+  })
+
+  it('dual-source: model not in pool but is an agent default → uses agent.efforts (gpt-5.5)', () => {
+    // gpt-5.5 is the codex agent's default model; it is NOT a valid override
+    // target so it never appears in modelsList. Capability must still resolve
+    // via the agent's own efforts (carried by /api/agents).
+    const agents = [
+      { id: 'main', model: 'claude-opus-4-7' },
+      { id: 'codex', model: 'gpt-5.5', efforts: ['low', 'medium', 'high', 'xhigh'] },
+    ]
+    const e = makeEffortMode('gpt-5.5', undefined, agents)
+    assert.deepEqual(e.getSupportedEfforts('gpt-5.5'), ['low', 'medium', 'high', 'xhigh'])
+    assert.equal(e.modelSupportsExtraEffort('gpt-5.5'), true)
+    // pool still wins when present; unknown stays empty.
+    assert.deepEqual(e.getSupportedEfforts('claude-opus-4-8'), ['high', 'xhigh', 'max'])
+    assert.deepEqual(e.getSupportedEfforts('totally-unknown'), [])
   })
 
   it('modelSupportsExtraEffort reflects efforts presence', () => {

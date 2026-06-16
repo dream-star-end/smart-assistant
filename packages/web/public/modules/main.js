@@ -89,7 +89,7 @@ import {
   reloadAgents,
   renderAgentDropdown,
   renderAgentsManagementList,
-} from './agents.js?v=5'
+} from './agents.js?v=6'
 
 // ── Sessions ──
 import {
@@ -126,7 +126,7 @@ import {
   setMessageDeps,
   updateMessageEl,
   updateSessionSub,
-} from './messages.js?v=45'
+} from './messages.js?v=46'
 
 // ── WebSocket ──
 import {
@@ -168,14 +168,14 @@ import {
   showSlashPopup,
   slashPopupVisible,
 } from './commands.js?v=8'
-import { getEffortForSubmit, initModePills, renderModePills } from './effortMode.js?v=1'
+import { getEffortForSubmit, initModePills, renderModePills } from './effortMode.js?v=2'
 import {
   getGoalModeForSubmit,
   initGoalModePanel,
   markGoalModeSeeded,
   renderGoalModePanel,
 } from './goalMode.js?v=3'
-import { getModelForSubmit, initModelPicker, renderModelPicker } from './modelMode.js'
+import { getModelForSubmit, initModelPicker, renderModelPicker } from './modelMode.js?v=1'
 import {
   applyTerminalTheme,
   initOfficialClaudeTerminal,
@@ -183,7 +183,7 @@ import {
 } from './officialTerminal.js?v=16'
 import { getConversationModeForSubmit } from './planMode.js?v=4'
 import { initPlanPanel } from './planPanel.js?v=3'
-import { initResearchTools, renderResearchTools } from './researchTools.js?v=1'
+import { initResearchTools, renderResearchTools } from './researchTools.js?v=2'
 
 // ═══════════════════════════════════════════════════════════
 // 1. Wire late-bound dependencies

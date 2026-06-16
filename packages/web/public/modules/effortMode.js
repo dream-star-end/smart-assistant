@@ -5,21 +5,27 @@
 // 可见性 / 可调档位**能力驱动**:取当前生效 model(含模型选择器的 per-session 覆盖)
 // 在 config.models 里声明的 `efforts`。
 import { $ } from './dom.js'
-import { getEffectiveModel } from './modelMode.js'
+import { getEffectiveModel } from './modelMode.js?v=1'
 import { getSession, state } from './state.js'
 
 const STORAGE_KEY = 'openclaude_effort_by_agent'
 // 与 protocol/frames.ts InboundMessage.effortLevel + config.ts EFFORT_LEVELS 一致。
 const VALID = new Set(['low', 'medium', 'high', 'xhigh', 'max'])
 
-/** 返回该 model 在 UI 中可调的思考深度档,**能力驱动**:查 state.modelsList
- *  (来自 /api/agents 的 config.models / 默认 seed)里该 model 的 `efforts`。
- *  空/缺省 = 该 model 不暴露思考深度控件。新增模型只改 config,不动前端代码。 */
+/** 返回该 model 在 UI 中可调的思考深度档,**能力驱动**,两个权威源(都来自后端
+ *  effortsForModel(),前端不写死):
+ *    1. state.modelsList — 模型选择器的"可覆盖目标"池(config.models / 默认 seed)。
+ *    2. state.agentsList — 某个 agent 自己的默认 model 带的 efforts。覆盖池里查不到时
+ *       回退到这里,这样 codex 的 gpt-5.5(不是可覆盖目标、不在池里)也能正确显示思考深度。
+ *  空/缺省 = 该 model 不暴露思考深度控件。新增模型只改后端能力推断,不动前端。 */
 function getSupportedEfforts(modelId) {
   if (!modelId || typeof modelId !== 'string') return []
   const list = Array.isArray(state.modelsList) ? state.modelsList : []
-  const m = list.find((x) => x && x.id === modelId)
-  return Array.isArray(m?.efforts) ? m.efforts.filter((e) => VALID.has(e)) : []
+  const inPool = list.find((x) => x && x.id === modelId)
+  if (Array.isArray(inPool?.efforts)) return inPool.efforts.filter((e) => VALID.has(e))
+  const agents = Array.isArray(state.agentsList) ? state.agentsList : []
+  const owner = agents.find((a) => a && a.model === modelId && Array.isArray(a.efforts))
+  return owner ? owner.efforts.filter((e) => VALID.has(e)) : []
 }
 
 export function modelSupportsExtraEffort(modelId) {

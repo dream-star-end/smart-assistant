@@ -29,6 +29,7 @@ import {
   claimSession,
   defaultModels,
   deleteClientSession,
+  effortsForModel,
   getClientSession,
   getUsageSummary,
   listClientSessions,
@@ -2488,12 +2489,25 @@ export class Gateway {
     const cfg = await readAgentsConfig()
     if (req.method === 'GET') {
       this.sendJson(res, 200, {
-        agents: cfg.agents.map((a) => this.redactAgentForApi(a)),
+        agents: cfg.agents.map((a) => ({
+          ...this.redactAgentForApi(a),
+          // Thinking-depth capability of the agent's OWN default model. Carried
+          // per-agent so the composer can gate the effort control even when that
+          // model is NOT in the override pool (e.g. codex/gpt-5.5, which isn't a
+          // valid override target but still drives its own reasoning effort).
+          // Single authority: effortsForModel().
+          efforts: effortsForModel(a.model),
+        })),
         default: cfg.default,
         routes: cfg.routes,
         // Model registry for the composer's model picker (per-session override).
-        // config.models when set, else the Claude-family seed.
-        models: this.deps.config.models ?? defaultModels(),
+        // config.models when set, else the Claude-family seed. Backfill `efforts`
+        // for operator-configured models that omit it, so adding a model to
+        // config.models never silently drops its thinking-depth control.
+        models: (this.deps.config.models ?? defaultModels()).map((m) => ({
+          ...m,
+          efforts: m.efforts ?? effortsForModel(m.id),
+        })),
       })
       return
     }

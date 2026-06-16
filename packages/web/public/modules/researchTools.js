@@ -15,7 +15,7 @@
 // 所有状态仅属当前会话(sessionStorage,不跨会话),避免污染其它对话。
 
 import { $ } from './dom.js'
-import { getCurrentEffort, modelSupportsExtraEffort } from './effortMode.js?v=1'
+import { getCurrentEffort, modelSupportsExtraEffort } from './effortMode.js?v=2'
 import { getSession, state } from './state.js'
 
 // 受众选择按 session.id 分桶存在 sessionStorage(随标签页关闭清空)。

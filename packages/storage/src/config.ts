@@ -42,20 +42,48 @@ export interface ModelChoice {
   efforts?: EffortLevel[]
 }
 
+/** Single source of truth for which thinking-depth levels a model exposes in
+ *  the UI. Capability is an INTRINSIC property of the model, derived from its id
+ *  family — not a hand-maintained table that drifts out of sync with the agents
+ *  actually in use (which is how gpt-5.5 lost its control once the frontend
+ *  stopped hardcoding it). Tolerates id variants (case, `anthropic/`/`openai/`
+ *  prefixes). Used by both defaultModels() and /api/agents (per-agent + models
+ *  backfill), so any model — pool member or an agent's own default — is gated
+ *  consistently. Returns [] = no extra thinking-depth control. */
+export function effortsForModel(modelId: string | undefined): EffortLevel[] {
+  if (!modelId || typeof modelId !== 'string') return []
+  const id = modelId.toLowerCase()
+  // Codex / GPT-5.5 reasoning depth. Maps to codex `model_reasoning_effort`
+  // (low/medium/high/xhigh — codex exposes no `max`); see codexLaunchOverrides.
+  if (/(^|[/_-])gpt[-_]?5\.5($|[/_-])/.test(id)) return ['low', 'medium', 'high', 'xhigh']
+  // Claude Opus 4.8 — full depth incl. 科研模式 (max).
+  if (/opus[-_]?4[-_]?8/.test(id)) return ['high', 'xhigh', 'max']
+  // Claude Opus 4.7 — legacy 编码/科研模式 (xhigh/max).
+  if (/opus[-_]?4[-_]?7/.test(id)) return ['xhigh', 'max']
+  // Claude Sonnet 4.6.
+  if (/sonnet[-_]?4[-_]?6/.test(id)) return ['high', 'xhigh']
+  // Haiku / MiniMax / anything else — no extra thinking-depth control.
+  return []
+}
+
 /** Default model registry (used when `config.models` is unset). Seeded to the
  *  current subscription Claude family; operators edit `config.models` to add or
  *  remove. ids/labels are editable — keep them in sync with what the account can
- *  actually serve. */
+ *  actually serve. `efforts` is derived from effortsForModel() (single authority)
+ *  so the seed never disagrees with /api/agents capability gating. */
 export function defaultModels(): ModelChoice[] {
   return [
-    { id: 'claude-opus-4-8', label: 'Opus 4.8', efforts: ['high', 'xhigh', 'max'] },
+    { id: 'claude-opus-4-8', label: 'Opus 4.8' },
     // Opus 4.7 is the current default agent model on this install — keep it in
     // the seed so the picker lists it AND the thinking-depth control stays
-    // available on the default model (preserves the legacy 编码/科研模式 = xhigh/max).
-    { id: 'claude-opus-4-7', label: 'Opus 4.7', efforts: ['xhigh', 'max'] },
-    { id: 'claude-sonnet-4-6', label: 'Sonnet 4.6', efforts: ['high', 'xhigh'] },
+    // available (preserves the legacy 编码/科研模式 = xhigh/max).
+    { id: 'claude-opus-4-7', label: 'Opus 4.7' },
+    { id: 'claude-sonnet-4-6', label: 'Sonnet 4.6' },
     { id: 'claude-haiku-4-5', label: 'Haiku 4.5' },
-  ]
+  ].map((m) => {
+    const efforts = effortsForModel(m.id)
+    return efforts.length > 0 ? { ...m, efforts } : m
+  })
 }
 
 /** Predefined tool groups that can be assigned to agents or routes */
