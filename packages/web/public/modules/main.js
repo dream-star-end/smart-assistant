@@ -53,6 +53,7 @@ import {
   fileToText,
   removeAttachment,
   renderAttachments,
+  uploadAttachment,
 } from './attachments.js'
 
 // ── Speech recognition ──
@@ -775,14 +776,37 @@ async function send() {
       ? `\n\n📎 ${state.attachments.map((a) => a.name).join(', ')}`
       : '')
   const modelText = buildMessageText(text, state.attachments)
-  const media = state.attachments
-    .filter((a) => a.kind !== 'text')
-    .map((a) => ({
-      kind: a.kind,
-      base64: a.dataUrl,
-      mimeType: a.type,
-      filename: a.name,
-    }))
+  // Upload non-text attachments over the independent HTTP channel BEFORE the WS
+  // send, so the message frame carries only `upload:<ref>` tokens instead of
+  // base64. This keeps the frame tiny (instant send) and surfaces real upload
+  // progress on the attachment chips — root fix for the "send image → long
+  // silent stall" problem. On any failure we abort and keep the input +
+  // attachments so the user can retry; we never half-send.
+  const mediaAtts = state.attachments.filter((a) => a.kind !== 'text')
+  let media = []
+  if (mediaAtts.length > 0) {
+    try {
+      media = await Promise.all(
+        mediaAtts.map((a) =>
+          uploadAttachment(a, (pct) => {
+            a._uploadPct = pct
+            renderAttachments()
+          }).then((r) => ({
+            kind: a.kind,
+            url: r.ref,
+            mimeType: a.type,
+            filename: a.name,
+          })),
+        ),
+      )
+    } catch (err) {
+      for (const a of mediaAtts) a._uploadPct = undefined
+      renderAttachments()
+      toast(`附件上传失败：${err?.message || err}`, 'error')
+      return // keep input + attachments for retry
+    }
+    for (const a of mediaAtts) a._uploadPct = undefined
+  }
   const effortLevel = getEffortForSubmit()
   const model = getModelForSubmit()
   const conversationMode = getConversationModeForSubmit(text, state.attachments)
