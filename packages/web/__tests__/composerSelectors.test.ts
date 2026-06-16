@@ -40,7 +40,11 @@ function loadModule(file: string, exposeNames: string[], deps: Record<string, un
 }
 
 const MODELS = [
-  { id: 'claude-opus-4-8', label: 'Opus 4.8', efforts: ['low', 'medium', 'high', 'xhigh', 'max'] },
+  {
+    id: 'claude-opus-4-8',
+    label: 'Opus 4.8',
+    efforts: ['low', 'medium', 'high', 'xhigh', 'max'],
+  },
   { id: 'claude-haiku-4-5', label: 'Haiku 4.5' },
 ]
 
@@ -134,7 +138,13 @@ function makeEffortMode(
 describe('effortMode: capability-driven gating', () => {
   it('getSupportedEfforts reads config.models[].efforts', () => {
     const e = makeEffortMode('claude-opus-4-8')
-    assert.deepEqual(e.getSupportedEfforts('claude-opus-4-8'), ['low', 'medium', 'high', 'xhigh', 'max'])
+    assert.deepEqual(e.getSupportedEfforts('claude-opus-4-8'), [
+      'low',
+      'medium',
+      'high',
+      'xhigh',
+      'max',
+    ])
     assert.deepEqual(e.getSupportedEfforts('claude-haiku-4-5'), [])
     assert.deepEqual(e.getSupportedEfforts('unknown-model'), [])
   })
@@ -151,7 +161,13 @@ describe('effortMode: capability-driven gating', () => {
     assert.deepEqual(e.getSupportedEfforts('gpt-5.5'), ['low', 'medium', 'high', 'xhigh'])
     assert.equal(e.modelSupportsExtraEffort('gpt-5.5'), true)
     // pool still wins when present; unknown stays empty.
-    assert.deepEqual(e.getSupportedEfforts('claude-opus-4-8'), ['low', 'medium', 'high', 'xhigh', 'max'])
+    assert.deepEqual(e.getSupportedEfforts('claude-opus-4-8'), [
+      'low',
+      'medium',
+      'high',
+      'xhigh',
+      'max',
+    ])
     assert.deepEqual(e.getSupportedEfforts('totally-unknown'), [])
   })
 

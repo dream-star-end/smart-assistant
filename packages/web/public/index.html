@@ -337,6 +337,7 @@
           <select id="persona-model-preset" onchange="if(this.value){document.getElementById('persona-model').value=this.value;var g=this.selectedOptions[0]?.parentElement?.label||'';var p=document.getElementById('persona-provider');if(g.startsWith('Claude'))p.value='claude-subscription';else if(g.startsWith('MiniMax'))p.value='minimax';else if(g.startsWith('DeepSeek'))p.value='deepseek';else if(g.startsWith('OpenAI'))p.value='codex-native';p.dispatchEvent(new Event('change'))}">
             <option value="">自定义</option>
             <optgroup label="Claude">
+              <option value="claude-opus-4-8">Opus 4.8</option>
               <option value="claude-opus-4-7">Opus 4.7</option>
               <option value="claude-opus-4-6">Opus 4.6</option>
               <option value="claude-sonnet-4-6">Sonnet 4.6</option>
@@ -902,7 +903,7 @@
 <!-- Force SW cache refresh (one-time, remove after all clients updated) -->
 <script>
 (function(){
-  var V='sw-flush-v24';
+  var V='sw-flush-v25';
   if(localStorage.getItem(V))return;
   if('serviceWorker' in navigator){
     navigator.serviceWorker.getRegistrations().then(function(regs){

@@ -648,7 +648,7 @@ initOAuthListeners()
 initWechatListeners()
 initOfficialClaudeTerminal()
 
-// ── Effort pills (编码模式 / 科研模式): bind once + render initial visibility ──
+// ── 思考深度 pills: bind once + render initial visibility ──
 // 完整可见性由 agent.model 决定,真正的渲染会在 reloadAgents → renderAgentDropdown 内
 // 再触发一次;这里只是绑定点击事件并把初始隐藏态打上去。
 initModePills()
