@@ -3231,9 +3231,10 @@ a:hover {
   outline-offset: 2px;
 }
 .model-menu {
-  position: absolute;
-  bottom: calc(100% + 6px); /* composer 在底部 → 菜单往上弹 */
-  left: var(--space-3);
+  /* position: fixed + JS 算坐标(modelMode.positionMenu): 菜单必须逃出
+     .composer-inner 的 overflow:hidden,否则向上弹的菜单会被裁成不可见。
+     left/bottom 由 JS 按 trigger 的视口坐标设置(向上弹)。 */
+  position: fixed;
   min-width: 240px;
   max-height: 50vh;
   overflow-y: auto;
@@ -3242,7 +3243,7 @@ a:hover {
   border: 1px solid var(--border);
   border-radius: var(--radius-md);
   box-shadow: 0 8px 24px rgba(0, 0, 0, 0.28);
-  z-index: 20;
+  z-index: 200; /* 高于 composer;与 slash-popup(100) 不会同时出现 */
 }
 .model-menu[hidden] {
   display: none;

@@ -1,16 +1,16 @@
 // OpenClaude Service Worker
 // App-shell caching only. Never intercept /ws, /api/*, or external CDN requests.
-const VERSION = 'openclaude-v90'
+const VERSION = 'openclaude-v91'
 const SHELL = [
   '/',
   '/index.html',
   '/style.css',
-  '/style.css?v=58', // versioned URL used in index.html
+  '/style.css?v=59', // versioned URL used in index.html
   '/manifest.json',
   '/icon.svg',
   // ES modules
   '/modules/main.js',
-  '/modules/main.js?v=70', // versioned URL used in index.html
+  '/modules/main.js?v=71', // versioned URL used in index.html
   '/modules/dom.js',
   '/modules/util.js',
   '/modules/state.js',
@@ -28,10 +28,11 @@ const SHELL = [
   '/modules/memory.js',
   '/modules/tasks.js',
   '/modules/agents.js',
-  '/modules/agents.js?v=5',
+  '/modules/agents.js?v=6',
   '/modules/effortMode.js',
-  '/modules/effortMode.js?v=1',
+  '/modules/effortMode.js?v=2',
   '/modules/modelMode.js',
+  '/modules/modelMode.js?v=1',
   '/modules/planMode.js',
   '/modules/planMode.js?v=4',
   '/modules/sessions.js',
@@ -39,7 +40,7 @@ const SHELL = [
   '/modules/sync.js',
   '/modules/sync.js?v=9',
   '/modules/messages.js',
-  '/modules/messages.js?v=45',
+  '/modules/messages.js?v=46',
   '/modules/planPanel.js',
   '/modules/planPanel.js?v=3',
   '/modules/websocket.js',
@@ -52,7 +53,7 @@ const SHELL = [
   '/modules/goalMode.js?v=3',
   '/modules/wechat.js',
   '/modules/researchTools.js',
-  '/modules/researchTools.js?v=1',
+  '/modules/researchTools.js?v=2',
   '/modules/officialTerminal.js',
   '/modules/officialTerminal.js?v=16',
   '/modules/export-docx.js',

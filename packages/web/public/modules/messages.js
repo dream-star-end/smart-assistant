@@ -1,6 +1,6 @@
 // OpenClaude — Message rendering and display
 import { $, _mod, fallbackCopy, htmlSafeEscape } from './dom.js'
-import { getEffortForSubmit } from './effortMode.js?v=1'
+import { getEffortForSubmit } from './effortMode.js?v=2'
 import { exportMessageDocx } from './export-docx.js'
 import { exportMessageTex } from './export-tex.js'
 import { renderGoalModePanel } from './goalMode.js?v=3'
