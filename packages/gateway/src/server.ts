@@ -7,10 +7,19 @@ import {
   realpathSync,
   statSync,
 } from 'node:fs'
-import { appendFile, mkdir, readFile, rename, unlink, writeFile } from 'node:fs/promises'
+import {
+  appendFile,
+  mkdir,
+  readFile,
+  realpath,
+  rename,
+  stat,
+  unlink,
+  writeFile,
+} from 'node:fs/promises'
 import { type IncomingMessage, type ServerResponse, createServer } from 'node:http'
 import { homedir } from 'node:os'
-import { basename, dirname, extname, join, relative, resolve } from 'node:path'
+import { basename, dirname, extname, join, relative, resolve, sep } from 'node:path'
 import type { Duplex } from 'node:stream'
 import type { ChannelAdapter, ChannelContext } from '@openclaude/plugin-sdk'
 import type {
@@ -139,6 +148,83 @@ const TERMINAL_UPLOAD_MAX_SINGLE_BYTES = 512 * 1024 * 1024
 const TERMINAL_UPLOAD_STALE_MS = 6 * 60 * 60_000
 const TERMINAL_LIST_MAX_ENTRIES = 1000
 const TERMINAL_DOWNLOAD_TICKET_TTL_MS = 5 * 60_000
+
+// ── Chat attachment (multimodal) limits — single source of truth ──
+// Shared by the HTTP upload endpoint (/api/attachments) and the inbound media
+// save path (dispatchInbound) so the two channels can't drift apart.
+const MEDIA_MAX_SINGLE_FILE = 25 * 1024 * 1024 // 25MB per file
+const MEDIA_MAX_TOTAL = 50 * 1024 * 1024 // 50MB total per message
+const MEDIA_ALLOWED_MIME_PREFIXES = [
+  'image/',
+  'audio/',
+  'video/',
+  'application/pdf',
+  'text/',
+  'application/vnd.openxmlformats-officedocument.', // docx, xlsx, pptx
+  'application/vnd.ms-', // doc, xls, ppt
+  'application/msword', // .doc
+  'application/zip',
+  'application/x-zip', // zip archives
+  'application/gzip',
+  'application/x-gzip', // .gz, .tar.gz
+  'application/x-tar',
+  'application/x-compressed-tar',
+  'application/x-gtar', // .tar / tarball variants
+  'application/x-7z-compressed', // .7z
+  'application/vnd.rar',
+  'application/x-rar-compressed', // .rar
+  'application/x-bzip',
+  'application/x-bzip2', // .bz2
+  'application/x-xz', // .xz
+  'application/json', // json files
+  'application/xml', // xml files
+]
+const MEDIA_MIME_TO_EXT: Record<string, string> = {
+  'image/jpeg': 'jpg',
+  'image/png': 'png',
+  'image/gif': 'gif',
+  'image/webp': 'webp',
+  'image/bmp': 'bmp',
+  'image/svg+xml': 'svg',
+  'audio/mpeg': 'mp3',
+  'audio/wav': 'wav',
+  'audio/ogg': 'ogg',
+  'audio/aac': 'aac',
+  'audio/flac': 'flac',
+  'audio/mp4': 'm4a',
+  'video/mp4': 'mp4',
+  'video/webm': 'webm',
+  'video/quicktime': 'mov',
+  'application/pdf': 'pdf',
+  'application/msword': 'doc',
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document': 'docx',
+  'application/vnd.ms-excel': 'xls',
+  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': 'xlsx',
+  'application/zip': 'zip',
+  'application/x-zip': 'zip',
+  'application/x-zip-compressed': 'zip',
+  'application/gzip': 'gz',
+  'application/x-gzip': 'gz',
+  'application/x-tar': 'tar',
+  'application/x-compressed-tar': 'tar.gz',
+  'application/x-gtar': 'tar',
+  'application/x-7z-compressed': '7z',
+  'application/vnd.rar': 'rar',
+  'application/x-rar-compressed': 'rar',
+  'application/x-bzip': 'bz2',
+  'application/x-bzip2': 'bz2',
+  'application/x-xz': 'xz',
+  'text/html': 'html',
+}
+const MEDIA_MIME_ALLOWED = (mime: string): boolean =>
+  !mime ||
+  mime === 'application/octet-stream' ||
+  MEDIA_ALLOWED_MIME_PREFIXES.some((p) => mime.startsWith(p))
+// WS media `url` prefix marking an already-uploaded local attachment (vs an
+// external http(s) URL). The HTTP endpoint returns `upload:<filename>`; the
+// inbound path resolves it back to a file under uploadsDir. Keeps the existing
+// `url` = external-link semantics intact for any non-prefixed value.
+const UPLOAD_REF_PREFIX = 'upload:'
 
 interface TerminalUploadState {
   id: string
@@ -1998,6 +2084,17 @@ export class Gateway {
       return
     }
 
+    // ── Chat attachment upload (binary body → uploadsDir, returns upload:<ref>) ──
+    // Moves large media (images/audio/…) off the inbound WS message frame: the
+    // frame then carries only the ref, so it sends instantly and the client can
+    // show real upload progress via XHR.
+    if (url.pathname === '/api/attachments' && req.method === 'POST') {
+      this.handleAttachmentUpload(req, res, url).catch((err) =>
+        this.sendError(res, 400, err instanceof Error ? err.message : String(err)),
+      )
+      return
+    }
+
     // ── File serving by absolute path (whitelist-restricted) ──
     if (url.pathname === '/api/file') {
       const filePath = url.searchParams.get('path')
@@ -3702,6 +3799,81 @@ export class Gateway {
       })
       req.on('end', () => resolve(Buffer.concat(chunks).toString()))
       req.on('error', reject)
+    })
+  }
+
+  /** Read a raw binary request body into a Buffer with a hard byte cap.
+   *  Unlike readBody() this never decodes to a string — used for
+   *  application/octet-stream uploads (chat attachments). */
+  private readBinaryBody(req: IncomingMessage, maxBytes: number): Promise<Buffer> {
+    return new Promise((resolveBody, reject) => {
+      const chunks: Buffer[] = []
+      let size = 0
+      req.on('data', (c: Buffer) => {
+        size += c.length
+        if (size > maxBytes) {
+          req.destroy()
+          reject(new Error('body too large'))
+          return
+        }
+        chunks.push(c)
+      })
+      req.on('end', () => resolveBody(Buffer.concat(chunks)))
+      req.on('error', reject)
+    })
+  }
+
+  /** POST /api/attachments — stream a single binary attachment to uploadsDir and
+   *  return an `upload:<filename>` ref the client puts on the WS media frame.
+   *  Auth is already enforced by the /api/ gate in handleHttp. */
+  private async handleAttachmentUpload(
+    req: IncomingMessage,
+    res: ServerResponse,
+    url: URL,
+  ): Promise<void> {
+    const name = url.searchParams.get('name') || 'file'
+    const mime = (url.searchParams.get('mime') || 'application/octet-stream').slice(0, 200)
+    const kind = url.searchParams.get('kind') || 'file'
+    if (!MEDIA_MIME_ALLOWED(mime)) {
+      this.sendJson(res, 415, { ok: false, error: `不支持的文件类型: ${mime}` })
+      return
+    }
+    // Fast-reject oversized uploads before reading the body.
+    const contentLength = Number(req.headers['content-length'])
+    if (Number.isFinite(contentLength) && contentLength > MEDIA_MAX_SINGLE_FILE) {
+      this.sendJson(res, 413, {
+        ok: false,
+        error: `附件超过 ${MEDIA_MAX_SINGLE_FILE / 1024 / 1024}MB 限制`,
+      })
+      return
+    }
+    let buf: Buffer
+    try {
+      buf = await this.readBinaryBody(req, MEDIA_MAX_SINGLE_FILE)
+    } catch {
+      this.sendJson(res, 413, {
+        ok: false,
+        error: `附件超过 ${MEDIA_MAX_SINGLE_FILE / 1024 / 1024}MB 限制`,
+      })
+      return
+    }
+    if (buf.length === 0) {
+      this.sendJson(res, 400, { ok: false, error: 'empty upload' })
+      return
+    }
+    const ext = MEDIA_MIME_TO_EXT[mime] ?? mime.split('/')[1]?.replace(/[^a-zA-Z0-9]/g, '') ?? 'bin'
+    const defaultName =
+      kind === 'image' ? 'image' : kind === 'audio' ? 'audio' : kind === 'video' ? 'video' : 'file'
+    const safeBase = (name || defaultName).replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 40)
+    const fname = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}-${safeBase}.${ext}`
+    await mkdir(paths.uploadsDir, { recursive: true })
+    await writeFile(join(paths.uploadsDir, fname), buf)
+    this.sendJson(res, 200, {
+      ok: true,
+      ref: `${UPLOAD_REF_PREFIX}${fname}`,
+      mimeType: mime,
+      name,
+      sizeHint: `${(buf.length / 1024).toFixed(1)}KB`,
     })
   }
 
@@ -5609,34 +5781,28 @@ export class Gateway {
     const text = frame.content.text ?? ''
     const media = frame.content.media ?? []
 
-    // Server-side upload validation
-    const MAX_SINGLE_FILE = 25 * 1024 * 1024 // 25MB
-    const MAX_TOTAL_MEDIA = 50 * 1024 * 1024 // 50MB total
-    const ALLOWED_MIME_PREFIXES = [
-      'image/',
-      'audio/',
-      'video/',
-      'application/pdf',
-      'text/',
-      'application/vnd.openxmlformats-officedocument.', // docx, xlsx, pptx
-      'application/vnd.ms-', // doc, xls, ppt
-      'application/msword', // .doc
-      'application/zip',
-      'application/x-zip', // zip archives
-      'application/gzip',
-      'application/x-gzip', // .gz, .tar.gz
-      'application/x-tar',
-      'application/x-compressed-tar',
-      'application/x-gtar', // .tar / tarball variants
-      'application/x-7z-compressed', // .7z
-      'application/vnd.rar',
-      'application/x-rar-compressed', // .rar
-      'application/x-bzip',
-      'application/x-bzip2', // .bz2
-      'application/x-xz', // .xz
-      'application/json', // json files
-      'application/xml', // xml files
-    ]
+    // Surface an upload rejection to the user as a final outbound message and
+    // abort the turn (mirrors the inline base64-validation failures below).
+    const failUpload = (errMsg: string): void => {
+      this.log.warn('upload rejected', { reason: errMsg, sessionKey })
+      this.deliver(
+        {
+          type: 'outbound.message',
+          sessionKey: sessionKey!,
+          channel: frame.channel,
+          peer: frame.peer,
+          blocks: [{ kind: 'text', text: `⚠️ 上传失败: ${errMsg}` }],
+          isFinal: true,
+        },
+        adapter,
+      )
+    }
+
+    // Server-side upload validation (limits/allowlist live at module scope —
+    // see MEDIA_* — so the HTTP /api/attachments endpoint stays in lockstep).
+    const MAX_SINGLE_FILE = MEDIA_MAX_SINGLE_FILE
+    const MAX_TOTAL_MEDIA = MEDIA_MAX_TOTAL
+    const ALLOWED_MIME_PREFIXES = MEDIA_ALLOWED_MIME_PREFIXES
     let totalMediaSize = 0
     for (const m of media) {
       if (!m.base64) continue
@@ -5706,45 +5872,6 @@ export class Gateway {
       }
     }
 
-    // MIME → extension lookup (expanded to cover all media types)
-    const mimeToExt: Record<string, string> = {
-      'image/jpeg': 'jpg',
-      'image/png': 'png',
-      'image/gif': 'gif',
-      'image/webp': 'webp',
-      'image/bmp': 'bmp',
-      'image/svg+xml': 'svg',
-      'audio/mpeg': 'mp3',
-      'audio/wav': 'wav',
-      'audio/ogg': 'ogg',
-      'audio/aac': 'aac',
-      'audio/flac': 'flac',
-      'audio/mp4': 'm4a',
-      'video/mp4': 'mp4',
-      'video/webm': 'webm',
-      'video/quicktime': 'mov',
-      'application/pdf': 'pdf',
-      'application/msword': 'doc',
-      'application/vnd.openxmlformats-officedocument.wordprocessingml.document': 'docx',
-      'application/vnd.ms-excel': 'xls',
-      'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': 'xlsx',
-      'application/zip': 'zip',
-      'application/x-zip': 'zip',
-      'application/x-zip-compressed': 'zip',
-      'application/gzip': 'gz',
-      'application/x-gzip': 'gz',
-      'application/x-tar': 'tar',
-      'application/x-compressed-tar': 'tar.gz',
-      'application/x-gtar': 'tar',
-      'application/x-7z-compressed': '7z',
-      'application/vnd.rar': 'rar',
-      'application/x-rar-compressed': 'rar',
-      'application/x-bzip': 'bz2',
-      'application/x-bzip2': 'bz2',
-      'application/x-xz': 'xz',
-      'text/html': 'html',
-    }
-
     type SavedMedia = {
       kind: string
       path: string
@@ -5753,14 +5880,65 @@ export class Gateway {
       sizeHint: string
     }
     const savedMedia: SavedMedia[] = []
+    const uploadsRoot = resolve(paths.uploadsDir)
+    let refTotalSize = 0
     for (const m of media) {
+      // HTTP-channel attachment: the file was already streamed to uploadsDir via
+      // POST /api/attachments and the WS frame carries only `upload:<filename>`.
+      // Resolve it to the existing path instead of re-decoding base64 in-band.
+      if (!m.base64 && m.url?.startsWith(UPLOAD_REF_PREFIX)) {
+        const refName = basename(m.url.slice(UPLOAD_REF_PREFIX.length))
+        const candidate = resolve(join(uploadsRoot, refName))
+        const insideUploads = (p: string): boolean =>
+          p === uploadsRoot || p.startsWith(uploadsRoot + sep)
+        if (!insideUploads(candidate)) {
+          failUpload('附件引用非法')
+          return
+        }
+        let st: Awaited<ReturnType<typeof stat>>
+        let realPath: string
+        try {
+          realPath = await realpath(candidate) // resolves symlinks before the boundary check
+          if (!insideUploads(realPath)) {
+            failUpload('附件引用非法')
+            return
+          }
+          st = await stat(realPath)
+        } catch {
+          failUpload('附件已失效或不存在，请重新上传')
+          return
+        }
+        if (!st.isFile()) {
+          failUpload('附件已失效或不存在，请重新上传')
+          return
+        }
+        if (st.size > MAX_SINGLE_FILE) {
+          failUpload(
+            `附件超过 ${MAX_SINGLE_FILE / 1024 / 1024}MB 限制 (${(st.size / 1024 / 1024).toFixed(1)}MB)`,
+          )
+          return
+        }
+        refTotalSize += st.size
+        if (refTotalSize > MAX_TOTAL_MEDIA) {
+          failUpload(`总附件超过 ${MAX_TOTAL_MEDIA / 1024 / 1024}MB 限制`)
+          return
+        }
+        savedMedia.push({
+          kind: m.kind,
+          path: realPath,
+          name: m.filename ?? refName,
+          mimeType: m.mimeType ?? 'application/octet-stream',
+          sizeHint: `${(st.size / 1024).toFixed(1)}KB`,
+        })
+        continue
+      }
       let base64 = m.base64 ?? ''
       if (!base64 && m.url) continue // external URL — don't save, just reference
       const prefixMatch = base64.match(/^data:([^;]+);base64,(.*)$/)
       const mimeType = prefixMatch ? prefixMatch[1] : (m.mimeType ?? 'application/octet-stream')
       if (prefixMatch) base64 = prefixMatch[2]
       const ext =
-        mimeToExt[mimeType] ?? mimeType.split('/')[1]?.replace(/[^a-zA-Z0-9]/g, '') ?? 'bin'
+        MEDIA_MIME_TO_EXT[mimeType] ?? mimeType.split('/')[1]?.replace(/[^a-zA-Z0-9]/g, '') ?? 'bin'
       const defaultName =
         m.kind === 'image'
           ? 'image'
