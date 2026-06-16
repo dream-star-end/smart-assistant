@@ -71,6 +71,11 @@ export interface FinalizeContext {
    *   - 计费、journal、ledger 全部按 user 维度走,与 accountId 解耦
    */
   accountId: bigint | null;
+  /**
+   * B7 per-slot 租约 id。OAuth 路径 = pick.slotId(非 null);DeepSeek/MiniMax = null
+   * (与 accountId 同生死)。finalize 权威 release 按此精确还槽。
+   */
+  slotId: string | null;
   model: string;
   pricing: ModelPricing;
   precheckCredits: bigint;
@@ -346,9 +351,10 @@ export function makeFinalizer(deps: FinalizeDeps, ctx: FinalizeContext): Finaliz
         } catch (e) {
           ctx.log.warn("proxy_release_precheck_failed", { err: errSummary(e) });
         }
-        // DeepSeek 路径(accountId===null)无 claude_accounts pool slot 要回流;
-        // 跳过 scheduler.release 以免传 null account_id 进 scheduler 内部。
-        if (ctx.accountId !== null) {
+        // DeepSeek/MiniMax 路径(accountId===null)无 claude_accounts pool slot 要回流;
+        // 跳过 scheduler.release。accountId 与 slotId 同生死,配对判 null 同时让 TS 收窄
+        // slotId 为非 null(避免裸 `!`,Codex 计划审 nice-to-have)。
+        if (ctx.accountId !== null && ctx.slotId !== null) {
           try {
             const releaseResult: ReleaseResult =
               schedulerResult === "success"
@@ -358,6 +364,7 @@ export function makeFinalizer(deps: FinalizeDeps, ctx: FinalizeContext): Finaliz
                   : { kind: "failure", error: schedulerErrMsg };
             await deps.scheduler.release({
               account_id: ctx.accountId,
+              slotId: ctx.slotId,
               result: releaseResult,
             });
           } catch (e) {

@@ -251,6 +251,61 @@ function sanitizeMaxConcurrent(n: number | undefined): number {
   return n
 }
 
+/** 泄漏槽 reaper 默认 TTL:30min(远大于任何合法单 turn,偏向 under-reap)。 */
+export const DEFAULT_SLOT_LEASE_TTL_MS = 30 * 60_000
+/** 泄漏槽 reaper TTL 名义上界:24h(实际上界 = max(floor, 此值),保证 ≥ floor)。 */
+export const SLOT_LEASE_TTL_CEIL_MS = 24 * 60 * 60_000
+
+/**
+ * 读 `CODEX_SESSION_MAX_MS` 作 TTL 下界因子。本地复刻 userChatBridge 的解析语义
+ * (避免 scheduler→bridge import 环):有限且 ≥1000 才采用,否则默认 600s。
+ */
+function readCodexSessionMaxMsFloor(
+  raw: string | undefined = process.env.CODEX_SESSION_MAX_MS,
+): number {
+  if (!raw) return 600_000
+  const n = Number(raw)
+  return Number.isFinite(n) && n >= 1000 ? n : 600_000
+}
+
+/**
+ * 解析 `ACCOUNT_SLOT_LEASE_TTL_MS`:纯正整数字符串(ms)才采用,否则 undefined(交 sanitize 回落)。
+ */
+export function parseSlotLeaseTtlEnv(
+  raw: string | undefined = process.env.ACCOUNT_SLOT_LEASE_TTL_MS,
+): number | undefined {
+  if (!raw || !/^[1-9]\d*$/.test(raw)) return undefined
+  const n = Number.parseInt(raw, 10)
+  return Number.isSafeInteger(n) ? n : undefined
+}
+
+/**
+ * 归一化泄漏槽 TTL。
+ *
+ * floor = max(CODEX_SESSION_MAX_MS, 30min) —— reaper 必须晚于 Codex bridge 600s timer,
+ *   否则会抢在 bridge 之前误回收**活跃** Codex turn 的槽 → 过并发。
+ * ceil  = max(floor, 24h) —— 名义上界 24h,但若运维把 CODEX_SESSION_MAX_MS 设成 >24h,
+ *   上界抬到 floor,保证 `ttl ≥ floor ≥ CODEX_SESSION_MAX_MS` 恒成立(Codex 计划审 Blocking 4)。
+ * 非法/非 SafeInteger/未配 → 默认 30min,再被 floor 夹上去。
+ */
+export function sanitizeSlotLeaseTtl(
+  n: number | undefined,
+  codexFloor: number = readCodexSessionMaxMsFloor(),
+): number {
+  const floor = Math.max(codexFloor, DEFAULT_SLOT_LEASE_TTL_MS)
+  const ceil = Math.max(floor, SLOT_LEASE_TTL_CEIL_MS)
+  let configured = n
+  if (configured === undefined) configured = parseSlotLeaseTtlEnv()
+  if (
+    configured === undefined ||
+    !Number.isSafeInteger(configured) ||
+    configured <= 0
+  ) {
+    configured = DEFAULT_SLOT_LEASE_TTL_MS
+  }
+  return Math.min(Math.max(configured, floor), ceil)
+}
+
 export interface PickInput {
   /**
    * `mode` 字段只作 metric label,真实选号算法全部走 WRH(见文件头注释)。
@@ -335,6 +390,11 @@ export interface PickInput {
 
 export interface PickResult {
   account_id: bigint
+  /**
+   * 本次 pick 的 per-slot 租约 id(唯一,不复用)。release/releasePickResult/finalizer
+   * 必须原样回传以精确还槽。绝不可用 account_id 还槽(那会误伤同账号其它在途租约)。
+   */
+  slotId: string
   plan: AccountPlan
   /** 解密后的 OAuth access token —— **调用方用完必须 .fill(0)** */
   token: Buffer
@@ -412,6 +472,8 @@ export type ReleaseResult =
 
 export interface ReleaseInput {
   account_id: bigint | string
+  /** pick() 返回的同一 slotId,精确还槽。 */
+  slotId: string
   result: ReleaseResult
 }
 
@@ -426,6 +488,14 @@ export interface SchedulerDeps {
    * 测试用此 dep 可让 mode=chat 无 sessionId 路径变得确定。
    */
   ephemeralKey?: () => string
+  /**
+   * 注入 per-slot 租约 id 生成器;默认 `crypto.randomUUID()`。
+   *
+   * **必须与 `ephemeralKey` 分离**:ephemeralKey 是"无 sessionId 时的 WRH key"生成器,
+   * 测试里常被注入成确定性函数。slotId 复用它会在同账号并发时 `Map.set` 覆盖 → under-count,
+   * 破坏 per-slot 幂等/无别名不变量。本 dep 独立,测试可注入单调计数器保证唯一。
+   */
+  slotIdFn?: () => string
   /** 注入"当前时间"(用于测试 subscription_end_at 因子);默认 `() => new Date()` */
   now?: () => Date
   /**
@@ -433,6 +503,11 @@ export interface SchedulerDeps {
    * 再 fallback `DEFAULT_MAX_CONCURRENT_PER_ACCOUNT`(10)。
    */
   maxConcurrent?: number
+  /**
+   * 泄漏槽 reaper TTL(ms)。未传则读 `ACCOUNT_SLOT_LEASE_TTL_MS`,再 fallback 30min。
+   * 经 `sanitizeSlotLeaseTtl` 夹到 [max(CODEX_SESSION_MAX_MS,30min), max(同下界,24h)]。
+   */
+  slotLeaseTtlMs?: number
 }
 
 /**
@@ -612,17 +687,32 @@ export class AccountScheduler {
   private readonly ephemeralKey: () => string
   private readonly now: () => Date
   /**
-   * 单账号 in-flight 计数。pick() 选中并准备返 token 之前 inc,
-   * release() 时 dec;归 0 就 delete 避免 Map 无限膨胀。
+   * 单账号 per-slot 租约集 — `accountId → (slotId → acquiredAtMs)`。
    *
-   * 一致性边界:本字段是进程内状态,只在同一 AccountScheduler 实例内严格
-   * 满足 inflight[id] ≤ maxConcurrent。多进程部署不会自动汇总。
+   * 取代旧的"匿名计数" `Map<accountId, number>`(B6+B7 根治):
+   *   - count(id) = inner.size;cap 判定 O(1)
+   *   - acquireSlot(id) 发唯一 slotId + 记 acquiredAtMs;releaseSlot(id, slotId) 精确还槽
+   *   - slotId 唯一不复用 → 重复/错配 release 只是幂等 no-op,绝不误伤同账号其它在途租约
+   *   - reaper 按 acquiredAtMs 兜底回收"活进程内泄漏"的槽(见 reapExpiredSlots)
    *
-   * TOCTOU 安全:`filter → pickWRH → inc` 在 pick() 循环内的一个同步块里完成,
+   * 一致性边界(B6 技术债):本字段是**进程内**状态,只在同一 AccountScheduler 实例内严格
+   * 满足 size(id) ≤ maxConcurrent。多实例(蓝绿/双 master)不汇总 → 真实上限 N×cap。
+   * 按 boss 决策**暂不建分布式租约**:双 master 仅在 hot-standby 切机瞬时出现,靠切换 SOP
+   * quiesce 账号池兜底。**偿还触发=未来转常态双活**(届时把 slot 后端做成 Redis SETNX+TTL,
+   * slotId 即天然分布式租约 key)。详见 docs/B6B7_ACCOUNT_SLOT_LEASE_DESIGN.md §6。
+   *
+   * TOCTOU 安全:`filter → pickWRH → acquireSlot` 在 pick() 循环内的一个同步块里完成,
    * 中间没有 await —— Node 单线程协作调度下两个并发 pick() 只能在 await 边界
    * 交错,因此硬上限成立。
    */
-  private readonly inflight = new Map<string, number>()
+  private readonly slots = new Map<string, Map<string, number>>()
+  /** per-slot 租约 id 生成器(独立于 ephemeralKey,保证唯一)。 */
+  private readonly slotIdFn: () => string
+  /**
+   * 泄漏槽 TTL(ms):reaper 回收 acquiredAt 早于 now-ttl 的租约。
+   * 下界 max(CODEX_SESSION_MAX_MS, 30min) 保证永远晚于 Codex bridge 600s timer,不抢跑。
+   */
+  readonly slotLeaseTtlMs: number
   /** 单账号同时 in-flight 请求上限。 */
   readonly maxConcurrent: number
 
@@ -631,28 +721,72 @@ export class AccountScheduler {
     this.keyFn = deps.keyFn ?? loadKmsKey
     this.hash = deps.hash ?? defaultHash
     this.ephemeralKey = deps.ephemeralKey ?? randomUUID
+    this.slotIdFn = deps.slotIdFn ?? randomUUID
     this.now = deps.now ?? (() => new Date())
     this.maxConcurrent = sanitizeMaxConcurrent(deps.maxConcurrent)
+    this.slotLeaseTtlMs = sanitizeSlotLeaseTtl(deps.slotLeaseTtlMs)
   }
 
   /**
    * 当前 in-flight 计数。测试/监控用;非测试路径不要依赖返回值做判断。
    */
   getInflight(accountId: bigint | string): number {
-    return this.inflight.get(String(accountId)) ?? 0
+    return this.slots.get(String(accountId))?.size ?? 0
   }
 
-  private incInflight(id: string): void {
-    this.inflight.set(id, (this.inflight.get(id) ?? 0) + 1)
+  /**
+   * 同步占一个 slot,返回唯一 slotId。**必须在 pick() 循环的无 await 块内调用**
+   * (与旧 incInflight 同位),以保住 TOCTOU 硬上限不变量。
+   */
+  private acquireSlot(id: string): string {
+    let inner = this.slots.get(id)
+    if (inner === undefined) {
+      inner = new Map<string, number>()
+      this.slots.set(id, inner)
+    }
+    let slotId = this.slotIdFn()
+    // 防御(Codex 计划审 nice-to-have):slotIdFn 被错误注入成非唯一时重试至不碰撞,
+    // 绝不 Map.set 覆盖既有 slot → under-count。randomUUID 实际碰撞概率可忽略。
+    let guard = 0
+    while (inner.has(slotId)) {
+      if (++guard > 8) {
+        throw new Error('acquireSlot: slotIdFn produced colliding ids repeatedly')
+      }
+      slotId = this.slotIdFn()
+    }
+    inner.set(slotId, this.now().getTime())
+    return slotId
   }
 
-  /** 幂等:对未计数/已归零的 id 调用无副作用、无日志噪音。 */
-  private decInflight(id: string): void {
-    const cur = this.inflight.get(id)
-    if (cur === undefined) return
-    const next = cur - 1
-    if (next <= 0) this.inflight.delete(id)
-    else this.inflight.set(id, next)
+  /** 精确还槽(幂等):删不存在的 slotId 无副作用;inner 空则删账号 entry 防 Map 膨胀。 */
+  private releaseSlot(id: string, slotId: string): void {
+    const inner = this.slots.get(id)
+    if (inner === undefined) return
+    inner.delete(slotId)
+    if (inner.size === 0) this.slots.delete(id)
+  }
+
+  /**
+   * 回收"活进程内泄漏"的槽:acquiredAt 早于 `now - slotLeaseTtlMs` 的租约。返回回收数。
+   *
+   * **不调 health tracker** —— 超时是 ambiguous(泄漏 or 合法长 turn 已被别处释放只剩残影),
+   * 按 transient_network/client_error 既定哲学不扣健康分,只释放容量。聚合回收数由 sweeper
+   * (accountSlotReaper)log,供 ops 监测泄漏率。
+   *
+   * 迭代中 delete 安全:Map 迭代删当前/已访问 key 符合 ECMAScript 规范(只有 add 会有问题)。
+   */
+  reapExpiredSlots(nowMs: number = this.now().getTime()): number {
+    let reaped = 0
+    for (const [id, inner] of this.slots) {
+      for (const [slotId, acquiredAt] of inner) {
+        if (nowMs - acquiredAt > this.slotLeaseTtlMs) {
+          inner.delete(slotId)
+          reaped += 1
+        }
+      }
+      if (inner.size === 0) this.slots.delete(id)
+    }
+    return reaped
   }
 
   /**
@@ -1052,12 +1186,14 @@ export class AccountScheduler {
     let vanished = 0
     let quarantined = 0
     while (pool.length > 0) {
-      const available = pool.filter((c) => (this.inflight.get(c.id) ?? 0) < this.maxConcurrent)
+      const available = pool.filter(
+        (c) => (this.slots.get(c.id)?.size ?? 0) < this.maxConcurrent,
+      )
       if (available.length === 0) break
 
       const chosen = pickWRH(available, wrhKey, now, this.hash)
       // 同步 reserve 槽位 —— 必须在下一个 await(getTokenForUse)之前完成
-      this.incInflight(chosen.id)
+      const slotId = this.acquireSlot(chosen.id)
       try {
         // requireActiveStatus: 把"select active pool → token decrypt"之间被另一
         // 进程 ban/disabled 的账号在 SQL 层即 fail-closed → null。null 路径继续走
@@ -1068,6 +1204,7 @@ export class AccountScheduler {
         if (tok) {
           return {
             account_id: BigInt(chosen.id),
+            slotId,
             plan: tok.plan,
             token: tok.token,
             refresh: tok.refresh,
@@ -1082,11 +1219,11 @@ export class AccountScheduler {
           }
         }
         // 账号在 SELECT 和 readToken 之间被并发删/ban/disabled,剔除再选
-        this.decInflight(chosen.id)
+        this.releaseSlot(chosen.id, slotId)
         vanished += 1
         pool = pool.filter((c) => c.id !== chosen.id)
       } catch (err) {
-        this.decInflight(chosen.id)
+        this.releaseSlot(chosen.id, slotId)
         if (err instanceof AeadError) {
           // 密文坏 —— 隔离这个账号(异步 disable 不阻塞 pick 路径),从候选剔除继续选
           void updateAccount(
@@ -1181,9 +1318,10 @@ export class AccountScheduler {
     const targetIdStr = targetId.toString()
     const chosen = pool.find((c) => c.id === targetIdStr)
     if (chosen === undefined) return null
-    if ((this.inflight.get(chosen.id) ?? 0) >= this.maxConcurrent) return null
+    if ((this.slots.get(chosen.id)?.size ?? 0) >= this.maxConcurrent) return null
 
-    this.incInflight(chosen.id)
+    // 同步 reserve 槽位 —— 与 runWRHLoop 同位,await(getTokenForUse)前完成
+    const slotId = this.acquireSlot(chosen.id)
     try {
       // requireActiveStatus: 同 runWRHLoop 路径 — pin hit 不能拿已 ban/disabled
       // 账号的 token。null → 上层判定 SessionPinTemporarilyUnavailable / fall through。
@@ -1191,11 +1329,12 @@ export class AccountScheduler {
         requireActiveStatus: true,
       })
       if (!tok) {
-        this.decInflight(chosen.id)
+        this.releaseSlot(chosen.id, slotId)
         return null
       }
       return {
         account_id: BigInt(chosen.id),
+        slotId,
         plan: tok.plan,
         token: tok.token,
         refresh: tok.refresh,
@@ -1209,7 +1348,7 @@ export class AccountScheduler {
         persona: chosen.persona,
       }
     } catch (err) {
-      this.decInflight(chosen.id)
+      this.releaseSlot(chosen.id, slotId)
       if (err instanceof AeadError) {
         void updateAccount(
           chosen.id,
@@ -1353,13 +1492,13 @@ export class AccountScheduler {
    * 释放一个已 pick 但不会被上层 release() 处理的 PickResult。
    *
    * 用于 race-lost 切换:当 caller 决定切到 winner 账号时,**手里这个**结果(losers)
-   * 已经 incInflight + 解密了 token,但不会真发请求 → 必须 dec inflight + 销毁 token,
+   * 已经 acquireSlot + 解密了 token,但不会真发请求 → 必须按 slotId 还槽 + 销毁 token,
    * 防止泄漏。
    *
    * 不调 health tracker(没真发请求,onSuccess/onFailure 都不应触发)。
    */
   private releasePickResult(r: PickResult): void {
-    this.decInflight(r.account_id.toString())
+    this.releaseSlot(r.account_id.toString(), r.slotId)
     r.token.fill(0)
     r.refresh?.fill(0)
   }
@@ -1406,10 +1545,11 @@ export class AccountScheduler {
    *   const p = await scheduler.pick({mode:"chat"});
    *   try {
    *     const r = await callClaudeApi(p.token);
-   *     await scheduler.release({account_id:p.account_id, result:{kind:"success"}});
+   *     await scheduler.release({account_id:p.account_id, slotId:p.slotId, result:{kind:"success"}});
    *   } catch (err) {
    *     await scheduler.release({
    *       account_id:p.account_id,
+   *       slotId:p.slotId,
    *       result:{kind:"failure", error:String(err)},
    *     });
    *     throw err;
@@ -1419,8 +1559,8 @@ export class AccountScheduler {
    *   ```
    */
   async release(input: ReleaseInput): Promise<void> {
-    // 先 dec inflight(幂等,健康 tracker 抛错也不能让 slot 永久占用)
-    this.decInflight(String(input.account_id))
+    // 先按 slotId 精确还槽(幂等,健康 tracker 抛错也不能让 slot 永久占用)
+    this.releaseSlot(String(input.account_id), input.slotId)
     if (input.result.kind === 'success') {
       await this.health.onSuccess(input.account_id)
     } else if (input.result.kind === 'failure') {
@@ -1435,34 +1575,35 @@ export class AccountScheduler {
    * 与 pick() 路径区别:
    *   - 不解密 token、不读 DB 之外的状态
    *   - 不调 health tracker(release 也不调)
-   *   - 仅按 maxConcurrent 卡 inflight Map
+   *   - 仅按 maxConcurrent 卡 slot 数
    *
    * 调用契约:
    *   - 每条 codex inbound 独立成对调用 acquire / release(plan G7 严格单飞)
+   *   - **返回 slotId,release 必须原样回传**(精确还槽,且让 reaper 兜底泄漏)
    *   - 抛 AccountPoolBusyError → bridge 转 error 帧 fast-fail,不 fallback
    *
-   * @throws `AccountPoolBusyError` 当 inflight[id] >= maxConcurrent
+   * @throws `AccountPoolBusyError` 当 slot 数 >= maxConcurrent
    */
-  acquireCodexSlot(account_id: bigint | string): void {
+  acquireCodexSlot(account_id: bigint | string): string {
     const id = String(account_id)
-    const cur = this.inflight.get(id) ?? 0
+    const cur = this.slots.get(id)?.size ?? 0
     if (cur >= this.maxConcurrent) {
       throw new AccountPoolBusyError(
         `codex account ${id} at per-account concurrency cap (max=${this.maxConcurrent})`,
       )
     }
     // 与 pick() 同步块语义一致 —— 当前 fn 是 sync,确实在 await 边界之外完成
-    this.incInflight(id)
+    return this.acquireSlot(id)
   }
 
   /**
-   * 释放一个 codex per-account 并发槽(幂等)。
+   * 释放一个 codex per-account 并发槽(按 slotId 精确还,幂等)。
    *
    * 不调 health.onSuccess / onFailure(plan 决策 J2:bridge 用真实 turn 出参
    * 决定健康分,不在这里挂)。
    */
-  releaseCodexSlot(account_id: bigint | string): void {
-    this.decInflight(String(account_id))
+  releaseCodexSlot(account_id: bigint | string, slotId: string): void {
+    this.releaseSlot(String(account_id), slotId)
   }
 }
 

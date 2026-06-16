@@ -130,6 +130,12 @@ export function validateUpstreamConfig(
 export interface PreparedUpstreamSession {
   /** account_pool account_id;`null` = 静态 key 路径(deepseek/minimax/ark,无 OAuth 池) */
   readonly accountId: bigint | null;
+  /**
+   * pick() 的 per-slot 租约 id。OAuth 路径 = pick.slotId(非 null);
+   * 静态 key 路径(deepseek/minimax/ark,无池)= null。release/finalizer 必须按此精确还槽。
+   * 不变量:accountId 与 slotId 同生死 —— 两者皆非 null 或皆 null。
+   */
+  readonly slotId: string | null;
   /** 反风控锚定 device_id;`null` = 静态 key 路径 */
   readonly pinnedUserId: string | null;
   /** 上游 URL;OAuth = `deps.upstreamEndpoint ?? DEFAULT`;静态 = `spec.upstreamEndpoint` */
@@ -302,6 +308,7 @@ function makeStaticKeyUpstream(
 ): PreparedUpstreamSession {
   return {
     accountId: null,
+    slotId: null,
     pinnedUserId: null,
     endpoint: spec.upstreamEndpoint,
     dispatcher: undefined,
@@ -338,6 +345,7 @@ function makeOAuthPoolUpstream(
   let zeroized = false;
   return {
     accountId: pick.account_id,
+    slotId: pick.slotId,
     pinnedUserId: pick.pinned_user_id,
     endpoint,
     dispatcher,
@@ -602,6 +610,7 @@ export async function pickUpstream(
     await deps.scheduler
       .release({
         account_id: pick.account_id,
+        slotId: pick.slotId,
         result: { kind: "failure", error: "account_uuid_null_in_fail_closed" },
       })
       .catch(() => {
@@ -653,6 +662,7 @@ export async function pickUpstream(
       await deps.scheduler
         .release({
           account_id: pick.account_id,
+          slotId: pick.slotId,
           result: { kind: "transient_network", error: "egress_unavailable" },
         })
         .catch(() => {
@@ -705,6 +715,9 @@ export async function pickUpstream(
         }
         pick = {
           account_id: pick.account_id,
+          // refresh rebind:槽未释放(同账号仅换 token)→ slotId 必须原样保留,
+          // 否则 finalizer 拿不到 slotId → 还槽失败 → 泄漏(B7 自伤)。
+          slotId: pick.slotId,
           plan: pick.plan,
           token: r.token,
           refresh: r.refresh,
@@ -738,6 +751,7 @@ export async function pickUpstream(
         await deps.scheduler
           .release({
             account_id: pick.account_id,
+            slotId: pick.slotId,
             result: isTransient
               ? { kind: "transient_network", error: errMessageShort(err) }
               : { kind: "failure", error: errMessageShort(err) },
@@ -780,6 +794,7 @@ export async function pickUpstream(
     await deps.scheduler
       .release({
         account_id: pick.account_id,
+        slotId: pick.slotId,
         result: { kind: "failure", error: errMessageShort(err) },
       })
       .catch(() => {
@@ -821,9 +836,15 @@ export async function releaseUpstreamSession(
   reason: { kind: "failure"; error: string },
   log: Logger,
 ): Promise<void> {
-  if (session.accountId === null) return;
+  // accountId 与 slotId 同生死(OAuth 两者非 null;DeepSeek/MiniMax 两者 null)。
+  // 配对判 null 既保 DeepSeek noop 语义,又让 TS 收窄 slotId 为非 null(避免裸 `!`)。
+  if (session.accountId === null || session.slotId === null) return;
   try {
-    await scheduler.release({ account_id: session.accountId, result: reason });
+    await scheduler.release({
+      account_id: session.accountId,
+      slotId: session.slotId,
+      result: reason,
+    });
   } catch (err) {
     log.warn("proxy_release_upstream_failed", { err: errSummary(err) });
   }

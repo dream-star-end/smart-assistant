@@ -396,6 +396,7 @@ function buildFakeScheduler(initialSpec: PickSpec | null = {}, releaseOrder?: st
         createHash("sha256").update("test-device").digest("hex");
       return {
         account_id: pickSpec.account_id ?? 1001n,
+        slotId: "slot-test",
         plan: "pro",
         token: Buffer.from("FAKE-TOKEN-VALUE"),
         refresh: null,

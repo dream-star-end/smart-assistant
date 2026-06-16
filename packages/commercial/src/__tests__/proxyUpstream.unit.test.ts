@@ -58,6 +58,7 @@ const PINNED_BAD = "not-hex-bad-length"; // schema breach
 function makePick(over: Partial<PickResult> = {}): PickResult {
   return {
     account_id: 7n,
+    slotId: "slot-test-7",
     plan: "pro",
     token: Buffer.from("AAAA-old-token", "utf8"),
     refresh: Buffer.from("BBBB-old-refresh", "utf8"),

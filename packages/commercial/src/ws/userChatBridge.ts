@@ -372,8 +372,8 @@ export interface UserChatBridgeDeps {
    *   - acquire 抛 `AccountPoolBusyError` → bridge fast-fail(决策 O):error 帧
    *     "codex pool busy",**不 fallback 到 legacy**
    *   - acquire 抛其他 → bridge fast-fail "GPT temporarily unavailable"
-   *   - `release(account_id)` 必须用 acquire 时记录的 account_id(决策 N2 MAJOR 3:
-   *     不重读 row,防 lazy migrate 漂移导致 release 减错账号槽)
+   *   - `release(account_id, slotId)` 必须用 acquire 时记录的 (account_id, slotId)(决策 N2
+   *     MAJOR 3:不重读 row,防 lazy migrate 漂移;slotId 精确还槽,不误伤同账号其它在途槽)
    *
    * **G7 严格单飞**:bridge 内部维护 per-bridge "已持槽" 状态;新 inbound 命中已持
    * 状态 → reject "previous codex turn still in progress"(error 帧),不复用 slot
@@ -437,8 +437,10 @@ export interface UserChatBridgeDeps {
  * onFailure(决策 J2:bridge 不知道真实 turn 出参,健康分留给 release 层)。幂等。
  */
 export interface CodexBindingHandle {
-  acquire(containerId: number, groupId?: string | null): Promise<{ account_id: bigint } | null>;
-  release(account_id: bigint): void;
+  /** 成功返回 {account_id, slotId};legacy NULL 容器返 null。slotId 为 per-slot 租约 id。 */
+  acquire(containerId: number, groupId?: string | null): Promise<{ account_id: bigint; slotId: string } | null>;
+  /** 必须用 acquire 时记录的 (account_id, slotId) 成对还槽(精确 + reaper 兜底)。 */
+  release(account_id: bigint, slotId: string): void;
 }
 
 export interface CodexApiRelayRoute {
@@ -1185,6 +1187,9 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     //   codexReleaseTimer → CODEX_SESSION_MAX_MS 兜底释放(决策 G6),防 outbound 丢/
     //     ws 异常断后槽永久泄漏
     let acquiredCodexAccountId: bigint | null = null;
+    // B7 per-slot 租约 id,与 acquiredCodexAccountId 同生死(成对 set/reset)。
+    // release 必须传它精确还槽;reaper 兜底"timer 也没跑到"的极端泄漏。
+    let acquiredCodexSlotId: string | null = null;
     let codexAcquireInflight = false;
     let codexApiRelayTurnInFlight = false;
     let codexApiRelayRouteToken: string | null = null;
@@ -1761,9 +1766,10 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             clearTimeout(codexReleaseTimer);
             codexReleaseTimer = null;
           }
-          if (acquiredCodexAccountId !== null && codexBinding !== undefined) {
-            try { codexBinding.release(acquiredCodexAccountId); } catch { /* */ }
+          if (acquiredCodexAccountId !== null && acquiredCodexSlotId !== null && codexBinding !== undefined) {
+            try { codexBinding.release(acquiredCodexAccountId, acquiredCodexSlotId); } catch { /* */ }
             acquiredCodexAccountId = null;
+            acquiredCodexSlotId = null;
           }
           expireActiveCodexRoute("failure");
           codexApiRelayTurnInFlight = false;
@@ -1817,7 +1823,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               }
             }
 
-            let acquired: { account_id: bigint } | null = null;
+            let acquired: { account_id: bigint; slotId: string } | null = null;
             if (codexRoute === null) {
               if (codexBinding === undefined) {
                 throw Object.assign(new Error("no enabled Codex API relay group"), { name: "CodexRouteUnavailable" });
@@ -1833,7 +1839,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 expireCodexRouteToken(codexRoute.token, "cleanup_during_route_creation");
               }
               if (acquired !== null && codexBinding !== undefined) {
-                try { codexBinding.release(acquired.account_id); } catch { /* */ }
+                try { codexBinding.release(acquired.account_id, acquired.slotId); } catch { /* */ }
               }
               return;
             }
@@ -1853,12 +1859,14 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               // (acquire() 内部 row 查很轻),持续保持每轮扣费。
             } else {
               acquiredCodexAccountId = acquired.account_id;
+              acquiredCodexSlotId = acquired.slotId;
               codexInboundPeerId = peerIdForAcquire;
               codexReleaseTimer = setTimeout(() => {
                 // 兜底释放:防 outbound 完成信号丢 / ws 异常断 → 槽永久泄漏
-                if (acquiredCodexAccountId !== null && codexBinding !== undefined) {
-                  try { codexBinding.release(acquiredCodexAccountId); } catch { /* */ }
+                if (acquiredCodexAccountId !== null && acquiredCodexSlotId !== null && codexBinding !== undefined) {
+                  try { codexBinding.release(acquiredCodexAccountId, acquiredCodexSlotId); } catch { /* */ }
                   acquiredCodexAccountId = null;
+                  acquiredCodexSlotId = null;
                 }
                 codexApiRelayTurnInFlight = false;
                 codexInboundPeerId = null;
@@ -2656,15 +2664,17 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             const isErr = obj.type === "outbound.error";
             if ((isFinalMsg || isErr) && peerId !== null && peerId === codexInboundPeerId) {
               const accountId = acquiredCodexAccountId;
+              const slotId = acquiredCodexSlotId;
               acquiredCodexAccountId = null;
+              acquiredCodexSlotId = null;
               codexApiRelayTurnInFlight = false;
               codexInboundPeerId = null;
               if (codexReleaseTimer !== null) {
                 clearTimeout(codexReleaseTimer);
                 codexReleaseTimer = null;
               }
-              if (accountId !== null && deps.codexBinding !== undefined) {
-                try { deps.codexBinding.release(accountId); } catch { /* swallow */ }
+              if (accountId !== null && slotId !== null && deps.codexBinding !== undefined) {
+                try { deps.codexBinding.release(accountId, slotId); } catch { /* swallow */ }
               }
               expireActiveCodexRoute(isFinalMsg ? "turn_final" : "turn_error");
             }
@@ -3009,9 +3019,10 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         clearTimeout(codexReleaseTimer);
         codexReleaseTimer = null;
       }
-      if (acquiredCodexAccountId !== null && deps.codexBinding) {
-        try { deps.codexBinding.release(acquiredCodexAccountId); } catch { /* */ }
+      if (acquiredCodexAccountId !== null && acquiredCodexSlotId !== null && deps.codexBinding) {
+        try { deps.codexBinding.release(acquiredCodexAccountId, acquiredCodexSlotId); } catch { /* */ }
         acquiredCodexAccountId = null;
+        acquiredCodexSlotId = null;
       }
       expireActiveCodexRoute("bridge_cleanup");
       codexApiRelayTurnInFlight = false;

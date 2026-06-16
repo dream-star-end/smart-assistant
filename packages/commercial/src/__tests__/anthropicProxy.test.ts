@@ -877,14 +877,15 @@ describe("isClientAbort", () => {
 
 describe("makeFinalizer.failClient → scheduler.release 走 client_error", () => {
   test("fail vs failClient:同样写 abort journal,但 release.kind 区分", async () => {
-    type ReleaseCall = { account_id: bigint | string; kind: string; error?: string | null };
+    type ReleaseCall = { account_id: bigint | string; slotId: string; kind: string; error?: string | null };
     const releaseCalls: ReleaseCall[] = [];
     const queriedSql: string[] = [];
 
     const stubScheduler = {
-      release: async (input: { account_id: bigint | string; result: { kind: string; error?: string | null } }) => {
+      release: async (input: { account_id: bigint | string; slotId: string; result: { kind: string; error?: string | null } }) => {
         releaseCalls.push({
           account_id: input.account_id,
+          slotId: input.slotId,
           kind: input.result.kind,
           error: input.result.error ?? null,
         });
@@ -907,6 +908,7 @@ describe("makeFinalizer.failClient → scheduler.release 走 client_error", () =
       userId: 1n,
       containerId: 0n,
       accountId: 42n,
+      slotId: "slot-test",
       model: "claude-sonnet-4-6",
       pricing: sonnet,
       precheckCredits: 100n,
@@ -927,6 +929,7 @@ describe("makeFinalizer.failClient → scheduler.release 走 client_error", () =
     assert.equal(releaseCalls.length, 1);
     assert.equal(releaseCalls[0].kind, "client_error");
     assert.equal(releaseCalls[0].account_id, 42n);
+    assert.equal(releaseCalls[0].slotId, "slot-test"); // B7:slotId 透传到 scheduler.release
 
     // 2) fail (control) → release.kind === 'failure'
     const f2 = makeFinalizer(

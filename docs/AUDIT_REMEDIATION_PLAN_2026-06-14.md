@@ -48,9 +48,9 @@
 | R3 | 客户端 idempotencyKey 防重放重复计费 | 实时/资金 | P1 | 6 | W4 | 无 | ⬜ 随 A1 |
 | A5 | 前端 `checkJs` + 消除 DI 隐式环 | 架构 | P1 | 4 | W4 | 无 | ⬜ A4 前置 |
 | A4 | god-file 拆分（websocket/handleOutbound 注册表/admin） | 架构 | P1 | 5 | W4 | 无（纯重构） | ⬜ A5 之后 |
-| B6 | per-account 并发上限改分布式租约 | 正确性 | P2 | 11 | W5 | 无 | ⬜ |
-| B7 | Claude inflight slot TTL reaper | 正确性 | P2 | 11 | W5 | ↑（少误 429） | ⬜ |
-| B9 | auth rate-limiter Redis down 优雅降级 | 可用性 | P3 | 14 | W5 | ↑ | ⬜ |
+| B6 | per-account 并发上限（统一 per-slot 租约；分布式暂不建=技术债） | 正确性 | P2 | 11 | W5 | 无 | ✅ PASS（Codex 计划审+代码审；单 master 计数根治，双 master 留技术债） |
+| B7 | Claude inflight slot TTL reaper（per-slot 租约 + reaper） | 正确性 | P2 | 11 | W5 | ↑（少误 429） | ✅ PASS（Codex 计划审 2 轮 APPROVE + 代码审 PASS） |
+| B9 | auth rate-limiter Redis down 优雅降级 | 可用性 | P3 | 14 | W5 | ↑ | ✅ PASS（Codex 2 轮） |
 
 状态图例：⬜ 未开始 / 🟡 进行中(含子状态) / 🔵 待 Codex / ✅ PASS 已合并。
 
@@ -196,6 +196,21 @@
   - **仍待办:B4(Go node-agent)单独 rollout** —— deploy-v3.sh 只部署 master;B4 改的是 `packages/commercial/node-agent/**`(Go),需另走 node-agent build+distribute+restart 流水线(非 P0,容器 stop/remove/inspect 缺失返真 404 的正确性修复),建议作为独立 ops 操作或与下次 node-agent 改动合并。
 - 2026-06-15:**A1 设计文档完成,Codex 计划审 APPROVE(3 轮 REVISE→APPROVE)**,见 `docs/A1_TURN_LIFECYCLE_DESIGN.md`。Explore agent 实测映射:3 套并行 in-flight 表示(`sess._sendingInFlight` 17R/16W、被独立赋值的派生量 `state.sendingInFlight` 16R/14W、`_reconnectInFlightSet`)+ teardown 复制 11 处(仅 isFinal 完整)+ 帧↔turn 靠跨时钟域 ts 比较(自承认设备钟快>5s 丢 final)。设计:客户端 `turnLifecycle.js` `sess.turn` 单一真相 + `beginTurn/endTurn(reason,{finalize})` reason 策略 + UI/transport 读点分层(非一刀切派生 getter);server `clientTurnId`(client-mint 全链路 echo,含商业 bridge)+ per-turn binding mode(capability 协商,未确证→legacy,杜绝混用)。Codex 关键修正已纳入:派生 getter 会破坏 reconnect UI 抑制(1829)→改分层 + 镜像过渡;非 final 不得自动定稿流式行→finalize 三策略(full/flushOnly/none);bridge echo + 合成帧 turnId 规则;full finalize 须抽完整有序阶段(2441+2997)。
   - **实现待办(本环境无法 headless 完成的硬前置)**:A1 验收门是**dev 起站 + 浏览器逐条流式 smoke**(P1-P6:打字指示器/停止按钮/流式增量/重连恢复/切会话/弱网),headless 无法验证可见流式体验。按 Codex 建议 Phase 1 起(1a facade+镜像零行为变 → 1b reason 策略 teardown → 1c UI getter 分层),每子步浏览器 smoke。**留待具备 dev/浏览器的会话实现,或由用户在每子步跑 smoke。**
+- 2026-06-15:**移动端紧急修复 + 上线 v1.0.324**(`81b3a369`→`dc9e4d68`)。boss 报修:iOS 软键盘弹出 → 输入框被顶到屏顶、思考深度选择行切出屏外、下方留白。根因:iOS Safari 键盘 overlay/pan(`visualViewport.offsetTop>0`)不缩 layout,原代码只同步 height、shell 锚 layout 顶 → 跑到可见区上方。修复:main.js 同步 `--oc-visual-viewport-offset-top`,style.css 权威 `.app`(refreshed-app 块)`position:relative→fixed; top=offsetTop`,把 chat shell 钉到可见 visual viewport(offsetTop=0 桌面态等价原布局,纯加法)。Codex PASS;web 测全绿;待 boss iOS 真机确认(本环境无 iOS Safari)。
+- 2026-06-15:**B9(auth rate-limiter Redis-down 优雅降级)完成,Codex PASS(2 轮)**。根因:`enforceRateLimit`(唯一 choke point,register/login/reset/refresh/verify/feedback/payment/oauth 共用)调 `checkRateLimit` 内 `redis.incr` 无兜底 → Redis 挂即 throw → 鉴权全 500。修复:try/catch 包 checkRateLimit,Redis 错误 → 降级到 per-process `FallbackRateLimiter`(复用聊天代理同类;cap=ceil(max/3)"降级而非开闸";键 scope+window+max+keyPrefix);Redis 正常路径逐字节不变。Codex 修正:identifier 校验前置到 try 外(非法即抛、不被兜底掩盖)、keyPrefix 纳入键。测试 enforceRateLimitFallback 5/5 + rateLimit 12/12;authRateLimit.integ 2/4 失败经 baseline 对比确认为预存在环境问题(非本改动)。master-only,无需 runtime image。
+- 2026-06-15:**B6+B7 深入调研完成,判定为 hot-path 高风险、需 design-doc + Codex plan 先行(同 A1/A3 规格),不在长会话尾部仓促实现**。关键发现:
+  - 两者同源,都围绕 `account-pool/scheduler.ts` 的 `inflight: Map<string, number>`(**仅计数、无 per-slot 身份**,进程内)。
+  - **B7(reaper)**:Codex 侧是 ws bridge 内**每-turn 安全 setTimeout**(`codexReleaseTimer` 600s,正常完成清除,信号丢/ws 异常断时兜底 release,见 userChatBridge.ts:1843-1867)。Claude 侧 release 分散在 `http/proxy/upstream.ts`(pick@549 + release@612/663/748/790)**+ 流式完成的 caller**,不是单一闭包;且计数模型无 per-slot 身份 → **正确的 TTL 回收必须给 `pick()`/`release()` 契约加 slot-token**(否则匿名时间戳无法对应具体活跃请求,reaper 会误回收活跃槽 → 过并发)。
+  - **B6(分布式)**:同一 inflight 跨实例不汇总 → 蓝绿/双 master 真实上限 N×cap。生产稳态是单 master,N×cap 仅在 **hot-standby 迁移**的瞬时双 master 期出现(且该迁移有独立 SOP,可在切换窗口 quiesce 账号池)。
+  - **统一根治方向(推荐)**:把 scheduler inflight 改成 **per-slot 租约**(pick 发 slot-token、release 按 token、每 slot 记 acquireTime),则:① per-slot 身份 → 正确 release + 正确 TTL 回收(根治 B7);② 给 token 加 600s TTL → 兜底回收(对齐 Codex);③ 可选 Redis 后端 + Redis-down 回退 in-memory(根治 B6 多实例,复用 B9 的"降级而非开闸"哲学)。**B6 也有更轻的备选:硬启动守卫/leader 选举**(只让一个实例持账号池),复杂度低但牺牲双活——属设计取舍,建议 boss 拍板"分布式租约 vs 启动守卫"。
+- 2026-06-15:**B6+B7 统一完成,Codex 计划审(2 轮 REVISE→APPROVE)+ 代码审 PASS**。设计见 `docs/B6B7_ACCOUNT_SLOT_LEASE_DESIGN.md`。boss 拍板方案 1(per-slot 租约 + 切机 quiesce 兜底,分布式租约暂不建=技术债,偿还触发=常态双活)。
+  - 根治:`scheduler.inflight: Map<id,number>`(匿名计数)→ `slots: Map<id, Map<slotId, acquiredAtMs>>`(具名租约)。`acquireSlot`(同步 mint slotId+碰撞防御)/`releaseSlot`(按 slotId 精确还、幂等)/`reapExpiredSlots`(返回回收数、不调 health);`slotIdFn` dep(默认 randomUUID,独立于 ephemeralKey);`PickResult.slotId`/`ReleaseInput.slotId` 必填(tsc 编译期强制全量 caller 更新)。一改根治:B7(Claude 侧补 reaper,对齐 Codex bridge timer 的对称性破坏)+ release 精度 bug(双重/错配 release 不再误伤同账号其它活跃槽)+ B6 单 master 计数正确。
+  - 全链路 slotId 透传:Claude(pick→PreparedUpstreamSession→makeFinalizer→FinalizeContext→proxyBilling release;refresh rebind 保留;4 处早 release + releaseUpstreamSession 配对判 null)+ Codex(acquireCodexSlot 返回→bridge `acquiredCodexSlotId` 成对 set/reset→5 处 release+codexReleaseTimer 透传)。新增 `accountSlotReaper.ts`(SweeperHandle 60s,index.ts wire+shutdown stop)。TTL floor=max(CODEX_SESSION_MAX_MS,30min)、ceil=max(floor,24h),偏向 under-reap。
+  - Codex 计划审 Blocking(已修):①slotId 不复用 ephemeralKey ②finalizer 在 proxyBilling.ts:359 非 core.ts ③漏 pickPinnedAccount 直接 inflight 路径 ④TTL clamp 矛盾。代码审 PASS(0 blocking;3 处旧签名注释已顺手更新)。
+  - 验证:tsc 改动文件 0 error(全部剩余 commercial/src 错误经核在未触碰文件且无一引用本改动类型=0 新增);biome 逐文件 base-vs-worktree 全相等=0 新增;单测 accountScheduler+accountSlotReaper 62/62、proxyUpstream+anthropicProxy(含 finalizer slotId 透传断言)181/181;**真 PG integ accountScheduler.integ 46/46**(release(slotId)/cap/health 全用例)+ anthropicProxy/apiKeyAdmin.integ 通过;ccExternalEndpoint H1.2 与 userChatBridgeCodexBilling close-code 两处失败经 stash 复核**在 base 上失败完全相同=预存,与本改动无关**。
+  - **B6 技术债登记**:双 master 真实上限 N×cap 仅 hot-standby 切机瞬时窗口出现,靠切换 SOP quiesce 账号池兜底;`slots` 字段注释已标 + design-doc §6;偿还触发=未来转常态双活(届时把 slot 后端做 Redis SETNX+TTL,slotId 即天然分布式租约 key)。
+  - **未部署**:worktree commit,等 boss 批准后按 v3-commercial-deploy 合并 canonical + deploy-v3.sh(master-only,无需 runtime image)。
 - 下一步(按"可否 headless 完成"分流):
-  - **headless 可完成**(同 A3/B1/B3 范式,有 PG/Redis 可 integ 测):**W5 B6**(per-account 并发分布式租约)、**B7**(Claude inflight slot TTL reaper)、**B9**(auth rate-limiter Redis-down 降级);**A5**(前端 checkJs 消环,tsc 可验)、**A4**(god-file 拆分,单测可验)。
+  - **headless 可完成但属大型重构**:**A5**(前端 checkJs 消环——实测 45 模块/36k 行/10 处 DI 注入环/开 checkJs 暴露 578 类型错误,需 6-8 会话分阶段,A4 前置)、**A4**(god-file 拆分,单测可验,大面积移动)。
   - **需 dev/浏览器验证**(流式/多标签/IDB 可见行为):**A1 实现**、**R1/R2/R3**(多标签协调 / IDB 迁移 / 客户端幂等)。
+  - **独立 ops**:B4 Go node-agent rollout(非 P0)。
