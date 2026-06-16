@@ -49,6 +49,10 @@ export interface ModelChoice {
 export function defaultModels(): ModelChoice[] {
   return [
     { id: 'claude-opus-4-8', label: 'Opus 4.8', efforts: ['high', 'xhigh', 'max'] },
+    // Opus 4.7 is the current default agent model on this install — keep it in
+    // the seed so the picker lists it AND the thinking-depth control stays
+    // available on the default model (preserves the legacy 编码/科研模式 = xhigh/max).
+    { id: 'claude-opus-4-7', label: 'Opus 4.7', efforts: ['xhigh', 'max'] },
     { id: 'claude-sonnet-4-6', label: 'Sonnet 4.6', efforts: ['high', 'xhigh'] },
     { id: 'claude-haiku-4-5', label: 'Haiku 4.5' },
   ]

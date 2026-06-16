@@ -89,7 +89,7 @@ import {
   reloadAgents,
   renderAgentDropdown,
   renderAgentsManagementList,
-} from './agents.js?v=4'
+} from './agents.js?v=5'
 
 // ── Sessions ──
 import {
@@ -126,7 +126,7 @@ import {
   setMessageDeps,
   updateMessageEl,
   updateSessionSub,
-} from './messages.js?v=44'
+} from './messages.js?v=45'
 
 // ── WebSocket ──
 import {
@@ -168,7 +168,7 @@ import {
   showSlashPopup,
   slashPopupVisible,
 } from './commands.js?v=8'
-import { getEffortForSubmit, initModePills, renderModePills } from './effortMode.js'
+import { getEffortForSubmit, initModePills, renderModePills } from './effortMode.js?v=1'
 import {
   getGoalModeForSubmit,
   initGoalModePanel,
@@ -183,7 +183,7 @@ import {
 } from './officialTerminal.js?v=16'
 import { getConversationModeForSubmit } from './planMode.js?v=4'
 import { initPlanPanel } from './planPanel.js?v=3'
-import { initResearchTools, renderResearchTools } from './researchTools.js'
+import { initResearchTools, renderResearchTools } from './researchTools.js?v=1'
 
 // ═══════════════════════════════════════════════════════════
 // 1. Wire late-bound dependencies

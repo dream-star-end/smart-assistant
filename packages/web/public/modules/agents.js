@@ -1,10 +1,10 @@
 import { apiGet, apiJson } from './api.js'
 // OpenClaude — Agents
 import { $, htmlSafeEscape } from './dom.js'
-import { renderModePills } from './effortMode.js'
+import { renderModePills } from './effortMode.js?v=1'
 import { renderGoalModePanel } from './goalMode.js?v=3'
 import { renderModelPicker } from './modelMode.js'
-import { renderResearchTools } from './researchTools.js'
+import { renderResearchTools } from './researchTools.js?v=1'
 import { getSession, state } from './state.js'
 import { closeModal, openModal, toast } from './ui.js'
 
