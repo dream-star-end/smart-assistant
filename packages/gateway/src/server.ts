@@ -962,14 +962,12 @@ export class Gateway {
         this.log.warn('pending permission sweep failed', undefined, err)
       }
     }, Gateway.PENDING_PERMISSION_SWEEP_MS)
-    // Materialize current token to runtime file BEFORE kicking off refresh,
-    // and await it. Two reasons:
-    //   1) Any ccb subprocess spawned during boot has a file to read.
-    //   2) Avoids a stale-overwrite race where refresh writes the new token
-    //      first, then this fire-and-forget sync (reading deps.config snapshot
-    //      from before refresh updated it) overwrites it with the old value.
+    // Purge any legacy CCB-era runtime OAuth token sidecar at boot. The official
+    // claude engine reads CLAUDE_CODE_OAUTH_TOKEN from the spawn env, not a file,
+    // so we just make sure no stale sensitive token is left on disk.
     await this.syncRuntimeOauthTokenFromConfig().catch(() => {})
-    // Check refresh on boot. Will write the file again if it actually rotates.
+    // Check refresh on boot (updates config; running subprocesses pick up the
+    // fresh token on their next restart via the 401/AUTH_ERROR retry path).
     this.refreshClaudeOAuthIfNeeded().catch(() => {})
 
     await new Promise<void>((res) => {
