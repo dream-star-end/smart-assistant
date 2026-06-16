@@ -179,7 +179,7 @@ import {
   applyTerminalTheme,
   initOfficialClaudeTerminal,
   openOfficialClaudeTerminal,
-} from './officialTerminal.js?v=15'
+} from './officialTerminal.js?v=16'
 import { getConversationModeForSubmit } from './planMode.js?v=4'
 import { initPlanPanel } from './planPanel.js?v=3'
 import { initResearchTools, renderResearchTools } from './researchTools.js'
