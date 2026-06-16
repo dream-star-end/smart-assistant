@@ -1,8 +1,8 @@
-import { apiGet, apiJson } from './api.js?v=9bffe072'
-import { $, htmlSafeEscape } from './dom.js?v=9bffe072'
-import { scheduleSaveFromUserEdit } from './sessions.js?v=9bffe072'
-import { state } from './state.js?v=9bffe072'
-import { confirmDialog, toast, toastOptsFromError } from './ui.js?v=9bffe072'
+import { apiGet, apiJson } from './api.js?v=fbeead85'
+import { $, htmlSafeEscape } from './dom.js?v=fbeead85'
+import { scheduleSaveFromUserEdit } from './sessions.js?v=fbeead85'
+import { state } from './state.js?v=fbeead85'
+import { confirmDialog, toast, toastOptsFromError } from './ui.js?v=fbeead85'
 
 const TEAM_ID_RE = /^[a-zA-Z0-9_-]+$/
 export const SELECTED_TEAM_KEY = 'openclaude_selected_team'
