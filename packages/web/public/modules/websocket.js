@@ -273,6 +273,15 @@ if (typeof window !== 'undefined') {
 const THINKING_SAFETY_MS = 10 * 60_000
 const _thinkingTimers = new Map() // sessId -> timeoutId
 
+// ── Reconnect REST-reconcile grace ──
+// After a reconnect, the hello handshake lets the gateway replay buffered
+// frames (autoResumeFromHello, fast path). We wait this long for that replay to
+// deliver before falling back to a forced REST sync for sessions that were
+// mid-turn at reconnect. Long enough for a healthy replay to win (so the sync
+// no-ops); short enough that a silent replay miss doesn't leave the transcript
+// blank for long. See the onopen safety-net block for the full rationale.
+const RECONNECT_RECONCILE_GRACE_MS = 4000
+
 function _normalizeActiveTeamRun(teamRun) {
   if (!teamRun || typeof teamRun !== 'object') return null
   const leaderAgentId = typeof teamRun.leaderAgentId === 'string' ? teamRun.leaderAgentId.trim() : ''
@@ -1771,6 +1780,63 @@ export function connect() {
     // v1.0.94 Bug② 修:hello 发完后 flush 任何待确认 bind 帧。
     // 覆盖"PUT 时 ws 未 OPEN 丢帧 + 用户不切会话/不刷新"导致的永久 pending。
     try { _flushPendingRepoBinds() } catch {}
+    // ── Safety net: REST-reconcile sessions that were mid-turn at reconnect ──
+    // The hello above lets the gateway replay buffered outbound frames
+    // (autoResumeFromHello, the fast path). But that ring-buffer replay can
+    // silently miss the in-flight turn *without* emitting `outbound.resume_failed`
+    // — observed on mobile reconnects through the master user-chat-bridge during
+    // long (team deep-thinking) turns: the bridge tears down repeatedly, the
+    // live stream never resumes, and the transcript stays blank until the user
+    // manually refreshes. handleResumeFailed only covers the case where the
+    // gateway *does* emit resume_failed, so it doesn't catch this. Here we
+    // proactively pull the server-authored persisted state — exactly what a
+    // page-load / refresh does — for any session that was mid-turn when we
+    // dropped, after a short grace window for the fast replay to win.
+    //
+    // Gated on `_lastFrameAt < reconnect time`: if the replay (or any live
+    // outbound.message blocks/isFinal or turn_status frame) has updated
+    // `_lastFrameAt` since this onopen, we skip — no redundant GET, no flicker.
+    // When we do sync, `_mergeServerAuthoredIntoLocal` is
+    // server-authoritative + idempotent, so a sync that races a working stream
+    // reconciles cleanly. Mirrors handleResumeFailed's recovery, but proactive.
+    if (state._reconnectInFlightSet && state._reconnectInFlightSet.size > 0) {
+      const _reconnectAt = Date.now()
+      const _reconcileSet = new Set(state._reconnectInFlightSet)
+      if (state._reconnectReconcileTimer) clearTimeout(state._reconnectReconcileTimer)
+      state._reconnectReconcileTimer = setTimeout(() => {
+        state._reconnectReconcileTimer = null
+        // Only act if THIS connection is still the live one: a rapid drop+reopen
+        // installs a newer ws (with its own timer); don't let a stale timer
+        // reconcile against an unrelated connection.
+        if (state.ws !== ws || ws.readyState !== 1) return
+        let anyFlagged = false
+        for (const sessId of _reconcileSet) {
+          const s = state.sessions.get(sessId)
+          // Only reconcile sessions still mid-turn whose live stream hasn't
+          // delivered anything on this connection (fast replay didn't cover it).
+          if (s?._sendingInFlight && (!s._lastFrameAt || s._lastFrameAt < _reconnectAt)) {
+            s._liveStreamBroken = true // make syncSessionsFromServer refetch despite in-flight
+            anyFlagged = true
+          }
+        }
+        if (!anyFlagged) return // fast replay already delivered — nothing to back-fill
+        maybeSyncNow({
+          force: true,
+          freshAfterInFlight: true,
+          onResult: (result) => {
+            if (!result) return
+            for (const sessId of _reconcileSet) {
+              const live = state.sessions.get(sessId)
+              if (live) live._liveStreamBroken = false
+            }
+            try { _deps.renderSidebar() } catch {}
+            if (result.needsRenderMessages || _reconcileSet.has(state.currentSessionId)) {
+              try { _deps.renderMessages() } catch {}
+            }
+          },
+        })
+      }, RECONNECT_RECONCILE_GRACE_MS)
+    }
     // Flush offline queue — delay drain start to let hello/resume isFinals arrive first.
     // This prevents a resumed turn's isFinal from being mistaken for a drain response.
     if (state._offlineDrainTimer) clearTimeout(state._offlineDrainTimer)
@@ -1825,6 +1891,7 @@ export function connect() {
     if (state._offlineDrainTimer) { clearTimeout(state._offlineDrainTimer); state._offlineDrainTimer = null }
     if (state._drainTimeout) { clearTimeout(state._drainTimeout); state._drainTimeout = null }
     if (state._reconnectInFlightTimer) { clearTimeout(state._reconnectInFlightTimer); state._reconnectInFlightTimer = null; state._reconnectInFlightSet = null }
+    if (state._reconnectReconcileTimer) { clearTimeout(state._reconnectReconcileTimer); state._reconnectReconcileTimer = null }
     setStatus('已断线', 'disconnected')
     // Only clear global UI sending state — keep per-session _sendingInFlight
     // so that after reconnect + hello/resume, sessions can restore their loading state
