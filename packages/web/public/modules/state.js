@@ -8,6 +8,7 @@ export const state = {
   reconnectTimer: null,
   sendingInFlight: false,
   agentsList: [],
+  modelsList: [], // composer 模型选择器选项(来自 /api/agents 响应的 models)
   defaultAgentId: 'main',
   attachments: [],
   recognition: null,

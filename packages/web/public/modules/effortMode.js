@@ -1,26 +1,25 @@
-// OpenClaude — 思考强度 pill(编码模式 / 科研模式 / GPT reasoning depth)
+// OpenClaude — 思考深度 pill
 //
 // pill 状态按 agent 持久化在 localStorage 里(per-agent),page reload 后复原。
-// 默认空(unset),让 CCB 用模型默认 effort。
+// 默认空(unset),让 claude 用模型默认 effort。
+// 可见性 / 可调档位**能力驱动**:取当前生效 model(含模型选择器的 per-session 覆盖)
+// 在 config.models 里声明的 `efforts`。
 import { $ } from './dom.js'
+import { getEffectiveModel } from './modelMode.js'
 import { getSession, state } from './state.js'
 
 const STORAGE_KEY = 'openclaude_effort_by_agent'
-// 与 protocol/frames.ts InboundMessage.effortLevel 严格一一对应。
-// 改动时同步更新两处。
+// 与 protocol/frames.ts InboundMessage.effortLevel + config.ts EFFORT_LEVELS 一致。
 const VALID = new Set(['low', 'medium', 'high', 'xhigh', 'max'])
-const OPUS_EXTRA_EFFORTS = ['xhigh', 'max']
-const GPT55_REASONING_EFFORTS = ['low', 'medium', 'high', 'xhigh']
 
-/** 返回当前 model 在 UI 中可调的 effort 列表。
- *  - Opus 4.7: 保持原有"编码模式/科研模式"语义(xhigh/max)
- *  - GPT-5.5: Codex reasoning depth(low/medium/high/xhigh)
- *  容忍模型 ID 大小写、preset / 自定义命名(如 anthropic/claude-opus-4-7、openai/gpt-5.5)。 */
+/** 返回该 model 在 UI 中可调的思考深度档,**能力驱动**:查 state.modelsList
+ *  (来自 /api/agents 的 config.models / 默认 seed)里该 model 的 `efforts`。
+ *  空/缺省 = 该 model 不暴露思考深度控件。新增模型只改 config,不动前端代码。 */
 function getSupportedEfforts(modelId) {
   if (!modelId || typeof modelId !== 'string') return []
-  if (/opus[-_]?4[-_]?7/i.test(modelId)) return OPUS_EXTRA_EFFORTS
-  if (/(^|[/_-])gpt[-_]?5\.5($|[/_-])/i.test(modelId)) return GPT55_REASONING_EFFORTS
-  return []
+  const list = Array.isArray(state.modelsList) ? state.modelsList : []
+  const m = list.find((x) => x && x.id === modelId)
+  return Array.isArray(m?.efforts) ? m.efforts.filter((e) => VALID.has(e)) : []
 }
 
 export function modelSupportsExtraEffort(modelId) {
@@ -92,16 +91,13 @@ function setCurrentEffort(level) {
   renderModePills()
 }
 
+/** 当前生效 model = 模型选择器的 per-session 覆盖 ?? agent 默认。 */
 function getCurrentAgentModel() {
-  const sess = getSession()
-  if (!sess) return ''
-  const agentId = sess.agentId || state.defaultAgentId
-  const a = (state.agentsList || []).find((x) => x.id === agentId)
-  return a?.model || ''
+  return getEffectiveModel()
 }
 
-/** 根据当前会话 agent 的 model 决定整个 pill 行的可见性,并同步 pill 的可见性/aria-pressed 状态。
- *  应在 agent 切换、session 切换、agent list 加载完成后调用。 */
+/** 根据当前生效 model 决定整个 pill 行的可见性,并同步 pill 的可见性/aria-pressed 状态。
+ *  应在 agent 切换、session 切换、model 切换、agent list 加载完成后调用。 */
 export function renderModePills() {
   const wrap = $('composer-modes')
   if (!wrap) return
@@ -110,20 +106,12 @@ export function renderModePills() {
   const visible = supported.length > 0
   wrap.hidden = !visible
   if (!visible) return
-  wrap.setAttribute(
-    'aria-label',
-    /gpt[-_]?5\.5/i.test(model) ? '思考深度 (GPT-5.5)' : '思考强度模式 (Opus 4.7)',
-  )
+  wrap.setAttribute('aria-label', '思考深度')
   const current = getCurrentEffort()
-  const isGpt55 = /gpt[-_]?5\.5/i.test(model)
   for (const btn of wrap.querySelectorAll('.mode-pill')) {
     const v = btn.dataset.effort
     btn.hidden = !supported.includes(v)
     btn.setAttribute('aria-pressed', v === current ? 'true' : 'false')
-    if (v === 'xhigh') {
-      const label = btn.querySelector('span')
-      if (label) label.textContent = isGpt55 ? '超高' : '编码模式'
-    }
   }
 }
 

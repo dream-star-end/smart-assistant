@@ -27,6 +27,33 @@ export interface McpServerConfig {
   provider?: string
 }
 
+/** Thinking-depth levels the official `claude --effort` flag accepts. */
+export const EFFORT_LEVELS = ['low', 'medium', 'high', 'xhigh', 'max'] as const
+export type EffortLevel = (typeof EFFORT_LEVELS)[number]
+
+/** A selectable model for the web composer's model picker (per-session override). */
+export interface ModelChoice {
+  /** Model id passed to `claude --model` (gateway does not validate). */
+  id: string
+  /** Human label shown in the picker. */
+  label: string
+  /** Thinking-depth levels exposed for this model; empty/undefined hides the
+   *  effort control. Must be a subset of EFFORT_LEVELS. */
+  efforts?: EffortLevel[]
+}
+
+/** Default model registry (used when `config.models` is unset). Seeded to the
+ *  current subscription Claude family; operators edit `config.models` to add or
+ *  remove. ids/labels are editable — keep them in sync with what the account can
+ *  actually serve. */
+export function defaultModels(): ModelChoice[] {
+  return [
+    { id: 'claude-opus-4-8', label: 'Opus 4.8', efforts: ['high', 'xhigh', 'max'] },
+    { id: 'claude-sonnet-4-6', label: 'Sonnet 4.6', efforts: ['high', 'xhigh'] },
+    { id: 'claude-haiku-4-5', label: 'Haiku 4.5' },
+  ]
+}
+
 /** Predefined tool groups that can be assigned to agents or routes */
 export type ToolsetName = 'assistant' | 'research' | 'coding' | 'browser' | string
 
@@ -126,6 +153,10 @@ export interface OpenClaudeConfig {
     permissionMode: 'default' | 'acceptEdits' | 'bypassPermissions' | 'dontAsk' | 'plan'
     toolsets?: ToolsetName[] // default toolsets for all agents (if not overridden)
   }
+  // 前台"模型选择器"的可选列表(per-session 覆盖用)。缺省时用 defaultModels()
+  // 的 Claude 家族 seed。`efforts` 列举该 model 在 UI 可调的思考深度档,空/缺省
+  // = 不显示思考深度控件。id 即官方 `claude --model` 接受的值,gateway 不本地校验。
+  models?: ModelChoice[]
   // Named toolset definitions: group MCP servers by purpose
   // e.g. { research: ['browser'], coding: ['openclaude-memory'], browser: ['browser'] }
   // If undefined, all MCP servers are available to all agents (current behavior)

@@ -55,6 +55,11 @@ export const InboundMessage = Type.Object({
       Type.Literal('max'),
     ]),
   ),
+  // Per-session model override (来自 Web 前端的模型选择器)。提供时 gateway 把已有
+  // runner 切到该 model(setModel + recycle,与 effortLevel 同机制);缺省则用 agent
+  // 默认 model。仅覆盖当前会话,不改 agents.yaml。取值由 config.models 列举,gateway
+  // 不本地校验(交由官方 claude 的 --model 处理)。
+  model: Type.Optional(Type.String()),
   // Codex-native app-server conversation mode. plan asks Codex to first
   // produce a reviewable plan; default runs the implementation turn.
   conversationMode: Type.Optional(Type.Union([Type.Literal('default'), Type.Literal('plan')])),

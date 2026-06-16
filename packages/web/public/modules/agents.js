@@ -3,6 +3,7 @@ import { apiGet, apiJson } from './api.js'
 import { $, htmlSafeEscape } from './dom.js'
 import { renderModePills } from './effortMode.js'
 import { renderGoalModePanel } from './goalMode.js?v=3'
+import { renderModelPicker } from './modelMode.js'
 import { renderResearchTools } from './researchTools.js'
 import { getSession, state } from './state.js'
 import { closeModal, openModal, toast } from './ui.js'
@@ -11,6 +12,7 @@ export async function reloadAgents() {
   try {
     const data = await apiGet('/api/agents')
     state.agentsList = data.agents || []
+    state.modelsList = data.models || []
     state.defaultAgentId = data.default || 'main'
     renderAgentDropdown()
     renderAgentsManagementList()
@@ -33,7 +35,10 @@ export function renderAgentDropdown() {
   }
   const sess = getSession()
   if (sess) sel.value = sess.agentId || state.defaultAgentId
-  // Pill 可见性依赖当前 agent 的 model — 任何 agent 列表/会话切换后都要刷新一次。
+  // 模型选择器选项随 agent 默认 model 变;agent 列表/会话切换后刷新。先于 effort,
+  // 因为 effort 档位依赖"当前生效 model"(可能是模型选择器里的覆盖值)。
+  renderModelPicker()
+  // Pill 可见性依赖当前生效 model — 任何 agent 列表/会话切换后都要刷新一次。
   renderModePills()
   // 科研工具条的可见性同样取决于 effort pill 当前选中值,跟随 agent 切换一起刷新。
   renderResearchTools()

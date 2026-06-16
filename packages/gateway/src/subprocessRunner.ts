@@ -254,6 +254,19 @@ export class SubprocessRunner extends EventEmitter {
     this.opts.effortLevel = level
   }
 
+  /** Current model (used by sessionManager.submit to detect a per-session model
+   *  override before deciding whether to recycle the subprocess). */
+  get model(): string | undefined {
+    return this.opts.model
+  }
+
+  /** Update the model. Like effort, the new value only takes effect on the next
+   *  spawn (buildClaudeCliArgs reads opts.model at start()), so the caller must
+   *  shutdown() the current subprocess; the next submit() auto-respawns with it. */
+  setModel(model: string | undefined): void {
+    this.opts.model = model
+  }
+
   /** True if the subprocess is currently alive or being started */
   get isRunning(): boolean {
     return (this.proc !== null && !this.closed) || this.starting
