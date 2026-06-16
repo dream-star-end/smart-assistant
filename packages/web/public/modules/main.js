@@ -818,6 +818,7 @@ async function send() {
     }
     _attachmentUploadInFlight = false
     for (const a of mediaAtts) a._uploadPct = undefined
+    renderAttachments()
     // Session may have changed while bytes were uploading — don't send the
     // captured `sess`'s message into whatever session is now active (mirrors
     // the hydrateSession guard above). Attachments stay in the composer.
