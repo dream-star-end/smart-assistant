@@ -43,7 +43,7 @@ export const STATIC_PROVIDER_META: Record<StaticProviderId, StaticProviderCommer
 };
 
 /**
- * fail-closed guard：若平台全局默认模型(PLATFORM_DEFAULT_MODEL，当前 glm-5.1)路由到某静态 key
+ * fail-closed guard：若平台全局默认模型(PLATFORM_DEFAULT_MODEL，2026-06-16 起 MiniMax-M3)路由到某静态 key
  * provider，但生产 env 未配该 provider 的 key → **throw**，让 master 装配 internal proxy 的启动路径
  * loud fail，而非全员默认模型静默 503(Codex plan review #4)。
  *

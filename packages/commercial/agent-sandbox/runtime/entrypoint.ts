@@ -102,20 +102,23 @@ const BROWSER_TOOLSET_ID = "browser";
 const RESEARCH_TOOLSET_ID = "research";
 const WEB_CONTEXT_TOOLSET_ID = "web_context";
 
-// 平台全局默认模型(2026-06-15 起 glm-5.1 / 火山方舟 Ark)。
-// 注意:本文件由 Dockerfile 单独 COPY 进 runtime 镜像,无法 import packages/commercial/src,
-// 故这里**本地维护**该常量;master 侧权威常量在 src/platformDefaults.ts。两源一致性由
-// src/__tests__/runtimeEntrypointPolicy.test.ts 文本断言守护 —— 改这里必须同步改 platformDefaults.ts。
-const COMMERCIAL_DEFAULT_MODEL = "glm-5.1";
-const COMMERCIAL_DEFAULT_PROVIDER = "ark";
-// 2026-06-16 boss 重配:内置 agent 按角色多样化分配模型(方案 WS2)。改这里必须同步改
-// 前端 fallback packages/web/public/modules/agents.js 与本测试 runtimeEntrypointPolicy.test.ts。
-//   - researcher → MiniMax-M3(512k 超长上下文吃文献;MiniMax 默认思考模型)
-//   - scientist / reviewer → deepseek-v4-pro(分析 + 异构独立复核)
-//   - coder → glm-5.1(火山 Coding Plan 代码模型,自带 thinking)= COMMERCIAL_DEFAULT_*
-//   - main / codex 不变
+// 平台全局默认模型。2026-06-16 改回 MiniMax-M3(新加坡端点)—— glm-5.1 走火山方舟【北京】端点,
+// 从 master(吉隆坡)跨境进中国大陆、链路间歇抖动,长 turn 撞瞬时丢包 → "半天没反应"。MiniMax 端点
+// 在新加坡(稳)+ 512k 窗口 + 已开思考。注意:本文件由 Dockerfile 单独 COPY 进 runtime 镜像,无法
+// import packages/commercial/src,故本地维护;master 权威常量在 src/platformDefaults.ts,两源一致性由
+// src/__tests__/runtimeEntrypointPolicy.test.ts 守护 —— 改这里必须同步改 platformDefaults.ts。
+const COMMERCIAL_DEFAULT_MODEL = "MiniMax-M3";
+const COMMERCIAL_DEFAULT_PROVIDER = "minimax";
+// 内置 agent 按角色分配模型(改这里必须同步改前端 fallback agents.js 与 runtimeEntrypointPolicy.test.ts):
+//   - main(队长) → MiniMax-M3(= DEFAULT,新加坡稳端点,512k)
+//   - researcher → MiniMax-M3(512k 吃长文献;思考模型)
+//   - scientist / reviewer → deepseek-v4-pro(分析 + 异构复核;edge 稳端点)
+//   - coder → glm-5.1 / 火山 Coding Plan(coding 强;coder turn 较短、跨境暴露低,boss 2026-06-16 决定保留)
+//   - codex → gpt-5.5(不变)
 const COMMERCIAL_RESEARCHER_MODEL = "MiniMax-M3";
 const COMMERCIAL_RESEARCHER_PROVIDER = "minimax";
+const COMMERCIAL_CODER_MODEL = "glm-5.1";
+const COMMERCIAL_CODER_PROVIDER = "ark";
 const COMMERCIAL_DEEPSEEK_PRO_MODEL = "deepseek-v4-pro";
 const COMMERCIAL_DEEPSEEK_PRO_PROVIDER = "deepseek";
 const COMMERCIAL_CODEX_MODEL = "gpt-5.5";
@@ -1133,10 +1136,11 @@ try {
 
   const desiredCoderAgent = {
     id: "coder",
-    model: COMMERCIAL_DEFAULT_MODEL,
+    // 显式绑 glm-5.1(不跟 DEFAULT,DEFAULT 已改 MiniMax-M3)。boss 2026-06-16 决定 coder 保留 glm-5.1。
+    model: COMMERCIAL_CODER_MODEL,
     persona: ensureAgentPersona("coder", CODER_PERSONA, LEGACY_CODER_PERSONAS),
     permissionMode: "bypassPermissions",
-    provider: COMMERCIAL_DEFAULT_PROVIDER,
+    provider: COMMERCIAL_CODER_PROVIDER,
     displayName: "代码工程师",
     avatarEmoji: "🛠️",
     toolsets: [CORE_TOOLSET_ID],
@@ -1169,10 +1173,9 @@ try {
     id: "science_research_team",
     name: "科研协作团队",
     description: "适合文献调研、实验/数据分析、论文思路和证据复核",
-    // 队长默认走 glm-5.1：codex-native runner 跑不了 glm-5.1，故队长用
-    // main（GLM-5.1 助手）+ 队长提示词，而非 codex（GPT-5.5）。这是团队队长
-    // 模型的权威源；patchPlatformSeedTeam 会据此把用户未定制的旧 codex 队长
-    // 团队在容器启动时迁移到 main。
+    // 队长走 main（现 MiniMax-M3 / 新加坡端点,2026-06-16 起）：codex-native runner 只能跑
+    // GPT-5.5、当不了静态 provider 队长,故队长用 main + 队长提示词,而非 codex（GPT-5.5）。
+    // 这是团队队长的权威源；patchPlatformSeedTeam 会据此把用户未定制的旧 codex 队长团队迁移到 main。
     leaderAgentId: "main",
     leaderRole: "科研项目负责人",
     leaderPrompt:
@@ -1214,7 +1217,7 @@ try {
     id: "programming_team",
     name: "编程协作团队",
     description: "适合需求拆解、技术调研、代码实现、测试和审查闭环",
-    // 队长默认走 glm-5.1（同上：main 而非 codex/GPT-5.5）。
+    // 队长走 main（现 MiniMax-M3,同上：main 而非 codex/GPT-5.5）。
     leaderAgentId: "main",
     leaderRole: "技术负责人",
     leaderPrompt:

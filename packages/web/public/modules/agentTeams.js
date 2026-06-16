@@ -78,8 +78,8 @@ const TEAM_TEMPLATES = [
     id: 'science_research_team',
     name: '科研协作团队',
     description: '适合文献调研、实验/数据分析、论文思路和证据复核',
-    // 队长默认走 glm-5.1：codex-native runner 跑不了 glm-5.1，故队长用
-    // main（GLM-5.1 助手）+ 队长提示词，而非 codex（GPT-5.5）。
+    // 队长走 main（现 MiniMax-M3,2026-06-16 起）：codex-native 只能跑 GPT-5.5、当不了
+    // 静态 provider 队长，故队长用 main + 队长提示词，而非 codex（GPT-5.5）。
     leaderAgentId: 'main',
     leaderRole: '科研项目负责人',
     leaderPrompt:
@@ -121,7 +121,7 @@ const TEAM_TEMPLATES = [
     id: 'programming_team',
     name: '编程协作团队',
     description: '适合需求拆解、技术调研、代码实现、测试和审查闭环',
-    // 队长默认走 glm-5.1（同上：main 而非 codex/GPT-5.5）。
+    // 队长走 main（现 MiniMax-M3,同上：main 而非 codex/GPT-5.5）。
     leaderAgentId: 'main',
     leaderRole: '技术负责人',
     leaderPrompt:

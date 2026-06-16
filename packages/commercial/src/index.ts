@@ -970,8 +970,10 @@ export async function registerCommercial(
     proxyPort !== undefined &&
     selfHostUuid
   ) {
-    // fail-closed guard(Codex plan review #4 + diff review Blocker):平台全局默认模型 glm-5.1
-    // 路由到静态 provider ark,若 ARK_CODING_PLAN_KEY 未配 → throw,loud fail 拒绝启动。
+    // fail-closed guard(Codex plan review #4 + diff review Blocker):平台默认模型(2026-06-16 起
+    // MiniMax-M3)路由到静态 provider minimax,若 MINIMAX_TOKEN_PLAN_KEY 未配 → throw,loud fail 拒绝启动。
+    // 注:coder 仍用 glm-5.1/ark,但 ark key 不再被本 guard 拦(它只守默认模型的 provider key);
+    // 部署须另行确保 ARK_CODING_PLAN_KEY 存在,否则 coder 请求会运行时 503。
     // **必须放在下面 try 之外** —— 该 try 的 catch 只会打印 "internal proxy ... disabling" 并把
     // internalProxyHandler 置空后让 master 继续跑;若 guard 在 try 内,缺 key 会被降级吞成
     // "internal proxy 禁用但 master 照跑",违反 loud-fail。放 try 外则异常直接冒泡崩 master boot。
@@ -1021,8 +1023,9 @@ export async function registerCommercial(
         // 静态 key 文本 provider 的 key 解析表(deepseek/minimax/ark)。cfg 在外层闭包已
         // loadConfig() 过,这里直接读取;某 provider 未配 → 命中其模型时 503(各自 reject reason)。
         // 这是 internal proxy(容器/agent runtime 走的上游),三个 provider 全注入。
-        // key 只留 master,不进用户容器。glm-5.1(ark)是平台全局默认模型,其 key 缺失已由下方
-        // assertPlatformDefaultModelConfigured guard 在装配前 loud-fail。
+        // key 只留 master,不进用户容器。MiniMax-M3(minimax)是平台默认模型,其 key 缺失已由下方
+        // assertPlatformDefaultModelConfigured guard 在装配前 loud-fail;ark(coder 用)/deepseek 的
+        // key 不被该 guard 拦,缺失则命中其模型时 503。
         staticProviderKeys: {
           deepseek: cfg.DEEPSEEK_API_KEY,
           minimax: cfg.MINIMAX_TOKEN_PLAN_KEY,

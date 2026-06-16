@@ -16,7 +16,7 @@ import { isMiniMaxM3Model } from './minimax.js'
 //      betas/thinking 也走默认路径,本次一字不动。
 //   2) 静态模型的 context window(auto-compact 上限)。deepseek 无特判 → 落 MODEL_CONTEXT_WINDOW_DEFAULT。
 
-/** glm-5.1(火山方舟 Ark Coding Plan,平台全局默认模型)。精确匹配,大小写不敏感。 */
+/** glm-5.1(火山方舟 Ark Coding Plan,coder 默认模型;2026-06-16 起平台默认改为 MiniMax-M3)。精确匹配,大小写不敏感。 */
 export function isArkGlmModel(model: string): boolean {
   return model.trim().toLowerCase() === 'glm-5.1'
 }

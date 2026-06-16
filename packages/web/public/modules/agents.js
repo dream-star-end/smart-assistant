@@ -16,10 +16,11 @@ export function setRenderModelPill(fn) {
 const COMMERCIAL_FALLBACK_AGENTS = Object.freeze([
   {
     id: 'main',
-    displayName: 'GLM-5.1 助手',
+    // 2026-06-16:默认队长改回 MiniMax-M3(新加坡稳端点),须与 entrypoint.ts main 一致。
+    displayName: 'MiniMax M3 助手',
     avatarEmoji: '🧠',
-    model: 'glm-5.1',
-    provider: 'ark',
+    model: 'MiniMax-M3',
+    provider: 'minimax',
   },
   {
     id: 'researcher',

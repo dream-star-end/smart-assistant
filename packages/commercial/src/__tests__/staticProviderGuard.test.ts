@@ -1,6 +1,6 @@
 /**
- * fail-closed guard 单测:平台默认模型(glm-5.1 / ark)缺 key 时 master 装配 internal proxy
- * 必须 loud-fail(throw),而非全员默认模型静默 503。(Codex plan review #4)
+ * fail-closed guard 单测:平台默认模型(2026-06-16 起 MiniMax-M3 / minimax)缺 key 时 master 装配
+ * internal proxy 必须 loud-fail(throw),而非全员默认模型静默 503。(Codex plan review #4)
  *
  * 跑法: npx tsx --test packages/commercial/src/__tests__/staticProviderGuard.test.ts
  */
@@ -14,33 +14,33 @@ import { PLATFORM_DEFAULT_MODEL } from "../platformDefaults.js";
 import { findRouteProviderForModel } from "@openclaude/protocol";
 
 describe("assertPlatformDefaultModelConfigured", () => {
-  test("默认模型(glm-5.1)路由到 ark,缺 ARK_CODING_PLAN_KEY → throw", () => {
+  test("默认模型(MiniMax-M3)路由到 minimax,缺 MINIMAX_TOKEN_PLAN_KEY → throw", () => {
     assert.throws(
       () => assertPlatformDefaultModelConfigured({}),
-      /ARK_CODING_PLAN_KEY/,
-      "缺 ark key 必须 throw",
+      /MINIMAX_TOKEN_PLAN_KEY/,
+      "缺 minimax key 必须 throw",
     );
     assert.throws(
-      () => assertPlatformDefaultModelConfigured({ ARK_CODING_PLAN_KEY: "   " }),
-      /ARK_CODING_PLAN_KEY/,
+      () => assertPlatformDefaultModelConfigured({ MINIMAX_TOKEN_PLAN_KEY: "   " }),
+      /MINIMAX_TOKEN_PLAN_KEY/,
       "空白 key 视为未配置,必须 throw",
     );
   });
 
-  test("默认模型 ark key 已配 → 不 throw(无关 provider 的 key 不影响)", () => {
+  test("默认模型 minimax key 已配 → 不 throw(无关 provider 的 key 不影响)", () => {
     assert.doesNotThrow(() =>
-      assertPlatformDefaultModelConfigured({ ARK_CODING_PLAN_KEY: "ark-rotated-key" }),
+      assertPlatformDefaultModelConfigured({ MINIMAX_TOKEN_PLAN_KEY: "mm-rotated-key" }),
     );
-    // 注入别家 key 但缺 ark → 仍 throw(只认默认模型自己 provider 的 key)
+    // 注入别家 key 但缺 minimax → 仍 throw(只认默认模型自己 provider 的 key)
     assert.throws(() =>
-      assertPlatformDefaultModelConfigured({ DEEPSEEK_API_KEY: "ds" }),
+      assertPlatformDefaultModelConfigured({ ARK_CODING_PLAN_KEY: "ark" }),
     );
   });
 
   test("不变量:PLATFORM_DEFAULT_MODEL 当前确实路由到一个静态 provider(否则 guard 形同虚设)", () => {
     const p = findRouteProviderForModel(PLATFORM_DEFAULT_MODEL);
     assert.ok(p, `PLATFORM_DEFAULT_MODEL=${PLATFORM_DEFAULT_MODEL} 应命中静态 provider`);
-    assert.equal(p?.id, "ark");
+    assert.equal(p?.id, "minimax");
   });
 
   // 结构守护(Codex diff review Blocker):guard 调用必须在 internal-proxy 装配的 try **之前**,
