@@ -5785,17 +5785,19 @@ export class Gateway {
     // abort the turn (mirrors the inline base64-validation failures below).
     const failUpload = (errMsg: string): void => {
       this.log.warn('upload rejected', { reason: errMsg, sessionKey })
-      this.deliver(
-        {
-          type: 'outbound.message',
-          sessionKey: sessionKey!,
-          channel: frame.channel,
-          peer: frame.peer,
-          blocks: [{ kind: 'text', text: `⚠️ 上传失败: ${errMsg}` }],
-          isFinal: true,
-        },
-        adapter,
-      )
+      const failFrame = {
+        type: 'outbound.message' as const,
+        sessionKey: sessionKey!,
+        channel: frame.channel,
+        peer: frame.peer,
+        blocks: [{ kind: 'text' as const, text: `⚠️ 上传失败: ${errMsg}` }],
+        isFinal: true,
+      }
+      // Route the error to the requesting user (deliver() strips _userId before
+      // the wire); without this, a non-default user could miss the final error
+      // and see the turn hang after we return.
+      ;(failFrame as any)._userId = activeUserId
+      this.deliver(failFrame, adapter)
     }
 
     // Server-side upload validation (limits/allowlist live at module scope —
@@ -5881,7 +5883,6 @@ export class Gateway {
     }
     const savedMedia: SavedMedia[] = []
     const uploadsRoot = resolve(paths.uploadsDir)
-    let refTotalSize = 0
     for (const m of media) {
       // HTTP-channel attachment: the file was already streamed to uploadsDir via
       // POST /api/attachments and the WS frame carries only `upload:<filename>`.
@@ -5918,8 +5919,10 @@ export class Gateway {
           )
           return
         }
-        refTotalSize += st.size
-        if (refTotalSize > MAX_TOTAL_MEDIA) {
+        // Share the single per-message total with the base64 validation loop
+        // above so a mixed base64 + ref frame can't bypass MAX_TOTAL_MEDIA.
+        totalMediaSize += st.size
+        if (totalMediaSize > MAX_TOTAL_MEDIA) {
           failUpload(`总附件超过 ${MAX_TOTAL_MEDIA / 1024 / 1024}MB 限制`)
           return
         }

@@ -785,6 +785,13 @@ async function send() {
   const mediaAtts = state.attachments.filter((a) => a.kind !== 'text')
   let media = []
   if (mediaAtts.length > 0) {
+    // Lock the composer for the duration of the upload await — without this,
+    // pressing Enter again mid-upload re-enters send() and double-uploads /
+    // double-sends the same message. Released synchronously after upload (no
+    // await before ws.send, so re-entry is impossible past this point); the
+    // send branches below re-assert the lock as needed.
+    setSending(true)
+    updateSendEnabled()
     try {
       media = await Promise.all(
         mediaAtts.map((a) =>
@@ -802,10 +809,14 @@ async function send() {
     } catch (err) {
       for (const a of mediaAtts) a._uploadPct = undefined
       renderAttachments()
+      setSending(false)
+      updateSendEnabled()
       toast(`附件上传失败：${err?.message || err}`, 'error')
       return // keep input + attachments for retry
     }
     for (const a of mediaAtts) a._uploadPct = undefined
+    setSending(false)
+    updateSendEnabled()
   }
   const effortLevel = getEffortForSubmit()
   const model = getModelForSubmit()
