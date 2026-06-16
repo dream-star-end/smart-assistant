@@ -15,15 +15,17 @@ ps -eo pid,ppid,rss,%mem,%cpu,etime,cmd | grep -E 'bun|tsx|openclaude|node.*gate
 echo
 echo "=== MCP subprocess count ==="
 echo "MCP processes: $(pgrep -f 'mcp-memory|playwright|minimax' | wc -l)"
-echo "CCB bun processes: $(pgrep -f 'bun.*cli.tsx' | wc -l)"
+# Chat subprocesses are the official `claude` spawned in headless stream-json
+# mode (distinct from interactive PTY terminal sessions).
+echo "claude chat processes: $(pgrep -f 'claude.*--input-format=stream-json' | wc -l)"
 
 echo
 echo "=== File descriptor usage ==="
 for PID in $(pgrep -f 'node.*gateway' | head -1); do
   echo "Gateway (PID=$PID): $(ls /proc/$PID/fd 2>/dev/null | wc -l) fds"
 done
-for PID in $(pgrep -f 'bun.*cli.tsx' | head -3); do
-  echo "CCB (PID=$PID): $(ls /proc/$PID/fd 2>/dev/null | wc -l) fds"
+for PID in $(pgrep -f 'claude.*--input-format=stream-json' | head -3); do
+  echo "claude chat (PID=$PID): $(ls /proc/$PID/fd 2>/dev/null | wc -l) fds"
 done
 
 echo

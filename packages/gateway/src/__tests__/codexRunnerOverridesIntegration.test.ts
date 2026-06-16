@@ -38,7 +38,7 @@ function makeFakeConfig(token: string): OpenClaudeConfig {
   return {
     version: 1,
     gateway: { bind: '127.0.0.1', port: 18789, accessToken: token },
-    auth: { mode: 'subscription', claudeCodePath: '/opt/openclaude/openclaude/claude-code-best' },
+    auth: { mode: 'subscription' },
     defaults: { model: 'claude-opus-4-7', permissionMode: 'bypassPermissions' },
     channels: { webchat: { enabled: true } },
   } as unknown as OpenClaudeConfig

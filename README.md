@@ -2,7 +2,7 @@
 
 > 基于 Claude Code 的全能个人 AI 助理
 
-把 Claude Code Best (CCB) 的强 agent 内核装进多渠道 Gateway 里,支持 Web、Telegram 多端对话,内置三层记忆、技能自进化、多媒体生成、浏览器自动化、多 Agent 协作。
+把官方 Claude Code (`claude`) 的强 agent 内核装进多渠道 Gateway 里,支持 Web、Telegram 多端对话,内置三层记忆、技能自进化、多媒体生成、浏览器自动化、多 Agent 协作。
 
 ## ✨ 核心特性
 
@@ -83,7 +83,7 @@
 - stdout 活性超时 (3 分钟无输出才判定卡死)
 - API 指数退避重试 (3 次,529/503/502 自动恢复)
 - WS ping 保活 (服务端 25s + 客户端 30s 心跳)
-- 检查点恢复 (resume-map.json + CCB `--resume`)
+- 检查点恢复 (resume-map.json + 官方 claude `--resume`)
 - 进程组清理 (detached + SIGKILL 整组)
 
 ---
@@ -92,7 +92,7 @@
 
 ### 前置要求
 - Node.js 18+
-- Bun (用于 CCB agent runtime)
+- 官方 Claude Code (`claude`) — 安装见 https://docs.claude.com/claude-code (默认装在 `~/.local/bin/claude`)
 - Linux 服务器 (推荐 Ubuntu 20.04+,2GB+ RAM)
 
 ### 安装
@@ -101,8 +101,8 @@
 git clone https://github.com/dream-star-end/smart-assistant.git
 cd smart-assistant
 
-# 安装 CCB 依赖
-cd claude-code-best && bun install && cd ..
+# 安装官方 Claude Code 并登录(订阅 OAuth / API key)
+claude          # 启动后 /login,或 `claude setup-token`
 
 # 安装 OpenClaude 依赖
 npm install
@@ -143,9 +143,7 @@ sudo systemctl start openclaude
 
 ```
 smart-assistant/
-├── claude-code-best/          # CCB agent runtime (反编译 Claude Code)
-│   ├── src/                   # 原 CCB 源码 (QueryEngine, 工具系统, OAuth)
-│   └── scripts/dev.ts         # 开发入口
+# agent runtime = 官方 Claude Code (`claude`),系统单独安装,不在本仓内
 ├── packages/
 │   ├── protocol/              # TypeBox WS 帧定义
 │   ├── storage/               # 配置 / 记忆 / 技能 / 归档存储
@@ -157,7 +155,7 @@ smart-assistant/
 │   ├── gateway/               # HTTP + WS 网关
 │   │   ├── server.ts          # 路由 / OAuth / Cron / 文件服务
 │   │   ├── sessionManager.ts  # 会话管理 (Mutex / 重试 / 超时)
-│   │   ├── subprocessRunner.ts# CCB 子进程管理 + 上下文工程
+│   │   ├── subprocessRunner.ts# 官方 claude 子进程管理 + 上下文工程
 │   │   └── cron.ts            # 定时任务调度器
 │   ├── mcp-memory/            # MCP 工具服务器
 │   │   └── index.ts           # 12 个工具: memory / session_search / skill_* / archival_* / create_reminder / send_to_agent
@@ -191,9 +189,9 @@ smart-assistant/
   "gateway": { "bind": "0.0.0.0", "port": 18789, "accessToken": "..." },
   "auth": {
     "mode": "subscription",
-    "claudeCodePath": "/opt/openclaude/claude-code-best",
     "claudeOAuth": { "accessToken": "...", "refreshToken": "...", "expiresAt": ... }
   },
+  // claudeCliPath 可选:官方 claude 二进制路径覆盖;缺省自动探测 ~/.local/bin/claude
   "defaults": { "model": "claude-opus-4-6", "permissionMode": "acceptEdits" },
   "provider": "minimax",
   "mcpServers": [

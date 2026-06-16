@@ -7,12 +7,12 @@ This note records the current feasibility findings for OpenClaude's official Cla
 ## Runtime vs local source reference
 
 - Production launches the official `claude` interactive CLI through a server PTY.
-- The installed CLI at `/root/.local/share/claude/versions/2.1.172` is a native ELF binary.
-- The repository also contains `claude-code-best/`, which includes TypeScript sources and docs, but its package version is `1.0.3`. Treat it as protocol reference material, not as the exact source for the installed 2.1.172 runtime.
+- The installed CLI under `/root/.local/share/claude/versions/<ver>` is a native ELF binary.
+- A `claude-code-best/` fork (Claude Code `1.0.3` TypeScript sources) used to live in this repo and was the reference for these notes. It has since been removed — the protocol observations below were captured from it and remain useful as background, but verify against the installed binary's behaviour, not against that deleted source.
 
 ## What IDE integration appears to do
 
-From `claude-code-best`:
+From the (now-removed) `claude-code-best` reference sources:
 
 - IDE extensions/plugins write lockfiles under `~/.claude/ide/*.lock`.
 - Lockfile JSON can include `workspaceFolders`, `pid`, `ideName`, `transport`, `runningInWindows`, and `authToken`.

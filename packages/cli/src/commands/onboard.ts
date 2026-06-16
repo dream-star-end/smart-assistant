@@ -1,9 +1,9 @@
 import { existsSync } from 'node:fs'
 import { mkdir } from 'node:fs/promises'
-import { resolve } from 'node:path'
+import { isAbsolute } from 'node:path'
 import { stdin, stdout } from 'node:process'
 import { createInterface } from 'node:readline/promises'
-import { generateAccessToken } from '@openclaude/gateway'
+import { generateAccessToken, resolveOfficialClaudePath } from '@openclaude/gateway'
 import {
   type OpenClaudeConfig,
   paths,
@@ -15,7 +15,8 @@ import {
 interface OnboardOpts {
   nonInteractive?: boolean
   json?: boolean
-  claudeCodePath?: string
+  /** Optional override for the official `claude` binary path. */
+  claudeCliPath?: string
   authMode?: 'subscription' | 'api_key' | 'custom_platform'
   port?: number
   bind?: string
@@ -36,25 +37,22 @@ export async function onboard(opts: OnboardOpts): Promise<void> {
     return a || def || ''
   }
 
-  // 1. Claude Code 路径
-  const defaultCcb = resolve(process.cwd(), '..', 'claude-code-best')
-  const claudeCodePath = opts.claudeCodePath ?? (await ask('Claude Code Best 项目路径', defaultCcb))
-  if (!existsSync(claudeCodePath)) {
-    console.error(`✗ 路径不存在: ${claudeCodePath}`)
-    console.error('  请先 git clone https://github.com/dream-star-end/claude-code-best.git')
+  // 1. 官方 Claude Code 二进制
+  const resolvedClaude = resolveOfficialClaudePath()
+  const claudeCliPath = opts.claudeCliPath ?? (await ask('官方 claude 二进制路径', resolvedClaude))
+  // 绝对路径才校验存在;裸 `claude` 走 PATH,无法用 existsSync 判断。
+  if (isAbsolute(claudeCliPath) && !existsSync(claudeCliPath)) {
+    console.error(`✗ 找不到官方 claude: ${claudeCliPath}`)
+    console.error('  请先安装官方 Claude Code: https://docs.claude.com/claude-code')
+    console.error('  (默认装在 ~/.local/bin/claude)')
     process.exit(1)
   }
-  const cliEntry = resolve(claudeCodePath, 'src/entrypoints/cli.tsx')
-  if (!existsSync(cliEntry)) {
-    console.error(`✗ 找不到 CCB 入口: ${cliEntry}`)
-    process.exit(1)
-  }
-  console.log('✓ Claude Code Best 已找到')
+  console.log(`✓ 官方 Claude Code: ${claudeCliPath}`)
 
   // 2. 登录方式
   let authMode = opts.authMode
   if (!authMode && rl) {
-    console.log('\n登录方式三选一(底层都用 CCB,token 由 CCB 自己存):')
+    console.log('\n登录方式三选一(底层都用官方 claude,token 由 claude 自己存):')
     console.log('  1) Sign in with Claude.ai (订阅 OAuth) ← 推荐')
     console.log('  2) Anthropic API key')
     console.log('  3) Custom Platform (第三方兼容网关 / 国产模型)')
@@ -63,11 +61,11 @@ export async function onboard(opts: OnboardOpts): Promise<void> {
   }
   authMode ??= 'subscription'
 
-  console.log('\n→ 接下来请在 Claude Code Best 里完成登录:')
-  console.log(`  cd ${claudeCodePath} && bun run dev`)
-  console.log('  然后输入 /login,选择对应方式完成授权')
+  console.log('\n→ 接下来请用官方 claude 完成登录:')
+  console.log('  claude            # 启动后输入 /login,选择对应方式授权')
+  console.log('  claude setup-token  # 或生成长期 token')
   console.log(
-    '  完成后 token 会被 CCB 存到它自己的 keychain/settings,后续 OpenClaude spawn 它时自动复用\n',
+    '  完成后 token 存到 ~/.claude/.credentials.json,OpenClaude spawn 官方 claude 时自动复用\n',
   )
 
   // 3. Gateway 端口
@@ -89,9 +87,9 @@ export async function onboard(opts: OnboardOpts): Promise<void> {
     },
     auth: {
       mode: authMode,
-      claudeCodePath: resolve(claudeCodePath),
-      claudeCodeEntry: 'src/entrypoints/cli.tsx',
-      claudeCodeRuntime: 'bun',
+      // Only persist an explicit override; default resolution lives in
+      // resolveOfficialClaudePath so installs that move the binary keep working.
+      ...(opts.claudeCliPath ? { claudeCliPath } : {}),
     },
     defaults: {
       model,

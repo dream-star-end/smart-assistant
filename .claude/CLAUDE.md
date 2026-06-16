@@ -15,17 +15,17 @@ git push origin master
 ## VPS 关键路径
 
 - 代码: `/opt/openclaude/openclaude/` (git repo, tracks origin/master)
-- CCB: `/opt/openclaude/claude-code-best/`
+- Agent runtime: 官方 Claude Code (`~/.local/bin/claude`),由 `resolveOfficialClaudePath()` 解析(可被 `OPENCLAUDE_OFFICIAL_CLAUDE_PATH` env 或 `auth.claudeCliPath` 覆盖)
 - 配置: `/root/.openclaude/openclaude.json`
 - Agents: `/root/.openclaude/agents.yaml`
-- CCB settings: `/root/.claude/settings.json` (ANTHROPIC_BASE_URL → MiniMax)
+- claude settings/credentials: `/root/.claude/settings.json` + `/root/.claude/.credentials.json`(订阅 OAuth)
 - Skills: `/root/.openclaude/agents/<id>/skills/`
 - Cron: `/root/.openclaude/cron.yaml`
 
 ## Provider 路由
 
-- `provider: claude-subscription` → 注入 CLAUDE_CODE_OAUTH_TOKEN + CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST=1, 清空 ANTHROPIC_BASE_URL
-- `provider: minimax` 或无 → 不注入 token, CCB fallback 到 settings.json (MiniMax API)
+- `provider: claude-subscription` → 注入 CLAUDE_CODE_OAUTH_TOKEN + 清空 ANTHROPIC_BASE_URL/AUTH_TOKEN/MODEL(provider 隔离依赖此 env 清空 + settings.json 不含 provider env)
+- `provider: minimax` 或无 → 不注入 token, 官方 claude fallback 到 `~/.claude/.credentials.json` / settings.json
 - 每个 agent 有独立的 Chrome profile (`/tmp/openclaude-browser-<agentId>`)
 
 ## 前端架构

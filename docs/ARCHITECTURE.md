@@ -2,7 +2,7 @@
 
 ## Overview
 
-OpenClaude is a personal AI assistant built on top of Claude Code Best (CCB) as the execution harness.
+OpenClaude is a personal AI assistant built on top of the official Claude Code (`claude`) as the execution harness. The gateway spawns the official `claude` binary in headless stream-json mode and bridges its output to the web/Telegram interfaces. (Earlier revisions vendored a `claude-code-best` fork; that has been removed in favour of the upstream binary.)
 
 ```
 ┌─────────────────────────────────────────────────────────┐
@@ -14,14 +14,14 @@ OpenClaude is a personal AI assistant built on top of Claude Code Best (CCB) as 
 │  WebhookRouter   │  TaskStore │  RunLog                 │
 ├─────────────────────────────────────────────────────────┤
 │                    Harness Layer                         │
-│  SubprocessRunner  │  CcbMessageParser  │  PromptSlots  │
+│  SubprocessRunner  │ ClaudeMessageParser │  PromptSlots  │
 │  TerminalBackend (local / docker)                       │
 ├─────────────────────────────────────────────────────────┤
 │                  Plugin / Capability                     │
 │  ChannelPlugin  │  ProviderPlugin  │  AutomationPlugin  │
 │  CapabilityPlugin (host extension point)                │
 ├─────────────────────────────────────────────────────────┤
-│                    CCB (claude-code-best)                │
+│                official Claude Code (`claude`)           │
 │  Agent loop  │  Tool system  │  OAuth  │  Resume        │
 └─────────────────────────────────────────────────────────┘
 ```
@@ -30,8 +30,9 @@ OpenClaude is a personal AI assistant built on top of Claude Code Best (CCB) as 
 
 | Layer | File | Responsibility |
 |-------|------|----------------|
-| Harness | `subprocessRunner.ts` | Spawn/manage CCB subprocess |
-| Harness | `ccbMessageParser.ts` | Parse CCB stream-json output |
+| Harness | `subprocessRunner.ts` | Spawn/manage the official `claude` subprocess |
+| Harness | `claudeMessageParser.ts` | Parse claude stream-json output |
+| Harness | `claudeCli.ts` | Resolve the official `claude` binary path (shared with the PTY terminal) |
 | Harness | `promptSlots.ts` | Build structured system prompt (SOUL/USER/AGENTS/SKILLS/MEMORY/TOOLS) |
 | Harness | `terminalBackend.ts` | Abstraction for local/docker execution |
 | Orchestration | `sessionManager.ts` | Session lifecycle, mutex, retry, FTS5 indexing |
@@ -63,8 +64,8 @@ Static content first (cache-friendly), dynamic last.
 
 Events flow through `GatewayEventBus`:
 
-- `task.created` — CCB CronCreate bridge or API
-- `task.deleted` — CCB CronDelete bridge or API
+- `task.created` — CronCreate tool bridge or API
+- `task.deleted` — CronDelete tool bridge or API
 - `webhook.received` — incoming webhook → agent execution
 - `cron.fired` — cron job completion
 - `agent.delegated` — delegate_task initiated

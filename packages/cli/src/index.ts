@@ -17,7 +17,7 @@ program
   .description('引导式配置(首次)')
   .option('--non-interactive', '非交互模式')
   .option('--json', '输出 JSON 摘要')
-  .option('--claude-code-path <path>', 'Claude Code Best 项目路径')
+  .option('--claude-cli-path <path>', '官方 claude 二进制路径(可选,缺省自动探测)')
   .option('--port <port>', 'gateway 端口', (v) => Number(v))
   .option('--bind <addr>', 'gateway 绑定地址')
   .option('--model <model>', '默认模型 ID')

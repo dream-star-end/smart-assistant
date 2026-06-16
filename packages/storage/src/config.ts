@@ -97,15 +97,15 @@ export interface OpenClaudeConfig {
       includeUsers?: string[]
     }
   }
-  // 接入方式三选一(实际 token 由 CCB 自己存,这里只记录类型)
+  // 接入方式三选一(实际 token 由官方 claude 自己存,这里只记录类型)
   auth: {
     mode: 'subscription' | 'api_key' | 'custom_platform'
-    // CCB 工程目录(我们 spawn 它)
-    claudeCodePath: string
-    // CCB cli 入口(相对 claudeCodePath),默认 src/entrypoints/cli.tsx
-    claudeCodeEntry?: string
-    // 运行 CCB 的解释器(bun / node)
-    claudeCodeRuntime?: 'bun' | 'node'
+    // 可选:官方 `claude` 二进制路径覆盖。缺省时 resolveOfficialClaudePath()
+    // 解析 OPENCLAUDE_OFFICIAL_CLAUDE_PATH → ~/.local/bin/claude → PATH 上的 claude。
+    claudeCliPath?: string
+    // 可选(已弃用):旧的内置 fork 工程目录。聊天引擎已改 spawn 官方 claude,
+    // 此字段不再用于 spawn,仅作为 resolveMcpMemoryEntry 的兜底定位提示而保留兼容。
+    claudeCodePath?: string
     // Claude.ai OAuth tokens (when mode='subscription')
     claudeOAuth?: {
       accessToken: string

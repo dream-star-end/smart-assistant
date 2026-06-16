@@ -41,8 +41,9 @@ export const paths = {
   uploadsDir: join(HOME, 'uploads'),
   // MCP-generated media (images, audio, video) — served via /api/media/
   generatedDir: join(HOME, 'generated'),
-  // Runtime token file written by gateway, mtime-watched by ccb subprocesses
-  // so an OAuth refresh propagates without subprocess restart.
+  // Legacy CCB-era OAuth token sidecar. No longer written or read — the official
+  // claude engine takes its token from the spawn env. Retained only so the
+  // gateway can purge a stale file left over from the in-repo fork.
   runtimeClaudeOauthToken: join(HOME, 'runtime', 'claude_oauth_token.json'),
   // Existing
   agentSessionsDir: (agentId: string) => join(HOME, 'agents', agentId, 'sessions'),

@@ -2,8 +2,9 @@ import type { ChildProcessWithoutNullStreams } from 'node:child_process'
 import { EventEmitter } from 'node:events'
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { dirname, isAbsolute, resolve } from 'node:path'
-import { type McpServerConfig, type OpenClaudeConfig, paths } from '@openclaude/storage'
+import { isAbsolute, resolve } from 'node:path'
+import type { McpServerConfig, OpenClaudeConfig } from '@openclaude/storage'
+import { resolveOfficialClaudePath } from './claudeCli.js'
 import { resolveMcpMemoryEntry } from './codexLaunchOverrides.js'
 import { createLogger } from './logger.js'
 import { buildPromptContext } from './promptSlots.js'
@@ -15,19 +16,23 @@ const runnerLog = createLogger({ module: 'subprocessRunner' })
 // ───────────────────────────────────────────────
 // SubprocessRunner
 //
-// 给单个 sessionKey 长驻一个 CCB 子进程。
-// CCB 命令行:
-//   <runtime> <ccb-entry> -p \
+// 给单个 sessionKey 长驻一个官方 Claude Code 子进程(`claude`)。
+// 命令行:
+//   claude -p \
 //     --input-format=stream-json \
 //     --output-format=stream-json \
 //     --include-partial-messages \
+//     --permission-prompt-tool stdio \
+//     [--model <model>] [--effort <level>] \
 //     [--resume <sessionId>] \
-//     [--system-prompt-file <persona>] \
-//     [--add-dir <cwd>] \
-//     [--permission-mode <mode>]
+//     [--append-system-prompt-file <persona>] \
+//     [--mcp-config <file>] [--permission-mode <mode>] \
+//     [--add-dir <cwd>]   (variadic — kept last)
 //
 // 我们写入 stdin 一行 JSON(SDK user message),从 stdout 读流式 JSONL(SDK 消息流)。
-// CCB 自己处理 auth(订阅 OAuth / API key)、工具循环、压缩、CLAUDE.md。
+// 官方 claude 自己处理 auth(订阅 OAuth / API key)、工具循环、压缩、CLAUDE.md。
+// 权限走 stdio control 协议:claude 在 stdout 发 control_request(can_use_tool),
+// gateway 桥接到前端审批 UI 后,经 stdin 回 control_response(参见 sendPermissionResponse)。
 // ───────────────────────────────────────────────
 
 export interface SubprocessRunnerOpts {
@@ -44,40 +49,22 @@ export interface SubprocessRunnerOpts {
   agentMcpServers?: McpServerConfig[] // agent 专属 MCP servers
   agentToolsets?: string[] // resolved toolsets for this agent (filters MCP servers)
   delegationDepth?: number // current delegation recursion depth (0 = top-level)
-  // Optional CCB effort level passed via env (CLAUDE_CODE_EFFORT_LEVEL).
-  // When undefined, no env var is set and CCB falls back to its model-default
-  // effort (typically "high" on Opus 4.7 per Anthropic API). Only set values
-  // CCB recognises in EFFORT_LEVELS — currently 'low'|'medium'|'high'|'xhigh'|'max'.
-  // Source-of-truth lives in claude-code-best/src/utils/effort.ts.
+  // Optional effort level passed via the official `--effort <level>` flag.
+  // When undefined, no flag is set and claude falls back to its model-default
+  // effort. Only set values claude recognises — 'low'|'medium'|'high'|'xhigh'|'max'.
   effortLevel?: string
   /**
-   * Workload tag threaded to CCB's `--workload <tag>` flag, which CCB writes
-   * into `x-anthropic-billing-header` as `cc_workload=<tag>`. Anthropic uses
-   * it to route e.g. cron-initiated traffic to a lower-QoS pool, keeping
-   * automated background calls from competing with interactive user calls
-   * for rate-limit headroom.
-   *
-   * Runner creation-time attribute — fixed for the life of the subprocess.
-   * Don't try to mutate per-turn: CCB consumes the value through
-   * `runWithWorkload(cmd.workload ?? options.workload, ...)` in print.ts and
-   * `options.workload` is set once at process startup.
-   *
-   * CCB sanitizer accepts lowercase `[a-z0-9_-]{0,32}` only — callers should
-   * pass values matching that shape (currently only `'cron'`).
-   */
-  workload?: string
-  /**
-   * Effective egress proxy URL for this CCB subprocess (per-agent override
+   * Effective egress proxy URL for this claude subprocess (per-agent override
    * resolved against the global config in `sessionManager`).
    *
    * Non-empty → 4 PROXY env keys (HTTPS_PROXY/HTTP_PROXY + lowercase) are
    * injected over whatever the gateway process env carries. Empty / undefined
-   * → no override; CCB inherits the gateway's own env (typically the systemd
+   * → no override; claude inherits the gateway's own env (typically the systemd
    * `HTTPS_PROXY`). This is the deliberate asymmetry with codex runners —
    * see `OpenClaudeConfig.proxyUrl` docstring in storage/config.ts for the
-   * rationale (codex stays explicit-only, CCB keeps its historical inherit
-   * behaviour so the operator's systemd carve-outs / NO_PROXY remain in
-   * effect for plain CCB).
+   * rationale (codex stays explicit-only, the chat engine keeps its historical
+   * inherit behaviour so the operator's systemd carve-outs / NO_PROXY remain
+   * in effect).
    *
    * Caller is responsible for normalising whitespace / empty values
    * (`normalizeProxyUrl` in `proxyEnv.ts`).
@@ -85,7 +72,7 @@ export interface SubprocessRunnerOpts {
   proxyUrl?: string
 }
 
-// CCB 输出的 SDK message 类型(简化):兼容 stream-json 输出
+// 官方 claude 输出的 SDK message 类型(简化):兼容 stream-json 输出
 export interface SdkMessage {
   type: string
   subtype?: string
@@ -109,66 +96,48 @@ export interface SdkMessage {
   is_error?: boolean
 }
 
-/** Permission response from the user (sent back to CCB as control_response) */
+/** Permission response from the user (sent back to claude as control_response) */
 export type PermissionResponse =
   | { behavior: 'allow'; updatedInput: Record<string, unknown>; toolUseID?: string }
   | { behavior: 'deny'; message: string; toolUseID?: string }
 
 /**
- * Inputs for `buildCcbCliArgs`. Everything that influences the subprocess's
+ * Inputs for `buildClaudeCliArgs`. Everything that influences the subprocess's
  * CLI argv lives here so the argv construction is a pure function — trivially
  * unit-testable, no side effects, no file I/O.
  */
-export interface CcbCliArgsInput {
-  /** e.g. 'bun' or 'node' (maps to `run` vs `--experimental-strip-types`) */
-  runtime: string
-  /** Entry file path, e.g. src/entrypoints/cli.tsx */
-  entry: string
+export interface ClaudeCliArgsInput {
   model?: string
+  /** Effort level → official `--effort <level>` flag ('low'|'medium'|'high'|'xhigh'|'max'). */
+  effortLevel?: string
   permissionMode?: string
   extraPromptFile?: string
   mcpConfigFile?: string
   addDir?: string
   resumeSessionId?: string | null
-  /**
-   * Workload tag → CCB `--workload <tag>` → `cc_workload=<tag>` in the
-   * attribution header. CCB sanitizer rejects anything outside
-   * `[a-z0-9_-]{0,32}`, so pass only lowercase short tags
-   * (currently only `'cron'`).
-   */
-  workload?: string
 }
 
 /**
- * Build the argv array that we pass to the CCB subprocess.
+ * Build the argv array that we pass to the official `claude` subprocess.
  *
  * IMPORTANT invariant: `--permission-prompt-tool stdio` is always present,
- * regardless of `permissionMode`. CCB's permissions.ts step 1e keeps
- * `requiresUserInteraction()` tools (AskUserQuestion, ExitPlanMode, …)
- * bypass-immune — they still return `behavior:'ask'` even in
- * bypassPermissions mode. Without a permission-prompt-tool, that ask falls
- * through `getCanUseToolFn`'s fallback branch in CCB's print.ts and
- * toolExecution.ts then treats the unresolved ask as a deny, surfacing the
- * tool's raw ask-message (e.g. "Answer questions?") as the tool error.
- *
- * Non-interactive tools are unaffected — step 2a's bypass-allow in
- * permissions.ts fires before any ask result is ever produced for them.
+ * regardless of `permissionMode`. Interactive tools (AskUserQuestion,
+ * ExitPlanMode, …) stay ask-immune even under bypassPermissions; the stdio
+ * permission-prompt channel is how claude emits `can_use_tool` control_requests
+ * on stdout that the gateway bridges to the web frontend. Without it those asks
+ * have no responder and surface as tool errors.
  */
-export function buildCcbCliArgs(input: CcbCliArgsInput): string[] {
+export function buildClaudeCliArgs(input: ClaudeCliArgsInput): string[] {
   const {
-    runtime,
-    entry,
     model,
+    effortLevel,
     permissionMode,
     extraPromptFile,
     mcpConfigFile,
     addDir,
     resumeSessionId,
-    workload,
   } = input
   const args: string[] = [
-    runtime === 'bun' ? 'run' : '--experimental-strip-types',
-    entry,
     '-p',
     '--input-format=stream-json',
     '--output-format=stream-json',
@@ -176,6 +145,9 @@ export function buildCcbCliArgs(input: CcbCliArgsInput): string[] {
     '--verbose',
   ]
   if (model) args.push('--model', model)
+  // Effort moved from CCB's CLAUDE_CODE_EFFORT_LEVEL env to the official
+  // `--effort` flag. Omitted → claude uses its model-default effort.
+  if (effortLevel) args.push('--effort', effortLevel)
   if (permissionMode) {
     args.push('--permission-mode', permissionMode)
     // bypassPermissions 需要配合 --dangerously-skip-permissions 才真正放行所有工具
@@ -183,7 +155,7 @@ export function buildCcbCliArgs(input: CcbCliArgsInput): string[] {
       args.push('--dangerously-skip-permissions')
     }
   }
-  // See function JSDoc: stdio prompting must be enabled in ALL modes so CCB
+  // See function JSDoc: stdio prompting must be enabled in ALL modes so claude
   // emits `can_use_tool` control_requests on stdout that the gateway bridges
   // to the web frontend. Required even under bypassPermissions for
   // interactive tools like AskUserQuestion.
@@ -193,16 +165,13 @@ export function buildCcbCliArgs(input: CcbCliArgsInput): string[] {
   if (extraPromptFile) args.push('--append-system-prompt-file', extraPromptFile)
   // Wire up MCP memory/skills/search server
   if (mcpConfigFile) args.push('--mcp-config', mcpConfigFile)
-  if (addDir) args.push('--add-dir', addDir)
   if (resumeSessionId) args.push('--resume', resumeSessionId)
-  // CCB `--workload <tag>` is a hidden CLI flag intended for SDK daemon
-  // callers that spawn CCB for background work (cron / scheduled tasks).
-  // The tag is wrapped around every turn via runWithWorkload() in print.ts
-  // and surfaces as `cc_workload=<tag>` in x-anthropic-billing-header,
-  // letting Anthropic route the traffic at a lower QoS.
-  if (workload) args.push('--workload', workload)
-  // 必须给一个 prompt placeholder,CCB stream-json 会从 stdin 接管
-  args.push('')
+  // --add-dir LAST: official claude declares it variadic (`<directories...>`),
+  // so it must not be followed by stray tokens or they're swallowed as extra
+  // dirs. (The old CCB fork also took a trailing '' prompt placeholder; official
+  // claude reads the prompt from stdin in stream-json mode and needs none — a
+  // trailing '' would be eaten by --add-dir as an empty path and warned on.)
+  if (addDir) args.push('--add-dir', addDir)
   return args
 }
 
@@ -234,13 +203,6 @@ export class SubprocessRunner extends EventEmitter {
   /** Running byte count for stderr within a single "line" window — caps runaway stderr. */
   private stderrBufBytes = 0
   private currentSessionId: string | null = null
-  /**
-   * Count of `_oc_telemetry` lines silently dropped because their `session_id`
-   * field was missing or empty. Design rule: telemetry session_id is runtime
-   * expected but implementation tolerates absence (drop + count, don't error).
-   * See docs/ccb-telemetry-refactor-plan.md §3.1 + §5.1.
-   */
-  private missingSessionIdCount = 0
   private starting = false
   private closed = false
   private shuttingDown = false
@@ -326,21 +288,17 @@ export class SubprocessRunner extends EventEmitter {
     // retry immediately and re-throw, burning CPU.
     try {
       const { config } = this.opts
-      let ccbDir: string
-      try {
-        ccbDir = resolve(config.auth.claudeCodePath)
-      } catch (err) {
-        this.starting = false
-        throw err
-      }
-      if (!existsSync(ccbDir)) {
+      // Resolve the official `claude` binary. Config override wins, else the
+      // shared resolver (same authority the interactive PTY uses). Only
+      // sanity-check absolute paths; a bare `claude` is resolved via PATH at
+      // spawn time.
+      const claudeBin = config.auth.claudeCliPath?.trim() || resolveOfficialClaudePath()
+      if (isAbsolute(claudeBin) && !existsSync(claudeBin)) {
         this.starting = false
         throw new Error(
-          `Claude Code path not found: ${ccbDir}. Set auth.claudeCodePath in ~/.openclaude/openclaude.json`,
+          `Official Claude Code binary not found: ${claudeBin}. Install it (see onboard) or set OPENCLAUDE_OFFICIAL_CLAUDE_PATH.`,
         )
       }
-      const entry = config.auth.claudeCodeEntry ?? 'src/entrypoints/cli.tsx'
-      const runtime = config.auth.claudeCodeRuntime ?? 'bun'
 
       // ─── L1/L2/L3: prepare learning-loop context for the subprocess ───
       let learningContext: Awaited<ReturnType<typeof this.buildLearningContext>>
@@ -351,64 +309,61 @@ export class SubprocessRunner extends EventEmitter {
         throw err
       }
 
-      const args = buildCcbCliArgs({
-        runtime,
-        entry,
+      // ── Provider-aware auth injection ──
+      // claude auth priority: ANTHROPIC_AUTH_TOKEN > CLAUDE_CODE_OAUTH_TOKEN >
+      // ~/.claude/.credentials.json / settings.json. We inject the right env per
+      // provider so claude routes to the correct API.
+      const providerEnv: Record<string, string> = {}
+      const effectiveProvider = this.opts.agentProvider ?? this.opts.config.provider
+
+      if (effectiveProvider === 'claude-subscription') {
+        // Claude subscription: inject OAuth token, route to Anthropic API.
+        if (this.opts.config.auth.claudeOAuth?.accessToken) {
+          // Official claude reads CLAUDE_CODE_OAUTH_TOKEN from env. A gateway-side
+          // token refresh is materialised into config; a running subprocess keeps
+          // its spawn-time token until it restarts — the 401/AUTH_ERROR retry path
+          // (sessionManager) recycles it when the old token expires mid-turn.
+          // (We no longer ship the CCB-only OPENCLAUDE_CLAUDE_OAUTH_TOKEN_FILE
+          // hot-reload sidecar; a token refresh costs at most one 401 round-trip.)
+          providerEnv.CLAUDE_CODE_OAUTH_TOKEN = this.opts.config.auth.claudeOAuth.accessToken
+        }
+        // Clear any inherited provider vars so nothing redirects Claude requests
+        // away from Anthropic. Provider isolation relies on (a) this env clearing
+        // and (b) the host's ~/.claude/settings.json carrying no provider `env`
+        // block. (We previously passed `--setting-sources project,local` to mimic
+        // CCB's PROVIDER_MANAGED_BY_HOST, but that both excluded legitimate user
+        // settings AND collapsed to a no-op when the agent cwd equals $HOME — so
+        // project settings == user settings. Dropped as a fragile half-measure.)
+        providerEnv.ANTHROPIC_BASE_URL = ''
+        providerEnv.ANTHROPIC_AUTH_TOKEN = ''
+        providerEnv.ANTHROPIC_MODEL = ''
+      } else if (effectiveProvider === 'codex' || effectiveProvider === 'openai') {
+        // OpenAI/Codex: use Codex OAuth token via an Anthropic-compatible proxy.
+        if (this.opts.config.auth.codexOAuth?.accessToken) {
+          providerEnv.ANTHROPIC_AUTH_TOKEN = this.opts.config.auth.codexOAuth.accessToken
+          // Leave ANTHROPIC_BASE_URL unset to let settings.json / env provide it.
+        }
+        // Don't inject Claude OAuth — that would override the Codex token.
+      } else {
+        // MiniMax / DeepSeek / custom provider: DON'T inject any OAuth token.
+        // Let claude fall through to ~/.claude/.credentials.json / settings.json,
+        // which carry the active subscription (or a provider's
+        // Anthropic-compatible ANTHROPIC_BASE_URL + ANTHROPIC_AUTH_TOKEN).
+        // This is the "default" path — credentials/settings control routing.
+      }
+
+      const args = buildClaudeCliArgs({
         model: this.opts.model,
+        effortLevel: this.opts.effortLevel,
         permissionMode: this.opts.permissionMode,
         extraPromptFile: learningContext.extraPromptFile,
         mcpConfigFile: learningContext.mcpConfigFile,
         addDir: this.opts.cwd,
         resumeSessionId: this.currentSessionId,
-        workload: this.opts.workload,
       })
 
-      // ── Provider-aware auth injection ──
-      // CCB auth priority: ANTHROPIC_AUTH_TOKEN > CLAUDE_CODE_OAUTH_TOKEN > settings.json
-      // We must inject the right env vars per provider so CCB routes to the correct API.
-      const providerEnv: Record<string, string> = {}
-      const effectiveProvider = this.opts.agentProvider ?? this.opts.config.provider
-
-      if (effectiveProvider === 'claude-subscription') {
-        // Claude subscription: inject OAuth token, route to Anthropic API
-        if (this.opts.config.auth.claudeOAuth?.accessToken) {
-          providerEnv.CLAUDE_CODE_OAUTH_TOKEN = this.opts.config.auth.claudeOAuth.accessToken
-          // Hot-reload path: ccb watches this file's mtime and re-reads on change,
-          // so a gateway-side OAuth refresh propagates without subprocess restart.
-          // Falls back to CLAUDE_CODE_OAUTH_TOKEN env above when file is missing.
-          // Gated on config token existing so a stale runtime file (e.g. left
-          // over after the user logged out) can't "revive" old auth.
-          providerEnv.OPENCLAUDE_CLAUDE_OAUTH_TOKEN_FILE = paths.runtimeClaudeOauthToken
-        }
-        // CRITICAL: Tell CCB that the host owns provider routing.
-        // Without this, CCB's managedEnv.ts will Object.assign settings.json env
-        // (ANTHROPIC_BASE_URL=minimax, ANTHROPIC_AUTH_TOKEN=minimax_key) OVER our
-        // spawn env, routing Claude requests to MiniMax instead of Anthropic.
-        // With this flag, CCB strips provider vars from settings.json during load.
-        providerEnv.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST = '1'
-        providerEnv.ANTHROPIC_BASE_URL = ''
-        providerEnv.ANTHROPIC_AUTH_TOKEN = ''
-        providerEnv.ANTHROPIC_MODEL = ''
-      } else if (effectiveProvider === 'codex' || effectiveProvider === 'openai') {
-        // OpenAI/Codex: use Codex OAuth token via OpenAI-compatible endpoint
-        // CCB doesn't natively support OpenAI, but OpenAI provides an Anthropic-compatible
-        // proxy at https://api.openai.com/anthropic/ (or use a local proxy like LiteLLM)
-        if (this.opts.config.auth.codexOAuth?.accessToken) {
-          providerEnv.ANTHROPIC_AUTH_TOKEN = this.opts.config.auth.codexOAuth.accessToken
-          // Note: OpenAI doesn't have an Anthropic-compatible endpoint by default.
-          // Users need to configure a proxy (LiteLLM/OneAPI) or this won't work.
-          // Leave ANTHROPIC_BASE_URL unset to let settings.json or env provide it.
-        }
-        // Don't inject Claude OAuth — that would override the Codex token
-      } else {
-        // MiniMax / DeepSeek / custom provider: DON'T inject any OAuth token.
-        // Let CCB fall through to settings.json (which has ANTHROPIC_BASE_URL +
-        // ANTHROPIC_AUTH_TOKEN pointing to the provider's Anthropic-compatible endpoint).
-        // This is the "default" path — settings.json controls routing.
-      }
-
       // Per-agent / global egress proxy override. Non-empty wins over any
-      // inherited process.env. Empty / undefined → no override, CCB inherits
+      // inherited process.env. Empty / undefined → no override, claude inherits
       // whatever the gateway process env carries (typically systemd
       // HTTPS_PROXY). All four common spellings are set in lockstep so Rust
       // reqwest / Node undici / shelled-out tools all see the same value.
@@ -417,13 +372,32 @@ export class SubprocessRunner extends EventEmitter {
         for (const key of PROXY_ENV_KEYS) proxyEnv[key] = this.opts.proxyUrl
       }
 
+      // Fail fast on the Docker terminal backend: its volume-mount + command
+      // semantics were designed around the vendored CCB install dir (mounting the
+      // source tree at /opt/ccb and running `bun`/`node` against it). The official
+      // `claude` binary isn't present in that container layout, so spawning it via
+      // DockerBackend would silently break. Local backend is the supported path;
+      // re-enable Docker only once the mount/command semantics are redefined for
+      // the official binary.
+      if (this.opts.config.terminal?.type === 'docker') {
+        this.starting = false
+        throw new Error(
+          'Docker terminal backend is not supported with the official Claude Code engine yet ' +
+            "(its /opt/ccb mount assumed the removed in-repo fork). Use terminal.type 'local'.",
+        )
+      }
+
       let proc: ReturnType<TerminalBackend['spawn']>
       try {
         const backend: TerminalBackend = createBackend(this.opts.config.terminal)
         proc = backend.spawn({
-          command: runtime,
+          command: claudeBin,
           args,
-          cwd: ccbDir,
+          // Run in the agent's real working directory: official claude is a
+          // self-contained binary, so (unlike the old vendored fork that had to
+          // run from its own source dir) we let it discover CLAUDE.md / relative
+          // paths from the agent's cwd. `--add-dir` still grants access.
+          cwd: this.opts.cwd,
           agentCwd: this.opts.cwd, // agent's real working directory (for Docker volume mount)
           env: {
             ...process.env,
@@ -431,21 +405,11 @@ export class SubprocessRunner extends EventEmitter {
             ...proxyEnv,
             OPENCLAUDE_SESSION_KEY: this.opts.sessionKey,
             OPENCLAUDE_AGENT_ID: this.opts.agentId,
-            // Per-session effort level (xhigh / max from chat-mode pills, or
-            // undefined to let CCB use its model-default — Opus 4.7 → high).
-            // Empty string deletes any inherited CLAUDE_CODE_EFFORT_LEVEL so a
-            // gateway-process env doesn't bleed into spawned CCBs.
-            CLAUDE_CODE_EFFORT_LEVEL: this.opts.effortLevel ?? '',
-            // Note: CLAUDE_CODE_DISABLE_BACKGROUND_TASKS used to be set to '1'
-            // here to strip run_in_background from Bash/Agent/PowerShell tool
-            // schemas (visibility band-aid for Opus 4.7 over-using background
-            // mode). Removed once CCB started streaming bash_output_tail
-            // SDK events at 1 Hz — the underlying UX problem (background
-            // commands looking idle) is now solved end-to-end (CCB
-            // sdkEventQueue → gateway ccbMessageParser → web tool_output_tail
-            // block), so the model can pick run_in_background:true again.
+            // Effort is passed via the official `--effort` flag now (see
+            // buildClaudeCliArgs). Blank out any inherited CLAUDE_CODE_EFFORT_LEVEL
+            // so a gateway-process env can't silently override the flag.
+            CLAUDE_CODE_EFFORT_LEVEL: '',
             IS_SANDBOX: '1',
-            FEATURE_VERIFICATION_AGENT: '1',
           },
           stdio: ['pipe', 'pipe', 'pipe'],
           detached: true, // create process group so shutdown() can kill all children
@@ -604,39 +568,12 @@ export class SubprocessRunner extends EventEmitter {
       if (trimmed) {
         try {
           const msg = JSON.parse(trimmed) as SdkMessage
-          // OpenClaude telemetry side-channel: `_oc_telemetry` lines are
-          // observability events, not SDK messages. Route them to the
-          // dedicated 'telemetry' listener and skip the normal pipeline:
-          //   - NEVER update currentSessionId from a telemetry line
-          //     (Gateway session tracking must stay driven by real SDK
-          //     messages only)
-          //   - NEVER emit 'message' (parser would crash on unknown type)
-          //
-          // session_id on telemetry is required-but-tolerated: if missing
-          // we silently drop and bump missingSessionIdCount so anomalies
-          // show up in diagnostics instead of crashing.
-          // Design doc: ccb-telemetry-refactor-plan.md §3.1 + §5.1.
-          if ((msg as { type?: string }).type === '_oc_telemetry') {
-            const telemetryMsg = msg as SdkMessage & {
-              type: '_oc_telemetry'
-              session_id?: string
-            }
-            if (
-              typeof telemetryMsg.session_id !== 'string' ||
-              telemetryMsg.session_id.length === 0
-            ) {
-              this.missingSessionIdCount++
-            } else {
-              this.emit('telemetry', telemetryMsg)
-            }
-          } else {
-            // Always update session ID (CCB may report a new one after --resume)
-            if (msg.session_id && msg.session_id !== this.currentSessionId) {
-              this.currentSessionId = msg.session_id
-              this.emit('session_id', this.currentSessionId)
-            }
-            this.emit('message', msg)
+          // Always update session ID (claude may report a new one after --resume)
+          if (msg.session_id && msg.session_id !== this.currentSessionId) {
+            this.currentSessionId = msg.session_id
+            this.emit('session_id', this.currentSessionId)
           }
+          this.emit('message', msg)
         } catch (err) {
           this.emit('parse_error', { line: trimmed, err })
         }
@@ -877,12 +814,7 @@ export class SubprocessRunner extends EventEmitter {
     }
   }
 
-  /** Read-only snapshot of telemetry drop diagnostics. */
-  getTelemetryDiagnostics(): { missingSessionIdCount: number } {
-    return { missingSessionIdCount: this.missingSessionIdCount }
-  }
-
-  // 发送 interrupt control request — CCB 会中止当前 turn
+  // 发送 interrupt control request — claude 会中止当前 turn
   interrupt(): boolean {
     if (!this.proc) return false
     try {

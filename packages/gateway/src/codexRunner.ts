@@ -983,7 +983,7 @@ export class CodexRunner extends EventEmitter {
       if (itemType === 'agent_message') {
         const text = typeof item.text === 'string' ? item.text : ''
         if (text) {
-          // CcbMessageParser 约定正常 assistant 文本走 stream_event.text_delta
+          // ClaudeMessageParser 约定正常 assistant 文本走 stream_event.text_delta
           // 路径(assistant 快照只带 tool_use,text 会被 _handleAssistant 丢弃)。
           // 我们把 codex 的一次性 agent_message 以一个完整 delta 送进去,
           // 由 _handleStreamEvent 正常累加到 assistantBuf 并 emit block。

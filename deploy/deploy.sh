@@ -18,9 +18,11 @@ git log --oneline $BEFORE..$AFTER
 
 echo ""
 echo "=== Restarting gateway ==="
-# Kill old CCB processes so they pick up new code
-pkill -9 -f claude-code-best 2>/dev/null || true
-sleep 1
+# Restarting the gateway tears down its detached process group, which kills any
+# child `claude` chat subprocesses, so they re-spawn against the new code. (No
+# more `pkill -f claude-code-best` — the in-repo fork is gone, and we must NOT
+# blanket-kill `claude` lest we also kill the official interactive terminal
+# sessions, which are owned by the same gateway but should survive.)
 systemctl restart openclaude
 sleep 3
 

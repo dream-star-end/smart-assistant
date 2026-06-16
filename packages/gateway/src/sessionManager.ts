@@ -11,14 +11,13 @@ import {
   paths,
   upsertSessionMeta,
 } from '@openclaude/storage'
-import { CcbMessageParser, type SessionStreamEvent } from './ccbMessageParser.js'
+import { ClaudeMessageParser, type SessionStreamEvent } from './claudeMessageParser.js'
 import { CodexAppServerRunner } from './codexAppServerRunner.js'
 import { CodexRunner } from './codexRunner.js'
 import { createEvent, eventBus } from './eventBus.js'
 import { createLogger } from './logger.js'
 import { normalizeProxyUrl } from './proxyEnv.js'
 import { SubprocessRunner } from './subprocessRunner.js'
-import { type OcTelemetryEvent, TelemetryChannel } from './telemetryChannel.js'
 
 const log = createLogger({ module: 'sessionManager' })
 
@@ -309,7 +308,7 @@ export interface AgentSession {
   // CCB CronCreate bridge: maps tool_use_id/content_key → gateway cron job ID
   _cronBridgeMap?: Map<string, string>
   // Current turn parser (for idle-timeout to check pendingToolCalls)
-  _currentParser?: import('./ccbMessageParser.js').CcbMessageParser
+  _currentParser?: import('./claudeMessageParser.js').ClaudeMessageParser
   // Cross-turn stdout 'message' listener. Per-turn _runOneTurn replaces
   // (not removes) this on the next turn so bg-bash bash_output_tail
   // emitted after the turn's `result` keeps flowing through parser ->
@@ -318,8 +317,8 @@ export interface AgentSession {
   _historicalContextInjected?: boolean
 }
 
-// Re-export from ccbMessageParser so existing imports keep working
-export type { SessionStreamEvent } from './ccbMessageParser.js'
+// Re-export from claudeMessageParser so existing imports keep working
+export type { SessionStreamEvent } from './claudeMessageParser.js'
 
 export interface CronBridgeEvent {
   action: 'create' | 'delete' | 'list'
@@ -542,26 +541,15 @@ export class SessionManager {
     userId?: string
     title?: string
     delegationDepth?: number
-    /** 仅用于**新建** runner 时初始化 CLAUDE_CODE_EFFORT_LEVEL:
+    /** 仅用于**新建** runner 时初始化 effort(官方 `--effort` flag):
      *    - string         : 用作初始值
-     *    - null/undefined : 让 CCB 用模型默认 effort
+     *    - null/undefined : 让 claude 用模型默认 effort
      *
      *  既存 session 的 effort 切换走 submit(effortLevel) — 在那里和 turn 入队
      *  原子串行,避免 getOrCreate→submit 之间的窗口期被另一条并发消息覆盖。 */
     effortLevel?: string | null
-    /**
-     * Workload tag → CCB `--workload <tag>` → `cc_workload=<tag>` in the
-     * billing-header attribution block. Set this to `'cron'` for
-     * cron-initiated sessions so Anthropic can serve them at lower QoS and
-     * keep automated traffic from competing with interactive calls for
-     * rate-limit headroom.
-     *
-     * Runner creation-time attribute — read only on fresh-spawn, ignored on
-     * existing-session reuse. CCB sanitizer requires `[a-z0-9_-]{0,32}`.
-     */
-    workload?: string
   }): Promise<AgentSession> {
-    // 新建时 null 等同 undefined(都让 CCB 用模型默认)
+    // 新建时 null 等同 undefined(都让 claude 用模型默认)
     const initialEffort: string | undefined =
       opts.effortLevel === null ? undefined : opts.effortLevel
 
@@ -665,10 +653,9 @@ export class SessionManager {
         agentMcpServers: opts.agent.mcpServers,
         agentToolsets: opts.agent.toolsets ?? this.config.defaults.toolsets,
         delegationDepth: opts.delegationDepth,
-        // Symmetrically: only resume CCB from a CCB-tagged id.
+        // Symmetrically: only resume claude from a claude-tagged id.
         resumeSessionId: this._resumeIdFor(opts.sessionKey, providerTag),
         effortLevel: initialEffort,
-        workload: opts.workload,
         proxyUrl: effectiveProxyUrl,
       })
     }
@@ -953,9 +940,8 @@ export class SessionManager {
       }
       // Liveness-based timeout with state-aware thresholds.
       // `lastActivityAt` is refreshed on EVERY stdout chunk (subprocessRunner
-      // handleStdout:505) — this includes CCB's _oc_telemetry side-channel
-      // events (tool.preUse fires just before each tool.call, turn.apiResponse
-      // after each stream, etc.), so a live subprocess keeps refreshing even
+      // handleStdout) — claude streams partial-message deltas and stream_event
+      // rows throughout a turn, so a live subprocess keeps refreshing even
       // during long tools that produce no content blocks.
       // Thresholds tuned for "process active but deadlocked" detection speed
       // (was 30/60min pre-2026-04-19):
@@ -1269,18 +1255,12 @@ export class SessionManager {
         onEvent(e)
       }
 
-      // Per-turn OpenClaude telemetry sink. Consumes `_oc_telemetry` lines
-      // routed by subprocessRunner (see docs/ccb-telemetry-refactor-plan.md).
-      // Lifecycle: constructed per turn, dropped by `detach()` on every exit
-      // path (normal finish / error / exit / idle timeout / submit catch).
-      const telemetry = new TelemetryChannel()
-      const handleTelemetry = (ev: OcTelemetryEvent) => telemetry.ingest(ev)
       // Per-turn parse_error listener (previously only installed at runner
       // construction). Must be detached with the rest to avoid per-turn
       // listener accumulation (R9).
       const handleParseError = (payload: { line: string; err: unknown }) => {
         const err = payload.err as Error | undefined
-        log.warn('ccb stdout parse_error', {
+        log.warn('claude stdout parse_error', {
           sessionKey: session.sessionKey,
           msg: err?.message,
           sample: payload.line?.slice(0, 200),
@@ -1297,18 +1277,14 @@ export class SessionManager {
         // where idle-timeout releases the lock, a new turn starts and sets
         // a new parser, then this stale detach wipes the new reference).
         if (session._currentParser === parser) session._currentParser = undefined
-        // 故意不卸载 runner.off('message', handleMessage):
-        // CCB 的 bg bash 在 turn 结束后仍 emit bash_output_tail,
-        // 需要继续流经 parser (允许 finalized 通过 tail) → wrappedOnEvent
-        // → onEvent → this.deliver。下一轮 _runOneTurn 启动时会主动替换
-        // session._currentMessageListener,旧闭包链届时被 GC。
+        // 故意不卸载 runner.off('message', handleMessage):下一轮 _runOneTurn
+        // 启动时会主动替换 session._currentMessageListener,旧闭包链届时被 GC。
         runner.off('error', handleError)
         runner.off('exit', handleExit)
-        runner.off('telemetry', handleTelemetry)
         runner.off('parse_error', handleParseError)
       }
 
-      const parser = new CcbMessageParser({
+      const parser = new ClaudeMessageParser({
         toolUseIdToName: session.toolUseIdToName,
         onEvent: wrappedOnEvent,
         onToolUse: (tool) => {
@@ -1372,7 +1348,7 @@ export class SessionManager {
           detach()
 
           // Detect auth error in assistant output — roll back counters and reject.
-          // Two signals: (1) isError + broad keyword match, (2) CCB's exact error prefix.
+          // Two signals: (1) isError + broad keyword match, (2) claude's exact error prefix.
           const isAuthError =
             result &&
             ((result.isError && SessionManager.AUTH_KEYWORDS_RE.test(result.assistantText)) ||
@@ -1385,78 +1361,32 @@ export class SessionManager {
             return
           }
 
-          // Phantom-turn detection — three-state logic (v3):
-          //   - apiState='skipped'  → CCB explicitly said no API call
-          //                           (slash command path). Normal completion,
-          //                           zero cost is expected, NOT phantom.
-          //   - apiState='called'   → CCB explicitly fired willCallApi.
-          //                           Cannot be phantom. If the result row is
-          //                           missing stop_reason AND no blocks came
-          //                           out, note `incomplete` for diagnostics
-          //                           but don't roll back.
-          //   - apiState='unknown'  → No telemetry arrived (e.g. old CCB,
-          //                           disabled kill switch, emit swallowed an
-          //                           error). Fall back to the legacy 9-AND
-          //                           heuristic so behavior is strictly ≤
-          //                           pre-refactor (R7: never fail closed).
-          // See docs/ccb-telemetry-refactor-plan.md §5.4.
+          // Phantom-turn detection (observable-output heuristic).
+          // Official `claude` has no `_oc_telemetry` side-channel, so we judge
+          // purely from what the turn produced. A turn is phantom only when a
+          // plain (non-slash) string prompt yields a clean result with zero
+          // tokens, zero cost, and zero observable output — i.e. claude returned
+          // without ever invoking the model. Slash commands legitimately make
+          // no model call, so they're excluded. This is the same conservative
+          // heuristic the telemetry path fell back to when no signal arrived
+          // (R7: never fail closed — a real turn is never misflagged).
           const userInputStr = typeof userTextOrBlocks === 'string' ? userTextOrBlocks : null
           const isStringInput = userInputStr !== null
           const isSlashCommand = isStringInput && userInputStr!.trimStart().startsWith('/')
 
-          const signals = telemetry.getTurnSignals()
-          let isPhantomTurn = false
-          switch (signals.apiState) {
-            case 'skipped':
-              log.info('turn.skipped (telemetry)', {
-                sessionKey: session.sessionKey,
-                reason: signals.skipReason,
-              })
-              isPhantomTurn = false
-              break
-            case 'called':
-              isPhantomTurn = false
-              if (
-                result &&
-                !result.stopReason &&
-                turnBlockCount === 0 &&
-                turnPermissionCount === 0
-              ) {
-                telemetry.noteIncomplete()
-                // Correlate with turn.apiResponse (if received) to distinguish
-                // "stream ended mid-flight" from "stream never finished" —
-                // apiResponse fires only after stream loop completes, so its
-                // absence here means CCB's stream completed without producing
-                // an assistant message.
-                const apiResp = telemetry.getTurnApiResponse()
-                const lastTool = telemetry.getLastToolPreUse()
-                log.warn('telemetry: willCallApi fired but no stop_reason and no blocks', {
-                  sessionKey: session.sessionKey,
-                  incompleteCount: telemetry.getIncompleteCount(),
-                  hadApiResponse: !!apiResp,
-                  apiRespStopReason: apiResp?.data.stopReason,
-                  lastToolPreUse: lastTool?.data.toolName,
-                  toolErrorCount: telemetry.getToolErrors().length,
-                })
-              }
-              break
-            case 'unknown':
-              // Legacy 9-AND heuristic (unchanged from pre-refactor)
-              isPhantomTurn =
-                !!result &&
-                isStringInput &&
-                !isSlashCommand &&
-                !result.isError &&
-                result.inputTokens === 0 &&
-                result.outputTokens === 0 &&
-                result.cacheReadTokens === 0 &&
-                result.cacheCreationTokens === 0 &&
-                result.cost === 0 &&
-                turnToolCallCount === 0 &&
-                turnBlockCount === 0 &&
-                turnPermissionCount === 0
-              break
-          }
+          const isPhantomTurn =
+            !!result &&
+            isStringInput &&
+            !isSlashCommand &&
+            !result.isError &&
+            result.inputTokens === 0 &&
+            result.outputTokens === 0 &&
+            result.cacheReadTokens === 0 &&
+            result.cacheCreationTokens === 0 &&
+            result.cost === 0 &&
+            turnToolCallCount === 0 &&
+            turnBlockCount === 0 &&
+            turnPermissionCount === 0
 
           if (isPhantomTurn) {
             // Roll back parser-mutated counters (parser already incremented
@@ -1464,12 +1394,12 @@ export class SessionManager {
             session.totalCostUSD = prevCostUSD
             session.turns = prevTurns
             session._lastCcbCumulativeCost = prevLastCcbCost
-            log.warn('phantom turn — CCB returned empty result without invoking model', {
+            log.warn('phantom turn — claude returned empty result without invoking model', {
               sessionKey: session.sessionKey,
               turnIndex: session.turns + 1,
               durationMs: Date.now() - turnStartTime,
             })
-            settle(() => reject(new Error('PHANTOM_TURN: CCB returned empty result')))
+            settle(() => reject(new Error('PHANTOM_TURN: claude returned empty result')))
             return
           }
 
@@ -1775,7 +1705,6 @@ export class SessionManager {
       session._currentMessageListener = handleMessage
       runner.on('error', handleError)
       runner.on('exit', handleExit)
-      runner.on('telemetry', handleTelemetry)
       runner.on('parse_error', handleParseError)
 
       runner.submit(userTextOrBlocks).catch((err) => {

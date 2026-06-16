@@ -24,7 +24,7 @@ journalctl -u openclaude -f     # 实时跟踪日志
 | 路径 | 用途 |
 |------|------|
 | `/opt/openclaude/openclaude/` | 代码主目录 |
-| `/opt/openclaude/claude-code-best/` | CCB agent 运行时 |
+| `~/.local/bin/claude` | 官方 Claude Code agent 运行时(gateway spawn 它) |
 | `/root/.openclaude/openclaude.json` | 主配置(provider/MCP/gateway) |
 | `/root/.openclaude/agents.yaml` | agent 路由配置 |
 | `/root/.openclaude/agents/main/` | 默认 agent 目录 |
