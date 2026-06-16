@@ -175,7 +175,9 @@ export interface PreparedUpstreamSession {
    *
    * OAuth:`stripMalformedThinkingBlocks` 清掉 signature 不足的 thinking / redacted_thinking
    *        block(Anthropic 风控会拒)。strip > 0 → log.warn `proxy_malformed_thinking_blocks_stripped`。
-   * 静态 key:返回原引用(第三方兼容端点不校验 Anthropic signature,strip 无收益)。
+   * 静态 key:此处 noop 原样返回。文本 provider 的 text-only 非文本块(image/document)strip
+   *        已在 handler(http/proxy/index.ts)estimateInputTokens **之前**完成 —— 必须早于静态
+   *        input cap / preCheck,否则历史大 base64 图会被误判 413 + 高估预留 cost。
    */
   sanitizeMessages(messages: unknown[], model: string, log: Logger): unknown[];
 
@@ -300,7 +302,8 @@ type Phase6AccountUuidEnforce = "off" | "fail_open" | "fail_closed";
  *     service_tier;ark:output_config/context_management/service_tier —— **保留 thinking**,glm-5.1 是
  *     thinking 模型) —— 避免第三方 strict 兼容层报未知 beta/参数
  *   - 不注入 oauth-2025-04-20、不动 metadata、不做 persona/device_id pin(那些是 OAuth 专属)
- *   - sanitizeMessages 原样返回、zeroizeSecrets noop(apiKey 来自配置注入,不归 session)
+ *   - sanitizeMessages noop 原样返回(文本 provider 的 text-only 非文本块 strip 在 handler
+ *     estimateInputTokens 之前完成,见 http/proxy/index.ts)、zeroizeSecrets noop(apiKey 来自配置注入,不归 session)
  */
 function makeStaticKeyUpstream(
   spec: StaticKeyProviderSpec,
@@ -324,6 +327,9 @@ function makeStaticKeyUpstream(
       }
     },
     sanitizeMessages(messages, _model, _log) {
+      // 静态 key 文本 provider 的 text-only 非文本块 strip 在 handler(http/proxy/index.ts)
+      // estimateInputTokens **之前**完成(否则历史里残留的大 base64 图会被静态 input cap
+      // 误判 413 + 高估 preCheck cost);到这里 messages 已 sanitized,故 noop 原样返回。
       return messages;
     },
     zeroizeSecrets() {

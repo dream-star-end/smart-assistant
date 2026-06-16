@@ -1023,6 +1023,115 @@ export function stripMalformedThinkingBlocks(messages: unknown[]): {
   };
 }
 
+/**
+ * 静态 key **文本 provider**(deepseek / minimax / ark glm-5.1 —— 见
+ * @openclaude/protocol STATIC_KEY_PROVIDERS,通篇命名即"文本 provider")的 text-only
+ * 输入兜底:把 messages 里的非文本 content block(image / document)就地替换为占位
+ * text block,避免第三方 Anthropic 兼容上游对图片/文档输入返回 400。
+ *
+ * 实测(2026-06-15)ark glm-5.1 Coding Plan 端点对含 image block 的请求返回:
+ *   `{"error":{"code":"InvalidParameter","message":"...Model only support text input...",
+ *     "type":"BadRequest"}}`
+ * → proxy 转译成 502 UPSTREAM_ERROR,且因每个 turn 重放含图历史 → 永久 400 + 重试风暴。
+ *
+ * 为什么必须放在 proxy 而非 gateway 入站:gateway dispatchInbound 已把"用户**上传**的图"
+ * 转成纯文本提示(server.ts "Pass as plain text. No image content blocks"),但图片仍会经
+ * **工具结果**(Read 图片文件 / 浏览器截图 / 返图 MCP)进入 CCB 历史 transcript,作为
+ * `tool_result.content[]` 内嵌 image block 长期驻留。gateway 入站层看不到工具结果;proxy
+ * 是唯一能看到"含历史 tool_result 的完整上游请求体"的权威 chokepoint。
+ *
+ * 处理面(与 Anthropic content block 形状对齐):
+ *   - message.content[] 顶层 image / document        → 替换为占位 text block
+ *   - tool_result.content[] 内嵌 image / document     → 同样替换(保留 tool_use_id;
+ *     tool_result content 不允许为空,1:1 占位保证非空)
+ *   - thinking / text / tool_use / 无内嵌非文本的 tool_result 等 → 原样保留
+ *
+ * 选择"就地替换为占位"而非"删除":1:1 保证 content 非空、保 tool_result 结构,并让文本
+ * 模型明确"此处曾有一张它无法读取的图",而非静默丢上下文。
+ *
+ * 性能/不变量:copy-on-write —— 无任何非文本块时直返原引用,且不 mutate 入参(调用方在
+ * sanitize 后还会读 body / estimateInputTokens 等),与 stripMalformedThinkingBlocks 同构。
+ */
+export function stripNonTextContentBlocks(messages: unknown[]): {
+  messages: unknown[];
+  imagesStripped: number;
+  documentsStripped: number;
+} {
+  let imagesStripped = 0;
+  let documentsStripped = 0;
+  let outer: unknown[] | null = null;
+
+  const isRecord = (v: unknown): v is Record<string, unknown> =>
+    typeof v === "object" && v !== null && !Array.isArray(v);
+
+  // 非文本 block → 占位 text block(并计数);非非文本 → 返回 null 表示原样保留。
+  const placeholderFor = (
+    block: Record<string, unknown>,
+  ): Record<string, unknown> | null => {
+    if (block.type === "image") {
+      imagesStripped++;
+      return { type: "text", text: "[image omitted: this model accepts text input only]" };
+    }
+    if (block.type === "document") {
+      documentsStripped++;
+      return { type: "text", text: "[document omitted: this model accepts text input only]" };
+    }
+    return null;
+  };
+
+  for (let i = 0; i < messages.length; i++) {
+    const msg = messages[i];
+    if (!isRecord(msg)) continue;
+    const content = msg.content;
+    if (!Array.isArray(content)) continue;
+
+    let kept: unknown[] | null = null; // null = 本 message 尚未改
+    for (let j = 0; j < content.length; j++) {
+      const block = content[j];
+      let replacement: unknown = block;
+      if (isRecord(block)) {
+        const ph = placeholderFor(block);
+        if (ph !== null) {
+          replacement = ph;
+        } else if (block.type === "tool_result" && Array.isArray(block.content)) {
+          // 进 tool_result.content 内层(image 最常出现在这里:Read 图片 / 截图工具返图)
+          const inner = block.content;
+          let innerKept: unknown[] | null = null;
+          for (let k = 0; k < inner.length; k++) {
+            const sub = inner[k];
+            const subPh = isRecord(sub) ? placeholderFor(sub) : null;
+            if (subPh !== null) {
+              if (innerKept === null) innerKept = inner.slice(0, k);
+              innerKept.push(subPh);
+            } else if (innerKept !== null) {
+              innerKept.push(sub);
+            }
+          }
+          // innerKept 非 null = 内层有替换;占位已保证非空,直接装回。
+          if (innerKept !== null) replacement = { ...block, content: innerKept };
+        }
+      }
+      if (replacement !== block) {
+        if (kept === null) kept = content.slice(0, j);
+        kept.push(replacement);
+      } else if (kept !== null) {
+        kept.push(block);
+      }
+    }
+
+    if (kept === null) continue; // 本 message 未改
+    const newMsg = { ...msg, content: kept };
+    if (outer === null) outer = messages.slice();
+    outer[i] = newMsg;
+  }
+
+  return {
+    messages: outer ?? messages,
+    imagesStripped,
+    documentsStripped,
+  };
+}
+
 // ─── handler 接口契约(types only) ────────────────────────────────────────
 
 export interface AnthropicProxyDeps {

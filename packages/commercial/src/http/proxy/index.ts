@@ -73,6 +73,7 @@ import {
   extractSessionId,
   readBoundedJson,
   sendJsonError,
+  stripNonTextContentBlocks,
   errMessageShort,
   errSummary,
 } from "./shared.js";
@@ -368,6 +369,32 @@ export function makeAnthropicProxyHandler(
           ctxAvailable: platformCtx !== null,
           fp3: envelopeResult.fp3,
         });
+      }
+
+      // 5e) 静态 key **文本 provider**(deepseek/minimax/ark)text-only 输入兜底。
+      //
+      // 这些上游全是纯文本模型(代码通篇命名即"文本 provider"):ark glm-5.1 Coding Plan
+      // 端点实测对含 image 的请求返回 400 `{"code":"InvalidParameter","message":"...Model
+      // only support text input..."}`。图片为何会到这:gateway 入站已把用户**上传**的图转成
+      // 纯文本提示(server.ts "No image content blocks"),但 image 仍会经**工具结果**(Read
+      // 图片 / 浏览器截图 / 返图 MCP)写进 CCB 历史 transcript,作为 tool_result.content[]
+      // 内嵌 block 长期驻留,每个 turn 重放 → 永久 400 + 重试风暴。
+      //
+      // **必须在 `estimateInputTokens(body)` / 静态 input cap / preCheck 之前**:否则历史里
+      // 的大 base64 图会(a)被下方静态 provider 200k/512k input cap 误判 413(本地卡死,
+      // 与上游 400 同样卡会话),(b)高估 preCheck 预留 cost。strip 后估算/cap/上游 body 同口径。
+      // 注:若未来新增**多模态**静态 provider,需在此按 route.provider.id 分支,而非无条件 strip。
+      if (route.kind === "static") {
+        const stripped = stripNonTextContentBlocks(body.messages);
+        if (stripped.imagesStripped + stripped.documentsStripped > 0) {
+          body.messages = stripped.messages as typeof body.messages;
+          userLog.warn("proxy_static_text_only_nontext_stripped", {
+            provider: route.provider.id,
+            model: body.model,
+            images: stripped.imagesStripped,
+            documents: stripped.documentsStripped,
+          });
+        }
       }
 
       // 6) 双侧 cost 估算 + preCheck(原子预留:Lua 一次完成 余额比对 + 写入)

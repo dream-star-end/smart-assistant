@@ -17,6 +17,8 @@
 
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import {
   proxyBodySchema,
   enforceFieldByteBudgets,
@@ -31,6 +33,7 @@ import {
   rewriteMetadataAccountUuid,
   rewriteMetadataDeviceId,
   stripMalformedThinkingBlocks,
+  stripNonTextContentBlocks,
   isUuidLike,
   DEEPSEEK_UPSTREAM_ENDPOINT,
   ALLOWED_BETA_VALUES,
@@ -1205,6 +1208,149 @@ describe("stripMalformedThinkingBlocks", () => {
     const r = stripMalformedThinkingBlocks(messages);
     assert.equal(r.thinkingStripped, 0, "长但伪造 signature 不被本规则剔除");
     assert.equal(r.redactedThinkingStripped, 0);
+  });
+});
+
+// ─── stripNonTextContentBlocks(文本 provider text-only 输入兜底)──────────────
+
+describe("stripNonTextContentBlocks", () => {
+  const IMG = (mt = "image/jpeg") => ({
+    type: "image",
+    source: { type: "base64", media_type: mt, data: "AAAA" },
+  });
+
+  test("纯文本会话无改动 → 返回原数组引用(copy-on-write)", () => {
+    const messages = [
+      { role: "user", content: "hello" },
+      { role: "assistant", content: [{ type: "text", text: "hi" }] },
+      {
+        role: "user",
+        content: [
+          {
+            type: "tool_result",
+            tool_use_id: "x",
+            content: [{ type: "text", text: "tool output" }],
+          },
+        ],
+      },
+    ];
+    const r = stripNonTextContentBlocks(messages);
+    assert.equal(r.imagesStripped, 0);
+    assert.equal(r.documentsStripped, 0);
+    assert.strictEqual(r.messages, messages, "无非文本块时返回原引用");
+  });
+
+  test("顶层 image block → 就地换占位 text,文本兄弟块保留", () => {
+    const messages = [
+      { role: "user", content: [IMG(), { type: "text", text: "看这张图" }] },
+    ];
+    const r = stripNonTextContentBlocks(messages);
+    assert.equal(r.imagesStripped, 1);
+    const content = (r.messages[0] as { content: any[] }).content;
+    assert.equal(content.length, 2);
+    assert.equal(content[0].type, "text");
+    assert.match(content[0].text, /image omitted/);
+    assert.deepEqual(content[1], { type: "text", text: "看这张图" });
+  });
+
+  test("tool_result 内嵌 image → 就地换占位,保留 tool_use_id 与文本子块(命中生产实况)", () => {
+    const messages = [
+      {
+        role: "user",
+        content: [
+          {
+            type: "tool_result",
+            tool_use_id: "call_34f5d63b",
+            content: [
+              { type: "text", text: "Read 了一张图" },
+              IMG(),
+              IMG("image/png"),
+            ],
+          },
+        ],
+      },
+    ];
+    const r = stripNonTextContentBlocks(messages);
+    assert.equal(r.imagesStripped, 2);
+    const tr = (r.messages[0] as { content: any[] }).content[0];
+    assert.equal(tr.type, "tool_result");
+    assert.equal(tr.tool_use_id, "call_34f5d63b");
+    assert.equal(tr.content.length, 3);
+    assert.equal(tr.content[0].text, "Read 了一张图");
+    assert.match(tr.content[1].text, /image omitted/);
+    assert.match(tr.content[2].text, /image omitted/);
+  });
+
+  test("tool_result content 全是图 → 占位保证非空(上游拒空 content)", () => {
+    const messages = [
+      {
+        role: "user",
+        content: [{ type: "tool_result", tool_use_id: "c", content: [IMG()] }],
+      },
+    ];
+    const r = stripNonTextContentBlocks(messages);
+    assert.equal(r.imagesStripped, 1);
+    const tr = (r.messages[0] as { content: any[] }).content[0];
+    assert.equal(tr.content.length, 1);
+    assert.equal(tr.content[0].type, "text");
+  });
+
+  test("document block → 就地换占位,计入 documentsStripped", () => {
+    const messages = [
+      {
+        role: "user",
+        content: [
+          { type: "document", source: { type: "base64", media_type: "application/pdf", data: "JVBER" } },
+          { type: "text", text: "总结一下" },
+        ],
+      },
+    ];
+    const r = stripNonTextContentBlocks(messages);
+    assert.equal(r.documentsStripped, 1);
+    assert.equal(r.imagesStripped, 0);
+    const content = (r.messages[0] as { content: any[] }).content;
+    assert.match(content[0].text, /document omitted/);
+  });
+
+  test("string content / 非数组 content 跳过,不抛错", () => {
+    const messages = [
+      { role: "user", content: "plain string" },
+      { role: "assistant", content: null },
+      { not_a_message: true },
+    ];
+    const r = stripNonTextContentBlocks(messages as unknown[]);
+    assert.equal(r.imagesStripped, 0);
+    assert.strictEqual(r.messages, messages);
+  });
+
+  test("不 mutate 入参原数组/原对象", () => {
+    const origInner = [{ type: "text", text: "t" }, IMG()];
+    const origMsg = { role: "user", content: [{ type: "tool_result", tool_use_id: "c", content: origInner }] };
+    const messages = [origMsg];
+    const r = stripNonTextContentBlocks(messages);
+    assert.notStrictEqual(r.messages, messages);
+    // 原对象未被改写
+    assert.equal((origMsg.content[0] as any).content[1].type, "image");
+    assert.equal(origInner.length, 2);
+  });
+
+  // 行为锁:strip 必须在 estimateInputTokens **之前**(否则历史里的大 base64 图会先被静态
+  // input cap 误判 413 + 高估 preCheck cost)。用源码文本结构钉死调用顺序,避免未来重排回归。
+  test("index.ts:strip 调用在 estimateInputTokens(body) 之前,且 gated route.kind==='static'", () => {
+    const indexPath = fileURLToPath(new URL("../http/proxy/index.ts", import.meta.url));
+    const src = readFileSync(indexPath, "utf-8");
+
+    // 锚定真实调用(`estimateInputTokens(body)` 也出现在注释里,故用赋值整句锚定)。
+    const stripIdx = src.indexOf("stripNonTextContentBlocks(body.messages)");
+    assert.ok(stripIdx >= 0, "必须存在 stripNonTextContentBlocks(body.messages) 调用");
+
+    const estimateIdx = src.indexOf("const inputTokens = estimateInputTokens(body)");
+    assert.ok(estimateIdx >= 0, "必须存在 const inputTokens = estimateInputTokens(body) 调用");
+    assert.ok(stripIdx < estimateIdx, "strip 必须在 estimateInputTokens(body) 之前");
+
+    // strip 必须 gated 在 `if (route.kind === "static")` 内(只对静态文本 provider strip)。
+    const gateIdx = src.lastIndexOf('if (route.kind === "static")', stripIdx);
+    assert.ok(gateIdx >= 0 && gateIdx < stripIdx, 'strip 必须 gated 在 if (route.kind === "static") 内');
   });
 });
 
