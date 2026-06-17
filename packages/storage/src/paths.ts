@@ -15,12 +15,30 @@ export const paths = {
   // Memory system (L1): per-agent MEMORY.md + USER.md with char budget
   agentMemoryMd: (agentId: string) => join(HOME, 'agents', agentId, 'MEMORY.md'),
   agentUserMd: (agentId: string) => join(HOME, 'agents', agentId, 'USER.md'),
-  // Skills system (L3): per-agent skill directory
+  // Skills system (L3): per-agent skill directory.
+  // NOTE: with the user-level shared skill library (see sharedSkillsDir below),
+  // this per-agent dir is a read-only "legacy" overlay layer kept only for
+  // backward-compat / migration. New writes go to sharedSkillsDir; platform
+  // seeds live in agentSeedSkillsDir.
   agentSkillsDir: (agentId: string) => join(HOME, 'agents', agentId, 'skills'),
   agentSkillDir: (agentId: string, skillName: string) =>
     join(HOME, 'agents', agentId, 'skills', skillName),
   agentSkillMd: (agentId: string, skillName: string) =>
     join(HOME, 'agents', agentId, 'skills', skillName, 'SKILL.md'),
+  // Per-agent platform seed skills (read-only). Physically separated from the
+  // user-writable agentSkillsDir so platform seeds (e.g. scientist's科研 libs)
+  // never collide with shared/legacy user-skill semantics (overlay & delete).
+  agentSeedSkillsDir: (agentId: string) => join(HOME, 'agents', agentId, 'seed-skills'),
+  agentSeedSkillDir: (agentId: string, skillName: string) =>
+    join(HOME, 'agents', agentId, 'seed-skills', skillName),
+  agentSeedSkillMd: (agentId: string, skillName: string) =>
+    join(HOME, 'agents', agentId, 'seed-skills', skillName, 'SKILL.md'),
+  // User-level shared skill library (writable; single authoritative write source).
+  // Lives at the volume root (~/.openclaude/skills) so it is visible to ALL of a
+  // user's agents — self-authored / auto-sedimented skills are reusable everywhere.
+  sharedSkillsDir: join(HOME, 'skills'),
+  sharedSkillDir: (skillName: string) => join(HOME, 'skills', skillName),
+  sharedSkillMd: (skillName: string) => join(HOME, 'skills', skillName, 'SKILL.md'),
   // ClawHub installed skills (shared across agents)
   hubDir: join(HOME, 'hub'),
   hubLockfile: join(HOME, 'hub', 'lock.json'),

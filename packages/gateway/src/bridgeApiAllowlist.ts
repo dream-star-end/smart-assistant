@@ -75,6 +75,20 @@ export const BRIDGE_API_ALLOWLIST: readonly BridgeApiAllowRule[] = [
     methods: M('GET', 'PUT', 'DELETE'),
     proxyFromCommercial: true,
   },
+  // User-level shared skill library (agentId-less). Proxied to the user's own
+  // container, where it operates on that user's shared/legacy skill volume.
+  {
+    label: '/api/skills',
+    re: /^\/api\/skills$/,
+    methods: M('GET'),
+    proxyFromCommercial: true,
+  },
+  {
+    label: '/api/skills/:name',
+    re: /^\/api\/skills\/[^/]+$/,
+    methods: M('GET', 'PUT', 'DELETE'),
+    proxyFromCommercial: true,
+  },
   {
     label: '/api/agent-teams',
     re: /^\/api\/agent-teams$/,

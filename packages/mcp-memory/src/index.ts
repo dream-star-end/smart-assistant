@@ -28,7 +28,8 @@ import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprot
 import {
   type EmbeddingProvider,
   MemoryStore,
-  SkillStore,
+  type SkillStore,
+  buildAgentSkillStore,
   archivalAdd,
   archivalCount,
   archivalDelete,
@@ -91,35 +92,11 @@ function readGatewayToken(): string {
 const memory = new MemoryStore(AGENT_ID)
 await memory.load()
 
-/**
- * PR4: optional platform baseline skills dir (ro mount in v3 containers).
- * Only the explicit `OPENCLAUDE_BASELINE_SKILLS_DIR` env is honored — we
- * deliberately avoid fallbacks like `${CLAUDE_CONFIG_DIR}/skills` because that
- * env is common in personal/local setups where the dir contains regular
- * user-writable skills (not a platform baseline) and silently treating those as
- * read-only platform skills would break existing workflows.
- *
- * Any failure (missing dir, not a directory, SkillStore constructor throw)
- * warns to stderr and falls back to single-root user-only behavior rather
- * than crashing the MCP server.
- */
-function resolveBaselineDir(): string | undefined {
-  const raw = process.env.OPENCLAUDE_BASELINE_SKILLS_DIR
-  if (!raw || raw.trim() === '') return undefined
-  return raw
-}
-
 function buildSkillStore(): SkillStore {
-  const baselineDir = resolveBaselineDir()
-  if (baselineDir == null) return new SkillStore(AGENT_ID)
-  try {
-    return new SkillStore(AGENT_ID, { baselineDir })
-  } catch (err: any) {
-    process.stderr.write(
-      `[mcp-memory] OPENCLAUDE_BASELINE_SKILLS_DIR invalid (${baselineDir}), falling back to user-only: ${err?.message ?? err}\n`,
-    )
-    return new SkillStore(AGENT_ID)
-  }
+  // Overlay (single wiring in @openclaude/storage): platform baseline (ro env)
+  // > agent-seed (ro) > shared (rw, user-level/all-agents; single write source)
+  // > legacy per-agent. Degrades gracefully if a dir is invalid.
+  return buildAgentSkillStore(AGENT_ID)
 }
 
 const skills = buildSkillStore()
