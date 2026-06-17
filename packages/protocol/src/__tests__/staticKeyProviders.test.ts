@@ -141,9 +141,17 @@ describe('staticKeyProviders — strip / endpoint', () => {
   })
 })
 
+describe('staticKeyProviders — supportsVision(原生多模态标记)', () => {
+  it('minimax(MiniMax-M3)=true;deepseek/ark(纯文本)=false', () => {
+    assert.equal(getStaticProvider('minimax').supportsVision, true)
+    assert.equal(getStaticProvider('deepseek').supportsVision ?? false, false)
+    assert.equal(getStaticProvider('ark').supportsVision ?? false, false)
+  })
+})
+
 // ─── 漂移守护:protocol-owned 字段 vs 仓库根 snapshot ──────────────────────
 describe('staticKeyProviders — snapshot 漂移守护(protocol-owned)', () => {
-  it('registry 的 id/inboundModelIds/maxInputTokens/upstreamEndpoint 与 snapshot 一致', () => {
+  it('registry 的 id/inboundModelIds/maxInputTokens/upstreamEndpoint/supportsVision 与 snapshot 一致', () => {
     const snapshotPath = fileURLToPath(
       new URL('../../../../static-key-providers.snapshot.json', import.meta.url),
     )
@@ -153,6 +161,7 @@ describe('staticKeyProviders — snapshot 漂移守护(protocol-owned)', () => {
         inboundModelIds: string[]
         maxInputTokens: number | null
         upstreamEndpoint: string
+        supportsVision?: boolean
       }>
     }
     // 数量与顺序一致
@@ -166,6 +175,11 @@ describe('staticKeyProviders — snapshot 漂移守护(protocol-owned)', () => {
       assert.deepEqual([...p.inboundModelIds], sp.inboundModelIds, `${sp.id} inboundModelIds 漂移`)
       assert.equal(p.maxInputTokens ?? null, sp.maxInputTokens, `${sp.id} maxInputTokens 漂移`)
       assert.equal(p.upstreamEndpoint, sp.upstreamEndpoint, `${sp.id} upstreamEndpoint 漂移`)
+      assert.equal(
+        p.supportsVision ?? false,
+        sp.supportsVision ?? false,
+        `${sp.id} supportsVision 漂移`,
+      )
     }
   })
 })

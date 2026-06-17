@@ -214,6 +214,12 @@ export function buildOpenClaudeVisionMcpEnv(
     ...(process.env.OPENCLAUDE_V3_MASTER_BASE_URL
       ? { OPENCLAUDE_V3_MASTER_BASE_URL: process.env.OPENCLAUDE_V3_MASTER_BASE_URL }
       : {}),
+    // minimax vision backend 经容器 internal anthropic proxy 调 MiniMax-M3。base url 非 secret,
+    // 可直接放 env;bearer 走 containerTokenFile(下方,token file,不进 argv)。
+    ...(process.env.ANTHROPIC_BASE_URL ? { ANTHROPIC_BASE_URL: process.env.ANTHROPIC_BASE_URL } : {}),
+    ...(process.env.OPENCLAUDE_VISION_BACKEND
+      ? { OPENCLAUDE_VISION_BACKEND: process.env.OPENCLAUDE_VISION_BACKEND }
+      : {}),
     ...(opts.containerTokenFile
       ? { OPENCLAUDE_V3_CONTAINER_TOKEN_FILE: opts.containerTokenFile }
       : process.env.OPENCLAUDE_V3_CONTAINER_TOKEN

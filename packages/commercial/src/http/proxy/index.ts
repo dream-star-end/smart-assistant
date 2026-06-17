@@ -383,8 +383,9 @@ export function makeAnthropicProxyHandler(
       // **必须在 `estimateInputTokens(body)` / 静态 input cap / preCheck 之前**:否则历史里
       // 的大 base64 图会(a)被下方静态 provider 200k/512k input cap 误判 413(本地卡死,
       // 与上游 400 同样卡会话),(b)高估 preCheck 预留 cost。strip 后估算/cap/上游 body 同口径。
-      // 注:若未来新增**多模态**静态 provider,需在此按 route.provider.id 分支,而非无条件 strip。
-      if (route.kind === "static") {
+      // 注:**多模态静态 provider(supportsVision=true,如 MiniMax-M3)不 strip 图** —— 它原生识图;
+      // 其余纯文本静态 provider(deepseek/ark glm-5.x)仍 strip(模型看不到图,靠 understand_image 工具兜底)。
+      if (route.kind === "static" && !route.provider.supportsVision) {
         const stripped = stripNonTextContentBlocks(body.messages);
         if (stripped.imagesStripped + stripped.documentsStripped > 0) {
           body.messages = stripped.messages as typeof body.messages;

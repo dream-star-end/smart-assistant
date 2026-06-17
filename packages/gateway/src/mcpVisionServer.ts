@@ -46,14 +46,38 @@ const DEFAULT_REFRESH_TIMEOUT_MS = 3_000
 const MIN_REFRESH_TIMEOUT_MS = 500
 const MAX_REFRESH_TIMEOUT_MS = 8_000
 
+// ── MiniMax vision backend(默认 backend）─────────────────────────────────────
+// understand_image 默认用 **MiniMax-M3**(订阅制,2026-06-17 实测其 Anthropic 端点准确识图),
+// 经容器 internal anthropic proxy(ANTHROPIC_BASE_URL + oc-v3 容器 bearer)调用 —— minimax key
+// 留 master,容器只用身份 bearer。codex(gpt-5.5)backend 仅 OPENCLAUDE_VISION_BACKEND=codex 显式启用。
+const MINIMAX_VISION_MODEL = 'MiniMax-M3'
+const MINIMAX_VISION_MAX_TOKENS = 1024
+const DEFAULT_MINIMAX_TIMEOUT_MS = 60_000
+// master proxy messages body budget = 8MB(shared.ts);base64 膨胀 ~1.33x → raw cap 5MB → base64 ~6.7MB < 8MB。
+const DEFAULT_MINIMAX_MAX_IMAGE_BYTES = 5 * 1024 * 1024
+const MINIMAX_MAX_IMAGE_HARD_CAP = 6 * 1024 * 1024
+
+function visionBackend(): 'minimax' | 'codex' {
+  return process.env.OPENCLAUDE_VISION_BACKEND?.trim().toLowerCase() === 'codex' ? 'codex' : 'minimax'
+}
+
 export const OPENCLAUDE_VISION_MCP_ID = 'openclaude-vision'
 export const OPENCLAUDE_VISION_TOOLS = [TOOL_NAME]
 
+/**
+ * 是否给该 provider/model 注入 understand_image 工具。
+ * **纯文本静态模型**(看不到图)启用;**原生多模态模型不启用**。
+ *   - deepseek-* / glm-5.1 / glm-5.2(火山 ark,纯文本)→ true
+ *   - MiniMax-M3(原生多模态,supportsVision)→ **false**(它直接识图,不需要工具,也作为本工具 backend)
+ * 显式 allowlist(不用 startsWith('glm-') 等宽匹配,避免误伤未来 glm 多模态模型;与 protocol
+ * staticKeyProviders supportsVision 口径一致 —— 新增纯文本静态模型时两处同步)。
+ */
 export function shouldEnableOpenClaudeVision(provider?: string, model?: string): boolean {
   if (process.env.OPENCLAUDE_VISION_MCP_DISABLED === '1') return false
   const p = provider?.trim().toLowerCase()
   const m = model?.trim().toLowerCase()
   if (p === 'deepseek' || m?.startsWith('deepseek-')) return true
+  if (m === 'glm-5.1' || m === 'glm-5.2') return true
 
   const optInProviders = (process.env.OPENCLAUDE_VISION_MCP_PROVIDERS ?? '')
     .split(',')
@@ -172,15 +196,18 @@ export function resolveVisionInput(args: VisionToolArgs): ResolvedVisionInput {
   if (!rawPath) throw new Error('image_file is required')
   if (!rawPath.startsWith('/')) throw new Error('image_file must be an absolute local path')
 
+  // backend-aware:minimax 经 proxy(messages 8MB budget)→ raw cap 5MB / 默认超时 60s;
+  // codex(gpt-5.5)→ 20MB / 120s。
+  const minimaxBackend = visionBackend() === 'minimax'
   const maxImageBytes = parseBoundedInt(
     process.env.OPENCLAUDE_VISION_MAX_IMAGE_BYTES,
-    DEFAULT_MAX_IMAGE_BYTES,
+    minimaxBackend ? DEFAULT_MINIMAX_MAX_IMAGE_BYTES : DEFAULT_MAX_IMAGE_BYTES,
     MIN_CONFIGURED_IMAGE_BYTES,
-    MAX_CONFIGURED_IMAGE_BYTES,
+    minimaxBackend ? MINIMAX_MAX_IMAGE_HARD_CAP : MAX_CONFIGURED_IMAGE_BYTES,
   )
   const timeoutMs = parseBoundedInt(
     process.env.OPENCLAUDE_VISION_TIMEOUT_MS,
-    DEFAULT_TIMEOUT_MS,
+    minimaxBackend ? DEFAULT_MINIMAX_TIMEOUT_MS : DEFAULT_TIMEOUT_MS,
     10_000,
     300_000,
   )
@@ -638,6 +665,176 @@ async function runCodexVisionOnce(input: ResolvedVisionInput): Promise<string> {
   }
 }
 
+function mediaTypeForExtension(ext: RasterImageExtension): string {
+  switch (ext) {
+    case 'png':
+      return 'image/png'
+    case 'jpg':
+      return 'image/jpeg'
+    case 'gif':
+      return 'image/gif'
+    case 'webp':
+      return 'image/webp'
+  }
+}
+
+// 读容器身份 bearer(oc-v3.<id>.<secret>)。**优先 token file**(避免 raw token 出现在 Codex MCP
+// env argv —— 见 codexLaunchOverrides 的 v3-container-token 文件机制),回退 raw env。
+// 与 ANTHROPIC_AUTH_TOKEN 同值(v3supervisor 注入);minimax 上游 key 始终留 master,不进容器。
+function readContainerBearer(): string | undefined {
+  const file = process.env.OPENCLAUDE_V3_CONTAINER_TOKEN_FILE?.trim()
+  if (file) {
+    try {
+      const t = readFileSync(file, 'utf8').trim()
+      if (t) return t
+    } catch {}
+  }
+  const raw = process.env.OPENCLAUDE_V3_CONTAINER_TOKEN?.trim()
+  return raw || undefined
+}
+
+// 解析 Anthropic SSE(master proxy 强制 stream:true,返回 text/event-stream),拼接 text_delta。
+// 只取 content_block_delta 的 text_delta(忽略 MiniMax-M3 的 thinking_delta);**见到 error 事件一律抛**(不返回 partial)。
+async function readAnthropicSseText(resp: Response): Promise<string> {
+  const reader = resp.body?.getReader()
+  if (!reader) {
+    // proxy 理论上总 stream;非 stream 兜底按 JSON content[].text 取。
+    const j = (await resp.json().catch(() => null)) as {
+      content?: Array<{ type?: string; text?: string }>
+    } | null
+    const t = (j?.content ?? [])
+      .filter((b) => b?.type === 'text' && typeof b.text === 'string')
+      .map((b) => b.text as string)
+      .join('')
+      .trim()
+    if (!t) throw new Error('empty vision response')
+    return t
+  }
+  const decoder = new TextDecoder()
+  let pending = ''
+  let text = ''
+  let errMsg = ''
+  for (;;) {
+    const { done, value } = await reader.read()
+    if (done) break
+    pending += decoder.decode(value, { stream: true })
+    let nl: number
+    while ((nl = pending.indexOf('\n')) >= 0) {
+      const line = pending.slice(0, nl).trim()
+      pending = pending.slice(nl + 1)
+      if (!line.startsWith('data:')) continue
+      const payload = line.slice(5).trim()
+      if (!payload || payload === '[DONE]') continue
+      let ev: {
+        type?: string
+        delta?: { type?: string; text?: string }
+        error?: { message?: string }
+      }
+      try {
+        ev = JSON.parse(payload)
+      } catch {
+        continue
+      }
+      if (
+        ev?.type === 'content_block_delta' &&
+        ev?.delta?.type === 'text_delta' &&
+        typeof ev.delta.text === 'string'
+      ) {
+        text += ev.delta.text
+      } else if (ev?.type === 'error') {
+        errMsg = typeof ev.error?.message === 'string' ? ev.error.message : 'upstream error'
+      }
+    }
+  }
+  // SSE error 事件表示本次 stream 失败:**不论是否已收到 partial text,一律抛**(不把失败当成功结果)。
+  if (errMsg) throw new Error(`vision upstream error: ${errMsg}`)
+  const out = text.trim()
+  if (!out) throw new Error('empty vision response')
+  return out
+}
+
+// MiniMax-M3 vision backend:经容器 internal anthropic proxy 发 MiniMax-M3 + image content block,
+// 复用 master 的路由/计费/authz/key 管理。**不 spawn 子进程、不写 auth.json、不碰 minimax key。**
+async function runMinimaxVision(input: ResolvedVisionInput): Promise<string> {
+  const release = acquireVisionLock(input.timeoutMs)
+  try {
+    const baseUrl = process.env.ANTHROPIC_BASE_URL?.trim()
+    if (!baseUrl) throw new Error('minimax vision backend unavailable: ANTHROPIC_BASE_URL unset')
+    const bearer = readContainerBearer()
+    if (!bearer) throw new Error('minimax vision backend unavailable: container token unset')
+
+    const buf = readFileSync(input.imagePath)
+    if (buf.length > input.maxImageBytes) {
+      throw new Error(
+        `image exceeds ${Math.round(input.maxImageBytes / 1024 / 1024)}MB minimax vision limit`,
+      )
+    }
+    const ext = rasterImageExtension(buf)
+    if (!ext) throw new Error('image_file is not a supported raster image (PNG/JPEG/GIF/WebP)')
+
+    const body = {
+      model: MINIMAX_VISION_MODEL,
+      max_tokens: MINIMAX_VISION_MAX_TOKENS,
+      messages: [
+        {
+          role: 'user',
+          content: [
+            {
+              type: 'image',
+              source: {
+                type: 'base64',
+                media_type: mediaTypeForExtension(ext),
+                data: buf.toString('base64'),
+              },
+            },
+            { type: 'text', text: input.prompt },
+          ],
+        },
+      ],
+    }
+    const url = `${baseUrl.replace(/\/+$/, '')}/v1/messages`
+    // **timer 覆盖 fetch + SSE body 读取全程**(不是只到响应头):reader.read() 若卡住,
+    // controller.abort() 会中断它,避免无限挂住 MCP tool 和 acquireVisionLock(Codex diff review #1)。
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), input.timeoutMs)
+    try {
+      const resp = await fetch(url, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          authorization: `Bearer ${bearer}`,
+          'anthropic-version': '2023-06-01',
+        },
+        body: JSON.stringify(body),
+        signal: controller.signal,
+      })
+      if (!resp.ok) {
+        const detail = (await resp.text().catch(() => '')).slice(0, 300)
+        throw new Error(`minimax vision upstream ${resp.status}${detail ? `: ${detail}` : ''}`)
+      }
+      return await readAnthropicSseText(resp)
+    } catch (err) {
+      if (controller.signal.aborted) {
+        throw new Error(`minimax vision timed out after ${input.timeoutMs}ms`)
+      }
+      throw err
+    } finally {
+      clearTimeout(timer)
+    }
+  } finally {
+    release()
+  }
+}
+
+export const runMinimaxVisionForTest = runMinimaxVision
+
+// backend 路由:默认 MiniMax-M3(boss 2026-06-17);OPENCLAUDE_VISION_BACKEND=codex 时走 gpt-5.5。
+// **不做自动 fallback**:minimax 业务错误(4xx/余额/413)不绕到 codex(避免绕过 authz/计费语义),
+// 直接把错误返回给调用方模型。
+async function runVision(input: ResolvedVisionInput): Promise<string> {
+  return visionBackend() === 'codex' ? runCodexVision(input) : runMinimaxVision(input)
+}
+
 async function runCodexVision(input: ResolvedVisionInput): Promise<string> {
   const release = acquireVisionLock(input.timeoutMs)
 
@@ -699,7 +896,7 @@ export async function startVisionMcpServer(): Promise<void> {
     }
     try {
       const input = resolveVisionInput((args ?? {}) as VisionToolArgs)
-      const text = await runCodexVision(input)
+      const text = await runVision(input)
       return { content: [{ type: 'text', text }] }
     } catch (err: any) {
       return {

@@ -217,16 +217,22 @@ export async function buildAgentsSlot(ctx: PromptSlotContext): Promise<PromptSlo
       '**text_to_audio**: 必须传 `model="speech-2.8-hd"` + `emotion="neutral"` (MCP 默认 speech-2.6-hd 不可用)',
     )
     lines.push('**text_to_image**: 默认 image-01 可用,传 `aspect_ratio` 控制比例')
-    lines.push(
-      '**understand_image**: 传 `image_file="绝对路径"` 或 `image_url="https://..."` (主模型不支持多模态)',
-    )
+    // MiniMax-M3 原生支持图像识别(2026-06-17 放开 strip):用户上传的图片会直接进入对话,
+    // **无需** understand_image 工具,直接读图回答即可。
   }
-  if ((provider === 'deepseek' || ctx.model?.startsWith('deepseek-')) && hasUnderstandImageTool) {
+  if (
+    hasUnderstandImageTool &&
+    (provider === 'deepseek' ||
+      ctx.model?.startsWith('deepseek-') ||
+      ctx.model === 'glm-5.1' ||
+      ctx.model === 'glm-5.2')
+  ) {
     lines.push('')
-    lines.push('## DeepSeek 图片理解提示')
+    lines.push('## 图片理解提示')
     lines.push('')
     lines.push(
-      'DeepSeek 当前按纯文本模型接入。用户上传图片时,先调用 `understand_image` MCP 工具,传 `image_file="绝对路径"`,再基于工具返回的图片描述回答。',
+      '当前模型按纯文本接入、看不到图。用户上传图片时,先调用 `understand_image` MCP 工具,' +
+        '传 `image_file="绝对路径"`(从上传提示里取该图的本地路径),再基于工具返回的图片描述回答。',
     )
   }
   if (

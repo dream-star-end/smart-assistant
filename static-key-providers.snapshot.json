@@ -7,7 +7,8 @@
       "maxInputTokens": null,
       "upstreamEndpoint": "https://api.deepseek.com/anthropic/v1/messages",
       "capabilityZero": false,
-      "contextWindow": null
+      "contextWindow": null,
+      "supportsVision": false
     },
     {
       "id": "minimax",
@@ -15,7 +16,8 @@
       "maxInputTokens": 512000,
       "upstreamEndpoint": "https://api.minimaxi.com/anthropic/v1/messages",
       "capabilityZero": true,
-      "contextWindow": 512000
+      "contextWindow": 512000,
+      "supportsVision": true
     },
     {
       "id": "ark",
@@ -23,7 +25,8 @@
       "maxInputTokens": 1000000,
       "upstreamEndpoint": "https://ark.cn-beijing.volces.com/api/coding/v1/messages",
       "capabilityZero": true,
-      "contextWindow": 1000000
+      "contextWindow": 1000000,
+      "supportsVision": false
     }
   ]
 }

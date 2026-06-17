@@ -34,6 +34,26 @@ describe('collectAvailableMcpToolNames', () => {
     assert.equal(tools.includes('understand_image'), false)
   })
 
+  it('advertises understand_image for glm-5.x text-only models(火山 ark)', () => {
+    const config = {
+      ...baseConfig,
+      provider: 'ark',
+      defaults: { ...baseConfig.defaults, model: 'glm-5.2' },
+    }
+    const tools = collectAvailableMcpToolNames(config, { id: 'main' } as any)
+    assert.ok(tools.includes('understand_image'))
+  })
+
+  it('does not advertise understand_image for MiniMax-M3(原生多模态)', () => {
+    const config = {
+      ...baseConfig,
+      provider: 'minimax',
+      defaults: { ...baseConfig.defaults, model: 'MiniMax-M3' },
+    }
+    const tools = collectAvailableMcpToolNames(config, { id: 'main' } as any)
+    assert.equal(tools.includes('understand_image'), false)
+  })
+
   it('lets explicit provider opt-ins use built-in vision for custom text-only providers', () => {
     const old = process.env.OPENCLAUDE_VISION_MCP_PROVIDERS
     process.env.OPENCLAUDE_VISION_MCP_PROVIDERS = 'openrouter'

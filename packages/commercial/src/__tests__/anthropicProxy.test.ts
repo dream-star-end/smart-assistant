@@ -1348,9 +1348,16 @@ describe("stripNonTextContentBlocks", () => {
     assert.ok(estimateIdx >= 0, "必须存在 const inputTokens = estimateInputTokens(body) 调用");
     assert.ok(stripIdx < estimateIdx, "strip 必须在 estimateInputTokens(body) 之前");
 
-    // strip 必须 gated 在 `if (route.kind === "static")` 内(只对静态文本 provider strip)。
-    const gateIdx = src.lastIndexOf('if (route.kind === "static")', stripIdx);
-    assert.ok(gateIdx >= 0 && gateIdx < stripIdx, 'strip 必须 gated 在 if (route.kind === "static") 内');
+    // strip 必须 gated 在 `if (route.kind === "static" && !route.provider.supportsVision)` 内:
+    // 只对静态**纯文本** provider strip;MiniMax-M3 等 supportsVision provider 不 strip(原生识图)。
+    const gateIdx = src.lastIndexOf(
+      'if (route.kind === "static" && !route.provider.supportsVision)',
+      stripIdx,
+    );
+    assert.ok(
+      gateIdx >= 0 && gateIdx < stripIdx,
+      'strip 必须 gated 在 if (route.kind === "static" && !route.provider.supportsVision) 内',
+    );
   });
 });
 

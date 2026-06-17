@@ -54,6 +54,15 @@ export interface StaticKeyProviderSpec {
   readonly stripBodyFields: readonly string[]
   /** master raw-request input token 上限(估算值，JSON.length/4)。undefined = 不设 cap(如 deepseek)。 */
   readonly maxInputTokens?: number
+  /**
+   * 该 provider 的上游模型是否**原生支持图像识别(vision)**。
+   *   - true  → master proxy **不 strip** image/document content block(模型直接识图);
+   *             且 understand_image 视觉工具**不对它启用**(它不需要工具)。
+   *   - false/undefined → 纯文本模型,master strip 图,understand_image 工具兜底。
+   * 当前:minimax(MiniMax-M3,2026-06-17 实测其 Anthropic 端点接受 image block 并准确识图)=true;
+   *       deepseek / ark(glm-5.1/glm-5.2,纯文本)=false。
+   */
+  readonly supportsVision?: boolean
 }
 
 const DEEPSEEK: StaticKeyProviderSpec = {
@@ -88,6 +97,9 @@ const MINIMAX: StaticKeyProviderSpec = {
   // CCB modelSupportsThinking(MiniMax-M3)=true 会发 thinking,故不能 strip。其余 firstParty-only 字段仍 strip。
   stripBodyFields: ['output_config', 'context_management', 'service_tier'],
   maxInputTokens: 512_000,
+  // MiniMax-M3 原生多模态(2026-06-17 直连验证其 Anthropic 端点接受 base64 image block 并准确识图)。
+  // → master 不 strip 它的图;它也作为 understand_image 工具给纯文本模型识图的 backend。
+  supportsVision: true,
 }
 
 const ARK: StaticKeyProviderSpec = {
