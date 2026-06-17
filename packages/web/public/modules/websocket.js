@@ -896,8 +896,104 @@ function _delegateToolCallPreviewInfo(entry) {
   return m ? { toolName: m[1] } : null
 }
 
+// Match the gateway's delegate_progress goal normalization (normalizeDelegateGoalKey
+// in delegateProgress.ts) byte-for-byte so (agentId, goal) keys line up: normalize
+// newlines, trim, cap. MUST stay in sync with DELEGATE_GOAL_KEY_CAP on the server.
+function _normalizeDelegateGoalKey(raw) {
+  return String(raw ?? '')
+    .replace(/\r\n?/g, '\n')
+    .trim()
+    .slice(0, 1024)
+}
+
+// Leader delegation tools that render a collapsible agent-group card whose child
+// run nests into it. Matches `delegate_task` across provider tool-name shapes
+// (CCB `mcp__openclaude-memory__delegate_task`, codex
+// `openclaude_memory__delegate_task`, bare `delegate_task`). Deliberately does
+// NOT match `ask_gpt55_codex` / `send_to_agent` — those keep prior behavior.
+function _isDelegateToolName(name) {
+  return /(?:^|_)delegate_task$/.test(name || '')
+}
+
+// Bind a delegate_progress run to the leader's delegate_task agent-group card by
+// a STRICT-UNIQUE (agentId, goal) match. The realistic collision — the same goal
+// fanned out to different agents — is separated by agentId. Ambiguous (0 or >1
+// candidates) → return null and degrade to a standalone progress card rather than
+// graft the child stream onto the wrong card. Mirrors the backend correlation
+// policy (pickPendingDelegationIndex on the master branch).
+function _bindDelegateRunToGroup(sess, block) {
+  const agentId = block.agentId || ''
+  const goal = typeof block.goal === 'string' ? block.goal : ''
+  if (!agentId || !goal) return null
+  const candidates = (sess.messages || []).filter(
+    (m) =>
+      m.role === 'agent-group' &&
+      m._delegate &&
+      !m._delegateRunId &&
+      m._delegateAgentId === agentId &&
+      m._delegateGoal === goal,
+  )
+  if (candidates.length !== 1) return null
+  const groupMsg = candidates[0]
+  groupMsg._delegateRunId = block.runId
+  if (!sess._delegateRunGroups) sess._delegateRunGroups = new Map()
+  sess._delegateRunGroups.set(block.runId, groupMsg.id)
+  return groupMsg.id
+}
+
 function _handleDelegateProgressBlock(sess, block) {
   if (!block.runId) return
+
+  // Preferred path: nest the child's live blocks INTO the leader's delegate_task
+  // agent-group card so the "委托子任务" call and its run show as one collapsible
+  // unit. Binding happens on the start frame via a unique (agentId, goal) match.
+  let groupMsgId = sess._delegateRunGroups?.get(block.runId)
+  if (groupMsgId === undefined) {
+    // Self-heal: the runtime _delegateRunGroups map isn't persisted, but a bound
+    // agent-group keeps _delegateRunId in IDB across a refresh / session sync
+    // (only _partial/bashTail/partialJson/_completed-class fields are stripped on
+    // load — see _normalizeLoadedSession). Rebind from message state on ANY frame
+    // so post-refresh live frames still nest, not just the one-shot start frame.
+    // runId is unique per run (dlg-<ts>-<rand>), so this match can't collide.
+    const bound = (sess.messages || []).find(
+      (m) => m.role === 'agent-group' && m._delegateRunId === block.runId,
+    )
+    if (bound) {
+      if (!sess._delegateRunGroups) sess._delegateRunGroups = new Map()
+      sess._delegateRunGroups.set(block.runId, bound.id)
+      groupMsgId = bound.id
+    } else if (block.phase === 'start') {
+      groupMsgId = _bindDelegateRunToGroup(sess, block)
+    }
+  }
+  if (groupMsgId) {
+    const groupMsg = (sess.messages || []).find((m) => m.id === groupMsgId)
+    if (groupMsg) {
+      if (block.phase === 'done' || block.phase === 'error') {
+        // Completion + auto-collapse is driven by the leader's delegate_task
+        // tool_result (it always arrives, mirroring the Agent tool). Keep a
+        // result preview here only as a fallback in case that frame is missed.
+        if (block.text && !groupMsg._resultPreview) {
+          groupMsg._resultPreview = String(block.text).slice(0, 200)
+        }
+        if (block.phase === 'error') groupMsg._isError = true
+      } else if (block.block && typeof block.block === 'object') {
+        const child = block.block
+        const childText = typeof child.text === 'string' ? child.text : ''
+        _appendSubagentBlock(sess, groupMsg, child, childText)
+      }
+      if (sess.id === state.currentSessionId) {
+        _deps.updateMessageEl(groupMsg)
+        _deps.scrollBottom()
+      }
+      return
+    }
+    // Group card vanished (history cleared mid-run) → fall through to standalone.
+  }
+
+  // Fallback: standalone delegate-progress card keyed by runId. Used when the
+  // leader card can't be matched (old gateway w/o goal, ambiguous match, or
+  // non-webchat parent). Preserves the prior behavior — no regression.
   let msg = _findDelegateProgressMsg(sess, block.runId)
   if (!msg) {
     msg = addMessage(sess, 'delegate-progress', '', {
@@ -2860,24 +2956,47 @@ export function handleOutbound(frame) {
       sess._streamingAssistant = null
       sess._streamingThinking = null
       const isAgent = /^Agent$/i.test(block.toolName || '')
+      const isDelegate = _isDelegateToolName(block.toolName)
 
-      if (isAgent) {
-        // Sub-agent: create a collapsible group card + register as bg task
+      if (isAgent || isDelegate) {
+        // Sub-agent (Agent tool) OR delegated task (delegate_task): a collapsible
+        // group card + bg task. For delegate_task, the child's live progress
+        // (delegate_progress frames) is later nested INTO this card by
+        // _handleDelegateProgressBlock — so the leader's "委托子任务" call and its
+        // run render as ONE unit instead of a flat card + a separate progress card.
         if (!sess._agentGroups) sess._agentGroups = new Map()
         if (block.blockId) {
           const input = block.inputJson && typeof block.inputJson === 'object' ? block.inputJson : null
           const preview = (block.inputPreview || '').replace(/[{}"]/g, '').slice(0, 80)
-          const desc =
-            (input && typeof input.description === 'string' && input.description) ||
-            (input && typeof input.prompt === 'string' && input.prompt.slice(0, 80)) ||
-            preview ||
-            '子任务'
+          let desc
+          let delegateFields = null
+          if (isDelegate) {
+            const goalRaw = input && typeof input.goal === 'string' ? input.goal : ''
+            // Normalize the target the SAME way the gateway resolves it
+            // (`args.agentId || 'main'`) so it equals the delegate_progress
+            // frame's agentId (= resolved targetAgentId) for correlation.
+            const agentRaw =
+              input && typeof input.agentId === 'string' && input.agentId ? input.agentId : 'main'
+            desc = (goalRaw && goalRaw.trim()) || preview || '委托子任务'
+            delegateFields = {
+              _delegate: true,
+              _delegateAgentId: agentRaw,
+              _delegateGoal: _normalizeDelegateGoalKey(goalRaw),
+            }
+          } else {
+            desc =
+              (input && typeof input.description === 'string' && input.description) ||
+              (input && typeof input.prompt === 'string' && input.prompt.slice(0, 80)) ||
+              preview ||
+              '子任务'
+          }
           if (!sess._agentGroups.has(block.blockId)) {
             const groupMsg = addMessage(sess, 'agent-group', desc, {
               blockId: block.blockId,
-              toolName: 'Agent',
+              toolName: isDelegate ? block.toolName || 'delegate_task' : 'Agent',
               startTime: Date.now(),
               childBlocks: [],
+              ...(delegateFields || {}),
             })
             sess._agentGroups.set(block.blockId, groupMsg.id)
             if (block.blockId) sess._blockIdToMsgId.set(block.blockId, groupMsg.id)
@@ -2885,9 +3004,26 @@ export function handleOutbound(frame) {
           } else {
             const groupMsgId = sess._agentGroups.get(block.blockId)
             const groupMsg = sess.messages.find((m) => m.id === groupMsgId)
-            if (groupMsg && desc && groupMsg.text !== desc) {
-              groupMsg.text = desc
-              if (sess.id === state.currentSessionId) _deps.updateMessageEl(groupMsg)
+            if (groupMsg) {
+              let changed = false
+              if (desc && groupMsg.text !== desc) {
+                groupMsg.text = desc
+                changed = true
+              }
+              // Refresh correlation keys as partial inputJson finalizes — the
+              // delegate_progress start frame matches against the FINAL values.
+              if (delegateFields) {
+                groupMsg._delegate = true
+                if (groupMsg._delegateAgentId !== delegateFields._delegateAgentId) {
+                  groupMsg._delegateAgentId = delegateFields._delegateAgentId
+                  changed = true
+                }
+                if (groupMsg._delegateGoal !== delegateFields._delegateGoal) {
+                  groupMsg._delegateGoal = delegateFields._delegateGoal
+                  changed = true
+                }
+              }
+              if (changed && sess.id === state.currentSessionId) _deps.updateMessageEl(groupMsg)
             }
           }
         }
@@ -2996,8 +3132,11 @@ export function handleOutbound(frame) {
       sess._streamingAssistant = null
       sess._streamingThinking = null
 
-      // Check if this result belongs to a sub-agent group
-      const isAgentResult = /^Agent$/i.test(block.toolName || '')
+      // Check if this result belongs to a sub-agent group (Agent tool) or a
+      // delegated task (delegate_task) — both render as an agent-group card and
+      // fold to a single-line summary once their result lands.
+      const isAgentResult =
+        /^Agent$/i.test(block.toolName || '') || _isDelegateToolName(block.toolName)
       const agentToolUseId =
         block.toolUseBlockId ||
         (block.blockId ? String(block.blockId).replace(/:result$/, '') : null)

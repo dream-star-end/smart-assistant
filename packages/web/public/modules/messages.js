@@ -695,22 +695,28 @@ function _resolveAgentGroupCollapsed(msg) {
   return !!msg._completed
 }
 
-function _appendAgentChildBlock(body, child) {
-  if (!child || typeof child !== 'object') return
+// Build the DOM node for a single child block (text / thinking / tool_use), or
+// null when there's nothing to render. Split out from _appendAgentChildBlock so
+// _renderAgentGroup can diff and replace children individually (per-child
+// incremental patch) instead of rebuilding the whole body every frame.
+function _buildAgentChildNode(child) {
+  if (!child || typeof child !== 'object') return null
   if (child.kind === 'text') {
-    if (!child.text) return
+    if (!child.text) return null
     const p = document.createElement('div')
     p.className = 'agent-group-child-text'
     // 与主聊天一致:文本走 markdown 渲染(主聊天 assistant 文本同款 renderMarkdown)。
     p.innerHTML = renderMarkdown(child.text)
-    body.appendChild(p)
-  } else if (child.kind === 'thinking') {
-    if (!child.text) return
+    return p
+  }
+  if (child.kind === 'thinking') {
+    if (!child.text) return null
     const p = document.createElement('div')
     p.className = 'agent-group-child-thinking'
     p.textContent = child.text
-    body.appendChild(p)
-  } else if (child.kind === 'tool_use') {
+    return p
+  }
+  if (child.kind === 'tool_use') {
     const card = document.createElement('div')
     card.className = 'msg tool agent-group-child-tool'
     // Mark nested Agent calls (subagent spawning a grand-child subagent)
@@ -724,68 +730,150 @@ function _appendAgentChildBlock(body, child) {
     // field names (toolName, inputPreview, inputJson, _completed, output,
     // error, _partial) so it can be passed through directly.
     _buildToolCard(card, child)
-    body.appendChild(card)
+    return card
   }
+  return null
 }
 
+function _appendAgentChildBlock(body, child) {
+  const node = _buildAgentChildNode(child)
+  if (node) body.appendChild(node)
+}
+
+// Per-child render signature. _renderAgentGroup re-renders a child's DOM only
+// when its signature changes, so completed cards above an actively-streaming
+// child are not destroyed+rebuilt every frame (the flicker root cause).
+//
+// The live coalescer (_appendSubagentBlock) only ever APPENDS to text/thinking
+// (length monotonic) and mutates tool_use in place — so length + flags are a
+// faithful change detector for the streaming path. The extra fields below
+// (text tail sample, toolName, truncatedHead) guard the non-append edge cases
+// an audit raised (same-length replacement / metadata-only changes) so a stale
+// child node can't survive a content change that happens to keep the length.
+function _agentChildSig(ch) {
+  if (!ch || typeof ch !== 'object') return ''
+  if (ch.kind === 'text' || ch.kind === 'thinking') {
+    const t = ch.text || ''
+    return `${ch.kind}#${t.length}#${t.slice(-32)}`
+  }
+  if (ch.kind === 'tool_use') {
+    const ij =
+      ch.inputJson && typeof ch.inputJson === 'object' ? JSON.stringify(ch.inputJson).length : 0
+    return [
+      'tool',
+      ch.blockId || '',
+      ch.toolName || '',
+      ch._partial ? 1 : 0,
+      ch._completed ? 1 : 0,
+      (ch.inputPreview || '').length,
+      ij,
+      (ch.output || '').length,
+      ch.error ? 1 : 0,
+      ch.bashTail?.totalBytes || 0,
+      ch.bashTail?.truncatedHead ? 1 : 0,
+    ].join('#')
+  }
+  return ch.kind || ''
+}
+
+// Renders the Agent / delegate_task tool_use as a collapsible parent card whose
+// body shows every streamed child block. Incremental: the first call builds the
+// full structure; later calls (every streaming frame) patch only what changed —
+// status, title, newly-arrived/changed children, result preview. This is the
+// #2b fix: we no longer innerHTML='' the whole card each frame, so a completed
+// tool card above an actively-streaming one stops flickering.
 function _renderAgentGroup(el, msg) {
-  el.innerHTML = ''
-  el.className = 'agent-group'
   const collapsed = _resolveAgentGroupCollapsed(msg)
-  if (collapsed) el.classList.add('collapsed')
+  // Title: delegate_task reads as "委托子任务: <goal>", native Agent as "子任务: …".
+  const titlePrefix = msg._delegate ? '委托子任务' : '子任务'
+  const wantTitle = `${titlePrefix}: ${msg.text || ''}`
 
   let statusHtml
   if (msg._completed) {
     if (msg._isError) {
-      statusHtml = '<span class="agent-group-status" style="color:var(--danger)">失败</span>'
+      statusHtml = '<span style="color:var(--danger)">失败</span>'
     } else {
       const dur = typeof msg._duration === 'number' ? ` (${(msg._duration / 1000).toFixed(1)}s)` : ''
-      statusHtml = `<span class="agent-group-status" style="color:var(--success)">完成${dur}</span>`
+      statusHtml = `<span style="color:var(--success)">完成${dur}</span>`
     }
   } else {
-    statusHtml = '<span class="agent-group-status">运行中…</span>'
+    statusHtml = '运行中…'
   }
 
-  const header = document.createElement('div')
-  header.className = 'agent-group-header'
-  header.innerHTML = `${_SVG_BOT_AGENT}<span class="agent-group-title">子任务: ${htmlSafeEscape(msg.text || '')}</span>${statusHtml}${_SVG_CHEVRON_AGENT}`
-  makeDisclosure(header, el, {
-    onToggle: () => {
-      msg._userCollapsed = !el.classList.contains('collapsed')
-      el.classList.toggle('collapsed', msg._userCollapsed)
-    },
-  })
-  el.appendChild(header)
+  if (!el._agentGroupInit) {
+    // ── First build: full structure (one-time) ──
+    el.innerHTML = ''
+    el.className = 'agent-group'
+    const header = document.createElement('div')
+    header.className = 'agent-group-header'
+    header.innerHTML = `${_SVG_BOT_AGENT}<span class="agent-group-title"></span><span class="agent-group-status"></span>${_SVG_CHEVRON_AGENT}`
+    makeDisclosure(header, el, {
+      onToggle: () => {
+        msg._userCollapsed = !el.classList.contains('collapsed')
+        el.classList.toggle('collapsed', msg._userCollapsed)
+      },
+    })
+    el.appendChild(header)
+    const body = document.createElement('div')
+    body.className = 'agent-group-body'
+    el.appendChild(body)
+    el._agentGroupHeader = header
+    el._agentGroupBody = body
+    el._childEls = [] // childBlocks index → mounted DOM node (or null)
+    el._childSigs = [] // childBlocks index → last render signature
+    el._agentGroupInit = true
+  }
 
-  const body = document.createElement('div')
-  body.className = 'agent-group-body'
+  el.classList.toggle('collapsed', collapsed)
 
-  // Child blocks: streamed subagent output (text / thinking / tool_use+result).
+  const titleSpan = el._agentGroupHeader.querySelector('.agent-group-title')
+  if (titleSpan && titleSpan.textContent !== wantTitle) titleSpan.textContent = wantTitle
+  const statusSpan = el._agentGroupHeader.querySelector('.agent-group-status')
+  if (statusSpan && statusSpan._html !== statusHtml) {
+    statusSpan.innerHTML = statusHtml
+    statusSpan._html = statusHtml
+  }
+
+  // ── Children: per-index diff. Only changed/new children touch the DOM. ──
+  const body = el._agentGroupBody
   const children = Array.isArray(msg.childBlocks) ? msg.childBlocks : []
-  for (const ch of children) _appendAgentChildBlock(body, ch)
-
-  // Final result preview (the wrapped agent's return value). Render as a
-  // summary row so it's always visible even when the card is collapsed —
-  // the body is display:none'd when collapsed, but we emit a second
-  // single-line summary directly on the element so the header area stays
-  // informative. CSS hides the body's summary copy when expanded to avoid
-  // duplication.
-  if (msg._resultPreview) {
-    const preview = document.createElement('div')
-    preview.className = 'agent-group-result'
-    preview.innerHTML = `<span class="tool-icon">${msg._isError ? '⚠️' : '✓'}</span><div class="tool-body">${htmlSafeEscape(msg._resultPreview)}</div>`
-    body.appendChild(preview)
+  for (let i = 0; i < children.length; i++) {
+    const sig = _agentChildSig(children[i])
+    if (el._childEls[i] !== undefined && el._childSigs[i] === sig) continue
+    const node = _buildAgentChildNode(children[i])
+    const prev = el._childEls[i]
+    if (prev) {
+      if (node) body.replaceChild(node, prev)
+      else body.removeChild(prev)
+    } else if (node) {
+      // Insert in order, before the result row if it's already mounted.
+      body.insertBefore(node, el._resultEl || null)
+    }
+    el._childEls[i] = node || null
+    el._childSigs[i] = sig
   }
 
-  el.appendChild(body)
-
-  // Collapsed summary line (shown only when .collapsed): lets the user see
-  // the final output without expanding the full child log.
+  // ── Result preview (in body, after children) + collapsed summary (on el). ──
+  // body is display:none when collapsed, so a single-line copy is mirrored onto
+  // the element itself; CSS hides whichever is redundant.
   if (msg._resultPreview) {
-    const collapsedSummary = document.createElement('div')
-    collapsedSummary.className = 'agent-group-collapsed-summary'
-    collapsedSummary.textContent = msg._resultPreview.slice(0, 200)
-    el.appendChild(collapsedSummary)
+    const resHtml = `<span class="tool-icon">${msg._isError ? '⚠️' : '✓'}</span><div class="tool-body">${htmlSafeEscape(msg._resultPreview)}</div>`
+    if (!el._resultEl) {
+      el._resultEl = document.createElement('div')
+      el._resultEl.className = 'agent-group-result'
+      body.appendChild(el._resultEl)
+    }
+    if (el._resultEl._html !== resHtml) {
+      el._resultEl.innerHTML = resHtml
+      el._resultEl._html = resHtml
+    }
+    const summ = msg._resultPreview.slice(0, 200)
+    if (!el._collapsedSummaryEl) {
+      el._collapsedSummaryEl = document.createElement('div')
+      el._collapsedSummaryEl.className = 'agent-group-collapsed-summary'
+      el.appendChild(el._collapsedSummaryEl)
+    }
+    if (el._collapsedSummaryEl.textContent !== summ) el._collapsedSummaryEl.textContent = summ
   }
 }
 

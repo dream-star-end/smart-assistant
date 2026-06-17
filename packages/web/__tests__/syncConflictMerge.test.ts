@@ -204,6 +204,37 @@ describe('_localMessageSupersedes — role whitelist', () => {
     )
   })
 
+  it('agent-group with active delegate binding → true (server allowlist drops _delegateRunId)', () => {
+    // The server PUT allowlist strips _delegate*; adopting the server copy would
+    // wipe the live binding mid-run and re-split the delegate card. A bound
+    // delegate group must keep local even when text/childBlocks diverge.
+    assert.equal(
+      _localMessageSupersedes(
+        {
+          id: 'g1',
+          role: 'agent-group',
+          text: '调研黄金趋势',
+          _delegate: true,
+          _delegateRunId: 'dlg-abc-1234',
+          childBlocks: [{ kind: 'text', text: 'partial' }],
+        },
+        { id: 'g1', role: 'agent-group', text: '调研黄金趋势' },
+      ),
+      true,
+    )
+  })
+
+  it('agent-group without _delegateRunId stays on prior path → false', () => {
+    // Scoping guard: unbound delegate / native Agent groups keep prior behavior.
+    assert.equal(
+      _localMessageSupersedes(
+        { id: 'g1', role: 'agent-group', text: 'agent-v2', _delegate: true },
+        { id: 'g1', role: 'agent-group', text: 'agent-v1' },
+      ),
+      false,
+    )
+  })
+
   it('permission role, identical → true via Layer 1', () => {
     assert.equal(
       _localMessageSupersedes(

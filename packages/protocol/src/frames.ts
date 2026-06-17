@@ -300,6 +300,10 @@ export const OutboundContentBlock = Type.Union([
     text: Type.Optional(Type.String()),
     toolName: Type.Optional(Type.String()),
     isError: Type.Optional(Type.Boolean()),
+    // 委派目标的原始 goal(仅 start 帧携带)。前端用 (agentId, goal) 把这个
+    // 委派 run 唯一关联回队长那次 delegate_task 工具卡(把进度嵌进同一张
+    // agent-group 卡,而非另起独立卡)。匹配不到则回退独立卡,向后兼容。
+    goal: Type.Optional(Type.String()),
     // 完整子 agent block payload(text/thinking/tool_use/tool_result/tool_output_tail),
     // 供新前端复用主聊天富渲染。gateway 已 sanitize,前端按子块 kind 渲染;旧前端忽略此字段。
     block: Type.Optional(Type.Unknown()),

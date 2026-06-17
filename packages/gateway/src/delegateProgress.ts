@@ -19,6 +19,12 @@ export type DelegateProgressBlock = {
   toolName?: string
   isError?: boolean
   /**
+   * 委派目标的原始 goal,仅 start 帧携带。前端用 (agentId, goal) 把整个委派 run
+   * 唯一关联回队长那次 delegate_task 工具卡,从而把进度嵌进同一张 agent-group 卡。
+   * 不做摘要折叠 / 截断改写,保持与队长 tool_use input.goal 同源以便精确匹配。
+   */
+  goal?: string
+  /**
    * 完整子 agent block payload(text/thinking/tool_use/tool_result/tool_output_tail),供新前端
    * 复用主聊天富渲染(`_appendSubagentBlock`)。旧前端不读此字段、走 `text`/`phase` 降级,两侧兼容。
    * 仅「透传模式」(makeDelegateBlockPassthrough)产生;start/done/error/plan 仍是纯摘要帧无 block。
@@ -41,6 +47,23 @@ export function sanitizeDelegateProgressText(
   return `${normalized.slice(0, Math.max(0, maxLen - 1))}…`
 }
 
+/** Goal-as-correlation-key max length. Goals are short task descriptions; this
+ *  is just a wire-size guard. The frontend slices `input.goal` to the same cap
+ *  before comparing, so equality still holds after truncation. */
+const DELEGATE_GOAL_KEY_CAP = 1024
+
+/** Normalize a goal for use as a (agentId, goal) correlation key. Normalizes
+ *  newlines and trims, but deliberately does NOT fold internal whitespace
+ *  (unlike sanitizeDelegateProgressText) so it stays byte-identical to the
+ *  leader's raw delegate_task `input.goal` the frontend compares against
+ *  (the frontend applies the same trim + slice). */
+export function normalizeDelegateGoalKey(raw: unknown): string {
+  return String(raw ?? '')
+    .replace(/\r\n?/g, '\n')
+    .trim()
+    .slice(0, DELEGATE_GOAL_KEY_CAP)
+}
+
 export function makeDelegateProgressBlock(args: {
   runId: string
   agentId: string
@@ -48,6 +71,7 @@ export function makeDelegateProgressBlock(args: {
   text?: unknown
   toolName?: unknown
   isError?: boolean
+  goal?: unknown
   maxLen?: number
   preserveWhitespace?: boolean
 }): DelegateProgressBlock {
@@ -64,6 +88,10 @@ export function makeDelegateProgressBlock(args: {
   const toolName = sanitizeDelegateProgressText(args.toolName, 80)
   if (toolName) block.toolName = toolName
   if (args.isError !== undefined) block.isError = Boolean(args.isError)
+  if (args.goal !== undefined) {
+    const goal = normalizeDelegateGoalKey(args.goal)
+    if (goal) block.goal = goal
+  }
   return block
 }
 

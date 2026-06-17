@@ -5034,6 +5034,10 @@ export class Gateway {
           agentId: targetAgentId,
           phase: 'start',
           text: `开始委派给 ${targetAgentId}: ${goal}`,
+          // Correlation key: lets the frontend nest this run's live blocks into
+          // the leader's delegate_task tool_use card (matched by agentId+goal)
+          // instead of spawning a separate progress card.
+          goal,
         }),
       )
     }

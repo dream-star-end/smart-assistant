@@ -124,6 +124,17 @@ export function _localMessageSupersedes(localMsg, serverMsg) {
   const ss = _stableStringify(serverMsg)
   if (ls !== null && ss !== null && ls === ss) return true
 
+  // A delegate agent-group that this client has bound to a live run is a
+  // client-assembled container whose correlation markers (_delegateRunId /
+  // _delegateGoal / _delegateAgentId) are client-only — the server PUT allowlist
+  // (_stripClientPutMessage) drops them, so the server copy can't carry the
+  // binding back. Adopting the server version would wipe _delegateRunId mid-run
+  // and re-split the card (later delegate_progress frames fall back to a separate
+  // progress card). Keep local for these rows; _overlayServerAuthoritative still
+  // layers server-authoritative metadata (_seq/_source/usage/…) on top. Scoped to
+  // bound rows only, so native Agent groups and unbound rows keep prior behavior.
+  if (role === 'agent-group' && localMsg._delegateRunId) return true
+
   // Layer 2: text-level judgement, roles whitelist only.
   if (role !== 'assistant' && role !== 'thinking' && role !== 'user') return false
   // Any childBlocks on either side → structural, refuse text-level judgement.
@@ -1026,13 +1037,24 @@ export async function syncSessionsFromServer() {
         if (!local?.id) continue
         const server = serverById.get(local.id)
         if (server) {
-          // v7.2 — same invariant as `_mergeServerAuthoredIntoLocal`'s
-          // server-wins branch: server content is authoritative, but
-          // local ts wins as the visual sort key for any row the client
-          // saw stream in. Without this, this resume_failed recovery
-          // path would resurrect the post-stream server ts and put
-          // tool/thinking cards below the assistant text.
-          out.push({ ...server, ts: local.ts ?? server.ts })
+          if (local.role === 'agent-group' && local._delegateRunId) {
+            // Preserve a live delegate binding even on this resume_failed
+            // force-sync path: the server copy is stripped of _delegate*
+            // (PUT allowlist) and adopting it would wipe _delegateRunId /
+            // childBlocks and re-split the card mid-run. Overlay only
+            // server-authoritative metadata, keep local (incl. local ts).
+            // Mirrors the _localMessageSupersedes agent-group rule on the
+            // normal merge path.
+            out.push({ ..._overlayServerAuthoritative(local, server), ts: local.ts ?? server.ts })
+          } else {
+            // v7.2 — same invariant as `_mergeServerAuthoredIntoLocal`'s
+            // server-wins branch: server content is authoritative, but
+            // local ts wins as the visual sort key for any row the client
+            // saw stream in. Without this, this resume_failed recovery
+            // path would resurrect the post-stream server ts and put
+            // tool/thinking cards below the assistant text.
+            out.push({ ...server, ts: local.ts ?? server.ts })
+          }
           usedServerIds.add(local.id)
         } else if (local.role === 'user' && PENDING_SEND_STATUSES.has(local.status)) {
           out.push(local)

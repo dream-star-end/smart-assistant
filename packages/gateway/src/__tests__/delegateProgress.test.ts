@@ -3,6 +3,7 @@ import { describe, it } from 'node:test'
 import {
   makeDelegateBlockPassthrough,
   makeDelegateProgressBlock,
+  normalizeDelegateGoalKey,
   sanitizeDelegateProgressText,
   summarizeDelegateProgressEvent,
 } from '../delegateProgress.js'
@@ -106,6 +107,45 @@ describe('delegate progress sanitization', () => {
       maxLen: 1200,
     })
     assert.equal(block.text?.length, 1200)
+  })
+
+  it('carries goal on the start frame as the (agentId, goal) correlation key', () => {
+    const block = makeDelegateProgressBlock({
+      runId: 'run-1',
+      agentId: 'researcher',
+      phase: 'start',
+      text: '开始委派给 researcher: 调研黄金趋势',
+      goal: '调研黄金趋势',
+    })
+    assert.equal(block.goal, '调研黄金趋势')
+  })
+
+  it('omits goal when not provided (only the start frame carries it)', () => {
+    const block = makeDelegateProgressBlock({
+      runId: 'run-1',
+      agentId: 'researcher',
+      phase: 'text',
+      text: 'partial output',
+    })
+    assert.equal('goal' in block, false)
+  })
+})
+
+describe('normalizeDelegateGoalKey (frontend-matched correlation key)', () => {
+  it('normalizes newlines and trims without folding internal whitespace', () => {
+    // Internal double-space is preserved (unlike sanitizeDelegateProgressText)
+    // so it stays byte-identical to the leader tool_use input.goal the frontend
+    // compares against (which applies the same trim + slice).
+    assert.equal(normalizeDelegateGoalKey('  a\r\nb  c  \r\n'), 'a\nb  c')
+  })
+
+  it('caps overlong goals so the wire field stays bounded', () => {
+    assert.equal(normalizeDelegateGoalKey('x'.repeat(2000)).length, 1024)
+  })
+
+  it('coerces null/undefined to empty string', () => {
+    assert.equal(normalizeDelegateGoalKey(undefined), '')
+    assert.equal(normalizeDelegateGoalKey(null), '')
   })
 })
 
