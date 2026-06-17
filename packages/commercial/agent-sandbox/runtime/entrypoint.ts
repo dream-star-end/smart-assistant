@@ -994,6 +994,8 @@ try {
   const PLATFORM_SEED_DISPLAY_NAMES = new Set([
     "main",
     "MiniMax M3 助手",
+    "GLM-5.2 助手",
+    "全能助手",
     "资料研究员",
     "科研分析师",
     "代码工程师",
@@ -1091,10 +1093,10 @@ try {
   const desiredMainAgent = {
     id: "main",
     model: COMMERCIAL_DEFAULT_MODEL,
-    persona: ensureAgentPersona("main", "你是 OpenClaude 商业版的默认 MiniMax M3 助手,用简洁中文直接回答。\n"),
+    persona: ensureAgentPersona("main", "你是 OpenClaude 商业版的默认全能助手,用简洁中文直接回答。\n"),
     permissionMode: "bypassPermissions",
     provider: COMMERCIAL_DEFAULT_PROVIDER,
-    displayName: "MiniMax M3 助手",
+    displayName: "全能助手",
     avatarEmoji: "🧠",
   };
 
