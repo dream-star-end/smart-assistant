@@ -2,7 +2,7 @@
   "currentVersion": "v1.0.342",
   "releases": [
     {
-      "version": "PENDING",
+      "version": "v1.0.342",
       "date": "2026-06-17",
       "title": "修复 GLM-5.2 等模型上传图片仍提示不支持的问题",
       "items": [
