@@ -41,12 +41,12 @@ describe("isCapabilityZeroStaticModel — minimax + ark(不含 deepseek)", () =>
 });
 
 describe("getStaticModelContextWindow", () => {
-  test("minimax=512k, ark(glm-5.1/glm-5.2)=200k", () => {
+  test("minimax=512k, ark glm-5.1=200k / glm-5.2=1M(per-model)", () => {
     expect(getStaticModelContextWindow("MiniMax-M3")).toBe(512_000);
     expect(getStaticModelContextWindow("glm-5.1")).toBe(200_000);
     expect(getStaticModelContextWindow("GLM-5.1")).toBe(200_000);
-    expect(getStaticModelContextWindow("glm-5.2")).toBe(200_000);
-    expect(getStaticModelContextWindow("GLM-5.2")).toBe(200_000);
+    expect(getStaticModelContextWindow("glm-5.2")).toBe(1_000_000);
+    expect(getStaticModelContextWindow("GLM-5.2")).toBe(1_000_000);
   });
   test("deepseek 无特判 → undefined(由 caller 落 MODEL_CONTEXT_WINDOW_DEFAULT,等价现状)", () => {
     expect(getStaticModelContextWindow("deepseek-v4-pro")).toBeUndefined();

@@ -69,15 +69,15 @@ describe('staticKeyProviders — inboundModelIds(与 route 面故意不同)', ()
   })
   it('minimax 1 项 / ark 2 项(glm-5.1 兼容 + glm-5.2 主力)', () => {
     assert.deepEqual([...getStaticProvider('minimax').inboundModelIds], ['MiniMax-M3'])
-    assert.deepEqual([...getStaticProvider('ark').inboundModelIds], ['glm-5.1', 'glm-5.2'])
+    assert.deepEqual([...getStaticProvider('ark').inboundModelIds], ['glm-5.2', 'glm-5.1'])
   })
   it('STATIC_KEY_INBOUND_MODEL_IDS = 全 provider 字面量展开', () => {
     assert.deepEqual([...STATIC_KEY_INBOUND_MODEL_IDS], [
       'deepseek-v4-flash',
       'deepseek-v4-pro',
       'MiniMax-M3',
-      'glm-5.1',
       'glm-5.2',
+      'glm-5.1',
     ])
   })
 })
@@ -131,7 +131,7 @@ describe('staticKeyProviders — strip / endpoint', () => {
       'service_tier',
     ])
     assert.equal(ark.stripBodyFields.includes('thinking'), false, 'ark 必须不 strip thinking')
-    assert.equal(ark.maxInputTokens, 200_000)
+    assert.equal(ark.maxInputTokens, 1_000_000)
   })
   it('ark endpoint = 火山方舟 coding plan /v1/messages', () => {
     assert.equal(

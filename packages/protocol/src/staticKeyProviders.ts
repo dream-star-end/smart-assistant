@@ -101,7 +101,7 @@ const ARK: StaticKeyProviderSpec = {
     const m = modelId.toLowerCase()
     return m === 'glm-5.1' || m === 'glm-5.2'
   },
-  inboundModelIds: ['glm-5.1', 'glm-5.2'],
+  inboundModelIds: ['glm-5.2', 'glm-5.1'],
   canonicalizeForPricing(modelId) {
     const m = modelId.toLowerCase()
     return m === 'glm-5.1' ? 'glm-5.1' : m === 'glm-5.2' ? 'glm-5.2' : null
@@ -112,9 +112,13 @@ const ARK: StaticKeyProviderSpec = {
   // glm-5.2 同通道同协议)。CCB 对 glm-5.1/glm-5.2 modelSupportsThinking=true，会按用户设置发 thinking，
   // 故必须放行。其余 3 个 firstParty-only 字段仍 strip(Ark 不识别/可能拒)。
   stripBodyFields: ['output_config', 'context_management', 'service_tier'],
-  // glm-5.1/glm-5.2 火山上下文窗口 200k(沿用 glm-5.1 公开规格;⚠️ 火山 glm-5.2 实际窗口待确认,
-  // 若火山支持更大可后调)。input cap 是估算 guard(JSON.length/4)，防超窗。
-  maxInputTokens: 200_000,
+  // **glm-5.2 上下文窗口 1M**(火山规格,boss 2026-06-17 确认);glm-5.1 200k(已退场)。
+  // maxInputTokens 是 provider 级单值 input guard(估算 JSON.length/4),取 glm-5.2 的 1M:
+  //   - glm-5.2 长上下文(200k~1M)不再被 master 误拒 413;
+  //   - glm-5.1(退场)guard 随之放宽到 1M,存量 glm-5.1 超 200k 的罕见请求由火山端点兜底拒(400)。
+  // 注:CCB auto-compact 上限是 **per-model 精确**的(staticKeyModels STATIC_MODEL_CONTEXT_WINDOW:
+  //     5.2=1M / 5.1=200k),防 glm-5.1 存量会话按 1M 不压缩而超窗。
+  maxInputTokens: 1_000_000,
 }
 
 export const STATIC_KEY_PROVIDERS: readonly StaticKeyProviderSpec[] = [DEEPSEEK, MINIMAX, ARK]

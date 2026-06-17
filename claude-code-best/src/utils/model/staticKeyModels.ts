@@ -39,14 +39,17 @@ export function isCapabilityZeroStaticModel(model: string): boolean {
 
 /**
  * 静态模型 context window 显式特判表(deepseek 不在内 —— 它无特判,落 MODEL_CONTEXT_WINDOW_DEFAULT)。
- * ark(glm-5.1/glm-5.2)=200_000 恰等于当前默认,仍显式列出以防默认值将来变动。
+ * **per-model**:glm-5.2=1M(火山规格,boss 2026-06-17 确认)、glm-5.1=200k(退场,沿用旧规格)。
+ * auto-compact 上限必须 per-model:glm-5.1 存量会话若按 1M 不压缩会超 200k 窗 → 火山拒。
+ * 顺序敏感:glm-5.2 条目必须在 glm-5.1 之前(find 短路);二者大小写/空白不敏感,与 isArkGlmModel 一致口径。
  */
 export const STATIC_MODEL_CONTEXT_WINDOW: ReadonlyArray<{
   matches: (model: string) => boolean
   contextWindow: number
 }> = [
   { matches: isMiniMaxM3Model, contextWindow: 512_000 },
-  { matches: isArkGlmModel, contextWindow: 200_000 },
+  { matches: (m) => m.trim().toLowerCase() === 'glm-5.2', contextWindow: 1_000_000 },
+  { matches: (m) => m.trim().toLowerCase() === 'glm-5.1', contextWindow: 200_000 },
 ]
 
 /** 命中静态模型 context 特判表 → 返回其 contextWindow;否则 undefined(由 caller 落默认)。 */
