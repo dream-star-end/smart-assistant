@@ -95,10 +95,33 @@ describe('collectAvailableMcpToolNames', () => {
     assert.ok(tools.includes('agent_tool'))
   })
 
-  it('respects explicit toolset filtering for built-in vision', () => {
+  it('built-in vision 豁免 toolset 过滤(像 memory;由 shouldEnable 控制)', () => {
+    // deepseek(shouldEnable=true)+ toolset coding(不含 vision)→ 仍有 understand_image。
     const config = {
       ...baseConfig,
       defaults: { ...baseConfig.defaults, toolsets: ['coding'] },
+      toolsets: { coding: ['browser'] },
+    }
+    const tools = collectAvailableMcpToolNames(config, { id: 'main' } as any)
+    assert.equal(tools.includes('understand_image'), true)
+  })
+
+  it('glm-5.2 + core toolset(不含 vision)仍拿到 understand_image(回归:main/全能助手场景)', () => {
+    const config = {
+      ...baseConfig,
+      provider: 'ark',
+      defaults: { ...baseConfig.defaults, model: 'glm-5.2', toolsets: ['core'] },
+      toolsets: { core: [] },
+    }
+    const tools = collectAvailableMcpToolNames(config, { id: 'main' } as any)
+    assert.equal(tools.includes('understand_image'), true)
+  })
+
+  it('多模态模型 + toolset 仍不拿 understand_image(shouldEnable gate,不受豁免影响)', () => {
+    const config = {
+      ...baseConfig,
+      provider: 'anthropic',
+      defaults: { ...baseConfig.defaults, model: 'claude-opus-4-7', toolsets: ['coding'] },
       toolsets: { coding: ['browser'] },
     }
     const tools = collectAvailableMcpToolNames(config, { id: 'main' } as any)

@@ -202,7 +202,10 @@ export function collectAvailableMcpToolNames(
     shouldEnableOpenClaudeVision(effectiveProvider, effectiveModel) &&
     resolveVisionEntry(config.auth.claudeCodePath)
   ) {
-    addTools(OPENCLAUDE_VISION_MCP_ID, OPENCLAUDE_VISION_TOOLS)
+    // bypassToolset=true:vision 是内置平台工具,豁免 toolset 过滤(与 subprocessRunner 注入侧一致;
+    // gating 已由 shouldEnableOpenClaudeVision 控制)。否则有 toolset 的 agent 的 prompt hint 不提
+    // understand_image,与实际注入不一致。
+    addTools(OPENCLAUDE_VISION_MCP_ID, OPENCLAUDE_VISION_TOOLS, true)
   }
 
   for (const srv of config.mcpServers ?? []) {

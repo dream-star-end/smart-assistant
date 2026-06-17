@@ -1032,8 +1032,13 @@ export class SubprocessRunner extends EventEmitter {
         const ids = toolsetDefs[ts]
         if (ids) for (const id of ids) allowedMcpIds.add(id)
       }
-      // Built-in 'openclaude-memory' is always allowed regardless of toolset
+      // Built-in 平台 MCP **总是豁免 toolset 过滤**(各自有独立 gating):
+      //   - openclaude-memory:总开;
+      //   - openclaude-vision:由 shouldEnableOpenClaudeVision 控制(纯文本模型 understand_image)。
+      // 注:vision 之前漏了这行,导致**有 toolset 的 agent(如 main/全能助手 core toolset)拿不到
+      // understand_image** —— 纯文本模型上传图被 strip 后又没工具兜底,表现为"不支持图片识别"。
       allowedMcpIds.add('openclaude-memory')
+      allowedMcpIds.add(OPENCLAUDE_VISION_MCP_ID)
     }
     const openClaudeVisionAllowed =
       shouldEnableOpenClaudeVision(effectiveProvider, this.opts.model) &&
