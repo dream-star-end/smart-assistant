@@ -961,9 +961,13 @@ try {
     },
   ] as const;
 
-  function ensureAgentSkill(agentId: string, name: string, content: string): void {
+  function ensureAgentSeedSkill(agentId: string, name: string, content: string): void {
     try {
-      const skillDir = join(ocConfigDir, "agents", agentId, "skills", name);
+      // Platform per-agent seeds live in a dedicated READ-ONLY layer ("seed-skills"),
+      // physically separate from the user-writable per-agent skills dir, so the
+      // user-level shared-library overlay never treats them as deletable user data
+      // (agent-seed wins over legacy on read; reserved on write).
+      const skillDir = join(ocConfigDir, "agents", agentId, "seed-skills", name);
       const skillPath = join(skillDir, "SKILL.md");
       if (existsSync(skillPath)) return;
       if (existsSync(skillDir)) {
@@ -984,7 +988,7 @@ try {
   }
 
   for (const seed of SCIENTIST_SKILL_SEEDS) {
-    ensureAgentSkill("scientist", seed.name, scientificSkillContent(seed));
+    ensureAgentSeedSkill("scientist", seed.name, scientificSkillContent(seed));
   }
 
   function isAgentWithId(value: unknown, id: string): value is Record<string, unknown> {

@@ -6,6 +6,7 @@
  *   npx tsx --test packages/storage/src/__tests__/skillStore.test.ts
  */
 import * as assert from 'node:assert/strict'
+import { existsSync } from 'node:fs'
 import { mkdir, mkdtemp, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -185,7 +186,9 @@ describe('SkillStore — PR4 baseline-wins merge', () => {
     const store = new SkillStore(MERGE_AGENT, { baselineDir: baselineRoot })
     const r = await store.delete('platform-only')
     assert.equal(r.ok, false)
-    assert.match(r.error ?? '', /cannot delete platform baseline skill/)
+    // Message generalized to "platform skill" now that platform layers include
+    // both baseline and per-agent agent-seed.
+    assert.match(r.error ?? '', /cannot delete platform skill/)
   })
 
   it('delete() on user shadow cleans user but reports baseline remains', async () => {
@@ -199,7 +202,7 @@ describe('SkillStore — PR4 baseline-wins merge', () => {
     )
     const r = await store.delete('system-info')
     assert.equal(r.ok, true)
-    assert.match(r.note ?? '', /platform baseline 'system-info' remains/)
+    assert.match(r.note ?? '', /platform skill 'system-info' remains/)
     // After delete, baseline view still works (unaffected).
     const v = await store.view('system-info')
     assert.ok(v && typeof v !== 'string')
@@ -315,5 +318,123 @@ describe('searchSkillMetadata — tier-1 skill discovery', () => {
 
   it('returns [] for blank queries', () => {
     assert.deepEqual(searchSkillMetadata(fixtures as any, '   '), [])
+  })
+})
+
+describe('SkillStore — four-layer overlay (baseline > agent-seed > shared > legacy)', () => {
+  const OA = 'overlay-agent'
+  const seedDir = paths.agentSeedSkillsDir(OA)
+  const legacyDir = paths.agentSkillsDir(OA)
+  const sharedDir = paths.sharedSkillsDir
+  let baselineDir: string
+
+  before(async () => {
+    baselineDir = await mkdtemp(join(tmpdir(), 'oc-overlay-baseline-'))
+    await mkdir(seedDir, { recursive: true })
+    await mkdir(legacyDir, { recursive: true })
+    await mkdir(sharedDir, { recursive: true })
+  })
+
+  const mkStore = () => new SkillStore(OA, { baselineDir, agentSeedDir: seedDir, sharedDir })
+
+  it('read priority dedups same-named skill: baseline wins', async () => {
+    await writeSkillMd(baselineDir, 'pri', fm('pri', 'from-baseline'))
+    await writeSkillMd(seedDir, 'pri', fm('pri', 'from-seed'))
+    await writeSkillMd(sharedDir, 'pri', fm('pri', 'from-shared'))
+    await writeSkillMd(legacyDir, 'pri', fm('pri', 'from-legacy'))
+    const list = await mkStore().list()
+    const pri = list.filter((s) => s.name === 'pri')
+    assert.equal(pri.length, 1)
+    assert.equal(pri[0].layer, 'platform')
+    assert.equal(pri[0].description, 'from-baseline')
+    assert.equal((await mkStore().view('pri') as any).layer, 'platform')
+  })
+
+  it('agent-seed wins over shared and legacy (read-only)', async () => {
+    await writeSkillMd(seedDir, 'seedwin', fm('seedwin', 'seed'))
+    await writeSkillMd(sharedDir, 'seedwin', fm('seedwin', 'shared'))
+    const v = (await mkStore().view('seedwin')) as any
+    assert.equal(v.layer, 'agent-seed')
+    assert.equal(v.source, 'platform')
+    assert.equal(v.writable, false)
+  })
+
+  it('shared wins over legacy; layer/writable flags correct', async () => {
+    await writeSkillMd(sharedDir, 'shw', fm('shw', 'shared-v'))
+    await writeSkillMd(legacyDir, 'shw', fm('shw', 'legacy-v'))
+    const v = (await mkStore().view('shw')) as any
+    assert.equal(v.layer, 'shared')
+    assert.equal(v.writable, true)
+    assert.equal(v.description, 'shared-v')
+    await writeSkillMd(legacyDir, 'legonly', fm('legonly', 'leg'))
+    const v2 = (await mkStore().view('legonly')) as any
+    assert.equal(v2.layer, 'legacy')
+    assert.equal(v2.writable, false)
+  })
+
+  it('save writes to shared, not the per-agent legacy dir', async () => {
+    const r = await mkStore().save({ name: 'written', description: 'w' }, 'body')
+    assert.equal(r.ok, true)
+    assert.ok(existsSync(join(sharedDir, 'written', 'SKILL.md')))
+    assert.ok(!existsSync(join(legacyDir, 'written', 'SKILL.md')))
+    assert.equal((await mkStore().view('written') as any).layer, 'shared')
+  })
+
+  it('save rejects names reserved by baseline or agent-seed', async () => {
+    await writeSkillMd(baselineDir, 'bres', fm('bres', 'b'))
+    await writeSkillMd(seedDir, 'sres', fm('sres', 's'))
+    const r1 = await mkStore().save({ name: 'bres', description: 'x' }, 'b')
+    assert.equal(r1.ok, false)
+    assert.match(r1.error ?? '', /reserved for platform baseline/)
+    const r2 = await mkStore().save({ name: 'sres', description: 'x' }, 'b')
+    assert.equal(r2.ok, false)
+    assert.match(r2.error ?? '', /reserved for platform agent-seed/)
+  })
+
+  it('delete sweeps same-named legacy residue across ALL agents', async () => {
+    await writeSkillMd(sharedDir, 'sweep', fm('sweep', 'shared'))
+    await writeSkillMd(paths.agentSkillsDir('agA'), 'sweep', fm('sweep', 'a'))
+    await writeSkillMd(paths.agentSkillsDir('agB'), 'sweep', fm('sweep', 'b'))
+    const r = await mkStore().delete('sweep')
+    assert.equal(r.ok, true)
+    assert.ok(!existsSync(join(sharedDir, 'sweep')))
+    assert.ok(!existsSync(join(paths.agentSkillsDir('agA'), 'sweep')))
+    assert.ok(!existsSync(join(paths.agentSkillsDir('agB'), 'sweep')))
+  })
+
+  it('delete of legacy-only residue in another agent does not resurface', async () => {
+    await writeSkillMd(paths.agentSkillsDir('agC'), 'ghost', fm('ghost', 'g'))
+    const r = await mkStore().delete('ghost')
+    assert.equal(r.ok, true)
+    assert.ok(!existsSync(join(paths.agentSkillsDir('agC'), 'ghost')))
+  })
+
+  it('rejects a sharedDir resolving outside home', () => {
+    assert.throws(
+      () => new SkillStore(OA, { sharedDir: join(tmpdir(), 'outside-home-skills') }),
+      /within home/,
+    )
+  })
+
+  it('aggregateLegacy merges all agents legacy + shared, excludes agent-seed', async () => {
+    await writeSkillMd(paths.agentSkillsDir('uA'), 'agg-a', fm('agg-a', 'a'))
+    await writeSkillMd(paths.agentSkillsDir('uB'), 'agg-b', fm('agg-b', 'b'))
+    await writeSkillMd(sharedDir, 'agg-shared', fm('agg-shared', 's'))
+    await writeSkillMd(paths.agentSeedSkillsDir('uA'), 'agg-seed', fm('agg-seed', 'seed'))
+    const store = new SkillStore('main', { baselineDir, sharedDir, aggregateLegacy: true })
+    const names = (await store.list()).map((s) => s.name)
+    assert.ok(names.includes('agg-a'))
+    assert.ok(names.includes('agg-b'))
+    assert.ok(names.includes('agg-shared'))
+    assert.ok(!names.includes('agg-seed'), 'agent-seed must NOT appear in user-level aggregate')
+  })
+
+  it('user-level save is rejected for names reserved by ANY agent seed (anti-shadow)', async () => {
+    await writeSkillMd(paths.agentSeedSkillsDir('scientist'), 'reserved-seed', fm('reserved-seed', 'seed'))
+    const userStore = new SkillStore('main', { baselineDir, sharedDir, aggregateLegacy: true })
+    const r = await userStore.save({ name: 'reserved-seed', description: 'x' }, 'b')
+    assert.equal(r.ok, false)
+    assert.match(r.error ?? '', /reserved for a platform agent-seed/)
+    assert.ok(!existsSync(join(sharedDir, 'reserved-seed')), 'must not have written a shadowed shared skill')
   })
 })

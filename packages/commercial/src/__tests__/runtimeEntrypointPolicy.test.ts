@@ -416,7 +416,7 @@ describe("openclaude-runtime entrypoint env-scrub policy", () => {
     );
   });
 
-  test("entrypoint.ts seeds curated scientific skills only under scientist agent skills", () => {
+  test("entrypoint.ts seeds curated scientific skills only under scientist agent seed-skills (read-only layer)", () => {
     const src = readFileSync(ENTRYPOINT_TS_PATH, "utf-8");
     assert.match(
       src,
@@ -425,12 +425,12 @@ describe("openclaude-runtime entrypoint env-scrub policy", () => {
     );
     assert.match(
       src,
-      /join\(ocConfigDir,\s*"agents",\s*agentId,\s*"skills",\s*name\)/,
-      "scientific skills must be written to the per-agent SkillStore namespace",
+      /join\(ocConfigDir,\s*"agents",\s*agentId,\s*"seed-skills",\s*name\)/,
+      "scientific seeds must be written to the per-agent read-only seed-skills layer (not the user-writable skills dir)",
     );
     assert.match(
       src,
-      /ensureAgentSkill\("scientist",\s*seed\.name,\s*scientificSkillContent\(seed\)\)/,
+      /ensureAgentSeedSkill\("scientist",\s*seed\.name,\s*scientificSkillContent\(seed\)\)/,
       "scientific seed loop must target only the scientist agent",
     );
     assert.match(src, /if \(existsSync\(skillPath\)\) return/, "skill seed must not overwrite existing skills");

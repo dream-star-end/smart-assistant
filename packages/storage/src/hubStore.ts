@@ -220,6 +220,10 @@ export class HubStore {
           // flow as self-authored ones (can be uninstalled, not protected by the
           // platform-baseline contract) — so they count as 'user' for SkillMetadata.
           source: 'user',
+          // Distinct overlay layer; managed via hub install/uninstall, not the skill
+          // API, so it is not writable through SkillStore.save/delete.
+          layer: 'hub',
+          writable: false,
         })
       } catch {}
     }

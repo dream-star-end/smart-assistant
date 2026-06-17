@@ -201,6 +201,11 @@ describe("BLOCKED_FOR_USER_RULES — user role → 403", () => {
     { path: "/api/agents/main/skills", method: "POST" },
     { path: "/api/agents/main/skills/my-skill", method: "GET" },
     { path: "/api/agents/main/skills/my-skill", method: "DELETE" },
+    // user-level shared skill library (host singleton store; users go via container proxy)
+    { path: "/api/skills", method: "GET" },
+    { path: "/api/skills", method: "POST" },
+    { path: "/api/skills/my-skill", method: "GET" },
+    { path: "/api/skills/my-skill", method: "DELETE" },
     // host agent teams(写 host singleton agents.yaml;用户只能走 container proxy)
     { path: "/api/agent-teams", method: "GET" },
     { path: "/api/agent-teams", method: "POST" },

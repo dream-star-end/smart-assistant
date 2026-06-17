@@ -46,6 +46,8 @@ import {
   type OpenClaudeConfig,
   SkillStore,
   TaskStore,
+  buildAgentSkillStore,
+  buildUserSkillStore,
   paths,
   readAgentsConfig,
   readConfig,
@@ -2291,6 +2293,18 @@ export class Gateway {
     if (memoryMatch) {
       this.handleMemory(req, res, memoryMatch[1], memoryMatch[2] as 'memory' | 'user').catch(
         (err) => this.sendError(res, 500, String(err)),
+      )
+      return
+    }
+    // User-level skill library (agentId-less; baseline + shared + aggregated legacy).
+    if (url.pathname === '/api/skills') {
+      this.handleUserSkillsList(req, res).catch((err) => this.sendError(res, 500, String(err)))
+      return
+    }
+    const userSkillItemMatch = url.pathname.match(/^\/api\/skills\/([a-z0-9-]+)$/)
+    if (userSkillItemMatch) {
+      this.handleUserSkillItem(req, res, userSkillItemMatch[1]).catch((err) =>
+        this.sendError(res, 500, String(err)),
       )
       return
     }
@@ -4677,7 +4691,7 @@ export class Gateway {
     agentId: string,
   ): Promise<void> {
     if (req.method !== 'GET') return this.sendError(res, 405, 'method not allowed')
-    const store = new SkillStore(agentId)
+    const store = buildAgentSkillStore(agentId)
     const list = await store.list()
     this.sendJson(res, 200, { skills: list })
   }
@@ -4689,7 +4703,54 @@ export class Gateway {
     agentId: string,
     skillName: string,
   ): Promise<void> {
-    const store = new SkillStore(agentId)
+    const store = buildAgentSkillStore(agentId)
+    if (req.method === 'GET') {
+      const v = await store.view(skillName)
+      if (!v || typeof v === 'string') return this.sendError(res, 404, 'skill not found')
+      this.sendJson(res, 200, { skill: v })
+      return
+    }
+    if (req.method === 'PUT') {
+      const body = await this.readJsonBody<{
+        description?: string
+        body?: string
+        tags?: string[]
+      }>(req)
+      const r = await store.save(
+        { name: skillName, description: body.description ?? '', tags: body.tags },
+        body.body ?? '',
+      )
+      if (!r.ok) return this.sendError(res, 400, r.error ?? 'save failed')
+      this.sendJson(res, 200, { ok: true })
+      return
+    }
+    if (req.method === 'DELETE') {
+      const r = await store.delete(skillName)
+      if (!r.ok) return this.sendError(res, 404, r.error ?? 'delete failed')
+      this.sendJson(res, 200, { ok: true })
+      return
+    }
+    this.sendError(res, 405, 'method not allowed')
+  }
+
+  // GET /api/skills — user-level skill library list.
+  // Aggregates baseline + shared + all agents' legacy (NOT per-agent seed), so a
+  // user sees one unified "my skills" library regardless of which agent is active.
+  private async handleUserSkillsList(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    if (req.method !== 'GET') return this.sendError(res, 405, 'method not allowed')
+    const store = buildUserSkillStore()
+    const list = await store.list()
+    this.sendJson(res, 200, { skills: list })
+  }
+
+  // GET/PUT/DELETE /api/skills/:name — user-level skill item. Writes/deletes go to
+  // the shared library (delete also sweeps same-named legacy residue across agents).
+  private async handleUserSkillItem(
+    req: IncomingMessage,
+    res: ServerResponse,
+    skillName: string,
+  ): Promise<void> {
+    const store = buildUserSkillStore()
     if (req.method === 'GET') {
       const v = await store.view(skillName)
       if (!v || typeof v === 'string') return this.sendError(res, 404, 'skill not found')
@@ -9091,6 +9152,7 @@ function normalizePath(p: string): string {
   // Dynamic API routes — normalize IDs
   const normalized = p
     .replace(/\/api\/agents\/[a-zA-Z0-9_-]+\/skills\/[a-z0-9-]+/, '/api/agents/:id/skills/:name')
+    .replace(/\/api\/skills\/[a-z0-9-]+/, '/api/skills/:name')
     .replace(/\/api\/agents\/[a-zA-Z0-9_-]+\/([a-z]+)/, '/api/agents/:id/$1')
     .replace(/\/api\/agents\/[a-zA-Z0-9_-]+/, '/api/agents/:id')
     .replace(/\/api\/cron\/[a-zA-Z0-9_-]+/, '/api/cron/:id')

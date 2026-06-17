@@ -17,7 +17,7 @@
  *   10. REPO             — 当前会话 GitHub repo 绑定快照 (离 user 消息最近)
  */
 import { existsSync, readFileSync } from 'node:fs'
-import { MemoryStore, SkillStore, paths, readAgentsConfig } from '@openclaude/storage'
+import { MemoryStore, type SkillStore, buildAgentSkillStore, paths, readAgentsConfig } from '@openclaude/storage'
 import { request as undiciRequest } from 'undici'
 import type { RepoSnapshot } from './sessionRepoWorkspace.js'
 
@@ -45,17 +45,9 @@ export interface PromptSlot {
 }
 
 function buildPromptSkillStore(agentId: string): SkillStore {
-  const baselineDir = process.env.OPENCLAUDE_BASELINE_SKILLS_DIR?.trim()
-  if (!baselineDir) return new SkillStore(agentId)
-  try {
-    return new SkillStore(agentId, { baselineDir })
-  } catch (err) {
-    console.warn(
-      '[promptSlots] OPENCLAUDE_BASELINE_SKILLS_DIR invalid, falling back to user-only skills:',
-      err,
-    )
-    return new SkillStore(agentId)
-  }
+  // Overlay (single wiring in @openclaude/storage): baseline(ro) > agent-seed(ro)
+  // > shared(rw, all agents) > legacy(per-agent).
+  return buildAgentSkillStore(agentId)
 }
 
 // ── Individual slot builders ──

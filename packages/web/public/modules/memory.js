@@ -384,7 +384,9 @@ async function _loadSkills() {
   const wrap = $('context-skills-list')
   if (wrap) wrap.innerHTML = '<div class="context-loading">读取技能库中…</div>'
   try {
-    const data = await apiGet(`/api/agents/${encodeURIComponent(_activeAgentId(_hubAgentId))}/skills`)
+    // User-level shared skill library — visible/usable across ALL of the user's
+    // agents (not filtered by the currently-active agent).
+    const data = await apiGet('/api/skills')
     _skillsCache = data.skills || []
     _selectedSkill = _skillsCache[0]?.name || null
     _renderSkillsList()
@@ -434,12 +436,16 @@ async function _loadSkillDetail(name) {
   const detail = $('skill-detail')
   detail.innerHTML = '<div class="context-loading">读取技能详情中…</div>'
   try {
-    const data = await apiGet(`/api/agents/${encodeURIComponent(_activeAgentId(_hubAgentId))}/skills/${encodeURIComponent(name)}`)
+    const data = await apiGet(`/api/skills/${encodeURIComponent(name)}`)
     const skill = data.skill
-    const canEdit = skill.source !== 'platform'
+    // Editability follows `writable` (platform baseline/agent-seed = read-only;
+    // legacy per-agent residue is user-sourced but read-only until migrated to shared).
+    const isPlatform = skill.source === 'platform'
+    const canEdit = skill.writable === true
+    const badgeText = isPlatform ? '平台只读' : canEdit ? '自建可编辑' : '自建·迁移中(只读)'
     detail.innerHTML = `
       <div class="skill-detail-head">
-        <div><span class="source-badge ${skill.source === 'platform' ? 'platform' : 'user'}">${skill.source === 'platform' ? '平台只读' : '自建可编辑'}</span><h4>${htmlSafeEscape(skill.name)}</h4><p>${htmlSafeEscape(skill.description || '')}</p></div>
+        <div><span class="source-badge ${isPlatform ? 'platform' : 'user'}">${badgeText}</span><h4>${htmlSafeEscape(skill.name)}</h4><p>${htmlSafeEscape(skill.description || '')}</p></div>
         <button type="button" id="skill-edit-inline" class="btn btn-secondary" ${canEdit ? '' : 'disabled'}>${canEdit ? '编辑' : '只读'}</button>
       </div>
       <div class="skill-detail-tags">${(skill.tags || []).map((tag) => `<span>${htmlSafeEscape(tag)}</span>`).join('')}</div>
@@ -478,7 +484,7 @@ async function _saveSkillEditor() {
   const btn = $('skill-editor-save')
   _setBusy(btn, true, '保存中…')
   try {
-    await apiJson('PUT', `/api/agents/${encodeURIComponent(_activeAgentId(_hubAgentId))}/skills/${encodeURIComponent(name)}`, {
+    await apiJson('PUT', `/api/skills/${encodeURIComponent(name)}`, {
       description,
       tags,
       body,
@@ -499,7 +505,7 @@ async function _deleteSelectedSkill() {
   if (!skill) return
   if (!(await confirmDialog({ title: '删除 Skill?', body: `删除 skill "${skill}"?`, confirmText: '删除', danger: true }))) return
   try {
-    await apiJson('DELETE', `/api/agents/${encodeURIComponent(_activeAgentId(_hubAgentId))}/skills/${encodeURIComponent(skill)}`)
+    await apiJson('DELETE', `/api/skills/${encodeURIComponent(skill)}`)
     toast('技能已删除')
     await _loadSkills()
   } catch (err) {

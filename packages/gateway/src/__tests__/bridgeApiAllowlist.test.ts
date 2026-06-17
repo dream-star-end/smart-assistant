@@ -33,6 +33,16 @@ describe('bridge API allowlist', () => {
       matchCommercialContainerApiProxy('/api/agents/main/skills/foo', 'PUT')?.label,
       '/api/agents/:id/skills/:name',
     )
+    // User-level shared skill library (agentId-less) — proxied into the user's container.
+    assert.equal(matchCommercialContainerApiProxy('/api/skills', 'GET')?.label, '/api/skills')
+    assert.equal(
+      matchCommercialContainerApiProxy('/api/skills/foo', 'PUT')?.label,
+      '/api/skills/:name',
+    )
+    assert.equal(
+      matchCommercialContainerApiProxy('/api/skills/foo', 'DELETE')?.label,
+      '/api/skills/:name',
+    )
     assert.equal(matchCommercialContainerApiProxy('/api/cron', 'POST')?.label, '/api/cron')
     assert.equal(
       matchCommercialContainerApiProxy('/api/cron/job-1', 'DELETE')?.label,
