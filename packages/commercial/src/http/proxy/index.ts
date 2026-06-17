@@ -403,8 +403,12 @@ export function makeAnthropicProxyHandler(
       // 静态 provider input 上限 guard(注册表 spec.maxInputTokens；deepseek 无 cap=undefined)。
       // 注意 inputTokens 是 estimateInputTokens 的**估算值**(JSON.length/4，非真 tokenizer)，
       // 故此 cap 是粗 guardrail：防超模型上下文窗(如 glm-5.1 200k / MiniMax-M3 512k)无声进更贵档。
+      // **supportsVision provider(MiniMax-M3)跳过此 cap**:vision 请求含大 base64 image，
+      // JSON.length/4 会把图当文本 token 严重高估(2MB 图≈725k「token」)而误撞文本 context cap →
+      // understand_image 永远 413。图请求的真正体积上限由下游 enforceFieldByteBudgets(messages 8MB)兜底。
       if (
         route.kind === "static" &&
+        !route.provider.supportsVision &&
         route.provider.maxInputTokens != null &&
         inputTokens > route.provider.maxInputTokens
       ) {

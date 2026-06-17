@@ -1358,6 +1358,15 @@ describe("stripNonTextContentBlocks", () => {
       gateIdx >= 0 && gateIdx < stripIdx,
       'strip 必须 gated 在 if (route.kind === "static" && !route.provider.supportsVision) 内',
     );
+
+    // input cap guard 也必须 gated 在 !route.provider.supportsVision —— vision 请求含大 base64 图,
+    // estimateInputTokens(JSON.length/4)把图当文本 token 高估(2MB 图≈725k),误撞文本 context cap → 413。
+    // 期望源码里有**两处** !route.provider.supportsVision:strip gate + input cap gate。
+    const supportsVisionGates = (src.match(/!route\.provider\.supportsVision/g) ?? []).length;
+    assert.ok(
+      supportsVisionGates >= 2,
+      'strip 与 static input cap guard 两处都必须 gated 在 !route.provider.supportsVision',
+    );
   });
 });
 
