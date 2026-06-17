@@ -9,7 +9,7 @@ import { isEnvTruthy } from './envUtils.js'
 import type { EffortLevel } from 'src/entrypoints/sdk/runtimeTypes.js'
 import { resolveAntModel } from './model/antModels.js'
 import { getAntModelOverrideConfig } from './model/antModels.js'
-import { isCapabilityZeroStaticModel } from './model/staticKeyModels.js'
+import { isArkGlmModel, isCapabilityZeroStaticModel } from './model/staticKeyModels.js'
 
 export type { EffortLevel }
 
@@ -26,6 +26,12 @@ export type EffortValue = EffortLevel | number
 // @[MODEL LAUNCH]: Add the new model to the allowlist if it supports the effort parameter.
 export function modelSupportsEffort(model: string): boolean {
   const m = model.toLowerCase()
+  // glm-5.x(火山方舟 ark)虽在 capabilityZero 集,但火山端点支持 output_config.effort(high/max,
+  // 端点 error message 实测合法值 low/medium/high/max)。**例外放行**(在 capabilityZero return 之前),
+  // 同 thinking.ts 对 glm 的处理。master proxy 会把 output_config 清洗成只剩 effort 透传火山。
+  if (isArkGlmModel(model)) {
+    return true
+  }
   if (isCapabilityZeroStaticModel(model)) {
     return false
   }
@@ -62,6 +68,10 @@ export function modelSupportsEffort(model: string): boolean {
 // @[MODEL LAUNCH]: Add the new model to the allowlist if it supports 'max' effort.
 // Per API docs, 'max' is Opus 4.6+ only for public models — other models return an error.
 export function modelSupportsMaxEffort(model: string): boolean {
+  // glm-5.x(火山 ark)支持 effort=max(端点合法值含 max)。例外放行。
+  if (isArkGlmModel(model)) {
+    return true
+  }
   if (isCapabilityZeroStaticModel(model)) {
     return false
   }
@@ -197,7 +207,8 @@ export function resolveAppliedEffort(
   if (envOverride === null) {
     return undefined
   }
-  if (isCapabilityZeroStaticModel(model)) {
+  // glm-5.x(火山 ark)是 capabilityZero 但支持 effort(high/max),不在此 early-return。
+  if (isCapabilityZeroStaticModel(model) && !isArkGlmModel(model)) {
     return undefined
   }
   const resolved =
@@ -348,6 +359,12 @@ export function getDefaultEffortForModel(
     }
     // Always default ants to undefined/high
     return undefined
+  }
+
+  // glm-5.x(火山 ark):默认最高档(boss 2026-06-17:可调思考模型默认拉满 max)。
+  // 放在 ultrathink/opus 默认之前,确保所有入口(含非 web channel,如微信不传 effortLevel)默认 max。
+  if (isArkGlmModel(model)) {
+    return 'max'
   }
 
   // IMPORTANT: Do not change the default effort level without notifying

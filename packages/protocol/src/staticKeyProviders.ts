@@ -63,6 +63,18 @@ export interface StaticKeyProviderSpec {
    *       deepseek / ark(glm-5.1/glm-5.2,纯文本)=false。
    */
   readonly supportsVision?: boolean
+  /**
+   * master proxy 对 `output_config` 的清洗白名单(思考深度 effort 档位)。
+   *   - undefined → 不特殊处理(由 stripBodyFields 决定整体 strip 还是放行)。
+   *   - 非空数组 → **只保留 `output_config.effort`**,且仅当其值 ∈ 本数组;否则(非法值/缺失/
+   *     非 string)删掉整个 output_config。其余子字段(task_budget/format/...)一律删。
+   * 这是该 provider"上游允许的思考档位"的**单一权威源**:proxy 纯消费,前端选择器 / CCB 默认值
+   * 与之对齐(三处职责不同但档位语义同源)。用于火山 ark glm:火山端点实测合法值 low/medium/high/max,
+   * 但 glm-5.2 产品上只暴露高/最高 = ['high','max'],故收窄到这两档(boss 2026-06-17)。
+   * **配套硬约束**:声明本字段的 provider 不能再把 'output_config' 放进 stripBodyFields
+   * (否则被整体 strip,effort 透不过去)。
+   */
+  readonly allowedOutputConfigEfforts?: readonly string[]
 }
 
 const DEEPSEEK: StaticKeyProviderSpec = {
@@ -122,8 +134,15 @@ const ARK: StaticKeyProviderSpec = {
   // **与 MiniMax 不同:不 strip `thinking`**。glm-5.1/glm-5.2 都是 thinking 模型，火山 Ark Anthropic
   // 兼容层实测支持 `thinking:{type:enabled,budget_tokens}` / `{type:disabled}`(glm-5.1 2026-06-15 直连验证;
   // glm-5.2 同通道同协议)。CCB 对 glm-5.1/glm-5.2 modelSupportsThinking=true，会按用户设置发 thinking，
-  // 故必须放行。其余 3 个 firstParty-only 字段仍 strip(Ark 不识别/可能拒)。
-  stripBodyFields: ['output_config', 'context_management', 'service_tier'],
+  // 故必须放行。
+  // **output_config 不整体 strip**:火山 ark 支持 `output_config.effort`(思考深度,boss 2026-06-17
+  // 实测端点合法值 low/medium/high/max,glm-5.2 上线高/最高两档=high/max)。改由 outputConfigEffortOnly
+  // 让 master 只保留合法 effort、删掉 CCB 其他 firstParty-only 子字段(task_budget/format 等火山不识别)。
+  // 其余 2 个 firstParty-only body 字段仍整体 strip(Ark 不识别/可能拒)。
+  stripBodyFields: ['context_management', 'service_tier'],
+  // 火山端点合法档位 low/medium/high/max,但 glm-5.2 产品只暴露高/最高;收窄到这两档,
+  // 任何其他值(含 low/medium/minimal/xhigh)在 master 兜底剥成"无 effort"(火山默认思考)。
+  allowedOutputConfigEfforts: ['high', 'max'],
   // **glm-5.2 上下文窗口 1M**(火山规格,boss 2026-06-17 确认);glm-5.1 200k(已退场)。
   // maxInputTokens 是 provider 级单值 input guard(估算 JSON.length/4),取 glm-5.2 的 1M:
   //   - glm-5.2 长上下文(200k~1M)不再被 master 误拒 413;

@@ -299,8 +299,10 @@ type Phase6AccountUuidEnforce = "off" | "fail_open" | "fail_closed";
  *   - accountId/pinnedUserId=null、dispatcher=undefined、shouldUpdateQuota=false(不占 OAuth 池)
  *   - applyUpstreamAuth: Authorization Bearer + strip spec.stripHeaders(永含 anthropic-beta)
  *     + strip spec.stripBodyFields(deepseek:[];minimax:output_config/context_management/service_tier;
- *     ark:output_config/context_management/service_tier —— minimax/ark 均**保留 thinking**,
- *     glm-5.1 与 MiniMax-M3 都是 thinking 模型,2026-06-16) —— 避免第三方 strict 兼容层报未知 beta/参数
+ *     ark:context_management/service_tier —— minimax/ark 均**保留 thinking**,glm 与 MiniMax-M3 都是
+ *     thinking 模型,2026-06-16) —— 避免第三方 strict 兼容层报未知 beta/参数
+ *   - 若 spec.allowedOutputConfigEfforts 存在(ark glm):output_config 不整体 strip,而是**只留合法 effort**
+ *     (思考深度档位透传火山,见 protocol 注释);非法/缺失则整删。其余 provider 无此字段,行为不变。
  *   - 不注入 oauth-2025-04-20、不动 metadata、不做 persona/device_id pin(那些是 OAuth 专属)
  *   - sanitizeMessages noop 原样返回(文本 provider 的 text-only 非文本块 strip 在 handler
  *     estimateInputTokens 之前完成,见 http/proxy/index.ts)、zeroizeSecrets noop(apiKey 来自配置注入,不归 session)
@@ -324,6 +326,25 @@ function makeStaticKeyUpstream(
       const mutableBody = body as Record<string, unknown>;
       for (const field of spec.stripBodyFields) {
         delete mutableBody[field];
+      }
+      // outputConfig effort 白名单(火山 ark glm):output_config 不整体 strip,但**只保留合法 effort**。
+      // 火山端点仅识别 output_config.effort(其余 CCB firstParty-only 子字段 task_budget/format 等会拒/忽略),
+      // 且 glm-5.2 产品只暴露高/最高两档。按 protocol 权威白名单收口:effort ∈ allowlist → 重建为 { effort };
+      // 否则(非法值/缺失/非 string/非 object)删掉整个 output_config,退回火山默认思考,避免 400 与产品档位漂移。
+      if (spec.allowedOutputConfigEfforts) {
+        const oc = mutableBody.output_config;
+        const effort =
+          oc !== null && typeof oc === "object" && !Array.isArray(oc)
+            ? (oc as Record<string, unknown>).effort
+            : undefined;
+        if (
+          typeof effort === "string" &&
+          spec.allowedOutputConfigEfforts.includes(effort)
+        ) {
+          mutableBody.output_config = { effort };
+        } else {
+          delete mutableBody.output_config;
+        }
       }
     },
     sanitizeMessages(messages, _model, _log) {

@@ -14,6 +14,10 @@
 //    none/minimal/low/medium/high/xhigh)。`max` 在后端 helper
 //    `codexReasoningEffortConfig` 显式映射 xhigh,前端不暴露 max(同 DeepSeek 模式,
 //    避免给用户"伪选项")。
+//  - 2026-06-17 加 火山方舟 glm-5.1/glm-5.2(智谱)接入 — 同 DeepSeek 暴露 high/max
+//    两档(默认 max)。后端权威白名单 = protocol staticKeyProviders ark
+//    `allowedOutputConfigEfforts=['high','max']`,master proxy 据此清洗 output_config.effort
+//    透传火山(low/medium/minimal/xhigh 等会被兜底剥成"无 effort"=火山默认思考)。
 //
 // 协议契约:
 //  - 后端 `InboundMessage.effortLevel`(`packages/protocol/src/frames.ts:48-57`)
@@ -57,6 +61,11 @@ function isCodexModel(modelId) {
   // 后续若有 gpt-5.5-codex 等 alias 接入,改这里集中扩展。
   return /^gpt-5\.5$/i.test(modelId || '')
 }
+function isGlmModel(modelId) {
+  // exact-match glm-5.1/glm-5.2(与 protocol staticKeyProviders ark matchesRoute 一致,
+  // 大小写不敏感)。火山方舟 glm 思考深度同 DeepSeek 暴露 high/max 两档(boss 2026-06-17)。
+  return /^glm-5\.[12]$/i.test(modelId || '')
+}
 
 const OPUS_47_OPTIONS = [
   { value: 'low', label: '低', hint: '快速响应' },
@@ -84,11 +93,20 @@ const CODEX_OPTIONS = [
   { value: 'xhigh', label: '更高', hint: '深度推理(token 消耗显著上升)' },
 ]
 
+// 火山方舟 glm-5.1/glm-5.2 思考深度:产品暴露 高/最高 两档(boss 2026-06-17)。
+// 后端权威白名单 = protocol staticKeyProviders ark `allowedOutputConfigEfforts=['high','max']`,
+// master proxy 据此清洗 output_config.effort 透传火山;其他档位兜底剥成无 effort。默认 max。
+const GLM_OPTIONS = [
+  { value: 'high', label: '高', hint: '标准推理' },
+  { value: 'max', label: '最高', hint: '深度推理(默认)' },
+]
+
 /** 返回该 model 在菜单里要展示的档位列表(顺序就是渲染顺序)。
  *  不支持思考深度选择的 model 返回空数组(由 `shouldShowEffortControl` 隐藏控件)。 */
 function getEffortOptionsForModel(modelId) {
   if (isDeepseekModel(modelId)) return DEEPSEEK_OPTIONS
   if (isCodexModel(modelId)) return CODEX_OPTIONS
+  if (isGlmModel(modelId)) return GLM_OPTIONS
   if (isOpus47Model(modelId)) return OPUS_47_OPTIONS
   return []
 }
@@ -99,6 +117,7 @@ function getEffortOptionsForModel(modelId) {
 function getDefaultEffortForModel(modelId) {
   if (isDeepseekModel(modelId)) return 'max'
   if (isCodexModel(modelId)) return 'medium' // gpt-5.5:boss 指定默认中等
+  if (isGlmModel(modelId)) return 'max' // 火山 glm:默认最高(显式,不依赖下方 fallback)
   return 'max' // Opus 4.7 等可调思考模型:默认最高
 }
 
@@ -110,7 +129,12 @@ function getAllowedEffortsForModel(modelId) {
  *  容忍模型 ID 大小写、preset / 自定义命名(如 anthropic/claude-opus-4-7)。 */
 export function modelSupportsExtraEffort(modelId) {
   if (!modelId || typeof modelId !== 'string') return false
-  return isOpus47Model(modelId) || isDeepseekModel(modelId) || isCodexModel(modelId)
+  return (
+    isOpus47Model(modelId) ||
+    isDeepseekModel(modelId) ||
+    isCodexModel(modelId) ||
+    isGlmModel(modelId)
+  )
 }
 
 /** commercial v3 产品策略:当前 agent 是否应显示"思考深度"选择器。
@@ -402,14 +426,14 @@ function labelForCurrent() {
 }
 
 /** 模块级:上次渲染菜单 DOM 时用的 options 集合 key。
- *  Opus 5 档 / Codex 4 档 / DeepSeek 2 档之间切换时必须重建 DOM,不能复用旧 DOM。
- *  Values 集合作为 key 当前够用(Opus="low,medium,high,xhigh,max" vs
- *  Codex="low,medium,high,xhigh" vs DeepSeek="high,max",两两不同)。未来若两个
- *  model values 相同但 label/hint 不同,需要把 label 也纳入 key。 */
+ *  Opus 5 档 / Codex 4 档 / DeepSeek 2 档 / GLM 2 档之间切换时必须重建 DOM,不能复用旧 DOM。
+ *  2026-06-17:GLM 与 DeepSeek 的 values 都是 "high,max"(撞车),故 key **纳入 label+hint**
+ *  (根治原注释预警的"values 相同但文案不同→stale DOM"风险):文案全同则复用 DOM(无害),
+ *  任一档 label/hint 不同则重建。 */
 let _lastRenderedOptionsKey = ''
 function _optionsKey(model) {
   return getEffortOptionsForModel(model)
-    .map((o) => o.value)
+    .map((o) => `${o.value}:${o.label}:${o.hint}`)
     .join(',')
 }
 

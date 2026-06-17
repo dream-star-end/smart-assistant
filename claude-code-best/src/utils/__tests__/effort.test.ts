@@ -337,17 +337,28 @@ describe("MiniMax-M3 effort support", () => {
   });
 });
 
-// glm-5.1(Ark)与 MiniMax-M3 同属"firstParty 能力全关"静态模型集
-// (isCapabilityZeroStaticModel),effort 全部不生成。**注意 deepseek 不在此集**:
-// deepseek-v4-pro 的 effort=max 仍保留(见上方 "modelSupportsMaxEffort — deepseek-v4" 测试)。
-describe("glm-5.1 (Ark) effort support", () => {
-  test("does not advertise or send effort parameters (大小写不敏感)", () => {
+// glm-5.1/glm-5.2(火山 Ark)虽在"firstParty 能力全关"静态模型集(isCapabilityZeroStaticModel),
+// 但**例外支持 output_config.effort**:火山端点接受 effort 思考深度(boss 2026-06-17 上线高/最高两档)。
+// 行为与 deepseek-v4 对称(high/max 两档,默认 max,xhigh 降级 high)。master proxy 按 protocol
+// allowedOutputConfigEfforts=['high','max'] 兜底清洗,CCB 层只负责按用户选择生成 effort 值。
+// **对比 MiniMax-M3**(同 capabilityZero 但火山外、不在 isArkGlmModel):仍不发 effort(见上方测试)。
+describe("glm-5.1 / glm-5.2 (Ark) effort support", () => {
+  test("支持 effort 且放行 max(大小写不敏感)", () => {
+    for (const m of ["glm-5.1", "GLM-5.1", "glm-5.2", "GLM-5.2"]) {
+      expect(modelSupportsEffort(m)).toBe(true);
+      expect(modelSupportsMaxEffort(m)).toBe(true);
+    }
+  });
+  test("resolveAppliedEffort:max 保留 / high 保留 / xhigh 降级 high / 缺省默认 max", () => {
     const saved = process.env.CLAUDE_CODE_EFFORT_LEVEL;
     delete process.env.CLAUDE_CODE_EFFORT_LEVEL;
-    for (const m of ["glm-5.1", "GLM-5.1"]) {
-      expect(modelSupportsEffort(m)).toBe(false);
-      expect(modelSupportsMaxEffort(m)).toBe(false);
-      expect(resolveAppliedEffort(m, "max")).toBeUndefined();
+    for (const m of ["glm-5.1", "glm-5.2"]) {
+      expect(resolveAppliedEffort(m, "max")).toBe("max");
+      expect(resolveAppliedEffort(m, "high")).toBe("high");
+      // 火山无 xhigh 档:xhigh 降级 high(modelSupportsXhighEffort(glm)=false)
+      expect(resolveAppliedEffort(m, "xhigh")).toBe("high");
+      // 无显式输入:落 getDefaultEffortForModel(glm)=max
+      expect(resolveAppliedEffort(m, undefined)).toBe("max");
     }
     if (saved !== undefined) process.env.CLAUDE_CODE_EFFORT_LEVEL = saved;
   });

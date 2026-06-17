@@ -122,14 +122,18 @@ describe('staticKeyProviders — strip / endpoint', () => {
     assert.equal(mm.stripBodyFields.includes('thinking'), false, 'minimax 不能 strip thinking(直连验证支持)')
     assert.equal(mm.maxInputTokens, 512_000)
   })
-  it('ark strip anthropic-beta + 3 body 字段(**保留 thinking** —— glm-5.1 是 thinking 模型)', () => {
+  it('ark strip anthropic-beta + 2 body 字段(output_config 改 effort 白名单不整体 strip;**保留 thinking**)', () => {
     const ark = getStaticProvider('ark')
     assert.deepEqual([...ark.stripHeaders], ['anthropic-beta'])
     assert.deepEqual([...ark.stripBodyFields], [
-      'output_config',
       'context_management',
       'service_tier',
     ])
+    assert.equal(
+      ark.stripBodyFields.includes('output_config'),
+      false,
+      'ark 不能整体 strip output_config(要透传 effort 思考深度)',
+    )
     assert.equal(ark.stripBodyFields.includes('thinking'), false, 'ark 必须不 strip thinking')
     assert.equal(ark.maxInputTokens, 1_000_000)
   })
@@ -138,6 +142,28 @@ describe('staticKeyProviders — strip / endpoint', () => {
       getStaticProvider('ark').upstreamEndpoint,
       'https://ark.cn-beijing.volces.com/api/coding/v1/messages',
     )
+  })
+})
+
+describe('staticKeyProviders — allowedOutputConfigEfforts(思考深度白名单)', () => {
+  it('ark = [high, max];deepseek/minimax 未声明(undefined)', () => {
+    assert.deepEqual([...(getStaticProvider('ark').allowedOutputConfigEfforts ?? [])], [
+      'high',
+      'max',
+    ])
+    assert.equal(getStaticProvider('deepseek').allowedOutputConfigEfforts, undefined)
+    assert.equal(getStaticProvider('minimax').allowedOutputConfigEfforts, undefined)
+  })
+  it('硬约束:声明 allowedOutputConfigEfforts 的 provider 不能把 output_config 放进 stripBodyFields', () => {
+    for (const p of STATIC_KEY_PROVIDERS) {
+      if (p.allowedOutputConfigEfforts) {
+        assert.equal(
+          p.stripBodyFields.includes('output_config'),
+          false,
+          `${p.id} 声明 effort 白名单却整体 strip output_config —— effort 永远透不过去`,
+        )
+      }
+    }
   })
 })
 

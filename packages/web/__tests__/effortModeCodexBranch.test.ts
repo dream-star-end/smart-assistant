@@ -86,3 +86,69 @@ describe('effortMode.js — gpt-5.5 (codex) branch', () => {
     )
   })
 })
+
+describe('effortMode.js — 火山 glm-5.1/glm-5.2 branch', () => {
+  it('isGlmModel predicate 存在,exact-match `^glm-5\\.[12]$`', () => {
+    // 与 protocol staticKeyProviders ark matchesRoute 一致;不放过未声明 glm 变体。
+    assert.match(
+      EFFORT,
+      /function\s+isGlmModel\s*\(\s*modelId\s*\)\s*\{[\s\S]{0,260}\/\^glm-5\\\.\[12\]\$\/i\.test/,
+      'isGlmModel 必须用 `/^glm-5\\.[12]$/i.test(modelId || "")` 形式 exact-match',
+    )
+  })
+
+  it('GLM_OPTIONS 含 high/max 两档,不含 low/medium/xhigh', () => {
+    const m = EFFORT.match(/const\s+GLM_OPTIONS\s*=\s*\[([\s\S]*?)\]/)
+    assert.ok(m, '缺 GLM_OPTIONS 数组')
+    const body = m![1]
+    for (const v of ['high', 'max']) {
+      assert.match(body, new RegExp(`value:\\s*['"]${v}['"]`), `GLM_OPTIONS 缺档位 ${v}`)
+    }
+    for (const v of ['low', 'medium', 'xhigh']) {
+      assert.ok(
+        !new RegExp(`value:\\s*['"]${v}['"]`).test(body),
+        `GLM_OPTIONS 不应暴露 ${v}(火山 glm 产品只开放高/最高两档)`,
+      )
+    }
+  })
+
+  it('getDefaultEffortForModel glm 分支显式返回 max', () => {
+    const fnMatch = EFFORT.match(/function\s+getDefaultEffortForModel[\s\S]{0,600}\n\}/)
+    assert.ok(fnMatch, '缺 getDefaultEffortForModel 函数')
+    assert.match(
+      fnMatch![0],
+      /if\s*\(\s*isGlmModel\s*\(\s*modelId\s*\)\s*\)\s*return\s+['"]max['"]/,
+      'getDefaultEffortForModel 必须有 glm → max 分支',
+    )
+  })
+
+  it('getEffortOptionsForModel glm 分支返回 GLM_OPTIONS', () => {
+    const fnMatch = EFFORT.match(/function\s+getEffortOptionsForModel[\s\S]{0,400}\n\}/)
+    assert.ok(fnMatch, '缺 getEffortOptionsForModel 函数')
+    assert.match(
+      fnMatch![0],
+      /if\s*\(\s*isGlmModel\s*\(\s*modelId\s*\)\s*\)\s*return\s+GLM_OPTIONS/,
+      'getEffortOptionsForModel 必须有 glm → GLM_OPTIONS 分支',
+    )
+  })
+
+  it('modelSupportsExtraEffort 接入 isGlmModel', () => {
+    const fnMatch = EFFORT.match(/export\s+function\s+modelSupportsExtraEffort[\s\S]{0,400}\n\}/)
+    assert.ok(fnMatch, '缺 modelSupportsExtraEffort 函数')
+    assert.match(
+      fnMatch![0],
+      /isGlmModel\s*\(\s*modelId\s*\)/,
+      'modelSupportsExtraEffort 必须 OR 上 isGlmModel(modelId)',
+    )
+  })
+
+  it('_optionsKey 纳入 value+label+hint(GLM/DeepSeek values 撞车,防 stale 菜单 DOM)', () => {
+    const fnMatch = EFFORT.match(/function\s+_optionsKey[\s\S]{0,300}\n\}/)
+    assert.ok(fnMatch, '缺 _optionsKey 函数')
+    assert.match(
+      fnMatch![0],
+      /o\.value[\s\S]{0,40}o\.label[\s\S]{0,40}o\.hint/,
+      '_optionsKey 必须纳入 value+label+hint(GLM/DeepSeek 同 values 切换否则不重建菜单)',
+    )
+  })
+})

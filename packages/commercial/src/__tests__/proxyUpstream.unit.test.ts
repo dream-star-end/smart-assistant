@@ -308,7 +308,7 @@ describe("pickUpstream — MiniMax route", () => {
 // ─── pickUpstream — Ark(glm-5.1)路径(新增)──────────────────────────────
 
 describe("pickUpstream — Ark glm-5.1 route", () => {
-  test("不调 scheduler;endpoint=ark coding;Bearer ARK key + strip beta/4 body extras;保留 metadata", async () => {
+  test("不调 scheduler;endpoint=ark coding;Bearer ARK key + strip beta/2 body extras;output_config 留合法 effort;保留 metadata/thinking", async () => {
     const sched = makeScheduler({});
     const res = await pickUpstream(
       { scheduler: sched.scheduler, staticProviderKeys: { ark: "ARK-KEY" } },
@@ -342,7 +342,12 @@ describe("pickUpstream — Ark glm-5.1 route", () => {
     session.applyUpstreamAuth(safeHeaders, body, log);
     assert.equal(safeHeaders.authorization, "Bearer ARK-KEY");
     assert.equal(safeHeaders["anthropic-beta"], undefined);
-    assert.equal((body as { output_config?: unknown }).output_config, undefined);
+    // output_config 不整体 strip:effort=max 是合法档位 → 重建为 { effort: "max" } 透传火山。
+    assert.deepEqual(
+      (body as { output_config?: unknown }).output_config,
+      { effort: "max" },
+      "ark 应保留合法 effort 思考深度(收窄为只剩 effort 子字段)",
+    );
     assert.equal((body as { context_management?: unknown }).context_management, undefined);
     assert.equal((body as { service_tier?: unknown }).service_tier, undefined);
     // **glm-5.1 是 thinking 模型:thinking 必须被保留(不 strip)**,透传给 Ark。
@@ -371,6 +376,66 @@ describe("pickUpstream — Ark glm-5.1 route", () => {
     assert.equal(res.session.sanitizeMessages(messages, "glm-5.1", log), messages);
     res.session.zeroizeSecrets();
     res.session.zeroizeSecrets();
+  });
+});
+
+// ─── Ark output_config effort 白名单清洗(边界)────────────────────────────
+
+describe("pickUpstream — Ark output_config effort 白名单清洗", () => {
+  async function arkSession() {
+    const sched = makeScheduler({});
+    const res = await pickUpstream(
+      { scheduler: sched.scheduler, staticProviderKeys: { ark: "k" } },
+      bodyFor("glm-5.2"),
+      ARK_ROUTE,
+      log,
+    );
+    assert.equal(res.ok, true);
+    if (!res.ok) throw new Error("ark pick failed");
+    return res.session;
+  }
+  function cleanse(
+    session: Awaited<ReturnType<typeof arkSession>>,
+    outputConfig: unknown,
+  ): unknown {
+    const body = {
+      metadata: {},
+      ...(outputConfig !== undefined ? { output_config: outputConfig } : {}),
+    } as unknown as Parameters<typeof session.applyUpstreamAuth>[1];
+    session.applyUpstreamAuth({}, body, log);
+    return (body as { output_config?: unknown }).output_config;
+  }
+
+  test("合法档位 high/max → 保留(收窄为只剩 effort 子字段)", async () => {
+    const s = await arkSession();
+    assert.deepEqual(cleanse(s, { effort: "high" }), { effort: "high" });
+    assert.deepEqual(cleanse(s, { effort: "max" }), { effort: "max" });
+  });
+  test("火山合法但产品未开放的 low/medium → 删整个 output_config", async () => {
+    const s = await arkSession();
+    assert.equal(cleanse(s, { effort: "low" }), undefined);
+    assert.equal(cleanse(s, { effort: "medium" }), undefined);
+  });
+  test("非法档位 minimal/xhigh → 删", async () => {
+    const s = await arkSession();
+    assert.equal(cleanse(s, { effort: "minimal" }), undefined);
+    assert.equal(cleanse(s, { effort: "xhigh" }), undefined);
+  });
+  test("混入其他 firstParty-only 子字段 + 合法 effort → 收窄为只剩 effort", async () => {
+    const s = await arkSession();
+    assert.deepEqual(
+      cleanse(s, { effort: "max", task_budget: { tokens: 1 }, format: { type: "json" } }),
+      { effort: "max" },
+    );
+  });
+  test("缺 effort / 非 string / 非 object / array / null / 无 output_config → 删或 noop", async () => {
+    const s = await arkSession();
+    assert.equal(cleanse(s, { task_budget: { tokens: 1 } }), undefined);
+    assert.equal(cleanse(s, { effort: 3 }), undefined);
+    assert.equal(cleanse(s, "max"), undefined);
+    assert.equal(cleanse(s, ["max"]), undefined); // array(typeof==object)被 Array.isArray 排除
+    assert.equal(cleanse(s, null), undefined);
+    assert.equal(cleanse(s, undefined), undefined);
   });
 });
 
