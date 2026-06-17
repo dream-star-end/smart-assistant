@@ -9,21 +9,26 @@ import {
 } from "../staticKeyModels";
 
 describe("isArkGlmModel", () => {
-  test("精确匹配 glm-5.1,大小写/空白不敏感", () => {
+  test("精确匹配 glm-5.1 + glm-5.2,大小写/空白不敏感", () => {
     expect(isArkGlmModel("glm-5.1")).toBe(true);
     expect(isArkGlmModel("GLM-5.1")).toBe(true);
     expect(isArkGlmModel("  glm-5.1  ")).toBe(true);
+    expect(isArkGlmModel("glm-5.2")).toBe(true);
+    expect(isArkGlmModel("GLM-5.2")).toBe(true);
+    expect(isArkGlmModel("  glm-5.2  ")).toBe(true);
     expect(isArkGlmModel("glm-5")).toBe(false);
-    expect(isArkGlmModel("glm-5.2")).toBe(false);
+    expect(isArkGlmModel("glm-5.3")).toBe(false);
   });
 });
 
 describe("isCapabilityZeroStaticModel — minimax + ark(不含 deepseek)", () => {
-  test("MiniMax-M3 / glm-5.1 → true", () => {
+  test("MiniMax-M3 / glm-5.1 / glm-5.2 → true", () => {
     expect(isCapabilityZeroStaticModel("MiniMax-M3")).toBe(true);
     expect(isCapabilityZeroStaticModel("minimax-m3")).toBe(true);
     expect(isCapabilityZeroStaticModel("glm-5.1")).toBe(true);
     expect(isCapabilityZeroStaticModel("GLM-5.1")).toBe(true);
+    expect(isCapabilityZeroStaticModel("glm-5.2")).toBe(true);
+    expect(isCapabilityZeroStaticModel("GLM-5.2")).toBe(true);
   });
   test("deepseek **不在**能力全关集(保留 effort=max 等默认路径能力)", () => {
     expect(isCapabilityZeroStaticModel("deepseek-v4-pro")).toBe(false);
@@ -36,10 +41,12 @@ describe("isCapabilityZeroStaticModel — minimax + ark(不含 deepseek)", () =>
 });
 
 describe("getStaticModelContextWindow", () => {
-  test("minimax=512k, ark(glm-5.1)=200k", () => {
+  test("minimax=512k, ark(glm-5.1/glm-5.2)=200k", () => {
     expect(getStaticModelContextWindow("MiniMax-M3")).toBe(512_000);
     expect(getStaticModelContextWindow("glm-5.1")).toBe(200_000);
     expect(getStaticModelContextWindow("GLM-5.1")).toBe(200_000);
+    expect(getStaticModelContextWindow("glm-5.2")).toBe(200_000);
+    expect(getStaticModelContextWindow("GLM-5.2")).toBe(200_000);
   });
   test("deepseek 无特判 → undefined(由 caller 落 MODEL_CONTEXT_WINDOW_DEFAULT,等价现状)", () => {
     expect(getStaticModelContextWindow("deepseek-v4-pro")).toBeUndefined();

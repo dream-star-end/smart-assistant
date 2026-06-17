@@ -157,7 +157,8 @@ describe("full migration suite", () => {
     assert.equal(minimax.rows[0].enabled, true);
     assert.equal(minimax.rows[0].visibility, "public");
 
-    // 0082: glm-5.1(火山方舟 Ark,平台全局默认模型)定价 + 一步到位 public/enabled。
+    // 0082→0083: glm-5.1(火山方舟 Ark)定价不变;但 0083 把 visibility public→hidden(被 glm-5.2 替换,
+    // 退 picker 但保留 enabled 兼容存量会话)。
     const glm = await query<{
       enabled: boolean;
       visibility: string;
@@ -178,12 +179,34 @@ describe("full migration suite", () => {
     );
     assert.equal(glm.rows.length, 1);
     assert.equal(glm.rows[0].enabled, true);
-    assert.equal(glm.rows[0].visibility, "public");
+    assert.equal(glm.rows[0].visibility, "hidden");
     assert.equal(glm.rows[0].input_per_mtok, "600");
     assert.equal(glm.rows[0].output_per_mtok, "2400");
     assert.equal(glm.rows[0].cache_read_per_mtok, "120");
     assert.equal(glm.rows[0].cache_write_per_mtok, "0");
     assert.equal(glm.rows[0].multiplier, "1.000");
+
+    // 0083: glm-5.2(火山方舟 Ark,2026-06-17 起平台默认/主力)public + enabled,定价参照 glm-5.1。
+    const glm52 = await query<{
+      enabled: boolean;
+      visibility: string;
+      input_per_mtok: string;
+      output_per_mtok: string;
+      multiplier: string;
+    }>(
+      `SELECT enabled, visibility,
+              input_per_mtok::text AS input_per_mtok,
+              output_per_mtok::text AS output_per_mtok,
+              multiplier::text AS multiplier
+         FROM model_pricing WHERE model_id=$1`,
+      ["glm-5.2"],
+    );
+    assert.equal(glm52.rows.length, 1);
+    assert.equal(glm52.rows[0].enabled, true);
+    assert.equal(glm52.rows[0].visibility, "public");
+    assert.equal(glm52.rows[0].input_per_mtok, "600");
+    assert.equal(glm52.rows[0].output_per_mtok, "2400");
+    assert.equal(glm52.rows[0].multiplier, "1.000");
 
     const plan1000 = await query<{ amount_cents: string; credits: string }>(
       "SELECT amount_cents::text AS amount_cents, credits::text AS credits FROM topup_plans WHERE code=$1",

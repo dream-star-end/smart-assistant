@@ -16,11 +16,11 @@ export function setRenderModelPill(fn) {
 const COMMERCIAL_FALLBACK_AGENTS = Object.freeze([
   {
     id: 'main',
-    // 2026-06-16:默认队长改回 MiniMax-M3(新加坡稳端点),须与 entrypoint.ts main 一致。
-    displayName: 'MiniMax M3 助手',
+    // 2026-06-17:默认队长改为 glm-5.2(火山 ark),须与 entrypoint.ts main / platformDefaults 一致。
+    displayName: 'GLM-5.2 助手',
     avatarEmoji: '🧠',
-    model: 'MiniMax-M3',
-    provider: 'minimax',
+    model: 'glm-5.2',
+    provider: 'ark',
   },
   {
     id: 'researcher',
@@ -41,7 +41,7 @@ const COMMERCIAL_FALLBACK_AGENTS = Object.freeze([
     id: 'coder',
     displayName: '代码工程师',
     avatarEmoji: '🛠️',
-    model: 'glm-5.1',
+    model: 'glm-5.2',
     provider: 'ark',
   },
   {

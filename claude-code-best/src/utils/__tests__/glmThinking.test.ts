@@ -39,8 +39,14 @@ describe("glm-5.1 (Ark) thinking capability", () => {
     expect(modelSupportsThinking("minimax-m3")).toBe(true);
   });
 
-  test("glm-5.1 不支持 adaptive thinking → CCB 走 enabled+budget(Ark 实测可用的格式)", () => {
+  test("glm-5.2(火山 Ark,2026-06-17 主力)thinking = true(同 glm-5.1;大小写不敏感)", () => {
+    expect(modelSupportsThinking("glm-5.2")).toBe(true);
+    expect(modelSupportsThinking("GLM-5.2")).toBe(true);
+  });
+
+  test("glm-5.1/glm-5.2 不支持 adaptive thinking → CCB 走 enabled+budget(Ark 实测可用的格式)", () => {
     expect(modelSupportsAdaptiveThinking("glm-5.1")).toBe(false);
+    expect(modelSupportsAdaptiveThinking("glm-5.2")).toBe(false);
     expect(modelSupportsAdaptiveThinking("MiniMax-M3")).toBe(false);
   });
 });

@@ -131,8 +131,8 @@ describe("selectUpstreamRoute", () => {
       if (r.kind === "static") assert.equal(r.provider.id, "minimax");
     }
   });
-  test("glm-5.1(大小写不敏感) → static/ark", () => {
-    for (const m of ["glm-5.1", "GLM-5.1"]) {
+  test("glm-5.1 / glm-5.2(大小写不敏感) → static/ark", () => {
+    for (const m of ["glm-5.1", "GLM-5.1", "glm-5.2", "GLM-5.2"]) {
       const r = selectUpstreamRoute(m);
       assert.equal(r.kind, "static");
       if (r.kind === "static") assert.equal(r.provider.id, "ark");

@@ -86,7 +86,7 @@ export function _buildCcbSpawnTraceEnv(
 }
 
 /**
- * Static-key upstreams (MiniMax / DeepSeek / Ark glm-5.1) are selected by
+ * Static-key upstreams (MiniMax / DeepSeek / Ark glm-5.2+glm-5.1) are selected by
  * commercial master from the request body model and must not consume the OAuth
  * account pool.
  *
@@ -111,7 +111,8 @@ export function _buildStaticProviderSmallFastModelEnv(
   if (
     normalized === 'minimax-m3' ||
     normalized.startsWith('deepseek-') ||
-    normalized === 'glm-5.1'
+    normalized === 'glm-5.1' ||
+    normalized === 'glm-5.2'
   ) {
     return { ANTHROPIC_SMALL_FAST_MODEL: model }
   }

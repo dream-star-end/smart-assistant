@@ -19,7 +19,7 @@
     },
     {
       "id": "ark",
-      "inboundModelIds": ["glm-5.1"],
+      "inboundModelIds": ["glm-5.1", "glm-5.2"],
       "maxInputTokens": 200000,
       "upstreamEndpoint": "https://ark.cn-beijing.volces.com/api/coding/v1/messages",
       "capabilityZero": true,

@@ -274,18 +274,18 @@ describe("openclaude-runtime entrypoint env-scrub policy", () => {
     const src = readFileSync(ENTRYPOINT_TS_PATH, "utf-8");
     assert.match(
       src,
-      /const COMMERCIAL_DEFAULT_MODEL\s*=\s*"MiniMax-M3"/,
-      "commercial runtime default model must be MiniMax-M3 (2026-06-16 改回:ark 北京端点跨境抖动)",
+      /const COMMERCIAL_DEFAULT_MODEL\s*=\s*"glm-5\.2"/,
+      "commercial runtime default model must be glm-5.2 (2026-06-17 boss:替换 glm-5.1、队长全切 glm-5.2)",
     );
     assert.match(
       src,
-      /const COMMERCIAL_DEFAULT_PROVIDER\s*=\s*"minimax"/,
-      "commercial runtime default provider must be minimax",
+      /const COMMERCIAL_DEFAULT_PROVIDER\s*=\s*"ark"/,
+      "commercial runtime default provider must be ark (火山方舟)",
     );
     assert.match(
       src,
-      /const COMMERCIAL_CODER_MODEL\s*=\s*"glm-5\.1"/,
-      "coder seed must stay glm-5.1 (boss 2026-06-16:coder 保留 glm-5.1 coding plan)",
+      /const COMMERCIAL_CODER_MODEL\s*=\s*"glm-5\.2"/,
+      "coder seed must be glm-5.2 (2026-06-17 由 glm-5.1 升级)",
     );
     assert.match(
       src,
@@ -379,11 +379,11 @@ describe("openclaude-runtime entrypoint env-scrub policy", () => {
     // per-agent model assignment (WS2)
     assert.match(researcher, /model:\s*COMMERCIAL_RESEARCHER_MODEL/, "researcher must use MiniMax-M3");
     assert.match(researcher, /provider:\s*COMMERCIAL_RESEARCHER_PROVIDER/, "researcher must use minimax");
-    assert.match(coder, /model:\s*COMMERCIAL_CODER_MODEL/, "coder must use glm-5.1 (显式常量,不跟 DEFAULT)");
+    assert.match(coder, /model:\s*COMMERCIAL_CODER_MODEL/, "coder must use glm-5.2 (显式常量,不跟 DEFAULT)");
     assert.match(coder, /provider:\s*COMMERCIAL_CODER_PROVIDER/, "coder must use ark (explicit)");
-    // main(队长)走 DEFAULT,现已是 MiniMax-M3(新加坡稳端点)
+    // main(队长)走 DEFAULT,现已是 glm-5.2(火山 ark,2026-06-17)
     const mainAgent = extractConstObjectFromSource(src, "desiredMainAgent");
-    assert.match(mainAgent, /model:\s*COMMERCIAL_DEFAULT_MODEL/, "main captain must use DEFAULT (now MiniMax-M3)");
+    assert.match(mainAgent, /model:\s*COMMERCIAL_DEFAULT_MODEL/, "main captain must use DEFAULT (now glm-5.2)");
     const reviewer = extractConstObjectFromSource(src, "desiredReviewerAgent");
     assert.match(reviewer, /model:\s*COMMERCIAL_DEEPSEEK_PRO_MODEL/, "reviewer must use deepseek-v4-pro (heterogeneous review)");
     assert.match(reviewer, /provider:\s*COMMERCIAL_DEEPSEEK_PRO_PROVIDER/, "reviewer must use deepseek");
@@ -558,10 +558,10 @@ describe("openclaude-runtime entrypoint env-scrub policy", () => {
     }
   });
 
-  test("entrypoint.ts pre-seeds the two default teams with the MiniMax-M3 main captain", () => {
+  test("entrypoint.ts pre-seeds the two default teams with the glm-5.2 main captain", () => {
     const src = readFileSync(ENTRYPOINT_TS_PATH, "utf-8");
     assert.match(src, /const desiredSeedTeams\s*=\s*\[desiredScienceTeam,\s*desiredProgrammingTeam\]/);
-    // 队长走 main（现为 MiniMax-M3），不再是 codex（GPT-5.5）。
+    // 队长走 main（现为 glm-5.2，2026-06-17），不再是 codex（GPT-5.5）。
     assert.match(src, /id:\s*"science_research_team"[\s\S]*leaderAgentId:\s*"main"/);
     assert.doesNotMatch(src, /id:\s*"science_research_team"[\s\S]*leaderAgentId:\s*"codex"/);
     assert.match(
@@ -660,11 +660,11 @@ describe("openclaude-runtime entrypoint env-scrub policy", () => {
 
   test("web agents fallback uses MiniMax-M3 (platform default) instead of an unsupported Claude default", () => {
     const src = readFileSync(WEB_AGENTS_MODULE_PATH, "utf-8");
-    // main 队长 = MiniMax-M3/minimax(2026-06-16 改回);coder 仍 glm-5.1/ark(保留)。
-    assert.match(src, /model:\s*'MiniMax-M3'/, "web fallback must use MiniMax-M3 (main/researcher)");
-    assert.match(src, /provider:\s*'minimax'/, "web fallback must use minimax provider");
-    assert.match(src, /model:\s*'glm-5\.1'/, "web fallback coder must keep glm-5.1");
-    assert.match(src, /provider:\s*'ark'/, "web fallback coder must keep ark provider");
+    // main 队长 = glm-5.2/ark(2026-06-17);researcher 仍 MiniMax-M3/minimax;coder = glm-5.2/ark。
+    assert.match(src, /model:\s*'MiniMax-M3'/, "web fallback must still have MiniMax-M3 (researcher)");
+    assert.match(src, /provider:\s*'minimax'/, "web fallback must still have minimax provider (researcher)");
+    assert.match(src, /model:\s*'glm-5\.2'/, "web fallback main/coder must use glm-5.2");
+    assert.match(src, /provider:\s*'ark'/, "web fallback main/coder must use ark provider");
     assert.match(src, /id:\s*'scientist'/, "web fallback must include the scientist agent");
     assert.match(src, /displayName:\s*'科研分析师'/, "web fallback scientist display name must match runtime seed");
     assert.match(src, /model:\s*'deepseek-v4-pro'/, "web fallback scientist/reviewer must use DeepSeek V4 Pro");
@@ -705,8 +705,8 @@ describe("platform default model — entrypoint ↔ platformDefaults 一致性",
       PLATFORM_DEFAULT_PROVIDER,
       "entrypoint.ts COMMERCIAL_DEFAULT_PROVIDER 与 platformDefaults.PLATFORM_DEFAULT_PROVIDER 漂移",
     );
-    // 当前期望值(2026-06-16 起 MiniMax-M3 / minimax —— ark 北京端点跨境抖动,改回新加坡端点)
-    assert.equal(PLATFORM_DEFAULT_MODEL, "MiniMax-M3");
-    assert.equal(PLATFORM_DEFAULT_PROVIDER, "minimax");
+    // 当前期望值(2026-06-17 起 glm-5.2 / ark —— boss 决定替换 glm-5.1、队长全切 glm-5.2,接受跨境风险)
+    assert.equal(PLATFORM_DEFAULT_MODEL, "glm-5.2");
+    assert.equal(PLATFORM_DEFAULT_PROVIDER, "ark");
   });
 });

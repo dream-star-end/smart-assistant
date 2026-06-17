@@ -309,8 +309,8 @@ describe('inferAgentForModel — MiniMax model routing', () => {
   })
 })
 
-describe('inferAgentForModel — Ark glm-5.1 model routing', () => {
-  it('keeps default non-codex agent for glm-5.1(平台默认)', () => {
+describe('inferAgentForModel — Ark glm-5.1/glm-5.2 model routing', () => {
+  it('keeps default non-codex agent for glm-5.1(兼容存量)', () => {
     const r = inferAgentForModel({
       model: 'glm-5.1',
       requestedAgentId: 'main',
@@ -320,9 +320,19 @@ describe('inferAgentForModel — Ark glm-5.1 model routing', () => {
     assert.deepEqual(r, { agentId: 'main' })
   })
 
-  it('routes codex agent + glm-5.1 back to default non-codex agent', () => {
+  it('keeps default non-codex agent for glm-5.2(2026-06-17 起平台默认)', () => {
     const r = inferAgentForModel({
-      model: 'glm-5.1',
+      model: 'glm-5.2',
+      requestedAgentId: 'main',
+      defaultAgentId: 'main',
+      agents: fullAgents,
+    })
+    assert.deepEqual(r, { agentId: 'main' })
+  })
+
+  it('routes codex agent + glm-5.2 back to default non-codex agent', () => {
+    const r = inferAgentForModel({
+      model: 'glm-5.2',
       requestedAgentId: 'codex',
       defaultAgentId: 'main',
       agents: fullAgents,

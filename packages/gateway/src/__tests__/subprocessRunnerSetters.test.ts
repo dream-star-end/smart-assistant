@@ -81,8 +81,9 @@ describe('SubprocessRunner.model getter / setModel', () => {
     assert.ok(ALLOWED_INBOUND_MODELS.has('deepseek-v4-pro'))
     // MiniMax-M3 Token Plan anthropic-compatible 上游:
     assert.ok(ALLOWED_INBOUND_MODELS.has('MiniMax-M3'))
-    // glm-5.1 火山方舟 Ark Coding Plan anthropic-compatible 上游(平台全局默认模型):
+    // glm-5.1/glm-5.2 火山方舟 Ark Coding Plan anthropic-compatible 上游(glm-5.2=平台默认 2026-06-17):
     assert.ok(ALLOWED_INBOUND_MODELS.has('glm-5.1'))
+    assert.ok(ALLOWED_INBOUND_MODELS.has('glm-5.2'))
   })
 
   it('ALLOWED_INBOUND_MODELS rejects bogus / typo model ids', () => {
@@ -153,6 +154,15 @@ describe('SubprocessRunner static-provider small-fast model env', () => {
     })
     assert.deepEqual(_buildStaticProviderSmallFastModelEnv('GLM-5.1'), {
       ANTHROPIC_SMALL_FAST_MODEL: 'GLM-5.1',
+    })
+  })
+
+  it('pins Ark glm-5.2 hidden secondary calls to glm-5.2(2026-06-17 主力)', () => {
+    assert.deepEqual(_buildStaticProviderSmallFastModelEnv('glm-5.2'), {
+      ANTHROPIC_SMALL_FAST_MODEL: 'glm-5.2',
+    })
+    assert.deepEqual(_buildStaticProviderSmallFastModelEnv('GLM-5.2'), {
+      ANTHROPIC_SMALL_FAST_MODEL: 'GLM-5.2',
     })
   })
 

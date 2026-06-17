@@ -37,12 +37,14 @@ describe('staticKeyProviders — matchesRoute', () => {
     assert.equal(mm.matchesRoute('minimax-m3'), true)
     assert.equal(mm.matchesRoute('minimax-m2'), false)
   })
-  it('ark(glm-5.1)精确,大小写不敏感', () => {
+  it('ark(glm-5.1 + glm-5.2)精确,大小写不敏感', () => {
     const ark = getStaticProvider('ark')
     assert.equal(ark.matchesRoute('glm-5.1'), true)
     assert.equal(ark.matchesRoute('GLM-5.1'), true)
+    assert.equal(ark.matchesRoute('glm-5.2'), true)
+    assert.equal(ark.matchesRoute('GLM-5.2'), true)
     assert.equal(ark.matchesRoute('glm-5'), false)
-    assert.equal(ark.matchesRoute('glm-5.2'), false)
+    assert.equal(ark.matchesRoute('glm-5.3'), false)
   })
 })
 
@@ -51,6 +53,7 @@ describe('staticKeyProviders — findRouteProviderForModel', () => {
     assert.equal(findRouteProviderForModel('deepseek-v4-pro')?.id, 'deepseek')
     assert.equal(findRouteProviderForModel('MiniMax-M3')?.id, 'minimax')
     assert.equal(findRouteProviderForModel('glm-5.1')?.id, 'ark')
+    assert.equal(findRouteProviderForModel('glm-5.2')?.id, 'ark')
     assert.equal(findRouteProviderForModel('claude-opus-4-7'), undefined)
     assert.equal(findRouteProviderForModel('DeepSeek-v4-pro'), undefined)
     assert.equal(findRouteProviderForModel(''), undefined)
@@ -64,9 +67,9 @@ describe('staticKeyProviders — inboundModelIds(与 route 面故意不同)', ()
       'deepseek-v4-pro',
     ])
   })
-  it('minimax/ark 各 1 项', () => {
+  it('minimax 1 项 / ark 2 项(glm-5.1 兼容 + glm-5.2 主力)', () => {
     assert.deepEqual([...getStaticProvider('minimax').inboundModelIds], ['MiniMax-M3'])
-    assert.deepEqual([...getStaticProvider('ark').inboundModelIds], ['glm-5.1'])
+    assert.deepEqual([...getStaticProvider('ark').inboundModelIds], ['glm-5.1', 'glm-5.2'])
   })
   it('STATIC_KEY_INBOUND_MODEL_IDS = 全 provider 字面量展开', () => {
     assert.deepEqual([...STATIC_KEY_INBOUND_MODEL_IDS], [
@@ -74,6 +77,7 @@ describe('staticKeyProviders — inboundModelIds(与 route 面故意不同)', ()
       'deepseek-v4-pro',
       'MiniMax-M3',
       'glm-5.1',
+      'glm-5.2',
     ])
   })
 })
@@ -90,11 +94,13 @@ describe('staticKeyProviders — canonicalizeForPricing', () => {
     assert.equal(mm.canonicalizeForPricing('MiniMax-M3'), 'MiniMax-M3')
     assert.equal(mm.canonicalizeForPricing('claude-x'), null)
   })
-  it('ark → glm-5.1', () => {
+  it('ark → glm-5.1 / glm-5.2(各自原样)', () => {
     const ark = getStaticProvider('ark')
     assert.equal(ark.canonicalizeForPricing('GLM-5.1'), 'glm-5.1')
     assert.equal(ark.canonicalizeForPricing('glm-5.1'), 'glm-5.1')
-    assert.equal(ark.canonicalizeForPricing('glm-5.2'), null)
+    assert.equal(ark.canonicalizeForPricing('GLM-5.2'), 'glm-5.2')
+    assert.equal(ark.canonicalizeForPricing('glm-5.2'), 'glm-5.2')
+    assert.equal(ark.canonicalizeForPricing('glm-5.3'), null)
   })
 })
 

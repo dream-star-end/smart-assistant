@@ -102,22 +102,24 @@ const BROWSER_TOOLSET_ID = "browser";
 const RESEARCH_TOOLSET_ID = "research";
 const WEB_CONTEXT_TOOLSET_ID = "web_context";
 
-// 平台全局默认模型。2026-06-16 改回 MiniMax-M3(新加坡端点)—— glm-5.1 走火山方舟【北京】端点,
-// 从 master(吉隆坡)跨境进中国大陆、链路间歇抖动,长 turn 撞瞬时丢包 → "半天没反应"。MiniMax 端点
-// 在新加坡(稳)+ 512k 窗口 + 已开思考。注意:本文件由 Dockerfile 单独 COPY 进 runtime 镜像,无法
-// import packages/commercial/src,故本地维护;master 权威常量在 src/platformDefaults.ts,两源一致性由
-// src/__tests__/runtimeEntrypointPolicy.test.ts 守护 —— 改这里必须同步改 platformDefaults.ts。
-const COMMERCIAL_DEFAULT_MODEL = "MiniMax-M3";
-const COMMERCIAL_DEFAULT_PROVIDER = "minimax";
+// 平台全局默认模型。**2026-06-17 改为 glm-5.2(火山方舟 ark,boss 决定:替换掉 glm-5.1、队长全切 glm-5.2)。**
+// ⚠️ 已知运营权衡:glm-5.x 走火山方舟【北京】端点,从 master(吉隆坡)跨境进中国大陆、链路间歇抖动,
+// 长 turn 可能撞瞬时丢包 → "半天没反应"(2026-06-16 正因此把队长撤回 MiniMax-M3)。boss 2026-06-17
+// 明确接受该风险、把队长/平台默认切回火山系 glm-5.2;部署 smoke 须重点验证队长长 turn 稳定性。
+// 注意:本文件由 Dockerfile 单独 COPY 进 runtime 镜像,无法 import packages/commercial/src,故本地维护;
+// master 权威常量在 src/platformDefaults.ts,两源一致性由 src/__tests__/runtimeEntrypointPolicy.test.ts
+// 守护 —— 改这里必须同步改 platformDefaults.ts。
+const COMMERCIAL_DEFAULT_MODEL = "glm-5.2";
+const COMMERCIAL_DEFAULT_PROVIDER = "ark";
 // 内置 agent 按角色分配模型(改这里必须同步改前端 fallback agents.js 与 runtimeEntrypointPolicy.test.ts):
-//   - main(队长) → MiniMax-M3(= DEFAULT,新加坡稳端点,512k)
-//   - researcher → MiniMax-M3(512k 吃长文献;思考模型)
-//   - scientist / reviewer → deepseek-v4-pro(分析 + 异构复核;edge 稳端点)
-//   - coder → glm-5.1 / 火山 Coding Plan(coding 强;coder turn 较短、跨境暴露低,boss 2026-06-16 决定保留)
+//   - main(队长) → glm-5.2(= DEFAULT,火山 ark,2026-06-17 起)
+//   - researcher → MiniMax-M3(512k 吃长文献;思考模型;不变)
+//   - scientist / reviewer → deepseek-v4-pro(分析 + 异构复核;edge 稳端点;不变)
+//   - coder → glm-5.2 / 火山 Coding Plan(2026-06-17 由 glm-5.1 升级,glm-5.1 退 picker)
 //   - codex → gpt-5.5(不变)
 const COMMERCIAL_RESEARCHER_MODEL = "MiniMax-M3";
 const COMMERCIAL_RESEARCHER_PROVIDER = "minimax";
-const COMMERCIAL_CODER_MODEL = "glm-5.1";
+const COMMERCIAL_CODER_MODEL = "glm-5.2";
 const COMMERCIAL_CODER_PROVIDER = "ark";
 const COMMERCIAL_DEEPSEEK_PRO_MODEL = "deepseek-v4-pro";
 const COMMERCIAL_DEEPSEEK_PRO_PROVIDER = "deepseek";
