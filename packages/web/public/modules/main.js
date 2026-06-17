@@ -3,11 +3,11 @@
 // This file exports nothing; it IS the application.
 
 // ── DOM utilities ──
-import { $, _isMac, _isMobileUA, _mod, fallbackCopy, htmlSafeEscape } from './dom.js?v=199a2afa'
-import { getLastFlushDiagForPath, invalidateSignCache, signMediaPath } from './mediaSign.js?v=199a2afa'
+import { $, _isMac, _isMobileUA, _mod, fallbackCopy, htmlSafeEscape } from './dom.js?v=27740372'
+import { getLastFlushDiagForPath, invalidateSignCache, signMediaPath } from './mediaSign.js?v=27740372'
 
 // ── Pure utilities ──
-import { formatSize, msgId, shortTime } from './util.js?v=199a2afa'
+import { formatSize, msgId, shortTime } from './util.js?v=27740372'
 
 // ── App state ──
 import {
@@ -18,7 +18,7 @@ import {
   setSending,
   state,
   tryEnqueueOffline,
-} from './state.js?v=199a2afa'
+} from './state.js?v=27740372'
 
 // ── API layer ──
 import {
@@ -33,22 +33,22 @@ import {
   scheduleProactiveRefresh,
   silentRefresh,
   snapshotDiagnostics,
-} from './api.js?v=199a2afa'
+} from './api.js?v=27740372'
 
 // ── IndexedDB ──
-import { dbDelete, dbGetAll, onIdbUnavailable } from './db.js?v=199a2afa'
+import { dbDelete, dbGetAll, onIdbUnavailable } from './db.js?v=27740372'
 
 // ── Cross-device sync ──
-import { maybeSyncNow, setSyncDeps, syncSessionsFromServer } from './sync.js?v=199a2afa'
+import { maybeSyncNow, setSyncDeps, syncSessionsFromServer } from './sync.js?v=27740372'
 
 // ── Diagnostic trace (d1193355375 "已读但无回复" instrumentation) ──
-import { flushTrace, trace } from './trace.js?v=199a2afa'
+import { flushTrace, trace } from './trace.js?v=27740372'
 
 // ── Theme ──
-import { applyTheme, cycleTheme, setToastFn } from './theme.js?v=199a2afa'
+import { applyTheme, cycleTheme, setToastFn } from './theme.js?v=27740372'
 
 // ── Markdown / rich rendering ──
-import { _renderLocalMedia, processRichBlocks, renderMarkdown } from './markdown.js?v=199a2afa'
+import { _renderLocalMedia, processRichBlocks, renderMarkdown } from './markdown.js?v=27740372'
 
 // ── UI helpers ──
 import {
@@ -58,16 +58,16 @@ import {
   openModal,
   toast,
   toastOptsFromError,
-} from './ui.js?v=199a2afa'
+} from './ui.js?v=27740372'
 
 // ── Attachments ──
-import { addFiles, clearAttachments } from './attachments.js?v=199a2afa'
+import { addFiles, clearAttachments } from './attachments.js?v=27740372'
 
 // ── Speech recognition ──
-import { bindVoiceButton, setAutoResize } from './speech.js?v=199a2afa'
+import { bindVoiceButton, setAutoResize } from './speech.js?v=27740372'
 
 // ── Notifications ──
-import { refreshDocumentTitle, setTitleBusy } from './notifications.js?v=199a2afa'
+import { refreshDocumentTitle, setTitleBusy } from './notifications.js?v=27740372'
 
 // ?v= bust:auth.js Turnstile reset 修复,未带 ?v= 导致 CF 边缘 4h max-age 吃住旧版。
 // 加上后每次 deploy bump-version 会自动刷新,用户刷新即拉新。
@@ -78,31 +78,31 @@ import {
   mintSessionCookie,
   setMode as setAuthMode,
   onLoginSuccess as setAuthSuccessHandler,
-} from './auth.js?v=199a2afa'
-// ?v=199a2afa bust: websocket.js now imports billing.js for refreshBalance() after
+} from './auth.js?v=27740372'
+// ?v=27740372 bust: websocket.js now imports billing.js for refreshBalance() after
 // outbound.cost_charged frame, and formatMeta switched from $X.XXXX to credits.
 // CF edge caches /modules/*.js for up to 1h (gateway sends `public, max-age=3600`);
 // without bumped query-strings users get stale billing.js (no refreshBalance export
 // = runtime error) or stale websocket.js (still shows $ not 积分).
-import { initBilling, isHostAgentAdmin, refreshBalance } from './billing.js?v=199a2afa'
-import { onAuthBroadcast, publishLogout, shouldAdoptTokenRefresh } from './broadcast.js?v=199a2afa'
-import { startInbox, stopInbox } from './inbox.js?v=199a2afa'
+import { initBilling, isHostAgentAdmin, refreshBalance } from './billing.js?v=27740372'
+import { onAuthBroadcast, publishLogout, shouldAdoptTokenRefresh } from './broadcast.js?v=27740372'
+import { startInbox, stopInbox } from './inbox.js?v=27740372'
 // ── OAuth ──
-import { initOAuthListeners, openOAuthModal } from './oauth.js?v=199a2afa'
+import { initOAuthListeners, openOAuthModal } from './oauth.js?v=27740372'
 // ?v= 带版本:新模块必须跟随 bump-version 刷缓存,避免 CF/SW 里停留旧代码。
-import { openApiKeysModal } from './apiKeys.js?v=199a2afa'
-import { initUsageStats, openUsageModal } from './usageStats.js?v=199a2afa'
+import { openApiKeysModal } from './apiKeys.js?v=27740372'
+import { initUsageStats, openUsageModal } from './usageStats.js?v=27740372'
 import {
   clearUserPrefsCache,
   initUserPrefs,
   loadUserPrefs,
   openPrefsModal,
   setOnPrefsChanged,
-} from './userPrefs.js?v=199a2afa'
-import { initWechatListeners, openWechatModal } from './wechat.js?v=199a2afa'
+} from './userPrefs.js?v=27740372'
+import { initWechatListeners, openWechatModal } from './wechat.js?v=27740372'
 
 // ── Memory & Skills ──
-import { loadMemoryTab, openMemoryModal, openSkillsModal, saveMemory } from './memory.js?v=199a2afa'
+import { loadMemoryTab, openMemoryModal, openSkillsModal, saveMemory } from './memory.js?v=27740372'
 
 // ── Phase 6 GitHub repo binding ──
 import {
@@ -112,11 +112,11 @@ import {
   openGithubModal,
   refreshGithubPill,
   wireGithubModalButtons,
-} from './github.js?v=199a2afa'
+} from './github.js?v=27740372'
 
 // ── Scheduled tasks ──
-import { initTasksListeners, openTasksModal } from './tasks.js?v=199a2afa'
-import { initPapersAssistant } from './papers.js?v=199a2afa'
+import { initTasksListeners, openTasksModal } from './tasks.js?v=27740372'
+import { initPapersAssistant } from './papers.js?v=27740372'
 
 // ── Agents ──
 import {
@@ -124,7 +124,7 @@ import {
   reloadAgents,
   renderAgentDropdown,
   setRenderModelPill,
-} from './agents.js?v=199a2afa' // 2026-04-22 fix: 非 admin 用户 /api/agents 403 兜底 + 隐藏 agent-select
+} from './agents.js?v=27740372' // 2026-04-22 fix: 非 admin 用户 /api/agents 403 兜底 + 隐藏 agent-select
 import {
   buildTeamRunPrompt,
   clearStoredAgentTeamSelection,
@@ -133,7 +133,7 @@ import {
   reloadAgentTeams,
   syncSelectedTeamForCurrentSession,
   teamDisplayPrefix,
-} from './agentTeams.js?v=199a2afa'
+} from './agentTeams.js?v=27740372'
 
 // ── Sessions ──
 import {
@@ -149,7 +149,7 @@ import {
   setSessionDeps,
   setSessionUIDeps,
   switchSession,
-} from './sessions.js?v=199a2afa'
+} from './sessions.js?v=27740372'
 
 // ── Messages ──
 import {
@@ -163,7 +163,7 @@ import {
   updateMessageEl,
   updateMsgMetaEl,
   updateSessionSub,
-} from './messages.js?v=199a2afa'
+} from './messages.js?v=27740372'
 
 // ── WebSocket ──
 import {
@@ -189,7 +189,7 @@ import {
   stopCurrentTurn,
   updateMsgStatus,
   updateSendEnabled,
-} from './websocket.js?v=199a2afa'
+} from './websocket.js?v=27740372'
 
 // ── Slash commands ──
 import {
@@ -202,21 +202,21 @@ import {
   setSlashSelected,
   showSlashPopup,
   slashPopupVisible,
-} from './commands.js?v=199a2afa'
+} from './commands.js?v=27740372'
 import {
   clearEffortOnLogout,
   getEffortForSubmit,
   initModePills,
   renderModePills,
-} from './effortMode.js?v=199a2afa'
-import { initModelPicker, renderModelPill } from './modelPicker.js?v=199a2afa'
-import { getSingleAgentModelOverride } from './modelPolicy.js?v=199a2afa'
-import { getConversationModeForSubmit } from './planMode.js?v=199a2afa'
-import { initPlanPanel } from './planPanel.js?v=199a2afa'
+} from './effortMode.js?v=27740372'
+import { initModelPicker, renderModelPill } from './modelPicker.js?v=27740372'
+import { getSingleAgentModelOverride } from './modelPolicy.js?v=27740372'
+import { getConversationModeForSubmit } from './planMode.js?v=27740372'
+import { initPlanPanel } from './planPanel.js?v=27740372'
 
 // Signal to the inline boot-watchdog in index.html that the module graph loaded.
 // If ANY static import above fails (typically CF edge cache mismatch after a
-// deploy where main.js?v=199a2afa imports a bare-URL state.js that CF still serves
+// deploy where main.js?v=27740372 imports a bare-URL state.js that CF still serves
 // old), this line is never reached → watchdog fires at T+15s and self-heals.
 window.__ocBooted = true
 
