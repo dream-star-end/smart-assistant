@@ -2,7 +2,7 @@
   "currentVersion": "v1.0.340",
   "releases": [
     {
-      "version": "PENDING",
+      "version": "v1.0.340",
       "date": "2026-06-17",
       "title": "默认助手更名「全能助手」，修复切到旧模型时提示未开通",
       "items": [

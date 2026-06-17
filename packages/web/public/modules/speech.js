@@ -2,9 +2,9 @@
 // Commercial v3 path: browser MediaRecorder → /ws/voice-transcribe → Deepgram Nova-3,
 // then DeepSeek V4 Flash context polish after the user stops recording. The Deepgram
 // API key never leaves the server. Browser SpeechRecognition remains as fallback.
-import { $ } from './dom.js?v=a0ebd178'
-import { getSession, state } from './state.js?v=a0ebd178'
-import { toast } from './ui.js?v=a0ebd178'
+import { $ } from './dom.js?v=f8bb6179'
+import { getSession, state } from './state.js?v=f8bb6179'
+import { toast } from './ui.js?v=f8bb6179'
 
 const VOICE_WS_PATH = '/ws/voice-transcribe'
 const RECORDER_TIMESLICE_MS = 150
