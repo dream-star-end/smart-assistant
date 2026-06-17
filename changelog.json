@@ -2,7 +2,7 @@
   "currentVersion": "v1.0.344",
   "releases": [
     {
-      "version": "PENDING",
+      "version": "v1.0.344",
       "date": "2026-06-17",
       "title": "修复国内模型(GLM-5.2 等)较长回答常中途中断的问题",
       "items": [
