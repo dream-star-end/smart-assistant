@@ -939,73 +939,163 @@ function _buildDelegateToolChip(entry, text) {
   return chip
 }
 
+// Build the render node for one legacy delegate-progress `entry` (tool chip for
+// a tool call, plain text otherwise). Split out from the inline loop so the
+// incremental diff in _renderDelegateProgress can build/replace entries
+// individually instead of rebuilding the whole list. Returns null for
+// nothing-to-render (empty / thinking) entries.
+function _buildDelegateEntryNode(entry) {
+  const text = String(entry?.text || '').trim()
+  if (!text || entry.phase === 'thinking') return null
+  if (entry.phase === 'tool') return _buildDelegateToolChip(entry, text)
+  const p = document.createElement('div')
+  p.className = 'agent-group-child-text'
+  if (entry.isError) p.classList.add('error')
+  p.textContent = text
+  return p
+}
+
+// Per-entry render signature for the legacy entries view — same idea as
+// _agentChildSig: re-render an entry's DOM only when its content/flags change.
+function _delegateEntrySig(entry) {
+  const text = String(entry?.text || '')
+  return `${entry?.phase || ''}#${entry?.isError ? 1 : 0}#${entry?.toolName || ''}#${text.length}#${text.slice(-24)}`
+}
+
+// Standalone "委派过程" fallback card (used when a delegate run can't be nested
+// into the leader's delegate_task agent-group — old gateway w/o goal, ambiguous
+// match, or non-webchat parent). Incremental, mirroring _renderAgentGroup: the
+// first call builds the structure; later calls (every streaming frame) patch
+// only the title/status and the changed/new children via a per-index signature
+// diff. The previous implementation rebuilt the whole card (el.innerHTML='')
+// every frame, destroying+recreating every tool card — the flicker this fixes.
 function _renderDelegateProgress(el, msg) {
-  el.innerHTML = ''
-  el.className = 'agent-group delegate-progress'
-  // 折叠语义与子任务卡(agent-group)统一:运行中展开看实时进度、完成自动折叠,
-  // 用户手动 toggle 后永久尊重其选择(_userCollapsed)。
-  if (_resolveAgentGroupCollapsed(msg)) el.classList.add('collapsed')
-  if (msg.error) el.classList.add('error')
-  el.dataset.msgId = msg.id
-
+  const collapsed = _resolveAgentGroupCollapsed(msg)
+  const wantTitle = `委派过程: ${msg.agentId || 'agent'}`
   const statusHtml = msg.error
-    ? '<span class="agent-group-status" style="color:var(--danger)">失败</span>'
+    ? '<span style="color:var(--danger)">失败</span>'
     : msg._completed
-      ? '<span class="agent-group-status" style="color:var(--success)">完成</span>'
-      : '<span class="agent-group-status">运行中…</span>'
+      ? '<span style="color:var(--success)">完成</span>'
+      : '运行中…'
 
-  const header = document.createElement('div')
-  header.className = 'agent-group-header'
-  header.innerHTML = `${_SVG_BOT_AGENT}<span class="agent-group-title">委派过程: ${htmlSafeEscape(msg.agentId || 'agent')}</span>${statusHtml}${_SVG_CHEVRON_AGENT}`
-  makeDisclosure(header, el, {
-    onToggle: () => {
-      msg._userCollapsed = !el.classList.contains('collapsed')
-      el.classList.toggle('collapsed', msg._userCollapsed)
-    },
-  })
-  el.appendChild(header)
+  if (!el._delegateProgressInit) {
+    // ── First build: full structure (one-time) ──
+    el.innerHTML = ''
+    el.className = 'agent-group delegate-progress'
+    const header = document.createElement('div')
+    header.className = 'agent-group-header'
+    header.innerHTML = `${_SVG_BOT_AGENT}<span class="agent-group-title"></span><span class="agent-group-status"></span>${_SVG_CHEVRON_AGENT}`
+    // 折叠语义与子任务卡(agent-group)统一:运行中展开看实时进度、完成自动折叠,
+    // 用户手动 toggle 后永久尊重其选择(_userCollapsed)。
+    makeDisclosure(header, el, {
+      onToggle: () => {
+        msg._userCollapsed = !el.classList.contains('collapsed')
+        el.classList.toggle('collapsed', msg._userCollapsed)
+      },
+    })
+    el.appendChild(header)
+    const body = document.createElement('div')
+    body.className = 'agent-group-body'
+    el.appendChild(body)
+    el._delegateProgressHeader = header
+    el._delegateProgressBody = body
+    el._childEls = [] // item index → mounted DOM node (or null)
+    el._childSigs = [] // item index → last render signature
+    el._delegateProgressInit = true
+  }
 
-  const body = document.createElement('div')
-  body.className = 'agent-group-body'
+  el.classList.toggle('collapsed', collapsed)
+  el.classList.toggle('error', !!msg.error)
 
-  // 新富透传:childBlocks 走主聊天同款渲染(工具卡 / 思考 / markdown 文本)。
+  const titleSpan = el._delegateProgressHeader.querySelector('.agent-group-title')
+  if (titleSpan && titleSpan.textContent !== wantTitle) titleSpan.textContent = wantTitle
+  const statusSpan = el._delegateProgressHeader.querySelector('.agent-group-status')
+  if (statusSpan && statusSpan._html !== statusHtml) {
+    statusSpan.innerHTML = statusHtml
+    statusSpan._html = statusHtml
+  }
+
+  // Unify both render modes into one ordered item list so a single per-index
+  // diff covers them: rich passthrough (childBlocks) takes priority; the legacy
+  // entries view is the fallback for old in-container gateways. A trailing
+  // summary item, or an empty-state placeholder when there's nothing yet.
   const childBlocks = Array.isArray(msg.childBlocks) ? msg.childBlocks : []
+  const entries = Array.isArray(msg.entries) ? msg.entries : []
+  const items = []
   if (childBlocks.length > 0) {
-    for (const ch of childBlocks) _appendAgentChildBlock(body, ch)
+    for (const ch of childBlocks) {
+      items.push({ sig: `c:${_agentChildSig(ch)}`, build: () => _buildAgentChildNode(ch) })
+    }
   } else {
-    // 旧降级帧(历史卡 / 升级过渡):保留 entries chip/纯文本视图。
-    const entries = Array.isArray(msg.entries) ? msg.entries : []
     for (const entry of entries) {
-      const text = String(entry?.text || '').trim()
-      if (!text) continue
-      if (entry.phase === 'thinking') continue
-      if (entry.phase === 'tool') {
-        const chip = _buildDelegateToolChip(entry, text)
-        if (chip) body.appendChild(chip)
-        continue
-      }
-      const p = document.createElement('div')
-      p.className = 'agent-group-child-text'
-      if (entry.isError) p.classList.add('error')
-      p.textContent = text
-      body.appendChild(p)
+      items.push({ sig: `e:${_delegateEntrySig(entry)}`, build: () => _buildDelegateEntryNode(entry) })
     }
   }
-
   if (msg.summary) {
-    const preview = document.createElement('div')
-    preview.className = 'agent-group-result'
-    preview.textContent = msg.summary
-    body.appendChild(preview)
+    const summary = String(msg.summary)
+    items.push({
+      sig: `s:${summary.length}#${summary.slice(-24)}`,
+      build: () => {
+        const preview = document.createElement('div')
+        preview.className = 'agent-group-result'
+        preview.textContent = summary
+        return preview
+      },
+    })
   }
-  if (childBlocks.length === 0 && (!Array.isArray(msg.entries) || msg.entries.length === 0) && !msg.summary) {
-    const empty = document.createElement('div')
-    empty.className = 'agent-group-empty'
-    empty.textContent = '等待子 agent 输出…'
-    body.appendChild(empty)
+  if (items.length === 0) {
+    items.push({
+      sig: 'empty',
+      build: () => {
+        const empty = document.createElement('div')
+        empty.className = 'agent-group-empty'
+        empty.textContent = '等待子 agent 输出…'
+        return empty
+      },
+    })
   }
-  el.appendChild(body)
-  _appendMsgTime(el, msg.completedAt || msg.ts)
+
+  // ── Per-index diff: only changed/new items touch the DOM. ──
+  const body = el._delegateProgressBody
+  for (let i = 0; i < items.length; i++) {
+    const sig = items[i].sig
+    if (el._childEls[i] !== undefined && el._childSigs[i] === sig) continue
+    const node = items[i].build()
+    const prev = el._childEls[i]
+    if (prev) {
+      if (node) body.replaceChild(node, prev)
+      else body.removeChild(prev)
+    } else if (node) {
+      // prev is null/undefined (a previously empty slot, e.g. a legacy `entries`
+      // item that built to null and later got content, or a brand-new index).
+      // Insert before the NEXT already-mounted sibling so order is preserved
+      // even when earlier slots are null — a plain appendChild would land the
+      // node at the tail and misorder once entries shift under the 120 cap.
+      let ref = null
+      for (let j = i + 1; j < el._childEls.length; j++) {
+        if (el._childEls[j]) {
+          ref = el._childEls[j]
+          break
+        }
+      }
+      body.insertBefore(node, ref)
+    }
+    el._childEls[i] = node || null
+    el._childSigs[i] = sig
+  }
+  // Drop trailing nodes left over from a previous, longer render (entries
+  // trimmed at the 120 cap, or the empty placeholder superseded by real items).
+  for (let i = el._childEls.length - 1; i >= items.length; i--) {
+    const prev = el._childEls[i]
+    if (prev) body.removeChild(prev)
+    el._childEls.pop()
+    el._childSigs.pop()
+  }
+
+  // Idempotent: creates the .msg-time on first render, updates it in place on
+  // later frames (ts → completedAt). _appendMsgTime is NOT idempotent, so it
+  // must not be called per-frame here (it would stack duplicate timestamps).
+  _refreshMsgTime(el, msg)
 }
 
 function _buildToolCard(el, msg) {

@@ -108,7 +108,7 @@ import { WebhookRouter } from './webhooks.js'
 import { syncCodexAuthFiles } from './codexAuthSync.js'
 import { resolveCodexConversationMode } from './codexAutoPlanMode.js'
 import { inferAgentForModel } from './inferAgentForModel.js'
-import { mergeOnDemandToolsets } from './toolsetIntent.js'
+import { mergeOnDemandToolsets, resolveDelegateToolsets } from './toolsetIntent.js'
 import { resolveOpenClaudeVisionEntry } from './codexLaunchOverrides.js'
 import {
   OPENCLAUDE_VISION_MCP_ID,
@@ -574,46 +574,6 @@ function readDelegateMemoryPressure(): { current: number; max: number; ratio: nu
   // Docker/cgroup v1 sometimes reports a huge sentinel for "unlimited".
   if (max > Number.MAX_SAFE_INTEGER / 4) return null
   return { current, max, ratio: current / max }
-}
-
-function normalizeDelegateToolsetList(value: unknown): string[] | null {
-  if (!Array.isArray(value)) return null
-  const out: string[] = []
-  for (const item of value) {
-    if (typeof item !== 'string') continue
-    const trimmed = item.trim()
-    if (!trimmed || out.includes(trimmed)) continue
-    out.push(trimmed)
-  }
-  return out
-}
-
-function effectiveDelegateToolsets(
-  targetAgent: AgentDef,
-  defaultToolsets: readonly string[] | undefined,
-  requestedRaw: unknown,
-): { ok: true; toolsets: string[] } | { ok: false; error: string } {
-  const requested = normalizeDelegateToolsetList(requestedRaw)
-  if (requested === null) return { ok: false, error: 'delegate toolsets must be an array' }
-  if (requested.length === 0) {
-    return { ok: false, error: 'delegate toolsets must include at least one valid toolset' }
-  }
-
-  const ceiling = Array.isArray(targetAgent.toolsets)
-    ? targetAgent.toolsets
-    : Array.isArray(defaultToolsets)
-      ? defaultToolsets
-      : undefined
-  if (!ceiling || ceiling.length === 0) return { ok: true, toolsets: requested }
-
-  const allowed = requested.filter((toolset) => ceiling.includes(toolset))
-  if (allowed.length === 0) {
-    return {
-      ok: false,
-      error: `delegate toolsets not allowed for agent "${targetAgent.id}"`,
-    }
-  }
-  return { ok: true, toolsets: allowed }
 }
 
 export class Gateway {
@@ -4954,20 +4914,23 @@ export class Gateway {
     const targetAgent = cfg.agents.find((a) => a.id === targetAgentId)
     if (!targetAgent) return this.sendError(res, 404, `agent "${targetAgentId}" not found`)
 
-    // Apply requested toolset restriction as an intersection with the target
-    // agent's configured ceiling. Never let a delegator replace a core-only
-    // specialist with broader browser/research toolsets.
-    const hasRequestedToolsets = Object.prototype.hasOwnProperty.call(parsed, 'toolsets')
-    let delegatedAgent = targetAgent
-    if (hasRequestedToolsets) {
-      const resolvedToolsets = effectiveDelegateToolsets(
-        targetAgent,
-        this.deps.config.defaults.toolsets,
-        toolsets,
-      )
-      if (!resolvedToolsets.ok) return this.sendError(res, 400, resolvedToolsets.error)
-      delegatedAgent = { ...targetAgent, toolsets: resolvedToolsets.toolsets }
-    }
+    // Resolve the delegated member's toolsets the same way the normal message
+    // path does: member baseline + on-demand grant (task intent on goal/context)
+    // + the leader's explicit `toolsets` as an additive grant of DEFINED toolsets
+    // only. This is never fatal — an unknown or non-intersecting request degrades
+    // to the merged baseline instead of aborting the whole delegation (the old
+    // empty-intersection hard-400 that surfaced as "delegate toolsets not allowed
+    // for agent …"). Escalation to "all tools" stays impossible: a configured
+    // baseline is only ever extended with toolsets defined in config.toolsets.
+    const delegateIntentText = [goal, context].filter(Boolean).join('\n')
+    const resolvedToolsets = resolveDelegateToolsets(
+      targetAgent,
+      this.deps.config,
+      toolsets,
+      delegateIntentText,
+    )
+    const delegatedAgent =
+      resolvedToolsets === undefined ? targetAgent : { ...targetAgent, toolsets: resolvedToolsets }
 
     const memoryPressure = readDelegateMemoryPressure()
     const memoryPressureLimit = parseDelegateMemoryPressureRatio()

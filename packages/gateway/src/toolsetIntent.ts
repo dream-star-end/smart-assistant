@@ -1,4 +1,4 @@
-import type { OpenClaudeConfig } from '@openclaude/storage'
+import type { AgentDef, OpenClaudeConfig } from '@openclaude/storage'
 
 export const BROWSER_TOOLSET_ID = 'browser'
 export const WEB_CONTEXT_TOOLSET_ID = 'web_context'
@@ -86,4 +86,77 @@ export function mergeOnDemandToolsets(
     }
   }
   return next
+}
+
+// Normalize a leader-supplied delegate `toolsets` request: keep only non-empty,
+// de-duplicated strings. Returns null if the input isn't an array at all.
+export function normalizeDelegateToolsetList(value: unknown): string[] | null {
+  if (!Array.isArray(value)) return null
+  const out: string[] = []
+  for (const item of value) {
+    if (typeof item !== 'string') continue
+    const trimmed = item.trim()
+    if (!trimmed || out.includes(trimmed)) continue
+    out.push(trimmed)
+  }
+  return out
+}
+
+// Resolve the toolset list for a delegated member. Unifies the two historical
+// authority sources for "what tools does a delegated member get" into ONE model,
+// identical in spirit to the normal message path (`mergeOnDemandToolsets` at the
+// WS entry):
+//   - The member's configured toolsets are a BASELINE, not a hard cap. Post the
+//     core-only seed migration (entrypoint), researcher/scientist/coder are
+//     `["core"]`; browser/research are mounted on demand, never pre-mounted.
+//   - Toolsets DEFINED in config.toolsets (core/browser/research) are grantable
+//     on demand to any member, via (a) task intent on the goal+context, AND
+//     (b) the leader's explicit `toolsets` request. BOTH are ADDITIVE and capped
+//     to defined toolsets — so a delegation can never escalate to "all tools"
+//     (the old #5 over-reach guard still holds) and an unknown/empty request can
+//     never abort the delegation (the old empty-intersection hard-400 is gone).
+//
+// Returns the resolved toolset list, or undefined meaning "inherit / mount all"
+// — preserved only for the legacy case where neither the member nor defaults
+// configure any toolsets (SubprocessRunner then mounts all global MCP servers).
+export function resolveDelegateToolsets(
+  targetAgent: AgentDef,
+  config: Pick<OpenClaudeConfig, 'toolsets' | 'defaults'>,
+  requestedRaw: unknown,
+  intentText: string,
+): string[] | undefined {
+  const base = Array.isArray(targetAgent.toolsets)
+    ? targetAgent.toolsets
+    : Array.isArray(config.defaults?.toolsets)
+      ? config.defaults.toolsets
+      : undefined
+  // No baseline configured → keep legacy "mount all" semantics. mergeOnDemand
+  // also no-ops on an empty base, and a leader request can't sensibly narrow
+  // "all", so inherit unchanged.
+  if (!base || base.length === 0) return undefined
+
+  // (a) Intent-based on-demand grant — same call the normal message path makes,
+  //     so a delegated researcher gets browser/research from the task text just
+  //     like a directly-prompted one would. Symmetry: delegate path == WS path.
+  //     mergeOnDemandToolsets always returns a fresh array for a non-empty base,
+  //     so `resolved` is safe to extend in place below.
+  const resolved = mergeOnDemandToolsets(base, config, intentText) ?? [...base]
+
+  // (b) Explicit leader request — additive grant, but ONLY for toolsets that are
+  //     actually DEFINED in config.toolsets. Unknown names are ignored (never
+  //     fatal); defined-but-absent names are appended. This demotes the leader's
+  //     `toolsets` from a hard-failing intersection to a grant hint consistent
+  //     with intent-merge.
+  const requested = normalizeDelegateToolsetList(requestedRaw)
+  if (requested && requested.length > 0 && config.toolsets) {
+    for (const toolset of requested) {
+      if (
+        Object.prototype.hasOwnProperty.call(config.toolsets, toolset) &&
+        !resolved.includes(toolset)
+      ) {
+        resolved.push(toolset)
+      }
+    }
+  }
+  return resolved
 }

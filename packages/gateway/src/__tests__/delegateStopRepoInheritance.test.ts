@@ -142,26 +142,24 @@ test('stop interrupts active delegate children for the stopped parent session', 
   )
 })
 
-test('delegate toolset restrictions are intersected with target agent ceiling', () => {
+test('delegate handler wires the unified additive toolset resolver (no fatal intersection)', () => {
+  // The resolver logic itself lives in toolsetIntent.ts and is exercised
+  // behaviorally by resolveDelegateToolsets.test.ts; here we only guard the
+  // server.ts wiring + the removal of the old hard-fail path.
   assert.match(
-    SERVER_TS,
-    /function\s+effectiveDelegateToolsets\(/,
-    'gateway must use a helper for delegate toolset intersection',
+    handleDelegateTask,
+    /resolveDelegateToolsets\(\s*targetAgent,\s*this\.deps\.config,/,
+    'delegate handler must resolve toolsets via the unified resolver with full config',
   )
   assert.match(
-    SERVER_TS,
-    /targetAgent\.toolsets[\s\S]*this\.deps\.config\.defaults\.toolsets/,
-    'delegate toolset ceiling must use target agent toolsets or global config defaults',
+    handleDelegateTask,
+    /const\s+delegateIntentText\s*=\s*\[goal,\s*context\]/,
+    'delegate handler must derive intent text from goal+context (symmetry with WS path)',
   )
-  assert.match(
-    SERVER_TS,
-    /requested\.filter\(\(toolset\) => ceiling\.includes\(toolset\)\)/,
-    'requested delegate toolsets must be intersected with the target ceiling',
-  )
-  assert.match(
+  assert.doesNotMatch(
     SERVER_TS,
     /delegate toolsets not allowed for agent/,
-    'empty delegate toolset intersection must be rejected instead of falling back to all tools',
+    'empty/unknown delegate toolset requests must degrade to the merged baseline, not a hard 400',
   )
   assert.doesNotMatch(
     handleDelegateTask,

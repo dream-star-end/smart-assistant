@@ -410,7 +410,8 @@ const TOOLS = [
         toolsets: {
           type: 'array',
           items: { type: 'string' },
-          description: '限制子 agent 可用的工具集 (可选,如 ["research","browser"])',
+          description:
+            '可选:为子 agent 额外授予的平台工具集名(如需联网检索可填 "research"/"browser")。通常无需手动指定 —— 系统会按任务目标自动挂载所需工具集;只能授予平台已配置的工具集,无法越权,填错或填不存在的名字会被忽略而非报错。',
         },
       },
       required: ['goal'],
@@ -438,7 +439,8 @@ const TOOLS = [
         toolsets: {
           type: 'array',
           items: { type: 'string' },
-          description: '限制 Codex 可用工具集 (可选)',
+          description:
+            '可选:为 Codex 额外授予的平台工具集名。通常无需指定 —— 系统会按任务意图自动挂载;只能授予平台已配置的工具集,填错会被忽略而非报错。',
         },
       },
       required: ['goal'],

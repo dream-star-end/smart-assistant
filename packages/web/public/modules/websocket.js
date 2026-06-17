@@ -941,6 +941,75 @@ function _bindDelegateRunToGroup(sess, block) {
   return groupMsg.id
 }
 
+// Bidirectional counterpart to _bindDelegateRunToGroup. _bindDelegateRunToGroup
+// handles "group finalized BEFORE the start frame". This handles the opposite
+// race: a delegate_progress run already fell back to a standalone card because
+// its start frame arrived BEFORE the leader's delegate_task tool_use finalized
+// its (agentId, goal). Once that group finalizes its correlation keys, pull the
+// standalone run INTO it so the call + its progress render as ONE card.
+//
+// Fail-safe — does nothing (leaving the standalone exactly as today, i.e. no
+// regression) unless ALL hold:
+//   - the group is a delegate group, still unbound, with no nested blocks yet;
+//   - it carries a non-empty (agentId, normalized goal);
+//   - exactly ONE unadopted standalone delegate-progress run matches that key
+//     (a real same-goal/same-agent fan-out stays separate rather than risk
+//     grafting onto the wrong card);
+//   - that standalone isn't a legacy entries-only card (old gateway w/o goal
+//     never matches anyway, but guard against losing visible entries content).
+// Returns true iff it adopted a run. Caller re-renders the group.
+function _adoptStandaloneDelegateRun(sess, groupMsg) {
+  if (!groupMsg || !groupMsg._delegate || groupMsg._delegateRunId) return false
+  const agentId = groupMsg._delegateAgentId || ''
+  const goal = groupMsg._delegateGoal || ''
+  if (!agentId || !goal) return false
+  if (Array.isArray(groupMsg.childBlocks) && groupMsg.childBlocks.length > 0) return false
+
+  const candidates = (sess.messages || []).filter(
+    (m) =>
+      m.role === 'delegate-progress' &&
+      !m._adoptedInto &&
+      m.runId &&
+      m._delegateGoal === goal &&
+      (m.agentId || '') === agentId,
+  )
+  if (candidates.length !== 1) return false
+  const standalone = candidates[0]
+
+  const standaloneChildBlocks = Array.isArray(standalone.childBlocks) ? standalone.childBlocks : []
+  const standaloneEntries = Array.isArray(standalone.entries) ? standalone.entries : []
+  // Legacy entries-only card with no rich blocks → don't adopt (would drop the
+  // entries view). Can't realistically co-occur with a goal, but stay safe.
+  if (standaloneChildBlocks.length === 0 && standaloneEntries.length > 0) return false
+
+  // Take over the (already coalesced) child blocks. group is empty (guarded
+  // above) so a direct hand-off preserves order; future frames keep coalescing
+  // via _appendSubagentBlock once the run is bound below.
+  groupMsg.childBlocks = standaloneChildBlocks
+  // Carry terminal state, mirroring the nested done/error handling: surface a
+  // result preview + error flag, but leave _completed/auto-collapse to the
+  // leader's delegate_task tool_result (it always arrives).
+  if (standalone.summary && !groupMsg._resultPreview) {
+    groupMsg._resultPreview = String(standalone.summary).slice(0, 200)
+  }
+  if (standalone.error) groupMsg._isError = true
+
+  // Bind so ALL future frames for this run nest into the group.
+  groupMsg._delegateRunId = standalone.runId
+  if (!sess._delegateRunGroups) sess._delegateRunGroups = new Map()
+  sess._delegateRunGroups.set(standalone.runId, groupMsg.id)
+
+  // Remove the now-superseded standalone card (data + DOM).
+  standalone._adoptedInto = groupMsg.id
+  const idx = (sess.messages || []).findIndex((m) => m === standalone)
+  if (idx >= 0) sess.messages.splice(idx, 1)
+  if (sess.id === state.currentSessionId && standalone.id != null) {
+    const node = document.querySelector(`[data-msg-id="${CSS.escape(String(standalone.id))}"]`)
+    if (node) node.remove()
+  }
+  return true
+}
+
 function _handleDelegateProgressBlock(sess, block) {
   if (!block.runId) return
 
@@ -999,12 +1068,22 @@ function _handleDelegateProgressBlock(sess, block) {
     msg = addMessage(sess, 'delegate-progress', '', {
       runId: block.runId,
       agentId: block.agentId || '',
+      // Carry the start frame's raw goal + normalized correlation key so the
+      // leader's delegate_task agent-group can later ADOPT this standalone card
+      // if it finalizes after we fell back (see _adoptStandaloneDelegateRun).
+      // goal only rides the start frame; absent on old gateways → no adoption.
+      goal: typeof block.goal === 'string' ? block.goal : '',
+      _delegateGoal: typeof block.goal === 'string' ? _normalizeDelegateGoalKey(block.goal) : '',
       entries: [],
       childBlocks: [],
       _completed: false,
     })
   }
   if (block.agentId) msg.agentId = block.agentId
+  if (typeof block.goal === 'string' && block.goal && !msg._delegateGoal) {
+    msg.goal = block.goal
+    msg._delegateGoal = _normalizeDelegateGoalKey(block.goal)
+  }
   if (block.phase === 'done' || block.phase === 'error') {
     msg._completed = true
     msg.completedAt = Date.now()
@@ -3001,6 +3080,13 @@ export function handleOutbound(frame) {
             sess._agentGroups.set(block.blockId, groupMsg.id)
             if (block.blockId) sess._blockIdToMsgId.set(block.blockId, groupMsg.id)
             addBgTask(block.blockId, desc)
+            // If a delegate_progress run already fell back to a standalone card
+            // (its start frame raced ahead of this tool_use finalizing), adopt
+            // it now so the call + its run render as ONE card. addMessage already
+            // rendered this (empty) group, so re-render after pulling in blocks.
+            if (delegateFields && _adoptStandaloneDelegateRun(sess, groupMsg)) {
+              if (sess.id === state.currentSessionId) _deps.updateMessageEl(groupMsg)
+            }
           } else {
             const groupMsgId = sess._agentGroups.get(block.blockId)
             const groupMsg = sess.messages.find((m) => m.id === groupMsgId)
@@ -3022,6 +3108,9 @@ export function handleOutbound(frame) {
                   groupMsg._delegateGoal = delegateFields._delegateGoal
                   changed = true
                 }
+                // Correlation keys just (re)finalized — a standalone fallback
+                // run for this (agentId, goal) can now be adopted into this card.
+                if (_adoptStandaloneDelegateRun(sess, groupMsg)) changed = true
               }
               if (changed && sess.id === state.currentSessionId) _deps.updateMessageEl(groupMsg)
             }
