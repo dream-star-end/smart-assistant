@@ -1,5 +1,5 @@
 {
-  "currentVersion": "v1.0.344",
+  "currentVersion": "v1.0.345",
   "releases": [
     {
       "version": "v1.0.344",
@@ -10,7 +10,7 @@
       ]
     },
     {
-      "version": "v1.0.344",
+      "version": "v1.0.343",
       "date": "2026-06-17",
       "title": "GLM-5.2 新增「思考深度」选择器（高 / 最高）",
       "items": [
