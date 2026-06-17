@@ -385,6 +385,64 @@ const _notifSound = (() => {
 // (10min) and gateway idle timeout.
 const STALE_WARN_MS = 90_000    // Switch to "深度思考中" after 90s
 const STALE_DANGER_MS = 300_000 // Switch to "处理时间较长,仍在思考中" after 5min
+// "正在生成内容" 阶段:无新帧达到 10s 即切换。低于 stale-warn,是正向安抚而非卡死告警。
+// 专治"上游不逐字流式工具输入"的体感空窗 —— 例如 glm-5.2/火山方舟 的 Write/Edit:
+// 模型在产出大段文件内容,但上游把整个 tool_use(content_block_start + 全部
+// input_json_delta)缓冲到末尾才一次性吐,期间前端零帧。此时不能谎称"正在写文件
+// XX"(上游还没告诉我们接下来是什么工具),只能给中性的"正在生成内容"。对任何
+// 大输出静默窗口(含 Claude 深度推理无 token 输出)同样适用,故做成模型无关。
+const STALE_GENERATING_MS = 10_000
+
+/**
+ * Pure decision for the typing-indicator label text + style class. Factored out
+ * of the 1 Hz interval so the escalation ladder is unit-testable (the timer/DOM
+ * shell stays a thin renderer). Returns `{ text, cls }`; `cls` is one of
+ * '' | 'generating' | 'stale-warn' | 'stale-danger' | 'compacting' and is the
+ * SINGLE escalation class the caller should own on the element.
+ *
+ * Priority high→low:
+ *   compacting   — CCB context-compaction phase (own LLM call, can run minutes).
+ *   stale-danger — >=5min no new frame: diagnostic, surfaces "Ns 无新数据".
+ *   stale-warn   — >=90s no new frame: diagnostic, surfaces "Ns 无新数据".
+ *   generating   — >=10s no new frame: model IS producing output but the upstream
+ *                  isn't streaming it (buffered tool input / large-output gap).
+ *                  Neutral + reassuring, NOT a stall warning. Below stale-warn so
+ *                  short normal pauses on streaming upstreams (Claude/DeepSeek)
+ *                  never trip it — they emit frames sub-second.
+ *   (default)    — 思考中 (Ns) / cold-start hint.
+ *
+ * @param {{name:string, secs:number, silenceMs:number, turnStatus?:string|null, hint?:string}} a
+ * @returns {{text:string, cls:string}}
+ */
+export function _computeTypingLabel({ name, secs, silenceMs, turnStatus, hint = '' }) {
+  if (turnStatus === 'compacting') {
+    return { text: `${name} 正在压缩上下文 (${secs}s)`, cls: 'compacting' }
+  }
+  if (silenceMs >= STALE_DANGER_MS) {
+    const sil = Math.round(silenceMs / 1000)
+    return { text: `${name} 处理时间较长,仍在思考中 (${secs}s · ${sil}s 无新数据)`, cls: 'stale-danger' }
+  }
+  if (silenceMs >= STALE_WARN_MS) {
+    const sil = Math.round(silenceMs / 1000)
+    return { text: `${name} 深度思考中 (${secs}s · ${sil}s 无新数据)`, cls: 'stale-warn' }
+  }
+  if (silenceMs >= STALE_GENERATING_MS) {
+    return { text: `${name} 正在生成内容,请稍候 (${secs}s)`, cls: 'generating' }
+  }
+  if (secs >= 5) {
+    return { text: `${name} 思考中 (${secs}s)${hint}`, cls: '' }
+  }
+  return { text: `${name} 思考中${hint}`, cls: '' }
+}
+
+// The single-escalation-class invariant lives here so the 1 Hz tick AND the
+// immediate-feedback bypass paths (handleOutboundTurnStatus compact_start/end)
+// can't drift into multi-class coexistence. Pass the ONE class to keep on
+// (or '' for none); every other escalation class is removed in lockstep.
+const _TYPING_ESCALATION_CLASSES = ['compacting', 'stale-danger', 'stale-warn', 'generating']
+function _setTypingEscalationClass(el, cls) {
+  for (const c of _TYPING_ESCALATION_CLASSES) el.classList.toggle(c, cls === c)
+}
 
 // Per-session frame tracking (stored on sess object: sess._lastFrameAt, sess._turnStartedAt)
 export function markFrameReceived(sess) {
@@ -467,38 +525,13 @@ export function showTypingIndicator() {
     // 长思考态(stale-warn / stale-danger)不拼 cold-hint —— 信息已饱和,
     // 再加冗长后缀只会噪声。hint 仅在 "正常思考中" 文案出现。
     const hint = _coldHintSuffix(_sess)
-    // Plan 2 (compact-progress-frame)— compacting 分支优先级高于 stale-warn /
-    // stale-danger:CCB compact 期间走单独 LLM 调用,几十秒到几分钟无 stream,
-    // 走 stale 文案会让用户以为卡死;走 compacting 明确告诉用户"在压缩,继续等"。
-    // 同 secs 计数(本帧 elapsed = turn 启动至今,跨 compact_start 也保留)。
-    if (_sess?._turnStatus === 'compacting') {
-      label.textContent = `${name} 正在压缩上下文 (${secs}s)`
-      el.classList.remove('stale-warn', 'stale-danger')
-      el.classList.add('compacting')
-      return
-    }
-    el.classList.remove('compacting')
-    // 文案中性化(不再"可能已卡住"红字),但保留"无新数据时长"诊断指标 ——
-    // tool-use 5-10min 静默时 silence 数值是用户判断"真在工作 vs 真断流"的
-    // 唯一前端线索,删了就只能等 gateway idle timeout 兜底,诊断盲区太长。
-    if (silenceMs >= STALE_DANGER_MS) {
-      const sil = Math.round(silenceMs / 1000)
-      label.textContent = `${name} 处理时间较长,仍在思考中 (${secs}s · ${sil}s 无新数据)`
-      el.classList.add('stale-danger')
-      el.classList.remove('stale-warn')
-    } else if (silenceMs >= STALE_WARN_MS) {
-      const sil = Math.round(silenceMs / 1000)
-      label.textContent = `${name} 深度思考中 (${secs}s · ${sil}s 无新数据)`
-      el.classList.add('stale-warn')
-      el.classList.remove('stale-danger')
-    } else if (secs >= 5) {
-      label.textContent = `${name} 思考中 (${secs}s)${hint}`
-      el.classList.remove('stale-warn', 'stale-danger')
-    } else if (hint) {
-      // <5s 也允许 cold hint 进入(sys.cold_start 在 typing 起首即可激活,不等 5s)。
-      label.textContent = `${name} 思考中${hint}`
-      el.classList.remove('stale-warn', 'stale-danger')
-    }
+    // 文案 + 升级样式类的纯决策抽到 _computeTypingLabel(可单测);这里只做渲染:
+    // 写 label 文本 + 把那唯一的升级类 toggle 到 el 上(其余升级类一律关掉),
+    // 避免原先在 5 个分支里散落 add/remove 造成的类残留。compacting 优先级、
+    // stale "无新数据" 诊断指标、cold-hint 语义全部保留在纯函数内。
+    const r = _computeTypingLabel({ name, secs, silenceMs, turnStatus: _sess?._turnStatus, hint })
+    label.textContent = r.text
+    _setTypingEscalationClass(el, r.cls)
   }, 1000)
   inner.appendChild(el)
   _deps.scrollBottom(true)
@@ -3796,8 +3829,15 @@ function handleColdStart(_frame) {
   if (!el) return
   const label = el.querySelector('.typing-label')
   if (!label) return
-  // 已进入长思考态(stale-warn / stale-danger)时文案已有自己的语义,不再叠 cold-hint。
-  if (el.classList.contains('stale-warn') || el.classList.contains('stale-danger')) return
+  // 已进入有自身语义的升级态(stale-warn / stale-danger / generating)时不再叠
+  // cold-hint —— 这些文案已表达"在干活",且其升级类还在,叠 cold-hint 会造成
+  // 文案与样式类不一致(下一 tick 才纠)。
+  if (
+    el.classList.contains('stale-warn') ||
+    el.classList.contains('stale-danger') ||
+    el.classList.contains('generating')
+  )
+    return
   const name = _typingDisplayTarget(sess).name
   const startedAt = sess._turnStartedAt || Date.now()
   const secs = Math.round((Date.now() - startedAt) / 1000)
@@ -3855,11 +3895,14 @@ function handleOutboundTurnStatus(frame) {
   const secs = Math.round((Date.now() - startedAt) / 1000)
   if (status === 'compacting') {
     label.textContent = `${name} 正在压缩上下文 (${secs}s)`
-    el.classList.remove('stale-warn', 'stale-danger')
-    el.classList.add('compacting')
+    // 走集中 helper 保持"单一升级类"不变量 —— 若此刻是 generating/stale,一并清掉,
+    // 不再像旧代码只 remove 一部分而漏掉新加的 generating。
+    _setTypingEscalationClass(el, 'compacting')
   } else {
-    el.classList.remove('compacting')
-    // 不主动改回 "思考中" 文案 —— 下一 1s tick 自然处理,避免与 stale 状态机抢写
+    // compact 结束:清掉所有升级类,文案不主动改回 "思考中" —— 下一 1s tick 自然
+    // 处理(markFrameReceived 刚把 silence 归零,tick 会回到普通 "思考中"),避免与
+    // stale 状态机抢写。
+    _setTypingEscalationClass(el, '')
   }
 }
 

@@ -2982,6 +2982,11 @@ a:hover {
  * 同列,加一点 accent 让用户知道这是个独立 phase(不是普通 stale-warn)。 */
 .typing-indicator.compacting .typing-label { color: var(--accent, var(--fg-muted)); font-weight: 500; }
 
+/* "正在生成内容" 阶段 — 上游缓冲工具输入(如 glm-5.2/火山方舟 写文件)或任何大
+ * 输出静默窗口的正向安抚标记。与 compacting 同样用 accent 表示"独立的进行中
+ * phase",区别于灰色的 stale-warn/stale-danger 诊断态。 */
+.typing-indicator.generating .typing-label { color: var(--accent, var(--fg-muted)); font-weight: 500; }
+
 /* Meta line under assistant message */
 .msg-meta {
   font-size: var(--text-xs);
