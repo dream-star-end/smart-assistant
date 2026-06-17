@@ -28,15 +28,15 @@
 //   - 个人版 (master) 不带 commercial 路由 — /api/me 会 404,balance pill 自动保持隐藏。
 //
 // 模块外部接口(在 main.js 的 init 中调一次):
-//   import { initBilling, refreshBalance } from './billing.js?v=710b7221'
+//   import { initBilling, refreshBalance } from './billing.js?v=3867aeb1'
 //   initBilling()        — 一次性 wire 静态 DOM 事件
 //   refreshBalance()     — 拉一次 /api/me,更新 pill;失败静默(commercial 未启用时)
 //                          返回 Promise<{ shown: boolean, credits: string|null }>
 
-import { apiGet, apiJson } from './api.js?v=710b7221'
-import { _isMobileUA, htmlSafeEscape } from './dom.js?v=710b7221'
-import { closeModal, openModal, toast } from './ui.js?v=710b7221'
-import { state } from './state.js?v=710b7221'
+import { apiGet, apiJson } from './api.js?v=3867aeb1'
+import { _isMobileUA, htmlSafeEscape } from './dom.js?v=3867aeb1'
+import { closeModal, openModal, toast } from './ui.js?v=3867aeb1'
+import { state } from './state.js?v=3867aeb1'
 
 // ── 常量 ───────────────────────────────────────────────────────────
 const POLL_INTERVAL_MS = 3000
