@@ -36,7 +36,7 @@
  *   - 不在 log 里打 raw proxyUrl(可能含密码),只打 host
  */
 
-import { ProxyAgent, type Dispatcher } from "undici";
+import { Agent, ProxyAgent, type Dispatcher } from "undici";
 import { timingSafeEqual, type X509Certificate } from "node:crypto";
 
 import { rootLogger } from "../logging/logger.js";
@@ -106,6 +106,28 @@ type CacheEntry = PlainCacheEntry | MtlsCacheEntry;
 const _cache = new Map<string, CacheEntry>();
 
 const log = rootLogger.child({ subsys: "egressDispatcher" });
+
+/**
+ * 进程级单例「直连出口」dispatcher —— 一个**不带任何代理**的 undici Agent。
+ *
+ * 背景:gateway 启动时 `setGlobalDispatcher(new EnvHttpProxyAgent())` 把全局默认出口设成了
+ * `HTTPS_PROXY`(给 Anthropic 出海用的日本节点)。于是任何**未显式指定 dispatcher** 的 fetch
+ * 都会被全局代理**静默接管**绕日本。对国内/亚洲静态 provider(火山 ark 北京 / deepseek /
+ * minimax)而言这是"海外→日本→中国"双重跨境,长流式易半路断。
+ *
+ * 这些 provider 必须显式挂本 dispatcher 走**真直连**(per-request dispatcher 覆盖全局),绕开
+ * 全局代理。Anthropic OAuth 池仍走 account egress dispatcher(plain/mTLS),二者互不影响。
+ *
+ * 单例:进程内复用(各 origin 独立子池);keep-alive 用 Agent 默认值(与全局 EnvHttpProxyAgent
+ * 底层 Agent 默认一致,SSE 长流式行为对齐)。常驻不进 LRU、不 close。
+ */
+let _directDispatcher: Agent | undefined;
+export function directEgressDispatcher(): Dispatcher {
+  if (_directDispatcher === undefined) {
+    _directDispatcher = new Agent();
+  }
+  return _directDispatcher;
+}
 
 function _plainCacheKey(accountId: bigint | string, proxyUrl: string): string {
   return `${String(accountId)}|plain:${proxyUrl}`;

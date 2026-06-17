@@ -54,7 +54,9 @@ import {
 import {
   getDispatcherForAccount,
   resolveAccountEgressDispatcher,
+  directEgressDispatcher,
 } from "../../account-pool/egressDispatcher.js";
+import { STATIC_PROVIDER_META } from "./staticProviderMeta.js";
 import {
   findRouteProviderForModel,
   type StaticKeyProviderSpec,
@@ -140,7 +142,11 @@ export interface PreparedUpstreamSession {
   readonly pinnedUserId: string | null;
   /** 上游 URL;OAuth = `deps.upstreamEndpoint ?? DEFAULT`;静态 = `spec.upstreamEndpoint` */
   readonly endpoint: string;
-  /** undici dispatcher;OAuth 绑账号 egress IP;静态 = undefined(默认出口) */
+  /**
+   * undici dispatcher。OAuth = 绑账号 egress IP(account egress dispatcher)。
+   * 静态 = 按 STATIC_PROVIDER_META[spec.id].egress:"direct" 挂无代理直连 dispatcher
+   * (绕开 gateway 全局 EnvHttpProxyAgent/日本节点),"proxy" 为 undefined 落全局默认出口。
+   */
   readonly dispatcher: Dispatcher | undefined;
   /** 上游响应是否值得抓 quota(OAuth=true;静态=false) */
   readonly shouldUpdateQuotaFromResponse: boolean;
@@ -296,7 +302,11 @@ type Phase6AccountUuidEnforce = "off" | "fail_open" | "fail_closed";
  * endpoint / strip 规则全部由 @openclaude/protocol 注册表 spec 驱动,新增 provider 零改本函数。
  *
  * 等价保证(与原两工厂逐字节一致):
- *   - accountId/pinnedUserId=null、dispatcher=undefined、shouldUpdateQuota=false(不占 OAuth 池)
+ *   - accountId/pinnedUserId=null、shouldUpdateQuota=false(不占 OAuth 池)
+ *   - dispatcher:按 STATIC_PROVIDER_META[spec.id].egress 决定 —— "direct" 显式挂无代理直连
+ *     dispatcher(绕开 gateway 全局 EnvHttpProxyAgent/日本节点,见 staticProviderMeta.egress 注释),
+ *     "proxy" 仍为 undefined 落全局默认出口。当前 deepseek/minimax/ark 三家均 "direct"。
+ *     (注:这是 2026-06-17 修复"国内模型绕日本→长流式半路断"引入,非原逐字节行为)
  *   - applyUpstreamAuth: Authorization Bearer + strip spec.stripHeaders(永含 anthropic-beta)
  *     + strip spec.stripBodyFields(deepseek:[];minimax:output_config/context_management/service_tier;
  *     ark:context_management/service_tier —— minimax/ark 均**保留 thinking**,glm 与 MiniMax-M3 都是
@@ -311,12 +321,18 @@ function makeStaticKeyUpstream(
   spec: StaticKeyProviderSpec,
   apiKey: string,
 ): PreparedUpstreamSession {
+  // 出口策略(commercial 部署拓扑权威源):国内/亚洲静态 provider 必须显式直连,绕开 gateway
+  // 启动装的全局 EnvHttpProxyAgent(给 Anthropic 出海的日本节点),否则双重跨境长流式易半路断。
+  const dispatcher =
+    STATIC_PROVIDER_META[spec.id].egress === "direct"
+      ? directEgressDispatcher()
+      : undefined;
   return {
     accountId: null,
     slotId: null,
     pinnedUserId: null,
     endpoint: spec.upstreamEndpoint,
-    dispatcher: undefined,
+    dispatcher,
     shouldUpdateQuotaFromResponse: false,
     applyUpstreamAuth(safeHeaders, body, _log) {
       safeHeaders.authorization = `Bearer ${apiKey}`;

@@ -33,6 +33,7 @@ import {
   releaseUpstreamSession,
   type PickUpstreamDeps,
 } from "../http/proxy/upstream.js";
+import { directEgressDispatcher } from "../account-pool/egressDispatcher.js";
 
 // 静态 provider route 构造助手:registry spec → UpstreamRoute。
 const DEEPSEEK_ROUTE = { kind: "static" as const, provider: getStaticProvider("deepseek") };
@@ -214,7 +215,8 @@ describe("pickUpstream — DeepSeek route", () => {
     assert.equal(sched.pickCalls, 0, "DeepSeek 路径绝不调 scheduler.pick");
     assert.equal(session.accountId, null);
     assert.equal(session.pinnedUserId, null);
-    assert.equal(session.dispatcher, undefined);
+    // 国内/亚洲静态 provider 走显式直连 dispatcher,绕开 gateway 全局 EnvHttpProxyAgent(日本节点)。
+    assert.equal(session.dispatcher, directEgressDispatcher());
     assert.equal(session.shouldUpdateQuotaFromResponse, false);
     assert.match(session.endpoint, /deepseek/i);
 
@@ -277,6 +279,8 @@ describe("pickUpstream — MiniMax route", () => {
     const { session } = res;
     assert.equal(sched.pickCalls, 0, "MiniMax 路径绝不调 scheduler.pick");
     assert.equal(session.accountId, null);
+    // 静态 provider 走显式直连 dispatcher,绕开全局日本代理。
+    assert.equal(session.dispatcher, directEgressDispatcher());
     assert.equal(session.shouldUpdateQuotaFromResponse, false);
     assert.ok(session.endpoint.includes("api.minimaxi.com/anthropic/v1/messages"));
 
@@ -322,7 +326,8 @@ describe("pickUpstream — Ark glm-5.1 route", () => {
     assert.equal(sched.pickCalls, 0, "Ark 路径绝不调 scheduler.pick");
     assert.equal(session.accountId, null);
     assert.equal(session.pinnedUserId, null);
-    assert.equal(session.dispatcher, undefined);
+    // 火山 ark 北京端点走显式直连 dispatcher,绕开全局日本代理(否则双重跨境长流式半路断)。
+    assert.equal(session.dispatcher, directEgressDispatcher());
     assert.equal(session.shouldUpdateQuotaFromResponse, false);
     assert.ok(
       session.endpoint.includes("ark.cn-beijing.volces.com/api/coding/v1/messages"),
