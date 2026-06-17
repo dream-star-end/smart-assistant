@@ -2,7 +2,7 @@
   "currentVersion": "v1.0.339",
   "releases": [
     {
-      "version": "PENDING",
+      "version": "v1.0.339",
       "date": "2026-06-17",
       "title": "GLM-5.2 启用完整 1M 上下文窗口",
       "items": [

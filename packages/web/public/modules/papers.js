@@ -1,7 +1,7 @@
 // OpenClaude — chat-native ScanSci PDF helpers
-import { $ } from './dom.js?v=df1d8d4d'
-import { state } from './state.js?v=df1d8d4d'
-import { closeModal, openModal, toast } from './ui.js?v=df1d8d4d'
+import { $ } from './dom.js?v=a0ebd178'
+import { state } from './state.js?v=a0ebd178'
+import { closeModal, openModal, toast } from './ui.js?v=a0ebd178'
 
 function _hasAttachments() {
   return Array.isArray(state.attachments) && state.attachments.length > 0
