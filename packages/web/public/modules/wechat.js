@@ -15,10 +15,10 @@
 // service (api.qrserver.com, etc.) would let third parties hijack the pair
 // handshake, so we never leave the page with that value.
 
-import { apiGet, apiJson } from './api.js?v=27740372'
-import { $, htmlSafeEscape } from './dom.js?v=27740372'
-import { closeModal, confirmDialog, openModal, toast } from './ui.js?v=27740372'
-import { loadUserPrefs, setCachedPrefField } from './userPrefs.js?v=27740372'
+import { apiGet, apiJson } from './api.js?v=df1d8d4d'
+import { $, htmlSafeEscape } from './dom.js?v=df1d8d4d'
+import { closeModal, confirmDialog, openModal, toast } from './ui.js?v=df1d8d4d'
+import { loadUserPrefs, setCachedPrefField } from './userPrefs.js?v=df1d8d4d'
 
 let _pollAbort = null
 let _currentQrcode = null
