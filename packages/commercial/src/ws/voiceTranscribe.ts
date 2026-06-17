@@ -6,6 +6,8 @@ import { WebSocketServer, WebSocket, type RawData } from "ws";
 import { verifyAccess, JwtError, type AccessClaims } from "../auth/jwt.js";
 import type { Logger } from "../logging/logger.js";
 import { DEEPSEEK_UPSTREAM_ENDPOINT } from "../http/proxy/shared.js";
+import { directEgressDispatcher } from "../account-pool/egressDispatcher.js";
+import type { Dispatcher } from "undici";
 
 export const VOICE_WS_PATH = "/ws/voice-transcribe";
 
@@ -423,7 +425,10 @@ async function polishTranscriptStream(input: {
       },
       body: JSON.stringify(body),
       signal: input.signal,
-    });
+      // deepseek 北京端点显式直连,绕开 gateway 全局 EnvHttpProxyAgent(给 Anthropic 出海的日本节点),
+      // 否则被全局代理静默接管 → 海外→日本→中国双重跨境,见 egressDispatcher.directEgressDispatcher。
+      dispatcher: directEgressDispatcher(),
+    } as RequestInit & { dispatcher: Dispatcher });
   } catch {
     return null;
   }
@@ -511,7 +516,9 @@ async function polishTranscriptOnce(input: {
       },
       body: JSON.stringify(body),
       signal: input.signal,
-    });
+      // deepseek 北京端点显式直连,绕开 gateway 全局 EnvHttpProxyAgent(日本),理由同上。
+      dispatcher: directEgressDispatcher(),
+    } as RequestInit & { dispatcher: Dispatcher });
   } catch {
     return { text: transcript, changed: false, confidence: 0, skipped: true };
   }

@@ -10,6 +10,7 @@ import assert from "node:assert/strict";
 import {
   getDispatcherForAccount,
   resolveAccountEgressDispatcher,
+  directEgressDispatcher,
   _clearEgressDispatcherCacheForTest,
   _egressDispatcherCacheSizeForTest,
   EGRESS_DISPATCHER_CACHE_MAX,
@@ -19,6 +20,17 @@ import type { Dispatcher } from "undici";
 
 beforeEach(() => {
   _clearEgressDispatcherCacheForTest();
+});
+
+describe("directEgressDispatcher (静态/国内 provider 直连出口)", () => {
+  test("返回稳定单例,defined,且不进 account egress LRU 缓存", () => {
+    const d1 = directEgressDispatcher();
+    const d2 = directEgressDispatcher();
+    assert.ok(d1, "must return a defined dispatcher (绕开全局 EnvHttpProxyAgent/日本)");
+    assert.strictEqual(d1, d2, "进程级单例:多次调用返同一实例");
+    // 直连出口与账号专属 egress dispatcher 隔离,绝不进 LRU cache。
+    assert.equal(_egressDispatcherCacheSizeForTest(), 0);
+  });
 });
 
 describe("egressDispatcher (plain proxy)", () => {

@@ -2,7 +2,10 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import type { Pool } from "pg";
 import { z } from "zod";
 
+import type { Dispatcher } from "undici";
+
 import { rootLogger, type Logger } from "../logging/logger.js";
+import { directEgressDispatcher } from "../account-pool/egressDispatcher.js";
 import {
   REQUEST_ID_HEADER,
   ensureRequestId,
@@ -171,7 +174,9 @@ async function postJson(fetchFn: typeof fetch, token: string, path: string, body
     },
     body: JSON.stringify(body),
     signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS),
-  });
+    // minimax 新加坡端点显式直连,绕开 gateway 全局 EnvHttpProxyAgent(给 Anthropic 出海的日本节点)。
+    dispatcher: directEgressDispatcher(),
+  } as RequestInit & { dispatcher: Dispatcher });
   const json = await readUpstreamJson(res);
   if (!res.ok || !baseRespOk(json)) {
     throw new HttpError(502, "MINIMAX_UPSTREAM_ERROR", baseRespMessage(json));
@@ -186,7 +191,9 @@ async function getJson(fetchFn: typeof fetch, token: string, path: string, param
     method: "GET",
     headers: { authorization: `Bearer ${token}`, accept: "application/json" },
     signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS),
-  });
+    // minimax 端点显式直连,绕开全局日本代理(理由同 postJson)。
+    dispatcher: directEgressDispatcher(),
+  } as RequestInit & { dispatcher: Dispatcher });
   const json = await readUpstreamJson(res);
   if (!res.ok || !baseRespOk(json)) {
     throw new HttpError(502, "MINIMAX_UPSTREAM_ERROR", baseRespMessage(json));
@@ -237,7 +244,12 @@ export const __internal_minimaxDownloadUrl = { ensureAllowedDownloadUrl };
 
 async function downloadFile(fetchFn: typeof fetch, rawUrl: string): Promise<{ base64: string; contentType: string; bytes: number }> {
   const url = ensureAllowedDownloadUrl(rawUrl);
-  const res = await fetchFn(url, { method: "GET", signal: AbortSignal.timeout(DOWNLOAD_TIMEOUT_MS) });
+  const res = await fetchFn(url, {
+    method: "GET",
+    signal: AbortSignal.timeout(DOWNLOAD_TIMEOUT_MS),
+    // minimax 媒体下载 URL(allowlist 限 minimax 媒体域:minimaxi/minimax.chat/.io/hailuoai/OSS)显式直连,绕开全局日本代理。
+    dispatcher: directEgressDispatcher(),
+  } as RequestInit & { dispatcher: Dispatcher });
   if (!res.ok || !res.body) {
     throw new HttpError(502, "MINIMAX_DOWNLOAD_FAILED", "failed to download minimax file");
   }

@@ -19,8 +19,9 @@
  * 视为缺 capability。
  */
 
-import { Agent } from 'undici'
+import type { Dispatcher } from 'undici'
 import type { V3ContainerStatus } from '../agent-sandbox/v3supervisor.js'
+import { directEgressDispatcher } from '../account-pool/egressDispatcher.js'
 
 const CACHE_TTL_MS = 60_000
 // 单次 healthz 探活超时。同时用作 connect / head read / body read 三段 budget
@@ -39,7 +40,8 @@ const HEALTHZ_TIMEOUT_MS = 5_000
 // through that residential proxy; EnvHttpProxyAgent/NO_PROXY CIDR handling is not
 // reliable enough for this path and caused `/api/media-signed` downloads to fail
 // with CONTAINER_OUTDATED even while the container's /healthz was healthy.
-const directHealthzDispatcher = new Agent()
+// 单一权威:复用 egressDispatcher.directEgressDispatcher()(进程级无代理 Agent 单例),不再
+// 各处 new Agent() 造平行的"直连出口",避免权威源分裂(国内 provider / bridge-local 同源)。
 
 interface CacheEntry {
   caps: Set<string>
@@ -83,8 +85,8 @@ async function defaultFetchHealthz(
   const res = await fetch(`http://${boundIp}:${port}/healthz`, {
     method: 'GET',
     signal: AbortSignal.timeout(timeoutMs),
-    dispatcher: directHealthzDispatcher,
-  } as RequestInit & { dispatcher: Agent })
+    dispatcher: directEgressDispatcher(),
+  } as RequestInit & { dispatcher: Dispatcher })
   if (!res.ok) throw new Error(`/healthz status=${res.status}`)
   return (await res.json()) as HealthzResponse
 }
