@@ -1,8 +1,8 @@
 {
-  "currentVersion": "v1.0.347",
+  "currentVersion": "v1.0.348",
   "releases": [
     {
-      "version": "PENDING",
+      "version": "v1.0.348",
       "title": "响应底部显示「请求ID」+ 单条回复一键反馈",
       "items": [
         "回复底部不再显示 token 用量统计，改为显示「请求ID」：点击即可复制，遇到问题反馈时附上它，我们能快速定位到对应日志、更快排查",
