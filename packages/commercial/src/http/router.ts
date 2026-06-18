@@ -16,115 +16,20 @@
  */
 
 import type { IncomingMessage, ServerResponse } from 'node:http'
-import {
-  HttpError,
-  REQUEST_ID_HEADER,
-  ensureRequestId,
-  sendError,
-  setSecurityHeaders,
-  clientIpOf,
-  userAgentOf,
-} from './util.js'
-import {
-  handleRegister,
-  handleLogin,
-  handleRefresh,
-  handleLogout,
-  handleVerifyEmail,
-  handleResendVerification,
-  handleCheckVerification,
-  handleRequestPasswordReset,
-  handleConfirmPasswordReset,
-  handleMe,
-  handleListPublicModels,
-  handleGetPublicConfig,
-  handleGetMyPreferences,
-  handlePatchMyPreferences,
-  handleGetMyUsage,
-  handleCreateSession,
-  handleClearSession,
-  handleMediaSign,
-  handleMediaSigned,
-  handleSubmitFeedback,
-  handleListMyInbox,
-  handleCountMyInboxUnread,
-  handleMarkInboxRead,
-  handleReadAllInbox,
-  type CommercialHttpDeps,
-  type RequestContext,
-} from './handlers.js'
-import { handleClientErrorReport } from './clientErrors.js'
-import { containerFileProxy } from './containerFileProxy.js'
-import { containerApiProxy, matchContainerApiProxyRoute } from './containerApiProxy.js'
-import { ContainerUnreadyError } from '../ws/userChatBridge.js'
-import { getBearerToken, getSessionCookieToken } from './authHelpers.js'
-import { defaultTunnelFetchHealthz } from './tunnelHealthzProbe.js'
-import { getHostById as computePoolGetHostById } from '../compute-pool/queries.js'
+// V3 S12e CG9 — contract D (deploy smoke) trace-id child binding on HTTP
+// request logger. master HTTP segment is the ONLY commercial path that reads
+// X-Trace-Id here (WS bridge has its own X-Connection-Trace-Id flow).
+import { newTraceId, parseTraceIdCandidate } from '@openclaude/protocol'
+import { writeAdminAudit } from '../admin/audit.js'
+import { incrGatewayRequest } from '../admin/metrics.js'
+import { requireAdminVerifyDb } from '../admin/requireAdmin.js'
+import { verifyCommercialJwtSync } from '../auth/jwtSync.js'
 import { dialTunnelSocket as defaultTunnelDial } from '../compute-pool/nodeAgentClient.js'
-import { handleLinuxdoStart, handleLinuxdoCallback } from './oauthLinuxdo.js'
-import { handleGithubStart, handleGithubCallback } from './oauthGithub.js'
-// V3 CC 外接 plan Phase 4(2026-05-18):用户自管 CC API key 的管理面 endpoints。
-import {
-  handleListMyApiKeys,
-  handleCreateMyApiKey,
-  handleRevokeMyApiKey,
-} from './apiKeyAdmin.js'
-import {
-  handleGetMyGithub,
-  handleDeleteMyGithub,
-  handleListMyGithubRepos,
-  handleListMyGithubBranches,
-  handleGetSessionGithubSelection,
-  handlePutSessionGithubSelection,
-  handleDeleteSessionGithubSelection,
-} from './githubApi.js'
-import { handleWechatLivePage, handleWechatLiveSnapshot } from './wechatLive.js'
-import { requireUserVerifyDb } from './requireUser.js'
-import { handleListPlans, handleCreateHupi, handleHupiCallback, handleGetOrder } from './payment.js'
-import { handleAgentOpen, handleAgentStatus, handleAgentCancel } from './agent.js'
-import {
-  handleListRemoteHosts,
-  handleCreateRemoteHost,
-  handleGetRemoteHost,
-  handlePatchRemoteHost,
-  handleDeleteRemoteHost,
-  handleRemoteHostAction,
-} from './remoteHosts.js'
-import { handleAdminAgentAudit } from './adminAudit.js'
-// S3 §6.2 终局:admin handler 直接从各拆分文件 import,admin.ts barrel 已删。
-import {
-  handleAdminListUsers,
-  handleAdminUsersStats,
-  handleAdminGetUser,
-  handleAdminPatchUser,
-  handleAdminAdjustCredits,
-} from './admin/users.js'
-import { handleAdminListAudit } from './admin/audit.js'
-import {
-  handleAdminListPricing,
-  handleAdminPatchPricing,
-} from './admin/pricing.js'
-import {
-  handleAdminGetLiterature,
-  handleAdminPatchLiterature,
-  handleAdminTestLiterature,
-} from './admin/literature.js'
-import {
-  handleAdminListPlans,
-  handleAdminPatchPlan,
-} from './admin/plans.js'
-import {
-  handleAdminListAccounts,
-  handleAdminAccountsStats,
-  handleAdminListRefreshEvents,
-  handleAdminGetAccount,
-  handleAdminCreateAccount,
-  handleAdminPatchAccount,
-  handleAdminDeleteAccount,
-  handleAdminResetAccountCooldown,
-  handleAdminOAuthStart,
-  handleAdminOAuthExchange,
-} from './admin/accounts.js'
+import { getHostById as computePoolGetHostById } from '../compute-pool/queries.js'
+import { getPool } from '../db/index.js'
+import { type Logger, rootLogger } from '../logging/logger.js'
+import { isActiveAdmin, isInMaintenance } from '../middleware/maintenanceMode.js'
+import { ContainerUnreadyError } from '../ws/userChatBridge.js'
 import {
   handleAdminCreateAccountGroup,
   handleAdminCreateRelayCredential,
@@ -137,97 +42,175 @@ import {
   handleAdminPutAccountGroupModels,
 } from './admin/accountGroups.js'
 import {
-  handleAdminListEgressProxies,
-  handleAdminGetEgressProxy,
+  handleAdminAccountsStats,
+  handleAdminCreateAccount,
+  handleAdminDeleteAccount,
+  handleAdminGetAccount,
+  handleAdminListAccounts,
+  handleAdminListRefreshEvents,
+  handleAdminOAuthExchange,
+  handleAdminOAuthStart,
+  handleAdminPatchAccount,
+  handleAdminResetAccountCooldown,
+} from './admin/accounts.js'
+import { handleAdminListAudit } from './admin/audit.js'
+import {
+  handleAdminAgentContainerAction,
+  handleAdminContainerLogs,
+  handleAdminContainersStats,
+  handleAdminListAgentContainers,
+} from './admin/containers.js'
+import {
   handleAdminCreateEgressProxy,
-  handleAdminPatchEgressProxy,
   handleAdminDeleteEgressProxy,
+  handleAdminGetEgressProxy,
+  handleAdminListEgressProxies,
+  handleAdminPatchEgressProxy,
 } from './admin/egressProxies.js'
 import {
-  handleAdminListAgentContainers,
-  handleAdminContainersStats,
-  handleAdminContainerLogs,
-  handleAdminAgentContainerAction,
-} from './admin/containers.js'
-import { handleAdminListLedger } from './admin/ledger.js'
-import {
   handleAdminExportLedgerCsv,
-  handleAdminExportUsersCsv,
   handleAdminExportOrdersCsv,
+  handleAdminExportUsersCsv,
 } from './admin/export.js'
-import { handleAdminMetrics } from './admin/metrics.js'
+import { handleAdminAckFeedback, handleAdminListFeedback } from './admin/feedback.js'
 import {
-  handleAdminListSettings,
-  handleAdminGetSetting,
-  handleAdminPutSetting,
-} from './admin/settings.js'
-import {
-  handleAdminListOrders,
-  handleAdminOrdersKpi,
-  handleAdminGetOrder,
-} from './admin/orders.js'
-import {
-  handleAdminListFeedback,
-  handleAdminAckFeedback,
-} from './admin/feedback.js'
-import {
-  handleAdminListInbox,
   handleAdminCreateInbox,
   handleAdminDeleteInbox,
   handleAdminGetInboxEmailConfig,
+  handleAdminListInbox,
 } from './admin/inbox.js'
-import { handleAdminGetSession } from './admin/sessions.js'
+import { handleAdminListLedger } from './admin/ledger.js'
+import {
+  handleAdminGetLiterature,
+  handleAdminPatchLiterature,
+  handleAdminTestLiterature,
+} from './admin/literature.js'
+import { handleAdminMetrics } from './admin/metrics.js'
 import { handleAdminRemoveUserModelGrant } from './admin/modelGrants.js'
+import { handleAdminGetOrder, handleAdminListOrders, handleAdminOrdersKpi } from './admin/orders.js'
+import { handleAdminListPlans, handleAdminPatchPlan } from './admin/plans.js'
+import { handleAdminListPricing, handleAdminPatchPricing } from './admin/pricing.js'
+import { handleAdminGetSession } from './admin/sessions.js'
 import {
-  handleAdminStatsDau,
-  handleAdminStatsRevenueByDay,
-  handleAdminStatsSignupsByDay,
-  handleAdminStatsFunnel,
-  handleAdminStatsRequestSeries,
-  handleAdminStatsAlertsSummary,
-  handleAdminStatsAccountPool,
-  handleAdminStatsHostsUtilization,
-  handleAdminStatsAlertEvents7d,
-  handleAdminStatsLifetime,
-  handleAdminDiagnostics,
-} from './adminStats.js'
+  handleAdminGetSetting,
+  handleAdminListSettings,
+  handleAdminPutSetting,
+} from './admin/settings.js'
+// S3 §6.2 终局:admin handler 直接从各拆分文件 import,admin.ts barrel 已删。
 import {
-  handleAdminListComputeHosts,
-  handleAdminAddComputeHost,
-  handleAdminComputeHostGetSubresource,
-  handleAdminComputeHostAction,
-  handleAdminBaselineVersion,
-  handleAdminDistributeImageToAllHosts,
-} from './adminComputeHosts.js'
+  handleAdminAdjustCredits,
+  handleAdminGetUser,
+  handleAdminListUsers,
+  handleAdminPatchUser,
+  handleAdminUsersStats,
+} from './admin/users.js'
 import {
-  handleAdminAlertsListEvents,
-  handleAdminAlertsListChannels,
-  handleAdminAlertsIlinkQrcode,
-  handleAdminAlertsIlinkPoll,
-  handleAdminAlertsPatchChannel,
-  handleAdminAlertsDeleteChannel,
-  handleAdminAlertsTestChannel,
-  handleAdminAlertsCreateTelegramChannel,
-  handleAdminAlertsListOutbox,
-  handleAdminAlertsListSilences,
-  handleAdminAlertsCreateSilence,
-  handleAdminAlertsDeleteSilence,
-  handleAdminAlertsListRuleStates,
-  handleAdminAlertsRetryOutbox,
   handleAdminAlertsAckRule,
+  handleAdminAlertsCreateSilence,
+  handleAdminAlertsCreateTelegramChannel,
+  handleAdminAlertsDeleteChannel,
+  handleAdminAlertsDeleteSilence,
+  handleAdminAlertsIlinkPoll,
+  handleAdminAlertsIlinkQrcode,
+  handleAdminAlertsListChannels,
+  handleAdminAlertsListEvents,
+  handleAdminAlertsListOutbox,
+  handleAdminAlertsListRuleStates,
+  handleAdminAlertsListSilences,
+  handleAdminAlertsPatchChannel,
+  handleAdminAlertsRetryOutbox,
+  handleAdminAlertsTestChannel,
   handleListEventCoverage,
 } from './adminAlerts.js'
-import { incrGatewayRequest } from '../admin/metrics.js'
-import { rootLogger, type Logger } from '../logging/logger.js'
-import { verifyCommercialJwtSync } from '../auth/jwtSync.js'
-import { requireAdminVerifyDb } from '../admin/requireAdmin.js'
-import { writeAdminAudit } from '../admin/audit.js'
-import { getPool } from '../db/index.js'
-import { isInMaintenance, isActiveAdmin } from '../middleware/maintenanceMode.js'
-// V3 S12e CG9 — contract D (deploy smoke) trace-id child binding on HTTP
-// request logger. master HTTP segment is the ONLY commercial path that reads
-// X-Trace-Id here (WS bridge has its own X-Connection-Trace-Id flow).
-import { parseTraceIdCandidate, newTraceId } from '@openclaude/protocol'
+import { handleAdminAgentAudit } from './adminAudit.js'
+import {
+  handleAdminAddComputeHost,
+  handleAdminBaselineVersion,
+  handleAdminComputeHostAction,
+  handleAdminComputeHostGetSubresource,
+  handleAdminDistributeImageToAllHosts,
+  handleAdminListComputeHosts,
+} from './adminComputeHosts.js'
+import {
+  handleAdminDiagnostics,
+  handleAdminStatsAccountPool,
+  handleAdminStatsAlertEvents7d,
+  handleAdminStatsAlertsSummary,
+  handleAdminStatsDau,
+  handleAdminStatsFunnel,
+  handleAdminStatsHostsUtilization,
+  handleAdminStatsLifetime,
+  handleAdminStatsRequestSeries,
+  handleAdminStatsRevenueByDay,
+  handleAdminStatsSignupsByDay,
+} from './adminStats.js'
+import { handleAgentCancel, handleAgentOpen, handleAgentStatus } from './agent.js'
+// V3 CC 外接 plan Phase 4(2026-05-18):用户自管 CC API key 的管理面 endpoints。
+import { handleCreateMyApiKey, handleListMyApiKeys, handleRevokeMyApiKey } from './apiKeyAdmin.js'
+import { getBearerToken, getSessionCookieToken } from './authHelpers.js'
+import { handleClientErrorReport } from './clientErrors.js'
+import { containerApiProxy, matchContainerApiProxyRoute } from './containerApiProxy.js'
+import { containerFileProxy } from './containerFileProxy.js'
+import {
+  handleDeleteMyGithub,
+  handleDeleteSessionGithubSelection,
+  handleGetMyGithub,
+  handleGetSessionGithubSelection,
+  handleListMyGithubBranches,
+  handleListMyGithubRepos,
+  handlePutSessionGithubSelection,
+} from './githubApi.js'
+import {
+  type CommercialHttpDeps,
+  type RequestContext,
+  handleCheckVerification,
+  handleClearSession,
+  handleConfirmPasswordReset,
+  handleCountMyInboxUnread,
+  handleCreateSession,
+  handleGetMyPreferences,
+  handleGetMyUsage,
+  handleGetPublicConfig,
+  handleListMyInbox,
+  handleListPublicModels,
+  handleLogin,
+  handleLogout,
+  handleMarkInboxRead,
+  handleMe,
+  handleMediaSign,
+  handleMediaSigned,
+  handlePatchMyPreferences,
+  handleReadAllInbox,
+  handleRefresh,
+  handleRegister,
+  handleRequestPasswordReset,
+  handleResendVerification,
+  handleSubmitFeedback,
+  handleVerifyEmail,
+} from './handlers.js'
+import { handleGithubCallback, handleGithubStart } from './oauthGithub.js'
+import { handleLinuxdoCallback, handleLinuxdoStart } from './oauthLinuxdo.js'
+import { handleCreateHupi, handleGetOrder, handleHupiCallback, handleListPlans } from './payment.js'
+import {
+  handleCreateRemoteHost,
+  handleDeleteRemoteHost,
+  handleGetRemoteHost,
+  handleListRemoteHosts,
+  handlePatchRemoteHost,
+  handleRemoteHostAction,
+} from './remoteHosts.js'
+import { requireUserVerifyDb } from './requireUser.js'
+import { defaultTunnelFetchHealthz } from './tunnelHealthzProbe.js'
+import {
+  HttpError,
+  REQUEST_ID_HEADER,
+  clientIpOf,
+  ensureRequestId,
+  sendError,
+  setSecurityHeaders,
+  userAgentOf,
+} from './util.js'
+import { handleWechatLivePage, handleWechatLiveSnapshot } from './wechatLive.js'
 
 /**
  * **P0 — v3 multi-tenant leak firewall** (2026-04-22)
@@ -322,6 +305,11 @@ const BLOCKED_FOR_USER_RULES: readonly BlockedForUserRule[] = [
   { re: /^\/api\/agents\/[^/]+\/skills(\/[A-Za-z0-9_\-]+)?$/, label: '/api/agents/:id/skills' },
   // 用户级共享技能库(host singleton 存储);付费用户只能经 container proxy 操作自己容器
   { re: /^\/api\/skills(\/[A-Za-z0-9_\-]+)?$/, label: '/api/skills' },
+  // SkillOpt 训练(/api/skills/:name/train + /api/skill-training/*):同样落 host singleton
+  // 存储 + 起 host 主 agent 会话 = RCE/越权,付费用户必须经 container proxy(见 bridge
+  // allowlist)。这里 block host 兜底,防 proxy 关闭/admin 绕过时落到 master host。
+  { re: /^\/api\/skills\/[A-Za-z0-9_\-]+\/train$/, label: '/api/skills/:name/train' },
+  { re: /^\/api\/skill-training\/.+$/, label: '/api/skill-training/*' },
   // Agent teams 也写 host singleton agents.yaml；付费用户只能通过 container proxy
   // 操作自己容器内的 teams，不能落到 master host。
   { re: /^\/api\/agent-teams$/, label: '/api/agent-teams' },
@@ -583,7 +571,11 @@ export function createCommercialHandler(
     // R3:exact path 在 pathPrefix 之前精确命中(matchRoute exact-first)
     { method: 'GET', path: '/api/admin/accounts/stats', handler: handleAdminAccountsStats },
     // M6/P1-9 — refresh 历史 exact path,必须排在 pathPrefix 之前
-    { method: 'GET', path: '/api/admin/accounts/refresh-events', handler: handleAdminListRefreshEvents },
+    {
+      method: 'GET',
+      path: '/api/admin/accounts/refresh-events',
+      handler: handleAdminListRefreshEvents,
+    },
     // OAuth 引导:exact path 必须排在 prefix 之前(prefix 才能 fall through)
     { method: 'POST', path: '/api/admin/accounts/oauth/start', handler: handleAdminOAuthStart },
     {
@@ -606,20 +598,56 @@ export function createCommercialHandler(
     { method: 'GET', path: '/api/admin/account-groups', handler: handleAdminListAccountGroups },
     { method: 'POST', path: '/api/admin/account-groups', handler: handleAdminCreateAccountGroup },
     // credential 子资源必须排在通用 group prefix 前,否则被 /:id 解析吞掉。
-    { method: 'PATCH', pathPrefix: '/api/admin/account-groups/relay-credentials/', handler: handleAdminPatchRelayCredential },
-    { method: 'DELETE', pathPrefix: '/api/admin/account-groups/relay-credentials/', handler: handleAdminDeleteRelayCredential },
-    { method: 'PUT', pathPrefix: '/api/admin/account-groups/', handler: handleAdminPutAccountGroupModels },
-    { method: 'POST', pathPrefix: '/api/admin/account-groups/', handler: handleAdminCreateRelayCredential },
-    { method: 'GET', pathPrefix: '/api/admin/account-groups/', handler: handleAdminGetAccountGroup },
-    { method: 'PATCH', pathPrefix: '/api/admin/account-groups/', handler: handleAdminPatchAccountGroup },
-    { method: 'DELETE', pathPrefix: '/api/admin/account-groups/', handler: handleAdminDeleteAccountGroup },
+    {
+      method: 'PATCH',
+      pathPrefix: '/api/admin/account-groups/relay-credentials/',
+      handler: handleAdminPatchRelayCredential,
+    },
+    {
+      method: 'DELETE',
+      pathPrefix: '/api/admin/account-groups/relay-credentials/',
+      handler: handleAdminDeleteRelayCredential,
+    },
+    {
+      method: 'PUT',
+      pathPrefix: '/api/admin/account-groups/',
+      handler: handleAdminPutAccountGroupModels,
+    },
+    {
+      method: 'POST',
+      pathPrefix: '/api/admin/account-groups/',
+      handler: handleAdminCreateRelayCredential,
+    },
+    {
+      method: 'GET',
+      pathPrefix: '/api/admin/account-groups/',
+      handler: handleAdminGetAccountGroup,
+    },
+    {
+      method: 'PATCH',
+      pathPrefix: '/api/admin/account-groups/',
+      handler: handleAdminPatchAccountGroup,
+    },
+    {
+      method: 'DELETE',
+      pathPrefix: '/api/admin/account-groups/',
+      handler: handleAdminDeleteAccountGroup,
+    },
     // V3 — Egress Proxy Pool(决策 P/Q/R)
     // exact path 在 prefix 之前命中(matchRoute exact-first)
     { method: 'GET', path: '/api/admin/egress-proxies', handler: handleAdminListEgressProxies },
     { method: 'POST', path: '/api/admin/egress-proxies', handler: handleAdminCreateEgressProxy },
     { method: 'GET', pathPrefix: '/api/admin/egress-proxies/', handler: handleAdminGetEgressProxy },
-    { method: 'PATCH', pathPrefix: '/api/admin/egress-proxies/', handler: handleAdminPatchEgressProxy },
-    { method: 'DELETE', pathPrefix: '/api/admin/egress-proxies/', handler: handleAdminDeleteEgressProxy },
+    {
+      method: 'PATCH',
+      pathPrefix: '/api/admin/egress-proxies/',
+      handler: handleAdminPatchEgressProxy,
+    },
+    {
+      method: 'DELETE',
+      pathPrefix: '/api/admin/egress-proxies/',
+      handler: handleAdminDeleteEgressProxy,
+    },
     // T-60 超管 Agent 容器
     { method: 'GET', path: '/api/admin/agent-containers', handler: handleAdminListAgentContainers },
     // R4:exact path 在 pathPrefix 之前(matchRoute exact-first)
@@ -770,7 +798,11 @@ export function createCommercialHandler(
     { method: 'GET', path: '/api/admin/v3/baseline-version', handler: handleAdminBaselineVersion },
     // V3: 把 OC_RUNTIME_IMAGE 推到所有 ready remote host(同步等返回 per-host result)
     // 单 host 路径在 prefix POST handler 里(action=distribute-image)
-    { method: 'POST', path: '/api/admin/v3/distribute-image', handler: handleAdminDistributeImageToAllHosts },
+    {
+      method: 'POST',
+      path: '/api/admin/v3/distribute-image',
+      handler: handleAdminDistributeImageToAllHosts,
+    },
     {
       method: 'GET',
       pathPrefix: '/api/admin/v3/compute-hosts/',
@@ -813,7 +845,11 @@ export function createCommercialHandler(
     { method: 'GET', pathPrefix: '/api/me/github/repos/', handler: handleListMyGithubBranches },
     { method: 'GET', pathPrefix: '/api/me/sessions/', handler: handleGetSessionGithubSelection },
     { method: 'PUT', pathPrefix: '/api/me/sessions/', handler: handlePutSessionGithubSelection },
-    { method: 'DELETE', pathPrefix: '/api/me/sessions/', handler: handleDeleteSessionGithubSelection },
+    {
+      method: 'DELETE',
+      pathPrefix: '/api/me/sessions/',
+      handler: handleDeleteSessionGithubSelection,
+    },
     { method: 'GET', path: '/api/me/messages', handler: handleListMyInbox },
     { method: 'GET', path: '/api/me/messages/unread_count', handler: handleCountMyInboxUnread },
     { method: 'POST', path: '/api/me/messages/read_all', handler: handleReadAllInbox },
@@ -828,7 +864,11 @@ export function createCommercialHandler(
     //                                              注:GET /api/admin/messages/email-config 走
     //                                              path 完全匹配,不是 prefix,所以独立项即可.
     { method: 'GET', path: '/api/admin/messages', handler: handleAdminListInbox },
-    { method: 'GET', path: '/api/admin/messages/email-config', handler: handleAdminGetInboxEmailConfig },
+    {
+      method: 'GET',
+      path: '/api/admin/messages/email-config',
+      handler: handleAdminGetInboxEmailConfig,
+    },
     { method: 'POST', path: '/api/admin/messages', handler: handleAdminCreateInbox },
     { method: 'DELETE', pathPrefix: '/api/admin/messages/', handler: handleAdminDeleteInbox },
 
@@ -1081,7 +1121,10 @@ export function createCommercialHandler(
           handleError(err, res, requestId, apiProxyLog)
         }
         incrGatewayRequest('__container_api_proxy__', method, res.statusCode)
-        apiProxyLog.info('http_request', { status: res.statusCode, durationMs: Date.now() - startedAt })
+        apiProxyLog.info('http_request', {
+          status: res.statusCode,
+          durationMs: Date.now() - startedAt,
+        })
         return true
       }
       // fall through to BLOCKED_FOR_USER_RULES for admin/no-token cases
@@ -1310,9 +1353,7 @@ export function createCommercialHandler(
     // newTraceId() so reqLog ALWAYS has a traceId binding — that's what
     // verify_trace_propagation in smoke-v3.sh greps for. Plan §510 spec.
     const rawTrace = req.headers['x-trace-id']
-    const traceCand = parseTraceIdCandidate(
-      Array.isArray(rawTrace) ? rawTrace[0] : rawTrace,
-    )
+    const traceCand = parseTraceIdCandidate(Array.isArray(rawTrace) ? rawTrace[0] : rawTrace)
     const traceId = traceCand.ok ? traceCand.traceId : newTraceId()
     const reqLog: Logger = httpLogger.child({
       requestId,
