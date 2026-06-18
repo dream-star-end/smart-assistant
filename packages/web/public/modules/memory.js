@@ -4,7 +4,7 @@ import { $, htmlSafeEscape } from './dom.js?v=6cf1729b'
 import { getSession, state } from './state.js?v=6cf1729b'
 import { confirmDialog, openModal, toast, toastOptsFromError } from './ui.js?v=6cf1729b'
 import { _cronHuman } from './util.js?v=6cf1729b'
-import { openSkillTrainPanel } from './skillTrainPanel.js?v=6cf1729b'
+import { openSkillTrainPanel } from './skillTrainPanel.js?v=auto'
 
 const MEMORY_DELIMITER = '\n§\n'
 const CONTEXT_TABS = ['memory', 'skills', 'tasks']
