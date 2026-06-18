@@ -28,7 +28,12 @@ import { type Dirent, existsSync, realpathSync } from 'node:fs'
 import { lstat, mkdir, readFile, readdir, realpath, rename, rm, writeFile } from 'node:fs/promises'
 import { isAbsolute, join, resolve, sep } from 'node:path'
 import { paths } from './paths.js'
-import { type SkillFrontmatter, formatFrontmatter, parseFrontmatter, validateSkillName } from './skillStore.js'
+import {
+  type SkillFrontmatter,
+  formatFrontmatter,
+  parseFrontmatter,
+  validateSkillName,
+} from './skillStore.js'
 
 const VALID_RUN_ID_RE = /^[a-zA-Z0-9_-]{1,128}$/
 

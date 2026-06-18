@@ -60,7 +60,9 @@ describe('SkillTrainJobStore concurrency guard', () => {
 describe('SkillTrainJobStore.applyEvent', () => {
   it('advances phase monotonically, counts proposals, flips queued→running', async () => {
     const changes: string[] = []
-    const store = new SkillTrainJobStore({ onChange: (r) => changes.push(`${r.status}:${r.phase}`) })
+    const store = new SkillTrainJobStore({
+      onChange: (r) => changes.push(`${r.status}:${r.phase}`),
+    })
     await freshRun(store, 'r1')
     await store.applyEvent('r1', tool('skill_list'), T0 + 1)
     assert.equal(store.get('r1')?.status, 'running')

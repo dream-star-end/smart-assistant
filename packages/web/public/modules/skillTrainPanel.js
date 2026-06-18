@@ -98,7 +98,9 @@ function _renderIdle() {
     <div class="skt-actions">
       <button type="button" class="skt-btn skt-btn-primary skt-start">开始训练</button>
     </div>`
-  _body().querySelector('.skt-start').addEventListener('click', () => _start())
+  _body()
+    .querySelector('.skt-start')
+    .addEventListener('click', () => _start())
 }
 
 async function _start() {
@@ -109,7 +111,9 @@ async function _start() {
     startBtn.textContent = '启动中…'
   }
   try {
-    const r = await apiJson('POST', `/api/skills/${encodeURIComponent(_skillName)}/train`, { focus })
+    const r = await apiJson('POST', `/api/skills/${encodeURIComponent(_skillName)}/train`, {
+      focus,
+    })
     _runId = r.runId
     _renderProgress({ status: 'queued', phase: 'queued', proposalCount: 0, toolCalls: 0 })
     _startPoll()
@@ -160,7 +164,9 @@ function _renderProgress(run) {
 function _renderTerminal(html) {
   _body().innerHTML = `<div class="skt-terminal">${html}</div>
     <div class="skt-actions"><button type="button" class="skt-btn skt-again">重新训练</button></div>`
-  _body().querySelector('.skt-again').addEventListener('click', () => _renderIdle())
+  _body()
+    .querySelector('.skt-again')
+    .addEventListener('click', () => _renderIdle())
 }
 
 async function _renderDiffReady(run) {
@@ -178,8 +184,12 @@ async function _renderDiffReady(run) {
       </div>
     </div>
     <div class="skt-drafts"></div>`
-  _body().querySelector('.skt-merge-all').addEventListener('click', () => _merge())
-  _body().querySelector('.skt-discard').addEventListener('click', () => _discard())
+  _body()
+    .querySelector('.skt-merge-all')
+    .addEventListener('click', () => _merge())
+  _body()
+    .querySelector('.skt-discard')
+    .addEventListener('click', () => _discard())
   const host = _body().querySelector('.skt-drafts')
   for (const d of drafts) {
     host.appendChild(await _renderDraftCard(d))
@@ -314,7 +324,11 @@ async function _comment(name, comment) {
 
 async function _merge(name) {
   try {
-    const r = await apiJson('POST', `/api/skill-training/${encodeURIComponent(_runId)}/merge`, name ? { name } : {})
+    const r = await apiJson(
+      'POST',
+      `/api/skill-training/${encodeURIComponent(_runId)}/merge`,
+      name ? { name } : {},
+    )
     const failed = (r.results || []).filter((x) => !x.ok)
     if (failed.length) {
       toast(`部分合入失败:${failed.map((f) => `${f.name}(${f.error})`).join(', ')}`, 'error')

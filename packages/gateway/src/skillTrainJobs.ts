@@ -11,9 +11,9 @@
 // Phases are derived DETERMINISTICALLY from the agent's observable tool calls (which
 // tool it just invoked → which phase), never from the model self-reporting progress.
 
+import { randomUUID } from 'node:crypto'
 import { existsSync } from 'node:fs'
 import { mkdir, readFile, readdir, rename, rm, writeFile } from 'node:fs/promises'
-import { randomUUID } from 'node:crypto'
 import { join } from 'node:path'
 import { paths } from '@openclaude/storage'
 import type { SessionStreamEvent } from './ccbMessageParser.js'
@@ -201,7 +201,11 @@ export class SkillTrainJobStore {
       if (ev.block.toolName === 'skill_propose') {
         run.proposalCount++
       }
-    } else if (ev.kind === 'block' && ev.block.kind === 'text' && typeof ev.block.text === 'string') {
+    } else if (
+      ev.kind === 'block' &&
+      ev.block.kind === 'text' &&
+      typeof ev.block.text === 'string'
+    ) {
       // Keep the latest non-empty text as a rolling summary (truncated).
       const t = ev.block.text.trim()
       if (t) {
