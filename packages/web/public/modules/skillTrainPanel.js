@@ -8,9 +8,9 @@
 // Backend (gateway): POST /api/skills/:name/train, GET/DELETE /api/skill-training/:id,
 // GET .../drafts, GET/PUT .../drafts/:name, POST .../drafts/:name/comment, POST .../merge.
 
-import { apiGet, apiJson } from './api.js?v=aa9597a4'
-import { htmlSafeEscape } from './dom.js?v=aa9597a4'
-import { toast } from './ui.js?v=aa9597a4'
+import { apiGet, apiJson } from './api.js?v=c9d2ed11'
+import { htmlSafeEscape } from './dom.js?v=c9d2ed11'
+import { toast } from './ui.js?v=c9d2ed11'
 
 const PHASE_LABEL = {
   queued: '排队中',
