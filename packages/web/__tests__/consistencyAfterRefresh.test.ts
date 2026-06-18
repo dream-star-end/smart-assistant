@@ -236,12 +236,12 @@ describe('T18: 用户发一句话 → cost_charged → 409 server-wins → 刷�
     assert.equal(derived, 'replied', '后续有 server-authored completed assistant → 派生 replied')
 
     // ── Step 7:render meta 行 —— formatMeta(assistant) ──
+    // 2026-06-18 契约:meta 行只显示 costCredits(¥/积分),token 统计已移除。
     const meta = formatMeta(messages[1])
-    assert.ok(meta.includes('¥8.50'), `meta 行应含 ¥8.50:${meta}`)
-    assert.ok(meta.includes('in 13178'), meta)
-    assert.ok(meta.includes('out 142'), meta)
-    assert.ok(meta.includes('cache-r 4096'), meta)
-    assert.ok(meta.includes('T1'), meta)
+    assert.equal(meta, '¥8.50', `meta 行应只含 ¥8.50:${meta}`)
+    assert.ok(!meta.includes('13178'), `token 不应出现:${meta}`)
+    assert.ok(!meta.includes('cache-r'), meta)
+    assert.ok(!meta.includes('T1'), meta)
 
     // ── Step 8:模拟 PUT 前 strip(_stripMessageEphemeral)──
     // client 送出去的不许带 server-authoritative 字段或 'replied' status。
@@ -356,12 +356,13 @@ describe('T19: dbGetAll → _normalizeLoadedSession — 三类历史污染 row',
     }
     const loaded = _normalizeLoadedSession(sess)
     const m = loaded.messages[0]
-    assert.equal(m.metaText, 'in 100 · out 50', 'metaText 应保留')
+    assert.equal(m.metaText, 'in 100 · out 50', 'metaText 应保留(数据层兼容,不影响渲染)')
     assert.deepEqual(m._rawMeta, { inputTokens: 100, outputTokens: 50 }, '_rawMeta 应保留')
-    // formatMeta 通过 _rawMeta fallback 仍能渲染
+    // 2026-06-18 契约:formatMeta 只渲染 costCredits。row A 的 _rawMeta 只有 token、
+    // 无 costCredits → 渲染为空(token 统计已下线)。metaText/_rawMeta 仍作为历史
+    // 数据保留,只是不再被 formatMeta 渲染成 token 行。
     const meta = formatMeta(m)
-    assert.ok(meta.includes('in 100'), `应渲染 in 100,实际:${meta}`)
-    assert.ok(meta.includes('out 50'), `应渲染 out 50,实际:${meta}`)
+    assert.equal(meta, '', `老 row 仅 token 无积分 → meta 为空,实际:${meta}`)
   })
 
   it('row B — 老 row 有 usage:删除 metaText/_rawMeta + formatMeta 走 usage', () => {
@@ -384,11 +385,11 @@ describe('T19: dbGetAll → _normalizeLoadedSession — 三类历史污染 row',
     assert.equal(m.metaText, undefined, 'metaText 应被 strip')
     assert.equal(m._rawMeta, undefined, '_rawMeta 应被 strip')
     assert.deepEqual(m.usage, { inputTokens: 100, outputTokens: 50, costCredits: '50' })
-    // formatMeta 走 usage,不读老的 _rawMeta inputTokens=999
+    // formatMeta 走 usage.costCredits;2026-06-18 契约:只显示积分,token 不再渲染。
     const meta = formatMeta(m)
-    assert.ok(meta.includes('in 100'), `应走 usage:${meta}`)
-    assert.ok(!meta.includes('in 999'), `不应使用陈旧 _rawMeta:${meta}`)
-    assert.ok(meta.includes('50 积分') || meta.includes('¥0.50') || meta.includes('积分'), meta)
+    assert.equal(meta, '50 积分', `应只显示积分:${meta}`)
+    assert.ok(!meta.includes('100'), `token 不应出现:${meta}`)
+    assert.ok(!meta.includes('999'), `不应使用陈旧 _rawMeta:${meta}`)
   })
 
   it('row C — user 消息 status="replied" 历史污染:删除 + 派生算', () => {
@@ -501,9 +502,10 @@ describe('T21: costCredits 早到/晚到/跨进程持久 — usage 合并语义'
       outputTokens: 50,
       turn: 2,
     })
+    // 2026-06-18 契约:meta 只显示积分,token 不渲染(但 usage 对象内仍保留 token)。
     const meta = formatMeta(msg)
-    assert.ok(meta.includes('¥3.00'), meta)
-    assert.ok(meta.includes('in 100'), meta)
+    assert.equal(meta, '¥3.00', meta)
+    assert.ok(!meta.includes('100'), `token 不应出现:${meta}`)
   })
 
   it('cost 晚到(isFinal 先,broadcast 后):cost 字段并入既有 usage', () => {
@@ -517,8 +519,7 @@ describe('T21: costCredits 早到/晚到/跨进程持久 — usage 合并语义'
       costCredits: '12',
     })
     const meta = formatMeta(msg)
-    assert.ok(meta.includes('12 积分'), meta) // <100 分 → 积分
-    assert.ok(meta.includes('in 100'), meta)
+    assert.equal(meta, '12 积分', meta) // <100 分 → 积分;token 不渲染
   })
 
   it('跨进程持久:刷新后从 IDB 加载 → usage 完整保留', () => {
@@ -536,11 +537,10 @@ describe('T21: costCredits 早到/晚到/跨进程持久 — usage 合并语义'
     const sess = { id: 'sess-1', messages: [serverMsg] }
     const loaded = _normalizeLoadedSession(sess)
     assert.deepEqual(loaded.messages[0].usage, serverMsg.usage, 'usage 跨刷新完整保留')
-    // 与本会话内 setUsage(msg, {...broadcast...}) 后的 formatMeta 输出一致
+    // usage 对象 token 跨刷新仍完整保留(数据层);但 formatMeta 显示层只渲染积分。
     const reloadMeta = formatMeta(loaded.messages[0])
-    assert.ok(reloadMeta.includes('¥8.50'), reloadMeta)
-    assert.ok(reloadMeta.includes('in 13178'), reloadMeta)
-    assert.ok(reloadMeta.includes('T1'), reloadMeta)
+    assert.equal(reloadMeta, '¥8.50', reloadMeta)
+    assert.ok(!reloadMeta.includes('13178'), `token 不应出现:${reloadMeta}`)
   })
 
   it('双重累加防御(broadcast + GET 各自合入)— costCredits 是覆盖语义', () => {

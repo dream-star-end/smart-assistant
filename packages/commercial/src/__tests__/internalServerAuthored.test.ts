@@ -735,6 +735,74 @@ describe("internalServerAuthored handler — requestId dispatch (cost-late-patch
     const roles = spy.plainCalls.map((c) => c.role).sort();
     assert.deepEqual(roles, ["assistant", "tool"]);
   });
+
+  // 2026-06-18 — per-turn traceId 透传:gateway 把 master canonical traceId 折进
+  // usage.traceId,master schema(.strict() usage)必须接受并原样传给 storage,
+  // 最终落 messages[i].usage.traceId 供前端"请求ID"芯片 + 刷新后反查日志。
+  test("usage.traceId accepted by schema + forwarded to storage as-is", async () => {
+    let capturedUsage: unknown;
+    const storage: ServerAuthoredStorage = {
+      async appendServerAuthoredMessage(_sessId, _userId, _msg) {
+        return { applied: true };
+      },
+      async appendServerAuthoredMessageForRequest(_requestId, _sessId, _userId, msg) {
+        capturedUsage = (msg as { usage?: unknown }).usage;
+        return { applied: true };
+      },
+    };
+    const h = makeServerAuthoredHandler({
+      identityRepo: makeRepoFor(VALID_TOKEN, VALID_HOST, VALID_IP),
+      storage,
+    });
+    const { res, rec } = makeRes();
+    await h(
+      authed(JSON.stringify({
+        sessionId: "sess12345",
+        turnIndex: 0,
+        status: "completed",
+        text: "answer",
+        requestId: "req-12345abc",
+        usage: {
+          inputTokens: 100,
+          outputTokens: 50,
+          turn: 1,
+          traceId: "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6",
+        },
+      })),
+      res,
+      CTX,
+    );
+    assert.equal(rec.status, 200, "usage.traceId must not be rejected by strict schema");
+    assert.deepEqual(capturedUsage, {
+      inputTokens: 100,
+      outputTokens: 50,
+      turn: 1,
+      traceId: "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6",
+    });
+  });
+
+  test("usage.traceId with illegal chars → 400 (schema regex guard)", async () => {
+    const spy = spyStorage();
+    const h = makeServerAuthoredHandler({
+      identityRepo: makeRepoFor(VALID_TOKEN, VALID_HOST, VALID_IP),
+      storage: spy.storage,
+    });
+    const { res, rec } = makeRes();
+    await h(
+      authed(JSON.stringify({
+        sessionId: "sess12345",
+        turnIndex: 0,
+        status: "completed",
+        text: "answer",
+        requestId: "req-12345abc",
+        usage: { inputTokens: 1, traceId: "bad id with spaces!" },
+      })),
+      res,
+      CTX,
+    );
+    assert.equal(rec.status, 400, "illegal traceId must be schema-rejected");
+    assert.equal(spy.forRequestCalls.length, 0);
+  });
 });
 
 describe("internalServerAuthored handler — storage outcome mapping", () => {

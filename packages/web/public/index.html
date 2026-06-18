@@ -2233,6 +2233,12 @@
       <button class="modal-close" data-close-modal="feedback-modal" aria-label="关闭">&times;</button>
     </div>
     <div class="modal-body">
+      <!-- 2026-06-18 逐条反馈上下文提示:从某条回复的"反馈"图标进入时显示其请求ID,
+           让用户确认反馈已关联到这条消息;请求ID 会随反馈上报供 admin 反查日志。 -->
+      <div id="feedback-context-note" class="feedback-context-note" hidden>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width:15px;height:15px;flex-shrink:0"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+        <span>关于这条回复 · 请求ID <code id="feedback-context-reqid"></code></span>
+      </div>
       <div class="form-row">
         <label for="feedback-category">类别</label>
         <select id="feedback-category">

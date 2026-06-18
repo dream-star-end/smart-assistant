@@ -104,6 +104,12 @@ const formatMeta = new Function(
   `${_formatCreditsInlineSrc}; ${_formatMetaSrc}; return formatMeta;`,
 )() as (m: any) => string
 
+// 2026-06-18 — 请求ID 取值函数(响应底部"请求ID"芯片的数据源)。读 msg.usage.traceId,
+// 回退 msg._rawMeta.traceId。纯函数,直接 extract。
+const getMsgRequestId = makeCallable<(m: any) => string>(
+  extractFunction(appJs, 'getMsgRequestId'),
+)
+
 // 派生 status / IDB normalize / push-strip 都是无外部依赖的纯函数,直接 makeCallable。
 const _deriveUserMsgStatus = makeCallable<
   (messages: any[], idx: number) => string | null
@@ -325,47 +331,40 @@ describe('T07: htmlSafeEscape — HTML entity encoding', () => {
 
 // ── T08: formatMeta — flat-msg fallback (handleOutbound 兼容路径) ──
 //
-// 2026-05-06 改动 8:formatMeta(msg) 新签名读 msg.usage → msg._rawMeta → msg。
-// $X.XXXX cost / cacheCreationTokens(cache-w)字段已下线 —— v3 商用版上线后所有
-// 消息走 server-authored usage.costCredits(分),前端不再做客户端估算口径。
-// T08 保留 flat-msg fallback(无 usage 无 _rawMeta 时把 msg 自身当 usage 用)的
-// 边界 case;usage / _rawMeta 显式路径单独走 T13 / T14。
+// 2026-06-18 契约变更:formatMeta(msg) 现在**只渲染 costCredits**(积分/¥),
+// 不再输出原始 token 统计(in/out/cache-r/T)。token 数字对终端用户噪声大、
+// 暴露内部口径,已移除;响应底部用于定位日志的"请求ID"改由独立的 getMsgRequestId
+// + .msg-reqid 芯片承载(见 T13b)。formatMeta 仍读 msg.usage → msg._rawMeta → msg。
+// $X.XXXX cost / cacheCreationTokens 字段早已下线。
 describe('T08: formatMeta — flat-msg fallback (无 usage/_rawMeta)', () => {
   it('null returns empty', () => assert.equal(formatMeta(null), ''))
   it('undefined returns empty', () => assert.equal(formatMeta(undefined), ''))
   it('empty object returns empty', () => assert.equal(formatMeta({}), ''))
-  it('flat tokens (handleOutbound 探测)', () => {
-    const result = formatMeta({ inputTokens: 100, outputTokens: 50 })
-    assert.ok(result.includes('in 100'), `Expected "in 100", got: ${result}`)
-    assert.ok(result.includes('out 50'), `Expected "out 50", got: ${result}`)
+  it('flat tokens 不再渲染(token 统计已移除)', () => {
+    // 旧契约会输出 "in 100 · out 50";新契约只保留 costCredits,无 token → 返空。
+    assert.equal(formatMeta({ inputTokens: 100, outputTokens: 50 }), '')
   })
-  it('flat turn', () => {
-    const result = formatMeta({ turn: 3 })
-    assert.ok(result.includes('T3'), `Expected "T3", got: ${result}`)
+  it('flat turn 不再渲染(turn 统计已移除)', () => {
+    assert.equal(formatMeta({ turn: 3 }), '')
   })
   it('legacy cost field 不再渲染(下线)', () => {
-    // 老 formatMeta 会输出 "$0.0100",新签名彻底丢弃 cost(交给 costCredits 权威值)。
     assert.equal(formatMeta({ cost: 0.0123 }), '')
   })
   it('legacy cacheCreationTokens 不再渲染(下线)', () => {
-    // 老 formatMeta 会输出 "cache-w 100",新签名只保留 cache-r 单字段(server usage.cacheReadTokens)。
     assert.equal(formatMeta({ cacheCreationTokens: 100 }), '')
   })
-  it('parts separated by ·', () => {
-    const result = formatMeta({ inputTokens: 1, outputTokens: 2, turn: 3 })
-    assert.ok(result.includes('·'), `Expected · separator, got: ${result}`)
-    assert.equal(result.split(' · ').length, 3)
+  it('flat costCredits 仍渲染(flat fallback 路径)', () => {
+    // 无 usage/_rawMeta 时 msg 本身当 usage 用,costCredits 仍走积分/¥。
+    assert.equal(formatMeta({ costCredits: '500' }), '¥5.00')
   })
 })
 
-// ── T13: formatMeta(msg.usage) — 主路径,server-authored usage 渲染 ──
+// ── T13: formatMeta(msg.usage) — 主路径,只渲染 costCredits ──
 //
-// 字段集与历史 metaText 对齐(spec §5.3 T13):
-//   costCredits(优先,formatCreditsInline → "X 积分" 或 "¥X.XX")
-//   + inputTokens / outputTokens / cacheReadTokens / turn。
-// usage 字段缺失时各自跳过,不输出占位符。
-describe('T13: formatMeta(msg.usage) — server-authored usage 主路径', () => {
-  it('全字段(¥ 显示):costCredits ≥ 100 → ¥X.XX', () => {
+// 2026-06-18 契约:仅 costCredits(formatCreditsInline → "X 积分" 或 "¥X.XX")。
+// token 字段(inputTokens/outputTokens/cacheReadTokens/turn)即使存在也不渲染。
+describe('T13: formatMeta(msg.usage) — server-authored usage 主路径(仅积分)', () => {
+  it('有 token 也只显示 costCredits(¥):costCredits ≥ 100 → ¥X.XX', () => {
     const result = formatMeta({
       usage: {
         costCredits: '850',
@@ -375,87 +374,88 @@ describe('T13: formatMeta(msg.usage) — server-authored usage 主路径', () =>
         turn: 1,
       },
     })
-    assert.ok(result.includes('¥8.50'), `Expected ¥8.50, got: ${result}`)
-    assert.ok(result.includes('in 13178'), result)
-    assert.ok(result.includes('out 142'), result)
-    assert.ok(result.includes('cache-r 4096'), result)
-    assert.ok(result.includes('T1'), result)
-    assert.ok(result.includes('·'), `Expected · separator, got: ${result}`)
+    assert.equal(result, '¥8.50')
+    // token 数一律不出现
+    assert.ok(!result.includes('13178'), `tokens should be hidden, got: ${result}`)
+    assert.ok(!result.includes('cache-r'), result)
+    assert.ok(!result.includes('T1'), result)
   })
-  it('costCredits < 100(分):显示 "X 积分"', () => {
+  it('costCredits < 100(分):显示 "X 积分",token 仍隐藏', () => {
     const result = formatMeta({ usage: { costCredits: '8', inputTokens: 100, outputTokens: 50 } })
-    assert.ok(result.includes('8 积分'), `Expected "8 积分", got: ${result}`)
-    assert.ok(result.includes('in 100'), result)
-    assert.ok(result.includes('out 50'), result)
+    assert.equal(result, '8 积分')
   })
   it('costCredits BigInt 字符串边界:刚好 100 → ¥1.00', () => {
-    const result = formatMeta({ usage: { costCredits: '100' } })
-    assert.equal(result, '¥1.00')
+    assert.equal(formatMeta({ usage: { costCredits: '100' } }), '¥1.00')
   })
   it('costCredits 包含小数分:99 → 99 积分', () => {
-    const result = formatMeta({ usage: { costCredits: '99' } })
-    assert.equal(result, '99 积分')
+    assert.equal(formatMeta({ usage: { costCredits: '99' } }), '99 积分')
   })
-  it('部分字段缺失:仅 inputTokens', () => {
-    const result = formatMeta({ usage: { inputTokens: 42 } })
-    assert.equal(result, 'in 42')
+  it('仅 inputTokens(无 costCredits)→ 空(token 不再渲染)', () => {
+    assert.equal(formatMeta({ usage: { inputTokens: 42 } }), '')
   })
-  it('部分字段缺失:仅 turn', () => {
-    const result = formatMeta({ usage: { turn: 5 } })
-    assert.equal(result, 'T5')
+  it('仅 turn(无 costCredits)→ 空', () => {
+    assert.equal(formatMeta({ usage: { turn: 5 } }), '')
   })
-  it('cacheReadTokens=0 不渲染(避免无意义 cache-r 0)', () => {
-    const result = formatMeta({ usage: { inputTokens: 10, cacheReadTokens: 0 } })
-    assert.equal(result, 'in 10')
+  it('cacheReadTokens 不再渲染', () => {
+    assert.equal(formatMeta({ usage: { inputTokens: 10, cacheReadTokens: 4096 } }), '')
   })
-  it('msg 本身 + usage 共存 — 优先读 usage,不读 msg 顶层', () => {
-    const result = formatMeta({
-      inputTokens: 999, // 顶层应被忽略
-      usage: { inputTokens: 1 },
-    })
-    assert.equal(result, 'in 1')
+  it('costCredits null / undefined 跳过 → 空(token 也不补)', () => {
+    assert.equal(formatMeta({ usage: { costCredits: null, inputTokens: 7 } }), '')
+    assert.equal(formatMeta({ usage: { costCredits: undefined, inputTokens: 7 } }), '')
   })
-  it('costCredits null / undefined 跳过(后端尚未结算)', () => {
-    assert.equal(formatMeta({ usage: { costCredits: null, inputTokens: 7 } }), 'in 7')
-    assert.equal(formatMeta({ usage: { costCredits: undefined, inputTokens: 7 } }), 'in 7')
-  })
-  it('costCredits 0 也跳过(0 积分显示无意义)', () => {
-    // formatCreditsInline 返 "0 积分",但 0 本身没意义 — 检查是否 push;
-    // 当前实现:n=0n 走 "<100" 分支返回 "0 积分"。Spec T13 没明确禁止,
-    // 这里固化当前行为(若后续要改成跳过,改实现 + 改本 case 同步)。
-    const result = formatMeta({ usage: { costCredits: '0' } })
-    assert.equal(result, '0 积分')
+  it('traceId 不进 formatMeta(由 getMsgRequestId 单独承载)', () => {
+    assert.equal(formatMeta({ usage: { traceId: 'abc123', inputTokens: 7 } }), '')
   })
 })
 
-// ── T14: formatMeta — _rawMeta 兼容老 IDB row ──
+// ── T13b: getMsgRequestId — 响应底部"请求ID"数据源 ──
 //
-// db.js _normalizeLoadedSession 条件清洗时,如果消息没有 usage 则保留 _rawMeta,
-// 让 formatMeta 仍能渲染老数据。一旦 usage 就位,_rawMeta 就被 strip 掉(T16b)。
-describe('T14: formatMeta — _rawMeta fallback (老 IDB row 兼容)', () => {
-  it('msg._rawMeta 单独存在 → 走 fallback 渲染', () => {
-    const result = formatMeta({
-      _rawMeta: { inputTokens: 11, outputTokens: 22, turn: 3 },
-    })
-    assert.ok(result.includes('in 11'), result)
-    assert.ok(result.includes('out 22'), result)
-    assert.ok(result.includes('T3'), result)
+// 2026-06-18 — 读 msg.usage.traceId(master per-turn canonical id),回退
+// msg._rawMeta.traceId。供 .msg-reqid 芯片展示 + 逐条反馈做关联键。
+describe('T13b: getMsgRequestId — per-turn 请求ID 取值', () => {
+  it('null / undefined / 空 → 空串', () => {
+    assert.equal(getMsgRequestId(null), '')
+    assert.equal(getMsgRequestId(undefined), '')
+    assert.equal(getMsgRequestId({}), '')
   })
-  it('usage 优先于 _rawMeta(usage 即权威源)', () => {
+  it('usage.traceId 命中', () => {
+    assert.equal(getMsgRequestId({ usage: { traceId: 'a1b2c3d4e5' } }), 'a1b2c3d4e5')
+  })
+  it('_rawMeta.traceId 回退(老 row)', () => {
+    assert.equal(getMsgRequestId({ _rawMeta: { traceId: 'deadbeef' } }), 'deadbeef')
+  })
+  it('usage 优先于 _rawMeta', () => {
+    assert.equal(
+      getMsgRequestId({ usage: { traceId: 'new' }, _rawMeta: { traceId: 'old' } }),
+      'new',
+    )
+  })
+  it('traceId 非字符串 / 缺失 → 空串', () => {
+    assert.equal(getMsgRequestId({ usage: { inputTokens: 1 } }), '')
+    assert.equal(getMsgRequestId({ usage: { traceId: 123 as any } }), '')
+  })
+})
+
+// ── T14: formatMeta — _rawMeta 兼容老 IDB row(仅 costCredits)──
+//
+// db.js _normalizeLoadedSession 保留 _rawMeta 让老数据仍能渲染积分。
+// 2026-06-18 契约:同样只渲染 costCredits,token 不渲染。
+describe('T14: formatMeta — _rawMeta fallback (老 IDB row 兼容)', () => {
+  it('_rawMeta 仅 token → 空(token 已移除)', () => {
+    assert.equal(formatMeta({ _rawMeta: { inputTokens: 11, outputTokens: 22, turn: 3 } }), '')
+  })
+  it('usage 优先于 _rawMeta(都看 costCredits)', () => {
     const result = formatMeta({
-      usage: { inputTokens: 1 },
-      _rawMeta: { inputTokens: 999 }, // 老 row 残留,被忽略
+      usage: { costCredits: '100' },
+      _rawMeta: { costCredits: '999' }, // 老 row 残留,被忽略
     })
-    assert.equal(result, 'in 1')
+    assert.equal(result, '¥1.00')
   })
   it('_rawMeta 含 costCredits → 走积分/¥ 渲染', () => {
-    const result = formatMeta({ _rawMeta: { costCredits: '500', turn: 1 } })
-    assert.ok(result.includes('¥5.00'), result)
-    assert.ok(result.includes('T1'), result)
+    assert.equal(formatMeta({ _rawMeta: { costCredits: '500', turn: 1 } }), '¥5.00')
   })
-  it('_rawMeta 为非 object → 退回 msg 顶层', () => {
-    const result = formatMeta({ _rawMeta: null, inputTokens: 5 })
-    assert.equal(result, 'in 5')
+  it('_rawMeta 为非 object → 退回 msg 顶层 costCredits', () => {
+    assert.equal(formatMeta({ _rawMeta: null, costCredits: '300' }), '¥3.00')
   })
 })
 

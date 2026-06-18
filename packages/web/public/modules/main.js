@@ -33,6 +33,8 @@ import {
   scheduleProactiveRefresh,
   silentRefresh,
   snapshotDiagnostics,
+  reportClientError,
+  setClientErrorVersion,
 } from './api.js?v=6cf1729b'
 
 // ── IndexedDB ──
@@ -252,6 +254,8 @@ setMessageDeps({
   openMemoryModal,
   openSkillsModal,
   openTasksModal,
+  // 2026-06-18 — 逐条反馈:消息操作栏"反馈"图标调用,带消息上下文(traceId 等)。
+  openMessageFeedback: openFeedbackModal,
 })
 
 setWsDeps({
@@ -626,6 +630,19 @@ window.addEventListener('error', (ev) => {
     console.error('[global error]', ev.error || ev)
   }
   _showErrorToastOnce(ev.error, msg)
+  // 2026-06-18 — 自动上报到后端(结构化日志)。沿用 toast 的抑制规则:AbortError /
+  // TimeoutError / ResizeObserver / 跨域 Script error 等 benign/不可行动的不上报。
+  if (!_shouldSuppressError(ev.error, msg)) {
+    reportClientError({
+      type: 'js_error',
+      message: msg,
+      name: ev.error?.name,
+      stack: ev.error?.stack,
+      filename: ev.filename,
+      lineno: ev.lineno,
+      colno: ev.colno,
+    })
+  }
 })
 
 window.addEventListener('unhandledrejection', (ev) => {
@@ -649,6 +666,17 @@ window.addEventListener('unhandledrejection', (ev) => {
     console.error('[unhandled rejection]', reason)
   }
   _showErrorToastOnce(reason, msg)
+  // 2026-06-18 — 同步自动上报。reason 若是 api.js 抛的 Error,带 requestId/status,
+  // 一并上报让后端按 requestId 关联;benign(AbortError 等)按 toast 同规则跳过。
+  if (!_shouldSuppressError(reason, msg)) {
+    reportClientError({
+      type: 'unhandled_rejection',
+      message: msg,
+      name: reason?.name,
+      stack: reason?.stack,
+      requestId: reason?.requestId,
+    })
+  }
 })
 
 // Auto-resize htmlpreview iframes based on content height
@@ -2515,6 +2543,9 @@ async function loadChangelog() {
     if (_changelogData.currentVersion) {
       const vEl = $('app-version')
       if (vEl) vEl.textContent = _changelogData.currentVersion
+      // 2026-06-18 — 把版本号注入错误自动上报,每条 client_error 日志带 clientVersion,
+      // 便于按版本归因前端问题。
+      setClientErrorVersion(_changelogData.currentVersion)
     }
     // 2026-04-21 安全审计 HIGH#F1 修复:用户桶原用 state.token 末 8 字节,
     // 但 JWT 每次 refresh 会换,导致同一用户的"已读"状态反复丢失;更糟的是
@@ -2602,7 +2633,19 @@ const FEEDBACK_CLARIFY_MESSAGES = [
   '好的反馈需要足够的上下文。请至少说明：问题是什么、何时发生、影响是什么。',
 ]
 
-function openFeedbackModal() {
+// 2026-06-18 — 逐条反馈上下文。从某条回复的"反馈"图标进入时由 messages.js 传入
+// { traceId, sessionId, msgId, role, errorCode, snippet };从菜单"发送反馈"进入时为
+// 空。submitFeedback 据此把 request_id 设为该消息的 traceId(后端 feedback 表有
+// request_id 列),并把其余上下文塞进 meta,让 admin 反馈与日志按同一 id 关联。
+let _feedbackContext = null
+
+function openFeedbackModal(context) {
+  // context 可能是 DOM 事件对象(若被当 onclick 直接绑定)——只接受我们自己构造的
+  // 纯对象(带 traceId/msgId 字段),其余一律按"无上下文"处理。
+  _feedbackContext =
+    context && typeof context === 'object' && !(context instanceof Event)
+      ? context
+      : null
   $('feedback-desc').value = ''
   $('feedback-category').value = 'bug'
   $('feedback-clarify').hidden = true
@@ -2610,6 +2653,18 @@ function openFeedbackModal() {
   $('feedback-foot').style.display = ''
   $('feedback-desc').parentElement.style.display = ''
   $('feedback-category').parentElement.style.display = ''
+  // 上下文提示:有请求ID 才显示(纯 JS 异常或 traceId 缺失时不展示假关联)。
+  const noteEl = $('feedback-context-note')
+  if (noteEl) {
+    const rid = _feedbackContext?.traceId || null
+    if (rid) {
+      const ridEl = $('feedback-context-reqid')
+      if (ridEl) ridEl.textContent = rid
+      noteEl.hidden = false
+    } else {
+      noteEl.hidden = true
+    }
+  }
   openModal('feedback-modal')
   setTimeout(() => $('feedback-desc').focus(), 50)
 }
@@ -2650,6 +2705,10 @@ async function submitFeedback() {
       typeof navigator !== 'undefined' && navigator.serviceWorker
         ? navigator.serviceWorker.controller
         : null
+    // 2026-06-18 — 逐条反馈上下文(从某条回复的"反馈"图标进入时存在)。把这条消息的
+    // 请求ID(traceId)+ 会话/消息/角色/错误码/摘要塞进 meta,admin 据 message_context
+    // 还原是哪条回复、再用 request_id(= traceId)反查 master 日志。
+    const ctx = _feedbackContext
     const meta = {
       last_api_errors: lastErrors,
       request_ids: requestIds,
@@ -2657,12 +2716,27 @@ async function submitFeedback() {
       sw_active: !!swCtl,
       sw_state: swCtl?.state ?? null,
       ts: new Date().toISOString(),
+      ...(ctx
+        ? {
+            message_context: {
+              trace_id: ctx.traceId || null,
+              session_id: ctx.sessionId || null,
+              msg_id: ctx.msgId || null,
+              role: ctx.role || null,
+              error_code: ctx.errorCode || null,
+              snippet: ctx.snippet || null,
+            },
+          }
+        : {}),
     }
     const resp = await apiJson('POST', '/api/feedback', {
       category,
       description: desc,
       // 后端字段命名:snake_case (与 admin/feedback.ts 入参一致)
-      session_id: sess?.id || null,
+      session_id: ctx?.sessionId || sess?.id || null,
+      // request_id 优先取这条消息的 traceId(逐条反馈),否则退回诊断里最近的 requestId,
+      // 让纯菜单反馈也尽量带个可查 id。后端 feedback 表有 request_id 列 + 索引。
+      request_id: ctx?.traceId || requestIds[requestIds.length - 1] || null,
       user_agent: navigator.userAgent,
       version: (_changelogData && _changelogData.currentVersion) || null,
       meta,

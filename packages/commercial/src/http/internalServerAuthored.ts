@@ -230,6 +230,16 @@ const BodySchema = z
         cacheCreationTokens: z.number().int().min(0).optional(),
         model: z.string().max(128).optional(),
         turn: z.number().int().min(0).optional(),
+        // Master-owned per-turn canonical traceId (gateway folds it in from
+        // the inbound-stamped outbound frame). Persisted into
+        // `messages[i].usage.traceId` and synced down server-authoritatively
+        // so the web UI shows a copyable "请求ID" that survives refresh and
+        // greps verbatim against master turn logs. Format mirrors
+        // protocol/traceId.ts TRACE_ID_REGEX (alnum + - _, 1..64).
+        traceId: z
+          .string()
+          .regex(/^[A-Za-z0-9_-]{1,64}$/)
+          .optional(),
       })
       .strict()
       .optional(),
@@ -325,6 +335,9 @@ export type ServerAuthoredMessageInput = {
     cacheCreationTokens?: number;
     model?: string;
     turn?: number;
+    /** Master-owned per-turn canonical traceId, folded into the persisted
+     *  usage blob as-is and synced down to the web UI as a copyable "请求ID". */
+    traceId?: string;
   };
   _truncated?: boolean;
   _errorCode?: string;

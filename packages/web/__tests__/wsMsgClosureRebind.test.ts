@@ -51,10 +51,8 @@ const _findMsgIdx = new Function(
   `${_findMsgIdxSrc}; return _findMsgIdx;`,
 )() as (sess: any, msg: any) => number
 
-const _computeUndoInsertIdxSrc = extractTopLevelFn(MSGS_SRC, '_computeUndoInsertIdx')
-const _computeUndoInsertIdx = new Function(
-  `${_computeUndoInsertIdxSrc}; return _computeUndoInsertIdx;`,
-)() as (messages: any[], prevMsgId: string | null) => number
+// 2026-06-18 — _computeUndoInsertIdx 随"删除消息+撤销"功能一并移除(消息操作栏的
+// 删除按钮已改为反馈按钮),相关 undo 单测一并删除。
 
 // ── A. Helper unit tests ──────────────────────────────────────────────────
 
@@ -87,28 +85,6 @@ describe('_findMsgIdx', () => {
   })
 })
 
-describe('_computeUndoInsertIdx', () => {
-  it('null prevMsgId → insert at head (was first row)', () => {
-    assert.equal(_computeUndoInsertIdx([{ id: 'a' }, { id: 'b' }], null), 0)
-  })
-  it('predecessor in middle → insert after it', () => {
-    assert.equal(
-      _computeUndoInsertIdx([{ id: 'a' }, { id: 'b' }, { id: 'c' }], 'b'),
-      2,
-    )
-  })
-  it('predecessor at end → insert at tail', () => {
-    assert.equal(_computeUndoInsertIdx([{ id: 'a' }, { id: 'b' }], 'b'), 2)
-  })
-  it('predecessor also gone (rare race) → append at end', () => {
-    // messages.length === 2, fallback returns 2 (tail append)
-    assert.equal(_computeUndoInsertIdx([{ id: 'a' }, { id: 'c' }], 'b'), 2)
-  })
-  it('single-element array, predecessor at head → insert at idx 1', () => {
-    assert.equal(_computeUndoInsertIdx([{ id: 'a' }], 'a'), 1)
-  })
-})
-
 // ── B. Static-source assertions (Codex Round 2-3 blocker — wire test) ────
 
 describe('messages.js call-site wiring', () => {
@@ -128,22 +104,17 @@ describe('messages.js call-site wiring', () => {
     assert.doesNotMatch(MSGS_SRC, /const\s+text\s*=\s*\(msg\.text\s*\|\|\s*''\)/)
   })
 
-  it('del handler uses splice(...,1)[0] + removedMsg + undo by removedMsg + duplicate guard', () => {
-    // Stable anchor: from `else if (action === 'del')` to the end of the
-    // assistant actions click handler (`el.appendChild(actions)`).
-    const startIdx = MSGS_SRC.indexOf("else if (action === 'del')")
-    assert.ok(startIdx > 0, "del branch anchor missing")
-    const tailIdx = MSGS_SRC.indexOf('el.appendChild(actions)', startIdx)
-    assert.ok(tailIdx > startIdx, "actions tail anchor missing")
-    const region = MSGS_SRC.slice(startIdx, tailIdx)
-
-    // Live row capture from splice (not closure msg)
-    assert.match(region, /sess\.messages\.splice\(\s*idx\s*,\s*1\s*\)\s*\[\s*0\s*\]/)
-    assert.match(region, /removedMsg/)
-    // Undo splices removedMsg, never the closure msg
-    assert.match(region, /splice\(\s*insertIdx\s*,\s*0\s*,\s*removedMsg\s*\)/)
-    // Duplicate guard against sync re-introducing same-id msg
-    assert.match(region, /sess\.messages\.some\([\s\S]*?m\.id\s*===\s*removedMsg\.id/)
+  it('删除快捷键已改为反馈:无 del 分支/按钮,feedback 分支带 per-message 上下文', () => {
+    // 2026-06-18 契约变更:消息操作栏的"删除"(含 undo)整体下线,改为"反馈"图标。
+    // 旧的 del 分支、删除按钮、undo splice 逻辑都不应再出现。
+    assert.doesNotMatch(MSGS_SRC, /else if \(action === 'del'\)/, 'del branch should be gone')
+    assert.doesNotMatch(MSGS_SRC, /data-action="del"/, 'del button should be gone')
+    assert.doesNotMatch(MSGS_SRC, /removedMsg/, 'undo-by-removedMsg logic should be gone')
+    // 反馈按钮 + 分支就位:正常消息走 `action === 'feedback'`,错误消息走
+    // `btn.dataset.action === 'feedback'`,两者都经 _buildMsgFeedbackContext 传上下文。
+    assert.match(MSGS_SRC, /data-action="feedback"/)
+    assert.match(MSGS_SRC, /action === 'feedback'/)
+    assert.match(MSGS_SRC, /_openMessageFeedback\?\.\(\s*_buildMsgFeedbackContext\(/)
   })
 
   it('exportMessageDocx/Tex receive liveMsg, not closure msg', () => {
@@ -155,7 +126,9 @@ describe('messages.js call-site wiring', () => {
 
   it('copy/save/tts paths all use _findMsgIdx + liveMsg resolve pattern', () => {
     const findIdxCalls = (MSGS_SRC.match(/_findMsgIdx\(sess,\s*msg\)/g) || []).length
-    // Expected sites: error-card copy(1) + assistant copy(1) + save click(1) + regen(1) + tts(1) + del(1) + user-status(1) = 7
+    // Expected sites (2026-06-18 后,del→feedback):error-card copy(1) + error-card
+    // feedback(1) + assistant copy(1) + save click(1) + regen(1) + tts(1) +
+    // assistant feedback(1) + user-status(1)。仍 >=6。
     assert.ok(findIdxCalls >= 6, `expected >=6 _findMsgIdx call sites, found ${findIdxCalls}`)
     const liveMsgPatterns = (
       MSGS_SRC.match(/const\s+liveMsg\s*=\s*_idx\s*>=\s*0\s*\?\s*sess\.messages\[_idx\]\s*:\s*msg/g) || []

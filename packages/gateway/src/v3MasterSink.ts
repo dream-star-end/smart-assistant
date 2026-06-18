@@ -170,6 +170,15 @@ export interface V3MasterSinkWirePayload {
     cacheCreationTokens?: number
     model?: string
     turn?: number
+    /** Master-owned per-turn canonical traceId (generated at inbound.message
+     *  entry, stamped onto the outbound.message frame). Folded into
+     *  `messages[i].usage.traceId` so the web UI can surface a copyable
+     *  "请求ID" that ops greps verbatim against master turn logs — and so it
+     *  survives refresh via the same server-authoritative usage sync channel
+     *  as inputTokens/costCredits. Nested under usage (not a sibling) because
+     *  usage is already the sync overlay key carrying turn metadata (model/
+     *  turn), so traceId rides existing rails with no new overlay-key wiring. */
+    traceId?: string
   }
   /** Plan §4.4 改动 7 — turn was truncated (max_tokens / stop_reason
    *  diverged from `end_turn`). Renders the red "已截断" pill on the

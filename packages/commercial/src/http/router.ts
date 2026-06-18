@@ -53,6 +53,7 @@ import {
   type CommercialHttpDeps,
   type RequestContext,
 } from './handlers.js'
+import { handleClientErrorReport } from './clientErrors.js'
 import { containerFileProxy } from './containerFileProxy.js'
 import { containerApiProxy, matchContainerApiProxyRoute } from './containerApiProxy.js'
 import { ContainerUnreadyError } from '../ws/userChatBridge.js'
@@ -783,6 +784,9 @@ export function createCommercialHandler(
     // P1-2 用户反馈入库(commercial 接管;gateway/server.ts:1325 那段对 commercial 已是死路)
     //   匿名 / 已登录均可,IP 限流防 spam(handler 内 enforceRateLimit)
     { method: 'POST', path: '/api/feedback', handler: handleSubmitFeedback },
+    // 2026-06-18 前端问题自动上报(commercial 接管;结构化日志按 traceId 落 journald)
+    //   匿名 / 已登录均可,IP 限流(handler 内 enforceRateLimit,比 feedback 宽)
+    { method: 'POST', path: '/api/client-errors', handler: handleClientErrorReport },
     // P0-3 订单 admin —— exact path 在 prefix 之前(matchRoute exact-first)
     //   /api/admin/orders/kpi 必须排前,否则会被 /api/admin/orders/ prefix 吞成 ORDER_NOT_FOUND
     { method: 'GET', path: '/api/admin/orders', handler: handleAdminListOrders },
@@ -855,6 +859,8 @@ export function createCommercialHandler(
     // P1-2 (2026-04-25):commercial 接管 /api/feedback POST,阻止 fall through
     // 到 gateway/server.ts:1325 的文件落盘 handler
     '/api/feedback',
+    // 2026-06-18:commercial 接管 /api/client-errors POST,阻止 fall through 到 gateway
+    '/api/client-errors',
     // v3 signed media URL —— 同样商业化管,维护期闸门必须覆盖到,否则维护期
     // 用户仍能通过签好的 URL drain 容器文件
     '/api/media-sign',

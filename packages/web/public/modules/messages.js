@@ -21,6 +21,7 @@ import { parsePartialJson } from './partialJson.js?v=6cf1729b'
 import { msgTimeLabel, shortTime } from './util.js?v=6cf1729b'
 import {
   formatMeta,
+  getMsgRequestId,
   getActiveStopAgentId,
   safeWsSend,
   setActiveTeamRunForSession,
@@ -107,6 +108,8 @@ let _resetReplyTracker
 let _openMemoryModal
 let _openSkillsModal
 let _openTasksModal
+// 2026-06-18 — 逐条反馈入口(main.js openFeedbackModal 带消息上下文)。
+let _openMessageFeedback
 export function setMessageDeps(deps) {
   _updateSendEnabled = deps.updateSendEnabled
   _showTypingIndicator = deps.showTypingIndicator
@@ -118,6 +121,27 @@ export function setMessageDeps(deps) {
   _openMemoryModal = deps.openMemoryModal
   _openSkillsModal = deps.openSkillsModal
   _openTasksModal = deps.openTasksModal
+  _openMessageFeedback = deps.openMessageFeedback
+}
+
+// 2026-06-18 — 消息操作栏"反馈"按钮(替代原"删除")。点击打开反馈弹窗并带上本条
+// 消息的请求ID(traceId)做关联键。图标用 message-square,与现有 inline-svg 风格一致。
+const _SVG_FEEDBACK =
+  '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>'
+const _FEEDBACK_BTN_HTML = `<button data-action="feedback" title="反馈">${_SVG_FEEDBACK}</button>`
+
+// 从消息对象组装逐条反馈上下文:请求ID(traceId)+ 会话/消息 id + 角色 + 文本摘要。
+// 摘要截断到 280 字,够 admin 还原问题语境又不灌满 meta(后端 8KB 上限)。
+function _buildMsgFeedbackContext(sess, msg) {
+  const text = typeof msg?.text === 'string' ? msg.text : ''
+  return {
+    traceId: getMsgRequestId(msg) || null,
+    sessionId: sess?.id || null,
+    msgId: msg?.id || null,
+    role: msg?.role || null,
+    errorCode: msg?._errorCode || null,
+    snippet: text ? text.slice(0, 280) : null,
+  }
 }
 
 // ── Closure-stale msg ref helpers (sync server-wins guard) ──
@@ -133,15 +157,6 @@ export function _findMsgIdx(sess, msg) {
   if (idx >= 0) return idx
   if (msg.id) idx = sess.messages.findIndex((m) => m && m.id === msg.id)
   return idx
-}
-
-// Undo helper: re-insert the live `removedMsg` at the position anchored by
-// the predecessor msg's id (captured at delete time). If the predecessor was
-// also removed by a concurrent sync, append at end (rare race).
-export function _computeUndoInsertIdx(messages, prevMsgId) {
-  if (!prevMsgId) return 0
-  const pi = messages.findIndex((m) => m && m.id === prevMsgId)
-  return pi >= 0 ? pi + 1 : messages.length
 }
 
 // ── Message status rendering ──
@@ -209,14 +224,57 @@ export function updateMsgMetaEl(msg) {
   let meta = el.querySelector('.msg-meta')
   if (!text) {
     if (meta) meta.remove()
-    return
+  } else {
+    if (!meta) {
+      meta = document.createElement('div')
+      meta.className = 'msg-meta'
+      // 放在 .msg-reqid / .msg-time 之前,保持"积分 → 请求ID → 时间"的视觉顺序。
+      const anchor = el.querySelector('.msg-reqid') || el.querySelector('.msg-time')
+      if (anchor) el.insertBefore(meta, anchor)
+      else el.appendChild(meta)
+    }
+    renderMetaInto(meta, text)
   }
-  if (!meta) {
-    meta = document.createElement('div')
-    meta.className = 'msg-meta'
-    el.appendChild(meta)
-  }
-  renderMetaInto(meta, text)
+  // 2026-06-18 — 请求ID 与积分分离:即使本轮无计费(text 为空),只要 usage.traceId
+  // 到了就渲染请求ID 芯片。setUsage 异步合入 traceId 后会再次走到这里。
+  _renderReqIdInto(el, msg)
+}
+
+// 2026-06-18 — 渲染响应底部"请求ID"芯片(替代原 token 统计)。
+// 读 msg.usage.traceId(master per-turn canonical id):点击复制全量 id,短显前 8 位,
+// title 给全量值。运维拿这串能 grep master turn 日志;逐条反馈也带它做关联键。
+// 与 .msg-meta(积分)职责分离,统一插在 .msg-time 之前。幂等:重复调用先清旧芯片。
+function _renderReqIdInto(parentEl, msg) {
+  if (!parentEl) return
+  const existing = parentEl.querySelector('.msg-reqid')
+  if (existing) existing.remove()
+  const rid = getMsgRequestId(msg)
+  if (!rid) return
+  const chip = document.createElement('button')
+  chip.type = 'button'
+  chip.className = 'msg-reqid'
+  chip.title = `请求ID ${rid}（点击复制，用于反馈/排查）`
+  chip.setAttribute('aria-label', `复制请求ID ${rid}`)
+  chip.innerHTML =
+    '<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>'
+  const label = document.createElement('span')
+  label.className = 'msg-reqid-text'
+  label.textContent = `ID ${rid.length > 8 ? rid.slice(0, 8) : rid}`
+  chip.appendChild(label)
+  chip.addEventListener('click', (e) => {
+    e.stopPropagation()
+    try {
+      if (navigator.clipboard?.writeText) {
+        navigator.clipboard.writeText(rid).catch(() => fallbackCopy(rid))
+      } else fallbackCopy(rid)
+      toast('已复制请求 ID', 'success')
+    } catch {
+      fallbackCopy(rid)
+    }
+  })
+  const timeEl = parentEl.querySelector('.msg-time')
+  if (timeEl) parentEl.insertBefore(chip, timeEl)
+  else parentEl.appendChild(chip)
 }
 
 // ═══════════════ RENDERING ═══════════════
@@ -2550,7 +2608,7 @@ export function _buildMessageEl(msg) {
       actErr.className = 'msg-actions'
       actErr.innerHTML =
         '<button data-action="copy" title="复制"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button>' +
-        '<button data-action="del" title="删除"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/></svg></button>'
+        _FEEDBACK_BTN_HTML
       actErr.addEventListener('click', (e) => {
         const btn = e.target.closest('[data-action]')
         if (!btn) return
@@ -2564,16 +2622,17 @@ export function _buildMessageEl(msg) {
             navigator.clipboard.writeText(raw).catch(() => fallbackCopy(raw))
           } else fallbackCopy(raw)
           toast('已复制', 'success')
-        } else if (btn.dataset.action === 'del') {
-          const i = sess.messages.findIndex((m) => m.id === msg.id)
-          if (i >= 0) {
-            sess.messages.splice(i, 1)
-            renderMessages()
-            _scheduleSaveFromUserEdit?.(sess)
-          }
+        } else if (btn.dataset.action === 'feedback') {
+          // 错误消息反馈尤其有价值:带上 traceId + errorCode,admin 直接对得上日志。
+          const _idx = _findMsgIdx(sess, msg)
+          const liveMsg = _idx >= 0 ? sess.messages[_idx] : msg
+          _openMessageFeedback?.(_buildMsgFeedbackContext(sess, liveMsg))
         }
       })
       el.appendChild(actErr)
+      // 2026-06-18 — 错误卡片也渲染请求ID 芯片(若 usage.traceId 存在):错误恰是最需要
+      // 反查日志的场景,芯片可点复制,与"反馈"图标互补。
+      _renderReqIdInto(el, msg)
       const ts = document.createElement('div')
       ts.className = 'msg-time'
       ts.textContent = msgTimeLabel(msg.ts)
@@ -2592,7 +2651,7 @@ export function _buildMessageEl(msg) {
       '<span class="msg-save-wrap"><button data-action="save" title="保存为文件"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg></button></span>' +
       '<button data-action="regen" title="重新生成"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg></button>' +
       '<button data-action="tts" title="朗读"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14"/></svg></button>' +
-      '<button data-action="del" title="删除"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/></svg></button>'
+      _FEEDBACK_BTN_HTML
     actions.addEventListener('click', (e) => {
       const btn = e.target.closest('[data-action]')
       if (!btn) return
@@ -2910,44 +2969,12 @@ export function _buildMessageEl(msg) {
         } else {
           toast('浏览器不支持语音合成', 'error')
         }
-      } else if (action === 'del') {
-        const idx = _findMsgIdx(sess, msg)
-        if (idx < 0) return
-        // Capture the predecessor's id before splice so undo can re-anchor
-        // by id (idx-based reinsert breaks after a concurrent sync that
-        // rewrites sess.messages or its length).
-        const prevMsgId = idx > 0 ? sess.messages[idx - 1]?.id || null : null
-        // Capture the LIVE row from splice, not the closure `msg` — after a
-        // server-wins sync, `msg` may be an orphan with stale fields while
-        // sess.messages[idx] is the authoritative server-merged object.
-        const removedMsg = sess.messages.splice(idx, 1)[0]
-        el.style.display = 'none'
-        const undoToast = document.createElement('div')
-        undoToast.className = 'toast show'
-        undoToast.innerHTML =
-          '消息已删除 <button class="undo-btn" style="margin-left:12px;color:var(--accent);background:none;border:none;cursor:pointer;font-weight:600;text-decoration:underline">撤销</button>'
-        document.body.appendChild(undoToast)
-        let undone = false
-        undoToast.querySelector('.undo-btn').onclick = () => {
-          undone = true
-          // Duplicate guard: if a concurrent sync re-introduced the same-id
-          // msg (server hadn't seen our DELETE PUT yet), skip reinsert.
-          const alreadyHas = sess.messages.some((m) => m && m.id === removedMsg.id)
-          if (!alreadyHas) {
-            const insertIdx = _computeUndoInsertIdx(sess.messages, prevMsgId)
-            sess.messages.splice(insertIdx, 0, removedMsg)
-          }
-          el.style.display = ''
-          undoToast.remove()
-          _scheduleSaveFromUserEdit(sess)
-        }
-        setTimeout(() => {
-          if (!undone) {
-            el.remove()
-            _scheduleSaveFromUserEdit(sess)
-          }
-          undoToast.remove()
-        }, 4000)
+      } else if (action === 'feedback') {
+        // 2026-06-18 — 原"删除"位改为"反馈":打开反馈弹窗并带上本条消息的请求ID
+        // (traceId)+ 会话/消息上下文,让用户一键就近反馈,admin 据 traceId 反查日志。
+        const _idx = _findMsgIdx(sess, msg)
+        const liveMsg = _idx >= 0 ? sess.messages[_idx] : msg
+        _openMessageFeedback?.(_buildMsgFeedbackContext(sess, liveMsg))
       }
     })
     el.appendChild(actions)
@@ -2964,6 +2991,9 @@ export function _buildMessageEl(msg) {
         el.appendChild(meta)
       }
     }
+    // 2026-06-18 — 响应底部请求ID 芯片(替代原 token 统计)。读 msg.usage.traceId,
+    // 此处 .msg-time 尚未创建,_renderReqIdInto 会 append,随后 _appendMsgTime 接在其后。
+    _renderReqIdInto(el, msg)
     // Absolute timestamp. For assistant messages we prefer `completedAt`
     // (set on final frame / when streaming hands off to a tool) so the
     // stamp reflects when the reply actually finished, not when the first
@@ -3144,6 +3174,8 @@ export function updateMessageEl(msg, streaming) {
         if (meta) meta.remove()
       }
     }
+    // 2026-06-18 — 全量更新路径同样刷新请求ID 芯片(幂等,内部先清旧再渲染)。
+    _renderReqIdInto(el, msg)
     // Refresh msg-time when completedAt has been set (isFinal / tool handoff).
     // The initial _buildMessageEl append shows ts (first token) while streaming;
     // once the turn completes we want the actual completion wall-clock instead.

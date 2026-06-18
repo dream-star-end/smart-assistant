@@ -483,6 +483,10 @@ function persistServerAuthoredTurn(args: {
     cacheCreationTokens?: number
     model?: string
     turn?: number
+    /** Master-owned per-turn canonical traceId (see V3MasterSinkWirePayload).
+     *  Folded into messages[i].usage.traceId for the web UI's copyable
+     *  "请求ID" + refresh-stable log correlation. */
+    traceId?: string
   }
   /** Plan §4.4 改动 7 — refresh-stable status pills. */
   truncated?: boolean
@@ -2326,6 +2330,11 @@ export class SessionManager {
                   cacheCreationTokens: result.cacheCreationTokens,
                   ...(session.model ? { model: session.model } : {}),
                   turn: turnIndex,
+                  // Surface the master-owned per-turn traceId so the web UI can
+                  // show a copyable "请求ID" that greps verbatim against master
+                  // turn logs; persisted into messages[i].usage.traceId so it
+                  // survives refresh via the usage sync channel.
+                  ...(traceId ? { traceId } : {}),
                 },
                 ...(result.stopReason === 'max_tokens' ? { truncated: true } : {}),
                 ...(completedHasTools ? { tools: result.tools } : {}),
@@ -2573,11 +2582,15 @@ export class SessionManager {
                     // Plan §4.4 改动 7 — propagate requestId so master can
                     // still wire pending costCredits onto the partial turn
                     // on the rare interrupt-after-cost-charged path.
-                    // No usage/truncated on the interrupt path: usage isn't
-                    // computed yet (parser hadn't run handleResult), and
-                    // 'truncated' specifically means stop_reason=max_tokens
-                    // — distinct from interrupt/crash which use the `status`
-                    // field instead.
+                    // No token/truncated usage on the interrupt path: token
+                    // counts aren't computed yet (parser hadn't run
+                    // handleResult), and 'truncated' specifically means
+                    // stop_reason=max_tokens — distinct from interrupt/crash
+                    // which use the `status` field instead. We DO carry the
+                    // per-turn traceId here so an interrupted/crashed turn —
+                    // exactly the case a user wants to report — still persists
+                    // a copyable "请求ID" on its assistant row for log lookup.
+                    ...(traceId ? { usage: { traceId, turn: turnIndex } } : {}),
                     ...(requestId ? { requestId } : {}),
                     // Tools that completed before the crash/interrupt — they
                     // produced real outputs and deserve durable persistence

@@ -1,5 +1,5 @@
 // OpenClaude — WebSocket connection, messaging, background tasks
-import { abortInflightRefresh, apiGet, clearProactiveRefresh, silentRefresh } from './api.js?v=6cf1729b'
+import { abortInflightRefresh, apiGet, clearProactiveRefresh, reportClientError, silentRefresh } from './api.js?v=6cf1729b'
 // V3 file-proxy R4 SHOULD#1:WS 1008 + silentRefresh 失败的 teardown 也要清 oc_session,
 // 否则 UI 已 showLogin 但 HttpOnly cookie 还能让 /api/file GET 到,语义分裂。
 import { clearSessionCookie } from './auth.js?v=6cf1729b'
@@ -2409,10 +2409,12 @@ export function connect() {
 //     再无则把 msg 本身当扁平对象(handleOutbound 仍以 frame.meta 形式调用本函数
 //     做"是否非空"探测的兼容路径)。
 //
-// 字段集与历史 metaText 对齐:costCredits(优先,formatCreditsInline 转积分/¥) +
-// inputTokens / outputTokens / cacheReadTokens / turn。
-// 旧的 m.cost($X.XXXX 估算) / totalCost / cacheCreationTokens 已删:v3 商用版上线后
-// 全部消息都有 costCredits 权威值,$X.XXXX 估算只让 boss 误以为账单口径不一致。
+// 字段集:仅 costCredits(formatCreditsInline 转积分/¥)。
+// 2026-06-18 改动 —— 移除原始 token 统计(in/out/cache-r/T):这些数字对终端用户
+// 噪声大、可读性差,且会暴露内部口径。响应底部的"花了多少钱"由 costCredits 承载;
+// 用于"快速定位日志/问题"的请求ID 改由独立的 .msg-reqid 元素承载(读 msg.usage.traceId,
+// 见 messages.js _renderReqIdInto),与计费信息职责分离。
+// 旧的 m.cost($X.XXXX 估算) / totalCost / cacheCreationTokens 早已删。
 export function formatMeta(msg) {
   if (!msg) return ''
   const u = msg.usage || msg._rawMeta || msg
@@ -2422,12 +2424,18 @@ export function formatMeta(msg) {
     const credits = formatCreditsInline(u.costCredits)
     if (credits) parts.push(credits)
   }
-  if (typeof u.inputTokens === 'number') parts.push(`in ${u.inputTokens}`)
-  if (typeof u.outputTokens === 'number') parts.push(`out ${u.outputTokens}`)
-  if (typeof u.cacheReadTokens === 'number' && u.cacheReadTokens > 0)
-    parts.push(`cache-r ${u.cacheReadTokens}`)
-  if (typeof u.turn === 'number') parts.push(`T${u.turn}`)
   return parts.join(' · ')
+}
+
+// 2026-06-18 — 从消息对象取 per-turn 请求ID(后端 master canonical traceId)。
+// live 路径:isFinal 帧 frame.traceId 经 setUsage 写入 msg.usage.traceId;
+// 刷新/历史:server-authored usage 同步回放 msg.usage.traceId(权威源)。
+// 该 id 运维可直接 grep master turn 日志,也是逐条反馈携带的关联键。
+export function getMsgRequestId(msg) {
+  if (!msg) return ''
+  const u = msg.usage || msg._rawMeta || null
+  const t = u && typeof u === 'object' ? u.traceId : undefined
+  return typeof t === 'string' && t ? t : ''
 }
 
 // credits(= 分 = ¥0.01)→ 中文可读字串。
@@ -3346,6 +3354,12 @@ export function handleOutbound(frame) {
       // _pendingCostCredits 是字符串("0" 或正整数串),不是 BigInt:sync.js
       // 持久化 stringify 不能序列化 BigInt。
       const usagePatch = { ...frame.meta }
+      // 2026-06-18 — 把 master per-turn canonical traceId(outbound.message 公开
+      // 字段)写进 msg.usage.traceId,作为响应底部"请求ID"的 live 源。刷新后由
+      // server-authored usage 同步回放同一值(权威源),live 与持久化一致。
+      if (typeof frame.traceId === 'string' && frame.traceId) {
+        usagePatch.traceId = frame.traceId
+      }
       try {
         const pending = BigInt(sess._pendingCostCredits || '0')
         if (pending > 0n) {
@@ -3988,6 +4002,10 @@ function handleLegacyBridgeError(frame) {
   addMessage(sess, 'assistant', text, {
     _errorCode: normalized,
     _errorDetail: typeof frame?.message === 'string' ? frame.message : '',
+    // 2026-06-18(Codex MEDIUM)— 错误消息也带 per-turn traceId(若有),让用户点错误
+    // 红卡"反馈"时 getMsgRequestId 能拿到本轮 id、且错误卡片能渲染请求ID 芯片。legacy
+    // 传输级 error 帧通常没有 turn traceId,缺失时不写(getMsgRequestId 退空)。
+    ...(frame?.traceId ? { usage: { traceId: frame.traceId } } : {}),
   })
   // Legacy `type:error` frames do not have a following final frame, so the
   // frontend must close local turn UI itself. For CODEX_TURN_BUSY this may be
@@ -4013,11 +4031,37 @@ function handleOutboundError(frame) {
   addMessage(sess, 'assistant', _friendlyBridgeErrorMessage(frame.code, frame.message || '出错了'), {
     _errorCode: normalized,
     _errorDetail: typeof frame.detail === 'string' ? frame.detail : '',
+    // 2026-06-18(Codex MEDIUM)— 写入本轮 traceId(outbound.error 帧由 gateway 盖了
+    // 公开 traceId),让错误红卡的"反馈"携带本轮 id + 渲染请求ID 芯片,便于反查日志。
+    ...(frame.traceId ? { usage: { traceId: frame.traceId } } : {}),
   })
+  // 2026-06-18 — 真·turn 失败自动上报,带 frame.traceId 让后端把这条用户可见的报错
+  // 与 master 该轮全链路日志按同一 id 关联。跳过预期业务态(余额/繁忙/维护/未开通/
+  // 鉴权)—— 那些不是"前台出问题",报了只会污染日志、拉低定位效率。
+  if (!_EXPECTED_TURN_ERR_CODES.has(normalized)) {
+    reportClientError({
+      type: 'turn_error',
+      message: `${normalized}: ${frame.message || frame.detail || ''}`,
+      traceId: typeof frame.traceId === 'string' ? frame.traceId : undefined,
+      sessionId: sess?.id || undefined,
+    })
+  }
   if (normalized === 'insufficient_credits') {
     try { refreshBalance() } catch {}
   }
 }
+
+// 预期业务态错误码:这些是正常流程的一部分,不算"前台问题",不自动上报。
+const _EXPECTED_TURN_ERR_CODES = new Set([
+  'insufficient_credits',
+  'codex_turn_busy',
+  'codex_pool_busy',
+  'codex_route_unavailable',
+  'unauthorized_model',
+  'codex_container_recycled',
+  'maintenance',
+  'unauthorized',
+])
 
 // ═══════════════ PERMISSION PROMPTS ═══════════════
 const _pendingPermissions = new Map() // requestId -> { frame, el, timer }

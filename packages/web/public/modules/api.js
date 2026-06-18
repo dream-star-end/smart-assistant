@@ -69,6 +69,13 @@ function _composeSignal(userSignal, timeoutMs) {
   }
 }
 
+// 2026-06-18 安全 — 把 path 的 query/hash 剥掉,只留 pathname。自动错误上报会把
+// 错误 message/route 落 journald,而 query 里可能有 admin 邮箱筛选、OAuth code/state、
+// 重置/验证 token、订单号等敏感值。凡是会进入"可能被上报的字符串"的 path 都过这道。
+function _safePath(p) {
+  return String(p ?? '').split(/[?#]/)[0]
+}
+
 function _httpError(label, status, msg, code, issues, requestId) {
   const e = new Error(msg ? `${label} failed: ${status} ${msg}` : `${label} failed: ${status}`)
   e.status = status
@@ -124,6 +131,95 @@ function _logApiError(ctx) {
     console.error('[api]', ctx)
   } catch {}
   _pushDiag({ kind: 'api', ...ctx })
+  // 2026-06-18 — 自动上报真·服务问题(5xx)。4xx(校验/鉴权/限流)是预期响应,
+  // 上报只会污染日志、拉低定位效率,故不报。网络层异常(fetch throw)走全局
+  // unhandledrejection 上报路径,不在这里。
+  if (typeof ctx?.status === 'number' && ctx.status >= 500) {
+    // route 可能带 query(admin 邮箱/筛选等)— 剥掉再进 message/route,防 journald PII。
+    const safeRoute = ctx.route ? _safePath(ctx.route) : ''
+    reportClientError({
+      type: 'api_error',
+      message: `${ctx.method || ''} ${safeRoute} → ${ctx.status} ${ctx.code || ''} ${ctx.message || ''}`.trim(),
+      route: safeRoute,
+      requestId: ctx.requestId,
+    })
+  }
+}
+
+// ── 前端问题自动上报(2026-06-18)────────────────────────────────────────────
+// fire-and-forget 把前台错误打到 /api/client-errors,后端按 traceId/requestId 落
+// 结构化日志(journald),与上游 turn 日志同流。运维 grep 一个 requestId 就能把
+// "用户截图里的报错"和"后端这一轮日志"串起来,提升定位效率与可维护性。
+//
+// 关键约束:
+//   1) 走裸 fetch(不经 apiFetch)—— 避免 401 silent-refresh、诊断缓冲污染,以及
+//      "上报失败 → 又触发上报"的递归;keepalive 让卸载/导航时也能发出去。
+//   2) 签名节流(同签名 30s 一次)+ 整页生命周期硬上限,防错误风暴刷爆日志。
+//   3) 永不上报关于 /api/client-errors 自身的任何错误(防递归)。
+//   4) 上报本身绝不抛错。
+const _CLIENT_ERR_ENDPOINT = '/api/client-errors'
+const _clientErrReported = new Map() // signature → last ts
+const _CLIENT_ERR_COOLDOWN_MS = 30000
+let _clientErrBudget = 50 // 每次页面加载的硬上限
+let _clientErrVersion = null
+
+// main.js boot 时注入当前版本号,随每条上报带上,便于按版本归因。
+export function setClientErrorVersion(v) {
+  if (typeof v === 'string' && v) _clientErrVersion = v
+}
+
+export function reportClientError(payload) {
+  try {
+    const p = payload && typeof payload === 'object' ? payload : {}
+    const msg = typeof p.message === 'string' ? p.message : String(p.message ?? '')
+    // 防递归:不上报关于上报端点自身的错误。
+    if (msg.includes(_CLIENT_ERR_ENDPOINT)) return
+    if (typeof p.url === 'string' && p.url.includes(_CLIENT_ERR_ENDPOINT)) return
+    if (typeof p.route === 'string' && p.route.includes(_CLIENT_ERR_ENDPOINT)) return
+    if (_clientErrBudget <= 0) return
+    const sig = `${p.type || 'err'}:${msg.slice(0, 120)}`
+    const now = Date.now()
+    if (now - (_clientErrReported.get(sig) || 0) < _CLIENT_ERR_COOLDOWN_MS) return
+    _clientErrReported.set(sig, now)
+    if (_clientErrReported.size > 64) {
+      const oldest = [..._clientErrReported.entries()].sort((a, b) => a[1] - b[1])[0]
+      if (oldest) _clientErrReported.delete(oldest[0])
+    }
+    _clientErrBudget -= 1
+
+    // 2026-06-18 安全(Codex MEDIUM):上报落 journald,query/hash 里可能有 OAuth
+    // code/state、重置/验证 token、订单号、admin 邮箱筛选等敏感值,等同 PII 泄漏。
+    // 防御纵深:无论 route 来自调用方显式传入还是 location,一律剥掉 query/hash 只留 path。
+    const rawRoute = p.route || (typeof location !== 'undefined' ? location.pathname : null)
+    const route = rawRoute ? _safePath(rawRoute) : null
+    const body = {
+      type: p.type || 'unknown',
+      message: msg.slice(0, 2048),
+      ...(p.name ? { name: String(p.name).slice(0, 128) } : {}),
+      ...(p.stack ? { stack: String(p.stack).slice(0, 4096) } : {}),
+      ...(route ? { route: String(route).slice(0, 512) } : {}),
+      ...(p.filename ? { filename: String(p.filename).slice(0, 512) } : {}),
+      ...(typeof p.lineno === 'number' ? { lineno: p.lineno } : {}),
+      ...(typeof p.colno === 'number' ? { colno: p.colno } : {}),
+      ...(p.traceId ? { trace_id: String(p.traceId).slice(0, 64) } : {}),
+      ...(p.requestId ? { request_id: String(p.requestId).slice(0, 64) } : {}),
+      ...(p.sessionId ? { session_id: String(p.sessionId).slice(0, 64) } : {}),
+      ...(_clientErrVersion ? { version: _clientErrVersion } : {}),
+      ...(typeof navigator !== 'undefined' ? { user_agent: navigator.userAgent } : {}),
+    }
+    const headers = { 'Content-Type': 'application/json' }
+    // 带 access token(若有)让后端关联 uid;无 token 匿名也接收。不触发 refresh。
+    if (state.token) headers.Authorization = `Bearer ${state.token}`
+    fetch(_CLIENT_ERR_ENDPOINT, {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers,
+      body: JSON.stringify(body),
+      keepalive: true,
+    }).catch(() => {})
+  } catch {
+    // 上报路径自身的任何异常都吞掉 —— 绝不能因为"上报失败"再炸一层。
+  }
 }
 
 async function _readStdErrorFromRes(res) {
@@ -494,6 +590,29 @@ export async function apiFetch(path, init = {}) {
   let res
   try {
     res = await fetch(path, { ...rest, signal })
+  } catch (err) {
+    // 2026-06-18(Codex LOW)— 网络层失败(DNS / 连接拒绝 / 离线 / TLS)自动上报。
+    // fetch reject 不会进 _logApiError(那只处理 non-2xx 响应),调用方多是 catch+toast,
+    // 这类用户可见失败否则永远不上报。AbortError(用户取消)/ TimeoutError(自身超时)
+    // 是 benign,跳过(与全局 _shouldSuppressError 同思路);自身上报路由也跳过防递归。
+    const name = err?.name
+    // 2026-06-18 安全(Codex MEDIUM #2):path 可能带 query(admin 邮箱/筛选等敏感值),
+    // 显式传 route 会绕过 reportClientError 的 pathname 去敏 —— 这里先剥掉 query/hash,
+    // message 与 route 都只用 safePath。
+    const safePath = _safePath(path)
+    if (
+      name !== 'AbortError' &&
+      name !== 'TimeoutError' &&
+      !safePath.includes(_CLIENT_ERR_ENDPOINT)
+    ) {
+      reportClientError({
+        type: 'api_fetch_error',
+        message: `${safePath} → ${name || 'NetworkError'} ${err?.message || ''}`.trim(),
+        name,
+        route: safePath,
+      })
+    }
+    throw err
   } finally {
     cleanup()
   }
@@ -542,7 +661,7 @@ export async function apiGet(path, opts = {}) {
       message: std.message,
     })
     throw _httpError(
-      `GET ${path}`,
+      `GET ${_safePath(path)}`,
       res.status,
       std.message ?? std.code,
       std.code,
@@ -569,7 +688,7 @@ export async function apiText(path, opts = {}) {
       message: std.message,
     })
     throw _httpError(
-      `GET ${path}`,
+      `GET ${_safePath(path)}`,
       res.status,
       std.message ?? std.code,
       std.code,
@@ -599,7 +718,7 @@ export async function apiJson(method, path, body, opts = {}) {
       message: std.message,
     })
     throw _httpError(
-      `${method} ${path}`,
+      `${method} ${_safePath(path)}`,
       res.status,
       std.message ?? std.code,
       std.code,

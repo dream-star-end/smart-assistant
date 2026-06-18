@@ -124,6 +124,8 @@ export interface CommercialHttpDeps {
     logout: RateLimitConfig;
     // P1-2 (2026-04-25):用户反馈匿名可提交,必须按 IP 限流防 spam
     feedback: RateLimitConfig;
+    // 2026-06-18:前端问题自动上报,匿名可提交,按 IP 限流(比 feedback 宽)
+    clientErrors: RateLimitConfig;
   }>;
   /** T-12.1:开启后,login 强制要求 email_verified=true */
   requireEmailVerified?: boolean;
@@ -329,6 +331,9 @@ export const DEFAULT_RATE_LIMITS = {
   logout: { scope: "logout", windowSeconds: 60, max: 30 } satisfies RateLimitConfig,
   // P1-2:5/min/IP — 反馈是低频操作,匿名也允许,这个上限挡 spam 又不影响真实用户
   feedback: { scope: "feedback", windowSeconds: 60, max: 5 } satisfies RateLimitConfig,
+  // 2026-06-18:前端问题自动上报。比 feedback 宽(30/min/IP)—— 一个坏页面会连发
+  // 几条(JS 异常 + 接口失败 + 流式中断),但仍挡住脚本刷日志。前端侧另有签名节流。
+  clientErrors: { scope: "client_errors", windowSeconds: 60, max: 30 } satisfies RateLimitConfig,
 };
 
 /**
