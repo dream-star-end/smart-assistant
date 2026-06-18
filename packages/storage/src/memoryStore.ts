@@ -1,18 +1,24 @@
 // MemoryStore — bounded file-backed memory with char budget and injection scan.
-// Ported from NousResearch/hermes-agent tools/memory_tool.py but rewritten in TS
-// and per-agent instead of per-profile.
+// Ported from NousResearch/hermes-agent tools/memory_tool.py but rewritten in TS.
 //
-// Two targets per agent:
-//   MEMORY.md — agent's observations (environment, conventions, lessons learned)
-//   USER.md   — what the agent knows about the user (preferences, style)
+// Two targets:
+//   MEMORY.md — agent's observations (environment, conventions, lessons learned).
+//               PER-AGENT (~/.openclaude/agents/<id>/MEMORY.md). Stays isolated:
+//               each agent's working notes shouldn't pollute another's role.
+//   USER.md   — what we know about the user (identity, preferences, style).
+//               USER-LEVEL SHARED (~/.openclaude/user.md). Any agent's learning about
+//               the user reaches ALL of that user's agents. Because it is shared, all
+//               user-target writes take a cross-process file lock and re-read under the
+//               lock (read-modify-write) so concurrent agents don't lose updates.
 //
 // Entries are separated by "\n§\n". Character (not token) budgets are enforced
 // because char counts are model-independent. Content is scanned for prompt
 // injection and exfiltration patterns before being persisted, since these files
 // get injected into the system prompt.
 
+import { randomUUID } from 'node:crypto'
 import { existsSync } from 'node:fs'
-import { mkdir, readFile, writeFile } from 'node:fs/promises'
+import { mkdir, open, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
 import { dirname } from 'node:path'
 import { paths } from './paths.js'
 
@@ -81,6 +87,59 @@ export function scanMemoryContent(content: string): ScanResult {
   return { ok: true }
 }
 
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms))
+
+/**
+ * Cross-process advisory lock for the shared user.md via O_CREAT|O_EXCL lockfile.
+ * Returns a release fn. Steals stale locks (mtime older than STALE_MS) to survive a
+ * crashed holder; throws if it can't acquire within ACQUIRE_TIMEOUT_MS.
+ */
+export async function acquireUserLock(lockPath: string): Promise<() => Promise<void>> {
+  const STALE_MS = 15_000
+  const ACQUIRE_TIMEOUT_MS = 8_000
+  const myToken = randomUUID()
+  const start = Date.now()
+  for (;;) {
+    try {
+      const fh = await open(lockPath, 'wx') // O_CREAT | O_EXCL — atomic create
+      // Write an owner token so that if another writer later steals this lock (judging
+      // us stale), our release won't unlink THEIR lock.
+      await fh.writeFile(myToken).catch(() => {})
+      await fh.close().catch(() => {})
+      let released = false
+      return async () => {
+        if (released) return
+        released = true
+        // Only remove the lock if we still own it. If it was stolen+recreated by another
+        // writer, leave their lock intact so mutual exclusion is preserved.
+        try {
+          const cur = await readFile(lockPath, 'utf-8')
+          if (cur.trim() === myToken) await rm(lockPath, { force: true })
+        } catch {
+          /* lock already gone */
+        }
+      }
+    } catch (err: any) {
+      if (err?.code !== 'EEXIST') throw err
+      // Steal if stale (previous holder crashed without releasing).
+      try {
+        const st = await stat(lockPath)
+        if (Date.now() - st.mtimeMs > STALE_MS) {
+          await rm(lockPath, { force: true }).catch(() => {})
+          continue
+        }
+      } catch {
+        // lock vanished between EEXIST and stat — retry immediately
+        continue
+      }
+      if (Date.now() - start > ACQUIRE_TIMEOUT_MS) {
+        throw new Error('user memory lock acquire timeout')
+      }
+      await sleep(15 + Math.floor(Math.random() * 25))
+    }
+  }
+}
+
 export class MemoryStore {
   private memoryEntries: string[] = []
   private userEntries: string[] = []
@@ -91,7 +150,8 @@ export class MemoryStore {
   ) {}
 
   private pathFor(target: MemoryTarget): string {
-    return target === 'user' ? paths.agentUserMd(this.agentId) : paths.agentMemoryMd(this.agentId)
+    // user → user-level shared (volume root); memory → per-agent.
+    return target === 'user' ? paths.sharedUserMd : paths.agentMemoryMd(this.agentId)
   }
 
   private limitFor(target: MemoryTarget): number {
@@ -135,6 +195,30 @@ export class MemoryStore {
     }
   }
 
+  /** Force-reread the user entries from disk (used under the write lock so the
+   *  read-modify-write sees the latest content another process may have written). */
+  private async reloadUserFromDisk(): Promise<void> {
+    this.userEntries = await this.readFile(this.pathFor('user'))
+    this.userEntries = [...new Set(this.userEntries)].filter((e) => scanMemoryContent(e).ok)
+    this._userMtime = 0 // invalidate cache; next load() re-stats
+  }
+
+  /**
+   * Serialize a read-modify-write on the target. For the shared `user` target this
+   * takes the cross-process lock and re-reads under it (so concurrent agents don't
+   * lose updates). For per-agent `memory` there's a single writer → no lock needed.
+   */
+  private async withWriteGuard<T>(target: MemoryTarget, fn: () => Promise<T>): Promise<T> {
+    if (target !== 'user') return fn()
+    const release = await acquireUserLock(paths.sharedUserLock)
+    try {
+      await this.reloadUserFromDisk()
+      return await fn()
+    } finally {
+      await release()
+    }
+  }
+
   private async readFile(path: string): Promise<string[]> {
     if (!existsSync(path)) return []
     try {
@@ -152,7 +236,16 @@ export class MemoryStore {
     const path = this.pathFor(target)
     await mkdir(dirname(path), { recursive: true })
     const content = this.entriesFor(target).join(ENTRY_DELIMITER)
-    await writeFile(path, content)
+    // Atomic write: temp + rename so a concurrent reader never sees a half-written file
+    // (and a crash mid-write leaves the previous content intact).
+    const tmp = `${path}.tmp-${randomUUID()}`
+    try {
+      await writeFile(tmp, content)
+      await rename(tmp, path)
+    } catch (err) {
+      await rm(tmp, { force: true }).catch(() => {})
+      throw err
+    }
   }
 
   charCount(target: MemoryTarget): number {
@@ -165,27 +258,29 @@ export class MemoryStore {
     if (!content) return { ok: false, error: 'empty content' }
     const scan = scanMemoryContent(content)
     if (!scan.ok) return { ok: false, error: `rejected: ${scan.reason}` }
-    const entries = this.entriesFor(target)
-    // Dedupe: if this exact content already exists, treat as success no-op
-    if (entries.includes(content)) return { ok: true }
-    const newEntries = [...entries, content]
-    const projected = newEntries.join(ENTRY_DELIMITER).length
-    const limit = this.limitFor(target)
-    if (projected > limit) {
-      // Auto-trim oldest entries until it fits
-      const trimmed = [...newEntries]
-      while (trimmed.join(ENTRY_DELIMITER).length > limit && trimmed.length > 1) {
-        trimmed.shift()
+    return this.withWriteGuard(target, async () => {
+      const entries = this.entriesFor(target)
+      // Dedupe: if this exact content already exists, treat as success no-op
+      if (entries.includes(content)) return { ok: true }
+      const newEntries = [...entries, content]
+      const projected = newEntries.join(ENTRY_DELIMITER).length
+      const limit = this.limitFor(target)
+      if (projected > limit) {
+        // Auto-trim oldest entries until it fits
+        const trimmed = [...newEntries]
+        while (trimmed.join(ENTRY_DELIMITER).length > limit && trimmed.length > 1) {
+          trimmed.shift()
+        }
+        if (trimmed.join(ENTRY_DELIMITER).length > limit) {
+          return { ok: false, error: `content exceeds ${limit}-char limit even alone` }
+        }
+        this.setEntriesFor(target, trimmed)
+      } else {
+        this.setEntriesFor(target, newEntries)
       }
-      if (trimmed.join(ENTRY_DELIMITER).length > limit) {
-        return { ok: false, error: `content exceeds ${limit}-char limit even alone` }
-      }
-      this.setEntriesFor(target, trimmed)
-    } else {
-      this.setEntriesFor(target, newEntries)
-    }
-    await this.saveTarget(target)
-    return { ok: true }
+      await this.saveTarget(target)
+      return { ok: true }
+    })
   }
 
   async replace(
@@ -195,24 +290,28 @@ export class MemoryStore {
   ): Promise<{ ok: boolean; error?: string }> {
     const scan = scanMemoryContent(replacement)
     if (!scan.ok) return { ok: false, error: `rejected: ${scan.reason}` }
-    const entries = this.entriesFor(target)
-    const matches = entries.map((e, i) => ({ e, i })).filter(({ e }) => e.includes(needle))
-    if (matches.length === 0) return { ok: false, error: 'needle not found' }
-    if (matches.length > 1) return { ok: false, error: `ambiguous: ${matches.length} matches` }
-    const newEntries = [...entries]
-    newEntries[matches[0].i] = replacement.trim()
-    this.setEntriesFor(target, newEntries)
-    await this.saveTarget(target)
-    return { ok: true }
+    return this.withWriteGuard(target, async () => {
+      const entries = this.entriesFor(target)
+      const matches = entries.map((e, i) => ({ e, i })).filter(({ e }) => e.includes(needle))
+      if (matches.length === 0) return { ok: false, error: 'needle not found' }
+      if (matches.length > 1) return { ok: false, error: `ambiguous: ${matches.length} matches` }
+      const newEntries = [...entries]
+      newEntries[matches[0].i] = replacement.trim()
+      this.setEntriesFor(target, newEntries)
+      await this.saveTarget(target)
+      return { ok: true }
+    })
   }
 
   async remove(target: MemoryTarget, needle: string): Promise<{ ok: boolean; error?: string }> {
-    const entries = this.entriesFor(target)
-    const filtered = entries.filter((e) => !e.includes(needle))
-    if (filtered.length === entries.length) return { ok: false, error: 'needle not found' }
-    this.setEntriesFor(target, filtered)
-    await this.saveTarget(target)
-    return { ok: true }
+    return this.withWriteGuard(target, async () => {
+      const entries = this.entriesFor(target)
+      const filtered = entries.filter((e) => !e.includes(needle))
+      if (filtered.length === entries.length) return { ok: false, error: 'needle not found' }
+      this.setEntriesFor(target, filtered)
+      await this.saveTarget(target)
+      return { ok: true }
+    })
   }
 
   read(target: MemoryTarget): string {
@@ -243,8 +342,13 @@ export class MemoryStore {
     if (total > this.limitFor(target)) {
       return { ok: false, error: `content exceeds ${this.limitFor(target)}-char limit` }
     }
-    this.setEntriesFor(target, entries)
-    await this.saveTarget(target)
-    return { ok: true }
+    return this.withWriteGuard(target, async () => {
+      // Explicit full replace (UI editor). The lock still serializes it against
+      // concurrent add/replace/remove; it intentionally does not merge with the
+      // re-read entries (the editor is overwriting the whole document on purpose).
+      this.setEntriesFor(target, entries)
+      await this.saveTarget(target)
+      return { ok: true }
+    })
   }
 }

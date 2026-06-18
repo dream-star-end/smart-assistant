@@ -8841,7 +8841,8 @@ export const FILE_BLOCKED_PATTERNS = [
   /shadow$/, // /etc/shadow
   /auth.*token/i, // token files
   /MEMORY\.md$/, // agent long-term memory
-  /USER\.md$/, // user identity / core memory
+  /USER\.md$/, // user identity / core memory (legacy per-agent)
+  /(^|\/)user\.md$/, // user-level shared identity / core memory (~/.openclaude/user.md)
   /CLAUDE\.md$/, // agent persona / system instructions
   /resume-map\.json$/, // session checkpoint data
   /\.npmrc$/, // npm registry tokens (top-level)

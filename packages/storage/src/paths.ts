@@ -12,9 +12,15 @@ export const paths = {
   logsDir: join(HOME, 'logs'),
   agentDir: (agentId: string) => join(HOME, 'agents', agentId),
   agentClaudeMd: (agentId: string) => join(HOME, 'agents', agentId, 'CLAUDE.md'),
-  // Memory system (L1): per-agent MEMORY.md + USER.md with char budget
+  // Memory system (L1): MEMORY.md per-agent; USER.md user-level shared.
+  // MEMORY.md = agent's own working notes (per-agent, stays isolated). USER.md = who
+  // the user is / preferences → user-level shared at the volume root so any agent's
+  // learning about the user reaches ALL agents. `agentUserMd` kept only as the legacy
+  // per-agent path for migration / back-compat read.
   agentMemoryMd: (agentId: string) => join(HOME, 'agents', agentId, 'MEMORY.md'),
   agentUserMd: (agentId: string) => join(HOME, 'agents', agentId, 'USER.md'),
+  sharedUserMd: join(HOME, 'user.md'),
+  sharedUserLock: join(HOME, 'user.md.lock'),
   // Skills system (L3): per-agent skill directory.
   // NOTE: with the user-level shared skill library (see sharedSkillsDir below),
   // this per-agent dir is a read-only "legacy" overlay layer kept only for
