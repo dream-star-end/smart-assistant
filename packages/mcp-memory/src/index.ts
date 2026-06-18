@@ -31,6 +31,7 @@ import {
   SkillDraftStore,
   type SkillStore,
   buildAgentSkillStore,
+  isPlatformReservedSkillName,
   validateSkillName,
   archivalAdd,
   archivalCount,
@@ -786,6 +787,13 @@ async function handleSkillPropose(args: {
   if (!nameCheck.ok) return toolError(nameCheck.error ?? 'invalid skill name')
   const rationale = typeof args.rationale === 'string' ? args.rationale.trim() : ''
   if (!rationale) return toolError('rationale required — cite the evidence for this change')
+
+  // Authoritative reserved-name guard: reject names reserved by the env baseline OR
+  // ANY agent's seed up front (same invariant SkillStore.save enforces at merge), not
+  // just the names visible in THIS training agent's overlay.
+  if (await isPlatformReservedSkillName(args.name)) {
+    return toolError(`"${args.name}" is reserved by a platform skill — cannot propose changes to it`)
+  }
 
   // Resolve the current authoritative skill (baseline-wins overlay) for authority
   // checks + base-version pinning.

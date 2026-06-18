@@ -309,8 +309,8 @@ export class SkillTrainJobStore {
    * reconciled to 'failed' — its background session did not survive the restart.
    */
   async loadAll(now: number): Promise<void> {
-    const root = paths.skillDraftsDir
-    if (!existsSync(root)) return
+    const root = this._safeRoot()
+    if (!root || !existsSync(root)) return
     let dirs: string[]
     try {
       dirs = await readdir(root)
@@ -322,8 +322,12 @@ export class SkillTrainJobStore {
       const file = join(root, runId, 'run.json')
       if (!existsSync(file)) continue
       try {
-        const parsed = JSON.parse(await readFile(file, 'utf-8')) as SkillTrainRun
-        if (!parsed?.runId) continue
+        // realpath-contain the file within the (HOME-contained) root before reading.
+        const realFile = await realpath(file)
+        if (!realFile.startsWith(root + sep)) continue
+        const parsed = JSON.parse(await readFile(realFile, 'utf-8')) as SkillTrainRun
+        // The on-disk runId must match its directory — reject mismatched/forged rows.
+        if (!parsed?.runId || parsed.runId !== runId) continue
         if (ACTIVE_STATUSES.has(parsed.status)) {
           parsed.status = 'failed'
           parsed.phase = 'failed'
@@ -335,18 +339,30 @@ export class SkillTrainJobStore {
     }
   }
 
+  /**
+   * Resolve the drafts root, returning null unless it resolves WITHIN HOME. Guards a
+   * symlinked `~/.openclaude/skill-drafts` from redirecting reads/writes outside HOME
+   * (mirrors SkillDraftStore.resolveDraftsRoot's containment model).
+   */
+  private _safeRoot(): string | null {
+    const root = existsSync(paths.skillDraftsDir)
+      ? realpathSync(paths.skillDraftsDir)
+      : resolve(paths.skillDraftsDir)
+    const home = existsSync(paths.home) ? realpathSync(paths.home) : resolve(paths.home)
+    if (root !== home && !root.startsWith(home + sep)) return null
+    return root
+  }
+
   private async persist(run: SkillTrainRun): Promise<void> {
     try {
       if (!VALID_RUN_ID_RE.test(run.runId)) return
+      const root = this._safeRoot()
+      if (!root) return
       const dir = paths.skillDraftRunDir(run.runId)
       await mkdir(dir, { recursive: true })
-      // Verify the run dir resolves within the drafts root (guards a symlinked
-      // skill-drafts dir from widening the write surface beyond HOME).
+      // Verify the run dir resolves within the HOME-contained drafts root.
       const realDir = await realpath(dir)
-      const root = existsSync(paths.skillDraftsDir)
-        ? realpathSync(paths.skillDraftsDir)
-        : resolve(paths.skillDraftsDir)
-      if (realDir !== root && !realDir.startsWith(root + sep)) return
+      if (!realDir.startsWith(root + sep)) return
       const file = join(realDir, 'run.json')
       const tmp = join(realDir, `.run.json.tmp-${randomUUID()}`)
       await writeFile(tmp, `${JSON.stringify(run, null, 2)}\n`)
