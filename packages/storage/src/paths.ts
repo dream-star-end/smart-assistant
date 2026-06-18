@@ -45,6 +45,19 @@ export const paths = {
   sharedSkillsDir: join(HOME, 'skills'),
   sharedSkillDir: (skillName: string) => join(HOME, 'skills', skillName),
   sharedSkillMd: (skillName: string) => join(HOME, 'skills', skillName, 'SKILL.md'),
+  // Skill-training drafts (SkillOpt feature). A candidate SKILL.md produced by a
+  // training run / AI revision / manual edit is STAGED here before the user
+  // confirms a merge into the authoritative library above. Keyed by runId then
+  // skill name so one run can stage multiple candidates. Under HOME → persisted in
+  // the per-user named volume (survives container recycle). This is NEVER a write
+  // target for the authoritative SkillStore; promoting a draft is an explicit,
+  // separate store.save()/store.delete() at merge time.
+  skillDraftsDir: join(HOME, 'skill-drafts'),
+  skillDraftRunDir: (runId: string) => join(HOME, 'skill-drafts', runId),
+  skillDraftDir: (runId: string, skillName: string) =>
+    join(HOME, 'skill-drafts', runId, skillName),
+  skillDraftMd: (runId: string, skillName: string) =>
+    join(HOME, 'skill-drafts', runId, skillName, 'SKILL.md'),
   // ClawHub installed skills (shared across agents)
   hubDir: join(HOME, 'hub'),
   hubLockfile: join(HOME, 'hub', 'lock.json'),
