@@ -75,6 +75,67 @@ describe('bridge API allowlist', () => {
     )
   })
 
+  it('proxies SkillOpt training routes to the container with correct methods', () => {
+    assert.equal(
+      matchCommercialContainerApiProxy('/api/skills/deploy-flow/train', 'POST')?.label,
+      '/api/skills/:name/train',
+    )
+    assert.equal(
+      matchCommercialContainerApiProxy('/api/skill-training/train-abc123', 'GET')?.label,
+      '/api/skill-training/:runId',
+    )
+    assert.equal(
+      matchCommercialContainerApiProxy('/api/skill-training/train-abc123', 'DELETE')?.label,
+      '/api/skill-training/:runId',
+    )
+    assert.equal(
+      matchCommercialContainerApiProxy('/api/skill-training/train-abc123/drafts', 'GET')?.label,
+      '/api/skill-training/:runId/drafts',
+    )
+    assert.equal(
+      matchCommercialContainerApiProxy('/api/skill-training/train-abc/drafts/deploy-flow', 'PUT')
+        ?.label,
+      '/api/skill-training/:runId/drafts/:name',
+    )
+    assert.equal(
+      matchCommercialContainerApiProxy(
+        '/api/skill-training/train-abc/drafts/deploy-flow/comment',
+        'POST',
+      )?.label,
+      '/api/skill-training/:runId/drafts/:name/comment',
+    )
+    assert.equal(
+      matchCommercialContainerApiProxy('/api/skill-training/train-abc/merge', 'POST')?.label,
+      '/api/skill-training/:runId/merge',
+    )
+    // Wrong methods / shapes are rejected.
+    assert.equal(matchCommercialContainerApiProxy('/api/skills/deploy-flow/train', 'GET'), null)
+    // Skill-name segment must match the container's [a-z0-9-]+ exactly — no encoded
+    // slash/backslash, dots, uppercase, or extra path segments slip through the gate.
+    assert.equal(matchCommercialContainerApiProxy('/api/skills/a%2Fb/train', 'POST'), null)
+    assert.equal(matchCommercialContainerApiProxy('/api/skills/a%5Cb/train', 'POST'), null)
+    assert.equal(matchCommercialContainerApiProxy('/api/skills/a.b/train', 'POST'), null)
+    assert.equal(matchCommercialContainerApiProxy('/api/skills/Foo/train', 'POST'), null)
+    assert.equal(matchCommercialContainerApiProxy('/api/skills/a/b/train', 'POST'), null)
+    assert.equal(
+      matchCommercialContainerApiProxy('/api/skill-training/run-1/drafts/a%2Fb', 'GET'),
+      null,
+    )
+    assert.equal(
+      matchCommercialContainerApiProxy('/api/skill-training/run-1/drafts/Foo', 'PUT'),
+      null,
+    )
+    assert.equal(
+      matchCommercialContainerApiProxy('/api/skill-training/train-abc/drafts', 'POST'),
+      null,
+    )
+    assert.equal(
+      matchCommercialContainerApiProxy('/api/skill-training/train-abc/merge', 'GET'),
+      null,
+    )
+    assert.equal(matchCommercialContainerApiProxy('/api/skill-training/a%2Fb', 'GET'), null)
+  })
+
   it('rejects host-sensitive endpoints and unused methods', () => {
     assert.equal(matchCommercialContainerApiProxy('/api/config', 'GET'), null)
     assert.equal(matchCommercialContainerApiProxy('/api/search', 'POST'), null)

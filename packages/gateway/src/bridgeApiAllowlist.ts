@@ -89,6 +89,48 @@ export const BRIDGE_API_ALLOWLIST: readonly BridgeApiAllowRule[] = [
     methods: M('GET', 'PUT', 'DELETE'),
     proxyFromCommercial: true,
   },
+  // SkillOpt training (async; train → diff → confirm-merge). All operate on the user's
+  // OWN container skill volume, so they must be proxied to the container (and the
+  // container re-validates incoming bridge requests against this same allowlist).
+  {
+    label: '/api/skills/:name/train',
+    // skill name segment matches the container route exactly ([a-z0-9-]+) so the
+    // bridge gate is no looser than the handler (rejects %2F/%5C/uppercase/dots).
+    re: /^\/api\/skills\/[a-z0-9-]+\/train$/,
+    methods: M('POST'),
+    proxyFromCommercial: true,
+  },
+  {
+    label: '/api/skill-training/:runId',
+    re: /^\/api\/skill-training\/[A-Za-z0-9_-]+$/,
+    methods: M('GET', 'DELETE'),
+    proxyFromCommercial: true,
+  },
+  {
+    label: '/api/skill-training/:runId/drafts',
+    re: /^\/api\/skill-training\/[A-Za-z0-9_-]+\/drafts$/,
+    methods: M('GET'),
+    proxyFromCommercial: true,
+  },
+  {
+    label: '/api/skill-training/:runId/drafts/:name',
+    // draft :name is a skill name → match the container's [a-z0-9-]+ exactly.
+    re: /^\/api\/skill-training\/[A-Za-z0-9_-]+\/drafts\/[a-z0-9-]+$/,
+    methods: M('GET', 'PUT'),
+    proxyFromCommercial: true,
+  },
+  {
+    label: '/api/skill-training/:runId/drafts/:name/comment',
+    re: /^\/api\/skill-training\/[A-Za-z0-9_-]+\/drafts\/[a-z0-9-]+\/comment$/,
+    methods: M('POST'),
+    proxyFromCommercial: true,
+  },
+  {
+    label: '/api/skill-training/:runId/merge',
+    re: /^\/api\/skill-training\/[A-Za-z0-9_-]+\/merge$/,
+    methods: M('POST'),
+    proxyFromCommercial: true,
+  },
   {
     label: '/api/agent-teams',
     re: /^\/api\/agent-teams$/,
