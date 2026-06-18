@@ -12,11 +12,14 @@
 // tool it just invoked → which phase), never from the model self-reporting progress.
 
 import { randomUUID } from 'node:crypto'
-import { existsSync } from 'node:fs'
-import { mkdir, readFile, readdir, rename, rm, writeFile } from 'node:fs/promises'
-import { join } from 'node:path'
+import { existsSync, realpathSync } from 'node:fs'
+import { mkdir, readFile, readdir, realpath, rename, writeFile } from 'node:fs/promises'
+import { join, resolve, sep } from 'node:path'
 import { paths } from '@openclaude/storage'
 import type { SessionStreamEvent } from './ccbMessageParser.js'
+
+/** Same shape as SkillTrainJobStore.newRunId() output; guards path construction. */
+const VALID_RUN_ID_RE = /^[a-zA-Z0-9_-]{1,128}$/
 
 export type SkillTrainStatus =
   | 'queued'
@@ -218,25 +221,59 @@ export class SkillTrainJobStore {
       run.error = ev.error || 'training failed'
       run.finishedAt = now
       changed = true
-    } else if (ev.kind === 'final') {
-      // Terminal. Proposals staged → wait at the diff/confirm gate. Nothing staged
-      // (the agent replied "[SILENT]" / found no signal) → close as a no-op discard.
-      if (run.proposalCount > 0) {
-        run.status = 'diff_ready'
-        run.phase = 'diff_ready'
-      } else {
-        run.status = 'discarded'
-        run.phase = 'done'
-      }
-      run.finishedAt = now
-      changed = true
     }
+    // NOTE: 'final' is intentionally NOT terminal here. proposalCount counts
+    // skill_propose *calls*, but a call can be rejected (bad name, etc.), so it is not
+    // the source of truth for "are there drafts". The caller resolves the terminal
+    // state from the actual draft-store count via finalize() instead.
 
     if (changed) {
       run.updatedAt = now
       await this.persist(run)
       this.onChange(run)
     }
+  }
+
+  /**
+   * Resolve the terminal state on the agent's `final` event from the ACTUAL number of
+   * staged drafts (source of truth), not the proposal-call count: drafts present →
+   * wait at the diff/confirm gate; none → close as a no-op discard ("[SILENT]" / all
+   * proposals rejected). `draftCount` also overwrites the displayed proposalCount so a
+   * comment re-run that re-proposes the same skill doesn't inflate the number.
+   */
+  async finalize(runId: string, draftCount: number, now: number): Promise<void> {
+    const run = this.runs.get(runId)
+    if (!run || !ACTIVE_STATUSES.has(run.status)) return
+    run.proposalCount = draftCount
+    if (draftCount > 0) {
+      run.status = 'diff_ready'
+      run.phase = 'diff_ready'
+    } else {
+      run.status = 'discarded'
+      run.phase = 'done'
+    }
+    run.finishedAt = now
+    run.updatedAt = now
+    await this.persist(run)
+    this.onChange(run)
+  }
+
+  /**
+   * Re-open a diff_ready run for another agentic pass (a user comment → AI revision).
+   * Resets status to running and rewinds the phase so progress advances again from a
+   * running baseline (the monotonic guard in applyEvent would otherwise pin it at
+   * diff_ready). No-op if the run is already active or gone.
+   */
+  async reopen(runId: string, now: number): Promise<void> {
+    const run = this.runs.get(runId)
+    if (!run) return
+    if (ACTIVE_STATUSES.has(run.status)) return
+    run.status = 'running'
+    run.phase = 'evaluating'
+    run.finishedAt = null
+    run.updatedAt = now
+    await this.persist(run)
+    this.onChange(run)
   }
 
   /** Mark a terminal user action (merge/discard) or an external failure. */
@@ -281,6 +318,7 @@ export class SkillTrainJobStore {
       return
     }
     for (const runId of dirs) {
+      if (!VALID_RUN_ID_RE.test(runId)) continue
       const file = join(root, runId, 'run.json')
       if (!existsSync(file)) continue
       try {
@@ -299,10 +337,18 @@ export class SkillTrainJobStore {
 
   private async persist(run: SkillTrainRun): Promise<void> {
     try {
+      if (!VALID_RUN_ID_RE.test(run.runId)) return
       const dir = paths.skillDraftRunDir(run.runId)
       await mkdir(dir, { recursive: true })
-      const file = join(dir, 'run.json')
-      const tmp = join(dir, `.run.json.tmp-${randomUUID()}`)
+      // Verify the run dir resolves within the drafts root (guards a symlinked
+      // skill-drafts dir from widening the write surface beyond HOME).
+      const realDir = await realpath(dir)
+      const root = existsSync(paths.skillDraftsDir)
+        ? realpathSync(paths.skillDraftsDir)
+        : resolve(paths.skillDraftsDir)
+      if (realDir !== root && !realDir.startsWith(root + sep)) return
+      const file = join(realDir, 'run.json')
+      const tmp = join(realDir, `.run.json.tmp-${randomUUID()}`)
       await writeFile(tmp, `${JSON.stringify(run, null, 2)}\n`)
       await rename(tmp, file)
     } catch {

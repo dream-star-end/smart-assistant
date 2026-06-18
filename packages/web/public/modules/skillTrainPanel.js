@@ -248,6 +248,19 @@ function _renderLineDiff(oldText, newText) {
   const b = newText ? newText.split('\n') : []
   const n = a.length
   const m = b.length
+  // LCS is O(n*m); for very large skills fall back to a plain del-all/add-all block
+  // rather than freeze the UI building an n*m table.
+  if (n * m > 400_000) {
+    const del = a.map(
+      (l) =>
+        `<div class="skt-row skt-del"><span class="skt-sign">-</span>${htmlSafeEscape(l)}</div>`,
+    )
+    const add = b.map(
+      (l) =>
+        `<div class="skt-row skt-add"><span class="skt-sign">+</span>${htmlSafeEscape(l)}</div>`,
+    )
+    return `<div class="skt-diff-empty">(内容较大,按整体替换展示)</div>${del.join('')}${add.join('')}`
+  }
   const dp = Array.from({ length: n + 1 }, () => new Array(m + 1).fill(0))
   for (let i = n - 1; i >= 0; i--) {
     for (let j = m - 1; j >= 0; j--) {
@@ -367,8 +380,10 @@ async function _refresh() {
       return
     }
     await _renderDiffReady(run)
-  } catch (err) {
-    toast(`刷新失败:${String(err)}`, 'error')
+  } catch {
+    // The run is gone (fully merged → forgotten, or discarded). That's a success
+    // terminal after a merge, not an error.
+    _renderTerminal('本次训练已结束,技能库已更新。')
   }
 }
 

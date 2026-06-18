@@ -66,7 +66,8 @@ import {
   claimSession,
 } from '@openclaude/storage'
 import { normalizeAgentTeamInput, TEAM_ID_RE } from './agentTeams.js'
-import { SkillTrainJobStore } from './skillTrainJobs.js'
+import type { SessionStreamEvent } from './ccbMessageParser.js'
+import { type SkillTrainRun, SkillTrainJobStore } from './skillTrainJobs.js'
 import {
   SKILL_TRAIN_DEFAULT_MODEL,
   SKILL_TRAIN_EFFORT,
@@ -4859,6 +4860,45 @@ export class Gateway {
     return cfg.agents.find((a) => a.id === 'main') ?? cfg.agents[0] ?? null
   }
 
+  /**
+   * Resolve a run-scoped request: the run must exist AND be owned by the caller.
+   * Sends 404/403 and returns null on failure. Every run-scoped endpoint (status,
+   * drafts, diff, comment, merge, discard) gates on this so a leaked runId cannot be
+   * read or mutated across users.
+   */
+  private _ownedTrainRun(
+    req: IncomingMessage,
+    res: ServerResponse,
+    runId: string,
+  ): SkillTrainRun | null {
+    const run = this.skillTrainJobs.get(runId)
+    if (!run) {
+      this.sendError(res, 404, 'training run not found')
+      return null
+    }
+    if (run.userId !== this.getUserId(req)) {
+      this.sendError(res, 403, 'forbidden')
+      return null
+    }
+    return run
+  }
+
+  /**
+   * Fold a training session's stream event into the run state. On the agent's `final`
+   * event the terminal state is resolved from the ACTUAL staged-draft count (source of
+   * truth), not the proposal-call count; other events flow through applyEvent.
+   */
+  private _onTrainEvent(runId: string, e: SessionStreamEvent): void {
+    if (e.kind === 'final') {
+      void this.skillDrafts
+        .listDrafts(runId)
+        .then((d) => this.skillTrainJobs.finalize(runId, d.length, Date.now()))
+        .catch(() => {})
+      return
+    }
+    void this.skillTrainJobs.applyEvent(runId, e, Date.now())
+  }
+
   // POST /api/skills/:name/train — start an async DeepSeek training run for ONE
   // user-authored skill. Returns a runId immediately; progress via GET status.
   private async _handleSkillTrainStart(
@@ -4916,9 +4956,7 @@ export class Gateway {
       .submit(
         session,
         buildSkillTrainPrompt(opts),
-        (e) => {
-          void this.skillTrainJobs.applyEvent(runId, e, Date.now())
-        },
+        (e) => this._onTrainEvent(runId, e),
         SKILL_TRAIN_EFFORT,
         SKILL_TRAIN_DEFAULT_MODEL,
         runId,
@@ -4935,9 +4973,9 @@ export class Gateway {
     res: ServerResponse,
     runId: string,
   ): Promise<void> {
+    const run = this._ownedTrainRun(req, res, runId)
+    if (!run) return
     if (req.method === 'GET') {
-      const run = this.skillTrainJobs.get(runId)
-      if (!run) return this.sendError(res, 404, 'training run not found')
       this.sendJson(res, 200, { run })
       return
     }
@@ -4958,6 +4996,7 @@ export class Gateway {
     runId: string,
   ): Promise<void> {
     if (req.method !== 'GET') return this.sendError(res, 405, 'method not allowed')
+    if (!this._ownedTrainRun(req, res, runId)) return
     const drafts = await this.skillDrafts.listDrafts(runId)
     this.sendJson(res, 200, { drafts })
   }
@@ -4970,6 +5009,7 @@ export class Gateway {
     runId: string,
     skillName: string,
   ): Promise<void> {
+    if (!this._ownedTrainRun(req, res, runId)) return
     if (req.method === 'GET') {
       const draft = await this.skillDrafts.readDraft(runId, skillName)
       if (!draft) return this.sendError(res, 404, 'draft not found')
@@ -5016,8 +5056,8 @@ export class Gateway {
     skillName: string,
   ): Promise<void> {
     if (req.method !== 'POST') return this.sendError(res, 405, 'method not allowed')
-    const run = this.skillTrainJobs.get(runId)
-    if (!run) return this.sendError(res, 404, 'training run not found')
+    const run = this._ownedTrainRun(req, res, runId)
+    if (!run) return
     const body = await this.readJsonBody<{ comment: string; lineRange?: string }>(req)
     const comment = (body?.comment ?? '').trim()
     if (!comment) return this.sendError(res, 400, 'comment required')
@@ -5044,14 +5084,12 @@ export class Gateway {
       effortLevel: SKILL_TRAIN_EFFORT,
       skillTrainRunId: runId,
     })
-    await this.skillTrainJobs.setStatus(runId, 'running', Date.now())
+    await this.skillTrainJobs.reopen(runId, Date.now())
     void this.sessions
       .submit(
         session,
         revisePrompt,
-        (e) => {
-          void this.skillTrainJobs.applyEvent(runId, e, Date.now())
-        },
+        (e) => this._onTrainEvent(runId, e),
         SKILL_TRAIN_EFFORT,
         SKILL_TRAIN_DEFAULT_MODEL,
         runId,
@@ -5070,6 +5108,11 @@ export class Gateway {
     runId: string,
   ): Promise<void> {
     if (req.method !== 'POST') return this.sendError(res, 405, 'method not allowed')
+    const run = this._ownedTrainRun(req, res, runId)
+    if (!run) return
+    if (run.status !== 'diff_ready') {
+      return this.sendError(res, 409, `run is not ready to merge (status: ${run.status})`)
+    }
     const body = await this.readJsonBody<{ name?: string }>(req).catch(
       () => ({}) as { name?: string },
     )

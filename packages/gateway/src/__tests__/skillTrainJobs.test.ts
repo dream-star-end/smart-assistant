@@ -84,19 +84,42 @@ describe('SkillTrainJobStore.applyEvent', () => {
     assert.equal(store.get('r1')?.toolCalls, 0)
   })
 
-  it('final with proposals → diff_ready; without → discarded', async () => {
+  it('applyEvent does not terminalize on final (caller finalizes by draft count)', async () => {
     const store = new SkillTrainJobStore()
     await freshRun(store, 'r1')
     await store.applyEvent('r1', tool('skill_propose'), T0 + 1)
     await store.applyEvent('r1', { kind: 'final', meta: { stopReason: 'end_turn' } } as any, T0 + 2)
+    assert.equal(store.get('r1')?.status, 'running') // still active; final is no-op here
+  })
+
+  it('finalize: actual drafts → diff_ready (count overwrites proposalCount); none → discarded', async () => {
+    const store = new SkillTrainJobStore()
+    await freshRun(store, 'r1')
+    await store.applyEvent('r1', tool('skill_propose'), T0 + 1)
+    await store.applyEvent('r1', tool('skill_propose'), T0 + 2) // 2 propose calls...
+    await store.finalize('r1', 1, T0 + 3) // ...but only 1 real draft staged
     assert.equal(store.get('r1')?.status, 'diff_ready')
-    assert.equal(store.get('r1')?.finishedAt, T0 + 2)
+    assert.equal(store.get('r1')?.proposalCount, 1) // reconciled to actual count
+    assert.equal(store.get('r1')?.finishedAt, T0 + 3)
 
     const store2 = new SkillTrainJobStore()
     await freshRun(store2, 'r2')
-    await store2.applyEvent('r2', { kind: 'final', meta: {} } as any, T0 + 5)
+    await store2.finalize('r2', 0, T0 + 5)
     assert.equal(store2.get('r2')?.status, 'discarded')
     assert.equal(store2.get('r2')?.phase, 'done')
+  })
+
+  it('reopen: diff_ready → running so a comment revision pass advances the bar again', async () => {
+    const store = new SkillTrainJobStore()
+    await freshRun(store, 'r1')
+    await store.finalize('r1', 1, T0 + 1)
+    assert.equal(store.get('r1')?.status, 'diff_ready')
+    await store.reopen('r1', T0 + 2)
+    assert.equal(store.get('r1')?.status, 'running')
+    assert.equal(store.get('r1')?.phase, 'evaluating')
+    assert.equal(store.get('r1')?.finishedAt, null)
+    await store.applyEvent('r1', tool('skill_propose'), T0 + 3) // phase advances again
+    assert.equal(store.get('r1')?.phase, 'drafting')
   })
 
   it('error → failed terminal, ignores later events', async () => {

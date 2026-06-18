@@ -471,7 +471,14 @@ const SKILL_PROPOSE_TOOL = {
 }
 
 server.setRequestHandler(ListToolsRequestSchema, async () => ({
-  tools: SKILL_TRAIN_RUN_ID ? [...TOOLS, SKILL_PROPOSE_TOOL] : TOOLS,
+  // In a training session the authoritative-write tools are REMOVED (training must
+  // only stage drafts via skill_propose); normal sessions keep the full toolset.
+  tools: SKILL_TRAIN_RUN_ID
+    ? [
+        ...TOOLS.filter((t) => t.name !== 'skill_save' && t.name !== 'skill_delete'),
+        SKILL_PROPOSE_TOOL,
+      ]
+    : TOOLS,
 }))
 
 // ─────────────────────────────────────────────────────────────
@@ -718,6 +725,11 @@ async function handleSkillSave(args: {
   body: string
   tags?: string[]
 }) {
+  // Defense in depth: training sessions must never write the authoritative library
+  // (the tool is also removed from the training tool list above).
+  if (SKILL_TRAIN_RUN_ID) {
+    return toolError('skill_save is disabled during a training run — use skill_propose (draft only)')
+  }
   const r = await skills.save(
     {
       name: args.name,
@@ -731,6 +743,11 @@ async function handleSkillSave(args: {
 }
 
 async function handleSkillDelete(args: { name: string }) {
+  if (SKILL_TRAIN_RUN_ID) {
+    return toolError(
+      'skill_delete is disabled during a training run — use skill_propose op="delete" (draft only)',
+    )
+  }
   const r = await skills.delete(args.name)
   if (!r.ok) return toolError(r.error ?? 'delete failed')
   // PR4: when a user shadow was removed but the platform baseline remains,
