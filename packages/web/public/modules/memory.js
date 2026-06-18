@@ -67,6 +67,19 @@ function _setBusy(btn, busy, label) {
   }
 }
 
+// Skills mobile detail: below this width the detail/editor pane is shown as a
+// full-screen overlay over the list (tap a skill → popup; back button to return).
+function _isMobileSkills() {
+  return typeof window !== 'undefined' && window.matchMedia('(max-width: 860px)').matches
+}
+function _openSkillDetailOverlay() {
+  document.querySelector('.skills-layout')?.classList.add('detail-open')
+}
+function _closeSkillDetailOverlay() {
+  document.querySelector('.skills-layout')?.classList.remove('detail-open')
+  $('skill-editor').hidden = true
+}
+
 function _syncMemoryEditorState() {
   if (_memoryRawMode) {
     const text = $('memory-raw-text')?.value || ''
@@ -237,6 +250,8 @@ export async function openSkillsModal(agentId) {
 
 export async function switchContextHubTab(tab) {
   _hubTab = CONTEXT_TABS.includes(tab) ? tab : 'memory'
+  // Never carry a mobile skill-detail overlay across tab switches / hub re-open.
+  _closeSkillDetailOverlay()
   for (const t of CONTEXT_TABS) {
     const btn = document.querySelector(`[data-context-tab="${t}"]`)
     const panel = $(CONTEXT_PANEL_IDS[t])
@@ -388,11 +403,20 @@ async function _loadSkills() {
     // User-level shared skill library — visible/usable across ALL of the user's
     // agents (not filtered by the currently-active agent).
     const data = await apiGet('/api/skills')
-    _skillsCache = data.skills || []
-    _selectedSkill = _skillsCache[0]?.name || null
+    // This manager is for the user's OWN skills — hide platform baseline/seed skills
+    // (read-only, not user content) so the list isn't dominated by them.
+    _skillsCache = (data.skills || []).filter((s) => s.source !== 'platform')
     _renderSkillsList()
-    if (_selectedSkill) await _loadSkillDetail(_selectedSkill)
-    else _renderSkillEmpty()
+    // On mobile, opening a detail pops a full-screen overlay — don't auto-open one on
+    // load; show the list first and let the user tap a skill.
+    if (_isMobileSkills()) {
+      _selectedSkill = null
+      _renderSkillEmpty()
+    } else {
+      _selectedSkill = _skillsCache[0]?.name || null
+      if (_selectedSkill) await _loadSkillDetail(_selectedSkill)
+      else _renderSkillEmpty()
+    }
   } catch (err) {
     if (wrap) wrap.innerHTML = `<div class="context-error">加载失败：${htmlSafeEscape(String(err))}</div>`
     toast(String(err), 'error', toastOptsFromError(err))
@@ -427,6 +451,10 @@ function _renderSkillsList() {
 }
 
 function _renderSkillEmpty() {
+  // Empty detail = nothing selected → on mobile drop the overlay back to the list
+  // (covers initial load, post-delete reload, and the no-skills case so the user is
+  // never trapped in a backless overlay).
+  _closeSkillDetailOverlay()
   $('skill-detail').innerHTML = '<div class="context-empty-card"><div class="context-empty-icon">✨</div><strong>选择一个技能查看详情</strong><p>技能会在相关任务开始前被 Agent 按需加载。</p></div>'
   $('skill-delete-btn').hidden = true
 }
@@ -434,6 +462,8 @@ function _renderSkillEmpty() {
 async function _loadSkillDetail(name) {
   _selectedSkill = name
   _renderSkillsList()
+  // On mobile, present the detail as a full-screen overlay over the list.
+  _openSkillDetailOverlay()
   const detail = $('skill-detail')
   detail.innerHTML = '<div class="context-loading">读取技能详情中…</div>'
   try {
@@ -445,6 +475,7 @@ async function _loadSkillDetail(name) {
     const canEdit = skill.writable === true
     const badgeText = isPlatform ? '平台只读' : canEdit ? '自建可编辑' : '自建·迁移中(只读)'
     detail.innerHTML = `
+      <button type="button" id="skill-detail-back" class="skill-detail-back btn btn-ghost btn-sm">← 返回技能列表</button>
       <div class="skill-detail-head">
         <div><span class="source-badge ${isPlatform ? 'platform' : 'user'}">${badgeText}</span><h4>${htmlSafeEscape(skill.name)}</h4><p>${htmlSafeEscape(skill.description || '')}</p></div>
         <div class="skill-detail-head-btns">
@@ -455,17 +486,31 @@ async function _loadSkillDetail(name) {
       <div class="skill-detail-tags">${(skill.tags || []).map((tag) => `<span>${htmlSafeEscape(tag)}</span>`).join('')}</div>
       <pre class="skill-body-preview">${htmlSafeEscape(skill.body || skill.rawContent || '')}</pre>`
     $('skill-delete-btn').hidden = !canEdit
+    detail.querySelector('#skill-detail-back')?.addEventListener('click', () => {
+      _closeSkillDetailOverlay()
+      _selectedSkill = null
+      _renderSkillsList()
+    })
     detail.querySelector('#skill-edit-inline')?.addEventListener('click', () => _openSkillEditor(skill))
     detail
       .querySelector('#skill-train-inline')
       ?.addEventListener('click', () => openSkillTrainPanel(skill.name))
   } catch (err) {
-    detail.innerHTML = `<div class="context-error">加载失败：${htmlSafeEscape(String(err))}</div>`
+    // Keep a back button on the error path too, so a failed fetch can't trap the user
+    // inside the mobile overlay.
+    detail.innerHTML = `<button type="button" id="skill-detail-back" class="skill-detail-back btn btn-ghost btn-sm">← 返回技能列表</button><div class="context-error">加载失败：${htmlSafeEscape(String(err))}</div>`
+    detail.querySelector('#skill-detail-back')?.addEventListener('click', () => {
+      _closeSkillDetailOverlay()
+      _selectedSkill = null
+      _renderSkillsList()
+    })
   }
 }
 
 function _openSkillEditor(skill) {
   $('skill-editor').hidden = false
+  // On mobile, surface the editor in the detail overlay (incl. the "新建技能" flow).
+  _openSkillDetailOverlay()
   $('skill-editor-title').textContent = skill ? `编辑 ${skill.name}` : '新建技能'
   $('skill-editor-name').value = skill?.name || ''
   $('skill-editor-name').disabled = !!skill
@@ -477,6 +522,9 @@ function _openSkillEditor(skill) {
 
 function _closeSkillEditor() {
   $('skill-editor').hidden = true
+  // If the editor was opened standalone (新建技能, no skill selected), leaving it on
+  // mobile should drop the overlay back to the list rather than show an empty detail.
+  if (!_selectedSkill) _closeSkillDetailOverlay()
 }
 
 async function _saveSkillEditor() {
