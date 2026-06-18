@@ -1180,6 +1180,12 @@ export class SessionManager {
      * existing-session reuse. CCB sanitizer requires `[a-z0-9_-]{0,32}`.
      */
     workload?: string
+    /**
+     * SkillOpt training run id. Set ONLY for a skill-training session; forwarded to
+     * the runner → mcp-memory env so the draft-only `skill_propose` tool is exposed
+     * and bound to this run. Spawn-time attribute (preserved across model respawn).
+     */
+    skillTrainRunId?: string
   }): Promise<AgentSession> {
     // 新建时 null 等同 undefined(都让 CCB 用模型默认)
     const initialEffort: string | undefined =
@@ -1295,6 +1301,7 @@ export class SessionManager {
         sessionId: repoSessionId,
         getRepoSnapshot: this._getRepoSnapshot,
         workload: opts.workload,
+        skillTrainRunId: opts.skillTrainRunId,
       })
     }
     const now = Date.now()

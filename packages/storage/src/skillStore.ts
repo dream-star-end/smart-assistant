@@ -958,3 +958,30 @@ export function buildUserSkillStore(agentId = 'main'): SkillStore {
     }
   }
 }
+
+/**
+ * True iff `name` is reserved by a PLATFORM skill — the env baseline OR ANY agent's
+ * read-only seed. This is the authoritative reserved-name predicate that
+ * `SkillStore.save()` enforces on the write path; expose it so callers (e.g. skill
+ * training's `skill_propose`) can reject a proposal up front regardless of which
+ * agent's overlay they can see, instead of only failing at merge time.
+ */
+export async function isPlatformReservedSkillName(name: string): Promise<boolean> {
+  if (!validateSkillName(name).ok) return false
+  const baselineDir = resolveBaselineSkillsDirFromEnv()
+  if (baselineDir && existsSync(join(baselineDir, name, 'SKILL.md'))) return true
+  const agentsDir = paths.agentsDir
+  if (!existsSync(agentsDir)) return false
+  let entries: Dirent[]
+  try {
+    entries = await readdir(agentsDir, { withFileTypes: true })
+  } catch {
+    return false
+  }
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue
+    if (!VALID_AGENT_ID_RE.test(entry.name)) continue
+    if (existsSync(join(paths.agentSeedSkillsDir(entry.name), name, 'SKILL.md'))) return true
+  }
+  return false
+}

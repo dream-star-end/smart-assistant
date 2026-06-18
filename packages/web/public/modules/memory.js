@@ -4,6 +4,7 @@ import { $, htmlSafeEscape } from './dom.js?v=4a9e0139'
 import { getSession, state } from './state.js?v=4a9e0139'
 import { confirmDialog, openModal, toast, toastOptsFromError } from './ui.js?v=4a9e0139'
 import { _cronHuman } from './util.js?v=4a9e0139'
+import { openSkillTrainPanel } from './skillTrainPanel.js?v=auto'
 
 const MEMORY_DELIMITER = '\n§\n'
 const CONTEXT_TABS = ['memory', 'skills', 'tasks']
@@ -446,12 +447,18 @@ async function _loadSkillDetail(name) {
     detail.innerHTML = `
       <div class="skill-detail-head">
         <div><span class="source-badge ${isPlatform ? 'platform' : 'user'}">${badgeText}</span><h4>${htmlSafeEscape(skill.name)}</h4><p>${htmlSafeEscape(skill.description || '')}</p></div>
-        <button type="button" id="skill-edit-inline" class="btn btn-secondary" ${canEdit ? '' : 'disabled'}>${canEdit ? '编辑' : '只读'}</button>
+        <div class="skill-detail-head-btns">
+          ${canEdit ? '<button type="button" id="skill-train-inline" class="btn btn-secondary">训练优化</button>' : ''}
+          <button type="button" id="skill-edit-inline" class="btn btn-secondary" ${canEdit ? '' : 'disabled'}>${canEdit ? '编辑' : '只读'}</button>
+        </div>
       </div>
       <div class="skill-detail-tags">${(skill.tags || []).map((tag) => `<span>${htmlSafeEscape(tag)}</span>`).join('')}</div>
       <pre class="skill-body-preview">${htmlSafeEscape(skill.body || skill.rawContent || '')}</pre>`
     $('skill-delete-btn').hidden = !canEdit
     detail.querySelector('#skill-edit-inline')?.addEventListener('click', () => _openSkillEditor(skill))
+    detail
+      .querySelector('#skill-train-inline')
+      ?.addEventListener('click', () => openSkillTrainPanel(skill.name))
   } catch (err) {
     detail.innerHTML = `<div class="context-error">加载失败：${htmlSafeEscape(String(err))}</div>`
   }

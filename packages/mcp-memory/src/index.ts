@@ -28,8 +28,11 @@ import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprot
 import {
   type EmbeddingProvider,
   MemoryStore,
+  SkillDraftStore,
   type SkillStore,
   buildAgentSkillStore,
+  isPlatformReservedSkillName,
+  validateSkillName,
   archivalAdd,
   archivalCount,
   archivalDelete,
@@ -100,6 +103,15 @@ function buildSkillStore(): SkillStore {
 }
 
 const skills = buildSkillStore()
+
+// Skill-training run id, set by the gateway ONLY when this mcp-memory subprocess is
+// itself a skill-training session. When present, the draft-only `skill_propose` tool
+// is exposed so the agent can stage candidate skill changes for this run. This env is
+// the authoritative run identity — the model cannot redirect proposals to a different
+// run via tool args (guarded in handleSkillPropose). Absent in normal sessions, where
+// skill_propose is neither listed nor usable.
+const SKILL_TRAIN_RUN_ID = (process.env.OPENCLAUDE_SKILL_TRAIN_RUN_ID ?? '').trim()
+const drafts = new SkillDraftStore()
 
 // Track in-flight embedding tasks to prevent add/delete race conditions
 const pendingEmbeds = new Map<string, Promise<void>>()
@@ -425,7 +437,50 @@ const TOOLS = [
   },
 ]
 
-server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }))
+// Draft-only skill proposal tool. Exposed ONLY inside a skill-training session
+// (OPENCLAUDE_SKILL_TRAIN_RUN_ID set). Stages a candidate change into the run's draft
+// area; it never touches the authoritative library. The user reviews each draft as a
+// diff and confirms the merge afterward.
+const SKILL_PROPOSE_TOOL = {
+  name: 'skill_propose',
+  description: [
+    'Stage a candidate skill change for the current training run (draft only — NOT applied).',
+    'The user reviews your proposals as a diff and confirms the merge afterward.',
+    '',
+    'Provide:',
+    '  name        — target skill name (lowercase a-z 0-9 -, max 64 chars)',
+    '  op          — "create" (new skill), "update" (revise existing), or "delete" (propose removal)',
+    '  description — when-to-use summary (required for create/update, max 1024 chars)',
+    '  body        — full SKILL.md instructions (required for create/update)',
+    '  tags        — optional topical tags',
+    '  rationale   — one paragraph citing the evidence sessions for this change',
+    '',
+    'Only USER-AUTHORED skills can be proposed against; platform baseline/agent-seed skills are rejected.',
+  ].join('\n'),
+  inputSchema: {
+    type: 'object',
+    properties: {
+      name: { type: 'string' },
+      op: { type: 'string', enum: ['create', 'update', 'delete'] },
+      description: { type: 'string' },
+      body: { type: 'string' },
+      tags: { type: 'array', items: { type: 'string' } },
+      rationale: { type: 'string' },
+    },
+    required: ['name', 'op', 'rationale'],
+  },
+}
+
+server.setRequestHandler(ListToolsRequestSchema, async () => ({
+  // In a training session the authoritative-write tools are REMOVED (training must
+  // only stage drafts via skill_propose); normal sessions keep the full toolset.
+  tools: SKILL_TRAIN_RUN_ID
+    ? [
+        ...TOOLS.filter((t) => t.name !== 'skill_save' && t.name !== 'skill_delete'),
+        SKILL_PROPOSE_TOOL,
+      ]
+    : TOOLS,
+}))
 
 // ─────────────────────────────────────────────────────────────
 // Tool handlers
@@ -448,6 +503,8 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
         return await handleSkillSave(args as any)
       case 'skill_delete':
         return await handleSkillDelete(args as any)
+      case 'skill_propose':
+        return await handleSkillPropose(args as any)
       case 'archival_add':
         return await handleArchivalAdd(args as any)
       case 'archival_search':
@@ -669,6 +726,11 @@ async function handleSkillSave(args: {
   body: string
   tags?: string[]
 }) {
+  // Defense in depth: training sessions must never write the authoritative library
+  // (the tool is also removed from the training tool list above).
+  if (SKILL_TRAIN_RUN_ID) {
+    return toolError('skill_save is disabled during a training run — use skill_propose (draft only)')
+  }
   const r = await skills.save(
     {
       name: args.name,
@@ -682,6 +744,11 @@ async function handleSkillSave(args: {
 }
 
 async function handleSkillDelete(args: { name: string }) {
+  if (SKILL_TRAIN_RUN_ID) {
+    return toolError(
+      'skill_delete is disabled during a training run — use skill_propose op="delete" (draft only)',
+    )
+  }
   const r = await skills.delete(args.name)
   if (!r.ok) return toolError(r.error ?? 'delete failed')
   // PR4: when a user shadow was removed but the platform baseline remains,
@@ -690,6 +757,89 @@ async function handleSkillDelete(args: { name: string }) {
     ? `Deleted skill "${args.name}". ${r.note}`
     : `Deleted skill "${args.name}".`
   return toolOk(msg)
+}
+
+// Draft-only proposal handler (skill-training sessions only). Stages a candidate
+// change into the run's draft area; never writes the authoritative library. Authority
+// rules: (1) the run id comes from the spawn env, not tool args — the model cannot
+// redirect drafts to another run; (2) only user-authored skills may be proposed
+// against — platform baseline/agent-seed skills are read-only and rejected.
+async function handleSkillPropose(args: {
+  name: string
+  op: 'create' | 'update' | 'delete'
+  description?: string
+  body?: string
+  tags?: string[]
+  rationale?: string
+  runId?: string
+}) {
+  if (!SKILL_TRAIN_RUN_ID) {
+    return toolError('skill_propose is only available during a skill-training run')
+  }
+  if (args.runId && args.runId !== SKILL_TRAIN_RUN_ID) {
+    return toolError(`runId mismatch — this training run is "${SKILL_TRAIN_RUN_ID}"`)
+  }
+  const op = args.op
+  if (op !== 'create' && op !== 'update' && op !== 'delete') {
+    return toolError('op must be "create", "update", or "delete"')
+  }
+  const nameCheck = validateSkillName(args.name)
+  if (!nameCheck.ok) return toolError(nameCheck.error ?? 'invalid skill name')
+  const rationale = typeof args.rationale === 'string' ? args.rationale.trim() : ''
+  if (!rationale) return toolError('rationale required — cite the evidence for this change')
+
+  // Authoritative reserved-name guard: reject names reserved by the env baseline OR
+  // ANY agent's seed up front (same invariant SkillStore.save enforces at merge), not
+  // just the names visible in THIS training agent's overlay.
+  if (await isPlatformReservedSkillName(args.name)) {
+    return toolError(`"${args.name}" is reserved by a platform skill — cannot propose changes to it`)
+  }
+
+  // Resolve the current authoritative skill (baseline-wins overlay) for authority
+  // checks + base-version pinning.
+  const current = await skills.view(args.name)
+  const currentMeta = current && typeof current !== 'string' ? current : null
+  if (currentMeta && currentMeta.source === 'platform') {
+    return toolError(
+      `"${args.name}" is a platform skill (read-only) — cannot propose changes to it`,
+    )
+  }
+  if (op === 'create' && currentMeta) {
+    return toolError(`"${args.name}" already exists — use op="update" instead`)
+  }
+  if ((op === 'update' || op === 'delete') && !currentMeta) {
+    return toolError(`"${args.name}" not found among your skills — use op="create" to add it`)
+  }
+  if (op !== 'delete') {
+    const description = typeof args.description === 'string' ? args.description.trim() : ''
+    const body = typeof args.body === 'string' ? args.body : ''
+    if (!description) return toolError('description required for create/update')
+    if (!body.trim()) return toolError('body required for create/update')
+    const res = await drafts.writeDraft({
+      runId: SKILL_TRAIN_RUN_ID,
+      op,
+      meta: { name: args.name, description, tags: args.tags },
+      body,
+      rationale,
+      authoredBy: 'ai',
+      baseVersion: currentMeta?.version ?? null,
+    })
+    if (!res.ok) return toolError(res.error ?? 'propose failed')
+  } else {
+    const res = await drafts.writeDraft({
+      runId: SKILL_TRAIN_RUN_ID,
+      op: 'delete',
+      meta: { name: args.name, description: currentMeta?.description ?? '' },
+      body: '',
+      rationale,
+      authoredBy: 'ai',
+      baseVersion: currentMeta?.version ?? null,
+    })
+    if (!res.ok) return toolError(res.error ?? 'propose failed')
+  }
+  return toolOk(
+    `Staged ${op} draft for "${args.name}" (run ${SKILL_TRAIN_RUN_ID}). Awaiting user review in the diff panel.`,
+  )
 }
 
 // ── Archival Memory handlers ──

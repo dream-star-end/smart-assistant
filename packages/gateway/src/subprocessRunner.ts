@@ -208,6 +208,13 @@ export interface SubprocessRunnerOpts {
    * pass values matching that shape (currently only `'cron'`).
    */
   workload?: string
+  /**
+   * Skill-training run id. Set ONLY when this session is a SkillOpt training run;
+   * forwarded to the mcp-memory subprocess as `OPENCLAUDE_SKILL_TRAIN_RUN_ID`, which
+   * gates the draft-only `skill_propose` tool and binds its writes to this run.
+   * Spawn-time attribute (read once when the mcp env is built), like delegationDepth.
+   */
+  skillTrainRunId?: string
 }
 
 // CCB 输出的 SDK message 类型(简化):兼容 stream-json 输出
@@ -1146,6 +1153,11 @@ export class SubprocessRunner extends EventEmitter {
                   OPENCLAUDE_BASELINE_SKILLS_DIR:
                     process.env.OPENCLAUDE_BASELINE_SKILLS_DIR,
                 }
+              : {}),
+            // SkillOpt training: expose the draft-only skill_propose tool bound to
+            // this run. Only set for training sessions, so normal sessions never see it.
+            ...(this.opts.skillTrainRunId
+              ? { OPENCLAUDE_SKILL_TRAIN_RUN_ID: this.opts.skillTrainRunId }
               : {}),
           },
         }

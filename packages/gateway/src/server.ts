@@ -45,6 +45,7 @@ import {
   MemoryStore,
   type OpenClaudeConfig,
   SkillStore,
+  SkillDraftStore,
   TaskStore,
   buildAgentSkillStore,
   buildUserSkillStore,
@@ -65,6 +66,14 @@ import {
   claimSession,
 } from '@openclaude/storage'
 import { normalizeAgentTeamInput, TEAM_ID_RE } from './agentTeams.js'
+import type { SessionStreamEvent } from './ccbMessageParser.js'
+import { type SkillTrainRun, SkillTrainJobStore } from './skillTrainJobs.js'
+import {
+  SKILL_TRAIN_DEFAULT_MODEL,
+  SKILL_TRAIN_EFFORT,
+  buildSkillTrainPrompt,
+  normalizeSkillTrainArgs,
+} from './skillTrain.js'
 import { type WebSocket, WebSocketServer } from 'ws'
 import { checkToken, verifyPassword, signJwt, verifyJwt, type JwtPayload } from './auth.js'
 import { CronScheduler, isUserInitiatedCronJob } from './cron.js'
@@ -590,6 +599,10 @@ export class Gateway {
   private webhookRouter: WebhookRouter | null = null
   private _taskStore = new TaskStore()
   private _runLog = new RunLog()
+  // SkillOpt training: async run registry (state machine + per-skill/global concurrency
+  // cap). Drafts staged via skill_propose; merge promotes them to the authoritative lib.
+  private skillTrainJobs = new SkillTrainJobStore({ maxConcurrent: 2 })
+  private skillDrafts = new SkillDraftStore()
   private channels = new Map<string, ChannelAdapter>()
   private log = createLogger({ module: 'gateway' })
   private rateLimiter = new RateLimiter()
@@ -840,6 +853,8 @@ export class Gateway {
   constructor(private deps: GatewayDeps) {
     this.router = new Router(deps.agentsConfig)
     this.sessions = new SessionManager(deps.config)
+    // Reconcile skill-training runs persisted across a gateway restart (active → failed).
+    void this.skillTrainJobs.loadAll(Date.now())
     // Wire up auth error handler: force-refresh token when 401 detected (bypass expiry check)
     this.sessions.onAuthError = () => this.refreshClaudeOAuthIfNeeded(true)
     // Phase 5:把 _repoWorkspace 的 getRepoSnapshot 当 provider 注入。
@@ -2320,6 +2335,63 @@ export class Gateway {
     )
     if (skillViewMatch) {
       this.handleSkillItem(req, res, skillViewMatch[1], skillViewMatch[2]).catch((err) =>
+        this.sendError(res, 500, String(err)),
+      )
+      return
+    }
+    // ── SkillOpt skill-training (async; train → diff → confirm-merge) ──
+    const skillTrainStartMatch = url.pathname.match(/^\/api\/skills\/([a-z0-9-]+)\/train$/)
+    if (skillTrainStartMatch) {
+      this._handleSkillTrainStart(req, res, skillTrainStartMatch[1]).catch((err) =>
+        this.sendError(res, 500, String(err)),
+      )
+      return
+    }
+    const skillTrainDraftItemMatch = url.pathname.match(
+      /^\/api\/skill-training\/([a-zA-Z0-9_-]+)\/drafts\/([a-z0-9-]+)$/,
+    )
+    if (skillTrainDraftItemMatch) {
+      this._handleSkillTrainDraftItem(
+        req,
+        res,
+        skillTrainDraftItemMatch[1],
+        skillTrainDraftItemMatch[2],
+      ).catch((err) => this.sendError(res, 500, String(err)))
+      return
+    }
+    const skillTrainCommentMatch = url.pathname.match(
+      /^\/api\/skill-training\/([a-zA-Z0-9_-]+)\/drafts\/([a-z0-9-]+)\/comment$/,
+    )
+    if (skillTrainCommentMatch) {
+      this._handleSkillTrainComment(
+        req,
+        res,
+        skillTrainCommentMatch[1],
+        skillTrainCommentMatch[2],
+      ).catch((err) => this.sendError(res, 500, String(err)))
+      return
+    }
+    const skillTrainDraftsMatch = url.pathname.match(
+      /^\/api\/skill-training\/([a-zA-Z0-9_-]+)\/drafts$/,
+    )
+    if (skillTrainDraftsMatch) {
+      this._handleSkillTrainDrafts(req, res, skillTrainDraftsMatch[1]).catch((err) =>
+        this.sendError(res, 500, String(err)),
+      )
+      return
+    }
+    const skillTrainMergeMatch = url.pathname.match(
+      /^\/api\/skill-training\/([a-zA-Z0-9_-]+)\/merge$/,
+    )
+    if (skillTrainMergeMatch) {
+      this._handleSkillTrainMerge(req, res, skillTrainMergeMatch[1]).catch((err) =>
+        this.sendError(res, 500, String(err)),
+      )
+      return
+    }
+    const skillTrainRunMatch = url.pathname.match(/^\/api\/skill-training\/([a-zA-Z0-9_-]+)$/)
+    if (skillTrainRunMatch) {
+      this._handleSkillTrainRun(req, res, skillTrainRunMatch[1]).catch((err) =>
         this.sendError(res, 500, String(err)),
       )
       return
@@ -4778,6 +4850,302 @@ export class Gateway {
       return
     }
     this.sendError(res, 405, 'method not allowed')
+  }
+
+  // ── SkillOpt skill-training (async; train → diff → confirm-merge) ──
+
+  /** The agent that runs training sessions (default 'main', else the first agent). */
+  private async _trainingAgent() {
+    const cfg = await this._getAgentsConfig()
+    return cfg.agents.find((a) => a.id === 'main') ?? cfg.agents[0] ?? null
+  }
+
+  /**
+   * Resolve a run-scoped request: the run must exist AND be owned by the caller.
+   * Sends 404/403 and returns null on failure. Every run-scoped endpoint (status,
+   * drafts, diff, comment, merge, discard) gates on this so a leaked runId cannot be
+   * read or mutated across users.
+   */
+  private _ownedTrainRun(
+    req: IncomingMessage,
+    res: ServerResponse,
+    runId: string,
+  ): SkillTrainRun | null {
+    const run = this.skillTrainJobs.get(runId)
+    if (!run) {
+      this.sendError(res, 404, 'training run not found')
+      return null
+    }
+    if (run.userId !== this.getUserId(req)) {
+      this.sendError(res, 403, 'forbidden')
+      return null
+    }
+    return run
+  }
+
+  /**
+   * Fold a training session's stream event into the run state. On the agent's `final`
+   * event the terminal state is resolved from the ACTUAL staged-draft count (source of
+   * truth), not the proposal-call count; other events flow through applyEvent.
+   */
+  private _onTrainEvent(runId: string, e: SessionStreamEvent): void {
+    if (e.kind === 'final') {
+      void this.skillDrafts
+        .listDrafts(runId)
+        .then((d) => this.skillTrainJobs.finalize(runId, d.length, Date.now()))
+        .catch(() => {})
+      return
+    }
+    void this.skillTrainJobs.applyEvent(runId, e, Date.now())
+  }
+
+  // POST /api/skills/:name/train — start an async DeepSeek training run for ONE
+  // user-authored skill. Returns a runId immediately; progress via GET status.
+  private async _handleSkillTrainStart(
+    req: IncomingMessage,
+    res: ServerResponse,
+    skillName: string,
+  ): Promise<void> {
+    if (req.method !== 'POST') return this.sendError(res, 405, 'method not allowed')
+    const userId = this.getUserId(req)
+
+    // Authority: only train user-authored skills. Platform baseline/seed are read-only.
+    const userStore = buildUserSkillStore()
+    const current = await userStore.view(skillName)
+    if (!current || typeof current === 'string') return this.sendError(res, 404, 'skill not found')
+    if (current.source === 'platform') {
+      return this.sendError(res, 403, 'cannot train a platform skill (read-only)')
+    }
+
+    const guard = this.skillTrainJobs.canStart(skillName)
+    if (!guard.ok) return this.sendError(res, 409, guard.reason ?? 'cannot start training')
+
+    const agent = await this._trainingAgent()
+    if (!agent) return this.sendError(res, 500, 'no agent available for training')
+
+    const body = await this.readJsonBody<{ focus?: string }>(req).catch(
+      () => ({}) as { focus?: string },
+    )
+    const runId = SkillTrainJobStore.newRunId()
+    const opts = normalizeSkillTrainArgs(
+      { runId, targetSkill: skillName, focus: body?.focus },
+      agent.id,
+    )
+    await this.skillTrainJobs.create({
+      runId,
+      skillName,
+      agentId: agent.id,
+      userId,
+      model: SKILL_TRAIN_DEFAULT_MODEL,
+      effort: SKILL_TRAIN_EFFORT,
+      now: Date.now(),
+    })
+
+    // Background session bound to this run (skillTrainRunId exposes skill_propose).
+    const session = await this.sessions.getOrCreate({
+      sessionKey: `skilltrain:${runId}`,
+      agent,
+      channel: 'skill-train',
+      peerId: runId,
+      userId,
+      effortLevel: SKILL_TRAIN_EFFORT,
+      skillTrainRunId: runId,
+    })
+    // Fire-and-forget: fold stream events into the run state; don't block the HTTP reply.
+    void this.sessions
+      .submit(
+        session,
+        buildSkillTrainPrompt(opts),
+        (e) => this._onTrainEvent(runId, e),
+        SKILL_TRAIN_EFFORT,
+        SKILL_TRAIN_DEFAULT_MODEL,
+        runId,
+      )
+      .catch((err) => {
+        void this.skillTrainJobs.setStatus(runId, 'failed', Date.now(), String(err))
+      })
+    this.sendJson(res, 202, { ok: true, runId })
+  }
+
+  // GET /api/skill-training/:runId — run status. DELETE — discard run + its drafts.
+  private async _handleSkillTrainRun(
+    req: IncomingMessage,
+    res: ServerResponse,
+    runId: string,
+  ): Promise<void> {
+    const run = this._ownedTrainRun(req, res, runId)
+    if (!run) return
+    if (req.method === 'GET') {
+      this.sendJson(res, 200, { run })
+      return
+    }
+    if (req.method === 'DELETE') {
+      await this.skillDrafts.deleteRun(runId)
+      await this.skillTrainJobs.setStatus(runId, 'discarded', Date.now())
+      this.skillTrainJobs.forget(runId)
+      this.sendJson(res, 200, { ok: true })
+      return
+    }
+    this.sendError(res, 405, 'method not allowed')
+  }
+
+  // GET /api/skill-training/:runId/drafts — list staged draft summaries.
+  private async _handleSkillTrainDrafts(
+    req: IncomingMessage,
+    res: ServerResponse,
+    runId: string,
+  ): Promise<void> {
+    if (req.method !== 'GET') return this.sendError(res, 405, 'method not allowed')
+    if (!this._ownedTrainRun(req, res, runId)) return
+    const drafts = await this.skillDrafts.listDrafts(runId)
+    this.sendJson(res, 200, { drafts })
+  }
+
+  // GET /api/skill-training/:runId/drafts/:name — draft + current authoritative
+  // (the two diff sides). PUT — apply a manual user edit to the draft.
+  private async _handleSkillTrainDraftItem(
+    req: IncomingMessage,
+    res: ServerResponse,
+    runId: string,
+    skillName: string,
+  ): Promise<void> {
+    if (!this._ownedTrainRun(req, res, runId)) return
+    if (req.method === 'GET') {
+      const draft = await this.skillDrafts.readDraft(runId, skillName)
+      if (!draft) return this.sendError(res, 404, 'draft not found')
+      const cur = await buildUserSkillStore().view(skillName)
+      const current =
+        cur && typeof cur !== 'string'
+          ? { body: cur.body, description: cur.description, version: cur.version }
+          : null
+      this.sendJson(res, 200, { draft, current })
+      return
+    }
+    if (req.method === 'PUT') {
+      const existing = await this.skillDrafts.readDraft(runId, skillName)
+      if (!existing) return this.sendError(res, 404, 'draft not found')
+      const body = await this.readJsonBody<{
+        description?: string
+        body?: string
+        tags?: string[]
+      }>(req)
+      const r = await this.skillDrafts.writeDraft({
+        runId,
+        op: existing.record.op,
+        meta: {
+          name: skillName,
+          description: body.description ?? existing.meta.description,
+          tags: body.tags ?? existing.meta.tags,
+        },
+        body: body.body ?? existing.body,
+        authoredBy: 'user',
+      })
+      if (!r.ok) return this.sendError(res, 400, r.error ?? 'save failed')
+      this.sendJson(res, 200, { ok: true })
+      return
+    }
+    this.sendError(res, 405, 'method not allowed')
+  }
+
+  // POST /api/skill-training/:runId/drafts/:name/comment — user comment → AI revises
+  // the draft by continuing the SAME training session (async; status returns to running).
+  private async _handleSkillTrainComment(
+    req: IncomingMessage,
+    res: ServerResponse,
+    runId: string,
+    skillName: string,
+  ): Promise<void> {
+    if (req.method !== 'POST') return this.sendError(res, 405, 'method not allowed')
+    const run = this._ownedTrainRun(req, res, runId)
+    if (!run) return
+    const body = await this.readJsonBody<{ comment: string; lineRange?: string }>(req)
+    const comment = (body?.comment ?? '').trim()
+    if (!comment) return this.sendError(res, 400, 'comment required')
+    const agent = await this._trainingAgent()
+    if (!agent) return this.sendError(res, 500, 'no agent available')
+
+    const where = body.lineRange ? ` (lines ${body.lineRange})` : ''
+    const revisePrompt = [
+      `The user reviewed your draft for skill "${skillName}"${where} and commented:`,
+      '',
+      comment,
+      '',
+      `Revise the draft accordingly: re-issue skill_propose (runId="${runId}") with the`,
+      'improved content addressing the comment. Keep all prior good content; change only',
+      'what the comment asks for.',
+    ].join('\n')
+
+    const session = await this.sessions.getOrCreate({
+      sessionKey: `skilltrain:${runId}`,
+      agent,
+      channel: 'skill-train',
+      peerId: runId,
+      userId: run.userId,
+      effortLevel: SKILL_TRAIN_EFFORT,
+      skillTrainRunId: runId,
+    })
+    await this.skillTrainJobs.reopen(runId, Date.now())
+    void this.sessions
+      .submit(
+        session,
+        revisePrompt,
+        (e) => this._onTrainEvent(runId, e),
+        SKILL_TRAIN_EFFORT,
+        SKILL_TRAIN_DEFAULT_MODEL,
+        runId,
+      )
+      .catch((err) => {
+        void this.skillTrainJobs.setStatus(runId, 'failed', Date.now(), String(err))
+      })
+    this.sendJson(res, 202, { ok: true, runId })
+  }
+
+  // POST /api/skill-training/:runId/merge — promote draft(s) into the AUTHORITATIVE
+  // library (the only write to live skills). Body {name?} merges one, else all.
+  private async _handleSkillTrainMerge(
+    req: IncomingMessage,
+    res: ServerResponse,
+    runId: string,
+  ): Promise<void> {
+    if (req.method !== 'POST') return this.sendError(res, 405, 'method not allowed')
+    const run = this._ownedTrainRun(req, res, runId)
+    if (!run) return
+    if (run.status !== 'diff_ready') {
+      return this.sendError(res, 409, `run is not ready to merge (status: ${run.status})`)
+    }
+    const body = await this.readJsonBody<{ name?: string }>(req).catch(
+      () => ({}) as { name?: string },
+    )
+    const all = await this.skillDrafts.listDrafts(runId)
+    const targets = body?.name ? all.filter((d) => d.name === body.name) : all
+    if (targets.length === 0) return this.sendError(res, 404, 'no drafts to merge')
+
+    const store = buildUserSkillStore()
+    const results: Array<{ name: string; ok: boolean; error?: string }> = []
+    for (const t of targets) {
+      const draft = await this.skillDrafts.readDraft(runId, t.name)
+      if (!draft) {
+        results.push({ name: t.name, ok: false, error: 'draft vanished' })
+        continue
+      }
+      const r =
+        draft.record.op === 'delete'
+          ? await store.delete(t.name)
+          : await store.save(
+              { name: t.name, description: draft.meta.description, tags: draft.meta.tags },
+              draft.body,
+            )
+      results.push({ name: t.name, ok: r.ok, error: r.error })
+      if (r.ok) await this.skillDrafts.deleteDraft(runId, t.name)
+    }
+
+    // All drafts consumed → close the run; otherwise leave it for a retry.
+    const remaining = await this.skillDrafts.listDrafts(runId)
+    if (remaining.length === 0) {
+      await this.skillTrainJobs.setStatus(runId, 'merged', Date.now())
+      this.skillTrainJobs.forget(runId)
+    }
+    this.sendJson(res, 200, { ok: results.every((r) => r.ok), results })
   }
 
   // GET /api/search?q=... → full-text search past sessions
