@@ -67,6 +67,12 @@ describe('T01: isFileBlocked — sensitive file blocking', () => {
   it('blocks USER.md (user identity)', () => {
     assert.ok(isFileBlocked('/root/.openclaude/agents/main/USER.md'))
   })
+  it('blocks user-level shared user.md (user identity)', () => {
+    assert.ok(isFileBlocked('/home/agent/.openclaude/user.md'))
+    assert.ok(isFileBlocked('/root/.openclaude/user.md'))
+    // precise: a project file like myuser.md must NOT be caught by the pattern
+    assert.ok(!isFileBlocked('/home/agent/project/myuser.md'))
+  })
   it('blocks CLAUDE.md (agent persona/instructions)', () => {
     assert.ok(isFileBlocked('/root/.openclaude/agents/main/CLAUDE.md'))
   })

@@ -5,16 +5,16 @@
 // 供 master 在外接 API outbound 时注入到 system[N+1]。
 //
 // 权威路径(与 packages/storage/src/paths.ts 对齐):
-//   <volume_mountpoint>/agents/main/USER.md
-//   <volume_mountpoint>/agents/main/MEMORY.md
-//   <volume_mountpoint>/agents/main/skills/<slug>/SKILL.md
+//   <volume_mountpoint>/user.md                  (用户级共享 USER.md — 该用户所有 agent 共用)
+//   <volume_mountpoint>/agents/main/MEMORY.md    (per-agent — 主 agent 工作记忆,保持隔离)
+//   <volume_mountpoint>/skills/<slug>/SKILL.md   (用户级共享 skill 库)
 //
 // 安全约束:
 //   - 路径完全由 server 端拼接,client 仅传 uid;不接受任何路径参数
 //   - uid 严格 [1-9][0-9]{0,15},不允许前导 0 / 负 / 非数字(与 volumes.go reVolumeName 对齐)
 //   - 文件读取大小硬上限 256 KiB(单文件),超过即截断返(防恶意撑爆 master 内存)
 //   - skills 扫描数量上限 200(防目录爆炸);frontmatter 只取 name + description
-//   - 不读 USER.md / MEMORY.md / SKILL.md 之外任何文件
+//   - 不读 user.md / MEMORY.md / SKILL.md 之外任何文件
 package usercontext
 
 import (
@@ -143,15 +143,17 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func readPlatformContext(mountpoint string) (*Response, error) {
 	agentRoot := filepath.Join(mountpoint, "agents", "main")
 
-	userMd, userMtime, err := readFileCapped(filepath.Join(agentRoot, "USER.md"))
+	// USER.md → user-level shared (volume root user.md). MEMORY.md stays main's per-agent
+	// working notes. skills → user-level shared library (volume root skills/) post sharing.
+	userMd, userMtime, err := readFileCapped(filepath.Join(mountpoint, "user.md"))
 	if err != nil {
-		return nil, fmt.Errorf("read USER.md: %w", err)
+		return nil, fmt.Errorf("read user.md: %w", err)
 	}
 	memoryMd, memMtime, err := readFileCapped(filepath.Join(agentRoot, "MEMORY.md"))
 	if err != nil {
 		return nil, fmt.Errorf("read MEMORY.md: %w", err)
 	}
-	skills, skillMtime, err := readSkills(filepath.Join(agentRoot, "skills"))
+	skills, skillMtime, err := readSkills(filepath.Join(mountpoint, "skills"))
 	if err != nil {
 		return nil, fmt.Errorf("read skills: %w", err)
 	}

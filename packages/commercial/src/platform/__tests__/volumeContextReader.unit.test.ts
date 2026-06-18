@@ -45,16 +45,20 @@ async function writeUserVolume(
     skills?: Array<{ dir: string; head: string }>;
   },
 ): Promise<string> {
-  const root = join(baseDir, `oc-v3-data-u${userId.toString()}`, "_data", "agents", "main");
-  await fsp.mkdir(root, { recursive: true });
+  const vroot = join(baseDir, `oc-v3-data-u${userId.toString()}`, "_data");
+  const agentMain = join(vroot, "agents", "main");
+  await fsp.mkdir(agentMain, { recursive: true });
   if (files.userMd !== undefined) {
-    await fsp.writeFile(join(root, "USER.md"), files.userMd, "utf8");
+    // USER.md is user-level shared → volume root user.md
+    await fsp.writeFile(join(vroot, "user.md"), files.userMd, "utf8");
   }
   if (files.memoryMd !== undefined) {
-    await fsp.writeFile(join(root, "MEMORY.md"), files.memoryMd, "utf8");
+    // MEMORY.md stays per-agent (main)
+    await fsp.writeFile(join(agentMain, "MEMORY.md"), files.memoryMd, "utf8");
   }
   if (files.skills) {
-    const skillsDir = join(root, "skills");
+    // skills are user-level shared → volume root skills/
+    const skillsDir = join(vroot, "skills");
     await fsp.mkdir(skillsDir, { recursive: true });
     for (const s of files.skills) {
       const sd = join(skillsDir, s.dir);
@@ -62,7 +66,7 @@ async function writeUserVolume(
       await fsp.writeFile(join(sd, "SKILL.md"), s.head, "utf8");
     }
   }
-  return root;
+  return vroot;
 }
 
 describe("makeLocalVolumeReader — fs 实跑(`volumeBaseDir` hook 注入 tmpdir)", () => {
