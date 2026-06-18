@@ -1,5 +1,5 @@
 // OpenClaude — Scheduled Tasks compatibility wrappers
-import { openContextHub, switchContextTasksTab } from './memory.js?v=3ef84d0a'
+import { openContextHub, switchContextTasksTab } from './memory.js?v=6cf1729b'
 
 export async function openTasksModal() {
   await openContextHub('tasks')
