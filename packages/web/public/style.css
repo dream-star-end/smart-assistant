@@ -9643,6 +9643,25 @@ body.body-landing {
   .automation-actions { width: 100%; justify-content: flex-end; }
 }
 
+/* Skills detail: a side pane on desktop, a full-screen overlay popup on mobile.
+ * The back button is desktop-hidden (the pane is always visible there). */
+.skill-detail-back { display: none; }
+@media (max-width: 860px) {
+  .skills-layout .skills-detail-pane { display: none; }
+  .skills-layout.detail-open .skills-detail-pane {
+    display: grid;
+    position: fixed;
+    inset: 0;
+    z-index: 60;
+    background: var(--bg-primary, #1a1a1d);
+    overflow: auto;
+    padding: var(--space-4);
+    gap: var(--space-3);
+    align-content: start;
+  }
+  .skill-detail-back { display: inline-flex; align-self: flex-start; }
+}
+
 /* ══════════════════════════════════════════════════════════════════
  *  Commercial UI Refresh — modernized user-facing surfaces (2026-06)
  *

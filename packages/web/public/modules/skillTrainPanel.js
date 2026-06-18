@@ -390,50 +390,55 @@ async function _refresh() {
 function _ensureStyles() {
   if (_stylesInjected) return
   _stylesInjected = true
+  // Use the app's real theme tokens (--bg-elevated / --text-primary / --border /
+  // --accent / --danger ...) so the panel adapts to BOTH light and dark themes.
+  // (Earlier it guessed --surface/--text which don't exist → dark fallbacks rendered
+  // an unreadable black modal on the light theme.)
   const css = `
-.skt-backdrop{position:fixed;inset:0;background:rgba(0,0,0,.5);display:flex;align-items:center;justify-content:center;z-index:1000}
-.skt-modal{background:var(--surface,#1b1d22);color:var(--text,#e7e9ee);width:min(760px,94vw);max-height:88vh;border-radius:12px;display:flex;flex-direction:column;box-shadow:0 12px 48px rgba(0,0,0,.5)}
-.skt-head{display:flex;align-items:center;justify-content:space-between;padding:14px 18px;border-bottom:1px solid var(--border,#2c2f36)}
-.skt-head h3{margin:0;font-size:15px}
-.skt-x{background:none;border:none;color:inherit;font-size:16px;cursor:pointer;opacity:.7}
-.skt-x:hover{opacity:1}
-.skt-body{padding:18px;overflow:auto}
-.skt-intro{font-size:13px;line-height:1.6;opacity:.9;margin:0 0 14px}
-.skt-focus{display:block;font-size:12px;opacity:.85;margin-bottom:14px}
-.skt-focus-input,.skt-comment-input,.skt-edit-body{width:100%;box-sizing:border-box;margin-top:6px;background:var(--surface-2,#23262d);color:inherit;border:1px solid var(--border,#2c2f36);border-radius:8px;padding:8px;font:inherit}
+.skt-backdrop{position:fixed;inset:0;background:rgba(0,0,0,.5);display:flex;align-items:center;justify-content:center;z-index:1200}
+.skt-modal{background:var(--bg-elevated,#212125);color:var(--text-primary,#eceae6);width:min(760px,94vw);max-height:88vh;border-radius:14px;display:flex;flex-direction:column;box-shadow:0 12px 48px rgba(0,0,0,.45);border:1px solid var(--border,#32323a)}
+.skt-head{display:flex;align-items:center;justify-content:space-between;padding:14px 18px;border-bottom:1px solid var(--border,#32323a)}
+.skt-head h3{margin:0;font-size:15px;color:var(--text-primary,#eceae6)}
+.skt-x{background:none;border:none;color:var(--text-secondary,#9f9c96);font-size:16px;cursor:pointer}
+.skt-x:hover{color:var(--text-primary,#eceae6)}
+.skt-body{padding:18px;overflow:auto;color:var(--text-primary,#eceae6)}
+.skt-intro{font-size:13px;line-height:1.6;color:var(--text-secondary,#9f9c96);margin:0 0 14px}
+.skt-focus{display:block;font-size:12px;color:var(--text-secondary,#9f9c96);margin-bottom:14px}
+.skt-focus-input,.skt-comment-input,.skt-edit-body{width:100%;box-sizing:border-box;margin-top:6px;background:var(--bg-secondary,#2a2a30);color:var(--text-primary,#eceae6);border:1px solid var(--border,#32323a);border-radius:8px;padding:8px;font:inherit}
 .skt-actions{display:flex;gap:10px;justify-content:flex-end}
-.skt-btn{background:var(--surface-2,#2a2d34);color:inherit;border:1px solid var(--border,#3a3d44);border-radius:8px;padding:7px 14px;font-size:13px;cursor:pointer}
-.skt-btn:hover{filter:brightness(1.15)}
-.skt-btn-primary{background:var(--accent,#4f7cff);border-color:var(--accent,#4f7cff);color:#fff}
-.skt-link{background:none;border:none;color:var(--accent,#7aa2ff);cursor:pointer;font-size:12px;padding:0}
+.skt-btn{background:var(--bg-tertiary,#2a2a30);color:var(--text-primary,#eceae6);border:1px solid var(--border,#32323a);border-radius:8px;padding:7px 14px;font-size:13px;cursor:pointer}
+.skt-btn:hover{filter:brightness(1.08)}
+.skt-btn-primary{background:var(--accent,#d97757);border-color:var(--accent,#d97757);color:#fff}
+.skt-link{background:none;border:none;color:var(--accent,#d97757);cursor:pointer;font-size:12px;padding:0}
 .skt-progress{text-align:center;padding:14px 0}
-.skt-phase{font-size:14px;margin-bottom:12px}
-.skt-bar{height:8px;background:var(--surface-2,#2a2d34);border-radius:6px;overflow:hidden}
-.skt-bar-fill{height:100%;background:var(--accent,#4f7cff);transition:width .4s ease}
-.skt-stat{font-size:12px;opacity:.8;margin-top:10px}
-.skt-spinner{font-size:12px;opacity:.6;margin-top:8px}
+.skt-phase{font-size:14px;margin-bottom:12px;color:var(--text-primary,#eceae6)}
+.skt-bar{height:8px;background:var(--bg-tertiary,#2a2a30);border-radius:6px;overflow:hidden}
+.skt-bar-fill{height:100%;background:var(--accent,#d97757);transition:width .4s ease}
+.skt-stat{font-size:12px;color:var(--text-secondary,#9f9c96);margin-top:10px}
+.skt-spinner{font-size:12px;color:var(--text-secondary,#9f9c96);opacity:.8;margin-top:8px}
 .skt-diffhead{display:flex;align-items:center;justify-content:space-between;font-size:13px;margin-bottom:14px;gap:12px}
 .skt-diffhead-actions{display:flex;gap:8px;flex-shrink:0}
-.skt-draft{border:1px solid var(--border,#2c2f36);border-radius:10px;padding:12px;margin-bottom:14px}
+.skt-draft{border:1px solid var(--border,#32323a);border-radius:10px;padding:12px;margin-bottom:14px}
 .skt-draft-head{display:flex;align-items:center;gap:8px;margin-bottom:6px}
 .skt-op{font-size:11px;padding:1px 7px;border-radius:10px;font-weight:600}
 .skt-op-create{background:#1f5132;color:#9fe7b8}
 .skt-op-update{background:#1f3a63;color:#9fc2ff}
 .skt-op-delete{background:#5a2530;color:#ffb3bd}
-.skt-author{font-size:11px;opacity:.6;margin-left:auto}
-.skt-rationale{font-size:12px;opacity:.85;line-height:1.5;margin-bottom:10px;white-space:pre-wrap}
-.skt-diff{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;background:var(--surface-2,#202329);border-radius:8px;padding:8px;max-height:340px;overflow:auto;white-space:pre-wrap}
+.skt-author{font-size:11px;color:var(--text-secondary,#9f9c96);margin-left:auto}
+.skt-rationale{font-size:12px;color:var(--text-secondary,#9f9c96);line-height:1.5;margin-bottom:10px;white-space:pre-wrap}
+.skt-diff{font-family:var(--font-mono,ui-monospace,Menlo,Consolas,monospace);font-size:12px;background:var(--bg-secondary,#1e1e22);color:var(--text-primary,#eceae6);border:1px solid var(--border-subtle,#26262c);border-radius:8px;padding:8px;max-height:340px;overflow:auto;white-space:pre-wrap}
 .skt-row{display:flex;gap:6px}
 .skt-sign{width:1ch;opacity:.6;flex-shrink:0}
-.skt-add{background:rgba(63,185,80,.18)}
-.skt-del{background:rgba(248,81,73,.18)}
-.skt-diff-empty{opacity:.5}
+.skt-add{background:rgba(63,185,80,.20)}
+.skt-del{background:rgba(248,81,73,.20)}
+.skt-diff-empty{color:var(--text-secondary,#9f9c96);opacity:.8}
 .skt-draft-tools{display:flex;align-items:center;justify-content:space-between;margin-top:10px}
 .skt-comment{margin-top:10px;display:flex;gap:8px;align-items:flex-start}
 .skt-comment-send{flex-shrink:0}
 .skt-edit-actions{display:flex;gap:10px;align-items:center;margin-top:8px}
-.skt-terminal{padding:18px 4px;font-size:13px;line-height:1.6}
-.skt-error{color:#ffb3bd;font-size:12px}`
+.skt-terminal{padding:18px 4px;font-size:13px;line-height:1.6;color:var(--text-primary,#eceae6)}
+.skt-error{color:var(--danger,#e06c6c);font-size:12px}
+@media (max-width:640px){.skt-modal{width:100vw;height:100%;max-height:100%;border-radius:0}.skt-comment{flex-direction:column}.skt-comment-send{align-self:flex-end}}`
   const style = document.createElement('style')
   style.id = 'skt-styles'
   style.textContent = css
