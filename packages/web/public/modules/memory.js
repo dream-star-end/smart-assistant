@@ -250,6 +250,8 @@ export async function openSkillsModal(agentId) {
 
 export async function switchContextHubTab(tab) {
   _hubTab = CONTEXT_TABS.includes(tab) ? tab : 'memory'
+  // Never carry a mobile skill-detail overlay across tab switches / hub re-open.
+  _closeSkillDetailOverlay()
   for (const t of CONTEXT_TABS) {
     const btn = document.querySelector(`[data-context-tab="${t}"]`)
     const panel = $(CONTEXT_PANEL_IDS[t])
@@ -449,6 +451,10 @@ function _renderSkillsList() {
 }
 
 function _renderSkillEmpty() {
+  // Empty detail = nothing selected → on mobile drop the overlay back to the list
+  // (covers initial load, post-delete reload, and the no-skills case so the user is
+  // never trapped in a backless overlay).
+  _closeSkillDetailOverlay()
   $('skill-detail').innerHTML = '<div class="context-empty-card"><div class="context-empty-icon">✨</div><strong>选择一个技能查看详情</strong><p>技能会在相关任务开始前被 Agent 按需加载。</p></div>'
   $('skill-delete-btn').hidden = true
 }
@@ -490,7 +496,14 @@ async function _loadSkillDetail(name) {
       .querySelector('#skill-train-inline')
       ?.addEventListener('click', () => openSkillTrainPanel(skill.name))
   } catch (err) {
-    detail.innerHTML = `<div class="context-error">加载失败：${htmlSafeEscape(String(err))}</div>`
+    // Keep a back button on the error path too, so a failed fetch can't trap the user
+    // inside the mobile overlay.
+    detail.innerHTML = `<button type="button" id="skill-detail-back" class="skill-detail-back btn btn-ghost btn-sm">← 返回技能列表</button><div class="context-error">加载失败：${htmlSafeEscape(String(err))}</div>`
+    detail.querySelector('#skill-detail-back')?.addEventListener('click', () => {
+      _closeSkillDetailOverlay()
+      _selectedSkill = null
+      _renderSkillsList()
+    })
   }
 }
 
