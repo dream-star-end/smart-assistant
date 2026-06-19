@@ -16,7 +16,7 @@
 <link rel="apple-touch-icon" href="/icon.svg" />
 <link rel="stylesheet" href="/vendor/github-dark.min.css" />
 <link rel="stylesheet" href="/vendor/katex/katex.min.css" />
-<link rel="stylesheet" href="/style.css?v=60" />
+<link rel="stylesheet" href="/style.css?v=61" />
 <link rel="stylesheet" href="/vendor/xterm/xterm.css?v=1" />
 <style>/* Inline styles removed — see style.css */
 </style>
@@ -234,10 +234,10 @@
           <button id="voice-hold-btn" type="button" class="voice-hold-btn" aria-label="按住说话">按住说话</button>
           <textarea id="input" placeholder="发消息给 agent…" rows="1" aria-label="输入消息"></textarea>
           <div class="composer-actions">
-            <input id="file-input" type="file" accept="image/*,audio/*,video/*,.pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.txt,.md,.json,.yaml,.yml,.csv,.log,.xml,.html,.htm,.js,.ts,.tsx,.py,.go,.rs,.java,.c,.cpp,.h,.sh,.sql,.zip,.rar,.7z,.tar,.tar.gz,.tgz,.gz,.bz2,.xz" multiple hidden />
-            <button id="upload-btn" class="input-btn" title="上传文件" aria-label="上传文件">
+            <input id="file-input" class="file-input-hidden" type="file" accept="image/*,audio/*,video/*,.pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.txt,.md,.json,.yaml,.yml,.csv,.log,.xml,.html,.htm,.js,.ts,.tsx,.py,.go,.rs,.java,.c,.cpp,.h,.sh,.sql,.zip,.rar,.7z,.tar,.tgz,.gz,.bz2,.xz" multiple tabindex="-1" />
+            <label id="upload-btn" class="input-btn" for="file-input" role="button" tabindex="0" title="上传文件" aria-label="上传文件">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>
-            </button>
+            </label>
             <button id="voice-btn" class="input-btn" title="语音输入" aria-label="语音输入">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg>
             </button>
@@ -769,7 +769,7 @@
       <div class="claude-terminal-toolbar">
         <span id="claude-terminal-status" class="claude-terminal-status" role="status" aria-live="polite" data-state="idle">未连接</span>
         <div class="claude-terminal-toolbar-actions">
-          <input id="claude-terminal-file-input" type="file" multiple hidden />
+          <input id="claude-terminal-file-input" class="file-input-hidden" type="file" multiple tabindex="-1" />
           <div class="claude-terminal-sessions-wrap">
             <button id="claude-terminal-sessions-btn" class="btn btn-ghost" type="button" aria-haspopup="menu" aria-expanded="false" aria-controls="claude-terminal-sessions-menu">会话 ▾</button>
             <div id="claude-terminal-sessions-menu" class="claude-terminal-sessions-menu" role="menu" aria-label="Claude 会话" hidden>
@@ -779,7 +779,7 @@
             </div>
           </div>
           <button id="claude-terminal-copy-btn" class="icon-btn" type="button" title="复制选中内容；未选中时复制当前可见输出" aria-label="复制终端内容"><svg viewBox="0 0 24 24" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button>
-          <button id="claude-terminal-upload-btn" class="icon-btn" type="button" title="上传文件给 Claude Code 读取" aria-label="上传文件"><svg viewBox="0 0 24 24" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg></button>
+          <label id="claude-terminal-upload-btn" class="icon-btn" for="claude-terminal-file-input" role="button" tabindex="0" title="上传文件给 Claude Code 读取" aria-label="上传文件"><svg viewBox="0 0 24 24" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg></label>
           <button id="claude-terminal-files-btn" class="icon-btn" type="button" title="浏览 / 下载终端文件" aria-label="终端文件"><svg viewBox="0 0 24 24" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg></button>
           <span class="claude-terminal-hint">关闭=隐藏会话；终止=结束 Claude。</span>
         </div>
@@ -872,7 +872,7 @@
       </div>
     </div>
     <div class="modal-foot claude-terminal-files-foot">
-      <button id="claude-terminal-file-modal-upload-btn" class="btn btn-ghost" type="button">上传文件</button>
+      <label id="claude-terminal-file-modal-upload-btn" class="btn btn-ghost" for="claude-terminal-file-input" role="button" tabindex="0">上传文件</label>
       <button class="btn btn-primary" type="button" data-claude-terminal-files-close data-close-modal="claude-terminal-files-modal">关闭</button>
     </div>
   </div>
@@ -925,6 +925,6 @@
 <script src="/vendor/katex/katex.min.js" defer></script>
 <script src="/vendor/qrcode.min.js"></script>
 <div id="toast" class="toast"></div>
-<script type="module" src="/modules/main.js?v=73"></script>
+<script type="module" src="/modules/main.js?v=74"></script>
 </body>
 </html>

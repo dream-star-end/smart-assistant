@@ -3338,6 +3338,17 @@ a:hover {
   gap: 2px;
   flex-shrink: 0;
 }
+/* Visually hide the file input but keep it activatable via its <label for>.
+   NOT display:none — some mobile engines (HarmonyOS ArkWeb) refuse to open the
+   native picker for a display:none input even through a label. */
+.file-input-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+  overflow: hidden;
+  pointer-events: none;
+}
 .input-btn {
   display: inline-flex;
   align-items: center;

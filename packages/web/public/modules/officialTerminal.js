@@ -2044,8 +2044,18 @@ export function initOfficialClaudeTerminal() {
   $(RECONNECT_BTN_ID)?.addEventListener('click', () => reconnectTerminal())
   $(NEW_OUTPUT_BTN_ID)?.addEventListener('click', () => scrollTerminalToBottom())
   bindTerminalCopyButton()
-  $(FILE_UPLOAD_BTN_ID)?.addEventListener('click', () => $(FILE_INPUT_ID)?.click())
-  $(FILE_MODAL_UPLOAD_BTN_ID)?.addEventListener('click', () => $(FILE_INPUT_ID)?.click())
+  // Upload buttons are <label for=FILE_INPUT_ID>: tap/click natively opens the
+  // picker (synthetic .click() on a hidden input is dropped on mobile ArkWeb).
+  // Wire keyboard activation for these role=button labels.
+  for (const id of [FILE_UPLOAD_BTN_ID, FILE_MODAL_UPLOAD_BTN_ID]) {
+    $(id)?.addEventListener('keydown', (e) => {
+      if (e.repeat) return
+      if (e.key === 'Enter' || e.key === ' ') {
+        e.preventDefault()
+        $(FILE_INPUT_ID)?.click()
+      }
+    })
+  }
   $(FILE_PANEL_BTN_ID)?.addEventListener('click', () => toggleTerminalFilePanel())
   $(FILE_INPUT_ID)?.addEventListener('change', (event) => {
     if (event.target.files?.length) void uploadTerminalFiles(event.target.files)

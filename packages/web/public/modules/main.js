@@ -181,7 +181,7 @@ import {
   applyTerminalTheme,
   initOfficialClaudeTerminal,
   openOfficialClaudeTerminal,
-} from './officialTerminal.js?v=16'
+} from './officialTerminal.js?v=17'
 import { getConversationModeForSubmit } from './planMode.js?v=4'
 import { initPlanPanel } from './planPanel.js?v=3'
 
@@ -1795,7 +1795,16 @@ async function init() {
   }
   $('save-memory-btn').onclick = saveMemory
   bindVoiceButton($('voice-btn'))
-  $('upload-btn').onclick = () => $('file-input').click()
+  // upload-btn is a <label for="file-input">, so tap/click natively opens the
+  // file picker (no synthetic .click() — that path is silently dropped on mobile
+  // ArkWeb/WebView). role=button labels need keyboard activation wired manually.
+  $('upload-btn').addEventListener('keydown', (e) => {
+    if (e.repeat) return
+    if (e.key === 'Enter' || e.key === ' ') {
+      e.preventDefault()
+      $('file-input').click()
+    }
+  })
   $('file-input').addEventListener('change', (e) => {
     if (e.target.files && e.target.files.length > 0) addFiles(e.target.files)
     e.target.value = ''
