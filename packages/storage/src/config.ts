@@ -106,6 +106,18 @@ export interface OpenClaudeConfig {
     accessToken: string
     users?: UserEntry[] // multi-user: login with username+password
     /**
+     * Personal-instance opt-in: when true, `/api/file` may serve files from ANY
+     * directory (not just the generated/uploads allowlist), so the frontend can
+     * render & download artifacts the agent writes anywhere on the box. Still
+     * gated by login auth, the `..`-traversal block, a regular-file check, and the
+     * sensitive-file denylist (FILE_BLOCKED_PATTERNS, checked on the realpath).
+     *
+     * DEFAULT FALSE — leave unset on the multi-tenant commercial product, where
+     * arbitrary-directory reads would be a cross-tenant LFI. Only the single-user
+     * personal deployment (boss owns the whole box) should enable this.
+     */
+    unrestrictedFileAccess?: boolean
+    /**
      * Per-session outbound frame ring buffer overrides. All fields optional —
      * any unset field falls back to DEFAULT_RING_CONFIG (2000 entries / 10min /
      * 5MB). On the personal instance, where `boss` regularly backgrounds the

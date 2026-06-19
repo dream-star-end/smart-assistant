@@ -201,6 +201,53 @@ describe('T01b: isFileAllowed — allowlist directory check', () => {
   })
 })
 
+// ── T01b2: isFileAllowed unrestricted mode (personal opt-in) ──
+describe('T01b2: isFileAllowed — unrestricted personal mode', () => {
+  it('allows ANY absolute directory when unrestricted=true', () => {
+    assert.ok(isFileAllowed(resolve('/root/projects/q2/report.docx'), [], { unrestricted: true }))
+    assert.ok(isFileAllowed(resolve('/etc/hosts'), [], { unrestricted: true }))
+    assert.ok(isFileAllowed(resolve('/var/log/app.log'), undefined, { unrestricted: true }))
+  })
+  it('still denies the same paths when unrestricted is false/omitted', () => {
+    assert.ok(!isFileAllowed(resolve('/root/projects/q2/report.docx')))
+    assert.ok(!isFileAllowed(resolve('/etc/hosts'), [], { unrestricted: false }))
+  })
+  it('unrestricted only widens the allowlist — the denylist is enforced separately', () => {
+    // isFileAllowed says "in scope", but the route still runs isFileBlocked().
+    assert.ok(
+      isFileAllowed(resolve('/root/.openclaude/openclaude.json'), [], { unrestricted: true }),
+    )
+    assert.ok(isFileBlocked('/root/.openclaude/openclaude.json'))
+    assert.ok(isFileBlocked('/root/project/.env'))
+    assert.ok(isFileBlocked('/root/.ssh/id_ed25519'))
+  })
+})
+
+// ── T01b3: widened denylist for unrestricted mode (pseudo-fs + more secrets) ──
+describe('T01b3: isFileBlocked — widened high-value denylist', () => {
+  it('blocks process/kernel pseudo-filesystems (token leak via /proc)', () => {
+    assert.ok(isFileBlocked('/proc/self/environ'))
+    assert.ok(isFileBlocked('/proc/1234/cmdline'))
+    assert.ok(isFileBlocked('/sys/class/net/eth0/address'))
+    assert.ok(isFileBlocked('/dev/mem'))
+  })
+  it('blocks docker/systemd secret stores and sockets', () => {
+    assert.ok(isFileBlocked('/run/secrets/db_password'))
+    assert.ok(isFileBlocked('/var/run/docker.sock'))
+  })
+  it('blocks shell history, git credentials and gh cli tokens', () => {
+    assert.ok(isFileBlocked('/root/.bash_history'))
+    assert.ok(isFileBlocked('/home/me/.zsh_history'))
+    assert.ok(isFileBlocked('/root/.git-credentials'))
+    assert.ok(isFileBlocked('/root/.config/gh/hosts.yml'))
+  })
+  it('does NOT over-block legit paths that merely contain those words', () => {
+    assert.ok(!isFileBlocked('/root/proc-notes/summary.txt')) // not /proc/
+    assert.ok(!isFileBlocked('/root/devlog/today.md')) // not /dev/
+    assert.ok(!isFileBlocked('/root/projects/sysadmin/readme.md')) // not /sys/
+  })
+})
+
 // ── T01c: /api/file disposition policy ──
 describe('T01c: shouldServeInline — file disposition policy', () => {
   it('serves previewable media inline', () => {

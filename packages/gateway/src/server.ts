@@ -2044,11 +2044,14 @@ export class Gateway {
         return
       }
       // Security: allowlist directories first, then blocklist as secondary defense.
+      // Personal-instance opt-in widens the allowlist to any directory; the
+      // denylist, realpath (symlink) check and regular-file check still apply.
       const resolved = resolve(filePath)
+      const unrestricted = this.deps.config.gateway.unrestrictedFileAccess === true
       const agentCwds = this.deps.agentsConfig.agents
         .map((a) => a.cwd)
         .filter((c): c is string => !!c)
-      if (!isFileAllowed(resolved, agentCwds)) {
+      if (!isFileAllowed(resolved, agentCwds, { unrestricted })) {
         this.log.warn('api/file denied (not in allowlist)', { path: resolved })
         res.writeHead(403)
         res.end('access denied')
@@ -2060,20 +2063,38 @@ export class Gateway {
         res.end('access denied')
         return
       }
-      let fileStat: ReturnType<typeof statSync>
+      // Canonicalize symlinks, then re-check the denylist on the real target so a
+      // symlink like /tmp/x.docx -> /root/.env cannot bypass the string denylist.
+      // realpathSync throws on a missing / broken-symlink path → 404.
+      let realResolved: string
       try {
-        fileStat = statSync(resolved)
+        realResolved = realpathSync(resolved)
       } catch {
         res.writeHead(404)
         res.end('not found')
         return
       }
+      if (isFileBlocked(realResolved)) {
+        this.log.warn('api/file blocked sensitive (realpath)', { path: realResolved })
+        res.writeHead(403)
+        res.end('access denied')
+        return
+      }
+      let fileStat: ReturnType<typeof statSync>
+      try {
+        fileStat = statSync(realResolved)
+      } catch {
+        res.writeHead(404)
+        res.end('not found')
+        return
+      }
+      // Only regular files — reject dirs, sockets, fifos and /proc-style pseudo files.
       if (!fileStat.isFile()) {
         res.writeHead(404)
         res.end('not found')
         return
       }
-      const fileContentType = mimeFor(resolved)
+      const fileContentType = mimeFor(realResolved)
       // C3: Force download for active content types, and for non-previewable
       // documents such as .docx so mobile browsers do not open a blank tab.
       const fileDispositionMode = shouldServeInline(fileContentType) ? 'inline' : 'attachment'
@@ -2083,7 +2104,7 @@ export class Gateway {
         'Cache-Control': 'private, max-age=3600',
         'Content-Disposition': `${fileDispositionMode}; filename="${encodeURIComponent(basename(resolved) || 'file')}"`,
       })
-      createReadStream(resolved).pipe(res)
+      createReadStream(realResolved).pipe(res)
       return
     }
 
@@ -6460,8 +6481,20 @@ const MEDIA_EXTENSIONS = new Set([
  * Returns true if the resolved absolute path falls within the allowlist.
  * Checked BEFORE the blocklist — if this returns false, the file is denied
  * regardless of blocklist status.
+ *
+ * `opts.unrestricted` (personal-instance opt-in, gateway.unrestrictedFileAccess)
+ * bypasses the allowlist entirely so any directory is reachable. It does NOT
+ * bypass the denylist — the caller still runs isFileBlocked() afterwards. Leave
+ * it false on the multi-tenant commercial product.
  */
-export function isFileAllowed(resolvedPath: string, agentCwds?: string[]): boolean {
+export function isFileAllowed(
+  resolvedPath: string,
+  agentCwds?: string[],
+  opts?: { unrestricted?: boolean },
+): boolean {
+  // 0. Unrestricted personal mode — any absolute path is in-scope (denylist,
+  //    regular-file check and auth still apply at the call site).
+  if (opts?.unrestricted) return true
   // 1. Static allowed directories (OPENCLAUDE_HOME, generated/, uploads/)
   for (const dir of FILE_ALLOWED_DIRS) {
     if (resolvedPath.startsWith(`${dir}/`) || resolvedPath === dir) return true
@@ -6511,6 +6544,18 @@ export const FILE_BLOCKED_PATTERNS = [
   /\.aws\//, // AWS credentials & config directory
   /\.kube\//, // Kubernetes config directory
   /\.docker\/config\.json$/, // Docker registry credentials
+  // Widened surface (unrestricted mode): block kernel/process pseudo-filesystems
+  // and a few more high-value secret stores. Anchored to the filesystem root so
+  // a legit /root/proc/notes.txt is not caught.
+  /^\/proc\//, // /proc/self/environ etc. leak process env (tokens)
+  /^\/sys\//, // kernel/device internals
+  /^\/dev\//, // device & pseudo files
+  /^\/run\/secrets\//, // docker/systemd secret mounts
+  /docker\.sock$/, // docker daemon socket
+  /\.git-credentials$/, // git stored credentials
+  /\.bash_history$/, // shell history (may contain secrets)
+  /\.zsh_history$/, // shell history (may contain secrets)
+  /\.config\/gh\//, // GitHub CLI tokens
 ]
 
 /** Returns true if the resolved path matches any sensitive-file pattern. */

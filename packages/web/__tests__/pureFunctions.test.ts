@@ -235,6 +235,78 @@ describe('T06: localPathToUrl — path to API URL', () => {
   })
 })
 
+// ── T06b: embedMediaUrls — auto-detect & render ANY-directory ANY-type file paths ──
+// Verifies the markdown.js path auto-detection: arbitrary file types in AI output
+// become clickable cards (media inline, everything else a 📎 download card), and
+// that the letter-led extension rule does not linkify prose / version suffixes.
+const _extractConstLine = (source: string, name: string): string => {
+  const m = source.match(new RegExp(`^\\s*(?:export\\s+)?const ${name}\\s*=.*$`, 'm'))
+  if (!m) throw new Error(`const ${name} not found`)
+  return m[0].replace(/^\s*export\s+/, '')
+}
+const embedMediaUrls = (() => {
+  const bundle = [
+    // Stub the only cross-module dep (dom.js arrow const) with an equivalent.
+    `const htmlSafeEscape = (s) => String(s).replace(/[&<>"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c])`,
+    _extractConstLine(appJs, '_IMG_EXTS'),
+    _extractConstLine(appJs, '_AUD_EXTS'),
+    _extractConstLine(appJs, '_VID_EXTS'),
+    _extractConstLine(appJs, '_PDF_EXTS'),
+    extractFunction(appJs, '_basename'),
+    extractFunction(appJs, '_safeMediaUrl'),
+    extractFunction(appJs, '_imgHtml'),
+    extractFunction(appJs, 'localPathToUrl'),
+    extractFunction(appJs, '_renderLocalMedia'),
+    extractFunction(appJs, 'embedMediaUrls'),
+  ].join('\n')
+  return new Function(`${bundle}; return embedMediaUrls;`)() as (html: string) => string
+})()
+
+describe('T06b: embedMediaUrls — arbitrary-directory/arbitrary-type detection', () => {
+  it('renders a non-media file (.docx) anywhere as a download card', () => {
+    const out = embedMediaUrls('<p>结果在 /root/projects/q2/report.docx 里</p>')
+    assert.ok(out.includes('doc-card'), 'should produce a doc card')
+    assert.ok(out.includes('download='), 'non-media card must force download')
+    assert.ok(
+      out.includes('/api/file?path=%2Froot%2Fprojects%2Fq2%2Freport.docx'),
+      'href should point at the /api/file URL for the exact path',
+    )
+  })
+  it('renders other non-media types (.zip/.csv/.py) as download cards', () => {
+    for (const p of ['/tmp/data/out.zip', '/var/log/app.log', '/home/me/scripts/run.py']) {
+      const out = embedMediaUrls(`<p>${p}</p>`)
+      assert.ok(out.includes('doc-card') && out.includes('download='), `${p} → download card`)
+    }
+  })
+  it('keeps chained extensions (.tar.gz) whole', () => {
+    const out = embedMediaUrls('<p>/tmp/backup/archive.tar.gz</p>')
+    assert.ok(
+      out.includes('archive.tar.gz'),
+      'the full chained-extension filename must survive, not just archive.tar',
+    )
+  })
+  it('still renders images inline (not as a plain link)', () => {
+    const out = embedMediaUrls('<p>/root/.openclaude/generated/pic.png</p>')
+    assert.ok(out.includes('inline-img'), 'png should inline as <img>')
+    assert.ok(!out.includes('doc-card'), 'png should not be a doc card')
+  })
+  it('still renders video inline and pdf as a doc card', () => {
+    assert.ok(embedMediaUrls('<p>/a/b/clip.mp4</p>').includes('inline-video'))
+    assert.ok(embedMediaUrls('<p>/a/b/manual.pdf</p>').includes('doc-card'))
+  })
+  it('does NOT linkify prose without an absolute path or a real extension', () => {
+    assert.ok(!embedMediaUrls('<p>升级到 python3.11 之后</p>').includes('doc-card'))
+    assert.ok(!embedMediaUrls('<p>see version 1.2.3 notes</p>').includes('doc-card'))
+    assert.ok(!embedMediaUrls('<p>路径 /usr/bin/python3.11 是解释器</p>').includes('doc-card'))
+  })
+  it('does not double-process paths already inside an anchor/img tag', () => {
+    const pre = '<img class="inline-img" src="/api/file?path=%2Fa%2Fb.png">'
+    const out = embedMediaUrls(pre)
+    // No nested doc-card / second img injected for the already-embedded src
+    assert.ok(!out.includes('doc-card'))
+  })
+})
+
 // ── T07: htmlSafeEscape ──
 describe('T07: htmlSafeEscape — HTML entity encoding', () => {
   it('escapes &', () => assert.equal(htmlSafeEscape('a & b'), 'a &amp; b'))

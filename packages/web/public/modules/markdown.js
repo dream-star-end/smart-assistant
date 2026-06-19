@@ -285,12 +285,16 @@ export function embedMediaUrls(html) {
   // Step 1: Detect local file paths — both inline <code>/path/file.mp4</code> and bare /path/file.mp4
   // We need to handle HTML entities: marked converts `/` inside code to `<code>...</code>`
   // and may entity-encode chars. First handle <code>-wrapped paths, then bare paths.
-  const _MEDIA_EXTS =
-    'jpg|jpeg|png|gif|webp|bmp|svg|mp3|wav|ogg|aac|flac|m4a|mp4|webm|mov|avi|mkv|pdf'
+  // Generic file extension for ANY downloadable file (docx/xlsx/zip/csv/py/log/…),
+  // not just media. Letter-led 1–8 alnum (+ a couple of common digit-led real
+  // exts) so prose suffixes like /usr/bin/python3.11 or version tags are NOT
+  // matched — only real filenames. _renderLocalMedia() then dispatches: img/
+  // audio/video/pdf render inline, everything else becomes a 📎 download card.
+  const _FILE_EXT = '(?:[A-Za-z][A-Za-z0-9]{0,7}|7z)'
 
   // Match <code>/path.ext</code> or <code>C:\path.ext</code> — handles both POSIX and Windows paths
   html = html.replace(
-    new RegExp(`<code>((?:(?:/|[A-Za-z]:\\\\?)[^<]*?)\\.(?:${_MEDIA_EXTS}))</code>`, 'gi'),
+    new RegExp(`<code>((?:/|[A-Za-z]:\\\\?)[^<]*?(?:\\.${_FILE_EXT})+)</code>`, 'gi'),
     (match, rawPath) => {
       const filePath = rawPath
         .replace(/&amp;/g, '&')
@@ -302,10 +306,12 @@ export function embedMediaUrls(html) {
     },
   )
 
-  // Match bare absolute paths: /path/file.ext or C:\path\file.ext
+  // Match bare absolute paths: /path/file.ext or C:\path\file.ext (any extension).
+  // Trailing lookahead lets a path end a sentence (.docx.) or be quoted without
+  // swallowing the boundary char; (?:\.ext)+ keeps chained exts like .tar.gz whole.
   html = html.replace(
     new RegExp(
-      `((?:^|[\\s>])((?:(?:/|[A-Za-z]:[\\\\\\\\])[^\\s<"\'\`>]+?\\.(?:${_MEDIA_EXTS}))))`,
+      `((?:^|[\\s>])((?:/|[A-Za-z]:[\\\\\\\\])[^\\s<"\'\`>]+?(?:\\.${_FILE_EXT})+))(?=[\\s<"\'\`)\\].,!?:;]|$)`,
       'gi',
     ),
     (match, full, filePath, offset) => {
