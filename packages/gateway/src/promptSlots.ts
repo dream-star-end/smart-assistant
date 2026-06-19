@@ -161,6 +161,9 @@ export async function buildAgentsSlot(ctx: PromptSlotContext): Promise<PromptSlo
       lines.push(
         '选择 agent 时考虑其模型和能力特长。需要用结果继续处理 → delegate_task,只需通知 → send_to_agent。',
       )
+      lines.push(
+        '注意: 调用 `send_to_agent` 成功后,不要把工具回执当作本轮已完成,也不要立刻结束本轮。你必须继续输出一段简短调度说明:已把什么任务交给哪个 agent、为什么这样分工、用户稍后会直接收到该 agent 的结果;如果你还会继续处理,也说明下一步。',
+      )
     }
   } catch {}
 
