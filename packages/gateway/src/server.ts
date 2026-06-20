@@ -71,6 +71,7 @@ import {
   listClaudeSessions,
   resolveClaudeTerminalUserIdForAuth,
 } from './claudeTerminal.js'
+import { readClaudeCredentialsSync, syncClaudeCredentialsFile } from './claudeCredentialsSync.js'
 import { syncCodexAuthFile } from './codexAuthSync.js'
 import { CronScheduler } from './cron.js'
 import { runDelegateExecution } from './delegateExecution.js'
@@ -968,9 +969,11 @@ export class Gateway {
       }
     })
 
-    // Periodic OAuth token refresh (every 10 min). Running subprocesses keep
-    // the old token until restarted; 401 detection in sessionManager handles
-    // the restart + retry when the old token expires mid-conversation.
+    // Periodic OAuth token refresh (every 10 min). This now covers CODEX only —
+    // Claude is no longer refreshed by the gateway (credentials.json is
+    // authoritative and the official engine owns its refresh). For Codex,
+    // running subprocesses keep the old token until restarted; 401 detection in
+    // sessionManager handles the restart + retry when it expires mid-conversation.
     this._oauthRefreshTimer = setInterval(
       () => this.refreshClaudeOAuthIfNeeded().catch(() => {}),
       10 * 60_000,
@@ -984,11 +987,17 @@ export class Gateway {
       }
     }, Gateway.PENDING_PERMISSION_SWEEP_MS)
     // Purge any legacy CCB-era runtime OAuth token sidecar at boot. The official
-    // claude engine reads CLAUDE_CODE_OAUTH_TOKEN from the spawn env, not a file,
-    // so we just make sure no stale sensitive token is left on disk.
+    // claude engine now reads its token from ~/.claude/.credentials.json (the
+    // single authority source), so this sidecar is obsolete — we only make sure
+    // no stale sensitive token is left on disk.
     await this.syncRuntimeOauthTokenFromConfig().catch(() => {})
-    // Check refresh on boot (updates config; running subprocesses pick up the
-    // fresh token on their next restart via the 401/AUTH_ERROR retry path).
+    // Recover credentials.json from the legacy config breadcrumb only if the
+    // file is entirely missing (no-op on a healthy install; never touches an
+    // existing file, so it can't stomp a token the official engine rotated in).
+    await this.seedClaudeCredentialsFromConfig().catch(() => {})
+    // Check refresh on boot. Claude is no longer refreshed here (credentials.json
+    // is authoritative and the official engine owns it) — this now only covers
+    // Codex; running subprocesses pick up any fresh token on restart.
     this.refreshClaudeOAuthIfNeeded().catch(() => {})
 
     await new Promise<void>((res) => {
@@ -1724,10 +1733,11 @@ export class Gateway {
       const authInfo: Record<string, any> = {
         mode: this.deps.config.auth.mode,
       }
-      if (this.deps.config.auth.claudeOAuth?.accessToken) {
+      const claudeAuth = this.claudeAuthStatus()
+      if (claudeAuth.active) {
         authInfo.claudeOAuth = {
           active: true,
-          expiresAt: this.deps.config.auth.claudeOAuth.expiresAt,
+          expiresAt: claudeAuth.expiresAt,
         }
       }
       if (this.deps.config.auth.codexOAuth?.accessToken) {
@@ -1959,11 +1969,11 @@ export class Gateway {
       return
     }
     if (url.pathname === '/api/auth/claude/status') {
-      const oauth = this.deps.config.auth.claudeOAuth
+      const claudeAuth = this.claudeAuthStatus()
       this.sendJson(res, 200, {
-        authenticated: !!oauth?.accessToken,
-        expiresAt: oauth?.expiresAt,
-        scope: oauth?.scope,
+        authenticated: claudeAuth.active,
+        expiresAt: claudeAuth.expiresAt,
+        scope: claudeAuth.scope,
       })
       return
     }
@@ -3551,11 +3561,25 @@ export class Gateway {
         await writeConfig(config)
         this.deps.config = config
         this.sessions.updateConfig(config)
-        // Official claude reads CLAUDE_CODE_OAUTH_TOKEN from the spawn env (set
-        // from config at spawn time), not a runtime sidecar file. Purge any
-        // legacy CCB-era runtime token file so a stale sensitive token can't
-        // linger on disk after this /login.
         if (providerKey === 'claude') {
+          // credentials.json is the single authority source the official `claude`
+          // engine reads AND refreshes. The user just explicitly logged in via the
+          // UI, so force-write the fresh token there so the subscription takes
+          // effect immediately. (config.auth.claudeOAuth is still written above —
+          // but only as a boot-seed breadcrumb / status fallback; the gateway no
+          // longer refreshes it, so it can never fight credentials.json's chain.)
+          await syncClaudeCredentialsFile({
+            oauth: {
+              accessToken: oauthData.accessToken,
+              refreshToken: oauthData.refreshToken,
+              expiresAt: oauthData.expiresAt,
+              scope: oauthData.scope,
+            },
+            filePath: join(homedir(), '.claude', '.credentials.json'),
+            log: this.log,
+          })
+          // Purge any legacy CCB-era runtime token sidecar so a stale sensitive
+          // token can't linger on disk after this /login.
           await this.removeRuntimeOauthToken()
         } else if (providerKey === 'codex') {
           // Mirror the new token into ~/.codex/auth.json so codex CLI / MCP
@@ -3589,10 +3613,10 @@ export class Gateway {
    * Best-effort delete of the legacy runtime OAuth token file.
    *
    * History: the in-repo CCB fork mtime-watched `runtime/claude_oauth_token.json`
-   * for hot token reloads. The official `claude` engine reads
-   * CLAUDE_CODE_OAUTH_TOKEN from the spawn env instead, so this file is no longer
-   * written or read — we only purge any leftover from the CCB era so a stale
-   * sensitive token can't linger on disk.
+   * for hot token reloads. The official `claude` engine reads its token from
+   * ~/.claude/.credentials.json (the single authority source) instead, so this
+   * file is no longer written or read — we only purge any leftover from the CCB
+   * era so a stale sensitive token can't linger on disk.
    */
   private async removeRuntimeOauthToken(): Promise<void> {
     try {
@@ -3611,11 +3635,55 @@ export class Gateway {
 
   /**
    * Called at startup: purge any legacy CCB-era runtime OAuth token file. The
-   * official `claude` engine takes its token from the spawn env, so the sidecar
-   * file is obsolete — we only ensure no stale sensitive token is left on disk.
+   * official `claude` engine reads its token from ~/.claude/.credentials.json,
+   * so the sidecar file is obsolete — we only ensure no stale sensitive token is
+   * left on disk.
    */
   private async syncRuntimeOauthTokenFromConfig(): Promise<void> {
     await this.removeRuntimeOauthToken()
+  }
+
+  /**
+   * Boot-seed `~/.claude/.credentials.json` from the legacy config breadcrumb
+   * (`auth.claudeOAuth`) — but ONLY when the file does not exist at all
+   * (onlyIfMissing). This recovers the single authority source for an older
+   * install that logged in via the OpenClaude UI (so the config copy exists) but
+   * never got a credentials.json written. We deliberately do NOT touch an
+   * existing file: if it exists but is stale, the official `claude` engine
+   * refreshes it; if its token is truly revoked, the config copy is from the same
+   * account/family and can't rescue it anyway. On a healthy install this is a
+   * no-op, and at boot no official `claude` subprocess is running yet, so there's
+   * no writer to race. Best-effort; runs before the WS server accepts clients.
+   */
+  private async seedClaudeCredentialsFromConfig(): Promise<void> {
+    const oauth = this.deps.config.auth.claudeOAuth
+    if (!oauth?.accessToken || !oauth.refreshToken) return
+    await syncClaudeCredentialsFile({
+      oauth: {
+        accessToken: oauth.accessToken,
+        refreshToken: oauth.refreshToken,
+        expiresAt: oauth.expiresAt,
+        scope: oauth.scope,
+      },
+      filePath: join(homedir(), '.claude', '.credentials.json'),
+      log: this.log,
+      onlyIfMissing: true,
+    })
+  }
+
+  // Claude auth status for the UI. credentials.json is the authority source the
+  // official `claude` engine reads + refreshes; the config copy is only a
+  // login-time breadcrumb (never refreshed). Read the file first so the UI shows
+  // the live expiry, and fall back to the breadcrumb for the brief window after a
+  // fresh login before anything has spawned.
+  private claudeAuthStatus(): { active: boolean; expiresAt?: number; scope?: string } {
+    const creds = readClaudeCredentialsSync(join(homedir(), '.claude', '.credentials.json'))
+    if (creds?.accessToken) {
+      return { active: true, expiresAt: creds.expiresAt, scope: creds.scopes?.join(' ') }
+    }
+    const cfg = this.deps.config.auth.claudeOAuth
+    if (cfg?.accessToken) return { active: true, expiresAt: cfg.expiresAt, scope: cfg.scope }
+    return { active: false }
   }
 
   // Token auto-refresh (called periodically and on-demand after 401).
@@ -3643,12 +3711,18 @@ export class Gateway {
   }
 
   private async _refreshClaudeOAuthImpl(force: boolean): Promise<void> {
-    // Try refreshing Claude OAuth
-    const claudeOAuth = this.deps.config.auth.claudeOAuth
-    if (claudeOAuth?.refreshToken && (force || Date.now() >= claudeOAuth.expiresAt - 5 * 60_000)) {
-      await this._refreshToken('claude', claudeOAuth)
-    }
-    // Try refreshing Codex OAuth
+    // NOTE: Claude OAuth is intentionally NOT refreshed here anymore.
+    // ~/.claude/.credentials.json is the single authority source and the
+    // official `claude` engine owns its refresh. A gateway-side refresher would
+    // be a SECOND independent client on the same OAuth client_id + account,
+    // sharing one rotating refresh-token chain — which trips Anthropic's
+    // refresh-token-reuse detection and revokes the token family (periodic 401
+    // storms). On a Claude 401 the sessionManager AUTH_ERROR path simply
+    // restarts the subprocess, and the restarted official `claude` re-reads /
+    // refreshes credentials.json itself. See claudeCredentialsSync.ts.
+    //
+    // Codex stays here: separate provider, separate client_id, separate file
+    // (~/.codex/auth.json) — no shared-chain hazard.
     const codexOAuth = this.deps.config.auth.codexOAuth
     if (codexOAuth?.refreshToken && (force || Date.now() >= codexOAuth.expiresAt - 5 * 60_000)) {
       await this._refreshToken('codex', codexOAuth)

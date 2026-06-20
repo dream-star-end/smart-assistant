@@ -330,25 +330,36 @@ export class SubprocessRunner extends EventEmitter {
       const effectiveProvider = this.opts.agentProvider ?? this.opts.config.provider
 
       if (effectiveProvider === 'claude-subscription') {
-        // Claude subscription: inject OAuth token, route to Anthropic API.
-        if (this.opts.config.auth.claudeOAuth?.accessToken) {
-          // Official claude reads CLAUDE_CODE_OAUTH_TOKEN from env. A gateway-side
-          // token refresh is materialised into config; a running subprocess keeps
-          // its spawn-time token until it restarts — the 401/AUTH_ERROR retry path
-          // (sessionManager) recycles it when the old token expires mid-turn.
-          // (We no longer ship the CCB-only OPENCLAUDE_CLAUDE_OAUTH_TOKEN_FILE
-          // hot-reload sidecar; a token refresh costs at most one 401 round-trip.)
-          providerEnv.CLAUDE_CODE_OAUTH_TOKEN = this.opts.config.auth.claudeOAuth.accessToken
-        }
-        // Clear any inherited provider vars so nothing redirects Claude requests
-        // away from Anthropic. Provider isolation relies on (a) this env clearing
-        // and (b) the host's ~/.claude/settings.json carrying no provider `env`
-        // block. (We previously passed `--setting-sources project,local` to mimic
-        // CCB's PROVIDER_MANAGED_BY_HOST, but that both excluded legitimate user
-        // settings AND collapsed to a no-op when the agent cwd equals $HOME — so
-        // project settings == user settings. Dropped as a fragile half-measure.)
-        providerEnv.ANTHROPIC_BASE_URL = ''
+        // Single authority source: the official `claude` engine reads its OAuth
+        // token from ~/.claude/.credentials.json and owns its own refresh. We
+        // deliberately do NOT inject CLAUDE_CODE_OAUTH_TOKEN here.
+        //
+        // History: we used to inject `config.auth.claudeOAuth.accessToken` and
+        // run a SEPARATE gateway-side refresher. But that refresher uses the
+        // official Claude Code OAuth client_id (9d1c250a-…) against the SAME
+        // account as credentials.json — so two independent refreshers shared one
+        // rotating refresh-token chain. Anthropic OAuth uses single-use
+        // refresh-token rotation with reuse detection: the second refresher trips
+        // reuse detection and the auth server revokes the whole token *family*,
+        // including freshly issued access tokens → "refresh succeeded but the new
+        // token 401s seconds later" → periodic WebChat 401 storms. The CC terminal
+        // never broke because it only ever read credentials.json (one refresher).
+        // Authenticating the subprocess exactly like the CC terminal collapses
+        // both onto one refresher / one chain. See claudeCredentialsSync.ts.
+        //
+        // Explicitly blank every auth/routing var that could be INHERITED from
+        // the gateway process env (spawn env = { ...process.env, ...providerEnv }),
+        // so the official `claude` falls through to credentials.json + Anthropic.
+        // claude treats an empty string here as unset. This must include
+        // ANTHROPIC_API_KEY: if it leaks in, claude uses API-key auth instead of
+        // the OAuth credentials file — the exact divergence the CC terminal avoids
+        // by building a whitelist env that never carries it. Provider isolation
+        // still relies on the host's ~/.claude/settings.json carrying no provider
+        // `env` block.
+        providerEnv.CLAUDE_CODE_OAUTH_TOKEN = ''
+        providerEnv.ANTHROPIC_API_KEY = ''
         providerEnv.ANTHROPIC_AUTH_TOKEN = ''
+        providerEnv.ANTHROPIC_BASE_URL = ''
         providerEnv.ANTHROPIC_MODEL = ''
       } else if (effectiveProvider === 'codex' || effectiveProvider === 'openai') {
         // OpenAI/Codex: use Codex OAuth token via an Anthropic-compatible proxy.
