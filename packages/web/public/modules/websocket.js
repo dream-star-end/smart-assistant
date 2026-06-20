@@ -5,6 +5,7 @@ import { abortInflightRefresh, apiGet, clearProactiveRefresh, reportClientError,
 import { clearSessionCookie } from './auth.js?v=c9d2ed11'
 import { dbPut } from './db.js?v=c9d2ed11'
 import { $, htmlSafeEscape } from './dom.js?v=c9d2ed11'
+import { classifyEmptyTurn, countAnswerBlocks } from './emptyTurn.js?v=auto'
 import { maybeNotify, setTitleBusy } from './notifications.js?v=c9d2ed11'
 import { _clearStoredAccessToken, getSession, state } from './state.js?v=c9d2ed11'
 import { maybeSyncNow } from './sync.js?v=c9d2ed11'
@@ -320,7 +321,21 @@ function _resetThinkingSafety(sessId) {
     _thinkingTimers.delete(sessId)
     const s = state.sessions.get(sessId)
     if (s && s._sendingInFlight) {
+      // Liveness re-check before tearing down. turn_status (compacting) frames
+      // refresh `_lastFrameAt` via markFrameReceived but do NOT reset this
+      // timer (handleOutboundTurnStatus has no _resetThinkingSafety), so a long
+      // compacting phase could trip the 10min timeout on a session that's
+      // demonstrably alive. If ANY frame landed within the window, reschedule
+      // instead of killing the turn and showing a bogus "interrupted" notice.
+      const sinceLastFrame = Date.now() - (s._lastFrameAt || 0)
+      if (s._lastFrameAt && sinceLastFrame < THINKING_SAFETY_MS) {
+        _resetThinkingSafety(sessId)
+        return
+      }
       console.warn('[ws] Thinking safety timeout for session', sessId)
+      // Capture the in-flight target BEFORE resetReplyTracker clears it, so the
+      // visible notice below can dedup against the same user turn.
+      const _timedOutMsgId = s._replyingToMsgId || null
       // Send stop to backend so the turn is actually interrupted,
       // preventing late frames from being misattributed to a future turn.
       // safeWsSend:若 buffer 堵死直接 close+reconnect,stop 丢了也 OK —— close 时
@@ -337,6 +352,23 @@ function _resetThinkingSafety(sessId) {
       // so any belated isFinal must NOT retroactively flag this message as
       // an empty turn (or attach to whatever message comes next).
       resetReplyTracker(s)
+      // Never end a turn silently: surface a persistent, in-conversation notice
+      // so the user knows the round was torn down (not just a stopped spinner).
+      // Dedup by target user-message id against the live tail — a late isFinal
+      // or replay could have already inserted an empty-turn notice for this turn
+      // (and isFinal clears this timer at line ~2640, so normally only one path
+      // fires; this guards the rare race).
+      const _lastMsg = s.messages[s.messages.length - 1]
+      const _dup =
+        _lastMsg && _lastMsg._emptyTurn && _lastMsg._emptyTurnTargetMsgId === _timedOutMsgId
+      if (!_dup) {
+        addMessage(s, 'assistant', '约 10 分钟未收到新内容,本轮可能已中断。可重新发送,或直接说"继续"。', {
+          _emptyTurn: true,
+          _emptyTurnSoft: false,
+          _emptyTurnTimeout: true,
+          _emptyTurnTargetMsgId: _timedOutMsgId,
+        })
+      }
       if (s.id === state.currentSessionId) {
         state.sendingInFlight = false
         updateSendEnabled()
@@ -1485,7 +1517,7 @@ export function updateSendEnabled() {
 export function resetReplyTracker(sess) {
   if (!sess) return
   sess._replyingToMsgId = null
-  sess._currentTurnBlockCount = 0
+  sess._currentTurnAnswerCount = 0
   sess._trackerResetAt = Date.now()
 }
 
@@ -2516,9 +2548,15 @@ function _acceptFrameSeq(sess, frame, traceDrop) {
   _setFrameSeqCursor(sess, key, frame.frameSeq)
   return true
 }
+
 export function handleOutbound(frame) {
   const peerId = frame.peer?.id
   let sess = peerId ? state.sessions.get(peerId) : null
+  // Deferred empty-turn notice: classified in the isFinal block (which runs
+  // BEFORE this frame's blocks are rendered) but inserted AFTER the block loop,
+  // so a final-frame thinking-only turn shows the notice below its thinking
+  // card instead of above it. null = nothing to insert.
+  let _deferredEmptyNotice = null
   trace('ws.frame.in', {
     sess: sess?.id ?? peerId ?? null,
     seq: frame.frameSeq ?? null,
@@ -2686,9 +2724,10 @@ export function handleOutbound(frame) {
   // the indicator switches to "深度思考中" / "处理时间较长,仍在思考中" instead of looking idle.
   // Update user message status: find the most recent user msg in THIS session
   // that is still pending (sent/read but not replied). Only update one msg per turn.
-  // Also track a per-turn content-block counter so we can detect "empty turn"
-  // (isFinal arrives without any preceding text/thinking/tool block) — that state
-  // otherwise leaves the user message marked "已回复" with nothing to show.
+  // Also track a per-turn ANSWER-block counter so we can detect "empty turn"
+  // (isFinal arrives without any answer-bearing block) — that state otherwise
+  // leaves the user message marked "已回复" with nothing to show. `thinking`
+  // blocks do NOT count: a reasoning-only turn is blank to the user.
   if (!sess._replyingToMsgId) {
     // Only match sent/read messages — skip 'queued' (not yet sent, shouldn't be marked read/replied)
     const pending = [...sess.messages].reverse().find(
@@ -2696,7 +2735,7 @@ export function handleOutbound(frame) {
     )
     if (pending) {
       sess._replyingToMsgId = pending.id
-      sess._currentTurnBlockCount = 0
+      sess._currentTurnAnswerCount = 0
     }
   }
   const _targetMsg = sess._replyingToMsgId
@@ -2707,19 +2746,20 @@ export function handleOutbound(frame) {
   if (sess._replyingToMsgId && !_targetMsg) {
     resetReplyTracker(sess)
   }
-  // Count content blocks for this turn (before isFinal processing). Count blocks
+  // Count ANSWER-bearing blocks for this turn (before isFinal processing). Count
   // from BOTH streaming and final frames — the gateway has several final-with-content
   // paths (rate-limit rejection, upload rejection, run-error, webhook delivery, etc.)
   // where isFinal:true arrives carrying the only text block of the turn. Ignoring
-  // final-frame blocks here would cause those legitimate responses to be flagged as
-  // empty and trigger a spurious "本轮响应为空" warning BEFORE the real block is
-  // rendered (addMessage/block-apply happens later in this function).
-  if (
-    _targetMsg &&
-    Array.isArray(frame.blocks) &&
-    frame.blocks.length > 0
-  ) {
-    sess._currentTurnBlockCount = (sess._currentTurnBlockCount || 0) + frame.blocks.length
+  // final-frame blocks here would flag those legitimate responses as empty and
+  // trigger a spurious notice BEFORE the real block is rendered (addMessage/
+  // block-apply happens later in this function).
+  //
+  // countAnswerBlocks uses a WHITELIST (ANSWER_BLOCK_KINDS): thinking is excluded
+  // (a reasoning-only turn is blank to the user — the GLM screenshot bug), and so
+  // are update-only kinds (tool_result / tool_output_tail / delegate_progress)
+  // that may not render at all on their own — see emptyTurn.js for why.
+  if (_targetMsg && Array.isArray(frame.blocks) && frame.blocks.length > 0) {
+    sess._currentTurnAnswerCount = (sess._currentTurnAnswerCount || 0) + countAnswerBlocks(frame.blocks)
   }
   if (_targetMsg) {
     if (
@@ -2731,139 +2771,19 @@ export function handleOutbound(frame) {
       updateMsgStatus(_targetMsg, sess)
     }
     if (frame.isFinal) {
-      // Stale-final frames were already dropped at the top of handleOutbound
-      // via an early return, so by the time we get here the frame is known
-      // to be current. Run the empty-turn detector and close the tracker.
-      // Detect empty-turn by directly inspecting the message array: did any
-      // content-bearing message get added AFTER the target user message?
-      // This is more robust than relying on transient streaming pointers.
-      // Roles considered content: assistant, thinking, tool, agent-group,
-      // delegate-progress, plan, goal, and permission (permission prompts are visible cards that count as
-      // real turn output).
-      let producedContent = false
-      const targetIdx = sess.messages.findIndex((m) => m.id === _targetMsg.id)
-      if (targetIdx >= 0) {
-        for (let i = targetIdx + 1; i < sess.messages.length; i++) {
-          const r = sess.messages[i].role
-          if (
-            r === 'assistant' ||
-            r === 'thinking' ||
-            r === 'tool' ||
-            r === 'agent-group' ||
-            r === 'delegate-progress' ||
-            r === 'plan' ||
-            r === 'goal' ||
-            r === 'permission'
-          ) {
-            producedContent = true
-            break
-          }
-        }
-      }
-      if (
-        !producedContent &&
-        !sess._currentTurnBlockCount &&
-        !sess._streamingAssistant &&
-        !sess._streamingThinking
-      ) {
-        // Empty turn (isFinal with zero content blocks) has two very
-        // different root causes:
-        //
-        //   (1) Model preference — Opus 4.7 (and other newer Claudes)
-        //       routinely end_turn without any text block after a tool
-        //       call completes, or when the user's follow-up is a meta
-        //       question it judges needs no answer. The session is healthy.
-        //
-        //   (2) Real backend fault — rate-limit swallowed upstream, gateway
-        //       returning isFinal on a dead subprocess, etc.
-        //
-        // Classifying these two reliably from frontend state is risky (see
-        // history: a prior "prior turn had content → silent" heuristic
-        // would mask case 2 any time it followed a successful case 1).
-        // Instead we always show a single non-alarmist notice and let the
-        // *wording* differentiate: if the previous turn produced content,
-        // we say "模型本轮未输出新内容"; otherwise "未收到回复". Either
-        // way it's an info-level notice, not a red error, so users don't
-        // distrust the UI — but real faults remain visible.
-        //
-        // Walk backwards from target user msg until we hit another user
-        // msg (= previous turn boundary) or the start of the array. If the
-        // previous turn contains any content-bearing block, treat as the
-        // "likely model preference" variant. Role set here mirrors the
-        // producedContent check above (including 'permission') so the two
-        // classifiers agree on what counts as "content".
-        let priorTurnHadContent = false
-        for (let i = targetIdx - 1; i >= 0; i--) {
-          const r = sess.messages[i].role
-          if (r === 'user') break
-          if (
-            r === 'assistant' ||
-            r === 'thinking' ||
-            r === 'tool' ||
-            r === 'agent-group' ||
-            r === 'delegate-progress' ||
-            r === 'plan' ||
-            r === 'goal' ||
-            r === 'permission'
-          ) {
-            priorTurnHadContent = true
-            break
-          }
-        }
-        // Avoid double-insertion on rare re-entrant cases: skip if the last
-        // message is already an empty-turn notice for this target.
-        const last = sess.messages[sess.messages.length - 1]
-        const alreadyWarned = last && last._emptyTurn
-        if (!alreadyWarned) {
-          // Prefer `frame.meta.stopReason` (extracted from CCB's result row
-          // by ccbMessageParser._handleResult) over the old prior-turn
-          // heuristic. When present, use Anthropic's own termination code
-          // to pick a precise notice. When absent (older CCB, telemetry
-          // drop, etc.), fall back to the priorTurnHadContent wording.
-          // See docs/ccb-telemetry-refactor-plan.md §5.6.
-          const stopReason = frame.meta?.stopReason
-          console.warn('[ws] empty-turn: isFinal with zero blocks', {
-            sessionId: sess.id,
-            targetMsgId: _targetMsg.id,
-            priorTurnHadContent,
-            stopReason: stopReason ?? null,
-          })
-          let noticeText
-          switch (stopReason) {
-            case 'end_turn':
-              noticeText = '模型本轮主动结束(通常表示它判断不需要再回复或上下文已表达完整)。可继续追问。'
-              break
-            case 'pause_turn':
-              noticeText = '模型暂停了本轮(通常因长任务超时),可直接重新发送让它继续。'
-              break
-            case 'max_tokens':
-              noticeText = '本轮输出达到 token 上限,内容可能不完整。可让它"继续"。'
-              break
-            case 'refusal':
-              noticeText = '模型拒绝回复本轮内容。'
-              break
-            case 'tool_use':
-              // stop_reason=tool_use but 0 blocks → tool_use stream was cut
-              noticeText = '工具调用流意外中断,请重试。'
-              break
-            case 'stop_sequence':
-              noticeText = '模型命中停止序列结束本轮。'
-              break
-            default:
-              if (stopReason) {
-                noticeText = `模型本轮无内容输出 (stop_reason=${stopReason})。可重试或继续追问。`
-              } else if (priorTurnHadContent) {
-                noticeText = '模型本轮未输出新内容,可继续追问或重新提问。'
-              } else {
-                noticeText = '未收到回复 — 服务端标记已完成,但没有生成任何内容。请重试。'
-              }
-          }
-          addMessage(sess, 'assistant', noticeText, {
-            _emptyTurn: true,
-            _emptyTurnSoft: priorTurnHadContent || !!stopReason,
-            _emptyTurnStopReason: stopReason ?? null,
-          })
-        }
+      // Stale-final frames were already dropped at the top of handleOutbound.
+      // Capture the turn target + stopReason now; the empty-turn DECISION is
+      // deferred to after this frame's blocks are rendered (second isFinal block
+      // below), where classifyEmptyTurn inspects the ACTUALLY-RENDERED messages.
+      // A final-only frame can render a tool / delegate-progress card during the
+      // block loop (tool_result with preview, delegate_progress fallback) —
+      // classifying before render would wrongly flag those as empty. The
+      // lookahead flag is only a fast "already saw an answer block" hint; the
+      // rendered-message scan in the consumer is authoritative.
+      _deferredEmptyNotice = {
+        targetMsgId: _targetMsg.id,
+        stopReason: frame.meta?.stopReason,
+        hadAnswerLookahead: !!sess._currentTurnAnswerCount || !!sess._streamingAssistant,
       }
       // 2026-05-06 §4.6 改动 13 — 显式 _targetMsg.status='replied' 写入路径退役。
       // 角标改由 messages.js _deriveUserMsgStatus 在 render 时按"后续是否有
@@ -3340,6 +3260,43 @@ export function handleOutbound(frame) {
   }
   sess.lastAt = Date.now()
   if (frame.isFinal) {
+    // ── Empty-turn notice — classified HERE, AFTER this frame's blocks have
+    // been rendered above, so classifyEmptyTurn sees the actually-rendered
+    // messages. A final-only frame may render a tool / delegate-progress card
+    // during the block loop; classifying pre-render would mis-flag those as
+    // empty. Inserting post-render also places the notice below any thinking
+    // card. Dedup against the live tail by target msg id: replay, a late final,
+    // or the THINKING_SAFETY timeout may already have inserted a notice for this
+    // same user turn.
+    if (_deferredEmptyNotice) {
+      const _cls = classifyEmptyTurn({
+        messages: sess.messages,
+        targetMsgId: _deferredEmptyNotice.targetMsgId,
+        hasAnswerOutput: _deferredEmptyNotice.hadAnswerLookahead || !!sess._streamingAssistant,
+        stopReason: _deferredEmptyNotice.stopReason,
+      })
+      if (_cls.insert) {
+        const _lastMsg = sess.messages[sess.messages.length - 1]
+        const _dup =
+          _lastMsg &&
+          _lastMsg._emptyTurn &&
+          _lastMsg._emptyTurnTargetMsgId === _deferredEmptyNotice.targetMsgId
+        if (!_dup) {
+          console.warn('[ws] empty-turn: isFinal with no rendered answer', {
+            sessionId: sess.id,
+            targetMsgId: _deferredEmptyNotice.targetMsgId,
+            stopReason: _cls.stopReason,
+          })
+          addMessage(sess, 'assistant', _cls.text, {
+            _emptyTurn: true,
+            _emptyTurnSoft: _cls.soft,
+            _emptyTurnStopReason: _cls.stopReason,
+            _emptyTurnTargetMsgId: _deferredEmptyNotice.targetMsgId,
+          })
+        }
+      }
+      _deferredEmptyNotice = null
+    }
     if (frame.meta && sess._streamingAssistant) {
       // 2026-05-06 §4.5 改动 9 — 把 frame.meta 结构化合入 _streamingAssistant.usage,
       // 渲染层 formatMeta(msg) 现算字串。本路径同时 drain 早到的 cost_charged:
@@ -3537,7 +3494,7 @@ export function handleOutbound(frame) {
       sess: sess.id,
       targetMsgId: _targetMsg?.id ?? null,
       targetIdx: _targetIdx,
-      blockCount: sess._currentTurnBlockCount ?? 0,
+      blockCount: sess._currentTurnAnswerCount ?? 0,
       msgCount: sess.messages.length,
       lastAssistantTextLen: _lastAssistantTextLen,
       producedContent: _producedContent,

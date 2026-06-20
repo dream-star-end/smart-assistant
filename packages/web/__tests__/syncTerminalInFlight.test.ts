@@ -213,7 +213,7 @@ describe('_clearLocalInFlightAfterServerSettle', () => {
       _isFirstTurnAfterReady: true,
       _turnStatus: { label: 'running' },
       _replyingToMsgId: 'u1',
-      _currentTurnBlockCount: 3,
+      _currentTurnAnswerCount: 3,
       messages,
     }
 
@@ -232,7 +232,7 @@ describe('_clearLocalInFlightAfterServerSettle', () => {
     assert.equal(sess._isFirstTurnAfterReady, false)
     assert.equal(sess._turnStatus, null)
     assert.equal(sess._replyingToMsgId, null)
-    assert.equal(sess._currentTurnBlockCount, 0)
+    assert.equal(sess._currentTurnAnswerCount, 0)
     assert.equal(sess._trackerResetAt, 1234)
   })
 
@@ -284,7 +284,7 @@ describe('_preserveLocalInFlightRuntime', () => {
       _streamingAssistant: oldAssistant,
       _streamingThinking: oldThinking,
       _replyingToMsgId: 'u1',
-      _currentTurnBlockCount: 2,
+      _currentTurnAnswerCount: 2,
       _turnStartedAt: 10,
       _lastFrameAt: 20,
       _activeTeamRun: { id: 'team', leaderAgentId: 'leader' },
@@ -302,7 +302,7 @@ describe('_preserveLocalInFlightRuntime', () => {
     assert.equal(sess._streamingAssistant, freshAssistant)
     assert.equal(sess._streamingThinking, freshThinking)
     assert.equal(sess._replyingToMsgId, 'u1')
-    assert.equal(sess._currentTurnBlockCount, 2)
+    assert.equal(sess._currentTurnAnswerCount, 2)
     assert.equal(sess._turnStartedAt, 10)
     assert.equal(sess._lastFrameAt, 20)
     assert.deepEqual(sess._activeTeamRun, { id: 'team', leaderAgentId: 'leader' })
@@ -310,6 +310,19 @@ describe('_preserveLocalInFlightRuntime', () => {
     assert.equal(sess._pendingCostCredits, '3')
     assert.equal(sess._lastFinaledAssistantId, 'a0')
     assert.equal(sess._lastFinaledAt, 30)
+  })
+
+  it('migrates the pre-rename _currentTurnBlockCount across REST replacement (deploy window)', () => {
+    // A turn in flight when the rename shipped still carries the old field name
+    // on the in-memory session object; preserve must not lose its answer count.
+    const existingLocal = {
+      _sendingInFlight: true,
+      _replyingToMsgId: 'u1',
+      _currentTurnBlockCount: 5,
+    }
+    const sess = { messages: [user('u1', 'read')] }
+    _preserveLocalInFlightRuntime(existingLocal, sess)
+    assert.equal(sess._currentTurnAnswerCount, 5)
   })
 
   it('is used by both non-terminal sync replacement paths', () => {

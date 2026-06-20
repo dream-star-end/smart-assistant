@@ -1179,7 +1179,7 @@ describe('pushSessionToServer — 409 server-wins fallback', () => {
     assert.equal(sess._streamingAssistant, sess.messages[1])
   })
 
-  it('clears _replyingToMsgId and _currentTurnBlockCount when that msg vanishes from server', async () => {
+  it('clears _replyingToMsgId and _currentTurnAnswerCount when that msg vanishes from server', async () => {
     // server 端为本 turn 写了 srv-asst (takeover,`_source: 'server'`),local 仍
     // 抱着 m-orphan 这条 client phantom。新 merger 的 turn-group dedupe (同 group
     // 出现 server-authored assistant) 应该丢 m-orphan;`_rebindStreamingPointers`
@@ -1195,7 +1195,7 @@ describe('pushSessionToServer — 409 server-wins fallback', () => {
       ],
       lastAt: 1000, pinned: false, agentId: 'a', _dirty: true, _syncedAt: 500,
       _replyingToMsgId: 'm-orphan',
-      _currentTurnBlockCount: 7,
+      _currentTurnAnswerCount: 7,
     }
 
     const deps = baseDeps({
@@ -1222,7 +1222,7 @@ describe('pushSessionToServer — 409 server-wins fallback', () => {
     assert.equal(sess.messages.length, 2)
     assert.deepEqual(sess.messages.map((m: any) => m.id), ['u1', 'srv-peer1-t1'])
     assert.equal(sess._replyingToMsgId, null)
-    assert.equal(sess._currentTurnBlockCount, 0)
+    assert.equal(sess._currentTurnAnswerCount, 0)
   })
 
   it('preserves local if user typed during PUT (live.lastAt > preFlightLastAt)', async () => {

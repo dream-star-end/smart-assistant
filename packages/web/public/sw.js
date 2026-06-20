@@ -50,6 +50,7 @@ const SHELL = [
   '/modules/sync.js',
   '/modules/messages.js',
   '/modules/messages.js?v=c9d2ed11',
+  '/modules/emptyTurn.js?v=auto',  // 版本化 URL(websocket.js import 带 ?v=auto;空 turn 分类纯函数)
   '/modules/websocket.js',
   '/modules/commands.js',
   '/modules/commands.js?v=c9d2ed11',

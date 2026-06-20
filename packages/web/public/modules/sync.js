@@ -562,7 +562,7 @@ function _rebindStreamingPointers(sess) {
   }
   if (sess._replyingToMsgId && !byId.has(sess._replyingToMsgId)) {
     sess._replyingToMsgId = null
-    sess._currentTurnBlockCount = 0  // hygiene: old turn's counter is stale
+    sess._currentTurnAnswerCount = 0  // hygiene: old turn's counter is stale
   }
 }
 
@@ -760,7 +760,7 @@ export function _clearLocalInFlightAfterServerSettle(sess, now = Date.now()) {
   sess._isFirstTurnAfterReady = false
   sess._turnStatus = null
   sess._replyingToMsgId = null
-  sess._currentTurnBlockCount = 0
+  sess._currentTurnAnswerCount = 0
   sess._trackerResetAt = now
   return hadTurnState
 }
@@ -779,7 +779,12 @@ export function _preserveLocalInFlightRuntime(existingLocal, sess) {
   if (existingLocal._streamingAssistant) sess._streamingAssistant = existingLocal._streamingAssistant
   if (existingLocal._streamingThinking) sess._streamingThinking = existingLocal._streamingThinking
   if (existingLocal._replyingToMsgId) sess._replyingToMsgId = existingLocal._replyingToMsgId
-  if (existingLocal._currentTurnBlockCount) sess._currentTurnBlockCount = existingLocal._currentTurnBlockCount
+  // Preserve the answer-bearing block counter across a mid-turn sync/reconnect
+  // so a later isFinal isn't misjudged empty. Falls back to the pre-rename
+  // `_currentTurnBlockCount` for any session object still in flight across the
+  // deploy that introduced the rename.
+  const _answerCount = existingLocal._currentTurnAnswerCount ?? existingLocal._currentTurnBlockCount
+  if (_answerCount) sess._currentTurnAnswerCount = _answerCount
   if (existingLocal._isFirstTurnAfterReady) sess._isFirstTurnAfterReady = true
   if (existingLocal._turnStatus) sess._turnStatus = existingLocal._turnStatus
   if (existingLocal._pendingCostCredits) sess._pendingCostCredits = existingLocal._pendingCostCredits
