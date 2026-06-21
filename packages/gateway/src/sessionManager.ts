@@ -1267,6 +1267,12 @@ export class SessionManager {
         // so it must NOT be flagged as phantom even if usage is 0.
         if (e.kind === 'block') turnBlockCount++
         else if (e.kind === 'permission_request') turnPermissionCount++
+        // A background Workflow launched this sub-turn → claude will proactively
+        // emit a continuation turn with the result once it completes. Keep the
+        // turn open (see onFinish re-arm) so that result is not dropped.
+        else if (e.kind === 'workflow_progress' && e.stage === 'started') {
+          expectsContinuation = true
+        }
         if (e.kind === 'final') {
           pendingFinal = e
           return
@@ -1286,6 +1292,20 @@ export class SessionManager {
         })
       }
 
+      // ── ultracode background-workflow continuation ──
+      // When a sub-turn launches a background Workflow, claude proactively emits
+      // a fresh turn (task_notification → init → assistant → result) on the SAME
+      // runner once it completes — no stdin needed. We keep the turn open and
+      // re-arm a fresh parser for each continuation so the workflow's result
+      // answer is delivered + persisted instead of hitting the finalized-parser
+      // drop. The turn resolves only on a result whose sub-turn did NOT launch a
+      // background workflow. `parser` is reassigned on each re-arm; `detach` /
+      // `handleMessage` always read the current one. Capped to bound runaway chains.
+      let parser: ClaudeMessageParser
+      let expectsContinuation = false
+      let continuationCount = 0
+      const MAX_CONTINUATIONS = 16
+
       let detached = false
       const detach = () => {
         if (detached) return
@@ -1303,7 +1323,7 @@ export class SessionManager {
         runner.off('parse_error', handleParseError)
       }
 
-      const parser = new ClaudeMessageParser({
+      const makeParser = () => new ClaudeMessageParser({
         toolUseIdToName: session.toolUseIdToName,
         onEvent: wrappedOnEvent,
         onToolUse: (tool) => {
@@ -1364,7 +1384,9 @@ export class SessionManager {
           )
         },
         onFinish: (result) => {
-          detach()
+          // NB: do NOT detach() unconditionally — a background-workflow sub-turn
+          // re-arms below and must keep its idle timer + crash listeners alive.
+          // Every terminal branch (auth / phantom / normal) calls detach() itself.
 
           // Detect auth error in assistant output — roll back counters and reject.
           // Two signals: (1) isError + broad keyword match, (2) claude's exact error prefix.
@@ -1376,6 +1398,7 @@ export class SessionManager {
             session.totalCostUSD = prevCostUSD
             session.turns = prevTurns
             session._lastCcbCumulativeCost = prevLastCcbCost
+            detach()
             settle(() => reject(new Error('AUTH_ERROR: Token expired or invalid')))
             return
           }
@@ -1418,6 +1441,7 @@ export class SessionManager {
               turnIndex: session.turns + 1,
               durationMs: Date.now() - turnStartTime,
             })
+            detach()
             settle(() => reject(new Error('PHANTOM_TURN: claude returned empty result')))
             return
           }
@@ -1616,12 +1640,34 @@ export class SessionManager {
               })
             }
           }
+          // Background-workflow continuation: if this sub-turn launched a
+          // background Workflow, claude will proactively emit the result answer
+          // as a fresh turn on the same runner. Keep the turn open + re-arm a
+          // fresh parser instead of resolving, so that answer is delivered and
+          // persisted (each sub-turn already incremented session.turns → distinct
+          // durable-append id). Resolve only when a sub-turn launches no workflow.
+          if (expectsContinuation && continuationCount < MAX_CONTINUATIONS) {
+            continuationCount++
+            expectsContinuation = false
+            turnBlockCount = 0
+            turnToolCallCount = 0
+            turnPermissionCount = 0
+            pendingFinal = null
+            parser.finish()
+            if (session._currentParser === parser) session._currentParser = undefined
+            parser = makeParser()
+            session._currentParser = parser
+            if (!detached) timer.refresh()
+            return
+          }
+          detach()
           settle(() => resolve())
         },
         sessionTotals: session, // parser reads/writes totalCostUSD and turns directly
       })
 
       // Expose parser to outer idle-timeout checker
+      parser = makeParser()
       session._currentParser = parser
 
       const handleMessage = (msg: any) => {
