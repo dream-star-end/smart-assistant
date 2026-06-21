@@ -243,6 +243,169 @@ describe('lazy session hydration', () => {
     assert.deepEqual(sessionGets, [])
   })
 
+  // Regression: a turn that ended abnormally (backgrounded subtask vanish,
+  // disconnect, force-quit) leaves a stale persisted `_sendingInFlight=true`.
+  // Within the 10-min freshness window sanitizeLoadedTurnState keeps it, and the
+  // OLD gate (`_sendingInFlight && !_liveStreamBroken`) permanently blocked hydrate
+  // — so reopening (esp. on mobile, restoring from IndexedDB) showed a truncated
+  // history. The new gate ignores the persisted flag, so hydrate proceeds.
+  it('stale persisted _sendingInFlight no longer blocks hydration', async () => {
+    const makeHarness = makeLazySyncHarness()
+    const stale = {
+      id: 'web-stale',
+      title: 'Stale',
+      agentId: 'codex',
+      pinned: false,
+      createdAt: 1,
+      lastAt: 2,
+      messages: [{ id: 'm-old', role: 'user', text: 'partial' }],
+      _syncedAt: 10,
+      _needsFetch: true,
+      _sendingInFlight: true, // stale leftover; NO runtime streaming pointers
+      _turnStartedAt: 11,
+      _dirty: false,
+    }
+    const state = {
+      token: 'tok',
+      sessions: new Map([['web-stale', stale]]),
+      currentSessionId: 'web-stale',
+      sendingInFlight: true,
+    }
+    const sessionGets: string[] = []
+    const { hydrateSession } = makeHarness({
+      state,
+      apiJson: async () => ({}),
+      apiGet: async (path: string) => {
+        sessionGets.push(path)
+        return {
+          id: 'web-stale',
+          title: 'Stale',
+          messages: [
+            { id: 'm-old', role: 'user', text: 'partial' },
+            { id: 'm-new', role: 'assistant', text: 'full reply' },
+          ],
+          updatedAt: 20,
+        }
+      },
+      dbGetAll: async () => [stale],
+      dbPut: async () => {},
+      dbDelete: async () => {},
+      isDeletePending: () => false,
+      clearDeleteTombstone: () => {},
+      _rebuildSearchIndex: () => {},
+      pushSessionToServer: async () => {},
+    })
+
+    const hydrated = await hydrateSession('web-stale')
+    assert.deepEqual(sessionGets, ['/api/sessions/web-stale'])
+    assert.equal(hydrated.messages.length, 2)
+    assert.equal(hydrated._needsFetch, false)
+  })
+
+  // A genuinely live stream (runtime-only pointer set by an in-flight turn in THIS
+  // tab) must still skip hydrate so the server snapshot can't clobber the tail.
+  it('live runtime streaming pointer still skips hydration', async () => {
+    const makeHarness = makeLazySyncHarness()
+    const live = {
+      id: 'web-live',
+      title: 'Live',
+      agentId: 'codex',
+      pinned: false,
+      createdAt: 1,
+      lastAt: 2,
+      messages: [{ id: 'm1', role: 'user', text: 'q' }],
+      _syncedAt: 10,
+      _needsFetch: true,
+      _streamingAssistant: { id: 'stream-1' }, // runtime-only → truly streaming now
+    }
+    const state = {
+      token: 'tok',
+      sessions: new Map([['web-live', live]]),
+      currentSessionId: 'web-live',
+      sendingInFlight: true,
+    }
+    const sessionGets: string[] = []
+    const { hydrateSession } = makeHarness({
+      state,
+      apiJson: async () => ({}),
+      apiGet: async (path: string) => {
+        sessionGets.push(path)
+        return { id: 'web-live', messages: [], updatedAt: 20 }
+      },
+      dbGetAll: async () => [live],
+      dbPut: async () => {},
+      dbDelete: async () => {},
+      isDeletePending: () => false,
+      clearDeleteTombstone: () => {},
+      _rebuildSearchIndex: () => {},
+      pushSessionToServer: async () => {},
+    })
+
+    const result = await hydrateSession('web-live')
+    assert.deepEqual(sessionGets, []) // no GET — protect the streaming tail
+    assert.equal(result, live)
+  })
+
+  // resume_failed recovery: _liveStreamBroken takes priority over the live-pointer
+  // skip so the REST refetch reconciles missed frames even while a long turn runs.
+  it('liveStreamBroken forces hydration despite runtime pointer + sendingInFlight', async () => {
+    const makeHarness = makeLazySyncHarness()
+    const broken = {
+      id: 'web-broken',
+      title: 'Broken',
+      agentId: 'codex',
+      pinned: false,
+      createdAt: 1,
+      lastAt: 2,
+      messages: [{ id: 'm1', role: 'user', text: 'q' }],
+      _syncedAt: 10,
+      _needsFetch: true,
+      _sendingInFlight: true,
+      _streamingAssistant: { id: 's1' }, // long turn still running, pointer lingers
+      _liveStreamBroken: true, // but replay-miss → MUST refetch from REST
+      _dirty: false,
+    }
+    const state = {
+      token: 'tok',
+      sessions: new Map([['web-broken', broken]]),
+      currentSessionId: 'web-broken',
+      sendingInFlight: true,
+    }
+    const sessionGets: string[] = []
+    const dbWrites: any[] = []
+    const { hydrateSession } = makeHarness({
+      state,
+      apiJson: async () => ({}),
+      apiGet: async (path: string) => {
+        sessionGets.push(path)
+        return {
+          id: 'web-broken',
+          messages: [
+            { id: 'm1', role: 'user', text: 'q' },
+            { id: 'm2', role: 'assistant', text: 'recovered' },
+          ],
+          updatedAt: 20,
+        }
+      },
+      dbGetAll: async () => [broken],
+      dbPut: async (s: any) => dbWrites.push(s),
+      dbDelete: async () => {},
+      isDeletePending: () => false,
+      clearDeleteTombstone: () => {},
+      _rebuildSearchIndex: () => {},
+      pushSessionToServer: async () => {},
+    })
+
+    const hydrated = await hydrateSession('web-broken')
+    assert.deepEqual(sessionGets, ['/api/sessions/web-broken'])
+    assert.equal(hydrated.messages.length, 2)
+    // _liveStreamBroken retired by the successful REST reconciliation — in memory
+    // and in the persisted snapshot — so it can't survive a reload as a stale flag
+    // that would later bypass the live-pointer protection.
+    assert.equal(hydrated._liveStreamBroken, false)
+    assert.equal(dbWrites.at(-1)?._liveStreamBroken, false)
+  })
+
   it('hello peer filter includes current placeholder and active sessions only', () => {
     const buildHelloPeers = new Function(
       'state',

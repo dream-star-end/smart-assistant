@@ -4,7 +4,7 @@
 
 import { apiFetch, apiGet, apiJson, authHeaders } from './api.js'
 import { dbDelete, dbGetAll, dbPut } from './db.js'
-import { _rebuildSearchIndex, clearDeleteTombstone, isDeletePending } from './sessions.js?v=10'
+import { _rebuildSearchIndex, clearDeleteTombstone, isDeletePending } from './sessions.js?v=11'
 import { state } from './state.js'
 
 // Dep-injected callback: fired when a push hits a 409 conflict and we
@@ -543,7 +543,20 @@ function _sessionDbSnapshot(sess, extra = {}) {
 function _canHydrateNow(id, sess) {
   if (!id) return false
   if (!sess) return true
-  if (sess._sendingInFlight && !sess._liveStreamBroken) return false
+  // Stream known-broken (resume_failed / replay-miss): MUST allow hydrate so the
+  // REST refetch can reconcile from the server-authored tape — even if a long turn
+  // is still running and runtime pointers linger. syncSessionsFromServer relies on
+  // this recovery path (see websocket.js handleResumeFailed).
+  if (sess._liveStreamBroken) return true
+  // Only skip hydrate while THIS tab is genuinely receiving a live stream, to avoid
+  // the server full-snapshot clobbering the streaming tail. Gate on runtime-only
+  // pointers (all stripped by _doSave / _sessionDbSnapshot, so they never survive an
+  // IndexedDB reload as stale flags) — NOT on the persisted _sendingInFlight, which
+  // can be a stale leftover from a turn that ended abnormally (backgrounded subtask
+  // vanish, disconnect, force-quit) and would otherwise permanently wedge hydrate,
+  // leaving the history truncated (especially on mobile restoring from cache).
+  if (sess._streamingAssistant || sess._streamingThinking || sess._streamingPlan) return false
+  if (sess._replyingToMsgId) return false
   return true
 }
 
@@ -575,6 +588,13 @@ export async function hydrateSession(id, { force = false } = {}) {
     const sess = _buildSessionFromRemote(remote, live, { placeholder: false })
     sess._needsFetch = false
     sess._hydrating = false
+    // This GET is itself the authoritative REST reconciliation, so retire the
+    // broken-stream override here (memory + the dbPut snapshot below). Otherwise
+    // a persisted `_liveStreamBroken=true` would survive into a later reload and,
+    // via the escape hatch in _canHydrateNow, bypass the live-pointer protection
+    // and risk clobbering a future streaming tail. Mirrors the in-memory clear in
+    // websocket.js handleResumeFailed onResult, but also clears the persisted copy.
+    sess._liveStreamBroken = false
     _rebindStreamingPointers(sess)
     _rebuildSearchIndex(sess)
     clearDeleteTombstone(sess.id)
