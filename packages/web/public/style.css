@@ -1820,6 +1820,87 @@ a:hover {
   margin: 4px 0;
   overflow: hidden;
 }
+
+/* ── 多agent工作流(ultracode)进度卡片 ── */
+.workflow-group {
+  border-left: 3px solid var(--accent);
+  border-radius: var(--radius-md);
+  background: rgba(124, 92, 191, 0.06);
+  margin: 4px 0;
+  overflow: hidden;
+}
+.wf-header {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  cursor: pointer;
+  font-size: var(--text-sm);
+}
+.wf-icon {
+  flex-shrink: 0;
+}
+.wf-title {
+  flex: 1;
+  font-weight: 500;
+  color: var(--fg);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.wf-status {
+  flex-shrink: 0;
+  font-size: var(--text-xs);
+  color: var(--fg-muted);
+}
+.wf-status--done {
+  color: var(--success);
+}
+.workflow-group.collapsed .wf-body {
+  display: none;
+}
+.wf-body {
+  padding: 0 var(--space-3) var(--space-2);
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.wf-phase {
+  font-size: var(--text-xs);
+  color: var(--fg-muted);
+  padding: 2px 0;
+}
+.wf-agent {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-size: var(--text-xs);
+  color: var(--fg-muted);
+}
+.wf-agent-badge {
+  flex-shrink: 0;
+  width: 14px;
+  text-align: center;
+}
+.wf-agent--done .wf-agent-badge {
+  color: var(--success);
+}
+.wf-agent--done .wf-agent-label {
+  color: var(--fg);
+}
+.wf-agent-label {
+  font-family: var(--font-mono);
+}
+.wf-agent-phase {
+  color: var(--fg-dim);
+  margin-left: auto;
+}
+.wf-usage {
+  font-size: var(--text-xs);
+  color: var(--fg-dim);
+  font-family: var(--font-mono);
+  margin-top: 2px;
+}
 .agent-group-header {
   display: flex;
   align-items: center;

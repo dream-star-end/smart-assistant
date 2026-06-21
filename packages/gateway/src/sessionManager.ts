@@ -1323,7 +1323,10 @@ export class SessionManager {
         runner.off('parse_error', handleParseError)
       }
 
-      const makeParser = () => new ClaudeMessageParser({
+      // Parser config is reused to re-arm a fresh parser on each background-
+      // workflow continuation (see onFinish). Callbacks close over the mutable
+      // `parser` + continuation flags, so one config object serves every sub-turn.
+      const parserConfig: ConstructorParameters<typeof ClaudeMessageParser>[0] = {
         toolUseIdToName: session.toolUseIdToName,
         onEvent: wrappedOnEvent,
         onToolUse: (tool) => {
@@ -1655,7 +1658,7 @@ export class SessionManager {
             pendingFinal = null
             parser.finish()
             if (session._currentParser === parser) session._currentParser = undefined
-            parser = makeParser()
+            parser = new ClaudeMessageParser(parserConfig)
             session._currentParser = parser
             if (!detached) timer.refresh()
             return
@@ -1664,10 +1667,10 @@ export class SessionManager {
           settle(() => resolve())
         },
         sessionTotals: session, // parser reads/writes totalCostUSD and turns directly
-      })
+      }
 
       // Expose parser to outer idle-timeout checker
-      parser = makeParser()
+      parser = new ClaudeMessageParser(parserConfig)
       session._currentParser = parser
 
       const handleMessage = (msg: any) => {

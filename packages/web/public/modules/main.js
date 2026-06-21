@@ -127,7 +127,7 @@ import {
   setMessageDeps,
   updateMessageEl,
   updateSessionSub,
-} from './messages.js?v=47'
+} from './messages.js?v=48'
 
 // ── WebSocket ──
 import {
@@ -155,7 +155,7 @@ import {
   updateMessage,
   updateMsgStatus,
   updateSendEnabled,
-} from './websocket.js?v=49'
+} from './websocket.js?v=50'
 
 // ── Slash commands ──
 import {

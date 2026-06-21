@@ -570,6 +570,60 @@ function _renderAgentGroup(el, msg) {
   }
 }
 
+// Background-workflow (ultracode) progress card. Mirrors _renderAgentGroup but
+// laid out around workflow phases + parallel agents, driven by the merged
+// `_wfPhases` / `_wfAgents` snapshots accumulated in handleWorkflowProgress.
+function _renderWorkflowGroup(el, msg) {
+  el.innerHTML = ''
+  el.className = 'msg workflow-group'
+  el.dataset.msgId = msg.id
+  const done = msg._wfStatus === 'completed'
+  const agents = Array.isArray(msg._wfAgents) ? msg._wfAgents : []
+  const phases = Array.isArray(msg._wfPhases) ? msg._wfPhases : []
+  const doneCount = agents.filter((a) => a.state === 'done').length
+  const statusHtml = done
+    ? '<span class="wf-status wf-status--done">完成</span>'
+    : `<span class="wf-status">运行中… ${doneCount}/${agents.length || '?'}</span>`
+  const header = document.createElement('div')
+  header.className = 'wf-header'
+  const title = htmlSafeEscape(msg.workflowName || msg.text || '工作流')
+  header.innerHTML = `<span class="wf-icon">⚙️</span><span class="wf-title">多agent工作流: ${title}</span>${statusHtml}`
+  header.onclick = () => el.classList.toggle('collapsed')
+  el.appendChild(header)
+
+  const body = document.createElement('div')
+  body.className = 'wf-body'
+  const phaseTitleFor = (a) =>
+    a.phaseTitle || phases.find((p) => p.index === a.phaseIndex)?.title || ''
+  if (agents.length === 0) {
+    for (const p of phases) {
+      const row = document.createElement('div')
+      row.className = 'wf-phase'
+      row.textContent = `▸ ${p.title || ''}`
+      body.appendChild(row)
+    }
+  }
+  for (const a of agents) {
+    const badge = a.state === 'done' ? '✓' : a.state === 'progress' ? '▶' : '⏳'
+    const row = document.createElement('div')
+    row.className = `wf-agent wf-agent--${a.state || 'queued'}`
+    const ph = phaseTitleFor(a)
+    row.innerHTML = `<span class="wf-agent-badge">${badge}</span><span class="wf-agent-label">${htmlSafeEscape(a.label || `agent ${a.index}`)}</span>${ph ? `<span class="wf-agent-phase">${htmlSafeEscape(ph)}</span>` : ''}`
+    body.appendChild(row)
+  }
+  if (
+    msg._wfUsage &&
+    typeof msg._wfUsage.totalTokens === 'number' &&
+    msg._wfUsage.totalTokens > 0
+  ) {
+    const usage = document.createElement('div')
+    usage.className = 'wf-usage'
+    usage.textContent = `${msg._wfUsage.totalTokens.toLocaleString()} tokens`
+    body.appendChild(usage)
+  }
+  el.appendChild(body)
+}
+
 function _buildToolCard(el, msg) {
   const name = msg.toolName || 'unknown'
   const meta = _toolMeta(name)
@@ -1719,6 +1773,8 @@ export function _buildMessageEl(msg) {
     el.hidden = true
   } else if (msg.role === 'agent-group') {
     _renderAgentGroup(el, msg)
+  } else if (msg.role === 'workflow-group') {
+    _renderWorkflowGroup(el, msg)
   } else if (msg.role === 'thinking') {
     const header = document.createElement('div')
     header.className = 'thinking-header'
@@ -1898,6 +1954,8 @@ export function updateMessageEl(msg, streaming) {
     _refreshMsgTime(el, msg)
   } else if (msg.role === 'agent-group') {
     _renderAgentGroup(el, msg)
+  } else if (msg.role === 'workflow-group') {
+    _renderWorkflowGroup(el, msg)
   } else if (msg.role === 'plan') {
     el.innerHTML = ''
     el.className = 'msg plan'

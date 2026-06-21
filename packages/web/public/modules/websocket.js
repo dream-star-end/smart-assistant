@@ -1094,6 +1094,7 @@ export function connect() {
       else if (f.type === 'outbound.permission_request') handlePermissionRequest(f)
       else if (f.type === 'outbound.permission_settled') handlePermissionSettled(f)
       else if (f.type === 'outbound.goal_status') handleGoalStatus(f)
+      else if (f.type === 'outbound.workflow_progress') handleWorkflowProgress(f)
       else if (f.type === 'outbound.resume_failed') handleResumeFailed(f)
       else if (f.type === 'outbound.ack' && f.deduplicated) {
         // Server already processed this message; clear drain state so queue continues
@@ -1906,6 +1907,53 @@ export function handleOutbound(frame) {
   _deps.scheduleSave(sess, !!frame.isFinal, { rebuildSearchIndex: !!frame.isFinal })
   // Only rebuild sidebar on final message (not every streaming delta)
   if (frame.isFinal) _deps.renderSidebar()
+}
+
+// Background-workflow (ultracode) progress side-channel → live workflow card.
+// Accumulates per-task phase/agent snapshots into one `workflow-group` message
+// keyed by taskId, updating in place. Never a chat block; the workflow's final
+// result answer arrives separately as a normal assistant message (gateway
+// continuation lifecycle).
+function handleWorkflowProgress(frame) {
+  const peerId = frame.peer?.id
+  const sess = peerId ? state.sessions.get(peerId) : null
+  if (!sess) return
+  markFrameReceived(sess)
+  const taskId = frame.taskId
+  if (!taskId) return
+  if (!sess._wfGroups) sess._wfGroups = new Map()
+  let msg = sess._wfGroups.has(taskId)
+    ? sess.messages.find((m) => m.id === sess._wfGroups.get(taskId))
+    : null
+  if (!msg) {
+    if (frame.stage === 'updated') return // completion for an unknown task — ignore
+    msg = addMessage(sess, 'workflow-group', frame.workflowName || frame.description || '工作流', {
+      workflowTaskId: taskId,
+      workflowName: frame.workflowName,
+      _wfStatus: 'running',
+      _wfPhases: [],
+      _wfAgents: [],
+      _wfUsage: null,
+      startTime: Date.now(),
+    })
+    sess._wfGroups.set(taskId, msg.id)
+  }
+  if (frame.workflowName && !msg.workflowName) msg.workflowName = frame.workflowName
+  if (frame.usage) msg._wfUsage = frame.usage
+  if (frame.stage === 'updated' && frame.status === 'completed') msg._wfStatus = 'completed'
+  for (const it of Array.isArray(frame.items) ? frame.items : []) {
+    if (!it || typeof it !== 'object') continue
+    if (it.type === 'workflow_phase') {
+      const ex = msg._wfPhases.find((p) => p.index === it.index)
+      if (ex) Object.assign(ex, it)
+      else msg._wfPhases.push({ index: it.index, title: it.title })
+    } else if (it.type === 'workflow_agent') {
+      const ex = msg._wfAgents.find((a) => a.index === it.index)
+      if (ex) Object.assign(ex, it)
+      else msg._wfAgents.push({ ...it })
+    }
+  }
+  if (sess.id === state.currentSessionId) _deps.updateMessageEl(msg)
 }
 
 function handleOutboundTurnStatus(frame) {
