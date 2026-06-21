@@ -1933,7 +1933,17 @@ function handleWorkflowProgress(frame) {
   markFrameReceived(sess)
   const taskId = frame.taskId
   if (!taskId) return
-  if (!sess._wfGroups) sess._wfGroups = new Map()
+  // `_wfGroups` is a runtime-only index (taskId → card msg id) stripped from
+  // persistence. Rebuild it from existing messages after a reload / REST hydrate
+  // so replayed progress frames (workflow_progress is frameSeq-exempt and may be
+  // re-sent on reconnect) re-attach to the existing card instead of duplicating.
+  if (!sess._wfGroups) {
+    sess._wfGroups = new Map()
+    for (const m of sess.messages || []) {
+      if (m.role === 'workflow-group' && m.workflowTaskId)
+        sess._wfGroups.set(m.workflowTaskId, m.id)
+    }
+  }
   let msg = sess._wfGroups.has(taskId)
     ? sess.messages.find((m) => m.id === sess._wfGroups.get(taskId))
     : null
@@ -1966,6 +1976,10 @@ function handleWorkflowProgress(frame) {
     }
   }
   if (sess.id === state.currentSessionId) _deps.updateMessageEl(msg)
+  // Persist so a later reload restores the card's latest phase/agent/completed
+  // state (a delayed `done`/`completed` frame after the turn's final message
+  // must survive refresh, not revert to "running").
+  _deps.scheduleSave(sess, frame.stage === 'updated', { rebuildSearchIndex: false })
 }
 
 function handleOutboundTurnStatus(frame) {

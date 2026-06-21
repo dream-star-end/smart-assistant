@@ -326,6 +326,7 @@ async function _doSave(sess) {
     _blockIdToMsgId,
     _replyingToMsgId,
     _agentGroups,
+    _wfGroups,
     _streamRafPending,
     _thinkRafPending,
     _searchText,

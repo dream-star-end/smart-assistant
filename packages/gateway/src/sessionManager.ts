@@ -1266,8 +1266,10 @@ export class SessionManager {
       // a far ScheduleWakeup, or the workflow produced no follow-up). Without a
       // bound the session would sit "thinking" until the 30-min idle cap. So once
       // continuation-waiting, if the runner goes silent for this long we resolve
-      // GRACEFULLY — no interrupt, the persistent process lives on (any late
-      // continuation simply lands on a future turn).
+      // GRACEFULLY — no interrupt, the persistent process lives on. NOTE: a
+      // continuation that arrives AFTER this resolve is dropped (the finalized
+      // parser ignores it until the next turn re-arms); the user can re-ask. This
+      // is the accepted tail-loss tradeoff of the 90s soft cap.
       const CONTINUATION_WAIT_MS = 90 * 1000
       let continuationTimer: ReturnType<typeof setTimeout> | null = null
 
