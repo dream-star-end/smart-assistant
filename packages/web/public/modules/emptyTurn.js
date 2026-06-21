@@ -104,3 +104,53 @@ export function classifyEmptyTurn({ messages, targetMsgId, hasAnswerOutput, stop
     stopReason: stopReason ?? null,
   }
 }
+
+// ── Auto-continue an empty (answer-less) turn once ──
+//
+// When a turn ends with `end_turn` but produced no answer (the GLM "thought but
+// didn't speak" case), instead of only showing a notice we auto-send ONE
+// continuation prompt on the user's behalf. Capped at one retry per original
+// turn to bound cost (commercial billing charges per turn) and avoid loops.
+//
+// The continuation prompt is the model-facing text; the display text is a light
+// marker. Both double as PERSISTENCE-RECOVERABLE markers for the cap: a
+// client-only `_isAutoRetry` flag is lost across refresh / server-wins / replay,
+// so the cap also recognizes an auto-continue message by its fixed text.
+export const AUTO_CONTINUE_PROMPT = '请基于刚才的思考,继续输出完整的正文回答。'
+export const AUTO_CONTINUE_DISPLAY = '↻ 自动续写'
+
+/** Is this message an auto-continue we sent (by any recoverable marker)? */
+export function isAutoContinueMsg(m) {
+  return !!(
+    m &&
+    (m._isAutoRetry === true ||
+      m._modelText === AUTO_CONTINUE_PROMPT ||
+      m.text === AUTO_CONTINUE_DISPLAY)
+  )
+}
+
+/**
+ * Decide whether to auto-continue an empty turn (vs. just showing the notice).
+ * Pure — no side effects. Conservative on purpose:
+ *   - ONLY `stopReason === 'end_turn'` (model actively ended without an answer).
+ *     max_tokens/pause_turn (truncation/pause) and refusal/tool_use/stop_sequence
+ *     and absent stopReason all fall through to the manual notice.
+ *   - At most ONE auto-continue per original turn: refuse if the target IS an
+ *     auto-continue message (chain cap), or if an auto-continue user message
+ *     already follows the target (replay / late-final / multi-tab guard).
+ *
+ * @returns {boolean}
+ */
+export function shouldAutoContinueEmptyTurn({ messages, targetMsgId, stopReason }) {
+  if (stopReason !== 'end_turn') return false
+  if (!Array.isArray(messages)) return false
+  const idx = messages.findIndex((m) => m && m.id === targetMsgId)
+  if (idx < 0) return false
+  // Chain cap: the target itself is already an auto-continue → don't retry again.
+  if (isAutoContinueMsg(messages[idx])) return false
+  // Already retried: an auto-continue user message follows this target.
+  for (let i = idx + 1; i < messages.length; i++) {
+    if (messages[i]?.role === 'user' && isAutoContinueMsg(messages[i])) return false
+  }
+  return true
+}

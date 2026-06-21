@@ -184,6 +184,7 @@ import {
   resetThinkingSafety,
   refreshWebchatHelloForCurrentSession,
   safeWsSend,
+  _resetTurnBillingState,
   setActiveTeamRunForSession,
   setProvisioningBanner,
   setWsDeps,
@@ -214,6 +215,12 @@ import {
 import { initModelPicker, renderModelPill } from './modelPicker.js?v=8526f798'
 import { getSingleAgentModelOverride } from './modelPolicy.js?v=8526f798'
 import { getConversationModeForSubmit } from './planMode.js?v=8526f798'
+import {
+  AUTO_CONTINUE_DISPLAY,
+  AUTO_CONTINUE_PROMPT,
+  emptyTurnNoticeText,
+  shouldAutoContinueEmptyTurn,
+} from './emptyTurn.js?v=auto'
 import { initPlanPanel } from './planPanel.js?v=8526f798'
 
 // Signal to the inline boot-watchdog in index.html that the module graph loaded.
@@ -278,6 +285,8 @@ setWsDeps({
   // Phase 6:WS dispatcher 路由 outbound.control.session_repo_* 帧到 github 模块
   handleRepoStatusFrame,
   handleRepoBindErrorFrame,
+  autoContinueEmptyTurn,
+  clearAutoContinueInFlight,
 })
 
 setCommandDeps({
@@ -1476,6 +1485,153 @@ function send() {
   autoResize()
   scheduleSaveFromUserEdit(sess)
   renderSidebar()
+}
+
+// ── Auto-continue an empty (end_turn, no-answer) turn ONCE ──
+// Injected into websocket.js via setWsDeps; called DEFERRED (setTimeout 0) from
+// the empty-turn consumer so the old final's teardown has already run and we
+// start a clean new turn. Re-validates session/ws/in-flight/cap before sending;
+// on any failure inserts the manual empty-turn notice so the turn never ends
+// silently. Cap + cost bound live in emptyTurn.js (one auto-continue per turn).
+function autoContinueEmptyTurn(sessId, targetMsgId, cls) {
+  const sess = state.sessions.get(sessId)
+  if (!sess) return
+  // Deferred call runs after the old final cleared in-flight; if a new turn has
+  // already started (user typed, regen, …) bail silently.
+  if (sess._sendingInFlight) return
+  const idx = sess.messages.findIndex((m) => m && m.id === targetMsgId)
+  if (idx < 0) return
+  // Re-check the cap against the (possibly changed) list — replay, a late final,
+  // or the user acting during the defer window may have changed it.
+  if (!shouldAutoContinueEmptyTurn({ messages: sess.messages, targetMsgId, stopReason: 'end_turn' })) {
+    return
+  }
+  const target = sess.messages[idx]
+
+  // Fallback notice (same shape as the consumer's manual path).
+  const insertNotice = () => {
+    const last = sess.messages[sess.messages.length - 1]
+    const dup = last && last._emptyTurn && last._emptyTurnTargetMsgId === targetMsgId
+    if (dup) return
+    addMessage(sess, 'assistant', cls?.text || emptyTurnNoticeText('end_turn', false), {
+      _emptyTurn: true,
+      _emptyTurnSoft: cls?.soft ?? true,
+      _emptyTurnStopReason: 'end_turn',
+      _emptyTurnTargetMsgId: targetMsgId,
+    })
+    // This runs deferred, AFTER the old final already scheduled its save — so the
+    // fallback notice would otherwise be lost on refresh/sync. Persist it.
+    scheduleSave(sess, true)
+    if (sess.id === state.currentSessionId) renderMessages()
+    else renderSidebar()
+  }
+
+  // Auto-continue is not worth queueing offline — fall back to the notice.
+  const hasQueued =
+    state.offlineQueue?.some((i) => i.sessId === sess.id) ||
+    state._offlineQueuePending?.some((i) => i.sessId === sess.id) ||
+    state._offlineDrainingCurrent?.sessId === sess.id
+  if (!(state.ws && state.ws.readyState === 1) || hasQueued) {
+    insertNotice()
+    return
+  }
+
+  // Carry the team over from the ORIGINAL turn (not the global selection), so a
+  // team turn keeps its leader + model override + collaboration prompt.
+  const team = target._teamRun?.leaderAgentId
+    ? {
+        id: target._teamRun.id || '',
+        name: target._teamRun.name || target._teamRun.id || '',
+        leaderAgentId: target._teamRun.leaderAgentId || '',
+        ...(target._teamRun.modelOverride !== undefined
+          ? { modelOverride: target._teamRun.modelOverride }
+          : {}),
+      }
+    : null
+  const modelText = team ? buildTeamRunPrompt(team, AUTO_CONTINUE_PROMPT) : AUTO_CONTINUE_PROMPT
+  const agentId = team?.leaderAgentId || sess.agentId || state.defaultAgentId
+  const effortLevel = getEffortForSubmit()
+  const conversationMode = getConversationModeForSubmit(AUTO_CONTINUE_PROMPT, [])
+  const modelOverride = team
+    ? team.modelOverride
+    : getSingleAgentModelOverride({
+        userPrefs: state.userPrefs,
+        agentId,
+        defaultAgentId: state.defaultAgentId,
+        agentsList: state.agentsList,
+      })
+  const wsPayload = {
+    type: 'inbound.message',
+    // Deterministic key from (session, target): multi-tab / replay can't
+    // double-charge a second auto-continue for the same empty turn.
+    idempotencyKey: `autocont-${sessId}-${targetMsgId}`,
+    channel: 'webchat',
+    peer: { id: sess.id, kind: 'dm' },
+    agentId,
+    content: { text: modelText },
+    ...(effortLevel !== undefined ? { effortLevel } : {}),
+    ...(conversationMode !== undefined ? { conversationMode } : {}),
+    ...(modelOverride !== undefined ? { model: modelOverride } : {}),
+    ts: Date.now(),
+  }
+  const userMsg = addMessage(sess, 'user', AUTO_CONTINUE_DISPLAY, {
+    status: 'sending',
+    _isAutoRetry: true,
+    _modelText: modelText,
+    _teamRun: team || undefined,
+    // Store the deterministic key so a deduplicated ACK (another tab/replay
+    // already ran this exact auto-continue) can reconcile this tab's optimistic
+    // in-flight instead of spinning until the safety timeout.
+    _idem: wsPayload.idempotencyKey,
+  })
+  const sent = safeWsSend(state.ws, JSON.stringify(wsPayload))
+  if (!sent) {
+    // safeWsSend closed the socket on backpressure — roll back the auto user so
+    // no bogus pending message lingers, then fall back to the notice.
+    const ri = sess.messages.indexOf(userMsg)
+    if (ri >= 0) sess.messages.splice(ri, 1)
+    insertNotice()
+    return
+  }
+  userMsg.status = 'sent'
+  setActiveTeamRunForSession(sess, team)
+  sess._sendingInFlight = true
+  _resetTurnBillingState(sess, 'auto-continue-start')
+  resetThinkingSafety(sess.id)
+  scheduleSaveFromUserEdit(sess)
+  if (sess.id === state.currentSessionId) {
+    state.sendingInFlight = true
+    updateMsgStatus(userMsg)
+    updateSendEnabled()
+    showTypingIndicator()
+    setTitleBusy(true)
+    renderMessages()
+  } else {
+    renderSidebar()
+  }
+}
+
+// Reconcile a deduplicated auto-continue ACK: another tab / a replay already ran
+// this exact (deterministic-keyed) auto-continue, so NO new turn runs for THIS
+// connection. Clear only the optimistic in-flight + UI so we don't spin until the
+// safety timeout. Deliberately keep the auto user row and reply tracker intact:
+// the tab that won the race may have a turn genuinely running whose outbound
+// frames must still render; the bogus local row reconciles on the next
+// server-authored sync.
+function clearAutoContinueInFlight(idem) {
+  if (typeof idem !== 'string') return
+  for (const sess of state.sessions.values()) {
+    if (!sess?.messages?.some((m) => m && m._isAutoRetry && m._idem === idem)) continue
+    if (!sess._sendingInFlight) return
+    sess._sendingInFlight = false
+    if (sess.id === state.currentSessionId) {
+      state.sendingInFlight = false
+      updateSendEnabled()
+      hideTypingIndicator()
+      setTitleBusy(false)
+    }
+    return
+  }
 }
 
 // ── autoResize ──

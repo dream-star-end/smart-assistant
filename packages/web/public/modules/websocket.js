@@ -5,7 +5,7 @@ import { abortInflightRefresh, apiGet, clearProactiveRefresh, reportClientError,
 import { clearSessionCookie } from './auth.js?v=8526f798'
 import { dbPut } from './db.js?v=8526f798'
 import { $, htmlSafeEscape } from './dom.js?v=8526f798'
-import { classifyEmptyTurn, countAnswerBlocks } from './emptyTurn.js?v=8526f798'
+import { classifyEmptyTurn, countAnswerBlocks, shouldAutoContinueEmptyTurn } from './emptyTurn.js?v=auto'
 import { maybeNotify, setTitleBusy } from './notifications.js?v=8526f798'
 import { _clearStoredAccessToken, getSession, state } from './state.js?v=8526f798'
 import { maybeSyncNow } from './sync.js?v=8526f798'
@@ -2409,6 +2409,13 @@ export function connect() {
           state._offlineDrainingCurrent = null
           nudgeDrain()
         }
+        // Auto-continue uses a deterministic idempotencyKey (autocont-<sess>-<target>)
+        // to prevent multi-tab / replay double-charging. The flip side: a dedup ACK
+        // means NO new turn runs for this connection, so the optimistic in-flight set
+        // by autoContinueEmptyTurn would spin until THINKING_SAFETY (10min). Reconcile.
+        if (typeof f.idempotencyKey === 'string' && f.idempotencyKey.startsWith('autocont-')) {
+          _deps.clearAutoContinueInFlight?.(f.idempotencyKey)
+        }
       }
     } catch (e) {
       try {
@@ -3276,23 +3283,42 @@ export function handleOutbound(frame) {
         stopReason: _deferredEmptyNotice.stopReason,
       })
       if (_cls.insert) {
-        const _lastMsg = sess.messages[sess.messages.length - 1]
-        const _dup =
-          _lastMsg &&
-          _lastMsg._emptyTurn &&
-          _lastMsg._emptyTurnTargetMsgId === _deferredEmptyNotice.targetMsgId
-        if (!_dup) {
-          console.warn('[ws] empty-turn: isFinal with no rendered answer', {
-            sessionId: sess.id,
-            targetMsgId: _deferredEmptyNotice.targetMsgId,
+        const _autoTid = _deferredEmptyNotice.targetMsgId
+        // Auto-continue ONCE if the model ended with end_turn but no answer:
+        // send a continuation on the user's behalf instead of only notifying.
+        // DEFERRED to a macrotask so this frame's final teardown below (which
+        // clears _sendingInFlight / typing / busy) runs FIRST — otherwise the
+        // new turn we start would be torn down by the old final's tail. The
+        // helper re-validates session/ws/in-flight/target before sending and
+        // falls back to the notice itself on failure.
+        const _canAuto =
+          state.ws?.readyState === 1 &&
+          typeof _deps.autoContinueEmptyTurn === 'function' &&
+          shouldAutoContinueEmptyTurn({
+            messages: sess.messages,
+            targetMsgId: _autoTid,
             stopReason: _cls.stopReason,
           })
-          addMessage(sess, 'assistant', _cls.text, {
-            _emptyTurn: true,
-            _emptyTurnSoft: _cls.soft,
-            _emptyTurnStopReason: _cls.stopReason,
-            _emptyTurnTargetMsgId: _deferredEmptyNotice.targetMsgId,
-          })
+        if (_canAuto) {
+          const _autoSessId = sess.id
+          setTimeout(() => _deps.autoContinueEmptyTurn(_autoSessId, _autoTid, _cls), 0)
+        } else {
+          const _lastMsg = sess.messages[sess.messages.length - 1]
+          const _dup =
+            _lastMsg && _lastMsg._emptyTurn && _lastMsg._emptyTurnTargetMsgId === _autoTid
+          if (!_dup) {
+            console.warn('[ws] empty-turn: isFinal with no rendered answer', {
+              sessionId: sess.id,
+              targetMsgId: _autoTid,
+              stopReason: _cls.stopReason,
+            })
+            addMessage(sess, 'assistant', _cls.text, {
+              _emptyTurn: true,
+              _emptyTurnSoft: _cls.soft,
+              _emptyTurnStopReason: _cls.stopReason,
+              _emptyTurnTargetMsgId: _autoTid,
+            })
+          }
         }
       }
       _deferredEmptyNotice = null
