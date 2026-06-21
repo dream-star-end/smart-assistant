@@ -16,7 +16,7 @@
 <link rel="apple-touch-icon" href="/icon.svg" />
 <link rel="stylesheet" href="/vendor/github-dark.min.css" />
 <link rel="stylesheet" href="/vendor/katex/katex.min.css" />
-<link rel="stylesheet" href="/style.css?v=61" />
+<link rel="stylesheet" href="/style.css?v=62" />
 <link rel="stylesheet" href="/vendor/xterm/xterm.css?v=1" />
 <style>/* Inline styles removed — see style.css */
 </style>
@@ -487,24 +487,22 @@
     <div class="modal-head chatgpt-web-head">
       <div>
         <h3>ChatGPT 网页</h3>
-        <p id="chatgpt-web-proxy-status" class="chatgpt-web-status">读取代理配置中…</p>
+        <p id="chatgpt-web-proxy-status" class="chatgpt-web-status">准备就绪</p>
       </div>
       <div class="chatgpt-web-actions">
+        <button id="chatgpt-browser-back-btn" class="btn btn-ghost btn-sm" type="button" title="后退">←</button>
+        <button id="chatgpt-browser-home-btn" class="btn btn-ghost btn-sm" type="button" title="ChatGPT 主页">⌂</button>
         <button id="chatgpt-web-refresh-btn" class="btn btn-ghost btn-sm" type="button">刷新</button>
+        <button id="chatgpt-browser-restart-btn" class="btn btn-ghost btn-sm" type="button" title="重启服务器浏览器">重启</button>
+        <button id="chatgpt-browser-clear-btn" class="btn btn-ghost btn-sm" type="button" title="清除登录态并重启">清除登录</button>
         <button class="modal-close" data-close-modal="chatgpt-web-modal" aria-label="关闭">×</button>
       </div>
     </div>
-    <div class="chatgpt-web-warning">
-      这是反代 ChatGPT 网页的功能：请求经 OpenClaude 的 Chrome-TLS 模拟出站通道转发（以通过 Cloudflare 的人机校验），并放开 iframe 的 same-origin、弹窗和跳转能力以提高兼容性。登录需在页面内完成 OpenAI 自身的验证；语音／实时等基于 WebSocket 的功能暂不代理。
+    <div id="chatgpt-browser-viewport" class="chatgpt-browser-viewport" tabindex="0">
+      <canvas id="chatgpt-browser-canvas" class="chatgpt-browser-canvas" width="1280" height="800"></canvas>
+      <textarea id="chatgpt-browser-ime" class="chatgpt-browser-ime" autocapitalize="off" autocomplete="off" autocorrect="off" spellcheck="false" aria-hidden="true"></textarea>
+      <div id="chatgpt-browser-overlay" class="chatgpt-browser-overlay">正在启动服务器浏览器…</div>
     </div>
-    <iframe
-      id="chatgpt-web-iframe"
-      class="chatgpt-web-iframe"
-      src="about:blank"
-      title="ChatGPT Web via OpenClaude proxy"
-      referrerpolicy="no-referrer"
-      sandbox="allow-downloads allow-forms allow-modals allow-popups allow-popups-to-escape-sandbox allow-same-origin allow-scripts allow-top-navigation-by-user-activation"
-    ></iframe>
   </div>
 </div>
 

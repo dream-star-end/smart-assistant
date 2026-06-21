@@ -193,6 +193,34 @@ export interface OpenClaudeConfig {
       /** curl_cffi impersonation target. Default `chrome`. */
       impersonate?: string
     }
+    /**
+     * Personal-instance opt-in: the "ChatGPT 实时浏览器" feature — a real headful
+     * Chromium (Xvfb) per user, run by a gateway-supervised sidecar, egressing
+     * through the sing-box proxy and streamed to the frontend as JPEG frames
+     * over `/api/chatgpt-browser/ws`. The only way to deliver login (OAuth +
+     * Arkose) / WebSocket / all ChatGPT features (the reverse proxy can't).
+     *
+     * Requires the runtime provisioned via setup-chatgpt-browser-sidecar.sh and
+     * Xvfb installed. Missing runtime / crashed sidecar never blocks gateway
+     * startup — the WS relay just fails the connection. Leave disabled otherwise.
+     */
+    chatgptBrowser?: {
+      enabled?: boolean
+      /** Loopback port the sidecar WS listens on. Default 18994. */
+      port?: number
+      /** Node project with playwright + chromium. Default /opt/openclaude/chatgpt-browser. */
+      runtimeDir?: string
+      /** Egress proxy the browser dials chatgpt through. Default config.proxyUrl. */
+      proxyUrl?: string
+      /** Per-user persistent profile base (login persists). Default /root/.openclaude/chatgpt-browser. */
+      profileDir?: string
+      /** Stealth init-script. Default $OPENCLAUDE_HOME/browser-stealth.js. */
+      stealthScript?: string
+      /** Render size, e.g. "1280x800". */
+      viewport?: string
+      /** PLAYWRIGHT_BROWSERS_PATH. Default /root/.cache/ms-playwright. */
+      browsersPath?: string
+    }
   }
   // 接入方式三选一(实际 token 由官方 claude 自己存,这里只记录类型)
   auth: {

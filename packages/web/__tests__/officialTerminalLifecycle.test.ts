@@ -245,9 +245,9 @@ describe('official Claude terminal lifecycle', () => {
     assert.match(MAIN, /from '\.\/officialTerminal\.js\?v=17'/)
     assert.match(SW, /\/modules\/officialTerminal\.js\?v=17/)
     assert.match(INDEX, /\/modules\/main\.js\?v=75/)
-    assert.match(INDEX, /\/style\.css\?v=61/)
+    assert.match(INDEX, /\/style\.css\?v=62/)
     assert.match(INDEX, /sw-flush-v25/)
-    assert.match(SW, /openclaude-v96/)
+    assert.match(SW, /openclaude-v97/)
   })
 
   it('caches xterm selection (TTL + consume + new-interaction bounded) so TUI redraws do not drop copy', () => {

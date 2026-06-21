@@ -5814,6 +5814,62 @@ body.voice-overlay-open {
   border: 0;
   background: var(--bg);
 }
+/* ChatGPT 实时浏览器: live screencast canvas + hidden IME capture overlay */
+.chatgpt-browser-viewport {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: #000;
+  overflow: hidden;
+  outline: none;
+  cursor: default;
+}
+.chatgpt-browser-canvas {
+  max-width: 100%;
+  max-height: 100%;
+  width: auto;
+  height: auto;
+  display: block;
+  image-rendering: auto;
+}
+/* Invisible focusable textarea covering the canvas — captures keystrokes + IME
+   composition (Chinese) so the canvas-only view still accepts real typing. */
+.chatgpt-browser-ime {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  resize: none;
+  background: transparent;
+  color: transparent;
+  caret-color: transparent;
+  opacity: 0;
+  outline: none;
+  overflow: hidden;
+}
+.chatgpt-browser-overlay {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--fg-muted, #aaa);
+  font-size: var(--text-sm, 13px);
+  background: rgba(0, 0, 0, 0.55);
+  pointer-events: none;
+  text-align: center;
+  padding: 1rem;
+}
+.chatgpt-browser-overlay[hidden] {
+  display: none;
+}
 @media (max-width: 860px) {
   .chatgpt-web-backdrop {
     padding: 0;

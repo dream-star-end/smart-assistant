@@ -1479,44 +1479,241 @@ const FEEDBACK_CLARIFY_MESSAGES = [
   '好的反馈需要足够的上下文。请至少说明：问题是什么、何时发生、影响是什么。',
 ]
 
-async function loadChatGptWebFrame(force = false) {
-  const status = $('chatgpt-web-proxy-status')
-  const iframe = $('chatgpt-web-iframe')
-  if (!force && iframe.getAttribute('src') !== 'about:blank') return
-  status.textContent = '创建 ChatGPT 网页隔离访问令牌…'
-  iframe.src = 'about:blank'
-  try {
-    const session = await apiGet('/api/chatgpt-web/session')
-    if (!session?.entryUrl) throw new Error('missing ChatGPT proxy entryUrl')
-    iframe.src = session.entryUrl
-  } catch (err) {
-    status.textContent = 'ChatGPT 网页入口创建失败，请重新登录或刷新后再试。'
-    toast(String(err), 'error')
-    throw err
+// ===== ChatGPT 实时浏览器 (server-side real browser, screencast over WS) =====
+// The reverse-proxy iframe couldn't do login (OAuth/Arkose) or WebSocket. This
+// drives a real headful Chromium running on the server: JPEG frames render to a
+// canvas, mouse/keyboard/IME are captured and sent back.
+let _cgbWs = null
+let _cgbVW = 1280
+let _cgbVH = 800
+let _cgbCloseObserver = null
+let _cgbLastMove = 0
+let _cgbDecoding = false
+let _cgbPendingBlob = null
+const _cgbPressedKeys = new Set()
+
+function _cgbStatus(text) {
+  const s = $('chatgpt-web-proxy-status')
+  if (s) s.textContent = text
+}
+function _cgbOverlay(text) {
+  const o = $('chatgpt-browser-overlay')
+  if (!o) return
+  if (text == null) o.hidden = true
+  else {
+    o.hidden = false
+    o.textContent = text
   }
 }
-
-function refreshChatGptWebFrame() {
-  loadChatGptWebFrame(true).catch(() => {})
+function _cgbSend(obj) {
+  if (_cgbWs && _cgbWs.readyState === 1) {
+    try {
+      _cgbWs.send(JSON.stringify(obj))
+    } catch {}
+  }
 }
-
-async function openChatGptWebModal() {
-  const status = $('chatgpt-web-proxy-status')
-  status.textContent = '读取代理配置中…'
-  openModal('chatgpt-web-modal')
-  const loaded = await loadChatGptWebFrame(false).then(
-    () => true,
-    () => false,
+function _cgbScaleXY(e) {
+  const cv = $('chatgpt-browser-canvas')
+  const r = cv.getBoundingClientRect()
+  const x = r.width ? ((e.clientX - r.left) / r.width) * _cgbVW : 0
+  const y = r.height ? ((e.clientY - r.top) / r.height) * _cgbVH : 0
+  return { x: Math.max(0, Math.min(_cgbVW, x)), y: Math.max(0, Math.min(_cgbVH, y)) }
+}
+function _cgbDrawFrame(blob) {
+  const cv = $('chatgpt-browser-canvas')
+  if (!cv) return
+  // Keep only one decode in-flight; on a slow device newest frame wins so
+  // stale frames never queue up or paint out of order.
+  if (_cgbDecoding) {
+    _cgbPendingBlob = blob
+    return
+  }
+  _cgbDecoding = true
+  createImageBitmap(blob)
+    .then((bmp) => {
+      if (cv.width !== bmp.width || cv.height !== bmp.height) {
+        cv.width = bmp.width
+        cv.height = bmp.height
+      }
+      cv.getContext('2d').drawImage(bmp, 0, 0)
+      bmp.close?.()
+      _cgbOverlay(null)
+    })
+    .catch(() => {})
+    .finally(() => {
+      _cgbDecoding = false
+      if (_cgbPendingBlob) {
+        const b = _cgbPendingBlob
+        _cgbPendingBlob = null
+        _cgbDrawFrame(b)
+      }
+    })
+}
+function _cgbMapKey(e) {
+  if (e.key === ' ') return 'Space'
+  return e.key
+}
+function _cgbReleaseKeys() {
+  for (const k of _cgbPressedKeys) _cgbSend({ t: 'key', kind: 'up', key: k })
+  _cgbPressedKeys.clear()
+}
+function _cgbBindInput() {
+  const vp = $('chatgpt-browser-viewport')
+  const ime = $('chatgpt-browser-ime')
+  if (!vp || vp._cgbBound) return
+  vp._cgbBound = true
+  const focusIme = () => {
+    try {
+      ime.focus({ preventScroll: true })
+    } catch {}
+  }
+  vp.addEventListener('mousemove', (e) => {
+    const now = performance.now()
+    if (now - _cgbLastMove < 33) return
+    _cgbLastMove = now
+    const p = _cgbScaleXY(e)
+    _cgbSend({ t: 'mouse', kind: 'move', x: p.x, y: p.y })
+  })
+  vp.addEventListener('mousedown', (e) => {
+    e.preventDefault()
+    focusIme()
+    const p = _cgbScaleXY(e)
+    _cgbSend({ t: 'mouse', kind: 'down', x: p.x, y: p.y, button: e.button })
+  })
+  vp.addEventListener('mouseup', (e) => {
+    e.preventDefault()
+    const p = _cgbScaleXY(e)
+    _cgbSend({ t: 'mouse', kind: 'up', x: p.x, y: p.y, button: e.button })
+  })
+  vp.addEventListener('contextmenu', (e) => e.preventDefault())
+  vp.addEventListener(
+    'wheel',
+    (e) => {
+      e.preventDefault()
+      _cgbSend({ t: 'mouse', kind: 'wheel', dx: e.deltaX, dy: e.deltaY })
+    },
+    { passive: false },
   )
-  if (!loaded) return
-  try {
-    const cfg = await apiGet('/api/config')
-    status.textContent = cfg.proxyUrl
-      ? `出站代理：${cfg.proxyUrl}`
-      : '未配置全局代理：将使用 gateway 环境代理 fallback；若环境也未设置则直连。'
-  } catch {
-    status.textContent = '代理配置读取失败：仍会尝试通过 gateway 代理入口加载。'
+  // Printable text + IME composition flow through the hidden textarea's input;
+  // control keys and modifier combos go through key down/up (so e.g. Ctrl+A
+  // works: Control-down then a-down are both forwarded).
+  const flushText = () => {
+    const v = ime.value
+    if (v) {
+      _cgbSend({ t: 'text', text: v })
+      ime.value = ''
+    }
   }
+  ime.addEventListener('input', () => {
+    if (!ime._composing) flushText()
+  })
+  ime.addEventListener('compositionstart', () => {
+    ime._composing = true
+  })
+  ime.addEventListener('compositionend', () => {
+    ime._composing = false
+    flushText()
+  })
+  const isTextKey = (e) => e.key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey
+  ime.addEventListener('keydown', (e) => {
+    if (e.isComposing) return
+    if (!isTextKey(e)) {
+      e.preventDefault()
+      const k = _cgbMapKey(e)
+      _cgbPressedKeys.add(k)
+      _cgbSend({ t: 'key', kind: 'down', key: k })
+    }
+  })
+  ime.addEventListener('keyup', (e) => {
+    if (e.isComposing) return
+    if (!isTextKey(e)) {
+      const k = _cgbMapKey(e)
+      _cgbPressedKeys.delete(k)
+      _cgbSend({ t: 'key', kind: 'up', key: k })
+    }
+  })
+  // Never leave a modifier "stuck" down on the server if focus/visibility is
+  // lost before the keyup arrives.
+  ime.addEventListener('blur', _cgbReleaseKeys)
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) _cgbReleaseKeys()
+  })
+}
+function stopChatgptBrowser() {
+  _cgbReleaseKeys()
+  if (_cgbWs) {
+    try {
+      _cgbWs.onmessage = null
+      _cgbWs.close()
+    } catch {}
+    _cgbWs = null
+  }
+}
+async function startChatgptBrowser() {
+  stopChatgptBrowser()
+  _cgbOverlay('正在启动服务器浏览器…(首次较慢)')
+  _cgbStatus('连接中…')
+  let sess
+  try {
+    sess = await apiGet('/api/chatgpt-browser/session')
+  } catch (err) {
+    _cgbStatus('启动失败,请刷新重试')
+    _cgbOverlay(`启动失败:${err}`)
+    return
+  }
+  if (!sess?.wsToken) {
+    _cgbStatus('实时浏览器未启用')
+    _cgbOverlay('该功能未启用')
+    return
+  }
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws'
+  // Token rides the `bearer` subprotocol (server reads it via extractToken),
+  // never the URL — so it can't leak into access logs / history.
+  const ws = new WebSocket(`${proto}://${location.host}${sess.wsPath}`, ['bearer', sess.wsToken])
+  ws.binaryType = 'blob'
+  _cgbWs = ws
+  ws.onmessage = (ev) => {
+    if (typeof ev.data !== 'string') {
+      _cgbDrawFrame(ev.data)
+      return
+    }
+    let m
+    try {
+      m = JSON.parse(ev.data)
+    } catch {
+      return
+    }
+    if (m.t === 'size') {
+      _cgbVW = m.w
+      _cgbVH = m.h
+    } else if (m.t === 'status') {
+      if (m.state === 'launching') {
+        _cgbOverlay('正在启动服务器浏览器…(首次较慢)')
+        _cgbStatus('启动中…')
+      } else if (m.state === 'ready') {
+        _cgbStatus('已连接 · 真实浏览器(点击画面开始操作)')
+      } else if (m.state === 'closed' || m.state === 'error') {
+        _cgbOverlay(`浏览器已关闭:${m.message || ''} · 点「刷新」重连`)
+        _cgbStatus('已断开')
+      }
+    }
+  }
+  ws.onclose = () => _cgbStatus('已断开 · 点「刷新」重连')
+  ws.onerror = () => _cgbStatus('连接错误 · 点「刷新」重试')
+  _cgbBindInput()
+}
+function refreshChatGptWebFrame() {
+  startChatgptBrowser()
+}
+function openChatGptWebModal() {
+  openModal('chatgpt-web-modal')
+  const modal = $('chatgpt-web-modal')
+  if (_cgbCloseObserver) _cgbCloseObserver.disconnect()
+  _cgbCloseObserver = new MutationObserver(() => {
+    if (!modal.classList.contains('open')) stopChatgptBrowser()
+  })
+  _cgbCloseObserver.observe(modal, { attributes: true, attributeFilter: ['class'] })
+  startChatgptBrowser()
 }
 
 function openFeedbackModal() {
@@ -1782,6 +1979,20 @@ async function init() {
   })
   initProxyUi()
   $('chatgpt-web-refresh-btn').onclick = refreshChatGptWebFrame
+  $('chatgpt-browser-back-btn').onclick = () => _cgbSend({ t: 'nav', action: 'back' })
+  $('chatgpt-browser-home-btn').onclick = () => _cgbSend({ t: 'nav', action: 'home' })
+  $('chatgpt-browser-restart-btn').onclick = () => {
+    _cgbSend({ t: 'restart' })
+    _cgbOverlay('重启中…')
+    setTimeout(() => startChatgptBrowser(), 1800)
+  }
+  $('chatgpt-browser-clear-btn').onclick = () => {
+    if (confirm('清除 ChatGPT 登录态并重启服务器浏览器?')) {
+      _cgbSend({ t: 'clearLogin' })
+      _cgbOverlay('已清除登录态,重启中…')
+      setTimeout(() => startChatgptBrowser(), 1800)
+    }
+  }
   // Memory modal events
   $('memory-tab-memory').onclick = async () => {
     $('memory-tab-memory').className = 'btn btn-secondary'

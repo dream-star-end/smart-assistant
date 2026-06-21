@@ -52,8 +52,9 @@ import {
   writeAgentsConfig,
   writeConfig,
 } from '@openclaude/storage'
-import { type WebSocket, WebSocketServer } from 'ws'
+import { type WebSocket, WebSocketServer, WebSocket as WsClient } from 'ws'
 import { type JwtPayload, checkToken, signJwt, verifyJwt, verifyPassword } from './auth.js'
+import { ChatGptBrowserSidecar } from './chatgptBrowserSidecar.js'
 import { ChatGptTlsSidecar } from './chatgptTlsSidecar.js'
 import {
   CHATGPT_PROXY_CORS_HEADERS,
@@ -160,6 +161,7 @@ const TERMINAL_DOWNLOAD_TICKET_TTL_MS = 5 * 60_000
 // UPLOAD_MIME_TO_EXT) — single source of truth, shared by the HTTP endpoint and
 // the inbound media save path.
 const UPLOAD_REF_PREFIX = 'upload:'
+const CHATGPT_BROWSER_WS_PATH = '/api/chatgpt-browser/ws'
 
 interface TerminalUploadState {
   id: string
@@ -202,6 +204,8 @@ export class Gateway {
   private claudeTerminal: ClaudeTerminalManager | null = null
   private httpServer!: ReturnType<typeof createServer>
   private _chatgptTlsSidecar: ChatGptTlsSidecar
+  private _chatgptBrowserSidecar: ChatGptBrowserSidecar
+  private chatgptBrowserWss: WebSocketServer | null = null
   private router: Router
   private sessions: SessionManager
   private cron: CronScheduler | null = null
@@ -413,6 +417,17 @@ export class Gateway {
       },
       this.log,
     )
+    const browserCfg = deps.config.gateway.chatgptBrowser
+    this._chatgptBrowserSidecar = new ChatGptBrowserSidecar(
+      {
+        ...browserCfg,
+        proxyUrl: browserCfg?.proxyUrl ?? deps.config.proxyUrl,
+        stealthScript:
+          browserCfg?.stealthScript ??
+          `${process.env.OPENCLAUDE_HOME ?? '/root/.openclaude'}/browser-stealth.js`,
+      },
+      this.log,
+    )
   }
 
   /** Feed `prune()` eviction counts into Prometheus counters. Called from
@@ -574,6 +589,7 @@ export class Gateway {
     // Supervise the ChatGPT TLS-impersonation sidecar (no-op unless enabled).
     // A missing venv / crash never blocks startup — the proxy handler 502s.
     this._chatgptTlsSidecar.start()
+    this._chatgptBrowserSidecar.start()
 
     // Phase 0.2: replay any server-authored messages queued to the outbox
     // while the previous gateway instance was unable to reach SQLite (disk
@@ -598,6 +614,10 @@ export class Gateway {
       noServer: true,
       maxPayload: CLAUDE_TERMINAL_MAX_CLIENT_MESSAGE_BYTES,
     })
+    // ChatGPT real-browser screencast relay (only if the sidecar is enabled).
+    if (this._chatgptBrowserSidecar.dialInfo()) {
+      this.chatgptBrowserWss = new WebSocketServer({ noServer: true, maxPayload: 256 * 1024 })
+    }
     this.claudeTerminal = createClaudeTerminalManager({
       logger: createLogger({ module: 'claudeTerminal' }),
     })
@@ -629,19 +649,26 @@ export class Gateway {
 
     // WS keepalive: ping every 25s, terminate if no pong in 35s
     this._wsKeepaliveTimer = setInterval(() => {
-      for (const ws of this.wss.clients) {
-        if ((ws as any)._isAlive === false) {
-          ws.terminate()
-          continue
+      const pools = [this.wss.clients, this.chatgptBrowserWss?.clients]
+      for (const pool of pools) {
+        if (!pool) continue
+        for (const ws of pool) {
+          if ((ws as any)._isAlive === false) {
+            ws.terminate()
+            continue
+          }
+          ;(ws as any)._isAlive = false
+          ws.ping()
         }
-        ;(ws as any)._isAlive = false
-        ws.ping()
       }
     }, 25_000)
 
     this.wss.on('connection', (ws, req) => this.handleWsConnection(ws, req))
     this.claudeTerminalWss.on('connection', (ws, req) =>
       this.handleClaudeTerminalConnection(ws, req),
+    )
+    this.chatgptBrowserWss?.on('connection', (ws, req) =>
+      this.handleChatgptBrowserConnection(ws, req),
     )
 
     // 启动渠道
@@ -1091,6 +1118,13 @@ export class Gateway {
       this._chatgptTlsSidecar.stop()
     } catch {}
     try {
+      this._chatgptBrowserSidecar.stop()
+    } catch {}
+    try {
+      for (const ws of this.chatgptBrowserWss?.clients ?? []) ws.terminate()
+      this.chatgptBrowserWss?.close()
+    } catch {}
+    try {
       this._stopEviction?.()
     } catch {}
     this._stopEviction = null
@@ -1440,6 +1474,23 @@ export class Gateway {
       const token = this.signChatGptWebScopedToken(req, exp)
       this.sendJson(res, 200, {
         entryUrl: chatGptProxySessionEntryPath(token),
+        expiresAt: exp,
+      })
+      return
+    }
+    if (url.pathname === '/api/chatgpt-browser/session') {
+      if (req.method !== 'GET') {
+        this.sendError(res, 405, 'method not allowed')
+        return
+      }
+      if (!this._chatgptBrowserSidecar.dialInfo()) {
+        this.sendError(res, 503, 'chatgpt browser disabled')
+        return
+      }
+      const exp = Math.floor(Date.now() / 1000) + Gateway.CHATGPT_WEB_TOKEN_TTL_SECONDS
+      this.sendJson(res, 200, {
+        wsToken: this.signChatGptBrowserScopedToken(req, exp),
+        wsPath: CHATGPT_BROWSER_WS_PATH,
         expiresAt: exp,
       })
       return
@@ -2351,6 +2402,28 @@ export class Gateway {
       | (JwtPayload & { scope?: string })
       | null
     return payload?.scope === 'chatgpt-web'
+  }
+
+  private signChatGptBrowserScopedToken(req: IncomingMessage, exp: number): string {
+    const payload = {
+      userId: this.getUserId(req),
+      exp,
+      scope: 'chatgpt-browser',
+      nonce: randomBytes(16).toString('base64url'),
+    }
+    return signJwt(payload, this.deps.config.gateway.accessToken)
+  }
+
+  /** Verify the scoped browser-WS token (passed via the `bearer` subprotocol,
+   *  never the URL — avoids leaking it in logs/history); returns userId. */
+  private checkChatGptBrowserScopedAuth(req: IncomingMessage): string | null {
+    const token = this.extractToken(req)
+    if (!token) return null
+    const payload = verifyJwt(token, this.deps.config.gateway.accessToken) as
+      | (JwtPayload & { scope?: string; userId?: string })
+      | null
+    if (payload?.scope !== 'chatgpt-browser') return null
+    return typeof payload.userId === 'string' && payload.userId ? payload.userId : 'default'
   }
 
   /** Set HttpOnly session cookie on response — stores the verified auth token so
@@ -4390,9 +4463,86 @@ export class Gateway {
       })
       return
     }
+    if (pathname === CHATGPT_BROWSER_WS_PATH && this.chatgptBrowserWss) {
+      const userId = this.checkChatGptBrowserScopedAuth(req)
+      if (!userId) {
+        try {
+          socket.destroy()
+        } catch {}
+        return
+      }
+      this.chatgptBrowserWss.handleUpgrade(req, socket, head, (ws) => {
+        this.chatgptBrowserWss?.emit('connection', ws, req)
+      })
+      return
+    }
     try {
       socket.destroy()
     } catch {}
+  }
+
+  /** Relay a frontend screencast WS to the loopback browser sidecar WS. */
+  private handleChatgptBrowserConnection(ws: WebSocket, req: IncomingMessage): void {
+    if (this._shuttingDown) {
+      try {
+        ws.close(1001, 'shutting down')
+      } catch {}
+      return
+    }
+    const dial = this._chatgptBrowserSidecar.dialInfo()
+    const userId = this.checkChatGptBrowserScopedAuth(req)
+    if (!dial || !userId) {
+      try {
+        ws.close(1008, 'unauthorized')
+      } catch {}
+      return
+    }
+    ;(ws as any)._isAlive = true
+    ws.on('pong', () => {
+      ;(ws as any)._isAlive = true
+    })
+
+    const upstream = new WsClient(
+      `ws://${dial.host}:${dial.port}/?token=${encodeURIComponent(dial.token)}&user=${encodeURIComponent(userId)}`,
+      { maxPayload: 8 * 1024 * 1024 },
+    )
+    const closeBoth = (code: number, reason: string) => {
+      try {
+        ws.close(code, reason)
+      } catch {}
+      try {
+        upstream.close()
+      } catch {}
+    }
+    ws.on('message', (data, isBinary) => {
+      if (upstream.readyState === WsClient.OPEN) {
+        try {
+          upstream.send(data, { binary: isBinary })
+        } catch {}
+      }
+    })
+    upstream.on('message', (data, isBinary) => {
+      if (ws.readyState !== ws.OPEN) return
+      // Drop screencast frames when the client link (gateway→frontend over the
+      // tunnel — the real slow hop) is backed up; newest frame wins. Control
+      // JSON (text) is always delivered.
+      if (isBinary && ws.bufferedAmount > 1 << 20) return
+      try {
+        ws.send(data, { binary: isBinary })
+      } catch {}
+    })
+    upstream.on('error', () => closeBoth(1011, 'browser sidecar unavailable'))
+    upstream.on('close', () => closeBoth(1000, 'browser sidecar closed'))
+    ws.on('close', () => {
+      try {
+        upstream.close()
+      } catch {}
+    })
+    ws.on('error', () => {
+      try {
+        upstream.close()
+      } catch {}
+    })
   }
 
   private wsClients = new Set<WebSocket>()
