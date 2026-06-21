@@ -43,7 +43,7 @@ const MODELS = [
   {
     id: 'claude-opus-4-8',
     label: 'Opus 4.8',
-    efforts: ['low', 'medium', 'high', 'xhigh', 'max'],
+    efforts: ['low', 'medium', 'high', 'xhigh', 'max', 'ultracode'],
   },
   { id: 'claude-haiku-4-5', label: 'Haiku 4.5' },
 ]
@@ -144,6 +144,7 @@ describe('effortMode: capability-driven gating', () => {
       'high',
       'xhigh',
       'max',
+      'ultracode',
     ])
     assert.deepEqual(e.getSupportedEfforts('claude-haiku-4-5'), [])
     assert.deepEqual(e.getSupportedEfforts('unknown-model'), [])
@@ -167,6 +168,7 @@ describe('effortMode: capability-driven gating', () => {
       'high',
       'xhigh',
       'max',
+      'ultracode',
     ])
     assert.deepEqual(e.getSupportedEfforts('totally-unknown'), [])
   })
@@ -185,6 +187,12 @@ describe('effortMode: capability-driven gating', () => {
   it('getEffortForSubmit: supported model + valid pill → that level', () => {
     const e = makeEffortMode('claude-opus-4-8', 'xhigh')
     assert.equal(e.getEffortForSubmit(), 'xhigh')
+  })
+
+  it('getEffortForSubmit: ultracode is a first-class selectable level on Opus', () => {
+    const e = makeEffortMode('claude-opus-4-8', 'ultracode')
+    assert.equal(e.getCurrentEffort(), 'ultracode')
+    assert.equal(e.getEffortForSubmit(), 'ultracode')
   })
 
   it('filters out effort values outside EFFORT_LEVELS', () => {

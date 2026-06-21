@@ -3166,14 +3166,17 @@ a:hover {
   border: 1px solid var(--border-subtle);
 }
 
-/* ── 思考强度 / 思考深度 pill(Opus 4.7、GPT-5.5) ── */
-.composer-modes {
+/* ── 模型 / 思考深度选择器:并排一行(均为 composer popover) ── */
+.composer-controls {
   display: flex;
   flex-wrap: wrap;
+  align-items: center;
   gap: var(--space-2);
   padding: var(--space-2) var(--space-3) 0;
 }
-.composer-modes[hidden] {
+/* 两个控件都隐藏(如 codex agent + 无 effort 档的 model)时不要留出空 padding 行。
+   :has() 不支持的老内核最多在该罕见场景留一点空白,功能无碍。 */
+.composer-controls:not(:has(> :not([hidden]))) {
   display: none;
 }
 .mode-pill {
@@ -3195,25 +3198,18 @@ a:hover {
   background: var(--bg-hover);
   color: var(--fg);
 }
-.mode-pill[aria-pressed="true"] {
-  background: var(--accent-soft);
-  color: var(--accent);
-  border-color: var(--accent-border);
-}
 .mode-pill svg {
   flex-shrink: 0;
   opacity: 0.8;
 }
-.mode-pill[aria-pressed="true"] svg {
-  opacity: 1;
-}
 
-/* ── 模型选择器(composer popover, per-session 覆盖) ── */
-.composer-model {
-  position: relative; /* 菜单的定位锚 */
-  padding: var(--space-2) var(--space-3) 0;
+/* ── 模型选择器 + 思考深度选择器(composer popover, per-session 覆盖) ── */
+.composer-model,
+.composer-effort {
+  position: relative; /* 菜单的定位锚;padding 由 .composer-controls 统一给 */
 }
-.composer-model[hidden] {
+.composer-model[hidden],
+.composer-effort[hidden] {
   display: none;
 }
 .mode-pill--trigger[aria-expanded="true"] {

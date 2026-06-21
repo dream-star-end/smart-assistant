@@ -1,16 +1,36 @@
-// OpenClaude — 思考深度 pill
+// OpenClaude — 思考深度(effort)选择器
 //
-// pill 状态按 agent 持久化在 localStorage 里(per-agent),page reload 后复原。
-// 默认空(unset),让 claude 用模型默认 effort。
-// 可见性 / 可调档位**能力驱动**:取当前生效 model(含模型选择器的 per-session 覆盖)
-// 在 config.models 里声明的 `efforts`。
+// 与模型选择器(modelMode.js)同构的 composer popover:一个 trigger 显示当前
+// 档位「思考深度: 中」,点开是下拉菜单。选中值按 agent 持久化在 localStorage,
+// 作为 inbound.message.effortLevel 发给 gateway。
+//
+// 可见性 / 可选档位**能力驱动**:取当前生效 model(含模型选择器的 per-session
+// 覆盖)在 config.models 里声明的 `efforts`(来自后端 effortsForModel(),前端不
+// 写死)。空/缺省 = 不显示思考深度控件。
+//
+// popover 交互沿用 v3-popover-menu-pattern:pointerdown capture 外部关闭、roving
+// tabindex、键盘全导航、Tab 跳出不还焦、render 幂等(与 modelMode.js 一致)。
 import { $ } from './dom.js'
 import { getEffectiveModel } from './modelMode.js?v=1'
 import { getSession, state } from './state.js'
 
 const STORAGE_KEY = 'openclaude_effort_by_agent'
 // 与 protocol/frames.ts InboundMessage.effortLevel + config.ts EFFORT_LEVELS 一致。
-const VALID = new Set(['low', 'medium', 'high', 'xhigh', 'max'])
+const VALID = new Set(['low', 'medium', 'high', 'xhigh', 'max', 'ultracode'])
+// 档位 id → 中文标签(纯档位命名,不带「模式」叙事)。ultracode = xhigh + 多 agent 工作流编排。
+const LABELS = {
+  low: '低',
+  medium: '中',
+  high: '高',
+  xhigh: '极高',
+  max: '最高',
+  ultracode: '多agent工作流',
+}
+
+let globalListenersBound = false
+let outsideListener = null
+let keydownListener = null
+let repositionListener = null
 
 /** 返回该 model 在 UI 中可调的思考深度档,**能力驱动**,两个权威源(都来自后端
  *  effortsForModel(),前端不写死):
@@ -51,87 +71,233 @@ function writeStore(obj) {
   }
 }
 
-/** 取当前会话的 agent 当前选中的 effort('low' | 'medium' | 'high' | 'xhigh' | 'max' | undefined)。
- *  返回 undefined 表示没选,仅用于 UI(pill 高亮态)。
- *  发 inbound.message 用 getEffortForSubmit(),它会区分"未选" vs "支持 effort 但取消"。 */
-export function getCurrentEffort() {
+function currentAgentId() {
   const sess = getSession()
-  if (!sess) return undefined
-  const agentId = sess.agentId || state.defaultAgentId
-  if (!agentId) return undefined
-  const store = readStore()
-  const v = store[agentId]
-  const supported = getSupportedEfforts(getCurrentAgentModel())
+  if (!sess) return null
+  return sess.agentId || state.defaultAgentId || null
+}
+
+/** 当前生效 model = 模型选择器的 per-session 覆盖 ?? agent 默认。 */
+function currentModel() {
+  return getEffectiveModel()
+}
+
+/** 取当前会话 agent 选中的 effort('low'|'medium'|'high'|'xhigh'|'max'|undefined)。
+ *  返回 undefined 表示没选(用模型默认)。仅在档位被当前 model 支持时才有效。 */
+export function getCurrentEffort() {
+  const id = currentAgentId()
+  if (!id) return undefined
+  const v = readStore()[id]
+  const supported = getSupportedEfforts(currentModel())
   return VALID.has(v) && supported.includes(v) ? v : undefined
 }
 
 /** 决定 inbound.message.effortLevel 的取值:
- *    - 字符串:用户在支持 effort 的会话里选了对应 pill
- *    - null:**显式清除** — 当前 agent 支持 effort 但没选 pill。让 gateway 把
- *           已存在 runner 的 effort env 复位到模型默认(否则一旦升过档就回不去)
- *    - undefined:不传字段 — 当前 agent 不支持前端 effort,完全不参与 effort 协商
- *
- *  返回 undefined 时调用方应省略 effortLevel 字段;返回 null/string 时按值发送。 */
+ *    - 字符串:用户在支持 effort 的会话里选了对应档
+ *    - null:**显式清除** — 当前 model 支持 effort 但没选。让 gateway 把已存在
+ *           runner 的 effort env 复位到模型默认(否则一旦升过档就回不去)
+ *    - undefined:不传字段 — 当前 model 不支持前端 effort,完全不参与协商 */
 export function getEffortForSubmit() {
-  if (!modelSupportsExtraEffort(getCurrentAgentModel())) return undefined
+  if (!modelSupportsExtraEffort(currentModel())) return undefined
   const cur = getCurrentEffort()
-  // 支持 effort + 未选 pill → 显式 null,让 gateway 重启回模型默认 effort
   return cur === undefined ? null : cur
 }
 
-/** 设置当前会话 agent 的 effort。传 undefined 取消选中。 */
+/** 设置当前会话 agent 的 effort。传 undefined/null/'' 取消选中(回模型默认)。 */
 function setCurrentEffort(level) {
-  const sess = getSession()
-  if (!sess) return
-  const agentId = sess.agentId || state.defaultAgentId
-  if (!agentId) return
+  const id = currentAgentId()
+  if (!id) return
   const store = readStore()
-  if (level === undefined || level === null) {
-    delete store[agentId]
-  } else if (VALID.has(level)) {
-    store[agentId] = level
+  if (level && VALID.has(level) && getSupportedEfforts(currentModel()).includes(level)) {
+    store[id] = level
   } else {
-    return
+    delete store[id]
   }
   writeStore(store)
-  renderModePills()
+  closeMenu(false)
+  renderEffortPicker()
 }
 
-/** 当前生效 model = 模型选择器的 per-session 覆盖 ?? agent 默认。 */
-function getCurrentAgentModel() {
-  return getEffectiveModel()
+/** 选项列表:置顶「默认」(清除选择,用模型默认 effort),再拼当前 model 支持的档。 */
+function effortOptions() {
+  const supported = getSupportedEfforts(currentModel())
+  const out = [{ id: '', label: '默认', isDefault: true }]
+  for (const lvl of supported) out.push({ id: lvl, label: LABELS[lvl] || lvl })
+  return out
 }
 
-/** 根据当前生效 model 决定整个 pill 行的可见性,并同步 pill 的可见性/aria-pressed 状态。
- *  应在 agent 切换、session 切换、model 切换、agent list 加载完成后调用。 */
-export function renderModePills() {
-  const wrap = $('composer-modes')
-  if (!wrap) return
-  const model = getCurrentAgentModel()
-  const supported = getSupportedEfforts(model)
-  const visible = supported.length > 0
-  wrap.hidden = !visible
-  if (!visible) return
-  wrap.setAttribute('aria-label', '思考深度')
-  const current = getCurrentEffort()
-  for (const btn of wrap.querySelectorAll('.mode-pill')) {
-    const v = btn.dataset.effort
-    btn.hidden = !supported.includes(v)
-    btn.setAttribute('aria-pressed', v === current ? 'true' : 'false')
+function isMenuOpen() {
+  const menu = $('effort-menu')
+  return !!menu && !menu.hidden
+}
+
+/** 把菜单定位到 trigger 正上方(向上弹)。与 modelMode.positionMenu 同构:
+ *  position:fixed + 视口坐标,逃出 .composer-inner 的 overflow:hidden。 */
+function positionMenu() {
+  const menu = $('effort-menu')
+  const trigger = $('effort-trigger')
+  if (!menu || !trigger || menu.hidden) return
+  const r = trigger.getBoundingClientRect()
+  const gap = 6
+  const maxLeft = window.innerWidth - menu.offsetWidth - 8
+  menu.style.left = `${Math.max(8, Math.min(r.left, maxLeft))}px`
+  menu.style.bottom = `${Math.max(8, window.innerHeight - r.top + gap)}px`
+}
+
+function openMenu() {
+  const menu = $('effort-menu')
+  const trigger = $('effort-trigger')
+  if (!menu || !trigger) return
+  menu.hidden = false
+  trigger.setAttribute('aria-expanded', 'true')
+  const items = [...menu.querySelectorAll('[role="option"]')]
+  if (items.length === 0) {
+    menu.hidden = true
+    trigger.setAttribute('aria-expanded', 'false')
+    return
+  }
+  positionMenu()
+  const cur = getCurrentEffort() ?? ''
+  const target = items.find((el) => el.dataset.effort === cur) ?? items[0]
+  for (const it of items) it.setAttribute('tabindex', it === target ? '0' : '-1')
+  target.focus()
+  attachGlobalListeners()
+}
+
+function closeMenu(returnFocus = true) {
+  const menu = $('effort-menu')
+  const trigger = $('effort-trigger')
+  if (menu) menu.hidden = true
+  if (trigger) {
+    trigger.setAttribute('aria-expanded', 'false')
+    if (returnFocus) trigger.focus()
+  }
+  detachGlobalListeners()
+}
+
+function attachGlobalListeners() {
+  if (globalListenersBound) return
+  globalListenersBound = true
+  const wrap = $('composer-effort')
+  outsideListener = (ev) => {
+    if (wrap && !wrap.contains(ev.target)) closeMenu(false)
+  }
+  keydownListener = (ev) => {
+    if (!isMenuOpen()) return
+    if (ev.key === 'Escape') {
+      ev.preventDefault()
+      closeMenu(true)
+    } else if (ev.key === 'Tab') {
+      closeMenu(false) // 非 modal:Tab 跳出不还焦
+    }
+  }
+  repositionListener = () => positionMenu()
+  document.addEventListener('pointerdown', outsideListener, true)
+  document.addEventListener('keydown', keydownListener, true)
+  window.addEventListener('resize', repositionListener)
+  window.addEventListener('scroll', repositionListener, true)
+}
+
+function detachGlobalListeners() {
+  if (!globalListenersBound) return
+  globalListenersBound = false
+  if (outsideListener) document.removeEventListener('pointerdown', outsideListener, true)
+  if (keydownListener) document.removeEventListener('keydown', keydownListener, true)
+  if (repositionListener) {
+    window.removeEventListener('resize', repositionListener)
+    window.removeEventListener('scroll', repositionListener, true)
+  }
+  outsideListener = null
+  keydownListener = null
+  repositionListener = null
+}
+
+/** 重渲选项 + 同步 trigger 标签/选中态。agent/session/model 切换、models 加载后
+ *  调用,幂等。不支持思考深度的 model → 整个控件隐藏。 */
+export function renderEffortPicker() {
+  const wrap = $('composer-effort')
+  const trigger = $('effort-trigger')
+  const labelEl = $('effort-label')
+  const menu = $('effort-menu')
+  if (!wrap || !trigger || !labelEl || !menu) return
+  const supported = getSupportedEfforts(currentModel())
+  if (supported.length === 0) {
+    wrap.hidden = true
+    if (isMenuOpen()) closeMenu(false)
+    return
+  }
+  wrap.hidden = false
+  const cur = getCurrentEffort()
+  labelEl.textContent = cur ? `思考深度: ${LABELS[cur] || cur}` : '思考深度'
+  menu.replaceChildren()
+  const selected = cur ?? ''
+  for (const opt of effortOptions()) {
+    const btn = document.createElement('button')
+    btn.type = 'button'
+    btn.className = 'model-menu-item'
+    btn.setAttribute('role', 'option')
+    btn.dataset.effort = opt.id
+    btn.tabIndex = -1
+    const sel = opt.id === selected
+    btn.setAttribute('aria-selected', sel ? 'true' : 'false')
+    btn.classList.toggle('model-menu-item--selected', sel)
+    const labelSpan = document.createElement('span')
+    labelSpan.className = 'label'
+    labelSpan.textContent = opt.label + (opt.isDefault ? ' · 模型默认' : '')
+    btn.append(labelSpan)
+    menu.appendChild(btn)
   }
 }
 
-/** 一次性绑定 pill 的点击事件(切换:再次点击同一个 pill 取消)。 */
-export function initModePills() {
-  const wrap = $('composer-modes')
-  if (!wrap) return
-  wrap.addEventListener('click', (e) => {
-    const btn = e.target.closest('.mode-pill')
-    if (!btn || !wrap.contains(btn)) return
-    const v = btn.dataset.effort
-    if (!VALID.has(v)) return
-    const current = getCurrentEffort()
-    setCurrentEffort(current === v ? undefined : v)
+/** 一次性绑定 trigger/menu 事件。与 modelMode.initModelPicker 同构。 */
+export function initEffortPicker() {
+  const trigger = $('effort-trigger')
+  const menu = $('effort-menu')
+  if (!trigger || !menu) return
+  trigger.addEventListener('click', (e) => {
+    e.preventDefault()
+    if (isMenuOpen()) closeMenu(true)
+    else openMenu()
   })
-  renderModePills()
+  trigger.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' || e.key === ' ') {
+      e.preventDefault()
+      isMenuOpen() ? closeMenu(true) : openMenu()
+    } else if (e.key === 'ArrowDown') {
+      e.preventDefault()
+      openMenu()
+    }
+  })
+  menu.addEventListener('click', (e) => {
+    const btn = e.target.closest('[role="option"]')
+    if (!btn || !menu.contains(btn)) return
+    setCurrentEffort(btn.dataset.effort)
+  })
+  menu.addEventListener('keydown', (e) => {
+    const items = [...menu.querySelectorAll('[role="option"]')]
+    if (items.length === 0) return
+    const idx = items.indexOf(document.activeElement)
+    const move = (next) => {
+      for (const it of items) it.setAttribute('tabindex', it === next ? '0' : '-1')
+      next.focus()
+    }
+    if (e.key === 'ArrowDown') {
+      e.preventDefault()
+      move(items[(idx + 1 + items.length) % items.length])
+    } else if (e.key === 'ArrowUp') {
+      e.preventDefault()
+      move(items[(idx - 1 + items.length) % items.length])
+    } else if (e.key === 'Home') {
+      e.preventDefault()
+      move(items[0])
+    } else if (e.key === 'End') {
+      e.preventDefault()
+      move(items[items.length - 1])
+    } else if (e.key === 'Enter' || e.key === ' ') {
+      e.preventDefault()
+      const cur = items[idx] || document.activeElement
+      if (cur?.dataset.effort !== undefined) setCurrentEffort(cur.dataset.effort)
+    }
+  })
+  renderEffortPicker()
 }

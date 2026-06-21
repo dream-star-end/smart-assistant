@@ -14,14 +14,31 @@ describe('effortsForModel: capability authority', () => {
     assert.deepEqual(effortsForModel('gpt-5.5'), expected)
     assert.deepEqual(effortsForModel('GPT-5.5'), expected)
     assert.deepEqual(effortsForModel('openai/gpt-5.5'), expected)
-    // codex has no 'max' depth — must not appear.
+    // codex has no 'max' depth and no Workflow tool — 'max'/'ultracode' must not appear.
     assert.ok(!effortsForModel('gpt-5.5').includes('max'))
+    assert.ok(!effortsForModel('gpt-5.5').includes('ultracode'))
   })
 
-  it('Claude family depths', () => {
-    assert.deepEqual(effortsForModel('claude-opus-4-8'), ['low', 'medium', 'high', 'xhigh', 'max'])
-    assert.deepEqual(effortsForModel('claude-opus-4-7'), ['low', 'medium', 'high', 'xhigh', 'max'])
+  it('Claude family depths (Opus exposes ultracode = xhigh + Workflow 编排)', () => {
+    assert.deepEqual(effortsForModel('claude-opus-4-8'), [
+      'low',
+      'medium',
+      'high',
+      'xhigh',
+      'max',
+      'ultracode',
+    ])
+    assert.deepEqual(effortsForModel('claude-opus-4-7'), [
+      'low',
+      'medium',
+      'high',
+      'xhigh',
+      'max',
+      'ultracode',
+    ])
+    // Sonnet keeps high/xhigh — no ultracode (scope = Opus only).
     assert.deepEqual(effortsForModel('claude-sonnet-4-6'), ['high', 'xhigh'])
+    assert.ok(!effortsForModel('claude-sonnet-4-6').includes('ultracode'))
   })
 
   it('models without an extra thinking-depth control → []', () => {

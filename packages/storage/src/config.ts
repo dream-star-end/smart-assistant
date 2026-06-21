@@ -27,8 +27,13 @@ export interface McpServerConfig {
   provider?: string
 }
 
-/** Thinking-depth levels the official `claude --effort` flag accepts. */
-export const EFFORT_LEVELS = ['low', 'medium', 'high', 'xhigh', 'max'] as const
+/** Selectable thinking-depth levels across the protocol + web composer.
+ *  low/medium/high/xhigh/max map 1:1 to the official `claude --effort` flag.
+ *  'ultracode' is a COMPOSITE level the CLI does NOT accept via --effort — the
+ *  subprocess runner translates it to `--effort xhigh` + the `ultracode` session
+ *  setting (xhigh reasoning + standing multi-agent Workflow orchestration).
+ *  See buildClaudeCliArgs in gateway/subprocessRunner.ts. */
+export const EFFORT_LEVELS = ['low', 'medium', 'high', 'xhigh', 'max', 'ultracode'] as const
 export type EffortLevel = (typeof EFFORT_LEVELS)[number]
 
 /** A selectable model for the web composer's model picker (per-session override). */
@@ -56,10 +61,11 @@ export function effortsForModel(modelId: string | undefined): EffortLevel[] {
   // Codex / GPT-5.5 reasoning depth. Maps to codex `model_reasoning_effort`
   // (low/medium/high/xhigh — codex exposes no `max`); see codexLaunchOverrides.
   if (/(^|[/_-])gpt[-_]?5\.5($|[/_-])/.test(id)) return ['low', 'medium', 'high', 'xhigh']
-  // Claude Opus 4.8 — full ladder. max 仍触发 buildResearchSlot 高严谨度守则。
-  if (/opus[-_]?4[-_]?8/.test(id)) return ['low', 'medium', 'high', 'xhigh', 'max']
-  // Claude Opus 4.7 — 同样全档,picker 切到 4.7 时档位行为不抖动。
-  if (/opus[-_]?4[-_]?7/.test(id)) return ['low', 'medium', 'high', 'xhigh', 'max']
+  // Claude Opus 4.8 — full ladder + ultracode. max 仍触发 buildResearchSlot 高严谨度守则;
+  // ultracode = xhigh + 常驻 Workflow(多 agent)编排(runner 翻译,见 subprocessRunner)。
+  if (/opus[-_]?4[-_]?8/.test(id)) return ['low', 'medium', 'high', 'xhigh', 'max', 'ultracode']
+  // Claude Opus 4.7 — 同样全档 + ultracode,picker 切到 4.7 时档位行为不抖动。
+  if (/opus[-_]?4[-_]?7/.test(id)) return ['low', 'medium', 'high', 'xhigh', 'max', 'ultracode']
   // Claude Sonnet 4.6.
   if (/sonnet[-_]?4[-_]?6/.test(id)) return ['high', 'xhigh']
   // Haiku / MiniMax / anything else — no extra thinking-depth control.
