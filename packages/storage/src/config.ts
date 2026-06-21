@@ -165,6 +165,34 @@ export interface OpenClaudeConfig {
       /** Optional owner allowlist used only for ranking recent client sessions. */
       includeUsers?: string[]
     }
+    /**
+     * Personal-instance opt-in: route the embedded ChatGPT web proxy
+     * (`/api/chatgpt-web`) upstream through a Chrome-TLS-impersonating sidecar
+     * (Python + curl_cffi). chatgpt.com sits behind Cloudflare's *managed
+     * challenge*, which fingerprints the TLS handshake — Node's stack always
+     * gets `cf-mitigated: challenge` (403), so the iframe shows OpenAI's
+     * "Unable to load site" page. A Chrome-JA3 client passes it cleanly.
+     *
+     * The gateway supervises the sidecar as a child process. A missing venv or
+     * a crashed sidecar NEVER blocks gateway startup — `/api/chatgpt-web` just
+     * returns 502 with a clear message. Leave disabled unless the venv was
+     * provisioned via `packages/gateway/scripts/setup-chatgpt-tls-sidecar.sh`.
+     */
+    chatgptTlsSidecar?: {
+      enabled?: boolean
+      /** Loopback port the sidecar listens on. Default 18992. */
+      port?: number
+      /** venv Python with curl_cffi installed.
+       *  Default `/opt/openclaude/chatgpt-tls/venv/bin/python`. */
+      pythonPath?: string
+      /** Sidecar script path. Default resolved relative to the gateway pkg. */
+      scriptPath?: string
+      /** Egress proxy the sidecar dials chatgpt.com through (e.g. sing-box).
+       *  Default: falls back to `config.proxyUrl`. */
+      proxyUrl?: string
+      /** curl_cffi impersonation target. Default `chrome`. */
+      impersonate?: string
+    }
   }
   // 接入方式三选一(实际 token 由官方 claude 自己存,这里只记录类型)
   auth: {

@@ -10,3 +10,4 @@ deploy/.env
 
 # 本地浏览器/codex/playwright 临时数据
 .playwright-mcp/
+__pycache__/

@@ -495,7 +495,7 @@
       </div>
     </div>
     <div class="chatgpt-web-warning">
-      这是直接反代 ChatGPT 网页的功能优先预览版：请求会走 OpenClaude 的全局出站代理，并放开 iframe 的 same-origin、弹窗和跳转能力以提高兼容性。ChatGPT 的登录风控、反自动化或 WebSocket/Service Worker 限制仍可能导致空白或无法登录。
+      这是反代 ChatGPT 网页的功能：请求经 OpenClaude 的 Chrome-TLS 模拟出站通道转发（以通过 Cloudflare 的人机校验），并放开 iframe 的 same-origin、弹窗和跳转能力以提高兼容性。登录需在页面内完成 OpenAI 自身的验证；语音／实时等基于 WebSocket 的功能暂不代理。
     </div>
     <iframe
       id="chatgpt-web-iframe"

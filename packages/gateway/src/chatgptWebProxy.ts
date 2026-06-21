@@ -59,11 +59,24 @@ export interface ChatGptProxyTarget {
 interface ChatGptWebProxyDeps {
   proxyUrl?: string
   forwardAuthorization?: boolean
+  /**
+   * When set, the upstream HTTPS leg is delegated to the Chrome-TLS sidecar
+   * (see chatgptTlsSidecar.ts) instead of Node's own `https.request`. This is
+   * what lets the proxy pass chatgpt.com's Cloudflare managed challenge. The
+   * sidecar owns egress (so `proxyUrl` is ignored in this mode).
+   */
+  sidecar?: { host: string; port: number; token: string }
   log?: {
     warn?: (msg: string, meta?: Record<string, unknown>, err?: unknown) => void
     debug?: (msg: string, meta?: Record<string, unknown>, err?: unknown) => void
   }
 }
+
+// Request headers curl_cffi's impersonation owns end-to-end: forwarding the
+// browser's own values would contradict the forged Chrome JA3 (e.g. a Safari
+// iOS UA over a Chrome TLS handshake is an instant bot tell).
+const SIDECAR_FINGERPRINT_HEADERS = new Set(['user-agent', 'accept-language', 'accept-encoding'])
+const SIDECAR_FINGERPRINT_PREFIXES = ['sec-ch-', 'sec-fetch-']
 
 function isAllowedChatGptProxyHost(host: string): boolean {
   return ALLOWED_ROOT_DOMAINS.some((root) => host === root || host.endsWith(`.${root}`))
@@ -273,6 +286,46 @@ export function buildChatGptProxyUpstreamHeaders(
   headers.origin = target.url.origin
   headers.referer = target.url.href
   headers['accept-encoding'] = 'identity'
+
+  const cookie = filterChatGptProxyCookieHeader(requestHeaders.cookie, target.host)
+  if (cookie) headers.cookie = cookie
+
+  return headers
+}
+
+/**
+ * Upstream headers for the sidecar path. Unlike the direct builder, the
+ * fingerprint headers (UA / sec-ch-* / sec-fetch-* / accept-language /
+ * accept-encoding) are dropped so curl_cffi's Chrome impersonation sets them
+ * consistently with its forged JA3. We still forward semantic/app headers
+ * (accept, content-type, oai-*, …) and the rewritten cookie/origin/referer.
+ * Returns a flat name→value map (the gateway ships it to the sidecar as a
+ * base64 JSON blob, so single string values keep that wire format simple).
+ */
+export function buildChatGptSidecarUpstreamHeaders(
+  requestHeaders: IncomingHttpHeaders,
+  target: ChatGptProxyTarget,
+  options: { forwardAuthorization?: boolean } = {},
+): Record<string, string> {
+  const headers: Record<string, string> = {}
+  for (const [name, value] of Object.entries(requestHeaders)) {
+    const lower = name.toLowerCase()
+    if (HOP_BY_HOP_HEADERS.has(lower)) continue
+    if (lower === 'host') continue
+    if (lower === 'cookie') continue
+    if (lower === 'origin') continue
+    if (lower === 'referer') continue
+    if (lower === 'authorization' && !options.forwardAuthorization) continue
+    if (lower.startsWith('x-forwarded-')) continue
+    if (SIDECAR_FINGERPRINT_HEADERS.has(lower)) continue
+    if (SIDECAR_FINGERPRINT_PREFIXES.some((prefix) => lower.startsWith(prefix))) continue
+    const copied = copyHeaderValue(value)
+    if (copied === undefined) continue
+    headers[name] = Array.isArray(copied) ? copied.join(', ') : copied
+  }
+
+  headers.origin = target.url.origin
+  headers.referer = target.url.href
 
   const cookie = filterChatGptProxyCookieHeader(requestHeaders.cookie, target.host)
   if (cookie) headers.cookie = cookie
@@ -618,6 +671,81 @@ function buildRequestOptions(
   return options
 }
 
+async function proxyChatGptViaSidecar(
+  req: IncomingMessage,
+  res: ServerResponse,
+  target: ChatGptProxyTarget,
+  deps: ChatGptWebProxyDeps,
+  sidecar: NonNullable<ChatGptWebProxyDeps['sidecar']>,
+): Promise<void> {
+  const upstreamHeaders = buildChatGptSidecarUpstreamHeaders(req.headers, target, {
+    forwardAuthorization: !!deps.forwardAuthorization,
+  })
+  const sidecarHeaders: Record<string, string> = {
+    'x-oc-sidecar-token': sidecar.token,
+    'x-oc-upstream-url': target.url.href,
+    'x-oc-upstream-headers': Buffer.from(JSON.stringify(upstreamHeaders)).toString('base64'),
+  }
+
+  // The gateway→sidecar hop must carry an explicit Content-Length: the Python
+  // handler reads the body by length (it has no chunked reader), so we buffer
+  // the request body here. Bodies are bounded (form posts, image uploads) on a
+  // single-user instance, so buffering is fine and — crucially — avoids
+  // silently dropping POST/PUT bodies (login, conversation, every mutation).
+  let body: Buffer | undefined
+  if (req.method !== 'GET' && req.method !== 'HEAD') {
+    const chunks: Buffer[] = []
+    for await (const chunk of req) chunks.push(Buffer.from(chunk as Buffer))
+    body = Buffer.concat(chunks)
+    sidecarHeaders['content-length'] = String(body.length)
+  }
+
+  const fail502 = (text: string) => {
+    if (!res.headersSent) {
+      res.removeHeader('X-Frame-Options')
+      res.writeHead(502, {
+        'Content-Type': 'text/plain; charset=utf-8',
+        'Cache-Control': 'no-store',
+      })
+      res.end(text)
+    } else if (!res.writableEnded) {
+      // Headers already streamed (e.g. mid-SSE): never splice error text into a
+      // live body — just close.
+      res.end()
+    }
+  }
+
+  await new Promise<void>((resolve) => {
+    const upstreamReq = httpRequest(
+      {
+        host: sidecar.host,
+        port: sidecar.port,
+        method: req.method,
+        path: '/',
+        headers: sidecarHeaders,
+      },
+      (upstreamRes) => {
+        sendProxyResponse(res, upstreamRes, target, req.method === 'HEAD')
+          .catch((err) => {
+            deps.log?.warn?.('chatgpt sidecar response failed', { host: target.host }, err)
+            fail502('ChatGPT proxy response failed')
+          })
+          .finally(resolve)
+      },
+    )
+    // Inactivity timeout — resets on every byte, so steady SSE never trips it;
+    // it only reaps a stream that has gone fully silent for 5 minutes.
+    upstreamReq.setTimeout(300_000, () => upstreamReq.destroy(new Error('ChatGPT sidecar timeout')))
+    upstreamReq.once('error', (err) => {
+      deps.log?.warn?.('chatgpt sidecar unavailable', { host: target.host }, err)
+      fail502('ChatGPT TLS sidecar unavailable')
+      resolve()
+    })
+
+    upstreamReq.end(body)
+  })
+}
+
 export async function handleChatGptWebProxy(
   req: IncomingMessage,
   res: ServerResponse,
@@ -629,6 +757,11 @@ export async function handleChatGptWebProxy(
     res.removeHeader('X-Frame-Options')
     res.writeHead(400, { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store' })
     res.end('bad ChatGPT proxy target')
+    return
+  }
+
+  if (deps.sidecar) {
+    await proxyChatGptViaSidecar(req, res, target, deps, deps.sidecar)
     return
   }
 

@@ -54,12 +54,14 @@ import {
 } from '@openclaude/storage'
 import { type WebSocket, WebSocketServer } from 'ws'
 import { type JwtPayload, checkToken, signJwt, verifyJwt, verifyPassword } from './auth.js'
+import { ChatGptTlsSidecar } from './chatgptTlsSidecar.js'
 import {
   CHATGPT_PROXY_CORS_HEADERS,
   chatGptProxySessionEntryPath,
   extractChatGptProxySessionToken,
   handleChatGptWebProxy,
 } from './chatgptWebProxy.js'
+import { readClaudeCredentialsSync, syncClaudeCredentialsFile } from './claudeCredentialsSync.js'
 import {
   CLAUDE_TERMINAL_MAX_CLIENT_MESSAGE_BYTES,
   CLAUDE_TERMINAL_WS_PATH,
@@ -71,7 +73,6 @@ import {
   listClaudeSessions,
   resolveClaudeTerminalUserIdForAuth,
 } from './claudeTerminal.js'
-import { readClaudeCredentialsSync, syncClaudeCredentialsFile } from './claudeCredentialsSync.js'
 import { syncCodexAuthFile } from './codexAuthSync.js'
 import { CronScheduler } from './cron.js'
 import { runDelegateExecution } from './delegateExecution.js'
@@ -200,6 +201,7 @@ export class Gateway {
   private claudeTerminalWss: WebSocketServer | null = null
   private claudeTerminal: ClaudeTerminalManager | null = null
   private httpServer!: ReturnType<typeof createServer>
+  private _chatgptTlsSidecar: ChatGptTlsSidecar
   private router: Router
   private sessions: SessionManager
   private cron: CronScheduler | null = null
@@ -397,6 +399,20 @@ export class Gateway {
     this.sessions.onClientSessionMutated = (sessionId, userId) => {
       this._redisSessionBus.invalidateClientSession(userId, sessionId)
     }
+    const sidecarCfg = deps.config.gateway.chatgptTlsSidecar
+    this._chatgptTlsSidecar = new ChatGptTlsSidecar(
+      {
+        ...sidecarCfg,
+        proxyUrl:
+          sidecarCfg?.proxyUrl ??
+          deps.config.proxyUrl ??
+          process.env.HTTPS_PROXY ??
+          process.env.HTTP_PROXY ??
+          process.env.https_proxy ??
+          process.env.http_proxy,
+      },
+      this.log,
+    )
   }
 
   /** Feed `prune()` eviction counts into Prometheus counters. Called from
@@ -554,6 +570,10 @@ export class Gateway {
 
   async start(): Promise<void> {
     const { config } = this.deps
+
+    // Supervise the ChatGPT TLS-impersonation sidecar (no-op unless enabled).
+    // A missing venv / crash never blocks startup — the proxy handler 502s.
+    this._chatgptTlsSidecar.start()
 
     // Phase 0.2: replay any server-authored messages queued to the outbox
     // while the previous gateway instance was unable to reach SQLite (disk
@@ -1068,6 +1088,9 @@ export class Gateway {
 
     // ── Stage 2: stop all background timers ──
     try {
+      this._chatgptTlsSidecar.stop()
+    } catch {}
+    try {
       this._stopEviction?.()
     } catch {}
     this._stopEviction = null
@@ -1431,6 +1454,7 @@ export class Gateway {
       handleChatGptWebProxy(req, res, url, {
         proxyUrl: chatGptProxyUrl,
         forwardAuthorization: hasChatGptWebScopedAuth && !this.isOpenClaudeAuthorizationHeader(req),
+        sidecar: this._chatgptTlsSidecar.dialInfo() ?? undefined,
         log: this.log,
       }).catch((err) => {
         this.log.warn('chatgpt proxy failed', undefined, err)
