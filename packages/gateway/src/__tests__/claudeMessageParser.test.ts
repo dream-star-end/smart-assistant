@@ -521,7 +521,12 @@ describe('ClaudeMessageParser: workflow_progress side-channel', () => {
   it('workflow_progress is a side-channel: never a block, never finalizes', () => {
     const { parser, events, getFinished } = createParser()
     parser.parse({ type: 'system', subtype: 'task_started', task_id: 't1' } as any)
-    parser.parse({ type: 'system', subtype: 'task_updated', task_id: 't1', patch: { status: 'completed' } } as any)
+    parser.parse({
+      type: 'system',
+      subtype: 'task_updated',
+      task_id: 't1',
+      patch: { status: 'completed' },
+    } as any)
     assert.equal(getFinished(), false)
     assert.ok(events.every((e) => e.kind === 'workflow_progress'))
   })

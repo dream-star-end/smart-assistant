@@ -1089,7 +1089,11 @@ export function connect() {
       // would silently drop the agent done/completed updates (card stuck at
       // "running"). It neither participates in replay dedup nor advances the
       // cursor; the handler merges every snapshot it sees.
-      if (typeof f.frameSeq === 'number' && f.frameSeq > 0 && f.type !== 'outbound.workflow_progress') {
+      if (
+        typeof f.frameSeq === 'number' &&
+        f.frameSeq > 0 &&
+        f.type !== 'outbound.workflow_progress'
+      ) {
         const sess = _resolveSessForFrame(f)
         if (sess) {
           const last = sess._lastFrameSeq || 0
