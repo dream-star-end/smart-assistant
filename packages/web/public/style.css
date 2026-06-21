@@ -5835,15 +5835,19 @@ body.voice-overlay-open {
   -webkit-touch-callout: none;
 }
 .chatgpt-browser-canvas {
-  max-width: 100%;
-  max-height: 100%;
-  width: auto;
-  height: auto;
+  /* Fill the viewport area, letterboxing to preserve the remote aspect ratio —
+     with a per-device viewport the remote already matches, so this is ~full. */
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
   display: block;
   image-rendering: auto;
 }
 /* Invisible focusable textarea covering the canvas — captures keystrokes + IME
-   composition (Chinese) so the canvas-only view still accepts real typing. */
+   composition (Chinese) so the canvas-only view still accepts real typing.
+   pointer-events:none is critical: taps must pass through to the canvas touch
+   handlers, NOT focus this textarea (which would auto-pop the soft keyboard on
+   mobile). It's focused programmatically instead (⌨ button / desktop click). */
 .chatgpt-browser-ime {
   position: absolute;
   inset: 0;
@@ -5859,6 +5863,7 @@ body.voice-overlay-open {
   opacity: 0;
   outline: none;
   overflow: hidden;
+  pointer-events: none;
 }
 .chatgpt-browser-overlay {
   position: absolute;

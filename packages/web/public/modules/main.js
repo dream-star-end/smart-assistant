@@ -1490,6 +1490,8 @@ let _cgbCloseObserver = null
 let _cgbLastMove = 0
 let _cgbDecoding = false
 let _cgbPendingBlob = null
+let _cgbIsTouch = false
+let _cgbLastSentW = 0
 const _cgbPressedKeys = new Set()
 
 function _cgbStatus(text) {
@@ -1515,8 +1517,20 @@ function _cgbSend(obj) {
 function _cgbScaleXY(e) {
   const cv = $('chatgpt-browser-canvas')
   const r = cv.getBoundingClientRect()
-  const x = r.width ? ((e.clientX - r.left) / r.width) * _cgbVW : 0
-  const y = r.height ? ((e.clientY - r.top) / r.height) * _cgbVH : 0
+  // The canvas uses object-fit:contain, so the painted image is letterboxed
+  // inside the element box when aspect ratios differ (e.g. the soft keyboard
+  // shrinks the container height). Map against the actual content rect, not the
+  // full box, or edge taps land off-target.
+  const iw = cv.width || _cgbVW
+  const ih = cv.height || _cgbVH
+  if (!r.width || !r.height || !iw || !ih) return { x: 0, y: 0 }
+  const scale = Math.min(r.width / iw, r.height / ih)
+  const dispW = iw * scale
+  const dispH = ih * scale
+  const offX = r.left + (r.width - dispW) / 2
+  const offY = r.top + (r.height - dispH) / 2
+  const x = ((e.clientX - offX) / dispW) * _cgbVW
+  const y = ((e.clientY - offY) / dispH) * _cgbVH
   return { x: Math.max(0, Math.min(_cgbVW, x)), y: Math.max(0, Math.min(_cgbVH, y)) }
 }
 // Tell the server browser to render at the client viewport size, so the remote
@@ -1526,7 +1540,10 @@ function _cgbSendResize() {
   if (!vp) return
   const w = Math.round(vp.clientWidth)
   const h = Math.round(vp.clientHeight)
-  if (w > 0 && h > 0) _cgbSend({ t: 'resize', w, h })
+  if (w > 0 && h > 0) {
+    _cgbLastSentW = w
+    _cgbSend({ t: 'resize', w, h })
+  }
 }
 function _cgbDrawFrame(blob) {
   const cv = $('chatgpt-browser-canvas')
@@ -1538,25 +1555,30 @@ function _cgbDrawFrame(blob) {
     return
   }
   _cgbDecoding = true
-  createImageBitmap(blob)
-    .then((bmp) => {
-      if (cv.width !== bmp.width || cv.height !== bmp.height) {
-        cv.width = bmp.width
-        cv.height = bmp.height
-      }
-      cv.getContext('2d').drawImage(bmp, 0, 0)
-      bmp.close?.()
-      _cgbOverlay(null)
-    })
-    .catch(() => {})
-    .finally(() => {
-      _cgbDecoding = false
-      if (_cgbPendingBlob) {
-        const b = _cgbPendingBlob
-        _cgbPendingBlob = null
-        _cgbDrawFrame(b)
-      }
-    })
+  // Decode via <img>+objectURL (works on every browser incl. iOS Safari, where
+  // createImageBitmap(Blob) can blank the canvas) instead of createImageBitmap.
+  const url = URL.createObjectURL(blob)
+  const img = new Image()
+  const done = () => {
+    URL.revokeObjectURL(url)
+    _cgbDecoding = false
+    if (_cgbPendingBlob) {
+      const b = _cgbPendingBlob
+      _cgbPendingBlob = null
+      _cgbDrawFrame(b)
+    }
+  }
+  img.onload = () => {
+    if (cv.width !== img.naturalWidth || cv.height !== img.naturalHeight) {
+      cv.width = img.naturalWidth
+      cv.height = img.naturalHeight
+    }
+    cv.getContext('2d').drawImage(img, 0, 0)
+    _cgbOverlay(null)
+    done()
+  }
+  img.onerror = done
+  img.src = url
 }
 function _cgbMapKey(e) {
   if (e.key === ' ') return 'Space'
@@ -1585,7 +1607,10 @@ function _cgbBindInput() {
   })
   vp.addEventListener('mousedown', (e) => {
     e.preventDefault()
-    focusIme()
+    // Desktop click-to-type only. On touch devices a tap's synthesized mousedown
+    // must NOT auto-focus the textarea, or the soft keyboard pops on every tap
+    // (and its resize shrinks the view). The ⌨ button is the touch path.
+    if (!_cgbIsTouch) focusIme()
     const p = _cgbScaleXY(e)
     _cgbSend({ t: 'mouse', kind: 'down', x: p.x, y: p.y, button: e.button })
   })
@@ -1609,6 +1634,7 @@ function _cgbBindInput() {
   vp.addEventListener(
     'touchstart',
     (e) => {
+      _cgbIsTouch = true
       if (e.touches.length !== 1) {
         _touch = null
         return
@@ -1711,11 +1737,16 @@ function _cgbBindInput() {
   document.addEventListener('visibilitychange', () => {
     if (document.hidden) _cgbReleaseKeys()
   })
-  // Re-fit the remote viewport on rotation / window resize (debounced).
+  // Re-fit the remote viewport on rotation / real width change (debounced).
+  // A pure height change (soft keyboard showing/hiding) keeps the same width and
+  // must NOT re-resize the remote — that's what made the view collapse.
   let _rzTimer = null
   const onResize = () => {
     clearTimeout(_rzTimer)
-    _rzTimer = setTimeout(_cgbSendResize, 300)
+    _rzTimer = setTimeout(() => {
+      const el = $('chatgpt-browser-viewport')
+      if (el && Math.round(el.clientWidth) !== _cgbLastSentW) _cgbSendResize()
+    }, 300)
   }
   window.addEventListener('resize', onResize)
   window.addEventListener('orientationchange', onResize)
