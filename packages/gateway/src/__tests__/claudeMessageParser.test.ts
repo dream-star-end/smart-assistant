@@ -432,12 +432,98 @@ describe('ClaudeMessageParser: system', () => {
     assert.equal(events.length, 0)
   })
 
-  it('ignores other system subtypes (e.g. task_progress, init)', () => {
+  it('ignores non-workflow system subtypes (init) and rows without task_id', () => {
     const { parser, events } = createParser()
     parser.parse({ type: 'system', subtype: 'init', session_id: 'x' } as any)
-    parser.parse({ type: 'system', subtype: 'task_progress', task_id: 't1' } as any)
-    parser.parse({ type: 'system', subtype: 'task_started', task_id: 't1' } as any)
+    // task_* without a task_id is not a recognised workflow row → no event.
+    parser.parse({ type: 'system', subtype: 'task_progress' } as any)
     assert.equal(events.length, 0)
+  })
+})
+
+// ── Background-workflow (ultracode) progress side-channel ──
+describe('ClaudeMessageParser: workflow_progress side-channel', () => {
+  it('task_started → workflow_progress{stage:started} with name/tool/description', () => {
+    const { parser, events } = createParser()
+    parser.parse({
+      type: 'system',
+      subtype: 'task_started',
+      task_id: 'w2hh61dpp',
+      tool_use_id: 'toolu_abc',
+      description: 'Run two parallel agents',
+      task_type: 'local_workflow',
+      workflow_name: 'minimal-parallel-ok',
+      prompt: 'export const meta = {...}',
+    } as any)
+    assert.equal(events.length, 1)
+    const e = events[0] as any
+    assert.equal(e.kind, 'workflow_progress')
+    assert.equal(e.stage, 'started')
+    assert.equal(e.taskId, 'w2hh61dpp')
+    assert.equal(e.toolUseId, 'toolu_abc')
+    assert.equal(e.workflowName, 'minimal-parallel-ok')
+    assert.equal(e.description, 'Run two parallel agents')
+  })
+
+  it('task_progress → carries usage (snake→camel) + workflow_progress items', () => {
+    const { parser, events } = createParser()
+    parser.parse({
+      type: 'system',
+      subtype: 'task_progress',
+      task_id: 'w2hh61dpp',
+      tool_use_id: 'toolu_abc',
+      description: 'Run: agent-2',
+      last_tool_name: 'agent-2',
+      summary: 'Run two parallel agents',
+      usage: { total_tokens: 11390, tool_uses: 0, duration_ms: 2136 },
+      workflow_progress: [
+        { type: 'workflow_agent', index: 2, label: 'agent-2', phaseTitle: 'Run', state: 'done' },
+      ],
+    } as any)
+    assert.equal(events.length, 1)
+    const e = events[0] as any
+    assert.equal(e.stage, 'progress')
+    assert.equal(e.lastTool, 'agent-2')
+    assert.deepEqual(e.usage, { totalTokens: 11390, toolUses: 0, durationMs: 2136 })
+    assert.equal(e.items.length, 1)
+    assert.equal(e.items[0].label, 'agent-2')
+    assert.equal(e.items[0].state, 'done')
+  })
+
+  it('tolerates usage/workflow_progress arriving as JSON strings', () => {
+    const { parser, events } = createParser()
+    parser.parse({
+      type: 'system',
+      subtype: 'task_progress',
+      task_id: 't1',
+      usage: '{"total_tokens": 5, "tool_uses": 1, "duration_ms": 99}',
+      workflow_progress: '[{"type":"workflow_phase","index":1,"title":"Run"}]',
+    } as any)
+    const e = events[0] as any
+    assert.deepEqual(e.usage, { totalTokens: 5, toolUses: 1, durationMs: 99 })
+    assert.equal(e.items[0].title, 'Run')
+  })
+
+  it('task_updated{completed} → workflow_progress{stage:updated,status:completed}', () => {
+    const { parser, events } = createParser()
+    parser.parse({
+      type: 'system',
+      subtype: 'task_updated',
+      task_id: 'w2hh61dpp',
+      patch: { status: 'completed', end_time: 1782059427031 },
+    } as any)
+    assert.equal(events.length, 1)
+    const e = events[0] as any
+    assert.equal(e.stage, 'updated')
+    assert.equal(e.status, 'completed')
+  })
+
+  it('workflow_progress is a side-channel: never a block, never finalizes', () => {
+    const { parser, events, getFinished } = createParser()
+    parser.parse({ type: 'system', subtype: 'task_started', task_id: 't1' } as any)
+    parser.parse({ type: 'system', subtype: 'task_updated', task_id: 't1', patch: { status: 'completed' } } as any)
+    assert.equal(getFinished(), false)
+    assert.ok(events.every((e) => e.kind === 'workflow_progress'))
   })
 })
 

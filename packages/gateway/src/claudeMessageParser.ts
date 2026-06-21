@@ -23,6 +23,25 @@ export interface PermissionRequest {
 export type SessionStreamEvent =
   | { kind: 'block'; block: OutboundContentBlock }
   | { kind: 'turn_status'; status: 'compacting' | null }
+  // Background-workflow progress side-channel (ultracode). claude emits these as
+  // `system/task_started|task_progress|task_updated` rows carrying a structured
+  // `workflow_progress` array (phases + parallel agents). Forwarded out-of-band
+  // so the web can render a live workflow card without polluting chat history.
+  | {
+      kind: 'workflow_progress'
+      taskId: string
+      stage: 'started' | 'progress' | 'updated'
+      workflowName?: string
+      toolUseId?: string
+      description?: string
+      summary?: string
+      lastTool?: string
+      usage?: { totalTokens?: number; toolUses?: number; durationMs?: number }
+      /** Parsed `workflow_progress` items: {type:'workflow_phase',...} | {type:'workflow_agent',...} */
+      items?: Array<Record<string, unknown>>
+      /** task_updated patch status, e.g. 'completed'. */
+      status?: string
+    }
   | {
       kind: 'final'
       meta?: {
@@ -268,6 +287,13 @@ export class ClaudeMessageParser {
         this.onEvent({ kind: 'turn_status', status: null })
         return
       }
+      // Background-workflow (ultracode) progress side-channel. claude streams
+      // task_started / task_progress / task_updated rows while a `Workflow` tool
+      // runs in the background. Surface them as workflow_progress events so the
+      // web can render a live phase/agent card. Side-channel only — never a chat
+      // block, never finalizes the turn.
+      const wf = this._parseWorkflowSystem(raw)
+      if (wf) this.onEvent(wf)
       return
     }
 
@@ -309,6 +335,67 @@ export class ClaudeMessageParser {
     // produce no user-visible artifact here today, so surfacing them would
     // require matching protocol + frontend rendering work. Revisit if we
     // add a dedicated bash-progress visualization.
+  }
+
+  /** Map a `system/task_*` row to a workflow_progress event, or null if it isn't
+   *  a recognised background-workflow row. Tolerant of object-or-JSON-string
+   *  shapes for `usage` / `workflow_progress` / `patch`. */
+  private _parseWorkflowSystem(raw: any): SessionStreamEvent | null {
+    const sub = raw?.subtype
+    const taskId = typeof raw?.task_id === 'string' ? raw.task_id : undefined
+    if (!taskId) return null
+    const asObj = (v: unknown): any => {
+      if (v && typeof v === 'object') return v
+      if (typeof v === 'string') {
+        try {
+          return JSON.parse(v)
+        } catch {
+          return undefined
+        }
+      }
+      return undefined
+    }
+    if (sub === 'task_started') {
+      return {
+        kind: 'workflow_progress',
+        taskId,
+        stage: 'started',
+        toolUseId: typeof raw.tool_use_id === 'string' ? raw.tool_use_id : undefined,
+        workflowName: typeof raw.workflow_name === 'string' ? raw.workflow_name : undefined,
+        description: typeof raw.description === 'string' ? raw.description : undefined,
+      }
+    }
+    if (sub === 'task_progress') {
+      const usage = asObj(raw.usage)
+      const items = asObj(raw.workflow_progress)
+      return {
+        kind: 'workflow_progress',
+        taskId,
+        stage: 'progress',
+        toolUseId: typeof raw.tool_use_id === 'string' ? raw.tool_use_id : undefined,
+        description: typeof raw.description === 'string' ? raw.description : undefined,
+        summary: typeof raw.summary === 'string' ? raw.summary : undefined,
+        lastTool: typeof raw.last_tool_name === 'string' ? raw.last_tool_name : undefined,
+        usage: usage
+          ? {
+              totalTokens: typeof usage.total_tokens === 'number' ? usage.total_tokens : undefined,
+              toolUses: typeof usage.tool_uses === 'number' ? usage.tool_uses : undefined,
+              durationMs: typeof usage.duration_ms === 'number' ? usage.duration_ms : undefined,
+            }
+          : undefined,
+        items: Array.isArray(items) ? items : undefined,
+      }
+    }
+    if (sub === 'task_updated') {
+      const patch = asObj(raw.patch)
+      return {
+        kind: 'workflow_progress',
+        taskId,
+        stage: 'updated',
+        status: typeof patch?.status === 'string' ? patch.status : undefined,
+      }
+    }
+    return null
   }
 
   private _handleControlRequest(msg: SdkMessage): void {
