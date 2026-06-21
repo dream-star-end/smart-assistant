@@ -1259,6 +1259,18 @@ export class SessionManager {
         }
       }, IDLE_TIMEOUT_MS)
 
+      // Background-workflow continuation soft cap. After a sub-turn launches a
+      // background Workflow we hold the turn open for the proactive result turn
+      // (re-arm in onFinish). claude normally continues within seconds of the
+      // workflow completing, but it is NOT guaranteed (e.g. the agent deferred to
+      // a far ScheduleWakeup, or the workflow produced no follow-up). Without a
+      // bound the session would sit "thinking" until the 30-min idle cap. So once
+      // continuation-waiting, if the runner goes silent for this long we resolve
+      // GRACEFULLY — no interrupt, the persistent process lives on (any late
+      // continuation simply lands on a future turn).
+      const CONTINUATION_WAIT_MS = 90 * 1000
+      let continuationTimer: ReturnType<typeof setTimeout> | null = null
+
       // Buffer 'final' event — only forward to client after auth check passes
       let pendingFinal: SessionStreamEvent | null = null
       const wrappedOnEvent = (e: SessionStreamEvent) => {
@@ -1311,6 +1323,10 @@ export class SessionManager {
         if (detached) return
         detached = true
         clearTimeout(timer)
+        if (continuationTimer) {
+          clearTimeout(continuationTimer)
+          continuationTimer = null
+        }
         parser.finish()
         // Only clear if still pointing to this turn's parser (prevents race
         // where idle-timeout releases the lock, a new turn starts and sets
@@ -1321,6 +1337,24 @@ export class SessionManager {
         runner.off('error', handleError)
         runner.off('exit', handleExit)
         runner.off('parse_error', handleParseError)
+      }
+
+      // (Re)arm the continuation soft-cap. Called when a sub-turn re-arms for a
+      // background-workflow continuation, and refreshed on every runner message
+      // while waiting. Fires only if the runner goes fully silent past the cap —
+      // resolves gracefully (no interrupt; process kept alive).
+      const armContinuationTimer = () => {
+        if (continuationTimer) clearTimeout(continuationTimer)
+        continuationTimer = setTimeout(() => {
+          if (detached) return
+          log.info('background-workflow continuation wait timed out — resolving gracefully', {
+            sessionKey: session.sessionKey,
+          })
+          if (pendingFinal) onEvent(pendingFinal)
+          onEvent({ kind: 'final' })
+          detach()
+          settle(() => resolve())
+        }, CONTINUATION_WAIT_MS)
       }
 
       // Parser config is reused to re-arm a fresh parser on each background-
@@ -1660,7 +1694,10 @@ export class SessionManager {
             if (session._currentParser === parser) session._currentParser = undefined
             parser = new ClaudeMessageParser(parserConfig)
             session._currentParser = parser
-            if (!detached) timer.refresh()
+            if (!detached) {
+              timer.refresh()
+              armContinuationTimer()
+            }
             return
           }
           detach()
@@ -1678,7 +1715,12 @@ export class SessionManager {
         // detach 后跳过 timer.refresh():Node Timer.refresh() 即使已 clearTimeout
         // 也会重新 arm,会让旧 turn 的 idle 回调在 30 分钟后被无意义地触发
         // (回调内有 !parser.finalized 守卫所以是 no-op,但还是不要触发更干净)。
-        if (!detached) timer.refresh()
+        if (!detached) {
+          timer.refresh()
+          // Any runner output (workflow progress, the continuation turn itself)
+          // resets the continuation soft-cap so it only fires on true silence.
+          if (continuationTimer) armContinuationTimer()
+        }
         parser.parse(msg)
       }
       const handleError = (err: Error) => {

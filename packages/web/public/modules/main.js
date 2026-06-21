@@ -155,7 +155,7 @@ import {
   updateMessage,
   updateMsgStatus,
   updateSendEnabled,
-} from './websocket.js?v=50'
+} from './websocket.js?v=51'
 
 // ── Slash commands ──
 import {

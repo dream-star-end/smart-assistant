@@ -1081,7 +1081,15 @@ export function connect() {
       // protocol — otherwise gateway would re-replay them on every reconnect.
       // Sess unresolved (unknown peer) → leave cursor untouched and let the
       // type-specific handler decide whether to warn or silently ignore.
-      if (typeof f.frameSeq === 'number' && f.frameSeq > 0) {
+      //
+      // EXEMPTION: `outbound.workflow_progress` is an idempotent, order-tolerant
+      // side-channel (live workflow card). Under the redis-backed async frame bus
+      // a later message frame (e.g. the continuation result, higher frameSeq) can
+      // land before a delayed earlier progress frame — gating those by the cursor
+      // would silently drop the agent done/completed updates (card stuck at
+      // "running"). It neither participates in replay dedup nor advances the
+      // cursor; the handler merges every snapshot it sees.
+      if (typeof f.frameSeq === 'number' && f.frameSeq > 0 && f.type !== 'outbound.workflow_progress') {
         const sess = _resolveSessForFrame(f)
         if (sess) {
           const last = sess._lastFrameSeq || 0
