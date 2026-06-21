@@ -102,6 +102,10 @@ class BrowserSession {
     this.launching = null
     this.closing = null
     this.gen = 0
+    // Render size, mutable per the client viewport (portrait phone vs desktop).
+    this.vw = VW
+    this.vh = VH
+    this.resizeSeq = 0
   }
 
   async ensure() {
@@ -126,7 +130,7 @@ class BrowserSession {
     const context = await chromium.launchPersistentContext(this.profileDir, {
       headless: false,
       proxy: PROXY ? { server: PROXY } : undefined,
-      viewport: { width: VW, height: VH },
+      viewport: { width: this.vw, height: this.vh },
       args: [
         '--no-sandbox',
         '--disable-dev-shm-usage',
@@ -177,10 +181,41 @@ class BrowserSession {
     await cdp.send('Page.startScreencast', {
       format: 'jpeg',
       quality: JPEG_QUALITY,
-      maxWidth: VW,
-      maxHeight: VH,
+      maxWidth: this.vw,
+      maxHeight: this.vh,
       everyNthFrame: 1,
     })
+  }
+
+  /** Resize the remote viewport to match the client (portrait phone, etc.) and
+   *  restart the screencast at the new size. Clamped + no-op on no change. */
+  async resize(w, h) {
+    const vw = Math.max(320, Math.min(2048, Math.round(num(w))))
+    const vh = Math.max(320, Math.min(2048, Math.round(num(h))))
+    if (!this.page || (vw === this.vw && vh === this.vh)) return
+    // latest-wins: a newer resize (orientation jitter) bumps the seq and any
+    // older in-flight resize bails out, so we never settle on a stale size.
+    const seq = ++this.resizeSeq
+    this.vw = vw
+    this.vh = vh
+    try {
+      await this.page.setViewportSize({ width: vw, height: vh })
+      if (seq !== this.resizeSeq) return
+      if (this.cdp) {
+        await this.cdp.send('Page.stopScreencast').catch(() => {})
+        if (seq !== this.resizeSeq) return
+        await this.cdp.send('Page.startScreencast', {
+          format: 'jpeg',
+          quality: JPEG_QUALITY,
+          maxWidth: vw,
+          maxHeight: vh,
+          everyNthFrame: 1,
+        })
+      }
+    } catch {}
+    if (seq === this.resizeSeq) {
+      for (const ws of this.viewers) sendJson(ws, { t: 'size', w: vw, h: vh })
+    }
   }
 
   _pushFrame(ws) {
@@ -197,7 +232,7 @@ class BrowserSession {
       clearTimeout(this.idleTimer)
       this.idleTimer = null
     }
-    sendJson(ws, { t: 'size', w: VW, h: VH })
+    sendJson(ws, { t: 'size', w: this.vw, h: this.vh })
     if (this.page) sendJson(ws, { t: 'url', url: this.page.url() })
     sendJson(ws, { t: 'status', state: 'ready' })
     if (this.latestFrame) this._pushFrame(ws)
@@ -218,8 +253,8 @@ class BrowserSession {
     if (!page) return
     try {
       if (msg.t === 'mouse') {
-        const x = clampNum(msg.x, 0, VW)
-        const y = clampNum(msg.y, 0, VH)
+        const x = clampNum(msg.x, 0, this.vw)
+        const y = clampNum(msg.y, 0, this.vh)
         if (msg.kind === 'move') await page.mouse.move(x, y)
         else if (msg.kind === 'down') {
           await page.mouse.move(x, y)
@@ -232,7 +267,7 @@ class BrowserSession {
       } else if (msg.t === 'text') {
         if (typeof msg.text === 'string' && msg.text) await page.keyboard.insertText(msg.text)
       } else if (msg.t === 'resize') {
-        // MVP: fixed render size; the frontend letterboxes.
+        await this.resize(msg.w, msg.h)
       } else if (msg.t === 'nav') {
         if (msg.action === 'reload') await page.reload().catch(() => {})
         else if (msg.action === 'back') await page.goBack().catch(() => {})

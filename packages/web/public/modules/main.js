@@ -1519,6 +1519,15 @@ function _cgbScaleXY(e) {
   const y = r.height ? ((e.clientY - r.top) / r.height) * _cgbVH : 0
   return { x: Math.max(0, Math.min(_cgbVW, x)), y: Math.max(0, Math.min(_cgbVH, y)) }
 }
+// Tell the server browser to render at the client viewport size, so the remote
+// page lays out for the actual device (portrait phone gets ChatGPT mobile).
+function _cgbSendResize() {
+  const vp = $('chatgpt-browser-viewport')
+  if (!vp) return
+  const w = Math.round(vp.clientWidth)
+  const h = Math.round(vp.clientHeight)
+  if (w > 0 && h > 0) _cgbSend({ t: 'resize', w, h })
+}
 function _cgbDrawFrame(blob) {
   const cv = $('chatgpt-browser-canvas')
   if (!cv) return
@@ -1594,6 +1603,70 @@ function _cgbBindInput() {
     },
     { passive: false },
   )
+  // Touch: single-finger tap = click, drag = scroll. preventDefault also
+  // suppresses the browser's synthesized mouse events so we don't double-fire.
+  let _touch = null
+  vp.addEventListener(
+    'touchstart',
+    (e) => {
+      if (e.touches.length !== 1) {
+        _touch = null
+        return
+      }
+      e.preventDefault()
+      const t = e.touches[0]
+      const p = _cgbScaleXY(t)
+      _touch = {
+        x: p.x,
+        y: p.y,
+        sx: t.clientX,
+        sy: t.clientY,
+        lx: t.clientX,
+        ly: t.clientY,
+        t0: performance.now(),
+        moved: false,
+      }
+      _cgbSend({ t: 'mouse', kind: 'move', x: p.x, y: p.y })
+    },
+    { passive: false },
+  )
+  vp.addEventListener('touchcancel', () => {
+    _touch = null
+  })
+  vp.addEventListener(
+    'touchmove',
+    (e) => {
+      if (!_touch) return
+      if (e.touches.length !== 1) {
+        _touch = null
+        return
+      }
+      e.preventDefault()
+      const t = e.touches[0]
+      const dx = t.clientX - _touch.lx
+      const dy = t.clientY - _touch.ly
+      _touch.lx = t.clientX
+      _touch.ly = t.clientY
+      if (Math.abs(t.clientX - _touch.sx) > 8 || Math.abs(t.clientY - _touch.sy) > 8)
+        _touch.moved = true
+      // Natural scroll: drag down → reveal content above (wheel up).
+      if (_touch.moved) _cgbSend({ t: 'mouse', kind: 'wheel', dx: -dx, dy: -dy })
+    },
+    { passive: false },
+  )
+  vp.addEventListener(
+    'touchend',
+    (e) => {
+      if (!_touch) return
+      e.preventDefault()
+      if (!_touch.moved && performance.now() - _touch.t0 < 500) {
+        _cgbSend({ t: 'mouse', kind: 'down', x: _touch.x, y: _touch.y, button: 0 })
+        _cgbSend({ t: 'mouse', kind: 'up', x: _touch.x, y: _touch.y, button: 0 })
+      }
+      _touch = null
+    },
+    { passive: false },
+  )
   // Printable text + IME composition flow through the hidden textarea's input;
   // control keys and modifier combos go through key down/up (so e.g. Ctrl+A
   // works: Control-down then a-down are both forwarded).
@@ -1638,6 +1711,14 @@ function _cgbBindInput() {
   document.addEventListener('visibilitychange', () => {
     if (document.hidden) _cgbReleaseKeys()
   })
+  // Re-fit the remote viewport on rotation / window resize (debounced).
+  let _rzTimer = null
+  const onResize = () => {
+    clearTimeout(_rzTimer)
+    _rzTimer = setTimeout(_cgbSendResize, 300)
+  }
+  window.addEventListener('resize', onResize)
+  window.addEventListener('orientationchange', onResize)
 }
 function stopChatgptBrowser() {
   _cgbReleaseKeys()
@@ -1692,6 +1773,7 @@ async function startChatgptBrowser() {
         _cgbStatus('启动中…')
       } else if (m.state === 'ready') {
         _cgbStatus('已连接 · 真实浏览器(点击画面开始操作)')
+        _cgbSendResize() // fit the remote viewport to this device
       } else if (m.state === 'closed' || m.state === 'error') {
         _cgbOverlay(`浏览器已关闭:${m.message || ''} · 点「刷新」重连`)
         _cgbStatus('已断开')
@@ -1981,6 +2063,14 @@ async function init() {
   $('chatgpt-web-refresh-btn').onclick = refreshChatGptWebFrame
   $('chatgpt-browser-back-btn').onclick = () => _cgbSend({ t: 'nav', action: 'back' })
   $('chatgpt-browser-home-btn').onclick = () => _cgbSend({ t: 'nav', action: 'home' })
+  // Mobile: focus the hidden textarea from a real user gesture so iOS shows the
+  // soft keyboard (then typing flows to the focused remote input).
+  $('chatgpt-browser-keyboard-btn').onclick = () => {
+    const ime = $('chatgpt-browser-ime')
+    try {
+      ime.focus({ preventScroll: true })
+    } catch {}
+  }
   $('chatgpt-browser-restart-btn').onclick = () => {
     _cgbSend({ t: 'restart' })
     _cgbOverlay('重启中…')
