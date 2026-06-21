@@ -246,6 +246,51 @@ describe('ChatGPT web proxy sidecar upstream headers', () => {
       'Bearer up',
     )
   })
+
+  it('drops proxy/CDN-injected headers (cf-*, x-forwarded-*) so the upstream CF never sees spoofed edge headers', () => {
+    const base = target('/api/chatgpt-web/https/chatgpt.com/')
+    // Exactly the set cloudflared's trycloudflare tunnel injects in front of the
+    // gateway — forwarding these to chatgpt.com (also behind Cloudflare) hard-403s.
+    const headers = buildChatGptSidecarUpstreamHeaders(
+      {
+        'cf-connecting-ip': '203.0.113.7',
+        'cf-visitor': '{"scheme":"https"}',
+        'cf-ray': '8abcdeadbeef-NRT',
+        'cf-ipcountry': 'CN',
+        'cdn-loop': 'cloudflare; loops=1',
+        'x-forwarded-for': '203.0.113.7',
+        'x-forwarded-proto': 'https',
+        'x-real-ip': '203.0.113.7',
+        'true-client-ip': '203.0.113.7',
+        forwarded: 'for=203.0.113.7',
+        accept: 'text/html',
+      },
+      base,
+    )
+    for (const dropped of [
+      'cf-connecting-ip',
+      'cf-visitor',
+      'cf-ray',
+      'cf-ipcountry',
+      'cdn-loop',
+      'x-forwarded-for',
+      'x-forwarded-proto',
+      'x-real-ip',
+      'true-client-ip',
+      'forwarded',
+    ]) {
+      assert.equal(headers[dropped], undefined, `${dropped} must not be forwarded upstream`)
+    }
+    assert.equal(headers.accept, 'text/html') // real headers still pass
+
+    // The direct (non-sidecar) builder shares the same helper — guard it too.
+    const direct = buildChatGptProxyUpstreamHeaders(
+      { 'cf-connecting-ip': '203.0.113.7', 'x-forwarded-for': '203.0.113.7' },
+      base,
+    )
+    assert.equal(direct['cf-connecting-ip'], undefined)
+    assert.equal(direct['x-forwarded-for'], undefined)
+  })
 })
 
 describe('ChatGPT web proxy sidecar request body', () => {

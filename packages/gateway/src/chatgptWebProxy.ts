@@ -78,6 +78,24 @@ interface ChatGptWebProxyDeps {
 const SIDECAR_FINGERPRINT_HEADERS = new Set(['user-agent', 'accept-language', 'accept-encoding'])
 const SIDECAR_FINGERPRINT_PREFIXES = ['sec-ch-', 'sec-fetch-']
 
+// Headers injected by reverse proxies / CDN tunnels in front of the gateway
+// (cloudflared adds CF-Connecting-IP / CF-Visitor / CF-RAY / CF-IPCountry, etc.).
+// They MUST NOT be forwarded upstream: chatgpt.com is itself behind Cloudflare,
+// and an inbound request carrying CF-* edge headers looks spoofed/looped and is
+// hard-403'd (this is exactly why the embed failed only through the public
+// trycloudflare tunnel, not over direct localhost). Also avoids leaking the
+// real client IP / geo to OpenAI.
+function isProxyInjectedRequestHeader(lower: string): boolean {
+  return (
+    lower.startsWith('cf-') ||
+    lower.startsWith('x-forwarded-') ||
+    lower === 'forwarded' ||
+    lower === 'cdn-loop' ||
+    lower === 'x-real-ip' ||
+    lower === 'true-client-ip'
+  )
+}
+
 function isAllowedChatGptProxyHost(host: string): boolean {
   return ALLOWED_ROOT_DOMAINS.some((root) => host === root || host.endsWith(`.${root}`))
 }
@@ -277,7 +295,7 @@ export function buildChatGptProxyUpstreamHeaders(
     if (lower === 'origin') continue
     if (lower === 'referer') continue
     if (lower === 'accept-encoding') continue
-    if (lower.startsWith('x-forwarded-')) continue
+    if (isProxyInjectedRequestHeader(lower)) continue
     const copied = copyHeaderValue(value)
     if (copied !== undefined) headers[name] = copied
   }
@@ -316,7 +334,7 @@ export function buildChatGptSidecarUpstreamHeaders(
     if (lower === 'origin') continue
     if (lower === 'referer') continue
     if (lower === 'authorization' && !options.forwardAuthorization) continue
-    if (lower.startsWith('x-forwarded-')) continue
+    if (isProxyInjectedRequestHeader(lower)) continue
     if (SIDECAR_FINGERPRINT_HEADERS.has(lower)) continue
     if (SIDECAR_FINGERPRINT_PREFIXES.some((prefix) => lower.startsWith(prefix))) continue
     const copied = copyHeaderValue(value)
