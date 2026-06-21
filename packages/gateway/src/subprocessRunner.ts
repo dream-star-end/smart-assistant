@@ -49,9 +49,10 @@ export interface SubprocessRunnerOpts {
   agentMcpServers?: McpServerConfig[] // agent 专属 MCP servers
   agentToolsets?: string[] // resolved toolsets for this agent (filters MCP servers)
   delegationDepth?: number // current delegation recursion depth (0 = top-level)
-  // Optional effort level passed via the official `--effort <level>` flag.
-  // When undefined, no flag is set and claude falls back to its model-default
-  // effort. Only set values claude recognises — 'low'|'medium'|'high'|'xhigh'|'max'.
+  // Optional logical effort level. Mapped to argv in buildClaudeCliArgs:
+  // 'low'|'medium'|'high'|'xhigh'|'max' → `--effort <level>`; 'ultracode' →
+  // `--effort xhigh` + `--settings {"ultracode":true}`. undefined → no flag
+  // (claude uses its model-default effort).
   effortLevel?: string
   /**
    * Effective egress proxy URL for this claude subprocess (per-agent override
@@ -108,7 +109,8 @@ export type PermissionResponse =
  */
 export interface ClaudeCliArgsInput {
   model?: string
-  /** Effort level → official `--effort <level>` flag ('low'|'medium'|'high'|'xhigh'|'max'). */
+  /** Logical effort level → argv. 'low'|'medium'|'high'|'xhigh'|'max' map to
+   *  `--effort <level>`; 'ultracode' → `--effort xhigh` + `--settings {"ultracode":true}`. */
   effortLevel?: string
   permissionMode?: string
   extraPromptFile?: string
@@ -147,7 +149,18 @@ export function buildClaudeCliArgs(input: ClaudeCliArgsInput): string[] {
   if (model) args.push('--model', model)
   // Effort moved from CCB's CLAUDE_CODE_EFFORT_LEVEL env to the official
   // `--effort` flag. Omitted → claude uses its model-default effort.
-  if (effortLevel) args.push('--effort', effortLevel)
+  //   'ultracode' is NOT a valid --effort value (the CLI warns + ignores it).
+  //   It is xhigh reasoning + a standing multi-agent Workflow orchestration
+  //   session setting, so translate it here: --effort xhigh + `--settings`
+  //   (highest-precedence MERGE layer; only adds the ultracode key, leaves the
+  //   ambient settings.json untouched). The runner keeps storing the logical
+  //   'ultracode' value (so setEffortLevel/recycle compare correctly).
+  if (effortLevel === 'ultracode') {
+    args.push('--effort', 'xhigh')
+    args.push('--settings', JSON.stringify({ ultracode: true }))
+  } else if (effortLevel) {
+    args.push('--effort', effortLevel)
+  }
   if (permissionMode) {
     args.push('--permission-mode', permissionMode)
     // bypassPermissions 需要配合 --dangerously-skip-permissions 才真正放行所有工具

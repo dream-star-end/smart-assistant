@@ -39,11 +39,12 @@ export const InboundMessage = Type.Object({
     media: Type.Optional(Type.Array(MediaRef)),
   }),
   replyToId: Type.Optional(Type.String()),
-  // Effort/reasoning-depth override for this session (一般来自 Web 前端的思考深度 pill,低/中/高/极高/最高)。
-  //   - 字符串 ∈ EFFORT_LEVELS:CCB 写 CLAUDE_CODE_EFFORT_LEVEL; Codex 写 model_reasoning_effort(支持的取值)
+  // Effort/reasoning-depth override for this session (一般来自 Web 前端的思考深度选择器,低/中/高/极高/最高/多agent工作流)。
+  //   - 字符串 ∈ EFFORT_LEVELS:CCB 写 --effort; Codex 写 model_reasoning_effort(支持的取值)
+  //     'ultracode' 是复合档:runner 翻译成 --effort xhigh + ultracode 会话设置(xhigh + Workflow 编排),仅 claude 链路。
   //   - null:**显式清除** — 让 gateway 把已有 runner 的 effort env 复位到模型默认
   //   - 字段缺省 (undefined):什么也不做 (其他 channel 默认行为)
-  // 区分 null 与缺省是为了让 Web pill 的"取消选中"能反向取消之前的 xhigh/max,
+  // 区分 null 与缺省是为了让 Web 选择器的"回默认"能反向取消之前的 xhigh/max/ultracode,
   // 否则一旦升过档就回不去模型默认了。
   effortLevel: Type.Optional(
     Type.Union([
@@ -53,6 +54,7 @@ export const InboundMessage = Type.Object({
       Type.Literal('high'),
       Type.Literal('xhigh'),
       Type.Literal('max'),
+      Type.Literal('ultracode'),
     ]),
   ),
   // Per-session model override (来自 Web 前端的模型选择器)。提供时 gateway 把已有

@@ -16,7 +16,7 @@
 <link rel="apple-touch-icon" href="/icon.svg" />
 <link rel="stylesheet" href="/vendor/github-dark.min.css" />
 <link rel="stylesheet" href="/vendor/katex/katex.min.css" />
-<link rel="stylesheet" href="/style.css?v=64" />
+<link rel="stylesheet" href="/style.css?v=65" />
 <link rel="stylesheet" href="/vendor/xterm/xterm.css?v=1" />
 <style>/* Inline styles removed — see style.css */
 </style>
@@ -159,73 +159,39 @@
     <footer class="composer">
       <div class="composer-inner">
         <div id="attachments" class="attachments" hidden></div>
-        <div id="composer-model" class="composer-model" hidden>
-          <button
-            type="button"
-            id="model-trigger"
-            class="mode-pill mode-pill--trigger"
-            aria-haspopup="listbox"
-            aria-expanded="false"
-            aria-controls="model-menu"
-            title="选择本会话使用的模型(仅覆盖当前会话,不改 agent 默认)"
-          >
-            <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="4" width="16" height="16" rx="2"/><path d="M9 9h6v6H9z"/><path d="M9 1v3M15 1v3M9 20v3M15 20v3M1 9h3M1 15h3M20 9h3M20 15h3"/></svg>
-            <span id="model-label">模型</span>
-            <svg class="mode-pill-caret" viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="6 9 12 15 18 9"/></svg>
-          </button>
-          <div id="model-menu" class="model-menu" role="listbox" aria-labelledby="model-trigger" hidden></div>
-        </div>
-        <div id="composer-modes" class="composer-modes" hidden role="group" aria-label="思考深度">
-          <button
-            type="button"
-            id="mode-pill-low"
-            class="mode-pill"
-            data-effort="low"
-            aria-pressed="false"
-            title="最低思考深度,响应最快,适合简单问题"
-          >
-            <span>低</span>
-          </button>
-          <button
-            type="button"
-            id="mode-pill-medium"
-            class="mode-pill"
-            data-effort="medium"
-            aria-pressed="false"
-            title="标准思考深度,速度与推理平衡"
-          >
-            <span>中</span>
-          </button>
-          <button
-            type="button"
-            id="mode-pill-high"
-            class="mode-pill"
-            data-effort="high"
-            aria-pressed="false"
-            title="较高思考深度,适合复杂任务"
-          >
-            <span>高</span>
-          </button>
-          <button
-            type="button"
-            id="mode-pill-xhigh"
-            class="mode-pill"
-            data-effort="xhigh"
-            aria-pressed="false"
-            title="极高思考深度,适合长链路代理任务、复杂工程改造"
-          >
-            <span>极高</span>
-          </button>
-          <button
-            type="button"
-            id="mode-pill-max"
-            class="mode-pill"
-            data-effort="max"
-            aria-pressed="false"
-            title="最高思考深度,启用高严谨度守则;延迟与 token 用量显著上升"
-          >
-            <span>最高</span>
-          </button>
+        <div class="composer-controls">
+          <div id="composer-model" class="composer-model" hidden>
+            <button
+              type="button"
+              id="model-trigger"
+              class="mode-pill mode-pill--trigger"
+              aria-haspopup="listbox"
+              aria-expanded="false"
+              aria-controls="model-menu"
+              title="选择本会话使用的模型(仅覆盖当前会话,不改 agent 默认)"
+            >
+              <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="4" width="16" height="16" rx="2"/><path d="M9 9h6v6H9z"/><path d="M9 1v3M15 1v3M9 20v3M15 20v3M1 9h3M1 15h3M20 9h3M20 15h3"/></svg>
+              <span id="model-label">模型</span>
+              <svg class="mode-pill-caret" viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="6 9 12 15 18 9"/></svg>
+            </button>
+            <div id="model-menu" class="model-menu" role="listbox" aria-labelledby="model-trigger" hidden></div>
+          </div>
+          <div id="composer-effort" class="composer-effort" hidden>
+            <button
+              type="button"
+              id="effort-trigger"
+              class="mode-pill mode-pill--trigger"
+              aria-haspopup="listbox"
+              aria-expanded="false"
+              aria-controls="effort-menu"
+              title="选择本会话的思考深度(仅覆盖当前会话)"
+            >
+              <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m12 14 4-4"/><path d="M3.34 19a10 10 0 1 1 17.32 0"/></svg>
+              <span id="effort-label">思考深度</span>
+              <svg class="mode-pill-caret" viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="6 9 12 15 18 9"/></svg>
+            </button>
+            <div id="effort-menu" class="model-menu" role="listbox" aria-labelledby="effort-trigger" hidden></div>
+          </div>
         </div>
         <div class="composer-input-row">
           <button id="voice-keyboard-btn" type="button" class="voice-keyboard-btn" title="切回键盘输入" aria-label="切回键盘输入">
@@ -924,6 +890,6 @@
 <script src="/vendor/katex/katex.min.js" defer></script>
 <script src="/vendor/qrcode.min.js"></script>
 <div id="toast" class="toast"></div>
-<script type="module" src="/modules/main.js?v=77"></script>
+<script type="module" src="/modules/main.js?v=78"></script>
 </body>
 </html>

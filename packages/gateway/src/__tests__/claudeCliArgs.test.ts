@@ -73,6 +73,19 @@ describe('buildClaudeCliArgs', () => {
     assert.ok(hasFlagWithValue(args, '--effort', 'xhigh'))
   })
 
+  it('translates effortLevel=ultracode → --effort xhigh + --settings {"ultracode":true}', () => {
+    // 'ultracode' is NOT a valid --effort value (the CLI warns + ignores it).
+    // It is xhigh reasoning + the ultracode session setting (Workflow 编排).
+    const args = buildClaudeCliArgs({ effortLevel: 'ultracode' })
+    assert.ok(hasFlagWithValue(args, '--effort', 'xhigh'), 'ultracode must map to --effort xhigh')
+    assert.ok(
+      hasFlagWithValue(args, '--settings', JSON.stringify({ ultracode: true })),
+      'ultracode must enable the ultracode session setting via --settings',
+    )
+    // The raw, CLI-rejected value must never reach --effort.
+    assert.equal(hasFlagWithValue(args, '--effort', 'ultracode'), false)
+  })
+
   it('omits --effort when effortLevel is falsy (model default)', () => {
     for (const e of [null, undefined, '']) {
       const args = buildClaudeCliArgs({ effortLevel: e as string | undefined })

@@ -31,6 +31,7 @@ import type {
 import {
   type AgentDef,
   type AgentsConfig,
+  EFFORT_LEVELS,
   MemoryStore,
   type OpenClaudeConfig,
   SkillStore,
@@ -5911,7 +5912,9 @@ export class Gateway {
     //   - 合法 string → 透传
     //   - null      → 透传(显式清除已有 effort,让 runner 回到模型默认)
     //   - 其它(包括字段缺省) → 不传给 sessionManager,保持现有 runner 不动
-    const _effortAllow = new Set(['low', 'medium', 'high', 'xhigh', 'max'])
+    // Single authority: EFFORT_LEVELS (storage/config.ts) — not a parallel
+    // hardcoded set that drifts when a level is added (e.g. 'ultracode').
+    const _effortAllow = new Set<string>(EFFORT_LEVELS)
     const _frameEffort = (frame as any).effortLevel
     let safeEffortLevel: string | null | undefined
     if (_frameEffort === null) {

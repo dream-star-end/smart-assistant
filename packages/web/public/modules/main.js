@@ -90,7 +90,7 @@ import {
   reloadAgents,
   renderAgentDropdown,
   renderAgentsManagementList,
-} from './agents.js?v=7'
+} from './agents.js?v=8'
 
 // ── Sessions ──
 import {
@@ -127,7 +127,7 @@ import {
   setMessageDeps,
   updateMessageEl,
   updateSessionSub,
-} from './messages.js?v=46'
+} from './messages.js?v=47'
 
 // ── WebSocket ──
 import {
@@ -169,7 +169,7 @@ import {
   showSlashPopup,
   slashPopupVisible,
 } from './commands.js?v=9'
-import { getEffortForSubmit, initModePills, renderModePills } from './effortMode.js?v=2'
+import { getEffortForSubmit, initEffortPicker, renderEffortPicker } from './effortMode.js?v=3'
 import {
   getGoalModeForSubmit,
   initGoalModePanel,
@@ -652,9 +652,9 @@ initOfficialClaudeTerminal()
 // ── 思考深度 pills: bind once + render initial visibility ──
 // 完整可见性由 agent.model 决定,真正的渲染会在 reloadAgents → renderAgentDropdown 内
 // 再触发一次;这里只是绑定点击事件并把初始隐藏态打上去。
-initModePills()
+initEffortPicker()
 // 模型选择器:绑定一次。onChange 在切换 model 后联动重渲 effort 档位(model 决定可调档位)。
-initModelPicker({ onChange: renderModePills })
+initModelPicker({ onChange: renderEffortPicker })
 initPlanPanel()
 initGoalModePanel()
 
@@ -2014,8 +2014,8 @@ async function init() {
     sess.agentId = e.target.value
     // 模型选择器先刷(切 agent → 默认 model/可选项变);effort 再刷(档位依赖生效 model)。
     renderModelPicker()
-    // Pill 跟着新 agent 的生效 model 走 — 不支持思考深度的 model 自动隐藏。
-    renderModePills()
+    // 思考深度选择器跟着新 agent 的生效 model 走 — 不支持的 model 自动隐藏。
+    renderEffortPicker()
     renderGoalModePanel({ autoRefresh: true })
     // Mark switch time — handleOutbound will ignore frames arriving before this
     sess._agentSwitchedAt = Date.now()

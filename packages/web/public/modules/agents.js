@@ -1,7 +1,7 @@
 import { apiGet, apiJson } from './api.js'
 // OpenClaude — Agents
 import { $, htmlSafeEscape } from './dom.js'
-import { renderModePills } from './effortMode.js?v=2'
+import { renderEffortPicker } from './effortMode.js?v=3'
 import { renderGoalModePanel } from './goalMode.js?v=3'
 import { renderModelPicker } from './modelMode.js?v=1'
 import { getSession, state } from './state.js'
@@ -37,8 +37,8 @@ export function renderAgentDropdown() {
   // 模型选择器选项随 agent 默认 model 变;agent 列表/会话切换后刷新。先于 effort,
   // 因为 effort 档位依赖"当前生效 model"(可能是模型选择器里的覆盖值)。
   renderModelPicker()
-  // Pill 可见性依赖当前生效 model — 任何 agent 列表/会话切换后都要刷新一次。
-  renderModePills()
+  // 思考深度选择器可见性/档位依赖当前生效 model — 任何 agent 列表/会话切换后都要刷新一次。
+  renderEffortPicker()
   // Goal 模式只对 codex-native app-server agent 可见。
   renderGoalModePanel({ autoRefresh: true })
 }
