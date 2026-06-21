@@ -26,6 +26,10 @@ import {
   EMPTY_TURN_ANSWER_ROLES,
   ANSWER_BLOCK_KINDS,
   countAnswerBlocks,
+  AUTO_CONTINUE_PROMPT,
+  AUTO_CONTINUE_DISPLAY,
+  isAutoContinueMsg,
+  shouldAutoContinueEmptyTurn,
 } from '../public/modules/emptyTurn.js'
 
 const user = (id: string) => ({ id, role: 'user' })
@@ -214,5 +218,76 @@ describe('websocket.js — THINKING_SAFETY timeout: liveness-aware and never sil
     const calls = (WS.match(/classifyEmptyTurn\(\{/g) || []).length
     assert.equal(calls, 1, 'exactly one classifyEmptyTurn call (post-render consumer)')
     assert.match(WS, /if \(_deferredEmptyNotice\) \{[\s\S]{0,260}classifyEmptyTurn\(\{/)
+  })
+})
+
+const u = (id: string) => ({ id, role: 'user' })
+const autoUser = (id: string) => ({
+  id,
+  role: 'user',
+  _isAutoRetry: true,
+  _modelText: AUTO_CONTINUE_PROMPT,
+  text: AUTO_CONTINUE_DISPLAY,
+})
+
+describe('isAutoContinueMsg — recoverable across flag loss', () => {
+  it('recognizes by _isAutoRetry flag', () => {
+    assert.equal(isAutoContinueMsg({ role: 'user', _isAutoRetry: true }), true)
+  })
+  it('recognizes by persisted _modelText prompt (flag lost after server-wins sync)', () => {
+    assert.equal(isAutoContinueMsg({ role: 'user', _modelText: AUTO_CONTINUE_PROMPT }), true)
+  })
+  it('recognizes by display text', () => {
+    assert.equal(isAutoContinueMsg({ role: 'user', text: AUTO_CONTINUE_DISPLAY }), true)
+  })
+  it('ordinary message / null → false', () => {
+    assert.equal(isAutoContinueMsg({ role: 'user', text: '你好' }), false)
+    assert.equal(isAutoContinueMsg(null), false)
+  })
+})
+
+describe('shouldAutoContinueEmptyTurn — only end_turn, capped once', () => {
+  it('end_turn + plain target + nothing after → true', () => {
+    const messages = [u('u1'), { id: 't1', role: 'thinking' }]
+    assert.equal(shouldAutoContinueEmptyTurn({ messages, targetMsgId: 'u1', stopReason: 'end_turn' }), true)
+  })
+
+  it('non-end_turn stop reasons → false', () => {
+    const messages = [u('u1'), { id: 't1', role: 'thinking' }]
+    for (const sr of ['max_tokens', 'pause_turn', 'refusal', 'tool_use', 'stop_sequence', null, undefined]) {
+      assert.equal(
+        shouldAutoContinueEmptyTurn({ messages, targetMsgId: 'u1', stopReason: sr as string }),
+        false,
+        `stopReason ${sr} must not auto-continue`,
+      )
+    }
+  })
+
+  it('target IS an auto-continue → false (chain cap, no infinite loop)', () => {
+    const messages = [u('u0'), autoUser('u1')]
+    assert.equal(shouldAutoContinueEmptyTurn({ messages, targetMsgId: 'u1', stopReason: 'end_turn' }), false)
+  })
+
+  it('an auto-continue user already follows target → false (already retried; replay guard)', () => {
+    const messages = [u('u1'), { id: 't1', role: 'thinking' }, autoUser('u2')]
+    assert.equal(shouldAutoContinueEmptyTurn({ messages, targetMsgId: 'u1', stopReason: 'end_turn' }), false)
+  })
+
+  it('cap survives _isAutoRetry flag loss — recognized via persisted _modelText', () => {
+    // server-authored replay drops the client-only flag but keeps text/_modelText
+    const followed = { id: 'u2', role: 'user', _modelText: AUTO_CONTINUE_PROMPT }
+    const messages = [u('u1'), followed]
+    assert.equal(shouldAutoContinueEmptyTurn({ messages, targetMsgId: 'u1', stopReason: 'end_turn' }), false)
+  })
+
+  it('target missing / messages not array → false', () => {
+    assert.equal(
+      shouldAutoContinueEmptyTurn({ messages: [u('u1')], targetMsgId: 'nope', stopReason: 'end_turn' }),
+      false,
+    )
+    assert.equal(
+      shouldAutoContinueEmptyTurn({ messages: null as unknown as [], targetMsgId: 'u1', stopReason: 'end_turn' }),
+      false,
+    )
   })
 })
