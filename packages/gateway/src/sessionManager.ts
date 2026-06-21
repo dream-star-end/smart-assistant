@@ -1259,6 +1259,20 @@ export class SessionManager {
         }
       }, IDLE_TIMEOUT_MS)
 
+      // Background-workflow continuation soft cap. After a sub-turn launches a
+      // background Workflow we hold the turn open for the proactive result turn
+      // (re-arm in onFinish). claude normally continues within seconds of the
+      // workflow completing, but it is NOT guaranteed (e.g. the agent deferred to
+      // a far ScheduleWakeup, or the workflow produced no follow-up). Without a
+      // bound the session would sit "thinking" until the 30-min idle cap. So once
+      // continuation-waiting, if the runner goes silent for this long we resolve
+      // GRACEFULLY — no interrupt, the persistent process lives on. NOTE: a
+      // continuation that arrives AFTER this resolve is dropped (the finalized
+      // parser ignores it until the next turn re-arms); the user can re-ask. This
+      // is the accepted tail-loss tradeoff of the 90s soft cap.
+      const CONTINUATION_WAIT_MS = 90 * 1000
+      let continuationTimer: ReturnType<typeof setTimeout> | null = null
+
       // Buffer 'final' event — only forward to client after auth check passes
       let pendingFinal: SessionStreamEvent | null = null
       const wrappedOnEvent = (e: SessionStreamEvent) => {
@@ -1267,6 +1281,12 @@ export class SessionManager {
         // so it must NOT be flagged as phantom even if usage is 0.
         if (e.kind === 'block') turnBlockCount++
         else if (e.kind === 'permission_request') turnPermissionCount++
+        // A background Workflow launched this sub-turn → claude will proactively
+        // emit a continuation turn with the result once it completes. Keep the
+        // turn open (see onFinish re-arm) so that result is not dropped.
+        else if (e.kind === 'workflow_progress' && e.stage === 'started') {
+          expectsContinuation = true
+        }
         if (e.kind === 'final') {
           pendingFinal = e
           return
@@ -1286,11 +1306,29 @@ export class SessionManager {
         })
       }
 
+      // ── ultracode background-workflow continuation ──
+      // When a sub-turn launches a background Workflow, claude proactively emits
+      // a fresh turn (task_notification → init → assistant → result) on the SAME
+      // runner once it completes — no stdin needed. We keep the turn open and
+      // re-arm a fresh parser for each continuation so the workflow's result
+      // answer is delivered + persisted instead of hitting the finalized-parser
+      // drop. The turn resolves only on a result whose sub-turn did NOT launch a
+      // background workflow. `parser` is reassigned on each re-arm; `detach` /
+      // `handleMessage` always read the current one. Capped to bound runaway chains.
+      let parser: ClaudeMessageParser
+      let expectsContinuation = false
+      let continuationCount = 0
+      const MAX_CONTINUATIONS = 16
+
       let detached = false
       const detach = () => {
         if (detached) return
         detached = true
         clearTimeout(timer)
+        if (continuationTimer) {
+          clearTimeout(continuationTimer)
+          continuationTimer = null
+        }
         parser.finish()
         // Only clear if still pointing to this turn's parser (prevents race
         // where idle-timeout releases the lock, a new turn starts and sets
@@ -1303,7 +1341,28 @@ export class SessionManager {
         runner.off('parse_error', handleParseError)
       }
 
-      const parser = new ClaudeMessageParser({
+      // (Re)arm the continuation soft-cap. Called when a sub-turn re-arms for a
+      // background-workflow continuation, and refreshed on every runner message
+      // while waiting. Fires only if the runner goes fully silent past the cap —
+      // resolves gracefully (no interrupt; process kept alive).
+      const armContinuationTimer = () => {
+        if (continuationTimer) clearTimeout(continuationTimer)
+        continuationTimer = setTimeout(() => {
+          if (detached) return
+          log.info('background-workflow continuation wait timed out — resolving gracefully', {
+            sessionKey: session.sessionKey,
+          })
+          if (pendingFinal) onEvent(pendingFinal)
+          onEvent({ kind: 'final' })
+          detach()
+          settle(() => resolve())
+        }, CONTINUATION_WAIT_MS)
+      }
+
+      // Parser config is reused to re-arm a fresh parser on each background-
+      // workflow continuation (see onFinish). Callbacks close over the mutable
+      // `parser` + continuation flags, so one config object serves every sub-turn.
+      const parserConfig: ConstructorParameters<typeof ClaudeMessageParser>[0] = {
         toolUseIdToName: session.toolUseIdToName,
         onEvent: wrappedOnEvent,
         onToolUse: (tool) => {
@@ -1364,7 +1423,9 @@ export class SessionManager {
           )
         },
         onFinish: (result) => {
-          detach()
+          // NB: do NOT detach() unconditionally — a background-workflow sub-turn
+          // re-arms below and must keep its idle timer + crash listeners alive.
+          // Every terminal branch (auth / phantom / normal) calls detach() itself.
 
           // Detect auth error in assistant output — roll back counters and reject.
           // Two signals: (1) isError + broad keyword match, (2) claude's exact error prefix.
@@ -1376,6 +1437,7 @@ export class SessionManager {
             session.totalCostUSD = prevCostUSD
             session.turns = prevTurns
             session._lastCcbCumulativeCost = prevLastCcbCost
+            detach()
             settle(() => reject(new Error('AUTH_ERROR: Token expired or invalid')))
             return
           }
@@ -1418,6 +1480,7 @@ export class SessionManager {
               turnIndex: session.turns + 1,
               durationMs: Date.now() - turnStartTime,
             })
+            detach()
             settle(() => reject(new Error('PHANTOM_TURN: claude returned empty result')))
             return
           }
@@ -1616,12 +1679,37 @@ export class SessionManager {
               })
             }
           }
+          // Background-workflow continuation: if this sub-turn launched a
+          // background Workflow, claude will proactively emit the result answer
+          // as a fresh turn on the same runner. Keep the turn open + re-arm a
+          // fresh parser instead of resolving, so that answer is delivered and
+          // persisted (each sub-turn already incremented session.turns → distinct
+          // durable-append id). Resolve only when a sub-turn launches no workflow.
+          if (expectsContinuation && continuationCount < MAX_CONTINUATIONS) {
+            continuationCount++
+            expectsContinuation = false
+            turnBlockCount = 0
+            turnToolCallCount = 0
+            turnPermissionCount = 0
+            pendingFinal = null
+            parser.finish()
+            if (session._currentParser === parser) session._currentParser = undefined
+            parser = new ClaudeMessageParser(parserConfig)
+            session._currentParser = parser
+            if (!detached) {
+              timer.refresh()
+              armContinuationTimer()
+            }
+            return
+          }
+          detach()
           settle(() => resolve())
         },
         sessionTotals: session, // parser reads/writes totalCostUSD and turns directly
-      })
+      }
 
       // Expose parser to outer idle-timeout checker
+      parser = new ClaudeMessageParser(parserConfig)
       session._currentParser = parser
 
       const handleMessage = (msg: any) => {
@@ -1629,7 +1717,12 @@ export class SessionManager {
         // detach 后跳过 timer.refresh():Node Timer.refresh() 即使已 clearTimeout
         // 也会重新 arm,会让旧 turn 的 idle 回调在 30 分钟后被无意义地触发
         // (回调内有 !parser.finalized 守卫所以是 no-op,但还是不要触发更干净)。
-        if (!detached) timer.refresh()
+        if (!detached) {
+          timer.refresh()
+          // Any runner output (workflow progress, the continuation turn itself)
+          // resets the continuation soft-cap so it only fires on true silence.
+          if (continuationTimer) armContinuationTimer()
+        }
         parser.parse(msg)
       }
       const handleError = (err: Error) => {

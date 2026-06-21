@@ -1081,7 +1081,19 @@ export function connect() {
       // protocol — otherwise gateway would re-replay them on every reconnect.
       // Sess unresolved (unknown peer) → leave cursor untouched and let the
       // type-specific handler decide whether to warn or silently ignore.
-      if (typeof f.frameSeq === 'number' && f.frameSeq > 0) {
+      //
+      // EXEMPTION: `outbound.workflow_progress` is an idempotent, order-tolerant
+      // side-channel (live workflow card). Under the redis-backed async frame bus
+      // a later message frame (e.g. the continuation result, higher frameSeq) can
+      // land before a delayed earlier progress frame — gating those by the cursor
+      // would silently drop the agent done/completed updates (card stuck at
+      // "running"). It neither participates in replay dedup nor advances the
+      // cursor; the handler merges every snapshot it sees.
+      if (
+        typeof f.frameSeq === 'number' &&
+        f.frameSeq > 0 &&
+        f.type !== 'outbound.workflow_progress'
+      ) {
         const sess = _resolveSessForFrame(f)
         if (sess) {
           const last = sess._lastFrameSeq || 0
@@ -1094,6 +1106,7 @@ export function connect() {
       else if (f.type === 'outbound.permission_request') handlePermissionRequest(f)
       else if (f.type === 'outbound.permission_settled') handlePermissionSettled(f)
       else if (f.type === 'outbound.goal_status') handleGoalStatus(f)
+      else if (f.type === 'outbound.workflow_progress') handleWorkflowProgress(f)
       else if (f.type === 'outbound.resume_failed') handleResumeFailed(f)
       else if (f.type === 'outbound.ack' && f.deduplicated) {
         // Server already processed this message; clear drain state so queue continues
@@ -1906,6 +1919,71 @@ export function handleOutbound(frame) {
   _deps.scheduleSave(sess, !!frame.isFinal, { rebuildSearchIndex: !!frame.isFinal })
   // Only rebuild sidebar on final message (not every streaming delta)
   if (frame.isFinal) _deps.renderSidebar()
+}
+
+// Background-workflow (ultracode) progress side-channel → live workflow card.
+// Accumulates per-task phase/agent snapshots into one `workflow-group` message
+// keyed by taskId, updating in place. Never a chat block; the workflow's final
+// result answer arrives separately as a normal assistant message (gateway
+// continuation lifecycle).
+function handleWorkflowProgress(frame) {
+  const peerId = frame.peer?.id
+  const sess = peerId ? state.sessions.get(peerId) : null
+  if (!sess) return
+  markFrameReceived(sess)
+  const taskId = frame.taskId
+  if (!taskId) return
+  // `_wfGroups` is a runtime-only index (taskId → card msg id) stripped from
+  // persistence. Rebuild it from existing messages after a reload / REST hydrate
+  // so replayed progress frames (workflow_progress is frameSeq-exempt and may be
+  // re-sent on reconnect) re-attach to the existing card instead of duplicating.
+  if (!sess._wfGroups) {
+    sess._wfGroups = new Map()
+    for (const m of sess.messages || []) {
+      if (m.role === 'workflow-group' && m.workflowTaskId)
+        sess._wfGroups.set(m.workflowTaskId, m.id)
+    }
+  }
+  let msg = sess._wfGroups.has(taskId)
+    ? sess.messages.find((m) => m.id === sess._wfGroups.get(taskId))
+    : null
+  if (!msg) {
+    if (frame.stage === 'updated') return // completion for an unknown task — ignore
+    msg = addMessage(sess, 'workflow-group', frame.workflowName || frame.description || '工作流', {
+      workflowTaskId: taskId,
+      workflowName: frame.workflowName,
+      _wfStatus: 'running',
+      _wfPhases: [],
+      _wfAgents: [],
+      _wfUsage: null,
+      startTime: Date.now(),
+    })
+    sess._wfGroups.set(taskId, msg.id)
+  }
+  if (frame.workflowName && !msg.workflowName) msg.workflowName = frame.workflowName
+  if (frame.usage) msg._wfUsage = frame.usage
+  if (frame.stage === 'updated' && frame.status === 'completed') msg._wfStatus = 'completed'
+  for (const it of Array.isArray(frame.items) ? frame.items : []) {
+    if (!it || typeof it !== 'object') continue
+    if (it.type === 'workflow_phase') {
+      const ex = msg._wfPhases.find((p) => p.index === it.index)
+      if (ex) Object.assign(ex, it)
+      else msg._wfPhases.push({ index: it.index, title: it.title })
+    } else if (it.type === 'workflow_agent') {
+      const ex = msg._wfAgents.find((a) => a.index === it.index)
+      if (ex) Object.assign(ex, it)
+      else msg._wfAgents.push({ ...it })
+    }
+  }
+  if (sess.id === state.currentSessionId) _deps.updateMessageEl(msg)
+  // Persist ONLY on terminal completion, not per progress frame. Saving on every
+  // snapshot churns the per-session save chain and provokes 409 conflict storms
+  // whose server-wins adoption reverts the just-completed live card back to
+  // "running". One immediate save on `updated/completed` is enough to survive a
+  // later reload; intermediate progress stays live-only (re-derived from frames).
+  if (frame.stage === 'updated') {
+    _deps.scheduleSave(sess, true, { rebuildSearchIndex: false })
+  }
 }
 
 function handleOutboundTurnStatus(frame) {

@@ -530,6 +530,7 @@ function _sessionDbSnapshot(sess, extra = {}) {
     _blockIdToMsgId,
     _replyingToMsgId,
     _agentGroups,
+    _wfGroups,
     _streamRafPending,
     _thinkRafPending,
     _searchText,
@@ -814,6 +815,7 @@ export function pushSessionToServer(sess) {
     _sendingInFlight,
     _replyingToMsgId,
     _agentGroups,
+    _wfGroups,
     _streamRafPending,
     _thinkRafPending,
     _searchText,
@@ -984,6 +986,7 @@ export function pushSessionToServer(sess) {
           // Invalidate runtime maps so they get rebuilt from new messages on next handleOutbound
           target._blockIdToMsgId = null
           target._agentGroups = null
+          target._wfGroups = null
           target._conflictRetryCount = 0 // server-wins adoption resets the cap
           _rebindStreamingPointers(target)
           _rebuildSearchIndex(target)
