@@ -1,24 +1,24 @@
 // OpenClaude Service Worker
 // App-shell caching only. Never intercept /ws, /api/*, or external CDN requests.
-const VERSION = 'openclaude-8526f798'
+const VERSION = 'openclaude-422cb9fb'
 const SHELL = [
   '/',
   '/index.html',
   '/style.css',
-  '/style.css?v=8526f798',  // versioned URL used in index.html
+  '/style.css?v=422cb9fb',  // versioned URL used in index.html
   '/manifest.json',
   '/icon.svg',
   // ES modules
   '/modules/main.js',
-  '/modules/main.js?v=8526f798',  // versioned URL used in index.html
+  '/modules/main.js?v=422cb9fb',  // versioned URL used in index.html
   '/modules/auth.js',
-  '/modules/auth.js?v=8526f798',  // versioned URL used in main.js import (session cookie mint/clear)
+  '/modules/auth.js?v=422cb9fb',  // versioned URL used in main.js import (session cookie mint/clear)
   '/modules/billing.js',
-  '/modules/billing.js?v=8526f798',  // versioned URL used in main.js import (mobile H5 pay + 积分 formatter)
+  '/modules/billing.js?v=422cb9fb',  // versioned URL used in main.js import (mobile H5 pay + 积分 formatter)
   '/modules/userPrefs.js',
-  '/modules/userPrefs.js?v=8526f798',  // versioned URL used in main.js import (prefs modal redesign)
+  '/modules/userPrefs.js?v=422cb9fb',  // versioned URL used in main.js import (prefs modal redesign)
   '/modules/usageStats.js',
-  '/modules/usageStats.js?v=8526f798',  // 版本化 URL(main.js import 带 ?v=)
+  '/modules/usageStats.js?v=422cb9fb',  // 版本化 URL(main.js import 带 ?v=)
   '/modules/dom.js',
   '/modules/util.js',
   '/modules/state.js',
@@ -34,26 +34,26 @@ const SHELL = [
   '/modules/memory.js',
   '/modules/tasks.js',
   '/modules/papers.js',
-  '/modules/papers.js?v=8526f798',
+  '/modules/papers.js?v=422cb9fb',
   '/modules/agents.js',
-  '/modules/agents.js?v=8526f798',  // 版本化 URL(main.js import 带 ?v=)
+  '/modules/agents.js?v=422cb9fb',  // 版本化 URL(main.js import 带 ?v=)
   '/modules/effortMode.js',
   '/modules/modelPolicy.js',
-  '/modules/modelPolicy.js?v=8526f798',
+  '/modules/modelPolicy.js?v=422cb9fb',
   '/modules/modelPicker.js',
-  '/modules/modelPicker.js?v=8526f798',  // 版本化 URL(main.js import 带 ?v=)
+  '/modules/modelPicker.js?v=422cb9fb',  // 版本化 URL(main.js import 带 ?v=)
   '/modules/planMode.js',
-  '/modules/planMode.js?v=8526f798',  // 版本化 URL(main.js/messages.js import 带 ?v=)
+  '/modules/planMode.js?v=422cb9fb',  // 版本化 URL(main.js/messages.js import 带 ?v=)
   '/modules/planPanel.js',
-  '/modules/planPanel.js?v=8526f798',  // 版本化 URL(main.js/messages.js import 带 ?v=)
+  '/modules/planPanel.js?v=422cb9fb',  // 版本化 URL(main.js/messages.js import 带 ?v=)
   '/modules/sessions.js',
   '/modules/sync.js',
   '/modules/messages.js',
-  '/modules/messages.js?v=8526f798',
-  '/modules/emptyTurn.js?v=8526f798',  // 版本化 URL(websocket.js import 带 ?v=8526f798;空 turn 分类纯函数)
+  '/modules/messages.js?v=422cb9fb',
+  '/modules/emptyTurn.js?v=422cb9fb',  // 版本化 URL(websocket.js import 带 ?v=422cb9fb;空 turn 分类纯函数)
   '/modules/websocket.js',
   '/modules/commands.js',
-  '/modules/commands.js?v=8526f798',
+  '/modules/commands.js?v=422cb9fb',
   '/modules/trace.js',
   '/modules/wechat.js',
   '/modules/inbox.js',
