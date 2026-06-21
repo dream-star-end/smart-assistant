@@ -1976,10 +1976,14 @@ function handleWorkflowProgress(frame) {
     }
   }
   if (sess.id === state.currentSessionId) _deps.updateMessageEl(msg)
-  // Persist so a later reload restores the card's latest phase/agent/completed
-  // state (a delayed `done`/`completed` frame after the turn's final message
-  // must survive refresh, not revert to "running").
-  _deps.scheduleSave(sess, frame.stage === 'updated', { rebuildSearchIndex: false })
+  // Persist ONLY on terminal completion, not per progress frame. Saving on every
+  // snapshot churns the per-session save chain and provokes 409 conflict storms
+  // whose server-wins adoption reverts the just-completed live card back to
+  // "running". One immediate save on `updated/completed` is enough to survive a
+  // later reload; intermediate progress stays live-only (re-derived from frames).
+  if (frame.stage === 'updated') {
+    _deps.scheduleSave(sess, true, { rebuildSearchIndex: false })
+  }
 }
 
 function handleOutboundTurnStatus(frame) {
