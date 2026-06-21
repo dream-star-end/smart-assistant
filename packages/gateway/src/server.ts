@@ -6389,6 +6389,33 @@ export class Gateway {
               ts: Date.now(),
             })
           }
+        } else if (e.kind === 'workflow_progress') {
+          // Background-workflow (ultracode) progress side-channel — same stamped
+          // delivery as turn_status (WebChat only; non-interactive adapters get
+          // no live workflow card). Never a chat block, never finalizes a turn.
+          if (!adapter) {
+            const dispatchUserId: string =
+              typeof (frame as any)._userId === 'string' ? (frame as any)._userId : 'default'
+            const peerKey = Gateway.makePeerKey(dispatchUserId, frame.channel, frame.peer.id)
+            this._sendStampedSessionFrame(sessionKey, peerKey, {
+              type: 'outbound.workflow_progress',
+              sessionKey,
+              channel: frame.channel,
+              peer: frame.peer,
+              agentId: session.agentId,
+              taskId: e.taskId,
+              stage: e.stage,
+              workflowName: e.workflowName,
+              toolUseId: e.toolUseId,
+              description: e.description,
+              summary: e.summary,
+              lastTool: e.lastTool,
+              usage: e.usage,
+              items: e.items,
+              status: e.status,
+              ts: Date.now(),
+            })
+          }
         } else if (e.kind === 'permission_request') {
           // Forward permission prompt to WebSocket clients for user approval.
           // userId is stashed on the frame by the WS handler (see handleWsConnection)
