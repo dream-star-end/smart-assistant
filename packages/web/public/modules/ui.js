@@ -110,3 +110,26 @@ export function closeLightbox() {
   lb.querySelector('.lightbox-body').innerHTML = ''
   document.body.style.overflow = ''
 }
+
+// Open an htmlpreview's HTML in the fullscreen lightbox overlay. Reuses the
+// #lightbox close interactions (close button / backdrop click / scroll lock).
+// The iframe is its own browsing context, so once it takes focus the parent's
+// document keydown no longer sees Escape — inject a tiny forwarder that posts a
+// close message (validated by e.source in main.js).
+export function openHtmlPreviewFullscreen(source) {
+  const lb = $('lightbox')
+  const body = lb.querySelector('.lightbox-body')
+  body.innerHTML = ''
+  const escScript = `<script>document.addEventListener("keydown",e=>{if(e.key==="Escape")parent.postMessage({type:"html-preview-fullscreen-close"},"*")})<\/script>`
+  const fullCode = source.includes('</body>')
+    ? source.replace('</body>', `${escScript}</body>`)
+    : source + escScript
+  const iframe = document.createElement('iframe')
+  iframe.className = 'lightbox-preview-iframe'
+  iframe.setAttribute('sandbox', 'allow-scripts')
+  iframe.srcdoc = fullCode
+  body.appendChild(iframe)
+  lb.hidden = false
+  document.body.style.overflow = 'hidden'
+  lb.querySelector('.lightbox-close')?.focus()
+}

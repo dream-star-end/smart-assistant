@@ -721,7 +721,7 @@ export async function processRichBlocks() {
     const el = document.getElementById(id)
     if (!el) continue
     const iframeId = `${id}-iframe`
-    el.innerHTML = `<div class="html-preview-head"><span>HTML preview (sandboxed)</span><button type="button" data-view-source="${iframeId}">view source</button></div><iframe id="${iframeId}" class="html-preview-iframe" sandbox="allow-scripts"></iframe>`
+    el.innerHTML = `<div class="html-preview-head"><span>HTML preview (sandboxed)</span><span class="html-preview-actions"><button type="button" data-fullscreen-preview="${iframeId}" aria-label="全屏查看 HTML 预览" title="全屏查看">全屏</button><button type="button" data-view-source="${iframeId}">view source</button></span></div><iframe id="${iframeId}" class="html-preview-iframe" sandbox="allow-scripts"></iframe>`
     const iframe = document.getElementById(iframeId)
     if (iframe) {
       // Inject auto-resize script into the HTML content
