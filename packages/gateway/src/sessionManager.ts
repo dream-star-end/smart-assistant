@@ -315,11 +315,18 @@ export interface AgentSession {
   // thinking by turn and reconcile live (m-*) messages with the server-authored
   // durable row (which shares this exact id). undefined for non-webchat sessions.
   _activeTurnId?: string
-  // Cross-turn stdout 'message' listener. Per-turn _runOneTurn replaces
-  // (not removes) this on the next turn so bg-bash bash_output_tail
-  // emitted after the turn's `result` keeps flowing through parser ->
-  // onEvent -> deliver. destroySession/shutdownAll explicitly off().
-  _currentMessageListener?: ((msg: any) => void) | null
+  // Permanent (session-lifetime) stdout 'message' pump. Installed once on the
+  // first _runOneTurn and bound to `session.runner` (never reassigned, so it
+  // survives effort/model recycle + idle hard-reset which shut the proc but keep
+  // the runner EventEmitter). It delegates each raw message to the current turn's
+  // handler — the dispatcher seam P2.2/P2.3 build on. destroySession/shutdownAll/
+  // eviction explicitly off() it.
+  _messagePump?: ((msg: any) => void) | null
+  // The current turn's message handler (set per turn in _runOneTurn). The pump
+  // routes to whatever this points at. Deliberately NOT cleared on detach so a
+  // post-result frame still reaches the old, finalized parser and is dropped —
+  // preserving the legacy "replace not remove" behaviour (the next turn replaces it).
+  _currentTurnHandler?: ((msg: any) => void) | null
   _historicalContextInjected?: boolean
 }
 
@@ -1361,8 +1368,9 @@ export class SessionManager {
         // where idle-timeout releases the lock, a new turn starts and sets
         // a new parser, then this stale detach wipes the new reference).
         if (session._currentParser === parser) session._currentParser = undefined
-        // 故意不卸载 runner.off('message', handleMessage):下一轮 _runOneTurn
-        // 启动时会主动替换 session._currentMessageListener,旧闭包链届时被 GC。
+        // 故意不动 session._currentTurnHandler:permanent pump 仍指向本轮 handler,
+        // 下一轮 _runOneTurn 会 repoint;期间 post-result 帧落到已 finalized 的旧
+        // parser 被丢弃(保留 "replace not remove" 语义)。pump 本身常驻不卸载。
         runner.off('error', handleError)
         runner.off('exit', handleExit)
         runner.off('parse_error', handleParseError)
@@ -1832,19 +1840,20 @@ export class SessionManager {
         }, 150)
       }
 
-      // Replace any prior turn's stdout listener (kept attached across turn
-      // boundaries to forward bg bash bash_output_tail) before installing
-      // this turn's listener. This ensures there's at most one
-      // 'message' listener per session at any time, so closures from old
-      // turns become unreachable and GC'able.
-      if (session._currentMessageListener) {
-        try {
-          runner.off('message', session._currentMessageListener)
-        } catch {}
-        session._currentMessageListener = null
+      // Permanent stdout pump (install-once, session-lifetime). Bound to
+      // `session.runner`, which is never reassigned — it survives effort/model
+      // recycle + idle hard-reset (those shut the proc, keep the runner). The
+      // pump routes each raw message to the current turn's handler; per turn we
+      // just repoint `_currentTurnHandler`. This replaces the old per-turn
+      // off-old/on-new churn while keeping exactly one routing target at a time.
+      // (The pump is the seam P2.2/P2.3 extend to catch post-result continuation
+      // frames without holding the submit lock.)
+      if (!session._messagePump) {
+        const pump = (msg: any) => session._currentTurnHandler?.(msg)
+        session._messagePump = pump
+        runner.on('message', pump)
       }
-      runner.on('message', handleMessage)
-      session._currentMessageListener = handleMessage
+      session._currentTurnHandler = handleMessage
       runner.on('error', handleError)
       runner.on('exit', handleExit)
       runner.on('parse_error', handleParseError)
@@ -1939,12 +1948,13 @@ export class SessionManager {
     if (s) {
       // Detach cross-turn message listener before shutting down to release
       // the closure chain (parser + per-turn onEvent + frame envelope).
-      if (s._currentMessageListener) {
+      if (s._messagePump) {
         try {
-          s.runner.off('message', s._currentMessageListener)
+          s.runner.off('message', s._messagePump)
         } catch {}
-        s._currentMessageListener = null
+        s._messagePump = null
       }
+      s._currentTurnHandler = null
       await s.runner.shutdown()
       this.sessions.delete(sessionKey)
     }
@@ -1964,12 +1974,13 @@ export class SessionManager {
     this._saveResumeMap()
     await this._resumeMapWrite
     for (const s of this.sessions.values()) {
-      if (s._currentMessageListener) {
+      if (s._messagePump) {
         try {
-          s.runner.off('message', s._currentMessageListener)
+          s.runner.off('message', s._messagePump)
         } catch {}
-        s._currentMessageListener = null
+        s._messagePump = null
       }
+      s._currentTurnHandler = null
     }
     await Promise.all([...this.sessions.values()].map((s) => s.runner.shutdown()))
     this.sessions.clear()
@@ -2014,12 +2025,13 @@ export class SessionManager {
       for (const key of toEvict) {
         const s = this.sessions.get(key)
         if (!s) continue
-        if (s._currentMessageListener) {
+        if (s._messagePump) {
           try {
-            s.runner.off('message', s._currentMessageListener)
+            s.runner.off('message', s._messagePump)
           } catch {}
-          s._currentMessageListener = null
+          s._messagePump = null
         }
+        s._currentTurnHandler = null
         s.runner.shutdown().catch(() => {})
         this.sessions.delete(key)
         // Only webchat sessions should survive eviction in resume-map.

@@ -32,9 +32,11 @@ import type { SessionStreamEvent } from '../claudeMessageParser.js'
 // node:test runs each *.test.ts file in its own process, so the env set lands
 // before any storage/paths module is first loaded in this process.
 process.env.OPENCLAUDE_HOME = await mkdtemp(join(tmpdir(), 'oc-p2baseline-'))
-// Many short-lived SessionManager instances in one file → bump the per-process
-// listener cap to silence Node's benign MaxListeners heuristic (process-local).
-process.setMaxListeners(50)
+// This file legitimately spins up many short-lived runner/session instances; the
+// per-test process is isolated and exits promptly, so disable Node's MaxListeners
+// heuristic for it (process-local; no prod impact, and no process.on('exit') is
+// added by the gateway code under test — verified).
+process.setMaxListeners(0)
 const { CodexAppServerRunner } = await import('../codexAppServerRunner.js')
 const { ClaudeMessageParser } = await import('../claudeMessageParser.js')
 const {
@@ -431,5 +433,44 @@ describe('P2.0 baseline — sessionManager continuation orchestration', () => {
       0.5,
       'ccb cumulative rolled back (would be 0.75 if broken)',
     )
+  })
+})
+
+// ───────────────────────── P2.1 permanent stdout pump lifecycle ────────────
+// Locks the refactor that replaced the per-turn off-old/on-new 'message' churn
+// with a single install-once pump delegating to session._currentTurnHandler.
+describe('P2.1 baseline — permanent stdout pump lifecycle', () => {
+  it('installs the message pump ONCE and reuses it across turns (no per-turn listener leak)', async () => {
+    const runner = new FakeRunner()
+    const session = makeTestSession(runner)
+
+    runner.scripts = [[result()], [result()]]
+    await manager.submit(session, 'first', () => {})
+    assert.equal(runner.listenerCount('message'), 1, 'pump installed on first turn')
+    assert.ok(session._messagePump, 'pump stored on session')
+
+    await manager.submit(session, 'second', () => {})
+    // The pump is install-once (`if (!session._messagePump)`) — a second turn must
+    // NOT add another 'message' listener (the old per-turn code off/on-ed each turn).
+    assert.equal(runner.listenerCount('message'), 1, 'pump NOT re-added on the second turn')
+    assert.ok(session._currentTurnHandler, 'current-turn handler set')
+  })
+
+  it('destroySession offs the permanent pump (no leak after teardown)', async () => {
+    const runner = new FakeRunner()
+    const session = makeTestSession(runner)
+
+    runner.scripts = [[result()]]
+    await manager.submit(session, 'go', () => {})
+    assert.equal(runner.listenerCount('message'), 1)
+
+    // destroySession looks the session up by key (makeTestSession bypasses
+    // createSession), so register it first to exercise the cleanup path.
+    ;(manager as any).sessions.set(session.sessionKey, session)
+    await manager.destroySession(session.sessionKey)
+
+    assert.equal(runner.listenerCount('message'), 0, 'pump removed on destroy')
+    assert.equal(session._messagePump, null, 'pump ref cleared')
+    assert.equal(session._currentTurnHandler, null, 'handler ref cleared')
   })
 })
