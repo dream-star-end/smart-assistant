@@ -134,3 +134,13 @@ R1(`task_notification` 真实帧未知)已闭环。机器上**没有任何 trans
 8. 删 90s CONTINUATION_WAIT_MS finalize+drop;保留 MAX_CONTINUATIONS。
 9. watch-end 清理必须全:clear `_continuationWatch` + 仅当仍属己时 repoint `_currentTurnHandler` + remove watch exit/error/parse_error + clear timers + resolve 排队 submit waiter;durable 链失败也要 settle 链 + end watch(排队 submit 不能永挂)。
 10. 测试:翻 B2(#1 投递+持久化)、改 B1(#2 release+watch)、加"慢续轮(>90s 旧窗口后)被接住"、submit-gate(插话排队、续轮仍投递)、per-context rollback 隔离、watch backstop end、eviction 跳过 active watch;storage-mock 测(durable 一次/正确 srv-tN)放独立文件、mock.module 在 import sessionManager 前。
+
+## 十、P2.2 落地状态 + P2.3 决策(2026-06-23)
+
+**P2.2 已在分支完成并验证**(commit 9469eea2,Codex PASS):#1/#2 续轮答案现在投递+持久化,无 90s 尾损,无 16min 锁占,无错投。验证:typecheck 全包 + gateway 566/0 + web 456/0 + gateway 包 runtime load smoke + Codex 三阶段 PASS。
+
+**P2.3 的两块,一块已被 P2.2 实现方式吸收,一块按数据缺口推迟**:
+1. **strict 队列 / `USER_STDIN_WRITTEN_PENDING_OUTPUT` 状态——已不需要**。设计原本担心"strict 超时放行 user submit(写了 stdin)后 task_notification 才到 → 错投"。但 P2.2 的 submit gate 是 **await watch.done**(watch 活跃时根本不写 stdin、不 repoint handler),所以"写了 stdin 又来续轮"的竞态在本实现里**不可能发生**。await-gate 比"超时放行+处理迟到帧"更严格也更简单,直接消除了那个状态。
+2. **`session_state_changed(idle)` 作为 watch 主结束信号——推迟,缺帧序数据**。风险:若 backgrounded task 运行期间主 session 就 emit `idle`(而非 `running`),naive 的"idle→结束 watch"会在续轮到达前**提前结束 watch → 重新蒸发**(就是要修的 bug)。是 idle 还是 running 取决于 auto-background 真实帧序,dev 复现不了、prod 未抓到。**不在猜测的帧序上实现有正确性风险的改动**。当前 backstop(20min > 实测 max 16min)正确兜底:所有合法续轮(≤16min)都在 backstop 前被接住;只有"启动了 bg task 但 20min 内零续轮"才结束 watch(正确)。已知代价:那种罕见情形下用户下一条消息最多等 20min(strict 排队语义)。修法 = 抓 prod 真实 auto-background 帧序(含 session_state_changed 时序)后,按"idle + 短 grace,可被 running/续轮帧取消"安全设计,再过 Codex。
+
+**Ship(P2.4)是 gated 最后一步**:按 CLAUDE.md,合 master 前必须 dev 实例验证(BLOCKING)→ 合并 → openclaude-safe-restart → prod smoke。这是对 boss 日用助手的最高风险操作,谨慎单独执行,不在超长 turn 末尾仓促做。
