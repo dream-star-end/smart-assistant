@@ -3022,11 +3022,22 @@ a:hover {
   object-fit: contain;
   border-radius: var(--radius-md);
 }
+.lightbox-preview-iframe {
+  width: 90vw;
+  height: 88vh;
+  border: none;
+  background: #fff;
+  border-radius: var(--radius-md);
+}
 @media (max-width: 860px) {
   .lightbox-body img,
   .lightbox-body video {
     max-width: 96vw;
     max-height: 85vh;
+  }
+  .lightbox-preview-iframe {
+    width: 96vw;
+    height: 85vh;
   }
   .lightbox-close {
     top: 10px;
@@ -3145,6 +3156,10 @@ a:hover {
   justify-content: space-between;
   align-items: center;
   border-bottom: 1px solid var(--border);
+}
+.html-preview-actions {
+  display: flex;
+  gap: 8px;
 }
 .html-preview-head button {
   color: var(--fg-muted);

@@ -43,7 +43,14 @@ import {
 } from './markdown.js'
 
 // ── UI helpers ──
-import { closeLightbox, closeModal, openLightbox, openModal, toast } from './ui.js'
+import {
+  closeLightbox,
+  closeModal,
+  openHtmlPreviewFullscreen,
+  openLightbox,
+  openModal,
+  toast,
+} from './ui.js'
 
 // ── Attachments ──
 import {
@@ -481,6 +488,13 @@ window.addEventListener('unhandledrejection', (ev) => {
 
 // Auto-resize htmlpreview iframes based on content height
 window.addEventListener('message', (e) => {
+  // Fullscreen htmlpreview iframe forwards Escape via postMessage: once focused,
+  // the iframe (its own browsing context) swallows keydown from the parent.
+  if (e.data?.type === 'html-preview-fullscreen-close') {
+    const ifr = $('lightbox')?.querySelector('.lightbox-preview-iframe')
+    if (ifr && e.source === ifr.contentWindow) closeLightbox()
+    return
+  }
   if (e.data?.type === 'iframe-resize' && e.data.id && e.data.h) {
     // Only accept resize from our own managed iframes (id starts with htmlpv-)
     if (typeof e.data.id !== 'string' || !e.data.id.startsWith('htmlpv-')) return
@@ -494,6 +508,13 @@ window.addEventListener('message', (e) => {
 
 // ── Markdown: global click handler for [data-copy] and [data-view-source] ──
 document.addEventListener('click', (e) => {
+  // fullscreen htmlpreview iframe (reuses the #lightbox overlay)
+  const fsBtn = e.target.closest?.('[data-fullscreen-preview]')
+  if (fsBtn) {
+    const iframe = document.getElementById(fsBtn.dataset.fullscreenPreview)
+    if (iframe) openHtmlPreviewFullscreen(iframe.dataset.source || '')
+    return
+  }
   // view source toggle for htmlpreview iframes
   const srcBtn = e.target.closest?.('[data-view-source]')
   if (srcBtn) {
