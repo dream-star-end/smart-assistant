@@ -18,7 +18,7 @@
  * Run: npx tsx --test packages/gateway/src/__tests__/continuationBaseline.test.ts
  */
 import * as assert from 'node:assert/strict'
-import { mkdtemp } from 'node:fs/promises'
+import { mkdtemp, readFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, it, mock } from 'node:test'
@@ -212,102 +212,91 @@ const turnIdIndex = (id: string | undefined): number => {
   return Number(m![1])
 }
 
-describe('P2.0 baseline — sessionManager continuation orchestration', () => {
-  it('B1: #2 ultracode continuation — re-arm holds the lock, delivers both sub-turn finals, turnId↔meta.turn lockstep (C/H/G)', async () => {
+describe('P2.2 — webchat continuation watch (release lock + out-of-lock deliver/persist)', () => {
+  it('B1: bg-task turn releases the lock + arms a watch; the continuation is delivered out-of-band with an advanced turnId (C/H/G)', async () => {
     const runner = new FakeRunner()
     const session = makeTestSession(runner)
+    session.userId = undefined // skip the durable write (tested separately); assert delivery only
     const turnsBefore = session.turns
     const events: any[] = []
-    const finalTurnIds: Array<string | undefined> = []
-    const finalMetaTurns: Array<number | undefined> = []
+    const cont: Array<{ route: any; e: any }> = []
+    manager.onContinuationEvent = (route, e) => cont.push({ route, e })
 
-    // sub-turn 1 only: task_started arms the continuation, then its result.
+    // user turn launches a background task (task_started before result), then result.
     runner.scripts = [[taskStarted(), result()]]
-    let settled = false
-    const p = manager
-      .submit(session, 'do bg work', (e) => {
-        events.push(e)
-        if (e.kind === 'final') {
-          finalTurnIds.push(session._activeTurnId)
-          finalMetaTurns.push((e as any).meta?.turn)
-        }
-      })
-      .then(() => {
-        settled = true
-      })
-
-    // let submit reach runner.submit(), process sub-turn 1, and re-arm.
-    await new Promise((r) => setImmediate(r))
-    // invariant G: the submit lock stays HELD across the continuation (not settled).
-    assert.equal(settled, false, 'submit lock stays held across the continuation re-arm')
+    let userTurnId: string | undefined
+    await manager.submit(session, 'do bg work', (e) => {
+      events.push(e)
+      if (e.kind === 'final') userTurnId = session._activeTurnId
+    })
+    // the user turn resolved (lock released) and a watch is armed.
     assert.equal(
       events.filter((e) => e.kind === 'final').length,
       1,
-      'sub-turn 1 final already delivered',
+      'user turn final delivered via the submit onEvent',
     )
+    assert.ok(session._continuationWatch, 'a continuation watch is armed (lock released)')
 
-    // continuation result arrives proactively on the SAME runner (no new submit),
-    // with no further task_started → terminal sub-turn → resolve + release.
+    // the continuation arrives LATER on the same runner — no new submit.
+    runner.emit('message', msgStart('m-cont'))
+    runner.emit('message', textDelta('synthesized continuation answer'))
     runner.emit('message', result())
-    await p
-    assert.equal(settled, true, 'turn settles only on the terminal (non-continuing) result')
+    await new Promise((r) => setImmediate(r))
 
-    const finals = events.filter((e) => e.kind === 'final')
-    // CURRENT behavior: pendingFinal is forwarded at sessionManager.ts:1516 on
-    // every non-auth/non-phantom result BEFORE the re-arm branch (1715), so the
-    // client receives one final PER sub-turn. P2.x may collapse this to one
-    // terminal final — that diff lands here.
-    assert.equal(finals.length, 2, 'one final per sub-turn delivered today')
-    assert.equal(session.turns - turnsBefore, 2, 'each sub-turn increments the turn counter')
-    // invariant C/H: every frame's turnId == the durable srv-<peer>-tN id for its
-    // sub-turn (turnIdIndex === meta.turn), and advances by exactly one. Asserting
-    // the ABSOLUTE turnId↔meta.turn equality (not just a relative +1) is what
-    // guards against a refactor stamping the right delta but the wrong base.
-    assert.equal(finalTurnIds.length, 2)
-    assert.equal(
-      turnIdIndex(finalTurnIds[0]),
-      finalMetaTurns[0],
-      'sub-turn 1 turnId == its meta.turn',
+    // delivered OUT-OF-BAND via onContinuationEvent (NOT the submit onEvent).
+    const contFinals = cont.filter((c) => c.e.kind === 'final')
+    assert.equal(contFinals.length, 1, 'continuation final delivered via onContinuationEvent')
+    assert.ok(
+      cont.some(
+        (c) =>
+          c.e.kind === 'block' && (c.e.block as any)?.text === 'synthesized continuation answer',
+      ),
+      'continuation answer text delivered out-of-band',
     )
+    // invariant C: continuation turnId == user turnId + 1 (lockstep, advanced).
+    const contTurnId = contFinals[0].route.turnId
     assert.equal(
-      turnIdIndex(finalTurnIds[1]),
-      finalMetaTurns[1],
-      'sub-turn 2 turnId == its meta.turn',
+      turnIdIndex(contTurnId),
+      turnIdIndex(userTurnId) + 1,
+      'continuation turnId advances by exactly 1',
     )
-    assert.equal(
-      finalMetaTurns[1],
-      (finalMetaTurns[0] ?? Number.NaN) + 1,
-      'continuation advances turn by exactly 1',
-    )
+    assert.equal(session.turns - turnsBefore, 2, 'each sub-turn advanced the turn counter')
+    assert.equal(session._continuationWatch, null, 'watch ended after the terminal continuation')
   })
 
-  it('B2: #1 auto-background task_notification — continuation answer EVAPORATES (KNOWN BUG; P2.2 flips this)', async () => {
+  it('B2: #1 auto-background — realistic task_notification-led continuation is now DELIVERED (P2.2 flip; was evaporate)', async () => {
     const runner = new FakeRunner()
     const session = makeTestSession(runner)
-    const events: any[] = []
+    session.userId = undefined
+    const cont: Array<{ route: any; e: any }> = []
+    manager.onContinuationEvent = (_route, e) => cont.push({ route: _route, e })
 
-    // turn 1 has NO preceding task_started → expectsContinuation stays false → turn resolves.
-    runner.scripts = [[result()]]
-    await manager.submit(session, 'kick off auto-background subtask', (e) => events.push(e))
+    // realistic #1: the user turn launches a backgrounded agent (task_started) then result.
+    runner.scripts = [[taskStarted('agent-1'), result()]]
+    await manager.submit(session, 'kick off auto-background subtask', () => {})
+    assert.ok(session._continuationWatch, 'watch armed for the backgrounded task')
 
-    const finalsAfterTurn1 = events.filter((e) => e.kind === 'final').length
-    const turnsAfterTurn1 = session.turns
-    const eventsLen = events.length
-    assert.equal(finalsAfterTurn1, 1, 'turn 1 delivered its final')
-
-    // The auto-background subtask completes LATER: task_notification (bookend)
-    // then the continuation turn (init→assistant→result) arrives on the SAME
-    // runner with no new submit(). The message listener is still attached
-    // (detach never off()s 'message') but its parser is finalized → all dropped.
+    // the backgrounded agent completes LATER → task_notification bookend (inert at the
+    // parser), then the continuation turn (assistant → result) on the SAME runner.
     runner.emit('message', taskNotification('completed'))
     runner.emit('message', msgStart('m-cont'))
-    runner.emit('message', textDelta('Here is the synthesized auto-background answer.'))
+    runner.emit('message', textDelta('Here is the auto-background result summary.'))
     runner.emit('message', result())
+    await new Promise((r) => setImmediate(r))
 
-    // BUG BASELINE: nothing new delivered, turn counter unchanged for the dropped continuation.
-    assert.equal(events.length, eventsLen, 'continuation frames are dropped (no new events)')
-    assert.equal(events.filter((e) => e.kind === 'final').length, 1, 'no second final delivered')
-    assert.equal(session.turns, turnsAfterTurn1, 'dropped continuation does not advance turns')
+    assert.ok(
+      cont.some((c) => c.e.kind === 'final'),
+      'continuation final delivered (no longer evaporates)',
+    )
+    assert.ok(
+      cont.some(
+        (c) =>
+          c.e.kind === 'block' &&
+          (c.e.block as any)?.text === 'Here is the auto-background result summary.',
+      ),
+      'continuation answer delivered',
+    )
+    assert.equal(session._continuationWatch, null, 'watch ended after the continuation')
   })
 
   it('B3: invariant G — settle/lock-release exactly once per turn (two sequential turns both complete)', async () => {
@@ -325,73 +314,60 @@ describe('P2.0 baseline — sessionManager continuation orchestration', () => {
     assert.equal(events.filter((e) => e.kind === 'error').length, 0)
   })
 
-  it('B4a: continuation chain is bounded by MAX_CONTINUATIONS (locks the cap behaviorally)', async () => {
+  it('B4a: watch supports multi-continuation — a continuation that launches another bg task re-arms the watch', async () => {
     const runner = new FakeRunner()
     const session = makeTestSession(runner)
-    const turnsBefore = session.turns
-    const events: any[] = []
+    session.userId = undefined
+    const cont: Array<{ route: any; e: any }> = []
+    manager.onContinuationEvent = (route, e) => cont.push({ route, e })
 
-    // 17 task_started→result pairs: 1 initial + 16 continuations = MAX_CONTINUATIONS(16) exhausted,
-    // then the chain resolves on the 17th even though it also armed a continuation.
-    const burst: any[] = []
-    for (let i = 0; i < 17; i++) burst.push(taskStarted(`w${i}`), result())
-    runner.scripts = [burst]
-    await manager.submit(session, 'runaway', (e) => events.push(e))
+    runner.scripts = [[taskStarted('t0'), result()]]
+    await manager.submit(session, 'chain', () => {})
+    assert.ok(session._continuationWatch, 'watch armed')
 
-    assert.equal(
-      events.filter((e) => e.kind === 'final').length,
-      17,
-      'exactly 17 sub-turns complete',
-    )
-    assert.equal(session.turns - turnsBefore, 17)
-    assert.equal(runner.interrupted, false, 'bound is graceful — runner is not interrupted')
-
-    // A continuation arriving after the bound is dropped by the finalized parser.
-    const before = events.length
+    // continuation 1: produces an answer AND launches another bg task → re-arm.
+    runner.emit('message', msgStart('c1'))
+    runner.emit('message', textDelta('answer 1'))
+    runner.emit('message', taskStarted('t1'))
     runner.emit('message', result())
-    assert.equal(events.length, before, 'post-bound frame dropped')
+    assert.ok(
+      session._continuationWatch,
+      'watch re-armed after a continuation that launched another bg task',
+    )
+
+    // continuation 2: produces an answer, no further bg task → watch ends.
+    runner.emit('message', msgStart('c2'))
+    runner.emit('message', textDelta('answer 2'))
+    runner.emit('message', result())
+    await new Promise((r) => setImmediate(r))
+    assert.equal(session._continuationWatch, null, 'watch ended after the terminal continuation')
+
+    const contFinals = cont.filter((c) => c.e.kind === 'final')
+    assert.equal(contFinals.length, 2, 'both continuation finals delivered')
+    const ids = contFinals.map((c) => turnIdIndex(c.route.turnId))
+    assert.equal(ids[1], ids[0] + 1, 'continuation turnIds advance by 1 per sub-turn')
   })
 
-  it('B4b: continuation 90s soft-cap resolves GRACEFULLY on silence (no interrupt) — P2.3 replaces silence with session_state_changed', async () => {
+  it('B4b: watch ends on the idle backstop when no continuation arrives (no runner interrupt)', async () => {
     mock.timers.enable({ apis: ['Date', 'setInterval', 'setTimeout'] })
     try {
       const runner = new FakeRunner()
       const session = makeTestSession(runner)
-      const events: any[] = []
-
-      // arm a continuation then go silent — the 90s CONTINUATION_WAIT_MS soft cap should fire.
+      session.userId = undefined
       runner.scripts = [[taskStarted(), result()]]
-      let settled = false
-      const p = manager
-        .submit(session, 'bg then silent', (e) => events.push(e))
-        .then(() => {
-          settled = true
-        })
-      // flush microtasks so submit reaches runner.submit() and arms the soft-cap timer
-      await new Promise((r) => setImmediate(r))
-      // invariant: while waiting for the continuation, the turn is NOT yet settled
-      // (a broken impl that resolved on the first result would fail here, not just
-      // at the final-state assertions below).
-      assert.equal(settled, false, 'submit stays open while waiting for the continuation')
+      await manager.submit(session, 'bg then silent', () => {})
+      assert.ok(session._continuationWatch, 'watch armed')
 
-      mock.timers.tick(90_001)
-      await p
-      assert.equal(settled, true, 'the soft cap settles the turn')
-      assert.equal(
-        runner.interrupted,
-        false,
-        'graceful soft-cap must NOT interrupt the persistent process',
-      )
-      assert.ok(
-        events.some((e) => e.kind === 'final'),
-        'a final is emitted when the soft cap resolves',
-      )
+      // no continuation arrives; advance past the watch backstop.
+      mock.timers.tick(20 * 60_000 + 1)
+      assert.equal(session._continuationWatch, null, 'watch ended on the idle backstop')
+      assert.equal(runner.interrupted, false, 'backstop does NOT interrupt the persistent runner')
     } finally {
       mock.timers.reset()
     }
   })
 
-  it('B5: invariant D — current liveness idle thresholds (the dispatcher must NOT kill CONTINUATION_WATCH with the 5-min default)', () => {
+  it('B5: invariant D — current liveness idle thresholds (the watch must NOT be killed by the 5-min default)', () => {
     assert.equal(getLivenessIdleTimeoutMs(undefined), LIVENESS_IDLE_TIMEOUT_DEFAULT_MS)
     assert.equal(getLivenessIdleTimeoutMs({}), LIVENESS_IDLE_TIMEOUT_DEFAULT_MS)
     assert.equal(getLivenessIdleTimeoutMs({ pendingToolCalls: 1 }), LIVENESS_IDLE_TIMEOUT_TOOL_MS)
@@ -399,7 +375,6 @@ describe('P2.0 baseline — sessionManager continuation orchestration', () => {
       getLivenessIdleTimeoutMs({ isCompacting: true }),
       LIVENESS_IDLE_TIMEOUT_COMPACTING_MS,
     )
-    // 5-min default would interrupt a #1 auto-background wait (prod max 948s).
     assert.ok(LIVENESS_IDLE_TIMEOUT_DEFAULT_MS < 16 * 60_000)
   })
 
@@ -411,17 +386,10 @@ describe('P2.0 baseline — sessionManager continuation orchestration', () => {
     session._lastCcbCumulativeCost = 0.5
     const events: any[] = []
 
-    // result total_cost_usd=0.75 with prior cumulative 0.5 → POSITIVE delta 0.25,
-    // so in-flight the parser bumps totalCostUSD to 1.48 and _lastCcbCumulativeCost
-    // to 0.75 BEFORE onFinish. Using a positive delta (not result(0), which clamps
-    // to a zero delta) is what makes the rollback assertions non-false-green:
-    // if rollback were broken they'd read 1.48 / 0.75, not 1.23 / 0.5.
-    // assistantText matches AUTH_ERROR_PREFIX_RE (/^Failed to authenticate\b/).
+    // positive cost delta (0.75 - 0.5) so the rollback assertions are non-false-green.
     runner.scripts = [
       [msgStart('m-auth'), textDelta('Failed to authenticate: token expired'), result(0.75)],
     ]
-    // runOneTurnWithRetry swallows+retries AUTH_ERROR, so assert the invariant on the
-    // private per-turn engine where the rollback+reject is observable directly.
     await assert.rejects(
       (manager as any)._runOneTurn(session, 'hi', (e: any) => events.push(e)),
       /AUTH_ERROR/,
@@ -432,6 +400,177 @@ describe('P2.0 baseline — sessionManager continuation orchestration', () => {
       session._lastCcbCumulativeCost,
       0.5,
       'ccb cumulative rolled back (would be 0.75 if broken)',
+    )
+  })
+
+  it('B7: a user submit during a watch QUEUES behind it (continuation delivered first, then the user turn runs)', async () => {
+    const runner = new FakeRunner()
+    const session = makeTestSession(runner)
+    session.userId = undefined
+    const cont: any[] = []
+    manager.onContinuationEvent = (_route, e) => cont.push(e)
+
+    runner.scripts = [[taskStarted(), result()], [result()]] // 2nd burst = the queued user turn
+    await manager.submit(session, 'turn1 bg', () => {})
+    assert.ok(session._continuationWatch, 'watch armed')
+
+    // user submits again DURING the watch → must queue (await watch.done before taking the runner).
+    const p2 = manager.submit(session, 'turn2 interrupt', () => {})
+    await new Promise((r) => setImmediate(r))
+    assert.deepEqual(
+      runner.submissions,
+      ['turn1 bg'],
+      'queued submit has NOT written stdin while the watch is active',
+    )
+
+    // continuation arrives + completes → watch ends → queued submit proceeds.
+    runner.emit('message', msgStart('m-c'))
+    runner.emit('message', textDelta('continuation done'))
+    runner.emit('message', result())
+    await p2
+
+    assert.ok(
+      cont.some((e) => e.kind === 'block' && (e.block as any)?.text === 'continuation done'),
+      'continuation delivered before the queued user turn ran',
+    )
+    assert.deepEqual(
+      runner.submissions,
+      ['turn1 bg', 'turn2 interrupt'],
+      'queued submit ran only AFTER the watch ended',
+    )
+  })
+
+  it('B8: invariant E (per-context) — a continuation auth error rolls back ONLY its own context, not the user turn', async () => {
+    const runner = new FakeRunner()
+    const session = makeTestSession(runner)
+    session.userId = undefined
+    manager.onContinuationEvent = () => {}
+
+    runner.scripts = [[taskStarted(), result()]]
+    await manager.submit(session, 'bg', () => {})
+    assert.ok(session._continuationWatch)
+    const turnsAfterUser = session.turns
+    const costAfterUser = session.totalCostUSD
+
+    // the continuation hits an auth error → its own per-context snapshot is restored,
+    // the watch ends, and the USER turn's accumulators are untouched.
+    runner.emit('message', msgStart('m-auth'))
+    runner.emit('message', textDelta('Failed to authenticate: continuation token expired'))
+    runner.emit('message', result(0.9))
+    await new Promise((r) => setImmediate(r))
+
+    assert.equal(session._continuationWatch, null, 'watch ended on continuation auth error')
+    assert.equal(
+      session.turns,
+      turnsAfterUser,
+      'user-turn count NOT rolled back by a continuation auth error',
+    )
+    assert.equal(
+      session.totalCostUSD,
+      costAfterUser,
+      'user-turn cost NOT corrupted by a continuation auth error',
+    )
+  })
+
+  it('B9: durable no-drop floor — the continuation answer is persisted (durable outbox) with its srv-tN id', async () => {
+    const runner = new FakeRunner()
+    const session = makeTestSession(runner) // userId='boss' → durable write fires
+    manager.onContinuationEvent = () => {}
+
+    runner.scripts = [[taskStarted(), result()]]
+    let userTurnId: string | undefined
+    await manager.submit(session, 'bg', (e) => {
+      if (e.kind === 'final') userTurnId = session._activeTurnId
+    })
+    assert.ok(session._continuationWatch)
+
+    const text = `durable-floor continuation ${userTurnId}`
+    runner.emit('message', msgStart('m-d'))
+    runner.emit('message', textDelta(text))
+    runner.emit('message', result())
+    // the durable write is on the per-session serial chain — await it (settlement).
+    await session._continuationWrite
+    await new Promise((r) => setImmediate(r))
+
+    // No client_session row exists in the tmp store, so appendServerAuthoredMessageDurable
+    // queues to the durable outbox (replayed on restart) — that IS the no-drop floor.
+    const outbox = await readFile(
+      join(process.env.OPENCLAUDE_HOME ?? '', 'msg-outbox.jsonl'),
+      'utf8',
+    ).catch(() => '')
+    const expectedId = `srv-web-test-t${turnIdIndex(userTurnId) + 1}`
+    assert.ok(
+      outbox.includes(expectedId) && outbox.includes(text),
+      `continuation answer must be persisted to the durable outbox with id ${expectedId}`,
+    )
+  })
+
+  it('B10: a phantom continuation (zero output, zero tokens) is rolled back — no turn/cost advance, watch ends', async () => {
+    const runner = new FakeRunner()
+    const session = makeTestSession(runner)
+    session.userId = undefined
+    manager.onContinuationEvent = () => {}
+
+    runner.scripts = [[taskStarted(), result()]]
+    await manager.submit(session, 'bg', () => {})
+    assert.ok(session._continuationWatch)
+    const turnsAfterUser = session.turns
+    const costAfterUser = session.totalCostUSD
+
+    // the continuation produces NOTHING: a clean all-zero result (claude returned
+    // without invoking the model) → must be rolled back, not counted/delivered.
+    runner.emit('message', {
+      type: 'result',
+      subtype: 'success',
+      session_id: SID,
+      total_cost_usd: 0,
+      duration_ms: 1,
+      is_error: false,
+      result: '',
+      usage: {
+        input_tokens: 0,
+        output_tokens: 0,
+        cache_read_input_tokens: 0,
+        cache_creation_input_tokens: 0,
+      },
+    })
+    await new Promise((r) => setImmediate(r))
+
+    assert.equal(session._continuationWatch, null, 'watch ended on the phantom continuation')
+    assert.equal(session.turns, turnsAfterUser, 'phantom continuation rolled back the turn counter')
+    assert.equal(session.totalCostUSD, costAfterUser, 'phantom continuation rolled back cost')
+  })
+
+  it('B11: a runner crash mid-continuation flushes the partial text durably (no-drop on the crash path)', async () => {
+    const runner = new FakeRunner()
+    const session = makeTestSession(runner) // userId='boss' → durable
+    session.turns = 50 // distinct turn base so durable ids don't collide with B9 in the shared outbox
+    manager.onContinuationEvent = () => {}
+
+    runner.scripts = [[taskStarted(), result()]]
+    let userTurnId: string | undefined
+    await manager.submit(session, 'bg', (e) => {
+      if (e.kind === 'final') userTurnId = session._activeTurnId
+    })
+    assert.ok(session._continuationWatch)
+
+    // the continuation streams partial text, then the runner CRASHES before result.
+    const partial = `partial continuation answer ${userTurnId}`
+    runner.emit('message', msgStart('m-crash'))
+    runner.emit('message', textDelta(partial))
+    runner.emit('exit', { code: null, signal: 'SIGKILL', crashed: true })
+    await session._continuationWrite
+    await new Promise((r) => setImmediate(r))
+
+    assert.equal(session._continuationWatch, null, 'watch ended on runner crash')
+    const outbox = await readFile(
+      join(process.env.OPENCLAUDE_HOME ?? '', 'msg-outbox.jsonl'),
+      'utf8',
+    ).catch(() => '')
+    const expectedId = `srv-web-test-t${turnIdIndex(userTurnId) + 1}`
+    assert.ok(
+      outbox.includes(expectedId) && outbox.includes(partial),
+      `partial continuation text must be flushed to the durable outbox with id ${expectedId} on crash`,
     )
   })
 })

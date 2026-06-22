@@ -116,3 +116,21 @@ R1(`task_notification` 真实帧未知)已闭环。机器上**没有任何 trans
 3. P2.0 #1 baseline 测试不再 `.todo`:以上真帧形状可直接构造 faithful mock 序列(`result → task_notification(status:'completed') → [init/system] → assistant → result`)。
 
 > 此节是源码 ground truth(可直接照抄进 mock);第 2 点的 watcher 信号改造是**对已审设计的偏离**,P2.3 plan 必须显式向 Codex/boss 复核后再落地,不得静默替换。
+
+## 九、P2.2 实现契约(Codex 两轮审 PASS @ 2026-06-23,Option A)
+
+新 ground truth(CCB 源码):`registerTask`(framework.ts:104)在**任意** task 启动时(#1 backgrounded agent + #2 workflow)发 `task_started`,在 result **前**;`_parseWorkflowSystem` 映射所有 task_started→workflow_progress{started}(不按 task_type gate)。所以 **#1 也会 set expectsContinuation**。真 bug = "持有 lock + re-arm + 90s soft-cap" 治了快的 87%(median 3.3s),但慢的 13%(>90s,max 948s)续轮在 soft-cap finalize+drop 之后到 → 蒸发。持锁更久不可接受(16min 冻 UI)。
+
+**核心:result 处放锁 + 进 CONTINUATION_WATCH(永久 pump 喂),续轮在锁外投递(实时,优化)+ 持久化(durable,不丢底线)。** 取代 hold-lock+softcap。
+
+实现要点(含 Codex 必守约束):
+1. **最小 submit gate(P2.2 就要,否则有 no-drop 漏洞)**:watch active 时 `submit()` 在 repoint `_currentTurnHandler`/写 stdin **之前** await watch 完成(donePromise,受 backstop 限时);用户插话排在 watch 后,不打断续轮。
+2. **turn 计数不双增**:watch parser 用 `sessionTotals: session`,`_handleResult` 自己 +turns。不手动 `++session.turns`。turnId 开 context 时 precompute `serverAuthoredMsgId(peerId, turns+1)`,durable 用 post-increment 的 `turns`(同现有 onFinish lockstep)。
+3. **durable 重入**:parser onFinish 同步 → 同步 capture result + 同步 re-arm fresh parser + repoint `_currentTurnHandler`(下一续轮帧能路由)→ 再把 durable append 入**每 session 串行链** `_continuationWrite`(仿 `_resumeMapWrite`)。实时 deliver 在 onFinish 同步走 `onContinuationEvent`。watch "完全 settle"(destroy/eviction await)= 串行链 drain 后。capture 不可变 `{turnId, assistantText, userId, peerId, turnIndex}`(别用 live session 字段,下一 context 会改)。
+4. **watch liveness/eviction**:submit 的 5min liveness 只在 submit 期间(finally 清),放锁后不作用于 watch。watch 自己的 backstop idle timer(raw msg 刷新,低于 30min webchat eviction TTL),超时**不**interrupt runner。LRU eviction sweep 跳过 `_continuationWatch` active 的 session。P2.3 把 silence backstop 换成 session_state_changed(idle) 主信号。
+5. **watch exit/error**:submit turn 的 per-turn exit/error 在 turn resolve 时已 detach;watch 装自己的 minimal exit/error listener(runner 崩 → flush partial 续轮文本 durable + end watch + 释放排队 submit)。createSession 的永久 crash-log exit listener 不动。watch-local settled guard(double observe OK,double settle 不行)。
+6. **per-context rollback(E/R5)**:每 continuation context 开时 capture 自己的 prevCost/prevTurns/prevLastCcbCost;续轮 auth/phantom 只回滚自己,绝不碰原 user turn;续轮 auth-error 结束 watch(不 retry user turn)。
+7. **独立投递**:新 `public onContinuationEvent?(route, event)`;gateway wire 到 stamp turnId + push peer ws(仿 server.ts block/final deliver),**不复用** per-submit onEvent(避 _runLog 双 complete + stale out.blocks)。
+8. 删 90s CONTINUATION_WAIT_MS finalize+drop;保留 MAX_CONTINUATIONS。
+9. watch-end 清理必须全:clear `_continuationWatch` + 仅当仍属己时 repoint `_currentTurnHandler` + remove watch exit/error/parse_error + clear timers + resolve 排队 submit waiter;durable 链失败也要 settle 链 + end watch(排队 submit 不能永挂)。
+10. 测试:翻 B2(#1 投递+持久化)、改 B1(#2 release+watch)、加"慢续轮(>90s 旧窗口后)被接住"、submit-gate(插话排队、续轮仍投递)、per-context rollback 隔离、watch backstop end、eviction 跳过 active watch;storage-mock 测(durable 一次/正确 srv-tN)放独立文件、mock.module 在 import sessionManager 前。
