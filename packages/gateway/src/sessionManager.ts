@@ -315,12 +315,69 @@ export interface AgentSession {
   // thinking by turn and reconcile live (m-*) messages with the server-authored
   // durable row (which shares this exact id). undefined for non-webchat sessions.
   _activeTurnId?: string
-  // Cross-turn stdout 'message' listener. Per-turn _runOneTurn replaces
-  // (not removes) this on the next turn so bg-bash bash_output_tail
-  // emitted after the turn's `result` keeps flowing through parser ->
-  // onEvent -> deliver. destroySession/shutdownAll explicitly off().
-  _currentMessageListener?: ((msg: any) => void) | null
+  // Permanent (session-lifetime) stdout 'message' pump. Installed once on the
+  // first _runOneTurn and bound to `session.runner` (never reassigned, so it
+  // survives effort/model recycle + idle hard-reset which shut the proc but keep
+  // the runner EventEmitter). It delegates each raw message to the current turn's
+  // handler — the dispatcher seam P2.2/P2.3 build on. destroySession/shutdownAll/
+  // eviction explicitly off() it.
+  _messagePump?: ((msg: any) => void) | null
+  // The current turn's message handler (set per turn in _runOneTurn). The pump
+  // routes to whatever this points at. Deliberately NOT cleared on detach so a
+  // post-result frame still reaches the old, finalized parser and is dropped —
+  // preserving the legacy "replace not remove" behaviour (the next turn replaces it).
+  _currentTurnHandler?: ((msg: any) => void) | null
+  // P2.2: active continuation watch — runs OUTSIDE the submit lock after a turn
+  // that launched a background task resolves. The permanent pump routes to its
+  // parser; a new user submit queues behind it (minimal strict gate). null/absent
+  // when no watch is active.
+  _continuationWatch?: ContinuationWatch | null
+  // P2.2: per-session serial chain for continuation durable writes. Serialized so
+  // the pump can synchronously re-arm + deliver the NEXT continuation while a prior
+  // durable append is still in flight, without reordering/dropping (mirrors the
+  // _resumeMapWrite chain pattern).
+  _continuationWrite?: Promise<void>
   _historicalContextInjected?: boolean
+}
+
+/** Immutable routing captured when a continuation watch opens. The gateway wires
+ *  SessionManager.onContinuationEvent to stamp `turnId` + push to the peer's ws —
+ *  an independent delivery path (NOT the per-submit onEvent closure, which would
+ *  re-complete the RunLog and clear stale out.blocks). */
+export interface ContinuationDeliveryRoute {
+  sessionKey: string
+  peerId: string
+  userId?: string
+  channel: string
+  agentId: string
+  /** The (sub-)turn id — `srv-${peerId}-t${turnIndex}` — shared by every frame of
+   *  this continuation and equal to its durable row id (invariant C lockstep). */
+  turnId?: string
+}
+
+/** Session-level continuation watch state (P2.2). Lives on the session, fed by the
+ *  permanent stdout pump, outside any submit lock. */
+export interface ContinuationWatch {
+  /** Fresh parser for the current continuation sub-turn (re-armed per sub-turn). */
+  parser: import('./claudeMessageParser.js').ClaudeMessageParser
+  /** Streaming turnId for the current sub-turn = serverAuthoredMsgId(peerId, turns+1),
+   *  recomputed at each re-arm. Equals the eventual durable row id (turns post-inc). */
+  streamTurnId?: string
+  /** Immutable route captured at watch open. */
+  route: ContinuationDeliveryRoute
+  /** Sub-turns delivered so far (bounded by MAX_CONTINUATIONS). */
+  count: number
+  /** Backstop idle timer — ends the watch on prolonged silence (no interrupt). */
+  backstop: ReturnType<typeof setTimeout> | null
+  /** Watch-owned settle guard (double observe OK, double settle not). */
+  ended: boolean
+  /** Runner listeners owned by the watch (removed on every end path). */
+  onExit: (info: { code: number | null; signal: string | null; crashed: boolean }) => void
+  onError: (err: Error) => void
+  onParseError: (p: { line: string; err: unknown }) => void
+  /** Resolved when the watch ends — queued user submits await this. */
+  done: Promise<void>
+  resolveDone: () => void
 }
 
 /** Canonical id for a server-authored assistant message / its turn. Single
@@ -357,6 +414,12 @@ export class SessionManager {
   public onAuthError?: () => Promise<void>
   /** Called after server-authored assistant text mutates a client_sessions row. */
   public onClientSessionMutated?: (sessionId: string, userId: string) => void
+  // P2.2: independent continuation delivery. The gateway wires this to stamp
+  // route.turnId onto the event and push it to the peer's ws (mirroring the
+  // per-block/final deliver), WITHOUT the per-submit onEvent closure (which would
+  // re-complete the RunLog + clear stale out.blocks). Optimization layer on top of
+  // the durable "no-drop" floor — absent callback => persist-only (still no drop).
+  public onContinuationEvent?: (route: ContinuationDeliveryRoute, event: SessionStreamEvent) => void
 
   private resumeMapPath = join(paths.home, 'resume-map.json')
 
@@ -816,6 +879,15 @@ export class SessionManager {
     let turnPromise: Promise<void> | null = null
     try {
       await prev
+      // P2.2 minimal strict gate: if a continuation watch from the prior turn is
+      // still delivering/persisting the late continuation (out-of-lock), let it
+      // finish BEFORE this user submit repoints the pump / writes stdin — otherwise
+      // the in-flight continuation's frames would be misrouted into this turn's
+      // parser. Bounded by the watch backstop. (P2.3 refines into the full strict
+      // state machine + supersede.)
+      if (session._continuationWatch) {
+        await session._continuationWatch.done
+      }
       // effort 应用必须在本 turn 真正启动**之前**完成,且必须在 prev 之后:
       //   - prev 之前:可能中断别人的 in-flight turn
       //   - 本 turn 之后:env 已被 CCB 启动时读完,改也无效
@@ -1361,8 +1433,9 @@ export class SessionManager {
         // where idle-timeout releases the lock, a new turn starts and sets
         // a new parser, then this stale detach wipes the new reference).
         if (session._currentParser === parser) session._currentParser = undefined
-        // 故意不卸载 runner.off('message', handleMessage):下一轮 _runOneTurn
-        // 启动时会主动替换 session._currentMessageListener,旧闭包链届时被 GC。
+        // 故意不动 session._currentTurnHandler:permanent pump 仍指向本轮 handler,
+        // 下一轮 _runOneTurn 会 repoint;期间 post-result 帧落到已 finalized 的旧
+        // parser 被丢弃(保留 "replace not remove" 语义)。pump 本身常驻不卸载。
         runner.off('error', handleError)
         runner.off('exit', handleExit)
         runner.off('parse_error', handleParseError)
@@ -1706,31 +1779,44 @@ export class SessionManager {
               })
             }
           }
-          // Background-workflow continuation: if this sub-turn launched a
-          // background Workflow, claude will proactively emit the result answer
-          // as a fresh turn on the same runner. Keep the turn open + re-arm a
-          // fresh parser instead of resolving, so that answer is delivered and
-          // persisted (each sub-turn already incremented session.turns → distinct
-          // durable-append id). Resolve only when a sub-turn launches no workflow.
+          // Continuation: this sub-turn launched a background task, so claude will
+          // proactively emit the result answer as a fresh turn on the same runner.
           if (expectsContinuation && continuationCount < MAX_CONTINUATIONS) {
-            continuationCount++
-            expectsContinuation = false
-            turnBlockCount = 0
-            turnToolCallCount = 0
-            turnPermissionCount = 0
-            pendingFinal = null
-            parser.finish()
-            if (session._currentParser === parser) session._currentParser = undefined
-            // New continuation sub-turn → new turnId (the prev sub-turn's result
-            // already incremented session.turns).
-            refreshActiveTurnId()
-            parser = new ClaudeMessageParser(parserConfig)
-            session._currentParser = parser
-            if (!detached) {
-              timer.refresh()
-              armContinuationTimer()
+            if (session.channel === 'webchat') {
+              // P2.2: RELEASE the submit lock now and hand off to an OUT-OF-LOCK
+              // continuation watch. The watch (fed by the permanent pump) catches
+              // the late continuation (median 3.3s, up to 16min), delivers it via
+              // onContinuationEvent + persists it durably — no 90s tail-loss, no
+              // 16-min lock hold. A queued user submit waits on watch.done.
+              this._armContinuationWatch(session, {
+                sessionKey: session.sessionKey,
+                peerId: session.peerId,
+                userId: session.userId,
+                channel: session.channel,
+                agentId: session.agentId,
+              })
+              // fall through → detach + settle (release lock); the watch owns it now.
+            } else {
+              // Non-webchat (cron/telegram/delegate): no peer-ws continuation
+              // delivery path, and continuations are rare. Keep the legacy in-lock
+              // re-arm + 90s soft-cap unchanged to avoid regressing those channels.
+              continuationCount++
+              expectsContinuation = false
+              turnBlockCount = 0
+              turnToolCallCount = 0
+              turnPermissionCount = 0
+              pendingFinal = null
+              parser.finish()
+              if (session._currentParser === parser) session._currentParser = undefined
+              refreshActiveTurnId()
+              parser = new ClaudeMessageParser(parserConfig)
+              session._currentParser = parser
+              if (!detached) {
+                timer.refresh()
+                armContinuationTimer()
+              }
+              return
             }
-            return
           }
           detach()
           settle(() => resolve())
@@ -1832,19 +1918,20 @@ export class SessionManager {
         }, 150)
       }
 
-      // Replace any prior turn's stdout listener (kept attached across turn
-      // boundaries to forward bg bash bash_output_tail) before installing
-      // this turn's listener. This ensures there's at most one
-      // 'message' listener per session at any time, so closures from old
-      // turns become unreachable and GC'able.
-      if (session._currentMessageListener) {
-        try {
-          runner.off('message', session._currentMessageListener)
-        } catch {}
-        session._currentMessageListener = null
+      // Permanent stdout pump (install-once, session-lifetime). Bound to
+      // `session.runner`, which is never reassigned — it survives effort/model
+      // recycle + idle hard-reset (those shut the proc, keep the runner). The
+      // pump routes each raw message to the current turn's handler; per turn we
+      // just repoint `_currentTurnHandler`. This replaces the old per-turn
+      // off-old/on-new churn while keeping exactly one routing target at a time.
+      // (The pump is the seam P2.2/P2.3 extend to catch post-result continuation
+      // frames without holding the submit lock.)
+      if (!session._messagePump) {
+        const pump = (msg: any) => session._currentTurnHandler?.(msg)
+        session._messagePump = pump
+        runner.on('message', pump)
       }
-      runner.on('message', handleMessage)
-      session._currentMessageListener = handleMessage
+      session._currentTurnHandler = handleMessage
       runner.on('error', handleError)
       runner.on('exit', handleExit)
       runner.on('parse_error', handleParseError)
@@ -1855,6 +1942,272 @@ export class SessionManager {
         settle(() => resolve())
       })
     })
+  }
+
+  /** P2.2: arm a continuation watch after a turn that launched a background task
+   *  resolves. Runs OUTSIDE the submit lock — the permanent pump feeds it. Catches
+   *  the late continuation turn (task_notification → init → assistant → result),
+   *  delivers it real-time via onContinuationEvent and persists it durably on a
+   *  serial chain (the no-drop floor). Multi-continuation: re-arms while each
+   *  continuation launches another background task, bounded by MAX_CONTINUATIONS.
+   *  A queued user submit awaits `watch.done`. */
+  private _armContinuationWatch(session: AgentSession, route: ContinuationDeliveryRoute): void {
+    if (session._continuationWatch) return // one watch per session
+    const runner = session.runner
+    const WATCH_BACKSTOP_MS = 20 * 60_000 // generous; below the 30-min webchat eviction TTL. P2.3 swaps for session_state_changed(idle).
+    const MAX_CONTINUATIONS = 16
+
+    let resolveDone!: () => void
+    const done = new Promise<void>((r) => {
+      resolveDone = r
+    })
+    const watch: ContinuationWatch = {
+      parser: undefined as any, // set by armNext() below
+      streamTurnId: undefined,
+      route,
+      count: 0,
+      backstop: null,
+      ended: false,
+      onExit: () => {},
+      onError: () => {},
+      onParseError: () => {},
+      done,
+      resolveDone,
+    }
+
+    const refreshBackstop = () => {
+      if (watch.backstop) clearTimeout(watch.backstop)
+      watch.backstop = setTimeout(() => {
+        if (watch.ended) return
+        log.info('continuation watch idle backstop — ending', { sessionKey: session.sessionKey })
+        this._endContinuationWatch(session)
+      }, WATCH_BACKSTOP_MS)
+      // A pending watch must never keep the process alive on its own (the gateway
+      // server keeps it up); unref so shutdown/tests aren't blocked by the backstop.
+      watch.backstop.unref?.()
+    }
+
+    // Build a fresh continuation sub-turn context (parser + streamTurnId + per-
+    // context rollback snapshot). Called at open and at each re-arm.
+    const armNext = () => {
+      const peerId = route.peerId
+      // turns+1 now == session.turns AFTER this sub-turn's result (the parser
+      // increments via sessionTotals: session) → durable row id == streaming turnId.
+      const streamTurnId = peerId ? serverAuthoredMsgId(peerId, session.turns + 1) : undefined
+      watch.streamTurnId = streamTurnId
+      // per-context rollback snapshot (invariant E / R5) — isolated from the user turn.
+      const prevCostUSD = session.totalCostUSD
+      const prevTurns = session.turns
+      const prevLastCcbCost = session._lastCcbCumulativeCost
+      let expectsAnother = false
+      let producedOutput = false // any observable output (block/permission) — for phantom detection
+      let pendingFinal: SessionStreamEvent | null = null
+
+      const deliver = (e: SessionStreamEvent) =>
+        this.onContinuationEvent?.({ ...route, turnId: streamTurnId }, e)
+
+      watch.parser = new ClaudeMessageParser({
+        toolUseIdToName: session.toolUseIdToName,
+        onEvent: (e) => {
+          if (e.kind === 'workflow_progress' && e.stage === 'started') expectsAnother = true
+          else if (e.kind === 'block' || e.kind === 'permission_request') producedOutput = true
+          if (e.kind === 'final') {
+            pendingFinal = e
+            return
+          }
+          deliver(e)
+        },
+        onToolUse: undefined,
+        onFinish: (result) => {
+          if (!result || watch.ended) return // null = parser.finish() during end
+          // per-context auth rollback — restore ONLY this context's snapshot, end watch.
+          const isAuthError =
+            (result.isError && SessionManager.AUTH_KEYWORDS_RE.test(result.assistantText)) ||
+            SessionManager.AUTH_ERROR_PREFIX_RE.test(result.assistantText)
+          if (isAuthError) {
+            session.totalCostUSD = prevCostUSD
+            session.turns = prevTurns
+            session._lastCcbCumulativeCost = prevLastCcbCost
+            this._endContinuationWatch(session)
+            return
+          }
+          // per-context phantom rollback — a continuation that produced NOTHING
+          // (zero tokens/cost, no observable output, no further task) is a phantom:
+          // restore this context's snapshot so it neither advances the turn counter
+          // nor delivers/persists, then end the watch. (Mirrors the main-turn phantom
+          // guard, minus the user-input-string gate which doesn't apply to a
+          // model-proactive continuation.)
+          const isPhantom =
+            !result.isError &&
+            !producedOutput &&
+            !expectsAnother &&
+            result.inputTokens === 0 &&
+            result.outputTokens === 0 &&
+            result.cacheReadTokens === 0 &&
+            result.cacheCreationTokens === 0 &&
+            result.cost === 0
+          if (isPhantom) {
+            session.totalCostUSD = prevCostUSD
+            session.turns = prevTurns
+            session._lastCcbCumulativeCost = prevLastCcbCost
+            this._endContinuationWatch(session)
+            return
+          }
+          // forward the buffered final (real-time optimization)
+          if (pendingFinal) deliver(pendingFinal)
+          // capture IMMUTABLE values — the next context can mutate live session fields.
+          const assistantText = result.assistantText ?? ''
+          const turnIndex = session.turns // post-increment by the parser
+          const durableTurnId = streamTurnId
+          const userId = route.userId
+          watch.count++
+          const reArm = expectsAnother && watch.count < MAX_CONTINUATIONS
+          // SYNC re-arm BEFORE awaiting the durable write so the NEXT continuation's
+          // frames route to a fresh parser without reordering/dropping.
+          if (reArm) armNext()
+
+          // durable "no-drop" floor on a per-session serial chain.
+          if (
+            session.channel === 'webchat' &&
+            userId &&
+            assistantText.length > 0 &&
+            durableTurnId
+          ) {
+            session._continuationWrite = (session._continuationWrite ?? Promise.resolve())
+              .then(async () => {
+                const r = await appendServerAuthoredMessageDurable(peerId, userId, {
+                  id: durableTurnId,
+                  role: 'assistant',
+                  text: assistantText,
+                  ts: Date.now(),
+                  status: 'completed',
+                })
+                if (r.applied) this.onClientSessionMutated?.(peerId, userId)
+              })
+              .catch((err) =>
+                log.error(
+                  'continuation durable append failed',
+                  { sessionKey: session.sessionKey, turnIndex },
+                  err as Error,
+                ),
+              )
+          }
+          // observability (mirrors the main-turn onFinish emits)
+          eventBus.emit(
+            'turn.completed',
+            createEvent('turn.completed', session.agentId, {
+              sessionKey: session.sessionKey,
+              turnIndex,
+              usage: {
+                inputTokens: result.inputTokens,
+                outputTokens: result.outputTokens,
+                cacheReadTokens: result.cacheReadTokens,
+                cacheCreationTokens: result.cacheCreationTokens,
+                costUsd: result.cost,
+                model: session.model,
+              },
+              toolCalls: 0,
+              durationMs: 0,
+            }),
+          )
+
+          if (reArm) refreshBackstop()
+          else this._endContinuationWatch(session)
+        },
+        sessionTotals: session,
+      })
+      session._currentParser = watch.parser
+    }
+
+    watch.onError = (err: Error) => {
+      if (watch.ended) return
+      log.warn('continuation watch runner error', {
+        sessionKey: session.sessionKey,
+        err: err.message,
+      })
+      this._endContinuationWatch(session)
+    }
+    watch.onExit = (info) => {
+      if (watch.ended) return
+      // Mirror the main-turn handleExit drain: persist any partial continuation
+      // text durably before ending, so a runner crash mid-continuation doesn't
+      // lose the streamed-but-unfinalized answer (no-drop floor on the crash path).
+      const partial = watch.parser?.assistantBuf
+      if (
+        route.channel === 'webchat' &&
+        route.userId &&
+        watch.streamTurnId &&
+        partial &&
+        partial.length > 0
+      ) {
+        const status: 'interrupted' | 'crashed' = info.signal ? 'interrupted' : 'crashed'
+        const peerId = route.peerId
+        const userId = route.userId
+        const turnId = watch.streamTurnId
+        const text = partial
+        session._continuationWrite = (session._continuationWrite ?? Promise.resolve())
+          .then(async () => {
+            const r = await appendServerAuthoredMessageDurable(peerId, userId, {
+              id: turnId,
+              role: 'assistant',
+              text,
+              ts: Date.now(),
+              status,
+            })
+            if (r.applied) this.onClientSessionMutated?.(peerId, userId)
+          })
+          .catch((err) =>
+            log.error(
+              'continuation partial flush failed',
+              { sessionKey: session.sessionKey },
+              err as Error,
+            ),
+          )
+      }
+      this._endContinuationWatch(session)
+    }
+    watch.onParseError = () => {}
+
+    session._continuationWatch = watch
+    armNext()
+    // Route the permanent pump to the watch parser (late-bound on watch.parser so
+    // re-arm reassignment is picked up). Ended → no-op (next user submit repoints).
+    session._currentTurnHandler = (msg: any) => {
+      if (watch.ended) return
+      refreshBackstop()
+      watch.parser.parse(msg)
+    }
+    runner.on('error', watch.onError)
+    runner.on('exit', watch.onExit)
+    runner.on('parse_error', watch.onParseError)
+    refreshBackstop()
+  }
+
+  /** End an active continuation watch: remove its listeners + timer, finalize its
+   *  parser, clear state, and release any queued user submit. Idempotent. */
+  private _endContinuationWatch(session: AgentSession): void {
+    const watch = session._continuationWatch
+    if (!watch || watch.ended) return
+    watch.ended = true
+    if (watch.backstop) {
+      clearTimeout(watch.backstop)
+      watch.backstop = null
+    }
+    try {
+      session.runner.off('error', watch.onError)
+    } catch {}
+    try {
+      session.runner.off('exit', watch.onExit)
+    } catch {}
+    try {
+      session.runner.off('parse_error', watch.onParseError)
+    } catch {}
+    if (watch.parser && !watch.parser.finalized) watch.parser.finish()
+    if (session._currentParser === watch.parser) session._currentParser = undefined
+    session._continuationWatch = null
+    // _currentTurnHandler still points at the (now no-op) watch handler; the next
+    // user submit repoints it (mirrors the replace-not-remove discipline).
+    watch.resolveDone()
   }
 
   interrupt(sessionKey: string): boolean {
@@ -1937,14 +2290,16 @@ export class SessionManager {
   async destroySession(sessionKey: string): Promise<void> {
     const s = this.sessions.get(sessionKey)
     if (s) {
+      this._endContinuationWatch(s) // tear down any active continuation watch first
       // Detach cross-turn message listener before shutting down to release
       // the closure chain (parser + per-turn onEvent + frame envelope).
-      if (s._currentMessageListener) {
+      if (s._messagePump) {
         try {
-          s.runner.off('message', s._currentMessageListener)
+          s.runner.off('message', s._messagePump)
         } catch {}
-        s._currentMessageListener = null
+        s._messagePump = null
       }
+      s._currentTurnHandler = null
       await s.runner.shutdown()
       this.sessions.delete(sessionKey)
     }
@@ -1964,12 +2319,14 @@ export class SessionManager {
     this._saveResumeMap()
     await this._resumeMapWrite
     for (const s of this.sessions.values()) {
-      if (s._currentMessageListener) {
+      this._endContinuationWatch(s)
+      if (s._messagePump) {
         try {
-          s.runner.off('message', s._currentMessageListener)
+          s.runner.off('message', s._messagePump)
         } catch {}
-        s._currentMessageListener = null
+        s._messagePump = null
       }
+      s._currentTurnHandler = null
     }
     await Promise.all([...this.sessions.values()].map((s) => s.runner.shutdown()))
     this.sessions.clear()
@@ -2004,6 +2361,9 @@ export class SessionManager {
         // so an evicted webchat subprocess can cold-start via --resume on next message.
         const isTempSession = key.includes(':cron:') || key.includes(':task:')
         const maxIdle = isTempSession ? this.maxIdleMsCron : this.maxIdleMsChat
+        // P2.2: never evict a session with an active continuation watch — the late
+        // continuation (up to ~16min) is still being delivered/persisted out-of-lock.
+        if (s._continuationWatch) continue
         // Use the more recent of lastUsedAt and runner.lastActivityAt to avoid
         // killing sessions with long-running active tasks
         const lastActive = Math.max(s.lastUsedAt, s.runner.lastActivityAt)
@@ -2014,12 +2374,13 @@ export class SessionManager {
       for (const key of toEvict) {
         const s = this.sessions.get(key)
         if (!s) continue
-        if (s._currentMessageListener) {
+        if (s._messagePump) {
           try {
-            s.runner.off('message', s._currentMessageListener)
+            s.runner.off('message', s._messagePump)
           } catch {}
-          s._currentMessageListener = null
+          s._messagePump = null
         }
+        s._currentTurnHandler = null
         s.runner.shutdown().catch(() => {})
         this.sessions.delete(key)
         // Only webchat sessions should survive eviction in resume-map.

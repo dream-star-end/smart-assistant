@@ -404,6 +404,34 @@ export class Gateway {
     this.sessions.onClientSessionMutated = (sessionId, userId) => {
       this._redisSessionBus.invalidateClientSession(userId, sessionId)
     }
+    // P2.2: out-of-band delivery of a continuation answer (the late auto-background
+    // / workflow result turn). webchat-only — stamp route.turnId + push to the peer
+    // ws via deliver(), mirroring the per-block/final path in dispatchInbound but
+    // WITHOUT the per-submit onEvent closure (which would re-complete the RunLog +
+    // clear stale out.blocks). The durable "no-drop" floor lives in sessionManager.
+    this.sessions.onContinuationEvent = (route, event) => {
+      if (route.channel !== 'webchat') return
+      const base: OutboundMessage = {
+        type: 'outbound.message',
+        sessionKey: route.sessionKey,
+        channel: route.channel,
+        peer: { id: route.peerId, kind: 'dm' },
+        blocks: [],
+        isFinal: false,
+      }
+      ;(base as any)._userId = route.userId ?? 'default'
+      if (event.kind === 'block') {
+        this.deliver({ ...base, blocks: [event.block], isFinal: false, turnId: route.turnId })
+      } else if (event.kind === 'final') {
+        this.deliver({
+          ...base,
+          blocks: [],
+          isFinal: true,
+          meta: event.meta,
+          turnId: route.turnId,
+        })
+      }
+    }
     const sidecarCfg = deps.config.gateway.chatgptTlsSidecar
     this._chatgptTlsSidecar = new ChatGptTlsSidecar(
       {
