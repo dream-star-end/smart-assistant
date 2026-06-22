@@ -83,3 +83,36 @@ CONTINUATION_WATCH 期间用户 submit **在 gateway 内排队**(不写 stdin),�
 - **P2.4**:全测试 + Codex 审 + dev mock 帧序列验证(#1 dev `CLAUDE_AUTO_BACKGROUND_TASKS=0` 复现不了,用 mock)+ 上线。
 
 每阶段过 Codex;dev 验证用 mock 帧序列(auto-bg 真实序列 dev 复现不了)。
+
+## 八、帧形状 ground truth(源码核验 @ 2026-06-22)+ 设计修正
+
+R1(`task_notification` 真实帧未知)已闭环。机器上**没有任何 transcript 含真帧**——证明设计/注释里 `task_notification` 这个名字此前是推测。权威源 = 官方 Claude Code 源码副本 `claude-code-best`(installed CLI 2.1.185 已编译为 ELF,不可 grep;CCB 是其 TS 源)。
+
+**核验到的真实 SDK system 帧形状**(`src/entrypoints/sdk/coreSchemas.ts` Zod schema + `src/utils/sdkEventQueue.ts` 发射器 + `src/cli/print.ts:878-908` 确认 stream-json verbose 下全部写出 stdout):
+
+```ts
+// 任务到达终态的"收尾书签"——#1 的信号,在 result 之后到
+{ type:'system', subtype:'task_notification',
+  task_id:string, tool_use_id?:string,
+  status:'completed'|'failed'|'stopped',
+  output_file:string, summary:string,
+  usage?:{total_tokens,tool_uses,duration_ms},
+  uuid:string, session_id:string }
+
+// 任务开始——#2 ultracode 在 result 之前到(已治)
+{ type:'system', subtype:'task_started',
+  task_id:string, tool_use_id?:string, description:string,
+  task_type?:string, workflow_name?:string, prompt?:string, uuid, session_id }
+
+// 权威 turn 存活信号(headless 下也发)
+{ type:'system', subtype:'session_state_changed',
+  state:'idle'|'running'|'requires_action', uuid, session_id }
+```
+
+**关键修正(改变 watcher 判据,需在 P2.1/P2.3 前经 Codex 复审)**:
+1. `task_notification` 是**侧信道 UI 书签**(原文注释:"does NOT trigger the LLM loop"),它**不等于**"续轮必来"。真正驱动续轮 LLM loop 的是注入会话的 XML `<task-notification>`(print.ts 解析),续轮自身仍是 `init → assistant → result` 帧。所以"`task_notification` = 强信号"成立(提示续轮**可能**来),但**不是**保证——dispatcher 必须容忍"见 task_notification 但续轮没来"(idle→settle)。
+2. **`session_state_changed` 是更可靠的边界信号**:`state:'idle'` = 本 turn 真正结束(即便 bg-agent 把 result 扣住),`state:'running'` = 正在产出。schema 原注释称其为 "authoritative turn-over signal even when result was withheld for background agents"。
+   - **建议**:CONTINUATION_WATCH 的"结束/续轮判定"以 `session_state_changed(idle/running)` 为主信号,90s 静默 soft-cap 降级为兜底而非主判据。这直接化解不变量 D 冲突(R4)——无需对长达 16min 的 auto-bg "盲目挂起 liveness",而是用显式 `running` 信号确认 runner 真在干活才续等,`idle` 立即收尾。比"凭静默猜"安全得多。
+3. P2.0 #1 baseline 测试不再 `.todo`:以上真帧形状可直接构造 faithful mock 序列(`result → task_notification(status:'completed') → [init/system] → assistant → result`)。
+
+> 此节是源码 ground truth(可直接照抄进 mock);第 2 点的 watcher 信号改造是**对已审设计的偏离**,P2.3 plan 必须显式向 Codex/boss 复核后再落地,不得静默替换。
