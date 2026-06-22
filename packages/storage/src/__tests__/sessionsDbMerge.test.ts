@@ -307,6 +307,55 @@ describe('mergePreservingServerAuthored', () => {
   })
 })
 
+describe('dropPhantomClientAssistants — keyed routeKey (Phase 3 turnId-precise)', () => {
+  const keyedCli = (id: string, ts: number, turnId: string, idx = 0): Msg => ({
+    id,
+    role: 'assistant',
+    text: 'seg',
+    ts,
+    blockId: `${turnId}:assistant:msg:${idx}`,
+  })
+
+  it('drops a keyed client assistant when its OWN server row is present', () => {
+    const out = dropPhantomClientAssistants([
+      cli('u1', 100),
+      keyedCli('m-1', 150, 'srv-p-t1'),
+      srv('srv-p-t1', 200, 'agg'),
+    ] as Msg[]).map((m) => (m as Msg).id)
+    assert.deepEqual(out, ['u1', 'srv-p-t1'])
+  })
+
+  it('KEEPS a keyed client assistant when its server row is absent, even with a partition-mate server row (no false-drop)', () => {
+    const out = dropPhantomClientAssistants([
+      cli('u1', 100),
+      { id: 'srv-greeting', role: 'assistant', text: 'hi', ts: 120, _source: 'server' },
+      keyedCli('m-9', 150, 'srv-p-t9'),
+    ] as Msg[]).map((m) => (m as Msg).id)
+    assert.ok(out.includes('m-9'), 'keyed client kept — its server copy is pending via outbox')
+    assert.ok(out.includes('srv-greeting'))
+  })
+
+  it('drops ALL keyed client segments of a tool-split turn when the server row is present', () => {
+    const out = dropPhantomClientAssistants([
+      cli('u1', 100),
+      keyedCli('m-a', 150, 'srv-p-t1', 0),
+      { id: 't-1', role: 'tool', text: 'Bash', ts: 160 },
+      keyedCli('m-b', 170, 'srv-p-t1', 2),
+      srv('srv-p-t1', 200, 'agg'),
+    ] as Msg[]).map((m) => (m as Msg).id)
+    assert.deepEqual(out, ['u1', 't-1', 'srv-p-t1'])
+  })
+
+  it('unkeyed legacy client assistant still dropped via the partition heuristic', () => {
+    const out = dropPhantomClientAssistants([
+      cli('u1', 100),
+      { id: 'm-old', role: 'assistant', text: 'phantom', ts: 150 },
+      srv('srv-1', 200, 'agg'),
+    ] as Msg[]).map((m) => (m as Msg).id)
+    assert.deepEqual(out, ['u1', 'srv-1'])
+  })
+})
+
 describe('appendServerAuthoredPure', () => {
   it('appends a new message, stamps _source, and sorts by ts', () => {
     const existing: Msg[] = [cli('u1', 100), cli('u2', 300)]

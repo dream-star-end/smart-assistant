@@ -114,6 +114,13 @@ export class ClaudeMessageParser {
   >()
   /** content_block index → tool_use id (for routing input_json_delta) */
   private indexToToolId = new Map<number, string>()
+  /** Anthropic message id from the current `message_start` (stream_event). Used
+   *  to build stable per-block ids for text/thinking blocks (`${messageId}:${index}`);
+   *  the gateway prefixes the turnId so the web side can upsert by a stable key
+   *  instead of the easily-lost _streamingAssistant pointer. Empty until
+   *  message_start arrives; the turnId prefix guarantees cross-turn uniqueness
+   *  even if claude were to reuse a message id. */
+  private currentAnthropicMsgId = ''
   /** tool_use id → timing/preview captured at finalization (for tool.called metrics) */
   private toolUseMeta = new Map<string, { startAt: number; inputPreview?: string }>()
   /** De-duplicate emitted tool_results within a turn */
@@ -454,11 +461,25 @@ export class ClaudeMessageParser {
         // Only accumulate main-agent text into assistantBuf; subagent text
         // must not pollute the parent turn's stored assistant message.
         if (!parentToolUseId) this.assistantBuf += textStr
-        this.onEvent({ kind: 'block', block: withParent({ kind: 'text', text: textStr }) })
+        this.onEvent({
+          kind: 'block',
+          block: withParent({
+            kind: 'text',
+            text: textStr,
+            blockId: `${this.currentAnthropicMsgId}:${typeof ev.index === 'number' ? ev.index : 0}`,
+          }),
+        })
       } else if (delta.type === 'thinking_delta' && delta.thinking) {
         const thinkStr =
           typeof delta.thinking === 'string' ? delta.thinking : JSON.stringify(delta.thinking)
-        this.onEvent({ kind: 'block', block: withParent({ kind: 'thinking', text: thinkStr }) })
+        this.onEvent({
+          kind: 'block',
+          block: withParent({
+            kind: 'thinking',
+            text: thinkStr,
+            blockId: `${this.currentAnthropicMsgId}:${typeof ev.index === 'number' ? ev.index : 0}`,
+          }),
+        })
       } else if (delta.type === 'input_json_delta' && typeof delta.partial_json === 'string') {
         const toolId = this.indexToToolId.get(ev.index as number)
         const tool = toolId ? this.streamingToolUses.get(toolId) : undefined
@@ -487,7 +508,14 @@ export class ClaudeMessageParser {
       }
       return
     }
-    // message_start / message_delta / message_stop: ignore
+    if (ev.type === 'message_start') {
+      // Record the Anthropic message id so text/thinking blocks can carry a
+      // stable `${messageId}:${index}` blockId (gateway adds the turnId prefix).
+      const id = (ev as any).message?.id
+      if (typeof id === 'string' && id) this.currentAnthropicMsgId = id
+      return
+    }
+    // message_delta / message_stop: ignore
   }
 
   private _handleAssistant(msg: SdkMessage, parentToolUseId?: string): void {
@@ -506,7 +534,11 @@ export class ClaudeMessageParser {
     // match on an empty assistantBuf so the token-refresh path never triggers.
     const rawMsg = msg as any
     const isSyntheticError = typeof rawMsg.error === 'string'
-    for (const c of content) {
+    const snapshotMsgId =
+      typeof rawMsg.message?.id === 'string' && rawMsg.message.id
+        ? rawMsg.message.id
+        : this.currentAnthropicMsgId
+    for (const [ci, c] of content.entries()) {
       if (c?.type === 'tool_use' && c.id) {
         this.toolUseIdToName.set(c.id, c.name ?? 'unknown')
         const inputRaw = c.input ?? {}
@@ -570,7 +602,11 @@ export class ClaudeMessageParser {
         // _handleStreamEvent's text_delta rule). Subagent error text is
         // still surfaced to the UI but not merged into the parent's buffer.
         if (!parentToolUseId) this.assistantBuf += c.text
-        const textBlock: Record<string, unknown> = { kind: 'text', text: c.text }
+        const textBlock: Record<string, unknown> = {
+          kind: 'text',
+          text: c.text,
+          blockId: `${snapshotMsgId}:${ci}`,
+        }
         if (parentToolUseId) textBlock.parentToolUseId = parentToolUseId
         this.onEvent({ kind: 'block', block: textBlock as any })
       }

@@ -532,4 +532,68 @@ describe('ClaudeMessageParser: workflow_progress side-channel', () => {
   })
 })
 
+// ── Stable text/thinking blockId (Phase 1 — agent-display-identity root-fix) ──
+describe('ClaudeMessageParser: stable text/thinking blockId', () => {
+  const sev = (event: any) => ({ type: 'stream_event', event }) as any
+  const delta = (index: number, d: any) => sev({ type: 'content_block_delta', index, delta: d })
+
+  it('text block carries blockId `${messageId}:${index}` after message_start', () => {
+    const { parser, events } = createParser()
+    parser.parse(sev({ type: 'message_start', message: { id: 'msg_abc' } }))
+    parser.parse(delta(0, { type: 'text_delta', text: 'Hello' }))
+    assert.equal(events.length, 1)
+    if (events[0].kind === 'block') assert.equal((events[0].block as any).blockId, 'msg_abc:0')
+  })
+
+  it('thinking block uses the same blockId scheme', () => {
+    const { parser, events } = createParser()
+    parser.parse(sev({ type: 'message_start', message: { id: 'msg_t' } }))
+    parser.parse(delta(1, { type: 'thinking_delta', thinking: 'hmm' }))
+    if (events[0].kind === 'block') assert.equal((events[0].block as any).blockId, 'msg_t:1')
+  })
+
+  it('multiple deltas of the SAME content-block index share ONE blockId (web routes to one message)', () => {
+    const { parser, events } = createParser()
+    parser.parse(sev({ type: 'message_start', message: { id: 'msg_x' } }))
+    parser.parse(delta(0, { type: 'text_delta', text: 'Hel' }))
+    parser.parse(delta(0, { type: 'text_delta', text: 'lo' }))
+    assert.equal(events.length, 2)
+    assert.deepEqual(
+      events.map((e) => (e.kind === 'block' ? (e.block as any).blockId : null)),
+      ['msg_x:0', 'msg_x:0'],
+    )
+  })
+
+  it('tool-separated text segments (different content-block index) get DISTINCT blockIds', () => {
+    const { parser, events } = createParser()
+    parser.parse(sev({ type: 'message_start', message: { id: 'msg_y' } }))
+    parser.parse(delta(0, { type: 'text_delta', text: 'before' }))
+    parser.parse(delta(2, { type: 'text_delta', text: 'after' }))
+    assert.deepEqual(
+      events.filter((e) => e.kind === 'block').map((e) => (e.block as any).blockId),
+      ['msg_y:0', 'msg_y:2'],
+    )
+  })
+
+  it('falls back to `:index` when message_start was not seen (turnId prefix disambiguates cross-turn)', () => {
+    const { parser, events } = createParser()
+    parser.parse(delta(0, { type: 'text_delta', text: 'orphan' }))
+    if (events[0].kind === 'block') assert.equal((events[0].block as any).blockId, ':0')
+  })
+
+  it('synthetic API-error assistant text also carries a blockId', () => {
+    const { parser, events } = createParser()
+    parser.parse({
+      type: 'assistant',
+      error: 'API error',
+      message: { id: 'msg_err', content: [{ type: 'text', text: 'rate limited' }] },
+    } as any)
+    assert.equal(events.length, 1)
+    if (events[0].kind === 'block') {
+      assert.equal(events[0].block.kind, 'text')
+      assert.equal((events[0].block as any).blockId, 'msg_err:0')
+    }
+  })
+})
+
 console.log('ClaudeMessageParser tests passed.')
