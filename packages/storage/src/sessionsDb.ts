@@ -767,14 +767,19 @@ export function dropPhantomClientAssistants<T extends MessageLike>(
   // Lets callers short-circuit without allocating; also preserves the
   // "pure client history returns same reference" contract relied on by
   // mergePreservingServerAuthored's own fast-path invariants.
-  let hasAnyServerAsst = false
+  // Collect server-authored assistant ids up front. A keyed client assistant's
+  // blockId carries `${turnId}:assistant:...` where turnId == its own server
+  // row id; we drop such a phantom only when THAT id is present (precise,
+  // id-based), never merely because a partition-mate server row exists (which
+  // would lose an answer whose server copy is still pending via the outbox).
+  const serverAsstIds = new Set<string>()
   for (const m of messages) {
     if (isAssistant(m) && (m as MessageLike)._source === 'server') {
-      hasAnyServerAsst = true
-      break
+      const sid = (m as MessageLike).id
+      if (typeof sid === 'string') serverAsstIds.add(sid)
     }
   }
-  if (!hasAnyServerAsst) return messages
+  if (serverAsstIds.size === 0) return messages
 
   // First pass: compute per-index turn group id and whether that group has
   // any server-authored assistant. We need the ENTIRE partition answer
@@ -881,6 +886,24 @@ export function dropPhantomClientAssistants<T extends MessageLike>(
       deduped.push(cur)
       continue
     }
+    // Keyed client assistant (Phase 3 — agent-display-identity): blockId is
+    // `${turnId}:assistant:...` where turnId is its own server-authored row id.
+    // It is a phantom of THAT specific row only — drop iff that row is present;
+    // otherwise keep it (the server copy may still be pending via the outbox).
+    // This is stronger than the partition heuristic: it neither false-drops when
+    // a partition-mate server row (srv-greeting / a different turn) lacks the
+    // matching id, nor misses a dedupe if group assignment drifted.
+    const bid = (cur as MessageLike).blockId
+    const sep = typeof bid === 'string' ? bid.indexOf(':assistant:') : -1
+    // sep > 0: a non-empty turnId prefix precedes ':assistant:'. Guards against
+    // a hand-crafted/degenerate blockId like ':assistant:x' being read as keyed.
+    const keyedTurnId = sep > 0 ? (bid as string).slice(0, sep) : null
+    if (keyedTurnId) {
+      if (serverAsstIds.has(keyedTurnId)) continue // drop: its server row is present
+      deduped.push(cur) // keep: server copy still pending
+      continue
+    }
+    // Unkeyed (legacy) client assistant → existing partition heuristic.
     const g = turnGroup[i]
     if (groupHasServerAsst[g]) {
       // Client-assistant in a turn that the server re-authored. Drop.

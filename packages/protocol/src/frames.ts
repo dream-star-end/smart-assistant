@@ -143,6 +143,13 @@ export const OutboundContentBlock = Type.Union([
   Type.Object({
     kind: Type.Literal('text'),
     text: Type.String(),
+    // Stable identity `${turnId}:${messageId}:${blockIndex}` (mirrors tool_use's
+    // blockId). Lets web route streaming deltas + the persisted copy into ONE
+    // assistant message via _blockIdToMsgId, instead of the fragile
+    // _streamingAssistant pointer that loses identity on reconnect/refresh/
+    // server-wins → duplicate assistant bubbles. Optional: absent on old
+    // gateways → web falls back to the legacy pointer path.
+    blockId: Type.Optional(Type.String()),
     parentToolUseId: Type.Optional(Type.String()),
   }),
   Type.Object({
@@ -170,6 +177,8 @@ export const OutboundContentBlock = Type.Union([
   Type.Object({
     kind: Type.Literal('thinking'),
     text: Type.String(),
+    // Stable identity, same scheme as the text block's blockId above.
+    blockId: Type.Optional(Type.String()),
     parentToolUseId: Type.Optional(Type.String()),
   }),
   Type.Object({
@@ -230,6 +239,15 @@ export type OutboundContentBlock = Static<typeof OutboundContentBlock>
 export const OutboundMessage = Type.Object({
   type: Type.Literal('outbound.message'),
   sessionKey: Type.String(),
+  // Stable turn identity. Authoritative source = sessionManager turnIndex (the
+  // same counter behind the durable id `srv-${peerId}-t${turnIndex}`). Carried
+  // on EVERY frame of a turn (streaming + final) so web can (a) upsert
+  // assistant/thinking by turn rather than the easily-lost _streamingAssistant
+  // pointer, and (b) reconcile live (m-*) messages with server-authored durable
+  // (srv-*) rows that share this turnId. Optional during rollout (absent →
+  // legacy pointer path). NOT a transport cursor — frameSeq still owns
+  // ordering/replay dedup.
+  turnId: Type.Optional(Type.String()),
   channel: Type.String(),
   peer: Peer,
   blocks: Type.Array(OutboundContentBlock),

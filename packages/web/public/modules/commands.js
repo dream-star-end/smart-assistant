@@ -8,7 +8,7 @@ import {
   localStopTeardown,
   nudgeDrain,
   resetReplyTracker,
-} from './websocket.js?v=52'
+} from './websocket.js?v=53'
 
 // ── Late-binding for circular deps ──
 let _deps = {}

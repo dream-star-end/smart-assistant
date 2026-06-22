@@ -309,12 +309,27 @@ export interface AgentSession {
   _cronBridgeMap?: Map<string, string>
   // Current turn parser (for idle-timeout to check pendingToolCalls)
   _currentParser?: import('./claudeMessageParser.js').ClaudeMessageParser
+  // Stable id of the turn currently streaming (`srv-${peerId}-t${turnIndex}`),
+  // refreshed at turn start + each background-workflow re-arm. Stamped onto every
+  // outbound.message frame as `turnId` so the web side can upsert assistant/
+  // thinking by turn and reconcile live (m-*) messages with the server-authored
+  // durable row (which shares this exact id). undefined for non-webchat sessions.
+  _activeTurnId?: string
   // Cross-turn stdout 'message' listener. Per-turn _runOneTurn replaces
   // (not removes) this on the next turn so bg-bash bash_output_tail
   // emitted after the turn's `result` keeps flowing through parser ->
   // onEvent -> deliver. destroySession/shutdownAll explicitly off().
   _currentMessageListener?: ((msg: any) => void) | null
   _historicalContextInjected?: boolean
+}
+
+/** Canonical id for a server-authored assistant message / its turn. Single
+ *  source of truth shared by durable persistence (appendServerAuthoredMessageDurable)
+ *  and the outbound `turnId` stamp, so the web side can match the live (m-*) and
+ *  durable copies of the same turn. Changing this format breaks live↔durable
+ *  reconciliation — keep the two call sites in lockstep. */
+function serverAuthoredMsgId(peerId: string, turnIndex: number): string {
+  return `srv-${peerId}-t${turnIndex}`
 }
 
 // Re-export from claudeMessageParser so existing imports keep working
@@ -1232,6 +1247,18 @@ export class SessionManager {
     const prevTurns = session.turns
     const prevLastCcbCost = session._lastCcbCumulativeCost
 
+    // Stamp the active turnId before the first block streams. Reads live
+    // session.turns + 1 — the value session.turns reaches once this turn's
+    // result increments it (matching the durable-append id), so streaming
+    // frames and the persisted server-authored row share one turnId. Refreshed
+    // on each background-workflow re-arm so continuations get their own turnId.
+    const refreshActiveTurnId = () => {
+      session._activeTurnId = session.peerId
+        ? serverAuthoredMsgId(session.peerId, session.turns + 1)
+        : undefined
+    }
+    refreshActiveTurnId()
+
     await new Promise<void>((resolve, reject) => {
       let settled = false
       const settle = (fn: () => void) => {
@@ -1559,7 +1586,7 @@ export class SessionManager {
               // that didn't carry userId (cron pre-warm, old webchat calls).
               const directWrite = async () => {
                 if (session.userId) {
-                  const messageId = `srv-${peerId}-t${turnIndex}`
+                  const messageId = serverAuthoredMsgId(peerId, turnIndex)
                   const r = await appendServerAuthoredMessageDurable(peerId, session.userId, {
                     id: messageId,
                     role: 'assistant',
@@ -1571,7 +1598,7 @@ export class SessionManager {
                 }
                 const existing = await getClientSession(peerId)
                 if (!existing) return undefined // cron-style pre-UI, no owner
-                const messageId = `srv-${peerId}-t${turnIndex}`
+                const messageId = serverAuthoredMsgId(peerId, turnIndex)
                 const r = await appendServerAuthoredMessageDurable(peerId, existing.userId, {
                   id: messageId,
                   role: 'assistant',
@@ -1694,6 +1721,9 @@ export class SessionManager {
             pendingFinal = null
             parser.finish()
             if (session._currentParser === parser) session._currentParser = undefined
+            // New continuation sub-turn → new turnId (the prev sub-turn's result
+            // already incremented session.turns).
+            refreshActiveTurnId()
             parser = new ClaudeMessageParser(parserConfig)
             session._currentParser = parser
             if (!detached) {
@@ -1766,7 +1796,7 @@ export class SessionManager {
                 const uid = session.userId ?? (await getClientSession(peerId))?.userId
                 if (!uid) return undefined // no owner, nothing to persist to
                 const r = await appendServerAuthoredMessageDurable(peerId, uid, {
-                  id: `srv-${peerId}-t${turnIndex}`,
+                  id: serverAuthoredMsgId(peerId, turnIndex),
                   role: 'assistant',
                   text: partial,
                   ts: Date.now(),

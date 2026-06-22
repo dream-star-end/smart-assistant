@@ -287,6 +287,50 @@ export function addMessage(sess, role, text, extra) {
   }
   return msg
 }
+// Route a streaming text/thinking block to its owning message via a stable
+// `${turnId}:${role}:${blockId}` key — mirroring how tool/plan/goal already use
+// _blockIdToMsgId. The key is persisted as msg.blockId and rebuilt into
+// _blockIdToMsgId on refresh, so a resumed/replayed stream re-homes onto the
+// SAME message instead of spawning a duplicate (the core of the duplicate fix).
+// Falls back to the legacy _streamingAssistant/_streamingThinking pointer when
+// the frame lacks turnId/blockId (old gateways / codex early paths). When a key
+// arrives mid-segment after a pointer-created (blockId-less) message, it CLAIMS
+// that message for the routeKey so a half-legacy/half-keyed segment stays one
+// bubble. Role is checked on map hits so a stale/foreign blockId can't be reused
+// across kinds.
+function _routeStreamingBlock(sess, role, block, turnId, extra) {
+  const ptrKey = role === 'assistant' ? '_streamingAssistant' : '_streamingThinking'
+  const routeKey = turnId && block.blockId ? `${turnId}:${role}:${block.blockId}` : null
+  let msg = null
+  if (routeKey && sess._blockIdToMsgId?.has(routeKey)) {
+    const mid = sess._blockIdToMsgId.get(routeKey)
+    msg = sess.messages.find((m) => m.id === mid && m.role === role) || null
+  }
+  if (!msg && sess[ptrKey]) {
+    const ptr = sess[ptrKey]
+    if (!routeKey) {
+      // unkeyed frame (old gateway / codex path) → continue the open stream
+      msg = ptr
+    } else if (!ptr.blockId) {
+      // keyed frame whose open pointer was created blockId-less by an earlier
+      // legacy frame in this SAME segment → claim it for this routeKey
+      msg = ptr
+      ptr.blockId = routeKey
+      sess._blockIdToMsgId?.set(routeKey, ptr.id)
+    }
+    // else: keyed frame whose pointer already owns a DIFFERENT routeKey → fall
+    // through to create a new message (a distinct content block / segment).
+  }
+  if (!msg) {
+    msg = addMessage(sess, role, '', {
+      ...(routeKey ? { blockId: routeKey } : {}),
+      ...(extra || {}),
+    })
+    if (routeKey) sess._blockIdToMsgId?.set(routeKey, msg.id)
+  }
+  sess[ptrKey] = msg
+  return msg
+}
 export function updateMessage(sess, msg, newText, streaming) {
   msg.text = newText
   if (sess.id === state.currentSessionId) {
@@ -1467,6 +1511,11 @@ export function handleOutbound(frame) {
   // Skip drain advancement for cron/heartbeat pushes (not real turn completions)
   const _isCronOrHeartbeat = !!frame.cronJob
 
+  // Stable turn id for this frame (Phase 1+ outbound.message.turnId). Used to
+  // route text/thinking blocks by `${turnId}:${kind}:${blockId}` so a stream
+  // survives reconnect/refresh/server-wins without duplicating its bubble.
+  const frameTurnId = typeof frame.turnId === 'string' && frame.turnId ? frame.turnId : null
+
   for (const block of frame.blocks || []) {
     // Defensive: coerce block.text to string to prevent [object Object] rendering
     const blockText =
@@ -1498,14 +1547,13 @@ export function handleOutbound(frame) {
 
     if (block.kind === 'text') {
       sess._streamingThinking = null
-      if (!sess._streamingAssistant) {
-        sess._streamingAssistant = addMessage(
-          sess,
-          'assistant',
-          '',
-          isCronPush ? { cronPush: true, cronLabel: frame.cronJob?.label } : {},
-        )
-      }
+      _routeStreamingBlock(
+        sess,
+        'assistant',
+        block,
+        frameTurnId,
+        isCronPush ? { cronPush: true, cronLabel: frame.cronJob?.label } : undefined,
+      )
       sess._streamingAssistant.text += blockText
       // Track "latest content arrived" as completion time. Kept in sync on
       // every delta so abnormal teardowns (stopCurrentTurn, thinking safety
@@ -1537,7 +1585,7 @@ export function handleOutbound(frame) {
         }
       }
     } else if (block.kind === 'thinking') {
-      if (!sess._streamingThinking) sess._streamingThinking = addMessage(sess, 'thinking', '')
+      _routeStreamingBlock(sess, 'thinking', block, frameTurnId)
       sess._streamingThinking.text += blockText
       sess._streamingThinking.completedAt = Date.now() // see assistant branch rationale
       if (!sess._thinkRafPending) {

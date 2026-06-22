@@ -6342,7 +6342,10 @@ export class Gateway {
           } else {
             // WebChat: stream each block immediately via WS
             if (!isTail) out.blocks.push(e.block)
-            this.deliver({ ...out, blocks: [e.block], isFinal: false }, undefined)
+            this.deliver(
+              { ...out, blocks: [e.block], isFinal: false, turnId: session._activeTurnId },
+              undefined,
+            )
           }
         } else if (e.kind === 'final') {
           this._runLog.complete(_run, {
@@ -6366,7 +6369,10 @@ export class Gateway {
               adapter,
             )
           } else {
-            this.deliver({ ...out, blocks: [], isFinal: true, meta: e.meta }, undefined)
+            this.deliver(
+              { ...out, blocks: [], isFinal: true, meta: e.meta, turnId: session._activeTurnId },
+              undefined,
+            )
           }
           // 释放本轮聚合数组的内存。本闭包跨 turn 仍会被 sessionManager 的
           // 跨 turn message listener 调用(转发 bg-bash bash_output_tail);
@@ -6481,6 +6487,7 @@ export class Gateway {
               ...out,
               blocks: [{ kind: 'text', text: `[error] ${e.error}` }],
               isFinal: true,
+              turnId: session._activeTurnId,
             },
             adapter,
           )
