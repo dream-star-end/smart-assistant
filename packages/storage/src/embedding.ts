@@ -48,6 +48,13 @@ export interface EmbeddingProviderConfig {
   batchSize?: number
   /** Request timeout in ms (default: 30_000) */
   timeoutMs?: number
+  /**
+   * Optional undici Dispatcher for the fetch call. Lets callers force direct
+   * egress (bypassing a process-global EnvHttpProxyAgent) for region-specific
+   * endpoints — e.g. China-region DashScope must NOT go through an overseas
+   * proxy. Typed loosely to avoid a hard undici dependency in this layer.
+   */
+  dispatcher?: unknown
 }
 
 // ── Config validation ────────────────────────────
@@ -87,6 +94,7 @@ export class OpenAIEmbeddingProvider implements EmbeddingProvider {
   private readonly baseUrl: string
   private readonly batchSize: number
   private readonly timeoutMs: number
+  private readonly dispatcher: unknown
 
   constructor(config: EmbeddingProviderConfig = {}) {
     this.modelId = config.model ?? 'text-embedding-3-small'
@@ -95,9 +103,12 @@ export class OpenAIEmbeddingProvider implements EmbeddingProvider {
     this.baseUrl = (config.baseUrl ?? 'https://api.openai.com/v1').replace(/\/+$/, '')
     this.batchSize = config.batchSize ?? 100
     this.timeoutMs = config.timeoutMs ?? 30_000
+    this.dispatcher = config.dispatcher
 
     if (!this.apiKey) {
-      throw new Error('OpenAIEmbeddingProvider: apiKey is required (set EMBEDDING_API_KEY or OPENAI_API_KEY)')
+      throw new Error(
+        'OpenAIEmbeddingProvider: apiKey is required (set EMBEDDING_API_KEY or OPENAI_API_KEY)',
+      )
     }
     assertPositiveInt('dimensions', this.dimensions)
     assertPositiveInt('batchSize', this.batchSize)
@@ -124,7 +135,7 @@ export class OpenAIEmbeddingProvider implements EmbeddingProvider {
     const timer = setTimeout(() => controller.abort(), this.timeoutMs)
 
     try {
-      const resp = await fetch(`${this.baseUrl}/embeddings`, {
+      const init: RequestInit & { dispatcher?: unknown } = {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -137,7 +148,9 @@ export class OpenAIEmbeddingProvider implements EmbeddingProvider {
           encoding_format: 'float',
         }),
         signal: controller.signal,
-      })
+      }
+      if (this.dispatcher) init.dispatcher = this.dispatcher
+      const resp = await fetch(`${this.baseUrl}/embeddings`, init)
 
       if (!resp.ok) {
         const status = resp.status
