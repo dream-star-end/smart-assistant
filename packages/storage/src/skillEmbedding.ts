@@ -120,6 +120,23 @@ export function skillContentHash(m: SkillEmbedMeta): string {
   return createHash('sha256').update(skillCanonicalInput(m)).digest('hex')
 }
 
+/**
+ * Marketplace artifact identity: sha256 of the *normalized full SKILL.md*.
+ *
+ * Single authority for the normalization so the publisher (commercial master),
+ * the stored artifact_hash, and the container-side hub sync all compute the
+ * exact same digest — the hash is what pins "what the reviewer saw == what the
+ * agent executes". Any drift between two copies of this logic would silently
+ * break that guarantee, so both callers import this one function.
+ */
+export function marketplaceArtifactHash(rawSkillMd: string): string {
+  const norm = rawSkillMd
+    .replace(/\r\n/g, '\n')
+    .replace(/[ \t]+$/gm, '')
+    .trimEnd()
+  return createHash('sha256').update(norm).digest('hex')
+}
+
 /** Natural-language text actually sent to the embedding model. */
 export function skillEmbedText(m: SkillEmbedMeta): string {
   const parts = [`${m.name} — ${(m.description ?? '').trim()}`]

@@ -424,6 +424,7 @@ const TABS = {
   modelGrants: renderModelGrantsTab,
   feedback: renderFeedbackTab,
   inbox: renderInboxTab,
+  marketplace: renderMarketplaceTab,
   literature: renderLiteratureTab,
   settings: renderSettingsTab,
   audit: renderAuditTab,
@@ -446,6 +447,7 @@ const ADMIN_TAB_META = {
   modelGrants: { group: '财务与商业', label: '用户模型授权', desc: '按用户放行特殊模型', key: '12', chips: [{ label: '用户', value: 'email / uid' }, { label: '模型', value: 'admin only' }, { label: '动作', value: 'grant / revoke' }] },
   feedback: { group: '用户触达', label: '反馈', desc: '用户问题、优先级和确认', key: '13', chips: [{ label: '队列', value: 'open / acked' }, { label: '上下文', value: '用户详情' }, { label: '动作', value: '确认处理' }] },
   inbox: { group: '用户触达', label: '站内信', desc: '发送、历史和触达记录', key: '14', chips: [{ label: '范围', value: '全员 / 单人' }, { label: '级别', value: 'info / warning' }, { label: '历史', value: 'sent / deleted' }] },
+  marketplace: { group: '用户触达', label: '技能市场', desc: '审核投稿、上架和下架', key: '14b', chips: [{ label: '队列', value: 'pending' }, { label: '动作', value: '通过 / 拒绝' }, { label: '风控', value: '扫描标记 / 下架' }] },
   literature: { group: '系统运营', label: '文献检索', desc: '检索服务连接和配额', key: '15', chips: [{ label: '连接', value: 'base_url / token' }, { label: '配额', value: 'daily cap' }, { label: '验证', value: 'test connection' }] },
   settings: { group: '系统运营', label: '系统设置', desc: '开关、阈值和 JSON 配置', key: '16', chips: [{ label: '类型', value: 'bool / enum / JSON' }, { label: '默认', value: '继承 / 覆盖' }, { label: '审计', value: '保存留痕' }] },
   audit: { group: '系统运营', label: '审计日志', desc: '操作者、对象和配置变更', key: '17', chips: [{ label: '过滤', value: 'admin / action' }, { label: '对象', value: 'target' }, { label: '详情', value: 'before / after' }] },
@@ -5489,9 +5491,196 @@ async function saveSetting(key, btn) {
 //                                          { result: { ok, status, result_count,
 //                                                     elapsed_ms, error? } }
 //
-// UI 策略:单页内联表单(非 modal),token 用 radio 三态显式区分,避免 mask 回显歧义。
-// 保存时只把 form 当前值打包成 PATCH(等同"覆盖式"),后端 normalize 时同样的 patch
-// 输入对当前 DB 没变的字段不会写 audit(等效 no-op),前端不做 diff。
+// ─── Skill marketplace review ───────────────────────────────────────────────
+// Pending投稿审核(通过/拒绝)+ 已上架下架(kill-switch)。审核台展示完整 SKILL.md
+// 的原始字节(<pre> 转义,不做 markdown 渲染)——人工审核是静态扫描之上的治理步骤,
+// 必须看到将要安装的确切内容;扫描标记并列展示,block 级标记本应在发布时已被拦下。
+
+const MKT_SEVERITY_LABEL = { high: '高', medium: '中', low: '低' }
+const MKT_CATEGORY_LABEL = {
+  secret: '密钥',
+  internal: '内部基建',
+  injection: '提示注入',
+  html: 'HTML/XSS',
+  obfuscation: '混淆字符',
+  metadata: '元数据',
+  size: '体积',
+}
+
+function _mktFlagsHtml(flags) {
+  if (!flags || flags.length === 0)
+    return '<div class="mkt-adm-flags-clean">静态扫描无标记</div>'
+  const rows = flags
+    .map((f) => {
+      const cls = f.block ? 'block' : f.severity
+      const cat = MKT_CATEGORY_LABEL[f.category] || f.category
+      const sev = MKT_SEVERITY_LABEL[f.severity] || f.severity
+      const sample = f.sample ? ` <code>${escapeHtml(f.sample)}</code>` : ''
+      return `<li class="mkt-adm-flag mkt-adm-${cls}"><b>${escapeHtml(sev)}</b> ${escapeHtml(cat)} — ${escapeHtml(f.message)}${sample}${f.block ? ' <b>[拦截]</b>' : ''}</li>`
+    })
+    .join('')
+  return `<ul class="mkt-adm-flags">${rows}</ul>`
+}
+
+let _mktAdmStyles = false
+function _ensureMktAdmStyles() {
+  if (_mktAdmStyles) return
+  _mktAdmStyles = true
+  const css = `
+.mkt-adm-card{border:1px solid var(--border,#2a2a30);border-radius:10px;padding:12px;margin-bottom:14px;background:var(--bg-secondary,#1e1e22)}
+.mkt-adm-head{display:flex;justify-content:space-between;gap:12px}
+.mkt-adm-meta{font-size:12px;color:var(--text-secondary,#9f9c96);margin-left:6px}
+.mkt-adm-meta code{font-family:var(--font-mono,monospace)}
+.mkt-adm-desc{font-size:13px;color:var(--text-secondary,#9f9c96);margin:6px 0;line-height:1.5}
+.mkt-adm-tags{display:flex;flex-wrap:wrap;gap:5px;margin-bottom:8px}
+.mkt-adm-tags span{font-size:11px;background:var(--bg-tertiary,#33333b);border-radius:8px;padding:1px 8px;color:var(--text-secondary,#9f9c96)}
+.mkt-adm-flags{list-style:none;margin:8px 0;padding:0;display:flex;flex-direction:column;gap:5px}
+.mkt-adm-flags-clean{font-size:12px;color:#6fbf8b;margin:6px 0}
+.mkt-adm-flag{font-size:12px;line-height:1.5;padding:4px 8px;border-radius:6px;background:var(--bg-tertiary,#2a2a30)}
+.mkt-adm-flag b{margin-right:4px}
+.mkt-adm-high{border-left:3px solid #e0635f}
+.mkt-adm-medium{border-left:3px solid #d9a441}
+.mkt-adm-low{border-left:3px solid #5a8fc2}
+.mkt-adm-block{border-left:3px solid #b3202f;color:#ffb3bd}
+.mkt-adm-flag code{font-family:var(--font-mono,monospace);font-size:11px;background:rgba(0,0,0,.25);border-radius:4px;padding:0 4px}
+.mkt-adm-details{margin:8px 0}
+.mkt-adm-details summary{cursor:pointer;font-size:12px;color:var(--accent,#d97757)}
+.mkt-adm-pre{font-family:var(--font-mono,monospace);font-size:12px;white-space:pre-wrap;word-break:break-word;background:#1a1a1e;color:#eceae6;border:1px solid var(--border,#2a2a30);border-radius:8px;padding:10px;max-height:360px;overflow:auto;margin-top:6px}
+.mkt-adm-review{display:flex;gap:8px;align-items:center;margin-top:8px}
+.mkt-adm-note{flex:1;min-width:0;background:var(--bg-tertiary,#2a2a30);color:var(--text-primary,#eceae6);border:1px solid var(--border,#32323a);border-radius:8px;padding:7px 10px;font:inherit}
+.mkt-adm-live-row{display:flex;align-items:center;justify-content:space-between;gap:12px;border:1px solid var(--border,#2a2a30);border-radius:8px;padding:8px 12px;margin-bottom:8px}`
+  const el = document.createElement('style')
+  el.id = 'mkt-adm-styles'
+  el.textContent = css
+  document.head.appendChild(el)
+}
+
+async function renderMarketplaceTab() {
+  _ensureMktAdmStyles()
+  view().innerHTML = `
+    <div class="panel">
+      <h2>技能市场审核 <small id="mkt-pending-count">加载中…</small></h2>
+      <div id="mkt-pending"><div class="skeleton-row"><div class="skeleton-bar w60"></div></div></div>
+    </div>
+    <div class="panel">
+      <h2>已上架技能 <small id="mkt-live-count"></small></h2>
+      <p class="hint">下架是 kill-switch:下架后用户容器在下次同步时会移除该技能。</p>
+      <div id="mkt-live"></div>
+    </div>`
+  await Promise.all([_loadMktPending(), _loadMktLive()])
+}
+
+async function _loadMktPending() {
+  let data
+  try {
+    data = await apiGet('/api/admin/marketplace/pending')
+  } catch (err) {
+    if (_currentTab !== 'marketplace') return
+    const host = $('mkt-pending')
+    if (host) host.innerHTML = `<div class="empty" style="color:var(--danger)">加载失败:${escapeHtml(err.message || String(err))}</div>`
+    return
+  }
+  if (_currentTab !== 'marketplace') return
+  const pending = data?.pending ?? []
+  const cnt = $('mkt-pending-count')
+  if (cnt) cnt.textContent = `${pending.length} 待审`
+  const host = $('mkt-pending')
+  if (!host) return
+  if (pending.length === 0) {
+    host.innerHTML = '<div class="empty">没有待审投稿</div>'
+    return
+  }
+  host.innerHTML = ''
+  for (const p of pending) {
+    const card = document.createElement('div')
+    card.className = 'mkt-adm-card'
+    card.innerHTML = `
+      <div class="mkt-adm-head">
+        <div>
+          <strong>${escapeHtml(p.name || p.slug)}</strong>
+          <span class="mkt-adm-meta"><code>${escapeHtml(p.slug)}</code> · v${escapeHtml(p.version)} · 投稿 user #${escapeHtml(String(p.submittedBy))} · ${escapeHtml((p.createdAt || '').slice(0, 19).replace('T', ' '))}</span>
+        </div>
+      </div>
+      <div class="mkt-adm-desc">${escapeHtml(p.description || '')}</div>
+      <div class="mkt-adm-tags">${(p.tags || []).map((t) => `<span>${escapeHtml(t)}</span>`).join('')}</div>
+      ${_mktFlagsHtml(p.riskFlags)}
+      <details class="mkt-adm-details"><summary>查看完整 SKILL.md</summary><pre class="mkt-adm-pre">${escapeHtml(p.rawSkillMd || '')}</pre></details>
+      <div class="mkt-adm-review">
+        <input type="text" class="mkt-adm-note" placeholder="审核备注(可选,拒绝时建议填)" />
+        <button class="btn btn-primary mkt-adm-approve">通过上架</button>
+        <button class="btn mkt-adm-reject">拒绝</button>
+      </div>`
+    const note = () => card.querySelector('.mkt-adm-note').value.trim() || undefined
+    card.querySelector('.mkt-adm-approve').addEventListener('click', (ev) =>
+      withBtnLoading(ev.currentTarget, () => _reviewMkt(p.versionId, 'approve', note())),
+    )
+    card.querySelector('.mkt-adm-reject').addEventListener('click', (ev) =>
+      withBtnLoading(ev.currentTarget, () => _reviewMkt(p.versionId, 'reject', note())),
+    )
+    host.appendChild(card)
+  }
+}
+
+async function _reviewMkt(versionId, decision, note) {
+  try {
+    await apiJson('POST', `/api/admin/marketplace/${encodeURIComponent(versionId)}/review`, {
+      decision,
+      note,
+    })
+    toast(decision === 'approve' ? '已通过并上架' : '已拒绝', 'ok')
+    await Promise.all([_loadMktPending(), _loadMktLive()])
+  } catch (err) {
+    toast(`操作失败:${err.message}`, 'danger', toastOptsFromError(err))
+  }
+}
+
+async function _loadMktLive() {
+  let data
+  try {
+    data = await apiGet('/api/marketplace/search')
+  } catch (err) {
+    if (_currentTab !== 'marketplace') return
+    const host = $('mkt-live')
+    if (host) host.innerHTML = `<div class="empty" style="color:var(--danger)">加载失败:${escapeHtml(err.message || String(err))}</div>`
+    return
+  }
+  if (_currentTab !== 'marketplace') return
+  const live = data?.results ?? []
+  const cnt = $('mkt-live-count')
+  if (cnt) cnt.textContent = `${live.length} 个`
+  const host = $('mkt-live')
+  if (!host) return
+  if (live.length === 0) {
+    host.innerHTML = '<div class="empty">暂无已上架技能</div>'
+    return
+  }
+  host.innerHTML = ''
+  for (const s of live) {
+    const row = document.createElement('div')
+    row.className = 'mkt-adm-live-row'
+    row.innerHTML = `
+      <div><strong>${escapeHtml(s.name || s.slug)}</strong> <span class="mkt-adm-meta"><code>${escapeHtml(s.slug)}</code></span></div>
+      <button class="btn btn-danger mkt-adm-revoke">下架</button>`
+    row.querySelector('.mkt-adm-revoke').addEventListener('click', (ev) =>
+      withBtnLoading(ev.currentTarget, () => _revokeMkt(s.slug, s.name)),
+    )
+    host.appendChild(row)
+  }
+}
+
+async function _revokeMkt(slug, name) {
+  const reason = prompt(`下架「${name || slug}」的原因(将记录,可留空):`)
+  if (reason === null) return // cancelled
+  try {
+    const r = await apiJson('POST', `/api/admin/marketplace/${encodeURIComponent(slug)}/revoke`, {
+      reason: reason || undefined,
+    })
+    toast(`已下架,影响 ${r.affectedInstalls ?? 0} 个安装`, 'ok')
+    await _loadMktLive()
+  } catch (err) {
+    toast(`下架失败:${err.message}`, 'danger', toastOptsFromError(err))
+  }
+}
 
 async function renderLiteratureTab() {
   const data = await apiGet('/api/admin/literature')

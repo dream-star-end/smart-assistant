@@ -343,6 +343,12 @@ export interface SkillStoreOptions {
    */
   sharedDir?: string
   /**
+   * Marketplace-installed skills dir (read-only `hub` layer, e.g.
+   * `~/.openclaude/hub/skills`). Lowest precedence; never shadows platform/user
+   * skills. Missing tolerated. Reconciled by the container-side marketplace sync.
+   */
+  hubDir?: string
+  /**
    * User-level aggregation mode (for the agentId-less `/api/skills` surface).
    * When true, the legacy layer aggregates ALL agents' `agents/<id>/skills` dirs and
    * the per-agent agent-seed layer is NOT loaded. Requires sharedDir.
@@ -358,6 +364,8 @@ export class SkillStore {
   private readonly agentSeedRoot: string | null
   /** Absolute (lexically resolved) shared root, or null. May not exist yet. */
   private readonly sharedRoot: string | null
+  /** Absolute, realpath-resolved hub root (marketplace-installed skills, ro), or null. */
+  private readonly hubRoot: string | null
   /** Aggregate all agents' legacy dirs on read (user-level surface). */
   private readonly aggregateLegacy: boolean
   /** Absolute write target: shared (when sharedRoot set) else per-agent legacy dir. */
@@ -402,6 +410,21 @@ export class SkillStore {
       this.sharedRoot = resolved
     } else {
       this.sharedRoot = null
+    }
+
+    // --- hub (ro marketplace-installed; missing tolerated; must resolve within HOME) ---
+    if (opts.hubDir != null && existsSync(opts.hubDir)) {
+      if (!isAbsolute(opts.hubDir)) {
+        throw new Error(`hubDir must be an absolute path: ${opts.hubDir}`)
+      }
+      const resolved = realpathSync(opts.hubDir)
+      const homeResolved = existsSync(paths.home) ? realpathSync(paths.home) : resolve(paths.home)
+      if (resolved !== homeResolved && !resolved.startsWith(homeResolved + sep)) {
+        throw new Error(`hubDir must resolve within home (${paths.home}): ${opts.hubDir}`)
+      }
+      this.hubRoot = resolved
+    } else {
+      this.hubRoot = null
     }
 
     this.aggregateLegacy = Boolean(opts.aggregateLegacy)
@@ -461,6 +484,10 @@ export class SkillStore {
     const legacyWritable = this.sharedRoot == null
     for (const legacyRoot of await this.legacyRoots()) {
       push(await this.scanRoot(legacyRoot, 'user', 'legacy', legacyWritable))
+    }
+    // 5) hub (marketplace-installed, ro; lowest precedence — never shadows the above)
+    if (this.hubRoot) {
+      push(await this.scanRoot(this.hubRoot, 'user', 'hub', false))
     }
     return result.sort((a, b) => a.name.localeCompare(b.name))
   }
@@ -587,6 +614,10 @@ export class SkillStore {
       if (await this.rootHas(legacyRoot, name)) {
         return this.viewFromRoot(name, subfile, legacyRoot, 'user', 'legacy', legacyWritable)
       }
+    }
+    // hub (marketplace-installed, ro) — lowest read priority
+    if (await this.rootHas(this.hubRoot, name)) {
+      return this.viewFromRoot(name, subfile, this.hubRoot as string, 'user', 'hub', false)
     }
     return null
   }
@@ -928,11 +959,12 @@ export function buildAgentSkillStore(agentId: string): SkillStore {
   const baselineDir = resolveBaselineSkillsDirFromEnv()
   const sharedDir = paths.sharedSkillsDir
   const agentSeedDir = paths.agentSeedSkillsDir(agentId)
+  const hubDir = join(paths.hubDir, 'skills')
   try {
-    return new SkillStore(agentId, { baselineDir, sharedDir, agentSeedDir })
+    return new SkillStore(agentId, { baselineDir, sharedDir, agentSeedDir, hubDir })
   } catch {
     try {
-      return new SkillStore(agentId, { sharedDir, agentSeedDir })
+      return new SkillStore(agentId, { sharedDir, agentSeedDir, hubDir })
     } catch {
       return new SkillStore(agentId)
     }
@@ -948,11 +980,12 @@ export function buildAgentSkillStore(agentId: string): SkillStore {
 export function buildUserSkillStore(agentId = 'main'): SkillStore {
   const baselineDir = resolveBaselineSkillsDirFromEnv()
   const sharedDir = paths.sharedSkillsDir
+  const hubDir = join(paths.hubDir, 'skills')
   try {
-    return new SkillStore(agentId, { baselineDir, sharedDir, aggregateLegacy: true })
+    return new SkillStore(agentId, { baselineDir, sharedDir, aggregateLegacy: true, hubDir })
   } catch {
     try {
-      return new SkillStore(agentId, { sharedDir, aggregateLegacy: true })
+      return new SkillStore(agentId, { sharedDir, aggregateLegacy: true, hubDir })
     } catch {
       return new SkillStore(agentId)
     }

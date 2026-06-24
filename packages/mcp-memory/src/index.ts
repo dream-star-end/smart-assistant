@@ -52,6 +52,7 @@ import {
   upsertArchivalVector,
   upsertSessionMeta,
 } from '@openclaude/storage'
+import { syncMarketplaceHub } from './marketplaceSync.js'
 
 const AGENT_ID = process.env.OPENCLAUDE_AGENT_ID ?? 'main'
 
@@ -120,6 +121,10 @@ const pendingEmbeds = new Map<string, Promise<void>>()
 // archivalCount triggers ensureSchema() which creates archival + archival_fts tables.
 // Must run before hybridArchivalSearch which queries archival_fts directly.
 await archivalCount(AGENT_ID)
+
+// Reconcile installed marketplace skills into the hub layer (v3 only; no-op
+// otherwise). Fire-and-forget + fail-soft so it never delays mcp readiness.
+void syncMarketplaceHub()
 
 let embeddingProvider: EmbeddingProvider | null = null
 

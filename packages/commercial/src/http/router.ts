@@ -28,6 +28,17 @@ import { dialTunnelSocket as defaultTunnelDial } from '../compute-pool/nodeAgent
 import { getHostById as computePoolGetHostById } from '../compute-pool/queries.js'
 import { getPool } from '../db/index.js'
 import { type Logger, rootLogger } from '../logging/logger.js'
+import {
+  handleAdminMarketplacePending,
+  handleAdminMarketplaceReview,
+  handleAdminMarketplaceRevoke,
+  handleMarketplaceDetail,
+  handleMarketplaceInstall,
+  handleMarketplaceInstalled,
+  handleMarketplacePublish,
+  handleMarketplaceUninstall,
+} from '../marketplace/marketplaceRoutes.js'
+import { handleMarketplaceSearch } from '../marketplace/marketplaceSearch.js'
 import { isActiveAdmin, isInMaintenance } from '../middleware/maintenanceMode.js'
 import { ContainerUnreadyError } from '../ws/userChatBridge.js'
 import {
@@ -310,6 +321,12 @@ const BLOCKED_FOR_USER_RULES: readonly BlockedForUserRule[] = [
   // allowlist)。这里 block host 兜底,防 proxy 关闭/admin 绕过时落到 master host。
   { re: /^\/api\/skills\/[A-Za-z0-9_\-]+\/train$/, label: '/api/skills/:name/train' },
   { re: /^\/api\/skill-training\/.+$/, label: '/api/skill-training/*' },
+  // NOTE: /api/marketplace/* is deliberately NOT in this table. This table 403s
+  // *commercial browser users*, but the marketplace is a browser-facing feature
+  // those exact users must reach. Agent-bypass is enforced structurally instead:
+  // marketplace is absent from BRIDGE_API_ALLOWLIST (a closed allowlist), so a
+  // container cannot proxy to it, and the handlers require a browser user JWT a
+  // container never holds. See the routes registration below.
   // Agent teams 也写 host singleton agents.yaml；付费用户只能通过 container proxy
   // 操作自己容器内的 teams，不能落到 master host。
   { re: /^\/api\/agent-teams$/, label: '/api/agent-teams' },
@@ -530,6 +547,56 @@ export function createCommercialHandler(
     { method: 'POST', path: '/api/agent/open', handler: handleAgentOpen },
     { method: 'GET', path: '/api/agent/status', handler: handleAgentStatus },
     { method: 'POST', path: '/api/agent/cancel', handler: handleAgentCancel },
+    // ── Skill marketplace (B2) — browser-only user/admin routes ──
+    // These serve commercial browser users (requireAuth / requireAdminVerifyDb).
+    // Agent-bypass is enforced structurally, NOT via BLOCKED_FOR_USER_RULES (that
+    // table would 403 the very users we serve): /api/marketplace/* is absent from
+    // BRIDGE_API_ALLOWLIST so a container can't proxy to it, and these handlers
+    // require a browser user JWT a container never holds.
+    {
+      method: 'POST',
+      path: '/api/marketplace/publish',
+      handler: (req, res) => handleMarketplacePublish(req, res, deps),
+    },
+    {
+      method: 'GET',
+      path: '/api/marketplace/search',
+      handler: (req, res) => handleMarketplaceSearch(req, res, deps),
+    },
+    {
+      method: 'POST',
+      path: '/api/marketplace/install',
+      handler: (req, res) => handleMarketplaceInstall(req, res, deps),
+    },
+    {
+      method: 'GET',
+      path: '/api/marketplace/installed',
+      handler: (req, res) => handleMarketplaceInstalled(req, res, deps),
+    },
+    {
+      method: 'DELETE',
+      pathPrefix: '/api/marketplace/installed/',
+      handler: (req, res) => handleMarketplaceUninstall(req, res, deps),
+    },
+    // detail by slug — prefix; exact /installed (+ later /search) match first
+    {
+      method: 'GET',
+      pathPrefix: '/api/marketplace/',
+      handler: (req, res) => handleMarketplaceDetail(req, res, deps),
+    },
+    {
+      method: 'GET',
+      path: '/api/admin/marketplace/pending',
+      handler: (req, res) => handleAdminMarketplacePending(req, res, deps),
+    },
+    {
+      method: 'POST',
+      pathPrefix: '/api/admin/marketplace/',
+      handler: (req, res) =>
+        (req.url ?? '').includes('/revoke')
+          ? handleAdminMarketplaceRevoke(req, res, deps)
+          : handleAdminMarketplaceReview(req, res, deps),
+    },
     // FEATURE_REMOTE_SSH —— 用户远程执行机 CRUD + test + reset-fingerprint。
     //   列表 / 创建走 exact path;读/改/删/action 走 prefix(handler 自抽 :id)。
     //   POST prefix 同时承载 /:id/test 和 /:id/reset-fingerprint,handler 内按 suffix 派发。
@@ -910,6 +977,12 @@ export function createCommercialHandler(
     // 仍由 gateway 自己处理,必须 fall through；这里不能写成 `/api/wechat/`。
     '/wx/live',
     '/api/wechat/live',
+    // Skill marketplace (B2). Browser-only commercial routes registered above;
+    // must be in `prefixes` so isOurs() is true and the routes actually
+    // dispatch (otherwise commercialHandler returns false and falls through).
+    // Covers exact `/api/marketplace` + prefix `/api/marketplace/*`; admin
+    // marketplace is already covered by `/api/admin/`.
+    '/api/marketplace',
     // V3 CC 外接 plan Phase 3(2026-05-18)— public-facing
     // `POST /api/anthropic/v1/messages`。必须列在这里,让:
     //   - maintenance gate(L802 起)能把维护期请求统一 503;

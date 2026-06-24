@@ -5,6 +5,7 @@ import { getSession, state } from './state.js?v=4df2bda6'
 import { confirmDialog, openModal, toast, toastOptsFromError } from './ui.js?v=4df2bda6'
 import { _cronHuman } from './util.js?v=4df2bda6'
 import { openSkillTrainPanel } from './skillTrainPanel.js?v=4df2bda6'
+import { openMarketplace, openMarketplacePublish } from './marketplace.js?v=4df2bda6'
 
 const MEMORY_DELIMITER = '\n§\n'
 const CONTEXT_TABS = ['memory', 'skills', 'tasks']
@@ -209,6 +210,7 @@ function _ensureHubBound() {
 
   $('skills-search')?.addEventListener('input', () => _renderSkillsList())
   $('skill-new-btn')?.addEventListener('click', () => _openSkillEditor())
+  $('skill-market-btn')?.addEventListener('click', () => openMarketplace())
   $('skill-editor-cancel')?.addEventListener('click', () => _closeSkillEditor())
   $('skill-editor-save')?.addEventListener('click', () => _saveSkillEditor())
   $('skill-delete-btn')?.addEventListener('click', () => _deleteSelectedSkill())
@@ -480,6 +482,7 @@ async function _loadSkillDetail(name) {
         <div><span class="source-badge ${isPlatform ? 'platform' : 'user'}">${badgeText}</span><h4>${htmlSafeEscape(skill.name)}</h4><p>${htmlSafeEscape(skill.description || '')}</p></div>
         <div class="skill-detail-head-btns">
           ${canEdit ? '<button type="button" id="skill-train-inline" class="btn btn-secondary">训练优化</button>' : ''}
+          ${canEdit ? '<button type="button" id="skill-publish-inline" class="btn btn-secondary">发布到市场</button>' : ''}
           <button type="button" id="skill-edit-inline" class="btn btn-secondary" ${canEdit ? '' : 'disabled'}>${canEdit ? '编辑' : '只读'}</button>
         </div>
       </div>
@@ -495,6 +498,15 @@ async function _loadSkillDetail(name) {
     detail
       .querySelector('#skill-train-inline')
       ?.addEventListener('click', () => openSkillTrainPanel(skill.name))
+    detail.querySelector('#skill-publish-inline')?.addEventListener('click', () =>
+      openMarketplacePublish({
+        slug: skill.name,
+        name: skill.name,
+        description: skill.description || '',
+        tags: skill.tags || [],
+        body: skill.body || skill.rawContent || '',
+      }),
+    )
   } catch (err) {
     // Keep a back button on the error path too, so a failed fetch can't trap the user
     // inside the mobile overlay.
