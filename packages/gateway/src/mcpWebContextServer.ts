@@ -242,7 +242,7 @@ async function withConcurrency<T>(fn: () => Promise<T>): Promise<T> {
   }
 }
 
-async function extractUrl(args: WebContextExtractUrlArgs): Promise<Record<string, unknown>> {
+export async function extractUrl(args: WebContextExtractUrlArgs): Promise<Record<string, unknown>> {
   const url = optionalString(args.url)
   if (!url) throw new Error('url is required')
   const mode = optionalString(args.mode) ?? 'auto'
@@ -342,7 +342,7 @@ async function extractUrl(args: WebContextExtractUrlArgs): Promise<Record<string
   }
 }
 
-async function parseFile(args: WebContextParseFileArgs): Promise<Record<string, unknown>> {
+export async function parseFile(args: WebContextParseFileArgs): Promise<Record<string, unknown>> {
   const input = resolveSafeParseFile(args)
   const child = await runChild(
     {
@@ -362,7 +362,7 @@ async function parseFile(args: WebContextParseFileArgs): Promise<Record<string, 
   }
 }
 
-async function healthCheck(): Promise<Record<string, unknown>> {
+export async function healthCheck(): Promise<Record<string, unknown>> {
   const timeoutMs = boundedNumber(undefined, 20_000, 1_000, 60_000)
   return await runChild({ op: 'health_check' }, timeoutMs)
 }
