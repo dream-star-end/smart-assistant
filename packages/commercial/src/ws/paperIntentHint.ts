@@ -18,12 +18,12 @@ export const SCANSCI_PAPER_HINT_MARKER = "【OpenClaude 论文任务系统提示
 const SCANSCI_PAPER_HINT = [
   "---",
   SCANSCI_PAPER_HINT_MARKER,
-  "检测到这轮可能是论文/文献任务。用户不需要打开任何设置入口；如果当前工具列表中存在 `scansci_pdf_*` 工具，可优先使用它们；否则使用内置 WebSearch/WebFetch 检索/抓取，必要时说明当前未挂载专用 PDF 下载工具。",
-  "- 单个 DOI、arXiv、论文 URL 或精确题名：若有 `scansci_pdf_*` 则解析/下载；否则用 WebSearch/WebFetch 查找来源、标题、链接与可访问 PDF，不要假装已下载。",
-  "- 主题、关键词或模糊题名：先搜索并列候选，让用户按编号/卡片选择；不要擅自批量下载。",
-  "- 引用、BibTeX、RIS、EndNote：有专用工具时生成结构化结果；否则给出可核验的普通引用信息。",
-  "- 多篇列表或阅读清单：小批量处理，汇总成功/失败与下一步建议；专用下载工具不可用时只汇总链接与检索结果。",
-  "- 不要输出 ScanSci 配置、Cookie、Token、browser_state、代理或机构登录敏感信息；隐身浏览器/WebVPN 相关请求先做状态检测并清楚说明可用边界。",
+  "检测到这轮可能是论文/文献任务。用户不需要打开任何设置入口。论文检索与下载用 `scansci-pdf` 命令行(经 Bash 调用，始终可用；子命令与流程见 `skill_view(\"scansci-pdf\")`)；拿不到全文时再用内置 WebSearch/WebFetch 兜底。",
+  "- 单个 DOI、arXiv、论文 URL 或精确题名：用 `scansci-pdf` 解析/下载；拿不到全文时用 WebSearch/WebFetch 查找来源、标题、链接，不要假装已下载。",
+  "- 主题、关键词或模糊题名：先 `scansci-pdf search` 列候选，让用户按编号/卡片选择；不要擅自批量下载。",
+  "- 引用、BibTeX、RIS、EndNote：用 `scansci-pdf` 生成结构化结果；否则给出可核验的普通引用信息。",
+  "- 多篇列表或阅读清单：小批量处理，汇总成功/失败与下一步建议。",
+  "- 不要输出 ScanSci 配置、Cookie、Token、browser_state、代理或机构登录敏感信息(尤其不要运行 `scansci-pdf config get`)；隐身浏览器/WebVPN 相关请求先做状态检测并清楚说明可用边界。",
 ].join("\n");
 
 export type ScanSciPaperIntentKind = "download" | "search" | "citation" | "batch" | "health" | "browser";

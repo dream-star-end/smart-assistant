@@ -33,10 +33,6 @@
 import { existsSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { createLogger } from './logger.js'
-import {
-  OPENCLAUDE_WEB_CONTEXT_MCP_ID,
-  OPENCLAUDE_WEB_CONTEXT_TOOLS,
-} from './mcpWebContextServer.js'
 import { modelHintAppliedTotal } from './metrics.js'
 import { buildPromptContext } from './promptSlots.js'
 import type { RepoSnapshot } from './sessionRepoWorkspace.js'
@@ -153,38 +149,6 @@ export function resolveOpenClaudeVisionEntry(claudeCodePath?: string): string | 
       resolve(claudeCodePath, '..', 'openclaude/packages/gateway/src/mcpVisionServer.ts'),
     )
   }
-  for (const c of candidates) {
-    if (existsSync(c)) return c
-  }
-  return null
-}
-
-/** Resolve the built-in OpenClaude web-context MCP entry. Mirrors the source
- * checkout, process.cwd() checkout, and v3 runtime image layouts. */
-export function resolveOpenClaudeWebContextEntry(claudeCodePath?: string): string | null {
-  const moduleDir = new URL('.', import.meta.url).pathname.replace(/^\/([A-Za-z]):/, '$1:')
-  const candidates: string[] = [
-    resolve(moduleDir, 'mcpWebContextServer.ts'),
-    resolve(process.cwd(), 'packages/gateway/src/mcpWebContextServer.ts'),
-  ]
-  if (claudeCodePath) {
-    candidates.push(
-      resolve(claudeCodePath, '..', 'openclaude/packages/gateway/src/mcpWebContextServer.ts'),
-    )
-  }
-  for (const c of candidates) {
-    if (existsSync(c)) return c
-  }
-  return null
-}
-
-/** Resolve the parser helper required by the web-context MCP. The TS MCP entry
- * alone is not enough: without this binary, Codex would advertise tools that
- * immediately fail with ENOENT. Runtime images install the default path;
- * source/dev environments can opt in with OPENCLAUDE_WEB_CONTEXT_BIN. */
-export function resolveOpenClaudeWebContextBin(): string | null {
-  const configured = process.env.OPENCLAUDE_WEB_CONTEXT_BIN?.trim()
-  const candidates = configured ? [configured] : ['/usr/local/bin/oc-web-context']
   for (const c of candidates) {
     if (existsSync(c)) return c
   }
@@ -429,18 +393,8 @@ export async function buildCodexLaunchOverrides(
     process.env.OPENCLAUDE_VISION_MCP_DISABLED === '1'
       ? null
       : resolveOpenClaudeVisionEntry(ctx.claudeCodePath)
-  const openClaudeWebContextBin =
-    process.env.OPENCLAUDE_WEB_CONTEXT_MCP_DISABLED === '1'
-      ? null
-      : resolveOpenClaudeWebContextBin()
-  const openClaudeWebContextEntry =
-    process.env.OPENCLAUDE_WEB_CONTEXT_MCP_DISABLED === '1' || !openClaudeWebContextBin
-      ? null
-      : resolveOpenClaudeWebContextEntry(ctx.claudeCodePath)
-  const availableMcpTools = [
-    ...(openClaudeVisionEntry ? ['understand_image'] : []),
-    ...(openClaudeWebContextEntry ? OPENCLAUDE_WEB_CONTEXT_TOOLS : []),
-  ]
+  // web-context retired from the codex MCP path → oc-web CLI (baseline skill).
+  const availableMcpTools = [...(openClaudeVisionEntry ? ['understand_image'] : [])]
   const platformResult = await buildPromptContext({
     agentId: ctx.agentId,
     persona: ctx.persona,
@@ -537,23 +491,6 @@ export async function buildCodexLaunchOverrides(
       )}`,
       '-c',
       `mcp_servers.openclaude-vision.default_tools_approval_mode=${tomlValue('approve')}`,
-    )
-  }
-
-  if (openClaudeWebContextEntry && openClaudeWebContextBin) {
-    argvOverrides.push(
-      '-c',
-      `mcp_servers.${OPENCLAUDE_WEB_CONTEXT_MCP_ID}.command=${tomlValue('npx')}`,
-      '-c',
-      `mcp_servers.${OPENCLAUDE_WEB_CONTEXT_MCP_ID}.args=${tomlValue(['tsx', openClaudeWebContextEntry])}`,
-      '-c',
-      `mcp_servers.${OPENCLAUDE_WEB_CONTEXT_MCP_ID}.env=${tomlValue({
-        OPENCLAUDE_WEB_CONTEXT_BIN: openClaudeWebContextBin,
-      })}`,
-      '-c',
-      `mcp_servers.${OPENCLAUDE_WEB_CONTEXT_MCP_ID}.default_tools_approval_mode=${tomlValue('approve')}`,
-      '-c',
-      `mcp_servers.${OPENCLAUDE_WEB_CONTEXT_MCP_ID}.tool_timeout_sec=${codexMcpToolTimeoutSec()}`,
     )
   }
 

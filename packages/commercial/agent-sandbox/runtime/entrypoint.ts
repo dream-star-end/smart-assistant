@@ -99,6 +99,10 @@ cleanEnv.SCANSCI_PDF_DATA_DIR = SCANSCI_PDF_DATA_DIR;
 
 const CORE_TOOLSET_ID = "core";
 const BROWSER_TOOLSET_ID = "browser";
+// `research` (scansci-pdf + web-context) and `web_context` toolsets were retired
+// when those capabilities moved from MCP tools to the `scansci-pdf` / `oc-web`
+// CLIs (documented by baseline skills). Their ids + MCP servers are stripped
+// from any stale user-volume config in upsertPlatformMcpIntegrations below.
 const RESEARCH_TOOLSET_ID = "research";
 const WEB_CONTEXT_TOOLSET_ID = "web_context";
 
@@ -147,67 +151,12 @@ function cloneBrowserMcpServer() {
   };
 }
 
+// Retired MCP servers — ids retained only so upsertPlatformMcpIntegrations can
+// strip stale platform-owned entries from existing user volumes. The `scansci-pdf`
+// CLI (still installed in the image, reads SCANSCI_PDF_DATA_DIR) and the `oc-web`
+// CLI now provide these capabilities, documented by baseline skills.
 const SCANSCI_PDF_MCP_ID = "scansci-pdf";
-const SCANSCI_PDF_MCP_TOOLS = [
-  "scansci_pdf_download",
-  "scansci_pdf_batch_download",
-  "scansci_pdf_search",
-  "scansci_pdf_health_check",
-  "scansci_pdf_source_scores",
-  "scansci_pdf_network_diagnose",
-  // Do not expose config_get in the commercial default toolset: downloader
-  // config may contain institution/browser cookies, proxy tokens or other
-  // credentials.  Users can still update settings through config_set, but the
-  // model/UI should never receive a raw config dump by default.
-  "scansci_pdf_config_set",
-  "scansci_pdf_cache_clear",
-  "scansci_pdf_import_bib",
-  "scansci_pdf_citation",
-  "scansci_pdf_zotero_push",
-  "scansci_pdf_vpnsci_login",
-  "scansci_pdf_vpnsci_test",
-  "scansci_pdf_vpnsci_status",
-  "scansci_pdf_vpnsci_schools",
-  "scansci_pdf_vpnsci_set_school",
-  "scansci_pdf_parse_list",
-  "scansci_pdf_resolve_and_download",
-  "scansci_pdf_setup_check",
-  "scansci_pdf_tor_install",
-  "scansci_pdf_tor_start",
-  "scansci_pdf_tor_stop",
-] as const;
-
-function cloneScanSciPdfMcpServer() {
-  return {
-    id: SCANSCI_PDF_MCP_ID,
-    label: "ScanSci PDF",
-    command: "scansci-pdf",
-    args: ["run"],
-    env: {
-      SCANSCI_PDF_DATA_DIR,
-    },
-    tools: [...SCANSCI_PDF_MCP_TOOLS],
-    enabled: true,
-  };
-}
-
 const WEB_CONTEXT_MCP_ID = "web-context";
-const WEB_CONTEXT_MCP_TOOLS = [
-  "web_context_extract_url",
-  "web_context_parse_file",
-  "web_context_health_check",
-] as const;
-
-function cloneWebContextMcpServer() {
-  return {
-    id: WEB_CONTEXT_MCP_ID,
-    label: "Web Context",
-    command: "npx",
-    args: ["tsx", "/opt/openclaude/packages/gateway/src/mcpWebContextServer.ts"],
-    tools: [...WEB_CONTEXT_MCP_TOOLS],
-    enabled: true,
-  };
-}
 
 function isRecord(v: unknown): v is Record<string, unknown> {
   return v !== null && typeof v === "object" && !Array.isArray(v);
@@ -250,27 +199,6 @@ function isDesiredBrowserMcpServer(v: unknown): boolean {
   return sameStringArray(v.tools, BROWSER_MCP_TOOLS);
 }
 
-function isDesiredScanSciPdfMcpServer(v: unknown): boolean {
-  if (!isRecord(v)) return false;
-  if (v.id !== SCANSCI_PDF_MCP_ID) return false;
-  if (v.label !== "ScanSci PDF") return false;
-  if (v.command !== "scansci-pdf") return false;
-  if (v.enabled !== true) return false;
-  if (!sameStringArray(v.args, ["run"])) return false;
-  if (!sameStringArray(v.tools, SCANSCI_PDF_MCP_TOOLS)) return false;
-  return isRecord(v.env) && v.env.SCANSCI_PDF_DATA_DIR === SCANSCI_PDF_DATA_DIR;
-}
-
-function isDesiredWebContextMcpServer(v: unknown): boolean {
-  if (!isRecord(v)) return false;
-  if (v.id !== WEB_CONTEXT_MCP_ID) return false;
-  if (v.label !== "Web Context") return false;
-  if (v.command !== "npx") return false;
-  if (v.enabled !== true) return false;
-  if (!sameStringArray(v.args, ["tsx", "/opt/openclaude/packages/gateway/src/mcpWebContextServer.ts"])) return false;
-  return sameStringArray(v.tools, WEB_CONTEXT_MCP_TOOLS);
-}
-
 function upsertPlatformMcpServer(
   servers: unknown[],
   id: string,
@@ -289,6 +217,28 @@ function upsertPlatformMcpServer(
     return true;
   }
   return false;
+}
+
+// Strip a retired platform-owned MCP server id from a user volume's config so an
+// image upgrade actively removes deprecated tools (not just stops re-adding them).
+// Removes ALL matching entries: a hand-edited/legacy volume may hold duplicates,
+// and a single splice would leave the later copies for SubprocessRunner to mount.
+function removePlatformMcpServer(servers: unknown[], id: string): boolean {
+  let removed = false;
+  for (let i = servers.length - 1; i >= 0; i--) {
+    const srv = servers[i];
+    if (isRecord(srv) && srv.id === id) {
+      servers.splice(i, 1);
+      removed = true;
+    }
+  }
+  return removed;
+}
+
+function deleteToolset(toolsets: Record<string, unknown>, name: string): boolean {
+  if (!Object.prototype.hasOwnProperty.call(toolsets, name)) return false;
+  delete toolsets[name];
+  return true;
 }
 
 function setToolset(
@@ -327,34 +277,23 @@ function upsertPlatformMcpIntegrations(config: Record<string, unknown>): boolean
   mutated =
     upsertPlatformMcpServer(existingServers, BROWSER_MCP_ID, cloneBrowserMcpServer(), isDesiredBrowserMcpServer) ||
     mutated;
-  mutated =
-    upsertPlatformMcpServer(
-      existingServers,
-      SCANSCI_PDF_MCP_ID,
-      cloneScanSciPdfMcpServer(),
-      isDesiredScanSciPdfMcpServer,
-    ) || mutated;
-  mutated =
-    upsertPlatformMcpServer(
-      existingServers,
-      WEB_CONTEXT_MCP_ID,
-      cloneWebContextMcpServer(),
-      isDesiredWebContextMcpServer,
-    ) || mutated;
+  // scansci-pdf + web-context retired from MCP → CLI: drop any stale entries.
+  mutated = removePlatformMcpServer(existingServers, SCANSCI_PDF_MCP_ID) || mutated;
+  mutated = removePlatformMcpServer(existingServers, WEB_CONTEXT_MCP_ID) || mutated;
   if (!Array.isArray(config.mcpServers) || mutated) {
     config.mcpServers = existingServers;
   }
 
   // v3 runtime default is deliberately lightweight: `core` mounts no optional
-  // global MCPs. Browser and ScanSci remain named opt-in toolsets; never append
-  // ScanSci or browser into defaults/core, otherwise CCB can exceed the
-  // Anthropic-compatible 64-tool proxy schema limit again.
+  // global MCPs. Browser remains the only named opt-in toolset (scansci-pdf +
+  // web-context moved to CLIs); never append browser into defaults/core,
+  // otherwise CCB can exceed the Anthropic-compatible 64-tool proxy schema limit.
   const toolsets = isRecord(config.toolsets) ? { ...config.toolsets } : {};
   let toolsetsMutated = !isRecord(config.toolsets);
   toolsetsMutated = setToolset(toolsets, CORE_TOOLSET_ID, []) || toolsetsMutated;
   toolsetsMutated = setToolset(toolsets, BROWSER_TOOLSET_ID, [BROWSER_MCP_ID]) || toolsetsMutated;
-  toolsetsMutated = setToolset(toolsets, RESEARCH_TOOLSET_ID, [SCANSCI_PDF_MCP_ID, WEB_CONTEXT_MCP_ID]) || toolsetsMutated;
-  toolsetsMutated = setToolset(toolsets, WEB_CONTEXT_TOOLSET_ID, [WEB_CONTEXT_MCP_ID]) || toolsetsMutated;
+  toolsetsMutated = deleteToolset(toolsets, RESEARCH_TOOLSET_ID) || toolsetsMutated;
+  toolsetsMutated = deleteToolset(toolsets, WEB_CONTEXT_TOOLSET_ID) || toolsetsMutated;
   if (toolsetsMutated) {
     config.toolsets = toolsets;
     mutated = true;
@@ -564,10 +503,10 @@ try {
       toolsets: {
         [CORE_TOOLSET_ID]: [],
         [BROWSER_TOOLSET_ID]: [BROWSER_MCP_ID],
-        [RESEARCH_TOOLSET_ID]: [SCANSCI_PDF_MCP_ID, WEB_CONTEXT_MCP_ID],
-        [WEB_CONTEXT_TOOLSET_ID]: [WEB_CONTEXT_MCP_ID],
+        // research / web_context toolsets retired — scansci-pdf + web-context
+        // moved from MCP to the scansci-pdf / oc-web CLIs (baseline skills).
       },
-      mcpServers: [cloneBrowserMcpServer(), cloneScanSciPdfMcpServer(), cloneWebContextMcpServer()],
+      mcpServers: [cloneBrowserMcpServer()],
       // 必填占位:个人版 gateway.ts 在启动时直接读 config.channels.wechat / .telegram
       // 不存在会 TypeError。容器场景下我们不开任何外部 channel —— webchat 由商用版
       // userChatBridge 走 docker bridge 直连容器 18789(WS upgrade),无需 channel adapter。
@@ -584,7 +523,7 @@ try {
       const parsedConfig = JSON.parse(rawConfig) as unknown;
       if (isRecord(parsedConfig) && upsertPlatformMcpIntegrations(parsedConfig)) {
         writeFileSync(ocConfigPath, JSON.stringify(parsedConfig, null, 2), { mode: 0o600 });
-        console.error("[entrypoint] openclaude.json: ensured core/browser/research MCP toolsets");
+        console.error("[entrypoint] openclaude.json: ensured core/browser toolsets, stripped retired scansci/web-context MCP");
       }
     } catch (configErr) {
       // Existing config parse failures should not be silently repaired here:
@@ -1105,7 +1044,7 @@ try {
   };
 
   const RESEARCHER_PERSONA =
-    "你是资料研究员。先澄清问题范围,优先基于当前上下文、平台文献/搜索入口和已加载 skill 描述整理证据;不要假设浏览器或 ScanSci/PDF 工具已挂载,只有当前工具列表明确包含相关工具时才调用。最后给出来源线索清楚的中文结论。\n";
+    "你是资料研究员。先澄清问题范围,优先基于当前上下文、已加载 skill 描述和平台 CLI 整理证据;论文检索/下载用 `scansci-pdf` CLI、网页/文档提取用 `oc-web` CLI(都常驻可用,经 Bash 调用,详见对应 skill),浏览器 MCP 仅在当前工具列表明确包含时才用。最后给出来源线索清楚的中文结论。\n";
   const LEGACY_RESEARCHER_PERSONAS = [
     "你是资料研究员。先澄清问题范围,善用浏览器和论文/PDF工具查证,最后给出来源清楚的中文结论。\n",
   ] as const;
@@ -1187,14 +1126,14 @@ try {
     leaderAgentId: "main",
     leaderRole: "科研项目负责人",
     leaderPrompt:
-      "你是科研协作队长。先把研究问题拆成可验证子问题,定义证据标准和交付物;优先把资料整理交给 researcher,把统计建模/科学计算/可视化/生信分析交给 scientist,把工程实现或复现实验脚本交给 coder,把证据链复核交给 reviewer。默认不假设 browser/research MCP 已挂载,需要外部检索或论文工具时只要求成员在当前工具列表可用时使用。最终按结论、证据、局限和下一步组织输出。",
+      "你是科研协作队长。先把研究问题拆成可验证子问题,定义证据标准和交付物;优先把资料整理交给 researcher,把统计建模/科学计算/可视化/生信分析交给 scientist,把工程实现或复现实验脚本交给 coder,把证据链复核交给 reviewer。默认不假设浏览器工具已挂载,需要交互浏览时只要求成员在当前工具列表可用时使用;论文检索/下载用 scansci-pdf、网页/文档提取用 oc-web CLI(常驻可用,经 Bash 调用)。最终按结论、证据、局限和下一步组织输出。",
     members: [
       {
         agentId: "researcher",
         role: "文献研究员",
         responsibility: "整理资料、阅读论文/文档并列出可靠来源",
         rolePrompt:
-          "围绕研究问题整理和筛选高可信资料,区分已证实结论、假设和争议。默认不假设浏览器或 PDF 工具可用;若当前工具列表没有 browser/research,就基于已有上下文、平台文献/搜索入口和可追溯来源线索输出。输出必须包含来源线索、关键证据、适用边界和仍需验证的问题。",
+          "围绕研究问题整理和筛选高可信资料,区分已证实结论、假设和争议。默认不假设浏览器工具可用;论文检索/下载用 scansci-pdf、网页/文档提取用 oc-web CLI(常驻可用,经 Bash 调用),其余基于已有上下文和可追溯来源线索输出。输出必须包含来源线索、关键证据、适用边界和仍需验证的问题。",
       },
       {
         agentId: "scientist",

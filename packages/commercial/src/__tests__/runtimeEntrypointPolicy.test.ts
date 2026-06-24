@@ -201,7 +201,7 @@ describe("openclaude-runtime entrypoint env-scrub policy", () => {
     );
   });
 
-  test("entrypoint.ts wires lightweight default toolsets plus browser/research MCP configs", () => {
+  test("entrypoint.ts wires lightweight default toolsets + browser-only MCP, and strips retired scansci/web-context", () => {
     const src = readFileSync(ENTRYPOINT_TS_PATH, "utf-8");
     assert.match(
       src,
@@ -211,7 +211,7 @@ describe("openclaude-runtime entrypoint env-scrub policy", () => {
     assert.match(
       src,
       /cleanEnv\.SCANSCI_PDF_DATA_DIR\s*=\s*SCANSCI_PDF_DATA_DIR/,
-      "entrypoint must pass SCANSCI_PDF_DATA_DIR to gateway/MCP subprocesses",
+      "entrypoint must still pass SCANSCI_PDF_DATA_DIR (the scansci-pdf CLI reads it)",
     );
     assert.match(
       src,
@@ -226,37 +226,40 @@ describe("openclaude-runtime entrypoint env-scrub policy", () => {
     assert.match(
       src,
       /setToolset\(toolsets,\s*BROWSER_TOOLSET_ID,\s*\[BROWSER_MCP_ID\]\)/,
-      "browser tools must be opt-in via the browser toolset",
+      "browser tools must remain opt-in via the browser toolset",
     );
     assert.match(
       src,
-      /setToolset\(toolsets,\s*WEB_CONTEXT_TOOLSET_ID,\s*\[WEB_CONTEXT_MCP_ID\]\)/,
-      "web-context tools must also have a narrow standalone opt-in toolset",
-    );
-    assert.match(
-      src,
-      /setToolset\(toolsets,\s*RESEARCH_TOOLSET_ID,\s*\[SCANSCI_PDF_MCP_ID,\s*WEB_CONTEXT_MCP_ID\]\)/,
-      "ScanSci tools must be opt-in via the research toolset",
-    );
-    assert.match(
-      src,
-      /mcpServers:\s*\[cloneBrowserMcpServer\(\),\s*cloneScanSciPdfMcpServer\(\),\s*cloneWebContextMcpServer\(\)\]/,
-      "minimal openclaude.json must use array-shaped mcpServers, not a keyed object",
+      /mcpServers:\s*\[cloneBrowserMcpServer\(\)\]/,
+      "minimal openclaude.json must mount only the browser MCP server now",
     );
     assert.match(
       src,
       /command:\s*"npx"[\s\S]*args:\s*\["-y",\s*"@playwright\/mcp@latest",\s*"--headless",\s*"--no-sandbox"\]/,
       "browser MCP server should launch Playwright MCP over stdio",
     );
-    assert.match(
+    // scansci-pdf + web-context retired from MCP → CLI (baseline skills). The
+    // minimal config must not re-introduce them, and upsert must actively strip
+    // stale entries (servers + toolsets) from existing user volumes.
+    assert.doesNotMatch(
       src,
-      /command:\s*"scansci-pdf"[\s\S]*args:\s*\["run"\]/,
-      "ScanSci MCP server should launch `scansci-pdf run` over stdio",
+      /cloneScanSciPdfMcpServer\(\)|cloneWebContextMcpServer\(\)/,
+      "retired scansci/web-context MCP server builders must be gone",
+    );
+    assert.doesNotMatch(
+      src,
+      /setToolset\(toolsets,\s*(?:RESEARCH_TOOLSET_ID|WEB_CONTEXT_TOOLSET_ID)/,
+      "research / web_context toolsets must no longer be provisioned",
     );
     assert.match(
       src,
-      /args:\s*\["tsx",\s*"\/opt\/openclaude\/packages\/gateway\/src\/mcpWebContextServer\.ts"\]/,
-      "web-context MCP server should launch the built-in TS stdio server",
+      /removePlatformMcpServer\(existingServers,\s*SCANSCI_PDF_MCP_ID\)[\s\S]*removePlatformMcpServer\(existingServers,\s*WEB_CONTEXT_MCP_ID\)/,
+      "upsert must strip stale scansci/web-context MCP entries from existing volumes",
+    );
+    assert.match(
+      src,
+      /deleteToolset\(toolsets,\s*RESEARCH_TOOLSET_ID\)[\s\S]*deleteToolset\(toolsets,\s*WEB_CONTEXT_TOOLSET_ID\)/,
+      "upsert must strip stale research/web_context toolsets from existing volumes",
     );
     assert.doesNotMatch(
       src,
@@ -362,8 +365,8 @@ describe("openclaude-runtime entrypoint env-scrub policy", () => {
     );
     assert.match(
       src,
-      /const RESEARCHER_PERSONA\s*=[\s\S]*不要假设浏览器或 ScanSci\/PDF 工具已挂载/,
-      "researcher persona must not imply optional MCP tools are always available",
+      /const RESEARCHER_PERSONA\s*=[\s\S]*scansci-pdf[\s\S]*oc-web[\s\S]*浏览器 MCP 仅在当前工具列表明确包含时才用/,
+      "researcher persona must point at the scansci-pdf/oc-web CLIs (retired from MCP) and still gate browser MCP on the tool list",
     );
     assert.match(
       src,

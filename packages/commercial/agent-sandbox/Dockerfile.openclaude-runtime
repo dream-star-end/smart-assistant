@@ -151,8 +151,11 @@ COPY --chown=root:root ./runtime/oc-docx.sh /usr/local/bin/oc-docx
 COPY --chown=root:root ./runtime/create-docgen-reference.py /usr/local/lib/openclaude/create-docgen-reference.py
 COPY --chown=root:root ./runtime/oc-minimax.py /usr/local/bin/oc-minimax
 COPY --chown=root:root ./runtime/oc-web-context.py /usr/local/bin/oc-web-context
+# oc-web: CLI front-end over the web-context core (replaces the retired
+# web_context_* MCP tools; documented by the `web-context` baseline skill).
+COPY --chown=root:root ./runtime/oc-web.sh /usr/local/bin/oc-web
 RUN set -eux; \
-    chmod 0755 /usr/local/bin/oc-docx /usr/local/bin/oc-minimax /usr/local/bin/oc-web-context /usr/local/lib/openclaude/create-docgen-reference.py; \
+    chmod 0755 /usr/local/bin/oc-docx /usr/local/bin/oc-minimax /usr/local/bin/oc-web-context /usr/local/bin/oc-web /usr/local/lib/openclaude/create-docgen-reference.py; \
     ln -sf /usr/local/bin/oc-minimax /usr/local/bin/mmx; \
     python3 /usr/local/lib/openclaude/create-docgen-reference.py /usr/local/share/openclaude-docgen/reference.docx; \
     printf '%s\n' '# DOCX smoke' 'Inline $a^2+b^2=c^2$.' '' '$$' 'E = mc^2' '$$' > /tmp/oc-docx-smoke.md; \

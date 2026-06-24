@@ -985,9 +985,11 @@ describe("userChatBridge — model authorization", () => {
       assert.match(forwarded.traceId ?? "", /^[a-f0-9]{32}$/);
       assert.ok(forwarded.content?.text?.startsWith("10.1038/nature12373"));
       assert.ok((forwarded.content?.text ?? "").includes(SCANSCI_PAPER_HINT_MARKER));
-      assert.match(forwarded.content?.text ?? "", /scansci_pdf_\*/);
+      // scansci retired from MCP → CLI: hint must point at the `scansci-pdf` CLI,
+      // not the removed `scansci_pdf_*` MCP tools.
+      assert.match(forwarded.content?.text ?? "", /`scansci-pdf` 命令行/);
+      assert.doesNotMatch(forwarded.content?.text ?? "", /scansci_pdf_\*/);
       assert.match(forwarded.content?.text ?? "", /WebSearch\/WebFetch/);
-      assert.doesNotMatch(forwarded.content?.text ?? "", /优先使用 `scansci-pdf` MCP 工具/);
 
       ws.close();
       await waitClose(ws);

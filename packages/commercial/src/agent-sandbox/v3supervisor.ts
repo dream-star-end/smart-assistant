@@ -402,6 +402,7 @@ export const V3_CCB_BASELINE_SKILL_NAMES = [
   "skill-management",
   "skill-search",
   "scansci-pdf",
+  "web-context",
   "document-writing",
   "minimax-media",
 ] as const;

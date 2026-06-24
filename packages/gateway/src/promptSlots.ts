@@ -78,8 +78,6 @@ export async function buildAgentsSlot(ctx: PromptSlotContext): Promise<PromptSlo
   const hasUnderstandImageTool = ctx.availableMcpTools?.includes('understand_image') === true
   const hasBrowserTools =
     ctx.availableMcpTools?.some((tool) => tool.startsWith('browser_')) === true
-  const hasWebContextTools =
-    ctx.availableMcpTools?.some((tool) => tool.startsWith('web_context_')) === true
   const lines = [
     '# Platform capabilities',
     '',
@@ -138,28 +136,23 @@ export async function buildAgentsSlot(ctx: PromptSlotContext): Promise<PromptSlo
   } else {
     lines.push(
       '',
-      '## 浏览器/研究 MCP 按需挂载',
+      '## 浏览器 MCP 按需挂载',
       '',
-      '为减少初始上下文和避免工具过多,浏览器与研究下载类 MCP 默认不挂载。',
-      '不要假设可调用 `browser_*` 或 `scansci_pdf_*` 工具;只有它们出现在当前工具列表时才可以使用。',
-      '普通网页检索优先用模型内置的 WebSearch/WebFetch 能力。',
+      '为减少初始上下文,浏览器 MCP 默认不挂载。不要假设可调用 `browser_*` 工具;只有它们出现在当前工具列表时才可以使用。',
+      '普通网页检索优先用模型内置的 WebSearch/WebFetch,或下方的 `oc-web` / `scansci-pdf` CLI。',
       '如果用户明确要求交互式浏览器操作,平台可能会为下一轮启动浏览器工具;若当前轮仍不可用,请说明限制或请用户重试/切换,不要编造工具调用。',
     )
   }
 
-  if (hasWebContextTools) {
-    lines.push(
-      '',
-      '## 网页/文档上下文提取',
-      '',
-      '当前 `web_context_*` MCP 工具已挂载。用户要求读取公开 URL、网页、公告、PDF、Office 文档或把资料喂给 AI 时,优先调用:',
-      '- `web_context_extract_url(url)`：把公开网页/PDF/文档 URL 转成 Markdown 上下文。',
-      '- `web_context_parse_file(file_path)`：解析已上传/已生成的本地文档。',
-      '',
-      '安全边界:不要尝试绕过 CAPTCHA、Cloudflare、登录墙或站点反爬;工具返回 blocked/error 时,如实说明受阻并改用官方 API、用户上传文件或用户提供的数据源。',
-      '输出结论时标明来源 URL、数据时间或文件路径;不要把网页抓取结果当成实时金融/法律/医疗等高风险事实的唯一依据。',
-    )
-  }
+  // web-context + scansci-pdf 已从 MCP 工具迁到 CLI(始终可用,经 Bash 调用),
+  // 细节走 skill 渐进披露,基线提示只放精简指针,避免臃肿。
+  lines.push(
+    '',
+    '## 网页/文档提取 · 论文下载 (CLI)',
+    '',
+    '读取公开 URL、网页、PDF、Office 文档 → 用 Bash 调 `oc-web extract <url>` / `oc-web parse <绝对路径>`;学术论文检索与下载 → `scansci-pdf <子命令>`(search/download/citation 等)。细节见 `skill_view("web-context")` 与 `skill_view("scansci-pdf")`。',
+    '安全边界:不要绕过 CAPTCHA、Cloudflare、登录墙或站点反爬;返回 blocked/error 时如实说明受阻,改用官方 API、用户上传文件或用户提供的数据源。输出标明来源 URL/时间/路径,不要把网页抓取当高风险事实的唯一依据。',
+  )
 
   // Dynamically inject available agents list
   try {

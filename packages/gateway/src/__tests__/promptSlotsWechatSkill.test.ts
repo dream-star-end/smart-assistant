@@ -34,8 +34,8 @@ describe('WeChat channel operation skill prompt', () => {
 
   it('keeps browser instructions lightweight until browser tools are mounted', async () => {
     const slot = await buildAgentsSlot({ agentId: 'main', availableMcpTools: [] })
-    assert.match(slot.content, /浏览器\/研究 MCP 按需挂载/)
-    assert.match(slot.content, /不要假设可调用 `browser_\*` 或 `scansci_pdf_\*`/)
+    assert.match(slot.content, /浏览器 MCP 按需挂载/)
+    assert.match(slot.content, /不要假设可调用 `browser_\*` 工具/)
     assert.doesNotMatch(slot.content, /browser_navigate/)
   })
 
