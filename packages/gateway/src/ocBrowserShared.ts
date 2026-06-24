@@ -16,10 +16,11 @@
 
 import { join } from 'node:path'
 
-// Root for per-agent runtime state. /run/oc is the established v3 runtime tmp
-// root (codex-auth, agent dirs); fall back to /tmp outside the container image.
+// Root for per-agent runtime state (socket + start lock + pid). Must be writable
+// by the unprivileged `agent` (uid 1000) user — /run/oc is root-owned and only
+// /run/oc/claude-config is chowned, so default to an agent-writable /tmp path.
 export function ocBrowserStateRoot(): string {
-  return process.env.OPENCLAUDE_OC_BROWSER_ROOT?.trim() || '/run/oc/browser'
+  return process.env.OPENCLAUDE_OC_BROWSER_ROOT?.trim() || '/tmp/openclaude-oc-browser'
 }
 
 export function ocBrowserAgentId(): string {

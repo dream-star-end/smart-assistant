@@ -360,8 +360,8 @@ describe("openclaude-runtime entrypoint env-scrub policy", () => {
     );
     assert.match(
       src,
-      /const RESEARCHER_PERSONA\s*=[\s\S]*scansci-pdf[\s\S]*oc-web[\s\S]*浏览器 MCP 仅在当前工具列表明确包含时才用/,
-      "researcher persona must point at the scansci-pdf/oc-web CLIs (retired from MCP) and still gate browser MCP on the tool list",
+      /const RESEARCHER_PERSONA\s*=[\s\S]*scansci-pdf[\s\S]*oc-web[\s\S]*oc-browser/,
+      "researcher persona must point at the scansci-pdf/oc-web/oc-browser CLIs (all retired from MCP)",
     );
     assert.match(
       src,
@@ -404,8 +404,8 @@ describe("openclaude-runtime entrypoint env-scrub policy", () => {
     );
     assert.match(
       src,
-      /const CODER_PERSONA\s*=[\s\S]*不要假设浏览器工具已挂载/,
-      "coder persona must not imply browser tools are always available",
+      /const CODER_PERSONA\s*=[\s\S]*oc-web[\s\S]*oc-browser/,
+      "coder persona must point at the oc-web/oc-browser CLIs (browser retired from MCP)",
     );
     assert.match(
       src,

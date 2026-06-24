@@ -17,11 +17,10 @@
  *    MCP call.
  */
 
-import type { ChildProcess } from 'node:child_process'
 import { existsSync, mkdirSync, unlinkSync } from 'node:fs'
-import { type Server, type Socket, createServer, connect as netConnect } from 'node:net'
+import { type Server, type Socket, connect as netConnect, createServer } from 'node:net'
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
-import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
+import { StdioClientTransport, getDefaultEnvironment } from '@modelcontextprotocol/sdk/client/stdio.js'
 import {
   OC_BROWSER_TOOLS,
   type OcBrowserRequest,
@@ -59,7 +58,7 @@ async function main(): Promise<void> {
 
   // ── State ──
   let mcp: Client | null = null
-  let mcpChild: ChildProcess | null = null
+  let transport: StdioClientTransport | null = null
   let readyResolve!: () => void
   let readyReject!: (e: Error) => void
   const ready = new Promise<void>((res, rej) => {
@@ -81,7 +80,9 @@ async function main(): Promise<void> {
       if (existsSync(socketPath)) unlinkSync(socketPath)
     } catch {}
     try {
-      mcpChild?.kill('SIGTERM')
+      // transport.close() closes the child's stdin (clean MCP shutdown) and
+      // terminates the @playwright/mcp process + its Chromium.
+      transport?.close()
     } catch {}
     setTimeout(() => process.exit(code), 200)
   }
@@ -151,6 +152,9 @@ async function main(): Promise<void> {
       return { ok: false, error: (err as Error).message }
     } finally {
       inFlight -= 1
+      // Re-arm idle if the client already disconnected while this call was in
+      // flight (the close handler skipped arming because inFlight was > 0).
+      if (openConnections === 0 && inFlight === 0) armIdle()
     }
   }
 
@@ -187,7 +191,7 @@ async function main(): Promise<void> {
 
   // ── Start @playwright/mcp via the official MCP client ──
   try {
-    const transport = new StdioClientTransport({
+    transport = new StdioClientTransport({
       command: 'npx',
       args: [
         '--no-install',
@@ -197,14 +201,27 @@ async function main(): Promise<void> {
         '--user-data-dir',
         ocBrowserUserDataDir(agentId),
       ],
+      // StdioClientTransport's default env is a minimal allowlist that does NOT
+      // forward PLAYWRIGHT_BROWSERS_PATH, so the child would look for Chromium in
+      // the wrong cache and fail. Pass it through (the image installs it there).
+      env: {
+        ...getDefaultEnvironment(),
+        PLAYWRIGHT_BROWSERS_PATH:
+          process.env.PLAYWRIGHT_BROWSERS_PATH ?? '/usr/local/share/ms-playwright',
+      },
       stderr: 'ignore',
     })
     const client = new Client({ name: 'oc-browser-daemon', version: '1.0.0' }, { capabilities: {} })
     await client.connect(transport)
-    mcpChild =
-      transport.pid != null
-        ? ({ kill: (s?: NodeJS.Signals) => process.kill(transport.pid!, s) } as ChildProcess)
-        : null
+    // If the @playwright/mcp child dies later, the socket would stay live but
+    // every callTool would fail; tear down so the next CLI lazy-starts a fresh
+    // daemon instead of connecting to a dead one.
+    transport.onclose = () => {
+      if (!shuttingDown) {
+        log('@playwright/mcp transport closed — shutting down')
+        shutdown(1)
+      }
+    }
     // Validate the expected tools exist so a pinned-version bump fails loudly.
     const { tools } = await client.listTools()
     const names = new Set(tools.map((t) => t.name))
