@@ -10,9 +10,9 @@
 // POST /api/marketplace/install, GET /api/marketplace/installed,
 // DELETE /api/marketplace/installed/:slug, POST /api/marketplace/publish.
 
-import { apiFetch, apiGet, apiJson, authHeaders } from './api.js?v=8ecb0b2d'
-import { htmlSafeEscape } from './dom.js?v=8ecb0b2d'
-import { confirmDialog, toast } from './ui.js?v=8ecb0b2d'
+import { apiFetch, apiGet, apiJson, authHeaders } from './api.js?v=f082d8ba'
+import { htmlSafeEscape } from './dom.js?v=f082d8ba'
+import { confirmDialog, toast } from './ui.js?v=f082d8ba'
 
 const SLUG_RE = /^[a-z0-9][a-z0-9-]{1,63}$/
 const VERSION_RE = /^\d+\.\d+\.\d+$/
