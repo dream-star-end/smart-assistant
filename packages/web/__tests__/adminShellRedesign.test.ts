@@ -22,6 +22,7 @@ const EXPECTED_TABS = [
   'modelGrants',
   'feedback',
   'inbox',
+  'marketplace',
   'literature',
   'settings',
   'audit',

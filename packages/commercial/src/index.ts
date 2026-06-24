@@ -158,6 +158,11 @@ import {
   type SkillEmbedHandler,
 } from "./http/internalSkillEmbed.js";
 import {
+  MARKETPLACE_SYNC_PATH,
+  makeMarketplaceSyncHandler,
+  type MarketplaceSyncHandler,
+} from "./http/internalMarketplaceSync.js";
+import {
   makePgSkillEmbedCache,
   makePgSkillSearchLogger,
 } from "./http/skillEmbedCachePg.js";
@@ -1215,6 +1220,11 @@ export async function registerCommercial(
         cache: makePgSkillEmbedCache(),
         recordSearch: makePgSkillSearchLogger(),
       });
+      // /internal/v3/marketplace/sync — 容器内 mcp-memory 拉取本用户已安装(未撤回)
+      // 的市场 skill artifact 做 hub 对账(pull 模型,同款 verifyContainerIdentity)。
+      const marketplaceSyncHandler: MarketplaceSyncHandler = makeMarketplaceSyncHandler({
+        identityRepo,
+      });
       dispatchInternal = (req, res, ctx) => {
         const path = (req.url ?? "/").split("?")[0];
         if (path === SERVER_AUTHORED_PATH) {
@@ -1237,6 +1247,9 @@ export async function registerCommercial(
         }
         if (path === SKILL_EMBED_PREFIX) {
           return skillEmbedHandler(req, res, ctx);
+        }
+        if (path === MARKETPLACE_SYNC_PATH) {
+          return marketplaceSyncHandler(req, res, ctx);
         }
         if (path === WECHAT_OUTBOUND_PATH) {
           // P1.7 slice 7c — wechat broker outbound 接收点
