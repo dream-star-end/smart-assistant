@@ -36,9 +36,9 @@
 //    点高(=deepseek default)→ 切回 Opus,Opus 退回 medium。接受。第三个支持
 //    effort 的模型接入时建议升级到模型元数据 / model-scoped store。
 
-import { $ } from './dom.js?v=f082d8ba'
-import { getEffectiveSingleAgentModel } from './modelPolicy.js?v=f082d8ba'
-import { getSession, state } from './state.js?v=f082d8ba'
+import { $ } from './dom.js?v=1b540d2a'
+import { getEffectiveSingleAgentModel } from './modelPolicy.js?v=1b540d2a'
+import { getSession, state } from './state.js?v=1b540d2a'
 
 const STORAGE_KEY = 'openclaude_effort_by_agent'
 
