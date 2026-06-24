@@ -153,6 +153,15 @@ import {
   type CodexRelayHandler,
 } from "./http/internalCodexRelay.js";
 import {
+  SKILL_EMBED_PREFIX,
+  makeSkillEmbedHandler,
+  type SkillEmbedHandler,
+} from "./http/internalSkillEmbed.js";
+import {
+  makePgSkillEmbedCache,
+  makePgSkillSearchLogger,
+} from "./http/skillEmbedCachePg.js";
+import {
   appendCostCredits,
   appendServerAuthoredMessage,
   appendServerAuthoredMessageForRequest,
@@ -1198,6 +1207,14 @@ export async function registerCommercial(
         identityRepo,
         db: makeDefaultCodexRelayDb(),
       });
+      // /internal/v3/skill-embed — 容器内 mcp-memory 语义 skill_search 回源 master。
+      // master 持 SKILL_EMBEDDING_API_KEY/DASHSCOPE_API_KEY(只在 master env,不注入容器),
+      // 同款 verifyContainerIdentity 双因子鉴权;向量跨租户 PG 缓存,fail-closed 回落关键词。
+      const skillEmbedHandler: SkillEmbedHandler = makeSkillEmbedHandler({
+        identityRepo,
+        cache: makePgSkillEmbedCache(),
+        recordSearch: makePgSkillSearchLogger(),
+      });
       dispatchInternal = (req, res, ctx) => {
         const path = (req.url ?? "/").split("?")[0];
         if (path === SERVER_AUTHORED_PATH) {
@@ -1217,6 +1234,9 @@ export async function registerCommercial(
         }
         if (path === CODEX_RELAY_PREFIX || path.startsWith(`${CODEX_RELAY_PREFIX}/`)) {
           return codexRelayHandler(req, res, ctx);
+        }
+        if (path === SKILL_EMBED_PREFIX) {
+          return skillEmbedHandler(req, res, ctx);
         }
         if (path === WECHAT_OUTBOUND_PATH) {
           // P1.7 slice 7c — wechat broker outbound 接收点

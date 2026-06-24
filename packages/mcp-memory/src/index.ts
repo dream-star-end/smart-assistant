@@ -256,6 +256,12 @@ const TOOLS = [
       '  description — 1-2 sentence summary of when to use it (max 1024 chars)',
       '  body        — full markdown instructions: overview, prerequisites, steps, examples',
       '  tags        — optional array of topical tags',
+      '  force       — optional; set true to skip the near-duplicate check',
+      '',
+      'Before creating a NEW skill, this checks whether a semantically similar',
+      'skill already exists. If one does, the save is declined with a pointer to',
+      'it — prefer updating that skill (skill_save with its name) over adding a',
+      'near-duplicate. Pass force:true to create anyway.',
       '',
       'The skill is stored under your agent home and will appear in `skill_list` next session.',
     ].join('\n'),
@@ -266,6 +272,7 @@ const TOOLS = [
         description: { type: 'string' },
         body: { type: 'string' },
         tags: { type: 'array', items: { type: 'string' } },
+        force: { type: 'boolean' },
       },
       required: ['name', 'description', 'body'],
     },
@@ -672,11 +679,79 @@ async function handleSkillList() {
   return { content: [{ type: 'text', text: lines.join('\n') }] }
 }
 
+/**
+ * v3 semantic skill ranking via the master embedding relay. The DashScope key
+ * lives on master (never in the container) — we send only raw skill metadata
+ * (master computes the content hash + embed text itself, so a container can't
+ * poison the shared cache), and the cleaned query is embedded master-side.
+ * Returns validated ranked {name, score} or null to signal "fall back to the
+ * deterministic keyword search" (no master configured = personal version, or
+ * any relay/embedding failure). Never throws.
+ */
+async function semanticSkillRank(
+  list: Array<{ name: string; description: string; tags?: string[]; related_skills?: string[] }>,
+  query: string,
+  limit: number | undefined,
+): Promise<Array<{ name: string; score: number }> | null> {
+  const base = process.env.OPENCLAUDE_V3_MASTER_BASE_URL?.trim()
+  const token = process.env.OPENCLAUDE_V3_CONTAINER_TOKEN?.trim()
+  if (!base || !token || list.length === 0) return null
+  try {
+    const res = await postJsonToGateway(`${base.replace(/\/+$/, '')}/internal/v3/skill-embed`, {
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify({
+        query,
+        limit,
+        skills: list.map((s) => ({
+          name: s.name,
+          description: s.description,
+          tags: s.tags,
+          related_skills: s.related_skills,
+        })),
+      }),
+      timeoutMs: 3500,
+    })
+    if (res.statusCode < 200 || res.statusCode >= 300) return null
+    const data = JSON.parse(res.body) as { ok?: boolean; ranked?: unknown }
+    if (!data.ok || !Array.isArray(data.ranked)) return null
+    const ranked = data.ranked.filter(
+      (r): r is { name: string; score: number } =>
+        !!r && typeof r.name === 'string' && typeof r.score === 'number',
+    )
+    return ranked.length > 0 ? ranked : null
+  } catch {
+    return null // fail-closed → keyword
+  }
+}
+
 async function handleSkillSearch(args: { query: string; limit?: number } | undefined) {
   const query = typeof args?.query === 'string' ? args.query.trim() : ''
   if (!query) return toolError('query required')
 
   const list = await skills.list()
+
+  // v3: semantic ranking via master relay (key stays on master); any miss → keyword fallback.
+  const semantic = await semanticSkillRank(list, query, args?.limit)
+  if (semantic) {
+    const byName = new Map(list.map((s) => [s.name, s]))
+    const matched = semantic.map((r) => ({ r, s: byName.get(r.name) })).filter((x) => x.s)
+    // If none of the ranked names map back to a known skill, treat as a miss
+    // and fall through to keyword rather than emitting an empty "Found N".
+    if (matched.length > 0) {
+      const lines = [`Found ${matched.length} relevant skill(s) for "${query}" (semantic):`, '']
+      for (const { r, s } of matched) {
+        lines.push(`### ${r.name} [source: ${s!.source}, relevance: ${r.score.toFixed(3)}]`)
+        lines.push(s!.description)
+        if (s!.tags && s!.tags.length > 0) lines.push(`tags: ${s!.tags.join(', ')}`)
+        if (s!.related_skills && s!.related_skills.length > 0)
+          lines.push(`related_skills: ${s!.related_skills.join(', ')}`)
+        lines.push('')
+      }
+      lines.push('Next: call `skill_view(name)` for the best match before applying it.')
+      return { content: [{ type: 'text', text: lines.join('\n') }] }
+    }
+  }
+
   const hits = searchSkillMetadata(list, query, args?.limit)
   if (hits.length === 0) {
     return {
@@ -720,16 +795,88 @@ async function handleSkillView(args: { name: string; subfile?: string }) {
   return { content: [{ type: 'text', text: `${header}\n\n${v.rawContent}` }] }
 }
 
+// Cosine threshold above which a new skill is treated as a near-duplicate of an
+// existing one. Conservative (force-overridable) to avoid blocking legit skills.
+const SKILL_DUP_THRESHOLD = 0.82
+
+/**
+ * v3 near-duplicate detection for skill_save. Reuses the master embedding relay
+ * (DashScope key stays on master): ranks existing skills against the new skill's
+ * text and returns the closest one if above the similarity threshold. Excludes a
+ * same-named skill (that is an update, not a duplicate). Fail-open — any miss
+ * (no master configured / relay error / timeout) returns null and the save
+ * proceeds, so this is a soft quality gate, never a hard dependency.
+ */
+async function findNearDuplicateSkill(
+  meta: { name: string; description: string; tags?: string[] },
+  existing: Array<{ name: string; description: string; tags?: string[]; related_skills?: string[] }>,
+): Promise<{ name: string; score: number } | null> {
+  const base = process.env.OPENCLAUDE_V3_MASTER_BASE_URL?.trim()
+  const token = process.env.OPENCLAUDE_V3_CONTAINER_TOKEN?.trim()
+  const others = existing.filter((s) => s.name !== meta.name)
+  if (!base || !token || others.length === 0) return null
+  try {
+    const res = await postJsonToGateway(`${base.replace(/\/+$/, '')}/internal/v3/skill-embed`, {
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify({
+        // include tags so dedup doesn't rely on description text alone
+        query: [meta.name, meta.description, ...(meta.tags ?? [])].join(' '),
+        // ask for several: exact-name-guard may reorder, so scan for the true
+        // highest-cosine candidate rather than trusting index 0
+        limit: 5,
+        skills: others.map((s) => ({
+          name: s.name,
+          description: s.description,
+          tags: s.tags,
+          related_skills: s.related_skills,
+        })),
+      }),
+      timeoutMs: 3500,
+    })
+    if (res.statusCode < 200 || res.statusCode >= 300) return null
+    const data = JSON.parse(res.body) as { ok?: boolean; ranked?: unknown }
+    if (!data.ok || !Array.isArray(data.ranked)) return null
+    let best: { name: string; score: number } | null = null
+    for (const r of data.ranked) {
+      if (!r || typeof r.name !== 'string' || typeof r.score !== 'number') continue
+      if (!best || r.score > best.score) best = { name: r.name, score: r.score }
+    }
+    return best && best.score >= SKILL_DUP_THRESHOLD ? best : null
+  } catch {
+    return null // fail-open → save proceeds
+  }
+}
+
 async function handleSkillSave(args: {
   name: string
   description: string
   body: string
   tags?: string[]
+  force?: boolean
 }) {
   // Defense in depth: training sessions must never write the authoritative library
   // (the tool is also removed from the training tool list above).
   if (SKILL_TRAIN_RUN_ID) {
     return toolError('skill_save is disabled during a training run — use skill_propose (draft only)')
+  }
+  // Near-duplicate soft gate: steer toward updating an existing similar skill
+  // rather than growing the library uncontrolled. force:true bypasses. Only the
+  // v3 path (master configured) runs it — personal version skips entirely (no
+  // extra skills.list() cost).
+  if (!args.force && process.env.OPENCLAUDE_V3_MASTER_BASE_URL && process.env.OPENCLAUDE_V3_CONTAINER_TOKEN) {
+    const dup = await findNearDuplicateSkill(
+      { name: args.name, description: args.description, tags: args.tags },
+      await skills.list(),
+    )
+    if (dup) {
+      return toolError(
+        [
+          `A semantically similar skill already exists: "${dup.name}" (similarity ${dup.score.toFixed(2)}).`,
+          `Prefer updating it — call skill_save with name="${dup.name}".`,
+          'To create this as a separate new skill anyway, call skill_save again with force:true.',
+        ].join(' '),
+      )
+    }
   }
   const r = await skills.save(
     {
