@@ -209,7 +209,7 @@ RUN npm install -g @openai/codex@0.137.0 --no-audit --no-fund \
 # readable path so the unprivileged `agent` user can run them.
 # ⚠️ Phase 5: confirm OC_PLAYWRIGHT_MCP_VERSION is a published version (the build
 #    fails loudly otherwise) and that the bundled chromium installs cleanly.
-ARG OC_PLAYWRIGHT_MCP_VERSION=0.0.41
+ARG OC_PLAYWRIGHT_MCP_VERSION=0.0.76
 ENV PLAYWRIGHT_BROWSERS_PATH=/usr/local/share/ms-playwright
 RUN set -eux; \
     npm install -g "@playwright/mcp@${OC_PLAYWRIGHT_MCP_VERSION}" --no-audit --no-fund; \
