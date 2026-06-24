@@ -79,12 +79,17 @@ async function main(): Promise<void> {
     try {
       if (existsSync(socketPath)) unlinkSync(socketPath)
     } catch {}
-    try {
-      // transport.close() closes the child's stdin (clean MCP shutdown) and
-      // terminates the @playwright/mcp process + its Chromium.
-      transport?.close()
-    } catch {}
-    setTimeout(() => process.exit(code), 200)
+    // transport.close() closes the child's stdin (clean MCP shutdown) then
+    // SIGTERM/SIGKILLs @playwright/mcp + its Chromium. Await it (bounded) so the
+    // browser is actually reaped, then exit regardless.
+    const exit = () => process.exit(code)
+    const cap = setTimeout(exit, 3_000)
+    Promise.resolve(transport?.close())
+      .catch(() => {})
+      .finally(() => {
+        clearTimeout(cap)
+        exit()
+      })
   }
 
   const armIdle = () => {
@@ -215,8 +220,12 @@ async function main(): Promise<void> {
     await client.connect(transport)
     // If the @playwright/mcp child dies later, the socket would stay live but
     // every callTool would fail; tear down so the next CLI lazy-starts a fresh
-    // daemon instead of connecting to a dead one.
+    // daemon instead of connecting to a dead one. CHAIN (do not overwrite) the
+    // SDK's onclose so it still rejects any in-flight listTools/callTool promises
+    // immediately instead of leaving the CLI hung until its call timeout.
+    const sdkOnClose = transport.onclose
     transport.onclose = () => {
+      sdkOnClose?.()
       if (!shuttingDown) {
         log('@playwright/mcp transport closed — shutting down')
         shutdown(1)
