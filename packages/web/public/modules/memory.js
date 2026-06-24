@@ -450,13 +450,29 @@ function _renderSkillsList() {
     const btn = document.createElement('button')
     btn.type = 'button'
     btn.className = `skill-card${s.name === _selectedSkill ? ' active' : ''}`
+    const ic = _richIcon(s.name)
     btn.innerHTML = `
-      <span class="skill-card-top"><strong>${htmlSafeEscape(s.name)}</strong><span class="source-badge ${s.source === 'platform' ? 'platform' : 'user'}">${s.source === 'platform' ? '平台' : '自建'}</span></span>
-      <span class="skill-card-desc">${htmlSafeEscape(s.description || '无描述')}</span>
-      <span class="skill-card-tags">${(s.tags || []).slice(0, 4).map((tag) => `<span>${htmlSafeEscape(tag)}</span>`).join('')}</span>`
+      <span class="rich-ic ${ic.cls}" aria-hidden="true">${htmlSafeEscape(ic.glyph)}</span>
+      <span class="skill-card-main">
+        <span class="skill-card-top"><strong>${htmlSafeEscape(s.name)}</strong><span class="source-badge ${s.source === 'platform' ? 'platform' : 'user'}">${s.source === 'platform' ? '平台' : '自建'}</span></span>
+        <span class="skill-card-desc">${htmlSafeEscape(s.description || '无描述')}</span>
+        <span class="skill-card-tags">${(s.tags || []).slice(0, 4).map((tag) => `<span>${htmlSafeEscape(tag)}</span>`).join('')}</span>
+      </span>
+      <span class="skill-card-chev" aria-hidden="true">›</span>`
     btn.addEventListener('click', () => _loadSkillDetail(s.name))
     wrap.appendChild(btn)
   }
+}
+
+// Decorative colored icon chip for skill cards (rich hub UI). Hue is derived
+// from the name so each skill keeps a stable color; glyph is the first
+// alphanumeric char (uppercased), falling back to a generic tool glyph.
+function _richIcon(name) {
+  const str = String(name || '')
+  let h = 0
+  for (let i = 0; i < str.length; i++) h = (h * 31 + str.charCodeAt(i)) >>> 0
+  const m = str.match(/[a-z0-9]/i)
+  return { cls: `rich-c${(h % 5) + 1}`, glyph: m ? m[0].toUpperCase() : '🛠️' }
 }
 
 function _renderSkillEmpty() {
