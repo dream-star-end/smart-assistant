@@ -1,5 +1,5 @@
 /**
- * Postgres-backed cross-tenant skill embedding cache (see migration 0081).
+ * Postgres-backed cross-tenant skill embedding cache (see migration 0085).
  *
  * Vectors are deterministic per (content_hash, backend_id, dimensions), so
  * writes are insert-once (ON CONFLICT DO NOTHING). Baseline skills shared by
@@ -9,7 +9,7 @@ import { query } from '../db/queries.js'
 import type { SkillEmbedCache, SkillSearchLogRow } from './internalSkillEmbed.js'
 
 /**
- * Best-effort central feedback writer (migration 0082). Fire-and-forget: a
+ * Best-effort central feedback writer (migration 0086). Fire-and-forget: a
  * logging failure must never affect skill_search, so errors are swallowed.
  */
 export function makePgSkillSearchLogger(): (row: SkillSearchLogRow) => void {

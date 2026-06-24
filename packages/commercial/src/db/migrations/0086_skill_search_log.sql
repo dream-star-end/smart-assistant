@@ -1,4 +1,4 @@
--- 0082_skill_search_log.sql
+-- 0086_skill_search_log.sql
 -- Central feedback log for semantic skill_search, written master-side in the
 -- skill-embed relay (every semantic search already flows through master, so
 -- this is the natural central collection point — no per-container sink needed).

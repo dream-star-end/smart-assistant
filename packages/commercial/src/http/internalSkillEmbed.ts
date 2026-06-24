@@ -83,7 +83,7 @@ export interface SkillEmbedCache {
   ): Promise<void>
 }
 
-/** Central feedback row (see migration 0082). */
+/** Central feedback row (see migration 0086). */
 export interface SkillSearchLogRow {
   userId: number
   containerId: number

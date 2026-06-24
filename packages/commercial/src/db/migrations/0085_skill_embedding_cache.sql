@@ -1,4 +1,4 @@
--- 0081_skill_embedding_cache.sql
+-- 0085_skill_embedding_cache.sql
 -- Cross-tenant cache of skill embedding vectors for semantic skill_search.
 --
 -- Keyed by (content_hash, backend_id, dimensions):
