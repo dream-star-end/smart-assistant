@@ -1216,16 +1216,8 @@ export class SubprocessRunner extends EventEmitter {
         }
       }
 
-      // Per-agent browser isolation: give each agent its own Chrome profile
-      // to prevent "Browser is already in use" conflicts between agents.
-      if (mcpServers.browser) {
-        const browserArgs = [...(mcpServers.browser.args || [])]
-        const hasUserDataDir = browserArgs.some((a: string) => a.startsWith('--user-data-dir'))
-        if (!hasUserDataDir) {
-          browserArgs.push('--user-data-dir', `/tmp/openclaude-browser-${this.opts.agentId}`)
-          mcpServers.browser.args = browserArgs
-        }
-      }
+      // (browser per-agent profile now handled by the oc-browser daemon, which
+      // owns its own per-agent --user-data-dir; browser is no longer an MCP.)
 
       if (Object.keys(mcpServers).length > 0) {
         const mcpPath = resolve(sessionDir, 'mcp-config.json')

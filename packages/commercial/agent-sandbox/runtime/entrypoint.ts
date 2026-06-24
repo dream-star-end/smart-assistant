@@ -129,27 +129,11 @@ const COMMERCIAL_DEEPSEEK_PRO_MODEL = "deepseek-v4-pro";
 const COMMERCIAL_DEEPSEEK_PRO_PROVIDER = "deepseek";
 const COMMERCIAL_CODEX_MODEL = "gpt-5.5";
 
+// Retired MCP server — id retained only so upsertPlatformMcpIntegrations can
+// strip stale platform-owned entries from existing user volumes. Browser is now
+// the stateful oc-browser daemon (keeps one Playwright session alive) +
+// thin `oc-browser` CLI, documented by the `browser` baseline skill.
 const BROWSER_MCP_ID = "browser";
-const BROWSER_MCP_TOOLS = [
-  "browser_navigate",
-  "browser_snapshot",
-  "browser_click",
-  "browser_type",
-  "browser_press_key",
-  "browser_take_screenshot",
-  "browser_wait_for",
-] as const;
-
-function cloneBrowserMcpServer() {
-  return {
-    id: BROWSER_MCP_ID,
-    label: "Playwright Browser",
-    command: "npx",
-    args: ["-y", "@playwright/mcp@latest", "--headless", "--no-sandbox"],
-    tools: [...BROWSER_MCP_TOOLS],
-    enabled: true,
-  };
-}
 
 // Retired MCP servers — ids retained only so upsertPlatformMcpIntegrations can
 // strip stale platform-owned entries from existing user volumes. The `scansci-pdf`
@@ -187,16 +171,6 @@ function sameStringSet(a: unknown, b: readonly string[]): boolean {
   const av = a.filter((v): v is string => typeof v === "string").sort();
   const bv = [...b].sort();
   return av.length === bv.length && av.every((v, i) => v === bv[i]);
-}
-
-function isDesiredBrowserMcpServer(v: unknown): boolean {
-  if (!isRecord(v)) return false;
-  if (v.id !== BROWSER_MCP_ID) return false;
-  if (v.label !== "Playwright Browser") return false;
-  if (v.command !== "npx") return false;
-  if (v.enabled !== true) return false;
-  if (!sameStringArray(v.args, ["-y", "@playwright/mcp@latest", "--headless", "--no-sandbox"])) return false;
-  return sameStringArray(v.tools, BROWSER_MCP_TOOLS);
 }
 
 function upsertPlatformMcpServer(
@@ -274,24 +248,22 @@ function upsertPlatformMcpIntegrations(config: Record<string, unknown>): boolean
   let mutated = false;
 
   const existingServers = Array.isArray(config.mcpServers) ? [...config.mcpServers] : [];
-  mutated =
-    upsertPlatformMcpServer(existingServers, BROWSER_MCP_ID, cloneBrowserMcpServer(), isDesiredBrowserMcpServer) ||
-    mutated;
-  // scansci-pdf + web-context retired from MCP → CLI: drop any stale entries.
+  // browser + scansci-pdf + web-context all retired from MCP → CLI: actively
+  // strip any stale platform-owned entries from existing user volumes.
+  mutated = removePlatformMcpServer(existingServers, BROWSER_MCP_ID) || mutated;
   mutated = removePlatformMcpServer(existingServers, SCANSCI_PDF_MCP_ID) || mutated;
   mutated = removePlatformMcpServer(existingServers, WEB_CONTEXT_MCP_ID) || mutated;
   if (!Array.isArray(config.mcpServers) || mutated) {
     config.mcpServers = existingServers;
   }
 
-  // v3 runtime default is deliberately lightweight: `core` mounts no optional
-  // global MCPs. Browser remains the only named opt-in toolset (scansci-pdf +
-  // web-context moved to CLIs); never append browser into defaults/core,
-  // otherwise CCB can exceed the Anthropic-compatible 64-tool proxy schema limit.
+  // v3 runtime default is deliberately lightweight: `core` is the only toolset
+  // and mounts no MCP servers — browser/scansci-pdf/web-context all moved to the
+  // oc-browser / scansci-pdf / oc-web CLIs (documented by baseline skills).
   const toolsets = isRecord(config.toolsets) ? { ...config.toolsets } : {};
   let toolsetsMutated = !isRecord(config.toolsets);
   toolsetsMutated = setToolset(toolsets, CORE_TOOLSET_ID, []) || toolsetsMutated;
-  toolsetsMutated = setToolset(toolsets, BROWSER_TOOLSET_ID, [BROWSER_MCP_ID]) || toolsetsMutated;
+  toolsetsMutated = deleteToolset(toolsets, BROWSER_TOOLSET_ID) || toolsetsMutated;
   toolsetsMutated = deleteToolset(toolsets, RESEARCH_TOOLSET_ID) || toolsetsMutated;
   toolsetsMutated = deleteToolset(toolsets, WEB_CONTEXT_TOOLSET_ID) || toolsetsMutated;
   if (toolsetsMutated) {
@@ -501,12 +473,11 @@ try {
         toolsets: [CORE_TOOLSET_ID],
       },
       toolsets: {
+        // `core` is the only toolset; browser/scansci-pdf/web-context all moved
+        // from MCP to the oc-browser / scansci-pdf / oc-web CLIs (baseline skills).
         [CORE_TOOLSET_ID]: [],
-        [BROWSER_TOOLSET_ID]: [BROWSER_MCP_ID],
-        // research / web_context toolsets retired — scansci-pdf + web-context
-        // moved from MCP to the scansci-pdf / oc-web CLIs (baseline skills).
       },
-      mcpServers: [cloneBrowserMcpServer()],
+      mcpServers: [],
       // 必填占位:个人版 gateway.ts 在启动时直接读 config.channels.wechat / .telegram
       // 不存在会 TypeError。容器场景下我们不开任何外部 channel —— webchat 由商用版
       // userChatBridge 走 docker bridge 直连容器 18789(WS upgrade),无需 channel adapter。

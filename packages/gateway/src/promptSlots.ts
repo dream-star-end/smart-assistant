@@ -76,8 +76,6 @@ export async function buildUserSlot(ctx: PromptSlotContext): Promise<PromptSlot 
 export async function buildAgentsSlot(ctx: PromptSlotContext): Promise<PromptSlot> {
   const provider = ctx.provider
   const hasUnderstandImageTool = ctx.availableMcpTools?.includes('understand_image') === true
-  const hasBrowserTools =
-    ctx.availableMcpTools?.some((tool) => tool.startsWith('browser_')) === true
   const lines = [
     '# Platform capabilities',
     '',
@@ -117,32 +115,18 @@ export async function buildAgentsSlot(ctx: PromptSlotContext): Promise<PromptSlo
     '子 agent 会继承你的全部工具和上下文。用户在 UI 中能看到子任务的进度卡片。',
   ]
 
-  if (hasBrowserTools) {
-    lines.push(
-      '',
-      '## 浏览器操作',
-      '',
-      '当前 `browser_*` MCP 工具已挂载,可以用 Playwright 自主浏览和操作网页:',
-      '',
-      '1. `browser_navigate(url)` → 打开网页',
-      '2. `browser_snapshot()` → 获取页面 accessibility tree + 元素 ref 编号',
-      '3. `browser_click(ref="XX")` / `browser_type(ref="XX", text="...")` → 用 ref 操作',
-      '4. 重复 2-3 直到完成',
-      '',
-      '常用场景: 搜索信息、填表单、登录网站、抓取数据。',
-      '优先用 snapshot(文本,省 token),只在需要视觉确认时用 screenshot。',
-      '详细操作指南见 skill `browser-automation`。',
-    )
-  } else {
-    lines.push(
-      '',
-      '## 浏览器 MCP 按需挂载',
-      '',
-      '为减少初始上下文,浏览器 MCP 默认不挂载。不要假设可调用 `browser_*` 工具;只有它们出现在当前工具列表时才可以使用。',
-      '普通网页检索优先用模型内置的 WebSearch/WebFetch,或下方的 `oc-web` / `scansci-pdf` CLI。',
-      '如果用户明确要求交互式浏览器操作,平台可能会为下一轮启动浏览器工具;若当前轮仍不可用,请说明限制或请用户重试/切换,不要编造工具调用。',
-    )
-  }
+  // browser is now the stateful oc-browser daemon + thin CLI (retired from MCP);
+  // always available via Bash, detail via the `browser` skill.
+  lines.push(
+    '',
+    '## 浏览器操作 (CLI)',
+    '',
+    '用 Bash 调 `oc-browser` 操作真实浏览器(有状态,跨调用共享同一会话):',
+    '1. `oc-browser navigate --url <url>` → 打开网页',
+    '2. `oc-browser snapshot` → 拿页面 accessibility tree + 元素 ref',
+    '3. `oc-browser click --ref <ref> --element "<描述>"` / `oc-browser type --ref <ref> --element "<描述>" --text "<文本>"` → 按 ref 操作,重复 2-3 直到完成',
+    '常用场景: 搜索、填表、登录、抓数据。优先 snapshot(文本省 token),需视觉确认才 `oc-browser screenshot`。细节见 `skill_view("browser")`。',
+  )
 
   // web-context + scansci-pdf 已从 MCP 工具迁到 CLI(始终可用,经 Bash 调用),
   // 细节走 skill 渐进披露,基线提示只放精简指针,避免臃肿。

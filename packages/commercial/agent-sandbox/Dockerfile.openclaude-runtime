@@ -154,8 +154,11 @@ COPY --chown=root:root ./runtime/oc-web-context.py /usr/local/bin/oc-web-context
 # oc-web: CLI front-end over the web-context core (replaces the retired
 # web_context_* MCP tools; documented by the `web-context` baseline skill).
 COPY --chown=root:root ./runtime/oc-web.sh /usr/local/bin/oc-web
+# oc-browser: thin client over the oc-browser daemon (replaces the retired
+# browser_* MCP tools; documented by the `browser` baseline skill).
+COPY --chown=root:root ./runtime/oc-browser.sh /usr/local/bin/oc-browser
 RUN set -eux; \
-    chmod 0755 /usr/local/bin/oc-docx /usr/local/bin/oc-minimax /usr/local/bin/oc-web-context /usr/local/bin/oc-web /usr/local/lib/openclaude/create-docgen-reference.py; \
+    chmod 0755 /usr/local/bin/oc-docx /usr/local/bin/oc-minimax /usr/local/bin/oc-web-context /usr/local/bin/oc-web /usr/local/bin/oc-browser /usr/local/lib/openclaude/create-docgen-reference.py; \
     ln -sf /usr/local/bin/oc-minimax /usr/local/bin/mmx; \
     python3 /usr/local/lib/openclaude/create-docgen-reference.py /usr/local/share/openclaude-docgen/reference.docx; \
     printf '%s\n' '# DOCX smoke' 'Inline $a^2+b^2=c^2$.' '' '$$' 'E = mc^2' '$$' > /tmp/oc-docx-smoke.md; \
@@ -194,6 +197,27 @@ RUN set -eux; \
 RUN npm install -g @openai/codex@0.137.0 --no-audit --no-fund \
     && npm cache clean --force \
     && rm -rf /root/.npm
+
+# ------------------------------------------------------------
+# Playwright MCP + Chromium for the oc-browser daemon
+# ------------------------------------------------------------
+# browser is the stateful oc-browser daemon (packages/gateway/src/ocBrowserDaemon.ts):
+# it keeps ONE @playwright/mcp session alive and serves it over a per-agent Unix
+# socket. We PIN @playwright/mcp (no @latest) and pre-install the matching Chromium
+# so the first browser call is instant and fully offline — the daemon launches it
+# with `npx --no-install @playwright/mcp`. Browsers cached at a shared, world-
+# readable path so the unprivileged `agent` user can run them.
+# ⚠️ Phase 5: confirm OC_PLAYWRIGHT_MCP_VERSION is a published version (the build
+#    fails loudly otherwise) and that the bundled chromium installs cleanly.
+ARG OC_PLAYWRIGHT_MCP_VERSION=0.0.41
+ENV PLAYWRIGHT_BROWSERS_PATH=/usr/local/share/ms-playwright
+RUN set -eux; \
+    npm install -g "@playwright/mcp@${OC_PLAYWRIGHT_MCP_VERSION}" --no-audit --no-fund; \
+    PW_BIN="$(npm root -g)/@playwright/mcp/node_modules/.bin/playwright"; \
+    "$PW_BIN" install --with-deps chromium; \
+    chmod -R a+rX /usr/local/share/ms-playwright; \
+    npm cache clean --force; \
+    rm -rf /root/.npm
 
 # ------------------------------------------------------------
 # Codex system skills 预 populate(image_gen / openai-docs / document-writing / ...)

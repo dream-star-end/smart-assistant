@@ -32,21 +32,15 @@ describe('WeChat channel operation skill prompt', () => {
     assert.match(slot.content, /txt` 或 `md/)
   })
 
-  it('keeps browser instructions lightweight until browser tools are mounted', async () => {
+  it('always advertises the oc-browser CLI workflow (browser retired from MCP)', async () => {
+    // browser is now the always-available oc-browser daemon + CLI, so the section
+    // no longer depends on availableMcpTools and never mentions browser_* tools.
     const slot = await buildAgentsSlot({ agentId: 'main', availableMcpTools: [] })
-    assert.match(slot.content, /浏览器 MCP 按需挂载/)
-    assert.match(slot.content, /不要假设可调用 `browser_\*` 工具/)
-    assert.doesNotMatch(slot.content, /browser_navigate/)
-  })
-
-  it('adds detailed Playwright instructions when browser tools are mounted', async () => {
-    const slot = await buildAgentsSlot({
-      agentId: 'main',
-      availableMcpTools: ['browser_navigate', 'browser_snapshot'],
-    })
-    assert.match(slot.content, /当前 `browser_\*` MCP 工具已挂载/)
-    assert.match(slot.content, /browser_navigate/)
-    assert.match(slot.content, /browser_snapshot/)
+    assert.match(slot.content, /## 浏览器操作 \(CLI\)/)
+    assert.match(slot.content, /oc-browser navigate --url/)
+    assert.match(slot.content, /oc-browser snapshot/)
+    assert.match(slot.content, /skill_view\("browser"\)/)
+    assert.doesNotMatch(slot.content, /browser_navigate|browser_snapshot/)
   })
 
   it('is injected into DeepSeek/CCB prompt context', async () => {

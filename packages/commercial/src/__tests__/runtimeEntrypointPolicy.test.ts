@@ -201,7 +201,7 @@ describe("openclaude-runtime entrypoint env-scrub policy", () => {
     );
   });
 
-  test("entrypoint.ts wires lightweight default toolsets + browser-only MCP, and strips retired scansci/web-context", () => {
+  test("entrypoint.ts wires a core-only toolset with no MCP servers, and strips retired browser/scansci/web-context", () => {
     const src = readFileSync(ENTRYPOINT_TS_PATH, "utf-8");
     assert.match(
       src,
@@ -225,41 +225,36 @@ describe("openclaude-runtime entrypoint env-scrub policy", () => {
     );
     assert.match(
       src,
-      /setToolset\(toolsets,\s*BROWSER_TOOLSET_ID,\s*\[BROWSER_MCP_ID\]\)/,
-      "browser tools must remain opt-in via the browser toolset",
+      /mcpServers:\s*\[\]/,
+      "minimal openclaude.json must mount no MCP servers now (browser is the oc-browser daemon)",
     );
-    assert.match(
-      src,
-      /mcpServers:\s*\[cloneBrowserMcpServer\(\)\]/,
-      "minimal openclaude.json must mount only the browser MCP server now",
-    );
-    assert.match(
-      src,
-      /command:\s*"npx"[\s\S]*args:\s*\["-y",\s*"@playwright\/mcp@latest",\s*"--headless",\s*"--no-sandbox"\]/,
-      "browser MCP server should launch Playwright MCP over stdio",
-    );
-    // scansci-pdf + web-context retired from MCP → CLI (baseline skills). The
-    // minimal config must not re-introduce them, and upsert must actively strip
-    // stale entries (servers + toolsets) from existing user volumes.
+    // browser + scansci-pdf + web-context all retired from MCP → CLI (baseline
+    // skills). The minimal config must not re-introduce them, and upsert must
+    // actively strip stale entries (servers + toolsets) from existing volumes.
     assert.doesNotMatch(
       src,
-      /cloneScanSciPdfMcpServer\(\)|cloneWebContextMcpServer\(\)/,
-      "retired scansci/web-context MCP server builders must be gone",
+      /cloneScanSciPdfMcpServer\(\)|cloneWebContextMcpServer\(\)|cloneBrowserMcpServer\(\)/,
+      "retired scansci/web-context/browser MCP server builders must be gone",
     );
     assert.doesNotMatch(
       src,
-      /setToolset\(toolsets,\s*(?:RESEARCH_TOOLSET_ID|WEB_CONTEXT_TOOLSET_ID)/,
-      "research / web_context toolsets must no longer be provisioned",
+      /@playwright\/mcp/,
+      "entrypoint must not reference @playwright/mcp (browser is the oc-browser daemon now)",
+    );
+    assert.doesNotMatch(
+      src,
+      /setToolset\(toolsets,\s*(?:RESEARCH_TOOLSET_ID|WEB_CONTEXT_TOOLSET_ID|BROWSER_TOOLSET_ID)/,
+      "research / web_context / browser toolsets must no longer be provisioned",
     );
     assert.match(
       src,
-      /removePlatformMcpServer\(existingServers,\s*SCANSCI_PDF_MCP_ID\)[\s\S]*removePlatformMcpServer\(existingServers,\s*WEB_CONTEXT_MCP_ID\)/,
-      "upsert must strip stale scansci/web-context MCP entries from existing volumes",
+      /removePlatformMcpServer\(existingServers,\s*BROWSER_MCP_ID\)[\s\S]*removePlatformMcpServer\(existingServers,\s*SCANSCI_PDF_MCP_ID\)[\s\S]*removePlatformMcpServer\(existingServers,\s*WEB_CONTEXT_MCP_ID\)/,
+      "upsert must strip stale browser/scansci/web-context MCP entries from existing volumes",
     );
     assert.match(
       src,
-      /deleteToolset\(toolsets,\s*RESEARCH_TOOLSET_ID\)[\s\S]*deleteToolset\(toolsets,\s*WEB_CONTEXT_TOOLSET_ID\)/,
-      "upsert must strip stale research/web_context toolsets from existing volumes",
+      /deleteToolset\(toolsets,\s*BROWSER_TOOLSET_ID\)[\s\S]*deleteToolset\(toolsets,\s*RESEARCH_TOOLSET_ID\)[\s\S]*deleteToolset\(toolsets,\s*WEB_CONTEXT_TOOLSET_ID\)/,
+      "upsert must strip stale browser/research/web_context toolsets from existing volumes",
     );
     assert.doesNotMatch(
       src,
