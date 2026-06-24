@@ -69,9 +69,12 @@ function _setBusy(btn, busy, label) {
 }
 
 // Skills mobile detail: below this width the detail/editor pane is shown as a
-// full-screen overlay over the list (tap a skill → popup; back button to return).
+// full-screen slide-in page over the list (tap a skill → page; back to return).
+// Must stay in sync with the context-hub mobile breakpoint in style.css
+// (`@media (max-width: 900px)`), which switches the whole hub to the bottom-tab
+// mobile layout — otherwise 861–900px gets a CSS/JS split-brain.
 function _isMobileSkills() {
-  return typeof window !== 'undefined' && window.matchMedia('(max-width: 860px)').matches
+  return typeof window !== 'undefined' && window.matchMedia('(max-width: 900px)').matches
 }
 function _openSkillDetailOverlay() {
   document.querySelector('.skills-layout')?.classList.add('detail-open')
@@ -257,7 +260,11 @@ export async function switchContextHubTab(tab) {
   for (const t of CONTEXT_TABS) {
     const btn = document.querySelector(`[data-context-tab="${t}"]`)
     const panel = $(CONTEXT_PANEL_IDS[t])
-    btn?.classList.toggle('active', t === _hubTab)
+    const on = t === _hubTab
+    btn?.classList.toggle('active', on)
+    // The nav doubles as a bottom tab bar on mobile (role=tab); keep the
+    // selected state exposed to AT in sync with the visual active state.
+    btn?.setAttribute('aria-selected', on ? 'true' : 'false')
     if (panel) panel.hidden = t !== _hubTab
   }
   if (_hubTab === 'memory') await _renderMemoryPanel(true)

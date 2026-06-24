@@ -1658,14 +1658,14 @@
       <button class="modal-close" data-close-modal="context-hub-modal" aria-label="关闭">×</button>
     </div>
     <div class="context-hub-shell">
-      <aside class="context-hub-nav" aria-label="学习与自动化导航">
-        <button type="button" class="context-nav-card active" data-context-tab="memory">
+      <aside class="context-hub-nav" role="tablist" aria-label="学习与自动化导航">
+        <button type="button" role="tab" aria-selected="true" class="context-nav-card active" data-context-tab="memory">
           <span class="context-nav-icon">🧠</span><strong>记忆</strong><small>长期偏好与事实</small>
         </button>
-        <button type="button" class="context-nav-card" data-context-tab="skills">
+        <button type="button" role="tab" aria-selected="false" class="context-nav-card" data-context-tab="skills">
           <span class="context-nav-icon">🛠️</span><strong>技能</strong><small>可复用工作流</small>
         </button>
-        <button type="button" class="context-nav-card" data-context-tab="tasks">
+        <button type="button" role="tab" aria-selected="false" class="context-nav-card" data-context-tab="tasks">
           <span class="context-nav-icon">⏰</span><strong>任务</strong><small>提醒与自动化</small>
         </button>
       </aside>
