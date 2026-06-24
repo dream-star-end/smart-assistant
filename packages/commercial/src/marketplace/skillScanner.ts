@@ -371,9 +371,14 @@ export function scanSkillArtifact(input: SkillScanInput): SkillScanResult {
   if (strippedBody !== body) applyRules(strippedBody, '正文', flags)
 
   // Combination escalation: reading credentials/env AND posting to an external
-  // host are each only flagged alone (legit skills do one or the other), but
-  // together in one shared artifact they form a high-confidence exfil chain
-  // (read the installer's secret, ship it out). Escalate to a block.
+  // host together in one artifact form a suspected exfil chain. We surface this
+  // as a prominent high-severity FLAG (shown to the reviewer + in the install-
+  // confirm dialog) rather than a hard publish block — the mechanical "read an
+  // env secret then call a third-party API" pattern has legitimate uses (a skill
+  // authenticating to its own API), so a hard block would refuse valid skills.
+  // Reviewer + install-time disclosure carry this one. (The explicit
+  // "send credentials/secrets to …" phrasing is still a hard block via
+  // exfil_creds — that one has near-zero false positives.)
   const hasReadCreds = flags.some((f) => f.code === 'read_creds')
   const hasExfilHttp = flags.some((f) => f.code === 'exfil_http')
   if (hasReadCreds && hasExfilHttp)
@@ -381,8 +386,8 @@ export function scanSkillArtifact(input: SkillScanInput): SkillScanResult {
       category: 'injection',
       severity: 'high',
       code: 'cred_exfil_chain',
-      message: '同一 skill 同时读取凭证/环境并向外部 POST(高置信外泄链)',
-      block: true,
+      message: '同一 skill 同时读取凭证/环境并向外部 POST(疑似外泄链,请重点核对)',
+      block: false,
     })
 
   // dedupe by code+category (a pattern may hit metadata and body)
