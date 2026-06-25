@@ -1428,23 +1428,22 @@
 </div>
 
 <!-- ═══════════════ MODALS ═══════════════ -->
-<div id="agents-modal" class="modal-backdrop" role="dialog" aria-modal="true">
+<div id="agents-modal" class="modal-backdrop rich-modal" role="dialog" aria-modal="true">
   <div class="modal settings-modal">
     <div class="modal-head">
       <div class="modal-title-block">
         <div class="modal-title-row"><span class="modal-icon" aria-hidden="true">🤖</span><h3>管理 Agents</h3></div>
-        <p class="modal-subtitle">创建、查看和管理你的专属云端 Agent。</p>
       </div>
       <button class="modal-close" data-close-modal="agents-modal" aria-label="关闭">×</button>
     </div>
     <div class="modal-body agent-manager-body">
-      <div class="agent-manager-hero">
-        <div>
-          <span class="agent-manager-eyebrow">Agents Console</span>
-          <h4>把常用角色和协作团队整理在一个地方</h4>
-          <p>单 Agent 负责日常对话和专业人格；多 Agent 团队用于科研、编程等需要分工与复核的任务。</p>
-        </div>
-        <button id="new-team-btn" class="btn btn-primary" type="button">新建团队</button>
+      <div class="rich-hero">
+        <span class="rich-hero-kicker">Agents Console</span>
+        <h3>常用角色与协作团队</h3>
+        <p>单 Agent 处理日常对话与专业人格;多 Agent 团队用于科研、编程等需要分工与复核的任务。</p>
+      </div>
+      <div style="display:flex;justify-content:flex-end;margin:-8px 0 14px">
+        <button id="new-team-btn" class="btn btn-primary" type="button">＋ 新建团队</button>
       </div>
       <div class="agent-manager-grid">
         <section class="agent-manager-panel">
@@ -1541,16 +1540,20 @@
   </div>
 </div>
 
-<div id="persona-modal" class="modal-backdrop" role="dialog" aria-modal="true">
+<div id="persona-modal" class="modal-backdrop rich-modal" role="dialog" aria-modal="true">
   <div class="modal settings-modal">
     <div class="modal-head">
       <div class="modal-title-block">
         <div class="modal-title-row"><span class="modal-icon" aria-hidden="true">✨</span><h3 id="persona-modal-title">编辑 Agent</h3></div>
-        <p class="modal-subtitle">配置身份、模型、权限和长期人格指令。</p>
       </div>
       <button class="modal-close" data-close-modal="persona-modal" aria-label="关闭">×</button>
     </div>
     <div class="modal-body persona-editor-body">
+      <div class="rich-hero">
+        <span class="rich-hero-kicker">Agent Persona</span>
+        <h3>调教一个专属 Agent</h3>
+        <p>配置身份、模型、权限和长期人格指令,塑造它回答的方式与边界。</p>
+      </div>
       <section class="persona-card persona-card--identity">
         <div class="persona-card-title">
           <span>身份</span>
@@ -1848,23 +1851,20 @@
 </div>
 
 <!-- ScanSci PDF Paper Library modal (passive, chat-native) -->
-<div id="papers-modal" class="modal-backdrop" role="dialog" aria-modal="true">
+<div id="papers-modal" class="modal-backdrop rich-modal" role="dialog" aria-modal="true">
   <div class="modal settings-modal papers-modal">
     <div class="modal-head">
       <div class="modal-title-block">
         <div class="modal-title-row"><span class="modal-icon" aria-hidden="true">📚</span><h3>论文库与下载记录</h3></div>
-        <p class="modal-subtitle">论文搜索、下载和引用已经无感接入聊天；这里用于查看产物说明、状态和后续记录。</p>
       </div>
       <button class="modal-close" data-close-modal="papers-modal" aria-label="关闭">×</button>
     </div>
     <div class="modal-body">
-      <div class="papers-hero">
-        <div>
-          <div class="papers-hero-kicker">Chat-native ScanSci PDF</div>
-          <div class="papers-hero-title">直接在聊天里粘 DOI、arXiv 或论文题名</div>
-          <div class="papers-hero-desc">Agent 会自动判断论文任务并调用 ScanSci PDF。搜索结果、PDF 文件卡、引用和失败诊断都会回到当前对话中。</div>
-        </div>
-        <div class="papers-hero-badge">无感</div>
+      <div class="rich-hero rh-violet">
+        <span class="rich-hero-kicker">Chat-native ScanSci PDF</span>
+        <h3>直接在聊天里粘 DOI、arXiv 或论文题名</h3>
+        <p>Agent 会自动判断论文任务并调用 ScanSci PDF。搜索结果、PDF 文件卡、引用和失败诊断都会回到当前对话。</p>
+        <span class="rich-stat-pill">⌁ 无感接入</span>
       </div>
 
       <div class="papers-grid papers-grid-library">
@@ -1917,18 +1917,22 @@
 </div>
 
 <!-- GitHub repo binding modal (Phase 6) -->
-<div id="github-modal" class="modal-backdrop" role="dialog" aria-modal="true">
+<div id="github-modal" class="modal-backdrop rich-modal" role="dialog" aria-modal="true">
   <div class="modal settings-modal">
     <div class="modal-head">
       <div class="modal-title-block">
         <div class="modal-title-row"><span class="modal-icon" aria-hidden="true">🐙</span><h3>GitHub 仓库</h3></div>
-        <p class="modal-subtitle">为当前会话选择可读写的仓库和分支。</p>
       </div>
       <button class="modal-close" data-close-modal="github-modal" aria-label="关闭">×</button>
     </div>
     <div class="modal-body">
+      <div class="rich-hero rh-blue">
+        <span class="rich-hero-kicker">GitHub Workspace</span>
+        <h3>让助手在你的仓库里干活</h3>
+        <p>为当前会话选择一个可读写的仓库和分支,助手就在该工作树内编辑文件并能 git push。</p>
+      </div>
       <!-- 顶部账号状态条:未连接显示 link 按钮;已连接显示 @login + 解绑账号 -->
-      <div id="github-account-bar" style="margin-bottom:var(--space-4)"></div>
+      <div id="github-account-bar" class="rich-section-card" style="margin-bottom:var(--space-4)"></div>
       <!-- 主体两栏:左侧 repo 列表(可搜),右侧 branch 列表 -->
       <div id="github-modal-body" hidden>
         <div style="display:flex;gap:12px;height:420px">
@@ -1957,14 +1961,20 @@
 </div>
 
 <!-- Tasks & Automation Control Panel -->
-<div id="tasks-modal" class="modal-backdrop" role="dialog" aria-modal="true">
-  <div class="modal settings-modal" style="max-width:620px">
+<div id="tasks-modal" class="modal-backdrop rich-modal" role="dialog" aria-modal="true">
+  <div class="modal settings-modal" style="max-width:660px">
     <div class="modal-head">
       <div class="modal-title-block">
         <div class="modal-title-row"><span class="modal-icon" aria-hidden="true">⏰</span><h3>任务中心</h3></div>
-        <p class="modal-subtitle">管理提醒、后台任务和自动化执行记录。</p>
       </div>
       <button class="modal-close" data-close-modal="tasks-modal" aria-label="关闭">&times;</button>
+    </div>
+    <div style="padding:0 var(--space-5)">
+      <div class="rich-hero rh-blue">
+        <span class="rich-hero-kicker">Automation</span>
+        <h3>提醒、后台任务与执行记录</h3>
+        <p>让助手定时主动干活;查看正在跑的后台任务和最近的执行记录。</p>
+      </div>
     </div>
     <div class="modal-tabs">
       <button id="tasks-tab-cron" class="btn btn-secondary" data-tasks-tab="cron">定时任务</button>
@@ -1993,20 +2003,26 @@
 </div>
 
 <!-- Add Reminder Form Modal -->
-<div id="add-task-modal" class="modal-backdrop" role="dialog" aria-modal="true">
-  <div class="modal settings-modal" style="max-width:440px">
+<div id="add-task-modal" class="modal-backdrop rich-modal" role="dialog" aria-modal="true">
+  <div class="modal settings-modal" style="max-width:480px">
     <div class="modal-head">
       <div class="modal-title-block">
         <div class="modal-title-row"><span class="modal-icon" aria-hidden="true">🔔</span><h3>新建提醒</h3></div>
-        <p class="modal-subtitle">用 Cron 表达式创建一次性或重复提醒。</p>
       </div>
       <button class="modal-close" data-close-modal="add-task-modal" aria-label="关闭">&times;</button>
     </div>
     <div class="modal-body">
-      <div class="form-row"><label for="task-message">提醒内容</label><input id="task-message" placeholder="如: 喝水、开会、检查邮件" /></div>
-      <div class="form-row"><label for="task-cron">Cron 表达式</label><input id="task-cron" placeholder="分 时 日 月 周, 如: 0 9 * * *" /></div>
-      <div class="form-row" style="flex-direction:row;align-items:center;gap:8px">
-        <label style="margin:0"><input type="checkbox" id="task-oneshot" checked /> 一次性 (执行后自动删除)</label>
+      <div class="rich-hero rh-blue">
+        <span class="rich-hero-kicker">Reminder</span>
+        <h3>让助手定时来提醒你</h3>
+        <p>用 Cron 表达式创建一次性或重复提醒,到点自动触发。</p>
+      </div>
+      <div class="rich-section-card">
+        <div class="form-row"><label for="task-message">提醒内容</label><input id="task-message" placeholder="如: 喝水、开会、检查邮件" /></div>
+        <div class="form-row"><label for="task-cron">Cron 表达式</label><input id="task-cron" placeholder="分 时 日 月 周, 如: 0 9 * * *" /></div>
+        <div class="form-row" style="flex-direction:row;align-items:center;gap:8px">
+          <label style="margin:0"><input type="checkbox" id="task-oneshot" checked /> 一次性 (执行后自动删除)</label>
+        </div>
       </div>
     </div>
     <div class="modal-foot">
@@ -2017,17 +2033,21 @@
 </div>
 
 <!-- Claude.ai OAuth Login -->
-<div id="oauth-modal" class="modal-backdrop" role="dialog" aria-modal="true">
-  <div class="modal settings-modal" style="max-width:480px">
+<div id="oauth-modal" class="modal-backdrop rich-modal" role="dialog" aria-modal="true">
+  <div class="modal settings-modal" style="max-width:520px">
     <div class="modal-head">
       <div class="modal-title-block">
         <div class="modal-title-row"><span class="modal-icon" aria-hidden="true">🔐</span><h3>OAuth 认证</h3></div>
-        <p class="modal-subtitle">连接订阅账号以启用对应模型能力。</p>
       </div>
       <button class="modal-close" data-close-modal="oauth-modal" aria-label="关闭">&times;</button>
     </div>
     <div class="modal-body">
-      <div id="oauth-step1">
+      <div class="rich-hero rh-amber">
+        <span class="rich-hero-kicker">OAuth Login</span>
+        <h3>连接你的订阅账号</h3>
+        <p>授权 Claude.ai 或 OpenAI Codex 后,即可在这里直接使用对应模型能力。</p>
+      </div>
+      <div id="oauth-step1" class="rich-section-card">
         <div class="form-row" style="margin:0 0 var(--space-3)">
           <label for="oauth-provider">选择服务商</label>
           <select id="oauth-provider" style="width:100%">
@@ -2059,18 +2079,22 @@
 </div>
 
 <!-- WeChat (iLink) binding modal -->
-<div id="wechat-modal" class="modal-backdrop" role="dialog" aria-modal="true">
-  <div class="modal settings-modal" style="max-width:520px">
+<div id="wechat-modal" class="modal-backdrop rich-modal" role="dialog" aria-modal="true">
+  <div class="modal settings-modal" style="max-width:560px">
     <div class="modal-head">
       <div class="modal-title-block">
         <div class="modal-title-row"><span class="modal-icon" aria-hidden="true">💬</span><h3>微信绑定</h3></div>
-        <p class="modal-subtitle">绑定微信后，可在移动端继续与 Agent 对话。</p>
       </div>
       <button class="modal-close" data-close-modal="wechat-modal" aria-label="关闭">&times;</button>
     </div>
     <div class="modal-body">
+      <div class="rich-hero rh-teal">
+        <span class="rich-hero-kicker">WeChat Bridge</span>
+        <h3>在微信里继续对话</h3>
+        <p>绑定一个微信号作为你的 OpenClaude bot,移动端发消息就能进会话,提醒也能推到微信。</p>
+      </div>
       <!-- Unbound state: show Start Pairing button -->
-      <div id="wechat-state-unbound">
+      <div id="wechat-state-unbound" class="rich-section-card">
         <p style="margin:0 0 var(--space-3);color:var(--fg-muted);font-size:var(--text-sm)">
           扫码绑定一个微信号作为你的 OpenClaude bot。绑定后,向该 bot 发消息会进入 OC 会话,OC 会把本轮回复发回微信。
         </p>
@@ -2078,7 +2102,7 @@
       </div>
 
       <!-- Pairing state: show QR image + status text -->
-      <div id="wechat-state-pairing" hidden>
+      <div id="wechat-state-pairing" class="rich-section-card" hidden>
         <div style="text-align:center">
           <img id="wechat-qr-img" alt="WeChat QR" style="width:240px;height:240px;border:1px solid var(--border);border-radius:var(--radius-md);background:#fff;padding:8px" />
           <p id="wechat-pairing-status" style="margin:var(--space-3) 0 0;color:var(--fg-muted);font-size:var(--text-sm)">请用手机微信扫描二维码...</p>
@@ -2086,7 +2110,7 @@
       </div>
 
       <!-- Bound state: show account + status + unbind (no gating) -->
-      <div id="wechat-state-bound" hidden>
+      <div id="wechat-state-bound" class="rich-section-card" hidden>
         <div class="form-row">
           <label>绑定账号</label>
           <div id="wechat-account" style="font-family:var(--font-mono);color:var(--fg-muted);font-size:var(--text-sm);word-break:break-all"></div>
@@ -2129,8 +2153,8 @@
 </div>
 
 <!-- Inbox(站内信)modal -->
-<div id="inbox-modal" class="modal-backdrop" role="dialog" aria-modal="true" aria-label="站内信">
-  <div class="modal settings-modal" style="max-width:560px">
+<div id="inbox-modal" class="modal-backdrop rich-modal" role="dialog" aria-modal="true" aria-label="站内信">
+  <div class="modal settings-modal" style="max-width:600px">
     <div class="modal-head">
       <div class="modal-title-block">
         <div class="modal-title-row">
@@ -2138,11 +2162,15 @@
           <h3>站内信</h3>
           <span id="inbox-unread-pill" class="modal-count-pill" hidden>0 未读</span>
         </div>
-        <p class="modal-subtitle">系统通知、功能更新和重要提醒都会出现在这里。</p>
       </div>
       <button class="modal-close" data-close-modal="inbox-modal" aria-label="关闭">&times;</button>
     </div>
     <div class="modal-body modal-body-scroll inbox-modal-body">
+      <div class="rich-hero rh-teal">
+        <span class="rich-hero-kicker">Inbox</span>
+        <h3>系统通知与更新</h3>
+        <p>功能更新、重要提醒和平台公告都会出现在这里。</p>
+      </div>
       <div id="inbox-list" class="inbox-list"></div>
       <div id="inbox-empty" class="inbox-empty empty-state" hidden>
         <div class="empty-state-icon" aria-hidden="true">✓</div>
@@ -2213,16 +2241,20 @@
 </div>
 
 <!-- Changelog / Release Notes modal -->
-<div id="changelog-modal" class="modal-backdrop" role="dialog" aria-modal="true">
-  <div class="modal settings-modal" style="max-width:560px">
+<div id="changelog-modal" class="modal-backdrop rich-modal" role="dialog" aria-modal="true">
+  <div class="modal settings-modal" style="max-width:580px">
     <div class="modal-head">
       <div class="modal-title-block">
         <div class="modal-title-row"><span class="modal-icon" aria-hidden="true">📣</span><h3>更新日志</h3></div>
-        <p class="modal-subtitle">查看最近上线的功能、修复和体验改进。</p>
       </div>
       <button class="modal-close" data-close-modal="changelog-modal" aria-label="关闭">&times;</button>
     </div>
     <div class="modal-body" style="max-height:60vh;overflow-y:auto">
+      <div class="rich-hero">
+        <span class="rich-hero-kicker">What's New</span>
+        <h3>最近上线的改进</h3>
+        <p>查看最近上线的功能、修复和体验提升,持续在变好。</p>
+      </div>
       <div id="changelog-content"></div>
     </div>
     <div class="modal-foot">
@@ -2234,34 +2266,40 @@
 </div>
 
 <!-- Feedback modal -->
-<div id="feedback-modal" class="modal-backdrop" role="dialog" aria-modal="true">
-  <div class="modal settings-modal" style="max-width:480px">
+<div id="feedback-modal" class="modal-backdrop rich-modal" role="dialog" aria-modal="true">
+  <div class="modal settings-modal" style="max-width:520px">
     <div class="modal-head">
       <div class="modal-title-block">
         <div class="modal-title-row"><span class="modal-icon" aria-hidden="true">💬</span><h3>反馈</h3></div>
-        <p class="modal-subtitle">告诉我们你遇到的问题，或希望改进的体验。</p>
       </div>
       <button class="modal-close" data-close-modal="feedback-modal" aria-label="关闭">&times;</button>
     </div>
     <div class="modal-body">
+      <div class="rich-hero rh-blue">
+        <span class="rich-hero-kicker">Feedback</span>
+        <h3>告诉我们哪里能更好</h3>
+        <p>你遇到的问题、希望改进的体验、新功能想法 —— 我们都会认真看。</p>
+      </div>
       <!-- 2026-06-18 逐条反馈上下文提示:从某条回复的"反馈"图标进入时显示其请求ID,
            让用户确认反馈已关联到这条消息;请求ID 会随反馈上报供 admin 反查日志。 -->
       <div id="feedback-context-note" class="feedback-context-note" hidden>
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width:15px;height:15px;flex-shrink:0"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
         <span>关于这条回复 · 请求ID <code id="feedback-context-reqid"></code></span>
       </div>
-      <div class="form-row">
-        <label for="feedback-category">类别</label>
-        <select id="feedback-category">
-          <option value="bug">Bug 报告</option>
-          <option value="feature">功能建议</option>
-          <option value="ux">体验问题</option>
-          <option value="other">其他</option>
-        </select>
-      </div>
-      <div class="form-row">
-        <label for="feedback-desc">描述</label>
-        <textarea id="feedback-desc" placeholder="请详细描述你遇到的问题或建议&#10;&#10;好的反馈包含：&#10;- 发生了什么 / 期望什么&#10;- 复现步骤&#10;- 相关截图或上下文" style="min-height:140px"></textarea>
+      <div class="rich-section-card">
+        <div class="form-row">
+          <label for="feedback-category">类别</label>
+          <select id="feedback-category">
+            <option value="bug">Bug 报告</option>
+            <option value="feature">功能建议</option>
+            <option value="ux">体验问题</option>
+            <option value="other">其他</option>
+          </select>
+        </div>
+        <div class="form-row">
+          <label for="feedback-desc">描述</label>
+          <textarea id="feedback-desc" placeholder="请详细描述你遇到的问题或建议&#10;&#10;好的反馈包含：&#10;- 发生了什么 / 期望什么&#10;- 复现步骤&#10;- 相关截图或上下文" style="min-height:140px"></textarea>
+        </div>
       </div>
       <div id="feedback-clarify" class="feedback-clarify" hidden>
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width:16px;height:16px;flex-shrink:0"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>
@@ -2281,8 +2319,8 @@
 </div>
 
 <!-- V3 commercial: 充值模态(Phase 4B) -->
-<div id="topup-modal" class="modal-backdrop" role="dialog" aria-modal="true" aria-label="充值">
-  <div class="modal" style="max-width:560px">
+<div id="topup-modal" class="modal-backdrop rich-modal" role="dialog" aria-modal="true" aria-label="充值">
+  <div class="modal" style="max-width:580px">
     <div class="modal-head">
       <h3>充值</h3>
       <button class="modal-close" data-close-modal="topup-modal" aria-label="关闭">×</button>
@@ -2290,8 +2328,11 @@
     <div class="modal-body">
       <!-- Stage A: 套餐选择 -->
       <div id="topup-stage-plans">
-        <div class="topup-bonus-banner">🎁 新用户注册即送 ¥5 / 500 积分</div>
-        <p style="color:var(--fg-muted);font-size:var(--text-sm);margin:0 0 var(--space-3)">选择充值套餐,扫描微信二维码完成支付</p>
+        <div class="rich-hero">
+          <span class="rich-hero-kicker">Top Up</span>
+          <h3>选择套餐,扫码即付</h3>
+          <p>余额按 token 实时扣费,大额套餐更划算。新用户注册即送 ¥5 / 500 积分 🎁</p>
+        </div>
         <div id="topup-plans-list" class="plan-grid"></div>
       </div>
       <!-- Stage B: 二维码 + 等待 -->
@@ -2400,20 +2441,19 @@
 <!-- V3 CC 外接 Phase 6:API Key 管理 modal(admin-only 临时门控,plan §3.4)
      主体三个互斥 panel:list / create / secret。secret panel 的 plaintext 由
      apiKeys.js MutationObserver 在 .open class 被移除时清空,覆盖所有 close 路径。 -->
-<div id="api-keys-modal" class="modal-backdrop" role="dialog" aria-modal="true" aria-label="API Key 管理">
-  <div class="modal settings-modal" style="max-width:620px">
+<div id="api-keys-modal" class="modal-backdrop rich-modal" role="dialog" aria-modal="true" aria-label="API Key 管理">
+  <div class="modal settings-modal" style="max-width:660px">
     <div class="modal-head">
       <div class="modal-title-block">
         <div class="modal-title-row"><span class="modal-icon" aria-hidden="true">🔑</span><h3>API Key 管理</h3></div>
-        <p class="modal-subtitle">为外部客户端生成和管理访问凭证。</p>
       </div>
       <button class="modal-close" data-close-modal="api-keys-modal" aria-label="关闭">&times;</button>
     </div>
     <div class="modal-body" style="max-height:520px;overflow-y:auto;display:flex;flex-direction:column;gap:12px">
-      <div class="modal-callout">
-        用于 Claude Code 客户端外接调用:配置 <code style="font-family:var(--font-mono,ui-monospace,monospace)">ANTHROPIC_BASE_URL=https://claudeai.chat/api/anthropic</code> +
-        <code style="font-family:var(--font-mono,ui-monospace,monospace)">ANTHROPIC_API_KEY=&lt;此处生成&gt;</code>。
-        <br><strong style="color:var(--accent-danger)">⚠️ 新建后明文仅显示一次,请立即妥善保管。</strong>
+      <div class="rich-hero rh-amber">
+        <span class="rich-hero-kicker">External Access</span>
+        <h3>给外部客户端生成访问凭证</h3>
+        <p>Claude Code 等客户端外接调用:配置 <code style="background:rgba(255,255,255,0.2);padding:1px 6px;border-radius:6px;font-family:var(--font-mono,ui-monospace,monospace)">ANTHROPIC_BASE_URL=https://claudeai.chat/api/anthropic</code> + <code style="background:rgba(255,255,255,0.2);padding:1px 6px;border-radius:6px;font-family:var(--font-mono,ui-monospace,monospace)">ANTHROPIC_API_KEY</code>。新建后明文仅显示一次,请立即妥善保管。</p>
       </div>
 
       <!-- Panel A:列表态 -->
@@ -2451,16 +2491,20 @@
 </div>
 
 <!-- V3 commercial: 使用消耗统计(设置 → 使用消耗统计) -->
-<div id="usage-modal" class="modal-backdrop" role="dialog" aria-modal="true" aria-label="使用消耗统计">
-  <div class="modal settings-modal usage-modal-body" style="max-width:760px">
+<div id="usage-modal" class="modal-backdrop rich-modal" role="dialog" aria-modal="true" aria-label="使用消耗统计">
+  <div class="modal settings-modal usage-modal-body" style="max-width:800px">
     <div class="modal-head">
       <div class="modal-title-block">
         <div class="modal-title-row"><span class="modal-icon" aria-hidden="true">📊</span><h3>使用消耗统计</h3></div>
-        <p class="modal-subtitle">按会话和积分流水查看 token 用量与费用。</p>
       </div>
       <button class="modal-close" data-close-modal="usage-modal" aria-label="关闭">×</button>
     </div>
     <div class="modal-body">
+      <div class="rich-hero rh-violet">
+        <span class="rich-hero-kicker">Usage Stats</span>
+        <h3>token 用量与费用一览</h3>
+        <p>按会话和积分流水查看 token 消耗与费用,缓存命中能省多少也算给你看。</p>
+      </div>
       <div id="usage-loading" class="usage-loading">加载中…</div>
       <div id="usage-error" class="usage-error" hidden></div>
       <div id="usage-content" hidden>
