@@ -43,6 +43,12 @@ export const LIVENESS_IDLE_TIMEOUT_COMPACTING_MS = 20 * 60_000
 // steady-state deadlock detection is unchanged.
 export const LIVENESS_IDLE_TIMEOUT_CODEX_FIRST_TOKEN_MS = 20 * 60_000
 export const IDLE_TIMEOUT_TURN_DRAIN_MS = 2_000
+// Continuation watch backstop — how long a post-turn continuation watch may stay
+// armed before it force-ends itself (it also ends earlier on result/exit).
+// Hoisted to module scope so the user-submit drain gate (which must bound how
+// long a new turn waits for an in-flight watch) and _armContinuationWatch share
+// ONE authoritative value instead of two drifting magic numbers.
+export const CONTINUATION_WATCH_BACKSTOP_MS = 20 * 60_000
 
 export function getLivenessIdleTimeoutMs(
   parser: { pendingToolCalls?: number; isCompacting?: boolean } | null | undefined,
@@ -53,7 +59,13 @@ export function getLivenessIdleTimeoutMs(
 }
 
 export function shouldHardResetRunnerAfterIdleTimeout(runner: unknown): boolean {
-  return runner instanceof CodexAppServerRunner
+  // Both long-lived runner types can wedge such that a plain interrupt() cannot
+  // free them: codex app-server (JSON-RPC process stuck high-CPU) and the claude
+  // subprocess (stdin ended / internal deadlock — interrupt is a no-op, as
+  // observed when a wedged turn ignored a turn/interrupt and stayed `running`).
+  // For both, the only reliable recovery is shutdown() so the next submit()
+  // respawns a fresh process. shutdown() is idempotent on already-dead runners.
+  return runner instanceof CodexAppServerRunner || runner instanceof SubprocessRunner
 }
 
 export function getLivenessIdleMs(
@@ -928,7 +940,28 @@ export class SessionManager {
       // parser. Bounded by the watch backstop. (P2.3 refines into the full strict
       // state machine + supersede.)
       if (session._continuationWatch) {
-        await session._continuationWatch.done
+        // Bound the wait. The watch's own backstop can be repeatedly re-armed by
+        // a background workflow that keeps emitting activity, so `done` may never
+        // resolve on its own — which would wedge THIS user submit indefinitely
+        // BEFORE the liveness watchdog (armed later, after this gate) ever runs.
+        // That is exactly how a turn ends up `running` for tens of minutes with
+        // zero idle-timeout firing. If the watch overstays the backstop window,
+        // force it to end (which resolves `done` + detaches its handlers) so this
+        // turn can proceed instead of hanging forever.
+        const CONTINUATION_DRAIN_LIMIT_MS = CONTINUATION_WATCH_BACKSTOP_MS + 60_000
+        let drainTimer: NodeJS.Timeout | undefined
+        const drained = new Promise<void>((r) => {
+          drainTimer = setTimeout(r, CONTINUATION_DRAIN_LIMIT_MS)
+          drainTimer.unref?.()
+        })
+        await Promise.race([session._continuationWatch.done, drained])
+        if (drainTimer) clearTimeout(drainTimer)
+        if (session._continuationWatch && !session._continuationWatch.ended) {
+          log.warn('continuation watch exceeded drain limit — forcing end before new turn', {
+            sessionKey: session.sessionKey,
+          })
+          this._endContinuationWatch(session)
+        }
       }
       // effort 应用必须在本 turn 真正启动**之前**完成,且必须在 prev 之后:
       //   - prev 之前:可能中断别人的 in-flight turn
@@ -2015,7 +2048,10 @@ export class SessionManager {
   private _armContinuationWatch(session: AgentSession, route: ContinuationDeliveryRoute): void {
     if (session._continuationWatch) return // one watch per session
     const runner = session.runner
-    const WATCH_BACKSTOP_MS = 20 * 60_000 // generous; below the 30-min webchat eviction TTL. P2.3 swaps for session_state_changed(idle).
+    // Backstop window is shared with the user-submit drain gate — see
+    // CONTINUATION_WATCH_BACKSTOP_MS at module scope (below the 30-min webchat
+    // eviction TTL; P2.3 swaps for session_state_changed(idle)).
+    const WATCH_BACKSTOP_MS = CONTINUATION_WATCH_BACKSTOP_MS
     const MAX_CONTINUATIONS = 16
 
     let resolveDone!: () => void

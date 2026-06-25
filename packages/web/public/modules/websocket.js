@@ -2167,10 +2167,20 @@ function handleResumeFailed(frame) {
   if (peerId) {
     const sess = state.sessions.get(peerId)
     if (sess) {
-      // Reset the frameSeq cursor so a server restart (currentLast drops
-      // back to a small number) can be recovered — otherwise every
-      // subsequent frame would look "stale" to the dedupe in handleOutbound.
-      sess._lastFrameSeq = 0
+      // Re-anchor the frameSeq cursor to the SERVER's authoritative currentLast
+      // (`frame.to`), not 0. Setting it to 0 makes the next hello send
+      // lastFrameSeq:0, which — for a `buffer_miss` (server still up, ring
+      // pruned its low end, currentLast still high) — is unreplayable again,
+      // producing another resume_failed and an endless reconnect loop. `frame.to`
+      // is the server's real currentLast at resume time and is correct for all
+      // three reasons: buffer_miss (jump cursor up to currentLast so the next
+      // hello asks for nothing stale), no_buffer (server restarted → to is the
+      // fresh low currentLast), sequence_mismatch (client outran server → fall
+      // back to the authoritative currentLast). Subsequent frames with
+      // frameSeq > to are still accepted as forward-progress by handleOutbound's
+      // dedupe, so the original "server restart drops to a small number"
+      // recovery still holds.
+      sess._lastFrameSeq = typeof frame.to === 'number' ? frame.to : 0
       // Phase 0.4 P1-1: instead of force-clearing _sendingInFlight (which
       // would lie about a still-running long REPL turn in buffer_miss
       // cases), flag the live stream as known-broken. syncSessionsFromServer
