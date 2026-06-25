@@ -671,6 +671,22 @@ export class SubprocessRunner extends EventEmitter {
   ): Promise<void> {
     if (!this.proc) await this.start()
     if (!this.proc) throw new Error('failed to start CCB subprocess')
+    const stdin = this.proc.stdin
+    // Fail fast if stdin can no longer accept the prompt. A write to an
+    // ended/destroyed/errored stdin EITHER throws synchronously
+    // (ERR_STREAM_WRITE_AFTER_END) OR — more commonly — returns false and only
+    // fires an ASYNC 'error' event (caught by the proc.stdin 'error' listener as
+    // a warn) that does NOT reject this submit(). Either way the prompt never
+    // reaches the subprocess and _runOneTurn would wait forever for stdout,
+    // leaving the run stuck `running`. Node's `writable` flag is false exactly
+    // when the stream is no longer safe to write (destroyed/errored/ended);
+    // backpressure keeps it true, so this does not misfire on a merely-full
+    // buffer. Reject now so _runOneTurn's submit().catch surfaces an error frame
+    // and the run is marked failed (A2 idle-timeout hard-reset then respawns a
+    // fresh proc on the next turn).
+    if (!stdin || !stdin.writable) {
+      throw new Error('CCB stdin not writable (ended/destroyed) — runner needs respawn')
+    }
     const content =
       typeof userTextOrBlocks === 'string'
         ? [{ type: 'text', text: userTextOrBlocks }]
@@ -683,9 +699,14 @@ export class SubprocessRunner extends EventEmitter {
       },
     }
     try {
-      this.proc.stdin.write(`${JSON.stringify(userMsg)}\n`)
+      stdin.write(`${JSON.stringify(userMsg)}\n`)
     } catch (err: any) {
+      // Synchronous-throw path: the stream went unwritable between the guard
+      // above and this write. Do NOT swallow — rethrow so _runOneTurn's
+      // submit().catch surfaces an error frame and the run is marked failed
+      // instead of hanging on stdout that never comes.
       runnerLog.warn('stdin write failed', { sessionKey: this.opts.sessionKey }, err)
+      throw err
     }
   }
 

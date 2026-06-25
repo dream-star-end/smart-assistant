@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import test, { mock } from 'node:test'
 import { CodexAppServerRunner } from '../codexAppServerRunner.js'
+import { SubprocessRunner } from '../subprocessRunner.js'
 import {
   LIVENESS_IDLE_TIMEOUT_CODEX_FIRST_TOKEN_MS,
   LIVENESS_IDLE_TIMEOUT_COMPACTING_MS,
@@ -145,7 +146,7 @@ test('getLivenessIdleTimeoutMs gives context compaction its own budget', () => {
   )
 })
 
-test('shouldHardResetRunnerAfterIdleTimeout only targets codex app-server runners', () => {
+test('shouldHardResetRunnerAfterIdleTimeout targets long-lived runners interrupt cannot free', () => {
   const runner = new CodexAppServerRunner({
     sessionKey: 'test-session',
     agentId: 'codex',
@@ -153,6 +154,14 @@ test('shouldHardResetRunnerAfterIdleTimeout only targets codex app-server runner
   })
 
   assert.equal(shouldHardResetRunnerAfterIdleTimeout(runner), true)
+
+  // claude subprocess runner: a wedged stdin / internal deadlock is a no-op for
+  // interrupt(), so it must also be hard-reset (shutdown → next submit respawns).
+  // Use the prototype so we don't spawn a real process in a unit test.
+  const subproc = Object.create(SubprocessRunner.prototype)
+  assert.equal(shouldHardResetRunnerAfterIdleTimeout(subproc), true)
+
+  // A plain object that merely looks like a runner is NOT hard-reset.
   assert.equal(shouldHardResetRunnerAfterIdleTimeout({ interrupt() {}, shutdown() {} }), false)
 })
 
