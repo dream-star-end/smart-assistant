@@ -33,6 +33,15 @@ export type CodexGoalControlInput = {
 export const LIVENESS_IDLE_TIMEOUT_TOOL_MS = 15 * 60_000
 export const LIVENESS_IDLE_TIMEOUT_DEFAULT_MS = 5 * 60_000
 export const LIVENESS_IDLE_TIMEOUT_COMPACTING_MS = 20 * 60_000
+// Codex app-server only: cold-start grace until a turn's first observable-output
+// block. codex liveness counts only visible progress (getLivenessIdleMs ignores
+// its raw stdout), and gpt-5.5 at high reasoning effort (esp. Goal mode) can
+// reason server-side for >5min before emitting its first block. The 5min DEFAULT
+// tier is tuned for claude's dense streaming and falsely kills codex's cold
+// phase. Until the first block of a turn, codex measures idle from turnStartedAt
+// against this window; once a block lands it falls back to the normal tiers, so
+// steady-state deadlock detection is unchanged.
+export const LIVENESS_IDLE_TIMEOUT_CODEX_FIRST_TOKEN_MS = 20 * 60_000
 export const IDLE_TIMEOUT_TURN_DRAIN_MS = 2_000
 
 export function getLivenessIdleTimeoutMs(
@@ -60,6 +69,39 @@ export function getLivenessIdleMs(
       ? (runner as any).lastActivityAt
       : visibleActivityAt
   return now - lastActivityAt
+}
+
+/**
+ * Resolve the idle measurement + threshold for one liveness watchdog tick.
+ *
+ * Codex cold-start exception: before a turn emits its first observable-output
+ * block (`hasVisibleProgress=false`), a CodexAppServerRunner measures idle from
+ * `turnStartedAt` against the wide first-token grace window instead of the 5min
+ * DEFAULT tier — high-effort server-side reasoning can legitimately stay silent
+ * longer than 5min before the first block. Once a block lands, or for any
+ * non-codex runner, the normal liveness clock (`getLivenessIdleMs`) + tiers
+ * (`getLivenessIdleTimeoutMs`) apply, so steady-state deadlock detection is
+ * unchanged.
+ */
+export function resolveLivenessIdle(args: {
+  runner: unknown
+  hasVisibleProgress: boolean
+  parser: { pendingToolCalls?: number; isCompacting?: boolean } | null | undefined
+  turnStartedAt: number
+  visibleActivityAt: number
+  now?: number
+}): { idleMs: number; threshold: number } {
+  const now = args.now ?? Date.now()
+  if (args.runner instanceof CodexAppServerRunner && !args.hasVisibleProgress) {
+    return {
+      idleMs: now - args.turnStartedAt,
+      threshold: LIVENESS_IDLE_TIMEOUT_CODEX_FIRST_TOKEN_MS,
+    }
+  }
+  return {
+    idleMs: getLivenessIdleMs(args.runner, args.visibleActivityAt, now),
+    threshold: getLivenessIdleTimeoutMs(args.parser),
+  }
 }
 
 export function createIdleTimeoutEventGate(
@@ -1059,10 +1101,24 @@ export class SessionManager {
       // turn-level backstop that resets on every stdout message.
       const CHECK_INTERVAL = 15_000 // check every 15s
       let livenessTimer: NodeJS.Timeout | null = null
-      let visibleActivityAt = Date.now()
+      const turnStartedAt = Date.now()
+      let visibleActivityAt = turnStartedAt
+      // Latched on this turn's first observable-output event (block /
+      // permission_request — the same "producedOutput" signal used by the
+      // continuation watcher). Status / heartbeat-only events do NOT count.
+      // Gates the codex cold-start grace (see
+      // LIVENESS_IDLE_TIMEOUT_CODEX_FIRST_TOKEN_MS / resolveLivenessIdle).
+      let hasVisibleProgress = false
       eventGate = createIdleTimeoutEventGate(
         (e) => {
           visibleActivityAt = Date.now()
+          // Latch on real model output. The gateway-synthesized recoveryNotice is
+          // emitted before the turn starts and is NOT model progress, so it must
+          // not end the codex cold-start grace (a non-native-resume turn can still
+          // reason for >5min before its first real block).
+          if ((e.kind === 'block' || e.kind === 'permission_request') && e !== recoveryNotice) {
+            hasVisibleProgress = true
+          }
           onEvent(e)
         },
         (e, count) => {
@@ -1077,9 +1133,14 @@ export class SessionManager {
       )
       const livenessPromise = new Promise<never>((_, reject) => {
         livenessTimer = setInterval(() => {
-          const idleMs = getLivenessIdleMs(session.runner, visibleActivityAt)
-          const parser = session._currentParser
-          const threshold = getLivenessIdleTimeoutMs(parser)
+          const { idleMs, threshold } = resolveLivenessIdle({
+            runner: session.runner,
+            hasVisibleProgress,
+            parser: session._currentParser,
+            turnStartedAt,
+            visibleActivityAt,
+            now: Date.now(),
+          })
           if (idleMs > threshold) {
             reject(new Error(`idle timeout (${Math.round(idleMs / 1000)}s no output)`))
           }

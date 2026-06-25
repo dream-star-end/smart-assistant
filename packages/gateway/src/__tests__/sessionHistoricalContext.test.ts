@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import test, { mock } from 'node:test'
 import { CodexAppServerRunner } from '../codexAppServerRunner.js'
 import {
+  LIVENESS_IDLE_TIMEOUT_CODEX_FIRST_TOKEN_MS,
   LIVENESS_IDLE_TIMEOUT_COMPACTING_MS,
   LIVENESS_IDLE_TIMEOUT_DEFAULT_MS,
   LIVENESS_IDLE_TIMEOUT_TOOL_MS,
@@ -11,6 +12,7 @@ import {
   getLivenessIdleMs,
   getLivenessIdleTimeoutMs,
   isLowInformationContinuationText,
+  resolveLivenessIdle,
   shouldClarifyNonNativeResume,
   shouldHardResetRunnerAfterIdleTimeout,
 } from '../sessionManager.js'
@@ -167,6 +169,86 @@ test('getLivenessIdleMs uses visible activity for codex app-server and raw activ
   assert.equal(getLivenessIdleMs({ lastActivityAt: 9_500 }, 1_000, now), 500)
 })
 
+test('resolveLivenessIdle: codex cold-start measures idle from turnStartedAt against first-token grace', () => {
+  const now = 100 * 60_000
+  const codexRunner = new CodexAppServerRunner({
+    sessionKey: 'test-session',
+    agentId: 'codex',
+    cwd: process.cwd(),
+  })
+  // Raw + visible activity both recent (e.g. a status/heartbeat event refreshed
+  // visibleActivityAt 1s ago), but no output block yet → grace must be measured
+  // from turnStartedAt, NOT visibleActivityAt, so a heartbeat can't reset it.
+  codexRunner.lastActivityAt = now - 1_000
+  const within = resolveLivenessIdle({
+    runner: codexRunner,
+    hasVisibleProgress: false,
+    parser: null,
+    turnStartedAt: now - 12 * 60_000, // 12min into cold reasoning
+    visibleActivityAt: now - 1_000,
+    now,
+  })
+  assert.equal(within.threshold, LIVENESS_IDLE_TIMEOUT_CODEX_FIRST_TOKEN_MS)
+  assert.equal(within.idleMs, 12 * 60_000)
+  assert.ok(within.idleMs < within.threshold) // 12min < 20min → not killed
+
+  const exceeded = resolveLivenessIdle({
+    runner: codexRunner,
+    hasVisibleProgress: false,
+    parser: null,
+    turnStartedAt: now - 21 * 60_000, // past the 20min grace
+    visibleActivityAt: now - 1_000,
+    now,
+  })
+  assert.ok(exceeded.idleMs > exceeded.threshold) // 21min > 20min → killed
+})
+
+test('resolveLivenessIdle: codex after first block falls back to visible-activity clock + normal tiers', () => {
+  const now = 100 * 60_000
+  const codexRunner = new CodexAppServerRunner({
+    sessionKey: 'test-session',
+    agentId: 'codex',
+    cwd: process.cwd(),
+  })
+  codexRunner.lastActivityAt = now - 1_000 // raw chatter recent — must be ignored for codex
+
+  const dflt = resolveLivenessIdle({
+    runner: codexRunner,
+    hasVisibleProgress: true,
+    parser: null, // DEFAULT tier
+    turnStartedAt: now - 30 * 60_000, // long ago — must NOT be used after first block
+    visibleActivityAt: now - 6 * 60_000, // 6min since last visible event
+    now,
+  })
+  assert.equal(dflt.threshold, LIVENESS_IDLE_TIMEOUT_DEFAULT_MS) // back to 5min
+  assert.equal(dflt.idleMs, 6 * 60_000) // measured from visibleActivityAt, not turnStartedAt/raw
+  assert.ok(dflt.idleMs > dflt.threshold) // 6min > 5min → steady-state deadlock detection intact
+
+  const tool = resolveLivenessIdle({
+    runner: codexRunner,
+    hasVisibleProgress: true,
+    parser: { pendingToolCalls: 1 },
+    turnStartedAt: now - 30 * 60_000,
+    visibleActivityAt: now - 6 * 60_000,
+    now,
+  })
+  assert.equal(tool.threshold, LIVENESS_IDLE_TIMEOUT_TOOL_MS) // pending tool → 15min
+})
+
+test('resolveLivenessIdle: non-codex runner ignores cold-start grace, uses raw activity + tiers', () => {
+  const now = 100 * 60_000
+  const claudeLike = resolveLivenessIdle({
+    runner: { lastActivityAt: now - 7 * 60_000 },
+    hasVisibleProgress: false, // even pre-progress, no grace for non-codex runners
+    parser: null,
+    turnStartedAt: now - 1_000, // recent — would wrongly shrink idle if used
+    visibleActivityAt: now - 30 * 60_000,
+    now,
+  })
+  assert.equal(claudeLike.threshold, LIVENESS_IDLE_TIMEOUT_DEFAULT_MS)
+  assert.equal(claudeLike.idleMs, 7 * 60_000) // getLivenessIdleMs non-codex path (lastActivityAt)
+})
+
 test('createIdleTimeoutEventGate suppresses late events after idle timeout', () => {
   const forwarded: string[] = []
   const suppressed: Array<{ kind: string; count: number }> = []
@@ -307,7 +389,11 @@ test('SessionManager idle timeout hard-resets codex app-server and suppresses la
     await Promise.resolve()
     const second = manager.submit(session, 'second', (e) => events.push(e))
 
-    mock.timers.tick(LIVENESS_IDLE_TIMEOUT_DEFAULT_MS + 15_001)
+    // 'first' hangs with zero visible output → codex cold-start grace
+    // (LIVENESS_IDLE_TIMEOUT_CODEX_FIRST_TOKEN_MS, 20min from turn start), not
+    // the 5min DEFAULT tier. The hard-reset / late-event suppression behavior is
+    // what this test locks; it now fires at the 20min cold-start threshold.
+    mock.timers.tick(LIVENESS_IDLE_TIMEOUT_CODEX_FIRST_TOKEN_MS + 15_001)
     await first
     await second
 
@@ -319,7 +405,7 @@ test('SessionManager idle timeout hard-resets codex app-server and suppresses la
       events.map((e) => e.kind),
       ['error', 'final'],
     )
-    assert.match(events[0].error, /子进程约 5 分钟无输出,已中断。请重试。/)
+    assert.match(events[0].error, /子进程约 20 分钟无输出,已中断。请重试。/)
   } finally {
     mock.timers.reset()
   }
@@ -417,7 +503,11 @@ test('SessionManager codex app-server idle timeout ignores raw internal activity
     await Promise.resolve()
     const second = manager.submit(session, 'second', (e) => events.push(e))
 
-    mock.timers.tick(LIVENESS_IDLE_TIMEOUT_DEFAULT_MS + 15_001)
+    // Raw internal activity (token_count / heartbeats) ticks throughout, but the
+    // turn emits zero visible output → codex stays in cold-start grace measured
+    // from turn start. Raw chatter must NOT extend it: the kill fires at the
+    // 20min cold-start threshold, never later.
+    mock.timers.tick(LIVENESS_IDLE_TIMEOUT_CODEX_FIRST_TOKEN_MS + 15_001)
     await first
     await second
 
@@ -430,7 +520,7 @@ test('SessionManager codex app-server idle timeout ignores raw internal activity
       events.map((e) => e.kind),
       ['error', 'final'],
     )
-    assert.match(events[0].error, /子进程约 5 分钟无输出,已中断。请重试。/)
+    assert.match(events[0].error, /子进程约 20 分钟无输出,已中断。请重试。/)
   } finally {
     mock.timers.reset()
   }
