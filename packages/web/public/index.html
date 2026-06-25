@@ -2335,41 +2335,59 @@
 </div>
 
 <!-- V3 commercial: 个人信息(原 Phase 4C 用户偏好) -->
-<div id="prefs-modal" class="modal-backdrop" role="dialog" aria-modal="true" aria-label="个人信息">
-  <div class="modal settings-modal" style="max-width:520px">
+<div id="prefs-modal" class="modal-backdrop rich-modal" role="dialog" aria-modal="true" aria-label="个人信息">
+  <div class="modal settings-modal" style="max-width:560px">
     <div class="modal-head">
       <div class="modal-title-block">
         <div class="modal-title-row"><span class="modal-icon" aria-hidden="true">👤</span><h3>个人信息</h3></div>
-        <p class="modal-subtitle">查看账户状态，并设置默认模型、思考强度与通知偏好。</p>
       </div>
       <button class="modal-close" data-close-modal="prefs-modal" aria-label="关闭">×</button>
     </div>
     <div class="modal-body">
-      <!-- 账户信息(只读)— 5 行,_renderAccountInfo() 渲染 -->
-      <section id="profile-account-card" class="profile-account-card" aria-label="账户信息"></section>
-      <div class="profile-section-label">偏好设置</div>
-      <div class="form-row">
-        <label for="prefs-default-model">默认模型</label>
-        <select id="prefs-default-model" class="prefs-select"></select>
-        <p class="prefs-hint">新建会话时默认选用。「跟随会话默认」= 由当前 agent / 会话决定。</p>
+      <!-- Gradient hero (rich-modal layer) — replaces the plain modal-subtitle -->
+      <div class="rich-hero rh-blue">
+        <span class="rich-hero-kicker">Personal Preferences</span>
+        <h3>账户与偏好</h3>
+        <p>查看账户状态,设置默认模型、思考强度与通知偏好。</p>
       </div>
-      <div class="form-row">
-        <label id="prefs-effort-label">默认 effort</label>
-        <div id="prefs-effort-radios" class="prefs-effort-radios" role="radiogroup" aria-labelledby="prefs-effort-label"></div>
-        <p class="prefs-hint">控制思考强度;effort 越高响应越深入但消耗也更多。选择「超高」会切到 Opus 4.7。</p>
-      </div>
-      <div class="form-row">
-        <div class="prefs-toggle-row">
-          <div class="prefs-toggle-text">
-            <div class="prefs-toggle-title">邮件通知</div>
-            <div class="prefs-toggle-desc">支付与重要事件</div>
-          </div>
-          <label class="prefs-switch" aria-label="邮件通知支付与重要事件">
-            <input type="checkbox" id="prefs-notify-email" />
-            <span class="prefs-switch-slider"></span>
-          </label>
+
+      <!-- 账户信息(只读)— 自身即卡片,不再嵌套 rich-section-card -->
+      <section id="profile-account-card" class="profile-account-card rich-section-card" aria-label="账户信息"></section>
+
+      <!-- 偏好分组:三段 form-row 各自 elevated 卡片化 -->
+      <div class="rich-section-card">
+        <span class="rich-section-title">默认模型</span>
+        <div class="form-row">
+          <label for="prefs-default-model" class="sr-only">默认模型</label>
+          <select id="prefs-default-model" class="prefs-select"></select>
+          <p class="prefs-hint">新建会话时默认选用。「跟随会话默认」= 由当前 agent / 会话决定。</p>
         </div>
       </div>
+
+      <div class="rich-section-card">
+        <label id="prefs-effort-label" class="rich-section-title">默认 effort</label>
+        <div class="form-row">
+          <div id="prefs-effort-radios" class="prefs-effort-radios" role="radiogroup" aria-labelledby="prefs-effort-label"></div>
+          <p class="prefs-hint">控制思考强度;effort 越高响应越深入但消耗也更多。选择「超高」会切到 Opus 4.7。</p>
+        </div>
+      </div>
+
+      <div class="rich-section-card">
+        <span class="rich-section-title">通知</span>
+        <div class="form-row">
+          <div class="prefs-toggle-row">
+            <div class="prefs-toggle-text">
+              <div class="prefs-toggle-title">邮件通知</div>
+              <div class="prefs-toggle-desc">支付与重要事件</div>
+            </div>
+            <label class="prefs-switch" aria-label="邮件通知支付与重要事件">
+              <input type="checkbox" id="prefs-notify-email" />
+              <span class="prefs-switch-slider"></span>
+            </label>
+          </div>
+        </div>
+      </div>
+
       <div id="prefs-status" class="prefs-status"></div>
     </div>
     <div class="modal-foot">
