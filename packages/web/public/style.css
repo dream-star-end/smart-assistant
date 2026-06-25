@@ -11899,6 +11899,18 @@ textarea:focus-visible,
   min-height: 0;
   overflow-y: auto;
 }
+/* Some modal bodies are `display:grid` (agents-modal `.agent-manager-body`,
+ * persona-modal `.persona-editor-body`). The grid track-sizing algorithm
+ * interacts badly with our `.rich-hero { overflow:hidden }`: it measures the
+ * hero's max-content as ~0 (clip eligible) and packs the hero + the next
+ * sibling into the same row, causing a visible 60–70px overlap on persona /
+ * the first persona-card. Switching to a flex column inside .rich-modal flows
+ * items by their natural block-size and preserves the original `gap`. */
+.rich-modal .modal-body.persona-editor-body,
+.rich-modal .modal-body.agent-manager-body {
+  display: flex;
+  flex-direction: column;
+}
 
 /* gradient hero banner (drop-in for any modal-body) */
 .rich-modal .rich-hero {
@@ -11911,17 +11923,23 @@ textarea:focus-visible,
   margin-bottom: 18px;
   background: var(--gh-coral);
   box-shadow: var(--gh-soft);
-  /* When a parent is a flex/grid container with a stretching cross-axis or a
-     row-track constraint (e.g. agents-modal uses `display:grid`), the hero
-     could otherwise be sized to just its padding and clip h3/p with our
-     overflow:hidden. `align-self:start` + explicit width:100% / min-block-size:
-     min-content lets the hero size to its content vertically while still
-     filling the container horizontally — opting out of cross-axis stretch
-     would otherwise shrink hero width inside .modal-body flex columns
-     (api-keys-modal, etc.). */
+  /* Container-agnostic sizing. The hero can sit inside three kinds of bodies:
+       1. Plain block flow (most modals).
+       2. `display:flex; flex-direction:column` (api-keys-modal).
+       3. `display:grid` (agents-modal `.agent-manager-body`, persona-modal
+          `.persona-editor-body`).
+     `grid-column: 1 / -1` forces the hero into its own full-width row when
+     the parent is a grid — without it the implicit grid algorithm,
+     confused by our `overflow:hidden`, would share a row track with the
+     next sibling and stack them on top of each other (persona regression).
+     `align-self: start` opts out of cross-axis stretch in flex/grid, and
+     `width: 100%` keeps the hero filling the container horizontally even
+     when align-self:start would otherwise shrink-wrap it. None of these
+     properties have any effect in plain block flow. */
+  grid-column: 1 / -1;
   align-self: start;
-  inline-size: 100%;
-  min-block-size: min-content;
+  flex-shrink: 0;
+  width: 100%;
 }
 .rich-modal .rich-hero.rh-blue { background: var(--gh-blue); }
 .rich-modal .rich-hero.rh-teal { background: var(--gh-teal); }
