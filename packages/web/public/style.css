@@ -11911,6 +11911,17 @@ textarea:focus-visible,
   margin-bottom: 18px;
   background: var(--gh-coral);
   box-shadow: var(--gh-soft);
+  /* When a parent is a flex/grid container with a stretching cross-axis or a
+     row-track constraint (e.g. agents-modal uses `display:grid`), the hero
+     could otherwise be sized to just its padding and clip h3/p with our
+     overflow:hidden. `align-self:start` + explicit width:100% / min-block-size:
+     min-content lets the hero size to its content vertically while still
+     filling the container horizontally — opting out of cross-axis stretch
+     would otherwise shrink hero width inside .modal-body flex columns
+     (api-keys-modal, etc.). */
+  align-self: start;
+  inline-size: 100%;
+  min-block-size: min-content;
 }
 .rich-modal .rich-hero.rh-blue { background: var(--gh-blue); }
 .rich-modal .rich-hero.rh-teal { background: var(--gh-teal); }
