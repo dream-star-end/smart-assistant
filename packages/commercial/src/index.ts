@@ -1720,12 +1720,18 @@ export async function registerCommercial(
   // sanity check,真正 ACL 由 containerFileProxy 转发到容器内 handleApiFile
   // (走 agentCwds + realpathSync + isFileAllowed) 把权威。
   //
-  // 装配条件同旧:agentRuntime 起得来(docker client 在手)。其他 fail-closed 分支
-  // 由 resolver 自己返 kind='fail' + reason。
-  const userMediaResolver = agentRuntime
+  // 装配条件:有 docker client 即可——agentRuntime(legacy)或 v3Deps(on-demand 容器运行时)任一。
+  // ⚠️ v5 回归根因(P7 修复):v5 env 移除 AGENT_IMAGE 以禁 legacy agent runtime + 其 scheduler
+  // → agentRuntime=undefined → 旧代码 resolver=undefined → gateway _resolveMediaDirs 回退到
+  // master 单租户 uploadsDir,/api/uploads 写的文件进不了用户容器卷,容器内 dispatchInbound
+  // 解析 /api/media/<file> 时报"媒体不存在或不可读"。v3 prod 有 AGENT_IMAGE(agentRuntime 在)
+  // 故无此问题。这里把 docker 退到 v3Deps.docker：优先 agentRuntime(v3 行为零改变),v5 用 v3Deps。
+  // resolver 内部按 getRuntimeChannel() 解析 channel 卷(oc-v5-data-u<uid>),安全。
+  const mediaResolverDocker = agentRuntime?.docker ?? v3Deps?.docker;
+  const userMediaResolver = mediaResolverDocker
     ? createUserMediaResolver({
         pool: getPool(),
-        docker: agentRuntime.docker,
+        docker: mediaResolverDocker,
       })
     : undefined;
 
