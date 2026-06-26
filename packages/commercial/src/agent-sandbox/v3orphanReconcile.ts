@@ -57,6 +57,7 @@
 import type Docker from "dockerode";
 import type { Pool } from "pg";
 import { getRuntimeChannel } from "../runtimeChannel.js";
+import { RUNTIME_CHANNEL_LABEL_KEY } from "../compute-pool/containerService.js";
 
 import {
   stopAndRemoveV3Container,
@@ -170,9 +171,14 @@ async function listManagedContainers(
     filters: { label: [`${V3_MANAGED_LABEL_KEY}=1`] },
   });
   const cutoffSec = Math.floor(Date.now() / 1000) - safetySec;
+  const myCh = getRuntimeChannel();
   const all: DockerContainerInfo[] = [];
   let recentSkipped = 0;
   for (const c of list) {
+    // P1a 隔离:v5 实例只 reconcile v5 容器;v3(默认)收"除 v5 外全部"(含无 runtime_channel
+    // label 的存量 v3 容器 —— 它们 slice3 前创建、缺 label,不能按 =v3 过滤否则漏掉)。
+    const ch = (c.Labels ?? {})[RUNTIME_CHANNEL_LABEL_KEY];
+    if (myCh === "v5" ? ch !== "v5" : ch === "v5") continue;
     const created = typeof c.Created === "number" ? c.Created : 0;
     if (created > cutoffSec) {
       recentSkipped++;
