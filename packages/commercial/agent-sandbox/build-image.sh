@@ -222,7 +222,11 @@ echo "[build-image] docker build → $IMAGE_FULL"
 #   "v3sink" 不命中)
 # - oc.runtime.git_sha: 与 v3 仓 HEAD 短 sha 一致($TAG 默认就是这个值,
 #   上方 TAG 计算分支已 cd 到 SANDBOX_DIR 里 git rev-parse)
+# OC_BUILD_NETWORK_HOST=1 → docker build 用宿主网络栈跑 RUN(buildkit --network=host)。
+# 用于宿主 docker 容器 DNS 不可用(如 systemd-resolved 127.0.0.53 stub 未被 daemon.json
+# DNS 兜底)时让 build 期 npm/playwright 能解析+走宿主代理。默认空=不加(v3 行为不变)。
 docker build \
+  ${OC_BUILD_NETWORK_HOST:+--network=host} \
   --label "oc.runtime.features=v3-sink" \
   --label "oc.runtime.git_sha=$TAG" \
   --label "oc.runtime.include_codex=${OC_INCLUDE_CODEX:-1}" \
