@@ -130,6 +130,11 @@ export type AgentContainerStatus =
 export type AgentStatus = {
   /** false = 系统未开 agent 运行时；true + subscription=null = 用户未订阅。 */
   runtimeReady: boolean;
+  /**
+   * true = 按需容器模型(v5 ccb 单底座):无 legacy 订阅,容器随 user-chat-bridge WS 连接
+   * ensureRunning 起、按 turn 计费。前端跳过订阅 gate 直连 WS,冷启由 useChatSocket 4503 重试处理。
+   */
+  ondemand: boolean;
   subscription: {
     id: string;
     plan: string;

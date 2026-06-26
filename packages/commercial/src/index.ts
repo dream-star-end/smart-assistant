@@ -1776,6 +1776,9 @@ export async function registerCommercial(
     hupijiao,
     hupijiaoConfig,
     agentRuntime,
+    // 按需容器路径就绪 = v3-supervisor 已装配(v3Deps)。/api/agent/status 据此返
+    // runtime_ready+ondemand,前端跳过 legacy 订阅 gate 直连 WS(v5 ccb 单底座聊天前置)。
+    containerRuntimeReady: Boolean(v3Deps),
     // HIGH#6:admin/containers v3 行的 stop/remove/restart 走这条 dispatch
     v3Supervisor: v3Deps,
     prewarmContainer,

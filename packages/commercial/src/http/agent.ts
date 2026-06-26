@@ -175,8 +175,14 @@ export async function handleAgentStatus(
   const view = await getAgentStatus(user.id);
   // `runtime_ready`:前端据此区分"用户没订阅"(ready=true + sub=null)vs
   // "系统没开 agent"(ready=false)。否则空数据前端根本无法提示。
+  // runtime_ready:聊天是否可用。两套运行时:legacy agentRuntime(AGENT_IMAGE 订阅模型)
+  // 或 v3-supervisor 按需模型(containerRuntimeReady,容器随 WS 连接 ensureRunning 起、按 turn 计费)。
+  // ondemand=true(v5 ccb 单底座):无 legacy 订阅模型,前端应跳过 open 订阅 gate、直连 WS,
+  // 冷启由 useChatSocket 的 4503 重试处理。
+  const ondemand = !deps.agentRuntime && Boolean(deps.containerRuntimeReady);
   sendJson(res, 200, {
-    runtime_ready: Boolean(deps.agentRuntime),
+    runtime_ready: Boolean(deps.agentRuntime) || Boolean(deps.containerRuntimeReady),
+    ondemand,
     subscription: view.subscription
       ? {
           id: view.subscription.id,

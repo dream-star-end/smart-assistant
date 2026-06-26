@@ -141,6 +141,12 @@ export interface CommercialHttpDeps {
    */
   agentRuntime?: AgentHttpDeps;
   /**
+   * 按需容器路径(v3-supervisor / OC_RUNTIME_IMAGE)是否就绪。true 时 /api/agent/status
+   * 返 runtime_ready=true + ondemand(无 legacy 订阅,容器随 user-chat-bridge WS 连接 ensureRunning
+   * 起、按 turn 计费)。v5 ccb 单底座走此路;与 legacy agentRuntime 平行。
+   */
+  containerRuntimeReady?: boolean;
+  /**
    * 2026-04-21 安全审计 HIGH#6 — v3 supervisor 依赖(docker + pool + image)。
    * 注入后 admin 对 v3 行(docker_name=NULL)的 restart/stop/remove 走 v3 路径
    * (`stopAndRemoveV3Container`,行标 vanished)。未注入时对 v3 行返 503。

@@ -512,6 +512,7 @@ export const api = {
   getAgentStatus: (a: AuthSession): Promise<AgentStatus> =>
     jsonOrThrow<{
       runtime_ready: boolean;
+      ondemand?: boolean;
       subscription: {
         id: string;
         plan: string;
@@ -539,6 +540,7 @@ export const api = {
       ),
     ).then((b) => ({
       runtimeReady: b.runtime_ready,
+      ondemand: Boolean(b.ondemand),
       subscription: b.subscription
         ? {
             id: b.subscription.id,

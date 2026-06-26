@@ -51,6 +51,10 @@ export type AgentGate = {
 /** 由后端状态推导前置 phase（纯函数，无副作用，便于测试/推理）。 */
 function derivePhase(s: AgentStatus): AgentGatePhase {
   if (!s.runtimeReady) return { kind: "runtime-unavailable" };
+  // 按需模型(v5 ccb 单底座):无 legacy 订阅,容器随 user-chat-bridge WS 连接 ensureRunning 起。
+  // 直接 ready 放行 WS 连接;冷启 provisioning 由 useChatSocket 的 4503 重试 + provisioning banner
+  // 处理(不走 legacy /api/agent/open 订阅 gate —— v5 无 AGENT_IMAGE,open 会 503)。
+  if (s.ondemand) return { kind: "ready", status: s };
   const sub = s.subscription;
   // status!=='active'（expired/canceled/suspended）一律视作需要重新开通。
   if (!sub || sub.status !== "active") return { kind: "unsubscribed" };
