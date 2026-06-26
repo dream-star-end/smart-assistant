@@ -1,0 +1,55 @@
+# v5 Aurora 灰度验收 —— 访问方式
+
+> v5 = 全新 Aurora React 前端 + ccb 单底座后端,与现网 v3 同机灰度并行。
+> 下面的入口**只有拿到这条带 key 的 URL 才进得去**;普通用户访问 `claudeai.chat` 完全无感、仍是现网 v3。
+
+## 一、进入 v5(浏览器,只需一次)
+
+把这条完整链接粘进浏览器地址栏打开:
+
+```
+https://claudeai.chat/?v5key=e487aa73f63e9767bdc1b30ea634055d2cd6aa36a8c2e861
+```
+
+- 打开后会自动跳到 `https://claudeai.chat/` 并显示**全新 Aurora 界面**(落地页)。
+- 浏览器会种一个 cookie(`oc_v5`,存 30 天),之后你正常访问 `claudeai.chat` 都是 v5,不用再带 key。
+
+## 二、测试账号(已充 5 万积分)
+
+| | |
+|---|---|
+| 邮箱 | `v5-canary@claudeai.chat` |
+| 密码 | `V5canaryTest2026x` |
+
+## 三、建议验收路径
+
+1. 落地页:看 Aurora 设计(Hero / 9 位专家 / 定价 / 浅深主题)。
+2. 点「登录」→ 用上面账号登录。
+3. 进对话工作区:选「全能助手」+ 模型 **GLM-5.2**。
+4. 发一条消息 → **首条会冷启容器(~40 秒)**,之后正常流式回复。看回复卡片 / 思考块 / 扣费(右上余额)。
+5. 试:设置中心(账户/计费/用量)、浅深主题切换、侧栏会话、刷新页面看会话是否还在。
+
+## 四、退出 / 对照现网 v3
+
+- **无痕窗口**直接开 `https://claudeai.chat/` → 就是现网老版 v3(最干净的对照)。
+- 或在当前浏览器清掉 `claudeai.chat` 的 cookie → 回到 v3。
+
+## 五、要知道的点
+
+- **看不到 gpt-5.5 是正常的**:v5 是 ccb 单底座(codex/gpt 已彻底删除),模型只有
+  GLM-5.2 / DeepSeek / MiniMax(claude 的 OAuth 账号现网本就全 disabled)。
+  这正是全量切换后所有用户的状态——请重点感受「少了 gpt-5.5」是否可接受。
+- **现网零影响**:这入口是 secret 门控,默认流量(普通用户)完全不受影响,还是 v3。
+- **可秒回退**:删 Caddyfile 的 v5/cookie 块 + reload,立刻全退回 v3。
+
+## 六、验收满意后 → 全量上线(cutover)
+
+满意 + 接受 gpt-5.5 移除后,回我:`cutover,接受 gpt-5.5 移除` + 告诉我「改 v3 的那个 AI 已停 / 给我维护窗口」。
+我会按 `deploy/v5/CUTOVER-RUNBOOK.md` 执行:v3 channel-aware 重启 → 关 Turnstile bypass 验真实登录 →
+Caddy 默认翻 v5 → 烟雾验证 + 盯监控待命(随时秒回退)。
+
+## 七、遇到问题
+
+- 进去还是老界面 → 确认 URL 带完整 key、或清 cookie 重试。
+- 发消息一直转 → 首条冷启需 ~40s,耐心等;仍不回叫我查 v5 容器/日志。
+- 任何异常截图发我,我这边有 v5 实例日志(`/var/log/openclaude-v5.log`)+ 浏览器 e2e 工具可复现。
