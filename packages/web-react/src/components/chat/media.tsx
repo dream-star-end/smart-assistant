@@ -39,8 +39,12 @@ export function MediaSignProvider({
   const signRef = useRef<SignFn | null>(sign);
   useEffect(() => {
     signRef.current = sign;
-    cacheRef.current.clear();
-    inflightRef.current.clear();
+    // P5 fix(Codex R2):换 Map 实例,**非** .clear()。resolve() 在 .then 里用调用时捕获的 cache
+    // 引用 cache.set(url);若只 clear() 同一 Map,账号切换期间旧 inflight 晚返回会把旧账号
+    // bearerless signed URL 重新写回当前 cache → 隐私泄漏。换实例后旧 inflight 只写进已弃用的旧
+    // Map(被 GC),新 resolve() 读到的是干净的新 Map,同 path 走新账号 token 重签。
+    cacheRef.current = new Map();
+    inflightRef.current = new Map();
   }, [sign, authKey]);
 
   const ctxRef = useRef<MediaSignCtx>({
