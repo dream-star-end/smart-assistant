@@ -36,7 +36,9 @@ set -euo pipefail
 #
 # 单一权威源 invariant 保留至今,deploy 目标已迁到 KL primary。runtime image 通过
 # rsync exclude packages/commercial/ 继续保留 "不含商用版代码" 这条不变量。
-PERSONAL_SRC="/opt/openclaude/openclaude"
+# PERSONAL_SRC 可经 env 覆盖:v5 ccb-only 镜像须指向 v5 树(/opt/openclaude/openclaude-v5),
+# 否则会 bun-rebuild v3 生产树的 claude-code-best/dist(现网文件改动)。默认仍 v3,行为不变。
+PERSONAL_SRC="${PERSONAL_SRC:-/opt/openclaude/openclaude}"
 SANDBOX_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"  # 本脚本所在目录(agent-sandbox/)
 BUILD_CTX="/tmp/oc-runtime-build"
 IMAGE_REPO="openclaude/openclaude-runtime"
@@ -223,6 +225,8 @@ echo "[build-image] docker build → $IMAGE_FULL"
 docker build \
   --label "oc.runtime.features=v3-sink" \
   --label "oc.runtime.git_sha=$TAG" \
+  --label "oc.runtime.include_codex=${OC_INCLUDE_CODEX:-1}" \
+  --build-arg "OC_INCLUDE_CODEX=${OC_INCLUDE_CODEX:-1}" \
   -f "$BUILD_CTX/Dockerfile.openclaude-runtime" \
   -t "$IMAGE_FULL" \
   "$BUILD_CTX"
