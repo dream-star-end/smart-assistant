@@ -1230,6 +1230,17 @@ export class SessionManager {
     //   'exec'        — legacy `codex exec` per-turn subprocess (no token streaming)
     //   'app-server'  — `codex app-server` long-lived JSON-RPC (token-level streaming)
     // Default is 'exec' for backward compat with existing agents.yaml entries.
+    // P1f / v5 ccb 单底座硬不变量:v5 channel 绝不构造 codex runner。v5 不提供 gpt-*/
+    // codex-native agent,走到这里说明配置漏配 → fail-closed,防 v5 误起 codex。
+    // (gateway 对 commercial 零编译期依赖,故直接读 env OC_RUNTIME_CHANNEL 作 channel 权威。)
+    if (
+      (process.env.OC_RUNTIME_CHANNEL?.trim() || 'v3') === 'v5' &&
+      opts.agent.provider === 'codex-native'
+    ) {
+      throw new Error(
+        `[v5] ccb-only invariant violated: codex-native agent '${opts.agent.id}' not allowed on v5 channel`,
+      )
+    }
     let runner: SubprocessRunner
     if (opts.agent.provider === 'codex-native') {
       // Only resume if the persisted id was produced by a codex-native runner —
