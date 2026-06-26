@@ -1,0 +1,223 @@
+@import "tailwindcss";
+@import "@fontsource-variable/inter";
+
+/* ── Design tokens exposed to Tailwind (utilities like bg-bg, text-fg…) ── */
+@theme {
+  --font-sans: "Inter Variable", ui-sans-serif, system-ui, -apple-system, "Segoe UI",
+    "PingFang SC", "Microsoft YaHei", sans-serif;
+  --font-mono: "SF Mono", "JetBrains Mono", ui-monospace, Menlo, Consolas, monospace;
+
+  --color-bg: var(--bg);
+  --color-surface: var(--surface);
+  --color-sidebar: var(--sidebar);
+  --color-elevated: var(--elevated);
+  --color-hover: var(--hover);
+  --color-active: var(--active);
+  --color-border: var(--border);
+  --color-border-strong: var(--border-strong);
+  --color-fg: var(--fg);
+  --color-muted: var(--muted);
+  --color-faint: var(--faint);
+  --color-accent: var(--accent);
+  --color-accent-soft: var(--accent-soft);
+  --color-primary: var(--primary);
+  --color-primary-fg: var(--primary-fg);
+  --color-bubble: var(--bubble);
+  --color-danger: var(--danger);
+  --color-danger-soft: var(--danger-soft);
+  --color-success: var(--success);
+  --color-success-soft: var(--success-soft);
+  --color-warning: var(--warning);
+  --color-warning-soft: var(--warning-soft);
+  --color-info: var(--info);
+  --color-info-soft: var(--info-soft);
+  /* Gemini/M3 expressive accent layer (tonal strong + on-accent foreground) */
+  --color-accent-strong: var(--accent-strong);
+  --color-accent-fg: var(--accent-fg);
+  /* interaction tokens */
+  --color-ring: var(--ring);
+  /* code surface (CodeBlock background) — tokenised, no longer hard-coded */
+  --color-code: var(--code);
+
+  --radius-xl2: 28px;
+  --radius-xl: 22px;
+  --radius-lg: 16px;
+  --radius-md: 12px;
+  --radius-sm: 9px;
+  --radius-xs: 6px;
+  --radius-full: 999px;
+
+  --shadow-soft: 0 1px 2px rgba(0, 0, 0, 0.04), 0 4px 16px rgba(0, 0, 0, 0.06);
+  --shadow-pop: 0 8px 30px rgba(0, 0, 0, 0.12), 0 2px 6px rgba(0, 0, 0, 0.06);
+  --shadow-float: 0 2px 6px rgba(0, 0, 0, 0.05), 0 12px 36px rgba(0, 0, 0, 0.09);
+
+  /* Motion — Material 3 "emphasized" easings give Gemini-grade momentum;
+     spring is the ChatGPT-style settle already used by .animate-in. */
+  --ease-standard: cubic-bezier(0.2, 0, 0, 1);
+  --ease-emphasized: cubic-bezier(0.2, 0, 0, 1);
+  --ease-emphasized-decel: cubic-bezier(0.05, 0.7, 0.1, 1);
+  --ease-emphasized-accel: cubic-bezier(0.3, 0, 0.8, 0.15);
+  --ease-spring: cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+/* ── Light (default) — Aurora: airy near-white canvas, ink primary,
+   violet interactive accent, soft pastel gradient reserved for brand moments ── */
+:root {
+  color-scheme: light;
+  --bg: #fafafb;
+  --surface: #ffffff;
+  --sidebar: #f5f5f8;
+  --elevated: #ffffff;
+  --hover: #15151b0a;
+  --active: #15151b14;
+  --border: #e9e9ef;
+  --border-strong: #d9d9e1;
+  --fg: #15151b;
+  --muted: #51515c;
+  --faint: #8b8b97;
+  --accent: #6e56f0;
+  --accent-soft: #6e56f014;
+  --accent-strong: #5a45d6;
+  --accent-fg: #ffffff;
+  --primary: #17171d;
+  --primary-fg: #ffffff;
+  --bubble: #f4f4f7;
+  --danger: #e04953;
+  --danger-soft: #e0495314;
+  --success: #1fa463;
+  --success-soft: #1fa46314;
+  --warning: #d9871a;
+  --warning-soft: #d9871a14;
+  --info: #3b82f6;
+  --info-soft: #3b82f614;
+  --ring: #6e56f059;
+  --code: #fbfbfd;
+  /* brand moments only — never the app's in-workspace primary action.
+     grad-cta endpoints kept dark enough for white text ≥4.5:1 (WCAG AA). */
+  --aurora: linear-gradient(135deg, #c9bcff 0%, #a9c2ff 42%, #ffc2d8 100%);
+  --grad-cta: linear-gradient(120deg, #6d4af0 0%, #4a63d6 100%);
+}
+
+/* ── Dark — Aurora: deep near-black, inverted ink (light) primary,
+   brighter violet accent, success stays green for semantic integrity ── */
+.dark {
+  color-scheme: dark;
+  --bg: #0c0c11;
+  --surface: #15151c;
+  --sidebar: #09090e;
+  --elevated: #1c1c25;
+  --hover: #ffffff0f;
+  --active: #ffffff1a;
+  --border: #27272f;
+  --border-strong: #383843;
+  --fg: #f2f2f6;
+  --muted: #bcbcc7;
+  --faint: #76767f;
+  --accent: #9a8aff;
+  --accent-soft: #9a8aff1f;
+  --accent-strong: #ab9cff;
+  --accent-fg: #15151c;
+  --primary: #f2f2f6;
+  --primary-fg: #15151c;
+  --bubble: #1c1c25;
+  --danger: #f0666e;
+  --danger-soft: #f0666e1f;
+  --success: #3dbe7e;
+  --success-soft: #3dbe7e1f;
+  --warning: #e0a03a;
+  --warning-soft: #e0a03a1f;
+  --info: #6aa6ff;
+  --info-soft: #6aa6ff1f;
+  --ring: #9a8aff66;
+  --code: #0a0a0e;
+  --aurora: linear-gradient(135deg, #5e50a8 0%, #4a5aa0 45%, #a05878 100%);
+  /* same robust endpoints as light — a brand CTA fill needn't invert per theme */
+  --grad-cta: linear-gradient(120deg, #6d4af0 0%, #4a63d6 100%);
+}
+
+* { box-sizing: border-box; }
+html, body, #root { height: 100%; margin: 0; }
+body {
+  background: var(--bg);
+  color: var(--fg);
+  font-family: var(--font-sans);
+  font-synthesis-weight: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+*::-webkit-scrollbar { width: 9px; height: 9px; }
+*::-webkit-scrollbar-thumb {
+  background: color-mix(in srgb, var(--fg) 16%, transparent);
+  border-radius: 999px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+*::-webkit-scrollbar-thumb:hover { background: color-mix(in srgb, var(--fg) 28%, transparent); }
+*::-webkit-scrollbar-track { background: transparent; }
+
+@layer utilities {
+  .no-scrollbar::-webkit-scrollbar { display: none; }
+  .no-scrollbar { scrollbar-width: none; }
+  .animate-in { animation: fade-up 0.32s cubic-bezier(0.22, 1, 0.36, 1); }
+  .animate-fade { animation: fade-in 0.4s ease; }
+  /* brand gradient surfaces — pastel aurora for decorative glows, grad-cta for marketing CTAs */
+  .bg-aurora { background-image: var(--aurora); }
+  .bg-grad-cta { background-image: var(--grad-cta); }
+}
+
+@keyframes fade-up { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+@keyframes fade-in { from { opacity: 0; } to { opacity: 1; } }
+@keyframes blink { 0%, 100% { opacity: 1; } 50% { opacity: 0; } }
+.caret-blink { animation: blink 1s step-end infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
+.spin { animation: spin 0.9s linear infinite; }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; }
+}
+
+/* ── Markdown prose (assistant body) ── */
+.prose { font-size: 16px; line-height: 1.75; color: var(--fg); word-break: break-word; }
+.prose > :first-child { margin-top: 0; }
+.prose > :last-child { margin-bottom: 0; }
+.prose p { margin: 0 0 16px; }
+.prose ul, .prose ol { margin: 0 0 16px; padding-left: 26px; }
+.prose ul { list-style: disc; }
+.prose ol { list-style: decimal; }
+.prose li { margin: 5px 0; }
+.prose li::marker { color: var(--faint); }
+.prose h1, .prose h2, .prose h3, .prose h4 { font-weight: 650; line-height: 1.3; margin: 26px 0 12px; letter-spacing: -0.01em; }
+.prose h1 { font-size: 1.5em; }
+.prose h2 { font-size: 1.28em; }
+.prose h3 { font-size: 1.12em; }
+.prose a { color: var(--accent); text-decoration: none; border-bottom: 1px solid color-mix(in srgb, var(--accent) 35%, transparent); }
+.prose a:hover { border-bottom-color: var(--accent); }
+.prose strong { font-weight: 650; }
+.prose blockquote { margin: 0 0 16px; padding: 2px 0 2px 16px; border-left: 3px solid var(--border-strong); color: var(--muted); }
+.prose hr { border: none; border-top: 1px solid var(--border); margin: 24px 0; }
+.prose table { width: 100%; border-collapse: collapse; margin: 0 0 16px; font-size: 14.5px; display: block; overflow-x: auto; }
+.prose th, .prose td { border: 1px solid var(--border); padding: 8px 12px; text-align: left; }
+.prose th { background: var(--hover); font-weight: 600; }
+.prose :not(pre) > code {
+  font-family: var(--font-mono);
+  font-size: 0.875em;
+  background: var(--active);
+  padding: 0.15em 0.4em;
+  border-radius: 6px;
+  white-space: break-spaces;
+}
+.prose pre { margin: 0 0 16px; }
+
+/* highlight.js bridged to our tokens */
+.hljs { color: var(--fg); background: transparent; }
+.hljs-comment, .hljs-quote { color: var(--faint); font-style: italic; }
+.hljs-keyword, .hljs-selector-tag, .hljs-built_in, .hljs-name, .hljs-tag { color: #a655c9; }
+.dark .hljs-keyword, .dark .hljs-selector-tag, .dark .hljs-built_in { color: #c792ea; }
+.hljs-string, .hljs-title, .hljs-section, .hljs-attribute, .hljs-literal, .hljs-type, .hljs-addition { color: #1fa463; }
+.dark .hljs-string, .dark .hljs-title, .dark .hljs-type { color: #3dbe7e; }
+.hljs-number, .hljs-symbol, .hljs-bullet, .hljs-meta, .hljs-link, .hljs-deletion { color: #c2761b; }
+.dark .hljs-number, .dark .hljs-meta { color: #e0a45e; }
+.hljs-function, .hljs-variable, .hljs-attr { color: #3b6fd4; }
+.dark .hljs-function, .dark .hljs-attr, .dark .hljs-variable { color: #82aaff; }
