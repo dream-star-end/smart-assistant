@@ -1,0 +1,22 @@
+-- no-transaction
+-- 0090_drop_old_user_active_unique.sql
+-- P1a 索引切换"真正开关":drop 旧 uniq_ac_user_id_active(ON agent_containers(user_id)
+-- WHERE state='active'),让唯一性改由 0089 的 uniq_ac_user_channel_active
+-- (user_id, runtime_channel) WHERE active 接管 → 同一 user 可同时各有 1 个 v3 active +
+-- 1 个 v5 active 容器(v3/v5 灰度并行的前提)。
+--
+-- 【安全性已论证(2026-06-26 ON-CONFLICT 分析)】:
+--   - agent_containers 无全列 user_id 唯一约束 → legacy subscriptions.ts 的
+--     `ON CONFLICT (user_id)`(无 WHERE 限定)本就无 partial 索引可作 arbiter,
+--     且生产 2103 行 docker_name 全为 NULL(legacy docker 路径从未 provision)→ 该路径死,
+--     不依赖本索引。
+--   - 对 v3 自身:0089 的复合唯一对 runtime_channel='v3' 行等价强制"同 user 单 active v3",
+--     与旧索引对 v3 完全等价 → v3 行为不变。
+--
+-- 【应用时机】= 启用 v5 容器前(reader 全 channel-aware 已部署、本会话已满足),
+-- 由受控 deploy 应用;DR=0,应用前确保已有备份(本会话备份:
+-- /var/backups/openclaude/openclaude_commercial.pre-p1a-20260626-062020.sql.gz)。
+-- 回滚:重建 `CREATE UNIQUE INDEX CONCURRENTLY uniq_ac_user_id_active ON agent_containers(user_id) WHERE state='active'`。
+-- 幂等:IF EXISTS。
+
+DROP INDEX CONCURRENTLY IF EXISTS uniq_ac_user_id_active;
