@@ -59,6 +59,7 @@ import { AgentAppError } from "../compute-pool/nodeAgentClient.js";
 import { listAllHosts as defaultListAllHosts } from "../compute-pool/queries.js";
 import type { ComputeHostRow } from "../compute-pool/types.js";
 import { computeInboundNonce } from "../bridgeSecret.js";
+import { getRuntimeChannel } from "../runtimeChannel.js";
 import { rootLogger } from "../logging/logger.js";
 import { V3_AGENT_GID, V3_AGENT_UID } from "./constants.js";
 import { SupervisorError } from "./types.js";
@@ -1443,9 +1444,9 @@ async function allocateBoundIpAndInsertRow(
   // 历史 NULL 行不 backfill:v3 ephemeral 容器在 lazy reprovision 时自然修复,
   // 残留 NULL 行均已 vanished / stopped,admin 不再操作。
   const insertSql = `INSERT INTO agent_containers
-       (user_id, host_uuid, bound_ip, secret_hash, state, port, image, last_ws_activity, created_at, updated_at)
+       (user_id, host_uuid, bound_ip, secret_hash, state, port, image, runtime_channel, last_ws_activity, created_at, updated_at)
      VALUES
-       ($1::bigint, $2::uuid, $3::inet, $4::bytea, 'active', $5::int, $6::text, NOW(), NOW(), NOW())
+       ($1::bigint, $2::uuid, $3::inet, $4::bytea, 'active', $5::int, $6::text, $7::text, NOW(), NOW(), NOW())
      RETURNING id`;
 
   // B.4: scheduler 已经为我们选好了 IP — 不 retry,冲突直接 NameConflict。
@@ -1453,7 +1454,7 @@ async function allocateBoundIpAndInsertRow(
   if (fixedBoundIp !== undefined) {
     try {
       const r = await client.query<{ id: string }>(insertSql, [
-        String(uid), hostUuid, fixedBoundIp, secretHash, V3_CONTAINER_PORT, image,
+        String(uid), hostUuid, fixedBoundIp, secretHash, V3_CONTAINER_PORT, image, getRuntimeChannel(),
       ]);
       const id = Number.parseInt(r.rows[0]!.id, 10);
       return { id, boundIp: fixedBoundIp };
@@ -1474,7 +1475,7 @@ async function allocateBoundIpAndInsertRow(
     const candidate = pickIp();
     try {
       const r = await client.query<{ id: string }>(insertSql, [
-        String(uid), hostUuid, candidate, secretHash, V3_CONTAINER_PORT, image,
+        String(uid), hostUuid, candidate, secretHash, V3_CONTAINER_PORT, image, getRuntimeChannel(),
       ]);
       const id = Number.parseInt(r.rows[0]!.id, 10);
       return { id, boundIp: candidate };
@@ -2552,16 +2553,18 @@ export async function getV3ContainerStatus(
     // 这串拼进 ws://host:port/ws 会让 dns lookup 直接 fail,readiness probe 永远 false,
     // ensureRunning 路径表现为 4503 reason="starting" 死循环。host(inet) 只取地址本体,
     // 与 IPv4/IPv6 都兼容,与 provision 路径 INSERT 时传入的 JS string 一致。
+    // P1a 隔离:按 runtime_channel 过滤 —— v3 实例只见 v3 容器、v5 只见 v5,
+    // 防换 (user_id,runtime_channel) 复合唯一后 v3/v5 互相捞到对方的 active 行。
     `SELECT id, user_id, host(bound_ip) AS bound_ip, port, container_internal_id, host_uuid, created_at
        FROM agent_containers
-      WHERE user_id = $1::bigint AND state='active'
+      WHERE user_id = $1::bigint AND state='active' AND runtime_channel = $2::text
         AND NOT EXISTS (
           SELECT 1 FROM agent_migrations m
            WHERE m.agent_container_id = agent_containers.id
              AND m.phase NOT IN ('committed', 'rolled_back')
         )
       LIMIT 1`,
-    [String(uid)],
+    [String(uid), getRuntimeChannel()],
   );
   if (r.rowCount === 0) return null;
   const row = r.rows[0]!;
