@@ -23,6 +23,8 @@
 import { promises as fsp } from "node:fs";
 import { join } from "node:path";
 
+import { getRuntimeChannel } from "../runtimeChannel.js";
+
 import {
   AgentAppError,
   getUserOpenClaudeContext,
@@ -65,7 +67,9 @@ const DEFAULT_VOLUME_BASE_DIR = "/var/lib/docker/volumes";
 
 function volumeRoot(userId: bigint, baseDir: string): string {
   // 与 packages/commercial/node-agent/internal/containers/volumes.go reVolumeName 对齐
-  return join(baseDir, `oc-v3-data-u${userId.toString()}`, "_data");
+  // P1a:channel 化 —— v3 → oc-v3-data(不变)、v5 → oc-v5-data(node-agent Go 侧 reVolumeName
+  // 加 oc-v5-* 白名单留 P1d;v5 远程卷路径当前不走,本机 local-only)。
+  return join(baseDir, `oc-${getRuntimeChannel()}-data-u${userId.toString()}`, "_data");
 }
 
 function agentMainRoot(userId: bigint, baseDir: string): string {

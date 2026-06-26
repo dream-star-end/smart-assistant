@@ -888,7 +888,8 @@ export function v3ContainerNameFor(uid: number): string {
   if (!Number.isInteger(uid) || uid <= 0) {
     throw new SupervisorError("InvalidArgument", `invalid uid: ${uid}`);
   }
-  return `oc-v3-u${uid}`;
+  // P1a:channel 化 —— v3 → oc-v3-u<uid>(字节不变);v5 → oc-v5-u<uid>(避免与 v3 容器撞 docker 名)。
+  return `oc-${getRuntimeChannel()}-u${uid}`;
 }
 
 /** uid → 主 named volume 名(挂 /home/agent/.openclaude)。`oc-v3-data-u<uid>` */
@@ -896,7 +897,7 @@ export function v3VolumeNameFor(uid: number): string {
   if (!Number.isInteger(uid) || uid <= 0) {
     throw new SupervisorError("InvalidArgument", `invalid uid: ${uid}`);
   }
-  return `oc-v3-data-u${uid}`;
+  return `oc-${getRuntimeChannel()}-data-u${uid}`;
 }
 
 /**
@@ -909,7 +910,7 @@ export function v3ProjectsVolumeNameFor(uid: number): string {
   if (!Number.isInteger(uid) || uid <= 0) {
     throw new SupervisorError("InvalidArgument", `invalid uid: ${uid}`);
   }
-  return `oc-v3-proj-u${uid}`;
+  return `oc-${getRuntimeChannel()}-proj-u${uid}`;
 }
 
 /**
@@ -920,7 +921,7 @@ export function v3CodexVolumeNameFor(uid: number): string {
   if (!Number.isInteger(uid) || uid <= 0) {
     throw new SupervisorError("InvalidArgument", `invalid uid: ${uid}`);
   }
-  return `oc-v3-codex-u${uid}`;
+  return `oc-${getRuntimeChannel()}-codex-u${uid}`;
 }
 
 /**
@@ -931,7 +932,7 @@ export function v3UserLocalVolumeNameFor(uid: number): string {
   if (!Number.isInteger(uid) || uid <= 0) {
     throw new SupervisorError("InvalidArgument", `invalid uid: ${uid}`);
   }
-  return `oc-v3-userlocal-u${uid}`;
+  return `oc-${getRuntimeChannel()}-userlocal-u${uid}`;
 }
 
 /**
@@ -942,7 +943,7 @@ export function v3UserConfigVolumeNameFor(uid: number): string {
   if (!Number.isInteger(uid) || uid <= 0) {
     throw new SupervisorError("InvalidArgument", `invalid uid: ${uid}`);
   }
-  return `oc-v3-userconfig-u${uid}`;
+  return `oc-${getRuntimeChannel()}-userconfig-u${uid}`;
 }
 
 /**
