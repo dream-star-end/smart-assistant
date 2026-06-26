@@ -231,12 +231,30 @@ export function useChatSocket(opts: {
       }
     };
 
-    void store.getAll().then((all) => {
-      if (cancelled) return;
-      for (const stored of all) socket.loadStored(stored);
-      onHydratedRef.current?.(all);
-      setHydrationDone(true); // 注水完成 → 放行 gate.ready 连接（hello 带恢复游标）
-    });
+    // 注水是 best-effort：成功 / 失败(IndexedDB 隐私模式·配额·headless 不可用) / 超时
+    // **都必须放行 gate**,否则 WS 连接被永久阻塞 → 整个聊天打不开(P6 回归根因:原
+    // getAll().then 无 catch,IDB reject 即 hydrationDone 永 false)。失败仅降级"无持久"。
+    let hydrationSettled = false;
+    const releaseHydration = () => {
+      if (cancelled || hydrationSettled) return;
+      hydrationSettled = true;
+      setHydrationDone(true);
+    };
+    const hydrationTimer = setTimeout(releaseHydration, 3000); // IDB 卡住兜底,不无限等
+    void store
+      .getAll()
+      .then((all) => {
+        if (cancelled) return;
+        for (const stored of all) socket.loadStored(stored);
+        onHydratedRef.current?.(all);
+      })
+      .catch(() => {
+        /* IndexedDB 不可用 → 降级无持久,聊天仍可用 */
+      })
+      .finally(() => {
+        clearTimeout(hydrationTimer);
+        releaseHydration();
+      });
 
     const onHide = () => flushAll();
     const onVis = () => {
@@ -247,6 +265,7 @@ export function useChatSocket(opts: {
 
     return () => {
       cancelled = true;
+      clearTimeout(hydrationTimer);
       window.removeEventListener("pagehide", onHide);
       document.removeEventListener("visibilitychange", onVis);
       // teardown 仅发生在登出/换号（enabled/userId 变）：先 final flush（wipe 后 dead→no-op），
