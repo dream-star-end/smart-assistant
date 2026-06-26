@@ -131,16 +131,28 @@ function appendSubagentBlock(
       : null;
     if (existing) {
       existing.inputPreview = block.inputPreview || existing.inputPreview;
+      // P5 fix(Codex):子 tool_use 也累进 partialJson(镜像 top-level §8),否则 agent-group 内
+      // Edit/Write 子工具不会边流边渲 diff,只能等 final inputJson。applyPartialJsonDelta 对
+      // 无 delta 字段的 block 返 "keep"(no-op),安全。
+      const dr = applyPartialJsonDelta(existing.partialJson, block);
+      if (dr.action === "set") existing.partialJson = dr.value;
+      else if (dr.action === "drop") delete existing.partialJson;
       if (block.inputJson !== undefined && block.inputJson !== null) existing.inputJson = block.inputJson;
       existing._partial = !!block.partial;
+      if (!block.partial) delete existing.partialJson;
       if (block.toolName) existing.toolName = block.toolName;
     } else {
+      const initialPartialJson = (() => {
+        const r = applyPartialJsonDelta(null, block);
+        return r.action === "set" ? r.value : undefined;
+      })();
       children.push({
         kind: "tool_use",
         blockId: block.blockId,
         toolName: block.toolName || "unknown",
         inputPreview: block.inputPreview || "",
         inputJson: block.inputJson != null ? block.inputJson : null,
+        ...(initialPartialJson !== undefined ? { partialJson: initialPartialJson } : {}),
         _partial: !!block.partial,
         _completed: false,
         output: null as unknown as string,

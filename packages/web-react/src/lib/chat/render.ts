@@ -151,6 +151,9 @@ export function messageSignature(
         m.summary ? m.summary.length : 0,
         (m.entries ?? []).length,
         m.entries?.length ? m.entries[m.entries.length - 1].phase : "",
+        // P5 fix(Codex):reducer 把 legacy 降级帧的流式文本 append 到同一 entry.text(entries
+        // 数量/phase 不变),签名必须含 entries 文本量,否则 delegate-progress 流式文本卡住不刷。
+        (m.entries ?? []).reduce((n, e) => n + (e.text ? e.text.length : 0), 0),
         (m.childBlocks ?? []).map(childSignature).join(";"),
         m._adoptedInto ?? "",
       ].join("|");

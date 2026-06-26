@@ -470,7 +470,7 @@ export function App() {
   };
 
   return (
-    <MediaSignProvider sign={demo ? null : signMedia}>
+    <MediaSignProvider sign={demo ? null : signMedia} authKey={user?.id ?? "anon"}>
     <div className="flex h-screen overflow-hidden bg-bg text-fg">
       {/* 桌面：内联侧栏（可折叠）。窄屏隐藏，改用抽屉。 */}
       {!collapsed && (

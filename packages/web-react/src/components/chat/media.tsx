@@ -24,12 +24,16 @@ const Ctx = createContext<MediaSignCtx>(noop);
 
 export function MediaSignProvider({
   sign,
+  authKey,
   children,
 }: {
   sign: SignFn | null;
+  // P5 fix(Codex):商业签名 URL 是 5min bearerless、token 内含 user/path。同浏览器换账号后
+  // 旧账号 signed URL 不能命中(隐私)。authKey 随登录用户变化(登出→null),变即清缓存。
+  authKey?: string | number | null;
   children: React.ReactNode;
 }) {
-  // 缓存与 inflight 跨重渲存活；sign 变化（登录态切换）时重置。
+  // 缓存与 inflight 跨重渲存活；sign 或 authKey 变化（登录态/账号切换）时重置。
   const cacheRef = useRef<Map<string, string>>(new Map());
   const inflightRef = useRef<Map<string, Promise<string | null>>>(new Map());
   const signRef = useRef<SignFn | null>(sign);
@@ -37,7 +41,7 @@ export function MediaSignProvider({
     signRef.current = sign;
     cacheRef.current.clear();
     inflightRef.current.clear();
-  }, [sign]);
+  }, [sign, authKey]);
 
   const ctxRef = useRef<MediaSignCtx>({
     resolve: async (path: string) => {
