@@ -1603,8 +1603,11 @@ export class Gateway {
     // policy makes the widget hang at "before-interactive" and never produce a
     // token (silent failure — user sees blank widget area). See:
     // https://developers.cloudflare.com/turnstile/troubleshooting/permissions-policy
+    // microphone=(self): 允许同源页面用 getUserMedia 录音(语音输入 /ws/voice-transcribe）。
+    // 之前 microphone=() 对所有源(含自身)禁用 → 浏览器报 "Permissions policy violation:
+    // microphone is not allowed" → 语音输入彻底不可用。用户仍需显式授予麦克风权限,无安全损失。
     res.setHeader('Permissions-Policy', [
-      'camera=()', 'microphone=()', 'geolocation=()',
+      'camera=()', 'microphone=(self)', 'geolocation=()',
       'accelerometer=(self "https://challenges.cloudflare.com")',
       'gyroscope=(self "https://challenges.cloudflare.com")',
       'magnetometer=(self "https://challenges.cloudflare.com")',
