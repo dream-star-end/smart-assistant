@@ -26,6 +26,7 @@
 
 import type Docker from "dockerode";
 import { rootLogger } from "../logging/logger.js";
+import { getRuntimeChannel } from "../runtimeChannel.js";
 import * as queries from "./queries.js";
 import { SupervisorError } from "../agent-sandbox/types.js";
 import {
@@ -64,6 +65,17 @@ const V3_AGENT_USER = "1000:1000";
 
 /** managed label(docker 层识别 v3 容器)与 v3supervisor 共享同一 key 名。 */
 const V3_MANAGED_LABEL_KEY = "com.openclaude.v3.managed";
+
+/** P1a:runtime channel label —— docker 层区分 v3/v5 容器,供 orphan reconcile 等按 channel 过滤。 */
+export const RUNTIME_CHANNEL_LABEL_KEY = "com.openclaude.runtime_channel";
+
+/**
+ * P1a:当前实例的容器网络名 —— v3=openclaude-v3-net(不变),v5=openclaude-v5-net(物理隔离)。
+ * v5 容器一律落 v5 专网,绝不与 v3 容器同网(防 IP/路由串台)。v5 网络由 v5 接线步骤(P1d)预建。
+ */
+export function v3NetworkNameForChannel(): string {
+  return getRuntimeChannel() === "v5" ? "openclaude-v5-net" : V3_NETWORK_NAME;
+}
 
 /** host-local baseline 固定路径(self-host 用 repo 内目录)。 */
 export const SELF_HOST_CCB_BASELINE_DIR =
@@ -175,7 +187,11 @@ export class LocalDockerBackend {
     await this.docker.createVolume({
       Name: name,
       Driver: "local",
-      Labels: { [V3_MANAGED_LABEL_KEY]: "1", ...extraLabels },
+      Labels: {
+        [V3_MANAGED_LABEL_KEY]: "1",
+        [RUNTIME_CHANNEL_LABEL_KEY]: getRuntimeChannel(),
+        ...extraLabels,
+      },
     });
   }
 
@@ -211,7 +227,11 @@ export class LocalDockerBackend {
         Env: envArr,
         Cmd: spec.cmd,
         User: V3_AGENT_USER,
-        Labels: { [V3_MANAGED_LABEL_KEY]: "1", ...spec.labels },
+        Labels: {
+          [V3_MANAGED_LABEL_KEY]: "1",
+          [RUNTIME_CHANNEL_LABEL_KEY]: getRuntimeChannel(),
+          ...spec.labels,
+        },
         AttachStdin: false,
         AttachStdout: false,
         AttachStderr: false,
@@ -219,13 +239,13 @@ export class LocalDockerBackend {
         OpenStdin: false,
         NetworkingConfig: {
           EndpointsConfig: {
-            [V3_NETWORK_NAME]: {
+            [v3NetworkNameForChannel()]: {
               IPAMConfig: { IPv4Address: spec.boundIp },
             },
           },
         },
         HostConfig: {
-          NetworkMode: V3_NETWORK_NAME,
+          NetworkMode: v3NetworkNameForChannel(),
           Memory: spec.memoryBytes,
           MemorySwap: spec.memoryBytes,
           MemorySwappiness: 0,
@@ -300,7 +320,7 @@ export class LocalDockerBackend {
       (info.NetworkSettings &&
         (info.NetworkSettings.Networks as Record<string, { IPAddress?: string }> | undefined)) ||
       undefined;
-    const boundIp = endpoints?.[V3_NETWORK_NAME]?.IPAddress ?? "";
+    const boundIp = endpoints?.[v3NetworkNameForChannel()]?.IPAddress ?? "";
     return {
       id: info.Id ?? cid,
       state: normalized,
