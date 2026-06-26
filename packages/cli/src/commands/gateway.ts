@@ -102,7 +102,16 @@ export async function gatewayCmd(_opts: { dev?: boolean }): Promise<void> {
   }
   const agentsConfig = await readAgentsConfig()
   const here = fileURLToPath(new URL('.', import.meta.url))
-  const webRoot = resolve(here, '../../../web/public')
+  // 静态前端按 runtime channel 分流(底层权威 = OC_RUNTIME_CHANNEL,与 commercial
+  // getRuntimeChannel() 同源;此处只做"服务哪套产物 + 用哪种缓存语义"的纯路径决策,
+  // 不引入 cli→commercial 结构耦合。fail-closed 的 v3|v5 校验在同进程的 commercial 侧)。
+  //   - v5(Aurora): packages/web-react/dist(Vite bundler 产物)+ 'spa' 缓存模式。
+  //   - 其它(默认 v3/personal): packages/web/public(vanilla)+ 'vanilla' 模式,行为不变。
+  const isV5Channel = (process.env.OC_RUNTIME_CHANNEL?.trim() || 'v3') === 'v5'
+  const webRoot = isV5Channel
+    ? resolve(here, '../../../web-react/dist')
+    : resolve(here, '../../../web/public')
+  const staticMode: 'vanilla' | 'spa' = isV5Channel ? 'spa' : 'vanilla'
 
   const channelFactories: Array<(deps: { config: OpenClaudeConfig }) => ChannelAdapter> = []
 
@@ -196,6 +205,6 @@ export async function gatewayCmd(_opts: { dev?: boolean }): Promise<void> {
     console.log('[cli] v3 wechat outbound adapter wired (container mode)')
   }
 
-  gw = new Gateway({ config, agentsConfig, webRoot, channelFactories, commercial })
+  gw = new Gateway({ config, agentsConfig, webRoot, staticMode, channelFactories, commercial })
   await gw.start()
 }

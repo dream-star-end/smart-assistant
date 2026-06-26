@@ -10,6 +10,7 @@
     "packages/gateway",
     "packages/mcp-memory",
     "packages/web",
+    "packages/web-react",
     "packages/cli",
     "packages/commercial",
     "packages/channels/webchat",

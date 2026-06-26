@@ -89,7 +89,7 @@ export function Landing({
               看看有哪些智能体
             </a>
           </div>
-          <p className="mt-5 text-[13px] text-faint">「{BRAND.slogan}」—— 源自《易经》</p>
+          <p className="mt-5 text-[13px] text-faint">「{BRAND.slogan}」</p>
         </div>
 
         {/* floating agent chips */}

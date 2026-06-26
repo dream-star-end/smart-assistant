@@ -11,7 +11,7 @@ export const DEMO_SESSIONS: Session[] = [
   { id: "s3", title: "A 股多 agent 投研平台方案", ownerUserId: "demo", updatedAt: iso(120), messageCount: 12 },
   { id: "s4", title: "杭州四季青 AI 智能体需求评估", ownerUserId: "demo", updatedAt: iso(1500), messageCount: 6 },
   { id: "s5", title: "南山 baseline transfer 计划评阅", ownerUserId: "demo", updatedAt: iso(1600), messageCount: 9 },
-  { id: "s6", title: "部署链路与备份机巡检", ownerUserId: "demo", updatedAt: iso(4000), messageCount: 5 },
+  { id: "s6", title: "部署链路巡检与上线清单", ownerUserId: "demo", updatedAt: iso(4000), messageCount: 5 },
 ];
 
 export const DEMO_MESSAGES: Message[] = [

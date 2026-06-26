@@ -438,6 +438,15 @@ export interface GatewayDeps {
   config: OpenClaudeConfig
   agentsConfig: AgentsConfig
   webRoot?: string // 静态 web UI 目录
+  /**
+   * 静态托管语义模式(单一权威在 cli launcher 按 runtime channel 选定,与 webRoot 同源决定):
+   *   - 'vanilla'(默认,v3/personal): 服务 packages/web/public,沿用 ?v=hash cache-bust
+   *     约定 → 资产 `public, max-age=3600`、sw.js 不缓存。**未设即 vanilla,v3 行为零变化**。
+   *   - 'spa'(v5 Aurora): 服务 packages/web-react/dist 这类 bundler 产物 →
+   *     `/assets/` 下内容哈希资产长缓存 immutable,其余(含 index.html)走 ETag 重校验。
+   * 仅影响 Cache-Control 头的计算;ETag/304、路径白名单、SPA 回退逻辑两模式共用。
+   */
+  staticMode?: 'vanilla' | 'spa'
   channelFactories?: Array<(deps: { config: OpenClaudeConfig }) => ChannelAdapter>
   /** V3 2H: 商业化模块挂载点(undefined = 未启用)。由 cli launcher 在 COMMERCIAL_ENABLED=1 时注入。 */
   commercial?: CommercialHook
@@ -2480,11 +2489,9 @@ export class Gateway {
     // 静态 web UI (with in-memory cache)
     if (this.deps.webRoot) {
       const safePath = url.pathname === '/' ? '/index.html' : url.pathname
-      // sw.js must never be edge-cached: SW versioning depends on browser
-      // re-fetching the new file on every page load. CF defaults to a 4h TTL
-      // which strands users on stale SW for hours. (See feedback memory
-      // v3_static_cache_trap.md.)
-      const cacheHeader = safePath === '/sw.js' ? 'no-cache, no-store, must-revalidate' : 'public, max-age=3600'
+      // Cache-Control 按托管模式分流(规则单一权威 = staticCacheControl)。两模式共用下方的
+      // ETag/304、路径白名单与 SPA 回退;仅本头不同 → vanilla 分支与历史完全一致(v3 零变化)。
+      const cacheHeader = staticCacheControl(safePath, this.deps.staticMode)
       const filePath = resolve(this.deps.webRoot, `.${safePath}`)
       if (filePath.startsWith(resolve(this.deps.webRoot))) {
         const cached = this._staticFileCache.get(filePath)
@@ -9161,6 +9168,24 @@ const MIME_MAP: Record<string, string> = {
 
 function mimeFor(p: string): string {
   return MIME_MAP[extname(p).toLowerCase()] ?? 'application/octet-stream'
+}
+
+/**
+ * 静态 web UI 资产的 Cache-Control —— 缓存规则的单一权威(见 GatewayDeps.staticMode)。
+ * `safePath` 已把 `/` 归一为 `/index.html`。抽为纯函数便于单测锁定、避免规则在测试里被
+ * 重新实现而漂移。
+ *   - 'spa'(v5 Aurora,bundler dist): 内容哈希资产 `/assets/*` → immutable 1 年;
+ *     其余(含 index.html / public 透传文件)→ no-cache,借 ETag 廉价重校验。
+ *   - 'vanilla'(默认,v3/personal,web/public): 沿用 ?v=hash cache-bust →
+ *     普通资产 1 小时;sw.js 永不被边缘缓存(CF 默认 4h TTL 会把用户钉在陈旧 SW 上)。
+ */
+export function staticCacheControl(safePath: string, mode: 'vanilla' | 'spa' | undefined): string {
+  if (mode === 'spa') {
+    return safePath.startsWith('/assets/')
+      ? 'public, max-age=31536000, immutable'
+      : 'no-cache'
+  }
+  return safePath === '/sw.js' ? 'no-cache, no-store, must-revalidate' : 'public, max-age=3600'
 }
 
 /** MIME types that can execute scripts in the browser and must be force-downloaded. */

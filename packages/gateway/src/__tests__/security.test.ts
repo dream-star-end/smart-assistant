@@ -19,6 +19,7 @@ import {
   isTrustedContainerFileServeEnabled,
   isUploadMimeAllowed,
   makeUserScopedMediaPredicate,
+  staticCacheControl,
 } from '../server.js'
 
 // ── T01: /api/file blacklist — tests the REAL isFileBlocked function ──
@@ -350,6 +351,49 @@ describe('T04: SPA fallback extension check', () => {
   it('no extension for root path', () => assert.ok(!hasExtension('/')))
   it('no extension for SPA route', () => assert.ok(!hasExtension('/settings')))
   it('no extension for agent route', () => assert.ok(!hasExtension('/agents/main')))
+})
+
+// ── T04b: static hosting Cache-Control by channel mode (real staticCacheControl) ──
+// P2 v5 Aurora gateway 静态托管:v5='spa'(React/Vite dist),v3/personal=vanilla(web/public)。
+describe('T04b: staticCacheControl — channel-aware cache headers', () => {
+  describe("vanilla mode (v3/personal — undefined or 'vanilla')", () => {
+    it('assets get 1h public cache (?v=hash cache-bust convention)', () => {
+      assert.equal(staticCacheControl('/modules/app.js', 'vanilla'), 'public, max-age=3600')
+      assert.equal(staticCacheControl('/style.css', undefined), 'public, max-age=3600')
+    })
+    it('sw.js is never edge-cached (CF 4h TTL stale-SW trap)', () => {
+      assert.equal(staticCacheControl('/sw.js', 'vanilla'), 'no-cache, no-store, must-revalidate')
+      assert.equal(staticCacheControl('/sw.js', undefined), 'no-cache, no-store, must-revalidate')
+    })
+    it('index.html follows the generic 1h rule in vanilla (index served no-cache downstream)', () => {
+      assert.equal(staticCacheControl('/index.html', 'vanilla'), 'public, max-age=3600')
+    })
+  })
+
+  describe("spa mode (v5 Aurora — bundler dist)", () => {
+    it('content-hashed /assets/* are immutable 1y', () => {
+      assert.equal(
+        staticCacheControl('/assets/index-AbC123.js', 'spa'),
+        'public, max-age=31536000, immutable',
+      )
+      assert.equal(
+        staticCacheControl('/assets/index-AbC123.css', 'spa'),
+        'public, max-age=31536000, immutable',
+      )
+      assert.equal(
+        staticCacheControl('/assets/index-AbC123.js.map', 'spa'),
+        'public, max-age=31536000, immutable',
+      )
+    })
+    it('index.html and non-asset (public passthrough) files are no-cache (ETag revalidate)', () => {
+      assert.equal(staticCacheControl('/index.html', 'spa'), 'no-cache')
+      assert.equal(staticCacheControl('/manifest.json', 'spa'), 'no-cache')
+      assert.equal(staticCacheControl('/icon.svg', 'spa'), 'no-cache')
+    })
+    it('does NOT special-case sw.js in spa mode (v5 ships no service worker)', () => {
+      assert.equal(staticCacheControl('/sw.js', 'spa'), 'no-cache')
+    })
+  })
 })
 
 // ── T05: Blacklist pattern coverage ──
