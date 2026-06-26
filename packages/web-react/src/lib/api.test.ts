@@ -108,9 +108,8 @@ test('a failed refresh calls onExpired exactly once and surfaces the original er
   expect(expired()).toBe(true)
 })
 
-test('chat transport is an explicit P4 stub — calling it rejects, never pretends to work', async () => {
-  const { session } = makeSession('tok1')
-  await expect(
-    api.chat.send(session, 's1', 'hi', { onDelta: () => {}, onDone: () => {} }),
-  ).rejects.toThrow(/P4/)
+test('chat transport moved off api into the WS engine (api has no chat stub)', () => {
+  // P4：对话传输从 api.chat（占位抛错）迁到 lib/chat/socket.ts 的 ChatSocket service。
+  // api 只剩 REST，不再暴露 chat 入口。
+  expect((api as unknown as { chat?: unknown }).chat).toBeUndefined()
 })

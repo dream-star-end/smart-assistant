@@ -19,7 +19,6 @@ import type {
   RegisterResult,
   SessionDetail,
   SessionMeta,
-  StreamHandlers,
   UsageQuery,
   UsageResponse,
   User,
@@ -872,30 +871,12 @@ export const api = {
       provider: b.data.provider,
     })),
 
-  // ── 对话传输（P4 占位：WS user-chat-bridge 尚未接入） ──────────────────
-
-  /**
-   * 对话发送 / 流式解析。
-   *
-   * v5 对话传输走 WebSocket（/ws/user-chat-bridge，bearer 子协议：
-   * `new WebSocket(url, ['bearer', accessJWT])`，inbound.message 帧），不再是 v4-trial 的
-   * SSE。该 hook 在 **P4** 接入；本期刻意 **不实现**，调用即抛错，绝不假装能用。
-   */
-  chat: {
-    /** @throws 永远抛 —— P4 未接入 WS 对话传输前不可调用。 */
-    send(
-      _a: AuthSession,
-      _sessionId: string,
-      _content: string,
-      _h: StreamHandlers,
-      _signal?: AbortSignal,
-      _agentId?: string,
-    ): Promise<never> {
-      // TODO(P4): 实现 useChatSocket —— bearer 子协议鉴权 + safeWsSend 背压 +
-      // per-sessionKey 连接复用，消费 inbound.message / outbound 帧。
-      return Promise.reject(
-        new Error("对话传输尚未接入（P4：WebSocket user-chat-bridge）。当前为 v5 前端骨架。"),
-      );
-    },
-  },
+  // ── 对话传输（P4 已接入：WS user-chat-bridge） ────────────────────────
+  //
+  // v5 对话传输走 WebSocket（/ws/user-chat-bridge，bearer 子协议
+  // `new WebSocket(url, ['bearer', accessJWT])`，inbound.message 帧），不再是
+  // v4-trial 的 SSE。实现不在 api.ts（REST 专属），而在渲染树之外的单例 service
+  // `lib/chat/socket.ts`（ChatSocket：safeWsSend 2MB 背压 + per-sessionKey frameSeq
+  // 去重 + 三层断点续传 + 离线队列三段式 drain），由 React 绑定 `hooks/useChatSocket.ts`
+  // 消费。会话历史的 REST 全量 sync（断点续传最终权威源）走上面的 getSession。
 };

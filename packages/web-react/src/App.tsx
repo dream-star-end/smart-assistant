@@ -13,21 +13,13 @@ import { SettingsCenter } from "./components/SettingsCenter";
 import { Sidebar } from "./components/Sidebar";
 import { Alert, Sheet } from "./components/ui";
 import { useAgentGate } from "./hooks/useAgentGate";
+import { type UseChatSocket, useChatSocket } from "./hooks/useChatSocket";
 import { useTheme } from "./hooks/useTheme";
+import type { ChatMessage } from "./lib/chat/model";
 import { DEFAULT_AGENT } from "./lib/agents";
 import { api } from "./lib/api";
 import { DEMO_MESSAGES, DEMO_MODELS, DEMO_SESSIONS, DEMO_USER, demoReply } from "./lib/demo";
 import type { AuthSession, Message, PublicModel, Session, ToolCard, User } from "./lib/types";
-
-/**
- * P2 占位：v5 对话传输（WS user-chat-bridge）在 P4 接入。在此之前，登录后的工作区
- * 是真实 app shell（侧栏 / 顶栏 / 智能体选择 / 设置），但会话与消息仅为**本地脚手架**
- * （不落后端、刷新即失）。发送消息回一条明确标注的占位助手消息，绝不假装真在对话。
- */
-const P4_PLACEHOLDER_REPLY =
-  "对话传输将在后续版本接入（P4：WebSocket user-chat-bridge）。\n\n" +
-  "当前你看到的是 **v5 商业版前端骨架**：登录鉴权、品牌、主题、布局均已就位，" +
-  "真实的流式对话、会话历史与九类卡片会在后续阶段陆续上线。";
 
 function makeLocalSession(title: string, ownerUserId: string): Session {
   return {
@@ -37,6 +29,24 @@ function makeLocalSession(title: string, ownerUserId: string): Session {
     updatedAt: new Date().toISOString(),
     messageCount: 0,
   };
+}
+
+const EMPTY_WS_MESSAGES: ChatMessage[] = [];
+
+/** WS 会话 id（peer.id）：须匹配后端 `[A-Za-z0-9_-]{8,50}`。*/
+function genWsSessionId(): string {
+  return `web${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
+}
+
+/** ChatMessage 是否“可展示成一行内容”（P4 最简文本渲染；P5 出九类富卡）。*/
+function chatMsgText(m: ChatMessage): string {
+  if (m.role === "tool") return `🔧 ${m.toolName || "工具"}${m._completed ? " ✓" : "…"}`;
+  if (m.role === "agent-group") return `👥 ${m.text || "子任务"}${m._completed ? " ✓" : "…"}`;
+  if (m.role === "plan") return `📋 ${m.text || "计划"}`;
+  if (m.role === "goal") return `🎯 ${m.text || "目标"}`;
+  if (m.role === "permission") return `🔐 权限请求：${m.toolName || ""}${m._resolved ? `（${m._behavior}）` : "（待确认）"}`;
+  if (m.role === "delegate-progress") return `👥 委派进度${m._completed ? " ✓" : "…"}`;
+  return m.text || "";
 }
 
 export function App() {
@@ -75,6 +85,9 @@ export function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
   const stopRef = useRef(false);
+  // 稳定句柄：让早于 useChatSocket 声明的 send/regenerate 回调引用 WS 引擎，避免
+  // “块级变量在声明前使用” 的 TDZ（hook 在下方调用后回填 sockRef.current）。
+  const sockRef = useRef<UseChatSocket | null>(null);
 
   // 本地会话消息存储（脚手架）：activeId → 消息数组。P4 接入 WS 会话历史后替换。
   const localStore = useRef<Map<string, Message[]>>(new Map());
@@ -162,24 +175,32 @@ export function App() {
       return;
     }
     if (!user) return;
-    const s = makeLocalSession("新对话", user.id);
-    localStore.current.set(s.id, []);
+    // 非 demo：新建一个 WS 会话占位（peer.id 用真实 id），socket 侧在首次 send 时
+    // 惰性 ensureSession —— 空会话不必提前占用 service 槽位。
+    const id = genWsSessionId();
+    const s: Session = {
+      id,
+      title: "新对话",
+      ownerUserId: user.id,
+      updatedAt: new Date().toISOString(),
+      messageCount: 0,
+    };
     setSessions((c) => [s, ...c]);
-    setActiveId(s.id);
+    setActiveId(id);
   }, [demo, user, interrupt]);
 
   const send = useCallback(
     async (text: string) => {
       setChatError(null);
-      const userMsg: Message = {
-        id: `tmp-${Date.now()}`,
-        role: "user",
-        content: text,
-        createdAt: new Date().toISOString(),
-      };
 
       // demo：本地流式回放（无网络），仅用于离线预览设计。
       if (demo) {
+        const userMsg: Message = {
+          id: `tmp-${Date.now()}`,
+          role: "user",
+          content: text,
+          createdAt: new Date().toISOString(),
+        };
         setMessages((m) => [...m, userMsg]);
         setBusy(true);
         setStreamText("");
@@ -199,53 +220,55 @@ export function App() {
       }
 
       if (!user) return;
-      // 确保有一个（本地）会话承载本轮消息。
+      // 非 demo：经真实 WS 引擎发送（inbound.message）。确保有会话承载本轮（peer.id）。
       let sessionId = activeId;
       let createdSession: Session | null = null;
       if (!sessionId) {
-        createdSession = makeLocalSession(text.slice(0, 24), user.id);
-        sessionId = createdSession.id;
-        localStore.current.set(sessionId, []);
+        sessionId = genWsSessionId();
+        createdSession = {
+          id: sessionId,
+          title: text.slice(0, 24) || "新对话",
+          ownerUserId: user.id,
+          updatedAt: new Date().toISOString(),
+          messageCount: 0,
+        };
         setSessions((c) => [createdSession!, ...c]);
         setActiveId(sessionId);
       }
-
-      // P4 占位：不接 WS，立即回一条明确标注的占位助手消息，绝不假装在与后端对话。
-      const assistantMsg: Message = {
-        id: `a-${Date.now()}`,
-        role: "assistant",
-        content: P4_PLACEHOLDER_REPLY,
-        createdAt: new Date().toISOString(),
-      };
-      const prev = localStore.current.get(sessionId) ?? [];
-      const nextMsgs = [...prev, userMsg, assistantMsg];
-      localStore.current.set(sessionId, nextMsgs);
-      setMessages(nextMsgs);
-      // 把会话提到顶部并更新计数/标题（纯本地）。
+      sockRef.current?.ensureSession(sessionId, agent.id, text.slice(0, 24));
+      // model：选中的真实模型 id（顶层字段，非 content 内）。effortLevel 本期不接（P5/后续）。
+      sockRef.current?.send({ sessId: sessionId, agentId: agent.id, text, model: modelId });
+      // 侧栏：提到顶 + 更新标题/时间/计数（计数仅作排序提示，权威消息在 WS service）。
       setSessions((c) => {
         const sid = sessionId!;
         const found = c.find((s) => s.id === sid);
+        const base: Session =
+          found ?? createdSession ?? { id: sid, title: text.slice(0, 24) || "新对话", ownerUserId: user.id, updatedAt: "", messageCount: 0 };
         const updated: Session = {
-          ...(found ?? createdSession ?? makeLocalSession(text.slice(0, 24), user.id)),
+          ...base,
           id: sid,
           title: found?.title && found.messageCount > 0 ? found.title : text.slice(0, 24) || "新对话",
           updatedAt: new Date().toISOString(),
-          messageCount: nextMsgs.length,
+          messageCount: (found?.messageCount ?? 0) + 1,
         };
         return [updated, ...c.filter((s) => s.id !== sid)];
       });
     },
-    [activeId, demo, user],
+    [activeId, demo, user, agent, modelId],
   );
 
   const regenerate = useCallback(() => {
-    for (let i = messages.length - 1; i >= 0; i--) {
-      if (messages[i].role === "user") {
-        send(messages[i].content);
+    // demo 用本地 messages；非 demo 找 WS 末条 user 重发。
+    const src: Array<{ role: string; content?: string; text?: string }> = demo
+      ? messages
+      : (sockRef.current?.getMessages(activeId) ?? []);
+    for (let i = src.length - 1; i >= 0; i--) {
+      if (src[i].role === "user") {
+        send((src[i].content ?? src[i].text ?? "") as string);
         return;
       }
     }
-  }, [messages, send]);
+  }, [demo, messages, activeId, send]);
 
   const logout = useCallback(() => {
     // 先请求后端吊销 refresh cookie（错误已在 api 层吞掉），再清空内存态回到首页。
@@ -270,11 +293,6 @@ export function App() {
     void refreshMe();
     setSettingsOpen(true);
   }, [refreshMe]);
-
-  // autoscroll
-  useEffect(() => {
-    scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" });
-  }, [messages, streamText]);
 
   // 键盘快捷键：⌘/Ctrl+K 新会话；Esc 停止当前（demo）流式。仅在进入工作区后生效。
   const inWorkspace = demo || (view === "app" && !!auth && !!user);
@@ -307,20 +325,53 @@ export function App() {
   // 对话前置态机：检查订阅/容器、引导开通、轮询容器至就绪。gate.access=false 时由
   // AgentGate 面板占据对话区并禁用 Composer；gate.ready 是 P4 useChatSocket 连接的硬前置。
   const gate = useAgentGate(auth, inWorkspace && !demo);
+
+  // P4 真实 WS 对话引擎。gate.ready（容器 running）是连接硬前置；refreshMe 供
+  // cost_charged / 余额不足时刷新顶栏余额。demo 不连真实 WS。
+  const chat = useChatSocket({
+    auth,
+    ready: gate.ready,
+    enabled: inWorkspace && !demo,
+    defaultAgentId: "main",
+    refreshBalance: refreshMe,
+  });
+  sockRef.current = chat; // 回填稳定句柄（供上方 send/regenerate 引用）。
+  // 非 demo：展示的消息来自 WS service 快照（就地 mutation + version 触发重渲）。
+  const wsMessages = !demo && activeId ? chat.getMessages(activeId) : EMPTY_WS_MESSAGES;
+  const wsSending = !demo && chat.isSending(activeId);
+  // 统一“本轮进行中”信号：demo 用本地 busy，非 demo 用 WS in-flight。
+  const sending = demo ? busy : wsSending;
+  // 停止当前轮：demo 本地停回放；非 demo 发 inbound.control.stop 并本地收尾。
+  const stopTurn = useCallback(() => {
+    if (demo) {
+      stopRef.current = true;
+      setBusy(false);
+      setStreamText("");
+    } else if (activeId) {
+      chat.stop(activeId);
+    }
+    setChatError(null);
+  }, [demo, activeId, chat]);
+
+  // autoscroll（demo: messages/streamText；非 demo: WS 消息流 + in-flight）
+  useEffect(() => {
+    scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" });
+  }, [messages, streamText, wsMessages, wsSending]);
+
   useEffect(() => {
     if (!inWorkspace) return;
     const onKey = (e: KeyboardEvent) => {
       if ((e.metaKey || e.ctrlKey) && (e.key === "k" || e.key === "K")) {
         e.preventDefault();
         newSession();
-      } else if (e.key === "Escape" && busy) {
+      } else if (e.key === "Escape" && sending) {
         e.preventDefault();
-        interrupt();
+        stopTurn();
       }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [inWorkspace, busy, newSession, interrupt]);
+  }, [inWorkspace, sending, newSession, stopTurn]);
 
   if (!demo && view === "home") {
     return (
@@ -345,7 +396,7 @@ export function App() {
     );
   }
 
-  const showEmpty = messages.length === 0 && !busy;
+  const showEmpty = demo ? messages.length === 0 && !busy : wsMessages.length === 0 && !wsSending;
   // 对话前置门：非 demo 且尚无访问权（容器未就绪/未订阅/出错等）→ 由 AgentGate 占据对话区
   // 并禁用 Composer。demo 与已就绪（ready|dormant）放行正常对话。
   const gated = !demo && !gate.access;
@@ -361,6 +412,7 @@ export function App() {
   const deleteSessionConfirm = (s: Session) => {
     if (!confirm("删除该会话？")) return;
     localStore.current.delete(s.id);
+    if (!demo) chat.removeSession(s.id);
     setSessions((c) => c.filter((x) => x.id !== s.id));
     if (s.id === activeId) {
       setActiveId(undefined);
@@ -440,7 +492,7 @@ export function App() {
             />
           ) : showEmpty ? (
             <EmptyState agent={agent} onPick={send} onChangeAgent={() => setPickerOpen(true)} />
-          ) : (
+          ) : demo ? (
             <div className="mx-auto flex max-w-3xl flex-col gap-7 px-5 py-8">
               {messages.map((m, i) =>
                 m.role === "user" ? (
@@ -467,13 +519,49 @@ export function App() {
                 />
               )}
             </div>
+          ) : (
+            // 非 demo：真实 WS 消息流。P4 用最简文本渲染（含九类卡片的占位行）；
+            // P5 接入 MessageRenderer/ToolCard 后替换本块为九类 Aurora 富卡。
+            <div className="mx-auto flex max-w-3xl flex-col gap-7 px-5 py-8">
+              {wsMessages.map((m, i) =>
+                m.role === "user" ? (
+                  <UserMessage key={m.id} content={m.text} />
+                ) : (
+                  <AssistantMessage
+                    key={m.id}
+                    message={{
+                      id: m.id,
+                      role: "assistant",
+                      content: chatMsgText(m),
+                      createdAt: new Date(m.ts).toISOString(),
+                    }}
+                    streaming={i === wsMessages.length - 1 && wsSending && (m.role === "assistant" || m.role === "thinking")}
+                    toolCards={[]}
+                    onRegenerate={i === wsMessages.length - 1 && !wsSending && m.role === "assistant" ? regenerate : undefined}
+                  />
+                ),
+              )}
+              {wsSending && wsMessages[wsMessages.length - 1]?.role === "user" && (
+                <AssistantMessage
+                  message={{ id: "ws-streaming", role: "assistant", content: "", createdAt: new Date().toISOString() }}
+                  streaming
+                  toolCards={[]}
+                />
+              )}
+            </div>
           )}
         </div>
 
         <div className="shrink-0 pb-3">
           {!demo && gate.phase.kind === "dormant" && (
             <div className="mx-auto mb-2 max-w-3xl px-4">
-              <Alert tone="info">容器已休眠，接入实时对话后将自动唤醒（P4）。</Alert>
+              <Alert tone="info">容器已休眠，发送消息后将自动唤醒。</Alert>
+            </div>
+          )}
+          {/* WS 连接状态条（连接中/重连/补发离线消息/容器初始化等）。仅非 demo。*/}
+          {!demo && !gated && chat.status.cls !== "connected" && (
+            <div className="mx-auto mb-2 max-w-3xl px-4">
+              <Alert tone={chat.status.cls === "disconnected" ? "warning" : "info"}>{chat.status.label}</Alert>
             </div>
           )}
           {chatError && (
@@ -489,8 +577,8 @@ export function App() {
           )}
           <Composer
             onSend={send}
-            busy={busy}
-            onStop={demo ? () => (stopRef.current = true) : interrupt}
+            busy={sending}
+            onStop={stopTurn}
             model={modelFooter}
             disabled={gated}
             placeholder={`和「${agent.name}」对话…`}
@@ -503,6 +591,9 @@ export function App() {
         current={agent}
         onClose={() => setPickerOpen(false)}
         onPick={(a) => {
+          // 切 agent：若当前会话已在 WS service 注册，打跨-agent 污染守卫戳（§11），
+          // 让旧 agent 的 late frames 被 drop、stop/hello 默认 agent 跟新选一致。
+          if (!demo && activeId && a.id !== agent.id) chat.switchAgent(activeId, a.id);
           setAgent(a);
           setPickerOpen(false);
           setChatError(null);

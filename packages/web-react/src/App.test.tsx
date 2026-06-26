@@ -174,15 +174,16 @@ describe('Aurora v5 skeleton — auth → workspace', () => {
     await waitFor(() => expect(screen.getByText('邮箱或密码错误')).toBeInTheDocument())
   })
 
-  test('authenticated send returns an explicit P4 placeholder (no fake streaming, no network chat)', async () => {
-    // P3：对话前置门要求容器就绪后才放行 Composer，故 mock 一个 ready 的 agent 状态。
+  test('authenticated send goes through the real WS engine — optimistic user bubble, no SSE/v4 chat', async () => {
+    // P4：对话经 WS user-chat-bridge（ChatSocket service）。容器就绪门放行后 Composer 可用。
+    // jsdom 无 WebSocket，connect() 优雅降级 → 消息进离线队列（status=queued），但用户气泡
+    // 仍乐观渲染。关键不变量：绝不走 SSE /api/chat、绝不走 v4-trial 端点。
     fetchMock = routedFetch()
     vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
 
     render(<App />)
     await loginViaUi()
 
-    // 等容器就绪门放行（Composer 由 disabled 变可用）。
     const ta = await screen.findByPlaceholderText('和「全能助手」对话…')
     await waitFor(() => expect(ta).not.toBeDisabled())
 
@@ -191,13 +192,13 @@ describe('Aurora v5 skeleton — auth → workspace', () => {
       fireEvent.click(screen.getByRole('button', { name: '发送' }))
     })
 
-    // "你好" 同时出现在会话标题与用户气泡，断言至少一处 + 占位回复唯一文案。
-    expect(screen.getAllByText('你好').length).toBeGreaterThan(0)
-    expect(screen.getByText(/对话传输将在后续版本接入/)).toBeInTheDocument()
-    // 关键不变量：本期绝不走真实对话传输（无 SSE /api/chat、无 v4-trial 端点）。
-    // 前置链路的 REST（status/models）是合法的；只断言没有对话发送类网络。
+    // 用户消息乐观入流（"你好" 至少出现一处：会话标题 / 用户气泡）。
+    await waitFor(() => expect(screen.getAllByText('你好').length).toBeGreaterThan(0))
+    // 不再有 P2 占位回复文案。
+    expect(screen.queryByText(/对话传输将在后续版本接入/)).not.toBeInTheDocument()
+    // 关键不变量：无 SSE /api/chat、无 v4-trial 端点（对话走 WS，不走这些 REST）。
     const chatLike = fetchMock.mock.calls.filter(([url]) =>
-      /\/api\/chat|\/api\/v4|\/api\/sessions/.test(String(url)),
+      /\/api\/chat|\/api\/v4/.test(String(url)),
     )
     expect(chatLike.length).toBe(0)
   })
