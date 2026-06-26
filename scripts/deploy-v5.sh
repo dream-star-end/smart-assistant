@@ -75,6 +75,18 @@ RSYNC_EXCLUDES=(--exclude '.git' --exclude 'node_modules' --exclude 'data'
   --exclude '*.log' --exclude 'dist' --exclude '.codex' --exclude 'packages/desktop'
   --exclude 'VERSION.json')
 
+# 写 VERSION.json(gateway /version 读 cwd/VERSION.json)—— 灰度归属:channel + commit + builtAt。
+write_version() {
+  local commit builtAt tag
+  commit="$(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+  builtAt="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  tag="v5-$commit"
+  local json="{\"tag\":\"$tag\",\"commit\":\"$commit\",\"channel\":\"v5\",\"builtAt\":\"$builtAt\"}"
+  if [[ "$DRY" == 1 ]]; then echo "  [dry-run] write VERSION.json: $json"; return; fi
+  ssh "$KL_HOST" "cat > '$REMOTE_SRC/VERSION.json'" <<<"$json"
+  echo "  ✓ VERSION.json: $json"
+}
+
 # ───────────────────────── smoke:健康 + 隔离断言 ─────────────────────────
 smoke() {
   echo "── v5 smoke(健康 + 隔离断言)──"
@@ -106,10 +118,13 @@ bootstrap() {
   # 1) 源码树
   echo "── 1) rsync v5 源码 → $REMOTE_SRC ──"
   run "rsync -az --delete ${RSYNC_EXCLUDES[*]} '$REPO_ROOT/' '$KL_HOST:$REMOTE_SRC/'"
+  write_version
   # 2) 依赖:从 v3 树硬拷(同机同 HEAD 同 lockfile;.ts 经 tsx 运行无需 build)
   echo "── 2) 拷贝 node_modules(root + commercial)从 v3 树 ──"
   sshk "test -d '$REMOTE_SRC/node_modules' || cp -a '$REMOTE_V3_SRC/node_modules' '$REMOTE_SRC/node_modules'"
-  sshk "test -d '$REMOTE_SRC/packages/commercial/node_modules' || cp -a '$REMOTE_V3_SRC/packages/commercial/node_modules' '$REMOTE_SRC/packages/commercial/node_modules'"
+  # commercial 包级 node_modules:dev worktree 可能有、kl-mirror prod 树通常没有(依赖 hoist 到 root)。
+  # 仅当源存在且目标缺失才拷;否则跳过(root node_modules 已含全部依赖)。
+  sshk "if [ ! -d '$REMOTE_SRC/packages/commercial/node_modules' ] && [ -d '$REMOTE_V3_SRC/packages/commercial/node_modules' ]; then cp -a '$REMOTE_V3_SRC/packages/commercial/node_modules' '$REMOTE_SRC/packages/commercial/node_modules' && echo '  ✓ commercial pkg node_modules 已拷'; else echo '  (commercial pkg node_modules 源不存在/目标已有 → 跳过;依赖在 root node_modules)'; fi"
   # 3) HOME + openclaude.json(从 v3 派生:改 gateway.port/bind、清空 channels)
   echo "── 3) $V5_HOME/openclaude.json(port=$V5_PORT, channels 清空)──"
   sshk "mkdir -p '$V5_HOME'"
@@ -142,6 +157,7 @@ deploy() {
   sshk "set -e; for n in 5 4 3 2 1; do m=\$((n+1)); [ -d '$REMOTE_SRC.prev.'\$n ] && { [ \$m -le 5 ] && rm -rf '$REMOTE_SRC.prev.'\$m 2>/dev/null; mv '$REMOTE_SRC.prev.'\$n '$REMOTE_SRC.prev.'\$m 2>/dev/null; }; done; rsync -a --delete ${RSYNC_EXCLUDES[*]} '$REMOTE_SRC/' '$REMOTE_SRC.prev.1/'"
   echo "── rsync v5 源码 ──"
   run "rsync -az --delete ${RSYNC_EXCLUDES[*]} '$REPO_ROOT/' '$KL_HOST:$REMOTE_SRC/'"
+  write_version
   echo "── restart openclaude-v5(仅 v5,绝不碰 v3)──"
   sshk "systemctl restart $V5_UNIT"
   run "sleep 4"
