@@ -39,6 +39,7 @@
  */
 
 import type { Pool } from "pg";
+import { getRuntimeChannel } from "../runtimeChannel.js";
 
 import {
   stopAndRemoveV3Container,
@@ -151,9 +152,11 @@ async function selectStaleRows(
   batchLimit: number,
 ): Promise<StaleRow[]> {
   const r = await pool.query<{ id: string; container_internal_id: string | null }>(
+    // P1a 隔离:只扫本 channel 容器 —— v3 idle sweep 不得碰 v5 行(反之亦然)。
     `SELECT id, container_internal_id
        FROM agent_containers c
       WHERE state = 'active'
+        AND c.runtime_channel = $3::text
         AND last_ws_activity IS NOT NULL
         AND last_ws_activity < NOW() - ($1::int * interval '1 minute')
         AND NOT EXISTS (
@@ -163,7 +166,7 @@ async function selectStaleRows(
             )
       ORDER BY last_ws_activity ASC
       LIMIT $2::int`,
-    [idleCutoffMin, batchLimit],
+    [idleCutoffMin, batchLimit, getRuntimeChannel()],
   );
   return r.rows.map((row) => ({
     id: Number.parseInt(row.id, 10),

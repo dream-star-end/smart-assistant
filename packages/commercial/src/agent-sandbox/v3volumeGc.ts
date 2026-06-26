@@ -40,6 +40,7 @@
  */
 
 import type { Pool } from "pg";
+import { getRuntimeChannel } from "../runtimeChannel.js";
 
 import {
   acquireUserLifecycleLock,
@@ -201,13 +202,15 @@ async function hasActiveContainerLocked(
   client: import("pg").PoolClient,
   uid: number,
 ): Promise<boolean> {
+  // P1a 隔离:只看本 channel 的 active 容器 —— v3 volume GC 判定不得被 v5 行影响(反之亦然)。
   const r = await client.query<{ exists: boolean }>(
     `SELECT EXISTS (
        SELECT 1 FROM agent_containers
         WHERE user_id = $1::bigint
           AND state = 'active'
+          AND runtime_channel = $2::text
      ) AS exists`,
-    [String(uid)],
+    [String(uid), getRuntimeChannel()],
   );
   return r.rows[0]?.exists === true;
 }

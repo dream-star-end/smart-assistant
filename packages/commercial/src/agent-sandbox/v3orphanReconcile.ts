@@ -56,6 +56,7 @@
 
 import type Docker from "dockerode";
 import type { Pool } from "pg";
+import { getRuntimeChannel } from "../runtimeChannel.js";
 
 import {
   stopAndRemoveV3Container,
@@ -213,9 +214,11 @@ async function listActiveRows(pool: Pool, batchLimit: number): Promise<DbActiveR
     container_internal_id: string | null;
     host_uuid: string | null;
   }>(
+    // P1a 隔离:只 reconcile 本 channel 容器 —— v3 orphan reconcile 不得 vanish v5 行(反之亦然)。
     `SELECT id, container_internal_id, host_uuid
        FROM agent_containers c
       WHERE state = 'active'
+        AND c.runtime_channel = $2::text
         AND NOT EXISTS (
               SELECT 1 FROM agent_migrations m
                WHERE m.agent_container_id = c.id
@@ -223,7 +226,7 @@ async function listActiveRows(pool: Pool, batchLimit: number): Promise<DbActiveR
             )
       ORDER BY id ASC
       LIMIT $1::int`,
-    [batchLimit],
+    [batchLimit, getRuntimeChannel()],
   );
   return r.rows.map((row) => ({
     id: Number.parseInt(row.id, 10),
