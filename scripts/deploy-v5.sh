@@ -71,6 +71,22 @@ done
 run() { if [[ "$DRY" == 1 ]]; then echo "  [dry-run] $*"; else eval "$@"; fi; }
 sshk() { if [[ "$DRY" == 1 ]]; then echo "  [dry-run] ssh $KL_HOST '$*'"; else ssh "$KL_HOST" "$@"; fi; }
 
+# 部署顺序守卫(Codex 铁律):引用 runtime_channel 的 P1a 代码上线前,共享库必须先 apply 0088
+# 加列(v5 AUTO_MIGRATE=0,须 v3 控制面/人工先迁)。否则 channel-aware 查询会报 "column
+# runtime_channel does not exist"。本守卫【只读】校验列存在,缺失即拒部署 + 提示,绝不自行迁移。
+assert_runtime_channel_column() {
+  if [[ "$DRY" == 1 ]]; then echo "  [dry-run] 跳过 runtime_channel 列前置校验"; return 0; fi
+  local has
+  has="$(ssh "$KL_HOST" "set -a; . '$V5_ENV' 2>/dev/null; psql \"\$DATABASE_URL\" -tAc \"SELECT 1 FROM information_schema.columns WHERE table_name='agent_containers' AND column_name='runtime_channel' LIMIT 1\"" 2>/dev/null | tr -d '[:space:]')"
+  if [[ "$has" != "1" ]]; then
+    echo "✗ 部署中止:共享库 agent_containers 缺 runtime_channel 列(迁移 0088 未应用)。" >&2
+    echo "  P1a channel-aware 代码依赖该列;请先在受控窗口应用 0088(加列,additive 安全),再重试部署。" >&2
+    echo "  (v5 AUTO_MIGRATE=0 不会自动迁移;DR=0,迁移前先备份。)" >&2
+    exit 1
+  fi
+  echo "  ✓ runtime_channel 列已存在(0088 已应用),部署顺序前置满足。"
+}
+
 RSYNC_EXCLUDES=(--exclude '.git' --exclude 'node_modules' --exclude 'data'
   --exclude '*.log' --exclude 'dist' --exclude '.codex' --exclude 'packages/desktop'
   --exclude 'VERSION.json')
@@ -139,6 +155,9 @@ bootstrap() {
   echo "── 5) 安装 $V5_UNIT ──"
   run "rsync -az '$REPO_ROOT/deploy/v5/$V5_UNIT' '$KL_HOST:/etc/systemd/system/$V5_UNIT'"
   sshk "systemctl daemon-reload"
+  # 5.5) 部署顺序守卫:P1a channel-aware 代码需共享库已加 runtime_channel 列(0088)。
+  echo "── 5.5) 部署顺序守卫:校验 runtime_channel 列(0088)已应用 ──"
+  assert_runtime_channel_column
   # 6) 启动 + 环境隔离断言
   echo "── 6) 启动 openclaude-v5 + 环境隔离断言 ──"
   sshk "systemctl enable --now $V5_UNIT"
@@ -158,6 +177,8 @@ deploy() {
   echo "── rsync v5 源码 ──"
   run "rsync -az --delete ${RSYNC_EXCLUDES[*]} '$REPO_ROOT/' '$KL_HOST:$REMOTE_SRC/'"
   write_version
+  echo "── 部署顺序守卫:校验 runtime_channel 列(0088)已应用 ──"
+  assert_runtime_channel_column
   echo "── restart openclaude-v5(仅 v5,绝不碰 v3)──"
   sshk "systemctl restart $V5_UNIT"
   run "sleep 4"
