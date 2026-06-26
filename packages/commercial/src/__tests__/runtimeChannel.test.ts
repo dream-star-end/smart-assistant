@@ -1,7 +1,11 @@
 import assert from "node:assert/strict";
 import { afterEach, beforeEach, describe, it } from "node:test";
 
-import { getRuntimeChannel, isV5Channel } from "../runtimeChannel.js";
+import {
+  dockerContainerOwnedByChannel,
+  getRuntimeChannel,
+  isV5Channel,
+} from "../runtimeChannel.js";
 
 // runtimeChannel 是 v3/v5 容器隔离的单一权威(OC_RUNTIME_CHANNEL)。本测试锁住:
 //   - 默认 'v3'(未设 env → 现网零行为变化)
@@ -47,5 +51,18 @@ describe("runtimeChannel", () => {
       process.env.OC_RUNTIME_CHANNEL = bad;
       assert.throws(() => getRuntimeChannel(), /非法 OC_RUNTIME_CHANNEL/, `应对 '${bad}' 抛错`);
     }
+  });
+});
+
+describe("dockerContainerOwnedByChannel(非对称归属)", () => {
+  it("v5 实例:只认 label==='v5' 的容器", () => {
+    assert.equal(dockerContainerOwnedByChannel("v5", "v5"), true);
+    assert.equal(dockerContainerOwnedByChannel("v3", "v5"), false);
+    assert.equal(dockerContainerOwnedByChannel(undefined, "v5"), false); // 无 label 不归 v5
+  });
+  it("v3 实例:认 'v3' + 无 label 存量,但不碰 v5", () => {
+    assert.equal(dockerContainerOwnedByChannel("v3", "v3"), true);
+    assert.equal(dockerContainerOwnedByChannel(undefined, "v3"), true); // 存量无 label 容器归 v3(关键)
+    assert.equal(dockerContainerOwnedByChannel("v5", "v3"), false); // v3 不删 v5 容器
   });
 });
