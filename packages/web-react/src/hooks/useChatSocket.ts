@@ -1,10 +1,28 @@
-import { useCallback, useEffect, useMemo, useRef, useSyncExternalStore } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { api } from "../lib/api";
 import type { ChatMessage, ChatSession } from "../lib/chat/model";
 import { rebuildIndexes } from "../lib/chat/model";
 import { ChatSocket, type ChatSnapshot } from "../lib/chat/socket";
 import type { InboundMessage } from "../lib/chat/frames";
+import { SessionStore, type StoredSession } from "../lib/persist";
 import type { AuthSession } from "../lib/types";
+
+/** 流式期防 IDB 写抖：尾沿 debounce 后落盘一次（isFinal/resume_failed 走立即写，不等它）。*/
+const PERSIST_DEBOUNCE_MS = 900;
+
+/**
+ * 会话写盘签名（debounce 去重，避免无谓 IDB 写）：消息条数 + 末条多维度（文本/工具输出/
+ * partialJson 长度、完成标记、状态）+ 游标 + 时间戳。覆盖流式期最常变的「末条」增长
+ * （含 Bash tail / 工具输出）。中段旧消息的罕见变更不进签名 —— 兜底靠 pagehide/隐藏时
+ * 的全量 flush（无条件落盘）与 isFinal 立即写。
+ */
+function persistSignature(s: StoredSession): string {
+  const last = s.messages[s.messages.length - 1];
+  const lastSig = last
+    ? `${last.text?.length ?? 0}/${last.output?.length ?? 0}/${last.partialJson?.length ?? 0}/${last._completed ? 1 : 0}/${last.status ?? ""}`
+    : "";
+  return `${s.messages.length}:${lastSig}:${s._lastFrameSeq ?? 0}:${s._maxSeq ?? 0}:${s.updatedAt ?? s.lastAt}`;
+}
 
 /**
  * P4 —— 真实 WS 对话引擎的 React 绑定。
@@ -45,6 +63,20 @@ export type UseChatSocket = {
     message?: string;
     updatedInput?: Record<string, unknown>;
   }) => void;
+  /** 历史加载：把 server canonical 消息合并进会话（server-wins / id 幂等）并落地。*/
+  mergeServerHistory: (p: {
+    sessId: string;
+    agentId: string;
+    messages: ChatMessage[];
+    full: boolean;
+    maxSeq?: number;
+  }) => void;
+  /** server 增量游标（getSession 的 sinceSeq；无则 0=全量）。*/
+  storedMaxSeq: (sessId: string | undefined) => number;
+  /** 删除某会话的本地持久副本（与 removeSession 配套）。*/
+  removePersisted: (sessId: string) => void;
+  /** 清空当前 user 命名空间（登出隐私收尾）。*/
+  wipePersistence: () => Promise<void>;
 };
 
 const EMPTY_MESSAGES: ChatMessage[] = [];
@@ -58,8 +90,12 @@ export function useChatSocket(opts: {
   defaultAgentId?: string;
   /** 商业版余额刷新（cost_charged / 4506 / insufficient_credits）。*/
   refreshBalance?: () => void;
+  /** 当前登录用户 id：IndexedDB 持久按它命名空间（隐私隔离）。null=不持久。*/
+  userId?: string | null;
+  /** boot/登录从 IndexedDB 读回会话后回调（供侧栏装载本地会话）。*/
+  onHydrated?: (stored: StoredSession[]) => void;
 }): UseChatSocket {
-  const { auth, ready, enabled, defaultAgentId, refreshBalance } = opts;
+  const { auth, ready, enabled, defaultAgentId, refreshBalance, userId, onHydrated } = opts;
 
   // authRef / refreshBalanceRef：让 service deps 永远读到最新闭包，无 stale。
   const authRef = useRef(auth);
@@ -68,6 +104,16 @@ export function useChatSocket(opts: {
   refreshBalanceRef.current = refreshBalance;
   const defaultAgentRef = useRef(defaultAgentId);
   defaultAgentRef.current = defaultAgentId;
+  const onHydratedRef = useRef(onHydrated);
+  onHydratedRef.current = onHydrated;
+
+  // 持久存储（按 user 命名空间）+ 立即落盘句柄 + 写盘签名（防无谓 IDB 写）。
+  const storeRef = useRef<SessionStore | null>(null);
+  const persistRef = useRef<(sessId: string) => void>(() => {});
+  const sigRef = useRef<Map<string, string>>(new Map());
+  // IndexedDB 注水是否完成：持久启用时，connect 须等注水完成，否则首个 hello 不带恢复的
+  // 断点续传游标（restored 会话无法 auto-resume，要等下次重连才补）。
+  const [hydrationDone, setHydrationDone] = useState(false);
 
   // 单例 service：整个组件生命周期复用同一实例。
   const socketRef = useRef<ChatSocket | null>(null);
@@ -112,10 +158,13 @@ export function useChatSocket(opts: {
             rebuildIndexes(sess);
           }
           sess._liveStreamBroken = false;
+          persistRef.current(sessId); // server-wins 替换后落地新 tape + 游标
         } catch {
           /* sync 失败：保留现状，下次重连/前台再试 */
         }
       },
+      // resume_failed 游标推进 / isFinal turn 收尾：立即落 IndexedDB（防 reload 死循环 + 不丢轮）。
+      persistSession: (sessId) => persistRef.current(sessId),
       defaultAgentId: defaultAgentRef.current,
     });
   }
@@ -123,6 +172,16 @@ export function useChatSocket(opts: {
 
   // 订阅 service 快照。
   const snap = useSyncExternalStore(socket.subscribe, socket.getSnapshot);
+
+  // 立即落盘句柄（isFinal / resume_failed / syncSession 触发）：读当前 store，写盘并更新签名。
+  persistRef.current = (sessId: string) => {
+    const store = storeRef.current;
+    if (!store) return;
+    const stored = socket.toStored(sessId);
+    if (!stored) return;
+    sigRef.current.set(sessId, persistSignature(stored));
+    void store.putSession(stored);
+  };
 
   // 生命周期：enabled 时 start（绑事件）；卸载/禁用时 stop（解绑 + 关 ws）。
   useEffect(() => {
@@ -137,11 +196,86 @@ export function useChatSocket(opts: {
     };
   }, [enabled, auth, socket]);
 
-  // gate.ready 作为 connect 硬前置喂给 service。
+  // gate.ready 作为 connect 硬前置喂给 service。持久启用（userId 在）时，须等 IndexedDB
+  // 注水完成再放行连接，让首个 hello 带上恢复的 per-session 游标（boot auto-resume）。
+  // 禁用（登出/换号）时显式把 gateReady 降为 false：单例 service 的 connect 闸是边沿触发
+  // （ready && !was 才 connect），若登出不复位，再登录时 ready 仍 === was(true) → 永不重连。
   useEffect(() => {
-    if (!enabled || !auth) return;
+    if (!enabled || !auth) {
+      socket.setGateReady(false);
+      return;
+    }
+    if (userId && !hydrationDone) return;
     socket.setGateReady(ready);
-  }, [enabled, auth, ready, socket]);
+  }, [enabled, auth, ready, socket, userId, hydrationDone]);
+
+  // 持久存储生命周期：登录(enabled+userId)→开 store + 从 IndexedDB 注水会话（reload 不丢）；
+  // 卸载/登出→flush + close。pagehide / 切到后台时同步 flush，保 mid-stream reload 不丢。
+  // 此 effect 必须声明在下方 debounce 落盘 effect 之前（同 commit 内先建 store 再消费）。
+  useEffect(() => {
+    if (!enabled || !userId) return;
+    const store = new SessionStore(userId);
+    storeRef.current = store;
+    sigRef.current = new Map();
+    setHydrationDone(false);
+    let cancelled = false;
+
+    const flushAll = () => {
+      const st = storeRef.current;
+      if (!st) return;
+      for (const [id] of socket.sessions) {
+        const stored = socket.toStored(id);
+        if (!stored) continue;
+        sigRef.current.set(id, persistSignature(stored));
+        void st.putSession(stored);
+      }
+    };
+
+    void store.getAll().then((all) => {
+      if (cancelled) return;
+      for (const stored of all) socket.loadStored(stored);
+      onHydratedRef.current?.(all);
+      setHydrationDone(true); // 注水完成 → 放行 gate.ready 连接（hello 带恢复游标）
+    });
+
+    const onHide = () => flushAll();
+    const onVis = () => {
+      if (typeof document !== "undefined" && document.visibilityState === "hidden") flushAll();
+    };
+    window.addEventListener("pagehide", onHide);
+    document.addEventListener("visibilitychange", onVis);
+
+    return () => {
+      cancelled = true;
+      window.removeEventListener("pagehide", onHide);
+      document.removeEventListener("visibilitychange", onVis);
+      // teardown 仅发生在登出/换号（enabled/userId 变）：先 final flush（wipe 后 dead→no-op），
+      // 再清内存会话（隐私收尾，防换号后旧会话残留单例），最后关 store。
+      flushAll();
+      socket.resetSessions();
+      store.close();
+      if (storeRef.current === store) storeRef.current = null;
+      sigRef.current = new Map();
+      setHydrationDone(false);
+    };
+  }, [enabled, userId, socket]);
+
+  // 流式期尾沿 debounce 落盘（高频 delta 不每帧写 IDB）；签名去重避免无谓写。
+  useEffect(() => {
+    const store = storeRef.current;
+    if (!store) return;
+    const t = setTimeout(() => {
+      for (const [id] of socket.sessions) {
+        const stored = socket.toStored(id);
+        if (!stored) continue;
+        const sig = persistSignature(stored);
+        if (sigRef.current.get(id) === sig) continue;
+        sigRef.current.set(id, sig);
+        void store.putSession(stored);
+      }
+    }, PERSIST_DEBOUNCE_MS);
+    return () => clearTimeout(t);
+  }, [snap.version, socket]);
 
   const getMessages = useCallback(
     (sessId: string | undefined) => {
@@ -179,6 +313,31 @@ export function useChatSocket(opts: {
     [socket],
   );
 
+  const mergeServerHistory = useCallback<UseChatSocket["mergeServerHistory"]>(
+    (p) => {
+      socket.applyServerMessages(p.sessId, p.agentId, p.messages, p.full, p.maxSeq);
+      persistRef.current(p.sessId); // 合并后落地（含推进的 _maxSeq 游标）
+    },
+    [socket],
+  );
+  const storedMaxSeq = useCallback(
+    (sessId: string | undefined) => {
+      void snap.version;
+      return (sessId && snap.sessions.get(sessId)?._maxSeq) || 0;
+    },
+    [snap],
+  );
+  const removePersisted = useCallback((sessId: string) => {
+    sigRef.current.delete(sessId);
+    const st = storeRef.current;
+    if (st) void st.deleteSession(sessId);
+  }, []);
+  const wipePersistence = useCallback(async () => {
+    sigRef.current.clear();
+    const st = storeRef.current;
+    if (st) await st.wipe();
+  }, []);
+
   return useMemo(
     () => ({
       status: snap.status,
@@ -192,7 +351,26 @@ export function useChatSocket(opts: {
       send,
       stop,
       respondPermission,
+      mergeServerHistory,
+      storedMaxSeq,
+      removePersisted,
+      wipePersistence,
     }),
-    [snap, getMessages, getSession, isSending, ensureSession, removeSession, switchAgent, send, stop, respondPermission],
+    [
+      snap,
+      getMessages,
+      getSession,
+      isSending,
+      ensureSession,
+      removeSession,
+      switchAgent,
+      send,
+      stop,
+      respondPermission,
+      mergeServerHistory,
+      storedMaxSeq,
+      removePersisted,
+      wipePersistence,
+    ],
   );
 }

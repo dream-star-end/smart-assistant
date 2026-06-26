@@ -3,7 +3,11 @@ import { useState } from "react";
 import type { Theme } from "../hooks/useTheme";
 import { BRAND } from "../lib/brand";
 import { ThemeToggle } from "./ThemeToggle";
+import { TurnstileWidget } from "./TurnstileWidget";
 import { Button, Input, Spinner } from "./ui";
+
+/** 占位 token：canary 开启 TURNSTILE_TEST_BYPASS 时发它即可过（服务端 bypass 接受任意串）。*/
+const BYPASS_TOKEN = "bypass";
 
 export function AuthGate({
   onLogin,
@@ -12,16 +16,39 @@ export function AuthGate({
   onBack,
   theme,
   onCycleTheme,
+  turnstileBypass,
+  turnstileSiteKey,
 }: {
-  onLogin: (email: string, password: string) => void;
+  // 第三参为 Turnstile token：bypass(含 config 加载中)发占位串，生产用真 widget token。
+  onLogin: (email: string, password: string, turnstileToken: string) => void;
   loading?: boolean;
   error?: string | null;
   onBack?: () => void;
   theme: Theme;
   onCycleTheme: () => void;
+  /** GET /api/public/config 的 turnstile_bypass；undefined=config 尚未加载。*/
+  turnstileBypass?: boolean;
+  /** GET /api/public/config 的 turnstile_site_key（!bypass 时 render widget）。*/
+  turnstileSiteKey?: string;
 }) {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
+  // 真实 Turnstile token（仅 !bypass 且 widget onSuccess 后非空）。
+  const [token, setToken] = useState<string | null>(null);
+
+  // 三态 fail-closed：config 未就绪（undefined）既不发占位也不放行——避免生产（bypass 关闭）
+  // 在 config 拉取失败时用假 token 登录。仅 bypass===true（canary）发占位；bypass===false
+  // 渲染真 widget 且 token 到手前禁用。
+  const bypassKnown = typeof turnstileBypass === "boolean";
+  const needsWidget = turnstileBypass === false;
+  // 提交时上传的 token：canary(bypass) 发占位串（行为不变）；生产用真 widget token。
+  const submitToken = turnstileBypass === true ? BYPASS_TOKEN : token;
+  const canSubmit =
+    !loading &&
+    !!email.trim() &&
+    !!password &&
+    bypassKnown &&
+    (turnstileBypass === true || !!token);
 
   return (
     <div className="relative flex min-h-screen items-center justify-center overflow-hidden bg-bg px-5">
@@ -54,7 +81,9 @@ export function AuthGate({
         <form
           onSubmit={(e) => {
             e.preventDefault();
-            onLogin(email.trim(), password);
+            // fail-closed：无有效 token 绝不提交（生产不会误发占位 'bypass'）。
+            if (!canSubmit || !submitToken) return;
+            onLogin(email.trim(), password, submitToken);
           }}
           className="flex flex-col gap-3 rounded-xl border border-border bg-surface p-5 shadow-soft"
         >
@@ -87,10 +116,23 @@ export function AuthGate({
             </div>
           )}
 
+          {/* 生产（bypass 关闭）才渲染真实人机验证；token 拿到前禁用登录。canary(bypass) 跳过。 */}
+          {needsWidget && (
+            <div className="flex justify-center">
+              <TurnstileWidget
+                siteKey={turnstileSiteKey ?? ""}
+                theme={theme === "system" ? "auto" : theme}
+                onToken={setToken}
+                onExpire={() => setToken(null)}
+                onError={() => setToken(null)}
+              />
+            </div>
+          )}
+
           <Button
             type="submit"
             variant="primary"
-            disabled={loading || !email.trim() || !password}
+            disabled={!canSubmit}
             className="mt-1 w-full gap-2 rounded-xl text-[14.5px]"
           >
             {loading ? (

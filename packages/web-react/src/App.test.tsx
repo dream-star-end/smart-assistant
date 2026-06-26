@@ -38,6 +38,15 @@ const LOGIN_OK = okJson({
   remember: false,
 })
 
+// 公开配置：canary 默认 turnstile_bypass:true（AuthGate fail-closed，bypass 关闭才需真 widget）。
+const PUBLIC_CONFIG = okJson({
+  turnstile_site_key: '',
+  turnstile_bypass: true,
+  require_email_verified: false,
+  feature_remote_ssh: false,
+  allow_registration: true,
+})
+
 // ─── P3 对话前置 fixtures（后端 wire 形态，snake_case） ────────────────────────
 const MODELS = {
   models: [
@@ -99,6 +108,7 @@ function routedFetch(over?: {
   return vi.fn(async (url: string) => {
     const u = String(url)
     if (u.includes('/api/auth/login')) return LOGIN_OK
+    if (u.includes('/api/public/config')) return PUBLIC_CONFIG
     if (u.includes('/api/public/models')) return okJson(over?.models ?? MODELS)
     if (u.includes('/api/agent/open')) {
       opened = true
@@ -129,11 +139,15 @@ afterEach(() => {
 })
 
 async function loginViaUi() {
-  fireEvent.click(screen.getByRole('button', { name: '登录' }))
+  fireEvent.click(screen.getByRole('button', { name: '登录' })) // Landing 登录 → AuthGate
   fireEvent.change(screen.getByPlaceholderText('邮箱'), { target: { value: 'a@b.com' } })
   fireEvent.change(screen.getByPlaceholderText('密码'), { target: { value: 'password123' } })
+  // AuthGate fail-closed：公开配置（turnstile_bypass）加载完前登录按钮禁用。等其就绪再提交
+  // （生产同样：登录页拉到 config 后按钮才可点）。
+  const submit = screen.getByRole('button', { name: '登录' })
+  await waitFor(() => expect(submit).not.toBeDisabled())
   await act(async () => {
-    fireEvent.click(screen.getByRole('button', { name: '登录' }))
+    fireEvent.click(submit)
   })
 }
 
@@ -148,7 +162,9 @@ describe('Aurora v5 skeleton — landing (de-branded)', () => {
 
 describe('Aurora v5 skeleton — auth → workspace', () => {
   test('login posts to v5 /api/auth/login (credentials include) and enters workspace', async () => {
-    fetchMock = vi.fn(async () => LOGIN_OK) as unknown as FetchMock
+    fetchMock = vi.fn(async (url: string) =>
+      String(url).includes('/api/public/config') ? PUBLIC_CONFIG : LOGIN_OK,
+    ) as unknown as FetchMock
     vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
 
     render(<App />)
@@ -163,8 +179,10 @@ describe('Aurora v5 skeleton — auth → workspace', () => {
   })
 
   test('login error surfaces the backend message', async () => {
-    fetchMock = vi.fn(async () =>
-      errJson(401, { error: { code: 'INVALID_CREDENTIALS', message: '邮箱或密码错误' } }),
+    fetchMock = vi.fn(async (url: string) =>
+      String(url).includes('/api/public/config')
+        ? PUBLIC_CONFIG
+        : errJson(401, { error: { code: 'INVALID_CREDENTIALS', message: '邮箱或密码错误' } }),
     ) as unknown as FetchMock
     vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
 
@@ -298,5 +316,75 @@ describe('Aurora v5 — P3 对话前置（模型选择器 + 订阅/容器门）'
     expect(screen.getByText(/120/)).toBeInTheDocument()
     expect(screen.getByRole('button', { name: /去充值/ })).toBeInTheDocument()
     expect(screen.getByPlaceholderText('和「全能助手」对话…')).toBeDisabled()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// P6 历史会话加载：登录后 listSessions 填侧栏；selectSession → getSession 拉历史并
+// 合并进 WS service（server canonical）。jsdom 无 IndexedDB，本地注水降级 no-op，
+// 故此用例验证的是 server 历史链路（listSessions + getSession + 渲染）。
+// ---------------------------------------------------------------------------
+const HIST_META = {
+  sessions: [
+    {
+      id: 'webhist01',
+      agentId: 'main',
+      title: '历史会话甲',
+      pinned: false,
+      createdAt: 1,
+      lastAt: 2,
+      messageCount: 1,
+      updatedAt: 2,
+    },
+  ],
+}
+const HIST_DETAIL = {
+  id: 'webhist01',
+  userId: 'u1',
+  agentId: 'main',
+  title: '历史会话甲',
+  pinned: false,
+  createdAt: 1,
+  lastAt: 2,
+  messages: [{ id: 'mm1', role: 'assistant', text: '历史答复正文', ts: 1 }],
+  updatedAt: 2,
+  isPartial: false,
+  totalMessageCount: 1,
+  maxSeq: 5,
+}
+
+describe('Aurora v5 — P6 历史会话加载', () => {
+  test('listSessions 填侧栏；选中会话 → getSession 拉历史并渲染', async () => {
+    fetchMock = vi.fn(async (url: string) => {
+      const u = String(url)
+      if (u.includes('/api/auth/login')) return LOGIN_OK
+      if (u.includes('/api/public/config')) return okJson({ turnstile_bypass: true })
+      if (u.includes('/api/public/models')) return okJson(MODELS)
+      if (u.includes('/api/sessions/list')) return okJson(HIST_META)
+      if (/\/api\/sessions\/webhist01/.test(u)) return okJson(HIST_DETAIL)
+      if (u.includes('/api/agent/status')) return okJson(AGENT_READY)
+      if (u.includes('/api/me'))
+        return okJson({ user: { id: 'u1', email: 'a@b.com', role: 'user', display_name: 'Alice', credits: '300' } })
+      return okJson({})
+    }) as unknown as FetchMock
+    vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
+
+    render(<App />)
+    await loginViaUi()
+
+    // listSessions 填侧栏：历史会话标题出现。
+    await waitFor(() => expect(screen.getByText('历史会话甲')).toBeInTheDocument())
+
+    // 选中 → getSession 拉历史。
+    await act(async () => {
+      fireEvent.click(screen.getByText('历史会话甲'))
+    })
+    await waitFor(() =>
+      expect(
+        fetchMock.mock.calls.some(([u]) => /\/api\/sessions\/webhist01/.test(String(u))),
+      ).toBe(true),
+    )
+    // 合并进 WS service 后渲染历史正文。
+    await waitFor(() => expect(screen.getByText('历史答复正文')).toBeInTheDocument())
   })
 })

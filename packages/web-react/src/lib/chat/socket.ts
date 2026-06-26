@@ -27,8 +27,14 @@ import {
   type ChatSession,
   clearTurnTiming,
   createSession,
+  rebuildIndexes,
   resetReplyTracker,
 } from "./model";
+import {
+  applyServerIncremental,
+  mergeFullServerWins,
+  type StoredSession,
+} from "../persist";
 import {
   AUTO_CONTINUE_DISPLAY,
   backoffDelay,
@@ -80,6 +86,8 @@ export type ChatSocketDeps = {
   reportClientError?: (p: { type: string; message: string; traceId?: string; sessionId?: string }) => void;
   /** resume_failed / 重连 reconcile：强制 REST 全量 sync（最终权威源）。*/
   syncSession?: (sessId: string) => Promise<void> | void;
+  /** 立即把某会话快照落 IndexedDB（resume_failed 游标推进 / isFinal turn 收尾时调）。*/
+  persistSession?: (sessId: string) => void;
   defaultAgentId?: string;
 };
 
@@ -418,6 +426,8 @@ export class ChatSocket {
           else this.offlineQueueDraining = false;
           this.maybePromoteToConnected();
         }
+        // turn 收尾：落地完成轮（reload 不丢；游标 + 完整 tape durable）。
+        this.deps.persistSession?.(sess.id);
       },
       onLiveFrame: (sess) => {
         if (sess._sendingInFlight) this.resetThinkingSafety(sess.id);
@@ -431,6 +441,7 @@ export class ChatSocket {
       forceSync: (sessId) => {
         void this.deps.syncSession?.(sessId);
       },
+      persistSession: (sessId) => this.deps.persistSession?.(sessId),
       onAuthControlError: () => {
         // 交给 close(1008) handler 续期，不渲染。
       },
@@ -918,6 +929,92 @@ export class ChatSocket {
 
   removeSession(sessId: string): void {
     if (this.sessions.delete(sessId)) this.scheduleNotify();
+  }
+
+  /**
+   * 清空全部内存会话（登出/换号隐私收尾，类比 P5 媒体缓存按 authKey 失效）。单例
+   * service 跨登出存活，若不清，换号后旧会话残留内存。调用前 WS 应已 stop（无活跃 turn）。
+   */
+  resetSessions(): void {
+    if (this.sessions.size === 0) return;
+    this.sessions.clear();
+    this.scheduleNotify();
+  }
+
+  // ═══════════════ 本地持久 / 历史装载（P6）═══════════════
+
+  /**
+   * 序列化为可持久化的 StoredSession：只取 reducer 产出的稳定数据 + 断点续传游标，
+   * 剥离流式指针 / Map / in-flight 瞬态（注水时由 rebuildIndexes 重建）。
+   */
+  toStored(sessId: string): StoredSession | null {
+    const s = this.sessions.get(sessId);
+    if (!s) return null;
+    return {
+      id: s.id,
+      agentId: s.agentId,
+      title: s.title,
+      messages: s.messages,
+      createdAt: s.createdAt,
+      lastAt: s.lastAt,
+      updatedAt: s.updatedAt,
+      _lastFrameSeqByKey: s._lastFrameSeqByKey ? { ...s._lastFrameSeqByKey } : undefined,
+      _lastFrameSeq: s._lastFrameSeq,
+      _maxSeq: s._maxSeq,
+    };
+  }
+
+  /**
+   * 从 IndexedDB 注水会话（boot/登录读回）。**不发任何帧、不连 WS**——纯本地恢复，
+   * 让 reload 不丢会话。已存在（live）则跳过：live 状态永远优先于磁盘快照。
+   * 注水后清流式瞬态 + reset in-flight（防 reload 后卡 loading），并重建 block/agent 索引。
+   */
+  loadStored(stored: StoredSession): void {
+    if (!stored?.id || this.sessions.has(stored.id)) return;
+    const s = createSession({
+      id: stored.id,
+      agentId: stored.agentId || this.deps.defaultAgentId || "main",
+      title: stored.title,
+      createdAt: stored.createdAt,
+    });
+    s.messages = Array.isArray(stored.messages) ? stored.messages : [];
+    s.lastAt = typeof stored.lastAt === "number" ? stored.lastAt : s.lastAt;
+    s.updatedAt = stored.updatedAt;
+    s._lastFrameSeqByKey = stored._lastFrameSeqByKey ? { ...stored._lastFrameSeqByKey } : {};
+    s._lastFrameSeq = stored._lastFrameSeq;
+    s._maxSeq = stored._maxSeq;
+    s._streamingAssistant = null;
+    s._streamingThinking = null;
+    s._sendingInFlight = false;
+    rebuildIndexes(s);
+    this.sessions.set(stored.id, s);
+    this.scheduleNotify();
+  }
+
+  /**
+   * 合并 server canonical 历史（gateway getSession 结果）。server-wins / 按 id 幂等：
+   *  - full（!isPartial）：server 整带为权威在前，仅追加本地 server 不认识的乐观尾消息。
+   *  - 增量（isPartial）：在本地基础上按 id 覆盖 + 追加新增。
+   * maxSeq 单调推进作下次增量游标。会话不存在则按 agentId 惰性建。
+   */
+  applyServerMessages(
+    sessId: string,
+    agentId: string,
+    msgs: ChatMessage[],
+    full: boolean,
+    maxSeq?: number,
+  ): void {
+    const s = this.ensureSession(sessId, agentId || this.deps.defaultAgentId || "main");
+    s.messages = full ? mergeFullServerWins(msgs, s.messages) : applyServerIncremental(s.messages, msgs);
+    if (typeof maxSeq === "number" && (s._maxSeq === undefined || maxSeq > s._maxSeq)) {
+      s._maxSeq = maxSeq;
+    }
+    s._streamingAssistant = null;
+    s._streamingThinking = null;
+    s._blockIdToMsgId = new Map();
+    s._agentGroups = new Map();
+    rebuildIndexes(s);
+    this.scheduleNotify();
   }
 
   /**

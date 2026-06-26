@@ -21,9 +21,19 @@ import { useTheme } from "./hooks/useTheme";
 import type { ChatMessage } from "./lib/chat/model";
 import { CONTINUE_PROMPT } from "./lib/chat/render";
 import { DEFAULT_AGENT } from "./lib/agents";
-import { api } from "./lib/api";
+import { ApiError, api } from "./lib/api";
+import type { StoredSession } from "./lib/persist";
 import { DEMO_MESSAGES, DEMO_MODELS, DEMO_SESSIONS, DEMO_USER, demoReply } from "./lib/demo";
-import type { AuthSession, Message, PublicModel, Session, ToolCard, User } from "./lib/types";
+import type {
+  AuthSession,
+  Message,
+  PublicConfig,
+  PublicModel,
+  Session,
+  SessionMeta,
+  ToolCard,
+  User,
+} from "./lib/types";
 
 function makeLocalSession(title: string, ownerUserId: string): Session {
   return {
@@ -33,6 +43,44 @@ function makeLocalSession(title: string, ownerUserId: string): Session {
     updatedAt: new Date().toISOString(),
     messageCount: 0,
   };
+}
+
+/** IndexedDB 注水的 StoredSession → 侧栏 Session（updatedAt 统一 ISO 串，便于排序展示）。*/
+function storedToSession(s: StoredSession, ownerUserId: string): Session {
+  return {
+    id: s.id,
+    title: s.title || "新对话",
+    ownerUserId,
+    updatedAt: new Date(s.updatedAt ?? s.lastAt ?? Date.now()).toISOString(),
+    messageCount: Array.isArray(s.messages) ? s.messages.length : 0,
+  };
+}
+
+/** server canonical SessionMeta（gateway listSessions）→ 侧栏 Session。*/
+function metaToSession(m: SessionMeta, ownerUserId: string): Session {
+  return {
+    id: m.id,
+    title: m.title || "新对话",
+    ownerUserId,
+    updatedAt: new Date(m.updatedAt ?? m.lastAt ?? Date.now()).toISOString(),
+    messageCount: m.messageCount ?? 0,
+  };
+}
+
+/**
+ * 合并侧栏会话：union by id，按 updatedAt 倒序。`incomingWins` 决定重叠项谁覆盖元数据
+ * （listSessions=server-wins=true；IndexedDB 注水=本地不覆盖既有=false）。
+ */
+function upsertSessions(cur: Session[], incoming: Session[], incomingWins: boolean): Session[] {
+  const map = new Map<string, Session>();
+  for (const s of cur) map.set(s.id, s);
+  for (const s of incoming) {
+    const prev = map.get(s.id);
+    map.set(s.id, prev ? (incomingWins ? { ...prev, ...s } : { ...s, ...prev }) : s);
+  }
+  return [...map.values()].sort((a, b) =>
+    a.updatedAt < b.updatedAt ? 1 : a.updatedAt > b.updatedAt ? -1 : 0,
+  );
 }
 
 const EMPTY_WS_MESSAGES: ChatMessage[] = [];
@@ -58,6 +106,8 @@ export function App() {
   const [user, setUser] = useState<User | null>(demo ? DEMO_USER : null);
   const [authLoading, setAuthLoading] = useState(false);
   const [authError, setAuthError] = useState<string | null>(null);
+  // 公开配置（Turnstile bypass / site key）：登录页驱动 AuthGate 是否渲染真 widget。
+  const [publicCfg, setPublicCfg] = useState<PublicConfig | null>(null);
 
   const [sessions, setSessions] = useState<Session[]>(demo ? DEMO_SESSIONS : []);
   const [activeId, setActiveId] = useState<string | undefined>(demo ? DEMO_SESSIONS[0].id : undefined);
@@ -82,13 +132,20 @@ export function App() {
   // “块级变量在声明前使用” 的 TDZ（hook 在下方调用后回填 sockRef.current）。
   const sockRef = useRef<UseChatSocket | null>(null);
 
-  // 本地会话消息存储（脚手架）：activeId → 消息数组。P4 接入 WS 会话历史后替换。
+  // 本地会话消息存储（脚手架，仅 demo 路径用）：activeId → 消息数组。非 demo 走 WS + IndexedDB。
   const localStore = useRef<Map<string, Message[]>>(new Map());
+  // 已拉过 server 历史的会话 id（防 selectSession 每次都重拉；404 的本地会话也记入）。
+  const historyFetchedRef = useRef<Set<string>>(new Set());
+  // 当前登录 user id 的实时镜像：异步历史请求 await 后比对，防登出/换号后 stale 响应
+  // 把上一个用户的历史污染进单例 WS service / 写进新用户的 IndexedDB 命名空间（隐私）。
+  const userIdRef = useRef<string | null>(null);
+  userIdRef.current = user?.id ?? null;
 
   // 清空全部鉴权 + 会话状态，回到登录/首页（静默刷新失败或主动登出都走这里）。
   const clearAuth = useCallback(() => {
     tokenRef.current = null;
     localStore.current.clear();
+    historyFetchedRef.current.clear();
     setAuthed(false);
     setUser(null);
     setSessions([]);
@@ -121,30 +178,21 @@ export function App() {
     setChatError(null);
   }, []);
 
-  const login = useCallback(async (email: string, password: string) => {
+  const login = useCallback(async (email: string, password: string, turnstileToken: string) => {
     setAuthLoading(true);
     setAuthError(null);
     try {
-      // 服务端 /api/auth/login schema 必填 turnstile_token(即便 bypass)。canary v5 已开
-      // TURNSTILE_TEST_BYPASS=1(public config turnstile_bypass:true)→ 发占位串即可过(服务端
-      // bypass 接受任意 token)。
-      // TODO(生产 cutover,bypass 关闭后):接真实 Cloudflare Turnstile widget(challenges.cloudflare
-      // .com/turnstile/v0/api.js + render(turnstile_site_key)→ onSuccess(token)),用真 token 替占位。
-      let turnstileToken: string | undefined;
-      try {
-        const cfg = await api.getPublicConfig();
-        if (cfg.turnstileBypass) turnstileToken = "bypass";
-      } catch {
-        /* 拿不到 config 不阻断登录尝试;无 token 时服务端会回明确错误 */
-      }
+      // 服务端 /api/auth/login schema 必填 turnstile_token。turnstileToken 由 AuthGate 给出：
+      // canary（turnstile_bypass:true）发占位 'bypass'（服务端接受任意串）；生产（bypass 关闭）
+      // 为真实 Cloudflare Turnstile widget 的 onSuccess token。canary 登录行为不变。
       // 登录拿到内存态 accessToken + 用户信息；token 只写进 tokenRef（内存），绝不落地。
       // refresh token 由后端通过 HttpOnly cookie 下发（api.login credentials:'include'）。
       const { accessToken, user: me } = await api.login(email, password, turnstileToken);
       tokenRef.current = accessToken;
       setAuthed(true);
       setUser(me);
-      // P2 占位：v5 会话历史走 WS（P4），REST 不再提供 chat session 列表。
-      // 这里不预载会话，侧栏初始为空，用户可新建本地会话预览骨架。
+      // 不在此预载会话：登录后由 useChatSocket 从 IndexedDB 注水（onHydrated）+ listSessions
+      // 合并 server canonical 列表填侧栏；selectSession 再按需拉取单会话历史。
       setSessions([]);
       setActiveId(undefined);
       setMessages([]);
@@ -155,6 +203,46 @@ export function App() {
     }
   }, []);
 
+  // IndexedDB 注水回调：把本地会话填进侧栏（本地优先；随后 listSessions server-wins 覆盖元数据）。
+  const onHydrated = useCallback(
+    (stored: StoredSession[]) => {
+      const owner = user?.id;
+      if (!owner || stored.length === 0) return;
+      const local = stored.map((s) => storedToSession(s, owner));
+      setSessions((cur) => upsertSessions(cur, local, false));
+    },
+    [user],
+  );
+
+  // 按需拉取单会话 server canonical 历史并合并进 WS service（server-wins / id 幂等）。
+  // 经稳定 sockRef 调用历史方法，避免依赖每帧重建的 chat 引用。
+  const loadHistory = useCallback(
+    async (id: string) => {
+      const owner = userIdRef.current;
+      if (!auth || !owner) return;
+      if (historyFetchedRef.current.has(id)) return;
+      historyFetchedRef.current.add(id);
+      try {
+        const sinceSeq = sockRef.current?.storedMaxSeq(id) ?? 0;
+        const detail = await api.getSession(authRef.current, id, sinceSeq);
+        // 登出/换号守卫：await 期间用户已变 → 丢弃，绝不污染当前会话/新用户 IndexedDB。
+        if (userIdRef.current !== owner) return;
+        const msgs = Array.isArray(detail.messages) ? (detail.messages as ChatMessage[]) : [];
+        sockRef.current?.mergeServerHistory({
+          sessId: id,
+          agentId: detail.agentId || agent.id,
+          messages: msgs,
+          full: !detail.isPartial,
+          maxSeq: detail.maxSeq,
+        });
+      } catch (e) {
+        // 404 = 本地新建/未同步会话，无 server 历史（正常）；其他错误允许下次重选重试。
+        if (!(e instanceof ApiError && e.status === 404)) historyFetchedRef.current.delete(id);
+      }
+    },
+    [auth, agent.id],
+  );
+
   const selectSession = useCallback(
     (id: string) => {
       if (id === activeId) return;
@@ -164,9 +252,10 @@ export function App() {
         setMessages(id === DEMO_SESSIONS[0].id ? DEMO_MESSAGES : []);
         return;
       }
-      setMessages(localStore.current.get(id) ?? []);
+      // 非 demo：消息来自 WS service 快照；选中后按需拉 server 历史合并（本地已注水的直接展示）。
+      void loadHistory(id);
     },
-    [activeId, demo],
+    [activeId, demo, loadHistory],
   );
 
   const newSession = useCallback(() => {
@@ -276,8 +365,12 @@ export function App() {
   }, [demo, messages, activeId, send]);
 
   const logout = useCallback(() => {
-    // 先请求后端吊销 refresh cookie（错误已在 api 层吞掉），再清空内存态回到首页。
-    if (!demo) void api.logout();
+    // 先请求后端吊销 refresh cookie（错误已在 api 层吞掉），并清本 user 的 IndexedDB
+    // 命名空间（隐私，类比 P5 媒体缓存按 authKey 失效），再清空内存态回到首页。
+    if (!demo) {
+      void api.logout();
+      void sockRef.current?.wipePersistence();
+    }
     clearAuth();
   }, [demo, clearAuth]);
 
@@ -301,6 +394,25 @@ export function App() {
 
   // 键盘快捷键：⌘/Ctrl+K 新会话；Esc 停止当前（demo）流式。仅在进入工作区后生效。
   const inWorkspace = demo || (view === "app" && !!auth && !!user);
+
+  // 进入登录页（view=app 且未认证）时拉一次公开配置：决定 AuthGate 是否渲染真 Turnstile
+  // widget。停在首页（home）/demo/已登录均不拉，避免无谓请求（与无网络测试用例兼容）。
+  useEffect(() => {
+    if (demo || authed || view !== "app") return;
+    let cancelled = false;
+    api
+      .getPublicConfig()
+      .then((c) => {
+        if (!cancelled) setPublicCfg(c);
+      })
+      .catch(() => {
+        /* 拿不到 config：publicCfg 维持 null → AuthGate fail-closed（bypass 未知，禁用登录，
+         * 绝不发占位 token）。生产（bypass 关闭）下 config 拉取失败时不会用假 token 蒙混登录。 */
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [demo, authed, view]);
 
   // 进入工作区后拉取模型列表（公开端点；登录态带 Bearer 走 grants 视图）。失败不阻断
   // 对话前置——选择器降级为「暂无可用模型」，对话仍可在订阅就绪后进行。
@@ -339,8 +451,31 @@ export function App() {
     enabled: inWorkspace && !demo,
     defaultAgentId: "main",
     refreshBalance: refreshMe,
+    // 持久按 user 命名空间（隐私隔离）；onHydrated 把 IndexedDB 本地会话填进侧栏。
+    userId: demo ? null : (user?.id ?? null),
+    onHydrated,
   });
-  sockRef.current = chat; // 回填稳定句柄（供上方 send/regenerate 引用）。
+  sockRef.current = chat; // 回填稳定句柄（供上方 send/regenerate/历史方法引用）。
+
+  // 历史会话列表：登录后用 listSessions 填侧栏（server canonical 元数据 server-wins）。
+  // 失败保留本地（IndexedDB 注水）会话，不阻断。
+  useEffect(() => {
+    if (demo || !auth || !user) return;
+    let cancelled = false;
+    api
+      .listSessions(authRef.current)
+      .then((metas) => {
+        if (cancelled) return;
+        const server = metas.map((m) => metaToSession(m, user.id));
+        setSessions((cur) => upsertSessions(cur, server, true));
+      })
+      .catch(() => {
+        /* 列表失败：保留本地会话，不打断工作区 */
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [demo, auth, user]);
   // 非 demo：展示的消息来自 WS service 快照（就地 mutation + version 触发重渲）。
   const wsMessages = !demo && activeId ? chat.getMessages(activeId) : EMPTY_WS_MESSAGES;
   const wsSending = !demo && chat.isSending(activeId);
@@ -441,6 +576,8 @@ export function App() {
         onBack={() => setView("home")}
         theme={theme}
         onCycleTheme={cycle}
+        turnstileBypass={publicCfg?.turnstileBypass}
+        turnstileSiteKey={publicCfg?.turnstileSiteKey}
       />
     );
   }
@@ -461,7 +598,13 @@ export function App() {
   const deleteSessionConfirm = (s: Session) => {
     if (!confirm("删除该会话？")) return;
     localStore.current.delete(s.id);
-    if (!demo) chat.removeSession(s.id);
+    historyFetchedRef.current.delete(s.id);
+    if (!demo) {
+      chat.removeSession(s.id);
+      chat.removePersisted(s.id); // 清 IndexedDB 本地副本
+      // 服务端删除（幂等，best-effort）：否则 reload 后会从 listSessions 复活。
+      void api.deleteSession(authRef.current, s.id).catch(() => {});
+    }
     setSessions((c) => c.filter((x) => x.id !== s.id));
     if (s.id === activeId) {
       setActiveId(undefined);

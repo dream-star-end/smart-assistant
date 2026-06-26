@@ -63,6 +63,12 @@ export type FrameEffects = {
   reportTurnError?: (p: { code: string; message: string; traceId?: string; sessionId?: string }) => void;
   /** resume_failed / reconcile：游标已推进 + 标 _liveStreamBroken 后，强制 REST 全量 sync。*/
   forceSync?: (sessId: string) => void;
+  /**
+   * 立即把会话快照落 IndexedDB（断点续传游标 durable）。resume_failed 推进游标后必须
+   * 同步落地：否则 reload 后 hello 仍发旧游标 → server 反复 resume 失败 → reload 死循环。
+   * turn 收尾（isFinal）也落一次保证 reload 不丢已完成轮。
+   */
+  persistSession?: (sessId: string) => void;
   /** 1008 前的 auth-control error：交给 close handler 续期，不渲染。*/
   onAuthControlError?: () => void;
 };
@@ -888,6 +894,7 @@ export function applyResumeFailed(sess: ChatSession, frame: OutboundResumeFailed
   const frameTo = typeof frame.to === "number" ? frame.to : 0;
   advanceFrameSeqCursorTo(sess, frame, frameTo); // 推游标到 server currentLast（防 reload 死循环，配 dbPut）
   sess._liveStreamBroken = true;
+  effects.persistSession?.(sess.id); // 立即落地推进后的游标（dbPut 写点；防 reload 死循环）
   effects.forceSync?.(sess.id);
 }
 

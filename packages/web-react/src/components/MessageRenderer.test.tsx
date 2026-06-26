@@ -37,9 +37,13 @@ function renderMsg(
 }
 
 describe("MessageRenderer 角色分派 + 非工具卡", () => {
-  test("assistant：渲染 markdown 正文", () => {
+  test("assistant：渲染 markdown 正文（懒加载 chunk 解析后富文本生效）", async () => {
     renderMsg(mk("assistant", { text: "你好**世界**" }));
-    expect(screen.getByText(/世界/)).toBeInTheDocument();
+    // Markdown 经 React.lazy 异步加载：占位期渲染纯文本整段「你好**世界**」。
+    // 用精确匹配「世界」跳过占位（占位无独立「世界」节点），等到真正的富文本解析完成，
+    // 届时 **世界** 被渲染为 <strong>世界</strong> —— 既验证内容到位，又验证懒加载边界确实落地。
+    const strong = await screen.findByText("世界");
+    expect(strong.tagName).toBe("STRONG");
   });
 
   test("assistant：余额不足错误卡含「去充值」CTA，点击触发 onTopUp", () => {

@@ -188,6 +188,8 @@ export type ChatSession = {
   // ── frameSeq 去重游标（§3）──
   _lastFrameSeqByKey?: Record<string, number>;
   _lastFrameSeq?: number;
+  /** server canonical 增量游标（历史加载 getSession 的 sinceSeq；随 StoredSession 落地）。*/
+  _maxSeq?: number;
 
   // ── turn 流式指针（就地 mutation 目标）──
   _streamingAssistant?: ChatMessage | null;
