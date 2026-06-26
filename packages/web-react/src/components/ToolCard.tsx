@@ -51,7 +51,9 @@ export function ToolCard({ message }: { message: ToolLike }) {
   return (
     <div
       className={cn(
-        "my-2.5 overflow-hidden rounded-lg border bg-surface",
+        // 不带外边距——间距交由容器（MessageList 的 gap / AgentGroupCard 的 space-y）统一控制，
+        // 避免 margin 与父级 gap 叠加导致卡片间距过大（boss 反馈"卡片间距好大"的根因之一）。
+        "overflow-hidden rounded-lg border bg-surface",
         isRunning ? "border-accent-soft" : "border-border",
       )}
     >

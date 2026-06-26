@@ -127,9 +127,12 @@ describe("ToolCard 二级分派 + 状态 (P5)", () => {
       />,
     );
     expect(screen.getByText("终端")).toBeInTheDocument();
+    // 命令在表头摘要（唯一精确匹配的元素）
+    expect(screen.getByText("pwd")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button"));
-    // 命令两处（摘要 + 终端行），输出仅展开体一处
-    expect(screen.getAllByText("pwd")).toHaveLength(2);
-    expect(screen.getByText("/home")).toBeInTheDocument();
+    // 展开体为**单一终端块**（$ 命令 + 输出合一，不再命令一框/输出一框的嵌套方框）
+    const pre = document.querySelector("pre");
+    expect(pre?.textContent).toContain("$ pwd");
+    expect(pre?.textContent).toContain("/home");
   });
 });

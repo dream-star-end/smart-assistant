@@ -56,8 +56,11 @@ export function TopupDialog({
   }, [open, stopPoll]);
 
   // 打开 plans 段时拉套餐（带 token → 首充档按是否用过过滤）。
+  // 注意：依赖数组**绝不能含 loadingPlans**——effect 自身 setLoadingPlans(true) 会改它，
+  // 触发 cleanup(alive=false) 再重跑，导致 fetch 回来时 alive 已 false、setPlans/finally 全被跳过
+  // → 永久转圈。只在 open/stage/auth/plans 变时触发；plans!=null 守卫挡住成功后的回跑。
   useEffect(() => {
-    if (!open || stage.kind !== "plans" || plans != null || loadingPlans) return;
+    if (!open || stage.kind !== "plans" || plans != null) return;
     let alive = true;
     setLoadingPlans(true);
     setErr(null);
@@ -75,7 +78,7 @@ export function TopupDialog({
     return () => {
       alive = false;
     };
-  }, [open, stage.kind, plans, loadingPlans, auth]);
+  }, [open, stage.kind, plans, auth]);
 
   // 卸载时兜底清轮询。
   useEffect(() => () => stopPoll(), [stopPoll]);

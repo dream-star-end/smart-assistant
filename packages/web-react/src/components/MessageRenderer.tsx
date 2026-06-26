@@ -97,7 +97,7 @@ export function MessageList({
     last.role !== "permission";
 
   return (
-    <div className="mx-auto flex max-w-3xl flex-col gap-7 px-5 py-8">
+    <div className="mx-auto flex max-w-3xl flex-col gap-4 px-5 py-8">
       {start > 0 && (
         <button
           type="button"

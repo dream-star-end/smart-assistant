@@ -14,10 +14,12 @@ import {
   RotateCcw,
   Sparkles,
   MessageSquare,
+  Square,
   Type,
+  Volume2,
   Wallet,
 } from "lucide-react";
-import { memo, useState } from "react";
+import { memo, useEffect, useState } from "react";
 import type { ChatMessage } from "../../lib/chat/model";
 import {
   CONTINUE_PROMPT,
@@ -134,7 +136,48 @@ function MetaRow({ msg }: { msg: ChatMessage }) {
   );
 }
 
-// ─── 动作条（copy 富/纯 + 重新生成 + 反馈） ─────────────────────────────
+// ─── 朗读（浏览器原生 SpeechSynthesis，无后端 TTS 依赖；不支持的浏览器整按钮隐藏） ───
+function SpeakButton({ getText }: { getText: () => string }) {
+  const [speaking, setSpeaking] = useState(false);
+  const supported = typeof window !== "undefined" && "speechSynthesis" in window;
+  // 卸载时停掉本条朗读，避免离开后还在念。
+  useEffect(() => {
+    return () => {
+      if (supported && speaking) window.speechSynthesis.cancel();
+    };
+  }, [supported, speaking]);
+  if (!supported) return null;
+  const toggle = () => {
+    const synth = window.speechSynthesis;
+    if (speaking) {
+      synth.cancel();
+      setSpeaking(false);
+      return;
+    }
+    const text = getText().slice(0, 4000).trim();
+    if (!text) return;
+    synth.cancel(); // 停掉其它正在念的消息（全局单例）
+    const u = new SpeechSynthesisUtterance(text);
+    u.lang = "zh-CN";
+    u.onend = () => setSpeaking(false);
+    u.onerror = () => setSpeaking(false);
+    setSpeaking(true);
+    synth.speak(u);
+  };
+  return (
+    <IconButton
+      aria-label={speaking ? "停止朗读" : "朗读"}
+      title={speaking ? "停止朗读" : "朗读"}
+      size="sm"
+      shape="square"
+      onClick={toggle}
+    >
+      {speaking ? <Square size={14} className="fill-current" /> : <Volume2 size={15} />}
+    </IconButton>
+  );
+}
+
+// ─── 动作条（copy 富/纯 + 朗读 + 重新生成 + 反馈） ─────────────────────────────
 function MessageActions({
   msg,
   cb,
@@ -152,6 +195,7 @@ function MessageActions({
         label="复制纯文本"
         icon={<Type size={15} />}
       />
+      <SpeakButton getText={() => stripMarkdown(msg.text || "")} />
       {showRegen && cb.onRegenerate && (
         <IconButton aria-label="重新生成" title="重新生成" size="sm" shape="square" onClick={cb.onRegenerate}>
           <RotateCcw size={15} />

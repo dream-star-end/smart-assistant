@@ -68,8 +68,11 @@ export function SettingsCenter({
   }, [open]);
 
   // 偏好分区懒加载 prefs。
+  // 注意：依赖数组**绝不能含 prefsLoading**——effect 自身 setPrefsLoading(true) 会改它，
+  // 触发 cleanup(alive=false) 再重跑，使 fetch 回来时 alive 已 false、setPrefs/finally 被跳过
+  // → 永久"加载偏好…"转圈（后端其实 200）。prefs!=null 守卫挡住成功后的回跑。
   useEffect(() => {
-    if (!open || demo || !auth || section !== "preferences" || prefs != null || prefsLoading) {
+    if (!open || demo || !auth || section !== "preferences" || prefs != null) {
       return;
     }
     let alive = true;
@@ -89,7 +92,7 @@ export function SettingsCenter({
     return () => {
       alive = false;
     };
-  }, [open, demo, auth, section, prefs, prefsLoading]);
+  }, [open, demo, auth, section, prefs]);
 
   const patchPref = useCallback(
     async (patch: Record<string, unknown>) => {

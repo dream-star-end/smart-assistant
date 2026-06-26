@@ -686,7 +686,7 @@ export function App() {
           ) : showEmpty ? (
             <EmptyState agent={agent} onPick={send} onChangeAgent={() => setPickerOpen(true)} />
           ) : demo ? (
-            <div className="mx-auto flex max-w-3xl flex-col gap-7 px-5 py-8">
+            <div className="mx-auto flex max-w-3xl flex-col gap-4 px-5 py-8">
               {messages.map((m, i) =>
                 m.role === "user" ? (
                   <UserMessage key={m.id} content={m.content} />

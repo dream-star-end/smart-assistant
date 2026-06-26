@@ -17,12 +17,16 @@ type BodyProps = { input: Input; tool: ToolLike };
 
 // ── 共用原语 ──────────────────────────────────────────────────────────────
 
-/** 等宽预格式化块（终端输出 / 文件内容 / 代码）。 */
+/**
+ * 等宽预格式化块（终端输出 / 文件内容 / 代码）。
+ * 无边框——卡壳本身（ToolCard 的 border-t 体区）已是容器，再加边框会变"框中框"（设计 `.out` 即无边框）。
+ * 仅用 bg-code 这层极淡表面做区隔。
+ */
 function Pre({ children, className }: { children: ReactNode; className?: string }) {
   return (
     <pre
       className={cn(
-        "mt-1.5 max-h-80 overflow-auto whitespace-pre-wrap break-words rounded-md border border-border bg-code px-3 py-2 font-mono text-xs leading-relaxed text-fg",
+        "mt-1.5 max-h-80 overflow-auto whitespace-pre-wrap break-words rounded-md bg-code px-3 py-2 font-mono text-xs leading-relaxed text-fg",
         className,
       )}
     >
@@ -128,30 +132,33 @@ function BashBody({ input, tool }: BodyProps) {
     (out.startsWith("Command running in background with ID:") ||
       out.startsWith("Command was manually backgrounded by user with ID:") ||
       out.includes("was moved to the background with ID:"));
-  let outputNode: ReactNode = null;
+  // 单个"终端块"：$ 命令 + 输出合一渲染在同一个 Pre 内（消除"命令一框 + 输出一框"的嵌套方框感）。
+  let outText: string | null = null;
+  let headTruncated = false;
+  let totalBytes = 0;
   if (out && !isBgPlaceholder) {
-    outputNode = <Pre>{out}</Pre>;
+    outText = out;
   } else if (tool.bashTail && typeof tool.bashTail.tail === "string") {
-    outputNode = (
-      <>
-        {tool.bashTail.truncatedHead && (
-          <FileMeta>… (head 已截断, 共 {tool.bashTail.totalBytes ?? 0} 字节)</FileMeta>
-        )}
-        <Pre className="border-accent-soft">{tool.bashTail.tail}</Pre>
-      </>
-    );
+    outText = tool.bashTail.tail;
+    headTruncated = !!tool.bashTail.truncatedHead;
+    totalBytes = tool.bashTail.totalBytes ?? 0;
   } else if (out) {
-    outputNode = <Pre>{out}</Pre>;
+    outText = out;
   }
+  if (!command && !outText) return null;
   return (
     <>
-      {command && (
-        <div className="mt-1.5 overflow-x-auto rounded-md border border-border bg-code px-3 py-2 font-mono text-xs">
-          <span className="text-faint">$ </span>
-          <span className="whitespace-pre-wrap break-words text-fg">{command}</span>
-        </div>
-      )}
-      {outputNode}
+      {headTruncated && <FileMeta>… (head 已截断, 共 {totalBytes} 字节)</FileMeta>}
+      <Pre>
+        {command && (
+          <>
+            <span className="text-success">$ </span>
+            {command}
+            {outText ? "\n" : ""}
+          </>
+        )}
+        {outText}
+      </Pre>
     </>
   );
 }
