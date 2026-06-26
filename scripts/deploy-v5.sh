@@ -114,11 +114,14 @@ smoke() {
   done
   echo "  /healthz: $hz"
   [[ -z "$hz" ]] && { echo "✗ v5 /healthz 无响应(10 次重试后)" >&2; return 1; }
-  # 断言 channel=v5、控制面静默(schedulers=[])、容器/agent 运行时 disabled
+  # 断言 channel=v5、控制面静默(schedulers=[])、legacy agentRuntime disabled。
+  # 注:P1+ 后 v5 跑真实 on-demand 容器(v3supervisor),containerRuntime=enabled 为正确态
+  #     (P0 时代曾断言 disabled,空壳阶段已过)。真正的隔离不变量是 schedulers=[](控制面
+  #     静默,follower)+ agentRuntime=disabled(不起 legacy agent 运行时)。
   echo "$hz" | grep -q '"channel":"v5"' || { echo "✗ channel != v5" >&2; return 1; }
   echo "$hz" | grep -q '"schedulers":\[\]' || { echo "✗ schedulers 非空(控制面未静默!)" >&2; return 1; }
-  echo "$hz" | grep -q '"containerRuntime":"disabled"' || { echo "✗ containerRuntime 非 disabled" >&2; return 1; }
-  echo "$hz" | grep -q '"agentRuntime":"disabled"' || { echo "✗ agentRuntime 非 disabled" >&2; return 1; }
+  echo "$hz" | grep -q '"controlPlaneEnabled":false' || { echo "✗ controlPlaneEnabled 非 false" >&2; return 1; }
+  echo "$hz" | grep -q '"agentRuntime":"disabled"' || { echo "✗ agentRuntime 非 disabled(不应起 legacy agent 运行时)" >&2; return 1; }
   local ver; ver="$(ssh "$KL_HOST" "curl -fsS http://127.0.0.1:${V5_PORT}/version" 2>/dev/null || true)"
   echo "  /version: $ver"
   # 现网 v3 零影响断言:v3:18789 仍健康
