@@ -1,4 +1,4 @@
-import { LogOut, PanelLeftClose, Pencil, Plus, Search, Sparkles, Trash2 } from "lucide-react";
+import { LayoutGrid, LogOut, PanelLeftClose, Pencil, Plus, Search, Sparkles, Trash2 } from "lucide-react";
 import { useMemo, useState } from "react";
 import { BRAND } from "../lib/brand";
 import type { Session, User } from "../lib/types";
@@ -17,6 +17,7 @@ export function Sidebar({
   onCollapse,
   onLogout,
   onOpenAccount,
+  onOpenManage,
 }: {
   sessions: Session[];
   activeId?: string;
@@ -30,6 +31,8 @@ export function Sidebar({
   onCollapse?: () => void;
   onLogout?: () => void;
   onOpenAccount?: () => void;
+  /** 打开管理中心（记忆/定时任务/技能）。省略则不渲染入口（demo）。 */
+  onOpenManage?: () => void;
 }) {
   const [q, setQ] = useState("");
 
@@ -78,6 +81,17 @@ export function Sidebar({
             className="w-full bg-transparent text-[13.5px] text-fg outline-none placeholder:text-faint"
           />
         </div>
+
+        {onOpenManage && (
+          <button
+            onClick={onOpenManage}
+            className="flex items-center gap-2.5 rounded-lg px-3 py-2 text-left text-[13.5px] font-medium text-muted outline-none transition-colors hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
+          >
+            <LayoutGrid size={16} className="text-faint" />
+            管理中心
+            <span className="ml-auto text-[11px] text-faint">记忆 · 定时 · 技能</span>
+          </button>
+        )}
       </div>
 
       <div className="no-scrollbar flex-1 overflow-y-auto px-2 pb-3">

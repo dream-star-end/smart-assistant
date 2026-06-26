@@ -5,6 +5,10 @@ import type {
   ApiKeySummary,
   AuthSession,
   CreatedApiKey,
+  CronCreateInput,
+  CronJob,
+  SkillDetail,
+  SkillSummary,
   HupiCreateResult,
   LoginResult,
   MediaSignResult,
@@ -900,6 +904,114 @@ export const api = {
       createdAt: b.data.created_at,
       provider: b.data.provider,
     })),
+
+  // ── 容器内管理（记忆 / 定时任务 / 技能；经 commercial router 自动代理进用户容器） ──
+  //
+  // 这些 host 级路径对商业用户本会 403 BLOCKED，但命中 bridgeApiAllowlist 的
+  // proxyFromCommercial 条目后由 router 注入 bridge nonce 转发到用户容器内 gateway
+  // (127.0.0.1:18789，按 userId 隔离)。前端只需普通 Bearer fetch，无需特殊 header。
+  // 容器未就绪时 router 会先 ensureContainerReady（可能冷启 ~40s），失败返 503/4503。
+
+  /** 取某 agent 的记忆文档（GET /api/agents/:id/memory/:target，target=memory|user）。 */
+  getMemory: (a: AuthSession, agentId: string, target: "memory" | "user") =>
+    jsonOrThrow<{ text: string; charCount?: number; target: string }>(
+      callWithRefresh(a, (t) =>
+        fetch(`/api/agents/${encodeURIComponent(agentId)}/memory/${target}`, {
+          credentials: "include",
+          headers: bearerHeaders(t),
+        }),
+      ),
+    ),
+
+  /** 写某 agent 的记忆文档（PUT /api/agents/:id/memory/:target）。 */
+  putMemory: (a: AuthSession, agentId: string, target: "memory" | "user", text: string) =>
+    jsonOrThrow<{ ok: boolean; charCount?: number }>(
+      callWithRefresh(a, (t) =>
+        fetch(`/api/agents/${encodeURIComponent(agentId)}/memory/${target}`, {
+          method: "PUT",
+          credentials: "include",
+          headers: bearerHeaders(t, true),
+          body: JSON.stringify({ text }),
+        }),
+      ),
+    ),
+
+  /** 定时任务列表（GET /api/cron）。 */
+  listCron: (a: AuthSession) =>
+    jsonOrThrow<{ jobs: CronJob[] }>(
+      callWithRefresh(a, (t) =>
+        fetch("/api/cron", { credentials: "include", headers: bearerHeaders(t) }),
+      ),
+    ).then((b) => b.jobs || []),
+
+  /** 新建定时任务（POST /api/cron）。 */
+  createCron: (a: AuthSession, body: CronCreateInput) =>
+    jsonOrThrow<{ ok: boolean; job?: CronJob }>(
+      callWithRefresh(a, (t) =>
+        fetch("/api/cron", {
+          method: "POST",
+          credentials: "include",
+          headers: bearerHeaders(t, true),
+          body: JSON.stringify(body),
+        }),
+      ),
+    ),
+
+  /** 改定时任务（PUT /api/cron/:id，如 {enabled}）。 */
+  updateCron: (a: AuthSession, id: string, patch: Record<string, unknown>) =>
+    jsonOrThrow<{ ok: boolean }>(
+      callWithRefresh(a, (t) =>
+        fetch(`/api/cron/${encodeURIComponent(id)}`, {
+          method: "PUT",
+          credentials: "include",
+          headers: bearerHeaders(t, true),
+          body: JSON.stringify(patch),
+        }),
+      ),
+    ),
+
+  /** 删除定时任务（DELETE /api/cron/:id）。 */
+  deleteCron: (a: AuthSession, id: string) =>
+    jsonOrThrow<{ ok: boolean }>(
+      callWithRefresh(a, (t) =>
+        fetch(`/api/cron/${encodeURIComponent(id)}`, {
+          method: "DELETE",
+          credentials: "include",
+          headers: bearerHeaders(t),
+        }),
+      ),
+    ),
+
+  /** 技能列表（GET /api/skills）。 */
+  listSkills: (a: AuthSession) =>
+    jsonOrThrow<{ skills: SkillSummary[] }>(
+      callWithRefresh(a, (t) =>
+        fetch("/api/skills", { credentials: "include", headers: bearerHeaders(t) }),
+      ),
+    ).then((b) => b.skills || []),
+
+  /** 技能详情（GET /api/skills/:name）。 */
+  getSkill: (a: AuthSession, name: string) =>
+    jsonOrThrow<{ skill: SkillDetail }>(
+      callWithRefresh(a, (t) =>
+        fetch(`/api/skills/${encodeURIComponent(name)}`, {
+          credentials: "include",
+          headers: bearerHeaders(t),
+        }),
+      ),
+    ).then((b) => b.skill),
+
+  /** 删除技能（DELETE /api/skills/:name）。 */
+  deleteSkill: (a: AuthSession, name: string) =>
+    jsonOrThrow<{ ok: boolean }>(
+      callWithRefresh(a, (t) =>
+        fetch(`/api/skills/${encodeURIComponent(name)}`, {
+          method: "DELETE",
+          credentials: "include",
+          headers: bearerHeaders(t),
+        }),
+      ),
+    ),
 
   // ── 对话传输（P4 已接入：WS user-chat-bridge） ────────────────────────
   //

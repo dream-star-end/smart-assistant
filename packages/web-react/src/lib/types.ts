@@ -415,3 +415,44 @@ export type MediaSignResult = {
   urls: Record<string, string>;
   expMs: number;
 };
+
+// ─── 容器内管理（记忆 / 定时任务 / 技能；经 commercial router 代理进用户容器） ──
+
+/** 定时任务（GET /api/cron 的 jobs 项；字段宽松，按容器 gateway 实际返回。 */
+export type CronJob = {
+  id: string;
+  schedule?: string;
+  agent?: string;
+  prompt?: string;
+  deliver?: string;
+  enabled?: boolean;
+  oneshot?: boolean;
+  label?: string;
+  nextRunAt?: string | number | null;
+  lastRunAt?: string | number | null;
+  heartbeat?: boolean;
+};
+
+/** 新建定时任务入参（POST /api/cron）。 */
+export type CronCreateInput = {
+  schedule: string;
+  prompt: string;
+  deliver?: string;
+  oneshot?: boolean;
+  label?: string;
+  agent?: string;
+};
+
+/** 技能列表项（GET /api/skills 的 skills 项）。 */
+export type SkillSummary = {
+  name: string;
+  description?: string;
+  tags?: string[];
+  source?: string;
+  writable?: boolean;
+};
+
+/** 技能详情（GET /api/skills/:name 的 skill）。 */
+export type SkillDetail = SkillSummary & {
+  body?: string;
+};

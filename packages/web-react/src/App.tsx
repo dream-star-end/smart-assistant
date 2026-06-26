@@ -7,10 +7,12 @@ import { Composer } from "./components/Composer";
 import { EmptyState } from "./components/EmptyState";
 import { type ChatError, ErrorBanner } from "./components/ErrorBanner";
 import { Landing } from "./components/Landing";
+import { ManageCenter, type ManageTab } from "./components/ManageCenter";
 import { AssistantMessage, UserMessage } from "./components/Message";
 import { MessageList } from "./components/MessageRenderer";
 import type { CardCallbacks } from "./components/chat/cards";
 import { MediaSignProvider } from "./components/chat/media";
+import { ToolCardActionsContext } from "./components/tool/context";
 import { modelLabel } from "./components/ModelSelector";
 import { SettingsCenter } from "./components/SettingsCenter";
 import { Sidebar } from "./components/Sidebar";
@@ -127,6 +129,8 @@ export function App() {
   const [modelsLoading, setModelsLoading] = useState(false);
   const [chatError, setChatError] = useState<ChatError | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [manageOpen, setManageOpen] = useState(false);
+  const [manageTab, setManageTab] = useState<ManageTab>("memory");
   const scrollRef = useRef<HTMLDivElement>(null);
   const stopRef = useRef(false);
   // 稳定句柄：让早于 useChatSocket 声明的 send/regenerate 回调引用 WS 引擎，避免
@@ -408,6 +412,12 @@ export function App() {
     setSettingsOpen(true);
   }, [refreshMe]);
 
+  // 打开管理中心到指定分区（侧栏入口 + 工具卡「打开记忆/技能/定时」按钮统一走此）。
+  const openManage = useCallback((tab: ManageTab) => {
+    setManageTab(tab);
+    setManageOpen(true);
+  }, []);
+
   // 键盘快捷键：⌘/Ctrl+K 新会话；Esc 停止当前（demo）流式。仅在进入工作区后生效。
   const inWorkspace = demo || (view === "app" && !!auth && !!user);
 
@@ -542,6 +552,20 @@ export function App() {
     },
     [activeId],
   );
+  // 工具卡上下文动作（记忆/技能/定时任务卡上的「打开…」按钮）。稳定引用经 context 注入，
+  // 不污染 ToolCard 数据契约。demo 无网络 → 不提供（按钮自动隐藏）。
+  const toolActions = useMemo(
+    () =>
+      demo
+        ? {}
+        : {
+            onOpenMemory: () => openManage("memory"),
+            onOpenSkills: () => openManage("skills"),
+            onOpenTasks: () => openManage("cron"),
+          },
+    [demo, openManage],
+  );
+
   // 卡片回调集（稳定引用：作为 MessageRenderer memo 比较键之一，避免无谓重渲）。
   const cardCallbacks: CardCallbacks = useMemo(
     () => ({
@@ -638,10 +662,12 @@ export function App() {
     onRename: renameSessionPrompt,
     onDelete: deleteSessionConfirm,
     onLogout: demo ? undefined : logout,
+    onOpenManage: demo ? undefined : () => openManage("memory"),
   };
 
   return (
     <MediaSignProvider sign={demo ? null : signMedia} authKey={user?.id ?? "anon"}>
+    <ToolCardActionsContext.Provider value={toolActions}>
     <div className="flex h-screen overflow-hidden bg-bg text-fg">
       {/* 桌面：内联侧栏（可折叠）。窄屏隐藏，改用抽屉。 */}
       {!collapsed && (
@@ -799,7 +825,17 @@ export function App() {
         onSetTheme={setTheme}
         onRefreshMe={refreshMe}
       />
+
+      <ManageCenter
+        open={manageOpen}
+        tab={manageTab}
+        auth={auth}
+        agentId={agent.id}
+        onTabChange={setManageTab}
+        onClose={() => setManageOpen(false)}
+      />
     </div>
+    </ToolCardActionsContext.Provider>
     </MediaSignProvider>
   );
 }
