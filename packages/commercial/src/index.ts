@@ -331,12 +331,34 @@ function shouldAutoMigrate(
   return true;
 }
 
+/**
+ * v5 灰度运行时状态 — 由 commercial 自身计算(它拥有控制面/运行时的事实),
+ * 经 RegisterCommercialResult 暴露给 gateway,gateway 仅在 /healthz 透传序列化。
+ * 用作"控制面是否静默 / 容器·agent 运行时是否启用 / 灰度归属(channel)"的只读断言面。
+ */
+export interface CommercialRuntimeStatus {
+  /** 运行时 channel 单一权威(OC_RUNTIME_CHANNEL),默认 "v3"。 */
+  channel: string;
+  /** 后台控制面 mutator 是否启用(v5 follower 恒为 false)。 */
+  controlPlaneEnabled: boolean;
+  /** 启动是否执行了共享 PG migration(COMMERCIAL_AUTO_MIGRATE)。 */
+  autoMigrate: boolean;
+  /** legacy agent 运行时(AGENT_IMAGE/docker)状态。 */
+  agentRuntime: "enabled" | "disabled";
+  /** v3 supervisor 容器运行时(OC_RUNTIME_IMAGE)状态。 */
+  containerRuntime: "enabled" | "disabled";
+  /** 当前存活的后台 scheduler/actor 名单(v5 follower 必须为空)。 */
+  schedulers: string[];
+}
+
 export interface RegisterCommercialResult {
   /**
    * HTTP 处理器:gateway 在自身 handleHttp 入口前调用,
    * 返回 true 表示已处理完毕,gateway 不再继续路由。
    */
   handle: CommercialHandler;
+  /** v5 灰度运行时状态(见 CommercialRuntimeStatus)。 */
+  runtimeStatus?: CommercialRuntimeStatus;
   /**
    * WebSocket upgrade 处理器:gateway 在 HTTP server 的 `upgrade` 事件里调用。
    * 返回 true → commercial 已处理(可能是鉴权失败 + destroy,也可能是成功 upgrade);
@@ -684,7 +706,42 @@ export async function registerCommercial(
 
   const cfg = loadConfig();
 
-  if (shouldAutoMigrate()) {
+  // v5 灰度 — 运行时 channel 单一权威。OC_RUNTIME_CHANNEL 默认 "v3"(现网零行为变化)。
+  // v5=follower:控制面(后台 mutator,会写共享 PG/账号池/订单/发邮件)必须静默,
+  // 直到 P1 控制面权威收敛 + leader 选举再按需放开。controlPlaneEnabled 作为单一闸门
+  // 直接 AND 进每个后台 mutator 的启动条件 —— 根除"漏关某个 *_DISABLED 即污染共享现网"
+  // 的整类风险(个别 *_DISABLED 仍保留为 v3 细粒度运维开关)。
+  const runtimeChannel = process.env.OC_RUNTIME_CHANNEL?.trim() || "v3";
+  // channel=v5 是控制面的【绝对权威】:恒静默,无任何 env 可翻盘 —— 防 P0 期误设
+  // COMMERCIAL_CONTROL_PLANE_ENABLED=1 等重开"v5 启动期写共享 PG/账号池/订单"的洞(Codex 评审)。
+  // P1 给 v5 放开部分控制面将走 leader 选举,而非粗暴 env override。
+  // v3(及其它非 v5 channel):默认开,COMMERCIAL_CONTROL_PLANE_DISABLED=1 为应急 kill-switch。
+  const controlPlaneEnabled =
+    runtimeChannel === "v5" ? false : process.env.COMMERCIAL_CONTROL_PLANE_DISABLED !== "1";
+
+  // v5 follower(P0)硬约束 —— fail-closed,早于一切共享-state 副作用(auto-migrate /
+  // compute-pool / baseline / image-promote / wechat broker / 容器 lifecycle 都在下面)。
+  // 关键认知(Codex 评审):"v5 不设某 env" 是配置、不是安全边界。容器/agent 运行时与
+  // 微信 broker 一旦被误设的 env 触发,会 fire-and-forget 写共享 compute-pool / wechat_outbox /
+  // session / 账号池 —— 必须在代码层、副作用之前硬拦,而不是指望 env 配对。
+  if (runtimeChannel === "v5") {
+    const offenders: string[] = [];
+    if (process.env.OC_RUNTIME_IMAGE) offenders.push("OC_RUNTIME_IMAGE");
+    if (process.env.AGENT_IMAGE) offenders.push("AGENT_IMAGE");
+    if (process.env.WECHAT_BROKER_ENABLED === "1") offenders.push("WECHAT_BROKER_ENABLED=1");
+    if (offenders.length > 0) {
+      throw new Error(
+        `[commercial] v5 follower(P0)禁止容器/渠道副作用(它们会写共享现网),检测到危险 env=[${offenders.join(
+          ",",
+        )}],拒启。`,
+      );
+    }
+  }
+
+  // 共享 PG schema 迁移同样受控制面单一权威 gate:v5 follower 绝不迁移共享库
+  // (防漏配 COMMERCIAL_AUTO_MIGRATE=0 仍误改现网 schema)。一次计算,供下方 runtimeStatus 复用。
+  const autoMigrateEffective = controlPlaneEnabled && shouldAutoMigrate();
+  if (autoMigrateEffective) {
     // eslint-disable-next-line no-console
     console.log("[commercial] auto-migrate: running...");
     const r = await runMigrations({
@@ -697,7 +754,9 @@ export async function registerCommercial(
     );
   } else {
     // eslint-disable-next-line no-console
-    console.log("[commercial] auto-migrate disabled (COMMERCIAL_AUTO_MIGRATE=0)");
+    console.log(
+      `[commercial] auto-migrate disabled (controlPlaneEnabled=${controlPlaneEnabled} channel=${runtimeChannel})`,
+    );
   }
 
   const jwtSecret =
@@ -1748,7 +1807,7 @@ export async function registerCommercial(
     };
     // B3 — fanout 是 fire-and-forget,单容器 rebind 失败无重试且恢复 actor 看不到
     // disabled 账号的残留绑定 → 周期性兜底对账,复用同一强一致 rebind。
-    if (process.env.COMMERCIAL_CODEX_DRIFT_RECONCILER_DISABLED !== "1") {
+    if (controlPlaneEnabled && process.env.COMMERCIAL_CODEX_DRIFT_RECONCILER_DISABLED !== "1") {
       const raw = Number(process.env.COMMERCIAL_CODEX_DRIFT_RECONCILER_INTERVAL_MS);
       const intervalMs = Number.isFinite(raw) && raw >= 30_000 ? raw : 300_000;
       codexDriftReconciler = startCodexDisableDriftReconciler({ deps: fanoutDeps, intervalMs });
@@ -2409,7 +2468,9 @@ export async function registerCommercial(
   // 这样后续若加 ConfigService 热重载,把 callback 换成 ConfigService.get 即可,
   // 不动 broker.ts。
   let wechatBroker: WechatBroker | undefined;
-  if (cfg.WECHAT_BROKER_ENABLED && bridgeSecret) {
+  // controlPlaneEnabled 纳入:broker 启动 outbox worker/reconcile/housekeeping(写 wechat_outbox /
+  // soft-delete session / 发 iLink)属共享-state mutator,v5 follower 必须静默。
+  if (controlPlaneEnabled && cfg.WECHAT_BROKER_ENABLED && bridgeSecret) {
     // ─ 依赖装配(自下而上):transport → dispatcher → outboundReceiver →
     //   sendText → broker
     const wechatLog = rootLogger.child({ subsys: "wechatBrokerAssembly" });
@@ -2900,7 +2961,7 @@ export async function registerCommercial(
 
   // T-62 告警调度器 —— 默认 60s tick,不在启动时立刻跑(避免冷启动误报)
   let alertScheduler: AlertScheduler | undefined;
-  if (process.env.COMMERCIAL_ALERTS_DISABLED !== "1") {
+  if (controlPlaneEnabled && process.env.COMMERCIAL_ALERTS_DISABLED !== "1") {
     // 非法 / 空 / NaN → 60s;下限 1s(防 typo 写成 "50" ms 把 DB 打穿)
     const raw = Number(process.env.COMMERCIAL_ALERT_TICK_MS);
     const tickMs = Number.isFinite(raw) && raw >= 1000 ? raw : 60_000;
@@ -2913,7 +2974,7 @@ export async function registerCommercial(
   // M6/P1-9 — account_refresh_events 28 天 retention sweeper(24h interval,unref)。
   // boot 不立即跑,等 24h 后第一次 tick(不会冲启动 DB 负载)。
   let refreshEventsSweeper: RefreshEventsSweeperHandle | undefined;
-  if (process.env.COMMERCIAL_REFRESH_EVENTS_SWEEP_DISABLED !== "1") {
+  if (controlPlaneEnabled && process.env.COMMERCIAL_REFRESH_EVENTS_SWEEP_DISABLED !== "1") {
     refreshEventsSweeper = startRefreshEventsSweeper();
   }
 
@@ -2921,7 +2982,7 @@ export async function registerCommercial(
   // 扫 codex 账号 → 提前 15min refresh → 持锁逐容器写 per-container auth.json。
   // 永不写 master 文件 / legacy 共享 dir。详见 codexAccountActor.ts 头注。
   let codexRefreshActor: CodexRefreshActorHandle | undefined;
-  if (process.env.COMMERCIAL_CODEX_REFRESH_ACTOR_DISABLED !== "1") {
+  if (controlPlaneEnabled && process.env.COMMERCIAL_CODEX_REFRESH_ACTOR_DISABLED !== "1") {
     const codexContainerDir =
       process.env.OC_V3_CODEX_CONTAINER_DIR?.trim() || DEFAULT_V3_CODEX_CONTAINER_DIR;
     // v1.0.72 多机:把 v3Deps 上的 putRemoteCodexAuth helper(已含
@@ -2940,7 +3001,7 @@ export async function registerCommercial(
   // 默认 5min tick(下限 1s 防 typo)。
   // 关闭:`COMMERCIAL_COOLDOWN_RECOVERY_DISABLED=1`(测试 / 应急)。
   let cooldownRecoveryActor: CooldownRecoveryActorHandle | undefined;
-  if (process.env.COMMERCIAL_COOLDOWN_RECOVERY_DISABLED !== "1") {
+  if (controlPlaneEnabled && process.env.COMMERCIAL_COOLDOWN_RECOVERY_DISABLED !== "1") {
     const raw = Number(process.env.COMMERCIAL_COOLDOWN_RECOVERY_INTERVAL_MS);
     const intervalMs = Number.isFinite(raw) && raw >= 1000 ? raw : 5 * 60_000;
     cooldownRecoveryActor = startCooldownRecoveryActor({
@@ -2954,7 +3015,7 @@ export async function registerCommercial(
   // 的体验回归);过期清理由本 sweeper 负责,被推 expired 后 markOrderPaid 自然拒。
   // 非法 / 空 / NaN → 60s;下限 1s(防 typo 把 DB 打穿)
   let pendingOrdersExpirer: PendingOrdersExpirerHandle | undefined;
-  if (process.env.COMMERCIAL_PENDING_ORDERS_EXPIRER_DISABLED !== "1") {
+  if (controlPlaneEnabled && process.env.COMMERCIAL_PENDING_ORDERS_EXPIRER_DISABLED !== "1") {
     const raw = Number(process.env.COMMERCIAL_PENDING_ORDERS_EXPIRER_INTERVAL_MS);
     const intervalMs = Number.isFinite(raw) && raw >= 1000 ? raw : 60_000;
     pendingOrdersExpirer = startPendingOrdersExpirer({ intervalMs });
@@ -2964,7 +3025,7 @@ export async function registerCommercial(
   // release 路径丢失/未执行的孤儿 slot,防虚假 429。TTL 在 scheduler 内夹到
   // max(CODEX_SESSION_MAX_MS,30min) 下界,不抢 Codex bridge timer。纯进程内、无 DB。
   let accountSlotReaper: SlotReaperHandle | undefined;
-  if (process.env.COMMERCIAL_ACCOUNT_SLOT_REAPER_DISABLED !== "1") {
+  if (controlPlaneEnabled && process.env.COMMERCIAL_ACCOUNT_SLOT_REAPER_DISABLED !== "1") {
     const raw = Number(process.env.COMMERCIAL_ACCOUNT_SLOT_REAPER_INTERVAL_MS);
     const intervalMs = Number.isFinite(raw) && raw >= 1000 ? raw : 60_000;
     accountSlotReaper = startAccountSlotReaper({ scheduler, intervalMs });
@@ -2975,7 +3036,7 @@ export async function registerCommercial(
   // 并 GC 老终态行。stuck 阈值对 env 向上夹到 max(CODEX_SESSION_MAX_MS*3, 30min),
   // 因为 journal 不心跳、不能把存活长流误判成 stuck。
   let finalizeJournalReconciler: FinalizeJournalReconcilerHandle | undefined;
-  if (process.env.COMMERCIAL_FINALIZE_RECONCILER_DISABLED !== "1") {
+  if (controlPlaneEnabled && process.env.COMMERCIAL_FINALIZE_RECONCILER_DISABLED !== "1") {
     const rawInterval = Number(process.env.COMMERCIAL_FINALIZE_RECONCILER_INTERVAL_MS);
     const intervalMs =
       Number.isFinite(rawInterval) && rawInterval >= FINALIZE_RECONCILER_MIN_INTERVAL_MS
@@ -2992,7 +3053,7 @@ export async function registerCommercial(
   // Onboarding inbox scheduler — 由 system_settings.onboarding_enabled 决定是否真发,
   // 默认 false 上线即静默,boss 显式开启后才触达用户。详见 inbox/onboarding.ts。
   let onboardingScheduler: OnboardingSchedulerHandle | undefined;
-  if (process.env.COMMERCIAL_ONBOARDING_DISABLED !== "1") {
+  if (controlPlaneEnabled && process.env.COMMERCIAL_ONBOARDING_DISABLED !== "1") {
     const raw = Number(process.env.COMMERCIAL_ONBOARDING_INTERVAL_MS);
     const intervalMs = Number.isFinite(raw) && raw >= 5000 ? raw : 60_000;
     onboardingScheduler = startOnboardingScheduler({ intervalMs });
@@ -3004,7 +3065,7 @@ export async function registerCommercial(
   // 关闭:COMMERCIAL_INBOX_EMAIL_DISABLED=1.默认 30s tick / 50 条/batch / 600ms 间隔.
   // mailer 走 stub 也能跑(打 stdout),只有禁用 worker 时不跑.
   let inboxEmailScheduler: InboxEmailSchedulerHandle | undefined;
-  if (process.env.COMMERCIAL_INBOX_EMAIL_DISABLED !== "1") {
+  if (controlPlaneEnabled && process.env.COMMERCIAL_INBOX_EMAIL_DISABLED !== "1") {
     const raw = Number(process.env.COMMERCIAL_INBOX_EMAIL_INTERVAL_MS);
     const intervalMs = Number.isFinite(raw) && raw >= 5000 ? raw : 30_000;
     inboxEmailScheduler = startInboxEmailScheduler({
@@ -3013,8 +3074,55 @@ export async function registerCommercial(
     });
   }
 
+  // v5 灰度可观测 — runtimeStatus 暴露给 gateway /healthz,作为"控制面静默 / 运行时隔离 /
+  // 灰度归属"的只读断言面(P4 可观测前移)。
+  const enabledSchedulers: string[] = [];
+  if (lifecycleScheduler) enabledSchedulers.push("lifecycle");
+  if (idleSweepScheduler) enabledSchedulers.push("idleSweep");
+  if (volumeGcScheduler) enabledSchedulers.push("volumeGc");
+  if (orphanReconcileScheduler) enabledSchedulers.push("orphanReconcile");
+  if (migrationReconcileScheduler) enabledSchedulers.push("migrationReconcile");
+  if (healthPoller) enabledSchedulers.push("healthPoller");
+  if (containerEventsWorker) enabledSchedulers.push("containerEvents");
+  if (alertScheduler) enabledSchedulers.push("alert");
+  if (refreshEventsSweeper) enabledSchedulers.push("refreshEventsSweep");
+  if (codexRefreshActor) enabledSchedulers.push("codexRefresh");
+  if (cooldownRecoveryActor) enabledSchedulers.push("cooldownRecovery");
+  if (pendingOrdersExpirer) enabledSchedulers.push("pendingOrdersExpirer");
+  if (accountSlotReaper) enabledSchedulers.push("accountSlotReaper");
+  if (finalizeJournalReconciler) enabledSchedulers.push("finalizeReconciler");
+  if (codexDriftReconciler) enabledSchedulers.push("codexDriftReconciler");
+  if (onboardingScheduler) enabledSchedulers.push("onboarding");
+  if (inboxEmailScheduler) enabledSchedulers.push("inboxEmail");
+  if (wechatBroker) enabledSchedulers.push("wechatBroker");
+  // 注:compute-pool / image-promote / baseline / 容器 lifecycle 属"v3 runtime plane",
+  // v5 已在函数早期 fail-closed(检测 OC_RUNTIME_IMAGE/AGENT_IMAGE 即拒启)→ 不可能在 v5 启动,
+  // 故不会出现在 v5 的 enabledSchedulers。
+  const runtimeStatus: CommercialRuntimeStatus = {
+    channel: runtimeChannel,
+    controlPlaneEnabled,
+    autoMigrate: autoMigrateEffective,
+    agentRuntime: agentRuntime ? "enabled" : "disabled",
+    containerRuntime: v3Deps ? "enabled" : "disabled",
+    schedulers: enabledSchedulers,
+  };
+  // fail-closed:v5 follower 绝不允许任何控制面 scheduler 存活 —— 防 env 漏配让 v5
+  // 后台 mutator 写共享现网(订单/账号池/计费/邮件)。宁可 v5 拒启,也不污染现网。
+  if (runtimeChannel === "v5" && enabledSchedulers.length > 0) {
+    throw new Error(
+      `[commercial] v5 follower invariant violated: control-plane schedulers active=[${enabledSchedulers.join(
+        ",",
+      )}]. P0 要求 v5 控制面全静默。`,
+    );
+  }
+  rootLogger.info(
+    `commercial runtime status: channel=${runtimeChannel} controlPlane=${controlPlaneEnabled} agentRuntime=${runtimeStatus.agentRuntime} containerRuntime=${runtimeStatus.containerRuntime} schedulers=[${enabledSchedulers.join(",")}]`,
+    { subsys: "commercial", runtimeStatus },
+  );
+
   return {
     handle: handler,
+    runtimeStatus,
     handleWsUpgrade: (req, socket, head) => {
       // V3: 优先匹配 voice input,再 /ws/user-chat-bridge(2E),其次 /ws/agent(legacy)。
       if (voiceTranscribeHandler.handleUpgrade(req, socket, head)) return true;

@@ -404,6 +404,19 @@ export interface CommercialHook {
   shutdown: () => Promise<void>
   internalProxyAddress?: { host: string; port: number }
   /**
+   * v5 灰度运行时状态(commercial 自算,gateway 仅在 /healthz 只读透传)。
+   * 结构内联(gateway 对 commercial 零编译期依赖),与 commercial 的
+   * CommercialRuntimeStatus 保持一致。
+   */
+  runtimeStatus?: {
+    channel: string
+    controlPlaneEnabled: boolean
+    autoMigrate: boolean
+    agentRuntime: string
+    containerRuntime: string
+    schedulers: string[]
+  }
+  /**
    * 商业化模块的 JWT HMAC 密钥(HS256)。注入后,gateway 的 personal-version 路由
    * 会同时尝试用这个 secret 验证 access token,使商业化用户也能命中
    * /api/agents、/api/sessions/* 等 personal-version 端点。
@@ -1994,6 +2007,12 @@ export class Gateway {
         : { ok: true }
       body.containerId = OC_CONTAINER_ID || null
       body.capabilities = bridgeReady ? ['file-proxy-v1'] : []
+      // v5 灰度可观测 — channel 标签 + commercial 运行时状态(控制面静默 / 运行时隔离 /
+      // 灰度归属的只读断言面)。无标签默认 "v3";commercial 未注入 runtimeStatus 时省略。
+      body.channel = process.env.OC_RUNTIME_CHANNEL?.trim() || 'v3'
+      const instanceId = process.env.OC_INSTANCE_ID?.trim()
+      if (instanceId) body.instance = instanceId
+      if (c?.runtimeStatus) body.runtime = c.runtimeStatus
       res.writeHead(200, { 'Content-Type': 'application/json' })
       res.end(JSON.stringify(body))
       return

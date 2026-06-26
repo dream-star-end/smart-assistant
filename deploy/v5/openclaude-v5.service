@@ -1,0 +1,36 @@
+[Unit]
+# v5 Aurora 灰度实例 —— 与现网 openclaude.service(v3)完全隔离的第二 gateway 实例。
+# 同机(kl-mirror)、独立端口(18790)、独立 HOME(/root/.openclaude-v5)、独立源码树
+# (/opt/openclaude/openclaude-v5)、独立日志、独立 StateDirectory。共享 PG/Redis(身份/
+# 计费/账号池权威),但控制面静默(OC_RUNTIME_CHANNEL=v5 → 后台 mutator 全部不启)。
+Description=OpenClaude Gateway (v5 Aurora gray-scale)
+After=network.target postgresql.service redis-server.service openclaude.service
+Wants=postgresql.service redis-server.service
+
+[Service]
+Type=simple
+User=root
+# 独立源码树(由 scripts/deploy-v5.sh rsync;绝不与 v3 的 /opt/openclaude/openclaude 共用)
+WorkingDirectory=/opt/openclaude/openclaude-v5
+# 独立 env(由 scripts/deploy-v5.sh 从 v3 commercial.env 派生 + v5 覆盖键生成)
+EnvironmentFile=/etc/openclaude/commercial-v5.env
+Environment="PATH=/root/.bun/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+# 独立 HOME → 会话 SQLite / uploads / cron 全部隔离(聊天历史 v5 全新,符合已定方案 A)
+Environment="OPENCLAUDE_HOME=/root/.openclaude-v5"
+Environment="NODE_ENV=production"
+# 端口/bind 由 $OPENCLAUDE_HOME/openclaude.json 的 gateway.port=18790,bind=127.0.0.1 决定
+ExecStart=/usr/bin/npx tsx packages/cli/src/index.ts gateway
+Restart=on-failure
+RestartSec=5
+KillMode=control-group
+TimeoutStopSec=15
+SendSIGKILL=yes
+# 独立日志,便于按实例检索;绝不写 v3 的 /var/log/openclaude.log
+StandardOutput=append:/var/log/openclaude-v5.log
+StandardError=append:/var/log/openclaude-v5.log
+LimitNOFILE=65536
+StateDirectory=openclaude-v5
+StateDirectoryMode=0700
+
+[Install]
+WantedBy=multi-user.target
