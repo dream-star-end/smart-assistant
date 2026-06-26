@@ -64,15 +64,18 @@ export function ChatHeader({
       )}
       <button
         onClick={onAgentClick}
-        className="flex items-center gap-2 rounded-xl px-2.5 py-1.5 outline-none transition-colors hover:bg-hover focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg active:scale-[0.98]"
+        className="flex min-w-0 items-center gap-2 rounded-xl px-2.5 py-1.5 outline-none transition-colors hover:bg-hover focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg active:scale-[0.98]"
       >
         <span
-          className={`flex size-7 items-center justify-center rounded-lg bg-gradient-to-br ${agent.grad} text-white`}
+          className={`flex size-7 shrink-0 items-center justify-center rounded-lg bg-gradient-to-br ${agent.grad} text-white`}
         >
           <agent.icon size={15} />
         </span>
-        <span className="text-[15px] font-semibold text-fg">{agent.name}</span>
-        <ChevronDown size={15} className="text-faint" />
+        {/* 窄屏不折行：截断而非换行（避免"全能/助手"难看的两行）。 */}
+        <span className="max-w-[7.5rem] truncate whitespace-nowrap text-[15px] font-semibold text-fg sm:max-w-none">
+          {agent.name}
+        </span>
+        <ChevronDown size={15} className="shrink-0 text-faint" />
       </button>
       {models && onSelectModel && (
         <ModelSelector
@@ -82,20 +85,21 @@ export function ChatHeader({
           loading={modelsLoading}
         />
       )}
-      <div className="ml-auto flex items-center gap-1.5">
+      <div className="ml-auto flex shrink-0 items-center gap-1.5">
         {credits != null && (
           <button
             onClick={onOpenBilling}
             disabled={!onOpenBilling}
             aria-label="账户与计费"
-            className={`flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-[12.5px] font-medium tabular-nums outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg ${
+            className={`flex items-center gap-1.5 rounded-full border px-2 py-1 text-[12.5px] font-medium tabular-nums outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg sm:px-2.5 ${
               low
                 ? "border-danger/40 bg-danger-soft text-danger hover:bg-danger-soft"
                 : "border-border text-muted enabled:hover:bg-hover enabled:hover:text-fg"
             } disabled:cursor-default`}
           >
-            <Wallet size={13} />
-            <span>{formatCredits(credits)}</span>
+            <Wallet size={13} className="shrink-0" />
+            {/* 窄屏只留图标（点击进设置看余额），省出空间避免顶栏溢出/主题被裁。 */}
+            <span className="hidden sm:inline">{formatCredits(credits)}</span>
           </button>
         )}
         <ThemeToggle theme={theme} onCycle={onCycleTheme} />

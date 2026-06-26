@@ -733,6 +733,34 @@ export const api = {
       ),
     ).then(() => undefined),
 
+  // ── 文件上传（gateway /api/uploads，Bearer；写入用户容器工作区，返回内容寻址 URL） ──
+
+  /**
+   * 上传单个文件（POST /api/uploads，Bearer）。原始二进制 body + x-filename 头。
+   * 返回 `{ url, digest, size, mimeType }`——url 形如 `/api/media/<digest>.<ext>`，
+   * 可直接作为 MediaRef.url 放进对话 inbound.message.content.media。
+   * File/Blob body 可重发，故 401 透明刷新重放安全。
+   */
+  uploadFile: (
+    a: AuthSession,
+    file: File,
+  ): Promise<{ url: string; digest?: string; size?: number; mimeType?: string }> =>
+    jsonOrThrow(
+      callWithRefresh(a, (t) =>
+        fetch("/api/uploads", {
+          method: "POST",
+          credentials: "include",
+          headers: {
+            Accept: "application/json",
+            Authorization: `Bearer ${t}`,
+            "content-type": file.type || "application/octet-stream",
+            "x-filename": encodeURIComponent(file.name || "file"),
+          },
+          body: file,
+        }),
+      ),
+    ),
+
   // ── 媒体签名（commercial REST） ──────────────────────────────────────────
 
   /**

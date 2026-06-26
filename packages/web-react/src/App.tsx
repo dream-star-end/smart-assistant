@@ -18,6 +18,7 @@ import { Alert, Sheet } from "./components/ui";
 import { useAgentGate } from "./hooks/useAgentGate";
 import { type UseChatSocket, useChatSocket } from "./hooks/useChatSocket";
 import { useTheme } from "./hooks/useTheme";
+import type { MediaRef } from "./lib/chat/frames";
 import type { ChatMessage } from "./lib/chat/model";
 import { CONTINUE_PROMPT } from "./lib/chat/render";
 import { DEFAULT_AGENT } from "./lib/agents";
@@ -284,7 +285,7 @@ export function App() {
   }, [demo, user, interrupt]);
 
   const send = useCallback(
-    async (text: string) => {
+    async (text: string, media?: MediaRef[]) => {
       setChatError(null);
 
       // demo：本地流式回放（无网络），仅用于离线预览设计。
@@ -331,7 +332,8 @@ export function App() {
       }
       sockRef.current?.ensureSession(sessionId, agent.id, text.slice(0, 24));
       // model：选中的真实模型 id（顶层字段，非 content 内）。effortLevel 本期不接（P5/后续）。
-      sockRef.current?.send({ sessId: sessionId, agentId: agent.id, text, model: modelId });
+      // media：已上传附件（图片/文件等），随 inbound.message.content.media 发送。
+      sockRef.current?.send({ sessId: sessionId, agentId: agent.id, text, model: modelId, media });
       // 侧栏：提到顶 + 更新标题/时间/计数（计数仅作排序提示，权威消息在 WS service）。
       setSessions((c) => {
         const sid = sessionId!;
@@ -350,6 +352,20 @@ export function App() {
     },
     [activeId, demo, user, agent, modelId],
   );
+
+  // 上传单文件 → MediaRef（kind 以服务端 mimeType 为准，退回 file.type）。供 Composer 附件。
+  const uploadMedia = useCallback(async (file: File): Promise<MediaRef> => {
+    const r = await api.uploadFile(authRef.current, file);
+    const mime = r.mimeType || file.type || "";
+    const kind: MediaRef["kind"] = mime.startsWith("image/")
+      ? "image"
+      : mime.startsWith("audio/")
+        ? "audio"
+        : mime.startsWith("video/")
+          ? "video"
+          : "file";
+    return { kind, url: r.url, mimeType: mime || undefined, filename: file.name };
+  }, []);
 
   const regenerate = useCallback(() => {
     // demo 用本地 messages；非 demo 找 WS 末条 user 重发。
@@ -754,6 +770,7 @@ export function App() {
             model={modelFooter}
             disabled={gated}
             placeholder={`和「${agent.name}」对话…`}
+            onUpload={demo ? undefined : uploadMedia}
           />
         </div>
       </main>
