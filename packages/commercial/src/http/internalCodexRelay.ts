@@ -15,6 +15,7 @@ import { Readable } from 'node:stream'
 import type { Dispatcher } from 'undici'
 
 import { rootLogger, type Logger } from '../logging/logger.js'
+import { getRuntimeChannel } from '../runtimeChannel.js'
 import {
   REQUEST_ID_HEADER,
   ensureRequestId,
@@ -318,8 +319,8 @@ export function makeDefaultCodexRelayDb(): CodexRelayDb {
                 ca.status AS account_status
            FROM agent_containers ac
            LEFT JOIN claude_accounts ca ON ca.id = ac.codex_account_id
-          WHERE ac.id = $1`,
-        [containerId],
+          WHERE ac.id = $1 AND ac.runtime_channel = $2`,
+        [containerId, getRuntimeChannel()],
       )
       if (!r.rows[0]) return null
       const row = r.rows[0]

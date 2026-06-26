@@ -1213,9 +1213,10 @@ describe("stopAndRemoveV3Container", () => {
     assert.equal(pool.rows[0]!.state, "vanished");
   });
 
-  test("v1.0.22: caller 无 host_uuid + UPDATE 0 行(row 已并发删) + 多 host → skip + warn", async () => {
-    // FakePool 没插任何 row → UPDATE 0 行 → effectiveHostUuid=null
-    // 多 host 系统下 host 未知不可假设本地,gate A 触发
+  test("v1.0.22 / P1d: caller 无 host_uuid + UPDATE 0 行(row 已删/跨 channel) → skip docker + warn", async () => {
+    // FakePool 没插任何 row → UPDATE rowCount=0。P1d 起:rowCount=0 统一早返回 false 跳过 docker
+    // 清理(不再用 caller 的 container_internal_id 误清,跨 channel 安全),docker 残骸交 orphanReconcile;
+    // 非守卫路径(requireNoOpenMigration 未设)记一条诊断 warn。
     const { docker, captured } = makeDocker();
     const pool = new FakePool();
     const { cs, calls } = makeContainerServiceStub();
@@ -1234,12 +1235,12 @@ describe("stopAndRemoveV3Container", () => {
       );
     });
 
-    assert.equal(captured.stopped, 0, "host 未知不应触本地 docker");
+    assert.equal(captured.stopped, 0, "rowCount=0 不应触本地 docker");
     assert.equal(captured.removed, 0);
     assert.equal(calls.length, 0, "containerService 也不应被调");
     assert.ok(
-      warns.some((w) => /host_uuid unknown in multi-host system/.test(w)),
-      `gate A warn 必须写 console:实际 warns=${JSON.stringify(warns)}`,
+      warns.some((w) => /rowCount=0.*skipping docker cleanup/.test(w)),
+      `rowCount=0 诊断 warn 必须写 console:实际 warns=${JSON.stringify(warns)}`,
     );
   });
 

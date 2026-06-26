@@ -55,7 +55,10 @@ import { mkdir as fsMkdir, chown as fsChown, chmod as fsChmod } from "node:fs/pr
 import { isAbsolute as pathIsAbsolute, join as pathJoin, normalize as pathNormalize, sep as pathSep } from "node:path";
 import type { Pool, PoolClient } from "pg";
 import type { ContainerService, ContainerSpec } from "../compute-pool/containerService.js";
-import { RUNTIME_CHANNEL_LABEL_KEY } from "../compute-pool/containerService.js";
+import {
+  RUNTIME_CHANNEL_LABEL_KEY,
+  v3NetworkNameForChannel,
+} from "../compute-pool/containerService.js";
 import { AgentAppError } from "../compute-pool/nodeAgentClient.js";
 import { listAllHosts as defaultListAllHosts } from "../compute-pool/queries.js";
 import type { ComputeHostRow } from "../compute-pool/types.js";
@@ -98,15 +101,18 @@ export const V3_GATEWAY_IP = "172.30.0.1";
 export const V3_INTERNAL_PROXY_URL = "http://172.30.0.1:18791";
 
 // P1d v5 容器网络 channel 化:v5 容器落 openclaude-v5-net(172.31/16),egress 走 v5 自己的
-// 内部代理(172.31.0.1:18792),与 v3(172.30/172.30.0.1:18791)物理隔离。v3 取值不变。
+// 内部代理(172.31.0.1:18892),与 v3(172.30/172.30.0.1:18791)物理隔离。v3 取值不变。
 function ocSubnetPrefixForChannel(): string {
   return getRuntimeChannel() === "v5" ? "172.31" : "172.30";
 }
-function ocGatewayIpForChannel(): string {
+// 导出:内部代理 gateway IP / port 是"容器 egress 目标"与"master 监听 bind"的【单一权威】。
+// index.ts 启动期用它校验 INTERNAL_PROXY_BIND/PORT env 与 channel 期望一致(消双权威错位)。
+export function ocGatewayIpForChannel(): string {
   return getRuntimeChannel() === "v5" ? "172.31.0.1" : V3_GATEWAY_IP;
 }
-function ocInternalProxyPortForChannel(): number {
-  return getRuntimeChannel() === "v5" ? 18792 : 18791;
+export function ocInternalProxyPortForChannel(): number {
+  // v5 用 18892(避开 v3 占用的 18791 内部代理 + 18792 baseline server);v3 仍 18791。
+  return getRuntimeChannel() === "v5" ? 18892 : 18791;
 }
 
 /**
@@ -1612,6 +1618,17 @@ export async function provisionV3Container(
     && effectiveHostUuid !== deps.selfHostId
     && deps.containerService !== undefined;
 
+  // P1b v5 local-only 硬门(纵深防御):v5 是单机本地 channel,绝不允许调度到远端 host。
+  // 正常路径已由 v3ensureRunning 跳过多机 schedulePlacement(placement=undefined →
+  // effectiveHostUuid=selfHostId → useRemote=false)保证;此处兜底防 future caller 误传
+  // 远端 hostId,或 host 池增长后 schedulePlacement 被错误启用。fail-closed 优于静默跨网段。
+  if (useRemote && getRuntimeChannel() === "v5") {
+    throw new SupervisorError(
+      "InvalidArgument",
+      `v5 channel is local-only; remote host placement forbidden (hostId=${effectiveHostUuid}, selfHostId=${deps.selfHostId})`,
+    );
+  }
+
   // v1.0.84 PR #4 — supply-chain guard:provision 之前先 inspect image labels,
   // 缺 v3-sink token 直接抛 ImageOutdated。早于 BEGIN / docker create,失败不留
   // 半事务和 docker 副作用。模式 OC_V3_IMAGE_GUARD ∈ enforce/warn/off,缺省 enforce。
@@ -2119,13 +2136,15 @@ export async function provisionV3Container(
           // (docker create 接受 NetworkingConfig.EndpointsConfig.<net>.IPAMConfig)
           NetworkingConfig: {
             EndpointsConfig: {
-              [V3_NETWORK_NAME]: {
+              // P1d:self-host 直建路径的网络名必须 channel 化 —— v5 落 openclaude-v5-net
+              // (172.31/16),否则把 172.31 IP 接到 v3 网络上 → docker 拒绝 / 跨网段污染。
+              [v3NetworkNameForChannel()]: {
                 IPAMConfig: { IPv4Address: row.boundIp },
               },
             },
           },
           HostConfig: {
-            NetworkMode: V3_NETWORK_NAME,
+            NetworkMode: v3NetworkNameForChannel(),
             // 资源硬限额 — 单容器吃不光宿主;env OC_V3_MEMORY_MB / OC_V3_CPUS / OC_V3_PIDS_LIMIT 覆盖
             Memory: memoryBytes,
             // MemorySwap == Memory → 禁 swap;不设 docker 会默认配 2×Memory
@@ -2357,17 +2376,33 @@ export async function stopAndRemoveV3Container(
              AND m.phase NOT IN ('committed', 'rolled_back')
         )`
     : "";
+  // P1d 跨 channel 防护:破坏性 UPDATE 必须带 runtime_channel 过滤 —— 否则任何传错(对方
+  // channel)id 的 caller 都会把对方行翻 vanished 并随后 docker stop/remove。$2=本实例 channel。
   const updateResult = await deps.pool.query<{ host_uuid: string | null }>(
     `UPDATE agent_containers
         SET state='vanished',
             updated_at=NOW()
-      WHERE id = $1${guardSql}
+      WHERE id = $1 AND runtime_channel = $2${guardSql}
       RETURNING host_uuid`,
-    [String(containerRow.id)],
+    [String(containerRow.id), getRuntimeChannel()],
   );
   const rowFound = (updateResult.rowCount ?? 0) > 0;
-  if (!rowFound && options?.requireNoOpenMigration === true) {
-    // 守卫拦截 OR 行不存在:不进 docker,让 reconciler 处理
+  if (!rowFound) {
+    // rowCount=0 的三种成因统一不进 docker 清理:
+    //   (a) requireNoOpenMigration 守卫拦截(并发 migration ledger 行);
+    //   (b) 行已不存在(罕见 race);
+    //   (c) 跨 channel —— 该 id 属对方 channel(UPDATE 的 runtime_channel 过滤未命中)。
+    // 三种情况都绝不能用 caller 提供的 container_internal_id 去 docker rm(c 会误删对方容器,
+    // a/b 无主可清)。docker↔DB 残骸对账交由 channel-aware 的 orphanReconcile 单点权威兜底。
+    // (a) 是正常守卫路径不告警;(b)/(c) 是 destructive 函数拿到 0 行的"意外",记一条诊断。
+    if (options?.requireNoOpenMigration !== true) {
+      // eslint-disable-next-line no-console
+      console.warn(
+        `[v3supervisor.stopAndRemove] rowCount=0 for container ${containerRow.id} ` +
+          `(channel=${getRuntimeChannel()}): row gone or wrong channel ` +
+          `— skipping docker cleanup, deferring to orphanReconcile`,
+      );
+    }
     return false;
   }
   const dbHostUuid: string | null = updateResult.rows[0]?.host_uuid ?? null;

@@ -41,6 +41,7 @@ import type { TLSSocket } from "node:tls";
 import type { RequestContext } from "./handlers.js";
 import type { V3ContainerStatus, V3SupervisorDeps } from "../agent-sandbox/v3supervisor.js";
 import { getV3ContainerStatus } from "../agent-sandbox/v3supervisor.js";
+import { getRuntimeChannel } from "../runtimeChannel.js";
 import {
   isContainerCapabilityReady,
   type CapabilityProbeDeps,
@@ -57,11 +58,14 @@ const MAX_HEADER_BYTES = 64 * 1024;
 /** per-uid 并发计数。key = uid string。release() 幂等。 */
 const inflight = new Map<string, number>();
 
-/** 172.30.0.0/16 白名单 —— 容器必须在我们自己的 docker bridge 上 */
+/** docker bridge 网段白名单(channel-aware)—— 容器必须在本 channel 自己的 bridge 上:
+ *  v3=172.30.0.0/16,v5=172.31.0.0/16。各 channel 的 proxy 只能够到本 channel 网段容器,
+ *  防 SSRF 跨网段、也防 v3 proxy 误连 v5 容器(反之亦然)。 */
 function isBoundIpAllowed(ip: string): boolean {
   if (!isIPv4(ip)) return false;
   const p = ip.split(".").map(Number);
-  return p[0] === 172 && p[1] === 30;
+  const expectSecond = getRuntimeChannel() === "v5" ? 31 : 30;
+  return p[0] === 172 && p[1] === expectSecond;
 }
 
 /**

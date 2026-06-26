@@ -146,12 +146,15 @@ export async function listSchedulableHosts(): Promise<SchedulableHost[]> {
             COALESCE(
               (SELECT COUNT(*) FROM agent_containers ac
                 WHERE ac.host_uuid = compute_hosts.id
-                  AND ac.state = 'active'),
+                  AND ac.state = 'active'
+                  AND ac.runtime_channel = $1),
               0
             )::text AS active_containers
        FROM compute_hosts, desired
       WHERE ${PLACEMENT_GATE_PREDICATE}
       ORDER BY created_at ASC`,
+    // P1d:容量计数按 channel —— v3 调度只算 v3 容器(恢复 pre-v5 行为,不被 v5 行膨胀)。
+    [getRuntimeChannel()],
   );
   return r.rows
     .map((row) => ({
@@ -185,14 +188,16 @@ export async function getSchedulableHostById(
             COALESCE(
               (SELECT COUNT(*) FROM agent_containers ac
                 WHERE ac.host_uuid = compute_hosts.id
-                  AND ac.state = 'active'),
+                  AND ac.state = 'active'
+                  AND ac.runtime_channel = $2),
               0
             )::text AS active_containers
        FROM compute_hosts, desired
       WHERE id = $1
         AND ${PLACEMENT_GATE_PREDICATE}
       LIMIT 1`,
-    [id],
+    // P1d:容量计数按 channel(同 listSchedulableHosts)。
+    [id, getRuntimeChannel()],
   );
   if (r.rowCount === 0) return null;
   const row = r.rows[0]!;
@@ -1484,9 +1489,10 @@ export async function findUserStickyHost(userId: number): Promise<{
             ch.status AS host_status
        FROM agent_containers ac
        JOIN compute_hosts ch ON ch.id = ac.host_uuid
-      WHERE ac.user_id = $1 AND ac.state='active'
+      WHERE ac.user_id = $1 AND ac.state='active' AND ac.runtime_channel = $2
       LIMIT 1`,
-    [userId],
+    // P1d:sticky host 解析按 channel —— 否则 sshMux/远程文件操作可能路由到对方 channel 的 host。
+    [userId, getRuntimeChannel()],
   );
   if (r.rowCount === 0) return null;
   const row = r.rows[0]!;
@@ -1564,11 +1570,13 @@ export async function findUserDataHost(userId: number): Promise<{
       WHERE ac.user_id = $1
         AND ac.state IN ('active', 'vanished')
         AND ac.host_uuid IS NOT NULL
+        AND ac.runtime_channel = $2
       ORDER BY (ac.state = 'active') DESC,
                ac.created_at DESC,
                ac.id DESC
       LIMIT 1`,
-    [userId],
+    // P1d:data-host sticky 只看本 channel —— 用户的 v5 容器不应让 v3 sticky 到该 host(反之亦然)。
+    [userId, getRuntimeChannel()],
   );
   if (r.rowCount === 0) return null;
   const row = r.rows[0]!;

@@ -40,6 +40,7 @@
 import type Docker from "dockerode";
 import { getPool } from "../db/index.js";
 import { query } from "../db/queries.js";
+import { getRuntimeChannel } from "../runtimeChannel.js";
 import {
   containerNameFor,
   removeContainer as supRemove,
@@ -197,6 +198,10 @@ export async function listContainers(input: ListContainersInput = {}): Promise<A
     params.push(input.host_uuid);
     where.push(`c.host_uuid = $${params.length}::uuid`);
   }
+  // P1d:admin 列表默认只看本实例 channel —— v3 admin 看 v3、v5 admin 看 v5,不跨 channel 误管。
+  // (v3 视图不变:历史容器全是 'v3';v5 只见自己的 canary 容器。)
+  params.push(getRuntimeChannel());
+  where.push(`c.runtime_channel = $${params.length}`);
   let limit = input.limit ?? 50;
   if (!Number.isInteger(limit) || limit <= 0) limit = 50;
   if (limit > 500) limit = 500;
@@ -264,8 +269,10 @@ async function lookupContainer(id: bigint | string): Promise<ContainerLookup | n
             docker_name,
             container_internal_id
        FROM agent_containers
-      WHERE id = $1`,
-    [String(id)],
+      WHERE id = $1 AND runtime_channel = $2`,
+    // P1d:admin 写操作(restart/stop/remove 都经此 lookup)按 channel —— v5 admin 查不到
+    // v3 容器 → ContainerNotFoundError,绝不跨 channel stop/remove(stopAndRemoveV3Container 另有兜底)。
+    [String(id), getRuntimeChannel()],
   );
   if (r.rows.length === 0) return null;
   const row = r.rows[0]!;

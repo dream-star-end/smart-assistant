@@ -98,7 +98,10 @@ import {
   DEFAULT_V3_CODEX_CONTAINER_DIR,
   V3_CONTAINER_PORT,
   stopAndRemoveV3Container,
+  ocGatewayIpForChannel,
+  ocInternalProxyPortForChannel,
 } from "./agent-sandbox/v3supervisor.js";
+import { getRuntimeChannel } from "./runtimeChannel.js";
 import { V3_AGENT_GID, V3_AGENT_UID } from "./agent-sandbox/constants.js";
 import {
   startPendingOrdersExpirer,
@@ -738,6 +741,22 @@ export async function registerCommercial(
         )}],拒启。`,
       );
     }
+    // 内部代理双权威错位防护(Codex 重要项):listener 实际 bind 读 INTERNAL_PROXY_BIND/PORT
+    // env,而容器 egress 目标由 ocGatewayIpForChannel()/ocInternalProxyPortForChannel() 计算。
+    // 二者必须一致,否则容器把 API 打到一个没人监听的地址 → 全部 turn fail。env 漏配/错配时
+    // fail-closed 拒启,而非上线后才发现 v5 容器一调用就挂。expected 来自单一权威 helper。
+    const expectBind = ocGatewayIpForChannel(); // v5 → 172.31.0.1
+    const expectPort = ocInternalProxyPortForChannel(); // v5 → 18892
+    const actualBind = process.env.INTERNAL_PROXY_BIND?.trim();
+    const actualPort = Number(process.env.INTERNAL_PROXY_PORT?.trim());
+    if (actualBind !== expectBind || actualPort !== expectPort) {
+      throw new Error(
+        `[commercial] v5 内部代理 env 与 channel 期望不符:` +
+          `INTERNAL_PROXY_BIND=${actualBind ?? "(unset)"} (期望 ${expectBind}),` +
+          `INTERNAL_PROXY_PORT=${process.env.INTERNAL_PROXY_PORT ?? "(unset)"} (期望 ${expectPort})。` +
+          `容器 egress 与 listener bind 须一致,拒启。`,
+      );
+    }
   }
 
   // 共享 PG schema 迁移同样受控制面单一权威 gate:v5 follower 绝不迁移共享库
@@ -1168,8 +1187,8 @@ export async function registerCommercial(
                       ca.status AS account_status
                  FROM agent_containers ac
                  LEFT JOIN claude_accounts ca ON ca.id = ac.codex_account_id
-                WHERE ac.id = $1`,
-              [containerId],
+                WHERE ac.id = $1 AND ac.runtime_channel = $2`,
+              [containerId, getRuntimeChannel()],
             );
             if (r.rows.length === 0) return null;
             const row = r.rows[0];
@@ -1197,9 +1216,9 @@ export async function registerCommercial(
                         ca.status AS account_status
                    FROM agent_containers ac
                    LEFT JOIN claude_accounts ca ON ca.id = ac.codex_account_id
-                  WHERE ac.id = $1
+                  WHERE ac.id = $1 AND ac.runtime_channel = $2
                     FOR UPDATE OF ac`,
-                [containerId],
+                [containerId, getRuntimeChannel()],
               );
               const row =
                 lockRes.rows.length === 0
@@ -1725,7 +1744,11 @@ export async function registerCommercial(
     // V3 Phase 3I — 启动时镜像预热(fire-and-forget):本地已有 → noop;
     // 没有 → docker pull,把首次 provision 30-60s 拉镜像延迟摊到启动时。
     // OC_PREHEAT_DISABLED=1 关闭(测试 / 网络受限 / CI)。失败不影响 gateway。
-    if (process.env.OC_PREHEAT_DISABLED !== "1") {
+    // P1d 单一权威:preheat + 其内嵌的 compute pool init / image-promote scheduler 都向
+    // 共享 compute_hosts 写状态(desired/loaded image、quarantine、backfill),属 v3 控制面。
+    // 必须先过 controlPlaneEnabled(channel=v5 恒 false → 整块跳过,v5 绝不写共享控制面;
+    // v5 镜像本就在本机,preheat 对 v5 也是 noop)。
+    if (controlPlaneEnabled && process.env.OC_PREHEAT_DISABLED !== "1") {
       void preheatV3Image(v3Docker, cfg.OC_RUNTIME_IMAGE, {
         info: (m, meta) => { /* eslint-disable-next-line no-console */ console.log(m, meta ?? {}); },
         warn: (m, meta) => { /* eslint-disable-next-line no-console */ console.warn(m, meta ?? {}); },
@@ -1826,16 +1849,18 @@ export async function registerCommercial(
     try {
       const baselineDir =
         process.env.OC_V3_CCB_BASELINE_DIR?.trim() || DEFAULT_V3_CCB_BASELINE_DIR;
+      // v5 baseline 走 18893(避开 v3 占用的 0.0.0.0:18792);v3 仍 18792。
+      const baselinePort = runtimeChannel === "v5" ? 18893 : 18792;
       baselineSrv = getBaselineServer({
         baselineDir,
         bind: "0.0.0.0",
-        port: 18792,
+        port: baselinePort,
       });
       await baselineSrv.start();
       // eslint-disable-next-line no-console
       console.log("[commercial] baseline server started", {
         bind: "0.0.0.0",
-        port: 18792,
+        port: baselinePort,
         baselineDir,
       });
     } catch (err) {
@@ -2065,8 +2090,10 @@ export async function registerCommercial(
   // V3 Phase 3F:idle 30min stop+remove ephemeral 容器(MVP 单轨)。
   // 仅在 v3 supervisor 装配后启用;cfg.OC_IDLE_SWEEP_DISABLED=1 可手动关掉
   // (运维灾备时用,默认 60s tick / 30min idle cutoff)。
+  // P1d 单一权威:容器面后台 mutator 一律先过 controlPlaneEnabled(channel=v5 恒 false →
+  // 永不启动,连 runOnStart mutate 都不会发生),env *_DISABLED 仅作 v3 运维二级开关。
   let idleSweepScheduler: IdleSweepScheduler | undefined;
-  if (v3Deps && process.env.OC_IDLE_SWEEP_DISABLED !== "1") {
+  if (controlPlaneEnabled && v3Deps && process.env.OC_IDLE_SWEEP_DISABLED !== "1") {
     const idleSweepLog = rootLogger.child({ subsys: "v3/idleSweep" });
     idleSweepScheduler = startIdleSweepScheduler(v3Deps, {
       logger: idleSweepLog,
@@ -2078,7 +2105,7 @@ export async function registerCommercial(
   // V3 Phase 3G:volume GC(banned 7d / no-login 90d)。1h 一跑,删孤立 volume。
   // cfg.OC_VOLUME_GC_DISABLED=1 可手动关掉(运维灾备 / 数据回滚演练时用)。
   let volumeGcScheduler: VolumeGcScheduler | undefined;
-  if (v3Deps && process.env.OC_VOLUME_GC_DISABLED !== "1") {
+  if (controlPlaneEnabled && v3Deps && process.env.OC_VOLUME_GC_DISABLED !== "1") {
     const volumeGcLog = rootLogger.child({ subsys: "v3/volumeGc" });
     volumeGcScheduler = startVolumeGcScheduler(v3Deps, {
       logger: volumeGcLog,
@@ -2092,7 +2119,7 @@ export async function registerCommercial(
   // V3 Phase 3H:orphan reconcile(gateway 启动立刻 + 1h tick)。docker↔DB 双向对账。
   // cfg.OC_ORPHAN_RECONCILE_DISABLED=1 可关闭(运维灾备 / 数据冷恢复时用)。
   let orphanReconcileScheduler: OrphanReconcileScheduler | undefined;
-  if (v3Deps && process.env.OC_ORPHAN_RECONCILE_DISABLED !== "1") {
+  if (controlPlaneEnabled && v3Deps && process.env.OC_ORPHAN_RECONCILE_DISABLED !== "1") {
     const orphanReconcileLog = rootLogger.child({ subsys: "v3/orphanReconcile" });
     orphanReconcileScheduler = startOrphanReconcileScheduler(v3Deps, {
       logger: orphanReconcileLog,
@@ -2108,7 +2135,7 @@ export async function registerCommercial(
   // 单点权威闭环(02-DEVELOPMENT-PLAN.md §14.2.6:2093)。
   // OC_MIGRATION_RECONCILER_DISABLED=1 关闭(运维灾备 / writer 上线前的紧急回滚开关)。
   let migrationReconcileScheduler: MigrationReconcileScheduler | undefined;
-  if (v3Deps && process.env.OC_MIGRATION_RECONCILER_DISABLED !== "1") {
+  if (controlPlaneEnabled && v3Deps && process.env.OC_MIGRATION_RECONCILER_DISABLED !== "1") {
     const migrationReconcileLog = rootLogger.child({ subsys: "v3/migrationReconciler" });
     migrationReconcileScheduler = startMigrationReconcileScheduler(v3Deps, {
       logger: migrationReconcileLog,
@@ -2124,7 +2151,7 @@ export async function registerCommercial(
   // mTLS cert 临近过期的自动 renewal 也跟着失效。OC_HEALTH_POLLER_DISABLED=1 给单
   // host / dev 场景保留 disable。
   let healthPoller: HealthPoller | undefined;
-  if (v3Deps && process.env.OC_HEALTH_POLLER_DISABLED !== "1") {
+  if (controlPlaneEnabled && v3Deps && process.env.OC_HEALTH_POLLER_DISABLED !== "1") {
     healthPoller = getHealthPoller();
     healthPoller.start();
     rootLogger.child({ subsys: "node-health" }).info("scheduler started", {
@@ -2135,7 +2162,7 @@ export async function registerCommercial(
   // T-63 Phase 2:订阅 docker container events → `container.oom_exited` 告警。
   // cfg.OC_CONTAINER_EVENTS_DISABLED=1 可关闭(运维灾备 / docker daemon 异常时用)。
   let containerEventsWorker: V3ContainerEventsWorker | undefined;
-  if (v3Deps && process.env.OC_CONTAINER_EVENTS_DISABLED !== "1") {
+  if (controlPlaneEnabled && v3Deps && process.env.OC_CONTAINER_EVENTS_DISABLED !== "1") {
     containerEventsWorker = startV3ContainerEventsWorker({
       docker: v3Deps.docker,
       logger: {
@@ -2694,9 +2721,9 @@ export async function registerCommercial(
                       EXTRACT(EPOCH FROM (NOW() - ac.created_at))::text AS age_seconds
                FROM agent_containers ac
                LEFT JOIN claude_accounts ca ON ca.id = ac.codex_account_id
-               WHERE ac.id = $1
+               WHERE ac.id = $1 AND ac.runtime_channel = $2
                FOR UPDATE OF ac`,
-              [containerId],
+              [containerId, getRuntimeChannel()],
             );
             if (lookup.rows.length === 0) {
               // 容器在 acquire 前刚被删了 — 当 legacy 透传(下游 sendToContainer 必失败,
@@ -2773,10 +2800,12 @@ export async function registerCommercial(
               // 拦截)。这里 throw 抬出问题,而不是静默 return null 让 caller 当 legacy
               // 透传 — 那条路径走旧容器仍会 401,只是把问题往后挪。
               const upd = await client.query(
+                // P1d 防御:codex 路径生命周期变更 SQL 也按 channel(v5 不暴露 codex,正常不可达;
+                // 防调用链传错 containerId 跨 channel vanish。codex 全栈下线见 P1f)。
                 `UPDATE agent_containers
                     SET state = 'vanished', updated_at = NOW()
-                  WHERE id = $1 AND state = 'active'`,
-                [containerId],
+                  WHERE id = $1 AND state = 'active' AND runtime_channel = $2`,
+                [containerId, getRuntimeChannel()],
               );
               if ((upd.rowCount ?? 0) === 0) {
                 throw new Error(
@@ -3097,9 +3126,13 @@ export async function registerCommercial(
   if (onboardingScheduler) enabledSchedulers.push("onboarding");
   if (inboxEmailScheduler) enabledSchedulers.push("inboxEmail");
   if (wechatBroker) enabledSchedulers.push("wechatBroker");
-  // 注:compute-pool / image-promote / baseline / 容器 lifecycle 属"v3 runtime plane",
-  // v5 已在函数早期 fail-closed(检测 OC_RUNTIME_IMAGE/AGENT_IMAGE 即拒启)→ 不可能在 v5 启动,
-  // 故不会出现在 v5 的 enabledSchedulers。
+  // 注:compute-pool init / image-promote / preheat 及所有容器面 scheduler(idleSweep/
+  // volumeGc/orphanReconcile/migrationReconcile/healthPoller/containerEvents)现已**全部 gate
+  // 在 controlPlaneEnabled** 上(channel=v5 恒 false,绝对权威,无 env 可翻盘)→ v5 下整条
+  // 控制面/容器面后台 mutator 都不会启动,连 runOnStart mutate 都不发生。下方 fail-closed 是
+  // 防 env 漏配的纵深兜底(理论上 channel=v5 已使 controlPlaneEnabled 恒假,enabledSchedulers
+  // 必空;若非空说明有 mutator 绕过了 controlPlaneEnabled gate,属代码 bug,宁可拒启)。
+  // baseline server 不是 mutator(只读 serve ccb tarball + mTLS/PSK 鉴权),不在此列。
   const runtimeStatus: CommercialRuntimeStatus = {
     channel: runtimeChannel,
     controlPlaneEnabled,

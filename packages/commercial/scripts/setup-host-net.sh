@@ -12,7 +12,8 @@
 #      不动 FORWARD 链(容器→公网仍开),否则 browser-automation / web-search /
 #      MCP server fetch 全瘫 — 个人版那批工具就是直连公网的。
 #
-# 使用:  sudo bash setup-host-net.sh
+# 使用:  sudo bash setup-host-net.sh [v3|v5]        # 默认 v3,完整(网络+ufw+iptables)
+#       sudo SETUP_NET_ONLY=1 bash setup-host-net.sh v5  # 仅建网络(ICC=false),跳过 egress 守卫
 #
 # 幂等: 重复执行无副作用。docker network 已存在则校验 subnet/gateway/ipv6/icc 全吻合;
 #       ufw 规则走自身幂等 ("Skipping adding existing rule") + 解析 stderr 决定 [OK]/[ADDED];
@@ -25,12 +26,30 @@ set -e
 export LANG=C
 export LC_ALL=C
 
-NET_NAME="openclaude-v3-net"
-SUBNET="172.30.0.0/16"
-GATEWAY="172.30.0.1"
-INTERNAL_PROXY_PORT="18791"
-# 容器→host 横向防火墙独立链
-V3_HOST_GUARD_CHAIN="V3_EGRESS_IN"
+# P1b channel 化:同一脚本以同等安全姿态(ICC=false + egress 守卫链)建 v3/v5 两套隔离网络。
+# channel 取值优先级:$1 > $OC_RUNTIME_CHANNEL > 默认 v3。v3 取值与历史完全一致(向后兼容)。
+CHANNEL="${1:-${OC_RUNTIME_CHANNEL:-v3}}"
+case "$CHANNEL" in
+  v3)
+    NET_NAME="openclaude-v3-net"
+    SUBNET="172.30.0.0/16"
+    GATEWAY="172.30.0.1"
+    INTERNAL_PROXY_PORT="18791"
+    V3_HOST_GUARD_CHAIN="V3_EGRESS_IN"
+    ;;
+  v5)
+    NET_NAME="openclaude-v5-net"
+    SUBNET="172.31.0.0/16"
+    GATEWAY="172.31.0.1"
+    INTERNAL_PROXY_PORT="18892"
+    V3_HOST_GUARD_CHAIN="V5_EGRESS_IN"
+    ;;
+  *)
+    echo "[ABORT] 未知 channel: $CHANNEL (仅支持 v3 / v5)"
+    exit 1
+    ;;
+esac
+echo "[CHANNEL] $CHANNEL → net=$NET_NAME subnet=$SUBNET gw=$GATEWAY proxy_port=$INTERNAL_PROXY_PORT chain=$V3_HOST_GUARD_CHAIN"
 
 require_root() {
   if [ "$(id -u)" -ne 0 ]; then
@@ -97,7 +116,7 @@ ensure_ufw_rule() {
     return
   fi
   apply_ufw "allow ${SUBNET} → ${INTERNAL_PROXY_PORT}/tcp" \
-    allow proto tcp from "$SUBNET" to any port "$INTERNAL_PROXY_PORT" comment 'openclaude-v3 internal proxy (172.30.0.1:18791)'
+    allow proto tcp from "$SUBNET" to any port "$INTERNAL_PROXY_PORT" comment "openclaude-${CHANNEL} internal proxy (${GATEWAY}:${INTERNAL_PROXY_PORT})"
   # 防御性显式 deny — ufw default 是 deny 但写一条审计可见,且兼容 default allow 的环境
   apply_ufw "deny v4/v6 → ${INTERNAL_PROXY_PORT}/tcp (除 ${SUBNET} 外)" \
     deny in proto tcp to any port "$INTERNAL_PROXY_PORT"
@@ -153,14 +172,14 @@ ensure_v3_host_guard() {
     -m comment --comment "allow reply traffic for host-initiated conns"
   iptables -A "$V3_HOST_GUARD_CHAIN" \
     -d "$GATEWAY" -p tcp --dport "$INTERNAL_PROXY_PORT" -j RETURN \
-    -m comment --comment "v3 container -> internal proxy"
+    -m comment --comment "${CHANNEL} container -> internal proxy"
   # ICMP echo 留着,容器内 ping 网关用作 readiness 检测可以;ICMP 不会泄露敏感
   iptables -A "$V3_HOST_GUARD_CHAIN" \
     -d "$GATEWAY" -p icmp --icmp-type echo-request -j RETURN \
-    -m comment --comment "v3 container -> gateway icmp (readiness)"
+    -m comment --comment "${CHANNEL} container -> gateway icmp (readiness)"
   iptables -A "$V3_HOST_GUARD_CHAIN" \
     -d "$GATEWAY" -j DROP \
-    -m comment --comment "v3 container -> any other host port: deny"
+    -m comment --comment "${CHANNEL} container -> any other host port: deny"
   # 注意:不在链内匹配 src=172.30.0.0/16,src 已在 INPUT jump 时过滤
   echo "[ADDED] $V3_HOST_GUARD_CHAIN allow $GATEWAY:$INTERNAL_PROXY_PORT, deny rest"
 
@@ -176,27 +195,42 @@ ensure_v3_host_guard() {
   # 新做法:先 while-loop 删光所有匹配(带/不带 comment 都试),再插入一条。
   # 天然幂等,终态唯一。
   while iptables -D INPUT -s "$SUBNET" -j "$V3_HOST_GUARD_CHAIN" \
-        -m comment --comment "v3 container egress isolation" 2>/dev/null; do :; done
+        -m comment --comment "${CHANNEL} container egress isolation" 2>/dev/null; do :; done
   while iptables -D INPUT -s "$SUBNET" -j "$V3_HOST_GUARD_CHAIN" 2>/dev/null; do :; done
   iptables -I INPUT 1 -s "$SUBNET" -j "$V3_HOST_GUARD_CHAIN" \
-    -m comment --comment "v3 container egress isolation"
+    -m comment --comment "${CHANNEL} container egress isolation"
   echo "[ADDED] INPUT -s $SUBNET -j $V3_HOST_GUARD_CHAIN (at position 1, deduped)"
 }
 
 main() {
   require_root
   require_cmd docker
+
+  # SETUP_NET_ONLY=1:只建/校验 docker 网络(ICC=false 容器横向隔离),跳过 ufw/iptables
+  #   egress 守卫。canary 期 v5 取此模式 —— 与现网 v3 实际姿态对齐(v3 的
+  #   openclaude-v3-host-firewall.service 当前 inactive,主防护靠 PG/Redis loopback 绑定),
+  #   不引入 v3 尚未启用的单向 egress 守卫分歧。完整守卫(全机收口)留作 v3+v5 共同硬化项。
+  if [ "${SETUP_NET_ONLY:-0}" = "1" ]; then
+    echo "=== [仅网络] 创建 docker bridge 网络 ${NET_NAME} (ICC=false) ==="
+    ensure_network
+    echo ""
+    echo "=== Done (net-only) ==="
+    echo "网络: ${NET_NAME} (${SUBNET}, gateway ${GATEWAY}, IPv6 disabled, ICC disabled)"
+    echo "[跳过] ufw / iptables egress 守卫 (SETUP_NET_ONLY=1)"
+    return
+  fi
+
   require_cmd ufw
 
   echo "=== [1/3] 创建 docker bridge 网络 ${NET_NAME} ==="
   ensure_network
 
   echo ""
-  echo "=== [2/3] 配置 ufw 入向规则 (internal proxy 18791) ==="
+  echo "=== [2/3] 配置 ufw 入向规则 (internal proxy ${INTERNAL_PROXY_PORT}) ==="
   ensure_ufw_rule
 
   echo ""
-  echo "=== [3/3] 配置 iptables 容器→host 横向阻断 (V3_EGRESS_IN 链) ==="
+  echo "=== [3/3] 配置 iptables 容器→host 横向阻断 (${V3_HOST_GUARD_CHAIN} 链) ==="
   ensure_v3_host_guard
 
   echo ""

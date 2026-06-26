@@ -64,6 +64,7 @@ import { getHostById, setQuarantined } from "../compute-pool/queries.js";
 import { hostRowToTarget, type NodeAgentTarget } from "../compute-pool/nodeAgentClient.js";
 import { promoteOnce } from "../compute-pool/imagePromote.js";
 import { observeContainerEnsureDuration } from "../admin/metrics.js";
+import { isV5Channel } from "../runtimeChannel.js";
 import { randomUUID } from "node:crypto";
 
 /** 前端 retry-after 提示秒数(provision 中)。冷启平均 5-8s,5s 比较合理。 */
@@ -387,8 +388,16 @@ export function makeV3EnsureRunning(
 
     // 3) provision 新容器(无 active 行 OR 刚清掉 missing 行)
     // B.4:注入了 containerService → 走 scheduler 挑 host + 分 IP;否则走单机 MVP(randomIp)
+    //
+    // P1b v5 local-only 硬门:v5 channel **跳过多机 schedulePlacement**。
+    //   原因(根因级,非缝补):schedulePlacement→pickBoundIp 把 self-host CIDR 硬编码成
+    //   172.30.0.0/24(v3 网段),且从全 host 池挑 host。v5 走它会拿到 172.30.x 的 boundIp +
+    //   bridgeCidr=172.30 → 与 v3 网段碰撞、且与 v5 容器实际所在的 openclaude-v5-net(172.31/16)
+    //   不一致。v5 是单机本地实例:placement 留 undefined → provisionV3Container 落 !useRemote
+    //   本地分支,用 channel-aware 的 defaultPickRandomIp(172.31)+ ocGatewayIpForChannel(172.31.0.1),
+    //   与 v3 物理隔离。provisionV3Container 内另有 useRemote+v5 的 fail-closed 兜底(纵深防御)。
     let placement: SchedulePlacement | undefined;
-    if (deps.containerService) {
+    if (deps.containerService && !isV5Channel()) {
       try {
         placement = await schedulePlacement({ userId: uid });
       } catch (err) {

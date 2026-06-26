@@ -29,6 +29,7 @@ import type { PoolClient } from 'pg'
 import { extractChatGptAccountId } from '../codex-auth/extractAccountId.js'
 import { writeCodexContainerAuthFile } from '../codex-auth/codexAuthFile.js'
 import { pickCodexAccountForBindingInTx } from './scheduler.js'
+import { getRuntimeChannel } from '../runtimeChannel.js'
 import {
   type AccountPlan,
   type CodexTokenSnapshot,
@@ -117,9 +118,10 @@ export async function acquireAndPickInTx(
             ac.host_uuid AS host_uuid
      FROM agent_containers ac
      LEFT JOIN claude_accounts ca ON ca.id = ac.codex_account_id
-     WHERE ac.id = $1
+     WHERE ac.id = $1 AND ac.runtime_channel = $2
      FOR UPDATE OF ac`,
-    [containerId],
+    // P1d 防御:lazy migrate 用户路径可达,按 channel 防跨 channel 锁/改(codex 下线见 P1f)。
+    [containerId, getRuntimeChannel()],
   )
   if (sel.rows.length === 0) return { kind: 'vanished' }
   const row = sel.rows[0]!
@@ -180,8 +182,8 @@ export async function commitCodexRebindInTx(
   await client.query(
     `UPDATE agent_containers
      SET codex_account_id = $1, updated_at = NOW()
-     WHERE id = $2`,
-    [String(newAccountId), containerId],
+     WHERE id = $2 AND runtime_channel = $3`,
+    [String(newAccountId), containerId, getRuntimeChannel()],
   )
 }
 

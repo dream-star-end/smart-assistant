@@ -18,6 +18,7 @@
 
 import { getPool } from "../db/index.js";
 import { rootLogger } from "../logging/logger.js";
+import { getRuntimeChannel } from "../runtimeChannel.js";
 import * as queries from "./queries.js";
 import {
   DataHostUnavailableError,
@@ -57,8 +58,10 @@ async function bridgeCidrFromExisting(hostId: string): Promise<string | null> {
        FROM agent_containers
       WHERE host_uuid = $1
         AND bound_ip IS NOT NULL
+        AND runtime_channel = $2
       LIMIT 1`,
-    [hostId],
+    // P1d:反推 CIDR 只从本 channel 容器取 —— 否则 v3 可能取到 v5 容器的 172.31 IP 推出错网段。
+    [hostId, getRuntimeChannel()],
   );
   const ip = r.rows[0]?.bound_ip;
   if (!ip) return null;
@@ -315,8 +318,10 @@ export async function pickBoundIp(hostId: string): Promise<{ boundIp: string; ci
        FROM agent_containers
       WHERE host_uuid = $1
         AND state = 'active'
-        AND bound_ip IS NOT NULL`,
-    [hostId],
+        AND bound_ip IS NOT NULL
+        AND runtime_channel = $2`,
+    // P1d:已用 IP 集合按 channel —— v3 分配只避让 v3 已用 IP(v5 在 172.31 段,互不干涉)。
+    [hostId, getRuntimeChannel()],
   );
   for (const row of r.rows) used.add(row.bound_ip);
 

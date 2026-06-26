@@ -47,6 +47,7 @@
 import type Docker from "dockerode";
 import type { Pool } from "pg";
 import { v3VolumeNameFor } from "./v3supervisor.js";
+import { getRuntimeChannel } from "../runtimeChannel.js";
 
 /** Per-user media dir prefix on master (docker volume host path). */
 export const USER_VOLUME_MEDIA_HOST_PREFIX = "/var/lib/docker/volumes";
@@ -69,19 +70,26 @@ export type MediaKind = "uploads" | "generated";
  * directory (either subdir). Public + exported so the gateway can reuse the
  * same source of truth when iterating user volumes for orphan sweeps.
  *
- *   /var/lib/docker/volumes/oc-v3-data-u<digits>/_data/(uploads|generated)
+ *   /var/lib/docker/volumes/oc-<channel>-data-u<digits>/_data/(uploads|generated)
+ *
+ * P1d:卷前缀 channel 化 —— 与 v3VolumeNameFor 同一权威(oc-${channel}-data)。每个进程按
+ * 自身 OC_RUNTIME_CHANNEL 构建严格 per-channel regex:v3 进程只认 oc-v3-data,v5 只认
+ * oc-v5-data → 媒体读路径不会跨 channel(v5 不会把 v3 卷路径当合法,反之亦然)。
  *
  * No trailing slash, no trailing junk — callers should `realpathSync` first,
  * which strips trailing slashes. Digits = 1-19 positive (matches
  * v3VolumeNameFor's `Number.isInteger && >0` invariant, since 2^63 fits in
  * 19 digits).
  */
-export const USER_VOLUME_MEDIA_DIR_REGEX =
-  /^\/var\/lib\/docker\/volumes\/oc-v3-data-u([1-9][0-9]{0,18})\/_data\/(uploads|generated)$/;
+const MEDIA_VOLUME_PREFIX = `oc-${getRuntimeChannel()}-data`;
+export const USER_VOLUME_MEDIA_DIR_REGEX = new RegExp(
+  `^/var/lib/docker/volumes/${MEDIA_VOLUME_PREFIX}-u([1-9][0-9]{0,18})/_data/(uploads|generated)$`,
+);
 
 /** Strict regex over the trailing component (uid + filename) under the dir. */
-export const USER_VOLUME_MEDIA_FILE_REGEX =
-  /^\/var\/lib\/docker\/volumes\/oc-v3-data-u([1-9][0-9]{0,18})\/_data\/(uploads|generated)\/[^/]+$/;
+export const USER_VOLUME_MEDIA_FILE_REGEX = new RegExp(
+  `^/var/lib/docker/volumes/${MEDIA_VOLUME_PREFIX}-u([1-9][0-9]{0,18})/_data/(uploads|generated)/[^/]+$`,
+);
 
 /**
  * Build the master-side host path for a user's media subdirectory.
@@ -260,8 +268,10 @@ export function createUserMediaResolver(deps: {
         `SELECT h.name AS host_name, h.id::text AS host_uuid, c.id::text AS container_id
            FROM agent_containers c
            JOIN compute_hosts h ON c.host_uuid = h.id
-          WHERE c.user_id = $1 AND c.state = 'active'`,
-        [uid],
+          WHERE c.user_id = $1 AND c.state = 'active' AND c.runtime_channel = $2`,
+        // P1d:媒体解析按 channel —— 否则同 user v3+v5 并行 active 会命中 >1 行走 ambiguous fail-closed,
+        // 或选错 channel 的 host/volume,破坏 v5 媒体链路。
+        [uid, getRuntimeChannel()],
       );
       rows = res.rows;
     } catch (err) {

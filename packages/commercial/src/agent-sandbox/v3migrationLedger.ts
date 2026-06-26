@@ -25,6 +25,7 @@
 
 import type { QueryRunner } from "../db/queries.js";
 import { query } from "../db/queries.js";
+import { getRuntimeChannel } from "../runtimeChannel.js";
 
 // ───────────────────────────────────────────────────────────────────────
 // 类型
@@ -334,10 +335,13 @@ export async function findOpenByUser(
        JOIN agent_migrations m ON m.agent_container_id = c.id
       WHERE c.user_id = $1
         AND c.state IN ('active', 'pending_apply')
+        AND c.runtime_channel = $2
         AND m.phase NOT IN ('committed', 'rolled_back')
       ORDER BY m.updated_at DESC, m.id DESC
       LIMIT 1`,
-    [userId.toString()],
+    // P1d:ensureRunning open-migration 闸门按 channel —— v3 用户的 open migration 不应阻断
+    // v5 的 ensureRunning(反之亦然);v5 控制面静默本就不产生 migration,过滤同时是未来防御。
+    [userId.toString(), getRuntimeChannel()],
     runner,
   );
   if (r.rows.length === 0) return null;

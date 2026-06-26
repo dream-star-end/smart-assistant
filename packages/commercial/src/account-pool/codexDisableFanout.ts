@@ -35,6 +35,7 @@
 
 import type { QueryRunner } from '../db/queries.js'
 import { query as defaultQuery, tx as defaultTx } from '../db/queries.js'
+import { getRuntimeChannel } from '../runtimeChannel.js'
 import {
   type LazyMigrateOutcome,
   type WriteAuthDeps,
@@ -128,10 +129,11 @@ async function runFanout(
     //    tx 内每个容器自己拿,FOR UPDATE 范围必须最小,否则限流 N=4 也会撑大
     //    锁集。
     const rows = await queryFn<{ id: string }>(
+      // P1d 防御:按 channel(fanout 受 controlPlaneEnabled gate,v5 不跑;codex 下线见 P1f)。
       `SELECT id::text AS id
        FROM agent_containers
-       WHERE codex_account_id = $1 AND state = 'active'`,
-      [String(accountId)],
+       WHERE codex_account_id = $1 AND state = 'active' AND runtime_channel = $2`,
+      [String(accountId), getRuntimeChannel()],
     )
     if (rows.rows.length === 0) {
       logger?.info?.('codex_fanout_no_containers', { accountId: String(accountId) })
@@ -274,14 +276,18 @@ export async function findCodexDisableDrift(
   queryFn: typeof defaultQuery = defaultQuery,
 ): Promise<CodexDriftRow[]> {
   const res = await queryFn<{ container_id: string; account_id: string }>(
+    // P1d 防御:drift reconciler 扫 active 容器做迁移/写 auth,按 channel —— 否则 v3 drift
+    // 可能扫到 v5 active 容器的 codex 账号进迁移路径(codex 下线见 P1f)。
     `SELECT ac.id::text AS container_id, ac.codex_account_id::text AS account_id
        FROM agent_containers ac
        JOIN claude_accounts ca ON ca.id = ac.codex_account_id
       WHERE ac.state = 'active'
+        AND ac.runtime_channel = $1
         AND ac.codex_account_id IS NOT NULL
         AND ca.provider = 'codex'
         AND ca.status <> 'active'
       ORDER BY ac.id`,
+    [getRuntimeChannel()],
   )
   return res.rows.map((r) => ({ containerId: Number(r.container_id), accountId: BigInt(r.account_id) }))
 }

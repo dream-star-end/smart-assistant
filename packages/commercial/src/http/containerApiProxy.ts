@@ -13,6 +13,7 @@ import { request as httpRequest } from 'node:http'
 import { isIPv4 } from 'node:net'
 import type { TLSSocket } from 'node:tls'
 import { matchCommercialContainerApiProxy } from '@openclaude/gateway'
+import { getRuntimeChannel } from '../runtimeChannel.js'
 import type { V3ContainerStatus, V3SupervisorDeps } from '../agent-sandbox/v3supervisor.js'
 import { V3_CONTAINER_PORT, getV3ContainerStatus } from '../agent-sandbox/v3supervisor.js'
 import { type dialTunnelSocket, hostRowToTarget } from '../compute-pool/nodeAgentClient.js'
@@ -53,7 +54,9 @@ export function matchContainerApiProxyRoute(path: string, method: string): boole
 function isBoundIpAllowed(ip: string): boolean {
   if (!isIPv4(ip)) return false
   const p = ip.split('.').map(Number)
-  return p[0] === 172 && p[1] === 30
+  // channel-aware 网段白名单:v3=172.30/16,v5=172.31/16(同 containerFileProxy)。
+  const expectSecond = getRuntimeChannel() === 'v5' ? 31 : 30
+  return p[0] === 172 && p[1] === expectSecond
 }
 
 async function readRequestBodyCapped(req: IncomingMessage): Promise<Buffer> {

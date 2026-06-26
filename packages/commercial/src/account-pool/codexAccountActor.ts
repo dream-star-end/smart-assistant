@@ -33,6 +33,7 @@
 import type { PoolClient } from 'pg'
 
 import { tx } from '../db/queries.js'
+import { getRuntimeChannel } from '../runtimeChannel.js'
 import { writeCodexContainerAuthFile } from '../codex-auth/codexAuthFile.js'
 import { query } from '../db/queries.js'
 import { refreshCodexAccountToken, type RefreshCodexDeps } from './refresh.js'
@@ -163,10 +164,11 @@ export function startCodexRefreshActor(deps: CodexRefreshActorDeps): CodexRefres
 
       // 枚举绑定容器(无锁查询,只为拿 cid 列表;FOR UPDATE 在每个 cid 的独立事务里取)
       const containerRes = await queryFn<{ id: string }>(
+        // P1d 防御:按 channel(codex actor 受 controlPlaneEnabled gate,v5 不跑;codex 下线见 P1f)。
         `SELECT id::text AS id
          FROM agent_containers
-         WHERE codex_account_id = $1 AND state = 'active'`,
-        [String(accountId)],
+         WHERE codex_account_id = $1 AND state = 'active' AND runtime_channel = $2`,
+        [String(accountId), getRuntimeChannel()],
       )
       if (containerRes.rows.length === 0) return
 
@@ -212,9 +214,9 @@ export function startCodexRefreshActor(deps: CodexRefreshActorDeps): CodexRefres
       const lockRes = await client.query<ContainerLockRow>(
         `SELECT codex_account_id::text AS codex_account_id, state, host_uuid::text AS host_uuid
          FROM agent_containers
-         WHERE id = $1
+         WHERE id = $1 AND runtime_channel = $2
          FOR UPDATE`,
-        [containerId],
+        [containerId, getRuntimeChannel()],
       )
       if (lockRes.rows.length === 0) {
         // 容器在枚举与持锁之间被删了 — skip(rollback 自然回滚 SELECT)

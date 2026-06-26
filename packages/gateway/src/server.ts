@@ -9064,8 +9064,11 @@ const MEDIA_EXTENSIONS = new Set([
  * gate ever needs to match more shapes (e.g. additional subdirs alongside
  * uploads/generated), update both this regex and the commercial-side ones.
  */
+// P1d:同时匹配 v3(oc-v3-data)与 v5(oc-v5-data)用户卷媒体路径。这是 fail-closed deny
+// gate,over-match 是安全方向 —— 若 v5 路径不被本 gate 捕获,会落到非 uid-aware 的
+// FILE_ALLOWED_DIRS/agent-CWD 分支 → v5 媒体跨租户 IDOR。匹配两 channel 前缀即堵死。
 const COMMERCIAL_USER_VOLUME_MEDIA_GATE =
-  /^\/var\/lib\/docker\/volumes\/oc-v3-data-u\d+\/_data\/(uploads|generated)(\/|$)/
+  /^\/var\/lib\/docker\/volumes\/oc-v[35]-data-u\d+\/_data\/(uploads|generated)(\/|$)/
 
 /**
  * v3 trusted backend mode — agent OS user home root inside the per-user docker
