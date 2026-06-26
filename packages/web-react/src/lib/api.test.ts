@@ -83,7 +83,7 @@ test('concurrent 401s trigger only ONE /api/auth/refresh (singleflight) and both
 
   const { session } = makeSession('tok1')
   // 两个并发鉴权请求同时拿旧 token → 同时 401。
-  const [a, b] = await Promise.all([api.me(session), api.me(session)])
+  const [a, b] = await Promise.all([api.getMe(session), api.getMe(session)])
 
   expect(refreshCalls).toBe(1) // 关键：只刷新一次，不会触发后端 reuse 撤 family
   expect(a.id).toBe('u1')
@@ -103,7 +103,7 @@ test('a failed refresh calls onExpired exactly once and surfaces the original er
   vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
 
   const { session, expired } = makeSession('tok1')
-  await expect(api.me(session)).rejects.toThrow()
+  await expect(api.getMe(session)).rejects.toThrow()
   expect(refreshCalls).toBe(1)
   expect(expired()).toBe(true)
 })

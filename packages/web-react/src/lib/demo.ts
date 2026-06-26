@@ -1,6 +1,19 @@
-import type { Message, Session, User } from "./types";
+import type { Message, PublicModel, Session, User } from "./types";
 
 export const DEMO_USER: User = { id: "demo", displayName: "rqmn", roles: ["user"] };
+
+/**
+ * 离线预览用的模型列表（?demo=1）。真实工作区一律由 GET /api/public/models 驱动
+ * （v5 经 dropGptForV5Channel 仅 claude/glm-5.2/deepseek/minimax）；这里只是为了
+ * 让 demo 模式在零网络下也能展示模型选择器的视觉，刻意与后端权威源解耦、不参与任何请求。
+ */
+export const DEMO_MODELS: PublicModel[] = [
+  { id: "claude-opus-4-7", display_name: "Claude Opus 4.7" },
+  { id: "claude-sonnet-4-6", display_name: "Claude Sonnet 4.6" },
+  { id: "glm-5.2", display_name: "GLM-5.2" },
+  { id: "deepseek", display_name: "DeepSeek" },
+  { id: "MiniMax-M3", display_name: "MiniMax M3" },
+];
 
 const now = Date.now();
 const iso = (mins: number) => new Date(now - mins * 60000).toISOString();

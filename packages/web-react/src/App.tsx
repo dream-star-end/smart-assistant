@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { AgentGate } from "./components/AgentGate";
 import { AgentPicker } from "./components/AgentPicker";
 import { AuthGate } from "./components/AuthGate";
 import { ChatHeader } from "./components/ChatHeader";
@@ -7,14 +8,16 @@ import { EmptyState } from "./components/EmptyState";
 import { type ChatError, ErrorBanner } from "./components/ErrorBanner";
 import { Landing } from "./components/Landing";
 import { AssistantMessage, UserMessage } from "./components/Message";
+import { modelLabel } from "./components/ModelSelector";
 import { SettingsCenter } from "./components/SettingsCenter";
 import { Sidebar } from "./components/Sidebar";
-import { Sheet } from "./components/ui";
+import { Alert, Sheet } from "./components/ui";
+import { useAgentGate } from "./hooks/useAgentGate";
 import { useTheme } from "./hooks/useTheme";
 import { DEFAULT_AGENT } from "./lib/agents";
 import { api } from "./lib/api";
-import { DEMO_MESSAGES, DEMO_SESSIONS, DEMO_USER, demoReply } from "./lib/demo";
-import type { AuthSession, Message, Session, ToolCard, User } from "./lib/types";
+import { DEMO_MESSAGES, DEMO_MODELS, DEMO_SESSIONS, DEMO_USER, demoReply } from "./lib/demo";
+import type { AuthSession, Message, PublicModel, Session, ToolCard, User } from "./lib/types";
 
 /**
  * P2 占位：v5 对话传输（WS user-chat-bridge）在 P4 接入。在此之前，登录后的工作区
@@ -63,6 +66,11 @@ export function App() {
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
   const [agent, setAgent] = useState(DEFAULT_AGENT);
   const [pickerOpen, setPickerOpen] = useState(false);
+  // 对话模型：唯一权威源是后端 GET /api/public/models（v5 仅 claude/glm-5.2/deepseek/minimax）。
+  // demo 用本地 fixture 仅作离线视觉，不发请求。选中的 modelId 由 P4 的 WS inbound.message 顶层发送。
+  const [models, setModels] = useState<PublicModel[]>(demo ? DEMO_MODELS : []);
+  const [modelId, setModelId] = useState<string | undefined>(demo ? DEMO_MODELS[0]?.id : undefined);
+  const [modelsLoading, setModelsLoading] = useState(false);
   const [chatError, setChatError] = useState<ChatError | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -245,6 +253,24 @@ export function App() {
     clearAuth();
   }, [demo, clearAuth]);
 
+  // 刷新账户余额（GET /api/me）：充值到账 / 打开计费面板后调用，让顶栏 balance-pill
+  // 与账户分区拿到权威 credits（字符串大数，原样存进 user）。失败静默（401 会触发 onExpired）。
+  const refreshMe = useCallback(async () => {
+    if (demo || !authed) return;
+    try {
+      const me = await api.getMe(authRef.current);
+      setUser(me);
+    } catch {
+      /* 刷新失败静默：余额停留在上次已知值，不打断当前操作 */
+    }
+  }, [demo, authed]);
+
+  // 打开设置中心并顺带刷新余额（顶栏 pill / 侧栏 / AgentGate 充值入口统一走此）。
+  const openSettings = useCallback(() => {
+    void refreshMe();
+    setSettingsOpen(true);
+  }, [refreshMe]);
+
   // autoscroll
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" });
@@ -252,6 +278,35 @@ export function App() {
 
   // 键盘快捷键：⌘/Ctrl+K 新会话；Esc 停止当前（demo）流式。仅在进入工作区后生效。
   const inWorkspace = demo || (view === "app" && !!auth && !!user);
+
+  // 进入工作区后拉取模型列表（公开端点；登录态带 Bearer 走 grants 视图）。失败不阻断
+  // 对话前置——选择器降级为「暂无可用模型」，对话仍可在订阅就绪后进行。
+  useEffect(() => {
+    if (demo || !auth) return;
+    let cancelled = false;
+    setModelsLoading(true);
+    api
+      .getPublicModels(auth)
+      .then((ms) => {
+        if (cancelled) return;
+        setModels(ms);
+        // 保留用户已选（若仍在列表内），否则落到列表首项。
+        setModelId((cur) => (cur && ms.some((m) => m.id === cur) ? cur : ms[0]?.id));
+      })
+      .catch(() => {
+        /* 公开端点失败：保持空列表，选择器禁用，不弹错误打断前置流程 */
+      })
+      .finally(() => {
+        if (!cancelled) setModelsLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [demo, auth]);
+
+  // 对话前置态机：检查订阅/容器、引导开通、轮询容器至就绪。gate.access=false 时由
+  // AgentGate 面板占据对话区并禁用 Composer；gate.ready 是 P4 useChatSocket 连接的硬前置。
+  const gate = useAgentGate(auth, inWorkspace && !demo);
   useEffect(() => {
     if (!inWorkspace) return;
     const onKey = (e: KeyboardEvent) => {
@@ -291,6 +346,12 @@ export function App() {
   }
 
   const showEmpty = messages.length === 0 && !busy;
+  // 对话前置门：非 demo 且尚无访问权（容器未就绪/未订阅/出错等）→ 由 AgentGate 占据对话区
+  // 并禁用 Composer。demo 与已就绪（ready|dormant）放行正常对话。
+  const gated = !demo && !gate.access;
+  const selectedModel = models.find((m) => m.id === modelId);
+  // Composer 底部展示当前对话模型（真实模型名优先，退回 agent 名仅作占位）。
+  const modelFooter = selectedModel ? modelLabel(selectedModel) : agent.name;
 
   // 侧栏公共 props：桌面内联与移动抽屉两处复用。余额（balanceCents）本期不展示（P3.5 计费中心）。
   const renameSessionPrompt = (s: Session) => {
@@ -311,8 +372,8 @@ export function App() {
     sessions,
     activeId,
     user,
-    balanceCents: null,
-    onOpenAccount: demo ? undefined : () => setSettingsOpen(true),
+    credits: user?.credits ?? null,
+    onOpenAccount: demo ? undefined : openSettings,
     onNew: newSession,
     onRename: renameSessionPrompt,
     onDelete: deleteSessionConfirm,
@@ -355,6 +416,12 @@ export function App() {
         <ChatHeader
           agent={agent}
           onAgentClick={() => setPickerOpen(true)}
+          models={models}
+          selectedModelId={modelId}
+          onSelectModel={setModelId}
+          modelsLoading={modelsLoading}
+          credits={demo ? null : (user?.credits ?? null)}
+          onOpenBilling={demo ? undefined : openSettings}
           sidebarCollapsed={collapsed}
           onExpandSidebar={() => setCollapsed(false)}
           onNew={newSession}
@@ -364,7 +431,14 @@ export function App() {
         />
 
         <div ref={scrollRef} className="flex-1 overflow-y-auto">
-          {showEmpty ? (
+          {gated ? (
+            <AgentGate
+              phase={gate.phase}
+              onOpen={gate.open}
+              onRetry={gate.check}
+              onTopUp={openSettings}
+            />
+          ) : showEmpty ? (
             <EmptyState agent={agent} onPick={send} onChangeAgent={() => setPickerOpen(true)} />
           ) : (
             <div className="mx-auto flex max-w-3xl flex-col gap-7 px-5 py-8">
@@ -397,6 +471,11 @@ export function App() {
         </div>
 
         <div className="shrink-0 pb-3">
+          {!demo && gate.phase.kind === "dormant" && (
+            <div className="mx-auto mb-2 max-w-3xl px-4">
+              <Alert tone="info">容器已休眠，接入实时对话后将自动唤醒（P4）。</Alert>
+            </div>
+          )}
           {chatError && (
             <ErrorBanner
               error={chatError}
@@ -412,7 +491,8 @@ export function App() {
             onSend={send}
             busy={busy}
             onStop={demo ? () => (stopRef.current = true) : interrupt}
-            model={agent.name}
+            model={modelFooter}
+            disabled={gated}
             placeholder={`和「${agent.name}」对话…`}
           />
         </div>
@@ -431,12 +511,13 @@ export function App() {
 
       <SettingsCenter
         open={settingsOpen}
-        billing={null}
+        auth={auth}
         user={user}
         theme={theme}
+        demo={demo}
         onClose={() => setSettingsOpen(false)}
         onSetTheme={setTheme}
-        onReauth={clearAuth}
+        onRefreshMe={refreshMe}
       />
     </div>
   );

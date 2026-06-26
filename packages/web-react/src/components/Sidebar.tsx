@@ -2,14 +2,14 @@ import { LogOut, PanelLeftClose, Pencil, Plus, Search, Sparkles, Trash2 } from "
 import { useMemo, useState } from "react";
 import { BRAND } from "../lib/brand";
 import type { Session, User } from "../lib/types";
-import { cn, formatCny, groupLabel } from "../lib/utils";
+import { cn, formatCredits, groupLabel } from "../lib/utils";
 import { Avatar, Button, IconButton } from "./ui";
 
 export function Sidebar({
   sessions,
   activeId,
   user,
-  balanceCents,
+  credits,
   onSelect,
   onNew,
   onRename,
@@ -21,7 +21,8 @@ export function Sidebar({
   sessions: Session[];
   activeId?: string;
   user: User | null;
-  balanceCents?: number | null;
+  /** 账户余额（积分字符串大数，来自 /api/me）。null 时退化为通用文案。 */
+  credits?: string | null;
   onSelect: (id: string) => void;
   onNew: () => void;
   onRename: (s: Session) => void;
@@ -146,7 +147,7 @@ export function Sidebar({
               {user?.displayName || "未登录"}
             </span>
             <span className="block truncate text-[11.5px] text-faint">
-              {typeof balanceCents === "number" ? `余额 ${formatCny(balanceCents)}` : "多模型 · 计量计费"}
+              {credits != null ? `余额 ${formatCredits(credits)} 积分` : "多模型 · 计量计费"}
             </span>
           </span>
         </button>

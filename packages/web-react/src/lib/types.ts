@@ -50,26 +50,10 @@ export type ToolCard = {
   evidence?: string[];
 };
 
-export type BillingLedgerEntry = {
-  id: string;
-  type: "seed_grant" | "topup_test" | "charge" | "refund" | "monthly_grant";
-  amountCents: number;
-  balanceAfterCents: number;
-  currency: string;
-  description: string;
-  createdAt: string;
-  traceId?: string;
-};
-
-/**
- * 计费摘要（账户面板用）。v5 计费/账单中心在 P3.5 接入（/api/me/usage + 充值），
- * 本期 SettingsCenter / Sidebar 以 `Billing | null` 接收，恒传 null（不显示余额）。
- */
-export type Billing = {
-  currency: string;
-  balanceCents: number;
-  ledger: BillingLedgerEntry[];
-};
+// P3.5 计费/账单中心已接入真实 v5 契约：余额走 /api/me 的 credits（字符串大数），
+// 账单流水走 /api/me/usage 的 credit_ledger（keyset 分页），充值走 /api/payment/*。
+// 旧的本地 Billing/BillingLedgerEntry（分为单位、number）已废弃删除——计费 surface
+// 全程消费下方 v5 wire 类型，绝不再数值化大数。
 
 /**
  * 鉴权会话：access token 的唯一权威源（仅存内存，绝不落地）。
@@ -131,13 +115,25 @@ export type PublicModel = {
 /** 用户偏好快照（GET/PATCH /api/me/preferences）。strict allowlist 在后端，前端宽松透传。 */
 export type Preferences = Record<string, unknown>;
 
+/** agent_subscriptions.status（后端权威：commercial/src/agent/subscriptions.ts）。 */
+export type AgentSubscriptionStatus = "active" | "expired" | "canceled" | "suspended";
+
+/** agent_containers.status（后端权威：commercial/src/agent/subscriptions.ts）。 */
+export type AgentContainerStatus =
+  | "provisioning"
+  | "running"
+  | "stopped"
+  | "removed"
+  | "error";
+
 /** Agent 订阅/容器状态（GET /api/agent/status）。 */
 export type AgentStatus = {
+  /** false = 系统未开 agent 运行时；true + subscription=null = 用户未订阅。 */
   runtimeReady: boolean;
   subscription: {
     id: string;
     plan: string;
-    status: string;
+    status: AgentSubscriptionStatus | string;
     startAt: string;
     endAt: string;
     autoRenew: boolean;
@@ -145,14 +141,23 @@ export type AgentStatus = {
   } | null;
   container: {
     id: string;
-    status: string;
+    subscriptionId: string | null;
+    dockerId: string | null;
     dockerName: string | null;
-    lastError: string | null;
+    image: string | null;
+    status: AgentContainerStatus | string;
+    lastStartedAt: string | null;
+    lastStoppedAt: string | null;
     volumeGcAt: string | null;
+    lastError: string | null;
   } | null;
 };
 
-/** Agent 开通受理（POST /api/agent/open，202 provisioning）。 */
+/**
+ * Agent 开通受理（POST /api/agent/open，202 provisioning）。
+ * 402（余额不足，issues 带 shortfall）/ 409（已订阅，issues 带 subscription_id+end_at）
+ * 经 ApiError 抛出，调用方按 status 分支。balanceAfter 为字符串大数，勿数值化。
+ */
 export type AgentOpenResult = {
   subscriptionId: string;
   containerId: string;
@@ -160,7 +165,18 @@ export type AgentOpenResult = {
   startAt: string;
   endAt: string;
   balanceAfter: string;
+  ledgerId: string;
   dockerName: string;
+  workspaceVolume: string;
+  homeVolume: string;
+};
+
+/** Agent 退订（POST /api/agent/cancel）。404 = 未订阅（经 ApiError 抛出）。 */
+export type AgentCancelResult = {
+  subscriptionId: string;
+  endAt: string;
+  autoRenew: false;
+  wasAutoRenew: boolean;
 };
 
 /**
@@ -172,4 +188,225 @@ export type StreamHandlers = {
   onToolCard?: (card: ToolCard) => void;
   onError?: (err: StreamError) => void;
   onDone: (payload: { session: Session; messages: Message[] }) => void;
+};
+
+// ─── 会话历史（权威源 = gateway/src/server.ts，非 commercial router） ────────
+//
+// 注意：这一组端点的 wire 形态是 **camelCase**（gateway 直接序列化 storage 层的
+// TS 对象 ClientSessionMeta / ClientSession），与 commercial REST 的 snake_case
+// 截然不同 —— 故此处类型不做适配，按 wire 原样透传，供 P4/P5 装载真实会话。
+// 鉴权：gateway checkHttpAuth 接受 commercial access JWT（按 `c:<sub>` 分区），
+// 因此仍走 Bearer + callWithRefresh。messages 内层结构是 P4/P5 的渲染契约，这里宽松 unknown[]。
+
+/** GET /api/sessions/list → { sessions: SessionMeta[] }。列表项，无 messages。 */
+export type SessionMeta = {
+  id: string;
+  agentId: string;
+  title: string;
+  pinned: boolean;
+  createdAt: number;
+  lastAt: number;
+  messageCount: number;
+  updatedAt: number;
+};
+
+/**
+ * GET /api/sessions/:id（全量或增量）。
+ * - 全量（无 since / since≤0）：isPartial=false，messages 为完整数组。
+ * - 增量（?since=<seq>）：messages 仅含 `_seq > since` 的增量；legacy 行降级为
+ *   isPartial=false + 全量 messages（后端无副作用回填）。
+ * maxSeq 由 messages 实算（非 next_seq-1），客户端据此推进游标。
+ */
+export type SessionDetail = {
+  id: string;
+  userId: string;
+  agentId: string;
+  title: string;
+  pinned: boolean;
+  createdAt: number;
+  lastAt: number;
+  messages: unknown[];
+  updatedAt: number;
+  isPartial: boolean;
+  totalMessageCount: number;
+  maxSeq: number;
+};
+
+/**
+ * PUT /api/sessions/:id 请求体。`_baseSyncedAt` 是乐观并发基线（上次同步到的
+ * updatedAt）：服务端若发现 existing.updated_at > _baseSyncedAt → 409 conflict。
+ * wire body 上限 2MB（超出 413）；存储层 blob 上限 4MB（post-merge 超出也 413 oversized）。
+ */
+export type PutSessionInput = {
+  agentId?: string;
+  title?: string;
+  pinned?: boolean;
+  createdAt?: number;
+  lastAt?: number;
+  messages?: unknown[];
+  _baseSyncedAt?: number;
+};
+
+/** PUT /api/sessions/:id 成功响应。 */
+export type PutSessionResult = { ok: true; applied: boolean; updatedAt: number };
+
+// ─── 用量统计（GET /api/me/usage，commercial REST，snake_case 透传） ─────────
+//
+// 设计取舍：这是一个 ~25 字段的只读聚合 read-model，后端 wire 形态即唯一权威。
+// 若强行 snake→camel 适配会引入第二套必须与后端同步演进的并行 schema（drift 风险），
+// 故此处刻意保留 snake_case 类型镜像 wire，不做适配。**所有大数（token / credit /
+// cost）后端均以字符串返回，本类型一律 string，严禁 Number() 化。**
+
+export type UsageSummary = {
+  input_tokens: string;
+  output_tokens: string;
+  cache_read_tokens: string;
+  cache_write_tokens: string;
+  requests_total: string;
+  /** 名义账单（按 pricing 计），可能 != 实扣（clamp / billing_failed）。 */
+  billed_credits: string;
+  /** 实际扣款（credit_ledger delta<0 聚合）。 */
+  debited_credits: string;
+};
+
+export type UsageLegacyUnattributed = {
+  requests: string;
+  input_tokens: string;
+  output_tokens: string;
+  cache_read_tokens: string;
+  cache_write_tokens: string;
+  billed_credits: string;
+};
+
+export type UsageSavings = {
+  /** 节省积分（字符串大数）；savings_unavailable=true 时为 null。 */
+  savings_credits: string | null;
+  savings_is_estimate: boolean;
+  savings_unavailable: boolean;
+  savings_rows_skipped: number;
+};
+
+export type UsageSessionRow = {
+  session_id: string;
+  requests: string;
+  input_tokens: string;
+  output_tokens: string;
+  cache_read_tokens: string;
+  cache_write_tokens: string;
+  billed_credits: string;
+  last_used_at: string;
+};
+
+export type UsageSessionsPage = {
+  rows: UsageSessionRow[];
+  limit: number;
+  offset: number;
+  has_more: boolean;
+};
+
+export type UsageLedgerRow = {
+  id: string;
+  delta: string;
+  balance_after: string;
+  reason: string;
+  ref_type: string | null;
+  ref_id: string | null;
+  memo: string | null;
+  created_at: string;
+};
+
+export type UsageLedger = {
+  rows: UsageLedgerRow[];
+  /** keyset 游标：下一页传 ledger_before=next_before；null = 到底。 */
+  next_before: string | null;
+};
+
+export type UsageResponse = {
+  summary: UsageSummary;
+  legacy_unattributed: UsageLegacyUnattributed;
+  savings: UsageSavings;
+  cache: { hit_rate: number | null };
+  sessions: UsageSessionsPage;
+  ledger: UsageLedger;
+  cutoff_started_at: string | null;
+};
+
+/** getUsage 查询参数（分页 / keyset 游标）。 */
+export type UsageQuery = {
+  sessionsLimit?: number;
+  sessionsOffset?: number;
+  ledgerLimit?: number;
+  /** credit_ledger id keyset 游标（取上一页 ledger.next_before）。 */
+  ledgerBefore?: string;
+};
+
+// ─── API Keys（GET/POST/DELETE /api/me/api-keys，commercial REST） ───────────
+// 注意：当前后端 admin-only rollout —— 普通用户调用返 403（requireAdmin）。
+
+/** API key 摘要（列表项），不含明文与 hash。 */
+export type ApiKeySummary = {
+  id: string;
+  label: string;
+  keyPrefix: string;
+  createdAt: string;
+  lastUsedAt: string | null;
+};
+
+/** 新建 API key（201）。`plaintext` 完整明文仅此一次返回，之后无法再取。 */
+export type CreatedApiKey = {
+  id: string;
+  label: string;
+  keyPrefix: string;
+  /** `oc-cc.<prefix>.<secret>` —— 仅创建时返回一次，必须立即引导用户保存。 */
+  plaintext: string;
+  createdAt: string;
+};
+
+// ─── 充值 / 计费（GET /api/payment/*，commercial REST，虎皮椒扫码） ──────────
+// 金额一律「分」字符串大数，credits 字符串大数，全程勿数值化。
+
+/** 充值套餐（GET /api/payment/plans，公开端点；带 token 则按用户过滤首充档）。 */
+export type PaymentPlan = {
+  code: string;
+  label: string;
+  /** 金额（分），字符串。 */
+  amountCents: string;
+  /** 到账积分，字符串。 */
+  credits: string;
+};
+
+/** 创建虎皮椒订单（POST /api/payment/hupi/create）。409 = 首充已用过（FIRST_TOPUP_USED）。 */
+export type HupiCreateResult = {
+  orderNo: string;
+  /** 扫码 URL（PC 端展二维码）。 */
+  qrcodeUrl: string;
+  /** 移动端跳转 URL（可能 null）。 */
+  mobileUrl: string | null;
+  amountCents: string;
+  credits: string;
+  expiresAt: string;
+};
+
+/** 订单视图（GET /api/payment/orders/:orderNo，轮询）。status: pending|paid|expired|... */
+export type PaymentOrder = {
+  orderNo: string;
+  status: string;
+  amountCents: string;
+  credits: string;
+  expiresAt: string;
+  paidAt: string | null;
+  createdAt: string;
+  provider: string;
+};
+
+// ─── 媒体签名（commercial REST） ─────────────────────────────────────────────
+
+/**
+ * POST /api/media-sign → 容器内路径 → opaque 签名 URL 映射。
+ * `urls` 仅含通过 ACL（isContainerPathAllowed）的路径，被拒路径会被 **静默跳过**
+ * （key 缺失即未签发，调用方需自行判断缺漏）。expMs = 绝对过期时间戳（ms）。
+ */
+export type MediaSignResult = {
+  urls: Record<string, string>;
+  expMs: number;
 };

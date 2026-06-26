@@ -2486,6 +2486,23 @@ export class Gateway {
       return
     }
 
+    // ── API / WS 404 守卫（仅 spa 模式）────────────────────────────────────
+    // 走到这里说明请求未匹配上方任何 /api/* 或 /ws/* 路由(所有已匹配路由都已 return)。
+    // spa 模式必须在 SPA fallback 之前对未匹配的 /api/*、/ws/* 显式返回 404 JSON:
+    // 否则它们会落到下方 SPA fallback 拿到 index.html(200),新 React client 调错端点
+    // 时会把 HTML 当 JSON 解析直接抛错、难定位。
+    // 严格 gate 在 staticMode==='spa':vanilla(v3) 分支完全不进此守卫,行为字节级不变
+    // (v3 零影响);且只拦"本就该 404 的兜底",不触碰任何已匹配路由。
+    if (
+      this.deps.staticMode === 'spa' &&
+      (url.pathname.startsWith('/api/') ||
+        url.pathname === '/ws' ||
+        url.pathname.startsWith('/ws/'))
+    ) {
+      this.sendJson(res, 404, { error: 'not found' })
+      return
+    }
+
     // 静态 web UI (with in-memory cache)
     if (this.deps.webRoot) {
       const safePath = url.pathname === '/' ? '/index.html' : url.pathname

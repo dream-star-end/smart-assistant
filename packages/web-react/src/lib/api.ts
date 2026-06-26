@@ -1,14 +1,27 @@
 import type {
+  AgentCancelResult,
   AgentOpenResult,
   AgentStatus,
+  ApiKeySummary,
   AuthSession,
+  CreatedApiKey,
+  HupiCreateResult,
   LoginResult,
+  MediaSignResult,
+  PaymentOrder,
+  PaymentPlan,
   Preferences,
   PublicConfig,
   PublicModel,
+  PutSessionInput,
+  PutSessionResult,
   RefreshResult,
   RegisterResult,
+  SessionDetail,
+  SessionMeta,
   StreamHandlers,
+  UsageQuery,
+  UsageResponse,
   User,
   VerifyEmailResult,
 } from "./types";
@@ -67,6 +80,25 @@ async function callWithRefresh(
   return make(newToken);
 }
 
+/** 可中断 sleep（用于冷启轮询退避）。abort 时 reject AbortError 并清理定时器。 */
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new DOMException("aborted", "AbortError"));
+      return;
+    }
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(new DOMException("aborted", "AbortError"));
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
 /** 拼鉴权头：身份完全由 access JWT(sub) 决定，只带 Bearer。 */
 function bearerHeaders(token: string, json = false): Record<string, string> {
   const h: Record<string, string> = { Accept: "application/json", Authorization: `Bearer ${token}` };
@@ -80,18 +112,97 @@ function withReqId(msg: string, res: Response): string {
   return id ? `${msg}（追踪号 ${id}）` : msg;
 }
 
+/** 后端错误 issue（commercial HttpError.issues：path+message 键值对）。 */
+export type ApiIssue = { path: string; message: string };
+
+/**
+ * 统一的网络错误类型 —— 唯一权威，承载 status / code / issues / requestId，
+ * 让上层按 **状态码 + 机器码** 分支（402 余额不足 / 409 已订阅 / 409 conflict /
+ * 413 too large / 404 not found …），而不是去 parse 中文 message 字符串。
+ *
+ * 兼容两套后端错误信封：
+ *   - commercial REST：`{ error: { code, message, issues? } }`
+ *   - gateway（会话历史等）：`{ error: "<string>" }`
+ */
+export class ApiError extends Error {
+  readonly status: number;
+  readonly code?: string;
+  readonly requestId?: string;
+  readonly issues?: ApiIssue[];
+  /** 503 / 4503 冷启场景的建议重试秒数（Retry-After 头或 body）。 */
+  readonly retryAfterSec?: number;
+  /** 原始解析后的 body（调试 / 提取 commercial issues 的额外字段）。 */
+  readonly body?: unknown;
+  constructor(init: {
+    status: number;
+    message: string;
+    code?: string;
+    requestId?: string;
+    issues?: ApiIssue[];
+    retryAfterSec?: number;
+    body?: unknown;
+  }) {
+    super(init.message);
+    this.name = "ApiError";
+    this.status = init.status;
+    this.code = init.code;
+    this.requestId = init.requestId;
+    this.issues = init.issues;
+    this.retryAfterSec = init.retryAfterSec;
+    this.body = init.body;
+  }
+  /** 从 issues 里取某个字段值（如 402 的 shortfall、409 的 subscription_id）。 */
+  issue(path: string): string | undefined {
+    return this.issues?.find((i) => i.path === path)?.message;
+  }
+}
+
+function parseRetryAfter(res: Response): number | undefined {
+  const raw = res.headers.get("retry-after");
+  if (!raw) return undefined;
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 0 ? n : undefined;
+}
+
+/** 读 !res.ok 的响应体，组装并抛出 ApiError（绝不返回）。 */
+async function throwApi(res: Response): Promise<never> {
+  let message = `请求失败 (${res.status})`;
+  let code: string | undefined;
+  let issues: ApiIssue[] | undefined;
+  let body: unknown;
+  try {
+    body = await res.json();
+    const b = body as Record<string, unknown> | null;
+    const err = b?.error;
+    if (err && typeof err === "object") {
+      // commercial：{ error: { code, message, issues } }
+      const e = err as Record<string, unknown>;
+      if (typeof e.message === "string") message = e.message;
+      if (typeof e.code === "string") code = e.code;
+      if (Array.isArray(e.issues)) issues = e.issues as ApiIssue[];
+    } else if (typeof err === "string") {
+      // gateway：{ error: "<string>" }
+      message = err;
+    } else if (typeof b?.message === "string") {
+      message = b.message as string;
+    }
+  } catch {
+    /* 非 JSON 响应：保留默认 message */
+  }
+  throw new ApiError({
+    status: res.status,
+    message: withReqId(message, res),
+    code,
+    issues,
+    requestId: res.headers.get("x-request-id") ?? undefined,
+    retryAfterSec: parseRetryAfter(res),
+    body,
+  });
+}
+
 async function jsonOrThrow<T>(p: Promise<Response> | Response): Promise<T> {
   const res = await p;
-  if (!res.ok) {
-    let msg = `请求失败 (${res.status})`;
-    try {
-      const b = await res.json();
-      msg = (b?.error?.message as string) || (b?.message as string) || msg;
-    } catch {
-      /* ignore */
-    }
-    throw new Error(withReqId(msg, res));
-  }
+  if (!res.ok) await throwApi(res);
   return (await res.json()) as T;
 }
 
@@ -141,16 +252,7 @@ export const api = {
         ...(turnstileToken ? { turnstile_token: turnstileToken } : {}),
       }),
     });
-    if (!res.ok) {
-      let msg = "登录失败";
-      try {
-        const b = await res.json();
-        msg = (b?.error?.message as string) || msg;
-      } catch {
-        /* ignore */
-      }
-      throw new Error(withReqId(msg, res));
-    }
+    if (!res.ok) await throwApi(res);
     const b = (await res.json()) as {
       user: WireUser;
       access_token: string;
@@ -257,7 +359,7 @@ export const api = {
   // ── 账户 ───────────────────────────────────────────────────────────
 
   /** 当前用户（GET /api/me，Bearer）。credits 为字符串大数，adaptUser 原样保留。 */
-  me: (a: AuthSession) =>
+  getMe: (a: AuthSession) =>
     jsonOrThrow<{ user: WireUser }>(
       callWithRefresh(a, (t) =>
         fetch("/api/me", { credentials: "include", headers: bearerHeaders(t) }),
@@ -285,13 +387,93 @@ export const api = {
       ),
     ),
 
-  /** 用量统计（GET /api/me/usage，Bearer）。形态宽松透传（P3.5 细化）；失败返回 null。 */
-  getUsage: (a: AuthSession): Promise<Record<string, unknown> | null> =>
-    jsonOrThrow<Record<string, unknown>>(
+  /**
+   * 用量统计（GET /api/me/usage，Bearer）。summary + 分页 sessions（offset）+
+   * keyset ledger（before）+ savings。**所有大数字段为字符串，勿数值化。**
+   * 抛 ApiError（含 400 INVALID_USAGE_QUERY）—— 调用方自行兜底，不再吞成 null。
+   */
+  getUsage: (a: AuthSession, q?: UsageQuery): Promise<UsageResponse> => {
+    const qs = new URLSearchParams();
+    if (q?.sessionsLimit != null) qs.set("sessions_limit", String(q.sessionsLimit));
+    if (q?.sessionsOffset != null) qs.set("sessions_offset", String(q.sessionsOffset));
+    if (q?.ledgerLimit != null) qs.set("ledger_limit", String(q.ledgerLimit));
+    if (q?.ledgerBefore) qs.set("ledger_before", q.ledgerBefore);
+    const suffix = qs.toString() ? `?${qs.toString()}` : "";
+    return jsonOrThrow<UsageResponse>(
       callWithRefresh(a, (t) =>
-        fetch("/api/me/usage", { credentials: "include", headers: bearerHeaders(t) }),
+        fetch(`/api/me/usage${suffix}`, { credentials: "include", headers: bearerHeaders(t) }),
       ),
-    ).catch(() => null),
+    );
+  },
+
+  // ── API Keys（注意：当前后端 admin-only rollout，普通用户调用返 403） ─────────
+
+  /** 列出我的 API key（GET /api/me/api-keys，Bearer）。不含明文。 */
+  listApiKeys: (a: AuthSession): Promise<ApiKeySummary[]> =>
+    jsonOrThrow<{
+      keys: Array<{
+        id: string;
+        label: string;
+        key_prefix: string;
+        created_at: string;
+        last_used_at: string | null;
+      }>;
+    }>(
+      callWithRefresh(a, (t) =>
+        fetch("/api/me/api-keys", { credentials: "include", headers: bearerHeaders(t) }),
+      ),
+    ).then((b) =>
+      b.keys.map((k) => ({
+        id: k.id,
+        label: k.label,
+        keyPrefix: k.key_prefix,
+        createdAt: k.created_at,
+        lastUsedAt: k.last_used_at,
+      })),
+    ),
+
+  /**
+   * 新建 API key（POST /api/me/api-keys，201，Bearer）。返完整明文 plaintext **仅一次**，
+   * 必须立即引导用户复制保存；后端永远无法重新生成。400 INVALID_LABEL 经 ApiError 抛。
+   */
+  createApiKey: (a: AuthSession, label: string): Promise<CreatedApiKey> =>
+    jsonOrThrow<{
+      id: string;
+      label: string;
+      key_prefix: string;
+      plaintext: string;
+      created_at: string;
+    }>(
+      callWithRefresh(a, (t) =>
+        fetch("/api/me/api-keys", {
+          method: "POST",
+          credentials: "include",
+          headers: bearerHeaders(t, true),
+          body: JSON.stringify({ label }),
+        }),
+      ),
+    ).then((b) => ({
+      id: b.id,
+      label: b.label,
+      keyPrefix: b.key_prefix,
+      plaintext: b.plaintext,
+      createdAt: b.created_at,
+    })),
+
+  /**
+   * 撤销 API key（DELETE /api/me/api-keys/:id，Bearer）。软撤销，幂等。
+   * 不存在 / 已撤销 / 非本人一律 404（不暴露存在性），经 ApiError 抛。
+   */
+  deleteApiKey: (a: AuthSession, id: string): Promise<void> =>
+    jsonOrThrow<{ ok: true }>(
+      callWithRefresh(a, (t) =>
+        fetch(`/api/me/api-keys/${encodeURIComponent(id)}`, {
+          method: "DELETE",
+          credentials: "include",
+          headers: bearerHeaders(t),
+        }),
+      ),
+    ).then(() => undefined),
 
   // ── 公开（匿名可读） ────────────────────────────────────────────────
 
@@ -328,7 +510,7 @@ export const api = {
   // ── 对话前置（Agent 订阅 / 容器） ────────────────────────────────────
 
   /** Agent 订阅/容器状态（GET /api/agent/status，Bearer）。 */
-  agentStatus: (a: AuthSession): Promise<AgentStatus> =>
+  getAgentStatus: (a: AuthSession): Promise<AgentStatus> =>
     jsonOrThrow<{
       runtime_ready: boolean;
       subscription: {
@@ -342,10 +524,15 @@ export const api = {
       } | null;
       container: {
         id: string;
-        status: string;
+        subscription_id: string | null;
+        docker_id: string | null;
         docker_name: string | null;
-        last_error: string | null;
+        image: string | null;
+        status: string;
+        last_started_at: string | null;
+        last_stopped_at: string | null;
         volume_gc_at: string | null;
+        last_error: string | null;
       } | null;
     }>(
       callWithRefresh(a, (t) =>
@@ -367,16 +554,27 @@ export const api = {
       container: b.container
         ? {
             id: b.container.id,
-            status: b.container.status,
+            subscriptionId: b.container.subscription_id,
+            dockerId: b.container.docker_id,
             dockerName: b.container.docker_name,
-            lastError: b.container.last_error,
+            image: b.container.image,
+            status: b.container.status,
+            lastStartedAt: b.container.last_started_at,
+            lastStoppedAt: b.container.last_stopped_at,
             volumeGcAt: b.container.volume_gc_at,
+            lastError: b.container.last_error,
           }
         : null,
     })),
 
-  /** 开通 Agent 订阅（POST /api/agent/open，202 provisioning，Bearer）。 */
-  agentOpen: (a: AuthSession): Promise<AgentOpenResult> =>
+  /**
+   * 开通 Agent 订阅（POST /api/agent/open，Bearer）。成功 202（status='provisioning'，
+   * 容器异步开机，需随后 pollAgentReady）。失败经 ApiError 抛：
+   *   - 402（issues.shortfall = 缺口积分字符串）→ 余额不足
+   *   - 409（issues.subscription_id / issues.end_at）→ 已有有效订阅
+   * balanceAfter 为字符串大数，勿数值化。
+   */
+  openAgent: (a: AuthSession): Promise<AgentOpenResult> =>
     jsonOrThrow<{
       subscription_id: string;
       container_id: string;
@@ -384,7 +582,10 @@ export const api = {
       start_at: string;
       end_at: string;
       balance_after: string;
+      ledger_id: string;
       docker_name: string;
+      workspace_volume: string;
+      home_volume: string;
     }>(
       callWithRefresh(a, (t) =>
         fetch("/api/agent/open", {
@@ -400,7 +601,275 @@ export const api = {
       startAt: b.start_at,
       endAt: b.end_at,
       balanceAfter: b.balance_after,
+      ledgerId: b.ledger_id,
       dockerName: b.docker_name,
+      workspaceVolume: b.workspace_volume,
+      homeVolume: b.home_volume,
+    })),
+
+  /** 退订 Agent（POST /api/agent/cancel，Bearer）。404 = 未订阅（经 ApiError 抛）。 */
+  agentCancel: (a: AuthSession): Promise<AgentCancelResult> =>
+    jsonOrThrow<{
+      subscription_id: string;
+      end_at: string;
+      auto_renew: false;
+      was_auto_renew: boolean;
+    }>(
+      callWithRefresh(a, (t) =>
+        fetch("/api/agent/cancel", {
+          method: "POST",
+          credentials: "include",
+          headers: bearerHeaders(t),
+        }),
+      ),
+    ).then((b) => ({
+      subscriptionId: b.subscription_id,
+      endAt: b.end_at,
+      autoRenew: false as const,
+      wasAutoRenew: b.was_auto_renew,
+    })),
+
+  /**
+   * 容器冷启轮询封装（对话前置）。openAgent 返 202 provisioning 后，容器在后台异步开机，
+   * 此 helper 轮询 getAgentStatus 直到容器 'running'。
+   *
+   * 终态语义：
+   *   - container.status==='running'         → resolve(status)
+   *   - container.status==='error'           → reject(ApiError 503 CONTAINER_ERROR, 带 lastError)
+   *   - 超时（timeoutMs）                     → reject(ApiError 504 PROVISION_TIMEOUT)
+   *   - signal abort                          → reject(AbortError)
+   * 其余态（provisioning/stopped/无容器）继续按 intervalMs 轮询。
+   *
+   * 说明：WS user-chat-bridge 的容器未就绪用 **WS close code 4503 + retryAfterSec**
+   * 表达（非 HTTP 状态），其重连节流由 P4 useChatSocket 负责；此处只覆盖 REST 侧的
+   * open→running 过渡，供对话前置 UI 展示「正在开机」。
+   */
+  async pollAgentReady(
+    a: AuthSession,
+    opts?: { intervalMs?: number; timeoutMs?: number; signal?: AbortSignal },
+  ): Promise<AgentStatus> {
+    const intervalMs = opts?.intervalMs ?? 2000;
+    const timeoutMs = opts?.timeoutMs ?? 120_000;
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+      if (opts?.signal?.aborted) {
+        throw new DOMException("aborted", "AbortError");
+      }
+      const status = await api.getAgentStatus(a);
+      const cs = status.container?.status;
+      if (cs === "running") return status;
+      if (cs === "error") {
+        throw new ApiError({
+          status: 503,
+          code: "CONTAINER_ERROR",
+          message: status.container?.lastError || "容器开机失败，请稍后重试或联系支持。",
+        });
+      }
+      if (Date.now() + intervalMs >= deadline) {
+        throw new ApiError({
+          status: 504,
+          code: "PROVISION_TIMEOUT",
+          message: "容器开机超时，请稍后重试。",
+        });
+      }
+      await sleep(intervalMs, opts?.signal);
+    }
+  },
+
+  // ── 会话历史（权威源 = gateway，camelCase wire；走 Bearer + callWithRefresh） ──
+
+  /** 列出我的会话（GET /api/sessions/list，Bearer）。无 messages 的元数据列表。 */
+  listSessions: (a: AuthSession): Promise<SessionMeta[]> =>
+    jsonOrThrow<{ sessions: SessionMeta[] }>(
+      callWithRefresh(a, (t) =>
+        fetch("/api/sessions/list", { credentials: "include", headers: bearerHeaders(t) }),
+      ),
+    ).then((b) => b.sessions || []),
+
+  /**
+   * 取单个会话（GET /api/sessions/:id，Bearer）。
+   * sinceSeq>0 → 增量同步（仅返 `_seq > sinceSeq` 的 messages；legacy 行降级全量）。
+   * 不存在 → 404（经 ApiError 抛）。id 形态须匹配后端 `[A-Za-z0-9_-]{8,50}`。
+   */
+  getSession: (a: AuthSession, id: string, sinceSeq = 0): Promise<SessionDetail> => {
+    const suffix = sinceSeq > 0 ? `?since=${encodeURIComponent(String(sinceSeq))}` : "";
+    return jsonOrThrow<SessionDetail>(
+      callWithRefresh(a, (t) =>
+        fetch(`/api/sessions/${encodeURIComponent(id)}${suffix}`, {
+          credentials: "include",
+          headers: bearerHeaders(t),
+        }),
+      ),
+    );
+  },
+
+  /**
+   * 写入会话（PUT /api/sessions/:id，Bearer）。乐观并发：传 `_baseSyncedAt`（上次同步
+   * 到的 updatedAt），服务端发现被他人抢先 → 409 conflict（经 ApiError 抛，调用方需
+   * 重新拉取合并后重试）。wire body 上限 2MB / 存储 blob 上限 4MB，超出 413。
+   */
+  putSession: (a: AuthSession, id: string, input: PutSessionInput): Promise<PutSessionResult> =>
+    jsonOrThrow<PutSessionResult>(
+      callWithRefresh(a, (t) =>
+        fetch(`/api/sessions/${encodeURIComponent(id)}`, {
+          method: "PUT",
+          credentials: "include",
+          headers: bearerHeaders(t, true),
+          body: JSON.stringify(input),
+        }),
+      ),
+    ),
+
+  /** 删除会话（DELETE /api/sessions/:id，Bearer）。幂等，恒 200。 */
+  deleteSession: (a: AuthSession, id: string): Promise<void> =>
+    jsonOrThrow<{ ok: true }>(
+      callWithRefresh(a, (t) =>
+        fetch(`/api/sessions/${encodeURIComponent(id)}`, {
+          method: "DELETE",
+          credentials: "include",
+          headers: bearerHeaders(t),
+        }),
+      ),
+    ).then(() => undefined),
+
+  // ── 媒体签名（commercial REST） ──────────────────────────────────────────
+
+  /**
+   * 批量签名容器内媒体路径（POST /api/media-sign，Bearer + cookie dual-verify）。
+   * 返回 path→opaque签名URL 映射（被 ACL 拒的路径静默缺失，需自行判断）。
+   * 签出的 URL 可直接用于 `<img src>` / `<a href>`（无需鉴权头，opaque token 自证）。
+   */
+  mediaSign: (a: AuthSession, paths: string[]): Promise<MediaSignResult> =>
+    jsonOrThrow<MediaSignResult>(
+      callWithRefresh(a, (t) =>
+        fetch("/api/media-sign", {
+          method: "POST",
+          credentials: "include",
+          headers: bearerHeaders(t, true),
+          body: JSON.stringify({ paths }),
+        }),
+      ),
+    ),
+
+  /**
+   * 按签名 URL 取媒体二进制（GET /api/media-signed，公开端点，无需鉴权头）。
+   * 多数场景下 mediaSign 返回的 URL 直接挂到元素 src 即可；此 helper 仅用于需要
+   * 程序化拿到 Blob 的场景（如下载 / 转存）。
+   * 冷启容器未就绪 → 503 + Retry-After：自动按 Retry-After 退避重试（上限 maxRetries）。
+   */
+  async fetchSignedMedia(
+    signedUrl: string,
+    opts?: { maxRetries?: number; signal?: AbortSignal },
+  ): Promise<Blob> {
+    const maxRetries = opts?.maxRetries ?? 3;
+    for (let attempt = 0; ; attempt++) {
+      if (opts?.signal?.aborted) throw new DOMException("aborted", "AbortError");
+      const res = await fetch(signedUrl, { headers: { Accept: "*/*" }, signal: opts?.signal });
+      if (res.ok) return res.blob();
+      // 容器冷启：503 + Retry-After（见 commercial handleMediaSigned ensureContainerReady）。
+      if (res.status === 503 && attempt < maxRetries) {
+        const retryAfterSec = parseRetryAfter(res) ?? 2;
+        await sleep(retryAfterSec * 1000, opts?.signal);
+        continue;
+      }
+      await throwApi(res);
+    }
+  },
+
+  // ── 充值 / 计费（虎皮椒扫码，commercial REST） ────────────────────────────
+
+  /**
+   * 充值套餐列表（GET /api/payment/plans）。公开端点，可选带 Bearer（登录用户首充档
+   * 按是否用过过滤）。金额/积分均字符串大数。
+   */
+  async listPlans(a?: AuthSession): Promise<PaymentPlan[]> {
+    const run = (t?: string) =>
+      fetch("/api/payment/plans", {
+        credentials: "include",
+        headers: t ? bearerHeaders(t) : { Accept: "application/json" },
+      });
+    const res = a ? await callWithRefresh(a, (t) => run(t)) : await run();
+    const b = await jsonOrThrow<{
+      ok: boolean;
+      data: {
+        plans: Array<{ code: string; label: string; amount_cents: string; credits: string }>;
+      };
+    }>(res);
+    return (b.data?.plans || []).map((p) => ({
+      code: p.code,
+      label: p.label,
+      amountCents: p.amount_cents,
+      credits: p.credits,
+    }));
+  },
+
+  /**
+   * 创建虎皮椒充值订单（POST /api/payment/hupi/create，Bearer）。
+   * 返回扫码 URL + 订单号（随后用 getOrder 轮询到账）。
+   * 409 FIRST_TOPUP_USED = 老用户企图复用首充档（经 ApiError 抛）。
+   */
+  createHupiOrder: (a: AuthSession, planCode: string): Promise<HupiCreateResult> =>
+    jsonOrThrow<{
+      ok: boolean;
+      data: {
+        order_no: string;
+        qrcode_url: string;
+        mobile_url: string | null;
+        amount_cents: string;
+        credits: string;
+        expires_at: string;
+      };
+    }>(
+      callWithRefresh(a, (t) =>
+        fetch("/api/payment/hupi/create", {
+          method: "POST",
+          credentials: "include",
+          headers: bearerHeaders(t, true),
+          body: JSON.stringify({ plan_code: planCode }),
+        }),
+      ),
+    ).then((b) => ({
+      orderNo: b.data.order_no,
+      qrcodeUrl: b.data.qrcode_url,
+      mobileUrl: b.data.mobile_url,
+      amountCents: b.data.amount_cents,
+      credits: b.data.credits,
+      expiresAt: b.data.expires_at,
+    })),
+
+  /**
+   * 查询订单（GET /api/payment/orders/:orderNo，Bearer）。轮询用：status 转 'paid'
+   * 即到账。404 ORDER_NOT_FOUND（非本人 / 不存在）经 ApiError 抛。
+   */
+  getOrder: (a: AuthSession, orderNo: string): Promise<PaymentOrder> =>
+    jsonOrThrow<{
+      ok: boolean;
+      data: {
+        order_no: string;
+        status: string;
+        amount_cents: string;
+        credits: string;
+        expires_at: string;
+        paid_at: string | null;
+        created_at: string;
+        provider: string;
+      };
+    }>(
+      callWithRefresh(a, (t) =>
+        fetch(`/api/payment/orders/${encodeURIComponent(orderNo)}`, {
+          credentials: "include",
+          headers: bearerHeaders(t),
+        }),
+      ),
+    ).then((b) => ({
+      orderNo: b.data.order_no,
+      status: b.data.status,
+      amountCents: b.data.amount_cents,
+      credits: b.data.credits,
+      expiresAt: b.data.expires_at,
+      paidAt: b.data.paid_at,
+      createdAt: b.data.created_at,
+      provider: b.data.provider,
     })),
 
   // ── 对话传输（P4 占位：WS user-chat-bridge 尚未接入） ──────────────────
