@@ -1626,12 +1626,13 @@ export async function provisionV3Container(
     // draining 的 host,语义上仅延后 drain 完成,不破数据。R6.8 host live
     // migration 上线时再做。
     const capQ = await client.query<{ active: string; max_containers: number | null }>(
+      // P1a 隔离:host 容量计数按 channel(v3/v5 各算各的 active 数)。
       `SELECT
            (SELECT COUNT(*) FROM agent_containers
-             WHERE state = 'active' AND host_uuid = $1::uuid)::text AS active,
+             WHERE state = 'active' AND host_uuid = $1::uuid AND runtime_channel = $2)::text AS active,
            (SELECT max_containers FROM compute_hosts WHERE id = $1::uuid)
              AS max_containers`,
-      [effectiveHostUuid],
+      [effectiveHostUuid, getRuntimeChannel()],
     );
     const capRow = capQ.rows[0];
     if (!capRow || capRow.max_containers == null) {

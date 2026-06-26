@@ -10,6 +10,7 @@
 
 import type { PoolClient } from "pg";
 import { getPool } from "../db/index.js";
+import { getRuntimeChannel } from "../runtimeChannel.js";
 import type {
   ComputeHostRow,
   ComputeHostStatus,
@@ -295,9 +296,10 @@ export async function countActiveContainersOnHost(
 ): Promise<number> {
   const q = client ?? getPool();
   const r = await q.query<{ n: string }>(
+    // P1a 隔离:容量计数按 channel —— v3 与 v5 各算各的 host active 数,互不计入。
     `SELECT COUNT(*)::text AS n FROM agent_containers
-      WHERE host_uuid = $1 AND state = 'active'`,
-    [hostUuid],
+      WHERE host_uuid = $1 AND state = 'active' AND runtime_channel = $2`,
+    [hostUuid, getRuntimeChannel()],
   );
   return Number.parseInt(r.rows[0]!.n, 10);
 }
@@ -327,13 +329,16 @@ export async function findActiveByHostAndBoundIp(
     secret_hash: Buffer | null;
     host_uuid: string;
   }>(
+    // P1a 隔离:容器身份反查按 channel —— v3 代理只认 v3 容器、v5 代理只认 v5 容器,
+    // 防跨 channel 身份误认(请求路径出站鉴权)。
     `SELECT id, user_id, host(bound_ip) AS bound_ip, secret_hash, host_uuid
        FROM agent_containers
       WHERE state='active'
         AND host_uuid = $1
         AND bound_ip = $2
+        AND runtime_channel = $3
       LIMIT 1`,
-    [hostUuid, boundIp],
+    [hostUuid, boundIp, getRuntimeChannel()],
   );
   if (r.rowCount === 0) return null;
   const row = r.rows[0]!;
