@@ -125,9 +125,21 @@ export function App() {
     setAuthLoading(true);
     setAuthError(null);
     try {
+      // 服务端 /api/auth/login schema 必填 turnstile_token(即便 bypass)。canary v5 已开
+      // TURNSTILE_TEST_BYPASS=1(public config turnstile_bypass:true)→ 发占位串即可过(服务端
+      // bypass 接受任意 token)。
+      // TODO(生产 cutover,bypass 关闭后):接真实 Cloudflare Turnstile widget(challenges.cloudflare
+      // .com/turnstile/v0/api.js + render(turnstile_site_key)→ onSuccess(token)),用真 token 替占位。
+      let turnstileToken: string | undefined;
+      try {
+        const cfg = await api.getPublicConfig();
+        if (cfg.turnstileBypass) turnstileToken = "bypass";
+      } catch {
+        /* 拿不到 config 不阻断登录尝试;无 token 时服务端会回明确错误 */
+      }
       // 登录拿到内存态 accessToken + 用户信息；token 只写进 tokenRef（内存），绝不落地。
       // refresh token 由后端通过 HttpOnly cookie 下发（api.login credentials:'include'）。
-      const { accessToken, user: me } = await api.login(email, password);
+      const { accessToken, user: me } = await api.login(email, password, turnstileToken);
       tokenRef.current = accessToken;
       setAuthed(true);
       setUser(me);
