@@ -5,40 +5,24 @@ import { findRouteProviderForModel } from '@openclaude/protocol'
  * Pure routing helper: given an inbound model id and requested agent id,
  * decide which agent should actually handle the request.
  *
- * Two cases drive the rerouting:
- *   1) Model family demands a specific provider. `gpt-*` requires a
- *      codex-native agent; `claude-*` and `deepseek-*` require a non-codex
- *      agent.
- *   2) Frontend picks the model independently of the agent (modelPicker
- *      lives outside the agent menu). When the user changes model without
- *      explicitly switching agents, requestedAgentId equals defaultAgentId,
- *      and the gateway has to pick the right backend.
+ * v5 is a ccb-only deployment (Claude + domain static-key models
+ * glm/deepseek/minimax). There is **no codex (gpt-*) backend** — gpt models
+ * are rejected fail-closed here so a stray model-picker selection never reaches
+ * the runner layer.
  *
  * Rules (fail-closed — never silently fall back):
  *
- *   (a) model starts with `gpt-` → MUST use the agent with the canonical
- *       id `codex` (not "first agent with provider=codex-native" — fixed
- *       id keeps user-visible attribution stable and prevents agents.yaml
- *       drift from breaking routing).
- *   (b) Explicit non-codex agent picked + gpt-* model → error 'mismatch'.
- *   (c) Default agent picked + gpt-* model → route to id='codex'. If that
- *       agent is absent or not codex-native → error 'no_codex_agent'.
- *   (d) claude-* / deepseek-* model + any codex-native/unknown requested agent → route
- *       back to a compatible non-codex agent. This covers the model-picker
- *       flow where the browser session remains on agentId='codex' after a
- *       previous GPT turn, but the user now selected Claude/DeepSeek/MiniMax.
- *   (e) Unknown model family or model undefined → pass through.
- *
- * NOTE: an unknown requestedAgentId (not in agents[]) is treated as
- * pass-through only for model families that do not need a provider override.
- * For known cross-provider families (`gpt-*`, `claude-*`, `deepseek-*`, `MiniMax-M3`) the
- * model picker is authoritative and this helper routes to the compatible
- * backend.
+ *   (a) model starts with `gpt-` → error 'gpt_unsupported'. v5 has no
+ *       codex-native runner; this is the authoritative rejection point.
+ *   (b) claude-* / deepseek-* / minimax / ark(glm) model → route to the
+ *       requested agent when it exists, otherwise to the default (or first)
+ *       agent. All v5 agents are ccb, so any of them can serve these models.
+ *   (c) Unknown model family or model undefined → pass through.
  */
 
 export type InferAgentResult =
   | { agentId: string }
-  | { error: 'no_codex_agent' | 'no_compatible_agent' | 'mismatch'; reason: string }
+  | { error: 'gpt_unsupported' | 'no_compatible_agent'; reason: string }
 
 function isGptModel(model: string): boolean {
   return /^gpt-/.test(model)
@@ -48,24 +32,11 @@ function isClaudeModel(model: string): boolean {
   return /^claude-/.test(model)
 }
 
-function isNonCodexModel(model: string): boolean {
-  // 静态 key 文本 provider(deepseek/minimax/ark[glm-5.1])一律 non-codex,跑 claude-subscription
+function isSupportedNonGptModel(model: string): boolean {
+  // 静态 key 文本 provider(deepseek/minimax/ark[glm])一律走 claude-subscription
   // 类 agent。判定走 @openclaude/protocol 注册表 matchesRoute(deepseek 大小写敏感前缀、
-  // minimax/ark 精确),与历史 /^deepseek-/ + minimax-m3 逐字节等价,新增 provider 零改本处。
+  // minimax/ark 精确),新增 provider 零改本处。
   return isClaudeModel(model) || findRouteProviderForModel(model) !== undefined
-}
-
-function isCodexNative(agent: AgentDef | undefined): boolean {
-  return agent?.provider === 'codex-native'
-}
-
-function findNonCodexAgent(args: {
-  agents: AgentDef[]
-  defaultAgentId: string
-}): AgentDef | undefined {
-  const defaultAgent = args.agents.find((a) => a.id === args.defaultAgentId)
-  if (defaultAgent && !isCodexNative(defaultAgent)) return defaultAgent
-  return args.agents.find((a) => !isCodexNative(a))
 }
 
 export function inferAgentForModel(args: {
@@ -80,48 +51,32 @@ export function inferAgentForModel(args: {
     return { agentId: requestedAgentId }
   }
 
-  const requestedAgent = agents.find((a) => a.id === requestedAgentId)
-  const requestedIsCodexNative = isCodexNative(requestedAgent)
-  const isExplicitAgent = requestedAgentId !== defaultAgentId
-
+  // (a) gpt-* / codex models are not supported on this ccb-only deployment.
   if (isGptModel(model)) {
-    // (b) explicit non-codex agent + gpt model → mismatch
-    // Only reportable when the agent is resolvable; unknown agentId falls
-    // through (downstream will reject the unknown id anyway).
-    if (isExplicitAgent && requestedAgent && !requestedIsCodexNative) {
-      return {
-        error: 'mismatch',
-        reason: `agent '${requestedAgentId}' provider='${requestedAgent.provider ?? '<unset>'}' cannot serve gpt-* model '${model}'`,
-      }
+    return {
+      error: 'gpt_unsupported',
+      reason: `gpt model '${model}' is not supported on this ccb-only deployment`,
     }
-    // (a) + (c) need agent id='codex' with provider=codex-native
-    const codexAgent = agents.find((a) => a.id === 'codex')
-    if (!codexAgent || codexAgent.provider !== 'codex-native') {
-      return {
-        error: 'no_codex_agent',
-        reason: codexAgent
-          ? `agent 'codex' has provider='${codexAgent.provider ?? '<unset>'}' (expected codex-native)`
-          : `no agent with id='codex' configured`,
-      }
-    }
-    return { agentId: 'codex' }
   }
 
-  if (isNonCodexModel(model)) {
-    if (requestedAgent && !requestedIsCodexNative) {
+  // (b) claude / deepseek / minimax / ark(glm) — route to the requested agent
+  //     when it exists, else the default (or first) agent.
+  if (isSupportedNonGptModel(model)) {
+    const requestedAgent = agents.find((a) => a.id === requestedAgentId)
+    if (requestedAgent) {
       return { agentId: requestedAgentId }
     }
-    const compatibleAgent = findNonCodexAgent({ agents, defaultAgentId })
-    if (!compatibleAgent) {
+    const fallback = agents.find((a) => a.id === defaultAgentId) ?? agents[0]
+    if (!fallback) {
       return {
         error: 'no_compatible_agent',
-        reason: `no non-codex agent configured for model '${model}'`,
+        reason: `no agent configured for model '${model}'`,
       }
     }
-    return { agentId: compatibleAgent.id }
+    return { agentId: fallback.id }
   }
 
-  // Unknown model family — pass through. sessionManager / provider layer
+  // (c) Unknown model family — pass through. sessionManager / provider layer
   // will surface an error if the model id is genuinely invalid.
   return { agentId: requestedAgentId }
 }

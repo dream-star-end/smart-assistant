@@ -22,12 +22,7 @@ export function initOAuthListeners() {
         _oauthState = data.state
         window.open(data.authUrl, '_blank')
         $('oauth-code-input').focus()
-        // For Codex, show extra hint about copying URL code
-        if (oauthProvider === 'codex') {
-          $('oauth-code-input').placeholder = '授权后从浏览器地址栏复制 code=XXX 的值...'
-        } else {
-          $('oauth-code-input').placeholder = '粘贴授权代码或完整回调 URL...'
-        }
+        $('oauth-code-input').placeholder = '粘贴授权代码或完整回调 URL...'
       } else {
         $('oauth-error').textContent = '生成授权链接失败'
         $('oauth-error').hidden = false
@@ -64,7 +59,7 @@ export function initOAuthListeners() {
       if (data.ok) {
         $('oauth-step1').hidden = true
         $('oauth-step2').hidden = false
-        const provName = $('oauth-provider').value === 'codex' ? 'OpenAI Codex' : 'Claude.ai'
+        const provName = 'Claude.ai'
         $('oauth-result-text').textContent =
           `已连接 ${provName} · Token 有效期 ${Math.round((data.expiresIn || 3600) / 60)} 分钟`
         toast(`${provName} 登录成功!`, 'success')

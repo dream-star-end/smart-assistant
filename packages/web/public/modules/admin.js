@@ -435,7 +435,7 @@ const TABS = {
 const ADMIN_TAB_META = {
   dashboard: { group: '经营驾驶舱', label: '总览', desc: '收入、用量、资源和告警', key: '01', chips: [{ label: '优先看', value: '异常 / 收入 / 资源' }, { label: '刷新', value: '30s 自动' }, { label: '下一步', value: '告警与账号池' }] },
   users: { group: '经营驾驶舱', label: '用户', desc: '增长、留存、余额和详情', key: '02', chips: [{ label: '定位', value: '邮箱 / UID' }, { label: '动作', value: '详情 / 余额' }, { label: '联动', value: '容器与流水' }] },
-  accounts: { group: '账号与调度', label: '账号池', desc: 'Claude / Codex 账号健康', key: '03', chips: [{ label: '排查', value: 'active / cooldown' }, { label: '凭据', value: 'UUID / Token' }, { label: '风险', value: 'no_uuid / expired' }] },
+  accounts: { group: '账号与调度', label: '账号池', desc: 'Claude 账号健康', key: '03', chips: [{ label: '排查', value: 'active / cooldown' }, { label: '凭据', value: 'UUID / Token' }, { label: '风险', value: 'no_uuid / expired' }] },
   accountGroups: { group: '账号与调度', label: '账号分组', desc: '容量、权重和调度边界', key: '04', chips: [{ label: '路由', value: 'provider / model' }, { label: '策略', value: 'priority' }, { label: '边界', value: 'allowlist' }] },
   egressProxies: { group: '账号与调度', label: '代理池', desc: '出口线路和失败冷却', key: '05', chips: [{ label: '状态', value: 'active / disabled' }, { label: '冷却', value: 'recent failures' }, { label: '资产', value: 'region / owner' }] },
   containers: { group: '运行资源', label: '容器', desc: '运行态、日志和重启动作', key: '06', chips: [{ label: '筛选', value: '用户 / Host' }, { label: '动作', value: '日志 / 重启' }, { label: '版本', value: 'runtime image' }] },
@@ -2402,10 +2402,10 @@ function openCreateAccountGroupModal() {
     <h3>新建账号分组</h3>
     <div class="form-row"><label>名称</label><input id="grp-label" value="" placeholder="如 Yunwu GPT 中转站" /></div>
     <div class="form-row"><label>类型</label><select id="grp-kind"><option value="api_relay">API 中转站</option><option value="official_oauth">官方 OAuth 订阅</option></select></div>
-    <div class="form-row"><label>provider</label><select id="grp-provider"><option value="codex">codex</option><option value="claude">claude</option></select><small style="color:var(--muted)">支持 api_relay+codex、official_oauth+codex、official_oauth+claude。</small></div>
+    <div class="form-row"><label>provider</label><select id="grp-provider"><option value="claude">claude</option></select><small style="color:var(--muted)">支持 official_oauth+claude。(v5 ccb-only:codex 已下线)</small></div>
     <div class="form-row"><label>启用</label><select id="grp-enabled"><option value="true">启用</option><option value="false">停用</option></select></div>
     <div class="form-row"><label>优先级</label><input id="grp-priority" type="number" value="100" /></div>
-    <div class="form-row"><label>模型 id(逗号分隔)</label><input id="grp-models-input" value="gpt-5.5" /></div>
+    <div class="form-row"><label>模型 id(逗号分隔)</label><input id="grp-models-input" value="" /></div>
     <div class="form-actions"><button class="btn" id="grp-cancel">取消</button><button class="btn btn-primary" id="grp-save">创建</button></div>`)
   $('grp-cancel').addEventListener('click', closeModal)
   $('grp-save').addEventListener('click', async () => {
@@ -3110,9 +3110,6 @@ async function openCreateAccountModal() {
       <div style="display:flex;gap:14px">
         <label style="display:inline-flex;gap:6px;align-items:center">
           <input type="radio" name="acc-provider" value="claude" checked /> claude
-        </label>
-        <label style="display:inline-flex;gap:6px;align-items:center">
-          <input type="radio" name="acc-provider" value="codex" /> codex (GPT)
         </label>
       </div>
     </div>

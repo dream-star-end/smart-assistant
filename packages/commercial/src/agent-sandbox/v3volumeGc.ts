@@ -45,7 +45,6 @@ import { getRuntimeChannel } from "../runtimeChannel.js";
 import {
   acquireUserLifecycleLock,
   removeV3Volume,
-  v3CodexVolumeNameFor,
   v3ProjectsVolumeNameFor,
   v3UserConfigVolumeNameFor,
   v3UserLocalVolumeNameFor,
@@ -360,11 +359,11 @@ export async function runVolumeGcTick(
         log?.info?.("[v3/volumeGc] removed volumes", {
           uid: cand.uid,
           reason: cand.reason,
-          // removeV3Volume 内部删 5 个 volume(D2);日志列全名便于事故定位
+          // removeV3Volume 内部删 4 个 volume(D2;v5 ccb-only 已移除 codex 卷);
+          // 日志列全名便于事故定位
           volumes: [
             v3VolumeNameFor(cand.uid),
             v3ProjectsVolumeNameFor(cand.uid),
-            v3CodexVolumeNameFor(cand.uid),
             v3UserLocalVolumeNameFor(cand.uid),
             v3UserConfigVolumeNameFor(cand.uid),
           ],

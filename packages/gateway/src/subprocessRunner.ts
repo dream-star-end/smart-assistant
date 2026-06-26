@@ -4,11 +4,6 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from 'node:os'
 import { dirname, isAbsolute, resolve } from 'node:path'
 import { type McpServerConfig, type OpenClaudeConfig, paths } from '@openclaude/storage'
-import {
-  buildOpenClaudeVisionMcpEnv,
-  resolveMcpMemoryEntry,
-  resolveOpenClaudeVisionEntry,
-} from './codexLaunchOverrides.js'
 import { createLogger } from './logger.js'
 import {
   OPENCLAUDE_VISION_MCP_ID,
@@ -119,7 +114,84 @@ export function _buildStaticProviderSmallFastModelEnv(
   return {}
 }
 
-export { buildOpenClaudeVisionMcpEnv } from './codexLaunchOverrides.js'
+/** Three-candidate fallback for resolving the bundled `openclaude-memory`
+ *  MCP server entry path. Returns the first existing absolute path, or `null`
+ *  if none exist (caller decides whether to log+skip or fall back to no MCP).
+ *
+ *  @param claudeCodePath Optional CCB install root. Used to construct the
+ *    third candidate (the path inside the v3 commercial container image). */
+export function resolveMcpMemoryEntry(claudeCodePath?: string): string | null {
+  const moduleDir = new URL('.', import.meta.url).pathname.replace(/^\/([A-Za-z]):/, '$1:')
+  const candidates: string[] = [
+    resolve(moduleDir, '../../mcp-memory/src/index.ts'),
+    resolve(process.cwd(), 'packages/mcp-memory/src/index.ts'),
+  ]
+  if (claudeCodePath) {
+    candidates.push(resolve(claudeCodePath, '..', 'openclaude/packages/mcp-memory/src/index.ts'))
+  }
+  for (const c of candidates) {
+    if (existsSync(c)) return c
+  }
+  return null
+}
+
+/** Resolve the built-in OpenClaude vision MCP entry used by CCB text-only
+ * providers (DeepSeek/custom). Mirrors resolveMcpMemoryEntry's three layouts:
+ * source checkout, process.cwd() checkout, and v3 runtime image layout. */
+export function resolveOpenClaudeVisionEntry(claudeCodePath?: string): string | null {
+  const moduleDir = new URL('.', import.meta.url).pathname.replace(/^\/([A-Za-z]):/, '$1:')
+  const candidates: string[] = [
+    resolve(moduleDir, 'mcpVisionServer.ts'),
+    resolve(process.cwd(), 'packages/gateway/src/mcpVisionServer.ts'),
+  ]
+  if (claudeCodePath) {
+    candidates.push(
+      resolve(claudeCodePath, '..', 'openclaude/packages/gateway/src/mcpVisionServer.ts'),
+    )
+  }
+  for (const c of candidates) {
+    if (existsSync(c)) return c
+  }
+  return null
+}
+
+/** Build the env table for the built-in openclaude-vision MCP server child.
+ *  Used by CCB text-only providers (DeepSeek/custom) that need understand_image
+ *  via the MiniMax-backed vision MCP. */
+export function buildOpenClaudeVisionMcpEnv(
+  agentId: string,
+  opts: { containerTokenFile?: string } = {},
+): Record<string, string> {
+  return {
+    OPENCLAUDE_AGENT_ID: agentId,
+    ...(process.env.OPENCLAUDE_HOME ? { OPENCLAUDE_HOME: process.env.OPENCLAUDE_HOME } : {}),
+    ...(process.env.OPENCLAUDE_VISION_TIMEOUT_MS
+      ? { OPENCLAUDE_VISION_TIMEOUT_MS: process.env.OPENCLAUDE_VISION_TIMEOUT_MS }
+      : {}),
+    ...(process.env.OPENCLAUDE_VISION_MAX_IMAGE_BYTES
+      ? {
+          OPENCLAUDE_VISION_MAX_IMAGE_BYTES: process.env.OPENCLAUDE_VISION_MAX_IMAGE_BYTES,
+        }
+      : {}),
+    ...(process.env.OPENCLAUDE_VISION_MAX_CONCURRENT
+      ? { OPENCLAUDE_VISION_MAX_CONCURRENT: process.env.OPENCLAUDE_VISION_MAX_CONCURRENT }
+      : {}),
+    ...(process.env.OPENCLAUDE_V3_MASTER_BASE_URL
+      ? { OPENCLAUDE_V3_MASTER_BASE_URL: process.env.OPENCLAUDE_V3_MASTER_BASE_URL }
+      : {}),
+    // minimax vision backend 经容器 internal anthropic proxy 调 MiniMax-M3。base url 非 secret,
+    // 可直接放 env;bearer 走 containerTokenFile(下方,token file,不进 argv)。
+    ...(process.env.ANTHROPIC_BASE_URL ? { ANTHROPIC_BASE_URL: process.env.ANTHROPIC_BASE_URL } : {}),
+    ...(process.env.OPENCLAUDE_VISION_BACKEND
+      ? { OPENCLAUDE_VISION_BACKEND: process.env.OPENCLAUDE_VISION_BACKEND }
+      : {}),
+    ...(opts.containerTokenFile
+      ? { OPENCLAUDE_V3_CONTAINER_TOKEN_FILE: opts.containerTokenFile }
+      : process.env.OPENCLAUDE_V3_CONTAINER_TOKEN
+        ? { OPENCLAUDE_V3_CONTAINER_TOKEN: process.env.OPENCLAUDE_V3_CONTAINER_TOKEN }
+        : {}),
+  }
+}
 
 // ───────────────────────────────────────────────
 // SubprocessRunner
@@ -663,17 +735,6 @@ export class SubprocessRunner extends EventEmitter {
       // into process.env at container-boot time, pointing CCB at the internal
       // proxy. Leave those alone; MANAGED_BY_HOST still protects against
       // settings.json overrides.
-    } else if (effectiveProvider === 'codex' || effectiveProvider === 'openai') {
-      // OpenAI/Codex: use Codex OAuth token via OpenAI-compatible endpoint
-      // CCB doesn't natively support OpenAI, but OpenAI provides an Anthropic-compatible
-      // proxy at https://api.openai.com/anthropic/ (or use a local proxy like LiteLLM)
-      if (this.opts.config.auth.codexOAuth?.accessToken) {
-        providerEnv.ANTHROPIC_AUTH_TOKEN = this.opts.config.auth.codexOAuth.accessToken
-        // Note: OpenAI doesn't have an Anthropic-compatible endpoint by default.
-        // Users need to configure a proxy (LiteLLM/OneAPI) or this won't work.
-        // Leave ANTHROPIC_BASE_URL unset to let settings.json or env provide it.
-      }
-      // Don't inject Claude OAuth — that would override the Codex token
     } else {
       // MiniMax / DeepSeek / custom provider: DON'T inject any OAuth token.
       // Let CCB fall through to settings.json (which has ANTHROPIC_BASE_URL +

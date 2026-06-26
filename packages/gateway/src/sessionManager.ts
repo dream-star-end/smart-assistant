@@ -24,8 +24,6 @@ import { eventBus, createEvent } from './eventBus.js'
 import { createLogger } from './logger.js'
 import { getV3MasterSinkOrNull, type V3MasterSinkPayload } from './v3MasterSink.js'
 import { SubprocessRunner } from './subprocessRunner.js'
-import { CodexAppServerRunner } from './codexAppServerRunner.js'
-import { CodexRunner, type CodexProviderConfigOverride } from './codexRunner.js'
 import {
   type ExecutionTarget,
   type RemoteTargetController,
@@ -1241,80 +1239,33 @@ export class SessionManager {
         `[v5] ccb-only invariant violated: codex-native agent '${opts.agent.id}' not allowed on v5 channel`,
       )
     }
-    let runner: SubprocessRunner
-    if (opts.agent.provider === 'codex-native') {
-      // Only resume if the persisted id was produced by a codex-native runner —
-      // feeding a CCB session_id to either codex backend would make codex reject
-      // the id or attach to a nonexistent thread.
-      const codexResumeId = this._resumeIdFor(opts.sessionKey, providerTag)
-      const codexModel = opts.agent.model ?? this.config.defaults.model
-      if (opts.agent.runnerKind === 'app-server') {
-        runner = new CodexAppServerRunner({
-          sessionKey: opts.sessionKey,
-          agentId: opts.agent.id,
-          cwd,
-          resumeSessionId: codexResumeId,
-          model: codexModel,
-          // ── Phase 1 platform context (master a88419ba ported to v3) ──
-          // Wires SOUL/USER/AGENTS/SKILLS/MEMORY/TOOLS/RESEARCH slots into
-          // codex via `-c model_instructions_file=...` and gives codex the
-          // openclaude_memory MCP server for archival/skill/recall tools.
-          persona,
-          agentProvider: opts.agent.provider,
-          effortLevel: initialEffort,
-          config: this.config,
-          delegationDepth: opts.delegationDepth,
-          // Phase 5:与 SubprocessRunner 对称 — repoSessionId(默认 peerId)+
-          // 全局 snapshot provider。runner 在每轮 turn 顶部 capture 一次,
-          // 决定 thread/start.cwd / thread/resume.cwd / spawn cwd。
-          sessionId: repoSessionId,
-          getRepoSnapshot: this._getRepoSnapshot,
-        }) as unknown as SubprocessRunner
-      } else {
-        runner = new CodexRunner({
-          sessionKey: opts.sessionKey,
-          agentId: opts.agent.id,
-          cwd,
-          resumeSessionId: codexResumeId,
-          model: codexModel,
-          persona,
-          agentProvider: opts.agent.provider,
-          effortLevel: initialEffort,
-          config: this.config,
-          delegationDepth: opts.delegationDepth,
-          // Phase 5:同上(per-turn `codex exec` 也需要按 repo binding
-          // 切 spawn cwd)。
-          sessionId: repoSessionId,
-          getRepoSnapshot: this._getRepoSnapshot,
-        }) as unknown as SubprocessRunner
-      }
-    } else {
-      runner = new SubprocessRunner({
-        sessionKey: opts.sessionKey,
-        agentId: opts.agent.id,
-        agentBaseDir: cwd,
-        config: this.config,
-        persona,
-        model: opts.agent.model ?? this.config.defaults.model,
-        permissionMode: opts.agent.permissionMode ?? this.config.defaults.permissionMode,
-        agentProvider: opts.agent.provider,
-        agentMcpServers: opts.agent.mcpServers,
-        agentToolsets: opts.agent.toolsets ?? this.config.defaults.toolsets,
-        delegationDepth: opts.delegationDepth,
-        // Symmetrically: only resume CCB from a CCB-tagged id.
-        // _resumeIdFor also drops the entry silently when the CCB JSONL
-        // was wiped (pre-2026-04-22 v3 containers' tmpfs was ephemeral).
-        resumeSessionId: this._resumeIdFor(opts.sessionKey, providerTag),
-        effortLevel: initialEffort,
-        // Phase 5:repoSessionId 默认等于 peerId;delegate_task 可传父 webchat
-        // session id 作为 repo lookup key,但不改变 delegate 自己的 peerId。
-        // getRepoSnapshot 由 Gateway 构造器注入。
-        sessionId: repoSessionId,
-        getRepoSnapshot: this._getRepoSnapshot,
-        workload: opts.workload,
-        skillTrainRunId: opts.skillTrainRunId,
-      })
-    }
+    // P1f / v5 ccb 单底座:codex runner 已删,所有 agent 无条件走 SubprocessRunner。
+    // codex-native agent 在 v5 channel 已被上方不变量 fail-closed 拦截。
+    const runner = new SubprocessRunner({
+      sessionKey: opts.sessionKey,
+      agentId: opts.agent.id,
+      agentBaseDir: cwd,
+      config: this.config,
+      persona,
+      model: opts.agent.model ?? this.config.defaults.model,
+      permissionMode: opts.agent.permissionMode ?? this.config.defaults.permissionMode,
+      agentProvider: opts.agent.provider,
+      agentMcpServers: opts.agent.mcpServers,
+      agentToolsets: opts.agent.toolsets ?? this.config.defaults.toolsets,
+      delegationDepth: opts.delegationDepth,
+      // Symmetrically: only resume CCB from a CCB-tagged id.
+      // _resumeIdFor also drops the entry silently when the CCB JSONL
+      // was wiped (pre-2026-04-22 v3 containers' tmpfs was ephemeral).
+      resumeSessionId: this._resumeIdFor(opts.sessionKey, providerTag),
+      effortLevel: initialEffort,
+      // Phase 5:repoSessionId 默认等于 peerId;delegate_task 可传父 webchat
+      // session id 作为 repo lookup key,但不改变 delegate 自己的 peerId。
+      // getRepoSnapshot 由 Gateway 构造器注入。
+      sessionId: repoSessionId,
+      getRepoSnapshot: this._getRepoSnapshot,
+      workload: opts.workload,
+      skillTrainRunId: opts.skillTrainRunId,
+    })
     const now = Date.now()
     const session: AgentSession = {
       sessionKey: opts.sessionKey,
@@ -1494,7 +1445,6 @@ export class SessionManager {
     conversationMode?: 'default' | 'plan',
     opts?: {
       historicalMessages?: unknown[]
-      codexRoute?: CodexProviderConfigOverride | null
       toolsets?: string[]
     },
   ): Promise<void> {
@@ -1531,14 +1481,6 @@ export class SessionManager {
       // stdin JSON-RPC 扩展。Lock 保证 setTraceId 与并发 submit() 串行,不会
       // 跨 turn 互踩。
       if (traceId !== undefined) session.runner.setTraceId(traceId)
-      const maybeSetConversationMode = (session.runner as any).setConversationMode
-      if (typeof maybeSetConversationMode === 'function') {
-        maybeSetConversationMode.call(session.runner, conversationMode ?? 'default')
-      }
-      const maybeSetCodexRoute = (session.runner as any).setCodexRoute
-      if (typeof maybeSetCodexRoute === 'function') {
-        maybeSetCodexRoute.call(session.runner, opts?.codexRoute ?? null)
-      }
       // effort + model 应用都必须在本 turn 真正启动**之前**完成,且必须在 prev 之后:
       //   - prev 之前:可能中断别人的 in-flight turn
       //   - 本 turn 之后:env / cli args 已被 CCB 启动时读完,改也无效
@@ -2433,93 +2375,8 @@ export class SessionManager {
         // 也会重新 arm,会让旧 turn 的 idle 回调在 30 分钟后被无意义地触发
         // (回调内有 !parser.finalized 守卫所以是 no-op,但还是不要触发更干净)。
         if (!detached) timer.refresh()
-        // PR2 v1.0.66 — codex turn 终态侧信道。CodexAppServerRunner 在 emitResult
-        // 时把 server-owned requestId 挂在 RunnerMessage 上;sessionManager 这里**额外**
-        // 派一帧 'codex_billing' 给 server.ts 路由到 outbound.codex_billing(发给 master
-        // 做真扣费 settle)。parser.parse(msg) 仍照常发 kind:'final' 给前端 UI。
-        //
-        // 守卫:
-        //   - msg.type === 'result':runner result 帧
-        //   - msg.requestId 字符串非空:仅 codex-native runner 透传过来才有
-        //   - !detached:turn 已 idle/error 走完不再 emit(否则可能撞二次 settle 路径)
-        //   只看 msg.requestId 不看 runner 类型 —— 类型识别在 master 不在容器侧;
-        //   container 只对"携带 requestId 的 result"放行,信任 caller(master)
-        //   只在 codex 路径才传。其它 runner 即使被改造支持 requestId,也走得通。
-        if (
-          !detached &&
-          msg &&
-          typeof msg === 'object' &&
-          msg.type === 'result' &&
-          typeof msg.requestId === 'string' &&
-          msg.requestId.length > 0
-        ) {
-          const isOk: boolean = msg.is_error !== true
-          const errReason: string | undefined =
-            !isOk && typeof msg.result === 'string' && msg.result.length > 0
-              ? msg.result
-              : undefined
-          const u = msg.usage as
-            | {
-                input_tokens?: number
-                output_tokens?: number
-                cache_read_input_tokens?: number
-                cache_creation_input_tokens?: number
-                reasoning_output_tokens?: number
-              }
-            | undefined
-          // typeof 防御 → undefined 字段不进 emit,兼容旧帧 / 容器 schema 漂移
-          const usagePayload = u
-            ? {
-                ...(typeof u.input_tokens === 'number' ? { input_tokens: u.input_tokens } : {}),
-                ...(typeof u.output_tokens === 'number' ? { output_tokens: u.output_tokens } : {}),
-                ...(typeof u.cache_read_input_tokens === 'number'
-                  ? { cache_read_input_tokens: u.cache_read_input_tokens }
-                  : {}),
-                ...(typeof u.cache_creation_input_tokens === 'number'
-                  ? { cache_creation_input_tokens: u.cache_creation_input_tokens }
-                  : {}),
-                ...(typeof u.reasoning_output_tokens === 'number'
-                  ? { reasoning_output_tokens: u.reasoning_output_tokens }
-                  : {}),
-              }
-            : undefined
-          // Issue A v1.0.108 — codex `account/rateLimits/updated` snapshot piggy-back。
-          // CodexAppServerRunner.runTurn 在 emitResult 时把最新已知 rateLimits 挂在
-          // msg.rateLimits;sessionManager 这里**透传**到 codex_billing 事件,server.ts
-          // 再写到 OutboundCodexBilling.rateLimits 帧给 master.userChatBridge 落库。
-          // typeof 防御保持与 usage 同样宽松,容器旧版本不会带本字段。
-          const rl = (msg as { rateLimits?: unknown }).rateLimits
-          const rateLimitsPayload =
-            rl && typeof rl === 'object'
-              ? (() => {
-                  const r = rl as Record<string, unknown>
-                  const out: {
-                    util5h?: number
-                    reset5h?: string
-                    util7d?: number
-                    reset7d?: string
-                  } = {}
-                  // Codex review MINOR:边界层用 Number.isFinite 拒掉 NaN/Infinity,
-                  // 否则会被 JSON 序列化成 null 进 wire,下游 quota.ts 行为不可预测。
-                  if (typeof r.util5h === 'number' && Number.isFinite(r.util5h)) out.util5h = r.util5h
-                  if (typeof r.reset5h === 'string') out.reset5h = r.reset5h
-                  if (typeof r.util7d === 'number' && Number.isFinite(r.util7d)) out.util7d = r.util7d
-                  if (typeof r.reset7d === 'string') out.reset7d = r.reset7d
-                  return Object.keys(out).length > 0 ? out : undefined
-                })()
-              : undefined
-          // wrappedOnEvent 不动:billing 帧不计 turnBlockCount/turnPermissionCount,
-          // phantom-turn 判定不该把 billing 算成"输出"。直接调 onEvent。
-          onEvent({
-            kind: 'codex_billing',
-            requestId: msg.requestId,
-            status: isOk ? 'success' : 'error',
-            durationMs: typeof msg.duration_ms === 'number' ? msg.duration_ms : 0,
-            ...(usagePayload ? { usage: usagePayload } : {}),
-            ...(errReason ? { errorReason: errReason } : {}),
-            ...(rateLimitsPayload ? { rateLimits: rateLimitsPayload } : {}),
-          })
-        }
+        // P1f / v5 ccb 单底座:codex turn 终态侧信道(outbound.codex_billing 发射)
+        // 已随 codex runner 一并删除。v5 容器永不产生 codex_billing 帧。
         parser.parse(msg)
       }
       const handleError = (err: Error) => {

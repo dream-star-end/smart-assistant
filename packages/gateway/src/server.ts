@@ -116,22 +116,14 @@ import {
 } from './sessionRepoWorkspace.js'
 import { SessionManager } from './sessionManager.js'
 import { WebhookRouter } from './webhooks.js'
-import { syncCodexAuthFiles } from './codexAuthSync.js'
-import { resolveCodexConversationMode } from './codexAutoPlanMode.js'
 import { inferAgentForModel } from './inferAgentForModel.js'
 import { mergeOnDemandToolsets, resolveDelegateToolsets } from './toolsetIntent.js'
-import { resolveOpenClaudeVisionEntry } from './codexLaunchOverrides.js'
+import { resolveOpenClaudeVisionEntry } from './subprocessRunner.js'
 import {
   OPENCLAUDE_VISION_MCP_ID,
   OPENCLAUDE_VISION_TOOLS,
   shouldEnableOpenClaudeVision,
 } from './mcpVisionServer.js'
-import {
-  handleV3CodexRelayLocal,
-  readV3CodexRelayConfig,
-  V3_CODEX_RELAY_PREFIX,
-} from './v3CodexRelay.js'
-import type { CodexProviderConfigOverride } from './codexRunner.js'
 
 // User-Agent for gateway-internal Claude OAuth fetch (token exchange + refresh).
 // Default Node fetch sends `undici` which is an obvious non-CC fingerprint to
@@ -235,76 +227,6 @@ export function collectAvailableMcpToolNames(
   return [...tools]
 }
 
-/**
- * Parse the master-owned Codex per-turn route override from an inbound frame.
- *
- * Contract:
- * - API relay groups carry a localhost relay URL + modelProvider and become
- *   launch-time Codex provider overrides.
- * - official_oauth groups carry only `{ kind: 'official_oauth' }` and become
- *   an explicit empty override. That empty object is important: it tells the
- *   Codex runner "do not inherit process.env OC_CODEX_* relay defaults" while
- *   still preserving the normal official OAuth auth.json path.
- */
-export function _buildSafeCodexRouteOverride(args: {
-  agentProvider?: string
-  model?: string
-  rawRoute: unknown
-}): CodexProviderConfigOverride | null {
-  if (
-    args.agentProvider !== 'codex-native' ||
-    !args.model?.startsWith('gpt-') ||
-    !args.rawRoute ||
-    typeof args.rawRoute !== 'object' ||
-    Array.isArray(args.rawRoute)
-  ) {
-    return null
-  }
-
-  const r = args.rawRoute as Record<string, unknown>
-  if (r.kind === 'official_oauth') {
-    // Exact-shape marker only. A malformed/client-shaped object such as
-    // `{ kind: 'official_oauth', baseUrl: ... }` must not be reinterpreted as
-    // the empty override sentinel.
-    return Object.keys(r).length === 1 ? {} : null
-  }
-
-  let routeBaseUrlOk = false
-  if (typeof r.baseUrl === 'string') {
-    try {
-      const parsedRouteBase = new URL(r.baseUrl)
-      routeBaseUrlOk =
-        parsedRouteBase.protocol === 'http:' &&
-        parsedRouteBase.hostname === '127.0.0.1' &&
-        parsedRouteBase.pathname.startsWith('/internal/v3/codex-relay/route/')
-    } catch {
-      routeBaseUrlOk = false
-    }
-  }
-
-  if (
-    typeof r.baseUrl === 'string' &&
-    routeBaseUrlOk &&
-    typeof r.modelProvider === 'string' &&
-    /^[A-Za-z0-9_-]+$/.test(r.modelProvider)
-  ) {
-    return {
-      baseUrl: r.baseUrl,
-      modelProvider: r.modelProvider,
-      providerName: typeof r.providerName === 'string' ? r.providerName : null,
-      wireApi: r.wireApi === 'responses' || r.wireApi === 'chat' ? r.wireApi : null,
-      preferredAuthMethod:
-        r.preferredAuthMethod === 'apikey' || r.preferredAuthMethod === 'chatgpt'
-          ? r.preferredAuthMethod
-          : null,
-      disableResponseStorage:
-        typeof r.disableResponseStorage === 'boolean' ? r.disableResponseStorage : null,
-    }
-  }
-
-  return null
-}
-
 // ─── handleUpload TOCTOU hardening test seam (v3 commercial v1.0.155) ───────
 //
 // Production calls fchmod / fchown / link via `_uploadFsOps.*` so unit tests
@@ -328,35 +250,6 @@ export function __setUploadFsOpsForTests(overrides: Partial<UploadFsOps> | null)
   _uploadFsOps = overrides ? { ...defaultUploadFsOps, ...overrides } : defaultUploadFsOps
 }
 
-// v3 commercial: shared codex chatgpt OAuth between host gateway and per-user
-// containers requires two host directories — master (refresh_token, never
-// mounted) and container (stripped, ro bind-mounted into containers). See
-// codexAuthSync.ts for the design. Defaults can be overridden by env to
-// support staging / alt deploys.
-const CODEX_MASTER_DIR_DEFAULT = '/var/lib/openclaude-v3/codex-master-auth'
-const CODEX_CONTAINER_DIR_DEFAULT = '/var/lib/openclaude-v3/codex-container-auth'
-
-// Container Dockerfile (packages/commercial/agent-sandbox/Dockerfile.openclaude-runtime)
-// fixes the agent user at uid=1000 / gid=1000. Default here matches that
-// invariant so a missing env var doesn't silently leave auth.json root-owned
-// (which would prevent the container's agent uid from reading it). Overrideable
-// via CODEX_CONTAINER_AUTH_UID for non-default deploys / dev.
-const CODEX_CONTAINER_AUTH_UID_DEFAULT = 1000
-
-function getCodexAuthDirs(): {
-  masterDir: string
-  containerDir: string
-  containerUid: number
-} {
-  const uidRaw = process.env.CODEX_CONTAINER_AUTH_UID
-  const containerUid =
-    uidRaw && /^\d+$/.test(uidRaw) ? Number(uidRaw) : CODEX_CONTAINER_AUTH_UID_DEFAULT
-  return {
-    masterDir: process.env.CODEX_MASTER_DIR || CODEX_MASTER_DIR_DEFAULT,
-    containerDir: process.env.CODEX_CONTAINER_DIR || CODEX_CONTAINER_DIR_DEFAULT,
-    containerUid,
-  }
-}
 
 /**
  * V3 Phase 2 Task 2H: 商业化模块 hook 形状(只声明 gateway 需要的接口,
@@ -1463,14 +1356,6 @@ export class Gateway {
     // Check immediately on boot
     this.refreshClaudeOAuthIfNeeded().catch(() => {})
 
-    // v3 commercial: self-heal codex auth files on boot. If host master /
-    // container files were lost (deploy moved dirs, perms got stomped, fresh
-    // host) but codexOAuth in config is still valid, regenerate them so
-    // per-user containers can read the shared chatgpt subscription without
-    // requiring boss to re-OAuth. Force-write — no ownership check needed
-    // because we trust the in-memory config as source of truth on boot.
-    void this._selfHealCodexAuthOnBoot()
-
     await new Promise<void>((res) => {
       this.httpServer.listen(config.gateway.port, config.gateway.bind, () => res())
     })
@@ -1732,27 +1617,6 @@ export class Gateway {
       }
     })
 
-
-    // v3 commercial Codex local relay. Codex CLI uses Authorization for its
-    // upstream token, so the container gateway must translate it into a
-    // private header and authenticate to master with OPENCLAUDE_V3_CONTAINER_TOKEN.
-    // The handler is loopback-only; other bridge containers cannot use it.
-    if (url.pathname === V3_CODEX_RELAY_PREFIX || url.pathname.startsWith(`${V3_CODEX_RELAY_PREFIX}/`)) {
-      const relayCfg = readV3CodexRelayConfig(process.env)
-      if (!relayCfg) {
-        this.sendJson(res, 404, { error: { code: 'CODEX_RELAY_NOT_CONFIGURED', message: 'codex relay not configured' } })
-        return
-      }
-      handleV3CodexRelayLocal(req, res, relayCfg).catch((err) => {
-        this.log.error('v3 codex local relay crashed', undefined, err)
-        if (!res.headersSent) {
-          try { this.sendJson(res, 500, { error: { code: 'INTERNAL', message: 'codex relay crashed' } }) } catch {}
-        } else {
-          try { res.end() } catch {}
-        }
-      })
-      return
-    }
 
     // ── Multi-user login (no auth required, rate-limited) ──
     if (url.pathname === '/api/auth/login' && req.method === 'POST') {
@@ -2270,12 +2134,6 @@ export class Gateway {
         authInfo.claudeOAuth = {
           active: true,
           expiresAt: this.deps.config.auth.claudeOAuth.expiresAt,
-        }
-      }
-      if (this.deps.config.auth.codexOAuth?.accessToken) {
-        authInfo.codexOAuth = {
-          active: true,
-          expiresAt: this.deps.config.auth.codexOAuth.expiresAt,
         }
       }
       res.end(
@@ -2915,31 +2773,6 @@ export class Gateway {
       this.sendJson(res, 400, { error: 'requestId must be 32 lowercase hex chars' })
       return
     }
-    const rawCodexRoute = body.__oc_codex_route
-    if (rawCodexRoute !== undefined) {
-      if (typeof model !== 'string' || !model.startsWith('gpt-')) {
-        this.sendJson(res, 400, { error: 'codex route requires explicit gpt model' })
-        return
-      }
-      if (
-        !rawCodexRoute ||
-        typeof rawCodexRoute !== 'object' ||
-        Array.isArray(rawCodexRoute) ||
-        (rawCodexRoute as Record<string, unknown>).kind === 'official_oauth'
-      ) {
-        this.sendJson(res, 400, { error: 'codex route override invalid for wechat inbound' })
-        return
-      }
-      const safeWechatCodexRoute = _buildSafeCodexRouteOverride({
-        agentProvider: 'codex-native',
-        model,
-        rawRoute: rawCodexRoute,
-      })
-      if (safeWechatCodexRoute === null || Object.keys(safeWechatCodexRoute).length === 0) {
-        this.sendJson(res, 400, { error: 'codex route override invalid for wechat inbound' })
-        return
-      }
-    }
     const contentRaw = body.content as Record<string, unknown> | undefined
     if (!contentRaw || typeof contentRaw !== 'object') {
       this.sendJson(res, 400, { error: 'content required' })
@@ -2996,7 +2829,6 @@ export class Gateway {
       ...(typeof agentId === 'string' ? { agentId } : {}),
       ...(typeof model === 'string' ? { model } : {}),
       ...(typeof requestId === 'string' ? { requestId } : {}),
-      ...(rawCodexRoute !== undefined ? { __oc_codex_route: rawCodexRoute } : {}),
       content: { text },
       ts,
     }
@@ -6025,18 +5857,6 @@ export class Gateway {
       redirect: 'https://platform.claude.com/oauth/code/callback',
       scopes: 'user:profile user:inference user:sessions:claude_code user:mcp_servers',
     },
-    codex: {
-      clientId: 'app_EMoamEEZ73f0CkXaXp7hrann',
-      authUrl: 'https://auth.openai.com/oauth/authorize',
-      tokenUrl: 'https://auth.openai.com/oauth/token',
-      redirect: 'http://localhost:1455/auth/callback',
-      scopes: 'openid profile email offline_access',
-      extraParams: {
-        id_token_add_organizations: 'true',
-        codex_cli_simplified_flow: 'true',
-        originator: 'codex_vscode',
-      },
-    },
   }
 
   private async handleOAuthStart(req: IncomingMessage, res: ServerResponse): Promise<void> {
@@ -6150,31 +5970,11 @@ export class Gateway {
         if (providerKey === 'claude') {
           config.auth.claudeOAuth = oauthData
           config.auth.mode = 'subscription'
-        } else if (providerKey === 'codex') {
-          config.auth.codexOAuth = oauthData
         }
         await writeConfig(config)
         this.deps.config = config
         this.sessions.updateConfig(config)
         this.log.info('oauth tokens saved', { provider: providerKey })
-
-        // v3 commercial: callback path = boss just OAuth'd via the UI →
-        // force-write both master and container auth.json so per-user
-        // containers can immediately use the shared chatgpt subscription.
-        // No expectedPreviousRefreshToken: this is an explicit user action,
-        // overwriting any prior file is intended.
-        if (providerKey === 'codex') {
-          const dirs = getCodexAuthDirs()
-          await syncCodexAuthFiles({
-            oauth: { accessToken: oauthData.accessToken, refreshToken: oauthData.refreshToken },
-            masterDir: dirs.masterDir,
-            containerDir: dirs.containerDir,
-            containerUid: dirs.containerUid,
-            log: this.log,
-          }).catch((err) =>
-            this.log.warn('codex auth sync after OAuth callback failed', undefined, err),
-          )
-        }
       }
 
       this.sendJson(res, 200, {
@@ -6194,28 +5994,6 @@ export class Gateway {
   // we chain the forced refresh after the current one completes.
   private _refreshPromise: Promise<void> | null = null
   private _refreshForced = false
-
-  /**
-   * v3 commercial: regenerate master + container auth.json on gateway boot
-   * if config has a codexOAuth token. Idempotent — same JSON written to
-   * stable paths via atomic rename. Fire-and-forget; never throws.
-   */
-  private async _selfHealCodexAuthOnBoot(): Promise<void> {
-    try {
-      const codexOAuth = this.deps.config.auth.codexOAuth
-      if (!codexOAuth?.accessToken || !codexOAuth.refreshToken) return
-      const dirs = getCodexAuthDirs()
-      await syncCodexAuthFiles({
-        oauth: { accessToken: codexOAuth.accessToken, refreshToken: codexOAuth.refreshToken },
-        masterDir: dirs.masterDir,
-        containerDir: dirs.containerDir,
-        containerUid: dirs.containerUid,
-        log: this.log,
-      })
-    } catch (err) {
-      this.log.warn('codex auth self-heal on boot failed', undefined, err)
-    }
-  }
 
   private refreshClaudeOAuthIfNeeded(force = false): Promise<void> {
     if (this._refreshPromise) {
@@ -6243,10 +6021,6 @@ export class Gateway {
     const claudeOAuth = this.deps.config.auth.claudeOAuth
     if (claudeOAuth?.refreshToken && (force || Date.now() >= claudeOAuth.expiresAt - REFRESH_LEAD_MS)) {
       await this._refreshToken('claude', claudeOAuth)
-    }
-    const codexOAuth = this.deps.config.auth.codexOAuth
-    if (codexOAuth?.refreshToken && (force || Date.now() >= codexOAuth.expiresAt - REFRESH_LEAD_MS)) {
-      await this._refreshToken('codex', codexOAuth)
     }
   }
 
@@ -6301,26 +6075,6 @@ export class Gateway {
           provider: providerKey,
           expiresInSec: tokens.expires_in,
         })
-
-        // v3 commercial: refresh path → write master with ownership check
-        // (only overwrite if master file's refresh_token is still the one
-        // we just consumed = oauth.refreshToken before swap), then write
-        // container variant. Single-actor invariant: in v3 commercial the
-        // gateway is a single systemd unit — _refreshPromise dedups inside
-        // this process. See risk #3 in plan v3 for multi-gateway caveats.
-        if (providerKey === 'codex') {
-          const dirs = getCodexAuthDirs()
-          await syncCodexAuthFiles({
-            oauth: { accessToken: refreshed.accessToken, refreshToken: refreshed.refreshToken },
-            masterDir: dirs.masterDir,
-            containerDir: dirs.containerDir,
-            containerUid: dirs.containerUid,
-            log: this.log,
-            expectedPreviousRefreshToken: oauth.refreshToken,
-          }).catch((err) =>
-            this.log.warn('codex auth sync after token refresh failed', undefined, err),
-          )
-        }
       }
     } catch (err) {
       this.log.error('oauth refresh error', { provider: providerKey }, err)
@@ -7662,46 +7416,6 @@ export class Gateway {
       }
     }
 
-    // ── plan v3 §B4 review v3 finding 1: defense-in-depth ──
-    // Gateway runs inside the per-user container with no commercial DB access,
-    // so it can't run model authz directly — that's the bridge's job. But
-    // bridge's AGENT_AUTHZ_IMPLIED_MODEL allowlist only covers the canonical
-    // id='codex'. A user who edits `agents.yaml` to add a second agent with
-    // `provider: 'codex-native'` under a custom id and sends
-    // `{agentId: '<custom>'}` (no `model` field) would bypass:
-    //   - bridge: no frame.model + custom id not in allowlist → no authz check
-    //   - gateway: safeModelForRouting=undefined → inferAgentForModel skipped
-    //   - sessionManager: provider==='codex-native' → spawns CodexRunner
-    // Close the loop here: any codex-native agent execution MUST carry an
-    // explicit ALLOWED_INBOUND_MODELS gpt-* model so the bridge's frame.model
-    // authz path runs. Frontend always sends `model` with codex selection,
-    // so legit flows are unaffected. Reject is fail-closed (error frame +
-    // return, never enters sessionManager).
-    if (agent.provider === 'codex-native' && !safeModelForRouting) {
-      const _errUserId: string =
-        typeof (frame as any)._userId === 'string' ? (frame as any)._userId : 'default'
-      const errFrame = {
-        type: 'outbound.message' as const,
-        sessionKey,
-        channel: frame.channel,
-        peer: frame.peer,
-        blocks: [
-          {
-            kind: 'text' as const,
-            text: '[error] codex-native agent requires explicit model field',
-          },
-        ],
-        isFinal: true,
-        traceId: turnTraceId,
-        _userId: _errUserId,
-      }
-      this.log.warn('codex-native agent invoked without explicit model — rejected', {
-        agentId: agent.id,
-      })
-      this.deliver(errFrame, adapter)
-      return
-    }
-
     // Track last active channel for proactive push
     const activeUserId: string =
       typeof (frame as any)._userId === 'string' ? (frame as any)._userId : 'default'
@@ -7763,12 +7477,6 @@ export class Gateway {
       typeof _frameRequestId === 'string' && _frameRequestId.length > 0
         ? _frameRequestId
         : undefined
-
-    const safeCodexRoute = _buildSafeCodexRouteOverride({
-      agentProvider: agent.provider,
-      model: safeModelForRouting,
-      rawRoute: (frame as any).__oc_codex_route,
-    })
 
     const baseToolsets = agent.toolsets ?? this.deps.config.defaults.toolsets
     const effectiveToolsets = mergeOnDemandToolsets(
@@ -7889,13 +7597,6 @@ export class Gateway {
     // so the agent knows how to access them via MCP tools or Read.
     const text = frame.content.text ?? ''
     const media = frame.content.media ?? []
-    const effectiveConversationMode = resolveCodexConversationMode({
-      requestedMode: safeConversationMode,
-      agent,
-      model: safeModel,
-      text,
-      attachmentCount: media.length,
-    })
 
     // Server-side upload validation. Constants live at module level
     // (UPLOAD_MIME_PREFIXES / MAX_UPLOAD_SINGLE / MAX_UPLOAD_TOTAL) so they
@@ -8460,39 +8161,6 @@ export class Gateway {
         // ts / frameSeq 由 deliver() 在 ring 落地时一并 stamp,这里不预填
         // (与 outbound.codex_billing / outbound.error 同 wire stamp 模式)。
         this.deliver(turnStatusFrame, adapter)
-      } else if (e.kind === 'codex_billing') {
-        // PR2 v1.0.66 — codex turn 终态侧信道。CodexAppServerRunner.emitResult 把
-        // server-owned requestId 回带,sessionManager 转成 'codex_billing' 事件,
-        // server.ts 这里发 outbound.codex_billing 帧给 master(走 deliver() 同样路径,
-        // 落到 userChatBridge 的 onContainerMessage,Stage 3 会拦截 settle)。
-        //
-        // 不影响 turn 流式 UX:这帧与 outbound.message/error 并存,前端不识别此 type
-        // 在 default case 静默忽略。master 拦截后不 forward 到 user。
-        //
-        // 用 deliver() 是因为它已经处理 frameSeq + ring + per-peer 路由,我们不该
-        // 在这里手抄一份。带 _userId 让 deliver 路由到正确 peerKey(等同 out 帧)。
-        // 路由三件套从 out 复制(同 OutboundError 模式),deliver() 需要 channel/
-        // peer.id 算 peerKey、需要 sessionKey 落 outbound ring。billing 只去 master,
-        // master 从 requestId 找 inflight,不读这三字段做 settle。
-        // CG7 — derived frame copies routing + traceId from main `out`. Note
-        // billing carries the same `traceId` as the turn's outbound.message
-        // (intentional — codex_billing settles in master.userChatBridge keyed
-        // by requestId, but having traceId on it lets trace queries pivot from
-        // billing rows to the turn that produced them).
-        const billingFrame: OutboundCodexBilling & { _userId?: string } = {
-          type: 'outbound.codex_billing',
-          ..._inheritOutboundRouting(out),
-          requestId: e.requestId,
-          status: e.status,
-          durationMs: e.durationMs,
-          ...(e.usage ? { usage: e.usage } : {}),
-          ...(e.errorReason ? { errorReason: e.errorReason } : {}),
-          // Issue A v1.0.108 — codex rateLimits 快照,master.userChatBridge 落库到
-          // claude_accounts.quota_*。container/runtime 与 master 协议层都已扩 schema,
-          // optional 字段缺省时自然不带,与旧版本 master 向后兼容。
-          ...(e.rateLimits ? { rateLimits: e.rateLimits } : {}),
-        }
-        this.deliver(billingFrame, adapter)
       } else if (e.kind === 'error') {
         // Plan 2 — turn 终态前清 turn_status cache,语义同 final 分支。
         session.currentTurnStatus = null
@@ -8550,9 +8218,8 @@ export class Gateway {
           )
         }
       }
-    }, safeEffortLevel, safeModel, safeRequestId, turnTraceId, effectiveConversationMode, {
+    }, safeEffortLevel, safeModel, safeRequestId, turnTraceId, safeConversationMode, {
       historicalMessages: masterHistoricalMessages,
-      codexRoute: safeCodexRoute,
       ...(effectiveToolsets !== undefined ? { toolsets: effectiveToolsets } : {}),
     })
     if (liveWechatAdapter) {

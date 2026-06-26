@@ -67,14 +67,6 @@ import { getRuntimeChannel } from "../runtimeChannel.js";
 import { rootLogger } from "../logging/logger.js";
 import { V3_AGENT_GID, V3_AGENT_UID } from "./constants.js";
 import { SupervisorError } from "./types.js";
-import { getCodexTokenSnapshot } from "../account-pool/store.js";
-import { pickCodexAccountForBinding } from "../account-pool/scheduler.js";
-import { buildCodexRelayLocalBaseUrl, readCodexUpstreamBaseUrl } from "../http/internalCodexRelay.js";
-import { zeroBuffer } from "../crypto/keys.js";
-import {
-  removeCodexContainerAuthDir,
-  writeCodexContainerAuthFile,
-} from "../codex-auth/codexAuthFile.js";
 
 // ───────────────────────────────────────────────────────────────────────
 // 常量(硬编码,设计有意为之)
@@ -174,24 +166,6 @@ export const V3_PROJECTS_MOUNT = "/run/oc/claude-config/projects";
 export const V3_VOLUME_MOUNT = "/home/agent/.openclaude";
 
 /**
- * 容器内 codex CLI HOME 持久化挂载点(D2 方案,2026-05-09)。
- *
- * 解决问题:用户 `codex mcp add` / 安装 plugin / 自定义 skill 全部写在 ~/.codex
- * 下的 config.toml + skills/。早期 ~/.codex 在 image overlay → 容器重启全丢。
- * Boss 要求"在正常环境使用一模一样,不阉割"。
- *
- * 共生关系:
- *   - V3_CODEX_AUTH_RO_MOUNT (`/run/oc/codex-auth`) 是独立 RO 目录,放 host 写
- *     的 auth.json。entrypoint.ts 在 ~/.codex/auth.json 建 symlink → /run/oc/codex-auth/auth.json
- *     新挂的 codex volume 与该 RO bind 不重叠。
- *   - codex system skills(image_gen 等)由 entrypoint.ts cpSync 从
- *     /opt/codex-system-skills 种子到 ~/.codex/skills/.system/。volume 首次挂载
- *     是空目录 → seed 一次 → marker 落 volume → 后续 restart skip。用户后加的
- *     ~/.codex/skills/<name>/ 不被 seed 覆盖。
- */
-export const V3_CODEX_HOME_MOUNT = "/home/agent/.codex";
-
-/**
  * 容器内 ~/.local 持久化挂载点(pip --user / npm prefix / pipx / uv tool)。
  *
  * 配套 Dockerfile 的 ENV PATH=/home/agent/.local/bin:... 与 ENV
@@ -213,130 +187,7 @@ export const V3_USER_CONFIG_MOUNT = "/home/agent/.config";
 /** 容器内 entrypoint 跑的非 root 用户(uid:gid),与 Dockerfile USER 一致 */
 const V3_AGENT_USER = "1000:1000";
 
-/**
- * Codex CLI(GPT 模型走 codex app-server runner)的容器侧 auth **源**挂载点。
- *
- * **设计要点(plan v3 §D + 风险 #4)**:
- *   - 容器内 `CODEX_HOME=/home/agent/.codex`(entrypoint.ts 显式 set),codex CLI 启动时
- *     需要在 CODEX_HOME 下写 `.personality_migration` / `logs_*.sqlite` /
- *     `state_*.sqlite` / `memories/` / `skills/` / helper PATH binaries —— 因此
- *     **CODEX_HOME 必须可写**(挂 RO 会让 `codex app-server` exit 1)。
- *   - 本常量是 host auth 源的**独立 RO 挂载点**(不是 CODEX_HOME):docker bind-mount
- *     把 host 剥离 refresh_token 后的 auth.json 目录挂到 `/run/oc/codex-auth`,**ro**。
- *     entrypoint.ts 在 CODEX_HOME/auth.json 创建 symlink 指向 `/run/oc/codex-auth/auth.json`。
- *   - **必须挂目录而非单文件**:host atomic rename(`auth.json.tmp.<rand> → auth.json`)
- *     在文件 bind-mount 下绑死旧 inode,容器永远看不到新 token。挂目录后
- *     容器侧 dirfd → entry "auth.json",rename 替换 entry 后,symlink 解析到新 inode 即可见。
- *   - **永不挂 master 目录**(`codex-master-auth/`)—— 那里有完整 refresh_token,
- *     挂入容器即扩大泄漏面。本常量只引用 container 目录。
- *   - **始终挂载**(boss 未 OAuth 时目录内无 auth.json,symlink 解析 ENOENT,codex
- *     启动报"未授权"是预期行为;前端 modelPicker 在 GPT 未授权时也不会出选项)。
- *   - **安全边界**:RO 挂载保证 host auth 源不可被容器代码改写。CODEX_HOME 下的
- *     auth.json **symlink 本身不是安全控制** —— 容器内 agent 已经能读 token,改 symlink
- *     最多让自己的 codex 找不到 auth(自伤),不影响 host 文件。
- *   - **当前限制**:host 写入由 master gateway 完成,远端 host(useRemote=true)
- *     的容器拿不到 auth.json,GPT 模型仅在 master host 容器可用。跨 host 同步
- *     auth.json 是后续 task,plan v3 范围内不处理。
- */
-export const V3_CODEX_AUTH_RO_MOUNT = "/run/oc/codex-auth";
-
-/**
- * Host 侧容器 auth 目录默认路径。对应 codexAuthSync.writeContainerVariant
- * 写入的目标目录。env `OC_V3_CODEX_CONTAINER_DIR` 覆盖(仅本地 host 有效;
- * 远端 host 必须用 default,见 codex-auth/constants.ts)。
- *
- * v1.0.72:常量挪到 codex-auth/constants 避免循环依赖,这里 re-export
- * 保持向后兼容(index.ts 等老调用方不变)。
- */
-export { DEFAULT_V3_CODEX_CONTAINER_DIR } from "../codex-auth/constants.js";
-import { DEFAULT_V3_CODEX_CONTAINER_DIR } from "../codex-auth/constants.js";
-
 const log = rootLogger.child({ subsys: "v3-supervisor" });
-
-function readCodexContainerDirFromEnv(): string {
-  const raw = process.env.OC_V3_CODEX_CONTAINER_DIR;
-  if (raw == null || raw.trim() === "") return DEFAULT_V3_CODEX_CONTAINER_DIR;
-  return raw.trim();
-}
-
-const LEGACY_CODEX_CONTAINER_ENV_KEYS = [
-  "OC_CODEX_MODEL_PROVIDER",
-  "OC_CODEX_PROVIDER_NAME",
-  "OC_CODEX_BASE_URL",
-  "OC_CODEX_WIRE_API",
-  "OC_CODEX_PREFERRED_AUTH_METHOD",
-  "OC_CODEX_DISABLE_RESPONSE_STORAGE",
-] as const;
-
-const LOCAL_RELAY_CODEX_CONTAINER_ENV_KEYS = [
-  "OC_CODEX_MODEL_PROVIDER",
-  "OC_CODEX_PROVIDER_NAME",
-  "OC_CODEX_WIRE_API",
-  "OC_CODEX_PREFERRED_AUTH_METHOD",
-  "OC_CODEX_DISABLE_RESPONSE_STORAGE",
-] as const;
-
-/** Loopback base for the container-local gateway relay. */
-export const V3_CODEX_LOCAL_RELAY_ORIGIN = `http://127.0.0.1:${V3_CONTAINER_PORT}`;
-
-export function isCodexLocalRelayEnabled(
-  sourceEnv: NodeJS.ProcessEnv = process.env,
-): boolean {
-  const raw = sourceEnv.OC_V3_CODEX_LOCAL_RELAY_ENABLED?.trim().toLowerCase();
-  return raw === "1" || raw === "true" || raw === "yes";
-}
-
-/**
- * Build non-secret Codex relay env for user containers.
- *
- * The new local relay needs runtime-image support from packages/gateway. Keep
- * it behind an explicit rollout gate so master can be deployed first, then a
- * new image can be built/distributed/flipped without handing old images a
- * loopback URL they do not understand.
- *
- * Important: the external upstream base URL (OC_CODEX_BASE_URL /
- * OC_CODEX_UPSTREAM_BASE_URL on master) is **not** passed through when the
- * local relay gate is enabled. Containers receive a loopback URL handled by
- * their own gateway, which then authenticates to master with
- * OPENCLAUDE_V3_CONTAINER_TOKEN. This prevents managed Codex traffic from
- * drifting to direct container egress or leaking proxy credentials.
- */
-export function buildCodexRelayContainerEnv(
-  sourceEnv: NodeJS.ProcessEnv = process.env,
-): string[] {
-  const out: string[] = [];
-
-  if (!isCodexLocalRelayEnabled(sourceEnv)) {
-    if (!sourceEnv.OC_CODEX_MODEL_PROVIDER?.trim()) return out;
-    for (const key of LEGACY_CODEX_CONTAINER_ENV_KEYS) {
-      const value = sourceEnv[key]?.trim();
-      if (value) out.push(`${key}=${value}`);
-    }
-    if (!sourceEnv.OC_CODEX_BASE_URL?.trim()) {
-      const dedicatedUpstream = sourceEnv.OC_CODEX_UPSTREAM_BASE_URL?.trim();
-      if (dedicatedUpstream) out.push(`OC_CODEX_BASE_URL=${dedicatedUpstream}`);
-    }
-    return out;
-  }
-
-  const provider = sourceEnv.OC_CODEX_MODEL_PROVIDER?.trim();
-  if (!provider) return out;
-
-  out.push(`OC_CODEX_MODEL_PROVIDER=${provider}`);
-  for (const key of LOCAL_RELAY_CODEX_CONTAINER_ENV_KEYS) {
-    if (key === "OC_CODEX_MODEL_PROVIDER") continue;
-    const value = sourceEnv[key]?.trim();
-    if (value) out.push(`${key}=${value}`);
-  }
-
-  const upstreamBaseUrl = readCodexUpstreamBaseUrl(sourceEnv);
-  out.push(`OC_CODEX_BASE_URL=${buildCodexRelayLocalBaseUrl(V3_CODEX_LOCAL_RELAY_ORIGIN, upstreamBaseUrl)}`);
-  return out;
-}
-
-function appendCodexRelayEnv(env: string[]): void {
-  env.push(...buildCodexRelayContainerEnv(process.env));
-}
 
 /**
  * 宿主侧远程执行 mux 目录 per-user 分片根。
@@ -821,36 +672,6 @@ export interface V3SupervisorDeps {
    */
   selfHostId?: string;
   /**
-   * v1.0.72 — 远端 host 的 per-container codex auth.json 写入路由。
-   *
-   * provisionV3Container / lazy migrate 决定要在远端 host 上落 codex
-   * per-container auth 时调用。caller 已选好 hostUuid(必 ≠ selfHostId,
-   * 否则走本地 writeCodexContainerAuthFile);本回调内部:
-   *   1. computeQueries.getHostById(hostUuid) → ComputeHostRow
-   *   2. hostRowToTarget(row) → NodeAgentTarget(含解密的 PSK)
-   *   3. putRemoteCodexContainerAuth(target, containerId, ...)
-   *   4. finally:target.psk?.fill(0) 清密钥 buffer
-   *
-   * 抛 Error → caller 当 codex 绑定失败,fallback 到 NULL bind / no codex
-   * mount(与本地 try/catch fallback 相同语义)。
-   *
-   * 仅在 useRemote 路径有意义;不注入 → useRemote=true 时 codex 绑定退化
-   * 为"无 codex 绑定"(不阻断 provision,GPT 在该容器内不可用)。
-   */
-  putRemoteCodexAuth?(
-    hostUuid: string,
-    containerId: string,
-    accessToken: string,
-    lastRefreshIso: string,
-  ): Promise<void>;
-  /**
-   * v1.0.72 — 远端 host 的 per-container codex auth.json 删除。
-   *
-   * stopAndRemoveV3Container 在容器清理后调用,best-effort,失败不抛
-   * (与本地 removeCodexContainerAuthDir 同语义)。
-   */
-  deleteRemoteCodexAuth?(hostUuid: string, containerId: string): Promise<void>;
-  /**
    * v1.0.106 — 测试钩子:覆盖 `listAllHosts`(P1 远端 GC 路由用)。
    *
    * `removeV3Volume` 在多 host 场景下需要把 5 个 volume 在所有 ready/draining
@@ -933,17 +754,6 @@ export function v3ProjectsVolumeNameFor(uid: number): string {
 }
 
 /**
- * uid → codex HOME 持久化 volume 名。`oc-v3-codex-u<uid>`(D2)。
- * 挂 /home/agent/.codex,持久化用户 MCP 配置 / plugins / 自定义 skills。
- */
-export function v3CodexVolumeNameFor(uid: number): string {
-  if (!Number.isInteger(uid) || uid <= 0) {
-    throw new SupervisorError("InvalidArgument", `invalid uid: ${uid}`);
-  }
-  return `oc-${getRuntimeChannel()}-codex-u${uid}`;
-}
-
-/**
  * uid → ~/.local 持久化 volume 名。`oc-v3-userlocal-u<uid>`(D2)。
  * 挂 /home/agent/.local,持久化 pip --user / npm prefix / pipx / uv tool 安装。
  */
@@ -980,8 +790,6 @@ export interface V3VolumeBundle {
   data: string;
   /** CCB projects volume(挂 /run/oc/claude-config/projects) */
   projects: string;
-  /** codex CLI HOME volume(挂 /home/agent/.codex)— D2 */
-  codex: string;
   /** ~/.local volume(挂 /home/agent/.local)— D2 */
   userLocal: string;
   /** ~/.config volume(挂 /home/agent/.config)— D2 */
@@ -1248,7 +1056,7 @@ async function ensureSingleV3Volume(
   docker: Docker,
   uid: number,
   name: string,
-  purpose: "data" | "projects" | "codex" | "userLocal" | "userConfig",
+  purpose: "data" | "projects" | "userLocal" | "userConfig",
 ): Promise<void> {
   await docker.createVolume({
     Name: name,
@@ -1291,32 +1099,29 @@ async function ensureSingleV3Volume(
 }
 
 /**
- * 幂等创建用户全部 5 个 volume(D2 持久化方案):
+ * 幂等创建用户全部 4 个 volume(D2 持久化方案,v5 ccb-only 已移除 codex HOME 卷):
  *   - 主 volume       (`oc-v3-data-u<uid>`)       → /home/agent/.openclaude
  *   - projects volume (`oc-v3-proj-u<uid>`)       → /run/oc/claude-config/projects
- *   - codex volume    (`oc-v3-codex-u<uid>`)      → /home/agent/.codex
  *   - userLocal volume(`oc-v3-userlocal-u<uid>`)  → /home/agent/.local
  *   - userConfig volume(`oc-v3-userconfig-u<uid>`)→ /home/agent/.config
  *
- * 5 个 volume 的生命周期绑定:ensureV3Volumes 一起建,removeV3Volume 一起删。
+ * 4 个 volume 的生命周期绑定:ensureV3Volumes 一起建,removeV3Volume 一起删。
  * 任一 volume 被 label 守护拒绝 → 直接抛,不尝试部分接管(语义更清晰)。
  *
- * **purpose 标签** 串复用 ensureSingleV3Volume 的诊断用 enum;新增 codex /
- * userLocal / userConfig 三类只为出错时人能看懂哪个挂载点 fail,不落 label,
- * 与既有 data / projects 一致(靠名字前缀就能唯一区分)。
+ * **purpose 标签** 串复用 ensureSingleV3Volume 的诊断用 enum;userLocal /
+ * userConfig 只为出错时人能看懂哪个挂载点 fail,不落 label,与既有 data /
+ * projects 一致(靠名字前缀就能唯一区分)。
  */
 async function ensureV3Volumes(docker: Docker, uid: number): Promise<V3VolumeBundle> {
   const data = v3VolumeNameFor(uid);
   const projects = v3ProjectsVolumeNameFor(uid);
-  const codex = v3CodexVolumeNameFor(uid);
   const userLocal = v3UserLocalVolumeNameFor(uid);
   const userConfig = v3UserConfigVolumeNameFor(uid);
   await ensureSingleV3Volume(docker, uid, data, "data");
   await ensureSingleV3Volume(docker, uid, projects, "projects");
-  await ensureSingleV3Volume(docker, uid, codex, "codex");
   await ensureSingleV3Volume(docker, uid, userLocal, "userLocal");
   await ensureSingleV3Volume(docker, uid, userConfig, "userConfig");
-  return { data, projects, codex, userLocal, userConfig };
+  return { data, projects, userLocal, userConfig };
 }
 
 /**
@@ -1338,14 +1143,13 @@ async function ensureV3Volumes(docker: Docker, uid: number): Promise<V3VolumeBun
  * Fallback:`deps.containerService` 未注入(测试 / 单机 MVP 场景)→ 退化为
  * 仅本机 dockerode 删除,保留向后兼容。
  *
- * 5 个 volume 全删,语义"哪个 host 上有就删哪个,没有跳过"。生命周期绑定:
- * ensureV3Volumes 一起建,本函数一起删(host 维度独立但 name 集合恒定 5 个)。
+ * 4 个 volume 全删,语义"哪个 host 上有就删哪个,没有跳过"。生命周期绑定:
+ * ensureV3Volumes 一起建,本函数一起删(host 维度独立但 name 集合恒定 4 个)。
  */
 export async function removeV3Volume(deps: V3SupervisorDeps, uid: number): Promise<void> {
   const names = [
     v3VolumeNameFor(uid),
     v3ProjectsVolumeNameFor(uid),
-    v3CodexVolumeNameFor(uid),
     v3UserLocalVolumeNameFor(uid),
     v3UserConfigVolumeNameFor(uid),
   ];
@@ -1697,23 +1501,20 @@ export async function provisionV3Container(
     // ensureV3Volumes 必须在持 per-uid lock 期间调,防 GC race(见函数 doc)
     try {
       if (useRemote) {
-        // 远端路径:label 守护由 node-agent 侧负责;这里只确保 5 个 volume 存在。
+        // 远端路径:label 守护由 node-agent 侧负责;这里只确保 4 个 volume 存在。
         // 顺序与 ensureV3Volumes 本地路径保持一致(diagnostic 一致性,部分失败时
-        // master log 与本地路径同形态 — data → proj → codex → userLocal → userConfig)。
+        // master log 与本地路径同形态 — data → proj → userLocal → userConfig)。
         const dataName = v3VolumeNameFor(uid);
         const projectsName = v3ProjectsVolumeNameFor(uid);
-        const codexName = v3CodexVolumeNameFor(uid);
         const userLocalName = v3UserLocalVolumeNameFor(uid);
         const userConfigName = v3UserConfigVolumeNameFor(uid);
         await deps.containerService!.ensureVolume(hostId!, dataName);
         await deps.containerService!.ensureVolume(hostId!, projectsName);
-        await deps.containerService!.ensureVolume(hostId!, codexName);
         await deps.containerService!.ensureVolume(hostId!, userLocalName);
         await deps.containerService!.ensureVolume(hostId!, userConfigName);
         volumeNames = {
           data: dataName,
           projects: projectsName,
-          codex: codexName,
           userLocal: userLocalName,
           userConfig: userConfigName,
         };
@@ -1817,7 +1618,6 @@ export async function provisionV3Container(
       // 行为(FILE_ALLOWED_DIRS + TEMP_PREFIX + agent_cwd MEDIA_EXTENSIONS)。
       "OC_V3_TRUSTED_FILE_SERVE=1",
     ];
-    appendCodexRelayEnv(env);
 
     // v3 file proxy:bridgeSecret 就位 → 注入 OC_CONTAINER_ID + OC_BRIDGE_NONCE。
     // 容器内 gateway 靠这两个 env 做 bridge bypass 校验 + /healthz capability 广播。
@@ -1902,132 +1702,12 @@ export async function provisionV3Container(
     const binds: string[] = [
       `${volumeNames.data}:${V3_VOLUME_MOUNT}:rw`,
       `${volumeNames.projects}:${V3_PROJECTS_MOUNT}:rw`,
-      // D2 持久化(2026-05-09):codex / ~/.local / ~/.config 全 per-user 持久化,
-      // 让 codex mcp add / pip --user / npm 用户级 install / XDG configs 跨重启保留。
-      // 详见三个 V3_*_MOUNT 常量上的 docstring。
-      `${volumeNames.codex}:${V3_CODEX_HOME_MOUNT}:rw`,
+      // D2 持久化:~/.local / ~/.config per-user 持久化,让 pip --user / npm
+      // 用户级 install / XDG configs 跨重启保留。详见两个 V3_*_MOUNT 常量 docstring。
+      // (v5 ccb-only:codex HOME 卷 + codex auth ro bind 已移除。)
       `${volumeNames.userLocal}:${V3_USER_LOCAL_MOUNT}:rw`,
       `${volumeNames.userConfig}:${V3_USER_CONFIG_MOUNT}:rw`,
     ];
-
-    // Codex auth ro bind-mount(plan v3 §F1/F2/D1)。仅本地 provision 路径挂 ——
-    // 远端 host 上无对应目录,跨机同步 auth.json 是后续 task(GPT 模型在远端
-    // 容器报未授权,与未 OAuth 路径合并到同一种 fail mode,前端 modelPicker
-    // 不会给远端用户出 GPT 选项 / 后端 canUseModel 在执行路径再兜底一次)。
-    //
-    // 两种 mount 模式(K/L):
-    //   - codex_account_id NOT NULL → mount per-container `<codexContainerDir>/<row.id>/`
-    //   - codex_account_id NULL(legacy / 池空 / 任一步失败回滚)→ mount 共享
-    //     `<codexContainerDir>/`(对应 master gateway 的 syncCodexAuthFile 路径)
-    //
-    // **mount 不可变 invariant**:启动时定型,运行时永不切换。lazy migrate 只换
-    // account_id 不换 mount;NULL 容器永远锁死在 legacy(决策 K/L/N3)。
-    //
-    // 始终挂载:目录由本模块在 provision 前 mkdir(idempotent),即使 host 还没
-    // 跑过 codexAuthSync,容器看到的是空目录,codex 启动报无 auth(预期)。
-    // host 写入后无需重启容器,mount 是目录而非单文件,新 entry 立即可见。
-    // Codex per-container auth bind(plan v3 §F1/F2/D1 + v1.0.72 跨 host 同步)。
-    // 本地与远端 host 共享同一 picker + UPDATE,只在"写文件"和"bind source 路径"
-    // 上分流:
-    //   - 本地:writeCodexContainerAuthFile + bind <env-resolvable codexContainerDir>/<row.id>
-    //   - 远端:deps.putRemoteCodexAuth + bind <DEFAULT_V3_CODEX_CONTAINER_DIR>/<row.id>
-    //          (远端路径硬编码,不读 master env;远端 node-agent AllowedRoots 锁同值)
-    //
-    // 任一步失败 → fallback:
-    //   - 本地:legacy shared dir mount(NULL bind),codex CLI 启动报"未授权"
-    //          但容器仍可正常跑非 GPT 流量
-    //   - 远端:不挂 codex mount(MVP D 决策)。远端没有 shared dir 模型 ——
-    //          NULL bind 不存在等价物。codex CLI 启动报"未授权"行为一致。
-    //
-    // **mount 不可变 invariant**(决策 K/L/N3):启动时定型,运行时永不切换。
-    // lazy migrate 只换 account_id 不换 mount;NULL 容器永远锁死在 legacy mount
-    // (本地)或 no-mount(远端)。
-    let codexMountSource: string | null = null;
-    {
-      // 远端 host 必须用 DEFAULT 常量(node-agent AllowedRoots 锁住),本地走 env 可覆盖
-      const codexContainerDir = useRemote
-        ? DEFAULT_V3_CODEX_CONTAINER_DIR
-        : readCodexContainerDirFromEnv();
-      let boundCodexAccountId: bigint | null = null;
-      try {
-        const picked = await pickCodexAccountForBinding(String(row.id), {});
-        if (picked) {
-          let snap: Awaited<ReturnType<typeof getCodexTokenSnapshot>> = null;
-          try {
-            snap = await getCodexTokenSnapshot(picked.account_id);
-            if (snap && snap.token) {
-              const accessToken = snap.token.toString("utf8");
-              const lastRefreshIso = new Date().toISOString();
-              if (useRemote) {
-                if (!deps.putRemoteCodexAuth) {
-                  throw new Error(
-                    "useRemote=true but deps.putRemoteCodexAuth not wired",
-                  );
-                }
-                // hostId! 安全:useRemote=true 蕴含 typeof hostId === "string"(见 useRemote 定义)
-                await deps.putRemoteCodexAuth(
-                  hostId!,
-                  String(row.id),
-                  accessToken,
-                  lastRefreshIso,
-                );
-              } else {
-                await writeCodexContainerAuthFile({
-                  rootDir: codexContainerDir,
-                  containerId: String(row.id),
-                  containerUid: V3_AGENT_UID,
-                  containerGid: V3_AGENT_GID,
-                  auth: { accessToken, lastRefreshIso },
-                });
-              }
-              // UPDATE 在同一事务内,COMMIT 时一并落盘;若后续步骤失败 rollback
-              // 自动回滚到 NULL,但 host 文件(本地或远端)留在 per-container 子目录
-              // 是孤儿 —— 由 stopAndRemoveV3Container / volume gc / 重 provision
-              // 的同名 row.id 覆盖兜底(本 PR 接受这层不一致)。
-              await client.query(
-                `UPDATE agent_containers SET codex_account_id = $1, updated_at = NOW() WHERE id = $2`,
-                [String(picked.account_id), String(row.id)],
-              );
-              boundCodexAccountId = picked.account_id;
-            }
-          } finally {
-            if (snap?.token) zeroBuffer(snap.token);
-            if (snap?.refresh) zeroBuffer(snap.refresh);
-          }
-        }
-      } catch (codexErr) {
-        // codex 路径任意失败 → 回退;不打断 provision。
-        // eslint-disable-next-line no-console
-        console.error(
-          `[v3supervisor] WARN: codex account binding failed (useRemote=${useRemote}); falling back: ${(codexErr as Error).message}`,
-        );
-      }
-
-      if (boundCodexAccountId !== null) {
-        // per-container subdir 由 writeCodexContainerAuthFile / putRemoteCodexAuth 创建
-        codexMountSource = pathJoin(codexContainerDir, String(row.id));
-      } else if (!useRemote) {
-        // 本地 fallback:legacy shared dir mount
-        try {
-          // mode 0755:owner=root rwx,其他用户(含容器内 agent uid)只能 r-x。
-          // 防容器内进程往 host 这个目录写,但允许进入查 auth.json。
-          await fsMkdir(codexContainerDir, { recursive: true, mode: 0o755 });
-        } catch (mkErr) {
-          // mkdir 失败不致命:bind-mount 时 docker 自身会报错,SupervisorError
-          // 走标准 wrapDockerError 路径。这里只做日志,不打断 provision。
-          // eslint-disable-next-line no-console
-          console.error(
-            `[v3supervisor] WARN: ensure codex container dir failed: ${(mkErr as Error).message}`,
-          );
-        }
-        codexMountSource = codexContainerDir;
-      }
-      // useRemote && fallback → codexMountSource = null → 跳过下方 binds.push,
-      // 不挂 codex mount(远端没有 shared dir 模型)
-      if (codexMountSource !== null) {
-        binds.push(`${codexMountSource}:${V3_CODEX_AUTH_RO_MOUNT}:ro`);
-      }
-    }
 
     if (sshUserRunDir) {
       // ro 防容器内 agent 篡改 ctl.sock / known_hosts。容器对 unix socket
@@ -2497,26 +2177,7 @@ export async function stopAndRemoveV3Container(
       failures.push({ stage: "remove", err: wrapDockerError(err) });
     }
   }
-  // F3:per-container codex auth 文件 best-effort 清理(绝不阻塞清理流程)。
-  //   - 本地容器:rm <codexContainerDir>/<cid>/auth.json + rmdir 空 parent
-  //   - 远端容器(v1.0.72):RPC DELETE /files?path=<远端 default 路径>;
-  //     deps.deleteRemoteCodexAuth 未注入 → skip;失败 → 吞错。
-  //     远端不 rmdir parent(node-agent 无该 endpoint),留空 <cid>/ 目录,
-  //     与 deleteRemoteCodexContainerAuth 注释一致。
-  if (!useRemote) {
-    try {
-      const codexContainerDir = readCodexContainerDirFromEnv();
-      await removeCodexContainerAuthDir(codexContainerDir, String(containerRow.id));
-    } catch {
-      /* swallow */
-    }
-  } else if (deps.deleteRemoteCodexAuth) {
-    try {
-      await deps.deleteRemoteCodexAuth(effectiveHostUuid!, String(containerRow.id));
-    } catch {
-      /* swallow */
-    }
-  }
+  // (v5 ccb-only:per-container codex auth 文件清理已随 codex 注入一并移除。)
   // 容器确认已清理 + 之前只有 stop 失败(没有 remove 失败) → 视作完整成功
   if (containerCleared && failures.every((f) => f.stage === "stop")) return true;
   if (failures.length > 0) throw aggregatePartialV3Cleanup(failures);

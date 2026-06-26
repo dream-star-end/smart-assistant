@@ -37,8 +37,6 @@ const buildTeamRunPrompt = new Function(
 
 const getModelOverrideForSend = new Function(
   [
-    extractFunction(modelPolicySrc, 'isGptModel'),
-    extractFunction(modelPolicySrc, 'isCodexNativeAgent'),
     extractFunction(modelPolicySrc, 'findAgent'),
     extractFunction(modelPolicySrc, 'getSingleAgentModelOverride'),
     extractFunction(mainSrc, 'getModelOverrideForSend'),
@@ -116,53 +114,34 @@ describe('agent team prompt builder', () => {
   })
 
   it('suppresses user default model override during team runs so leader routing is preserved', () => {
+    // 团队消息永远不带 frame.model override(leader 配置决定模型)。
     assert.equal(
       getModelOverrideForSend(
         { id: 'dev_team', leaderAgentId: 'main' },
-        { default_model: 'gpt-5.5' },
+        { default_model: 'MiniMax-M3' },
         [{ id: 'main', provider: 'minimax', model: 'MiniMax-M3' }],
       ),
       undefined,
     )
-    assert.equal(getModelOverrideForSend(null, { default_model: 'gpt-5.5' }), 'gpt-5.5')
+    // 单 agent 消息透传用户 default_model(v5 ccb-only:不再对 gpt-* 特判)。
+    assert.equal(getModelOverrideForSend(null, { default_model: 'MiniMax-M3' }), 'MiniMax-M3')
     assert.equal(getModelOverrideForSend(null, { default_model: '' }), undefined)
-    assert.equal(
-      getModelOverrideForSend(
-        { id: 'codex_team', leaderAgentId: 'codex' },
-        { default_model: 'MiniMax-M3' },
-        [{ id: 'codex', provider: 'codex-native', model: 'gpt-5.5' }],
-      ),
-      'gpt-5.5',
-    )
   })
 
-  it('suppresses stale GPT default model for explicit non-codex specialist agents', () => {
+  it('single-agent send forwards the user default model as-is (v5 ccb-only)', () => {
     const agents = [
       { id: 'main', provider: 'minimax', model: 'MiniMax-M3' },
       { id: 'scientist', provider: 'minimax', model: 'MiniMax-M3' },
-      { id: 'codex', provider: 'codex-native', model: 'gpt-5.5' },
     ]
-    assert.equal(
-      getModelOverrideForSend(null, { default_model: 'gpt-5.5' }, agents, {
-        agentId: 'scientist',
-        defaultAgentId: 'main',
-      }),
-      undefined,
-    )
-    assert.equal(
-      getModelOverrideForSend(null, { default_model: 'gpt-5.5' }, agents, {
-        agentId: 'main',
-        defaultAgentId: 'main',
-      }),
-      'gpt-5.5',
-    )
-    assert.equal(
-      getModelOverrideForSend(null, { default_model: 'gpt-5.5' }, agents, {
-        agentId: 'codex',
-        defaultAgentId: 'main',
-      }),
-      'gpt-5.5',
-    )
+    for (const agentId of ['scientist', 'main']) {
+      assert.equal(
+        getModelOverrideForSend(null, { default_model: 'glm-5.2' }, agents, {
+          agentId,
+          defaultAgentId: 'main',
+        }),
+        'glm-5.2',
+      )
+    }
   })
 
   it('adds a configured review agent to the allowed delegation list when it is not a member', () => {

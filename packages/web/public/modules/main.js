@@ -1313,19 +1313,11 @@ export function getModelOverrideForSend(
   options = {},
 ) {
   // Team mode is agent-owned routing: the selected team's leaderAgentId must
-  // decide the runner/model. If we also send the user's global default_model
-  // (e.g. gpt-5.5), gateway model inference can reroute the turn to `codex`
-  // and bypass the leader entirely. Non-team sends keep the normal model
-  // picker behavior unchanged. Exception: a codex-native leader must still
-  // carry an explicit GPT model because gateway rejects codex-native turns
-  // without a model authz signal. Single-agent sends share modelPolicy.js:
-  // explicit non-codex specialists ignore stale gpt-* global defaults so the
-  // backend does not reject `scientist + gpt-5.5` as a mismatch.
+  // decide the runner/model. If we also send the user's global default_model,
+  // gateway model inference could reroute the turn and bypass the leader.
+  // So team sends never carry a frame.model override (leader config decides).
+  // (v5 ccb-only: the prior codex-native leader gpt-* carve-out is gone.)
   if (teamForSend) {
-    const leader = (agentsList || state.agentsList || []).find((a) => a.id === teamForSend.leaderAgentId)
-    if (leader?.provider === 'codex-native' || leader?.id === 'codex') {
-      return leader?.model || 'gpt-5.5'
-    }
     return undefined
   }
   const list = agentsList || (typeof state !== 'undefined' ? state.agentsList : [])

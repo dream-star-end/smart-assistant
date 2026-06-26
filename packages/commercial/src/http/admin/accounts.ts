@@ -485,10 +485,6 @@ export async function handleAdminPatchAccount(
       adminId: admin.id,
       ip: ctx.clientIp,
       userAgent: ctx.userAgent,
-      // v1.0.120 feat/codex-disable-rebind:codex provider 从 active 转为
-      // disabled 时,主动 fanout rebind 仍绑该账号的活跃容器。adminPatchAccount
-      // 内部按 (provider==='codex' && before.active && patch.disabled) 严格筛。
-      triggerCodexDisableFanout: deps.triggerCodexDisableFanout,
     });
     const poolLabels = await fetchEgressProxyLabels([a]);
     sendJson(res, 200, { account: serializeAccount(a, poolLabels) });

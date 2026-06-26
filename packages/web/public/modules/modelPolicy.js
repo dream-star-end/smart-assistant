@@ -1,13 +1,5 @@
 // OpenClaude — frontend model/agent compatibility policy
 
-export function isGptModel(modelId) {
-  return /^gpt-/i.test(modelId || '')
-}
-
-export function isCodexNativeAgent(agent) {
-  return agent?.provider === 'codex-native' || agent?.id === 'codex'
-}
-
 function findAgent(agentsList, agentId) {
   if (!agentId) return null
   return (agentsList || []).find((a) => a?.id === agentId) || null
@@ -17,40 +9,18 @@ function findAgent(agentsList, agentId) {
  * Decide whether the user's global default_model should be sent as an explicit
  * frame.model for the current single-agent turn.
  *
- * Backend routing intentionally rejects explicit non-codex agent + gpt-*:
- * silently rerouting `scientist + gpt-5.5` to Codex would drop the scientist
- * persona/skills. When a user selects an explicit non-codex specialist, ignore
- * a stale GPT global preference and let the agent run with its configured model.
+ * v5 ccb-only: gpt-* models are no longer offered (codex backend removed), so
+ * the prior "explicit non-codex agent + stale gpt pref → drop" special-case is
+ * gone. The user's default model (if any) is sent as-is.
  */
-export function getSingleAgentModelOverride({
-  userPrefs,
-  agentId,
-  defaultAgentId,
-  agentsList,
-} = {}) {
+export function getSingleAgentModelOverride({ userPrefs } = {}) {
   const prefModel = userPrefs?.default_model
   if (typeof prefModel !== 'string' || !prefModel) return undefined
-
-  const agent = findAgent(agentsList, agentId)
-  const isExplicitAgent = Boolean(agentId && defaultAgentId && agentId !== defaultAgentId)
-  if (isExplicitAgent && agent && !isCodexNativeAgent(agent) && isGptModel(prefModel)) {
-    return undefined
-  }
   return prefModel
 }
 
-export function getEffectiveSingleAgentModel({
-  userPrefs,
-  agentId,
-  defaultAgentId,
-  agentsList,
-} = {}) {
-  const override = getSingleAgentModelOverride({
-    userPrefs,
-    agentId,
-    defaultAgentId,
-    agentsList,
-  })
+export function getEffectiveSingleAgentModel({ userPrefs, agentId, agentsList } = {}) {
+  const override = getSingleAgentModelOverride({ userPrefs })
   if (override) return override
   return findAgent(agentsList, agentId)?.model || ''
 }

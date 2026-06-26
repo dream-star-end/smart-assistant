@@ -161,29 +161,6 @@ test('handleWechatInbound validates and forwards master-owned requestId', () => 
   )
 })
 
-test('handleWechatInbound accepts only api-relay codex route overrides for WeChat', () => {
-  assert.match(
-    handleWechatInbound,
-    /body\.__oc_codex_route/,
-    'WeChat inbound handler 必须读取 master-owned __oc_codex_route',
-  )
-  assert.match(
-    handleWechatInbound,
-    /\.kind\s*===\s*['"]official_oauth['"]/,
-    'WeChat 暂不支持 official_oauth route marker,必须在 handler 边界拒绝',
-  )
-  assert.match(
-    handleWechatInbound,
-    /_buildSafeCodexRouteOverride\(\{[\s\S]+agentProvider:\s*['"]codex-native['"][\s\S]+rawRoute:\s*rawCodexRoute[\s\S]+\}\)/,
-    'api-relay route 仍需复用 shared sanitizer 校验 baseUrl/modelProvider 等字段',
-  )
-  assert.match(
-    handleWechatInbound,
-    /\.\.\.\(rawCodexRoute !== undefined \? \{ __oc_codex_route: rawCodexRoute \} : \{\}\)/,
-    '通过校验的 raw route 必须透传到 frame,由 dispatchInbound 再按真实 agent/model 应用',
-  )
-})
-
 // ── 副断言:peer.displayName carrier 完整性(slice 7c senderId 通过 peer.displayName 携带)──
 test('handleWechatInbound preserves peer.displayName on the outbound frame', () => {
   // peerOut 构造分支必须把 peerDisplayName(来自 body.peer.displayName)

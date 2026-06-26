@@ -120,7 +120,6 @@ describe('unified assistant picker wiring', () => {
 
   it('single-agent model policy is shared by send, regen, picker label, and effort controls', () => {
     assert.match(MODEL_POLICY, /getSingleAgentModelOverride/)
-    assert.match(MODEL_POLICY, /isGptModel/)
     assert.match(MAIN, /getSingleAgentModelOverride/)
     assert.match(MESSAGES, /getSingleAgentModelOverride/)
     assert.match(MODEL, /getEffectiveSingleAgentModel/)

@@ -190,31 +190,9 @@ describe('buildPromptContext literature slot ordering', () => {
     assert.match(result.content, /POST \/v3\/literature\/search/)
   })
 
-  it('codex-native provider 跳过 SKILLS_LITERATURE 注入(env scrub 拿不到 bearer)', async () => {
-    // 锁住 backend asymmetry:codex 子进程的 spawn env 被 buildCodexEnv() scrub
-    // 掉所有 OPENCLAUDE_*/ANTHROPIC_*/CLAUDE_CODE_* 前缀 env,看不到容器身份
-    // bearer (OPENCLAUDE_V3_CONTAINER_TOKEN)。注入 literature slot 会误导 codex
-    // 调一个必然 401 的端点,浪费 turn。详见 promptSlots.ts:768 段落注释。
-    setLiteratureSkillProvider(async () => ({
-      name: 'SKILLS_LITERATURE',
-      content: '# 平台技能: 文献检索',
-    }))
-    const result = await buildPromptContext({
-      agentId: 'nonexistent-agent-for-test',
-      provider: 'codex-native',
-    })
-    const names = result.applied.map((s) => s.name)
-    assert.equal(
-      names.includes('SKILLS_LITERATURE'),
-      false,
-      'codex-native must NOT receive SKILLS_LITERATURE slot',
-    )
-    assert.equal(result.content.includes('文献检索'), false)
-  })
-
   it('CCB providers (claude-subscription / minimax) 仍然注入 SKILLS_LITERATURE', async () => {
-    // 反向 spot check:确保 codex 跳过逻辑不误伤 CCB 路径。任何不是 'codex-native'
-    // 的 provider 都应继续渲染该 slot —— CCB 子进程不 scrub env,能拿到 bearer。
+    // v5 ccb-only:codex-native backend asymmetry 跳过逻辑已删,所有 ccb provider
+    // 都注入该 slot(CCB 子进程不 scrub env,能拿到容器身份 bearer)。
     setLiteratureSkillProvider(async () => ({
       name: 'SKILLS_LITERATURE',
       content: '# 平台技能: 文献检索',

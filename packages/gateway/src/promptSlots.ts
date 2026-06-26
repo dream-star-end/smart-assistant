@@ -204,20 +204,6 @@ export async function buildAgentsSlot(ctx: PromptSlotContext): Promise<PromptSlo
         '传 `image_file="绝对路径"`(从上传提示里取该图的本地路径),再基于工具返回的图片描述回答。',
     )
   }
-  if (
-    hasUnderstandImageTool &&
-    (provider === 'codex-native' ||
-      provider === 'codex' ||
-      ctx.model?.startsWith('gpt-') ||
-      ctx.model?.startsWith('codex-'))
-  ) {
-    lines.push('')
-    lines.push('## GPT/Codex 图片理解提示')
-    lines.push('')
-    lines.push(
-      '用户消息中出现本地图片路径时,先调用 `understand_image` MCP 工具,传 `image_file="绝对路径"`,再基于工具返回的图片内容回答。不要声称用户没有上传图片。',
-    )
-  }
 
   return { name: 'AGENTS', content: lines.join('\n') }
 }
@@ -851,15 +837,13 @@ export async function buildPromptContext(ctx: PromptSlotContext): Promise<Prompt
   //   - 这条 scrub 设计本身合理(防 codex 横向移动 OpenClaude 凭证),不应为
   //     literature 单个功能开洞。如未来要让 codex 也用 literature,需独立设计
   //     "codex 可用且与 OpenClaude 凭证隔离"的鉴权通道,与本 skip 正交。
-  if (ctx.provider !== 'codex-native') {
-    if (remotePlatformSlots === null) {
-      const literature = await buildLiteratureSkillSlot()
-      if (literature) slots.push(literature)
-    } else {
-      const literature = remotePlatformSlots.find((s) => s.name === 'SKILLS_LITERATURE')
-      if (literature) {
-        slots.push({ name: 'SKILLS_LITERATURE', content: literature.content })
-      }
+  if (remotePlatformSlots === null) {
+    const literature = await buildLiteratureSkillSlot()
+    if (literature) slots.push(literature)
+  } else {
+    const literature = remotePlatformSlots.find((s) => s.name === 'SKILLS_LITERATURE')
+    if (literature) {
+      slots.push({ name: 'SKILLS_LITERATURE', content: literature.content })
     }
   }
 

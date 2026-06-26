@@ -1,7 +1,7 @@
 import * as assert from 'node:assert/strict'
 /**
  * Tests for inferAgentForModel — pure routing decision for model→agent
- * fan-out in v3 commercial.
+ * fan-out in v5 commercial (ccb-only: gpt-* rejected fail-closed).
  *
  * Run: npx tsx --test packages/gateway/src/__tests__/inferAgentForModel.test.ts
  */
@@ -9,26 +9,9 @@ import { describe, it } from 'node:test'
 import type { AgentDef } from '@openclaude/storage'
 import { inferAgentForModel } from '../inferAgentForModel.js'
 
-const claudeAgent: AgentDef = { id: 'main', model: 'claude-opus-4-7' }
-const codexAgent: AgentDef = {
-  id: 'codex',
-  model: 'gpt-5.5',
-  provider: 'codex-native',
-  runnerKind: 'app-server',
-}
-const altCodexAgent: AgentDef = {
-  id: 'gpt-alt',
-  model: 'gpt-5.5',
-  provider: 'codex-native',
-}
-
-const fullAgents: AgentDef[] = [claudeAgent, codexAgent]
-const onlyClaudeAgents: AgentDef[] = [claudeAgent]
-const onlyCodexAgents: AgentDef[] = [codexAgent, altCodexAgent]
-const codexWrongProvider: AgentDef[] = [
-  claudeAgent,
-  { id: 'codex', model: 'gpt-5.5', provider: 'something-else' as unknown as 'codex-native' },
-]
+const mainAgent: AgentDef = { id: 'main', model: 'claude-opus-4-7' }
+const coderAgent: AgentDef = { id: 'coder', model: 'claude-opus-4-7' }
+const fullAgents: AgentDef[] = [mainAgent, coderAgent]
 
 describe('inferAgentForModel — pass-through cases', () => {
   it('returns requestedAgentId when model is undefined', () => {
@@ -52,89 +35,29 @@ describe('inferAgentForModel — pass-through cases', () => {
   })
 })
 
-describe('inferAgentForModel — gpt model routing', () => {
-  it('routes default agent + gpt-* to id="codex"', () => {
+describe('inferAgentForModel — gpt model rejection (v5 ccb-only)', () => {
+  it('rejects any gpt-* model with gpt_unsupported error', () => {
     const r = inferAgentForModel({
       model: 'gpt-5.5',
       requestedAgentId: 'main',
       defaultAgentId: 'main',
       agents: fullAgents,
     })
-    assert.deepEqual(r, { agentId: 'codex' })
+    assert.equal('error' in r, true)
+    if (!('error' in r)) return
+    assert.equal(r.error, 'gpt_unsupported')
   })
 
-  it('keeps id="codex" when user explicitly requests codex agent + gpt-*', () => {
+  it('rejects gpt-* regardless of requested agent', () => {
     const r = inferAgentForModel({
-      model: 'gpt-5.5',
-      requestedAgentId: 'codex',
+      model: 'gpt-5-codex',
+      requestedAgentId: 'coder',
       defaultAgentId: 'main',
-      agents: fullAgents,
-    })
-    assert.deepEqual(r, { agentId: 'codex' })
-  })
-
-  it('mismatch when user explicitly picks claude agent + gpt-* model', () => {
-    const r = inferAgentForModel({
-      model: 'gpt-5.5',
-      requestedAgentId: 'main',
-      defaultAgentId: 'codex',
       agents: fullAgents,
     })
     assert.equal('error' in r, true)
     if (!('error' in r)) return
-    assert.equal(r.error, 'mismatch')
-  })
-
-  it('no_codex_agent when agents list lacks an id="codex"', () => {
-    const r = inferAgentForModel({
-      model: 'gpt-5.5',
-      requestedAgentId: 'main',
-      defaultAgentId: 'main',
-      agents: onlyClaudeAgents,
-    })
-    assert.equal('error' in r, true)
-    if (!('error' in r)) return
-    assert.equal(r.error, 'no_codex_agent')
-    assert.match(r.reason, /no agent with id='codex'/)
-  })
-
-  it('no_codex_agent when id="codex" exists but provider is not codex-native', () => {
-    const r = inferAgentForModel({
-      model: 'gpt-5.5',
-      requestedAgentId: 'main',
-      defaultAgentId: 'main',
-      agents: codexWrongProvider,
-    })
-    assert.equal('error' in r, true)
-    if (!('error' in r)) return
-    assert.equal(r.error, 'no_codex_agent')
-  })
-
-  it('does NOT use a non-id="codex" codex-native agent (fixed id only)', () => {
-    // Plan v3 explicitly: "必须用确定 id `codex`, 不是第一个 provider=codex-native"
-    const agents = [claudeAgent, altCodexAgent] // has provider=codex-native but id != 'codex'
-    const r = inferAgentForModel({
-      model: 'gpt-5.5',
-      requestedAgentId: 'main',
-      defaultAgentId: 'main',
-      agents,
-    })
-    assert.equal('error' in r, true)
-    if (!('error' in r)) return
-    assert.equal(r.error, 'no_codex_agent')
-  })
-
-  it('unknown explicit agentId + gpt-* falls through to id="codex" route', () => {
-    // Unknown agent isn't 'mismatch' (we can't know its family); downstream
-    // sessionManager.submit will reject if the id is genuinely invalid.
-    // But routing-wise we still send the request to codex when model is gpt.
-    const r = inferAgentForModel({
-      model: 'gpt-5.5',
-      requestedAgentId: 'no-such-agent',
-      defaultAgentId: 'main',
-      agents: fullAgents,
-    })
-    assert.deepEqual(r, { agentId: 'codex' })
+    assert.equal(r.error, 'gpt_unsupported')
   })
 })
 
@@ -149,59 +72,32 @@ describe('inferAgentForModel — claude model routing', () => {
     assert.deepEqual(r, { agentId: 'main' })
   })
 
-  it('keeps requestedAgentId for explicit non-codex + claude-* model', () => {
-    const otherClaude: AgentDef = { id: 'chatgpt', model: 'claude-sonnet-4-6' }
-    const r = inferAgentForModel({
-      model: 'claude-sonnet-4-6',
-      requestedAgentId: 'chatgpt',
-      defaultAgentId: 'main',
-      agents: [...fullAgents, otherClaude],
-    })
-    assert.deepEqual(r, { agentId: 'chatgpt' })
-  })
-
-  it('routes explicit codex agent + claude-* back to default non-codex agent', () => {
+  it('preserves router-rule-resolved non-default claude agent (Fix 6 contract)', () => {
     const r = inferAgentForModel({
       model: 'claude-opus-4-7',
-      requestedAgentId: 'codex',
+      requestedAgentId: 'coder',
       defaultAgentId: 'main',
       agents: fullAgents,
-    })
-    assert.deepEqual(r, { agentId: 'main' })
-  })
-
-  it('preserves router-rule-resolved non-default claude agent (Fix 6 contract)', () => {
-    // The dispatchInbound call site MUST pass the already-resolved `agent.id`
-    // as requestedAgentId (NOT `frame.agentId ?? cfg.default`). When router rules
-    // pick e.g. "coder" for some claude-* models with no explicit frame.agentId,
-    // we must keep "coder" — not regress back to cfg.default. This test pins the
-    // contract: given the resolved id, inferAgentForModel returns it untouched.
-    const coderAgent: AgentDef = { id: 'coder', model: 'claude-opus-4-7' }
-    const r = inferAgentForModel({
-      model: 'claude-opus-4-7',
-      requestedAgentId: 'coder', // ← what dispatchInbound now passes (agent.id post-router)
-      defaultAgentId: 'main',
-      agents: [...fullAgents, coderAgent],
     })
     assert.deepEqual(r, { agentId: 'coder' })
   })
 
-  it('uses the first non-codex agent for claude-* when default is codex', () => {
+  it('falls back to default agent for unknown requested agent + claude-*', () => {
     const r = inferAgentForModel({
       model: 'claude-opus-4-7',
-      requestedAgentId: 'codex',
-      defaultAgentId: 'codex',
+      requestedAgentId: 'no-such-agent',
+      defaultAgentId: 'main',
       agents: fullAgents,
     })
     assert.deepEqual(r, { agentId: 'main' })
   })
 
-  it('no_compatible_agent when claude-* has no non-codex agent to route to', () => {
+  it('no_compatible_agent when claude-* has no agent configured', () => {
     const r = inferAgentForModel({
       model: 'claude-opus-4-7',
-      requestedAgentId: 'codex',
-      defaultAgentId: 'codex',
-      agents: onlyCodexAgents,
+      requestedAgentId: 'main',
+      defaultAgentId: 'main',
+      agents: [],
     })
     assert.equal('error' in r, true)
     if (!('error' in r)) return
@@ -210,7 +106,7 @@ describe('inferAgentForModel — claude model routing', () => {
 })
 
 describe('inferAgentForModel — deepseek model routing', () => {
-  it('keeps default non-codex agent for deepseek-*', () => {
+  it('keeps default agent for deepseek-*', () => {
     const r = inferAgentForModel({
       model: 'deepseek-v4-pro',
       requestedAgentId: 'main',
@@ -220,28 +116,17 @@ describe('inferAgentForModel — deepseek model routing', () => {
     assert.deepEqual(r, { agentId: 'main' })
   })
 
-  it('keeps explicit non-codex agent for deepseek-*', () => {
-    const otherClaude: AgentDef = { id: 'chatgpt', model: 'claude-sonnet-4-6' }
+  it('keeps explicit agent for deepseek-*', () => {
     const r = inferAgentForModel({
       model: 'deepseek-v4-pro',
-      requestedAgentId: 'chatgpt',
-      defaultAgentId: 'main',
-      agents: [...fullAgents, otherClaude],
-    })
-    assert.deepEqual(r, { agentId: 'chatgpt' })
-  })
-
-  it('routes explicit codex agent + deepseek-* back to default non-codex agent', () => {
-    const r = inferAgentForModel({
-      model: 'deepseek-v4-pro',
-      requestedAgentId: 'codex',
+      requestedAgentId: 'coder',
       defaultAgentId: 'main',
       agents: fullAgents,
     })
-    assert.deepEqual(r, { agentId: 'main' })
+    assert.deepEqual(r, { agentId: 'coder' })
   })
 
-  it('routes unknown requested agent + deepseek-* to default non-codex agent', () => {
+  it('routes unknown requested agent + deepseek-* to default agent', () => {
     const r = inferAgentForModel({
       model: 'deepseek-v4-flash',
       requestedAgentId: 'no-such-agent',
@@ -250,33 +135,10 @@ describe('inferAgentForModel — deepseek model routing', () => {
     })
     assert.deepEqual(r, { agentId: 'main' })
   })
-
-  it('uses the first non-codex agent when default is codex', () => {
-    const otherClaude: AgentDef = { id: 'chatgpt', model: 'claude-sonnet-4-6' }
-    const r = inferAgentForModel({
-      model: 'deepseek-v4-pro',
-      requestedAgentId: 'codex',
-      defaultAgentId: 'codex',
-      agents: [codexAgent, otherClaude],
-    })
-    assert.deepEqual(r, { agentId: 'chatgpt' })
-  })
-
-  it('no_compatible_agent when deepseek-* has no non-codex agent to route to', () => {
-    const r = inferAgentForModel({
-      model: 'deepseek-v4-pro',
-      requestedAgentId: 'codex',
-      defaultAgentId: 'codex',
-      agents: onlyCodexAgents,
-    })
-    assert.equal('error' in r, true)
-    if (!('error' in r)) return
-    assert.equal(r.error, 'no_compatible_agent')
-  })
 })
 
 describe('inferAgentForModel — MiniMax model routing', () => {
-  it('keeps default non-codex agent for MiniMax-M3', () => {
+  it('keeps default agent for MiniMax-M3', () => {
     const r = inferAgentForModel({
       model: 'MiniMax-M3',
       requestedAgentId: 'main',
@@ -285,32 +147,10 @@ describe('inferAgentForModel — MiniMax model routing', () => {
     })
     assert.deepEqual(r, { agentId: 'main' })
   })
-
-  it('routes codex agent + MiniMax-M3 back to default non-codex agent', () => {
-    const r = inferAgentForModel({
-      model: 'MiniMax-M3',
-      requestedAgentId: 'codex',
-      defaultAgentId: 'main',
-      agents: fullAgents,
-    })
-    assert.deepEqual(r, { agentId: 'main' })
-  })
-
-  it('no_compatible_agent when MiniMax-M3 has no non-codex agent', () => {
-    const r = inferAgentForModel({
-      model: 'MiniMax-M3',
-      requestedAgentId: 'codex',
-      defaultAgentId: 'codex',
-      agents: onlyCodexAgents,
-    })
-    assert.equal('error' in r, true)
-    if (!('error' in r)) return
-    assert.equal(r.error, 'no_compatible_agent')
-  })
 })
 
 describe('inferAgentForModel — Ark glm-5.1/glm-5.2 model routing', () => {
-  it('keeps default non-codex agent for glm-5.1(兼容存量)', () => {
+  it('keeps default agent for glm-5.1(兼容存量)', () => {
     const r = inferAgentForModel({
       model: 'glm-5.1',
       requestedAgentId: 'main',
@@ -320,20 +160,10 @@ describe('inferAgentForModel — Ark glm-5.1/glm-5.2 model routing', () => {
     assert.deepEqual(r, { agentId: 'main' })
   })
 
-  it('keeps default non-codex agent for glm-5.2(2026-06-17 起平台默认)', () => {
+  it('keeps default agent for glm-5.2(平台默认)', () => {
     const r = inferAgentForModel({
       model: 'glm-5.2',
       requestedAgentId: 'main',
-      defaultAgentId: 'main',
-      agents: fullAgents,
-    })
-    assert.deepEqual(r, { agentId: 'main' })
-  })
-
-  it('routes codex agent + glm-5.2 back to default non-codex agent', () => {
-    const r = inferAgentForModel({
-      model: 'glm-5.2',
-      requestedAgentId: 'codex',
       defaultAgentId: 'main',
       agents: fullAgents,
     })

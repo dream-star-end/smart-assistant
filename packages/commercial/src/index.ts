@@ -53,25 +53,8 @@ import { createHttpHupijiaoClient, type HupijiaoClient, type HupijiaoConfig } fr
 import {
   AccountScheduler,
   ContainerStaleBindingError,
-  pickCodexAccountForBindingInTx,
 } from "./account-pool/scheduler.js";
-import {
-  type WriteAuthDeps,
-  commitCodexRebindInTx,
-  fetchSnapshotAndWriteContainerAuth,
-} from "./account-pool/codexLazyMigrate.js";
-import {
-  type CodexDisableFanoutDeps,
-  type CodexDriftReconcilerHandle,
-  enqueueCodexDisableFanout,
-  startCodexDisableDriftReconciler,
-} from "./account-pool/codexDisableFanout.js";
 import { AccountHealthTracker, wrapIoredisForHealth } from "./account-pool/health.js";
-import { writeCodexContainerAuthFile } from "./codex-auth/codexAuthFile.js";
-import {
-  putRemoteCodexContainerAuth,
-  deleteRemoteCodexContainerAuth,
-} from "./codex-auth/remoteCodexAuth.js";
 import { tx } from "./db/queries.js";
 import { createAgentWsHandler, type AgentWsHandler } from "./ws/agent.js";
 import {
@@ -87,15 +70,10 @@ import {
   type SweeperHandle as RefreshEventsSweeperHandle,
 } from "./account-pool/refreshEventsSweeper.js";
 import {
-  startCodexRefreshActor,
-  type CodexRefreshActorHandle,
-} from "./account-pool/codexAccountActor.js";
-import {
   startCooldownRecoveryActor,
   type CooldownRecoveryActorHandle,
 } from "./account-pool/cooldownRecoveryActor.js";
 import {
-  DEFAULT_V3_CODEX_CONTAINER_DIR,
   V3_CONTAINER_PORT,
   stopAndRemoveV3Container,
   ocGatewayIpForChannel,
@@ -139,22 +117,8 @@ import {
   type ServerAuthoredHandler,
 } from "./http/internalServerAuthored.js";
 import {
-  CODEX_TOKEN_REFRESH_PATH,
-  makeCodexTokenRefreshHandler,
-  type CodexTokenRefreshHandler,
-} from "./http/internalCodexTokenRefresh.js";
-import {
-  createCodexRouteContextForModel,
-  expireCodexRouteContext,
-  hasActiveOfficialOAuthAccountInGroup,
   listEnabledGroupsForModel,
 } from "./account-pool/groups.js";
-import {
-  CODEX_RELAY_PREFIX,
-  makeCodexRelayHandler,
-  makeDefaultCodexRelayDb,
-  type CodexRelayHandler,
-} from "./http/internalCodexRelay.js";
 import {
   SKILL_EMBED_PREFIX,
   makeSkillEmbedHandler,
@@ -183,7 +147,6 @@ import {
 import {
   WECHAT_OUTBOUND_PATH,
   makeOutboundReceiverHandler,
-  type WechatCodexBillingBody,
 } from "./wechat/outboundReceiver.js";
 import {
   WECHAT_PROACTIVE_PATH,
@@ -210,7 +173,6 @@ import {
 } from "./minimax/mediaProxy.js";
 import {
   makeInboundDispatcher,
-  type PrepareWechatCodexTurnResult,
 } from "./wechat/inboundDispatcher.js";
 import { handleWechatModelCommand } from "./wechat/modelCommand.js";
 import { pickWechatInboundModel } from "./wechat/modelResolver.js";
@@ -231,7 +193,6 @@ import {
   type ResolveContainerEndpoint,
   type UserChatBridgeHandler,
   type BridgeMetricSink,
-  type CodexBindingHandle,
 } from "./ws/userChatBridge.js";
 import {
   createVoiceTranscribeHandler,
@@ -242,10 +203,6 @@ import {
   getAgentCostMultiplier,
 } from "./billing/agentMultiplier.js";
 import { startInflightJournal } from "./billing/proxyBilling.js";
-import {
-  makeCodexFinalizer,
-  type CodexFinalizeHandle,
-} from "./billing/codexFinalizer.js";
 import type { TokenUsage } from "./billing/calculator.js";
 import { createTunnelContainerSocket } from "./ws/tunnelContainerSocket.js";
 import {
@@ -998,17 +955,6 @@ export async function registerCommercial(
   // 主动微信投递接收点(cron/提醒 → master 权威解析收件人 → outbox)。与 broker 同生命周期,
   // 同条件块内装配;未装配时 dispatchInternal 显式 404(同 wechat-outbound 语义)。
   const wechatProactiveRef: { current: ProactiveReceiverHandler | null } = { current: null };
-  // v1.0.120 feat/codex-disable-rebind:fanoutDeps 依赖 v3Deps.putRemoteCodexAuth,
-  // 必须在 v3Deps 装配后(line ~1067)才能赋值;但 proxy / codex token refresh
-  // handler / commercialHttpDeps 在更早就要拿到 trigger 闭包,故用 ref 打破先后。
-  //
-  // 装配前到达的事件(理论不可能,proxy 接请求前 v3Deps 已就绪)走 noop。
-  const triggerCodexDisableFanoutRef: { current: (accountId: bigint) => void } = {
-    current: () => { /* fanoutDeps 还没装好,静默丢弃 */ },
-  };
-  const triggerCodexDisableFanout = (accountId: bigint): void => {
-    triggerCodexDisableFanoutRef.current(accountId);
-  };
   // D.1b: self host uuid 取失败只降级多机路径(proxy / v3Deps.containerService /
   // baselineServer),不牵连整个 commercial 启动。多处共用,提前一次性取。
   let selfHostUuid: string | undefined;
@@ -1103,7 +1049,7 @@ export async function registerCommercial(
         // health 注入进来是为了 refresh 失败时按规约走 health.manualDisable。
         // v1.0.120:triggerCodexDisableFanout 注入 — disableOnFailure 内部
         // 按 provider 二次过滤,claude 账号 refresh 失败不会误触发 codex fanout。
-        refreshDeps: { health: healthTracker, triggerCodexDisableFanout },
+        refreshDeps: { health: healthTracker },
         // 真实扣费积分推送 —— proxy 在 finalize.commit 后调,通过 bridge 把
         // outbound.cost_charged 帧发给用户。bridge 启动顺序在 proxy 之后,
         // 故用 ref 打破先后(构造期调用是 noop,请求期 bridge 必已 wire)。
@@ -1147,121 +1093,6 @@ export async function registerCommercial(
           appendServerAuthoredMessageForRequest,
         },
       });
-      // Codex reverse-RPC `account/chatgptAuthTokens/refresh` over HTTP.
-      // Container's gateway forwards 401-recovery refresh asks here; we read
-      // the bound codex_account, refresh upstream, persist to DB + per-container
-      // auth.json under FOR UPDATE, and return the new token. Without this
-      // path every codex 401 fails the turn (-32601 method-not-found).
-      const codexContainerDirForRefresh =
-        process.env.OC_V3_CODEX_CONTAINER_DIR?.trim() || DEFAULT_V3_CODEX_CONTAINER_DIR;
-      const codexTokenRefreshHandler: CodexTokenRefreshHandler = makeCodexTokenRefreshHandler({
-        identityRepo,
-        rateLimitRedis,
-        codexContainerDir: codexContainerDirForRefresh,
-        containerUid: V3_AGENT_UID,
-        containerGid: V3_AGENT_GID,
-        // selfHostId 取自外层闭包 selfHostUuid;此分支已 guard 它非空。
-        selfHostId: selfHostUuid,
-        // refreshDeps 注入 healthTracker — 保持与 anthropicProxy 一致(失败走
-        // health.manualDisable 路径)。
-        // v1.0.120:triggerCodexDisableFanout — codex token refresh 失败 disable
-        // 后立刻 fanout rebind 其他活跃容器,避免老 token 仍被 codex CLI 沿用。
-        refreshDeps: { health: healthTracker, triggerCodexDisableFanout },
-        db: {
-          // 注:两处都 LEFT JOIN claude_accounts 取 ca.status,以让 handler
-          // 拒刷 disabled/quarantined/已删 账号 — 见 codex round 2 BLOCKER#2。
-          // FOR UPDATE 仍只锁 agent_containers(`OF ac` 显式收窄,避免锁
-          // claude_accounts 行,与 lazy migrate 的 `FOR UPDATE OF ac` 兼容)。
-          async readContainerAccount(containerId) {
-            const r = await getPool().query<{
-              codex_account_id: string | null;
-              user_id: string;
-              state: string;
-              host_uuid: string | null;
-              account_status: string | null;
-            }>(
-              `SELECT ac.codex_account_id::text AS codex_account_id,
-                      ac.user_id::text AS user_id,
-                      ac.state,
-                      ac.host_uuid::text AS host_uuid,
-                      ca.status AS account_status
-                 FROM agent_containers ac
-                 LEFT JOIN claude_accounts ca ON ca.id = ac.codex_account_id
-                WHERE ac.id = $1 AND ac.runtime_channel = $2`,
-              [containerId, getRuntimeChannel()],
-            );
-            if (r.rows.length === 0) return null;
-            const row = r.rows[0];
-            return {
-              codexAccountId: row.codex_account_id === null ? null : BigInt(row.codex_account_id),
-              userId: BigInt(row.user_id),
-              state: row.state,
-              hostUuid: row.host_uuid,
-              accountStatus: row.account_status,
-            };
-          },
-          async txWithLock(containerId, fn) {
-            return await tx(async (client) => {
-              const lockRes = await client.query<{
-                codex_account_id: string | null;
-                user_id: string;
-                state: string;
-                host_uuid: string | null;
-                account_status: string | null;
-              }>(
-                `SELECT ac.codex_account_id::text AS codex_account_id,
-                        ac.user_id::text AS user_id,
-                        ac.state,
-                        ac.host_uuid::text AS host_uuid,
-                        ca.status AS account_status
-                   FROM agent_containers ac
-                   LEFT JOIN claude_accounts ca ON ca.id = ac.codex_account_id
-                  WHERE ac.id = $1 AND ac.runtime_channel = $2
-                    FOR UPDATE OF ac`,
-                [containerId, getRuntimeChannel()],
-              );
-              const row =
-                lockRes.rows.length === 0
-                  ? null
-                  : {
-                      codexAccountId:
-                        lockRes.rows[0].codex_account_id === null
-                          ? null
-                          : BigInt(lockRes.rows[0].codex_account_id),
-                      userId: BigInt(lockRes.rows[0].user_id),
-                      state: lockRes.rows[0].state,
-                      hostUuid: lockRes.rows[0].host_uuid,
-                      accountStatus: lockRes.rows[0].account_status,
-                    };
-              return await fn(client, row);
-            });
-          },
-        },
-        fileWriter: {
-          async writeLocal(args) {
-            await writeCodexContainerAuthFile(args);
-          },
-          // Remote write — same getHostById → hostRowToTarget → putRemote →
-          // finally psk.fill(0) shape as v3Deps.putRemoteCodexAuth (line ~883).
-          // Constructed inline because v3Deps is initialized *after* this
-          // dispatchInternal block; we don't want to depend on declaration
-          // order. The handler only invokes this when row.host_uuid !== self.
-          async writeRemote(hostUuid, containerId, accessToken, lastRefreshIso) {
-            // A3 — service file-IO:revoked / 缺 fingerprint 的 host 直接拒(不写 codex auth 到终态 host)。
-            const target = await resolveServiceableHostTarget(hostUuid);
-            try {
-              await putRemoteCodexContainerAuth(
-                target,
-                containerId,
-                accessToken,
-                lastRefreshIso,
-              );
-            } finally {
-              target.psk?.fill(0);
-            }
-          },
-        },
-      });
       // /v3/literature/search — DeepXiv 文献检索 proxy。复用 identityRepo
       // (同 anthropicProxy 的双因子身份),token 留在 master,容器只走 mTLS 内部 proxy。
       // GET-then-INCR Lua 配额 + per-container 60req/5min in-memory limiter。
@@ -1287,10 +1118,6 @@ export async function registerCommercial(
         identityRepo,
         pgPool: getPool(),
         tokenPlanKey: cfg.MINIMAX_TOKEN_PLAN_KEY,
-      });
-      const codexRelayHandler: CodexRelayHandler = makeCodexRelayHandler({
-        identityRepo,
-        db: makeDefaultCodexRelayDb(),
       });
       // /internal/v3/skill-embed — 容器内 mcp-memory 语义 skill_search 回源 master。
       // master 持 SKILL_EMBEDDING_API_KEY/DASHSCOPE_API_KEY(只在 master env,不注入容器),
@@ -1318,12 +1145,6 @@ export async function registerCommercial(
         }
         if (path === MINIMAX_MEDIA_PATH) {
           return minimaxMediaHandler(req, res, ctx);
-        }
-        if (path === CODEX_TOKEN_REFRESH_PATH) {
-          return codexTokenRefreshHandler(req, res, ctx);
-        }
-        if (path === CODEX_RELAY_PREFIX || path.startsWith(`${CODEX_RELAY_PREFIX}/`)) {
-          return codexRelayHandler(req, res, ctx);
         }
         if (path === SKILL_EMBED_PREFIX) {
           return skillEmbedHandler(req, res, ctx);
@@ -1461,7 +1282,7 @@ export async function registerCommercial(
         identity: apiKeyStrategy,
         rateLimitRedis: sharedRateLimitRedis,
         // 与 internal 同型:OAuth refresh 走 health + codex disable fanout。
-        refreshDeps: { health: healthTracker, triggerCodexDisableFanout },
+        refreshDeps: { health: healthTracker },
         // bridge broadcastToUser 同型 ref 闭包;externalApiKeyProxy 装配于
         // bridge 之前是正常顺序(请求期 bridge 必已就绪)。
         broadcastToUser: (uid, payload) => bridgeBroadcastRef.current(uid, payload),
@@ -1655,46 +1476,6 @@ export async function registerCommercial(
         ? {
             containerService: createContainerService(v3Docker),
             selfHostId: selfHostUuid,
-            // v1.0.72 — 远端 codex auth 写/删 helper:统一在此一处做
-            // getHostById → hostRowToTarget → put/delete → finally psk.fill(0)
-            // 三处调用方(provisionV3Container / lazy migrate / stopAndRemove)
-            // 都通过这两个回调,避免泄密 buffer 散落。
-            //
-            // 失败语义:put 抛 → caller fallback NULL bind;delete 抛 → caller
-            // 应吞掉(best-effort,与本地 removeCodexContainerAuthDir 一致)。
-            // 本闭包不做 catch —— 让 caller 决定。
-            putRemoteCodexAuth: async (
-              hostUuid: string,
-              containerId: string,
-              accessToken: string,
-              lastRefreshIso: string,
-            ) => {
-              // A3 — service file-IO:revoked / 缺 fingerprint 的 host 直接拒。
-              const target = await resolveServiceableHostTarget(hostUuid);
-              try {
-                await putRemoteCodexContainerAuth(
-                  target,
-                  containerId,
-                  accessToken,
-                  lastRefreshIso,
-                );
-              } finally {
-                target.psk?.fill(0);
-              }
-            },
-            deleteRemoteCodexAuth: async (
-              hostUuid: string,
-              containerId: string,
-            ) => {
-              // A3 — service file-IO:revoked / 缺 fingerprint 的 host 直接拒
-              // (与 put/pull 对称;清 codex auth 也是 node-agent file 接触)。
-              const target = await resolveServiceableHostTarget(hostUuid);
-              try {
-                await deleteRemoteCodexContainerAuth(target, containerId);
-              } finally {
-                target.psk?.fill(0);
-              }
-            },
           }
         : {}),
     };
@@ -1799,44 +1580,6 @@ export async function registerCommercial(
     console.log(
       "[commercial] v3 supervisor disabled; missing env: OC_RUNTIME_IMAGE",
     );
-  }
-
-  // v1.0.120 feat/codex-disable-rebind:fanoutDeps 装配 —— admin disable codex
-  // 账号 / refresh.ts 401 自动 disable 后触发后台 actor,把仍绑该账号的容器
-  // rebind 到新 active 账号(M2 强一致路径)。
-  //
-  // 单机 / v3Deps 未装(测试 / 无 docker)时 putRemoteCodexAuth 为 undefined,
-  // 走本地 fs 写;若实际 row.host_uuid 是远端但 helper 未注入,
-  // fetchSnapshotAndWriteContainerAuth 会抛错 → tx ROLLBACK,符合强一致语义。
-  // 句柄声明在 block 外,shutdown 才能 stop(fanoutDeps 是 block-local)。
-  let codexDriftReconciler: CodexDriftReconcilerHandle | undefined;
-  {
-    const codexContainerDirForFanout =
-      process.env.OC_V3_CODEX_CONTAINER_DIR?.trim() || DEFAULT_V3_CODEX_CONTAINER_DIR;
-    const fanoutDeps: CodexDisableFanoutDeps = {
-      writeAuth: {
-        selfHostId: v3Deps?.selfHostId ?? null,
-        containerUid: V3_AGENT_UID,
-        containerGid: V3_AGENT_GID,
-        codexContainerDir: codexContainerDirForFanout,
-        putRemoteCodexAuth: v3Deps?.putRemoteCodexAuth,
-      },
-      concurrency: 4,
-      logger: rootLogger.child({
-        subsys: "commercial",
-        module: "codexDisableFanout",
-      }),
-    };
-    triggerCodexDisableFanoutRef.current = (accountId: bigint) => {
-      enqueueCodexDisableFanout(accountId, fanoutDeps);
-    };
-    // B3 — fanout 是 fire-and-forget,单容器 rebind 失败无重试且恢复 actor 看不到
-    // disabled 账号的残留绑定 → 周期性兜底对账,复用同一强一致 rebind。
-    if (controlPlaneEnabled && process.env.COMMERCIAL_CODEX_DRIFT_RECONCILER_DISABLED !== "1") {
-      const raw = Number(process.env.COMMERCIAL_CODEX_DRIFT_RECONCILER_INTERVAL_MS);
-      const intervalMs = Number.isFinite(raw) && raw >= 30_000 ? raw : 300_000;
-      codexDriftReconciler = startCodexDisableDriftReconciler({ deps: fanoutDeps, intervalMs });
-    }
   }
 
   // V3 多机路由:启动 BaselineServer,给远端 node-agent 提供
@@ -2055,9 +1798,6 @@ export async function registerCommercial(
     // (isContainerPathAllowed)。
     mediaSignKey,
     wechatLiveLinkKey,
-    // v1.0.120 feat/codex-disable-rebind:透传给 admin/accounts handler 的
-    // adminPatchAccount ctx,active→disabled 转移触发 fanout actor。
-    triggerCodexDisableFanout,
     // V3 CC 外接 plan Phase 3:公网 `POST /api/anthropic/v1/messages` 的 handler
     // 实例。undefined 时 router 该路径返 503 EXTERNAL_PROXY_UNAVAILABLE 而非 404。
     externalApiKeyProxy,
@@ -2185,305 +1925,6 @@ export async function registerCommercial(
       throw new ContainerUnreadyError(5, "supervisor_not_wired");
     });
 
-  const CODEX_PRECHECK_TOKEN_ESTIMATE = 64_000;
-  const DEFAULT_CODEX_SESSION_MAX_MS = 600_000;
-  const readCodexSessionMaxMs = (): number => {
-    const raw = process.env.CODEX_SESSION_MAX_MS;
-    if (!raw) return DEFAULT_CODEX_SESSION_MAX_MS;
-    const n = Number(raw);
-    return Number.isFinite(n) && n >= 1000 ? n : DEFAULT_CODEX_SESSION_MAX_MS;
-  };
-  const newCodexRequestId = (): string => randomBytes(16).toString("hex");
-  const codexRouteLog = rootLogger.child({ subsys: "commercial", module: "codexRoute" });
-
-  const createCommercialCodexRoute = async ({ containerId, userId, modelId }: {
-    containerId: number;
-    userId: bigint;
-    modelId: string;
-  }) => {
-    const groups = await listEnabledGroupsForModel({ modelId, provider: "codex" });
-    if (groups.length === 0) return null;
-    for (const group of groups) {
-      if (group.kind === "api_relay") {
-        const route = await createCodexRouteContextForModel({
-          containerId,
-          userId,
-          modelId,
-          groupId: group.id,
-        });
-        if (!route) continue;
-        return {
-          kind: "api_relay" as const,
-          token: route.token,
-          baseUrl: `http://127.0.0.1:${V3_CONTAINER_PORT}/internal/v3/codex-relay/route/${route.token}`,
-          modelProvider: route.credential.model_provider,
-          providerName: route.credential.provider_name,
-          wireApi: route.credential.wire_api,
-          preferredAuthMethod: route.credential.preferred_auth_method,
-          disableResponseStorage: route.credential.disable_response_storage,
-          groupId: route.group.id.toString(),
-          credentialId: route.credential.id.toString(),
-        };
-      }
-      if (group.kind === "official_oauth") {
-        const hasAccount = await hasActiveOfficialOAuthAccountInGroup(group.id, "codex");
-        if (!hasAccount) continue;
-        return { kind: "official_oauth" as const, groupId: group.id.toString() };
-      }
-    }
-    return { kind: "unavailable" as const, reason: "no usable enabled Codex group" };
-  };
-
-  const createWechatApiRelayRoute = async (args: {
-    containerId: number;
-    userId: bigint;
-    modelId: string;
-  }) => {
-    const groups = await listEnabledGroupsForModel({ modelId: args.modelId, provider: "codex" });
-    for (const group of groups) {
-      if (group.kind !== "api_relay") continue;
-      const route = await createCodexRouteContextForModel({
-        containerId: args.containerId,
-        userId: args.userId,
-        modelId: args.modelId,
-        groupId: group.id,
-      });
-      if (!route) continue;
-      return {
-        token: route.token,
-        routeFrame: {
-          baseUrl: `http://127.0.0.1:${V3_CONTAINER_PORT}/internal/v3/codex-relay/route/${route.token}`,
-          modelProvider: route.credential.model_provider,
-          providerName: route.credential.provider_name ?? null,
-          wireApi: route.credential.wire_api ?? "responses",
-          preferredAuthMethod: route.credential.preferred_auth_method ?? "apikey",
-          disableResponseStorage: route.credential.disable_response_storage ?? true,
-        },
-      };
-    }
-    return null;
-  };
-
-  type WechatCodexTurnSnapshot = {
-    finalizer: CodexFinalizeHandle;
-    requestId: string;
-    userId: bigint;
-    containerId: number;
-    model: string;
-    accountId: bigint;
-    traceId: string;
-    routeToken: string;
-    timeout: ReturnType<typeof setTimeout>;
-  };
-  const wechatCodexTurns = new Map<string, WechatCodexTurnSnapshot>();
-
-  const expireCodexRouteToken = (token: string | null | undefined, reason: string): void => {
-    if (!token) return;
-    expireCodexRouteContext(token).catch((err) => {
-      codexRouteLog.warn("expire_codex_route_failed", {
-        reason,
-        errMessage: (err as Error)?.message ?? String(err),
-      });
-    });
-  };
-
-  const failWechatCodexTurn = async (requestId: string, reason: string): Promise<void> => {
-    const snap = wechatCodexTurns.get(requestId);
-    if (!snap) return;
-    wechatCodexTurns.delete(requestId);
-    clearTimeout(snap.timeout);
-    try {
-      await snap.finalizer.fail(reason);
-    } finally {
-      expireCodexRouteToken(snap.routeToken, reason);
-    }
-  };
-
-  const safeBillingNum = (v: unknown): bigint => {
-    if (typeof v !== "number" || !Number.isFinite(v) || v <= 0) return 0n;
-    return BigInt(Math.trunc(v));
-  };
-
-  const handleWechatCodexBilling = async (
-    body: WechatCodexBillingBody,
-    identity: { userId: number; containerId: number },
-  ): Promise<void> => {
-    const snap = wechatCodexTurns.get(body.requestId);
-    if (!snap) {
-      codexRouteLog.info("wechat_codex_billing_unknown_turn", { requestId: body.requestId });
-      return;
-    }
-    if (snap.userId !== BigInt(identity.userId) || snap.containerId !== identity.containerId) {
-      codexRouteLog.warn("wechat_codex_billing_identity_mismatch", {
-        requestId: body.requestId,
-        expectedUserId: snap.userId.toString(),
-        gotUserId: identity.userId,
-        expectedContainerId: snap.containerId,
-        gotContainerId: identity.containerId,
-      });
-      return;
-    }
-    wechatCodexTurns.delete(body.requestId);
-    clearTimeout(snap.timeout);
-
-    const u = body.usage ?? {};
-    const usage: TokenUsage = {
-      input_tokens: safeBillingNum(u.input_tokens),
-      output_tokens: safeBillingNum(u.output_tokens) + safeBillingNum(u.reasoning_output_tokens),
-      cache_read_tokens: safeBillingNum(u.cache_read_input_tokens),
-      cache_write_tokens: safeBillingNum(u.cache_creation_input_tokens),
-    };
-    try {
-      const result = await snap.finalizer.commit(
-        usage,
-        body.status === "error" ? "error" : "success",
-        body.errorReason,
-      );
-      if (result.debitedCredits !== null && result.debitedCredits > 0n) {
-        try {
-          await appendCostCredits(
-            body.requestId,
-            snap.userId.toString(),
-            result.debitedCredits.toString(),
-          );
-        } catch (err) {
-          codexRouteLog.warn("wechat_codex_persist_cost_credits_failed", {
-            requestId: body.requestId,
-            errMessage: (err as Error)?.message ?? String(err),
-          });
-        }
-      }
-    } catch (err) {
-      codexRouteLog.error("wechat_codex_finalizer_commit_failed", {
-        requestId: body.requestId,
-        errMessage: (err as Error)?.message ?? String(err),
-      });
-    } finally {
-      expireCodexRouteToken(snap.routeToken, "wechat_codex_billing_settled");
-    }
-  };
-
-  const prepareWechatCodexTurn = async (args: {
-    containerId: number;
-    bindingUserId: string;
-    userId: bigint;
-    modelId: string;
-    agentId: string;
-    traceId: string;
-  }): Promise<PrepareWechatCodexTurnResult> => {
-    const route = await createWechatApiRelayRoute(args);
-    if (!route) {
-      return {
-        kind: "unavailable",
-        reply: "GPT 模型通道暂时不可用，请稍后再试，或发送 /model 切换到其它模型。",
-      };
-    }
-
-    const modelPricing = pricing.get(args.modelId);
-    if (!modelPricing) {
-      expireCodexRouteToken(route.token, "wechat_codex_pricing_missing");
-      return { kind: "unavailable", reply: "GPT 模型计费配置暂时不可用，请稍后再试。" };
-    }
-
-    const agentForCharge = args.agentId || "codex";
-    let derivedPricing: ModelPricing;
-    try {
-      const agentMul = await getAgentCostMultiplier(getPool(), agentForCharge);
-      derivedPricing = {
-        ...modelPricing,
-        multiplier: composeMultiplier(modelPricing.multiplier, agentMul),
-      };
-    } catch (err) {
-      expireCodexRouteToken(route.token, "wechat_codex_multiplier_failed");
-      codexRouteLog.error("wechat_codex_multiplier_failed", {
-        agentId: agentForCharge,
-        errMessage: (err as Error)?.message ?? String(err),
-      });
-      return { kind: "unavailable", reply: "GPT 模型计费配置暂时不可用，请稍后再试。" };
-    }
-
-    const requestId = newCodexRequestId();
-    let maxCost: bigint;
-    try {
-      maxCost = estimateMaxCost(CODEX_PRECHECK_TOKEN_ESTIMATE, derivedPricing);
-    } catch (err) {
-      expireCodexRouteToken(route.token, "wechat_codex_estimate_failed");
-      codexRouteLog.error("wechat_codex_estimate_failed", {
-        errMessage: (err as Error)?.message ?? String(err),
-      });
-      return { kind: "unavailable", reply: "GPT 模型计费配置暂时不可用，请稍后再试。" };
-    }
-
-    let preCheckResult: Awaited<ReturnType<typeof preCheckWithCost>>;
-    try {
-      preCheckResult = await preCheckWithCost(preCheckRedis, {
-        userId: args.userId,
-        requestId,
-        maxCost,
-      });
-    } catch (err) {
-      expireCodexRouteToken(route.token, "wechat_codex_precheck_failed");
-      if (err instanceof InsufficientCreditsError) {
-        return { kind: "unavailable", reply: "余额不足，请到网页端充值后再使用 GPT 模型，或发送 /model 切换其它模型。" };
-      }
-      codexRouteLog.error("wechat_codex_precheck_failed", {
-        errMessage: (err as Error)?.message ?? String(err),
-      });
-      return { kind: "unavailable", reply: "GPT 模型计费检查暂时不可用，请稍后再试。" };
-    }
-
-    try {
-      await startInflightJournal(getPool(), {
-        requestId,
-        userId: args.userId,
-        containerId: BigInt(args.containerId),
-        model: args.modelId,
-        precheckCredits: preCheckResult.maxCost,
-        ctxJson: {
-          agentId: agentForCharge,
-          codexAccountId: null,
-          source: "wechat_codex_api_relay",
-        },
-      });
-    } catch (err) {
-      await releasePreCheck(preCheckRedis, preCheckResult.reservation).catch(() => {});
-      expireCodexRouteToken(route.token, "wechat_codex_journal_failed");
-      codexRouteLog.error("wechat_codex_journal_failed", {
-        requestId,
-        errMessage: (err as Error)?.message ?? String(err),
-      });
-      return { kind: "unavailable", reply: "GPT 模型计费初始化暂时不可用，请稍后再试。" };
-    }
-
-    const finalizer = makeCodexFinalizer({
-      pgPool: getPool(),
-      preCheckRedis,
-      userId: args.userId,
-      requestId,
-      containerId: String(args.containerId),
-      model: args.modelId,
-      derivedPricing,
-      reservation: preCheckResult.reservation,
-      accountId: 0n,
-    });
-    const timeout = setTimeout(() => {
-      void failWechatCodexTurn(requestId, "wechat_codex_billing_timeout");
-    }, readCodexSessionMaxMs());
-    timeout.unref?.();
-    wechatCodexTurns.set(requestId, {
-      finalizer,
-      requestId,
-      userId: args.userId,
-      containerId: args.containerId,
-      model: args.modelId,
-      accountId: 0n,
-      traceId: args.traceId,
-      routeToken: route.token,
-      timeout,
-    });
-
-    return { kind: "ready", requestId, routeFrame: route.routeFrame };
-  };
 
   // ─── P1.7 slice 7c — WeChat broker 装配 ───────────────────────────────────
   //
@@ -2541,8 +1982,6 @@ export async function registerCommercial(
           allowedModels: ALLOWED_INBOUND_MODELS,
         });
       },
-      prepareCodexTurn: prepareWechatCodexTurn,
-      failCodexTurn: failWechatCodexTurn,
       // dispatcher Step 2a / 2b — 走 storage helper 写 master sqlite client_sessions。
       upsertMasterClientSession,
       // dispatcher Step 2b 失败 + broker reconcile 共用同一个 soft-delete
@@ -2560,7 +1999,6 @@ export async function registerCommercial(
       identityRepo,
       pool: getPool(),
       rateLimiter: createNoopRateLimiter(),
-      handleCodexBilling: handleWechatCodexBilling,
     });
 
     // 主动微信投递接收点 —— 权威解析收件人(senderId = binding.loginUserId),
@@ -2677,241 +2115,6 @@ export async function registerCommercial(
     ? (cid: number) => { void markV3ContainerActivity(v3Deps!, cid); }
     : undefined;
 
-  // plan v3 G5/G7 — codex per-account 并发槽 + lazy migrate handle。
-  //   - acquire(containerId):FOR UPDATE 锁 agent_containers row + LEFT JOIN claude_accounts
-  //     看绑定账号状态:
-  //       * codex_account_id IS NULL → 返回 null(legacy 容器,mount immutable,决策 N3)
-  //       * 已 active → tx 不写,返回 account_id;tx 提交后(无写)再 acquireCodexSlot
-  //       * 非 active(disabled / quarantined)→ pickCodexAccountForBinding 重选 →
-  //         getCodexTokenSnapshot → writeCodexContainerAuthFile 原子写 → UPDATE
-  //         codex_account_id;tx 提交后再 acquireCodexSlot(失败 → bridge fast-fail,
-  //         migrate 已落盘永久不回滚:下次重连 active 路径直接走 happy 分支)
-  //   - acquireCodexSlot 在 tx **外**调,避免 commit 失败造成的 in-process slot 永久泄漏:
-  //     已经持有 slot 但 UPDATE 回滚 → 调用方拿到错误 → bridge.acquiredCodexAccountId
-  //     未被赋值 → cleanup() 与 G6 timer 都不知道哪个 account 该 release → 永久泄漏。
-  //   - release(account_id, slotId):按 slotId 精确还槽,幂等。
-  //   - v3Deps 未注入(测试 / 早期 boot 路径)→ codexBinding=undefined,bridge 退化为不做并发管控
-  // 闭包外 capture v3Deps 给 stale recycle fire-and-forget 路径用(必须非空)。
-  const v3DepsForCodex = v3Deps;
-  const codexBinding: CodexBindingHandle | undefined = v3Deps
-    ? {
-        async acquire(containerId: number, groupId?: string | null) {
-          // tx 内做"锁 + 查 + 可能 lazy migrate / stale recycle";acquire slot / 容器 rm 在 tx 外
-          type AcquireResult =
-            | { kind: "active"; account_id: bigint }
-            | { kind: "stale"; containerInternalId: string | null; hostUuid: string | null }
-            | null;
-          const desiredGroupId = groupId ?? null;
-          const result: AcquireResult = await tx<AcquireResult>(async (client) => {
-            const lookup = await client.query<{
-              account_id: string | null;
-              account_status: string | null;
-              account_group_id: string | null;
-              state: string;
-              container_internal_id: string | null;
-              host_uuid: string | null;
-              age_seconds: string;
-            }>(
-              `SELECT ac.codex_account_id::text AS account_id,
-                      ca.status AS account_status,
-                      ca.group_id::text AS account_group_id,
-                      ac.state AS state,
-                      ac.container_internal_id AS container_internal_id,
-                      ac.host_uuid AS host_uuid,
-                      EXTRACT(EPOCH FROM (NOW() - ac.created_at))::text AS age_seconds
-               FROM agent_containers ac
-               LEFT JOIN claude_accounts ca ON ca.id = ac.codex_account_id
-               WHERE ac.id = $1 AND ac.runtime_channel = $2
-               FOR UPDATE OF ac`,
-              [containerId, getRuntimeChannel()],
-            );
-            if (lookup.rows.length === 0) {
-              // 容器在 acquire 前刚被删了 — 当 legacy 透传(下游 sendToContainer 必失败,
-              // 错误从那条路径返回给前端,与本桥状态一致)
-              return null;
-            }
-            const row = lookup.rows[0];
-            if (row.state !== "active") {
-              // 容器已不再 active(stopped / vanished / removed) — 当 legacy 透传,
-              // 让下游 sendToContainer 路径产出标准错误,不在 acquire 这层造一种新的错。
-              return null;
-            }
-            if (row.account_id === null) {
-              // v1.0.72:host guard(v1.0.71 临时把"远端 host + NULL bind"硬挡)
-              // 替换为下方 **age 守护**(死循环熔断,见 ageSec < 60 注释)。原因 ——
-              //   v1.0.71 临时 guard 是因为 provisionV3Container 在远端跳过 codex
-              //   绑定,远端 host 上重 provision 仍是 NULL → 死循环。v1.0.72 起远端
-              //   provision 路径已能写 per-container auth.json(v3supervisor 的
-              //   useRemote codex 分支走 deps.putRemoteCodexAuth),正常路径下
-              //   stale recycle + ensureRunning 重 provision 会自然产出 per-container
-              //   mount。但 putRemote 短暂故障(node-agent 抖 / fingerprint 错配)
-              //   仍可能让 row 又留 NULL —— 此时由 age guard 熔断,不再依赖 host 判定。
-              // legacy NULL 绑定 + 任意 host。检查池子里是否有 active codex 账号:
-              //   - 没有 → 真 legacy 路径不变,return null(N3 行为兼容)
-              //   - 有   → 用户 admin 已加账号但容器 mount immutable 永远 401,
-              //            必须 mark vanished + docker rm 让 ensureRunning 重 provision
-              //            重新走 picker 路径产出 per-container mount。
-              // 池子查询条件必须与 pickCodexAccountForBinding 完全一致(provider='codex'
-              // AND status='active'),否则可能误判为"有账号"但 picker 实际拿不到。
-              const poolParams: unknown[] = [];
-              const poolWhere = ["provider = 'codex'", "status = 'active'"];
-              if (desiredGroupId !== null) {
-                poolParams.push(desiredGroupId);
-                poolWhere.push(`group_id = $${poolParams.length}`);
-              }
-              const poolCount = await client.query<{ cnt: string }>(
-                `SELECT count(*)::text AS cnt
-                   FROM claude_accounts
-                  WHERE ${poolWhere.join(" AND ")}`,
-                poolParams,
-              );
-              if (Number(poolCount.rows[0]?.cnt ?? "0") === 0) {
-                return null;
-              }
-              // **死循环守护(v1.0.72 Codex review High#1)**:
-              // 远端 host 的 putRemoteCodexAuth 短暂故障(node-agent 抖 / fingerprint
-              // 错配 / cert 失效)→ provisionV3Container 写 codex auth 失败 → no-mount
-              // + codex_account_id NULL → 下次 acquire 看池非空 → 又 recycle → 又重 provision
-              // → 又失败 → 死循环烧资源。本地 host 也存在同 case(picker 抛 / write fail),
-              // 只是远端故障频率高。
-              //
-              // 守护:row 才创建 < 60s 又被 stale recycle = 强信号上一轮 provision codex
-              // 绑定失败,**这一轮不再 recycle**,return null 走 legacy 透传(N3 行为)。
-              // 用户 GPT 请求会失败但容器照常用,不会陷入重建循环。运维通过监控 NULL
-              // bind 容器数 + 日志告警感知后,修复 host 后下一轮自然 recycle 自愈
-              // (60s 后行不再"年轻")。
-              const ageSec = Number(row.age_seconds ?? "0");
-              if (Number.isFinite(ageSec) && ageSec < 60) {
-                // eslint-disable-next-line no-console
-                console.warn(
-                  "[codex acquire] skip stale recycle: row too young (likely upstream codex bind failed last provision)",
-                  { containerId, ageSec, hostUuid: row.host_uuid },
-                );
-                return null;
-              }
-              // 池子非空 — recycle。同 tx 内把 row 标 vanished,与下面 lazy migrate
-              // 的 UPDATE 同 commit,避免并发 acquirer 看到 state='active' 走错路径。
-              // WHERE state='active' guard 防 race:并发 acquirer/admin/idleSweep
-              // 已经把 state 改了的话本 UPDATE rowCount=0,我们也回 null 让 caller
-              // 当 legacy 透传(那条路径自然产出错误返给前端)。
-              // FOR UPDATE OF ac 已锁住本 row,UPDATE WHERE state='active' 在同 tx
-              // 内应永远 rowCount=1。rowCount=0 = 不变量破坏(只可能是更上层 SELECT
-              // 时 row.state 已经不是 'active' — 但前面 row.state !== 'active' 早已
-              // 拦截)。这里 throw 抬出问题,而不是静默 return null 让 caller 当 legacy
-              // 透传 — 那条路径走旧容器仍会 401,只是把问题往后挪。
-              const upd = await client.query(
-                // P1d 防御:codex 路径生命周期变更 SQL 也按 channel(v5 不暴露 codex,正常不可达;
-                // 防调用链传错 containerId 跨 channel vanish。codex 全栈下线见 P1f)。
-                `UPDATE agent_containers
-                    SET state = 'vanished', updated_at = NOW()
-                  WHERE id = $1 AND state = 'active' AND runtime_channel = $2`,
-                [containerId, getRuntimeChannel()],
-              );
-              if ((upd.rowCount ?? 0) === 0) {
-                throw new Error(
-                  `codex stale recycle: UPDATE state=vanished rowCount=0 for container ${containerId} (invariant: FOR UPDATE row was active)`,
-                );
-              }
-              return {
-                kind: "stale",
-                containerInternalId: row.container_internal_id,
-                hostUuid: row.host_uuid,
-              };
-            }
-            if (row.account_status === "active" && (desiredGroupId === null || row.account_group_id === desiredGroupId)) {
-              return { kind: "active", account_id: BigInt(row.account_id) };
-            }
-            // disabled / quarantined / 任意非 active → lazy migrate
-            //
-            // v1.0.120 feat/codex-disable-rebind:把"pick + snapshot + write +
-            // UPDATE"这一段 inlined IO 抽到 `codexLazyMigrate` 模块,与 M1
-            // (`internalCodexTokenRefresh` in-turn 自愈)+ M2(`codexDisableFanout`
-            // 后台 actor)共享同一组 helper。三条路径都靠 `acquireAndPickInTx` 做
-            // FOR UPDATE 锁 + 决策,`commitCodexRebindInTx` 做 UPDATE,
-            // `fetchSnapshotAndWriteContainerAuth` 做"读 token snapshot + 本地或
-            // 远端写 per-container auth.json"。
-            //
-            // acquire 仍走**强一致**(tx 内 pick + write + UPDATE 一同 COMMIT):
-            //   - acquire 是用户 inbound 触发,单容器单流,不像 reverse-RPC 那样
-            //     burst,持锁 IO 开销可接受
-            //   - 写失败 → tx ROLLBACK → row 仍指 disabled 账号 → 下次 inbound 再 acquire
-            //     重试,与本次失败前状态一致(无孤儿 auth.json,因为是先写后 UPDATE
-            //     的强一致,但 helper 顺序是 fetch+write → UPDATE,write 成功 → UPDATE
-            //     失败极少,失败时 auth.json 是已落盘的新 token 孤儿。**新版顺序略
-            //     变**:之前是 write → UPDATE 同 tx;现在是 helper write(物理文件 IO,
-            //     非 PG)→ commitCodexRebindInTx UPDATE → tx COMMIT。物理文件 IO 之前
-            //     与之后整体语义不变,孤儿 auth.json 行为同 v1.0.72 注释)
-            //   - 持锁的 60s remote PUT 风险 v1.0.115 出现过:但当时是
-            //     internalCodexTokenRefresh burst,acquire 路径单容器单流不重复;
-            //     accept 同型权衡
-            const picked = await pickCodexAccountForBindingInTx(client, String(containerId), { groupId: desiredGroupId });
-            if (!picked) {
-              throw new Error(
-                `codex pool empty during lazy migrate for container ${containerId}`,
-              );
-            }
-            const codexContainerDir =
-              process.env.OC_V3_CODEX_CONTAINER_DIR?.trim() || DEFAULT_V3_CODEX_CONTAINER_DIR;
-            // v1.0.72 host 路由由 helper 内部决定(完全同 selfHostId / host_uuid / putRemote
-            // 三选一逻辑,见 codexLazyMigrate.fetchSnapshotAndWriteContainerAuth);
-            // 远端 helper 未注入抛错 → tx ROLLBACK,与之前行为一致。
-            const writeAuthDeps: WriteAuthDeps = {
-              selfHostId: v3DepsForCodex?.selfHostId ?? null,
-              containerUid: V3_AGENT_UID,
-              containerGid: V3_AGENT_GID,
-              codexContainerDir,
-              putRemoteCodexAuth: v3DepsForCodex?.putRemoteCodexAuth,
-            };
-            // 用 client 传入 helper → 走 in-tx snapshot,**不**申请第二个 PG client
-            // (避免 burst 时撑大 pool 占用)。
-            await fetchSnapshotAndWriteContainerAuth({
-              accountId: picked.account_id,
-              containerId,
-              hostUuidUnderLock: row.host_uuid,
-              deps: writeAuthDeps,
-              client,
-            });
-            // FOR UPDATE 持锁内 UPDATE,COMMIT 时一同落盘。失败 → tx 抛出 → ROLLBACK
-            // (写入的 auth.json 是孤儿,由 stopAndRemoveV3Container / volume gc / 同
-            //  containerId 重 provision 覆盖兜底,与 v3supervisor provision 路径同处理)
-            await commitCodexRebindInTx(client, containerId, picked.account_id);
-            return { kind: "active", account_id: picked.account_id };
-          });
-          if (result === null) return null;
-          if (result.kind === "stale") {
-            // tx 已 commit:row.state 已落 vanished。**必须 await** 把 docker 实体清掉
-            // 再返错,否则容器名 oc-v3-u<uid> 是 per-uid 固定,旧实体没 rm 时下条
-            // message 触发 ensureRunning 会撞 docker NameConflict 被卡几秒重试,体
-            // 验上不"自愈"。await 失败也 throw stale(下次 ensureRunning 仍会自己
-            // try stop/remove 旧名字兜底,与今天 orphanReconcile 路径一致),但日志
-            // 留 warn 便于诊断。
-            try {
-              await stopAndRemoveV3Container(v3DepsForCodex!, {
-                id: containerId,
-                container_internal_id: result.containerInternalId,
-                host_uuid: result.hostUuid,
-              });
-            } catch (err) {
-              rootLogger.warn(
-                "[commercial] codex stale recycle: stopAndRemoveV3Container failed (continuing — ensureRunning will retry on next message)",
-                {
-                  containerId,
-                  err: (err as Error)?.message ?? String(err),
-                },
-              );
-            }
-            throw new ContainerStaleBindingError(containerId);
-          }
-          // tx 已 commit;现在尝试占 in-process per-account slot。Busy → 抛 AccountPoolBusyError
-          // (bridge 转 CODEX_POOL_BUSY)。lazy migrate 已落盘不会回滚,Busy 只影响本 turn。
-          const slotId = scheduler.acquireCodexSlot(result.account_id);
-          return { account_id: result.account_id, slotId };
-        },
-        release(account_id: bigint, slotId: string): void {
-          try { scheduler.releaseCodexSlot(account_id, slotId); } catch { /* */ }
-        },
-      }
-    : undefined;
 
   const userChatBridge: UserChatBridgeHandler = createUserChatBridge({
     jwtSecret,
@@ -2949,17 +2152,9 @@ export async function registerCommercial(
       const session = await getClientSession(sessionId, MASTER_USER_PREFIX + uid.toString());
       return session?.messages ?? null;
     },
-    // plan v3 G5/G7 — codex per-account 并发槽 / lazy migrate / 严格单飞 handle。
-    // v3Deps 未注入(测试 mock)→ undefined,bridge 退化为透传不做并发管控(测试默认行为)。
-    codexBinding,
-    createCodexRoute: createCommercialCodexRoute,
-    expireCodexRoute: async (token) => {
-      await expireCodexRouteContext(token);
-    },
-    // PR2 v1.0.66 — codex 真扣费三件套:bridge 内部走 preCheckWithCost / startInflightJournal
-    //   / settleUsageAndLedger 一条龙。pgPool / preCheckRedis / pricing 都是进程级 singleton,
-    //   注入即用。createUserChatBridge entry 已强校验"三件套全有或全无",partial 注入会 throw,
-    //   防生产配错让 codex 免费。codexBinding 已注 → 三件套必须全注(见 createUserChatBridge)。
+    // PR2 v1.0.66 — 真扣费三件套(pgPool / preCheckRedis / pricing 进程级 singleton)。
+    //   createUserChatBridge entry 已强校验"三件套全有或全无",partial 注入会 throw。
+    //   (v5 ccb-only:codex billing/route/binding 已删,此处仅保留标准计费依赖。)
     pgPool: getPool(),
     preCheckRedis,
     pricing,
@@ -3009,24 +2204,7 @@ export async function registerCommercial(
     refreshEventsSweeper = startRefreshEventsSweeper();
   }
 
-  // plan G2/G4 — codex token refresh actor(commercial 单进程独占,60s tick,unref)。
-  // 扫 codex 账号 → 提前 15min refresh → 持锁逐容器写 per-container auth.json。
-  // 永不写 master 文件 / legacy 共享 dir。详见 codexAccountActor.ts 头注。
-  let codexRefreshActor: CodexRefreshActorHandle | undefined;
-  if (controlPlaneEnabled && process.env.COMMERCIAL_CODEX_REFRESH_ACTOR_DISABLED !== "1") {
-    const codexContainerDir =
-      process.env.OC_V3_CODEX_CONTAINER_DIR?.trim() || DEFAULT_V3_CODEX_CONTAINER_DIR;
-    // v1.0.72 多机:把 v3Deps 上的 putRemoteCodexAuth helper(已含
-    // getHostById → hostRowToTarget → finally psk.fill(0) 三件套)透传给 actor,
-    // actor 自己不持密钥 buffer,泄密面与 lazy migrate / provision 完全一致。
-    codexRefreshActor = startCodexRefreshActor({
-      codexContainerDir,
-      containerUid: V3_AGENT_UID,
-      containerGid: V3_AGENT_GID,
-      selfHostId: v3Deps?.selfHostId ?? null,
-      writeRemoteFn: v3Deps?.putRemoteCodexAuth,
-    });
-  }
+  // (v5 ccb-only:codex token refresh actor 已随 codex 全栈一并移除。)
 
   // 账号池 cooldown 半开恢复 actor —— 周期扫 cooldown_until 已过期的账号 → active。
   // 默认 5min tick(下限 1s 防 typo)。
@@ -3117,12 +2295,10 @@ export async function registerCommercial(
   if (containerEventsWorker) enabledSchedulers.push("containerEvents");
   if (alertScheduler) enabledSchedulers.push("alert");
   if (refreshEventsSweeper) enabledSchedulers.push("refreshEventsSweep");
-  if (codexRefreshActor) enabledSchedulers.push("codexRefresh");
   if (cooldownRecoveryActor) enabledSchedulers.push("cooldownRecovery");
   if (pendingOrdersExpirer) enabledSchedulers.push("pendingOrdersExpirer");
   if (accountSlotReaper) enabledSchedulers.push("accountSlotReaper");
   if (finalizeJournalReconciler) enabledSchedulers.push("finalizeReconciler");
-  if (codexDriftReconciler) enabledSchedulers.push("codexDriftReconciler");
   if (onboardingScheduler) enabledSchedulers.push("onboarding");
   if (inboxEmailScheduler) enabledSchedulers.push("inboxEmail");
   if (wechatBroker) enabledSchedulers.push("wechatBroker");
@@ -3207,9 +2383,6 @@ export async function registerCommercial(
       if (refreshEventsSweeper) {
         try { refreshEventsSweeper.stop(); } catch { /* ignore */ }
       }
-      if (codexRefreshActor) {
-        try { codexRefreshActor.stop(); } catch { /* ignore */ }
-      }
       if (cooldownRecoveryActor) {
         try { cooldownRecoveryActor.stop(); } catch { /* ignore */ }
       }
@@ -3221,9 +2394,6 @@ export async function registerCommercial(
       }
       if (finalizeJournalReconciler) {
         try { finalizeJournalReconciler.stop(); } catch { /* ignore */ }
-      }
-      if (codexDriftReconciler) {
-        try { codexDriftReconciler.stop(); } catch { /* ignore */ }
       }
       if (onboardingScheduler) {
         try { onboardingScheduler.stop(); } catch { /* ignore */ }
