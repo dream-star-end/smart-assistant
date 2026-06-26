@@ -97,6 +97,18 @@ export const V3_GATEWAY_IP = "172.30.0.1";
 /** 同上注释 — master 自身用,容器 env 的 per-host 版本由 supervisor 计算。 */
 export const V3_INTERNAL_PROXY_URL = "http://172.30.0.1:18791";
 
+// P1d v5 容器网络 channel 化:v5 容器落 openclaude-v5-net(172.31/16),egress 走 v5 自己的
+// 内部代理(172.31.0.1:18792),与 v3(172.30/172.30.0.1:18791)物理隔离。v3 取值不变。
+function ocSubnetPrefixForChannel(): string {
+  return getRuntimeChannel() === "v5" ? "172.31" : "172.30";
+}
+function ocGatewayIpForChannel(): string {
+  return getRuntimeChannel() === "v5" ? "172.31.0.1" : V3_GATEWAY_IP;
+}
+function ocInternalProxyPortForChannel(): number {
+  return getRuntimeChannel() === "v5" ? 18792 : 18791;
+}
+
 /**
  * 从 v3 docker bridge CIDR 推该 host 的 bridge gateway IP。
  *
@@ -979,7 +991,8 @@ function defaultPickRandomIp(): string {
   const third = Math.floor(Math.random() * 256);
   const fourth = V3_IP_OCTET_MIN + Math.floor(Math.random() * (V3_IP_OCTET_MAX - V3_IP_OCTET_MIN + 1));
   // 极小概率撞到 .0.1 网关:third=0 && fourth=1。fourth 起点 >= 10,绝不会
-  return `172.30.${third}.${fourth}`;
+  // P1d:v5 → 172.31 段(openclaude-v5-net),v3 → 172.30(不变)。
+  return `${ocSubnetPrefixForChannel()}.${third}.${fourth}`;
 }
 
 /** 32-byte random → 64 hex(默认实现) */
@@ -1728,14 +1741,15 @@ export async function provisionV3Container(
     if (typeof bridgeCidr === "string" && bridgeCidr.length > 0) {
       hostGatewayIp = gatewayIpFromV3Cidr(bridgeCidr);
     } else if (!useRemote) {
-      hostGatewayIp = V3_GATEWAY_IP;
+      // P1d:v5 本地 → 172.31.0.1(v5-net 网关);v3 → 172.30.0.1(不变)。
+      hostGatewayIp = ocGatewayIpForChannel();
     } else {
       throw new SupervisorError(
         "InvalidArgument",
         `remote host ${hostId} requires bridgeCidr; got ${bridgeCidr === null ? "null" : "undefined"}`,
       );
     }
-    const internalProxyUrl = `http://${hostGatewayIp}:18791`;
+    const internalProxyUrl = `http://${hostGatewayIp}:${ocInternalProxyPortForChannel()}`;
 
     const env: string[] = [
       `ANTHROPIC_BASE_URL=${internalProxyUrl}`,
