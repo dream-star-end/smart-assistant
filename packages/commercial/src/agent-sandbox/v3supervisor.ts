@@ -55,6 +55,7 @@ import { mkdir as fsMkdir, chown as fsChown, chmod as fsChmod } from "node:fs/pr
 import { isAbsolute as pathIsAbsolute, join as pathJoin, normalize as pathNormalize, sep as pathSep } from "node:path";
 import type { Pool, PoolClient } from "pg";
 import type { ContainerService, ContainerSpec } from "../compute-pool/containerService.js";
+import { RUNTIME_CHANNEL_LABEL_KEY } from "../compute-pool/containerService.js";
 import { AgentAppError } from "../compute-pool/nodeAgentClient.js";
 import { listAllHosts as defaultListAllHosts } from "../compute-pool/queries.js";
 import type { ComputeHostRow } from "../compute-pool/types.js";
@@ -1236,6 +1237,8 @@ async function ensureSingleV3Volume(
     Labels: {
       [V3_MANAGED_LABEL_KEY]: "1",
       [V3_UID_LABEL_KEY]: String(uid),
+      // P1a:卷也盖 runtime_channel(v5 卷名已是 oc-v5-*,label 再标 channel 便于 GC/审计按 channel 过滤)。
+      [RUNTIME_CHANNEL_LABEL_KEY]: getRuntimeChannel(),
     },
   });
   const info = await docker.getVolume(name).inspect();
@@ -2089,6 +2092,9 @@ export async function provisionV3Container(
           Labels: {
             [V3_MANAGED_LABEL_KEY]: "1",
             [V3_UID_LABEL_KEY]: String(uid),
+            // P1a:self-host 直建路径也盖 runtime_channel(否则 v5 容器无 label →
+            // orphanReconcile 误把它当 v3 处理。network/IP channel 化须与 pickIp 配套,留 P1b/P1d)。
+            [RUNTIME_CHANNEL_LABEL_KEY]: getRuntimeChannel(),
           },
           AttachStdin: false,
           AttachStdout: false,
