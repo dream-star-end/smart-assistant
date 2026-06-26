@@ -674,7 +674,7 @@ export interface V3SupervisorDeps {
   /**
    * v1.0.106 — 测试钩子:覆盖 `listAllHosts`(P1 远端 GC 路由用)。
    *
-   * `removeV3Volume` 在多 host 场景下需要把 5 个 volume 在所有 ready/draining
+   * `removeV3Volume` 在多 host 场景下需要把 4 个 volume 在所有 ready/draining
    * host 上 fan-out 删一遍(banned/no-login user 已无 active 容器,无法定位
    * 权威 host;fan-out 是最可靠的兜底)。生产留空走 `queries.listAllHosts`,
    * 测试可注入 fake 列表精确控制 host 维度。
@@ -744,7 +744,7 @@ export function v3VolumeNameFor(uid: number): string {
  * uid → CCB projects(session JSONL)持久化 volume 名。`oc-v3-proj-u<uid>`。
  *
  * 独立于主 volume,专用于 `/run/oc/claude-config/projects` 挂载点。
- * 主 volume 死了这个也要一起死(GC / reconcile 成对操作),全 5 volume 生命周期绑定。
+ * 主 volume 死了这个也要一起死(GC / reconcile 成对操作),全 4 volume 生命周期绑定。
  */
 export function v3ProjectsVolumeNameFor(uid: number): string {
   if (!Number.isInteger(uid) || uid <= 0) {
@@ -776,13 +776,13 @@ export function v3UserConfigVolumeNameFor(uid: number): string {
 }
 
 /**
- * 5 volume 名的打包返回值(D2 持久化方案)。
+ * 4 volume 名的打包返回值(D2 持久化方案;v5 ccb-only 已移除 codex 卷)。
  *
  * 历史:v1.0.0 ~ 1.0.27 只有 data 一个 volume → v1.0.28 加 projects 成 V3VolumePair
  * → v1.0.105 (D2) 加 codex / userLocal / userConfig 凑齐用户级持久化全套
  * (Boss 要求"在容器里像普通 Linux 一样装 MCP / 插件 / pip / npm 不丢")。
  *
- * 5 个 volume 生命周期严格绑定:ensureV3Volumes 一起建,removeV3Volume 一起删。
+ * 4 个 volume 生命周期严格绑定:ensureV3Volumes 一起建,removeV3Volume 一起删。
  * 任一 volume 创建失败直接抛,不尝试部分接管。
  */
 export interface V3VolumeBundle {

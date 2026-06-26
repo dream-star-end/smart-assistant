@@ -300,11 +300,12 @@ describe("openclaude-runtime entrypoint env-scrub policy", () => {
       /provider:\s*"claude-subscription"/,
       "entrypoint must not seed Claude subscription provider for default commercial agents",
     );
-    for (const id of ["main", "researcher", "scientist", "coder", "reviewer", "codex"]) {
+    // v5 ccb-only:不再 seed codex agent。
+    for (const id of ["main", "researcher", "scientist", "coder", "reviewer"]) {
       assert.match(src, new RegExp(`id:\\s*"${id}"`), `entrypoint must seed ${id} agent`);
     }
     // 2026-06-16 boss 重配:按角色多样化(WS2)。researcher=MiniMax-M3、scientist/reviewer=deepseek-v4-pro、
-    // coder=glm-5.1(=DEFAULT)、main/codex 不变。
+    // coder=glm-5.1(=DEFAULT)、main 不变。
     assert.match(
       src,
       /const COMMERCIAL_RESEARCHER_MODEL\s*=\s*"MiniMax-M3"/,
@@ -337,8 +338,13 @@ describe("openclaude-runtime entrypoint env-scrub policy", () => {
     );
     assert.match(
       src,
-      /const desiredSeedAgents\s*=\s*\[\.\.\.desiredCollaborationSeedAgents,\s*desiredCodexAgent\]/,
-      "initial agents.yaml should contain collaboration seed agents plus the canonical codex agent",
+      /const desiredSeedAgents\s*=\s*\[\.\.\.desiredCollaborationSeedAgents\]/,
+      "v5 ccb-only: initial agents.yaml should contain only the collaboration seed agents (no codex)",
+    );
+    assert.doesNotMatch(
+      src,
+      /provider:\s*"codex-native"/,
+      "v5 ccb-only: entrypoint must not seed any codex-native agent",
     );
   });
 
@@ -453,18 +459,22 @@ describe("openclaude-runtime entrypoint env-scrub policy", () => {
     }
   });
 
-  test("entrypoint.ts keeps the canonical codex agent as the only GPT seed", () => {
+  test("entrypoint.ts seeds no codex/gpt agent (v5 ccb-only)", () => {
     const src = readFileSync(ENTRYPOINT_TS_PATH, "utf-8");
-    assert.match(src, /const COMMERCIAL_CODEX_MODEL\s*=\s*"gpt-5\.5"/);
-    assert.match(
+    assert.doesNotMatch(
       src,
-      /const desiredCodexAgent\s*=\s*\{[\s\S]*id:\s*"codex"[\s\S]*model:\s*COMMERCIAL_CODEX_MODEL[\s\S]*provider:\s*"codex-native"[\s\S]*runnerKind:\s*"app-server"[\s\S]*\}/,
-      "gpt-5.5 must remain bound to canonical id='codex' with app-server runner",
+      /const desiredCodexAgent\s*=/,
+      "v5 ccb-only: entrypoint must not define a codex seed agent",
     );
     assert.doesNotMatch(
       src,
-      /id:\s*"(?!codex")[^"]+"[\s\S]{0,160}provider:\s*"codex-native"/,
-      "entrypoint must not seed extra codex-native agents with non-canonical ids",
+      /const COMMERCIAL_CODEX_MODEL\s*=/,
+      "v5 ccb-only: entrypoint must not define the gpt-5.5 codex model const",
+    );
+    assert.doesNotMatch(
+      src,
+      /provider:\s*"codex-native"/,
+      "v5 ccb-only: entrypoint must not seed any codex-native agent",
     );
   });
 

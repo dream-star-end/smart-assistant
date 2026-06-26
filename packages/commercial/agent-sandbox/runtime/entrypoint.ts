@@ -120,14 +120,13 @@ const COMMERCIAL_DEFAULT_PROVIDER = "ark";
 //   - researcher → MiniMax-M3(512k 吃长文献;思考模型;不变)
 //   - scientist / reviewer → deepseek-v4-pro(分析 + 异构复核;edge 稳端点;不变)
 //   - coder → glm-5.2 / 火山 Coding Plan(2026-06-17 由 glm-5.1 升级,glm-5.1 退 picker)
-//   - codex → gpt-5.5(不变)
+//   (v5 ccb-only:codex/gpt-5.5 seed agent 已移除)
 const COMMERCIAL_RESEARCHER_MODEL = "MiniMax-M3";
 const COMMERCIAL_RESEARCHER_PROVIDER = "minimax";
 const COMMERCIAL_CODER_MODEL = "glm-5.2";
 const COMMERCIAL_CODER_PROVIDER = "ark";
 const COMMERCIAL_DEEPSEEK_PRO_MODEL = "deepseek-v4-pro";
 const COMMERCIAL_DEEPSEEK_PRO_PROVIDER = "deepseek";
-const COMMERCIAL_CODEX_MODEL = "gpt-5.5";
 
 // Retired MCP server — id retained only so upsertPlatformMcpIntegrations can
 // strip stale platform-owned entries from existing user volumes. Browser is now
@@ -508,18 +507,16 @@ try {
 
   // 个人版 SessionManager 也需要 agents.yaml 才能解析 opts.agent。两件事:
   //
-  //   (a) volume 空 → bootstrap 商业版 seed agents + 固定 id `codex` + 两个团队
+  //   (a) volume 空 → bootstrap 商业版 seed agents(v5 ccb-only:main/researcher/
+  //       scientist/coder/reviewer + 两个团队,不再 seed codex agent)
   //   (b) volume 已有 yaml(用户/旧版镜像写过)→ merge 平台 seed:
-  //       - 保留用户自建 agent,但规范化 main/researcher/scientist/coder/reviewer/codex 这些平台保留 id
-  //       - 修复 main 被旧配置污染成 gpt-5.5/codex-native 导致前端出现两个 GPT 5.5
-  //       - 缺少 science_research_team/programming_team → append;旧默认形态 → 迁移为 codex 队长
+  //       - 保留用户自建 agent,但规范化 main/researcher/scientist/coder/reviewer 这些平台保留 id
+  //       - 缺少 science_research_team/programming_team → append;旧 codex 队长默认形态 → 迁移为 main 队长
   //       - 解析失败 → 备份原文件到 .bak.<rand>,重新写一份平台 seed yaml
   //
   // **安全边界放在后端 canUseModel + inferAgentForModel(fail-closed),agents.yaml
-  // 不当权限系统**。这里 merge 的目的只是确保默认商业版 agent 不再落到不可用 Claude,
-  // 同时保证 `id:codex` agent 一定存在 + 配置正确,让 SessionManager 路由 gpt-5.5
-  // 时能找到 runnerKind:'app-server' 的目标。用户哪怕手改 yaml 加了别的 codex agent,
-  // 后端 canUseModel 不放行也无意义。
+  // 不当权限系统**。这里 merge 的目的只是确保默认商业版 agent 不再落到不可用 Claude。
+  // (v5 ccb-only:gpt-* 被 inferAgentForModel fail-closed 拒绝,不再有 codex runner。)
   const agentsPath = join(ocConfigDir, "agents.yaml");
 
   function ensureAgentPersona(
@@ -914,9 +911,9 @@ try {
     "科研分析师",
     "代码工程师",
     "审阅员",
-    "GPT 5.5 (Codex)",
+    // v5 ccb-only:不再 seed codex agent,但保留这条遗留 display 识别串,
+    // 让旧版镜像把 main 污染成 GPT 5.5 默认显示的容器在 merge 时被规范化回 ccb。
     "GPT 5.5 (default)",
-    "GPT 5.5 队长",
   ]);
 
   const LEGACY_RESEARCHER_TOOLSETS = [
@@ -993,16 +990,7 @@ try {
     return patched ? next : null;
   }
 
-  // 期望的 codex agent 配置 —— 固定 GPT 5.5 的唯一 seed 入口。
-  const desiredCodexAgent = {
-    id: "codex",
-    model: COMMERCIAL_CODEX_MODEL,
-    permissionMode: "bypassPermissions",
-    provider: "codex-native",
-    runnerKind: "app-server",
-    displayName: "GPT 5.5 队长",
-    avatarEmoji: "🤖",
-  };
+  // (v5 ccb-only:codex/gpt-5.5 seed agent 已移除 —— 不再 seed codex agent。)
 
   const desiredMainAgent = {
     id: "main",
@@ -1085,7 +1073,7 @@ try {
     desiredCoderAgent,
     desiredReviewerAgent,
   ];
-  const desiredSeedAgents = [...desiredCollaborationSeedAgents, desiredCodexAgent];
+  const desiredSeedAgents = [...desiredCollaborationSeedAgents];
 
   const desiredScienceTeam = {
     id: "science_research_team",

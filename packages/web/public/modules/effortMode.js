@@ -9,11 +9,7 @@
 //    (high / max)。后端口径见 api-docs.deepseek.com/guides/anthropic_api:
 //    `output_config.effort` 支持 high/max;low/medium 自动映射 high,xhigh 映射 max。
 //    我们前端不暴露 deepseek 的 xhigh/low/medium,避免给用户"伪选项"。
-//  - 2026-05-25 v1.0.200 加 gpt-5.5 (codex provider) 接入 — 覆盖 low/medium/high/xhigh
-//    四档。后端透传到 codex CLI 的 `-c model_reasoning_effort=...`(实测合法值
-//    none/minimal/low/medium/high/xhigh)。`max` 在后端 helper
-//    `codexReasoningEffortConfig` 显式映射 xhigh,前端不暴露 max(同 DeepSeek 模式,
-//    避免给用户"伪选项")。
+//  - (v5 ccb-only:gpt-5.5 (codex) 思考深度接入已随 codex 全栈下线移除。)
 //  - 2026-06-17 加 火山方舟 glm-5.1/glm-5.2(智谱)接入 — 同 DeepSeek 暴露 high/max
 //    两档(默认 max)。后端权威白名单 = protocol staticKeyProviders ark
 //    `allowedOutputConfigEfforts=['high','max']`,master proxy 据此清洗 output_config.effort
@@ -56,11 +52,7 @@ function isDeepseekModel(modelId) {
   // 不放过未来未声明的 deepseek 变体。
   return /^deepseek-v4-(flash|pro)$/i.test(modelId || '')
 }
-function isCodexModel(modelId) {
-  // exact-match `gpt-5.5`(与 server.ts ALLOWED_INBOUND_MODELS 一致)。
-  // 后续若有 gpt-5.5-codex 等 alias 接入,改这里集中扩展。
-  return /^gpt-5\.5$/i.test(modelId || '')
-}
+// (v5 ccb-only:isCodexModel / gpt-5.5 思考深度分支已移除。)
 function isGlmModel(modelId) {
   // exact-match glm-5.1/glm-5.2(与 protocol staticKeyProviders ark matchesRoute 一致,
   // 大小写不敏感)。火山方舟 glm 思考深度同 DeepSeek 暴露 high/max 两档(boss 2026-06-17)。
@@ -82,16 +74,7 @@ const DEEPSEEK_OPTIONS = [
   { value: 'max', label: '最高', hint: '深度推理(默认)' },
 ]
 
-// gpt-5.5 (codex) 暴露四档,与 codex CLI 接受值集合的子集对齐
-// (none/minimal 不暴露 — 用户角度"低"已是最低有意义档位)。
-// `max` 不暴露:后端 helper 会把任意上游 max payload 映射 xhigh,但前端避免
-// "伪选项",同 DeepSeek 模式。默认 medium(对齐 codex CLI 自身默认)。
-const CODEX_OPTIONS = [
-  { value: 'low', label: '低', hint: '快速响应' },
-  { value: 'medium', label: '中', hint: '均衡(默认)' },
-  { value: 'high', label: '高', hint: '更彻底' },
-  { value: 'xhigh', label: '更高', hint: '深度推理(token 消耗显著上升)' },
-]
+// (v5 ccb-only:CODEX_OPTIONS / gpt-5.5 思考深度档位已移除。)
 
 // 火山方舟 glm-5.1/glm-5.2 思考深度:产品暴露 高/最高 两档(boss 2026-06-17)。
 // 后端权威白名单 = protocol staticKeyProviders ark `allowedOutputConfigEfforts=['high','max']`,
@@ -105,18 +88,16 @@ const GLM_OPTIONS = [
  *  不支持思考深度选择的 model 返回空数组(由 `shouldShowEffortControl` 隐藏控件)。 */
 function getEffortOptionsForModel(modelId) {
   if (isDeepseekModel(modelId)) return DEEPSEEK_OPTIONS
-  if (isCodexModel(modelId)) return CODEX_OPTIONS
   if (isGlmModel(modelId)) return GLM_OPTIONS
   if (isOpus47Model(modelId)) return OPUS_47_OPTIONS
   return []
 }
 
 /** 该 model 在该会话冷启动 / store 缺失时的默认档位。
- *  2026-06-16 boss 决策:可调思考等级的模型默认拉满(最高),gpt-5.5(codex) 例外用中等。
+ *  2026-06-16 boss 决策:可调思考等级的模型默认拉满(最高)。
  *  注意 getEffortForSubmit 永远显式带 effort(缺省即取本默认),故改这里即真正改变下发档位。 */
 function getDefaultEffortForModel(modelId) {
   if (isDeepseekModel(modelId)) return 'max'
-  if (isCodexModel(modelId)) return 'medium' // gpt-5.5:boss 指定默认中等
   if (isGlmModel(modelId)) return 'max' // 火山 glm:默认最高(显式,不依赖下方 fallback)
   return 'max' // Opus 4.7 等可调思考模型:默认最高
 }
@@ -132,7 +113,6 @@ export function modelSupportsExtraEffort(modelId) {
   return (
     isOpus47Model(modelId) ||
     isDeepseekModel(modelId) ||
-    isCodexModel(modelId) ||
     isGlmModel(modelId)
   )
 }
@@ -426,7 +406,7 @@ function labelForCurrent() {
 }
 
 /** 模块级:上次渲染菜单 DOM 时用的 options 集合 key。
- *  Opus 5 档 / Codex 4 档 / DeepSeek 2 档 / GLM 2 档之间切换时必须重建 DOM,不能复用旧 DOM。
+ *  Opus 5 档 / DeepSeek 2 档 / GLM 2 档之间切换时必须重建 DOM,不能复用旧 DOM。
  *  2026-06-17:GLM 与 DeepSeek 的 values 都是 "high,max"(撞车),故 key **纳入 label+hint**
  *  (根治原注释预警的"values 相同但文案不同→stale DOM"风险):文案全同则复用 DOM(无害),
  *  任一档 label/hint 不同则重建。 */

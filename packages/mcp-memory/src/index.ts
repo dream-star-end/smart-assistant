@@ -398,8 +398,6 @@ const TOOLS = [
       '- 并行分发多个研究/分析任务',
       '- 需要隔离上下文的子任务',
       '',
-      '提示:需要让 GPT-5.5/Codex 参与时,传 `agentId="codex"`;也可直接用 `ask_gpt55_codex`。',
-      '',
       '限制: 最大递归深度 3 层,最大并发 5 个。',
     ].join('\n'),
     inputSchema: {
@@ -418,35 +416,7 @@ const TOOLS = [
       required: ['goal'],
     },
   },
-  // ── Direct GPT-5.5 / Codex bridge ──
-  {
-    name: 'ask_gpt55_codex',
-    description: [
-      '直接调用系统内置的 GPT-5.5 / Codex agent 并等待结果返回。',
-      '',
-      '适用场景:',
-      '- 当前主模型是 DeepSeek/Claude Code(CC),但需要 GPT-5.5/Codex 做代码审查、复杂推理或第二意见。',
-      '- 用户明确要求“让 codex / gpt-5.5 看一下”。',
-      '- 你需要同步拿到 GPT-5.5 的输出后再继续整合回答。',
-      '',
-      '等价于 `delegate_task(agentId="codex", ...)`,但无需记住 agentId。',
-      '限制: 仍受委派最大递归深度 3 层、并发 5 个限制。',
-    ].join('\n'),
-    inputSchema: {
-      type: 'object',
-      properties: {
-        goal: { type: 'string', description: '要交给 GPT-5.5/Codex 完成的问题或任务' },
-        context: { type: 'string', description: '必要上下文,如代码片段、报错、你的初步判断等' },
-        toolsets: {
-          type: 'array',
-          items: { type: 'string' },
-          description:
-            '可选:为 Codex 额外授予的平台工具集名。通常无需指定 —— 系统会按任务意图自动挂载;只能授予平台已配置的工具集,填错会被忽略而非报错。',
-        },
-      },
-      required: ['goal'],
-    },
-  },
+  // (v5 ccb-only:ask_gpt55_codex direct bridge 已移除 —— 无 codex agent。)
 ]
 
 // Draft-only skill proposal tool. Exposed ONLY inside a skill-training session
@@ -529,8 +499,6 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
         return await handleSendToAgent(args as any)
       case 'delegate_task':
         return await handleDelegateTask(args as any)
-      case 'ask_gpt55_codex':
-        return await handleAskGpt55Codex(args as any)
       default:
         return { content: [{ type: 'text', text: `unknown tool: ${name}` }], isError: true }
     }
@@ -1129,14 +1097,7 @@ async function handleDelegateTask(args: {
   })
 }
 
-async function handleAskGpt55Codex(args: { goal: string; context?: string; toolsets?: string[] }) {
-  return handleDelegateTaskToAgent('codex', {
-    goal: args.goal,
-    context: args.context,
-    toolsets: args.toolsets,
-    label: 'codex / GPT-5.5',
-  })
-}
+// (v5 ccb-only:handleAskGpt55Codex 已移除 —— 无 codex agent。)
 
 /**
  * The captain's HTTP client must wait strictly longer than the gateway's

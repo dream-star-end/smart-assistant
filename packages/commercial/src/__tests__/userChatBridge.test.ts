@@ -845,29 +845,8 @@ describe("userChatBridge — model authorization", () => {
     }
   });
 
-  test("inbound.message 仅带 agentId='codex' 不带 model 且未授权 → 仍被拦(round-2 finding 1)", async () => {
-    // 这是 Codex review v2 finding 1 修复的核心:agentId='codex' 隐含 gpt-5.5,
-    // 即便不带 model 也必须按 gpt-5.5 校验,否则未授权用户可以用纯 agentId 帧绕过 authz。
-    const allowed = new Set<string>(["claude-opus-4-7"]);
-    const rig = await startRig({
-      loadAllowedModelChecker: async () => (id: string) => allowed.has(id),
-    });
-    try {
-      const token = await makeJwt("201");
-      const ws = openClient(rig.gatewayPort, token);
-      await new Promise<void>((r) => ws.once("open", () => r()));
-
-      const errFrameP = waitMessage(ws);
-      const closeP = waitClose(ws);
-      ws.send(JSON.stringify({ type: "inbound.message", agentId: "codex" }));
-      const err = await errFrameP;
-      assert.match(err.data.toString(), /UNAUTHORIZED_MODEL/);
-      const closed = await closeP;
-      assert.equal(closed.code, CLOSE_BRIDGE.POLICY);
-    } finally {
-      await stopRig(rig);
-    }
-  });
+  // (v5 ccb-only:agentId='codex' 隐含 gpt-5.5 的 authz 用例已随 codex agent +
+  //  AGENT_AUTHZ_IMPLIED_MODEL codex 条目一并移除。)
 
   test("inbound.message 带 claude-* model 且授权 → 透传到容器", async () => {
     // 普通 claude 帧路径不应受 round-2 修改影响。

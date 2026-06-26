@@ -52,13 +52,7 @@ const COMMERCIAL_FALLBACK_AGENTS = Object.freeze([
     model: 'deepseek-v4-pro',
     provider: 'deepseek',
   },
-  {
-    id: 'codex',
-    displayName: 'GPT 5.5 队长',
-    avatarEmoji: '🤖',
-    model: 'gpt-5.5',
-    provider: 'codex-native',
-  },
+  // v5 ccb-only:不再 fallback codex/gpt-5.5 agent。
 ])
 
 function _mergeCommercialFallbackAgents(agents = []) {
