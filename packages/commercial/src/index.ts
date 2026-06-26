@@ -719,19 +719,21 @@ export async function registerCommercial(
   const controlPlaneEnabled =
     runtimeChannel === "v5" ? false : process.env.COMMERCIAL_CONTROL_PLANE_DISABLED !== "1";
 
-  // v5 follower(P0)硬约束 —— fail-closed,早于一切共享-state 副作用(auto-migrate /
-  // compute-pool / baseline / image-promote / wechat broker / 容器 lifecycle 都在下面)。
-  // 关键认知(Codex 评审):"v5 不设某 env" 是配置、不是安全边界。容器/agent 运行时与
-  // 微信 broker 一旦被误设的 env 触发,会 fire-and-forget 写共享 compute-pool / wechat_outbox /
-  // session / 账号池 —— 必须在代码层、副作用之前硬拦,而不是指望 env 配对。
+  // v5 follower 硬约束 —— fail-closed,早于一切共享-state 副作用。
+  // P1d 起:v5 容器隔离已就位(runtime_channel 贯穿 writer/reader/sweeper/docker label/name/
+  // volume/network + 复合唯一索引 + v5-net 172.31 + v5 内部代理),故 v5 合法使用 v3-supervisor
+  // 容器路径(OC_RUNTIME_IMAGE)——不再是 offender。仍硬拦下列会写共享现网的危险 env:
+  //   - AGENT_IMAGE:legacy agent 路径(v5 不走;会起 lifecycle scheduler 写共享)
+  //   - WECHAT_BROKER_ENABLED=1:渠道 broker 写共享 outbox/session
+  // (compute-pool 写仍由 OC_IMAGE_DISTRIBUTE_DISABLED=1 + 无 COMPUTE_POOL_SELF_HOST_UUID 挡;
+  //  控制面 sweeper 仍由 controlPlaneEnabled=false + 各 *_DISABLED + 末尾 enabledSchedulers 不变量挡。)
   if (runtimeChannel === "v5") {
     const offenders: string[] = [];
-    if (process.env.OC_RUNTIME_IMAGE) offenders.push("OC_RUNTIME_IMAGE");
     if (process.env.AGENT_IMAGE) offenders.push("AGENT_IMAGE");
     if (process.env.WECHAT_BROKER_ENABLED === "1") offenders.push("WECHAT_BROKER_ENABLED=1");
     if (offenders.length > 0) {
       throw new Error(
-        `[commercial] v5 follower(P0)禁止容器/渠道副作用(它们会写共享现网),检测到危险 env=[${offenders.join(
+        `[commercial] v5 follower 禁止 legacy/渠道副作用(写共享现网),检测到危险 env=[${offenders.join(
           ",",
         )}],拒启。`,
       );
