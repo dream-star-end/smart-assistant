@@ -133,9 +133,22 @@ after(async () => {
 beforeEach(async () => {
   if (!pgAvailable || !redis) return;
   await query("TRUNCATE TABLE orders, credit_ledger, refresh_tokens, email_verifications, users RESTART IDENTITY CASCADE");
+  // 默认开启充值 —— DEFAULTS=false 是生产 fail-safe,但本套测试假设充值正常工作;
+  // 个别"禁用语义"测试自己在内部 UPDATE 把 flag 改 false。
+  await query(
+    "INSERT INTO system_settings(key, value) VALUES('payment_enabled', 'true'::jsonb) ON CONFLICT(key) DO UPDATE SET value='true'::jsonb, updated_at=NOW()",
+  );
   await redis.flushdb();
   mockNextCreate = null;
 });
+
+/** 把 payment_enabled 切到指定值;测试内部 setup 调用。 */
+async function setPaymentEnabled(enabled: boolean): Promise<void> {
+  await query(
+    "INSERT INTO system_settings(key, value) VALUES('payment_enabled', $1::jsonb) ON CONFLICT(key) DO UPDATE SET value=$1::jsonb, updated_at=NOW()",
+    [enabled ? "true" : "false"],
+  );
+}
 
 function skipIfMissing(t: { skip: (reason: string) => void }): boolean {
   if (!pgAvailable || !redis || !server) { t.skip("pg/redis/server not available"); return true; }
@@ -578,5 +591,93 @@ describe("GET /api/payment/orders/:order_no", () => {
     });
     // route 能匹配但 handler 里 extractOrderNoFromUrl → null → 400
     assert.equal(resp.status, 400);
+  });
+});
+
+// payment_enabled 关闭时:plans / hupi/create 503;callback / orders 不受影响。
+// P0 不变量:已扫码用户的 callback 必须能把订单推 paid + 加积分,否则财务事故。
+describe("payment_enabled feature gate", () => {
+  test("disabled:GET /api/payment/plans 返 503 PAYMENT_DISABLED(未登录)", async (t) => {
+    if (skipIfMissing(t)) return;
+    await setPaymentEnabled(false);
+    const resp = await fetch(`${baseUrl}/api/payment/plans`);
+    assert.equal(resp.status, 503);
+    const json = await resp.json() as { error: { code: string } };
+    assert.equal(json.error.code, "PAYMENT_DISABLED");
+  });
+
+  test("disabled:POST /api/payment/hupi/create 返 503(已登录也拦)", async (t) => {
+    if (skipIfMissing(t)) return;
+    const { token } = await createUserWithToken("gate-create@example.com");
+    await setPaymentEnabled(false);
+    const r = await postJson("/api/payment/hupi/create", { plan_code: "plan-10" }, token);
+    assert.equal(r.status, 503);
+    assert.equal((r.json.error as Record<string, unknown>).code, "PAYMENT_DISABLED");
+  });
+
+  test("disabled:POST /api/payment/hupi/create 未登录也拦(gate 在 requireAuth 之前)", async (t) => {
+    if (skipIfMissing(t)) return;
+    await setPaymentEnabled(false);
+    const r = await postJson("/api/payment/hupi/create", { plan_code: "plan-10" });
+    // 未登录 + disabled:gate 早于 requireAuth,返 503 而不是 401(避免暴露需登录这个事实)
+    assert.equal(r.status, 503);
+    assert.equal((r.json.error as Record<string, unknown>).code, "PAYMENT_DISABLED");
+  });
+
+  test("P0:disabled 时 callback 仍 honor 在途 pending 订单 → paid + credits 到账", async (t) => {
+    if (skipIfMissing(t)) return;
+    const { id: uid } = await createUserWithToken("gate-cb@example.com", 0n);
+    // 先在 enabled 状态创建 pending 订单(模拟用户已扫码,管理员之后关停了充值)
+    const { order } = await (await import("../payment/orders.js")).createPendingOrder({
+      userId: uid, planCode: "plan-100",
+    });
+    await setPaymentEnabled(false);
+    const form: Record<string, string> = {
+      version: "1.1",
+      appid: HUPI_APP_ID,
+      trade_order_id: order.order_no,
+      transaction_id: "WX_TX_GATED",
+      total_fee: "100.00",
+      status: "OD",
+      nonce_str: "yyy",
+      time: "1800000001",
+    };
+    form.hash = signHupijiao(form, HUPI_SECRET);
+    const r = await postForm("/api/payment/hupi/callback", form);
+    assert.equal(r.status, 200);
+    assert.equal(r.text, "success");
+    const o = await query<{ status: string }>(
+      "SELECT status FROM orders WHERE order_no=$1", [order.order_no],
+    );
+    assert.equal(o.rows[0].status, "paid");
+    const u = await query<{ credits: string }>(
+      "SELECT credits::text AS credits FROM users WHERE id=$1", [uid],
+    );
+    assert.equal(u.rows[0].credits, "10500");
+  });
+
+  test("disabled 时 GET /api/payment/orders/:no 属主仍可查(轮询不被打断)", async (t) => {
+    if (skipIfMissing(t)) return;
+    const { id: uid, token } = await createUserWithToken("gate-orders@example.com");
+    const { order } = await (await import("../payment/orders.js")).createPendingOrder({
+      userId: uid, planCode: "plan-10",
+    });
+    await setPaymentEnabled(false);
+    const resp = await fetch(`${baseUrl}/api/payment/orders/${order.order_no}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    assert.equal(resp.status, 200);
+    const json = await resp.json() as { ok: boolean; data: { status: string } };
+    assert.equal(json.data.status, "pending");
+  });
+
+  test("disabled → re-enabled:plans 恢复 200(可一键复活)", async (t) => {
+    if (skipIfMissing(t)) return;
+    await setPaymentEnabled(false);
+    let resp = await fetch(`${baseUrl}/api/payment/plans`);
+    assert.equal(resp.status, 503);
+    await setPaymentEnabled(true);
+    resp = await fetch(`${baseUrl}/api/payment/plans`);
+    assert.equal(resp.status, 200);
   });
 });

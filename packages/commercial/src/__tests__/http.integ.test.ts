@@ -274,6 +274,51 @@ describe("commercial HTTP router (integ)", () => {
     const user = me.json.user as Record<string, unknown>;
     assert.equal(user.email, "alice@example.com");
     assert.equal(user.role, "user");
+    // features.payment_enabled 字段必返(boolean)。本套测试未 seed payment_enabled
+    // → getSystemSetting fallback DEFAULTS=false → false。前端据此决定 pill 显隐。
+    const features = user.features as Record<string, unknown>;
+    assert.ok(features, "user.features must be present");
+    assert.equal(features.payment_enabled, false);
+  });
+
+  test("/api/me features.payment_enabled 跟随 system_settings 切换", async (t) => {
+    if (skipIfMissing(t)) return;
+    const reg = await postJson("/api/auth/register", {
+      email: "features-toggle@example.com",
+      password: "good password please",
+      turnstile_token: "tok",
+    });
+    assert.equal(reg.status, 201, JSON.stringify(reg.json));
+    const login = await postJson("/api/auth/login", {
+      email: "features-toggle@example.com",
+      password: "good password please",
+      turnstile_token: "tok",
+    });
+    const accessToken = login.json.access_token as string;
+
+    // 开关 → true:features.payment_enabled === true
+    await query(
+      `INSERT INTO system_settings(key, value, updated_at)
+       VALUES ('payment_enabled', 'true'::jsonb, NOW())
+       ON CONFLICT (key) DO UPDATE
+         SET value = EXCLUDED.value, updated_at = NOW()`,
+    );
+    let me = await getJson("/api/me", { Authorization: `Bearer ${accessToken}` });
+    let features = (me.json.user as Record<string, unknown>).features as Record<string, unknown>;
+    assert.equal(features.payment_enabled, true);
+
+    // 开关 → false:features.payment_enabled === false
+    await query(
+      `INSERT INTO system_settings(key, value, updated_at)
+       VALUES ('payment_enabled', 'false'::jsonb, NOW())
+       ON CONFLICT (key) DO UPDATE
+         SET value = EXCLUDED.value, updated_at = NOW()`,
+    );
+    me = await getJson("/api/me", { Authorization: `Bearer ${accessToken}` });
+    features = (me.json.user as Record<string, unknown>).features as Record<string, unknown>;
+    assert.equal(features.payment_enabled, false);
+
+    // 后续测试不污染:回写 false(同 DEFAULTS)避免影响其它共享 system_settings 的 case
   });
 
   test("/api/me without token → 401 UNAUTHORIZED + standard error body", async (t) => {

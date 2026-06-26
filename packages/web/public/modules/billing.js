@@ -28,15 +28,15 @@
 //   - 个人版 (master) 不带 commercial 路由 — /api/me 会 404,balance pill 自动保持隐藏。
 //
 // 模块外部接口(在 main.js 的 init 中调一次):
-//   import { initBilling, refreshBalance } from './billing.js?v=c26a43d4'
+//   import { initBilling, refreshBalance } from './billing.js?v=7d920715'
 //   initBilling()        — 一次性 wire 静态 DOM 事件
 //   refreshBalance()     — 拉一次 /api/me,更新 pill;失败静默(commercial 未启用时)
 //                          返回 Promise<{ shown: boolean, credits: string|null }>
 
-import { apiGet, apiJson } from './api.js?v=c26a43d4'
-import { _isMobileUA, htmlSafeEscape } from './dom.js?v=c26a43d4'
-import { closeModal, openModal, toast } from './ui.js?v=c26a43d4'
-import { state } from './state.js?v=c26a43d4'
+import { apiGet, apiJson } from './api.js?v=7d920715'
+import { _isMobileUA, htmlSafeEscape } from './dom.js?v=7d920715'
+import { closeModal, openModal, toast } from './ui.js?v=7d920715'
+import { state } from './state.js?v=7d920715'
 
 // ── 常量 ───────────────────────────────────────────────────────────
 const POLL_INTERVAL_MS = 3000
@@ -57,6 +57,11 @@ const HUPIJIAO_HOST_ALLOW = /(^|\.)xunhupay\.com$|(^|\.)hupijiao\.com$|(^|\.)dpw
 // ── 模块状态 ────────────────────────────────────────────────────────
 let _wired = false
 let _commercialMode = null       // null=unknown, true/false
+// 服务端 system_settings.payment_enabled 的本地快照。fail-safe 默认 false:
+// /api/me 响应缺字段 / 短暂失败 / 后端旧版本无 features.* → 一律视为禁用,
+// 与后端 DEFAULTS=false + ensurePaymentEnabled fail-closed 语义对齐(Codex 反馈)。
+// 仅在显式拿到 user.features.payment_enabled === true 时翻 true。
+let _paymentEnabled = false
 let _pollTimer = null
 let _pollFailures = 0
 let _activeOrderNo = null
@@ -158,7 +163,10 @@ export async function refreshBalance() {
     const user = data?.user || {}
     const credits = user.credits ?? '0'
     _setPillText(formatCredits(credits))
-    _showPill(true)
+    // 显式 === true 才开;字段缺失 / 非 boolean / 旧后端 → false(隐藏 pill),
+    // 与后端 DEFAULTS=false 对齐(Codex 阻塞反馈,拒用 !== false 这种 fail-open 默认)。
+    _paymentEnabled = user?.features?.payment_enabled === true
+    _showPill(_paymentEnabled)
     _commercialMode = true
     // 2026-04-21 安全审计 HIGH#F1:把稳定 user.id 存到 state,changelog_seen /
     // effort_by_agent 等用户级 localStorage 桶改用这个而不是 JWT 末 8 字节
@@ -180,6 +188,7 @@ export async function refreshBalance() {
   } catch (err) {
     // 个人版无此接口;商用版 401 已被 api.js 处理,此处其它失败一律静默。
     _showPill(false)
+    _paymentEnabled = false
     _setAdminLinkVisible(false)
     _setApiKeysLinkVisible(false)
     _setHostAgentEntriesVisible(false)
@@ -578,6 +587,13 @@ export function _openTopupModal(opts = {}) {
     return
   }
   if (opts.force && _commercialMode !== true) _commercialMode = true
+  // payment_enabled gate —— 即便 messages.js 余额不足 CTA 走 force:true 也要拦,
+  // 否则后端 /api/payment/plans 503 加载到模态里只会显示一个尴尬的错误占位。
+  // force 标记仅绕开 _commercialMode 的"个人版未启用 commercial"判定,不能绕开禁用开关。
+  if (!_paymentEnabled) {
+    toast('充值功能暂未开放,请联系管理员', 'error')
+    return
+  }
   _activeOrderNo = null
   _setStage('plans')
   openModal('topup-modal')

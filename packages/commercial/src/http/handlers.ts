@@ -892,6 +892,20 @@ export async function handleMe(
     throw new HttpError(401, "UNAUTHORIZED", "user is not active");
   }
   const u = r.rows[0];
+  // 前端 billing.js 根据 features.payment_enabled 决定 pill 显隐与充值模态行为。
+  // try/catch fail-safe:getSystemSetting 内部对 row 缺失/zod 失败已 fallback DEFAULTS;
+  // 但 query() 自身 PG 抖动会抛,这里兜底为 false —— 既不让 /api/me 因开关读取失败 500
+  // (Codex round 1 反馈),又与 DEFAULTS=false 的 fail-safe 语义一致(开关读不到 = 视为禁用)。
+  let paymentEnabled = false;
+  try {
+    paymentEnabled = (await getSystemSetting("payment_enabled")).value;
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.warn(
+      "[handlers/me] read payment_enabled failed, defaulting to false:",
+      err instanceof Error ? err.message : err,
+    );
+  }
   sendJson(res, 200, {
     user: {
       id: u.id,
@@ -902,6 +916,7 @@ export async function handleMe(
       avatar_url: u.avatar_url,
       credits: u.credits,
       created_at: u.created_at instanceof Date ? u.created_at.toISOString() : u.created_at,
+      features: { payment_enabled: paymentEnabled },
     },
   });
 }

@@ -50,6 +50,23 @@ import type { HupijiaoClient, HupijiaoConfig } from "../payment/hupijiao/client.
 import { HupijiaoError } from "../payment/hupijiao/client.js";
 import { safeEnqueueAlert } from "../admin/alertOutbox.js";
 import { EVENTS } from "../admin/alertEvents.js";
+import { getSystemSetting } from "../admin/systemSettings.js";
+
+/**
+ * 充值总开关读取 —— `payment_enabled=false` 时抛 503 PAYMENT_DISABLED。
+ * 只 gate plans / hupi/create 两个用户主动充值入口;callback 与 orders 查询不调本函数,
+ * 让已在途订单的支付回调能 mark paid、用户能继续查询轮询自己的订单。
+ *
+ * fail-closed:DB row 不存在或 zod 校验失败时 getSystemSetting 已自动 fallback DEFAULTS
+ * (=false),即视为禁用。query() 自身抛(PG 抖动)会冒出去走 500,这种瞬时故障下
+ * 不让新充值创建是更安全的选择(避免在数据库异常时绕过开关)。
+ */
+async function ensurePaymentEnabled(): Promise<void> {
+  const { value: enabled } = await getSystemSetting("payment_enabled");
+  if (!enabled) {
+    throw new HttpError(503, "PAYMENT_DISABLED", "充值功能暂未开放");
+  }
+}
 
 /**
  * 告警:单笔充值金额达到此值(分)→ 发 payment.large_topup。
@@ -136,6 +153,9 @@ export async function handleListPlans(
   ctx: RequestContext,
   deps: CommercialHttpDeps,
 ): Promise<void> {
+  // payment_enabled=false → 503 PAYMENT_DISABLED;前端 billing.js 据此隐藏 pill。
+  // gate 放最前面(在 try-auth 之前):公开端点也要返回 503,匿名探测同样被拦。
+  await ensurePaymentEnabled();
   // try-auth:有 token 解出来用,无 token / 解析失败一律按未登录处理
   // (不抛 401 —— 这是公开端点)
   let userId: string | null = null;
@@ -185,6 +205,10 @@ export async function handleCreateHupi(
   _ctx: RequestContext,
   deps: CommercialHttpDeps,
 ): Promise<void> {
+  // payment_enabled=false → 503 PAYMENT_DISABLED。
+  // gate 在 requireAuth 之前(未登录用户绕过 UI 直接 POST 也得到一致 503,
+  // 而不是先暴露需要登录这个事实)。
+  await ensurePaymentEnabled();
   const user = await requireAuth(req, deps.jwtSecret);
   if (!deps.hupijiao) {
     throw new HttpError(503, "PAYMENT_NOT_READY", "hupijiao client is not configured");

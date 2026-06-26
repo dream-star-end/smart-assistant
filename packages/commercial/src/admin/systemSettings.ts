@@ -121,6 +121,14 @@ export const KEY_SCHEMAS = {
    * < 0.5% 安全)→ enforce。
    */
   session_pin_mode: z.enum(["off", "observe", "enforce"]),
+  /**
+   * 用户充值开关。`false` → `GET /api/payment/plans` 与 `POST /api/payment/hupi/create`
+   * 返 503 `PAYMENT_DISABLED`;`/api/payment/hupi/callback` 与 `GET /api/payment/orders/:order_no`
+   * 不受此 flag 影响 —— 已在途订单的支付回调必须能 mark paid(避免扣款无法到账),
+   * 用户也需能继续轮询自己已下单订单的状态。admin /api/admin/orders* /api/admin/plans*
+   * 同样不受影响(运营面独立)。
+   */
+  payment_enabled: z.boolean(),
 } as const;
 
 export type SystemSettingKey = keyof typeof KEY_SCHEMAS;
@@ -185,6 +193,10 @@ export const DEFAULTS: { [K in SystemSettingKey]: SystemSettingValue<K> } = {
   // v3 反关联根治 — 默认 off,与原 env-only 字段默认一致(零迁移)
   phase6_account_uuid_enforce: "off",
   session_pin_mode: "off",
+  // 默认禁用 —— 新部署/未在 system_settings 显式 enable 的环境一律不开放用户充值。
+  // 重开走 admin UI 或 SQL:`INSERT INTO system_settings(key, value) VALUES('payment_enabled', 'true')
+  // ON CONFLICT (key) DO UPDATE SET value = 'true', updated_at = now();`
+  payment_enabled: false,
 };
 
 /**
@@ -263,6 +275,11 @@ export const KEY_META: Record<
     enumValues: ["off", "observe", "enforce"],
     description:
       "csap chat_session_account_pin 三态调度。灰度 off → observe(只观测打点)→ enforce(锁 sticky;409 让客户端 x-force-repin 重试)",
+  },
+  payment_enabled: {
+    kind: "boolean",
+    description:
+      "用户充值总开关。false → plans/hupi/create 返 503 PAYMENT_DISABLED + 前端隐藏积分 pill;callback / orders 查询不受影响(保住在途订单)",
   },
 };
 
