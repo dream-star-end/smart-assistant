@@ -194,9 +194,14 @@ RUN set -eux; \
 # entrypoint.ts 在 CODEX_HOME 下建 symlink auth.json → /run/oc/codex-auth/auth.json,
 # 后者是 supervisor 把 host 剥离 refresh_token 的 auth.json 目录 ro bind-mount 进来的源。
 # 详见 packages/gateway/src/codexAuthSync.ts + v3supervisor.ts 的 V3_CODEX_AUTH_RO_MOUNT。
-RUN npm install -g @openai/codex@0.137.0 --no-audit --no-fund \
-    && npm cache clean --force \
-    && rm -rf /root/.npm
+# P1d / v5 ccb 单底座:OC_INCLUDE_CODEX=0 → 不装 codex CLI(镜像更小、冷启更快;v5 runner
+# seam 永不走 codex、模型面无 gpt-*,故 codex 二进制对 v5 是纯死重)。v3 默认 1,行为不变。
+ARG OC_INCLUDE_CODEX=1
+RUN if [ "$OC_INCLUDE_CODEX" = "1" ]; then \
+      npm install -g @openai/codex@0.137.0 --no-audit --no-fund \
+      && npm cache clean --force \
+      && rm -rf /root/.npm; \
+    else echo "[v5 ccb-only] skip codex CLI install (OC_INCLUDE_CODEX=0)"; fi
 
 # ------------------------------------------------------------
 # Playwright MCP + Chromium for the oc-browser daemon
@@ -237,7 +242,7 @@ RUN set -eux; \
 #
 # 失败兜底:populate 后的 marker 文件必须存在,否则 build fail(避免发坏镜像)。
 COPY --chown=root:root ./runtime/codex-system-skills/document-writing/SKILL.md /tmp/codex-system-skills/document-writing/
-RUN mkdir -p /tmp/_cx/.codex && \
+RUN if [ "$OC_INCLUDE_CODEX" = "1" ]; then mkdir -p /tmp/_cx/.codex && \
     HOME=/tmp/_cx CODEX_HOME=/tmp/_cx/.codex bash -c '\
       codex app-server --listen stdio:// </dev/null >/dev/null 2>&1 & \
       pid=$!; \
@@ -254,7 +259,8 @@ RUN mkdir -p /tmp/_cx/.codex && \
     cp /tmp/codex-system-skills/document-writing/SKILL.md /opt/codex-system-skills/.system/document-writing/SKILL.md && \
     rm -rf /tmp/_cx && \
     chmod -R a+rX /opt/codex-system-skills && \
-    test -f /opt/codex-system-skills/.system/.codex-system-skills.marker
+    test -f /opt/codex-system-skills/.system/.codex-system-skills.marker; \
+    else echo "[v5 ccb-only] skip codex system skills populate (OC_INCLUDE_CODEX=0)"; fi
 
 # ------------------------------------------------------------
 # 账户 agent (uid=1000)
