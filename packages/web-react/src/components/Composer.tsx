@@ -1,5 +1,6 @@
 import { ArrowUp, FileText, Image as ImageIcon, Loader2, Mic, Plus, Square, X } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { useVoiceInput } from "../hooks/useVoiceInput";
 import type { MediaRef } from "../lib/chat/frames";
 import { cn } from "../lib/utils";
 import { IconButton } from "./ui";
@@ -31,6 +32,7 @@ export function Composer({
   disabled,
   placeholder = "给 OpenClaude 发消息…",
   onUpload,
+  getVoiceToken,
 }: {
   /** 发送：text + 可选已上传媒体（图片/文件等）。 */
   onSend: (text: string, media?: MediaRef[]) => void;
@@ -41,12 +43,28 @@ export function Composer({
   placeholder?: string;
   /** 上传单文件 → MediaRef（demo / 未登录省略 → 附件按钮禁用）。 */
   onUpload?: (file: File) => Promise<MediaRef>;
+  /** 语音输入取 token（demo / 未登录省略 → 麦克风禁用）。 */
+  getVoiceToken?: () => string | null;
 }) {
   const [value, setValue] = useState("");
   const [attachments, setAttachments] = useState<Attach[]>([]);
+  const [voiceMsg, setVoiceMsg] = useState<string | null>(null);
   const ref = useRef<HTMLTextAreaElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
   const idRef = useRef(0);
+
+  const onVoiceText = useCallback((text: string) => {
+    setVoiceMsg(null);
+    setValue((v) => (v.trim() ? `${v.trim()} ${text}` : text));
+    // 回填后聚焦输入框
+    setTimeout(() => ref.current?.focus(), 0);
+  }, []);
+  const onVoiceErr = useCallback((m: string) => {
+    setVoiceMsg(m);
+    setTimeout(() => setVoiceMsg(null), 3000);
+  }, []);
+  const voice = useVoiceInput({ getToken: getVoiceToken, onText: onVoiceText, onError: onVoiceErr });
+  const voiceEnabled = voice.supported && !!getVoiceToken;
 
   useEffect(() => {
     const el = ref.current;
@@ -139,12 +157,19 @@ export function Composer({
             className="max-h-[240px] min-h-[24px] flex-1 resize-none bg-transparent py-2 text-[16px] leading-relaxed text-fg outline-none placeholder:text-faint disabled:opacity-50"
           />
           <IconButton
-            aria-label="语音输入（即将支持）"
-            title="语音输入即将支持"
-            disabled
-            className="mb-0.5"
+            aria-label={voice.state === "recording" ? "停止录音" : "语音输入"}
+            title={voiceEnabled ? (voice.state === "recording" ? "停止录音" : "语音输入") : "语音输入暂不可用"}
+            disabled={!voiceEnabled || disabled || voice.state === "transcribing"}
+            onClick={voice.toggle}
+            className={cn("mb-0.5", voice.state === "recording" && "text-danger")}
           >
-            <Mic size={19} />
+            {voice.state === "transcribing" ? (
+              <Loader2 size={19} className="animate-spin" />
+            ) : voice.state === "recording" ? (
+              <Square size={16} className="fill-current" />
+            ) : (
+              <Mic size={19} />
+            )}
           </IconButton>
           <button
             aria-label={busy ? "停止" : "发送"}
@@ -164,7 +189,19 @@ export function Composer({
         </div>
       </div>
       <p className="py-2 text-center text-xs text-faint">
-        {model ? `${model} · ` : ""}内容由 AI 生成，请注意甄别
+        {voiceMsg ? (
+          <span className="text-danger">{voiceMsg}</span>
+        ) : voice.state === "recording" ? (
+          <span className="text-danger">● 正在录音，点击麦克风停止</span>
+        ) : voice.state === "connecting" ? (
+          "正在打开麦克风…"
+        ) : voice.state === "transcribing" ? (
+          "正在转写…"
+        ) : (
+          <>
+            {model ? `${model} · ` : ""}内容由 AI 生成，请注意甄别
+          </>
+        )}
       </p>
     </div>
   );

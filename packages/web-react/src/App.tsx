@@ -797,6 +797,7 @@ export function App() {
             disabled={gated}
             placeholder={`和「${agent.name}」对话…`}
             onUpload={demo ? undefined : uploadMedia}
+            getVoiceToken={demo ? undefined : () => authRef.current.getToken()}
           />
         </div>
       </main>
