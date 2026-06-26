@@ -54,6 +54,7 @@ function makeEvent(over: Partial<InboundEvent> = {}): InboundEvent {
     contextToken: 'ctx-tok',
     messageId: 'msg-1',
     imageAttachments: [],
+    mediaAttachments: [],
     raw: {},
     ...over,
   }

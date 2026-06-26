@@ -40,7 +40,7 @@ describe("wechat image ingest URL guard", () => {
           headers: new Headers({ location: "https://example.com/redirected" }),
           body: null,
           async arrayBuffer() { return new Uint8Array([1]).buffer; },
-        })) as typeof fetch,
+        })) as unknown as typeof fetch,
       ),
       /host is not allowed/,
     );
@@ -63,7 +63,7 @@ describe("wechat image ingest URL guard", () => {
             async arrayBuffer() { return new Uint8Array([]).buffer; },
           };
         }
-        return new Response(encrypted, {
+        return new Response(new Uint8Array(encrypted), {
           status: 200,
           headers: { "content-length": String(encrypted.length) },
         });
@@ -95,7 +95,7 @@ describe("wechat image ingest save", () => {
             assert.equal(userId, "c:42");
             return { kind: "ok", uid: 42, uploads: dir, generated: join(dir, "generated") };
           },
-          fetchFn: (async () => new Response(encrypted, {
+          fetchFn: (async () => new Response(new Uint8Array(encrypted), {
             status: 200,
             headers: { "content-length": String(encrypted.length) },
           })) as typeof fetch,

@@ -76,7 +76,7 @@ function extractIlinkImageAesKeyHex(image: any, media: any): string | null {
   return null
 }
 
-function normalizeAesKeyHex(input: string | null): string | null {
+function normalizeAesKeyHex(input: string | undefined | null): string | null {
   if (!input || !HEX_AES_KEY_RE.test(input)) return null
   return input.toLowerCase()
 }

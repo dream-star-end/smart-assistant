@@ -20,6 +20,7 @@ import {
   renderAssistantText,
   renderToolAnnouncement,
 } from "../wechat/rendererPipeline.js"
+import type { IlinkTextPart } from "../wechat/types.js"
 
 describe("rendererPipeline.friendlyToolName", () => {
   test("builtin map: Read → 读取文件 etc.", () => {
@@ -171,14 +172,24 @@ describe("rendererPipeline.splitTextForWechatPages", () => {
   })
 })
 
+// renderAssistantText only ever projects markdown into text IlinkParts. This
+// typed pass-through narrows the union so per-part `.text` assertions
+// type-check — pure type narrowing, identical runtime (returns the exact array
+// renderAssistantText produced).
+function renderAssistantTextParts(
+  ...args: Parameters<typeof renderAssistantText>
+): IlinkTextPart[] {
+  return renderAssistantText(...args) as IlinkTextPart[]
+}
+
 describe("rendererPipeline.renderAssistantText", () => {
   test("plain text → single text part", () => {
-    const parts = renderAssistantText("hello world")
+    const parts = renderAssistantTextParts("hello world")
     assert.deepEqual(parts, [{ type: "text", text: "hello world" }])
   })
 
   test("raw UNKNOWN_MODEL API error is rewritten before sending to WeChat", () => {
-    const parts = renderAssistantText(
+    const parts = renderAssistantTextParts(
       `API Error: 400 {"error":{"code":"UNKNOWN_MODEL","message":"model 'claude-opus-4-7' not enabled"},"request_id":"req-secret"}`,
     )
     assert.equal(parts.length, 1)
@@ -187,14 +198,14 @@ describe("rendererPipeline.renderAssistantText", () => {
   })
 
   test("markdown is preserved before splitting", () => {
-    const parts = renderAssistantText("# 标题\n\n**粗** `code`")
+    const parts = renderAssistantTextParts("# 标题\n\n**粗** `code`")
     assert.equal(parts.length, 1)
     assert.equal(parts[0]!.text, "# 标题\n\n**粗** `code`")
   })
 
   test("long text is split into multiple parts honoring WECHAT_MAX_TEXT", () => {
     const long = "a".repeat(WECHAT_MAX_TEXT * 2 + 5)
-    const parts = renderAssistantText(long)
+    const parts = renderAssistantTextParts(long)
     assert.equal(parts.length, 3)
     assert.match(parts[0]!.text, /^（1\/3）\n/)
     assert.match(parts[1]!.text, /^（2\/3）\n/)
@@ -219,14 +230,14 @@ describe("rendererPipeline.renderAssistantText", () => {
 
   test("under-4000 multi-paragraph Markdown stays as one bubble", () => {
     const md = `# 标题\n\n- a\n- b\n\n| A | B |\n| - | - |\n| 1 | 2 |`
-    const parts = renderAssistantText(md)
+    const parts = renderAssistantTextParts(md)
     assert.equal(parts.length, 1)
     assert.equal(parts[0]!.text, md)
   })
 
   test("fenced code block stays intact across logical chunking when possible", () => {
     const md = `${"a".repeat(3980)}\n\n` + "```ts\nconst x = 1\n```\n\n尾巴"
-    const parts = renderAssistantText(md)
+    const parts = renderAssistantTextParts(md)
     assert.equal(parts.length, 2)
     assert.match(parts[0]!.text, /^（1\/2）\n/)
     assert.match(parts[1]!.text, /^（2\/2）\n```ts\nconst x = 1\n```\n\n尾巴$/)

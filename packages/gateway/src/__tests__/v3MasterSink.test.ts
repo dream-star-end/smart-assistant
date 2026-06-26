@@ -333,6 +333,7 @@ describe("attemptSend — body cap shrink", () => {
       isError: false,
       durationMs: 1,
       ts: 1_000_000,
+      arrivedAt: 1_000_000,
     };
   }
 
@@ -435,6 +436,7 @@ describe("attemptSend — body cap shrink", () => {
       isError: false,
       durationMs: 1,
       ts: 1_000_000,
+      arrivedAt: 1_000_000,
     };
   }
 

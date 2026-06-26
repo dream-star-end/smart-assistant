@@ -35,7 +35,7 @@ import { Readable } from "node:stream";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { Pool } from "pg";
 
-import { createCommercialHandler } from "../http/router.js";
+import { createCommercialHandler, type CommercialHandler } from "../http/router.js";
 import type { CommercialHttpDeps } from "../http/handlers.js";
 import { makeAnthropicProxyHandler } from "../http/anthropicProxy.js";
 import { makeApiKeyIdentityStrategy } from "../auth/apiKeyIdentity.js";
@@ -419,7 +419,7 @@ class MockRes {
 
 interface Harness {
   fp: FakePoolHandle;
-  handler: (req: IncomingMessage, res: ServerResponse) => Promise<void>;
+  handler: CommercialHandler;
   jwtFor(userId: string, role?: "admin" | "user"): Promise<string>;
 }
 

@@ -24,6 +24,7 @@ import {
   CcbMessageParser,
   type SessionStreamEvent,
 } from '../ccbMessageParser.js'
+import type { SdkMessage } from '../subprocessRunner.js'
 
 function createParser() {
   const events: SessionStreamEvent[] = []
@@ -46,7 +47,7 @@ const textDelta = (text: string) =>
       type: 'content_block_delta',
       delta: { type: 'text_delta', text },
     },
-  }) as unknown as Record<string, unknown>
+  }) as unknown as SdkMessage
 
 const thinkingDelta = (thinking: string) =>
   ({
@@ -55,7 +56,7 @@ const thinkingDelta = (thinking: string) =>
       type: 'content_block_delta',
       delta: { type: 'thinking_delta', thinking },
     },
-  }) as unknown as Record<string, unknown>
+  }) as unknown as SdkMessage
 
 const toolUseStart = (blockId: string, name: string) =>
   ({
@@ -65,7 +66,7 @@ const toolUseStart = (blockId: string, name: string) =>
       index: 0,
       content_block: { type: 'tool_use', id: blockId, name },
     },
-  }) as unknown as Record<string, unknown>
+  }) as unknown as SdkMessage
 
 function textBlocks(events: SessionStreamEvent[]) {
   return events
@@ -211,7 +212,7 @@ describe('Fix B: tool arrivedAt (card appearance time, not result completion)', 
           },
         ],
       },
-    } as unknown as Record<string, unknown>
+    } as unknown as SdkMessage
   }
 
   function makeToolUseAssistantSnapshot(toolUseId: string, name: string) {
@@ -221,7 +222,7 @@ describe('Fix B: tool arrivedAt (card appearance time, not result completion)', 
         role: 'assistant',
         content: [{ type: 'tool_use', id: toolUseId, name, input: {} }],
       },
-    } as unknown as Record<string, unknown>
+    } as unknown as SdkMessage
   }
 
   it('completedTools[].arrivedAt is the tool_use first-observation time, distinct from ts (tool_result arrival)', async () => {

@@ -185,6 +185,7 @@ export function makeIlinkSendAdapter(opts: MakeIlinkSendAdapterOptions = {}): Se
     toUserId: string
     contextToken: string
     text: string
+    clientId?: string
   }): Promise<SendResult> => {
     try {
       const body = await send(params.botToken, params.toUserId, params.contextToken, params.text, {

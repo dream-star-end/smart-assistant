@@ -119,7 +119,7 @@ function buildAttachment(
   kind: WechatMediaKind,
   rawType: number,
   media: Record<string, unknown>,
-  fields: Omit<Partial<WechatMediaAttachment>, 'kind' | 'fullUrl' | 'rawType'> & {
+  fields: Omit<Partial<WechatMediaAttachment>, 'kind' | 'fullUrl' | 'rawType' | 'aesKeyHex'> & {
     aesKeyHex?: string | null
   },
 ): WechatMediaAttachment | null {

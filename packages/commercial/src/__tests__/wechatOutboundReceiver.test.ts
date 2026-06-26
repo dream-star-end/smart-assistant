@@ -36,6 +36,7 @@ import {
 import type { ContainerIdentityRepo } from "../auth/containerIdentity.js"
 import type { RateLimiter } from "../wechat/rateLimiter.js"
 import type { EnqueueOutcome } from "../wechat/outboxStore.js"
+import type { IlinkTextPart } from "../wechat/types.js"
 
 // ─── fixtures ──────────────────────────────────────────────────────────────
 
@@ -901,22 +902,33 @@ describe("outboundReceiver — trust boundary", () => {
 
 // ─── renderWechatBlocks pure function ──────────────────────────────────────
 
+// Every case in this block feeds only text/tool_use/tool_result/thinking/goal/
+// tool_output_tail blocks, which renderWechatBlocks always projects to text
+// IlinkParts. This typed pass-through narrows the union so per-part `.text`
+// assertions type-check — it is a pure type narrowing with identical runtime
+// behaviour (it returns the exact object renderWechatBlocks produced).
+function renderTextBlocks(
+  ...args: Parameters<typeof renderWechatBlocks>
+): { parts: IlinkTextPart[]; dropped: number } {
+  return renderWechatBlocks(...args) as { parts: IlinkTextPart[]; dropped: number }
+}
+
 describe("renderWechatBlocks pure function", () => {
   test("text block → 1 text IlinkPart (under 4000)", () => {
-    const r = renderWechatBlocks([{ kind: "text", text: "hello world" }])
+    const r = renderTextBlocks([{ kind: "text", text: "hello world" }])
     assert.equal(r.parts.length, 1)
     assert.deepEqual(r.parts[0], { type: "text", text: "hello world" })
     assert.equal(r.dropped, 0)
   })
 
   test("text block with markdown is preserved for WeChat/iLink rendering", () => {
-    const r = renderWechatBlocks([{ kind: "text", text: "**bold** `code`" }])
+    const r = renderTextBlocks([{ kind: "text", text: "**bold** `code`" }])
     assert.equal(r.parts.length, 1)
     assert.equal(r.parts[0]!.text, "**bold** `code`")
   })
 
   test("raw UNKNOWN_MODEL API errors are rewritten for WeChat", () => {
-    const r = renderWechatBlocks([
+    const r = renderTextBlocks([
       {
         kind: "text",
         text: `API Error: 400 {"error":{"code":"UNKNOWN_MODEL","message":"model 'claude-opus-4-7' not enabled"},"request_id":"req-secret"}`,
@@ -929,14 +941,14 @@ describe("renderWechatBlocks pure function", () => {
 
   test("text block > 4000 chars splits into multiple parts", () => {
     const long = "a".repeat(8050)
-    const r = renderWechatBlocks([{ kind: "text", text: long }])
+    const r = renderTextBlocks([{ kind: "text", text: long }])
     assert.equal(r.parts.length, 3)
     assert.match(r.parts[0]!.text, /^（1\/3）\n/)
     assert.ok(r.parts.every((part) => part.text.length <= 4000))
   })
 
   test("consecutive text blocks are coalesced into one WeChat bubble", () => {
-    const r = renderWechatBlocks([
+    const r = renderTextBlocks([
       { kind: "text", text: "你好" },
       { kind: "text", text: "!" },
       { kind: "text", text: "有什么" },
@@ -947,7 +959,7 @@ describe("renderWechatBlocks pure function", () => {
   })
 
   test("coalesced long text still splits into WeChat pages", () => {
-    const r = renderWechatBlocks([
+    const r = renderTextBlocks([
       { kind: "text", text: "a".repeat(2300) },
       { kind: "text", text: "b".repeat(2300) },
     ])
@@ -961,13 +973,13 @@ describe("renderWechatBlocks pure function", () => {
   })
 
   test("tool_use block → tool announcement (single text part)", () => {
-    const r = renderWechatBlocks([{ kind: "tool_use", toolName: "Read" }])
+    const r = renderTextBlocks([{ kind: "tool_use", toolName: "Read" }])
     assert.equal(r.parts.length, 1)
     assert.match(r.parts[0]!.text, /读取文件/)
   })
 
   test("Bash tool_use shows the concrete command", () => {
-    const r = renderWechatBlocks([
+    const r = renderTextBlocks([
       { kind: "tool_use", toolName: "Bash", inputJson: { command: "ls -la /tmp" } },
     ])
     assert.equal(r.parts.length, 1)
@@ -976,7 +988,7 @@ describe("renderWechatBlocks pure function", () => {
   })
 
   test("tool_use falls back to JSON inputPreview details", () => {
-    const r = renderWechatBlocks([
+    const r = renderTextBlocks([
       {
         kind: "tool_use",
         toolName: "mcp__demo__custom_tool",
@@ -989,7 +1001,7 @@ describe("renderWechatBlocks pure function", () => {
   })
 
   test("tool_use detail is capped for WeChat", () => {
-    const r = renderWechatBlocks([
+    const r = renderTextBlocks([
       { kind: "tool_use", toolName: "Bash", inputJson: { command: "a".repeat(500) } },
     ])
     assert.equal(r.parts.length, 1)
@@ -998,7 +1010,7 @@ describe("renderWechatBlocks pure function", () => {
   })
 
   test("tool_use announcement can be hidden by user preference", () => {
-    const r = renderWechatBlocks([
+    const r = renderTextBlocks([
       { kind: "text", text: "查询中。" },
       { kind: "tool_use", toolName: "Bash", inputJson: { command: "pwd" } },
       { kind: "text", text: "完成。" },
@@ -1008,13 +1020,13 @@ describe("renderWechatBlocks pure function", () => {
   })
 
   test("tool_result block → dropped (P1)", () => {
-    const r = renderWechatBlocks([{ kind: "tool_result", toolName: "Read", isError: false }])
+    const r = renderTextBlocks([{ kind: "tool_result", toolName: "Read", isError: false }])
     assert.equal(r.parts.length, 0)
     assert.equal(r.dropped, 1)
   })
 
   test("thinking blocks → coalesced detailed process transcript", () => {
-    const r = renderWechatBlocks([
+    const r = renderTextBlocks([
       { kind: "thinking", text: "reasoning" },
       { kind: "thinking", text: " with\nsteps" },
       { kind: "text", text: "答案" },
@@ -1026,7 +1038,7 @@ describe("renderWechatBlocks pure function", () => {
   })
 
   test("thinking transcript is not truncated at the old 800-char preview cap", () => {
-    const r = renderWechatBlocks([{ kind: "thinking", text: "a".repeat(900) }])
+    const r = renderTextBlocks([{ kind: "thinking", text: "a".repeat(900) }])
     assert.equal(r.parts.length, 1)
     assert.match(r.parts[0]!.text, /^💭 思考过程：\n/)
     assert.ok(r.parts[0]!.text.length > 900)
@@ -1034,13 +1046,13 @@ describe("renderWechatBlocks pure function", () => {
   })
 
   test("very long thinking transcript is split by renderer instead of preview-truncated", () => {
-    const r = renderWechatBlocks([{ kind: "thinking", text: "a".repeat(4500) }])
+    const r = renderTextBlocks([{ kind: "thinking", text: "a".repeat(4500) }])
     assert.ok(r.parts.length >= 2)
     assert.ok(r.parts.every((p) => p.type === "text" && p.text.includes("a")))
   })
 
   test("thinking process can be hidden by user preference", () => {
-    const r = renderWechatBlocks([
+    const r = renderTextBlocks([
       { kind: "thinking", text: "reasoning..." },
       { kind: "text", text: "done" },
     ], { showToolCalls: false })
@@ -1049,7 +1061,7 @@ describe("renderWechatBlocks pure function", () => {
   })
 
   test("goal block renders a top-level Codex goal update", () => {
-    const r = renderWechatBlocks([
+    const r = renderTextBlocks([
       {
         kind: "goal",
         objective: "adapt goals",
@@ -1069,14 +1081,14 @@ describe("renderWechatBlocks pure function", () => {
   })
 
   test("cleared goal block renders a clear notice and ignores tool-call preference", () => {
-    const r = renderWechatBlocks([{ kind: "goal", cleared: true }], { showToolCalls: false })
+    const r = renderTextBlocks([{ kind: "goal", cleared: true }], { showToolCalls: false })
     assert.equal(r.parts.length, 1)
     assert.match((r.parts[0] as { type: "text"; text: string }).text, /已清除/)
     assert.equal(r.dropped, 0)
   })
 
   test("tool_output_tail block → dropped (P1)", () => {
-    const r = renderWechatBlocks([
+    const r = renderTextBlocks([
       { kind: "tool_output_tail", toolUseBlockId: "blk-1", tail: "...", totalBytes: 100, truncatedHead: false },
     ])
     assert.equal(r.parts.length, 0)
@@ -1084,7 +1096,7 @@ describe("renderWechatBlocks pure function", () => {
   })
 
   test("parentToolUseId set → block dropped regardless of kind", () => {
-    const r = renderWechatBlocks([
+    const r = renderTextBlocks([
       { kind: "text", text: "from subagent", parentToolUseId: "agent-1" },
       { kind: "tool_use", toolName: "Bash", parentToolUseId: "agent-1" },
       { kind: "goal", objective: "child goal", parentToolUseId: "agent-1" },
@@ -1094,14 +1106,14 @@ describe("renderWechatBlocks pure function", () => {
   })
 
   test("markdown syntax-only text is preserved instead of dropped", () => {
-    const r = renderWechatBlocks([{ kind: "text", text: "---\n```\n```\n" }])
+    const r = renderTextBlocks([{ kind: "text", text: "---\n```\n```\n" }])
     assert.equal(r.parts.length, 1)
     assert.equal(r.parts[0]!.text, "---\n```\n```")
     assert.equal(r.dropped, 0)
   })
 
   test("mixed blocks: text + tool_use + thinking + parentToolUseId text → 3 parts (text + announcement + thinking)", () => {
-    const r = renderWechatBlocks([
+    const r = renderTextBlocks([
       { kind: "text", text: "I'll help" },
       { kind: "tool_use", toolName: "Grep" },
       { kind: "thinking", text: "internal" },
@@ -1115,7 +1127,7 @@ describe("renderWechatBlocks pure function", () => {
   })
 
   test("empty blocks array → empty result (caller decides empty_render)", () => {
-    const r = renderWechatBlocks([])
+    const r = renderTextBlocks([])
     assert.equal(r.parts.length, 0)
     assert.equal(r.dropped, 0)
   })

@@ -1267,7 +1267,7 @@ describe("invariant 4 — DeepSeek (pick=null) noop set + 反向 claude 锚定",
 
     assert.ok(upstreamHeaders, "fetch 必须被调用");
     assert.equal(
-      upstreamHeaders!.authorization,
+      (upstreamHeaders as Record<string, string>).authorization,
       "Bearer DS-SECRET-KEY",
       "Authorization 必须用 deepseekApiKey",
     );
@@ -1328,7 +1328,7 @@ describe("invariant 4 — DeepSeek (pick=null) noop set + 反向 claude 锚定",
     });
 
     assert.ok(upstreamHeaders);
-    const beta = upstreamHeaders!["anthropic-beta"] ?? "";
+    const beta = (upstreamHeaders as Record<string, string>)["anthropic-beta"] ?? "";
     const tokens = beta.split(",").map((s) => s.trim());
     assert.ok(
       tokens.includes("oauth-2025-04-20"),

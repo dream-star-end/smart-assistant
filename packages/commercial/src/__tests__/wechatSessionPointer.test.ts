@@ -18,6 +18,7 @@ import {
   listRunningSessions,
   RECONCILE_GRACE_MS_DEFAULT,
   type PgConn,
+  type PgRunner,
 } from "../wechat/sessionPointer.js"
 import { WECHAT_SESSION_ID_REGEX, isWechatSessionId } from "../wechat/types.js"
 
@@ -201,7 +202,7 @@ describe("wechat sessionPointer.getCurrentSessionPointer", () => {
   test("falls back to legacy pointer read before current_agent_id migration lands", async () => {
     const captured: { sql: string; params: ReadonlyArray<unknown> }[] = []
     const conn: PgConn = {
-      query: async (sql: string, params: ReadonlyArray<unknown> = []) => {
+      query: (async (sql: string, params: ReadonlyArray<unknown> = []) => {
         captured.push({ sql, params })
         if (captured.length === 1) {
           const err = new Error('column "current_agent_id" does not exist') as Error & { code: string; column: string }
@@ -210,7 +211,7 @@ describe("wechat sessionPointer.getCurrentSessionPointer", () => {
           throw err
         }
         return { rows: [{ current_session_id: "wsess-0123456789abcdef" }], rowCount: 1 }
-      },
+      }) as PgRunner["query"],
     }
     const pointer = await getCurrentSessionPointer(conn, "u1")
     assert.deepEqual(pointer, { sessionId: "wsess-0123456789abcdef" })
