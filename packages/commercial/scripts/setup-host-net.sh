@@ -206,17 +206,28 @@ main() {
   require_root
   require_cmd docker
 
-  # SETUP_NET_ONLY=1:只建/校验 docker 网络(ICC=false 容器横向隔离),跳过 ufw/iptables
-  #   egress 守卫。canary 期 v5 取此模式 —— 与现网 v3 实际姿态对齐(v3 的
-  #   openclaude-v3-host-firewall.service 当前 inactive,主防护靠 PG/Redis loopback 绑定),
-  #   不引入 v3 尚未启用的单向 egress 守卫分歧。完整守卫(全机收口)留作 v3+v5 共同硬化项。
+  # SETUP_NET_ONLY=1:建 docker 网络(ICC=false)+ ufw 放行(subnet→proxy),跳过 iptables
+  #   egress 守卫(V*_EGRESS_IN 链)。
+  #   【为什么必须含 ufw】2026-06-26 实测:本机 ufw active 且 `-P INPUT DROP`,docker 桥
+  #   靠 ufw-before-input 里 `-i br-<bridge> -j ACCEPT`(v3)放行容器→网关。新建的 v5 桥没有
+  #   该放行 → 容器→172.31.0.1:18892(内部代理)被 INPUT DROP(curl 000/ping fail)→ 全部
+  #   turn 卡死在 egress。故必须用 ufw 显式放行 `$SUBNET → $INTERNAL_PROXY_PORT`(按 subnet
+  #   而非桥名,网络 recreate 也稳)。
+  #   【为什么仍跳 iptables 守卫】与现网 v3 实际姿态对齐(v3 的 openclaude-v3-host-firewall
+  #   .service 当前 inactive,主防护靠 PG/Redis loopback 绑定),不引入 v3 尚未启用的单向
+  #   egress 守卫分歧。完整守卫(全机收口)留作 v3+v5 共同硬化项。
   if [ "${SETUP_NET_ONLY:-0}" = "1" ]; then
-    echo "=== [仅网络] 创建 docker bridge 网络 ${NET_NAME} (ICC=false) ==="
+    require_cmd ufw
+    echo "=== [网络+ufw] 创建 docker bridge 网络 ${NET_NAME} (ICC=false) ==="
     ensure_network
     echo ""
-    echo "=== Done (net-only) ==="
+    echo "=== 配置 ufw 入向规则 (容器 → internal proxy ${INTERNAL_PROXY_PORT}) ==="
+    ensure_ufw_rule
+    echo ""
+    echo "=== Done (net + ufw, 跳过 iptables egress 守卫) ==="
     echo "网络: ${NET_NAME} (${SUBNET}, gateway ${GATEWAY}, IPv6 disabled, ICC disabled)"
-    echo "[跳过] ufw / iptables egress 守卫 (SETUP_NET_ONLY=1)"
+    echo "ufw: ${SUBNET} → ${GATEWAY}:${INTERNAL_PROXY_PORT} 已放行"
+    echo "[跳过] iptables ${V3_HOST_GUARD_CHAIN} egress 守卫 (SETUP_NET_ONLY=1)"
     return
   fi
 
