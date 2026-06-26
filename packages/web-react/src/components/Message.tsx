@@ -3,7 +3,6 @@ import { useState } from "react";
 import type { Message as MessageT, ToolCard as ToolCardT } from "../lib/types";
 import { Markdown } from "./Markdown";
 import { Avatar, IconButton } from "./ui";
-import { ToolCard } from "./ToolCard";
 
 function CopyBtn({ text }: { text: string }) {
   const [done, setDone] = useState(false);
@@ -40,11 +39,15 @@ export function UserMessage({ content }: { content: string }) {
 export function AssistantMessage({
   message,
   streaming,
-  toolCards,
   onRegenerate,
 }: {
   message: MessageT;
   streaming?: boolean;
+  /**
+   * 历史 demo 占位 prop（App.tsx 仍传入，恒为 []）。真实工具卡走 P5 的 MessageRenderer
+   * + components/ToolCard.tsx（新契约 `tool` 对象），不再经此 demo 通道，故此处保留类型
+   * 以兼容 App.tsx 调用点但不渲染。
+   */
   toolCards?: ToolCardT[];
   /** 提供时在该条助手消息下显示「重新生成」（重发上一轮）。仅最后一条传入。 */
   onRegenerate?: () => void;
@@ -55,7 +58,6 @@ export function AssistantMessage({
         <Sparkles size={16} />
       </Avatar>
       <div className="min-w-0 flex-1">
-        {toolCards?.map((c) => <ToolCard key={c.id} card={c} />)}
         {message.content ? (
           <Markdown>{message.content}</Markdown>
         ) : streaming ? (

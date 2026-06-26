@@ -1,0 +1,261 @@
+/**
+ * 工具图标 / 标签 / 摘要的解析层（Aurora 视觉，功能基线对齐现网
+ * `_TOOL_ICONS` / `_TOOL_LABELS` / `_MCP_SERVER_META` / `_MCP_OP_META` / `_toolSummary`）。
+ *
+ * v5 无 codex —— **不实现** `codex:<type>` 与 `Codex:multiAgent` 的图标/标签/摘要。
+ * 图标统一走 lucide-react（Aurora 设计系统的图标权威源），不再内联 SVG 字符串。
+ */
+import {
+  AppWindow,
+  Archive,
+  BarChart3,
+  Bot,
+  Brain,
+  Camera,
+  Clock,
+  Eye,
+  FilePlus,
+  FileText,
+  FolderOpen,
+  FormInput,
+  Globe,
+  Image as ImageIcon,
+  Keyboard,
+  ListChecks,
+  Mic,
+  MousePointer2,
+  Music,
+  NotebookPen,
+  Pencil,
+  Search,
+  Send,
+  Sparkles,
+  Terminal,
+  Video,
+  Wrench,
+  type LucideIcon,
+} from "lucide-react";
+import { asArr, asStr, shortPath } from "./format";
+
+export type ToolMeta = { icon: LucideIcon; label: string };
+
+// ── builtin claude-code 工具 ──
+const TOOL_META: Record<string, ToolMeta> = {
+  Bash: { icon: Terminal, label: "终端" },
+  Read: { icon: FileText, label: "读取文件" },
+  Edit: { icon: Pencil, label: "编辑文件" },
+  Write: { icon: FilePlus, label: "写入文件" },
+  Grep: { icon: Search, label: "搜索内容" },
+  Glob: { icon: FolderOpen, label: "搜索文件" },
+  WebFetch: { icon: Globe, label: "网页抓取" },
+  WebSearch: { icon: Globe, label: "网页搜索" },
+  TodoWrite: { icon: ListChecks, label: "任务列表" },
+  NotebookEdit: { icon: NotebookPen, label: "笔记本" },
+  Task: { icon: Bot, label: "子任务" },
+  Agent: { icon: Bot, label: "子任务" },
+};
+
+// ── MCP server 前缀 → 友好 meta（图标 + 基础标签）──
+// 工具名形如 `mcp__<server>__<op>`，先按 server 分类，再按 op 细化。
+const MCP_SERVER_META: Record<string, ToolMeta> = {
+  browser: { icon: AppWindow, label: "浏览器" },
+  "minimax-media": { icon: Sparkles, label: "媒体生成" },
+  "minimax-vision": { icon: Eye, label: "视觉理解" },
+  "openclaude-vision": { icon: Eye, label: "视觉理解" },
+  "openclaude-memory": { icon: Brain, label: "记忆" },
+  "scansci-pdf": { icon: FileText, label: "论文检索" },
+  "quant-system": { icon: BarChart3, label: "量化" },
+};
+
+// ── per-op 覆盖（server 作用域），给更贴切的图标 + 标签 ──
+const MCP_OP_META: Record<string, ToolMeta> = {
+  // browser
+  "browser:browser_navigate": { icon: Globe, label: "打开网页" },
+  "browser:browser_navigate_back": { icon: Globe, label: "后退" },
+  "browser:browser_take_screenshot": { icon: Camera, label: "截图" },
+  "browser:browser_snapshot": { icon: AppWindow, label: "页面快照" },
+  "browser:browser_click": { icon: MousePointer2, label: "点击" },
+  "browser:browser_type": { icon: Keyboard, label: "输入文本" },
+  "browser:browser_fill_form": { icon: FormInput, label: "填写表单" },
+  "browser:browser_press_key": { icon: Keyboard, label: "按键" },
+  "browser:browser_select_option": { icon: FormInput, label: "选择选项" },
+  "browser:browser_evaluate": { icon: Terminal, label: "执行脚本" },
+  "browser:browser_run_code": { icon: Terminal, label: "执行代码" },
+  "browser:browser_wait_for": { icon: Clock, label: "等待" },
+  "browser:browser_close": { icon: AppWindow, label: "关闭浏览器" },
+  "browser:browser_tabs": { icon: AppWindow, label: "标签页" },
+  "browser:browser_console_messages": { icon: Terminal, label: "控制台" },
+  "browser:browser_network_requests": { icon: Globe, label: "网络请求" },
+  "browser:browser_pdf_save": { icon: FileText, label: "保存 PDF" },
+  "browser:browser_resize": { icon: AppWindow, label: "调整窗口" },
+  "browser:browser_hover": { icon: MousePointer2, label: "悬停" },
+  "browser:browser_drag": { icon: MousePointer2, label: "拖拽" },
+  "browser:browser_file_upload": { icon: FilePlus, label: "上传文件" },
+  "browser:browser_handle_dialog": { icon: AppWindow, label: "处理弹窗" },
+  // minimax-media
+  "minimax-media:text_to_image": { icon: ImageIcon, label: "生成图片" },
+  "minimax-media:generate_video": { icon: Video, label: "生成视频" },
+  "minimax-media:query_video_generation": { icon: Video, label: "查询视频" },
+  "minimax-media:music_generation": { icon: Music, label: "生成音乐" },
+  "minimax-media:text_to_audio": { icon: Mic, label: "语音合成" },
+  "minimax-media:voice_clone": { icon: Mic, label: "克隆音色" },
+  "minimax-media:voice_design": { icon: Mic, label: "设计音色" },
+  "minimax-media:list_voices": { icon: Mic, label: "音色列表" },
+  "minimax-media:play_audio": { icon: Music, label: "播放音频" },
+  // vision
+  "minimax-vision:understand_image": { icon: Eye, label: "图片理解" },
+  "minimax-vision:web_search": { icon: Globe, label: "联网搜索" },
+  "openclaude-vision:understand_image": { icon: Eye, label: "图片理解" },
+  // memory
+  "openclaude-memory:memory": { icon: Brain, label: "核心记忆" },
+  "openclaude-memory:archival_add": { icon: Archive, label: "归档写入" },
+  "openclaude-memory:archival_search": { icon: Archive, label: "归档检索" },
+  "openclaude-memory:archival_delete": { icon: Archive, label: "归档删除" },
+  "openclaude-memory:session_search": { icon: Search, label: "历史检索" },
+  "openclaude-memory:create_reminder": { icon: Clock, label: "创建提醒" },
+  "openclaude-memory:delegate_task": { icon: Bot, label: "委托子任务" },
+  "openclaude-memory:send_to_agent": { icon: Send, label: "发送给子 Agent" },
+  "openclaude-memory:skill_list": { icon: Sparkles, label: "技能列表" },
+  "openclaude-memory:skill_view": { icon: Sparkles, label: "查看技能" },
+  "openclaude-memory:skill_save": { icon: Sparkles, label: "保存技能" },
+  "openclaude-memory:skill_delete": { icon: Sparkles, label: "删除技能" },
+  // scansci-pdf
+  "scansci-pdf:scansci_pdf_download": { icon: FileText, label: "下载论文 PDF" },
+  "scansci-pdf:scansci_pdf_batch_download": { icon: FilePlus, label: "批量下载论文" },
+  "scansci-pdf:scansci_pdf_search": { icon: Search, label: "搜索论文" },
+  "scansci-pdf:scansci_pdf_citation": { icon: FileText, label: "生成引用" },
+  "scansci-pdf:scansci_pdf_health_check": { icon: ListChecks, label: "论文源健康检查" },
+  "scansci-pdf:scansci_pdf_network_diagnose": { icon: Globe, label: "论文网络诊断" },
+  "scansci-pdf:scansci_pdf_source_scores": { icon: BarChart3, label: "论文源评分" },
+  "scansci-pdf:scansci_pdf_vpnsci_status": { icon: AppWindow, label: "机构登录状态" },
+  "scansci-pdf:scansci_pdf_vpnsci_login": { icon: AppWindow, label: "机构登录" },
+  "scansci-pdf:scansci_pdf_vpnsci_test": { icon: AppWindow, label: "测试机构访问" },
+  "scansci-pdf:scansci_pdf_parse_list": { icon: FileText, label: "解析论文列表" },
+  "scansci-pdf:scansci_pdf_resolve_and_download": { icon: FilePlus, label: "解析并下载" },
+};
+
+/** 解析 `mcp__<server>__<op>` → { server, op }；非 MCP 名返回 null。 */
+export function parseMcpName(name: string): { server: string; op: string } | null {
+  if (typeof name !== "string" || !name.startsWith("mcp__")) return null;
+  const rest = name.slice(5);
+  const idx = rest.indexOf("__");
+  if (idx < 0) return { server: rest, op: "" };
+  return { server: rest.slice(0, idx), op: rest.slice(idx + 2) };
+}
+
+/** snake_case op → 友好标签（`browser_navigate` → `browser navigate`）。 */
+export function humanizeOp(op: string): string {
+  return (op || "").replace(/_/g, " ").trim();
+}
+
+/**
+ * 为工具名解析图标 + 标签（处理 MCP 名）。
+ * 优先级：builtin > MCP per-op > MCP server 兜底 > 通用扳手。
+ */
+export function resolveToolMeta(name: string): ToolMeta {
+  if (TOOL_META[name]) return TOOL_META[name];
+  const mcp = parseMcpName(name);
+  if (mcp) {
+    const opMeta = MCP_OP_META[`${mcp.server}:${mcp.op}`];
+    if (opMeta) return opMeta;
+    const srvMeta = MCP_SERVER_META[mcp.server];
+    const opLabel = humanizeOp(mcp.op) || mcp.server;
+    if (srvMeta) return { icon: srvMeta.icon, label: `${srvMeta.label}: ${opLabel}` };
+    return { icon: Wrench, label: opLabel };
+  }
+  return { icon: Wrench, label: name };
+}
+
+/** 工具卡 header 行的紧凑摘要（文件路径 / 命令 / 查询等）。 */
+export function toolSummary(name: string, input: Record<string, unknown> | null): string {
+  if (!input) return "";
+  switch (name) {
+    case "Bash":
+      return (asStr(input.description) || asStr(input.command).split("\n")[0]).slice(0, 60);
+    case "Edit":
+      return shortPath(input.file_path);
+    case "Read":
+      return shortPath(input.file_path);
+    case "Write":
+      return shortPath(input.file_path);
+    case "Grep":
+      return `/${asStr(input.pattern)}/`;
+    case "Glob":
+      return asStr(input.pattern);
+    case "WebFetch":
+      return asStr(input.url).slice(0, 60);
+    case "WebSearch":
+      return asStr(input.query).slice(0, 60);
+    case "TodoWrite": {
+      const todos = asArr(input.todos);
+      const done = todos.filter(
+        (t) => t && typeof t === "object" && (t as Record<string, unknown>).status === "completed",
+      ).length;
+      return todos.length ? `${done}/${todos.length}` : "";
+    }
+    case "NotebookEdit":
+      return shortPath(input.notebook_path);
+    case "Task":
+    case "Agent":
+      return (asStr(input.description) || asStr(input.prompt)).slice(0, 60);
+  }
+  const mcp = parseMcpName(name);
+  if (!mcp) return "";
+  return mcpSummary(mcp.server, mcp.op, input).slice(0, 80);
+}
+
+/** MCP per-server 摘要（端口自 `_mcpSummary`，去 codex）。 */
+function mcpSummary(server: string, op: string, input: Record<string, unknown>): string {
+  if (!input) return "";
+  if (server === "browser") {
+    if (op === "browser_navigate" || op === "browser_navigate_back") return asStr(input.url);
+    if (op === "browser_click" || op === "browser_hover") return asStr(input.element) || asStr(input.ref);
+    if (op === "browser_type" || op === "browser_press_key") return asStr(input.text) || asStr(input.key);
+    if (op === "browser_take_screenshot") return asStr(input.filename);
+    if (op === "browser_evaluate" || op === "browser_run_code")
+      return (asStr(input.code) || asStr(input.function)).replace(/\s+/g, " ").slice(0, 60);
+    if (op === "browser_wait_for") return asStr(input.text) || `${(input.time as number) || 0}s`;
+    return op;
+  }
+  if (server === "minimax-media") {
+    if (op === "text_to_image" || op === "generate_video" || op === "music_generation" || op === "text_to_audio") {
+      return (asStr(input.prompt) || asStr(input.text) || asStr(input.lyrics)).slice(0, 60);
+    }
+    if (op === "query_video_generation") return asStr(input.task_id);
+    return op;
+  }
+  if (server === "minimax-vision" || server === "openclaude-vision") {
+    if (op === "understand_image") return (asStr(input.prompt) || asStr(input.question)).slice(0, 60);
+    if (op === "web_search") return asStr(input.query);
+    return op;
+  }
+  if (server === "openclaude-memory") {
+    if (op === "memory") return `${asStr(input.op) || "read"} ${asStr(input.section)}`.trim();
+    if (op === "archival_add" || op === "archival_search" || op === "archival_delete") {
+      return asStr(input.query) || asStr(input.id) || asStr(input.text).slice(0, 50);
+    }
+    if (op === "session_search") return asStr(input.query);
+    if (op === "create_reminder") return asStr(input.message) || asStr(input.label) || asStr(input.schedule);
+    if (op === "delegate_task" || op === "send_to_agent") {
+      const tgt = input.agentId ? `→ ${asStr(input.agentId)} ` : "";
+      return `${tgt}${(asStr(input.goal) || asStr(input.message) || asStr(input.prompt)).slice(0, 60)}`;
+    }
+    if (op === "skill_view" || op === "skill_delete" || op === "skill_save") return asStr(input.name);
+    return op;
+  }
+  if (server === "scansci-pdf") {
+    if (op === "scansci_pdf_search") return asStr(input.query).slice(0, 60);
+    if (op === "scansci_pdf_batch_download") {
+      const ids = asArr(input.identifiers);
+      return ids.length ? `${ids.length} 篇` : "";
+    }
+    if (op === "scansci_pdf_download" || op === "scansci_pdf_citation" || op === "scansci_pdf_resolve_and_download") {
+      return (asStr(input.identifier) || asStr(input.file_path)).slice(0, 70);
+    }
+    if (op === "scansci_pdf_parse_list") return shortPath(input.file_path);
+    if (op.includes("health") || op.includes("diagnose") || op.includes("source")) return op;
+    if (op.includes("vpnsci")) return asStr(input.school) || asStr(input.query) || asStr(input.doi);
+    return op;
+  }
+  return "";
+}

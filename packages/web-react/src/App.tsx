@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AgentGate } from "./components/AgentGate";
 import { AgentPicker } from "./components/AgentPicker";
 import { AuthGate } from "./components/AuthGate";
@@ -8,6 +8,9 @@ import { EmptyState } from "./components/EmptyState";
 import { type ChatError, ErrorBanner } from "./components/ErrorBanner";
 import { Landing } from "./components/Landing";
 import { AssistantMessage, UserMessage } from "./components/Message";
+import { MessageList } from "./components/MessageRenderer";
+import type { CardCallbacks } from "./components/chat/cards";
+import { MediaSignProvider } from "./components/chat/media";
 import { modelLabel } from "./components/ModelSelector";
 import { SettingsCenter } from "./components/SettingsCenter";
 import { Sidebar } from "./components/Sidebar";
@@ -16,6 +19,7 @@ import { useAgentGate } from "./hooks/useAgentGate";
 import { type UseChatSocket, useChatSocket } from "./hooks/useChatSocket";
 import { useTheme } from "./hooks/useTheme";
 import type { ChatMessage } from "./lib/chat/model";
+import { CONTINUE_PROMPT } from "./lib/chat/render";
 import { DEFAULT_AGENT } from "./lib/agents";
 import { api } from "./lib/api";
 import { DEMO_MESSAGES, DEMO_MODELS, DEMO_SESSIONS, DEMO_USER, demoReply } from "./lib/demo";
@@ -36,17 +40,6 @@ const EMPTY_WS_MESSAGES: ChatMessage[] = [];
 /** WS 会话 id（peer.id）：须匹配后端 `[A-Za-z0-9_-]{8,50}`。*/
 function genWsSessionId(): string {
   return `web${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
-}
-
-/** ChatMessage 是否“可展示成一行内容”（P4 最简文本渲染；P5 出九类富卡）。*/
-function chatMsgText(m: ChatMessage): string {
-  if (m.role === "tool") return `🔧 ${m.toolName || "工具"}${m._completed ? " ✓" : "…"}`;
-  if (m.role === "agent-group") return `👥 ${m.text || "子任务"}${m._completed ? " ✓" : "…"}`;
-  if (m.role === "plan") return `📋 ${m.text || "计划"}`;
-  if (m.role === "goal") return `🎯 ${m.text || "目标"}`;
-  if (m.role === "permission") return `🔐 权限请求：${m.toolName || ""}${m._resolved ? `（${m._behavior}）` : "（待确认）"}`;
-  if (m.role === "delegate-progress") return `👥 委派进度${m._completed ? " ✓" : "…"}`;
-  return m.text || "";
 }
 
 export function App() {
@@ -353,6 +346,50 @@ export function App() {
     setChatError(null);
   }, [demo, activeId, chat]);
 
+  // ── P5 渲染层接线 ──────────────────────────────────────────────────────
+  // 媒体签名单一权威：把 api.mediaSign 注入渲染树（demo 无网络 → null）。容器内路径
+  // 经此换签名 URL，图片/视频/音频才不停在占位。
+  const signMedia = useCallback(
+    (paths: string[]) => api.mediaSign(authRef.current, paths).then((r) => r.urls),
+    [],
+  );
+  // 权限审批回送：绑定当前会话，桥接 useChatSocket.respondPermission。
+  // 走稳定 sockRef（非 chat），避免依赖每帧重建的 chat 引用 —— 否则该回调每个流式帧
+  // 都换新引用，会击穿 MessageRenderer 的 memo（防闪失效，全列表逐帧重渲）。
+  const onRespondPermission = useCallback(
+    (p: { requestId: string; behavior: "allow" | "deny"; message?: string; updatedInput?: Record<string, unknown> }) => {
+      if (!activeId) return;
+      sockRef.current?.respondPermission({ sessId: activeId, ...p });
+    },
+    [activeId],
+  );
+  // 逐条反馈（P6 反馈弹窗的占位接线）：暂以复制诊断串兜底（请求ID + 关联键），
+  // 让用户/运维能立即把可追溯上下文交出去；P6 落地后替换为带上下文的反馈弹窗。
+  const onFeedback = useCallback(
+    (ctx: { traceId: string | null; messageId: string; role: string; errorCode: string | null }) => {
+      const diag = [
+        ctx.traceId ? `请求ID: ${ctx.traceId}` : null,
+        `消息: ${ctx.messageId}`,
+        activeId ? `会话: ${activeId}` : null,
+        ctx.errorCode ? `错误码: ${ctx.errorCode}` : null,
+      ]
+        .filter(Boolean)
+        .join("\n");
+      void navigator.clipboard?.writeText(diag).catch(() => {});
+    },
+    [activeId],
+  );
+  // 卡片回调集（稳定引用：作为 MessageRenderer memo 比较键之一，避免无谓重渲）。
+  const cardCallbacks: CardCallbacks = useMemo(
+    () => ({
+      onRegenerate: regenerate,
+      onContinue: () => send(CONTINUE_PROMPT),
+      onTopUp: demo ? undefined : openSettings,
+      onFeedback,
+    }),
+    [regenerate, send, demo, openSettings, onFeedback],
+  );
+
   // autoscroll（demo: messages/streamText；非 demo: WS 消息流 + in-flight）
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" });
@@ -433,6 +470,7 @@ export function App() {
   };
 
   return (
+    <MediaSignProvider sign={demo ? null : signMedia}>
     <div className="flex h-screen overflow-hidden bg-bg text-fg">
       {/* 桌面：内联侧栏（可折叠）。窄屏隐藏，改用抽屉。 */}
       {!collapsed && (
@@ -520,35 +558,14 @@ export function App() {
               )}
             </div>
           ) : (
-            // 非 demo：真实 WS 消息流。P4 用最简文本渲染（含九类卡片的占位行）；
-            // P5 接入 MessageRenderer/ToolCard 后替换本块为九类 Aurora 富卡。
-            <div className="mx-auto flex max-w-3xl flex-col gap-7 px-5 py-8">
-              {wsMessages.map((m, i) =>
-                m.role === "user" ? (
-                  <UserMessage key={m.id} content={m.text} />
-                ) : (
-                  <AssistantMessage
-                    key={m.id}
-                    message={{
-                      id: m.id,
-                      role: "assistant",
-                      content: chatMsgText(m),
-                      createdAt: new Date(m.ts).toISOString(),
-                    }}
-                    streaming={i === wsMessages.length - 1 && wsSending && (m.role === "assistant" || m.role === "thinking")}
-                    toolCards={[]}
-                    onRegenerate={i === wsMessages.length - 1 && !wsSending && m.role === "assistant" ? regenerate : undefined}
-                  />
-                ),
-              )}
-              {wsSending && wsMessages[wsMessages.length - 1]?.role === "user" && (
-                <AssistantMessage
-                  message={{ id: "ws-streaming", role: "assistant", content: "", createdAt: new Date().toISOString() }}
-                  streaming
-                  toolCards={[]}
-                />
-              )}
-            </div>
+            // 非 demo：真实 WS 消息流 → P5 九类 Aurora 富卡（MessageList 按 role 分派、
+            // 签名 memo 防闪；tool 委托 ToolCardSlot；权限审批经 onRespondPermission）。
+            <MessageList
+              messages={wsMessages}
+              sending={wsSending}
+              cb={cardCallbacks}
+              onRespondPermission={onRespondPermission}
+            />
           )}
         </div>
 
@@ -611,5 +628,6 @@ export function App() {
         onRefreshMe={refreshMe}
       />
     </div>
+    </MediaSignProvider>
   );
 }
