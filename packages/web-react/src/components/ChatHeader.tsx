@@ -44,7 +44,7 @@ export function ChatHeader({
 }) {
   const low = credits != null && (credits.trim().startsWith("-") || /^-?0+$/.test(credits.trim()));
   return (
-    <header className="flex h-14 shrink-0 items-center gap-1 px-3 py-2.5">
+    <header className="flex h-14 shrink-0 items-center gap-1 px-3 pb-2.5 header-safe-t">
       {/* 移动端汉堡：窄屏始终可见，打开侧栏抽屉。 */}
       {onOpenMobileNav && (
         <IconButton onClick={onOpenMobileNav} aria-label="打开菜单" shape="square" className="md:hidden">

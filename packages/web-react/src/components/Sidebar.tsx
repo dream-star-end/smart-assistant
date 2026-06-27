@@ -146,7 +146,7 @@ export function Sidebar({
         ))}
       </div>
 
-      <div className="flex items-center gap-1 border-t border-border p-2">
+      <div className="flex items-center gap-1 border-t border-border px-2 pt-2 sidebar-foot-safe-b">
         <button
           onClick={onOpenAccount}
           disabled={!onOpenAccount}

@@ -668,7 +668,8 @@ export function App() {
   return (
     <MediaSignProvider sign={demo ? null : signMedia} authKey={user?.id ?? "anon"}>
     <ToolCardActionsContext.Provider value={toolActions}>
-    <div className="flex h-screen overflow-hidden bg-bg text-fg">
+    {/* safe-px:横屏侧刘海安全区(竖屏为 0) */}
+    <div className="flex h-screen overflow-hidden bg-bg text-fg safe-px">
       {/* 桌面：内联侧栏（可折叠）。窄屏隐藏，改用抽屉。 */}
       {!collapsed && (
         <div className="hidden md:contents">
@@ -766,7 +767,8 @@ export function App() {
           )}
         </div>
 
-        <div className="shrink-0 pb-3">
+        {/* composer-safe-b:底部 Home 指示条安全区(叠在原 pb-3 上),否则发送区被遮 */}
+        <div className="shrink-0 composer-safe-b">
           {!demo && gate.phase.kind === "dormant" && (
             <div className="mx-auto mb-2 max-w-3xl px-4">
               <Alert tone="info">容器已休眠，发送消息后将自动唤醒。</Alert>

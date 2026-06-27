@@ -160,6 +160,13 @@ body {
 @layer utilities {
   .no-scrollbar::-webkit-scrollbar { display: none; }
   .no-scrollbar { scrollbar-width: none; }
+  /* ── iOS 安全区(刘海/灵动岛/Home 指示条 + 横屏侧刘海),配合 index.html viewport-fit=cover。
+     无安全区的设备(安卓/桌面)env() 回退 0px,零影响。各类按"叠加在原内边距之上"用 calc。── */
+  .safe-px { padding-left: env(safe-area-inset-left, 0px); padding-right: env(safe-area-inset-right, 0px); }
+  .header-safe-t { padding-top: calc(0.625rem + env(safe-area-inset-top, 0px)); } /* 叠 py-2.5 顶部 */
+  .composer-safe-b { padding-bottom: calc(0.75rem + env(safe-area-inset-bottom, 0px)); } /* 叠原 pb-3 */
+  .landing-safe-t { padding-top: env(safe-area-inset-top, 0px); }
+  .sidebar-foot-safe-b { padding-bottom: calc(0.5rem + env(safe-area-inset-bottom, 0px)); } /* 叠 p-2 底部 */
   .animate-in { animation: fade-up 0.32s cubic-bezier(0.22, 1, 0.36, 1); }
   .animate-fade { animation: fade-in 0.4s ease; }
   /* brand gradient surfaces — pastel aurora for decorative glows, grad-cta for marketing CTAs */

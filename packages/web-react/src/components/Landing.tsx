@@ -32,7 +32,7 @@ export function Landing({
   return (
     <div className="min-h-screen bg-bg text-fg">
       {/* Nav */}
-      <header className="sticky top-0 z-30 border-b border-border/60 bg-bg/80 backdrop-blur-xl">
+      <header className="landing-safe-t sticky top-0 z-30 border-b border-border/60 bg-bg/80 backdrop-blur-xl">
         {/* 窄屏(华为折叠外屏 / 320 小屏)收紧内边距,避免 nav 溢出 8px。 */}
         <div className="mx-auto flex h-16 max-w-6xl items-center justify-between px-4 sm:px-5">
           <Logo />
