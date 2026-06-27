@@ -98,6 +98,12 @@ export type ChatSocketDeps = {
    * （调用方据此不标 ensured、下次发送/重连重试，见 socket.ts serverSessionInflight，Codex 审 MAJOR）。
    */
   ensureServerSession?: (sessId: string, agentId: string, title?: string) => Promise<boolean> | boolean;
+  /** 跨设备持久化「用户发送的消息」到 master(POST /api/sessions/:id/user-message)。
+   *  带本地 client id → getSession 回带同 id,前端合并去重。best-effort。 */
+  persistUserMessage?: (
+    sessId: string,
+    msg: { id: string; text: string; ts: number; media?: InboundMessage["content"]["media"] },
+  ) => Promise<void> | void;
   /** 立即把某会话快照落 IndexedDB（resume_failed 游标推进 / isFinal turn 收尾时调）。*/
   persistSession?: (sessId: string) => void;
   defaultAgentId?: string;
@@ -1190,17 +1196,21 @@ export class ChatSocket {
     // 主控 session 建行(每会话一次):必须在容器跑完 turn 回传 authored 消息之前落地,
     // 否则 session_not_found 风暴。**只在 PUT 确认成功(返回 true)后才标 ensured**;失败则清
     // inflight、下次发送重试(Codex 审 MAJOR:旧实现发送即标 ensured,PUT 失败被吞 → 永不重建)。
+    // ensurePromise:用于把"用户消息持久化"排在主控建行之后(行须先存在,否则 append 404)。
+    let ensurePromise: Promise<boolean> = Promise.resolve(this.serverSessionEnsured.has(sess.id));
     if (!this.serverSessionEnsured.has(sess.id) && !this.serverSessionInflight.has(sess.id)) {
       this.serverSessionInflight.add(sess.id);
       const sid = sess.id;
-      void Promise.resolve(this.deps.ensureServerSession?.(sid, p.agentId, sess.title))
+      ensurePromise = Promise.resolve(this.deps.ensureServerSession?.(sid, p.agentId, sess.title))
         .then((ok) => {
           this.serverSessionInflight.delete(sid);
           // 仅当会话仍在(PUT pending 期间未被 remove/reset)才标 ensured,避免给已删会话留残 marker。
           if (ok && this.sessions.has(sid)) this.serverSessionEnsured.add(sid);
+          return !!ok;
         })
         .catch(() => {
           this.serverSessionInflight.delete(sid);
+          return false;
         });
     }
     const media = p.media && p.media.length > 0 ? p.media : undefined;
@@ -1220,6 +1230,22 @@ export class ChatSocket {
       _media: media,
       _modelText: p.displayText && p.displayText !== p.text ? p.text : undefined,
     });
+    // 跨设备持久化用户消息:行确保存在后,带本地 client id POST 给 master(getSession 回带同
+    // id → 合并天然去重,不与本地乐观 user 重复)。best-effort:失败不影响发送(本地 + IndexedDB
+    // 仍在);容器回传的 server-authored 助手消息走另一条链。
+    {
+      const sid = sess.id;
+      const um = { id: userMsg.id, text: userMsg.text, ts: userMsg.ts, media };
+      void ensurePromise
+        .then((ok) => {
+          if ((ok || this.serverSessionEnsured.has(sid)) && this.sessions.has(sid)) {
+            return this.deps.persistUserMessage?.(sid, um);
+          }
+        })
+        .catch(() => {
+          /* 持久化失败:best-effort,跨设备该条不显,本地仍在 */
+        });
+    }
     sess._streamingAssistant = null;
     sess._streamingThinking = null;
     sess._blockIdToMsgId = new Map();

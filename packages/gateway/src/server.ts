@@ -61,6 +61,7 @@ import {
   getClientSession,
   getClientSessionPartial,
   upsertClientSession,
+  appendServerAuthoredMessage,
   deleteClientSession,
   listUnclaimedSessions,
   claimSession,
@@ -2019,6 +2020,49 @@ export class Gateway {
         }
         this.sendJson(res, 200, { ok: true, results })
       }).catch(() => this.sendJson(res, 400, { error: 'invalid body' }))
+      return
+    }
+    // 持久化「用户发送的消息」到 master(跨设备/换浏览器可见)。前端发消息后调用,带自己的
+    // 客户端消息 id —— getSession 回带同 id,前端合并天然去重(不与本地乐观 user 重复)。
+    // 直写(appendServerAuthoredMessage,绕乐观并发,scoped by userId),只构造 role:'user',
+    // 客户端无法注入 role/usage/_source/billing。会话行须先存在(前端 ensureServerSession 已建)。
+    const userMsgMatch = url.pathname.match(/^\/api\/sessions\/([a-zA-Z0-9_-]{8,50})\/user-message$/)
+    if (userMsgMatch && req.method === 'POST') {
+      const sessId = userMsgMatch[1]
+      const userId = this.getUserId(req)
+      ;(async () => {
+        let body: string
+        try {
+          body = await this.readBody(req, 256 * 1024)
+        } catch {
+          this.sendJson(res, 400, { error: 'invalid body' })
+          return
+        }
+        let data: { id?: unknown; text?: unknown; ts?: unknown; media?: unknown }
+        try {
+          data = JSON.parse(body)
+        } catch {
+          this.sendJson(res, 400, { error: 'invalid JSON' })
+          return
+        }
+        if (typeof data.id !== 'string' || !/^[\w:-]{1,80}$/.test(data.id) || typeof data.text !== 'string') {
+          this.sendJson(res, 400, { error: 'id+text required' })
+          return
+        }
+        const msg = {
+          id: data.id,
+          role: 'user' as const,
+          text: data.text.slice(0, 200_000),
+          ts: typeof data.ts === 'number' && Number.isFinite(data.ts) ? data.ts : Date.now(),
+          ...(Array.isArray(data.media) ? { _media: data.media } : {}),
+        }
+        const r = await appendServerAuthoredMessage(sessId, userId, msg)
+        if (r.applied) this.sendJson(res, 200, { ok: true })
+        else if (r.reason === 'already_exists') this.sendJson(res, 200, { ok: true, idempotent: true })
+        else if (r.reason === 'session_not_found') this.sendJson(res, 404, { error: 'session_not_found' })
+        else if (r.reason === 'session_deleted') this.sendJson(res, 410, { error: 'session_deleted' })
+        else this.sendJson(res, 409, { error: r.reason ?? 'conflict' })
+      })().catch(() => this.sendJson(res, 500, { error: 'append failed' }))
       return
     }
     const clientSessMatch = url.pathname.match(/^\/api\/sessions\/([a-zA-Z0-9_-]{8,50})$/)

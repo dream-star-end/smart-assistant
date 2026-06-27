@@ -178,6 +178,16 @@ export function useChatSocket(opts: {
           return (e as { status?: number } | null)?.status === 409;
         }
       },
+      // 跨设备持久化用户消息(行已由 ensureServerSession 建)。best-effort,失败静默。
+      persistUserMessage: async (sessId, msg) => {
+        const a = authRef.current;
+        if (!a) return;
+        try {
+          await api.appendUserMessage(a, sessId, msg);
+        } catch {
+          /* best-effort:本地 + IndexedDB 仍在,仅跨设备该条不显 */
+        }
+      },
       // resume_failed 游标推进 / isFinal turn 收尾：立即落 IndexedDB（防 reload 死循环 + 不丢轮）。
       persistSession: (sessId) => persistRef.current(sessId),
       defaultAgentId: defaultAgentRef.current,

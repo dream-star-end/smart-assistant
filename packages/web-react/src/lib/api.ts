@@ -725,6 +725,27 @@ export const api = {
       ),
     ),
 
+  /**
+   * 跨设备持久化「用户发送的消息」（POST /api/sessions/:id/user-message，Bearer）。
+   * 带前端 client 消息 id；服务端直写(role:'user',绕乐观并发,scoped by userId),
+   * getSession 回带同 id → 前端合并去重。best-effort，调用方吞错不阻断发送。
+   */
+  appendUserMessage: (
+    a: AuthSession,
+    id: string,
+    msg: { id: string; text: string; ts: number; media?: unknown },
+  ): Promise<void> =>
+    jsonOrThrow<{ ok: true }>(
+      callWithRefresh(a, (t) =>
+        fetch(`/api/sessions/${encodeURIComponent(id)}/user-message`, {
+          method: "POST",
+          credentials: "include",
+          headers: bearerHeaders(t, true),
+          body: JSON.stringify(msg),
+        }),
+      ),
+    ).then(() => undefined),
+
   /** 删除会话（DELETE /api/sessions/:id，Bearer）。幂等，恒 200。 */
   deleteSession: (a: AuthSession, id: string): Promise<void> =>
     jsonOrThrow<{ ok: true }>(
