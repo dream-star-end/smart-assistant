@@ -387,6 +387,16 @@ export interface ServerAuthoredStorage {
     | { applied: true }
     | { applied: false; reason: "session_not_found" | "session_deleted" | "already_exists" | "malformed" | "oversized" }
   >;
+  /** ccb-spawn 助手路径(无 requestId):落库时按 user 排空 pending costCredits,使
+   *  跨设备 reload 也能看到 per-response 积分(见 storage 同名函数的局限说明)。 */
+  appendServerAuthoredMessageDrainByUser(
+    sessId: string,
+    userId: string,
+    message: ServerAuthoredMessageInput,
+  ): Promise<
+    | { applied: true }
+    | { applied: false; reason: "session_not_found" | "session_deleted" | "already_exists" | "malformed" | "oversized" }
+  >;
 }
 
 export interface ServerAuthoredHandlerDeps {
@@ -1084,14 +1094,14 @@ export function makeServerAuthoredHandler(
           lastAssistant.msg,
         );
       } else {
-        const r = await deps.storage.appendServerAuthoredMessage(
+        // ccb-spawn 路径(无 per-turn requestId):走 drain-by-user,把 anthropicProxy 异步算费
+        // park 在 pending_usage_patches 的本轮 cost 合进这条助手消息的 usage.costCredits,
+        // 使跨设备 reload(getSession)也能看到 per-response 积分(live 帧走 broadcastToUser 另算)。
+        assistantResult = await deps.storage.appendServerAuthoredMessageDrainByUser(
           body.sessionId,
           userId,
           lastAssistant.msg,
         );
-        assistantResult = r.applied
-          ? { applied: true }
-          : { applied: false, reason: r.reason! };
       }
     } catch (err) {
       userLog.error("assistant_storage_threw", {

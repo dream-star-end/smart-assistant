@@ -284,6 +284,9 @@ export async function getSessionsDb(): Promise<Database.Database> {
       PRIMARY KEY (request_id, user_id)
     );
     CREATE INDEX IF NOT EXISTS idx_pup_created ON pending_usage_patches(created_at);
+    -- by-user drain(ccb-spawn 路径 appendServerAuthoredMessageDrainByUser 的 WHERE user_id)
+    -- 走索引,避免 pending 积压时全表扫。
+    CREATE INDEX IF NOT EXISTS idx_pup_user ON pending_usage_patches(user_id);
   `)
 
   _db = db
@@ -1586,6 +1589,61 @@ export async function appendServerAuthoredMessageForRequest(
       ).run(requestId, userId)
     }
 
+    return { applied: true }
+  })
+  return txn()
+}
+
+/**
+ * ccb-spawn 路径(无 per-turn requestId)的 server-authored 助手消息持久化 + **按 user 排空**
+ * pending costCredits。
+ *
+ * 背景:anthropicProxy 给 claude/glm 异步算费 → `appendCostCredits` 因 ccb 不回流 requestId
+ * 而恒 park 到 `pending_usage_patches`(keyed by (request_id, user_id)),而 ccb 助手持久化走
+ * 不带 requestId 的 plain 路径 → `server_authored_request_map` 恒空 → pending 永不 drain →
+ * `messages[i].usage.costCredits` 永远写不进去(跨设备 reload 看不到 per-response 积分)。
+ *
+ * 本函数在助手消息落库时,把该 user 当前 park 的 cost **全量合并**进本条消息的
+ * usage.costCredits(写库前合入,随消息一次 `_seq` 分配,getSession 增量/全量都可见)。
+ * 仅删本次读到的 request_id 行(非 blanket DELETE),避免并发新 park 的 cost 被误删。
+ *
+ * 局限:按 user 排空——同一 user 并发多 turn 可能跨轮归并(canary 单会话顺序使用无此问题;
+ * 真正 per-turn 精确需 ccb 端回流 requestId 走 {@link appendServerAuthoredMessageForRequest},
+ * 属已知技术债)。requestId 路径(codex/anthropicProxy-with-requestId)不走本函数、行为不变。
+ */
+export async function appendServerAuthoredMessageDrainByUser<T extends MessageLike & { id: string }>(
+  sessId: string,
+  userId: string,
+  message: T,
+): Promise<AppendForRequestResult> {
+  const db = await getSessionsDb()
+  const txn = db.transaction((): AppendForRequestResult => {
+    const pendings = db.prepare(
+      'SELECT request_id, cost_credits FROM pending_usage_patches WHERE user_id = ?'
+    ).all(userId) as { request_id: string; cost_credits: string }[]
+    let sum = 0n
+    for (const p of pendings) {
+      try { const v = BigInt(p.cost_credits); if (v > 0n) sum += v } catch { /* skip malformed */ }
+    }
+
+    let msgToWrite: MessageLike & { id: string } = message
+    if (sum > 0n) {
+      const existingUsage = (message.usage && typeof message.usage === 'object')
+        ? message.usage as Record<string, unknown>
+        : {}
+      let base = 0n
+      try { base = BigInt((existingUsage.costCredits as string) ?? '0') } catch { base = 0n }
+      msgToWrite = { ...message, usage: { ...existingUsage, costCredits: (base + sum).toString() } }
+    }
+
+    const r = _appendServerAuthoredCore(db, sessId, userId, msgToWrite)
+    if (!r.applied) return r
+
+    // 只删本次读到的行——并发新 park(本次 SELECT 之后到达)不在列表里,留给下一轮 drain。
+    if (pendings.length) {
+      const del = db.prepare('DELETE FROM pending_usage_patches WHERE user_id = ? AND request_id = ?')
+      for (const p of pendings) del.run(userId, p.request_id)
+    }
     return { applied: true }
   })
   return txn()

@@ -2004,6 +2004,17 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
    */
   function broadcastToUser(uid: bigint, payload: unknown): number {
     const set = uidToUserWs.get(uid.toString());
+    // 可观测:cost_charged 投递命中情况(per-turn 低频)。set 为空=该 uid 当前无注册 user WS
+    // (cost 帧投不出,前端无 live 积分徽章)。排查"积分有时不显示"用得到。
+    if ((payload as { type?: string } | null)?.type === "outbound.cost_charged") {
+      // 可观测(per-turn 低频):cost_charged 投递命中。recipients=0 表示该 uid 当前无注册 user WS
+      // (cost 帧投不出 → 前端无 live 积分徽章)——排查"积分有时不显示"的关键信号。
+      log?.info("user-chat-bridge: cost_charged broadcast", {
+        uid: uid.toString(),
+        recipients: set ? set.size : 0,
+        registeredUids: uidToUserWs.size,
+      });
+    }
     if (!set || set.size === 0) return 0;
     let text: string;
     try { text = JSON.stringify(payload); }

@@ -137,6 +137,7 @@ import {
   appendCostCredits,
   appendServerAuthoredMessage,
   appendServerAuthoredMessageForRequest,
+  appendServerAuthoredMessageDrainByUser,
   getClientSession,
   // P1.7 slice 7c — broker assembly 需要的 master sqlite helpers
   upsertMasterClientSession,
@@ -946,6 +947,20 @@ export async function registerCommercial(
   const bridgeBroadcastRef: { current: (uid: bigint, payload: unknown) => void } = {
     current: () => { /* bridge 还没装好,静默丢弃 */ },
   };
+  // ⚠️ 命名空间对齐(根因修复):商业版 session 存储(SQLite client_sessions /
+  // pending_usage_patches / server_authored_request_map)的 user_id 是 `c:<uid>`
+  // (MASTER_USER_PREFIX),而 proxy/bridge 传进来的是裸 uid(与 PG 计费同口径)。
+  // appendCostCredits 直接打 session 存储,必须加同一前缀——否则 cost 落库的
+  // (request_id, 裸uid) 与 server-authored 持久化写的 (request_id, c:uid) 永不 join,
+  // 成本永久孤儿在 pending_usage_patches、落不到消息 usage.costCredits → 前端无积分徽章。
+  // 姊妹 dep loadMasterSessionMessages 早已加前缀,此处历史漏加(去 codex 后全量 ccb 暴露)。
+  const appendCostCreditsForUser = (requestId: string, rawUserId: string, costCredits: string) =>
+    appendCostCredits(
+      requestId,
+      // 防双前缀:当前调用方都传裸 uid,但 guard 住将来复用误传 c: 前缀的情况(Codex 次要建议)。
+      rawUserId.startsWith(MASTER_USER_PREFIX) ? rawUserId : MASTER_USER_PREFIX + rawUserId,
+      costCredits,
+    );
   // P1.7 slice 7c — broker 前向引用。dispatchInternal 在 line ~883 装配,需要路由
   // `/internal/v3/wechat-outbound` → broker.outboundHandler;但 broker 本身依赖
   // resolveContainerEndpoint(line ~1529)装配完才能 makeInboundDispatcher → makeWechatBroker。
@@ -1059,7 +1074,7 @@ export async function registerCommercial(
         // owns the (sessionId, msgId) lookup via `server_authored_request_map`
         // and falls back to `pending_usage_patches` when the assistant sink
         // POST hasn't landed yet.
-        appendCostCredits,
+        appendCostCredits: appendCostCreditsForUser, // c:<uid> 前缀对齐 session 存储命名空间
         // 静态 key 文本 provider 的 key 解析表(deepseek/minimax/ark)。cfg 在外层闭包已
         // loadConfig() 过,这里直接读取;某 provider 未配 → 命中其模型时 503(各自 reject reason)。
         // 这是 internal proxy(容器/agent runtime 走的上游),三个 provider 全注入。
@@ -1091,6 +1106,7 @@ export async function registerCommercial(
         storage: {
           appendServerAuthoredMessage,
           appendServerAuthoredMessageForRequest,
+          appendServerAuthoredMessageDrainByUser,
         },
       });
       // /v3/literature/search — DeepXiv 文献检索 proxy。复用 identityRepo
@@ -1286,7 +1302,7 @@ export async function registerCommercial(
         // bridge broadcastToUser 同型 ref 闭包;externalApiKeyProxy 装配于
         // bridge 之前是正常顺序(请求期 bridge 必已就绪)。
         broadcastToUser: (uid, payload) => bridgeBroadcastRef.current(uid, payload),
-        appendCostCredits,
+        appendCostCredits: appendCostCreditsForUser, // c:<uid> 前缀对齐 session 存储命名空间
         // external API-key proxy **故意只注入 deepseek**(保持现有能力面,不拓宽 minimax/ark)。
         // 该 proxy 上 minimax/ark 模型请求维持 not_configured 503,与历史行为一致。
         staticProviderKeys: { deepseek: cfg.DEEPSEEK_API_KEY },
@@ -2170,7 +2186,7 @@ export async function registerCommercial(
     // Plan §4.2 改动 4a — codex billing commit 路径同样把 debit 持久化进
     // master's `client_sessions.messages[i].usage.costCredits`。与 anthropicProxy
     // 走同一个 storage helper,签名一致。
-    appendCostCredits,
+    appendCostCredits: appendCostCreditsForUser, // c:<uid> 前缀对齐 session 存储命名空间
   });
   // 把 proxy 的 forward-ref 指向真实 broadcastToUser —— 此刻以后,commit 成功
   // 扣费事件会实时推到用户前端。

@@ -25,6 +25,7 @@ const {
   appendCostCredits,
   appendServerAuthoredMessage,
   appendServerAuthoredMessageForRequest,
+  appendServerAuthoredMessageDrainByUser,
   getSessionsDb,
   sweepUsageAggregationGc,
   upsertClientSession,
@@ -249,6 +250,60 @@ describe('usage aggregation: A-then-B path (commit first, sink later)', () => {
 
     assert.equal(await getPendingRow(requestId, userId), undefined, 'pending cleared')
     assert.ok(await getMapRow(requestId, userId), 'map row inserted')
+  })
+})
+
+describe('usage aggregation: drain-by-user path (ccb-spawn, no per-turn requestId)', () => {
+  before(async () => {
+    await clearTables()
+  })
+
+  it('T-ccb: 多笔 pending(同 user、不同 requestId)在助手落库时求和合入 usage + 清空', async () => {
+    const userId = 'c:777'
+    await ensureSession(userId)
+
+    // anthropicProxy 给本轮多次 LLM 调用各 park 一笔(ccb 不回流 requestId → 都进 pending)。
+    assert.deepEqual(await appendCostCredits('req-ccb-1', userId, '8'), { applied: 'pending' })
+    assert.deepEqual(await appendCostCredits('req-ccb-2', userId, '3'), { applied: 'pending' })
+
+    // ccb 助手落库走 drain-by-user:求和(8+3=11)合入这条消息的 usage.costCredits、删两条 pending。
+    const r = await appendServerAuthoredMessageDrainByUser(SESSION_ID, userId, {
+      id: 'srv-ccb-t1',
+      role: 'assistant' as const,
+      text: 'hi from ccb',
+      ts: 3000,
+      status: 'completed',
+      usage: { inputTokens: 100, outputTokens: 20 },
+    })
+    assert.deepEqual(r, { applied: true })
+
+    const messages = await getMessages(SESSION_ID, userId)
+    assert.equal(messages.length, 1)
+    assert.equal(messages[0].usage?.costCredits, '11', '多笔 pending 求和合入 usage.costCredits')
+    assert.equal(messages[0].usage?.inputTokens, 100, 'inputTokens 保留自 sink payload')
+
+    assert.equal(await getPendingRow('req-ccb-1', userId), undefined, 'pending 1 清空')
+    assert.equal(await getPendingRow('req-ccb-2', userId), undefined, 'pending 2 清空')
+    // drain-by-user 不写 map(无单一 requestId);不应误写。
+    assert.equal(await getMapRow('req-ccb-1', userId), undefined, 'drain-by-user 不写 map')
+  })
+
+  it('T-ccb2: 无 pending 时助手正常落库,usage.costCredits 不被臆造', async () => {
+    await clearTables()
+    const userId = 'c:778'
+    await ensureSession(userId)
+    const r = await appendServerAuthoredMessageDrainByUser(SESSION_ID, userId, {
+      id: 'srv-ccb2-t1',
+      role: 'assistant' as const,
+      text: 'no cost',
+      ts: 4000,
+      status: 'completed',
+      usage: { inputTokens: 5, outputTokens: 2 },
+    })
+    assert.deepEqual(r, { applied: true })
+    const messages = await getMessages(SESSION_ID, userId)
+    assert.equal(messages.length, 1)
+    assert.equal(messages[0].usage?.costCredits, undefined, '无 pending → 不写 costCredits')
   })
 })
 

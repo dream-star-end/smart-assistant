@@ -106,6 +106,13 @@ function fakeStorage(impl: ServerAuthoredStorage["appendServerAuthoredMessage"])
       if (r.applied) return { applied: true };
       return { applied: false, reason: r.reason ?? "malformed" };
     },
+    // ccb-spawn(无 requestId)助手路径:mirror 到同一 impl,既有断言不变(drain 行为由 storage
+    // 单测覆盖;这里只验 handler 路由)。
+    async appendServerAuthoredMessageDrainByUser(sessId, userId, msg) {
+      const r = await impl(sessId, userId, msg);
+      if (r.applied) return { applied: true };
+      return { applied: false, reason: r.reason ?? "malformed" };
+    },
   };
 }
 
@@ -628,10 +635,12 @@ describe("internalServerAuthored handler — requestId dispatch (cost-late-patch
   function spyStorage(): {
     plainCalls: Array<{ sessId: string; userId: string; msgId: string; role: string }>;
     forRequestCalls: Array<{ requestId: string; sessId: string; userId: string; msgId: string; role: string }>;
+    drainByUserCalls: Array<{ sessId: string; userId: string; msgId: string; role: string }>;
     storage: ServerAuthoredStorage;
   } {
     const plainCalls: Array<{ sessId: string; userId: string; msgId: string; role: string }> = [];
     const forRequestCalls: Array<{ requestId: string; sessId: string; userId: string; msgId: string; role: string }> = [];
+    const drainByUserCalls: Array<{ sessId: string; userId: string; msgId: string; role: string }> = [];
     const storage: ServerAuthoredStorage = {
       async appendServerAuthoredMessage(sessId, userId, msg) {
         plainCalls.push({ sessId, userId, msgId: msg.id, role: msg.role });
@@ -641,8 +650,12 @@ describe("internalServerAuthored handler — requestId dispatch (cost-late-patch
         forRequestCalls.push({ requestId, sessId, userId, msgId: msg.id, role: msg.role });
         return { applied: true };
       },
+      async appendServerAuthoredMessageDrainByUser(sessId, userId, msg) {
+        drainByUserCalls.push({ sessId, userId, msgId: msg.id, role: msg.role });
+        return { applied: true };
+      },
     };
-    return { plainCalls, forRequestCalls, storage };
+    return { plainCalls, forRequestCalls, drainByUserCalls, storage };
   }
 
   test("assistant text + requestId → routes to appendServerAuthoredMessageForRequest", async () => {
@@ -675,10 +688,11 @@ describe("internalServerAuthored handler — requestId dispatch (cost-late-patch
     );
   });
 
-  test("assistant text + missing requestId → routes to appendServerAuthoredMessage (200 ok)", async () => {
-    // The pre-fix bug: this exact body shape triggered "requestId is required
-    // when text is non-empty" and got 400-rejected → fatal-drop at sink → all
-    // server-authored data lost for every DeepSeek V4 Pro turn.
+  test("assistant text + missing requestId → routes to appendServerAuthoredMessageDrainByUser (200 ok)", async () => {
+    // ccb-spawn 路径(无 requestId):助手写入走 drainByUser(落库时按 user 排空 pending cost),
+    // 而非 plain append——使跨设备 reload 也能看到 per-response 积分。
+    // (pre-fix 老 bug:该 body 曾因 "requestId required" 400 拒 → sink fatal-drop → 数据全丢,
+    //  那条已修;本测试现锁定 ccb 助手路由到 drainByUser。)
     const spy = spyStorage();
     const h = makeServerAuthoredHandler({
       identityRepo: makeRepoFor(VALID_TOKEN, VALID_HOST, VALID_IP),
@@ -698,16 +712,17 @@ describe("internalServerAuthored handler — requestId dispatch (cost-late-patch
     );
     assert.equal(rec.status, 200);
     assert.equal(spy.forRequestCalls.length, 0);
-    const assistantPlain = spy.plainCalls.filter((c) => c.role === "assistant");
-    assert.equal(assistantPlain.length, 1);
-    assert.equal(assistantPlain[0].msgId, "srv-sess12345-t0");
-    assert.equal(assistantPlain[0].userId, "c:42");
+    // 助手写入走 drainByUser,不再走 plain。
+    assert.equal(spy.plainCalls.filter((c) => c.role === "assistant").length, 0);
+    assert.equal(spy.drainByUserCalls.length, 1);
+    assert.equal(spy.drainByUserCalls[0].msgId, "srv-sess12345-t0");
+    assert.equal(spy.drainByUserCalls[0].userId, "c:42");
+    assert.equal(spy.drainByUserCalls[0].role, "assistant");
   });
 
-  test("assistant text + missing requestId + tools[] → both go through plain append", async () => {
-    // Tools were always plain-append (best-effort, no requestId join even on
-    // codex turns). Pin that the assistant write joining them on the plain
-    // path doesn't accidentally route tools to *ForRequest.
+  test("assistant text + missing requestId + tools[] → tool plain, assistant drainByUser", async () => {
+    // Tools 始终 plain-append(best-effort,无 requestId join)。ccb 助手写入走 drainByUser
+    // (落库排空 pending cost),不会误路由到 *ForRequest;tool 仍走 plain。
     const spy = spyStorage();
     const h = makeServerAuthoredHandler({
       identityRepo: makeRepoFor(VALID_TOKEN, VALID_HOST, VALID_IP),
@@ -731,9 +746,9 @@ describe("internalServerAuthored handler — requestId dispatch (cost-late-patch
     );
     assert.equal(rec.status, 200);
     assert.equal(spy.forRequestCalls.length, 0);
-    // Expect two plain calls: one tool, one assistant.
-    const roles = spy.plainCalls.map((c) => c.role).sort();
-    assert.deepEqual(roles, ["assistant", "tool"]);
+    // tool 走 plain;assistant 走 drainByUser。
+    assert.deepEqual(spy.plainCalls.map((c) => c.role).sort(), ["tool"]);
+    assert.deepEqual(spy.drainByUserCalls.map((c) => c.role).sort(), ["assistant"]);
   });
 
   // 2026-06-18 — per-turn traceId 透传:gateway 把 master canonical traceId 折进
@@ -746,6 +761,10 @@ describe("internalServerAuthored handler — requestId dispatch (cost-late-patch
         return { applied: true };
       },
       async appendServerAuthoredMessageForRequest(_requestId, _sessId, _userId, msg) {
+        capturedUsage = (msg as { usage?: unknown }).usage;
+        return { applied: true };
+      },
+      async appendServerAuthoredMessageDrainByUser(_sessId, _userId, msg) {
         capturedUsage = (msg as { usage?: unknown }).usage;
         return { applied: true };
       },
@@ -1091,6 +1110,13 @@ describe("internalServerAuthored handler — thinking durability", () => {
         // to assert the *ForRequest contract specifically (see usageAggregation
         // suite in storage package) cover the storage-layer behavior directly.
         async appendServerAuthoredMessageForRequest(_requestId, sessId, userId, msg) {
+          const r = await this.appendServerAuthoredMessage(sessId, userId, msg);
+          if (r.applied) return { applied: true };
+          return { applied: false, reason: r.reason ?? "malformed" };
+        },
+        // ccb 助手写入(无 requestId)走此路径;mirror 到 appendServerAuthoredMessage 保 rows
+        // 记录 + override/throw 矩阵不变(drain 行为由 storage 单测覆盖)。
+        async appendServerAuthoredMessageDrainByUser(sessId, userId, msg) {
           const r = await this.appendServerAuthoredMessage(sessId, userId, msg);
           if (r.applied) return { applied: true };
           return { applied: false, reason: r.reason ?? "malformed" };
@@ -1475,6 +1501,12 @@ describe("internalServerAuthored handler — tool durability", () => {
         async appendServerAuthoredMessageForRequest(_requestId, sessId, userId, msg) {
           // Assistant goes through *ForRequest in branch B; mirror to direct
           // path so the rows[] recording and override matrix work uniformly.
+          const r = await this.appendServerAuthoredMessage(sessId, userId, msg);
+          if (r.applied) return { applied: true };
+          return { applied: false, reason: r.reason ?? "malformed" };
+        },
+        // ccb 助手(无 requestId)走 drainByUser;同样 mirror,保 rows/override 矩阵一致。
+        async appendServerAuthoredMessageDrainByUser(sessId, userId, msg) {
           const r = await this.appendServerAuthoredMessage(sessId, userId, msg);
           if (r.applied) return { applied: true };
           return { applied: false, reason: r.reason ?? "malformed" };
