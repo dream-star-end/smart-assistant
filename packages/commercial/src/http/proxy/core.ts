@@ -83,6 +83,7 @@ export interface RoundTripCtx {
     requestId: string,
     userId: string,
     costCredits: string,
+    sessionId?: string | null,
   ) => Promise<unknown>;
   broadcastToUser?: (uid: bigint, payload: unknown) => void;
   req: IncomingMessage;
@@ -288,6 +289,9 @@ export async function runUpstreamRoundTrip(ctx: RoundTripCtx): Promise<void> {
             requestId,
             uid.toString(),
             outcome.debitedCredits.toString(),
+            // agent session id(ccb getSessionId,= cost 帧 sessionId)→ park 进 pending.session_id,
+            // 供 ccb 助手落库按 session 精确 drain(per-turn 精确,消除 by-user 跨会话归并)。
+            sessionId,
           );
         } catch (err) {
           userLog.warn("proxy_persist_costcredits_failed", {

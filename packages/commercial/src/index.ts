@@ -954,12 +954,18 @@ export async function registerCommercial(
   // (request_id, 裸uid) 与 server-authored 持久化写的 (request_id, c:uid) 永不 join,
   // 成本永久孤儿在 pending_usage_patches、落不到消息 usage.costCredits → 前端无积分徽章。
   // 姊妹 dep loadMasterSessionMessages 早已加前缀,此处历史漏加(去 codex 后全量 ccb 暴露)。
-  const appendCostCreditsForUser = (requestId: string, rawUserId: string, costCredits: string) =>
+  const appendCostCreditsForUser = (
+    requestId: string,
+    rawUserId: string,
+    costCredits: string,
+    sessionId?: string | null,
+  ) =>
     appendCostCredits(
       requestId,
       // 防双前缀:当前调用方都传裸 uid,但 guard 住将来复用误传 c: 前缀的情况(Codex 次要建议)。
       rawUserId.startsWith(MASTER_USER_PREFIX) ? rawUserId : MASTER_USER_PREFIX + rawUserId,
       costCredits,
+      sessionId,
     );
   // P1.7 slice 7c — broker 前向引用。dispatchInternal 在 line ~883 装配,需要路由
   // `/internal/v3/wechat-outbound` → broker.outboundHandler;但 broker 本身依赖

@@ -158,6 +158,10 @@ export interface V3MasterSinkWirePayload {
    *  from the upstream proxy `x-openclaude-request-id` header captured at
    *  stream begin, so master and gateway agree on a single key. */
   requestId?: string
+  /** CCB agent session id(= runner.sessionId / ccb getSessionId）。透传给 master,
+   *  使 ccb 助手落库时按 session 精确排空 pending costCredits(anthropicProxy 异步算费
+   *  park 时以 LLM metadata.session_id 为 key,与此一致)。缺省 → master 退回 by-user。 */
+  agentSessionId?: string
   /** Plan §4.4 改动 7 — token usage gathered by the gateway-side stream
    *  finalizer at `message_stop`. Persisted into `messages[i].usage`;
    *  costCredits joins later via `appendCostCredits`. Snake-case JSON
@@ -331,6 +335,7 @@ export async function attemptSend(
     // assistant write). We forward them as-is (null/empty values are
     // dropped by the spread guard below).
     ...(payload.requestId !== undefined ? { requestId: payload.requestId } : {}),
+    ...(payload.agentSessionId !== undefined ? { agentSessionId: payload.agentSessionId } : {}),
     ...(payload.usage !== undefined ? { usage: payload.usage } : {}),
     ...(payload.truncated ? { truncated: true } : {}),
     ...(payload.errorCode !== undefined ? { errorCode: payload.errorCode } : {}),

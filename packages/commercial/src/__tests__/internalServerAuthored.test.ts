@@ -635,12 +635,12 @@ describe("internalServerAuthored handler — requestId dispatch (cost-late-patch
   function spyStorage(): {
     plainCalls: Array<{ sessId: string; userId: string; msgId: string; role: string }>;
     forRequestCalls: Array<{ requestId: string; sessId: string; userId: string; msgId: string; role: string }>;
-    drainByUserCalls: Array<{ sessId: string; userId: string; msgId: string; role: string }>;
+    drainByUserCalls: Array<{ sessId: string; userId: string; msgId: string; role: string; agentSessionId?: string | null }>;
     storage: ServerAuthoredStorage;
   } {
     const plainCalls: Array<{ sessId: string; userId: string; msgId: string; role: string }> = [];
     const forRequestCalls: Array<{ requestId: string; sessId: string; userId: string; msgId: string; role: string }> = [];
-    const drainByUserCalls: Array<{ sessId: string; userId: string; msgId: string; role: string }> = [];
+    const drainByUserCalls: Array<{ sessId: string; userId: string; msgId: string; role: string; agentSessionId?: string | null }> = [];
     const storage: ServerAuthoredStorage = {
       async appendServerAuthoredMessage(sessId, userId, msg) {
         plainCalls.push({ sessId, userId, msgId: msg.id, role: msg.role });
@@ -650,8 +650,8 @@ describe("internalServerAuthored handler — requestId dispatch (cost-late-patch
         forRequestCalls.push({ requestId, sessId, userId, msgId: msg.id, role: msg.role });
         return { applied: true };
       },
-      async appendServerAuthoredMessageDrainByUser(sessId, userId, msg) {
-        drainByUserCalls.push({ sessId, userId, msgId: msg.id, role: msg.role });
+      async appendServerAuthoredMessageDrainByUser(sessId, userId, msg, agentSessionId) {
+        drainByUserCalls.push({ sessId, userId, msgId: msg.id, role: msg.role, agentSessionId });
         return { applied: true };
       },
     };
@@ -718,6 +718,34 @@ describe("internalServerAuthored handler — requestId dispatch (cost-late-patch
     assert.equal(spy.drainByUserCalls[0].msgId, "srv-sess12345-t0");
     assert.equal(spy.drainByUserCalls[0].userId, "c:42");
     assert.equal(spy.drainByUserCalls[0].role, "assistant");
+  });
+
+  test("assistant + missing requestId + agentSessionId → 透传 agentSessionId 给 storage(按 session 精确)", async () => {
+    const spy = spyStorage();
+    const h = makeServerAuthoredHandler({
+      identityRepo: makeRepoFor(VALID_TOKEN, VALID_HOST, VALID_IP),
+      storage: spy.storage,
+    });
+    const { res, rec } = makeRes();
+    await h(
+      authed(JSON.stringify({
+        sessionId: "sess12345",
+        turnIndex: 0,
+        status: "completed",
+        text: "answer",
+        agentSessionId: "113cb35c-c1d0-41ff-9cda-a6f370b622e0", // ccb getSessionId
+        // requestId 缺省 → ccb 路径
+      })),
+      res,
+      CTX,
+    );
+    assert.equal(rec.status, 200);
+    assert.equal(spy.drainByUserCalls.length, 1);
+    assert.equal(
+      spy.drainByUserCalls[0].agentSessionId,
+      "113cb35c-c1d0-41ff-9cda-a6f370b622e0",
+      "agentSessionId 从 body 透传到 storage drain(精确按 session 排空)",
+    );
   });
 
   test("assistant text + missing requestId + tools[] → tool plain, assistant drainByUser", async () => {

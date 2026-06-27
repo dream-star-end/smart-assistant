@@ -219,6 +219,10 @@ const BodySchema = z
      *  → 05-09: every DeepSeek V4 Pro turn was 400-rejected, fatal-dropped at
      *  the sink, and lost — refresh-recovery saw zero server-authored data). */
     requestId: z.string().min(8).max(128).optional(),
+    /** CCB agent session id(= proxy 从 LLM metadata.session_id 提取、park 进
+     *  pending.session_id 的同一 id)。ccb 助手落库时据此按 session 精确排空 pending
+     *  costCredits;缺省 → 退回 by-user。extractSessionId 上限 256。 */
+    agentSessionId: z.string().min(1).max(256).optional(),
     /** Plan §4.3 改动 6 — token usage from gateway-side stream-finalizer.
      *  Persisted into `messages[i].usage`. costCredits joins later via
      *  `appendCostCredits` patch (which mutates this same usage object). */
@@ -393,6 +397,7 @@ export interface ServerAuthoredStorage {
     sessId: string,
     userId: string,
     message: ServerAuthoredMessageInput,
+    agentSessionId?: string | null,
   ): Promise<
     | { applied: true }
     | { applied: false; reason: "session_not_found" | "session_deleted" | "already_exists" | "malformed" | "oversized" }
@@ -1101,6 +1106,8 @@ export function makeServerAuthoredHandler(
           body.sessionId,
           userId,
           lastAssistant.msg,
+          // 有 agentSessionId(新镜像)→ 按 session 精确排空;缺省(老镜像)→ by-user 兜底。
+          body.agentSessionId,
         );
       }
     } catch (err) {

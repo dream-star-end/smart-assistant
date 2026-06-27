@@ -354,6 +354,26 @@ describe("attemptSend — body cap shrink", () => {
     assert.equal(sent.text, "small assistant", "assistant preserved");
   });
 
+  test("agentSessionId 透传进 POST body(供 master 按 session 精确排空 pending cost)", async () => {
+    const { fetcher, captures } = makeCapturingFetcher();
+    const payload: V3MasterSinkPayload = {
+      ...PAYLOAD,
+      text: "answer",
+      agentSessionId: "113cb35c-c1d0-41ff-9cda-a6f370b622e0",
+    };
+    await attemptSend(payload, { config: CFG, fetcher });
+    assert.equal(captures.length, 1);
+    const sent = JSON.parse(captures[0].body) as Record<string, unknown>;
+    assert.equal(sent.agentSessionId, "113cb35c-c1d0-41ff-9cda-a6f370b622e0");
+  });
+
+  test("无 agentSessionId 时 body 不带该键(老路径/缺省安全)", async () => {
+    const { fetcher, captures } = makeCapturingFetcher();
+    await attemptSend({ ...PAYLOAD, text: "answer" }, { config: CFG, fetcher });
+    const sent = JSON.parse(captures[0].body) as Record<string, unknown>;
+    assert.equal("agentSessionId" in sent, false);
+  });
+
   test("tools[] + thinking together exceed cap → tools[] dropped first; if still over, thinkingText dropped second", async () => {
     const { fetcher, captures } = makeCapturingFetcher();
     const payload: V3MasterSinkPayload = {

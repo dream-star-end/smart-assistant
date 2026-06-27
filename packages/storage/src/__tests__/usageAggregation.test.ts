@@ -305,6 +305,24 @@ describe('usage aggregation: drain-by-user path (ccb-spawn, no per-turn requestI
     assert.equal(messages.length, 1)
     assert.equal(messages[0].usage?.costCredits, undefined, '无 pending → 不写 costCredits')
   })
+
+  it('T-ccb3: 给 agentSessionId 时按 session 精确排空,不碰同 user 其它 session', async () => {
+    await clearTables()
+    const userId = 'c:999'
+    await ensureSession(userId)
+    // 同一 user、两个 agent session 各 park 一笔(proxy 以 LLM metadata.session_id 为 key)。
+    await appendCostCredits('req-s-a1', userId, '4', 'sessA')
+    await appendCostCredits('req-s-b1', userId, '7', 'sessB')
+    // ccb 助手落库带 agentSessionId=sessA → 只收 sessA 的 4,sessB 不动。
+    const r = await appendServerAuthoredMessageDrainByUser(SESSION_ID, userId, {
+      id: 'srv-sa-t1', role: 'assistant' as const, text: 'a', ts: 5000, status: 'completed', usage: {},
+    }, 'sessA')
+    assert.deepEqual(r, { applied: true })
+    const msg = (await getMessages(SESSION_ID, userId)).find((m) => m.id === 'srv-sa-t1')
+    assert.equal(msg?.usage?.costCredits, '4', '只合入本 session(sessA)的成本')
+    assert.equal(await getPendingRow('req-s-a1', userId), undefined, 'sessA pending 已清')
+    assert.ok(await getPendingRow('req-s-b1', userId), 'sessB pending 保留(跨会话不归并)')
+  })
 })
 
 describe('usage aggregation: idempotency', () => {

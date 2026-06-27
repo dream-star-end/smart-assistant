@@ -1615,12 +1615,20 @@ export async function appendServerAuthoredMessageDrainByUser<T extends MessageLi
   sessId: string,
   userId: string,
   message: T,
+  // agent session id(ccb getSessionId,proxy 存进 pending.session_id)。给定 → 仅排空该
+  // session 的 pending(per-turn 精确:串行 turn 下一个 session 的累积 pending 即本轮成本,
+  // 消除同 user 跨会话归并)。缺省 → 退回按 user 排空(兜底:老 proxy / 缺 session)。
+  agentSessionId?: string | null,
 ): Promise<AppendForRequestResult> {
   const db = await getSessionsDb()
   const txn = db.transaction((): AppendForRequestResult => {
-    const pendings = db.prepare(
-      'SELECT request_id, cost_credits FROM pending_usage_patches WHERE user_id = ?'
-    ).all(userId) as { request_id: string; cost_credits: string }[]
+    const pendings = (agentSessionId
+      ? db.prepare(
+          'SELECT request_id, cost_credits FROM pending_usage_patches WHERE user_id = ? AND session_id = ?'
+        ).all(userId, agentSessionId)
+      : db.prepare(
+          'SELECT request_id, cost_credits FROM pending_usage_patches WHERE user_id = ?'
+        ).all(userId)) as { request_id: string; cost_credits: string }[]
     let sum = 0n
     for (const p of pendings) {
       try { const v = BigInt(p.cost_credits); if (v > 0n) sum += v } catch { /* skip malformed */ }
@@ -1676,6 +1684,10 @@ export async function appendCostCredits(
   requestId: string,
   userId: string,
   costCredits: string,
+  // agent session id(ccb getSessionId,proxy 从 LLM metadata.session_id 提取)。park 时一并
+  // 记入 pending.session_id,供 ccb 助手落库时按 session 精确 drain(消除 by-user 跨会话归并)。
+  // 缺省 → 存 NULL,退回 by-user 兜底(老 proxy / 拿不到 session 的路径)。
+  sessionId?: string | null,
 ): Promise<AppendCostCreditsResult> {
   const db = await getSessionsDb()
   const txn = db.transaction((): AppendCostCreditsResult => {
@@ -1759,11 +1771,12 @@ export async function appendCostCredits(
 
     db.prepare(
       `INSERT INTO pending_usage_patches (request_id, user_id, session_id, cost_credits)
-       VALUES (?, ?, NULL, ?)
+       VALUES (?, ?, ?, ?)
        ON CONFLICT (request_id, user_id) DO UPDATE SET
          cost_credits = excluded.cost_credits,
+         session_id = excluded.session_id,
          created_at = (CAST(strftime('%s','now') AS INTEGER)*1000)`
-    ).run(requestId, userId, costCredits)
+    ).run(requestId, userId, sessionId ?? null, costCredits)
     return { applied: 'pending' }
   })
   return txn()

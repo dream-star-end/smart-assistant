@@ -471,6 +471,11 @@ function persistServerAuthoredTurn(args: {
    *  path requires this for assistant writes (master schema refine).
    *  Legacy / personal path ignores it. */
   requestId?: string
+  /** CCB agent session id(= runner.sessionId,与 anthropicProxy 从 LLM
+   *  metadata.session_id 提取的一致)。v3 sink 透传给 master,使 ccb 助手落库时按
+   *  session 精确排空 pending costCredits(per-turn 精确,消除 by-user 跨会话归并)。
+   *  Legacy/personal path 忽略。 */
+  agentSessionId?: string
   /** Plan §4.4 改动 7 — token usage gathered at message_stop. Wire-only on
    *  the v3 sink path; legacy persists usage via the
    *  `outputs/usage_log` table separately. */
@@ -523,6 +528,7 @@ function persistServerAuthoredTurn(args: {
       // (thinking-only). Caller is responsible for supplying requestId on
       // the assistant path; we don't synthesize one here.
       ...(args.requestId !== undefined ? { requestId: args.requestId } : {}),
+      ...(args.agentSessionId !== undefined ? { agentSessionId: args.agentSessionId } : {}),
       ...(args.usage !== undefined ? { usage: args.usage } : {}),
       ...(args.truncated ? { truncated: true } : {}),
       ...(args.errorCode !== undefined ? { errorCode: args.errorCode } : {}),
@@ -2283,6 +2289,9 @@ export class SessionManager {
                 // there. When absent (personal-version dev), the legacy
                 // path is taken (sink is null) and requestId is ignored.
                 ...(requestId ? { requestId } : {}),
+                // CCB agent session id → 让 master 按 session 精确排空 pending costCredits
+                // (= anthropicProxy 从 LLM metadata.session_id 提取的同一 id)。
+                ...(session.ccbSessionId ? { agentSessionId: session.ccbSessionId } : {}),
                 usage: {
                   inputTokens: result.inputTokens,
                   outputTokens: result.outputTokens,
@@ -2467,6 +2476,8 @@ export class SessionManager {
                     // a copyable "请求ID" on its assistant row for log lookup.
                     ...(traceId ? { usage: { traceId, turn: turnIndex } } : {}),
                     ...(requestId ? { requestId } : {}),
+                    // CCB agent session id → master 按 session 精确排空 pending costCredits。
+                    ...(session.ccbSessionId ? { agentSessionId: session.ccbSessionId } : {}),
                     // Tools that completed before the crash/interrupt — they
                     // produced real outputs and deserve durable persistence
                     // alongside the partial text.
