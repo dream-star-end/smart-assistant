@@ -3,6 +3,7 @@
  * 二者都在 MarkdownImpl(懒加载 chunk)内按需用：mermaid 库再经 dynamic import 拆成
  * 独立 chunk(只有真出现 ```mermaid 才下载,不拖累首屏与普通对话)。
  */
+import { Maximize2, X } from "lucide-react";
 import { useEffect, useId, useRef, useState } from "react";
 
 /** ```mermaid 代码块 → 渲染成 SVG 流程图;失败回退源码。 */
@@ -128,31 +129,68 @@ export function ChartBlock({ code }: { code: string }) {
   );
 }
 
-/** ```html 代码块 → 默认显示源码,可切到沙盒 iframe 预览(allow-scripts,无 same-origin)。 */
+/** ```html 代码块 → **默认沙盒预览**(allow-scripts,无 same-origin),可切源码 + 全屏放大。 */
 export function HtmlPreview({ code }: { code: string }) {
-  const [show, setShow] = useState(false);
+  const [show, setShow] = useState(true); // 默认预览(boss:html 应默认渲染,而非看源码)
+  const [full, setFull] = useState(false);
+  // 全屏时按 Esc 退出。
+  useEffect(() => {
+    if (!full) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setFull(false);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [full]);
+  // sandbox 不含 allow-same-origin → 取不到父页 cookie/storage;仅 allow-scripts 跑演示。
+  const frame = (cls: string) => (
+    <iframe sandbox="allow-scripts" srcDoc={code} title="HTML 沙盒预览" className={cls} />
+  );
   return (
     <div className="my-3 overflow-hidden rounded-lg border border-border">
       <div className="flex items-center justify-between border-b border-border bg-hover px-3 py-1.5 text-[12px] text-muted">
         <span>HTML {show ? "预览(沙盒)" : "源码"}</span>
-        <button
-          type="button"
-          onClick={() => setShow((s) => !s)}
-          className="rounded-md px-2 py-0.5 text-accent outline-none hover:bg-accent-soft focus-visible:ring-2 focus-visible:ring-ring"
-        >
-          {show ? "看源码" : "预览"}
-        </button>
+        <div className="flex items-center gap-1">
+          {show && (
+            <button
+              type="button"
+              onClick={() => setFull(true)}
+              title="全屏放大"
+              aria-label="全屏放大预览"
+              className="rounded-md p-1 text-muted outline-none hover:bg-accent-soft hover:text-accent focus-visible:ring-2 focus-visible:ring-ring"
+            >
+              <Maximize2 size={13} />
+            </button>
+          )}
+          <button
+            type="button"
+            onClick={() => setShow((s) => !s)}
+            className="rounded-md px-2 py-0.5 text-accent outline-none hover:bg-accent-soft focus-visible:ring-2 focus-visible:ring-ring"
+          >
+            {show ? "看源码" : "预览"}
+          </button>
+        </div>
       </div>
       {show ? (
-        <iframe
-          // sandbox 不含 allow-same-origin → 取不到父页 cookie/storage;仅 allow-scripts 跑演示。
-          sandbox="allow-scripts"
-          srcDoc={code}
-          title="HTML 沙盒预览"
-          className="h-64 w-full bg-white"
-        />
+        frame("h-72 w-full bg-white")
       ) : (
         <pre className="max-h-72 overflow-auto bg-code px-3 py-2 font-mono text-xs text-fg">{code}</pre>
+      )}
+      {full && (
+        <div className="fixed inset-0 z-[60] flex flex-col bg-black/80 p-3 animate-in sm:p-6">
+          <div className="mb-2 flex items-center justify-between text-white">
+            <span className="text-sm opacity-80">HTML 预览(沙盒) · 按 Esc 退出</span>
+            <button
+              type="button"
+              onClick={() => setFull(false)}
+              aria-label="关闭全屏"
+              className="flex items-center gap-1 rounded-md bg-white/15 px-3 py-1.5 text-sm outline-none hover:bg-white/25 focus-visible:ring-2 focus-visible:ring-white/50"
+            >
+              <X size={16} /> 关闭
+            </button>
+          </div>
+          {frame("min-h-0 flex-1 w-full rounded-lg bg-white")}
+        </div>
       )}
     </div>
   );
