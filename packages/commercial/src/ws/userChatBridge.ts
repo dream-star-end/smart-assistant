@@ -1972,6 +1972,11 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
    */
   function broadcastToUser(uid: bigint, payload: unknown): number {
     const set = uidToUserWs.get(uid.toString());
+    log?.info("OCDIAG2 broadcastToUser", {
+      uid: uid.toString(),
+      ptype: (payload as { type?: string } | null)?.type ?? "?",
+      setSize: set ? set.size : 0,
+    });
     if (!set || set.size === 0) return 0;
     let text: string;
     try { text = JSON.stringify(payload); }
