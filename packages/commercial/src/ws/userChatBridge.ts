@@ -1101,6 +1101,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       let set = uidToUserWs.get(key);
       if (!set) { set = new Set(); uidToUserWs.set(key, set); }
       set.add(userWs);
+      log?.info("DIAG add", { connId, key, n: set.size });
     }
 
     // 连接超时:N ms 内 containerWs 没 OPEN → 取消 + 关 user
@@ -1937,6 +1938,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           set.delete(userWs);
           if (set.size === 0) uidToUserWs.delete(key);
         }
+        log?.info("DIAG detach", { connId, key, cause: triggerCause, remaining: uidToUserWs.get(key)?.size ?? 0 });
       }
     }
 
@@ -2004,6 +2006,9 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
    */
   function broadcastToUser(uid: bigint, payload: unknown): number {
     const set = uidToUserWs.get(uid.toString());
+    if (payload && typeof payload === "object" && (payload as { type?: string }).type === "outbound.cost_charged") {
+      log?.info("DIAG cost-bcast", { uid: uid.toString(), setSize: set?.size ?? -1, keys: [...uidToUserWs.keys()] });
+    }
     if (!set || set.size === 0) return 0;
     let text: string;
     try { text = JSON.stringify(payload); }
