@@ -23,6 +23,14 @@ export function MermaidBlock({ code }: { code: string }) {
           securityLevel: "strict",
           theme: document.documentElement.classList.contains("dark") ? "dark" : "default",
         });
+        // 先 parse 校验(suppressErrors→只返 bool,不向 document.body 注入错误图)。
+        // 流式时代码常是半截 → parse=false → 回退源码,绝不调 render(render 对坏输入会把
+        // "Syntax error" SVG 注入 body 残留)。代码写完变有效后,effect 重跑再真正 render。
+        const ok = await mermaid.parse(code, { suppressErrors: true });
+        if (!ok) {
+          if (alive) setErr(true);
+          return;
+        }
         const id = "mmd" + rawId.replace(/[^a-zA-Z0-9]/g, "");
         const out = await mermaid.render(id, code);
         if (alive) setSvg(out.svg);
