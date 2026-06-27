@@ -178,6 +178,16 @@ export class ChatSocket {
   private offlineDrainTimer: ReturnType<typeof setTimeout> | null = null;
   private drainTimeoutTimer: ReturnType<typeof setTimeout> | null = null;
   private drainGeneration = 0;
+  /**
+   * 本连接上 direct-send(readyState===1 快路径)出去、尚未确认送达的消息(每 session 最新一条)。
+   * 冷启时 bridge 先完成 WS 握手(前端 onopen)再查容器就绪,不就绪则 close(4503/provisioning);
+   * 这窗口内 direct-send 的消息发给了即将被 4503 关闭的连接、relay 从未建立 → **必未送达容器**,
+   * 且不在 offlineQueue 里、原 onclose re-queue 漏掉它 → 冷启首条消息丢失。onclose 若判定为
+   * provisioning(4503),把这些重排回 offlineQueue 等下次连接 drain(idempotencyKey 去重,重发安全);
+   * 非 provisioning 关闭(mid-turn heartbeat 等)则丢弃,由 hello/resume 续传机制处理,不重发防重复。
+   * 每次 onclose 清空(连接级);同 session 再 direct-send 覆盖旧条。
+   */
+  private inFlightSends = new Map<string, OfflineItem>();
 
   // ── 生命周期事件绑定句柄 ──
   private boundOnline?: () => void;
@@ -640,6 +650,22 @@ export class ChatSocket {
 
       const decision = classifyClose(e.code, e.reason);
 
+      // 冷启 container-not-ready(4503/provisioning)关闭:relay 从未建立,本连接 direct-send 的
+      // 消息必未送达容器 → 重排回 offlineQueue,reconnect 后 onopen 自动 drain(idempotencyKey
+      // 去重,重发安全)。非 provisioning 关闭(mid-turn heartbeat 等)→ 丢弃,由 hello/resume
+      // 续传处理,不重发防重复。inFlightSends 每次 onclose 清空(连接级)。
+      if (this.inFlightSends.size > 0) {
+        const lostDirect = [...this.inFlightSends.values()];
+        this.inFlightSends.clear();
+        if (decision.provisioning) {
+          this.offlineQueue.unshift(...lostDirect);
+          for (const it of lostDirect) {
+            const m = this.sessions.get(it.sessId)?.messages.find((mm) => mm.id === it.msgId);
+            if (m && m.status === "sent") m.status = "queued";
+          }
+        }
+      }
+
       if (decision.action === "policy" && decision.policy) {
         this.setProvisioningBanner(false);
         this.setStatus(decision.policy.status, "disconnected");
@@ -983,6 +1009,7 @@ export class ChatSocket {
   removeSession(sessId: string): void {
     this.serverSessionEnsured.delete(sessId);
     this.serverSessionInflight.delete(sessId);
+    this.inFlightSends.delete(sessId);
     if (this.sessions.delete(sessId)) this.scheduleNotify();
   }
 
@@ -991,9 +1018,10 @@ export class ChatSocket {
    * service 跨登出存活，若不清，换号后旧会话残留内存。调用前 WS 应已 stop（无活跃 turn）。
    */
   resetSessions(): void {
-    // Set 无条件清(即使 sessions 已空也可能有残留 ensured/inflight,Codex 审 LOW)。
+    // Set/Map 无条件清(即使 sessions 已空也可能有残留 ensured/inflight,Codex 审 LOW)。
     this.serverSessionEnsured.clear();
     this.serverSessionInflight.clear();
+    this.inFlightSends.clear();
     if (this.sessions.size === 0) return;
     this.sessions.clear();
     this.scheduleNotify();
@@ -1150,6 +1178,9 @@ export class ChatSocket {
     }
     if (sentNow) {
       userMsg.status = "sent";
+      // 记录 direct-send 在途消息:若本连接随后 4503/provisioning 关闭(relay 从未建立 = 必未送达),
+      // onclose 会把它重排回 offlineQueue 重试,修复冷启首条消息丢失(见 inFlightSends 注释)。
+      this.inFlightSends.set(sess.id, { sessId: sess.id, payload, msgId: userMsg.id });
       sess._sendingInFlight = true;
       sess._turnStartedAt = Date.now();
       // 新 turn 开始：清跨 turn 计费归因状态（与 drain / auto-continue turn-start 一致）。
