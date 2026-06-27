@@ -660,8 +660,17 @@ export class ChatSocket {
         if (decision.provisioning) {
           this.offlineQueue.unshift(...lostDirect);
           for (const it of lostDirect) {
-            const m = this.sessions.get(it.sessId)?.messages.find((mm) => mm.id === it.msgId);
+            const s = this.sessions.get(it.sessId);
+            if (!s) continue;
+            const m = s.messages.find((mm) => mm.id === it.msgId);
             if (m && m.status === "sent") m.status = "queued";
+            // 关键(Codex 审 BLOCKER):必须回退 in-flight 态,否则 drainNextOfflineItem 因
+            // _sendingInFlight===true 跳过该项;冷启 4503 下 relay 未建立、无 final/resume 清此
+            // flag → 重排进去的消息永久卡 queued 不 drain。把会话退回"待发"态让 drain 能真发。
+            s._sendingInFlight = false;
+            clearTurnTiming(s);
+            resetReplyTracker(s);
+            this.clearThinkingSafety(s.id);
           }
         }
       }
