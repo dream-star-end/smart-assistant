@@ -1085,6 +1085,8 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       let set = uidToUserWs.get(key);
       if (!set) { set = new Set(); uidToUserWs.set(key, set); }
       set.add(userWs);
+      // eslint-disable-next-line no-console
+      console.log(`OCDIAG uidToUserWs ADD uid=${key} size=${set.size}`);
     }
 
     // 连接超时:N ms 内 containerWs 没 OPEN → 取消 + 关 user
@@ -1898,6 +1900,8 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           set.delete(userWs);
           if (set.size === 0) uidToUserWs.delete(key);
         }
+        // eslint-disable-next-line no-console
+        console.log(`OCDIAG uidToUserWs DETACH uid=${key} cause=${triggerCause} remain=${set ? set.size : -1}`);
       }
     }
 
