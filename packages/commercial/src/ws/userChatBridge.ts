@@ -1079,14 +1079,23 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     };
     const { unregister } = registry.register(conn);
 
-    // 同步加入 uid→ws 表,broadcastToUser 用得到。cleanup 里务必同步删除。
+    // 同步加入 uid→ws 表,broadcastToUser 用得到。
+    // ⚠️ 生命周期绑定到 userWs 的真实 'close' 事件,而非 detachUserSide。
+    //   bug(P7):detachUserSide 在 per-turn drain 等早期就跑,会把仍在 relay 的 user WS 从
+    //   uidToUserWs 删掉 → cost_charged 广播时 set 为空 → 前端永远收不到积分。绑 'close' 后,
+    //   连接整个存活期都留在广播集合里(broadcastToUser 已按 readyState!==OPEN 跳过陈旧条目)。
     {
       const key = uid.toString();
       let set = uidToUserWs.get(key);
       if (!set) { set = new Set(); uidToUserWs.set(key, set); }
       set.add(userWs);
-      // eslint-disable-next-line no-console
-      console.log(`OCDIAG uidToUserWs ADD uid=${key} size=${set.size}`);
+      userWs.on("close", () => {
+        const s = uidToUserWs.get(key);
+        if (s) {
+          s.delete(userWs);
+          if (s.size === 0) uidToUserWs.delete(key);
+        }
+      });
     }
 
     // 连接超时:N ms 内 containerWs 没 OPEN → 取消 + 关 user
@@ -1893,16 +1902,10 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         try { userWs.terminate(); } catch { /* */ }
       }
       unregister();
-      {
-        const key = uid.toString();
-        const set = uidToUserWs.get(key);
-        if (set) {
-          set.delete(userWs);
-          if (set.size === 0) uidToUserWs.delete(key);
-        }
-        // eslint-disable-next-line no-console
-        console.log(`OCDIAG uidToUserWs DETACH uid=${key} cause=${triggerCause} remain=${set ? set.size : -1}`);
-      }
+      // uidToUserWs 的移除改由 userWs 的 'close' 事件负责(见注册处注释)——detachUserSide
+      // 可能在连接仍活时(per-turn drain)就跑,这里删会导致广播丢失 cost_charged。
+      // 非 client_close 路径上面已 terminate(userWs),'close' 会触发移除;client_close
+      // 本就由对端关闭触发 'close'。两条路径都收敛到 'close' handler,无泄漏。
     }
 
     /**
@@ -1969,14 +1972,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
    */
   function broadcastToUser(uid: bigint, payload: unknown): number {
     const set = uidToUserWs.get(uid.toString());
-    if (!set || set.size === 0) {
-      // 临时诊断(P7):set 为空 → 广播无目标(注册/detach 时序问题)。
-      log?.info("user-chat-bridge: broadcastToUser empty", {
-        uid: uid.toString(),
-        ptype: (payload as { type?: string } | null)?.type ?? "?",
-      });
-      return 0;
-    }
+    if (!set || set.size === 0) return 0;
     let text: string;
     try { text = JSON.stringify(payload); }
     catch (err) {
@@ -1986,9 +1982,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       return 0;
     }
     let sent = 0;
-    const states: number[] = [];
     for (const ws of set) {
-      states.push(ws.readyState);
       if (ws.readyState !== WebSocket.OPEN) continue;
       try {
         ws.send(text, { binary: false }, (err) => {
@@ -2003,14 +1997,6 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         });
       }
     }
-    // 临时诊断(P7 积分广播):记 setSize/各 ws readyState/实际 sent,定位为何浏览器收不到。
-    log?.info("user-chat-bridge: broadcastToUser sent", {
-      uid: uid.toString(),
-      ptype: (payload as { type?: string } | null)?.type ?? "?",
-      setSize: set.size,
-      states: states.join(","),
-      sent,
-    });
     return sent;
   }
 
