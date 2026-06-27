@@ -49,10 +49,10 @@ import {
   recordAccess,
   searchSessions,
   searchSkillMetadata,
+  syncMarketplaceHub,
   upsertArchivalVector,
   upsertSessionMeta,
 } from '@openclaude/storage'
-import { syncMarketplaceHub } from './marketplaceSync.js'
 
 const AGENT_ID = process.env.OPENCLAUDE_AGENT_ID ?? 'main'
 

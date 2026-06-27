@@ -62,7 +62,7 @@ export interface SkillFrontmatter {
 
 export type SkillSource = 'user' | 'platform'
 
-/** Precise overlay layer a skill was resolved from. ('hub' = ClawHub-installed; not wired into the runtime overlay yet.) */
+/** Precise overlay layer a skill was resolved from. ('hub' = marketplace-installed, reconciled by syncMarketplaceHub into the read-only hub overlay; lowest precedence.) */
 export type SkillLayer = 'platform' | 'agent-seed' | 'shared' | 'legacy' | 'hub'
 
 export interface SkillMetadata extends SkillFrontmatter {

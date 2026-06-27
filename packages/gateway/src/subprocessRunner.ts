@@ -3,7 +3,12 @@ import { EventEmitter } from 'node:events'
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, isAbsolute, resolve } from 'node:path'
-import { type McpServerConfig, type OpenClaudeConfig, paths } from '@openclaude/storage'
+import {
+  type McpServerConfig,
+  type OpenClaudeConfig,
+  paths,
+  syncMarketplaceHub,
+} from '@openclaude/storage'
 import { createLogger } from './logger.js'
 import {
   OPENCLAUDE_VISION_MCP_ID,
@@ -1130,6 +1135,20 @@ export class SubprocessRunner extends EventEmitter {
     for (const srv of this.opts.agentMcpServers ?? []) {
       if (srv.enabled === false) continue
       addAvailableTools(srv.tools)
+    }
+
+    // Pre-prompt: deterministically reconcile marketplace-installed skills into
+    // the hub overlay BEFORE building the skills slot, so a freshly-installed
+    // skill lands in this session's static prompt (not merely eventual /
+    // tool-visible). syncMarketplaceHub is fail-soft + a no-op outside a v3/v5
+    // commercial container (no master base url / container token), so this is
+    // free elsewhere. mcp-memory still kicks a background sync on startup; both
+    // call the same idempotent reconcile. Bounded (4s) + try/catch so a slow or
+    // unreachable master can never stall or break a new session.
+    try {
+      await syncMarketplaceHub({ timeoutMs: 4000 })
+    } catch {
+      /* fail-soft: hub sync must never block or fail the turn */
     }
 
     // Build merged extra system prompt via structured prompt slots

@@ -456,3 +456,92 @@ export type SkillSummary = {
 export type SkillDetail = SkillSummary & {
   body?: string;
 };
+
+// ── AI 市场（marketplace，见 packages/commercial/src/marketplace） ──────────
+
+/** 静态安全扫描命中项（发布被拦截时返回，前端做友好提示）。 */
+export type MarketplaceRiskFlag = {
+  category: string;
+  severity: string;
+  code: string;
+  message: string;
+  sample?: string;
+  block: boolean;
+};
+
+/** 市场目录卡片（GET /api/marketplace/search 的 results 项）。 */
+export type MarketplaceCard = {
+  slug: string;
+  name: string;
+  description: string;
+  tags: string[];
+  /** 仅 embedding 检索时带回，用于排序展示，可忽略。 */
+  score?: number;
+};
+
+/** 市场检索响应。method=all 为空查询返全部目录。 */
+export type MarketplaceSearchResult = {
+  results: MarketplaceCard[];
+  method: "all" | "keyword" | "embed";
+};
+
+/** 市场条目详情（GET /api/marketplace/:slug 的 detail，含完整 SKILL.md 供安装确认）。 */
+export type MarketplaceDetail = {
+  slug: string;
+  state: string;
+  ownerUserId: string;
+  version: string;
+  versionId: string;
+  name: string;
+  description: string;
+  tags: string[];
+  artifactHash: string;
+  rawSkillMd: string;
+  riskFlags: MarketplaceRiskFlag[];
+  installCount: number;
+};
+
+/** 已安装条目（GET /api/marketplace/installed 的 installed 项）。 */
+export type MarketplaceInstalled = {
+  slug: string;
+  version: string;
+  versionId: string;
+  name: string;
+  artifactHash: string;
+  installedAt: string;
+  listingState: string;
+};
+
+/** 待审版本（GET /api/admin/marketplace/pending 的 pending 项，含完整正文供审核）。 */
+export type MarketplacePending = {
+  versionId: string;
+  slug: string;
+  version: string;
+  name: string;
+  description: string;
+  tags: string[];
+  rawSkillMd: string;
+  riskFlags: MarketplaceRiskFlag[];
+  submittedBy: string;
+  ownerUserId: string;
+  createdAt: string;
+};
+
+/** 发布入参（POST /api/marketplace/publish）。 */
+export type MarketplacePublishInput = {
+  slug: string;
+  version: string;
+  name: string;
+  description: string;
+  body: string;
+  tags: string[];
+};
+
+/** 发布响应（200 已提交待审）。 */
+export type MarketplacePublishResult = {
+  ok: boolean;
+  versionId: string;
+  status: string;
+  riskFlags: MarketplaceRiskFlag[];
+  note: string;
+};

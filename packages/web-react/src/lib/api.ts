@@ -9,6 +9,12 @@ import type {
   CronJob,
   SkillDetail,
   SkillSummary,
+  MarketplaceDetail,
+  MarketplaceInstalled,
+  MarketplacePending,
+  MarketplacePublishInput,
+  MarketplacePublishResult,
+  MarketplaceSearchResult,
   HupiCreateResult,
   LoginResult,
   MediaSignResult,
@@ -1030,6 +1036,126 @@ export const api = {
           method: "DELETE",
           credentials: "include",
           headers: bearerHeaders(t),
+        }),
+      ),
+    ),
+
+  // ── AI 市场（marketplace，见 packages/commercial/src/marketplace） ─────────
+
+  /** 市场检索/浏览（GET /api/marketplace/search?q=&limit=，空 q 返全部目录）。 */
+  searchMarketplace: (a: AuthSession, q = "", limit = 50) =>
+    jsonOrThrow<MarketplaceSearchResult>(
+      callWithRefresh(a, (t) =>
+        fetch(`/api/marketplace/search?q=${encodeURIComponent(q)}&limit=${limit}`, {
+          credentials: "include",
+          headers: bearerHeaders(t),
+        }),
+      ),
+    ),
+
+  /** 市场条目详情（GET /api/marketplace/:slug，含完整 SKILL.md 供安装确认）。 */
+  getMarketplaceDetail: (a: AuthSession, slug: string) =>
+    jsonOrThrow<{ detail: MarketplaceDetail }>(
+      callWithRefresh(a, (t) =>
+        fetch(`/api/marketplace/${encodeURIComponent(slug)}`, {
+          credentials: "include",
+          headers: bearerHeaders(t),
+        }),
+      ),
+    ).then((b) => b.detail),
+
+  /** 安装一个已批准版本（POST /api/marketplace/install）。 */
+  installMarketplace: (a: AuthSession, versionId: string) =>
+    jsonOrThrow<{ ok: boolean; slug: string; version: string; note: string }>(
+      callWithRefresh(a, (t) =>
+        fetch("/api/marketplace/install", {
+          method: "POST",
+          credentials: "include",
+          headers: bearerHeaders(t, true),
+          body: JSON.stringify({ versionId }),
+        }),
+      ),
+    ),
+
+  /** 我的已安装（GET /api/marketplace/installed）。 */
+  listMarketplaceInstalled: (a: AuthSession) =>
+    jsonOrThrow<{ installed: MarketplaceInstalled[] }>(
+      callWithRefresh(a, (t) =>
+        fetch("/api/marketplace/installed", {
+          credentials: "include",
+          headers: bearerHeaders(t),
+        }),
+      ),
+    ).then((b) => b.installed || []),
+
+  /** 卸载（DELETE /api/marketplace/installed/:slug）。 */
+  uninstallMarketplace: (a: AuthSession, slug: string) =>
+    jsonOrThrow<{ ok: boolean }>(
+      callWithRefresh(a, (t) =>
+        fetch(`/api/marketplace/installed/${encodeURIComponent(slug)}`, {
+          method: "DELETE",
+          credentials: "include",
+          headers: bearerHeaders(t),
+        }),
+      ),
+    ),
+
+  /**
+   * 发布（POST /api/marketplace/publish）。被静态扫描拦截时抛 ApiError
+   * (status 422, code SCAN_BLOCKED, body 含 riskFlags)，上层据此做友好提示。
+   */
+  publishMarketplace: (a: AuthSession, input: MarketplacePublishInput) =>
+    jsonOrThrow<MarketplacePublishResult>(
+      callWithRefresh(a, (t) =>
+        fetch("/api/marketplace/publish", {
+          method: "POST",
+          credentials: "include",
+          headers: bearerHeaders(t, true),
+          body: JSON.stringify(input),
+        }),
+      ),
+    ),
+
+  // ── 管理员审核（admin；后端 requireAdminVerifyDb 二次把关） ────────────────
+
+  /** 待审版本列表（GET /api/admin/marketplace/pending）。 */
+  adminMarketplacePending: (a: AuthSession) =>
+    jsonOrThrow<{ pending: MarketplacePending[] }>(
+      callWithRefresh(a, (t) =>
+        fetch("/api/admin/marketplace/pending", {
+          credentials: "include",
+          headers: bearerHeaders(t),
+        }),
+      ),
+    ).then((b) => b.pending || []),
+
+  /** 审核(批准/拒绝)一个版本（POST /api/admin/marketplace/:id/review）。 */
+  adminMarketplaceReview: (
+    a: AuthSession,
+    versionId: string,
+    decision: "approve" | "reject",
+    note?: string,
+  ) =>
+    jsonOrThrow<{ ok: boolean }>(
+      callWithRefresh(a, (t) =>
+        fetch(`/api/admin/marketplace/${encodeURIComponent(versionId)}/review`, {
+          method: "POST",
+          credentials: "include",
+          headers: bearerHeaders(t, true),
+          body: JSON.stringify({ decision, note }),
+        }),
+      ),
+    ),
+
+  /** 下架(kill-switch)一个条目（POST /api/admin/marketplace/:slug/revoke）。 */
+  adminMarketplaceRevoke: (a: AuthSession, slug: string, reason?: string) =>
+    jsonOrThrow<{ ok: boolean; affectedInstalls: number; affectedUserIds: number[] }>(
+      callWithRefresh(a, (t) =>
+        fetch(`/api/admin/marketplace/${encodeURIComponent(slug)}/revoke`, {
+          method: "POST",
+          credentials: "include",
+          headers: bearerHeaders(t, true),
+          body: JSON.stringify({ reason }),
         }),
       ),
     ),

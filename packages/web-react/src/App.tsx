@@ -8,6 +8,7 @@ import { EmptyState } from "./components/EmptyState";
 import { type ChatError, ErrorBanner } from "./components/ErrorBanner";
 import { Landing } from "./components/Landing";
 import { ManageCenter, type ManageTab } from "./components/ManageCenter";
+import { MarketplaceCenter, type MarketplaceTab } from "./components/MarketplaceCenter";
 import { AssistantMessage, UserMessage } from "./components/Message";
 import { MessageList } from "./components/MessageRenderer";
 import type { CardCallbacks } from "./components/chat/cards";
@@ -131,6 +132,8 @@ export function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [manageOpen, setManageOpen] = useState(false);
   const [manageTab, setManageTab] = useState<ManageTab>("memory");
+  const [marketplaceOpen, setMarketplaceOpen] = useState(false);
+  const [marketplaceTab, setMarketplaceTab] = useState<MarketplaceTab>("browse");
   const scrollRef = useRef<HTMLDivElement>(null);
   const stopRef = useRef(false);
   // 稳定句柄：让早于 useChatSocket 声明的 send/regenerate 回调引用 WS 引擎，避免
@@ -421,6 +424,12 @@ export function App() {
     setManageOpen(true);
   }, []);
 
+  // 打开 AI 市场到指定分区（侧栏入口）。
+  const openMarketplace = useCallback((tab: MarketplaceTab) => {
+    setMarketplaceTab(tab);
+    setMarketplaceOpen(true);
+  }, []);
+
   // 键盘快捷键：⌘/Ctrl+K 新会话；Esc 停止当前（demo）流式。仅在进入工作区后生效。
   const inWorkspace = demo || (view === "app" && !!auth && !!user);
 
@@ -681,6 +690,7 @@ export function App() {
     onDelete: deleteSessionConfirm,
     onLogout: demo ? undefined : logout,
     onOpenManage: demo ? undefined : () => openManage("memory"),
+    onOpenMarketplace: demo ? undefined : () => openMarketplace("browse"),
   };
 
   return (
@@ -854,6 +864,15 @@ export function App() {
         agentId={agent.id}
         onTabChange={setManageTab}
         onClose={() => setManageOpen(false)}
+      />
+
+      <MarketplaceCenter
+        open={marketplaceOpen}
+        tab={marketplaceTab}
+        auth={auth}
+        isAdmin={user?.role === "admin"}
+        onTabChange={setMarketplaceTab}
+        onClose={() => setMarketplaceOpen(false)}
       />
     </div>
     </ToolCardActionsContext.Provider>
