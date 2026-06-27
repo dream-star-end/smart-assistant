@@ -8,10 +8,24 @@
  */
 import ReactMarkdown from "react-markdown";
 import rehypeHighlight from "rehype-highlight";
+import rehypeKatex from "rehype-katex";
 import remarkGfm from "remark-gfm";
+import remarkMath from "remark-math";
+import "katex/dist/katex.min.css";
+import type { ReactNode } from "react";
 import { SignedAudio, SignedImg, SignedVideo } from "./chat/media";
 import { CodeBlock } from "./CodeBlock";
+import { HtmlPreview, MermaidBlock } from "./RichBlocks";
 import type { MarkdownProps } from "./Markdown";
+
+/** 从(可能被 highlight 包成 span 的)code children 递归还原纯源码文本 —— mermaid/html 富块要原文。 */
+function nodeText(node: ReactNode): string {
+  if (node == null || node === false || node === true) return "";
+  if (typeof node === "string" || typeof node === "number") return String(node);
+  if (Array.isArray(node)) return node.map(nodeText).join("");
+  const props = (node as { props?: { children?: ReactNode } }).props;
+  return props?.children != null ? nodeText(props.children) : "";
+}
 
 // ── 媒体内联嵌入（对齐现网 embedMediaUrls）──────────────────────────────────
 // 技能/工具常把生成或上传的文件写到容器 /home/agent/.openclaude/... 然后在正文里以
@@ -89,9 +103,11 @@ export default function MarkdownImpl({ children, signMedia }: MarkdownProps) {
   return (
     <div className="prose">
       <ReactMarkdown
-        remarkPlugins={[remarkGfm]}
+        remarkPlugins={[remarkGfm, remarkMath]}
         rehypePlugins={[
           [rehypeHighlight, { detect: true, ignoreMissing: true }],
+          // 数学公式：$..$ / $$..$$ → KaTeX 渲染(remarkMath 解析 + rehypeKatex 出 HTML)。
+          [rehypeKatex, { strict: false, throwOnError: false }],
           // 仅在 signMedia(助手正文)启用：把媒体路径行内码转成可签名媒体节点。
           ...(signMedia ? [rehypeEmbedMedia] : []),
         ]}
@@ -108,6 +124,10 @@ export default function MarkdownImpl({ children, signMedia }: MarkdownProps) {
             const lang = /language-(\w+)/.exec(className || "")?.[1];
             const isBlock = className?.includes("language-") || String(children).includes("\n");
             if (isBlock) {
+              // 富块:mermaid 流程图 / html 沙盒预览(取原文,绕开 highlight 的 span 包裹)。
+              if (lang === "mermaid") return <MermaidBlock code={nodeText(children).replace(/\n$/, "")} />;
+              if (lang === "html" || lang === "htmlpreview")
+                return <HtmlPreview code={nodeText(children).replace(/\n$/, "")} />;
               return (
                 <CodeBlock language={lang}>
                   <span className={className} {...props}>
