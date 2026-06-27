@@ -40,6 +40,7 @@ import {
   backoffDelay,
   type ChatStatusClass,
   classifyClose,
+  COST_CHARGED_LAST_FINAL_TTL_MS,
   type EmptyTurnDecision,
   emptyTurnNoticeText,
   KEEPALIVE_INTERVAL_MS,
@@ -93,8 +94,10 @@ export type ChatSocketDeps = {
    * 无界重试风暴 + cost_charged 归因/投递链路连带失效。fire-and-forget：建行是快 REST，
    * 远早于容器跑完 LLM turn 后的 authored POST；upsertClientSession 用 baseSyncedAt=0 +
    * mergePreservingServerAuthored，已存在则 rejected_stale 空操作，绝不 clobber 历史。
+   * 返回**是否已确认建行**：true=PUT 200 或 409-stale（行已存在）；false=网络/5xx/401 等失败
+   * （调用方据此不标 ensured、下次发送/重连重试，见 socket.ts serverSessionInflight，Codex 审 MAJOR）。
    */
-  ensureServerSession?: (sessId: string, agentId: string, title?: string) => void;
+  ensureServerSession?: (sessId: string, agentId: string, title?: string) => Promise<boolean> | boolean;
   /** 立即把某会话快照落 IndexedDB（resume_failed 游标推进 / isFinal turn 收尾时调）。*/
   persistSession?: (sessId: string) => void;
   defaultAgentId?: string;
@@ -120,8 +123,10 @@ const WS_PATH = "/ws/user-chat-bridge";
 export class ChatSocket {
   private deps: ChatSocketDeps;
   readonly sessions = new Map<string, ChatSession>();
-  /** 已在主控建过行的会话 id(每会话只 PUT 一次,避免重复 REST + 409 churn)。登出清。*/
+  /** 已确认在主控建过行的会话 id(PUT 200 或 409-stale 才进;每会话只成功建一次)。登出清。*/
   private serverSessionEnsured = new Set<string>();
+  /** 建行 PUT 在途的会话 id(防并发重复 PUT)。PUT 失败时从此移除以便下次重试(不进 ensured)。*/
+  private serverSessionInflight = new Set<string>();
 
   // ── 订阅 / 批量 notify ──
   private listeners = new Set<() => void>();
@@ -810,21 +815,34 @@ export class ChatSocket {
    * cost_charged 的路由目标会话。frame.sessionId 是 **agent 内部会话 UUID**(来自容器 LLM
    * 请求的 metadata,extractSessionId),与前端 **client peer 会话键**(sess.id=peerId)是
    * 两套口径,直接 `sessions.get(sessionId)` 必失配 → 旧实现落 null → per-response 积分永不归因
-   * (只剩钱包余额刷新)。cost_charged 经 broadcastToUser 按 uid 投递、且恰在当前 turn 收尾后到,
-   * 故路由到"当前在飞 / 最近收尾"的会话最稳。安全性由 applyCostCharged 内部门控兜底:它只认
-   * _streamingAssistant 或 60s 内 _lastFinaledAssistantId,选错会话则 target=null 仅刷余额、不误算。
+   * (只剩钱包余额刷新)。cost_charged 经 broadcastToUser 按 uid 投递、恰在当前 turn 收尾后到,
+   * 故应路由到"正在等响应"的那条会话。
+   *
+   * **保守归因(Codex 审 HIGH)**:多会话并发(如 A 刚 isFinal、B 仍 streaming)无法仅凭
+   * "活跃"区分 cost 属于谁,盲猜会把 A 的 cost 算到 B。故只在**候选唯一**时归因;0 个或 ≥2 个
+   * 候选 → 返回 null(applyCostCharged 仅刷余额、不误挂任何消息)。候选 = streaming/sending
+   * 或 60s 内刚收尾的会话。单会话(canary/绝大多数实际)恒唯一,正常归因。
+   * TODO 后端 cost_charged 带的 requestId(=usage.traceId 口径)→ 可精确按 traceId 匹配消息,
+   *      届时替换此启发式即可支持并发归因。
    */
   private costTargetSession(): ChatSession | null {
-    let recentFinal: ChatSession | null = null;
-    let recentAt = 0;
+    const now = Date.now();
+    let only: ChatSession | null = null;
+    let count = 0;
     for (const s of this.sessions.values()) {
-      if (s._streamingAssistant || s._sendingInFlight) return s;
-      if (s._lastFinaledAssistantId && s._lastFinaledAt && s._lastFinaledAt > recentAt) {
-        recentAt = s._lastFinaledAt;
-        recentFinal = s;
+      const active =
+        !!s._streamingAssistant ||
+        s._sendingInFlight ||
+        (!!s._lastFinaledAssistantId &&
+          !!s._lastFinaledAt &&
+          now - s._lastFinaledAt < COST_CHARGED_LAST_FINAL_TTL_MS);
+      if (active) {
+        count += 1;
+        only = s;
+        if (count > 1) return null; // 多候选:不猜,避免跨会话误算
       }
     }
-    return recentFinal ?? this.firstSession();
+    return count === 1 ? only : null;
   }
 
   private buildHelloFrame(): string {
@@ -963,6 +981,8 @@ export class ChatSocket {
   }
 
   removeSession(sessId: string): void {
+    this.serverSessionEnsured.delete(sessId);
+    this.serverSessionInflight.delete(sessId);
     if (this.sessions.delete(sessId)) this.scheduleNotify();
   }
 
@@ -971,9 +991,11 @@ export class ChatSocket {
    * service 跨登出存活，若不清，换号后旧会话残留内存。调用前 WS 应已 stop（无活跃 turn）。
    */
   resetSessions(): void {
+    // Set 无条件清(即使 sessions 已空也可能有残留 ensured/inflight,Codex 审 LOW)。
+    this.serverSessionEnsured.clear();
+    this.serverSessionInflight.clear();
     if (this.sessions.size === 0) return;
     this.sessions.clear();
-    this.serverSessionEnsured.clear();
     this.scheduleNotify();
   }
 
@@ -1080,10 +1102,19 @@ export class ChatSocket {
   }): void {
     const sess = this.ensureSession(p.sessId, p.agentId);
     // 主控 session 建行(每会话一次):必须在容器跑完 turn 回传 authored 消息之前落地,
-    // 否则 session_not_found 风暴。fire-and-forget,见 deps.ensureServerSession 注释。
-    if (!this.serverSessionEnsured.has(sess.id)) {
-      this.serverSessionEnsured.add(sess.id);
-      this.deps.ensureServerSession?.(sess.id, p.agentId, sess.title);
+    // 否则 session_not_found 风暴。**只在 PUT 确认成功(返回 true)后才标 ensured**;失败则清
+    // inflight、下次发送重试(Codex 审 MAJOR:旧实现发送即标 ensured,PUT 失败被吞 → 永不重建)。
+    if (!this.serverSessionEnsured.has(sess.id) && !this.serverSessionInflight.has(sess.id)) {
+      this.serverSessionInflight.add(sess.id);
+      const sid = sess.id;
+      void Promise.resolve(this.deps.ensureServerSession?.(sid, p.agentId, sess.title))
+        .then((ok) => {
+          this.serverSessionInflight.delete(sid);
+          if (ok) this.serverSessionEnsured.add(sid);
+        })
+        .catch(() => {
+          this.serverSessionInflight.delete(sid);
+        });
     }
     const media = p.media && p.media.length > 0 ? p.media : undefined;
     const payload: InboundMessage = {

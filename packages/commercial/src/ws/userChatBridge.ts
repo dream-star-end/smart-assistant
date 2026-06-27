@@ -130,8 +130,12 @@ const DEFAULT_HEARTBEAT_TIMEOUT_MS = 60_000;
 // turn 在飞最长心跳宽限。CF/Caddy 不转发 WS ping/pong 控制帧 → 浏览器在等长 turn
 // (冷启 TTFT / 长生成 / 慢工具 / 静默推理)期间没有任何上行信号刷 lastAlive,会被 60s
 // 心跳误杀,连带丢掉响应帧与 cost_charged(计费在 turn 收尾后才广播)。对策:用户发了
-// inbound.message 即视为"在等响应",turn 在飞期间不 reap;但加硬上限防卡死 turn 永不回收。
+// inbound.message 即视为"在等响应",turn 在飞期间不 reap;但这是从 turn 起点算的**硬上限**,
+// 防"浏览器真断 + turn 卡死"的连接永不回收(turnActiveUntil 不被下行帧续期,见 Codex 审)。
 const MAX_TURN_GRACE_MS = 10 * 60_000;
+// turn 收尾(isFinal)后保留的短宽限:cost_charged 在 isFinal 之后才广播,留窗口确保它
+// 还能投到 user WS;窗口过后回归正常 idle 回收。取 min(原硬上限剩余, 此值),只缩不延。
+const POST_FINAL_GRACE_MS = 90_000;
 
 // ---------- 公共类型 --------------------------------------------------------
 
@@ -982,11 +986,12 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     // 周期 refresh modelChecker 的定时器;cleanup() 务必清掉。
     let modelCheckerRefreshTimer: ReturnType<typeof setInterval> | null = null;
 
-    // 心跳活跃时间戳。提前声明(onContainerMessage 下行帧也要刷它);心跳定时器在下方装配。
+    // 客户端存活时间戳(只由 pong / 用户上行消息刷新 —— 真·client liveness)。
+    // **不**被下行帧刷新(否则容器持续吐帧会架空下面的硬上限,Codex 审 MEDIUM)。
     let lastAliveAt = Date.now();
-    // turn 在飞起点:inbound.message 到达时置 now,下行 isFinal 帧到达时清 0。心跳据此
-    // 在长 turn 期间放行(见 MAX_TURN_GRACE_MS 注释),turn 收尾后回归正常 60s idle 回收。
-    let lastInboundAt = 0;
+    // turn 在飞的心跳放行截止点(绝对时刻)。inbound.message 到达 → now+MAX_TURN_GRACE_MS(硬上限);
+    // isFinal 到达 → 收窄到 now+POST_FINAL_GRACE_MS(只缩不延);心跳 now<turnActiveUntil 即放行。
+    let turnActiveUntil = 0;
 
     // (v5 ccb-only:codex per-account 并发槽 / route token / 早释放状态机已随
     //  codex runner 一并移除。)
@@ -1454,8 +1459,8 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             // CG2b — turnLog 派生:traceId 钉进 bindings,后续 turn 内 log 自动带上
             turnLogForFrame = bridgeLog?.child({ traceId: turnTraceIdForFrame }) ?? null;
             turnLogForFrame?.info("user-chat-bridge: inbound turn start", clientTraceFields);
-            // turn 在飞起点:用户已发消息在等响应,心跳在 turn 期间不得 reap(见 MAX_TURN_GRACE_MS)。
-            lastInboundAt = Date.now();
+            // turn 在飞起点:用户已发消息在等响应,心跳在 turn 期间不得 reap(见 MAX_TURN_GRACE_MS 硬上限)。
+            turnActiveUntil = Date.now() + MAX_TURN_GRACE_MS;
           }
         }
       }
@@ -1589,9 +1594,6 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         firstContainerFrameAtMs = Date.now();
         metrics.onTtft?.(uid, ttftKind, (firstContainerFrameAtMs - firstUserFrameAtMs) / 1000);
       }
-      // 下行帧 = 连接活跃,刷新心跳 lastAlive(对齐心跳注释:任意下行也刷)。流式响应期间
-      // 持续刷新 → cost_charged(turn 收尾后广播)到达时连接仍在,不会被误杀。
-      lastAliveAt = Date.now();
       // Phase 4 — outbound.control.session_repo_status 侧信道(容器→master→user):
       //   master 须**先**落 DB(applyStatusFrame:更新 status / token_invalid 触发
       //   revoke + clear sessions),再让帧流到 userWs 让前端 UI 反映状态。
@@ -1611,10 +1613,11 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         else if (Buffer.isBuffer(data)) {
           try { statusPeek = data.toString("utf8"); } catch { statusPeek = null; }
         }
-        // turn 收尾(isFinal 帧)→ 清 turn 宽限,让 idle 连接回到正常 60s 回收节奏,
-        // 不让已结束 turn 的连接(可能浏览器已离开)长期占用宽限期。cheap 子串预筛。
-        if (statusPeek !== null && statusPeek.includes('"isFinal":true')) {
-          lastInboundAt = 0;
+        // turn 收尾(isFinal 帧)→ 把 turn 宽限收窄到 POST_FINAL_GRACE_MS(只缩不延):既给
+        // cost_charged(isFinal 之后才广播)留投递窗口,又不让已结束 turn 的连接(浏览器可能已离开)
+        // 长期占用到 10min 硬上限。仅在 turn 在飞时收窄(turnActiveUntil>0)。cheap 子串预筛。
+        if (turnActiveUntil > 0 && statusPeek !== null && statusPeek.includes('"isFinal":true')) {
+          turnActiveUntil = Math.min(turnActiveUntil, Date.now() + POST_FINAL_GRACE_MS);
         }
         if (
           statusPeek !== null &&
@@ -1823,10 +1826,10 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         if (userWs.readyState !== WebSocket.OPEN) return;
         const idleMs = Date.now() - lastAliveAt;
         // turn 在飞宽限:CF/Caddy 不转发 ping/pong,长 turn 期间浏览器无上行刷 lastAlive。
-        // 用户已发 inbound.message 即在等响应,turn 期间(含冷启 TTFT 静默)不 reap;
-        // 但加 MAX_TURN_GRACE_MS 硬上限,防卡死 turn 让连接永不回收。
-        const turnGraceActive =
-          lastInboundAt > 0 && Date.now() - lastInboundAt <= MAX_TURN_GRACE_MS;
+        // 用户已发 inbound.message 即在等响应,turn 期间(含冷启 TTFT 静默 + 流式)不 reap。
+        // turnActiveUntil 是绝对截止点(turn 起点 +硬上限,isFinal 收窄),**不被下行帧续期**,
+        // 故"浏览器真断 + turn 卡死"的连接到点必回收(Codex 审 MEDIUM:硬上限是真硬)。
+        const turnGraceActive = Date.now() < turnActiveUntil;
         if (idleMs > heartbeatTimeoutMs && !turnGraceActive) {
           bridgeLog?.info("user-chat-bridge: heartbeat timeout, terminating", { idleMs });
           try { userWs.terminate(); } catch { /* */ }

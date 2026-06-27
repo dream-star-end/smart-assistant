@@ -167,12 +167,16 @@ export function useChatSocket(opts: {
       // fire-and-forget：建行是快 REST，远早于容器跑完 turn 后的 authored POST；失败不阻塞发送
       // （容器 append 自带重试 + syncSession GET 兜底）。messages:[] + baseSyncedAt:0 → 已存在
       // 则 rejected_stale 空操作，绝不 clobber server-authored 历史。
-      ensureServerSession: (sessId, agentId, title) => {
+      ensureServerSession: async (sessId, agentId, title) => {
         const a = authRef.current;
-        if (!a) return;
-        void api
-          .putSession(a, sessId, { agentId, title: title || "新会话", messages: [], _baseSyncedAt: 0 })
-          .catch(() => {});
+        if (!a) return false; // 未登录:不标 ensured,登录后下次发送重试
+        try {
+          await api.putSession(a, sessId, { agentId, title: title || "新会话", messages: [], _baseSyncedAt: 0 });
+          return true; // PUT 200:建行确认
+        } catch (e) {
+          // 409 = 行已存在(并发抢先 / 已建)→ 同样视为已确认,不必重试;其余(网络/5xx/401)→ 重试。
+          return (e as { status?: number } | null)?.status === 409;
+        }
       },
       // resume_failed 游标推进 / isFinal turn 收尾：立即落 IndexedDB（防 reload 死循环 + 不丢轮）。
       persistSession: (sessId) => persistRef.current(sessId),
