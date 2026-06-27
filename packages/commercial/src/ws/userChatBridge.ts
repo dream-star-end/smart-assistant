@@ -1089,6 +1089,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       let set = uidToUserWs.get(key);
       if (!set) { set = new Set(); uidToUserWs.set(key, set); }
       set.add(userWs);
+      log?.info("OCDIAG-ADD uidToUserWs", { key, setSize: set.size });
       userWs.on("close", () => {
         const s = uidToUserWs.get(key);
         if (s) {
