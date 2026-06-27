@@ -1965,13 +1965,14 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
    */
   function broadcastToUser(uid: bigint, payload: unknown): number {
     const set = uidToUserWs.get(uid.toString());
-    // 临时诊断(P7 积分广播排查):每次广播记 uid/set 大小/payload 类型,定位 cost_charged 是否送达。
-    log?.info("user-chat-bridge: broadcastToUser", {
-      uid: uid.toString(),
-      setSize: set ? set.size : -1,
-      ptype: (payload as { type?: string } | null)?.type ?? "?",
-    });
-    if (!set || set.size === 0) return 0;
+    if (!set || set.size === 0) {
+      // 临时诊断(P7):set 为空 → 广播无目标(注册/detach 时序问题)。
+      log?.info("user-chat-bridge: broadcastToUser empty", {
+        uid: uid.toString(),
+        ptype: (payload as { type?: string } | null)?.type ?? "?",
+      });
+      return 0;
+    }
     let text: string;
     try { text = JSON.stringify(payload); }
     catch (err) {
@@ -1981,7 +1982,9 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       return 0;
     }
     let sent = 0;
+    const states: number[] = [];
     for (const ws of set) {
+      states.push(ws.readyState);
       if (ws.readyState !== WebSocket.OPEN) continue;
       try {
         ws.send(text, { binary: false }, (err) => {
@@ -1996,6 +1999,14 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         });
       }
     }
+    // 临时诊断(P7 积分广播):记 setSize/各 ws readyState/实际 sent,定位为何浏览器收不到。
+    log?.info("user-chat-bridge: broadcastToUser sent", {
+      uid: uid.toString(),
+      ptype: (payload as { type?: string } | null)?.type ?? "?",
+      setSize: set.size,
+      states: states.join(","),
+      sent,
+    });
     return sent;
   }
 
