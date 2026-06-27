@@ -352,12 +352,39 @@ describe("applyCostCharged (§3 NOT deduped; 归因严格)", () => {
     expect(a.usage).toBeUndefined();
     expect(s._pendingCostCredits).toBe("15");
   });
-  test("NO target (tool-only / lastFinal expired) → DROP, only refreshBalance (no cross-turn pollution)", () => {
+  test("NO target 且 turn 未进行（turn 间晚到）→ DROP, only refreshBalance (no cross-turn pollution)", () => {
     const s = sess();
     const refreshBalance = vi.fn();
+    // _sendingInFlight 默认 false → 不入队（避免错算到下一 turn）。
     applyCostCharged(s, { type: "outbound.cost_charged", sessionId: "s1", costCredits: "99", balanceAfter: "1" }, { refreshBalance });
-    expect(s._pendingCostCredits).toBe("0"); // 绝不 enqueue
+    expect(s._pendingCostCredits).toBe("0"); // turn 间不 enqueue
     expect(refreshBalance).toHaveBeenCalledTimes(1);
+  });
+  test("NO target 但 turn 进行中（委派 cost 在子状态间到达）→ enqueue pending，不丢", () => {
+    const s = sess();
+    s._sendingInFlight = true; // 队长等子智能体：无 streamingAssistant，但本 turn 在飞
+    applyCostCharged(s, { type: "outbound.cost_charged", sessionId: "s1", costCredits: "7" }, {});
+    applyCostCharged(s, { type: "outbound.cost_charged", sessionId: "s1", costCredits: "3" }, {});
+    expect(s._pendingCostCredits).toBe("10"); // 累加，待收尾 flush 到本轮响应
+  });
+  test("isFinal: 兜底 flush pending cost 到本轮最后一条助手消息（无 streamingAssistant 时）", () => {
+    const s = sess();
+    const a = addMessage(s, "assistant", "汇总", { ts: 1, usage: { traceId: "t1" } });
+    s._sendingInFlight = true;
+    s._pendingCostCredits = "20"; // turn 内入队、未被 meta-drain（收尾帧无 meta / 无流式助手）
+    applyOutboundMessage(s, msgFrame({ isFinal: true }));
+    expect(a.usage?.costCredits).toBe("20"); // flush 到响应 → 徽章可见
+    expect(s._pendingCostCredits).toBe("0"); // 清零防泄漏到下一 turn
+  });
+  test("isFinal 兜底 flush 不跨轮：本轮无 assistant 时 pending 不落到上一轮 assistant", () => {
+    const s = sess();
+    const prev = addMessage(s, "assistant", "上一轮", { ts: 1, usage: { costCredits: "5" } });
+    addMessage(s, "user", "本轮提问", { ts: 2 }); // 本轮起点；本轮只有 tool/thinking、无 assistant 汇总
+    s._sendingInFlight = true;
+    s._pendingCostCredits = "20";
+    applyOutboundMessage(s, msgFrame({ isFinal: true }));
+    expect(prev.usage?.costCredits).toBe("5"); // 上一轮 assistant 不被错算（不跨 turn）
+    expect(s._pendingCostCredits).toBe("0"); // 本轮无响应可落 → 丢展示、清零防泄漏
   });
 });
 

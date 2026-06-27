@@ -117,6 +117,26 @@ describe("persist — 历史合并纯函数", () => {
     expect(mergeFullServerWins(server, [msg("a")])).toBe(server);
   });
 
+  test("mergeFullServerWins: 保留中段本地独有的 user 气泡（server 无用户消息，按 ts 归位）", () => {
+    const u = (id: string, text: string, ts: number): ChatMessage => ({ id, role: "user", text, ts });
+    const a = (id: string, text: string, ts: number): ChatMessage => ({ id, role: "assistant", text, ts });
+    // server 只含 server-authored 助手（v5 不把用户消息 PUT 上去）；本地有用户气泡(ts1)在助手(ts2)前。
+    const server = [a("srv1", "S-答", 2)];
+    const local = [u("usr1", "你好", 1), a("srv1", "L-答", 2)];
+    const merged = mergeFullServerWins(server, local);
+    expect(merged.map((m) => m.id)).toEqual(["usr1", "srv1"]); // 用户气泡保留 + ts 落到助手之前
+    expect(merged.find((m) => m.id === "usr1")!.role).toBe("user");
+    expect(merged.find((m) => m.id === "srv1")!.text).toBe("S-答"); // 重叠仍 server-wins
+  });
+
+  test("mergeFullServerWins: 中段本地独有的 assistant（非 user）仍丢弃（防 srv-* 重复卡）", () => {
+    const a = (id: string, text: string, ts: number): ChatMessage => ({ id, role: "assistant", text, ts });
+    const server = [a("x", "S-x", 1), a("y", "S-y", 3)];
+    const local = [a("x", "", 1), a("ghost", "乐观助手", 2), a("y", "", 3)];
+    const merged = mergeFullServerWins(server, local);
+    expect(merged.map((m) => m.id)).toEqual(["x", "y"]); // ghost(assistant 中段)被丢
+  });
+
   test("applyServerIncremental: 按 id 覆盖既有 + 追加新增，保持本地顺序", () => {
     const local = [msg("a", "L-a"), msg("b", "L-b")];
     const incoming = [msg("b", "S-b"), msg("c", "S-c")];

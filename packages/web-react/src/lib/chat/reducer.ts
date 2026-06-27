@@ -829,6 +829,38 @@ export function applyOutboundMessage(
         if (m.completedAt == null) m.completedAt = Date.now();
       }
     }
+    // 兜底 flush：本 turn 入队但未被上方 meta-drain 落账的 cost（收尾帧无 meta / 无流式助手 /
+    // 委派 turn cost 在子状态间到达）→ 累加到本轮最后一条助手消息（用户看到的响应）；无助手
+    // 消息则清零。**务必清零**：否则残留 pending 会被下一 turn 的 meta-drain 错算（归因黑洞）。
+    try {
+      const pending = BigInt(sess._pendingCostCredits || "0");
+      if (pending > 0n) {
+        // 目标限定在**本轮**内:从尾向前找 assistant,遇到 user(=本轮起点)即停——本轮没有
+        // assistant 响应(tool-only / thinking-only / empty end_turn)时绝不落到上一轮的 assistant
+        // (Codex BLOCKER:跨 turn 归因)。找不到则下方统一清零,只丢展示不泄漏。
+        let lastAsst: ChatMessage | null = null;
+        for (let k = sess.messages.length - 1; k >= 0; k--) {
+          const m = sess.messages[k];
+          if (m.role === "user") break;
+          if (m.role === "assistant") {
+            lastAsst = m;
+            break;
+          }
+        }
+        if (lastAsst) {
+          let cur = 0n;
+          try {
+            cur = BigInt(lastAsst.usage?.costCredits ?? "0");
+          } catch {
+            cur = 0n;
+          }
+          lastAsst.usage = { ...(lastAsst.usage || {}), costCredits: (cur + pending).toString() };
+        }
+      }
+    } catch {
+      /* 解析失败:照常清零 */
+    }
+    sess._pendingCostCredits = "0";
     // 清流式指针 + in-flight。
     sess._streamingAssistant = null;
     sess._streamingThinking = null;
@@ -932,9 +964,21 @@ export function applyCostCharged(sess: ChatSession | null, frame: CostChargedWir
   } catch {
     add = null;
   }
-  // (a) 无 target（无 active turn / lastFinal 过期 / tool-only turn）→ **drop 展示，只刷余额**。
-  //     绝不 enqueue：会被下一 turn 的 isFinal drain 错算到新 turn 头上（Codex 归因黑洞）。
+  // (a) 无 target：
+  //   - **turn 进行中（_sendingInFlight）→ 入队 _pendingCostCredits**，收尾时 drain 到本轮响应。
+  //     委派/多请求 turn 里 cost 常在两个子状态之间到达（队长等子智能体时无 streamingAssistant、
+  //     lastFinal 又已过期/指向别处），旧逻辑一律 drop 导致积分时有时无（boss 报）；turn 在飞时
+  //     这笔 cost 必属本轮，入队后由 isFinal 的 meta-drain 或收尾兜底落到本轮最后一条助手消息。
+  //   - turn 之间（未发送）才 drop 展示只刷余额：避免错算到下一 turn（Codex 归因黑洞）。
   if (!target) {
+    if (sess._sendingInFlight && add !== null) {
+      try {
+        const cur = BigInt(sess._pendingCostCredits || "0");
+        sess._pendingCostCredits = (cur + add).toString();
+      } catch {
+        sess._pendingCostCredits = add.toString();
+      }
+    }
     refresh();
     return;
   }

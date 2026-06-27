@@ -149,10 +149,19 @@ export function dbNameForUser(userId: string | null | undefined): string {
 }
 
 /**
- * full（server canonical 整带）合并：server 为权威在前，仅保留 local **末尾连续的、
- * server 不认识的乐观尾消息**（用户刚发出、server 尚未持久化的那一截）。一旦从尾部
- * 回溯遇到 server 认识的消息即停——中段 local-only 消息视为陈旧（已删/损坏）一律丢弃，
- * 绝不在历史中段复活脏数据（server-wins）。
+ * full（server canonical 整带）合并：server 为权威在前，保留两类 local-only 消息：
+ *  ① **末尾连续的乐观尾消息**（用户刚发出、server 尚未持久化的那一截：从尾部回溯到第一条
+ *     server 认识的消息为止）——含流式中的 assistant/tool 等，它们尚未被 server 重写。
+ *  ② **本地独有的 user 气泡**（出现在中段、非尾部那段）——用户消息是客户端权威，server 端
+ *     永不以另一 id 重写它们；但 v5 当前不把用户消息 PUT 到 server（server 历史只含
+ *     server-authored 的助手/委派/工具）。若像旧逻辑那样只保尾部，重连 server-wins 会丢掉
+ *     夹在助手轮之前的用户输入（boss 报"会话不显示用户输入"的根因）。故额外保留这些 user 行。
+ *
+ * 注意只对 **user** 角色放宽：assistant/thinking/tool/agent-group 等乐观消息可能已被 server
+ * 以 `srv-*` 重写，中段保留会出现重复卡片，故它们仍只保尾部（非尾部=已被取代→丢弃）。
+ * 合并后按 ts 稳定排序：user 气泡 ts < 其轮 server 助手 ts → 正确落到该轮助手之前；server
+ * 本就 ts 有序、尾部乐观消息 ts 最大 → 各归其位。跨设备（本地无此会话）仍需服务端持久化
+ * 用户消息才能恢复——此修复彻底解决"同浏览器重连"。
  */
 export function mergeFullServerWins(server: ChatMessage[], local: ChatMessage[]): ChatMessage[] {
   const serverIds = new Set<string>();
@@ -160,7 +169,12 @@ export function mergeFullServerWins(server: ChatMessage[], local: ChatMessage[])
   let i = local.length;
   while (i > 0 && local[i - 1]?.id && !serverIds.has(local[i - 1].id)) i--;
   const tail = local.slice(i);
-  return tail.length ? [...server, ...tail] : server;
+  const preservedUsers = local
+    .slice(0, i)
+    .filter((m) => m?.role === "user" && m.id && !serverIds.has(m.id));
+  if (!tail.length && !preservedUsers.length) return server;
+  // 稳定排序（现代 JS Array.sort 稳定）：等 ts 时维持 server→preservedUsers→tail 的插入序。
+  return [...server, ...preservedUsers, ...tail].sort((a, b) => (a?.ts ?? 0) - (b?.ts ?? 0));
 }
 
 /**

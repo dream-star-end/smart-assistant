@@ -141,6 +141,8 @@ export function App() {
   const localStore = useRef<Map<string, Message[]>>(new Map());
   // 已拉过 server 历史的会话 id（防 selectSession 每次都重拉；404 的本地会话也记入）。
   const historyFetchedRef = useRef<Set<string>>(new Set());
+  // 登录后是否已自动选中"上次会话"（仅做一次：避免覆盖用户随后的显式新建/切换/删除）。
+  const autoSelectedRef = useRef(false);
   // 当前登录 user id 的实时镜像：异步历史请求 await 后比对，防登出/换号后 stale 响应
   // 把上一个用户的历史污染进单例 WS service / 写进新用户的 IndexedDB 命名空间（隐私）。
   const userIdRef = useRef<string | null>(null);
@@ -151,6 +153,7 @@ export function App() {
     tokenRef.current = null;
     localStore.current.clear();
     historyFetchedRef.current.clear();
+    autoSelectedRef.current = false; // 下次登录重新自动选中最近会话
     setAuthed(false);
     setUser(null);
     setSessions([]);
@@ -502,6 +505,21 @@ export function App() {
       cancelled = true;
     };
   }, [demo, auth, user]);
+
+  // 登录后自动恢复"上次会话"：侧栏（IndexedDB 注水 / listSessions）填好且用户尚未选任何会话时，
+  // 选中最近一条（sessions 已按 updatedAt 倒序，[0]=最近）。仅做一次（autoSelectedRef）——
+  // 之后用户的新建/切换/删除都不被覆盖。修复"每次登录都默认开新会话"。
+  useEffect(() => {
+    if (demo || !auth) return;
+    if (autoSelectedRef.current) return;
+    if (activeId !== undefined) {
+      autoSelectedRef.current = true; // 用户已自行选中 → 标记完成，不再自动接管
+      return;
+    }
+    if (sessions.length === 0) return;
+    autoSelectedRef.current = true;
+    selectSession(sessions[0].id);
+  }, [demo, auth, activeId, sessions, selectSession]);
   // 非 demo：展示的消息来自 WS service 快照（就地 mutation + version 触发重渲）。
   const wsMessages = !demo && activeId ? chat.getMessages(activeId) : EMPTY_WS_MESSAGES;
   const wsSending = !demo && chat.isSending(activeId);
