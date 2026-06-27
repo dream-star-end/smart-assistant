@@ -122,9 +122,10 @@ describe("isLive / defaultCollapsed 折叠态默认", () => {
 });
 
 describe("errorLabel / stripMarkdown", () => {
-  test("已知错误码 → 中文，未知 → 原码", () => {
+  test("已知错误码 → 中文，未知 → 友好兜底(不再抛裸码)", () => {
     expect(errorLabel("insufficient_credits")).toBe("积分余额不足");
-    expect(errorLabel("some_new_code")).toBe("some_new_code");
+    expect(errorLabel("conn_kicked")).toBe("连接已断开");
+    expect(errorLabel("some_new_code")).toBe("出错了"); // 未知码不再回退裸码,统一友好
     expect(errorLabel(undefined)).toBe("出错了");
   });
   test("stripMarkdown 去标记取纯文本", () => {

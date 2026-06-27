@@ -276,13 +276,13 @@ export const AssistantCard = memo(function AssistantCard({
           </div>
         )}
 
-        {/* 正文（错误卡时不渲染空正文） */}
-        {msg.text ? (
+        {/* 正文：错误时不在卡外渲染裸正文(友好文案并入下方红卡),避免"server shutting down"式裸文本 */}
+        {msg.text && !hasError ? (
           <Markdown signMedia>{msg.text}</Markdown>
         ) : live && !hasError ? (
           <TypingDots />
         ) : null}
-        {live && msg.text && (
+        {live && msg.text && !hasError && (
           <span className="caret-blink ml-0.5 inline-block h-[1.1em] w-[2px] translate-y-[3px] bg-fg" />
         )}
 
@@ -318,6 +318,10 @@ export const AssistantCard = memo(function AssistantCard({
           <Alert tone="danger" className="mt-2.5" icon={<AlertTriangle size={16} />}>
             <div className="min-w-0 flex-1">
               <div className="font-medium">{errorLabel(msg._errorCode)}</div>
+              {/* 友好可读消息(friendlyBridgeErrorMessage 产出);与标题互补:标题=类别,这里=怎么办 */}
+              {msg.text && (
+                <div className="mt-0.5 text-[13px] text-fg/90">{msg.text}</div>
+              )}
               {msg._errorDetail && (
                 <details className="mt-1">
                   <summary className="cursor-pointer text-xs text-muted">查看详情</summary>

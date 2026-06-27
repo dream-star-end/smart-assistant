@@ -209,12 +209,17 @@ const ERROR_LABELS: Record<string, string> = {
   upstream_timeout: "模型响应超时",
   network_error: "网络异常，请重试",
   service_restart: "服务重启，本轮已中断",
+  conn_kicked: "连接已断开",
+  maintenance: "服务维护中",
+  unauthorized_model: "模型未开通",
+  unauthorized: "登录已失效",
   stopped: "已停止本轮生成",
   internal_error: "服务内部错误",
 };
 export function errorLabel(code: string | undefined): string {
   if (!code) return "出错了";
-  return ERROR_LABELS[code] ?? code;
+  // 未知码回退友好"出错了"(不再把裸码 err_xxx 抛给用户;原始码/消息在「查看详情」)。
+  return ERROR_LABELS[code] ?? "出错了";
 }
 
 /**

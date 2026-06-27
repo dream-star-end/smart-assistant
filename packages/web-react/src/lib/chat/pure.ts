@@ -511,6 +511,9 @@ export function normalizeBridgeErrorCode(code: unknown): string {
   if (upper === "ERR_INSUFFICIENT_CREDITS" || upper === "INSUFFICIENT_CREDITS") return "insufficient_credits";
   if (upper === "UNAUTHORIZED_MODEL") return "unauthorized_model";
   if (upper === "MAINTENANCE") return "maintenance";
+  // 连接被踢/服务重启/背压关闭等 bridge 连接态错误 → 统一归一为 conn_kicked(友好"连接已断开")。
+  if (upper === "ERR_CONN_KICKED" || upper === "CONN_KICKED") return "conn_kicked";
+  if (upper === "ERR_BACKPRESSURE" || upper === "BACKPRESSURE") return "conn_kicked";
   // codex_* v5 不会到达，保留归一化无害（删 codex 专属 UI 文案即可）。
   if (upper === "CODEX_TURN_BUSY") return "codex_turn_busy";
   if (upper === "CODEX_POOL_BUSY") return "codex_pool_busy";
@@ -528,9 +531,12 @@ export function friendlyBridgeErrorMessage(code: unknown, message?: string): str
   if (n === "insufficient_credits") return "余额不足，充值后即可继续使用。";
   if (n === "unauthorized_model") return "当前账号尚未开通这个模型，请切换模型或联系管理员。";
   if (n === "maintenance") return "服务正在维护中，请稍后再试。";
+  if (n === "conn_kicked") return "连接已断开（服务重启或被新会话顶替），刷新页面即可继续。";
   if (n === "codex_turn_busy") return "上一轮任务仍在运行，请等它结束后再发送。";
   if (n === "codex_pool_busy") return "账号池繁忙，请稍后重试。";
-  return message || "系统暂时不可用，请稍后重试。";
+  // 未知码:回友好通用文案,不把裸技术消息(如 "server shutting down")抛给用户;
+  // 原始 message 由 reducer 落进 _errorDetail,「查看详情」里仍可见,便于反馈/排查。
+  return "系统暂时不可用，请稍后重试。";
 }
 
 /** 预期业务态错误码：不自动上报（websocket.js:4038）。*/

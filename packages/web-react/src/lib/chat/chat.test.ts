@@ -333,6 +333,14 @@ describe("applyOutboundError double-frame suppression (§11)", () => {
     expect(s.messages.filter((m) => m.role === "assistant")).toHaveLength(1);
     expect(s._sendingInFlight).toBe(false);
   });
+
+  test("未知错误码 + 无 detail:主文案友好通用,原始 message 仍落 _errorDetail(不丢)", () => {
+    const s = sess();
+    applyOutboundError(s, { type: "outbound.error", sessionKey: "k", channel: "webchat", peer: { id: "s1", kind: "dm" }, code: "some_new_code", message: "server shutting down", isFinal: true } as never);
+    const err = s.messages.filter((m) => m.role === "assistant").at(-1)!;
+    expect(err.text).toBe("系统暂时不可用，请稍后重试。"); // 友好通用,不抛裸英文
+    expect(err._errorDetail).toBe("server shutting down"); // 原始信息进查看详情,Codex 审防丢失
+  });
 });
 
 describe("applyCostCharged (§3 NOT deduped; 归因严格)", () => {

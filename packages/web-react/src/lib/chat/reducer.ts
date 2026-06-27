@@ -884,9 +884,15 @@ export function applyOutboundError(sess: ChatSession, frame: OutboundErrorWire, 
     sess._suppressErrorBubbleAtSeq = frame.frameSeq + 1;
   }
   const normalized = normalizeBridgeErrorCode(frame.code);
+  // 友好主文案;原始技术信息(detail 优先,无则 message)落 _errorDetail→「查看详情」,未知码也不丢
+  // (friendlyBridgeErrorMessage 未知码返通用文案、不再带 message,故这里必须兜住 message)。Codex 审。
+  const rawDetail =
+    (typeof frame.detail === "string" && frame.detail) ||
+    (typeof frame.message === "string" && frame.message) ||
+    "";
   addMessage(sess, "assistant", friendlyBridgeErrorMessage(frame.code, frame.message || "出错了"), {
     _errorCode: normalized,
-    _errorDetail: typeof frame.detail === "string" ? frame.detail : "",
+    _errorDetail: rawDetail,
     ...(frame.traceId ? { usage: { traceId: frame.traceId } } : {}),
   });
   if (!EXPECTED_TURN_ERR_CODES.has(normalized)) {
