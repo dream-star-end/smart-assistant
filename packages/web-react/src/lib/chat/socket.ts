@@ -86,6 +86,15 @@ export type ChatSocketDeps = {
   reportClientError?: (p: { type: string; message: string; traceId?: string; sessionId?: string }) => void;
   /** resume_failed / 重连 reconcile：强制 REST 全量 sync（最终权威源）。*/
   syncSession?: (sessId: string) => Promise<void> | void;
+  /**
+   * 首次发消息前在主控创建 client_sessions 行（PUT /api/sessions/:id，messages:[]）。
+   * v3 commercial 持久化契约：**前端 PUT 建行 + 元数据，容器 server-authored 往该行 append
+   * 消息**。web-react 此前从不调 putSession → 主控无此行 → 容器回传持久化 session_not_found
+   * 无界重试风暴 + cost_charged 归因/投递链路连带失效。fire-and-forget：建行是快 REST，
+   * 远早于容器跑完 LLM turn 后的 authored POST；upsertClientSession 用 baseSyncedAt=0 +
+   * mergePreservingServerAuthored，已存在则 rejected_stale 空操作，绝不 clobber 历史。
+   */
+  ensureServerSession?: (sessId: string, agentId: string, title?: string) => void;
   /** 立即把某会话快照落 IndexedDB（resume_failed 游标推进 / isFinal turn 收尾时调）。*/
   persistSession?: (sessId: string) => void;
   defaultAgentId?: string;
@@ -111,6 +120,8 @@ const WS_PATH = "/ws/user-chat-bridge";
 export class ChatSocket {
   private deps: ChatSocketDeps;
   readonly sessions = new Map<string, ChatSession>();
+  /** 已在主控建过行的会话 id(每会话只 PUT 一次,避免重复 REST + 409 churn)。登出清。*/
+  private serverSessionEnsured = new Set<string>();
 
   // ── 订阅 / 批量 notify ──
   private listeners = new Set<() => void>();
@@ -938,6 +949,7 @@ export class ChatSocket {
   resetSessions(): void {
     if (this.sessions.size === 0) return;
     this.sessions.clear();
+    this.serverSessionEnsured.clear();
     this.scheduleNotify();
   }
 
@@ -1043,6 +1055,12 @@ export class ChatSocket {
     effortLevel?: InboundMessage["effortLevel"];
   }): void {
     const sess = this.ensureSession(p.sessId, p.agentId);
+    // 主控 session 建行(每会话一次):必须在容器跑完 turn 回传 authored 消息之前落地,
+    // 否则 session_not_found 风暴。fire-and-forget,见 deps.ensureServerSession 注释。
+    if (!this.serverSessionEnsured.has(sess.id)) {
+      this.serverSessionEnsured.add(sess.id);
+      this.deps.ensureServerSession?.(sess.id, p.agentId, sess.title);
+    }
     const media = p.media && p.media.length > 0 ? p.media : undefined;
     const payload: InboundMessage = {
       type: "inbound.message",

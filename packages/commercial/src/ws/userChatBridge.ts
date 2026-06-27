@@ -1096,7 +1096,6 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       let set = uidToUserWs.get(key);
       if (!set) { set = new Set(); uidToUserWs.set(key, set); }
       set.add(userWs);
-      log?.info("OCDIAG add", { connId, key, setSize: set.size });
     }
 
     // 连接超时:N ms 内 containerWs 没 OPEN → 取消 + 关 user
@@ -1925,7 +1924,6 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           set.delete(userWs);
           if (set.size === 0) uidToUserWs.delete(key);
         }
-        log?.info("OCDIAG detach", { connId, key, cause: triggerCause, remaining: uidToUserWs.get(key)?.size ?? 0 });
       }
     }
 
@@ -1993,15 +1991,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
    */
   function broadcastToUser(uid: bigint, payload: unknown): number {
     const set = uidToUserWs.get(uid.toString());
-    if (!set || set.size === 0) {
-      log?.info("OCDIAG broadcast-empty", {
-        uid: uid.toString(),
-        keys: [...uidToUserWs.keys()],
-        sizes: [...uidToUserWs.values()].map((s) => s.size),
-      });
-      return 0;
-    }
-    log?.info("OCDIAG broadcast-hit", { uid: uid.toString(), setSize: set.size });
+    if (!set || set.size === 0) return 0;
     let text: string;
     try { text = JSON.stringify(payload); }
     catch (err) {
