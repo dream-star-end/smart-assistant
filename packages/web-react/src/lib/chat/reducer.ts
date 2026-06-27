@@ -822,6 +822,12 @@ export function applyOutboundMessage(
       if (m.role === "tool" && typeof m._completed === "boolean" && !m._completed && !m.error) {
         m._completed = true;
       }
+      // agent-group / delegate-progress：turn 收尾仍未完成 → 标完成。turn 已结束就不该再
+      // "运行中/子智能体启动中…"(委托帧 runId 绑定缺位时会卡住,这里兜底收口)。
+      if ((m.role === "agent-group" || m.role === "delegate-progress") && !m._completed) {
+        m._completed = true;
+        if (m.completedAt == null) m.completedAt = Date.now();
+      }
     }
     // 清流式指针 + in-flight。
     sess._streamingAssistant = null;

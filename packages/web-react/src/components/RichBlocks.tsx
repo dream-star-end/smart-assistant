@@ -3,7 +3,7 @@
  * 二者都在 MarkdownImpl(懒加载 chunk)内按需用：mermaid 库再经 dynamic import 拆成
  * 独立 chunk(只有真出现 ```mermaid 才下载,不拖累首屏与普通对话)。
  */
-import { useEffect, useId, useState } from "react";
+import { useEffect, useId, useRef, useState } from "react";
 
 /** ```mermaid 代码块 → 渲染成 SVG 流程图;失败回退源码。 */
 export function MermaidBlock({ code }: { code: string }) {
@@ -62,6 +62,69 @@ export function MermaidBlock({ code }: { code: string }) {
       // biome-ignore lint/security/noDangerouslySetInnerHtml: mermaid strict-sanitized SVG
       dangerouslySetInnerHTML={{ __html: svg }}
     />
+  );
+}
+
+/** ```chart 代码块(Chart.js config JSON）→ canvas 图表;无效/半截回退源码(对齐 v3 markdown.js）。 */
+export function ChartBlock({ code }: { code: string }) {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const [err, setErr] = useState(false);
+
+  useEffect(() => {
+    let alive = true;
+    let chart: { destroy: () => void } | null = null;
+    setErr(false);
+    let config: Record<string, unknown>;
+    try {
+      config = JSON.parse(code);
+    } catch {
+      setErr(true); // 流式半截 / 非法 JSON → 回退源码,不动 chart.js
+      return;
+    }
+    (async () => {
+      try {
+        const { Chart, registerables } = await import("chart.js");
+        Chart.register(...registerables);
+        if (!alive || !canvasRef.current) return;
+        const isDark = document.documentElement.classList.contains("dark");
+        const text = isDark ? "#bcbcc7" : "#51515c";
+        const grid = isDark ? "rgba(255,255,255,0.08)" : "rgba(0,0,0,0.08)";
+        const opts = (config.options ??= {}) as Record<string, any>;
+        ((opts.plugins ??= {}).legend ??= {}).labels ??= {};
+        opts.plugins.legend.labels.color ??= text;
+        opts.scales ??= {};
+        for (const ax of ["x", "y"]) {
+          const a = (opts.scales[ax] ??= {});
+          (a.ticks ??= {}).color ??= text;
+          (a.grid ??= {}).color ??= grid;
+        }
+        opts.responsive = true;
+        opts.maintainAspectRatio = true;
+        // biome-ignore lint/suspicious/noExplicitAny: chart.js config 是动态 JSON
+        chart = new Chart(canvasRef.current, config as any);
+      } catch {
+        if (alive) setErr(true);
+      }
+    })();
+    return () => {
+      alive = false;
+      try {
+        chart?.destroy();
+      } catch {
+        /* ignore */
+      }
+    };
+  }, [code]);
+
+  if (err) {
+    return (
+      <pre className="my-3 overflow-auto rounded-lg bg-code px-3 py-2 font-mono text-xs text-fg">{code}</pre>
+    );
+  }
+  return (
+    <div className="my-3 rounded-lg border border-border bg-surface p-3">
+      <canvas ref={canvasRef} className="max-h-80 w-full" />
+    </div>
   );
 }
 

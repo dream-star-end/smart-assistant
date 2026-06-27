@@ -15,7 +15,7 @@ import "katex/dist/katex.min.css";
 import type { ReactNode } from "react";
 import { SignedAudio, SignedImg, SignedVideo } from "./chat/media";
 import { CodeBlock } from "./CodeBlock";
-import { HtmlPreview, MermaidBlock } from "./RichBlocks";
+import { ChartBlock, HtmlPreview, MermaidBlock } from "./RichBlocks";
 import type { MarkdownProps } from "./Markdown";
 
 /** 从(可能被 highlight 包成 span 的)code children 递归还原纯源码文本 —— mermaid/html 富块要原文。 */
@@ -126,6 +126,7 @@ export default function MarkdownImpl({ children, signMedia }: MarkdownProps) {
             if (isBlock) {
               // 富块:mermaid 流程图 / html 沙盒预览(取原文,绕开 highlight 的 span 包裹)。
               if (lang === "mermaid") return <MermaidBlock code={nodeText(children).replace(/\n$/, "")} />;
+              if (lang === "chart") return <ChartBlock code={nodeText(children).replace(/\n$/, "")} />;
               if (lang === "html" || lang === "htmlpreview")
                 return <HtmlPreview code={nodeText(children).replace(/\n$/, "")} />;
               return (
