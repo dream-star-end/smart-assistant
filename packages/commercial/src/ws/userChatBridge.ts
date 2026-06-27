@@ -1079,24 +1079,12 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     };
     const { unregister } = registry.register(conn);
 
-    // 同步加入 uid→ws 表,broadcastToUser 用得到。
-    // ⚠️ 生命周期绑定到 userWs 的真实 'close' 事件,而非 detachUserSide。
-    //   bug(P7):detachUserSide 在 per-turn drain 等早期就跑,会把仍在 relay 的 user WS 从
-    //   uidToUserWs 删掉 → cost_charged 广播时 set 为空 → 前端永远收不到积分。绑 'close' 后,
-    //   连接整个存活期都留在广播集合里(broadcastToUser 已按 readyState!==OPEN 跳过陈旧条目)。
+    // 同步加入 uid→ws 表,broadcastToUser 用得到。cleanup 里务必同步删除。
     {
       const key = uid.toString();
       let set = uidToUserWs.get(key);
       if (!set) { set = new Set(); uidToUserWs.set(key, set); }
       set.add(userWs);
-      log?.info("OCDIAG-ADD uidToUserWs", { key, setSize: set.size });
-      userWs.on("close", () => {
-        const s = uidToUserWs.get(key);
-        if (s) {
-          s.delete(userWs);
-          if (s.size === 0) uidToUserWs.delete(key);
-        }
-      });
     }
 
     // 连接超时:N ms 内 containerWs 没 OPEN → 取消 + 关 user
@@ -1903,10 +1891,14 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         try { userWs.terminate(); } catch { /* */ }
       }
       unregister();
-      // uidToUserWs 的移除改由 userWs 的 'close' 事件负责(见注册处注释)——detachUserSide
-      // 可能在连接仍活时(per-turn drain)就跑,这里删会导致广播丢失 cost_charged。
-      // 非 client_close 路径上面已 terminate(userWs),'close' 会触发移除;client_close
-      // 本就由对端关闭触发 'close'。两条路径都收敛到 'close' handler,无泄漏。
+      {
+        const key = uid.toString();
+        const set = uidToUserWs.get(key);
+        if (set) {
+          set.delete(userWs);
+          if (set.size === 0) uidToUserWs.delete(key);
+        }
+      }
     }
 
     /**
@@ -1973,11 +1965,6 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
    */
   function broadcastToUser(uid: bigint, payload: unknown): number {
     const set = uidToUserWs.get(uid.toString());
-    log?.info("OCDIAG2 broadcastToUser", {
-      uid: uid.toString(),
-      ptype: (payload as { type?: string } | null)?.type ?? "?",
-      setSize: set ? set.size : 0,
-    });
     if (!set || set.size === 0) return 0;
     let text: string;
     try { text = JSON.stringify(payload); }
