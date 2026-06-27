@@ -120,6 +120,10 @@ export type ChatSnapshot = {
 
 const WS_PATH = "/ws/user-chat-bridge";
 
+/** rAF 合并渲染的隐藏-tab 兜底间隔:rAF 在隐藏 tab 被节流到几乎不触发,用此 setTimeout
+ *  保证 snapshot 仍按时刷新 + listeners 触发(避免后台积压、切前台时一致);也封顶渲染延迟。*/
+const NOTIFY_FALLBACK_MS = 250;
+
 export class ChatSocket {
   private deps: ChatSocketDeps;
   readonly sessions = new Map<string, ChatSession>();
@@ -132,6 +136,9 @@ export class ChatSocket {
   private listeners = new Set<() => void>();
   private version = 0;
   private notifyScheduled = false;
+  /** rAF 合并渲染:scheduleNotify 排程的 rAF 句柄 + 隐藏 tab 兜底 timer(见 scheduleNotify)。*/
+  private notifyRaf: number | null = null;
+  private notifyFallbackTimer: ReturnType<typeof setTimeout> | null = null;
   /** useSyncExternalStore 要求 getSnapshot 在未变更时返回**同一引用**；缓存于此，
    *  仅在 notify flush 时重建（version++）。*/
   private snapshot: ChatSnapshot;
@@ -237,13 +244,33 @@ export class ChatSocket {
     if (this.notifyScheduled) return;
     this.notifyScheduled = true;
     const flush = () => {
+      if (!this.notifyScheduled) return; // 另一路(rAF/timer)已抢先 flush,二选一
       this.notifyScheduled = false;
+      if (this.notifyRaf !== null && typeof cancelAnimationFrame === "function") {
+        cancelAnimationFrame(this.notifyRaf);
+      }
+      this.notifyRaf = null;
+      if (this.notifyFallbackTimer !== null) {
+        clearTimeout(this.notifyFallbackTimer);
+        this.notifyFallbackTimer = null;
+      }
       this.version++;
       this.rebuildSnapshot();
       for (const cb of this.listeners) cb();
     };
-    if (typeof queueMicrotask === "function") queueMicrotask(flush);
-    else Promise.resolve().then(flush);
+    // 消费侧背压式流控:用 rAF 把"一帧内"多次状态变更(快速流式 token delta 每条 onmessage
+    // 都 applyFrame+scheduleNotify)合并成**一次** re-render(≤60fps),解耦"收帧速率"与"渲染
+    // 速率",避免高频流式下 React re-render storm。状态本身已在各方法里同步应用,这里只合并
+    // **渲染通知**,不延迟数据。隐藏 tab 下 rAF 被浏览器节流到几乎不触发 → setTimeout 兜底,
+    // 保证 snapshot 仍刷新 + listeners 触发(切回前台时状态一致)。SSR/测试(无 rAF)退回 microtask。
+    if (typeof requestAnimationFrame === "function") {
+      this.notifyRaf = requestAnimationFrame(flush);
+      this.notifyFallbackTimer = setTimeout(flush, NOTIFY_FALLBACK_MS);
+    } else if (typeof queueMicrotask === "function") {
+      queueMicrotask(flush);
+    } else {
+      Promise.resolve().then(flush);
+    }
   }
 
   private setStatus(label: string, cls: ChatStatusClass): void {
@@ -297,6 +324,12 @@ export class ChatSocket {
     if (this.reconnectReconcileTimer) clearTimeout(this.reconnectReconcileTimer);
     if (this.offlineDrainTimer) clearTimeout(this.offlineDrainTimer);
     if (this.drainTimeoutTimer) clearTimeout(this.drainTimeoutTimer);
+    // 取消挂起的 rAF 合并渲染(避免 teardown 后再 flush + dangling timer)。
+    if (this.notifyRaf !== null && typeof cancelAnimationFrame === "function") cancelAnimationFrame(this.notifyRaf);
+    this.notifyRaf = null;
+    if (this.notifyFallbackTimer !== null) clearTimeout(this.notifyFallbackTimer);
+    this.notifyFallbackTimer = null;
+    this.notifyScheduled = false;
     for (const t of this.thinkingTimers.values()) clearTimeout(t);
     this.thinkingTimers.clear();
     const ws = this.ws;
