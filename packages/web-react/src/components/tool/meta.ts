@@ -37,34 +37,36 @@ import {
 } from "lucide-react";
 import { asArr, asStr, shortPath } from "./format";
 
-export type ToolMeta = { icon: LucideIcon; label: string };
+/** 工具卡图标底色语义(对齐设计稿 aurora-conversation-cards 的 .tic.tn-* 分色)。 */
+export type ToolTone = "accent" | "success" | "info" | "warning" | "neutral";
+export type ToolMeta = { icon: LucideIcon; label: string; tone?: ToolTone };
 
-// ── builtin claude-code 工具 ──
+// ── builtin claude-code 工具(tone 对齐设计稿:终端紫/编辑写入绿/读取搜索灰/网页蓝)──
 const TOOL_META: Record<string, ToolMeta> = {
-  Bash: { icon: Terminal, label: "终端" },
-  Read: { icon: FileText, label: "读取文件" },
-  Edit: { icon: Pencil, label: "编辑文件" },
-  Write: { icon: FilePlus, label: "写入文件" },
-  Grep: { icon: Search, label: "搜索内容" },
-  Glob: { icon: FolderOpen, label: "搜索文件" },
-  WebFetch: { icon: Globe, label: "网页抓取" },
-  WebSearch: { icon: Globe, label: "网页搜索" },
-  TodoWrite: { icon: ListChecks, label: "任务列表" },
-  NotebookEdit: { icon: NotebookPen, label: "笔记本" },
-  Task: { icon: Bot, label: "子任务" },
-  Agent: { icon: Bot, label: "子任务" },
+  Bash: { icon: Terminal, label: "终端", tone: "accent" },
+  Read: { icon: FileText, label: "读取文件", tone: "neutral" },
+  Edit: { icon: Pencil, label: "编辑文件", tone: "success" },
+  Write: { icon: FilePlus, label: "写入文件", tone: "success" },
+  Grep: { icon: Search, label: "搜索内容", tone: "neutral" },
+  Glob: { icon: FolderOpen, label: "搜索文件", tone: "neutral" },
+  WebFetch: { icon: Globe, label: "网页抓取", tone: "info" },
+  WebSearch: { icon: Globe, label: "网页搜索", tone: "info" },
+  TodoWrite: { icon: ListChecks, label: "任务列表", tone: "accent" },
+  NotebookEdit: { icon: NotebookPen, label: "笔记本", tone: "neutral" },
+  Task: { icon: Bot, label: "子任务", tone: "accent" },
+  Agent: { icon: Bot, label: "子任务", tone: "accent" },
 };
 
-// ── MCP server 前缀 → 友好 meta（图标 + 基础标签）──
+// ── MCP server 前缀 → 友好 meta（图标 + 基础标签 + tone）──
 // 工具名形如 `mcp__<server>__<op>`，先按 server 分类，再按 op 细化。
 const MCP_SERVER_META: Record<string, ToolMeta> = {
-  browser: { icon: AppWindow, label: "浏览器" },
-  "minimax-media": { icon: Sparkles, label: "媒体生成" },
-  "minimax-vision": { icon: Eye, label: "视觉理解" },
-  "openclaude-vision": { icon: Eye, label: "视觉理解" },
-  "openclaude-memory": { icon: Brain, label: "记忆" },
-  "scansci-pdf": { icon: FileText, label: "论文检索" },
-  "quant-system": { icon: BarChart3, label: "量化" },
+  browser: { icon: AppWindow, label: "浏览器", tone: "info" },
+  "minimax-media": { icon: Sparkles, label: "媒体生成", tone: "accent" },
+  "minimax-vision": { icon: Eye, label: "视觉理解", tone: "warning" },
+  "openclaude-vision": { icon: Eye, label: "视觉理解", tone: "warning" },
+  "openclaude-memory": { icon: Brain, label: "记忆", tone: "accent" },
+  "scansci-pdf": { icon: FileText, label: "论文检索", tone: "info" },
+  "quant-system": { icon: BarChart3, label: "量化", tone: "info" },
 };
 
 // ── per-op 覆盖（server 作用域），给更贴切的图标 + 标签 ──
@@ -156,14 +158,15 @@ export function resolveToolMeta(name: string): ToolMeta {
   if (TOOL_META[name]) return TOOL_META[name];
   const mcp = parseMcpName(name);
   if (mcp) {
-    const opMeta = MCP_OP_META[`${mcp.server}:${mcp.op}`];
-    if (opMeta) return opMeta;
     const srvMeta = MCP_SERVER_META[mcp.server];
+    const opMeta = MCP_OP_META[`${mcp.server}:${mcp.op}`];
+    // op 级 meta 没单独配 tone 时继承 server tone(再退 accent)。
+    if (opMeta) return { ...opMeta, tone: opMeta.tone ?? srvMeta?.tone ?? "accent" };
     const opLabel = humanizeOp(mcp.op) || mcp.server;
-    if (srvMeta) return { icon: srvMeta.icon, label: `${srvMeta.label}: ${opLabel}` };
-    return { icon: Wrench, label: opLabel };
+    if (srvMeta) return { icon: srvMeta.icon, label: `${srvMeta.label}: ${opLabel}`, tone: srvMeta.tone };
+    return { icon: Wrench, label: opLabel, tone: "neutral" };
   }
-  return { icon: Wrench, label: name };
+  return { icon: Wrench, label: name, tone: "neutral" };
 }
 
 /** 工具卡 header 行的紧凑摘要（文件路径 / 命令 / 查询等）。 */

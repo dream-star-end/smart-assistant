@@ -28,6 +28,15 @@ import { Badge, Spinner } from "./ui";
 
 export type { ToolLike } from "./tool/format";
 
+// 图标底色按工具语义分色(对齐设计稿 .tic.tn-*);error 单独走红。
+const TONE_TILE: Record<string, string> = {
+  accent: "bg-accent-soft text-accent",
+  success: "bg-success-soft text-success",
+  info: "bg-info-soft text-info",
+  warning: "bg-warning-soft text-warning",
+  neutral: "bg-hover text-muted",
+};
+
 export function ToolCard({ message }: { message: ToolLike }) {
   const name = message.toolName || "unknown";
   const input = resolveToolInput(message);
@@ -69,7 +78,7 @@ export function ToolCard({ message }: { message: ToolLike }) {
         <span
           className={cn(
             "flex size-6 shrink-0 items-center justify-center rounded-md",
-            isError ? "bg-danger-soft text-danger" : "bg-accent-soft text-accent",
+            isError ? "bg-danger-soft text-danger" : TONE_TILE[meta.tone ?? "accent"],
           )}
         >
           <Icon size={13} />

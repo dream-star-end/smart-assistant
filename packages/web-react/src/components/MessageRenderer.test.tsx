@@ -42,7 +42,8 @@ describe("MessageRenderer 角色分派 + 非工具卡", () => {
     // Markdown 经 React.lazy 异步加载：占位期渲染纯文本整段「你好**世界**」。
     // 用精确匹配「世界」跳过占位（占位无独立「世界」节点），等到真正的富文本解析完成，
     // 届时 **世界** 被渲染为 <strong>世界</strong> —— 既验证内容到位，又验证懒加载边界确实落地。
-    const strong = await screen.findByText("世界");
+    // 懒加载 chunk 在全量套件并发下解析可能 >1s，给足超时余量(隔离稳过,仅满负载偶发)。
+    const strong = await screen.findByText("世界", {}, { timeout: 5000 });
     expect(strong.tagName).toBe("STRONG");
   });
 

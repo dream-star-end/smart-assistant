@@ -117,6 +117,35 @@ export function SignedImg(props: React.ImgHTMLAttributes<HTMLImageElement>) {
   return <img src={resolved} alt={alt || ""} loading="lazy" {...rest} />;
 }
 
+/** markdown 行内 <video>：容器路径签名后渲染（rehypeEmbedMedia 把媒体路径行内码转成 video 节点用）。 */
+export function SignedVideo(props: React.VideoHTMLAttributes<HTMLVideoElement> & { src?: string }) {
+  const { src, ...rest } = props;
+  const resolved = useSignedSrc(typeof src === "string" ? src : null);
+  if (!resolved) {
+    return (
+      <span className="inline-flex items-center gap-1 rounded-md bg-hover px-2 py-1 text-xs text-faint">
+        <FileText size={12} /> 视频加载中…
+      </span>
+    );
+  }
+  // biome-ignore lint/a11y/useMediaCaption: 模型生成媒体无字幕轨
+  return <video src={resolved} controls className="my-2 max-h-72 max-w-full rounded-lg border border-border" {...rest} />;
+}
+
+/** markdown 行内 <audio>：容器路径签名后渲染。 */
+export function SignedAudio(props: React.AudioHTMLAttributes<HTMLAudioElement> & { src?: string }) {
+  const { src, ...rest } = props;
+  const resolved = useSignedSrc(typeof src === "string" ? src : null);
+  if (!resolved) {
+    return (
+      <span className="inline-flex items-center gap-1 rounded-md bg-hover px-2 py-1 text-xs text-faint">
+        <FileText size={12} /> 音频加载中…
+      </span>
+    );
+  }
+  return <audio src={resolved} controls className="my-2 w-full max-w-sm" {...rest} />;
+}
+
 /** 单个已分类媒体的实际元素（image/video/audio/file）。 */
 function MediaItem({ item }: { item: ResolvedMedia }) {
   const path = item.mode === "sign" ? item.path : null;
