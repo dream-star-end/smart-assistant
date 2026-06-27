@@ -135,6 +135,12 @@ export function messageSignature(
       return [
         head,
         textSig(m.text),
+        // 委派队员标识/目标也是显示字段（AgentGroupCard 头 + TeamPanel 队员行读它们）：
+        // reducer 就地 mutate，若后到/修正而签名漏掉，memo 会跳过重渲，名字/任务卡在旧值。
+        // 用完整字符串而非 textSig（尾采样）—— goal 可能是较长任务描述，「只改前缀、后缀同长」
+        // 会让尾采样碰撞导致漏渲；这俩字段短、逐字符比较成本可忽略。
+        m._delegateAgentId ?? "",
+        m._delegateGoal ?? "",
         m._completed ? 1 : 0,
         m._isError ? 1 : 0,
         m._duration ?? 0,

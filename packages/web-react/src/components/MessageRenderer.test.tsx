@@ -3,7 +3,7 @@ import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import type { ChatMessage } from "../lib/chat/model";
 import { messageSignature } from "../lib/chat/render";
-import { MessageRenderer } from "./MessageRenderer";
+import { MessageList, MessageRenderer } from "./MessageRenderer";
 import type { CardCallbacks } from "./chat/cards";
 import type { PermissionRespond } from "./chat/PermissionCard";
 
@@ -184,5 +184,39 @@ describe("permission 审批", () => {
       }),
     );
     expect(screen.getByText("→ 蓝")).toBeInTheDocument();
+  });
+});
+
+describe("MessageList coalesceTeam 聚合(零回归关键路径)", () => {
+  function g(id: string, text: string, extra: Partial<ChatMessage> = {}): ChatMessage {
+    return { id, role: "agent-group", text, ts: 1000, _delegate: true, ...extra };
+  }
+  function renderList(messages: ChatMessage[]) {
+    return render(
+      <MessageList messages={messages} sending={false} cb={{}} onRespondPermission={() => {}} />,
+    );
+  }
+
+  test("连续 ≥2 条 agent-group → 聚成团队面板", () => {
+    renderList([g("g1", "任务A"), g("g2", "任务B")]);
+    expect(screen.getByText("团队协作 · 2 个智能体")).toBeInTheDocument();
+  });
+
+  test("单条 agent-group → 退化回 AgentGroupCard,不出团队面板", () => {
+    renderList([g("g1", "独立任务")]);
+    expect(screen.queryByText(/团队协作/)).not.toBeInTheDocument();
+    expect(screen.getByText("独立任务")).toBeInTheDocument(); // AgentGroupCard 头部
+  });
+
+  test("被其它消息夹断的 agent-group → 不聚合(各自独立卡)", () => {
+    renderList([g("g1", "任务A"), mk("user", { id: "u1", text: "插话" }), g("g2", "任务B")]);
+    expect(screen.queryByText(/团队协作/)).not.toBeInTheDocument();
+    expect(screen.getByText("任务A")).toBeInTheDocument();
+    expect(screen.getByText("任务B")).toBeInTheDocument();
+  });
+
+  test("三条连续 → 团队面板计数为 3", () => {
+    renderList([g("g1", "A"), g("g2", "B"), g("g3", "C")]);
+    expect(screen.getByText("团队协作 · 3 个智能体")).toBeInTheDocument();
   });
 });

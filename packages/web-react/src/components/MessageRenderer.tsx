@@ -23,6 +23,7 @@ import {
   UserCard,
 } from "./chat/cards";
 import { AgentGroupCard } from "./chat/AgentGroupCard";
+import { TeamPanel } from "./chat/TeamPanel";
 import { PermissionCard, type PermissionRespond } from "./chat/PermissionCard";
 import { ToolCardSlot } from "./chat/toolCardSlot";
 import { Avatar } from "./ui";
@@ -70,6 +71,46 @@ export const MessageRenderer = memo(
 
 const LOAD_MORE_STEP = 100;
 
+/** 渲染项:普通单条消息,或"连续多个委派智能体聚成的团队"。 */
+type RenderItem =
+  | { kind: "single"; m: ChatMessage; isLast: boolean }
+  | { kind: "team"; members: ChatMessage[]; sig: string };
+
+/**
+ * 把渲染切片里**连续的 agent-group 消息**(队长同一轮并行委派的多个智能体)聚成一个
+ * 团队项(≥2 个 → TeamPanel);单个委派退化为原 AgentGroupCard(走 MessageRenderer)。
+ * 团队 sig = 各成员 messageSignature 拼接(任一成员变 → 面板重渲,防闪)。
+ */
+function coalesceTeam(
+  slice: ChatMessage[],
+  start: number,
+  total: number,
+  sending: boolean,
+): RenderItem[] {
+  const items: RenderItem[] = [];
+  for (let i = 0; i < slice.length; i++) {
+    const m = slice[i];
+    if (messageKind(m) === "agent-group") {
+      const members: ChatMessage[] = [m];
+      while (i + 1 < slice.length && messageKind(slice[i + 1]) === "agent-group") {
+        members.push(slice[++i]);
+      }
+      if (members.length >= 2) {
+        items.push({
+          kind: "team",
+          members,
+          sig: members.map((mm) => messageSignature(mm, { isLast: false, sending })).join("||"),
+        });
+        continue;
+      }
+      items.push({ kind: "single", m: members[0], isLast: start + i === total - 1 });
+      continue;
+    }
+    items.push({ kind: "single", m, isLast: start + i === total - 1 });
+  }
+  return items;
+}
+
 export function MessageList({
   messages,
   sending,
@@ -107,20 +148,21 @@ export function MessageList({
           加载更多历史（还有 {start} 条）
         </button>
       )}
-      {slice.map((m, i) => {
-        const isLast = start + i === total - 1;
-        return (
+      {coalesceTeam(slice, start, total, sending).map((it) =>
+        it.kind === "team" ? (
+          <TeamPanel key={it.members[0].id} members={it.members} sig={it.sig} />
+        ) : (
           <MessageRenderer
-            key={m.id}
-            message={m}
-            sig={messageSignature(m, { isLast, sending })}
-            isLast={isLast}
+            key={it.m.id}
+            message={it.m}
+            sig={messageSignature(it.m, { isLast: it.isLast, sending })}
+            isLast={it.isLast}
             sending={sending}
             cb={cb}
             onRespondPermission={onRespondPermission}
           />
-        );
-      })}
+        ),
+      )}
       {showTyping && (
         <div className="flex gap-4 animate-in">
           <Avatar tone="brand" className="mt-0.5 shadow-sm">

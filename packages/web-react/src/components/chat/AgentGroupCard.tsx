@@ -15,7 +15,7 @@ import { Badge, Spinner } from "../ui";
 import { Markdown } from "../Markdown";
 import { ToolCardSlot } from "./toolCardSlot";
 
-const ChildBlockView = memo(
+export const ChildBlockView = memo(
   function ChildBlockView({ child }: { child: ChildBlock; sig: string }) {
     if (child.kind === "text") {
       if (!child.text) return null;
