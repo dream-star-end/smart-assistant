@@ -399,7 +399,9 @@ const STEP_DOT: Record<string, string> = {
   inProgress: "bg-accent animate-pulse",
   pending: "bg-faint",
 };
-export const PlanCard = memo(function PlanCard({ msg }: { msg: ChatMessage }) {
+// 不外包 memo:只收 {msg} + reducer 就地 mutate → 默认浅比较永不重渲(plan 步骤流式更新会丢)。
+// 重渲由上层 MessageRenderer 的 messageSignature memo 把关。
+export function PlanCard({ msg }: { msg: ChatMessage }) {
   const steps = msg.steps ?? [];
   return (
     <div className="rounded-lg border border-border bg-surface animate-in">
@@ -427,10 +429,11 @@ export const PlanCard = memo(function PlanCard({ msg }: { msg: ChatMessage }) {
       </div>
     </div>
   );
-});
+}
 
 // ═══════════════ delegate-progress（委派进度兜底卡） ═══════════════
-export const DelegateProgressCard = memo(function DelegateProgressCard({ msg }: { msg: ChatMessage }) {
+// 不外包 memo(同 PlanCard:就地 mutate + {msg} 会永不重渲)。
+export function DelegateProgressCard({ msg }: { msg: ChatMessage }) {
   const entries = msg.entries ?? [];
   const done = !!msg._completed;
   return (
@@ -462,7 +465,7 @@ export const DelegateProgressCard = memo(function DelegateProgressCard({ msg }: 
       )}
     </div>
   );
-});
+}
 
 // ═══════════════ system ═══════════════
 export const SystemCard = memo(function SystemCard({ msg }: { msg: ChatMessage }) {

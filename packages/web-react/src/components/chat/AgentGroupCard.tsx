@@ -43,7 +43,10 @@ const ChildBlockView = memo(
   (a, b) => a.sig === b.sig,
 );
 
-export const AgentGroupCard = memo(function AgentGroupCard({ msg }: { msg: ChatMessage }) {
+// 不外包 memo:本卡只收 {msg},而 reducer 就地 mutate(msg 引用不变)→ 默认浅比较会永不
+// 重渲(_completed/childBlocks 改了画面不更新,曾致委托卡永远"运行中")。重渲已由上层
+// MessageRenderer 的 messageSignature memo 把关(sig 变才渲染本卡),这层 memo 冗余且有害。
+export function AgentGroupCard({ msg }: { msg: ChatMessage }) {
   const running = !msg._completed;
   const isError = !!msg._isError;
   const [userCollapsed, setUserCollapsed] = useState<boolean | null>(null);
@@ -101,4 +104,4 @@ export const AgentGroupCard = memo(function AgentGroupCard({ msg }: { msg: ChatM
       )}
     </div>
   );
-});
+}
