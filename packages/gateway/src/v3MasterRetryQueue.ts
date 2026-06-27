@@ -73,6 +73,33 @@ export const ENTRY_TTL_MS = 24 * 60 * 60 * 1000
  *  still down. */
 export const DEFAULT_DRAIN_INTERVAL_MS = 30_000
 
+/**
+ * Per-entry 指数退避(基数 / 上限)。
+ *
+ * 风暴根因(实测 v5):drainer 被频繁 kick —— `enqueueDurable` 每次 turn-end kick()、
+ * 且 kick 的 finally 在 pendingKick 时 `setImmediate(kick)` 背靠背重 drain。持续 turn 活动下
+ * drainer 对**同一批**未送达 entry 无间隔地一遍遍 attemptSend,把 session_not_found 刷到
+ * ~18/s(27k+/25min),旁路了 30s 周期。
+ *
+ * 对策:每个 entry 失败后按 attempts 退避,未到下次重试时刻就跳过本轮 attemptSend(不调
+ * master)。这只**推迟**重试、**不改 drop 语义**,仍重试到 ENTRY_TTL_MS(24h)兜底,
+ * 不丢迟建会话的消息(保持 Plan v2.1 数据安全意图)。借鉴 Claude Code AutoCompact
+ * 断路器思想(小概率异常路径在规模下也是大浪费)。
+ */
+export const RETRY_BACKOFF_BASE_MS = 5_000
+export const RETRY_BACKOFF_MAX_MS = 5 * 60_000
+/** attempts=0 → 0(新 entry 立即可发);1 → 5s;2 → 10s;… 封顶 5min。 */
+export function retryBackoffMs(attempts: number): number {
+  if (attempts <= 0) return 0
+  const exp = Math.min(attempts - 1, 20)
+  return Math.min(RETRY_BACKOFF_BASE_MS * 2 ** exp, RETRY_BACKOFF_MAX_MS)
+}
+
+/** 重 kick 最小间隔。pendingKick 时不再 `setImmediate` 背靠背(配合退避后每轮多为
+ *  "读文件+跳过",仍会 file-read 自旋占满 event loop → 已知 v3 wedge 类隐患)。
+ *  改为延迟重 kick,把 drain 轮次封顶到 ~1/s;新 entry 最多等此值。 */
+export const MIN_REKICK_GAP_MS = 1_000
+
 /** Default queue dir = ${HOME}/v3-master-retry.d. Distinct from the
  *  legacy msgOutbox jsonl. Override for tests via deps. */
 export function defaultQueueDir(): string {
@@ -191,9 +218,11 @@ export function makeV3MasterRetryQueue(deps: MakeV3MasterRetryQueueDeps): V3Mast
         draining = false
         if (pendingKick) {
           pendingKick = false
-          // Schedule a fresh drain after current event-loop tick — avoids
-          // unbounded recursion if drain finishes synchronously.
-          setImmediate(() => kick())
+          // 延迟重 kick(非 setImmediate 背靠背):配合 per-entry 退避后,每轮多为"读文件+跳过",
+          // setImmediate 会让 drainer 在持续 enqueue 下自旋占满 event loop(已知 v3 wedge 类隐患:
+          // healthz timeout)。MIN_REKICK_GAP_MS 把 drain 轮次封顶到 ~1/s。unref 不阻进程退出。
+          const t = setTimeout(() => kick(), MIN_REKICK_GAP_MS)
+          if (typeof t.unref === 'function') t.unref()
         }
       })
   }
@@ -281,6 +310,15 @@ export function makeV3MasterRetryQueue(deps: MakeV3MasterRetryQueueDeps): V3Mast
         })
         await unlinkIgnoreEnoent(filepath)
         continue
+      }
+      // Per-entry 指数退避:刚失败过(attempts>0)且未到下次重试时刻 → 跳过本轮 attemptSend
+      // (不调 master),计为 pending。这是消除"频繁 kick → 无间隔背靠背重发"风暴的关键;
+      // 退避不丢数据(TTL 仍兜底)。新 entry(attempts=0)或退避已过 → 正常重试。
+      if (entry.attempts > 0 && typeof entry.lastErrorAt === 'number') {
+        if (now() < entry.lastErrorAt + retryBackoffMs(entry.attempts)) {
+          stats.pending++
+          continue
+        }
       }
       // Attempt.
       try {

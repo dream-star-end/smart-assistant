@@ -120,8 +120,12 @@ describe("enqueueDurable", () => {
     //   3. drain with success → attemptSend receives thinkingText from disk
     let stage: "transient" | "success" = "transient";
     let lastSeen: string | undefined;
+    // per-entry 退避后,同一时刻连续 drain 第二次会被跳过 → 注入可控时钟,stage 3 前推进
+    // 过退避窗(> RETRY_BACKOFF_MAX_MS)再 drain,反映"退避到期后重试"的新语义。
+    let clock = Date.now();
     const q = makeV3MasterRetryQueue({
       dir,
+      now: () => clock,
       attemptSend: async (p) => {
         lastSeen = p.thinkingText;
         if (stage === "transient")
@@ -156,8 +160,10 @@ describe("enqueueDurable", () => {
       "thinkingText preserved through rewrite",
     );
 
-    // Stage 3: success drain — attemptSend sees thinkingText
+    // Stage 3: success drain — attemptSend sees thinkingText.
+    // 推进时钟过退避窗(attempts=2 退避 10s,这里 +6min > 上限,确保到期可重试)。
     stage = "success";
+    clock += 6 * 60_000;
     await q.drainOnce();
     assert.equal(lastSeen, "step 1. think. step 2. answer.");
     const filesEnd = await listJsonFiles();
@@ -373,6 +379,31 @@ describe("drainOnce — transient retry", () => {
     assert.equal(files.length, 1);
     const reread = JSON.parse(await readFile(join(dir, files[0]), "utf8")) as V3MasterRetryEntry;
     assert.equal(reread.lastErrorClass, "session_missing");
+  });
+
+  test("per-entry 指数退避:退避窗内跳过 attemptSend,到期后才重试(防风暴)", async () => {
+    let clock = Date.now();
+    let calls = 0;
+    const q = makeV3MasterRetryQueue({
+      dir,
+      now: () => clock,
+      attemptSend: async () => {
+        calls += 1;
+        throw new V3SinkError("session_not_found", "session_missing", 404);
+      },
+    });
+    await writeEntryDirect(entry()); // attempts=1, 无 lastErrorAt → 首轮立即尝试
+    await q.drainOnce();
+    assert.equal(calls, 1, "首轮立即尝试一次(失败 → bump attempts=2 + 记 lastErrorAt)");
+    // 同一时刻再 drain:退避未到期 → 跳过,不再打 master(这是消除风暴的关键)。
+    await q.drainOnce();
+    assert.equal(calls, 1, "退避窗内连续 drain 不重复 attemptSend");
+    clock += 9_000; // < attempts=2 的 10s 退避
+    await q.drainOnce();
+    assert.equal(calls, 1, "退避未满仍跳过");
+    clock += 60_000; // 越过退避窗
+    await q.drainOnce();
+    assert.equal(calls, 2, "退避到期后重试一次");
   });
 });
 

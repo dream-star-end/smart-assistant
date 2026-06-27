@@ -188,6 +188,12 @@ export class ChatSocket {
    * 每次 onclose 清空(连接级);同 session 再 direct-send 覆盖旧条。
    */
   private inFlightSends = new Map<string, OfflineItem>();
+  /**
+   * 本连接 bridge↔容器 relay 是否已确认建立(收到 sys.relay_ready 即 true)。connect/onclose 复位。
+   * readiness 权威统一:冷启时 ws.onopen(握手完成)早于 relay 就绪,relay_ready 才是"可投递"的
+   * 单一权威信号。收到即排空离线队列(P7.8 重排进去的冷启首条消息得以立即投递)。
+   */
+  private relayReady = false;
 
   // ── 生命周期事件绑定句柄 ──
   private boundOnline?: () => void;
@@ -490,6 +496,7 @@ export class ChatSocket {
       return;
     }
     this.setStatus("连接中…", "connecting");
+    this.relayReady = false; // 新连接:relay 未确认,待 sys.relay_ready
     const proto = location.protocol === "https:" ? "wss://" : "ws://";
     const url = `${proto}${location.host}${WS_PATH}`;
     // 鉴权 = Sec-WebSocket-Protocol 子协议 ['bearer', token]（非 ?token= 非 header）。
@@ -620,6 +627,7 @@ export class ChatSocket {
         this.pendingPing = null;
       }
       if (this.ws !== ws) return; // stale socket
+      this.relayReady = false; // 连接关闭:relay 失效,待下次 sys.relay_ready
       if (this.offlineDrainTimer) {
         clearTimeout(this.offlineDrainTimer);
         this.offlineDrainTimer = null;
@@ -814,6 +822,14 @@ export class ChatSocket {
       case "sys.cold_start": {
         const sess = this.firstSession();
         if (sess) sess._isFirstTurnAfterReady = true;
+        return;
+      }
+      case "sys.relay_ready": {
+        // bridge↔容器 relay 真建立的**单一权威信号**(冷暖都发,见 userChatBridge containerWs open)。
+        // readiness 权威统一:冷启时 WS 握手(onopen)早于 relay 就绪,期间发的消息经 P7.8 在离线
+        // 队列等待;此处一收到就立即排空 → relay 一就绪即投递,不靠 4503 reconnect 反弹的运气/时延。
+        this.relayReady = true;
+        this.startOfflineDrainNow();
         return;
       }
       case "outbound.ack": {
@@ -1367,6 +1383,26 @@ export class ChatSocket {
     const sess = this.sessions.get(item.sessId);
     if (sess && this.statusCls !== "connected") this.setStatus("仍在等待回复…", "connecting");
     this.drainTimeoutTimer = setTimeout(() => this.handleDrainTimeout(item), 5 * 60_000);
+  }
+
+  /**
+   * 立即启动一轮离线队列 drain(由 sys.relay_ready 触发:relay 一就绪就发,不等 onopen 延迟
+   * 定时器/reconnect)。与 onopen 的延迟 drain 共用单飞守卫(offlineQueueDraining /
+   * offlineDrainingCurrent),不会重复 drain;队列空或未连接则 no-op。
+   */
+  private startOfflineDrainNow(): void {
+    if (!this.ws || this.ws.readyState !== 1) return;
+    if (this.offlineQueueDraining || this.offlineDrainingCurrent) return;
+    if (this.offlineQueue.length === 0) return;
+    if (this.offlineDrainTimer) {
+      clearTimeout(this.offlineDrainTimer);
+      this.offlineDrainTimer = null;
+    }
+    this.offlineQueuePending = [...this.offlineQueue];
+    this.offlineQueue = [];
+    this.offlineQueueDraining = true;
+    this.drainGeneration++;
+    this.drainNextOfflineItem();
   }
 
   private drainNextOfflineItem(): void {

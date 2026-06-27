@@ -1750,6 +1750,16 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           userWs.send(JSON.stringify({ type: "sys.cold_start" }));
         } catch { /* swallow — sidecar 提示失败不能影响 bridge */ }
       }
+      // relay 真建立(containerWs open = bridge↔容器双向通)→ 给前端发"就绪"单一权威信号。
+      // 冷暖都发(sys.cold_start 仅冷启)。这是 readiness 权威统一:前端把"relay 已就绪"只认
+      // 这一个信号,据此立刻排空离线队列 —— 冷启时握手完成(前端 onopen)早于 relay 就绪,
+      // 期间发的消息经 P7.8 进离线队列等待;收到 relay_ready 即发,不再靠 4503 reconnect 反弹。
+      // sys.* 命名;前端 default case 忽略未知 type,加 case 是 additive。
+      if (userWs.readyState === WebSocket.OPEN) {
+        try {
+          userWs.send(JSON.stringify({ type: "sys.relay_ready" }));
+        } catch { /* swallow */ }
+      }
       // 冲刷 preopen queue
       for (const m of preopenQueue) sendToContainer(m.data, m.isBinary, m.len);
       preopenQueue.length = 0;
