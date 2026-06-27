@@ -1110,7 +1110,8 @@ export class ChatSocket {
       void Promise.resolve(this.deps.ensureServerSession?.(sid, p.agentId, sess.title))
         .then((ok) => {
           this.serverSessionInflight.delete(sid);
-          if (ok) this.serverSessionEnsured.add(sid);
+          // 仅当会话仍在(PUT pending 期间未被 remove/reset)才标 ensured,避免给已删会话留残 marker。
+          if (ok && this.sessions.has(sid)) this.serverSessionEnsured.add(sid);
         })
         .catch(() => {
           this.serverSessionInflight.delete(sid);
