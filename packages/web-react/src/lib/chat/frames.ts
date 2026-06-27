@@ -94,6 +94,10 @@ export type CostChargedWire = {
 /** 容器冷启提示（typing-indicator 加 “容器首次加载中” 后缀）。*/
 export type ColdStartWire = { type: "sys.cold_start"; peer?: Peer };
 
+/** bridge↔容器 relay 真建立的就绪信号（containerWs open，冷暖都发）。readiness 单一权威：
+ *  前端据此立即排空离线队列（冷启时 ws.onopen 早于 relay 就绪，期间消息排队等此信号）。*/
+export type RelayReadyWire = { type: "sys.relay_ready"; peer?: Peer };
+
 /** server 已去重的 ack（drain 对账 + auto-continue 对账）。*/
 export type AckWire = {
   type: "outbound.ack";
@@ -115,6 +119,7 @@ export type OutboundWire =
   | LegacyBridgeErrorWire
   | CostChargedWire
   | ColdStartWire
+  | RelayReadyWire
   | AckWire
   | PongWire;
 
