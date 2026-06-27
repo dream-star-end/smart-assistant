@@ -7,7 +7,7 @@
  * <Media> 主动 effect 签名，替代"占位永停"。
  */
 import { createContext, useContext, useEffect, useRef, useState } from "react";
-import { FileText } from "lucide-react";
+import { Download, FileText } from "lucide-react";
 import type { MediaRef } from "../../lib/chat/frames";
 import { classifyMediaRef, isContainerPath, type ResolvedMedia } from "../../lib/chat/media";
 import { cn } from "../../lib/utils";
@@ -144,6 +144,43 @@ export function SignedAudio(props: React.AudioHTMLAttributes<HTMLAudioElement> &
     );
   }
   return <audio src={resolved} controls className="my-2 w-full max-w-sm" {...rest} />;
+}
+
+/** markdown 行内/正文里的容器文件路径 → 可下载文件卡(doc-card)。非媒体文件(txt/docx/pdf/zip…)。
+ * 经 /api/media-sign 把容器路径换成同源签名 URL,再用 <a download> 真下载(同源 download 生效)。 */
+export function SignedFileCard({ src, filename }: { src?: string; filename?: string }) {
+  const resolved = useSignedSrc(typeof src === "string" ? src : null);
+  const name = (filename || (typeof src === "string" ? src.split("/").pop() : "") || "文件").trim();
+  const inner = (
+    <>
+      <span className="flex size-8 shrink-0 items-center justify-center rounded-md bg-accent-soft text-accent">
+        <FileText size={16} />
+      </span>
+      <span className="min-w-0 flex-1 truncate text-[13px] text-fg">{name}</span>
+      <Download size={15} className={resolved ? "shrink-0 text-muted" : "shrink-0 text-faint"} />
+    </>
+  );
+  if (!resolved) {
+    return (
+      <span
+        className="my-1.5 inline-flex max-w-full items-center gap-2.5 rounded-lg border border-border bg-surface px-3 py-2"
+        title="文件准备中…(容器冷启时稍候)"
+      >
+        {inner}
+      </span>
+    );
+  }
+  return (
+    <a
+      href={resolved}
+      download={name}
+      target="_blank"
+      rel="noreferrer"
+      className="my-1.5 inline-flex max-w-full items-center gap-2.5 rounded-lg border border-border bg-surface px-3 py-2 no-underline transition-colors hover:border-border-strong hover:bg-hover"
+    >
+      {inner}
+    </a>
+  );
 }
 
 /** 单个已分类媒体的实际元素（image/video/audio/file）。 */

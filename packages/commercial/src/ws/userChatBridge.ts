@@ -1965,6 +1965,12 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
    */
   function broadcastToUser(uid: bigint, payload: unknown): number {
     const set = uidToUserWs.get(uid.toString());
+    // 临时诊断(P7 积分广播排查):每次广播记 uid/set 大小/payload 类型,定位 cost_charged 是否送达。
+    log?.info("user-chat-bridge: broadcastToUser", {
+      uid: uid.toString(),
+      setSize: set ? set.size : -1,
+      ptype: (payload as { type?: string } | null)?.type ?? "?",
+    });
     if (!set || set.size === 0) return 0;
     let text: string;
     try { text = JSON.stringify(payload); }

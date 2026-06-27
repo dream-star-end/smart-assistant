@@ -13,7 +13,7 @@ import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
 import "katex/dist/katex.min.css";
 import type { ReactNode } from "react";
-import { SignedAudio, SignedImg, SignedVideo } from "./chat/media";
+import { SignedAudio, SignedFileCard, SignedImg, SignedVideo } from "./chat/media";
 import { CodeBlock } from "./CodeBlock";
 import { ChartBlock, HtmlPreview, MermaidBlock } from "./RichBlocks";
 import type { MarkdownProps } from "./Markdown";
@@ -27,30 +27,34 @@ function nodeText(node: ReactNode): string {
   return props?.children != null ? nodeText(props.children) : "";
 }
 
-// ── 媒体内联嵌入（对齐现网 embedMediaUrls）──────────────────────────────────
-// 技能/工具常把生成或上传的文件写到容器 /home/agent/.openclaude/... 然后在正文里以
-// **行内码**或裸路径写出绝对路径(如 `/home/agent/.openclaude/generated/x.jpeg`)。
-// 默认 react-markdown 只把它当行内码渲染 → 用户看到一串路径、看不到图。这里加一个
-// rehype 插件：把"整段就是一个媒体路径/URL"的行内 code 节点改写成 img/video/audio
-// 元素，再交给下方 Signed* 组件经 /api/media-sign 签名渲染(容器路径浏览器才取得到)。
+// ── 媒体/文件内联嵌入（对齐现网 embedMediaUrls）────────────────────────────────
+// 技能/工具常把生成或上传的文件写到容器 /home/agent/.openclaude/...，然后在正文里以
+// **行内码**或**裸文本**写出绝对路径(如 `/home/agent/.openclaude/generated/x.jpeg` 或
+// .../hello.txt)。默认 react-markdown 只当文本渲染 → 用户看到一串路径:图看不到、文件
+// 没法下载。这里加 rehype 插件:把路径改写成媒体元素(img/video/audio)或可下载文件卡
+// (filecard)，再交给 Signed* 组件经 /api/media-sign 签名(容器路径浏览器才取得到)。
+// 两种来源都扫:① 行内 code(更明确,放宽到任意容器路径);② 纯文本(只认 openclaude
+// 生成/上传目录 + /api/media,避免句子里普通 "/x" 误判)。
 const IMG_EXT = new Set(["png", "jpg", "jpeg", "gif", "webp", "svg", "bmp", "avif"]);
 const VIDEO_EXT = new Set(["mp4", "webm", "mov", "mkv"]);
 const AUDIO_EXT = new Set(["mp3", "wav", "ogg", "m4a", "flac", "aac"]);
 
-/** 整段是单个媒体引用(容器绝对路径或 http(s) URL)→ 返回对应媒体标签；否则 null。 */
-function embedTag(raw: string): "img" | "video" | "audio" | null {
+type EmbedTag = "img" | "video" | "audio" | "filecard";
+
+/** 候选引用归类。媒体扩展名(容器路径/http/URL)→ 媒体标签;非媒体的容器文件路径 → 文件下载卡;否则 null。 */
+function classifyEmbed(raw: string): EmbedTag | null {
   const s = raw.trim();
-  if (!s || /\s/.test(s)) return null; // 必须是单一引用，含空格的句子不碰
-  const isPath = s.startsWith("/") && !s.startsWith("//");
+  if (!s || /\s/.test(s)) return null;
+  const isContainerPath = s.startsWith("/") && !s.startsWith("//") && !s.startsWith("/api/");
+  const isApiMedia = s.startsWith("/api/media");
   const isUrl = /^https?:\/\//i.test(s);
-  if (!isPath && !isUrl) return null;
   const m = /\.([a-z0-9]+)(?:\?.*)?$/i.exec(s);
   if (!m) return null;
   const e = m[1].toLowerCase();
-  if (IMG_EXT.has(e)) return "img";
-  if (VIDEO_EXT.has(e)) return "video";
-  if (AUDIO_EXT.has(e)) return "audio";
-  return null;
+  const media = IMG_EXT.has(e) ? "img" : VIDEO_EXT.has(e) ? "video" : AUDIO_EXT.has(e) ? "audio" : null;
+  if (media) return isContainerPath || isApiMedia || isUrl ? media : null;
+  // 非媒体:仅容器文件路径(生成/上传)→ 可下载文件卡(http 普通链接不碰,保持普通超链接)。
+  return isContainerPath ? "filecard" : null;
 }
 
 type HastNode = {
@@ -72,30 +76,68 @@ function isInlineCode(node: HastNode): boolean {
   return !arr.some((c) => typeof c === "string" && c.startsWith("language-"));
 }
 
+function embedEl(tag: EmbedTag, src: string): HastNode {
+  if (tag === "filecard")
+    return { type: "element", tagName: "filecard", properties: { src, filename: src.split("/").pop() || "" }, children: [] };
+  return {
+    type: "element",
+    tagName: tag,
+    properties: tag === "img" ? { src, alt: "" } : { src, controls: true },
+    children: [],
+  };
+}
+
+// 纯文本只认 openclaude 生成/上传目录 + /api/media(收口,避免误判普通 "/path")。
+const TEXT_PATH_RE = /(?:\/(?:home\/agent|root)\/\.openclaude|\/api\/media)\/[^\s"'`<>，。、；：）)】」]+\.[A-Za-z0-9]{1,10}/g;
+
 function rehypeEmbedMedia() {
   return (tree: HastNode) => visit(tree);
   function visit(node: HastNode) {
     const kids = node.children;
     if (!Array.isArray(kids)) return;
-    for (const child of kids) {
+    for (let i = 0; i < kids.length; i++) {
+      const child = kids[i];
+      // ① 行内 code(块级 ``` 在 <pre> 里、带 language- class 的不碰)。
       if (child.type === "element" && child.tagName === "code") {
-        // 块级代码(```)在 <pre> 里、或带 language- class → 不碰；只看行内 code。
         if (node.tagName !== "pre" && isInlineCode(child)) {
-          const tag = embedTag(hastText(child));
-          if (tag) {
-            child.tagName = tag;
-            child.properties =
-              tag === "img"
-                ? { src: hastText(child).trim(), alt: "" }
-                : { src: hastText(child).trim(), controls: true };
-            child.children = [];
-          }
+          const tag = classifyEmbed(hastText(child));
+          if (tag) kids[i] = embedEl(tag, hastText(child).trim());
         }
-        continue; // 不下钻 code
+        continue;
       }
-      if (child.type === "element" && child.tagName === "pre") continue; // 跳过代码块
+      // 代码块/已有链接不下钻。
+      if (child.type === "element" && (child.tagName === "pre" || child.tagName === "a")) continue;
+      // ② 纯文本:扫容器路径并切分插入媒体/文件元素。
+      if (child.type === "text" && typeof child.value === "string") {
+        const parts = splitText(child.value);
+        if (parts) {
+          kids.splice(i, 1, ...parts);
+          i += parts.length - 1;
+        }
+        continue;
+      }
       if (child.type === "element") visit(child);
     }
+  }
+  function splitText(value: string): HastNode[] | null {
+    TEXT_PATH_RE.lastIndex = 0;
+    if (!TEXT_PATH_RE.test(value)) return null;
+    TEXT_PATH_RE.lastIndex = 0;
+    const out: HastNode[] = [];
+    let last = 0;
+    let m: RegExpExecArray | null = TEXT_PATH_RE.exec(value);
+    while (m !== null) {
+      const tag = classifyEmbed(m[0]);
+      if (tag) {
+        if (m.index > last) out.push({ type: "text", value: value.slice(last, m.index) });
+        out.push(embedEl(tag, m[0]));
+        last = m.index + m[0].length;
+      }
+      m = TEXT_PATH_RE.exec(value);
+    }
+    if (out.length === 0) return null;
+    if (last < value.length) out.push({ type: "text", value: value.slice(last) });
+    return out;
   }
 }
 
@@ -118,6 +160,10 @@ export default function MarkdownImpl({ children, signMedia }: MarkdownProps) {
                 img: ({ node: _node, ...props }) => <SignedImg {...props} />,
                 video: ({ node: _node, ...props }) => <SignedVideo {...props} />,
                 audio: ({ node: _node, ...props }) => <SignedAudio {...props} />,
+                // 自定义 filecard 元素(rehypeEmbedMedia 产出)→ 可下载文件卡。
+                filecard: ({ src, filename }: { src?: string; filename?: string }) => (
+                  <SignedFileCard src={src} filename={filename} />
+                ),
               }
             : {}),
           code({ className, children, ...props }) {
