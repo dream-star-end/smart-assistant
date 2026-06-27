@@ -871,11 +871,6 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         // 容器 ws 生命周期。先解绑 early handler 避免双日志。
         containerWs.off("error", onEarlyContainerWsError);
 
-        log?.info("OCDIAG startBridge-call", {
-          connId, uid: uid.toString(),
-          coldStart: endpoint.coldStart, containerId: endpoint.containerId,
-          pendingMsgs: pendingMessages.length,
-        });
         startBridge(
           ws,
           uid,

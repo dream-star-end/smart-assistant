@@ -764,7 +764,10 @@ export class ChatSocket {
       }
       case "outbound.cost_charged": {
         const frame = f as CostChargedWire;
-        const sess = frame.sessionId ? this.sessions.get(frame.sessionId) || null : this.firstSession();
+        // frame.sessionId 是 agent 内部会话 UUID(LLM metadata 口径),与前端 client peer 会话键
+        // 失配,直接 get 必空。优先按 sessionId(若将来口径对齐),否则路由到在飞/刚收尾 turn 的会话。
+        const sess =
+          (frame.sessionId ? this.sessions.get(frame.sessionId) : undefined) ?? this.costTargetSession();
         applyCostCharged(sess, frame, this.effects());
         return;
       }
@@ -801,6 +804,27 @@ export class ChatSocket {
   private firstSession(): ChatSession | null {
     for (const s of this.sessions.values()) return s;
     return null;
+  }
+
+  /**
+   * cost_charged 的路由目标会话。frame.sessionId 是 **agent 内部会话 UUID**(来自容器 LLM
+   * 请求的 metadata,extractSessionId),与前端 **client peer 会话键**(sess.id=peerId)是
+   * 两套口径,直接 `sessions.get(sessionId)` 必失配 → 旧实现落 null → per-response 积分永不归因
+   * (只剩钱包余额刷新)。cost_charged 经 broadcastToUser 按 uid 投递、且恰在当前 turn 收尾后到,
+   * 故路由到"当前在飞 / 最近收尾"的会话最稳。安全性由 applyCostCharged 内部门控兜底:它只认
+   * _streamingAssistant 或 60s 内 _lastFinaledAssistantId,选错会话则 target=null 仅刷余额、不误算。
+   */
+  private costTargetSession(): ChatSession | null {
+    let recentFinal: ChatSession | null = null;
+    let recentAt = 0;
+    for (const s of this.sessions.values()) {
+      if (s._streamingAssistant || s._sendingInFlight) return s;
+      if (s._lastFinaledAssistantId && s._lastFinaledAt && s._lastFinaledAt > recentAt) {
+        recentAt = s._lastFinaledAt;
+        recentFinal = s;
+      }
+    }
+    return recentFinal ?? this.firstSession();
   }
 
   private buildHelloFrame(): string {
