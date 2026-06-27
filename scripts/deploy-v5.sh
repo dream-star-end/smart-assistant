@@ -176,7 +176,9 @@ deploy() {
   echo "══ v5 deploy on $KL_HOST ══"
   # 快照轮转 .prev.1..5
   echo "── 快照 $REMOTE_SRC → .prev.1(轮转 1..5)──"
-  sshk "set -e; for n in 5 4 3 2 1; do m=\$((n+1)); [ -d '$REMOTE_SRC.prev.'\$n ] && { [ \$m -le 5 ] && rm -rf '$REMOTE_SRC.prev.'\$m 2>/dev/null; mv '$REMOTE_SRC.prev.'\$n '$REMOTE_SRC.prev.'\$m 2>/dev/null; }; done; rsync -a --delete ${RSYNC_EXCLUDES[*]} '$REMOTE_SRC/' '$REMOTE_SRC.prev.1/'"
+  # 轮转用 if(非 && 链)——避免 set -e 下 `[ test ] && cmd` 在 test 失败时整体非零退出;
+  # 且 n=5(最旧)直接 rm 丢弃,不再 mv 到 .prev.6(旧逻辑那条 bug 会造出嵌套的 .prev.6)。
+  sshk "set -e; for n in 5 4 3 2 1; do m=\$((n+1)); if [ -d '$REMOTE_SRC.prev.'\$n ]; then if [ \$m -le 5 ]; then rm -rf '$REMOTE_SRC.prev.'\$m; mv '$REMOTE_SRC.prev.'\$n '$REMOTE_SRC.prev.'\$m; else rm -rf '$REMOTE_SRC.prev.'\$n; fi; fi; done; rm -rf '$REMOTE_SRC.prev.6'; rsync -a --delete ${RSYNC_EXCLUDES[*]} '$REMOTE_SRC/' '$REMOTE_SRC.prev.1/'"
   echo "── rsync v5 源码 ──"
   run "rsync -az --delete ${RSYNC_EXCLUDES[*]} '$REPO_ROOT/' '$KL_HOST:$REMOTE_SRC/'"
   write_version
