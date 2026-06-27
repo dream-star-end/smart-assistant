@@ -33,14 +33,15 @@ export function Landing({
     <div className="min-h-screen bg-bg text-fg">
       {/* Nav */}
       <header className="sticky top-0 z-30 border-b border-border/60 bg-bg/80 backdrop-blur-xl">
-        <div className="mx-auto flex h-16 max-w-6xl items-center justify-between px-5">
+        {/* 窄屏(华为折叠外屏 / 320 小屏)收紧内边距,避免 nav 溢出 8px。 */}
+        <div className="mx-auto flex h-16 max-w-6xl items-center justify-between px-4 sm:px-5">
           <Logo />
           <nav className="hidden items-center gap-7 text-[14.5px] text-muted md:flex">
             <a href="#agents" className="transition-colors hover:text-fg">智能体</a>
             <a href="#features" className="transition-colors hover:text-fg">能力</a>
             <a href="#pricing" className="transition-colors hover:text-fg">定价</a>
           </nav>
-          <div className="flex items-center gap-2">
+          <div className="flex shrink-0 items-center gap-1.5">
             <ThemeToggle theme={theme} onCycle={onCycleTheme} />
             <Button variant="ghost" shape="pill" onClick={onLogin} className="text-muted">
               登录
