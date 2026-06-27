@@ -135,9 +135,11 @@ export function DetailModal({
           )}
 
           <div>
-            <div className="mb-1.5 text-[12px] font-medium text-muted">完整内容（SKILL.md）</div>
+            <div className="mb-1.5 text-[12px] font-medium text-muted">
+              {detail.kind === "agent" ? "完整内容（智能体配置）" : "完整内容（SKILL.md）"}
+            </div>
             <pre className="max-h-72 overflow-auto whitespace-pre-wrap break-words rounded-lg border border-border bg-code px-3 py-2 font-mono text-[12px] leading-relaxed text-fg">
-              {detail.rawSkillMd}
+              {detail.rawArtifact}
             </pre>
           </div>
         </div>

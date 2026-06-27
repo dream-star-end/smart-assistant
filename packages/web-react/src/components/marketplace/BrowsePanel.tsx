@@ -9,7 +9,14 @@ import { DetailModal } from "./DetailModal";
  * 发现：搜索 + 目录卡片网格。空查询返回全部目录(后端 method=all)。
  * 已安装的条目打「已安装」徽标。点击卡片打开详情/安装确认。
  */
-export function BrowsePanel({ auth }: { auth: AuthSession }) {
+export function BrowsePanel({
+  auth,
+  kind = "skill",
+}: {
+  auth: AuthSession;
+  /** 仅展示该类目。M2 默认且仅 'skill'（agent 投递在 M3，M4 才开 agent Tab）。 */
+  kind?: "skill" | "agent";
+}) {
   const [q, setQ] = useState("");
   const [cards, setCards] = useState<MarketplaceCard[] | null>(null);
   const [loading, setLoading] = useState(true);
@@ -34,14 +41,14 @@ export function BrowsePanel({ auth }: { auth: AuthSession }) {
     setLoading(true);
     setErr(null);
     api
-      .searchMarketplace(auth, debouncedQ)
+      .searchMarketplace(auth, debouncedQ, kind)
       .then((r) => alive && setCards(r.results))
       .catch((e) => alive && setErr((e as Error).message || "加载市场失败"))
       .finally(() => alive && setLoading(false));
     return () => {
       alive = false;
     };
-  }, [auth, debouncedQ]);
+  }, [auth, debouncedQ, kind]);
 
   // 拉一次「我的已安装」用于卡片徽标
   useEffect(() => {

@@ -28,11 +28,12 @@ const cache = makePgSkillEmbedCache()
 
 function toCard(c: ApprovedSearchRow): {
   slug: string
+  kind: string
   name: string
   description: string
   tags: string[]
 } {
-  return { slug: c.slug, name: c.name, description: c.description, tags: c.tags }
+  return { slug: c.slug, kind: c.kind, name: c.name, description: c.description, tags: c.tags }
 }
 
 export async function handleMarketplaceSearch(
@@ -47,8 +48,15 @@ export async function handleMarketplaceSearch(
     Math.max(Number.parseInt(url.searchParams.get('limit') ?? '20', 10) || 20, 1),
     50,
   )
+  const kindParam = url.searchParams.get('kind')
+  // An explicit but unknown kind returns empty (not a silent fall-through to all).
+  if (kindParam !== null && kindParam !== 'skill' && kindParam !== 'agent') {
+    sendJson(res, 200, { results: [], method: 'all' })
+    return
+  }
+  const kind = kindParam === 'skill' || kindParam === 'agent' ? kindParam : undefined
 
-  const catalog = await listApprovedForSearch()
+  const catalog = await listApprovedForSearch(kind)
   if (catalog.length === 0 || !q) {
     sendJson(res, 200, { results: catalog.slice(0, limit).map(toCard), method: 'all' })
     return

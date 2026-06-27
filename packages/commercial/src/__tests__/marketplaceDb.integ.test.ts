@@ -134,6 +134,37 @@ function buildPublish(slug: string, owner: number, version = '1.0.0', extraBody 
   }
 }
 
+/** Build an agent artifact (kind='agent', manifest, no SKILL.md) — M2 generalization. */
+function buildPublishAgent(slug: string, owner: number, version = '1.0.0') {
+  const name = slug
+  const description = `${slug} 智能体`
+  const tags = ['agent']
+  const manifest = {
+    model: 'glm-5.2',
+    toolsets: ['assistant'],
+    skillDeps: [],
+    persona: '你是一个测试智能体。',
+  }
+  const rawArtifact = JSON.stringify(manifest, null, 2)
+  return {
+    slug,
+    ownerUserId: owner,
+    version,
+    name,
+    description,
+    tags,
+    rawSkillMd: null,
+    rawArtifact,
+    manifest,
+    kind: 'agent' as const,
+    artifactHash: marketplaceArtifactHash(rawArtifact),
+    embeddingHash: skillContentHash({ name, description, tags }),
+    riskFlags: [],
+    policyVersion: 1,
+    submittedBy: owner,
+  }
+}
+
 async function expectMarketplaceError(fn: () => Promise<unknown>, code: string): Promise<void> {
   await assert.rejects(fn, (e: unknown) => {
     assert.ok(e instanceof MarketplaceError, `expected MarketplaceError, got ${e}`)
@@ -151,7 +182,7 @@ describe('marketplaceDb (integ)', () => {
     const pending = await listPendingVersions()
     assert.equal(pending.length, 1)
     assert.equal(pending[0].slug, 'pdf-helper')
-    assert.equal(pending[0].rawSkillMd.includes('name: pdf-helper'), true)
+    assert.equal(pending[0].rawArtifact.includes('name: pdf-helper'), true)
     // not yet searchable
     assert.equal((await listApprovedForSearch()).length, 0)
   })
@@ -203,6 +234,57 @@ describe('marketplaceDb (integ)', () => {
     const rej = await publishSkillVersion(buildPublish('reject-me', owner))
     await reviewVersion({ versionId: rej.versionId, reviewerUserId: admin, approve: false })
     assert.equal(await getListingDetail('reject-me'), null)
+  })
+
+  test('M2: skill defaults kind=skill; detail/search expose kind + raw_artifact', async (t) => {
+    if (skipIfNoPg(t)) return
+    const owner = await createUser('m2skill@x.com')
+    const admin = await createUser('m2sadmin@x.com')
+    const p = await publishSkillVersion(buildPublish('m2-skill', owner))
+    await reviewVersion({ versionId: p.versionId, reviewerUserId: admin, approve: true })
+    const row = (await listApprovedForSearch()).find((c) => c.slug === 'm2-skill')
+    assert.equal(row?.kind, 'skill')
+    const detail = await getListingDetail('m2-skill')
+    assert.equal(detail?.kind, 'skill')
+    // raw_artifact backfilled == the SKILL.md for skills
+    assert.ok(detail?.rawArtifact.includes('name: m2-skill'))
+    assert.ok(detail?.rawSkillMd?.includes('name: m2-skill'))
+    assert.equal(detail?.manifest, null)
+  })
+
+  test('M2: agent kind round-trips; kind filter + kind-lock', async (t) => {
+    if (skipIfNoPg(t)) return
+    const owner = await createUser('m2agent@x.com')
+    const admin = await createUser('m2aadmin@x.com')
+    const a = await publishSkillVersion(buildPublishAgent('m2-agent', owner))
+    await reviewVersion({ versionId: a.versionId, reviewerUserId: admin, approve: true })
+
+    // kind filter: 'agent' returns the agent and no skills
+    const agents = await listApprovedForSearch('agent')
+    assert.ok(agents.some((c) => c.slug === 'm2-agent'))
+    assert.ok(agents.every((c) => c.kind === 'agent'))
+    const skills = await listApprovedForSearch('skill')
+    assert.ok(!skills.some((c) => c.slug === 'm2-agent'))
+
+    // agent detail: rawArtifact = manifest text, rawSkillMd null, manifest present
+    const detail = await getListingDetail('m2-agent')
+    assert.equal(detail?.kind, 'agent')
+    assert.equal(detail?.rawSkillMd, null)
+    assert.ok(detail?.manifest)
+
+    // slug is kind-locked: cannot republish an agent slug as a skill
+    await expectMarketplaceError(
+      () => publishSkillVersion(buildPublish('m2-agent', owner, '2.0.0')),
+      'KIND_MISMATCH',
+    )
+
+    // M2 fail-closed: an approved agent is NOT installable yet (no delivery path
+    // until M3) — install must reject it rather than record an undeliverable install.
+    const installer = await createUser('m2installer@x.com')
+    await expectMarketplaceError(
+      () => installApprovedVersion({ userId: installer, versionId: a.versionId }),
+      'NOT_INSTALLABLE',
+    )
   })
 
   test('cannot re-review a non-pending version', async (t) => {

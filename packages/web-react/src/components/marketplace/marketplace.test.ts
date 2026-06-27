@@ -23,13 +23,14 @@ test("searchMarketplace builds the search URL and returns results+method", async
   );
   vi.stubGlobal("fetch", fetchMock as unknown as typeof fetch);
 
-  const r = await api.searchMarketplace(session(), "翻译", 30);
+  const r = await api.searchMarketplace(session(), "翻译", "skill", 30);
   expect(r.method).toBe("all");
   expect(r.results[0].slug).toBe("x");
   const url = String(fetchMock.mock.calls[0][0]);
   expect(url).toContain("/api/marketplace/search?q=");
   expect(url).toContain(encodeURIComponent("翻译"));
   expect(url).toContain("limit=30");
+  expect(url).toContain("kind=skill");
 });
 
 test("installMarketplace POSTs versionId to the install route", async () => {

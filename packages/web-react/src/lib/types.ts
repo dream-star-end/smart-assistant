@@ -472,6 +472,7 @@ export type MarketplaceRiskFlag = {
 /** 市场目录卡片（GET /api/marketplace/search 的 results 项）。 */
 export type MarketplaceCard = {
   slug: string;
+  kind: MarketplaceKind;
   name: string;
   description: string;
   tags: string[];
@@ -485,9 +486,13 @@ export type MarketplaceSearchResult = {
   method: "all" | "keyword" | "embed";
 };
 
-/** 市场条目详情（GET /api/marketplace/:slug 的 detail，含完整 SKILL.md 供安装确认）。 */
+/** 市场条目类型（技能 / 智能体）。 */
+export type MarketplaceKind = "skill" | "agent";
+
+/** 市场条目详情（GET /api/marketplace/:slug 的 detail，含完整工件供安装确认）。 */
 export type MarketplaceDetail = {
   slug: string;
+  kind: MarketplaceKind;
   state: string;
   ownerUserId: string;
   version: string;
@@ -496,7 +501,12 @@ export type MarketplaceDetail = {
   description: string;
   tags: string[];
   artifactHash: string;
-  rawSkillMd: string;
+  /** 通用原始工件（技能=SKILL.md；智能体=manifest）。 */
+  rawArtifact: string;
+  /** 技能专有：SKILL.md（智能体为 null）。 */
+  rawSkillMd?: string | null;
+  /** 结构化元数据（智能体：model/toolsets/skillDeps；技能为 null）。 */
+  manifest?: unknown;
   riskFlags: MarketplaceRiskFlag[];
   installCount: number;
 };
@@ -512,15 +522,19 @@ export type MarketplaceInstalled = {
   listingState: string;
 };
 
-/** 待审版本（GET /api/admin/marketplace/pending 的 pending 项，含完整正文供审核）。 */
+/** 待审版本（GET /api/admin/marketplace/pending 的 pending 项，含完整工件供审核）。 */
 export type MarketplacePending = {
   versionId: string;
   slug: string;
+  kind: MarketplaceKind;
   version: string;
   name: string;
   description: string;
   tags: string[];
-  rawSkillMd: string;
+  /** 通用原始工件（技能=SKILL.md；智能体=manifest）。 */
+  rawArtifact: string;
+  rawSkillMd?: string | null;
+  manifest?: unknown;
   riskFlags: MarketplaceRiskFlag[];
   submittedBy: string;
   ownerUserId: string;

@@ -11,6 +11,11 @@ import { query, tx } from '../db/queries.js'
  */
 import type { RiskFlag } from './skillScanner.js'
 
+/** Artifact kind. The marketplace is generalized over this discriminator; the
+ *  lifecycle (publish→scan→review→approve→install→sync→revoke) is shared, only
+ *  the scanner / install-applier / detail-renderer vary by kind. */
+export type ArtifactKind = 'skill' | 'agent'
+
 export class MarketplaceError extends Error {
   constructor(
     readonly code:
@@ -20,7 +25,8 @@ export class MarketplaceError extends Error {
       | 'VERSION_NOT_FOUND'
       | 'NOT_PENDING'
       | 'REVIEWER_IS_AUTHOR'
-      | 'NOT_INSTALLABLE',
+      | 'NOT_INSTALLABLE'
+      | 'KIND_MISMATCH',
     message: string,
   ) {
     super(message)
@@ -35,25 +41,36 @@ export interface PublishInput {
   name: string
   description: string
   tags: string[]
-  rawSkillMd: string
+  /** Skill artifact (full SKILL.md). Required for kind='skill'; null for agents. */
+  rawSkillMd: string | null
+  /** Generic raw published text. Defaults to rawSkillMd for skills. */
+  rawArtifact?: string
+  /** Structured per-kind metadata (agent: model/toolsets/skillDeps). */
+  manifest?: unknown
   artifactHash: string
   embeddingHash: string
   riskFlags: RiskFlag[]
   policyVersion: number
   submittedBy: number
+  /** Artifact kind; the listing is owner- AND kind-locked. Defaults to 'skill'. */
+  kind?: ArtifactKind
 }
 
-/** Create the listing (owner-locked) if new, then a pending version. */
+/** Create the listing (owner- AND kind-locked) if new, then a pending version. */
 export async function publishSkillVersion(input: PublishInput): Promise<{ versionId: string }> {
+  const kind: ArtifactKind = input.kind ?? 'skill'
+  const rawArtifact = input.rawArtifact ?? input.rawSkillMd
+  if (rawArtifact == null)
+    throw new MarketplaceError('VERSION_NOT_FOUND', 'missing artifact content')
   return tx(async (c) => {
     await query(
-      `INSERT INTO marketplace_skill_listings (slug, owner_user_id)
-            VALUES ($1, $2) ON CONFLICT (slug) DO NOTHING`,
-      [input.slug, input.ownerUserId],
+      `INSERT INTO marketplace_skill_listings (slug, owner_user_id, kind)
+            VALUES ($1, $2, $3) ON CONFLICT (slug) DO NOTHING`,
+      [input.slug, input.ownerUserId, kind],
       c,
     )
-    const listing = await query<{ owner_user_id: string; state: string }>(
-      'SELECT owner_user_id::text, state FROM marketplace_skill_listings WHERE slug = $1 FOR UPDATE',
+    const listing = await query<{ owner_user_id: string; state: string; kind: string }>(
+      'SELECT owner_user_id::text, state, kind FROM marketplace_skill_listings WHERE slug = $1 FOR UPDATE',
       [input.slug],
       c,
     )
@@ -63,13 +80,19 @@ export async function publishSkillVersion(input: PublishInput): Promise<{ versio
       throw new MarketplaceError('SLUG_OWNED_BY_OTHER', `slug "${input.slug}" 已被他人占用`)
     if (row.state === 'revoked')
       throw new MarketplaceError('LISTING_REVOKED', `slug "${input.slug}" 已被下架`)
+    // slug is kind-locked: an existing skill slug can't be republished as an agent.
+    if (row.kind !== kind)
+      throw new MarketplaceError(
+        'KIND_MISMATCH',
+        `slug "${input.slug}" 已是「${row.kind}」类型，不能作为「${kind}」发布`,
+      )
 
     try {
       const ins = await query<{ id: string }>(
         `INSERT INTO marketplace_skill_versions
-           (slug, version, name, description, tags, raw_skill_md, artifact_hash, embedding_hash,
-            status, risk_flags, policy_version, submitted_by)
-         VALUES ($1,$2,$3,$4,$5::jsonb,$6,$7,$8,'pending',$9::jsonb,$10,$11)
+           (slug, version, name, description, tags, raw_skill_md, raw_artifact, manifest,
+            artifact_hash, embedding_hash, status, risk_flags, policy_version, submitted_by)
+         VALUES ($1,$2,$3,$4,$5::jsonb,$6,$7,$8::jsonb,$9,$10,'pending',$11::jsonb,$12,$13)
          RETURNING id::text`,
         [
           input.slug,
@@ -78,6 +101,8 @@ export async function publishSkillVersion(input: PublishInput): Promise<{ versio
           input.description,
           JSON.stringify(input.tags),
           input.rawSkillMd,
+          rawArtifact,
+          input.manifest == null ? null : JSON.stringify(input.manifest),
           input.artifactHash,
           input.embeddingHash,
           JSON.stringify(input.riskFlags),
@@ -98,35 +123,46 @@ export async function publishSkillVersion(input: PublishInput): Promise<{ versio
 export interface PendingVersionRow {
   versionId: string
   slug: string
+  kind: ArtifactKind
   version: string
   name: string
   description: string
   tags: string[]
-  rawSkillMd: string
+  /** Generic raw artifact (skill: the SKILL.md; agent: the manifest). */
+  rawArtifact: string
+  /** Skill-only SKILL.md (null for agents). */
+  rawSkillMd: string | null
+  /** Structured per-kind metadata (agent: model/toolsets/skillDeps). */
+  manifest: unknown
   riskFlags: RiskFlag[]
   submittedBy: string
   ownerUserId: string
   createdAt: string
 }
 
-// Admin-only: the full artifact (raw_skill_md) is included so the reviewer can
-// read exactly the bytes that will install — review is the human governance
-// step over the static scan, and it can't be done without the full content.
+// Admin-only: the full artifact (raw_artifact) is included so the reviewer can
+// read exactly the bytes that will install — review is the human governance step
+// over the static scan, and it can't be done without the full content. kind +
+// manifest let the reviewer judge an agent (capabilities/skillDeps), not just a skill.
 export async function listPendingVersions(limit = 100): Promise<PendingVersionRow[]> {
   const r = await query<{
     id: string
     slug: string
+    kind: string
     version: string
     name: string
     description: string
     tags: RiskFlag[] | unknown
-    raw_skill_md: string
+    raw_artifact: string
+    raw_skill_md: string | null
+    manifest: unknown
     risk_flags: RiskFlag[] | unknown
     submitted_by: string
     owner_user_id: string
     created_at: string
   }>(
-    `SELECT v.id::text, v.slug, v.version, v.name, v.description, v.tags, v.raw_skill_md,
+    `SELECT v.id::text, v.slug, l.kind, v.version, v.name, v.description, v.tags,
+            v.raw_artifact, v.raw_skill_md, v.manifest,
             v.risk_flags, v.submitted_by::text, l.owner_user_id::text, v.created_at::text
        FROM marketplace_skill_versions v
        JOIN marketplace_skill_listings l ON l.slug = v.slug
@@ -138,11 +174,14 @@ export async function listPendingVersions(limit = 100): Promise<PendingVersionRo
   return r.rows.map((x) => ({
     versionId: x.id,
     slug: x.slug,
+    kind: x.kind as ArtifactKind,
     version: x.version,
     name: x.name,
     description: x.description,
     tags: (x.tags as string[]) ?? [],
+    rawArtifact: x.raw_artifact,
     rawSkillMd: x.raw_skill_md,
+    manifest: x.manifest ?? null,
     riskFlags: (x.risk_flags as RiskFlag[]) ?? [],
     submittedBy: x.submitted_by,
     ownerUserId: x.owner_user_id,
@@ -196,30 +235,36 @@ export async function reviewVersion(args: {
 export interface ApprovedSearchRow {
   versionId: string
   slug: string
+  kind: ArtifactKind
   name: string
   description: string
   tags: string[]
   embeddingHash: string
 }
 
-/** Current approved version of every active listing — the searchable catalog. */
-export async function listApprovedForSearch(): Promise<ApprovedSearchRow[]> {
+/** Current approved version of every active listing — the searchable catalog.
+ *  `kind` lets a caller scope the catalog to skills or agents. */
+export async function listApprovedForSearch(kind?: ArtifactKind): Promise<ApprovedSearchRow[]> {
   const r = await query<{
     id: string
     slug: string
+    kind: string
     name: string
     description: string
     tags: unknown
     embedding_hash: string
   }>(
-    `SELECT v.id::text, v.slug, v.name, v.description, v.tags, v.embedding_hash
+    `SELECT v.id::text, v.slug, l.kind, v.name, v.description, v.tags, v.embedding_hash
        FROM marketplace_skill_listings l
        JOIN marketplace_skill_versions v ON v.id = l.current_approved_version_id
-      WHERE l.state = 'active' AND v.status = 'approved'`,
+      WHERE l.state = 'active' AND v.status = 'approved'
+            AND ($1::text IS NULL OR l.kind = $1)`,
+    [kind ?? null],
   )
   return r.rows.map((x) => ({
     versionId: x.id,
     slug: x.slug,
+    kind: x.kind as ArtifactKind,
     name: x.name,
     description: x.description,
     tags: (x.tags as string[]) ?? [],
@@ -229,6 +274,7 @@ export async function listApprovedForSearch(): Promise<ApprovedSearchRow[]> {
 
 export interface ListingDetail {
   slug: string
+  kind: ArtifactKind
   state: string
   ownerUserId: string
   version: string
@@ -237,15 +283,21 @@ export interface ListingDetail {
   description: string
   tags: string[]
   artifactHash: string
-  rawSkillMd: string
+  /** Generic raw artifact (skill: the SKILL.md; agent: the manifest). */
+  rawArtifact: string
+  /** Skill-only: the SKILL.md (null for agents). Kept for the skill read path. */
+  rawSkillMd: string | null
+  /** Structured per-kind metadata (agent: model/toolsets/skillDeps); null for skills. */
+  manifest: unknown
   riskFlags: RiskFlag[]
   installCount: number
 }
 
-/** Public detail for an active listing's current approved version (incl. full SKILL.md for the confirm dialog). */
+/** Public detail for an active listing's current approved version (incl. the full artifact for the confirm dialog). */
 export async function getListingDetail(slug: string): Promise<ListingDetail | null> {
   const r = await query<{
     slug: string
+    kind: string
     state: string
     owner_user_id: string
     version: string
@@ -254,12 +306,15 @@ export async function getListingDetail(slug: string): Promise<ListingDetail | nu
     description: string
     tags: unknown
     artifact_hash: string
-    raw_skill_md: string
+    raw_artifact: string
+    raw_skill_md: string | null
+    manifest: unknown
     risk_flags: unknown
     install_count: string
   }>(
-    `SELECT l.slug, l.state, l.owner_user_id::text, v.version, v.id::text AS vid,
-            v.name, v.description, v.tags, v.artifact_hash, v.raw_skill_md, v.risk_flags,
+    `SELECT l.slug, l.kind, l.state, l.owner_user_id::text, v.version, v.id::text AS vid,
+            v.name, v.description, v.tags, v.artifact_hash, v.raw_artifact, v.raw_skill_md,
+            v.manifest, v.risk_flags,
             (SELECT count(*) FROM marketplace_installs i
               WHERE i.slug = l.slug AND i.uninstalled_at IS NULL)::text AS install_count
        FROM marketplace_skill_listings l
@@ -271,6 +326,7 @@ export async function getListingDetail(slug: string): Promise<ListingDetail | nu
   if (!x) return null
   return {
     slug: x.slug,
+    kind: x.kind as ArtifactKind,
     state: x.state,
     ownerUserId: x.owner_user_id,
     version: x.version,
@@ -279,7 +335,9 @@ export async function getListingDetail(slug: string): Promise<ListingDetail | nu
     description: x.description,
     tags: (x.tags as string[]) ?? [],
     artifactHash: x.artifact_hash,
+    rawArtifact: x.raw_artifact,
     rawSkillMd: x.raw_skill_md,
+    manifest: x.manifest ?? null,
     riskFlags: (x.risk_flags as RiskFlag[]) ?? [],
     installCount: Number.parseInt(x.install_count, 10) || 0,
   }
@@ -307,11 +365,15 @@ export async function installApprovedVersion(args: {
       name: string
       artifact_hash: string
     }>(
+      // M2 fail-closed: only skills are installable until M3 wires agent
+      // install→agents.yaml delivery. (No agent can be published via the API yet,
+      // but this hard-stops a directly-seeded agent from being installed without
+      // a delivery path.) M3 relaxes this + adds the agent applier.
       `SELECT v.slug, v.version, v.name, v.artifact_hash
          FROM marketplace_skill_versions v
          JOIN marketplace_skill_listings l ON l.slug = v.slug
         WHERE v.id = $1 AND v.status = 'approved' AND l.state = 'active'
-              AND l.current_approved_version_id = v.id
+              AND l.current_approved_version_id = v.id AND l.kind = 'skill'
         FOR UPDATE OF l`,
       [args.versionId],
       c,
@@ -393,9 +455,13 @@ export interface InstalledArtifact {
 }
 
 /**
- * Active installs of a user, with the full artifact, for container-side hub
- * reconciliation. Excludes revoked listings — that is the kill-switch: a
- * revoked skill drops out of this list and the next container sync removes it.
+ * Active SKILL installs of a user, with the full SKILL.md, for container-side hub
+ * reconciliation. Excludes revoked listings — that is the kill-switch: a revoked
+ * skill drops out of this list and the next container sync removes it.
+ *
+ * Hard-scoped to kind='skill' with a non-null raw_skill_md so an approved agent
+ * (whose raw_skill_md is NULL) can never leak into the skill hub feed. Agent
+ * delivery is a separate M3 reconcile against agents.yaml.
  */
 export async function listActiveInstalledArtifacts(userId: number): Promise<InstalledArtifact[]> {
   const r = await query<{
@@ -409,6 +475,7 @@ export async function listActiveInstalledArtifacts(userId: number): Promise<Inst
        JOIN marketplace_skill_versions v ON v.id = i.version_id
        JOIN marketplace_skill_listings l ON l.slug = i.slug
       WHERE i.user_id = $1 AND i.uninstalled_at IS NULL AND l.state = 'active'
+            AND l.kind = 'skill' AND v.raw_skill_md IS NOT NULL
             AND i.artifact_hash = v.artifact_hash`,
     [userId],
   )

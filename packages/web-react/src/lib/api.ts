@@ -1042,14 +1042,14 @@ export const api = {
 
   // ── AI 市场（marketplace，见 packages/commercial/src/marketplace） ─────────
 
-  /** 市场检索/浏览（GET /api/marketplace/search?q=&limit=，空 q 返全部目录）。 */
-  searchMarketplace: (a: AuthSession, q = "", limit = 50) =>
+  /** 市场检索/浏览（GET /api/marketplace/search?q=&limit=&kind=，空 q 返该 kind 全部目录）。 */
+  searchMarketplace: (a: AuthSession, q = "", kind?: "skill" | "agent", limit = 50) =>
     jsonOrThrow<MarketplaceSearchResult>(
       callWithRefresh(a, (t) =>
-        fetch(`/api/marketplace/search?q=${encodeURIComponent(q)}&limit=${limit}`, {
-          credentials: "include",
-          headers: bearerHeaders(t),
-        }),
+        fetch(
+          `/api/marketplace/search?q=${encodeURIComponent(q)}&limit=${limit}${kind ? `&kind=${kind}` : ""}`,
+          { credentials: "include", headers: bearerHeaders(t) },
+        ),
       ),
     ),
 

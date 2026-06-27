@@ -71,7 +71,10 @@ function mapMarketplaceError(e: unknown): HttpError {
     const status =
       e.code === 'SLUG_OWNED_BY_OTHER' || e.code === 'REVIEWER_IS_AUTHOR'
         ? 403
-        : e.code === 'DUPLICATE_VERSION' || e.code === 'LISTING_REVOKED' || e.code === 'NOT_PENDING'
+        : e.code === 'DUPLICATE_VERSION' ||
+            e.code === 'LISTING_REVOKED' ||
+            e.code === 'NOT_PENDING' ||
+            e.code === 'KIND_MISMATCH'
           ? 409
           : e.code === 'VERSION_NOT_FOUND' || e.code === 'NOT_INSTALLABLE'
             ? 404

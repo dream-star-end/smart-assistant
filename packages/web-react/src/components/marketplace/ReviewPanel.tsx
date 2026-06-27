@@ -82,6 +82,7 @@ export function ReviewPanel({ auth }: { auth: AuthSession }) {
                     <div className="min-w-0">
                       <div className="flex items-center gap-1.5">
                         <span className="truncate text-[13.5px] font-medium text-fg">{r.name}</span>
+                        {r.kind === "agent" && <Badge tone="accent">智能体</Badge>}
                         <Badge tone="neutral">v{r.version}</Badge>
                         {flags.length > 0 && <Badge tone="warning">{flags.length} 项提示</Badge>}
                       </div>
@@ -128,7 +129,7 @@ export function ReviewPanel({ auth }: { auth: AuthSession }) {
                       </div>
                     )}
                     <pre className="max-h-72 overflow-auto whitespace-pre-wrap break-words rounded-lg border border-border bg-code px-3 py-2 font-mono text-[12px] leading-relaxed text-fg">
-                      {r.rawSkillMd}
+                      {r.rawArtifact}
                     </pre>
                   </div>
                 )}
