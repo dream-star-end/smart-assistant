@@ -1,9 +1,17 @@
 import { Clock, Loader2, Plus, Trash2, X } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
 import { api } from "../../lib/api";
+import {
+  buildSchedule,
+  cronHuman,
+  SCHEDULE_MODE_LABELS,
+  type ScheduleMode,
+  WEEKDAY_OPTIONS,
+} from "../../lib/cron";
 import type { AuthSession, CronJob } from "../../lib/types";
 import { cn } from "../../lib/utils";
 import { Alert, Button, Spinner, Switch } from "../ui";
+import { EmptyState, PanelHeader } from "./parts";
 
 const DELIVER_OPTIONS = [
   { value: "webchat", label: "网页对话" },
@@ -70,13 +78,16 @@ export function CronPanel({ auth }: { auth: AuthSession }) {
 
   return (
     <div className="flex flex-col">
-      <div className="flex items-center justify-between px-5 py-3">
-        <span className="text-[11px] font-medium uppercase tracking-wide text-faint">定时任务</span>
-        <Button variant="secondary" size="sm" onClick={() => setCreating((v) => !v)}>
-          {creating ? <X size={14} /> : <Plus size={14} />}
-          {creating ? "取消" : "新建"}
-        </Button>
-      </div>
+      <PanelHeader
+        title="定时任务"
+        hint="让智能体到点主动干活，并把结果按你选的方式推送。"
+        action={
+          <Button variant="secondary" size="sm" onClick={() => setCreating((v) => !v)}>
+            {creating ? <X size={14} /> : <Plus size={14} />}
+            {creating ? "取消" : "新建"}
+          </Button>
+        }
+      />
 
       {creating && (
         <CronCreateForm
@@ -102,9 +113,11 @@ export function CronPanel({ auth }: { auth: AuthSession }) {
           <Spinner /> 加载定时任务…
         </div>
       ) : !jobs || jobs.length === 0 ? (
-        <p className="px-5 py-10 text-center text-[13px] text-faint">
-          还没有定时任务。可在对话里让智能体「每天 9 点推送…」自动创建，或点上方「新建」。
-        </p>
+        <EmptyState
+          icon={Clock}
+          title="还没有定时任务"
+          hint="在对话里说「每天 9 点推送…」即可自动创建，或点右上「新建」。"
+        />
       ) : (
         <ul className="flex flex-col gap-1.5 px-4 pb-4">
           {jobs.map((job) => (
@@ -118,10 +131,11 @@ export function CronPanel({ auth }: { auth: AuthSession }) {
                   {job.label || job.prompt || "（无标题）"}
                 </div>
                 <div className="mt-0.5 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[11.5px] text-faint">
-                  {job.schedule && <code className="font-mono">{job.schedule}</code>}
+                  {job.schedule && <span className="text-muted">{cronHuman(job.schedule)}</span>}
                   {job.oneshot && <span>· 一次性</span>}
                   {job.deliver && <span>· {deliverLabel(job.deliver)}</span>}
                   {job.nextRunAt && <span>· 下次 {fmtTime(job.nextRunAt)}</span>}
+                  {job.schedule && <code className="font-mono text-faint">{job.schedule}</code>}
                 </div>
                 {job.label && job.prompt && job.prompt !== job.label && (
                   <div className="mt-1 line-clamp-2 text-[12px] text-muted">{job.prompt}</div>
@@ -154,23 +168,44 @@ function CronCreateForm({
   onCreated: () => void;
   onError: (m: string) => void;
 }) {
-  const [schedule, setSchedule] = useState("0 9 * * *");
-  const [prompt, setPrompt] = useState("");
+  const [mode, setMode] = useState<ScheduleMode>("daily");
+  const [time, setTime] = useState("09:00");
+  const [weekday, setWeekday] = useState(1);
+  const [minutes, setMinutes] = useState(10);
+  const [at, setAt] = useState("");
+  const [cron, setCron] = useState("0 9 * * *");
+  const [advOneshot, setAdvOneshot] = useState(false);
   const [label, setLabel] = useState("");
+  const [prompt, setPrompt] = useState("");
   const [deliver, setDeliver] = useState("webchat");
-  const [oneshot, setOneshot] = useState(false);
   const [busy, setBusy] = useState(false);
 
+  // 实时把当前表单解析成 { 人类可读, cron, 是否一次性 }；非法时给出原因。
+  const preview = (() => {
+    try {
+      const built = buildSchedule(mode, { time, weekday, minutes, at, cron, oneshot: advOneshot });
+      return { ok: true as const, human: cronHuman(built.schedule), oneshot: built.oneshot };
+    } catch (e) {
+      return { ok: false as const, msg: (e as Error).message };
+    }
+  })();
+
   const submit = useCallback(async () => {
-    if (!schedule.trim() || !prompt.trim()) return;
+    if (!prompt.trim()) return onError("请填写内容 / 指令");
+    let built: ReturnType<typeof buildSchedule>;
+    try {
+      built = buildSchedule(mode, { time, weekday, minutes, at, cron, oneshot: advOneshot });
+    } catch (e) {
+      return onError((e as Error).message);
+    }
     setBusy(true);
     try {
       await api.createCron(auth, {
-        schedule: schedule.trim(),
+        schedule: built.schedule,
         prompt: prompt.trim(),
         label: label.trim() || undefined,
         deliver,
-        oneshot,
+        oneshot: built.oneshot,
       });
       onCreated();
     } catch (e) {
@@ -178,18 +213,85 @@ function CronCreateForm({
     } finally {
       setBusy(false);
     }
-  }, [auth, schedule, prompt, label, deliver, oneshot, onCreated, onError]);
+  }, [auth, mode, time, weekday, minutes, at, cron, advOneshot, prompt, label, deliver, onCreated, onError]);
 
   return (
     <div className="mx-4 mb-3 flex flex-col gap-2.5 rounded-xl border border-border bg-bg px-4 py-3.5">
-      <Field label="cron 表达式">
-        <input
-          value={schedule}
-          onChange={(e) => setSchedule(e.target.value)}
-          placeholder="0 9 * * 1  （每周一 9 点）"
-          className={inputCls}
-        />
-      </Field>
+      <div className="flex flex-wrap items-end gap-x-3 gap-y-2.5">
+        <Field label="时间">
+          <select
+            value={mode}
+            onChange={(e) => setMode(e.target.value as ScheduleMode)}
+            className={cn(inputCls, "w-auto")}
+          >
+            {SCHEDULE_MODE_LABELS.map((o) => (
+              <option key={o.value} value={o.value}>
+                {o.label}
+              </option>
+            ))}
+          </select>
+        </Field>
+        {(mode === "daily" || mode === "weekly") && (
+          <Field label="几点">
+            <input type="time" value={time} onChange={(e) => setTime(e.target.value)} className={cn(inputCls, "w-auto")} />
+          </Field>
+        )}
+        {mode === "weekly" && (
+          <Field label="星期">
+            <select
+              value={weekday}
+              onChange={(e) => setWeekday(Number(e.target.value))}
+              className={cn(inputCls, "w-auto")}
+            >
+              {WEEKDAY_OPTIONS.map((o) => (
+                <option key={o.value} value={o.value}>
+                  {o.label}
+                </option>
+              ))}
+            </select>
+          </Field>
+        )}
+        {mode === "after" && (
+          <Field label="分钟后">
+            <input
+              type="number"
+              min={1}
+              value={minutes}
+              onChange={(e) => setMinutes(Number(e.target.value))}
+              className={cn(inputCls, "w-24")}
+            />
+          </Field>
+        )}
+        {mode === "once" && (
+          <Field label="日期时间">
+            <input
+              type="datetime-local"
+              value={at}
+              onChange={(e) => setAt(e.target.value)}
+              className={cn(inputCls, "w-auto")}
+            />
+          </Field>
+        )}
+        {mode === "advanced" && (
+          <>
+            <Field label="Cron 表达式">
+              <input
+                value={cron}
+                onChange={(e) => setCron(e.target.value)}
+                placeholder="0 9 * * 1"
+                className={cn(inputCls, "w-40 font-mono")}
+              />
+            </Field>
+            <label className="flex items-center gap-2 pb-2 text-[13px] text-fg">
+              <Switch checked={advOneshot} onCheckedChange={setAdvOneshot} aria-label="一次性" /> 一次性
+            </label>
+          </>
+        )}
+      </div>
+      {(mode === "daily" || mode === "weekly") && (
+        <p className="-mt-0.5 text-[11px] text-faint">每天 / 每周的时间按服务时区（北京时间）解释。</p>
+      )}
+
       <Field label="标题（可选）">
         <input value={label} onChange={(e) => setLabel(e.target.value)} placeholder="周报提醒" className={inputCls} />
       </Field>
@@ -201,6 +303,7 @@ function CronCreateForm({
           className={cn(inputCls, "min-h-[60px] resize-y")}
         />
       </Field>
+
       <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
         <Field label="送达" inline>
           <select value={deliver} onChange={(e) => setDeliver(e.target.value)} className={cn(inputCls, "w-auto")}>
@@ -211,10 +314,22 @@ function CronCreateForm({
             ))}
           </select>
         </Field>
-        <label className="flex items-center gap-2 text-[13px] text-fg">
-          <Switch checked={oneshot} onCheckedChange={setOneshot} aria-label="一次性" /> 一次性
-        </label>
-        <Button variant="primary" size="sm" onClick={submit} disabled={busy || !schedule.trim() || !prompt.trim()} className="ml-auto">
+        <span className="min-w-0 text-[11.5px] text-faint">
+          {preview.ok ? (
+            <>
+              将创建：<span className="text-muted">{preview.human}</span> · {preview.oneshot ? "一次性" : "重复"}
+            </>
+          ) : (
+            preview.msg
+          )}
+        </span>
+        <Button
+          variant="primary"
+          size="sm"
+          onClick={submit}
+          disabled={busy || !prompt.trim() || !preview.ok}
+          className="ml-auto"
+        >
           {busy ? <Loader2 size={14} className="animate-spin" /> : null}
           创建任务
         </Button>

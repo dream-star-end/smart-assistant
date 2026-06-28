@@ -4,6 +4,7 @@ import { api } from "../../lib/api";
 import type { AuthSession, SkillDetail, SkillSummary } from "../../lib/types";
 import { cn } from "../../lib/utils";
 import { Alert, Badge, Spinner } from "../ui";
+import { EmptyState, PanelHeader } from "./parts";
 
 /**
  * 技能库：列出用户可用技能（经容器代理 /api/skills），展开看正文（/api/skills/:name），
@@ -50,8 +51,9 @@ export function SkillsPanel({ auth }: { auth: AuthSession }) {
 
   return (
     <div className="flex flex-col">
+      <PanelHeader title="技能" hint="完成复杂任务后智能体会把流程沉淀成可复用技能；也可从市场安装。" />
       {err && (
-        <div className="px-5 pt-3">
+        <div className="px-5 pb-2">
           <Alert tone="danger" className="text-[12.5px]">
             {err}
           </Alert>
@@ -62,11 +64,13 @@ export function SkillsPanel({ auth }: { auth: AuthSession }) {
           <Spinner /> 加载技能…
         </div>
       ) : !skills || skills.length === 0 ? (
-        <p className="px-5 py-10 text-center text-[13px] text-faint">
-          还没有技能。可在对话里让智能体「把这个流程存成技能」自动沉淀。
-        </p>
+        <EmptyState
+          icon={Sparkles}
+          title="还没有技能"
+          hint="在对话里让智能体「把这个流程存成技能」即可自动沉淀，或从市场安装。"
+        />
       ) : (
-        <ul className="flex flex-col gap-1.5 px-4 py-4">
+        <ul className="flex flex-col gap-1.5 px-4 pb-4">
           {skills.map((sk) => (
             <SkillRow key={sk.name} auth={auth} skill={sk} onDelete={() => remove(sk.name)} />
           ))}
@@ -132,17 +136,17 @@ function SkillRow({
           </button>
         )}
       </div>
-      {(skill.tags?.length || skill.source) && (
-        <div className="flex flex-wrap gap-1.5 px-3.5 pb-2">
-          {skill.source && <Badge tone="neutral">{skill.source}</Badge>}
-          {skill.writable === false && <Badge tone="neutral">只读</Badge>}
-          {(skill.tags ?? []).slice(0, 6).map((t) => (
-            <Badge key={t} tone="accent">
-              {t}
-            </Badge>
-          ))}
-        </div>
-      )}
+      <div className="flex flex-wrap gap-1.5 px-3.5 pb-2">
+        <Badge tone={skill.layer === "hub" ? "neutral" : "accent"}>
+          {skill.layer === "hub" ? "市场" : "自建"}
+        </Badge>
+        {skill.writable === false && <Badge tone="neutral">只读</Badge>}
+        {(skill.tags ?? []).slice(0, 6).map((t) => (
+          <Badge key={t} tone="neutral">
+            {t}
+          </Badge>
+        ))}
+      </div>
       {open && (
         <div className="border-t border-border px-3.5 py-3">
           {loading ? (

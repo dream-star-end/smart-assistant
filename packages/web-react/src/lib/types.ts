@@ -449,6 +449,8 @@ export type SkillSummary = {
   description?: string;
   tags?: string[];
   source?: string;
+  /** 精确来源层（shared/legacy/hub…）；用于区分自建与市场安装。平台层后端已剔除。 */
+  layer?: string;
   writable?: boolean;
 };
 

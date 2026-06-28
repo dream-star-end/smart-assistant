@@ -3,6 +3,7 @@ import { useCallback, useEffect, useState } from "react";
 import { api } from "../../lib/api";
 import type { AuthSession } from "../../lib/types";
 import { Alert, Button } from "../ui";
+import { PanelHeader } from "./parts";
 
 type Target = "memory" | "user";
 const DOCS: { key: Target; label: string; hint: string; placeholder: string }[] = [
@@ -17,8 +18,9 @@ const DOCS: { key: Target; label: string; hint: string; placeholder: string }[] 
 export function MemoryPanel({ auth, agentId }: { auth: AuthSession; agentId: string }) {
   return (
     <div className="flex flex-col">
-      {DOCS.map((d, i) => (
-        <div key={d.key} className={i > 0 ? "border-t border-border" : ""}>
+      <PanelHeader title="记忆" hint="这些内容会注入智能体的长期上下文，让它越用越懂你。" />
+      {DOCS.map((d) => (
+        <div key={d.key} className="border-t border-border">
           <MemoryDoc auth={auth} agentId={agentId} target={d.key} meta={d} />
         </div>
       ))}
