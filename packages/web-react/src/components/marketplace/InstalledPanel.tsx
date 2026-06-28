@@ -27,8 +27,8 @@ export function InstalledPanel({ auth, onGoBrowse }: { auth: AuthSession; onGoBr
   }, [auth, reload]);
 
   const uninstall = useCallback(
-    async (slug: string, name: string) => {
-      if (!confirm(`卸载技能「${name}」？卸载后将不再对 AI 可用。`)) return;
+    async (slug: string, name: string, isAgent: boolean) => {
+      if (!confirm(`卸载${isAgent ? "智能体" : "技能"}「${name}」？卸载后将不再可用。`)) return;
       setBusy(slug);
       setErr(null);
       try {
@@ -57,7 +57,7 @@ export function InstalledPanel({ auth, onGoBrowse }: { auth: AuthSession; onGoBr
       ) : !rows || rows.length === 0 ? (
         <div className="flex flex-col items-center gap-3 px-6 py-16 text-center text-faint">
           <PackageOpen size={28} className="opacity-50" />
-          <p className="text-[13px]">还没有安装任何技能。</p>
+          <p className="text-[13px]">还没有安装任何技能或智能体。</p>
           <Button variant="secondary" size="sm" onClick={onGoBrowse}>
             去市场看看
           </Button>
@@ -81,17 +81,20 @@ export function InstalledPanel({ auth, onGoBrowse }: { auth: AuthSession; onGoBr
                 <div className="min-w-0 flex-1">
                   <div className="flex items-center gap-1.5">
                     <span className="truncate text-[13.5px] font-medium text-fg">{r.name}</span>
+                    {r.kind === "agent" && <Badge tone="accent">智能体</Badge>}
                     <Badge tone="neutral">v{r.version}</Badge>
                     {revoked && <Badge tone="warning">已被下架</Badge>}
                   </div>
                   <p className="mt-0.5 truncate text-[12px] text-muted">
-                    {revoked ? "平台已下架该技能，将自动从你的会话移除。" : r.slug}
+                    {revoked
+                      ? `平台已下架该${r.kind === "agent" ? "智能体" : "技能"}，将自动从你的会话移除。`
+                      : r.slug}
                   </p>
                 </div>
                 <Button
                   variant="ghost"
                   size="sm"
-                  onClick={() => uninstall(r.slug, r.name)}
+                  onClick={() => uninstall(r.slug, r.name, r.kind === "agent")}
                   disabled={busy === r.slug}
                   aria-label="卸载"
                 >

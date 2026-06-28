@@ -1,9 +1,72 @@
-import { Download, Loader2, ShieldCheck, Users } from "lucide-react";
-import { useEffect, useState } from "react";
-import { api, ApiError } from "../../lib/api";
-import type { AuthSession, MarketplaceDetail } from "../../lib/types";
-import { Alert, Badge, Button, Modal } from "../ui";
-import { friendlyRiskFlags } from "./riskFlags";
+import { Download, Loader2, ShieldCheck, Users } from 'lucide-react'
+import { useEffect, useState } from 'react'
+import { ApiError, api } from '../../lib/api'
+import type { AuthSession, MarketplaceDetail } from '../../lib/types'
+import { Alert, Badge, Button, Modal } from '../ui'
+import { friendlyRiskFlags } from './riskFlags'
+
+const TOOLSET_LABEL: Record<string, string> = {
+  core: '核心',
+  browser: '浏览器',
+  research: '研究检索',
+  web_context: '网页提取',
+}
+
+/** Friendly render of an agent manifest (model / toolsets / 依赖技能 / 人设). */
+function AgentManifestView({ manifest }: { manifest: unknown }) {
+  const m = (manifest ?? {}) as {
+    model?: string
+    toolsets?: string[]
+    skillDeps?: string[]
+    persona?: string
+  }
+  const toolsets = Array.isArray(m.toolsets) ? m.toolsets : []
+  const deps = Array.isArray(m.skillDeps) ? m.skillDeps : []
+  return (
+    <div className="flex flex-col gap-3">
+      <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+        <div>
+          <div className="mb-1 text-[12px] font-medium text-muted">模型</div>
+          <Badge tone="neutral">{m.model || '平台默认'}</Badge>
+        </div>
+        <div>
+          <div className="mb-1 text-[12px] font-medium text-muted">能力（工具集）</div>
+          <div className="flex flex-wrap gap-1">
+            {toolsets.length ? (
+              toolsets.map((t) => (
+                <Badge key={t} tone="accent">
+                  {TOOLSET_LABEL[t] ?? t}
+                </Badge>
+              ))
+            ) : (
+              <span className="text-[12px] text-faint">—</span>
+            )}
+          </div>
+        </div>
+      </div>
+      {deps.length > 0 && (
+        <div>
+          <div className="mb-1 text-[12px] font-medium text-muted">
+            依赖技能（安装时将一并加入 {deps.length} 个）
+          </div>
+          <div className="flex flex-wrap gap-1">
+            {deps.map((d) => (
+              <Badge key={d} tone="neutral">
+                {d}
+              </Badge>
+            ))}
+          </div>
+        </div>
+      )}
+      <div>
+        <div className="mb-1.5 text-[12px] font-medium text-muted">人设</div>
+        <pre className="max-h-56 overflow-auto whitespace-pre-wrap break-words rounded-lg border border-border bg-code px-3 py-2 text-[12.5px] leading-relaxed text-fg">
+          {m.persona || '（无）'}
+        </pre>
+      </div>
+    </div>
+  )
+}
 
 /**
  * 市场条目详情 + 安装确认。展示完整 SKILL.md(用户安装前看清「装的到底是什么」),
@@ -16,61 +79,61 @@ export function DetailModal({
   onClose,
   onInstalled,
 }: {
-  slug: string | null;
-  auth: AuthSession;
-  installed: boolean;
-  onClose: () => void;
-  onInstalled: () => void;
+  slug: string | null
+  auth: AuthSession
+  installed: boolean
+  onClose: () => void
+  onInstalled: () => void
 }) {
-  const [detail, setDetail] = useState<MarketplaceDetail | null>(null);
-  const [loading, setLoading] = useState(false);
-  const [err, setErr] = useState<string | null>(null);
-  const [installing, setInstalling] = useState(false);
-  const [done, setDone] = useState(false);
+  const [detail, setDetail] = useState<MarketplaceDetail | null>(null)
+  const [loading, setLoading] = useState(false)
+  const [err, setErr] = useState<string | null>(null)
+  const [installing, setInstalling] = useState(false)
+  const [done, setDone] = useState(false)
 
   useEffect(() => {
     if (!slug) {
-      setDetail(null);
-      setErr(null);
-      setDone(false);
-      return;
+      setDetail(null)
+      setErr(null)
+      setDone(false)
+      return
     }
-    let alive = true;
-    setLoading(true);
-    setErr(null);
-    setDone(false);
+    let alive = true
+    setLoading(true)
+    setErr(null)
+    setDone(false)
     api
       .getMarketplaceDetail(auth, slug)
       .then((d) => alive && setDetail(d))
-      .catch((e) => alive && setErr((e as Error).message || "加载详情失败"))
-      .finally(() => alive && setLoading(false));
+      .catch((e) => alive && setErr((e as Error).message || '加载详情失败'))
+      .finally(() => alive && setLoading(false))
     return () => {
-      alive = false;
-    };
-  }, [slug, auth]);
+      alive = false
+    }
+  }, [slug, auth])
 
   const install = async () => {
-    if (!detail) return;
-    setInstalling(true);
-    setErr(null);
+    if (!detail) return
+    setInstalling(true)
+    setErr(null)
     try {
-      await api.installMarketplace(auth, detail.versionId);
-      setDone(true);
-      onInstalled();
+      await api.installMarketplace(auth, detail.versionId)
+      setDone(true)
+      onInstalled()
     } catch (e) {
-      setErr(e instanceof ApiError ? e.message : (e as Error).message || "安装失败");
+      setErr(e instanceof ApiError ? e.message : (e as Error).message || '安装失败')
     } finally {
-      setInstalling(false);
+      setInstalling(false)
     }
-  };
+  }
 
-  const warns = friendlyRiskFlags(detail?.riskFlags);
+  const warns = friendlyRiskFlags(detail?.riskFlags)
 
   return (
     <Modal
       open={!!slug}
       onOpenChange={(o) => !o && onClose()}
-      title={detail?.name ?? "技能详情"}
+      title={detail?.name ?? '技能详情'}
       description={detail ? `${detail.slug} · v${detail.version}` : undefined}
       footer={
         detail && (
@@ -88,7 +151,11 @@ export function DetailModal({
               </Badge>
             ) : (
               <Button variant="primary" onClick={install} disabled={installing}>
-                {installing ? <Loader2 size={15} className="animate-spin" /> : <Download size={15} />}
+                {installing ? (
+                  <Loader2 size={15} className="animate-spin" />
+                ) : (
+                  <Download size={15} />
+                )}
                 安装
               </Button>
             )}
@@ -134,16 +201,18 @@ export function DetailModal({
             </div>
           )}
 
-          <div>
-            <div className="mb-1.5 text-[12px] font-medium text-muted">
-              {detail.kind === "agent" ? "完整内容（智能体配置）" : "完整内容（SKILL.md）"}
+          {detail.kind === 'agent' ? (
+            <AgentManifestView manifest={detail.manifest} />
+          ) : (
+            <div>
+              <div className="mb-1.5 text-[12px] font-medium text-muted">完整内容（SKILL.md）</div>
+              <pre className="max-h-72 overflow-auto whitespace-pre-wrap break-words rounded-lg border border-border bg-code px-3 py-2 font-mono text-[12px] leading-relaxed text-fg">
+                {detail.rawArtifact}
+              </pre>
             </div>
-            <pre className="max-h-72 overflow-auto whitespace-pre-wrap break-words rounded-lg border border-border bg-code px-3 py-2 font-mono text-[12px] leading-relaxed text-fg">
-              {detail.rawArtifact}
-            </pre>
-          </div>
+          )}
         </div>
       ) : null}
     </Modal>
-  );
+  )
 }

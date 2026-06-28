@@ -408,6 +408,7 @@ export async function recordUninstall(userId: number, slug: string): Promise<boo
 
 export interface InstalledRow {
   slug: string
+  kind: ArtifactKind
   version: string
   versionId: string
   name: string
@@ -419,6 +420,7 @@ export interface InstalledRow {
 export async function listInstalled(userId: number): Promise<InstalledRow[]> {
   const r = await query<{
     slug: string
+    kind: string
     version: string
     version_id: string
     name: string
@@ -426,7 +428,7 @@ export async function listInstalled(userId: number): Promise<InstalledRow[]> {
     installed_at: string
     state: string
   }>(
-    `SELECT i.slug, v.version, i.version_id::text, v.name, i.artifact_hash,
+    `SELECT i.slug, l.kind, v.version, i.version_id::text, v.name, i.artifact_hash,
             i.installed_at::text, l.state
        FROM marketplace_installs i
        JOIN marketplace_skill_versions v ON v.id = i.version_id
@@ -437,6 +439,7 @@ export async function listInstalled(userId: number): Promise<InstalledRow[]> {
   )
   return r.rows.map((x) => ({
     slug: x.slug,
+    kind: x.kind as ArtifactKind,
     version: x.version,
     versionId: x.version_id,
     name: x.name,

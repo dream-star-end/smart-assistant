@@ -11,6 +11,7 @@ import type {
   SkillSummary,
   MarketplaceDetail,
   MarketplaceInstalled,
+  MarketplaceMyAgent,
   MarketplacePending,
   MarketplacePublishInput,
   MarketplacePublishResult,
@@ -1115,6 +1116,17 @@ export const api = {
         }),
       ),
     ),
+
+  /** 我的智能体（GET /api/marketplace/my-agents：默认全能助手 + 已安装市场智能体）。 */
+  listMyAgents: (a: AuthSession) =>
+    jsonOrThrow<{ agents: MarketplaceMyAgent[] }>(
+      callWithRefresh(a, (t) =>
+        fetch("/api/marketplace/my-agents", {
+          credentials: "include",
+          headers: bearerHeaders(t),
+        }),
+      ),
+    ).then((b) => b.agents || []),
 
   // ── 管理员审核（admin；后端 requireAdminVerifyDb 二次把关） ────────────────
 

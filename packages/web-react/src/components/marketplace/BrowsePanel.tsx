@@ -77,7 +77,11 @@ export function BrowsePanel({
           <Input
             value={q}
             onChange={(e) => setQ(e.target.value)}
-            placeholder="搜索技能（试试「翻译」「论文」「写作」）…"
+            placeholder={
+              kind === "agent"
+                ? "搜索智能体（试试「写作」「编程」「研究」）…"
+                : "搜索技能（试试「翻译」「论文」「写作」）…"
+            }
             className="pl-9"
           />
         </div>
@@ -97,7 +101,9 @@ export function BrowsePanel({
         <div className="flex flex-col items-center gap-2 px-6 py-16 text-center text-faint">
           <PackageSearch size={28} className="opacity-50" />
           <p className="text-[13px]">
-            {debouncedQ ? "没有匹配的技能，换个关键词试试。" : "市场还没有上架的技能。"}
+            {debouncedQ
+              ? `没有匹配的${kind === "agent" ? "智能体" : "技能"}，换个关键词试试。`
+              : `市场还没有上架的${kind === "agent" ? "智能体" : "技能"}。`}
           </p>
         </div>
       ) : (

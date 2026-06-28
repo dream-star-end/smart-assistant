@@ -1,6 +1,7 @@
 import { ChevronDown, Menu, PanelLeft, PenSquare, Wallet } from "lucide-react";
 import type { Theme } from "../hooks/useTheme";
 import type { Agent } from "../lib/agents";
+import { AgentAvatar } from "./AgentAvatar";
 import type { PublicModel } from "../lib/types";
 import { formatCredits } from "../lib/utils";
 import { ModelSelector } from "./ModelSelector";
@@ -66,11 +67,7 @@ export function ChatHeader({
         onClick={onAgentClick}
         className="flex min-w-0 items-center gap-2 rounded-xl px-2.5 py-1.5 outline-none transition-colors hover:bg-hover focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg active:scale-[0.98]"
       >
-        <span
-          className={`flex size-7 shrink-0 items-center justify-center rounded-lg bg-gradient-to-br ${agent.grad} text-white`}
-        >
-          <agent.icon size={15} />
-        </span>
+        <AgentAvatar agent={agent} className="size-7 rounded-lg" iconSize={15} />
         {/* 窄屏不折行：截断而非换行（避免"全能/助手"难看的两行）。 */}
         <span className="max-w-[7.5rem] truncate whitespace-nowrap text-[15px] font-semibold text-fg sm:max-w-none">
           {agent.name}

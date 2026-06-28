@@ -146,7 +146,7 @@ export function AuthGate({
           </Button>
         </form>
         <p className="mt-4 text-center text-[12px] text-faint">
-          预置智能体 · 流式对话 · 持久会话
+          全能助手 · 流式对话 · 持久会话
         </p>
       </div>
     </div>

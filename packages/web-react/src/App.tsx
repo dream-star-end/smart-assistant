@@ -8,7 +8,11 @@ import { EmptyState } from "./components/EmptyState";
 import { type ChatError, ErrorBanner } from "./components/ErrorBanner";
 import { Landing } from "./components/Landing";
 import { ManageCenter, type ManageTab } from "./components/ManageCenter";
-import { MarketplaceCenter, type MarketplaceTab } from "./components/MarketplaceCenter";
+import {
+  MarketplaceCenter,
+  type MarketplaceKind,
+  type MarketplaceTab,
+} from "./components/MarketplaceCenter";
 import { AssistantMessage, UserMessage } from "./components/Message";
 import { MessageList } from "./components/MessageRenderer";
 import type { CardCallbacks } from "./components/chat/cards";
@@ -134,6 +138,7 @@ export function App() {
   const [manageTab, setManageTab] = useState<ManageTab>("memory");
   const [marketplaceOpen, setMarketplaceOpen] = useState(false);
   const [marketplaceTab, setMarketplaceTab] = useState<MarketplaceTab>("browse");
+  const [marketplaceBrowseKind, setMarketplaceBrowseKind] = useState<MarketplaceKind>("skill");
   const scrollRef = useRef<HTMLDivElement>(null);
   const stopRef = useRef(false);
   // 稳定句柄：让早于 useChatSocket 声明的 send/regenerate 回调引用 WS 引擎，避免
@@ -424,9 +429,10 @@ export function App() {
     setManageOpen(true);
   }, []);
 
-  // 打开 AI 市场到指定分区（侧栏入口）。
-  const openMarketplace = useCallback((tab: MarketplaceTab) => {
+  // 打开 AI 市场到指定分区（侧栏入口 / 「从市场添加智能体」)。
+  const openMarketplace = useCallback((tab: MarketplaceTab, kind: MarketplaceKind = "skill") => {
     setMarketplaceTab(tab);
+    setMarketplaceBrowseKind(kind);
     setMarketplaceOpen(true);
   }, []);
 
@@ -835,6 +841,15 @@ export function App() {
       <AgentPicker
         open={pickerOpen}
         current={agent}
+        auth={demo ? null : auth}
+        onAddFromMarket={
+          demo
+            ? undefined
+            : () => {
+                setPickerOpen(false);
+                openMarketplace("browse", "agent");
+              }
+        }
         onClose={() => setPickerOpen(false)}
         onPick={(a) => {
           // 切 agent：若当前会话已在 WS service 注册，打跨-agent 污染守卫戳（§11），
@@ -871,8 +886,22 @@ export function App() {
         tab={marketplaceTab}
         auth={auth}
         isAdmin={user?.role === "admin"}
+        initialBrowseKind={marketplaceBrowseKind}
         onTabChange={setMarketplaceTab}
-        onClose={() => setMarketplaceOpen(false)}
+        onClose={() => {
+          setMarketplaceOpen(false);
+          // If the currently-selected market agent was just uninstalled, fall back
+          // to 全能助手 so the header/composer don't show a stale agent.
+          if (!demo && auth && agent.id !== "main") {
+            const a = auth;
+            api
+              .listMyAgents(a)
+              .then((rows) => {
+                if (!rows.some((r) => r.id === agent.id)) setAgent(DEFAULT_AGENT);
+              })
+              .catch(() => {});
+          }
+        }}
       />
     </div>
     </ToolCardActionsContext.Provider>

@@ -1,6 +1,7 @@
 import { ArrowRight, Check, Shield, Sparkles, Zap } from "lucide-react";
 import type { Theme } from "../hooks/useTheme";
 import { AGENTS } from "../lib/agents";
+import { AgentAvatar } from "./AgentAvatar";
 import { BRAND } from "../lib/brand";
 import { ANNUAL_DISCOUNT, PLANS } from "../lib/plans";
 import { cn } from "../lib/utils";
@@ -66,17 +67,17 @@ export function Landing({
         <div className="relative mx-auto max-w-4xl px-5 pb-10 pt-20 text-center md:pt-28">
           <div className="mb-6 inline-flex items-center gap-2 rounded-full border border-border bg-surface px-3.5 py-1.5 text-[13px] text-muted shadow-sm animate-in">
             <span className="size-1.5 rounded-full bg-accent" />
-            {BRAND.company} · 预置智能体平台
+            {BRAND.company} · 可成长的 AI 助手
           </div>
           <h1 className="mx-auto max-w-3xl text-balance text-[42px] font-bold leading-[1.08] tracking-tight md:text-[64px] animate-in">
-            为每一件事，
+            一个全能助手起步，
             <br className="hidden sm:block" />
             <span className="bg-gradient-to-r from-accent to-info bg-clip-text text-transparent">
-              备好一位专家
+              按需加装更多能力
             </span>
           </h1>
           <p className="mx-auto mt-6 max-w-xl text-[17px] leading-relaxed text-muted animate-in">
-            {BRAND.name}汇集 9 位精心调校的预置智能体 —— 写作、编程、研究、商业、翻译……开箱即用，无需挑模型、调提示词，选好专家，直接开聊。
+            {BRAND.name}默认配备一位全能助手 —— 写作、编程、研究、分析样样在行；需要更专业时，从 AI 市场一键安装技能与专家智能体，让它越用越强。
           </p>
           <div className="mt-9 flex flex-col items-center justify-center gap-3 sm:flex-row animate-in">
             <Button variant="primary" shape="pill" size="lg" onClick={onStart} className="group shadow-float">
@@ -87,7 +88,7 @@ export function Landing({
               href="#agents"
               className={cn(buttonVariants({ variant: "secondary", shape: "pill", size: "lg" }))}
             >
-              看看有哪些智能体
+              逛逛 AI 市场
             </a>
           </div>
           <p className="mt-5 text-[13px] text-faint">「{BRAND.slogan}」</p>
@@ -101,9 +102,7 @@ export function Landing({
               className="flex items-center gap-2 rounded-full border border-border bg-surface px-3.5 py-2 text-[13.5px] shadow-sm animate-in"
               style={{ animationDelay: `${i * 60}ms` }}
             >
-              <span className={`flex size-5 items-center justify-center rounded-md bg-gradient-to-br ${a.grad} text-white`}>
-                <a.icon size={12} />
-              </span>
+              <AgentAvatar agent={a} className="size-5 rounded-md" iconSize={12} />
               {a.name}
             </div>
           ))}
@@ -113,8 +112,8 @@ export function Landing({
       {/* Agents */}
       <section id="agents" className="mx-auto max-w-6xl px-5 py-20">
         <div className="mb-12 text-center">
-          <h2 className="text-[32px] font-bold tracking-tight md:text-[40px]">9 位专家，各司其职</h2>
-          <p className="mx-auto mt-3 max-w-xl text-[16px] text-muted">不再纠结用哪个模型、怎么写提示词。挑一位调校好的专家，立刻进入状态。</p>
+          <h2 className="text-[32px] font-bold tracking-tight md:text-[40px]">AI 市场，按需取用</h2>
+          <p className="mx-auto mt-3 max-w-xl text-[16px] text-muted">全能助手之外，市场里还有更多专业智能体与技能 —— 写作、编程、研究、翻译……一键安装，随用随装。</p>
         </div>
         <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
           {AGENTS.map((a) => (
@@ -123,9 +122,7 @@ export function Landing({
               onClick={onStart}
               className="group flex flex-col items-start rounded-xl border border-border bg-surface p-5 text-left outline-none transition-[transform,box-shadow,border-color] duration-200 ease-standard hover:-translate-y-0.5 hover:border-border-strong hover:shadow-float focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg"
             >
-              <span className={`mb-4 flex size-11 items-center justify-center rounded-xl bg-gradient-to-br ${a.grad} text-white shadow-sm`}>
-                <a.icon size={21} />
-              </span>
+              <AgentAvatar agent={a} className="mb-4 size-11 rounded-xl shadow-sm" iconSize={21} />
               <span className="text-[16.5px] font-semibold">{a.name}</span>
               <span className="mt-0.5 text-[13px] font-medium text-accent">{a.tagline}</span>
               <span className="mt-2 text-[14px] leading-relaxed text-muted">{a.description}</span>
@@ -138,7 +135,7 @@ export function Landing({
       <section id="features" className="border-y border-border bg-sidebar/50">
         <div className="mx-auto grid max-w-6xl grid-cols-1 gap-8 px-5 py-20 md:grid-cols-3">
           {[
-            { icon: Sparkles, t: "开箱即用的专家", d: "每位智能体都经过精心调校，预设了角色、能力与表达风格。你只管提问，专业留给它。" },
+            { icon: Sparkles, t: "开箱即用 + 按需成长", d: "全能助手即开即用；需要更专业时，从 AI 市场加装技能与专家智能体，让它随你一起变强。" },
             { icon: Zap, t: "包月畅用，积分透明", d: "按月订阅，每档配足月度积分，用多少一目了然。无需为算力与模型操心。" },
             { icon: Shield, t: "隐私与安全", d: "对话数据加密存储、独立隔离。企业级稳定性，国内合规运营。" },
           ].map((f) => (
@@ -158,7 +155,7 @@ export function Landing({
         <div className="mb-12 text-center">
           <h2 className="text-[32px] font-bold tracking-tight md:text-[40px]">简单透明的包月订阅</h2>
           <p className="mx-auto mt-3 max-w-xl text-[16px] text-muted">
-            每档配足月度积分，全部智能体随心用。年付立享 {Math.round((1 - ANNUAL_DISCOUNT) * 100)}% 折扣。
+            每档配足月度积分，全能助手与市场内容随心用。年付立享 {Math.round((1 - ANNUAL_DISCOUNT) * 100)}% 折扣。
           </p>
         </div>
         <div className="grid grid-cols-1 gap-5 sm:grid-cols-2 lg:grid-cols-4">
@@ -204,8 +201,8 @@ export function Landing({
       {/* CTA */}
       <section className="mx-auto max-w-6xl px-5 pb-20">
         <div className="relative overflow-hidden rounded-3xl border border-border bg-gradient-to-br from-accent/10 to-info/5 px-6 py-14 text-center">
-          <h2 className="text-[28px] font-bold tracking-tight md:text-[36px]">现在就召唤你的专家</h2>
-          <p className="mx-auto mt-3 max-w-md text-[15.5px] text-muted">免费注册，立即体验 9 位预置智能体。</p>
+          <h2 className="text-[28px] font-bold tracking-tight md:text-[36px]">现在就开始</h2>
+          <p className="mx-auto mt-3 max-w-md text-[15.5px] text-muted">免费注册，从全能助手起步，按需从 AI 市场加装更多能力。</p>
           <Button variant="primary" shape="pill" size="lg" onClick={onStart} className="mt-7 shadow-float">
             免费开始使用
             <ArrowRight size={17} />

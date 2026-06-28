@@ -514,6 +514,7 @@ export type MarketplaceDetail = {
 /** 已安装条目（GET /api/marketplace/installed 的 installed 项）。 */
 export type MarketplaceInstalled = {
   slug: string;
+  kind: MarketplaceKind;
   version: string;
   versionId: string;
   name: string;
@@ -539,6 +540,19 @@ export type MarketplacePending = {
   submittedBy: string;
   ownerUserId: string;
   createdAt: string;
+};
+
+/** 我的智能体项（GET /api/marketplace/my-agents：默认全能助手 + 已安装）。 */
+export type MarketplaceMyAgent = {
+  id: string;
+  slug: string;
+  name: string;
+  description: string;
+  avatarEmoji?: string | null;
+  model?: string | null;
+  version?: string | null;
+  installed: boolean;
+  isDefault?: boolean;
 };
 
 /** 发布入参（POST /api/marketplace/publish）。 */

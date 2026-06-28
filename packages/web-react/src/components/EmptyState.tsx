@@ -1,5 +1,6 @@
 import { ArrowLeftRight } from "lucide-react";
 import type { Agent } from "../lib/agents";
+import { AgentAvatar } from "./AgentAvatar";
 import { Button } from "./ui";
 
 export function EmptyState({
@@ -13,11 +14,7 @@ export function EmptyState({
 }) {
   return (
     <div className="flex min-h-full flex-col items-center justify-center px-4 py-12 text-center animate-fade">
-      <div
-        className={`mb-5 flex size-16 items-center justify-center rounded-xl2 bg-gradient-to-br ${agent.grad} text-white shadow-float`}
-      >
-        <agent.icon size={30} />
-      </div>
+      <AgentAvatar agent={agent} className="mb-5 size-16 rounded-xl2 shadow-float" iconSize={30} />
       <h1 className="text-[26px] font-semibold tracking-tight text-fg">{agent.name}</h1>
       <p className="mt-2 max-w-md text-[15px] leading-relaxed text-muted">{agent.description}</p>
       <Button
@@ -32,7 +29,7 @@ export function EmptyState({
       </Button>
 
       <div className="mt-8 grid w-full max-w-2xl grid-cols-1 gap-2.5 sm:grid-cols-2">
-        {agent.starters.map((s) => (
+        {(agent.starters ?? []).map((s) => (
           <button
             key={s}
             onClick={() => onPick(s)}
