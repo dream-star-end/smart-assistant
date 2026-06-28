@@ -23,7 +23,9 @@ export function SkillsPanel({ auth }: { auth: AuthSession }) {
     api
       .listSkills(auth)
       .then((s) => {
-        if (alive) setSkills(s);
+        // 纵深防御：平台内置技能绝不展示。后端容器已 includePlatform:false 不返回平台技能；
+        // 这里再过滤一道，万一后端回归也不会漏到 UI。
+        if (alive) setSkills(s.filter((sk) => sk.source !== "platform"));
       })
       .catch((e) => {
         if (alive) setErr((e as Error).message || "加载技能失败");
