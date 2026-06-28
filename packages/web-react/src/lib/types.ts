@@ -457,6 +457,8 @@ export type SkillSummary = {
 /** 技能详情（GET /api/skills/:name 的 skill）。 */
 export type SkillDetail = SkillSummary & {
   body?: string;
+  /** skill 目录下的文件相对路径（一套技能是一个目录，含 SKILL.md + 可能的附属文件）。 */
+  files?: string[];
 };
 
 // ── AI 市场（marketplace，见 packages/commercial/src/marketplace） ──────────

@@ -193,6 +193,17 @@ describe('SkillStore — PR4 baseline-wins merge', () => {
     assert.ok(!content.rawContent.includes('PLATFORM BODY'), 'platform body must not leak')
   })
 
+  it('view() returns the skill directory file list (a skill is a directory)', async () => {
+    await writeSkillMd(mergeAgentUserRoot, 'multi-file', fm('multi-file', 'has extra files'))
+    await mkdir(join(mergeAgentUserRoot, 'multi-file', 'scripts'), { recursive: true })
+    await writeFile(join(mergeAgentUserRoot, 'multi-file', 'scripts', 'run.sh'), '#!/bin/sh\n', 'utf-8')
+    await writeFile(join(mergeAgentUserRoot, 'multi-file', 'reference.md'), '# ref\n', 'utf-8')
+    const store = new SkillStore(MERGE_AGENT, { baselineDir: baselineRoot })
+    const v = await store.view('multi-file')
+    assert.ok(v && typeof v !== 'string')
+    assert.deepEqual((v as { files?: string[] }).files, ['SKILL.md', 'reference.md', 'scripts/run.sh'])
+  })
+
   it('save() rejects names that collide with baseline', async () => {
     const store = new SkillStore(MERGE_AGENT, { baselineDir: baselineRoot })
     const r = await store.save(

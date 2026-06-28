@@ -28,10 +28,11 @@
 // Ported from NousResearch/hermes-agent tools/skills_tool.py.
 
 import { randomUUID } from 'node:crypto'
-import { type Dirent, type Stats, existsSync, realpathSync, statSync } from 'node:fs'
+import { type Dir, type Dirent, type Stats, existsSync, realpathSync, statSync } from 'node:fs'
 import {
   lstat,
   mkdir,
+  opendir,
   readFile,
   readdir,
   realpath,
@@ -75,6 +76,7 @@ export interface SkillMetadata extends SkillFrontmatter {
 export interface SkillContent extends SkillMetadata {
   body: string // the markdown after frontmatter
   rawContent: string // full SKILL.md
+  files?: string[] // relative paths of all files in the skill dir (a skill is a directory)
 }
 
 /**
@@ -665,6 +667,7 @@ export class SkillStore {
     if (!raw) return null
     const { meta, body } = parseFrontmatter(raw)
     if (!meta.name || !meta.description) return null
+    const files = await this.listSkillFiles(rootDir, name)
     return {
       name: meta.name,
       description: meta.description,
@@ -679,7 +682,56 @@ export class SkillStore {
       source,
       layer,
       writable,
+      files,
     }
+  }
+
+  /**
+   * List all regular files inside a skill's directory as relative POSIX paths
+   * (e.g. ["SKILL.md", "scripts/run.sh"]). A skill is a directory, not just its
+   * SKILL.md — this lets the UI surface its real file structure. Bounded by depth
+   * and count, and realpath-contained so a symlinked entry can't escape the dir.
+   */
+  private async listSkillFiles(rootDir: string, name: string): Promise<string[]> {
+    const base = join(rootDir, name)
+    if (!existsSync(base)) return []
+    let realBase: string
+    try {
+      realBase = await realpath(base)
+    } catch {
+      return []
+    }
+    const out: string[] = []
+    const MAX = 200
+    const contained = (real: string) => real === realBase || real.startsWith(realBase + sep)
+    const walk = async (dir: string, rel: string, depth: number): Promise<void> => {
+      if (depth > 6 || out.length >= MAX) return
+      let dh: Dir
+      try {
+        dh = await opendir(dir)
+      } catch {
+        return
+      }
+      // Stream entries (opendir async iterator) rather than readdir-into-array, so a
+      // pathologically huge directory can't blow up memory before the MAX cap is hit.
+      // The iterator auto-closes the handle on break / normal completion.
+      for await (const entry of dh) {
+        if (out.length >= MAX) break
+        if (entry.name.startsWith('.')) continue
+        const childRel = rel ? `${rel}/${entry.name}` : entry.name
+        const childAbs = join(dir, entry.name)
+        try {
+          // realpath-contain every entry (dir or file) before descending/listing,
+          // so a symlinked entry can never walk or surface outside the skill dir.
+          const real = await realpath(childAbs)
+          if (!contained(real)) continue
+          if (entry.isDirectory()) await walk(childAbs, childRel, depth + 1)
+          else if (entry.isFile()) out.push(childRel)
+        } catch {}
+      }
+    }
+    await walk(base, '', 0)
+    return out.sort()
   }
 
   /** Ensure the write root exists; create it safely and verify it stays within HOME. */

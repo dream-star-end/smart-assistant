@@ -1,4 +1,4 @@
-import { ChevronRight, Loader2, Sparkles, Trash2 } from "lucide-react";
+import { ChevronRight, FileText, Loader2, Sparkles, Trash2 } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
 import { api } from "../../lib/api";
 import type { AuthSession, SkillDetail, SkillSummary } from "../../lib/types";
@@ -158,9 +158,24 @@ function SkillRow({
           ) : err ? (
             <span className="text-[12.5px] text-danger">{err}</span>
           ) : (
-            <pre className="max-h-72 overflow-auto whitespace-pre-wrap break-words rounded-md bg-code px-3 py-2 font-mono text-[12px] leading-relaxed text-fg">
-              {detail?.body || "（无正文）"}
-            </pre>
+            <div className="flex flex-col gap-2">
+              {detail?.files && detail.files.length > 1 && (
+                <div className="flex flex-wrap items-center gap-1.5">
+                  <span className="text-[11px] text-faint">{detail.files.length} 个文件</span>
+                  {detail.files.map((f) => (
+                    <span
+                      key={f}
+                      className="inline-flex items-center gap-1 rounded-md bg-hover px-1.5 py-0.5 font-mono text-[11px] text-muted"
+                    >
+                      <FileText size={11} /> {f}
+                    </span>
+                  ))}
+                </div>
+              )}
+              <pre className="max-h-72 overflow-auto whitespace-pre-wrap break-words rounded-md bg-code px-3 py-2 font-mono text-[12px] leading-relaxed text-fg">
+                {detail?.body || "（无正文）"}
+              </pre>
+            </div>
           )}
         </div>
       )}
