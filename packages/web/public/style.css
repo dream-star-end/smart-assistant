@@ -9281,10 +9281,9 @@ body.body-landing {
   min-height: min(780px, 86vh);
 }
 .context-hub-head {
-  background:
-    radial-gradient(circle at 12% 20%, color-mix(in srgb, var(--accent) 24%, transparent), transparent 34%),
-    linear-gradient(135deg, color-mix(in srgb, var(--accent) 13%, transparent), transparent 58%),
-    color-mix(in srgb, var(--bg-elevated) 86%, transparent);
+  /* Match the canonical modal-head: a whisper of accent over a solid surface,
+     not a radial gradient soup. Strokes + spacing carry the structure. */
+  background: linear-gradient(180deg, color-mix(in srgb, var(--bg-elevated) 95%, var(--accent)), var(--bg-elevated));
 }
 .context-hub-shell {
   display: grid;
@@ -9294,10 +9293,9 @@ body.body-landing {
 }
 .context-hub-nav {
   padding: var(--space-4);
-  border-right: 1px solid color-mix(in srgb, var(--border-subtle) 78%, transparent);
-  background:
-    linear-gradient(180deg, color-mix(in srgb, var(--bg-raised) 56%, transparent), transparent),
-    color-mix(in srgb, var(--bg-subtle) 35%, transparent);
+  border-right: 1px solid var(--border-subtle);
+  /* Solid recessed rail, same figure/ground language as the app sidebar. */
+  background: var(--bg-subtle);
 }
 .context-nav-card {
   width: 100%;
@@ -9315,15 +9313,19 @@ body.body-landing {
 }
 .context-nav-card + .context-nav-card { margin-top: var(--space-2); }
 .context-nav-card:hover {
-  transform: translateY(-1px);
-  background: color-mix(in srgb, var(--bg-raised) 64%, transparent);
-  border-color: color-mix(in srgb, var(--accent) 22%, var(--border));
+  background: var(--bg-hover);
+  border-color: var(--border-strong);
 }
+.context-nav-card:active { transform: scale(0.99); }
 .context-nav-card.active {
-  background:
-    linear-gradient(135deg, color-mix(in srgb, var(--accent) 16%, transparent), color-mix(in srgb, var(--bg-raised) 80%, transparent));
+  background: var(--accent-soft);
   border-color: var(--accent-border);
-  box-shadow: 0 18px 40px -30px var(--accent);
+}
+.context-nav-card.active strong { color: var(--accent); }
+.context-nav-card.active .context-nav-icon {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--accent-fg);
 }
 .context-nav-icon {
   width: 34px;
@@ -9334,37 +9336,33 @@ body.body-landing {
   justify-content: center;
   background: color-mix(in srgb, var(--accent-soft) 70%, var(--bg-raised));
   border: 1px solid var(--accent-border);
+  color: var(--accent);
   margin-bottom: var(--space-1);
+  transition: background var(--transition-fast), border-color var(--transition-fast), color var(--transition-fast);
 }
+.context-nav-icon svg { width: 18px; height: 18px; }
 .context-nav-card strong { font-size: var(--text-base); color: var(--fg-strong); }
 .context-nav-card small { color: var(--fg-muted); line-height: 1.35; }
 .context-hub-content {
   min-width: 0;
   overflow: auto;
   padding: var(--space-5);
-  background:
-    radial-gradient(circle at 80% 0%, color-mix(in srgb, var(--accent) 10%, transparent), transparent 28%),
-    linear-gradient(180deg, color-mix(in srgb, var(--bg-subtle) 24%, transparent), transparent 260px);
+  /* Solid modal surface; raised cards sit on top and carry the depth. */
+  background: var(--bg-elevated);
 }
 .context-panel { display: flex; flex-direction: column; gap: var(--space-4); }
 .context-panel[hidden], .task-tab-panel[hidden], #memory-card-panel[hidden], #memory-raw-panel[hidden], #skill-editor[hidden], [data-reminder-fields][hidden] { display: none !important; }
 .context-panel-hero {
-  position: relative;
-  overflow: hidden;
   display: flex;
   align-items: flex-start;
   justify-content: space-between;
   gap: var(--space-4);
-  padding: var(--space-5);
-  border: 1px solid color-mix(in srgb, var(--accent) 22%, var(--border));
-  border-radius: var(--radius-2xl);
-  background:
-    radial-gradient(circle at 100% 0%, color-mix(in srgb, var(--accent) 24%, transparent), transparent 34%),
-    linear-gradient(135deg, color-mix(in srgb, var(--bg-elevated) 70%, var(--accent) 8%), color-mix(in srgb, var(--bg-raised) 72%, transparent));
-  box-shadow: 0 22px 70px -54px var(--accent);
+  padding: 0 0 var(--space-4);
+  border-bottom: 1px solid var(--border-subtle);
 }
-.context-panel-hero h4 { margin: 4px 0 4px; font-size: 22px; letter-spacing: -0.03em; color: var(--fg-strong); }
-.context-panel-hero p { margin: 0; color: var(--fg-muted); line-height: 1.5; max-width: 560px; }
+.context-panel-hero > div { min-width: 0; }
+.context-panel-hero h4 { margin: 3px 0 0; font-size: var(--text-lg); letter-spacing: -0.02em; color: var(--fg-strong); }
+.context-panel-hero p { margin: 5px 0 0; color: var(--fg-muted); line-height: 1.5; max-width: 560px; font-size: var(--text-sm); }
 .context-kicker {
   color: var(--accent);
   font-size: 11px;
@@ -9406,8 +9404,10 @@ body.body-landing {
   color: var(--fg-muted);
   background: color-mix(in srgb, var(--bg-raised) 70%, transparent);
 }
-.source-badge.platform { color: #a78bfa; border-color: color-mix(in srgb, #a78bfa 35%, var(--border)); background: color-mix(in srgb, #a78bfa 13%, transparent); }
 .source-badge.user { color: var(--accent); border-color: var(--accent-border); background: var(--accent-soft); }
+/* "market" is a neutral provenance tag, not a semantic state — keep it muted so the
+   single warm accent stays meaningful (one-accent discipline). */
+.source-badge.market { color: var(--fg-muted); border-color: var(--border-strong); background: color-mix(in srgb, var(--bg-raised) 70%, transparent); }
 .context-toolbar {
   display: flex;
   align-items: center;
@@ -9459,11 +9459,11 @@ body.body-landing {
 }
 .memory-entry-grid, .skills-card-list, .automation-list, .execution-list { display: flex; flex-direction: column; gap: var(--space-3); }
 .memory-entry-card, .automation-card, .skill-detail, .skill-editor, .reminder-composer-card, .context-empty-card {
-  border: 1px solid color-mix(in srgb, var(--border) 76%, transparent);
-  border-radius: var(--radius-xl);
-  background:
-    linear-gradient(180deg, color-mix(in srgb, var(--bg-elevated) 76%, transparent), color-mix(in srgb, var(--bg-raised) 58%, transparent));
-  box-shadow: 0 1px 0 color-mix(in srgb, var(--fg) 4%, transparent) inset;
+  /* Canonical card: solid raised surface + 1px stroke + hairline shadow. */
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--bg-raised);
+  box-shadow: var(--shadow-sm);
 }
 .memory-entry-card { padding: var(--space-3); display: grid; gap: var(--space-2); }
 .memory-entry-meta, .memory-entry-actions, .automation-actions, .context-inline-actions, .context-panel-foot {
@@ -9508,16 +9508,28 @@ body.body-landing {
 }
 .context-empty-card strong { color: var(--fg-strong); }
 .context-empty-card p { margin: 0; max-width: 360px; line-height: 1.5; }
-.context-empty-icon { font-size: 28px; }
+.context-empty-icon {
+  width: 46px;
+  height: 46px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--radius-lg);
+  background: color-mix(in srgb, var(--accent-soft) 60%, var(--bg-raised));
+  border: 1px solid var(--accent-border);
+  color: var(--accent);
+  margin-bottom: 2px;
+}
+.context-empty-icon svg { width: 22px; height: 22px; }
 .context-loading, .context-error { padding: var(--space-5); color: var(--fg-muted); text-align: center; }
 .context-error { color: var(--danger); }
 .skills-layout { display: grid; grid-template-columns: minmax(260px, 0.86fr) minmax(0, 1.14fr); gap: var(--space-4); align-items: start; }
 .skills-list-pane, .skills-detail-pane { min-width: 0; display: grid; gap: var(--space-3); }
 .skill-card {
   width: 100%;
-  border: 1px solid color-mix(in srgb, var(--border) 76%, transparent);
-  border-radius: var(--radius-xl);
-  background: color-mix(in srgb, var(--bg-raised) 56%, transparent);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--bg-raised);
   padding: var(--space-3);
   text-align: left;
   cursor: pointer;
@@ -9525,8 +9537,11 @@ body.body-landing {
   gap: var(--space-2);
   color: var(--fg);
   font-family: var(--font-sans);
+  transition: border-color var(--transition-fast), background var(--transition-fast), transform var(--transition-fast);
 }
-.skill-card:hover, .skill-card.active { border-color: var(--accent-border); background: color-mix(in srgb, var(--accent-soft) 38%, var(--bg-raised)); }
+.skill-card:hover { border-color: var(--border-strong); background: var(--bg-hover); }
+.skill-card:active { transform: scale(0.995); }
+.skill-card.active { border-color: var(--accent-border); background: var(--accent-soft); }
 .skill-card-top { display: flex; justify-content: space-between; gap: var(--space-2); align-items: center; }
 .skill-card-desc { color: var(--fg-muted); font-size: var(--text-sm); line-height: 1.45; }
 .skill-card-tags, .skill-detail-tags { display: flex; flex-wrap: wrap; gap: 6px; }
@@ -9563,20 +9578,21 @@ body.body-landing {
 .reminder-preview {
   flex: 1;
   min-width: 220px;
-  min-height: 34px;
+  min-height: 38px;
   display: inline-flex;
   align-items: center;
   gap: 8px;
-  padding: 6px 10px;
+  padding: 6px 12px;
   border-radius: var(--radius-lg);
-  background: color-mix(in srgb, var(--bg-raised) 68%, transparent);
-  border: 1px solid color-mix(in srgb, var(--border) 72%, transparent);
+  background: var(--bg);
+  border: 1px solid var(--border);
   color: var(--fg-muted);
   font-size: var(--text-sm);
 }
+.reminder-preview strong { color: var(--fg-strong); }
 .reminder-preview code, .automation-card code { color: var(--accent); font-family: var(--font-mono); }
-.automation-card { padding: var(--space-4); display: flex; justify-content: space-between; gap: var(--space-3); align-items: flex-start; }
-.automation-card.paused { opacity: 0.68; }
+.automation-card { padding: var(--space-4); display: flex; justify-content: space-between; gap: var(--space-3); align-items: flex-start; border-left: 3px solid var(--accent); }
+.automation-card.paused { opacity: 0.72; border-left-color: var(--fg-dim); }
 .automation-main { min-width: 0; display: grid; gap: 6px; }
 .automation-title { display: flex; align-items: center; gap: var(--space-2); font-weight: 750; color: var(--fg-strong); }
 .automation-meta { color: var(--fg-muted); font-size: var(--text-sm); line-height: 1.45; }
@@ -9698,10 +9714,11 @@ body.body-landing {
     margin: 0;
     border: none;
     background: none;
-    font-size: 21px;
+    color: var(--fg-muted);
     line-height: 1;
     transition: transform var(--transition-fast);
   }
+  .context-hub-nav .context-nav-icon svg { width: 22px; height: 22px; }
   /* active = tint icon+label accent, NOT the desktop gradient card. Scoped to
      .context-hub-nav so the shared base rule (which also targets .skill-card and
      paints an !important gradient) doesn't bleed into the tab bar. */
@@ -9714,7 +9731,12 @@ body.body-landing {
     color: var(--accent);
   }
   .context-hub-nav .context-nav-card.active strong { color: var(--accent); }
-  .context-hub-nav .context-nav-card.active .context-nav-icon { transform: translateY(-2px) scale(1.06); }
+  .context-hub-nav .context-nav-card.active .context-nav-icon {
+    transform: translateY(-1px);
+    background: none;
+    border-color: transparent;
+    color: var(--accent);
+  }
 
   /* single-column content */
   .skills-layout, .reminder-grid { grid-template-columns: 1fr; }
@@ -9723,7 +9745,7 @@ body.body-landing {
   .automation-actions { width: 100%; justify-content: flex-end; }
 
   /* tighter heroes + responsive raw editor (don't eat the whole first screen) */
-  .context-panel-hero { padding: var(--space-4); border-radius: var(--radius-xl); }
+  .context-panel-hero { padding: 0 0 var(--space-3); }
   .context-raw-text { min-height: 200px; }
 
   /* generous touch targets */
@@ -10316,7 +10338,6 @@ textarea:focus-visible,
 }
 .modal-segmented,
 .modal-tabs,
-.context-hub-nav,
 .settings-dropdown {
   background: color-mix(in srgb, var(--bg-subtle) 64%, transparent);
 }
@@ -10350,11 +10371,14 @@ textarea:focus-visible,
   border-radius: var(--radius-xl);
 }
 .context-nav-card.active,
-.context-nav-card:hover,
-.skill-card.active,
-.skill-card:hover {
+.skill-card.active {
   border-color: var(--accent-border) !important;
-  background: linear-gradient(135deg, var(--accent-soft), color-mix(in srgb, var(--bg-raised) 76%, transparent)) !important;
+  background: var(--accent-soft) !important;
+}
+.context-nav-card:hover,
+.skill-card:hover {
+  border-color: var(--border-strong) !important;
+  background: var(--bg-hover) !important;
 }
 .settings-modal .form-row input,
 .settings-modal .form-row textarea,
@@ -11732,41 +11756,34 @@ textarea:focus-visible,
   --gh-card: 0 2px 12px rgba(40, 32, 18, 0.07);
 }
 
-/* gradient hero banners */
+/* compact header band — kicker + title + subtitle, hairline divider, stat pill.
+   (Replaces the old full-bleed gradient hero so content gets the vertical space.) */
 #context-hub-modal .context-panel-hero {
   position: relative;
-  overflow: hidden;
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-4);
   border: none !important;
-  color: #fff;
-  border-radius: 20px !important;
-  padding: 20px 22px !important;
-  background: var(--gh-coral) !important;
-  box-shadow: var(--gh-soft);
+  border-bottom: 1px solid var(--border-subtle) !important;
+  color: var(--fg);
+  border-radius: 0 !important;
+  padding: 0 0 var(--space-4) !important;
+  background: transparent !important;
+  box-shadow: none;
 }
-#context-hub-modal .tasks-hero { background: var(--gh-blue) !important; }
-#context-hub-modal .context-panel-hero::after {
-  content: "";
-  position: absolute;
-  right: -34px;
-  top: -44px;
-  width: 168px;
-  height: 168px;
-  border-radius: 50%;
-  background: radial-gradient(circle, rgba(255, 255, 255, 0.3), transparent 65%);
-  pointer-events: none;
-}
-#context-hub-modal .context-panel-hero > div { position: relative; z-index: 1; }
-#context-hub-modal .context-panel-hero .context-kicker { color: rgba(255, 255, 255, 0.9); }
-#context-hub-modal .context-panel-hero h4 { color: #fff; }
-#context-hub-modal .context-panel-hero p { color: rgba(255, 255, 255, 0.92); }
+#context-hub-modal .context-panel-hero::after { content: none; }
+#context-hub-modal .context-panel-hero > div { min-width: 0; }
+#context-hub-modal .context-panel-hero .context-kicker { color: var(--accent); }
+#context-hub-modal .context-panel-hero h4 { color: var(--fg-strong); }
+#context-hub-modal .context-panel-hero p { color: var(--fg-muted); }
 #context-hub-modal .context-panel-hero .context-stat-pill {
   position: relative;
-  z-index: 1;
-  color: #fff;
-  border: none !important;
-  background: rgba(255, 255, 255, 0.2) !important;
-  backdrop-filter: blur(4px);
-  -webkit-backdrop-filter: blur(4px);
+  color: var(--accent);
+  border: 1px solid var(--accent-border) !important;
+  background: var(--accent-soft) !important;
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
 }
 
 /* feature cards (技能市场 / 新建技能) — horizontal, full-width above the skills split */
@@ -11782,11 +11799,12 @@ textarea:focus-visible,
 #context-hub-modal .ctx-feature-card {
   flex: 1 1 0;
   min-width: 150px;
-  min-height: 104px;
-  border: none;
-  border-radius: 16px;
-  padding: 15px;
-  color: #fff;
+  min-height: 88px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  padding: var(--space-4);
+  background: var(--bg-raised);
+  color: var(--fg);
   cursor: pointer;
   position: relative;
   overflow: hidden;
@@ -11795,24 +11813,29 @@ textarea:focus-visible,
   justify-content: flex-end;
   text-align: left;
   font-family: var(--font-sans);
-  box-shadow: var(--gh-soft);
-  transition: transform var(--transition-fast);
+  box-shadow: var(--shadow-sm);
+  transition: border-color var(--transition-fast), background var(--transition-fast), transform var(--transition-fast);
 }
+#context-hub-modal .ctx-feature-card:hover { border-color: var(--border-strong); background: var(--bg-hover); }
 #context-hub-modal .ctx-feature-card:active { transform: scale(0.985); }
-#context-hub-modal .ctx-feature-card.fc-coral { background: var(--gh-coral); }
-#context-hub-modal .ctx-feature-card.fc-teal { background: var(--gh-teal); }
-#context-hub-modal .ctx-feature-card .fc-orb {
+#context-hub-modal .ctx-feature-card .fc-orb { display: none; }
+#context-hub-modal .ctx-feature-card .fc-ic {
   position: absolute;
-  right: -22px;
-  top: -22px;
-  width: 92px;
-  height: 92px;
-  border-radius: 50%;
-  background: radial-gradient(circle, rgba(255, 255, 255, 0.28), transparent 65%);
+  top: 13px;
+  left: 15px;
+  width: 30px;
+  height: 30px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--radius-md);
+  background: var(--accent-soft);
+  border: 1px solid var(--accent-border);
+  color: var(--accent);
 }
-#context-hub-modal .ctx-feature-card .fc-ic { position: absolute; top: 13px; left: 15px; font-size: 22px; }
-#context-hub-modal .ctx-feature-card .fc-tt b { display: block; font-size: 15px; font-weight: 700; }
-#context-hub-modal .ctx-feature-card .fc-tt small { display: block; font-size: 11.5px; opacity: 0.92; margin-top: 3px; }
+#context-hub-modal .ctx-feature-card .fc-ic svg { width: 17px; height: 17px; }
+#context-hub-modal .ctx-feature-card .fc-tt b { display: block; font-size: var(--text-md); font-weight: 700; color: var(--fg-strong); }
+#context-hub-modal .ctx-feature-card .fc-tt small { display: block; font-size: 11.5px; color: var(--fg-muted); margin-top: 3px; }
 
 /* rich skill cards: [icon chip | content | chevron] */
 #context-hub-modal .skill-card {
@@ -11821,15 +11844,16 @@ textarea:focus-visible,
   gap: 13px;
   width: 100%;
   text-align: left;
-  background: var(--bg-elevated) !important;
-  border: 1px solid var(--border-subtle) !important;
-  border-radius: 16px !important;
+  background: var(--bg-raised) !important;
+  border: 1px solid var(--border) !important;
+  border-radius: var(--radius-lg) !important;
   padding: 14px !important;
-  box-shadow: var(--gh-card);
+  box-shadow: var(--shadow-sm);
 }
+#context-hub-modal .skill-card:hover { border-color: var(--border-strong) !important; background: var(--bg-hover) !important; }
 #context-hub-modal .skill-card.active {
   border-color: var(--accent-border) !important;
-  background: linear-gradient(135deg, var(--accent-soft), var(--bg-elevated)) !important;
+  background: var(--accent-soft) !important;
 }
 #context-hub-modal .skill-card-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 6px; }
 #context-hub-modal .skill-card-chev { align-self: center; color: var(--fg-dim); font-size: 18px; flex: 0 0 auto; }
@@ -11850,16 +11874,24 @@ textarea:focus-visible,
 #context-hub-modal .rich-ic.rich-c3, .rich-modal .rich-ic.rich-c3 { background: linear-gradient(135deg, #46c6b3, #2f8f9c); }
 #context-hub-modal .rich-ic.rich-c4, .rich-modal .rich-ic.rich-c4 { background: linear-gradient(135deg, #6aa8f0, #3f6fd0); }
 #context-hub-modal .rich-ic.rich-c5, .rich-modal .rich-ic.rich-c5 { background: linear-gradient(135deg, #f0b65c, #dd8e3a); }
+/* Context Hub keeps a single warm accent — neutralize the rainbow hues here only;
+   the marketplace (.rich-modal) keeps its multi-hue variety. */
+#context-hub-modal .rich-ic { color: var(--accent); background: var(--accent-soft); border: 1px solid var(--accent-border); }
+#context-hub-modal .rich-ic.rich-c1,
+#context-hub-modal .rich-ic.rich-c2,
+#context-hub-modal .rich-ic.rich-c3,
+#context-hub-modal .rich-ic.rich-c4,
+#context-hub-modal .rich-ic.rich-c5 { background: var(--accent-soft); }
 
-/* memory cards: left gradient accent; textarea stays editable */
+/* memory cards: left accent bar; textarea stays editable */
 #context-hub-modal .memory-entry-card {
   position: relative;
   overflow: hidden;
   padding-left: 18px;
-  background: var(--bg-elevated) !important;
-  border: 1px solid var(--border-subtle) !important;
-  border-radius: 14px !important;
-  box-shadow: var(--gh-card);
+  background: var(--bg-raised) !important;
+  border: 1px solid var(--border) !important;
+  border-radius: var(--radius-lg) !important;
+  box-shadow: var(--shadow-sm);
 }
 #context-hub-modal .memory-entry-card::before {
   content: "";
@@ -11867,19 +11899,32 @@ textarea:focus-visible,
   left: 0;
   top: 0;
   bottom: 0;
-  width: 4px;
-  background: var(--gh-coral);
+  width: 3px;
+  background: var(--accent);
 }
 
 /* automation cards / execution rows / empty cards: softer elevated surfaces */
 #context-hub-modal .automation-card {
-  background: var(--bg-elevated) !important;
-  border: 1px solid var(--border-subtle) !important;
-  border-radius: 16px !important;
-  box-shadow: var(--gh-card);
+  background: var(--bg-raised) !important;
+  border: 1px solid var(--border) !important;
+  border-left: 3px solid var(--accent) !important;
+  border-radius: var(--radius-lg) !important;
+  box-shadow: var(--shadow-sm);
 }
-#context-hub-modal .execution-row { border-radius: 14px !important; box-shadow: var(--gh-card); }
-#context-hub-modal .context-empty-card { border-radius: 18px !important; box-shadow: var(--gh-card); }
+#context-hub-modal .automation-card.paused { border-left-color: var(--fg-dim) !important; }
+#context-hub-modal .execution-row { border-radius: var(--radius-lg) !important; box-shadow: var(--shadow-sm); }
+/* These two cards are otherwise painted by the global commercial-refresh layer
+   (--oc-panel-bg); pin them to the same raised surface as the rest of the hub. */
+#context-hub-modal .reminder-composer-card {
+  background: var(--bg-raised) !important;
+  border-color: var(--border) !important;
+  border-radius: var(--radius-lg) !important;
+}
+#context-hub-modal .context-empty-card {
+  background: var(--bg-raised) !important;
+  border-radius: var(--radius-lg) !important;
+  box-shadow: var(--shadow-sm);
+}
 
 /* ══════════════════════════════════════════════════════════════════
  *  Generic .rich-modal layer (2026-06)

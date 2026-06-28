@@ -104,7 +104,7 @@ import {
 import { initWechatListeners, openWechatModal } from './wechat.js?v=c26a43d4'
 
 // ── Memory & Skills ──
-import { loadMemoryTab, openMemoryModal, openSkillsModal, saveMemory } from './memory.js?v=c26a43d4'
+import { openMemoryModal, openSkillsModal } from './memory.js?v=c26a43d4'
 
 // ── Phase 6 GitHub repo binding ──
 import {
@@ -3277,18 +3277,6 @@ async function init() {
       window.open('/admin.html', '_blank', 'noopener,noreferrer')
     } else if (action === 'logout') $('logout-btn').click()
   })
-  // Memory modal events
-  $('memory-tab-memory').onclick = async () => {
-    $('memory-tab-memory').className = 'btn btn-secondary'
-    $('memory-tab-user').className = 'btn btn-ghost'
-    await loadMemoryTab('memory')
-  }
-  $('memory-tab-user').onclick = async () => {
-    $('memory-tab-user').className = 'btn btn-secondary'
-    $('memory-tab-memory').className = 'btn btn-ghost'
-    await loadMemoryTab('user')
-  }
-  $('save-memory-btn').onclick = saveMemory
   // Phase 6 GitHub repo pill + modal
   $('github-trigger').onclick = () => openGithubModal(getSession()?.id)
   wireGithubModalButtons()

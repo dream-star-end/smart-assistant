@@ -34,6 +34,25 @@ function _safeText(v) {
   return v == null ? '' : String(v)
 }
 
+// Inline stroke icons (Feather/Lucide family) for empty-state chips. The design
+// system uses SVG everywhere in product UI — never emoji.
+const _EMPTY_ICONS = {
+  brain:
+    '<path d="M12 5a3 3 0 1 0-5.997.125 4 4 0 0 0-2.526 5.77 4 4 0 0 0 .556 6.588A4 4 0 1 0 12 18Z"/><path d="M12 5a3 3 0 1 1 5.997.125 4 4 0 0 1 2.526 5.77 4 4 0 0 1-.556 6.588A4 4 0 1 1 12 18Z"/>',
+  tool:
+    '<path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/>',
+  sparkles:
+    '<path d="M9.937 15.5A2 2 0 0 0 8.5 14.063l-6.135-1.582a.5.5 0 0 1 0-.962L8.5 9.936A2 2 0 0 0 9.937 8.5l1.582-6.135a.5.5 0 0 1 .963 0L14.063 8.5A2 2 0 0 0 15.5 9.937l6.135 1.581a.5.5 0 0 1 0 .964L15.5 14.063a2 2 0 0 0-1.437 1.437l-1.582 6.135a.5.5 0 0 1-.963 0z"/>',
+  clock: '<circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/>',
+  inbox:
+    '<path d="M22 12h-6l-2 3h-4l-2-3H2"/><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/>',
+  history:
+    '<path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/><path d="M12 7v5l4 2"/>',
+}
+function _emptyIcon(name) {
+  return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${_EMPTY_ICONS[name] || _EMPTY_ICONS.sparkles}</svg>`
+}
+
 function _splitMemoryEntries(raw) {
   if (!raw) return []
   return raw.replace(/\r\n/g, '\n').split(MEMORY_DELIMITER)
@@ -174,9 +193,10 @@ function _updateReminderPreview() {
   if (!el) return
   try {
     const { schedule, oneshot } = _readReminderForm()
-    el.innerHTML = `<span>将创建：</span><code>${htmlSafeEscape(schedule)}</code><span>${oneshot ? '一次性提醒' : '重复提醒'}</span>`
+    const human = _cronHuman(schedule)
+    el.innerHTML = `<span>将创建：</span><strong>${htmlSafeEscape(human)}</strong><span>${oneshot ? '一次性' : '重复'}</span><code>${htmlSafeEscape(schedule)}</code>`
   } catch (err) {
-    el.innerHTML = `<span>${htmlSafeEscape(err?.message || '填写提醒信息后自动生成 Cron')}</span>`
+    el.innerHTML = `<span>${htmlSafeEscape(err?.message || '填写提醒信息后自动生成时间安排')}</span>`
   }
 }
 
@@ -199,7 +219,7 @@ function _ensureHubBound() {
   $('memory-raw-text')?.addEventListener('input', () => {
     _memoryRaw[_memoryTarget] = $('memory-raw-text')?.value || ''
     _memoryDirty = true
-    $('memory-count-pill').textContent = `${($('memory-raw-text')?.value || '').length} chars`
+    $('memory-count-pill').textContent = `${($('memory-raw-text')?.value || '').length} 字`
   })
   $('memory-add-entry')?.addEventListener('click', () => {
     _memoryEntries[_memoryTarget] = ['', ..._memoryEntries[_memoryTarget]]
@@ -309,6 +329,13 @@ async function _renderMemoryPanel(ensureLoaded = false) {
     const btn = document.querySelector(`[data-memory-target="${t}"]`)
     btn?.classList.toggle('active', t === _memoryTarget)
   }
+  const targetNote = $('memory-target-note')
+  if (targetNote) {
+    targetNote.textContent =
+      _memoryTarget === 'user'
+        ? '你希望 Agent 始终记住的关于你的信息：身份、偏好、长期目标。'
+        : 'Agent 在对话中主动沉淀的观察与事实，越用越懂你。'
+  }
   if (ensureLoaded && !_memoryLoaded[_memoryTarget]) {
     $('memory-entries').innerHTML = '<div class="context-loading">读取记忆中…</div>'
     try {
@@ -341,12 +368,12 @@ function _renderMemoryEntries() {
     .map((text, idx) => ({ text, idx }))
     .filter((item) => !q || item.text.toLowerCase().includes(q))
   const joined = _memoryRawMode ? $('memory-raw-text')?.value || '' : _joinMemoryEntries(entries)
-  $('memory-count-pill').textContent = `${joined.length} chars`
+  $('memory-count-pill').textContent = `${joined.length} 字`
   $('memory-entry-count').textContent = `${entries.filter((e) => e.trim()).length} 条`
   if (!wrap) return
   wrap.innerHTML = ''
   if (shown.length === 0) {
-    wrap.innerHTML = `<div class="context-empty-card"><div class="context-empty-icon">🧠</div><strong>${q ? '没有匹配的记忆' : '还没有记忆条目'}</strong><p>${q ? '换个关键词搜索，或清空搜索。' : '点击“新增条目”，让 Agent 在后续对话中持续记住重要事实。'}</p></div>`
+    wrap.innerHTML = `<div class="context-empty-card"><div class="context-empty-icon">${_emptyIcon('brain')}</div><strong>${q ? '没有匹配的记忆' : '还没有记忆条目'}</strong><p>${q ? '换个关键词搜索，或清空搜索。' : '点击“新增条目”，让 Agent 在后续对话中持续记住重要事实。'}</p></div>`
     return
   }
   for (const item of shown) {
@@ -361,7 +388,7 @@ function _renderMemoryEntries() {
     textarea.addEventListener('input', () => {
       _memoryEntries[_memoryTarget][item.idx] = textarea.value
       _memoryDirty = true
-      $('memory-count-pill').textContent = `${_joinMemoryEntries(_memoryEntries[_memoryTarget]).length} chars`
+      $('memory-count-pill').textContent = `${_joinMemoryEntries(_memoryEntries[_memoryTarget]).length} 字`
     })
     const actions = document.createElement('div')
     actions.className = 'memory-entry-actions'
@@ -412,8 +439,9 @@ async function _loadSkills() {
     // User-level shared skill library — visible/usable across ALL of the user's
     // agents (not filtered by the currently-active agent).
     const data = await apiGet('/api/skills')
-    // This manager is for the user's OWN skills — hide platform baseline/seed skills
-    // (read-only, not user content) so the list isn't dominated by them.
+    // This manager is for the user's OWN skills. The backend already strips platform
+    // baseline/seed skills from /api/skills (they must never be exposed to end users);
+    // this filter is defense-in-depth so a backend regression can't leak them into the UI.
     _skillsCache = (data.skills || []).filter((s) => s.source !== 'platform')
     _renderSkillsList()
     // On mobile, opening a detail pops a full-screen overlay — don't auto-open one on
@@ -440,10 +468,10 @@ function _renderSkillsList() {
     const hay = [s.name, s.description, ...(s.tags || []), s.source].join(' ').toLowerCase()
     return !q || hay.includes(q)
   })
-  $('skills-count-pill').textContent = `${_skillsCache.length} skills`
+  $('skills-count-pill').textContent = `${_skillsCache.length} 个技能`
   wrap.innerHTML = ''
   if (list.length === 0) {
-    wrap.innerHTML = `<div class="context-empty-card"><div class="context-empty-icon">🛠️</div><strong>${q ? '没有匹配的技能' : '还没有自建技能'}</strong><p>复杂任务完成后 Agent 会自动沉淀 skill；你也可以手动新建。</p></div>`
+    wrap.innerHTML = `<div class="context-empty-card"><div class="context-empty-icon">${_emptyIcon('tool')}</div><strong>${q ? '没有匹配的技能' : '还没有自建技能'}</strong><p>复杂任务完成后 Agent 会自动沉淀 skill；你也可以手动新建。</p></div>`
     return
   }
   for (const s of list) {
@@ -454,7 +482,7 @@ function _renderSkillsList() {
     btn.innerHTML = `
       <span class="rich-ic ${ic.cls}" aria-hidden="true">${htmlSafeEscape(ic.glyph)}</span>
       <span class="skill-card-main">
-        <span class="skill-card-top"><strong>${htmlSafeEscape(s.name)}</strong><span class="source-badge ${s.source === 'platform' ? 'platform' : 'user'}">${s.source === 'platform' ? '平台' : '自建'}</span></span>
+        <span class="skill-card-top"><strong>${htmlSafeEscape(s.name)}</strong>${_skillSourceBadge(s)}</span>
         <span class="skill-card-desc">${htmlSafeEscape(s.description || '无描述')}</span>
         <span class="skill-card-tags">${(s.tags || []).slice(0, 4).map((tag) => `<span>${htmlSafeEscape(tag)}</span>`).join('')}</span>
       </span>
@@ -472,7 +500,15 @@ function _richIcon(name) {
   let h = 0
   for (let i = 0; i < str.length; i++) h = (h * 31 + str.charCodeAt(i)) >>> 0
   const m = str.match(/[a-z0-9]/i)
-  return { cls: `rich-c${(h % 5) + 1}`, glyph: m ? m[0].toUpperCase() : '🛠️' }
+  return { cls: `rich-c${(h % 5) + 1}`, glyph: m ? m[0].toUpperCase() : (str.trim()[0] || '#') }
+}
+
+// Platform baseline/seed skills never reach this user-management view (backend strips
+// them), so every skill here is user-owned. Distinguish marketplace-installed (hub
+// layer) from self-authored so users can tell where a skill came from.
+function _skillSourceBadge(s) {
+  const fromMarket = s.layer === 'hub'
+  return `<span class="source-badge ${fromMarket ? 'market' : 'user'}">${fromMarket ? '市场' : '自建'}</span>`
 }
 
 function _renderSkillEmpty() {
@@ -480,7 +516,7 @@ function _renderSkillEmpty() {
   // (covers initial load, post-delete reload, and the no-skills case so the user is
   // never trapped in a backless overlay).
   _closeSkillDetailOverlay()
-  $('skill-detail').innerHTML = '<div class="context-empty-card"><div class="context-empty-icon">✨</div><strong>选择一个技能查看详情</strong><p>技能会在相关任务开始前被 Agent 按需加载。</p></div>'
+  $('skill-detail').innerHTML = `<div class="context-empty-card"><div class="context-empty-icon">${_emptyIcon('sparkles')}</div><strong>选择一个技能查看详情</strong><p>技能会在相关任务开始前被 Agent 按需加载。</p></div>`
   $('skill-delete-btn').hidden = true
 }
 
@@ -494,15 +530,16 @@ async function _loadSkillDetail(name) {
   try {
     const data = await apiGet(`/api/skills/${encodeURIComponent(name)}`)
     const skill = data.skill
-    // Editability follows `writable` (platform baseline/agent-seed = read-only;
-    // legacy per-agent residue is user-sourced but read-only until migrated to shared).
-    const isPlatform = skill.source === 'platform'
+    // Platform baseline/seed never reach this user-management view (backend strips them),
+    // so a skill is either self-authored (shared/legacy) or marketplace-installed (hub).
+    // Editability follows `writable`: shared = editable; hub & un-migrated legacy = read-only.
+    const fromMarket = skill.layer === 'hub'
     const canEdit = skill.writable === true
-    const badgeText = isPlatform ? '平台只读' : canEdit ? '自建可编辑' : '自建·迁移中(只读)'
+    const badgeText = canEdit ? '自建·可编辑' : fromMarket ? '市场安装·只读' : '自建·迁移中(只读)'
     detail.innerHTML = `
       <button type="button" id="skill-detail-back" class="skill-detail-back btn btn-ghost btn-sm">← 返回技能列表</button>
       <div class="skill-detail-head">
-        <div><span class="source-badge ${isPlatform ? 'platform' : 'user'}">${badgeText}</span><h4>${htmlSafeEscape(skill.name)}</h4><p>${htmlSafeEscape(skill.description || '')}</p></div>
+        <div><span class="source-badge ${fromMarket ? 'market' : 'user'}">${badgeText}</span><h4>${htmlSafeEscape(skill.name)}</h4><p>${htmlSafeEscape(skill.description || '')}</p></div>
         <div class="skill-detail-head-btns">
           ${canEdit ? '<button type="button" id="skill-train-inline" class="btn btn-secondary">训练优化</button>' : ''}
           ${canEdit ? '<button type="button" id="skill-publish-inline" class="btn btn-secondary">发布到市场</button>' : ''}
@@ -627,10 +664,10 @@ async function _loadCronTasks() {
   try {
     const data = await apiGet('/api/cron')
     const jobs = data.jobs || []
-    $('tasks-count-pill').textContent = `${jobs.length} tasks`
+    $('tasks-count-pill').textContent = `${jobs.length} 个任务`
     list.innerHTML = ''
     if (jobs.length === 0) {
-      list.innerHTML = '<div class="context-empty-card"><div class="context-empty-icon">⏰</div><strong>暂无定时任务</strong><p>用上面的快捷表单创建一次性提醒或重复自动化。</p></div>'
+      list.innerHTML = `<div class="context-empty-card"><div class="context-empty-icon">${_emptyIcon('clock')}</div><strong>暂无定时任务</strong><p>用上面的快捷表单创建一次性提醒或重复自动化。</p></div>`
       return
     }
     for (const job of jobs) list.appendChild(_cronJobCard(job))
@@ -723,7 +760,7 @@ async function _loadBgTasks() {
     const tasks = data.tasks || []
     list.innerHTML = ''
     if (tasks.length === 0) {
-      list.innerHTML = '<div class="context-empty-card"><div class="context-empty-icon">📌</div><strong>暂无后台任务</strong><p>未来的长期任务、Webhook 和站立规则会显示在这里。</p></div>'
+      list.innerHTML = `<div class="context-empty-card"><div class="context-empty-icon">${_emptyIcon('inbox')}</div><strong>暂无后台任务</strong><p>Agent 执行较长任务时会在此登记，方便你回看进度与结果，通常无需手动创建。</p></div>`
       return
     }
     for (const t of tasks) {
@@ -758,7 +795,7 @@ async function _loadExecLog() {
     const execs = (data.executions || []).slice().reverse().slice(0, 30)
     list.innerHTML = ''
     if (execs.length === 0) {
-      list.innerHTML = '<div class="context-empty-card"><div class="context-empty-icon">📜</div><strong>暂无执行记录</strong><p>提醒或后台任务执行后会在这里保留最近记录。</p></div>'
+      list.innerHTML = `<div class="context-empty-card"><div class="context-empty-icon">${_emptyIcon('history')}</div><strong>暂无执行记录</strong><p>提醒或后台任务执行后会在这里保留最近记录。</p></div>`
       return
     }
     for (const ex of execs) {

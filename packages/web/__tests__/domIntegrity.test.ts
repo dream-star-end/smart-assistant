@@ -86,8 +86,9 @@ const DYNAMIC_IDS = new Set([
 // ── Template-literal dynamic IDs: $(`prefix-${var}`) ──
 // Each entry: prefix → known suffixes (must all exist in index.html)
 const TEMPLATE_DYNAMIC_EXPANSIONS: Record<string, readonly string[]> = {
-  'tasks-panel-': ['cron', 'bg', 'log'],
-  'tasks-tab-': ['cron', 'bg', 'log'],
+  // 旧 tasks-modal 的 tasks-panel-*/tasks-tab-* 已随该 modal 移除,记忆/技能/定时任务
+  // 现统一进 Context Hub(data-context-task-tab + context-tasks-* id),JS 不再有
+  // $(`tasks-panel-${t}`)/$(`tasks-tab-${t}`) 调用。
   // V3 Phase 4A 多模态认证: $(`auth-mode-${m}`) / $(`auth-tab-${m}`)
   'auth-mode-': ['login', 'register', 'forgot', 'reset', 'verify'],
   // login 是 default view,不存在独立 auth-tab-login 入口(auth.js:428 的
@@ -217,9 +218,8 @@ describe('T04: Critical IDs always present', () => {
     // Modals
     'agents-modal',
     'persona-modal',
-    'memory-modal',
-    'skills-modal',
-    'tasks-modal',
+    // 记忆/技能/定时任务统一进 Context Hub(旧 memory-modal/skills-modal/tasks-modal 已移除)
+    'context-hub-modal',
     'papers-modal',
     'add-task-modal',
     'oauth-modal',
