@@ -163,6 +163,36 @@ describe('SkillStore — PR4 baseline-wins merge', () => {
     assert.equal(v, null)
   })
 
+  // ── user-management view ({ includePlatform: false }) — platform skills must be
+  //    fully invisible so /api/skills cannot leak baseline/seed content to end users ──
+  it('list({ includePlatform:false }) drops every platform skill', async () => {
+    const store = new SkillStore(MERGE_AGENT, { baselineDir: baselineRoot })
+    const list = await store.list({ includePlatform: false })
+    assert.ok(!list.some((s) => s.source === 'platform'), 'no platform-sourced entry may leak')
+    assert.ok(!list.some((s) => s.name === 'platform-only'), 'platform-only must be hidden')
+    // a baseline-owned name now resolves to the user's own shadow (symmetric with view())
+    const systemInfo = list.find((s) => s.name === 'system-info')
+    assert.equal(systemInfo?.source, 'user')
+    assert.ok(systemInfo?.description.includes('User shadow'))
+    assert.ok(list.some((s) => s.name === 'user-only'), 'user skills stay visible')
+  })
+
+  it('view({ includePlatform:false }) returns null for a platform-only skill', async () => {
+    const store = new SkillStore(MERGE_AGENT, { baselineDir: baselineRoot })
+    const v = await store.view('platform-only', undefined, { includePlatform: false })
+    assert.equal(v, null)
+  })
+
+  it('view({ includePlatform:false }) returns the user shadow, never the platform body', async () => {
+    const store = new SkillStore(MERGE_AGENT, { baselineDir: baselineRoot })
+    const v = await store.view('system-info', undefined, { includePlatform: false })
+    assert.ok(v && typeof v !== 'string')
+    const content = v as any
+    assert.equal(content.source, 'user')
+    assert.ok(content.rawContent.includes('USER SHADOW BODY'))
+    assert.ok(!content.rawContent.includes('PLATFORM BODY'), 'platform body must not leak')
+  })
+
   it('save() rejects names that collide with baseline', async () => {
     const store = new SkillStore(MERGE_AGENT, { baselineDir: baselineRoot })
     const r = await store.save(

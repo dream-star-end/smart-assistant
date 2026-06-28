@@ -4691,7 +4691,8 @@ export class Gateway {
   ): Promise<void> {
     if (req.method !== 'GET') return this.sendError(res, 405, 'method not allowed')
     const store = buildAgentSkillStore(agentId)
-    const list = await store.list()
+    // User-facing surface: never enumerate platform baseline/seed skills.
+    const list = await store.list({ includePlatform: false })
     this.sendJson(res, 200, { skills: list })
   }
 
@@ -4704,7 +4705,8 @@ export class Gateway {
   ): Promise<void> {
     const store = buildAgentSkillStore(agentId)
     if (req.method === 'GET') {
-      const v = await store.view(skillName)
+      // User-facing read: platform skills resolve to 404, never leak their body.
+      const v = await store.view(skillName, undefined, { includePlatform: false })
       if (!v || typeof v === 'string') return this.sendError(res, 404, 'skill not found')
       this.sendJson(res, 200, { skill: v })
       return
@@ -4738,7 +4740,8 @@ export class Gateway {
   private async handleUserSkillsList(req: IncomingMessage, res: ServerResponse): Promise<void> {
     if (req.method !== 'GET') return this.sendError(res, 405, 'method not allowed')
     const store = buildUserSkillStore()
-    const list = await store.list()
+    // User-facing surface: never enumerate platform baseline/seed skills.
+    const list = await store.list({ includePlatform: false })
     this.sendJson(res, 200, { skills: list })
   }
 
@@ -4751,7 +4754,8 @@ export class Gateway {
   ): Promise<void> {
     const store = buildUserSkillStore()
     if (req.method === 'GET') {
-      const v = await store.view(skillName)
+      // User-facing read: platform skills resolve to 404, never leak their body.
+      const v = await store.view(skillName, undefined, { includePlatform: false })
       if (!v || typeof v === 'string') return this.sendError(res, 404, 'skill not found')
       this.sendJson(res, 200, { skill: v })
       return
@@ -4836,13 +4840,13 @@ export class Gateway {
     if (req.method !== 'POST') return this.sendError(res, 405, 'method not allowed')
     const userId = this.getUserId(req)
 
-    // Authority: only train user-authored skills. Platform baseline/seed are read-only.
+    // Authority: only train user-authored skills. Use the user-management view so a
+    // platform baseline/seed name resolves to 404 (same as a nonexistent skill) instead
+    // of 403 — otherwise the 403/404 split would be an existence oracle for the
+    // (otherwise hidden) platform skill catalog.
     const userStore = buildUserSkillStore()
-    const current = await userStore.view(skillName)
+    const current = await userStore.view(skillName, undefined, { includePlatform: false })
     if (!current || typeof current === 'string') return this.sendError(res, 404, 'skill not found')
-    if (current.source === 'platform') {
-      return this.sendError(res, 403, 'cannot train a platform skill (read-only)')
-    }
 
     const guard = this.skillTrainJobs.canStart(skillName)
     if (!guard.ok) return this.sendError(res, 409, guard.reason ?? 'cannot start training')
@@ -4940,7 +4944,7 @@ export class Gateway {
     if (req.method === 'GET') {
       const draft = await this.skillDrafts.readDraft(runId, skillName)
       if (!draft) return this.sendError(res, 404, 'draft not found')
-      const cur = await buildUserSkillStore().view(skillName)
+      const cur = await buildUserSkillStore().view(skillName, undefined, { includePlatform: false })
       const current =
         cur && typeof cur !== 'string'
           ? { body: cur.body, description: cur.description, version: cur.version }

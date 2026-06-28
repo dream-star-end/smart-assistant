@@ -77,6 +77,20 @@ export interface SkillContent extends SkillMetadata {
   rawContent: string // full SKILL.md
 }
 
+/**
+ * Visibility scope for the read APIs (`list`/`view`).
+ *
+ * `includePlatform` defaults to true so the agent runtime keeps seeing platform
+ * baseline/seed skills (it needs them to load skills at run time). User-facing
+ * management surfaces (`/api/skills`, `/api/agents/:id/skills`) pass `false` so
+ * platform-owned skills are never enumerated or read by end users — the
+ * authoritative "platform skills are invisible to user management" rule lives
+ * here in the store, not scattered across handlers or the frontend.
+ */
+export interface SkillViewOptions {
+  includePlatform?: boolean
+}
+
 export interface SkillSearchResult extends SkillMetadata {
   score: number
   matched: string[]
@@ -458,7 +472,8 @@ export class SkillStore {
     return roots
   }
 
-  async list(): Promise<SkillMetadata[]> {
+  async list(opts: SkillViewOptions = {}): Promise<SkillMetadata[]> {
+    const includePlatform = opts.includePlatform !== false
     const result: SkillMetadata[] = []
     const seen = new Set<string>()
     const push = (items: SkillMetadata[]) => {
@@ -468,12 +483,14 @@ export class SkillStore {
         result.push(item)
       }
     }
-    // 1) platform baseline (highest priority)
-    if (this.baselineRoot) {
+    // 1) platform baseline (highest priority). Skipped entirely for user-management
+    //    views so a platform skill never occupies a name slot there — a same-named
+    //    user skill in a lower layer then surfaces normally (symmetric with view()).
+    if (includePlatform && this.baselineRoot) {
       push(await this.scanRoot(this.baselineRoot, 'platform', 'platform', false))
     }
-    // 2) per-agent platform seed
-    if (this.agentSeedRoot) {
+    // 2) per-agent platform seed (also platform-owned; hidden from user-management views)
+    if (includePlatform && this.agentSeedRoot) {
       push(await this.scanRoot(this.agentSeedRoot, 'platform', 'agent-seed', false))
     }
     // 3) shared (user-level write source)
@@ -582,11 +599,18 @@ export class SkillStore {
     return false
   }
 
-  async view(name: string, subfile?: string): Promise<SkillContent | string | null> {
+  async view(
+    name: string,
+    subfile?: string,
+    opts: SkillViewOptions = {},
+  ): Promise<SkillContent | string | null> {
+    const includePlatform = opts.includePlatform !== false
     const v = validateSkillName(name)
     if (!v.ok) return null
     // Read priority: baseline > agent-seed > shared > legacy.
-    if (await this.rootHas(this.baselineRoot, name)) {
+    // User-management views skip the platform layers so a platform skill's name
+    // resolves to null (→ 404) instead of leaking its body — symmetric with list().
+    if (includePlatform && (await this.rootHas(this.baselineRoot, name))) {
       return this.viewFromRoot(
         name,
         subfile,
@@ -596,7 +620,7 @@ export class SkillStore {
         false,
       )
     }
-    if (await this.rootHas(this.agentSeedRoot, name)) {
+    if (includePlatform && (await this.rootHas(this.agentSeedRoot, name))) {
       return this.viewFromRoot(
         name,
         subfile,
