@@ -277,6 +277,7 @@ export const V3_CCB_BASELINE_SKILL_NAMES = [
   "browser",
   "document-writing",
   "minimax-media",
+  "market",
 ] as const;
 
 /**

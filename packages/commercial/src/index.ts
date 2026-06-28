@@ -130,6 +130,11 @@ import {
   type MarketplaceSyncHandler,
 } from "./http/internalMarketplaceSync.js";
 import {
+  MARKETPLACE_AGENT_PREFIX,
+  makeMarketplaceAgentHandler,
+  type MarketplaceAgentHandler,
+} from "./http/internalMarketplaceAgent.js";
+import {
   makePgSkillEmbedCache,
   makePgSkillSearchLogger,
 } from "./http/skillEmbedCachePg.js";
@@ -1154,6 +1159,13 @@ export async function registerCommercial(
       const marketplaceSyncHandler: MarketplaceSyncHandler = makeMarketplaceSyncHandler({
         identityRepo,
       });
+      // /internal/v3/marketplace/agent/* — 容器内 AI(market skill / oc-market CLI)
+      // 代用户做市场操作(search/install/uninstall/publish),同款 verifyContainerIdentity
+      // 限本用户;install 仅已审内容、publish 仅入 pending(管理员审核前不上线)。
+      const marketplaceAgentHandler: MarketplaceAgentHandler = makeMarketplaceAgentHandler({
+        identityRepo,
+        listPublicModels: () => pricing.listPublic(),
+      });
       dispatchInternal = (req, res, ctx) => {
         const path = (req.url ?? "/").split("?")[0];
         if (path === SERVER_AUTHORED_PATH) {
@@ -1173,6 +1185,9 @@ export async function registerCommercial(
         }
         if (path === MARKETPLACE_SYNC_PATH) {
           return marketplaceSyncHandler(req, res, ctx);
+        }
+        if (path.startsWith(MARKETPLACE_AGENT_PREFIX)) {
+          return marketplaceAgentHandler(req, res, ctx);
         }
         if (path === WECHAT_OUTBOUND_PATH) {
           // P1.7 slice 7c — wechat broker outbound 接收点

@@ -157,8 +157,11 @@ COPY --chown=root:root ./runtime/oc-web.sh /usr/local/bin/oc-web
 # oc-browser: thin client over the oc-browser daemon (replaces the retired
 # browser_* MCP tools; documented by the `browser` baseline skill).
 COPY --chown=root:root ./runtime/oc-browser.sh /usr/local/bin/oc-browser
+# oc-market: AI-driven AI-marketplace ops (search/install/uninstall/publish) over
+# master /internal/v3/marketplace/agent/*; documented by the `market` baseline skill.
+COPY --chown=root:root ./runtime/oc-market.sh /usr/local/bin/oc-market
 RUN set -eux; \
-    chmod 0755 /usr/local/bin/oc-docx /usr/local/bin/oc-minimax /usr/local/bin/oc-web-context /usr/local/bin/oc-web /usr/local/bin/oc-browser /usr/local/lib/openclaude/create-docgen-reference.py; \
+    chmod 0755 /usr/local/bin/oc-docx /usr/local/bin/oc-minimax /usr/local/bin/oc-web-context /usr/local/bin/oc-web /usr/local/bin/oc-browser /usr/local/bin/oc-market /usr/local/lib/openclaude/create-docgen-reference.py; \
     ln -sf /usr/local/bin/oc-minimax /usr/local/bin/mmx; \
     python3 /usr/local/lib/openclaude/create-docgen-reference.py /usr/local/share/openclaude-docgen/reference.docx; \
     printf '%s\n' '# DOCX smoke' 'Inline $a^2+b^2=c^2$.' '' '$$' 'E = mc^2' '$$' > /tmp/oc-docx-smoke.md; \
