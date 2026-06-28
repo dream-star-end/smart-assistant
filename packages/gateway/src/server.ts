@@ -53,6 +53,7 @@ import {
   readAgentsConfig,
   readConfig,
   searchSessions,
+  syncMarketplaceHub,
   writeAgentsConfig,
   writeConfig,
   getUsageSummary,
@@ -118,7 +119,11 @@ import {
 import { SessionManager } from './sessionManager.js'
 import { WebhookRouter } from './webhooks.js'
 import { inferAgentForModel } from './inferAgentForModel.js'
-import { mergeOnDemandToolsets, resolveDelegateToolsets } from './toolsetIntent.js'
+import {
+  capMarketplaceToolsets,
+  mergeOnDemandToolsets,
+  resolveDelegateToolsets,
+} from './toolsetIntent.js'
 import { resolveOpenClaudeVisionEntry } from './subprocessRunner.js'
 import {
   OPENCLAUDE_VISION_MCP_ID,
@@ -5276,12 +5281,20 @@ export class Gateway {
     // empty-intersection hard-400 that surfaced as "delegate toolsets not allowed
     // for agent …"). Escalation to "all tools" stays impossible: a configured
     // baseline is only ever extended with toolsets defined in config.toolsets.
+    // Security cap (RFC D2.7): the sub-agent's toolsets can never exceed the
+    // CALLER's. sourceAgent is injected from OPENCLAUDE_AGENT_ID (trusted, not
+    // tool-arg controlled), so a marketplace agent can't spoof a privileged caller.
+    // An undefined caller toolset = the trusted platform default (main) → no cap.
+    const callerAgent =
+      typeof sourceAgent === 'string' ? cfg.agents.find((a) => a.id === sourceAgent) : undefined
+    const callerToolsets = Array.isArray(callerAgent?.toolsets) ? callerAgent.toolsets : undefined
     const delegateIntentText = [goal, context].filter(Boolean).join('\n')
     const resolvedToolsets = resolveDelegateToolsets(
       targetAgent,
       this.deps.config,
       toolsets,
       delegateIntentText,
+      callerToolsets,
     )
     const delegatedAgent =
       resolvedToolsets === undefined ? targetAgent : { ...targetAgent, toolsets: resolvedToolsets }
@@ -7400,12 +7413,30 @@ export class Gateway {
       this._markIdempotencyKey(frame.idempotencyKey)
     }
 
+    // Pre-resolution marketplace sync: reconcile installed skills+agents into
+    // hub/skills + agents.yaml BEFORE reading agents.yaml, so a freshly-installed
+    // market agent is present at resolution time (not merely after a later spawn).
+    // No-op outside a commercial container; bounded + fail-soft so it never blocks
+    // the turn. The agents.yaml mtime change auto-invalidates _getAgentsConfig's cache.
+    try {
+      await syncMarketplaceHub({ timeoutMs: 4000 })
+    } catch {
+      /* fail-soft: sync must never block or fail the turn */
+    }
+
     // Explicit agentId override (web UI per-session selection)
     let sessionKey: string
     let agent: AgentDef
     const cfg = await this._getAgentsConfig()
     if (frame.agentId) {
-      const ag = cfg.agents.find((a) => a.id === frame.agentId) ?? { id: frame.agentId }
+      // Unknown agentId → demote to the default agent (全能助手), NEVER a personaless
+      // {id} (which would run with no persona/toolsets/model). After the sync above a
+      // genuinely-installed market agent is present; anything still unknown is treated
+      // as not-installed and safely resolved to the least-privileged default.
+      const ag =
+        cfg.agents.find((a) => a.id === frame.agentId) ??
+        cfg.agents.find((a) => a.id === cfg.default) ??
+        cfg.agents.find((a) => a.id === 'main') ?? { id: 'main' }
       agent = ag
       // Include agentId in sessionKey so different agents get isolated subprocesses
       sessionKey = `agent:${frame.agentId}:${frame.channel}:${frame.peer.kind}:${frame.peer.id.replace(/[^a-zA-Z0-9_-]/g, '_')}`
@@ -7550,15 +7581,18 @@ export class Gateway {
         : undefined
 
     const baseToolsets = agent.toolsets ?? this.deps.config.defaults.toolsets
-    const effectiveToolsets = mergeOnDemandToolsets(
+    let effectiveToolsets = mergeOnDemandToolsets(
       baseToolsets,
       this.deps.config,
       frame.content.text ?? '',
     )
+    // Marketplace agents are HARD-CAPPED to their declared manifest toolsets:
+    // on-demand intent expansion must never grant a capability the manifest didn't
+    // declare (RFC D2 — manifest toolsets are the total-reachable ceiling, not just
+    // for delegation). Platform/user agents (no source marker) keep on-demand expand.
+    effectiveToolsets = capMarketplaceToolsets(agent.source, agent.toolsets, effectiveToolsets)
     const effectiveAgent =
-      effectiveToolsets === undefined
-        ? agent
-        : { ...agent, toolsets: effectiveToolsets }
+      effectiveToolsets === undefined ? agent : { ...agent, toolsets: effectiveToolsets }
 
     const session = await this.sessions.getOrCreate({
       sessionKey,

@@ -32,9 +32,11 @@ import {
   handleAdminMarketplacePending,
   handleAdminMarketplaceReview,
   handleAdminMarketplaceRevoke,
+  handleMarketplaceAgentPublish,
   handleMarketplaceDetail,
   handleMarketplaceInstall,
   handleMarketplaceInstalled,
+  handleMarketplaceMyAgents,
   handleMarketplacePublish,
   handleMarketplaceUninstall,
 } from '../marketplace/marketplaceRoutes.js'
@@ -562,6 +564,16 @@ export function createCommercialHandler(
       method: 'GET',
       path: '/api/marketplace/search',
       handler: (req, res) => handleMarketplaceSearch(req, res, deps),
+    },
+    {
+      method: 'POST',
+      path: '/api/marketplace/agent/publish',
+      handler: (req, res) => handleMarketplaceAgentPublish(req, res, deps),
+    },
+    {
+      method: 'GET',
+      path: '/api/marketplace/my-agents',
+      handler: (req, res) => handleMarketplaceMyAgents(req, res, deps),
     },
     {
       method: 'POST',

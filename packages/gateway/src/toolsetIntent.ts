@@ -119,21 +119,48 @@ export function normalizeDelegateToolsetList(value: unknown): string[] | null {
 // Returns the resolved toolset list, or undefined meaning "inherit / mount all"
 // — preserved only for the legacy case where neither the member nor defaults
 // configure any toolsets (SubprocessRunner then mounts all global MCP servers).
+/**
+ * Cap an agent's effective toolsets to its manifest declaration when it is a
+ * MARKETPLACE agent (security ceiling, RFC D2): on-demand intent expansion must
+ * never grant a capability the vetted manifest didn't declare. Returns `effective`
+ * unchanged for platform/user agents (no source marker), which keep on-demand grow.
+ */
+export function capMarketplaceToolsets(
+  source: string | undefined,
+  manifestToolsets: readonly string[] | undefined,
+  effective: string[] | undefined,
+): string[] | undefined {
+  if (source !== 'marketplace' || !Array.isArray(manifestToolsets)) return effective
+  const cap = new Set(manifestToolsets)
+  return (effective ?? manifestToolsets).filter((t) => cap.has(t))
+}
+
 export function resolveDelegateToolsets(
   targetAgent: AgentDef,
   config: Pick<OpenClaudeConfig, 'toolsets' | 'defaults'>,
   requestedRaw: unknown,
   intentText: string,
+  /**
+   * The CALLER (leader)'s effective toolsets. Security cap (RFC D2.7 / Codex
+   * BLOCKER#2): a delegation can never grant the sub-agent a capability the
+   * caller itself doesn't have — `effective(sub) ⊆ effective(caller)`. Pass
+   * `undefined` when the caller declares no toolsets (the trusted platform
+   * default, e.g. main / 全能助手, full access) → no cap. A marketplace agent
+   * always declares a finite, vetted toolset, so it is always capped.
+   */
+  callerToolsets?: readonly string[],
 ): string[] | undefined {
+  const callerCap = Array.isArray(callerToolsets) ? new Set(callerToolsets) : null
   const base = Array.isArray(targetAgent.toolsets)
     ? targetAgent.toolsets
     : Array.isArray(config.defaults?.toolsets)
       ? config.defaults.toolsets
       : undefined
-  // No baseline configured → keep legacy "mount all" semantics. mergeOnDemand
-  // also no-ops on an empty base, and a leader request can't sensibly narrow
-  // "all", so inherit unchanged.
-  if (!base || base.length === 0) return undefined
+  // No baseline configured → legacy "mount all" semantics, UNLESS the caller is
+  // capped, in which case the sub-agent is bounded by the caller's toolsets
+  // (mount-all must never bypass the cap → otherwise a capped agent could escalate
+  // by delegating to a no-toolset agent).
+  if (!base || base.length === 0) return callerCap ? [...callerCap] : undefined
 
   // (a) Intent-based on-demand grant — same call the normal message path makes,
   //     so a delegated researcher gets browser/research from the task text just
@@ -158,5 +185,10 @@ export function resolveDelegateToolsets(
       }
     }
   }
+
+  // (c) Caller cap — the hard security ceiling. Intersect the resolved grant with
+  //     the caller's effective toolsets so the sub-agent can never exceed the
+  //     caller's own authority. No-op when the caller is uncapped (platform default).
+  if (callerCap) return resolved.filter((t) => callerCap.has(t))
   return resolved
 }

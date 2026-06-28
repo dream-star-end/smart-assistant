@@ -17,7 +17,10 @@ import {
   verifyContainerIdentity,
 } from '../auth/containerIdentity.js'
 import { type Logger, rootLogger } from '../logging/logger.js'
-import { listActiveInstalledArtifacts } from '../marketplace/marketplaceDb.js'
+import {
+  listActiveInstalledAgents,
+  listActiveInstalledArtifacts,
+} from '../marketplace/marketplaceDb.js'
 import { REQUEST_ID_HEADER, ensureRequestId, setSecurityHeaders } from './util.js'
 
 export const MARKETPLACE_SYNC_PATH = '/internal/v3/marketplace/sync'
@@ -69,8 +72,11 @@ export function makeMarketplaceSyncHandler(deps: MarketplaceSyncDeps): Marketpla
     }
 
     try {
-      const skills = await listActiveInstalledArtifacts(identity.userId)
-      sendJson(res, 200, { skills }, requestId)
+      const [skills, agents] = await Promise.all([
+        listActiveInstalledArtifacts(identity.userId),
+        listActiveInstalledAgents(identity.userId),
+      ])
+      sendJson(res, 200, { skills, agents }, requestId)
     } catch (err) {
       log
         .child({ requestId, uid: identity.userId })

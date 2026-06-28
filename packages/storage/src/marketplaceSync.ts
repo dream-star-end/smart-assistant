@@ -1,27 +1,34 @@
 /**
- * Container-side marketplace hub reconciliation (pull model).
+ * Container-side marketplace reconciliation (pull model) for BOTH kinds:
+ *   - skills → ~/.openclaude/hub/skills/<slug>/SKILL.md (read-only hub overlay)
+ *   - agents → ~/.openclaude/agents.yaml entries (source:'marketplace') + each
+ *     agent's inline persona written to ~/.openclaude/agents/<slug>/CLAUDE.md
  *
- * Asks master which marketplace skills this user has installed (active,
- * non-revoked) and reconciles ~/.openclaude/hub/skills/ to match: write/refresh
- * the approved SKILL.md (atomic), and remove any hub skill that is no longer in
- * the list (uninstalled OR revoked = kill-switch).
+ * Asks master which artifacts this user has installed (active, non-revoked) and
+ * reconciles local state to match: write/refresh desired, remove anything no
+ * longer installed (uninstall OR revoke = kill-switch). Same UID as the agent, no
+ * master-writes-volume. Fail-soft. No-op outside a v3/v5 commercial container
+ * (no OPENCLAUDE_V3_MASTER_BASE_URL / container token).
  *
- * Same UID as the agent, no master-writes-volume. Fail-soft: any error leaves
- * the existing hub untouched. No-op outside v3 (no OPENCLAUDE_V3_MASTER_BASE_URL
- * / container token).
- *
- * Lives in @openclaude/storage so BOTH the mcp-memory startup hook AND the
- * gateway runner's pre-prompt step can call it — the latter awaits it before
- * building the skills slot so a freshly-installed skill is in the next session's
- * static prompt (not merely eventual / tool-visible).
+ * Lives in @openclaude/storage so the gateway runner (pre-prompt + agent
+ * resolution) AND the mcp-memory startup hook can both call it. Both processes
+ * may run concurrently → all writes are atomic (temp+rename); writeAgentsConfig
+ * is atomic too.
  */
 import { lstat, mkdir, readFile, readdir, rename, rm, writeFile } from 'node:fs/promises'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 
+import { type AgentDef, type AgentsConfig, readAgentsConfig, writeAgentsConfig } from './config.js'
 import { paths } from './paths.js'
 import { marketplaceArtifactHash } from './skillEmbedding.js'
 
 const SLUG_RE = /^[a-z0-9][a-z0-9-]{1,63}$/
+
+/** Per-write temp suffix so concurrent writes in the SAME process don't share a
+ *  tmp path (process.pid alone isn't unique within a process). */
+function randomSuffix(): string {
+  return Math.random().toString(36).slice(2, 10)
+}
 
 interface SyncSkill {
   slug: string
@@ -30,11 +37,23 @@ interface SyncSkill {
   artifactHash: string
 }
 
+interface SyncAgent {
+  slug: string
+  version: string
+  rawManifest: string
+  artifactHash: string
+}
+
+interface SyncResponse {
+  skills: SyncSkill[]
+  agents: SyncAgent[]
+}
+
 async function fetchInstalled(
   base: string,
   token: string,
   timeoutMs: number,
-): Promise<SyncSkill[] | null> {
+): Promise<SyncResponse | null> {
   try {
     const ctl = new AbortController()
     const timer = setTimeout(() => ctl.abort(), timeoutMs)
@@ -45,28 +64,50 @@ async function fetchInstalled(
         signal: ctl.signal,
       })
       if (!res.ok) return null
-      const data = (await res.json()) as { skills?: unknown }
-      if (!Array.isArray(data.skills)) return null
-      const out: SyncSkill[] = []
-      for (const s of data.skills) {
-        if (!s || typeof s !== 'object') continue
-        const o = s as Record<string, unknown>
-        if (
-          typeof o.slug === 'string' &&
-          SLUG_RE.test(o.slug) &&
-          typeof o.rawSkillMd === 'string' &&
-          typeof o.artifactHash === 'string' &&
-          typeof o.version === 'string'
-        ) {
-          out.push({
-            slug: o.slug,
-            version: o.version,
-            rawSkillMd: o.rawSkillMd,
-            artifactHash: o.artifactHash,
-          })
+      const data = (await res.json()) as { skills?: unknown; agents?: unknown }
+      const skills: SyncSkill[] = []
+      if (Array.isArray(data.skills)) {
+        for (const s of data.skills) {
+          if (!s || typeof s !== 'object') continue
+          const o = s as Record<string, unknown>
+          if (
+            typeof o.slug === 'string' &&
+            SLUG_RE.test(o.slug) &&
+            typeof o.rawSkillMd === 'string' &&
+            typeof o.artifactHash === 'string' &&
+            typeof o.version === 'string'
+          ) {
+            skills.push({
+              slug: o.slug,
+              version: o.version,
+              rawSkillMd: o.rawSkillMd,
+              artifactHash: o.artifactHash,
+            })
+          }
         }
       }
-      return out
+      const agents: SyncAgent[] = []
+      if (Array.isArray(data.agents)) {
+        for (const a of data.agents) {
+          if (!a || typeof a !== 'object') continue
+          const o = a as Record<string, unknown>
+          if (
+            typeof o.slug === 'string' &&
+            SLUG_RE.test(o.slug) &&
+            typeof o.rawManifest === 'string' &&
+            typeof o.artifactHash === 'string' &&
+            typeof o.version === 'string'
+          ) {
+            agents.push({
+              slug: o.slug,
+              version: o.version,
+              rawManifest: o.rawManifest,
+              artifactHash: o.artifactHash,
+            })
+          }
+        }
+      }
+      return { skills, agents }
     } finally {
       clearTimeout(timer)
     }
@@ -75,22 +116,8 @@ async function fetchInstalled(
   }
 }
 
-/**
- * Reconcile the hub/skills dir against the user's installed marketplace skills.
- *
- * `timeoutMs` bounds the master fetch — callers on a latency-sensitive path
- * (the runner's pre-prompt sync) pass a small value so a slow/unreachable master
- * never stalls a new session; the background mcp-memory startup hook uses the
- * default.
- */
-export async function syncMarketplaceHub(opts?: { timeoutMs?: number }): Promise<void> {
-  const base = process.env.OPENCLAUDE_V3_MASTER_BASE_URL?.trim()
-  const token = process.env.OPENCLAUDE_V3_CONTAINER_TOKEN?.trim()
-  if (!base || !token) return // not a v3 commercial container → nothing to sync
-
-  const installed = await fetchInstalled(base, token, opts?.timeoutMs ?? 8000)
-  if (installed === null) return // fetch failed → leave hub as-is
-
+/** Reconcile hub/skills against the user's installed marketplace skills. */
+async function reconcileSkills(installed: SyncSkill[]): Promise<void> {
   const skillsRoot = join(paths.hubDir, 'skills')
   try {
     await mkdir(skillsRoot, { recursive: true })
@@ -98,11 +125,7 @@ export async function syncMarketplaceHub(opts?: { timeoutMs?: number }): Promise
     return
   }
 
-  // Independently re-verify the artifact hash here — do NOT trust master's
-  // rawSkillMd blindly. The container recomputes sha256 with the one shared
-  // normalization (marketplaceArtifactHash) and drops any skill whose content
-  // doesn't match its pinned hash, so a tampered/diverged artifact is treated as
-  // not-installed (and removed below if a stale copy exists on disk).
+  // Independently re-verify the artifact hash — do NOT trust master's content.
   const desired = new Map<string, SyncSkill>()
   for (const s of installed) {
     if (marketplaceArtifactHash(s.rawSkillMd) !== s.artifactHash) continue
@@ -113,17 +136,15 @@ export async function syncMarketplaceHub(opts?: { timeoutMs?: number }): Promise
   for (const s of desired.values()) {
     try {
       const skillDir = paths.hubSkillDir(s.slug)
-      // Never write through a symlink: if the slug dir was replaced with one,
-      // skip it (fail-soft) rather than letting a write escape the hub root.
       const st = await lstat(skillDir).catch(() => null)
       if (st?.isSymbolicLink()) continue
       const mdPath = paths.hubSkillMd(s.slug)
       const cur = await readFile(mdPath, 'utf8').catch(() => null)
-      if (cur === s.rawSkillMd) continue // already in sync
+      if (cur === s.rawSkillMd) continue
       await mkdir(skillDir, { recursive: true })
-      const tmp = `${mdPath}.tmp-${process.pid}`
+      const tmp = `${mdPath}.tmp-${process.pid}-${randomSuffix()}`
       await writeFile(tmp, s.rawSkillMd, 'utf8')
-      await rename(tmp, mdPath) // atomic on same fs
+      await rename(tmp, mdPath)
     } catch {
       /* skip this one; fail-soft */
     }
@@ -134,7 +155,7 @@ export async function syncMarketplaceHub(opts?: { timeoutMs?: number }): Promise
     const existing = await readdir(skillsRoot, { withFileTypes: true })
     for (const e of existing) {
       if (!e.isDirectory()) continue
-      if (!SLUG_RE.test(e.name)) continue // never touch anything that isn't a valid slug dir
+      if (!SLUG_RE.test(e.name)) continue
       if (!desired.has(e.name)) {
         await rm(join(skillsRoot, e.name), { recursive: true, force: true }).catch(() => {})
       }
@@ -142,4 +163,101 @@ export async function syncMarketplaceHub(opts?: { timeoutMs?: number }): Promise
   } catch {
     /* leave as-is */
   }
+}
+
+/** Build a deterministic (stable-key) AgentDef for a marketplace agent. */
+function marketAgentDef(slug: string, m: Record<string, unknown>, personaPath: string): AgentDef {
+  const def: AgentDef = { id: slug, source: 'marketplace', persona: personaPath }
+  if (typeof m.version === 'string') def.version = m.version
+  if (typeof m.model === 'string') def.model = m.model
+  if (Array.isArray(m.toolsets)) def.toolsets = m.toolsets.filter((t) => typeof t === 'string')
+  if (typeof m.displayName === 'string') def.displayName = m.displayName
+  if (typeof m.avatarEmoji === 'string') def.avatarEmoji = m.avatarEmoji
+  if (typeof m.greeting === 'string') def.greeting = m.greeting
+  return def
+}
+
+/** Reconcile agents.yaml (source:'marketplace' entries) + persona files. */
+async function reconcileAgents(installed: SyncAgent[]): Promise<void> {
+  // hash-verify + parse manifests
+  const desired = new Map<string, Record<string, unknown>>()
+  for (const a of installed) {
+    if (!SLUG_RE.test(a.slug)) continue
+    if (marketplaceArtifactHash(a.rawManifest) !== a.artifactHash) continue
+    try {
+      const m = JSON.parse(a.rawManifest)
+      if (m && typeof m === 'object' && !Array.isArray(m)) {
+        ;(m as Record<string, unknown>).version = a.version
+        desired.set(a.slug, m as Record<string, unknown>)
+      }
+    } catch {
+      /* skip malformed */
+    }
+  }
+
+  let cfg: AgentsConfig
+  try {
+    cfg = await readAgentsConfig()
+  } catch {
+    return // can't read → leave as-is
+  }
+
+  // keep platform/user agents (no source marker); their ids are RESERVED — a market
+  // agent that collides with one is skipped (never overwrite a platform/user agent's
+  // persona or shadow it in agents.yaml). 'main' is always reserved.
+  const nonMarket = (cfg.agents ?? []).filter((a) => a.source !== 'marketplace')
+  const reservedIds = new Set<string>(['main', ...nonMarket.map((a) => a.id)])
+
+  // write persona files (conditional) + build market defs
+  const marketDefs: AgentDef[] = []
+  for (const [slug, m] of desired) {
+    if (reservedIds.has(slug)) continue // collision with a platform/user agent → skip
+    try {
+      const personaPath = paths.agentClaudeMd(slug)
+      const personaText = typeof m.persona === 'string' ? m.persona : ''
+      const cur = await readFile(personaPath, 'utf8').catch(() => null)
+      if (cur !== personaText) {
+        await mkdir(dirname(personaPath), { recursive: true })
+        const tmp = `${personaPath}.tmp-${process.pid}-${randomSuffix()}`
+        await writeFile(tmp, personaText, 'utf8')
+        await rename(tmp, personaPath)
+      }
+      marketDefs.push(marketAgentDef(slug, m, personaPath))
+    } catch {
+      /* skip this agent; fail-soft */
+    }
+  }
+
+  const nextAgents = [...nonMarket, ...marketDefs.sort((a, b) => a.id.localeCompare(b.id))]
+
+  // only rewrite when the agent set actually changed (avoid mtime churn / write races)
+  if (JSON.stringify(nextAgents) !== JSON.stringify(cfg.agents ?? [])) {
+    try {
+      await writeAgentsConfig({ ...cfg, agents: nextAgents })
+    } catch {
+      /* fail-soft */
+    }
+  }
+  // (A removed market agent's persona dir is left on disk — harmless: it is no
+  //  longer referenced by agents.yaml, so it is never loaded. We do NOT reap dirs
+  //  to avoid any risk of deleting a platform/user agent's files.)
+}
+
+/**
+ * Reconcile the container's marketplace state (skills + agents).
+ *
+ * `timeoutMs` bounds the master fetch — latency-sensitive callers (runner
+ * pre-prompt / agent resolution) pass a small value; the background mcp-memory
+ * startup hook uses the default.
+ */
+export async function syncMarketplaceHub(opts?: { timeoutMs?: number }): Promise<void> {
+  const base = process.env.OPENCLAUDE_V3_MASTER_BASE_URL?.trim()
+  const token = process.env.OPENCLAUDE_V3_CONTAINER_TOKEN?.trim()
+  if (!base || !token) return // not a commercial container → nothing to sync
+
+  const installed = await fetchInstalled(base, token, opts?.timeoutMs ?? 8000)
+  if (installed === null) return // fetch failed → leave everything as-is
+
+  await reconcileSkills(installed.skills)
+  await reconcileAgents(installed.agents)
 }

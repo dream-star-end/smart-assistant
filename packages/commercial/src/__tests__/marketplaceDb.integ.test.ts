@@ -25,8 +25,10 @@ import { runMigrations } from '../db/migrate.js'
 import { query } from '../db/queries.js'
 import {
   MarketplaceError,
+  getApprovedSkillVersions,
   getListingDetail,
   installApprovedVersion,
+  listActiveInstalledAgents,
   listActiveInstalledArtifacts,
   listApprovedForSearch,
   listInstalled,
@@ -278,13 +280,31 @@ describe('marketplaceDb (integ)', () => {
       'KIND_MISMATCH',
     )
 
-    // M2 fail-closed: an approved agent is NOT installable yet (no delivery path
-    // until M3) — install must reject it rather than record an undeliverable install.
-    const installer = await createUser('m2installer@x.com')
-    await expectMarketplaceError(
-      () => installApprovedVersion({ userId: installer, versionId: a.versionId }),
-      'NOT_INSTALLABLE',
-    )
+    // M3: an approved agent IS installable; it surfaces via listActiveInstalledAgents
+    // and is kind-scoped OUT of the skill sync feed.
+    const installer = await createUser('m3installer@x.com')
+    const inst = await installApprovedVersion({ userId: installer, versionId: a.versionId })
+    assert.equal(inst.slug, 'm2-agent')
+    const installedAgents = await listActiveInstalledAgents(installer)
+    assert.equal(installedAgents.length, 1)
+    assert.equal(installedAgents[0].slug, 'm2-agent')
+    assert.ok(installedAgents[0].rawManifest.includes('"model"'))
+    const skillFeed = await listActiveInstalledArtifacts(installer)
+    assert.ok(!skillFeed.some((s) => s.slug === 'm2-agent'), 'agent must not leak into skill feed')
+  })
+
+  test('M3: getApprovedSkillVersions resolves approved skill slugs (for agent skillDeps)', async (t) => {
+    if (skipIfNoPg(t)) return
+    const owner = await createUser('m3deps@x.com')
+    const admin = await createUser('m3depsadmin@x.com')
+    const ok = await publishSkillVersion(buildPublish('dep-skill', owner))
+    await reviewVersion({ versionId: ok.versionId, reviewerUserId: admin, approve: true })
+    const pendingOnly = await publishSkillVersion(buildPublish('dep-pending', owner))
+    void pendingOnly // left pending → must NOT resolve
+    const map = await getApprovedSkillVersions(['dep-skill', 'dep-pending', 'nonexistent'])
+    assert.ok(map.has('dep-skill'))
+    assert.ok(!map.has('dep-pending'))
+    assert.ok(!map.has('nonexistent'))
   })
 
   test('cannot re-review a non-pending version', async (t) => {

@@ -1,4 +1,4 @@
-import { mkdir, readFile, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
 import { dirname } from 'node:path'
 import { parse as parseYaml, stringify as stringifyYaml } from 'yaml'
 import { paths } from './paths.js'
@@ -158,6 +158,11 @@ export interface AgentDef {
   provider?: string // 覆盖全局 config.provider (如 "minimax", "anthropic", "deepseek")
   mcpServers?: McpServerConfig[] // agent 专属 MCP servers (合并到系统共享工具之上)
   updatedAt?: string // ISO timestamp of last config change
+  // Provenance marker. 'marketplace' = installed from the AI market and managed by
+  // the container pull-sync (added/updated/removed automatically); absent =
+  // platform/user-authored (the sync never touches these). Used by the agents.yaml
+  // reconcile to scope its add/remove to market-managed entries only.
+  source?: 'marketplace'
   // Codex runner mode: 'exec' = legacy per-turn `codex exec` spawn (default);
   // 'app-server' = long-lived `codex app-server --listen stdio://` JSON-RPC
   // process with token-streaming via item/agentMessage/delta. Only meaningful
@@ -216,5 +221,10 @@ export async function readAgentsConfig(): Promise<AgentsConfig> {
 
 export async function writeAgentsConfig(cfg: AgentsConfig): Promise<void> {
   await mkdir(dirname(paths.agentsYaml), { recursive: true })
-  await writeFile(paths.agentsYaml, stringifyYaml(cfg), { mode: 0o600 })
+  // Atomic temp+rename: the in-container marketplace sync (mcp-memory process) and
+  // the gateway can both write agents.yaml; a torn read would break agent
+  // resolution. rename is atomic on the same fs → readers always see a whole file.
+  const tmp = `${paths.agentsYaml}.tmp-${process.pid}-${Math.random().toString(36).slice(2, 10)}`
+  await writeFile(tmp, stringifyYaml(cfg), { mode: 0o600 })
+  await rename(tmp, paths.agentsYaml)
 }

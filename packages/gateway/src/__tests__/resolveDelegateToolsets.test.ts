@@ -1,6 +1,6 @@
 import * as assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
-import { resolveDelegateToolsets } from '../toolsetIntent.js'
+import { capMarketplaceToolsets, resolveDelegateToolsets } from '../toolsetIntent.js'
 
 // Mirrors the in-container config the entrypoint ensures: core (empty marker) +
 // browser + research/web_context toolset definitions.
@@ -100,5 +100,80 @@ describe('resolveDelegateToolsets', () => {
     const member: any = { id: 'researcher', toolsets: ['core'] }
     resolveDelegateToolsets(member, config, ['research'], '打开网页 https://example.com')
     assert.deepEqual(member.toolsets, ['core'], 'member.toolsets must stay unchanged')
+  })
+})
+
+describe('resolveDelegateToolsets — caller cap (RFC D2.7 / Codex BLOCKER#2)', () => {
+  it('caps the delegated toolsets to the caller effective set (intersection)', () => {
+    // Caller only has ['core']; even though intent (browser) + request (research)
+    // would expand the sub-agent, it is capped to what the caller itself has.
+    const out = resolveDelegateToolsets(
+      coreMember,
+      config,
+      ['research'],
+      '打开网页 https://example.com 并点击登录',
+      ['core'],
+    )
+    assert.deepEqual(out, ['core'])
+  })
+
+  it('lets a caller grant a toolset it also has', () => {
+    assert.deepEqual(
+      resolveDelegateToolsets(coreMember, config, ['research'], '搜集资料', ['core', 'research']),
+      ['core', 'research'],
+    )
+  })
+
+  it('does NOT cap when the caller is unrestricted (undefined = trusted platform default)', () => {
+    assert.deepEqual(
+      resolveDelegateToolsets(
+        coreMember,
+        config,
+        ['research'],
+        '打开网页 https://example.com',
+        undefined,
+      ),
+      ['core', 'browser', 'research'],
+    )
+  })
+
+  it('caps a no-baseline sub-agent to the caller set instead of mounting all (no bypass)', () => {
+    // A capped caller must not be able to escalate by delegating to a no-toolset
+    // sub-agent (which would otherwise return undefined = "mount all").
+    const noToolsetSub: any = { id: 'x' }
+    const noDefaults: any = { toolsets: config.toolsets }
+    assert.deepEqual(
+      resolveDelegateToolsets(noToolsetSub, noDefaults, ['browser'], 'x', ['core']),
+      ['core'],
+    )
+  })
+
+  it('caps to empty when the caller and sub-agent share nothing', () => {
+    // Caller has only ['research']; sub-agent core + browser-by-intent → ∩ research = []
+    assert.deepEqual(
+      resolveDelegateToolsets(coreMember, config, ['browser'], '打开网页 https://x.com', [
+        'research',
+      ]),
+      [],
+    )
+  })
+})
+
+describe('capMarketplaceToolsets — agent self-path ceiling (RFC D2)', () => {
+  it('caps a marketplace agent core-only intent-expansion back to its manifest toolsets', () => {
+    // The normal message path would expand ['core'] → ['core','browser'] on a URL,
+    // but a marketplace agent must stay within its declared manifest toolsets.
+    assert.deepEqual(capMarketplaceToolsets('marketplace', ['core'], ['core', 'browser']), ['core'])
+  })
+
+  it('does NOT cap a platform/user agent (no source marker)', () => {
+    assert.deepEqual(capMarketplaceToolsets(undefined, ['core'], ['core', 'browser']), [
+      'core',
+      'browser',
+    ])
+  })
+
+  it('bounds a marketplace agent even if effective is undefined (mount-all)', () => {
+    assert.deepEqual(capMarketplaceToolsets('marketplace', ['core'], undefined), ['core'])
   })
 })

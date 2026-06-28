@@ -15,8 +15,10 @@ import { requireAuth } from '../http/auth.js'
 import { HttpError, readJsonBody, sendJson } from '../http/util.js'
 import {
   MarketplaceError,
+  getApprovedSkillVersions,
   getListingDetail,
   installApprovedVersion,
+  listActiveInstalledAgents,
   listInstalled,
   listPendingVersions,
   publishSkillVersion,
@@ -24,6 +26,11 @@ import {
   reviewVersion,
   revokeListing,
 } from './marketplaceDb.js'
+import {
+  VETTED_AGENT_TOOLSETS,
+  canonicalizeAgentManifest,
+  validateAgentManifest,
+} from './agentManifest.js'
 import { scanSkillArtifact } from './skillScanner.js'
 
 const SLUG_RE = /^[a-z0-9][a-z0-9-]{1,63}$/
@@ -156,6 +163,168 @@ export async function handleMarketplacePublish(
   }
 }
 
+// ── POST /api/marketplace/agent/publish ────────────────────────────────────
+// Publish an AGENT artifact. Strict allowlist manifest (no self-MCP / fixed
+// permissionMode / vetted toolsets / inline persona / approved skillDeps) +
+// persona static scan. Owner- and kind-locked, pending review like skills.
+export async function handleMarketplaceAgentPublish(
+  req: IncomingMessage,
+  res: ServerResponse,
+  deps: { jwtSecret: string | Uint8Array; pricing?: { listPublic: () => Array<{ id: string }> } },
+): Promise<void> {
+  const user = await requireAuth(req, deps.jwtSecret)
+  const body = (await readJsonBody(req)) as Record<string, unknown>
+  const slug = asStr(body.slug, 'slug', 64)
+  if (!SLUG_RE.test(slug)) throw new HttpError(400, 'BAD_SLUG', 'slug 须为小写字母数字连字符(2-64)')
+
+  // Allowed models = v5 public model set (gpt-* dropped on the v5 channel).
+  // Fail-closed: if pricing isn't available we cannot enforce model∈public, so we
+  // refuse to publish rather than accept an unvalidated model (matches
+  // handleListPublicModels' 503). Pricing is initialized at startup in production.
+  let publicModels: Array<{ id: string }>
+  try {
+    publicModels = deps.pricing?.listPublic() ?? []
+    if (!deps.pricing) throw new Error('no pricing')
+  } catch {
+    throw new HttpError(503, 'PRICING_UNAVAILABLE', '模型目录暂不可用,请稍后重试')
+  }
+  const allowedModels = new Set<string>()
+  const isV5 = (process.env.OC_RUNTIME_CHANNEL?.trim() || 'v3') === 'v5'
+  for (const m of publicModels) {
+    if (!isV5 || !m.id.toLowerCase().startsWith('gpt-')) allowedModels.add(m.id)
+  }
+
+  const manifestInput: Record<string, unknown> = { ...body }
+  // slug is the listing key, NOT a manifest field — remove the KEY (not just set
+  // undefined) so the strict allowlist validator doesn't reject it as "未知字段".
+  delete manifestInput.slug
+  const result = validateAgentManifest(manifestInput, {
+    vettedToolsets: VETTED_AGENT_TOOLSETS,
+    allowedModels,
+  })
+  if (!result.ok) {
+    sendJson(res, 422, {
+      error: { code: 'INVALID_MANIFEST', message: '智能体配置不合法,请按提示修正' },
+      errors: result.errors,
+    })
+    return
+  }
+  const manifest = result.manifest
+
+  // persona goes through the same static scanner as a skill body (injection/secret/…)
+  const scan = scanSkillArtifact({
+    name: manifest.name,
+    description: manifest.description,
+    tags: manifest.tags,
+    body: manifest.persona,
+  })
+  if (scan.blocked) {
+    sendJson(res, 422, {
+      error: { code: 'SCAN_BLOCKED', message: '发布被静态安全扫描拦截,请修正后重试' },
+      riskFlags: scan.flags,
+    })
+    return
+  }
+
+  // every skillDep must resolve to an approved, active marketplace skill
+  if (manifest.skillDeps.length > 0) {
+    const found = await getApprovedSkillVersions(manifest.skillDeps)
+    const missing = manifest.skillDeps.filter((s) => !found.has(s))
+    if (missing.length > 0) {
+      sendJson(res, 422, {
+        error: {
+          code: 'UNAPPROVED_SKILLDEP',
+          message: `依赖技能未上架或未批准：${missing.join(', ')}`,
+        },
+      })
+      return
+    }
+  }
+
+  const rawArtifact = canonicalizeAgentManifest(manifest)
+  try {
+    const { versionId } = await publishSkillVersion({
+      slug,
+      ownerUserId: uid(user),
+      version: manifest.version,
+      name: manifest.name,
+      description: manifest.description,
+      tags: manifest.tags,
+      rawSkillMd: null,
+      rawArtifact,
+      manifest,
+      kind: 'agent',
+      artifactHash: marketplaceArtifactHash(rawArtifact),
+      embeddingHash: skillContentHash({
+        name: manifest.name,
+        description: manifest.description,
+        tags: manifest.tags,
+      }),
+      riskFlags: scan.flags,
+      policyVersion: scan.policyVersion,
+      submittedBy: uid(user),
+    })
+    sendJson(res, 200, {
+      ok: true,
+      versionId,
+      status: 'pending',
+      riskFlags: scan.flags,
+      note: '已提交,平台审核通过后才会上架并对其他用户可见。',
+    })
+  } catch (e) {
+    throw mapMarketplaceError(e)
+  }
+}
+
+// ── GET /api/marketplace/my-agents ─────────────────────────────────────────
+// Per-user agent list for the picker (B-positioning): the default 全能助手 plus
+// the user's installed marketplace agents. Master-assembled from installs+manifest
+// so the picker is correct immediately, independent of container sync timing.
+// Named under /api/marketplace/* (NOT /api/agents — that is the container-proxied
+// RCE-gated route) so it shares the browser-JWT, no-bridge-allowlist boundary.
+export async function handleMarketplaceMyAgents(
+  req: IncomingMessage,
+  res: ServerResponse,
+  deps: { jwtSecret: string | Uint8Array },
+): Promise<void> {
+  const user = await requireAuth(req, deps.jwtSecret)
+  const installed = await listActiveInstalledAgents(uid(user))
+  const agents = installed.map((a) => {
+    let m: Record<string, unknown> = {}
+    try {
+      m = JSON.parse(a.rawManifest) as Record<string, unknown>
+    } catch {
+      /* corrupt manifest → minimal entry */
+    }
+    return {
+      id: a.slug,
+      slug: a.slug,
+      name: (m.displayName as string) || (m.name as string) || a.slug,
+      description: (m.description as string) ?? '',
+      avatarEmoji: (m.avatarEmoji as string) ?? null,
+      model: (m.model as string) ?? null,
+      version: a.version,
+      installed: true,
+    }
+  })
+  sendJson(res, 200, {
+    agents: [
+      {
+        id: 'main',
+        slug: 'main',
+        name: '全能助手',
+        description: '通用全能智能体,内置工具齐全,可随时加装市场技能。',
+        avatarEmoji: '✨',
+        model: null,
+        version: null,
+        installed: true,
+        isDefault: true,
+      },
+      ...agents,
+    ],
+  })
+}
+
 // ── POST /api/marketplace/install ──────────────────────────────────────────
 // Browser-only (the bridge allowlist excludes marketplace + containers have no
 // user JWT). The user has already seen the full SKILL.md + risk flags in the
@@ -174,11 +343,41 @@ export async function handleMarketplaceInstall(
   if (!/^\d+$/.test(versionId)) throw new HttpError(400, 'BAD_ID', 'invalid versionId')
   try {
     const v = await installApprovedVersion({ userId: uid(user), versionId })
+
+    // Installing an agent pulls in its (already-approved) skill dependencies so the
+    // agent works out of the box. Best-effort + idempotent: a dep already installed
+    // is re-pinned to its current approved version; a failure on one dep never fails
+    // the agent install.
+    let installedDeps = 0
+    const detail = await getListingDetail(v.slug)
+    if (detail?.kind === 'agent') {
+      const deps2 = Array.isArray((detail.manifest as { skillDeps?: unknown })?.skillDeps)
+        ? ((detail.manifest as { skillDeps: unknown[] }).skillDeps.filter(
+            (s) => typeof s === 'string',
+          ) as string[])
+        : []
+      if (deps2.length > 0) {
+        const versions = await getApprovedSkillVersions(deps2)
+        for (const depVid of versions.values()) {
+          try {
+            await installApprovedVersion({ userId: uid(user), versionId: depVid })
+            installedDeps++
+          } catch {
+            /* skip a single failing dep; agent install already recorded */
+          }
+        }
+      }
+    }
+
     sendJson(res, 200, {
       ok: true,
       slug: v.slug,
       version: v.version,
-      note: '已安装,将在你的下一次会话中对 AI 可用。',
+      installedDeps,
+      note:
+        detail?.kind === 'agent'
+          ? `已安装,将在你的下一次会话中可选用${installedDeps ? `（含 ${installedDeps} 个依赖技能）` : ''}。`
+          : '已安装,将在你的下一次会话中对 AI 可用。',
     })
   } catch (e) {
     throw mapMarketplaceError(e)

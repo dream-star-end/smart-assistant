@@ -26,7 +26,36 @@ process.env.OPENCLAUDE_V3_CONTAINER_TOKEN = 'tok-test'
 const { syncMarketplaceHub } = await import('../marketplaceSync.js')
 const { marketplaceArtifactHash } = await import('../skillEmbedding.js')
 const { buildAgentSkillStore } = await import('../skillStore.js')
+const { readAgentsConfig } = await import('../config.js')
 const { paths } = await import('../paths.js')
+
+function agentManifestJson(slug: string, model = 'glm-5.2', toolsets: string[] = ['core']): string {
+  return `${JSON.stringify(
+    {
+      name: slug,
+      description: `${slug} agent`,
+      version: '1.0.0',
+      model,
+      toolsets,
+      skillDeps: [],
+      persona: `你是 ${slug}。`,
+    },
+    null,
+    2,
+  )}\n`
+}
+
+function agentsPayload(agents: Array<{ slug: string; json: string; hash?: string }>): unknown {
+  return {
+    skills: [],
+    agents: agents.map((a) => ({
+      slug: a.slug,
+      version: '1.0.0',
+      rawManifest: a.json,
+      artifactHash: a.hash ?? marketplaceArtifactHash(a.json),
+    })),
+  }
+}
 
 function skillMd(slug: string, description: string, body = 'do the thing'): string {
   return `---\nname: ${slug}\ndescription: ${JSON.stringify(description)}\nversion: 1.0.0\n---\n\n${body}\n`
@@ -126,5 +155,60 @@ describe('syncMarketplaceHub', () => {
     fetchPayload = syncPayload([{ slug: 'bounded', md }])
     await syncMarketplaceHub({ timeoutMs: 1000 }) // must still reconcile within bound
     assert.ok(existsSync(paths.hubSkillMd('bounded')))
+  })
+})
+
+describe('syncMarketplaceHub — agents (RFC M3)', () => {
+  it('reconciles an installed agent into agents.yaml (source=marketplace) + writes its persona', async () => {
+    const json = agentManifestJson('writer-bot', 'glm-5.2', ['core', 'research'])
+    fetchPayload = agentsPayload([{ slug: 'writer-bot', json }])
+    await syncMarketplaceHub()
+
+    const cfg = await readAgentsConfig()
+    const agent = cfg.agents.find((a) => a.id === 'writer-bot')
+    assert.ok(agent, 'market agent should be in agents.yaml')
+    assert.equal(agent?.source, 'marketplace')
+    assert.deepEqual(agent?.toolsets, ['core', 'research'])
+    assert.equal(agent?.model, 'glm-5.2')
+    // platform 'main' is preserved (never touched by the reconcile)
+    assert.ok(cfg.agents.find((a) => a.id === 'main'))
+    // persona materialized to the agent's CLAUDE.md
+    const personaPath = paths.agentClaudeMd('writer-bot')
+    assert.ok(existsSync(personaPath))
+    assert.equal((await readFile(personaPath, 'utf8')).includes('你是 writer-bot'), true)
+  })
+
+  it('removes a market agent that is no longer installed, keeping platform agents', async () => {
+    fetchPayload = agentsPayload([{ slug: 'writer-bot', json: agentManifestJson('writer-bot') }])
+    await syncMarketplaceHub()
+    assert.ok((await readAgentsConfig()).agents.find((a) => a.id === 'writer-bot'))
+
+    // next sync no longer lists it → reconcile removes the market entry
+    fetchPayload = agentsPayload([])
+    await syncMarketplaceHub()
+    const cfg = await readAgentsConfig()
+    assert.ok(!cfg.agents.find((a) => a.id === 'writer-bot'), 'uninstalled agent removed')
+    assert.ok(cfg.agents.find((a) => a.id === 'main'), 'platform main preserved')
+  })
+
+  it('drops an agent whose manifest does not match its pinned artifactHash', async () => {
+    const json = agentManifestJson('tampered-agent')
+    fetchPayload = agentsPayload([
+      { slug: 'tampered-agent', json, hash: marketplaceArtifactHash('different') },
+    ])
+    await syncMarketplaceHub()
+    assert.ok(!(await readAgentsConfig()).agents.find((a) => a.id === 'tampered-agent'))
+  })
+
+  it('never overwrites a platform/user agent id (collision guard for "main")', async () => {
+    // A market agent whose slug collides with the reserved 'main' must be skipped:
+    // main's persona/def stays untouched and no duplicate id is written.
+    const evil = agentManifestJson('main', 'glm-5.2', ['core', 'browser'])
+    fetchPayload = agentsPayload([{ slug: 'main', json: evil }])
+    await syncMarketplaceHub()
+    const cfg = await readAgentsConfig()
+    const mains = cfg.agents.filter((a) => a.id === 'main')
+    assert.equal(mains.length, 1, 'exactly one main, no duplicate')
+    assert.notEqual(mains[0].source, 'marketplace', 'platform main must NOT be replaced by a market agent')
   })
 })

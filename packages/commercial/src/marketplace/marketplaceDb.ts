@@ -365,15 +365,14 @@ export async function installApprovedVersion(args: {
       name: string
       artifact_hash: string
     }>(
-      // M2 fail-closed: only skills are installable until M3 wires agent
-      // install→agents.yaml delivery. (No agent can be published via the API yet,
-      // but this hard-stops a directly-seeded agent from being installed without
-      // a delivery path.) M3 relaxes this + adds the agent applier.
+      // Kind-agnostic install: records the pinned install row for skill OR agent.
+      // Kind-specific delivery happens in the container sync (skill→hub/skills,
+      // agent→agents.yaml). M3 wired the agent delivery path, so both are installable.
       `SELECT v.slug, v.version, v.name, v.artifact_hash
          FROM marketplace_skill_versions v
          JOIN marketplace_skill_listings l ON l.slug = v.slug
         WHERE v.id = $1 AND v.status = 'approved' AND l.state = 'active'
-              AND l.current_approved_version_id = v.id AND l.kind = 'skill'
+              AND l.current_approved_version_id = v.id
         FOR UPDATE OF l`,
       [args.versionId],
       c,
@@ -485,6 +484,63 @@ export async function listActiveInstalledArtifacts(userId: number): Promise<Inst
     rawSkillMd: x.raw_skill_md,
     artifactHash: x.artifact_hash,
   }))
+}
+
+export interface InstalledAgent {
+  slug: string
+  version: string
+  /** Canonical agent manifest JSON (raw_artifact). */
+  rawManifest: string
+  artifactHash: string
+}
+
+/**
+ * Active AGENT installs of a user, with the full manifest, for container-side
+ * agents.yaml reconciliation (the agent analogue of listActiveInstalledArtifacts).
+ * Excludes revoked listings (kill-switch) + requires a non-null raw_artifact.
+ */
+export async function listActiveInstalledAgents(userId: number): Promise<InstalledAgent[]> {
+  const r = await query<{
+    slug: string
+    version: string
+    raw_artifact: string
+    artifact_hash: string
+  }>(
+    `SELECT i.slug, v.version, v.raw_artifact, i.artifact_hash
+       FROM marketplace_installs i
+       JOIN marketplace_skill_versions v ON v.id = i.version_id
+       JOIN marketplace_skill_listings l ON l.slug = i.slug
+      WHERE i.user_id = $1 AND i.uninstalled_at IS NULL AND l.state = 'active'
+            AND l.kind = 'agent' AND v.raw_artifact IS NOT NULL
+            AND i.artifact_hash = v.artifact_hash`,
+    [userId],
+  )
+  return r.rows.map((x) => ({
+    slug: x.slug,
+    version: x.version,
+    rawManifest: x.raw_artifact,
+    artifactHash: x.artifact_hash,
+  }))
+}
+
+/**
+ * For a set of skill slugs, return the current approved version id of each that is
+ * an active, approved SKILL listing. Used to (a) validate an agent's skillDeps all
+ * resolve to approved skills, and (b) auto-install them with the agent.
+ */
+export async function getApprovedSkillVersions(slugs: string[]): Promise<Map<string, string>> {
+  const out = new Map<string, string>()
+  if (slugs.length === 0) return out
+  const r = await query<{ slug: string; vid: string }>(
+    `SELECT l.slug, l.current_approved_version_id::text AS vid
+       FROM marketplace_skill_listings l
+       JOIN marketplace_skill_versions v ON v.id = l.current_approved_version_id
+      WHERE l.slug = ANY($1::text[]) AND l.kind = 'skill'
+            AND l.state = 'active' AND v.status = 'approved'`,
+    [slugs],
+  )
+  for (const row of r.rows) out.set(row.slug, row.vid)
+  return out
 }
 
 /** Kill-switch: revoke a listing. Returns the user_ids with an active install (to notify). */
