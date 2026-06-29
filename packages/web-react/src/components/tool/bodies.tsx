@@ -11,6 +11,7 @@ import { Button } from "../ui";
 import { useToolCardActions } from "./context";
 import { asArr, asStr, clampStr, formatValue, isSafeHttpUrl, shortPath, type ToolLike } from "./format";
 import { parseMcpName } from "./meta";
+import { researchToolCard } from "./researchCards";
 
 type Input = Record<string, unknown> | null;
 type BodyProps = { input: Input; tool: ToolLike };
@@ -124,6 +125,10 @@ function DiffView({ oldStr, newStr }: { oldStr: string; newStr: string }) {
 
 function BashBody({ input, tool }: BodyProps) {
   const command = asStr(input?.command).slice(0, 2000);
+  // oc-* 工具(文献检索/引用核验/…):若命令命中且输出可解析 → 渲染专门卡片,
+  // 而非原始"$ 命令 + JSON"终端块。不认/出错 → 回落下方通用渲染。
+  const ocCard = researchToolCard(command, tool);
+  if (ocCard) return ocCard;
   const out = tool.output;
   // bg-bash 的 tool_result.preview 只是占位文案（"Command running in background…"），
   // 不是真实输出；后台进程的真实 stdout/stderr 走 bashTail。识别占位 → 优先 bashTail。
