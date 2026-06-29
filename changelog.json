@@ -1,6 +1,14 @@
 {
-  "currentVersion": "v1.0.362",
+  "currentVersion": "v1.0.363",
   "releases": [
+    {
+      "version": "v1.0.363",
+      "title": "智能体市场后台维护",
+      "items": [
+        "后台一致性维护:智能体市场的分类隔离与数据库结构升级。不影响你的现有使用与任何功能。"
+      ],
+      "date": "2026-06-29"
+    },
     {
       "version": "v1.0.361",
       "title": "修复「编辑 Agent」「管理 Agents」顶部彩色卡遮住输入框",

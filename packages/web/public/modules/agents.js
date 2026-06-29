@@ -1,9 +1,9 @@
-import { apiGet, apiJson } from './api.js?v=5b7cd4db'
+import { apiGet, apiJson } from './api.js?v=eedf3a6f'
 // OpenClaude — Agents
-import { $, htmlSafeEscape } from './dom.js?v=5b7cd4db'
-import { renderModePills } from './effortMode.js?v=5b7cd4db'
-import { getSession, state } from './state.js?v=5b7cd4db'
-import { closeModal, confirmDialog, openModal, toast, toastOptsFromError } from './ui.js?v=5b7cd4db'
+import { $, htmlSafeEscape } from './dom.js?v=eedf3a6f'
+import { renderModePills } from './effortMode.js?v=eedf3a6f'
+import { getSession, state } from './state.js?v=eedf3a6f'
+import { closeModal, confirmDialog, openModal, toast, toastOptsFromError } from './ui.js?v=eedf3a6f'
 
 // modelPicker.renderModelPill 的 late-binding setter — 避免 modelPicker.js
 // (依赖本模块的 reloadAgents)与本模块互相 import 形成循环。
