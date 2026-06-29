@@ -10,6 +10,7 @@
  * 重建数组（streaming delta 频率极高）。订阅侧靠 `version` 单调递增触发重渲。
  */
 import type { MediaRef } from "./frames";
+import type { EvidenceManifest, SourceRecord } from "@openclaude/protocol/research";
 
 /** 用户消息状态机（派生展示，不持久化 'replied'，§9）。*/
 export type UserMsgStatus = "sending" | "sent" | "queued" | "read" | "replied" | "error";
@@ -80,6 +81,7 @@ export type ChatMessage = {
     | "goal"
     | "permission"
     | "delegate-progress"
+    | "research-report"
     | "system";
   /** 文本内容（user 输入 / assistant 文本 / thinking 文本 / tool 名 / goal objective / plan 摘要…）。*/
   text: string;
@@ -170,6 +172,16 @@ export type ChatMessage = {
   _behavior?: "allow" | "deny";
   _settledReason?: string | null;
   _answers?: Record<string, string>;
+
+  // ── research-report（引用接地结构化产物,artifact 驱动,非裸 markdown）──
+  /** master oc-cite check 输出的已检证据 manifest(claim↔quote↔source + gates）。 */
+  _researchManifest?: EvidenceManifest;
+  /** 文献检索结果(LiteratureLibraryPanel:标题/作者/年/引用数/OA + 导出)。 */
+  _researchLibrary?: SourceRecord[];
+  /** 可选:报告正文 markdown(角标 [N] 由引擎已解析);缺省则从 manifest 渲染 claim 列表。 */
+  _researchReportMd?: string;
+  /** 交付产物(report/slides/bib…)签名 URL。 */
+  _researchArtifacts?: { kind: string; path: string; signedUrl?: string; mime?: string }[];
 };
 
 /**

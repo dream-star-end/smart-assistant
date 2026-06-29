@@ -23,6 +23,7 @@ import {
   UserCard,
 } from "./chat/cards";
 import { AgentGroupCard } from "./chat/AgentGroupCard";
+import { ResearchReportCard } from "./chat/ResearchReportCard";
 import { TeamPanel } from "./chat/TeamPanel";
 import { PermissionCard, type PermissionRespond } from "./chat/PermissionCard";
 import { ToolCardSlot } from "./chat/toolCardSlot";
@@ -58,6 +59,8 @@ export const MessageRenderer = memo(
         return <AgentGroupCard msg={message} />;
       case "delegate-progress":
         return <DelegateProgressCard msg={message} />;
+      case "research-report":
+        return <ResearchReportCard msg={message} />;
       case "system":
         return <SystemCard msg={message} />;
       default:

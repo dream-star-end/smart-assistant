@@ -21,6 +21,7 @@ export type MessageKind =
   | "plan"
   | "permission"
   | "delegate-progress"
+  | "research-report"
   | "system"
   | "unknown";
 
@@ -39,6 +40,7 @@ export function messageKind(m: Pick<ChatMessage, "role">): MessageKind {
     case "plan":
     case "permission":
     case "delegate-progress":
+    case "research-report":
     case "system":
       return m.role;
     default:
@@ -68,6 +70,65 @@ export function childSignature(ch: ChildBlock): string {
     ch.partialJson ? ch.partialJson.length : 0,
     ch.bashTail?.totalBytes ?? 0,
   ].join("|");
+}
+
+/** djb2 字符串 hash(非加密,仅做内容变更探测);输出短、比较廉价。 */
+function djb2(s: string): string {
+  let h = 5381;
+  for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) >>> 0;
+  return h.toString(36);
+}
+
+/**
+ * research-report 渲染相关字段投影(ResearchReportCard 实际读到的全部内容)。
+ * 任意字段变化 → JSON 变化 → 上层 djb2 hash 变化 → 重渲。一次性产物,stringify 成本可接受。
+ */
+function researchProjection(m: ChatMessage): string {
+  const mf = m._researchManifest;
+  return JSON.stringify({
+    t: m.text,
+    md: m._researchReportMd ?? null,
+    mf: mf
+      ? {
+          cov: mf.coverage,
+          g: [
+            mf.gates.quoteFirst.passed,
+            mf.gates.claimBound.passed,
+            mf.gates.identifier.passed,
+            mf.gates.retraction.passed,
+          ],
+          c: mf.claims.map((c) => [c.id, c.status, c.text, c.supports.map((r) => r.quoteId)]),
+          q: mf.quotes.map((q) => [q.id, q.sourceId, q.text]),
+          s: mf.sources.map((s) => [
+            s.id,
+            s.title,
+            s.authors.map((a) => a.name),
+            s.year ?? null,
+            s.venue ?? null,
+            s.doi ?? null,
+            s.identifiersVerified ?? null,
+            s.retracted ?? null,
+            s.oa?.isOA ? s.oa.url ?? "" : null,
+            s.citationCount ?? null,
+          ]),
+        }
+      : null,
+    lib: (m._researchLibrary ?? []).map((s) => [
+      s.id,
+      s.title,
+      s.authors.map((a) => a.name),
+      s.year ?? null,
+      s.venue ?? null,
+      // doi/arxivId:exportLibrary(BibTeX/GB-T7714)依赖,纵不在可见行也须进签名,
+      // 否则"仅修正 DOI/arXiv 元数据"会被 memo-skip,导出陈旧引用。
+      s.doi ?? null,
+      s.arxivId ?? null,
+      s.citationCount ?? null,
+      s.oa?.isOA ?? false,
+      s.retracted ?? null,
+    ]),
+    art: (m._researchArtifacts ?? []).map((a) => [a.kind, a.path, a.signedUrl ?? null, a.mime ?? null]),
+  });
 }
 
 /**
@@ -148,6 +209,11 @@ export function messageSignature(
         m._delegate ? 1 : 0,
         (m.childBlocks ?? []).map(childSignature).join(";"),
       ].join("|");
+    case "research-report":
+      // research-report 是一次性结构化产物(非逐 token 流式),但 reducer 可能就地 mutate
+      // 同一对象。用「渲染相关字段投影」的内容 hash 做签名:**任意**内容变化(含同长文本、
+      // sourceId/DOI/OA/撤稿/库条目/产物 URL 改动)都会改变 hash → 不漏渲;hash 长度有界。
+      return [head, djb2(researchProjection(m))].join("|");
     case "delegate-progress":
       return [
         head,
