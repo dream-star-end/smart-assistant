@@ -282,6 +282,10 @@ export const V3_CCB_BASELINE_SKILL_NAMES = [
   "oc-cite",
   "oc-ingest",
   "oc-litrag",
+  "research-report",
+  "scientific-writing",
+  "scientific-figures",
+  "research-slides",
 ] as const;
 
 /**

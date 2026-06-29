@@ -9,7 +9,15 @@
  * 全 CSL 覆盖(citeproc-js + zotero-chinese)留 P1.5 升级(见 IMPLEMENTATION_PLAN §5)。
  */
 
-import type { CitationVerdict, SourceRecord } from "@openclaude/protocol/research";
+import {
+  type CitationStyle,
+  type CitationVerdict,
+  type SourceRecord,
+  formatApa,
+  formatBibtex,
+  formatCitation,
+  formatGbt7714,
+} from "@openclaude/protocol/research";
 import {
   type FetchLike,
   normalizeArxivId,
@@ -228,68 +236,10 @@ export async function verifyIdentifiers(raws: string[], deps: CiteDeps): Promise
 }
 
 // ───────────────────────────────────────────────
-// 格式化
+// 格式化(单一权威在 @openclaude/protocol/research,master 与容器 oc-report 共用)
 // ───────────────────────────────────────────────
 
-function asciiKey(rec: SourceRecord): string {
-  const surname = rec.authors[0]?.name?.split(/\s+/).pop() ?? "anon";
-  const ascii = surname.replace(/[^A-Za-z]/g, "") || "ref";
-  return `${ascii.toLowerCase()}${rec.year ?? ""}`;
-}
-
-/** BibTeX。type 按 crossrefType/arXiv 粗映射。 */
-export function formatBibtex(rec: SourceRecord): string {
-  const type = rec.arxivId && !rec.doi ? "misc" : "article";
-  const fields: string[] = [];
-  fields.push(`  title = {${rec.title}}`);
-  if (rec.authors.length) fields.push(`  author = {${rec.authors.map((a) => a.name).join(" and ")}}`);
-  if (rec.venue) fields.push(`  journal = {${rec.venue}}`);
-  if (rec.year) fields.push(`  year = {${rec.year}}`);
-  if (rec.doi) fields.push(`  doi = {${rec.doi}}`);
-  if (rec.arxivId) fields.push(`  eprint = {${rec.arxivId}}`);
-  return `@${type}{${asciiKey(rec)},\n${fields.join(",\n")}\n}`;
-}
-
-/** 作者列表(GB/T 7714:超 3 人取前 3 + 等)。 */
-function gbtAuthors(rec: SourceRecord): string {
-  const names = rec.authors.map((a) => a.name);
-  if (names.length === 0) return "佚名";
-  if (names.length <= 3) return names.join(", ");
-  return `${names.slice(0, 3).join(", ")}, 等`;
-}
-
-/**
- * GB/T 7714-2015。覆盖常见类型:期刊[J] / 预印本(arXiv,[J/OL] 在线)/ 其它默认 [J]。
- * 形如:作者. 题名[J]. 刊名, 年. DOI: ...
- */
-export function formatGbt7714(rec: SourceRecord): string {
-  const authors = gbtAuthors(rec);
-  if (rec.arxivId && !rec.doi) {
-    // 预印本(电子文献/在线)
-    return `${authors}. ${rec.title}[J/OL]. arXiv, ${rec.year ?? ""}. https://arxiv.org/abs/${rec.arxivId}.`.replace(
-      /,\s*\./,
-      ".",
-    );
-  }
-  const parts = [`${authors}. ${rec.title}[J].`];
-  if (rec.venue) parts.push(` ${rec.venue},`);
-  if (rec.year) parts.push(` ${rec.year}.`);
-  if (rec.doi) parts.push(` DOI: ${rec.doi}.`);
-  return parts.join("").replace(/,\s*\./g, ".").trim();
-}
-
-/** APA(7th,简化)。 */
-export function formatApa(rec: SourceRecord): string {
-  const authors = rec.authors.map((a) => a.name).join(", ");
-  const year = rec.year ? `(${rec.year}). ` : "";
-  const venue = rec.venue ? ` ${rec.venue}.` : "";
-  const doi = rec.doi ? ` https://doi.org/${rec.doi}` : rec.arxivId ? ` https://arxiv.org/abs/${rec.arxivId}` : "";
-  return `${authors} ${year}${rec.title}.${venue}${doi}`.trim();
-}
-
 /** 仅格式化(已知 record),供 oc-cite format 子命令复用。 */
-export function formatRecord(rec: SourceRecord, style: "bibtex" | "gb-t-7714-2015" | "apa"): string {
-  if (style === "bibtex") return formatBibtex(rec);
-  if (style === "apa") return formatApa(rec);
-  return formatGbt7714(rec);
+export function formatRecord(rec: SourceRecord, style: CitationStyle): string {
+  return formatCitation(rec, style);
 }

@@ -23,14 +23,13 @@ import {
   dedupKey,
   searchMultiSource,
 } from "../research/litSearch.js";
+import { parseIdentifier, verifyIdentifier } from "../research/cite.js";
 import {
+  type SourceRecord,
   formatApa,
   formatBibtex,
   formatGbt7714,
-  parseIdentifier,
-  verifyIdentifier,
-} from "../research/cite.js";
-import type { SourceRecord } from "@openclaude/protocol/research";
+} from "@openclaude/protocol/research";
 
 // ── mock fetch helper ────────────────────────────────────────────────
 

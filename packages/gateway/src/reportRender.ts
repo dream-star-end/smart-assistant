@@ -1,0 +1,160 @@
+/**
+ * 确定性报告文档构建(oc-report 用)。
+ *
+ * 方案原则:章节/编号/交叉引用/参考文献由**引擎**保证,LLM 不碰排版。输入 ReportSchema
+ * (LLM 产的结构)+ master 已检 EvidenceManifest(canonical quote + master 铸造 status),
+ * 输出 Quarto/pandoc 兼容 markdown:
+ *   - 正文 [[claim:<id>]] 占位 → 按引用顺序编号 [N];verified claim 用其支撑文献编号;
+ *     **unsupported/unchecked claim 红标(不给假编号)** —— fail-closed 渲染。
+ *   - 参考文献按引用顺序编号,GB/T7714/APA/BibTeX 由 protocol 单一格式化器渲染。
+ *   - 图表只 embed 路径(SciencePlots 出图,禁生成式插画,见 scientific-figures skill)。
+ *
+ * 纯函数,无 I/O,便于单测;oc-report CLI 负责写文件 + 调 quarto/pandoc。
+ */
+
+import { type EvidenceManifest, type ReportSchema, formatCitation } from "@openclaude/protocol/research";
+
+export interface BuildReportResult {
+  markdown: string;
+  /** 参考文献(按引用顺序,已编号 + 格式化)。 */
+  references: string[];
+  warnings: string[];
+  stats: { sections: number; citations: number; redFlags: number; figures: number };
+}
+
+const CLAIM_MARK_RE = /\[\[claim:([^\]]+)\]\]/g;
+
+export function buildReportDocument(schema: ReportSchema, manifest: EvidenceManifest): BuildReportResult {
+  const warnings: string[] = [];
+  const claimById = new Map(manifest.claims.map((c) => [c.id, c]));
+  const quoteSourceId = new Map(manifest.quotes.map((q) => [q.id, q.sourceId]));
+  const sourceById = new Map(manifest.sources.map((s) => [s.id, s]));
+
+  // 引用顺序编号:sourceId → [N]
+  const refOrder: string[] = [];
+  const refNum = new Map<string, number>();
+  const numberFor = (sourceId: string): number => {
+    const existing = refNum.get(sourceId);
+    if (existing) return existing;
+    refOrder.push(sourceId);
+    const n = refOrder.length;
+    refNum.set(sourceId, n);
+    return n;
+  };
+
+  let redFlags = 0;
+  let citations = 0;
+
+  /** 解析单个 [[claim:id]] 占位 → 编号角标 / 红标。 */
+  const resolveClaim = (claimId: string): string => {
+    const claim = claimById.get(claimId);
+    if (!claim) {
+      redFlags++;
+      warnings.push(`claim ${claimId} 不在 manifest 中`);
+      return "**[未核查:claim 缺失]**";
+    }
+    if (claim.status !== "verified") {
+      redFlags++;
+      warnings.push(`claim ${claimId} 状态=${claim.status},正文以红标呈现(未给引用编号)`);
+      return claim.status === "unsupported" ? "**[未核查:无可信引用]**" : "**[未核查]**";
+    }
+    // verified:取支撑 quote 的来源编号(去重,保序)
+    const nums: number[] = [];
+    for (const ref of claim.supports) {
+      const sid = quoteSourceId.get(ref.quoteId);
+      if (sid && sourceById.has(sid)) {
+        const n = numberFor(sid);
+        if (!nums.includes(n)) nums.push(n);
+      }
+    }
+    if (nums.length === 0) {
+      redFlags++;
+      return "**[未核查]**";
+    }
+    citations++;
+    return `[${nums.sort((a, b) => a - b).join(",")}]`;
+  };
+
+  // ── 组装正文 ────────────────────────────────────────────────────
+  const lines: string[] = [];
+  // Quarto YAML frontmatter
+  lines.push("---");
+  lines.push(`title: "${escapeYaml(schema.title)}"`);
+  lines.push("lang: zh");
+  lines.push("number-sections: true");
+  lines.push("---");
+  lines.push("");
+  if (schema.abstract?.trim()) {
+    lines.push("## 摘要");
+    lines.push("");
+    lines.push(resolveBody(schema.abstract, resolveClaim));
+    lines.push("");
+  }
+
+  for (const section of schema.sections) {
+    const level = Math.min(Math.max(section.level, 1), 6);
+    lines.push(`${"#".repeat(level)} ${section.heading}`);
+    lines.push("");
+    lines.push(resolveBody(section.bodyMd, resolveClaim));
+    lines.push("");
+  }
+
+  // ── 图表(只 embed 路径;禁生成式插画由 skill 约束) ─────────────────
+  for (const fig of schema.figures) {
+    lines.push(`![${escapeMd(fig.caption)}](${fig.path}){#fig-${fig.id}}`);
+    lines.push("");
+  }
+
+  // ── 参考文献(按引用顺序编号 + 格式化) ────────────────────────────
+  const references: string[] = [];
+  if (refOrder.length > 0) {
+    lines.push("## 参考文献");
+    lines.push("");
+    refOrder.forEach((sid, i) => {
+      const src = sourceById.get(sid);
+      const formatted = src ? formatCitation(src, schema.csl) : `(来源 ${sid} 缺失)`;
+      const line = `${i + 1}. ${formatted}`;
+      references.push(line);
+      lines.push(line);
+    });
+    lines.push("");
+  }
+
+  // 覆盖率提示(诚实呈现接地比例)
+  const { verifiedClaims, totalClaims } = manifest.coverage;
+  if (totalClaims > 0 && verifiedClaims < totalClaims) {
+    warnings.push(`接地覆盖率 ${verifiedClaims}/${totalClaims};${totalClaims - verifiedClaims} 条论断未核查(已红标)`);
+  }
+
+  return {
+    markdown: lines.join("\n"),
+    references,
+    warnings,
+    stats: { sections: schema.sections.length, citations, redFlags, figures: schema.figures.length },
+  };
+}
+
+function resolveBody(body: string, resolveClaim: (id: string) => string): string {
+  return body.replace(CLAIM_MARK_RE, (_m, id: string) => resolveClaim(id.trim()));
+}
+
+function escapeYaml(s: string): string {
+  return s.replace(/"/g, '\\"');
+}
+
+function escapeMd(s: string): string {
+  return s.replace(/([[\]])/g, "\\$1");
+}
+
+/** 仅供测试/校验:列出 schema 引用了但 manifest 缺失的 claim。 */
+export function missingClaimRefs(schema: ReportSchema, manifest: EvidenceManifest): string[] {
+  const have = new Set(manifest.claims.map((c) => c.id));
+  const missing = new Set<string>();
+  for (const sec of schema.sections) {
+    for (const m of sec.bodyMd.matchAll(CLAIM_MARK_RE)) {
+      const id = m[1].trim();
+      if (!have.has(id)) missing.add(id);
+    }
+  }
+  return [...missing];
+}

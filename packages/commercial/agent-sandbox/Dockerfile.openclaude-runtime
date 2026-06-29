@@ -99,6 +99,11 @@ RUN python3 -m pip install --break-system-packages --no-cache-dir \
       'scansci-pdf[fast,vpnsci]==1.3.1' \
     && scansci-pdf check
 
+# 科研出版级图表:matplotlib + SciencePlots(Nature/IEEE 样式)+ pandas/numpy。
+# scientist agent 出图用(scientific-figures skill);**禁生成式插画**,统一确定性出图。
+RUN python3 -m pip install --break-system-packages --no-cache-dir \
+      matplotlib SciencePlots numpy pandas
+
 # Generic web/document context extraction MCP dependencies.
 #
 # Keep Crawl4AI / Trafilatura / MarkItDown in separate venvs: current
@@ -167,8 +172,10 @@ COPY --chown=root:root ./runtime/oc-lit.sh /usr/local/bin/oc-lit
 COPY --chown=root:root ./runtime/oc-cite.sh /usr/local/bin/oc-cite
 COPY --chown=root:root ./runtime/oc-ingest.sh /usr/local/bin/oc-ingest
 COPY --chown=root:root ./runtime/oc-litrag.sh /usr/local/bin/oc-litrag
+# oc-report: 确定性报告渲染(ReportSchema + 已检 manifest → Quarto/pandoc),文档见 research-report skill。
+COPY --chown=root:root ./runtime/oc-report.sh /usr/local/bin/oc-report
 RUN set -eux; \
-    chmod 0755 /usr/local/bin/oc-docx /usr/local/bin/oc-minimax /usr/local/bin/oc-web-context /usr/local/bin/oc-web /usr/local/bin/oc-browser /usr/local/bin/oc-market /usr/local/bin/oc-lit /usr/local/bin/oc-cite /usr/local/bin/oc-ingest /usr/local/bin/oc-litrag /usr/local/lib/openclaude/create-docgen-reference.py; \
+    chmod 0755 /usr/local/bin/oc-docx /usr/local/bin/oc-minimax /usr/local/bin/oc-web-context /usr/local/bin/oc-web /usr/local/bin/oc-browser /usr/local/bin/oc-market /usr/local/bin/oc-lit /usr/local/bin/oc-cite /usr/local/bin/oc-ingest /usr/local/bin/oc-litrag /usr/local/bin/oc-report /usr/local/lib/openclaude/create-docgen-reference.py; \
     ln -sf /usr/local/bin/oc-minimax /usr/local/bin/mmx; \
     python3 /usr/local/lib/openclaude/create-docgen-reference.py /usr/local/share/openclaude-docgen/reference.docx; \
     printf '%s\n' '# DOCX smoke' 'Inline $a^2+b^2=c^2$.' '' '$$' 'E = mc^2' '$$' > /tmp/oc-docx-smoke.md; \
