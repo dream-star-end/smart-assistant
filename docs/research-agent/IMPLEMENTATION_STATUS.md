@@ -27,14 +27,24 @@
 - **MiniCheck 蕴含(闸⑤)**:✅ 架构已落(config-gated,见下);MVP 默认 backend=off(无模型时优雅跳过),配 endpoint 即生效。
 - **async durable worker**:proxy inline 覆盖 MVP(local 引擎秒级);大库/GPU 引擎入队待 MinerU 落地(基建已就绪)。
 
-## 路线图(plan §12 后续 Phase)
+## 路线图(plan §12)— 已基本全做完
 
-- **P1.5**:✅ MiniCheck 蕴含闸⑤(config-gated,strict mode 降级 + 请求级预算);⏳ 独立 worker 服务拆分;RCS rerank 精排;master OA-fetch → verifiedSource DOI 接地。
-- **P2**:✅ CiteFix 引用纠错(闸⑥ 后处理重对齐,oc-cite fix);✅ 引用图 snowball(oc-lit snowball,前后向);PPTAgent 多主题 slides;Paper2Poster;anti-pattern reviewer(GPTDetector 软信号);scholar 入口 agent;单轮实验闭环。anti-pattern 去AI味 lint ✅(软信号)。
-- **P3**:Elo tournament debate;agentic tree-search 多轮实验;个性化写作风格库;PresAesth 美学闸。
+- **P1.5**:✅ MiniCheck 蕴含闸⑤(config-gated + strict 降级 + 请求级预算)。⏳ 独立 worker 拆分 / RCS rerank / master OA-fetch→DOI 接地 = **infra-gated**(代码与 config 接入点已就位,缺生产 infra 才不自动激活)。
+- **P2**:✅ CiteFix 引用纠错(闸⑥,oc-cite fix);✅ 引用图 snowball(oc-lit snowball);✅ anti-pattern 去AI味 lint(软信号);✅ 自建 slides/poster(oc-slides/oc-poster,**替代 vendoring PPTAgent/Paper2Poster**,用户拍板自建);✅ scholar 入口/综述写手 agent;✅ 单轮实验闭环(research-experiment-loop skill)。
+- **P3**:✅ Elo tournament debate(oc-rank + research-tournament);✅ agentic tree-search(research-experiment-loop);✅ 个性化写作风格库(research-writing-style);✅ PresAesth 美学闸(确定性启发式软信号)。
+
+**所有不依赖外部 GPU/向量库/模型/研究 repo 的项均已实现并测试。** 仅剩"infra 激活"类(下方)。
+
+## 仍需 infra/凭证才"真跑"(代码已 pluggable,缺省优雅降级;零成本可维持 MVP)
+
+- MinerU GPU 端点(扫描件 OCR;否则文字层 PDF 免费解析 + needs_ocr)。**不需要 GPU 也能跑**,扫描件多再接按量付费 OCR API。
+- Qdrant + embedding 端点(否则 in-proc TF-IDF,只影响召回不碰 verified);BGE-M3 可 CPU,Qdrant 可容器。
+- MiniCheck 模型端点(闸⑤,默认 off;小模型 CPU 可跑)。
+- Unpaywall email / Semantic Scholar key / ncpssd(**全免费注册**,扩多源 + 中文 OA)。
+- master 出站放行 → master OA-fetch 自动 DOI 接地(verifiedSource)。
 
 ## 部署(未上线)
 
-- v5 lane:`scripts/deploy-v5.sh`;改 CLI/容器代理须重建 runtime image(新增 oc-lit/cite/ingest/litrag/report + SciencePlots pip + 7 baseline skills)。
+- v5 lane:`scripts/deploy-v5.sh`;改 CLI/容器代理须重建 runtime image(新增 oc-lit/cite/ingest/litrag/report/slides/poster/rank + SciencePlots pip + 11 baseline skills + scholar agent)。
 - 需跑 migration 0094/0095;research_config 默认 disabled(admin 开启)。
 - 前端 web-react 需 vite build + rsync dist。
