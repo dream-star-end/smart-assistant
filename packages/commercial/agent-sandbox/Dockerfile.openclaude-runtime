@@ -160,8 +160,12 @@ COPY --chown=root:root ./runtime/oc-browser.sh /usr/local/bin/oc-browser
 # oc-market: AI-driven AI-marketplace ops (search/install/uninstall/publish) over
 # master /internal/v3/marketplace/agent/*; documented by the `market` baseline skill.
 COPY --chown=root:root ./runtime/oc-market.sh /usr/local/bin/oc-market
+# oc-lit / oc-cite: 科研 agent 多源文献检索 + 引用接地门禁,走 master /v3/research/*
+# (平台持各源 key)。文档见 `oc-lit` / `oc-cite` baseline skill。
+COPY --chown=root:root ./runtime/oc-lit.sh /usr/local/bin/oc-lit
+COPY --chown=root:root ./runtime/oc-cite.sh /usr/local/bin/oc-cite
 RUN set -eux; \
-    chmod 0755 /usr/local/bin/oc-docx /usr/local/bin/oc-minimax /usr/local/bin/oc-web-context /usr/local/bin/oc-web /usr/local/bin/oc-browser /usr/local/bin/oc-market /usr/local/lib/openclaude/create-docgen-reference.py; \
+    chmod 0755 /usr/local/bin/oc-docx /usr/local/bin/oc-minimax /usr/local/bin/oc-web-context /usr/local/bin/oc-web /usr/local/bin/oc-browser /usr/local/bin/oc-market /usr/local/bin/oc-lit /usr/local/bin/oc-cite /usr/local/lib/openclaude/create-docgen-reference.py; \
     ln -sf /usr/local/bin/oc-minimax /usr/local/bin/mmx; \
     python3 /usr/local/lib/openclaude/create-docgen-reference.py /usr/local/share/openclaude-docgen/reference.docx; \
     printf '%s\n' '# DOCX smoke' 'Inline $a^2+b^2=c^2$.' '' '$$' 'E = mc^2' '$$' > /tmp/oc-docx-smoke.md; \

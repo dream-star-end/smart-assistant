@@ -278,6 +278,8 @@ export const V3_CCB_BASELINE_SKILL_NAMES = [
   "document-writing",
   "minimax-media",
   "market",
+  "oc-lit",
+  "oc-cite",
 ] as const;
 
 /**

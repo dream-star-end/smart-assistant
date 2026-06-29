@@ -172,6 +172,11 @@ import {
   type LiteratureProxyHandler,
 } from "./literatureProxy.js";
 import {
+  RESEARCH_PREFIX,
+  makeResearchProxyHandler,
+  type ResearchProxyHandler,
+} from "./research/researchProxy.js";
+import {
   PLATFORM_PROMPT_SLOTS_PATH,
   makePlatformPromptSlotsHandler,
   type PlatformPromptSlotsHandler,
@@ -1131,6 +1136,13 @@ export async function registerCommercial(
         identityRepo,
         redis,
       });
+      // /v3/research/* — 科研 agent 能力 proxy(oc-lit 多源检索 + oc-cite 引用门禁)。
+      // 同款 verifyContainerIdentity 双因子;平台 secret(S2/Unpaywall 等)留 master;
+      // enabled 由 research_config 控制(off → 503)。免费源(OpenAlex/Crossref/arXiv)无 key。
+      const researchProxyHandler: ResearchProxyHandler = makeResearchProxyHandler({
+        identityRepo,
+        redis,
+      });
       // /internal/v3/platform-prompt-slots — 容器 → master 拉取平台级 prompt slot
       // (SKILLS_LITERATURE / MODEL_HINT)。镜像 build 排除 packages/commercial,所以
       // 容器进程内的 gateway 看不到 setLiteratureSkillProvider / setModelHintProvider
@@ -1177,6 +1189,9 @@ export async function registerCommercial(
         }
         if (path === LITERATURE_SEARCH_PATH) {
           return literatureProxyHandler(req, res, ctx);
+        }
+        if (path.startsWith(RESEARCH_PREFIX)) {
+          return researchProxyHandler(req, res, ctx);
         }
         if (path === PLATFORM_PROMPT_SLOTS_PATH) {
           return platformPromptSlotsHandler(req, res, ctx);
