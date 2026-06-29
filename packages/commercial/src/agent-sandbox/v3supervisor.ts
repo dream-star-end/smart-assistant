@@ -288,6 +288,7 @@ export const V3_CCB_BASELINE_SKILL_NAMES = [
   "research-slides",
   "research-tournament",
   "research-experiment-loop",
+  "research-writing-style",
 ] as const;
 
 /**
