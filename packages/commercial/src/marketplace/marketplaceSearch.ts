@@ -22,7 +22,7 @@ import { directEgressDispatcher } from '../account-pool/egressDispatcher.js'
 import { requireAuth } from '../http/auth.js'
 import { makePgSkillEmbedCache } from '../http/skillEmbedCachePg.js'
 import { sendJson } from '../http/util.js'
-import { type ApprovedSearchRow, listApprovedForSearch } from './marketplaceDb.js'
+import { type ApprovedSearchRow, type ArtifactKind, listApprovedForSearch } from './marketplaceDb.js'
 
 const cache = makePgSkillEmbedCache()
 
@@ -54,7 +54,12 @@ export async function handleMarketplaceSearch(
     sendJson(res, 200, { results: [], method: 'all' })
     return
   }
-  const kind = kindParam === 'skill' || kindParam === 'agent' ? kindParam : undefined
+  // 无 kind 参数 → 默认 'skill'(而非"全部")。市场起家是技能市场(0087),agent 是
+  // 0092 才加的二级品类;v3 vanilla 的技能市场 UI 调 search 不带 kind,若 fall-through 到
+  // "全部"会把 v5 专属 agent(如平台科研 agent)混进 v3 技能市场——而 v3 容器没有对应能力,
+  // 装了即坏。v5 web-react BrowsePanel 每个分页都显式传 kind('skill'/'agent'),不受影响。
+  // 共享 DB 下,这是"v5 专属 agent 不泄漏给 v3"收敛到单一权威的最小改。
+  const kind: ArtifactKind = kindParam === 'agent' ? 'agent' : 'skill'
 
   const catalog = await listApprovedForSearch(kind)
   if (catalog.length === 0 || !q) {

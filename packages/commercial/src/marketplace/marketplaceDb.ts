@@ -232,6 +232,43 @@ export async function reviewVersion(args: {
   })
 }
 
+/**
+ * Platform-official seed approval. Marks (slug, version) approved + points the
+ * listing's current_approved_version_id at it. UNLIKE {@link reviewVersion} this
+ * does NOT enforce reviewer≠author: it is for PLATFORM-AUTHORED official content
+ * seeded from version control (the built-in research agents), which is trusted at
+ * source and has no user submission to peer-review. Idempotent — re-approving an
+ * already-approved version just re-points current_approved_version_id (no-op-ish).
+ * Throws VERSION_NOT_FOUND if the (slug, version) is absent. Marketplace SQL stays
+ * the single authority here (callers never hand-write listing/version SQL).
+ */
+export async function approvePlatformVersion(slug: string, version: string): Promise<void> {
+  await tx(async (c) => {
+    const v = await query<{ id: string }>(
+      'SELECT id::text FROM marketplace_skill_versions WHERE slug = $1 AND version = $2 FOR UPDATE',
+      [slug, version],
+      c,
+    )
+    const row = v.rows[0]
+    if (!row) throw new MarketplaceError('VERSION_NOT_FOUND', `version ${slug}@${version} 不存在`)
+    await query(
+      `UPDATE marketplace_skill_versions
+          SET status = 'approved', reviewed_by = submitted_by, reviewed_at = NOW(),
+              review_note = 'platform-official seed'
+        WHERE id = $1`,
+      [row.id],
+      c,
+    )
+    await query(
+      `UPDATE marketplace_skill_listings
+          SET current_approved_version_id = $2, updated_at = NOW()
+        WHERE slug = $1`,
+      [slug, row.id],
+      c,
+    )
+  })
+}
+
 export interface ApprovedSearchRow {
   versionId: string
   slug: string

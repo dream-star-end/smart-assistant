@@ -176,6 +176,8 @@ import {
   makeResearchProxyHandler,
   type ResearchProxyHandler,
 } from "./research/researchProxy.js";
+import { getResearchConfigPublic } from "./admin/researchConfig.js";
+import { seedPlatformMarketplaceAgents } from "./marketplace/seedPlatformAgents.js";
 import {
   PLATFORM_PROMPT_SLOTS_PATH,
   makePlatformPromptSlotsHandler,
@@ -1182,6 +1184,26 @@ export async function registerCommercial(
         identityRepo,
         listPublicModels: () => pricing.listPublic(),
       });
+      // 平台官方科研 agent 的幂等 seed —— v5-native 露出:让「科研分析师/科研写手」作为
+      // 已批准市场 agent 出现,用户「从市场添加」即可装(v5 agent 露出单一权威=市场,
+      // 不走 v3 seed/team)。仅当 research_config 已开启时 seed(关闭时科研能力本就不可用,
+      // 避免装到只会 503 的 agent;v3 不含本调用 → 不会 seed)。fire-and-forget,失败只
+      // log 不阻断启动;幂等,重启可反复跑。
+      void (async () => {
+        try {
+          const rc = await getResearchConfigPublic();
+          if (!rc.enabled) return;
+          const seeded = await seedPlatformMarketplaceAgents({
+            listPublicModels: () => pricing.listPublic(),
+          });
+          console.log(
+            "[commercial] platform research agents seed:",
+            JSON.stringify(seeded),
+          );
+        } catch (err) {
+          console.error("[commercial] seedPlatformMarketplaceAgents failed:", err);
+        }
+      })();
       dispatchInternal = (req, res, ctx) => {
         const path = (req.url ?? "/").split("?")[0];
         if (path === SERVER_AUTHORED_PATH) {
