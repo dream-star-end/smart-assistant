@@ -169,10 +169,8 @@ function mergeWithDefault(raw: Record<string, unknown>): ResearchConfigJson {
   } as ResearchConfigJson;
 }
 
-async function readRow(): Promise<ConfigDbRow> {
-  const r = await query<ConfigDbRow>(`SELECT ${COLS} FROM research_config WHERE id = 1`);
-  if (r.rows.length > 0) return r.rows[0];
-  // 0095 已 seed,理论永不到此;fail-closed 返 disabled 默认。
+/** disabled 默认行:研究能力未开通时的安全语义(enabled=false → 代理 503)。 */
+function disabledDefaultRow(): ConfigDbRow {
   return {
     id: 1,
     enabled: false,
@@ -183,6 +181,22 @@ async function readRow(): Promise<ConfigDbRow> {
     updated_at: new Date(0),
     updated_by: null,
   };
+}
+
+async function readRow(): Promise<ConfigDbRow> {
+  try {
+    const r = await query<ConfigDbRow>(`SELECT ${COLS} FROM research_config WHERE id = 1`);
+    if (r.rows.length > 0) return r.rows[0];
+  } catch (err) {
+    // 迁移(0095)未应用 → research_config 表不存在(PG SQLSTATE 42P01 undefined_table)。
+    // 此情形下研究能力本就未开通,fail-soft 返回 disabled 默认,使"未迁移 = 干净的
+    // 503 disabled"成立,而不是把"未开通"暴露成 500。仅吞 undefined_table;其它 DB
+    // 错误(连接/权限/超时)照常上抛,由调用方转 500,避免静默掩盖真故障。
+    if ((err as { code?: unknown } | null)?.code === "42P01") return disabledDefaultRow();
+    throw err;
+  }
+  // 表存在但无行(0095 已 seed,理论永不到此);fail-closed 返 disabled 默认。
+  return disabledDefaultRow();
 }
 
 // ─── 公共读(不解密) ─────────────────────────────────────────────────
