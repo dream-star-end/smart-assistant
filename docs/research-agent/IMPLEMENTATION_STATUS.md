@@ -24,12 +24,12 @@
 - **证据 DOI 路径**:当前 ingest 不填 `verifiedSource`(无 master OA-fetch),用户上传文档为 quote-bound verified 但 `identifierVerified=false`(不冒充已发表)。"已发表文献 DOI 接地"待 master 从 resolved DOI 的 OA 全文下载并 ingest(P1.5+)。
 - **RAG embedding**:in-proc TF-IDF(确定性,dev/小规模);config-gated 接 BGE-M3/SPECTER2 + Qdrant(只影响召回,不碰 verified)。
 - **解析引擎**:local 文字层抽取(pdf-parse);MinerU/Mistral config-gated;扫描件报 needs_ocr。
-- **MiniCheck 蕴含(闸⑤)**:见下 P1.5。
+- **MiniCheck 蕴含(闸⑤)**:✅ 架构已落(config-gated,见下);MVP 默认 backend=off(无模型时优雅跳过),配 endpoint 即生效。
 - **async durable worker**:proxy inline 覆盖 MVP(local 引擎秒级);大库/GPU 引擎入队待 MinerU 落地(基建已就绪)。
 
 ## 路线图(plan §12 后续 Phase)
 
-- **P1.5**:MiniCheck 蕴含闸⑤(strict mode)；独立 worker 服务拆分；RCS rerank 精排；master OA-fetch → verifiedSource DOI 接地。
+- **P1.5**:✅ MiniCheck 蕴含闸⑤(config-gated,strict mode 降级 + 请求级预算);⏳ 独立 worker 服务拆分;RCS rerank 精排;master OA-fetch → verifiedSource DOI 接地。
 - **P2**:CiteFix 引用纠错；引用图 snowball；PPTAgent 多主题 slides;Paper2Poster;anti-pattern reviewer(GPTDetector 软信号);scholar 入口 agent;单轮实验闭环。
 - **P3**:Elo tournament debate;agentic tree-search 多轮实验;个性化写作风格库;PresAesth 美学闸。
 
