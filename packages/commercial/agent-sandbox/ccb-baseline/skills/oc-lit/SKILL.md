@@ -14,7 +14,13 @@ tags: [research, literature, search, citation]
 
 ```bash
 oc-lit search "<关键词>" [--sources openalex,crossref,arxiv] [--size 20] [--year-min 2020] [--lang zh|en]
+
+# 引用图扩展(找全相关工作/综述):沿 seed 文献的前后向引用扩展
+oc-lit snowball <DOI|arXiv|OpenAlex id> [--direction backward|forward|both] [--size 20]
 ```
+
+`snowball`:backward=seed 引用的文献,forward=引用 seed 的文献,both=两者。适合从一篇
+关键论文出发滚雪球找全相关工作;输出同 search 的 SourceRecord(可再 oc-cite verify)。
 
 - `--sources`:默认全查;可只选其一两个。
 - `--size`:每源条数(1~100,默认 20)。

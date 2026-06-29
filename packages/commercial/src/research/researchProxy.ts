@@ -42,6 +42,7 @@ import { ingestBlob, litragQuery, runCheck, runCiteFix } from "./researchHandler
 import { queryDocuments } from "./litrag.js";
 import type { FetchLike } from "./sources.js";
 import { type LitSourceName, searchMultiSource } from "./litSearch.js";
+import { type SnowballDirection, snowball } from "./snowball.js";
 import { formatRecord, verifyIdentifier, verifyIdentifiers } from "./cite.js";
 
 /** master-owned blob 暂存目录(ingest 输入字节;仅 master worker 读)。 */
@@ -310,6 +311,10 @@ export function makeResearchProxyHandler(deps: ResearchProxyDeps): ResearchProxy
         await handleLitSearch(res, body, cfg, readSecrets, deps.fetchImpl, requestId);
         return;
       }
+      if (reqPath === `${RESEARCH_PREFIX}lit/snowball`) {
+        await handleLitSnowball(res, body, cfg, deps.fetchImpl, requestId);
+        return;
+      }
       if (reqPath === `${RESEARCH_PREFIX}cite/verify`) {
         await handleCiteVerify(res, body, cfg, deps.fetchImpl, requestId);
         return;
@@ -401,8 +406,8 @@ async function handleLitSearch(
   const sources = Array.isArray(body.sources)
     ? (body.sources.filter((s) => VALID_SOURCES.includes(s as LitSourceName)) as LitSourceName[])
     : undefined;
-  const size = typeof body.size === "number" ? body.size : undefined;
-  const yearMin = typeof body.yearMin === "number" ? body.yearMin : undefined;
+  const size = typeof body.size === "number" && Number.isFinite(body.size) ? body.size : undefined;
+  const yearMin = typeof body.yearMin === "number" && Number.isFinite(body.yearMin) ? body.yearMin : undefined;
   const lang = body.lang === "zh" || body.lang === "en" ? body.lang : undefined;
 
   // secrets 仅在需要(目前 unpaywall email 在 config 非密;S2 key 是 secret,Phase 1 未接 S2 源)
@@ -415,6 +420,30 @@ async function handleLitSearch(
       unpaywallEmail: cfg.config.litSources.unpaywallEmail,
       fetchImpl,
     },
+  );
+  sendJson(res, 200, result, requestId);
+}
+
+async function handleLitSnowball(
+  res: ServerResponse,
+  body: Record<string, unknown>,
+  cfg: ResearchConfigPublic,
+  fetchImpl: FetchLike | undefined,
+  requestId: string,
+): Promise<void> {
+  const seed = typeof body.seed === "string" ? body.seed.trim() : "";
+  if (!seed) {
+    sendErr(res, 400, "BAD_REQUEST", "seed required (DOI/arXiv/OpenAlex id)", requestId);
+    return;
+  }
+  const direction: SnowballDirection =
+    body.direction === "backward" || body.direction === "forward" || body.direction === "both"
+      ? body.direction
+      : "both";
+  const size = typeof body.size === "number" && Number.isFinite(body.size) ? body.size : undefined;
+  const result = await snowball(
+    { seed, direction, size },
+    { mailto: cfg.config.litSources.openalexMailto ?? cfg.config.litSources.crossrefMailto, fetchImpl },
   );
   sendJson(res, 200, result, requestId);
 }
@@ -515,7 +544,7 @@ async function handleLitragQuery(
     sendErr(res, 400, "BAD_REQUEST", "query and docIds[] required", requestId);
     return;
   }
-  const topK = typeof body.topK === "number" ? body.topK : undefined;
+  const topK = typeof body.topK === "number" && Number.isFinite(body.topK) ? body.topK : undefined;
   const result = await litragQuery(userId, docIds, query, { topK }, { getDocument: store.getDocument });
   sendJson(res, 200, result, requestId);
 }

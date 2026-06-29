@@ -31,8 +31,20 @@ async function main(): Promise<void> {
       out(await callResearch(TOOL, "lit/search", body));
       return;
     }
+    case "snowball": {
+      const seed = positional[0] ?? flags.seed;
+      if (!seed) fail(TOOL, "snowball <DOI|arXiv|OpenAlex id> [--direction backward|forward|both] [--size N]");
+      const body: Record<string, unknown> = { seed };
+      if (flags.direction) body.direction = flags.direction;
+      if (flags.size) body.size = Number(flags.size);
+      out(await callResearch(TOOL, "lit/snowball", body));
+      return;
+    }
     default:
-      fail(TOOL, "usage: oc-lit search <query> [--sources ...] [--size N] [--year-min Y] [--lang zh|en]");
+      fail(
+        TOOL,
+        "usage: oc-lit <search <query> [--sources ...] [--size N] [--year-min Y] [--lang zh|en] | snowball <id> [--direction ...]>",
+      );
   }
 }
 

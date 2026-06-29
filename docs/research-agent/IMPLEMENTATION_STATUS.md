@@ -30,7 +30,7 @@
 ## 路线图(plan §12 后续 Phase)
 
 - **P1.5**:✅ MiniCheck 蕴含闸⑤(config-gated,strict mode 降级 + 请求级预算);⏳ 独立 worker 服务拆分;RCS rerank 精排;master OA-fetch → verifiedSource DOI 接地。
-- **P2**:✅ CiteFix 引用纠错(闸⑥ 后处理重对齐,oc-cite fix);引用图 snowball；PPTAgent 多主题 slides;Paper2Poster;anti-pattern reviewer(GPTDetector 软信号);scholar 入口 agent;单轮实验闭环。anti-pattern 去AI味 lint ✅(软信号)。
+- **P2**:✅ CiteFix 引用纠错(闸⑥ 后处理重对齐,oc-cite fix);✅ 引用图 snowball(oc-lit snowball,前后向);PPTAgent 多主题 slides;Paper2Poster;anti-pattern reviewer(GPTDetector 软信号);scholar 入口 agent;单轮实验闭环。anti-pattern 去AI味 lint ✅(软信号)。
 - **P3**:Elo tournament debate;agentic tree-search 多轮实验;个性化写作风格库;PresAesth 美学闸。
 
 ## 部署(未上线)
