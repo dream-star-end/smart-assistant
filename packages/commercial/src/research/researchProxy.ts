@@ -38,7 +38,8 @@ import {
   putBlob as storePutBlob,
   putDocument as storePutDocument,
 } from "./store.js";
-import { ingestBlob, litragQuery, runCheck } from "./researchHandlers.js";
+import { ingestBlob, litragQuery, runCheck, runCiteFix } from "./researchHandlers.js";
+import { queryDocuments } from "./litrag.js";
 import type { FetchLike } from "./sources.js";
 import { type LitSourceName, searchMultiSource } from "./litSearch.js";
 import { formatRecord, verifyIdentifier, verifyIdentifiers } from "./cite.js";
@@ -329,6 +330,10 @@ export function makeResearchProxyHandler(deps: ResearchProxyDeps): ResearchProxy
         await handleCiteCheck(res, body, cfg, identity.userId, store, citeDeps, requestId);
         return;
       }
+      if (reqPath === `${RESEARCH_PREFIX}cite/fix`) {
+        await handleCiteFix(res, body, cfg, identity.userId, store, citeDeps, requestId);
+        return;
+      }
       sendErr(res, 404, "NOT_FOUND", `unknown research route ${reqPath}`, requestId);
     } catch (err) {
       log("error", "research_handler_failed", { path: reqPath, err: String(err) });
@@ -557,6 +562,63 @@ async function handleCiteCheck(
     entail,
     entailThreshold: mc?.threshold,
     strictEntail: mc?.strict,
+  });
+  sendJson(res, 200, result, requestId);
+}
+
+async function handleCiteFix(
+  res: ServerResponse,
+  body: Record<string, unknown>,
+  cfg: ResearchConfigPublic,
+  userId: number,
+  store: ResearchStoreDeps,
+  citeDeps: { mailto?: string; fetchImpl?: FetchLike },
+  requestId: string,
+): Promise<void> {
+  const raw = (body.manifest ?? body) as Partial<EvidenceManifest>;
+  if (!Array.isArray(raw.claims) || !Array.isArray(raw.quotes)) {
+    sendErr(res, 400, "BAD_REQUEST", "manifest{quotes,claims} arrays required", requestId);
+    return;
+  }
+  const docIds = Array.isArray(body.docIds)
+    ? body.docIds.filter((x): x is string => typeof x === "string").slice(0, 50)
+    : [];
+  if (docIds.length === 0) {
+    sendErr(res, 400, "BAD_REQUEST", "docIds[] required (用于重检索的权威文档)", requestId);
+    return;
+  }
+  if (raw.quotes.length > 2000 || raw.claims.length > 2000) {
+    sendErr(res, 413, "MANIFEST_TOO_LARGE", "too many quotes/claims", requestId);
+    return;
+  }
+  const manifest: EvidenceManifest = {
+    sources: Array.isArray(raw.sources) ? raw.sources : [],
+    quotes: raw.quotes,
+    claims: raw.claims,
+    coverage: { verifiedClaims: 0, totalClaims: 0 },
+    gates: {
+      quoteFirst: { passed: true, checked: 0, failed: 0 },
+      claimBound: { passed: true, checked: 0, failed: 0 },
+      identifier: { passed: true, checked: 0, failed: 0 },
+      retraction: { passed: true, checked: 0, failed: 0 },
+    },
+  };
+  const mc = cfg.config.minicheck;
+  const entail = mc?.backend === "http" && mc.endpoint ? makeEntail(mc.endpoint, citeDeps.fetchImpl) : undefined;
+  // docs 预加载一次(避免每 claim 重读 DB);query 在内存权威 docs 上跑 master litrag。
+  const docs = (await Promise.all(docIds.map((id) => store.getDocument(userId, id)))).filter(
+    (d): d is NonNullable<typeof d> => d != null,
+  );
+  const result = await runCiteFix(userId, manifest, docs.length > 0, {
+    getDocument: store.getDocument,
+    verifyIdentifier: (id) => verifyIdentifier(id, citeDeps),
+    strictDomains: cfg.config.cite.strictDomains,
+    entail,
+    entailThreshold: mc?.threshold,
+    strictEntail: mc?.strict,
+    // 逐字取权威 span 铸造 quote;要求一定召回分,避免硬塞弱来源
+    query: async (claimText) => queryDocuments(docs, claimText, { topK: 3 }),
+    fixMinScore: 0.5,
   });
   sendJson(res, 200, result, requestId);
 }

@@ -18,7 +18,17 @@ oc-cite verify 10.1038/s41586-020-2649-2 arxiv:1706.03762 openalex:W2741809809
 oc-cite format 10.1038/s41586-020-2649-2 --style gb-t-7714-2015   # 中文国标(默认)
 oc-cite format 10.1038/s41586-020-2649-2 --style apa
 oc-cite format 10.1038/s41586-020-2649-2 --style bibtex
+
+# 校验整份 evidence manifest(平台铸造 verified;未接地红标)
+oc-cite check --manifest manifest.json
+
+# 纠错:对未接地 claim 在权威文档里重检索更匹配 quote 重绑后重校验
+oc-cite fix --manifest manifest.json --docs <docId,docId>
 ```
+
+`fix` 会对 `check` 后仍未接地的 claim 在已 ingest 的权威文档(docId 来自 oc-ingest)里
+重新检索更贴的 verbatim quote 并重绑,再自动重校验;命中则可能转 verified,命中不了仍保持
+未核查(诚实)。`changes` 列出每条 claim 重绑到哪个 quote 或 none。
 
 `verify` 输出 `{ verdicts: [{ identifier, resolved, record, retracted, bibtex, gbt7714, apa }] }`。
 

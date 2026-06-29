@@ -25,6 +25,7 @@ import {
 } from "./ingest.js";
 import { type QueryOpts, queryDocuments } from "./litrag.js";
 import { type CheckManifestDeps, checkManifest } from "./checkManifest.js";
+import { type CiteFixChange, realignUnsupportedClaims } from "./citeFix.js";
 
 // ── ingest ───────────────────────────────────────────────────────────
 
@@ -154,4 +155,26 @@ export async function runCheck(
     strictEntail: deps.strictEntail,
   };
   return checkManifest(manifest, checkDeps);
+}
+
+/**
+ * CiteFix:对未接地 claim 在权威文档集重检索重绑(realign),再 recheck 铸造 status。
+ * query 由 proxy 用 litragQuery 注入(master 从权威 span 铸造 quote,红线不破)。
+ */
+export async function runCiteFix(
+  userId: number,
+  manifest: EvidenceManifest,
+  hasDocs: boolean,
+  deps: CheckDeps & {
+    /** 在(调用方预加载的)权威文档集上检索;返回 master 铸造的 quote handles。 */
+    query: (claimText: string) => Promise<import("@openclaude/protocol/research").QuoteHandle[]>;
+    fixMinScore?: number;
+  },
+): Promise<{ manifest: EvidenceManifest; gates: EvidenceManifest["gates"]; changes: CiteFixChange[] }> {
+  const realigned = await realignUnsupportedClaims(manifest, hasDocs, {
+    query: deps.query,
+    minScore: deps.fixMinScore,
+  });
+  const checked = await runCheck(userId, realigned.manifest, deps);
+  return { manifest: checked.manifest, gates: checked.gates, changes: realigned.changes };
 }

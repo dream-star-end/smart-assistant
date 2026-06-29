@@ -43,8 +43,25 @@ async function main(): Promise<void> {
       out(await callResearch(TOOL, "cite/check", { manifest }));
       return;
     }
+    case "fix": {
+      const file = flags.manifest ?? positional[0];
+      if (!file) fail(TOOL, "fix --manifest <file> --docs <docId,...>");
+      const docIds = (flags.docs ?? "")
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean);
+      if (docIds.length === 0) fail(TOOL, "fix 需 --docs <docId,...>(用于重检索的权威文档)");
+      let manifest: unknown;
+      try {
+        manifest = JSON.parse(readFileSync(file, "utf8"));
+      } catch {
+        fail(TOOL, `cannot read/parse manifest: ${file}`);
+      }
+      out(await callResearch(TOOL, "cite/fix", { manifest, docIds }));
+      return;
+    }
     default:
-      fail(TOOL, "usage: oc-cite <verify <id...>|format <id> --style ...|check --manifest <file>>");
+      fail(TOOL, "usage: oc-cite <verify <id...>|format <id> --style ...|check --manifest <f>|fix --manifest <f> --docs <ids>>");
   }
 }
 
