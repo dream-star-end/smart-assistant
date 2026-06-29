@@ -301,7 +301,7 @@ describe("openclaude-runtime entrypoint env-scrub policy", () => {
       "entrypoint must not seed Claude subscription provider for default commercial agents",
     );
     // v5 ccb-only:不再 seed codex agent。
-    for (const id of ["main", "researcher", "scientist", "coder", "reviewer"]) {
+    for (const id of ["main", "researcher", "scientist", "coder", "reviewer", "scholar"]) {
       assert.match(src, new RegExp(`id:\\s*"${id}"`), `entrypoint must seed ${id} agent`);
     }
     // 2026-06-16 boss 重配:按角色多样化(WS2)。researcher=MiniMax-M3、scientist/reviewer=deepseek-v4-pro、
@@ -675,6 +675,9 @@ describe("openclaude-runtime entrypoint env-scrub policy", () => {
     assert.match(src, /provider:\s*'ark'/, "web fallback main/coder must use ark provider");
     assert.match(src, /id:\s*'scientist'/, "web fallback must include the scientist agent");
     assert.match(src, /displayName:\s*'科研分析师'/, "web fallback scientist display name must match runtime seed");
+    // scholar(P2 综述写手)三权威源同步:web fallback 必含,与 entrypoint seed 一致
+    assert.match(src, /id:\s*'scholar'/, "web fallback must include the scholar agent");
+    assert.match(src, /displayName:\s*'科研写手'/, "web fallback scholar display name must match runtime seed");
     assert.match(src, /model:\s*'deepseek-v4-pro'/, "web fallback scientist/reviewer must use DeepSeek V4 Pro");
     assert.match(src, /provider:\s*'deepseek'/, "web fallback scientist/reviewer must use the deepseek provider");
     assert.doesNotMatch(

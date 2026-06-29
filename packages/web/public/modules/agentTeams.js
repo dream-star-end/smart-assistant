@@ -113,6 +113,13 @@ const TEAM_TEMPLATES = [
         rolePrompt:
           '重点复核 evidence manifest：每条标 verified 的 claim 是否真有 quote 支撑、quote 是否为来源 verbatim（以 oc-cite check 结果为准而非凭印象）、引用 DOI/arXiv 是否可解析且未撤稿、有无夸大或未接地的论断。把未接地的 claim 标红，要求移入未核查或补证据；同时指出样本、方法、因果、统计层面的弱点。不要重写答案，优先列出阻塞性问题和可信度判断。',
       },
+      {
+        agentId: 'scholar',
+        role: '科研写手',
+        responsibility: '把证据串成结构化报告/综述与汇报产物（不做统计分析）',
+        rolePrompt:
+          '把 researcher 的 evidence manifest 组织成结构化报告/综述与汇报产物：oc-report 出规范报告、oc-slides/oc-poster 出汇报，写作守去 AI 味与个人风格。正文每条论断必须有 verified quote 支撑、引用经 oc-cite，未接地标红；不做统计建模/科学计算（交 scientist）。',
+      },
     ],
     policy: { maxParallel: 2, requireReview: true, reviewAgentId: 'reviewer' },
     badge: '科研',

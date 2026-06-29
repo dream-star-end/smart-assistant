@@ -52,6 +52,14 @@ const COMMERCIAL_FALLBACK_AGENTS = Object.freeze([
     model: 'deepseek-v4-pro',
     provider: 'deepseek',
   },
+  {
+    id: 'scholar',
+    displayName: '科研写手',
+    avatarEmoji: '🎓',
+    // 长上下文综述/串稿,与 entrypoint.ts scholar 一致(复用 researcher 模型,三权威源同步)。
+    model: 'MiniMax-M3',
+    provider: 'minimax',
+  },
   // v5 ccb-only:不再 fallback codex/gpt-5.5 agent。
 ])
 

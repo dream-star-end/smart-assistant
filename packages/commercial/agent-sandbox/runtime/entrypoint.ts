@@ -1019,6 +1019,8 @@ try {
   ] as const;
   const SCIENTIST_PERSONA =
     "你是科研分析师。专注统计建模、科学计算、可视化、生信/单细胞和可复现实验分析;优先使用当前已加载的科研 skills,但不要假设浏览器、PDF 或外部数据库工具已挂载。先确认数据来源、变量、假设和成功标准,本地优先处理数据;上传私有数据或调用外部服务前必须征得用户同意。生物医学/临床内容只给研究辅助和证据边界,不提供诊断、治疗或合规结论。\n";
+  const SCHOLAR_PERSONA =
+    "你是科研写手(综述/入口)。面向用户组织科研产出与最终叙述:把 researcher 产的 evidence manifest 串成结构化报告/综述,用 oc-report 出规范报告、oc-slides/oc-poster 出汇报产物,写作守 scientific-writing(去 AI 味)与个人风格(research-writing-style)。**不替代 scientist**:不做统计建模/科学计算,需要分析就交给 scientist。**引用接地是硬性要求**:正文每条论断必须有 evidence manifest 里 verified 的 quote 支撑,引用经 oc-cite,绝不凭记忆编造 DOI;未接地论断标红或移入未核查。\n";
 
   const desiredResearcherAgent = {
     id: "researcher",
@@ -1068,12 +1070,25 @@ try {
     toolsets: [CORE_TOOLSET_ID],
   };
 
+  const desiredScholarAgent = {
+    id: "scholar",
+    // 长上下文利于综述/串稿;复用 researcher 的 MiniMax-M3/minimax(512k),不新增 provider。
+    model: COMMERCIAL_RESEARCHER_MODEL,
+    persona: ensureAgentPersona("scholar", SCHOLAR_PERSONA),
+    permissionMode: "bypassPermissions",
+    provider: COMMERCIAL_RESEARCHER_PROVIDER,
+    displayName: "科研写手",
+    avatarEmoji: "🎓",
+    toolsets: [CORE_TOOLSET_ID],
+  };
+
   const desiredCollaborationSeedAgents = [
     desiredMainAgent,
     desiredResearcherAgent,
     desiredScientistAgent,
     desiredCoderAgent,
     desiredReviewerAgent,
+    desiredScholarAgent,
   ];
   const desiredSeedAgents = [...desiredCollaborationSeedAgents];
 
@@ -1116,6 +1131,13 @@ try {
         responsibility: "复核 evidence manifest:引用是否真实接地、是否撤稿、有无未核查论断",
         rolePrompt:
           "重点复核 evidence manifest:每条标 verified 的 claim 是否真有 quote 支撑、quote 是否为来源 verbatim(以 oc-cite check 结果为准而非凭印象)、引用 DOI/arXiv 是否可解析且未撤稿、有无夸大或未接地的论断。把未接地的 claim 标红,要求移入未核查或补证据;同时指出样本、方法、因果、统计层面的弱点。优先列阻塞性问题和可信度判断。",
+      },
+      {
+        agentId: "scholar",
+        role: "科研写手",
+        responsibility: "把证据串成结构化报告/综述与汇报产物(不做统计分析)",
+        rolePrompt:
+          "把 researcher 的 evidence manifest 组织成结构化报告/综述与汇报产物:oc-report 出规范报告、oc-slides/oc-poster 出汇报,写作守去 AI 味与个人风格。正文每条论断必须有 verified quote 支撑、引用经 oc-cite,未接地标红;不做统计建模/科学计算(交 scientist)。",
       },
     ],
     policy: { maxParallel: 2, requireReview: true, reviewAgentId: "reviewer" },
