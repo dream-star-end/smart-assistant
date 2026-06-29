@@ -130,7 +130,7 @@ export async function listPendingVersions(limit = 100): Promise<PendingVersionRo
             v.risk_flags, v.submitted_by::text, l.owner_user_id::text, v.created_at::text
        FROM marketplace_skill_versions v
        JOIN marketplace_skill_listings l ON l.slug = v.slug
-      WHERE v.status = 'pending'
+      WHERE v.status = 'pending' AND l.kind = 'skill'
       ORDER BY v.created_at ASC
       LIMIT $1`,
     [Math.min(limit, 500)],
@@ -158,13 +158,18 @@ export async function reviewVersion(args: {
   note?: string
 }): Promise<void> {
   await tx(async (c) => {
-    const v = await query<{ slug: string; status: string; submitted_by: string }>(
-      'SELECT slug, status, submitted_by::text FROM marketplace_skill_versions WHERE id = $1 FOR UPDATE',
+    const v = await query<{ slug: string; status: string; submitted_by: string; kind: string }>(
+      `SELECT vv.slug, vv.status, vv.submitted_by::text, ll.kind
+         FROM marketplace_skill_versions vv
+         JOIN marketplace_skill_listings ll ON ll.slug = vv.slug
+        WHERE vv.id = $1 FOR UPDATE OF vv`,
       [args.versionId],
       c,
     )
     const row = v.rows[0]
-    if (!row) throw new MarketplaceError('VERSION_NOT_FOUND', 'version 不存在')
+    // v3 skill-only:agent 版本对 v3 视同不存在(其审核/批准由 v5 负责,v3 admin 不得跨渠道批 agent)。
+    if (!row || row.kind !== 'skill')
+      throw new MarketplaceError('VERSION_NOT_FOUND', 'version 不存在')
     if (row.status !== 'pending') throw new MarketplaceError('NOT_PENDING', '该版本已被审核')
     if (BigInt(row.submitted_by) === BigInt(args.reviewerUserId))
       throw new MarketplaceError('REVIEWER_IS_AUTHOR', '审核人不能是发布者本人')
@@ -409,12 +414,14 @@ export async function listActiveInstalledArtifacts(userId: number): Promise<Inst
     raw_skill_md: string
     artifact_hash: string
   }>(
+    // 容器 skill sync 落盘源:必须 kind='skill'。否则共享 PG 里用户的 agent install 会被
+    // 当成 skill 返回(raw_skill_md 可能 NULL)→ 容器 hub 落盘坏数据。v3 永不同步 agent。
     `SELECT i.slug, v.version, v.raw_skill_md, i.artifact_hash
        FROM marketplace_installs i
        JOIN marketplace_skill_versions v ON v.id = i.version_id
        JOIN marketplace_skill_listings l ON l.slug = i.slug
       WHERE i.user_id = $1 AND i.uninstalled_at IS NULL AND l.state = 'active'
-            AND i.artifact_hash = v.artifact_hash`,
+            AND l.kind = 'skill' AND i.artifact_hash = v.artifact_hash`,
     [userId],
   )
   return r.rows.map((x) => ({
@@ -429,9 +436,10 @@ export async function listActiveInstalledArtifacts(userId: number): Promise<Inst
 export async function revokeListing(slug: string, reason: string): Promise<number[]> {
   return tx(async (c) => {
     await query(
+      // v3 skill-only:只能撤 skill 类(agent 类的下架由 v5 负责,v3 admin 不跨渠道撤 agent)。
       `UPDATE marketplace_skill_listings
           SET state = 'revoked', revoked_reason = $2, updated_at = NOW()
-        WHERE slug = $1`,
+        WHERE slug = $1 AND kind = 'skill'`,
       [slug, reason],
       c,
     )
