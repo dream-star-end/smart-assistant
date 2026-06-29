@@ -136,7 +136,11 @@
 }
 
 * { box-sizing: border-box; }
-html, body, #root { height: 100%; margin: 0; }
+html, body { height: 100%; margin: 0; }
+/* #root 用动态视口高(dvh):移动端 100vh 含浏览器工具栏区,会比可视视口高 → 整页可下滑
+   露出输入框下方空白。100dvh = 当前可视高度;100vh 作不支持 dvh 时的回退(同属性后者覆盖,
+   末个有效值生效)。 */
+#root { height: 100vh; height: 100dvh; }
 body {
   background: var(--bg);
   color: var(--fg);
@@ -145,6 +149,9 @@ body {
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
+  /* 禁止 body 级滚动/橡皮筋(布局滚动只发生在聊天区 overflow-y-auto 内)。 */
+  overflow: hidden;
+  overscroll-behavior: none;
 }
 
 *::-webkit-scrollbar { width: 9px; height: 9px; }

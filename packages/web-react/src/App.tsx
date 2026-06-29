@@ -766,7 +766,7 @@ export function App() {
     <MediaSignProvider sign={demo ? null : signMedia} authKey={user?.id ?? "anon"}>
     <ToolCardActionsContext.Provider value={toolActions}>
     {/* safe-px:横屏侧刘海安全区(竖屏为 0) */}
-    <div className="flex h-screen overflow-hidden bg-bg text-fg safe-px">
+    <div className="flex h-full overflow-hidden bg-bg text-fg safe-px">
       {/* 桌面：内联侧栏（可折叠）。窄屏隐藏，改用抽屉。 */}
       {!collapsed && (
         <div className="hidden md:contents">
