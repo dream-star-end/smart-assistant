@@ -27,6 +27,16 @@ import { asArr, asStr, isSafeHttpUrl, type ToolLike } from "./format";
 
 // ── 解析助手 ────────────────────────────────────────────────────────────────
 
+/** 是否为非空对象(过滤数组里的 null / 基本类型 / 嵌套数组,防 agent 产出畸形 JSON 渲染崩)。 */
+function isRecord(v: unknown): v is Record<string, unknown> {
+  return v != null && typeof v === "object" && !Array.isArray(v);
+}
+
+/** 取对象数组:仅保留 record 元素(畸形元素丢弃,绝不让渲染崩);按调用方接口形状断言。 */
+function recArr<T>(v: unknown): T[] {
+  return asArr(v).filter(isRecord) as unknown as T[];
+}
+
 /** tool 的真实输出文本(优先 output,回落 bashTail)。 */
 function outputText(tool: ToolLike): string | null {
   if (typeof tool.output === "string" && tool.output.trim()) return tool.output;
@@ -134,7 +144,7 @@ function authorsLine(authors: LitAuthor[] | undefined): string {
 }
 
 function LiteratureCard({ data }: { data: Record<string, unknown> }) {
-  const sources = asArr(data.sources) as LitSource[];
+  const sources = recArr<LitSource>(data.sources);
   const warnings = asArr(data.warnings).map((w) => asStr(w)).filter(Boolean);
   if (sources.length === 0 && warnings.length === 0) return null;
   return (
@@ -205,8 +215,8 @@ interface Claim {
 }
 
 function CitationCard({ data }: { data: Record<string, unknown> }) {
-  const verdicts = asArr(data.verdicts) as Verdict[];
-  const claims = asArr(data.claims) as Claim[];
+  const verdicts = recArr<Verdict>(data.verdicts);
+  const claims = recArr<Claim>(data.claims);
   // verify:逐条 identifier 的接地/撤稿。
   if (verdicts.length > 0) {
     return (
@@ -238,7 +248,7 @@ function CitationCard({ data }: { data: Record<string, unknown> }) {
   }
   // check / fix:已检 manifest——claim 接地状态(verified 绿 / unsupported 红)+ 其引用原文。
   if (claims.length > 0) {
-    const quotes = asArr(data.quotes) as QuoteRow[];
+    const quotes = recArr<QuoteRow>(data.quotes);
     const quoteById = new Map(quotes.map((q) => [asStr(q.id), q] as const));
     const verified = claims.filter((c) => c.status === "verified").length;
     const unsupported = claims.filter((c) => c.status === "unsupported").length;
@@ -303,7 +313,7 @@ function IngestCard({ data }: { data: Record<string, unknown> }) {
 // ── 检索片段卡(oc-litrag) ───────────────────────────────────────────────────
 
 function LitragCard({ data }: { data: Record<string, unknown> }) {
-  const quotes = asArr(data.quotes) as QuoteRow[];
+  const quotes = recArr<QuoteRow>(data.quotes);
   const missing = asArr(data.missing).map((m) => asStr(m)).filter(Boolean);
   if (quotes.length === 0 && missing.length === 0) return null;
   return (
@@ -372,7 +382,7 @@ interface Ranked {
 }
 
 function RankCard({ data }: { data: Record<string, unknown> }) {
-  const ranked = asArr(data.ranked) as Ranked[];
+  const ranked = recArr<Ranked>(data.ranked);
   if (ranked.length === 0) return null;
   return (
     <CardShell icon={<Trophy className="size-4" />} title="候选排名" subtitle={`${ranked.length} 项`}>
@@ -426,9 +436,9 @@ function MarketCard({ tool }: { tool: ToolLike }) {
   if (text) {
     try {
       const v = JSON.parse(text.trim());
-      if (Array.isArray(v)) items = v as MarketItem[];
-      else if (v && Array.isArray((v as { results?: unknown }).results))
-        items = (v as { results: MarketItem[] }).results;
+      if (Array.isArray(v)) items = v.filter(isRecord) as unknown as MarketItem[];
+      else if (isRecord(v) && Array.isArray(v.results))
+        items = (v.results as unknown[]).filter(isRecord) as unknown as MarketItem[];
     } catch {
       // 非 list 输出(install/uninstall 等)→ 不渲染,回落通用。
     }

@@ -160,4 +160,20 @@ describe("其余 oc-* 卡片", () => {
   test("oc-market install(非 list 输出)→ null 回落", () => {
     expect(researchToolCard("oc-market install x", tool({ output: '{"ok":true}' }))).toBeNull();
   });
+
+  test("畸形数组([null]/基本类型项)不崩,被过滤", () => {
+    // sources/verdicts/ranked/results 里混 null 或基本类型 —— 渲染不得抛。
+    const bad = (cmd: string, out: string) =>
+      expect(() => render(<div>{researchToolCard(cmd, tool({ output: out }))}</div>)).not.toThrow();
+    bad('oc-lit search "x"', '{"sources":[null,1,{"title":"真的"}],"warnings":[]}');
+    bad("oc-cite verify x", '{"verdicts":[null,{"identifier":"doi:1","resolved":true}]}');
+    bad("oc-cite check m", '{"claims":[null,{"text":"c","status":"verified"}],"quotes":[null]}');
+    bad("oc-rank elo m", '{"ranked":[null,{"id":"a","rating":1500}]}');
+    bad("oc-market search x", "[null, 7, {\"name\":\"X\",\"kind\":\"skill\"}]");
+    bad('oc-litrag query "q" --docs d', '{"quotes":[null,{"text":"片段"}],"missing":[]}');
+    cleanup();
+    // 过滤后仍能渲染有效项。
+    render(<div>{researchToolCard('oc-lit search "x"', tool({ output: '{"sources":[null,{"title":"真的"}]}' }))}</div>);
+    expect(screen.getByText("真的")).toBeInTheDocument();
+  });
 });
