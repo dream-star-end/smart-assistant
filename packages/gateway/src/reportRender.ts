@@ -13,6 +13,7 @@
  */
 
 import { type EvidenceManifest, type ReportSchema, formatCitation } from "@openclaude/protocol/research";
+import { lintAiTone } from "./styleLint.js";
 
 export interface BuildReportResult {
   markdown: string;
@@ -124,6 +125,13 @@ export function buildReportDocument(schema: ReportSchema, manifest: EvidenceMani
   const { verifiedClaims, totalClaims } = manifest.coverage;
   if (totalClaims > 0 && verifiedClaims < totalClaims) {
     warnings.push(`接地覆盖率 ${verifiedClaims}/${totalClaims};${totalClaims - verifiedClaims} 条论断未核查(已红标)`);
+  }
+
+  // 去 AI 味 style lint(软信号,非硬 gate)— 对正文(摘要+各章节)跑
+  const bodyText = [schema.abstract ?? "", ...schema.sections.map((s) => s.bodyMd)].join("\n");
+  const style = lintAiTone(bodyText);
+  for (const f of style.findings) {
+    warnings.push(`去AI味[${f.kind}]: "${f.sample.slice(0, 30)}" — ${f.hint}`);
   }
 
   return {
