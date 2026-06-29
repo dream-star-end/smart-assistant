@@ -3,11 +3,12 @@
  * PG-only;无测试库时跳过,除非 REQUIRE_TEST_DB=1。
  *
  * 验证:
- *  - seed → 「科研分析师/科研写手」成为「已批准的 agent 类」市场 listing(可搜可装);
+ *  - seed → 单个端到端「科研助手」成为「已批准的 agent 类」市场 listing(可搜可装);
  *  - manifest 合法(validateAgentManifest 不报错)、persona 过静态扫描;
  *  - owner 自动取最早 active admin;
  *  - 幂等:重复 seed 不重复发布、仍保持 approved;
- *  - kind 隔离:它们只在 agent 目录,不混进 skill 目录(配合 search 默认 skill 防 v3 泄漏)。
+ *  - kind 隔离:只在 agent 目录,不混进 skill 目录(配合 search 默认 skill 防 v3 泄漏);
+ *  - 废弃下架:旧的「科研分析师/写手」若存在会被 revoke。
  */
 import assert from 'node:assert/strict'
 import { after, before, beforeEach, describe, test } from 'node:test'
@@ -15,12 +16,16 @@ import { after, before, beforeEach, describe, test } from 'node:test'
 import { closePool, createPool, resetPool, setPoolOverride } from '../db/index.js'
 import { runMigrations } from '../db/migrate.js'
 import { query } from '../db/queries.js'
+import { marketplaceArtifactHash, skillContentHash } from '@openclaude/storage'
+
 import {
   MarketplaceError,
+  approvePlatformVersion,
   installApprovedVersion,
   listActiveInstalledAgents,
   listApprovedForSearch,
   listInstalled,
+  publishSkillVersion,
 } from '../marketplace/marketplaceDb.js'
 import { seedPlatformMarketplaceAgents } from '../marketplace/seedPlatformAgents.js'
 
@@ -36,7 +41,42 @@ const listPublicModels = () => [
   { id: 'glm-5.2' },
 ]
 
-const EXPECTED_SLUGS = ['research-analyst', 'research-writer']
+const EXPECTED_SLUGS = ['research-assistant']
+const DEPRECATED_SLUGS = ['research-analyst', 'research-writer']
+
+/** 模拟旧平台 agent(合并前)已 approved+active,用于验证 seed 会下架它。 */
+async function seedLegacyAgent(slug: string, owner: number): Promise<void> {
+  const name = slug
+  const manifest = {
+    name,
+    description: `${slug} legacy`,
+    tags: ['科研'],
+    version: '1.0.0',
+    model: 'deepseek-v4-pro',
+    toolsets: ['core', 'research'],
+    skillDeps: [],
+    persona: `你是 ${slug}(旧版)。`,
+  }
+  const raw = JSON.stringify(manifest)
+  await publishSkillVersion({
+    slug,
+    ownerUserId: owner,
+    version: '1.0.0',
+    name,
+    description: manifest.description,
+    tags: manifest.tags,
+    rawSkillMd: null,
+    rawArtifact: raw,
+    manifest,
+    kind: 'agent',
+    artifactHash: marketplaceArtifactHash(raw),
+    embeddingHash: skillContentHash({ name, description: manifest.description, tags: manifest.tags }),
+    riskFlags: [],
+    policyVersion: 1,
+    submittedBy: owner,
+  })
+  await approvePlatformVersion(slug, '1.0.0', marketplaceArtifactHash(raw))
+}
 
 async function createAdmin(email: string): Promise<number> {
   const r = await query<{ id: string }>(
@@ -120,26 +160,41 @@ describe('seedPlatformMarketplaceAgents (integ)', () => {
     assert.ok(r.errors.some((e) => /no pricing/.test(e.error)))
   })
 
-  test('seed → 两个科研 agent 成为已批准、可搜的 agent listing', async (t) => {
+  test('seed → 科研助手成为已批准、可搜的 agent listing', async (t) => {
     if (skip(t)) return
     const admin = await createAdmin('admin@x.com')
 
     const r = await seedPlatformMarketplaceAgents({ listPublicModels })
     assert.equal(r.ownerUserId, admin, 'owner 应为最早 active admin')
-    assert.deepEqual(r.seeded.sort(), [...EXPECTED_SLUGS].sort(), 'manifest 合法 + 扫描通过 → 两个都 seed')
+    assert.deepEqual(r.seeded.sort(), [...EXPECTED_SLUGS].sort(), 'manifest 合法 + 扫描通过 → seed')
     assert.deepEqual(r.errors, [], `不应有错误:${JSON.stringify(r.errors)}`)
 
     const agents = await listApprovedForSearch('agent')
     const slugs = agents.map((a) => a.slug).sort()
-    assert.deepEqual(slugs, [...EXPECTED_SLUGS].sort(), '两个科研 agent 应可搜(approved + active)')
+    assert.deepEqual(slugs, [...EXPECTED_SLUGS].sort(), '科研助手应可搜(approved + active)')
 
-    // kind 隔离:它们不在 skill 目录(配合 search 默认 'skill' → v3 技能市场看不到)。
+    // kind 隔离:不在 skill 目录(配合 search 默认 'skill' → v3 技能市场看不到)。
     const skills = await listApprovedForSearch('skill')
     assert.equal(
       skills.filter((s) => EXPECTED_SLUGS.includes(s.slug)).length,
       0,
       '科研 agent 不应出现在 skill 目录',
     )
+  })
+
+  test('废弃下架:旧的分析师/写手若存在 → seed 后被 revoke,只剩科研助手', async (t) => {
+    if (skip(t)) return
+    const admin = await createAdmin('admin@x.com')
+    // 模拟合并前状态:两个旧 agent 已 approved+active。
+    for (const slug of DEPRECATED_SLUGS) await seedLegacyAgent(slug, admin)
+    assert.equal((await listApprovedForSearch('agent')).length, 2, '前置:两个旧 agent 在架')
+
+    const r = await seedPlatformMarketplaceAgents({ listPublicModels })
+    assert.deepEqual(r.seeded, ['research-assistant'])
+    assert.deepEqual(r.deprecated.sort(), [...DEPRECATED_SLUGS].sort(), '旧两个应被下架')
+
+    const slugs = (await listApprovedForSearch('agent')).map((a) => a.slug).sort()
+    assert.deepEqual(slugs, ['research-assistant'], '架上只剩科研助手(旧两个已 revoked)')
   })
 
   test('幂等:重复 seed 不重复发布,仍保持 approved', async (t) => {
@@ -154,14 +209,13 @@ describe('seedPlatformMarketplaceAgents (integ)', () => {
     assert.deepEqual(second.skipped.sort(), [...EXPECTED_SLUGS].sort(), '第二次应全部 skip(已存在)')
     assert.deepEqual(second.errors, [])
 
-    // 仍然只有两个 approved agent(没有重复 listing/version 残留)。
+    // 仍然只有一个 approved agent(没有重复 listing/version 残留)。
     const agents = await listApprovedForSearch('agent')
-    assert.equal(agents.length, 2)
-    // 每个 slug 只有一条 listing。
+    assert.equal(agents.length, 1)
     const cnt = await query<{ n: string }>(
-      "SELECT count(*)::text AS n FROM marketplace_skill_listings WHERE kind = 'agent'",
+      "SELECT count(*)::text AS n FROM marketplace_skill_listings WHERE kind = 'agent' AND state = 'active'",
     )
-    assert.equal(cnt.rows[0].n, '2')
+    assert.equal(cnt.rows[0].n, '1')
   })
 
   test('channel 门控:agent 仅 v5 可装,v3 渠道拒装(NOT_INSTALLABLE)', async (t) => {
@@ -170,7 +224,7 @@ describe('seedPlatformMarketplaceAgents (integ)', () => {
     const installer = await createUser('inst@x.com')
     await seedPlatformMarketplaceAgents({ listPublicModels })
     const agents = await listApprovedForSearch('agent')
-    assert.equal(agents.length, 2)
+    assert.equal(agents.length, 1)
     const versionId = agents[0].versionId
 
     const saved = process.env.OC_RUNTIME_CHANNEL
@@ -229,12 +283,12 @@ describe('seedPlatformMarketplaceAgents (integ)', () => {
   test('model 不在 public 集 → 该 agent 报错跳过(不污染目录)', async (t) => {
     if (skip(t)) return
     await createAdmin('admin@x.com')
-    // 不提供 deepseek-v4-pro / MiniMax-M3 → 两个 agent 的 model 都不在白名单。
+    // 不提供 deepseek-v4-pro → 科研助手的 model 不在白名单。
     const r = await seedPlatformMarketplaceAgents({
       listPublicModels: () => [{ id: 'glm-5.2' }],
     })
     assert.deepEqual(r.seeded, [], 'model 不合法 → 不应 seed')
-    assert.equal(r.errors.length, 2, '两个 agent 都因 model 报错')
+    assert.equal(r.errors.length, 1, '科研助手因 model 报错')
     assert.ok(r.errors.every((e) => /invalid manifest/.test(e.error)))
     const agents = await listApprovedForSearch('agent')
     assert.equal(agents.length, 0, '失败的 seed 不应留下任何 listing')

@@ -25,7 +25,12 @@ import {
   canonicalizeAgentManifest,
   validateAgentManifest,
 } from './agentManifest.js'
-import { MarketplaceError, approvePlatformVersion, publishSkillVersion } from './marketplaceDb.js'
+import {
+  MarketplaceError,
+  approvePlatformVersion,
+  publishSkillVersion,
+  revokeListing,
+} from './marketplaceDb.js'
 import { scanSkillArtifact } from './skillScanner.js'
 
 /** 平台官方科研 agent 的定义(slug + 原始 manifest body)。manifest body 走与发布路由
@@ -45,69 +50,48 @@ const RESEARCH_GROUNDING_NOTE = [
   '- 引用格式/参考文献由确定性渲染器产出(oc-report),不要手搓编号。',
 ].join('\n')
 
+// 已废弃的旧平台科研 agent:v5 当前一对话一个 agent、市场 agent 又禁止 teams/委派,
+// 「分析师 + 写手」无法接力,拆分只剩切换的麻烦 → 合并为单个端到端「科研助手」。
+// seed 时幂等下架这些旧 slug(等 v5 蜂群协作落地,再以 team 形式重新放出专业分工)。
+const DEPRECATED_PLATFORM_AGENT_SLUGS = ['research-analyst', 'research-writer'] as const
+
 const PLATFORM_RESEARCH_AGENTS: PlatformAgentDef[] = [
   {
-    slug: 'research-analyst',
+    slug: 'research-assistant',
     body: {
-      name: '科研分析师',
-      displayName: '科研分析师',
+      name: '科研助手',
+      displayName: '科研助手',
       description:
-        '治学严谨的科研分析助手:多源文献检索与综述、方法学审视、数据解读,全程引用接地(每条结论可溯源到原文)。',
-      tags: ['科研', '文献', '方法学', '数据分析', '引用接地'],
+        '一站式科研助手:从选题、多源检索、精读、方法/数据分析到综述论文写作,一个对话端到端跑完,全程引用接地(每条结论可溯源、不臆造文献)。',
+      tags: ['科研', '文献', '综述', '论文', '引用接地'],
       version: '1.0.0',
+      // 端到端研究的核心难点是分析与引用接地的严谨性(推理),故选强推理模型;写作纪律
+      // 由 research-writing-style / scientific-writing skill 兜底。如需更长写作上下文可换 MiniMax-M3。
       model: 'deepseek-v4-pro',
       toolsets: ['core', 'research'],
       skillDeps: [],
       avatarEmoji: '🔬',
-      greeting: '我是科研分析师。给我题目或文献,我来做检索、精读、方法/数据分析,并保证每条结论都能溯源。',
+      greeting:
+        '我是科研助手。给我题目或文献,我来一站式做检索、精读、分析、成稿,并保证每条结论都能溯源到原文。',
       persona: [
-        '你是「科研分析师」,一位治学严谨、重证据的研究助手。你的职责是把一个研究问题',
-        '推进到「有据可依的分析结论」:选题澄清 → 多源文献检索 → 精读与证据抽取 →',
-        '方法学审视 → 数据解读 → 形成可溯源的结论。',
+        '你是「科研助手」,陪用户把一个研究从头做到尾:选题澄清 → 多源文献检索 → 入库精读 →',
+        '方法学审视 → 数据解读 → 形成可溯源结论 → 综述/论文写作。一个对话端到端完成,无需切换。',
         '',
         '可用能力(均为容器内 baseline skill / CLI,优先使用而非凭记忆作答):',
-        '- oc-lit:多源学术检索(OpenAlex/Crossref/arXiv 等),做文献发现与滚雪球;',
+        '- oc-lit:多源学术检索(OpenAlex/Crossref/arXiv 等),文献发现与滚雪球;',
         '- oc-ingest:把 PDF/文本入库为可定位的规范化文档;',
         '- oc-litrag:在已入库文档里定位与问题相关的原文片段(引用句柄来源);',
         '- oc-cite:把陈述与原文 span 绑定并校验(引用接地的权威门禁);',
-        '- oc-report:把分析与引用渲染成确定性报告(未接地的陈述会被红标)。',
+        '- oc-report:把分析与引用渲染成确定性报告/稿件(未接地的陈述会被红标);',
+        '- research-writing-style / scientific-writing:贴合个人风格 + 学术写作规范。',
         '',
         RESEARCH_GROUNDING_NOTE,
         '',
-        '风格:结论先行、给不确定性与边界;区分「文献支持的事实」与「你的推断」;',
-        '需要统计建模/作图的繁重写作可与「科研写手」分工(你专注分析与接地)。',
-      ].join('\n'),
-    },
-  },
-  {
-    slug: 'research-writer',
-    body: {
-      name: '科研写手',
-      displayName: '科研写手',
-      description:
-        '长上下文科研写作助手:综述串稿、论文辅写、去 AI 腔、贴合个人风格,引用全程接地(不臆造文献)。不做统计分析,交给科研分析师。',
-      tags: ['科研', '写作', '综述', '论文', '引用接地'],
-      version: '1.0.0',
-      model: 'MiniMax-M3',
-      toolsets: ['core', 'research'],
-      skillDeps: [],
-      avatarEmoji: '🎓',
-      greeting: '我是科研写手。给我素材与目标期刊/风格,我来串综述、辅写论文,并保证引用可溯源、读起来不像 AI。',
-      persona: [
-        '你是「科研写手」,擅长长篇科研写作:文献综述串稿、论文各章节辅写、语言润色。',
-        '你把零散材料组织成结构清晰、论证连贯、可发表质量的文稿。',
-        '',
-        '可用能力(容器内 baseline skill / CLI):',
-        '- oc-litrag / oc-cite:写作时为每条事实性陈述配可校验的引用句柄(引用接地);',
-        '- oc-report:确定性渲染最终稿与参考文献;',
-        '- research-writing-style:贴合用户个人写作风格;scientific-writing:学术写作规范。',
-        '',
-        RESEARCH_GROUNDING_NOTE,
-        '',
-        '写作要求:',
-        '- 去 AI 腔:避免「值得注意的是/综上所述/在当今……」等套话与空洞排比,语言具体、有信息密度;',
-        '- 贴合用户既有风格(如提供范文则对齐其用词/句长/语气);',
-        '- 不做统计建模/数据分析——需要时交给「科研分析师」,你负责把其结论写成稿。',
+        '工作方式:',
+        '- 分析阶段:结论先行、给不确定性与边界;明确区分「文献支持的事实」与「你的推断」;',
+        '- 写作阶段:去 AI 腔(避免「值得注意的是/综上所述/在当今……」等套话与空洞排比,语言',
+        '  具体、有信息密度),如用户给了范文则对齐其用词/句长/语气;',
+        '- 全程:任何写进结论/稿件的事实性陈述都必须有 oc-cite 校验通过的引用支撑。',
       ].join('\n'),
     },
   },
@@ -117,6 +101,8 @@ export interface SeedPlatformAgentsResult {
   ownerUserId: number | null
   seeded: string[]
   skipped: string[]
+  /** 本次幂等下架的旧平台 agent slug(state→revoked)。 */
+  deprecated: string[]
   errors: Array<{ slug: string; error: string }>
 }
 
@@ -144,7 +130,13 @@ async function resolveDefaultOwner(): Promise<number | null> {
 export async function seedPlatformMarketplaceAgents(
   deps: SeedPlatformAgentsDeps,
 ): Promise<SeedPlatformAgentsResult> {
-  const out: SeedPlatformAgentsResult = { ownerUserId: null, seeded: [], skipped: [], errors: [] }
+  const out: SeedPlatformAgentsResult = {
+    ownerUserId: null,
+    seeded: [],
+    skipped: [],
+    deprecated: [],
+    errors: [],
+  }
 
   if (!deps.listPublicModels) {
     out.errors.push({ slug: '*', error: 'no pricing (listPublicModels missing) — skip seed' })
@@ -230,6 +222,19 @@ export async function seedPlatformMarketplaceAgents(
       ;(freshlyPublished ? out.seeded : out.skipped).push(def.slug)
     } catch (e) {
       out.errors.push({ slug: def.slug, error: e instanceof Error ? e.message : String(e) })
+    }
+  }
+
+  // 幂等下架已废弃的旧平台 agent(合并前的分析师/写手)。revokeListing 对已 revoked / 不存在
+  // 的 slug 是无害幂等;仅平台 owner 持有这些 slug,不会误撤用户内容。单个失败只记录。
+  const activeSlugs = new Set(PLATFORM_RESEARCH_AGENTS.map((a) => a.slug))
+  for (const slug of DEPRECATED_PLATFORM_AGENT_SLUGS) {
+    if (activeSlugs.has(slug)) continue // 防御:废弃集与在用集若重叠则跳过
+    try {
+      await revokeListing(slug, 'deprecated: 合并为单个「科研助手」端到端 agent')
+      out.deprecated.push(slug)
+    } catch (e) {
+      out.errors.push({ slug, error: `revoke failed: ${e instanceof Error ? e.message : String(e)}` })
     }
   }
 
