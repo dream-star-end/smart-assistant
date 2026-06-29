@@ -514,16 +514,20 @@ export async function listInstalled(userId: number): Promise<InstalledRow[]> {
       ORDER BY i.installed_at DESC`,
     [userId],
   )
-  return r.rows.map((x) => ({
-    slug: x.slug,
-    kind: x.kind as ArtifactKind,
-    version: x.version,
-    versionId: x.version_id,
-    name: x.name,
-    artifactHash: x.artifact_hash,
-    installedAt: x.installed_at,
-    listingState: x.state,
-  }))
+  // agent 类仅 v5:v3 渠道滤掉已装 agent(共享 installs 跨渠道,见 listActiveInstalledAgents)。
+  const agentsOk = marketplaceAgentsEnabled()
+  return r.rows
+    .filter((x) => agentsOk || x.kind !== 'agent')
+    .map((x) => ({
+      slug: x.slug,
+      kind: x.kind as ArtifactKind,
+      version: x.version,
+      versionId: x.version_id,
+      name: x.name,
+      artifactHash: x.artifact_hash,
+      installedAt: x.installed_at,
+      listingState: x.state,
+    }))
 }
 
 export interface InstalledArtifact {
@@ -580,6 +584,10 @@ export interface InstalledAgent {
  * Excludes revoked listings (kill-switch) + requires a non-null raw_artifact.
  */
 export async function listActiveInstalledAgents(userId: number): Promise<InstalledAgent[]> {
+  // agent 类仅 v5。marketplace_installs 是 v3/v5 共享且非渠道隔离:同一用户在 v5 装过、
+  // 或本次门控前已装的 agent,若不在此过滤,会经容器 sync(reconcileAgents → agents.yaml)
+  // 在 v3 容器复活(v3 无对应能力 → 坏 agent),也会出现在 v3 my-agents。v3 渠道直接返空。
+  if (!marketplaceAgentsEnabled()) return []
   const r = await query<{
     slug: string
     version: string

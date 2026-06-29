@@ -18,7 +18,9 @@ import { query } from '../db/queries.js'
 import {
   MarketplaceError,
   installApprovedVersion,
+  listActiveInstalledAgents,
   listApprovedForSearch,
+  listInstalled,
 } from '../marketplace/marketplaceDb.js'
 import { seedPlatformMarketplaceAgents } from '../marketplace/seedPlatformAgents.js'
 
@@ -186,6 +188,40 @@ describe('seedPlatformMarketplaceAgents (integ)', () => {
       assert.equal(r.slug, agents[0].slug)
     } finally {
       // 还原(空串与未设在 marketplaceAgentsEnabled 下等价:都回落 'v3')。
+      process.env.OC_RUNTIME_CHANNEL = saved ?? ''
+    }
+  })
+
+  test('channel 门控读侧:v3 不返回已装 agent(防 my-agents/容器 sync 复活)', async (t) => {
+    if (skip(t)) return
+    await createAdmin('admin@x.com')
+    const installer = await createUser('inst@x.com')
+    await seedPlatformMarketplaceAgents({ listPublicModels })
+    const agents = await listApprovedForSearch('agent')
+    const saved = process.env.OC_RUNTIME_CHANNEL
+    try {
+      // 在 v5 上装一个 agent。
+      process.env.OC_RUNTIME_CHANNEL = 'v5'
+      await installApprovedVersion({ userId: installer, versionId: agents[0].versionId })
+      assert.equal((await listActiveInstalledAgents(installer)).length, 1, 'v5 应可见已装 agent')
+      assert.equal(
+        (await listInstalled(installer)).filter((r) => r.kind === 'agent').length,
+        1,
+        'v5 installed 应含 agent',
+      )
+      // 切到 v3:读侧应滤空(容器 sync reconcileAgents 不会复活、my-agents 不显示)。
+      process.env.OC_RUNTIME_CHANNEL = 'v3'
+      assert.equal(
+        (await listActiveInstalledAgents(installer)).length,
+        0,
+        'v3 不应返回已装 agent(防容器复活)',
+      )
+      assert.equal(
+        (await listInstalled(installer)).filter((r) => r.kind === 'agent').length,
+        0,
+        'v3 installed 应滤掉 agent',
+      )
+    } finally {
       process.env.OC_RUNTIME_CHANNEL = saved ?? ''
     }
   })
