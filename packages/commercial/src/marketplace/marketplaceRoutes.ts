@@ -18,6 +18,7 @@ import {
   getApprovedSkillVersions,
   getListingDetail,
   installApprovedVersion,
+  marketplaceAgentsEnabled,
   listActiveInstalledAgents,
   listInstalled,
   listPendingVersions,
@@ -406,6 +407,9 @@ export async function handleMarketplaceDetail(
   if (!SLUG_RE.test(slug)) throw new HttpError(400, 'BAD_SLUG', 'invalid slug')
   const detail = await getListingDetail(slug)
   if (!detail) throw new HttpError(404, 'NOT_FOUND', 'skill 不存在或未上架')
+  // agent 类仅 v5 露出:v3 渠道上视同不存在(防止据 slug 取 detail→versionId 旁路)。
+  if (detail.kind === 'agent' && !marketplaceAgentsEnabled())
+    throw new HttpError(404, 'NOT_FOUND', 'skill 不存在或未上架')
   sendJson(res, 200, { detail })
 }
 

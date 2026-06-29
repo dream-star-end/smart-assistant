@@ -41,6 +41,7 @@ import {
   installApprovedVersion,
   listApprovedForSearch,
   listInstalled,
+  marketplaceAgentsEnabled,
   publishSkillVersion,
   recordUninstall,
 } from '../marketplace/marketplaceDb.js'
@@ -155,7 +156,12 @@ export function makeMarketplaceAgentHandler(deps: MarketplaceAgentDeps): Marketp
           send(res, 200, { results: [] }, requestId)
           return
         }
-        const kind = kindParam === 'agent' || kindParam === 'skill' ? kindParam : undefined
+        // 无 kind → 默认 'skill';agent 类仅 v5(v3 容器无对应能力,装了即坏)。
+        const kind = kindParam === 'agent' ? 'agent' : 'skill'
+        if (kind === 'agent' && !marketplaceAgentsEnabled()) {
+          send(res, 200, { results: [] }, requestId)
+          return
+        }
         const q = (url.searchParams.get('q') ?? '').trim().toLowerCase().slice(0, 200)
         const limit = Math.min(
           Math.max(Number.parseInt(url.searchParams.get('limit') ?? '20', 10) || 20, 1),
@@ -192,7 +198,8 @@ export function makeMarketplaceAgentHandler(deps: MarketplaceAgentDeps): Marketp
         const slug = url.searchParams.get('slug') ?? ''
         if (!SLUG_RE.test(slug)) return send(res, 400, { error: { code: 'BAD_SLUG' } }, requestId)
         const detail = await getListingDetail(slug)
-        if (!detail)
+        // agent 类仅 v5 露出:v3 渠道视同不存在(防 slug→detail→versionId 旁路装坏 agent)。
+        if (!detail || (detail.kind === 'agent' && !marketplaceAgentsEnabled()))
           return send(
             res,
             404,

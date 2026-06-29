@@ -15,7 +15,11 @@ import { after, before, beforeEach, describe, test } from 'node:test'
 import { closePool, createPool, resetPool, setPoolOverride } from '../db/index.js'
 import { runMigrations } from '../db/migrate.js'
 import { query } from '../db/queries.js'
-import { listApprovedForSearch } from '../marketplace/marketplaceDb.js'
+import {
+  MarketplaceError,
+  installApprovedVersion,
+  listApprovedForSearch,
+} from '../marketplace/marketplaceDb.js'
 import { seedPlatformMarketplaceAgents } from '../marketplace/seedPlatformAgents.js'
 
 const TEST_DB_URL =
@@ -35,6 +39,13 @@ const EXPECTED_SLUGS = ['research-analyst', 'research-writer']
 async function createAdmin(email: string): Promise<number> {
   const r = await query<{ id: string }>(
     "INSERT INTO users(email, password_hash, credits, role, status) VALUES ($1,'stub',0,'admin','active') RETURNING id::text AS id",
+    [email],
+  )
+  return Number.parseInt(r.rows[0].id, 10)
+}
+async function createUser(email: string): Promise<number> {
+  const r = await query<{ id: string }>(
+    "INSERT INTO users(email, password_hash, credits, role, status) VALUES ($1,'stub',0,'user','active') RETURNING id::text AS id",
     [email],
   )
   return Number.parseInt(r.rows[0].id, 10)
@@ -149,6 +160,34 @@ describe('seedPlatformMarketplaceAgents (integ)', () => {
       "SELECT count(*)::text AS n FROM marketplace_skill_listings WHERE kind = 'agent'",
     )
     assert.equal(cnt.rows[0].n, '2')
+  })
+
+  test('channel 门控:agent 仅 v5 可装,v3 渠道拒装(NOT_INSTALLABLE)', async (t) => {
+    if (skip(t)) return
+    await createAdmin('admin@x.com')
+    const installer = await createUser('inst@x.com')
+    await seedPlatformMarketplaceAgents({ listPublicModels })
+    const agents = await listApprovedForSearch('agent')
+    assert.equal(agents.length, 2)
+    const versionId = agents[0].versionId
+
+    const saved = process.env.OC_RUNTIME_CHANNEL
+    try {
+      // v3 渠道(或未设)→ agent 不可装。
+      process.env.OC_RUNTIME_CHANNEL = 'v3'
+      await assert.rejects(
+        () => installApprovedVersion({ userId: installer, versionId }),
+        (e: unknown) => e instanceof MarketplaceError && e.code === 'NOT_INSTALLABLE',
+        'v3 渠道应拒装 agent',
+      )
+      // v5 渠道 → 可装。
+      process.env.OC_RUNTIME_CHANNEL = 'v5'
+      const r = await installApprovedVersion({ userId: installer, versionId })
+      assert.equal(r.slug, agents[0].slug)
+    } finally {
+      // 还原(空串与未设在 marketplaceAgentsEnabled 下等价:都回落 'v3')。
+      process.env.OC_RUNTIME_CHANNEL = saved ?? ''
+    }
   })
 
   test('model 不在 public 集 → 该 agent 报错跳过(不污染目录)', async (t) => {

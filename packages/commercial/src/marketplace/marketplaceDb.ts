@@ -26,12 +26,28 @@ export class MarketplaceError extends Error {
       | 'NOT_PENDING'
       | 'REVIEWER_IS_AUTHOR'
       | 'NOT_INSTALLABLE'
-      | 'KIND_MISMATCH',
+      | 'KIND_MISMATCH'
+      | 'ARTIFACT_MISMATCH',
     message: string,
   ) {
     super(message)
     this.name = 'MarketplaceError'
   }
+}
+
+/**
+ * Agent-kind marketplace is v5-only. v3 is skill-only (its vanilla UI + container
+ * image lack the agent surface), but v3/v5 share one PG including the marketplace
+ * tables — so an approved agent listing is, without this gate, discoverable AND
+ * installable from v3 where it cannot work (no research baseline skills / CLIs).
+ * Every agent-kind surface (search / detail / install, public + internal) gates on
+ * this single predicate, keyed on the runtime channel. After v5 graduates to v3
+ * the channel collapses and the gate is a no-op.
+ */
+export function marketplaceAgentsEnabled(
+  channel: string = process.env.OC_RUNTIME_CHANNEL?.trim() || 'v3',
+): boolean {
+  return channel === 'v5'
 }
 
 export interface PublishInput {
@@ -242,15 +258,35 @@ export async function reviewVersion(args: {
  * Throws VERSION_NOT_FOUND if the (slug, version) is absent. Marketplace SQL stays
  * the single authority here (callers never hand-write listing/version SQL).
  */
-export async function approvePlatformVersion(slug: string, version: string): Promise<void> {
+export async function approvePlatformVersion(
+  slug: string,
+  version: string,
+  expectedArtifactHash: string,
+): Promise<void> {
   await tx(async (c) => {
-    const v = await query<{ id: string }>(
-      'SELECT id::text FROM marketplace_skill_versions WHERE slug = $1 AND version = $2 FOR UPDATE',
+    const v = await query<{ id: string; artifact_hash: string; kind: string }>(
+      `SELECT v.id::text, v.artifact_hash, l.kind
+         FROM marketplace_skill_versions v
+         JOIN marketplace_skill_listings l ON l.slug = v.slug
+        WHERE v.slug = $1 AND v.version = $2
+        FOR UPDATE OF v`,
       [slug, version],
       c,
     )
     const row = v.rows[0]
     if (!row) throw new MarketplaceError('VERSION_NOT_FOUND', `version ${slug}@${version} 不存在`)
+    // 只批准 agent 类(平台 seed 只产 agent)+ 内容必须与代码定义一致。否则可能把一个
+    // 早已存在的同名同版本(他人/历史/被拒)版本误批成「官方」——绝不批准外来内容。
+    if (row.kind !== 'agent')
+      throw new MarketplaceError(
+        'KIND_MISMATCH',
+        `platform seed 期望 agent 类,实际 ${row.kind}(${slug}@${version})`,
+      )
+    if (row.artifact_hash !== expectedArtifactHash)
+      throw new MarketplaceError(
+        'ARTIFACT_MISMATCH',
+        `platform seed artifact 不匹配,拒绝批准外来内容(${slug}@${version})`,
+      )
     await query(
       `UPDATE marketplace_skill_versions
           SET status = 'approved', reviewed_by = submitted_by, reviewed_at = NOW(),
@@ -401,11 +437,11 @@ export async function installApprovedVersion(args: {
       version: string
       name: string
       artifact_hash: string
+      kind: string
     }>(
-      // Kind-agnostic install: records the pinned install row for skill OR agent.
-      // Kind-specific delivery happens in the container sync (skill→hub/skills,
-      // agent→agents.yaml). M3 wired the agent delivery path, so both are installable.
-      `SELECT v.slug, v.version, v.name, v.artifact_hash
+      // Kind-agnostic delivery (skill→hub/skills, agent→agents.yaml), but the
+      // install row carries the listing kind so we can channel-gate agents below.
+      `SELECT v.slug, v.version, v.name, v.artifact_hash, l.kind
          FROM marketplace_skill_versions v
          JOIN marketplace_skill_listings l ON l.slug = v.slug
         WHERE v.id = $1 AND v.status = 'approved' AND l.state = 'active'
@@ -417,6 +453,10 @@ export async function installApprovedVersion(args: {
     const row = v.rows[0]
     if (!row)
       throw new MarketplaceError('NOT_INSTALLABLE', 'skill 不可安装(未上架/已下架/非当前版本)')
+    // agent 类仅 v5 可装(单一总闸:覆盖浏览器 install + 容器内 internal install +
+    // agent 的 skillDep 联动)。skillDep 都是 kind='skill',不受影响。
+    if (row.kind === 'agent' && !marketplaceAgentsEnabled())
+      throw new MarketplaceError('NOT_INSTALLABLE', 'agent 类市场仅在 v5 可用')
 
     await query(
       `UPDATE marketplace_installs SET uninstalled_at = NOW()

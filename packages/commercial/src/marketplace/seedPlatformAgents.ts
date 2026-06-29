@@ -193,8 +193,10 @@ export async function seedPlatformMarketplaceAgents(
       }
 
       const rawArtifact = canonicalizeAgentManifest(manifest)
+      const artifactHash = marketplaceArtifactHash(rawArtifact)
       // 复用发布路由的同一套插入。已存在同 (slug, version) → DUPLICATE_VERSION,视为已 seed,
-      // 继续走 approvePlatformVersion 确保其 approved(幂等)。
+      // 继续走 approvePlatformVersion 确保其 approved(幂等)。approvePlatformVersion 会校验
+      // 已存在版本的 artifact_hash 与本次一致(否则拒批),防止把外来/历史同名版本误批成官方。
       let freshlyPublished = false
       try {
         await publishSkillVersion({
@@ -208,7 +210,7 @@ export async function seedPlatformMarketplaceAgents(
           rawArtifact,
           manifest,
           kind: 'agent',
-          artifactHash: marketplaceArtifactHash(rawArtifact),
+          artifactHash,
           embeddingHash: skillContentHash({
             name: manifest.name,
             description: manifest.description,
@@ -223,8 +225,8 @@ export async function seedPlatformMarketplaceAgents(
         if (!(e instanceof MarketplaceError && e.code === 'DUPLICATE_VERSION')) throw e
       }
 
-      // 平台自审批(官方内容,不走 reviewer≠author);幂等。
-      await approvePlatformVersion(def.slug, manifest.version)
+      // 平台自审批(官方内容,不走 reviewer≠author);幂等 + 校验内容一致。
+      await approvePlatformVersion(def.slug, manifest.version, artifactHash)
       ;(freshlyPublished ? out.seeded : out.skipped).push(def.slug)
     } catch (e) {
       out.errors.push({ slug: def.slug, error: e instanceof Error ? e.message : String(e) })

@@ -22,7 +22,12 @@ import { directEgressDispatcher } from '../account-pool/egressDispatcher.js'
 import { requireAuth } from '../http/auth.js'
 import { makePgSkillEmbedCache } from '../http/skillEmbedCachePg.js'
 import { sendJson } from '../http/util.js'
-import { type ApprovedSearchRow, type ArtifactKind, listApprovedForSearch } from './marketplaceDb.js'
+import {
+  type ApprovedSearchRow,
+  type ArtifactKind,
+  listApprovedForSearch,
+  marketplaceAgentsEnabled,
+} from './marketplaceDb.js'
 
 const cache = makePgSkillEmbedCache()
 
@@ -60,6 +65,11 @@ export async function handleMarketplaceSearch(
   // 装了即坏。v5 web-react BrowsePanel 每个分页都显式传 kind('skill'/'agent'),不受影响。
   // 共享 DB 下,这是"v5 专属 agent 不泄漏给 v3"收敛到单一权威的最小改。
   const kind: ArtifactKind = kindParam === 'agent' ? 'agent' : 'skill'
+  // agent 类市场仅 v5 可用(共享 DB,v3 容器无对应能力)。v3 渠道上 agent 搜索一律返空。
+  if (kind === 'agent' && !marketplaceAgentsEnabled()) {
+    sendJson(res, 200, { results: [], method: 'all' })
+    return
+  }
 
   const catalog = await listApprovedForSearch(kind)
   if (catalog.length === 0 || !q) {
