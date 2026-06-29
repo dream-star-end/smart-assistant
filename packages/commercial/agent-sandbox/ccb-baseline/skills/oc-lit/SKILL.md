@@ -42,6 +42,12 @@ oc-lit snowball <DOI|arXiv|OpenAlex id> [--direction backward|forward|both] [--s
 - 展示给用户的每条文献都带 `doi` / `arxivId`,便于回查;**不要瞎编 DOI/arXiv 编号**。
 - 写报告/综述时,文献的"是否可信、是否撤稿、引用格式"交给 `oc-cite` 校验与生成,不要自己手搓引用。
 
+## 工具调用纪律(重要)
+
+- **只用本 skill 对应的 `oc-*` 命令传参调用**;CLI 已把鉴权、端点、proxy 全部封装好,你只需给参数,不必关心底层怎么请求。
+- **绝不**自己拼 `curl` / `wget` / 直连 HTTP 调用,**绝不**猜测或硬编码任何 URL / 端口 / 接口路径 / token —— 那样既会失败也不安全。
+- 命令失败(401/429/503/超时)按下方「安全」段处理:重试本命令、或如实告诉用户,**绝不**改用 curl/HTTP 兜底。
+
 ## 安全
 
 - 不打印/回显容器身份 token(`OPENCLAUDE_V3_CONTAINER_TOKEN`):不要 `echo`、`printenv`、`set -x`、`/proc/*/environ`。

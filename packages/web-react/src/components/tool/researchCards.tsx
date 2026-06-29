@@ -13,7 +13,9 @@ import {
   CheckCircle2,
   Database,
   ExternalLink,
+  FileText,
   FileOutput,
+  Package,
   Quote,
   Search,
   Trophy,
@@ -394,37 +396,106 @@ function RankCard({ data }: { data: Record<string, unknown> }) {
   );
 }
 
+// ── 文档产物卡(oc-docx) ─────────────────────────────────────────────────────
+
+function DocxCard({ command }: { command: string }) {
+  // oc-docx 输出是 pandoc/quarto(非 JSON),从命令解析输出文件名。
+  const m = command.match(/(?:-o|--output)\s+(\S+)/) ?? command.match(/(\S+\.docx)\b/);
+  const out = m?.[1] ?? "";
+  const fileName = out ? out.replace(/^['"]|['"]$/g, "").split("/").pop() : "文档.docx";
+  return (
+    <CardShell icon={<FileText className="size-4" />} title="Word 文档已生成" subtitle={fileName || undefined}>
+      <div className="text-xs text-faint">可在文件区下载;数学公式/排版已按高质量 Word 模板渲染。</div>
+    </CardShell>
+  );
+}
+
+// ── 技能市场卡(oc-market search / installed) ────────────────────────────────
+
+interface MarketItem {
+  slug?: string;
+  name?: string;
+  description?: string;
+  kind?: string;
+  version?: string;
+}
+
+function MarketCard({ tool }: { tool: ToolLike }) {
+  const text = outputText(tool);
+  let items: MarketItem[] = [];
+  if (text) {
+    try {
+      const v = JSON.parse(text.trim());
+      if (Array.isArray(v)) items = v as MarketItem[];
+      else if (v && Array.isArray((v as { results?: unknown }).results))
+        items = (v as { results: MarketItem[] }).results;
+    } catch {
+      // 非 list 输出(install/uninstall 等)→ 不渲染,回落通用。
+    }
+  }
+  if (items.length === 0) return null;
+  return (
+    <CardShell icon={<Package className="size-4" />} title="技能市场" subtitle={`${items.length} 项`}>
+      <ul className="flex flex-col divide-y divide-border">
+        {items.slice(0, 30).map((it, i) => (
+          <li key={it.slug || `${i}`} className="py-2 first:pt-0 last:pb-0">
+            <div className="flex items-center gap-2">
+              <span className="text-[13px] text-fg">{asStr(it.name) || asStr(it.slug)}</span>
+              {it.kind && <Chip>{it.kind === "agent" ? "智能体" : "技能"}</Chip>}
+              {it.version && <Chip>v{asStr(it.version)}</Chip>}
+            </div>
+            {it.description && (
+              <div className="mt-0.5 line-clamp-2 text-xs text-faint">{asStr(it.description)}</div>
+            )}
+          </li>
+        ))}
+      </ul>
+    </CardShell>
+  );
+}
+
 // ── 注册表 + 分派入口 ────────────────────────────────────────────────────────
 
 interface CardEntry {
-  /** 命令命中判定 */
+  /** 命令命中判定(可执行名 == 工具名)。 */
   match: (command: string) => boolean;
-  /** 解析出的 JSON → 卡片(返回 null 表示这条不渲染,回落通用) */
-  render: (data: Record<string, unknown>, tool: ToolLike) => ReactNode | null;
+  /**
+   * 渲染。**直接调用卡片函数**(而非 `<Card/>` JSX 实例化),使卡片返回的 null 能正确透传:
+   * 否则 `<Card/>` 元素恒为真值,即便卡片渲染 null,BashBody 也会 early-return 空卡、不回落通用。
+   */
+  render: (command: string, tool: ToolLike) => ReactNode | null;
 }
 
-const RESEARCH_CARD_REGISTRY: CardEntry[] = [
-  { match: (c) => matchOcTool(c, "oc-lit"), render: (data) => <LiteratureCard data={data} /> },
-  { match: (c) => matchOcTool(c, "oc-cite"), render: (data) => <CitationCard data={data} /> },
-  { match: (c) => matchOcTool(c, "oc-ingest"), render: (data) => <IngestCard data={data} /> },
-  { match: (c) => matchOcTool(c, "oc-litrag"), render: (data) => <LitragCard data={data} /> },
-  { match: (c) => matchOcTool(c, "oc-report"), render: (data) => <ArtifactCard data={data} /> },
-  { match: (c) => matchOcTool(c, "oc-slides"), render: (data) => <ArtifactCard data={data} /> },
-  { match: (c) => matchOcTool(c, "oc-poster"), render: (data) => <ArtifactCard data={data} /> },
-  { match: (c) => matchOcTool(c, "oc-rank"), render: (data) => <RankCard data={data} /> },
+/** 解析对象型输出,交给对象卡片函数(解析失败/卡片判空 → null 回落)。 */
+function obj(tool: ToolLike, card: (p: { data: Record<string, unknown> }) => ReactNode | null): ReactNode | null {
+  const data = looseJson(outputText(tool));
+  return data ? card({ data }) : null;
+}
+
+const TOOL_CARD_REGISTRY: CardEntry[] = [
+  // 研究工具(对象型 JSON 输出)。
+  { match: (c) => matchOcTool(c, "oc-lit"), render: (_c, t) => obj(t, LiteratureCard) },
+  { match: (c) => matchOcTool(c, "oc-cite"), render: (_c, t) => obj(t, CitationCard) },
+  { match: (c) => matchOcTool(c, "oc-ingest"), render: (_c, t) => obj(t, IngestCard) },
+  { match: (c) => matchOcTool(c, "oc-litrag"), render: (_c, t) => obj(t, LitragCard) },
+  { match: (c) => matchOcTool(c, "oc-report"), render: (_c, t) => obj(t, ArtifactCard) },
+  { match: (c) => matchOcTool(c, "oc-slides"), render: (_c, t) => obj(t, ArtifactCard) },
+  { match: (c) => matchOcTool(c, "oc-poster"), render: (_c, t) => obj(t, ArtifactCard) },
+  { match: (c) => matchOcTool(c, "oc-rank"), render: (_c, t) => obj(t, RankCard) },
+  // 其它通用工具。
+  { match: (c) => matchOcTool(c, "oc-docx"), render: (c) => DocxCard({ command: c }) },
+  { match: (c) => matchOcTool(c, "oc-market"), render: (_c, t) => MarketCard({ tool: t }) },
 ];
 
 /**
- * 若 Bash 命令是某个 oc-* 工具且输出可解析为其结构化结果 → 返回专门卡片;否则 null。
+ * 若 Bash 命令是某个 oc-* 工具 → 返回其专门卡片;不认/出错/输出不可解析 → null(回落通用 BashBody)。
  * 由 BashBody 在渲染通用终端块前调用。
  */
 export function researchToolCard(command: string, tool: ToolLike): ReactNode | null {
   if (!command) return null;
-  const entry = RESEARCH_CARD_REGISTRY.find((e) => e.match(command));
+  const entry = TOOL_CARD_REGISTRY.find((e) => e.match(command));
   if (!entry) return null;
   // 出错的调用回落通用(让用户看到错误输出)。
   if (tool.error) return null;
-  const data = looseJson(outputText(tool));
-  if (!data) return null;
-  return entry.render(data, tool);
+  return entry.render(command, tool);
 }

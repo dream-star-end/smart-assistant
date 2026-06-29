@@ -37,3 +37,10 @@ oc-web health                 # 检查解析器依赖是否可用
 1. 用户给公开链接 → `oc-web extract <url>`，把返回的 Markdown 作为上下文回答，并标注来源。
 2. 用户上传了 PDF/Office/HTML → 用其容器内绝对路径 `oc-web parse <path>`，再基于解析文本回答。
 3. 需要判断是否被拦或拿元数据 → 加 `--json` 看 `blocked`/`http_status`/`final_url`。
+
+## 工具调用纪律(重要)
+
+- **只用本 skill 对应的命令/工具传参调用**;它已把鉴权、端点、底层请求全封装好,你只需给参数。
+- **绝不**自己拼 `curl` / `wget` / 直连 HTTP,**绝不**猜测或硬编码任何 URL / 端口 / 接口路径 / token。
+- 命令失败时按本 skill 的失败处理重试或如实告诉用户,**绝不**改用 curl/HTTP 兜底。
+

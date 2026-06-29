@@ -139,3 +139,10 @@ unzip -p /path/to/final.docx word/document.xml | grep -q 'm:oMath' \
 - 最终回复里给 **绝对路径**,例如:`/home/agent/.openclaude/report.docx`。
 - 简短说明:文档由 Pandoc/Quarto 生成,公式是 Word 原生可编辑公式。
 - 如果同时生成了源 `.qmd/.md`,也给路径,方便用户后续修改再导出。
+
+## 工具调用纪律(重要)
+
+- **只用本 skill 对应的命令/工具传参调用**;它已把鉴权、端点、底层请求全封装好,你只需给参数。
+- **绝不**自己拼 `curl` / `wget` / 直连 HTTP,**绝不**猜测或硬编码任何 URL / 端口 / 接口路径 / token。
+- 命令失败时按本 skill 的失败处理重试或如实告诉用户,**绝不**改用 curl/HTTP 兜底。
+

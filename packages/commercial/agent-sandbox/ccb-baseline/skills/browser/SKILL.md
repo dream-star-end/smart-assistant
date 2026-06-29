@@ -31,3 +31,10 @@ oc-browser screenshot --path /home/agent/.openclaude/generated/page.png   # 需�
 - 不要绕过 CAPTCHA、登录墙、反爬;遇到拦截如实告知用户并改用官方 API 或用户提供的数据。
 - 截图存到 `/home/agent/.openclaude/generated/<安全文件名>` 再把绝对路径写进最终回复,平台会渲染成文件卡片。
 - 每个 agent 有独立浏览器会话(独立 profile),互不干扰。
+
+## 工具调用纪律(重要)
+
+- **只用本 skill 对应的命令/工具传参调用**;它已把鉴权、端点、底层请求全封装好,你只需给参数。
+- **绝不**自己拼 `curl` / `wget` / 直连 HTTP,**绝不**猜测或硬编码任何 URL / 端口 / 接口路径 / token。
+- 命令失败时按本 skill 的失败处理重试或如实告诉用户,**绝不**改用 curl/HTTP 兜底。
+

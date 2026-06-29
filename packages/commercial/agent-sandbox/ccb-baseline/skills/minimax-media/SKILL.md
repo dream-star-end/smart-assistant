@@ -59,3 +59,10 @@ mmx video download --file-id <file_id> --out minimax-output/video.mp4
 ## Output convention
 
 The command prints generated file paths. When responding to the user, provide the absolute or relative file paths it created; do not embed API keys or raw bearer tokens.
+
+## 工具调用纪律(重要)
+
+- **只用本 skill 对应的命令/工具传参调用**;它已把鉴权、端点、底层请求全封装好,你只需给参数。
+- **绝不**自己拼 `curl` / `wget` / 直连 HTTP,**绝不**猜测或硬编码任何 URL / 端口 / 接口路径 / token。
+- 命令失败时按本 skill 的失败处理重试或如实告诉用户,**绝不**改用 curl/HTTP 兜底。
+

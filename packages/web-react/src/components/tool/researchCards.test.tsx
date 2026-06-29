@@ -139,4 +139,25 @@ describe("其余 oc-* 卡片", () => {
     expect(screen.getByText("候选排名")).toBeInTheDocument();
     expect(screen.getByText("Elo 1533")).toBeInTheDocument();
   });
+
+  test("oc-docx → 文档卡(从命令解析文件名,无需 JSON 输出)", () => {
+    render(<div>{researchToolCard("oc-docx report.md -o /home/agent/x.docx", tool({ output: "[pandoc] ok" }))}</div>);
+    expect(screen.getByText("Word 文档已生成")).toBeInTheDocument();
+    expect(screen.getByText("x.docx")).toBeInTheDocument();
+  });
+
+  test("oc-market search → 技能市场卡(数组输出)", () => {
+    const out = JSON.stringify([
+      { slug: "research-assistant", name: "科研助手", kind: "agent", description: "端到端科研" },
+      { slug: "pptx", name: "PPTX", kind: "skill", description: "做幻灯" },
+    ]);
+    render(<div>{researchToolCard("oc-market search 科研", tool({ output: out }))}</div>);
+    expect(screen.getByText("技能市场")).toBeInTheDocument();
+    expect(screen.getByText("科研助手")).toBeInTheDocument();
+    expect(screen.getByText("智能体")).toBeInTheDocument();
+  });
+
+  test("oc-market install(非 list 输出)→ null 回落", () => {
+    expect(researchToolCard("oc-market install x", tool({ output: '{"ok":true}' }))).toBeNull();
+  });
 });
