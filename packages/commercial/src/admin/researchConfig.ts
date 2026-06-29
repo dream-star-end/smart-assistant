@@ -75,6 +75,18 @@ export const ResearchConfigJson = Type.Object(
       },
       { additionalProperties: false },
     ),
+    // MiniCheck 蕴含闸⑤(P1.5):backend=off → 跳过(verified 仍是 quote-bound+identifier);
+    // http → master 调 endpoint 算 claim↔quote 蕴含分;strict=true 时低于 threshold 的
+    // verified claim 降级 unsupported(高风险报告 gate)。
+    minicheck: Type.Object(
+      {
+        backend: Type.Union([Type.Literal("off"), Type.Literal("http")]),
+        endpoint: Type.Optional(Type.String()),
+        threshold: Type.Optional(Type.Number({ minimum: 0, maximum: 1 })),
+        strict: Type.Optional(Type.Boolean()),
+      },
+      { additionalProperties: false },
+    ),
     limits: Type.Object(
       {
         dailyCap: Type.Optional(Type.Integer()),
@@ -93,6 +105,7 @@ export const DEFAULT_RESEARCH_CONFIG: ResearchConfigJson = {
   ingest: { engine: "auto" },
   litrag: { embedBackend: "local", vectorBackend: "inproc" },
   cite: { retraction: "crossref", strictDomains: ["bio", "clinical", "policy"] },
+  minicheck: { backend: "off" },
   limits: {},
 };
 
@@ -151,6 +164,7 @@ function mergeWithDefault(raw: Record<string, unknown>): ResearchConfigJson {
     ingest: sub("ingest"),
     litrag: sub("litrag"),
     cite: sub("cite"),
+    minicheck: sub("minicheck"),
     limits: sub("limits"),
   } as ResearchConfigJson;
 }

@@ -548,10 +548,47 @@ async function handleCiteCheck(
       retraction: { passed: true, checked: 0, failed: 0 },
     },
   };
+  const mc = cfg.config.minicheck;
+  const entail = mc?.backend === "http" && mc.endpoint ? makeEntail(mc.endpoint, citeDeps.fetchImpl) : undefined;
   const result = await runCheck(userId, manifest, {
     getDocument: store.getDocument,
     verifyIdentifier: (id) => verifyIdentifier(id, citeDeps),
     strictDomains: cfg.config.cite.strictDomains,
+    entail,
+    entailThreshold: mc?.threshold,
+    strictEntail: mc?.strict,
   });
   sendJson(res, 200, result, requestId);
+}
+
+/**
+ * 闸⑤ MiniCheck 蕴含 adapter:POST endpoint {claim, quotes} → {score:0~1}。
+ * 失败/超时/解析不出 → 返 null(checkManifest 据此跳过该 claim 蕴含判定,不降级)。
+ * endpoint 是 admin 配置的可信内网地址(非用户输入)。
+ */
+function makeEntail(
+  endpoint: string,
+  fetchImpl: FetchLike | undefined,
+): (claimText: string, quoteTexts: string[]) => Promise<number | null> {
+  const fetchFn = fetchImpl ?? fetch;
+  return async (claimText, quoteTexts) => {
+    const ctrl = new AbortController();
+    const to = setTimeout(() => ctrl.abort(), 15_000);
+    try {
+      const res = await fetchFn(endpoint, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ claim: claimText, quotes: quoteTexts }),
+        signal: ctrl.signal,
+      });
+      if (!res.ok) return null;
+      const j = (await res.json()) as { score?: unknown };
+      const s = typeof j.score === "number" ? j.score : null;
+      return s != null && s >= 0 && s <= 1 ? s : null;
+    } catch {
+      return null;
+    } finally {
+      clearTimeout(to);
+    }
+  };
 }

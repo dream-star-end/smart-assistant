@@ -29,6 +29,7 @@ describe("researchConfig.validateResearchConfig", () => {
       ingest: { engine: "mineru", mineruEndpoint: "http://x", grobidEndpoint: "http://g" },
       litrag: { embedBackend: "http", embedEndpoint: "http://e", vectorBackend: "qdrant", qdrantUrl: "http://q" },
       cite: { retraction: "off", strictDomains: ["clinical"] },
+      minicheck: { backend: "http", endpoint: "http://mc", threshold: 0.6, strict: true },
       limits: { dailyCap: 1000, perContainerPerMin: 10 },
     };
     const out = validateResearchConfig(cfg);

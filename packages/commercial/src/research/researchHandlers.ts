@@ -133,6 +133,10 @@ export interface CheckDeps {
   getDocument: (userId: number, docId: string) => Promise<NormalizedDocument | null>;
   verifyIdentifier: (identifier: string) => Promise<CitationVerdict>;
   strictDomains?: string[];
+  /** 闸⑤ MiniCheck 蕴含(config-gated,见 checkManifest)。 */
+  entail?: (claimText: string, quoteTexts: string[]) => Promise<number | null>;
+  entailThreshold?: number;
+  strictEntail?: boolean;
 }
 
 /** oc-cite check:用 userId 绑定权威文档回查,master 铸造 verified。 */
@@ -145,6 +149,9 @@ export async function runCheck(
     getDocument: (docId) => deps.getDocument(userId, docId),
     verifyIdentifier: deps.verifyIdentifier,
     strictDomains: deps.strictDomains,
+    entail: deps.entail,
+    entailThreshold: deps.entailThreshold,
+    strictEntail: deps.strictEntail,
   };
   return checkManifest(manifest, checkDeps);
 }

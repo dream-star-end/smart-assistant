@@ -293,3 +293,63 @@ describe("checkManifest 红线", () => {
     assert.equal(out.coverage.totalClaims, 2);
   });
 });
+
+describe("checkManifest 闸⑤ MiniCheck 蕴含(P1.5)", () => {
+  function vClaim(doc: NormalizedDocument) {
+    return makeManifest({
+      quotes: [quoteFor(doc)],
+      claims: [{ id: "c1", text: "claim", supports: [{ quoteId: "q1" }], status: "verified" }],
+    });
+  }
+
+  it("未提供 entail → 无 minicheck 闸,verified 不变", async () => {
+    const doc = doc1();
+    const { manifest: out, gates } = await checkManifest(vClaim(doc), depsFor(doc, {}));
+    assert.equal(out.claims[0].status, "verified");
+    assert.equal(gates.minicheck, undefined);
+  });
+
+  it("entail 高分 → entailmentScore 记录,minicheck 闸通过", async () => {
+    const doc = doc1();
+    const { manifest: out, gates } = await checkManifest(vClaim(doc), {
+      ...depsFor(doc, {}),
+      entail: async () => 0.9,
+    });
+    assert.equal(out.claims[0].status, "verified");
+    assert.equal(out.claims[0].verdict?.entailmentScore, 0.9);
+    assert.equal(gates.minicheck?.passed, true);
+  });
+
+  it("entail 低分 + strict → 降级 unsupported", async () => {
+    const doc = doc1();
+    const { manifest: out, gates } = await checkManifest(vClaim(doc), {
+      ...depsFor(doc, {}),
+      entail: async () => 0.2,
+      strictEntail: true,
+    });
+    assert.equal(out.claims[0].status, "unsupported");
+    assert.equal(gates.minicheck?.passed, false);
+    assert.equal(out.coverage.verifiedClaims, 0);
+  });
+
+  it("entail 低分 + 非 strict → 保留 verified,仅 minicheck 闸记失败", async () => {
+    const doc = doc1();
+    const { manifest: out, gates } = await checkManifest(vClaim(doc), {
+      ...depsFor(doc, {}),
+      entail: async () => 0.2,
+    });
+    assert.equal(out.claims[0].status, "verified");
+    assert.equal(gates.minicheck?.passed, false);
+  });
+
+  it("entail 返 null(服务不可用)→ 跳过,不降级、无闸", async () => {
+    const doc = doc1();
+    const { manifest: out, gates } = await checkManifest(vClaim(doc), {
+      ...depsFor(doc, {}),
+      entail: async () => null,
+      strictEntail: true,
+    });
+    assert.equal(out.claims[0].status, "verified");
+    assert.equal(gates.minicheck, undefined);
+  });
+});

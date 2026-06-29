@@ -25,6 +25,11 @@ import type {
   SourceRecord,
 } from "@openclaude/protocol/research";
 
+/** 闸⑤ 请求级预算(防 MiniCheck 慢/黑洞放大成数小时挂起)。 */
+const ENTAIL_MAX_CLAIMS = 200;
+const ENTAIL_BUDGET_MS = 60_000;
+const ENTAIL_CONCURRENCY = 5;
+
 export interface CheckManifestDeps {
   /** 回查 master 权威文档(调用方已绑定 userId,tenant 隔离)。证据权威源。 */
   getDocument: (docId: string) => Promise<NormalizedDocument | null>;
@@ -32,6 +37,16 @@ export interface CheckManifestDeps {
   verifyIdentifier: (identifier: string) => Promise<CitationVerdict>;
   /** 高风险域(生医/临床/政策)强制撤稿过滤;预留。 */
   strictDomains?: string[];
+  /**
+   * 闸⑤ MiniCheck 蕴含(P1.5,config-gated):返回 claim↔quotes 蕴含分 0~1,或 null
+   * (服务未配/不可用 → 跳过,不降级)。只对 quote-bound+identifier 已过(verified)的
+   * claim 跑。
+   */
+  entail?: (claimText: string, quoteTexts: string[]) => Promise<number | null>;
+  /** 蕴含阈值(默认 0.5);低于则计入 minicheck 闸失败。 */
+  entailThreshold?: number;
+  /** strict mode:低蕴含的 verified claim 降级 unsupported(高风险报告 gate)。 */
+  strictEntail?: boolean;
 }
 
 function sourceIdentifier(s: SourceRecord): string | null {
@@ -219,6 +234,50 @@ export async function checkManifest(
     };
   });
 
+  // ── 闸⑤:MiniCheck 蕴含(config-gated;仅对 verified claim 跑) ──────────
+  // 请求级预算(防 MiniCheck 慢/黑洞时,2000 claim × per-claim timeout 累计成数小时):
+  //   - 至多 ENTAIL_MAX_CLAIMS 条 verified claim 参与;
+  //   - 全局 deadline ENTAIL_BUDGET_MS;超时停(剩余跳过,不降级);
+  //   - 有界并发 ENTAIL_CONCURRENCY。
+  let minicheckChecked = 0;
+  let minicheckFailed = 0;
+  if (deps.entail) {
+    const entail = deps.entail;
+    const threshold = deps.entailThreshold ?? 0.5;
+    const targets = checkedClaims
+      .filter((c) => c.status === "verified" && c.supports.length > 0)
+      .slice(0, ENTAIL_MAX_CLAIMS);
+    const deadline = Date.now() + ENTAIL_BUDGET_MS;
+    let idx = 0;
+    const worker = async (): Promise<void> => {
+      while (idx < targets.length) {
+        if (Date.now() > deadline) return; // 全局预算耗尽 → 停(剩余保留 verified)
+        const c = targets[idx++];
+        const quoteTexts = c.supports
+          .map((r) => quoteById.get(r.quoteId)?.text)
+          .filter((t): t is string => typeof t === "string");
+        if (quoteTexts.length === 0) continue;
+        let score: number | null = null;
+        try {
+          score = await entail(c.text, quoteTexts);
+        } catch {
+          score = null;
+        }
+        if (score == null) continue; // 服务不可用 → 跳过,不降级(fail-open 仅对蕴含层)
+        minicheckChecked++;
+        if (c.verdict) c.verdict.entailmentScore = score;
+        if (score < threshold) {
+          minicheckFailed++;
+          // strict mode:蕴含不足 → 降级(高风险报告);非 strict 仅记 gate,保留 verified
+          if (deps.strictEntail) c.status = "unsupported";
+        }
+      }
+    };
+    await Promise.all(
+      Array.from({ length: Math.min(ENTAIL_CONCURRENCY, Math.max(1, targets.length)) }, worker),
+    );
+  }
+
   const verifiedClaims = checkedClaims.filter((c) => c.status === "verified").length;
 
   const gates: EvidenceManifest["gates"] = {
@@ -226,6 +285,9 @@ export async function checkManifest(
     claimBound: gate(claimBoundChecked, claimBoundFailed, "claim 句级 quote 绑定"),
     identifier: gate(idChecked, idFailed, "出版身份 DOI/arXiv/OpenAlex 回查"),
     retraction: gate(retractChecked, retractFailed, "撤稿/关注过滤"),
+    ...(minicheckChecked > 0
+      ? { minicheck: gate(minicheckChecked, minicheckFailed, "MiniCheck 蕴含支持判定") }
+      : {}),
   };
 
   return {
