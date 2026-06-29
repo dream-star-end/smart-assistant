@@ -77,3 +77,52 @@ export async function callResearch(tool: string, path: string, body: unknown): P
 export function out(o: unknown): void {
   process.stdout.write(`${JSON.stringify(o, null, 2)}\n`);
 }
+
+/** 上传文件原始字节到 master /v3/research/blob,返回 { blobId, sha256, sizeBytes }。 */
+export async function uploadBlob(tool: string, filePath: string): Promise<any> {
+  const base = process.env.OPENCLAUDE_V3_MASTER_BASE_URL?.trim();
+  if (!base) fail(tool, "not in a commercial container (no master base url)");
+  const token = readContainerToken(tool);
+  let bytes: Buffer;
+  try {
+    bytes = readFileSync(filePath);
+  } catch {
+    fail(tool, `cannot read file: ${filePath}`);
+  }
+  const mime = guessMime(filePath);
+  const url = `${base.replace(/\/+$/, "")}/v3/research/blob`;
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), 120_000);
+  try {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}`, "content-type": mime },
+      // Buffer → Uint8Array(BodyInit/BufferSource);fetch 类型不直接收 Buffer
+      body: new Uint8Array(bytes),
+      signal: ctl.signal,
+    });
+    const text = await res.text();
+    let json: any;
+    try {
+      json = text ? JSON.parse(text) : {};
+    } catch {
+      json = { raw: text };
+    }
+    if (!res.ok) {
+      const e = json?.error;
+      fail(tool, `${res.status} ${e?.code ?? ""} ${e?.message ?? text}`);
+    }
+    return json;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function guessMime(filePath: string): string {
+  const ext = filePath.toLowerCase().split(".").pop() ?? "";
+  if (ext === "pdf") return "application/pdf";
+  if (ext === "html" || ext === "htm") return "text/html";
+  if (ext === "md" || ext === "markdown") return "text/markdown";
+  if (ext === "txt") return "text/plain";
+  return "application/octet-stream";
+}

@@ -121,6 +121,13 @@ export const NormalizedDocument = Type.Object({
   title: Type.Optional(Type.String()),
   spans: Type.Array(Span),
   references: Type.Array(ReferenceEntry),
+  /**
+   * **master 建立的**文档出版身份(含 DOI/arXiv 等)。只有 master 通过可信渠道确立
+   * doc↔文献的对应(如 master 自己从 resolved DOI 的 OA 全文下载并解析)时才设。
+   * 用户**上传**的文档此字段为空 —— 即"无可信出版身份",其 quote 只能 quote-bound,
+   * 不能冒充某已发表文献(防"上传任意文本 + 挂真 DOI"伪造,见 oc-cite check)。
+   */
+  verifiedSource: Type.Optional(SourceRecord),
 })
 export type NormalizedDocument = Static<typeof NormalizedDocument>
 
@@ -171,13 +178,17 @@ export type QuoteHandle = Static<typeof QuoteHandle>
 
 /**
  * claim 接地状态。**只能由 master oc-cite check 铸造**:
- *   - verified:quote-bound(quote ref 命中权威 span 且 range 合法)+ identifier-verified
- *               + 未撤稿。注意:MVP 下 verified ≠ 语义蕴含(真 quote 也可能被过度
- *               解读);P1.5 接 MiniCheck 后增 'supported'(蕴含)层。
- *   - unsupported:有 support 但校验未过(quote ref 不命中 / range 越界 / 撤稿 /
- *                  identifier 未命中)→ 红标。
+ *   - verified:**quote-bound**(quote ref 命中权威 span 且 range 合法)且其支撑文档
+ *               若有 master 建立的出版身份(verifiedSource)则该身份 resolved 且未撤稿。
+ *               用户上传文档无出版身份 → 仍可 verified(quote-bound),但此时
+ *               `verdict.identifierVerified=false`(诚实:不冒充已发表文献,不附 DOI)。
+ *               消费方(UI/渲染)须读 `verdict.identifierVerified` 区分"已发表文献接地"
+ *               与"上传文档接地"。注意:verified ≠ 语义蕴含(真 quote 也可能被过度解读);
+ *               P1.5 接 MiniCheck 后增 'supported'(蕴含)层。
+ *   - unsupported:有 support 但校验未过(quote ref 不命中 / range 越界 / 出版身份撤稿 /
+ *                  出版身份 identifier 未命中)→ 红标。
  *   - unchecked:尚未经 oc-cite(或无 support)→ 移入"未核查"。
- * LLM/容器在 manifest 里提交的任何 status 一律被 master 忽略/覆盖。
+ * LLM/容器在 manifest 里提交的任何 status / sourceId / sources 一律被 master 忽略/覆盖。
  */
 export const ClaimStatus = Type.Union([
   Type.Literal('verified'),

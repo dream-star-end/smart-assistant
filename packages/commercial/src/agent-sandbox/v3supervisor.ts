@@ -280,6 +280,8 @@ export const V3_CCB_BASELINE_SKILL_NAMES = [
   "market",
   "oc-lit",
   "oc-cite",
+  "oc-ingest",
+  "oc-litrag",
 ] as const;
 
 /**

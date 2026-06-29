@@ -4,10 +4,12 @@
  * 用法(baseline skill oc-cite 文档化):
  *   oc-cite verify <id...>            # DOI/arXiv/OpenAlex 回查 + 撤稿(闸③④)
  *   oc-cite format <id> --style gb-t-7714-2015|apa|bibtex
+ *   oc-cite check --manifest <file>   # 证据 manifest 接地校验(闸①②③④,master 铸 verified)
  *
- * verify 输出 { verdicts: CitationVerdict[] }:resolved=false 或 retracted=true
- * 即"不可信引用",不得写进"已验证参考文献"。
+ * verify 输出 { verdicts }:resolved=false 或 retracted=true 即"不可信引用",不得写进
+ * "已验证参考文献"。check 输出已检 manifest:claim.status 由 master 铸造,unsupported 红标。
  */
+import { readFileSync } from "node:fs";
 import { callResearch, fail, out, parseFlags } from "./ocResearchClient.js";
 
 const TOOL = "oc-cite";
@@ -29,8 +31,20 @@ async function main(): Promise<void> {
       out(await callResearch(TOOL, "cite/format", { identifier: id, style }));
       return;
     }
+    case "check": {
+      const file = flags.manifest ?? positional[0];
+      if (!file) fail(TOOL, "check --manifest <file>");
+      let manifest: unknown;
+      try {
+        manifest = JSON.parse(readFileSync(file, "utf8"));
+      } catch {
+        fail(TOOL, `cannot read/parse manifest: ${file}`);
+      }
+      out(await callResearch(TOOL, "cite/check", { manifest }));
+      return;
+    }
     default:
-      fail(TOOL, "usage: oc-cite <verify <id...>|format <id> --style ...>");
+      fail(TOOL, "usage: oc-cite <verify <id...>|format <id> --style ...|check --manifest <file>>");
   }
 }
 
