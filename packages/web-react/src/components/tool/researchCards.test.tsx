@@ -171,6 +171,9 @@ describe("其余 oc-* 卡片", () => {
     bad("oc-rank elo m", '{"ranked":[null,{"id":"a","rating":1500}]}');
     bad("oc-market search x", "[null, 7, {\"name\":\"X\",\"kind\":\"skill\"}]");
     bad('oc-litrag query "q" --docs d', '{"quotes":[null,{"text":"片段"}],"missing":[]}');
+    // 嵌套畸形:authors 非数组 / 元素是裸字符串。
+    bad('oc-lit search "x"', '{"sources":[{"title":"a","authors":"坏数据"}]}');
+    bad('oc-lit search "x"', '{"sources":[{"title":"b","authors":["张三",null,{"name":"李四"}]}]}');
     cleanup();
     // 过滤后仍能渲染有效项。
     render(<div>{researchToolCard('oc-lit search "x"', tool({ output: '{"sources":[null,{"title":"真的"}]}' }))}</div>);

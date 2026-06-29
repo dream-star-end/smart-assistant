@@ -136,8 +136,11 @@ interface LitSource {
   retracted?: boolean | null;
 }
 
-function authorsLine(authors: LitAuthor[] | undefined): string {
-  const names = (authors ?? []).map((a) => asStr(a?.name)).filter(Boolean);
+function authorsLine(authors: unknown): string {
+  // authors 可能非数组 / 元素是 record{name} 或裸字符串 / null —— 全部容错(防 agent 畸形 JSON)。
+  const names = asArr(authors)
+    .map((a) => (isRecord(a) ? asStr(a.name) : asStr(a)))
+    .filter(Boolean);
   if (names.length === 0) return "";
   if (names.length <= 3) return names.join(", ");
   return `${names.slice(0, 3).join(", ")} 等`;
