@@ -240,6 +240,13 @@ function ensureCoreDefaults(defaults: Record<string, unknown>): boolean {
     defaults.model = COMMERCIAL_DEFAULT_MODEL;
     mutated = true;
   }
+  // 迁移旧平台默认 acceptEdits → bypassPermissions:已有用户卷里 config.defaults 在缺失分支
+  // 不会被重建,需在此主动归一。沙箱即安全边界,消费级产品不逐条 bash 弹窗。只动旧平台默认值
+  // (acceptEdits),不覆盖用户/其它显式设置(如 default/plan)。
+  if (defaults.permissionMode === "acceptEdits") {
+    defaults.permissionMode = "bypassPermissions";
+    mutated = true;
+  }
   return mutated;
 }
 
@@ -271,7 +278,10 @@ function upsertPlatformMcpIntegrations(config: Record<string, unknown>): boolean
   }
 
   if (!isRecord(config.defaults)) {
-    config.defaults = { model: COMMERCIAL_DEFAULT_MODEL, permissionMode: "acceptEdits", toolsets: [CORE_TOOLSET_ID] };
+    // 默认 bypassPermissions:容器是每用户独立沙箱(沙箱即安全边界),消费级产品不应逐条
+    // bash 弹窗。seed agent 早已 bypass;市场/用户自建 agent(manifest 禁止自带 permissionMode)
+    // 此前落到 acceptEdits → bash/oc-* CLI 都弹确认。统一默认 bypass 消除该摩擦。
+    config.defaults = { model: COMMERCIAL_DEFAULT_MODEL, permissionMode: "bypassPermissions", toolsets: [CORE_TOOLSET_ID] };
     mutated = true;
   } else if (ensureCoreDefaults(config.defaults)) {
     mutated = true;
@@ -468,7 +478,8 @@ try {
       // 但永远不回包。
       defaults: {
         model: COMMERCIAL_DEFAULT_MODEL,
-        permissionMode: "acceptEdits",
+        // bypassPermissions:沙箱即安全边界,消费级产品不逐条 bash 弹窗(详见上方 ensureCoreDefaults 注释)。
+        permissionMode: "bypassPermissions",
         toolsets: [CORE_TOOLSET_ID],
       },
       toolsets: {
