@@ -435,14 +435,18 @@ export async function listActiveInstalledArtifacts(userId: number): Promise<Inst
 /** Kill-switch: revoke a listing. Returns the user_ids with an active install (to notify). */
 export async function revokeListing(slug: string, reason: string): Promise<number[]> {
   return tx(async (c) => {
-    await query(
-      // v3 skill-only:只能撤 skill 类(agent 类的下架由 v5 负责,v3 admin 不跨渠道撤 agent)。
+    // v3 skill-only:只能撤 skill 类(agent 下架由 v5 负责,v3 admin 不跨渠道撤 agent)。
+    // RETURNING 短路:非 skill / 不存在 → 不命中 → 直接返 [],也不去读该 slug 的 install 用户
+    // (否则会把 agent 的安装用户从共享表读出并经 revoke 响应暴露)。
+    const upd = await query<{ slug: string }>(
       `UPDATE marketplace_skill_listings
           SET state = 'revoked', revoked_reason = $2, updated_at = NOW()
-        WHERE slug = $1 AND kind = 'skill'`,
+        WHERE slug = $1 AND kind = 'skill'
+        RETURNING slug`,
       [slug, reason],
       c,
     )
+    if ((upd.rowCount ?? 0) === 0) return []
     const affected = await query<{ user_id: string }>(
       `SELECT DISTINCT user_id::text FROM marketplace_installs
         WHERE slug = $1 AND uninstalled_at IS NULL`,
