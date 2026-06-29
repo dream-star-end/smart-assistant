@@ -212,10 +212,13 @@ export async function listApprovedForSearch(): Promise<ApprovedSearchRow[]> {
     tags: unknown
     embedding_hash: string
   }>(
+    // v3 是 skill-only 市场:硬过滤 kind='skill'。v3/v5 共享 marketplace 表,v5 上架的
+    // agent 类(平台科研 agent 等)绝不能在 v3 露出——v3 无 agent 能力(容器无对应 skill/
+    // CLI、无 reconcileAgents 同步),装了即坏。v3 永不支持 agent,故用硬约束而非 channel 判断。
     `SELECT v.id::text, v.slug, v.name, v.description, v.tags, v.embedding_hash
        FROM marketplace_skill_listings l
        JOIN marketplace_skill_versions v ON v.id = l.current_approved_version_id
-      WHERE l.state = 'active' AND v.status = 'approved'`,
+      WHERE l.state = 'active' AND v.status = 'approved' AND l.kind = 'skill'`,
   )
   return r.rows.map((x) => ({
     versionId: x.id,
@@ -264,7 +267,8 @@ export async function getListingDetail(slug: string): Promise<ListingDetail | nu
               WHERE i.slug = l.slug AND i.uninstalled_at IS NULL)::text AS install_count
        FROM marketplace_skill_listings l
        JOIN marketplace_skill_versions v ON v.id = l.current_approved_version_id
-      WHERE l.slug = $1 AND l.state = 'active' AND v.status = 'approved'`,
+      WHERE l.slug = $1 AND l.state = 'active' AND v.status = 'approved'
+            AND l.kind = 'skill'`,
     [slug],
   )
   const x = r.rows[0]
@@ -307,11 +311,12 @@ export async function installApprovedVersion(args: {
       name: string
       artifact_hash: string
     }>(
+      // v3 skill-only:拒装 agent 类(共享市场表,v5 上架的 agent 不可在 v3 安装)。
       `SELECT v.slug, v.version, v.name, v.artifact_hash
          FROM marketplace_skill_versions v
          JOIN marketplace_skill_listings l ON l.slug = v.slug
         WHERE v.id = $1 AND v.status = 'approved' AND l.state = 'active'
-              AND l.current_approved_version_id = v.id
+              AND l.current_approved_version_id = v.id AND l.kind = 'skill'
         FOR UPDATE OF l`,
       [args.versionId],
       c,
@@ -370,7 +375,7 @@ export async function listInstalled(userId: number): Promise<InstalledRow[]> {
        FROM marketplace_installs i
        JOIN marketplace_skill_versions v ON v.id = i.version_id
        JOIN marketplace_skill_listings l ON l.slug = i.slug
-      WHERE i.user_id = $1 AND i.uninstalled_at IS NULL
+      WHERE i.user_id = $1 AND i.uninstalled_at IS NULL AND l.kind = 'skill'
       ORDER BY i.installed_at DESC`,
     [userId],
   )
