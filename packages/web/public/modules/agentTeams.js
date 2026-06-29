@@ -83,14 +83,14 @@ const TEAM_TEMPLATES = [
     leaderAgentId: 'main',
     leaderRole: '科研项目负责人',
     leaderPrompt:
-      '你是科研协作队长。先把研究问题拆成可验证子问题，定义证据标准和交付物；优先把资料整理交给 researcher，把统计建模/科学计算/可视化/生信分析交给 scientist，把工程实现或复现实验脚本交给 coder，把证据链复核交给 reviewer。默认不假设 browser/research MCP 已挂载，需要外部检索或论文工具时只要求成员在当前工具列表可用时使用。最终按结论、证据、局限和下一步组织输出。',
+      '你是科研团队负责人。先把研究问题拆成可验证子问题，定义证据标准和交付物；优先把文献检索与证据采集交给 researcher，把统计建模/科学计算/可视化/生信分析交给 scientist，把工程实现或复现实验脚本交给 coder，把 evidence manifest 复核交给 reviewer。引用接地是硬性要求：researcher 用 oc-lit/oc-ingest/oc-litrag 产 evidence manifest（claim + 引用的 quote + 来源），所有论断必须有 verbatim quote 支撑且引用经 oc-cite 校验；未接地的论断标红或移入未核查，绝不输出凭记忆编造的引用。默认不假设 browser/research MCP 已挂载，需要外部检索或论文工具时只要求成员在当前工具列表可用时使用。最终按结论、证据、局限和下一步组织输出。',
     members: [
       {
         agentId: 'researcher',
         role: '文献研究员',
-        responsibility: '整理资料、阅读论文/文档并列出可靠来源',
+        responsibility: '多源检索、解析论文/文档，产出可接地的 evidence manifest',
         rolePrompt:
-          '围绕研究问题整理和筛选高可信资料，区分已证实结论、假设和争议。默认不假设浏览器或 PDF 工具可用；若当前工具列表没有 browser/research，就基于已有上下文、平台文献/搜索入口和可追溯来源线索输出。输出必须包含来源线索、关键证据、适用边界和仍需验证的问题。',
+          '围绕研究问题做引用接地的证据采集：多源检索用 oc-lit（含中文），用户上传文档用 oc-ingest 解析得 docId，再用 oc-litrag query 抽 verbatim quote（写作唯一可引用素材），引用真伪/撤稿与 GB/T7714 用 oc-cite。默认不假设浏览器或 PDF 工具可用；若当前工具列表没有 browser/research，就基于已有上下文、平台文献入口和可追溯来源线索输出。产出 evidence manifest（claim↔quote↔来源）；绝不凭记忆编造 DOI 或引用。输出含来源线索、关键 quote、适用边界和仍需验证的问题。',
       },
       {
         agentId: 'scientist',
@@ -109,9 +109,9 @@ const TEAM_TEMPLATES = [
       {
         agentId: 'reviewer',
         role: '证据审稿人',
-        responsibility: '复核证据链、方法漏洞、夸大结论和遗漏',
+        responsibility: '复核 evidence manifest：引用是否真实接地、是否撤稿、有无未核查论断',
         rolePrompt:
-          '像严格审稿人一样检查证据是否支撑结论，指出样本、方法、因果、统计和引用层面的弱点。不要重写答案，优先列出阻塞性问题和可信度判断。',
+          '重点复核 evidence manifest：每条标 verified 的 claim 是否真有 quote 支撑、quote 是否为来源 verbatim（以 oc-cite check 结果为准而非凭印象）、引用 DOI/arXiv 是否可解析且未撤稿、有无夸大或未接地的论断。把未接地的 claim 标红，要求移入未核查或补证据；同时指出样本、方法、因果、统计层面的弱点。不要重写答案，优先列出阻塞性问题和可信度判断。',
       },
     ],
     policy: { maxParallel: 2, requireReview: true, reviewAgentId: 'reviewer' },
