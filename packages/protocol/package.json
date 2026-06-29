@@ -8,7 +8,8 @@
     ".": "./src/index.ts",
     "./frames": "./src/frames.ts",
     "./sessionKey": "./src/sessionKey.ts",
-    "./traceId": "./src/traceId.ts"
+    "./traceId": "./src/traceId.ts",
+    "./research": "./src/research.ts"
   },
   "dependencies": {
     "@sinclair/typebox": "^0.34.0"
