@@ -1,58 +1,38 @@
 ---
 name: research-slides
-description: 用 Quarto 把科研内容渲染成规范幻灯片(revealjs HTML 或 .pptx),统一主题、确定性排版、图表用 SciencePlots。要做科研汇报 PPT/slides 时使用。
-tags: [research, slides, quarto, pptx]
+description: 用 `oc-slides`/`oc-poster` 命令行把结构化 SlideDeck/PosterSpec 渲染成规范幻灯(pptx/html,多主题)或学术海报(pdf),确定性排版、PresAesth 美学软检查、图表用 SciencePlots。要做科研汇报 PPT/slides 或会议海报时使用。
+tags: [research, slides, poster, quarto]
 ---
 
-# research-slides 科研幻灯片(Quarto)
+# research-slides 科研幻灯 / 海报(CLI)
 
-科研汇报 slides 用 **Quarto**(运行时镜像内常驻)确定性渲染,统一一套主题;**不要用生成式插画**,图表走 scientific-figures(matplotlib+SciencePlots / Mermaid)。多主题/编辑式 PPT(PPTAgent)是后续增强,当前提供一套规范主题。
+汇报产物用 `oc-slides`/`oc-poster` 确定性渲染(自建 Quarto 流水线,运行时镜像内常驻),
+统一 design-token 主题;**不要用生成式插画**,图走 scientific-figures(matplotlib+SciencePlots / Mermaid)。
 
-## 用法
+## 幻灯 oc-slides
 
-写 `slides.qmd`(YAML 选主题),用 Bash 调 quarto:
+写 SlideDeck(JSON):`{ title, subtitle?, author?, theme?, slides:[{heading, bullets[], figure?, notes?}] }`,
+`theme` ∈ default/nature/ieee/dark/white/league。
 
 ```bash
-# revealjs(HTML,推荐:可交互、可嵌图)
-quarto render slides.qmd --to revealjs -o /home/agent/.openclaude/research/<id>/slides.html
-# 或导 PowerPoint
-quarto render slides.qmd --to pptx -o /home/agent/.openclaude/research/<id>/slides.pptx
+oc-slides --deck deck.json -o /home/agent/.openclaude/research/<id>/slides.pptx   # 或 .html
 ```
 
-slides.qmd 模板(统一主题):
+- 每页一个论点,bullets 精简(≤6 条、短句);细节放 `notes`(讲稿)或报告。
+- `figure` 指向已生成的图(SciencePlots/Mermaid 路径)。
+- 输出 `warnings` 含 PresAesth 美学软信号(要点过多/过长/疑似生成式插画)—— 据此修。
 
-```markdown
----
-title: "汇报标题"
-author: "研究团队"
-format:
-  revealjs:
-    theme: [default]
-    slide-number: true
-    incremental: false
-    fig-align: center
-lang: zh
----
+## 海报 oc-poster
 
-## 背景与问题
+写 PosterSpec(JSON):`{ title, authors?, affiliation?, columns?(2~4), sections:[{heading, bodyMd, figure?}] }`。
 
-- 要点一(有数据/引用支撑)
-- 要点二
-
-## 方法
-
-![](/home/agent/.openclaude/research/<id>/fig1.png)
-
-## 结果
-
-- 关键发现 + 图表(SciencePlots 出图)
-
-## 结论与局限
+```bash
+oc-poster --spec poster.json -o /home/agent/.openclaude/research/<id>/poster.pdf
 ```
 
 ## 规则
 
-- 每页一个论点,文字精简(标题 + 3~5 bullet),细节放讲稿/报告。
-- 图来自 scientific-figures(SciencePlots/Mermaid);**禁生成式插画**。
-- 引用沿用报告口径:论断有据,不在 slide 里编造数据/DOI。
+- 论断有据:slide/海报里的事实/数据沿用报告口径,不编造数字/DOI。
+- 图表零生成式插画(PresAesth 会软标);多主题切 `theme` 即可。
+- 渲染失败(无 quarto)降级产出 `.qmd`,仍可读;据此告知用户。
 - 输出末行打印产物绝对路径(前端渲染文件卡片)。

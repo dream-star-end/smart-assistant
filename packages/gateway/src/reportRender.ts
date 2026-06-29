@@ -14,6 +14,7 @@
 
 import { type EvidenceManifest, type ReportSchema, formatCitation } from "@openclaude/protocol/research";
 import { lintAiTone } from "./styleLint.js";
+import { presAesthFigures } from "./presAesth.js";
 
 export interface BuildReportResult {
   markdown: string;
@@ -133,6 +134,10 @@ export function buildReportDocument(schema: ReportSchema, manifest: EvidenceMani
   for (const f of style.findings) {
     warnings.push(`去AI味[${f.kind}]: "${f.sample.slice(0, 30)}" — ${f.hint}`);
   }
+  // PresAesth 图表美学(软信号:禁生成式插画、图须有 caption)
+  for (const f of presAesthFigures(schema.figures).findings) {
+    warnings.push(`美学[${f.kind}] ${f.where}: ${f.hint}`);
+  }
 
   return {
     markdown: lines.join("\n"),
@@ -147,7 +152,9 @@ function resolveBody(body: string, resolveClaim: (id: string) => string): string
 }
 
 function escapeYaml(s: string): string {
-  return s.replace(/"/g, '\\"');
+  // 折叠换行/控制字符为空格(防破坏 frontmatter),再转义引号
+  // biome-ignore lint/suspicious/noControlCharactersInRegex: collapse control chars to keep YAML valid
+  return s.replace(/[\r\n\t\x00-\x1F]+/g, " ").replace(/"/g, '\\"').trim();
 }
 
 function escapeMd(s: string): string {

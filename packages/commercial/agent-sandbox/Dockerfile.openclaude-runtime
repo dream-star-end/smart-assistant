@@ -172,10 +172,13 @@ COPY --chown=root:root ./runtime/oc-lit.sh /usr/local/bin/oc-lit
 COPY --chown=root:root ./runtime/oc-cite.sh /usr/local/bin/oc-cite
 COPY --chown=root:root ./runtime/oc-ingest.sh /usr/local/bin/oc-ingest
 COPY --chown=root:root ./runtime/oc-litrag.sh /usr/local/bin/oc-litrag
-# oc-report: 确定性报告渲染(ReportSchema + 已检 manifest → Quarto/pandoc),文档见 research-report skill。
+# oc-report / oc-slides / oc-poster: 确定性产物渲染(报告/幻灯/海报,自建 Quarto 流水线)。
+# 文档见 research-report / research-slides baseline skill。
 COPY --chown=root:root ./runtime/oc-report.sh /usr/local/bin/oc-report
+COPY --chown=root:root ./runtime/oc-slides.sh /usr/local/bin/oc-slides
+COPY --chown=root:root ./runtime/oc-poster.sh /usr/local/bin/oc-poster
 RUN set -eux; \
-    chmod 0755 /usr/local/bin/oc-docx /usr/local/bin/oc-minimax /usr/local/bin/oc-web-context /usr/local/bin/oc-web /usr/local/bin/oc-browser /usr/local/bin/oc-market /usr/local/bin/oc-lit /usr/local/bin/oc-cite /usr/local/bin/oc-ingest /usr/local/bin/oc-litrag /usr/local/bin/oc-report /usr/local/lib/openclaude/create-docgen-reference.py; \
+    chmod 0755 /usr/local/bin/oc-docx /usr/local/bin/oc-minimax /usr/local/bin/oc-web-context /usr/local/bin/oc-web /usr/local/bin/oc-browser /usr/local/bin/oc-market /usr/local/bin/oc-lit /usr/local/bin/oc-cite /usr/local/bin/oc-ingest /usr/local/bin/oc-litrag /usr/local/bin/oc-report /usr/local/bin/oc-slides /usr/local/bin/oc-poster /usr/local/lib/openclaude/create-docgen-reference.py; \
     ln -sf /usr/local/bin/oc-minimax /usr/local/bin/mmx; \
     python3 /usr/local/lib/openclaude/create-docgen-reference.py /usr/local/share/openclaude-docgen/reference.docx; \
     printf '%s\n' '# DOCX smoke' 'Inline $a^2+b^2=c^2$.' '' '$$' 'E = mc^2' '$$' > /tmp/oc-docx-smoke.md; \

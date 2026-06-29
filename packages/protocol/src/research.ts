@@ -306,6 +306,52 @@ export const ReportSchema = Type.Object({
 export type ReportSchema = Static<typeof ReportSchema>
 
 // ───────────────────────────────────────────────
+// 5.5) 演示产物:slides / poster(确定性渲染输入)
+// ───────────────────────────────────────────────
+
+/** 单页幻灯。bullets 精简(每页 ≤ ~6 条);figure 走 SciencePlots/Mermaid 路径,禁生成式插画。 */
+export const Slide = Type.Object({
+  heading: Type.String(),
+  bullets: Type.Array(Type.String()),
+  /** 可选配图相对路径(已生成的图)。 */
+  figure: Type.Optional(Type.String()),
+  /** 可选讲稿备注(不上屏)。 */
+  notes: Type.Optional(Type.String()),
+})
+export type Slide = Static<typeof Slide>
+
+/** 幻灯片组(oc-slides 输入)。theme=design-token 主题名,引擎据此确定性排版。 */
+export const SlideDeck = Type.Object({
+  title: Type.String(),
+  subtitle: Type.Optional(Type.String()),
+  author: Type.Optional(Type.String()),
+  /** 主题(design-token):default / nature / ieee / dark 等;引擎映射,LLM 不碰样式。 */
+  theme: Type.Optional(Type.String()),
+  slides: Type.Array(Slide),
+})
+export type SlideDeck = Static<typeof SlideDeck>
+
+/** 海报单块(标题 + 内容 markdown,可带图)。 */
+export const PosterSection = Type.Object({
+  heading: Type.String(),
+  bodyMd: Type.String(),
+  figure: Type.Optional(Type.String()),
+})
+export type PosterSection = Static<typeof PosterSection>
+
+/** 学术海报(oc-poster 输入,单页 Typst 渲染)。 */
+export const PosterSpec = Type.Object({
+  title: Type.String(),
+  authors: Type.Optional(Type.String()),
+  affiliation: Type.Optional(Type.String()),
+  theme: Type.Optional(Type.String()),
+  /** 列数(2~4,海报常用 3 列)。 */
+  columns: Type.Optional(Type.Integer()),
+  sections: Type.Array(PosterSection),
+})
+export type PosterSpec = Static<typeof PosterSpec>
+
+// ───────────────────────────────────────────────
 // 6) oc-cite 输出
 // ───────────────────────────────────────────────
 
