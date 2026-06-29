@@ -24,4 +24,5 @@ export { Spinner } from "./Spinner";
 export { Switch } from "./Switch";
 export { Tabs, type TabItem } from "./Tabs";
 export { Textarea } from "./Textarea";
+export { ToastProvider, useToast, type ToastTone } from "./Toast";
 export { Tooltip, TooltipProvider } from "./Tooltip";

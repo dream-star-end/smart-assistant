@@ -108,6 +108,32 @@ export type AckWire = {
 /** keepalive pong（按 id 匹配，先于一切 session handler 处理）。*/
 export type PongWire = { type: "pong"; id?: number };
 
+/**
+ * GitHub 仓库绑定状态推送（容器→bridge→client）。protocol 未建模的轻量控制帧。
+ * 容器报告 git clone 进度/结果；bridge 落库更新选择状态。version-gate 用 selectionVersion。
+ */
+export type RepoStatusWire = {
+  type: "outbound.control.session_repo_status";
+  sessionId: string;
+  selectionVersion?: number;
+  status: "pending" | "cloning" | "ready" | "failed";
+  owner?: string;
+  repo?: string;
+  branch?: string;
+  headSha?: string;
+  errorCode?: string;
+  errorMessage?: string;
+} & WireRuntimeFields;
+
+/** GitHub 绑定校验失败（bridge→client，stale / link 失效 / 内部错）。*/
+export type RepoBindErrorWire = {
+  type: "outbound.control.session_repo_bind_error";
+  sessionId: string;
+  selectionVersion?: number;
+  errorCode?: string;
+  errorMessage?: string;
+} & WireRuntimeFields;
+
 /** 消费侧能识别的全部出站帧判别联合。*/
 export type OutboundWire =
   | OutboundMessageWire
@@ -121,7 +147,9 @@ export type OutboundWire =
   | ColdStartWire
   | RelayReadyWire
   | AckWire
-  | PongWire;
+  | PongWire
+  | RepoStatusWire
+  | RepoBindErrorWire;
 
 // ─── 入站帧（client → gateway，发送侧）───────────────────────────────
 export type { InboundControlStop, InboundMessage, InboundPermissionResponse };
@@ -141,12 +169,35 @@ export type InboundHelloWire = {
 /** keepalive ping。*/
 export type InboundPingWire = { type: "ping"; id: number };
 
+/**
+ * GitHub 仓库绑定（client→bridge→容器）。前端只发 sessionId + 版本 + peer/agentId/channel；
+ * bridge 富化 owner/repo/branch/accessToken/headSha 后转发容器。形状严格对齐 v3
+ * websocket.js _buildBindFrame。
+ */
+export type InboundRepoBindWire = {
+  type: "inbound.control.session_repo_bind";
+  sessionId: string;
+  selectionVersion: number;
+  peer: Peer;
+  agentId: string;
+  channel: "webchat";
+};
+
+/** GitHub 解绑（client→bridge→容器）。*/
+export type InboundRepoUnbindWire = {
+  type: "inbound.control.session_repo_unbind";
+  sessionId: string;
+  selectionVersion: number;
+};
+
 export type InboundWire =
   | InboundMessage
   | InboundControlStop
   | InboundPermissionResponse
   | InboundHelloWire
-  | InboundPingWire;
+  | InboundPingWire
+  | InboundRepoBindWire
+  | InboundRepoUnbindWire;
 
 // ─── narrowing 守卫（onmessage 分发用）────────────────────────────────
 export function isOutboundFrame(f: unknown): f is OutboundWire {

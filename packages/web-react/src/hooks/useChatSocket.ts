@@ -3,7 +3,7 @@ import { api } from "../lib/api";
 import type { ChatMessage, ChatSession } from "../lib/chat/model";
 import { rebuildIndexes } from "../lib/chat/model";
 import { ChatSocket, type ChatSnapshot } from "../lib/chat/socket";
-import type { InboundMessage } from "../lib/chat/frames";
+import type { InboundMessage, RepoBindErrorWire, RepoStatusWire } from "../lib/chat/frames";
 import { SessionStore, type StoredSession } from "../lib/persist";
 import type { AuthSession } from "../lib/types";
 
@@ -77,6 +77,10 @@ export type UseChatSocket = {
   removePersisted: (sessId: string) => void;
   /** 清空当前 user 命名空间（登出隐私收尾）。*/
   wipePersistence: () => Promise<void>;
+  /** GitHub：发仓库绑定帧（PUT /github-selection 成功后）。peer/agentId/channel 由 socket 按 v3 形状构造。*/
+  sendRepoBind: (sessId: string, agentId: string, version: number) => void;
+  /** GitHub：发解绑帧（DELETE /github-selection 成功后）。*/
+  sendRepoUnbind: (sessId: string, version: number) => void;
 };
 
 const EMPTY_MESSAGES: ChatMessage[] = [];
@@ -94,6 +98,10 @@ export function useChatSocket(opts: {
   userId?: string | null;
   /** boot/登录从 IndexedDB 读回会话后回调（供侧栏装载本地会话）。*/
   onHydrated?: (stored: StoredSession[]) => void;
+  /** GitHub 仓库绑定状态帧回调（容器→bridge→client）。交 useRepoBinding 消费。*/
+  onRepoStatus?: (frame: RepoStatusWire) => void;
+  /** GitHub 绑定校验失败帧回调。*/
+  onRepoBindError?: (frame: RepoBindErrorWire) => void;
 }): UseChatSocket {
   const { auth, ready, enabled, defaultAgentId, refreshBalance, userId, onHydrated } = opts;
 
@@ -106,6 +114,11 @@ export function useChatSocket(opts: {
   defaultAgentRef.current = defaultAgentId;
   const onHydratedRef = useRef(onHydrated);
   onHydratedRef.current = onHydrated;
+  // 仓库绑定帧回调:经 ref 让单例 service 永远读到最新闭包(socket 只构造一次)。
+  const onRepoStatusRef = useRef(opts.onRepoStatus);
+  onRepoStatusRef.current = opts.onRepoStatus;
+  const onRepoBindErrorRef = useRef(opts.onRepoBindError);
+  onRepoBindErrorRef.current = opts.onRepoBindError;
 
   // 持久存储（按 user 命名空间）+ 立即落盘句柄 + 写盘签名（防无谓 IDB 写）。
   const storeRef = useRef<SessionStore | null>(null);
@@ -190,6 +203,9 @@ export function useChatSocket(opts: {
       },
       // resume_failed 游标推进 / isFinal turn 收尾：立即落 IndexedDB（防 reload 死循环 + 不丢轮）。
       persistSession: (sessId) => persistRef.current(sessId),
+      // GitHub 仓库绑定状态/错误帧 → 透传给 useRepoBinding（经 ref，无 stale）。
+      onRepoStatus: (frame) => onRepoStatusRef.current?.(frame),
+      onRepoBindError: (frame) => onRepoBindErrorRef.current?.(frame),
       defaultAgentId: defaultAgentRef.current,
     });
   }
@@ -381,6 +397,14 @@ export function useChatSocket(opts: {
     const st = storeRef.current;
     if (st) await st.wipe();
   }, []);
+  const sendRepoBind = useCallback(
+    (sessId: string, agentId: string, version: number) => socket.sendRepoBind(sessId, agentId, version),
+    [socket],
+  );
+  const sendRepoUnbind = useCallback(
+    (sessId: string, version: number) => socket.sendRepoUnbind(sessId, version),
+    [socket],
+  );
 
   return useMemo(
     () => ({
@@ -399,6 +423,8 @@ export function useChatSocket(opts: {
       storedMaxSeq,
       removePersisted,
       wipePersistence,
+      sendRepoBind,
+      sendRepoUnbind,
     }),
     [
       snap,
@@ -415,6 +441,8 @@ export function useChatSocket(opts: {
       storedMaxSeq,
       removePersisted,
       wipePersistence,
+      sendRepoBind,
+      sendRepoUnbind,
     ],
   );
 }

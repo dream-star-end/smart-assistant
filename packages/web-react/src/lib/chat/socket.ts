@@ -70,6 +70,8 @@ import type {
   OutboundResumeFailedWire,
   OutboundTurnStatusWire,
   OutboundWire,
+  RepoBindErrorWire,
+  RepoStatusWire,
 } from "./frames";
 
 export type { ChatStatusClass };
@@ -106,6 +108,10 @@ export type ChatSocketDeps = {
   ) => Promise<void> | void;
   /** 立即把某会话快照落 IndexedDB（resume_failed 游标推进 / isFinal turn 收尾时调）。*/
   persistSession?: (sessId: string) => void;
+  /** GitHub 仓库绑定状态帧（容器→bridge→client）。由 useRepoBinding 消费（banner/pill）。*/
+  onRepoStatus?: (frame: RepoStatusWire) => void;
+  /** GitHub 绑定校验失败帧（bridge→client，stale / link 失效 / 内部错）。*/
+  onRepoBindError?: (frame: RepoBindErrorWire) => void;
   defaultAgentId?: string;
 };
 
@@ -207,6 +213,14 @@ export class ChatSocket {
    * 单一权威信号。收到即排空离线队列(P7.8 重排进去的冷启首条消息得以立即投递)。
    */
   private relayReady = false;
+
+  // ── GitHub 仓库绑定待确认队列 ──
+  // PUT 成功后试发 inbound.control.session_repo_bind;若 WS 未就绪/未投递,在 onopen(hello 之后)
+  // 与 sys.relay_ready 时 flush 兜底。收到匹配/更新版本的 status/bind_error 帧即清。
+  // unbind / removeSession / resetSessions 主动清(避免迟到 status 错配)。键=sessId。
+  // 注:容器重启后 bridge 还有"自动重绑"(从 DB active selection 重发),此队列只覆盖
+  // "PUT 时 WS 未就绪"与"reconnect"两场景,故省去 v3 的 30s GET 轮询。
+  private pendingRepoBind = new Map<string, { agentId: string; version: number }>();
 
   // ── 生命周期事件绑定句柄 ──
   private boundOnline?: () => void;
@@ -587,6 +601,9 @@ export class ChatSocket {
         /* ignore */
       }
 
+      // hello 发完(peer 已注册)后补发积压的仓库绑定(reconnect 兜底,见 pendingRepoBind)。
+      this.flushAllRepoBinds();
+
       // 4s grace 主动 reconcile（§4）：补 resume_failed 覆盖不到的静默丢失。
       if (this.reconnectInFlightSet && this.reconnectInFlightSet.size > 0) {
         const reconnectAt = Date.now();
@@ -869,6 +886,7 @@ export class ChatSocket {
         // 队列等待;此处一收到就立即排空 → relay 一就绪即投递,不靠 4503 reconnect 反弹的运气/时延。
         this.relayReady = true;
         this.startOfflineDrainNow();
+        this.flushAllRepoBinds(); // relay 就绪:补发 PUT 时 WS 未就绪而积压的仓库绑定
         return;
       }
       case "outbound.ack": {
@@ -884,8 +902,21 @@ export class ChatSocket {
         }
         return;
       }
+      case "outbound.control.session_repo_status": {
+        const frame = f as RepoStatusWire;
+        // 收到任何 status(含 pending)即代表 bind 已被容器接收 → 清待确认队列(version 匹配/更新)。
+        this.maybeClearPendingRepoBind(frame.sessionId, frame.selectionVersion);
+        this.deps.onRepoStatus?.(frame);
+        return;
+      }
+      case "outbound.control.session_repo_bind_error": {
+        const frame = f as RepoBindErrorWire;
+        this.maybeClearPendingRepoBind(frame.sessionId, frame.selectionVersion);
+        this.deps.onRepoBindError?.(frame);
+        return;
+      }
       default:
-        // pong 已先处理；其余（repo_status 等）v5 webchat 不消费。
+        // pong 已先处理；其余 v5 webchat 不消费。
         return;
     }
   }
@@ -935,7 +966,14 @@ export class ChatSocket {
     return count === 1 ? only : null;
   }
 
-  private buildHelloFrame(): string {
+  /**
+   * 构造 hello 帧。includeInFlight：
+   *  - true（onopen 默认，reconnect 语义）：带 _sendingInFlight，gateway autoResumeFromHello
+   *    据此对断流 in-flight peer 推合成中断 isFinal。
+   *  - false（bind 前的注册刷新）：所有 peer 强制 inFlight=false —— 纯 peer 注册副作用，
+   *    绝不触发任何 synthetic 中断（对齐 v3 _buildHelloFrame includeInFlight=false）。
+   */
+  private buildHelloFrame(includeInFlight = true): string {
     const peers: Array<{ peerId: string; agentId: string; inFlight: boolean; lastFrameSeq: number }> = [];
     for (const [pid, s] of this.sessions) {
       const safeId = String(pid).replace(/[^a-zA-Z0-9_-]/g, "_");
@@ -944,7 +982,7 @@ export class ChatSocket {
         const aid = agentId || s.agentId || this.deps.defaultAgentId || "main";
         if (emitted.has(aid)) return;
         emitted.add(aid);
-        peers.push({ peerId: pid, agentId: aid, inFlight: !!s._sendingInFlight, lastFrameSeq: Number.isFinite(lastFrameSeq) ? lastFrameSeq : 0 });
+        peers.push({ peerId: pid, agentId: aid, inFlight: includeInFlight ? !!s._sendingInFlight : false, lastFrameSeq: Number.isFinite(lastFrameSeq) ? lastFrameSeq : 0 });
       };
       const byKey = s._lastFrameSeqByKey;
       if (byKey && typeof byKey === "object") {
@@ -1074,6 +1112,7 @@ export class ChatSocket {
     this.serverSessionEnsured.delete(sessId);
     this.serverSessionInflight.delete(sessId);
     this.inFlightSends.delete(sessId);
+    this.pendingRepoBind.delete(sessId);
     if (this.sessions.delete(sessId)) this.scheduleNotify();
   }
 
@@ -1086,6 +1125,7 @@ export class ChatSocket {
     this.serverSessionEnsured.clear();
     this.serverSessionInflight.clear();
     this.inFlightSends.clear();
+    this.pendingRepoBind.clear();
     if (this.sessions.size === 0) return;
     this.sessions.clear();
     this.scheduleNotify();
@@ -1180,6 +1220,70 @@ export class ChatSocket {
     sess._agentSwitchedAt = Date.now();
     resetReplyTracker(sess);
     this.scheduleNotify();
+  }
+
+  // ═══════════════ GitHub 仓库绑定控制帧（§repo）═══════════════
+
+  /**
+   * 发仓库绑定帧（PUT /github-selection 成功后调）。立即试发一次，并登记待确认队列；
+   * 若 WS 未就绪/未投递，onopen(hello 之后) 与 sys.relay_ready 会兜底补发。帧形状严格对齐
+   * v3 _buildBindFrame（peer/agentId/channel），bridge 富化 owner/repo/branch/token 后转发容器。
+   */
+  sendRepoBind(sessId: string, agentId: string, version: number): void {
+    if (!sessId) return;
+    this.pendingRepoBind.set(sessId, { agentId, version });
+    // 新建会话若尚未发过消息，可能还没注册到 bridge（hello 只在 onopen 发）。bind 前先把
+    // 会话登记进 this.sessions，再补发一次 registration hello（includeInFlight=false，纯注册、
+    // 不触发 auto-resume 合成中断），否则 bridge 5s 后回 SESSION_NOT_REGISTERED（对齐 v3
+    // bind 前 refreshWebchatHelloForCurrentSession）。reconnect 兜底仍由 onopen/relay_ready flush 覆盖。
+    this.ensureSession(sessId, agentId);
+    if (this.ws && this.ws.readyState === 1) this.safeWsSend(this.buildHelloFrame(false));
+    this.flushRepoBind(sessId);
+  }
+
+  /** 发解绑帧（DELETE /github-selection 成功后调）。先清待确认队列防迟到 status 错配。 */
+  sendRepoUnbind(sessId: string, version: number): void {
+    if (!sessId) return;
+    this.pendingRepoBind.delete(sessId);
+    this.safeWsSend(
+      JSON.stringify({
+        type: "inbound.control.session_repo_unbind",
+        sessionId: sessId,
+        selectionVersion: version,
+      }),
+    );
+  }
+
+  /** 试发某会话待确认的仓库绑定帧（WS 就绪才发；不就绪静默等 flush 兜底）。 */
+  private flushRepoBind(sessId: string): void {
+    const entry = this.pendingRepoBind.get(sessId);
+    if (!entry) return;
+    if (!this.ws || this.ws.readyState !== 1) return;
+    this.safeWsSend(
+      JSON.stringify({
+        type: "inbound.control.session_repo_bind",
+        sessionId: sessId,
+        selectionVersion: entry.version,
+        peer: { id: sessId, kind: "dm" },
+        agentId: entry.agentId,
+        channel: "webchat",
+      }),
+    );
+  }
+
+  /** 补发所有待确认的仓库绑定（onopen / relay_ready 调）。 */
+  private flushAllRepoBinds(): void {
+    if (!this.ws || this.ws.readyState !== 1) return;
+    for (const sessId of this.pendingRepoBind.keys()) this.flushRepoBind(sessId);
+  }
+
+  /** 收到匹配/更新版本的 status/bind_error 帧 → bind 已到容器/已被裁决,清待确认。 */
+  private maybeClearPendingRepoBind(sessId: string | undefined, version: number | undefined): void {
+    if (!sessId) return;
+    const entry = this.pendingRepoBind.get(sessId);
+    if (entry && typeof version === "number" && version >= entry.version) {
+      this.pendingRepoBind.delete(sessId);
+    }
   }
 
   // ═══════════════ 发送（inbound.message 构造 + 离线路由，§7/§10）═══════════════

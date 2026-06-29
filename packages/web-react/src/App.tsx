@@ -6,6 +6,9 @@ import { ChatHeader } from "./components/ChatHeader";
 import { Composer } from "./components/Composer";
 import { EmptyState } from "./components/EmptyState";
 import { type ChatError, ErrorBanner } from "./components/ErrorBanner";
+import { GithubRepoModal } from "./components/github/GithubRepoModal";
+import { RepoStatusBanner } from "./components/github/RepoStatusBanner";
+import { InboxDialog } from "./components/InboxDialog";
 import { Landing } from "./components/Landing";
 import { ManageCenter, type ManageTab } from "./components/ManageCenter";
 import {
@@ -24,7 +27,12 @@ import { Sidebar } from "./components/Sidebar";
 import { Alert, Sheet } from "./components/ui";
 import { useAgentGate } from "./hooks/useAgentGate";
 import { type UseChatSocket, useChatSocket } from "./hooks/useChatSocket";
+import { useInbox } from "./hooks/useInbox";
+import { useRepoBinding } from "./hooks/useRepoBinding";
 import { useTheme } from "./hooks/useTheme";
+import { useToast } from "./components/ui";
+import { githubErrorText } from "./lib/github";
+import type { RepoBindErrorWire, RepoStatusWire } from "./lib/chat/frames";
 import type { MediaRef } from "./lib/chat/frames";
 import type { ChatMessage } from "./lib/chat/model";
 import { CONTINUE_PROMPT } from "./lib/chat/render";
@@ -134,6 +142,8 @@ export function App() {
   const [modelsLoading, setModelsLoading] = useState(false);
   const [chatError, setChatError] = useState<ChatError | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [inboxOpen, setInboxOpen] = useState(false);
+  const [repoModalOpen, setRepoModalOpen] = useState(false);
   const [manageOpen, setManageOpen] = useState(false);
   const [manageTab, setManageTab] = useState<ManageTab>("memory");
   const [marketplaceOpen, setMarketplaceOpen] = useState(false);
@@ -144,6 +154,11 @@ export function App() {
   // 稳定句柄：让早于 useChatSocket 声明的 send/regenerate 回调引用 WS 引擎，避免
   // “块级变量在声明前使用” 的 TDZ（hook 在下方调用后回填 sockRef.current）。
   const sockRef = useRef<UseChatSocket | null>(null);
+  const toast = useToast();
+  // GitHub 仓库绑定帧处理器的稳定间接：useChatSocket 在 useRepoBinding 之前声明，故经 ref
+  // 透传（与 sockRef 同样的 TDZ 规避；handler 本身是 useRepoBinding 的稳定 useCallback）。
+  const repoStatusHandlerRef = useRef<(f: RepoStatusWire) => void>(() => {});
+  const repoBindErrorHandlerRef = useRef<(f: RepoBindErrorWire) => void>(() => {});
 
   // 本地会话消息存储（脚手架，仅 demo 路径用）：activeId → 消息数组。非 demo 走 WS + IndexedDB。
   const localStore = useRef<Map<string, Message[]>>(new Map());
@@ -439,6 +454,37 @@ export function App() {
   // 键盘快捷键：⌘/Ctrl+K 新会话；Esc 停止当前（demo）流式。仅在进入工作区后生效。
   const inWorkspace = demo || (view === "app" && !!auth && !!user);
 
+  // 站内信未读轮询（铃铛红点）。demo / 未登录不发请求。
+  const inbox = useInbox(auth, inWorkspace && !demo);
+
+  // GitHub OAuth 回调返回：URL 带 ?github_linked / ?github_error → toast + 清 query（仅一次，
+  // 对齐 v3 handleBootGithubParams）。redirect 回 /?github_linked=1，全局 toast 即时反馈。
+  const githubReturnHandledRef = useRef(false);
+  useEffect(() => {
+    if (demo || githubReturnHandledRef.current) return;
+    githubReturnHandledRef.current = true;
+    const sp = new URLSearchParams(window.location.search);
+    let touched = false;
+    if (sp.has("github_linked")) {
+      toast("GitHub 账号已连接", "success");
+      sp.delete("github_linked");
+      touched = true;
+    }
+    if (sp.has("github_error")) {
+      toast(`GitHub 连接失败：${githubErrorText(sp.get("github_error"))}`, "error");
+      sp.delete("github_error");
+      touched = true;
+    }
+    if (touched) {
+      const q = sp.toString();
+      window.history.replaceState(
+        {},
+        "",
+        window.location.pathname + (q ? `?${q}` : "") + window.location.hash,
+      );
+    }
+  }, [demo, toast]);
+
   // 进入登录页（view=app 且未认证）时拉一次公开配置：决定 AuthGate 是否渲染真 Turnstile
   // widget。停在首页（home）/demo/已登录均不拉，避免无谓请求（与无网络测试用例兼容）。
   useEffect(() => {
@@ -498,8 +544,25 @@ export function App() {
     // 持久按 user 命名空间（隐私隔离）；onHydrated 把 IndexedDB 本地会话填进侧栏。
     userId: demo ? null : (user?.id ?? null),
     onHydrated,
+    // GitHub 仓库绑定状态/错误帧 → useRepoBinding（经 ref，见 repoStatusHandlerRef）。
+    onRepoStatus: (f) => repoStatusHandlerRef.current(f),
+    onRepoBindError: (f) => repoBindErrorHandlerRef.current(f),
   });
   sockRef.current = chat; // 回填稳定句柄（供上方 send/regenerate/历史方法引用）。
+
+  // GitHub 仓库绑定：当前活动会话的 selection + 克隆进度 + 版本门控（v5 版 github.js）。
+  const repo = useRepoBinding({
+    auth,
+    activeId,
+    agentId: agent.id,
+    enabled: inWorkspace && !demo,
+    sendRepoBind: chat.sendRepoBind,
+    sendRepoUnbind: chat.sendRepoUnbind,
+    toast,
+  });
+  // 回填帧处理器（稳定 useCallback；render 期赋值幂等，与 useChatSocket persistRef 同模式）。
+  repoStatusHandlerRef.current = repo.onRepoStatus;
+  repoBindErrorHandlerRef.current = repo.onRepoBindError;
 
   // 历史会话列表：登录后用 listSessions 填侧栏（server canonical 元数据 server-wins）。
   // 失败保留本地（IndexedDB 注水）会话，不阻断。
@@ -748,9 +811,21 @@ export function App() {
           onExpandSidebar={() => setCollapsed(false)}
           onNew={newSession}
           onOpenMobileNav={() => setMobileNavOpen(true)}
+          onOpenInbox={demo ? undefined : () => setInboxOpen(true)}
+          unreadCount={inbox.unreadCount}
+          repoSelection={repo.selection}
+          onOpenRepo={demo ? undefined : () => setRepoModalOpen(true)}
           theme={theme}
           onCycleTheme={cycle}
         />
+
+        {!demo && repo.showBanner && repo.selection?.selected && (
+          <RepoStatusBanner
+            selection={repo.selection}
+            progressPct={repo.progressPct}
+            onDismiss={repo.dismissBanner}
+          />
+        )}
 
         <div ref={scrollRef} className="flex-1 overflow-y-auto">
           {gated ? (
@@ -870,6 +945,25 @@ export function App() {
         onClose={() => setSettingsOpen(false)}
         onSetTheme={setTheme}
         onRefreshMe={refreshMe}
+      />
+
+      <InboxDialog
+        open={inboxOpen}
+        auth={auth}
+        onClose={() => setInboxOpen(false)}
+        onUnreadChange={inbox.refreshUnread}
+      />
+
+      <GithubRepoModal
+        open={repoModalOpen}
+        auth={auth}
+        sessionId={activeId}
+        selection={repo.selection}
+        onClose={() => setRepoModalOpen(false)}
+        onConfirm={repo.confirm}
+        onUnbind={repo.unbind}
+        onAccountUnlinked={repo.refresh}
+        toast={toast}
       />
 
       <ManageCenter

@@ -1,10 +1,11 @@
-import { ChevronDown, Menu, PanelLeft, PenSquare, Wallet } from "lucide-react";
+import { Bell, ChevronDown, Menu, PanelLeft, PenSquare, Wallet } from "lucide-react";
 import type { Theme } from "../hooks/useTheme";
 import type { Agent } from "../lib/agents";
 import { AgentAvatar } from "./AgentAvatar";
-import type { PublicModel } from "../lib/types";
+import type { PublicModel, RepoSelection } from "../lib/types";
 import { formatCredits } from "../lib/utils";
 import { ModelSelector } from "./ModelSelector";
+import { RepoPill } from "./github/RepoPill";
 import { ThemeToggle } from "./ThemeToggle";
 import { IconButton } from "./ui";
 
@@ -21,6 +22,10 @@ export function ChatHeader({
   onExpandSidebar,
   onNew,
   onOpenMobileNav,
+  onOpenInbox,
+  unreadCount,
+  repoSelection,
+  onOpenRepo,
   theme,
   onCycleTheme,
 }: {
@@ -40,6 +45,14 @@ export function ChatHeader({
   onNew?: () => void;
   /** 移动端打开侧栏抽屉（窄屏侧栏不内联）。 */
   onOpenMobileNav?: () => void;
+  /** 打开站内信面板（省略则不渲染铃铛，如 demo / 未登录）。 */
+  onOpenInbox?: () => void;
+  /** 站内信未读数（>0 显红点，>99 显 99+）。 */
+  unreadCount?: number;
+  /** 当前会话的仓库绑定（省略 onOpenRepo 则不渲染仓库 pill，如 demo）。 */
+  repoSelection?: RepoSelection | null;
+  /** 打开 GitHub 仓库绑定 modal。 */
+  onOpenRepo?: () => void;
   theme: Theme;
   onCycleTheme: () => void;
 }) {
@@ -82,7 +95,20 @@ export function ChatHeader({
           loading={modelsLoading}
         />
       )}
+      {onOpenRepo && <RepoPill selection={repoSelection ?? null} onClick={onOpenRepo} />}
       <div className="ml-auto flex shrink-0 items-center gap-1.5">
+        {onOpenInbox && (
+          <div className="relative">
+            <IconButton onClick={onOpenInbox} aria-label="站内信" shape="square">
+              <Bell size={18} />
+            </IconButton>
+            {!!unreadCount && unreadCount > 0 && (
+              <span className="pointer-events-none absolute -right-0.5 -top-0.5 flex h-4 min-w-4 items-center justify-center rounded-full bg-danger px-1 text-[10px] font-semibold leading-none text-white tabular-nums">
+                {unreadCount > 99 ? "99+" : unreadCount}
+              </span>
+            )}
+          </div>
+        )}
         {credits != null && (
           <button
             onClick={onOpenBilling}

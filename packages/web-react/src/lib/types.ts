@@ -577,3 +577,59 @@ export type MarketplacePublishResult = {
   riskFlags: MarketplaceRiskFlag[];
   note: string;
 };
+
+// ── 站内信（inbox） ──────────────────────────────────────────────────
+export type InboxLevel = "info" | "notice" | "promo" | "warning";
+
+/** 站内信一条消息（GET /api/me/messages，后端 InboxMessageView 原样 wire）。 */
+export type InboxMessage = {
+  id: string;
+  audience: "all" | "user";
+  user_id: string | null;
+  title: string;
+  /** markdown 正文（前端经 <Markdown> 渲染）。 */
+  body_md: string;
+  level: InboxLevel;
+  created_by: string;
+  created_at: string;
+  expires_at: string | null;
+  read: boolean;
+};
+
+// ── GitHub 仓库绑定 ──────────────────────────────────────────────────
+/** GitHub 账号关联状态（GET /api/me/github）。 */
+export type GithubLink =
+  | { linked: false }
+  | { linked: true; login: string; avatar_url?: string; scopes: string };
+
+/** 用户 GitHub 仓库（GET /api/me/github/repos）。 */
+export type GithubRepo = {
+  owner: { login: string };
+  name: string;
+  full_name: string;
+  default_branch: string;
+  private: boolean;
+  pushed_at?: string;
+};
+
+/** 仓库分支（GET /api/me/github/repos/:owner/:repo/branches）。 */
+export type GithubBranch = { name: string; commit: { sha: string } };
+
+/** 容器克隆/绑定状态机。 */
+export type RepoStatus = "pending" | "cloning" | "ready" | "failed";
+
+/** 某会话的仓库选择（GET/PUT /api/me/sessions/:sid/github-selection）。 */
+export type RepoSelection =
+  | { selected: false }
+  | {
+      selected: true;
+      owner: string;
+      repo: string;
+      branch: string;
+      default_branch?: string;
+      status: RepoStatus;
+      head_sha?: string;
+      error_code?: string;
+      error_message?: string;
+      selection_version: number;
+    };

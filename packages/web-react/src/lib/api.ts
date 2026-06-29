@@ -7,6 +7,11 @@ import type {
   CreatedApiKey,
   CronCreateInput,
   CronJob,
+  GithubBranch,
+  GithubLink,
+  GithubRepo,
+  InboxMessage,
+  RepoSelection,
   SkillDetail,
   SkillSummary,
   MarketplaceDetail,
@@ -1168,6 +1173,166 @@ export const api = {
           credentials: "include",
           headers: bearerHeaders(t, true),
           body: JSON.stringify({ reason }),
+        }),
+      ),
+    ),
+
+  // ── 站内信（inbox，用户侧） ───────────────────────────────────────────
+
+  /** 拉站内信列表 + 未读数（GET /api/me/messages，Bearer）。unreadOnly 仅返未读。 */
+  listInboxMessages: (
+    a: AuthSession,
+    opts?: { unreadOnly?: boolean; limit?: number; offset?: number },
+  ): Promise<{ messages: InboxMessage[]; unread_count: number }> => {
+    const qs = new URLSearchParams();
+    if (opts?.unreadOnly) qs.set("unread_only", "1");
+    if (opts?.limit != null) qs.set("limit", String(opts.limit));
+    if (opts?.offset != null) qs.set("offset", String(opts.offset));
+    const suffix = qs.toString() ? `?${qs.toString()}` : "";
+    return jsonOrThrow<{ messages: InboxMessage[]; unread_count: number }>(
+      callWithRefresh(a, (t) =>
+        fetch(`/api/me/messages${suffix}`, { credentials: "include", headers: bearerHeaders(t) }),
+      ),
+    );
+  },
+
+  /** 仅未读数（GET /api/me/messages/unread_count，Bearer）。铃铛红点轮询用，轻量。 */
+  getInboxUnreadCount: (a: AuthSession): Promise<number> =>
+    jsonOrThrow<{ unread_count: number }>(
+      callWithRefresh(a, (t) =>
+        fetch("/api/me/messages/unread_count", {
+          credentials: "include",
+          headers: bearerHeaders(t),
+        }),
+      ),
+    ).then((b) => b.unread_count),
+
+  /** 标记单条已读（POST /api/me/messages/:id/read，Bearer，幂等）。 */
+  markInboxRead: (a: AuthSession, id: string): Promise<{ ok: boolean; already: boolean }> =>
+    jsonOrThrow<{ ok: boolean; already: boolean }>(
+      callWithRefresh(a, (t) =>
+        fetch(`/api/me/messages/${encodeURIComponent(id)}/read`, {
+          method: "POST",
+          credentials: "include",
+          headers: bearerHeaders(t),
+        }),
+      ),
+    ),
+
+  /** 全部标记已读（POST /api/me/messages/read_all，Bearer）。返插入行数。 */
+  markAllInboxRead: (a: AuthSession): Promise<{ ok: boolean; inserted: number }> =>
+    jsonOrThrow<{ ok: boolean; inserted: number }>(
+      callWithRefresh(a, (t) =>
+        fetch("/api/me/messages/read_all", {
+          method: "POST",
+          credentials: "include",
+          headers: bearerHeaders(t),
+        }),
+      ),
+    ),
+
+  // ── GitHub 仓库绑定 ──────────────────────────────────────────────────
+
+  /**
+   * 启动 GitHub 账号关联 OAuth（POST /api/auth/github/start，Bearer）。
+   * 返回 authorizeUrl + state（同时 Set-Cookie state 做双因素校验），调用方
+   * `location.href = authorizeUrl` 跳转 GitHub 授权页；授权后后端 302 回
+   * `/?github_linked=1` 或 `/?github_error=<code>`。未配 OAuth 时后端 503。
+   */
+  startGithubOAuth: (a: AuthSession): Promise<{ authorizeUrl: string; state: string }> =>
+    jsonOrThrow<{ authorizeUrl: string; state: string }>(
+      callWithRefresh(a, (t) =>
+        fetch("/api/auth/github/start", {
+          method: "POST",
+          credentials: "include",
+          headers: bearerHeaders(t, true),
+          body: "{}",
+        }),
+      ),
+    ),
+
+  /** 读 GitHub 账号关联状态（GET /api/me/github，Bearer）。 */
+  getGithubLink: (a: AuthSession): Promise<GithubLink> =>
+    jsonOrThrow<GithubLink>(
+      callWithRefresh(a, (t) =>
+        fetch("/api/me/github", { credentials: "include", headers: bearerHeaders(t) }),
+      ),
+    ),
+
+  /** 解绑 GitHub 账号（DELETE /api/me/github，Bearer）。级联清所有会话选择。 */
+  unlinkGithub: (a: AuthSession): Promise<{ revoked: boolean; sessionsCleared: number }> =>
+    jsonOrThrow<{ revoked: boolean; sessionsCleared: number }>(
+      callWithRefresh(a, (t) =>
+        fetch("/api/me/github", {
+          method: "DELETE",
+          credentials: "include",
+          headers: bearerHeaders(t),
+        }),
+      ),
+    ),
+
+  /** 列我的 GitHub 仓库（GET /api/me/github/repos，Bearer）。默认按 pushed 倒序、owner 类型。 */
+  listGithubRepos: (a: AuthSession): Promise<GithubRepo[]> =>
+    jsonOrThrow<{ items: GithubRepo[] }>(
+      callWithRefresh(a, (t) =>
+        fetch("/api/me/github/repos?per_page=100&sort=pushed&type=owner", {
+          credentials: "include",
+          headers: bearerHeaders(t),
+        }),
+      ),
+    ).then((b) => b.items ?? []),
+
+  /** 列某仓库分支（GET /api/me/github/repos/:owner/:repo/branches，Bearer）。 */
+  listGithubBranches: (a: AuthSession, owner: string, repo: string): Promise<GithubBranch[]> =>
+    jsonOrThrow<{ items: GithubBranch[] }>(
+      callWithRefresh(a, (t) =>
+        fetch(
+          `/api/me/github/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/branches?per_page=100`,
+          { credentials: "include", headers: bearerHeaders(t) },
+        ),
+      ),
+    ).then((b) => b.items ?? []),
+
+  /** 读某会话的仓库选择（GET /api/me/sessions/:sid/github-selection，Bearer）。 */
+  getRepoSelection: (a: AuthSession, sid: string): Promise<RepoSelection> =>
+    jsonOrThrow<RepoSelection>(
+      callWithRefresh(a, (t) =>
+        fetch(`/api/me/sessions/${encodeURIComponent(sid)}/github-selection`, {
+          credentials: "include",
+          headers: bearerHeaders(t),
+        }),
+      ),
+    ),
+
+  /**
+   * 设置某会话的仓库选择（PUT /api/me/sessions/:sid/github-selection，Bearer）。
+   * 后端校验写权限/分支存在，返回权威 selection_version + status:'pending'。
+   * 调用方拿到版本后经 WS 发 inbound.control.session_repo_bind 触发容器克隆。
+   */
+  putRepoSelection: (
+    a: AuthSession,
+    sid: string,
+    body: { owner: string; repo: string; branch: string },
+  ): Promise<RepoSelection> =>
+    jsonOrThrow<RepoSelection>(
+      callWithRefresh(a, (t) =>
+        fetch(`/api/me/sessions/${encodeURIComponent(sid)}/github-selection`, {
+          method: "PUT",
+          credentials: "include",
+          headers: bearerHeaders(t, true),
+          body: JSON.stringify(body),
+        }),
+      ),
+    ),
+
+  /** 清某会话的仓库选择（DELETE /api/me/sessions/:sid/github-selection，Bearer）。不返新版本号。 */
+  deleteRepoSelection: (a: AuthSession, sid: string): Promise<{ cleared: boolean }> =>
+    jsonOrThrow<{ cleared: boolean }>(
+      callWithRefresh(a, (t) =>
+        fetch(`/api/me/sessions/${encodeURIComponent(sid)}/github-selection`, {
+          method: "DELETE",
+          credentials: "include",
+          headers: bearerHeaders(t),
         }),
       ),
     ),
