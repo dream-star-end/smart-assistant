@@ -729,6 +729,12 @@ export interface V3ContainerStatus {
    * deps.selfHostId = remote host(caller 的 readiness/stop 要走 node-tunnel)。
    */
   hostId: string | null;
+  /**
+   * 运行容器实际镜像(docker inspect 的 Config.Image,如 openclaude/...:v5-ccb-<sha>)。
+   * 供 ensureRunning 比对 deps.image 做"镜像不符→滚动回收"。本地路径可取;remote
+   * containerService.inspect 暂不返回时为 undefined(不触发回收,行为同旧)。
+   */
+  image?: string;
 }
 
 // ───────────────────────────────────────────────────────────────────────
@@ -2330,14 +2336,19 @@ export async function getV3ContainerStatus(
     && deps.containerService !== undefined;
 
   let state: V3ContainerStatus["state"];
+  let image: string | undefined;
   try {
     if (useRemote) {
       const info = await deps.containerService!.inspect(row.host_uuid!, row.container_internal_id);
       state = info.state === "running" ? "running" : "stopped";
+      // remote inspect 暂不暴露 image(契约扩展前为 undefined → 不触发镜像回收)。
+      image = (info as { image?: unknown }).image as string | undefined;
     } else {
       const info = await deps.docker.getContainer(row.container_internal_id).inspect();
       const running = Boolean(info.State && info.State.Running);
       state = running ? "running" : "stopped";
+      // Config.Image = 创建容器时的镜像名:tag(非 resolved sha),与 deps.image 同形可直接比对。
+      image = info.Config?.Image;
     }
   } catch (err) {
     if (isNotFound(err)) {
@@ -2355,6 +2366,7 @@ export async function getV3ContainerStatus(
     dockerContainerId: row.container_internal_id,
     state,
     hostId: row.host_uuid,
+    ...(image ? { image } : {}),
   };
 }
 

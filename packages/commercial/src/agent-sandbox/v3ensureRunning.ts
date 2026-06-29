@@ -323,8 +323,25 @@ export function makeV3EnsureRunning(
       throw new ContainerUnreadyError(RETRY_AFTER_PROVISIONING_SEC, "supervisor_error");
     }
 
-    // 2a) running 直接进 readiness 探活(HTTP /healthz + WS upgrade)
-    if (status && status.state === "running") {
+    // 镜像滚动回收:运行中容器的实际镜像 != 目标镜像(发版换了新 tag)→ 视作过期,不复用,
+    // 落到下方 (2b) stopAndRemove + 用 deps.image 重建。根治"存量长活容器一直跑旧镜像/旧行为
+    // (旧 permissionMode / baseline / CLI),要等 idle 回收或 crash 才换新版"的问题。
+    // remote 容器 image 暂为 undefined → 不触发(行为同旧,纵深安全)。
+    const imageStale =
+      status?.state === "running" &&
+      typeof status.image === "string" &&
+      typeof deps.image === "string" &&
+      status.image !== deps.image;
+    if (imageStale) {
+      console.warn("[v3ensureRunning] recycling stale-image container", {
+        uid,
+        current: status?.image,
+        desired: deps.image,
+      });
+    }
+
+    // 2a) running 且镜像最新 → 直接进 readiness 探活(HTTP /healthz + WS upgrade)
+    if (status && status.state === "running" && !imageStale) {
       const endpoint = chooseReadinessEndpoint(
         status.hostId,
         deps.selfHostId,
@@ -375,7 +392,9 @@ export function makeV3EnsureRunning(
     //     age<15s` 边界(provision 事务刚 COMMIT 的极短窗口)。原本那也归 'stopped'
     //     让用户 3s 重试,但实际容器并不存在所以怎么也不会转 running,旧行为反而是
     //     死循环。新逻辑直接清掉重建,uniq + lock 保证不会留多份 active row。
-    if (status && (status.state === "stopped" || status.state === "missing")) {
+    // imageStale(running 但镜像过期)也走这里:stopAndRemove 对 running 容器先 stop 再 remove,
+    // 然后 fall through 到 (3) 用 deps.image 重建 → 滚动升级抵达存量长活容器。
+    if (status && (status.state === "stopped" || status.state === "missing" || imageStale)) {
       try {
         await stopAndRemoveV3Container(deps, {
           id: status.containerId,

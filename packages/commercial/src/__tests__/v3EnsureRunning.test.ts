@@ -237,6 +237,8 @@ class FakePool {
 type DockerBehavior = {
   /** docker.getContainer(id).inspect() 行为:running/stopped/missing */
   inspectState?: "running" | "stopped" | "missing";
+  /** 运行容器的 Config.Image(默认匹配 deps.image → 不触发镜像回收)。 */
+  containerImage?: string;
   /** 第 N 个 createContainer 抛(模拟 image missing) */
   createContainerThrow?: Error;
   /**
@@ -321,6 +323,7 @@ function makeDocker(behavior: DockerBehavior = {}): { docker: Docker; captured: 
         return {
           Id: _id,
           State: { Running: behavior.inspectState !== "stopped", Status: behavior.inspectState ?? "running" },
+          Config: { Image: behavior.containerImage ?? "openclaude/openclaude-runtime:test" },
         };
       },
       stop: async () => {
@@ -395,6 +398,27 @@ describe("makeV3EnsureRunning", () => {
       containerId: 1,
       coldStart: false, // running 重用分支
     });
+  });
+
+  test("active + running 但镜像过期 → stopAndRemove + 用新镜像 provision(滚动回收)", async () => {
+    const pool = new FakePool();
+    pool.preInsertActive(11, "172.30.1.5", "dockerid-pre-11");
+    // 运行容器镜像 = 旧 tag,与 deps.image(...:test)不符 → imageStale → 回收重建,而非 warm 复用。
+    const { docker, captured } = makeDocker({
+      inspectState: "running",
+      containerImage: "openclaude/openclaude-runtime:v5-ccb-OLD",
+    });
+    const ensureRunning = makeV3EnsureRunning(makeDeps(docker, pool as unknown as Pool), {
+      probeHealthz: async () => true,
+      probeWsUpgrade: async () => true,
+      sleep: noSleep,
+      now: fixedNow,
+    });
+
+    const ep = await ensureRunning(11n);
+    assert.strictEqual(ep.coldStart, true, "镜像过期应走 provision 重建,不是 warm 复用");
+    assert.ok(captured.stopped >= 1 && captured.removed >= 1, "旧容器应被 stopAndRemove");
+    assert.ok(captured.containersCreated >= 1, "应用新镜像 provision 新容器");
   });
 
   test("active + running + healthz 一直返 false → ContainerUnreadyError('starting')", async () => {
