@@ -43,8 +43,18 @@
 - Unpaywall email / Semantic Scholar key / ncpssd(**全免费注册**,扩多源 + 中文 OA)。
 - master 出站放行 → master OA-fetch 自动 DOI 接地(verifiedSource)。
 
-## 部署(未上线)
+## 部署:v5 暗发布已上线(2026-06-29,Path 2)
 
-- v5 lane:`scripts/deploy-v5.sh`;改 CLI/容器代理须重建 runtime image(新增 oc-lit/cite/ingest/litrag/report/slides/poster/rank + SciencePlots pip + 11 baseline skills + scholar agent)。
-- 需跑 migration 0094/0095;research_config 默认 disabled(admin 开启)。
-- 前端 web-react 需 vite build + rsync dist。
+**已上线到 v5 灰度实例(kl-mirror:18790)**,research_config 全程关闭 → 功能暗态,零 v3 触碰、可回滚:
+- canonical v5 = `feat/v5-aurora-rewrite` @ e14af002(merge research + 暗发布 fail-soft + overrides 镜像 tag;**未 push**,沿用 v5 本地约定)。
+- runtime image **v5-ccb-79b453509b35**(bb8aab10 超集:全部旧 oc-* + 新 oc-lit/cite/ingest/litrag/report/slides/poster/rank + matplotlib/SciencePlots);远端 env `OC_RUNTIME_IMAGE` 已指向(备份 `commercial-v5.env.bak.pre-research`)。
+- 前端 dist 已 rsync 到 `/opt/openclaude/openclaude-v5/packages/web-react/dist`。
+- **暗发布关键修复**:`research_config` 表未迁移时 readRow fail-soft 成 disabled(42P01→503,非 500)。
+- 验证:v5 /healthz ok(controlPlaneEnabled=false/autoMigrate=false/containerRuntime=enabled)、/version=e14af002、research 代理路由 401(已挂载)、`research_config` 表不存在、共享 DB 仍 0093、v3 /healthz 未受影响、启动日志无错。
+- 回滚:`scripts/deploy-v5.sh --rollback`(.prev.1)+ 还原 env 备份 + env 改回 bb8aab10。
+
+### 开启功能 = Path 2 第二步(尚未做,需一次 v3 lane 发布)
+1. **0094/0095 双树落地**(Option A):把两迁移 SQL 也加进 v3 商业版树(`/opt/openclaude/openclaude-v3`,v3-inert)→ deploy-v3.sh 发布 → v3 AUTO_MIGRATE 把 0094/0095 apply 到共享 DB(根因:共享 DB + migrate.ts 严格漂移检测,v5 单独 apply 会让 v3 启动 verifyIntegrity 失败)。
+2. migration apply 后 → admin 开 research_config.enabled=true(灰度)。
+3. 真容器端到端:起 v5 turn 验证容器用新镜像 provision + 调 oc-lit 走通(开启前调 → 干净 503)。
+- infra 升级(可选,免费起步):Unpaywall/S2/ncpssd key、MiniCheck 端点、Qdrant+embedding、MinerU OCR —— 见上方 infra 段,全 pluggable+config-gated。
