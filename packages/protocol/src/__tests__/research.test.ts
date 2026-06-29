@@ -66,8 +66,7 @@ describe('research protocol schemas', () => {
   })
 
   it('NormalizedDocument: 缺 spans 拒', () => {
-    const bad = baseDoc() as Record<string, unknown>
-    delete bad.spans
+    const bad = { docId: 'd', contentSha256: 'a', lang: 'en', title: 't', references: [] }
     assert.equal(Value.Check(NormalizedDocument, bad), false)
   })
 

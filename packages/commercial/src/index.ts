@@ -105,6 +105,10 @@ import {
   type InboxEmailSchedulerHandle,
 } from "./inbox/email.js";
 import {
+  startResearchJobScheduler,
+  type ResearchJobSchedulerHandle,
+} from "./research/scheduler.js";
+import {
   makeAnthropicProxyHandler,
   type AnthropicProxyHandler,
 } from "./http/anthropicProxy.js";
@@ -2329,6 +2333,23 @@ export async function registerCommercial(
     });
   }
 
+  // 科研 durable job worker(v5 科研 agent 子系统)。
+  // research_jobs 表持久化容器提交的重 master-side op(ingest/index/cite_check/...);
+  // 本 scheduler 周期 drain;启动时一次 stale cleanup(running>30min → interrupted).
+  // **必须 gate 在 controlPlaneEnabled**:v5 follower 不跑(下方 fail-closed 兜底).
+  // 关闭:COMMERCIAL_RESEARCH_JOBS_DISABLED=1.默认 5s tick.
+  // handler map:Phase 0 暂空(无 proxy 创建 job);Phase 1/2 逐步注入 ingest/index/
+  // cite_check/lit_search/render 真实 handler(DI seam,见 research/scheduler.ts).
+  let researchJobScheduler: ResearchJobSchedulerHandle | undefined;
+  if (controlPlaneEnabled && process.env.COMMERCIAL_RESEARCH_JOBS_DISABLED !== "1") {
+    const raw = Number(process.env.COMMERCIAL_RESEARCH_JOBS_INTERVAL_MS);
+    const intervalMs = Number.isFinite(raw) && raw >= 2000 ? raw : 5_000;
+    researchJobScheduler = startResearchJobScheduler({
+      handlers: {},
+      intervalMs,
+    });
+  }
+
   // v5 灰度可观测 — runtimeStatus 暴露给 gateway /healthz,作为"控制面静默 / 运行时隔离 /
   // 灰度归属"的只读断言面(P4 可观测前移)。
   const enabledSchedulers: string[] = [];
@@ -2347,6 +2368,7 @@ export async function registerCommercial(
   if (finalizeJournalReconciler) enabledSchedulers.push("finalizeReconciler");
   if (onboardingScheduler) enabledSchedulers.push("onboarding");
   if (inboxEmailScheduler) enabledSchedulers.push("inboxEmail");
+  if (researchJobScheduler) enabledSchedulers.push("researchJobs");
   if (wechatBroker) enabledSchedulers.push("wechatBroker");
   // 注:compute-pool init / image-promote / preheat 及所有容器面 scheduler(idleSweep/
   // volumeGc/orphanReconcile/migrationReconcile/healthPoller/containerEvents)现已**全部 gate
@@ -2446,6 +2468,9 @@ export async function registerCommercial(
       }
       if (inboxEmailScheduler) {
         try { inboxEmailScheduler.stop(); } catch { /* ignore */ }
+      }
+      if (researchJobScheduler) {
+        try { researchJobScheduler.stop(); } catch { /* ignore */ }
       }
       if (baselineSrv) {
         try { await baselineSrv.stop(); } catch { /* ignore */ }
