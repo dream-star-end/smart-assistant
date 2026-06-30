@@ -445,7 +445,10 @@ export async function handleRegister(
     getSystemSetting("allow_registration"),
     getSystemSetting("register_email_domain_blocklist"),
   ]);
-  if (allowReg.value !== true) {
+  // v5 灰度: 注册放开(channel 权威, 与 system_settings 共享库无关) —— v3 现网仍按 system_settings
+  // 门控, 不被 v5 牵连。channel 信号同模型过滤(OC_RUNTIME_CHANNEL)。
+  const isV5Channel = (process.env.OC_RUNTIME_CHANNEL?.trim() || "v3") === "v5";
+  if (!isV5Channel && allowReg.value !== true) {
     throw new HttpError(403, "REGISTRATION_DISABLED", "已关闭新用户注册");
   }
   const cfg = deps.rateLimits?.register ?? DEFAULT_RATE_LIMITS.register;
@@ -955,7 +958,9 @@ export async function handleGetPublicConfig(
   _ctx: RequestContext,
   deps: CommercialHttpDeps,
 ): Promise<void> {
-  const allow_registration = await _readAllowRegistrationCached();
+  // v5 灰度注册放开(channel 权威);v3 现网仍按 system_settings。与 handleRegister 后端门控一致。
+  const isV5Channel = (process.env.OC_RUNTIME_CHANNEL?.trim() || "v3") === "v5";
+  const allow_registration = isV5Channel || (await _readAllowRegistrationCached());
   sendJson(res, 200, {
     turnstile_site_key: deps.turnstileSiteKey ?? "",
     // turnstile_bypass=true → 前端可直接发"占位 token",dev/CI 用;生产必须 false

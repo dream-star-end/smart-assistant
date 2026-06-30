@@ -312,7 +312,7 @@ export function AuthGate({
   );
 
   return (
-    <div className="relative flex min-h-screen items-center justify-center overflow-hidden bg-bg px-5">
+    <div className="relative h-full overflow-y-auto bg-bg">
       <div
         aria-hidden
         className="pointer-events-none absolute inset-0 opacity-70"
@@ -326,16 +326,18 @@ export function AuthGate({
           variant="ghost"
           size="sm"
           onClick={mode === "login" ? onBack : () => go("login")}
-          className="absolute left-4 top-4 gap-1.5 text-muted"
+          className="absolute left-4 top-4 z-10 gap-1.5 text-muted"
         >
           <ArrowLeft size={15} />
           {mode === "login" ? "返回首页" : "返回登录"}
         </Button>
       )}
-      <div className="absolute right-4 top-4">
+      <div className="absolute right-4 top-4 z-10">
         <ThemeToggle theme={theme} onCycle={onCycleTheme} />
       </div>
 
+      {/* 滚动容器内居中：内容短则垂直居中，内容高(注册4字段/小屏)则可滚动不被裁。 */}
+      <div className="flex min-h-full items-center justify-center px-5 py-12">
       <div className="relative w-full max-w-[400px] animate-in">
         <div className="mb-7 flex flex-col items-center text-center">
           <span className="mb-4 flex size-12 items-center justify-center rounded-xl2 bg-grad-cta text-white shadow-float">
@@ -650,6 +652,7 @@ export function AuthGate({
         )}
 
         <p className="mt-4 text-center text-[12px] text-faint">全能助手 · 流式对话 · 持久会话</p>
+      </div>
       </div>
     </div>
   );

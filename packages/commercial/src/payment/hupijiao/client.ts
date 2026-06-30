@@ -16,6 +16,8 @@
  */
 
 import { randomBytes } from "node:crypto";
+import type { Dispatcher } from "undici";
+import { directEgressDispatcher } from "../../account-pool/egressDispatcher.js";
 import { signHupijiao } from "./sign.js";
 
 export interface HupijiaoConfig {
@@ -122,7 +124,11 @@ export function createHttpHupijiaoClient(
         method: "POST",
         headers: { "Content-Type": "application/x-www-form-urlencoded" },
         body: form.toString(),
-      });
+        // 虎皮椒/讯虎是**国内**支付网关，必须显式直连，绕开 gateway 全局 EnvHttpProxyAgent
+        // (给 Anthropic/GPT 出海的日本 sing-box 代理) —— 否则国内域名经日本代理 fetch failed。
+        // 同 minimax/marketplaceSearch 的直连模式（见 v3-egress-domestic-models-via-japan）。
+        dispatcher: directEgressDispatcher(),
+      } as RequestInit & { dispatcher: Dispatcher });
 
       if (!resp.ok) {
         let body: string | undefined;

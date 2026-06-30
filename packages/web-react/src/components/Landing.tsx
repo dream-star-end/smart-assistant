@@ -52,7 +52,7 @@ export function Landing({
   onCycleTheme: () => void;
 }) {
   return (
-    <div className="min-h-screen bg-bg text-fg">
+    <div className="h-full overflow-y-auto bg-bg text-fg">
       {/* Nav */}
       <header className="landing-safe-t sticky top-0 z-30 border-b border-border/60 bg-bg/80 backdrop-blur-xl">
         {/* 窄屏(华为折叠外屏 / 320 小屏)收紧内边距,避免 nav 溢出 8px。 */}
