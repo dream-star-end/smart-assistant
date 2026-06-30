@@ -27,6 +27,8 @@ import { ResearchReportCard } from "./chat/ResearchReportCard";
 import { TeamPanel } from "./chat/TeamPanel";
 import { PermissionCard, type PermissionRespond } from "./chat/PermissionCard";
 import { ToolCardSlot } from "./chat/toolCardSlot";
+import { asStr, resolveToolInput } from "./tool/format";
+import { researchToolCard } from "./tool/researchCards";
 import { Avatar } from "./ui";
 
 type RendererProps = {
@@ -49,11 +51,19 @@ export const MessageRenderer = memo(
         return <AssistantCard msg={message} ctx={ctx} cb={cb} />;
       case "thinking":
         return <ThinkingCard msg={message} ctx={ctx} />;
-      case "tool":
+      case "tool": {
         // 任务列表(TodoWrite)改由钉在输入框上方的 PinnedTaskTracker 展示:inline 卡不再
         // 渲染,避免与 HUD 重复、且不被消息流滚走。其余工具卡照常。
         if (message.toolName === "TodoWrite") return null;
+        // oc-* 研究工具:直接渲染干净的专属卡片,**去掉"终端 + 命令"外壳**(boss 反馈套壳没必要)。
+        // 命令出错时 researchToolCard 返回 null → 回落 ToolCardSlot 终端卡,保证报错可见。
+        const ocCmd = asStr(resolveToolInput(message)?.command);
+        if (ocCmd) {
+          const ocCard = researchToolCard(ocCmd, message);
+          if (ocCard) return <div className="px-0.5 py-1">{ocCard}</div>;
+        }
         return <ToolCardSlot message={message} />;
+      }
       case "plan":
         return <PlanCard msg={message} />;
       case "permission":

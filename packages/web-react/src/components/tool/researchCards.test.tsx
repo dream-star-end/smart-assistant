@@ -95,6 +95,39 @@ describe("其余 oc-* 卡片", () => {
     expect(screen.getByText(/实验显示 X 提升 5%/)).toBeInTheDocument();
   });
 
+  test("oc-cite format → 引用格式化卡(record + 可复制引用串)", () => {
+    const out = JSON.stringify({
+      verdict: {
+        identifier: "doi:10.1093/nsr/nwx110",
+        resolved: true,
+        retracted: null,
+        record: { title: "Deep learning for NLP", authors: [{ name: "Hang Li" }], year: 2017, venue: "NSR", doi: "10.1093/nsr/nwx110" },
+        bibtex: "@article{li2017, title={Deep learning for NLP}}",
+      },
+    });
+    render(<div>{researchToolCard("oc-cite format 10.1093/nsr/nwx110 --style bibtex", tool({ output: out }))}</div>);
+    expect(screen.getByText("引用格式化")).toBeInTheDocument();
+    expect(screen.getByText("Deep learning for NLP")).toBeInTheDocument();
+    expect(screen.getByText("已接地")).toBeInTheDocument();
+    expect(screen.getByText(/@article\{li2017/)).toBeInTheDocument(); // 格式化引用串可见
+  });
+
+  test("oc-cite check/fix → claims/quotes 嵌在 manifest 下也能渲染", () => {
+    const out = JSON.stringify({
+      manifest: {
+        sources: [],
+        quotes: [{ id: "q1", text: "原文证据片段" }],
+        claims: [{ id: "c1", text: "断言一", status: "verified", supports: [{ quoteId: "q1" }] }],
+        coverage: { verifiedClaims: 1, totalClaims: 1 },
+      },
+    });
+    render(<div>{researchToolCard("oc-cite fix --manifest m.json --docs d", tool({ output: out }))}</div>);
+    expect(screen.getByText("引用接地校验")).toBeInTheDocument();
+    expect(screen.getByText("断言一")).toBeInTheDocument();
+    expect(screen.getByText(/原文证据片段/)).toBeInTheDocument();
+    expect(screen.getByText(/1 已接地/)).toBeInTheDocument(); // 用 coverage
+  });
+
   test("oc-ingest → 入库卡 + needsOcr 警告", () => {
     render(
       <div>
@@ -125,12 +158,21 @@ describe("其余 oc-* 卡片", () => {
     expect(screen.getByText(/关键原文片段/)).toBeInTheDocument();
   });
 
-  test("oc-report → 产物卡(参考文献数 + 红标)", () => {
+  test("oc-report → 产物卡(参考文献数 + 红标 + 下载)", () => {
     const out = JSON.stringify({ output: "/tmp/report.pdf", references: 12, warnings: ["第3段未接地"] });
     render(<div>{researchToolCard("oc-report --schema s --manifest m", tool({ output: out }))}</div>);
     expect(screen.getByText("报告已生成")).toBeInTheDocument();
-    expect(screen.getByText("report.pdf")).toBeInTheDocument();
+    // 标题副标 + 下载卡都会显示文件名 → 至少出现一次(下载入口存在)。
+    expect(screen.getAllByText("report.pdf").length).toBeGreaterThanOrEqual(1);
     expect(screen.getByText(/未接地\/红标/)).toBeInTheDocument();
+  });
+
+  test("oc-report 产物卡:拒绝恶意 output scheme(不产出可点 href)", () => {
+    const out = JSON.stringify({ output: "javascript:alert(1)//.pdf" });
+    const { container } = render(<div>{researchToolCard("oc-report --schema s", tool({ output: out }))}</div>);
+    expect(screen.getByText("报告已生成")).toBeInTheDocument(); // 卡仍渲染
+    expect(container.querySelector('a[href^="javascript:"]')).toBeNull(); // 无 javascript href
+    expect(container.querySelector("a")).toBeNull(); // 不安全 src → 不渲染下载/预览链接
   });
 
   test("oc-rank → 排名卡(Elo)", () => {

@@ -23,6 +23,7 @@ import {
 } from "lucide-react";
 import type { ReactNode } from "react";
 import { cn } from "../../lib/utils";
+import { SignedFileCard, useSignedSrc } from "../chat/media";
 import { asArr, asStr, isSafeHttpUrl, type ToolLike } from "./format";
 
 // ── 解析助手 ────────────────────────────────────────────────────────────────
@@ -286,6 +287,8 @@ interface Verdict {
   retracted?: boolean | null;
   apa?: string;
   gbt7714?: string;
+  bibtex?: string;
+  record?: { title?: string; authors?: LitAuthor[]; year?: number; venue?: string; doi?: string };
 }
 interface QuoteRow {
   id?: string;
@@ -301,7 +304,11 @@ interface Claim {
 
 function CitationCard({ data, partial }: { data: Record<string, unknown>; partial?: boolean }) {
   const verdicts = recArr<Verdict>(data.verdicts);
-  const claims = recArr<Claim>(data.claims);
+  // format:单条 verdict + 格式化引用(bibtex/apa/gbt7714)。
+  const single = isRecord(data.verdict) ? (data.verdict as Verdict) : null;
+  // check/fix:claims/quotes 嵌在 manifest 下(兼容旧的 top-level)。
+  const manifest = isRecord(data.manifest) ? data.manifest : data;
+  const claims = recArr<Claim>(manifest.claims);
   // verify:逐条 identifier 的接地/撤稿。
   if (verdicts.length > 0) {
     return (
@@ -332,18 +339,48 @@ function CitationCard({ data, partial }: { data: Record<string, unknown>; partia
       </CardShell>
     );
   }
-  // check / fix:已检 manifest——claim 接地状态(verified 绿 / unsupported 红)+ 其引用原文。
-  if (claims.length > 0) {
-    const quotes = recArr<QuoteRow>(data.quotes);
-    const quoteById = new Map(quotes.map((q) => [asStr(q.id), q] as const));
-    const verified = claims.filter((c) => c.status === "verified").length;
-    const unsupported = claims.filter((c) => c.status === "unsupported").length;
+  // format:单条引用格式化(GB-T 7714 / APA / BibTeX),给可复制的引用串。
+  if (single) {
+    const rec = isRecord(single.record) ? (single.record as Verdict["record"]) : undefined;
+    const cite = asStr(single.gbt7714) || asStr(single.apa) || asStr(single.bibtex);
+    const ok = single.resolved === true && single.retracted !== true;
+    const meta = [authorsLine(rec?.authors), rec?.year ? String(rec.year) : "", asStr(rec?.venue)]
+      .filter(Boolean)
+      .join(" · ");
     return (
       <CardShell
         icon={<Quote className="size-4" />}
-        title="引用接地校验"
-        subtitle={`${verified} 已接地 · ${unsupported} 未支撑`}
+        title="引用格式化"
+        subtitle={asStr(rec?.doi) || asStr(single.identifier)}
       >
+        <div className="text-[13px] leading-snug text-fg">{asStr(rec?.title) || asStr(single.identifier)}</div>
+        {meta && <div className="mt-0.5 text-xs text-faint">{meta}</div>}
+        <div className="mt-1 flex flex-wrap gap-1.5">
+          <Chip tone={ok ? "ok" : "danger"}>{single.resolved ? "已接地" : "未命中可信记录"}</Chip>
+          {single.retracted === true && <Chip tone="danger">已撤稿</Chip>}
+        </div>
+        {cite && (
+          <pre className="mt-2 overflow-x-auto whitespace-pre-wrap break-words rounded bg-code px-2.5 py-2 font-mono text-[12px] text-muted">
+            {cite}
+          </pre>
+        )}
+      </CardShell>
+    );
+  }
+  // check / fix:已检 manifest——claim 接地状态(verified 绿 / unsupported 红)+ 其引用原文。
+  if (claims.length > 0) {
+    const quotes = recArr<QuoteRow>(manifest.quotes);
+    const quoteById = new Map(quotes.map((q) => [asStr(q.id), q] as const));
+    const cov = isRecord(manifest.coverage) ? manifest.coverage : null;
+    const verified =
+      cov && typeof cov.verifiedClaims === "number"
+        ? cov.verifiedClaims
+        : claims.filter((c) => c.status === "verified").length;
+    const unsupported = claims.filter((c) => c.status === "unsupported").length;
+    const subtitle =
+      unsupported > 0 ? `${claims.length} 条 · ${verified} 已接地 · ${unsupported} 未支撑` : `${claims.length} 条 · ${verified} 已接地`;
+    return (
+      <CardShell icon={<Quote className="size-4" />} title="引用接地校验" subtitle={subtitle}>
         <ul className="flex flex-col divide-y divide-border">
           {claims.slice(0, 50).map((c, i) => {
             const q = quoteById.get(asStr(c.supports?.[0]?.quoteId));
@@ -429,10 +466,54 @@ function LitragCard({ data, partial }: { data: Record<string, unknown>; partial?
 
 // ── 产物卡(oc-report 报告 / oc-slides 幻灯 / oc-poster 海报) ──────────────────
 
+/** 浏览器可直接预览的产物类型(其余只给下载)。 */
+const PREVIEWABLE_EXT = new Set(["html", "htm", "pdf", "png", "jpg", "jpeg", "gif", "webp", "svg"]);
+
+/** 产物 src 安全白名单:只允许**容器绝对路径**(/… 非 //,useSignedSrc 会签名)或 **http(s)**。
+ *  拒绝 javascript:/data:/blob:/协议相对/相对路径 —— 防工具输出里的恶意串拼成可点 href(XSS)。 */
+function safeArtifactSrc(s: unknown): string | null {
+  const v = asStr(s).trim();
+  if (!v) return null;
+  // 内联 http(s) 判定:不用 isSafeHttpUrl 类型守卫,避免它把 string 在 else 分支窄成 never。
+  if (/^https?:\/\//i.test(v)) return v;
+  if (v.startsWith("/") && !v.startsWith("//")) return v;
+  return null;
+}
+
+/** 从路径取小写扩展名(先去 query/hash,再取末段 . 后)。 */
+function fileExt(s: string): string {
+  const path = s.split(/[?#]/)[0] ?? "";
+  const base = path.split("/").pop() ?? "";
+  const dot = base.lastIndexOf(".");
+  return dot >= 0 ? base.slice(dot + 1).toLowerCase() : "";
+}
+
+/** 产物「预览」链接:容器路径经 /api/media-sign 签名后用新标签打开(html/pdf/图浏览器原生渲染)。
+ *  独立组件:研究卡是纯函数不能用 hook,预览需 useSignedSrc → 在此组件内调用。src 必须已过白名单。 */
+function ArtifactPreviewLink({ src }: { src: string }) {
+  const previewable = PREVIEWABLE_EXT.has(fileExt(src));
+  const signed = useSignedSrc(previewable ? src : null);
+  if (!previewable || !signed) return null;
+  return (
+    <a
+      href={signed}
+      target="_blank"
+      rel="noreferrer noopener"
+      className="inline-flex items-center gap-1 rounded bg-accent-soft px-2 py-1 text-[12px] text-accent hover:underline"
+    >
+      预览
+      <ExternalLink className="size-3" />
+    </a>
+  );
+}
+
 function ArtifactCard({ data }: { data: Record<string, unknown> }) {
   const output = asStr(data.output);
   if (!output) return null;
   const fileName = output.split("/").pop() || output;
+  const safeOut = safeArtifactSrc(output); // 白名单后才做 href(防恶意 scheme)
+  const qmd = asStr(data.qmd); // 中间产物(Quarto 源)
+  const safeQmd = qmd && qmd !== output ? safeArtifactSrc(qmd) : null;
   const warnings = asArr(data.warnings).map((w) => asStr(w)).filter(Boolean);
   const refs = typeof data.references === "number" ? data.references : null;
   const slides = typeof data.slideCount === "number" ? data.slideCount : null;
@@ -449,6 +530,19 @@ function ArtifactCard({ data }: { data: Record<string, unknown> }) {
             <Chip tone="danger">{warnings.length} 处未接地/红标</Chip>
           ))}
       </div>
+      {/* 结果产物:下载 + 预览(仅白名单安全 src) */}
+      {safeOut && (
+        <div className="mt-2 flex flex-wrap items-center gap-2">
+          <SignedFileCard src={safeOut} filename={fileName} />
+          <ArtifactPreviewLink src={safeOut} />
+        </div>
+      )}
+      {/* 中间产物(.qmd 源):下载 */}
+      {safeQmd && (
+        <div className="mt-1">
+          <SignedFileCard src={safeQmd} filename={qmd.split("/").pop() || "source.qmd"} />
+        </div>
+      )}
       {warnings.length > 0 && (
         <ul className="mt-2 flex flex-col gap-0.5 text-xs text-danger">
           {warnings.slice(0, 10).map((w, i) => (
