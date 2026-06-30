@@ -95,7 +95,11 @@ const DEEPSEEK: StaticKeyProviderSpec = {
 
 const MINIMAX: StaticKeyProviderSpec = {
   id: 'minimax',
-  upstreamEndpoint: 'https://api.minimaxi.com/anthropic/v1/messages',
+  // 2026-06-30:MiniMax-M3 接入从 MiniMax 官方直连切到火山方舟 Agent Plan。火山 Agent Plan
+  // 同名托管 minimax-m3(Anthropic 兼容 /v1/messages,实测返回带 thinking block + usage.input/output_tokens,
+  // 多模态 base64 识图通)。模型名/matchesRoute/canonicalize/supportsVision **全不变**,仅上游通道与
+  // key(MINIMAX_TOKEN_PLAN_KEY → ARK_AGENT_PLAN_KEY,见 staticProviderMeta)更换。
+  upstreamEndpoint: 'https://ark.cn-beijing.volces.com/api/plan/v1/messages',
   matchesRoute(modelId) {
     return modelId.toLowerCase() === 'minimax-m3'
   },

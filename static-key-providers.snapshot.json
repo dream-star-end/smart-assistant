@@ -14,7 +14,7 @@
       "id": "minimax",
       "inboundModelIds": ["MiniMax-M3"],
       "maxInputTokens": 512000,
-      "upstreamEndpoint": "https://api.minimaxi.com/anthropic/v1/messages",
+      "upstreamEndpoint": "https://ark.cn-beijing.volces.com/api/plan/v1/messages",
       "capabilityZero": true,
       "contextWindow": 512000,
       "supportsVision": true
