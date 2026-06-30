@@ -29,6 +29,7 @@
 
 import { z } from "zod";
 import { query, tx } from "../db/queries.js";
+import { getBalanceBreakdown } from "../billing/spend.js";
 import { hashPassword, verifyPassword } from "./passwords.js";
 import { signAccess, issueRefresh, refreshTokenHash, REFRESH_TOKEN_TTL_SECONDS } from "./jwt.js";
 import { verifyTurnstile, TurnstileError } from "./turnstile.js";
@@ -296,6 +297,9 @@ export async function login(raw: unknown, deps: LoginDeps): Promise<LoginResult>
     ],
   );
 
+  // 双钱包（0096）：返回"总可用"= 持久钱包 + active 未过期订阅期内桶，与 /api/me 一致。
+  const totalCredits = (await getBalanceBreakdown(user.id)).total;
+
   return {
     user: {
       id: user.id,
@@ -304,7 +308,7 @@ export async function login(raw: unknown, deps: LoginDeps): Promise<LoginResult>
       role: user.role,
       display_name: user.display_name,
       avatar_url: user.avatar_url,
-      credits: user.credits,
+      credits: totalCredits.toString(),
     },
     access_token: access.token,
     access_exp: access.exp,

@@ -183,7 +183,7 @@ describe("GET /api/payment/plans", () => {
     const json = await resp.json() as { ok: boolean; data: { plans: Array<{ code: string }> } };
     assert.equal(json.ok, true);
     const codes = json.data.plans.map((p) => p.code).sort();
-    // 0022 之后:enabled = plan-10 / plan-100 / plan-200 / plan-500
+    // 0022 之后:plan-10/100/200/500;0096 的 pack-50 enabled=FALSE（v3 隔离），不出现在公开列表。
     assert.deepEqual(codes, ["plan-10", "plan-100", "plan-200", "plan-500"]);
   });
 

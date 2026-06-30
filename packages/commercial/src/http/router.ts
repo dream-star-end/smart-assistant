@@ -205,6 +205,13 @@ import { handleGithubCallback, handleGithubStart } from './oauthGithub.js'
 import { handleLinuxdoCallback, handleLinuxdoStart } from './oauthLinuxdo.js'
 import { handleCreateHupi, handleGetOrder, handleHupiCallback, handleListPlans } from './payment.js'
 import {
+  handleBuyPack,
+  handleGetMySubscription,
+  handleListSubscriptionPlans,
+  handleSubscribe,
+  handleUpgrade,
+} from './subscription.js'
+import {
   handleCreateRemoteHost,
   handleDeleteRemoteHost,
   handleGetRemoteHost,
@@ -545,6 +552,12 @@ export function createCommercialHandler(
     { method: 'POST', path: '/api/payment/hupi/create', handler: handleCreateHupi },
     { method: 'POST', path: '/api/payment/hupi/callback', handler: handleHupiCallback },
     { method: 'GET', pathPrefix: '/api/payment/orders/', handler: handleGetOrder },
+    // 月度订阅（0096）。订单轮询复用 /api/payment/orders/:order_no；履约走 hupi/callback。
+    { method: 'GET', path: '/api/subscription/plans', handler: handleListSubscriptionPlans },
+    { method: 'GET', path: '/api/subscription/me', handler: handleGetMySubscription },
+    { method: 'POST', path: '/api/subscription/subscribe', handler: handleSubscribe },
+    { method: 'POST', path: '/api/subscription/upgrade', handler: handleUpgrade },
+    { method: 'POST', path: '/api/subscription/pack', handler: handleBuyPack },
     // T-53 Agent 订阅
     { method: 'POST', path: '/api/agent/open', handler: handleAgentOpen },
     { method: 'GET', path: '/api/agent/status', handler: handleAgentStatus },
@@ -965,6 +978,7 @@ export function createCommercialHandler(
     '/api/public/',
     '/api/models', // V3 2F: alias of /api/public/models, GET only
     '/api/payment/',
+    '/api/subscription/',
     '/api/agent/',
     '/api/admin/',
     // 匹配 exact `/api/remote-hosts` 与 prefix `/api/remote-hosts/`

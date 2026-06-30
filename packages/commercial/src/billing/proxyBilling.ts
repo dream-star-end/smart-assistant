@@ -35,6 +35,7 @@
 import type { Pool } from "pg";
 import type { Logger } from "../logging/logger.js";
 import { computeCost, type TokenUsage } from "./calculator.js";
+import { spendTwoBucket } from "./spend.js";
 import type { ModelPricing } from "./pricing.js";
 import {
   releasePreCheck,
@@ -523,46 +524,28 @@ export async function settleUsageAndLedger(
       throw err;
     }
     if (args.status === "success" && args.costCredits > 0n) {
-      // FOR UPDATE 行锁:同一 user 并发 finalize 串行,balance_after 单调
-      const before = await client.query<{ credits: string }>(
-        "SELECT credits::text AS credits FROM users WHERE id=$1 FOR UPDATE",
-        [args.userId.toString()],
-      );
-      if (before.rowCount === 0) throw new Error(`user ${args.userId} not found`);
-      const balance = BigInt(before.rows[0]!.credits);
-      // 余额 < cost:不再回滚 stream(已发字节回不来),把扣费金额 clamp 到余额。
-      // status 仍是 'success' (业务上已交付完整流), ledger memo 标 'clamped' 并把
-      // billing_debit_total{result="insufficient"} +1 (由 runCommit 根据 settled.clamped 上报)。
-      // balance_after = 0,用户回到 0 再充值。
-      const debit = balance < args.costCredits ? balance : args.costCredits;
-      clamped = debit < args.costCredits;
-      const newBalance = balance - debit;
-      balanceAfter = newBalance;
-      debitedCredits = debit;
-      await client.query(
-        "UPDATE users SET credits=$1 WHERE id=$2",
-        [newBalance.toString(), args.userId.toString()],
-      );
-      const led = await client.query<{ id: string }>(
-        `INSERT INTO credit_ledger
-           (user_id, delta, balance_after, reason, ref_type, ref_id, memo)
-         VALUES ($1, $2, $3, 'chat', 'usage_record', $4, $5)
-         RETURNING id::text AS id`,
-        [
-          args.userId.toString(),
-          (-debit).toString(),
-          newBalance.toString(),
+      // 双钱包扣费收口（0096）：先扣 period_credits 期内桶再扣 users.credits 持久钱包，
+      // 各桶 FOR UPDATE 行锁串行化、按桶各写一条 credit_ledger（balance_after=该桶扣后值）。
+      // 余额 < cost：不回滚 stream(已发字节回不来)，clamp 到总可用；status 仍 'success'，
+      // billing_debit_total{result="insufficient"} +1 由 runCommit 据 settled.clamped 上报。
+      const spend = await spendTwoBucket(client, {
+        userId: args.userId,
+        amount: args.costCredits,
+        reason: "chat",
+        ref: { type: "usage_record", id: usageId.toString() },
+        memo: `cost=${args.costCredits}`,
+      });
+      clamped = spend.clamped;
+      // balance_after 对外广播取"总可用"(期内桶+钱包)，对齐前端余额气泡语义。
+      balanceAfter = spend.totalAfter;
+      debitedCredits = spend.debited;
+      ledgerId = spend.primaryLedgerId;
+      if (ledgerId !== null) {
+        await client.query("UPDATE usage_records SET ledger_id=$1 WHERE id=$2", [
+          ledgerId.toString(),
           usageId.toString(),
-          debit < args.costCredits
-            ? `cost=${args.costCredits} balance=${balance} clamped`
-            : null,
-        ],
-      );
-      ledgerId = BigInt(led.rows[0]!.id);
-      await client.query(
-        "UPDATE usage_records SET ledger_id=$1 WHERE id=$2",
-        [ledgerId.toString(), usageId.toString()],
-      );
+        ]);
+      }
     }
     await client.query("COMMIT");
     return { usageId, ledgerId, clamped, debitedCredits, balanceAfter };

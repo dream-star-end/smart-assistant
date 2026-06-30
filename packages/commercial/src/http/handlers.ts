@@ -54,6 +54,7 @@ import { getSystemSetting } from "../admin/systemSettings.js";
 import type { Mailer } from "../auth/mail.js";
 import type { PricingCache } from "../billing/pricing.js";
 import type { PreCheckRedis } from "../billing/preCheck.js";
+import { ensureFreeSubscription } from "../billing/subscription.js";
 import { rootLogger, type Logger } from "../logging/logger.js";
 import type { HupijiaoClient, HupijiaoConfig } from "../payment/hupijiao/client.js";
 import type { AgentHttpDeps } from "./agent.js";
@@ -866,6 +867,9 @@ export async function handleMe(
   deps: CommercialHttpDeps,
 ): Promise<void> {
   const user = await requireAuth(req, deps.jwtSecret);
+  // 0096：保证每个活跃用户有一行订阅（首次惰性 bootstrap 免费档 + 发首期 300）。快路径已存在即返回。
+  await ensureFreeSubscription(user.id);
+  // 双钱包：展示「总可用余额」= users.credits 持久钱包 + active 订阅 period_credits 期内桶。
   const r = await query<{
     id: string;
     email: string;
@@ -873,13 +877,21 @@ export async function handleMe(
     role: "user" | "admin";
     display_name: string | null;
     avatar_url: string | null;
-    credits: string;
+    wallet_credits: string;
+    period_credits: string;
+    total_credits: string;
     status: string;
     created_at: Date;
   }>(
-    `SELECT id::text AS id, email, email_verified, role, display_name, avatar_url,
-            credits::text AS credits, status, created_at
-       FROM users WHERE id = $1`,
+    `SELECT u.id::text AS id, u.email, u.email_verified, u.role, u.display_name, u.avatar_url,
+            u.credits::text AS wallet_credits,
+            COALESCE(us.period_credits, 0)::text AS period_credits,
+            (u.credits + COALESCE(us.period_credits, 0))::text AS total_credits,
+            u.status, u.created_at
+       FROM users u
+       LEFT JOIN user_subscriptions us
+         ON us.user_id = u.id AND us.status = 'active' AND us.period_end > NOW()
+      WHERE u.id = $1`,
     [user.id],
   );
   if (r.rows.length === 0 || r.rows[0].status !== "active") {
@@ -895,7 +907,10 @@ export async function handleMe(
       role: u.role,
       display_name: u.display_name,
       avatar_url: u.avatar_url,
-      credits: u.credits,
+      // credits = 总可用（前端余额气泡显示总额，向后兼容字段名）。
+      credits: u.total_credits,
+      wallet_credits: u.wallet_credits,
+      period_credits: u.period_credits,
       created_at: u.created_at instanceof Date ? u.created_at.toISOString() : u.created_at,
     },
   });

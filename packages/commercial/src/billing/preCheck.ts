@@ -29,7 +29,7 @@
 
 import type Redis from "ioredis";
 import type { PricingCache, ModelPricing } from "./pricing.js";
-import { getBalance } from "./ledger.js";
+import { getSpendableBalance } from "./spend.js";
 
 /** Lua 及 JS 侧共同的 bigint 精度上限(2^53 - 1)。 */
 const SAFE_INT_BIGINT = BigInt(Number.MAX_SAFE_INTEGER);
@@ -258,7 +258,8 @@ export async function preCheckWithCost(
   assertRequestId(input.requestId);
   assertSafeBigInt("maxCost", input.maxCost);
 
-  const balance = await getBalance(input.userId);
+  // 双钱包（0096）：软预检按"总可用"= period_credits 期内桶 + users.credits 持久钱包。
+  const balance = await getSpendableBalance(input.userId);
 
   // 余额 ≤ 0 hard reject(不受 race 窗口影响 — PG 单点权威)。
   // 防止 0 余额用户绕过 cap 路径刷请求。负余额(adminAdjust 把人调过头)同走此路 →

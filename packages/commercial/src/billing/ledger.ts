@@ -30,7 +30,7 @@
 import type { PoolClient } from "pg";
 import { tx, query as rootQuery } from "../db/queries.js";
 
-/** credit_ledger.reason 的 CHECK 白名单,和 0002 迁移保持同步。 */
+/** credit_ledger.reason 的 CHECK 白名单,和 0002 / 0077 / 0096 迁移保持同步。 */
 export const LEDGER_REASONS = [
   "topup",
   "chat",
@@ -40,8 +40,16 @@ export const LEDGER_REASONS = [
   "admin_adjust",
   "promotion",
   "minimax_media",
+  // 0096 双钱包订阅：subscription=期内桶发放, subscription_expire=轮转清零(负), pack=加量包进期内桶。
+  "subscription",
+  "subscription_expire",
+  "pack",
 ] as const;
 export type LedgerReason = (typeof LEDGER_REASONS)[number];
+
+/** credit_ledger.bucket 的 CHECK 白名单（0096）：wallet=users.credits 持久钱包, period=套餐期内桶。 */
+export const LEDGER_BUCKETS = ["wallet", "period"] as const;
+export type LedgerBucket = (typeof LEDGER_BUCKETS)[number];
 
 export interface LedgerRef {
   /** e.g. 'usage_record' | 'order' | 'agent_sub' | 'refund' | null */

@@ -314,8 +314,14 @@ async function ensureSufficientBalance(
   cost: MiniMaxMediaCostResult,
 ): Promise<void> {
   if (cost.costCredits <= 0n) return;
+  // 双钱包（0096）：前置门按"总可用"= users.credits 持久钱包 + active 未过期订阅 period_credits
+  // 期内桶，否则钱包 0、套餐桶有余额的订阅用户会被误拒 402。
   const out = await deps.pgPool.query<{ credits: string }>(
-    "SELECT credits::text AS credits FROM users WHERE id=$1",
+    `SELECT (u.credits + COALESCE(us.period_credits, 0))::text AS credits
+       FROM users u
+       LEFT JOIN user_subscriptions us
+         ON us.user_id = u.id AND us.status = 'active' AND us.period_end > NOW()
+      WHERE u.id = $1`,
     [identity.userId.toString()],
   );
   const balance = out.rowCount === 0 ? 0n : BigInt(out.rows[0]!.credits);

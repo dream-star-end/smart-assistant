@@ -88,9 +88,10 @@ async function makeUser(email: string, credits = 0n): Promise<string> {
 }
 
 describe("plans", () => {
-  test("listPlans 启用 4 档(0022 之后 plan-50/plan-1000 已 disable),按 sort_order DESC", async (t) => {
+  test("listPlans 启用 4 档(0096 加量包 pack-50 在共享表里 enabled=FALSE,对 v3 隐藏)", async (t) => {
     if (skipIfNoDb(t)) return;
     const plans = await listPlans();
+    // 0096 的 pack-50 enabled=FALSE（v3 现网隔离），故公开 listPlans 仍只 4 档。
     assert.equal(plans.length, 4, `expected 4 enabled plans (10/100/200/500), got ${plans.length}`);
     // sort_order DESC: plan-10 (100) → plan-100 (95) → plan-200 (90) → plan-500 (75)
     assert.deepEqual(

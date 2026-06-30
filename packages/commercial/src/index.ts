@@ -86,6 +86,10 @@ import {
   type SweeperHandle as PendingOrdersExpirerHandle,
 } from "./payment/pendingOrdersExpirer.js";
 import {
+  startSubscriptionRolloverSweeper,
+  type SubscriptionRolloverHandle,
+} from "./billing/subscriptionRolloverSweeper.js";
+import {
   startAccountSlotReaper,
   type SlotReaperHandle,
 } from "./account-pool/accountSlotReaper.js";
@@ -2317,6 +2321,16 @@ export async function registerCommercial(
     pendingOrdersExpirer = startPendingOrdersExpirer({ intervalMs });
   }
 
+  // 0096 — 订阅周期轮转 sweeper(默认 5min tick,boot 即结算已到期订阅)。
+  // period_end < now 的 active 订阅:付费档到期未续→降级 free+重置 300;free 档→月度续期。
+  // 钱包不动。非法/空/NaN→5min;下限 1s。
+  let subscriptionRolloverSweeper: SubscriptionRolloverHandle | undefined;
+  if (controlPlaneEnabled && process.env.COMMERCIAL_SUBSCRIPTION_ROLLOVER_DISABLED !== "1") {
+    const raw = Number(process.env.COMMERCIAL_SUBSCRIPTION_ROLLOVER_INTERVAL_MS);
+    const intervalMs = Number.isFinite(raw) && raw >= 1000 ? raw : 300_000;
+    subscriptionRolloverSweeper = startSubscriptionRolloverSweeper({ intervalMs });
+  }
+
   // B7 — account-pool per-slot 租约泄漏回收 sweeper(60s tick)。回收进程存活期间
   // release 路径丢失/未执行的孤儿 slot,防虚假 429。TTL 在 scheduler 内夹到
   // max(CODEX_SESSION_MAX_MS,30min) 下界,不抢 Codex bridge timer。纯进程内、无 DB。
@@ -2493,6 +2507,9 @@ export async function registerCommercial(
       }
       if (pendingOrdersExpirer) {
         try { pendingOrdersExpirer.stop(); } catch { /* ignore */ }
+      }
+      if (subscriptionRolloverSweeper) {
+        try { subscriptionRolloverSweeper.stop(); } catch { /* ignore */ }
       }
       if (accountSlotReaper) {
         try { accountSlotReaper.stop(); } catch { /* ignore */ }

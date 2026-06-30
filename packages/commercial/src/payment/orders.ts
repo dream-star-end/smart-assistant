@@ -21,7 +21,22 @@
  */
 
 import { randomBytes } from "node:crypto";
+import type { PoolClient } from "pg";
 import { query, tx } from "../db/queries.js";
+import {
+  applyUpgradeOrRefundTx,
+  creditPeriodBucketTx,
+  getPlan,
+  grantSubscriptionTx,
+  type SubscriptionPlan,
+} from "../billing/subscription.js";
+
+/**
+ * 订单种类（0096）。topup→钱包；pack→期内桶(加量包)；subscription→订阅/续费(期内桶重置+周期顺延)；
+ * upgrade→升档(期内桶补到新档额度+周期不变)。
+ */
+export const ORDER_KINDS = ["topup", "pack", "subscription", "upgrade"] as const;
+export type OrderKind = (typeof ORDER_KINDS)[number];
 
 /** 订单状态的字面量类型。数据库 CHECK 同步。 */
 export const ORDER_STATUSES = [
@@ -41,6 +56,8 @@ export interface TopupPlan {
   credits: bigint;
   sort_order: number;
   enabled: boolean;
+  /** 0096：true=进 period_credits 期内桶(加量包)；false=进 users.credits 钱包(存量充值)。 */
+  period_scoped: boolean;
 }
 
 export interface OrderRow {
@@ -52,6 +69,12 @@ export interface OrderRow {
   amount_cents: bigint;
   credits: bigint;
   status: OrderStatus;
+  /** 0096 订单种类。 */
+  kind: OrderKind;
+  /** 0096 subscription/upgrade 的目标套餐档（topup/pack 为 null）。 */
+  plan_code: string | null;
+  /** 0096 upgrade 单的源套餐档快照（履约校验当前订阅仍 == 此档；仅 upgrade 非 null）。 */
+  from_plan_code: string | null;
   paid_at: Date | null;
   expires_at: Date;
   ledger_id: bigint | null;
@@ -185,10 +208,16 @@ export function generateOrderNo(nowFn: () => Date = () => new Date()): string {
   return `${yyyy}${mm}${dd}-${rand}`;
 }
 
-function rowToPlan(r: {
+type PlanDbRow = {
   id: string; code: string; label: string; amount_cents: string; credits: string;
-  sort_order: number; enabled: boolean;
-}): TopupPlan {
+  sort_order: number; enabled: boolean; period_scoped: boolean;
+};
+
+const TOPUP_PLAN_COLS =
+  `id::text AS id, code, label, amount_cents::text AS amount_cents, credits::text AS credits,
+   sort_order, enabled, period_scoped`;
+
+function rowToPlan(r: PlanDbRow): TopupPlan {
   return {
     id: BigInt(r.id),
     code: r.code,
@@ -197,16 +226,28 @@ function rowToPlan(r: {
     credits: BigInt(r.credits),
     sort_order: r.sort_order,
     enabled: r.enabled,
+    period_scoped: r.period_scoped,
   };
 }
 
-function rowToOrder(r: {
+type OrderDbRow = {
   id: string; order_no: string; user_id: string; provider: "hupijiao";
   provider_order: string | null; amount_cents: string; credits: string;
-  status: OrderStatus; paid_at: Date | null; expires_at: Date;
+  status: OrderStatus; kind: string; plan_code: string | null; from_plan_code: string | null;
+  paid_at: Date | null; expires_at: Date;
   ledger_id: string | null; refunded_ledger_id: string | null;
   created_at: Date; updated_at: Date;
-}): OrderRow {
+};
+
+/** 所有 orders SELECT 复用的列清单（含 0096 kind/plan_code/from_plan_code）。 */
+const ORDER_COLS =
+  `id::text AS id, order_no, user_id::text AS user_id, provider,
+   provider_order, amount_cents::text AS amount_cents, credits::text AS credits,
+   status, kind, plan_code, from_plan_code, paid_at, expires_at,
+   ledger_id::text AS ledger_id, refunded_ledger_id::text AS refunded_ledger_id,
+   created_at, updated_at`;
+
+function rowToOrder(r: OrderDbRow): OrderRow {
   return {
     id: BigInt(r.id),
     order_no: r.order_no,
@@ -216,6 +257,9 @@ function rowToOrder(r: {
     amount_cents: BigInt(r.amount_cents),
     credits: BigInt(r.credits),
     status: r.status,
+    kind: (ORDER_KINDS as ReadonlyArray<string>).includes(r.kind) ? (r.kind as OrderKind) : "topup",
+    plan_code: r.plan_code,
+    from_plan_code: r.from_plan_code,
     paid_at: r.paid_at,
     expires_at: r.expires_at,
     ledger_id: r.ledger_id ? BigInt(r.ledger_id) : null,
@@ -237,13 +281,8 @@ export interface ListPlansOptions {
 
 /** 读所有 enabled 套餐,按 sort_order DESC。 */
 export async function listPlans(opts: ListPlansOptions = {}): Promise<TopupPlan[]> {
-  const r = await query<{
-    id: string; code: string; label: string; amount_cents: string; credits: string;
-    sort_order: number; enabled: boolean;
-  }>(
-    `SELECT id::text AS id, code, label,
-            amount_cents::text AS amount_cents, credits::text AS credits,
-            sort_order, enabled
+  const r = await query<PlanDbRow>(
+    `SELECT ${TOPUP_PLAN_COLS}
        FROM topup_plans
       WHERE enabled = TRUE
       ORDER BY sort_order DESC, id ASC`,
@@ -261,14 +300,8 @@ export async function listPlans(opts: ListPlansOptions = {}): Promise<TopupPlan[
 /** 按 code 读一档(不过滤 enabled);找不到返 null,调用方决定怎么报错。 */
 export async function getPlanByCode(code: string): Promise<TopupPlan | null> {
   if (typeof code !== "string" || code.length === 0 || code.length > 64) return null;
-  const r = await query<{
-    id: string; code: string; label: string; amount_cents: string; credits: string;
-    sort_order: number; enabled: boolean;
-  }>(
-    `SELECT id::text AS id, code, label,
-            amount_cents::text AS amount_cents, credits::text AS credits,
-            sort_order, enabled
-       FROM topup_plans WHERE code = $1`,
+  const r = await query<PlanDbRow>(
+    `SELECT ${TOPUP_PLAN_COLS} FROM topup_plans WHERE code = $1`,
     [code],
   );
   return r.rows.length === 0 ? null : rowToPlan(r.rows[0]);
@@ -313,23 +346,98 @@ export async function createPendingOrder(
   const expiresAt = new Date(nowFn().getTime() + ttlMs);
   const orderNo = input.orderNo ?? generateOrderNo(nowFn);
 
-  const r = await query<{
-    id: string; order_no: string; user_id: string; provider: "hupijiao";
-    provider_order: string | null; amount_cents: string; credits: string;
-    status: OrderStatus; paid_at: Date | null; expires_at: Date;
-    ledger_id: string | null; refunded_ledger_id: string | null;
-    created_at: Date; updated_at: Date;
-  }>(
+  // 0096：加量包(period_scoped)→ kind='pack'(进期内桶)；存量充值 → kind='topup'(进钱包)。
+  const kind: OrderKind = plan.period_scoped ? "pack" : "topup";
+
+  const r = await query<OrderDbRow>(
     `INSERT INTO orders
-      (order_no, user_id, provider, amount_cents, credits, status, expires_at)
-     VALUES ($1, $2, 'hupijiao', $3, $4, 'pending', $5)
-     RETURNING
-       id::text AS id, order_no, user_id::text AS user_id, provider,
-       provider_order, amount_cents::text AS amount_cents, credits::text AS credits,
-       status, paid_at, expires_at,
-       ledger_id::text AS ledger_id, refunded_ledger_id::text AS refunded_ledger_id,
-       created_at, updated_at`,
-    [orderNo, uid, plan.amount_cents.toString(), plan.credits.toString(), expiresAt],
+      (order_no, user_id, provider, amount_cents, credits, status, kind, plan_code, expires_at)
+     VALUES ($1, $2, 'hupijiao', $3, $4, 'pending', $5, $6, $7)
+     RETURNING ${ORDER_COLS}`,
+    [orderNo, uid, plan.amount_cents.toString(), plan.credits.toString(), kind, plan.code, expiresAt],
+  );
+  return { order: rowToOrder(r.rows[0]), plan };
+}
+
+export interface CreateSubscriptionOrderInput {
+  userId: bigint | number | string;
+  /** 'subscription'=购买/续费；'upgrade'=升档（amountCents 应为差价）。 */
+  kind: "subscription" | "upgrade";
+  /** 目标套餐档 code。 */
+  planCode: string;
+  /** 升档单的**源套餐档快照**（履约校验当前订阅仍 == 此档；subscription 单传 null）。 */
+  fromPlanCode?: string | null;
+  /** 本单应付（分）。subscription=档全价；upgrade=新旧档差价。 */
+  amountCents: bigint;
+  /** 履约发放进期内桶的额度（= 目标档 monthly_credits 快照）。 */
+  credits: bigint;
+  ttlMs?: number;
+  orderNo?: string;
+  nowFn?: () => Date;
+}
+
+/**
+ * 创建订阅/升档订单（pending）。金额/积分由调用方（subscription 端点）依套餐档算好传入，
+ * 不复用 topup_plans。履约由 markOrderPaid 按 kind 分支（grantSubscriptionTx）。
+ */
+export async function createSubscriptionOrder(
+  input: CreateSubscriptionOrderInput,
+): Promise<OrderRow> {
+  const uid = normalizeUserId(input.userId);
+  if (input.amountCents <= 0n) throw new TypeError(`amountCents must be > 0, got ${input.amountCents}`);
+  if (input.credits < 0n) throw new TypeError(`credits must be >= 0, got ${input.credits}`);
+  // 升档单必须带源档快照（履约据此校验当前订阅未被换档/降级）；否则后续调用方会造出
+  // 永远走退款的"废升档单"。fail-fast 防误用。
+  if (input.kind === "upgrade" && !input.fromPlanCode) {
+    throw new TypeError("createSubscriptionOrder: upgrade order requires fromPlanCode");
+  }
+  const nowFn = input.nowFn ?? (() => new Date());
+  const ttlMs = Math.max(1, input.ttlMs ?? 15 * 60 * 1000);
+  const expiresAt = new Date(nowFn().getTime() + ttlMs);
+  const orderNo = input.orderNo ?? generateOrderNo(nowFn);
+
+  const r = await query<OrderDbRow>(
+    `INSERT INTO orders
+      (order_no, user_id, provider, amount_cents, credits, status, kind, plan_code, from_plan_code, expires_at)
+     VALUES ($1, $2, 'hupijiao', $3, $4, 'pending', $5, $6, $7, $8)
+     RETURNING ${ORDER_COLS}`,
+    [
+      orderNo, uid, input.amountCents.toString(), input.credits.toString(),
+      input.kind, input.planCode, input.fromPlanCode ?? null, expiresAt,
+    ],
+  );
+  return rowToOrder(r.rows[0]);
+}
+
+/** v5 加量包的 topup_plans code（在共享表里 enabled=FALSE，对 v3 现网隐藏；v5 按 code 读）。 */
+export const PACK_PLAN_CODE = "pack-50";
+
+/**
+ * 创建加量包订单（v5 专属，进期内桶）。**不走公开 /api/payment/plans**（那是 v3/v5 共享的
+ * enabled 列表），而是按 code 直读 pack-50（getPlanByCode 不过滤 enabled），故 pack 在共享表
+ * 里 enabled=FALSE 对 v3 现网不可见，v5 仍可下单。要求该 plan period_scoped=TRUE。
+ */
+export async function createPackOrder(input: {
+  userId: bigint | number | string;
+  ttlMs?: number;
+  orderNo?: string;
+  nowFn?: () => Date;
+}): Promise<{ order: OrderRow; plan: TopupPlan }> {
+  const uid = normalizeUserId(input.userId);
+  const plan = await getPlanByCode(PACK_PLAN_CODE);
+  if (!plan || !plan.period_scoped) throw new PlanNotFoundError(PACK_PLAN_CODE);
+
+  const nowFn = input.nowFn ?? (() => new Date());
+  const ttlMs = Math.max(1, input.ttlMs ?? 15 * 60 * 1000);
+  const expiresAt = new Date(nowFn().getTime() + ttlMs);
+  const orderNo = input.orderNo ?? generateOrderNo(nowFn);
+
+  const r = await query<OrderDbRow>(
+    `INSERT INTO orders
+      (order_no, user_id, provider, amount_cents, credits, status, kind, plan_code, expires_at)
+     VALUES ($1, $2, 'hupijiao', $3, $4, 'pending', 'pack', $5, $6)
+     RETURNING ${ORDER_COLS}`,
+    [orderNo, uid, plan.amount_cents.toString(), plan.credits.toString(), plan.code, expiresAt],
   );
   return { order: rowToOrder(r.rows[0]), plan };
 }
@@ -345,24 +453,12 @@ export async function getOrderByNo(
   opts: GetOrderOptions = {},
 ): Promise<OrderRow | null> {
   const params: unknown[] = [orderNo];
-  let sql =
-    `SELECT id::text AS id, order_no, user_id::text AS user_id, provider,
-            provider_order, amount_cents::text AS amount_cents, credits::text AS credits,
-            status, paid_at, expires_at,
-            ledger_id::text AS ledger_id, refunded_ledger_id::text AS refunded_ledger_id,
-            created_at, updated_at
-       FROM orders WHERE order_no = $1`;
+  let sql = `SELECT ${ORDER_COLS} FROM orders WHERE order_no = $1`;
   if (opts.userId !== undefined) {
     params.push(normalizeUserId(opts.userId));
     sql += " AND user_id = $2";
   }
-  const r = await query<{
-    id: string; order_no: string; user_id: string; provider: "hupijiao";
-    provider_order: string | null; amount_cents: string; credits: string;
-    status: OrderStatus; paid_at: Date | null; expires_at: Date;
-    ledger_id: string | null; refunded_ledger_id: string | null;
-    created_at: Date; updated_at: Date;
-  }>(sql, params);
+  const r = await query<OrderDbRow>(sql, params);
   return r.rows.length === 0 ? null : rowToOrder(r.rows[0]);
 }
 
@@ -411,6 +507,93 @@ export interface MarkOrderPaidResult {
  *     再回写 orders,两次事务有竞态窗口
  *   - 扣费路径已经在 T-22 / T-23 验过 "自写 tx" 模式,这里同样处理最干净
  */
+/**
+ * 钱包充值履约（topup / pack 无订阅兜底）：锁 users → 加 users.credits → 写 'topup' 钱包流水。
+ * 返回钱包流水 id。
+ */
+async function fulfillWalletTopupTx(client: PoolClient, order: OrderRow): Promise<bigint> {
+  const balRow = await client.query<{ credits: string }>(
+    "SELECT credits::text AS credits FROM users WHERE id = $1 FOR UPDATE",
+    [order.user_id.toString()],
+  );
+  if (balRow.rows.length === 0) {
+    throw new TypeError(`user not found for order ${order.order_no}: ${order.user_id}`);
+  }
+  const newBalance = BigInt(balRow.rows[0].credits) + order.credits;
+  await client.query("UPDATE users SET credits = $1 WHERE id = $2", [
+    newBalance.toString(),
+    order.user_id.toString(),
+  ]);
+  const ledgerRow = await client.query<{ id: string }>(
+    `INSERT INTO credit_ledger
+        (user_id, delta, balance_after, reason, bucket, ref_type, ref_id, memo)
+     VALUES ($1, $2, $3, 'topup', 'wallet', 'order', $4, $5)
+     RETURNING id::text AS id`,
+    [
+      order.user_id.toString(),
+      order.credits.toString(),
+      newBalance.toString(),
+      order.id.toString(),
+      `topup amount_cents=${order.amount_cents} order_no=${order.order_no}`,
+    ],
+  );
+  return BigInt(ledgerRow.rows[0].id);
+}
+
+/**
+ * 按订单 kind 履约（同一 tx 内，与 orders→paid 原子）。返回回写 orders.ledger_id 的钱包流水 id
+ * （期内桶路径返回 null —— 流水以 ref_id=order_no 关联，不占 orders.ledger_id）。
+ */
+async function fulfillPaidOrderTx(client: PoolClient, order: OrderRow): Promise<bigint | null> {
+  switch (order.kind) {
+    case "topup":
+      return fulfillWalletTopupTx(client, order);
+    case "pack": {
+      // 加量包进**有效期内桶**；无有效周期则就地新开 free 周期再加 pack（绝不落进永久钱包）。
+      await creditPeriodBucketTx(client, {
+        userId: order.user_id,
+        amount: order.credits,
+        orderNo: order.order_no,
+        memo: `pack amount_cents=${order.amount_cents} order_no=${order.order_no}`,
+      });
+      return null;
+    }
+    case "subscription": {
+      // 订阅/续费：按**订单快照** order.credits 发放（不受套餐改价影响）；periodDays 取当前档配置。
+      const plan: SubscriptionPlan | null = await getPlan(order.plan_code ?? "");
+      const periodDays = plan?.periodDays ?? 30;
+      await grantSubscriptionTx(client, {
+        userId: order.user_id,
+        planCode: order.plan_code ?? "",
+        grantCredits: order.credits,
+        periodDays,
+        orderNo: order.order_no,
+      });
+      return null;
+    }
+    case "upgrade": {
+      // 升档：付款时再校验当前订阅仍是更低付费档且未过期，否则把实付退回钱包（防 stale 占便宜）。
+      const plan: SubscriptionPlan | null = await getPlan(order.plan_code ?? "");
+      if (!plan) {
+        throw new TypeError(`order ${order.order_no} plan not found: ${order.plan_code ?? "<null>"}`);
+      }
+      const r = await applyUpgradeOrRefundTx(client, {
+        userId: order.user_id,
+        targetPlanCode: plan.code,
+        targetTier: plan.tier,
+        fromPlanCode: order.from_plan_code,
+        grantCredits: order.credits,
+        paidAmountCents: order.amount_cents,
+        orderNo: order.order_no,
+      });
+      // 退款路径把实付入钱包，回写 orders.ledger_id 指向该退款流水。
+      return r.applied ? null : r.refundLedgerId;
+    }
+    default:
+      throw new TypeError(`unknown order kind: ${order.kind}`);
+  }
+}
+
 export async function markOrderPaid(
   input: MarkOrderPaidInput,
 ): Promise<MarkOrderPaidResult> {
@@ -419,19 +602,8 @@ export async function markOrderPaid(
   }
 
   return tx(async (client) => {
-    const sel = await client.query<{
-      id: string; order_no: string; user_id: string; provider: "hupijiao";
-      provider_order: string | null; amount_cents: string; credits: string;
-      status: OrderStatus; paid_at: Date | null; expires_at: Date;
-      ledger_id: string | null; refunded_ledger_id: string | null;
-      created_at: Date; updated_at: Date;
-    }>(
-      `SELECT id::text AS id, order_no, user_id::text AS user_id, provider,
-              provider_order, amount_cents::text AS amount_cents, credits::text AS credits,
-              status, paid_at, expires_at,
-              ledger_id::text AS ledger_id, refunded_ledger_id::text AS refunded_ledger_id,
-              created_at, updated_at
-         FROM orders WHERE order_no = $1 FOR UPDATE`,
+    const sel = await client.query<OrderDbRow>(
+      `SELECT ${ORDER_COLS} FROM orders WHERE order_no = $1 FOR UPDATE`,
       [input.orderNo],
     );
     if (sel.rows.length === 0) throw new OrderNotFoundError(input.orderNo);
@@ -479,45 +651,17 @@ export async function markOrderPaid(
       );
     }
 
-    // 1. 锁用户余额
-    const balRow = await client.query<{ credits: string }>(
-      "SELECT credits::text AS credits FROM users WHERE id = $1 FOR UPDATE",
-      [current.user_id.toString()],
-    );
-    if (balRow.rows.length === 0) {
-      throw new TypeError(`user not found for order ${input.orderNo}: ${current.user_id}`);
-    }
-    const balance = BigInt(balRow.rows[0].credits);
-    const newBalance = balance + current.credits;
-    await client.query(
-      "UPDATE users SET credits = $1 WHERE id = $2",
-      [newBalance.toString(), current.user_id.toString()],
-    );
-
-    // 2. 写 credit_ledger(reason='topup', ref=order:<order_id>)
-    const ledgerRow = await client.query<{ id: string }>(
-      `INSERT INTO credit_ledger
-        (user_id, delta, balance_after, reason, ref_type, ref_id, memo)
-       VALUES ($1, $2, $3, 'topup', 'order', $4, $5)
-       RETURNING id::text AS id`,
-      [
-        current.user_id.toString(),
-        current.credits.toString(),
-        newBalance.toString(),
-        current.id.toString(),
-        `topup plan amount_cents=${current.amount_cents} order_no=${current.order_no}`,
-      ],
-    );
-    const ledgerId = BigInt(ledgerRow.rows[0].id);
+    // 1+2. 履约：按订单种类发放（0096 双钱包）。同一 tx 内完成，与 orders→paid 原子。
+    //   topup        → 进 users.credits 持久钱包（行为不变）
+    //   pack         → 进 period_credits 期内桶（加量包）；无 active 订阅兜底回钱包
+    //   subscription → 期内桶重置为档额度 + 周期顺延
+    //   upgrade      → 期内桶补到新档额度 + 周期不变
+    // orders.ledger_id 仅 topup/兜底钱包路径回写钱包流水 id；期内桶路径留 null
+    // （期内桶流水以 ref_type='subscription', ref_id=order_no 关联，可追溯）。
+    const ledgerId = await fulfillPaidOrderTx(client, current);
 
     // 3. orders 推到 paid
-    const updRow = await client.query<{
-      id: string; order_no: string; user_id: string; provider: "hupijiao";
-      provider_order: string | null; amount_cents: string; credits: string;
-      status: OrderStatus; paid_at: Date | null; expires_at: Date;
-      ledger_id: string | null; refunded_ledger_id: string | null;
-      created_at: Date; updated_at: Date;
-    }>(
+    const updRow = await client.query<OrderDbRow>(
       `UPDATE orders
           SET status = 'paid',
               paid_at = NOW(),
@@ -526,16 +670,11 @@ export async function markOrderPaid(
               ledger_id = $3,
               updated_at = NOW()
         WHERE id = $4
-       RETURNING
-         id::text AS id, order_no, user_id::text AS user_id, provider,
-         provider_order, amount_cents::text AS amount_cents, credits::text AS credits,
-         status, paid_at, expires_at,
-         ledger_id::text AS ledger_id, refunded_ledger_id::text AS refunded_ledger_id,
-         created_at, updated_at`,
+       RETURNING ${ORDER_COLS}`,
       [
         input.providerOrder ?? null,
         JSON.stringify(input.callbackPayload ?? null),
-        ledgerId.toString(),
+        ledgerId === null ? null : ledgerId.toString(),
         current.id.toString(),
       ],
     );

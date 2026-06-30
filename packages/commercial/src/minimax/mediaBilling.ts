@@ -1,5 +1,6 @@
 import type { Pool } from "pg";
 
+import { spendTwoBucket } from "../billing/spend.js";
 import type { MiniMaxMediaCostResult } from "./mediaPricing.js";
 
 export interface MiniMaxMediaSettleInput {
@@ -106,41 +107,24 @@ export async function settleMiniMaxMediaSuccess(
     }
 
     if (input.cost.costCredits > 0n) {
-      const before = await client.query<{ credits: string }>(
-        "SELECT credits::text AS credits FROM users WHERE id=$1 FOR UPDATE",
-        [input.userId.toString()],
-      );
-      if (before.rowCount === 0) throw new Error(`user ${input.userId} not found`);
-      const balance = BigInt(before.rows[0]!.credits);
-      const debit = balance < input.cost.costCredits ? balance : input.cost.costCredits;
-      clamped = debit < input.cost.costCredits;
-      const newBalance = balance - debit;
-      balanceAfter = newBalance;
-      debitedCredits = debit;
-      await client.query(
-        "UPDATE users SET credits=$1 WHERE id=$2",
-        [newBalance.toString(), input.userId.toString()],
-      );
-      const led = await client.query<{ id: string }>(
-        `INSERT INTO credit_ledger
-           (user_id, delta, balance_after, reason, ref_type, ref_id, memo)
-         VALUES ($1, $2, $3, 'minimax_media', 'minimax_media_usage_record', $4, $5)
-         RETURNING id::text AS id`,
-        [
-          input.userId.toString(),
-          (-debit).toString(),
-          newBalance.toString(),
-          usageId.toString(),
-          clamped
-            ? `cost=${input.cost.costCredits} balance=${balance} clamped`
-            : null,
-        ],
-      );
-      ledgerId = BigInt(led.rows[0]!.id);
-      await client.query(
-        "UPDATE minimax_media_usage_records SET ledger_id=$1 WHERE id=$2",
-        [ledgerId.toString(), usageId.toString()],
-      );
+      // 双钱包扣费收口（0096）：先扣 period_credits 期内桶再扣 users.credits 持久钱包。
+      const spend = await spendTwoBucket(client, {
+        userId: input.userId,
+        amount: input.cost.costCredits,
+        reason: "minimax_media",
+        ref: { type: "minimax_media_usage_record", id: usageId.toString() },
+        memo: `cost=${input.cost.costCredits}`,
+      });
+      clamped = spend.clamped;
+      balanceAfter = spend.totalAfter;
+      debitedCredits = spend.debited;
+      ledgerId = spend.primaryLedgerId;
+      if (ledgerId !== null) {
+        await client.query(
+          "UPDATE minimax_media_usage_records SET ledger_id=$1 WHERE id=$2",
+          [ledgerId.toString(), usageId.toString()],
+        );
+      }
     }
 
     await client.query("COMMIT");
