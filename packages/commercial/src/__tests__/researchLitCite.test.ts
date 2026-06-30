@@ -220,6 +220,71 @@ describe("litSearch: dedup & merge", () => {
     assert.equal(calls, 1, "404 不应重试");
     assert.ok(res.warnings.some((w) => w.includes("openalex")));
   });
+
+  it("searchMultiSource:主源全空 + DeepXiv 配置 → 用 DeepXiv 兜底召回", async () => {
+    const f = (async (url: string | URL | Request) => {
+      const u = String(url);
+      if (u.includes("data.rag.ac.cn")) {
+        return new Response(
+          JSON.stringify({ results: [{ title: "DX Paper", arxiv_id: "2301.00001", authors: ["Alice"], year: 2023 }] }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      if (u.includes("export.arxiv.org")) return new Response("<feed></feed>", { status: 200 });
+      return new Response(JSON.stringify({ results: [] }), { status: 200, headers: { "content-type": "application/json" } });
+    }) as unknown as typeof fetch;
+    const res = await searchMultiSource(
+      { query: "q" },
+      { fetchImpl: f, retryDelayMs: 0, deepxiv: { base: "https://data.rag.ac.cn", token: "t" } },
+    );
+    assert.equal(res.sources.length, 1);
+    assert.equal(res.sources[0].title, "DX Paper");
+    assert.equal(res.sources[0].arxivId, "2301.00001");
+    assert.ok(res.warnings.some((w) => w.includes("DeepXiv")));
+  });
+
+  it("searchMultiSource:主源有结果时不触发 DeepXiv(不常态加压)", async () => {
+    let dxCalls = 0;
+    const f = (async (url: string | URL | Request) => {
+      const u = String(url);
+      if (u.includes("data.rag.ac.cn")) {
+        dxCalls++;
+        return new Response(JSON.stringify({ results: [] }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+      if (u.includes("api.openalex.org")) {
+        return new Response(JSON.stringify({ results: [{ title: "OA", doi: "10.1/o" }] }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      if (u.includes("export.arxiv.org")) return new Response("<feed></feed>", { status: 200 });
+      return new Response(JSON.stringify({ results: [] }), { status: 200, headers: { "content-type": "application/json" } });
+    }) as unknown as typeof fetch;
+    const res = await searchMultiSource(
+      { query: "q" },
+      { fetchImpl: f, retryDelayMs: 0, deepxiv: { base: "https://data.rag.ac.cn", token: "t" } },
+    );
+    assert.ok(res.sources.length >= 1);
+    assert.equal(dxCalls, 0, "主源有结果不应查 DeepXiv");
+  });
+
+  it("searchMultiSource:显式 --sources 排除 arxiv 时,即使空也不用 DeepXiv", async () => {
+    let dxCalls = 0;
+    const f = (async (url: string | URL | Request) => {
+      const u = String(url);
+      if (u.includes("data.rag.ac.cn")) {
+        dxCalls++;
+        return new Response(JSON.stringify({ results: [] }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+      return new Response(JSON.stringify({ results: [] }), { status: 200, headers: { "content-type": "application/json" } });
+    }) as unknown as typeof fetch;
+    const res = await searchMultiSource(
+      { query: "q", sources: ["openalex"] },
+      { fetchImpl: f, retryDelayMs: 0, deepxiv: { base: "https://data.rag.ac.cn", token: "t" } },
+    );
+    assert.equal(res.sources.length, 0);
+    assert.equal(dxCalls, 0, "用户显式排除 arxiv → 不混入 DeepXiv");
+  });
 });
 
 // ── cite: parse identifier / verify / format ─────────────────────────

@@ -307,3 +307,53 @@ export async function searchArxiv(query: string, opts: SourceSearchOpts): Promis
   const xml = await fetchText(url, opts);
   return parseArxivAtom(xml);
 }
+
+/**
+ * DeepXiv(国内学术 RAG:arXiv 元数据 + 摘要)检索 —— oc-lit 的 **arXiv 兜底源**:直连源(arXiv 经
+ * 日本代理)出站失败/为空时用域内可达的 DeepXiv 补召回。`GET <base>/arxiv/?type=retrieve&query=&size=`
+ * + `Bearer <token>`(token 留 master,不进容器)。响应 `{ results: [{ title, authors, year, arxiv_id, … }] }`。
+ */
+export async function searchDeepXiv(
+  query: string,
+  opts: SourceSearchOpts,
+  cfg: { base: string; token: string },
+): Promise<SourceRecord[]> {
+  const size = Math.min(Math.max(opts.size, 1), 100);
+  const url = `${cfg.base.replace(/\/+$/, "")}/arxiv/?type=retrieve&query=${encodeURIComponent(query)}&size=${size}`;
+  const json = (await fetchJson(url, {
+    timeoutMs: opts.timeoutMs,
+    fetchImpl: opts.fetchImpl,
+    headers: { Authorization: `Bearer ${cfg.token}` },
+  })) as { results?: unknown };
+  const results = Array.isArray(json?.results) ? json.results : [];
+  const out: SourceRecord[] = [];
+  for (const item of results) {
+    const rec = parseDeepxivItem(item);
+    if (rec) out.push(rec);
+  }
+  return out;
+}
+
+function parseDeepxivItem(item: unknown): SourceRecord | null {
+  if (!item || typeof item !== "object") return null;
+  const o = item as Record<string, unknown>;
+  const title = typeof o.title === "string" ? o.title.trim() : "";
+  if (!title) return null;
+  const rawArxiv = typeof o.arxiv_id === "string" ? o.arxiv_id : typeof o.arxivId === "string" ? o.arxivId : undefined;
+  const arxivId = rawArxiv ? normalizeArxivId(rawArxiv) : undefined;
+  const authors: Author[] = Array.isArray(o.authors)
+    ? (o.authors
+        .map((a) =>
+          typeof a === "string"
+            ? { name: a }
+            : a && typeof a === "object" && typeof (a as { name?: unknown }).name === "string"
+              ? { name: (a as { name: string }).name }
+              : null,
+        )
+        .filter(Boolean) as Author[])
+    : [];
+  const yr = o.year;
+  const year = typeof yr === "number" ? yr : typeof yr === "string" && /^\d{4}$/.test(yr) ? Number(yr) : undefined;
+  const base = { title, authors, year, arxivId };
+  return { id: makeSourceId(base), ...base, lang: guessLang(title) };
+}

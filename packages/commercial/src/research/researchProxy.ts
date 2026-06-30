@@ -32,6 +32,7 @@ import {
   getResearchConfigPublic,
   getResearchSecrets,
 } from "../admin/researchConfig.js";
+import { getLiteratureConfig } from "../admin/literatureConfig.js";
 import {
   getBlob as storeGetBlob,
   getDocument as storeGetDocument,
@@ -413,12 +414,23 @@ async function handleLitSearch(
   // secrets 仅在需要(目前 unpaywall email 在 config 非密;S2 key 是 secret,Phase 1 未接 S2 源)
   await readSecrets().catch(() => ({}));
 
+  // DeepXiv arXiv 兜底源(域内 RAG):读旧 literature_deepxiv_config(外部服务凭据,token 留 master)。
+  // enabled+base+token 才启用;读不到/未配 → 不传(searchMultiSource 主源全空时才会用到)。
+  let deepxiv: { base: string; token: string } | undefined;
+  try {
+    const dx = await getLiteratureConfig(false);
+    if (dx.enabled && dx.base_url && dx.token) deepxiv = { base: dx.base_url, token: dx.token };
+  } catch {
+    /* 配置读不到 → 不启用兜底,主源照常 */
+  }
+
   const result = await searchMultiSource(
     { query, sources, size, yearMin, lang },
     {
       mailto: cfg.config.litSources.crossrefMailto ?? cfg.config.litSources.openalexMailto,
       unpaywallEmail: cfg.config.litSources.unpaywallEmail,
       fetchImpl,
+      deepxiv,
     },
   );
   sendJson(res, 200, result, requestId);

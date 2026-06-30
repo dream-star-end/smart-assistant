@@ -16,6 +16,7 @@ import {
   normalizeTitleForKey,
   searchArxiv,
   searchCrossref,
+  searchDeepXiv,
   searchOpenAlex,
 } from "./sources.js";
 
@@ -40,6 +41,8 @@ export interface LitSearchDeps {
   timeoutMs?: number;
   /** 瞬时出站失败的重试退避基数(ms);默认 400,测试可传 0 跑快。 */
   retryDelayMs?: number;
+  /** DeepXiv arXiv 兜底源(域内 RAG):主源全空时用它补召回。token 留 master,不进容器。 */
+  deepxiv?: { base: string; token: string };
 }
 
 export interface LitSearchResult {
@@ -199,6 +202,22 @@ export async function searchMultiSource(
   }
 
   let merged = dedupAndMerge(all);
+
+  // DeepXiv 兜底:主源(OpenAlex/Crossref/arXiv 直连,经日本代理)全空时(出站失败/无命中),用域内
+  // 可达的 DeepXiv RAG 补 arXiv 召回(boss #faa3c041:英文检索三源全 fetch failed)。仅在空时触发
+  // (不常态加压);失败不影响主结果。
+  // 仅当请求的源包含 arxiv 时兜底(DeepXiv 是 arxiv 类;尊重用户显式 --sources 排除 arxiv 的语义)。
+  if (merged.length === 0 && deps.deepxiv?.base && deps.deepxiv.token && sources.includes("arxiv")) {
+    try {
+      const dx = await withRetry(() => searchDeepXiv(input.query, opts, deps.deepxiv!), 2, deps.retryDelayMs ?? 400);
+      if (dx.length > 0) {
+        merged = dedupAndMerge(dx);
+        warnings.push("主源暂不可用,已用 DeepXiv(域内 arXiv RAG)兜底召回");
+      }
+    } catch (e) {
+      warnings.push(`DeepXiv 兜底也失败: ${errMsg(e)}`);
+    }
+  }
 
   // OA 富化(Unpaywall,可选):仅对有 DOI 且尚未发现 OA 的记录
   if (deps.unpaywallEmail) {
