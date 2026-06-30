@@ -26,7 +26,36 @@ export interface BuildReportResult {
 
 const CLAIM_MARK_RE = /\[\[claim:([^\]]+)\]\]/g;
 
+/**
+ * 入口校验:schema/manifest 来自 JSON 文件,TS 类型只是名义的,运行时可能缺字段。缺字段时
+ * 抛**可操作的清晰错误**(而非到下游 `.map` 才崩出裸 TypeError 栈——boss #faa3c041 见 oc-report
+ * 崩 3 次的根因)。manifest 必须是 oc-cite check/fix 的输出(含 coverage)。
+ */
+function validateReportInputs(schema: ReportSchema, manifest: EvidenceManifest): void {
+  const m = (manifest ?? {}) as Record<string, unknown>;
+  const missing: string[] = [];
+  if (!Array.isArray(m.sources)) missing.push("sources[]");
+  if (!Array.isArray(m.quotes)) missing.push("quotes[]");
+  if (!Array.isArray(m.claims)) missing.push("claims[]");
+  const cov = m.coverage as Record<string, unknown> | undefined;
+  if (!cov || typeof cov.verifiedClaims !== "number" || typeof cov.totalClaims !== "number") {
+    missing.push("coverage{verifiedClaims,totalClaims}");
+  }
+  if (missing.length > 0) {
+    throw new Error(
+      `manifest 缺少字段: ${missing.join(", ")}。oc-report 的 manifest 必须是 oc-cite check 或 oc-cite fix 的输出(直接传它的输出即可,会自动取 .manifest);不要手写 manifest 或传 schema。`,
+    );
+  }
+  const s = (schema ?? {}) as Record<string, unknown>;
+  if (!Array.isArray(s.sections)) {
+    throw new Error("schema 缺少 sections[]。oc-report 的 --schema 是 LLM 产出的 ReportSchema(title/abstract/sections[]),勿与 manifest 弄混。");
+  }
+}
+
 export function buildReportDocument(schema: ReportSchema, manifest: EvidenceManifest): BuildReportResult {
+  validateReportInputs(schema, manifest);
+  // figures 可选:缺失/非数组时按"无图"处理,不让无图报告崩(图非报告必需)。
+  const figures = Array.isArray(schema.figures) ? schema.figures : [];
   const warnings: string[] = [];
   const claimById = new Map(manifest.claims.map((c) => [c.id, c]));
   const quoteSourceId = new Map(manifest.quotes.map((q) => [q.id, q.sourceId]));
@@ -102,7 +131,7 @@ export function buildReportDocument(schema: ReportSchema, manifest: EvidenceMani
   }
 
   // ── 图表(只 embed 路径;禁生成式插画由 skill 约束) ─────────────────
-  for (const fig of schema.figures) {
+  for (const fig of figures) {
     lines.push(`![${escapeMd(fig.caption)}](${fig.path}){#fig-${fig.id}}`);
     lines.push("");
   }
@@ -135,7 +164,7 @@ export function buildReportDocument(schema: ReportSchema, manifest: EvidenceMani
     warnings.push(`去AI味[${f.kind}]: "${f.sample.slice(0, 30)}" — ${f.hint}`);
   }
   // PresAesth 图表美学(软信号:禁生成式插画、图须有 caption)
-  for (const f of presAesthFigures(schema.figures).findings) {
+  for (const f of presAesthFigures(figures).findings) {
     warnings.push(`美学[${f.kind}] ${f.where}: ${f.hint}`);
   }
 
@@ -143,7 +172,7 @@ export function buildReportDocument(schema: ReportSchema, manifest: EvidenceMani
     markdown: lines.join("\n"),
     references,
     warnings,
-    stats: { sections: schema.sections.length, citations, redFlags, figures: schema.figures.length },
+    stats: { sections: schema.sections.length, citations, redFlags, figures: figures.length },
   };
 }
 

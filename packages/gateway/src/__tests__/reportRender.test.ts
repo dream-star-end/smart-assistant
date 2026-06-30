@@ -108,4 +108,27 @@ describe("reportRender", () => {
     assert.ok(r.markdown.startsWith("---\ntitle:"));
     assert.ok(r.markdown.includes("number-sections: true"));
   });
+
+  // #faa3c041:oc-report 曾因 manifest 缺字段直接抛裸 TypeError 崩 3 次。现在入口校验 → 清晰错。
+  it("manifest 缺 coverage → 抛可操作错误(非裸 TypeError)", () => {
+    const bad = { ...manifest(), coverage: undefined } as unknown as EvidenceManifest;
+    assert.throws(() => buildReportDocument(schema(), bad), /coverage/);
+  });
+
+  it("manifest 缺 claims/quotes/sources 数组 → 抛错并列出缺失字段", () => {
+    const bad = { coverage: { verifiedClaims: 0, totalClaims: 0 } } as unknown as EvidenceManifest;
+    assert.throws(() => buildReportDocument(schema(), bad), /sources\[\].*quotes\[\].*claims\[\]/s);
+  });
+
+  it("schema 缺 sections → 抛错(别和 manifest 弄混)", () => {
+    const bad = { title: "x" } as unknown as ReportSchema;
+    assert.throws(() => buildReportDocument(bad, manifest()), /sections\[\]/);
+  });
+
+  it("schema 无 figures → 按无图正常出报告(不崩)", () => {
+    const noFig = { ...schema(), figures: undefined } as unknown as ReportSchema;
+    const r = buildReportDocument(noFig, manifest());
+    assert.equal(r.stats.figures, 0);
+    assert.ok(r.markdown.length > 0);
+  });
 });

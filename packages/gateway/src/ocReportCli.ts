@@ -53,7 +53,14 @@ function main(): void {
   const flags = parseFlags(process.argv.slice(2));
   if (!flags.schema || !flags.manifest) fail("usage: oc-report --schema <f> --manifest <f> [-o out.{pdf,docx,html,md}]");
   const schema = readJson<ReportSchema>(flags.schema);
-  const manifest = readJson<EvidenceManifest>(flags.manifest);
+  // oc-cite check/fix 的输出是 { manifest: {...} }(外层包了一层);直接传它即可,这里自动取
+  // 内层 .manifest(省去用户手动 extract——boss #faa3c041 折腾的步骤)。已是裸 manifest 则原样用。
+  const rawManifest = readJson<Record<string, unknown>>(flags.manifest);
+  const manifest = (
+    rawManifest && typeof rawManifest === "object" && !Array.isArray(rawManifest) && rawManifest.manifest
+      ? rawManifest.manifest
+      : rawManifest
+  ) as EvidenceManifest;
 
   const built = buildReportDocument(schema, manifest);
   const output = flags.output && flags.output !== "true" ? flags.output : "report.md";
@@ -94,4 +101,10 @@ function main(): void {
   process.stdout.write(`${finalPath}\n`);
 }
 
-main();
+try {
+  main();
+} catch (e) {
+  // 任何错误(含 buildReportDocument 的 manifest 校验)都走 fail() 输出干净可操作信息,
+  // 不再向用户/agent 抛裸 TypeError 栈(boss #faa3c041 见过 3 次)。
+  fail(e instanceof Error ? e.message : String(e));
+}
