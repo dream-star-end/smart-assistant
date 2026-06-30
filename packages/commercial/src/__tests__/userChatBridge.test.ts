@@ -964,10 +964,14 @@ describe("userChatBridge — model authorization", () => {
       assert.match(forwarded.traceId ?? "", /^[a-f0-9]{32}$/);
       assert.ok(forwarded.content?.text?.startsWith("10.1038/nature12373"));
       assert.ok((forwarded.content?.text ?? "").includes(SCANSCI_PAPER_HINT_MARKER));
-      // scansci retired from MCP → CLI: hint must point at the `scansci-pdf` CLI,
-      // not the removed `scansci_pdf_*` MCP tools.
-      assert.match(forwarded.content?.text ?? "", /`scansci-pdf` 命令行/);
+      // 文献检索/引用权威已迁到 oc-* 研究 CLI:hint 必须指向 oc-lit/oc-cite,而非
+      // 已退役的 scansci-pdf CLI(当前镜像 server-only,无 search/download 子命令——
+      // 旧 hint 引导 `scansci-pdf search` 会让 agent 每次先必失败再回落)。
+      assert.match(forwarded.content?.text ?? "", /oc-lit search/);
+      assert.match(forwarded.content?.text ?? "", /oc-cite verify/);
       assert.doesNotMatch(forwarded.content?.text ?? "", /scansci_pdf_\*/);
+      // 不得再把检索引导到 scansci-pdf(只能出现"不要用 scansci-pdf 做检索"这类禁用语)。
+      assert.doesNotMatch(forwarded.content?.text ?? "", /先 `scansci-pdf` search/);
       assert.match(forwarded.content?.text ?? "", /WebSearch\/WebFetch/);
 
       ws.close();

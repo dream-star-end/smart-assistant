@@ -180,3 +180,50 @@ describe("其余 oc-* 卡片", () => {
     expect(screen.getByText("真的")).toBeInTheDocument();
   });
 });
+
+describe("渐进披露:截断输出仍渲染已加载条目", () => {
+  test("文献检索:尾部半截对象被丢,前面完整的渲出 + 标注部分加载", () => {
+    // 第 3 条被截断(模拟 preview slice 后追加 …);前 2 条完整。
+    const truncated =
+      '{"sources":[{"id":"s1","title":"Paper One","authors":[{"name":"A"}]},' +
+      '{"id":"s2","title":"Paper Two","authors":[{"name":"B"}]},' +
+      '{"id":"s3","title":"Paper Thr…';
+    const node = researchToolCard('oc-lit search "x"', tool({ output: truncated }));
+    expect(node).not.toBeNull();
+    render(<div>{node}</div>);
+    expect(screen.getByText("Paper One")).toBeInTheDocument();
+    expect(screen.getByText("Paper Two")).toBeInTheDocument();
+    expect(screen.queryByText("Paper Thr")).toBeNull(); // 半截的不渲染
+    expect(screen.getByText("已加载 2 篇")).toBeInTheDocument();
+    expect(screen.getByText(/仅展示已加载的前 2 条/)).toBeInTheDocument();
+  });
+
+  test("扫描器字符串感知:字符串内的 } { 不破坏对象边界", () => {
+    const truncated =
+      '{"sources":[{"id":"s1","title":"a } { tricky \\" brace"},{"id":"s2","title":"second"},{"id":"s3","tit';
+    render(<div>{researchToolCard('oc-lit search "x"', tool({ output: truncated }))}</div>);
+    expect(screen.getByText("a } { tricky \" brace")).toBeInTheDocument();
+    expect(screen.getByText("second")).toBeInTheDocument();
+    expect(screen.getByText("已加载 2 篇")).toBeInTheDocument();
+  });
+
+  test("引用核验:verdicts 截断也走部分加载", () => {
+    const truncated =
+      '{"verdicts":[{"identifier":"doi:10.a","resolved":true,"gbt7714":"甲. 一[J]. 2020."},' +
+      '{"identifier":"doi:10.b","resolved":false},{"identifier":"doi:10.c","reso';
+    render(<div>{researchToolCard("oc-cite verify doi:10.a", tool({ output: truncated }))}</div>);
+    expect(screen.getByText("引用核验")).toBeInTheDocument();
+    expect(screen.getByText(/仅展示已加载的前 2 条/)).toBeInTheDocument();
+  });
+
+  test("连第一条都没完整 → null 回落(让通用 Bash 显示原始)", () => {
+    const truncated = '{"sources":[{"id":"s1","title":"only partial obj no close';
+    expect(researchToolCard('oc-lit search "x"', tool({ output: truncated }))).toBeNull();
+  });
+
+  test("未截断输出不显示部分加载提示", () => {
+    render(<div>{researchToolCard('oc-lit search "x"', tool({ output: LIT_JSON }))}</div>);
+    expect(screen.queryByText(/仅展示已加载的前/)).toBeNull();
+    expect(screen.getByText("2 篇")).toBeInTheDocument();
+  });
+});

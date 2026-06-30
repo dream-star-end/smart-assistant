@@ -65,6 +65,74 @@ function looseJson(text: string | null): Record<string, unknown> | null {
 }
 
 /**
+ * 从一段**可能被截断**的 JSON 文本里,恢复出第一个"对象数组"(形如 `"<key>":[{…},{…},…`)
+ * 中**已完整到达**的元素。渐进披露的核心:工具输出经 preview/bashTail 截断后(尾部可能是半截
+ * 对象),仍能把前面已加载完整的若干条渲染出来,而非整张卡白屏。绝不抛异常。
+ *
+ * 返回命中的 key 与已恢复的对象数组;没有可恢复的对象数组 → null。字符串/转义感知地数花括号
+ * 深度,只收 depth 归零(完整闭合)的顶层对象;遇到截断的半截对象即停止。
+ */
+function recoverArrayPrefix(text: string): { key: string; items: Record<string, unknown>[] } | null {
+  // 第一个"值是对象数组"的键(跳过 `"warnings":[]` / 字符串数组等)。
+  const m = text.match(/"(\w+)"\s*:\s*\[\s*\{/);
+  if (!m || m.index == null) return null;
+  const key = m[1] ?? "";
+  const n = text.length;
+  // 定位到该数组首个 '{'。
+  let i = text.indexOf("{", m.index + m[0].length - 1);
+  if (i < 0) return null;
+  const items: Record<string, unknown>[] = [];
+  while (i < n) {
+    while (i < n && (text[i] === " " || text[i] === "\n" || text[i] === "\t" || text[i] === "\r" || text[i] === ",")) i++;
+    if (i >= n || text[i] === "]") break;
+    if (text[i] !== "{") break;
+    const start = i;
+    let depth = 0;
+    let inStr = false;
+    let esc = false;
+    let complete = false;
+    for (; i < n; i++) {
+      const c = text[i];
+      if (inStr) {
+        if (esc) esc = false;
+        else if (c === "\\") esc = true;
+        else if (c === '"') inStr = false;
+      } else if (c === '"') inStr = true;
+      else if (c === "{") depth++;
+      else if (c === "}") {
+        depth--;
+        if (depth === 0) {
+          i++;
+          complete = true;
+          break;
+        }
+      }
+    }
+    if (!complete) break; // 半截对象(被截断)→ 停止收集
+    try {
+      const o = JSON.parse(text.slice(start, i));
+      if (o && typeof o === "object" && !Array.isArray(o)) items.push(o as Record<string, unknown>);
+      else break;
+    } catch {
+      break;
+    }
+  }
+  return items.length > 0 ? { key, items } : null;
+}
+
+/**
+ * 工具结构化输出解析(渐进披露):先尝试整段解析(未截断的常见情形);失败(被截断)则从
+ * 截断文本里恢复第一个对象数组的已加载完整条目,标记 partial=true 让卡片提示"部分加载"。
+ */
+function parseToolData(text: string | null): { data: Record<string, unknown>; partial: boolean } | null {
+  const full = looseJson(text);
+  if (full) return { data: full, partial: false };
+  const rec = recoverArrayPrefix(text ?? "");
+  if (rec) return { data: { [rec.key]: rec.items }, partial: true };
+  return null;
+}
+
+/**
  * 命令的"可执行名"是否就是某个 oc-* 工具(而非只是命令里提到它)。
  * 命中 `oc-lit ...`、`FOO=bar oc-lit ...`、`/usr/local/bin/oc-lit ...`;
  * 不命中 `echo oc-lit`、`cat oc-lit.sh`(首词是 echo/cat)。
@@ -118,6 +186,15 @@ function Chip({ children, href, tone }: { children: ReactNode; href?: string; to
   return <span className={cls}>{children}</span>;
 }
 
+/** 渐进披露提示:结果被截断、卡片只展示已加载的前若干条时给用户的一行说明。 */
+function PartialNote({ shown }: { shown: number }) {
+  return (
+    <div className="mt-2 text-[11px] text-faint">
+      结果较多,卡片仅展示已加载的前 {shown} 条;完整结果见上方回答。
+    </div>
+  );
+}
+
 // ── 文献检索卡(oc-lit search / snowball) ────────────────────────────────────
 
 interface LitAuthor {
@@ -146,12 +223,16 @@ function authorsLine(authors: unknown): string {
   return `${names.slice(0, 3).join(", ")} 等`;
 }
 
-function LiteratureCard({ data }: { data: Record<string, unknown> }) {
+function LiteratureCard({ data, partial }: { data: Record<string, unknown>; partial?: boolean }) {
   const sources = recArr<LitSource>(data.sources);
   const warnings = asArr(data.warnings).map((w) => asStr(w)).filter(Boolean);
   if (sources.length === 0 && warnings.length === 0) return null;
   return (
-    <CardShell icon={<BookOpen className="size-4" />} title="文献检索" subtitle={`${sources.length} 篇`}>
+    <CardShell
+      icon={<BookOpen className="size-4" />}
+      title="文献检索"
+      subtitle={partial ? `已加载 ${sources.length} 篇` : `${sources.length} 篇`}
+    >
       {sources.length > 0 && (
         <ul className="flex flex-col divide-y divide-border">
           {sources.slice(0, 50).map((s, i) => {
@@ -192,6 +273,7 @@ function LiteratureCard({ data }: { data: Record<string, unknown> }) {
           <span>部分来源暂不可用:{warnings.join(";")}</span>
         </div>
       )}
+      {partial && <PartialNote shown={sources.length} />}
     </CardShell>
   );
 }
@@ -217,7 +299,7 @@ interface Claim {
   supports?: { quoteId?: string }[];
 }
 
-function CitationCard({ data }: { data: Record<string, unknown> }) {
+function CitationCard({ data, partial }: { data: Record<string, unknown>; partial?: boolean }) {
   const verdicts = recArr<Verdict>(data.verdicts);
   const claims = recArr<Claim>(data.claims);
   // verify:逐条 identifier 的接地/撤稿。
@@ -246,6 +328,7 @@ function CitationCard({ data }: { data: Record<string, unknown> }) {
             );
           })}
         </ul>
+        {partial && <PartialNote shown={verdicts.length} />}
       </CardShell>
     );
   }
@@ -281,6 +364,7 @@ function CitationCard({ data }: { data: Record<string, unknown> }) {
             );
           })}
         </ul>
+        {partial && <PartialNote shown={claims.length} />}
       </CardShell>
     );
   }
@@ -315,12 +399,16 @@ function IngestCard({ data }: { data: Record<string, unknown> }) {
 
 // ── 检索片段卡(oc-litrag) ───────────────────────────────────────────────────
 
-function LitragCard({ data }: { data: Record<string, unknown> }) {
+function LitragCard({ data, partial }: { data: Record<string, unknown>; partial?: boolean }) {
   const quotes = recArr<QuoteRow>(data.quotes);
   const missing = asArr(data.missing).map((m) => asStr(m)).filter(Boolean);
   if (quotes.length === 0 && missing.length === 0) return null;
   return (
-    <CardShell icon={<Search className="size-4" />} title="原文片段定位" subtitle={`${quotes.length} 处`}>
+    <CardShell
+      icon={<Search className="size-4" />}
+      title="原文片段定位"
+      subtitle={partial ? `已加载 ${quotes.length} 处` : `${quotes.length} 处`}
+    >
       {quotes.length > 0 && (
         <ul className="flex flex-col gap-2">
           {quotes.slice(0, 30).map((q, i) => (
@@ -334,6 +422,7 @@ function LitragCard({ data }: { data: Record<string, unknown> }) {
       {missing.length > 0 && (
         <div className="mt-2 text-xs text-faint">未在已入库文档中找到:{missing.join(", ")}</div>
       )}
+      {partial && <PartialNote shown={quotes.length} />}
     </CardShell>
   );
 }
@@ -384,11 +473,15 @@ interface Ranked {
   draws?: number;
 }
 
-function RankCard({ data }: { data: Record<string, unknown> }) {
+function RankCard({ data, partial }: { data: Record<string, unknown>; partial?: boolean }) {
   const ranked = recArr<Ranked>(data.ranked);
   if (ranked.length === 0) return null;
   return (
-    <CardShell icon={<Trophy className="size-4" />} title="候选排名" subtitle={`${ranked.length} 项`}>
+    <CardShell
+      icon={<Trophy className="size-4" />}
+      title="候选排名"
+      subtitle={partial ? `已加载 ${ranked.length} 项` : `${ranked.length} 项`}
+    >
       <ol className="flex flex-col divide-y divide-border">
         {ranked.slice(0, 30).map((r, i) => (
           <li key={r.id || `${i}`} className="flex items-center gap-2 py-1.5 first:pt-0 last:pb-0">
@@ -405,6 +498,7 @@ function RankCard({ data }: { data: Record<string, unknown> }) {
           </li>
         ))}
       </ol>
+      {partial && <PartialNote shown={ranked.length} />}
     </CardShell>
   );
 }
@@ -479,10 +573,14 @@ interface CardEntry {
   render: (command: string, tool: ToolLike) => ReactNode | null;
 }
 
-/** 解析对象型输出,交给对象卡片函数(解析失败/卡片判空 → null 回落)。 */
-function obj(tool: ToolLike, card: (p: { data: Record<string, unknown> }) => ReactNode | null): ReactNode | null {
-  const data = looseJson(outputText(tool));
-  return data ? card({ data }) : null;
+/** 解析对象型输出,交给对象卡片函数(解析失败/卡片判空 → null 回落)。
+ *  渐进披露:输出被截断时仍恢复已加载的完整条目,partial=true 让卡片提示"部分加载"。 */
+function obj(
+  tool: ToolLike,
+  card: (p: { data: Record<string, unknown>; partial: boolean }) => ReactNode | null,
+): ReactNode | null {
+  const parsed = parseToolData(outputText(tool));
+  return parsed ? card({ data: parsed.data, partial: parsed.partial }) : null;
 }
 
 const TOOL_CARD_REGISTRY: CardEntry[] = [

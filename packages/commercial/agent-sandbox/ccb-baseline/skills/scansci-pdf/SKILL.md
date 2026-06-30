@@ -1,50 +1,27 @@
 ---
 name: scansci-pdf
-description: 用 `scansci-pdf` 命令行检索学术论文、按 DOI/arXiv/题名下载 PDF、批量下载阅读清单、生成引用。用户要找论文、下载 PDF、解析 DOI/arXiv/题名、批量下载、查来源健康或导出引用时使用。
-tags: [research, papers, pdf, citation]
+description: （已退役为重定向）文献检索/下载/引用请用 oc-lit / oc-cite / oc-ingest。当前镜像里的 `scansci-pdf` 仅 server 模式(只有 run/check)，没有 search/download/citation 等 CLI 子命令，别用它做这些。
+tags: [research, papers, redirect, deprecated]
 ---
 
-# ScanSci PDF 论文助手（CLI）
+# scansci-pdf（已退役 → 用 oc-* 研究命令行）
 
-当用户要找论文、下载论文 PDF、批量下载阅读清单、解析 DOI/arXiv/题名、检查论文来源健康或生成引用时，用这个技能。
+> **重要**:当前镜像安装的 `scansci-pdf`(1.3.x)是 **server-only**——`scansci-pdf --help` 只有 `run`(起服务)和 `check`(查依赖)两个子命令,**没有** `search` / `download` / `citation` 等子命令。任何 `scansci-pdf search "..."` 之类的调用都会报 `No such command` 而失败。文献能力已统一迁到研究子系统的 oc-* 命令行,请直接用下表对应工具,**不要**再调用 scansci-pdf 做检索/下载/引用。
 
-论文能力由容器内的 **`scansci-pdf` 命令行**提供（用 Bash 调用，始终可用），不再是 MCP 工具。商业版 Web 是 chat-native：直接从用户消息推断论文任务，**不要**让用户去打开“设置”或单独的论文助手入口。用户只贴了 DOI/arXiv/题名/URL、没多说，就按“解析/下载或查看该论文”处理。
+## 按任务对应的工具(唯一权威)
 
-## 先发现命令
+| 任务 | 用这个(经 Bash 调用) | 说明 |
+|---|---|---|
+| 按主题/关键词/模糊题名找文献、综述素材 | `oc-lit search "<3~8 个英文核心术语>"` | 多源 OpenAlex/Crossref/arXiv + 去重 + 开放获取(OA)发现 |
+| 从一篇关键论文滚雪球找全相关工作 | `oc-lit snowball <DOI\|arXiv\|OpenAlex id>` | 前后向引用扩展 |
+| 单个 DOI/arXiv/URL/精确题名定位元数据 | `oc-lit search` | `oa.isOA=true` 时给 `oa.url` 开放全文;付费墙无 OA 不代下载 |
+| 生成/核验引用(BibTeX/RIS/APA/GB-T7714) | `oc-cite verify <DOI\|arXiv\|OpenAlex id>` | 接地校验,撤稿/未命中会标注;引用接地是红线 |
+| 解析用户上传的 PDF/全文入库 | `oc-ingest` | 付费墙全文请用户上传后再解析 |
 
-第一次用前先跑一次帮助，确认本镜像的精确子命令与参数：
+详细参数见 `skill_view("oc-lit")` / `skill_view("oc-cite")` / `skill_view("oc-ingest")`。拿不到全文时再用内置 WebSearch/WebFetch 兜底查来源/链接,不要假装已下载。
 
-```bash
-scansci-pdf --help
-scansci-pdf <subcommand> --help    # 如 scansci-pdf download --help
-```
-
-核心操作（子命令名以 `--help` 实际输出为准）：search、download、batch-download、citation、health-check、network-diagnose、source-scores、vpnsci-status / vpnsci-schools / vpnsci-test。
-
-## 默认行为
-
-- 模糊主题、题名片段、可能命中多篇 → 先 `scansci-pdf search`，列候选让用户选，再下载；不要对一堆模糊结果擅自批量下载。
-- 单个 DOI / arXiv ID / URL / 精确题名 → `scansci-pdf download`，存入默认 ScanSci 数据目录，除非用户指定路径。
-- 用户给了 DOI/arXiv/题名列表 → `scansci-pdf batch-download`，批量保持小规模，除非用户明确要大批量。
-- 用户要 BibTeX/RIS/APA/MLA/Vancouver 或引用元数据 → `scansci-pdf citation`。
-- 下载反复失败 → `scansci-pdf health-check` / `scansci-pdf network-diagnose`。
-- 后续选择都留在对话里：搜索结果给简短编号候选，问用户下载哪个；UI 有结果卡片时用户可能点卡片动作发来后续 prompt。
-
-## 给用户的回复规则
-
-成功下载后，必须包含：
-
-1. 论文题名或标识符。
-2. 命令返回的来源/状态（若有）。
-3. 精确的 PDF 绝对路径，通常在 `/home/agent/.local/share/scansci-pdf/papers/`。把路径单独成行打印，OpenClaude 会渲染成文件卡片。
-4. 用户要的话给引用/BibTeX。
-
-返回搜索结果时给足后续动作所需标识：题名、年份、第一作者、DOI 或 arXiv ID。回复简洁、可执行。
-
-## 安全与隐私
+## 安全与隐私(若确需触碰 scansci-pdf server 配置)
 
 - 不泄露 ScanSci 配置、API key、cookie、browser state、access token、代理凭据。
-- **不要运行 `scansci-pdf config get` 之类的配置 dump 子命令**；商业版刻意隐藏配置输出。
+- **不要运行 `scansci-pdf config get` 之类配置 dump**;商业版刻意隐藏配置输出。
 - 不要打印 `config.json` / `browser_state.json` / cookie / token 文件内容。
-- 用户没指定获取策略时优先合法/开放获取途径。
-- 用户要机构/WebVPN/CARSI 登录或“隐身浏览器”时，说明当前 runtime 暴露的是 ScanSci 核心下载/检索/引用与状态检查；交互式远程浏览器登录需另行启用隔离浏览器 sidecar。
