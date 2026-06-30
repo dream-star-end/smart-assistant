@@ -17,6 +17,7 @@ import { SignedAudio, SignedFileCard, SignedImg, SignedVideo } from "./chat/medi
 import { CodeBlock } from "./CodeBlock";
 import { ChartBlock, HtmlPreview, MermaidBlock } from "./RichBlocks";
 import type { MarkdownProps } from "./Markdown";
+import { normalizeMathDelimiters } from "./mathDelimiters";
 
 /** 从(可能被 highlight 包成 span 的)code children 递归还原纯源码文本 —— mermaid/html 富块要原文。 */
 function nodeText(node: ReactNode): string {
@@ -196,7 +197,7 @@ export default function MarkdownImpl({ children, signMedia }: MarkdownProps) {
           ),
         }}
       >
-        {children}
+        {typeof children === "string" ? normalizeMathDelimiters(children) : children}
       </ReactMarkdown>
     </div>
   );
