@@ -266,7 +266,7 @@ describe("pickUpstream — DeepSeek route", () => {
 // ─── pickUpstream — MiniMax 路径(等价回归)───────────────────────────────
 
 describe("pickUpstream — MiniMax route", () => {
-  test("不调 scheduler;endpoint=minimax;Bearer Token Plan key + strip beta/3 body extras(**保留 thinking**,MiniMax-M3 是思考模型)", async () => {
+  test("不调 scheduler;endpoint=ark-agent-plan(/api/plan/v1/messages);Bearer Token Plan key + strip beta/3 body extras(**保留 thinking**,MiniMax-M3 是思考模型)", async () => {
     const sched = makeScheduler({});
     const res = await pickUpstream(
       { scheduler: sched.scheduler, staticProviderKeys: { minimax: "MM-KEY" } },
@@ -282,7 +282,8 @@ describe("pickUpstream — MiniMax route", () => {
     // 静态 provider 走显式直连 dispatcher,绕开全局日本代理。
     assert.equal(session.dispatcher, directEgressDispatcher());
     assert.equal(session.shouldUpdateQuotaFromResponse, false);
-    assert.ok(session.endpoint.includes("api.minimaxi.com/anthropic/v1/messages"));
+    // 2026-06-30:MiniMax-M3 文本/识图上游切火山方舟 Agent Plan(同名托管 minimax-m3,Anthropic 兼容)。
+    assert.ok(session.endpoint.includes("ark.cn-beijing.volces.com/api/plan/v1/messages"));
 
     const safeHeaders: Record<string, string> = {
       "anthropic-beta": "interleaved-thinking-2025-05-14",

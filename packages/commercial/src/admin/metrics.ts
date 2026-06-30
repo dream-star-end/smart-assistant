@@ -377,7 +377,7 @@ export const anthropicProxySettle = new Counter({
  *   - bad_path        非 POST /v1/messages
  *   - bad_headers     header allowlist 失败
  *   - upstream_auth   refresh token 失败
- *   - minimax_config  MiniMax-M3 命中但 MINIMAX_TOKEN_PLAN_KEY 未配置
+ *   - minimax_config  MiniMax-M3 命中但 ARK_AGENT_PLAN_KEY 未配置(2026-06-30 文本上游切火山 Agent Plan)
  *   - ark_config      glm-5.1 命中但 ARK_CODING_PLAN_KEY 未配置
  */
 export const anthropicProxyReject = new Counter({

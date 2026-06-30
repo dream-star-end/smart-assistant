@@ -15,7 +15,11 @@ import { PLATFORM_DEFAULT_MODEL } from "../../platformDefaults.js";
 
 export interface StaticProviderCommercialMeta {
   /** 静态 key 在 commercial Config 里的字段名(不含 key 值本身) */
-  readonly keyConfigField: "DEEPSEEK_API_KEY" | "MINIMAX_TOKEN_PLAN_KEY" | "ARK_CODING_PLAN_KEY";
+  readonly keyConfigField:
+    | "DEEPSEEK_API_KEY"
+    | "MINIMAX_TOKEN_PLAN_KEY"
+    | "ARK_CODING_PLAN_KEY"
+    | "ARK_AGENT_PLAN_KEY";
   /** 缺 key → 503 错误码 */
   readonly notConfiguredHttpCode:
     | "DEEPSEEK_NOT_CONFIGURED"
@@ -50,10 +54,12 @@ export const STATIC_PROVIDER_META: Record<StaticProviderId, StaticProviderCommer
     egress: "direct",
   },
   minimax: {
-    keyConfigField: "MINIMAX_TOKEN_PLAN_KEY",
+    // 2026-06-30:上游切火山方舟 Agent Plan,key 改用 ARK_AGENT_PLAN_KEY(与 ARK_CODING_PLAN_KEY 对称)。
+    // provider id 仍 'minimax'(路由的模型还是 minimax-m3,语义正确);metric/错误码保持 minimax_* 连续性。
+    keyConfigField: "ARK_AGENT_PLAN_KEY",
     notConfiguredHttpCode: "MINIMAX_NOT_CONFIGURED",
     rejectMetricLabel: "minimax_config",
-    // api.minimaxi.com:新加坡端点,海外直连最快;绕日本 TLS 抖到 ~6s。
+    // ark.cn-beijing.volces.com:火山北京端点,直连 TLS ~0.3s 且稳;绕日本双重跨境 ~6s 且半路断 → 必须 direct。
     egress: "direct",
   },
   ark: {
@@ -66,7 +72,7 @@ export const STATIC_PROVIDER_META: Record<StaticProviderId, StaticProviderCommer
 };
 
 /**
- * fail-closed guard：若平台全局默认模型(PLATFORM_DEFAULT_MODEL，2026-06-16 起 MiniMax-M3)路由到某静态 key
+ * fail-closed guard：若平台全局默认模型(PLATFORM_DEFAULT_MODEL，2026-06-17 起 glm-5.2→ark)路由到某静态 key
  * provider，但生产 env 未配该 provider 的 key → **throw**，让 master 装配 internal proxy 的启动路径
  * loud fail，而非全员默认模型静默 503(Codex plan review #4)。
  *
@@ -79,6 +85,7 @@ export function assertPlatformDefaultModelConfigured(cfg: {
   DEEPSEEK_API_KEY?: string;
   MINIMAX_TOKEN_PLAN_KEY?: string;
   ARK_CODING_PLAN_KEY?: string;
+  ARK_AGENT_PLAN_KEY?: string;
 }): void {
   const provider = findRouteProviderForModel(PLATFORM_DEFAULT_MODEL);
   if (!provider) return;

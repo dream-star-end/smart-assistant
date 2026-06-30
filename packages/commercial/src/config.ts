@@ -422,12 +422,12 @@ export const commercialConfigSchema = z
     VOICE_MAX_GLOBAL: positiveInt(500),
     /**
      * MiniMax Token Plan 订阅 key(2026-06-02 接入)。
-     * - 配置时 anthropicProxy 收到 model=MiniMax-M3 的请求 → forward
-     *   到 https://api.minimaxi.com/anthropic/v1/messages,Authorization: Bearer
-     *   <MINIMAX_TOKEN_PLAN_KEY>;不占 claude_accounts 池
-     * - 同一 key 也由 master-side `/internal/v3/minimax` 媒体 proxy 使用,
+     * **2026-06-30 起文本/识图(MiniMax-M3 面A)已迁火山方舟 Agent Plan(改走 ARK_AGENT_PLAN_KEY),
+     * 本字段仅剩 master-side `/internal/v3/minimax` 媒体 proxy(图/视频/语音/音乐/歌词)暂用;
+     * 待 P2/P3 媒体也切火山后即可整体下线本字段。**
+     * - 媒体 proxy:forward 到 https://api.minimaxi.com/v1/*,Authorization: Bearer <MINIMAX_TOKEN_PLAN_KEY>;
      *   用户容器只拿 oc-v3 container bearer,**永远不注入 MiniMax key**
-     * - 未配置 → 文本路由 503 MINIMAX_NOT_CONFIGURED;媒体 proxy 503
+     * - 未配置 → 媒体 proxy 503(文本/识图路由已不依赖本字段,改依赖 ARK_AGENT_PLAN_KEY)
      * - 不入 git;由 systemd EnvironmentFile 注入。用户已在聊天里暴露过的 key
      *   上线前必须在 MiniMax 控制台旋转后再写入生产 env。
      */
@@ -448,6 +448,18 @@ export const commercialConfigSchema = z
      *   控制台旋转后再写入生产 env。**
      */
     ARK_CODING_PLAN_KEY: z.string().trim().min(1).max(512).optional(),
+    /**
+     * 火山方舟 Agent Plan key(2026-06-30 接入,替换即将过期的 MiniMax)。Agent Plan 是与
+     * Coding Plan(/api/coding)并列的另一档套餐(/api/plan),**同一 key 覆盖全模态**:
+     * - 文本/识图(P1):model=minimax-m3 → https://ark.cn-beijing.volces.com/api/plan/v1/messages
+     *   (Anthropic 兼容,Authorization: Bearer <ARK_AGENT_PLAN_KEY>);不占 claude_accounts 池
+     * - 媒体(P2/P3):图 doubao-seedream-5.0-lite / 视频 doubao-seedance-1.5-pro(/api/plan/v3),
+     *   语音 seed-tts-2.0(openspeech.bytedance.com,鉴权头 X-Api-Key=<ARK_AGENT_PLAN_KEY>)
+     * - key 只在 master 进程,**绝不注入用户容器**(用户容器只拿 oc-v3 container bearer)
+     * - 未配 → 命中 minimax provider 的文本路由 503 MINIMAX_NOT_CONFIGURED
+     * - 不入 git;由 systemd EnvironmentFile 注入。**已在聊天暴露的 key,上线前必须在火山方舟控制台旋转后再写入生产 env。**
+     */
+    ARK_AGENT_PLAN_KEY: z.string().trim().min(1).max(512).optional(),
     /**
      * Platform HMAC secret(Phase 5 envelope rewriter,2026-05-21)。
      *
