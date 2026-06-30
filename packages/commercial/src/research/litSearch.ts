@@ -38,6 +38,8 @@ export interface LitSearchDeps {
   unpaywallEmail?: string;
   fetchImpl?: FetchLike;
   timeoutMs?: number;
+  /** 瞬时出站失败的重试退避基数(ms);默认 400,测试可传 0 跑快。 */
+  retryDelayMs?: number;
 }
 
 export interface LitSearchResult {
@@ -142,6 +144,24 @@ async function unpaywallOA(
 }
 
 /** 多源检索 + 去重 + OA 富化。 */
+/** 瞬时出站失败的有界重试:网络(fetch failed)、超时(abort)、5xx/429 才重试;4xx(404 等)
+ *  与最后一次直接抛。指数退避(400ms→800ms)。最坏 3×timeout + 1.2s,仍在容器 60s 调用窗内。 */
+async function withRetry<T>(fn: () => Promise<T>, attempts = 3, baseDelayMs = 400): Promise<T> {
+  let lastErr: unknown;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      return await fn();
+    } catch (e) {
+      lastErr = e;
+      const msg = errMsg(e);
+      const transient = /fetch failed|abort|terminated|ECONN|ETIMEDOUT|EAI_AGAIN|socket|network|upstream_5\d\d|upstream_429/i.test(msg);
+      if (!transient || i === attempts - 1) throw e;
+      await new Promise((r) => setTimeout(r, baseDelayMs * 2 ** i));
+    }
+  }
+  throw lastErr;
+}
+
 export async function searchMultiSource(
   input: LitSearchInput,
   deps: LitSearchDeps = {},
@@ -163,7 +183,11 @@ export async function searchMultiSource(
     arxiv: () => searchArxiv(input.query, opts),
   };
 
-  const settled = await Promise.allSettled(sources.map((s) => fns[s]()));
+  // 研究 API 出站走 master 全局 EnvHttpProxyAgent(→ 日本 sing-box 代理),偶发瞬时 fetch failed/
+  // 超时/5xx(boss #faa3c041:英文检索三源全 fetch failed、中文才成,即代理瞬时抖动)。每个源
+  // **整体重试**(重跑 searchX → 新 AbortController/signal,绕开复用已 abort 的 signal);只重试瞬时
+  // 类错误(网络/超时/5xx/429),4xx(如 404 not found)不重试。
+  const settled = await Promise.allSettled(sources.map((s) => withRetry(() => fns[s](), 3, deps.retryDelayMs ?? 400)));
   const all: SourceRecord[] = [];
   settled.forEach((r, i) => {
     if (r.status === "fulfilled") all.push(...r.value);

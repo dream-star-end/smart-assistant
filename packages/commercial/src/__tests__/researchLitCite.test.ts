@@ -180,10 +180,45 @@ describe("litSearch: dedup & merge", () => {
       { match: "api.crossref.org", status: 500 },
       { match: "export.arxiv.org", text: "<feed></feed>" },
     ]);
-    const res = await searchMultiSource({ query: "q" }, { fetchImpl: f });
+    const res = await searchMultiSource({ query: "q" }, { fetchImpl: f, retryDelayMs: 0 });
     assert.equal(res.sources.length, 1);
     assert.equal(res.sources[0].doi, "10.1/o");
     assert.ok(res.warnings.some((w) => w.includes("crossref")));
+  });
+
+  it("searchMultiSource:瞬时 fetch failed 自动重试后成功", async () => {
+    let calls = 0;
+    const f = (async (url: string | URL | Request) => {
+      const u = String(url);
+      if (u.includes("api.openalex.org")) {
+        calls++;
+        if (calls === 1) throw new TypeError("fetch failed"); // 第一次瞬时网络失败
+        return new Response(JSON.stringify({ results: [{ title: "OA", doi: "10.1/o" }] }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      return new Response("not used", { status: 404 });
+    }) as unknown as typeof fetch;
+    const res = await searchMultiSource({ query: "q", sources: ["openalex"] }, { fetchImpl: f, retryDelayMs: 0 });
+    assert.ok(calls >= 2, `应重试(实际调用 ${calls} 次)`);
+    assert.equal(res.sources.length, 1);
+    assert.equal(res.sources[0].doi, "10.1/o");
+  });
+
+  it("searchMultiSource:4xx(404)不重试,快速失败进 warnings", async () => {
+    let calls = 0;
+    const f = (async (url: string | URL | Request) => {
+      const u = String(url);
+      if (u.includes("api.openalex.org")) {
+        calls++;
+        return new Response("nope", { status: 404 }); // 非瞬时 → 不应重试
+      }
+      return new Response("x", { status: 404 });
+    }) as unknown as typeof fetch;
+    const res = await searchMultiSource({ query: "q", sources: ["openalex"] }, { fetchImpl: f, retryDelayMs: 0 });
+    assert.equal(calls, 1, "404 不应重试");
+    assert.ok(res.warnings.some((w) => w.includes("openalex")));
   });
 });
 
