@@ -223,6 +223,12 @@ body {
   white-space: break-spaces;
 }
 .prose pre { margin: 0 0 16px; }
+/* KaTeX 行间(显示)公式:KaTeX 默认 white-space:nowrap 且不做横向滚动,长公式(如泰勒
+   多项式展开)会撑破移动端视口宽度 → 整页出现横向滚动条。让公式在自身块内横向滚动,块宽
+   仍受容器约束,页面不再横滑。行内公式过长时由聊天区 overflow-x:hidden 兜底裁剪。
+   scope 到 .prose(katex-display 只出现在助手正文);padding-block 给极端 accent/大定界符
+   墨迹留余量,避免被 overflow-y:hidden 裁掉。 */
+.prose .katex-display { overflow-x: auto; overflow-y: hidden; padding-block: 0.08em; }
 
 /* highlight.js bridged to our tokens */
 .hljs { color: var(--fg); background: transparent; }
