@@ -1,5 +1,5 @@
-import { ArrowLeft, ArrowRight, Sparkles } from "lucide-react";
-import { useState } from "react";
+import { ArrowLeft, ArrowRight, Check, MailCheck, Sparkles } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
 import type { Theme } from "../hooks/useTheme";
 import { BRAND } from "../lib/brand";
 import { ThemeToggle } from "./ThemeToggle";
@@ -9,8 +9,18 @@ import { Button, Input, Spinner } from "./ui";
 /** 占位 token：canary 开启 TURNSTILE_TEST_BYPASS 时发它即可过（服务端 bypass 接受任意串）。*/
 const BYPASS_TOKEN = "bypass";
 
+/** 多模式鉴权表层：登录 / 注册 / 邮箱验证 / 忘记密码 / 重置密码。 */
+export type AuthMode = "login" | "register" | "verify" | "forgot" | "reset";
+
+const MIN_PW = 8;
+
 export function AuthGate({
   onLogin,
+  onRegister,
+  onVerifyEmail,
+  onResendVerification,
+  onRequestReset,
+  onConfirmReset,
   loading,
   error,
   onBack,
@@ -18,9 +28,29 @@ export function AuthGate({
   onCycleTheme,
   turnstileBypass,
   turnstileSiteKey,
+  allowRegistration = true,
+  requireEmailVerified = false,
+  initialMode = "login",
+  resetToken,
 }: {
-  // 第三参为 Turnstile token：bypass(含 config 加载中)发占位串，生产用真 widget token。
+  // 第三参为 Turnstile token：canary(bypass=true)发占位串 'bypass'；生产(bypass=false)为真
+  // widget token；config 未就绪(undefined)时 fail-closed（按钮禁用，绝不提交，绝不发占位）。
   onLogin: (email: string, password: string, turnstileToken: string) => void;
+  /** 注册（返回 verifyEmailSent 决定是否进入验证步）。 */
+  onRegister?: (input: {
+    email: string;
+    password: string;
+    displayName?: string;
+    turnstileToken: string;
+  }) => Promise<{ verifyEmailSent: boolean }>;
+  /** 邮箱验证（6 位验证码）。 */
+  onVerifyEmail?: (email: string, code: string) => Promise<void>;
+  /** 重发验证码。 */
+  onResendVerification?: (email: string) => Promise<void>;
+  /** 发起密码重置（发重置邮件）。 */
+  onRequestReset?: (email: string, turnstileToken: string) => Promise<void>;
+  /** 用邮件 token 完成密码重置。 */
+  onConfirmReset?: (token: string, newPassword: string) => Promise<void>;
   loading?: boolean;
   error?: string | null;
   onBack?: () => void;
@@ -30,25 +60,256 @@ export function AuthGate({
   turnstileBypass?: boolean;
   /** GET /api/public/config 的 turnstile_site_key（!bypass 时 render widget）。*/
   turnstileSiteKey?: string;
+  /** 是否允许注册（公开配置 allow_registration）；false 时隐藏注册入口。 */
+  allowRegistration?: boolean;
+  /** 是否强制邮箱验证后才能登录（公开配置 require_email_verified）。 */
+  requireEmailVerified?: boolean;
+  /** 初始模式：登录页用 login，「免费开始」用 register，重置链接用 reset。 */
+  initialMode?: AuthMode;
+  /** 重置密码邮件链接里的 token（mode=reset 时必有）。 */
+  resetToken?: string;
 }) {
+  const [mode, setMode] = useState<AuthMode>(initialMode);
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
+  const [confirmPw, setConfirmPw] = useState("");
+  const [displayName, setDisplayName] = useState("");
+  const [code, setCode] = useState("");
+  const [newPw, setNewPw] = useState("");
+  const [newPwConfirm, setNewPwConfirm] = useState("");
   // 真实 Turnstile token（仅 !bypass 且 widget onSuccess 后非空）。
   const [token, setToken] = useState<string | null>(null);
+  // 非 login 子流程的自管 loading / 错误 / 成功提示（login 仍用上层 loading/error props）。
+  const [busy, setBusy] = useState(false);
+  const [localErr, setLocalErr] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+  const [resetSent, setResetSent] = useState(false);
+  const [cooldown, setCooldown] = useState(0); // 重发验证码冷却秒数
 
-  // 三态 fail-closed：config 未就绪（undefined）既不发占位也不放行——避免生产（bypass 关闭）
-  // 在 config 拉取失败时用假 token 登录。仅 bypass===true（canary）发占位；bypass===false
-  // 渲染真 widget 且 token 到手前禁用。
+  // ── Turnstile 三态 fail-closed（与历史一致）──────────────────────────────
   const bypassKnown = typeof turnstileBypass === "boolean";
   const needsWidget = turnstileBypass === false;
-  // 提交时上传的 token：canary(bypass) 发占位串（行为不变）；生产用真 widget token。
   const submitToken = turnstileBypass === true ? BYPASS_TOKEN : token;
-  const canSubmit =
-    !loading &&
-    !!email.trim() &&
-    !!password &&
-    bypassKnown &&
-    (turnstileBypass === true || !!token);
+  // 仅 login/register/forgot 需要人机验证；verify(用验证码)/reset(用邮件 token)不需要。
+  const modeNeedsTurnstile = mode === "login" || mode === "register" || mode === "forgot";
+  const turnstileReady = bypassKnown && (turnstileBypass === true || !!token);
+
+  // 切换模式：复位瞬时态（token/错误/提示/busy），保留已填的 email/password 便于衔接。
+  // opGen 递增 → 让任何在途异步提交的迟到回调失效（防旧请求劫持新模式）。
+  function go(next: AuthMode) {
+    opGen.current += 1;
+    setMode(next);
+    setLocalErr(null);
+    setNotice(null);
+    setToken(null);
+    setBusy(false);
+    setResetSent(false);
+  }
+
+  // 重发验证码冷却倒计时：effect 驱动，自清理、卸载安全（无悬挂 interval）。
+  useEffect(() => {
+    if (cooldown <= 0) return;
+    const t = window.setTimeout(() => setCooldown((c) => c - 1), 1000);
+    return () => window.clearTimeout(t);
+  }, [cooldown]);
+
+  // 卸载/换代守卫：异步提交（注册/验证/重置等）的迟到回调，若组件已卸载或期间用户已切模式/
+  // 重新提交（opGen 递增），一律丢弃 —— 杜绝卸载后 setState 与「旧请求劫持新模式」。
+  const mountedRef = useRef(true);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
+  const opGen = useRef(0);
+  // 当前回调是否仍有效（组件在挂载且本次操作未被新操作/模式切换取代）。
+  const alive = (gen: number) => mountedRef.current && opGen.current === gen;
+
+  // 配置确认禁止注册后，若仍停在注册表单（如「免费开始」直接进 register），硬兜底回登录。
+  // opGen 递增：万一 config 动态刷新时有在途注册请求，迟到回调一并失效。
+  useEffect(() => {
+    if (mode === "register" && !allowRegistration) {
+      opGen.current += 1;
+      setMode("login");
+      setLocalErr(null);
+      setNotice("当前暂未开放注册，可先登录已有账号。");
+    }
+  }, [mode, allowRegistration]);
+
+  const busyNow = mode === "login" ? !!loading : busy;
+  const shownErr = mode === "login" ? error || localErr : localErr;
+
+  // ── 各模式提交 ───────────────────────────────────────────────────────────
+  function submitLogin() {
+    if (busyNow || !email.trim() || !password || !turnstileReady || !submitToken) return;
+    onLogin(email.trim(), password, submitToken);
+  }
+
+  async function submitRegister() {
+    // 配置确认禁止注册时拒绝提交（与隐藏入口 + 模式兜底配合，三重 fail-closed）。
+    if (!onRegister || !allowRegistration) return;
+    setLocalErr(null);
+    if (password.length < MIN_PW) {
+      setLocalErr(`密码至少 ${MIN_PW} 位`);
+      return;
+    }
+    if (password !== confirmPw) {
+      setLocalErr("两次输入的密码不一致");
+      return;
+    }
+    if (!turnstileReady || !submitToken) return;
+    const gen = ++opGen.current;
+    setBusy(true);
+    try {
+      const r = await onRegister({
+        email: email.trim(),
+        password,
+        displayName: displayName.trim() || undefined,
+        turnstileToken: submitToken,
+      });
+      if (!alive(gen)) return;
+      if (requireEmailVerified || r.verifyEmailSent) {
+        go("verify");
+        setNotice(
+          r.verifyEmailSent
+            ? `验证码已发送至 ${email.trim()}，请查收（含垃圾箱）。`
+            : "账号已创建，但验证邮件发送失败，请点下方重新发送。",
+        );
+        setCooldown(60);
+      } else {
+        go("login");
+        setNotice("注册成功，请登录。");
+      }
+    } catch (e) {
+      if (!alive(gen)) return;
+      setBusy(false);
+      setLocalErr((e as Error).message || "注册失败，请重试。");
+    }
+  }
+
+  async function submitVerify() {
+    if (!onVerifyEmail) return;
+    setLocalErr(null);
+    if (!/^\d{6}$/.test(code.trim())) {
+      setLocalErr("请输入 6 位数字验证码");
+      return;
+    }
+    const gen = ++opGen.current;
+    setBusy(true);
+    try {
+      await onVerifyEmail(email.trim(), code.trim());
+      if (!alive(gen)) return;
+      go("login");
+      setNotice("邮箱验证成功，请登录。");
+    } catch (e) {
+      if (!alive(gen)) return;
+      setBusy(false);
+      setLocalErr((e as Error).message || "验证失败，请检查验证码。");
+    }
+  }
+
+  async function resendCode() {
+    if (!onResendVerification || cooldown > 0) return;
+    setLocalErr(null);
+    const gen = opGen.current;
+    try {
+      await onResendVerification(email.trim());
+      if (!alive(gen)) return;
+      setNotice("验证码已重新发送，请查收。");
+      setCooldown(60);
+    } catch (e) {
+      if (!alive(gen)) return;
+      setLocalErr((e as Error).message || "发送失败，请稍后再试。");
+    }
+  }
+
+  async function submitForgot() {
+    if (!onRequestReset) return;
+    setLocalErr(null);
+    if (!email.trim()) {
+      setLocalErr("请输入邮箱");
+      return;
+    }
+    if (!turnstileReady || !submitToken) return;
+    const gen = ++opGen.current;
+    setBusy(true);
+    try {
+      await onRequestReset(email.trim(), submitToken);
+      if (!alive(gen)) return;
+      setBusy(false);
+      setResetSent(true);
+    } catch (e) {
+      if (!alive(gen)) return;
+      setBusy(false);
+      setLocalErr((e as Error).message || "发送失败，请重试。");
+    }
+  }
+
+  async function submitReset() {
+    if (!onConfirmReset || !resetToken) return;
+    setLocalErr(null);
+    if (newPw.length < MIN_PW) {
+      setLocalErr(`新密码至少 ${MIN_PW} 位`);
+      return;
+    }
+    if (newPw !== newPwConfirm) {
+      setLocalErr("两次输入的密码不一致");
+      return;
+    }
+    const gen = ++opGen.current;
+    setBusy(true);
+    try {
+      await onConfirmReset(resetToken, newPw);
+      if (!alive(gen)) return;
+      // 清掉 URL 上的重置 token，回到登录。
+      try {
+        window.history.replaceState({}, "", "/");
+      } catch {
+        /* ignore */
+      }
+      go("login");
+      setNotice("密码已重置，请用新密码登录。");
+    } catch (e) {
+      if (!alive(gen)) return;
+      setBusy(false);
+      setLocalErr((e as Error).message || "重置失败，链接可能已过期，请重新申请。");
+    }
+  }
+
+  const titles: Record<AuthMode, { h: string; sub: string }> = {
+    login: { h: `欢迎使用 ${BRAND.name}`, sub: BRAND.tagline },
+    register: { h: "创建账号", sub: "注册即可免费开始，每月赠 300 积分" },
+    verify: { h: "验证邮箱", sub: `验证码已发往 ${email.trim() || "你的邮箱"}` },
+    forgot: { h: "找回密码", sub: "输入注册邮箱，我们发你一个重置链接" },
+    reset: { h: "设置新密码", sub: "为你的账号设置一个新密码" },
+  };
+
+  // 真 widget 仅在需要人机验证的模式渲染；token 拿到前禁用提交。
+  const widget = modeNeedsTurnstile && needsWidget && (
+    <div className="flex justify-center">
+      <TurnstileWidget
+        key={mode}
+        siteKey={turnstileSiteKey ?? ""}
+        theme={theme === "system" ? "auto" : theme}
+        onToken={setToken}
+        onExpire={() => setToken(null)}
+        onError={() => setToken(null)}
+      />
+    </div>
+  );
+
+  const errBox = shownErr && (
+    <div className="rounded-xl border border-danger/30 bg-danger-soft px-3.5 py-2.5 text-[13px] text-danger">
+      {shownErr}
+    </div>
+  );
+  const noticeBox = notice && (
+    <div className="flex items-start gap-2 rounded-xl border border-success/30 bg-success-soft px-3.5 py-2.5 text-[13px] text-success">
+      <Check size={15} className="mt-0.5 shrink-0" />
+      <span>{notice}</span>
+    </div>
+  );
 
   return (
     <div className="relative flex min-h-screen items-center justify-center overflow-hidden bg-bg px-5">
@@ -60,94 +321,335 @@ export function AuthGate({
             "radial-gradient(60% 50% at 50% -10%, color-mix(in srgb, var(--accent) 16%, transparent), transparent 70%)",
         }}
       />
-      {onBack && (
-        <Button variant="ghost" size="sm" onClick={onBack} className="absolute left-4 top-4 gap-1.5 text-muted">
+      {onBack && mode !== "reset" && (
+        <Button
+          variant="ghost"
+          size="sm"
+          onClick={mode === "login" ? onBack : () => go("login")}
+          className="absolute left-4 top-4 gap-1.5 text-muted"
+        >
           <ArrowLeft size={15} />
-          返回首页
+          {mode === "login" ? "返回首页" : "返回登录"}
         </Button>
       )}
       <div className="absolute right-4 top-4">
         <ThemeToggle theme={theme} onCycle={onCycleTheme} />
       </div>
+
       <div className="relative w-full max-w-[400px] animate-in">
         <div className="mb-7 flex flex-col items-center text-center">
           <span className="mb-4 flex size-12 items-center justify-center rounded-xl2 bg-grad-cta text-white shadow-float">
             <Sparkles size={24} />
           </span>
-          <h1 className="text-[22px] font-semibold tracking-tight text-fg">欢迎使用 {BRAND.name}</h1>
-          <p className="mt-1.5 text-[14px] text-muted">{BRAND.tagline}</p>
+          <h1 className="text-[22px] font-semibold tracking-tight text-fg">{titles[mode].h}</h1>
+          <p className="mt-1.5 text-[14px] text-muted">{titles[mode].sub}</p>
         </div>
 
-        <form
-          onSubmit={(e) => {
-            e.preventDefault();
-            // fail-closed：无有效 token 绝不提交（生产不会误发占位 'bypass'）。
-            if (!canSubmit || !submitToken) return;
-            onLogin(email.trim(), password, submitToken);
-          }}
-          className="flex flex-col gap-3 rounded-xl border border-border bg-surface p-5 shadow-soft"
-        >
-          <label className="flex flex-col gap-1.5">
-            <span className="text-[13px] font-medium text-muted">邮箱</span>
-            <Input
-              value={email}
-              onChange={(e) => setEmail(e.target.value)}
-              type="email"
-              autoComplete="email"
-              placeholder="邮箱"
-              className="rounded-xl bg-bg"
-            />
-          </label>
-          <label className="flex flex-col gap-1.5">
-            <span className="text-[13px] font-medium text-muted">密码</span>
-            <Input
-              value={password}
-              onChange={(e) => setPassword(e.target.value)}
-              type="password"
-              autoComplete="current-password"
-              placeholder="密码"
-              className="rounded-xl bg-bg"
-            />
-          </label>
-
-          {error && (
-            <div className="rounded-xl border border-danger/30 bg-danger-soft px-3.5 py-2.5 text-[13px] text-danger">
-              {error}
-            </div>
-          )}
-
-          {/* 生产（bypass 关闭）才渲染真实人机验证；token 拿到前禁用登录。canary(bypass) 跳过。 */}
-          {needsWidget && (
-            <div className="flex justify-center">
-              <TurnstileWidget
-                siteKey={turnstileSiteKey ?? ""}
-                theme={theme === "system" ? "auto" : theme}
-                onToken={setToken}
-                onExpire={() => setToken(null)}
-                onError={() => setToken(null)}
+        {/* ── 登录 ── */}
+        {mode === "login" && (
+          <form
+            onSubmit={(e) => {
+              e.preventDefault();
+              submitLogin();
+            }}
+            className="flex flex-col gap-3 rounded-xl border border-border bg-surface p-5 shadow-soft"
+          >
+            <label className="flex flex-col gap-1.5">
+              <span className="text-[13px] font-medium text-muted">邮箱</span>
+              <Input
+                value={email}
+                onChange={(e) => setEmail(e.target.value)}
+                type="email"
+                autoComplete="email"
+                placeholder="邮箱"
+                className="rounded-xl bg-bg"
+              />
+            </label>
+            <div className="flex flex-col gap-1.5">
+              <div className="flex items-center justify-between">
+                <span className="text-[13px] font-medium text-muted">密码</span>
+                {onRequestReset && (
+                  <button
+                    type="button"
+                    onClick={() => go("forgot")}
+                    className="text-[12.5px] text-accent hover:underline"
+                  >
+                    忘记密码？
+                  </button>
+                )}
+              </div>
+              <Input
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                type="password"
+                autoComplete="current-password"
+                placeholder="密码"
+                aria-label="密码"
+                className="rounded-xl bg-bg"
               />
             </div>
-          )}
 
-          <Button
-            type="submit"
-            variant="primary"
-            disabled={!canSubmit}
-            className="mt-1 w-full gap-2 rounded-xl text-[14.5px]"
+            {errBox}
+            {noticeBox}
+            {widget}
+
+            <Button
+              type="submit"
+              variant="primary"
+              disabled={busyNow || !email.trim() || !password || !turnstileReady}
+              className="mt-1 w-full gap-2 rounded-xl text-[14.5px]"
+            >
+              {busyNow ? <Spinner size={17} /> : (<>登录<ArrowRight size={16} /></>)}
+            </Button>
+
+            {allowRegistration && onRegister && (
+              <p className="mt-1 text-center text-[13px] text-muted">
+                还没有账号？
+                <button type="button" onClick={() => go("register")} className="ml-1 font-medium text-accent hover:underline">
+                  立即注册
+                </button>
+              </p>
+            )}
+          </form>
+        )}
+
+        {/* ── 注册 ── */}
+        {mode === "register" && (
+          <form
+            onSubmit={(e) => {
+              e.preventDefault();
+              void submitRegister();
+            }}
+            className="flex flex-col gap-3 rounded-xl border border-border bg-surface p-5 shadow-soft"
           >
-            {loading ? (
-              <Spinner size={17} />
+            <label className="flex flex-col gap-1.5">
+              <span className="text-[13px] font-medium text-muted">邮箱</span>
+              <Input
+                value={email}
+                onChange={(e) => setEmail(e.target.value)}
+                type="email"
+                autoComplete="email"
+                placeholder="邮箱"
+                className="rounded-xl bg-bg"
+              />
+            </label>
+            <label className="flex flex-col gap-1.5">
+              <span className="text-[13px] font-medium text-muted">昵称（可选）</span>
+              <Input
+                value={displayName}
+                onChange={(e) => setDisplayName(e.target.value)}
+                type="text"
+                autoComplete="nickname"
+                placeholder="怎么称呼你"
+                className="rounded-xl bg-bg"
+              />
+            </label>
+            <label className="flex flex-col gap-1.5">
+              <span className="text-[13px] font-medium text-muted">密码</span>
+              <Input
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                type="password"
+                autoComplete="new-password"
+                placeholder={`至少 ${MIN_PW} 位`}
+                className="rounded-xl bg-bg"
+              />
+            </label>
+            <label className="flex flex-col gap-1.5">
+              <span className="text-[13px] font-medium text-muted">确认密码</span>
+              <Input
+                value={confirmPw}
+                onChange={(e) => setConfirmPw(e.target.value)}
+                type="password"
+                autoComplete="new-password"
+                placeholder="再输一次密码"
+                className="rounded-xl bg-bg"
+              />
+            </label>
+
+            {errBox}
+            {widget}
+
+            <Button
+              type="submit"
+              variant="primary"
+              disabled={busyNow || !email.trim() || !password || !confirmPw || !turnstileReady}
+              className="mt-1 w-full gap-2 rounded-xl text-[14.5px]"
+            >
+              {busyNow ? <Spinner size={17} /> : (<>创建账号<ArrowRight size={16} /></>)}
+            </Button>
+
+            <p className="mt-1 text-center text-[13px] text-muted">
+              已有账号？
+              <button type="button" onClick={() => go("login")} className="ml-1 font-medium text-accent hover:underline">
+                去登录
+              </button>
+            </p>
+          </form>
+        )}
+
+        {/* ── 邮箱验证 ── */}
+        {mode === "verify" && (
+          <form
+            onSubmit={(e) => {
+              e.preventDefault();
+              void submitVerify();
+            }}
+            className="flex flex-col gap-3 rounded-xl border border-border bg-surface p-5 shadow-soft"
+          >
+            {noticeBox}
+            <label className="flex flex-col gap-1.5">
+              <span className="text-[13px] font-medium text-muted">6 位验证码</span>
+              <Input
+                value={code}
+                onChange={(e) => setCode(e.target.value.replace(/\D/g, "").slice(0, 6))}
+                inputMode="numeric"
+                autoComplete="one-time-code"
+                placeholder="请输入邮箱里的 6 位验证码"
+                className="rounded-xl bg-bg text-center text-[18px] tracking-[0.4em]"
+              />
+            </label>
+
+            {errBox}
+
+            <Button
+              type="submit"
+              variant="primary"
+              disabled={busyNow || !/^\d{6}$/.test(code.trim())}
+              className="mt-1 w-full gap-2 rounded-xl text-[14.5px]"
+            >
+              {busyNow ? <Spinner size={17} /> : (<>验证并继续<ArrowRight size={16} /></>)}
+            </Button>
+
+            {onResendVerification && (
+              <button
+                type="button"
+                onClick={() => void resendCode()}
+                disabled={cooldown > 0}
+                className="mt-1 text-center text-[13px] text-accent hover:underline disabled:text-faint disabled:no-underline"
+              >
+                {cooldown > 0 ? `重新发送（${cooldown}s）` : "没收到？重新发送验证码"}
+              </button>
+            )}
+          </form>
+        )}
+
+        {/* ── 忘记密码（发重置邮件）── */}
+        {mode === "forgot" && (
+          <form
+            onSubmit={(e) => {
+              e.preventDefault();
+              void submitForgot();
+            }}
+            className="flex flex-col gap-3 rounded-xl border border-border bg-surface p-5 shadow-soft"
+          >
+            {resetSent ? (
+              <div className="flex flex-col items-center gap-3 py-3 text-center">
+                <span className="flex size-12 items-center justify-center rounded-full bg-success-soft text-success">
+                  <MailCheck size={26} />
+                </span>
+                <p className="text-[14px] text-fg">
+                  如果 <span className="font-medium">{email.trim()}</span> 已注册，重置链接已发出。
+                </p>
+                <p className="text-[12.5px] text-faint">请查收邮件（含垃圾箱），点击链接设置新密码。</p>
+                <Button variant="secondary" onClick={() => go("login")} className="mt-1 rounded-xl">
+                  返回登录
+                </Button>
+              </div>
             ) : (
               <>
-                登录
-                <ArrowRight size={16} />
+                <label className="flex flex-col gap-1.5">
+                  <span className="text-[13px] font-medium text-muted">邮箱</span>
+                  <Input
+                    value={email}
+                    onChange={(e) => setEmail(e.target.value)}
+                    type="email"
+                    autoComplete="email"
+                    placeholder="注册邮箱"
+                    className="rounded-xl bg-bg"
+                  />
+                </label>
+
+                {errBox}
+                {widget}
+
+                <Button
+                  type="submit"
+                  variant="primary"
+                  disabled={busyNow || !email.trim() || !turnstileReady}
+                  className="mt-1 w-full gap-2 rounded-xl text-[14.5px]"
+                >
+                  {busyNow ? <Spinner size={17} /> : (<>发送重置链接<ArrowRight size={16} /></>)}
+                </Button>
+
+                <p className="mt-1 text-center text-[13px] text-muted">
+                  想起来了？
+                  <button type="button" onClick={() => go("login")} className="ml-1 font-medium text-accent hover:underline">
+                    返回登录
+                  </button>
+                </p>
               </>
             )}
-          </Button>
-        </form>
-        <p className="mt-4 text-center text-[12px] text-faint">
-          全能助手 · 流式对话 · 持久会话
-        </p>
+          </form>
+        )}
+
+        {/* ── 重置密码（邮件链接 token）── */}
+        {mode === "reset" && (
+          <form
+            onSubmit={(e) => {
+              e.preventDefault();
+              void submitReset();
+            }}
+            className="flex flex-col gap-3 rounded-xl border border-border bg-surface p-5 shadow-soft"
+          >
+            {!resetToken ? (
+              <div className="flex flex-col items-center gap-3 py-3 text-center">
+                <p className="text-[14px] text-fg">重置链接无效或缺少 token。</p>
+                <Button variant="secondary" onClick={() => go("forgot")} className="rounded-xl">
+                  重新申请重置
+                </Button>
+              </div>
+            ) : (
+              <>
+                <label className="flex flex-col gap-1.5">
+                  <span className="text-[13px] font-medium text-muted">新密码</span>
+                  <Input
+                    value={newPw}
+                    onChange={(e) => setNewPw(e.target.value)}
+                    type="password"
+                    autoComplete="new-password"
+                    placeholder={`至少 ${MIN_PW} 位`}
+                    className="rounded-xl bg-bg"
+                  />
+                </label>
+                <label className="flex flex-col gap-1.5">
+                  <span className="text-[13px] font-medium text-muted">确认新密码</span>
+                  <Input
+                    value={newPwConfirm}
+                    onChange={(e) => setNewPwConfirm(e.target.value)}
+                    type="password"
+                    autoComplete="new-password"
+                    placeholder="再输一次新密码"
+                    className="rounded-xl bg-bg"
+                  />
+                </label>
+
+                {errBox}
+
+                <Button
+                  type="submit"
+                  variant="primary"
+                  disabled={busyNow || newPw.length < MIN_PW || !newPwConfirm}
+                  className="mt-1 w-full gap-2 rounded-xl text-[14.5px]"
+                >
+                  {busyNow ? <Spinner size={17} /> : (<>重置密码<ArrowRight size={16} /></>)}
+                </Button>
+              </>
+            )}
+          </form>
+        )}
+
+        <p className="mt-4 text-center text-[12px] text-faint">全能助手 · 流式对话 · 持久会话</p>
       </div>
     </div>
   );

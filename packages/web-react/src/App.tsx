@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AgentGate } from "./components/AgentGate";
 import { AgentPicker } from "./components/AgentPicker";
-import { AuthGate } from "./components/AuthGate";
+import { AuthGate, type AuthMode } from "./components/AuthGate";
 import { ChatHeader } from "./components/ChatHeader";
 import { Composer } from "./components/Composer";
 import { extractLatestTodos, PinnedTaskTracker } from "./components/chat/PinnedTaskTracker";
@@ -110,8 +110,16 @@ function genWsSessionId(): string {
 export function App() {
   const params = new URLSearchParams(location.search);
   const demo = params.get("demo") === "1";
+  // 密码重置邮件链接：/reset-password?token=…（gateway SPA fallback 对无扩展名路径回退
+  // index.html，故 SPA 能接住）。启动即检测 → 直接进入 AuthGate 的 reset 模式。
+  const resetToken =
+    !demo && location.pathname === "/reset-password"
+      ? params.get("token") || undefined
+      : undefined;
   // access token 仅存内存，刷新即丢失，所以启动一律落到首页/登录（无自动登录）。
-  const [view, setView] = useState<"home" | "app">("home");
+  const [view, setView] = useState<"home" | "app">(resetToken ? "app" : "home");
+  // AuthGate 初始模式：「登录」入口=login，「免费开始」入口=register，重置链接=reset。
+  const [authMode, setAuthMode] = useState<AuthMode>(resetToken ? "reset" : "login");
   // 主题的唯一权威源：useTheme 是「挂载读 localStorage」的单实例，经 props 下传给顶栏快捷开关
   // 与设置中心「偏好·外观」分区，二者共享同一状态——杜绝多个 useTheme 实例各自镜像、互不同步。
   const { theme, setTheme, cycle } = useTheme();
@@ -234,6 +242,37 @@ export function App() {
       setAuthLoading(false);
     }
   }, []);
+
+  // 注册 / 邮箱验证 / 找回密码：透传到 api（错误为带友好中文 message 的 ApiError，AuthGate 自捕展示）。
+  const register = useCallback(
+    (input: { email: string; password: string; displayName?: string; turnstileToken: string }) =>
+      api
+        .register({
+          email: input.email,
+          password: input.password,
+          displayName: input.displayName,
+          turnstileToken: input.turnstileToken,
+        })
+        .then((r) => ({ verifyEmailSent: r.verifyEmailSent })),
+    [],
+  );
+  const verifyEmail = useCallback(
+    (email: string, code: string) => api.verifyEmail(email, code).then(() => undefined),
+    [],
+  );
+  const resendVerification = useCallback(
+    (email: string) => api.resendVerification(email).then(() => undefined),
+    [],
+  );
+  const requestReset = useCallback(
+    (email: string, token: string) => api.requestPasswordReset(email, token).then(() => undefined),
+    [],
+  );
+  const confirmReset = useCallback(
+    (token: string, newPassword: string) =>
+      api.confirmPasswordReset(token, newPassword).then(() => undefined),
+    [],
+  );
 
   // IndexedDB 注水回调：把本地会话填进侧栏（本地优先；随后 listSessions server-wins 覆盖元数据）。
   const onHydrated = useCallback(
@@ -697,8 +736,14 @@ export function App() {
   if (!demo && view === "home") {
     return (
       <Landing
-        onStart={() => setView("app")}
-        onLogin={() => setView("app")}
+        onStart={() => {
+          setAuthMode("register");
+          setView("app");
+        }}
+        onLogin={() => {
+          setAuthMode("login");
+          setView("app");
+        }}
         theme={theme}
         onCycleTheme={cycle}
       />
@@ -708,13 +753,25 @@ export function App() {
     return (
       <AuthGate
         onLogin={login}
+        onRegister={register}
+        onVerifyEmail={verifyEmail}
+        onResendVerification={resendVerification}
+        onRequestReset={requestReset}
+        onConfirmReset={confirmReset}
         loading={authLoading}
         error={authError}
-        onBack={() => setView("home")}
+        onBack={() => {
+          setAuthMode("login");
+          setView("home");
+        }}
         theme={theme}
         onCycleTheme={cycle}
         turnstileBypass={publicCfg?.turnstileBypass}
         turnstileSiteKey={publicCfg?.turnstileSiteKey}
+        allowRegistration={publicCfg?.allowRegistration ?? true}
+        requireEmailVerified={publicCfg?.requireEmailVerified ?? false}
+        initialMode={authMode}
+        resetToken={resetToken}
       />
     );
   }

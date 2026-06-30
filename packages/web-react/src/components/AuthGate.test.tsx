@@ -1,12 +1,13 @@
 import "@testing-library/jest-dom/vitest";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import { AuthGate } from "./AuthGate";
 
 // ---------------------------------------------------------------------------
-// P6 Turnstile 门控（AuthGate）：
-//  - bypass=true / undefined(config 加载中) → 不渲染 widget，发占位 'bypass'（canary 不变）。
-//  - bypass=false → 渲染真实 widget，token 拿到前禁用登录（生产硬 cutover blocker）。
+// P6 Turnstile 门控（AuthGate，三态 fail-closed）：
+//  - bypass=true（canary）→ 不渲染 widget，登录发占位 'bypass'。
+//  - bypass=undefined（config 未就绪/失败）→ 不渲染 widget，但禁用登录、绝不发占位 token。
+//  - bypass=false（生产）→ 渲染真实 widget，token 拿到前禁用登录（硬 cutover blocker）。
 //    注：headless 无法完成真实 CF 挑战，这里只验证「渲染 + 禁用 gating」，token 流转
 //    待 canary 关闭 bypass 后浏览器侧验证。
 // ---------------------------------------------------------------------------
@@ -54,5 +55,123 @@ describe("AuthGate — Turnstile gating", () => {
     expect(btn).toBeDisabled(); // 无 token，绝不放行
     fireEvent.click(btn);
     expect(onLogin).not.toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 多模式：注册 / 邮箱验证 / 忘记密码 / 重置密码。
+// ---------------------------------------------------------------------------
+
+describe("AuthGate — 注册", () => {
+  test("login 模式提供注册入口；切换后填表提交带 bypass token，verifyEmailSent → 进入验证步", async () => {
+    const onRegister = vi.fn().mockResolvedValue({ verifyEmailSent: true });
+    render(<AuthGate {...base} onLogin={vi.fn()} onRegister={onRegister} turnstileBypass={true} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "立即注册" }));
+    fireEvent.change(screen.getByPlaceholderText("邮箱"), { target: { value: "a@b.com" } });
+    fireEvent.change(screen.getByPlaceholderText("至少 8 位"), { target: { value: "password123" } });
+    fireEvent.change(screen.getByPlaceholderText("再输一次密码"), {
+      target: { value: "password123" },
+    });
+
+    const btn = screen.getByRole("button", { name: /创建账号/ });
+    expect(btn).not.toBeDisabled();
+    await act(async () => {
+      fireEvent.click(btn);
+    });
+    expect(onRegister).toHaveBeenCalledWith(
+      expect.objectContaining({ email: "a@b.com", password: "password123", turnstileToken: "bypass" }),
+    );
+    await waitFor(() =>
+      expect(screen.getByPlaceholderText(/6 位验证码/)).toBeInTheDocument(),
+    );
+  });
+
+  test("两次密码不一致 → 报错且不调用 onRegister", () => {
+    const onRegister = vi.fn();
+    render(<AuthGate {...base} onLogin={vi.fn()} onRegister={onRegister} turnstileBypass={true} />);
+    fireEvent.click(screen.getByRole("button", { name: "立即注册" }));
+    fireEvent.change(screen.getByPlaceholderText("邮箱"), { target: { value: "a@b.com" } });
+    fireEvent.change(screen.getByPlaceholderText("至少 8 位"), { target: { value: "password123" } });
+    fireEvent.change(screen.getByPlaceholderText("再输一次密码"), { target: { value: "different9" } });
+    fireEvent.click(screen.getByRole("button", { name: /创建账号/ }));
+    expect(screen.getByText("两次输入的密码不一致")).toBeInTheDocument();
+    expect(onRegister).not.toHaveBeenCalled();
+  });
+
+  test("allowRegistration=false 时不显示注册入口", () => {
+    render(
+      <AuthGate
+        {...base}
+        onLogin={vi.fn()}
+        onRegister={vi.fn()}
+        allowRegistration={false}
+        turnstileBypass={true}
+      />,
+    );
+    expect(screen.queryByRole("button", { name: "立即注册" })).not.toBeInTheDocument();
+  });
+
+  test("initialMode=register 但 allowRegistration=false → 硬兜底回登录并提示", async () => {
+    render(
+      <AuthGate
+        {...base}
+        onLogin={vi.fn()}
+        onRegister={vi.fn()}
+        initialMode="register"
+        allowRegistration={false}
+        turnstileBypass={true}
+      />,
+    );
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: /登录/ })).toBeInTheDocument(),
+    );
+    expect(screen.queryByRole("button", { name: /创建账号/ })).not.toBeInTheDocument();
+    expect(screen.getByText(/暂未开放注册/)).toBeInTheDocument();
+  });
+});
+
+describe("AuthGate — 忘记密码", () => {
+  test("提交后调用 onRequestReset 并展示已发送确认", async () => {
+    const onRequestReset = vi.fn().mockResolvedValue(undefined);
+    render(
+      <AuthGate {...base} onLogin={vi.fn()} onRequestReset={onRequestReset} turnstileBypass={true} />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "忘记密码？" }));
+    fireEvent.change(screen.getByPlaceholderText("注册邮箱"), { target: { value: "a@b.com" } });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /发送重置链接/ }));
+    });
+    expect(onRequestReset).toHaveBeenCalledWith("a@b.com", "bypass");
+    await waitFor(() => expect(screen.getByText(/重置链接已发出/)).toBeInTheDocument());
+  });
+});
+
+describe("AuthGate — 重置密码", () => {
+  test("initialMode=reset + token：提交调用 onConfirmReset(token, 新密码)", async () => {
+    const onConfirmReset = vi.fn().mockResolvedValue(undefined);
+    render(
+      <AuthGate
+        {...base}
+        onLogin={vi.fn()}
+        onConfirmReset={onConfirmReset}
+        initialMode="reset"
+        resetToken="tok-123"
+      />,
+    );
+    fireEvent.change(screen.getByPlaceholderText("至少 8 位"), { target: { value: "newpass123" } });
+    fireEvent.change(screen.getByPlaceholderText("再输一次新密码"), {
+      target: { value: "newpass123" },
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /重置密码/ }));
+    });
+    expect(onConfirmReset).toHaveBeenCalledWith("tok-123", "newpass123");
+  });
+
+  test("无 token 时提示无效并给出重新申请入口", () => {
+    render(<AuthGate {...base} onLogin={vi.fn()} onConfirmReset={vi.fn()} initialMode="reset" />);
+    expect(screen.getByText(/重置链接无效/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /重新申请重置/ })).toBeInTheDocument();
   });
 });

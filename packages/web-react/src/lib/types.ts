@@ -392,6 +392,36 @@ export type HupiCreateResult = {
   expiresAt: string;
 };
 
+// ─── 月度订阅（0096） ────────────────────────────────────────────────────
+
+/** 套餐档（GET /api/subscription/plans）。金额/积分字符串大数。 */
+export type SubscriptionPlanWire = {
+  code: string;
+  name: string;
+  priceCents: string;
+  monthlyCredits: string;
+  periodDays: number;
+  /** 档位高低（升档判定）。 */
+  tier: number;
+};
+
+/** 当前订阅 + 双钱包余额（GET /api/subscription/me）。 */
+export type MySubscription = {
+  planCode: string;
+  planName: string;
+  status: string;
+  periodStart: string;
+  periodEnd: string;
+  /** 当期套餐期内桶余额。 */
+  periodCredits: string;
+  monthlyCredits: string;
+  priceCents: string;
+  tier: number;
+  paid: boolean;
+  /** 双钱包明细：wallet 持久钱包 + period 期内桶 = total 总可用。 */
+  balance: { wallet: string; period: string; total: string };
+};
+
 /** 订单视图（GET /api/payment/orders/:orderNo，轮询）。status: pending|paid|expired|... */
 export type PaymentOrder = {
   orderNo: string;

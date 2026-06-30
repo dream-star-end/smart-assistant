@@ -9,10 +9,10 @@
 export const BRAND = {
   name: "Aurora",
   nameEn: "Aurora",
-  tagline: "全能助手 · 按需生长",
+  tagline: "开箱即用 · 越用越懂你",
   // 中性 slogan 占位（不含任何典故/地域绑定）。
-  slogan: "一个全能助手起步，按需加装更多能力",
-  intro: "默认配备一位全能助手 —— 开箱即用；需要更专业时，从 AI 市场一键安装技能与专家智能体，让它越用越强。",
+  slogan: "开箱即用的 AI 助手，越用越好用，越用越懂你",
+  intro: "默认配备一位全能助手 —— 开箱即用；需要更专业时，从 AI 市场一键安装技能与专家智能体；你的偏好它会记住，越用越懂你。",
   // 运营主体 / 备案号上线前回填，先用中性占位。
   company: "Aurora",
   companyShort: "Aurora",

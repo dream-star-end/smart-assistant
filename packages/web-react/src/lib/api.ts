@@ -35,6 +35,8 @@ import type {
   RegisterResult,
   SessionDetail,
   SessionMeta,
+  SubscriptionPlanWire,
+  MySubscription,
   UsageQuery,
   UsageResponse,
   User,
@@ -221,6 +223,24 @@ async function jsonOrThrow<T>(p: Promise<Response> | Response): Promise<T> {
   return (await res.json()) as T;
 }
 
+/** 订阅/升档下单响应 → HupiCreateResult（与 hupi/create 同形，复用 QR + 订单轮询）。 */
+function parseSubscriptionOrder(p: Promise<Response>): Promise<HupiCreateResult> {
+  return jsonOrThrow<{
+    ok: boolean;
+    data: {
+      order_no: string; qrcode_url: string; mobile_url: string | null;
+      amount_cents: string; credits: string; expires_at: string;
+    };
+  }>(p).then((b) => ({
+    orderNo: b.data.order_no,
+    qrcodeUrl: b.data.qrcode_url,
+    mobileUrl: b.data.mobile_url,
+    amountCents: b.data.amount_cents,
+    credits: b.data.credits,
+    expiresAt: b.data.expires_at,
+  }));
+}
+
 // ─── v5 后端 wire 形态 → 前端类型适配 ────────────────────────────────
 type WireUser = {
   id: string;
@@ -369,6 +389,45 @@ export const api = {
         headers: { Accept: "application/json" },
       }),
     );
+  },
+
+  /**
+   * 发起密码重置（POST /api/auth/request-password-reset）。后端防枚举：无论邮箱是否存在
+   * 恒返 200 + accepted（仅 turnstile 校验失败会 400 TURNSTILE_FAILED）。校验通过后后端给
+   * 该邮箱发一封含 `/reset-password?token=…` 链接的邮件，用户点链接回站内走 confirmPasswordReset。
+   * turnstileToken：开启 Turnstile 时必填（生产）；canary bypass 发占位串即可。
+   */
+  requestPasswordReset(email: string, turnstileToken?: string): Promise<{ accepted: boolean }> {
+    return jsonOrThrow<{ accepted: boolean }>(
+      fetch("/api/auth/request-password-reset", {
+        method: "POST",
+        credentials: "include",
+        headers: { Accept: "application/json", "content-type": "application/json" },
+        body: JSON.stringify({
+          email,
+          ...(turnstileToken ? { turnstile_token: turnstileToken } : {}),
+        }),
+      }),
+    );
+  },
+
+  /**
+   * 完成密码重置（POST /api/auth/confirm-password-reset）。token 来自重置邮件链接的
+   * `?token=` 参数；成功后该用户**所有未吊销的 refresh token 全部被撤销**（强制各端重登）。
+   * token 失效 / 过期 / 已用 / 新密码不合规 → 400（经 ApiError 抛，调用方据 message 提示）。
+   */
+  confirmPasswordReset(
+    token: string,
+    newPassword: string,
+  ): Promise<{ userId: string; revokedRefreshTokens: number }> {
+    return jsonOrThrow<{ user_id: string; revoked_refresh_tokens: number }>(
+      fetch("/api/auth/confirm-password-reset", {
+        method: "POST",
+        credentials: "include",
+        headers: { Accept: "application/json", "content-type": "application/json" },
+        body: JSON.stringify({ token, new_password: newPassword }),
+      }),
+    ).then((b) => ({ userId: b.user_id, revokedRefreshTokens: b.revoked_refresh_tokens }));
   },
 
   // ── 账户 ───────────────────────────────────────────────────────────
@@ -937,6 +996,102 @@ export const api = {
       createdAt: b.data.created_at,
       provider: b.data.provider,
     })),
+
+  // ── 月度订阅（0096，commercial REST） ──────────────────────────────────────
+
+  /** 套餐档列表（GET /api/subscription/plans，公开）。金额/积分字符串大数。 */
+  async listSubscriptionPlans(): Promise<SubscriptionPlanWire[]> {
+    const b = await jsonOrThrow<{
+      ok: boolean;
+      data: {
+        plans: Array<{
+          code: string; name: string; price_cents: string;
+          monthly_credits: string; period_days: number; tier: number;
+        }>;
+      };
+    }>(fetch("/api/subscription/plans", { headers: { Accept: "application/json" } }));
+    return (b.data?.plans || []).map((p) => ({
+      code: p.code,
+      name: p.name,
+      priceCents: p.price_cents,
+      monthlyCredits: p.monthly_credits,
+      periodDays: p.period_days,
+      tier: p.tier,
+    }));
+  },
+
+  /** 当前订阅 + 双钱包余额明细（GET /api/subscription/me，Bearer）。 */
+  getMySubscription: (a: AuthSession): Promise<MySubscription> =>
+    jsonOrThrow<{
+      ok: boolean;
+      data: {
+        subscription: {
+          plan_code: string; plan_name: string; status: string;
+          period_start: string; period_end: string; period_credits: string;
+          monthly_credits: string; price_cents: string; tier: number; paid: boolean;
+        };
+        balance: { wallet: string; period: string; total: string };
+      };
+    }>(
+      callWithRefresh(a, (t) =>
+        fetch("/api/subscription/me", { credentials: "include", headers: bearerHeaders(t) }),
+      ),
+    ).then((b) => ({
+      planCode: b.data.subscription.plan_code,
+      planName: b.data.subscription.plan_name,
+      status: b.data.subscription.status,
+      periodStart: b.data.subscription.period_start,
+      periodEnd: b.data.subscription.period_end,
+      periodCredits: b.data.subscription.period_credits,
+      monthlyCredits: b.data.subscription.monthly_credits,
+      priceCents: b.data.subscription.price_cents,
+      tier: b.data.subscription.tier,
+      paid: b.data.subscription.paid,
+      balance: {
+        wallet: b.data.balance.wallet,
+        period: b.data.balance.period,
+        total: b.data.balance.total,
+      },
+    })),
+
+  /** 购买/续费某档（POST /api/subscription/subscribe，Bearer）→ 虎皮椒扫码（同 hupi/create 形）。 */
+  subscribe: (a: AuthSession, planCode: string): Promise<HupiCreateResult> =>
+    parseSubscriptionOrder(
+      callWithRefresh(a, (t) =>
+        fetch("/api/subscription/subscribe", {
+          method: "POST",
+          credentials: "include",
+          headers: bearerHeaders(t, true),
+          body: JSON.stringify({ plan_code: planCode }),
+        }),
+      ),
+    ),
+
+  /** 升档（补差价，POST /api/subscription/upgrade，Bearer）→ 扫码。 */
+  upgradeSubscription: (a: AuthSession, planCode: string): Promise<HupiCreateResult> =>
+    parseSubscriptionOrder(
+      callWithRefresh(a, (t) =>
+        fetch("/api/subscription/upgrade", {
+          method: "POST",
+          credentials: "include",
+          headers: bearerHeaders(t, true),
+          body: JSON.stringify({ plan_code: planCode }),
+        }),
+      ),
+    ),
+
+  /** 购买积分加量包（进期内桶，POST /api/subscription/pack，Bearer）→ 扫码。v5 专属，与 v3 隔离。 */
+  buyPack: (a: AuthSession): Promise<HupiCreateResult> =>
+    parseSubscriptionOrder(
+      callWithRefresh(a, (t) =>
+        fetch("/api/subscription/pack", {
+          method: "POST",
+          credentials: "include",
+          headers: bearerHeaders(t, true),
+          body: "{}",
+        }),
+      ),
+    ),
 
   // ── 容器内管理（记忆 / 定时任务 / 技能；经 commercial router 自动代理进用户容器） ──
   //

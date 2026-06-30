@@ -1,10 +1,17 @@
-import { Plus, Wallet } from "lucide-react";
+import { Crown, Plus, Wallet } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
 import { api } from "../../lib/api";
-import type { AuthSession, UsageLedgerRow, User } from "../../lib/types";
+import type { AuthSession, MySubscription, UsageLedgerRow, User } from "../../lib/types";
 import { cn, formatCredits } from "../../lib/utils";
 import { Alert, Button, Spinner } from "../ui";
 import { ledgerReasonLabel, shortTime } from "./labels";
+
+function fmtDate(iso: string): string {
+  const d = new Date(iso);
+  return Number.isNaN(d.getTime())
+    ? "—"
+    : `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+}
 
 const LEDGER_PAGE = 20;
 
@@ -15,13 +22,14 @@ const LEDGER_PAGE = 20;
 export function AccountTab({
   auth,
   user,
-  onTopup,
+  onManageSub,
   reloadKey,
 }: {
   auth: AuthSession;
   user: User | null;
-  onTopup: () => void;
-  /** 外部（充值到账）变更时 +1，触发流水重拉。 */
+  /** 打开订阅中心（套餐 + 加量包）。 */
+  onManageSub: () => void;
+  /** 外部（订阅/加量包到账）变更时 +1，触发流水 + 订阅重拉。 */
   reloadKey: number;
 }) {
   const [rows, setRows] = useState<UsageLedgerRow[]>([]);
@@ -29,6 +37,23 @@ export function AccountTab({
   const [loading, setLoading] = useState(true);
   const [loadingMore, setLoadingMore] = useState(false);
   const [err, setErr] = useState<string | null>(null);
+  const [sub, setSub] = useState<MySubscription | null>(null);
+
+  // 当前订阅（含双钱包余额明细）；reloadKey 变更（到账）后重拉。
+  useEffect(() => {
+    let alive = true;
+    api
+      .getMySubscription(auth)
+      .then((s) => {
+        if (alive) setSub(s);
+      })
+      .catch(() => {
+        /* 订阅读取失败：仅不显示套餐卡，不阻断账户页 */
+      });
+    return () => {
+      alive = false;
+    };
+  }, [auth, reloadKey]);
 
   const credits = user?.credits ?? null;
   const isZero = credits != null && /^-?0+$/.test(credits.trim());
@@ -74,9 +99,35 @@ export function AccountTab({
 
   return (
     <div className="flex flex-col">
+      {/* 当前套餐 */}
+      <div className="border-b border-border px-5 py-4">
+        <div className="flex items-center justify-between gap-3">
+          <div className="min-w-0">
+            <div className="flex items-center gap-1.5 text-[12px] text-faint">
+              <Crown size={13} /> 当前套餐
+            </div>
+            <div className="mt-1 flex items-center gap-2">
+              <span className="text-[18px] font-semibold text-fg">{sub?.planName ?? "—"}</span>
+              {sub?.paid && (
+                <span className="rounded-full bg-accent-soft px-2 py-0.5 text-[11px] font-medium text-accent">
+                  到期 {fmtDate(sub.periodEnd)}
+                </span>
+              )}
+            </div>
+            <div className="mt-1 text-[12px] text-faint">
+              每月 {sub ? formatCredits(sub.monthlyCredits) : "—"} 积分
+              {sub ? ` · 本期剩余 ${formatCredits(sub.periodCredits)}` : ""}
+            </div>
+          </div>
+          <Button variant="secondary" size="sm" onClick={onManageSub} className="shrink-0">
+            {sub?.paid ? "续费 / 升档" : "升级套餐"}
+          </Button>
+        </div>
+      </div>
+
       <div className="px-5 py-4">
         <div className="flex items-center gap-1.5 text-[12px] text-faint">
-          <Wallet size={13} /> {user?.displayName || "账户"} · 当前余额
+          <Wallet size={13} /> {user?.displayName || "账户"} · 总可用余额
         </div>
         <div
           className={cn(
@@ -87,16 +138,27 @@ export function AccountTab({
           {credits != null ? formatCredits(credits) : "—"}
           <span className="text-[14px] font-normal text-faint">积分</span>
         </div>
+        {sub && (
+          <div className="mt-1 text-[12px] text-faint">
+            套餐期内 {formatCredits(sub.balance.period)} + 钱包 {formatCredits(sub.balance.wallet)}
+          </div>
+        )}
         {low && (
           <Alert tone="danger" className="mt-2 text-[12.5px]">
-            余额不足，已暂停对话计费。充值后即可继续。
+            余额不足，已暂停对话计费。充值或升级套餐后即可继续。
           </Alert>
         )}
-        <Button variant="primary" size="sm" onClick={onTopup} className="mt-3">
-          <Plus size={15} /> 充值积分
-        </Button>
+        <div className="mt-3 flex flex-wrap gap-2">
+          <Button variant="primary" size="sm" onClick={onManageSub}>
+            <Crown size={15} /> 套餐订阅
+          </Button>
+          <Button variant="secondary" size="sm" onClick={onManageSub}>
+            <Plus size={15} /> 加量包
+          </Button>
+        </div>
         <p className="mt-2 text-[12px] text-faint">
-          按所选智能体的实际用量计量扣费。充值即时到账，余额永久有效。
+          按实际用量计量扣费，扣费优先消耗套餐期内积分。加量包仅在当前套餐有效期内可用；
+          存量钱包余额永久有效、扣完期内桶后继续使用。
         </p>
       </div>
 

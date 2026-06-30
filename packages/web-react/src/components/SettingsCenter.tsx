@@ -8,7 +8,7 @@ import type { AuthSession, User } from "../lib/types";
 import { Avatar, Spinner, Tabs } from "./ui";
 import { AccountTab } from "./settings/AccountTab";
 import { PreferencesTab, type PrefsView } from "./settings/PreferencesTab";
-import { TopupDialog } from "./settings/TopupDialog";
+import { SubscriptionDialog } from "./settings/SubscriptionDialog";
 import { UsageTab } from "./settings/UsageTab";
 
 type Section = "account" | "usage" | "preferences" | "about";
@@ -51,7 +51,7 @@ export function SettingsCenter({
   onRefreshMe?: () => void;
 }) {
   const [section, setSection] = useState<Section>("account");
-  const [topupOpen, setTopupOpen] = useState(false);
+  const [subOpen, setSubOpen] = useState(false);
   const [ledgerReload, setLedgerReload] = useState(0);
 
   // preferences 集中持有：偏好分区首次激活时拉一次，patch 后用返回快照刷新。
@@ -63,7 +63,7 @@ export function SettingsCenter({
   useEffect(() => {
     if (!open) {
       setSection("account");
-      setTopupOpen(false);
+      setSubOpen(false);
     }
   }, [open]);
 
@@ -146,7 +146,7 @@ export function SettingsCenter({
                   <AccountTab
                     auth={auth}
                     user={user}
-                    onTopup={() => setTopupOpen(true)}
+                    onManageSub={() => setSubOpen(true)}
                     reloadKey={ledgerReload}
                   />
                 )}
@@ -182,10 +182,10 @@ export function SettingsCenter({
       </Dialog.Portal>
 
       {auth && (
-        <TopupDialog
-          open={topupOpen}
+        <SubscriptionDialog
+          open={subOpen}
           auth={auth}
-          onClose={() => setTopupOpen(false)}
+          onClose={() => setSubOpen(false)}
           onPaid={onPaid}
         />
       )}
