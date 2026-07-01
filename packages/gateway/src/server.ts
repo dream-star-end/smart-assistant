@@ -5550,18 +5550,19 @@ export class Gateway {
     delegationId: string,
     teamRunId: string,
     maxParallel: number,
-    req: IncomingMessage,
+    res: ServerResponse,
   ): Promise<'ok' | 'run_closed' | 'cancelled' | 'timeout'> {
     const QUEUE_TIMEOUT_MS = 10 * 60 * 1000
     const POLL_MS = 500
     const memLimit = parseDelegateMemoryPressureRatio()
     const deadline = Date.now() + QUEUE_TIMEOUT_MS
-    // 客户端(leader/MCP)断开时立即退出，否则 queued 行会挡住 FIFO 队头到超时（Codex 审）。
-    let cancelled = false
+    // 监听 res 'close'：响应写完前连接关闭 = leader/MCP 断开等待，立即退出，否则 queued
+    // 行挡住 FIFO 队头到 10min 超时（Codex 审：req body 的 close 在 readBody 后不可靠）。
+    let cancelled = res.destroyed
     const onClose = () => {
-      cancelled = true
+      if (!res.writableEnded) cancelled = true
     }
-    req.on('close', onClose)
+    res.on('close', onClose)
     try {
       while (Date.now() < deadline) {
         if (cancelled) break
@@ -5580,7 +5581,7 @@ export class Gateway {
       await rejectQueuedTeamDelegation(delegationId, 'timeout').catch(() => {})
       return cancelled ? 'cancelled' : 'timeout'
     } finally {
-      req.off('close', onClose)
+      res.off('close', onClose)
     }
   }
 
@@ -5748,7 +5749,7 @@ export class Gateway {
           teamDelegationId,
           teamRunLeader.teamRunId,
           teamRunLeader.maxParallel,
-          req,
+          res,
         )
         if (waited === 'cancelled') return // 客户端已断开，无需响应
         if (waited === 'run_closed') return this.sendError(res, 409, 'team run is no longer active')
