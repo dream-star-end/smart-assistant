@@ -76,6 +76,9 @@ export const InboundMessage = Type.Object({
   // 实际接收方(gateway server.ts)会按静态 allowlist 过滤,无效 model 静默
   // 丢弃 —— 防止用户 prefs 里残留 admin 已 disable 的 model 把 CCB 启不起来。
   model: Type.Optional(Type.String()),
+  // 团队模式(v5 轻量组队):main 队长收到此 flag 的 turn 会被鼓励按任务复杂度自主
+  // delegate_task 给已安装 agent 组队,简单任务自己答。turn 级、可中途切,只对 main 生效。
+  teamMode: Type.Optional(Type.Boolean()),
   // Codex-native app-server conversation mode. `plan` asks Codex to produce a
   // reviewable read-only plan; `default` runs the implementation turn. Omitted
   // means runner default (commercial UI normally omits this; autonomous plan

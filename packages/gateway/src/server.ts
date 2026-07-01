@@ -8069,6 +8069,9 @@ export class Gateway {
       typeof _frameRequestId === 'string' && _frameRequestId.length > 0
         ? _frameRequestId
         : undefined
+    // 团队模式(v5 轻量组队):turn 级 flag,仅 main 队长生效。ws 帧无 typebox runtime
+    // 校验(JSON cast),用 === true 防御(与 _frameRequestId 同模式)。
+    const teamMode = (frame as any).teamMode === true
 
     const baseToolsets = agent.toolsets ?? this.deps.config.defaults.toolsets
     let effectiveToolsets = mergeOnDemandToolsets(
@@ -8493,6 +8496,30 @@ export class Gateway {
       }
 
       finalText = lines.join('\n')
+    }
+    // 团队模式(v5 轻量组队):main 队长这一轮前置"组队引导"——列出可委派的已安装 agent
+    // + 让它自主判断是否 delegate_task 组队(简单任务自己答)。turn 级,开关中途切立即生效;
+    // 放在 media 拼接之后,确保带附件时引导也在。委派本身走内置 delegate_task,无需改工具。
+    if (teamMode && agent.id === 'main') {
+      const teamCfg = await this._getAgentsConfig()
+      const members = teamCfg.agents.filter((a) => a.id !== 'main')
+      const memberLines =
+        members.length > 0
+          ? members
+              .map((a) => `- \`${a.id}\`${a.displayName ? `（${a.displayName}）` : ''}`)
+              .join('\n')
+          : '（当前没有其它已安装 agent —— 直接自己完成即可）'
+      const teamPreamble = [
+        '【团队模式已开启】把这次任务当作队长来处理：',
+        `可委派的成员（已安装 agent）：\n${memberLines}`,
+        '- 任务复杂、可拆解 → 用 `delegate_task(goal, agentId, context)` 委派子任务给最合适的成员组队，拿到各成员结果后你综合成给用户的最终答案。',
+        '- 任务简单、或没有更合适的成员 → 直接自己完成。',
+        '由你自主判断是否组队，不要为了组队而组队。',
+        '',
+        '用户任务：',
+        '',
+      ].join('\n')
+      finalText = teamPreamble + finalText
     }
     // Pass as plain text. No image content blocks — safer for non-multimodal providers.
     const payload: string = finalText
