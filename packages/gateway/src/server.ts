@@ -2013,6 +2013,11 @@ export class Gateway {
         const ownedIds = new Set(owned.map((s) => s.id))
         // Also include sessions with no matching client session (cron/task sessions) only for default user
         const filtered = allLive.filter((s) => {
+          // 排除内部委派/团队 run 会话：它们不是用户聊天会话，且 team leader session key
+          // 是 finalize 授权凭据，不能经此 API 泄露（Codex 审）。key 形如
+          // agent:<id>:delegate:... / agent:<id>:teamrun:...（第 3 段区分）。
+          const kind = s.sessionKey.split(':')[2] || ''
+          if (kind === 'delegate' || kind === 'teamrun') return false
           const peerId = s.sessionKey.split(':')[4] || ''
           return ownedIds.has(peerId) || (userId === 'default' && !peerId.startsWith('web-'))
         })
