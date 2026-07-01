@@ -1190,6 +1190,8 @@ export class SessionManager {
      * and bound to this run. Spawn-time attribute (preserved across model respawn).
      */
     skillTrainRunId?: string
+    /** Team run id — forwarded to the runner's mcp env as OPENCLAUDE_TEAM_RUN_ID (team leader session only). */
+    teamRunId?: string
   }): Promise<AgentSession> {
     // 新建时 null 等同 undefined(都让 CCB 用模型默认)
     const initialEffort: string | undefined =
@@ -1271,6 +1273,7 @@ export class SessionManager {
       getRepoSnapshot: this._getRepoSnapshot,
       workload: opts.workload,
       skillTrainRunId: opts.skillTrainRunId,
+      teamRunId: opts.teamRunId,
     })
     const now = Date.now()
     const session: AgentSession = {
