@@ -61,7 +61,9 @@ import {
   updateTeamRunStatus,
   getTeamRunByLeaderSessionKey,
   getTeamDelegationByChildSessionKey,
-  admitTeamDelegation,
+  enqueueTeamDelegation,
+  tryAcquireTeamSlot,
+  rejectQueuedTeamDelegation,
   recordRejectedTeamDelegation,
   setTeamDelegationChildSession,
   completeTeamDelegation,
@@ -5541,6 +5543,31 @@ export class Gateway {
     return interrupted
   }
 
+  // P5：等一个 queued 团队委派拿到 slot（maxParallel + 内存水位都满足）。轮询直到
+  // acquired / run 关闭(含被 stop) / 超时。返回 'ok' | 'run_closed' | 'timeout'。
+  // leader 的 delegate_task HTTP 会阻塞在此期间（MCP client 超时 2h+，足够）。
+  private async _waitForTeamSlot(
+    delegationId: string,
+    teamRunId: string,
+    maxParallel: number,
+  ): Promise<'ok' | 'run_closed' | 'timeout'> {
+    const QUEUE_TIMEOUT_MS = 10 * 60 * 1000
+    const POLL_MS = 500
+    const memLimit = parseDelegateMemoryPressureRatio()
+    const deadline = Date.now() + QUEUE_TIMEOUT_MS
+    while (Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, POLL_MS))
+      const mem = readDelegateMemoryPressure()
+      if (mem && mem.ratio >= memLimit) continue // 内存高，继续等，不占 slot
+      const acq = await tryAcquireTeamSlot({ delegationId, teamRunId, maxParallel })
+      if (acq === 'acquired') return 'ok'
+      if (acq === 'run_closed' || acq === 'gone') return 'run_closed'
+      // 'waiting' → 继续轮询
+    }
+    await rejectQueuedTeamDelegation(delegationId, 'timeout').catch(() => {})
+    return 'timeout'
+  }
+
   private async handleDelegateTask(
     req: IncomingMessage,
     res: ServerResponse,
@@ -5650,7 +5677,8 @@ export class Gateway {
 
     const memoryPressure = readDelegateMemoryPressure()
     const memoryPressureLimit = parseDelegateMemoryPressureRatio()
-    if (memoryPressure && memoryPressure.ratio >= memoryPressureLimit) {
+    // 团队 delegate 的内存水位在入队/等待环节处理（P5：排队而非硬拒）；非团队仍 503。
+    if (!teamRunLeader && memoryPressure && memoryPressure.ratio >= memoryPressureLimit) {
       const pct = Math.round(memoryPressure.ratio * 100)
       this.log.warn('delegate_resource_pressure', {
         targetAgentId,
@@ -5683,23 +5711,37 @@ export class Gateway {
       sourceAgent,
     })
 
-    // Team run admission (D-C): per-run 信号量。放在所有前置 guard（depth/memory
-    // pressure）之后、spawn 之前，避免占额度后又 bail。超额已原子记 rejected 行 → 429。
+    // Team run admission (D-C/P5): 入队式。撞 maxParallel 或内存水位 → 排队等 slot（不拒绝），
+    // slot 释放后 FIFO 放行。放在前置 guard 之后、spawn 之前。
     let teamDelegationId: string | null = null
     if (teamRunLeader) {
-      const admit = await admitTeamDelegation({
+      // 内存水位高时传 maxParallel=0 → 一律入队（等内存降下来再拿 slot，P5 集成内存 guard）。
+      const memPressured = !!(memoryPressure && memoryPressure.ratio >= memoryPressureLimit)
+      const enq = await enqueueTeamDelegation({
         teamRunId: teamRunLeader.teamRunId,
         memberAgentId: targetAgentId,
         goal,
-        maxParallel: teamRunLeader.maxParallel,
+        maxParallel: memPressured ? 0 : teamRunLeader.maxParallel,
       })
-      if (!admit.admitted) {
-        if (admit.reason === 'run_closed') {
-          return this.sendError(res, 409, 'team run is no longer active')
-        }
-        return this.sendError(res, 429, `team run maxParallel reached (${teamRunLeader.maxParallel})`)
+      if (enq.status === 'run_closed') {
+        return this.sendError(res, 409, 'team run is no longer active')
       }
-      teamDelegationId = admit.delegationId
+      teamDelegationId = enq.delegationId
+      if (enq.status === 'queued') {
+        const waited = await this._waitForTeamSlot(
+          teamDelegationId,
+          teamRunLeader.teamRunId,
+          teamRunLeader.maxParallel,
+        )
+        if (waited === 'run_closed') return this.sendError(res, 409, 'team run is no longer active')
+        if (waited === 'timeout') {
+          return this.sendError(
+            res,
+            429,
+            'team delegation queued too long (maxParallel / memory pressure)',
+          )
+        }
+      }
     }
 
     // admission 已占额度：getOrCreate 抛错必须释放（落 failed），否则永久占 maxParallel。

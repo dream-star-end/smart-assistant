@@ -303,7 +303,7 @@ function TeamRunLedger({
                       </span>
                     )}
                     <span className="ml-auto shrink-0 text-[11px] text-faint">
-                      {fmtDuration(d.startedAt, d.completedAt)}
+                      {d.status === "queued" ? "排队中" : fmtDuration(d.startedAt, d.completedAt)}
                     </span>
                   </div>
                   <p className="mt-0.5 line-clamp-2 text-[11.5px] leading-snug text-muted">{d.goal}</p>
@@ -357,5 +357,6 @@ function rejectLabel(reason: string): string {
   if (reason === "not_member") return "非团队成员";
   if (reason === "memory") return "内存不足";
   if (reason === "depth") return "嵌套过深";
+  if (reason === "timeout") return "排队超时";
   return reason;
 }

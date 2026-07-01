@@ -341,58 +341,106 @@ export async function interruptTeamRun(
 
 // ---- team_delegations ----
 
-// D-C：admission 原子事务 —— 数在跑委派 < maxParallel 才插一行 running。
-// P1 不排队：超额直接 rejected(maxParallel)。queued 态为 P5 资源队列预留。
-export async function admitTeamDelegation(input: {
+// D-C / P5：入队式准入（原子事务）。run 仍 active 时：slot 空且无人排在前面 → 直接
+// 'running'；否则 'queued'（不拒绝，等 slot）。run status 检查在事务内，防 finalize/
+// admit 并发穿透（Codex 审）。gateway 传的 maxParallel 若为 0（内存水位高）→ 一律入队。
+export async function enqueueTeamDelegation(input: {
   teamRunId: string
   memberAgentId: string
   goal: string
   maxParallel: number
-}): Promise<
-  | { admitted: true; delegationId: string }
-  | { admitted: false; reason: 'maxParallel' | 'run_closed'; delegationId: string | null }
-> {
+}): Promise<{ delegationId: string; status: 'running' | 'queued' | 'run_closed' }> {
   const db = await getSessionsDb()
   const now = Date.now()
-  // 原子事务：run 仍 active(running) + 数在跑委派 + 视额度插一行。run status 检查
-  // 放进事务，防 finalize/admit 并发穿透（Codex 审）。超额留 rejected 账本行。
-  const tx = db.transaction(
-    (): { admitted: boolean; reason?: 'maxParallel' | 'run_closed'; delegationId: string | null } => {
-      const run = db
-        .prepare('SELECT status FROM team_runs WHERE team_run_id = ?')
-        .get(input.teamRunId) as { status: string } | undefined
-      if (!run || run.status !== 'running') {
-        return { admitted: false, reason: 'run_closed', delegationId: null }
-      }
-      const running = db
-        .prepare(
-          "SELECT COUNT(*) AS c FROM team_delegations WHERE team_run_id = ? AND status = 'running'",
-        )
+  const tx = db.transaction((): { delegationId: string; status: 'running' | 'queued' | 'run_closed' } => {
+    const run = db
+      .prepare('SELECT status FROM team_runs WHERE team_run_id = ?')
+      .get(input.teamRunId) as { status: string } | undefined
+    if (!run || run.status !== 'running') return { delegationId: '', status: 'run_closed' }
+    const running = (
+      db
+        .prepare("SELECT COUNT(*) AS c FROM team_delegations WHERE team_run_id = ? AND status = 'running'")
         .get(input.teamRunId) as { c: number }
-      const delegationId = `tdl-${now.toString(36)}-${randomBytes(4).toString('hex')}`
-      if (running.c >= input.maxParallel) {
-        db.prepare(
-          `INSERT INTO team_delegations
-             (delegation_id, team_run_id, member_agent_id, goal, status, reject_reason, completed_at, created_at, updated_at)
-           VALUES (?, ?, ?, ?, 'rejected', 'maxParallel', ?, ?, ?)`,
-        ).run(delegationId, input.teamRunId, input.memberAgentId, input.goal, now, now, now)
-        return { admitted: false, reason: 'maxParallel', delegationId }
-      }
-      db.prepare(
-        `INSERT INTO team_delegations
-           (delegation_id, team_run_id, member_agent_id, goal, status, started_at, created_at, updated_at)
-         VALUES (?, ?, ?, ?, 'running', ?, ?, ?)`,
-      ).run(delegationId, input.teamRunId, input.memberAgentId, input.goal, now, now, now)
-      return { admitted: true, delegationId }
-    },
-  )
-  const r = tx()
-  if (r.admitted) return { admitted: true, delegationId: r.delegationId as string }
-  return {
-    admitted: false,
-    reason: r.reason as 'maxParallel' | 'run_closed',
-    delegationId: r.delegationId,
-  }
+    ).c
+    const queued = (
+      db
+        .prepare("SELECT COUNT(*) AS c FROM team_delegations WHERE team_run_id = ? AND status = 'queued'")
+        .get(input.teamRunId) as { c: number }
+    ).c
+    const delegationId = `tdl-${now.toString(36)}-${randomBytes(4).toString('hex')}`
+    // slot 空 且 队列为空才立即跑（保 FIFO：有人排队时新来的也排队）。
+    const status: 'running' | 'queued' = running < input.maxParallel && queued === 0 ? 'running' : 'queued'
+    db.prepare(
+      `INSERT INTO team_delegations
+         (delegation_id, team_run_id, member_agent_id, goal, status, started_at, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      delegationId,
+      input.teamRunId,
+      input.memberAgentId,
+      input.goal,
+      status,
+      status === 'running' ? now : null,
+      now,
+      now,
+    )
+    return { delegationId, status }
+  })
+  return tx()
+}
+
+// P5：尝试把一个 queued 委派提升为 running。仅当 run 仍 active + slot 空 + 自己是最老
+// 的 queued（FIFO）时成功。原子事务。
+export async function tryAcquireTeamSlot(input: {
+  delegationId: string
+  teamRunId: string
+  maxParallel: number
+}): Promise<'acquired' | 'waiting' | 'run_closed' | 'gone'> {
+  const db = await getSessionsDb()
+  const now = Date.now()
+  const tx = db.transaction((): 'acquired' | 'waiting' | 'run_closed' | 'gone' => {
+    const run = db
+      .prepare('SELECT status FROM team_runs WHERE team_run_id = ?')
+      .get(input.teamRunId) as { status: string } | undefined
+    if (!run || run.status !== 'running') return 'run_closed'
+    const self = db
+      .prepare('SELECT status FROM team_delegations WHERE delegation_id = ?')
+      .get(input.delegationId) as { status: string } | undefined
+    if (!self) return 'gone'
+    if (self.status === 'running') return 'acquired'
+    if (self.status !== 'queued') return 'gone' // failed/rejected（如被 stop）
+    const running = (
+      db
+        .prepare("SELECT COUNT(*) AS c FROM team_delegations WHERE team_run_id = ? AND status = 'running'")
+        .get(input.teamRunId) as { c: number }
+    ).c
+    if (running >= input.maxParallel) return 'waiting'
+    const oldest = db
+      .prepare(
+        "SELECT delegation_id FROM team_delegations WHERE team_run_id = ? AND status = 'queued' ORDER BY created_at ASC, delegation_id ASC LIMIT 1",
+      )
+      .get(input.teamRunId) as { delegation_id: string } | undefined
+    if (!oldest || oldest.delegation_id !== input.delegationId) return 'waiting'
+    const info = db
+      .prepare(
+        "UPDATE team_delegations SET status = 'running', started_at = ?, updated_at = ? WHERE delegation_id = ? AND status = 'queued'",
+      )
+      .run(now, now, input.delegationId)
+    return info.changes > 0 ? 'acquired' : 'waiting'
+  })
+  return tx()
+}
+
+// P5：排队超时——把仍 queued 的委派标 rejected(reason)，供账本可见。
+export async function rejectQueuedTeamDelegation(
+  delegationId: string,
+  reason: TeamDelegationRejectReason,
+): Promise<void> {
+  const db = await getSessionsDb()
+  const now = Date.now()
+  db.prepare(
+    "UPDATE team_delegations SET status = 'rejected', reject_reason = ?, completed_at = ?, updated_at = ? WHERE delegation_id = ? AND status = 'queued'",
+  ).run(reason, now, now, delegationId)
 }
 
 // admission 后、spawn child 前：把新建的 child session key 记回委派行（D-B 反查依赖）。
