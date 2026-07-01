@@ -1,11 +1,11 @@
-import { apiGet, apiJson } from './api.js?v=b0613d73'
+import { apiGet, apiJson } from './api.js?v=f9e5e54c'
 // OpenClaude — Context Hub: Memory + Skills + Automation
-import { $, htmlSafeEscape } from './dom.js?v=b0613d73'
-import { getSession, state } from './state.js?v=b0613d73'
-import { confirmDialog, openModal, toast, toastOptsFromError } from './ui.js?v=b0613d73'
-import { _cronHuman } from './util.js?v=b0613d73'
-import { openSkillTrainPanel } from './skillTrainPanel.js?v=b0613d73'
-import { openMarketplace, openMarketplacePublish } from './marketplace.js?v=b0613d73'
+import { $, htmlSafeEscape } from './dom.js?v=f9e5e54c'
+import { getSession, state } from './state.js?v=f9e5e54c'
+import { confirmDialog, openModal, toast, toastOptsFromError } from './ui.js?v=f9e5e54c'
+import { _cronHuman } from './util.js?v=f9e5e54c'
+import { openSkillTrainPanel } from './skillTrainPanel.js?v=f9e5e54c'
+import { openMarketplace, openMarketplacePublish } from './marketplace.js?v=f9e5e54c'
 
 const MEMORY_DELIMITER = '\n§\n'
 const CONTEXT_TABS = ['memory', 'skills', 'tasks']
