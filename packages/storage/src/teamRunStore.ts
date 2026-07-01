@@ -246,6 +246,20 @@ export async function updateTeamRunStatus(
   )
 }
 
+// CAS 标 failed：仅当 run 仍活跃才写。用于队长异步收尾——不能覆盖用户 stop 标的
+// interrupted，也不能覆盖已 completed（Codex 审：stop 后最终态必须仍是 interrupted）。
+export async function failTeamRunIfActive(teamRunId: string): Promise<boolean> {
+  const db = await getSessionsDb()
+  const info = db
+    .prepare(
+      `UPDATE team_runs SET status = 'failed', updated_at = ?
+       WHERE team_run_id = ?
+         AND status IN ('pending','running','waiting_review','finalize_required','finalizing')`,
+    )
+    .run(Date.now(), teamRunId)
+  return info.changes > 0
+}
+
 export async function markTeamRunReviewReturned(teamRunId: string, at: number): Promise<void> {
   const db = await getSessionsDb()
   db.prepare(

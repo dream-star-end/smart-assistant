@@ -68,6 +68,7 @@ import {
   markTeamRunFinalAccepted,
   hasCompletedReviewerDelegation,
   interruptTeamRun,
+  failTeamRunIfActive,
   writeConfig,
   getUsageSummary,
   queryEvents,
@@ -4758,7 +4759,8 @@ export class Gateway {
     submitPromise
       .then(async () => {
         if (leaderHadError) {
-          await updateTeamRunStatus(runId, 'failed')
+          // CAS：不覆盖用户 stop 标的 interrupted / 已 completed。
+          await failTeamRunIfActive(runId)
         } else {
           // 兜底 gate：队长 turn 结束但未经 submit_team_final（final_accepted_at 空）→
           // 标 finalize_required，UI 显示"未提交最终答案"，不误判 completed。
@@ -4770,7 +4772,7 @@ export class Gateway {
         deliverLeaderBlock(null, true)
       })
       .catch(async (err) => {
-        await updateTeamRunStatus(runId, 'failed').catch(() => {})
+        await failTeamRunIfActive(runId).catch(() => {})
         deliverLeaderBlock(
           { kind: 'text', text: `[team error] ${String(err?.message ?? err)}` },
           true,
