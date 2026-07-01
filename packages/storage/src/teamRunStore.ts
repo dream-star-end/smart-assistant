@@ -225,6 +225,16 @@ export async function getTeamRun(teamRunId: string): Promise<TeamRun | null> {
   return row ? rowToTeamRun(row) : null
 }
 
+// P6：团队运行历史（审计）—— 最近的 run，最新在前。
+export async function listTeamRuns(limit = 20): Promise<TeamRun[]> {
+  const db = await getSessionsDb()
+  const n = Math.max(1, Math.min(Math.floor(limit) || 20, 50))
+  const rows = db
+    .prepare('SELECT * FROM team_runs ORDER BY created_at DESC LIMIT ?')
+    .all(n) as TeamRunRow[]
+  return rows.map(rowToTeamRun)
+}
+
 // D-B：delegate admission 用 parentSessionKey 反查 —— 命中即"leader 委派"。
 export async function getTeamRunByLeaderSessionKey(sessionKey: string): Promise<TeamRun | null> {
   const db = await getSessionsDb()

@@ -1244,6 +1244,17 @@ export const api = {
       ),
     ),
 
+  /** 团队运行历史（GET /api/team-runs?limit=N）→ TeamRun[]（审计，无敏感字段）。 */
+  listTeamRuns: (a: AuthSession, limit = 20) =>
+    jsonOrThrow<{ runs: TeamRun[] }>(
+      callWithRefresh(a, (t) =>
+        fetch(`/api/team-runs?limit=${limit}`, {
+          credentials: "include",
+          headers: bearerHeaders(t),
+        }),
+      ),
+    ).then((b) => b.runs || []),
+
   /** 团队运行账本（GET /api/team-runs/:id）→ { run, delegations }。 */
   getTeamRun: (a: AuthSession, runId: string) =>
     jsonOrThrow<{ run: TeamRun; delegations: TeamDelegation[] }>(

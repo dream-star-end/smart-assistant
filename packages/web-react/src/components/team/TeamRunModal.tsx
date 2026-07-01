@@ -57,6 +57,7 @@ export function TeamRunModal({
   teamId,
   teamName,
   originPeerId,
+  viewRunId,
   onClose,
 }: {
   open: boolean;
@@ -65,6 +66,8 @@ export function TeamRunModal({
   teamName?: string;
   /** 发起用户会话的 peerId（origin 路由；队长输出直播回该连接，账本走轮询不依赖它）。 */
   originPeerId?: string;
+  /** 若提供：只查看该历史 run 的账本（不发起）。 */
+  viewRunId?: string | null;
   onClose: () => void;
 }) {
   return (
@@ -89,10 +92,14 @@ export function TeamRunModal({
             </Dialog.Close>
           </div>
           <div className="min-h-0 flex-1 overflow-y-auto px-5 pb-5">
-            {!auth || !teamId ? (
-              <p className="py-10 text-center text-[13px] text-faint">请先登录并选择团队。</p>
-            ) : (
+            {!auth ? (
+              <p className="py-10 text-center text-[13px] text-faint">请先登录。</p>
+            ) : viewRunId ? (
+              <TeamRunLedger key={viewRunId} auth={auth} runId={viewRunId} goal="" />
+            ) : teamId ? (
               <TeamRunBody key={teamId} auth={auth} teamId={teamId} originPeerId={originPeerId} />
+            ) : (
+              <p className="py-10 text-center text-[13px] text-faint">请选择团队。</p>
             )}
           </div>
         </Dialog.Content>
@@ -192,7 +199,8 @@ function TeamRunLedger({
   auth: AuthSession;
   runId: string;
   goal: string;
-  onRegen: () => void;
+  /** 省略则不显示「重新运行」（历史查看模式）。 */
+  onRegen?: () => void;
 }) {
   const [run, setRun] = useState<TeamRun | null>(null);
   const [delegations, setDelegations] = useState<TeamDelegation[]>([]);
@@ -333,7 +341,7 @@ function TeamRunLedger({
       {run?.status === "finalize_required" && (
         <Alert>队长已结束但未提交最终答案（未走 submit_team_final），本次运行未正式收尾。</Alert>
       )}
-      {!active && (
+      {!active && onRegen && (
         <div className="flex justify-end pt-1">
           <Button variant="secondary" size="sm" onClick={onRegen}>
             <RotateCcw size={13} />

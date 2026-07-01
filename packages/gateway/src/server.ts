@@ -57,6 +57,7 @@ import {
   writeAgentsConfig,
   createTeamRun,
   getTeamRun,
+  listTeamRuns,
   listTeamDelegations,
   updateTeamRunStatus,
   getTeamRunByLeaderSessionKey,
@@ -2265,6 +2266,10 @@ export class Gateway {
       this.handleCreateTeamRun(req, res, teamRunCreateMatch[1]).catch((err) =>
         this.sendError(res, 500, String(err)),
       )
+      return
+    }
+    if (url.pathname === '/api/team-runs') {
+      this.handleTeamRunList(req, res).catch((err) => this.sendError(res, 500, String(err)))
       return
     }
     const teamRunGetMatch = url.pathname.match(/^\/api\/team-runs\/([a-zA-Z0-9_-]+)$/)
@@ -4784,6 +4789,18 @@ export class Gateway {
 
     // 不回显 leaderSessionKey：它是 finalize 授权凭据，只 leader 自己的 MCP env 知道（Codex 审）。
     this.sendJson(res, 201, { teamRunId: runId })
+  }
+
+  // GET /api/team-runs?limit=N → { runs }（团队运行历史/审计，剥离敏感字段）。
+  private async handleTeamRunList(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    if (req.method !== 'GET') return this.sendError(res, 405, 'method not allowed')
+    const limitRaw = Number(new URL(req.url ?? '', 'http://localhost').searchParams.get('limit'))
+    const limit = Number.isFinite(limitRaw) && limitRaw > 0 ? Math.min(limitRaw, 50) : 20
+    const runs = await listTeamRuns(limit)
+    const dtos = runs.map(
+      ({ leaderSessionKey: _l, originSessionKey: _o, finalizeToken: _f, ...r }) => r,
+    )
+    this.sendJson(res, 200, { runs: dtos })
   }
 
   // GET /api/team-runs/:id → { run, delegations }

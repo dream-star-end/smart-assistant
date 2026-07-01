@@ -158,6 +158,7 @@ export function App() {
   const [manageOpen, setManageOpen] = useState(false);
   const [teamOpen, setTeamOpen] = useState(false);
   const [launchTeam, setLaunchTeam] = useState<{ id: string; name: string } | null>(null);
+  const [viewRun, setViewRun] = useState<{ runId: string; title: string } | null>(null);
   const [manageTab, setManageTab] = useState<ManageTab>("memory");
   const [marketplaceOpen, setMarketplaceOpen] = useState(false);
   const [marketplaceTab, setMarketplaceTab] = useState<MarketplaceTab>("browse");
@@ -1049,6 +1050,10 @@ export function App() {
           setTeamOpen(false);
           setLaunchTeam({ id, name });
         }}
+        onViewRun={(runId, title) => {
+          setTeamOpen(false);
+          setViewRun({ runId, title });
+        }}
       />
 
       <TeamRunModal
@@ -1058,6 +1063,15 @@ export function App() {
         teamName={launchTeam?.name}
         originPeerId={activeId ?? undefined}
         onClose={() => setLaunchTeam(null)}
+      />
+
+      <TeamRunModal
+        open={!!viewRun}
+        auth={auth}
+        teamId={null}
+        teamName={viewRun?.title}
+        viewRunId={viewRun?.runId ?? null}
+        onClose={() => setViewRun(null)}
       />
 
       <MarketplaceCenter

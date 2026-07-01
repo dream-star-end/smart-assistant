@@ -3,7 +3,14 @@ import { Crown, Play, Plus, Trash2, Users, X } from "lucide-react";
 import { type ReactNode, useCallback, useEffect, useState } from "react";
 import { AGENTS } from "../../lib/agents";
 import { api } from "../../lib/api";
-import type { AgentTeam, AgentTeamInput, AgentTeamMember, AuthSession } from "../../lib/types";
+import type {
+  AgentTeam,
+  AgentTeamInput,
+  AgentTeamMember,
+  AuthSession,
+  TeamRun,
+  TeamRunStatus,
+} from "../../lib/types";
 import { Alert, Button, Spinner, Switch } from "../ui";
 import { EmptyState, PanelHeader } from "../manage/parts";
 
@@ -14,6 +21,28 @@ const MAX_PARALLEL = 2;
 
 function agentName(id: string): string {
   return AGENTS.find((a) => a.id === id)?.name ?? id;
+}
+
+function teamNameOf(teams: AgentTeam[] | null, teamId: string): string {
+  return teams?.find((t) => t.id === teamId)?.name ?? teamId;
+}
+
+const RUN_STATUS_LABEL: Record<TeamRunStatus, string> = {
+  pending: "准备中",
+  running: "运行中",
+  waiting_review: "等待复核",
+  finalize_required: "待提交",
+  finalizing: "收尾中",
+  completed: "已完成",
+  failed: "失败",
+  interrupted: "已中断",
+};
+
+function runDotCls(s: TeamRunStatus): string {
+  if (s === "completed") return "bg-success";
+  if (s === "failed" || s === "interrupted") return "bg-danger";
+  if (s === "running" || s === "pending" || s === "finalizing") return "bg-accent";
+  return "bg-muted";
 }
 
 // 团队名常为中文，无法 slug；创建时给一个随机默认 id，用户可改成有意义的英文 id。
@@ -30,12 +59,15 @@ export function TeamManager({
   auth,
   onClose,
   onLaunch,
+  onViewRun,
 }: {
   open: boolean;
   auth: AuthSession | null;
   onClose: () => void;
   /** 点某团队的「发起」按钮时回调（跳到发起器）。 */
   onLaunch?: (teamId: string, teamName: string) => void;
+  /** 点某历史运行时回调（查看账本）。 */
+  onViewRun?: (runId: string, title: string) => void;
 }) {
   return (
     <Dialog.Root open={open} onOpenChange={(o) => !o && onClose()}>
@@ -60,7 +92,12 @@ export function TeamManager({
             {!auth ? (
               <p className="px-5 py-10 text-center text-[13px] text-faint">请先登录。</p>
             ) : (
-              <TeamPanel auth={auth} onLaunch={onLaunch} onClose={onClose} />
+              <TeamPanel
+                auth={auth}
+                onLaunch={onLaunch}
+                onViewRun={onViewRun}
+                onClose={onClose}
+              />
             )}
           </div>
         </Dialog.Content>
@@ -72,13 +109,16 @@ export function TeamManager({
 function TeamPanel({
   auth,
   onLaunch,
+  onViewRun,
   onClose,
 }: {
   auth: AuthSession;
   onLaunch?: (teamId: string, teamName: string) => void;
+  onViewRun?: (runId: string, title: string) => void;
   onClose: () => void;
 }) {
   const [teams, setTeams] = useState<AgentTeam[] | null>(null);
+  const [runs, setRuns] = useState<TeamRun[]>([]);
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState<string | null>(null);
   const [reload, setReload] = useState(0);
@@ -88,13 +128,15 @@ function TeamPanel({
     let alive = true;
     setLoading(true);
     setErr(null);
-    api
-      .listTeams(auth)
-      .then((t) => {
-        if (alive) setTeams(t);
+    Promise.all([api.listTeams(auth), api.listTeamRuns(auth, 15)])
+      .then(([t, r]) => {
+        if (alive) {
+          setTeams(t);
+          setRuns(r);
+        }
       })
       .catch((e) => {
-        if (alive) setErr((e as Error).message || "加载团队失败");
+        if (alive) setErr((e as Error).message || "加载失败");
       })
       .finally(() => {
         if (alive) setLoading(false);
@@ -214,6 +256,34 @@ function TeamPanel({
             </li>
           ))}
         </ul>
+      )}
+      {onViewRun && runs.length > 0 && (
+        <div className="mt-1 border-t border-border/60 px-3 pb-4 pt-3">
+          <p className="px-1 pb-2 text-[11.5px] font-medium text-faint">最近运行</p>
+          <ul className="flex flex-col gap-0.5">
+            {runs.map((run) => (
+              <li key={run.teamRunId}>
+                <button
+                  onClick={() => {
+                    onViewRun(run.teamRunId, teamNameOf(teams, run.teamId));
+                    onClose();
+                  }}
+                  className="flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-left outline-none transition-colors hover:bg-hover focus-visible:ring-2 focus-visible:ring-ring"
+                >
+                  <span className={`size-1.5 shrink-0 rounded-full ${runDotCls(run.status)}`} />
+                  <span className="min-w-0 flex-1">
+                    <span className="block truncate text-[12px] text-fg">
+                      {run.userGoal || "（无目标）"}
+                    </span>
+                    <span className="block truncate text-[11px] text-faint">
+                      {teamNameOf(teams, run.teamId)} · {RUN_STATUS_LABEL[run.status]}
+                    </span>
+                  </span>
+                </button>
+              </li>
+            ))}
+          </ul>
+        </div>
       )}
     </div>
   );
