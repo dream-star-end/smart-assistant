@@ -4684,6 +4684,10 @@ export class Gateway {
     // 授权凭据（只注入 leader MCP env、不经 API 回显），nonce 防被 teamRunId+leaderAgentId
     // 重构（Codex 审：可预测的凭据等于没凭据）。
     const leaderSessionKey = `agent:${team.leaderAgentId}:teamrun:${runId}:${randomBytes(12).toString('hex')}`
+    // finalize 授权凭据：独立随机 token（不是 session key —— session key 会经
+    // usage/events/runs/doctor 等观测面回显，不能当凭据）。只注入 leader MCP env，
+    // 绝不落任何 DTO/日志（Codex 审：根治，而非到处 redact session key）。
+    const finalizeToken = randomBytes(24).toString('hex')
     const policy = team.policy ?? {}
     // snapshot 存盘时已被 normalizeAgentTeamInput 钳到 TEAM_MAX_PARALLEL_CAP;此处兜底 >=1
     const maxParallel = Math.max(1, policy.maxParallel ?? 1)
@@ -4703,6 +4707,7 @@ export class Gateway {
       maxParallel,
       reviewRequired: !!policy.requireReview,
       reviewAgentId: policy.requireReview ? policy.reviewAgentId ?? null : null,
+      finalizeToken,
       status: 'running',
     })
 
@@ -4713,6 +4718,7 @@ export class Gateway {
       peerId: originPeerId,
       title: `[team] ${goal.slice(0, 40)}`,
       teamRunId: runId,
+      teamFinalizeToken: finalizeToken,
     })
 
     // 桥接：队长 session 的每个 block → origin（用户）会话。形态同 delegate emitProgress
@@ -4779,7 +4785,7 @@ export class Gateway {
     const delegations = await listTeamDelegations(runId)
     // 不暴露 leaderSessionKey/originSessionKey：内部路由用，且 leaderSessionKey 是
     // finalize 授权凭据，不应回显给前端（Codex 审）。
-    const { leaderSessionKey: _lsk, originSessionKey: _osk, ...runDto } = run
+    const { leaderSessionKey: _lsk, originSessionKey: _osk, finalizeToken: _ft, ...runDto } = run
     this.sendJson(res, 200, { run: runDto, delegations })
   }
 
@@ -4803,11 +4809,11 @@ export class Gateway {
     const run = await getTeamRun(runId)
     if (!run) return this.sendError(res, 404, 'team run not found')
 
-    // 三绑定校验：调用者必须是该 run 的 leader session（submit_team_final 带其
-    // OPENCLAUDE_SESSION_KEY）。防非 leader 越权 finalize。
-    const callerSessionKey = typeof parsed?.sessionKey === 'string' ? parsed.sessionKey : ''
-    if (!callerSessionKey || callerSessionKey !== run.leaderSessionKey) {
-      return this.sendError(res, 403, 'only the team leader session may finalize this run')
+    // 授权：finalize capability token（独立于 session key，只注入 leader MCP env，
+    // 不经任何 API/日志回显）。用不可观测的 token 而非可观测的 session key 作凭据（Codex 审）。
+    const callerToken = typeof parsed?.token === 'string' ? parsed.token : ''
+    if (!run.finalizeToken || !callerToken || callerToken !== run.finalizeToken) {
+      return this.sendError(res, 403, 'invalid or missing finalize token')
     }
     if (run.status === 'interrupted' || run.status === 'failed') {
       return this.sendError(res, 409, `team run already ${run.status}`)

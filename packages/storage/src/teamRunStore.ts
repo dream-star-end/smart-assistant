@@ -44,6 +44,7 @@ export interface TeamRun {
   reviewReturnedAt: number | null
   finalAcceptedAt: number | null
   finalContentRef: string | null
+  finalizeToken: string | null
   parentRunId: string | null
   createdAt: number
   updatedAt: number
@@ -84,6 +85,7 @@ interface TeamRunRow {
   review_returned_at: number | null
   final_accepted_at: number | null
   final_content_ref: string | null
+  finalize_token: string | null
   parent_run_id: string | null
   created_at: number
   updated_at: number
@@ -131,6 +133,7 @@ function rowToTeamRun(r: TeamRunRow): TeamRun {
     reviewReturnedAt: r.review_returned_at,
     finalAcceptedAt: r.final_accepted_at,
     finalContentRef: r.final_content_ref,
+    finalizeToken: r.finalize_token,
     parentRunId: r.parent_run_id,
     createdAt: r.created_at,
     updatedAt: r.updated_at,
@@ -172,6 +175,7 @@ export interface CreateTeamRunInput {
   maxParallel: number
   reviewRequired: boolean
   reviewAgentId?: string | null
+  finalizeToken?: string | null
   parentRunId?: string | null
   status?: TeamRunStatus
 }
@@ -183,11 +187,11 @@ export async function createTeamRun(input: CreateTeamRunInput): Promise<TeamRun>
     `INSERT INTO team_runs
        (team_run_id, team_id, team_snapshot, user_goal, origin_channel, origin_peer_id,
         origin_peer_kind, origin_session_key, origin_user_id, leader_agent_id, leader_session_key,
-        status, max_parallel, review_required, review_agent_id, parent_run_id, created_at, updated_at)
+        status, max_parallel, review_required, review_agent_id, finalize_token, parent_run_id, created_at, updated_at)
      VALUES
        (@teamRunId, @teamId, @teamSnapshot, @userGoal, @originChannel, @originPeerId,
         @originPeerKind, @originSessionKey, @originUserId, @leaderAgentId, @leaderSessionKey,
-        @status, @maxParallel, @reviewRequired, @reviewAgentId, @parentRunId, @now, @now)`,
+        @status, @maxParallel, @reviewRequired, @reviewAgentId, @finalizeToken, @parentRunId, @now, @now)`,
   ).run({
     teamRunId: input.teamRunId,
     teamId: input.teamId,
@@ -204,6 +208,7 @@ export async function createTeamRun(input: CreateTeamRunInput): Promise<TeamRun>
     maxParallel: input.maxParallel,
     reviewRequired: input.reviewRequired ? 1 : 0,
     reviewAgentId: input.reviewAgentId ?? null,
+    finalizeToken: input.finalizeToken ?? null,
     parentRunId: input.parentRunId ?? null,
     now,
   })

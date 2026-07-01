@@ -293,6 +293,12 @@ export interface SubprocessRunnerOpts {
    * `submit_team_final` tool and binds finalization to this run. Spawn-time attribute.
    */
   teamRunId?: string
+  /**
+   * Team run finalize capability token (NOT the session key). Injected as
+   * `OPENCLAUDE_TEAM_FINALIZE_TOKEN` for the leader session only; the finalize endpoint
+   * authorizes by this token, so the (loggable/observable) session key isn't a credential.
+   */
+  teamFinalizeToken?: string
 }
 
 // CCB 输出的 SDK message 类型(简化):兼容 stream-json 输出
@@ -1235,6 +1241,9 @@ export class SubprocessRunner extends EventEmitter {
             // team leader sessions, so normal sessions never see it.
             ...(this.opts.teamRunId
               ? { OPENCLAUDE_TEAM_RUN_ID: this.opts.teamRunId }
+              : {}),
+            ...(this.opts.teamFinalizeToken
+              ? { OPENCLAUDE_TEAM_FINALIZE_TOKEN: this.opts.teamFinalizeToken }
               : {}),
           },
         }

@@ -1192,6 +1192,8 @@ export class SessionManager {
     skillTrainRunId?: string
     /** Team run id — forwarded to the runner's mcp env as OPENCLAUDE_TEAM_RUN_ID (team leader session only). */
     teamRunId?: string
+    /** Team run finalize capability token — forwarded as OPENCLAUDE_TEAM_FINALIZE_TOKEN (leader session only). */
+    teamFinalizeToken?: string
   }): Promise<AgentSession> {
     // 新建时 null 等同 undefined(都让 CCB 用模型默认)
     const initialEffort: string | undefined =
@@ -1274,6 +1276,7 @@ export class SessionManager {
       workload: opts.workload,
       skillTrainRunId: opts.skillTrainRunId,
       teamRunId: opts.teamRunId,
+      teamFinalizeToken: opts.teamFinalizeToken,
     })
     const now = Date.now()
     const session: AgentSession = {

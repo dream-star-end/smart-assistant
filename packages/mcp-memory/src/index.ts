@@ -1197,7 +1197,7 @@ async function handleSubmitTeamFinal(args: { content?: string; summary?: string 
   if (!content.trim()) return toolError('content required')
   const gatewayPort = process.env.OPENCLAUDE_GATEWAY_PORT || '18789'
   const gatewayToken = readGatewayToken()
-  const sessionKey = process.env.OPENCLAUDE_SESSION_KEY || ''
+  const finalizeToken = process.env.OPENCLAUDE_TEAM_FINALIZE_TOKEN || ''
   try {
     const res = await postJsonToGateway(
       `http://127.0.0.1:${gatewayPort}/api/team-runs/${encodeURIComponent(TEAM_RUN_ID)}/finalize`,
@@ -1206,7 +1206,7 @@ async function handleSubmitTeamFinal(args: { content?: string; summary?: string 
           'Content-Type': 'application/json',
           Authorization: `Bearer ${gatewayToken}`,
         },
-        body: JSON.stringify({ content, summary: args?.summary, sessionKey }),
+        body: JSON.stringify({ content, summary: args?.summary, token: finalizeToken }),
         timeoutMs: DELEGATE_CLIENT_TIMEOUT_MS,
       },
     )

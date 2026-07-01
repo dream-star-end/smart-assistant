@@ -314,6 +314,7 @@ export async function getSessionsDb(): Promise<Database.Database> {
       review_returned_at INTEGER,
       final_accepted_at  INTEGER,
       final_content_ref  TEXT,
+      finalize_token     TEXT,
       parent_run_id      TEXT,
       created_at         INTEGER NOT NULL,
       updated_at         INTEGER NOT NULL
@@ -345,6 +346,9 @@ export async function getSessionsDb(): Promise<Database.Database> {
   const teamRunCols = db.pragma('table_info(team_runs)') as Array<{ name: string }>
   if (!teamRunCols.some((c) => c.name === 'origin_peer_kind')) {
     db.exec('ALTER TABLE team_runs ADD COLUMN origin_peer_kind TEXT')
+  }
+  if (!teamRunCols.some((c) => c.name === 'finalize_token')) {
+    db.exec('ALTER TABLE team_runs ADD COLUMN finalize_token TEXT')
   }
 
   _db = db
