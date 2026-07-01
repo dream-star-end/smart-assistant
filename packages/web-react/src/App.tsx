@@ -432,7 +432,8 @@ export function App() {
         return [updated, ...c.filter((s) => s.id !== sid)];
       });
     },
-    [activeId, demo, user, agent, modelId],
+    // teamMode 必须在依赖里:否则 memoized send 闭包捕获初始 false,用户开开关后仍发 false(Codex 审)。
+    [activeId, demo, user, agent, modelId, teamMode],
   );
 
   // 上传单文件 → MediaRef（kind 以服务端 mimeType 为准，退回 file.type）。供 Composer 附件。
