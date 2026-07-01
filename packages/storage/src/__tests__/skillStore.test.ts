@@ -16,7 +16,9 @@ import { before, describe, it } from 'node:test'
 const testHome = await mkdtemp(join(tmpdir(), 'oc-skillstore-'))
 process.env.OPENCLAUDE_HOME = testHome
 
-const { SkillStore, searchSkillMetadata } = await import('../skillStore.js')
+const { SkillStore, searchSkillMetadata, buildAgentSkillStore, buildUserSkillStore } = await import(
+  '../skillStore.js'
+)
 const { paths } = await import('../paths.js')
 
 const AGENT = 'test-agent'
@@ -477,5 +479,66 @@ describe('SkillStore — four-layer overlay (baseline > agent-seed > shared > le
     assert.equal(r.ok, false)
     assert.match(r.error ?? '', /reserved for a platform agent-seed/)
     assert.ok(!existsSync(join(sharedDir, 'reserved-seed')), 'must not have written a shadowed shared skill')
+  })
+})
+
+describe('buildAgentSkillStore — agent-scoped visibility (main aggregates, others isolated)', () => {
+  const baselineDir = join(testHome, 'factory-baseline')
+  const OFFICE = 'office-assistant'
+  const RESEARCH = 'research-assistant'
+
+  before(async () => {
+    process.env.OPENCLAUDE_BASELINE_SKILLS_DIR = baselineDir
+    await writeSkillMd(baselineDir, 'plat-x', fm('plat-x', 'platform baseline'))
+    await writeSkillMd(paths.sharedSkillsDir, 'shared-x', fm('shared-x', 'in shared')) // user-level
+    await writeSkillMd(paths.agentSkillsDir(OFFICE), 'office-own', fm('office-own', 'office private'))
+    await writeSkillMd(paths.agentSkillsDir(RESEARCH), 'research-own', fm('research-own', 'research private'))
+  })
+
+  it('non-default agent sees ONLY platform baseline + its own skills (no shared, no other agents)', async () => {
+    const names = (await buildAgentSkillStore(OFFICE).list()).map((s) => s.name)
+    assert.ok(names.includes('plat-x'), 'sees platform baseline')
+    assert.ok(names.includes('office-own'), 'sees its own per-agent skill')
+    assert.ok(!names.includes('shared-x'), 'must NOT see shared/user-level skill')
+    assert.ok(!names.includes('research-own'), "must NOT see another agent's skill")
+  })
+
+  it('default agent (main) aggregates everything: shared + every agent own skills', async () => {
+    const names = (await buildAgentSkillStore('main').list()).map((s) => s.name)
+    assert.ok(names.includes('plat-x'), 'sees platform baseline')
+    assert.ok(names.includes('shared-x'), 'sees shared')
+    assert.ok(names.includes('office-own'), 'aggregates office skill')
+    assert.ok(names.includes('research-own'), 'aggregates research skill')
+  })
+
+  it('non-default skill_save writes to its own namespace; invisible to peers, visible to main', async () => {
+    const r = await buildAgentSkillStore(OFFICE).save(
+      { name: 'office-new', description: 'created by office' },
+      'b',
+    )
+    assert.equal(r.ok, true, `save should succeed: ${r.error}`)
+    assert.ok(
+      existsSync(join(paths.agentSkillsDir(OFFICE), 'office-new', 'SKILL.md')),
+      'written to office per-agent dir',
+    )
+    assert.ok(!existsSync(join(paths.sharedSkillsDir, 'office-new')), 'NOT written to shared')
+    assert.ok((await buildAgentSkillStore(OFFICE).list()).some((s) => s.name === 'office-new'))
+    assert.ok(!(await buildAgentSkillStore(RESEARCH).list()).some((s) => s.name === 'office-new'))
+    assert.ok((await buildAgentSkillStore('main').list()).some((s) => s.name === 'office-new'))
+  })
+
+  it('view() honors the same scoping (no cross-agent read / existence leak)', async () => {
+    assert.equal(await buildAgentSkillStore(OFFICE).view('research-own'), null, 'no peer skill')
+    assert.equal(await buildAgentSkillStore(OFFICE).view('shared-x'), null, 'no shared skill')
+    const own = await buildAgentSkillStore(OFFICE).view('office-own')
+    assert.ok(own && typeof own === 'object' && (own as { name: string }).name === 'office-own')
+    assert.ok(await buildAgentSkillStore('main').view('shared-x'), 'main can view shared')
+    assert.ok(await buildAgentSkillStore('main').view('research-own'), 'main can view peer')
+  })
+
+  it('buildUserSkillStore (/api/skills surface) stays aggregate (user sees all their skills)', async () => {
+    const names = (await buildUserSkillStore().list({ includePlatform: false })).map((s) => s.name)
+    assert.ok(names.includes('shared-x') && names.includes('office-own') && names.includes('research-own'))
+    assert.ok(!names.includes('plat-x'), 'platform hidden from user surface')
   })
 })

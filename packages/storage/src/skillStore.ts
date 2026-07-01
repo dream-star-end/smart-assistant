@@ -1025,22 +1025,60 @@ export function resolveBaselineSkillsDirFromEnv(): string | undefined {
 }
 
 /**
+ * The default/generalist agent id — agents.yaml `default` (universally 'main' in
+ * v5; users can't change it). Env override hook for a future non-'main' default.
+ * Single authority for "which agent aggregates the whole skill library".
+ */
+export function resolveDefaultAgentId(): string {
+  return process.env.OPENCLAUDE_DEFAULT_AGENT_ID?.trim() || 'main'
+}
+
+/**
  * Standard per-agent runtime overlay store (single source of overlay wiring,
- * reused by gateway prompt slots, the skill API, and the mcp-memory tools):
- *   baseline(ro,env) > agent-seed(ro) > shared(rw, all of a user's agents) > legacy(per-agent).
- * Writes go to the shared root. Falls back step-wise if a dir is invalid so the
- * agent stays functional rather than crashing.
+ * reused by gateway prompt slots, the skill API, and the mcp-memory tools).
+ *
+ * Skill visibility is **agent-scoped**, with the DEFAULT/generalist agent as the
+ * sole aggregator:
+ *   - default agent (main): baseline(ro,env) > shared(rw, all agents) > aggregated
+ *     legacy(EVERY agent's per-agent dir) > hub. Sees the whole user skill library —
+ *     including skills authored under any other agent — and writes to shared.
+ *   - any other (specialized) agent: baseline(ro,env) > agent-seed(ro) > its OWN
+ *     per-agent dir (agents/<id>/skills, rw) > hub. **No shared layer**, so it only
+ *     sees platform baseline + its own skills, never skills authored under other
+ *     agents. Writes fall back to agents/<id>/skills (its private namespace).
+ *
+ * → each specialized assistant's self-authored skills are private to it, while the
+ * generalist still aggregates everything (preserves the shared-library goal of the
+ * leader/main seeing skills deposited by delegates). Falls back step-wise if a dir
+ * is invalid so the agent stays functional rather than crashing.
  */
 export function buildAgentSkillStore(agentId: string): SkillStore {
   const baselineDir = resolveBaselineSkillsDirFromEnv()
-  const sharedDir = paths.sharedSkillsDir
-  const agentSeedDir = paths.agentSeedSkillsDir(agentId)
   const hubDir = join(paths.hubDir, 'skills')
+
+  if (agentId === resolveDefaultAgentId()) {
+    // Default/generalist agent → aggregate view (same wiring as buildUserSkillStore).
+    const sharedDir = paths.sharedSkillsDir
+    try {
+      return new SkillStore(agentId, { baselineDir, sharedDir, aggregateLegacy: true, hubDir })
+    } catch {
+      try {
+        return new SkillStore(agentId, { sharedDir, aggregateLegacy: true, hubDir })
+      } catch {
+        return new SkillStore(agentId)
+      }
+    }
+  }
+
+  // Specialized agent → scoped to baseline + its own per-agent skills. NO sharedDir,
+  // so writeRoot falls back to agents/<id>/skills and the shared layer is never
+  // scanned — other agents' self-authored skills stay invisible.
+  const agentSeedDir = paths.agentSeedSkillsDir(agentId)
   try {
-    return new SkillStore(agentId, { baselineDir, sharedDir, agentSeedDir, hubDir })
+    return new SkillStore(agentId, { baselineDir, agentSeedDir, hubDir })
   } catch {
     try {
-      return new SkillStore(agentId, { sharedDir, agentSeedDir, hubDir })
+      return new SkillStore(agentId, { agentSeedDir, hubDir })
     } catch {
       return new SkillStore(agentId)
     }
