@@ -143,6 +143,31 @@ export const BRIDGE_API_ALLOWLIST: readonly BridgeApiAllowRule[] = [
     methods: M('GET', 'PUT', 'DELETE'),
     proxyFromCommercial: true,
   },
+  // team run：发起/观察/停止（finalize 不在此——只容器内 leader MCP 调，不经代理/桥接）。
+  {
+    label: '/api/agent-teams/:id/runs',
+    re: /^\/api\/agent-teams\/[A-Za-z0-9_-]+\/runs$/,
+    methods: M('POST'),
+    proxyFromCommercial: true,
+  },
+  {
+    label: '/api/team-runs',
+    re: /^\/api\/team-runs$/,
+    methods: M('GET'),
+    proxyFromCommercial: true,
+  },
+  {
+    label: '/api/team-runs/:id',
+    re: /^\/api\/team-runs\/[A-Za-z0-9_-]+$/,
+    methods: M('GET'),
+    proxyFromCommercial: true,
+  },
+  {
+    label: '/api/team-runs/:id/stop',
+    re: /^\/api\/team-runs\/[A-Za-z0-9_-]+\/stop$/,
+    methods: M('POST'),
+    proxyFromCommercial: true,
+  },
 
   { label: '/api/cron', re: /^\/api\/cron$/, methods: M('GET', 'POST'), proxyFromCommercial: true },
   {

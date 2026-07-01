@@ -73,6 +73,20 @@ describe('bridge API allowlist', () => {
       matchCommercialContainerApiProxy('/api/agent-teams/dev_team', 'DELETE')?.label,
       '/api/agent-teams/:id',
     )
+    // team run：发起/观察/停止经容器代理放行（finalize 不放行——只容器内 leader MCP 调）。
+    assert.equal(
+      matchCommercialContainerApiProxy('/api/agent-teams/dev_team/runs', 'POST')?.label,
+      '/api/agent-teams/:id/runs',
+    )
+    assert.equal(matchCommercialContainerApiProxy('/api/team-runs', 'GET')?.label, '/api/team-runs')
+    assert.equal(
+      matchCommercialContainerApiProxy('/api/team-runs/trun-abc123', 'GET')?.label,
+      '/api/team-runs/:id',
+    )
+    assert.equal(
+      matchCommercialContainerApiProxy('/api/team-runs/trun-abc123/stop', 'POST')?.label,
+      '/api/team-runs/:id/stop',
+    )
   })
 
   it('proxies SkillOpt training routes to the container with correct methods', () => {

@@ -340,6 +340,12 @@ const BLOCKED_FOR_USER_RULES: readonly BlockedForUserRule[] = [
   // 操作自己容器内的 teams，不能落到 master host。
   { re: /^\/api\/agent-teams$/, label: '/api/agent-teams' },
   { re: /^\/api\/agent-teams\/[A-Za-z0-9_-]+$/, label: '/api/agent-teams/:id' },
+  // team run：发起(POST .../:id/runs) + 观察(GET /api/team-runs, /api/team-runs/:id) +
+  // 停止(POST /api/team-runs/:id/stop)。finalize 只由容器内 leader MCP 调 127.0.0.1，不经此代理。
+  { re: /^\/api\/agent-teams\/[A-Za-z0-9_-]+\/runs$/, label: '/api/agent-teams/:id/runs' },
+  { re: /^\/api\/team-runs$/, label: '/api/team-runs' },
+  { re: /^\/api\/team-runs\/[A-Za-z0-9_-]+$/, label: '/api/team-runs/:id' },
+  { re: /^\/api\/team-runs\/[A-Za-z0-9_-]+\/stop$/, label: '/api/team-runs/:id/stop' },
 
   // ─── host cron / tasks / webhooks(所有方法,prompt 注入 = RCE)───
   { re: /^\/api\/cron(\/[^/]+)?$/, label: '/api/cron' },
