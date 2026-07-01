@@ -35,7 +35,7 @@ export function buildTeamLeaderPrompt(team: AgentTeamDef, goal: string): string 
 
   sections.push('# 团队协作任务（你是队长）')
 
-  if (team.leaderPrompt && team.leaderPrompt.trim()) {
+  if (team.leaderPrompt?.trim()) {
     sections.push(team.leaderPrompt.trim())
   }
 
@@ -52,8 +52,7 @@ export function buildTeamLeaderPrompt(team: AgentTeamDef, goal: string): string 
   ]
   if (reviewerId) {
     rules.push(
-      `复核强制：交付前必须先用 \`delegate_task\` 把最终草稿委派给复核者 \`${reviewerId}\`，` +
-        `待其返回后方可交付。未经复核，\`submit_team_final\` 会被服务端拒绝。`,
+      `复核强制：交付前必须先用 \`delegate_task\` 把最终草稿委派给复核者 \`${reviewerId}\`，待其返回后方可交付。未经复核，\`submit_team_final\` 会被服务端拒绝。`,
     )
   }
   rules.push(
