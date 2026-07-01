@@ -302,6 +302,7 @@ export async function getSessionsDb(): Promise<Database.Database> {
       user_goal          TEXT NOT NULL,
       origin_channel     TEXT NOT NULL,
       origin_peer_id     TEXT NOT NULL,
+      origin_peer_kind   TEXT,
       origin_session_key TEXT NOT NULL,
       origin_user_id     TEXT,
       leader_agent_id    TEXT NOT NULL,

@@ -32,6 +32,7 @@ export interface TeamRun {
   userGoal: string
   originChannel: string
   originPeerId: string
+  originPeerKind: string | null
   originSessionKey: string
   originUserId: string | null
   leaderAgentId: string
@@ -71,6 +72,7 @@ interface TeamRunRow {
   user_goal: string
   origin_channel: string
   origin_peer_id: string
+  origin_peer_kind: string | null
   origin_session_key: string
   origin_user_id: string | null
   leader_agent_id: string
@@ -117,6 +119,7 @@ function rowToTeamRun(r: TeamRunRow): TeamRun {
     userGoal: r.user_goal,
     originChannel: r.origin_channel,
     originPeerId: r.origin_peer_id,
+    originPeerKind: r.origin_peer_kind,
     originSessionKey: r.origin_session_key,
     originUserId: r.origin_user_id,
     leaderAgentId: r.leader_agent_id,
@@ -161,6 +164,7 @@ export interface CreateTeamRunInput {
   userGoal: string
   originChannel: string
   originPeerId: string
+  originPeerKind?: string | null
   originSessionKey: string
   originUserId?: string | null
   leaderAgentId: string
@@ -178,12 +182,12 @@ export async function createTeamRun(input: CreateTeamRunInput): Promise<TeamRun>
   db.prepare(
     `INSERT INTO team_runs
        (team_run_id, team_id, team_snapshot, user_goal, origin_channel, origin_peer_id,
-        origin_session_key, origin_user_id, leader_agent_id, leader_session_key, status,
-        max_parallel, review_required, review_agent_id, parent_run_id, created_at, updated_at)
+        origin_peer_kind, origin_session_key, origin_user_id, leader_agent_id, leader_session_key,
+        status, max_parallel, review_required, review_agent_id, parent_run_id, created_at, updated_at)
      VALUES
        (@teamRunId, @teamId, @teamSnapshot, @userGoal, @originChannel, @originPeerId,
-        @originSessionKey, @originUserId, @leaderAgentId, @leaderSessionKey, @status,
-        @maxParallel, @reviewRequired, @reviewAgentId, @parentRunId, @now, @now)`,
+        @originPeerKind, @originSessionKey, @originUserId, @leaderAgentId, @leaderSessionKey,
+        @status, @maxParallel, @reviewRequired, @reviewAgentId, @parentRunId, @now, @now)`,
   ).run({
     teamRunId: input.teamRunId,
     teamId: input.teamId,
@@ -191,6 +195,7 @@ export async function createTeamRun(input: CreateTeamRunInput): Promise<TeamRun>
     userGoal: input.userGoal,
     originChannel: input.originChannel,
     originPeerId: input.originPeerId,
+    originPeerKind: input.originPeerKind ?? null,
     originSessionKey: input.originSessionKey,
     originUserId: input.originUserId ?? null,
     leaderAgentId: input.leaderAgentId,
@@ -284,27 +289,39 @@ export async function admitTeamDelegation(input: {
   goal: string
   maxParallel: number
 }): Promise<
-  { admitted: true; delegationId: string } | { admitted: false; reason: 'maxParallel' }
+  | { admitted: true; delegationId: string }
+  | { admitted: false; reason: 'maxParallel'; delegationId: string }
 > {
   const db = await getSessionsDb()
   const now = Date.now()
-  const tx = db.transaction((): string | null => {
+  // 原子：数在跑委派 + 视额度插一行(running 或 rejected)。总是留账本行，
+  // 让 UI 能看到被拒的委派（Codex 审：admission 超额不能只返回布尔、要有 ledger 行）。
+  const tx = db.transaction((): { admitted: boolean; delegationId: string } => {
     const running = db
       .prepare(
         "SELECT COUNT(*) AS c FROM team_delegations WHERE team_run_id = ? AND status = 'running'",
       )
       .get(input.teamRunId) as { c: number }
-    if (running.c >= input.maxParallel) return null
     const delegationId = `tdl-${now.toString(36)}-${randomBytes(4).toString('hex')}`
+    if (running.c >= input.maxParallel) {
+      db.prepare(
+        `INSERT INTO team_delegations
+           (delegation_id, team_run_id, member_agent_id, goal, status, reject_reason, completed_at, created_at, updated_at)
+         VALUES (?, ?, ?, ?, 'rejected', 'maxParallel', ?, ?, ?)`,
+      ).run(delegationId, input.teamRunId, input.memberAgentId, input.goal, now, now, now)
+      return { admitted: false, delegationId }
+    }
     db.prepare(
       `INSERT INTO team_delegations
          (delegation_id, team_run_id, member_agent_id, goal, status, started_at, created_at, updated_at)
        VALUES (?, ?, ?, ?, 'running', ?, ?, ?)`,
     ).run(delegationId, input.teamRunId, input.memberAgentId, input.goal, now, now, now)
-    return delegationId
+    return { admitted: true, delegationId }
   })
-  const delegationId = tx()
-  return delegationId ? { admitted: true, delegationId } : { admitted: false, reason: 'maxParallel' }
+  const r = tx()
+  return r.admitted
+    ? { admitted: true, delegationId: r.delegationId }
+    : { admitted: false, reason: 'maxParallel', delegationId: r.delegationId }
 }
 
 // admission 后、spawn child 前：把新建的 child session key 记回委派行（D-B 反查依赖）。

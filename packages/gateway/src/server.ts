@@ -837,6 +837,17 @@ export class Gateway {
       this.log.error('msg-outbox replay failed (continuing startup)', undefined, err as Error)
     }
 
+    // Team runs: a prior gateway instance may have left team_runs active
+    // (running/finalizing) with no in-memory interrupt map to recover. Mark them
+    // interrupted so stop/refresh don't see ghost state. Best-effort (Codex 审).
+    try {
+      const { interruptStaleTeamRuns } = await import('@openclaude/storage')
+      const interrupted = await interruptStaleTeamRuns()
+      if (interrupted > 0) this.log.info('team-runs stale cleanup', { interrupted })
+    } catch (err) {
+      this.log.error('team-runs stale cleanup failed (continuing startup)', undefined, err as Error)
+    }
+
     // V3 commercial: container → master sink for server-authored messages.
     // Wire only if env is configured (set by v3supervisor when spawning
     // commercial containers). Personal version + dev sandbox don't set
@@ -4614,13 +4625,27 @@ export class Gateway {
       return this.sendError(res, 400, 'invalid JSON')
     }
     const goal = typeof parsed?.goal === 'string' ? parsed.goal.trim() : ''
-    const originSessionKey = typeof parsed?.sessionKey === 'string' ? parsed.sessionKey : ''
     if (!goal) return this.sendError(res, 400, 'goal required')
-    if (!originSessionKey) return this.sendError(res, 400, 'sessionKey required')
 
-    // origin = 发起用户的会话（队长输出流回这里，run 才可观测）
-    const origin = this.sessions.getByKey(originSessionKey)
-    if (!origin) return this.sendError(res, 404, 'origin session not found')
+    // origin = 发起用户的路由信息。优先用显式字段（前端从其 WS/会话上下文提供），
+    // **不依赖已存在的 AgentSession**（新会话发起团队 run 不应 404 —— Codex 审）。
+    // 若传了 sessionKey 且能查到会话，作为兜底补全 channel/peer/user。
+    // durable 真相源是 team_run 表 + run 事件；deliver 只是尽力而为的活跃连接直播。
+    const originIn = (parsed?.origin ?? {}) as Record<string, unknown>
+    const bySession =
+      typeof parsed?.sessionKey === 'string' && parsed.sessionKey
+        ? this.sessions.getByKey(parsed.sessionKey)
+        : undefined
+    const originChannel =
+      (typeof originIn.channel === 'string' && originIn.channel) || bySession?.channel || 'webchat'
+    const originPeerId =
+      (typeof originIn.peerId === 'string' && originIn.peerId) || bySession?.peerId || ''
+    const originPeerKind = (typeof originIn.peerKind === 'string' && originIn.peerKind) || 'dm'
+    const originUserId =
+      (typeof originIn.userId === 'string' && originIn.userId) || bySession?.userId || null
+    const originSessionKey =
+      (typeof parsed?.sessionKey === 'string' && parsed.sessionKey) || bySession?.sessionKey || ''
+    if (!originPeerId) return this.sendError(res, 400, 'origin peerId required')
 
     const cfg = await this._getAgentsConfig()
     const team = (cfg.teams ?? []).find((t) => t.id === teamId)
@@ -4641,10 +4666,11 @@ export class Gateway {
       teamId: team.id,
       teamSnapshot: team,
       userGoal: goal,
-      originChannel: origin.channel,
-      originPeerId: origin.peerId,
-      originSessionKey: origin.sessionKey,
-      originUserId: origin.userId ?? null,
+      originChannel,
+      originPeerId,
+      originPeerKind,
+      originSessionKey,
+      originUserId,
       leaderAgentId: team.leaderAgentId,
       leaderSessionKey,
       maxParallel,
@@ -4657,7 +4683,7 @@ export class Gateway {
       sessionKey: leaderSessionKey,
       agent: leaderAgent,
       channel: 'delegate',
-      peerId: origin.peerId,
+      peerId: originPeerId,
       title: `[team] ${goal.slice(0, 40)}`,
       teamRunId: runId,
     })
@@ -4667,30 +4693,38 @@ export class Gateway {
     const deliverLeaderBlock = (block: unknown | null, isFinal: boolean): void => {
       this.deliver({
         type: 'outbound.message',
-        sessionKey: origin.sessionKey,
-        channel: origin.channel,
-        peer: { id: origin.peerId, kind: 'dm' },
+        sessionKey: originSessionKey,
+        channel: originChannel,
+        peer: { id: originPeerId, kind: originPeerKind as 'dm' },
         blocks: block ? [block] : [],
         isFinal,
-        _userId: origin.userId,
+        _userId: originUserId ?? undefined,
       } as OutboundMessage & { _userId?: string })
     }
 
     const prompt = buildTeamLeaderPrompt(team, goal)
     // fire-and-forget：立即返回 runId，队长 turn 异步流式跑（可能很长）。
+    let leaderHadError = false
     const submitPromise = this.sessions.submit(leaderSession, prompt, (e) => {
       if (e.kind === 'block') deliverLeaderBlock(e.block, false)
       else if (e.kind === 'error') {
+        // SessionManager.submit 的 error path 是 onEvent(error)+resolve()（非 reject），
+        // 故这里标记，.then 里据此落 failed，避免把失败误判成 finalize_required（Codex 审）。
+        leaderHadError = true
         deliverLeaderBlock({ kind: 'text', text: `[error] ${e.error}` }, false)
       }
     })
     submitPromise
       .then(async () => {
-        // 兜底 gate：队长 turn 结束但未经 submit_team_final（final_accepted_at 空）→
-        // 标 finalize_required，UI 显示"未提交最终答案"，不误判 completed。
-        const run = await getTeamRun(runId)
-        if (run && !run.finalAcceptedAt && run.status === 'running') {
-          await updateTeamRunStatus(runId, 'finalize_required')
+        if (leaderHadError) {
+          await updateTeamRunStatus(runId, 'failed')
+        } else {
+          // 兜底 gate：队长 turn 结束但未经 submit_team_final（final_accepted_at 空）→
+          // 标 finalize_required，UI 显示"未提交最终答案"，不误判 completed。
+          const run = await getTeamRun(runId)
+          if (run && !run.finalAcceptedAt && run.status === 'running') {
+            await updateTeamRunStatus(runId, 'finalize_required')
+          }
         }
         deliverLeaderBlock(null, true)
       })
