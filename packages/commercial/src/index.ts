@@ -196,6 +196,11 @@ import {
   type MiniMaxMediaHandler,
 } from "./minimax/mediaProxy.js";
 import {
+  MINIMAX_WEB_SEARCH_PATH,
+  makeMiniMaxWebSearchHandler,
+  type MiniMaxWebSearchHandler,
+} from "./minimax/webSearchProxy.js";
+import {
   makeInboundDispatcher,
 } from "./wechat/inboundDispatcher.js";
 import { handleWechatModelCommand } from "./wechat/modelCommand.js";
@@ -1174,6 +1179,13 @@ export async function registerCommercial(
         pgPool: getPool(),
         tokenPlanKey: cfg.MINIMAX_TOKEN_PLAN_KEY,
       });
+      // /internal/v3/minimax-search — 容器内 CCB 内置 WebSearch(MiniMaxSearchAdapter)回源 master。
+      // key(MINIMAX_TOKEN_PLAN_KEY)只在 master,不注入容器;同款 verifyContainerIdentity 双因子。
+      // MiniMax coding_plan/search 中文深度强,替代脆弱的 Bing HTML 刮页(Bing Search API 已退役)。
+      const minimaxWebSearchHandler: MiniMaxWebSearchHandler = makeMiniMaxWebSearchHandler({
+        identityRepo,
+        tokenPlanKey: cfg.MINIMAX_TOKEN_PLAN_KEY,
+      });
       // /internal/v3/skill-embed — 容器内 mcp-memory 语义 skill_search 回源 master。
       // master 持 SKILL_EMBEDDING_API_KEY/DASHSCOPE_API_KEY(只在 master env,不注入容器),
       // 同款 verifyContainerIdentity 双因子鉴权;向量跨租户 PG 缓存,fail-closed 回落关键词。
@@ -1246,6 +1258,9 @@ export async function registerCommercial(
         }
         if (path === MINIMAX_MEDIA_PATH) {
           return minimaxMediaHandler(req, res, ctx);
+        }
+        if (path === MINIMAX_WEB_SEARCH_PATH) {
+          return minimaxWebSearchHandler(req, res, ctx);
         }
         if (path === SKILL_EMBED_PREFIX) {
           return skillEmbedHandler(req, res, ctx);
