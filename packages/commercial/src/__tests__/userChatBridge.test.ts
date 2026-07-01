@@ -848,9 +848,9 @@ describe("userChatBridge — model authorization", () => {
   // (v5 ccb-only:agentId='codex' 隐含 gpt-5.5 的 authz 用例已随 codex agent +
   //  AGENT_AUTHZ_IMPLIED_MODEL codex 条目一并移除。)
 
-  test("inbound.message 带 claude-* model 且授权 → 透传到容器", async () => {
-    // 普通 claude 帧路径不应受 round-2 修改影响。
-    const allowed = new Set<string>(["claude-opus-4-7"]);
+  test("inbound.message 带公开 model 且授权 → 透传到容器", async () => {
+    // 普通已授权模型帧路径应原样透传(Claude 官方模型已下线,这里用公开的 glm-5.2 验证)。
+    const allowed = new Set<string>(["glm-5.2"]);
     const rig = await startRig({
       loadAllowedModelChecker: async () => (id: string) => allowed.has(id),
     });
@@ -870,14 +870,14 @@ describe("userChatBridge — model authorization", () => {
         });
       });
 
-      ws.send(JSON.stringify({ type: "inbound.message", model: "claude-opus-4-7" }));
+      ws.send(JSON.stringify({ type: "inbound.message", model: "glm-5.2" }));
       const got = await seenP;
       const text = typeof got.data === "string" ? got.data : got.data.toString("utf8");
       // CG2a:inbound.message 现在会被 master 注入 traceId(32-hex)— 验类型 + model 透传 +
       // traceId 存在,但不绑定具体值(每 turn 随机)。
       const forwarded = JSON.parse(text) as Record<string, unknown>;
       assert.equal(forwarded.type, "inbound.message");
-      assert.equal(forwarded.model, "claude-opus-4-7");
+      assert.equal(forwarded.model, "glm-5.2");
       assert.match(forwarded.traceId as string, /^[a-f0-9]{32}$/);
 
       ws.close();

@@ -23,6 +23,7 @@ import {
 import { eventBus, createEvent } from './eventBus.js'
 import { createLogger } from './logger.js'
 import { getV3MasterSinkOrNull, type V3MasterSinkPayload } from './v3MasterSink.js'
+import { resolveExecutionModel } from './server.js'
 import { SubprocessRunner } from './subprocessRunner.js'
 import {
   type ExecutionTarget,
@@ -1257,7 +1258,9 @@ export class SessionManager {
       agentBaseDir: cwd,
       config: this.config,
       persona,
-      model: opts.agent.model ?? this.config.defaults.model,
+      // 统一执行模型准入:agent.model(marketplace/seed/delegate)可能是已下线模型(如
+      // stale claude-*),这里收敛到白名单内,否则会以不可路由的 --model spawn。
+      model: resolveExecutionModel(opts.agent.model, this.config.defaults.model),
       permissionMode: opts.agent.permissionMode ?? this.config.defaults.permissionMode,
       agentProvider: opts.agent.provider,
       agentMcpServers: opts.agent.mcpServers,
@@ -1311,7 +1314,9 @@ export class SessionManager {
       totalCacheCreationTokens: 0,
       turns: 0,
       _lastCcbCumulativeCost: this._lastCostFor(opts.sessionKey, providerTag) ?? 0,
-      model: opts.agent.model ?? this.config.defaults.model,
+      // 统一执行模型准入:agent.model(marketplace/seed/delegate)可能是已下线模型(如
+      // stale claude-*),这里收敛到白名单内,否则会以不可路由的 --model spawn。
+      model: resolveExecutionModel(opts.agent.model, this.config.defaults.model),
       toolUseIdToName: new Map(),
       executionTarget: { kind: 'local' },
       // Phase 5 G.0:固化 provider 路由信息,recyclePeerForRepoChange 用 providerTag
@@ -1513,7 +1518,9 @@ export class SessionManager {
         // 同步更新 session.model,outbound 帧 / metrics / audit 都靠它,避免
         // 下次 spawn 前的窗口期 stale。runner.model 要等 spawn 才生效;但 shutdown
         // 已让 runner 死,窗口期内不会产生新 metrics —— session.model 提前对齐安全。
-        session.model = desiredModel ?? this.config.defaults.model ?? 'claude-opus-4-7'
+        // 最后兜底用 glm-5.2(平台默认、v3/v5 都合法的静态 key 模型)。
+        // 不再硬编码 claude-opus-4-7 —— Claude 官方模型已下线,那会造出非法默认 → spawn 失败。
+        session.model = desiredModel ?? this.config.defaults.model ?? 'glm-5.2'
       }
       if (toolsetsChanged) {
         maybeSetToolsets.call(session.runner, desiredToolsets)

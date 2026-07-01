@@ -174,26 +174,49 @@ const WECHAT_FINAL_EMPTY_TEXT =
  * session 卡死。运行时校验在 server.ts:WS handler 里;export 出来便于 unit test
  * 与未来抽 helper。
  *
- * 当前 commercial 暴露集合(2026-05-02 v1.0.68 起):
- *   - claude-opus-4-7 / claude-sonnet-4-6 — 主力 anthropic 模型
- *   - gpt-5.5 — codex agent 走 codex JSON-RPC
+ * 当前 commercial 暴露集合:
+ *   - gpt-5.5 — codex agent 走 codex JSON-RPC(v5 从 picker dropGptForV5Channel,但入站仍受)
  *   - deepseek-v4-flash / deepseek-v4-pro — anthropicProxy 在 master 侧 isDeepseekModel
  *     命中后切换上游(DEEPSEEK_UPSTREAM_ENDPOINT + DEEPSEEK_API_KEY),
  *     在 claude-subscription agent 上跑就够,不需要切 agent
  *   - MiniMax-M3 — master 侧切到 MiniMax Token Plan Anthropic 兼容端点,
  *     同样跑 claude-subscription/non-codex agent,不进 codex-native
- *   - glm-5.1 — master 侧切到火山方舟 Ark Coding Plan Anthropic 兼容端点,同 non-codex,
- *     且是**平台全局默认模型**
+ *   - glm-5.1 / glm-5.2 — master 侧切到火山方舟 Ark Coding Plan Anthropic 兼容端点,
+ *     同 non-codex,glm-5.2 是**平台全局默认模型**
  *
- * 静态 key 文本 provider 的字面量(deepseek-v4-flash/pro, MiniMax-M3, glm-5.1)从
+ * **Claude 官方模型(claude-opus-4-7 / claude-sonnet-4-6 / claude-haiku-4-5)已全面下线**
+ * (v3 + v5 均不支持),不在白名单;stale prefs / 构造帧带 Claude 模型会被拒,而不是路由到
+ * 已下线的 Anthropic 上游。
+ *
+ * 静态 key 文本 provider 的字面量(deepseek-v4-flash/pro, MiniMax-M3, glm-5.1/5.2)从
  * @openclaude/protocol 注册表 STATIC_KEY_INBOUND_MODEL_IDS 注入,新增 provider 零改本处。
  */
-export const ALLOWED_INBOUND_MODELS = new Set([
-  'claude-opus-4-7',
-  'claude-sonnet-4-6',
+export const ALLOWED_INBOUND_MODELS = new Set<string>([
   'gpt-5.5',
   ...STATIC_KEY_INBOUND_MODEL_IDS,
 ])
+
+/** 平台执行模型兜底:v3/v5 两渠道都合法的静态 key 平台默认。 */
+export const EXECUTION_MODEL_FALLBACK = 'glm-5.2'
+
+/**
+ * 把 agent/config 级模型收敛到平台真实支持的集合。
+ *
+ * ALLOWED_INBOUND_MODELS 只拦**入站帧**;但 agent.model(marketplace manifest / seed /
+ * delegate 委派)会**绕过入站校验**,在 SessionManager.getOrCreate 里直接作为 CCB `--model`
+ * spawn。已下线模型(如某个 stale 已安装 agent 里残留的 claude-*)会让 CCB 用不可路由的
+ * --model 启动 → spawn 失败 / session 卡死。runner 创建是唯一收口点,这里把任何不在白名单的
+ * 模型降级到平台默认(glm-5.2),使"Claude 官方模型下线"在 agent 级路径上也真正生效。
+ */
+export function resolveExecutionModel(
+  preferred: string | undefined | null,
+  fallback: string | undefined | null,
+): string {
+  for (const m of [preferred, fallback]) {
+    if (typeof m === 'string' && ALLOWED_INBOUND_MODELS.has(m)) return m
+  }
+  return EXECUTION_MODEL_FALLBACK
+}
 
 /** Mirror SubprocessRunner's MCP merge rules for prompt/upload hints.
  * This is intentionally metadata-only: the actual tool injection still
