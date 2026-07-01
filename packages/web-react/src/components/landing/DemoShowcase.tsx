@@ -1,4 +1,4 @@
-import { Check, Sparkles } from "lucide-react";
+import { Check, FileDown, Sparkles } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
 import { cn } from "../../lib/utils";
 import { DEMO_SCENARIOS } from "./demoScripts";
@@ -32,6 +32,9 @@ export function DemoShowcase({ onTry }: { onTry: () => void }) {
   const [stepCount, setStepCount] = useState(0); // 已亮起的执行动作数
   const [typed, setTyped] = useState(0); // 已打出的答案字数
   const [done, setDone] = useState(false); // 本幕答案是否打完
+  // stepCount/typed/done 归属的场景。切场景时 idx 先变、这些进度态下一拍才在 effect 里重置，
+  // 中间那一帧若直接用旧进度态配新场景，会让新场景的答案/交付物芯片错误闪现。以此守卫。
+  const [stateIdx, setStateIdx] = useState(0);
 
   const next = useCallback(() => setIdx((i) => (i + 1) % DEMO_SCENARIOS.length), []);
 
@@ -39,6 +42,7 @@ export function DemoShowcase({ onTry }: { onTry: () => void }) {
     const sc = DEMO_SCENARIOS[idx];
     const steps = sc.steps ?? [];
     const answer = sc.answer;
+    setStateIdx(idx); // 进度态从这一拍起归属当前场景
 
     if (reduced) {
       // 无障碍：直接呈现完整内容，仅做定时轮播。
@@ -88,8 +92,13 @@ export function DemoShowcase({ onTry }: { onTry: () => void }) {
 
   const sc = DEMO_SCENARIOS[idx];
   const steps = sc.steps ?? [];
-  const shownAnswer = sc.answer.slice(0, typed);
-  const typing = !done && typed < sc.answer.length;
+  // 未同步（切场景后的第一帧）时一律按重置态渲染，避免用上一幕的完成态配新场景。
+  const synced = stateIdx === idx;
+  const shownStep = synced ? stepCount : 0;
+  const shownTyped = synced ? typed : 0;
+  const shownDone = synced ? done : false;
+  const shownAnswer = sc.answer.slice(0, shownTyped);
+  const typing = !shownDone && shownTyped < sc.answer.length;
 
   return (
     <div className="mx-auto w-full max-w-2xl">
@@ -125,7 +134,7 @@ export function DemoShowcase({ onTry }: { onTry: () => void }) {
           </span>
           <span className="text-[13px] font-medium text-fg">全能助手</span>
           <span className="ml-auto rounded-full border border-border bg-bg px-2 py-0.5 text-[11px] text-faint">
-            实时演示
+            动态演示
           </span>
         </div>
 
@@ -142,7 +151,7 @@ export function DemoShowcase({ onTry }: { onTry: () => void }) {
           {steps.length > 0 && (
             <div className="flex flex-wrap gap-2">
               {steps.map((st, i) => {
-                const shown = i < stepCount;
+                const shown = i < shownStep;
                 return (
                   <span
                     key={st.label}
@@ -162,7 +171,7 @@ export function DemoShowcase({ onTry }: { onTry: () => void }) {
           )}
 
           {/* 助手气泡（逐字打字） */}
-          {(typed > 0 || (steps.length > 0 && stepCount >= steps.length)) && (
+          {(shownTyped > 0 || (steps.length > 0 && shownStep >= steps.length)) && (
             <div className="flex justify-start">
               <div className="max-w-[92%] rounded-2xl rounded-bl-md border border-border bg-bg px-3.5 py-2.5">
                 <p
@@ -176,6 +185,13 @@ export function DemoShowcase({ onTry }: { onTry: () => void }) {
                     <span className="caret-blink ml-0.5 inline-block h-[1.05em] w-[2px] translate-y-[2px] bg-accent align-middle" />
                   )}
                 </p>
+                {/* 交付物附件芯片：答案打完后出现，让「交出真实成果」可视化。 */}
+                {sc.deliverable && shownDone && (
+                  <span className="mt-2.5 inline-flex items-center gap-1.5 rounded-lg border border-accent/30 bg-accent-soft px-2.5 py-1.5 text-[12.5px] font-medium text-accent animate-in">
+                    <FileDown size={14} className="shrink-0" />
+                    {sc.deliverable}
+                  </span>
+                )}
               </div>
             </div>
           )}

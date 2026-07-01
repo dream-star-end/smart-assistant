@@ -99,7 +99,7 @@ export function Landing({
             </span>
           </h1>
           <p className="mx-auto mt-6 max-w-xl text-[17px] leading-relaxed text-muted animate-in">
-            一位全能助手开箱即用 —— 写作、编程、研究、分析样样在行；需要更专业时从 AI 市场一键加装能力，它还会记住你的偏好，越来越懂你。
+            上传文件、联网调研、跑代码、做分析 —— 把复杂的活交给它，交回看板、报告、PPT、代码等能直接用的成果。需要更专业时从 AI 市场一键加装能力，它还记得你的偏好。
           </p>
           <div className="mt-9 flex flex-col items-center justify-center gap-3 sm:flex-row animate-in">
             <Button variant="primary" shape="pill" size="lg" onClick={onStart} className="group shadow-float">

@@ -14,7 +14,7 @@ describe("Landing 落地页", () => {
     // 叙事主题
     expect(screen.getByText(/越用越好用，越用越懂你/)).toBeInTheDocument();
     // 动态演示：首个场景的用户提问立即可见（不参与打字动画）
-    expect(screen.getByText(/桂花乌龙拿铁/)).toBeInTheDocument();
+    expect(screen.getByText(/业绩看板/)).toBeInTheDocument();
     // 教程区 + 可复制示例
     expect(screen.getByText(/五分钟，玩转每个功能/)).toBeInTheDocument();
     expect(screen.getAllByText(/试着说/).length).toBeGreaterThan(0);
