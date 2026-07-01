@@ -4675,7 +4675,10 @@ export class Gateway {
     }
 
     const runId = `trun-${Date.now().toString(36)}-${randomBytes(4).toString('hex')}`
-    const leaderSessionKey = `agent:${team.leaderAgentId}:teamrun:${runId}`
+    // leader session key 带随机 nonce → 不可预测。它既是 leader 身份、又是 finalize
+    // 授权凭据（只注入 leader MCP env、不经 API 回显），nonce 防被 teamRunId+leaderAgentId
+    // 重构（Codex 审：可预测的凭据等于没凭据）。
+    const leaderSessionKey = `agent:${team.leaderAgentId}:teamrun:${runId}:${randomBytes(12).toString('hex')}`
     const policy = team.policy ?? {}
     // snapshot 存盘时已被 normalizeAgentTeamInput 钳到 TEAM_MAX_PARALLEL_CAP;此处兜底 >=1
     const maxParallel = Math.max(1, policy.maxParallel ?? 1)
@@ -5648,6 +5651,9 @@ export class Gateway {
         maxParallel: teamRunLeader.maxParallel,
       })
       if (!admit.admitted) {
+        if (admit.reason === 'run_closed') {
+          return this.sendError(res, 409, 'team run is no longer active')
+        }
         return this.sendError(res, 429, `team run maxParallel reached (${teamRunLeader.maxParallel})`)
       }
       teamDelegationId = admit.delegationId

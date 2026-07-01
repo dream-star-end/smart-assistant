@@ -297,38 +297,49 @@ export async function admitTeamDelegation(input: {
   maxParallel: number
 }): Promise<
   | { admitted: true; delegationId: string }
-  | { admitted: false; reason: 'maxParallel'; delegationId: string }
+  | { admitted: false; reason: 'maxParallel' | 'run_closed'; delegationId: string | null }
 > {
   const db = await getSessionsDb()
   const now = Date.now()
-  // 原子：数在跑委派 + 视额度插一行(running 或 rejected)。总是留账本行，
-  // 让 UI 能看到被拒的委派（Codex 审：admission 超额不能只返回布尔、要有 ledger 行）。
-  const tx = db.transaction((): { admitted: boolean; delegationId: string } => {
-    const running = db
-      .prepare(
-        "SELECT COUNT(*) AS c FROM team_delegations WHERE team_run_id = ? AND status = 'running'",
-      )
-      .get(input.teamRunId) as { c: number }
-    const delegationId = `tdl-${now.toString(36)}-${randomBytes(4).toString('hex')}`
-    if (running.c >= input.maxParallel) {
+  // 原子事务：run 仍 active(running) + 数在跑委派 + 视额度插一行。run status 检查
+  // 放进事务，防 finalize/admit 并发穿透（Codex 审）。超额留 rejected 账本行。
+  const tx = db.transaction(
+    (): { admitted: boolean; reason?: 'maxParallel' | 'run_closed'; delegationId: string | null } => {
+      const run = db
+        .prepare('SELECT status FROM team_runs WHERE team_run_id = ?')
+        .get(input.teamRunId) as { status: string } | undefined
+      if (!run || run.status !== 'running') {
+        return { admitted: false, reason: 'run_closed', delegationId: null }
+      }
+      const running = db
+        .prepare(
+          "SELECT COUNT(*) AS c FROM team_delegations WHERE team_run_id = ? AND status = 'running'",
+        )
+        .get(input.teamRunId) as { c: number }
+      const delegationId = `tdl-${now.toString(36)}-${randomBytes(4).toString('hex')}`
+      if (running.c >= input.maxParallel) {
+        db.prepare(
+          `INSERT INTO team_delegations
+             (delegation_id, team_run_id, member_agent_id, goal, status, reject_reason, completed_at, created_at, updated_at)
+           VALUES (?, ?, ?, ?, 'rejected', 'maxParallel', ?, ?, ?)`,
+        ).run(delegationId, input.teamRunId, input.memberAgentId, input.goal, now, now, now)
+        return { admitted: false, reason: 'maxParallel', delegationId }
+      }
       db.prepare(
         `INSERT INTO team_delegations
-           (delegation_id, team_run_id, member_agent_id, goal, status, reject_reason, completed_at, created_at, updated_at)
-         VALUES (?, ?, ?, ?, 'rejected', 'maxParallel', ?, ?, ?)`,
+           (delegation_id, team_run_id, member_agent_id, goal, status, started_at, created_at, updated_at)
+         VALUES (?, ?, ?, ?, 'running', ?, ?, ?)`,
       ).run(delegationId, input.teamRunId, input.memberAgentId, input.goal, now, now, now)
-      return { admitted: false, delegationId }
-    }
-    db.prepare(
-      `INSERT INTO team_delegations
-         (delegation_id, team_run_id, member_agent_id, goal, status, started_at, created_at, updated_at)
-       VALUES (?, ?, ?, ?, 'running', ?, ?, ?)`,
-    ).run(delegationId, input.teamRunId, input.memberAgentId, input.goal, now, now, now)
-    return { admitted: true, delegationId }
-  })
+      return { admitted: true, delegationId }
+    },
+  )
   const r = tx()
-  return r.admitted
-    ? { admitted: true, delegationId: r.delegationId }
-    : { admitted: false, reason: 'maxParallel', delegationId: r.delegationId }
+  if (r.admitted) return { admitted: true, delegationId: r.delegationId as string }
+  return {
+    admitted: false,
+    reason: r.reason as 'maxParallel' | 'run_closed',
+    delegationId: r.delegationId,
+  }
 }
 
 // admission 后、spawn child 前：把新建的 child session key 记回委派行（D-B 反查依赖）。
