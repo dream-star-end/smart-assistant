@@ -12,10 +12,10 @@ import { Modal, Switch } from './ui'
  * (default 全能助手 + installed market agents), not a hardcoded set. "从市场添加"
  * routes to the marketplace agent tab.
  *
- * 团队模式(v5 轻量组队):开关只挂在「全能助手」(main)卡片上——开启后，用户发消息时 main
- * 队长会按任务自动选调已安装的 agent 组队(delegate_task)。开关是 turn 级 flag(App 持有
- * teamMode 状态，只在 agent.id==='main' 时随消息发送)，故换 agent 不影响、可随时切。
- * Radix Switch 本身是 <button>，不能嵌进卡片 <button>，所以做成主卡下方的独立 toggle 行。
+ * 布局:「全能助手」(main,默认) 单独占满宽度作 featured 卡,团队模式开关是它的**内嵌页脚**
+ * (同一 bordered 块,顶部分隔线)——开关语义上属于全能助手,视觉上不打乱下方 agent 网格。
+ * 其它已安装 agent + 市场入口走 2 列均匀网格。团队模式是 turn 级 flag(App 持 teamMode,
+ * 只在 agent.id==='main' 时随消息发送),故换 agent 不影响、可随时切。
  */
 export function AgentPicker({
   open,
@@ -57,6 +57,10 @@ export function AgentPicker({
     }
   }, [open, auth])
 
+  const defaultAgent = agents.find((a) => a.isDefault) ?? MAIN_AGENT
+  const others = agents.filter((a) => !a.isDefault)
+  const defaultActive = defaultAgent.id === current.id
+
   return (
     <Modal
       open={open}
@@ -70,15 +74,67 @@ export function AgentPicker({
           <Loader2 size={13} className="animate-spin" /> 加载你的智能体…
         </div>
       )}
+
+      {/* 全能助手(默认)—— featured 整块占满宽度,团队模式开关为其内嵌页脚 */}
+      <div
+        className={cn(
+          'mb-3 overflow-hidden rounded-xl border transition-colors',
+          defaultActive ? 'border-accent' : 'border-accent/35',
+        )}
+      >
+        <button
+          type="button"
+          onClick={() => onPick(defaultAgent)}
+          className={cn(
+            'flex w-full items-start gap-3 p-3.5 text-left outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset',
+            defaultActive ? 'bg-accent-soft' : 'bg-accent-soft/40 hover:bg-accent-soft',
+          )}
+        >
+          <AgentAvatar
+            agent={defaultAgent}
+            className="size-10 rounded-lg shadow-sm"
+            iconSize={19}
+          />
+          <span className="min-w-0 flex-1">
+            <span className="flex items-center gap-1.5">
+              <span className="text-[14.5px] font-semibold text-fg">{defaultAgent.name}</span>
+              <span className="rounded bg-accent/15 px-1.5 py-0.5 text-[10px] font-medium text-accent">
+                默认
+              </span>
+              {defaultActive && <Check size={14} className="text-accent" />}
+            </span>
+            <span className="mt-0.5 line-clamp-2 text-[12.5px] leading-snug text-muted">
+              {defaultAgent.description}
+            </span>
+          </span>
+        </button>
+
+        {onToggleTeamMode && (
+          <div className="flex items-center justify-between gap-3 border-t border-accent/20 bg-surface/70 px-3.5 py-2.5">
+            <span className="flex min-w-0 flex-col">
+              <span className="flex items-center gap-1.5 text-[12.5px] font-semibold text-fg">
+                <Users size={13} className="text-accent" /> 团队模式
+              </span>
+              <span className="mt-0.5 text-[11.5px] leading-snug text-muted">
+                开启后，全能助手按任务自动选调已安装的智能体组队协作；简单任务仍自己完成。
+              </span>
+            </span>
+            <Switch checked={teamMode} onCheckedChange={onToggleTeamMode} aria-label="启用团队模式" />
+          </div>
+        )}
+      </div>
+
+      {/* 其它已安装 agent + 市场入口 —— 2 列均匀网格 */}
       <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-2">
-        {agents.map((a) => {
+        {others.map((a) => {
           const active = a.id === current.id
-          const card = (
+          return (
             <button
               type="button"
+              key={a.id}
               onClick={() => onPick(a)}
               className={cn(
-                'group flex w-full items-start gap-3 rounded-xl border p-3.5 text-left outline-none transition-[transform,box-shadow,border-color,background-color] duration-150 ease-standard focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg',
+                'group flex items-start gap-3 rounded-xl border p-3.5 text-left outline-none transition-[transform,box-shadow,border-color,background-color] duration-150 ease-standard focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg',
                 active
                   ? 'border-accent bg-accent-soft'
                   : 'border-border bg-surface hover:-translate-y-0.5 hover:border-border-strong hover:shadow-soft',
@@ -88,11 +144,6 @@ export function AgentPicker({
               <span className="min-w-0 flex-1">
                 <span className="flex items-center gap-1.5">
                   <span className="text-[14.5px] font-semibold text-fg">{a.name}</span>
-                  {a.isDefault && (
-                    <span className="rounded bg-hover px-1.5 py-0.5 text-[10px] text-muted">
-                      默认
-                    </span>
-                  )}
                   {active && <Check size={14} className="text-accent" />}
                 </span>
                 <span className="mt-0.5 line-clamp-2 text-[12.5px] leading-snug text-muted">
@@ -101,37 +152,6 @@ export function AgentPicker({
               </span>
             </button>
           )
-
-          // 团队模式开关：只在「全能助手」卡片下方渲染（非 demo）。
-          if (a.isDefault && onToggleTeamMode) {
-            return (
-              <div key={a.id} className="flex flex-col gap-1.5">
-                {card}
-                <div
-                  className={cn(
-                    'flex items-center justify-between gap-3 rounded-xl border px-3 py-2 transition-colors',
-                    teamMode ? 'border-accent/60 bg-accent-soft' : 'border-border bg-surface',
-                  )}
-                >
-                  <span className="flex min-w-0 flex-col">
-                    <span className="flex items-center gap-1.5 text-[12.5px] font-semibold text-fg">
-                      <Users size={13} className="text-accent" /> 团队模式
-                    </span>
-                    <span className="mt-0.5 text-[11.5px] leading-snug text-muted">
-                      开启后，全能助手会按任务自动选调已安装的智能体组队协作；简单任务仍自己完成。
-                    </span>
-                  </span>
-                  <Switch
-                    checked={teamMode}
-                    onCheckedChange={onToggleTeamMode}
-                    aria-label="启用团队模式"
-                  />
-                </div>
-              </div>
-            )
-          }
-
-          return <div key={a.id}>{card}</div>
         })}
 
         {onAddFromMarket && (
