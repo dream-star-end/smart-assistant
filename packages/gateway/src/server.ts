@@ -55,6 +55,10 @@ import {
   searchSessions,
   syncMarketplaceHub,
   writeAgentsConfig,
+  createTeamRun,
+  getTeamRun,
+  listTeamDelegations,
+  updateTeamRunStatus,
   writeConfig,
   getUsageSummary,
   queryEvents,
@@ -68,6 +72,7 @@ import {
   claimSession,
 } from '@openclaude/storage'
 import { normalizeAgentTeamInput, TEAM_ID_RE } from './agentTeams.js'
+import { buildTeamLeaderPrompt } from './teamRun.js'
 import type { SessionStreamEvent } from './ccbMessageParser.js'
 import { type SkillTrainRun, SkillTrainJobStore } from './skillTrainJobs.js'
 import {
@@ -2222,6 +2227,21 @@ export class Gateway {
     const agentTeamIdMatch = url.pathname.match(/^\/api\/agent-teams\/([a-zA-Z0-9_-]+)$/)
     if (agentTeamIdMatch) {
       this.handleAgentTeamItem(req, res, agentTeamIdMatch[1]).catch((err) =>
+        this.sendError(res, 500, String(err)),
+      )
+      return
+    }
+    // Team run: server-side first-class team run (createTeamRun + observe).
+    const teamRunCreateMatch = url.pathname.match(/^\/api\/agent-teams\/([a-zA-Z0-9_-]+)\/runs$/)
+    if (teamRunCreateMatch) {
+      this.handleCreateTeamRun(req, res, teamRunCreateMatch[1]).catch((err) =>
+        this.sendError(res, 500, String(err)),
+      )
+      return
+    }
+    const teamRunGetMatch = url.pathname.match(/^\/api\/team-runs\/([a-zA-Z0-9_-]+)$/)
+    if (teamRunGetMatch) {
+      this.handleTeamRunGet(req, res, teamRunGetMatch[1]).catch((err) =>
         this.sendError(res, 500, String(err)),
       )
       return
@@ -4572,6 +4592,130 @@ export class Gateway {
       return
     }
     this.sendError(res, 405, 'method not allowed')
+  }
+
+  // POST /api/agent-teams/:id/runs  { goal, sessionKey } → { teamRunId, leaderSessionKey }
+  //
+  // v5 团队模式的服务端发起入口。冻结团队 snapshot、建独立队长 session（注入
+  // teamRunId env）、服务端构建队长 prompt、把队长输出**桥接**回发起用户的会话
+  // （origin = getByKey(sessionKey) 的 {channel,peerId,userId}）。取代老 web 客户端
+  // buildTeamRunPrompt + 直接发队长 agent 的旧路径。
+  private async handleCreateTeamRun(
+    req: IncomingMessage,
+    res: ServerResponse,
+    teamId: string,
+  ): Promise<void> {
+    if (req.method !== 'POST') return this.sendError(res, 405, 'method not allowed')
+    if (!TEAM_ID_RE.test(teamId)) return this.sendError(res, 404, 'team not found')
+    let parsed: any
+    try {
+      parsed = JSON.parse(await this.readBody(req))
+    } catch {
+      return this.sendError(res, 400, 'invalid JSON')
+    }
+    const goal = typeof parsed?.goal === 'string' ? parsed.goal.trim() : ''
+    const originSessionKey = typeof parsed?.sessionKey === 'string' ? parsed.sessionKey : ''
+    if (!goal) return this.sendError(res, 400, 'goal required')
+    if (!originSessionKey) return this.sendError(res, 400, 'sessionKey required')
+
+    // origin = 发起用户的会话（队长输出流回这里，run 才可观测）
+    const origin = this.sessions.getByKey(originSessionKey)
+    if (!origin) return this.sendError(res, 404, 'origin session not found')
+
+    const cfg = await this._getAgentsConfig()
+    const team = (cfg.teams ?? []).find((t) => t.id === teamId)
+    if (!team) return this.sendError(res, 404, 'team not found')
+    const leaderAgent = cfg.agents.find((a) => a.id === team.leaderAgentId)
+    if (!leaderAgent) {
+      return this.sendError(res, 400, `leader agent "${team.leaderAgentId}" not found`)
+    }
+
+    const runId = `trun-${Date.now().toString(36)}-${randomBytes(4).toString('hex')}`
+    const leaderSessionKey = `agent:${team.leaderAgentId}:teamrun:${runId}`
+    const policy = team.policy ?? {}
+    // snapshot 存盘时已被 normalizeAgentTeamInput 钳到 TEAM_MAX_PARALLEL_CAP;此处兜底 >=1
+    const maxParallel = Math.max(1, policy.maxParallel ?? 1)
+
+    await createTeamRun({
+      teamRunId: runId,
+      teamId: team.id,
+      teamSnapshot: team,
+      userGoal: goal,
+      originChannel: origin.channel,
+      originPeerId: origin.peerId,
+      originSessionKey: origin.sessionKey,
+      originUserId: origin.userId ?? null,
+      leaderAgentId: team.leaderAgentId,
+      leaderSessionKey,
+      maxParallel,
+      reviewRequired: !!policy.requireReview,
+      reviewAgentId: policy.requireReview ? policy.reviewAgentId ?? null : null,
+      status: 'running',
+    })
+
+    const leaderSession = await this.sessions.getOrCreate({
+      sessionKey: leaderSessionKey,
+      agent: leaderAgent,
+      channel: 'delegate',
+      peerId: origin.peerId,
+      title: `[team] ${goal.slice(0, 40)}`,
+      teamRunId: runId,
+    })
+
+    // 桥接：队长 session 的每个 block → origin（用户）会话。形态同 delegate emitProgress
+    // / webchat 逐块流；无 block 的 isFinal=true 作终止帧。
+    const deliverLeaderBlock = (block: unknown | null, isFinal: boolean): void => {
+      this.deliver({
+        type: 'outbound.message',
+        sessionKey: origin.sessionKey,
+        channel: origin.channel,
+        peer: { id: origin.peerId, kind: 'dm' },
+        blocks: block ? [block] : [],
+        isFinal,
+        _userId: origin.userId,
+      } as OutboundMessage & { _userId?: string })
+    }
+
+    const prompt = buildTeamLeaderPrompt(team, goal)
+    // fire-and-forget：立即返回 runId，队长 turn 异步流式跑（可能很长）。
+    const submitPromise = this.sessions.submit(leaderSession, prompt, (e) => {
+      if (e.kind === 'block') deliverLeaderBlock(e.block, false)
+      else if (e.kind === 'error') {
+        deliverLeaderBlock({ kind: 'text', text: `[error] ${e.error}` }, false)
+      }
+    })
+    submitPromise
+      .then(async () => {
+        // 兜底 gate：队长 turn 结束但未经 submit_team_final（final_accepted_at 空）→
+        // 标 finalize_required，UI 显示"未提交最终答案"，不误判 completed。
+        const run = await getTeamRun(runId)
+        if (run && !run.finalAcceptedAt && run.status === 'running') {
+          await updateTeamRunStatus(runId, 'finalize_required')
+        }
+        deliverLeaderBlock(null, true)
+      })
+      .catch(async (err) => {
+        await updateTeamRunStatus(runId, 'failed').catch(() => {})
+        deliverLeaderBlock(
+          { kind: 'text', text: `[team error] ${String(err?.message ?? err)}` },
+          true,
+        )
+      })
+
+    this.sendJson(res, 201, { teamRunId: runId, leaderSessionKey })
+  }
+
+  // GET /api/team-runs/:id → { run, delegations }
+  private async handleTeamRunGet(
+    req: IncomingMessage,
+    res: ServerResponse,
+    runId: string,
+  ): Promise<void> {
+    if (req.method !== 'GET') return this.sendError(res, 405, 'method not allowed')
+    const run = await getTeamRun(runId)
+    if (!run) return this.sendError(res, 404, 'team run not found')
+    const delegations = await listTeamDelegations(runId)
+    this.sendJson(res, 200, { run, delegations })
   }
 
   // GET /api/agents/:id    → { agent }
