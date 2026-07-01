@@ -248,17 +248,24 @@ export async function markTeamRunReviewReturned(teamRunId: string, at: number): 
   ).run(at, Date.now(), teamRunId)
 }
 
+// 原子 CAS finalize：仅当 run 仍开放（未 finalize、非终态）才落 completed，返回是否生效。
+// 防并发 double-finalize / last-write-wins（Codex 审）。
 export async function markTeamRunFinalAccepted(
   teamRunId: string,
   at: number,
   finalContentRef: string | null,
-): Promise<void> {
+): Promise<boolean> {
   const db = await getSessionsDb()
-  db.prepare(
-    `UPDATE team_runs
-       SET final_accepted_at = ?, final_content_ref = ?, status = 'completed', updated_at = ?
-     WHERE team_run_id = ?`,
-  ).run(at, finalContentRef, Date.now(), teamRunId)
+  const info = db
+    .prepare(
+      `UPDATE team_runs
+         SET final_accepted_at = ?, final_content_ref = ?, status = 'completed', updated_at = ?
+       WHERE team_run_id = ?
+         AND final_accepted_at IS NULL
+         AND status NOT IN ('failed','interrupted','completed')`,
+    )
+    .run(at, finalContentRef, Date.now(), teamRunId)
+  return info.changes > 0
 }
 
 // gateway 重启：把残留活跃 run 标记为 interrupted（in-memory interrupt map 已丢，

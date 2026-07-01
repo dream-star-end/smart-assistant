@@ -46,6 +46,10 @@ export function normalizeTeamPolicy(input: any, agentIds: Set<string>): AgentTea
     if (!agentIds.has(reviewAgentId)) throw new Error(`review agent "${reviewAgentId}" not found`)
     policy.reviewAgentId = reviewAgentId
   }
+  // fail-closed：requireReview 必须配合法 reviewAgentId，否则复核门形同虚设（Codex 审）。
+  if (policy.requireReview && !policy.reviewAgentId) {
+    throw new Error('policy.requireReview requires a valid policy.reviewAgentId')
+  }
   return Object.keys(policy).length ? policy : undefined
 }
 

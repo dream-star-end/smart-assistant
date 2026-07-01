@@ -4755,7 +4755,8 @@ export class Gateway {
         )
       })
 
-    this.sendJson(res, 201, { teamRunId: runId, leaderSessionKey })
+    // 不回显 leaderSessionKey：它是 finalize 授权凭据，只 leader 自己的 MCP env 知道（Codex 审）。
+    this.sendJson(res, 201, { teamRunId: runId })
   }
 
   // GET /api/team-runs/:id → { run, delegations }
@@ -4768,7 +4769,10 @@ export class Gateway {
     const run = await getTeamRun(runId)
     if (!run) return this.sendError(res, 404, 'team run not found')
     const delegations = await listTeamDelegations(runId)
-    this.sendJson(res, 200, { run, delegations })
+    // 不暴露 leaderSessionKey/originSessionKey：内部路由用，且 leaderSessionKey 是
+    // finalize 授权凭据，不应回显给前端（Codex 审）。
+    const { leaderSessionKey: _lsk, originSessionKey: _osk, ...runDto } = run
+    this.sendJson(res, 200, { run: runDto, delegations })
   }
 
   // POST /api/team-runs/:id/finalize  { content, summary?, sessionKey }
@@ -4800,12 +4804,13 @@ export class Gateway {
     if (run.status === 'interrupted' || run.status === 'failed') {
       return this.sendError(res, 409, `team run already ${run.status}`)
     }
-    if (run.finalAcceptedAt) {
-      return this.sendError(res, 409, 'team run already finalized')
-    }
 
-    // requireReview 硬 gate：必须存在一次 reviewer 且 completed 的委派。
-    if (run.reviewRequired && run.reviewAgentId) {
+    // requireReview 硬 gate（fail-closed）：要求复核则必须配 reviewer，且确有一次
+    // reviewer completed 委派。缺 reviewer 直接拒绝，不放行（Codex 审）。
+    if (run.reviewRequired) {
+      if (!run.reviewAgentId) {
+        return this.sendError(res, 409, 'team run requires review but no reviewer is configured')
+      }
       const reviewed = await hasCompletedReviewerDelegation(runId, run.reviewAgentId)
       if (!reviewed) {
         return this.sendError(
@@ -4816,7 +4821,11 @@ export class Gateway {
       }
     }
 
-    await markTeamRunFinalAccepted(runId, Date.now(), content)
+    // 原子 CAS：并发 double-finalize 只有一个能成功（Codex 审）。
+    const applied = await markTeamRunFinalAccepted(runId, Date.now(), content)
+    if (!applied) {
+      return this.sendError(res, 409, 'team run not open for finalize (already finalized or terminated)')
+    }
     this.sendJson(res, 200, { ok: true, teamRunId: runId })
   }
 
@@ -5506,6 +5515,14 @@ export class Gateway {
     const parentKey = typeof parsed.parentSessionKey === 'string' ? parsed.parentSessionKey : ''
     const teamRunLeader = parentKey ? await getTeamRunByLeaderSessionKey(parentKey) : null
     if (teamRunLeader) {
+      // 只有 active(running) run 接受新委派；已完成/终止的 run 拒绝（Codex 审）。
+      if (teamRunLeader.status !== 'running') {
+        return this.sendError(
+          res,
+          409,
+          `team run is ${teamRunLeader.status}, not accepting new delegations`,
+        )
+      }
       // leader 委派：成员白名单（只允许 snapshot 成员/复核者）
       const snap = teamRunLeader.teamSnapshot as {
         members?: Array<{ agentId: string }>
@@ -5636,19 +5653,37 @@ export class Gateway {
       teamDelegationId = admit.delegationId
     }
 
-    const session = await this.sessions.getOrCreate({
-      sessionKey,
-      agent: delegatedAgent,
-      channel: 'delegate',
-      peerId: sourceAgent || 'system',
-      repoSessionId: progressTarget?.peerId ?? delegateParent?.repoSessionId,
-      title: `[delegate] ${goal.slice(0, 40)}`,
-      delegationDepth: depth + 1,
-    })
+    // admission 已占额度：getOrCreate 抛错必须释放（落 failed），否则永久占 maxParallel。
+    const session = await this.sessions
+      .getOrCreate({
+        sessionKey,
+        agent: delegatedAgent,
+        channel: 'delegate',
+        peerId: sourceAgent || 'system',
+        repoSessionId: progressTarget?.peerId ?? delegateParent?.repoSessionId,
+        title: `[delegate] ${goal.slice(0, 40)}`,
+        delegationDepth: depth + 1,
+      })
+      .catch(async (err) => {
+        if (teamDelegationId) {
+          await completeTeamDelegation(teamDelegationId, {
+            status: 'failed',
+            error: `delegation init failed: ${String(err?.message ?? err)}`,
+          }).catch(() => {})
+        }
+        throw err
+      })
 
-    // D-B：把 child session key 记回委派行，供后续成员嵌套委派反查。
+    // D-B：把 child session key 记回委派行，供后续成员嵌套委派反查。SQLite 是权威，
+    // 回写失败必须让本次委派失败（否则成员嵌套拒绝会失效）—— 不能吞（Codex 审）。
     if (teamDelegationId) {
-      await setTeamDelegationChildSession(teamDelegationId, sessionKey).catch(() => {})
+      await setTeamDelegationChildSession(teamDelegationId, sessionKey).catch(async (err) => {
+        await completeTeamDelegation(teamDelegationId!, {
+          status: 'failed',
+          error: 'child session key writeback failed',
+        }).catch(() => {})
+        throw err
+      })
     }
 
     const progressRunId = `dlg-${Date.now().toString(36)}-${randomBytes(4).toString('hex')}`
