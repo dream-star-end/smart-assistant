@@ -9,6 +9,10 @@
 # 复杂需求(公式/透视/多表关联/图表/大数据分析)直接写 Python 用 openpyxl / pandas /
 # duckdb(见 office-spreadsheet skill),本 CLI 只做最高频的"结构化数据 → 规范 Excel"一击:
 #   表头加粗+底纹、冻结首行、自动列宽、中文字体、数字右对齐。零许可风险(openpyxl=MIT)。
+#
+# 安全:本 CLI 是**数据→表格转换器,绝不写公式**。所有字符串一律以「文本」类型写入
+# (data_type='s'),使 = / @ / + / - 开头的不可信内容(CSV/公式注入,如 =WEBSERVICE/
+# =HYPERLINK/=cmd)不会被 Excel/WPS/LibreOffice 当公式执行。数字仍以数值写入可参与计算。
 import csv
 import json
 import re
@@ -31,6 +35,8 @@ HEADER_FONT = Font(name=CJK_FONT, bold=True, color="FFFFFF", size=11)
 BODY_FONT = Font(name=CJK_FONT, size=11)
 THIN = Side(style="thin", color="D9D9D9")
 BORDER = Border(left=THIN, right=THIN, top=THIN, bottom=THIN)
+# Excel sheet 名禁用字符 + 长度上限 31。
+_SHEET_BAD = re.compile(r"[\[\]:*?/\\]")
 
 
 def fail(msg: str):
@@ -39,9 +45,11 @@ def fail(msg: str):
 
 
 def _num(v):
-    """尽量把纯数字字符串转成数值,让 Excel 识别为数字(可参与公式/图表)。"""
+    """尽量把纯数字字符串转成数值,让 Excel 识别为数字(可参与公式/图表)。非数值一律留作字符串。"""
     if v is None:
         return None
+    if isinstance(v, bool):
+        return v
     if isinstance(v, (int, float)):
         return v
     s = str(v).strip()
@@ -60,8 +68,16 @@ def _num(v):
     return s
 
 
+def _safe_sheet_name(name, fallback: str) -> str:
+    """清洗成合法 Excel sheet 名:去禁用字符、去首尾引号/空白、非空、≤31 字符。"""
+    s = _SHEET_BAD.sub(" ", str(name if name is not None else "")).strip().strip("'").strip()
+    if not s:
+        s = fallback
+    return s[:31]
+
+
 def _write_sheet(ws, rows, header=True):
-    """rows: list[list]。第一行可作表头。应用样式 + 自动列宽 + 冻结首行。"""
+    """rows: list[list]。第一行可作表头。应用样式 + 自动列宽 + 冻结首行。字符串一律文本类型。"""
     if not rows:
         return
     max_w = {}
@@ -70,6 +86,9 @@ def _write_sheet(ws, rows, header=True):
         for c_idx, raw in enumerate(row, start=1):
             val = raw if is_header else _num(raw)
             cell = ws.cell(row=r_idx, column=c_idx, value=val)
+            # 安全:字符串一律以文本类型存储,绝不让 openpyxl 把 =... 当公式(防公式注入)。
+            if isinstance(val, str) and val != "":
+                cell.data_type = "s"
             cell.border = BORDER
             if is_header:
                 cell.font = HEADER_FONT
@@ -78,7 +97,7 @@ def _write_sheet(ws, rows, header=True):
             else:
                 cell.font = BODY_FONT
                 cell.alignment = Alignment(
-                    horizontal="right" if isinstance(val, (int, float)) else "left",
+                    horizontal="right" if isinstance(val, (int, float)) and not isinstance(val, bool) else "left",
                     vertical="center",
                 )
             # 估算列宽(中文按 2 宽计)
@@ -136,7 +155,7 @@ def cmd_from_csv(args):
             rows.append(row)
     wb = Workbook()
     ws = wb.active
-    ws.title = args.get("sheet") or "Sheet1"
+    ws.title = _safe_sheet_name(args.get("sheet"), "Sheet1")
     _write_sheet(ws, rows, header=not args.get("no_header"))
     out = _out_path(inp, args.get("output"))
     wb.save(out)
@@ -145,24 +164,34 @@ def cmd_from_csv(args):
 
 def cmd_from_json(args):
     inp = args["input"]
-    data = json.loads(Path(inp).read_text(encoding="utf-8"))
-    if not isinstance(data, list) or not data or not isinstance(data[0], dict):
-        fail("from-json 需要「对象数组」,如 [{\"名称\":\"甲\",\"金额\":100}, ...]")
+    try:
+        data = json.loads(Path(inp).read_text(encoding="utf-8"))
+    except json.JSONDecodeError as e:
+        fail(f"JSON 解析失败: {e}")
+    if not isinstance(data, list) or not data:
+        fail('from-json 需要非空「对象数组」,如 [{"名称":"甲","金额":100}, ...]')
+    objs = [o for o in data if isinstance(o, dict)]
+    if not objs:
+        fail('from-json 需要「对象数组」:元素必须是 JSON 对象(dict)')
+    skipped = len(data) - len(objs)
     cols = []
-    for obj in data:
+    for obj in objs:
         for k in obj.keys():
             if k not in cols:
                 cols.append(k)
     rows = [cols]
-    for obj in data:
+    for obj in objs:
         rows.append([obj.get(c, "") for c in cols])
     wb = Workbook()
     ws = wb.active
-    ws.title = args.get("sheet") or "Sheet1"
+    ws.title = _safe_sheet_name(args.get("sheet"), "Sheet1")
     _write_sheet(ws, rows, header=True)
     out = _out_path(inp, args.get("output"))
     wb.save(out)
-    return out, {"sheets": 1, "rows": len(data)}
+    meta = {"sheets": 1, "rows": len(objs)}
+    if skipped:
+        meta["skippedNonObject"] = skipped
+    return out, meta
 
 
 def cmd_from_md(args):
@@ -174,12 +203,13 @@ def cmd_from_md(args):
     wb.remove(wb.active)
     used = set()
     for idx, (title, rows) in enumerate(tables, start=1):
-        name = (title or f"表{idx}")[:28]
-        base = name
+        base = _safe_sheet_name(title, f"表{idx}")
+        name = base
         n = 1
         while name in used:
             n += 1
-            name = f"{base}_{n}"[:28]
+            suffix = f"_{n}"
+            name = (base[: 31 - len(suffix)] + suffix)
         used.add(name)
         ws = wb.create_sheet(title=name)
         _write_sheet(ws, rows, header=True)
@@ -205,19 +235,27 @@ def parse_args(argv):
     while i < len(rest):
         a = rest[i]
         if a in ("-o", "--output"):
+            if i + 1 >= len(rest):
+                fail(f"{a} 需要一个路径")
             args["output"] = rest[i + 1]
             i += 2
         elif a == "--sheet":
+            if i + 1 >= len(rest):
+                fail("--sheet 需要一个名称")
             args["sheet"] = rest[i + 1]
             i += 2
         elif a == "--no-header":
             args["no_header"] = True
             i += 1
+        elif a.startswith("-") and a != "-":
+            fail(f"未知选项 {a!r}")
         else:
             positional.append(a)
             i += 1
     if not positional:
         fail(f"{sub}: 缺少输入文件")
+    if len(positional) > 1:
+        fail(f"{sub}: 只接受一个输入文件,多余参数: {positional[1:]}")
     args["input"] = positional[0]
     return sub, args
 
