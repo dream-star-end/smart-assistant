@@ -1,5 +1,5 @@
 import * as Dialog from "@radix-ui/react-dialog";
-import { AlertTriangle, CheckCircle2, Loader2, Play, Square, X, XCircle } from "lucide-react";
+import { AlertTriangle, CheckCircle2, Loader2, Play, RotateCcw, Square, X, XCircle } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { AGENTS } from "../../lib/agents";
 import { api } from "../../lib/api";
@@ -112,6 +112,7 @@ function TeamRunBody({
 }) {
   const [goal, setGoal] = useState("");
   const [runId, setRunId] = useState<string | null>(null);
+  const [parentRunId, setParentRunId] = useState<string | undefined>(undefined);
   const [launching, setLaunching] = useState(false);
   const [err, setErr] = useState<string | null>(null);
 
@@ -123,6 +124,7 @@ function TeamRunBody({
       const res = await api.createTeamRun(auth, teamId, {
         goal: goal.trim(),
         origin: { channel: "webchat", peerId: originPeerId || "web-team-run", peerKind: "dm" },
+        ...(parentRunId ? { parentRunId } : {}),
       });
       setRunId(res.teamRunId);
     } catch (e) {
@@ -130,9 +132,21 @@ function TeamRunBody({
     } finally {
       setLaunching(false);
     }
-  }, [auth, teamId, goal, originPeerId]);
+  }, [auth, teamId, goal, originPeerId, parentRunId]);
 
-  if (runId) return <TeamRunLedger auth={auth} runId={runId} goal={goal} />;
+  if (runId)
+    return (
+      <TeamRunLedger
+        auth={auth}
+        runId={runId}
+        goal={goal}
+        onRegen={() => {
+          // 用同一目标重开：runId 指向本次作为 parent，回到发起态（goal 保留）。
+          setParentRunId(runId);
+          setRunId(null);
+        }}
+      />
+    );
 
   return (
     <div className="flex flex-col gap-3 py-2">
@@ -173,10 +187,12 @@ function TeamRunLedger({
   auth,
   runId,
   goal,
+  onRegen,
 }: {
   auth: AuthSession;
   runId: string;
   goal: string;
+  onRegen: () => void;
 }) {
   const [run, setRun] = useState<TeamRun | null>(null);
   const [delegations, setDelegations] = useState<TeamDelegation[]>([]);
@@ -316,6 +332,14 @@ function TeamRunLedger({
       )}
       {run?.status === "finalize_required" && (
         <Alert>队长已结束但未提交最终答案（未走 submit_team_final），本次运行未正式收尾。</Alert>
+      )}
+      {!active && (
+        <div className="flex justify-end pt-1">
+          <Button variant="secondary" size="sm" onClick={onRegen}>
+            <RotateCcw size={13} />
+            用同一目标重新运行
+          </Button>
+        </div>
       )}
     </div>
   );

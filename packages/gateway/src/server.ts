@@ -4717,6 +4717,7 @@ export class Gateway {
       reviewRequired: !!policy.requireReview,
       reviewAgentId: policy.requireReview ? policy.reviewAgentId ?? null : null,
       finalizeToken,
+      parentRunId: typeof parsed?.parentRunId === 'string' ? parsed.parentRunId : null,
       status: 'running',
     })
 

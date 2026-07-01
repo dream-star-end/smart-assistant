@@ -1229,6 +1229,8 @@ export const api = {
       goal: string;
       sessionKey?: string;
       origin?: { channel?: string; peerId?: string; peerKind?: string; userId?: string };
+      /** 重新运行时指向上一次 run（溯源）。 */
+      parentRunId?: string;
     },
   ) =>
     jsonOrThrow<{ teamRunId: string }>(
