@@ -7,10 +7,6 @@ import type {
   CreatedApiKey,
   CronCreateInput,
   CronJob,
-  AgentTeam,
-  AgentTeamInput,
-  TeamRun,
-  TeamDelegation,
   GithubBranch,
   GithubLink,
   GithubRepo,
@@ -1168,110 +1164,6 @@ export const api = {
       callWithRefresh(a, (t) =>
         fetch(`/api/cron/${encodeURIComponent(id)}`, {
           method: "DELETE",
-          credentials: "include",
-          headers: bearerHeaders(t),
-        }),
-      ),
-    ),
-
-  // ── Agent Teams（团队模式）─────────────────────────────
-  /** 团队列表（GET /api/agent-teams）。 */
-  listTeams: (a: AuthSession) =>
-    jsonOrThrow<{ teams: AgentTeam[] }>(
-      callWithRefresh(a, (t) =>
-        fetch("/api/agent-teams", { credentials: "include", headers: bearerHeaders(t) }),
-      ),
-    ).then((b) => b.teams || []),
-
-  /** 新建团队（POST /api/agent-teams）。 */
-  createTeam: (a: AuthSession, body: AgentTeamInput) =>
-    jsonOrThrow<{ team: AgentTeam }>(
-      callWithRefresh(a, (t) =>
-        fetch("/api/agent-teams", {
-          method: "POST",
-          credentials: "include",
-          headers: bearerHeaders(t, true),
-          body: JSON.stringify(body),
-        }),
-      ),
-    ).then((b) => b.team),
-
-  /** 改团队（PUT /api/agent-teams/:id）。 */
-  updateTeam: (a: AuthSession, id: string, body: AgentTeamInput) =>
-    jsonOrThrow<{ team: AgentTeam }>(
-      callWithRefresh(a, (t) =>
-        fetch(`/api/agent-teams/${encodeURIComponent(id)}`, {
-          method: "PUT",
-          credentials: "include",
-          headers: bearerHeaders(t, true),
-          body: JSON.stringify(body),
-        }),
-      ),
-    ).then((b) => b.team),
-
-  /** 删除团队（DELETE /api/agent-teams/:id）。 */
-  deleteTeam: (a: AuthSession, id: string) =>
-    jsonOrThrow<{ ok: boolean }>(
-      callWithRefresh(a, (t) =>
-        fetch(`/api/agent-teams/${encodeURIComponent(id)}`, {
-          method: "DELETE",
-          credentials: "include",
-          headers: bearerHeaders(t),
-        }),
-      ),
-    ),
-
-  /** 发起一次团队运行（POST /api/agent-teams/:id/runs）→ { teamRunId }。 */
-  createTeamRun: (
-    a: AuthSession,
-    id: string,
-    body: {
-      goal: string;
-      sessionKey?: string;
-      origin?: { channel?: string; peerId?: string; peerKind?: string; userId?: string };
-      /** 重新运行时指向上一次 run（溯源）。 */
-      parentRunId?: string;
-    },
-  ) =>
-    jsonOrThrow<{ teamRunId: string }>(
-      callWithRefresh(a, (t) =>
-        fetch(`/api/agent-teams/${encodeURIComponent(id)}/runs`, {
-          method: "POST",
-          credentials: "include",
-          headers: bearerHeaders(t, true),
-          body: JSON.stringify(body),
-        }),
-      ),
-    ),
-
-  /** 团队运行历史（GET /api/team-runs?limit=N）→ TeamRun[]（审计，无敏感字段）。 */
-  listTeamRuns: (a: AuthSession, limit = 20) =>
-    jsonOrThrow<{ runs: TeamRun[] }>(
-      callWithRefresh(a, (t) =>
-        fetch(`/api/team-runs?limit=${limit}`, {
-          credentials: "include",
-          headers: bearerHeaders(t),
-        }),
-      ),
-    ).then((b) => b.runs || []),
-
-  /** 团队运行账本（GET /api/team-runs/:id）→ { run, delegations }。 */
-  getTeamRun: (a: AuthSession, runId: string) =>
-    jsonOrThrow<{ run: TeamRun; delegations: TeamDelegation[] }>(
-      callWithRefresh(a, (t) =>
-        fetch(`/api/team-runs/${encodeURIComponent(runId)}`, {
-          credentials: "include",
-          headers: bearerHeaders(t),
-        }),
-      ),
-    ),
-
-  /** 停止一次团队运行（POST /api/team-runs/:id/stop）→ 中断队长+全部委派。 */
-  stopTeamRun: (a: AuthSession, runId: string) =>
-    jsonOrThrow<{ ok: boolean; wasActive: boolean }>(
-      callWithRefresh(a, (t) =>
-        fetch(`/api/team-runs/${encodeURIComponent(runId)}/stop`, {
-          method: "POST",
           credentials: "include",
           headers: bearerHeaders(t),
         }),

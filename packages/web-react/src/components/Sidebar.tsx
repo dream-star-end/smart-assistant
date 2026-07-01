@@ -1,4 +1,4 @@
-import { LayoutGrid, LogOut, PanelLeftClose, Pencil, Plus, Search, Sparkles, Store, Trash2, Users } from "lucide-react";
+import { LayoutGrid, LogOut, PanelLeftClose, Pencil, Plus, Search, Sparkles, Store, Trash2 } from "lucide-react";
 import { useMemo, useState } from "react";
 import { BRAND } from "../lib/brand";
 import type { Session, User } from "../lib/types";
@@ -18,7 +18,6 @@ export function Sidebar({
   onLogout,
   onOpenAccount,
   onOpenManage,
-  onOpenTeam,
   onOpenMarketplace,
 }: {
   sessions: Session[];
@@ -35,8 +34,6 @@ export function Sidebar({
   onOpenAccount?: () => void;
   /** 打开管理中心（记忆/定时任务/技能）。省略则不渲染入口（demo）。 */
   onOpenManage?: () => void;
-  /** 打开团队管理（多智能体协作）。省略则不渲染入口（demo）。 */
-  onOpenTeam?: () => void;
   /** 打开 AI 市场（技能/智能体）。省略则不渲染入口（demo）。 */
   onOpenMarketplace?: () => void;
 }) {
@@ -96,17 +93,6 @@ export function Sidebar({
             <LayoutGrid size={16} className="text-faint" />
             管理中心
             <span className="ml-auto text-[11px] text-faint">记忆 · 定时 · 技能</span>
-          </button>
-        )}
-
-        {onOpenTeam && (
-          <button
-            onClick={onOpenTeam}
-            className="flex items-center gap-2.5 rounded-lg px-3 py-2 text-left text-[13.5px] font-medium text-muted outline-none transition-colors hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
-          >
-            <Users size={16} className="text-faint" />
-            团队
-            <span className="ml-auto text-[11px] text-faint">多智能体协作</span>
           </button>
         )}
 

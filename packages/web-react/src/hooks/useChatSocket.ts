@@ -54,6 +54,7 @@ export type UseChatSocket = {
     media?: InboundMessage["content"]["media"];
     model?: string;
     effortLevel?: InboundMessage["effortLevel"];
+    teamMode?: boolean;
   }) => void;
   stop: (sessId: string) => void;
   respondPermission: (p: {

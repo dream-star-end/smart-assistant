@@ -1295,6 +1295,7 @@ export class ChatSocket {
     media?: InboundMessage["content"]["media"];
     model?: string;
     effortLevel?: InboundMessage["effortLevel"];
+    teamMode?: boolean;
   }): void {
     const sess = this.ensureSession(p.sessId, p.agentId);
     // 主控 session 建行(每会话一次):必须在容器跑完 turn 回传 authored 消息之前落地,
@@ -1327,6 +1328,8 @@ export class ChatSocket {
       content: { text: p.text, ...(media ? { media } : {}) },
       ...(p.effortLevel !== undefined ? { effortLevel: p.effortLevel } : {}),
       ...(p.model ? { model: p.model } : {}),
+      // 团队模式(v5 轻量组队):只在开启时带上顶层 teamMode flag;后端仅 main 队长消费。
+      ...(p.teamMode ? { teamMode: true } : {}),
       ts: Date.now(),
     };
     const userMsg = addMessage(sess, "user", p.displayText ?? p.text, {

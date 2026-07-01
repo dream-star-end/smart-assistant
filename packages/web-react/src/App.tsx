@@ -37,8 +37,6 @@ import type { RepoBindErrorWire, RepoStatusWire } from "./lib/chat/frames";
 import type { MediaRef } from "./lib/chat/frames";
 import type { ChatMessage } from "./lib/chat/model";
 import { CONTINUE_PROMPT } from "./lib/chat/render";
-import { TeamManager } from "./components/team/TeamManager";
-import { TeamRunModal } from "./components/team/TeamRunModal";
 import { DEFAULT_AGENT } from "./lib/agents";
 import { ApiError, api } from "./lib/api";
 import type { StoredSession } from "./lib/persist";
@@ -146,6 +144,10 @@ export function App() {
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
   const [agent, setAgent] = useState(DEFAULT_AGENT);
   const [pickerOpen, setPickerOpen] = useState(false);
+  // 团队模式(v5 轻量组队):turn 级开关,只对「全能助手」(main)生效——开启后发消息时后端
+  // 给 main 队长注入组队引导,由它按任务自主 delegate_task 组已安装 agent 成队。换 agent 不清,
+  // 但只在 agent.id==='main' 时随消息发送(见 send)。开关 UI 挂在 AgentPicker 的 main 卡片。
+  const [teamMode, setTeamMode] = useState(false);
   // 对话模型：唯一权威源是后端 GET /api/public/models（v5 仅 claude/glm-5.2/deepseek/minimax）。
   // demo 用本地 fixture 仅作离线视觉，不发请求。选中的 modelId 由 P4 的 WS inbound.message 顶层发送。
   const [models, setModels] = useState<PublicModel[]>(demo ? DEMO_MODELS : []);
@@ -156,9 +158,6 @@ export function App() {
   const [inboxOpen, setInboxOpen] = useState(false);
   const [repoModalOpen, setRepoModalOpen] = useState(false);
   const [manageOpen, setManageOpen] = useState(false);
-  const [teamOpen, setTeamOpen] = useState(false);
-  const [launchTeam, setLaunchTeam] = useState<{ id: string; name: string } | null>(null);
-  const [viewRun, setViewRun] = useState<{ runId: string; title: string } | null>(null);
   const [manageTab, setManageTab] = useState<ManageTab>("memory");
   const [marketplaceOpen, setMarketplaceOpen] = useState(false);
   const [marketplaceTab, setMarketplaceTab] = useState<MarketplaceTab>("browse");
@@ -408,7 +407,15 @@ export function App() {
       sockRef.current?.ensureSession(sessionId, agent.id, text.slice(0, 24));
       // model：选中的真实模型 id（顶层字段，非 content 内）。effortLevel 本期不接（P5/后续）。
       // media：已上传附件（图片/文件等），随 inbound.message.content.media 发送。
-      sockRef.current?.send({ sessId: sessionId, agentId: agent.id, text, model: modelId, media });
+      // teamMode 只对 main 队长生效(其它 agent 无委派语义),故非 main 恒 false。
+      sockRef.current?.send({
+        sessId: sessionId,
+        agentId: agent.id,
+        text,
+        model: modelId,
+        media,
+        teamMode: agent.id === "main" ? teamMode : false,
+      });
       // 侧栏：提到顶 + 更新标题/时间/计数（计数仅作排序提示，权威消息在 WS service）。
       setSessions((c) => {
         const sid = sessionId!;
@@ -822,7 +829,6 @@ export function App() {
     onDelete: deleteSessionConfirm,
     onLogout: demo ? undefined : logout,
     onOpenManage: demo ? undefined : () => openManage("memory"),
-    onOpenTeam: demo ? undefined : () => setTeamOpen(true),
     onOpenMarketplace: demo ? undefined : () => openMarketplace("browse"),
   };
 
@@ -984,6 +990,8 @@ export function App() {
         open={pickerOpen}
         current={agent}
         auth={demo ? null : auth}
+        teamMode={teamMode}
+        onToggleTeamMode={demo ? undefined : setTeamMode}
         onAddFromMarket={
           demo
             ? undefined
@@ -1040,38 +1048,6 @@ export function App() {
         agentId={agent.id}
         onTabChange={setManageTab}
         onClose={() => setManageOpen(false)}
-      />
-
-      <TeamManager
-        open={teamOpen}
-        auth={auth}
-        onClose={() => setTeamOpen(false)}
-        onLaunch={(id, name) => {
-          setTeamOpen(false);
-          setLaunchTeam({ id, name });
-        }}
-        onViewRun={(runId, title) => {
-          setTeamOpen(false);
-          setViewRun({ runId, title });
-        }}
-      />
-
-      <TeamRunModal
-        open={!!launchTeam}
-        auth={auth}
-        teamId={launchTeam?.id ?? null}
-        teamName={launchTeam?.name}
-        originPeerId={activeId ?? undefined}
-        onClose={() => setLaunchTeam(null)}
-      />
-
-      <TeamRunModal
-        open={!!viewRun}
-        auth={auth}
-        teamId={null}
-        teamName={viewRun?.title}
-        viewRunId={viewRun?.runId ?? null}
-        onClose={() => setViewRun(null)}
       />
 
       <MarketplaceCenter

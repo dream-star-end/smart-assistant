@@ -1,31 +1,40 @@
-import { Check, Loader2, Store } from 'lucide-react'
+import { Check, Loader2, Store, Users } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { type Agent, MAIN_AGENT, agentFromApiRow } from '../lib/agents'
 import { api } from '../lib/api'
 import type { AuthSession } from '../lib/types'
 import { cn } from '../lib/utils'
 import { AgentAvatar } from './AgentAvatar'
-import { Modal } from './ui'
+import { Modal, Switch } from './ui'
 
 /**
  * B-positioning agent picker: lists the user's agents from /api/marketplace/my-agents
  * (default 全能助手 + installed market agents), not a hardcoded set. "从市场添加"
  * routes to the marketplace agent tab.
+ *
+ * 团队模式(v5 轻量组队):开关只挂在「全能助手」(main)卡片上——开启后，用户发消息时 main
+ * 队长会按任务自动选调已安装的 agent 组队(delegate_task)。开关是 turn 级 flag(App 持有
+ * teamMode 状态，只在 agent.id==='main' 时随消息发送)，故换 agent 不影响、可随时切。
+ * Radix Switch 本身是 <button>，不能嵌进卡片 <button>，所以做成主卡下方的独立 toggle 行。
  */
 export function AgentPicker({
   open,
   current,
   auth,
+  teamMode = false,
   onClose,
   onPick,
   onAddFromMarket,
+  onToggleTeamMode,
 }: {
   open: boolean
   current: Agent
   auth: AuthSession | null
+  teamMode?: boolean
   onClose: () => void
   onPick: (a: Agent) => void
   onAddFromMarket?: () => void
+  onToggleTeamMode?: (v: boolean) => void
 }) {
   const [agents, setAgents] = useState<Agent[]>([MAIN_AGENT])
   const [loading, setLoading] = useState(false)
@@ -64,13 +73,12 @@ export function AgentPicker({
       <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-2">
         {agents.map((a) => {
           const active = a.id === current.id
-          return (
+          const card = (
             <button
               type="button"
-              key={a.id}
               onClick={() => onPick(a)}
               className={cn(
-                'group flex items-start gap-3 rounded-xl border p-3.5 text-left outline-none transition-[transform,box-shadow,border-color,background-color] duration-150 ease-standard focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg',
+                'group flex w-full items-start gap-3 rounded-xl border p-3.5 text-left outline-none transition-[transform,box-shadow,border-color,background-color] duration-150 ease-standard focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg',
                 active
                   ? 'border-accent bg-accent-soft'
                   : 'border-border bg-surface hover:-translate-y-0.5 hover:border-border-strong hover:shadow-soft',
@@ -93,6 +101,37 @@ export function AgentPicker({
               </span>
             </button>
           )
+
+          // 团队模式开关：只在「全能助手」卡片下方渲染（非 demo）。
+          if (a.isDefault && onToggleTeamMode) {
+            return (
+              <div key={a.id} className="flex flex-col gap-1.5">
+                {card}
+                <div
+                  className={cn(
+                    'flex items-center justify-between gap-3 rounded-xl border px-3 py-2 transition-colors',
+                    teamMode ? 'border-accent/60 bg-accent-soft' : 'border-border bg-surface',
+                  )}
+                >
+                  <span className="flex min-w-0 flex-col">
+                    <span className="flex items-center gap-1.5 text-[12.5px] font-semibold text-fg">
+                      <Users size={13} className="text-accent" /> 团队模式
+                    </span>
+                    <span className="mt-0.5 text-[11.5px] leading-snug text-muted">
+                      开启后，全能助手会按任务自动选调已安装的智能体组队协作；简单任务仍自己完成。
+                    </span>
+                  </span>
+                  <Switch
+                    checked={teamMode}
+                    onCheckedChange={onToggleTeamMode}
+                    aria-label="启用团队模式"
+                  />
+                </div>
+              </div>
+            )
+          }
+
+          return <div key={a.id}>{card}</div>
         })}
 
         {onAddFromMarket && (
