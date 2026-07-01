@@ -206,6 +206,11 @@ import {
   type MiniMaxMediaHandler,
 } from "./minimax/mediaProxy.js";
 import {
+  MINIMAX_WEB_SEARCH_PATH,
+  makeMiniMaxWebSearchHandler,
+  type MiniMaxWebSearchHandler,
+} from "./minimax/webSearchProxy.js";
+import {
   makeInboundDispatcher,
   type PrepareWechatCodexTurnResult,
 } from "./wechat/inboundDispatcher.js";
@@ -1211,6 +1216,13 @@ export async function registerCommercial(
         pgPool: getPool(),
         tokenPlanKey: cfg.MINIMAX_TOKEN_PLAN_KEY,
       });
+      // /internal/v3/minimax-search — 容器内 CCB 内置 WebSearch(MiniMaxSearchAdapter)回源 master。
+      // key(MINIMAX_TOKEN_PLAN_KEY)只在 master,不注入容器;同款 verifyContainerIdentity 双因子。
+      // MiniMax coding_plan/search 中文深度强,替代脆弱的 Bing HTML 刮页(Bing Search API 已退役)。
+      const minimaxWebSearchHandler: MiniMaxWebSearchHandler = makeMiniMaxWebSearchHandler({
+        identityRepo,
+        tokenPlanKey: cfg.MINIMAX_TOKEN_PLAN_KEY,
+      });
       const codexRelayHandler: CodexRelayHandler = makeCodexRelayHandler({
         identityRepo,
         db: makeDefaultCodexRelayDb(),
@@ -1247,6 +1259,9 @@ export async function registerCommercial(
         }
         if (path === CODEX_RELAY_PREFIX || path.startsWith(`${CODEX_RELAY_PREFIX}/`)) {
           return codexRelayHandler(req, res, ctx);
+        }
+        if (path === MINIMAX_WEB_SEARCH_PATH) {
+          return minimaxWebSearchHandler(req, res, ctx);
         }
         if (path === SKILL_EMBED_PREFIX) {
           return skillEmbedHandler(req, res, ctx);
