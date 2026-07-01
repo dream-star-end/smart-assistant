@@ -1,5 +1,5 @@
 import * as Dialog from "@radix-ui/react-dialog";
-import { AlertTriangle, CheckCircle2, Loader2, Play, X, XCircle } from "lucide-react";
+import { AlertTriangle, CheckCircle2, Loader2, Play, Square, X, XCircle } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { AGENTS } from "../../lib/agents";
 import { api } from "../../lib/api";
@@ -181,6 +181,7 @@ function TeamRunLedger({
   const [run, setRun] = useState<TeamRun | null>(null);
   const [delegations, setDelegations] = useState<TeamDelegation[]>([]);
   const [err, setErr] = useState<string | null>(null);
+  const [stopping, setStopping] = useState(false);
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
@@ -208,6 +209,17 @@ function TeamRunLedger({
     };
   }, [auth, runId]);
 
+  const stop = useCallback(async () => {
+    setStopping(true);
+    try {
+      await api.stopTeamRun(auth, runId);
+    } catch {
+      // 忽略：下一次轮询会反映真实状态
+    } finally {
+      setStopping(false);
+    }
+  }, [auth, runId]);
+
   const active = run ? ACTIVE_STATUSES.has(run.status) : true;
 
   return (
@@ -226,6 +238,16 @@ function TeamRunLedger({
             并发上限 {run.maxParallel}
             {run.reviewRequired ? " · 强制复核" : ""}
           </span>
+        )}
+        {active && (
+          <button
+            onClick={stop}
+            disabled={stopping}
+            className="ml-auto flex items-center gap-1 rounded-md border border-border px-2 py-1 text-[11.5px] text-muted outline-none transition-colors hover:border-danger hover:bg-danger-soft hover:text-danger focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50"
+          >
+            <Square size={11} />
+            {stopping ? "停止中…" : "停止"}
+          </button>
         )}
       </div>
 

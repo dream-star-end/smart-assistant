@@ -67,6 +67,7 @@ import {
   completeTeamDelegation,
   markTeamRunFinalAccepted,
   hasCompletedReviewerDelegation,
+  interruptTeamRun,
   writeConfig,
   getUsageSummary,
   queryEvents,
@@ -2275,6 +2276,13 @@ export class Gateway {
     )
     if (teamRunFinalizeMatch) {
       this.handleTeamRunFinalize(req, res, teamRunFinalizeMatch[1]).catch((err) =>
+        this.sendError(res, 500, String(err)),
+      )
+      return
+    }
+    const teamRunStopMatch = url.pathname.match(/^\/api\/team-runs\/([a-zA-Z0-9_-]+)\/stop$/)
+    if (teamRunStopMatch) {
+      this.handleTeamRunStop(req, res, teamRunStopMatch[1]).catch((err) =>
         this.sendError(res, 500, String(err)),
       )
       return
@@ -4841,6 +4849,24 @@ export class Gateway {
       return this.sendError(res, 409, 'team run not open for finalize (already finalized or terminated)')
     }
     this.sendJson(res, 200, { ok: true, teamRunId: runId })
+  }
+
+  // POST /api/team-runs/:id/stop  → 用户主动中断一次团队运行（无需 finalize token：
+  // 这是用户对自己容器内运行的操作，普通 auth 即可）。复用 handleStop 的中断机制。
+  private async handleTeamRunStop(
+    req: IncomingMessage,
+    res: ServerResponse,
+    runId: string,
+  ): Promise<void> {
+    if (req.method !== 'POST') return this.sendError(res, 405, 'method not allowed')
+    const run = await getTeamRun(runId)
+    if (!run) return this.sendError(res, 404, 'team run not found')
+    // 中断队长 session + 其下所有成员委派（成员在 delegate 时以 leaderSessionKey 为
+    // parent 注册，_interruptDelegationsForParent 会递归停掉，与 handleStop 同机制）。
+    this.sessions.interrupt(run.leaderSessionKey)
+    this._interruptDelegationsForParent(run.leaderSessionKey)
+    const wasActive = await interruptTeamRun(runId)
+    this.sendJson(res, 200, { ok: true, wasActive })
   }
 
   // GET /api/agents/:id    → { agent }

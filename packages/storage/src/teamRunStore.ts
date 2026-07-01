@@ -291,6 +291,25 @@ export async function interruptStaleTeamRuns(): Promise<number> {
   return info.changes
 }
 
+// 用户主动停止一次运行：CAS 标 interrupted（仅当仍活跃）+ 活跃委派标 failed。
+// 返回是否本次真的停了活跃 run（幂等：已终态返回 false）。
+export async function interruptTeamRun(teamRunId: string): Promise<boolean> {
+  const db = await getSessionsDb()
+  const now = Date.now()
+  const info = db
+    .prepare(
+      `UPDATE team_runs SET status = 'interrupted', updated_at = ?
+       WHERE team_run_id = ?
+         AND status IN ('pending','running','waiting_review','finalize_required','finalizing')`,
+    )
+    .run(now, teamRunId)
+  db.prepare(
+    `UPDATE team_delegations SET status = 'failed', error = 'team run interrupted', completed_at = ?, updated_at = ?
+     WHERE team_run_id = ? AND status IN ('queued','running')`,
+  ).run(now, now, teamRunId)
+  return info.changes > 0
+}
+
 // ---- team_delegations ----
 
 // D-C：admission 原子事务 —— 数在跑委派 < maxParallel 才插一行 running。

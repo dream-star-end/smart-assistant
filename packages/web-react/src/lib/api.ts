@@ -1253,6 +1253,18 @@ export const api = {
       ),
     ),
 
+  /** 停止一次团队运行（POST /api/team-runs/:id/stop）→ 中断队长+全部委派。 */
+  stopTeamRun: (a: AuthSession, runId: string) =>
+    jsonOrThrow<{ ok: boolean; wasActive: boolean }>(
+      callWithRefresh(a, (t) =>
+        fetch(`/api/team-runs/${encodeURIComponent(runId)}/stop`, {
+          method: "POST",
+          credentials: "include",
+          headers: bearerHeaders(t),
+        }),
+      ),
+    ),
+
   /** 技能列表（GET /api/skills）。 */
   listSkills: (a: AuthSession) =>
     jsonOrThrow<{ skills: SkillSummary[] }>(
