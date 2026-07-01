@@ -340,6 +340,13 @@ export async function getSessionsDb(): Promise<Database.Database> {
     CREATE INDEX IF NOT EXISTS idx_team_deleg_child ON team_delegations(child_session_key);
   `)
 
+  // Migration: origin_peer_kind 在 team_runs 初版之后加入（本分支内演进）。已建过旧表的
+  // 本地 DB 需补列，否则带 origin_peer_kind 的 INSERT 失败（Codex 审）。
+  const teamRunCols = db.pragma('table_info(team_runs)') as Array<{ name: string }>
+  if (!teamRunCols.some((c) => c.name === 'origin_peer_kind')) {
+    db.exec('ALTER TABLE team_runs ADD COLUMN origin_peer_kind TEXT')
+  }
+
   _db = db
   return db
 }

@@ -4640,7 +4640,9 @@ export class Gateway {
       (typeof originIn.channel === 'string' && originIn.channel) || bySession?.channel || 'webchat'
     const originPeerId =
       (typeof originIn.peerId === 'string' && originIn.peerId) || bySession?.peerId || ''
-    const originPeerKind = (typeof originIn.peerKind === 'string' && originIn.peerKind) || 'dm'
+    // 规范化到协议允许的 dm|group（Codex 审：peerKind 来自请求字符串，需白名单）
+    const rawPeerKind = (typeof originIn.peerKind === 'string' && originIn.peerKind) || 'dm'
+    const originPeerKind: 'dm' | 'group' = rawPeerKind === 'group' ? 'group' : 'dm'
     const originUserId =
       (typeof originIn.userId === 'string' && originIn.userId) || bySession?.userId || null
     const originSessionKey =
@@ -4695,7 +4697,7 @@ export class Gateway {
         type: 'outbound.message',
         sessionKey: originSessionKey,
         channel: originChannel,
-        peer: { id: originPeerId, kind: originPeerKind as 'dm' },
+        peer: { id: originPeerId, kind: originPeerKind },
         blocks: block ? [block] : [],
         isFinal,
         _userId: originUserId ?? undefined,
