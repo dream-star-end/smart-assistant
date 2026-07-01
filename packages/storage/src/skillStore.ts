@@ -41,7 +41,7 @@ import {
   stat,
   writeFile,
 } from 'node:fs/promises'
-import { isAbsolute, join, resolve, sep } from 'node:path'
+import { isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { paths } from './paths.js'
 
 export const MAX_SKILL_NAME_LENGTH = 64
@@ -471,7 +471,11 @@ export class SkillStore {
       if (!VALID_AGENT_ID_RE.test(entry.name)) continue
       roots.push(paths.agentSkillsDir(entry.name))
     }
-    return roots
+    // Deterministic order: readdir() order is filesystem-dependent, and in aggregate
+    // mode a same-named skill can now exist under >1 agent (per-agent isolation). Sort
+    // by agent id so the aggregate view (main / /api/skills) is stable across calls —
+    // the name-dedup then always keeps the same representative rather than a random one.
+    return roots.sort()
   }
 
   async list(opts: SkillViewOptions = {}): Promise<SkillMetadata[]> {
@@ -741,6 +745,18 @@ export class SkillStore {
     const realHome = await realpath(paths.home)
     if (realWrite !== realHome && !realWrite.startsWith(realHome + sep)) {
       return { ok: false, error: 'write root resolves outside home' }
+    }
+    // Per-agent write target (no shared library): skill isolation is enforced BY
+    // directory, so the write root must resolve to exactly this agent's own
+    // agents/<id>/skills with no symlink hop. Reject a pre-planted symlink that would
+    // redirect a specialized agent's saves into another agent's dir or the shared
+    // library (which would defeat the cross-agent isolation). Shared writeRoot is
+    // validated within-home in the constructor and intentionally cross-agent.
+    if (this.sharedRoot == null) {
+      const expected = join(realHome, relative(paths.home, this.writeRoot))
+      if (realWrite !== expected) {
+        return { ok: false, error: 'per-agent skills root must not traverse a symlink' }
+      }
     }
     return { ok: true }
   }

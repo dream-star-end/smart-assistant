@@ -541,4 +541,18 @@ describe('buildAgentSkillStore — agent-scoped visibility (main aggregates, oth
     assert.ok(names.includes('shared-x') && names.includes('office-own') && names.includes('research-own'))
     assert.ok(!names.includes('plat-x'), 'platform hidden from user surface')
   })
+
+  it('non-default save rejects a symlinked per-agent write root (no escape to a peer dir)', async () => {
+    const EVIL = 'evil-agent'
+    const evilSkills = paths.agentSkillsDir(EVIL)
+    await mkdir(join(evilSkills, '..'), { recursive: true }) // agents/evil-agent
+    await symlink(paths.agentSkillsDir(RESEARCH), evilSkills, 'dir') // redirect into research's dir
+    const r = await buildAgentSkillStore(EVIL).save({ name: 'evil-x', description: 'x' }, 'b')
+    assert.equal(r.ok, false, 'must reject a symlinked per-agent write root')
+    assert.match(r.error ?? '', /symlink/)
+    assert.ok(
+      !existsSync(join(paths.agentSkillsDir(RESEARCH), 'evil-x', 'SKILL.md')),
+      'peer dir must not be written through the symlink',
+    )
+  })
 })
