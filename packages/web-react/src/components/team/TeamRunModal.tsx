@@ -95,7 +95,7 @@ export function TeamRunModal({
             {!auth ? (
               <p className="py-10 text-center text-[13px] text-faint">请先登录。</p>
             ) : viewRunId ? (
-              <TeamRunLedger key={viewRunId} auth={auth} runId={viewRunId} goal="" />
+              <TeamRunLedger key={viewRunId} auth={auth} runId={viewRunId} goal="" readOnly />
             ) : teamId ? (
               <TeamRunBody key={teamId} auth={auth} teamId={teamId} originPeerId={originPeerId} />
             ) : (
@@ -195,12 +195,15 @@ function TeamRunLedger({
   runId,
   goal,
   onRegen,
+  readOnly,
 }: {
   auth: AuthSession;
   runId: string;
   goal: string;
   /** 省略则不显示「重新运行」（历史查看模式）。 */
   onRegen?: () => void;
+  /** 只读审计视图（历史查看）：隐藏「停止」。 */
+  readOnly?: boolean;
 }) {
   const [run, setRun] = useState<TeamRun | null>(null);
   const [delegations, setDelegations] = useState<TeamDelegation[]>([]);
@@ -263,7 +266,7 @@ function TeamRunLedger({
             {run.reviewRequired ? " · 强制复核" : ""}
           </span>
         )}
-        {active && (
+        {active && !readOnly && (
           <button
             onClick={stop}
             disabled={stopping}

@@ -346,6 +346,9 @@ const BLOCKED_FOR_USER_RULES: readonly BlockedForUserRule[] = [
   { re: /^\/api\/team-runs$/, label: '/api/team-runs' },
   { re: /^\/api\/team-runs\/[A-Za-z0-9_-]+$/, label: '/api/team-runs/:id' },
   { re: /^\/api\/team-runs\/[A-Za-z0-9_-]+\/stop$/, label: '/api/team-runs/:id/stop' },
+  // finalize：**不**在 bridge allowlist(不代理到容器),但要在此 block 表 403 普通用户,
+  // 防其落到 host finalize route(Codex 审)。容器内 leader MCP 走 127.0.0.1 不经本 router。
+  { re: /^\/api\/team-runs\/[A-Za-z0-9_-]+\/finalize$/, label: '/api/team-runs/:id/finalize' },
 
   // ─── host cron / tasks / webhooks(所有方法,prompt 注入 = RCE)───
   { re: /^\/api\/cron(\/[^/]+)?$/, label: '/api/cron' },
