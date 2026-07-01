@@ -147,19 +147,66 @@ export function Landing({
         </div>
       </section>
 
-      {/* Agents */}
+      {/* Agents —— v5 纯市场:默认只配「全能助手」,其余是市场按需加装的示例(非预置 roster)。 */}
       <section id="agents" className="mx-auto max-w-6xl px-5 py-20">
         <div className="mb-12 text-center">
-          <h2 className="text-[32px] font-bold tracking-tight md:text-[40px]">AI 市场，按需取用</h2>
-          <p className="mx-auto mt-3 max-w-xl text-[16px] text-muted">全能助手之外，市场里还有更多专业智能体与技能 —— 写作、编程、研究、翻译……一键安装，随用随装。</p>
+          <h2 className="text-[32px] font-bold tracking-tight md:text-[40px]">一个全能助手起步，市场按需生长</h2>
+          <p className="mx-auto mt-3 max-w-2xl text-[16px] text-muted">
+            默认只配「全能助手」—— 写作、编程、研究、分析张口就用。需要更专业时，从 AI 市场一键加装专家智能体与技能，能力随需求生长。
+          </p>
+        </div>
+
+        {/* 默认配备:全能助手(唯一预置) */}
+        <button
+          onClick={onStart}
+          className="group mb-10 flex w-full items-start gap-5 rounded-2xl border border-accent/40 bg-accent-soft p-6 text-left outline-none transition-[transform,box-shadow,border-color] duration-200 ease-standard hover:-translate-y-0.5 hover:shadow-float focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg"
+        >
+          <AgentAvatar
+            agent={AGENTS[0]}
+            className="size-14 shrink-0 rounded-2xl shadow-sm"
+            iconSize={26}
+          />
+          <span className="min-w-0 flex-1">
+            <span className="flex flex-wrap items-center gap-2">
+              <span className="text-[19px] font-bold">{AGENTS[0].name}</span>
+              <span className="rounded-full bg-accent px-2 py-0.5 text-[11px] font-semibold text-white">
+                默认配备 · 即开即用
+              </span>
+            </span>
+            <span className="mt-1.5 block text-[14.5px] leading-relaxed text-muted">
+              {AGENTS[0].description}
+            </span>
+          </span>
+          <ArrowRight
+            size={20}
+            className="mt-1 shrink-0 text-accent transition-transform group-hover:translate-x-0.5"
+          />
+        </button>
+
+        {/* 市场:专业智能体(示例,陆续上新) —— 明确"从市场安装",不是预置 */}
+        <div className="mb-4 flex items-center justify-between gap-3">
+          <div className="flex items-center gap-2 text-[14px] font-semibold text-muted">
+            <Puzzle size={16} className="text-accent" />
+            AI 市场 · 专业智能体（示例，陆续上新）
+          </div>
+          <button
+            type="button"
+            onClick={onStart}
+            className="inline-flex items-center gap-1 text-[13.5px] font-medium text-accent outline-none hover:underline focus-visible:ring-2 focus-visible:ring-ring"
+          >
+            浏览 AI 市场 <ArrowRight size={14} />
+          </button>
         </div>
         <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
-          {AGENTS.map((a) => (
+          {AGENTS.slice(1).map((a) => (
             <button
               key={a.id}
               onClick={onStart}
-              className="group flex flex-col items-start rounded-xl border border-border bg-surface p-5 text-left outline-none transition-[transform,box-shadow,border-color] duration-200 ease-standard hover:-translate-y-0.5 hover:border-border-strong hover:shadow-float focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg"
+              className="group relative flex flex-col items-start rounded-xl border border-border bg-surface p-5 text-left outline-none transition-[transform,box-shadow,border-color] duration-200 ease-standard hover:-translate-y-0.5 hover:border-border-strong hover:shadow-float focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg"
             >
+              <span className="absolute right-3 top-3 inline-flex items-center gap-1 rounded-full border border-border bg-hover px-2 py-0.5 text-[10.5px] font-medium text-muted">
+                <Plus size={11} /> 市场安装
+              </span>
               <AgentAvatar agent={a} className="mb-4 size-11 rounded-xl shadow-sm" iconSize={21} />
               <span className="text-[16.5px] font-semibold">{a.name}</span>
               <span className="mt-0.5 text-[13px] font-medium text-accent">{a.tagline}</span>
