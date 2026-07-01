@@ -268,28 +268,47 @@ describe("openclaude-runtime entrypoint env-scrub policy", () => {
     );
   });
 
-  test("entrypoint.ts seeds commercial-supported default agents instead of Claude defaults", () => {
+  test("entrypoint.ts seeds ONLY the main 全能助手 agent (v5 纯市场:子 agent 走市场安装)", () => {
     const src = readFileSync(ENTRYPOINT_TS_PATH, "utf-8");
+    // 默认模型仍是 glm-5.2 / ark(火山方舟)
     assert.match(
       src,
       /const COMMERCIAL_DEFAULT_MODEL\s*=\s*"glm-5\.2"/,
-      "commercial runtime default model must be glm-5.2 (2026-06-17 boss:替换 glm-5.1、队长全切 glm-5.2)",
+      "commercial runtime default model must be glm-5.2",
     );
     assert.match(
       src,
       /const COMMERCIAL_DEFAULT_PROVIDER\s*=\s*"ark"/,
       "commercial runtime default provider must be ark (火山方舟)",
     );
+    // 纯市场:初始 agents.yaml 只 seed main。desiredSeedAgents 恰为 [desiredMainAgent]。
     assert.match(
       src,
-      /const COMMERCIAL_CODER_MODEL\s*=\s*"glm-5\.2"/,
-      "coder seed must be glm-5.2 (2026-06-17 由 glm-5.1 升级)",
+      /const desiredSeedAgents\s*=\s*\[desiredMainAgent\]/,
+      "v5 纯市场:initial agents.yaml must seed only the main agent (其它 agent 走市场安装)",
     );
-    assert.match(
-      src,
-      /const COMMERCIAL_CODER_PROVIDER\s*=\s*"ark"/,
-      "coder seed must use ark provider",
-    );
+    const mainAgent = extractConstObjectFromSource(src, "desiredMainAgent");
+    assert.match(mainAgent, /id:\s*"main"/, "main agent id must be stable");
+    assert.match(mainAgent, /model:\s*COMMERCIAL_DEFAULT_MODEL/, "main must use DEFAULT model (glm-5.2)");
+    assert.match(mainAgent, /provider:\s*COMMERCIAL_DEFAULT_PROVIDER/, "main must use DEFAULT provider (ark)");
+    assert.match(mainAgent, /permissionMode:\s*"bypassPermissions"/, "main must bypass permissions in the sandbox");
+    // 退役的平台预置子 agent / 团队定义不得再出现(纯市场根治 agent 数据分裂)。
+    for (const removed of [
+      "desiredResearcherAgent",
+      "desiredScientistAgent",
+      "desiredCoderAgent",
+      "desiredReviewerAgent",
+      "desiredScholarAgent",
+      "desiredCollaborationSeedAgents",
+      "desiredScienceTeam",
+      "desiredProgrammingTeam",
+    ]) {
+      assert.doesNotMatch(
+        src,
+        new RegExp(`const ${removed}\\b`),
+        `v5 纯市场:退役平台 seed ${removed} 必须已从 entrypoint 移除`,
+      );
+    }
     assert.doesNotMatch(
       src,
       /model:\s*"claude-opus-4-7"/,
@@ -298,125 +317,12 @@ describe("openclaude-runtime entrypoint env-scrub policy", () => {
     assert.doesNotMatch(
       src,
       /provider:\s*"claude-subscription"/,
-      "entrypoint must not seed Claude subscription provider for default commercial agents",
-    );
-    // v5 ccb-only:不再 seed codex agent。
-    for (const id of ["main", "researcher", "scientist", "coder", "reviewer", "scholar"]) {
-      assert.match(src, new RegExp(`id:\\s*"${id}"`), `entrypoint must seed ${id} agent`);
-    }
-    // 2026-06-16 boss 重配:按角色多样化(WS2)。researcher=MiniMax-M3、scientist/reviewer=deepseek-v4-pro、
-    // coder=glm-5.1(=DEFAULT)、main 不变。
-    assert.match(
-      src,
-      /const COMMERCIAL_RESEARCHER_MODEL\s*=\s*"MiniMax-M3"/,
-      "researcher seed must use MiniMax-M3 (512k long context)",
-    );
-    assert.match(
-      src,
-      /const COMMERCIAL_RESEARCHER_PROVIDER\s*=\s*"minimax"/,
-      "researcher seed must use the minimax provider",
-    );
-    assert.match(
-      src,
-      /const COMMERCIAL_DEEPSEEK_PRO_MODEL\s*=\s*"deepseek-v4-pro"/,
-      "scientist/reviewer seed must use DeepSeek V4 Pro",
-    );
-    assert.match(
-      src,
-      /const COMMERCIAL_DEEPSEEK_PRO_PROVIDER\s*=\s*"deepseek"/,
-      "scientist/reviewer seed must use the deepseek provider",
-    );
-    assert.match(
-      src,
-      /const desiredCollaborationSeedAgents\s*=\s*\[[\s\S]*desiredMainAgent[\s\S]*desiredResearcherAgent[\s\S]*desiredCoderAgent[\s\S]*desiredReviewerAgent[\s\S]*\]/,
-      "collaboration seed list should include the non-codex default agents",
-    );
-    assert.match(
-      src,
-      /const desiredCollaborationSeedAgents\s*=\s*\[[\s\S]*desiredResearcherAgent[\s\S]*desiredScientistAgent[\s\S]*desiredCoderAgent[\s\S]*\]/,
-      "collaboration seed list should include the dedicated scientist agent between researcher and coder",
-    );
-    assert.match(
-      src,
-      /const desiredSeedAgents\s*=\s*\[\.\.\.desiredCollaborationSeedAgents\]/,
-      "v5 ccb-only: initial agents.yaml should contain only the collaboration seed agents (no codex)",
+      "entrypoint must not seed Claude subscription provider for the default commercial agent",
     );
     assert.doesNotMatch(
       src,
       /provider:\s*"codex-native"/,
       "v5 ccb-only: entrypoint must not seed any codex-native agent",
-    );
-  });
-
-  test("entrypoint.ts seeds researcher/scientist/coder with core-only toolsets", () => {
-    const src = readFileSync(ENTRYPOINT_TS_PATH, "utf-8");
-    const researcher = extractConstObjectFromSource(src, "desiredResearcherAgent");
-    const scientist = extractConstObjectFromSource(src, "desiredScientistAgent");
-    const coder = extractConstObjectFromSource(src, "desiredCoderAgent");
-
-    assert.match(
-      researcher,
-      /toolsets:\s*\[CORE_TOOLSET_ID\]/,
-      "researcher must default to core only",
-    );
-    assert.doesNotMatch(
-      researcher,
-      /BROWSER_TOOLSET_ID|RESEARCH_TOOLSET_ID/,
-      "researcher must not mount browser/research MCP toolsets by default",
-    );
-    assert.match(
-      src,
-      /const RESEARCHER_PERSONA\s*=[\s\S]*scansci-pdf[\s\S]*oc-web[\s\S]*oc-browser/,
-      "researcher persona must point at the scansci-pdf/oc-web/oc-browser CLIs (all retired from MCP)",
-    );
-    assert.match(
-      src,
-      /LEGACY_RESEARCHER_PERSONAS[\s\S]*善用浏览器和论文\/PDF工具查证[\s\S]*ensureAgentPersona\("researcher", RESEARCHER_PERSONA, LEGACY_RESEARCHER_PERSONAS\)/,
-      "existing exact legacy researcher persona files must be refreshed safely",
-    );
-
-    assert.match(scientist, /id:\s*"scientist"/, "scientist seed id must be stable");
-    assert.match(scientist, /displayName:\s*"科研分析师"/, "scientist display name must be distinct");
-    assert.match(scientist, /provider:\s*COMMERCIAL_DEEPSEEK_PRO_PROVIDER/, "scientist must use deepseek (WS2 swap)");
-    assert.match(scientist, /model:\s*COMMERCIAL_DEEPSEEK_PRO_MODEL/, "scientist must use deepseek-v4-pro (WS2 swap with coder)");
-    assert.match(scientist, /toolsets:\s*\[CORE_TOOLSET_ID\]/, "scientist must default to core only");
-    // per-agent model assignment (WS2)
-    assert.match(researcher, /model:\s*COMMERCIAL_RESEARCHER_MODEL/, "researcher must use MiniMax-M3");
-    assert.match(researcher, /provider:\s*COMMERCIAL_RESEARCHER_PROVIDER/, "researcher must use minimax");
-    assert.match(coder, /model:\s*COMMERCIAL_CODER_MODEL/, "coder must use glm-5.2 (显式常量,不跟 DEFAULT)");
-    assert.match(coder, /provider:\s*COMMERCIAL_CODER_PROVIDER/, "coder must use ark (explicit)");
-    // main(队长)走 DEFAULT,现已是 glm-5.2(火山 ark,2026-06-17)
-    const mainAgent = extractConstObjectFromSource(src, "desiredMainAgent");
-    assert.match(mainAgent, /model:\s*COMMERCIAL_DEFAULT_MODEL/, "main captain must use DEFAULT (now glm-5.2)");
-    const reviewer = extractConstObjectFromSource(src, "desiredReviewerAgent");
-    assert.match(reviewer, /model:\s*COMMERCIAL_DEEPSEEK_PRO_MODEL/, "reviewer must use deepseek-v4-pro (heterogeneous review)");
-    assert.match(reviewer, /provider:\s*COMMERCIAL_DEEPSEEK_PRO_PROVIDER/, "reviewer must use deepseek");
-    assert.doesNotMatch(
-      scientist,
-      /BROWSER_TOOLSET_ID|RESEARCH_TOOLSET_ID/,
-      "scientist must not mount optional browser/research MCP toolsets by default",
-    );
-    assert.match(
-      src,
-      /const SCIENTIST_PERSONA\s*=[\s\S]*科研分析师[\s\S]*不要假设浏览器、PDF 或外部数据库工具已挂载[\s\S]*外部服务前必须征得用户同意/,
-      "scientist persona must advertise scientific scope without assuming optional external tools",
-    );
-
-    assert.match(coder, /toolsets:\s*\[CORE_TOOLSET_ID\]/, "coder must default to core only");
-    assert.doesNotMatch(
-      coder,
-      /BROWSER_TOOLSET_ID|RESEARCH_TOOLSET_ID/,
-      "coder must not mount optional MCP toolsets by default",
-    );
-    assert.match(
-      src,
-      /const CODER_PERSONA\s*=[\s\S]*oc-web[\s\S]*oc-browser/,
-      "coder persona must point at the oc-web/oc-browser CLIs (browser retired from MCP)",
-    );
-    assert.match(
-      src,
-      /LEGACY_CODER_PERSONAS[\s\S]*再做最小必要修改,验证结果后用简洁中文汇报[\s\S]*ensureAgentPersona\("coder", CODER_PERSONA, LEGACY_CODER_PERSONAS\)/,
-      "existing exact legacy coder persona files must be refreshed safely",
     );
   });
 
@@ -566,22 +472,26 @@ describe("openclaude-runtime entrypoint env-scrub policy", () => {
     }
   });
 
-  test("entrypoint.ts pre-seeds the two default teams with the glm-5.2 main captain", () => {
+  test("entrypoint.ts pre-seeds NO teams (v5 轻量组队:队长 turn 级自主 delegate)", () => {
     const src = readFileSync(ENTRYPOINT_TS_PATH, "utf-8");
-    assert.match(src, /const desiredSeedTeams\s*=\s*\[desiredScienceTeam,\s*desiredProgrammingTeam\]/);
-    // 队长走 main（现为 glm-5.2，2026-06-17），不再是 codex（GPT-5.5）。
-    assert.match(src, /id:\s*"science_research_team"[\s\S]*leaderAgentId:\s*"main"/);
-    assert.doesNotMatch(src, /id:\s*"science_research_team"[\s\S]*leaderAgentId:\s*"codex"/);
+    // 纯市场轻量组队:不再预置任何默认团队,desiredSeedTeams 为空数组。
     assert.match(
       src,
-      /id:\s*"science_research_team"[\s\S]*agentId:\s*"scientist"[\s\S]*role:\s*"科研数据分析师"[\s\S]*policy:\s*\{\s*maxParallel:\s*2,\s*requireReview:\s*true,\s*reviewAgentId:\s*"reviewer"\s*\}/,
-      "science team must include scientist and cap collaboration fanout at two",
+      /const desiredSeedTeams:\s*Record<string,\s*unknown>\[\]\s*=\s*\[\]/,
+      "v5:no default teams may be pre-seeded (leader forms ad-hoc team via delegate_task)",
     );
-    assert.match(src, /id:\s*"programming_team"[\s\S]*leaderAgentId:\s*"main"/);
-    assert.match(src, /teams:\s*desiredSeedTeams\.map\(cloneSeedTeam\)/);
-    assert.match(src, /patchPlatformSeedTeam/);
-    // 旧的 codex 队长默认团队仍被识别为可迁移的默认 seed 形态，启动时切到 main。
-    assert.match(src, /const defaultLeader\s*=\s*leader === ""\s*\|\|\s*leader === "main"\s*\|\|\s*leader === "codex"/);
+    // bootstrap 仍消费 desiredSeedTeams(空 → teams:[]),团队 merge 循环成为 no-op:
+    // 存量容器已有的团队条目按设计不 prune,靠 listCollaboratorAgents 的 source 过滤惰性化。
+    assert.match(
+      src,
+      /teams:\s*desiredSeedTeams\.map\(cloneSeedTeam\)/,
+      "bootstrap still maps desiredSeedTeams (empty seed → teams:[])",
+    );
+    assert.match(
+      src,
+      /for \(const desiredTeam of desiredSeedTeams\)/,
+      "team merge loop retained as no-op on empty seed (existing container teams not pruned)",
+    );
   });
 
   test("entrypoint.ts migrates only exact old default science team to scientist member set", () => {
@@ -620,50 +530,6 @@ describe("openclaude-runtime entrypoint env-scrub policy", () => {
         `science team migration spec mismatch for ${JSON.stringify(c.current)}`,
       );
     }
-  });
-
-  test("seeded team prompts do not assume optional browser/research toolsets are mounted", () => {
-    const entrypoint = readFileSync(ENTRYPOINT_TS_PATH, "utf-8");
-    const entrypointTeamDefaults = [
-      extractConstObjectFromSource(entrypoint, "desiredScienceTeam"),
-      extractConstObjectFromSource(entrypoint, "desiredProgrammingTeam"),
-    ].join("\n");
-    const sources = [
-      ["entrypoint", entrypointTeamDefaults],
-      ["web agentTeams", readFileSync(WEB_AGENT_TEAMS_MODULE_PATH, "utf-8")],
-    ] as const;
-    for (const [label, src] of sources) {
-      assert.match(
-        src,
-        /默认不假设(?: browser\/research MCP|浏览器工具|浏览器或 PDF 工具)/,
-        `${label} team prompts should state optional MCP tools are not assumed`,
-      );
-      assert.match(
-        src,
-        /当前工具列表/,
-        `${label} team prompts should gate optional external tools on the currently mounted tools`,
-      );
-      assert.doesNotMatch(
-        src,
-        /善用浏览器和论文\/PDF工具查证/,
-        `${label} must not keep the old researcher persona that assumed browser/PDF tools`,
-      );
-      assert.doesNotMatch(
-        src,
-        /优先查官方文档、仓库现有模式/,
-        `${label} must not keep the old programming researcher prompt that assumed external docs`,
-      );
-    }
-    assert.match(
-      entrypoint,
-      /function hasLegacyPlatformSeedTeamPrompt\([\s\S]*优先把资料检索交给 researcher[\s\S]*查官方文档、现有实现、依赖约束和可选方案/,
-      "entrypoint must detect old default team prompt text so existing seed teams are migrated",
-    );
-    assert.match(
-      entrypoint,
-      /!hasLegacyPlatformSeedTeamPrompt\(team, desired\.id\)/,
-      "seed team repair must not skip teams that still contain legacy default prompts",
-    );
   });
 
   test("web agents fallback uses MiniMax-M3 (platform default) instead of an unsupported Claude default", () => {

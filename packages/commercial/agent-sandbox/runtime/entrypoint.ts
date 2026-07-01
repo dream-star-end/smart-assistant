@@ -115,18 +115,9 @@ const WEB_CONTEXT_TOOLSET_ID = "web_context";
 // 守护 —— 改这里必须同步改 platformDefaults.ts。
 const COMMERCIAL_DEFAULT_MODEL = "glm-5.2";
 const COMMERCIAL_DEFAULT_PROVIDER = "ark";
-// 内置 agent 按角色分配模型(改这里必须同步改前端 fallback agents.js 与 runtimeEntrypointPolicy.test.ts):
-//   - main(队长) → glm-5.2(= DEFAULT,火山 ark,2026-06-17 起)
-//   - researcher → MiniMax-M3(512k 吃长文献;思考模型;不变)
-//   - scientist / reviewer → deepseek-v4-pro(分析 + 异构复核;edge 稳端点;不变)
-//   - coder → glm-5.2 / 火山 Coding Plan(2026-06-17 由 glm-5.1 升级,glm-5.1 退 picker)
-//   (v5 ccb-only:codex/gpt-5.5 seed agent 已移除)
-const COMMERCIAL_RESEARCHER_MODEL = "MiniMax-M3";
-const COMMERCIAL_RESEARCHER_PROVIDER = "minimax";
-const COMMERCIAL_CODER_MODEL = "glm-5.2";
-const COMMERCIAL_CODER_PROVIDER = "ark";
-const COMMERCIAL_DEEPSEEK_PRO_MODEL = "deepseek-v4-pro";
-const COMMERCIAL_DEEPSEEK_PRO_PROVIDER = "deepseek";
+// v5 纯市场模型:容器只 seed「全能助手」(main) → COMMERCIAL_DEFAULT_MODEL(glm-5.2,火山 ark)。
+// 历史内置子 agent(researcher/scientist/coder/reviewer/scholar)已退役,其各角色专用的
+// model/provider 常量随之移除;其它 agent 一律走市场安装(见下方 desiredSeedAgents)。
 
 // Retired MCP server — id retained only so upsertPlatformMcpIntegrations can
 // strip stale platform-owned entries from existing user volumes. Browser is now
@@ -1013,183 +1004,17 @@ try {
     avatarEmoji: "🧠",
   };
 
-  const RESEARCHER_PERSONA =
-    "你是资料研究员。先澄清问题范围,优先基于当前上下文、已加载 skill 描述和平台 CLI 整理证据。引用接地工作流:多源文献检索用 `oc-lit`(OpenAlex/Crossref/arXiv,含中文)、用户上传论文/文档解析用 `oc-ingest`(得 docId)、在解析后的权威文档上抽 verbatim 证据用 `oc-litrag query`(得 quote handle,写作唯一可引用素材)、引用真伪/撤稿校验与 GB/T7714 生成用 `oc-cite`;论文获取/下载用 `scansci-pdf` CLI、网页/文档提取用 `oc-web` CLI、需要交互/登录/抓动态页用 `oc-browser` CLI(都常驻可用,经 Bash 调用,详见对应 skill)。产出 evidence manifest(claim + 引用的 quote + 来源);**绝不凭记忆编造 DOI/引用,引用一律经 oc-cite 校验**。最后给出来源线索清楚的中文结论。\n";
-  const LEGACY_RESEARCHER_PERSONAS = [
-    "你是资料研究员。先澄清问题范围,善用浏览器和论文/PDF工具查证,最后给出来源清楚的中文结论。\n",
-    // 2026-06 旧版(无引用接地工作流)— 存量 agent 安全刷新到带 oc-lit/ingest/litrag/cite 的新版
-    "你是资料研究员。先澄清问题范围,优先基于当前上下文、已加载 skill 描述和平台 CLI 整理证据;论文检索/下载用 `scansci-pdf` CLI、网页/文档提取用 `oc-web` CLI、需要交互/登录/抓动态页用 `oc-browser` CLI(都常驻可用,经 Bash 调用,详见对应 skill)。最后给出来源线索清楚的中文结论。\n",
-  ] as const;
-  // 2026-06-16 WS2:coder 改用 glm-5.1(火山 Coding Plan),persona 去掉具体模型品牌,
-  // 改为模型中立,避免自我身份与实际模型漂移。旧 DeepSeek 文案进 LEGACY 供存量迁移。
-  const CODER_PERSONA =
-    "你是代码工程师。先读代码和现有约束,再做最小必要修改;需要外部资料时先说明依据,查公开文档/URL 用 `oc-web` CLI、需要交互浏览用 `oc-browser` CLI(常驻可用,经 Bash 调用)。验证结果后用简洁中文汇报。\n";
-  const LEGACY_CODER_PERSONAS = [
-    "你是 DeepSeek V4 Pro 代码工程师。先读代码和现有约束,再做最小必要修改,验证结果后用简洁中文汇报。\n",
-    "你是 DeepSeek V4 Pro 代码工程师。先读代码和现有约束,再做最小必要修改;需要外部资料时先说明依据,查公开文档/URL 用 `oc-web` CLI、需要交互浏览用 `oc-browser` CLI(常驻可用,经 Bash 调用)。验证结果后用简洁中文汇报。\n",
-  ] as const;
-  const SCIENTIST_PERSONA =
-    "你是科研分析师。专注统计建模、科学计算、可视化、生信/单细胞和可复现实验分析;优先使用当前已加载的科研 skills,但不要假设浏览器、PDF 或外部数据库工具已挂载。先确认数据来源、变量、假设和成功标准,本地优先处理数据;上传私有数据或调用外部服务前必须征得用户同意。生物医学/临床内容只给研究辅助和证据边界,不提供诊断、治疗或合规结论。\n";
-  const SCHOLAR_PERSONA =
-    "你是科研写手(综述/入口)。面向用户组织科研产出与最终叙述:把 researcher 产的 evidence manifest 串成结构化报告/综述,用 oc-report 出规范报告、oc-slides/oc-poster 出汇报产物,写作守 scientific-writing(去 AI 味)与个人风格(research-writing-style)。**不替代 scientist**:不做统计建模/科学计算,需要分析就交给 scientist。**引用接地是硬性要求**:正文每条论断必须有 evidence manifest 里 verified 的 quote 支撑,引用经 oc-cite,绝不凭记忆编造 DOI;未接地论断标红或移入未核查。\n";
+  // v5 纯市场模型:容器默认只 seed「全能助手」(main)。历史平台预置子 agent
+  // (researcher/scientist/coder/reviewer/scholar)已退役 —— 其它 agent 一律走市场安装
+  // (syncMarketplaceHub 直写 agents.yaml + source:marketplace 标记)。存量容器里的幽灵
+  // seed 不 prune,但 listCollaboratorAgents 的 marketplace-source 过滤已让它们在所有面惰性。
+  const desiredSeedAgents = [desiredMainAgent];
 
-  const desiredResearcherAgent = {
-    id: "researcher",
-    model: COMMERCIAL_RESEARCHER_MODEL,
-    persona: ensureAgentPersona("researcher", RESEARCHER_PERSONA, LEGACY_RESEARCHER_PERSONAS),
-    permissionMode: "bypassPermissions",
-    provider: COMMERCIAL_RESEARCHER_PROVIDER,
-    displayName: "资料研究员",
-    avatarEmoji: "🔎",
-    toolsets: [CORE_TOOLSET_ID],
-  };
-
-  const desiredScientistAgent = {
-    id: "scientist",
-    model: COMMERCIAL_DEEPSEEK_PRO_MODEL,
-    persona: ensureAgentPersona("scientist", SCIENTIST_PERSONA),
-    permissionMode: "bypassPermissions",
-    provider: COMMERCIAL_DEEPSEEK_PRO_PROVIDER,
-    displayName: "科研分析师",
-    avatarEmoji: "🔬",
-    toolsets: [CORE_TOOLSET_ID],
-  };
-
-  const desiredCoderAgent = {
-    id: "coder",
-    // 显式绑 glm-5.1(不跟 DEFAULT,DEFAULT 已改 MiniMax-M3)。boss 2026-06-16 决定 coder 保留 glm-5.1。
-    model: COMMERCIAL_CODER_MODEL,
-    persona: ensureAgentPersona("coder", CODER_PERSONA, LEGACY_CODER_PERSONAS),
-    permissionMode: "bypassPermissions",
-    provider: COMMERCIAL_CODER_PROVIDER,
-    displayName: "代码工程师",
-    avatarEmoji: "🛠️",
-    toolsets: [CORE_TOOLSET_ID],
-  };
-
-  const desiredReviewerAgent = {
-    id: "reviewer",
-    model: COMMERCIAL_DEEPSEEK_PRO_MODEL,
-    persona: ensureAgentPersona(
-      "reviewer",
-      "你是审阅员。重点检查正确性、边界条件、安全性和是否过度工程,只提出可执行的问题和建议。\n",
-    ),
-    permissionMode: "bypassPermissions",
-    provider: COMMERCIAL_DEEPSEEK_PRO_PROVIDER,
-    displayName: "审阅员",
-    avatarEmoji: "🧪",
-    toolsets: [CORE_TOOLSET_ID],
-  };
-
-  const desiredScholarAgent = {
-    id: "scholar",
-    // 长上下文利于综述/串稿;复用 researcher 的 MiniMax-M3/minimax(512k),不新增 provider。
-    model: COMMERCIAL_RESEARCHER_MODEL,
-    persona: ensureAgentPersona("scholar", SCHOLAR_PERSONA),
-    permissionMode: "bypassPermissions",
-    provider: COMMERCIAL_RESEARCHER_PROVIDER,
-    displayName: "科研写手",
-    avatarEmoji: "🎓",
-    toolsets: [CORE_TOOLSET_ID],
-  };
-
-  const desiredCollaborationSeedAgents = [
-    desiredMainAgent,
-    desiredResearcherAgent,
-    desiredScientistAgent,
-    desiredCoderAgent,
-    desiredReviewerAgent,
-    desiredScholarAgent,
-  ];
-  const desiredSeedAgents = [...desiredCollaborationSeedAgents];
-
-  const desiredScienceTeam = {
-    id: "science_research_team",
-    name: "科研协作团队",
-    description: "适合文献调研、实验/数据分析、论文思路和证据复核",
-    // 队长走 main（现 MiniMax-M3 / 新加坡端点,2026-06-16 起）：codex-native runner 只能跑
-    // GPT-5.5、当不了静态 provider 队长,故队长用 main + 队长提示词,而非 codex（GPT-5.5）。
-    // 这是团队队长的权威源；patchPlatformSeedTeam 会据此把用户未定制的旧 codex 队长团队迁移到 main。
-    leaderAgentId: "main",
-    leaderRole: "科研项目负责人",
-    leaderPrompt:
-      "你是科研团队负责人。先把研究问题拆成可验证子问题,定义证据标准和交付物;优先把文献检索与证据采集交给 researcher,把统计建模/科学计算/可视化/生信分析交给 scientist,把工程实现或复现实验脚本交给 coder,把 evidence manifest 复核交给 reviewer。**引用接地是硬性要求**:researcher 用 oc-lit/oc-ingest/oc-litrag 产 evidence manifest(claim + 引用的 quote + 来源),所有论断必须有 verbatim quote 支撑且引用经 oc-cite 校验;未接地的论断标红或移入未核查,绝不输出凭记忆编造的引用。默认不假设浏览器工具已挂载,需要交互浏览时只要求成员在当前工具列表可用时使用;论文检索用 oc-lit/scansci-pdf、网页/文档提取用 oc-web CLI(常驻可用,经 Bash 调用)。最终按结论、证据、局限和下一步组织输出。",
-    members: [
-      {
-        agentId: "researcher",
-        role: "文献研究员",
-        responsibility: "多源检索、解析论文/文档,产出可接地的 evidence manifest",
-        rolePrompt:
-          "围绕研究问题做引用接地的证据采集:多源检索用 oc-lit(含中文),用户上传文档用 oc-ingest 解析得 docId,再用 oc-litrag query 抽 verbatim quote(写作唯一可引用素材),引用真伪/撤稿与 GB/T7714 用 oc-cite。默认不假设浏览器工具可用,需要时只在当前工具列表允许下使用 scansci-pdf/oc-web。产出 evidence manifest(claim↔quote↔来源),区分已证实/假设/争议;**绝不凭记忆编造 DOI 或引用**。输出含来源线索、关键 quote、适用边界与仍需验证的问题。",
-      },
-      {
-        agentId: "scientist",
-        role: "科研数据分析师",
-        responsibility: "负责统计建模、科学计算、论文级可视化、生信/单细胞分析和方法选择",
-        rolePrompt:
-          "把研究问题转成可验证的数据分析、统计建模、科学计算、可视化或生信流程。优先使用已加载科研 skills,先确认变量、假设、样本量、评价指标和数据边界;默认本地处理数据,外部上传或数据库调用前先征得用户同意。输出方法选择、最小可复现实验、指标解释、图表建议、局限和验证风险。",
-      },
-      {
-        agentId: "coder",
-        role: "复现工程师",
-        responsibility: "把分析方案落成可运行脚本、数据处理管线或复现实验步骤",
-        rolePrompt:
-          "根据 researcher/scientist 的方案做最小可运行实现,明确输入输出、依赖、运行命令和失败风险。不要扩大成无关重构;代码交付必须可复现并便于 scientist/reviewer 复核。",
-      },
-      {
-        agentId: "reviewer",
-        role: "证据审稿人",
-        responsibility: "复核 evidence manifest:引用是否真实接地、是否撤稿、有无未核查论断",
-        rolePrompt:
-          "重点复核 evidence manifest:每条标 verified 的 claim 是否真有 quote 支撑、quote 是否为来源 verbatim(以 oc-cite check 结果为准而非凭印象)、引用 DOI/arXiv 是否可解析且未撤稿、有无夸大或未接地的论断。把未接地的 claim 标红,要求移入未核查或补证据;同时指出样本、方法、因果、统计层面的弱点。优先列阻塞性问题和可信度判断。",
-      },
-      {
-        agentId: "scholar",
-        role: "科研写手",
-        responsibility: "把证据串成结构化报告/综述与汇报产物(不做统计分析)",
-        rolePrompt:
-          "把 researcher 的 evidence manifest 组织成结构化报告/综述与汇报产物:oc-report 出规范报告、oc-slides/oc-poster 出汇报,写作守去 AI 味与个人风格。正文每条论断必须有 verified quote 支撑、引用经 oc-cite,未接地标红;不做统计建模/科学计算(交 scientist)。",
-      },
-    ],
-    policy: { maxParallel: 2, requireReview: true, reviewAgentId: "reviewer" },
-  };
-
-  const desiredProgrammingTeam = {
-    id: "programming_team",
-    name: "编程协作团队",
-    description: "适合需求拆解、技术调研、代码实现、测试和审查闭环",
-    // 队长走 main（现 MiniMax-M3,同上：main 而非 codex/GPT-5.5）。
-    leaderAgentId: "main",
-    leaderRole: "技术负责人",
-    leaderPrompt:
-      "你是编程协作队长。先确认需求、约束、影响范围和验收标准;把技术调研交给 researcher,把实现交给 coder,把质量审查交给 reviewer。默认不假设浏览器工具已挂载,需要外部官方资料时只要求成员在当前工具列表可用时使用。保持最小改动和可验证交付,最终说明改动点、验证结果、风险和后续建议。",
-    members: [
-      {
-        agentId: "researcher",
-        role: "技术调研工程师",
-        responsibility: "整理官方资料、现有实现、依赖约束和可选方案",
-        rolePrompt:
-          "优先阅读仓库现有模式、README/锁文件、已提供资料和真实约束,给出可执行方案对比。不要假设浏览器工具可用;只有当前工具列表明确包含 browser/WebFetch 等外部访问工具时才查外部官方文档。输出要包含推荐方案、关键依据、兼容性风险和不建议采用的方案理由。",
-      },
-      {
-        agentId: "coder",
-        role: "实现工程师",
-        responsibility: "按既有架构做最小必要代码修改并自测",
-        rolePrompt:
-          "先读相关代码和测试,再按项目约定做最小必要实现。不要扩大需求或重构无关模块。输出改动文件、核心逻辑、已跑验证和未覆盖风险。",
-      },
-      {
-        agentId: "reviewer",
-        role: "质量审查工程师",
-        responsibility: "检查正确性、边界、回归风险和测试覆盖",
-        rolePrompt:
-          "从正确性、回归风险、安全边界、测试覆盖和过度工程角度审查。区分阻塞问题和非阻塞建议,避免提出与需求无关的范围扩张。",
-      },
-    ],
-    policy: { maxParallel: 2, requireReview: true, reviewAgentId: "reviewer" },
-  };
-
-  const desiredSeedTeams = [desiredScienceTeam, desiredProgrammingTeam];
+  // v5 轻量组队重构:不再预置团队(队长 turn 级自主 delegate_task 组队)。保留空数组,
+  // 让下方 bootstrap 的 .map(cloneSeedTeam) 与 merge 团队循环自然成为 no-op —— 团队相关
+  // helper(cloneSeedTeam/patchPlatformSeedTeam 等)因此仍被引用,不删(避免在非 tsc 校验的
+  // 运行时脚本里拆一大片互相依赖的 helper);存量容器已有的团队条目按设计不 prune,保持惰性。
+  const desiredSeedTeams: Record<string, unknown>[] = [];
 
   function cloneSeedTeam(team: Record<string, unknown>): Record<string, unknown> {
     return {

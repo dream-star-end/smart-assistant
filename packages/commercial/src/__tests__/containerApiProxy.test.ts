@@ -88,12 +88,14 @@ describe('containerApiProxy', () => {
     assert.equal(matchContainerApiProxyRoute('/api/tasks', 'POST'), true)
     assert.equal(matchContainerApiProxyRoute('/api/tasks-executions', 'GET'), true)
     assert.equal(matchContainerApiProxyRoute('/api/agents', 'GET'), true)
-    assert.equal(matchContainerApiProxyRoute('/api/agents', 'POST'), true)
+    // v5 纯市场:不允许经容器代理创建容器内 agent(POST 已砍,其它 agent 走市场安装)。
+    assert.equal(matchContainerApiProxyRoute('/api/agents', 'POST'), false)
     assert.equal(matchContainerApiProxyRoute('/api/agents/main/memory/user', 'PUT'), true)
     assert.equal(matchContainerApiProxyRoute('/api/agents/main/message', 'POST'), false)
-    assert.equal(matchContainerApiProxyRoute('/api/agent-teams', 'GET'), true)
-    assert.equal(matchContainerApiProxyRoute('/api/agent-teams/dev_team', 'DELETE'), true)
-    assert.equal(matchContainerApiProxyRoute('/api/agent-teams/a%2Fb', 'GET'), false)
+    // v5 轻量组队:旧团队路由已从容器代理 allowlist 移除(浏览器→容器不再放行)。
+    assert.equal(matchContainerApiProxyRoute('/api/agent-teams', 'GET'), false)
+    assert.equal(matchContainerApiProxyRoute('/api/agent-teams/dev_team', 'DELETE'), false)
+    assert.equal(matchContainerApiProxyRoute('/api/team-runs/trun-abc123', 'GET'), false)
     assert.equal(matchContainerApiProxyRoute('/api/tasks-executions', 'POST'), false)
   })
 

@@ -40,9 +40,13 @@ export const BRIDGE_API_ALLOWLIST: readonly BridgeApiAllowRule[] = [
   // only when served by the master singleton; proxied to a user's own container they
   // operate on that user's isolated volume/session state.
   {
+    // v5 纯市场模型:用户不能自建容器内 agent(其它 agent 一律走市场安装,由
+    // syncMarketplaceHub 直写 agents.yaml)。故砍掉唯一的创建路径 POST /api/agents,
+    // 只保留 GET(列表)。这样容器里无 source 标记的非 main agent 只可能是已退役的平台
+    // 幽灵 seed → listCollaboratorAgents 的 marketplace-source 过滤可证明完备。
     label: '/api/agents',
     re: /^\/api\/agents$/,
-    methods: M('GET', 'POST'),
+    methods: M('GET'),
     proxyFromCommercial: true,
   },
   {
@@ -131,43 +135,12 @@ export const BRIDGE_API_ALLOWLIST: readonly BridgeApiAllowRule[] = [
     methods: M('POST'),
     proxyFromCommercial: true,
   },
-  {
-    label: '/api/agent-teams',
-    re: /^\/api\/agent-teams$/,
-    methods: M('GET', 'POST'),
-    proxyFromCommercial: true,
-  },
-  {
-    label: '/api/agent-teams/:id',
-    re: /^\/api\/agent-teams\/[A-Za-z0-9_-]+$/,
-    methods: M('GET', 'PUT', 'DELETE'),
-    proxyFromCommercial: true,
-  },
-  // team run：发起/观察/停止（finalize 不在此——只容器内 leader MCP 调，不经代理/桥接）。
-  {
-    label: '/api/agent-teams/:id/runs',
-    re: /^\/api\/agent-teams\/[A-Za-z0-9_-]+\/runs$/,
-    methods: M('POST'),
-    proxyFromCommercial: true,
-  },
-  {
-    label: '/api/team-runs',
-    re: /^\/api\/team-runs$/,
-    methods: M('GET'),
-    proxyFromCommercial: true,
-  },
-  {
-    label: '/api/team-runs/:id',
-    re: /^\/api\/team-runs\/[A-Za-z0-9_-]+$/,
-    methods: M('GET'),
-    proxyFromCommercial: true,
-  },
-  {
-    label: '/api/team-runs/:id/stop',
-    re: /^\/api\/team-runs\/[A-Za-z0-9_-]+\/stop$/,
-    methods: M('POST'),
-    proxyFromCommercial: true,
-  },
+  // v5 轻量组队重构:旧「团队」重后端(team_run 服务端实体 + /api/agent-teams、
+  // /api/team-runs* 路由)已从产品面移除,改为 main 队长 turn 级自主 delegate_task 组队。
+  // 这些路由从 bridge allowlist 删除后,浏览器→商业宿主→用户容器 这条唯一外部可达路径即
+  // 关闭(默认拒绝)。host 侧 commercial router 的 BLOCKED_FOR_USER_RULES 仍保留 team 条目
+  // 作为 deny 兜底。容器内 handler/storage/mcp submit_team_final(受 OPENCLAUDE_TEAM_RUN_ID
+  // env gate,新模型永不置位)保持休眠,整套删除是后续独立工程。
 
   { label: '/api/cron', re: /^\/api\/cron$/, methods: M('GET', 'POST'), proxyFromCommercial: true },
   {

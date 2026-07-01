@@ -12,7 +12,8 @@ describe('bridge API allowlist', () => {
 
   it('allows only selected per-container management routes for commercial proxy', () => {
     assert.equal(matchCommercialContainerApiProxy('/api/agents', 'GET')?.label, '/api/agents')
-    assert.equal(matchCommercialContainerApiProxy('/api/agents', 'POST')?.label, '/api/agents')
+    // v5 纯市场:不允许经容器代理创建容器内 agent(其它 agent 一律走市场安装)。POST 被砍。
+    assert.equal(matchCommercialContainerApiProxy('/api/agents', 'POST'), null)
     assert.equal(
       matchCommercialContainerApiProxy('/api/agents/main', 'PUT')?.label,
       '/api/agents/:id',
@@ -57,36 +58,24 @@ describe('bridge API allowlist', () => {
       matchCommercialContainerApiProxy('/api/tasks-executions', 'GET')?.label,
       '/api/tasks-executions',
     )
-    assert.equal(
-      matchCommercialContainerApiProxy('/api/agent-teams', 'GET')?.label,
-      '/api/agent-teams',
-    )
-    assert.equal(
-      matchCommercialContainerApiProxy('/api/agent-teams', 'POST')?.label,
-      '/api/agent-teams',
-    )
-    assert.equal(
-      matchCommercialContainerApiProxy('/api/agent-teams/dev_team', 'PUT')?.label,
-      '/api/agent-teams/:id',
-    )
-    assert.equal(
-      matchCommercialContainerApiProxy('/api/agent-teams/dev_team', 'DELETE')?.label,
-      '/api/agent-teams/:id',
-    )
-    // team run：发起/观察/停止经容器代理放行（finalize 不放行——只容器内 leader MCP 调）。
-    assert.equal(
-      matchCommercialContainerApiProxy('/api/agent-teams/dev_team/runs', 'POST')?.label,
-      '/api/agent-teams/:id/runs',
-    )
-    assert.equal(matchCommercialContainerApiProxy('/api/team-runs', 'GET')?.label, '/api/team-runs')
-    assert.equal(
-      matchCommercialContainerApiProxy('/api/team-runs/trun-abc123', 'GET')?.label,
-      '/api/team-runs/:id',
-    )
-    assert.equal(
-      matchCommercialContainerApiProxy('/api/team-runs/trun-abc123/stop', 'POST')?.label,
-      '/api/team-runs/:id/stop',
-    )
+    // v5 轻量组队重构:旧「团队」重后端(/api/agent-teams、/api/team-runs*)已从产品面移除,
+    // 从容器代理 allowlist 删除 → 浏览器→商业宿主→用户容器 这条唯一外部可达路径关闭(默认拒绝)。
+    for (const [p, m] of [
+      ['/api/agent-teams', 'GET'],
+      ['/api/agent-teams', 'POST'],
+      ['/api/agent-teams/dev_team', 'PUT'],
+      ['/api/agent-teams/dev_team', 'DELETE'],
+      ['/api/agent-teams/dev_team/runs', 'POST'],
+      ['/api/team-runs', 'GET'],
+      ['/api/team-runs/trun-abc123', 'GET'],
+      ['/api/team-runs/trun-abc123/stop', 'POST'],
+    ] as const) {
+      assert.equal(
+        matchCommercialContainerApiProxy(p, m),
+        null,
+        `retired team route must not be proxied: ${m} ${p}`,
+      )
+    }
   })
 
   it('proxies SkillOpt training routes to the container with correct methods', () => {

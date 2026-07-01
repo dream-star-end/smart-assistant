@@ -86,6 +86,7 @@ import {
 } from '@openclaude/storage'
 import { normalizeAgentTeamInput, TEAM_ID_RE } from './agentTeams.js'
 import { buildTeamLeaderPrompt } from './teamRun.js'
+import { listCollaboratorAgents } from './collaboratorAgents.js'
 import type { SessionStreamEvent } from './ccbMessageParser.js'
 import { type SkillTrainRun, SkillTrainJobStore } from './skillTrainJobs.js'
 import {
@@ -8502,7 +8503,9 @@ export class Gateway {
     // 放在 media 拼接之后,确保带附件时引导也在。委派本身走内置 delegate_task,无需改工具。
     if (teamMode && agent.id === 'main') {
       const teamCfg = await this._getAgentsConfig()
-      const members = teamCfg.agents.filter((a) => a.id !== 'main')
+      // 成员 = 市场安装集(source==='marketplace'),与 AgentPicker(master 市场安装权威)
+      // 对齐、对存量容器的幽灵平台 seed 免疫。队长是 main 自己,故 includeMain:false。
+      const members = listCollaboratorAgents(teamCfg, { selfId: 'main', includeMain: false })
       const memberLines =
         members.length > 0
           ? members

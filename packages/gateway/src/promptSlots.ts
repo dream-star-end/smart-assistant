@@ -20,6 +20,7 @@ import { existsSync, readFileSync } from 'node:fs'
 import { MemoryStore, type SkillStore, buildAgentSkillStore, paths, readAgentsConfig } from '@openclaude/storage'
 import { request as undiciRequest } from 'undici'
 import type { RepoSnapshot } from './sessionRepoWorkspace.js'
+import { listCollaboratorAgents } from './collaboratorAgents.js'
 
 export interface PromptSlotContext {
   agentId: string
@@ -141,7 +142,12 @@ export async function buildAgentsSlot(ctx: PromptSlotContext): Promise<PromptSlo
   // Dynamically inject available agents list
   try {
     const agentsCfg = await readAgentsConfig()
-    const otherAgents = agentsCfg.agents.filter((a) => a.id !== ctx.agentId)
+    // 只列市场安装集(source==='marketplace')+ main,排除已退役的幽灵平台 seed。
+    // 与 AgentPicker(master 市场安装权威)/队长组队引导同一权威,对 seed 漂移免疫。
+    const otherAgents = listCollaboratorAgents(agentsCfg, {
+      selfId: ctx.agentId,
+      includeMain: true,
+    })
     if (otherAgents.length > 0) {
       lines.push('')
       lines.push('## 多 Agent 协作')
