@@ -59,6 +59,12 @@ import {
   getTeamRun,
   listTeamDelegations,
   updateTeamRunStatus,
+  getTeamRunByLeaderSessionKey,
+  getTeamDelegationByChildSessionKey,
+  admitTeamDelegation,
+  recordRejectedTeamDelegation,
+  setTeamDelegationChildSession,
+  completeTeamDelegation,
   writeConfig,
   getUsageSummary,
   queryEvents,
@@ -5436,6 +5442,42 @@ export class Gateway {
     const { goal, context, sourceAgent, toolsets } = parsed
     if (!goal) return this.sendError(res, 400, 'goal required')
 
+    // Team run context (D-B): parentSessionKey 反查 teamRunStore 判定委派归属。
+    const parentKey = typeof parsed.parentSessionKey === 'string' ? parsed.parentSessionKey : ''
+    const teamRunLeader = parentKey ? await getTeamRunByLeaderSessionKey(parentKey) : null
+    if (teamRunLeader) {
+      // leader 委派：成员白名单（只允许 snapshot 成员/复核者）
+      const snap = teamRunLeader.teamSnapshot as {
+        members?: Array<{ agentId: string }>
+        policy?: { requireReview?: boolean; reviewAgentId?: string }
+      } | null
+      const allowed = new Set<string>((snap?.members ?? []).map((m) => m.agentId))
+      if (snap?.policy?.requireReview && snap.policy.reviewAgentId) {
+        allowed.add(snap.policy.reviewAgentId)
+      }
+      if (!allowed.has(targetAgentId)) {
+        await recordRejectedTeamDelegation({
+          teamRunId: teamRunLeader.teamRunId,
+          memberAgentId: targetAgentId,
+          goal,
+          reason: 'not_member',
+        }).catch(() => {})
+        return this.sendError(res, 403, `agent "${targetAgentId}" is not a member of this team run`)
+      }
+    } else if (parentKey) {
+      // 团队成员的嵌套委派：P1 拒绝（防 maxParallel=1 死锁 + 越权面，D-B）
+      const memberDeleg = await getTeamDelegationByChildSessionKey(parentKey)
+      if (memberDeleg) {
+        await recordRejectedTeamDelegation({
+          teamRunId: memberDeleg.teamRunId,
+          memberAgentId: targetAgentId,
+          goal,
+          reason: 'not_member',
+        }).catch(() => {})
+        return this.sendError(res, 403, 'team members cannot sub-delegate within a team run')
+      }
+    }
+
     // Concurrency guard
     if (this._activeDelegations >= Gateway.MAX_CONCURRENT_DELEGATIONS) {
       return this.sendError(
@@ -5517,6 +5559,23 @@ export class Gateway {
       parentSessionKey: parsed.parentSessionKey,
       sourceAgent,
     })
+
+    // Team run admission (D-C): per-run 信号量。放在所有前置 guard（depth/memory
+    // pressure）之后、spawn 之前，避免占额度后又 bail。超额已原子记 rejected 行 → 429。
+    let teamDelegationId: string | null = null
+    if (teamRunLeader) {
+      const admit = await admitTeamDelegation({
+        teamRunId: teamRunLeader.teamRunId,
+        memberAgentId: targetAgentId,
+        goal,
+        maxParallel: teamRunLeader.maxParallel,
+      })
+      if (!admit.admitted) {
+        return this.sendError(res, 429, `team run maxParallel reached (${teamRunLeader.maxParallel})`)
+      }
+      teamDelegationId = admit.delegationId
+    }
+
     const session = await this.sessions.getOrCreate({
       sessionKey,
       agent: delegatedAgent,
@@ -5526,6 +5585,11 @@ export class Gateway {
       title: `[delegate] ${goal.slice(0, 40)}`,
       delegationDepth: depth + 1,
     })
+
+    // D-B：把 child session key 记回委派行，供后续成员嵌套委派反查。
+    if (teamDelegationId) {
+      await setTeamDelegationChildSession(teamDelegationId, sessionKey).catch(() => {})
+    }
 
     const progressRunId = `dlg-${Date.now().toString(36)}-${randomBytes(4).toString('hex')}`
     const emitProgress = (block: DelegateProgressBlock | null) => {
@@ -5664,6 +5728,13 @@ export class Gateway {
       clearTimeoutTimer()
       unregisterDelegation?.()
       this._activeDelegations--
+      // Team run: 委派终态落 SQLite（error 空=completed）。
+      if (teamDelegationId) {
+        await completeTeamDelegation(teamDelegationId, {
+          status: error ? 'failed' : 'completed',
+          error: error || null,
+        }).catch(() => {})
+      }
     }
 
     eventBus.emit('agent.completed', createEvent('agent.completed', targetAgentId, {
