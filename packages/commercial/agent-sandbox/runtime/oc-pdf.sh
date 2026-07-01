@@ -78,17 +78,19 @@ if ! command -v quarto >/dev/null 2>&1; then
 fi
 
 # Typst 渲染。-M mainfont 让 Typst 用 CJK 字体,避免中文豆腐块。
-# 用临时工作目录避免污染源目录的中间产物。
+# 用临时工作目录避免污染源目录的中间产物。**必须 cd 进 work 再 render**:quarto 的
+# --output 是相对输入所在目录解析的,不 cd 会把产物写到意外的相对路径(../../),
+# 与 oc-poster 的 cwd:dir 范式一致。
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 src_base="$(basename "$input")"
 cp "$input" "$work/$src_base"
 
-if quarto render "$work/$src_base" \
+if ( cd "$work" && quarto render "$src_base" \
       --to typst \
       -M "mainfont:$mainfont" \
-      --output "$out_base" >/dev/null 2>"$work/err.log"; then
-  # quarto 把输出写到源同目录;搬到目标目录
+      --output "$out_base" ) >/dev/null 2>"$work/err.log"; then
+  # quarto 把输出写到 work 目录(cwd);搬到目标目录
   produced="$work/$out_base"
   if [[ -f "$produced" ]]; then
     mv -f "$produced" "$out_abs"
