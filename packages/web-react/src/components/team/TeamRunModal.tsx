@@ -6,11 +6,12 @@ import { api } from "../../lib/api";
 import type { AuthSession, TeamDelegation, TeamRun, TeamRunStatus } from "../../lib/types";
 import { Alert, Button, Spinner } from "../ui";
 
+// finalize_required = 队长 turn 已结束但未 submit_team_final，前端无动作可推进它，
+// 不纳入 active（否则永久空转轮询）；到达即停轮询并显示告警（Codex 审）。
 const ACTIVE_STATUSES = new Set<TeamRunStatus>([
   "pending",
   "running",
   "waiting_review",
-  "finalize_required",
   "finalizing",
 ]);
 
@@ -91,7 +92,7 @@ export function TeamRunModal({
             {!auth || !teamId ? (
               <p className="py-10 text-center text-[13px] text-faint">请先登录并选择团队。</p>
             ) : (
-              <TeamRunBody auth={auth} teamId={teamId} originPeerId={originPeerId} />
+              <TeamRunBody key={teamId} auth={auth} teamId={teamId} originPeerId={originPeerId} />
             )}
           </div>
         </Dialog.Content>

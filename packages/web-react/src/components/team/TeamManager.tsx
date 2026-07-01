@@ -16,6 +16,11 @@ function agentName(id: string): string {
   return AGENTS.find((a) => a.id === id)?.name ?? id;
 }
 
+// 团队名常为中文，无法 slug；创建时给一个随机默认 id，用户可改成有意义的英文 id。
+function genTeamId(): string {
+  return `team-${Math.random().toString(36).slice(2, 8)}`;
+}
+
 /**
  * 团队管理中心：列出 / 新建 / 编辑 / 删除智能体团队（经容器代理 /api/agent-teams*）。
  * 团队 = 一个队长 + 若干成员 + 协作策略（并发上限 / 强制复核）。运行语义在服务端强制。
@@ -226,6 +231,7 @@ function TeamEditor({
   onSaved: () => void;
 }) {
   const isEdit = !!team;
+  const [teamId, setTeamId] = useState(team?.id ?? genTeamId());
   const [name, setName] = useState(team?.name ?? "");
   const [description, setDescription] = useState(team?.description ?? "");
   const [leaderAgentId, setLeaderAgentId] = useState(team?.leaderAgentId ?? AGENTS[0]?.id ?? "");
@@ -256,16 +262,25 @@ function TeamEditor({
   const save = async () => {
     setErr(null);
     if (!name.trim()) return setErr("团队名称必填");
+    if (!isEdit && !/^[a-zA-Z0-9_-]+$/.test(teamId)) {
+      return setErr("团队 ID 只能含字母、数字、- 和 _");
+    }
     if (members.length === 0) return setErr("至少添加一名成员");
     if (requireReview && !reviewAgentId) return setErr("开启强制复核时必须指定复核者");
     const body: AgentTeamInput = {
+      // 编辑时 id 固定（后端禁止改）；新建时用用户填/生成的 id。
+      id: isEdit && team ? team.id : teamId,
       name: name.trim(),
       description: description.trim() || undefined,
       leaderAgentId,
+      // 透传本 UI 尚未编辑的字段（PUT 是整体替换，不透传会清空）—— Codex 审。
+      leaderRole: team?.leaderRole,
+      leaderPrompt: team?.leaderPrompt,
       members: members.map((m) => ({
         agentId: m.agentId,
         role: m.role?.trim() || undefined,
         responsibility: m.responsibility?.trim() || undefined,
+        rolePrompt: m.rolePrompt,
       })),
       policy: {
         maxParallel,
@@ -273,7 +288,6 @@ function TeamEditor({
         ...(requireReview && reviewAgentId ? { reviewAgentId } : {}),
       },
     };
-    if (isEdit && team) body.id = team.id;
     setSaving(true);
     try {
       if (isEdit && team) await api.updateTeam(auth, team.id, body);
@@ -305,6 +319,17 @@ function TeamEditor({
           maxLength={80}
         />
       </Field>
+      {!isEdit && (
+        <Field label="团队 ID（英文/数字/-/_，创建后不可改）">
+          <input
+            className={inputCls}
+            value={teamId}
+            onChange={(e) => setTeamId(e.target.value)}
+            placeholder="research-squad"
+            maxLength={48}
+          />
+        </Field>
+      )}
       <Field label="简介（可选）">
         <input
           className={inputCls}
