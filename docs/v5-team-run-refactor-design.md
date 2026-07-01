@@ -169,3 +169,28 @@ TeamDelegation {
 - 表 CREATE 在 `sessionsDb.ts:~289`（末尾 db.exec 块）；CRUD 新文件 `packages/storage/src/teamRunStore.ts`（拷 wechatBindings.ts 结构）；`storage/src/index.ts` 加 barrel export。零新单例。
 
 **P1 开工子步顺序**：P1a storage（表+teamRunStore，greenfield 最低风险）→ P1b createTeamRun+路由+桥接 → P1c delegate admission → P1d submit_team_final 工具+finalize 路由+兜底 gate。每子步 typecheck + Codex 审 code。
+
+---
+
+## 10. P1b-2 Codex 审 = BLOCK（2026-07-01）→ 桥接架构需 rework
+
+进度：P1a(cb1a8774) + P1b-1(97cf2df8) + P1b-2(5116acfe) 已 commit + typecheck 干净。Codex 审 P1b-2 = **BLOCK**（conversationId 019f1b95 复评2）。
+
+**确认 OK**：teamRunId env 注入、队长 prompt first-turn、admitTeamDelegation 原子事务。
+
+**必改**：
+1. **origin 依赖已存在 AgentSession（会 404 + deliver 无处可送）**：`handleCreateTeamRun` 用 `getByKey(sessionKey)` 要求 origin 会话已存在；但新 TeamLauncher 可能在新 client session 上发 REST /runs（无 AgentSession，clientsByPeer 未注册）。
+2. **leader error 被误标 finalize_required**：`SessionManager.submit` error path = onEvent(error)+resolve()（非 reject），`.then` 仍跑把失败标成"未提交"。→ 追踪 leaderHadError，error→failed。
+3. **桥接输出不进 durable client_sessions**：leader session=channel:'delegate'，durable 写回只对 webchat/wechat；手动 deliver 只进 outbound ring，刷新/断线丢队长 transcript。
+4. **interruptStaleTeamRuns 实现了没接线**（gateway 启动未调用）。
+
+**P1c/P1d 前接口缺口**：final/delegation content 存哪未定（只有 *_content_ref）；maxParallel rejection 无账本行（admitTeamDelegation 超额只返回不记录）；origin 缺 peer kind 字段（P5 渠道对称需要，现在加免迁移）。
+
+**→ 修正的桥接架构决策（下一步 rework，取代第 3/4 节部分桥接描述）**：team run 可观测性**不 piggyback 聊天 transcript**：
+- (a) `createTeamRun` 不依赖已存在 AgentSession —— 接收显式 origin routing（channel/peerId/**peerKind**/userId），需要时登记 peer；team_runs 加 `origin_peer_kind` 字段。
+- (b) **durable 真相源 = team_runs + team_delegations 表 + final content**（新增 content 存储约定，P1d 定死）。
+- (c) live 更新走 **team_run.snapshot/patch 事件**（run event schema，本是 P3，**提前作为核心观测机制**）+ 尽力而为的 leader 直播到活跃连接。
+- (d) TeamRunView 从 `GET /api/team-runs/:id` + 订阅 run 事件读状态，**不读聊天 transcript**。
+- (e) 附带修：leader error 终态、gateway 启动接线 interruptStaleTeamRuns、admission 超额原子记 rejected 行、加 origin_peer_kind。
+
+**结论**：P1b-2 commit 5116acfe 保留但标"桥接待 rework"。下一步 = 按上述 (a)-(e) 重做桥接 + 提前落 run event schema，再 Codex 复审 → PASS 后才进 P1c/P1d。**这是先设计对再写的正确迭代，不是返工浪费**。
