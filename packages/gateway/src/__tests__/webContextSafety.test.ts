@@ -1,6 +1,7 @@
 import * as assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
 import {
+  _buildPinnedLookup,
   detectBlockedContent,
   fetchWebContextUrl,
   isPublicIpAddress,
@@ -12,6 +13,47 @@ import {
 function fakeLookup(address: string, family: 4 | 6 = 4): any {
   return async () => [{ address, family }]
 }
+
+describe('_buildPinnedLookup (Node autoSelectFamily contract)', () => {
+  const pinned = { address: '203.0.113.7', family: 4 as const }
+
+  it('returns an ARRAY under { all: true } (Node ≥18.13 lookupAndConnectMultiple)', () => {
+    // Regression: the legacy triplet under {all:true} made Node read a bare
+    // string as an address array → ERR_INVALID_IP_ADDRESS "Invalid IP address:
+    // undefined", which broke every oc-web extract on Node 20.
+    const lookup = _buildPinnedLookup(pinned, 'example.com')
+    let received: unknown
+    let err: unknown
+    lookup('example.com', { all: true }, (e, addr) => {
+      err = e
+      received = addr
+    })
+    assert.equal(err, null)
+    assert.deepEqual(received, [{ address: '203.0.113.7', family: 4 }])
+  })
+
+  it('returns the legacy (address, family) triplet when all is absent', () => {
+    const lookup = _buildPinnedLookup(pinned, 'example.com')
+    let addr: unknown
+    let fam: unknown
+    lookup('example.com', undefined, (_e, a, f) => {
+      addr = a
+      fam = f
+    })
+    assert.equal(addr, '203.0.113.7')
+    assert.equal(fam, 4)
+  })
+
+  it('errors when the connect host drifts from the vetted host (SSRF guard)', () => {
+    const lookup = _buildPinnedLookup(pinned, 'example.com')
+    let err: unknown
+    lookup('evil.example.net', { all: true }, (e) => {
+      err = e
+    })
+    assert.ok(err instanceof Error)
+    assert.match((err as Error).message, /unexpected hostname/)
+  })
+})
 
 describe('webContextSafety', () => {
   it('rejects non-http, credentials, localhost and non-public IPs', () => {

@@ -13,13 +13,16 @@ const FETCH_TIMEOUT_MS = 30_000
 /**
  * Browser-like headers to avoid Bing's anti-bot JS-rendered response.
  * These mimic Microsoft Edge on macOS to get full HTML search results.
+ *
+ * NOTE: `Accept-Language` is intentionally NOT baked in here — it is set
+ * per-query from `localeForQuery` so CJK queries get their own locale instead
+ * of a global market.
  */
 const BROWSER_HEADERS = {
   'User-Agent':
     'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0',
   Accept:
     'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
-  'Accept-Language': 'en-US,en;q=0.9',
   'Accept-Encoding': 'gzip, deflate, br',
   'Cache-Control': 'no-cache',
   Pragma: 'no-cache',
@@ -32,6 +35,31 @@ const BROWSER_HEADERS = {
   'Sec-Fetch-User': '?1',
   'Upgrade-Insecure-Requests': '1',
 } as const
+
+/**
+ * Pick Bing market + Accept-Language from the query's script.
+ *
+ * Previously both were hardcoded to en-US, so a Chinese query like
+ * "抖音自媒体运营策略" was answered against Bing's US market and returned
+ * irrelevant English pages (Dell India, ABC Couriers, …) — the "中文搜索差"
+ * symptom seen in session webmr1zp65b2x07pe. Routing CJK queries to their own
+ * market fixes result relevance at the source, without a paid search API.
+ */
+export function localeForQuery(query: string): { mkt: string; acceptLanguage: string } {
+  // Hangul → Korean (checked first: modern Korean rarely uses Han).
+  if (/[가-힯]/.test(query)) {
+    return { mkt: 'ko-KR', acceptLanguage: 'ko-KR,ko;q=0.9,en;q=0.6' }
+  }
+  // Hiragana/Katakana → Japanese (kana disambiguates JP from ZH kanji).
+  if (/[぀-ヿ]/.test(query)) {
+    return { mkt: 'ja-JP', acceptLanguage: 'ja-JP,ja;q=0.9,en;q=0.6' }
+  }
+  // Han (CJK Unified + Ext-A + Compatibility Ideographs) → Simplified Chinese.
+  if (/[㐀-䶿一-鿿豈-﫿]/.test(query)) {
+    return { mkt: 'zh-CN', acceptLanguage: 'zh-CN,zh;q=0.9,en;q=0.6' }
+  }
+  return { mkt: 'en-US', acceptLanguage: 'en-US,en;q=0.9' }
+}
 
 export class BingSearchAdapter implements WebSearchAdapter {
   async search(
@@ -46,7 +74,8 @@ export class BingSearchAdapter implements WebSearchAdapter {
 
     onProgress?.({ type: 'query_update', query })
 
-    const url = `https://www.bing.com/search?q=${encodeURIComponent(query)}&setmkt=en-US`
+    const { mkt, acceptLanguage } = localeForQuery(query)
+    const url = `https://www.bing.com/search?q=${encodeURIComponent(query)}&setmkt=${mkt}`
 
     const abortController = new AbortController()
     if (signal) {
@@ -59,7 +88,7 @@ export class BingSearchAdapter implements WebSearchAdapter {
         signal: abortController.signal,
         timeout: FETCH_TIMEOUT_MS,
         responseType: 'text',
-        headers: BROWSER_HEADERS,
+        headers: { ...BROWSER_HEADERS, 'Accept-Language': acceptLanguage },
       })
       html = response.data
     } catch (e) {

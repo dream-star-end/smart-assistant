@@ -1,5 +1,5 @@
 import { describe, expect, mock, test } from 'bun:test'
-import { extractBingResults, decodeHtmlEntities } from '../adapters/bingAdapter'
+import { extractBingResults, decodeHtmlEntities, localeForQuery } from '../adapters/bingAdapter'
 
 // ---------------------------------------------------------------------------
 // decodeHtmlEntities
@@ -36,6 +36,38 @@ describe('decodeHtmlEntities', () => {
 
   test('handles mixed entities in one string', () => {
     expect(decodeHtmlEntities('&lt;a&nbsp;href=&quot;x&quot;&gt;')).toBe('<a\u00A0href="x">')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// localeForQuery
+// ---------------------------------------------------------------------------
+
+describe('localeForQuery', () => {
+  test('routes Chinese (Han) queries to zh-CN', () => {
+    expect(localeForQuery('抖音自媒体运营策略 2026')).toEqual({
+      mkt: 'zh-CN',
+      acceptLanguage: 'zh-CN,zh;q=0.9,en;q=0.6',
+    })
+  })
+
+  test('mixed Chinese + latin still routes to zh-CN', () => {
+    expect(localeForQuery('Douyin 抖音 algorithm').mkt).toBe('zh-CN')
+  })
+
+  test('routes Japanese kana queries to ja-JP', () => {
+    expect(localeForQuery('ドンキ おすすめ').mkt).toBe('ja-JP')
+  })
+
+  test('routes Korean queries to ko-KR', () => {
+    expect(localeForQuery('제헌절 공휴일').mkt).toBe('ko-KR')
+  })
+
+  test('defaults ASCII queries to en-US', () => {
+    expect(localeForQuery('best short video strategy')).toEqual({
+      mkt: 'en-US',
+      acceptLanguage: 'en-US,en;q=0.9',
+    })
   })
 })
 
@@ -493,7 +525,28 @@ describe('BingSearchAdapter.search', () => {
     const adapter = await createAdapter()
     await adapter.search('hello world & special=chars', {})
 
-    const calledUrl = axiosGet.mock.calls[0][0] as string
+    const [calledUrl] = axiosGet.mock.calls[0] as unknown as [string]
     expect(calledUrl).toContain('q=hello%20world%20%26%20special%3Dchars')
+    expect(calledUrl).toContain('setmkt=en-US')
+  })
+
+  test('Chinese query targets the zh-CN market and Accept-Language', async () => {
+    const axiosGet = mock(() => Promise.resolve({ data: SAMPLE_HTML }))
+    mock.module('axios', () => ({
+      default: { get: axiosGet, isCancel: () => false },
+    }))
+    mock.module('../../../utils/http', () => ({
+      getWebFetchUserAgent: () => 'TestAgent/1.0',
+    }))
+
+    const adapter = await createAdapter()
+    await adapter.search('抖音自媒体运营策略', {})
+
+    const [calledUrl, calledCfg] = axiosGet.mock.calls[0] as unknown as [
+      string,
+      { headers: Record<string, string> },
+    ]
+    expect(calledUrl).toContain('setmkt=zh-CN')
+    expect(calledCfg.headers['Accept-Language']).toBe('zh-CN,zh;q=0.9,en;q=0.6')
   })
 })

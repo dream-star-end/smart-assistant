@@ -443,6 +443,43 @@ async function decodeBody(
   return await collectWithCap(decoder as unknown as Readable, maxDecodedBytes)
 }
 
+/** Node dns.lookup-compatible callback (the subset we drive). */
+type PinnedLookupCb = (
+  err: NodeJS.ErrnoException | null,
+  address: string | Array<{ address: string; family: number }>,
+  family?: number,
+) => void
+
+/**
+ * Build a DNS `lookup` hook for HttpAgent that always resolves `expectedHost` to
+ * a pre-vetted public IP — the SSRF guard, so the socket can't connect to an IP
+ * we never checked. Honours BOTH callback contracts: the legacy
+ * `(address, family)` triplet and Node ≥18.13's autoSelectFamily `{ all: true }`
+ * array form. Returning the triplet under `{ all: true }` made Node index
+ * `addresses[0]` off a bare string → `ERR_INVALID_IP_ADDRESS: Invalid IP address:
+ * undefined`, which broke every oc-web extract on Node 20.
+ */
+export function _buildPinnedLookup(
+  pinned: { address: string; family: 4 | 6 },
+  expectedHost: string,
+) {
+  return (hostname: string, options: { all?: boolean } | undefined, cb: PinnedLookupCb) => {
+    try {
+      if (normalizeHostname(hostname) !== expectedHost) {
+        cb(new Error('unexpected hostname lookup') as NodeJS.ErrnoException, '', 0)
+        return
+      }
+      if (options?.all) {
+        cb(null, [{ address: pinned.address, family: pinned.family }])
+      } else {
+        cb(null, pinned.address, pinned.family)
+      }
+    } catch (err) {
+      cb(err as NodeJS.ErrnoException, '', 0)
+    }
+  }
+}
+
 async function requestOnce(
   url: URL,
   opts: Required<
@@ -456,21 +493,7 @@ async function requestOnce(
 }> {
   const pinned = await resolvePublicIp(url.hostname, opts.lookup)
   const expectedHost = normalizeHostname(url.hostname)
-  const agentLookup = (
-    hostname: string,
-    _options: unknown,
-    cb: (err: NodeJS.ErrnoException | null, address: string, family: number) => void,
-  ) => {
-    try {
-      if (normalizeHostname(hostname) !== expectedHost) {
-        cb(new Error('unexpected hostname lookup') as NodeJS.ErrnoException, '', 0)
-        return
-      }
-      cb(null, pinned.address, pinned.family)
-    } catch (err) {
-      cb(err as NodeJS.ErrnoException, '', 0)
-    }
-  }
+  const agentLookup = _buildPinnedLookup(pinned, expectedHost)
   const agent: HttpAgent | HttpsAgent =
     url.protocol === 'https:'
       ? new HttpsAgent({ lookup: agentLookup as any })

@@ -57,6 +57,57 @@ const TOOL_META: Record<string, ToolMeta> = {
   Agent: { icon: Bot, label: "子任务", tone: "accent" },
 };
 
+// ── 容器内 oc-* CLI(经 Bash 调用)→ 语义卡 ──
+// oc-web/oc-lit/… 是通过 `Bash` 执行的命令行(`oc-web extract <url>`),工具名恒为
+// "Bash",若不特判就全渲染成通用"终端"卡。这里按命令里的 oc-* 程序名给专属图标/标签,
+// 一次覆盖整类(会话 webmr1zp65b2x07pe 的 oc-web 抓取即因此没有专属卡)。
+const OC_CLI_META: Record<string, ToolMeta> = {
+  "oc-web": { icon: Globe, label: "网页/文档提取", tone: "info" },
+  "oc-browser": { icon: AppWindow, label: "浏览器", tone: "info" },
+  "oc-lit": { icon: Search, label: "文献检索", tone: "info" },
+  "oc-cite": { icon: FileText, label: "引用铸造", tone: "info" },
+  "oc-ingest": { icon: Archive, label: "资料入库", tone: "accent" },
+  "oc-litrag": { icon: Brain, label: "文献问答", tone: "accent" },
+  "oc-report": { icon: NotebookPen, label: "研究报告", tone: "accent" },
+  "oc-rank": { icon: BarChart3, label: "排序打分", tone: "info" },
+  "oc-market": { icon: Sparkles, label: "技能市场", tone: "accent" },
+  "oc-xlsx": { icon: BarChart3, label: "表格生成", tone: "success" },
+  "oc-pdf": { icon: FileText, label: "PDF 生成", tone: "success" },
+  "oc-docx": { icon: FileText, label: "Word 生成", tone: "success" },
+  "oc-slides": { icon: AppWindow, label: "幻灯片生成", tone: "success" },
+  "oc-poster": { icon: ImageIcon, label: "海报生成", tone: "success" },
+  "oc-minimax": { icon: Sparkles, label: "媒体生成", tone: "accent" },
+};
+
+// oc-* 程序名只在【命令位置】才算调用:行首(可有前导空白),或 shell 分隔符
+// (`\n ; & | (`,涵盖 && / ||)之后。这样 `echo oc-web`、`printf oc-web` 这类把
+// oc-web 当参数/文本的命令不会误判成 CLI 调用;lookahead 保证 `oc-lit` 不吞 `oc-litrag`。
+const OC_CLI_RE = new RegExp(
+  `(?:^\\s*|[\\n;&|(]\\s*)(${Object.keys(OC_CLI_META).join("|")})(?=\\s|$)`,
+);
+
+/** 定位命令里首个命令位置的 oc-* CLI(返回名 + token 末尾偏移,无则 null)。 */
+function matchOcCli(command: string): { cli: string; end: number } | null {
+  const m = OC_CLI_RE.exec(command);
+  if (!m) return null;
+  // m.index + m[0].length 落在 CLI token 末尾(lookahead 零宽);用它切摘要,
+  // 避免 `which oc-web ... && oc-web --help` 里 indexOf 命中预检那处 oc-web。
+  return { cli: m[1], end: m.index + m[0].length };
+}
+
+/** 从一条 Bash 命令里识别命令位置调用的 oc-* CLI 名(无则 null)。 */
+export function detectOcCli(command: string | undefined | null): string | null {
+  if (!command) return null;
+  return matchOcCli(command)?.cli ?? null;
+}
+
+/** oc-* 命令的紧凑摘要:CLI token 之后到首个 shell 操作符/重定向前的部分(子命令 + 首参)。 */
+function ocCliSummary(command: string, end: number): string {
+  const tail = command.slice(end).trim();
+  // 去掉从首个管道/重定向/连接符起的尾巴(`2>/dev/null | head` 等)。
+  return tail.replace(/\s+(?:\d*[<>]|\||&&|;).*$/, "").trim().slice(0, 70);
+}
+
 // ── MCP server 前缀 → 友好 meta（图标 + 基础标签 + tone）──
 // 工具名形如 `mcp__<server>__<op>`，先按 server 分类，再按 op 细化。
 const MCP_SERVER_META: Record<string, ToolMeta> = {
@@ -154,7 +205,15 @@ export function humanizeOp(op: string): string {
  * 为工具名解析图标 + 标签（处理 MCP 名）。
  * 优先级：builtin > MCP per-op > MCP server 兜底 > 通用扳手。
  */
-export function resolveToolMeta(name: string): ToolMeta {
+export function resolveToolMeta(
+  name: string,
+  input?: Record<string, unknown> | null,
+): ToolMeta {
+  // Bash 命令若调用 oc-* CLI,给专属语义卡而非通用"终端"卡。
+  if (name === "Bash" && input) {
+    const cli = detectOcCli(asStr(input.command));
+    if (cli && OC_CLI_META[cli]) return OC_CLI_META[cli];
+  }
   if (TOOL_META[name]) return TOOL_META[name];
   const mcp = parseMcpName(name);
   if (mcp) {
@@ -173,8 +232,12 @@ export function resolveToolMeta(name: string): ToolMeta {
 export function toolSummary(name: string, input: Record<string, unknown> | null): string {
   if (!input) return "";
   switch (name) {
-    case "Bash":
-      return (asStr(input.description) || asStr(input.command).split("\n")[0]).slice(0, 60);
+    case "Bash": {
+      const cmd = asStr(input.command);
+      const oc = matchOcCli(cmd);
+      if (oc) return ocCliSummary(cmd, oc.end);
+      return (asStr(input.description) || cmd.split("\n")[0]).slice(0, 60);
+    }
     case "Edit":
       return shortPath(input.file_path);
     case "Read":

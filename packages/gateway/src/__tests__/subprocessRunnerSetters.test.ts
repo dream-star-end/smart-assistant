@@ -15,8 +15,9 @@ import * as assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
 import { ALLOWED_INBOUND_MODELS } from '../server.js'
 import {
+  DEFAULT_SECONDARY_UTILITY_MODEL,
   SubprocessRunner,
-  _buildStaticProviderSmallFastModelEnv,
+  _buildSecondaryUtilityModelEnv,
 } from '../subprocessRunner.js'
 
 function createRunner(
@@ -129,54 +130,47 @@ describe('SubprocessRunner.model getter / setModel', () => {
   })
 })
 
-describe('SubprocessRunner static-provider small-fast model env', () => {
-  it('pins MiniMax-M3 hidden secondary calls to MiniMax-M3', () => {
-    assert.deepEqual(_buildStaticProviderSmallFastModelEnv('MiniMax-M3'), {
-      ANTHROPIC_SMALL_FAST_MODEL: 'MiniMax-M3',
-    })
-    assert.deepEqual(_buildStaticProviderSmallFastModelEnv('minimax-m3'), {
-      ANTHROPIC_SMALL_FAST_MODEL: 'minimax-m3',
-    })
+describe('SubprocessRunner secondary utility model env', () => {
+  it('pins CCB hidden secondary calls to the dedicated cheap static model, unconditionally', () => {
+    // Decoupled from the main model: WebFetch/hook/search secondary calls must
+    // never fall back to Haiku (OAuth pool → 402) nor run on a heavyweight
+    // thinking model (glm-5.2 → upstream 400 → 502). Always deepseek-v4-flash.
+    const prev = process.env.OPENCLAUDE_SECONDARY_MODEL
+    delete process.env.OPENCLAUDE_SECONDARY_MODEL
+    try {
+      assert.deepEqual(_buildSecondaryUtilityModelEnv(), {
+        ANTHROPIC_SMALL_FAST_MODEL: 'deepseek-v4-flash',
+      })
+      assert.equal(DEFAULT_SECONDARY_UTILITY_MODEL, 'deepseek-v4-flash')
+    } finally {
+      if (prev === undefined) delete process.env.OPENCLAUDE_SECONDARY_MODEL
+      else process.env.OPENCLAUDE_SECONDARY_MODEL = prev
+    }
   })
 
-  it('pins DeepSeek hidden secondary calls to the selected DeepSeek model', () => {
-    assert.deepEqual(_buildStaticProviderSmallFastModelEnv('deepseek-v4-flash'), {
-      ANTHROPIC_SMALL_FAST_MODEL: 'deepseek-v4-flash',
-    })
-    assert.deepEqual(_buildStaticProviderSmallFastModelEnv('deepseek-v4-pro'), {
-      ANTHROPIC_SMALL_FAST_MODEL: 'deepseek-v4-pro',
-    })
+  it('honours the OPENCLAUDE_SECONDARY_MODEL ops override', () => {
+    const prev = process.env.OPENCLAUDE_SECONDARY_MODEL
+    process.env.OPENCLAUDE_SECONDARY_MODEL = 'minimax-m3'
+    try {
+      assert.deepEqual(_buildSecondaryUtilityModelEnv(), {
+        ANTHROPIC_SMALL_FAST_MODEL: 'minimax-m3',
+      })
+    } finally {
+      if (prev === undefined) delete process.env.OPENCLAUDE_SECONDARY_MODEL
+      else process.env.OPENCLAUDE_SECONDARY_MODEL = prev
+    }
   })
 
-  it('pins Ark glm-5.1 hidden secondary calls to glm-5.1', () => {
-    assert.deepEqual(_buildStaticProviderSmallFastModelEnv('glm-5.1'), {
-      ANTHROPIC_SMALL_FAST_MODEL: 'glm-5.1',
-    })
-    assert.deepEqual(_buildStaticProviderSmallFastModelEnv('GLM-5.1'), {
-      ANTHROPIC_SMALL_FAST_MODEL: 'GLM-5.1',
-    })
-  })
-
-  it('pins Ark glm-5.2 hidden secondary calls to glm-5.2(2026-06-17 主力)', () => {
-    assert.deepEqual(_buildStaticProviderSmallFastModelEnv('glm-5.2'), {
-      ANTHROPIC_SMALL_FAST_MODEL: 'glm-5.2',
-    })
-    assert.deepEqual(_buildStaticProviderSmallFastModelEnv('GLM-5.2'), {
-      ANTHROPIC_SMALL_FAST_MODEL: 'GLM-5.2',
-    })
-  })
-
-  it('small-fast 匹配大小写不敏感(等价回归:不复用 case-sensitive route matcher)', () => {
-    // 故意保留本地 case-insensitive 逻辑:DeepSeek-v4-pro(大写 D)仍命中 pin。
-    // 若误用 protocol route matcher(deepseek 大小写敏感),这条会从 pin 变不 pin。
-    assert.deepEqual(_buildStaticProviderSmallFastModelEnv('DeepSeek-v4-pro'), {
-      ANTHROPIC_SMALL_FAST_MODEL: 'DeepSeek-v4-pro',
-    })
-  })
-
-  it('does not override small-fast model for Claude/Codex/absent model', () => {
-    assert.deepEqual(_buildStaticProviderSmallFastModelEnv('claude-opus-4-7'), {})
-    assert.deepEqual(_buildStaticProviderSmallFastModelEnv('gpt-5.5'), {})
-    assert.deepEqual(_buildStaticProviderSmallFastModelEnv(undefined), {})
+  it('ignores a blank override and keeps the default', () => {
+    const prev = process.env.OPENCLAUDE_SECONDARY_MODEL
+    process.env.OPENCLAUDE_SECONDARY_MODEL = '   '
+    try {
+      assert.deepEqual(_buildSecondaryUtilityModelEnv(), {
+        ANTHROPIC_SMALL_FAST_MODEL: 'deepseek-v4-flash',
+      })
+    } finally {
+      if (prev === undefined) delete process.env.OPENCLAUDE_SECONDARY_MODEL
+      else process.env.OPENCLAUDE_SECONDARY_MODEL = prev
+    }
   })
 })

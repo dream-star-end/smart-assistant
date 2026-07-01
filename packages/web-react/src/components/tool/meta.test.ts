@@ -1,5 +1,5 @@
 import { describe, expect, test } from "vitest";
-import { parseMcpName, resolveToolMeta, toolSummary } from "./meta";
+import { detectOcCli, parseMcpName, resolveToolMeta, toolSummary } from "./meta";
 
 describe("parseMcpName (P5)", () => {
   test("mcp__server__op → { server, op }", () => {
@@ -66,5 +66,52 @@ describe("toolSummary 摘要 (P5)", () => {
   });
   test("input 为 null → 空摘要", () => {
     expect(toolSummary("Bash", null)).toBe("");
+  });
+});
+
+describe("oc-* CLI 语义卡 (Bash 特判)", () => {
+  test("detectOcCli 识别行首命令", () => {
+    expect(detectOcCli('oc-web extract "https://x.com"')).toBe("oc-web");
+  });
+  test("detectOcCli 识别管道/连接符后的命令", () => {
+    expect(detectOcCli("cd /tmp && oc-cite mint doi:10.1/x")).toBe("oc-cite");
+    expect(detectOcCli("which oc-web 2>/dev/null && oc-web --help")).toBe("oc-web");
+  });
+  test("detectOcCli 不把 oc-lit 误吞成 oc-litrag 的前缀", () => {
+    expect(detectOcCli("oc-litrag ask 'q'")).toBe("oc-litrag");
+    expect(detectOcCli("oc-lit search 'q'")).toBe("oc-lit");
+  });
+  test("detectOcCli 只认命令位置,参数/文本里的 oc-web 不误报", () => {
+    // 非命令位置(echo/printf 的参数)→ 不识别为 CLI 调用。
+    expect(detectOcCli("echo oc-web")).toBeNull();
+    expect(detectOcCli("printf 'run oc-web'")).toBeNull();
+    expect(detectOcCli("echo oc-web-ish")).toBeNull();
+    // 命令位置(行首/分隔符后)→ 识别。
+    expect(detectOcCli("  oc-web extract url")).toBe("oc-web");
+  });
+  test("detectOcCli 对普通命令返回 null", () => {
+    expect(detectOcCli("ls -la")).toBeNull();
+    expect(detectOcCli(undefined)).toBeNull();
+  });
+  test("resolveToolMeta(Bash, oc-web) → 网页/文档提取 + Globe", () => {
+    const m = resolveToolMeta("Bash", { command: 'oc-web extract "https://x.com"' });
+    expect(m.label).toBe("网页/文档提取");
+    expect(m.tone).toBe("info");
+  });
+  test("resolveToolMeta(Bash, 普通命令) → 终端(回退)", () => {
+    expect(resolveToolMeta("Bash", { command: "ls -la" }).label).toBe("终端");
+    expect(resolveToolMeta("Bash").label).toBe("终端");
+  });
+  test("toolSummary(Bash, oc-web) 取子命令+首参,去掉重定向/管道", () => {
+    expect(
+      toolSummary("Bash", {
+        command: 'oc-web extract "https://www.woshipm.com/x" --max-chars 8000 2>&1 | head -150',
+      }),
+    ).toBe('extract "https://www.woshipm.com/x" --max-chars 8000');
+  });
+  test("toolSummary 从命令位置的 oc-web 切摘要,跳过 which 预检那处", () => {
+    expect(
+      toolSummary("Bash", { command: "which oc-web 2>/dev/null && oc-web --help" }),
+    ).toBe("--help");
   });
 });

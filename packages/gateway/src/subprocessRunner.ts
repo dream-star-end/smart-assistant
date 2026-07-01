@@ -81,37 +81,38 @@ export function _buildCcbSpawnTraceEnv(
 }
 
 /**
- * Static-key upstreams (MiniMax / DeepSeek / Ark glm-5.2+glm-5.1) are selected by
- * commercial master from the request body model and must not consume the OAuth
- * account pool.
+ * The model CCB uses for its hidden secondary calls — notably WebFetch's
+ * applyPromptToMarkdown (queryHaiku → getSmallFastModel), plus a few hook /
+ * search helpers. Upstream CCB defaults this to Haiku via ANTHROPIC_SMALL_FAST_MODEL.
  *
- * CCB hidden secondary calls (notably WebFetch's applyPromptToMarkdown via
- * queryHaiku/getSmallFastModel, plus a few hook/search helpers) normally use
- * ANTHROPIC_SMALL_FAST_MODEL or fall back to Haiku.  During a static-provider
- * turn that default would become an unrelated Claude OAuth request and can fail
- * with ACCOUNT_POOL_UNAVAILABLE.  Pin the small-fast model to the same static
- * provider model for this subprocess only.
+ * On v5 both prior behaviours were broken:
+ *   - No pin → CCB fell back to `claude-haiku-4-5`, an OAuth-pool Claude request.
+ *     The v5 pool has ~1 active Claude account, so WebFetch's secondary call
+ *     failed with ACCOUNT_POOL_UNAVAILABLE / HTTP 402.
+ *   - Pinning to the *main* static model → a plain thinking-disabled extraction
+ *     ran on a heavyweight thinking model (glm-5.2 / deepseek-v4-pro). Ark rejects
+ *     that request shape with upstream 400, surfaced to the agent as gateway 502.
+ * Real session `webmr1zp65b2x07pe` (glm-5.2) hit both: WebFetch → 502 (upstream 400)
+ * and → 402.
  *
- * NOTE: intentionally a **local** case-insensitive match, NOT the protocol
- * registry's `matchesRoute` (which is case-SENSITIVE for deepseek). Reusing the
- * route matcher would stop pinning `DeepSeek-v4-pro`-style mixed-case values that
- * currently pin. Kept case-insensitive for byte-equivalence; see equivalence test
- * for `DeepSeek-v4-pro` in subprocessRunnerSetters.test.ts.
+ * Root fix: decouple the utility model from the main model and pin it to ONE
+ * dedicated cheap static-key model. deepseek-v4-flash is the right choice: cheap,
+ * 1M context, strong Chinese, no thinking-format quirks, and it never touches the
+ * OAuth account pool. The commercial master's anthropicProxy dispatches by model
+ * name (isDeepseekModel), so this routes correctly for any proxy-routed session
+ * regardless of its main model.
+ *
+ * The caller gates this: it is applied only when the container routes through the
+ * commercial proxy, NOT when host OAuth points CCB directly at api.anthropic.com
+ * (where deepseek-v4-flash is not a valid model and Haiku must stay the default).
+ * Ops can override the pinned model via OPENCLAUDE_SECONDARY_MODEL.
  */
-export function _buildStaticProviderSmallFastModelEnv(
-  model: string | undefined,
-): Record<string, string> {
-  if (!model) return {}
-  const normalized = model.toLowerCase()
-  if (
-    normalized === 'minimax-m3' ||
-    normalized.startsWith('deepseek-') ||
-    normalized === 'glm-5.1' ||
-    normalized === 'glm-5.2'
-  ) {
-    return { ANTHROPIC_SMALL_FAST_MODEL: model }
-  }
-  return {}
+export const DEFAULT_SECONDARY_UTILITY_MODEL = 'deepseek-v4-flash'
+
+export function _buildSecondaryUtilityModelEnv(): Record<string, string> {
+  const model =
+    process.env.OPENCLAUDE_SECONDARY_MODEL?.trim() || DEFAULT_SECONDARY_UTILITY_MODEL
+  return { ANTHROPIC_SMALL_FAST_MODEL: model }
 }
 
 /** Three-candidate fallback for resolving the bundled `openclaude-memory`
@@ -721,6 +722,12 @@ export class SubprocessRunner extends EventEmitter {
     const providerEnv: Record<string, string> = {}
     const effectiveProvider = this.opts.agentProvider ?? this.opts.config.provider
 
+    // True only when host OAuth is injected below and CCB is pointed DIRECT at
+    // api.anthropic.com (ANTHROPIC_BASE_URL wiped). In that mode the hidden
+    // secondary model must stay an Anthropic-native model, so we skip the
+    // deepseek-v4-flash pin (deepseek is not routable at api.anthropic.com).
+    let routesDirectToAnthropic = false
+
     if (effectiveProvider === 'claude-subscription') {
       // Claude subscription: inject OAuth token, route to Anthropic API
       //
@@ -741,6 +748,7 @@ export class SubprocessRunner extends EventEmitter {
         providerEnv.ANTHROPIC_BASE_URL = ''
         providerEnv.ANTHROPIC_AUTH_TOKEN = ''
         providerEnv.ANTHROPIC_MODEL = ''
+        routesDirectToAnthropic = true
       }
       // else: no host OAuth to inject — some upstream (e.g. v3 commercial
       // supervisor) has already put ANTHROPIC_BASE_URL / ANTHROPIC_AUTH_TOKEN
@@ -753,7 +761,14 @@ export class SubprocessRunner extends EventEmitter {
       // ANTHROPIC_AUTH_TOKEN pointing to the provider's Anthropic-compatible endpoint).
       // This is the "default" path — settings.json controls routing.
     }
-    Object.assign(providerEnv, _buildStaticProviderSmallFastModelEnv(this.opts.model))
+    // Pin CCB's hidden secondary model (WebFetch/hook/search) to a cheap static
+    // model — but ONLY when the container routes through the commercial proxy
+    // (which dispatches by model name and can reach deepseek-v4-flash). In the
+    // direct-Anthropic path above, leave ANTHROPIC_SMALL_FAST_MODEL unset so CCB
+    // keeps its Anthropic-native Haiku default.
+    if (!routesDirectToAnthropic) {
+      Object.assign(providerEnv, _buildSecondaryUtilityModelEnv())
+    }
 
     let proc: ReturnType<TerminalBackend['spawn']>
     try {

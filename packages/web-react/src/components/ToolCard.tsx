@@ -40,7 +40,7 @@ const TONE_TILE: Record<string, string> = {
 export function ToolCard({ message }: { message: ToolLike }) {
   const name = message.toolName || "unknown";
   const input = resolveToolInput(message);
-  const meta = resolveToolMeta(name);
+  const meta = resolveToolMeta(name, input);
   const Icon = meta.icon;
   const summary = toolSummary(name, input);
 
