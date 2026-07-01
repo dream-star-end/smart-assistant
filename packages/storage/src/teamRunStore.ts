@@ -291,23 +291,38 @@ export async function interruptStaleTeamRuns(): Promise<number> {
   return info.changes
 }
 
-// 用户主动停止一次运行：CAS 标 interrupted（仅当仍活跃）+ 活跃委派标 failed。
-// 返回是否本次真的停了活跃 run（幂等：已终态返回 false）。
-export async function interruptTeamRun(teamRunId: string): Promise<boolean> {
+// 用户主动停止：**先在事务里 CAS 关 DB**（run→interrupted + 活跃委派→failed），
+// 关掉后 admission tx / finalize CAS 会据此拒绝新委派与收尾（关竞态窗口）。返回
+// wasActive + 被中断委派的 child_session_key 列表（供 gateway 逐个 interrupt，覆盖
+// admit→register 之间尚未进 active map 的 child）。幂等：已终态 wasActive=false。
+export async function interruptTeamRun(
+  teamRunId: string,
+): Promise<{ wasActive: boolean; childSessionKeys: string[] }> {
   const db = await getSessionsDb()
   const now = Date.now()
-  const info = db
-    .prepare(
-      `UPDATE team_runs SET status = 'interrupted', updated_at = ?
-       WHERE team_run_id = ?
-         AND status IN ('pending','running','waiting_review','finalize_required','finalizing')`,
-    )
-    .run(now, teamRunId)
-  db.prepare(
-    `UPDATE team_delegations SET status = 'failed', error = 'team run interrupted', completed_at = ?, updated_at = ?
-     WHERE team_run_id = ? AND status IN ('queued','running')`,
-  ).run(now, now, teamRunId)
-  return info.changes > 0
+  const tx = db.transaction((): { wasActive: boolean; childSessionKeys: string[] } => {
+    const rows = db
+      .prepare(
+        "SELECT child_session_key FROM team_delegations WHERE team_run_id = ? AND status IN ('queued','running')",
+      )
+      .all(teamRunId) as Array<{ child_session_key: string | null }>
+    const childSessionKeys = rows
+      .map((r) => r.child_session_key)
+      .filter((k): k is string => !!k)
+    const info = db
+      .prepare(
+        `UPDATE team_runs SET status = 'interrupted', updated_at = ?
+         WHERE team_run_id = ?
+           AND status IN ('pending','running','waiting_review','finalize_required','finalizing')`,
+      )
+      .run(now, teamRunId)
+    db.prepare(
+      `UPDATE team_delegations SET status = 'failed', error = 'team run interrupted', completed_at = ?, updated_at = ?
+       WHERE team_run_id = ? AND status IN ('queued','running')`,
+    ).run(now, now, teamRunId)
+    return { wasActive: info.changes > 0, childSessionKeys }
+  })
+  return tx()
 }
 
 // ---- team_delegations ----
@@ -402,10 +417,12 @@ export async function completeTeamDelegation(
 ): Promise<void> {
   const db = await getSessionsDb()
   const now = Date.now()
+  // CAS：仅当委派仍 queued/running 才落终态。防 stop 已把它标 failed(interrupted)后，
+  // 晚到的 delegate finally 又把它覆盖成 completed，污染账本、掩盖 stop 语义（Codex 审）。
   db.prepare(
     `UPDATE team_delegations
        SET status = ?, result_ref = ?, error = ?, completed_at = ?, updated_at = ?
-     WHERE delegation_id = ?`,
+     WHERE delegation_id = ? AND status IN ('queued','running')`,
   ).run(patch.status, patch.resultRef ?? null, patch.error ?? null, now, now, delegationId)
 }
 

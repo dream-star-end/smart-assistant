@@ -4861,11 +4861,14 @@ export class Gateway {
     if (req.method !== 'POST') return this.sendError(res, 405, 'method not allowed')
     const run = await getTeamRun(runId)
     if (!run) return this.sendError(res, 404, 'team run not found')
-    // 中断队长 session + 其下所有成员委派（成员在 delegate 时以 leaderSessionKey 为
-    // parent 注册，_interruptDelegationsForParent 会递归停掉，与 handleStop 同机制）。
+    // 顺序关键（Codex 审）：先在 DB 里 CAS 关 run（admission tx / finalize CAS 据此
+    // 拒绝新委派与收尾，关竞态窗口），再停进程。
+    const { wasActive, childSessionKeys } = await interruptTeamRun(runId)
+    // 中断队长 session + 其下已注册的成员委派（递归，与 handleStop 同机制）。
     this.sessions.interrupt(run.leaderSessionKey)
     this._interruptDelegationsForParent(run.leaderSessionKey)
-    const wasActive = await interruptTeamRun(runId)
+    // 再逐个中断 admit→register 窗口里尚未进 active map 的 child（DB 记的 child key）。
+    for (const childKey of childSessionKeys) this.sessions.interrupt(childKey)
     this.sendJson(res, 200, { ok: true, wasActive })
   }
 
@@ -5727,6 +5730,19 @@ export class Gateway {
         }).catch(() => {})
         throw err
       })
+      // stop 竞态：admission 通过后、submit 前复查 run 是否已被 stop 关闭。若已 interrupted，
+      // 不启动 child turn（child 已建则中断它），委派落 failed（CAS，若 stop 已标则 no-op）。
+      if (teamRunLeader) {
+        const fresh = await getTeamRun(teamRunLeader.teamRunId)
+        if (!fresh || fresh.status !== 'running') {
+          this.sessions.interrupt(sessionKey)
+          await completeTeamDelegation(teamDelegationId, {
+            status: 'failed',
+            error: 'team run interrupted before start',
+          }).catch(() => {})
+          return this.sendError(res, 409, 'team run interrupted')
+        }
+      }
     }
 
     const progressRunId = `dlg-${Date.now().toString(36)}-${randomBytes(4).toString('hex')}`
