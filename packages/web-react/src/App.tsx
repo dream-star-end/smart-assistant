@@ -38,6 +38,7 @@ import type { MediaRef } from "./lib/chat/frames";
 import type { ChatMessage } from "./lib/chat/model";
 import { CONTINUE_PROMPT } from "./lib/chat/render";
 import { TeamManager } from "./components/team/TeamManager";
+import { TeamRunModal } from "./components/team/TeamRunModal";
 import { DEFAULT_AGENT } from "./lib/agents";
 import { ApiError, api } from "./lib/api";
 import type { StoredSession } from "./lib/persist";
@@ -156,6 +157,7 @@ export function App() {
   const [repoModalOpen, setRepoModalOpen] = useState(false);
   const [manageOpen, setManageOpen] = useState(false);
   const [teamOpen, setTeamOpen] = useState(false);
+  const [launchTeam, setLaunchTeam] = useState<{ id: string; name: string } | null>(null);
   const [manageTab, setManageTab] = useState<ManageTab>("memory");
   const [marketplaceOpen, setMarketplaceOpen] = useState(false);
   const [marketplaceTab, setMarketplaceTab] = useState<MarketplaceTab>("browse");
@@ -1039,7 +1041,24 @@ export function App() {
         onClose={() => setManageOpen(false)}
       />
 
-      <TeamManager open={teamOpen} auth={auth} onClose={() => setTeamOpen(false)} />
+      <TeamManager
+        open={teamOpen}
+        auth={auth}
+        onClose={() => setTeamOpen(false)}
+        onLaunch={(id, name) => {
+          setTeamOpen(false);
+          setLaunchTeam({ id, name });
+        }}
+      />
+
+      <TeamRunModal
+        open={!!launchTeam}
+        auth={auth}
+        teamId={launchTeam?.id ?? null}
+        teamName={launchTeam?.name}
+        originPeerId={activeId ?? undefined}
+        onClose={() => setLaunchTeam(null)}
+      />
 
       <MarketplaceCenter
         open={marketplaceOpen}

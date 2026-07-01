@@ -30,7 +30,7 @@ export function TeamManager({
   auth: AuthSession | null;
   onClose: () => void;
   /** 点某团队的「发起」按钮时回调（跳到发起器）。 */
-  onLaunch?: (teamId: string) => void;
+  onLaunch?: (teamId: string, teamName: string) => void;
 }) {
   return (
     <Dialog.Root open={open} onOpenChange={(o) => !o && onClose()}>
@@ -70,7 +70,7 @@ function TeamPanel({
   onClose,
 }: {
   auth: AuthSession;
-  onLaunch?: (teamId: string) => void;
+  onLaunch?: (teamId: string, teamName: string) => void;
   onClose: () => void;
 }) {
   const [teams, setTeams] = useState<AgentTeam[] | null>(null);
@@ -183,7 +183,7 @@ function TeamPanel({
               {onLaunch && (
                 <button
                   onClick={() => {
-                    onLaunch(team.id);
+                    onLaunch(team.id, team.name);
                     onClose();
                   }}
                   title="发起运行"
