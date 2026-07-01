@@ -1,5 +1,5 @@
 /**
- * Integ 测试:平台官方科研 agent 的幂等 seed(seedPlatformMarketplaceAgents)。
+ * Integ 测试:平台官方科研 agent 的幂等 seed(seedPlatformResearchAgents)。
  * PG-only;无测试库时跳过,除非 REQUIRE_TEST_DB=1。
  *
  * 验证:
@@ -27,7 +27,10 @@ import {
   listInstalled,
   publishSkillVersion,
 } from '../marketplace/marketplaceDb.js'
-import { seedPlatformMarketplaceAgents } from '../marketplace/seedPlatformAgents.js'
+import {
+  seedPlatformGeneralAgents,
+  seedPlatformResearchAgents,
+} from '../marketplace/seedPlatformAgents.js'
 
 const TEST_DB_URL =
   process.env.TEST_DATABASE_URL ?? 'postgres://test:test@127.0.0.1:55432/openclaude_test'
@@ -143,10 +146,10 @@ function skip(t: { skip: (r: string) => void }): boolean {
   return false
 }
 
-describe('seedPlatformMarketplaceAgents (integ)', () => {
+describe('seedPlatformResearchAgents (integ)', () => {
   test('无 admin → 跳过(不抛)', async (t) => {
     if (skip(t)) return
-    const r = await seedPlatformMarketplaceAgents({ listPublicModels })
+    const r = await seedPlatformResearchAgents({ listPublicModels })
     assert.equal(r.ownerUserId, null)
     assert.deepEqual(r.seeded, [])
     assert.ok(r.errors.some((e) => /no active admin/.test(e.error)))
@@ -155,7 +158,7 @@ describe('seedPlatformMarketplaceAgents (integ)', () => {
   test('无 pricing → 跳过(不抛)', async (t) => {
     if (skip(t)) return
     await createAdmin('a@x.com')
-    const r = await seedPlatformMarketplaceAgents({})
+    const r = await seedPlatformResearchAgents({})
     assert.deepEqual(r.seeded, [])
     assert.ok(r.errors.some((e) => /no pricing/.test(e.error)))
   })
@@ -164,7 +167,7 @@ describe('seedPlatformMarketplaceAgents (integ)', () => {
     if (skip(t)) return
     const admin = await createAdmin('admin@x.com')
 
-    const r = await seedPlatformMarketplaceAgents({ listPublicModels })
+    const r = await seedPlatformResearchAgents({ listPublicModels })
     assert.equal(r.ownerUserId, admin, 'owner 应为最早 active admin')
     assert.deepEqual(r.seeded.sort(), [...EXPECTED_SLUGS].sort(), 'manifest 合法 + 扫描通过 → seed')
     assert.deepEqual(r.errors, [], `不应有错误:${JSON.stringify(r.errors)}`)
@@ -189,7 +192,7 @@ describe('seedPlatformMarketplaceAgents (integ)', () => {
     for (const slug of DEPRECATED_SLUGS) await seedLegacyAgent(slug, admin)
     assert.equal((await listApprovedForSearch('agent')).length, 2, '前置:两个旧 agent 在架')
 
-    const r = await seedPlatformMarketplaceAgents({ listPublicModels })
+    const r = await seedPlatformResearchAgents({ listPublicModels })
     assert.deepEqual(r.seeded, ['research-assistant'])
     assert.deepEqual(r.deprecated.sort(), [...DEPRECATED_SLUGS].sort(), '旧两个应被下架')
 
@@ -201,10 +204,10 @@ describe('seedPlatformMarketplaceAgents (integ)', () => {
     if (skip(t)) return
     await createAdmin('admin@x.com')
 
-    const first = await seedPlatformMarketplaceAgents({ listPublicModels })
+    const first = await seedPlatformResearchAgents({ listPublicModels })
     assert.deepEqual(first.seeded.sort(), [...EXPECTED_SLUGS].sort())
 
-    const second = await seedPlatformMarketplaceAgents({ listPublicModels })
+    const second = await seedPlatformResearchAgents({ listPublicModels })
     assert.deepEqual(second.seeded, [], '第二次不应重复发布')
     assert.deepEqual(second.skipped.sort(), [...EXPECTED_SLUGS].sort(), '第二次应全部 skip(已存在)')
     assert.deepEqual(second.errors, [])
@@ -222,7 +225,7 @@ describe('seedPlatformMarketplaceAgents (integ)', () => {
     if (skip(t)) return
     await createAdmin('admin@x.com')
     const installer = await createUser('inst@x.com')
-    await seedPlatformMarketplaceAgents({ listPublicModels })
+    await seedPlatformResearchAgents({ listPublicModels })
     const agents = await listApprovedForSearch('agent')
     assert.equal(agents.length, 1)
     const versionId = agents[0].versionId
@@ -250,7 +253,7 @@ describe('seedPlatformMarketplaceAgents (integ)', () => {
     if (skip(t)) return
     await createAdmin('admin@x.com')
     const installer = await createUser('inst@x.com')
-    await seedPlatformMarketplaceAgents({ listPublicModels })
+    await seedPlatformResearchAgents({ listPublicModels })
     const agents = await listApprovedForSearch('agent')
     const saved = process.env.OC_RUNTIME_CHANNEL
     try {
@@ -284,7 +287,7 @@ describe('seedPlatformMarketplaceAgents (integ)', () => {
     if (skip(t)) return
     await createAdmin('admin@x.com')
     // 不提供 deepseek-v4-pro → 科研助手的 model 不在白名单。
-    const r = await seedPlatformMarketplaceAgents({
+    const r = await seedPlatformResearchAgents({
       listPublicModels: () => [{ id: 'glm-5.2' }],
     })
     assert.deepEqual(r.seeded, [], 'model 不合法 → 不应 seed')
@@ -292,5 +295,49 @@ describe('seedPlatformMarketplaceAgents (integ)', () => {
     assert.ok(r.errors.every((e) => /invalid manifest/.test(e.error)))
     const agents = await listApprovedForSearch('agent')
     assert.equal(agents.length, 0, '失败的 seed 不应留下任何 listing')
+  })
+})
+
+describe('seedPlatformGeneralAgents (integ) — 办公助手', () => {
+  const GENERAL_SLUGS = ['office-assistant']
+
+  test('seed → 办公助手成为已批准、可搜的 agent listing(无条件,不依赖 research_config)', async (t) => {
+    if (skip(t)) return
+    const admin = await createAdmin('admin@x.com')
+    const r = await seedPlatformGeneralAgents({ listPublicModels })
+    assert.equal(r.ownerUserId, admin, 'owner 应为最早 active admin')
+    assert.deepEqual(r.seeded.sort(), [...GENERAL_SLUGS].sort(), 'manifest 合法 + 扫描通过 → seed')
+    assert.deepEqual(r.errors, [], `不应有错误:${JSON.stringify(r.errors)}`)
+
+    const agents = await listApprovedForSearch('agent')
+    assert.deepEqual(agents.map((a) => a.slug).sort(), [...GENERAL_SLUGS].sort(), '办公助手应可搜')
+
+    // kind 隔离:办公 agent 不进 skill 目录。
+    const skills = await listApprovedForSearch('skill')
+    assert.equal(
+      skills.filter((s) => GENERAL_SLUGS.includes(s.slug)).length,
+      0,
+      '办公 agent 不应出现在 skill 目录',
+    )
+  })
+
+  test('幂等:重复 seed 不重复发布,仍保持 approved', async (t) => {
+    if (skip(t)) return
+    await createAdmin('admin@x.com')
+    const first = await seedPlatformGeneralAgents({ listPublicModels })
+    assert.deepEqual(first.seeded.sort(), [...GENERAL_SLUGS].sort())
+    const second = await seedPlatformGeneralAgents({ listPublicModels })
+    assert.deepEqual(second.seeded, [], '第二次不应重复发布')
+    assert.deepEqual(second.skipped.sort(), [...GENERAL_SLUGS].sort(), '第二次应全部 skip')
+    assert.deepEqual(second.errors, [])
+  })
+
+  test('两条入口叠加:市场同时有科研助手与办公助手(互不干扰)', async (t) => {
+    if (skip(t)) return
+    await createAdmin('admin@x.com')
+    await seedPlatformResearchAgents({ listPublicModels })
+    await seedPlatformGeneralAgents({ listPublicModels })
+    const slugs = (await listApprovedForSearch('agent')).map((a) => a.slug).sort()
+    assert.deepEqual(slugs, ['office-assistant', 'research-assistant'], '两类平台 agent 应并存')
   })
 })

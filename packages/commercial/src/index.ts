@@ -181,7 +181,10 @@ import {
   type ResearchProxyHandler,
 } from "./research/researchProxy.js";
 import { getResearchConfigPublic } from "./admin/researchConfig.js";
-import { seedPlatformMarketplaceAgents } from "./marketplace/seedPlatformAgents.js";
+import {
+  seedPlatformGeneralAgents,
+  seedPlatformResearchAgents,
+} from "./marketplace/seedPlatformAgents.js";
 import {
   PLATFORM_PROMPT_SLOTS_PATH,
   makePlatformPromptSlotsHandler,
@@ -1191,16 +1194,15 @@ export async function registerCommercial(
         identityRepo,
         listPublicModels: () => pricing.listPublic(),
       });
-      // 平台官方科研 agent 的幂等 seed —— v5-native 露出:让「科研分析师/科研写手」作为
-      // 已批准市场 agent 出现,用户「从市场添加」即可装(v5 agent 露出单一权威=市场,
-      // 不走 v3 seed/team)。仅当 research_config 已开启时 seed(关闭时科研能力本就不可用,
-      // 避免装到只会 503 的 agent;v3 不含本调用 → 不会 seed)。fire-and-forget,失败只
-      // log 不阻断启动;幂等,重启可反复跑。
+      // 平台官方**科研** agent 的幂等 seed —— v5-native 露出(市场为 agent 露出单一权威,
+      // 不走 v3 seed/team)。**仅当 research_config 已开启时 seed**(关闭时科研能力本就 503,
+      // 避免装到只会报错的 agent;v3 不含本调用 → 不会 seed)。fire-and-forget,失败只 log
+      // 不阻断启动;幂等,重启可反复跑。
       void (async () => {
         try {
           const rc = await getResearchConfigPublic();
           if (!rc.enabled) return;
-          const seeded = await seedPlatformMarketplaceAgents({
+          const seeded = await seedPlatformResearchAgents({
             listPublicModels: () => pricing.listPublic(),
           });
           console.log(
@@ -1208,7 +1210,24 @@ export async function registerCommercial(
             JSON.stringify(seeded),
           );
         } catch (err) {
-          console.error("[commercial] seedPlatformMarketplaceAgents failed:", err);
+          console.error("[commercial] seedPlatformResearchAgents failed:", err);
+        }
+      })();
+      // 平台官方**通用/办公** agent(办公助手)的幂等 seed。能力全走容器内本地渲染 CLI
+      // (oc-docx/oc-slides/oc-xlsx/oc-pdf/mmx),不依赖 research_config,故**无条件** seed;
+      // 仍受 marketplaceAgentsEnabled 的 v5 渠道门控(v3 渠道 install/search 侧滤掉)。
+      // v3 不含本调用 → 不会 seed。fire-and-forget,幂等。
+      void (async () => {
+        try {
+          const seeded = await seedPlatformGeneralAgents({
+            listPublicModels: () => pricing.listPublic(),
+          });
+          console.log(
+            "[commercial] platform general agents seed:",
+            JSON.stringify(seeded),
+          );
+        } catch (err) {
+          console.error("[commercial] seedPlatformGeneralAgents failed:", err);
         }
       })();
       dispatchInternal = (req, res, ctx) => {

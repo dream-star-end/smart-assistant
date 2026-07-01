@@ -77,6 +77,7 @@ RUN apt-get update \
         python3 \
         python3-pip \
         python3-venv \
+        fonts-noto-cjk \
     && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/* \
     # 清掉 setuid/setgid 二进制(05-SEC §13 精神,减少本地提权面)。
     # **例外**: 保留 /usr/bin/sudo 的 setuid bit — sudo 二进制必须 setuid root
@@ -104,6 +105,16 @@ RUN python3 -m pip install --break-system-packages --no-cache-dir \
 RUN python3 -m pip install --break-system-packages --no-cache-dir \
       matplotlib SciencePlots numpy pandas
 
+# 办公助手文档工具链(office-* baseline skills 文档化):
+#   - Excel:openpyxl(读改+样式+图表) / XlsxWriter(纯写快) —— oc-xlsx CLI + 直接写 Python;
+#   - PDF:reportlab(票据/表单精确排版) / pypdf(合并拆分水印) / pdfplumber(解析+页码溯源);
+#   - Office 读写:python-docx / python-pptx(需要程序化直改 XML 的场景,通用生成仍走 oc-docx/oc-slides);
+#   - 数据分析:duckdb(让模型写 SQL 分析大表,比手搓 DataFrame 更省 token);
+#   - 日程:icalendar(生成 .ics 会议邀请)。
+# **全部宽松许可(MIT/BSD/LGPL-import)**;合规红线:**绝不装 PyMuPDF(AGPL)/ Marker(GPL)**。
+RUN python3 -m pip install --break-system-packages --no-cache-dir \
+      openpyxl XlsxWriter python-docx python-pptx reportlab pypdf pdfplumber duckdb icalendar
+
 # Generic web/document context extraction MCP dependencies.
 #
 # Keep Crawl4AI / Trafilatura / MarkItDown in separate venvs: current
@@ -121,7 +132,7 @@ RUN set -eux; \
     python3 -m venv /opt/openclaude-webctx/markenv; \
     /opt/openclaude-webctx/markenv/bin/python -m pip install --no-cache-dir --upgrade pip wheel; \
     /opt/openclaude-webctx/markenv/bin/python -m pip install --no-cache-dir --prefer-binary \
-      'markitdown[pdf]==0.1.6' requests; \
+      'markitdown[pdf,docx,xlsx,pptx]==0.1.6' requests; \
     python3 -m venv /opt/openclaude-webctx/crawlenv; \
     /opt/openclaude-webctx/crawlenv/bin/python -m pip install --no-cache-dir --upgrade pip wheel; \
     /opt/openclaude-webctx/crawlenv/bin/python -m pip install --no-cache-dir --prefer-binary \
@@ -179,8 +190,12 @@ COPY --chown=root:root ./runtime/oc-slides.sh /usr/local/bin/oc-slides
 COPY --chown=root:root ./runtime/oc-poster.sh /usr/local/bin/oc-poster
 # oc-rank: 确定性候选排名(tournament debate / tree-search 选分支),文档见 research-tournament skill。
 COPY --chown=root:root ./runtime/oc-rank.sh /usr/local/bin/oc-rank
+# oc-xlsx / oc-pdf: 办公助手确定性产物(Excel via openpyxl / 通用 PDF via Quarto-Typst)。
+# 文档见 office-spreadsheet / office-pdf baseline skill。
+COPY --chown=root:root ./runtime/oc-xlsx.py /usr/local/bin/oc-xlsx
+COPY --chown=root:root ./runtime/oc-pdf.sh /usr/local/bin/oc-pdf
 RUN set -eux; \
-    chmod 0755 /usr/local/bin/oc-docx /usr/local/bin/oc-minimax /usr/local/bin/oc-web-context /usr/local/bin/oc-web /usr/local/bin/oc-browser /usr/local/bin/oc-market /usr/local/bin/oc-lit /usr/local/bin/oc-cite /usr/local/bin/oc-ingest /usr/local/bin/oc-litrag /usr/local/bin/oc-report /usr/local/bin/oc-slides /usr/local/bin/oc-poster /usr/local/bin/oc-rank /usr/local/lib/openclaude/create-docgen-reference.py; \
+    chmod 0755 /usr/local/bin/oc-docx /usr/local/bin/oc-minimax /usr/local/bin/oc-web-context /usr/local/bin/oc-web /usr/local/bin/oc-browser /usr/local/bin/oc-market /usr/local/bin/oc-lit /usr/local/bin/oc-cite /usr/local/bin/oc-ingest /usr/local/bin/oc-litrag /usr/local/bin/oc-report /usr/local/bin/oc-slides /usr/local/bin/oc-poster /usr/local/bin/oc-rank /usr/local/bin/oc-xlsx /usr/local/bin/oc-pdf /usr/local/lib/openclaude/create-docgen-reference.py; \
     ln -sf /usr/local/bin/oc-minimax /usr/local/bin/mmx; \
     python3 /usr/local/lib/openclaude/create-docgen-reference.py /usr/local/share/openclaude-docgen/reference.docx; \
     printf '%s\n' '# DOCX smoke' 'Inline $a^2+b^2=c^2$.' '' '$$' 'E = mc^2' '$$' > /tmp/oc-docx-smoke.md; \
@@ -188,7 +203,17 @@ RUN set -eux; \
     test -s /tmp/oc-docx-smoke.docx; \
     unzip -tq /tmp/oc-docx-smoke.docx; \
     unzip -p /tmp/oc-docx-smoke.docx word/document.xml | grep -q 'm:oMath'; \
-    rm -f /tmp/oc-docx-smoke.md /tmp/oc-docx-smoke.docx
+    rm -f /tmp/oc-docx-smoke.md /tmp/oc-docx-smoke.docx; \
+    printf '%s\n' '名称,金额' '甲方,100' '乙方,200' > /tmp/oc-xlsx-smoke.csv; \
+    oc-xlsx from-csv /tmp/oc-xlsx-smoke.csv -o /tmp/oc-xlsx-smoke.xlsx; \
+    test -s /tmp/oc-xlsx-smoke.xlsx; \
+    unzip -tq /tmp/oc-xlsx-smoke.xlsx; \
+    rm -f /tmp/oc-xlsx-smoke.csv /tmp/oc-xlsx-smoke.xlsx; \
+    printf '%s\n' '# 办公助手 PDF 冒烟' '' '中文正文:验证 Noto CJK 字体 + Typst 渲染可用。' > /tmp/oc-pdf-smoke.md; \
+    oc-pdf /tmp/oc-pdf-smoke.md -o /tmp/oc-pdf-smoke.pdf; \
+    test -s /tmp/oc-pdf-smoke.pdf; \
+    head -c 5 /tmp/oc-pdf-smoke.pdf | grep -q '%PDF'; \
+    rm -f /tmp/oc-pdf-smoke.md /tmp/oc-pdf-smoke.pdf
 
 # ------------------------------------------------------------
 # Codex CLI(@openai/codex)— 跑 GPT 系模型用 app-server JSON-RPC runner

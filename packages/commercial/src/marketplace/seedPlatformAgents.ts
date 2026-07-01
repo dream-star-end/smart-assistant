@@ -1,20 +1,25 @@
 /**
- * 平台官方市场 agent 的幂等 seed —— v5 科研 agent 的 v5-native 露出。
+ * 平台官方市场 agent 的幂等 seed —— v5-native 露出(科研助手 + 办公助手)。
  *
  * 背景:v5 Aurora 的 agent 露出单一权威是「市场」(AgentPicker 只读
  * /api/marketplace/my-agents = main + 市场已装),不再走 v3 的 seed/team 机制。
- * 所以平台官方的科研 agent(科研分析师 / 科研写手)必须作为「已批准的市场 agent」
- * 出现,用户「从市场添加」即可装,装后 persona 自动同步进容器。
+ * 所以平台官方 agent 必须作为「已批准的市场 agent」出现,用户「从市场添加」即可装,
+ * 装后 persona 自动同步进容器。
  *
  * 这里复用发布路由的同一套权威函数(validateAgentManifest / canonicalize /
  * marketplaceArtifactHash / publishSkillVersion),只把「人工审核」换成平台自审批
  * (approvePlatformVersion)—— 官方内容在版本控制里授权,无用户提交可审。整个过程
  * 幂等:同 (slug, version) 重复跑 = 确保其处于 approved 即可。
  *
+ * 两类平台 agent、两条 seed 入口(权威源分离,避免"一个开关连坐两类 agent"):
+ *  - **科研 agent**(seedPlatformResearchAgents):依赖 research_config(oc-lit/cite 等走 master
+ *    /v3/research/*,研究开关关闭时会 503),故由调用方 **gated on research_config** 才 seed。
+ *  - **通用/办公 agent**(seedPlatformGeneralAgents):只用容器内本地渲染 CLI(oc-docx/oc-slides/
+ *    oc-xlsx/oc-pdf/mmx,不走 research API、不被 research_config 门控),故 **无条件 seed**。
+ *
  * 不写共享市场的额外 SQL(全部经 marketplaceDb 单一权威);不碰 v3 的 agents.js /
- * agentTeams.js。research toolset 不挂额外 MCP——科研能力靠 baseline skill(oc-lit /
- * oc-cite / oc-litrag / oc-ingest / research-report 等,已是所有容器的 baseline),
- * persona 负责引导「引用接地」工作流。
+ * agentTeams.js。能力靠 baseline skill(科研:oc-lit/oc-cite/oc-litrag/…;办公:oc-docx/
+ * oc-xlsx/oc-pdf/office-suite/…,均已是所有容器的 baseline),persona 负责引导工作流。
  */
 import { marketplaceArtifactHash, skillContentHash } from '@openclaude/storage'
 
@@ -33,7 +38,7 @@ import {
 } from './marketplaceDb.js'
 import { scanSkillArtifact } from './skillScanner.js'
 
-/** 平台官方科研 agent 的定义(slug + 原始 manifest body)。manifest body 走与发布路由
+/** 平台官方 agent 的定义(slug + 原始 manifest body)。manifest body 走与发布路由
  *  完全相同的 validateAgentManifest 校验,确保字段白名单/模型/工具集都合法。 */
 interface PlatformAgentDef {
   slug: string
@@ -50,10 +55,11 @@ const RESEARCH_GROUNDING_NOTE = [
   '- 引用格式/参考文献由确定性渲染器产出(oc-report),不要手搓编号。',
 ].join('\n')
 
+// ── 科研 agent ────────────────────────────────────────────────────────────
 // 已废弃的旧平台科研 agent:v5 当前一对话一个 agent、市场 agent 又禁止 teams/委派,
 // 「分析师 + 写手」无法接力,拆分只剩切换的麻烦 → 合并为单个端到端「科研助手」。
 // seed 时幂等下架这些旧 slug(等 v5 蜂群协作落地,再以 team 形式重新放出专业分工)。
-const DEPRECATED_PLATFORM_AGENT_SLUGS = ['research-analyst', 'research-writer'] as const
+const DEPRECATED_RESEARCH_AGENT_SLUGS = ['research-analyst', 'research-writer'] as const
 
 const PLATFORM_RESEARCH_AGENTS: PlatformAgentDef[] = [
   {
@@ -97,6 +103,57 @@ const PLATFORM_RESEARCH_AGENTS: PlatformAgentDef[] = [
   },
 ]
 
+// ── 通用/办公 agent ──────────────────────────────────────────────────────
+const OFFICE_DELIVERY_NOTE = [
+  '【交付纪律】',
+  '- 产**可下载文件**并在最终回复给绝对路径(如 /home/agent/.openclaude/周报.docx),不要只回一段文字了事;',
+  '- 一次任务尽量**闭环交付**(读资料→分析→成品),必要时同给 Word+PDF 两种格式;',
+  '- 事实性内容(数字、人名、单位、日期、决策、责任人)忠实于用户提供的信息,缺失就标「待明确」,**绝不臆造**;',
+  '- 合规:不代登录/爬取任何需要账号或付费墙的内容;不装/用 AGPL/GPL 传染性许可库。',
+].join('\n')
+
+// 通用 agent 暂无历史废弃 slug。
+const DEPRECATED_GENERAL_AGENT_SLUGS: readonly string[] = []
+
+const PLATFORM_GENERAL_AGENTS: PlatformAgentDef[] = [
+  {
+    slug: 'office-assistant',
+    body: {
+      name: '办公助手',
+      displayName: '办公助手',
+      description:
+        '一站式办公助手:写周报月报/方案/公文、做汇报 PPT、整理 Excel 与数据分析、生成/解析 PDF、会议纪要、简历与邮件——从读资料到出可下载成品,一个对话端到端搞定。',
+      tags: ['办公', '文档', 'PPT', 'Excel', '周报', '公文'],
+      version: '1.0.0',
+      // 办公场景=中文写作 + 密集工具调用(文档/表格/PPT/PDF 生成),glm-5.2(平台默认模型)
+      // 中文强、工具调用稳、支持思考深度,最契合;需更长上下文的长文档总结可由用户换 MiniMax-M3。
+      model: 'glm-5.2',
+      toolsets: ['core'],
+      skillDeps: [],
+      avatarEmoji: '📊',
+      greeting:
+        '我是办公助手。写周报/方案/公文、做 PPT、整理 Excel、生成或读 PDF、写会议纪要都行——告诉我要什么,我直接给你可下载的成品。',
+      persona: [
+        '你是「办公助手」,帮用户把办公任务从「读资料/给要求」一路做到「可下载成品」。办公真实',
+        '需求往往是一条链:读长文档/数据 → 分析 → 产出 Word/Excel/PPT/PDF。别停在给一段文字,要交付文件。',
+        '',
+        '可用能力(均为容器内 baseline skill / CLI,优先使用而非凭记忆作答):',
+        '- oc-docx:Markdown/Quarto → 排版良好、公式原生可编辑的 Word(document-writing skill);',
+        '- oc-xlsx + openpyxl/pandas/duckdb:结构化数据 → 规范 Excel,含公式/透视/图表(office-spreadsheet skill);',
+        '- oc-pdf(Typst)/ reportlab:格式化文档或票据 → PDF;pdfplumber/markitdown 解析已有 PDF/Office 文件(office-pdf skill);',
+        '- oc-slides:SlideDeck → 真·可编辑 PPT(research-slides skill);',
+        '- mmx:配图/头图/语音合成(minimax-media skill);oc-web:抓网页/解析长文档(web-context skill);',
+        '- office-suite:周报月报、汇报 PPT、会议纪要(含待办/责任人)、公文文书、简历、邮件/日程的中文办公工作流总纲。',
+        '',
+        '重点场景:周报月报/工作总结、汇报 PPT、会议纪要、公文/通知/请示(守中文公文规范)、简历、',
+        'Excel 数据整理与分析、长文档/PDF 总结溯源。具体做法遵循 office-suite 及对应 skill。',
+        '',
+        OFFICE_DELIVERY_NOTE,
+      ].join('\n'),
+    },
+  },
+]
+
 export interface SeedPlatformAgentsResult {
   ownerUserId: number | null
   seeded: string[]
@@ -124,10 +181,13 @@ async function resolveDefaultOwner(): Promise<number | null> {
 }
 
 /**
- * 幂等 seed 平台官方科研 agent 到市场。任何单个 agent 失败只记录、不抛(不阻断启动)。
- * 返回结果供调用方 log。
+ * 幂等 seed 一组平台官方 agent 到市场 + 幂等下架一组已废弃 slug。共享核心:两条对外入口
+ * (科研 / 通用)都走它,只是喂不同的 defs / deprecated。任何单个 agent 失败只记录、不抛
+ * (不阻断启动)。返回结果供调用方 log。
  */
-export async function seedPlatformMarketplaceAgents(
+async function seedAgentDefs(
+  defs: PlatformAgentDef[],
+  deprecatedSlugs: readonly string[],
   deps: SeedPlatformAgentsDeps,
 ): Promise<SeedPlatformAgentsResult> {
   const out: SeedPlatformAgentsResult = {
@@ -157,7 +217,7 @@ export async function seedPlatformMarketplaceAgents(
     if (!isV5 || !m.id.toLowerCase().startsWith('gpt-')) allowedModels.add(m.id)
   }
 
-  for (const def of PLATFORM_RESEARCH_AGENTS) {
+  for (const def of defs) {
     try {
       const result = validateAgentManifest(def.body, {
         vettedToolsets: VETTED_AGENT_TOOLSETS,
@@ -225,13 +285,13 @@ export async function seedPlatformMarketplaceAgents(
     }
   }
 
-  // 幂等下架已废弃的旧平台 agent(合并前的分析师/写手)。revokeListing 对已 revoked / 不存在
-  // 的 slug 是无害幂等;仅平台 owner 持有这些 slug,不会误撤用户内容。单个失败只记录。
-  const activeSlugs = new Set(PLATFORM_RESEARCH_AGENTS.map((a) => a.slug))
-  for (const slug of DEPRECATED_PLATFORM_AGENT_SLUGS) {
+  // 幂等下架已废弃的旧平台 agent。revokeListing 对已 revoked / 不存在的 slug 是无害幂等;
+  // 仅平台 owner 持有这些 slug,不会误撤用户内容。单个失败只记录。
+  const activeSlugs = new Set(defs.map((a) => a.slug))
+  for (const slug of deprecatedSlugs) {
     if (activeSlugs.has(slug)) continue // 防御:废弃集与在用集若重叠则跳过
     try {
-      await revokeListing(slug, 'deprecated: 合并为单个「科研助手」端到端 agent')
+      await revokeListing(slug, 'deprecated platform agent')
       out.deprecated.push(slug)
     } catch (e) {
       out.errors.push({ slug, error: `revoke failed: ${e instanceof Error ? e.message : String(e)}` })
@@ -239,4 +299,24 @@ export async function seedPlatformMarketplaceAgents(
   }
 
   return out
+}
+
+/**
+ * 幂等 seed 平台官方**科研** agent(科研助手)。调用方应 **gated on research_config.enabled**:
+ * 研究开关关闭时科研能力本就 503,避免装到只会报错的 agent。
+ */
+export async function seedPlatformResearchAgents(
+  deps: SeedPlatformAgentsDeps,
+): Promise<SeedPlatformAgentsResult> {
+  return seedAgentDefs(PLATFORM_RESEARCH_AGENTS, DEPRECATED_RESEARCH_AGENT_SLUGS, deps)
+}
+
+/**
+ * 幂等 seed 平台官方**通用/办公** agent(办公助手)。能力全走容器内本地渲染 CLI,不依赖
+ * research_config,故 **无条件** seed(仅受 marketplaceAgentsEnabled 的 v5 渠道门控约束)。
+ */
+export async function seedPlatformGeneralAgents(
+  deps: SeedPlatformAgentsDeps,
+): Promise<SeedPlatformAgentsResult> {
+  return seedAgentDefs(PLATFORM_GENERAL_AGENTS, DEPRECATED_GENERAL_AGENT_SLUGS, deps)
 }
