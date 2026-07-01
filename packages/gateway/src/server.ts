@@ -5543,29 +5543,45 @@ export class Gateway {
     return interrupted
   }
 
-  // P5：等一个 queued 团队委派拿到 slot（maxParallel + 内存水位都满足）。轮询直到
-  // acquired / run 关闭(含被 stop) / 超时。返回 'ok' | 'run_closed' | 'timeout'。
-  // leader 的 delegate_task HTTP 会阻塞在此期间（MCP client 超时 2h+，足够）。
+  // P5：等一个 queued 团队委派拿到 slot（maxParallel + 内存水位 + 全局 backstop 都满足）。
+  // 轮询直到 acquired / run 关闭(含被 stop) / 客户端断开 / 超时。返回
+  // 'ok' | 'run_closed' | 'cancelled' | 'timeout'。leader delegate_task HTTP 阻塞于此。
   private async _waitForTeamSlot(
     delegationId: string,
     teamRunId: string,
     maxParallel: number,
-  ): Promise<'ok' | 'run_closed' | 'timeout'> {
+    req: IncomingMessage,
+  ): Promise<'ok' | 'run_closed' | 'cancelled' | 'timeout'> {
     const QUEUE_TIMEOUT_MS = 10 * 60 * 1000
     const POLL_MS = 500
     const memLimit = parseDelegateMemoryPressureRatio()
     const deadline = Date.now() + QUEUE_TIMEOUT_MS
-    while (Date.now() < deadline) {
-      await new Promise((r) => setTimeout(r, POLL_MS))
-      const mem = readDelegateMemoryPressure()
-      if (mem && mem.ratio >= memLimit) continue // 内存高，继续等，不占 slot
-      const acq = await tryAcquireTeamSlot({ delegationId, teamRunId, maxParallel })
-      if (acq === 'acquired') return 'ok'
-      if (acq === 'run_closed' || acq === 'gone') return 'run_closed'
-      // 'waiting' → 继续轮询
+    // 客户端(leader/MCP)断开时立即退出，否则 queued 行会挡住 FIFO 队头到超时（Codex 审）。
+    let cancelled = false
+    const onClose = () => {
+      cancelled = true
     }
-    await rejectQueuedTeamDelegation(delegationId, 'timeout').catch(() => {})
-    return 'timeout'
+    req.on('close', onClose)
+    try {
+      while (Date.now() < deadline) {
+        if (cancelled) break
+        await new Promise((r) => setTimeout(r, POLL_MS))
+        if (cancelled) break
+        // 全局并发 backstop 再准入：queued 等待期间全局可能被占满，不能绕过 MAX_CONCURRENT。
+        if (this._activeDelegations >= Gateway.MAX_CONCURRENT_DELEGATIONS) continue
+        const mem = readDelegateMemoryPressure()
+        if (mem && mem.ratio >= memLimit) continue // 内存高，继续等，不占 slot
+        const acq = await tryAcquireTeamSlot({ delegationId, teamRunId, maxParallel })
+        if (acq === 'acquired') return 'ok'
+        if (acq === 'run_closed' || acq === 'gone') return 'run_closed'
+        // 'waiting' → 继续轮询
+      }
+      // 取消或超时：把 queued 行标 rejected(timeout)，让出 FIFO 队头。
+      await rejectQueuedTeamDelegation(delegationId, 'timeout').catch(() => {})
+      return cancelled ? 'cancelled' : 'timeout'
+    } finally {
+      req.off('close', onClose)
+    }
   }
 
   private async handleDelegateTask(
@@ -5732,7 +5748,9 @@ export class Gateway {
           teamDelegationId,
           teamRunLeader.teamRunId,
           teamRunLeader.maxParallel,
+          req,
         )
+        if (waited === 'cancelled') return // 客户端已断开，无需响应
         if (waited === 'run_closed') return this.sendError(res, 409, 'team run is no longer active')
         if (waited === 'timeout') {
           return this.sendError(
