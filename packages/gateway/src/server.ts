@@ -65,6 +65,8 @@ import {
   recordRejectedTeamDelegation,
   setTeamDelegationChildSession,
   completeTeamDelegation,
+  markTeamRunFinalAccepted,
+  hasCompletedReviewerDelegation,
   writeConfig,
   getUsageSummary,
   queryEvents,
@@ -2259,6 +2261,15 @@ export class Gateway {
     const teamRunGetMatch = url.pathname.match(/^\/api\/team-runs\/([a-zA-Z0-9_-]+)$/)
     if (teamRunGetMatch) {
       this.handleTeamRunGet(req, res, teamRunGetMatch[1]).catch((err) =>
+        this.sendError(res, 500, String(err)),
+      )
+      return
+    }
+    const teamRunFinalizeMatch = url.pathname.match(
+      /^\/api\/team-runs\/([a-zA-Z0-9_-]+)\/finalize$/,
+    )
+    if (teamRunFinalizeMatch) {
+      this.handleTeamRunFinalize(req, res, teamRunFinalizeMatch[1]).catch((err) =>
         this.sendError(res, 500, String(err)),
       )
       return
@@ -4758,6 +4769,55 @@ export class Gateway {
     if (!run) return this.sendError(res, 404, 'team run not found')
     const delegations = await listTeamDelegations(runId)
     this.sendJson(res, 200, { run, delegations })
+  }
+
+  // POST /api/team-runs/:id/finalize  { content, summary?, sessionKey }
+  // submit_team_final 工具的落点。硬校验 leader 身份 + requireReview gate。
+  private async handleTeamRunFinalize(
+    req: IncomingMessage,
+    res: ServerResponse,
+    runId: string,
+  ): Promise<void> {
+    if (req.method !== 'POST') return this.sendError(res, 405, 'method not allowed')
+    let parsed: any
+    try {
+      parsed = JSON.parse(await this.readBody(req))
+    } catch {
+      return this.sendError(res, 400, 'invalid JSON')
+    }
+    const content = typeof parsed?.content === 'string' ? parsed.content : ''
+    if (!content.trim()) return this.sendError(res, 400, 'content required')
+
+    const run = await getTeamRun(runId)
+    if (!run) return this.sendError(res, 404, 'team run not found')
+
+    // 三绑定校验：调用者必须是该 run 的 leader session（submit_team_final 带其
+    // OPENCLAUDE_SESSION_KEY）。防非 leader 越权 finalize。
+    const callerSessionKey = typeof parsed?.sessionKey === 'string' ? parsed.sessionKey : ''
+    if (!callerSessionKey || callerSessionKey !== run.leaderSessionKey) {
+      return this.sendError(res, 403, 'only the team leader session may finalize this run')
+    }
+    if (run.status === 'interrupted' || run.status === 'failed') {
+      return this.sendError(res, 409, `team run already ${run.status}`)
+    }
+    if (run.finalAcceptedAt) {
+      return this.sendError(res, 409, 'team run already finalized')
+    }
+
+    // requireReview 硬 gate：必须存在一次 reviewer 且 completed 的委派。
+    if (run.reviewRequired && run.reviewAgentId) {
+      const reviewed = await hasCompletedReviewerDelegation(runId, run.reviewAgentId)
+      if (!reviewed) {
+        return this.sendError(
+          res,
+          428,
+          `review required: delegate the draft to reviewer "${run.reviewAgentId}" and wait for it to complete before finalizing`,
+        )
+      }
+    }
+
+    await markTeamRunFinalAccepted(runId, Date.now(), content)
+    this.sendJson(res, 200, { ok: true, teamRunId: runId })
   }
 
   // GET /api/agents/:id    → { agent }

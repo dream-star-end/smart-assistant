@@ -112,6 +112,10 @@ const skills = buildSkillStore()
 // run via tool args (guarded in handleSkillPropose). Absent in normal sessions, where
 // skill_propose is neither listed nor usable.
 const SKILL_TRAIN_RUN_ID = (process.env.OPENCLAUDE_SKILL_TRAIN_RUN_ID ?? '').trim()
+// Team run id, set by the gateway ONLY when this mcp-memory subprocess is a team
+// leader session. When present, submit_team_final is exposed and bound to this run
+// via env — the model can't redirect finalization to another run via tool args.
+const TEAM_RUN_ID = (process.env.OPENCLAUDE_TEAM_RUN_ID ?? '').trim()
 const drafts = new SkillDraftStore()
 
 // Track in-flight embedding tasks to prevent add/delete race conditions
@@ -453,16 +457,36 @@ const SKILL_PROPOSE_TOOL = {
   },
 }
 
-server.setRequestHandler(ListToolsRequestSchema, async () => ({
-  // In a training session the authoritative-write tools are REMOVED (training must
-  // only stage drafts via skill_propose); normal sessions keep the full toolset.
-  tools: SKILL_TRAIN_RUN_ID
-    ? [
-        ...TOOLS.filter((t) => t.name !== 'skill_save' && t.name !== 'skill_delete'),
-        SKILL_PROPOSE_TOOL,
-      ]
-    : TOOLS,
-}))
+// Exposed ONLY in a team leader session (OPENCLAUDE_TEAM_RUN_ID set). The single way
+// to finalize a team run; gateway hard-enforces leader identity + requireReview gate.
+const SUBMIT_TEAM_FINAL_TOOL = {
+  name: 'submit_team_final',
+  description: [
+    '提交团队协作的最终答案（这是团队 run 唯一的收尾方式，只在你是团队队长时可用）。',
+    '调用后 team run 被服务端标记完成。',
+    '若团队配置了强制复核，必须先把最终草稿委派给复核者并等其返回，否则本工具会被服务端拒绝。',
+    '',
+    '  content — 交付给用户的最终答案全文（必填）',
+    '  summary — 可选的一句话摘要',
+  ].join('\n'),
+  inputSchema: {
+    type: 'object',
+    properties: {
+      content: { type: 'string' },
+      summary: { type: 'string' },
+    },
+    required: ['content'],
+  },
+}
+
+server.setRequestHandler(ListToolsRequestSchema, async () => {
+  // Training session REMOVES authoritative-write tools (only skill_propose drafts).
+  const base = SKILL_TRAIN_RUN_ID
+    ? [...TOOLS.filter((t) => t.name !== 'skill_save' && t.name !== 'skill_delete'), SKILL_PROPOSE_TOOL]
+    : TOOLS
+  // Team leader session ADDS submit_team_final.
+  return { tools: TEAM_RUN_ID ? [...base, SUBMIT_TEAM_FINAL_TOOL] : base }
+})
 
 // ─────────────────────────────────────────────────────────────
 // Tool handlers
@@ -499,6 +523,8 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
         return await handleSendToAgent(args as any)
       case 'delegate_task':
         return await handleDelegateTask(args as any)
+      case 'submit_team_final':
+        return await handleSubmitTeamFinal(args as any)
       default:
         return { content: [{ type: 'text', text: `unknown tool: ${name}` }], isError: true }
     }
@@ -1160,6 +1186,37 @@ function postJsonToGateway(
     })
     req.end(opts.body)
   })
+}
+
+// submit_team_final: POST 最终答案到 gateway 的 team-run finalize 端点。经 env
+// 绑定到本 run（OPENCLAUDE_TEAM_RUN_ID），并带 leader session key 供 gateway 校验
+// 调用者身份（三绑定：teamRunId + leaderSessionKey + SESSION_KEY）。
+async function handleSubmitTeamFinal(args: { content?: string; summary?: string }) {
+  if (!TEAM_RUN_ID) return toolError('submit_team_final 仅在团队队长会话可用')
+  const content = typeof args?.content === 'string' ? args.content : ''
+  if (!content.trim()) return toolError('content required')
+  const gatewayPort = process.env.OPENCLAUDE_GATEWAY_PORT || '18789'
+  const gatewayToken = readGatewayToken()
+  const sessionKey = process.env.OPENCLAUDE_SESSION_KEY || ''
+  try {
+    const res = await postJsonToGateway(
+      `http://127.0.0.1:${gatewayPort}/api/team-runs/${encodeURIComponent(TEAM_RUN_ID)}/finalize`,
+      {
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${gatewayToken}`,
+        },
+        body: JSON.stringify({ content, summary: args?.summary, sessionKey }),
+        timeoutMs: DELEGATE_CLIENT_TIMEOUT_MS,
+      },
+    )
+    if (res.statusCode < 200 || res.statusCode >= 300) {
+      return toolError(`团队最终答案提交失败: ${res.body}`)
+    }
+    return { content: [{ type: 'text', text: '已提交团队最终答案，team run 标记完成。' }] }
+  } catch (err: any) {
+    return toolError(`submit_team_final 调用失败: ${err?.message ?? String(err)}`)
+  }
 }
 
 async function handleDelegateTaskToAgent(
