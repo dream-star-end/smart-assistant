@@ -37,6 +37,7 @@ import type { RepoBindErrorWire, RepoStatusWire } from "./lib/chat/frames";
 import type { MediaRef } from "./lib/chat/frames";
 import type { ChatMessage } from "./lib/chat/model";
 import { CONTINUE_PROMPT } from "./lib/chat/render";
+import { TeamManager } from "./components/team/TeamManager";
 import { DEFAULT_AGENT } from "./lib/agents";
 import { ApiError, api } from "./lib/api";
 import type { StoredSession } from "./lib/persist";
@@ -154,6 +155,7 @@ export function App() {
   const [inboxOpen, setInboxOpen] = useState(false);
   const [repoModalOpen, setRepoModalOpen] = useState(false);
   const [manageOpen, setManageOpen] = useState(false);
+  const [teamOpen, setTeamOpen] = useState(false);
   const [manageTab, setManageTab] = useState<ManageTab>("memory");
   const [marketplaceOpen, setMarketplaceOpen] = useState(false);
   const [marketplaceTab, setMarketplaceTab] = useState<MarketplaceTab>("browse");
@@ -817,6 +819,7 @@ export function App() {
     onDelete: deleteSessionConfirm,
     onLogout: demo ? undefined : logout,
     onOpenManage: demo ? undefined : () => openManage("memory"),
+    onOpenTeam: demo ? undefined : () => setTeamOpen(true),
     onOpenMarketplace: demo ? undefined : () => openMarketplace("browse"),
   };
 
@@ -1035,6 +1038,8 @@ export function App() {
         onTabChange={setManageTab}
         onClose={() => setManageOpen(false)}
       />
+
+      <TeamManager open={teamOpen} auth={auth} onClose={() => setTeamOpen(false)} />
 
       <MarketplaceCenter
         open={marketplaceOpen}
