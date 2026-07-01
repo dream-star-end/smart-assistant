@@ -321,13 +321,9 @@ async function ensureMenuRendered() {
   for (const m of (_modelsCache || [])) {
     if (!m.id) continue
     const dn = String(m.display_name || m.id)
-    const hint = m.id === 'claude-opus-4-7'
-      ? '深度推理 · 默认推荐'
-      : m.id === 'claude-sonnet-4-6'
-        ? '更便宜 · 适合常规任务'
-        : currentTeamId
-          ? '切换后会退出团队模式并应用到单 Agent 发送'
-          : '切换后应用到单 Agent 发送'
+    const hint = currentTeamId
+      ? '切换后会退出团队模式并应用到单 Agent 发送'
+      : '切换后应用到单 Agent 发送'
     menu.appendChild(optionButton({
       type: 'model',
       id: String(m.id),

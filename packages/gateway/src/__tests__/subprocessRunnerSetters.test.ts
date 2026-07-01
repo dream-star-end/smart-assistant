@@ -13,7 +13,7 @@
  */
 import * as assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
-import { ALLOWED_INBOUND_MODELS } from '../server.js'
+import { ALLOWED_INBOUND_MODELS, resolveExecutionModel } from '../server.js'
 import {
   SubprocessRunner,
   _buildStaticProviderSmallFastModelEnv,
@@ -70,12 +70,9 @@ describe('SubprocessRunner.model getter / setModel', () => {
   it('ALLOWED_INBOUND_MODELS contains the currently exposed model set', () => {
     // 新增其他模型时这个测试要同步更新。
     // 防止 server.ts WS handler 的静态白名单跟前端 modelPicker 期望的列表漂移。
-    // v1.0.4 launch set:
-    assert.ok(ALLOWED_INBOUND_MODELS.has('claude-opus-4-7'))
-    assert.ok(ALLOWED_INBOUND_MODELS.has('claude-sonnet-4-6'))
     // codex agent (gpt-5.5 走 codex JSON-RPC):
     assert.ok(ALLOWED_INBOUND_MODELS.has('gpt-5.5'))
-    // v1.0.68 起 DeepSeek anthropic-compatible 上游(在 anthropicProxy
+    // DeepSeek anthropic-compatible 上游(在 anthropicProxy
     // isDeepseekModel 命中后切 DEEPSEEK_UPSTREAM_ENDPOINT):
     assert.ok(ALLOWED_INBOUND_MODELS.has('deepseek-v4-flash'))
     assert.ok(ALLOWED_INBOUND_MODELS.has('deepseek-v4-pro'))
@@ -86,6 +83,28 @@ describe('SubprocessRunner.model getter / setModel', () => {
     assert.ok(ALLOWED_INBOUND_MODELS.has('glm-5.2'))
   })
 
+  it('ALLOWED_INBOUND_MODELS 全面下线 Claude 官方模型(v3+v5)', () => {
+    // Claude 官方模型已下线,任何渠道都不再接受;stale prefs / 构造帧会被拒。
+    assert.equal(ALLOWED_INBOUND_MODELS.has('claude-opus-4-7'), false)
+    assert.equal(ALLOWED_INBOUND_MODELS.has('claude-sonnet-4-6'), false)
+    assert.equal(ALLOWED_INBOUND_MODELS.has('claude-haiku-4-5'), false)
+  })
+
+  it('resolveExecutionModel 收敛 agent 级已下线模型(spawn 收口点)', () => {
+    // 白名单内的模型原样保留。
+    assert.equal(resolveExecutionModel('glm-5.2', 'gpt-5.5'), 'glm-5.2')
+    assert.equal(resolveExecutionModel('deepseek-v4-pro', undefined), 'deepseek-v4-pro')
+    // 已下线的 Claude(marketplace manifest / seed / delegate 里 stale)→ 降级到平台默认,
+    // 不会以不可路由的 --model spawn。
+    assert.equal(resolveExecutionModel('claude-opus-4-7', undefined), 'glm-5.2')
+    assert.equal(resolveExecutionModel('claude-sonnet-4-6', 'claude-haiku-4-5'), 'glm-5.2')
+    // preferred 非法但 fallback 合法 → 用 fallback。
+    assert.equal(resolveExecutionModel('claude-opus-4-7', 'MiniMax-M3'), 'MiniMax-M3')
+    // 两者都缺/非法 → 平台默认 glm-5.2。
+    assert.equal(resolveExecutionModel(undefined, null), 'glm-5.2')
+    assert.equal(resolveExecutionModel('some-unknown-model', undefined), 'glm-5.2')
+  })
+
   it('ALLOWED_INBOUND_MODELS rejects bogus / typo model ids', () => {
     // CCB --model 拿到非法值会启动失败 → session 卡死,所以静态白名单要拦住
     // 用户 prefs 残留的旧 id / 恶意 frame 注入字符串。
@@ -93,7 +112,7 @@ describe('SubprocessRunner.model getter / setModel', () => {
       '',
       'opus-4-7',                    // 缺 claude- 前缀
       'claude-opus-4-7-bogus',       // 后缀污染
-      'claude-haiku-4-5',            // 协议本支持 Haiku 但 v1.0.4 产品没暴露
+      'claude-haiku-4-5',            // Claude 官方模型已下线
       'gpt-5',
       'minimax-m3',                  // 大小写敏感；产品暴露 canonical MiniMax-M3
       'CLAUDE-OPUS-4-7',             // 大小写敏感 — Anthropic API 也是
