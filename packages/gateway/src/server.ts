@@ -2314,6 +2314,27 @@ export class Gateway {
       this.handleUserSkillsList(req, res).catch((err) => this.sendInternalError(res, err))
       return
     }
+    const userSkillFilesMatch = url.pathname.match(/^\/api\/skills\/([a-z0-9-]+)\/files$/)
+    if (userSkillFilesMatch) {
+      this._handleUserSkillFiles(req, res, userSkillFilesMatch[1]).catch((err) =>
+        this.sendInternalError(res, err),
+      )
+      return
+    }
+    const userSkillHistoryMatch = url.pathname.match(/^\/api\/skills\/([a-z0-9-]+)\/history$/)
+    if (userSkillHistoryMatch) {
+      this._handleUserSkillHistory(req, res, userSkillHistoryMatch[1]).catch((err) =>
+        this.sendInternalError(res, err),
+      )
+      return
+    }
+    const userSkillRestoreMatch = url.pathname.match(/^\/api\/skills\/([a-z0-9-]+)\/restore$/)
+    if (userSkillRestoreMatch) {
+      this._handleUserSkillRestore(req, res, userSkillRestoreMatch[1]).catch((err) =>
+        this.sendInternalError(res, err),
+      )
+      return
+    }
     const userSkillItemMatch = url.pathname.match(/^\/api\/skills\/([a-z0-9-]+)$/)
     if (userSkillItemMatch) {
       this.handleUserSkillItem(req, res, userSkillItemMatch[1]).catch((err) =>
@@ -4761,6 +4782,83 @@ export class Gateway {
     this.sendJson(res, 200, { skills: list })
   }
 
+  // PUT/DELETE /api/skills/:name/files — 技能目录内辅助文件的写/删(编辑器)。
+  // 路径白名单 references/|assets/|evals/|scripts/,单文件≤64KB;evals.json 过 schema。
+  private async _handleUserSkillFiles(
+    req: IncomingMessage,
+    res: ServerResponse,
+    skillName: string,
+  ): Promise<void> {
+    const store = buildUserSkillStore()
+    const skill = await store.view(skillName, undefined, { includePlatform: false })
+    if (!skill || typeof skill === 'string') return this.sendError(res, 404, 'skill not found')
+    if (skill.writable !== true) return this.sendError(res, 403, 'skill is read-only')
+    const AUX_PREFIXES = ['references/', 'assets/', 'evals/', 'scripts/']
+    if (req.method === 'PUT') {
+      const body = await this.readJsonBody<{ path?: string; content?: string }>(req)
+      const path = (body?.path ?? '').trim()
+      const content = body?.content
+      if (!path || typeof content !== 'string') return this.sendError(res, 400, 'path/content required')
+      if (!AUX_PREFIXES.some((p) => path.startsWith(p)))
+        return this.sendError(res, 400, `path 须位于 ${AUX_PREFIXES.join(' | ')} 之下`)
+      if (Buffer.byteLength(content, 'utf8') > 64 * 1024)
+        return this.sendError(res, 400, '单文件上限 64KB')
+      if (path === 'evals/evals.json') {
+        const parsed = parseSkillEvalsJson(content)
+        if (!parsed.ok) {
+          this.sendJson(res, 422, { error: 'invalid evals', errors: parsed.errors })
+          return
+        }
+      }
+      const r = await store.saveAuxFile(skillName, path, content)
+      if (!r.ok) return this.sendError(res, 400, r.error ?? 'save failed')
+      this.sendJson(res, 200, { ok: true })
+      return
+    }
+    if (req.method === 'DELETE') {
+      const path = new URL(req.url ?? '/', 'http://x').searchParams.get('path') ?? ''
+      if (!AUX_PREFIXES.some((p) => path.startsWith(p)))
+        return this.sendError(res, 400, 'invalid path')
+      const r = await store.deleteAuxFile(skillName, path)
+      if (!r.ok) return this.sendError(res, 400, r.error ?? 'delete failed')
+      this.sendJson(res, 200, { ok: true })
+      return
+    }
+    this.sendError(res, 405, 'method not allowed')
+  }
+
+  // GET /api/skills/:name/history — 版本历史;POST /api/skills/:name/restore — 恢复。
+  // 历史/恢复只覆盖 SKILL.md 正文(save() 快照机制),辅助文件不在快照范围。
+  private async _handleUserSkillHistory(
+    req: IncomingMessage,
+    res: ServerResponse,
+    skillName: string,
+  ): Promise<void> {
+    if (req.method !== 'GET') return this.sendError(res, 405, 'method not allowed')
+    const store = buildUserSkillStore()
+    const skill = await store.view(skillName, undefined, { includePlatform: false })
+    if (!skill || typeof skill === 'string') return this.sendError(res, 404, 'skill not found')
+    this.sendJson(res, 200, { history: await store.history(skillName), writable: skill.writable === true })
+  }
+
+  private async _handleUserSkillRestore(
+    req: IncomingMessage,
+    res: ServerResponse,
+    skillName: string,
+  ): Promise<void> {
+    if (req.method !== 'POST') return this.sendError(res, 405, 'method not allowed')
+    const store = buildUserSkillStore()
+    const skill = await store.view(skillName, undefined, { includePlatform: false })
+    if (!skill || typeof skill === 'string') return this.sendError(res, 404, 'skill not found')
+    if (skill.writable !== true) return this.sendError(res, 403, 'skill is read-only')
+    const body = await this.readJsonBody<{ version?: string }>(req)
+    const version = (body?.version ?? '').trim()
+    if (!version) return this.sendError(res, 400, 'version required')
+    const r = await store.restore(skillName, version)
+    if (!r.ok) return this.sendError(res, 400, r.error ?? 'restore failed')
+    this.sendJson(res, 200, { ok: true })
+  }
+
   // GET/PUT/DELETE /api/skills/:name — user-level skill item. Writes/deletes go to
   // the shared library (delete also sweeps same-named legacy residue across agents).
   private async handleUserSkillItem(
@@ -4771,6 +4869,18 @@ export class Gateway {
     const store = buildUserSkillStore()
     if (req.method === 'GET') {
       // User-facing read: platform skills resolve to 404, never leak their body.
+      // ?file=<rel> → 读取技能目录内单个文件(编辑器/整目录发布导入用)。
+      const fileParam = new URL(req.url ?? '/', 'http://x').searchParams.get('file')
+      if (fileParam) {
+        // 目录穿越由 view() 的词法守卫兜底;此处仅挡明显非法与 history/。
+        if (fileParam.includes('..') || fileParam.startsWith('/') || fileParam.startsWith('history/')) {
+          return this.sendError(res, 400, 'invalid file path')
+        }
+        const content = await store.view(skillName, fileParam, { includePlatform: false })
+        if (typeof content !== 'string') return this.sendError(res, 404, 'file not found')
+        this.sendJson(res, 200, { path: fileParam, content })
+        return
+      }
       const v = await store.view(skillName, undefined, { includePlatform: false })
       if (!v || typeof v === 'string') return this.sendError(res, 404, 'skill not found')
       this.sendJson(res, 200, { skill: v })

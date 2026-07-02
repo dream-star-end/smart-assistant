@@ -1,4 +1,4 @@
-import { ChevronRight, FileText, Loader2, Search, Sparkles, Trash2 } from "lucide-react";
+import { ChevronRight, FileText, Loader2, Pencil, Search, Sparkles, Trash2 } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
 import { api } from "../../lib/api";
 import type { AuthSession, SkillDetail, SkillSummary } from "../../lib/types";
@@ -6,6 +6,7 @@ import { cn } from "../../lib/utils";
 import { Alert, Badge, EmptyState, Input, PanelHeader, Spinner, useConfirm } from "../ui";
 import { ratesFromPublicModel, type ModelRates } from "../../lib/skillRunCost";
 import { SKILL_RUN_MODEL, SkillEvalSection, SkillTrainSection } from "./SkillOptPanel";
+import { SkillEditor } from "./SkillEditor";
 
 /**
  * 技能库：列出用户可用技能（经容器代理 /api/skills），展开看正文（/api/skills/:name），
@@ -150,6 +151,7 @@ function SkillRow({
   const [loading, setLoading] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const [section, setSection] = useState<"body" | "evals" | "train">("body");
+  const [editorOpen, setEditorOpen] = useState(false);
 
   const toggle = useCallback(() => {
     const next = !open;
@@ -183,6 +185,13 @@ function SkillRow({
             className={cn("ml-auto shrink-0 text-faint transition-transform", open && "rotate-90")}
           />
         </button>
+        <button
+          onClick={() => setEditorOpen(true)}
+          aria-label={`编辑 ${skill.name}`}
+          className="flex size-7 shrink-0 items-center justify-center rounded-md text-faint outline-none hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
+        >
+          <Pencil size={14} />
+        </button>
         {skill.writable && (
           <button
             onClick={onDelete}
@@ -193,6 +202,16 @@ function SkillRow({
           </button>
         )}
       </div>
+      <SkillEditor
+        auth={auth}
+        skillName={skill.name}
+        open={editorOpen}
+        onClose={() => setEditorOpen(false)}
+        onChanged={() => {
+          // 编辑器改动后使已加载的正文缓存失效(下次展开重新拉)。
+          setDetail(null);
+        }}
+      />
       <div className="flex flex-wrap gap-1.5 px-3.5 pb-2">
         <Badge tone={skill.layer === "hub" ? "neutral" : "accent"}>
           {skill.layer === "hub" ? "市场" : "自建"}

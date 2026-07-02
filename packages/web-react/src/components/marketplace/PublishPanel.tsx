@@ -135,16 +135,43 @@ function SkillPublishForm({ auth, onPublished }: { auth: AuthSession; onPublishe
     try {
       const d = await api.getSkill(auth, sk.name);
       setBody(d.body ?? "");
+      // 整目录导入:技能是目录,不只是 SKILL.md —— 把 references/assets/evals/scripts
+      // 下的全部文件拉进附属文件区(≤20 个;可手动删减)。发布的就是完整技能。
+      const auxPaths = (d.files ?? [])
+        .filter(
+          (f) =>
+            f !== "SKILL.md" &&
+            !f.startsWith("history/") &&
+            ["references/", "assets/", "evals/", "scripts/"].some((p) => f.startsWith(p)),
+        )
+        .slice(0, 20);
+      const loaded: Array<{ path: string; content: string }> = [];
+      for (const path of auxPaths) {
+        try {
+          const r = await api.getSkillFile(auth, sk.name, path);
+          // evals.json 里的 autoRegression 是本地开关,不随发布走。
+          if (path === "evals/evals.json") {
+            try {
+              const parsed = JSON.parse(r.content) as { autoRegression?: boolean };
+              delete parsed.autoRegression;
+              loaded.push({ path, content: `${JSON.stringify(parsed, null, 2)}\n` });
+              continue;
+            } catch {
+              /* 原样携带 */
+            }
+          }
+          loaded.push({ path, content: r.content });
+        } catch {
+          /* 单文件读失败跳过 */
+        }
+      }
+      setFiles(loaded);
     } catch {
       /* 用户可手填正文 */
     }
-    // 自动附带评测用例 + 上次 baseline 实测(发布者自报,详情页会标注来源;可手动删)。
+    // 自动附带上次 baseline 实测(发布者自报,详情页会标注来源;可手动删)。
     try {
       const ev = await api.getSkillEvals(auth, sk.name);
-      if (ev.evals?.cases?.length) {
-        const { autoRegression: _drop, ...pub } = ev.evals;
-        setFiles([{ path: "evals/evals.json", content: `${JSON.stringify(pub, null, 2)}\n` }]);
-      }
       const b = ev.lastRun?.benchmark;
       if (b && b.passRate?.with !== undefined && b.passRate?.without !== undefined) {
         setBenchmark({

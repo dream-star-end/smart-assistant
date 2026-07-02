@@ -1225,6 +1225,79 @@ export const api = {
       ),
     ),
 
+  /** 更新技能(描述/正文/标签;PUT /api/skills/:name,旧版自动入 history)。 */
+  updateSkill: (a: AuthSession, name: string, body: { description: string; body: string; tags?: string[] }) =>
+    jsonOrThrow<{ ok: boolean }>(
+      callWithRefresh(a, (t) =>
+        fetch(`/api/skills/${encodeURIComponent(name)}`, {
+          method: "PUT",
+          credentials: "include",
+          headers: bearerHeaders(t, true),
+          body: JSON.stringify(body),
+        }),
+      ),
+    ),
+
+  /** 读技能目录内单个文件（GET /api/skills/:name?file=<rel>）。 */
+  getSkillFile: (a: AuthSession, name: string, path: string) =>
+    jsonOrThrow<{ path: string; content: string }>(
+      callWithRefresh(a, (t) =>
+        fetch(`/api/skills/${encodeURIComponent(name)}?file=${encodeURIComponent(path)}`, {
+          credentials: "include",
+          headers: bearerHeaders(t),
+        }),
+      ),
+    ),
+
+  /** 写技能辅助文件（PUT /api/skills/:name/files;references/assets/evals/scripts）。 */
+  putSkillFile: (a: AuthSession, name: string, path: string, content: string) =>
+    jsonOrThrow<{ ok: boolean }>(
+      callWithRefresh(a, (t) =>
+        fetch(`/api/skills/${encodeURIComponent(name)}/files`, {
+          method: "PUT",
+          credentials: "include",
+          headers: bearerHeaders(t, true),
+          body: JSON.stringify({ path, content }),
+        }),
+      ),
+    ),
+
+  /** 删技能辅助文件。 */
+  deleteSkillFile: (a: AuthSession, name: string, path: string) =>
+    jsonOrThrow<{ ok: boolean }>(
+      callWithRefresh(a, (t) =>
+        fetch(`/api/skills/${encodeURIComponent(name)}/files?path=${encodeURIComponent(path)}`, {
+          method: "DELETE",
+          credentials: "include",
+          headers: bearerHeaders(t),
+        }),
+      ),
+    ),
+
+  /** 技能版本历史（GET /api/skills/:name/history;快照覆盖 SKILL.md 正文）。 */
+  getSkillHistory: (a: AuthSession, name: string) =>
+    jsonOrThrow<{ history: Array<{ version: string; timestamp: string }>; writable: boolean }>(
+      callWithRefresh(a, (t) =>
+        fetch(`/api/skills/${encodeURIComponent(name)}/history`, {
+          credentials: "include",
+          headers: bearerHeaders(t),
+        }),
+      ),
+    ),
+
+  /** 恢复历史版本（POST /api/skills/:name/restore;以新版本号写回,可再回滚）。 */
+  restoreSkillVersion: (a: AuthSession, name: string, version: string) =>
+    jsonOrThrow<{ ok: boolean }>(
+      callWithRefresh(a, (t) =>
+        fetch(`/api/skills/${encodeURIComponent(name)}/restore`, {
+          method: "POST",
+          credentials: "include",
+          headers: bearerHeaders(t, true),
+          body: JSON.stringify({ version }),
+        }),
+      ),
+    ),
+
   // ── 技能评测 + 训练(SkillOpt;经容器代理,消耗积分的操作在 UI 层强制成本确认) ──
 
   /** 评测用例 + 上次结果（GET /api/skills/:name/evals）。 */

@@ -97,6 +97,24 @@ export const BRIDGE_API_ALLOWLIST: readonly BridgeApiAllowRule[] = [
   // OWN container skill volume, so they must be proxied to the container (and the
   // container re-validates incoming bridge requests against this same allowlist).
   {
+    label: '/api/skills/:name/files',
+    re: /^\/api\/skills\/[a-z0-9-]+\/files$/,
+    methods: M('PUT', 'DELETE'),
+    proxyFromCommercial: true,
+  },
+  {
+    label: '/api/skills/:name/history',
+    re: /^\/api\/skills\/[a-z0-9-]+\/history$/,
+    methods: M('GET'),
+    proxyFromCommercial: true,
+  },
+  {
+    label: '/api/skills/:name/restore',
+    re: /^\/api\/skills\/[a-z0-9-]+\/restore$/,
+    methods: M('POST'),
+    proxyFromCommercial: true,
+  },
+  {
     label: '/api/skills/:name/evals',
     re: /^\/api\/skills\/[a-z0-9-]+\/evals$/,
     methods: M('GET', 'PUT'),

@@ -925,6 +925,40 @@ export class SkillStore {
     return { ok: true }
   }
 
+  /**
+   * 删除 skill 目录内的辅助文件(编辑器用)。拒绝 SKILL.md / history/ 与目录穿越;
+   * 与 saveAuxFile 同一容器化守卫。文件不存在视为成功(幂等)。
+   */
+  async deleteAuxFile(name: string, relPath: string): Promise<{ ok: boolean; error?: string }> {
+    const v = validateSkillName(name)
+    if (!v.ok) return { ok: false, error: v.error }
+    if (!/^[a-zA-Z0-9._/-]{1,128}$/.test(relPath) || relPath.includes('..') || relPath.startsWith('/')) {
+      return { ok: false, error: 'invalid aux file path' }
+    }
+    if (relPath === 'SKILL.md' || relPath.startsWith('history/')) {
+      return { ok: false, error: 'SKILL.md/history 不可经辅助文件接口删除' }
+    }
+    const skillDir = join(this.writeRoot, name)
+    if (!existsSync(join(skillDir, 'SKILL.md'))) {
+      return { ok: false, error: 'skill not found in writable library' }
+    }
+    const realRoot = await realpath(this.writeRoot)
+    const realSkillDir = await realpath(skillDir)
+    if (!realSkillDir.startsWith(realRoot + sep)) {
+      return { ok: false, error: 'skill directory resolves outside skills root' }
+    }
+    const lexicalTarget = resolve(realSkillDir, relPath)
+    if (!lexicalTarget.startsWith(realSkillDir + sep)) {
+      return { ok: false, error: 'aux file resolves outside skill directory' }
+    }
+    if (!existsSync(lexicalTarget)) return { ok: true }
+    const st = await lstat(lexicalTarget)
+    if (st.isSymbolicLink()) return { ok: false, error: 'aux file target is a symlink' }
+    if (!st.isFile()) return { ok: false, error: 'aux path is not a file' }
+    await rm(lexicalTarget, { force: true })
+    return { ok: true }
+  }
+
   /** List version history for a skill (from the write root). */
   async history(name: string): Promise<Array<{ version: string; timestamp: string }>> {
     const v = validateSkillName(name)
