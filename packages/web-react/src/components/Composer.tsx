@@ -3,7 +3,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { useVoiceInput } from "../hooks/useVoiceInput";
 import type { MediaRef } from "../lib/chat/frames";
 import { cn } from "../lib/utils";
-import { IconButton } from "./ui";
+import { IconButton, useToast } from "./ui";
 
 type Attach = {
   id: string;
@@ -48,6 +48,7 @@ export function Composer({
 }) {
   const [value, setValue] = useState("");
   const [attachments, setAttachments] = useState<Attach[]>([]);
+  const toast = useToast();
   const [voiceMsg, setVoiceMsg] = useState<string | null>(null);
   const ref = useRef<HTMLTextAreaElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
@@ -88,15 +89,19 @@ export function Composer({
 
   const onFiles = async (files: FileList | null) => {
     if (!files || !onUpload) return;
-    const arr = Array.from(files).slice(0, MAX_ATTACH);
     if (fileRef.current) fileRef.current.value = ""; // 允许同名文件再次选择
+    // 上限守卫前置:超出配额的文件**不上传**(此前 chip 有守卫但 onUpload 无条件执行 →
+    // 超限文件白白上传后结果被丢弃),且截断有明确提示而非静默。
+    const room = Math.max(0, MAX_ATTACH - attachments.length);
+    const arr = Array.from(files).slice(0, room);
+    const dropped = files.length - arr.length;
+    if (dropped > 0) toast(`最多 ${MAX_ATTACH} 个附件,已忽略 ${dropped} 个`, "info");
     for (const file of arr) {
       const id = `att-${idRef.current++}`;
-      setAttachments((prev) =>
-        prev.length >= MAX_ATTACH
-          ? prev
-          : [...prev, { id, name: file.name, size: file.size, kind: mediaKindOf(file.type), status: "uploading" }],
-      );
+      setAttachments((prev) => [
+        ...prev,
+        { id, name: file.name, size: file.size, kind: mediaKindOf(file.type), status: "uploading" },
+      ]);
       try {
         const media = await onUpload(file);
         setAttachments((prev) => prev.map((a) => (a.id === id ? { ...a, status: "done", media } : a)));
@@ -150,7 +155,9 @@ export function Composer({
             onKeyDown={(e) => {
               if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
                 e.preventDefault();
-                busy ? onStop?.() : submit();
+                // 生成中 Enter 一律 no-op:流式期间打字回车是高频误触,直接停掉本轮
+                // 损失整个回复。停止只留给显式按钮 / Esc。
+                if (!busy) submit();
               }
             }}
             placeholder={placeholder}

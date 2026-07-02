@@ -492,7 +492,7 @@ function fileExt(s: string): string {
  *  独立组件:研究卡是纯函数不能用 hook,预览需 useSignedSrc → 在此组件内调用。src 必须已过白名单。 */
 function ArtifactPreviewLink({ src }: { src: string }) {
   const previewable = PREVIEWABLE_EXT.has(fileExt(src));
-  const signed = useSignedSrc(previewable ? src : null);
+  const { url: signed } = useSignedSrc(previewable ? src : null);
   if (!previewable || !signed) return null;
   return (
     <a

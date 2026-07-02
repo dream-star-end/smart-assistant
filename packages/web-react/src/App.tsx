@@ -25,7 +25,7 @@ import { ToolCardActionsContext } from "./components/tool/context";
 import { modelLabel } from "./components/ModelSelector";
 import { SettingsCenter } from "./components/SettingsCenter";
 import { Sidebar } from "./components/Sidebar";
-import { Alert, Sheet, Spinner } from "./components/ui";
+import { Alert, Sheet, Spinner, useConfirm, usePrompt } from "./components/ui";
 import { useAgentGate } from "./hooks/useAgentGate";
 import { type UseChatSocket, useChatSocket } from "./hooks/useChatSocket";
 import { useInbox } from "./hooks/useInbox";
@@ -177,6 +177,9 @@ export function App() {
   // “块级变量在声明前使用” 的 TDZ（hook 在下方调用后回填 sockRef.current）。
   const sockRef = useRef<UseChatSocket | null>(null);
   const toast = useToast();
+  // Aurora 风格确认/输入对话框(Promise 式),取代原生 window.confirm/prompt。
+  const [confirmDialog, confirmDialogEl] = useConfirm();
+  const [promptText, promptTextEl] = usePrompt();
   // GitHub 仓库绑定帧处理器的稳定间接：useChatSocket 在 useRepoBinding 之前声明，故经 ref
   // 透传（与 sockRef 同样的 TDZ 规避；handler 本身是 useRepoBinding 的稳定 useCallback）。
   const repoStatusHandlerRef = useRef<(f: RepoStatusWire) => void>(() => {});
@@ -493,12 +496,23 @@ export function App() {
 
   const regenerate = useCallback(() => {
     // demo 用本地 messages；非 demo 找 WS 末条 user 重发。
-    const src: Array<{ role: string; content?: string; text?: string }> = demo
-      ? messages
-      : (sockRef.current?.getMessages(activeId) ?? []);
+    if (demo) {
+      for (let i = messages.length - 1; i >= 0; i--) {
+        if (messages[i].role === "user") {
+          send(messages[i].content ?? "");
+          return;
+        }
+      }
+      return;
+    }
+    // 保真重发:_modelText 是"含附件的完整模型可见文本"(权威,regen 专用字段),text 只是
+    // 显示文案;media 一并透传 —— 此前只回发显示文本,带附件的提问 regen 后附件全丢。
+    const src = sockRef.current?.getMessages(activeId) ?? [];
     for (let i = src.length - 1; i >= 0; i--) {
-      if (src[i].role === "user") {
-        send((src[i].content ?? src[i].text ?? "") as string);
+      const m = src[i];
+      // 跳过 auto-continue/auto-retry 行:那是系统续跑文案,不是用户的真实提问。
+      if (m.role === "user" && !m._isAutoRetry) {
+        send(m._modelText ?? m.text ?? "", m._media);
         return;
       }
     }
@@ -904,12 +918,27 @@ export function App() {
   const modelFooter = selectedModel ? modelLabel(selectedModel) : agent.name;
 
   // 侧栏公共 props：桌面内联与移动抽屉两处复用。余额（balanceCents）本期不展示（P3.5 计费中心）。
-  const renameSessionPrompt = (s: Session) => {
-    const t = prompt("重命名会话", s.title);
-    if (t) setSessions((c) => c.map((x) => (x.id === s.id ? { ...x, title: t } : x)));
+  // rename 一次收口三个持有方:App state(侧栏)+ WS service/IndexedDB + 服务端 canonical。
+  // 此前只改 App state → listSessions server-wins 下次直接盖回旧标题(纯本地幻觉)。
+  const renameSessionPrompt = async (s: Session) => {
+    const t = (await promptText({ title: "重命名会话", initial: s.title }))?.trim();
+    if (!t || t === s.title) return;
+    setSessions((c) => c.map((x) => (x.id === s.id ? { ...x, title: t } : x)));
+    if (!demo) {
+      chat.renameSession(s.id, t);
+      void api.patchSessionTitle(authRef.current, s.id, t).catch(() => {
+        /* 服务端失败:本地已改,下次 listSessions server-wins 盖回旧值,用户可重试;不打断 */
+      });
+    }
   };
-  const deleteSessionConfirm = (s: Session) => {
-    if (!confirm("删除该会话？")) return;
+  const deleteSessionConfirm = async (s: Session) => {
+    const ok = await confirmDialog({
+      title: "删除该会话?",
+      body: `「${s.title || "新对话"}」的本地与云端记录都将删除,不可恢复。`,
+      confirmText: "删除",
+      danger: true,
+    });
+    if (!ok) return;
     localStore.current.delete(s.id);
     historyFetchedRef.current.delete(s.id);
     if (!demo) {
@@ -1182,6 +1211,8 @@ export function App() {
           }
         }}
       />
+      {confirmDialogEl}
+      {promptTextEl}
     </div>
     </ToolCardActionsContext.Provider>
     </MediaSignProvider>

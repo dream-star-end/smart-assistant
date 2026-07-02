@@ -2294,6 +2294,24 @@ export async function deleteClientSession(id: string, userId?: string): Promise<
   return result.changes > 0
 }
 
+/**
+ * Metadata-only rename (PATCH /api/sessions/:id title 专用)。
+ *
+ * 为什么不用 upsertClientSession:那是"整会话 blob 替换 + server-authored merge"语义,
+ * 元数据更新骑在它上面要么被乐观并发 409(不带 _baseSyncedAt),要么把客户端未随带的
+ * messages merge 掉。title 改名是纯元数据写,单列 UPDATE 收口,不触碰 messages/next_seq。
+ * updated_at 照常推进(它同时是 PUT 乐观并发 token;v5 React 客户端消息走 WS 不走全量
+ * PUT,推进无副作用,还能让其它设备的 listSessions server-wins 拿到新标题)。
+ */
+export async function renameClientSession(id: string, userId: string, title: string): Promise<{ ok: boolean; updatedAt: number }> {
+  const db = await getSessionsDb()
+  const now = Date.now()
+  const result = db.prepare(
+    'UPDATE client_sessions SET title = ?, updated_at = ? WHERE id = ? AND user_id = ? AND deleted_at IS NULL'
+  ).run(title, now, id, userId)
+  return { ok: result.changes > 0, updatedAt: now }
+}
+
 /** List unclaimed sessions (user_id='default') with summary for migration UI. */
 export async function listUnclaimedSessions(): Promise<Array<{
   id: string; agentId: string; title: string; createdAt: number;

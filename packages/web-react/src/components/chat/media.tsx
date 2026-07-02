@@ -14,12 +14,20 @@ import { cn } from "../../lib/utils";
 
 type SignFn = (paths: string[]) => Promise<Record<string, string>>;
 
+// 签名 URL 服务端有效期 5min(bearerless)。缓存按 4min 过期 —— 留 1min 余量,避免把
+// "还差几秒就失效"的 URL 交给刚挂载的 <img>(挂载+网络请求期间过期 → 403 裂图)。
+const SIGN_TTL_MS = 4 * 60_000;
+
+type CacheEntry = { url: string; expiresAt: number };
+
 type MediaSignCtx = {
-  /** 返回 path→签名URL（命中缓存直接回；未命中走 sign 并缓存）。被 ACL 拒的 path 缺失。 */
+  /** 返回 path→签名URL（命中未过期缓存直接回；未命中/已过期走 sign 并缓存）。被 ACL 拒的 path 缺失。 */
   resolve: (path: string) => Promise<string | null>;
+  /** 主动失效(媒体元素 onerror 重签用):删缓存条目,下次 resolve 重签。 */
+  invalidate: (path: string) => void;
 };
 
-const noop: MediaSignCtx = { resolve: async () => null };
+const noop: MediaSignCtx = { resolve: async () => null, invalidate: () => {} };
 const Ctx = createContext<MediaSignCtx>(noop);
 
 export function MediaSignProvider({
@@ -34,7 +42,7 @@ export function MediaSignProvider({
   children: React.ReactNode;
 }) {
   // 缓存与 inflight 跨重渲存活；sign 或 authKey 变化（登录态/账号切换）时重置。
-  const cacheRef = useRef<Map<string, string>>(new Map());
+  const cacheRef = useRef<Map<string, CacheEntry>>(new Map());
   const inflightRef = useRef<Map<string, Promise<string | null>>>(new Map());
   const signRef = useRef<SignFn | null>(sign);
   useEffect(() => {
@@ -50,7 +58,11 @@ export function MediaSignProvider({
   const ctxRef = useRef<MediaSignCtx>({
     resolve: async (path: string) => {
       const cache = cacheRef.current;
-      if (cache.has(path)) return cache.get(path)!;
+      const hit = cache.get(path);
+      // TTL:过期条目视为 miss(此前缓存永不过期 → 长会话 >5min 后重挂载的媒体拿到
+      // 过期 URL,403 永久裂图且无重签路径)。
+      if (hit && hit.expiresAt > Date.now()) return hit.url;
+      if (hit) cache.delete(path);
       const inflight = inflightRef.current;
       const pending = inflight.get(path);
       if (pending) return pending;
@@ -59,13 +71,16 @@ export function MediaSignProvider({
       const p = fn([path])
         .then((urls) => {
           const url = urls?.[path] ?? null;
-          if (url) cache.set(path, url);
+          if (url) cache.set(path, { url, expiresAt: Date.now() + SIGN_TTL_MS });
           return url;
         })
         .catch(() => null)
         .finally(() => inflight.delete(path));
       inflight.set(path, p);
       return p;
+    },
+    invalidate: (path: string) => {
+      cacheRef.current.delete(path);
     },
   });
 
@@ -74,13 +89,20 @@ export function MediaSignProvider({
 
 /**
  * 把一个"待签名的容器路径"解析为可用 URL。direct（http/data/已签名）原样回；
- * 容器路径走 provider 主动签名。返回 null 时调用方渲染占位/降级。
+ * 容器路径走 provider 主动签名。url 为 null 时调用方渲染占位/降级。
+ * onError:接到媒体元素的 onError —— 签名 URL 过期(403)时失效缓存并重签**一次**
+ * (retriedRef 防 403 循环;真 ACL 拒绝重签一次后停在占位)。
  */
-export function useSignedSrc(src: string | null | undefined): string | null {
-  const { resolve } = useContext(Ctx);
+export function useSignedSrc(src: string | null | undefined): {
+  url: string | null;
+  onError: () => void;
+} {
+  const { resolve, invalidate } = useContext(Ctx);
   const [url, setUrl] = useState<string | null>(() =>
     src && !isContainerPath(src) ? src : null,
   );
+  const [attempt, setAttempt] = useState(0);
+  const retriedRef = useRef(false);
   useEffect(() => {
     let alive = true;
     if (!src) {
@@ -98,14 +120,24 @@ export function useSignedSrc(src: string | null | undefined): string | null {
     return () => {
       alive = false;
     };
-  }, [src, resolve]);
-  return url;
+  }, [src, resolve, attempt]);
+  // src 变化重置一次性重试额度。
+  useEffect(() => {
+    retriedRef.current = false;
+  }, [src]);
+  const onError = () => {
+    if (retriedRef.current || !src || !isContainerPath(src)) return;
+    retriedRef.current = true;
+    invalidate(src);
+    setAttempt((n) => n + 1); // 触发重签 effect
+  };
+  return { url, onError };
 }
 
 /** markdown 行内 <img>：容器路径主动签名后渲染，否则直渲。签不出时显示替代文本。 */
 export function SignedImg(props: React.ImgHTMLAttributes<HTMLImageElement>) {
   const { src, alt, ...rest } = props;
-  const resolved = useSignedSrc(typeof src === "string" ? src : null);
+  const { url: resolved, onError } = useSignedSrc(typeof src === "string" ? src : null);
   if (!resolved) {
     return (
       <span className="inline-flex items-center gap-1 rounded-md bg-hover px-2 py-1 text-xs text-faint">
@@ -114,13 +146,13 @@ export function SignedImg(props: React.ImgHTMLAttributes<HTMLImageElement>) {
     );
   }
   // biome-ignore lint/a11y/useAltText: alt 经 props 透传
-  return <img src={resolved} alt={alt || ""} loading="lazy" {...rest} />;
+  return <img src={resolved} alt={alt || ""} loading="lazy" onError={onError} {...rest} />;
 }
 
 /** markdown 行内 <video>：容器路径签名后渲染（rehypeEmbedMedia 把媒体路径行内码转成 video 节点用）。 */
 export function SignedVideo(props: React.VideoHTMLAttributes<HTMLVideoElement> & { src?: string }) {
   const { src, ...rest } = props;
-  const resolved = useSignedSrc(typeof src === "string" ? src : null);
+  const { url: resolved, onError } = useSignedSrc(typeof src === "string" ? src : null);
   if (!resolved) {
     return (
       <span className="inline-flex items-center gap-1 rounded-md bg-hover px-2 py-1 text-xs text-faint">
@@ -129,13 +161,13 @@ export function SignedVideo(props: React.VideoHTMLAttributes<HTMLVideoElement> &
     );
   }
   // biome-ignore lint/a11y/useMediaCaption: 模型生成媒体无字幕轨
-  return <video src={resolved} controls className="my-2 max-h-72 max-w-full rounded-lg border border-border" {...rest} />;
+  return <video src={resolved} controls onError={onError} className="my-2 max-h-72 max-w-full rounded-lg border border-border" {...rest} />;
 }
 
 /** markdown 行内 <audio>：容器路径签名后渲染。 */
 export function SignedAudio(props: React.AudioHTMLAttributes<HTMLAudioElement> & { src?: string }) {
   const { src, ...rest } = props;
-  const resolved = useSignedSrc(typeof src === "string" ? src : null);
+  const { url: resolved, onError } = useSignedSrc(typeof src === "string" ? src : null);
   if (!resolved) {
     return (
       <span className="inline-flex items-center gap-1 rounded-md bg-hover px-2 py-1 text-xs text-faint">
@@ -143,13 +175,14 @@ export function SignedAudio(props: React.AudioHTMLAttributes<HTMLAudioElement> &
       </span>
     );
   }
-  return <audio src={resolved} controls className="my-2 w-full max-w-sm" {...rest} />;
+  return <audio src={resolved} controls onError={onError} className="my-2 w-full max-w-sm" {...rest} />;
 }
 
 /** markdown 行内/正文里的容器文件路径 → 可下载文件卡(doc-card)。非媒体文件(txt/docx/pdf/zip…)。
  * 经 /api/media-sign 把容器路径换成同源签名 URL,再用 <a download> 真下载(同源 download 生效)。 */
 export function SignedFileCard({ src, filename }: { src?: string; filename?: string }) {
-  const resolved = useSignedSrc(typeof src === "string" ? src : null);
+  // 文件卡是 <a download>,无媒体加载事件可挂 onError;点击 403 由 TTL 缓存过期重签兜底。
+  const { url: resolved } = useSignedSrc(typeof src === "string" ? src : null);
   const name = (filename || (typeof src === "string" ? src.split("/").pop() : "") || "文件").trim();
   const inner = (
     <>
@@ -187,14 +220,15 @@ export function SignedFileCard({ src, filename }: { src?: string; filename?: str
 function MediaItem({ item }: { item: ResolvedMedia }) {
   const path = item.mode === "sign" ? item.path : null;
   const direct = item.mode === "direct" ? item.src : null;
-  const signed = useSignedSrc(path);
+  const { url: signed, onError } = useSignedSrc(path);
   const url = direct ?? signed;
 
   if (item.mode === "none") {
+    // 不可下载(无 URL 也无可签路径):纯展示,用 span 而非无 href 的 <a>(a11y:假链接)。
     return (
-      <a className="flex items-center gap-1.5 rounded-lg border border-border bg-surface px-3 py-2 text-sm text-muted">
+      <span className="flex items-center gap-1.5 rounded-lg border border-border bg-surface px-3 py-2 text-sm text-muted">
         <FileText size={15} /> {item.filename || "附件"}
-      </a>
+      </span>
     );
   }
   if (!url) {
@@ -211,6 +245,7 @@ function MediaItem({ item }: { item: ResolvedMedia }) {
           src={url}
           alt={item.filename || "图片"}
           loading="lazy"
+          onError={onError}
           className="max-h-72 max-w-full rounded-lg border border-border object-contain"
         />
       </a>
@@ -219,11 +254,11 @@ function MediaItem({ item }: { item: ResolvedMedia }) {
   if (item.kind === "video") {
     return (
       // biome-ignore lint/a11y/useMediaCaption: 用户/模型上传媒体无字幕轨
-      <video src={url} controls className="max-h-72 max-w-full rounded-lg border border-border" />
+      <video src={url} controls onError={onError} className="max-h-72 max-w-full rounded-lg border border-border" />
     );
   }
   if (item.kind === "audio") {
-    return <audio src={url} controls className="w-full max-w-sm" />;
+    return <audio src={url} controls onError={onError} className="w-full max-w-sm" />;
   }
   return (
     <a

@@ -118,16 +118,25 @@ export function Sidebar({
               {label}
             </div>
             {items.map((s) => (
+              // 会话行键盘可达:选中区是真 <button>(Tab 聚焦 + Enter/Space 激活 + aria-current),
+              // 操作区 group-focus-within 显形(此前 div onClick + 仅 hover 显形,键盘用户
+              // 无法切换会话 —— 核心导航不可达)。嵌套按钮非法,故行容器保持 div。
               <div
                 key={s.id}
-                onClick={() => onSelect(s.id)}
                 className={cn(
-                  "group flex cursor-pointer items-center gap-2 rounded-lg px-3 py-2 text-[14px] transition-colors",
+                  "group flex items-center gap-2 rounded-lg pr-2 text-[14px] transition-colors",
                   s.id === activeId ? "bg-active text-fg" : "text-muted hover:bg-hover hover:text-fg",
                 )}
               >
-                <span className="min-w-0 flex-1 truncate">{s.title || "新对话"}</span>
-                <span className="flex shrink-0 items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100">
+                <button
+                  type="button"
+                  onClick={() => onSelect(s.id)}
+                  aria-current={s.id === activeId ? "true" : undefined}
+                  className="min-w-0 flex-1 truncate rounded-lg px-3 py-2 text-left outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                >
+                  {s.title || "新对话"}
+                </button>
+                <span className="flex shrink-0 items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100 group-focus-within:opacity-100">
                   <IconButton
                     aria-label="重命名"
                     variant="muted"

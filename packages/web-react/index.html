@@ -10,7 +10,12 @@
       try {
         var t = localStorage.getItem("oc_theme") || "system";
         var dark = t === "dark" || (t === "system" && matchMedia("(prefers-color-scheme: dark)").matches);
-        if (dark) document.documentElement.classList.add("dark");
+        if (dark) {
+          document.documentElement.classList.add("dark");
+          // theme-color 同步写入:静态值是浅色,暗色用户首屏地址栏/状态栏会闪白。
+          var tc = document.querySelector('meta[name="theme-color"]');
+          if (tc) tc.setAttribute("content", "#0c0c11");
+        }
       } catch (e) {}
     </script>
   </head>

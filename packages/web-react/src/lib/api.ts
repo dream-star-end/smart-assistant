@@ -797,6 +797,22 @@ export const api = {
     ),
 
   /**
+   * 会话重命名（PATCH /api/sessions/:id，Bearer，元数据专用）。不走 putSession 的
+   * 整 blob 替换语义：rename 不携带 messages，骑 PUT 要么 409 要么丢消息。
+   */
+  patchSessionTitle: (a: AuthSession, id: string, title: string): Promise<{ ok: true; updatedAt: number }> =>
+    jsonOrThrow<{ ok: true; updatedAt: number }>(
+      callWithRefresh(a, (t) =>
+        fetch(`/api/sessions/${encodeURIComponent(id)}`, {
+          method: "PATCH",
+          credentials: "include",
+          headers: bearerHeaders(t, true),
+          body: JSON.stringify({ title }),
+        }),
+      ),
+    ),
+
+  /**
    * 跨设备持久化「用户发送的消息」（POST /api/sessions/:id/user-message，Bearer）。
    * 带前端 client 消息 id；服务端直写(role:'user',绕乐观并发,scoped by userId),
    * getSession 回带同 id → 前端合并去重。best-effort，调用方吞错不阻断发送。

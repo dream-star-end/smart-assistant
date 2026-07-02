@@ -21,7 +21,8 @@ function persistSignature(s: StoredSession): string {
   const lastSig = last
     ? `${last.text?.length ?? 0}/${last.output?.length ?? 0}/${last.partialJson?.length ?? 0}/${last._completed ? 1 : 0}/${last.status ?? ""}`
     : "";
-  return `${s.messages.length}:${lastSig}:${s._lastFrameSeq ?? 0}:${s._maxSeq ?? 0}:${s.updatedAt ?? s.lastAt}`;
+  // title 计入:rename 是纯元数据变更,漏掉它 IndexedDB 永远存旧标题(reload 即回退)。
+  return `${s.messages.length}:${lastSig}:${s._lastFrameSeq ?? 0}:${s._maxSeq ?? 0}:${s.updatedAt ?? s.lastAt}:${s.title}`;
 }
 
 /**
@@ -47,6 +48,8 @@ export type UseChatSocket = {
   isSending: (sessId: string | undefined) => boolean;
   ensureSession: (sessId: string, agentId: string, title?: string) => void;
   removeSession: (sessId: string) => void;
+  /** 重命名会话(WS service 内存 + IndexedDB;服务端 PATCH 由 App 层同步)。*/
+  renameSession: (sessId: string, title: string) => void;
   /** 切换会话 agent（§11 跨 agent 污染守卫的写入点）。*/
   switchAgent: (sessId: string, agentId: string) => void;
   send: (p: {
@@ -369,6 +372,10 @@ export function useChatSocket(opts: {
     socket.ensureSession(sessId, agentId, title);
   }, [socket]);
   const removeSession = useCallback((sessId: string) => socket.removeSession(sessId), [socket]);
+  const renameSession = useCallback(
+    (sessId: string, title: string) => socket.renameSession(sessId, title),
+    [socket],
+  );
   const switchAgent = useCallback((sessId: string, agentId: string) => socket.switchAgent(sessId, agentId), [socket]);
   const send = useCallback<UseChatSocket["send"]>((p) => socket.sendMessage(p), [socket]);
   const stop = useCallback((sessId: string) => socket.stopTurn(sessId), [socket]);
@@ -420,6 +427,7 @@ export function useChatSocket(opts: {
       isSending,
       ensureSession,
       removeSession,
+      renameSession,
       switchAgent,
       send,
       stop,
@@ -438,6 +446,7 @@ export function useChatSocket(opts: {
       isSending,
       ensureSession,
       removeSession,
+      renameSession,
       switchAgent,
       send,
       stop,

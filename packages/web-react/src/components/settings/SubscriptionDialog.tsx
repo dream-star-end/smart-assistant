@@ -164,6 +164,8 @@ export function SubscriptionDialog({
           stopPoll();
           setStage({ kind: "paid", note });
           onPaid();
+          // 通知 WS 引擎立即重连(余额不足 4506 断开后的快路径;socket 监听本事件)。
+          window.dispatchEvent(new Event("openclaude:billing-paid"));
         } else if (o.status === "expired" || o.status === "canceled" || o.status === "cancelled") {
           stopPoll();
           setErr("订单已失效，请返回重新发起。");

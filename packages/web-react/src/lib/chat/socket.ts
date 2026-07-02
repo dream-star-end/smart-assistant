@@ -135,6 +135,10 @@ const WS_PATH = "/ws/user-chat-bridge";
 /** rAF 合并渲染的隐藏-tab 兜底间隔:rAF 在隐藏 tab 被节流到几乎不触发,用此 setTimeout
  *  保证 snapshot 仍按时刷新 + listeners 触发(避免后台积压、切前台时一致);也封顶渲染延迟。*/
 const NOTIFY_FALLBACK_MS = 250;
+// 流式渲染降频:turn 进行中把渲染通知从 rAF(≤60fps)夹到本间隔(~8fps)。每次通知都会
+// 让活动消息全量重走 markdown 管线(remark+katex+highlight),60fps 在 10KB+ 长输出/低端机
+// 上必然掉帧发热;120ms 视觉上仍是流畅"打字机"。只降"通知频率",数据仍逐帧同步应用。
+const STREAM_NOTIFY_MS = 120;
 
 export class ChatSocket {
   private deps: ChatSocketDeps;
@@ -148,6 +152,8 @@ export class ChatSocket {
   private listeners = new Set<() => void>();
   private version = 0;
   private notifyScheduled = false;
+  /** 上次渲染通知 flush 时刻(流式降频窗口基准)。*/
+  private lastNotifyAt = 0;
   /** rAF 合并渲染:scheduleNotify 排程的 rAF 句柄 + 隐藏 tab 兜底 timer(见 scheduleNotify)。*/
   private notifyRaf: number | null = null;
   private notifyFallbackTimer: ReturnType<typeof setTimeout> | null = null;
@@ -275,9 +281,19 @@ export class ChatSocket {
         this.notifyFallbackTimer = null;
       }
       this.version++;
+      this.lastNotifyAt = Date.now();
       this.rebuildSnapshot();
       for (const cb of this.listeners) cb();
     };
+    // 流式降频:turn 进行中且距上次通知不足 STREAM_NOTIFY_MS → 定时到窗口边界统一 flush
+    // (跳过 rAF 路径)。完成帧最多延迟 ~120ms,可接受;非流式路径行为不变。
+    if (this.inFlightSends.size > 0) {
+      const since = Date.now() - this.lastNotifyAt;
+      if (since < STREAM_NOTIFY_MS) {
+        this.notifyFallbackTimer = setTimeout(flush, STREAM_NOTIFY_MS - since);
+        return;
+      }
+    }
     // 消费侧背压式流控:用 rAF 把"一帧内"多次状态变更(快速流式 token delta 每条 onmessage
     // 都 applyFrame+scheduleNotify)合并成**一次** re-render(≤60fps),解耦"收帧速率"与"渲染
     // 速率",避免高频流式下 React re-render storm。状态本身已在各方法里同步应用,这里只合并
@@ -1106,6 +1122,15 @@ export class ChatSocket {
       this.scheduleNotify();
     }
     return s;
+  }
+
+  /** 重命名会话(纯元数据):改内存 title + notify → persist sig 变化,IndexedDB 随之落地。
+   *  服务端 canonical 由调用方经 PATCH /api/sessions/:id 同步(三持有方一次收口)。*/
+  renameSession(sessId: string, title: string): void {
+    const s = this.sessions.get(sessId);
+    if (!s || s.title === title) return;
+    s.title = title;
+    this.scheduleNotify();
   }
 
   removeSession(sessId: string): void {
