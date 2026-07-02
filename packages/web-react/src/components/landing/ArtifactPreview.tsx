@@ -43,7 +43,7 @@ export function ArtifactPreview({
         </span>
       </div>
 
-      <div className="relative flex-1 p-3.5">
+      <div className="relative min-h-[230px] flex-1 p-3.5">
         {done ? (
           <div className="animate-in">
             <ArtifactBody artifact={artifact} />

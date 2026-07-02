@@ -1,5 +1,4 @@
 import {
-  BookOpen,
   Brain,
   Check,
   Clock,
@@ -8,81 +7,74 @@ import {
   Globe,
   type LucideIcon,
   Paperclip,
-  Puzzle,
-  Sparkles,
+  PenLine,
+  Rocket,
   SlidersHorizontal,
+  Terminal,
 } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
-import { cn } from "../../lib/utils";
 
-/** 三步上手。 */
+/**
+ * 三步上手：把「多快能用起来」讲清楚（调研共识：3 分钟内到 wow moment）。
+ * 与动态演示职责分离 —— 演示是「看它干活」，这里是「你开口的第一句」。
+ */
 const QUICKSTART: { n: string; title: string; desc: string }[] = [
-  { n: "1", title: "注册并登录", desc: "邮箱注册，一分钟拥有专属助手，免费额度即刻到账。" },
-  { n: "2", title: "直接开口提问", desc: "写作、编程、查资料、做分析…… 像聊天一样把需求说出来即可。" },
-  { n: "3", title: "按需加装能力", desc: "想更专业？从 AI 市场一键安装技能与专家智能体，助手越用越强。" },
+  { n: "1", title: "邮箱注册", desc: "一分钟拥有专属助手，免费额度即刻到账。" },
+  { n: "2", title: "像派活一样开口", desc: "不用学提示词，把需求像跟同事说话一样讲出来。" },
+  { n: "3", title: "需要时再加装", desc: "更专业的活儿，从 AI 市场一键装上专家智能体。" },
 ];
 
-type Feature = {
-  icon: LucideIcon;
-  title: string;
-  desc: string;
-  /** 可一键复制的示例指令。 */
-  example: string;
-};
+/**
+ * 「开口第一句」：分类可复制的示例指令。空白输入框是新用户最大流失点，
+ * 给一句能直接照抄的话；类别刻意覆盖演示区没展开的能力（定时 / 记忆 / 多模型 / GitHub…）。
+ */
+type Starter = { icon: LucideIcon; tag: string; text: string };
 
-const FEATURES: Feature[] = [
+const STARTERS: Starter[] = [
   {
-    icon: Sparkles,
-    title: "全能助手对话",
-    desc: "开箱即用，无需配置。整理、分析、写作、规划、答疑，把复杂的活拆开一步步做完。",
-    example: "把这份会议录音的逐字稿整理成规范纪要，列出待办、负责人和截止时间",
-  },
-  {
-    icon: Puzzle,
-    title: "AI 市场 · 装技能 / 智能体",
-    desc: "需要更专业时，从市场一键安装技能与专家智能体，能力随用随装，越用越好用。",
-    example: "我要做门店经营数据分析，帮我从市场装个数据分析智能体",
-  },
-  {
-    icon: Brain,
-    title: "长期记忆",
-    desc: "记住你的身份、业务背景与偏好，下次自动带上下文，不必每次重新交代。",
-    example: "记住：我是连锁健身工作室运营，门店月付制，有包月卡和次卡",
+    icon: Paperclip,
+    tag: "上传文件",
+    text: "（上传 Excel）帮我做一张月度费用透视表，把异常项标出来",
   },
   {
     icon: Clock,
-    title: "定时任务",
-    desc: "把重复的活儿交给它，按时自动跑完再把结果推送给你。",
-    example: "每个工作日 10:30，自动汇总昨天的行业动态并把要点发我",
+    tag: "定时任务",
+    text: "每个工作日早上 9 点，汇总昨晚的行业动态要点发给我",
   },
   {
-    icon: Paperclip,
-    title: "文件 / 图片上传",
-    desc: "上传 Excel、PDF、Word、图片，让助手读懂内容再做分析、可视化、评阅、提取。",
-    example: "（上传生产数据 Excel）分析良率和各物料批次的相关性，画一张热力图",
+    icon: Brain,
+    tag: "长期记忆",
+    text: "记住：我是做母婴电商的，之后回答商业问题都贴着我的行业来",
   },
   {
     icon: Globe,
-    title: "联网搜索",
-    desc: "需要实时信息时自动联网检索、交叉核对多个来源，给出带出处的结论。",
-    example: "联网调研这个赛道的头部玩家和最新政策，给一份带来源的综述",
+    tag: "联网调研",
+    text: "联网查一下本周新发布的 AI 工具，挑 3 个值得试的，给出理由",
+  },
+  {
+    icon: PenLine,
+    tag: "写作",
+    text: "给新品上线写 3 版朋友圈文案，语气分别专业、亲切、俏皮",
+  },
+  {
+    icon: Terminal,
+    tag: "编程",
+    text: "写个 Python 脚本，把文件夹里的发票 PDF 批量重命名成「日期_金额」",
   },
   {
     icon: GitBranch,
-    title: "GitHub 仓库直连",
-    desc: "把仓库连给助手，让它直接读代码、修 bug、写功能，build 通过后提交推送。",
-    example: "连上我的 Vue3 仓库，重设计移动端页面，build 通过后提交并推送",
+    tag: "GitHub",
+    text: "连上我的仓库，优化首页加载速度，跑通构建后提交推送",
   },
   {
     icon: SlidersHorizontal,
-    title: "多模型可选",
-    desc: "对话框随时切换底层模型，按速度、深度、成本灵活取舍。",
-    example: "换更擅长推理的模型，重新推演这道复杂的相关性分析",
+    tag: "多模型",
+    text: "换个更擅长推理的模型，再帮我推演一遍这个定价方案",
   },
 ];
 
 /** 可点击复制的示例指令芯片。 */
-function ExampleChip({ text }: { text: string }) {
+function StarterChip({ s }: { s: Starter }) {
   const [copied, setCopied] = useState(false);
   const timerRef = useRef<number | null>(null);
   // 卸载清掉「已复制」回退定时器，避免卸载后 setState。
@@ -97,7 +89,7 @@ function ExampleChip({ text }: { text: string }) {
       type="button"
       onClick={() => {
         void navigator.clipboard
-          ?.writeText(text)
+          ?.writeText(s.text)
           .then(() => {
             setCopied(true);
             if (timerRef.current != null) window.clearTimeout(timerRef.current);
@@ -105,37 +97,46 @@ function ExampleChip({ text }: { text: string }) {
           })
           .catch(() => {});
       }}
-      title="点击复制示例"
-      className="group/ex mt-3 flex w-full items-start gap-2 rounded-xl border border-dashed border-border bg-bg px-3 py-2 text-left transition-colors hover:border-accent/50 hover:bg-accent-soft"
+      title="点击复制"
+      className="group flex items-start gap-3 rounded-xl border border-border bg-surface px-4 py-3.5 text-left outline-none transition-[border-color,background-color,transform] duration-200 ease-standard hover:-translate-y-0.5 hover:border-accent/50 hover:bg-accent-soft focus-visible:ring-2 focus-visible:ring-ring"
     >
-      <span className="mt-0.5 shrink-0 text-accent">
-        {copied ? <Check size={14} /> : <Copy size={14} className="opacity-60 group-hover/ex:opacity-100" />}
+      <span className="mt-0.5 flex size-7 shrink-0 items-center justify-center rounded-lg bg-accent-soft text-accent">
+        <s.icon size={14} />
       </span>
-      <span className="text-[12.5px] leading-relaxed text-muted">
-        <span className="font-medium text-faint">试着说：</span>
-        {copied ? "已复制到剪贴板 ✓" : `「${text}」`}
+      <span className="min-w-0 flex-1">
+        <span className="block text-[11.5px] font-semibold text-accent">{s.tag}</span>
+        <span className="mt-0.5 block text-[13.5px] leading-relaxed text-muted">
+          {copied ? "已复制，去粘贴给它吧 ✓" : `「${s.text}」`}
+        </span>
+      </span>
+      <span className="mt-1 shrink-0 text-accent">
+        {copied ? (
+          <Check size={15} />
+        ) : (
+          <Copy size={15} className="opacity-0 transition-opacity group-hover:opacity-70" />
+        )}
       </span>
     </button>
   );
 }
 
-/** 落地页教程区：三步上手 + 逐功能使用示例（每个示例一键复制）。 */
+/** 落地页快速上手区：三步上手 + 分类「开口第一句」（每条一键复制）。 */
 export function Tutorials() {
   return (
-    <section id="tutorials" className="mx-auto max-w-6xl px-5 py-20">
+    <section id="tutorials" className="mx-auto max-w-6xl scroll-mt-20 px-5 py-20">
       <div className="mb-12 text-center">
         <span className="mb-3 inline-flex items-center gap-1.5 rounded-full border border-border bg-surface px-3 py-1 text-[12.5px] text-muted">
-          <BookOpen size={13} className="text-accent" />
-          上手教程
+          <Rocket size={13} className="text-accent" />
+          快速上手
         </span>
-        <h2 className="text-[32px] font-bold tracking-tight md:text-[40px]">五分钟，玩转每个功能</h2>
+        <h2 className="text-[32px] font-bold tracking-tight md:text-[40px]">三步开始，一分钟上手</h2>
         <p className="mx-auto mt-3 max-w-xl text-[16px] text-muted">
-          每个能力都配了可直接复制的示例指令 —— 复制、粘进对话框，立刻见效。
+          不用学提示词、不用做配置 —— 注册、开口、需要时再加装。
         </p>
       </div>
 
       {/* 三步上手 */}
-      <div className="mb-12 grid grid-cols-1 gap-4 sm:grid-cols-3">
+      <div className="mb-14 grid grid-cols-1 gap-4 sm:grid-cols-3">
         {QUICKSTART.map((s) => (
           <div key={s.n} className="relative rounded-2xl border border-border bg-surface p-6">
             <span className="flex size-9 items-center justify-center rounded-full bg-grad-cta text-[15px] font-semibold text-white shadow-sm">
@@ -147,20 +148,16 @@ export function Tutorials() {
         ))}
       </div>
 
-      {/* 逐功能示例 */}
-      <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
-        {FEATURES.map((f) => (
-          <div
-            key={f.title}
-            className="flex flex-col rounded-2xl border border-border bg-surface p-5 transition-[transform,box-shadow,border-color] duration-200 ease-standard hover:-translate-y-0.5 hover:border-border-strong hover:shadow-soft"
-          >
-            <span className="mb-3.5 flex size-10 items-center justify-center rounded-xl bg-accent-soft text-accent">
-              <f.icon size={19} />
-            </span>
-            <h3 className="text-[16px] font-semibold">{f.title}</h3>
-            <p className="mt-1.5 flex-1 text-[13.5px] leading-relaxed text-muted">{f.desc}</p>
-            <ExampleChip text={f.example} />
-          </div>
+      {/* 开口第一句 */}
+      <div className="mb-6 text-center">
+        <h3 className="text-[22px] font-bold tracking-tight">不知道说什么？开口第一句，照抄就行</h3>
+        <p className="mx-auto mt-2 max-w-xl text-[14.5px] text-muted">
+          点一下复制，注册后粘进对话框 —— 定时、记忆、连仓库这些活儿它也全接。
+        </p>
+      </div>
+      <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
+        {STARTERS.map((s) => (
+          <StarterChip key={s.tag} s={s} />
         ))}
       </div>
     </section>

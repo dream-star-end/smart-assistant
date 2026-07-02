@@ -3,7 +3,6 @@ import type { Theme } from "../hooks/useTheme";
 import { AGENTS } from "../lib/agents";
 import { AgentAvatar } from "./AgentAvatar";
 import { BRAND } from "../lib/brand";
-import { PLANS, TOPUP_PACK } from "../lib/plans";
 import { cn } from "../lib/utils";
 import { DemoShowcase } from "./landing/DemoShowcase";
 import { Tutorials } from "./landing/Tutorials";
@@ -43,6 +42,26 @@ const COMPARE = {
   },
 };
 
+/** FAQ：把新用户最常见的犹豫点讲明白（信任信号 + 降低上手心理门槛）。 */
+const FAQS = [
+  {
+    q: "免费版怎么算？",
+    a: "注册即享每月 300 积分，够日常轻度使用；积分按实际消耗计费，不够用时可在应用内升级。",
+  },
+  {
+    q: "需要会写提示词吗？",
+    a: "不用。像跟同事说话一样描述需求就行，它会自己拆解、执行、交付；不知道说什么，照抄上手区的示例第一句即可。",
+  },
+  {
+    q: "我上传的文件安全吗？",
+    a: "文件只存放在你的专属工作空间、仅用于完成你交代的任务，可随时删除。",
+  },
+  {
+    q: "和普通 AI 聊天有什么区别？",
+    a: "普通聊天给你一段建议；它把活儿干完 —— 自己跑代码、查资料、做文件，最后交回能直接用的成果。",
+  },
+];
+
 
 export function Landing({
   onStart,
@@ -65,8 +84,8 @@ export function Landing({
           <nav className="hidden items-center gap-7 text-[14.5px] text-muted md:flex">
             <a href="#demo" className="transition-colors hover:text-fg">演示</a>
             <a href="#agents" className="transition-colors hover:text-fg">智能体</a>
-            <a href="#tutorials" className="transition-colors hover:text-fg">教程</a>
-            <a href="#pricing" className="transition-colors hover:text-fg">定价</a>
+            <a href="#tutorials" className="transition-colors hover:text-fg">快速上手</a>
+            <a href="#faq" className="transition-colors hover:text-fg">常见问题</a>
           </nav>
           <div className="flex shrink-0 items-center gap-1.5">
             <ThemeToggle theme={theme} onCycle={onCycleTheme} />
@@ -117,7 +136,7 @@ export function Landing({
               看看它能做什么
             </a>
           </div>
-          <p className="mt-5 text-[13px] text-faint">免费版每月 300 积分 · 无需信用卡</p>
+          <p className="mt-5 text-[13px] text-faint">免费版每月 300 积分</p>
         </div>
 
         {/* 动态演示 —— 左对话右成果的工作台，让「交付成果」看得见 */}
@@ -246,74 +265,21 @@ export function Landing({
       {/* Tutorials —— 每个功能配套使用示例 */}
       <Tutorials />
 
-      {/* Pricing */}
-      <section id="pricing" className="border-t border-border bg-sidebar/40">
+      {/* FAQ —— 把注册前最常见的犹豫点讲明白 */}
+      <section id="faq" className="border-t border-border bg-sidebar/40">
         <div className="mx-auto max-w-6xl px-5 py-20">
           <div className="mb-12 text-center">
-            <h2 className="text-[32px] font-bold tracking-tight md:text-[40px]">简单透明的包月套餐</h2>
-            <p className="mx-auto mt-3 max-w-xl text-[16px] text-muted">
-              每档配足月度积分，全能助手与市场内容随心用。可随时升档；用量不够再买加量包。
-            </p>
+            <h2 className="text-[32px] font-bold tracking-tight md:text-[40px]">常见问题</h2>
+            <p className="mx-auto mt-3 max-w-xl text-[16px] text-muted">还有疑问？注册后随时问它自己。</p>
           </div>
-          <div className="grid grid-cols-1 gap-5 sm:grid-cols-2 lg:grid-cols-4">
-            {PLANS.map((p) => (
-              <div
-                key={p.id}
-                className={`relative flex flex-col rounded-2xl border bg-surface p-6 transition-all ${
-                  p.highlight ? "border-accent shadow-[var(--shadow-float)] ring-1 ring-accent/30" : "border-border"
-                }`}
-              >
-                {p.highlight && (
-                  <span className="absolute -top-3 left-1/2 -translate-x-1/2 rounded-full bg-accent px-3 py-1 text-[12px] font-medium text-white">
-                    最受欢迎
-                  </span>
-                )}
-                <h3 className="text-[17px] font-semibold">{p.name}</h3>
-                <p className="mt-1 text-[13px] text-faint">{p.tagline}</p>
-                <div className="mt-4 flex items-baseline gap-1">
-                  <span className="text-[36px] font-bold tracking-tight">¥{p.price}</span>
-                  <span className="text-[14px] text-muted">/月</span>
-                </div>
-                <p className="mt-1 text-[13.5px] font-medium text-accent">每月 {p.credits.toLocaleString()} 积分</p>
-                <Button
-                  variant={p.highlight ? "primary" : "secondary"}
-                  onClick={onStart}
-                  className="mt-5 w-full rounded-xl"
-                >
-                  {p.cta}
-                </Button>
-                <ul className="mt-5 space-y-2.5">
-                  {p.features.map((f) => (
-                    <li key={f} className="flex items-start gap-2 text-[13.5px] text-muted">
-                      <Check size={16} className="mt-0.5 shrink-0 text-accent" />
-                      {f}
-                    </li>
-                  ))}
-                </ul>
+          <div className="mx-auto grid max-w-4xl grid-cols-1 gap-4 md:grid-cols-2">
+            {FAQS.map((f) => (
+              <div key={f.q} className="rounded-2xl border border-border bg-surface p-6">
+                <h3 className="text-[16px] font-semibold">{f.q}</h3>
+                <p className="mt-2 text-[14px] leading-relaxed text-muted">{f.a}</p>
               </div>
             ))}
           </div>
-
-          {/* 加量包 */}
-          <div className="mt-6 flex flex-col items-center justify-between gap-4 rounded-2xl border border-dashed border-border-strong bg-surface px-6 py-5 sm:flex-row">
-            <div className="flex items-center gap-3.5">
-              <span className="flex size-11 items-center justify-center rounded-xl bg-accent-soft text-accent">
-                <Plus size={22} />
-              </span>
-              <div>
-                <h3 className="text-[16px] font-semibold">积分加量包</h3>
-                <p className="mt-0.5 text-[13.5px] text-muted">
-                  ¥{TOPUP_PACK.price} 加 {TOPUP_PACK.credits.toLocaleString()} 积分 · {TOPUP_PACK.note}
-                </p>
-              </div>
-            </div>
-            <Button variant="secondary" onClick={onStart} className="shrink-0 rounded-xl">
-              用量不够，随时加量
-            </Button>
-          </div>
-          <p className="mt-4 text-center text-[12.5px] text-faint">
-            积分用于对话与各项能力调用，按实际消耗计费。加量包仅在当前套餐有效期内可用。
-          </p>
         </div>
       </section>
 
@@ -345,8 +311,8 @@ export function Landing({
                 <span className="font-medium text-fg">产品</span>
                 <a href="#demo" className="text-muted hover:text-fg">演示</a>
                 <a href="#agents" className="text-muted hover:text-fg">智能体</a>
-                <a href="#tutorials" className="text-muted hover:text-fg">教程</a>
-                <a href="#pricing" className="text-muted hover:text-fg">定价</a>
+                <a href="#tutorials" className="text-muted hover:text-fg">快速上手</a>
+                <a href="#faq" className="text-muted hover:text-fg">常见问题</a>
               </div>
               <div className="flex flex-col gap-2.5">
                 <span className="font-medium text-fg">关于</span>
