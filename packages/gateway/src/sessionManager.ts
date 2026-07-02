@@ -1566,15 +1566,19 @@ export class SessionManager {
     // if/else),宁可拒 turn 也不静默白跑:任何入口(webchat/cron/tasks/delegate)
     // 落到 codex engine 都必须持有 server-owned requestId。
     // 个人版 / 测试环境(无 commercial env)不受影响 —— 无 bridge 也能跑 codex。
+    // seam 合同校验的是**形状**而非仅存在性(Codex 复审 nit):bridge 生成的
+    // server-owned requestId 恒为 32 hex;空串/畸形值同样意味着没走 bridge 的
+    // preCheck/journal 路径,一律 fail-closed。
     if (
       session.runner.capabilities.needsServerRequestId &&
-      requestId === undefined &&
+      !(typeof requestId === 'string' && /^[0-9a-f]{32}$/.test(requestId)) &&
       isCommercialManagedRuntime()
     ) {
-      log.error('codex turn rejected: missing server-owned requestId (billing guard)', {
+      log.error('codex turn rejected: missing/malformed server-owned requestId (billing guard)', {
         sessionKey: session.sessionKey,
         agentId: session.agentId,
         engineId: session.runner.engineId,
+        requestIdShape: requestId === undefined ? 'undefined' : `len=${String(requestId).length}`,
         ...(traceId ? { traceId } : {}),
       })
       onEvent({

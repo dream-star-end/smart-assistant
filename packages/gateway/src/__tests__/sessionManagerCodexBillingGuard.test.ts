@@ -214,6 +214,24 @@ describe("submit() codex 计费 guard(fail-closed)", () => {
     );
   });
 
+  test("commercial + needsServerRequestId + 畸形 requestId(空串/非 32hex)→ 同样拒 turn", async () => {
+    process.env.OC_RUNTIME_CHANNEL = "v5";
+    const sm = makeSm();
+    // seam 合同校验形状:bridge 生成的 server-owned requestId 恒为 32 hex;
+    // 空串/短串/大写/非 hex 都意味着没走 bridge preCheck/journal → fail-closed。
+    for (const bad of ["", "abc", "A".repeat(32), "g".repeat(32), "a".repeat(31), "a".repeat(33)]) {
+      const runner = new FakeEngineAdapter("codex", CODEX_CAPS, "gpt-5.5");
+      const session = makeSession(runner);
+      const events: SessionStreamEvent[] = [];
+      await sm.submit(session, "hello", (e) => events.push(e), undefined, undefined, bad);
+      assert.equal(runner.submitTurnCalls.length, 0, `畸形 requestId '${bad.slice(0, 8)}…(len=${bad.length})' 应被拦截`);
+      assert.ok(
+        events.some((e) => e.kind === "error" && /CODEX_BILLING_GUARD/.test((e as { error: string }).error)),
+        "畸形 requestId 应发 guard error 事件",
+      );
+    }
+  });
+
   test("commercial + needsServerRequestId + 带 requestId → 放行,requestId 透传 submitTurn", async () => {
     process.env.OC_RUNTIME_CHANNEL = "v5";
     const runner = new FakeEngineAdapter("codex", CODEX_CAPS, "gpt-5.5");
