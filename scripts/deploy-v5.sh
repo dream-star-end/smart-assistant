@@ -55,7 +55,7 @@ REMOVE_KEYS=(
   OC_CODEX_PREFERRED_AUTH_METHOD OC_CODEX_PROVIDER_NAME OC_CODEX_WIRE_API
 )
 
-DRY=0; MODE="deploy"; ROLLBACK_N=1
+DRY=0; MODE="deploy"; ROLLBACK_N=1; RESTART_EGRESS=0
 for arg in "$@"; do
   case "$arg" in
     --dry-run) DRY=1 ;;
@@ -63,6 +63,10 @@ for arg in "$@"; do
     --smoke) MODE="smoke" ;;
     --rollback) MODE="rollback"; ROLLBACK_N=1 ;;
     --rollback=*) MODE="rollback"; ROLLBACK_N="${arg#*=}" ;;
+    # egress split(2026-07-02):openclaude-v5-egress 持有在飞 LLM 流,默认部署
+    # 【不】重启它(这正是解耦目的);仅 egress 相关代码(anthropicProxy/账号池/
+    # 计费 finalize/egress/*)变更时显式带本 flag。重启走 SIGTERM drain。
+    --egress) RESTART_EGRESS=1 ;;
     *) echo "未知参数: $arg" >&2; exit 2 ;;
   esac
 done
@@ -141,6 +145,12 @@ smoke() {
   local v3hz; v3hz="$(ssh "$KL_HOST" "curl -fsS http://127.0.0.1:18789/healthz" 2>/dev/null || true)"
   echo "  v3 /healthz(应不受影响): $v3hz"
   [[ -z "$v3hz" ]] && { echo "✗ v3 /healthz 异常 —— 现网受影响!" >&2; return 1; }
+  # egress split(存在该 unit 才断言):egress 健康 + 18892 由 egress 监听
+  if ssh "$KL_HOST" "systemctl is-enabled openclaude-v5-egress >/dev/null 2>&1"; then
+    local eg; eg="$(ssh "$KL_HOST" "curl -fsS --max-time 5 http://172.31.0.1:18892/internal/v5/egress-health" 2>/dev/null || true)"
+    echo "  egress-health: $eg"
+    echo "$eg" | grep -q '"role":"egress"' || { echo "✗ egress 进程不健康(18892 无响应或非 egress)" >&2; return 1; }
+  fi
   echo "✓ v5 smoke 通过:隔离空壳健康、控制面静默、v3 未受影响"
 }
 
@@ -200,6 +210,11 @@ deploy() {
   echo "── restart openclaude-v5(仅 v5,绝不碰 v3)──"
   sshk "systemctl restart $V5_UNIT"
   run "sleep 4"
+  if [[ "$RESTART_EGRESS" == 1 ]]; then
+    echo "── restart openclaude-v5-egress(显式 --egress;SIGTERM drain 在飞流)──"
+    sshk "systemctl restart openclaude-v5-egress"
+    run "sleep 3"
+  fi
   [[ "$DRY" == 1 ]] || smoke
   echo "✓ deploy 完成。"
 }

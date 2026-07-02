@@ -253,6 +253,40 @@ const externalMtlsEnabled = z
   .optional();
 
 /**
+ * V5 egress 进程解耦(2026-07-02)——根治"master 部署重启掐断在飞 LLM 生成流"。
+ *
+ * 拓扑(OC_EGRESS_SPLIT=1 时):
+ *   容器 → http://${INTERNAL_PROXY_BIND}:${INTERNAL_PROXY_PORT}  ← **egress 进程**监听
+ *     ├─ POST /v1/messages          → egress 本地 anthropicProxy(计费/账号池/上游流)
+ *     └─ 其它 /internal/v3/* 等     → 透明转发 master 控制口
+ *   master → 监听 ${INTERNAL_CONTROL_BIND}:${INTERNAL_CONTROL_PORT}(loopback-only)
+ *   egress → master:POST /internal/v5/cost-event(cost 持久化+WS 广播回执,秘钥头)
+ *
+ * master 重启只断 WS/控制面(容器 ring 重放兜底),上游生成流由 egress 进程持有不受影响。
+ * OC_EGRESS_SPLIT 未设 → 完全旧行为(master 进程内代理),零影响。
+ */
+const egressSplit = z
+  .string()
+  .transform((v) => v === "1" || v.toLowerCase() === "true")
+  .optional();
+/** master 控制口 bind(split 模式)。**只允许 loopback** —— 容器流量必须经 egress 转发
+ *  (egress 会拒转 /internal/v5/* 控制专用路径),直连面越小越好。 */
+const internalControlBind = z
+  .string()
+  .trim()
+  .refine((v) => v === "127.0.0.1" || v === "::1", "INTERNAL_CONTROL_BIND must be loopback (127.0.0.1/::1)")
+  .optional();
+const internalControlPort = z
+  .string()
+  .regex(/^\d+$/, "INTERNAL_CONTROL_PORT must be a positive integer")
+  .transform((v) => Number.parseInt(v, 10))
+  .refine((n) => n > 0 && n < 65536, "INTERNAL_CONTROL_PORT must be in (0, 65535]")
+  .optional();
+/** egress → master 控制口调用的共享秘钥(两进程共用同一 env 文件,天然同值)。
+ *  防"容器经 egress 转发面伪造控制调用"(egress 端也有 /internal/v5/* deny,双保险)。 */
+const egressSecret = z.string().trim().min(16).optional();
+
+/**
  * V3 Phase 3D — per-user openclaude-runtime 镜像名(含 tag)。
  *
  * 例:`openclaude/openclaude-runtime:abc123def456`(由 build-image.sh 输出 git sha12)。
@@ -380,6 +414,10 @@ export const commercialConfigSchema = z
     EXTERNAL_MTLS_BIND: externalMtlsBind,
     EXTERNAL_MTLS_PORT: externalMtlsPort,
     EXTERNAL_MTLS_ENABLED: externalMtlsEnabled,
+    OC_EGRESS_SPLIT: egressSplit,
+    INTERNAL_CONTROL_BIND: internalControlBind,
+    INTERNAL_CONTROL_PORT: internalControlPort,
+    OC_EGRESS_SECRET: egressSecret,
     OC_RUNTIME_IMAGE: ocRuntimeImage,
     FILE_PROXY_ENABLED: fileProxyEnabled,
     FEATURE_REMOTE_SSH: featureRemoteSsh,

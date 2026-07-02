@@ -141,6 +141,11 @@ import {
   type TurnWaiveHandler,
 } from "./http/internalTurnWaive.js";
 import {
+  COST_EVENT_PATH,
+  makeCostEventHandler,
+  type CostEventHandler,
+} from "./http/internalCostEvent.js";
+import {
   MARKETPLACE_AGENT_PREFIX,
   makeMarketplaceAgentHandler,
   type MarketplaceAgentHandler,
@@ -216,6 +221,7 @@ import { createNoopRateLimiter } from "./wechat/rateLimiter.js";
 import { makeWechatBroker, type WechatBroker } from "./wechat/broker.js";
 import { createPgIdentityRepo } from "./auth/containerIdentity.js";
 import { makeContainerIdentityStrategy } from "./auth/proxyIdentity.js";
+import { makeLoadUserModelAuthz } from "./auth/userModelAuthz.js";
 import { makePgApiKeyRepo } from "./auth/apiKeyRepo.js";
 import { makeApiKeyIdentityStrategy } from "./auth/apiKeyIdentity.js";
 import {
@@ -763,7 +769,19 @@ export async function registerCommercial(
     const expectPort = ocInternalProxyPortForChannel(); // v5 → 18892
     const actualBind = process.env.INTERNAL_PROXY_BIND?.trim();
     const actualPort = Number(process.env.INTERNAL_PROXY_PORT?.trim());
-    if (actualBind !== expectBind || actualPort !== expectPort) {
+    if (process.env.OC_EGRESS_SPLIT === "1") {
+      // egress split(2026-07-02):容器出站地址(INTERNAL_PROXY_*)由独立 egress
+      // 进程监听(它自己带同款 fail-closed guard,见 egress/main.ts),master 改听
+      // loopback 控制口。这里只验证控制口配置齐全 + 秘钥在位——master 若仍试图
+      // bind 容器地址会跟 egress 撞端口,而漏配控制口会让转发面全 503。
+      const cb = process.env.INTERNAL_CONTROL_BIND?.trim();
+      const cp = process.env.INTERNAL_CONTROL_PORT?.trim();
+      if (!cb || !cp || !process.env.OC_EGRESS_SECRET) {
+        throw new Error(
+          "[commercial] OC_EGRESS_SPLIT=1 但 INTERNAL_CONTROL_BIND/PORT/OC_EGRESS_SECRET 未配齐,拒启。",
+        );
+      }
+    } else if (actualBind !== expectBind || actualPort !== expectPort) {
       throw new Error(
         `[commercial] v5 内部代理 env 与 channel 期望不符:` +
           `INTERNAL_PROXY_BIND=${actualBind ?? "(unset)"} (期望 ${expectBind}),` +
@@ -986,8 +1004,12 @@ export async function registerCommercial(
   //   - 任何监听异常 → 仅 log + 跳过(/healthz 会反映 internalProxy=false)
   //
   // 强约束:bind 已在 config.ts schema 拒绝 0.0.0.0/::,这里不再二次校验。
-  const proxyBind = cfg.INTERNAL_PROXY_BIND;
-  const proxyPort = cfg.INTERNAL_PROXY_PORT;
+  // egress split 模式:容器出站地址(INTERNAL_PROXY_*)让位给独立 egress 进程,
+  // master 的 internal listener 改绑 loopback 控制口(容器流量经 egress 转发到达,
+  // /internal/v5/* 控制专用路径只有 egress 能直连)。未开 split → 完全旧行为。
+  const egressSplitEnabled = cfg.OC_EGRESS_SPLIT === true;
+  const proxyBind = egressSplitEnabled ? cfg.INTERNAL_CONTROL_BIND : cfg.INTERNAL_PROXY_BIND;
+  const proxyPort = egressSplitEnabled ? cfg.INTERNAL_CONTROL_PORT : cfg.INTERNAL_PROXY_PORT;
   let internalProxyServer: HttpServer | undefined;
   let internalProxyHandler: AnthropicProxyHandler | undefined;
   let internalProxyAddress: { host: string; port: number } | undefined;
@@ -1055,54 +1077,9 @@ export async function registerCommercial(
   // 注:rateLimitRedis 仅在两条 proxy strategy 中消费;放在外层不会额外占资源
   // (redis 客户端是同一个,wrapIoredis 只是 typed-method 投影)。
   const sharedRateLimitRedis = wrapIoredis(redis);
-  type UserModelAuthz = {
-    role: "user" | "admin";
-    grantedModelIds: ReadonlySet<string>;
-  };
-  const loadUserModelAuthzUncached = async (uid: bigint): Promise<UserModelAuthz> => {
-    const { query } = await import("./db/queries.js");
-    const { listGrantsForUser } = await import("./admin/modelGrants.js");
-    const r = await query<{ role: string }>(
-      "SELECT role FROM users WHERE id = $1",
-      [uid],
-    );
-    if (r.rows.length === 0) {
-      // user 在 DB 里不存在(理论被 verifyContainerIdentity 截掉,这里是
-      // 防御编程)。fail-closed:认 user role,grants 空集 → 公开 model
-      // 还能用,admin/hidden model 一律拒。
-      return { role: "user", grantedModelIds: new Set<string>() };
-    }
-    const roleRaw = r.rows[0].role;
-    const role: "user" | "admin" = roleRaw === "admin" ? "admin" : "user";
-    const grants = await listGrantsForUser(uid);
-    return {
-      role,
-      grantedModelIds: new Set(grants.map((g) => g.model_id)),
-    };
-  };
-  // 60s soft-TTL 缓存 + inflight 去重:本闭包在每次 /v1/messages 分发前被同步 await
-  // (推理最热路径),此前每请求白付 2 跳串行 DB(role + grants)。role/grants 均为低频
-  // admin 操作,60s 陈旧窗口可接受(权限撤销最迟 60s 生效;授予新模型同理)。
-  // fail-closed 语义不变:未命中/过期照走权威 DB。size 上限防御性 clear(用户量级远低于阈值)。
-  const AUTHZ_TTL_MS = 60_000;
-  const authzCache = new Map<string, { v: UserModelAuthz; exp: number }>();
-  const authzInflight = new Map<string, Promise<UserModelAuthz>>();
-  const loadUserModelAuthz = async (uid: bigint): Promise<UserModelAuthz> => {
-    const k = uid.toString();
-    const hit = authzCache.get(k);
-    if (hit && hit.exp > Date.now()) return hit.v;
-    const pending = authzInflight.get(k);
-    if (pending) return pending;
-    const p = loadUserModelAuthzUncached(uid)
-      .then((v) => {
-        if (authzCache.size > 5000) authzCache.clear();
-        authzCache.set(k, { v, exp: Date.now() + AUTHZ_TTL_MS });
-        return v;
-      })
-      .finally(() => authzInflight.delete(k));
-    authzInflight.set(k, p);
-    return p;
-  };
+  // 2026-07-02 egress split:authz 加载器抽到 auth/userModelAuthz.ts 单一权威
+  // (master 与 egress 两进程共用同一份规则),语义与原内联实现逐行等价。
+  const loadUserModelAuthz = makeLoadUserModelAuthz();
 
   if (
     !options.skipInternalProxy &&
@@ -1301,8 +1278,19 @@ export async function registerCommercial(
           console.error("[commercial] seedPlatformGeneralAgents failed:", err);
         }
       })();
+      // egress split:cost 回执接收端(egress finalize 后的 SQLite 持久化 + WS 广播
+      // 回投)。仅 split 模式挂载;秘钥头校验在 handler 内(loopback + egress 剥头 +
+      // 秘钥三层)。
+      const costEventHandler: CostEventHandler = makeCostEventHandler({
+        secret: cfg.OC_EGRESS_SECRET,
+        appendCostCredits: appendCostCreditsForUser,
+        broadcastToUser: (uid, payload) => bridgeBroadcastRef.current(uid, payload),
+      });
       dispatchInternal = (req, res, ctx) => {
         const path = (req.url ?? "/").split("?")[0];
+        if (egressSplitEnabled && path === COST_EVENT_PATH) {
+          return costEventHandler(req, res);
+        }
         if (path === SERVER_AUTHORED_PATH) {
           return serverAuthoredHandler(req, res, ctx);
         }
@@ -1369,7 +1357,12 @@ export async function registerCommercial(
         // self-host 路径:container → plain HTTP 18791 → 这里。peerIp 就是 container 的 bound_ip,
         // hostUuid 固定 = selfHostUuid(本机容器不需要也不可能带 mTLS cert)。
         // selfHostUuid 在外层闭包已取,保证非 undefined(否则根本走不到 createHttpServer 这行)。
-        const peerIp = req.socket.remoteAddress ?? "";
+        // split 模式下容器流量经 egress 转发到达,socket peer 恒为 loopback;
+        // 真实容器 ip 由 egress 注入 x-v5-egress-peer-ip(它同时会剥掉入站同名头,
+        // 容器伪造不进来)。verifyContainerIdentity 的 bound_ip 因子依赖这个值。
+        const fwdPeer = egressSplitEnabled ? req.headers["x-v5-egress-peer-ip"] : undefined;
+        const peerIp =
+          (typeof fwdPeer === "string" && fwdPeer.trim()) || req.socket.remoteAddress || "";
         // dispatchInternal 在外层闭包已被赋值;TS 不能静态证明 closure 内非 undefined,
         // 但 createHttpServer 只能在赋值之后被回调触发,故 ! 安全。
         Promise.resolve(
