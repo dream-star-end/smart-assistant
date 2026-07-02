@@ -63,20 +63,37 @@ for (const [file, src] of sources) {
   for (const m of src.matchAll(CLASS_RE)) exports.push({ file, name: m[1], kind: "class" });
 }
 
+// A file's exports that ARE referenced from elsewhere (comment-stripped).
+function referencedElsewhere(name: string, file: string): boolean {
+  const re = new RegExp(`\\b${name}\\b`);
+  for (const [otherFile, otherSrc] of sourcesCode) {
+    if (otherFile === file) continue;
+    if (re.test(otherSrc)) return true;
+  }
+  return false;
+}
+
 const unwired: LifecycleExport[] = [];
 for (const exp of exports) {
   // Require a reference in a non-test file other than the exporting file itself.
   // Use comment-stripped source so commented-out imports don't mask a missing wire.
-  const re = new RegExp(`\\b${exp.name}\\b`);
-  let referenced = false;
-  for (const [otherFile, otherSrc] of sourcesCode) {
-    if (otherFile === exp.file) continue;
-    if (re.test(otherSrc)) {
-      referenced = true;
-      break;
-    }
+  if (referencedElsewhere(exp.name, exp.file)) continue;
+  // Singleton-factory pattern:class 与其 get*/start* 工厂同文件(如 ImagePromoteScheduler
+  // + getImagePromoteScheduler)。类名只被工厂内部 new,外部只经工厂消费 —— 只要该工厂
+  // 自己被外部引用,类就算已接线。仍能抓住 HealthPoller 原始事故形态(工厂也无人调用)。
+  if (exp.kind === "class") {
+    const ownSrc = sourcesCode.get(exp.file) ?? "";
+    const usedInOwnFactory =
+      new RegExp(`\\bnew\\s+${exp.name}\\b`).test(ownSrc) &&
+      exports.some(
+        (other) =>
+          other.file === exp.file &&
+          other.kind === "function" &&
+          referencedElsewhere(other.name, other.file),
+      );
+    if (usedInOwnFactory) continue;
   }
-  if (!referenced) unwired.push(exp);
+  unwired.push(exp);
 }
 
 if (unwired.length > 0) {
@@ -96,3 +113,47 @@ if (unwired.length > 0) {
 }
 
 console.log(`✓ ${exports.length} lifecycle export(s) all referenced from non-test code.`);
+
+// ── Rule 2: mutator 归属登记强制(index.ts)──────────────────────────────────
+// index.ts 的 enabledSchedulers / v5 fail-closed 不变量由 schedulerRegistry 派生;
+// 该登记表靠创建点包 trackScheduler(...) 填充。若某个 scheduler 工厂调用没包
+// trackScheduler,它就成了不变量断言的盲区(前科:subscriptionRollover / imagePromote
+// 漏登记 → v5 下 gate 被误改也不会拒启)。本规则物理消灭"创建了但忘登记"。
+// 判定按行:工厂调用行(startXxxScheduler( / getHealthPoller() / makeWechatBroker( 等
+// lifecycle 命名)必须同行含 trackScheduler(。import 行不算调用。
+{
+  const INDEX = "index.ts";
+  const idxSrc = sourcesCode.get(INDEX);
+  if (!idxSrc) {
+    console.error("✗ check-schedulers rule 2: packages/commercial/src/index.ts not found");
+    process.exit(1);
+  }
+  // lifecycle 工厂调用形态:start*/get*/make* + Scheduler|Poller|Worker|Sweeper|Monitor|
+  // Expirer|Actor|Reaper|Broker 后缀,后随 "("。
+  const FACTORY_CALL_RE =
+    /\b((?:start|get|make)\w*(?:Scheduler|Poller|Worker|Sweeper|Monitor|Expirer|Actor|Reaper|Broker))\s*\(/;
+  const untracked: string[] = [];
+  const lines = idxSrc.split("\n");
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const m = FACTORY_CALL_RE.exec(line);
+    if (!m) continue;
+    // import 行不是调用(逐名导入 / from 子句)。
+    if (/^\s*(import\b|\}?\s*from\b)/.test(line) || /\bfrom\s+["']/.test(line)) continue;
+    // shutdown 路径(getXxx().stop())不是创建,豁免。
+    if (line.includes(".stop()")) continue;
+    if (line.includes("trackScheduler(")) continue;
+    untracked.push(`  index.ts:${i + 1}  ${m[1]}(...)  未包 trackScheduler(name, domain, ...)`);
+  }
+  if (untracked.length > 0) {
+    console.error(`✗ ${untracked.length} scheduler factory call(s) in index.ts missing trackScheduler registration:`);
+    console.error("");
+    for (const u of untracked) console.error(u);
+    console.error("");
+    console.error("每个后台 mutator 创建必须登记归属域(shared|v5-owned|local),否则");
+    console.error("enabledSchedulers 派生与 v5 fail-closed 不变量出现盲区。");
+    console.error("注:本规则按行判定,要求工厂调用与 trackScheduler( 写在同一行。");
+    process.exit(1);
+  }
+  console.log("✓ index.ts scheduler factory calls all registered via trackScheduler.");
+}

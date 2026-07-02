@@ -52,9 +52,22 @@ http://claudeai.chat {
 
 	# v5 灰度闸:仅带正确 secret 头的请求进 v5(P0 内测,不公开)。
 	@v5 header X-OC-V5-Secret ${secret}
+	# v5 独立支付回调:虎皮椒服务器回调不带 secret/cookie,按 path 定向 18790。
+	# 若走共享路径会落 v3,v3 markOrderPaid 对 kind 零感知 → v5 订阅订单被按充值错误履约。
+	@v5pay path /api/payment/hupi/callback-v5
 	@websocket {
 		header Connection *Upgrade*
 		header Upgrade websocket
+	}
+
+	# ── v5 支付回调(18790)—— 按 path 命中(handler 自带虎皮椒验签,无需 secret 闸)──
+	handle @v5pay {
+		reverse_proxy localhost:18790 {
+			header_up Host {host}
+			header_up X-Real-IP {remote_host}
+			header_up X-Forwarded-For {remote_host}
+			header_up X-Forwarded-Proto {scheme}
+		}
 	}
 
 	# ── v5(18790)—— 带 secret 才命中 ──

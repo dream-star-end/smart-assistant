@@ -708,6 +708,31 @@ export async function registerCommercial(
   const controlPlaneEnabled =
     runtimeChannel === "v5" ? false : process.env.COMMERCIAL_CONTROL_PLANE_DISABLED !== "1";
 
+  // ── mutator 归属矩阵(单一权威源)─────────────────────────────────────────
+  // 每个后台 scheduler/worker 创建即经 trackScheduler 登记,登记必须声明数据域归属:
+  //   "shared"   共享现网数据域(订单/账号池/容器面/邮件等) → 只允许 controlPlaneEnabled
+  //              (即 v3 leader)运行;v5 下出现即 fail-closed 拒启。
+  //   "v5-owned" v5 独有数据域(0096 订阅周期等 v3 现网树根本没有对应代码的表) →
+  //              channel=v5 也必须运行,否则该域权威真空(free 月度重置/到期降级无人执行)。
+  //   "local"    纯进程内自愈(无 DB/网络副作用,如 slot 租约回收) → 任何 channel 都运行。
+  // enabledSchedulers 由本登记表**派生**——根除"创建了 scheduler 但忘登记 → 不变量断言
+  // 出现盲区"的一类缺陷(此前 subscriptionRollover / imagePromote 均漏登记)。
+  // scripts/check-schedulers.ts 强制 index.ts 内所有 scheduler 工厂调用必须包 trackScheduler。
+  type MutatorDomain = "shared" | "v5-owned" | "local";
+  const schedulerRegistry: Array<{ name: string; domain: MutatorDomain }> = [];
+  const unregisterMutator = (name: string): void => {
+    const i = schedulerRegistry.findIndex((s) => s.name === name);
+    if (i >= 0) schedulerRegistry.splice(i, 1);
+  };
+  function trackScheduler<T>(name: string, domain: MutatorDomain, handle: T): T {
+    // 幂等:同名重复登记只记一次(imagePromote 在 gate 判定点先同步登记占位,
+    // 异步 initComputePool 完成后真正 .start() 时再包一层 —— 不产生重复项)。
+    if (handle && !schedulerRegistry.some((s) => s.name === name)) {
+      schedulerRegistry.push({ name, domain });
+    }
+    return handle;
+  }
+
   // v5 follower 硬约束 —— fail-closed,早于一切共享-state 副作用。
   // P1d 起:v5 容器隔离已就位(runtime_channel 贯穿 writer/reader/sweeper/docker label/name/
   // volume/network + 复合唯一索引 + v5-net 172.31 + v5 内部代理),故 v5 合法使用 v3-supervisor
@@ -908,12 +933,12 @@ export async function registerCommercial(
       };
 
       // Lifecycle scheduler:默认 1h tick,不在启动时跑
-      lifecycleScheduler = startLifecycleScheduler(docker, {
+      lifecycleScheduler = trackScheduler("lifecycle", "shared", startLifecycleScheduler(docker, {
         intervalMs: cfg.AGENT_LIFECYCLE_TICK_MS,
         volumeGcDays: cfg.AGENT_VOLUME_GC_DAYS,
         logger: agentLogger,
         runOnStart: false,
-      });
+      }));
       // eslint-disable-next-line no-console
       console.log("[commercial] agent runtime ready", {
         image: cfg.AGENT_IMAGE,
@@ -928,6 +953,7 @@ export async function registerCommercial(
         try { await lifecycleScheduler.stop(); } catch { /* */ }
       }
       lifecycleScheduler = undefined;
+      unregisterMutator("lifecycle"); // 初始化失败已回滚 → 登记表同步撤销,不留幽灵项
     }
   } else {
     const missing = Object.entries(agentEnvStatus)
@@ -1026,12 +1052,11 @@ export async function registerCommercial(
   // 注:rateLimitRedis 仅在两条 proxy strategy 中消费;放在外层不会额外占资源
   // (redis 客户端是同一个,wrapIoredis 只是 typed-method 投影)。
   const sharedRateLimitRedis = wrapIoredis(redis);
-  const loadUserModelAuthz = async (
-    uid: bigint,
-  ): Promise<{
+  type UserModelAuthz = {
     role: "user" | "admin";
     grantedModelIds: ReadonlySet<string>;
-  }> => {
+  };
+  const loadUserModelAuthzUncached = async (uid: bigint): Promise<UserModelAuthz> => {
     const { query } = await import("./db/queries.js");
     const { listGrantsForUser } = await import("./admin/modelGrants.js");
     const r = await query<{ role: string }>(
@@ -1051,6 +1076,29 @@ export async function registerCommercial(
       role,
       grantedModelIds: new Set(grants.map((g) => g.model_id)),
     };
+  };
+  // 60s soft-TTL 缓存 + inflight 去重:本闭包在每次 /v1/messages 分发前被同步 await
+  // (推理最热路径),此前每请求白付 2 跳串行 DB(role + grants)。role/grants 均为低频
+  // admin 操作,60s 陈旧窗口可接受(权限撤销最迟 60s 生效;授予新模型同理)。
+  // fail-closed 语义不变:未命中/过期照走权威 DB。size 上限防御性 clear(用户量级远低于阈值)。
+  const AUTHZ_TTL_MS = 60_000;
+  const authzCache = new Map<string, { v: UserModelAuthz; exp: number }>();
+  const authzInflight = new Map<string, Promise<UserModelAuthz>>();
+  const loadUserModelAuthz = async (uid: bigint): Promise<UserModelAuthz> => {
+    const k = uid.toString();
+    const hit = authzCache.get(k);
+    if (hit && hit.exp > Date.now()) return hit.v;
+    const pending = authzInflight.get(k);
+    if (pending) return pending;
+    const p = loadUserModelAuthzUncached(uid)
+      .then((v) => {
+        if (authzCache.size > 5000) authzCache.clear();
+        authzCache.set(k, { v, exp: Date.now() + AUTHZ_TTL_MS });
+        return v;
+      })
+      .finally(() => authzInflight.delete(k));
+    authzInflight.set(k, p);
+    return p;
   };
 
   if (
@@ -1670,6 +1718,9 @@ export async function registerCommercial(
       //  distribute,且会写 loaded_image_id + clear quarantine。
       //  OC_IMAGE_DISTRIBUTE_DISABLED=1 仍可关掉(单机 dev / 测试)。
       if (process.env.OC_IMAGE_DISTRIBUTE_DISABLED !== "1") {
+        // imagePromote 实际 .start() 在 initComputePool 完成后(异步),但归属登记必须
+        // 同步发生在 gate 判定点 —— 否则 v5 不变量断言窗口期看不到它(此前的漏登记盲区)。
+        trackScheduler("imagePromote", "shared", true);
         void initComputePool({ imageTag: cfg.OC_RUNTIME_IMAGE })
           .then((r) => {
             // eslint-disable-next-line no-console
@@ -1682,8 +1733,9 @@ export async function registerCommercial(
               backfillTimedOut: r.backfillTimedOut,
               promoteRan: r.promoteRan,
             });
-            // 启动周期性 promote scheduler(60s 后第一 tick,之后每 5min)
-            getImagePromoteScheduler({ imageTag: cfg.OC_RUNTIME_IMAGE }).start();
+            // 启动周期性 promote scheduler(60s 后第一 tick,之后每 5min)。
+            // trackScheduler 幂等:gate 判定点已同步登记占位,此处重复包装不产生重复项。
+            trackScheduler("imagePromote", "shared", getImagePromoteScheduler({ imageTag: cfg.OC_RUNTIME_IMAGE })).start();
           })
           .catch((err: unknown) => {
             // initComputePool 内部 best-effort 不抛;到这里就是 bug
@@ -1963,10 +2015,10 @@ export async function registerCommercial(
   let idleSweepScheduler: IdleSweepScheduler | undefined;
   if (controlPlaneEnabled && v3Deps && process.env.OC_IDLE_SWEEP_DISABLED !== "1") {
     const idleSweepLog = rootLogger.child({ subsys: "v3/idleSweep" });
-    idleSweepScheduler = startIdleSweepScheduler(v3Deps, {
+    idleSweepScheduler = trackScheduler("idleSweep", "shared", startIdleSweepScheduler(v3Deps, {
       logger: idleSweepLog,
       runOnStart: false,
-    });
+    }));
     idleSweepLog.info("scheduler started", { tickSec: 60, idleCutoffMin: 30 });
   }
 
@@ -1975,10 +2027,10 @@ export async function registerCommercial(
   let volumeGcScheduler: VolumeGcScheduler | undefined;
   if (controlPlaneEnabled && v3Deps && process.env.OC_VOLUME_GC_DISABLED !== "1") {
     const volumeGcLog = rootLogger.child({ subsys: "v3/volumeGc" });
-    volumeGcScheduler = startVolumeGcScheduler(v3Deps, {
+    volumeGcScheduler = trackScheduler("volumeGc", "shared", startVolumeGcScheduler(v3Deps, {
       logger: volumeGcLog,
       runOnStart: false,
-    });
+    }));
     volumeGcLog.info("scheduler started", {
       tickSec: 3600, bannedDays: 7, noLoginDays: 90,
     });
@@ -1989,10 +2041,10 @@ export async function registerCommercial(
   let orphanReconcileScheduler: OrphanReconcileScheduler | undefined;
   if (controlPlaneEnabled && v3Deps && process.env.OC_ORPHAN_RECONCILE_DISABLED !== "1") {
     const orphanReconcileLog = rootLogger.child({ subsys: "v3/orphanReconcile" });
-    orphanReconcileScheduler = startOrphanReconcileScheduler(v3Deps, {
+    orphanReconcileScheduler = trackScheduler("orphanReconcile", "shared", startOrphanReconcileScheduler(v3Deps, {
       logger: orphanReconcileLog,
       // 默认 runOnStart=true(§3H 明确"gateway 启动 reconcile")
-    });
+    }));
     orphanReconcileLog.info("scheduler started", { tickSec: 3600, runOnStart: true });
   }
 
@@ -2005,10 +2057,10 @@ export async function registerCommercial(
   let migrationReconcileScheduler: MigrationReconcileScheduler | undefined;
   if (controlPlaneEnabled && v3Deps && process.env.OC_MIGRATION_RECONCILER_DISABLED !== "1") {
     const migrationReconcileLog = rootLogger.child({ subsys: "v3/migrationReconciler" });
-    migrationReconcileScheduler = startMigrationReconcileScheduler(v3Deps, {
+    migrationReconcileScheduler = trackScheduler("migrationReconcile", "shared", startMigrationReconcileScheduler(v3Deps, {
       logger: migrationReconcileLog,
       // 默认 runOnStart=true + 60s tick + staleSec=600(R6.11 默认)
-    });
+    }));
     migrationReconcileLog.info("scheduler started", {
       tickSec: 60, staleSec: 600, runOnStart: true,
     });
@@ -2020,7 +2072,7 @@ export async function registerCommercial(
   // host / dev 场景保留 disable。
   let healthPoller: HealthPoller | undefined;
   if (controlPlaneEnabled && v3Deps && process.env.OC_HEALTH_POLLER_DISABLED !== "1") {
-    healthPoller = getHealthPoller();
+    healthPoller = trackScheduler("healthPoller", "shared", getHealthPoller());
     healthPoller.start();
     rootLogger.child({ subsys: "node-health" }).info("scheduler started", {
       intervalMs: 30_000,
@@ -2031,7 +2083,7 @@ export async function registerCommercial(
   // cfg.OC_CONTAINER_EVENTS_DISABLED=1 可关闭(运维灾备 / docker daemon 异常时用)。
   let containerEventsWorker: V3ContainerEventsWorker | undefined;
   if (controlPlaneEnabled && v3Deps && process.env.OC_CONTAINER_EVENTS_DISABLED !== "1") {
-    containerEventsWorker = startV3ContainerEventsWorker({
+    containerEventsWorker = trackScheduler("containerEvents", "shared", startV3ContainerEventsWorker({
       docker: v3Deps.docker,
       logger: {
         debug: (m, meta) => { /* eslint-disable-next-line no-console */ console.debug(m, meta ?? {}); },
@@ -2039,7 +2091,7 @@ export async function registerCommercial(
         warn:  (m, meta) => { /* eslint-disable-next-line no-console */ console.warn(m, meta ?? {}); },
         error: (m, meta) => { /* eslint-disable-next-line no-console */ console.error(m, meta ?? {}); },
       },
-    });
+    }));
     // eslint-disable-next-line no-console
     console.log("[commercial] v3 container events worker started (oom/die → alerts)");
   }
@@ -2152,7 +2204,7 @@ export async function registerCommercial(
       getSessionId: getCurrentSessionId,
     });
 
-    wechatBroker = makeWechatBroker({
+    wechatBroker = trackScheduler("wechatBroker", "shared", makeWechatBroker({
       pgPool: getPool(),
       dispatcher: inboundDispatcher,
       outboundReceiver,
@@ -2211,7 +2263,7 @@ export async function registerCommercial(
         return { botToken: b.botToken, contextTokens: b.contextTokens };
       },
       brokerEnabled: () => true, // 装配链已 gate 过整体开关
-    });
+    }));
     wechatBroker.start();
     wechatBrokerRef.current = wechatBroker;
     wechatLog.info("wechat_broker_assembled");
@@ -2319,17 +2371,17 @@ export async function registerCommercial(
     // 非法 / 空 / NaN → 60s;下限 1s(防 typo 写成 "50" ms 把 DB 打穿)
     const raw = Number(process.env.COMMERCIAL_ALERT_TICK_MS);
     const tickMs = Number.isFinite(raw) && raw >= 1000 ? raw : 60_000;
-    alertScheduler = startAlertScheduler({
+    alertScheduler = trackScheduler("alert", "shared", startAlertScheduler({
       intervalMs: tickMs,
       runOnStart: false,
-    });
+    }));
   }
 
   // M6/P1-9 — account_refresh_events 28 天 retention sweeper(24h interval,unref)。
   // boot 不立即跑,等 24h 后第一次 tick(不会冲启动 DB 负载)。
   let refreshEventsSweeper: RefreshEventsSweeperHandle | undefined;
   if (controlPlaneEnabled && process.env.COMMERCIAL_REFRESH_EVENTS_SWEEP_DISABLED !== "1") {
-    refreshEventsSweeper = startRefreshEventsSweeper();
+    refreshEventsSweeper = trackScheduler("refreshEventsSweep", "shared", startRefreshEventsSweeper());
   }
 
   // (v5 ccb-only:codex token refresh actor 已随 codex 全栈一并移除。)
@@ -2341,10 +2393,10 @@ export async function registerCommercial(
   if (controlPlaneEnabled && process.env.COMMERCIAL_COOLDOWN_RECOVERY_DISABLED !== "1") {
     const raw = Number(process.env.COMMERCIAL_COOLDOWN_RECOVERY_INTERVAL_MS);
     const intervalMs = Number.isFinite(raw) && raw >= 1000 ? raw : 5 * 60_000;
-    cooldownRecoveryActor = startCooldownRecoveryActor({
+    cooldownRecoveryActor = trackScheduler("cooldownRecovery", "shared", startCooldownRecoveryActor({
       tracker: healthTracker,
       intervalMs,
-    });
+    }));
   }
 
   // A1 — pending 订单 expirer(默认 60s tick,部署即 boot 跑一次清历史脏单)。
@@ -2355,27 +2407,40 @@ export async function registerCommercial(
   if (controlPlaneEnabled && process.env.COMMERCIAL_PENDING_ORDERS_EXPIRER_DISABLED !== "1") {
     const raw = Number(process.env.COMMERCIAL_PENDING_ORDERS_EXPIRER_INTERVAL_MS);
     const intervalMs = Number.isFinite(raw) && raw >= 1000 ? raw : 60_000;
-    pendingOrdersExpirer = startPendingOrdersExpirer({ intervalMs });
+    pendingOrdersExpirer = trackScheduler("pendingOrdersExpirer", "shared", startPendingOrdersExpirer({ intervalMs }));
   }
 
   // 0096 — 订阅周期轮转 sweeper(默认 5min tick,boot 即结算已到期订阅)。
   // period_end < now 的 active 订阅:付费档到期未续→降级 free+重置 300;free 档→月度续期。
   // 钱包不动。非法/空/NaN→5min;下限 1s。
+  //
+  // 【域归属 v5-owned】0096 订阅数据域(user_subscriptions/period_credits)只有 v5 树有
+  // 对应代码 —— v3 现网树 grep period_credits 零命中。若沿用 controlPlaneEnabled gate,
+  // v5 被禁跑、v3 没代码 → 全网无人执行:free 月度 300 永不重置、付费到期永不降级
+  // (产品语义断供;spendTwoBucket 排除过期桶所以钱是安全的)。故 channel=v5 必须自己跑。
+  // 并发安全:rollover 内部 FOR UPDATE SKIP LOCKED,多实例同跑无双重结算。
   let subscriptionRolloverSweeper: SubscriptionRolloverHandle | undefined;
-  if (controlPlaneEnabled && process.env.COMMERCIAL_SUBSCRIPTION_ROLLOVER_DISABLED !== "1") {
+  if (
+    (controlPlaneEnabled || runtimeChannel === "v5") &&
+    process.env.COMMERCIAL_SUBSCRIPTION_ROLLOVER_DISABLED !== "1"
+  ) {
     const raw = Number(process.env.COMMERCIAL_SUBSCRIPTION_ROLLOVER_INTERVAL_MS);
     const intervalMs = Number.isFinite(raw) && raw >= 1000 ? raw : 300_000;
-    subscriptionRolloverSweeper = startSubscriptionRolloverSweeper({ intervalMs });
+    subscriptionRolloverSweeper = trackScheduler("subscriptionRollover", "v5-owned", startSubscriptionRolloverSweeper({ intervalMs }));
   }
 
   // B7 — account-pool per-slot 租约泄漏回收 sweeper(60s tick)。回收进程存活期间
   // release 路径丢失/未执行的孤儿 slot,防虚假 429。TTL 在 scheduler 内夹到
   // max(CODEX_SESSION_MAX_MS,30min) 下界,不抢 Codex bridge timer。纯进程内、无 DB。
+  //
+  // 【域归属 local】纯进程内自愈,无任何共享-state 副作用 —— 此前 gate 在
+  // controlPlaneEnabled 是一刀切误伤:v5 的聊天代理路径同样持有 slot 租约,
+  // 泄漏后无人回收 → v5 侧虚假 429 永不自愈。任何 channel 都应运行。
   let accountSlotReaper: SlotReaperHandle | undefined;
-  if (controlPlaneEnabled && process.env.COMMERCIAL_ACCOUNT_SLOT_REAPER_DISABLED !== "1") {
+  if (process.env.COMMERCIAL_ACCOUNT_SLOT_REAPER_DISABLED !== "1") {
     const raw = Number(process.env.COMMERCIAL_ACCOUNT_SLOT_REAPER_INTERVAL_MS);
     const intervalMs = Number.isFinite(raw) && raw >= 1000 ? raw : 60_000;
-    accountSlotReaper = startAccountSlotReaper({ scheduler, intervalMs });
+    accountSlotReaper = trackScheduler("accountSlotReaper", "local", startAccountSlotReaper({ scheduler, intervalMs }));
   }
 
   // B1 — request_finalize_journal reconciler + GC(migration 0015 承诺、之前漏接)。
@@ -2394,7 +2459,7 @@ export async function registerCommercial(
       process.env.COMMERCIAL_FINALIZE_RECONCILER_THRESHOLD_MS,
       Number.isFinite(rawCodexMax) ? rawCodexMax : undefined,
     );
-    finalizeJournalReconciler = startFinalizeJournalReconciler({ intervalMs, thresholdMs });
+    finalizeJournalReconciler = trackScheduler("finalizeReconciler", "shared", startFinalizeJournalReconciler({ intervalMs, thresholdMs }));
   }
 
   // Onboarding inbox scheduler — 由 system_settings.onboarding_enabled 决定是否真发,
@@ -2403,7 +2468,7 @@ export async function registerCommercial(
   if (controlPlaneEnabled && process.env.COMMERCIAL_ONBOARDING_DISABLED !== "1") {
     const raw = Number(process.env.COMMERCIAL_ONBOARDING_INTERVAL_MS);
     const intervalMs = Number.isFinite(raw) && raw >= 5000 ? raw : 60_000;
-    onboardingScheduler = startOnboardingScheduler({ intervalMs });
+    onboardingScheduler = trackScheduler("onboarding", "shared", startOnboardingScheduler({ intervalMs }));
   }
 
   // Plan C — inbox 站内信邮件推送 worker.
@@ -2415,10 +2480,10 @@ export async function registerCommercial(
   if (controlPlaneEnabled && process.env.COMMERCIAL_INBOX_EMAIL_DISABLED !== "1") {
     const raw = Number(process.env.COMMERCIAL_INBOX_EMAIL_INTERVAL_MS);
     const intervalMs = Number.isFinite(raw) && raw >= 5000 ? raw : 30_000;
-    inboxEmailScheduler = startInboxEmailScheduler({
+    inboxEmailScheduler = trackScheduler("inboxEmail", "shared", startInboxEmailScheduler({
       mailer,
       intervalMs,
-    });
+    }));
   }
 
   // 科研 durable job worker(v5 科研 agent 子系统)。
@@ -2432,38 +2497,23 @@ export async function registerCommercial(
   if (controlPlaneEnabled && process.env.COMMERCIAL_RESEARCH_JOBS_DISABLED !== "1") {
     const raw = Number(process.env.COMMERCIAL_RESEARCH_JOBS_INTERVAL_MS);
     const intervalMs = Number.isFinite(raw) && raw >= 2000 ? raw : 5_000;
-    researchJobScheduler = startResearchJobScheduler({
+    researchJobScheduler = trackScheduler("researchJobs", "shared", startResearchJobScheduler({
       handlers: {},
       intervalMs,
-    });
+    }));
   }
 
   // v5 灰度可观测 — runtimeStatus 暴露给 gateway /healthz,作为"控制面静默 / 运行时隔离 /
   // 灰度归属"的只读断言面(P4 可观测前移)。
-  const enabledSchedulers: string[] = [];
-  if (lifecycleScheduler) enabledSchedulers.push("lifecycle");
-  if (idleSweepScheduler) enabledSchedulers.push("idleSweep");
-  if (volumeGcScheduler) enabledSchedulers.push("volumeGc");
-  if (orphanReconcileScheduler) enabledSchedulers.push("orphanReconcile");
-  if (migrationReconcileScheduler) enabledSchedulers.push("migrationReconcile");
-  if (healthPoller) enabledSchedulers.push("healthPoller");
-  if (containerEventsWorker) enabledSchedulers.push("containerEvents");
-  if (alertScheduler) enabledSchedulers.push("alert");
-  if (refreshEventsSweeper) enabledSchedulers.push("refreshEventsSweep");
-  if (cooldownRecoveryActor) enabledSchedulers.push("cooldownRecovery");
-  if (pendingOrdersExpirer) enabledSchedulers.push("pendingOrdersExpirer");
-  if (accountSlotReaper) enabledSchedulers.push("accountSlotReaper");
-  if (finalizeJournalReconciler) enabledSchedulers.push("finalizeReconciler");
-  if (onboardingScheduler) enabledSchedulers.push("onboarding");
-  if (inboxEmailScheduler) enabledSchedulers.push("inboxEmail");
-  if (researchJobScheduler) enabledSchedulers.push("researchJobs");
-  if (wechatBroker) enabledSchedulers.push("wechatBroker");
-  // 注:compute-pool init / image-promote / preheat 及所有容器面 scheduler(idleSweep/
-  // volumeGc/orphanReconcile/migrationReconcile/healthPoller/containerEvents)现已**全部 gate
-  // 在 controlPlaneEnabled** 上(channel=v5 恒 false,绝对权威,无 env 可翻盘)→ v5 下整条
-  // 控制面/容器面后台 mutator 都不会启动,连 runOnStart mutate 都不发生。下方 fail-closed 是
-  // 防 env 漏配的纵深兜底(理论上 channel=v5 已使 controlPlaneEnabled 恒假,enabledSchedulers
-  // 必空;若非空说明有 mutator 绕过了 controlPlaneEnabled gate,属代码 bug,宁可拒启)。
+  // enabledSchedulers 由归属登记表派生 —— 不再手工维护清单(此前 subscriptionRollover /
+  // imagePromote 漏登记,让下方 fail-closed 断言出现盲区)。
+  const enabledSchedulers: string[] = schedulerRegistry.map((s) => s.name);
+  // 注:shared 域(compute-pool init / image-promote / preheat / 容器面全部 scheduler /
+  // 订单·账号池·邮件 sweeper)一律 gate 在 controlPlaneEnabled(channel=v5 恒 false,无 env
+  // 可翻盘)→ v5 下不会启动,连 runOnStart mutate 都不发生。v5 下合法存活的只有
+  // v5-owned(subscriptionRollover:0096 订阅域 v3 无代码,v5 不跑则全网真空)与
+  // local(accountSlotReaper:纯进程内自愈)。下方 fail-closed 按域断言,防 env 漏配
+  // 或 gate 被误改让 shared mutator 在 v5 写共享现网 —— 宁可拒启。
   // baseline server 不是 mutator(只读 serve ccb tarball + mTLS/PSK 鉴权),不在此列。
   const runtimeStatus: CommercialRuntimeStatus = {
     channel: runtimeChannel,
@@ -2473,13 +2523,15 @@ export async function registerCommercial(
     containerRuntime: v3Deps ? "enabled" : "disabled",
     schedulers: enabledSchedulers,
   };
-  // fail-closed:v5 follower 绝不允许任何控制面 scheduler 存活 —— 防 env 漏配让 v5
-  // 后台 mutator 写共享现网(订单/账号池/计费/邮件)。宁可 v5 拒启,也不污染现网。
-  if (runtimeChannel === "v5" && enabledSchedulers.length > 0) {
+  // fail-closed:v5 下绝不允许任何 shared 域 mutator 存活 —— 防 env 漏配让 v5 后台
+  // mutator 写共享现网(订单/账号池/容器面/邮件)。宁可 v5 拒启,也不污染现网。
+  // v5-owned(订阅轮转)与 local(进程内自愈)域是 v5 的合法职责,放行。
+  const sharedOnV5 = schedulerRegistry.filter((s) => s.domain === "shared").map((s) => s.name);
+  if (runtimeChannel === "v5" && sharedOnV5.length > 0) {
     throw new Error(
-      `[commercial] v5 follower invariant violated: control-plane schedulers active=[${enabledSchedulers.join(
+      `[commercial] v5 invariant violated: shared-domain schedulers active=[${sharedOnV5.join(
         ",",
-      )}]. P0 要求 v5 控制面全静默。`,
+      )}]. v5 只允许 v5-owned/local 域 mutator。`,
     );
   }
   rootLogger.info(

@@ -23,6 +23,27 @@
        非致命但不干净。)
 - [ ] **灰度放量策略定**:secret 闸(内测)→ 全量。可选中间档:Caddy 按 user allowlist / 百分比先放一部分。
 - [ ] **DR 提醒**:DR=0 无 standby,cutover 前确保共享库已备份。
+- [ ] **mutator 归属交接(shared 域)**:见下节「后台 mutator 归属矩阵」。cutover 停 v3 前必须
+      把 shared 域 mutator 的执行权移交(要么 v5 放开对应域 + leader 选举,要么保留 v3 实例
+      只跑 mutator 不接流量)。**尤其 pendingOrdersExpirer**(markOrderPaid 的价格冻结防线
+      明文依赖它)与 finalizeJournalReconciler —— 停 v3 即熄火。
+- [ ] **支付回调切流确认**:v5 订单 notifyUrl 已独立(`/api/payment/hupi/callback-v5`,Caddy
+      @v5pay 按 path → 18790);cutover 后 v3 侧共享路径 `/api/payment/hupi/callback` 仍需
+      保留给存量 v3 pending 订单,直到其全部终态化(60s expirer,最长几分钟)。
+
+## 后台 mutator 归属矩阵(权威源:packages/commercial/src/index.ts schedulerRegistry)
+
+每个后台 scheduler 创建即经 `trackScheduler(name, domain, handle)` 登记(check-schedulers.ts
+rule 2 强制),v5 fail-closed 不变量按域断言(shared 域出现在 v5 → 拒启)。
+
+| 域 | 语义 | 谁运行 | 成员 |
+|---|---|---|---|
+| `shared` | 写共享现网数据(订单/账号池/容器面/邮件) | 仅 controlPlaneEnabled(v3 leader) | lifecycle, idleSweep, volumeGc, orphanReconcile, migrationReconcile, healthPoller, containerEvents, imagePromote, alert, refreshEventsSweep, cooldownRecovery, pendingOrdersExpirer, finalizeReconciler, onboarding, inboxEmail, researchJobs, wechatBroker |
+| `v5-owned` | v5 独有数据域(v3 现网树无对应代码) | v5(及 controlPlaneEnabled) | subscriptionRollover(0096:free 月度重置/到期降级) |
+| `local` | 纯进程内自愈,无共享副作用 | 所有 channel | accountSlotReaper(slot 租约泄漏回收,防虚假 429) |
+
+隐含假设显式化:**灰度期 shared 域靠"v3 实例活着"代跑**(orders 过期、journal 终态化都由
+v3 执行,对 v5 行同样生效)。cutover 时该假设失效,必须按上面前置条件交接。
 
 ## 执行(全量 flip)
 

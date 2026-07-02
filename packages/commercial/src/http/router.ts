@@ -560,6 +560,12 @@ export function createCommercialHandler(
     { method: 'GET', path: '/api/payment/plans', handler: handleListPlans },
     { method: 'POST', path: '/api/payment/hupi/create', handler: handleCreateHupi },
     { method: 'POST', path: '/api/payment/hupi/callback', handler: handleHupiCallback },
+    // v5 灰度独立回调路径:虎皮椒服务器回调不带 X-OC-V5-Secret/oc_v5 cookie,共享路径会被
+    // Caddy 默认路由送进 v3 —— 而 v3 的 markOrderPaid 对 kind 零感知,会把 v5 的
+    // subscription/upgrade/pack 订单按「永久钱包充值」错误履约(订阅未开通+期内额度变永久)。
+    // v5 订单 notifyUrl 指到本路径(HUPIJIAO_CALLBACK_URL env),Caddy 按 path 定向 18790。
+    // 同一 handler:验签/幂等/kind 分支履约逻辑不变。
+    { method: 'POST', path: '/api/payment/hupi/callback-v5', handler: handleHupiCallback },
     { method: 'GET', pathPrefix: '/api/payment/orders/', handler: handleGetOrder },
     // 月度订阅（0096）。订单轮询复用 /api/payment/orders/:order_no；履约走 hupi/callback。
     { method: 'GET', path: '/api/subscription/plans', handler: handleListSubscriptionPlans },
