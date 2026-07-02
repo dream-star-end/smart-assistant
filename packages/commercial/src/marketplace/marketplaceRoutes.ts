@@ -34,7 +34,12 @@ import {
   canonicalizeAgentManifest,
   validateAgentManifest,
 } from './agentManifest.js'
-import { canonicalBundleJson, validateBenchmark, validateBundleFiles } from './bundle.js'
+import {
+  canonicalBundleJson,
+  scanScriptContent,
+  validateBenchmark,
+  validateBundleFiles,
+} from './bundle.js'
 import { platformPresetAgentSlugs } from './platformPresets.js'
 import { scanSkillArtifact } from './skillScanner.js'
 
@@ -140,7 +145,10 @@ export async function handleMarketplacePublish(
     })
     return
   }
-  // 逐附属文件走同一静态扫描(密钥/注入/内网地址等对文本文件同样适用)。
+  // 逐附属文件走同一静态扫描(密钥/注入/内网地址等对文本文件同样适用);
+  // scripts/ 额外过危险模式扫描:毁灭性/远程管道执行直接拦,可疑模式作为
+  // warning flag 随版本入库(审核页可见,人审判断)。
+  const scriptFlags: ReturnType<typeof scanScriptContent> = []
   if (bundleV.bundle) {
     for (const [path, content] of Object.entries(bundleV.bundle)) {
       const fscan = scanSkillArtifact({ name: slug, description: path, tags: [], body: content })
@@ -150,6 +158,18 @@ export async function handleMarketplacePublish(
           riskFlags: fscan.flags,
         })
         return
+      }
+      if (path.startsWith('scripts/')) {
+        const sflags = scanScriptContent(path, content)
+        const blocked = sflags.filter((f) => f.block)
+        if (blocked.length > 0) {
+          sendJson(res, 422, {
+            error: { code: 'SCAN_BLOCKED', message: `脚本 ${path} 命中危险模式,发布被拦截` },
+            riskFlags: sflags,
+          })
+          return
+        }
+        scriptFlags.push(...sflags)
       }
     }
   }
@@ -182,7 +202,7 @@ export async function handleMarketplacePublish(
       rawSkillMd,
       artifactHash: marketplaceArtifactHash(rawSkillMd),
       embeddingHash: skillContentHash({ name, description, tags }),
-      riskFlags: scan.flags,
+      riskFlags: [...scan.flags, ...scriptFlags],
       policyVersion: scan.policyVersion,
       submittedBy: uid(user),
       rawBundle: bundleV.bundle,

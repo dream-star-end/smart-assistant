@@ -1,7 +1,7 @@
 ---
 name: skill-authoring
 description: "写好一个 skill 的平台规范: 目录结构(references/scripts/assets/evals)、SKILL.md 写法、评测用例(evals.json)格式与评测驱动迭代方法。创建/更新/训练 skill 前先读本文。"
-version: "1.0.0"
+version: "1.1.0"
 tags: [system, skill, authoring, evals]
 ---
 
@@ -58,6 +58,12 @@ skill-name/
 3. 通过率平台期先试**删**指令(精简即优化)。
 4. 每轮任务里重复手写的 helper 命令/脚本 → 沉淀进 scripts/。
 5. 模型升级后重跑 evals:with/without 无差异的技能考虑退役。
+
+## 上架市场
+
+发布到市场时,references/ assets/ evals/ **scripts/** 均可作为附属文件一并上架;
+scripts/ 会过危险模式扫描(毁灭性命令/远程管道执行直接拦截)+人工逐行审核,
+安装者在详情页能看到每个文件全文。不要在脚本里放密钥、内网地址或混淆代码。
 
 ## 成本提醒
 

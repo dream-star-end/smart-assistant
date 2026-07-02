@@ -28,6 +28,7 @@ export type RiskCategory =
   | 'obfuscation'
   | 'metadata'
   | 'size'
+  | 'script'
 
 export interface RiskFlag {
   category: RiskCategory

@@ -201,6 +201,11 @@ async function main(): Promise<void> {
       args: [
         '--no-install',
         PLAYWRIGHT_MCP_PKG,
+        // @playwright/mcp 默认走 Chrome 品牌通道(/opt/google/chrome),镜像里装的
+        // 是 playwright chromium(PLAYWRIGHT_BROWSERS_PATH 缓存)—— 不显式指定会报
+        // "Chromium distribution 'chrome' is not found"(v3/v5 现网实测同病)。
+        '--browser',
+        'chromium',
         '--headless',
         '--no-sandbox',
         '--user-data-dir',

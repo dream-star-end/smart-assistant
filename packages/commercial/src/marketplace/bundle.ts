@@ -2,8 +2,11 @@
  * 市场多文件工件(bundle)—— SKILL.md 之外的附属文本文件的校验与规范化单一权威。
  *
  * 安全边界:
- *  - 路径白名单:references/ | assets/ | evals/(**scripts/ 预留暂拒**:可执行内容
- *    的分发需要独立的审核/沙箱设计,先明确拒绝而不是默默吞掉);
+ *  - 路径白名单:references/ | assets/ | evals/ | scripts/;
+ *  - scripts/ 是可执行内容:逐文件危险模式扫描(毁灭性命令 block、可疑模式出
+ *    warning flag 给审核者),详情页/审核页全文透明 + 明确警示,kill-switch 兜底。
+ *    执行环境本就是用户自己的隔离容器,风险面 = 恶意作者→安装用户,靠
+ *    「扫描 + 人审 + 装前可见 + 可下架」四层收敛;
  *  - 词法安全:不允许 ../、绝对路径、非常规字符;深度≤2 段;
  *  - 体量上限:单文件≤64KB、总量≤256KB、≤20 个 —— 上架内容要精,不是网盘;
  *  - evals/evals.json 必须过 parseSkillEvalsJson(坏用例不允许进市场)。
@@ -13,7 +16,7 @@
  */
 import { parseSkillEvalsJson } from '@openclaude/storage'
 
-export const BUNDLE_ALLOWED_PREFIXES = ['references/', 'assets/', 'evals/'] as const
+export const BUNDLE_ALLOWED_PREFIXES = ['references/', 'assets/', 'evals/', 'scripts/'] as const
 export const BUNDLE_MAX_FILES = 20
 export const BUNDLE_MAX_FILE_BYTES = 64 * 1024
 export const BUNDLE_MAX_TOTAL_BYTES = 256 * 1024
@@ -29,7 +32,6 @@ export type ValidateBundleResult =
 export function validateBundlePath(path: string): string | null {
   if (typeof path !== 'string' || path.length === 0 || path.length > 160) return '路径非法'
   if (path.includes('..') || path.startsWith('/') || path.includes('\\')) return '路径不允许目录穿越'
-  if (path.startsWith('scripts/')) return 'scripts/ 暂不支持上架(可执行内容需独立审核,后续开放)'
   if (!BUNDLE_ALLOWED_PREFIXES.some((p) => path.startsWith(p)))
     return `路径须位于 ${BUNDLE_ALLOWED_PREFIXES.join(' | ')} 之下`
   const segs = path.split('/')
@@ -80,6 +82,76 @@ export function validateBundleFiles(
   }
   if (errors.length > 0) return { ok: false, errors }
   return { ok: true, bundle: Object.keys(bundle).length > 0 ? bundle : null }
+}
+
+// ── scripts/ 危险模式扫描 ────────────────────────────────────────────────────
+// block:毁灭性/远程注入执行 —— 没有正当理由出现在市场技能脚本里。
+// warn:可疑但可能正当(压缩解码执行、eval)—— 交给人审判断,不误杀。
+const SCRIPT_BLOCK_PATTERNS: Array<{ code: string; re: RegExp; message: string }> = [
+  {
+    code: 'remote_pipe_exec',
+    re: /\b(curl|wget)\b[^\n|;&]*\|\s*(ba|z|da)?sh\b/i,
+    message: '远程内容直接管道执行(curl|sh 类)',
+  },
+  {
+    code: 'destructive_rm',
+    re: /\brm\s+(-[a-z]*r[a-z]*f|-[a-z]*f[a-z]*r)[a-z]*\s+["']?(\/|\$HOME|~)(\s|["']|$)/i,
+    message: '毁灭性删除(rm -rf 根/HOME)',
+  },
+  { code: 'disk_destroy', re: /\b(mkfs\.|dd\s+[^\n]*of=\/dev\/)/i, message: '磁盘级破坏命令' },
+  { code: 'fork_bomb', re: /:\(\)\s*\{\s*:\|:\s*&\s*\}\s*;/, message: 'fork 炸弹' },
+]
+const SCRIPT_WARN_PATTERNS: Array<{ code: string; re: RegExp; message: string }> = [
+  {
+    code: 'decode_exec',
+    re: /base64\s+(-d|--decode)[^\n]*\|\s*(ba|z|da)?sh\b/i,
+    message: '解码后执行(需人工确认用途)',
+  },
+  { code: 'eval_dynamic', re: /\beval\b\s*["'$(]/, message: '动态 eval(需人工确认用途)' },
+  {
+    code: 'creds_touch',
+    re: /(\.ssh\/|\.aws\/credentials|\.npmrc|\.git-credentials)/,
+    message: '触碰凭据文件路径(需人工确认用途)',
+  },
+]
+
+export interface ScriptRiskFlag {
+  category: 'script'
+  severity: 'high' | 'medium'
+  code: string
+  message: string
+  sample?: string
+  block: boolean
+}
+
+/** 扫描单个 scripts/ 文件,返回命中的风险(block 命中 → 发布 422)。 */
+export function scanScriptContent(path: string, content: string): ScriptRiskFlag[] {
+  const flags: ScriptRiskFlag[] = []
+  for (const p of SCRIPT_BLOCK_PATTERNS) {
+    const m = content.match(p.re)
+    if (m)
+      flags.push({
+        category: 'script',
+        severity: 'high',
+        code: p.code,
+        message: `${path}: ${p.message}`,
+        sample: m[0].slice(0, 120),
+        block: true,
+      })
+  }
+  for (const p of SCRIPT_WARN_PATTERNS) {
+    const m = content.match(p.re)
+    if (m)
+      flags.push({
+        category: 'script',
+        severity: 'medium',
+        code: p.code,
+        message: `${path}: ${p.message}`,
+        sample: m[0].slice(0, 120),
+        block: false,
+      })
+  }
+  return flags
 }
 
 /** 稳定序列化(键排序)—— 两侧独立算 hash 的输入。 */

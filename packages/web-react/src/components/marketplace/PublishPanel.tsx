@@ -327,7 +327,7 @@ function SkillPublishForm({ auth, onPublished }: { auth: AuthSession; onPublishe
       <div>
         <div className="mb-1.5 flex items-center justify-between">
           <span className="text-[12px] font-medium text-muted">
-            附属文件（references/ assets/ evals/,可选;scripts/ 暂不支持）
+            附属文件（references/ assets/ evals/ scripts/,可选;脚本会被危险模式扫描并逐行人审）
           </span>
           <Button
             variant="ghost"
@@ -406,7 +406,10 @@ function AgentPublishForm({ auth, onPublished }: { auth: AuthSession; onPublishe
   const [avatarEmoji, setAvatarEmoji] = useState("🤖");
   const [model, setModel] = useState("");
   const [toolsets, setToolsets] = useState<string[]>(["core"]);
-  const [skillDeps, setSkillDeps] = useState("");
+  // 依赖技能 = 多选「我已安装的市场技能」(后端硬校验 skillDeps 必须是已上架技能;
+  // 已安装集合必然满足,且是用户真实用过、知道好坏的技能)。
+  const [installedSkills, setInstalledSkills] = useState<Array<{ slug: string; name: string }>>([]);
+  const [skillDeps, setSkillDeps] = useState<string[]>([]);
   const [persona, setPersona] = useState("");
 
   const [submitting, setSubmitting] = useState(false);
@@ -425,6 +428,17 @@ function AgentPublishForm({ auth, onPublished }: { auth: AuthSession; onPublishe
         setModel((cur) => cur || ms[0]?.id || "");
       })
       .catch(() => {});
+    api
+      .listMarketplaceInstalled(auth)
+      .then((rows) => {
+        if (!alive) return;
+        setInstalledSkills(
+          rows
+            .filter((r) => r.kind === "skill" && r.listingState === "active")
+            .map((r) => ({ slug: r.slug, name: r.name })),
+        );
+      })
+      .catch(() => {});
     return () => {
       alive = false;
     };
@@ -441,12 +455,6 @@ function AgentPublishForm({ auth, onPublished }: { auth: AuthSession; onPublishe
     if (!model) return "请选择模型";
     if (toolsets.length === 0) return "请至少选择一个能力工具集";
     if (!persona.trim()) return "请填写人设(它决定智能体的行为方式)";
-    const badDep = skillDeps
-      .split(",")
-      .map((t) => t.trim())
-      .filter(Boolean)
-      .find((d) => !SLUG_RE.test(d));
-    if (badDep) return `依赖技能 "${badDep}" 不是合法的市场 slug`;
     return null;
   };
 
@@ -472,10 +480,7 @@ function AgentPublishForm({ auth, onPublished }: { auth: AuthSession; onPublishe
           .filter(Boolean),
         model,
         toolsets,
-        skillDeps: skillDeps
-          .split(",")
-          .map((t) => t.trim())
-          .filter(Boolean),
+        skillDeps,
         persona,
         ...(avatarEmoji.trim() ? { avatarEmoji: avatarEmoji.trim() } : {}),
       });
@@ -515,7 +520,7 @@ function AgentPublishForm({ auth, onPublished }: { auth: AuthSession; onPublishe
           setTags("");
           setDescription("");
           setPersona("");
-          setSkillDeps("");
+          setSkillDeps([]);
         }}
       />
     );
@@ -635,13 +640,43 @@ function AgentPublishForm({ auth, onPublished }: { auth: AuthSession; onPublishe
         </div>
       </div>
 
-      <Field label="依赖技能（市场技能 slug，逗号分隔，可空；须已上架）">
-        <Input
-          value={skillDeps}
-          onChange={(e) => setSkillDeps(e.target.value)}
-          placeholder="academic-translate, paper-summary"
-        />
-      </Field>
+      <div>
+        <div className="mb-1.5 text-[12px] font-medium text-muted">
+          依赖技能（从你已安装的市场技能中多选，安装该智能体时会一并安装）
+        </div>
+        {installedSkills.length === 0 ? (
+          <p className="text-[12px] text-faint">
+            你还没有安装任何市场技能 —— 先在「发现」里安装,或不选(智能体也可以不带依赖技能)。
+          </p>
+        ) : (
+          <div className="flex flex-wrap gap-1.5">
+            {installedSkills.map((sk) => {
+              const checked = skillDeps.includes(sk.slug);
+              return (
+                <button
+                  type="button"
+                  key={sk.slug}
+                  onClick={() =>
+                    setSkillDeps((ds) =>
+                      checked ? ds.filter((d) => d !== sk.slug) : [...ds, sk.slug],
+                    )
+                  }
+                  className={cn(
+                    "rounded-full border px-2.5 py-1 text-[12px] outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring",
+                    checked
+                      ? "border-accent/50 bg-accent-soft text-accent"
+                      : "border-border text-muted hover:border-accent/40 hover:text-fg",
+                  )}
+                >
+                  {checked ? "✓ " : ""}
+                  {sk.name}
+                  <span className="ml-1 font-mono text-[10.5px] text-faint">{sk.slug}</span>
+                </button>
+              );
+            })}
+          </div>
+        )}
+      </div>
 
       <Field label="人设（persona，决定智能体的行为方式与工作流）">
         <Textarea

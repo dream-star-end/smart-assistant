@@ -30,7 +30,7 @@ function randomSuffix(): string {
   return Math.random().toString(36).slice(2, 10)
 }
 
-const BUNDLE_PATH_RE = /^(references|assets|evals)\/[A-Za-z0-9][A-Za-z0-9._-]{0,63}(\/[A-Za-z0-9][A-Za-z0-9._-]{0,63})?$/
+const BUNDLE_PATH_RE = /^(references|assets|evals|scripts)\/[A-Za-z0-9][A-Za-z0-9._-]{0,63}(\/[A-Za-z0-9][A-Za-z0-9._-]{0,63})?$/
 
 /** 稳定序列化(键排序)—— 与 master 侧 canonicalBundleJson 完全一致的 hash 输入。 */
 function canonicalBundleJson(bundle: Record<string, string>): string {
@@ -181,7 +181,7 @@ async function reconcileSkills(installed: SyncSkill[]): Promise<void> {
         s.bundle && s.bundleHash && marketplaceArtifactHash(canonicalBundleJson(s.bundle)) === s.bundleHash
           ? s.bundle
           : null
-      for (const sub of ['references', 'assets', 'evals']) {
+      for (const sub of ['references', 'assets', 'evals', 'scripts']) {
         const subDir = join(skillDir, sub)
         const wanted = new Map<string, string>()
         if (bundle) {

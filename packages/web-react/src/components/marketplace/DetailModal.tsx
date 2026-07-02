@@ -268,6 +268,14 @@ export function DetailModal({
             </div>
           )}
 
+          {detail.rawBundle &&
+            Object.keys(detail.rawBundle).some((p) => p.startsWith('scripts/')) && (
+              <Alert tone="warning" title="含可执行脚本">
+                该技能带 {Object.keys(detail.rawBundle).filter((p) => p.startsWith('scripts/')).length}{' '}
+                个脚本文件,安装后可能被智能体执行。脚本已过平台危险模式扫描与人工审核,
+                但建议安装前点开逐个查看内容。
+              </Alert>
+            )}
           {detail.rawBundle && Object.keys(detail.rawBundle).length > 0 && (
             <BundleFilesView bundle={detail.rawBundle} />
           )}

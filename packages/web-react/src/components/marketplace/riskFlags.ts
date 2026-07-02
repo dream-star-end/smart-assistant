@@ -13,6 +13,7 @@ const CATEGORY_LABEL: Record<string, string> = {
   obfuscation: "隐藏/不可见字符",
   metadata: "元数据格式问题",
   size: "内容过大",
+  script: "脚本风险",
 };
 
 const CATEGORY_HINT: Record<string, string> = {
@@ -23,6 +24,7 @@ const CATEGORY_HINT: Record<string, string> = {
   obfuscation: "请移除零宽字符、双向控制符等不可见内容。",
   metadata: "名称/描述需为纯文本,不能含换行或 HTML。",
   size: "技能正文过大,请精简到 64KB 以内。",
+  script: "脚本命中危险/可疑模式:毁灭性命令与远程管道执行会被直接拦截;可疑模式需说明用途,审核者会逐行查看。",
 };
 
 export type FriendlyFlag = {
