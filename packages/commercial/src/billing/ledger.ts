@@ -1,10 +1,11 @@
 /**
  * T-22 — 流水 + 余额(事务)。
  *
- * 三个原子操作,全部走 `tx()`:
- *   - debit(user, amount, reason, ref, memo?)  扣积分,余额不足抛 InsufficientCreditsError
- *   - credit(user, amount, reason, ref, memo?) 加积分
+ * 原子操作走 `tx()`:
  *   - adminAdjust(user, delta, memo, admin)    可正可负,同时写 admin_audit
+ *
+ * (旧 debit/credit/getBalance 已删除:生产扣费统一收口 billing/spend.ts 的
+ *  spendTwoBucket;本模块仅剩 adminAdjust 写路径 + listLedger 读路径。)
  *
  * Invariants:
  *   - **BIGINT / BigInt 贯穿**。pg driver 把 BIGINT 按 string 返回,我们在边界一次性转 bigint,
@@ -16,7 +17,7 @@
  *   - ledger.balance_after 写的是"扣/加之后"的真实余额(users.credits 更新后那一份),
  *     不是"扣之前"或"当前 read 的"。consumer-side 审计时可单调校验。
  *   - credit_ledger RULE 禁了 UPDATE/DELETE:这里只做 INSERT,禁止任何 update 路径(测试里也验)。
- *   - amount 必须 > 0(debit/credit 都是)。adminAdjust.delta 必须 ≠ 0,但允许正负。
+ *   - adminAdjust.delta 必须 ≠ 0,但允许正负。
  *     (delta=0 既没意义也会让 audit trail 出噪声,直接拒)
  *   - reason 必须在 schema 的 CHECK 白名单里;类型系统 + DB CHECK 双保险。
  *
@@ -83,12 +84,6 @@ export class InsufficientCreditsError extends Error {
   }
 }
 
-function assertReason(reason: string): asserts reason is LedgerReason {
-  if (!(LEDGER_REASONS as ReadonlyArray<string>).includes(reason)) {
-    throw new TypeError(`unknown ledger reason: ${reason}`);
-  }
-}
-
 function normalizeUserId(userId: bigint | number | string): string {
   // users.id 是 BIGINT,pg driver 以 string 返回 —— 我们也保留 string 存储式传递,
   // 这样 $1 绑定对 pg 来说是最直观的(不用 cast)。bigint 入参转 string 保持一致。
@@ -103,122 +98,8 @@ function normalizeUserId(userId: bigint | number | string): string {
   return userId;
 }
 
-function assertPositive(name: string, v: bigint): void {
-  if (v <= 0n) throw new TypeError(`${name} must be > 0, got ${v}`);
-}
-
 function assertNonZero(name: string, v: bigint): void {
   if (v === 0n) throw new TypeError(`${name} must be != 0`);
-}
-
-/**
- * 事务内:扣用户积分,写 ledger。余额不足抛 InsufficientCreditsError。
- *
- * @param userId  users.id
- * @param amount  **正数**,以"分"为单位(积分的最小刻度)。
- * @param reason  ledger 白名单之一。chat/agent 分不同 reason,便于分维度报表。
- * @param ref     { type, id } 关联对象(可 null)。e.g. `{ type: 'usage_record', id: '42' }`
- * @param memo    可选备注。管理员调整写原因,普通 debit 可留空。
- */
-export async function debit(
-  userId: bigint | number | string,
-  amount: bigint,
-  reason: LedgerReason,
-  ref: LedgerRef = {},
-  memo?: string,
-): Promise<DebitResult> {
-  assertReason(reason);
-  assertPositive("amount", amount);
-  const uid = normalizeUserId(userId);
-
-  return tx(async (client) => {
-    const before = await client.query<{ credits: string }>(
-      "SELECT credits::text AS credits FROM users WHERE id = $1 FOR UPDATE",
-      [uid],
-    );
-    if (before.rows.length === 0) {
-      throw new TypeError(`user not found: ${uid}`);
-    }
-    const balance = BigInt(before.rows[0].credits);
-    if (balance < amount) {
-      // 事务未 COMMIT;RollBack 会发生在 tx() 的 catch 分支。行锁随之释放。
-      throw new InsufficientCreditsError(balance, amount);
-    }
-    const newBalance = balance - amount;
-    await client.query(
-      "UPDATE users SET credits = $1 WHERE id = $2",
-      [newBalance.toString(), uid],
-    );
-    const inserted = await client.query<{ id: string }>(
-      `INSERT INTO credit_ledger
-        (user_id, delta, balance_after, reason, ref_type, ref_id, memo)
-       VALUES ($1, $2, $3, $4, $5, $6, $7)
-       RETURNING id::text AS id`,
-      [
-        uid,
-        (-amount).toString(),
-        newBalance.toString(),
-        reason,
-        ref.type ?? null,
-        ref.id ?? null,
-        memo ?? null,
-      ],
-    );
-    return {
-      ledger_id: BigInt(inserted.rows[0].id),
-      balance_after: newBalance,
-    };
-  });
-}
-
-/**
- * 事务内:加用户积分,写 ledger。amount 必须 > 0(用 adminAdjust 做负值调整)。
- */
-export async function credit(
-  userId: bigint | number | string,
-  amount: bigint,
-  reason: LedgerReason,
-  ref: LedgerRef = {},
-  memo?: string,
-): Promise<DebitResult> {
-  assertReason(reason);
-  assertPositive("amount", amount);
-  const uid = normalizeUserId(userId);
-
-  return tx(async (client) => {
-    const before = await client.query<{ credits: string }>(
-      "SELECT credits::text AS credits FROM users WHERE id = $1 FOR UPDATE",
-      [uid],
-    );
-    if (before.rows.length === 0) {
-      throw new TypeError(`user not found: ${uid}`);
-    }
-    const balance = BigInt(before.rows[0].credits);
-    const newBalance = balance + amount;
-    await client.query(
-      "UPDATE users SET credits = $1 WHERE id = $2",
-      [newBalance.toString(), uid],
-    );
-    const inserted = await client.query<{ id: string }>(
-      `INSERT INTO credit_ledger
-        (user_id, delta, balance_after, reason, ref_type, ref_id, memo)
-       VALUES ($1, $2, $3, $4, $5, $6, $7)
-       RETURNING id::text AS id`,
-      [
-        uid,
-        amount.toString(),
-        newBalance.toString(),
-        reason,
-        ref.type ?? null,
-        ref.id ?? null,
-        memo ?? null,
-      ],
-    );
-    return {
-      ledger_id: BigInt(inserted.rows[0].id),
-      balance_after: newBalance,
-    };
-  });
 }
 
 export interface AdminAdjustResult extends DebitResult {
@@ -316,17 +197,6 @@ export async function adminAdjust(
 }
 
 // ----------- 读路径辅助(不在事务里,只读当前快照) -----------
-
-/** 当前余额。注意这是无锁读,多线程环境下仅用于展示,不能用于决策。 */
-export async function getBalance(userId: bigint | number | string): Promise<bigint> {
-  const uid = normalizeUserId(userId);
-  const r = await rootQuery<{ credits: string }>(
-    "SELECT credits::text AS credits FROM users WHERE id = $1",
-    [uid],
-  );
-  if (r.rows.length === 0) throw new TypeError(`user not found: ${uid}`);
-  return BigInt(r.rows[0].credits);
-}
 
 /**
  * 读用户的 ledger 流水(按时间倒序)。分页参数 limit + created_before。

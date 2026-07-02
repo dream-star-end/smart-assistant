@@ -26,7 +26,6 @@ import {
   listAgentAudit,
   AGENT_AUDIT_MAX_LIMIT,
 } from "../admin/agentAudit.js";
-import { writeAgentAudit } from "../ws/agent.js";
 import { requireAdmin } from "../admin/requireAdmin.js";
 import { createCommercialHandler } from "../http/router.js";
 import type { Mailer, MailMessage } from "../auth/mail.js";
@@ -175,6 +174,42 @@ async function createUser(
     [email, role],
   );
   return BigInt(r.rows[0].id);
+}
+
+// legacy /ws/agent(及其 writeAgentAudit)已删除;listAgentAudit 读路径仍是生产代码。
+// 这里保留一个等价的本地 INSERT helper,专供测试造 agent_audit 数据。
+interface AgentAuditTestRow {
+  user_id: string;
+  session_id: string;
+  tool: string;
+  input_meta: Record<string, unknown>;
+  input_hash: string | null;
+  output_hash: string | null;
+  duration_ms: number;
+  success: boolean;
+  error_msg: string | null;
+}
+
+async function writeAgentAudit(
+  pool: import("pg").Pool,
+  row: AgentAuditTestRow,
+): Promise<void> {
+  await pool.query(
+    `INSERT INTO agent_audit
+       (user_id, session_id, tool, input_meta, input_hash, output_hash, duration_ms, success, error_msg)
+     VALUES ($1, $2, $3, $4::jsonb, $5, $6, $7, $8, $9)`,
+    [
+      row.user_id,
+      row.session_id,
+      row.tool,
+      JSON.stringify(row.input_meta),
+      row.input_hash,
+      row.output_hash,
+      row.duration_ms,
+      row.success,
+      row.error_msg,
+    ],
+  );
 }
 
 async function insertAudit(

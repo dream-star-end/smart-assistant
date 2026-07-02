@@ -175,36 +175,13 @@ export interface RouteRule {
   agent: string
 }
 
-export interface AgentTeamMemberDef {
-  agentId: string
-  role?: string
-  responsibility?: string
-  rolePrompt?: string
-}
-
-export interface AgentTeamPolicy {
-  maxParallel?: number
-  requireReview?: boolean
-  reviewAgentId?: string
-}
-
-export interface AgentTeamDef {
-  id: string
-  name: string
-  description?: string
-  leaderAgentId: string
-  leaderRole?: string
-  leaderPrompt?: string
-  members: AgentTeamMemberDef[]
-  policy?: AgentTeamPolicy
-  updatedAt?: string
-}
-
+// 旧重量级团队模式的 AgentTeamDef/AgentTeamMemberDef/AgentTeamPolicy 类型及
+// AgentsConfig.teams 字段已随 team_run 子系统整套删除。agents.yaml 里若残留
+// teams 键,parseYaml 只是原样带过,无消费方。
 export interface AgentsConfig {
   agents: AgentDef[]
   routes: RouteRule[]
   default: string
-  teams?: AgentTeamDef[]
 }
 
 export async function readAgentsConfig(): Promise<AgentsConfig> {

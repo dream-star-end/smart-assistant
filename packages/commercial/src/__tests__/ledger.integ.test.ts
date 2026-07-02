@@ -1,15 +1,16 @@
 /**
- * T-22 集成:ledger(debit/credit/adminAdjust)在真 Postgres 上的行为。
+ * T-22 集成:ledger(adminAdjust/listLedger)在真 Postgres 上的行为。
+ *
+ * (旧 debit/credit/getBalance 已删除 —— 生产扣费收口 billing/spend.ts spendTwoBucket,
+ *  其集成覆盖见 subscriptionBilling.integ.test.ts;本文件只测 adminAdjust 写路径 +
+ *  listLedger 读路径 + credit_ledger append-only RULE 回归。)
  *
  * 覆盖:
- *   1. debit 正常:users.credits 减少,credit_ledger 新增一行 delta<0 / balance_after 正确
- *   2. debit 余额不足:抛 InsufficientCreditsError,users.credits 未变,ledger 无新增
- *   3. credit 正常:users.credits 增加,ledger 正向 delta
- *   4. 并发 debit:10 个并发,余额仅够 5 次 → 严格 5 成功 5 失败(FOR UPDATE 行锁验证)
- *   5. ledger 的 UPDATE/DELETE 被 RULE 拦住:执行成功但行实际未变
- *   6. adminAdjust 正向 & 负向:users.credits 变更,同时写 admin_audit
- *   7. adminAdjust 会把余额打成负值 → InsufficientCreditsError,事务回滚
- *   8. user 不存在 → TypeError
+ *   1. adminAdjust 正向 & 负向:users.credits 变更,同时写 admin_audit
+ *   2. adminAdjust 会把余额打成负值 → InsufficientCreditsError,事务回滚
+ *   3. user 不存在 → TypeError
+ *   4. ledger 的 UPDATE/DELETE 被 RULE 拦住:执行成功但行实际未变
+ *   5. listLedger 分页
  */
 
 import { describe, test, before, after, beforeEach } from "node:test";
@@ -18,10 +19,7 @@ import { createPool, closePool, setPoolOverride, resetPool } from "../db/index.j
 import { query } from "../db/queries.js";
 import { runMigrations } from "../db/migrate.js";
 import {
-  debit,
-  credit,
   adminAdjust,
-  getBalance,
   listLedger,
   InsufficientCreditsError,
 } from "../billing/ledger.js";
@@ -126,101 +124,26 @@ async function createUser(email: string, credits = 0n, role = "user"): Promise<b
   return BigInt(r.rows[0].id);
 }
 
-describe("ledger.debit (integ)", () => {
-  test("happy path: users.credits 扣减 + ledger 新增一行", async (t) => {
-    if (skipIfNoPg(t)) return;
-    const uid = await createUser("debit-ok@example.com", 1000n);
-    const r = await debit(uid, 300n, "chat", { type: "usage_record", id: "42" }, "test memo");
-    assert.equal(r.balance_after, 700n);
-    assert.ok(r.ledger_id > 0n);
-
-    assert.equal(await getBalance(uid), 700n);
-    const rows = await listLedger(uid);
-    assert.equal(rows.length, 1);
-    assert.equal(rows[0].delta, -300n);
-    assert.equal(rows[0].balance_after, 700n);
-    assert.equal(rows[0].reason, "chat");
-    assert.equal(rows[0].ref_type, "usage_record");
-    assert.equal(rows[0].ref_id, "42");
-    assert.equal(rows[0].memo, "test memo");
-  });
-
-  test("余额不足:抛 InsufficientCreditsError,users.credits 未变,ledger 无新增", async (t) => {
-    if (skipIfNoPg(t)) return;
-    const uid = await createUser("debit-short@example.com", 100n);
-    await assert.rejects(
-      () => debit(uid, 500n, "chat"),
-      (err: unknown) =>
-        err instanceof InsufficientCreditsError &&
-        err.balance === 100n &&
-        err.required === 500n &&
-        err.shortfall === 400n,
-    );
-    assert.equal(await getBalance(uid), 100n, "credits must be untouched after failure");
-    const rows = await listLedger(uid);
-    assert.equal(rows.length, 0, "no ledger row on failure");
-  });
-
-  test("reason 'agent_chat' 正常写入并可读回", async (t) => {
-    if (skipIfNoPg(t)) return;
-    const uid = await createUser("debit-agent@example.com", 1000n);
-    await debit(uid, 50n, "agent_chat", { type: "agent", id: "sess-1" });
-    const rows = await listLedger(uid);
-    assert.equal(rows[0].reason, "agent_chat");
-  });
-});
-
-describe("ledger.credit (integ)", () => {
-  test("加积分 + ledger 正向 delta", async (t) => {
-    if (skipIfNoPg(t)) return;
-    const uid = await createUser("credit-ok@example.com", 100n);
-    const r = await credit(uid, 50n, "topup", { type: "order", id: "ord-1" });
-    assert.equal(r.balance_after, 150n);
-    assert.equal(await getBalance(uid), 150n);
-    const rows = await listLedger(uid);
-    assert.equal(rows[0].delta, 50n);
-    assert.equal(rows[0].balance_after, 150n);
-    assert.equal(rows[0].reason, "topup");
-  });
-});
-
-describe("ledger 并发:FOR UPDATE 保证扣减原子性", () => {
-  test("10 并发 debit,余额 500 每次 100 → 严格 5 成功 / 5 失败", async (t) => {
-    if (skipIfNoPg(t)) return;
-    const uid = await createUser("concurrent@example.com", 500n);
-    const promises = Array.from({ length: 10 }, () =>
-      debit(uid, 100n, "chat").then(
-        () => ({ ok: true }) as const,
-        (err: unknown) =>
-          err instanceof InsufficientCreditsError
-            ? ({ ok: false, code: err.code }) as const
-            : Promise.reject(err),
-      ),
-    );
-    const results = await Promise.all(promises);
-    const success = results.filter((r) => r.ok).length;
-    const failure = results.filter((r) => !r.ok).length;
-    assert.equal(success, 5, "must have exactly 5 successes");
-    assert.equal(failure, 5, "must have exactly 5 failures");
-    assert.equal(await getBalance(uid), 0n);
-    const ledger = await listLedger(uid);
-    assert.equal(ledger.length, 5);
-    // 每行 balance_after 严格递减(400 → 300 → 200 → 100 → 0),且顺序确定
-    const balances = ledger.map((r) => r.balance_after).slice().reverse();
-    assert.deepEqual(balances, [400n, 300n, 200n, 100n, 0n]);
-  });
-});
+// getBalance 已随旧 debit/credit 删除;测试直读 users.credits 作断言。
+async function readCredits(uid: bigint): Promise<bigint> {
+  const r = await query<{ credits: string }>(
+    "SELECT credits::text AS credits FROM users WHERE id = $1",
+    [uid.toString()],
+  );
+  return BigInt(r.rows[0].credits);
+}
 
 describe("credit_ledger append-only RULE 仍生效(T-02 回归)", () => {
   test("UPDATE / DELETE 被拦,实际行不变", async (t) => {
     if (skipIfNoPg(t)) return;
+    const adminId = await createUser("rule-admin@example.com", 0n, "admin");
     const uid = await createUser("rule@example.com", 100n);
-    await debit(uid, 10n, "chat");
+    await adminAdjust(uid, -10n, "rule check", adminId);
     await query("UPDATE credit_ledger SET memo = 'hacked' WHERE user_id = $1", [uid.toString()]);
     await query("DELETE FROM credit_ledger WHERE user_id = $1", [uid.toString()]);
     const rows = await listLedger(uid);
     assert.equal(rows.length, 1, "DELETE must be no-op");
-    assert.equal(rows[0].memo, null, "UPDATE must be no-op");
+    assert.equal(rows[0].memo, "rule check", "UPDATE must be no-op");
     assert.equal(rows[0].delta, -10n);
   });
 });
@@ -235,7 +158,7 @@ describe("ledger.adminAdjust (integ)", () => {
     assert.equal(r.balance_after, 150n);
     assert.ok(r.audit_id > 0n);
 
-    assert.equal(await getBalance(uid), 150n);
+    assert.equal(await readCredits(uid), 150n);
 
     const ledger = await query<{ delta: string; reason: string; balance_after: string }>(
       "SELECT delta::text AS delta, reason, balance_after::text AS balance_after FROM credit_ledger WHERE user_id = $1",
@@ -269,7 +192,7 @@ describe("ledger.adminAdjust (integ)", () => {
     const uid = await createUser("adj-neg@example.com", 200n);
     const r = await adminAdjust(uid, -80n, "penalty", adminId);
     assert.equal(r.balance_after, 120n);
-    assert.equal(await getBalance(uid), 120n);
+    assert.equal(await readCredits(uid), 120n);
     const ledger = await query<{ delta: string }>(
       "SELECT delta::text AS delta FROM credit_ledger WHERE user_id = $1",
       [uid.toString()],
@@ -288,7 +211,7 @@ describe("ledger.adminAdjust (integ)", () => {
         err.balance === 50n &&
         err.required === 100n,
     );
-    assert.equal(await getBalance(uid), 50n, "credits unchanged");
+    assert.equal(await readCredits(uid), 50n, "credits unchanged");
     const ledger = await query<{ cnt: string }>(
       "SELECT COUNT(*)::text AS cnt FROM credit_ledger WHERE user_id = $1",
       [uid.toString()],
@@ -303,11 +226,6 @@ describe("ledger.adminAdjust (integ)", () => {
 });
 
 describe("ledger — user 不存在", () => {
-  test("debit 不存在的 user → TypeError(事务回滚)", async (t) => {
-    if (skipIfNoPg(t)) return;
-    await assert.rejects(() => debit(999999999n, 10n, "chat"), /user not found/);
-  });
-
   test("adminAdjust 不存在的 user → TypeError", async (t) => {
     if (skipIfNoPg(t)) return;
     const adminId = await createUser("admin-notfound@example.com", 0n, "admin");
@@ -318,9 +236,10 @@ describe("ledger — user 不存在", () => {
 describe("listLedger 分页", () => {
   test("limit 参数生效,按时间倒序", async (t) => {
     if (skipIfNoPg(t)) return;
+    const adminId = await createUser("paging-admin@example.com", 0n, "admin");
     const uid = await createUser("paging@example.com", 10_000n);
     for (let i = 0; i < 5; i++) {
-      await debit(uid, 10n, "chat", { id: String(i) });
+      await adminAdjust(uid, -10n, "paging seed", adminId, { id: String(i) });
     }
     const top3 = await listLedger(uid, { limit: 3 });
     assert.equal(top3.length, 3);

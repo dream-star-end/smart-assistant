@@ -40,7 +40,6 @@ import {
 import { classifyDelegateOutputError, classifyRunError } from './errorClassify.js'
 import {
   type AgentDef,
-  type AgentTeamDef,
   type AgentsConfig,
   MemoryStore,
   type OpenClaudeConfig,
@@ -55,23 +54,6 @@ import {
   searchSessions,
   syncMarketplaceHub,
   writeAgentsConfig,
-  createTeamRun,
-  getTeamRun,
-  listTeamRuns,
-  listTeamDelegations,
-  updateTeamRunStatus,
-  getTeamRunByLeaderSessionKey,
-  getTeamDelegationByChildSessionKey,
-  enqueueTeamDelegation,
-  tryAcquireTeamSlot,
-  rejectQueuedTeamDelegation,
-  recordRejectedTeamDelegation,
-  setTeamDelegationChildSession,
-  completeTeamDelegation,
-  markTeamRunFinalAccepted,
-  hasCompletedReviewerDelegation,
-  interruptTeamRun,
-  failTeamRunIfActive,
   writeConfig,
   getUsageSummary,
   queryEvents,
@@ -85,8 +67,6 @@ import {
   listUnclaimedSessions,
   claimSession,
 } from '@openclaude/storage'
-import { normalizeAgentTeamInput, TEAM_ID_RE } from './agentTeams.js'
-import { buildTeamLeaderPrompt } from './teamRun.js'
 import { listCollaboratorAgents } from './collaboratorAgents.js'
 import type { SessionStreamEvent } from './ccbMessageParser.js'
 import { type SkillTrainRun, SkillTrainJobStore } from './skillTrainJobs.js'
@@ -873,17 +853,6 @@ export class Gateway {
       }
     } catch (err) {
       this.log.error('msg-outbox replay failed (continuing startup)', undefined, err as Error)
-    }
-
-    // Team runs: a prior gateway instance may have left team_runs active
-    // (running/finalizing) with no in-memory interrupt map to recover. Mark them
-    // interrupted so stop/refresh don't see ghost state. Best-effort (Codex 审).
-    try {
-      const { interruptStaleTeamRuns } = await import('@openclaude/storage')
-      const interrupted = await interruptStaleTeamRuns()
-      if (interrupted > 0) this.log.info('team-runs stale cleanup', { interrupted })
-    } catch (err) {
-      this.log.error('team-runs stale cleanup failed (continuing startup)', undefined, err as Error)
     }
 
     // V3 commercial: container → master sink for server-authored messages.
@@ -2043,11 +2012,10 @@ export class Gateway {
         const ownedIds = new Set(owned.map((s) => s.id))
         // Also include sessions with no matching client session (cron/task sessions) only for default user
         const filtered = allLive.filter((s) => {
-          // 排除内部委派/团队 run 会话：它们不是用户聊天会话，且 team leader session key
-          // 是 finalize 授权凭据，不能经此 API 泄露（Codex 审）。key 形如
-          // agent:<id>:delegate:... / agent:<id>:teamrun:...（第 3 段区分）。
+          // 排除内部委派会话：它们不是用户聊天会话，不能经此 API 泄露（Codex 审）。
+          // key 形如 agent:<id>:delegate:...（第 3 段区分）。
           const kind = s.sessionKey.split(':')[2] || ''
-          if (kind === 'delegate' || kind === 'teamrun') return false
+          if (kind === 'delegate') return false
           const peerId = s.sessionKey.split(':')[4] || ''
           return ownedIds.has(peerId) || (userId === 'default' && !peerId.startsWith('web-'))
         })
@@ -2292,54 +2260,6 @@ export class Gateway {
     }
     if (url.pathname === '/api/agents') {
       this.handleAgentsCollection(req, res).catch((err) => this.sendInternalError(res, err))
-      return
-    }
-    if (url.pathname === '/api/agent-teams') {
-      this.handleAgentTeamsCollection(req, res).catch((err) =>
-        this.sendInternalError(res, err),
-      )
-      return
-    }
-    const agentTeamIdMatch = url.pathname.match(/^\/api\/agent-teams\/([a-zA-Z0-9_-]+)$/)
-    if (agentTeamIdMatch) {
-      this.handleAgentTeamItem(req, res, agentTeamIdMatch[1]).catch((err) =>
-        this.sendInternalError(res, err),
-      )
-      return
-    }
-    // Team run: server-side first-class team run (createTeamRun + observe).
-    const teamRunCreateMatch = url.pathname.match(/^\/api\/agent-teams\/([a-zA-Z0-9_-]+)\/runs$/)
-    if (teamRunCreateMatch) {
-      this.handleCreateTeamRun(req, res, teamRunCreateMatch[1]).catch((err) =>
-        this.sendInternalError(res, err),
-      )
-      return
-    }
-    if (url.pathname === '/api/team-runs') {
-      this.handleTeamRunList(req, res).catch((err) => this.sendInternalError(res, err))
-      return
-    }
-    const teamRunGetMatch = url.pathname.match(/^\/api\/team-runs\/([a-zA-Z0-9_-]+)$/)
-    if (teamRunGetMatch) {
-      this.handleTeamRunGet(req, res, teamRunGetMatch[1]).catch((err) =>
-        this.sendInternalError(res, err),
-      )
-      return
-    }
-    const teamRunFinalizeMatch = url.pathname.match(
-      /^\/api\/team-runs\/([a-zA-Z0-9_-]+)\/finalize$/,
-    )
-    if (teamRunFinalizeMatch) {
-      this.handleTeamRunFinalize(req, res, teamRunFinalizeMatch[1]).catch((err) =>
-        this.sendInternalError(res, err),
-      )
-      return
-    }
-    const teamRunStopMatch = url.pathname.match(/^\/api\/team-runs\/([a-zA-Z0-9_-]+)\/stop$/)
-    if (teamRunStopMatch) {
-      this.handleTeamRunStop(req, res, teamRunStopMatch[1]).catch((err) =>
-        this.sendInternalError(res, err),
-      )
       return
     }
     const agentIdMatch = url.pathname.match(/^\/api\/agents\/([a-zA-Z0-9_-]+)$/)
@@ -4623,331 +4543,6 @@ export class Gateway {
     this.sendError(res, 405, 'method not allowed')
   }
 
-  // GET /api/agent-teams         → { teams }
-  // POST /api/agent-teams        → create team
-  private async handleAgentTeamsCollection(
-    req: IncomingMessage,
-    res: ServerResponse,
-  ): Promise<void> {
-    const cfg = await readAgentsConfig()
-    const teams: AgentTeamDef[] = cfg.teams ?? []
-    if (req.method === 'GET') {
-      this.sendJson(res, 200, { teams })
-      return
-    }
-    if (req.method === 'POST') {
-      const body = await this.readJsonBody<Partial<AgentTeamDef>>(req)
-      let team: AgentTeamDef
-      try {
-        team = normalizeAgentTeamInput(body, cfg.agents, teams)
-      } catch (err: any) {
-        this.sendError(res, 400, err?.message ?? String(err))
-        return
-      }
-      cfg.teams = [...teams, team]
-      await writeAgentsConfig(cfg)
-      this.deps.agentsConfig = cfg
-      this.sendJson(res, 201, { team })
-      return
-    }
-    this.sendError(res, 405, 'method not allowed')
-  }
-
-  // GET /api/agent-teams/:id    → { team }
-  // PUT /api/agent-teams/:id    → update team
-  // DELETE /api/agent-teams/:id → remove team
-  private async handleAgentTeamItem(
-    req: IncomingMessage,
-    res: ServerResponse,
-    id: string,
-  ): Promise<void> {
-    if (!TEAM_ID_RE.test(id)) return this.sendError(res, 404, 'team not found')
-    const cfg = await readAgentsConfig()
-    const teams: AgentTeamDef[] = cfg.teams ?? []
-    const idx = teams.findIndex((t) => t.id === id)
-    if (idx < 0) return this.sendError(res, 404, 'team not found')
-    if (req.method === 'GET') {
-      this.sendJson(res, 200, { team: teams[idx] })
-      return
-    }
-    if (req.method === 'PUT') {
-      const body = await this.readJsonBody<Partial<AgentTeamDef>>(req)
-      let team: AgentTeamDef
-      try {
-        team = normalizeAgentTeamInput({ ...body, id }, cfg.agents, teams, { currentId: id })
-      } catch (err: any) {
-        this.sendError(res, 400, err?.message ?? String(err))
-        return
-      }
-      const nextTeams = teams.slice()
-      nextTeams[idx] = team
-      cfg.teams = nextTeams
-      await writeAgentsConfig(cfg)
-      this.deps.agentsConfig = cfg
-      this.sendJson(res, 200, { team })
-      return
-    }
-    if (req.method === 'DELETE') {
-      cfg.teams = teams.filter((t) => t.id !== id)
-      await writeAgentsConfig(cfg)
-      this.deps.agentsConfig = cfg
-      this.sendJson(res, 200, { ok: true })
-      return
-    }
-    this.sendError(res, 405, 'method not allowed')
-  }
-
-  // POST /api/agent-teams/:id/runs  { goal, sessionKey } → { teamRunId, leaderSessionKey }
-  //
-  // v5 团队模式的服务端发起入口。冻结团队 snapshot、建独立队长 session（注入
-  // teamRunId env）、服务端构建队长 prompt、把队长输出**桥接**回发起用户的会话
-  // （origin = getByKey(sessionKey) 的 {channel,peerId,userId}）。取代老 web 客户端
-  // buildTeamRunPrompt + 直接发队长 agent 的旧路径。
-  private async handleCreateTeamRun(
-    req: IncomingMessage,
-    res: ServerResponse,
-    teamId: string,
-  ): Promise<void> {
-    if (req.method !== 'POST') return this.sendError(res, 405, 'method not allowed')
-    if (!TEAM_ID_RE.test(teamId)) return this.sendError(res, 404, 'team not found')
-    let parsed: any
-    try {
-      parsed = JSON.parse(await this.readBody(req))
-    } catch {
-      return this.sendError(res, 400, 'invalid JSON')
-    }
-    const goal = typeof parsed?.goal === 'string' ? parsed.goal.trim() : ''
-    if (!goal) return this.sendError(res, 400, 'goal required')
-
-    // origin = 发起用户的路由信息。优先用显式字段（前端从其 WS/会话上下文提供），
-    // **不依赖已存在的 AgentSession**（新会话发起团队 run 不应 404 —— Codex 审）。
-    // 若传了 sessionKey 且能查到会话，作为兜底补全 channel/peer/user。
-    // durable 真相源是 team_run 表 + run 事件；deliver 只是尽力而为的活跃连接直播。
-    const originIn = (parsed?.origin ?? {}) as Record<string, unknown>
-    const bySession =
-      typeof parsed?.sessionKey === 'string' && parsed.sessionKey
-        ? this.sessions.getByKey(parsed.sessionKey)
-        : undefined
-    const originChannel =
-      (typeof originIn.channel === 'string' && originIn.channel) || bySession?.channel || 'webchat'
-    const originPeerId =
-      (typeof originIn.peerId === 'string' && originIn.peerId) || bySession?.peerId || ''
-    // 规范化到协议允许的 dm|group（Codex 审：peerKind 来自请求字符串，需白名单）
-    const rawPeerKind = (typeof originIn.peerKind === 'string' && originIn.peerKind) || 'dm'
-    const originPeerKind: 'dm' | 'group' = rawPeerKind === 'group' ? 'group' : 'dm'
-    const originUserId =
-      (typeof originIn.userId === 'string' && originIn.userId) || bySession?.userId || null
-    const originSessionKey =
-      (typeof parsed?.sessionKey === 'string' && parsed.sessionKey) || bySession?.sessionKey || ''
-    if (!originPeerId) return this.sendError(res, 400, 'origin peerId required')
-
-    const cfg = await this._getAgentsConfig()
-    const team = (cfg.teams ?? []).find((t) => t.id === teamId)
-    if (!team) return this.sendError(res, 404, 'team not found')
-    const leaderAgent = cfg.agents.find((a) => a.id === team.leaderAgentId)
-    if (!leaderAgent) {
-      return this.sendError(res, 400, `leader agent "${team.leaderAgentId}" not found`)
-    }
-
-    const runId = `trun-${Date.now().toString(36)}-${randomBytes(4).toString('hex')}`
-    // leader session key 带随机 nonce → 不可预测。它既是 leader 身份、又是 finalize
-    // 授权凭据（只注入 leader MCP env、不经 API 回显），nonce 防被 teamRunId+leaderAgentId
-    // 重构（Codex 审：可预测的凭据等于没凭据）。
-    const leaderSessionKey = `agent:${team.leaderAgentId}:teamrun:${runId}:${randomBytes(12).toString('hex')}`
-    // finalize 授权凭据：独立随机 token（不是 session key —— session key 会经
-    // usage/events/runs/doctor 等观测面回显，不能当凭据）。只注入 leader MCP env，
-    // 绝不落任何 DTO/日志（Codex 审：根治，而非到处 redact session key）。
-    const finalizeToken = randomBytes(24).toString('hex')
-    const policy = team.policy ?? {}
-    // snapshot 存盘时已被 normalizeAgentTeamInput 钳到 TEAM_MAX_PARALLEL_CAP;此处兜底 >=1
-    const maxParallel = Math.max(1, policy.maxParallel ?? 1)
-
-    await createTeamRun({
-      teamRunId: runId,
-      teamId: team.id,
-      teamSnapshot: team,
-      userGoal: goal,
-      originChannel,
-      originPeerId,
-      originPeerKind,
-      originSessionKey,
-      originUserId,
-      leaderAgentId: team.leaderAgentId,
-      leaderSessionKey,
-      maxParallel,
-      reviewRequired: !!policy.requireReview,
-      reviewAgentId: policy.requireReview ? policy.reviewAgentId ?? null : null,
-      finalizeToken,
-      parentRunId: typeof parsed?.parentRunId === 'string' ? parsed.parentRunId : null,
-      status: 'running',
-    })
-
-    const leaderSession = await this.sessions.getOrCreate({
-      sessionKey: leaderSessionKey,
-      agent: leaderAgent,
-      channel: 'delegate',
-      peerId: originPeerId,
-      title: `[team] ${goal.slice(0, 40)}`,
-      teamRunId: runId,
-      teamFinalizeToken: finalizeToken,
-    })
-
-    // 桥接：队长 session 的每个 block → origin（用户）会话。形态同 delegate emitProgress
-    // / webchat 逐块流；无 block 的 isFinal=true 作终止帧。
-    const deliverLeaderBlock = (block: unknown | null, isFinal: boolean): void => {
-      this.deliver({
-        type: 'outbound.message',
-        sessionKey: originSessionKey,
-        channel: originChannel,
-        peer: { id: originPeerId, kind: originPeerKind },
-        blocks: block ? [block] : [],
-        isFinal,
-        _userId: originUserId ?? undefined,
-      } as OutboundMessage & { _userId?: string })
-    }
-
-    const prompt = buildTeamLeaderPrompt(team, goal)
-    // fire-and-forget：立即返回 runId，队长 turn 异步流式跑（可能很长）。
-    let leaderHadError = false
-    const submitPromise = this.sessions.submit(leaderSession, prompt, (e) => {
-      if (e.kind === 'block') deliverLeaderBlock(e.block, false)
-      else if (e.kind === 'error') {
-        // SessionManager.submit 的 error path 是 onEvent(error)+resolve()（非 reject），
-        // 故这里标记，.then 里据此落 failed，避免把失败误判成 finalize_required（Codex 审）。
-        leaderHadError = true
-        deliverLeaderBlock({ kind: 'text', text: `[error] ${e.error}` }, false)
-      }
-    })
-    submitPromise
-      .then(async () => {
-        if (leaderHadError) {
-          // CAS：不覆盖用户 stop 标的 interrupted / 已 completed。
-          await failTeamRunIfActive(runId)
-        } else {
-          // 兜底 gate：队长 turn 结束但未经 submit_team_final（final_accepted_at 空）→
-          // 标 finalize_required，UI 显示"未提交最终答案"，不误判 completed。
-          const run = await getTeamRun(runId)
-          if (run && !run.finalAcceptedAt && run.status === 'running') {
-            await updateTeamRunStatus(runId, 'finalize_required')
-          }
-        }
-        deliverLeaderBlock(null, true)
-      })
-      .catch(async (err) => {
-        await failTeamRunIfActive(runId).catch(() => {})
-        deliverLeaderBlock(
-          { kind: 'text', text: `[team error] ${String(err?.message ?? err)}` },
-          true,
-        )
-      })
-
-    // 不回显 leaderSessionKey：它是 finalize 授权凭据，只 leader 自己的 MCP env 知道（Codex 审）。
-    this.sendJson(res, 201, { teamRunId: runId })
-  }
-
-  // GET /api/team-runs?limit=N → { runs }（团队运行历史/审计，剥离敏感字段）。
-  private async handleTeamRunList(req: IncomingMessage, res: ServerResponse): Promise<void> {
-    if (req.method !== 'GET') return this.sendError(res, 405, 'method not allowed')
-    const limitRaw = Number(new URL(req.url ?? '', 'http://localhost').searchParams.get('limit'))
-    const limit = Number.isFinite(limitRaw) && limitRaw > 0 ? Math.min(limitRaw, 50) : 20
-    const runs = await listTeamRuns(limit)
-    const dtos = runs.map(
-      ({ leaderSessionKey: _l, originSessionKey: _o, finalizeToken: _f, ...r }) => r,
-    )
-    this.sendJson(res, 200, { runs: dtos })
-  }
-
-  // GET /api/team-runs/:id → { run, delegations }
-  private async handleTeamRunGet(
-    req: IncomingMessage,
-    res: ServerResponse,
-    runId: string,
-  ): Promise<void> {
-    if (req.method !== 'GET') return this.sendError(res, 405, 'method not allowed')
-    const run = await getTeamRun(runId)
-    if (!run) return this.sendError(res, 404, 'team run not found')
-    const delegations = await listTeamDelegations(runId)
-    // 不暴露 leaderSessionKey/originSessionKey：内部路由用，且 leaderSessionKey 是
-    // finalize 授权凭据，不应回显给前端（Codex 审）。
-    const { leaderSessionKey: _lsk, originSessionKey: _osk, finalizeToken: _ft, ...runDto } = run
-    this.sendJson(res, 200, { run: runDto, delegations })
-  }
-
-  // POST /api/team-runs/:id/finalize  { content, summary?, sessionKey }
-  // submit_team_final 工具的落点。硬校验 leader 身份 + requireReview gate。
-  private async handleTeamRunFinalize(
-    req: IncomingMessage,
-    res: ServerResponse,
-    runId: string,
-  ): Promise<void> {
-    if (req.method !== 'POST') return this.sendError(res, 405, 'method not allowed')
-    let parsed: any
-    try {
-      parsed = JSON.parse(await this.readBody(req))
-    } catch {
-      return this.sendError(res, 400, 'invalid JSON')
-    }
-    const content = typeof parsed?.content === 'string' ? parsed.content : ''
-    if (!content.trim()) return this.sendError(res, 400, 'content required')
-
-    const run = await getTeamRun(runId)
-    if (!run) return this.sendError(res, 404, 'team run not found')
-
-    // 授权：finalize capability token（独立于 session key，只注入 leader MCP env，
-    // 不经任何 API/日志回显）。用不可观测的 token 而非可观测的 session key 作凭据（Codex 审）。
-    const callerToken = typeof parsed?.token === 'string' ? parsed.token : ''
-    if (!run.finalizeToken || !callerToken || callerToken !== run.finalizeToken) {
-      return this.sendError(res, 403, 'invalid or missing finalize token')
-    }
-    if (run.status === 'interrupted' || run.status === 'failed') {
-      return this.sendError(res, 409, `team run already ${run.status}`)
-    }
-
-    // requireReview 硬 gate（fail-closed）：要求复核则必须配 reviewer，且确有一次
-    // reviewer completed 委派。缺 reviewer 直接拒绝，不放行（Codex 审）。
-    if (run.reviewRequired) {
-      if (!run.reviewAgentId) {
-        return this.sendError(res, 409, 'team run requires review but no reviewer is configured')
-      }
-      const reviewed = await hasCompletedReviewerDelegation(runId, run.reviewAgentId)
-      if (!reviewed) {
-        return this.sendError(
-          res,
-          428,
-          `review required: delegate the draft to reviewer "${run.reviewAgentId}" and wait for it to complete before finalizing`,
-        )
-      }
-    }
-
-    // 原子 CAS：并发 double-finalize 只有一个能成功（Codex 审）。
-    const applied = await markTeamRunFinalAccepted(runId, Date.now(), content)
-    if (!applied) {
-      return this.sendError(res, 409, 'team run not open for finalize (already finalized or terminated)')
-    }
-    this.sendJson(res, 200, { ok: true, teamRunId: runId })
-  }
-
-  // POST /api/team-runs/:id/stop  → 用户主动中断一次团队运行（无需 finalize token：
-  // 这是用户对自己容器内运行的操作，普通 auth 即可）。复用 handleStop 的中断机制。
-  private async handleTeamRunStop(
-    req: IncomingMessage,
-    res: ServerResponse,
-    runId: string,
-  ): Promise<void> {
-    if (req.method !== 'POST') return this.sendError(res, 405, 'method not allowed')
-    const run = await getTeamRun(runId)
-    if (!run) return this.sendError(res, 404, 'team run not found')
-    // 顺序关键（Codex 审）：先在 DB 里 CAS 关 run（admission tx / finalize CAS 据此
-    // 拒绝新委派与收尾，关竞态窗口），再停进程。
-    const { wasActive, childSessionKeys } = await interruptTeamRun(runId)
-    // 中断队长 session + 其下已注册的成员委派（递归，与 handleStop 同机制）。
-    this.sessions.interrupt(run.leaderSessionKey)
-    this._interruptDelegationsForParent(run.leaderSessionKey)
-    // 再逐个中断 admit→register 窗口里尚未进 active map 的 child（DB 记的 child key）。
-    for (const childKey of childSessionKeys) this.sessions.interrupt(childKey)
-    this.sendJson(res, 200, { ok: true, wasActive })
-  }
-
   // GET /api/agents/:id    → { agent }
   // PUT /api/agents/:id    → update model | persona
   // DELETE /api/agents/:id → remove (cannot remove default)
@@ -5614,48 +5209,6 @@ export class Gateway {
     return interrupted
   }
 
-  // P5：等一个 queued 团队委派拿到 slot（maxParallel + 内存水位 + 全局 backstop 都满足）。
-  // 轮询直到 acquired / run 关闭(含被 stop) / 客户端断开 / 超时。返回
-  // 'ok' | 'run_closed' | 'cancelled' | 'timeout'。leader delegate_task HTTP 阻塞于此。
-  private async _waitForTeamSlot(
-    delegationId: string,
-    teamRunId: string,
-    maxParallel: number,
-    res: ServerResponse,
-  ): Promise<'ok' | 'run_closed' | 'cancelled' | 'timeout'> {
-    const QUEUE_TIMEOUT_MS = 10 * 60 * 1000
-    const POLL_MS = 500
-    const memLimit = parseDelegateMemoryPressureRatio()
-    const deadline = Date.now() + QUEUE_TIMEOUT_MS
-    // 监听 res 'close'：响应写完前连接关闭 = leader/MCP 断开等待，立即退出，否则 queued
-    // 行挡住 FIFO 队头到 10min 超时（Codex 审：req body 的 close 在 readBody 后不可靠）。
-    let cancelled = res.destroyed
-    const onClose = () => {
-      if (!res.writableEnded) cancelled = true
-    }
-    res.on('close', onClose)
-    try {
-      while (Date.now() < deadline) {
-        if (cancelled) break
-        await new Promise((r) => setTimeout(r, POLL_MS))
-        if (cancelled) break
-        // 全局并发 backstop 再准入：queued 等待期间全局可能被占满，不能绕过 MAX_CONCURRENT。
-        if (this._activeDelegations >= Gateway.MAX_CONCURRENT_DELEGATIONS) continue
-        const mem = readDelegateMemoryPressure()
-        if (mem && mem.ratio >= memLimit) continue // 内存高，继续等，不占 slot
-        const acq = await tryAcquireTeamSlot({ delegationId, teamRunId, maxParallel })
-        if (acq === 'acquired') return 'ok'
-        if (acq === 'run_closed' || acq === 'gone') return 'run_closed'
-        // 'waiting' → 继续轮询
-      }
-      // 取消或超时：把 queued 行标 rejected(timeout)，让出 FIFO 队头。
-      await rejectQueuedTeamDelegation(delegationId, 'timeout').catch(() => {})
-      return cancelled ? 'cancelled' : 'timeout'
-    } finally {
-      res.off('close', onClose)
-    }
-  }
-
   private async handleDelegateTask(
     req: IncomingMessage,
     res: ServerResponse,
@@ -5671,50 +5224,6 @@ export class Gateway {
     }
     const { goal, context, sourceAgent, toolsets } = parsed
     if (!goal) return this.sendError(res, 400, 'goal required')
-
-    // Team run context (D-B): parentSessionKey 反查 teamRunStore 判定委派归属。
-    const parentKey = typeof parsed.parentSessionKey === 'string' ? parsed.parentSessionKey : ''
-    const teamRunLeader = parentKey ? await getTeamRunByLeaderSessionKey(parentKey) : null
-    if (teamRunLeader) {
-      // 只有 active(running) run 接受新委派；已完成/终止的 run 拒绝（Codex 审）。
-      if (teamRunLeader.status !== 'running') {
-        return this.sendError(
-          res,
-          409,
-          `team run is ${teamRunLeader.status}, not accepting new delegations`,
-        )
-      }
-      // leader 委派：成员白名单（只允许 snapshot 成员/复核者）
-      const snap = teamRunLeader.teamSnapshot as {
-        members?: Array<{ agentId: string }>
-        policy?: { requireReview?: boolean; reviewAgentId?: string }
-      } | null
-      const allowed = new Set<string>((snap?.members ?? []).map((m) => m.agentId))
-      if (snap?.policy?.requireReview && snap.policy.reviewAgentId) {
-        allowed.add(snap.policy.reviewAgentId)
-      }
-      if (!allowed.has(targetAgentId)) {
-        await recordRejectedTeamDelegation({
-          teamRunId: teamRunLeader.teamRunId,
-          memberAgentId: targetAgentId,
-          goal,
-          reason: 'not_member',
-        }).catch(() => {})
-        return this.sendError(res, 403, `agent "${targetAgentId}" is not a member of this team run`)
-      }
-    } else if (parentKey) {
-      // 团队成员的嵌套委派：P1 拒绝（防 maxParallel=1 死锁 + 越权面，D-B）
-      const memberDeleg = await getTeamDelegationByChildSessionKey(parentKey)
-      if (memberDeleg) {
-        await recordRejectedTeamDelegation({
-          teamRunId: memberDeleg.teamRunId,
-          memberAgentId: targetAgentId,
-          goal,
-          reason: 'not_member',
-        }).catch(() => {})
-        return this.sendError(res, 403, 'team members cannot sub-delegate within a team run')
-      }
-    }
 
     // Concurrency guard
     if (this._activeDelegations >= Gateway.MAX_CONCURRENT_DELEGATIONS) {
@@ -5765,8 +5274,7 @@ export class Gateway {
 
     const memoryPressure = readDelegateMemoryPressure()
     const memoryPressureLimit = parseDelegateMemoryPressureRatio()
-    // 团队 delegate 的内存水位在入队/等待环节处理（P5：排队而非硬拒）；非团队仍 503。
-    if (!teamRunLeader && memoryPressure && memoryPressure.ratio >= memoryPressureLimit) {
+    if (memoryPressure && memoryPressure.ratio >= memoryPressureLimit) {
       const pct = Math.round(memoryPressure.ratio * 100)
       this.log.warn('delegate_resource_pressure', {
         targetAgentId,
@@ -5799,86 +5307,15 @@ export class Gateway {
       sourceAgent,
     })
 
-    // Team run admission (D-C/P5): 入队式。撞 maxParallel 或内存水位 → 排队等 slot（不拒绝），
-    // slot 释放后 FIFO 放行。放在前置 guard 之后、spawn 之前。
-    let teamDelegationId: string | null = null
-    if (teamRunLeader) {
-      // 内存水位高时传 maxParallel=0 → 一律入队（等内存降下来再拿 slot，P5 集成内存 guard）。
-      const memPressured = !!(memoryPressure && memoryPressure.ratio >= memoryPressureLimit)
-      const enq = await enqueueTeamDelegation({
-        teamRunId: teamRunLeader.teamRunId,
-        memberAgentId: targetAgentId,
-        goal,
-        maxParallel: memPressured ? 0 : teamRunLeader.maxParallel,
-      })
-      if (enq.status === 'run_closed') {
-        return this.sendError(res, 409, 'team run is no longer active')
-      }
-      teamDelegationId = enq.delegationId
-      if (enq.status === 'queued') {
-        const waited = await this._waitForTeamSlot(
-          teamDelegationId,
-          teamRunLeader.teamRunId,
-          teamRunLeader.maxParallel,
-          res,
-        )
-        if (waited === 'cancelled') return // 客户端已断开，无需响应
-        if (waited === 'run_closed') return this.sendError(res, 409, 'team run is no longer active')
-        if (waited === 'timeout') {
-          return this.sendError(
-            res,
-            429,
-            'team delegation queued too long (maxParallel / memory pressure)',
-          )
-        }
-      }
-    }
-
-    // admission 已占额度：getOrCreate 抛错必须释放（落 failed），否则永久占 maxParallel。
-    const session = await this.sessions
-      .getOrCreate({
-        sessionKey,
-        agent: delegatedAgent,
-        channel: 'delegate',
-        peerId: sourceAgent || 'system',
-        repoSessionId: progressTarget?.peerId ?? delegateParent?.repoSessionId,
-        title: `[delegate] ${goal.slice(0, 40)}`,
-        delegationDepth: depth + 1,
-      })
-      .catch(async (err) => {
-        if (teamDelegationId) {
-          await completeTeamDelegation(teamDelegationId, {
-            status: 'failed',
-            error: `delegation init failed: ${String(err?.message ?? err)}`,
-          }).catch(() => {})
-        }
-        throw err
-      })
-
-    // D-B：把 child session key 记回委派行，供后续成员嵌套委派反查。SQLite 是权威，
-    // 回写失败必须让本次委派失败（否则成员嵌套拒绝会失效）—— 不能吞（Codex 审）。
-    if (teamDelegationId) {
-      await setTeamDelegationChildSession(teamDelegationId, sessionKey).catch(async (err) => {
-        await completeTeamDelegation(teamDelegationId!, {
-          status: 'failed',
-          error: 'child session key writeback failed',
-        }).catch(() => {})
-        throw err
-      })
-      // stop 竞态：admission 通过后、submit 前复查 run 是否已被 stop 关闭。若已 interrupted，
-      // 不启动 child turn（child 已建则中断它），委派落 failed（CAS，若 stop 已标则 no-op）。
-      if (teamRunLeader) {
-        const fresh = await getTeamRun(teamRunLeader.teamRunId)
-        if (!fresh || fresh.status !== 'running') {
-          this.sessions.interrupt(sessionKey)
-          await completeTeamDelegation(teamDelegationId, {
-            status: 'failed',
-            error: 'team run interrupted before start',
-          }).catch(() => {})
-          return this.sendError(res, 409, 'team run interrupted')
-        }
-      }
-    }
+    const session = await this.sessions.getOrCreate({
+      sessionKey,
+      agent: delegatedAgent,
+      channel: 'delegate',
+      peerId: sourceAgent || 'system',
+      repoSessionId: progressTarget?.peerId ?? delegateParent?.repoSessionId,
+      title: `[delegate] ${goal.slice(0, 40)}`,
+      delegationDepth: depth + 1,
+    })
 
     const progressRunId = `dlg-${Date.now().toString(36)}-${randomBytes(4).toString('hex')}`
     const emitProgress = (block: DelegateProgressBlock | null) => {
@@ -6017,13 +5454,6 @@ export class Gateway {
       clearTimeoutTimer()
       unregisterDelegation?.()
       this._activeDelegations--
-      // Team run: 委派终态落 SQLite（error 空=completed）。
-      if (teamDelegationId) {
-        await completeTeamDelegation(teamDelegationId, {
-          status: error ? 'failed' : 'completed',
-          error: error || null,
-        }).catch(() => {})
-      }
     }
 
     eventBus.emit('agent.completed', createEvent('agent.completed', targetAgentId, {

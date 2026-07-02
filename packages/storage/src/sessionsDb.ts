@@ -289,68 +289,8 @@ export async function getSessionsDb(): Promise<Database.Database> {
     CREATE INDEX IF NOT EXISTS idx_pup_user ON pending_usage_patches(user_id);
   `)
 
-  // team_runs / team_delegations — v5 团队模式：team run 服务端一等实体 + 委派账本。
-  // SQLite 为权威（in-memory 仅 live cache）；CRUD 在 teamRunStore.ts。
-  //   idx_team_runs_leader:  按 leader_session_key 反查 run（delegate admission 判定 leader 委派）
-  //   idx_team_deleg_child:  按 child_session_key 反查委派（判定"成员嵌套委派"→ P1 拒绝）
-  //   idx_team_deleg_run:    按 (team_run_id,status) 数在跑委派（per-run maxParallel 信号量）
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS team_runs (
-      team_run_id        TEXT PRIMARY KEY,
-      team_id            TEXT NOT NULL,
-      team_snapshot      TEXT NOT NULL,
-      user_goal          TEXT NOT NULL,
-      origin_channel     TEXT NOT NULL,
-      origin_peer_id     TEXT NOT NULL,
-      origin_peer_kind   TEXT,
-      origin_session_key TEXT NOT NULL,
-      origin_user_id     TEXT,
-      leader_agent_id    TEXT NOT NULL,
-      leader_session_key TEXT NOT NULL,
-      status             TEXT NOT NULL,
-      max_parallel       INTEGER NOT NULL,
-      review_required    INTEGER NOT NULL DEFAULT 0,
-      review_agent_id    TEXT,
-      review_returned_at INTEGER,
-      final_accepted_at  INTEGER,
-      final_content_ref  TEXT,
-      finalize_token     TEXT,
-      parent_run_id      TEXT,
-      created_at         INTEGER NOT NULL,
-      updated_at         INTEGER NOT NULL
-    );
-    CREATE INDEX IF NOT EXISTS idx_team_runs_leader ON team_runs(leader_session_key);
-    CREATE INDEX IF NOT EXISTS idx_team_runs_status ON team_runs(status);
-
-    CREATE TABLE IF NOT EXISTS team_delegations (
-      delegation_id     TEXT PRIMARY KEY,
-      team_run_id       TEXT NOT NULL,
-      member_agent_id   TEXT NOT NULL,
-      goal              TEXT NOT NULL,
-      status            TEXT NOT NULL,
-      child_session_key TEXT,
-      reject_reason     TEXT,
-      started_at        INTEGER,
-      completed_at      INTEGER,
-      result_ref        TEXT,
-      error             TEXT,
-      created_at        INTEGER NOT NULL,
-      updated_at        INTEGER NOT NULL
-    );
-    CREATE INDEX IF NOT EXISTS idx_team_deleg_run ON team_delegations(team_run_id, status);
-    CREATE INDEX IF NOT EXISTS idx_team_deleg_child ON team_delegations(child_session_key);
-  `)
-
-  // Migration: origin_peer_kind 在 team_runs 初版之后加入（本分支内演进）。已建过旧表的
-  // 本地 DB 需补列，否则带 origin_peer_kind 的 INSERT 失败（Codex 审）。
-  const teamRunCols = db.pragma('table_info(team_runs)') as Array<{ name: string }>
-  if (!teamRunCols.some((c) => c.name === 'origin_peer_kind')) {
-    db.exec('ALTER TABLE team_runs ADD COLUMN origin_peer_kind TEXT')
-  }
-  if (!teamRunCols.some((c) => c.name === 'finalize_token')) {
-    db.exec('ALTER TABLE team_runs ADD COLUMN finalize_token TEXT')
-  }
-
+  // 旧重量级团队模式(team_runs / team_delegations)已整套删除:schema 不再声明,
+  // 存量本地 DB 里已建的表留着无害(不写 DROP TABLE,不迁移)。
   _db = db
   return db
 }
@@ -741,7 +681,9 @@ const CLIENT_PUT_ALLOWED_FIELDS: ReadonlySet<string> = new Set<string>([
   'blockId',
   // empty-turn / cron metadata
   '_emptyTurn', '_emptyTurnSoft', '_emptyTurnStopReason', 'cronJob',
-  // client-persistent private fields (server treats opaquely)
+  // client-persistent private fields (server treats opaquely)。
+  // _teamRun 有意保留:它只是客户端消息上的 opaque 展示元数据(legacy packages/web
+  // 仍写入),与已删除的服务端 team_run 子系统无关,server 不解释。
   '_media', '_modelText', '_teamRun',
 ])
 

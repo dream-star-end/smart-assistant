@@ -136,11 +136,9 @@ export const BRIDGE_API_ALLOWLIST: readonly BridgeApiAllowRule[] = [
     proxyFromCommercial: true,
   },
   // v5 轻量组队重构:旧「团队」重后端(team_run 服务端实体 + /api/agent-teams、
-  // /api/team-runs* 路由)已从产品面移除,改为 main 队长 turn 级自主 delegate_task 组队。
-  // 这些路由从 bridge allowlist 删除后,浏览器→商业宿主→用户容器 这条唯一外部可达路径即
-  // 关闭(默认拒绝)。host 侧 commercial router 的 BLOCKED_FOR_USER_RULES 仍保留 team 条目
-  // 作为 deny 兜底。容器内 handler/storage/mcp submit_team_final(受 OPENCLAUDE_TEAM_RUN_ID
-  // env gate,新模型永不置位)保持休眠,整套删除是后续独立工程。
+  // /api/team-runs* 路由)已整套删除(gateway 路由/handler、storage teamRunStore、
+  // /ws/agent 入口皆已移除),组队 = main 队长 turn 级自主 delegate_task。
+  // host 侧 commercial router 的 BLOCKED_FOR_USER_RULES 仍保留 team 条目作为 deny 兜底。
 
   { label: '/api/cron', re: /^\/api\/cron$/, methods: M('GET', 'POST'), proxyFromCommercial: true },
   {

@@ -5,8 +5,6 @@
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
 import {
-  debit,
-  credit,
   adminAdjust,
   InsufficientCreditsError,
   LEDGER_REASONS,
@@ -52,34 +50,8 @@ describe("LEDGER_REASONS (schema sync check)", () => {
   });
 });
 
-describe("debit / credit input validation(不触 DB,校验先于 tx)", () => {
-  test("debit: amount <= 0 → TypeError", async () => {
-    await assert.rejects(() => debit(1, 0n, "chat"), TypeError);
-    await assert.rejects(() => debit(1, -5n, "chat"), TypeError);
-  });
-
-  test("credit: amount <= 0 → TypeError", async () => {
-    await assert.rejects(() => credit(1, 0n, "topup"), TypeError);
-    await assert.rejects(() => credit(1, -5n, "topup"), TypeError);
-  });
-
-  test("unknown reason → TypeError", async () => {
-    // @ts-expect-error — 故意传非法 reason 验证 runtime guard
-    await assert.rejects(() => debit(1, 10n, "hack_reason"), /unknown ledger reason/);
-  });
-
-  test("user_id number 非正整数 → TypeError", async () => {
-    await assert.rejects(() => debit(0, 10n, "chat"), TypeError);
-    await assert.rejects(() => debit(-1, 10n, "chat"), TypeError);
-    await assert.rejects(() => debit(1.5, 10n, "chat"), TypeError);
-  });
-
-  test("user_id string 非十进制 → TypeError", async () => {
-    await assert.rejects(() => debit("abc", 10n, "chat"), /decimal digits/);
-    await assert.rejects(() => debit("12x", 10n, "chat"), TypeError);
-  });
-});
-
+// 旧 debit/credit/getBalance 已删除(生产扣费收口 billing/spend.ts spendTwoBucket),
+// 对应入参校验用例随之移除;user_id 归一化校验由 adminAdjust 路径继续覆盖。
 describe("adminAdjust input validation", () => {
   test("delta = 0 → TypeError", async () => {
     await assert.rejects(
@@ -91,5 +63,16 @@ describe("adminAdjust input validation", () => {
   test("memo 空 / 仅空白 → TypeError", async () => {
     await assert.rejects(() => adminAdjust(1, 10n, "", 2), /memo is required/);
     await assert.rejects(() => adminAdjust(1, 10n, "   ", 2), /memo is required/);
+  });
+
+  test("user_id number 非正整数 → TypeError", async () => {
+    await assert.rejects(() => adminAdjust(0, 10n, "memo", 2), TypeError);
+    await assert.rejects(() => adminAdjust(-1, 10n, "memo", 2), TypeError);
+    await assert.rejects(() => adminAdjust(1.5, 10n, "memo", 2), TypeError);
+  });
+
+  test("user_id string 非十进制 → TypeError", async () => {
+    await assert.rejects(() => adminAdjust("abc", 10n, "memo", 2), /decimal digits/);
+    await assert.rejects(() => adminAdjust("12x", 10n, "memo", 2), TypeError);
   });
 });

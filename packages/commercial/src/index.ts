@@ -56,10 +56,8 @@ import {
 } from "./account-pool/scheduler.js";
 import { AccountHealthTracker, wrapIoredisForHealth } from "./account-pool/health.js";
 import { tx } from "./db/queries.js";
-import { createAgentWsHandler, type AgentWsHandler } from "./ws/agent.js";
 import {
   startLifecycleScheduler,
-  checkAgentAccess,
   type LifecycleScheduler,
   type LifecycleLogger,
 } from "./agent/index.js";
@@ -1983,20 +1981,7 @@ export async function registerCommercial(
     externalApiKeyProxy,
   });
 
-  // T-52 /ws/agent:仅在 agent runtime 就绪时启用。
-  // 校验:token 合法 + checkAgentAccess 返 ok(active 订阅 + container 可连接)。
-  let agentWsHandler: AgentWsHandler | undefined;
-  if (agentRuntime) {
-    const rpcDir = cfg.AGENT_RPC_SOCKET_DIR!;
-    agentWsHandler = createAgentWsHandler({
-      jwtSecret,
-      pool: getPool(),
-      resolveSocketPath: (uid) =>
-        path.join(rpcDir, `u${uid.toString()}`, "agent.sock"),
-      // 连接前 DB 校验:订阅 + 容器。失败 → 发 error 帧 + close,不建 socket。
-      preCheck: async (uid) => await checkAgentAccess(uid as bigint | number),
-    });
-  }
+  // legacy /ws/agent(T-52 老 agent runtime WS 入口)已删除;v5 一律走 /ws/user-chat-bridge。
 
   // V3 Phase 2 Task 2H + Phase 3D:用户 WS ↔ 容器 WS 桥接(/ws/user-chat-bridge)。
   //
@@ -2550,10 +2535,9 @@ export async function registerCommercial(
     handle: handler,
     runtimeStatus,
     handleWsUpgrade: (req, socket, head) => {
-      // V3: 优先匹配 voice input,再 /ws/user-chat-bridge(2E),其次 /ws/agent(legacy)。
+      // V3: 优先匹配 voice input,再 /ws/user-chat-bridge(2E)。legacy /ws/agent 已删除。
       if (voiceTranscribeHandler.handleUpgrade(req, socket, head)) return true;
       if (userChatBridge.handleUpgrade(req, socket, head)) return true;
-      if (agentWsHandler && agentWsHandler.handleUpgrade(req, socket, head)) return true;
       return false;
     },
     shutdown: async () => {
@@ -2566,9 +2550,6 @@ export async function registerCommercial(
       }
       try { await voiceTranscribeHandler.shutdown(); } catch { /* ignore */ }
       try { await userChatBridge.shutdown(); } catch { /* ignore */ }
-      if (agentWsHandler) {
-        try { await agentWsHandler.shutdown(); } catch { /* ignore */ }
-      }
       if (lifecycleScheduler) {
         try { await lifecycleScheduler.stop(); } catch { /* ignore */ }
       }
@@ -2747,10 +2728,7 @@ export type { ModelPricing, PublicModel } from "./billing/pricing.js";
 export { computeCost } from "./billing/calculator.js";
 export type { TokenUsage, PriceSnapshot, CostResult } from "./billing/calculator.js";
 export {
-  debit,
-  credit,
   adminAdjust,
-  getBalance,
   listLedger,
   InsufficientCreditsError,
   LEDGER_REASONS,
@@ -2907,7 +2885,8 @@ export type {
 // V3 Phase 2: T-40/T-40b/T-41 v2 chat orchestrator(chat/orchestrator.ts、chat/debit.ts、
 // ws/chat.ts、http/chat.ts)已删除 — v3 chat 不再走 commercial 进程出口,改由用户的
 // docker 容器跑个人版 → 经 anthropicProxy(2D 待加)统一访问上游。
-// 仍然保留 ws/connections.ts(legacy /ws/agent 用)。
+// ws/connections.ts 保留:ConnectionRegistry 仍是 /ws/user-chat-bridge 的连接注册表
+// (legacy /ws/agent 入口已删除)。
 export {
   ConnectionRegistry,
   DEFAULT_MAX_PER_USER,
