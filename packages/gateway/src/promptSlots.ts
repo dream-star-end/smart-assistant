@@ -222,6 +222,23 @@ export async function buildAgentsSlot(ctx: PromptSlotContext): Promise<PromptSlo
         '传 `image_file="绝对路径"`(从上传提示里取该图的本地路径),再基于工具返回的图片描述回答。',
     )
   }
+  // M1a 复活(P1f 删):GPT/Codex 路径的 understand_image 提示段。CodexAdapter
+  // 构造内核时强制 provider='codex-native'(engine 路由后任意 agent 都可能落
+  // codex 底座),model 前缀判定保留作 belt-and-braces。
+  if (
+    hasUnderstandImageTool &&
+    (provider === 'codex-native' ||
+      provider === 'codex' ||
+      ctx.model?.startsWith('gpt-') ||
+      ctx.model?.startsWith('codex-'))
+  ) {
+    lines.push('')
+    lines.push('## GPT/Codex 图片理解提示')
+    lines.push('')
+    lines.push(
+      '用户消息中出现本地图片路径时,先调用 `understand_image` MCP 工具,传 `image_file="绝对路径"`,再基于工具返回的图片内容回答。不要声称用户没有上传图片。',
+    )
+  }
 
   return { name: 'AGENTS', content: lines.join('\n') }
 }
@@ -873,20 +890,27 @@ export async function buildPromptContext(ctx: PromptSlotContext): Promise<Prompt
   //     (verifyContainerIdentity 双因子,见 commercial/src/literatureProxy.ts:373)
   //   - codex 子进程 spawn env 由 buildCodexEnv() 构造,显式 scrub 所有
   //     `OPENCLAUDE_*` / `ANTHROPIC_*` / `CLAUDE_CODE_*` 前缀的 env(见
-  //     codexRunner.ts:209 `ENV_SCRUB_PREFIXES`)。container token 因此对 codex
-  //     不可见,即使 prompt 告诉它走这个接口,调用也必然 401。
+  //     engine/codexShared.ts `ENV_SCRUB_PREFIXES`)。container token 因此对
+  //     codex 不可见,即使 prompt 告诉它走这个接口,调用也必然 401。
   //   - 让 codex 看到一个"会用,但调不通"的 endpoint 反而浪费 turn + 误导用户;
   //     直接不渲染该 slot,codex 会 fallback 到自身能力(web search 等)。
   //   - 这条 scrub 设计本身合理(防 codex 横向移动 OpenClaude 凭证),不应为
   //     literature 单个功能开洞。如未来要让 codex 也用 literature,需独立设计
   //     "codex 可用且与 OpenClaude 凭证隔离"的鉴权通道,与本 skip 正交。
-  if (remotePlatformSlots === null) {
-    const literature = await buildLiteratureSkillSlot()
-    if (literature) slots.push(literature)
-  } else {
-    const literature = remotePlatformSlots.find((s) => s.name === 'SKILLS_LITERATURE')
-    if (literature) {
-      slots.push({ name: 'SKILLS_LITERATURE', content: literature.content })
+  // M1a 复活(P1f 删):**安全 gate,必须在** —— codex 路径不注入 SKILLS_LITERATURE。
+  // CodexAdapter 构造内核时强制 provider='codex-native'(engine 由 registry 按
+  // 模型判定后,任意 provider 的 agent 都可能落到 codex 底座),保证本 gate 对
+  // codex 恒命中;与 codexShared.buildCodexEnv 的 env scrub 成对(一个断凭证
+  // env,一个断"会用但调不通"的提示注入),任何一侧松动都要过安全评审。
+  if (ctx.provider !== 'codex-native') {
+    if (remotePlatformSlots === null) {
+      const literature = await buildLiteratureSkillSlot()
+      if (literature) slots.push(literature)
+    } else {
+      const literature = remotePlatformSlots.find((s) => s.name === 'SKILLS_LITERATURE')
+      if (literature) {
+        slots.push({ name: 'SKILLS_LITERATURE', content: literature.content })
+      }
     }
   }
 

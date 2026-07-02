@@ -1,12 +1,14 @@
 /**
- * Engine registry fail-closed 测试(M0)。
+ * Engine registry fail-closed 测试(M0 → M1a 更新)。
  *
- * 锁两层语义:
- *   1. resolveEngine 单一权威:codex-native provider → 'codex'(runnerKind 仅接受
- *      缺省/'app-server','exec'/未知 fail-closed);其余 → 'ccb'(M0 model 映射为空)。
- *   2. createEngine 对未注册 engine fail-closed 抛错 —— 原 v5 channel 硬闸
- *      (sessionManager.ts:1266 禁 codex-native)的语义升级形态。M0 codex 未注册,
- *      codex-native agent 在 getOrCreate 必须抛错,不得静默落到 CCB 底座。
+ * 锁三层语义:
+ *   1. resolveEngine 单一权威:MODEL_ENGINE_MAP('gpt-5.5' → 'codex',M1a 登记)
+ *      + codex-native provider 显式 pin(runnerKind 仅接受缺省/'app-server',
+ *      'exec'/未知 fail-closed);其余 → 'ccb'。
+ *   2. createEngine 对未注册 engine fail-closed 抛错(用假 engine id 锁语义 ——
+ *      M1a 起 'codex' 已注册)。
+ *   3. getOrCreate:codex-native / gpt-5.5 → 'codex' adapter;runnerKind 'exec'
+ *      仍 fail-closed。
  *
  * Run: npx tsx --test packages/gateway/src/__tests__/engineRegistry.test.ts
  */
@@ -20,8 +22,9 @@ import {
   resolveEngine,
   type EngineCreateOpts,
 } from "../engine/registry.js";
-// side-effect:注册 'ccb' factory(与 sessionManager 的注册路径一致)。
+// side-effect:注册 'ccb' / 'codex' factory(与 sessionManager 的注册路径一致)。
 import "../engine/ccbAdapter.js";
+import "../engine/codexAdapter.js";
 import { SessionManager } from "../sessionManager.js";
 import type { OpenClaudeConfig, AgentDef } from "@openclaude/storage";
 
@@ -45,12 +48,20 @@ function minimalCreateOpts(): EngineCreateOpts {
 }
 
 describe("resolveEngine", () => {
-  test("默认/普通模型 → 'ccb'(M0 model 映射为空)", () => {
+  test("默认/普通模型 → 'ccb'", () => {
     assert.equal(resolveEngine(undefined, { id: "main" }), "ccb");
     assert.equal(resolveEngine("glm-5.2", { id: "main" }), "ccb");
     assert.equal(
       resolveEngine("deepseek-v4-pro", { id: "x", provider: "deepseek" }),
       "ccb",
+    );
+  });
+
+  test("M1a:MODEL_ENGINE_MAP 'gpt-5.5' → 'codex'(任意 agent,无需 provider pin)", () => {
+    assert.equal(resolveEngine("gpt-5.5", { id: "main" }), "codex");
+    assert.equal(
+      resolveEngine("gpt-5.5", { id: "coder", provider: "claude-subscription" }),
+      "codex",
     );
   });
 
@@ -97,22 +108,62 @@ describe("createEngine fail-closed", () => {
     assert.equal(adapter.capabilities.resumeKind, "ccb-session");
   });
 
-  test("未注册 engine('codex' @ M0)→ 抛错", () => {
-    assert.throws(() => createEngine("codex", minimalCreateOpts()), /fail-closed/);
+  test("M1a:'codex' 已注册,factory 返回 engineId='codex' 的 adapter", () => {
+    assert.ok(registeredEngines().includes("codex"));
+    const adapter = createEngine("codex", minimalCreateOpts());
+    assert.equal(adapter.engineId, "codex");
+    assert.equal(adapter.capabilities.billingMode, "engine-reported");
+    assert.equal(adapter.capabilities.resumeKind, "codex-thread");
+    assert.equal(adapter.capabilities.needsServerRequestId, true);
+  });
+
+  test("未注册 engine → 抛错(fail-closed 语义,假 engine id 锁死)", () => {
+    assert.throws(() => createEngine("no-such-engine", minimalCreateOpts()), /fail-closed/);
   });
 });
 
-describe("getOrCreate registry fail-closed(旧 v5 硬闸语义升级)", () => {
-  test("codex-native agent → getOrCreate 抛错,不静默落 CCB", async () => {
+describe("getOrCreate engine 路由(M1a)", () => {
+  test("codex-native agent → 'codex' adapter session(旧硬闸解除)", async () => {
+    const sm = new SessionManager(makeConfigStub());
+    const session = await sm.getOrCreate({
+      sessionKey: "agent:codex:webchat:dm:gate-peer",
+      agent: { id: "codex", provider: "codex-native", model: "gpt-5.5" } as AgentDef,
+      channel: "webchat",
+      peerId: "gate-peer",
+    });
+    assert.equal(session.runner.engineId, "codex");
+    assert.equal(session.providerTag, "codex");
+  });
+
+  test("普通 agent + inbound model gpt-5.5 → 'codex' adapter session", async () => {
+    const sm = new SessionManager(makeConfigStub());
+    const session = await sm.getOrCreate({
+      sessionKey: "agent:main:webchat:dm:gate-peer-gpt",
+      agent: { id: "main", model: "glm-5.2" } as AgentDef,
+      channel: "webchat",
+      peerId: "gate-peer-gpt",
+      model: "gpt-5.5",
+    });
+    assert.equal(session.runner.engineId, "codex");
+    assert.equal(session.providerTag, "codex");
+    assert.equal(session.model, "gpt-5.5");
+  });
+
+  test("codex-native + runnerKind 'exec' → getOrCreate 仍 fail-closed 抛错", async () => {
     const sm = new SessionManager(makeConfigStub());
     await assert.rejects(
       sm.getOrCreate({
-        sessionKey: "agent:codex:webchat:dm:gate-peer",
-        agent: { id: "codex", provider: "codex-native", model: "gpt-5.5" } as AgentDef,
+        sessionKey: "agent:codex:webchat:dm:gate-peer-exec",
+        agent: {
+          id: "codex",
+          provider: "codex-native",
+          model: "gpt-5.5",
+          runnerKind: "exec",
+        } as AgentDef,
         channel: "webchat",
-        peerId: "gate-peer",
+        peerId: "gate-peer-exec",
       }),
-      /no adapter registered for engine 'codex'/,
+      /fail-closed/,
     );
   });
 

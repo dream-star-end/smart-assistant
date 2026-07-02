@@ -1,7 +1,12 @@
 import * as assert from 'node:assert/strict'
 /**
  * Tests for inferAgentForModel — pure routing decision for model→agent
- * fan-out in v5 commercial (ccb-only: gpt-* rejected fail-closed).
+ * fan-out in v5 commercial.
+ *
+ * M1a(codex 复活):gpt-5.5 不再 fail-closed 拒绝,也不再路由到固定 id='codex'
+ * 专属 agent —— engine 由 engine/registry.ts 按 model 判定(getOrCreate 收口),
+ * 任意 agent 都能以 gpt-5.5 跑 codex 底座。本 helper 对 gpt-* 与 claude/deepseek
+ * 等已知家族同规则:requested 存在则用之,否则回落 default。
  *
  * Run: npx tsx --test packages/gateway/src/__tests__/inferAgentForModel.test.ts
  */
@@ -35,29 +40,47 @@ describe('inferAgentForModel — pass-through cases', () => {
   })
 })
 
-describe('inferAgentForModel — gpt model rejection (v5 ccb-only)', () => {
-  it('rejects any gpt-* model with gpt_unsupported error', () => {
+describe('inferAgentForModel — gpt model routing (M1a engine registry)', () => {
+  it('keeps requested agent for gpt-5.5 (engine 由 registry 判定,不换 agent)', () => {
     const r = inferAgentForModel({
       model: 'gpt-5.5',
       requestedAgentId: 'main',
       defaultAgentId: 'main',
       agents: fullAgents,
     })
-    assert.equal('error' in r, true)
-    if (!('error' in r)) return
-    assert.equal(r.error, 'gpt_unsupported')
+    assert.deepEqual(r, { agentId: 'main' })
   })
 
-  it('rejects gpt-* regardless of requested agent', () => {
+  it('keeps explicit non-default agent for gpt-*', () => {
     const r = inferAgentForModel({
       model: 'gpt-5-codex',
       requestedAgentId: 'coder',
       defaultAgentId: 'main',
       agents: fullAgents,
     })
+    assert.deepEqual(r, { agentId: 'coder' })
+  })
+
+  it('falls back to default agent for unknown requested agent + gpt-*', () => {
+    const r = inferAgentForModel({
+      model: 'gpt-5.5',
+      requestedAgentId: 'no-such-agent',
+      defaultAgentId: 'main',
+      agents: fullAgents,
+    })
+    assert.deepEqual(r, { agentId: 'main' })
+  })
+
+  it('no_compatible_agent when gpt-* has no agent configured at all', () => {
+    const r = inferAgentForModel({
+      model: 'gpt-5.5',
+      requestedAgentId: 'main',
+      defaultAgentId: 'main',
+      agents: [],
+    })
     assert.equal('error' in r, true)
     if (!('error' in r)) return
-    assert.equal(r.error, 'gpt_unsupported')
+    assert.equal(r.error, 'no_compatible_agent')
   })
 })
 

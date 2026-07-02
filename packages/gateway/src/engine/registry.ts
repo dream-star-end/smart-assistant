@@ -38,10 +38,14 @@ export function registeredEngines(): string[] {
 }
 
 /**
- * model → engine 映射(单一权威)。M0 为空 —— 所有非 codex-native agent 落 'ccb'。
- * M1 在此登记 gpt-* → 'codex'(与 /api/public/models 可见性、DB 定价同批接线)。
+ * model → engine 映射(单一权威)。M1a 起登记 gpt-5.5 → 'codex'(app-server 形态,
+ * factory 由 engine/codexAdapter.ts 注册)。入站帧的模型合法性仍由
+ * ALLOWED_INBOUND_MODELS / resolveExecutionModel 收口(server.ts),本表只回答
+ * "合法模型跑哪个底座";新增 codex 系模型在此登记即可,不散点 if/else。
  */
-const MODEL_ENGINE_MAP: Record<string, string> = {}
+const MODEL_ENGINE_MAP: Record<string, string> = {
+  'gpt-5.5': 'codex',
+}
 
 /**
  * 判定该 agent/model 应由哪个 engine 执行。只判定 id,不校验注册表 ——

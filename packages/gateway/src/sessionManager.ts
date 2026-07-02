@@ -13,10 +13,13 @@ import {
 } from '@openclaude/storage'
 // M0 engine 适配层:CCB 私有件(parser/telemetry/auth 分类)已下沉 CcbAdapter,
 // 本文件只消费 engine 中立契约(EngineAdapter / EngineEvent / TurnSummary /
-// PartialSnapshot)。ccbAdapter 的 import 兼有 registry 注册副作用('ccb' factory)。
+// PartialSnapshot)。ccbAdapter / codexAdapter 的 import 兼有 registry 注册副作用
+// ('ccb' / 'codex' factory)。
 import './engine/ccbAdapter.js'
+import './engine/codexAdapter.js'
 import type { EngineAdapter } from './engine/engineAdapter.js'
 import type {
+  EngineBillingEvent,
   EngineEvent,
   SessionStreamEvent,
   TurnSummary,
@@ -235,12 +238,14 @@ export const IDLE_TIMEOUT_DEFAULT_MS = 5 * 60_000
 export function pickIdleTimeoutMs(
   currentTurnStatus: 'compacting' | null | undefined,
   pendingToolCalls: number,
-  providerTag?: string,
+  /** M1a:providerTag 泛化为 engine id('ccb' | 'codex')。codex 判定从旧
+   *  'codex-native'(provider 语义)改为 'codex'(engine 语义),真值表不变。 */
+  engineId?: string,
 ): number {
   if (
     pendingToolCalls > 0 ||
     currentTurnStatus === 'compacting' ||
-    providerTag === 'codex-native'
+    engineId === 'codex'
   ) {
     return IDLE_TIMEOUT_TOOL_MS
   }
@@ -329,9 +334,11 @@ export interface AgentSession {
    */
   executionTarget: ExecutionTarget
   /**
-   * Phase 5 G.0:`SessionManager.providerTag(agent.provider)` 的固化结果
-   *  ('ccb' / 'codex-native')。recyclePeerForRepoChange 用它判断是否走
-   *  "codex per-turn 也要清线程态" 分支(避免 instanceof,见 Plan v3 G.0)。
+   * Phase 5 G.0 → M1a 泛化:本 session 的 **engine id**('ccb' / 'codex',
+   * = getOrCreate 时 resolveEngine 的固化结果;字段名保留 providerTag 以免
+   * 引用面扩散)。resume-map 按此维度隔离(防 codex thread_id 与 CCB
+   * session_id 互喂),recyclePeerForRepoChange / pickIdleTimeoutMs 用它走
+   * codex 专属分支(避免 instanceof,见 Plan v3 G.0)。
    */
   providerTag: string
   /**
@@ -762,7 +769,7 @@ export class SessionManager {
     //   到旧 repo 对应的 thread,污染 LLM 上下文(Plan v3 Codex Round 3 BLOCKER)。
     //   CCB(SubprocessRunner)是 long-running:!isRunning ⇒ 进程已死,
     //   下次 submit() 会读最新 snapshot 起一个新 spawn,无需重置任何 in-memory 状态。
-    const isCodex = session.providerTag === 'codex-native'
+    const isCodex = session.providerTag === 'codex'
     if (!session.runner.isRunning && !isCodex) {
       return // 没活进程且非 codex,下次 submit 会自然读最新 snapshot
     }
@@ -970,7 +977,7 @@ export class SessionManager {
   private _resumeIdFor(sessionKey: string, wantProvider: string): string | undefined {
     const id = this._resumeMap.get(sessionKey)
     if (!id) return undefined
-    const tag = this._resumeMapProvider.get(sessionKey) ?? SessionManager.CCB_PROVIDER_TAG
+    const tag = SessionManager.normalizeEngineTag(this._resumeMapProvider.get(sessionKey))
     if (tag !== wantProvider) return undefined
     if (tag === SessionManager.CCB_PROVIDER_TAG && !this._ccbJsonlExists(id)) {
       log.warn('resume-map entry points to missing JSONL — dropping silently', {
@@ -1032,14 +1039,16 @@ export class SessionManager {
   private _lastCostFor(sessionKey: string, wantProvider: string): number | undefined {
     const cost = this._resumeMapLastCost.get(sessionKey)
     if (cost === undefined) return undefined
-    const tag = this._resumeMapProvider.get(sessionKey) ?? SessionManager.CCB_PROVIDER_TAG
+    const tag = SessionManager.normalizeEngineTag(this._resumeMapProvider.get(sessionKey))
     return tag === wantProvider ? cost : undefined
   }
 
-  /** Normalised provider tag for a runner: ccb-family providers collapse to
-   *  'ccb', codex-native stays distinct. Extend here when new providers land. */
-  private static providerTag(agentProvider: string | undefined): string {
-    if (agentProvider === 'codex-native') return 'codex-native'
+  /** M1a:resume-map provider tag 的历史值归一。旧格式在 P1f 前写过
+   *  'codex-native'(provider 语义);engine 维度泛化后统一为 engine id
+   *  'codex',其余(含缺省)一律 'ccb'。加载与比较都过这一个函数,
+   *  防新旧 tag 混用导致 resume 条目被误判跨底座。 */
+  private static normalizeEngineTag(tag: string | undefined): string {
+    if (tag === 'codex-native' || tag === 'codex') return 'codex'
     return SessionManager.CCB_PROVIDER_TAG
   }
 
@@ -1080,9 +1089,12 @@ export class SessionManager {
               this._resumeMapLastCost.set(key, lastCost)
             }
             const prov = (val as any).provider
+            // M1a:tag 归一为 engine id(历史 'codex-native' → 'codex')。
             this._resumeMapProvider.set(
               key,
-              typeof prov === 'string' && prov ? prov : SessionManager.CCB_PROVIDER_TAG,
+              SessionManager.normalizeEngineTag(
+                typeof prov === 'string' && prov ? prov : undefined,
+              ),
             )
           }
         }
@@ -1169,6 +1181,16 @@ export class SessionManager {
     channel?: string
     peerId?: string
     /**
+     * M1a 跨 engine 切模型:入站帧的 desired model(server.ts dispatchInbound
+     * 传 safeModel;已过 ALLOWED_INBOUND_MODELS 白名单)。参与 engine 判定 ——
+     * 同一 sessionKey 上 glm-5.2 ↔ gpt-5.5 切换会在这里被 resolveEngine 判出
+     * engine 变化,走 provider-switch teardown + compact transcript preamble
+     * 路径。缺省(cron / pre-warm / hello 等无模型语境)时**不参与比较**,
+     * 沿用现存 session 的 engine,防止无模型调用把用户刚切换的 engine 踢回
+     * agent 默认。新建 session 时缺省回落 agent.model。
+     */
+    model?: string
+    /**
      * Authenticated userId owning the client_sessions row. When provided,
      * stored on the resulting AgentSession so the durable server-authored-
      * append path can bypass the `getClientSession` short-circuit on
@@ -1218,19 +1240,37 @@ export class SessionManager {
     const initialEffort: string | undefined =
       opts.effortLevel === null ? undefined : opts.effortLevel
 
-    const providerTag = SessionManager.providerTag(opts.agent.provider)
+    // ── M1a engine 判定(取代 providerTag 二值假设)────────────────────────
+    // 统一执行模型准入 + engine 解析都在这里一次收口:
+    //   - resolveExecutionModel:agent.model / 入站 model 可能是已下线模型,
+    //     收敛到白名单内(白名单只拦入站帧、agent.model 绕过的教训)。
+    //   - resolveEngine:model→engine 映射 + agentDef.provider 显式 pin 的单一
+    //     权威(gpt-5.5 → 'codex';codex-native pin 仅接受 app-server 形态)。
+    const executionModel = resolveExecutionModel(
+      opts.model ?? opts.agent.model,
+      this.config.defaults.model,
+    )
+    const engineId = resolveEngine(executionModel, opts.agent)
     const existing = this.sessions.get(opts.sessionKey)
     if (existing) {
-      if (existing.providerTag !== providerTag) {
-        // Same logical client session, but the agent was switched between
-        // Claude Code and Codex. Native resume ids are provider-specific, so
-        // tear down the old runner and let the fresh one receive a compact
-        // transcript preamble on its first submit().
+      // 跨 engine 切换判定:只有"caller 明确给了 model"或"agent 显式 pin 到
+      // codex-native"时 engine 判定才是权威;无模型调用沿用现存 engine(见
+      // opts.model JSDoc)。
+      const desiredEngine =
+        opts.model !== undefined || opts.agent.provider === 'codex-native'
+          ? engineId
+          : existing.providerTag
+      if (existing.providerTag !== desiredEngine) {
+        // Same logical client session, but the desired engine changed (model
+        // switch across engines, or agent switched between CCB and Codex).
+        // Native resume ids are engine-specific, so tear down the old runner
+        // and let the fresh one receive a compact transcript preamble on its
+        // first submit().
         try {
           await existing.lock
           await existing.runner.shutdown()
         } catch (err) {
-          log.warn('provider-switch shutdown failed', { sessionKey: opts.sessionKey }, err)
+          log.warn('engine-switch shutdown failed', { sessionKey: opts.sessionKey }, err)
         }
         this.sessions.delete(opts.sessionKey)
       } else {
@@ -1249,16 +1289,11 @@ export class SessionManager {
     const cwd = opts.agent.cwd ?? process.cwd()
     const persona = opts.agent.persona ?? paths.agentClaudeMd(opts.agent.id)
     const repoSessionId = opts.repoSessionId ?? opts.peerId
-    // 统一执行模型准入:agent.model(marketplace/seed/delegate)可能是已下线模型(如
-    // stale claude-*),这里收敛到白名单内,否则会以不可路由的 --model spawn。
-    const executionModel = resolveExecutionModel(opts.agent.model, this.config.defaults.model)
-    // M0 engine 适配层:runner 构造收口到 registry factory。
-    //   - resolveEngine 是 model→engine + provider pin 的单一权威(codex-native →
-    //     'codex',其中 runnerKind 仅接受缺省/'app-server','exec'/未知 fail-closed)。
-    //   - createEngine 对未注册 engine fail-closed 抛错 —— 原 v5 channel 硬闸
-    //     (禁 codex-native)的语义升级形态:M0 codex 未注册,codex-native agent
-    //     在任何 channel 都走不到底座构造,v5 行为等价旧硬闸且覆盖面更严。
-    const engineId = resolveEngine(executionModel, opts.agent)
+    // M0/M1a engine 适配层:runner 构造收口到 registry factory。
+    //   - executionModel / engineId 已在函数头部一次收口(见上方注释)——
+    //     teardown 判定与构造用同一份解析结果,不会出现"比较用 A、spawn 用 B"。
+    //   - createEngine 对未注册 engine fail-closed 抛错(原 v5 channel 硬闸的
+    //     语义升级形态:任何 channel 都不会把未注册 engine 静默落到 CCB)。
     const runner = createEngine(engineId, {
       sessionKey: opts.sessionKey,
       agentId: opts.agent.id,
@@ -1271,10 +1306,11 @@ export class SessionManager {
       agentMcpServers: opts.agent.mcpServers,
       agentToolsets: opts.agent.toolsets ?? this.config.defaults.toolsets,
       delegationDepth: opts.delegationDepth,
-      // Symmetrically: only resume CCB from a CCB-tagged id.
-      // _resumeIdFor also drops the entry silently when the CCB JSONL
+      // Symmetrically: only resume from an id produced by the SAME engine
+      // (resume-map 按 engine 维度隔离,防 codex thread_id 与 CCB session_id
+      // 互喂)。_resumeIdFor also drops the entry silently when the CCB JSONL
       // was wiped (pre-2026-04-22 v3 containers' tmpfs was ephemeral).
-      resumeSessionId: this._resumeIdFor(opts.sessionKey, providerTag),
+      resumeSessionId: this._resumeIdFor(opts.sessionKey, engineId),
       effortLevel: initialEffort,
       // Phase 5:repoSessionId 默认等于 peerId;delegate_task 可传父 webchat
       // session id 作为 repo lookup key,但不改变 delegate 自己的 peerId。
@@ -1313,20 +1349,21 @@ export class SessionManager {
       // NOTE: token counts are NOT persisted across gateway restarts — they
       // will start at 0 after a resume. This is a known limitation; fixing it
       // requires persisting per-token totals which we do not currently do.
-      totalCostUSD: this._lastCostFor(opts.sessionKey, providerTag) ?? 0,
+      totalCostUSD: this._lastCostFor(opts.sessionKey, engineId) ?? 0,
       totalInputTokens: 0,
       totalOutputTokens: 0,
       totalCacheReadTokens: 0,
       totalCacheCreationTokens: 0,
       turns: 0,
-      _lastCcbCumulativeCost: this._lastCostFor(opts.sessionKey, providerTag) ?? 0,
+      _lastCcbCumulativeCost: this._lastCostFor(opts.sessionKey, engineId) ?? 0,
       // 与 runner 同一份白名单收敛结果(见上方 executionModel 注释)。
       model: executionModel,
       toolUseIdToName: new Map(),
       executionTarget: { kind: 'local' },
-      // Phase 5 G.0:固化 provider 路由信息,recyclePeerForRepoChange 用 providerTag
+      // Phase 5 G.0 → M1a:固化 engine 路由信息(字段名保留 providerTag),
+      //   recyclePeerForRepoChange / pickIdleTimeoutMs 用它
       //   走 codex 专属重置分支(避免 instanceof / runner.constructor.name)。
-      providerTag,
+      providerTag: engineId,
       agentProvider: opts.agent.provider,
     }
     runner.on('session_id', (id: string) => {
@@ -1334,7 +1371,7 @@ export class SessionManager {
       // Remember which provider produced this id — the next getOrCreate on
       // this sessionKey (possibly after a gateway restart switching providers)
       // uses the tag to decide whether to pass the id through as --resume.
-      this._resumeMapProvider.set(opts.sessionKey, providerTag)
+      this._resumeMapProvider.set(opts.sessionKey, engineId)
       // Persist session→ccbSessionId mapping for resume after gateway restart
       this._saveResumeMap()
     })
@@ -2018,6 +2055,17 @@ export class SessionManager {
       // 靠 `!detached` guard(listener 跨 turn 保留),现 listener 在 detach 卸载,
       // guard 留作 belt-and-braces(卸载与 emit 同 tick 竞争时不重臂已清的 timer)。
       const handleActivity = () => { if (!detached) timer.refresh() }
+      // M1a — engine-reported 计费侧信道(codex)。adapter 在 turn 终态 result
+      // 帧上 emit 'billing'(先于 parser 产出 'final',顺序与 P1f 前一致);这里
+      // 包装成 SessionStreamEvent 'codex_billing' 直通 onEvent → server.ts 发
+      // outbound.codex_billing 帧给 master 做真扣费 settle(M2)。
+      //   - 直调 onEvent 而非 handleEngineEvent:billing 帧不计 turnBlockCount /
+      //     turnPermissionCount,phantom 判定不把 billing 当"输出"(旧语义)。
+      //   - `!detached` guard:turn 已 idle/error 收尾后不再补发,防二次 settle。
+      //   - CCB(billingMode:'proxy')永不 emit 'billing',本 listener 是 no-op。
+      const handleBilling = (b: EngineBillingEvent) => {
+        if (!detached) onEvent({ kind: 'codex_billing', ...b })
+      }
       // Per-turn parse_error listener (previously only installed at runner
       // construction). Must be detached with the rest to avoid per-turn
       // listener accumulation (R9).
@@ -2046,6 +2094,7 @@ export class SessionManager {
         // 路由,旧闭包链届时被 GC。telemetry 的 per-turn 作用域由 adapter 在
         // turn 终态时清(旧 runner.off('telemetry') 的对位物)。
         runner.off('activity', handleActivity)
+        runner.off('billing', handleBilling)
         runner.off('error', handleError)
         runner.off('exit', handleExit)
         runner.off('parse_error', handleParseError)
@@ -2517,6 +2566,7 @@ export class SessionManager {
       }
 
       runner.on('activity', handleActivity)
+      runner.on('billing', handleBilling)
       runner.on('error', handleError)
       runner.on('exit', handleExit)
       runner.on('parse_error', handleParseError)

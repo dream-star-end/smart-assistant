@@ -29,6 +29,7 @@ import { TelemetryChannel, type OcTelemetryEvent } from '../telemetryChannel.js'
 import type {
   EngineAdapter,
   EngineCapabilities,
+  EngineSessionTotals,
   EngineTurnRun,
   TurnParams,
 } from './engineAdapter.js'
@@ -68,6 +69,29 @@ export function classifyCcbErrorKind(result: {
     AUTH_ERROR_PREFIX_RE.test(result.assistantText)
   if (isAuth) return 'auth'
   return result.isError ? 'other' : undefined
+}
+
+/**
+ * CCB 兼容子契约(M0 Codex 评审 nit①):在 engine 中立的 EngineSessionTotals 之上
+ * 追加 CCB 私有的成本 delta 基线字段。`_lastCcbCumulativeCost` 是"CCB 进程累计
+ * cost 的上一次取值"(per-turn delta = cumulative − baseline),属底座私有知识,
+ * 不进 TurnParams 公开契约 —— CodexAdapter 等新底座不被迫实现它。
+ */
+export interface CcbSessionTotals extends EngineSessionTotals {
+  _lastCcbCumulativeCost: number
+}
+
+/**
+ * 把 engine 中立 totals 收窄为 CCB 兼容形态(CcbMessageParser 需要 delta 基线
+ * 字段)。AgentSession 恒带该字段(初始化于 getOrCreate);裸 EngineSessionTotals
+ * (理论上的新 caller / 测试 stub)就地补 0 —— 与 fresh session 的种子值一致,
+ * parser 的 `cumulative < baseline` 回退逻辑保证首个 result 语义正确。
+ * 就地 mutate(非拷贝):单一权威必须仍是传入的引用本身。
+ */
+export function asCcbSessionTotals(totals: EngineSessionTotals): CcbSessionTotals {
+  const t = totals as EngineSessionTotals & { _lastCcbCumulativeCost?: number }
+  if (typeof t._lastCcbCumulativeCost !== 'number') t._lastCcbCumulativeCost = 0
+  return t as CcbSessionTotals
 }
 
 /** per-turn 上下文(旧 _runOneTurn 里 parser + telemetry 闭包的对位物)。 */
@@ -224,8 +248,8 @@ export class CcbAdapter extends EventEmitter implements EngineAdapter {
         resolveSummary(result ? buildTurnSummary(result, telemetry) : null)
       },
       // CCB 成本 delta 基线:parser 直接 mutate session 引用,行为逐字节不变
-      // (见 TurnParams.sessionTotals 注释)。
-      sessionTotals: params.sessionTotals,
+      // (见 TurnParams.sessionTotals / CcbSessionTotals 注释)。
+      sessionTotals: asCcbSessionTotals(params.sessionTotals),
     })
     const ctx: CcbTurnContext = { parser, telemetry }
     this._routeTurn = ctx

@@ -37,6 +37,18 @@ export interface EngineCapabilities {
   needsServerRequestId: boolean
 }
 
+/**
+ * Session 级跨 turn 累计的 engine 中立契约(M0 Codex 评审 nit①)。
+ * `_lastCcbCumulativeCost` 之类的底座私有 delta 基线字段**不在**本契约里 ——
+ * CCB 兼容子契约(CcbSessionTotals,含该字段)收在 engine/ccbAdapter.ts,
+ * 新底座不被迫认识 CCB 私有字段。adapter 可 mutate 此引用(totalCostUSD +=
+ * delta / turns += 1),单一权威仍是 AgentSession 对象。
+ */
+export interface EngineSessionTotals {
+  totalCostUSD: number
+  turns: number
+}
+
 /** 一次 turn 的入参。spec 契约字段之外,M0 为保 CCB 成本 delta 基线逐字节不变,
  *  额外携带 sessionTotals ref / toolUseIdToName(spec 明示允许 totals ref 方案)。 */
 export interface TurnParams {
@@ -52,16 +64,13 @@ export interface TurnParams {
   /** turn 事件流(内容事件 + tool_use/result_detected)。同步、按底座输出顺序回调。 */
   onEvent: (e: EngineEvent) => void
   /**
-   * Session 级跨 turn 累计(CCB 成本 delta 基线)。parser 直接 mutate 此引用
-   * (totalCostUSD += delta / turns += 1 / _lastCcbCumulativeCost = cumulative),
-   * 与迁移前 sessionManager 传 `sessionTotals: session` 完全一致 —— 单一权威
-   * 仍是 AgentSession 对象,auth/phantom 回滚由 sessionManager 就地恢复。
+   * Session 级跨 turn 累计(engine 中立;见 EngineSessionTotals)。CCB 路径
+   * parser 直接 mutate 此引用(totalCostUSD += delta / turns += 1,另经
+   * CcbSessionTotals 兼容子契约维护 _lastCcbCumulativeCost 基线),与迁移前
+   * sessionManager 传 `sessionTotals: session` 完全一致 —— 单一权威仍是
+   * AgentSession 对象,auth/phantom 回滚由 sessionManager 就地恢复。
    */
-  sessionTotals: {
-    totalCostUSD: number
-    turns: number
-    _lastCcbCumulativeCost: number
-  }
+  sessionTotals: EngineSessionTotals
   /** 跨 turn 的 tool_use id → name 映射(session 拥有,submit 每 turn clear)。 */
   toolUseIdToName: Map<string, string>
 }

@@ -149,6 +149,13 @@ export type EngineEvent =
  */
 export interface EngineBillingEvent {
   requestId: string
+  /** engine-reported 计费的稳定记账键 = engine/engineSessionId.ts 的
+   *  `engineSessionId(sessionKey)`(唯一 helper,禁止各处自行 hash)。M2 双钱包
+   *  settle 落 usage_records.session_id 与 idle-timeout turn-waive 上报都用它 ——
+   *  不用 containerId/threadId 占位(refund.ts 按 session_id 圈退款窗口)。
+   *  M1a 阶段 wire 帧(outbound.codex_billing)暂不携带本字段(protocol 包
+   *  不在本批改动范围),master 侧接线在 M2。 */
+  engineSessionId: string
   status: 'success' | 'error'
   durationMs: number
   usage?: {
