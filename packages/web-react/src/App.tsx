@@ -92,10 +92,8 @@ export function App() {
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
   const [agent, setAgent] = useState(DEFAULT_AGENT);
   // 已装智能体目录(agent 归属解析用):登录后拉一次,市场关闭时刷新;AgentPicker 打开时
-  // 自行拉最新,两者互不依赖。ref 镜像供 effect 读最新值而不进依赖。
+  // 自行拉最新,两者互不依赖。目录**必须**参与会话归属解析的依赖(见下方 effect 注释)。
   const [myAgents, setMyAgents] = useState<Agent[]>([DEFAULT_AGENT]);
-  const myAgentsRef = useRef(myAgents);
-  myAgentsRef.current = myAgents;
   const [pickerOpen, setPickerOpen] = useState(false);
   // 团队模式(v5 轻量组队):turn 级开关,只对「全能助手」(main)生效——开启后发消息时后端
   // 给 main 队长注入组队引导,由它按任务自主 delegate_task 组已安装 agent 成队。换 agent 不清,
@@ -509,11 +507,11 @@ export function App() {
   // §11 跨 agent 污染守卫也未打戳。收口:切会话/历史合并后把 App.agent 同步为会话归属。
   const activeSessAgentId = !demo && activeId ? chat.getSession(activeId)?.agentId : undefined;
   useEffect(() => {
-    if (!activeSessAgentId || activeSessAgentId === agent.id) return;
+    if (!activeSessAgentId) return;
     const resolved =
       activeSessAgentId === DEFAULT_AGENT.id
         ? DEFAULT_AGENT
-        : (myAgentsRef.current.find((a) => a.id === activeSessAgentId) ?? {
+        : (myAgents.find((a) => a.id === activeSessAgentId) ?? {
             // 已卸载/目录未含的 agent:退化 stub(id 直显),仍保证 send/stop 归属一致。
             id: activeSessAgentId,
             name: activeSessAgentId,
@@ -521,8 +519,18 @@ export function App() {
             grad: "from-violet-500 to-fuchsia-600",
             description: "",
           });
-    setAgent(resolved);
-  }, [activeSessAgentId, agent.id]);
+    // myAgents 必须进依赖:刷新/重开会话时目录常晚于会话解析到达,若只看 id 相等就
+    // early-return,stub(裸 slug 如 research-assistant)会永久卡在 header,目录到了
+    // 也不重算。按展示字段判等:id/名字/头像任一不同才 set(stub→真名会触发,恒等
+    // 时不 set,防 set→重渲→effect 的循环)。
+    if (
+      resolved.id !== agent.id ||
+      resolved.name !== agent.name ||
+      resolved.avatarEmoji !== agent.avatarEmoji
+    ) {
+      setAgent(resolved);
+    }
+  }, [activeSessAgentId, agent.id, agent.name, agent.avatarEmoji, myAgents]);
 
   // 非 demo：展示的消息来自 WS service 快照（就地 mutation + version 触发重渲）。
   const wsMessages = !demo && activeId ? chat.getMessages(activeId) : EMPTY_WS_MESSAGES;
