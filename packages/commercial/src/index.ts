@@ -1108,6 +1108,8 @@ export async function registerCommercial(
               host_uuid: string | null;
               account_status: string | null;
             }>(
+              // 0098 channel 划分:token refresh 只服务本 channel(v3)容器 ——
+              // v5 容器/账号的刷新归 v5 master(防 refresh-token family 双刷)。
               `SELECT ac.codex_account_id::text AS codex_account_id,
                       ac.user_id::text AS user_id,
                       ac.state,
@@ -1115,7 +1117,7 @@ export async function registerCommercial(
                       ca.status AS account_status
                  FROM agent_containers ac
                  LEFT JOIN claude_accounts ca ON ca.id = ac.codex_account_id
-                WHERE ac.id = $1`,
+                WHERE ac.id = $1 AND ac.runtime_channel = 'v3'`,
               [containerId],
             );
             if (r.rows.length === 0) return null;
@@ -1137,6 +1139,7 @@ export async function registerCommercial(
                 host_uuid: string | null;
                 account_status: string | null;
               }>(
+                // 0098 channel 划分:与上方 readContainerAccount 同口径(v3-only)。
                 `SELECT ac.codex_account_id::text AS codex_account_id,
                         ac.user_id::text AS user_id,
                         ac.state,
@@ -1144,7 +1147,7 @@ export async function registerCommercial(
                         ca.status AS account_status
                    FROM agent_containers ac
                    LEFT JOIN claude_accounts ca ON ca.id = ac.codex_account_id
-                  WHERE ac.id = $1
+                  WHERE ac.id = $1 AND ac.runtime_channel = 'v3'
                     FOR UPDATE OF ac`,
                 [containerId],
               );
@@ -2640,6 +2643,7 @@ export async function registerCommercial(
               host_uuid: string | null;
               age_seconds: string;
             }>(
+              // 0098 channel 划分:codex acquire 只锁/处理本 channel(v3)容器。
               `SELECT ac.codex_account_id::text AS account_id,
                       ca.status AS account_status,
                       ca.group_id::text AS account_group_id,
@@ -2649,7 +2653,7 @@ export async function registerCommercial(
                       EXTRACT(EPOCH FROM (NOW() - ac.created_at))::text AS age_seconds
                FROM agent_containers ac
                LEFT JOIN claude_accounts ca ON ca.id = ac.codex_account_id
-               WHERE ac.id = $1
+               WHERE ac.id = $1 AND ac.runtime_channel = 'v3'
                FOR UPDATE OF ac`,
               [containerId],
             );
@@ -2680,9 +2684,10 @@ export async function registerCommercial(
               //            必须 mark vanished + docker rm 让 ensureRunning 重 provision
               //            重新走 picker 路径产出 per-container mount。
               // 池子查询条件必须与 pickCodexAccountForBinding 完全一致(provider='codex'
-              // AND status='active'),否则可能误判为"有账号"但 picker 实际拿不到。
+              // AND status='active' AND runtime_channel='v3'),否则可能误判为"有账号"
+              // 但 picker 实际拿不到。0098 channel 划分:只数本 channel(v3)的行。
               const poolParams: unknown[] = [];
-              const poolWhere = ["provider = 'codex'", "status = 'active'"];
+              const poolWhere = ["provider = 'codex'", "status = 'active'", "runtime_channel = 'v3'"];
               if (desiredGroupId !== null) {
                 poolParams.push(desiredGroupId);
                 poolWhere.push(`group_id = $${poolParams.length}`);
@@ -2728,9 +2733,11 @@ export async function registerCommercial(
               // 拦截)。这里 throw 抬出问题,而不是静默 return null 让 caller 当 legacy
               // 透传 — 那条路径走旧容器仍会 401,只是把问题往后挪。
               const upd = await client.query(
+                // 0098 channel 划分:与上方 FOR UPDATE 锁定条件同口径(v3-only),
+                // 破坏性 UPDATE 必须带 runtime_channel 过滤。
                 `UPDATE agent_containers
                     SET state = 'vanished', updated_at = NOW()
-                  WHERE id = $1 AND state = 'active'`,
+                  WHERE id = $1 AND state = 'active' AND runtime_channel = 'v3'`,
                 [containerId],
               );
               if ((upd.rowCount ?? 0) === 0) {

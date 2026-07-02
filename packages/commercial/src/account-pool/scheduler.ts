@@ -1151,6 +1151,10 @@ export class AccountScheduler {
   ): Promise<CandidateRow[]> {
     const params: unknown[] = [provider]
     const where = ["status = 'active'", 'provider = $1']
+    // 0098 channel 划分:codex 行按 runtime_channel 归属(v3 只见 v3 行,防跨
+    // channel 消费);claude 行维持共享池语义不过滤。pick({provider:'codex'})
+    // 当前无调用方(codex 走 pickCodexAccountForBindingInTx),这里是同口径防御。
+    if (provider === 'codex') where.push("runtime_channel = 'v3'")
     if (groupId !== null) {
       params.push(String(groupId))
       where.push(`group_id = $${params.length}`)
@@ -1664,6 +1668,10 @@ export async function pickCodexAccountForBindingInTx(
 
   const params: unknown[] = []
   const where = ["status = 'active'", "provider = 'codex'"]
+  // 0098 channel 划分:codex 账号池权威按 runtime_channel 归属,v3 picker 严格
+  // 只取 runtime_channel='v3' 的行 —— v3 绝不绑定/消费 v5 channel 的 codex 账号
+  // (防 v3/v5 双 master 共刷同一 codex OAuth 账号触发 refresh-token family 吊销)。
+  where.push("runtime_channel = 'v3'")
   if (deps.groupId !== undefined && deps.groupId !== null) {
     params.push(String(deps.groupId))
     where.push(`group_id = $${params.length}`)

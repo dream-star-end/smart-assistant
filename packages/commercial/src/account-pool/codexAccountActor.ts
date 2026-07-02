@@ -162,10 +162,11 @@ export function startCodexRefreshActor(deps: CodexRefreshActorDeps): CodexRefres
       accessTokenStr = refreshed.token.toString('utf8')
 
       // 枚举绑定容器(无锁查询,只为拿 cid 列表;FOR UPDATE 在每个 cid 的独立事务里取)
+      // 0098 channel 划分:只写本 channel(v3)容器的 auth 文件 —— v5 容器归 v5 master 管。
       const containerRes = await queryFn<{ id: string }>(
         `SELECT id::text AS id
          FROM agent_containers
-         WHERE codex_account_id = $1 AND state = 'active'`,
+         WHERE codex_account_id = $1 AND state = 'active' AND runtime_channel = 'v3'`,
         [String(accountId)],
       )
       if (containerRes.rows.length === 0) return
@@ -212,7 +213,7 @@ export function startCodexRefreshActor(deps: CodexRefreshActorDeps): CodexRefres
       const lockRes = await client.query<ContainerLockRow>(
         `SELECT codex_account_id::text AS codex_account_id, state, host_uuid::text AS host_uuid
          FROM agent_containers
-         WHERE id = $1
+         WHERE id = $1 AND runtime_channel = 'v3'
          FOR UPDATE`,
         [containerId],
       )
@@ -284,10 +285,14 @@ export function startCodexRefreshActor(deps: CodexRefreshActorDeps): CodexRefres
     // 找出待刷新的 codex 账号(过期临近窗口内)
     let res
     try {
+      // 0098 channel 划分:codex 账号池权威按 runtime_channel 归属,v3 只刷
+      // runtime_channel='v3' 的行 —— 防 v3/v5 双 master 共刷同一 codex OAuth
+      // 账号触发 refresh-token family 吊销(个人版 Claude OAuth 双权威源同型事故)。
       res = await queryFn<AccountRow>(
         `SELECT id::text AS id
          FROM claude_accounts
          WHERE provider = 'codex' AND status = 'active'
+           AND runtime_channel = 'v3'
            AND oauth_expires_at IS NOT NULL
            AND oauth_expires_at < (NOW() + ($1::int * interval '1 millisecond'))`,
         [refreshLeadMs],

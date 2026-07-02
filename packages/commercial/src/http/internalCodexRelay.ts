@@ -311,6 +311,8 @@ export function makeDefaultCodexRelayDb(): CodexRelayDb {
         provider: string | null
         account_status: string | null
       }>(
+        // 0098 channel 划分:relay 只服务本 channel(v3)容器的绑定 —— v5 容器/账号
+        // 归 v5 master 的 relay,v3 不代刷不代转发(防跨 channel 消费)。
         `SELECT ac.codex_account_id::text AS codex_account_id,
                 ac.user_id::text AS user_id,
                 ac.state,
@@ -318,7 +320,7 @@ export function makeDefaultCodexRelayDb(): CodexRelayDb {
                 ca.status AS account_status
            FROM agent_containers ac
            LEFT JOIN claude_accounts ca ON ca.id = ac.codex_account_id
-          WHERE ac.id = $1`,
+          WHERE ac.id = $1 AND ac.runtime_channel = 'v3'`,
         [containerId],
       )
       if (!r.rows[0]) return null

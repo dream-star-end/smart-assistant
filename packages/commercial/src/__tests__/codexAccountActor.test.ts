@@ -211,4 +211,36 @@ describe("codexAccountActor v1.0.72 host fanout", () => {
     assert.equal(harness.writeLocalCalls.length, 0);
     assert.equal(harness.writeRemoteCalls.length, 0);
   });
+
+  it("0098 channel 划分:刷新枚举与容器枚举 SQL 都圈定 runtime_channel='v3'(v5 行不进 v3 刷新权威)", async () => {
+    const captured: string[] = [];
+    const queryFn = (async (sql: string) => {
+      captured.push(sql);
+      // 刷新枚举返回空 → tick 提前结束,不触发 refresh/tx 路径
+      return { rows: [] } as never;
+    }) as CodexRefreshActorDeps["queryFn"];
+    const actor = startCodexRefreshActor({
+      codexContainerDir: "/tmp/codex",
+      containerUid: 1000,
+      containerGid: 1000,
+      queryFn,
+      txFn: (async () => undefined) as never,
+      refreshFn: (async () => {
+        throw new Error("refreshFn should not run");
+      }) as never,
+      writeFn: (async () => undefined) as never,
+      selfHostId: null,
+      onError: () => {},
+    });
+    await actor.runNow();
+    actor.stop();
+    assert.equal(captured.length, 1, "empty pool → 只有刷新枚举一条 SQL");
+    assert.match(captured[0], /FROM claude_accounts/);
+    assert.match(captured[0], /provider = 'codex'/);
+    assert.match(
+      captured[0],
+      /runtime_channel = 'v3'/,
+      "刷新枚举必须带 runtime_channel='v3'(防 v3/v5 双 master 共刷同一 OAuth family)",
+    );
+  });
 });

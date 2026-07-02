@@ -66,8 +66,10 @@ export async function collectRuleSnapshot(deps: SnapshotDeps = {}): Promise<Rule
   let silentNewUserCount24h = 0;
 
   try {
+    // 0098 channel 划分:v3 池告警只看 v3 权威的行(claude 共享池 + v3 channel
+    // 的 codex)—— v5 codex 行不进本实例的告警口径,防误报/误消警。
     const r = await query<{ id: string; health_score: number; status: string }>(
-      "SELECT id::text AS id, health_score, status FROM claude_accounts ORDER BY claude_accounts.id",
+      "SELECT id::text AS id, health_score, status FROM claude_accounts WHERE NOT (provider = 'codex' AND runtime_channel <> 'v3') ORDER BY claude_accounts.id",
     );
     accountHealth = r.rows.map((row) => ({
       account_id: row.id,
