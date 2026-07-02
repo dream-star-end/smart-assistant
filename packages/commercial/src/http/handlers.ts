@@ -2163,5 +2163,85 @@ export async function handleMediaSigned(
   }
 }
 
+// ─── 用户文献库(research_documents 管理面,ManageCenter「文献库」tab)────────
+//
+// GET    /api/me/research/library          → 列表(元数据,权威 span 文本不外泄)
+// POST   /api/me/research/library          → 上传原始字节入库(?filename=,≤25MiB,
+//                                            复用容器路径同一 ingestBlob 铸造链)
+// DELETE /api/me/research/library/:docId   → 删单篇(tenant 隔离)
+//
+// 数据逻辑在 research/library.ts;这里只做鉴权 + 参数/大小校验 + HTTP 形状。
+
+export async function handleListResearchLibrary(
+  req: IncomingMessage,
+  res: ServerResponse,
+  _ctx: RequestContext,
+  deps: CommercialHttpDeps,
+): Promise<void> {
+  const user = await requireAuth(req, deps.jwtSecret);
+  const { listLibraryDocuments } = await import("../research/library.js");
+  const docs = await listLibraryDocuments(user.id);
+  sendJson(res, 200, { documents: docs });
+}
+
+export async function handleDeleteResearchLibraryDoc(
+  req: IncomingMessage,
+  res: ServerResponse,
+  _ctx: RequestContext,
+  deps: CommercialHttpDeps,
+): Promise<void> {
+  const user = await requireAuth(req, deps.jwtSecret);
+  const m = (req.url ?? "").match(/^\/api\/me\/research\/library\/([A-Za-z0-9_-]+)(?:\?|$)/);
+  const docId = m?.[1] ?? "";
+  if (!docId) throw new HttpError(400, "INVALID_DOC_ID", "docId required");
+  const { deleteLibraryDocument } = await import("../research/library.js");
+  const deleted = await deleteLibraryDocument(user.id, docId);
+  if (!deleted) throw new HttpError(404, "NOT_FOUND", "document not found");
+  sendJson(res, 200, { ok: true });
+}
+
+export async function handleUploadResearchLibraryDoc(
+  req: IncomingMessage,
+  res: ServerResponse,
+  _ctx: RequestContext,
+  deps: CommercialHttpDeps,
+): Promise<void> {
+  const user = await requireAuth(req, deps.jwtSecret);
+  const { MAX_LIBRARY_UPLOAD_BYTES, uploadAndIngestDocument } = await import(
+    "../research/library.js"
+  );
+
+  const chunks: Buffer[] = [];
+  let total = 0;
+  for await (const chunk of req as AsyncIterable<Buffer>) {
+    total += chunk.length;
+    if (total > MAX_LIBRARY_UPLOAD_BYTES) {
+      throw new HttpError(413, "UPLOAD_TOO_LARGE", "document exceeds 25MiB limit");
+    }
+    chunks.push(chunk);
+  }
+  const bytes = Buffer.concat(chunks);
+  if (bytes.length === 0) throw new HttpError(400, "EMPTY_UPLOAD", "empty body");
+
+  const mime = (req.headers["content-type"] ?? "application/octet-stream").split(";")[0]!.trim();
+  const rawName = new URL(req.url ?? "/", "http://x").searchParams.get("filename") ?? "";
+  // 只取 basename 并限长:filename 仅用于抽取器猜格式/标题,不落盘,防路径注入。
+  const filename = rawName ? rawName.replace(/[/\\]/g, "").slice(0, 200) : undefined;
+
+  const outcome = await uploadAndIngestDocument(Number(user.id), bytes, mime, filename);
+  if ("disabled" in outcome) {
+    throw new HttpError(503, "RESEARCH_DISABLED", "research subsystem is disabled");
+  }
+  if (!outcome.ok) {
+    if (outcome.needsOcr) {
+      // 与容器 oc-ingest 同形状:扫描件无文字层 → 明确 needsOcr(前端展示可操作提示)。
+      sendJson(res, 200, { needsOcr: true, reason: outcome.reason });
+      return;
+    }
+    throw new HttpError(400, "INGEST_FAILED", outcome.reason);
+  }
+  sendJson(res, 200, outcome.outline);
+}
+
 // helper for tests / 其他 module
 export { clientIpOf, userAgentOf };

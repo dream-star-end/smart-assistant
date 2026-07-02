@@ -3,15 +3,17 @@ import { X } from "lucide-react";
 import type { AuthSession } from "../lib/types";
 import { Tabs } from "./ui";
 import { CronPanel } from "./manage/CronPanel";
+import { LibraryPanel } from "./manage/LibraryPanel";
 import { MemoryPanel } from "./manage/MemoryPanel";
 import { SkillsPanel } from "./manage/SkillsPanel";
 
-export type ManageTab = "memory" | "cron" | "skills";
+export type ManageTab = "memory" | "cron" | "skills" | "library";
 
 const TABS: { id: ManageTab; label: string }[] = [
   { id: "memory", label: "记忆" },
   { id: "cron", label: "定时任务" },
   { id: "skills", label: "技能" },
+  { id: "library", label: "文献库" },
 ];
 
 /**
@@ -75,6 +77,7 @@ export function ManageCenter({
                 {tab === "memory" && <MemoryPanel auth={auth} agentId={agentId} agents={agents} />}
                 {tab === "cron" && <CronPanel auth={auth} />}
                 {tab === "skills" && <SkillsPanel auth={auth} />}
+                {tab === "library" && <LibraryPanel auth={auth} />}
               </>
             )}
           </div>

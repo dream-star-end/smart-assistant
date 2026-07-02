@@ -46,9 +46,16 @@ import { type LitSourceName, searchMultiSource } from "./litSearch.js";
 import { type SnowballDirection, snowball } from "./snowball.js";
 import { formatRecord, verifyIdentifier, verifyIdentifiers } from "./cite.js";
 
-/** master-owned blob 暂存目录(ingest 输入字节;仅 master worker 读)。 */
-function defaultBlobDir(): string {
+/** master-owned blob 暂存目录(ingest 输入字节;仅 master worker 读)。
+ *  export:research/library.ts(用户会话向上传入库)与本 proxy 共用同一目录权威。 */
+export function defaultBlobDir(): string {
   return process.env.OC_RESEARCH_BLOB_DIR?.trim() || path.join(os.tmpdir(), "oc-research-blobs");
+}
+
+/** 默认 blob 落盘实现(0600 + mkdir -p);与 resolveStore 的默认 writeBlobBytes 同一实现。 */
+export async function writeBlobBytesDefault(p: string, bytes: Buffer): Promise<void> {
+  await mkdir(path.dirname(p), { recursive: true });
+  await writeFile(p, bytes, { mode: 0o600 });
 }
 
 const MAX_BLOB_BYTES = 25 * 1024 * 1024; // 25 MiB ingest 输入上限
@@ -162,12 +169,7 @@ function resolveStore(s?: Partial<ResearchStoreDeps>): ResearchStoreDeps {
     putDocument: s?.putDocument ?? storePutDocument,
     getDocument: s?.getDocument ?? storeGetDocument,
     readBlobBytes: s?.readBlobBytes ?? ((p: string) => readFile(p)),
-    writeBlobBytes:
-      s?.writeBlobBytes ??
-      (async (p: string, bytes: Buffer) => {
-        await mkdir(path.dirname(p), { recursive: true });
-        await writeFile(p, bytes, { mode: 0o600 });
-      }),
+    writeBlobBytes: s?.writeBlobBytes ?? writeBlobBytesDefault,
     blobDir,
   };
 }

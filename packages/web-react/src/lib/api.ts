@@ -13,6 +13,8 @@ import type {
   InboxMessage,
   RepoSelection,
   SkillDetail,
+  ResearchLibraryDoc,
+  ResearchLibraryUploadResult,
   SkillSummary,
   MarketplaceDetail,
   MarketplaceInstalled,
@@ -1190,6 +1192,42 @@ export const api = {
           method: "DELETE",
           credentials: "include",
           headers: bearerHeaders(t),
+        }),
+      ),
+    ),
+
+  /** 文献库列表(GET /api/me/research/library,master 直存,非容器代理)。 */
+  listResearchLibrary: (a: AuthSession) =>
+    jsonOrThrow<{ documents: ResearchLibraryDoc[] }>(
+      callWithRefresh(a, (t) =>
+        fetch("/api/me/research/library", { credentials: "include", headers: bearerHeaders(t) }),
+      ),
+    ).then((b) => b.documents || []),
+
+  /** 文献库删单篇(DELETE /api/me/research/library/:docId)。 */
+  deleteResearchDoc: (a: AuthSession, docId: string) =>
+    jsonOrThrow<{ ok: boolean }>(
+      callWithRefresh(a, (t) =>
+        fetch(`/api/me/research/library/${encodeURIComponent(docId)}`, {
+          method: "DELETE",
+          credentials: "include",
+          headers: bearerHeaders(t),
+        }),
+      ),
+    ),
+
+  /** 文献库上传入库(POST /api/me/research/library?filename=,raw bytes ≤25MiB)。 */
+  uploadResearchDoc: (a: AuthSession, file: File) =>
+    jsonOrThrow<ResearchLibraryUploadResult>(
+      callWithRefresh(a, (t) =>
+        fetch(`/api/me/research/library?filename=${encodeURIComponent(file.name)}`, {
+          method: "POST",
+          credentials: "include",
+          headers: {
+            ...bearerHeaders(t),
+            "content-type": file.type || "application/octet-stream",
+          },
+          body: file,
         }),
       ),
     ),

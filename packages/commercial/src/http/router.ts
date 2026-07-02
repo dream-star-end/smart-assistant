@@ -182,11 +182,13 @@ import {
   handleConfirmPasswordReset,
   handleCountMyInboxUnread,
   handleCreateSession,
+  handleDeleteResearchLibraryDoc,
   handleGetMyPreferences,
   handleGetMyUsage,
   handleGetPublicConfig,
   handleListMyInbox,
   handleListPublicModels,
+  handleListResearchLibrary,
   handleLogin,
   handleLogout,
   handleMarkInboxRead,
@@ -200,6 +202,7 @@ import {
   handleRequestPasswordReset,
   handleResendVerification,
   handleSubmitFeedback,
+  handleUploadResearchLibraryDoc,
   handleVerifyEmail,
 } from './handlers.js'
 import { handleGithubCallback, handleGithubStart } from './oauthGithub.js'
@@ -554,6 +557,11 @@ export function createCommercialHandler(
     { method: 'GET', path: '/api/me/api-keys', handler: handleListMyApiKeys },
     { method: 'POST', path: '/api/me/api-keys', handler: handleCreateMyApiKey },
     { method: 'DELETE', pathPrefix: '/api/me/api-keys/', handler: handleRevokeMyApiKey },
+    // 用户文献库(research_documents 管理面):列表 / 上传入库(raw bytes) / 删单篇。
+    // 详见 handlers.ts 对应 handler 注释;数据逻辑在 research/library.ts。
+    { method: 'GET', path: '/api/me/research/library', handler: handleListResearchLibrary },
+    { method: 'POST', path: '/api/me/research/library', handler: handleUploadResearchLibraryDoc },
+    { method: 'DELETE', pathPrefix: '/api/me/research/library/', handler: handleDeleteResearchLibraryDoc },
     { method: 'GET', path: '/api/public/config', handler: handleGetPublicConfig },
     { method: 'GET', path: '/api/public/models', handler: handleListPublicModels },
     // V3 Phase 2 Task 2F: 容器/前端按 spec 用 /api/models;沿用 /api/public/models 同一 handler

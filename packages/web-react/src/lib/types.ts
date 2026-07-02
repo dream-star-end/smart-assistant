@@ -446,6 +446,27 @@ export type MediaSignResult = {
   expMs: number;
 };
 
+// ─── 用户文献库(research_documents,master 直存;ManageCenter「文献库」tab) ──
+
+/** 文献库单篇(GET /api/me/research/library 的 documents 项)。 */
+export type ResearchLibraryDoc = {
+  docId: string;
+  title: string | null;
+  lang: string;
+  spanCount: number;
+  createdAt: string;
+};
+
+/** 上传入库结果(POST /api/me/research/library):成功回 outline,扫描件回 needsOcr。 */
+export type ResearchLibraryUploadResult = {
+  docId?: string;
+  title?: string | null;
+  lang?: string;
+  spanCount?: number;
+  needsOcr?: boolean;
+  reason?: string;
+};
+
 // ─── 容器内管理（记忆 / 定时任务 / 技能；经 commercial router 代理进用户容器） ──
 
 /** 定时任务（GET /api/cron 的 jobs 项；字段宽松，按容器 gateway 实际返回。 */
