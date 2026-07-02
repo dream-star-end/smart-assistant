@@ -22,6 +22,7 @@ import {
 } from './telemetryChannel.js'
 import { eventBus, createEvent } from './eventBus.js'
 import { createLogger } from './logger.js'
+import { sendTurnWaiveBestEffort } from './masterTurnWaive.js'
 import { getV3MasterSinkOrNull, type V3MasterSinkPayload } from './v3MasterSink.js'
 import { resolveExecutionModel } from './server.js'
 import { SubprocessRunner } from './subprocessRunner.js'
@@ -286,6 +287,9 @@ export interface AgentSession {
   startedAt: number
   runner: SubprocessRunner
   ccbSessionId: string | null
+  /** 本 turn 起始 ms(submit 进入执行段时打点)。idle-timeout 免单上报用它圈定
+   *  master 侧退款窗口(masterTurnWaive),turn 间不清零 — 只在超时路径读。 */
+  _turnStartedAtMs?: number
   lock: Promise<void>
   lastUsedAt: number
   // 跨 turn 累积
@@ -949,6 +953,23 @@ export class SessionManager {
    *  entry so the next spawn starts a fresh session silently — UI history
    *  stays visible (it lives in the DB), but CCB has no memory of previous
    *  turns (unavoidable when the JSONL is gone). */
+  /** idle-timeout 免单上报(见 masterTurnWaive.ts 头注)。ccb session id 未知
+   *  (首 turn 未学到)时无法圈定 master 侧记录,跳过并 warn —— 该场景下本 turn
+   *  多半也没有可退的成功 settle(连首个事件都没等到)。 */
+  private _reportTurnWaive(session: AgentSession, reason: 'idle_timeout' | 'no_response'): void {
+    try {
+      const ccbSessionId = session.ccbSessionId ?? this._resumeMap.get(session.sessionKey) ?? null
+      if (!ccbSessionId) {
+        log.warn('turn waive skipped — ccb session id unknown', { sessionKey: session.sessionKey })
+        return
+      }
+      const sinceTs = (session._turnStartedAtMs ?? Date.now()) - 15_000
+      sendTurnWaiveBestEffort({ sessionId: ccbSessionId, sinceTs, reason })
+    } catch (err) {
+      log.warn('turn waive report threw', { sessionKey: session.sessionKey }, err as Error)
+    }
+  }
+
   private _resumeIdFor(sessionKey: string, wantProvider: string): string | undefined {
     const id = this._resumeMap.get(sessionKey)
     if (!id) return undefined
@@ -1644,6 +1665,9 @@ export class SessionManager {
       // 只负责按当前 turn 的运行时状态查表 + 触发 reject。_runOneTurn 内还有
       // 一个 30-min 硬背书 timer 作为兜底,不在本路径管。
       const CHECK_INTERVAL = 15_000 // check every 15s
+      // 免单窗口打点:master 退款只圈本 turn 内 settle 的请求。回拨 15s 容忍
+      // 容器/DB 时钟微偏 —— 上一 turn 早已结束,cushion 不会误圈到它。
+      session._turnStartedAtMs = Date.now()
       let livenessTimer: NodeJS.Timeout | null = null
       const livenessPromise = new Promise<never>((_, reject) => {
         livenessTimer = setInterval(() => {
@@ -1671,6 +1695,9 @@ export class SessionManager {
       if (err?.message?.includes('idle timeout')) {
         // Actually interrupt the runner so the subprocess stops
         try { session.runner.interrupt() } catch {}
+        // boss 红线:本轮模型无响应/超时不扣费。上报 master 冲正本 turn 已扣费用
+        // (fire-and-forget,内部延迟 5s 让在飞 settle 落定;个人版 env 缺失自动 no-op)。
+        this._reportTurnWaive(session, 'idle_timeout')
         // Extract idle seconds from the inner error so the user-facing
         // message reflects the actual silence duration (avoids confusing
         // mismatch with the inner 30-min idle timer's fixed wording).
@@ -1937,6 +1964,7 @@ export class SessionManager {
         () => {
           if (!parser.finalized) {
             try { runner.interrupt() } catch {}
+            this._reportTurnWaive(session, 'idle_timeout')
             onEvent({ kind: 'error', error: '单轮对话空闲超时 (30 分钟无输出),已中断。请重试。' })
             detach()
             settle(() => resolve())

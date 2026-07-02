@@ -41,6 +41,8 @@ export type MsgUsage = {
   traceId?: string;
   /** 真实扣费积分（字符串大数）。*/
   costCredits?: string;
+  /** 本轮已免单（idle-timeout 无响应退款,cost_waived 帧置位）。*/
+  waived?: boolean;
 };
 
 /** Bash 实时 tail 快照（单调守卫：totalBytes 不回退）。*/

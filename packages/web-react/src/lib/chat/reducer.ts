@@ -37,6 +37,7 @@ import {
 } from "./model";
 import type {
   CostChargedWire,
+  CostWaivedWire,
   LegacyBridgeErrorWire,
   OutboundContentBlock,
   OutboundErrorWire,
@@ -1020,6 +1021,50 @@ export function applyCostCharged(sess: ChatSession | null, frame: CostChargedWir
     target.usage = { ...target.usage, costCredits: (cur + add).toString() };
   }
   refresh();
+}
+
+/** turn 免单退款帧：idle-timeout 无响应轮,master 已冲正扣费。
+ *  处理三件事：
+ *   1. 刷余额气泡（balanceAfter 在则触发 refreshBalance）。
+ *   2. 从 _pendingCostCredits 未落账队列里先行抵扣（cost 常在 turn 结束前入队未 drain）。
+ *   3. 找最近一条有 costCredits 的助手消息，把展示扣费额度减回去并标 waived
+ *      （UI 显示「已免单」而不是积分数）。*/
+export function applyCostWaived(sess: ChatSession | null, frame: CostWaivedWire, effects: FrameEffects = {}): void {
+  if (frame.balanceAfter !== undefined && frame.balanceAfter !== null) effects.refreshBalance?.();
+  if (!sess) return;
+  let refund: bigint;
+  try {
+    refund = BigInt(frame.refundedCredits ?? "0");
+  } catch {
+    refund = 0n;
+  }
+  if (refund <= 0n) return;
+  // 先抵扣未落账队列。
+  try {
+    const pending = BigInt(sess._pendingCostCredits || "0");
+    if (pending > 0n) {
+      const used = pending < refund ? pending : refund;
+      sess._pendingCostCredits = (pending - used).toString();
+      refund -= used;
+    }
+  } catch {
+    /* 非法 pending — 忽略 */
+  }
+  // 再从最近一条已展示扣费的助手消息上减（从尾部找，超时轮必然是最近的）。
+  for (let i = sess.messages.length - 1; i >= 0 && i >= sess.messages.length - 20; i--) {
+    const m = sess.messages[i];
+    if (m.role !== "assistant" || !m.usage?.costCredits) continue;
+    let cur = 0n;
+    try {
+      cur = BigInt(m.usage.costCredits);
+    } catch {
+      cur = 0n;
+    }
+    const used = cur < refund ? cur : refund;
+    m.usage = { ...m.usage, costCredits: (cur - used).toString(), waived: true };
+    refund -= used;
+    break;
+  }
 }
 
 // ═══════════════ permission_request / settled（§3 去重）═══════════════

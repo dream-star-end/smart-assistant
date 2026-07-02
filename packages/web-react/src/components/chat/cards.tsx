@@ -121,11 +121,17 @@ function ReqIdChip({ traceId }: { traceId: string }) {
 function MetaRow({ msg }: { msg: ChatMessage }) {
   const traceId = msg.usage?.traceId;
   const credits = msg.usage?.costCredits;
-  // 计费仅在有正向扣费时展示（"0"/负数/缺省不展示）。
-  const showCredits = credits && /^\d+$/.test(credits) && credits !== "0";
-  if (!traceId && !showCredits) return null;
+  const waived = msg.usage?.waived === true;
+  // 计费仅在有正向扣费时展示（"0"/负数/缺省不展示）；免单轮改展示「已免单」。
+  const showCredits = !waived && credits && /^\d+$/.test(credits) && credits !== "0";
+  if (!traceId && !showCredits && !waived) return null;
   return (
     <div className="mt-1.5 flex items-center gap-2 text-faint">
+      {waived && (
+        <Badge tone="success" aria-label="本轮已免单">
+          <Wallet size={11} /> 已免单
+        </Badge>
+      )}
       {showCredits && (
         <Badge tone="neutral" aria-label={`消耗 ${credits} 积分`}>
           <Wallet size={11} /> {groupDigits(credits!)} 积分

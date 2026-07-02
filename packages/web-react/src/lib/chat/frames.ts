@@ -91,6 +91,16 @@ export type CostChargedWire = {
   costCredits?: string | null;
 };
 
+/** turn 免单退款广播（master→user）：idle-timeout 杀 turn 后 master 冲正该轮费用。
+ *  **不进 frameSeq 去重**（同 cost_charged，§3）。sessionId 为 agent 内部会话 UUID 口径。*/
+export type CostWaivedWire = {
+  type: "outbound.cost_waived";
+  sessionId?: string;
+  balanceAfter?: string | null;
+  refundedCredits?: string | null;
+  reason?: string;
+};
+
 /** 容器冷启提示（typing-indicator 加 “容器首次加载中” 后缀）。*/
 export type ColdStartWire = { type: "sys.cold_start"; peer?: Peer };
 
@@ -144,6 +154,7 @@ export type OutboundWire =
   | OutboundTurnStatusWire
   | LegacyBridgeErrorWire
   | CostChargedWire
+  | CostWaivedWire
   | ColdStartWire
   | RelayReadyWire
   | AckWire

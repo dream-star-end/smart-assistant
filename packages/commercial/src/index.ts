@@ -136,6 +136,11 @@ import {
   type MarketplaceSyncHandler,
 } from "./http/internalMarketplaceSync.js";
 import {
+  TURN_WAIVE_PATH,
+  makeTurnWaiveHandler,
+  type TurnWaiveHandler,
+} from "./http/internalTurnWaive.js";
+import {
   MARKETPLACE_AGENT_PREFIX,
   makeMarketplaceAgentHandler,
   type MarketplaceAgentHandler,
@@ -1245,6 +1250,14 @@ export async function registerCommercial(
       const marketplaceSyncHandler: MarketplaceSyncHandler = makeMarketplaceSyncHandler({
         identityRepo,
       });
+      // /internal/v3/turn-waive — 容器 gateway 上报"turn idle-timeout 被杀"(用户视角
+      // 无响应/超时),master 按 (user, ccb session, turn 窗口) 冲正该轮已扣费用并广播
+      // outbound.cost_waived。boss 红线:本轮模型无响应或超时不得扣费。
+      const turnWaiveHandler: TurnWaiveHandler = makeTurnWaiveHandler({
+        identityRepo,
+        pgPool: getPool(),
+        broadcastToUser: (uid, payload) => bridgeBroadcastRef.current(uid, payload),
+      });
       // /internal/v3/marketplace/agent/* — 容器内 AI(market skill / oc-market CLI)
       // 代用户做市场操作(search/install/uninstall/publish),同款 verifyContainerIdentity
       // 限本用户;install 仅已审内容、publish 仅入 pending(管理员审核前不上线)。
@@ -1313,6 +1326,9 @@ export async function registerCommercial(
         }
         if (path === MARKETPLACE_SYNC_PATH) {
           return marketplaceSyncHandler(req, res, ctx);
+        }
+        if (path === TURN_WAIVE_PATH) {
+          return turnWaiveHandler(req, res, ctx);
         }
         if (path.startsWith(MARKETPLACE_AGENT_PREFIX)) {
           return marketplaceAgentHandler(req, res, ctx);

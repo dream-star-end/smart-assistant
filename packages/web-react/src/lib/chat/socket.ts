@@ -11,6 +11,7 @@
  */
 import {
   applyCostCharged,
+  applyCostWaived,
   applyLegacyBridgeError,
   applyOutboundError,
   applyOutboundMessage,
@@ -63,6 +64,7 @@ import {
 } from "./pure";
 import type {
   CostChargedWire,
+  CostWaivedWire,
   InboundMessage,
   LegacyBridgeErrorWire,
   OutboundErrorWire,
@@ -904,6 +906,15 @@ export class ChatSocket {
         const sess =
           (frame.sessionId ? this.sessions.get(frame.sessionId) : undefined) ?? this.costTargetSession();
         applyCostCharged(sess, frame, this.effects());
+        return;
+      }
+      case "outbound.cost_waived": {
+        const frame = f as CostWaivedWire;
+        // 同 cost_charged 的会话路由口径;免单帧到达时 turn 已结束,costTargetSession
+        // 的"刚收尾"窗口(60s)通常仍能命中;都不中就退化为只刷余额。
+        const sess =
+          (frame.sessionId ? this.sessions.get(frame.sessionId) : undefined) ?? this.costTargetSession();
+        applyCostWaived(sess, frame, this.effects());
         return;
       }
       case "sys.cold_start": {

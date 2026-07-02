@@ -17,6 +17,7 @@ import {
 import { addMessage, type ChatMessage, createSession } from "./model";
 import {
   applyCostCharged,
+  applyCostWaived,
   applyOutboundError,
   applyOutboundMessage,
   applyResumeFailed,
@@ -340,6 +341,35 @@ describe("applyOutboundError double-frame suppression (§11)", () => {
     const err = s.messages.filter((m) => m.role === "assistant").at(-1)!;
     expect(err.text).toBe("系统暂时不可用，请稍后重试。"); // 友好通用,不抛裸英文
     expect(err._errorDetail).toBe("server shutting down"); // 原始信息进查看详情,Codex 审防丢失
+  });
+});
+
+describe("applyCostWaived (turn 免单退款)", () => {
+  test("命中最近一条已扣费助手消息 → 减额 + waived 标记 + 刷余额", () => {
+    const s = sess();
+    const a = addMessage(s, "assistant", "半截", { ts: 1, usage: { costCredits: "11" } });
+    const refreshBalance = vi.fn();
+    applyCostWaived(s, { type: "outbound.cost_waived", sessionId: "x", refundedCredits: "11", balanceAfter: "100" }, { refreshBalance });
+    expect(a.usage?.costCredits).toBe("0");
+    expect(a.usage?.waived).toBe(true);
+    expect(refreshBalance).toHaveBeenCalledTimes(1);
+  });
+  test("退款先抵扣 _pendingCostCredits,余量再落消息", () => {
+    const s = sess();
+    const a = addMessage(s, "assistant", "半截", { ts: 1, usage: { costCredits: "5" } });
+    s._pendingCostCredits = "6";
+    applyCostWaived(s, { type: "outbound.cost_waived", refundedCredits: "11" }, {});
+    expect(s._pendingCostCredits).toBe("0");
+    expect(a.usage?.costCredits).toBe("0");
+    expect(a.usage?.waived).toBe(true);
+  });
+  test("无 session / 非法金额 → 只刷余额,不崩", () => {
+    const refreshBalance = vi.fn();
+    applyCostWaived(null, { type: "outbound.cost_waived", refundedCredits: "x", balanceAfter: "1" }, { refreshBalance });
+    expect(refreshBalance).toHaveBeenCalledTimes(1);
+    const s = sess();
+    applyCostWaived(s, { type: "outbound.cost_waived", refundedCredits: "-5" }, {});
+    expect(s._pendingCostCredits).toBe("0");
   });
 });
 
