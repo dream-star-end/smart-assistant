@@ -33,6 +33,7 @@ import { AeadError } from '../crypto/aead.js'
 import { loadKmsKey } from '../crypto/keys.js'
 import { getPool } from '../db/index.js'
 import { query } from '../db/queries.js'
+import { getRuntimeChannel } from '../runtimeChannel.js'
 import type { AccountHealthTracker } from './health.js'
 import {
   type AccountPlan,
@@ -1664,6 +1665,11 @@ export async function pickCodexAccountForBindingInTx(
 
   const params: unknown[] = []
   const where = ["status = 'active'", "provider = 'codex'"]
+  // 0098 channel 划分(M1b):codex 账号池权威按 runtime_channel 归属,picker 严格
+  // 只取本 channel 的行 —— v5 取不到 v3 行,池空即 fail-closed 返回 null,绝不回落。
+  // (防 v3/v5 双 master 共刷同一 codex OAuth 账号触发 refresh-token family 吊销。)
+  params.push(getRuntimeChannel())
+  where.push(`runtime_channel = $${params.length}`)
   if (deps.groupId !== undefined && deps.groupId !== null) {
     params.push(String(deps.groupId))
     where.push(`group_id = $${params.length}`)

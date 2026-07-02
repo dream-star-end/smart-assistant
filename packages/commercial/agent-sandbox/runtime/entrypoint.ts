@@ -115,9 +115,12 @@ const WEB_CONTEXT_TOOLSET_ID = "web_context";
 // 守护 —— 改这里必须同步改 platformDefaults.ts。
 const COMMERCIAL_DEFAULT_MODEL = "glm-5.2";
 const COMMERCIAL_DEFAULT_PROVIDER = "ark";
-// v5 纯市场模型:容器只 seed「全能助手」(main) → COMMERCIAL_DEFAULT_MODEL(glm-5.2,火山 ark)。
-// 历史内置子 agent(researcher/scientist/coder/reviewer/scholar)已退役,其各角色专用的
-// model/provider 常量随之移除;其它 agent 一律走市场安装(见下方 desiredSeedAgents)。
+// v5 纯市场模型:容器只 seed「全能助手」(main)+「GPT 5.5」(codex) → 其它 agent
+// 一律走市场安装(见下方 desiredSeedAgents)。历史内置子 agent(researcher/scientist/
+// coder/reviewer/scholar)已退役,其各角色专用的 model/provider 常量随之移除。
+// M1b codex 复活:codex seed agent 回归 —— provider:'codex-native' + runnerKind:
+// 'app-server' 是 gateway runner 路由依据,必须落 agents.yaml。
+const COMMERCIAL_CODEX_MODEL = "gpt-5.5";
 
 // Retired MCP server — id retained only so upsertPlatformMcpIntegrations can
 // strip stale platform-owned entries from existing user volumes. Browser is now
@@ -913,9 +916,11 @@ try {
     "科研分析师",
     "代码工程师",
     "审阅员",
-    // v5 ccb-only:不再 seed codex agent,但保留这条遗留 display 识别串,
-    // 让旧版镜像把 main 污染成 GPT 5.5 默认显示的容器在 merge 时被规范化回 ccb。
+    "GPT 5.5 (Codex)",
+    // 遗留 display 识别串:旧版镜像把 main 污染成 GPT 5.5 默认显示的容器在
+    // merge 时被规范化回 ccb 默认(main 仍归 glm-5.2;codex agent 独立 seed)。
     "GPT 5.5 (default)",
+    "GPT 5.5 队长",
   ]);
 
   const LEGACY_RESEARCHER_TOOLSETS = [
@@ -992,7 +997,16 @@ try {
     return patched ? next : null;
   }
 
-  // (v5 ccb-only:codex/gpt-5.5 seed agent 已移除 —— 不再 seed codex agent。)
+  // 期望的 codex agent 配置 —— 固定 GPT 5.5 的唯一 seed 入口(M1b 复活)。
+  const desiredCodexAgent = {
+    id: "codex",
+    model: COMMERCIAL_CODEX_MODEL,
+    permissionMode: "bypassPermissions",
+    provider: "codex-native",
+    runnerKind: "app-server",
+    displayName: "GPT 5.5 队长",
+    avatarEmoji: "🤖",
+  };
 
   const desiredMainAgent = {
     id: "main",
@@ -1008,7 +1022,7 @@ try {
   // (researcher/scientist/coder/reviewer/scholar)已退役 —— 其它 agent 一律走市场安装
   // (syncMarketplaceHub 直写 agents.yaml + source:marketplace 标记)。存量容器里的幽灵
   // seed 不 prune,但 listCollaboratorAgents 的 marketplace-source 过滤已让它们在所有面惰性。
-  const desiredSeedAgents = [desiredMainAgent];
+  const desiredSeedAgents = [desiredMainAgent, desiredCodexAgent];
 
   // v5 轻量组队重构:不再预置团队(队长 turn 级自主 delegate_task 组队)。保留空数组,
   // 让下方 bootstrap 的 .map(cloneSeedTeam) 与 merge 团队循环自然成为 no-op —— 团队相关

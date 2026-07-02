@@ -195,3 +195,56 @@ M0 先落 helper + 测试;接线在 M2 计费。
 - `_reportTurnWaive` 对 codex session 仍上报 thread id(错口径)——M2 用
   EngineBillingEvent.engineSessionId 统一记账键时一并改。
 - OutboundCodexBilling wire 帧扩 engineSessionId 字段(protocol 包)→ M2。
+
+---
+
+## M1b 实施记录(2026-07-02,commercial 侧 codex 基础设施复活)
+
+**范围**:packages/commercial/**(+db migration 0098 + 本文档)。bridge 计费状态机
+(userChatBridge codexBinding/createCodexRoute/expireCodexRoute + inflight/drain)
+留 M2,恢复源 `git show eb1ab67b^:packages/commercial/src/ws/userChatBridge.ts`。
+
+1. **复活文件**(0bed2f76^ 原样 + v5 lead 版):account-pool/{codexAccountActor,
+   codexDisableFanout,codexEgress,codexLazyMigrate}、codex-auth/* 整目录、
+   http/{internalCodexRelay,internalCodexTokenRefresh}、billing/codexFinalizer、
+   refresh.ts codex 段(-233 行反打)、v3supervisor codex auth/relay env 注入 +
+   codex HOME 卷(4→5)、admin codex-disable-rebind 钩子、entrypoint codex seed
+   agent(gpt-5.5 / codex-native / app-server)、index.ts 全部接线(调度器按
+   trackScheduler 登记制)。
+
+2. **架构决策①:codex 账号池权威按 runtime_channel 划分(migration 0098)**。
+   claude_accounts 加 runtime_channel 列(default 'v3',CHECK IN('v3','v5'),
+   v3 现网零影响);v5 的 codexAccountActor 枚举 / pickCodexAccountForBindingInTx /
+   hasActiveOfficialOAuthAccountInGroup(codex)严格只取本 channel 行,fail-closed
+   池空不回落 —— 防 v3/v5 双 master 共刷同一 codex OAuth refresh-token family 吊销
+   (个人版 Claude OAuth 双权威源同型事故)。codexRefreshActor / codexDriftReconciler
+   登记为 **v5-owned(channel-scoped)** 域,gate `(controlPlaneEnabled || channel==='v5')`。
+   claude provider 行暂不按 channel 分流(共享池语义不动)。
+   **运维待办**:v5 要用 codex,须由 admin 以 runtime_channel='v5' 录入专属账号行
+   (或把某 v3 行整行迁给 v5 —— 迁移即换权威,禁止两 channel 同链共刷)。
+
+3. **架构决策②:codex relay 归属 egress 进程**。装配收口新模块
+   http/codexInternalAssembly.ts(master 与 egress 共用同一份 db 闭包/fileWriter,
+   根除双份手抄漂移);egress/main.ts 本地挂载 codex-relay(流式)+ token-refresh
+   (401 自愈,fanout 在 egress 进程直连 enqueue,FOR UPDATE 跨进程安全),
+   master dispatchInternal 挂载保留服务非 split 拓扑。
+   **⚠️ 部署**:改 codex relay/refresh/assembly 代码须 `deploy-v5.sh --egress`。
+
+4. **计费红线预埋(finalizer v5 形态,bridge 不接)**:codexFinalizer 经
+   settleUsageAndLedger → spendTwoBucket(双钱包自动生效,balanceAfter=总可用);
+   零输出免单在 finalizer 层显式补(success+output=0+本有成本 → cost=0 落 audit,
+   snapshot 记 waived/wouldHaveCharged);usage_records.account_id 恒 NULL(弃 0n
+   假账号);session_id = deriveEngineSessionId('oceng-'+sha256(key).hex[0:48],
+   单一权威 helper,构造期形状 fail-closed)。wechat codex 路径已按新口径接
+   (顺带修 v3 遗留 appendCostCredits 未加 c: 前缀的孤儿成本 bug)。
+
+5. **测试**:复活 12 个 commercial codex 测试 + v3Supervisor.test 反打;
+   codexFinalizer.test 改双钱包 fake SQL + 新增 6 case(免单/NULL 账号/session 口径);
+   codexLazyMigrate.test 2 处断言更新为 channel SQL;新增
+   codexChannelPartition.integ.test(8 case:0098 幂等/CHECK/picker fail-closed/
+   actor 枚举口径/claude 不受影响,真 PG 全绿)。runtimeEntrypointPolicy.test
+   翻转为断言 codex seed 存在。单测/integ 失败集与 canonical 逐名一致(零新增)。
+
+**M1b 未做 / 留给 M2**:bridge codex 计费状态机与 codexBinding 三件套接线;
+userChatBridgeCodexBilling.test(1167 行)改造复用;runtime image 以
+OC_INCLUDE_CODEX=1 重建(M3);/api/public/models gpt-5.5 可见性确认。

@@ -35,6 +35,7 @@ import {
   v3ContainerNameFor,
   v3VolumeNameFor,
   v3ProjectsVolumeNameFor,
+  v3CodexVolumeNameFor,
   v3UserLocalVolumeNameFor,
   v3UserConfigVolumeNameFor,
   resolveCcbBaselineMounts,
@@ -47,10 +48,12 @@ import {
   V3_CONFIG_TMPFS_PATH,
   V3_VOLUME_MOUNT,
   V3_PROJECTS_MOUNT,
+  V3_CODEX_HOME_MOUNT,
   V3_USER_LOCAL_MOUNT,
   V3_USER_CONFIG_MOUNT,
   SupervisorError,
 } from "../agent-sandbox/index.js";
+import { buildCodexRelayLocalBaseUrl } from "../http/internalCodexRelay.js";
 
 // ───────────────────────────────────────────────────────────────────────
 //  fake docker
@@ -426,12 +429,13 @@ function fixedIps(ips: string[]): () => string {
 //  纯名字函数
 // ───────────────────────────────────────────────────────────────────────
 
-describe("v3ContainerNameFor / v3VolumeNameFor / v3ProjectsVolumeNameFor / v3{UserLocal,UserConfig}VolumeNameFor", () => {
+describe("v3ContainerNameFor / v3VolumeNameFor / v3ProjectsVolumeNameFor / v3{Codex,UserLocal,UserConfig}VolumeNameFor", () => {
   test("happy path", () => {
     assert.equal(v3ContainerNameFor(42), "oc-v3-u42");
     assert.equal(v3VolumeNameFor(42), "oc-v3-data-u42");
     assert.equal(v3ProjectsVolumeNameFor(42), "oc-v3-proj-u42");
-    // D2 — 持久化 volume(v5 ccb-only 已移除 codex 卷)
+    // D2 — 3 个新持久化 volume
+    assert.equal(v3CodexVolumeNameFor(42), "oc-v3-codex-u42");
     assert.equal(v3UserLocalVolumeNameFor(42), "oc-v3-userlocal-u42");
     assert.equal(v3UserConfigVolumeNameFor(42), "oc-v3-userconfig-u42");
   });
@@ -440,6 +444,7 @@ describe("v3ContainerNameFor / v3VolumeNameFor / v3ProjectsVolumeNameFor / v3{Us
       assert.throws(() => v3ContainerNameFor(bad as number), SupervisorError);
       assert.throws(() => v3VolumeNameFor(bad as number), SupervisorError);
       assert.throws(() => v3ProjectsVolumeNameFor(bad as number), SupervisorError);
+      assert.throws(() => v3CodexVolumeNameFor(bad as number), SupervisorError);
       assert.throws(() => v3UserLocalVolumeNameFor(bad as number), SupervisorError);
       assert.throws(() => v3UserConfigVolumeNameFor(bad as number), SupervisorError);
     }
@@ -482,11 +487,12 @@ describe("provisionV3Container", () => {
     assert.equal(result.token, `oc-v3.${result.containerId}.${SECRET}`);
     assert.ok(result.dockerContainerId.length > 0);
 
-    // volume 落 label(D2 4 个:data + projects + userlocal + userconfig;v5 ccb-only 无 codex 卷)
-    assert.equal(captured.volumesCreated.length, 4);
+    // volume 落 label(D2 全套 5 个:data + projects + codex + userlocal + userconfig)
+    assert.equal(captured.volumesCreated.length, 5);
     for (const expectedName of [
       "oc-v3-data-u777",
       "oc-v3-proj-u777",
+      "oc-v3-codex-u777",
       "oc-v3-userlocal-u777",
       "oc-v3-userconfig-u777",
     ]) {
@@ -562,18 +568,26 @@ describe("provisionV3Container", () => {
     assert.match(tmp, /nodev/);
     assert.match(tmp, /mode=0700/);
 
-    // 5 条 bind(D2 持久化方案 4 卷 + ssh-user-run ro;v5 ccb-only 已移除 codex 卷 + codex-auth ro):
+    // 7 条 bind(D2 持久化方案 + codex-auth ro + ssh-user-run ro):
     //   data       → /home/agent/.openclaude
     //   projects   → /run/oc/claude-config/projects
+    //   codex      → /home/agent/.codex
     //   userlocal  → /home/agent/.local
     //   userconfig → /home/agent/.config
+    //   codex-auth → /run/oc/codex-auth  (legacy fallback:本测试无 DATABASE_URL → pickCodex 抛错 →
+    //                                    boundCodexAccountId=null → 走 else if (!useRemote) 分支,
+    //                                    codexMountSource = DEFAULT_V3_CODEX_CONTAINER_DIR)
     //   ssh        → /run/ccb-ssh        (本地 provision 总会 mkdir /run/ccb-ssh/u<uid> + 挂 ro,
     //                                    让容器内 agent 走 ctl.sock 用 ccb ssh mux)
+    // 任一项改动 → 同步 v3supervisor.ts:1755-1764(base 5) / :1881(codex-auth) / :1889(ssh)
     assert.deepEqual(opts.HostConfig?.Binds, [
       `oc-v3-data-u777:${V3_VOLUME_MOUNT}:rw`,
       `oc-v3-proj-u777:${V3_PROJECTS_MOUNT}:rw`,
+      `oc-v3-codex-u777:${V3_CODEX_HOME_MOUNT}:rw`,
       `oc-v3-userlocal-u777:${V3_USER_LOCAL_MOUNT}:rw`,
       `oc-v3-userconfig-u777:${V3_USER_CONFIG_MOUNT}:rw`,
+      // DEFAULT_V3_CODEX_CONTAINER_DIR + V3_CODEX_AUTH_RO_MOUNT(literal 保持测试自证)
+      "/var/lib/openclaude-v3/codex-container-auth:/run/oc/codex-auth:ro",
       // V3_SSH_RUN_ROOT_HOST/u<uid> + V3_SSH_RUN_CONTAINER_MOUNT(常量未 export,literal)
       "/run/ccb-ssh/u777:/run/ccb-ssh:ro",
     ]);
@@ -589,7 +603,70 @@ describe("provisionV3Container", () => {
     assert.equal(captured.started, 1);
   });
 
-  // (v5 ccb-only:Codex relay env 注入测试已随 buildCodexRelayContainerEnv 一并移除。)
+  test("Codex relay env: passes non-secret knobs but rewrites upstream URL to container loopback relay", async () => {
+    const keys = [
+      "OC_V3_CODEX_LOCAL_RELAY_ENABLED",
+      "OC_CODEX_MODEL_PROVIDER",
+      "OC_CODEX_PROVIDER_NAME",
+      "OC_CODEX_BASE_URL",
+      "OC_CODEX_UPSTREAM_BASE_URL",
+      "OC_CODEX_WIRE_API",
+      "OC_CODEX_PREFERRED_AUTH_METHOD",
+      "OC_CODEX_DISABLE_RESPONSE_STORAGE",
+      "OC_CODEX_API_KEY",
+    ] as const;
+    const saved = new Map<string, string | undefined>();
+    for (const key of keys) saved.set(key, process.env[key]);
+    try {
+      process.env.OC_V3_CODEX_LOCAL_RELAY_ENABLED = "1";
+      process.env.OC_CODEX_MODEL_PROVIDER = "api111";
+      process.env.OC_CODEX_PROVIDER_NAME = "Yunwu";
+      process.env.OC_CODEX_BASE_URL = "https://yunwu.ai/v1";
+      process.env.OC_CODEX_WIRE_API = "responses";
+      process.env.OC_CODEX_PREFERRED_AUTH_METHOD = "apikey";
+      process.env.OC_CODEX_DISABLE_RESPONSE_STORAGE = "1";
+      process.env.OC_CODEX_API_KEY = "not-a-real-api-key";
+
+      const { docker, captured } = makeDocker();
+      await provisionV3Container(
+        {
+          docker,
+          pool: pool as unknown as Pool,
+          image: TEST_IMAGE,
+          selfHostId: TEST_HOST,
+          randomIp: () => "172.30.5.43",
+          randomSecret: fixedSecret("b".repeat(64)),
+        },
+        778,
+      );
+
+      const env = captured.containersCreated[0]?.Env ?? [];
+      assert.ok(env.includes("OC_CODEX_MODEL_PROVIDER=api111"));
+      assert.ok(env.includes("OC_CODEX_PROVIDER_NAME=Yunwu"));
+      assert.ok(env.includes(`OC_CODEX_BASE_URL=${buildCodexRelayLocalBaseUrl(`http://127.0.0.1:${V3_CONTAINER_PORT}`, "https://yunwu.ai/v1")}`));
+      assert.ok(env.includes("OC_CODEX_WIRE_API=responses"));
+      assert.ok(env.includes("OC_CODEX_PREFERRED_AUTH_METHOD=apikey"));
+      assert.ok(env.includes("OC_CODEX_DISABLE_RESPONSE_STORAGE=1"));
+      assert.ok(
+        !env.includes("OC_CODEX_BASE_URL=https://yunwu.ai/v1"),
+        "external upstream base URL must not be passed directly into managed containers",
+      );
+      assert.ok(
+        !env.some((entry) => entry.startsWith("OC_CODEX_UPSTREAM_BASE_URL=")),
+        "upstream base URL is master-only and must not be passed into managed containers",
+      );
+      assert.ok(
+        !env.some((entry) => entry.startsWith("OC_CODEX_API_KEY=")),
+        "OC_CODEX_API_KEY must stay in auth.json and out of docker env",
+      );
+    } finally {
+      for (const key of keys) {
+        const prev = saved.get(key);
+        if (prev === undefined) delete process.env[key];
+        else process.env[key] = prev;
+      }
+    }
+  });
 
   test("资源限额 env 覆盖:合法小数 CPU 正确转换 + 非法微值回退默认(Codex round 1 BLOCKER 回归锁)", async () => {
     // Codex round 1 抓到的 bug:OC_V3_MEMORY_MB=0.5 会被 floor 成 0,Docker 当"不限";必须回退默认
@@ -2576,7 +2653,7 @@ describe("provisionV3Container — CCB baseline 挂载分支", () => {
     assert.equal(captured.containersCreated.length, 0);
   });
 
-  test("baseline 缺失 + OC_V3_CCB_BASELINE_OPTIONAL=1 → warn 并继续(5 条 Binds:4 volume + ssh,无 baseline ro)", async () => {
+  test("baseline 缺失 + OC_V3_CCB_BASELINE_OPTIONAL=1 → warn 并继续(7 条 Binds:5 volume + codex-auth + ssh,无 baseline ro)", async () => {
     process.env.OC_V3_CCB_BASELINE_OPTIONAL = "1";
     const { docker, captured } = makeDocker();
     await provisionV3Container(
@@ -2591,18 +2668,20 @@ describe("provisionV3Container — CCB baseline 挂载分支", () => {
       124,
     );
     const opts = captured.containersCreated[0]!;
-    // D2 4 条 volume bind + ssh-user-run ro,不追加 baseline ro(v5 ccb-only 无 codex 卷/auth)
+    // D2 全套 5 条 volume bind + codex-auth legacy ro + ssh-user-run ro,不追加 baseline ro
     // (baselineMounts=null 因为 OPTIONAL=1 + 假目录)
     assert.deepEqual(opts.HostConfig?.Binds, [
       `oc-v3-data-u124:${V3_VOLUME_MOUNT}:rw`,
       `oc-v3-proj-u124:${V3_PROJECTS_MOUNT}:rw`,
+      `oc-v3-codex-u124:${V3_CODEX_HOME_MOUNT}:rw`,
       `oc-v3-userlocal-u124:${V3_USER_LOCAL_MOUNT}:rw`,
       `oc-v3-userconfig-u124:${V3_USER_CONFIG_MOUNT}:rw`,
+      "/var/lib/openclaude-v3/codex-container-auth:/run/oc/codex-auth:ro",
       "/run/ccb-ssh/u124:/run/ccb-ssh:ro",
     ]);
   });
 
-  test("(root only) baseline 齐全 → 8 条 Binds(4 volume + ssh + AGENTS.md + CLAUDE.md + skills 父目录)", async () => {
+  test("(root only) baseline 齐全 → 10 条 Binds(5 volume + codex-auth + ssh + AGENTS.md + CLAUDE.md + skills 父目录)", async () => {
     const b = makeFakeBaseline();
     if (!b) return; // 非 root 跳过
     try {
@@ -2619,12 +2698,14 @@ describe("provisionV3Container — CCB baseline 挂载分支", () => {
         125,
       );
       const opts = captured.containersCreated[0]!;
-      // 顺序匹配 v3supervisor.ts:base 4 → ssh → baseline AGENTS/CLAUDE/skills(v5 无 codex 卷/auth)。
+      // 顺序匹配 v3supervisor.ts:base 5 → codex-auth → ssh → baseline AGENTS/CLAUDE/skills。
       assert.deepEqual(opts.HostConfig?.Binds, [
         `oc-v3-data-u125:${V3_VOLUME_MOUNT}:rw`,
         `oc-v3-proj-u125:${V3_PROJECTS_MOUNT}:rw`,
+        `oc-v3-codex-u125:${V3_CODEX_HOME_MOUNT}:rw`,
         `oc-v3-userlocal-u125:${V3_USER_LOCAL_MOUNT}:rw`,
         `oc-v3-userconfig-u125:${V3_USER_CONFIG_MOUNT}:rw`,
+        "/var/lib/openclaude-v3/codex-container-auth:/run/oc/codex-auth:ro",
         "/run/ccb-ssh/u125:/run/ccb-ssh:ro",
         `${pathJoin(b.dir, "AGENTS.md")}:/opt/openclaude/AGENTS.md:ro`,
         `${pathJoin(b.dir, "CLAUDE.md")}:${V3_CONFIG_TMPFS_PATH}/CLAUDE.md:ro`,

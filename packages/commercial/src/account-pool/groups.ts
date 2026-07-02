@@ -4,6 +4,7 @@ import type { PoolClient } from "pg";
 import { encrypt, decryptToBuffer } from "../crypto/aead.js";
 import { loadKmsKey, zeroBuffer } from "../crypto/keys.js";
 import { query, tx, type QueryRunner } from "../db/queries.js";
+import { getRuntimeChannel } from "../runtimeChannel.js";
 
 export const ACCOUNT_GROUP_KINDS = ["official_oauth", "api_relay"] as const;
 export type AccountGroupKind = (typeof ACCOUNT_GROUP_KINDS)[number];
@@ -487,14 +488,18 @@ export async function hasActiveOfficialOAuthAccountInGroup(
 ): Promise<boolean> {
   const group = await getAccountGroup(groupId);
   if (!group || !group.enabled || group.kind !== "official_oauth" || group.provider !== provider) return false;
+  // 0098 channel 划分(M1b):codex 账号池权威按 runtime_channel 归属 —— codex 行
+  // 严格只认本 channel(v5 取不到 v3 行,fail-closed);claude 行维持共享池语义不过滤。
+  const codexChannel = provider === "codex" ? getRuntimeChannel() : null;
   const res = await query<{ ok: number }>(
     `SELECT 1 AS ok
        FROM claude_accounts
       WHERE provider = $1
         AND group_id = $2
         AND status = 'active'
+        AND ($3::text IS NULL OR runtime_channel = $3::text)
       LIMIT 1`,
-    [provider, String(groupId)],
+    [provider, String(groupId), codexChannel],
     runner,
   );
   return res.rows.length > 0;

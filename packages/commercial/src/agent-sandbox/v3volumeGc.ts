@@ -22,7 +22,7 @@
  *   - 删 volume 前必须验证 **该 uid 没有 active agent_containers 行**(否则
  *     docker 409 in-use,日志噪声)。idle 30min sweep + orphan reconcile 会清,
  *     volumeGc 等他们清完才动手。
- *   - 删 volume 走 supervisor.removeV3Volume(D2 后内部级联删 4 个:oc-v3-data /
+ *   - 删 volume 走 supervisor.removeV3Volume(D2 后内部级联删 5 个:oc-v3-data /
  *     oc-v3-proj / oc-v3-codex / oc-v3-userlocal / oc-v3-userconfig);missing
  *     → noop。任何 docker 错(401/500)聚合 errors[],单行不影响其他。
  *
@@ -45,6 +45,7 @@ import { getRuntimeChannel } from "../runtimeChannel.js";
 import {
   acquireUserLifecycleLock,
   removeV3Volume,
+  v3CodexVolumeNameFor,
   v3ProjectsVolumeNameFor,
   v3UserConfigVolumeNameFor,
   v3UserLocalVolumeNameFor,
@@ -95,7 +96,7 @@ export type VolumeGcReason = "banned" | "no_login";
 export interface VolumeGcTickResult {
   /** 本次 tick 扫到多少候选 uid(banned + no-login 合并去重) */
   scanned: number;
-  /** 实际被 GC 的 user 数(每 user 一次性删 data/proj/userlocal/userconfig 4 个 volume,计 1) */
+  /** 实际被 GC 的 user 数(每 user 一次性删 data/proj/codex/userlocal/userconfig 5 个 volume,计 1) */
   removed: number;
   /** 因有 active 容器行而 skip 的 uid 数 */
   skippedActiveContainer: number;
@@ -359,11 +360,11 @@ export async function runVolumeGcTick(
         log?.info?.("[v3/volumeGc] removed volumes", {
           uid: cand.uid,
           reason: cand.reason,
-          // removeV3Volume 内部删 4 个 volume(D2;v5 ccb-only 已移除 codex 卷);
-          // 日志列全名便于事故定位
+          // removeV3Volume 内部删 5 个 volume(D2);日志列全名便于事故定位
           volumes: [
             v3VolumeNameFor(cand.uid),
             v3ProjectsVolumeNameFor(cand.uid),
+            v3CodexVolumeNameFor(cand.uid),
             v3UserLocalVolumeNameFor(cand.uid),
             v3UserConfigVolumeNameFor(cand.uid),
           ],

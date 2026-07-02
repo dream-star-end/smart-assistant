@@ -268,7 +268,7 @@ describe("openclaude-runtime entrypoint env-scrub policy", () => {
     );
   });
 
-  test("entrypoint.ts seeds ONLY the main 全能助手 agent (v5 纯市场:子 agent 走市场安装)", () => {
+  test("entrypoint.ts seeds only main + codex agents (v5 纯市场:其它子 agent 走市场安装)", () => {
     const src = readFileSync(ENTRYPOINT_TS_PATH, "utf-8");
     // 默认模型仍是 glm-5.2 / ark(火山方舟)
     assert.match(
@@ -281,11 +281,12 @@ describe("openclaude-runtime entrypoint env-scrub policy", () => {
       /const COMMERCIAL_DEFAULT_PROVIDER\s*=\s*"ark"/,
       "commercial runtime default provider must be ark (火山方舟)",
     );
-    // 纯市场:初始 agents.yaml 只 seed main。desiredSeedAgents 恰为 [desiredMainAgent]。
+    // 纯市场 + M1b codex 复活:初始 agents.yaml 只 seed main + codex,
+    // 恰为 [desiredMainAgent, desiredCodexAgent](其它 agent 一律走市场安装)。
     assert.match(
       src,
-      /const desiredSeedAgents\s*=\s*\[desiredMainAgent\]/,
-      "v5 纯市场:initial agents.yaml must seed only the main agent (其它 agent 走市场安装)",
+      /const desiredSeedAgents\s*=\s*\[desiredMainAgent, desiredCodexAgent\]/,
+      "v5 纯市场:initial agents.yaml must seed exactly main + codex (其它 agent 走市场安装)",
     );
     const mainAgent = extractConstObjectFromSource(src, "desiredMainAgent");
     assert.match(mainAgent, /id:\s*"main"/, "main agent id must be stable");
@@ -318,11 +319,6 @@ describe("openclaude-runtime entrypoint env-scrub policy", () => {
       src,
       /provider:\s*"claude-subscription"/,
       "entrypoint must not seed Claude subscription provider for the default commercial agent",
-    );
-    assert.doesNotMatch(
-      src,
-      /provider:\s*"codex-native"/,
-      "v5 ccb-only: entrypoint must not seed any codex-native agent",
     );
   });
 
@@ -365,22 +361,25 @@ describe("openclaude-runtime entrypoint env-scrub policy", () => {
     }
   });
 
-  test("entrypoint.ts seeds no codex/gpt agent (v5 ccb-only)", () => {
+  test("entrypoint.ts seeds the codex/gpt-5.5 agent with app-server routing fields (M1b revival)", () => {
     const src = readFileSync(ENTRYPOINT_TS_PATH, "utf-8");
-    assert.doesNotMatch(
+    assert.match(
       src,
-      /const desiredCodexAgent\s*=/,
-      "v5 ccb-only: entrypoint must not define a codex seed agent",
+      /const COMMERCIAL_CODEX_MODEL\s*=\s*"gpt-5\.5"/,
+      "codex seed model const must pin gpt-5.5",
     );
-    assert.doesNotMatch(
+    const codexAgent = extractConstObjectFromSource(src, "desiredCodexAgent");
+    assert.match(codexAgent, /id:\s*"codex"/, "codex agent id must be stable");
+    assert.match(codexAgent, /model:\s*COMMERCIAL_CODEX_MODEL/, "codex agent must use the pinned gpt-5.5 const");
+    // provider/runnerKind 是 gateway runner seam 的路由依据(codex-native → app-server
+    // 形态 CodexAppServerRunner),缺失会让 gpt-5.5 会话落错 runner。
+    assert.match(codexAgent, /provider:\s*"codex-native"/, "codex agent must declare codex-native provider");
+    assert.match(codexAgent, /runnerKind:\s*"app-server"/, "codex agent must declare app-server runnerKind");
+    assert.match(codexAgent, /permissionMode:\s*"bypassPermissions"/, "codex agent must bypass permissions in the sandbox");
+    assert.match(
       src,
-      /const COMMERCIAL_CODEX_MODEL\s*=/,
-      "v5 ccb-only: entrypoint must not define the gpt-5.5 codex model const",
-    );
-    assert.doesNotMatch(
-      src,
-      /provider:\s*"codex-native"/,
-      "v5 ccb-only: entrypoint must not seed any codex-native agent",
+      /const desiredSeedAgents = \[desiredMainAgent, desiredCodexAgent\];/,
+      "codex agent must be part of the seed list",
     );
   });
 
