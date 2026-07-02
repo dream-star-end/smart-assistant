@@ -20,7 +20,7 @@
 import { _clearStoredAccessToken, state } from './state.js?v=7e6fc8e6'
 import { htmlSafeEscape } from './dom.js?v=7e6fc8e6'
 import { apiGet, apiJson, apiText, apiFetch, authHeaders, onAuthExpired, silentRefresh } from './api.js?v=7e6fc8e6'
-import { lineChart, barChart, destroyChart, fmt as cfmt } from './charts.js?v=7e6fc8e6'
+import { lineChart, barChart, donutChart, destroyChart, fmt as cfmt } from './charts.js?v=7e6fc8e6'
 
 // 与后端 packages/commercial/src/admin/ledger.ts 的 LEDGER_REASONS 枚举严格同步。
 // 新增/删除 reason 必须两端同步改,否则 ledger tab filter 会把错误值发给后端
@@ -616,6 +616,21 @@ const TAB_CLEANUPS = {
       clearInterval(HOSTS_STATE.refreshTimer)
       HOSTS_STATE.refreshTimer = null
     }
+  },
+  health() {
+    _destroyHealthCharts()
+  },
+  ledger() {
+    _destroyLedgerCharts()
+  },
+  orders() {
+    _destroyOrdersCharts()
+  },
+  users() {
+    _destroyUsersCharts()
+  },
+  containers() {
+    _destroyContainersCharts()
   },
 }
 let _currentTab = null
@@ -1432,6 +1447,8 @@ const USERS_STATE = {
   funnelDays: 7,
   /** 防 funnel KPI 异步竞态(切 7/30 来回点)。 */
   funnelLoadSeq: 0,
+  /** 图表 canvas 引用(转化漏斗),切 tab / 重渲染时销毁防泄漏。 */
+  charts: {},
 }
 
 const REG_WITHIN_CHIPS = [
@@ -1462,6 +1479,7 @@ function _userActiveTone(iso) {
 
 async function renderUsersTab() {
   const mySeq = ++USERS_STATE.renderSeq
+  _destroyUsersCharts() // 重渲染前销毁上一轮漏斗图,防 detached canvas 泄漏
 
   // toolbar 状态从 sessionStorage 恢复;state reset 只保留过滤条件不保留 rows。
   USERS_STATE.q = sessionStorage.getItem('admin_users_q') || ''
@@ -1509,6 +1527,14 @@ async function renderUsersTab() {
             <div class="stat-value is-loading">—</div>
             <div class="stat-delta">—</div>
           </div>`).join('')}
+      </div>
+
+      <div class="chart-card" style="margin-top:var(--s-3);min-height:auto;">
+        <div class="chart-card-head">
+          <h3>转化漏斗</h3>
+          <span class="chart-sub" id="u-funnel-chart-sub">最近 ${fday} 天 · cohort → 验证 → 充值 → 请求</span>
+        </div>
+        <div class="chart-card-body" style="min-height:220px;"><canvas id="u-funnel-chart"></canvas></div>
       </div>
 
       <div class="toolbar" style="margin-top:var(--s-3);">
@@ -1644,6 +1670,19 @@ async function _loadFunnelKpis(renderSeq) {
   updateStat(cards[5], pct(ret7, elig7),
     elig7 > 0 ? `${ret7} / ${elig7} 合格 cohort` : '窗口未到',
     elig7 > 0 && ret7 / elig7 < 0.1 ? 'warning' : null)
+
+  // 转化漏斗 bar:cohort → 验证 → 首次充值 → 首次请求(绝对量,直观看逐级流失)。
+  // 与 7/30 toggle 联动(_loadFunnelKpis 在切换时重跑),barChart 幂等重绘同一 canvas。
+  const canvas = $('u-funnel-chart')
+  if (canvas) {
+    USERS_STATE.charts.funnel = canvas
+    barChart(canvas, {
+      labels: ['cohort 总数', '已验证', '首次充值', '首次请求'],
+      series: [{ label: `最近 ${days} 天`, data: [total, verified, topup, req] }],
+    })
+    const sub = $('u-funnel-chart-sub')
+    if (sub) sub.textContent = `最近 ${days} 天 · cohort → 验证 → 充值 → 请求`
+  }
 }
 
 /** 加载/刷新一页用户(cursor = USERS_STATE.nextCursor,或首页 null)。 */
@@ -3549,11 +3588,13 @@ const CONTAINER_STATUSES = ['provisioning', 'running', 'stopped', 'removed', 'er
 const CONTAINERS_STATE = {
   renderSeq: 0, loadSeq: 0,
   rows: [], filterStatus: '', filterEmail: '', filterHostUuid: '',
+  charts: {}, // canvas 引用(状态构成 donut),切 tab / 重渲染销毁
 }
 
 async function renderContainersTab() {
   const mySeq = ++CONTAINERS_STATE.renderSeq
   CONTAINERS_STATE.rows = []
+  _destroyContainersCharts() // 重渲染(筛选/刷新)前销毁旧 donut,防 detached canvas 泄漏
   // deeplink 命中本 tab 时按"完整目标态"处理:query 里没出现的 cross-tab
   // filter 字段一律清空(并 remove sessionStorage),避免上一次跳转的残留
   // 与本次 deeplink 做交集 — 例如先按 host 过滤、再点用户的 chip,会变成
@@ -3579,16 +3620,21 @@ async function renderContainersTab() {
   }
 
   view().innerHTML = `
-    <div class="panel">
-      <h1 style="margin-top:0">Agent 容器 <small style="color:var(--muted);font-weight:400;font-size:14px" id="ct-count">加载中…</small></h1>
-
+    <div class="admin-two-col" style="align-items:stretch;">
+      <div class="chart-card">
+        <div class="chart-card-head"><h3>容器状态构成</h3><span class="chart-sub">running / provisioning / stopped / error</span></div>
+        <div class="chart-card-body"><canvas id="ct-chart-state"></canvas></div>
+      </div>
       <!-- 4 张 KPI 卡片 -->
-      <div class="stat-grid" id="ct-kpis" style="margin-bottom:18px">
+      <div class="stat-grid" id="ct-kpis" style="align-content:center;">
         <div class="stat-card"><div class="stat-label">总容器</div><div class="stat-value is-loading">—</div><div class="stat-delta stat-muted">加载中…</div></div>
         <div class="stat-card"><div class="stat-label">运行中</div><div class="stat-value is-loading">—</div><div class="stat-delta stat-muted">加载中…</div></div>
         <div class="stat-card"><div class="stat-label">错误 / 有过报错</div><div class="stat-value is-loading">—</div><div class="stat-delta stat-muted">加载中…</div></div>
         <div class="stat-card"><div class="stat-label">7d 订阅到期</div><div class="stat-value is-loading">—</div><div class="stat-delta stat-muted">加载中…</div></div>
       </div>
+    </div>
+    <div class="panel">
+      <h1 style="margin-top:0">Agent 容器 <small style="color:var(--muted);font-weight:400;font-size:14px" id="ct-count">加载中…</small></h1>
 
       <div class="toolbar">
         <label>生命周期:
@@ -3658,6 +3704,28 @@ async function _loadContainersKpis(renderSeq) {
   updateStat(cards[3], s.expiring_7d.toLocaleString(),
     s.expiring_7d > 0 ? '需关注续订' : '暂无到期风险',
     s.expiring_7d > 0 ? 'warning' : 'success')
+
+  // 容器状态构成 donut(running/provisioning/stopped/error),语义配色。
+  const canvas = $('ct-chart-state')
+  if (canvas) {
+    const states = [
+      { label: '运行中', value: Number(s.running) || 0, color: '--ok' },
+      { label: 'provisioning', value: Number(s.provisioning) || 0, color: '--warn' },
+      { label: 'stopped', value: Number(s.stopped) || 0, color: '--muted' },
+      { label: 'error', value: Number(s.error) || 0, color: '--danger' },
+    ].filter((x) => x.value > 0)
+    if (states.length === 0) {
+      if (CONTAINERS_STATE.charts.state) { destroyChart(canvas); CONTAINERS_STATE.charts.state = null }
+      _renderChartError(canvas, '无容器')
+    } else {
+      CONTAINERS_STATE.charts.state = canvas
+      donutChart(canvas, {
+        labels: states.map((x) => x.label),
+        values: states.map((x) => x.value),
+        colors: states.map((x) => x.color),
+      })
+    }
+  }
 }
 
 async function _loadContainers(renderSeq) {
@@ -3884,6 +3952,7 @@ const LEDGER_STATE = {
   reason: '',
   from: '', // ISO 字符串(toISOString 后),空字符串表示不过滤
   to: '',
+  charts: {}, // canvas 引用(reason 占比 / 时间序列),供切 tab 销毁用
 }
 const LEDGER_PAGE_SIZE = 50
 
@@ -3904,6 +3973,7 @@ function _isoToDatetimeLocal(iso) {
 
 async function renderLedgerTab() {
   const mySeq = ++LEDGER_STATE.renderSeq
+  _destroyLedgerCharts() // 同 tab 重查询也走 innerHTML 重置,先销毁旧 donut 防泄漏
 
   LEDGER_STATE.userId = sessionStorage.getItem('admin_ledger_user') || ''
   let reason = sessionStorage.getItem('admin_ledger_reason') || ''
@@ -3920,6 +3990,13 @@ async function renderLedgerTab() {
   LEDGER_STATE.done = false
 
   view().innerHTML = `
+    <div class="admin-two-col" style="align-items:stretch;">
+      <div class="chart-card">
+        <div class="chart-card-head"><h3>流水构成</h3><span class="chart-sub">按 reason · 金额(当前视图)</span></div>
+        <div class="chart-card-body"><canvas id="l-chart-reason"></canvas></div>
+      </div>
+      <div class="stat-grid" id="l-money-kpis" style="align-content:center;"></div>
+    </div>
     <div class="panel">
       <h2>积分流水 <small id="l-count">加载中…</small></h2>
       <div class="toolbar" style="flex-wrap:wrap;gap:var(--s-2)">
@@ -4054,6 +4131,47 @@ function _renderLedgerTable() {
 
   const lm = $('l-load-more')
   if (lm) lm.style.display = LEDGER_STATE.done ? 'none' : 'block'
+  _renderLedgerCharts()
+}
+
+// 当前视图(已加载行)的流水构成 donut(按 reason 汇总 |delta|)+ 收支 stat 卡。
+// 每次加载更多后由 _renderLedgerTable 调用重绘;canvas 常驻(在表格容器外)。
+const LEDGER_DONUT_PALETTE = ['--accent', '--ok', '--warn', '--danger', '--info', '--muted', '--accent']
+function _renderLedgerCharts() {
+  const rows = LEDGER_STATE.rows || []
+  let totalIn = 0
+  let totalOut = 0
+  const byReason = new Map() // reasonCode -> abs cents
+  for (const r of rows) {
+    const c = Number(r.delta) || 0
+    if (c >= 0) totalIn += c
+    else totalOut += -c
+    byReason.set(r.reason, (byReason.get(r.reason) || 0) + Math.abs(c))
+  }
+
+  const kpiEl = $('l-money-kpis')
+  if (kpiEl) {
+    const net = totalIn - totalOut
+    kpiEl.innerHTML =
+      _kpiCard('总入账', fmtCents(totalIn), `当前 ${rows.length} 条`, totalIn > 0 ? 'success' : undefined) +
+      _kpiCard('总扣减', fmtCents(-totalOut), '支出合计', totalOut > 0 ? 'danger' : undefined) +
+      _kpiCard('净额', fmtCents(net), '入账 − 扣减', net >= 0 ? 'success' : 'danger')
+  }
+
+  const canvas = $('l-chart-reason')
+  if (!canvas) return
+  const entries = [...byReason.entries()].filter(([, v]) => v > 0).sort((a, b) => b[1] - a[1])
+  if (entries.length === 0) {
+    if (LEDGER_STATE.charts.reason) { destroyChart(canvas); LEDGER_STATE.charts.reason = null }
+    _renderChartError(canvas, '无记录')
+    return
+  }
+  LEDGER_STATE.charts.reason = canvas
+  donutChart(canvas, {
+    labels: entries.map(([k]) => LEDGER_REASON_LABELS[k] || k),
+    values: entries.map(([, v]) => Number((v / 100).toFixed(2))), // 元
+    colors: entries.map((_, i) => LEDGER_DONUT_PALETTE[i % LEDGER_DONUT_PALETTE.length]),
+  })
 }
 
 async function _exportLedgerCsv() {
@@ -4135,11 +4253,13 @@ const ORDERS_STATE = {
   status: '',
   userId: '',
   done: false,
+  charts: {}, // canvas 引用(营收 / 支付状态占比),供切 tab 销毁用
 }
 const ORDERS_PAGE_SIZE = 50
 
 async function renderOrdersTab() {
   const mySeq = ++ORDERS_STATE.renderSeq
+  _destroyOrdersCharts() // 同 tab 重查询也走 innerHTML 重置,先销毁旧 donut 防泄漏
 
   // 过滤参数:status (sessionStorage 持久化 — 仪表盘 KPI 卡片可预过滤)、user_id
   ORDERS_STATE.status = sessionStorage.getItem('admin_orders_status') || ''
@@ -4154,9 +4274,15 @@ async function renderOrdersTab() {
   ORDERS_STATE.done = false
 
   view().innerHTML = `
+    <div class="admin-two-col" style="align-items:stretch;">
+      <div class="chart-card">
+        <div class="chart-card-head"><h3>支付状态构成</h3><span class="chart-sub">当前视图 · 按 status</span></div>
+        <div class="chart-card-body"><canvas id="o-chart-status"></canvas></div>
+      </div>
+      <div class="stat-grid" id="o-kpis" style="align-content:center;"></div>
+    </div>
     <div class="panel">
       <h2>订单 <small id="o-count">加载中…</small></h2>
-      <div id="o-kpis"></div>
       <div class="toolbar">
         <select id="o-status">
           <option value="">全部状态</option>
@@ -4205,22 +4331,15 @@ function _renderOrdersKpiStrip(kpi) {
   const el = $('o-kpis')
   if (!el) return
   if (!kpi) { el.innerHTML = ''; return }
-  el.innerHTML = `
-    <div class="toolbar" style="gap:var(--s-3);flex-wrap:wrap;">
-      <span class="stat-chip ${kpi.pending_overdue_24h > 0 ? 'warn' : 'ok'}">
-        24h 卡单 · <b>${kpi.pending_overdue_24h}</b>
-      </span>
-      <span class="stat-chip ${kpi.pending_overdue > 0 ? 'warn' : 'ok'}">
-        累计卡单 · <b>${kpi.pending_overdue}</b>
-      </span>
-      <span class="stat-chip ${kpi.callback_conflicts_24h > 0 ? 'danger' : 'ok'}">
-        24h 回调冲突 · <b>${kpi.callback_conflicts_24h}</b>
-      </span>
-      <span class="stat-chip ok">
-        24h 已付 · <b>${kpi.paid_24h_count}</b>
-        <span style="opacity:0.7">(${fmtCents(kpi.paid_24h_amount_cents)})</span>
-      </span>
-    </div>`
+  // 升级为标准 stat-card(装饰层补 accent 竖条),异常态用 tone 上色。
+  el.innerHTML =
+    _kpiCard('24h 卡单', String(kpi.pending_overdue_24h), '超时未支付',
+      kpi.pending_overdue_24h > 0 ? 'warning' : 'success') +
+    _kpiCard('累计卡单', String(kpi.pending_overdue), 'pending 超时',
+      kpi.pending_overdue > 0 ? 'warning' : 'success') +
+    _kpiCard('24h 回调冲突', String(kpi.callback_conflicts_24h), '需人工核对',
+      kpi.callback_conflicts_24h > 0 ? 'danger' : 'success') +
+    _kpiCard('24h 已付', String(kpi.paid_24h_count), fmtCents(kpi.paid_24h_amount_cents), 'success')
 }
 
 async function _loadMoreOrders(renderSeq) {
@@ -4315,6 +4434,32 @@ function _renderOrdersTable() {
   for (const b of view().querySelectorAll('button[data-act="view-order"]')) {
     b.addEventListener('click', () => openOrderDetailModal(b.dataset.no))
   }
+  _renderOrdersCharts()
+}
+
+// 当前视图(已加载订单)的支付状态构成 donut。每次加载更多后重绘;canvas 常驻。
+const ORDER_STATUS_COLORVAR = {
+  paid: '--ok', pending: '--warn', expired: '--muted', refunded: '--info', canceled: '--danger',
+}
+function _renderOrdersCharts() {
+  const canvas = $('o-chart-status')
+  if (!canvas) return
+  const byStatus = new Map()
+  for (const r of ORDERS_STATE.rows || []) {
+    byStatus.set(r.status, (byStatus.get(r.status) || 0) + 1)
+  }
+  const entries = [...byStatus.entries()].filter(([, v]) => v > 0).sort((a, b) => b[1] - a[1])
+  if (entries.length === 0) {
+    if (ORDERS_STATE.charts.status) { destroyChart(canvas); ORDERS_STATE.charts.status = null }
+    _renderChartError(canvas, '无订单')
+    return
+  }
+  ORDERS_STATE.charts.status = canvas
+  donutChart(canvas, {
+    labels: entries.map(([k]) => ORDER_STATUS_LABELS[k] || k),
+    values: entries.map(([, v]) => v),
+    colors: entries.map(([k]) => ORDER_STATUS_COLORVAR[k] || '--muted'),
+  })
 }
 
 async function openOrderDetailModal(orderNo) {
@@ -6135,7 +6280,62 @@ function _renderDiagnosticsSummary(d) {
   `
 }
 
+// ─── 图表化通用 helper ──────────────────────────────────────────────
+// 各 tab 的 chart canvas 统一存进各自 STATE.charts;切 tab 时由 TAB_CLEANUPS
+// 调对应 _destroy*Charts 销毁(与 dashboard 的 DASH_STATE.charts 同一 idiom,
+// 不另起并行机制)。
+const HEALTH_STATE = { charts: {}, renderSeq: 0 }
+
+function _destroyChartMap(map) {
+  for (const c of Object.values(map || {})) { if (c) destroyChart(c) }
+}
+function _destroyHealthCharts() { _destroyChartMap(HEALTH_STATE.charts); HEALTH_STATE.charts = {} }
+function _destroyLedgerCharts() { _destroyChartMap(LEDGER_STATE.charts); LEDGER_STATE.charts = {} }
+function _destroyOrdersCharts() { _destroyChartMap(ORDERS_STATE.charts); ORDERS_STATE.charts = {} }
+function _destroyUsersCharts() { _destroyChartMap(USERS_STATE.charts); USERS_STATE.charts = {} }
+function _destroyContainersCharts() { _destroyChartMap(CONTAINERS_STATE.charts); CONTAINERS_STATE.charts = {} }
+
+// HTTP 状态码 → 语义色 CSS 变量名(2xx ok / 3xx info / 4xx warn / 5xx danger)。
+function _statusColorVar(code) {
+  const s = String(code)
+  if (/^2/.test(s)) return '--ok'
+  if (/^3/.test(s)) return '--info'
+  if (/^4/.test(s)) return '--warn'
+  if (/^5/.test(s)) return '--danger'
+  return '--muted'
+}
+
+// 在一个 canvas 上按 {label:value} 画 donut / bar;空数据落 _renderChartError。
+// 返回 canvas(供 STATE.charts 存引用),统一被 _destroyChartMap 销毁。
+function _drawObjDonut(canvasId, obj, chartsMap, key, colorVars) {
+  const canvas = document.getElementById(canvasId)
+  if (!canvas) return
+  const entries = Object.entries(obj || {}).filter(([, v]) => Number(v) > 0)
+  if (entries.length === 0) { _renderChartError(canvas, '无数据'); return }
+  entries.sort((a, b) => b[1] - a[1])
+  chartsMap[key] = canvas
+  donutChart(canvas, {
+    labels: entries.map(([k]) => k),
+    values: entries.map(([, v]) => Number(v)),
+    colors: colorVars ? entries.map(([k]) => colorVars(k)) : undefined,
+  })
+}
+function _drawObjBar(canvasId, obj, chartsMap, key, label, color) {
+  const canvas = document.getElementById(canvasId)
+  if (!canvas) return
+  const entries = Object.entries(obj || {}).filter(([, v]) => Number(v) > 0)
+  if (entries.length === 0) { _renderChartError(canvas, '无数据'); return }
+  entries.sort((a, b) => b[1] - a[1])
+  chartsMap[key] = canvas
+  barChart(canvas, {
+    labels: entries.map(([k]) => k),
+    series: [{ label, data: entries.map(([, v]) => Number(v)), color }],
+  })
+}
+
 async function renderHealthTab() {
+  const mySeq = ++HEALTH_STATE.renderSeq
+  _destroyHealthCharts()
   view().innerHTML = `<div class="loading">正在抓取 /api/admin/metrics …</div>`
   let text
   let diagnostics = null
@@ -6145,9 +6345,14 @@ async function renderHealthTab() {
       apiGet('/api/admin/diagnostics').catch(() => null),
     ])
   } catch (e) {
+    // 切走 health tab / 又触发一次 render 期间旧请求失败:不再写 DOM。
+    if (mySeq !== HEALTH_STATE.renderSeq || _currentTab !== 'health') return
     showError(`拉取 metrics 失败: ${e.message}`, e)
     return
   }
+  // 过期保护:await 期间用户可能切走 tab(此时 TAB_CLEANUPS.health 已跑),
+  // 旧请求返回若继续写 DOM + 建 chart 会造成 stale render + Chart 泄漏。
+  if (mySeq !== HEALTH_STATE.renderSeq || _currentTab !== 'health') return
   const metrics = _parsePromText(text)
 
   // 总览数字
@@ -6199,14 +6404,43 @@ async function renderHealthTab() {
         <button class="btn btn-secondary" id="h-raw">查看原始 metrics →</button>
       </div>
 
-      <div style="display:grid; grid-template-columns:repeat(auto-fit,minmax(200px,1fr)); gap:12px; margin-bottom:16px;">
-        ${_kpiCard('总请求', fmtN(reqTotal), `OK ${fmtN(okStatusSum)} · 5xx ${fmtN(errStatusSum)}`)}
+      <div class="stat-grid" style="margin-bottom:4px;">
+        ${_kpiCard('总请求', fmtN(reqTotal), `OK ${fmtN(okStatusSum)} · 5xx ${fmtN(errStatusSum)}`,
+            errStatusSum > 0 ? 'danger' : 'success')}
         ${_kpiCard('运行中容器', fmtN(containersRunning), `agent_containers_running`)}
         ${_kpiCard('计费 success', fmtN(debitByResult.success || 0),
-            `insufficient ${fmtN(debitByResult.insufficient || 0)} · error ${fmtN(debitByResult.error || 0)}`)}
+            `insufficient ${fmtN(debitByResult.insufficient || 0)} · error ${fmtN(debitByResult.error || 0)}`,
+            (debitByResult.error || 0) > 0 ? 'danger'
+              : (debitByResult.insufficient || 0) > 0 ? 'warning' : 'success')}
         ${_kpiCard('Claude 调用 success', fmtN(claudeByStatus.success || 0),
-            `error ${fmtN(claudeByStatus.error || 0)}`)}
+            `error ${fmtN(claudeByStatus.error || 0)}`,
+            (claudeByStatus.error || 0) > 0 ? 'danger' : 'success')}
       </div>
+    </div>
+
+    <div class="admin-two-col">
+      <div class="chart-card">
+        <div class="chart-card-head">
+          <h3>HTTP 状态码分布</h3>
+          <span class="chart-sub">共 ${fmtN(reqTotal)} 请求</span>
+        </div>
+        <div class="chart-card-body"><canvas id="h-chart-status"></canvas></div>
+      </div>
+      <div class="chart-card">
+        <div class="chart-card-head">
+          <h3>代理拒绝原因</h3>
+          <span class="chart-sub">anthropic_proxy_reject</span>
+        </div>
+        <div class="chart-card-body"><canvas id="h-chart-reject"></canvas></div>
+      </div>
+    </div>
+
+    <div class="chart-card">
+      <div class="chart-card-head">
+        <h3>代理延迟 TTFT · 按模型平均 (ms)</h3>
+        <span class="chart-sub">anthropic_proxy_ttft_seconds</span>
+      </div>
+      <div class="chart-card-body"><canvas id="h-chart-ttft"></canvas></div>
     </div>
 
     <div class="panel">
@@ -6261,6 +6495,17 @@ async function renderHealthTab() {
       ${_renderKvTable(auditFailByAction, ['action', 'count'])}
     </div>` : ''}
   `
+
+  // ── 图表化:状态码占比 donut / 拒绝原因 bar / TTFT by model bar ──
+  // canvas 已在上面 innerHTML 落地;canvas 引用存进 HEALTH_STATE.charts,
+  // 切 tab 时 TAB_CLEANUPS.health → _destroyHealthCharts 统一销毁防泄漏。
+  _drawObjDonut('h-chart-status', reqByStatus, HEALTH_STATE.charts, 'status', _statusColorVar)
+  _drawObjBar('h-chart-reject', rejectByReason, HEALTH_STATE.charts, 'reject', '拒绝次数',
+    getComputedStyle(document.documentElement).getPropertyValue('--danger').trim() || undefined)
+  const ttftMsByModel = {}
+  for (const h of ttftHist || []) { if (h.avg > 0) ttftMsByModel[h.key] = Math.round(h.avg * 1000) }
+  _drawObjBar('h-chart-ttft', ttftMsByModel, HEALTH_STATE.charts, 'ttft', 'TTFT (ms)')
+
   $('h-refresh').addEventListener('click', applyHash)
   // 查看原始 metrics —— 直接用浏览器 <a href> 会丢 Authorization header,改走
   // JS fetch 带 token 拉文本,包成 blob 再新窗口打开。
@@ -6278,12 +6523,15 @@ async function renderHealthTab() {
   })
 }
 
-function _kpiCard(title, value, sub) {
+// 统一走设计系统的 .stat-card(装饰层会补 accent 竖条 + Aurora 卡片样式),
+// 不再用游离的内联样式。tone ∈ success|warning|danger 给 sub 行上色。
+function _kpiCard(title, value, sub, tone) {
+  const toneCls = tone ? ` stat-${tone}` : ''
   return `
-    <div style="background:var(--panel-2); border:1px solid var(--border); border-radius:8px; padding:12px;">
-      <div style="color:var(--muted); font-size:12px;">${escapeHtml(title)}</div>
-      <div style="font-size:24px; font-variant-numeric:tabular-nums; margin:4px 0;">${escapeHtml(value)}</div>
-      <div style="color:var(--muted); font-size:12px;">${escapeHtml(sub)}</div>
+    <div class="stat-card">
+      <div class="stat-label">${escapeHtml(title)}</div>
+      <div class="stat-value">${escapeHtml(value)}</div>
+      <div class="stat-delta${toneCls}">${escapeHtml(sub)}</div>
     </div>
   `
 }

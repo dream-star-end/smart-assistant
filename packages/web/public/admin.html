@@ -1,18 +1,22 @@
 <!doctype html>
-<html lang="zh-CN" data-theme="dark">
+<html lang="zh-CN" data-theme="light">
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
     <meta name="robots" content="noindex,nofollow" />
-    <meta name="theme-color" content="#1a1a1d" media="(prefers-color-scheme: dark)" />
-    <meta name="theme-color" content="#faf9f6" media="(prefers-color-scheme: light)" />
+    <meta name="theme-color" content="#0c0c11" media="(prefers-color-scheme: dark)" />
+    <meta name="theme-color" content="#fafafb" media="(prefers-color-scheme: light)" />
     <title>OpenClaude · 超管控制台</title>
     <link rel="icon" href="/icon.svg" />
     <style>
       /* ══════════════════════════════════════════════════════════════════
        *  OpenClaude · Admin Console
-       *  设计语言: warm terracotta accent (#d97757) + cream/ink neutrals
-       *  来源: ui_kits/openclaude-web 设计包 (2026-04-22 重构)
+       *  设计语言: v5 Aurora — violet accent (#6e56f0 / dark #9a8aff) +
+       *            airy near-white / deep near-black neutrals, light-first。
+       *  权威源: packages/web-react/src/styles.css 的 Aurora design tokens。
+       *  本文件把 Aurora 值落到 admin 既有 CSS 变量名(保留类名契约),使超管
+       *  后台与 v5 商业版主站视觉统一。语义色同时暴露 Aurora 名(--success/
+       *  --warning/--info)与 legacy 名(--ok/--warn),charts.js 与 admin.js 皆可读。
        *
        *  保留 admin.js 依赖的所有 class 名:
        *    .panel .toolbar .btn .btn-primary .data .badge .empty .loading
@@ -29,124 +33,149 @@
           Monaco, Consolas, monospace;
         --font-serif: "Source Serif Pro", "Noto Serif SC", ui-serif, Georgia, serif;
 
-        /* ── Radii ── */
-        --r-sm: 6px;
-        --r-md: 10px;
-        --r-lg: 14px;
-        --r-xl: 18px;
+        /* ── Radii (v5 Aurora scale) ── */
+        --r-xs: 6px;
+        --r-sm: 9px;
+        --r-md: 12px;
+        --r-lg: 16px;
+        --r-xl: 22px;
+        --r-2xl: 28px;
         --r-pill: 9999px;
 
         /* ── Spacing (4px baseline) ── */
         --s-1: 4px; --s-2: 8px; --s-3: 12px; --s-4: 16px;
         --s-5: 20px; --s-6: 24px; --s-8: 32px; --s-10: 40px;
 
-        /* ── Motion ── */
-        --ease: cubic-bezier(0.4, 0, 0.2, 1);
+        /* ── Motion (Material 3 "standard" easing, matches v5 Aurora) ── */
+        --ease: cubic-bezier(0.2, 0, 0, 1);
+        --ease-spring: cubic-bezier(0.22, 1, 0.36, 1);
         --t-fast: 120ms var(--ease);
         --t-base: 180ms var(--ease);
         --t-slow: 280ms var(--ease);
       }
 
-      /* ── Dark theme (default) — warm, not pure black ── */
-      :root, :root[data-theme="dark"] {
+      /* ── Dark theme — v5 Aurora: deep near-black canvas, violet accent ── */
+      :root[data-theme="dark"] {
         color-scheme: dark;
 
-        --bg: #1a1a1d;
-        --bg-elev: #212125;
-        --panel: #212125;
-        --panel-2: #2a2a30;
-        --panel-hover: #31313a;
-        --bg-subtle: #1e1e22;
+        --bg: #0c0c11;
+        --bg-elev: #1c1c25;
+        --panel: #15151c;
+        --panel-2: #1c1c25;
+        --panel-hover: #24242f;
+        --bg-subtle: #101017;
 
-        --border: #32323a;
-        --border-strong: #42424c;
-        --border-subtle: #26262c;
+        --border: #27272f;
+        --border-strong: #383843;
+        --border-subtle: #1e1e26;
 
-        --text: #eceae6;
-        --text-strong: #faf9f6;
-        --text-soft: #c5c2bc;
-        --muted: #9f9c96;
-        --dim: #6a6862;
+        --text: #f2f2f6;
+        --text-strong: #ffffff;
+        --text-soft: #d3d3db;
+        --muted: #bcbcc7;
+        --dim: #76767f;
 
-        --accent: #d97757;
-        --accent-hover: #e48968;
-        --accent-active: #c56a4a;
-        --accent-soft: rgba(217, 119, 87, 0.14);
-        --accent-border: rgba(217, 119, 87, 0.30);
+        --accent: #9a8aff;
+        --accent-hover: #ab9cff;
+        --accent-active: #8877ec;
+        --accent-soft: rgba(154, 138, 255, 0.15);
+        --accent-border: rgba(154, 138, 255, 0.32);
         --accent-fg: #ffffff;
-        --accent-glow: rgba(217, 119, 87, 0.25);
+        --accent-glow: rgba(154, 138, 255, 0.28);
+        --accent-rgb: 154, 138, 255;
 
-        --grad-primary: linear-gradient(135deg, #d97757 0%, #c56a4a 100%);
-        --grad-primary-hover: linear-gradient(135deg, #e48968 0%, #d97757 100%);
+        --grad-primary: linear-gradient(135deg, #9a8aff 0%, #7c66f0 100%);
+        --grad-primary-hover: linear-gradient(135deg, #ab9cff 0%, #9a8aff 100%);
 
-        --ok: #86c781;
-        --ok-soft: rgba(134, 199, 129, 0.12);
-        --warn: #e8b64c;
-        --warn-soft: rgba(232, 182, 76, 0.12);
-        --danger: #e06c6c;
-        --danger-soft: rgba(224, 108, 108, 0.12);
-        --info: #7aafe6;
+        /* Semantic colors — Aurora names (--success/--warning) with legacy
+           aliases (--ok/--warn) so charts.js + admin.js both resolve. */
+        --ok: #3dbe7e;
+        --ok-soft: rgba(61, 190, 126, 0.14);
+        --success: #3dbe7e;
+        --success-soft: rgba(61, 190, 126, 0.14);
+        --warn: #e0a03a;
+        --warn-soft: rgba(224, 160, 58, 0.14);
+        --warning: #e0a03a;
+        --warning-soft: rgba(224, 160, 58, 0.14);
+        --danger: #f0666e;
+        --danger-soft: rgba(240, 102, 110, 0.14);
+        --info: #6aa6ff;
+        --info-soft: rgba(106, 166, 255, 0.14);
 
-        --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.20);
-        --shadow-md: 0 4px 16px rgba(0, 0, 0, 0.30);
-        --shadow-lg: 0 12px 48px rgba(0, 0, 0, 0.45);
-        --shadow-xl: 0 24px 96px rgba(0, 0, 0, 0.60);
+        --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.24), 0 2px 8px rgba(0, 0, 0, 0.30);
+        --shadow-md: 0 4px 16px rgba(0, 0, 0, 0.36);
+        --shadow-lg: 0 12px 40px rgba(0, 0, 0, 0.48);
+        --shadow-xl: 0 24px 80px rgba(0, 0, 0, 0.60);
         --ring: 0 0 0 3px var(--accent-glow);
 
-        --glass-bg: rgba(26, 26, 29, 0.78);
-        --code-bg: #141418;
-        --inline-code-bg: rgba(155, 150, 140, 0.18);
+        --aurora: linear-gradient(135deg, #5e50a8 0%, #4a5aa0 45%, #a05878 100%);
+        --grad-cta: linear-gradient(120deg, #6d4af0 0%, #4a63d6 100%);
+
+        --glass-bg: rgba(12, 12, 17, 0.78);
+        --code-bg: #0a0a0e;
+        --inline-code-bg: rgba(255, 255, 255, 0.07);
       }
 
-      /* ── Light theme (cream) ── */
-      :root[data-theme="light"] {
+      /* ── Light theme (default) — v5 Aurora: airy near-white, violet accent ── */
+      :root, :root[data-theme="light"] {
         color-scheme: light;
 
-        --bg: #faf9f6;
+        --bg: #fafafb;
         --bg-elev: #ffffff;
         --panel: #ffffff;
-        --panel-2: #f3f2ed;
-        --panel-hover: #ebeae3;
-        --bg-subtle: #f6f5f1;
+        --panel-2: #f3f3f7;
+        --panel-hover: #ececf2;
+        --bg-subtle: #f5f5f8;
 
-        --border: #e3e1d9;
-        --border-strong: #cfccc2;
-        --border-subtle: #ecebe4;
+        --border: #e9e9ef;
+        --border-strong: #d9d9e1;
+        --border-subtle: #eeeef3;
 
-        --text: #1a1a1d;
-        --text-strong: #000000;
-        --text-soft: #3a3832;
-        --muted: #6a6862;
-        --dim: #9f9c96;
+        --text: #15151b;
+        --text-strong: #08080c;
+        --text-soft: #34343d;
+        --muted: #51515c;
+        --dim: #8b8b97;
 
-        --accent: #bc4f22;
-        --accent-hover: #a84418;
-        --accent-active: #8f390f;
-        --accent-soft: rgba(188, 79, 34, 0.08);
-        --accent-border: rgba(188, 79, 34, 0.22);
+        --accent: #6e56f0;
+        --accent-hover: #5f47e6;
+        --accent-active: #5a45d6;
+        --accent-soft: rgba(110, 86, 240, 0.08);
+        --accent-border: rgba(110, 86, 240, 0.22);
         --accent-fg: #ffffff;
-        --accent-glow: rgba(188, 79, 34, 0.22);
+        --accent-glow: rgba(110, 86, 240, 0.22);
+        --accent-rgb: 110, 86, 240;
 
-        --grad-primary: linear-gradient(135deg, #bc4f22 0%, #8f390f 100%);
-        --grad-primary-hover: linear-gradient(135deg, #d55c2a 0%, #bc4f22 100%);
+        --grad-primary: linear-gradient(135deg, #6e56f0 0%, #5a45d6 100%);
+        --grad-primary-hover: linear-gradient(135deg, #7c66f2 0%, #6e56f0 100%);
 
-        --ok: #3f9f4a;
-        --ok-soft: rgba(63, 159, 74, 0.10);
-        --warn: #b8820a;
-        --warn-soft: rgba(184, 130, 10, 0.10);
-        --danger: #c4393d;
-        --danger-soft: rgba(196, 57, 61, 0.10);
-        --info: #2a6ec2;
+        /* Semantic colors — Aurora names (--success/--warning) with legacy
+           aliases (--ok/--warn) so charts.js + admin.js both resolve. */
+        --ok: #1fa463;
+        --ok-soft: rgba(31, 164, 99, 0.10);
+        --success: #1fa463;
+        --success-soft: rgba(31, 164, 99, 0.10);
+        --warn: #d9871a;
+        --warn-soft: rgba(217, 135, 26, 0.10);
+        --warning: #d9871a;
+        --warning-soft: rgba(217, 135, 26, 0.10);
+        --danger: #e04953;
+        --danger-soft: rgba(224, 73, 83, 0.10);
+        --info: #3b82f6;
+        --info-soft: rgba(59, 130, 246, 0.10);
 
-        --shadow-sm: 0 1px 2px rgba(30, 25, 10, 0.06);
-        --shadow-md: 0 4px 16px rgba(30, 25, 10, 0.08);
-        --shadow-lg: 0 12px 48px rgba(30, 25, 10, 0.14);
-        --shadow-xl: 0 24px 96px rgba(30, 25, 10, 0.20);
+        --shadow-sm: 0 1px 2px rgba(20, 20, 40, 0.04), 0 4px 16px rgba(20, 20, 40, 0.06);
+        --shadow-md: 0 8px 30px rgba(20, 20, 40, 0.10), 0 2px 6px rgba(20, 20, 40, 0.06);
+        --shadow-lg: 0 12px 40px rgba(20, 20, 40, 0.14);
+        --shadow-xl: 0 24px 70px rgba(20, 20, 40, 0.18);
         --ring: 0 0 0 3px var(--accent-glow);
 
-        --glass-bg: rgba(250, 249, 246, 0.85);
-        --code-bg: #f3f2ec;
-        --inline-code-bg: rgba(60, 58, 50, 0.08);
+        --aurora: linear-gradient(135deg, #c9bcff 0%, #a9c2ff 42%, #ffc2d8 100%);
+        --grad-cta: linear-gradient(120deg, #6d4af0 0%, #4a63d6 100%);
+
+        --glass-bg: rgba(250, 250, 251, 0.82);
+        --code-bg: #fbfbfd;
+        --inline-code-bg: rgba(20, 20, 40, 0.06);
       }
 
       * { box-sizing: border-box; }
@@ -797,15 +826,15 @@
         color: #fff;
         border-color: transparent;
         font-weight: 600;
-        box-shadow: 0 4px 14px rgba(217, 119, 87, 0.24);
+        box-shadow: 0 4px 14px rgba(var(--accent-rgb), 0.24);
       }
       .btn-primary:hover:not(:disabled) {
         background: var(--grad-primary-hover);
-        box-shadow: 0 6px 20px rgba(217, 119, 87, 0.32);
+        box-shadow: 0 6px 20px rgba(var(--accent-rgb), 0.32);
       }
       .btn-primary:active:not(:disabled) { transform: scale(0.98); }
       [data-theme="light"] .btn-primary {
-        box-shadow: 0 4px 12px rgba(188, 79, 34, 0.22);
+        box-shadow: 0 4px 12px rgba(var(--accent-rgb), 0.22);
       }
 
       /* Button loading state (added by admin.js via .is-loading class) */
@@ -1099,7 +1128,7 @@
         animation: bgIn 0.2s var(--ease);
         padding: var(--s-4);
       }
-      [data-theme="light"] .modal-bg { background: rgba(30, 25, 10, 0.35); }
+      [data-theme="light"] .modal-bg { background: rgba(15, 15, 25, 0.35); }
       .modal-bg[hidden] { display: none; }
       @keyframes bgIn { from { opacity: 0; } to { opacity: 1; } }
 
@@ -1210,11 +1239,11 @@
         background: var(--grad-primary);
         color: #fff;
         border-color: transparent;
-        box-shadow: 0 4px 12px rgba(217, 119, 87, 0.24);
+        box-shadow: 0 4px 12px rgba(var(--accent-rgb), 0.24);
       }
       .modal .form-actions .btn-primary:hover:not(:disabled) {
         background: var(--grad-primary-hover);
-        box-shadow: 0 6px 18px rgba(217, 119, 87, 0.32);
+        box-shadow: 0 6px 18px rgba(var(--accent-rgb), 0.32);
         color: #fff;
       }
 
@@ -1235,11 +1264,11 @@
         font-weight: 600;
         cursor: pointer;
         transition: all var(--t-fast);
-        box-shadow: 0 2px 8px rgba(217, 119, 87, 0.24);
+        box-shadow: 0 2px 8px rgba(var(--accent-rgb), 0.24);
       }
       .modal .oauth-box button.btn-primary:hover:not(:disabled) {
         background: var(--grad-primary-hover);
-        box-shadow: 0 4px 14px rgba(217, 119, 87, 0.32);
+        box-shadow: 0 4px 14px rgba(var(--accent-rgb), 0.32);
       }
       .modal .oauth-box button.btn-primary:disabled {
         opacity: 0.5;
@@ -1288,7 +1317,7 @@
         color: #fff;
         font-weight: 600;
         font-size: 14px;
-        box-shadow: 0 4px 16px rgba(217, 119, 87, 0.32);
+        box-shadow: 0 4px 16px rgba(var(--accent-rgb), 0.32);
         transition: all var(--t-base);
         min-height: 44px;
         display: inline-flex;
@@ -1296,7 +1325,7 @@
       }
       .login-gate a:hover {
         background: var(--grad-primary-hover);
-        box-shadow: 0 6px 20px rgba(217, 119, 87, 0.4);
+        box-shadow: 0 6px 20px rgba(var(--accent-rgb), 0.4);
         color: #fff;
       }
 
@@ -1666,6 +1695,12 @@
         scroll-padding-top: 20px;
       }
       body.admin-shell-body main.content > * {
+        /* main.content.admin-view-ready 是 flex column;交叉轴 auto margin 会吃掉
+           free space 导致"内容窄的面板"(如纯 KPI 面板)shrink-to-fit 塌成一条。
+           显式 width:100% 定住交叉轴尺寸,让每个卡片/面板撑满主区(≤1440 居中),
+           stat-grid 才能多列铺开。min-width:0 防子项内容撑破 flex。 */
+        width: 100%;
+        min-width: 0;
         max-width: 1440px;
         margin-left: auto;
         margin-right: auto;
