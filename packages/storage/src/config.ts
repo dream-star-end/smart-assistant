@@ -61,6 +61,9 @@ export function effortsForModel(modelId: string | undefined): EffortLevel[] {
   // Codex / GPT-5.5 reasoning depth. Maps to codex `model_reasoning_effort`
   // (low/medium/high/xhigh — codex exposes no `max`); see codexLaunchOverrides.
   if (/(^|[/_-])gpt[-_]?5\.5($|[/_-])/.test(id)) return ['low', 'medium', 'high', 'xhigh']
+  // Claude Fable 5 — 旗舰,最强长程 agentic + 异步子代理编排。同 Opus 全档 + ultracode;
+  // Fable 5 思考常驻(不接受 --thinking 关),深度全靠 --effort,ultracode 正对其多 agent 强项。
+  if (/fable[-_]?5/.test(id)) return ['low', 'medium', 'high', 'xhigh', 'max', 'ultracode']
   // Claude Opus 4.8 — full ladder + ultracode. max 仍触发 buildResearchSlot 高严谨度守则;
   // ultracode = xhigh + 常驻 Workflow(多 agent)编排(runner 翻译,见 subprocessRunner)。
   if (/opus[-_]?4[-_]?8/.test(id)) return ['low', 'medium', 'high', 'xhigh', 'max', 'ultracode']
@@ -79,6 +82,9 @@ export function effortsForModel(modelId: string | undefined): EffortLevel[] {
  *  so the seed never disagrees with /api/agents capability gating. */
 export function defaultModels(): ModelChoice[] {
   return [
+    // Fable 5 — Anthropic 最强公开模型(旗舰)。非默认(默认仍是各 agent 自己的 model),
+    // 仅作为可选覆盖;$10/$50 每百万 token 高于 Opus,且需订阅账号有权限 + 30 天数据保留(非 ZDR)。
+    { id: 'claude-fable-5', label: 'Fable 5' },
     { id: 'claude-opus-4-8', label: 'Opus 4.8' },
     // Opus 4.7 仍保留,供想退回前一代模型的会话覆盖使用。
     { id: 'claude-opus-4-7', label: 'Opus 4.7' },

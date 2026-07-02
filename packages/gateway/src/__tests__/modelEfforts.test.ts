@@ -19,7 +19,24 @@ describe('effortsForModel: capability authority', () => {
     assert.ok(!effortsForModel('gpt-5.5').includes('ultracode'))
   })
 
-  it('Claude family depths (Opus exposes ultracode = xhigh + Workflow 编排)', () => {
+  it('Claude family depths (Fable 5 / Opus expose ultracode = xhigh + Workflow 编排)', () => {
+    // Fable 5 — flagship, full ladder + ultracode (best for multi-agent orchestration).
+    assert.deepEqual(effortsForModel('claude-fable-5'), [
+      'low',
+      'medium',
+      'high',
+      'xhigh',
+      'max',
+      'ultracode',
+    ])
+    assert.deepEqual(effortsForModel('CLAUDE-FABLE-5'), [
+      'low',
+      'medium',
+      'high',
+      'xhigh',
+      'max',
+      'ultracode',
+    ])
     assert.deepEqual(effortsForModel('claude-opus-4-8'), [
       'low',
       'medium',
