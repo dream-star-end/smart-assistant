@@ -4,6 +4,8 @@ import { api } from "../../lib/api";
 import type { AuthSession, SkillDetail, SkillSummary } from "../../lib/types";
 import { cn } from "../../lib/utils";
 import { Alert, Badge, EmptyState, Input, PanelHeader, Spinner, useConfirm } from "../ui";
+import { ratesFromPublicModel, type ModelRates } from "../../lib/skillRunCost";
+import { SKILL_RUN_MODEL, SkillEvalSection, SkillTrainSection } from "./SkillOptPanel";
 
 /**
  * 技能库：列出用户可用技能（经容器代理 /api/skills），展开看正文（/api/skills/:name），
@@ -15,7 +17,20 @@ export function SkillsPanel({ auth }: { auth: AuthSession }) {
   const [err, setErr] = useState<string | null>(null);
   const [reload, setReload] = useState(0);
   const [filter, setFilter] = useState("");
+  const [rates, setRates] = useState<ModelRates | null>(null);
   const [confirmDialog, confirmDialogEl] = useConfirm();
+
+  // 训练/评测锁定模型的公开费率(成本估算与实报的数据源;拿不到就不给估算数字)。
+  useEffect(() => {
+    let alive = true;
+    api
+      .getPublicModels(auth)
+      .then((ms) => alive && setRates(ratesFromPublicModel(ms.find((m) => m.id === SKILL_RUN_MODEL))))
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
+  }, [auth]);
 
   useEffect(() => {
     let alive = true;
@@ -109,7 +124,7 @@ export function SkillsPanel({ auth }: { auth: AuthSession }) {
           ) : (
             <ul className="flex flex-col gap-1.5 px-4 pb-4">
               {visible.map((sk) => (
-                <SkillRow key={sk.name} auth={auth} skill={sk} onDelete={() => remove(sk.name)} />
+                <SkillRow key={sk.name} auth={auth} skill={sk} rates={rates} onDelete={() => remove(sk.name)} />
               ))}
             </ul>
           )}
@@ -122,16 +137,19 @@ export function SkillsPanel({ auth }: { auth: AuthSession }) {
 function SkillRow({
   auth,
   skill,
+  rates,
   onDelete,
 }: {
   auth: AuthSession;
   skill: SkillSummary;
+  rates: ModelRates | null;
   onDelete: () => void;
 }) {
   const [open, setOpen] = useState(false);
   const [detail, setDetail] = useState<SkillDetail | null>(null);
   const [loading, setLoading] = useState(false);
   const [err, setErr] = useState<string | null>(null);
+  const [section, setSection] = useState<"body" | "evals" | "train">("body");
 
   const toggle = useCallback(() => {
     const next = !open;
@@ -188,7 +206,32 @@ function SkillRow({
       </div>
       {open && (
         <div className="border-t border-border px-3.5 py-3">
-          {loading ? (
+          <div className="mb-2.5 flex gap-1">
+            {(
+              [
+                { id: "body", label: "正文" },
+                { id: "evals", label: "评测" },
+                ...(skill.writable ? [{ id: "train", label: "训练优化" }] : []),
+              ] as Array<{ id: "body" | "evals" | "train"; label: string }>
+            ).map((t) => (
+              <button
+                type="button"
+                key={t.id}
+                onClick={() => setSection(t.id)}
+                className={cn(
+                  "rounded-full px-2.5 py-0.5 text-[12px] font-medium outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring",
+                  section === t.id ? "bg-accent-soft text-accent" : "text-muted hover:bg-hover hover:text-fg",
+                )}
+              >
+                {t.label}
+              </button>
+            ))}
+          </div>
+          {section === "evals" ? (
+            <SkillEvalSection auth={auth} skillName={skill.name} rates={rates} />
+          ) : section === "train" ? (
+            <SkillTrainSection auth={auth} skillName={skill.name} rates={rates} />
+          ) : loading ? (
             <div className="flex items-center gap-2 text-[12.5px] text-faint">
               <Loader2 size={14} className="animate-spin" /> 加载正文…
             </div>

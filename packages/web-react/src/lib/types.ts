@@ -484,6 +484,98 @@ export type SkillSummary = {
   writable?: boolean;
 };
 
+/** 评测用例(skill 目录 evals/evals.json)。 */
+export type SkillEvalCase = {
+  id: string;
+  prompt: string;
+  assertions: string[];
+  expectedOutput?: string;
+};
+
+export type SkillEvalsFile = {
+  version: 1;
+  cases: SkillEvalCase[];
+  /** P3 每日自动回归 opt-in(消耗积分,默认关;UI 开启时须确认成本)。 */
+  autoRegression?: boolean;
+};
+
+export type SkillRunUsage = {
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheCreationTokens: number;
+  turns: number;
+};
+
+/** 评测 run(GET /api/skill-eval/:runId 的 run)。 */
+export type SkillEvalRun = {
+  runId: string;
+  skillName: string;
+  mode: "baseline" | "draft";
+  trainRunId?: string | null;
+  model: string;
+  status: "queued" | "running" | "grading" | "done" | "failed";
+  progress: { done: number; total: number };
+  cases: SkillEvalCase[];
+  results: Array<{
+    caseId: string;
+    arm: "with" | "without" | "draft";
+    output: string;
+    usage: SkillRunUsage;
+    assertions: Array<{ text: string; passed: boolean; evidence: string }>;
+    error?: string;
+  }>;
+  benchmark: {
+    passRate: Partial<Record<"with" | "without" | "draft", number>>;
+    counts: Partial<Record<"with" | "without" | "draft", { passed: number; total: number }>>;
+    avgOutputTokens: Partial<Record<"with" | "without" | "draft", number>>;
+    preference?: { draft: number; current: number; tie: number };
+    verdict: string;
+  } | null;
+  usage: SkillRunUsage;
+  error: string | null;
+  startedAt: number;
+  finishedAt: number | null;
+};
+
+/** 训练 run(GET /api/skill-training/:runId 的 run)。 */
+export type SkillTrainRun = {
+  runId: string;
+  skillName: string | null;
+  status: "queued" | "running" | "diff_ready" | "merged" | "discarded" | "failed";
+  phase: string;
+  proposalCount: number;
+  toolCalls: number;
+  usage?: SkillRunUsage;
+  autoEval?: boolean;
+  evalRunId?: string | null;
+  error: string | null;
+  summary: string | null;
+  startedAt: number;
+  finishedAt: number | null;
+};
+
+/** 训练草稿摘要/详情。 */
+export type SkillDraftSummary = {
+  name: string;
+  op: "create" | "update" | "delete";
+  baseVersion: string | null;
+  rationale: string;
+  authoredBy: "ai" | "user";
+  updatedAt: string;
+};
+
+export type SkillDraftDetail = {
+  draft: {
+    meta: { name: string; description: string; tags?: string[] };
+    body: string;
+    rawContent: string;
+    evalsJson?: string;
+    record: SkillDraftSummary & { runId: string; createdAt: string };
+  };
+  current: { body: string; description: string; version?: string } | null;
+};
+
 /** 技能详情（GET /api/skills/:name 的 skill）。 */
 export type SkillDetail = SkillSummary & {
   body?: string;
