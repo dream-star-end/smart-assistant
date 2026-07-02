@@ -1474,6 +1474,26 @@ export async function provisionV3Container(
 
     // 锁顺序不变量:per-uid lifecycle → per-host admission(详见 advisory lock 段落注释)。
     await acquireUserLifecycleLock(client, uid);
+
+    // 幂等复查(锁内):存在性检查在锁外(v3ensureRunning),并发双请求(双 tab 首连 /
+    // WS+HTTP 各自 ensure)会双双走进 provision;此前第二个请求直到 INSERT 才撞
+    // uniq_ac_user_id_active 23505 —— MVP 路径原样重抛给用户,fixedBoundIp 路径还会
+    // 误判成 IP 冲突。拿到 per-uid 锁后先复查 active 行,命中即抛 NameConflict
+    // (语义=同 uid 并发 provision,v3ensureRunning 已把它翻成短重试 "provisioning"
+    // → 客户端下一轮 ensure 走 warm 复用路径,自愈且无伪错误)。
+    const dupQ = await client.query<{ id: string }>(
+      `SELECT id::text AS id FROM agent_containers
+        WHERE user_id = $1::bigint AND state = 'active' AND runtime_channel = $2
+        LIMIT 1`,
+      [String(uid), getRuntimeChannel()],
+    );
+    if (dupQ.rows.length > 0) {
+      throw new SupervisorError(
+        "NameConflict",
+        `uid ${uid} already has active container (row ${dupQ.rows[0].id}; concurrent ensure)`,
+      );
+    }
+
     await acquireHostCapLock(client, effectiveHostUuid);
 
     // per-host admission gate(同事务读 active 计数 + max_containers,与 host-cap

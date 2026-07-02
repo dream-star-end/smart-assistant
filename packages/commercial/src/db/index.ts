@@ -48,6 +48,10 @@ export function createPool(opts: CreatePoolOptions = {}): Pool {
     idleTimeoutMillis: positiveInt("idleTimeoutMillis", opts.idleTimeoutMillis ?? 30_000),
     connectionTimeoutMillis: positiveInt("connectionTimeoutMillis", opts.connectionTimeoutMillis ?? 5_000),
     statement_timeout: statementTimeout,
+    // BEGIN 后卡在非 DB await 的持锁事务上限:statement_timeout 只管单条语句,管不住
+    // "事务开着不发语句"(如 Tx 内 await 外部 IO 挂起)——那会长期持有行锁/advisory lock。
+    // v3+v5 共库(池合计可达 100 连接),必须有第二道防线。60s 远大于任何正常事务。
+    idle_in_transaction_session_timeout: 60_000,
     application_name: "openclaude-commercial",
   };
   const p = new Pool(cfg);

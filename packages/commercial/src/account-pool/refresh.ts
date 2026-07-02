@@ -174,6 +174,11 @@ export function shouldRefresh(expiresAt: Date | null, now: Date, skewMs: number)
   return expiresAt.getTime() - now.getTime() <= skewMs
 }
 
+/** OAuth token 端点出站超时。刷新在推理请求分发前被同步 await(upstream.ts),
+ *  上游挂起会让用户 turn 无限卡 + 占 per-uid 并发槽,必须有硬上限。30s 足够容纳
+ *  正常 token 交换(实测 <2s)+ 网络抖动,又不至于把用户 turn 卡死太久。 */
+export const REFRESH_FETCH_TIMEOUT_MS = 30_000
+
 /** 基于全局 fetch 的默认实现。生产走 globalThis.fetch。 */
 export const defaultHttp: RefreshHttpClient = {
   async post(url, headers, body, dispatcher) {
@@ -181,6 +186,7 @@ export const defaultHttp: RefreshHttpClient = {
       method: 'POST',
       headers,
       body,
+      signal: AbortSignal.timeout(REFRESH_FETCH_TIMEOUT_MS),
     }
     if (dispatcher) init.dispatcher = dispatcher
     const res = await fetch(url, init)

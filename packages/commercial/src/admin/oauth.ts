@@ -155,6 +155,8 @@ export async function exchangeAccountOAuth(
   const tokenRes = await fetch(prov.tokenUrl, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
+    // 出站硬超时:token 端点挂起时 admin 绑定请求无限卡(同 refresh.ts 收口)。
+    signal: AbortSignal.timeout(30_000),
     body: JSON.stringify(tokenBody),
   });
 

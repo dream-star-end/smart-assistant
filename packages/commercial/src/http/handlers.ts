@@ -103,6 +103,8 @@ export interface CommercialHttpDeps {
   rateLimits?: Partial<{
     register: RateLimitConfig;
     login: RateLimitConfig;
+    /** 2026-07-02:login per-email 维度(对照 verifyEmailEmail),防 IP 池打单账号。 */
+    loginEmail: RateLimitConfig;
     requestReset: RateLimitConfig;
     resendVerify: RateLimitConfig;
     /**
@@ -308,6 +310,10 @@ export interface RequestContext {
 export const DEFAULT_RATE_LIMITS = {
   register: { scope: "register", windowSeconds: 60, max: 5 } satisfies RateLimitConfig,
   login: { scope: "login", windowSeconds: 60, max: 5 } satisfies RateLimitConfig,
+  // 2026-07-02:per-email 维度,补 IP 限流盲点(攻击者切 IP 池打单账号)。对照
+  // verifyEmailEmail(A6)同款。20/30min 对真实用户宽松(忘密码连错也到不了),
+  // 对分布式暴破是硬闸;有 turnstile+argon2 在前,这是第三道防线。
+  loginEmail: { scope: "login_email", windowSeconds: 1800, max: 20 } satisfies RateLimitConfig,
   requestReset: { scope: "request_reset", windowSeconds: 60, max: 3 } satisfies RateLimitConfig,
   resendVerify: { scope: "resend_verify", windowSeconds: 60, max: 3 } satisfies RateLimitConfig,
   // 2026-04-23:邮箱验证码提交限流,防 10^6 key space 暴破。
@@ -498,6 +504,14 @@ export async function handleLogin(
   await enforceRateLimit(deps, cfg, ctx.clientIp);
 
   const body = await readJsonBody(req);
+  // per-email 限流(顺序同 verifyEmail A6:IP 限流 → body 解析 → email 限流;
+  // email 非法形状交给 login() 内 schema 拒,不消耗 email 维度额度)。
+  // 桶 key 用 sha256 前缀,明文邮箱不进 rate_limit_events。
+  const loginEmail = (body as { email?: unknown } | null)?.email;
+  if (typeof loginEmail === "string" && loginEmail.length > 0) {
+    const emailCfg = deps.rateLimits?.loginEmail ?? DEFAULT_RATE_LIMITS.loginEmail;
+    await enforceRateLimit(deps, emailCfg, hashEmailForRateLimit(loginEmail));
+  }
   try {
     // login 里 remoteIp 被两处用到:
     //   1. Turnstile verify — 需要真实访客 IP(CF bot scoring)

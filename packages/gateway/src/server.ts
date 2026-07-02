@@ -81,6 +81,7 @@ import {
   upsertClientSession,
   appendServerAuthoredMessage,
   deleteClientSession,
+  renameClientSession,
   listUnclaimedSessions,
   claimSession,
 } from '@openclaude/storage'
@@ -1769,7 +1770,7 @@ export class Gateway {
         .then((handled) => {
           if (!handled) this.sendError(res, 404, 'unknown v1 endpoint')
         })
-        .catch((err) => this.sendError(res, 500, String(err)))
+        .catch((err) => this.sendInternalError(res, err))
       return
     }
 
@@ -2231,6 +2232,28 @@ export class Gateway {
         })().catch(() => this.sendJson(res, 500, { error: 'put failed' }))
         return
       }
+      if (req.method === 'PATCH') {
+        // 元数据专用更新(当前仅 title)。不走 PUT 的"整 blob 替换 + 乐观并发"语义:
+        // rename 不携带 messages,骑 PUT 要么 409 要么把未随带的客户端消息 merge 掉。
+        ;(async () => {
+          let data: { title?: unknown }
+          try {
+            data = JSON.parse(await this.readBody(req, 16 * 1024))
+          } catch {
+            this.sendJson(res, 400, { error: 'invalid JSON' })
+            return
+          }
+          const title = typeof data.title === 'string' ? data.title.trim() : ''
+          if (!title || title.length > 120) {
+            this.sendJson(res, 400, { error: 'title required (1-120 chars)' })
+            return
+          }
+          const r = await renameClientSession(sessId, userId, title)
+          if (!r.ok) this.sendJson(res, 404, { error: 'not found' })
+          else this.sendJson(res, 200, { ok: true, updatedAt: r.updatedAt })
+        })().catch(() => this.sendJson(res, 500, { error: 'patch failed' }))
+        return
+      }
       if (req.method === 'DELETE') {
         deleteClientSession(sessId, userId)
           .then(() => this.sendJson(res, 200, { ok: true }))
@@ -2268,19 +2291,19 @@ export class Gateway {
       return
     }
     if (url.pathname === '/api/agents') {
-      this.handleAgentsCollection(req, res).catch((err) => this.sendError(res, 500, String(err)))
+      this.handleAgentsCollection(req, res).catch((err) => this.sendInternalError(res, err))
       return
     }
     if (url.pathname === '/api/agent-teams') {
       this.handleAgentTeamsCollection(req, res).catch((err) =>
-        this.sendError(res, 500, String(err)),
+        this.sendInternalError(res, err),
       )
       return
     }
     const agentTeamIdMatch = url.pathname.match(/^\/api\/agent-teams\/([a-zA-Z0-9_-]+)$/)
     if (agentTeamIdMatch) {
       this.handleAgentTeamItem(req, res, agentTeamIdMatch[1]).catch((err) =>
-        this.sendError(res, 500, String(err)),
+        this.sendInternalError(res, err),
       )
       return
     }
@@ -2288,18 +2311,18 @@ export class Gateway {
     const teamRunCreateMatch = url.pathname.match(/^\/api\/agent-teams\/([a-zA-Z0-9_-]+)\/runs$/)
     if (teamRunCreateMatch) {
       this.handleCreateTeamRun(req, res, teamRunCreateMatch[1]).catch((err) =>
-        this.sendError(res, 500, String(err)),
+        this.sendInternalError(res, err),
       )
       return
     }
     if (url.pathname === '/api/team-runs') {
-      this.handleTeamRunList(req, res).catch((err) => this.sendError(res, 500, String(err)))
+      this.handleTeamRunList(req, res).catch((err) => this.sendInternalError(res, err))
       return
     }
     const teamRunGetMatch = url.pathname.match(/^\/api\/team-runs\/([a-zA-Z0-9_-]+)$/)
     if (teamRunGetMatch) {
       this.handleTeamRunGet(req, res, teamRunGetMatch[1]).catch((err) =>
-        this.sendError(res, 500, String(err)),
+        this.sendInternalError(res, err),
       )
       return
     }
@@ -2308,28 +2331,28 @@ export class Gateway {
     )
     if (teamRunFinalizeMatch) {
       this.handleTeamRunFinalize(req, res, teamRunFinalizeMatch[1]).catch((err) =>
-        this.sendError(res, 500, String(err)),
+        this.sendInternalError(res, err),
       )
       return
     }
     const teamRunStopMatch = url.pathname.match(/^\/api\/team-runs\/([a-zA-Z0-9_-]+)\/stop$/)
     if (teamRunStopMatch) {
       this.handleTeamRunStop(req, res, teamRunStopMatch[1]).catch((err) =>
-        this.sendError(res, 500, String(err)),
+        this.sendInternalError(res, err),
       )
       return
     }
     const agentIdMatch = url.pathname.match(/^\/api\/agents\/([a-zA-Z0-9_-]+)$/)
     if (agentIdMatch) {
       this.handleAgentItem(req, res, agentIdMatch[1]).catch((err) =>
-        this.sendError(res, 500, String(err)),
+        this.sendInternalError(res, err),
       )
       return
     }
     const personaMatch = url.pathname.match(/^\/api\/agents\/([a-zA-Z0-9_-]+)\/persona$/)
     if (personaMatch) {
       this.handlePersona(req, res, personaMatch[1]).catch((err) =>
-        this.sendError(res, 500, String(err)),
+        this.sendInternalError(res, err),
       )
       return
     }
@@ -2338,26 +2361,26 @@ export class Gateway {
     )
     if (memoryMatch) {
       this.handleMemory(req, res, memoryMatch[1], memoryMatch[2] as 'memory' | 'user').catch(
-        (err) => this.sendError(res, 500, String(err)),
+        (err) => this.sendInternalError(res, err),
       )
       return
     }
     // User-level skill library (agentId-less; baseline + shared + aggregated legacy).
     if (url.pathname === '/api/skills') {
-      this.handleUserSkillsList(req, res).catch((err) => this.sendError(res, 500, String(err)))
+      this.handleUserSkillsList(req, res).catch((err) => this.sendInternalError(res, err))
       return
     }
     const userSkillItemMatch = url.pathname.match(/^\/api\/skills\/([a-z0-9-]+)$/)
     if (userSkillItemMatch) {
       this.handleUserSkillItem(req, res, userSkillItemMatch[1]).catch((err) =>
-        this.sendError(res, 500, String(err)),
+        this.sendInternalError(res, err),
       )
       return
     }
     const skillsListMatch = url.pathname.match(/^\/api\/agents\/([a-zA-Z0-9_-]+)\/skills$/)
     if (skillsListMatch) {
       this.handleSkillsList(req, res, skillsListMatch[1]).catch((err) =>
-        this.sendError(res, 500, String(err)),
+        this.sendInternalError(res, err),
       )
       return
     }
@@ -2366,7 +2389,7 @@ export class Gateway {
     )
     if (skillViewMatch) {
       this.handleSkillItem(req, res, skillViewMatch[1], skillViewMatch[2]).catch((err) =>
-        this.sendError(res, 500, String(err)),
+        this.sendInternalError(res, err),
       )
       return
     }
@@ -2374,7 +2397,7 @@ export class Gateway {
     const skillTrainStartMatch = url.pathname.match(/^\/api\/skills\/([a-z0-9-]+)\/train$/)
     if (skillTrainStartMatch) {
       this._handleSkillTrainStart(req, res, skillTrainStartMatch[1]).catch((err) =>
-        this.sendError(res, 500, String(err)),
+        this.sendInternalError(res, err),
       )
       return
     }
@@ -2387,7 +2410,7 @@ export class Gateway {
         res,
         skillTrainDraftItemMatch[1],
         skillTrainDraftItemMatch[2],
-      ).catch((err) => this.sendError(res, 500, String(err)))
+      ).catch((err) => this.sendInternalError(res, err))
       return
     }
     const skillTrainCommentMatch = url.pathname.match(
@@ -2399,7 +2422,7 @@ export class Gateway {
         res,
         skillTrainCommentMatch[1],
         skillTrainCommentMatch[2],
-      ).catch((err) => this.sendError(res, 500, String(err)))
+      ).catch((err) => this.sendInternalError(res, err))
       return
     }
     const skillTrainDraftsMatch = url.pathname.match(
@@ -2407,7 +2430,7 @@ export class Gateway {
     )
     if (skillTrainDraftsMatch) {
       this._handleSkillTrainDrafts(req, res, skillTrainDraftsMatch[1]).catch((err) =>
-        this.sendError(res, 500, String(err)),
+        this.sendInternalError(res, err),
       )
       return
     }
@@ -2416,14 +2439,14 @@ export class Gateway {
     )
     if (skillTrainMergeMatch) {
       this._handleSkillTrainMerge(req, res, skillTrainMergeMatch[1]).catch((err) =>
-        this.sendError(res, 500, String(err)),
+        this.sendInternalError(res, err),
       )
       return
     }
     const skillTrainRunMatch = url.pathname.match(/^\/api\/skill-training\/([a-zA-Z0-9_-]+)$/)
     if (skillTrainRunMatch) {
       this._handleSkillTrainRun(req, res, skillTrainRunMatch[1]).catch((err) =>
-        this.sendError(res, 500, String(err)),
+        this.sendInternalError(res, err),
       )
       return
     }
@@ -2431,7 +2454,7 @@ export class Gateway {
     const agentMsgMatch = url.pathname.match(/^\/api\/agents\/([a-zA-Z0-9_-]+)\/message$/)
     if (agentMsgMatch) {
       this.handleAgentMessage(req, res, agentMsgMatch[1]).catch((err) =>
-        this.sendError(res, 500, String(err)),
+        this.sendInternalError(res, err),
       )
       return
     }
@@ -2439,7 +2462,7 @@ export class Gateway {
     const delegateMatch = url.pathname.match(/^\/api\/agents\/([a-zA-Z0-9_-]+)\/delegate$/)
     if (delegateMatch) {
       this.handleDelegateTask(req, res, delegateMatch[1]).catch((err) =>
-        this.sendError(res, 500, String(err)),
+        this.sendInternalError(res, err),
       )
       return
     }
@@ -2507,30 +2530,30 @@ export class Gateway {
     }
 
     if (url.pathname === '/api/search') {
-      this.handleSearch(req, res, url).catch((err) => this.sendError(res, 500, String(err)))
+      this.handleSearch(req, res, url).catch((err) => this.sendInternalError(res, err))
       return
     }
     // ── Cron/reminder REST API ──
     if (url.pathname === '/api/cron') {
-      this.handleCronApi(req, res).catch((err) => this.sendError(res, 500, String(err)))
+      this.handleCronApi(req, res).catch((err) => this.sendInternalError(res, err))
       return
     }
     const cronItemMatch = url.pathname.match(/^\/api\/cron\/([a-zA-Z0-9_-]+)$/)
     if (cronItemMatch) {
       this.handleCronItem(req, res, cronItemMatch[1]).catch((err) =>
-        this.sendError(res, 500, String(err)),
+        this.sendInternalError(res, err),
       )
       return
     }
     // ── Tasks REST API ──
     if (url.pathname === '/api/tasks') {
-      this._handleTasksApi(req, res).catch((err) => this.sendError(res, 500, String(err)))
+      this._handleTasksApi(req, res).catch((err) => this.sendInternalError(res, err))
       return
     }
     const taskItemMatch = url.pathname.match(/^\/api\/tasks\/([a-zA-Z0-9_-]+)$/)
     if (taskItemMatch) {
       this._handleTaskItem(req, res, taskItemMatch[1]).catch((err) =>
-        this.sendError(res, 500, String(err)),
+        this.sendInternalError(res, err),
       )
       return
     }
@@ -2538,7 +2561,7 @@ export class Gateway {
       this._taskStore
         .recentExecutions()
         .then((execs) => this.sendJson(res, 200, { executions: execs }))
-        .catch((err) => this.sendError(res, 500, String(err)))
+        .catch((err) => this.sendInternalError(res, err))
       return
     }
 
@@ -2551,7 +2574,7 @@ export class Gateway {
     const webhookMatch = url.pathname.match(/^\/api\/webhooks\/([a-zA-Z0-9_-]+)$/)
     if (webhookMatch) {
       this._handleWebhook(req, res, webhookMatch[1]).catch((err) =>
-        this.sendError(res, 500, String(err)),
+        this.sendInternalError(res, err),
       )
       return
     }
@@ -2565,18 +2588,18 @@ export class Gateway {
     //   PUT    /api/wechat/binding/status        → { ok, status }
     if (url.pathname.startsWith('/api/wechat/')) {
       this._handleWechat(req, res, url.pathname).catch((err) =>
-        this.sendError(res, 500, String(err)),
+        this.sendInternalError(res, err),
       )
       return
     }
 
     // ── Claude.ai OAuth ──
     if (url.pathname === '/api/auth/claude/start') {
-      this.handleOAuthStart(req, res).catch((err) => this.sendError(res, 500, String(err)))
+      this.handleOAuthStart(req, res).catch((err) => this.sendInternalError(res, err))
       return
     }
     if (url.pathname === '/api/auth/claude/callback') {
-      this.handleOAuthCallback(req, res).catch((err) => this.sendError(res, 500, String(err)))
+      this.handleOAuthCallback(req, res).catch((err) => this.sendInternalError(res, err))
       return
     }
     if (url.pathname === '/api/auth/claude/status') {
@@ -2596,7 +2619,7 @@ export class Gateway {
     // event-loop stall incident. See feedback memo
     // v3_attachments_independent_channel.md.
     if (url.pathname === '/api/uploads' && req.method === 'POST') {
-      this.handleUpload(req, res).catch((err) => this.sendError(res, 500, String(err)))
+      this.handleUpload(req, res).catch((err) => this.sendInternalError(res, err))
       return
     }
 
@@ -2608,7 +2631,7 @@ export class Gateway {
     if (mediaMatch) {
       this.handleMediaGet(req, res, mediaMatch[1]).catch((err) => {
         if (!res.headersSent) {
-          this.sendError(res, 500, String(err))
+          this.sendInternalError(res, err)
         } else {
           try { res.end() } catch { /* socket gone */ }
         }
@@ -2623,7 +2646,7 @@ export class Gateway {
     if (url.pathname === '/api/file') {
       this.handleApiFile(req, res, url).catch((err) => {
         if (!res.headersSent) {
-          this.sendError(res, 500, String(err))
+          this.sendInternalError(res, err)
         } else {
           try { res.end() } catch { /* socket gone */ }
         }
@@ -3652,6 +3675,13 @@ export class Gateway {
   }
   private sendError(res: ServerResponse, code: number, message: string): void {
     this.sendJson(res, code, { error: message })
+  }
+  /** 500 兜底收口:真实错误进日志(可排障),响应只回受控文案 —— 此前 39 处
+   *  `sendError(res, 500, String(err))` 会把容器内部路径/栈回显给客户端。 */
+  private sendInternalError(res: ServerResponse, err: unknown): void {
+    // eslint-disable-next-line no-console
+    console.error('[gateway] internal error:', err)
+    this.sendJson(res, 500, { error: 'internal error' })
   }
   private async readJsonBody<T = any>(req: IncomingMessage): Promise<T> {
     const chunks: Buffer[] = []
@@ -6205,7 +6235,7 @@ export class Gateway {
         await updateWechatBindingStatus(userId, status)
         this.sendJson(res, 200, { ok: true, status })
       } catch (err: any) {
-        this.sendError(res, 500, String(err?.message || err))
+        this.sendInternalError(res, err)
       }
       return
     }
@@ -6364,7 +6394,7 @@ export class Gateway {
       const hits = await searchSessions(q, limit)
       this.sendJson(res, 200, { hits })
     } catch (err) {
-      this.sendError(res, 500, String(err))
+      this.sendInternalError(res, err)
     }
   }
 
@@ -6523,6 +6553,8 @@ export class Gateway {
           'Content-Type': 'application/json',
           ...(providerKey === 'claude' ? { 'User-Agent': CLAUDE_OAUTH_USER_AGENT } : {}),
         },
+        // 出站硬超时:token 端点挂起时回调请求无限卡(与 commercial refresh.ts 同款收口)。
+        signal: AbortSignal.timeout(30_000),
         body: JSON.stringify({
           grant_type: 'authorization_code',
           client_id: prov.clientId,
@@ -6642,6 +6674,8 @@ export class Gateway {
           'Content-Type': 'application/json',
           ...(providerKey === 'claude' ? { 'User-Agent': CLAUDE_OAUTH_USER_AGENT } : {}),
         },
+        // 出站硬超时:refresh 挂起会卡住定时续期链路(与 commercial refresh.ts 同款收口)。
+        signal: AbortSignal.timeout(30_000),
         body: JSON.stringify({
           grant_type: 'refresh_token',
           client_id: prov.clientId,

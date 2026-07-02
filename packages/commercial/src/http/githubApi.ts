@@ -199,6 +199,12 @@ export async function handleDeleteMyGithub(
   sendJson(res, 200, { revoked: true, sessionsCleared })
 }
 
+// repos 列表 60s TTL 缓存:GitHub API 经出站代理往返实测 3-6s(现网慢请求 top1),
+// 而仓库列表是低频变更数据(新建仓库最迟 1min 可见,重开弹窗即刷新)。仅缓存成功结果;
+// 测试注入 overrides 时跳过(不破坏用例隔离)。size 防御性 clear(键空间=用户×分页参数)。
+const REPOS_CACHE_TTL_MS = 60_000
+const reposCache = new Map<string, { items: unknown; exp: number }>()
+
 /** GET /api/me/github/repos */
 export async function handleListMyGithubRepos(
   req: IncomingMessage,
@@ -226,12 +232,25 @@ export async function handleListMyGithubRepos(
     perPage,
     sort: sortRaw as ListReposParams['sort'],
   }
+  const cacheable = !overrides
+  const cacheKey = `${user.id}:${scopeRaw}:${page}:${perPage}:${sortRaw}`
+  if (cacheable) {
+    const hit = reposCache.get(cacheKey)
+    if (hit && hit.exp > Date.now()) {
+      sendJson(res, 200, { items: hit.items, page, per_page: perPage })
+      return
+    }
+  }
   const { accessToken } = await loadUserToken(pool, Number(user.id))
   let repos
   try {
     repos = await fetchGithubRepos(accessToken, params, apiDeps)
   } catch (err) {
     throw await mapGithubErrToHttp(err, pool, Number(user.id), ctx)
+  }
+  if (cacheable) {
+    if (reposCache.size > 2000) reposCache.clear()
+    reposCache.set(cacheKey, { items: repos, exp: Date.now() + REPOS_CACHE_TTL_MS })
   }
   // 成功 → mark token healthy(best-effort)
   touchTokenChecked(pool, Number(user.id)).catch(() => {})

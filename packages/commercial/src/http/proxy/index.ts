@@ -504,7 +504,10 @@ export function makeAnthropicProxyHandler(
         forceRepin,
       );
       if (!pickRes.ok) {
-        await releasePreCheck(deps.preCheckRedis, pre.reservation).catch(() => {});
+        // 释放失败仅告警不阻断(TTL 300s 自愈兜底);但 Redis 故障时预留泄漏必须可观测。
+        await releasePreCheck(deps.preCheckRedis, pre.reservation).catch((e: unknown) => {
+          userLog.warn("precheck_release_failed", { msg: (e as Error)?.message ?? String(e) });
+        });
         switch (pickRes.error.kind) {
           case "pool_busy":
             userLog.warn("proxy_account_pool_busy", { msg: pickRes.error.err.message });
@@ -639,7 +642,9 @@ export function makeAnthropicProxyHandler(
           userLog,
         );
         session.zeroizeSecrets();
-        await releasePreCheck(deps.preCheckRedis, pre.reservation).catch(() => {});
+        await releasePreCheck(deps.preCheckRedis, pre.reservation).catch((e: unknown) => {
+          userLog.warn("precheck_release_failed", { msg: (e as Error)?.message ?? String(e) });
+        });
         userLog.error("proxy_journal_insert_failed", { err: errSummary(err) });
         sendJsonError(res, 500, "INTERNAL", "internal error", requestId);
         return;

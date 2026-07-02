@@ -210,6 +210,15 @@ class FakePool {
         }],
       };
     }
+    // provision 锁内幂等复查(并发 ensure 双请求):同 uid 已有 active 行 → NameConflict。
+    if (
+      /SELECT id::text AS id FROM agent_containers/i.test(trimmed)
+      && /state = 'active' AND runtime_channel/i.test(trimmed)
+    ) {
+      const userId = Number.parseInt(String(params![0]), 10);
+      const r = this.rows.find((x) => x.user_id === userId && x.state === "active");
+      return r ? { rowCount: 1, rows: [{ id: String(r.id) }] } : { rowCount: 0, rows: [] };
+    }
     // V3 Phase 3I — per-host admission gate(provisionV3Container 内事务):
     //   SELECT (SELECT COUNT(*) ... WHERE state='active' AND host_uuid=$1)::text AS active,
     //          (SELECT max_containers FROM compute_hosts WHERE id=$1) AS max_containers

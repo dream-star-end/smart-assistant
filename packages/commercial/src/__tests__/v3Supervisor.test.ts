@@ -344,6 +344,16 @@ class FakePool {
             }],
           };
         }
+        // provision 锁内幂等复查(并发 ensure 双请求):同 uid 已有 active 行 → NameConflict。
+        // SQL 形态: SELECT id::text AS id FROM agent_containers WHERE user_id=$1 AND state='active' AND runtime_channel=$2 LIMIT 1
+        if (
+          /SELECT id::text AS id FROM agent_containers/i.test(trimmed)
+          && /state = 'active' AND runtime_channel/i.test(trimmed)
+        ) {
+          const userId = Number.parseInt(String(params![0]), 10);
+          const r = self.rows.find((x) => x.user_id === userId && x.state === "active");
+          return r ? { rowCount: 1, rows: [{ id: String(r.id) }] } : { rowCount: 0, rows: [] };
+        }
         // v3 per-host cap admission gate —— provisionV3Container 在 BEGIN 后
         // 拿 per-host advisory lock 后,同事务读 per-host active count + per-host
         // compute_hosts.max_containers。SQL 形态:

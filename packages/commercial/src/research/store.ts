@@ -22,6 +22,7 @@ import type {
   Span,
 } from "@openclaude/protocol/research";
 import { query, tx } from "../db/queries.js";
+import { getRuntimeChannel } from "../runtimeChannel.js";
 
 // advisory lock key — 'OCRS'(OpenClaude ReSearch),双 int4 防超 JS Number.MAX_SAFE_INTEGER
 const LOCK_KEY_HI = 0x4f_43_52_53;
@@ -109,7 +110,9 @@ export async function createJob(input: CreateJobInput): Promise<ResearchJobRow> 
     [
       input.requestId,
       String(input.userId),
-      input.runtimeChannel ?? "v3",
+      // 归属默认=本实例 channel(getRuntimeChannel),绝不静默落 'v3' —— 否则 v5 实例
+      // 创建的 job 会被 v3 scheduler 抢跑(跨轨执行)。显式传入仍可覆盖(测试注入)。
+      input.runtimeChannel ?? getRuntimeChannel(),
       input.kind,
       JSON.stringify(input.payload ?? {}),
     ],
@@ -153,14 +156,18 @@ export async function claimNextJob(batchSize: number): Promise<ResearchJobRow[]>
       [LOCK_KEY_HI, LOCK_KEY_LO],
     );
     if (!lock.rows[0]?.ok) return [];
+    // channel 过滤:全库统一纪律(对照 v3idleSweep/v3orphanReconcile),本实例只认领
+    // 自己 channel 的 job —— 此前是全库唯一漏 channel 的认领查询,科研 agent 接线后
+    // 会让 v3 scheduler 抢跑 v5 任务。
     const sel = await client.query<{ id: string }>(
       `SELECT id::text AS id
          FROM research_jobs
         WHERE status = 'queued'
+          AND runtime_channel = $2
         ORDER BY id ASC
         LIMIT $1
         FOR UPDATE SKIP LOCKED`,
-      [limit],
+      [limit, getRuntimeChannel()],
     );
     if (sel.rows.length === 0) return [];
     const ids = sel.rows.map((r) => r.id);
