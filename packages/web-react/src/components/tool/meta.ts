@@ -55,6 +55,11 @@ const TOOL_META: Record<string, ToolMeta> = {
   NotebookEdit: { icon: NotebookPen, label: "笔记本", tone: "neutral" },
   Task: { icon: Bot, label: "子任务", tone: "accent" },
   Agent: { icon: Bot, label: "子任务", tone: "accent" },
+  // CCB Kairos cron 工具(已在商业容器禁用,agent 侧改走 openclaude-memory 的
+  // reminder 工具族);保留 meta 让历史会话的卡片仍有语义标签。
+  CronList: { icon: Clock, label: "定时任务列表", tone: "accent" },
+  CronCreate: { icon: Clock, label: "创建定时任务", tone: "accent" },
+  CronDelete: { icon: Clock, label: "删除定时任务", tone: "accent" },
 };
 
 // ── 容器内 oc-* CLI(经 Bash 调用)→ 语义卡 ──
@@ -70,7 +75,7 @@ const OC_CLI_META: Record<string, ToolMeta> = {
   "oc-litrag": { icon: Brain, label: "文献问答", tone: "accent" },
   "oc-report": { icon: NotebookPen, label: "研究报告", tone: "accent" },
   "oc-rank": { icon: BarChart3, label: "排序打分", tone: "info" },
-  "oc-market": { icon: Sparkles, label: "技能市场", tone: "accent" },
+  "oc-market": { icon: Sparkles, label: "AI 市场", tone: "accent" },
   "oc-xlsx": { icon: BarChart3, label: "表格生成", tone: "success" },
   "oc-pdf": { icon: FileText, label: "PDF 生成", tone: "success" },
   "oc-docx": { icon: FileText, label: "Word 生成", tone: "success" },
@@ -166,6 +171,9 @@ const MCP_OP_META: Record<string, ToolMeta> = {
   "openclaude-memory:archival_delete": { icon: Archive, label: "归档删除" },
   "openclaude-memory:session_search": { icon: Search, label: "历史检索" },
   "openclaude-memory:create_reminder": { icon: Clock, label: "创建提醒" },
+  "openclaude-memory:list_reminders": { icon: Clock, label: "定时任务列表" },
+  "openclaude-memory:update_reminder": { icon: Clock, label: "修改定时任务" },
+  "openclaude-memory:delete_reminder": { icon: Clock, label: "删除定时任务" },
   "openclaude-memory:delegate_task": { icon: Bot, label: "委托子任务" },
   "openclaude-memory:send_to_agent": { icon: Send, label: "发送给子 Agent" },
   "openclaude-memory:skill_list": { icon: Sparkles, label: "技能列表" },
@@ -302,6 +310,10 @@ function mcpSummary(server: string, op: string, input: Record<string, unknown>):
     }
     if (op === "session_search") return asStr(input.query);
     if (op === "create_reminder") return asStr(input.message) || asStr(input.label) || asStr(input.schedule);
+    if (op === "list_reminders") return "";
+    if (op === "update_reminder" || op === "delete_reminder") {
+      return (asStr(input.message) || asStr(input.label) || asStr(input.id)).slice(0, 50);
+    }
     if (op === "delegate_task" || op === "send_to_agent") {
       const tgt = input.agentId ? `→ ${asStr(input.agentId)} ` : "";
       return `${tgt}${(asStr(input.goal) || asStr(input.message) || asStr(input.prompt)).slice(0, 60)}`;

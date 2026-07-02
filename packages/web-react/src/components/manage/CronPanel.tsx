@@ -21,8 +21,8 @@ const DELIVER_OPTIONS = [
 
 /**
  * 定时任务中心：列出 / 启停 / 编辑 / 删除 / 新建 cron 任务（经容器代理 /api/cron*）。
- * 编辑走 PUT /api/cron/:id，仅 schedule/prompt/label 可改（gateway updateJob 的能力
- * 边界；送达方式与一次性属性创建后固定，编辑态只读展示）。
+ * 编辑走 PUT /api/cron/:id，schedule/prompt/label/deliver/oneshot 全量可改
+ *（gateway updateJob 已支持；label 空串 = 清空标题）。
  */
 export function CronPanel({ auth }: { auth: AuthSession }) {
   const [jobs, setJobs] = useState<CronJob[] | null>(null);
@@ -205,10 +205,9 @@ export function CronPanel({ auth }: { auth: AuthSession }) {
 }
 
 /**
- * 新建 / 编辑共用表单。编辑态（传入 job）：
- * - 预填 label/prompt；schedule 能还原成 每天/每周 预设就还原，否则落高级 cron；
- * - 一次性任务只能改 cron 表达式本身（once/after 的重建会引入时钟换算歧义）；
- * - 送达方式与一次性属性只读展示（后端 updateJob 不支持修改）。
+ * 新建 / 编辑共用表单。编辑态（传入 job）：预填全部字段；schedule 能还原成
+ * 每天/每周 预设就还原，否则落高级 cron。送达方式与一次性属性同样可改；
+ * 把一次性改回重复时若任务已因触发被自动停用，会随保存一并重新启用。
  */
 function CronForm({
   auth,
@@ -223,11 +222,7 @@ function CronForm({
 }) {
   const editing = !!job;
   const preset = editing ? scheduleToPreset(job?.schedule) : null;
-  // 编辑态可选模式：重复任务 = 每天/每周/高级；一次性任务 = 仅高级(直接改 cron)。
-  const editModes: ScheduleMode[] = job?.oneshot ? ["advanced"] : ["daily", "weekly", "advanced"];
-  const modeOptions = editing
-    ? SCHEDULE_MODE_LABELS.filter((o) => editModes.includes(o.value as ScheduleMode))
-    : SCHEDULE_MODE_LABELS;
+  const modeOptions = SCHEDULE_MODE_LABELS;
 
   const [mode, setMode] = useState<ScheduleMode>(
     editing ? (preset?.mode ?? "advanced") : "daily",
@@ -237,7 +232,7 @@ function CronForm({
   const [minutes, setMinutes] = useState(10);
   const [at, setAt] = useState("");
   const [cron, setCron] = useState(job?.schedule || "0 9 * * *");
-  const [advOneshot, setAdvOneshot] = useState(false);
+  const [advOneshot, setAdvOneshot] = useState(editing ? !!job?.oneshot : false);
   const [label, setLabel] = useState(job?.label ?? "");
   const [prompt, setPrompt] = useState(job?.prompt ?? "");
   const [deliver, setDeliver] = useState(job?.deliver || "webchat");
@@ -247,11 +242,7 @@ function CronForm({
   const preview = (() => {
     try {
       const built = buildSchedule(mode, { time, weekday, minutes, at, cron, oneshot: advOneshot });
-      return {
-        ok: true as const,
-        human: cronHuman(built.schedule),
-        oneshot: editing ? !!job?.oneshot : built.oneshot,
-      };
+      return { ok: true as const, human: cronHuman(built.schedule), oneshot: built.oneshot };
     } catch (e) {
       return { ok: false as const, msg: (e as Error).message };
     }
@@ -268,9 +259,15 @@ function CronForm({
     setBusy(true);
     try {
       if (editing && job) {
-        // updateJob 是 truthy-patch：label 留空 = 保持原值（不能清空，UI 有提示）。
-        const patch: Record<string, unknown> = { schedule: built.schedule, prompt: prompt.trim() };
-        if (label.trim()) patch.label = label.trim();
+        const patch: Record<string, unknown> = {
+          schedule: built.schedule,
+          prompt: prompt.trim(),
+          label: label.trim(),
+          deliver,
+          oneshot: built.oneshot,
+        };
+        // 一次性→重复：任务可能已因触发被自动停用，随保存重新启用。
+        if (job.oneshot && !built.oneshot && job.enabled === false) patch.enabled = true;
         await api.updateCron(auth, job.id, patch);
       } else {
         await api.createCron(auth, {
@@ -361,11 +358,9 @@ function CronForm({
                 className={cn(inputCls, "w-40 font-mono")}
               />
             </Field>
-            {!editing && (
-              <label className="flex items-center gap-2 pb-2 text-[13px] text-fg">
-                <Switch checked={advOneshot} onCheckedChange={setAdvOneshot} aria-label="一次性" /> 一次性
-              </label>
-            )}
+            <label className="flex items-center gap-2 pb-2 text-[13px] text-fg">
+              <Switch checked={advOneshot} onCheckedChange={setAdvOneshot} aria-label="一次性" /> 一次性
+            </label>
           </>
         )}
       </div>
@@ -373,7 +368,7 @@ function CronForm({
         <p className="-mt-0.5 text-[11px] text-faint">时间按服务时区（北京时间）解释。</p>
       )}
 
-      <Field label={editing ? "标题（留空保持不变）" : "标题（可选）"}>
+      <Field label="标题（可选）">
         <input value={label} onChange={(e) => setLabel(e.target.value)} placeholder="周报提醒" className={inputCls} />
       </Field>
       <Field label="内容 / 指令">
@@ -386,22 +381,15 @@ function CronForm({
       </Field>
 
       <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
-        {editing ? (
-          <span className="text-[11.5px] text-faint">
-            送达：{deliverLabel(job?.deliver || "webchat")}
-            {job?.oneshot ? " · 一次性" : ""}（创建后不可改）
-          </span>
-        ) : (
-          <Field label="送达" inline>
-            <select value={deliver} onChange={(e) => setDeliver(e.target.value)} className={cn(inputCls, "w-auto")}>
-              {DELIVER_OPTIONS.map((o) => (
-                <option key={o.value} value={o.value}>
-                  {o.label}
-                </option>
-              ))}
-            </select>
-          </Field>
-        )}
+        <Field label="送达" inline>
+          <select value={deliver} onChange={(e) => setDeliver(e.target.value)} className={cn(inputCls, "w-auto")}>
+            {DELIVER_OPTIONS.map((o) => (
+              <option key={o.value} value={o.value}>
+                {o.label}
+              </option>
+            ))}
+          </select>
+        </Field>
         <span className="min-w-0 text-[11.5px] text-faint">
           {preview.ok ? (
             <>

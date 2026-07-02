@@ -330,7 +330,10 @@ export class CronScheduler {
           if (lastRun[job.id] === minuteKey) continue
           const agent = agentsConfig.agents.find((a) => a.id === job.agent)
           if (!agent) {
-            logger.warn(`job ${job.id}: agent ${job.agent} not found`, { jobId: job.id, agent: job.agent })
+            logger.warn(`job ${job.id}: agent ${job.agent} not found`, {
+              jobId: job.id,
+              agent: job.agent,
+            })
             continue
           }
           await this.runJob(job, agent)
@@ -383,9 +386,11 @@ export class CronScheduler {
       // All jobs use isolated sessions — always destroy, even if submit()
       // threw, otherwise the subprocess + resume-map entry would leak until
       // the eviction loop catches it on the next sweep.
-      await this.sessions.destroySession(sessionKey).catch((err) =>
-        logger.warn(`destroySession failed for ${job.id}`, { jobId: job.id }, err as Error),
-      )
+      await this.sessions
+        .destroySession(sessionKey)
+        .catch((err) =>
+          logger.warn(`destroySession failed for ${job.id}`, { jobId: job.id }, err as Error),
+        )
     }
     // Persist output
     const ts = new Date().toISOString().replace(/[:.]/g, '-')
@@ -412,11 +417,18 @@ export class CronScheduler {
       })
       return
     }
-    logger.info(`job ${job.id} completed`, { jobId: job.id, chars: trimmed.length, deliver: job.deliver ?? 'local' })
+    logger.info(`job ${job.id} completed`, {
+      jobId: job.id,
+      chars: trimmed.length,
+      deliver: job.deliver ?? 'local',
+    })
     if ((job.deliver ?? 'local') === 'local') {
       // local = just log, don't push to any channel
     } else {
-      logger.info(`delivering job ${job.id} to ${job.deliver}`, { jobId: job.id, deliver: job.deliver })
+      logger.info(`delivering job ${job.id} to ${job.deliver}`, {
+        jobId: job.id,
+        deliver: job.deliver,
+      })
       await this.onDeliver(trimmed, job)
     }
   }
@@ -451,7 +463,9 @@ export class CronScheduler {
 
   async updateJob(
     id: string,
-    updates: Partial<Pick<CronJob, 'enabled' | 'schedule' | 'prompt' | 'label'>>,
+    updates: Partial<
+      Pick<CronJob, 'enabled' | 'schedule' | 'prompt' | 'label' | 'deliver' | 'oneshot'>
+    >,
   ): Promise<boolean> {
     const file = await ensureCronFile()
     const job = file.jobs.find((j) => j.id === id)
@@ -468,7 +482,17 @@ export class CronScheduler {
       job.schedule = updates.schedule
     }
     if (updates.prompt) job.prompt = updates.prompt
-    if (updates.label) job.label = updates.label
+    // label 显式携带即生效:空串 = 清空(回退到 prompt 显示),与 create 的可选语义对称。
+    if (updates.label !== undefined) job.label = updates.label || undefined
+    if (updates.deliver !== undefined) {
+      if (!['local', 'webchat', 'telegram'].includes(updates.deliver as string)) {
+        throw new Error(`Invalid deliver "${updates.deliver}": must be local | webchat | telegram`)
+      }
+      job.deliver = updates.deliver
+    }
+    // oneshot 可改:重复→一次性(下次触发后自动停用)或反向。改为重复时若任务曾因
+    // oneshot 触发被自动停用,调用方应同时传 enabled=true 重新启用(UI 已这么做)。
+    if (updates.oneshot !== undefined) job.oneshot = !!updates.oneshot
     await atomicWriteYaml(paths.cronYaml, file)
     logger.info(`updated job ${id}`, { jobId: id })
     return true

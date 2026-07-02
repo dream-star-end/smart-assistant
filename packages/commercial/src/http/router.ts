@@ -1182,8 +1182,12 @@ export function createCommercialHandler(
       const claims = token ? verifyCommercialJwtSync(token, deps.jwtSecret) : null
       if (!claims) {
         // Let BLOCKED_FOR_USER_RULES / gateway auth produce the canonical 401.
-      } else if (claims.role === 'admin') {
-        // Admin keeps host-level debugging semantics; do not silently proxy.
+      } else if (claims.role === 'admin' && req.headers['x-oc-host-scope'] === '1') {
+        // 显式宿主范围(仅 admin,须带 X-OC-Host-Scope: 1):保留 host 级运维调试语义,
+        // fall through 到原 admin bypass。默认不再静默落宿主 —— 否则 admin 账号的
+        // 管理中心(记忆/定时/技能)读写的是宿主 gateway,与其容器内 agent 的同名数据
+        // 完全分裂(2026-07-02 会话 45faa1d3… 实测:面板显示宿主平台任务,agent 却说
+        // 没有任务)。用户范围 API 的权威源必须恒为「调用者自己的容器」,admin 也不例外。
       } else {
         const verified = await requireUserVerifyDb(claims.sub, deps.v3Supervisor.pool)
         if (!verified) {

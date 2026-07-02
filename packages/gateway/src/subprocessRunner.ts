@@ -793,6 +793,13 @@ export class SubprocessRunner extends EventEmitter {
           // block), so the model can pick run_in_background:true again.
           IS_SANDBOX: '1',
           FEATURE_VERIFICATION_AGENT: '1',
+          // 禁用 CCB 自带 Kairos cron 工具(CronList/CronCreate/CronDelete)。它们操作
+          // CCB 进程内的第二调度器(内存/scheduled_tasks.json),与 gateway cron.yaml
+          // (管理中心/create_reminder 的权威源)天然分裂:面板建的任务 CronList 看不到,
+          // 只有 CronCreate→gateway 的单向镜像桥。定时任务的唯一权威 = gateway cron,
+          // agent 侧读写走 openclaude-memory MCP 的 reminder 工具族(list/create/
+          // update/delete,同一 /api/cron)。
+          CLAUDE_CODE_DISABLE_CRON: '1',
           // 远程执行目标:kind='remote' 时让 CCB RemoteExecutor 启用 ssh mux 分支。
           // 空串 = 本地执行(默认);OC_REMOTE_* 其余变量仅在 remote 分支设。
           // 容器里 ctl.sock 的真实路径是宿主侧 /run/ccb-ssh/u<uid>/h<hid>/ctl.sock,

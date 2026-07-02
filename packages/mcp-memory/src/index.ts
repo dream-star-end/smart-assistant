@@ -140,7 +140,9 @@ if (isEmbeddingAvailable()) {
       `[mcp-memory] embedding enabled: ${embeddingProvider.providerId}/${embeddingProvider.modelId} (${embeddingProvider.dimensions}d)\n`,
     )
   } catch (err: any) {
-    process.stderr.write(`[mcp-memory] embedding init failed (falling back to BM25-only): ${err?.message}\n`)
+    process.stderr.write(
+      `[mcp-memory] embedding init failed (falling back to BM25-only): ${err?.message}\n`,
+    )
     embeddingProvider = null
   }
 }
@@ -226,7 +228,10 @@ const TOOLS = [
     inputSchema: {
       type: 'object',
       properties: {
-        query: { type: 'string', description: 'Search query, e.g. "deploy", "定时任务", "skill search"' },
+        query: {
+          type: 'string',
+          description: 'Search query, e.g. "deploy", "定时任务", "skill search"',
+        },
         limit: {
           type: 'number',
           default: 5,
@@ -349,6 +354,8 @@ const TOOLS = [
     },
   },
   // ── Reminder / scheduled task ──
+  // 定时任务的唯一权威 = gateway cron(与网页「管理中心 → 定时任务」同一数据),
+  // 本工具族(create/list/update/delete)全部经 gateway /api/cron* 读写。
   {
     name: 'create_reminder',
     description: [
@@ -360,15 +367,66 @@ const TOOLS = [
       '- 重复:"每天9点" → "0 9 * * *"',
       '',
       'oneshot=true 表示只执行一次,false 表示重复执行。',
+      '',
+      'kind="reminder"(默认): message 作为提醒内容原样播报给用户。',
+      'kind="task": message 作为到点要执行的任务指令(如"汇总本周进展并推送"),届时会真的执行。',
     ].join('\n'),
     inputSchema: {
       type: 'object',
       properties: {
         schedule: { type: 'string', description: '5字段 crontab 表达式 (用户本地时区)' },
-        message: { type: 'string', description: '提醒内容,如 "吃饭"' },
+        message: { type: 'string', description: '提醒内容或任务指令' },
         oneshot: { type: 'boolean', description: '是否一次性 (默认 true)', default: true },
+        kind: {
+          type: 'string',
+          enum: ['reminder', 'task'],
+          description: 'reminder=到点播报内容(默认); task=到点执行 message 里的任务指令',
+        },
+        deliver: {
+          type: 'string',
+          enum: ['webchat', 'local'],
+          description: '结果送达方式: webchat=推送到网页对话(默认); local=仅记录不打扰',
+        },
       },
       required: ['schedule', 'message'],
+    },
+  },
+  {
+    name: 'list_reminders',
+    description:
+      '列出当前所有定时提醒/定时任务(与网页管理中心「定时任务」同一份数据)。用户问"我有哪些定时任务/提醒"时使用。',
+    inputSchema: { type: 'object', properties: {} },
+  },
+  {
+    name: 'update_reminder',
+    description: [
+      '修改一个已存在的定时提醒/任务(id 来自 list_reminders)。只传要改的字段:',
+      'schedule(5字段 crontab)/ message(内容或指令,按原任务语义)/ label(标题,空串=清空)/',
+      'enabled(启停)/ oneshot(一次性↔重复)/ deliver(webchat|local)。',
+    ].join('\n'),
+    inputSchema: {
+      type: 'object',
+      properties: {
+        id: { type: 'string', description: '任务 ID (来自 list_reminders)' },
+        schedule: { type: 'string', description: '新的 5 字段 crontab' },
+        message: { type: 'string', description: '新的提醒内容/任务指令(整体替换)' },
+        label: { type: 'string', description: '新标题;空串=清空' },
+        enabled: { type: 'boolean', description: '启用/停用' },
+        oneshot: { type: 'boolean', description: '一次性(true)或重复(false)' },
+        deliver: { type: 'string', enum: ['webchat', 'local'], description: '送达方式' },
+      },
+      required: ['id'],
+    },
+  },
+  {
+    name: 'delete_reminder',
+    description: '删除一个定时提醒/任务(id 来自 list_reminders)。用户说"取消/删掉那个提醒"时使用。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        id: { type: 'string', description: '任务 ID (来自 list_reminders)' },
+      },
+      required: ['id'],
     },
   },
   // ── Inter-agent communication ──
@@ -482,7 +540,10 @@ const SUBMIT_TEAM_FINAL_TOOL = {
 server.setRequestHandler(ListToolsRequestSchema, async () => {
   // Training session REMOVES authoritative-write tools (only skill_propose drafts).
   const base = SKILL_TRAIN_RUN_ID
-    ? [...TOOLS.filter((t) => t.name !== 'skill_save' && t.name !== 'skill_delete'), SKILL_PROPOSE_TOOL]
+    ? [
+        ...TOOLS.filter((t) => t.name !== 'skill_save' && t.name !== 'skill_delete'),
+        SKILL_PROPOSE_TOOL,
+      ]
     : TOOLS
   // Team leader session ADDS submit_team_final.
   return { tools: TEAM_RUN_ID ? [...base, SUBMIT_TEAM_FINAL_TOOL] : base }
@@ -519,6 +580,12 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
         return await handleArchivalDelete(args as any)
       case 'create_reminder':
         return await handleCreateReminder(args as any)
+      case 'list_reminders':
+        return await handleListReminders()
+      case 'update_reminder':
+        return await handleUpdateReminder(args as any)
+      case 'delete_reminder':
+        return await handleDeleteReminder(args as any)
       case 'send_to_agent':
         return await handleSendToAgent(args as any)
       case 'delegate_task':
@@ -594,8 +661,10 @@ async function handleSessionSearch(args: {
   // Use hybrid search (BM25 + vector) when embedding is available, else BM25-only
   const hits = embeddingProvider
     ? await hybridSessionSearch(args.query, embeddingProvider, limit, searchAgentId)
-    : (await searchSessions(args.query, limit, searchAgentId)).map(h => ({
-        ...h, bm25Rank: null as number | null, vecRank: null as number | null,
+    : (await searchSessions(args.query, limit, searchAgentId)).map((h) => ({
+        ...h,
+        bm25Rank: null as number | null,
+        vecRank: null as number | null,
       }))
 
   if (hits.length === 0) {
@@ -808,7 +877,12 @@ const SKILL_DUP_THRESHOLD = 0.82
  */
 async function findNearDuplicateSkill(
   meta: { name: string; description: string; tags?: string[] },
-  existing: Array<{ name: string; description: string; tags?: string[]; related_skills?: string[] }>,
+  existing: Array<{
+    name: string
+    description: string
+    tags?: string[]
+    related_skills?: string[]
+  }>,
 ): Promise<{ name: string; score: number } | null> {
   const base = process.env.OPENCLAUDE_V3_MASTER_BASE_URL?.trim()
   const token = process.env.OPENCLAUDE_V3_CONTAINER_TOKEN?.trim()
@@ -856,13 +930,19 @@ async function handleSkillSave(args: {
   // Defense in depth: training sessions must never write the authoritative library
   // (the tool is also removed from the training tool list above).
   if (SKILL_TRAIN_RUN_ID) {
-    return toolError('skill_save is disabled during a training run — use skill_propose (draft only)')
+    return toolError(
+      'skill_save is disabled during a training run — use skill_propose (draft only)',
+    )
   }
   // Near-duplicate soft gate: steer toward updating an existing similar skill
   // rather than growing the library uncontrolled. force:true bypasses. Only the
   // v3 path (master configured) runs it — personal version skips entirely (no
   // extra skills.list() cost).
-  if (!args.force && process.env.OPENCLAUDE_V3_MASTER_BASE_URL && process.env.OPENCLAUDE_V3_CONTAINER_TOKEN) {
+  if (
+    !args.force &&
+    process.env.OPENCLAUDE_V3_MASTER_BASE_URL &&
+    process.env.OPENCLAUDE_V3_CONTAINER_TOKEN
+  ) {
     const dup = await findNearDuplicateSkill(
       { name: args.name, description: args.description, tags: args.tags },
       await skills.list(),
@@ -899,9 +979,7 @@ async function handleSkillDelete(args: { name: string }) {
   if (!r.ok) return toolError(r.error ?? 'delete failed')
   // PR4: when a user shadow was removed but the platform baseline remains,
   // propagate the note so the agent understands why list still shows the name.
-  const msg = r.note
-    ? `Deleted skill "${args.name}". ${r.note}`
-    : `Deleted skill "${args.name}".`
+  const msg = r.note ? `Deleted skill "${args.name}". ${r.note}` : `Deleted skill "${args.name}".`
   return toolOk(msg)
 }
 
@@ -938,7 +1016,9 @@ async function handleSkillPropose(args: {
   // ANY agent's seed up front (same invariant SkillStore.save enforces at merge), not
   // just the names visible in THIS training agent's overlay.
   if (await isPlatformReservedSkillName(args.name)) {
-    return toolError(`"${args.name}" is reserved by a platform skill — cannot propose changes to it`)
+    return toolError(
+      `"${args.name}" is reserved by a platform skill — cannot propose changes to it`,
+    )
   }
 
   // Resolve the current authoritative skill (baseline-wins overlay) for authority
@@ -1038,7 +1118,7 @@ async function handleArchivalSearch(args: { query: string; limit?: number }) {
   if (results.length === 0) return toolOk(`No archival entries match "${args.query}".`)
 
   // Track access for lifecycle (non-blocking)
-  recordAccess(results.map(r => r.id)).catch(() => {})
+  recordAccess(results.map((r) => r.id)).catch(() => {})
 
   const mode = embeddingProvider ? 'hybrid (BM25+vector)' : 'BM25-only'
   const lines = results.map((r, i) => {
@@ -1055,7 +1135,9 @@ async function handleArchivalSearch(args: { query: string; limit?: number }) {
 
 async function handleArchivalDelete(args: { id: string }) {
   if (typeof args.id !== 'string' || args.id.trim() === '') {
-    return toolError('archival_delete requires a non-empty `id` string (from archival_search results)')
+    return toolError(
+      'archival_delete requires a non-empty `id` string (from archival_search results)',
+    )
   }
   const ok = await archivalDelete(AGENT_ID, args.id)
   if (!ok) return toolError(`Entry ${args.id} not found.`)
@@ -1180,7 +1262,9 @@ function postJsonToGateway(
     })
     req.on('error', reject)
     req.setTimeout(opts.timeoutMs, () => {
-      const err: any = new Error(`delegate client timeout after ${Math.round(opts.timeoutMs / 1000)}s`)
+      const err: any = new Error(
+        `delegate client timeout after ${Math.round(opts.timeoutMs / 1000)}s`,
+      )
       err.code = 'ETIMEDOUT'
       req.destroy(err)
     })
@@ -1276,39 +1360,140 @@ function looksLikeDelegateApiError(raw: unknown): boolean {
   return /^API Error:\s*(?:\d{3}\b|\{)/i.test(s)
 }
 
+// ── 定时任务工具族共用:gateway /api/cron 客户端 ────────────────────────────
+function gatewayCronBase(): { base: string; headers: Record<string, string> } {
+  const gatewayPort = process.env.OPENCLAUDE_GATEWAY_PORT || '18789'
+  return {
+    base: `http://127.0.0.1:${gatewayPort}/api/cron`,
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${readGatewayToken()}`,
+    },
+  }
+}
+
 async function handleCreateReminder(args: {
   schedule: string
   message: string
   oneshot?: boolean
+  kind?: 'reminder' | 'task'
+  deliver?: 'webchat' | 'local'
 }) {
-  // Call the gateway's /api/cron endpoint to create the reminder
-  const gatewayPort = process.env.OPENCLAUDE_GATEWAY_PORT || '18789'
-  const gatewayToken = readGatewayToken()
+  const { base, headers } = gatewayCronBase()
+  const isTask = args.kind === 'task'
   try {
-    const res = await fetch(`http://127.0.0.1:${gatewayPort}/api/cron`, {
+    const res = await fetch(base, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${gatewayToken}`,
-      },
+      headers,
       body: JSON.stringify({
         schedule: args.schedule,
-        prompt: `请直接输出以下提醒内容,不要添加任何额外文字:\n\n⏰ 提醒: ${args.message}`,
-        deliver: 'webchat',
+        // reminder = 到点原样播报;task = message 即任务指令,到点真执行。
+        prompt: isTask
+          ? args.message
+          : `请直接输出以下提醒内容,不要添加任何额外文字:\n\n⏰ 提醒: ${args.message}`,
+        deliver: args.deliver === 'local' ? 'local' : 'webchat',
         oneshot: args.oneshot !== false,
-        label: args.message,
+        label: args.message.slice(0, 50),
       }),
     })
     if (!res.ok) {
       const err = await res.text()
-      return toolError(`创建提醒失败: ${err}`)
+      return toolError(`创建${isTask ? '任务' : '提醒'}失败: ${err}`)
     }
     const data = (await res.json()) as any
     return toolOk(
-      `✅ 提醒已创建: "${args.message}"\n⏰ 计划: \`${args.schedule}\`\nID: \`${data.job?.id ?? '?'}\`${args.oneshot !== false ? ' (一次性)' : ' (重复)'}`,
+      `✅ ${isTask ? '定时任务' : '提醒'}已创建: "${args.message}"\n⏰ 计划: \`${args.schedule}\`\nID: \`${data.job?.id ?? '?'}\`${args.oneshot !== false ? ' (一次性)' : ' (重复)'}`,
     )
   } catch (err: any) {
-    return toolError(`创建提醒失败: ${err?.message ?? String(err)}`)
+    return toolError(`创建${isTask ? '任务' : '提醒'}失败: ${err?.message ?? String(err)}`)
+  }
+}
+
+async function handleListReminders() {
+  const { base, headers } = gatewayCronBase()
+  try {
+    const res = await fetch(base, { headers })
+    if (!res.ok) return toolError(`获取定时任务失败: ${await res.text()}`)
+    const data = (await res.json()) as {
+      jobs?: Array<{
+        id: string
+        schedule: string
+        label?: string
+        prompt?: string
+        enabled?: boolean
+        oneshot?: boolean
+        deliver?: string
+        nextRunAt?: string
+        heartbeat?: boolean
+      }>
+    }
+    const jobs = data.jobs ?? []
+    if (jobs.length === 0) return toolOk('当前没有任何定时提醒/任务。可用 create_reminder 创建。')
+    const lines = jobs.map((j) => {
+      const title = j.label || (j.prompt ? `${j.prompt.slice(0, 40)}…` : j.id)
+      const bits = [
+        `\`${j.schedule}\``,
+        j.oneshot ? '一次性' : '重复',
+        j.enabled === false ? '已停用' : '启用中',
+        j.deliver === 'local' ? '仅记录' : j.deliver === 'telegram' ? 'Telegram' : '推送对话',
+      ]
+      if (j.nextRunAt) bits.push(`下次 ${j.nextRunAt}`)
+      return `- **${title}** (ID: \`${j.id}\`) — ${bits.join(' · ')}`
+    })
+    return toolOk(`共 ${jobs.length} 个定时提醒/任务:\n${lines.join('\n')}`)
+  } catch (err: any) {
+    return toolError(`获取定时任务失败: ${err?.message ?? String(err)}`)
+  }
+}
+
+async function handleUpdateReminder(args: {
+  id: string
+  schedule?: string
+  message?: string
+  label?: string
+  enabled?: boolean
+  oneshot?: boolean
+  deliver?: 'webchat' | 'local'
+}) {
+  const { base, headers } = gatewayCronBase()
+  const patch: Record<string, unknown> = {}
+  if (args.schedule !== undefined) patch.schedule = args.schedule
+  if (args.message !== undefined) patch.prompt = args.message
+  if (args.label !== undefined) patch.label = args.label
+  if (args.enabled !== undefined) patch.enabled = args.enabled
+  if (args.oneshot !== undefined) {
+    patch.oneshot = args.oneshot
+    // 一次性→重复:若任务曾触发后被自动停用,顺手重新启用(除非显式要求停用)。
+    if (args.oneshot === false && args.enabled === undefined) patch.enabled = true
+  }
+  if (args.deliver !== undefined) patch.deliver = args.deliver
+  if (Object.keys(patch).length === 0) return toolError('没有要修改的字段')
+  try {
+    const res = await fetch(`${base}/${encodeURIComponent(args.id)}`, {
+      method: 'PUT',
+      headers,
+      body: JSON.stringify(patch),
+    })
+    if (res.status === 404) return toolError(`任务不存在: ${args.id}(用 list_reminders 查 ID)`)
+    if (!res.ok) return toolError(`修改失败: ${await res.text()}`)
+    return toolOk(`✅ 已修改任务 \`${args.id}\`: ${Object.keys(patch).join(', ')}`)
+  } catch (err: any) {
+    return toolError(`修改失败: ${err?.message ?? String(err)}`)
+  }
+}
+
+async function handleDeleteReminder(args: { id: string }) {
+  const { base, headers } = gatewayCronBase()
+  try {
+    const res = await fetch(`${base}/${encodeURIComponent(args.id)}`, {
+      method: 'DELETE',
+      headers,
+    })
+    if (res.status === 404) return toolError(`任务不存在: ${args.id}(用 list_reminders 查 ID)`)
+    if (!res.ok) return toolError(`删除失败: ${await res.text()}`)
+    return toolOk(`✅ 已删除任务 \`${args.id}\``)
+  } catch (err: any) {
+    return toolError(`删除失败: ${err?.message ?? String(err)}`)
   }
 }
 

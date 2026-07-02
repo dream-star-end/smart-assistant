@@ -17,7 +17,13 @@
  *   10. REPO             — 当前会话 GitHub repo 绑定快照 (离 user 消息最近)
  */
 import { existsSync, readFileSync } from 'node:fs'
-import { MemoryStore, type SkillStore, buildAgentSkillStore, paths, readAgentsConfig } from '@openclaude/storage'
+import {
+  MemoryStore,
+  type SkillStore,
+  buildAgentSkillStore,
+  paths,
+  readAgentsConfig,
+} from '@openclaude/storage'
 import { request as undiciRequest } from 'undici'
 import type { RepoSnapshot } from './sessionRepoWorkspace.js'
 import { listCollaboratorAgents } from './collaboratorAgents.js'
@@ -267,7 +273,8 @@ export function buildToolsSlot(): PromptSlot {
       `**当前服务器时间**: ${timeStr}`,
       '',
       '用户要求定时任务或提醒时,**必须立即创建,不要说做不到**。',
-      '快速用法: `create_reminder(schedule="分 时 日 月 周", message="内容", oneshot=true)`',
+      '快速用法: `create_reminder(schedule="分 时 日 月 周", message="内容", oneshot=true)`;到点执行的任务(非播报提醒)加 `kind="task"`。',
+      '查看/修改/删除: `list_reminders()` / `update_reminder(id, ...)` / `delete_reminder(id)`。这套工具与网页「管理中心 → 定时任务」是同一份数据,用户在页面上建的任务你也能看到。',
       '详细指南见 `skill_view("scheduled-tasks")`。',
       '',
       '## 技能自生成',
