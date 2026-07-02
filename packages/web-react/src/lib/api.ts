@@ -17,6 +17,7 @@ import type {
   MarketplaceDetail,
   MarketplaceInstalled,
   MarketplaceMyAgent,
+  MarketplaceMyPublish,
   MarketplacePending,
   MarketplacePublishInput,
   MarketplacePublishResult,
@@ -1292,6 +1293,17 @@ export const api = {
         }),
       ),
     ),
+
+  /** 我的发布记录（GET /api/marketplace/my-publishes：状态 + 审核理由，发布闭环）。 */
+  listMarketplaceMyPublishes: (a: AuthSession) =>
+    jsonOrThrow<{ publishes: MarketplaceMyPublish[] }>(
+      callWithRefresh(a, (t) =>
+        fetch("/api/marketplace/my-publishes", {
+          credentials: "include",
+          headers: bearerHeaders(t),
+        }),
+      ),
+    ).then((b) => b.publishes || []),
 
   /** 我的智能体（GET /api/marketplace/my-agents：默认全能助手 + 已安装市场智能体）。 */
   listMyAgents: (a: AuthSession) =>

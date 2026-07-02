@@ -512,6 +512,8 @@ export type MarketplaceCard = {
   tags: string[];
   /** 仅 embedding 检索时带回，用于排序展示，可忽略。 */
   score?: number;
+  /** 当前活跃安装数（≈使用人数；旧后端可能不带）。 */
+  installCount?: number;
 };
 
 /** 市场检索响应。method=all 为空查询返全部目录。 */
@@ -554,6 +556,28 @@ export type MarketplaceInstalled = {
   name: string;
   artifactHash: string;
   installedAt: string;
+  listingState: string;
+  /** listing 当前上架版本（升级可见性；旧后端/无上架版本时缺省）。 */
+  latestVersion?: string | null;
+  latestVersionId?: string | null;
+};
+
+/** 我的发布记录（GET /api/marketplace/my-publishes 的 publishes 项）。 */
+export type MarketplaceMyPublish = {
+  versionId: string;
+  slug: string;
+  kind: MarketplaceKind;
+  version: string;
+  name: string;
+  /** pending | approved | rejected */
+  status: string;
+  /** 审核备注（拒绝理由等）。 */
+  reviewNote?: string | null;
+  createdAt: string;
+  reviewedAt?: string | null;
+  /** 该版本是否 listing 当前上架版本。 */
+  isCurrent: boolean;
+  /** listing 状态（active/revoked）。 */
   listingState: string;
 };
 

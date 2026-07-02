@@ -1,7 +1,7 @@
-import { Download, Loader2, ShieldCheck, Users } from 'lucide-react'
+import { ArrowUpCircle, Download, Loader2, ShieldCheck, Users } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { ApiError, api } from '../../lib/api'
-import type { AuthSession, MarketplaceDetail } from '../../lib/types'
+import type { AuthSession, MarketplaceDetail, MarketplaceInstalled } from '../../lib/types'
 import { Alert, Badge, Button, Modal } from '../ui'
 import { friendlyRiskFlags } from './riskFlags'
 
@@ -69,8 +69,8 @@ function AgentManifestView({ manifest }: { manifest: unknown }) {
 }
 
 /**
- * 市场条目详情 + 安装确认。展示完整 SKILL.md(用户安装前看清「装的到底是什么」),
- * 一键安装。已安装则展示状态、可前往「已安装」卸载。
+ * 市场条目详情 + 安装/更新确认。展示完整 SKILL.md(用户安装前看清「装的到底是什么」),
+ * 一键安装；已安装但有新上架版本时给「更新」（复用 install 的幂等替换语义）。
  */
 export function DetailModal({
   slug,
@@ -81,7 +81,8 @@ export function DetailModal({
 }: {
   slug: string | null
   auth: AuthSession
-  installed: boolean
+  /** 已安装行(含 pin 的版本);未安装为 undefined。 */
+  installed?: MarketplaceInstalled
   onClose: () => void
   onInstalled: () => void
 }) {
@@ -128,6 +129,9 @@ export function DetailModal({
   }
 
   const warns = friendlyRiskFlags(detail?.riskFlags)
+  // detail.versionId 是当前上架版本(最新权威);已安装且 pin 的不是它 → 可更新。
+  const canUpdate = !!installed && !!detail && installed.versionId !== detail.versionId
+  const isAgent = detail?.kind === 'agent'
 
   return (
     <Modal
@@ -141,13 +145,22 @@ export function DetailModal({
             <Button variant="ghost" onClick={onClose}>
               关闭
             </Button>
-            {installed && !done ? (
+            {done ? (
+              <Badge tone="success" className="self-center">
+                <ShieldCheck size={13} /> {canUpdate ? '更新成功' : '安装成功'}
+              </Badge>
+            ) : canUpdate ? (
+              <Button variant="primary" onClick={install} disabled={installing}>
+                {installing ? (
+                  <Loader2 size={15} className="animate-spin" />
+                ) : (
+                  <ArrowUpCircle size={15} />
+                )}
+                更新到 v{detail.version}
+              </Button>
+            ) : installed ? (
               <Badge tone="success" className="self-center">
                 <ShieldCheck size={13} /> 已安装
-              </Badge>
-            ) : done ? (
-              <Badge tone="success" className="self-center">
-                <ShieldCheck size={13} /> 安装成功
               </Badge>
             ) : (
               <Button variant="primary" onClick={install} disabled={installing}>
@@ -173,8 +186,15 @@ export function DetailModal({
         <div className="flex flex-col gap-3">
           {err && <Alert tone="danger">{err}</Alert>}
           {done && (
-            <Alert tone="success" title="已安装">
-              将在你的下一次会话中对 AI 可用。
+            <Alert tone="success" title={canUpdate ? '已更新' : '已安装'}>
+              {isAgent
+                ? '可在输入框上方的智能体选择器中切换使用。'
+                : '将在你的下一次会话中对 AI 可用。'}
+            </Alert>
+          )}
+          {!done && canUpdate && installed && (
+            <Alert tone="info" title={`有新版本 v${detail.version}`}>
+              你当前安装的是 v{installed.version}，更新后下一次会话生效。
             </Alert>
           )}
           <p className="text-[13.5px] leading-relaxed text-fg">{detail.description}</p>

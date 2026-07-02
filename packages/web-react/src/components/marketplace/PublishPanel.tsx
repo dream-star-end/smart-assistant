@@ -1,8 +1,15 @@
-import { CheckCircle2, Loader2, Upload } from "lucide-react";
+import { CheckCircle2, ChevronRight, Loader2, Upload } from "lucide-react";
 import { type ReactNode, useEffect, useState } from "react";
 import { api, ApiError } from "../../lib/api";
-import type { AuthSession, MarketplaceRiskFlag, SkillSummary } from "../../lib/types";
-import { Alert, Button, Input, Textarea } from "../ui";
+import { suggestSlug } from "../../lib/marketplace";
+import type {
+  AuthSession,
+  MarketplaceMyPublish,
+  MarketplaceRiskFlag,
+  SkillSummary,
+} from "../../lib/types";
+import { cn } from "../../lib/utils";
+import { Alert, Badge, Button, Input, Textarea } from "../ui";
 import { friendlyRiskFlags } from "./riskFlags";
 
 /** 标签+控件包裹（input 嵌于 label 内即关联，参照 CronPanel.Field 模式）。 */
@@ -15,24 +22,19 @@ function Field({ label, children }: { label: string; children: ReactNode }) {
   );
 }
 
-function toSlug(name: string): string {
-  return name
-    .toLowerCase()
-    .replace(/[^a-z0-9-]+/g, "-")
-    .replace(/^-+|-+$/g, "")
-    .slice(0, 64);
-}
-
 const SLUG_RE = /^[a-z0-9][a-z0-9-]{1,63}$/;
 const VERSION_RE = /^\d+\.\d+\.\d+$/;
 
 /**
  * 发布：从「我的技能」一键导入或手填,提交进入平台审核队列(pending)。
- * 被静态扫描拦截时把命中翻译成可操作的中文修正提示。
+ * 被静态扫描拦截时把命中翻译成可操作的中文修正提示。顶部「我的发布」闭合
+ * 反馈环:提交后能看到 审核中/已上架/未通过+理由,不再石沉大海。
  */
 export function PublishPanel({ auth }: { auth: AuthSession }) {
   const [mySkills, setMySkills] = useState<SkillSummary[]>([]);
   const [slug, setSlug] = useState("");
+  // 用户手动改过 slug 后停止跟随名称联动。
+  const [slugTouched, setSlugTouched] = useState(false);
   const [version, setVersion] = useState("1.0.0");
   const [name, setName] = useState("");
   const [description, setDescription] = useState("");
@@ -43,6 +45,7 @@ export function PublishPanel({ auth }: { auth: AuthSession }) {
   const [err, setErr] = useState<string | null>(null);
   const [flags, setFlags] = useState<MarketplaceRiskFlag[]>([]);
   const [ok, setOk] = useState(false);
+  const [publishReload, setPublishReload] = useState(0);
 
   useEffect(() => {
     let alive = true;
@@ -58,7 +61,8 @@ export function PublishPanel({ auth }: { auth: AuthSession }) {
   const importSkill = async (sk: SkillSummary) => {
     setErr(null);
     setName(sk.name);
-    setSlug(toSlug(sk.name));
+    setSlug(suggestSlug(sk.name));
+    setSlugTouched(false);
     setDescription(sk.description ?? "");
     setTags((sk.tags ?? []).join(", "));
     try {
@@ -101,6 +105,7 @@ export function PublishPanel({ auth }: { auth: AuthSession }) {
           .filter(Boolean),
       });
       setOk(true);
+      setPublishReload((n) => n + 1);
     } catch (e) {
       if (e instanceof ApiError && e.status === 422) {
         const rf = (e.body as { riskFlags?: MarketplaceRiskFlag[] })?.riskFlags ?? [];
@@ -122,7 +127,7 @@ export function PublishPanel({ auth }: { auth: AuthSession }) {
         <CheckCircle2 size={32} className="text-success" />
         <p className="text-[14px] font-medium text-fg">已提交，等待平台审核</p>
         <p className="max-w-sm text-[12.5px] text-muted">
-          审核通过后将上架并对其他用户可见。你可以继续发布其它技能。
+          审核通过后将上架并对其他用户可见。审核进度可随时回到本页「我的发布」查看。
         </p>
         <Button
           variant="secondary"
@@ -130,6 +135,7 @@ export function PublishPanel({ auth }: { auth: AuthSession }) {
           onClick={() => {
             setOk(false);
             setSlug("");
+            setSlugTouched(false);
             setName("");
             setDescription("");
             setTags("");
@@ -137,7 +143,7 @@ export function PublishPanel({ auth }: { auth: AuthSession }) {
             setVersion("1.0.0");
           }}
         >
-          再发布一个
+          继续发布
         </Button>
       </div>
     );
@@ -145,6 +151,8 @@ export function PublishPanel({ auth }: { auth: AuthSession }) {
 
   return (
     <div className="flex flex-col gap-4 px-4 py-4">
+      <MyPublishes auth={auth} reload={publishReload} />
+
       {mySkills.length > 0 && (
         <div>
           <div className="mb-1.5 text-[12px] font-medium text-muted">从我的技能导入</div>
@@ -184,12 +192,22 @@ export function PublishPanel({ auth }: { auth: AuthSession }) {
 
       <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
         <Field label="显示名称">
-          <Input value={name} onChange={(e) => setName(e.target.value)} placeholder="例：学术翻译" />
+          <Input
+            value={name}
+            onChange={(e) => {
+              setName(e.target.value);
+              if (!slugTouched) setSlug(suggestSlug(e.target.value));
+            }}
+            placeholder="例：学术翻译"
+          />
         </Field>
         <Field label="标识 slug">
           <Input
             value={slug}
-            onChange={(e) => setSlug(e.target.value)}
+            onChange={(e) => {
+              setSlug(e.target.value);
+              setSlugTouched(true);
+            }}
             placeholder="academic-translate"
           />
         </Field>
@@ -228,4 +246,93 @@ export function PublishPanel({ auth }: { auth: AuthSession }) {
       </div>
     </div>
   );
+}
+
+const STATUS_META: Record<string, { label: string; tone: "warning" | "success" | "danger" }> = {
+  pending: { label: "审核中", tone: "warning" },
+  approved: { label: "已上架", tone: "success" },
+  rejected: { label: "未通过", tone: "danger" },
+};
+
+/**
+ * 我的发布记录（最近 50 条）。默认折叠成一行摘要,点开看每次提交的状态与
+ * 审核理由(rejected 的 review_note 按纯文本渲染)。无记录时整段隐藏。
+ */
+function MyPublishes({ auth, reload }: { auth: AuthSession; reload: number }) {
+  const [rows, setRows] = useState<MarketplaceMyPublish[] | null>(null);
+  const [open, setOpen] = useState(false);
+
+  useEffect(() => {
+    let alive = true;
+    api
+      .listMarketplaceMyPublishes(auth)
+      .then((r) => alive && setRows(r))
+      .catch(() => alive && setRows([]));
+    return () => {
+      alive = false;
+    };
+  }, [auth, reload]);
+
+  if (!rows || rows.length === 0) return null;
+  const pending = rows.filter((r) => r.status === "pending").length;
+  const rejected = rows.filter((r) => r.status === "rejected").length;
+
+  return (
+    <div className="overflow-hidden rounded-xl border border-border bg-elevated">
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        className="flex w-full items-center gap-2 px-3.5 py-2.5 text-left outline-none transition-colors hover:bg-hover focus-visible:ring-2 focus-visible:ring-ring"
+      >
+        <ChevronRight
+          size={15}
+          className={cn("shrink-0 text-faint transition-transform", open && "rotate-90")}
+        />
+        <span className="text-[13px] font-medium text-fg">我的发布（{rows.length}）</span>
+        <span className="flex items-center gap-1.5 text-[11.5px] text-faint">
+          {pending > 0 && <Badge tone="warning">{pending} 审核中</Badge>}
+          {rejected > 0 && <Badge tone="danger">{rejected} 未通过</Badge>}
+        </span>
+      </button>
+      {open && (
+        <ul className="flex flex-col border-t border-border">
+          {rows.map((r) => {
+            const meta = STATUS_META[r.status] ?? { label: r.status, tone: "warning" as const };
+            const revoked = r.status === "approved" && r.listingState === "revoked";
+            return (
+              <li key={r.versionId} className="border-b border-border px-3.5 py-2.5 last:border-b-0">
+                <div className="flex flex-wrap items-center gap-1.5">
+                  <span className="text-[13px] font-medium text-fg">{r.name}</span>
+                  <Badge tone="neutral">v{r.version}</Badge>
+                  {r.kind === "agent" && <Badge tone="accent">智能体</Badge>}
+                  <Badge tone={meta.tone}>{meta.label}</Badge>
+                  {revoked && <Badge tone="warning">已被下架</Badge>}
+                  {r.status === "approved" && !r.isCurrent && !revoked && (
+                    <Badge tone="neutral">已被新版本取代</Badge>
+                  )}
+                  <span className="ml-auto text-[11px] text-faint">{fmtDate(r.createdAt)}</span>
+                </div>
+                {r.status === "rejected" && r.reviewNote && (
+                  <p className="mt-1 text-[12px] leading-relaxed text-muted">
+                    <span className="text-danger">拒绝理由：</span>
+                    {r.reviewNote}
+                  </p>
+                )}
+              </li>
+            );
+          })}
+        </ul>
+      )}
+    </div>
+  );
+}
+
+function fmtDate(t: string): string {
+  try {
+    const d = new Date(t);
+    if (Number.isNaN(d.getTime())) return t;
+    return d.toLocaleDateString("zh-CN", { month: "numeric", day: "numeric" });
+  } catch {
+    return t;
+  }
 }

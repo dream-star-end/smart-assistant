@@ -953,6 +953,7 @@ export function App() {
         tab={manageTab}
         auth={auth}
         agentId={agent.id}
+        agents={myAgents}
         onTabChange={setManageTab}
         onClose={() => setManageOpen(false)}
       />

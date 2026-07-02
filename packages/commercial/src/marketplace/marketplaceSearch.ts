@@ -37,8 +37,17 @@ function toCard(c: ApprovedSearchRow): {
   name: string
   description: string
   tags: string[]
+  installCount: number
 } {
-  return { slug: c.slug, kind: c.kind, name: c.name, description: c.description, tags: c.tags }
+  // installCount 是加法字段(v3 vanilla UI 忽略);排序不动,热度排序收在 v5 前端。
+  return {
+    slug: c.slug,
+    kind: c.kind,
+    name: c.name,
+    description: c.description,
+    tags: c.tags,
+    installCount: c.installCount,
+  }
 }
 
 export async function handleMarketplaceSearch(

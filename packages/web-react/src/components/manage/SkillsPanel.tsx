@@ -1,10 +1,9 @@
-import { ChevronRight, FileText, Loader2, Sparkles, Trash2 } from "lucide-react";
+import { ChevronRight, FileText, Loader2, Search, Sparkles, Trash2 } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
 import { api } from "../../lib/api";
 import type { AuthSession, SkillDetail, SkillSummary } from "../../lib/types";
 import { cn } from "../../lib/utils";
-import { Alert, Badge, Spinner, useConfirm } from "../ui";
-import { EmptyState, PanelHeader } from "./parts";
+import { Alert, Badge, EmptyState, Input, PanelHeader, Spinner, useConfirm } from "../ui";
 
 /**
  * 技能库：列出用户可用技能（经容器代理 /api/skills），展开看正文（/api/skills/:name），
@@ -15,6 +14,7 @@ export function SkillsPanel({ auth }: { auth: AuthSession }) {
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState<string | null>(null);
   const [reload, setReload] = useState(0);
+  const [filter, setFilter] = useState("");
   const [confirmDialog, confirmDialogEl] = useConfirm();
 
   useEffect(() => {
@@ -52,10 +52,23 @@ export function SkillsPanel({ auth }: { auth: AuthSession }) {
     [auth, confirmDialog],
   );
 
+  // 过滤：名称/描述/标签（本地即时过滤，不发请求）。
+  const q = filter.trim().toLowerCase();
+  const visible = (skills ?? []).filter(
+    (sk) =>
+      !q ||
+      sk.name.toLowerCase().includes(q) ||
+      (sk.description ?? "").toLowerCase().includes(q) ||
+      (sk.tags ?? []).some((t) => t.toLowerCase().includes(q)),
+  );
+
   return (
     <div className="flex flex-col">
       {confirmDialogEl}
-      <PanelHeader title="技能" hint="完成复杂任务后智能体会把流程沉淀成可复用技能；也可从市场安装。" />
+      <PanelHeader
+        title={skills && skills.length > 0 ? `技能（${skills.length}）` : "技能"}
+        hint="完成复杂任务后智能体会把流程沉淀成可复用技能；也可从市场安装。"
+      />
       {err && (
         <div className="px-5 pb-2">
           <Alert tone="danger" className="text-[12.5px]">
@@ -74,11 +87,33 @@ export function SkillsPanel({ auth }: { auth: AuthSession }) {
           hint="在对话里让智能体「把这个流程存成技能」即可自动沉淀，或从市场安装。"
         />
       ) : (
-        <ul className="flex flex-col gap-1.5 px-4 pb-4">
-          {skills.map((sk) => (
-            <SkillRow key={sk.name} auth={auth} skill={sk} onDelete={() => remove(sk.name)} />
-          ))}
-        </ul>
+        <>
+          {skills.length > 5 && (
+            <div className="px-4 pb-2.5">
+              <div className="relative">
+                <Search
+                  size={14}
+                  className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-faint"
+                />
+                <Input
+                  value={filter}
+                  onChange={(e) => setFilter(e.target.value)}
+                  placeholder="按名称 / 描述 / 标签过滤…"
+                  className="pl-8"
+                />
+              </div>
+            </div>
+          )}
+          {visible.length === 0 ? (
+            <p className="px-5 py-8 text-center text-[12.5px] text-faint">没有匹配的技能，换个关键词试试。</p>
+          ) : (
+            <ul className="flex flex-col gap-1.5 px-4 pb-4">
+              {visible.map((sk) => (
+                <SkillRow key={sk.name} auth={auth} skill={sk} onDelete={() => remove(sk.name)} />
+              ))}
+            </ul>
+          )}
+        </>
       )}
     </div>
   );

@@ -1,10 +1,14 @@
-import { AlertTriangle, PackageOpen, ShieldCheck, Trash2 } from "lucide-react";
+import { AlertTriangle, ArrowUpCircle, Loader2, PackageOpen, ShieldCheck, Trash2 } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
 import { api } from "../../lib/api";
+import { updateAvailable } from "../../lib/marketplace";
 import type { AuthSession, MarketplaceInstalled } from "../../lib/types";
-import { Alert, Badge, Button, Spinner, useConfirm } from "../ui";
+import { Alert, Badge, Button, EmptyState, Spinner, useConfirm } from "../ui";
 
-/** 我的已安装：列出当前安装的技能,可卸载;被平台下架(revoked)的条目给出醒目提醒。 */
+/**
+ * 我的已安装：列出当前安装的技能/智能体,可卸载;有新上架版本的给「更新」按钮
+ * （复用 install 的幂等替换语义,以后端校验为准）;被平台下架(revoked)的醒目提醒。
+ */
 export function InstalledPanel({ auth, onGoBrowse }: { auth: AuthSession; onGoBrowse: () => void }) {
   const [rows, setRows] = useState<MarketplaceInstalled[] | null>(null);
   const [loading, setLoading] = useState(true);
@@ -50,6 +54,26 @@ export function InstalledPanel({ auth, onGoBrowse }: { auth: AuthSession; onGoBr
     [auth, confirmDialog],
   );
 
+  // 更新 = 安装 listing 当前上架版本。latestVersionId 可能在打开面板后又变化,
+  // 以后端 install 校验为准:失败(非当前版本)则报错并刷新列表。
+  const update = useCallback(
+    async (row: MarketplaceInstalled) => {
+      if (!row.latestVersionId) return;
+      setBusy(row.slug);
+      setErr(null);
+      try {
+        await api.installMarketplace(auth, row.latestVersionId);
+        setReload((n) => n + 1);
+      } catch (e) {
+        setErr((e as Error).message || "更新失败");
+        setReload((n) => n + 1);
+      } finally {
+        setBusy(null);
+      }
+    },
+    [auth],
+  );
+
   return (
     <div className="flex flex-col">
       {confirmDialogEl}
@@ -63,17 +87,21 @@ export function InstalledPanel({ auth, onGoBrowse }: { auth: AuthSession; onGoBr
           <Spinner /> 加载已安装…
         </div>
       ) : !rows || rows.length === 0 ? (
-        <div className="flex flex-col items-center gap-3 px-6 py-16 text-center text-faint">
-          <PackageOpen size={28} className="opacity-50" />
-          <p className="text-[13px]">还没有安装任何技能或智能体。</p>
-          <Button variant="secondary" size="sm" onClick={onGoBrowse}>
-            去市场看看
-          </Button>
-        </div>
+        <EmptyState
+          icon={PackageOpen}
+          title="还没有安装任何技能或智能体"
+          hint="去市场发现别人沉淀好的能力，一键安装即可使用。"
+          action={
+            <Button variant="secondary" size="sm" onClick={onGoBrowse}>
+              去市场看看
+            </Button>
+          }
+        />
       ) : (
         <ul className="flex flex-col gap-2 px-4 py-4">
           {rows.map((r) => {
             const revoked = r.listingState === "revoked";
+            const canUpdate = updateAvailable(r);
             return (
               <li
                 key={r.slug}
@@ -87,10 +115,15 @@ export function InstalledPanel({ auth, onGoBrowse }: { auth: AuthSession; onGoBr
                   {revoked ? <AlertTriangle size={15} /> : <ShieldCheck size={15} />}
                 </span>
                 <div className="min-w-0 flex-1">
-                  <div className="flex items-center gap-1.5">
+                  <div className="flex flex-wrap items-center gap-1.5">
                     <span className="truncate text-[13.5px] font-medium text-fg">{r.name}</span>
                     {r.kind === "agent" && <Badge tone="accent">智能体</Badge>}
                     <Badge tone="neutral">v{r.version}</Badge>
+                    {canUpdate && r.latestVersion && (
+                      <Badge tone="accent">
+                        <ArrowUpCircle size={11} /> 新版本 v{r.latestVersion}
+                      </Badge>
+                    )}
                     {revoked && <Badge tone="warning">已被下架</Badge>}
                   </div>
                   <p className="mt-0.5 truncate text-[12px] text-muted">
@@ -99,6 +132,17 @@ export function InstalledPanel({ auth, onGoBrowse }: { auth: AuthSession; onGoBr
                       : r.slug}
                   </p>
                 </div>
+                {canUpdate && (
+                  <Button
+                    variant="primary"
+                    size="sm"
+                    onClick={() => update(r)}
+                    disabled={busy === r.slug}
+                  >
+                    {busy === r.slug ? <Loader2 size={14} className="animate-spin" /> : <ArrowUpCircle size={14} />}
+                    更新
+                  </Button>
+                )}
                 <Button
                   variant="ghost"
                   size="sm"

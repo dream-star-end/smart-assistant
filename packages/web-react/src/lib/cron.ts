@@ -144,6 +144,27 @@ export function buildSchedule(mode: ScheduleMode, v: ScheduleInput = {}): BuiltS
   return { schedule, oneshot: v.oneshot !== false };
 }
 
+/**
+ * 尝试把 5 段 cron 还原成 每天/每周 预设（编辑表单预填）。只识别 buildSchedule
+ * 会产出的简单形态（分/时为整数、日/月为 *、周为空或单数字）；其余（step/range/
+ * 逗号列表等）返回 null，编辑表单回退到高级 cron 模式，不臆测语义。
+ */
+export function scheduleToPreset(
+  schedule?: string,
+): { mode: "daily" | "weekly"; time: string; weekday: number } | null {
+  const p = (schedule || "").trim().split(/\s+/);
+  if (p.length !== 5) return null;
+  const [min, hr, dom, mon, dow] = p;
+  if (!isPlainInt(min) || !isPlainInt(hr) || dom !== "*" || mon !== "*") return null;
+  const m = Number(min);
+  const h = Number(hr);
+  if (m > 59 || h > 23) return null;
+  const time = `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}`;
+  if (dow === "*") return { mode: "daily", time, weekday: 1 };
+  if (isPlainInt(dow) && Number(dow) <= 6) return { mode: "weekly", time, weekday: Number(dow) };
+  return null;
+}
+
 export const SCHEDULE_MODE_LABELS: { value: ScheduleMode; label: string }[] = [
   { value: "daily", label: "每天" },
   { value: "weekly", label: "每周" },

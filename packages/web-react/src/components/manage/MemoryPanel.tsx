@@ -2,8 +2,7 @@ import { Check, Loader2, Plus, Trash2 } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api } from "../../lib/api";
 import type { AuthSession } from "../../lib/types";
-import { Alert, Button } from "../ui";
-import { PanelHeader } from "./parts";
+import { Alert, Button, PanelHeader } from "../ui";
 
 // 记忆按 "\n§\n" 分隔成多条目（与 storage/memoryStore.ts 的 ENTRY_DELIMITER 一致）。
 const DELIM = "\n§\n";
@@ -29,15 +28,50 @@ function joinEntries(texts: string[]): string {
 /**
  * 记忆中心：核心记忆（memory）+ 用户画像（user）。每个文档是 "\n§\n" 分隔的多条目，
  * 这里逐条卡片化编辑（增/删/改），保存时重新拼接为整段经容器代理写回
- * （GET/PUT /api/agents/:id/memory/:target）。按当前对话 agent 维度。
+ * （GET/PUT /api/agents/:id/memory/:target）。记忆按 agent 维度 —— 面板顶部
+ * 明示并可切换在看哪个智能体的记忆（默认当前对话 agent），杜绝「静默绑定」。
  */
-export function MemoryPanel({ auth, agentId }: { auth: AuthSession; agentId: string }) {
+export function MemoryPanel({
+  auth,
+  agentId,
+  agents,
+}: {
+  auth: AuthSession;
+  /** 初始选中（当前对话 agent）。 */
+  agentId: string;
+  agents: { id: string; name: string }[];
+}) {
+  const [selected, setSelected] = useState(agentId);
+  // 选中项必须在可选列表内（agent 刚被卸载时回落到列表首项/传入项）。
+  const effective = agents.some((a) => a.id === selected) ? selected : agentId;
+  const showPicker = agents.length > 1;
   return (
     <div className="flex flex-col">
-      <PanelHeader title="记忆" hint="这些内容会注入智能体的长期上下文，让它越用越懂你。" />
+      <PanelHeader
+        title="记忆"
+        hint="这些内容会注入智能体的长期上下文，让它越用越懂你。记忆按智能体独立保存。"
+        action={
+          showPicker ? (
+            <label className="flex items-center gap-1.5 text-[12px] text-faint">
+              智能体
+              <select
+                value={effective}
+                onChange={(e) => setSelected(e.target.value)}
+                className="rounded-lg border border-border bg-surface px-2 py-1.5 text-[12.5px] text-fg outline-none transition-colors focus:border-accent focus:ring-2 focus:ring-ring"
+              >
+                {agents.map((a) => (
+                  <option key={a.id} value={a.id}>
+                    {a.name}
+                  </option>
+                ))}
+              </select>
+            </label>
+          ) : undefined
+        }
+      />
       {DOCS.map((d) => (
         <div key={d.key} className="border-t border-border">
-          <MemoryDoc auth={auth} agentId={agentId} target={d.key} meta={d} />
+          <MemoryDoc key={`${effective}:${d.key}`} auth={auth} agentId={effective} target={d.key} meta={d} />
         </div>
       ))}
     </div>

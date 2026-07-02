@@ -313,6 +313,8 @@ export interface ApprovedSearchRow {
   description: string
   tags: string[]
   embeddingHash: string
+  /** 当前活跃安装数(卸载不计;每用户同 slug 至多一条活跃安装,即≈使用人数)。 */
+  installCount: number
 }
 
 /** Current approved version of every active listing — the searchable catalog.
@@ -332,10 +334,16 @@ export async function listApprovedForSearch(kind?: ArtifactKind): Promise<Approv
     description: string
     tags: unknown
     embedding_hash: string
+    install_count: string | null
   }>(
-    `SELECT v.id::text, v.slug, l.kind, v.name, v.description, v.tags, v.embedding_hash
+    // install_count 走一次性聚合 JOIN(而非逐行 correlated 子查询):目录上限 500 行,
+    // 逐行子查询会对共享的 v3 search 端点放大 500 次 installs 扫描。
+    `SELECT v.id::text, v.slug, l.kind, v.name, v.description, v.tags, v.embedding_hash,
+            ic.n::text AS install_count
        FROM marketplace_skill_listings l
        JOIN marketplace_skill_versions v ON v.id = l.current_approved_version_id
+       LEFT JOIN (SELECT slug, count(*) AS n FROM marketplace_installs
+                   WHERE uninstalled_at IS NULL GROUP BY slug) ic ON ic.slug = l.slug
       WHERE l.state = 'active' AND v.status = 'approved'
             AND ($1::text IS NULL OR l.kind = $1)
       ORDER BY v.id DESC
@@ -357,6 +365,7 @@ export async function listApprovedForSearch(kind?: ArtifactKind): Promise<Approv
     description: x.description,
     tags: (x.tags as string[]) ?? [],
     embeddingHash: x.embedding_hash,
+    installCount: Number.parseInt(x.install_count ?? '0', 10) || 0,
   }))
 }
 
@@ -507,6 +516,9 @@ export interface InstalledRow {
   artifactHash: string
   installedAt: string
   listingState: string
+  /** listing 当前上架版本(升级可见性;listing 无 approved 版本时为 null)。 */
+  latestVersion: string | null
+  latestVersionId: string | null
 }
 
 export async function listInstalled(userId: number): Promise<InstalledRow[]> {
@@ -519,12 +531,18 @@ export async function listInstalled(userId: number): Promise<InstalledRow[]> {
     artifact_hash: string
     installed_at: string
     state: string
+    latest_version: string | null
+    latest_version_id: string | null
   }>(
+    // cv = listing 当前上架版本(升级可见性:安装 pin 旧 versionId,新版获批后
+    // latest_version_id ≠ version_id 即「可更新」)。LEFT JOIN:revoked/无 approved 时为 null。
     `SELECT i.slug, l.kind, v.version, i.version_id::text, v.name, i.artifact_hash,
-            i.installed_at::text, l.state
+            i.installed_at::text, l.state,
+            cv.version AS latest_version, cv.id::text AS latest_version_id
        FROM marketplace_installs i
        JOIN marketplace_skill_versions v ON v.id = i.version_id
        JOIN marketplace_skill_listings l ON l.slug = i.slug
+       LEFT JOIN marketplace_skill_versions cv ON cv.id = l.current_approved_version_id
       WHERE i.user_id = $1 AND i.uninstalled_at IS NULL
       ORDER BY i.installed_at DESC`,
     [userId],
@@ -542,7 +560,74 @@ export async function listInstalled(userId: number): Promise<InstalledRow[]> {
       artifactHash: x.artifact_hash,
       installedAt: x.installed_at,
       listingState: x.state,
+      latestVersion: x.latest_version,
+      latestVersionId: x.latest_version_id,
     }))
+}
+
+export interface MyPublishRow {
+  versionId: string
+  slug: string
+  kind: ArtifactKind
+  version: string
+  name: string
+  /** pending | approved | rejected */
+  status: string
+  /** 审核备注(拒绝理由等;管理员输入,前端须按纯文本渲染)。 */
+  reviewNote: string | null
+  createdAt: string
+  reviewedAt: string | null
+  /** 该版本是否 listing 当前上架版本。 */
+  isCurrent: boolean
+  /** listing 状态(active/revoked) —— 已通过但被下架时给发布者可见。 */
+  listingState: string
+}
+
+/** 我的发布记录上限:只展示最近 N 条(超出的老提交对状态闭环无增量价值)。 */
+const MY_PUBLISHES_LIMIT = 50
+
+/**
+ * 发布者视角的自有提交列表(发布闭环:提交→pending→approved/rejected+理由 全程可见)。
+ * 身份口径与发布写入一致(submitted_by = uid)。不含正文 —— 状态可见性接口,
+ * 防 50 × SKILL.md 的 payload 膨胀;重发编辑时正文从「我的技能」再导入。
+ */
+export async function listMyPublishes(userId: number): Promise<MyPublishRow[]> {
+  const r = await query<{
+    id: string
+    slug: string
+    kind: string
+    version: string
+    name: string
+    status: string
+    review_note: string | null
+    created_at: string
+    reviewed_at: string | null
+    is_current: boolean | null
+    state: string
+  }>(
+    `SELECT v.id::text, v.slug, l.kind, v.version, v.name, v.status,
+            v.review_note, v.created_at::text, v.reviewed_at::text,
+            (l.current_approved_version_id = v.id) AS is_current, l.state
+       FROM marketplace_skill_versions v
+       JOIN marketplace_skill_listings l ON l.slug = v.slug
+      WHERE v.submitted_by = $1
+      ORDER BY v.id DESC
+      LIMIT ${MY_PUBLISHES_LIMIT}`,
+    [userId],
+  )
+  return r.rows.map((x) => ({
+    versionId: x.id,
+    slug: x.slug,
+    kind: x.kind as ArtifactKind,
+    version: x.version,
+    name: x.name,
+    status: x.status,
+    reviewNote: x.review_note,
+    createdAt: x.created_at,
+    reviewedAt: x.reviewed_at,
+    isCurrent: x.is_current === true,
+    listingState: x.state,
+  }))
 }
 
 export interface InstalledArtifact {

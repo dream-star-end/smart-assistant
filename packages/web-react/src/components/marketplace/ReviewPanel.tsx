@@ -1,11 +1,14 @@
-import { Check, ChevronRight, Loader2, ShieldX, X } from "lucide-react";
+import { Check, ChevronRight, Inbox, Loader2, ShieldX, X } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
 import { api } from "../../lib/api";
-import type { AuthSession, MarketplacePending } from "../../lib/types";
-import { Alert, Badge, Button, Input, Spinner, useConfirm } from "../ui";
+import type { AuthSession, MarketplaceCard, MarketplacePending } from "../../lib/types";
+import { Alert, Badge, Button, EmptyState, Input, Spinner, useConfirm, usePrompt } from "../ui";
 import { friendlyRiskFlags } from "./riskFlags";
 
-/** 管理员审核：待审队列(批准/拒绝)+ 下架(kill-switch)。后端 requireAdminVerifyDb 二次把关。 */
+/**
+ * 管理员审核：待审队列(批准 / 拒绝须附理由——理由回显给发布者的「我的发布」)
+ * + 下架(kill-switch)。后端 requireAdminVerifyDb 二次把关。
+ */
 export function ReviewPanel({ auth }: { auth: AuthSession }) {
   const [rows, setRows] = useState<MarketplacePending[] | null>(null);
   const [loading, setLoading] = useState(true);
@@ -13,7 +16,7 @@ export function ReviewPanel({ auth }: { auth: AuthSession }) {
   const [busy, setBusy] = useState<string | null>(null);
   const [reload, setReload] = useState(0);
   const [open, setOpen] = useState<string | null>(null);
-  const [confirmDialog, confirmDialogEl] = useConfirm();
+  const [promptText, promptTextEl] = usePrompt();
 
   useEffect(() => {
     let alive = true;
@@ -31,15 +34,23 @@ export function ReviewPanel({ auth }: { auth: AuthSession }) {
 
   const review = useCallback(
     async (versionId: string, decision: "approve" | "reject") => {
-      if (
-        decision === "reject" &&
-        !(await confirmDialog({ title: "拒绝该版本?", confirmText: "拒绝", danger: true }))
-      )
-        return;
+      let note: string | undefined;
+      if (decision === "reject") {
+        // 拒绝必须给理由:回显到发布者「我的发布」,否则拒绝对发布者是黑盒。
+        const reason = await promptText({
+          title: "拒绝理由",
+          body: "理由会展示给发布者，请写明需要修正什么。",
+          placeholder: "例：正文包含内网地址，请移除后重新提交",
+          confirmText: "拒绝",
+          maxLength: 500,
+        });
+        if (reason === null) return;
+        note = reason;
+      }
       setBusy(versionId);
       setErr(null);
       try {
-        await api.adminMarketplaceReview(auth, versionId, decision);
+        await api.adminMarketplaceReview(auth, versionId, decision, note);
         setReload((n) => n + 1);
       } catch (e) {
         setErr((e as Error).message || "审核失败");
@@ -47,12 +58,12 @@ export function ReviewPanel({ auth }: { auth: AuthSession }) {
         setBusy(null);
       }
     },
-    [auth, confirmDialog],
+    [auth, promptText],
   );
 
   return (
     <div className="flex flex-col">
-      {confirmDialogEl}
+      {promptTextEl}
       {err && (
         <div className="px-4 pt-3">
           <Alert tone="danger">{err}</Alert>
@@ -64,7 +75,7 @@ export function ReviewPanel({ auth }: { auth: AuthSession }) {
           <Spinner /> 加载待审…
         </div>
       ) : !rows || rows.length === 0 ? (
-        <p className="px-5 py-10 text-center text-[13px] text-faint">暂无待审版本。</p>
+        <EmptyState icon={Inbox} title="暂无待审版本" hint="用户提交发布后会出现在这里。" />
       ) : (
         <ul className="flex flex-col gap-2 px-4 py-4">
           {rows.map((r) => {
@@ -130,6 +141,11 @@ export function ReviewPanel({ auth }: { auth: AuthSession }) {
                           <Alert key={f.label} tone={f.tone}>
                             <span className="font-medium">{f.label}：</span>
                             {f.message}
+                            {f.sample && (
+                              <code className="mt-1 block break-all rounded bg-code px-1.5 py-0.5 text-[11px]">
+                                {f.sample}
+                              </code>
+                            )}
                           </Alert>
                         ))}
                       </div>
@@ -150,19 +166,39 @@ export function ReviewPanel({ auth }: { auth: AuthSession }) {
   );
 }
 
-/** 下架(kill-switch)：撤销一个已上架条目,下次容器同步自动从所有用户移除。 */
+/**
+ * 下架(kill-switch)：撤销一个已上架条目,下次容器同步自动从所有用户移除。
+ * slug 输入带已上架目录 datalist 提示(技能+智能体),确认框回显条目名防误下架。
+ */
 function RevokeBox({ auth }: { auth: AuthSession }) {
   const [slug, setSlug] = useState("");
   const [reason, setReason] = useState("");
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState<{ tone: "success" | "danger"; text: string } | null>(null);
+  const [catalog, setCatalog] = useState<MarketplaceCard[]>([]);
   const [confirmDialog, confirmDialogEl] = useConfirm();
 
+  // 拉一次已上架目录做 datalist(两类各拉一页;搜索目录本身有 500 上限,极端时仍可手输)。
+  useEffect(() => {
+    let alive = true;
+    Promise.all([
+      api.searchMarketplace(auth, "", "skill", 50).catch(() => ({ results: [] as MarketplaceCard[] })),
+      api.searchMarketplace(auth, "", "agent", 50).catch(() => ({ results: [] as MarketplaceCard[] })),
+    ]).then(([s, a]) => {
+      if (alive) setCatalog([...s.results, ...a.results]);
+    });
+    return () => {
+      alive = false;
+    };
+  }, [auth]);
+
   const revoke = async () => {
-    if (!slug.trim()) return;
+    const target = slug.trim();
+    if (!target) return;
+    const known = catalog.find((c) => c.slug === target);
     const ok = await confirmDialog({
-      title: `下架「${slug}」?`,
-      body: "所有已安装用户将在下次会话被移除该技能。",
+      title: `下架「${known ? `${known.name}（${target}）` : target}」?`,
+      body: "所有已安装用户将在下次会话被移除该条目。",
       confirmText: "下架",
       danger: true,
     });
@@ -170,7 +206,7 @@ function RevokeBox({ auth }: { auth: AuthSession }) {
     setBusy(true);
     setMsg(null);
     try {
-      const r = await api.adminMarketplaceRevoke(auth, slug.trim(), reason.trim() || undefined);
+      const r = await api.adminMarketplaceRevoke(auth, target, reason.trim() || undefined);
       setMsg({ tone: "success", text: `已下架，影响 ${r.affectedInstalls} 个已安装用户。` });
       setSlug("");
       setReason("");
@@ -193,7 +229,19 @@ function RevokeBox({ auth }: { auth: AuthSession }) {
         </div>
       )}
       <div className="flex flex-col gap-2 sm:flex-row">
-        <Input value={slug} onChange={(e) => setSlug(e.target.value)} placeholder="slug" />
+        <Input
+          value={slug}
+          onChange={(e) => setSlug(e.target.value)}
+          placeholder="slug"
+          list="revoke-slug-options"
+        />
+        <datalist id="revoke-slug-options">
+          {catalog.map((c) => (
+            <option key={c.slug} value={c.slug}>
+              {c.name}（{c.kind === "agent" ? "智能体" : "技能"}）
+            </option>
+          ))}
+        </datalist>
         <Input
           value={reason}
           onChange={(e) => setReason(e.target.value)}

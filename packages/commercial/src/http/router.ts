@@ -37,6 +37,7 @@ import {
   handleMarketplaceInstall,
   handleMarketplaceInstalled,
   handleMarketplaceMyAgents,
+  handleMarketplaceMyPublishes,
   handleMarketplacePublish,
   handleMarketplaceUninstall,
 } from '../marketplace/marketplaceRoutes.js'
@@ -612,6 +613,11 @@ export function createCommercialHandler(
       method: 'GET',
       path: '/api/marketplace/installed',
       handler: (req, res) => handleMarketplaceInstalled(req, res, deps),
+    },
+    {
+      method: 'GET',
+      path: '/api/marketplace/my-publishes',
+      handler: (req, res) => handleMarketplaceMyPublishes(req, res, deps),
     },
     {
       method: 'DELETE',

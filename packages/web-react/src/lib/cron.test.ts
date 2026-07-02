@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildSchedule, cronHuman } from "./cron";
+import { buildSchedule, cronHuman, scheduleToPreset } from "./cron";
 
 describe("cronHuman", () => {
   it("每天定点", () => expect(cronHuman("0 9 * * *")).toBe("每天 09:00"));
@@ -52,4 +52,20 @@ describe("buildSchedule", () => {
   it("weekly 非法星期报错", () =>
     expect(() => buildSchedule("weekly", { time: "09:00", weekday: 9 })).toThrow(/星期/));
   it("after 缺分钟报错", () => expect(() => buildSchedule("after", {})).toThrow(/分钟/));
+});
+
+describe("scheduleToPreset", () => {
+  it("recovers daily/weekly presets produced by buildSchedule", () => {
+    expect(scheduleToPreset("30 9 * * *")).toEqual({ mode: "daily", time: "09:30", weekday: 1 });
+    expect(scheduleToPreset("0 18 * * 5")).toEqual({ mode: "weekly", time: "18:00", weekday: 5 });
+  });
+
+  it("refuses complex/out-of-range forms (edit form falls back to advanced)", () => {
+    expect(scheduleToPreset("*/5 * * * *")).toBeNull();
+    expect(scheduleToPreset("0 9 1 * *")).toBeNull(); // 月内固定日
+    expect(scheduleToPreset("0 9 * * 1,3")).toBeNull(); // 多星期
+    expect(scheduleToPreset("99 9 * * *")).toBeNull();
+    expect(scheduleToPreset("")).toBeNull();
+    expect(scheduleToPreset(undefined)).toBeNull();
+  });
 });

@@ -56,13 +56,13 @@ export function MarketplaceCenter({
         <Dialog.Overlay className="fixed inset-0 z-50 bg-black/40 backdrop-blur-sm data-[state=open]:animate-fade" />
         <Dialog.Content
           aria-describedby={undefined}
-          className="fixed left-1/2 top-1/2 z-50 flex max-h-[85vh] w-[calc(100vw-2rem)] max-w-3xl -translate-x-1/2 -translate-y-1/2 flex-col overflow-hidden rounded-xl border border-border bg-surface shadow-float focus:outline-none data-[state=open]:animate-in"
+          className="fixed left-1/2 top-1/2 z-50 flex h-[min(85vh,46rem)] w-[calc(100vw-2rem)] max-w-3xl -translate-x-1/2 -translate-y-1/2 flex-col overflow-hidden rounded-xl border border-border bg-surface shadow-float focus:outline-none data-[state=open]:animate-in"
         >
           <div className="flex items-center justify-between px-5 py-4">
             <div>
               <Dialog.Title className="text-[15px] font-semibold text-fg">AI 市场</Dialog.Title>
               <p className="mt-0.5 text-[12px] text-faint">
-                发现并安装技能，或把自己的技能分享给大家。
+                发现并安装技能与智能体，也可以把自己的作品分享给大家。
               </p>
             </div>
             <Dialog.Close asChild>

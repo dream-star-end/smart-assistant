@@ -21,6 +21,7 @@ import {
   marketplaceAgentsEnabled,
   listActiveInstalledAgents,
   listInstalled,
+  listMyPublishes,
   listPendingVersions,
   publishSkillVersion,
   recordUninstall,
@@ -393,6 +394,19 @@ export async function handleMarketplaceInstalled(
 ): Promise<void> {
   const user = await requireAuth(req, deps.jwtSecret)
   sendJson(res, 200, { installed: await listInstalled(uid(user)) })
+}
+
+// ── GET /api/marketplace/my-publishes ──────────────────────────────────────
+// 发布者自己的提交记录(pending/approved/rejected + 审核理由),闭合「发布→审核结果」
+// 反馈环。exact path,必须先于 /api/marketplace/ 的 detail prefix 匹配(matchRoute
+// exact-first;且 'my-publishes' 本身匹配 SLUG_RE,靠 prefix 会被当 slug 吞掉)。
+export async function handleMarketplaceMyPublishes(
+  req: IncomingMessage,
+  res: ServerResponse,
+  deps: { jwtSecret: string | Uint8Array },
+): Promise<void> {
+  const user = await requireAuth(req, deps.jwtSecret)
+  sendJson(res, 200, { publishes: await listMyPublishes(uid(user)) })
 }
 
 // ── GET /api/marketplace/:slug ─────────────────────────────────────────────

@@ -1,13 +1,15 @@
-import { PackageSearch, Search, ShieldCheck, Sparkles } from "lucide-react";
+import { ArrowUpCircle, PackageSearch, Search, ShieldCheck, Sparkles, Users } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api } from "../../lib/api";
-import type { AuthSession, MarketplaceCard } from "../../lib/types";
-import { Alert, Badge, Input, Spinner } from "../ui";
+import { formatInstallCount, sortByPopularity, updateAvailable } from "../../lib/marketplace";
+import type { AuthSession, MarketplaceCard, MarketplaceInstalled } from "../../lib/types";
+import { Alert, Badge, EmptyState, Input, Skeleton } from "../ui";
 import { DetailModal } from "./DetailModal";
 
 /**
- * 发现：搜索 + 目录卡片网格。空查询返回全部目录(后端 method=all)。
- * 已安装的条目打「已安装」徽标。点击卡片打开详情/安装确认。
+ * 发现：搜索 + 目录卡片网格。空查询返回全部目录(后端 method=all)，前端按热度
+ * （安装数）排序；有查询词时保持后端相关度排序。已安装/可更新的条目打徽标。
+ * 点击卡片打开详情/安装确认。
  */
 export function BrowsePanel({
   auth,
@@ -21,7 +23,7 @@ export function BrowsePanel({
   const [cards, setCards] = useState<MarketplaceCard[] | null>(null);
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState<string | null>(null);
-  const [installedSlugs, setInstalledSlugs] = useState<Set<string>>(new Set());
+  const [installed, setInstalled] = useState<Map<string, MarketplaceInstalled>>(new Map());
   const [active, setActive] = useState<string | null>(null);
   const [reloadInstalled, setReloadInstalled] = useState(0);
 
@@ -42,7 +44,11 @@ export function BrowsePanel({
     setErr(null);
     api
       .searchMarketplace(auth, debouncedQ, kind)
-      .then((r) => alive && setCards(r.results))
+      .then((r) => {
+        if (!alive) return;
+        // 目录态（空查询）按热度稳定排序；有查询词时尊重后端相关度。
+        setCards(debouncedQ ? r.results : sortByPopularity(r.results));
+      })
       .catch((e) => alive && setErr((e as Error).message || "加载市场失败"))
       .finally(() => alive && setLoading(false));
     return () => {
@@ -50,12 +56,12 @@ export function BrowsePanel({
     };
   }, [auth, debouncedQ, kind]);
 
-  // 拉一次「我的已安装」用于卡片徽标
+  // 拉一次「我的已安装」用于卡片徽标（含版本信息 → 可更新徽标）
   useEffect(() => {
     let alive = true;
     api
       .listMarketplaceInstalled(auth)
-      .then((rows) => alive && setInstalledSlugs(new Set(rows.map((r) => r.slug))))
+      .then((rows) => alive && setInstalled(new Map(rows.map((r) => [r.slug, r]))))
       .catch(() => {});
     return () => {
       alive = false;
@@ -94,22 +100,39 @@ export function BrowsePanel({
       )}
 
       {loading ? (
-        <div className="flex items-center justify-center gap-2 py-16 text-faint">
-          <Spinner /> 加载市场…
-        </div>
+        <ul className="grid grid-cols-1 gap-2.5 px-4 pb-5 sm:grid-cols-2" aria-hidden="true">
+          {Array.from({ length: 4 }, (_, i) => (
+            <li key={i} className="flex flex-col gap-2.5 rounded-xl border border-border bg-elevated p-3.5">
+              <div className="flex items-start gap-2.5">
+                <Skeleton className="size-8 shrink-0 rounded-lg" />
+                <div className="flex min-w-0 flex-1 flex-col gap-1.5">
+                  <Skeleton className="h-3.5 w-2/5" />
+                  <Skeleton className="h-3 w-4/5" />
+                </div>
+              </div>
+              <div className="flex gap-1.5">
+                <Skeleton className="h-4 w-12 rounded-full" />
+                <Skeleton className="h-4 w-16 rounded-full" />
+              </div>
+            </li>
+          ))}
+        </ul>
       ) : empty ? (
-        <div className="flex flex-col items-center gap-2 px-6 py-16 text-center text-faint">
-          <PackageSearch size={28} className="opacity-50" />
-          <p className="text-[13px]">
-            {debouncedQ
-              ? `没有匹配的${kind === "agent" ? "智能体" : "技能"}，换个关键词试试。`
-              : `市场还没有上架的${kind === "agent" ? "智能体" : "技能"}。`}
-          </p>
-        </div>
+        <EmptyState
+          icon={PackageSearch}
+          title={
+            debouncedQ
+              ? `没有匹配的${kind === "agent" ? "智能体" : "技能"}`
+              : `市场还没有上架的${kind === "agent" ? "智能体" : "技能"}`
+          }
+          hint={debouncedQ ? "换个关键词试试。" : undefined}
+        />
       ) : (
         <ul className="grid grid-cols-1 gap-2.5 px-4 pb-5 sm:grid-cols-2">
           {cards?.map((c) => {
-            const isInstalled = installedSlugs.has(c.slug);
+            const inst = installed.get(c.slug);
+            const canUpdate = inst ? updateAvailable(inst) : false;
+            const users = formatInstallCount(c.installCount);
             return (
               <li key={c.slug}>
                 <button
@@ -126,24 +149,30 @@ export function BrowsePanel({
                         <span className="truncate text-[13.5px] font-semibold text-fg">
                           {c.name}
                         </span>
-                        {isInstalled && (
-                          <ShieldCheck size={13} className="shrink-0 text-success" />
-                        )}
+                        {canUpdate ? (
+                          <ArrowUpCircle size={13} className="shrink-0 text-accent" aria-label="有新版本" />
+                        ) : inst ? (
+                          <ShieldCheck size={13} className="shrink-0 text-success" aria-label="已安装" />
+                        ) : null}
                       </div>
                       <p className="mt-0.5 line-clamp-2 text-[12px] leading-snug text-muted">
                         {c.description}
                       </p>
                     </div>
                   </div>
-                  {c.tags.length > 0 && (
-                    <div className="flex flex-wrap gap-1">
-                      {c.tags.slice(0, 4).map((t) => (
-                        <Badge key={t} tone="neutral">
-                          {t}
-                        </Badge>
-                      ))}
-                    </div>
-                  )}
+                  <div className="flex flex-wrap items-center gap-1">
+                    {canUpdate && <Badge tone="accent">可更新</Badge>}
+                    {c.tags.slice(0, 4).map((t) => (
+                      <Badge key={t} tone="neutral">
+                        {t}
+                      </Badge>
+                    ))}
+                    {users && (
+                      <span className="ml-auto inline-flex items-center gap-1 text-[11px] text-faint">
+                        <Users size={11} /> {users} 人在用
+                      </span>
+                    )}
+                  </div>
                 </button>
               </li>
             );
@@ -154,7 +183,7 @@ export function BrowsePanel({
       <DetailModal
         slug={active}
         auth={auth}
-        installed={active ? installedSlugs.has(active) : false}
+        installed={active ? installed.get(active) : undefined}
         onClose={() => setActive(null)}
         onInstalled={onInstalled}
       />
