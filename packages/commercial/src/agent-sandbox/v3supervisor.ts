@@ -1947,8 +1947,12 @@ export async function provisionV3Container(
               // 自动回滚到 NULL,但 host 文件(本地或远端)留在 per-container 子目录
               // 是孤儿 —— 由 stopAndRemoveV3Container / volume gc / 重 provision
               // 的同名 row.id 覆盖兜底(本 PR 接受这层不一致)。
+              // 0098 channel 划分(Codex 复审 nit):操作对象是同事务刚 INSERT 的
+              // v3 row,实际无跨 channel 风险;predicate 为对称防御 —— codex 绑定
+              // 写路径与 actor/lazyMigrate/relay 同口径,防未来重构漂移。
               await client.query(
-                `UPDATE agent_containers SET codex_account_id = $1, updated_at = NOW() WHERE id = $2`,
+                `UPDATE agent_containers SET codex_account_id = $1, updated_at = NOW()
+                 WHERE id = $2 AND runtime_channel = 'v3'`,
                 [String(picked.account_id), String(row.id)],
               );
               boundCodexAccountId = picked.account_id;
