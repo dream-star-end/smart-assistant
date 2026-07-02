@@ -248,3 +248,96 @@ M0 先落 helper + 测试;接线在 M2 计费。
 **M1b 未做 / 留给 M2**:bridge codex 计费状态机与 codexBinding 三件套接线;
 userChatBridgeCodexBilling.test(1167 行)改造复用;runtime image 以
 OC_INCLUDE_CODEX=1 重建(M3);/api/public/models gpt-5.5 可见性确认。
+
+---
+
+## M2 落地记录(2026-07-02,codex 真扣费 bridge 闭环 / 双钱包)
+
+**范围**:packages/{protocol,gateway,commercial} + 本文档。四条钱安全红线
+(方案 §D)全部落地,落点见下。
+
+1. **protocol**:`OutboundCodexBilling` 扩 `engineSessionId` 字段
+   (`Type.Optional(Type.String({ pattern: '^oceng-[0-9a-f]{48}$' }))`,
+   frames.ts)。Optional 仅为渐进部署(旧容器镜像不带);master 侧对缺失/非法
+   fail-closed(见 3)。
+
+2. **gateway**:
+   - server.ts codex_billing 分支:`engineSessionId: e.engineSessionId` 进 wire 帧
+     (M1a 遗留项收口)。
+   - sessionManager:`_reportTurnWaive` 记账键按 **billingMode 能力分支**收口到新
+     exported helper `waiveAccountingSessionId`:'engine-reported'(codex)→
+     `engineSessionId(sessionKey)`(恒可派生,不依赖 native id);'proxy'(CCB)→
+     原生 ccb session id(未学到跳过,行为不变)。M1a 偏离项4(codex 上报 thread
+     id 的错口径)就此消除 —— settle 与 waive 由构造保证同 helper 同入参。
+
+3. **commercial bridge(核心,ws/userChatBridge.ts)**:以 `0bed2f76^`(计费分支)
+   + `eb1ab67b^`(脚手架)为底本手工合流进现 HEAD(与 turnActiveUntil 心跳宽限 /
+   resume 裁决权归容器 / relay_ready 等 P1f 后改动共存):
+   - inbound:AGENT_AUTHZ_IMPLIED_MODEL 回登 codex→gpt-5.5;`__oc_codex_route`
+     client 输入剥离;codex IIFE(route 决策 → codexBinding.acquire 严格单飞/
+     legacy 透传/stale recycle → preCheckWithCost → startInflightJournal →
+     inflight snapshot 注册 → frame rewrite 注入 server-owned requestId+traceId
+     → forward)。
+   - **M2 结构改动:finalizer 延迟到 billing 帧构造**(CodexTurnSnapshot.getFinalizer/
+     abandon,单一 snapState 状态机)。原因:usage_records.session_id 的权威值 =
+     帧上的 engineSessionId(gateway 唯一 helper 产物);inbound 期 bridge 不可靠知道
+     gateway 侧 sessionKey(agent 路由可改写 sessionKey),自行派生会破坏
+     settle=waive 同值不变量。abandon = abort journal + release reservation(等价
+     finalizer.fail;finalizer 已构造则委托 _done 守门)。
+   - outbound:`outbound.codex_billing` 拦截在 **userWs.readyState 检查之前**
+     (drain 期用户已断也落账);engineSessionId 缺失/形状非法 → **fail-closed
+     免单**(abandon + error 告警,宁可少收不可乱扣 —— 口径错的 session_id 入库
+     会让退款窗口圈不到,变成"该退不退");settle 走 M1b codexFinalizer
+     (settleUsageAndLedger→spendTwoBucket 双钱包 / 零输出免单 / account_id NULL);
+     duplicate 帧防重 = Map 同步 delete + finalizer._done;cost_charged
+     balanceAfter = 双钱包总可用;G6 outbound 终态早释放回贴。
+   - cleanup:drain 状态机回贴(user_close+inflight → drain 窗口;DRAIN_BILLING_MS
+     改 env 可覆盖、读时求值,默认 5s —— 旧版模块常量测试只能真等 5s);
+     checkDrainComplete;finalCleanup fail-abort(残留 inflight abandon)+ 槽/route
+     兜底释放。heartbeat 超时同走 drain(client_close 语义)。
+   - `accountIdForLedger` 更名 `accountIdForQuota`:M2 起该值只服务 rateLimits 落
+     claude_accounts.quota_*(usage_records.account_id 恒 NULL)。
+
+4. **commercial index.ts**:复活 `createCommercialCodexRoute`(api_relay/
+   official_oauth/unavailable 判别联合)+ `codexBinding` handle(FOR UPDATE +
+   stale recycle + lazy migrate,P1f^ 原样;**一处刻意偏离**:legacy NULL 分支的
+   池非空探测 SQL 补 `runtime_channel` 过滤 —— 0098 后 picker 是 channel-scoped,
+   不同口径会让 v5 看见 v3 行误判"池非空"→ recycle 死循环)+ bridge 三件套
+   deps 注入(codexBinding/createCodexRoute/expireCodexRoute)。
+
+5. **四条钱安全红线落点**:
+   1. 零输出免单:billing/codexFinalizer.ts(M1b 已备)+ bridge settle 直连生效;
+      e2e case = userChatBridgeCodexBilling"零输出免单"套;
+   2. settle=waive 同一 engineSessionId:gateway engineSessionId helper(唯一权威)
+      → CodexAdapter billing 事件 → wire 帧 → bridge settle 落库;waive 侧
+      sessionManager.waiveAccountingSessionId 同 helper 同入参;
+      refund.refundSessionWindow 按 usage_records.session_id 圈账即可命中;
+   3. account_id NULL:codexFinalizer settle 恒传 null;bridge 不再有 0n 假账号
+      进 usage_records(仅 quota 路径保留 0n=无关联语义);
+   4. balanceAfter 双桶:spendTwoBucket.totalAfter 经 SettleResult → finalizer →
+      cost_charged 广播。
+
+6. **测试**:protocol frames.test +3(engineSessionId 形状);gateway 新增
+   sessionManagerTurnWaive.test(3:能力分支纯函数 + waive POST e2e,e2e 等真实
+   5s SEND_DELAY);test:gateway 1179/1179(M1a 基线 1176+3);
+   userChatBridgeCodexBilling.test 复活(20 case 全绿:happy path 双钱包断言/
+   duplicate/safeNum/零输出免单/balanceAfter 双桶跨桶两条 ledger/engineSessionId
+   缺失+非法 fail-closed/drain 落账(readyState 前拦截)/drain timeout fail-abort/
+   legacy NULL 逐轮计费(account_id NULL)/relay 四态/stale recycle/CG2c trace×2/
+   partial deps + codexBinding-无三件套 boot fail-closed)。fake pgPool 兜
+   spendTwoBucket 序列(users FOR UPDATE / user_subscriptions FOR UPDATE /
+   period UPDATE / 每桶一条 ledger / getSpendableBalance 双桶查询)。
+   test:commercial:unit 失败集与 HEAD(a08a7ab6)基线逐名一致零新增。
+
+7. **⚠️ 部署红线(92ddbbdc 拓扑判定)**:
+   - M2 改动均落 **master 进程**(userChatBridge / index 装配 / codexFinalizer
+     调用侧)与 **容器 gateway**(server.ts/sessionManager,需 M3 runtime image
+     重建才进容器);egress 进程职责(/v1/messages anthropicProxy、codex-relay、
+     token-refresh)本批**零改动** → M2 单独部署不强制 `--egress`。
+   - 但 codex 全链上线 = M1b(relay/refresh/assembly 归 egress)+ M2 一起发,
+     **合并部署必须 `deploy-v5.sh --egress`**(否则 egress 跑旧代码没有
+     codex-relay 本地挂载);protocol 包为共享依赖,--egress 顺带消除两进程
+     版本漂移。结论:**M2/M3 上线批次按 --egress 执行**。
+
+**M2 未做 / 留给 M3+**:runtime image OC_INCLUDE_CODEX=1 重建 + canary;
+/api/public/models gpt-5.5 可见性确认;e2e 卡片矩阵 + Codex 审计(M4)。

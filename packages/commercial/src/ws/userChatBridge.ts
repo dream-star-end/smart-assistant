@@ -34,7 +34,7 @@
 
 import type { IncomingMessage } from "node:http";
 import type { Duplex } from "node:stream";
-import { randomUUID } from "node:crypto";
+import { randomUUID, randomBytes } from "node:crypto";
 import { WebSocketServer, WebSocket, type RawData } from "ws";
 import type { Pool } from "pg";
 
@@ -43,12 +43,30 @@ import { ConnectionRegistry, type Conn } from "./connections.js";
 import type { Logger } from "../logging/logger.js";
 import { isInMaintenance } from "../middleware/maintenanceMode.js";
 import type { NodeAgentTarget } from "../compute-pool/nodeAgentClient.js";
-// (v5 ccb-only:codex 真扣费三件套 helper imports — preCheckWithCost / releasePreCheck /
-//  estimateMaxCost / InsufficientCreditsError / getAgentCostMultiplier / composeMultiplier /
-//  startInflightJournal / abortInflightJournal / ModelPricing / TokenUsage — 已随 codex
-//  billing 分支一并移除。PreCheckRedis / PricingCache 仍作 deps 类型保留。)
-import type { PreCheckRedis } from "../billing/preCheck.js";
-import type { PricingCache } from "../billing/pricing.js";
+import {
+  type PreCheckRedis,
+  type ReservationHandle,
+  preCheckWithCost,
+  releasePreCheck,
+  estimateMaxCost,
+  InsufficientCreditsError,
+} from "../billing/preCheck.js";
+import type { PricingCache, ModelPricing } from "../billing/pricing.js";
+import {
+  getAgentCostMultiplier,
+  composeMultiplier,
+} from "../billing/agentMultiplier.js";
+import {
+  startInflightJournal,
+  abortInflightJournal,
+} from "../billing/proxyBilling.js";
+import {
+  ENGINE_SESSION_ID_RE,
+  makeCodexFinalizer,
+  type CodexFinalizeHandle,
+} from "../billing/codexFinalizer.js";
+import type { TokenUsage } from "../billing/calculator.js";
+import { maybeUpdateAccountQuotaCodex } from "../account-pool/quota.js";
 import { OutboundRingBuffer, DEFAULT_RING_CONFIG } from "@openclaude/gateway";
 import {
   newTraceId,
@@ -351,16 +369,68 @@ export interface UserChatBridgeDeps {
     sessionId: string,
   ) => Promise<unknown[] | null>;
   /**
-   * billing 依赖(必须同时注入或同时缺省;boot-time fail-closed 防 partial 配错)。
+   * plan v3 G5/G7 — codex per-account 并发槽 + 严格单飞 acquire/release。
    *
-   * - pgPool:repo bind 富化 / status 落库等标准路径用(非 codex)。
-   * - preCheckRedis / pricing / appendCostCredits:历史 codex 真扣费 settle 依赖;
-   *   v5 ccb-only 下 codex 帧计费分支已删,这三个目前为保留的 optional 依赖
-   *   (标准 cost_charged 走 broadcastToUser,与此处无关)。
+   * 调用契约:
+   *   - bridge 在 inbound.message 帧 + effectiveModel 是 codex 类(`gpt-*` 或
+   *     agentImpliedModel='gpt-5.5')时调 `acquire(containerId)`
+   *   - acquire 返回:
+   *     - `null` → 容器是 legacy NULL(`codex_account_id IS NULL`),走 legacy
+   *       `config.auth.codexOAuth` 共享 dir 路径,**不占** per-account 槽(决策 N3)
+   *     - `{account_id}` → 已 inc inflight + 通过 lazy migrate(若需要)+ 写
+   *       per-container auth.json 并 UPDATE codex_account_id;调用方记下此 id 用于
+   *       后续 release
+   *   - acquire 抛 `AccountPoolBusyError` → bridge fast-fail(决策 O):error 帧
+   *     "codex pool busy",**不 fallback 到 legacy**
+   *   - acquire 抛其他 → bridge fast-fail "GPT temporarily unavailable"
+   *   - `release(account_id, slotId)` 必须用 acquire 时记录的 (account_id, slotId)(决策 N2
+   *     MAJOR 3:不重读 row,防 lazy migrate 漂移;slotId 精确还槽,不误伤同账号其它在途槽)
+   *
+   * **G7 严格单飞**:bridge 内部维护 per-bridge "已持槽" 状态;新 inbound 命中已持
+   * 状态 → reject "previous codex turn still in progress"(error 帧),不复用 slot
+   * 不并发,frame 不 forward 到容器。
+   *
+   * 未注入 → bridge 不做 codex 并发管控,inbound 透传(测试 / 个人版上下文)。
+   */
+  codexBinding?: CodexBindingHandle;
+  /** Create an opaque per-turn Codex API relay route. When injected, GPT turns use api_relay groups instead of legacy OAuth codex accounts. */
+  createCodexRoute?: (args: {
+    containerId: number;
+    userId: bigint;
+    modelId: string;
+  }) => Promise<CodexRouteDecision | null>;
+  /** Expire an opaque per-turn Codex API relay route after the turn settles or aborts. */
+  expireCodexRoute?: (token: string) => Promise<void>;
+  /**
+   * PR2 v1.0.66 — codex 真扣费三件套(必须同时注入或同时缺省)。
+   *
+   * - 注入(commercial 路径):codex inbound 帧走 preCheck → inflight journal →
+   *   forward → outbound.codex_billing settle → ledger debit + cost_charged 广播
+   * - 缺省(测试 / 个人版):codex inbound 仍可走 acquire 占槽,但不 settle,纯透传
+   *
+   * **创建 handler 时强校验**(见 createUserChatBridge entry):partial 注入
+   * (例如只注 pgPool 没注 preCheckRedis)→ 直接 throw,防生产配置错把"漏 settle"
+   *  静默隐藏导致 codex 免费。codexBinding 已注 ⇒ 三件套必须全注。
+   *
+   * settle 路径用法(M2 v5 形态):bridge 用 deps.pgPool 写 journal、用
+   * deps.preCheckRedis 跑 preCheckWithCost、用 deps.pricing.get(modelId) 拿
+   * ModelPricing 复合 agent multiplier;settle 收口在 billing/codexFinalizer
+   * (settleUsageAndLedger → spendTwoBucket 双钱包,零输出免单,account_id NULL,
+   * session_id = billing 帧 engineSessionId)。
    */
   pgPool?: Pool;
   preCheckRedis?: PreCheckRedis;
   pricing?: PricingCache;
+  /**
+   * Persist costCredits into master's `client_sessions` blob via storage's
+   * `appendCostCredits` helper. Mirror of the same dep on
+   * `AnthropicProxyDeps`: bridge in-line持久化 codex 模式扣费,fail-open if
+   * not injected. See plan §4.2 改动 4a.
+   *
+   * Called only on the codex billing commit success branch (debit > 0).
+   * Optional in the same way as `appendCostCredits` on anthropicProxy:
+   * tests omit, deploy injects.
+   */
   appendCostCredits?: (
     requestId: string,
     userId: string,
@@ -368,8 +438,48 @@ export interface UserChatBridgeDeps {
   ) => Promise<unknown>;
 }
 
-// (v5 ccb-only:CodexBindingHandle / CodexApiRelayRoute / CodexOfficialOAuthRoute /
-//  CodexRouteUnavailable / CodexRouteDecision 已随 codex runner 一并移除。)
+/**
+ * plan v3 G5/G7 — codex 容器与账号绑定 / per-account 并发槽控制 handle。
+ *
+ * `acquire`:幂等持锁逻辑(决策 N2):查 row.codex_account_id + status,若 active
+ * 则直接 inc inflight slot;若非 active 走 lazy migrate(`pickCodexAccountForBinding`
+ * + FOR UPDATE 持锁直到 atomic rename + UPDATE 持锁内同 tx 提交;失败 ROLLBACK
+ * 自动回滚 codex_account_id);返回最终 acquire 的 account_id(供 release 用)。
+ *
+ * `release`:dec inflight slot(scheduler.releaseCodexSlot),不调 health.onSuccess /
+ * onFailure(决策 J2:bridge 不知道真实 turn 出参,健康分留给 release 层)。幂等。
+ */
+export interface CodexBindingHandle {
+  /** 成功返回 {account_id, slotId};legacy NULL 容器返 null。slotId 为 per-slot 租约 id。 */
+  acquire(containerId: number, groupId?: string | null): Promise<{ account_id: bigint; slotId: string } | null>;
+  /** 必须用 acquire 时记录的 (account_id, slotId) 成对还槽(精确 + reaper 兜底)。 */
+  release(account_id: bigint, slotId: string): void;
+}
+
+export interface CodexApiRelayRoute {
+  kind?: "api_relay";
+  token: string;
+  baseUrl: string;
+  modelProvider: string;
+  providerName?: string | null;
+  wireApi?: "responses" | "chat";
+  preferredAuthMethod?: "apikey" | "chatgpt";
+  disableResponseStorage?: boolean;
+  groupId: string;
+  credentialId: string;
+}
+
+export interface CodexOfficialOAuthRoute {
+  kind: "official_oauth";
+  groupId: string;
+}
+
+export interface CodexRouteUnavailable {
+  kind: "unavailable";
+  reason: string;
+}
+
+export type CodexRouteDecision = CodexApiRelayRoute | CodexOfficialOAuthRoute | CodexRouteUnavailable;
 
 /**
  * 单连每 N ms 最多调一次 markContainerActivity —— 防 chatty 用户每帧都冲 DB。
@@ -392,19 +502,141 @@ const ACTIVITY_REFRESH_INTERVAL_MS = 60_000;
 const GRANTS_REFRESH_INTERVAL_MS = 30_000;
 
 /**
+ * plan v3 G6 — codex per-account 槽兜底释放上限(默认 10 分钟)。
+ *
+ * 为什么需要:bridge 是 byte-transparent 的,不解析 outbound SSE 流,因此无法精确
+ * 检测"codex turn 完成"信号(personal-version `event:message_stop` 在容器 ws 帧
+ * 内,跨多帧拼接)。退而求其次:每次 acquire 同时启动一个 setTimeout,到点强制
+ * release。CODEX_SESSION_MAX_MS = 600s 与个人版 codex app-server 单次 turn 实际上限
+ * (~5min stream + buffer)对齐。ws close 也会通过 cleanup 路径释放(更早触发)。
+ *
+ * env `CODEX_SESSION_MAX_MS` 覆盖(测试常用 1000-5000)。
+ */
+const DEFAULT_CODEX_SESSION_MAX_MS = 600_000;
+function readCodexSessionMaxMs(): number {
+  const raw = process.env.CODEX_SESSION_MAX_MS;
+  if (!raw) return DEFAULT_CODEX_SESSION_MAX_MS;
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 1000 ? n : DEFAULT_CODEX_SESSION_MAX_MS;
+}
+
+/**
  * Agent → 隐含 model 授权映射(plan v3 round-2 finding 1 fix)。
  *
- * 用户提交 inbound.message 可只带 `agentId` 不带 `model`;bridge 看到 agentId 命中
- * 本表 → 用对应 modelId 做 authz 校验(explicit allowlist:哪些 agentId 一旦使用即
- * 等于在用受限 model)。
+ * 为什么需要:用户提交 inbound.message 时可以**只**带 `agentId` 不带 `model`
+ * (v3 webchat 的常见情况:用户切到某 agent,不主动选 model)。这种帧到达时:
+ *   - bridge 之前只看 frame.model → 没 model 就 skip authz
+ *   - 容器内 gateway 把 frame 路由给 agentId='codex' 那个 agent → CodexAdapter
+ *     用 agent.model='gpt-5.5' 启动 → 未授权用户拿到 codex API
  *
- * v5 ccb-only:codex/gpt-5.5 agent 已下线,本表当前为空;机制保留以便未来登记
- * 其它"agentId 隐含受限 model"的项。
+ * 因此:bridge 看到 agentId 命中本表 → 用对应 modelId 做 authz 校验。本质是
+ * "哪些 agentId 一旦使用,等于在用受限 model"的 explicit allowlist。新增 codex
+ * agent 必须在此登记。
+ *
+ * 与 agents.yaml 的关系:agents.yaml 是 runtime 配置,本表是**安全 contract**;
+ * 二者偏离不影响安全(本表多列 = 多拦,少列 = 漏拦但 inferAgentForModel 仍兜底)。
  */
-const AGENT_AUTHZ_IMPLIED_MODEL: Record<string, string> = {};
+const AGENT_AUTHZ_IMPLIED_MODEL: Record<string, string> = {
+  codex: "gpt-5.5",
+};
+
+/**
+ * PR2 v1.0.66 — codex 真扣费 preCheck 估算用的 max output tokens。
+ *
+ * codex inbound 帧不带 max_tokens 字段(由 codex app-server 内部决定),master 估
+ * preCheck 上限只能拍脑袋。64K 是 codex app-server 默认 max output tokens
+ * 的近似上限(实际 32-64K 视模型)。
+ *
+ * 2026-05-06:preCheck 已移除 ceiling 拒,balance > 0 即放行,reservation cap 到
+ * balance — 这个估算只影响 originalMaxCost / capped metric,不再决定放/拒。
+ * 真实扣费由 finalizer 拿真 usage 重算。
+ */
+const CODEX_PRECHECK_TOKEN_ESTIMATE = 64_000;
 
 const MASTER_HISTORY_MAX_MESSAGES = 48;
 const MASTER_HISTORY_MAX_CHARS = 18_000;
+
+/**
+ * PR2 v1.0.66 — user WS close 后等 codex billing 帧的 drain 窗口。
+ *
+ * 为什么需要(Codex BLOCKER 1):用户中途断开 → cleanup 立即关 container WS
+ * → 容器侧已发出但还在网络/事件循环里的 outbound.codex_billing 帧丢失 → 漏扣。
+ * Drain 期保留 container WS 监听不变,只把 user 侧资源(registry slot、heartbeat)
+ * 立即让出,billing 帧在 5s 内到达走 settle 正常落账;超时未到则按 fail 收尾,
+ * 由 reconciler 后续兜底(已存 inflight 行)。
+ *
+ * 5s 取舍:codex turn 终态信号 → master 间通常毫秒级;5s 远高于 P99 网络抖动,
+ * 又不至于卡死容器 WS 太久导致下个用户连接挤占 host 资源。
+ *
+ * M2:改为 env `DRAIN_BILLING_MS` 可覆盖(读时求值;测试用短窗口验证 timeout
+ * 路径,生产不设置 → 5s。旧版模块级常量导致 1167 行测试套只能真等 5s)。
+ */
+const DEFAULT_DRAIN_BILLING_MS = 5_000;
+function readDrainBillingMs(): number {
+  const raw = process.env.DRAIN_BILLING_MS;
+  if (!raw) return DEFAULT_DRAIN_BILLING_MS;
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 50 ? n : DEFAULT_DRAIN_BILLING_MS;
+}
+
+/**
+ * PR2 v1.0.66 — 32-hex per-turn 标识,master 生成且**强制覆写** client 提供的值。
+ *
+ * 设计契约:client (浏览器) 不应也无法预测此 id;若 client 把别的 turn 的
+ * requestId 塞进 inbound.message 试图错关 inflight 行 → master 直接覆写,
+ * 防伪造。容器侧只在 inbound→outbound.codex_billing 透传,不验证。
+ */
+function ensureRequestIdServerSide(): string {
+  return randomBytes(16).toString("hex");
+}
+
+/**
+ * PR2 v1.0.66 → M2 — bridge 持有的 codex inflight turn 快照。
+ *
+ * 关键:settle 时**只信本快照**,不信 outbound.codex_billing 帧的 model/agentId
+ * 字段(防容器侧伪造改账)。frame 承载 usage 统计 + requestId 关联键 +
+ * engineSessionId 记账键。
+ *
+ * M2 变化:finalizer **延迟到 billing 帧到达时构造** —— usage_records.session_id
+ * 的权威值 = 帧上的 engineSessionId(gateway 唯一 helper engineSessionId(sessionKey)
+ * 产物,与 idle-timeout waive 上报同值,方案红线)。inbound 时 bridge 不可靠知道
+ * gateway 侧 sessionKey(agent 路由可改写),自行派生会破坏 settle=waive 同值
+ * 不变量,故不在 inbound 期构造。
+ */
+interface CodexTurnSnapshot {
+  /** server-owned 32-hex id;Map key 与本字段同值,仅冗余便于日志。 */
+  requestId: string;
+  /** preCheck 时取的 model id(audit / log)。 */
+  model: string;
+  /** Issue A v1.0.108 — billing 帧的 codex_billing 分支需要根据账号 id 把
+   *  rateLimits 落到 claude_accounts.quota_*(maybeUpdateAccountQuotaCodex)。
+   *  bigint 0n = legacy / api_relay 无关联账号(quota writer 内部跳过)。 */
+  accountId: bigint;
+  /** CG2c — turn 的 canonical traceId(master 在 inbound.message 入口生成,
+   *  与本 snapshot 的 requestId 同源固定)。outbound.codex_billing settle 路径用它
+   *  派生 billingLog + 注入 outbound.cost_charged 广播帧,实现
+   *  inbound→outbound→ledger→broadcast 的 trace 贯穿。
+   *  **服务端 trust source**:settle 决策永远只信本字段,不解析 outbound 帧的
+   *  frame.traceId(防容器侧伪造影响计费观测)。 */
+  traceId: string;
+  /** Opaque Codex API relay route token for this turn, if the turn used an API relay group. */
+  codexRouteToken: string | null;
+  /**
+   * M2 — 首次调用用 billing 帧的 engineSessionId 构造 codexFinalizer 并 memoize
+   * (同 handle 复用 → _done 幂等语义与旧"构造期单 finalizer"完全一致)。
+   * 已走过 abandon() → 返 null(belt-and-braces:Map.delete 纪律下不可达,
+   * 防未来改动引入 abandon 后再 settle 的错账路径)。
+   */
+  getFinalizer(engineSessionId: string): CodexFinalizeHandle | null;
+  /**
+   * M2 — 不扣费收尾:billing 帧缺失/engineSessionId 口径非法(fail-closed 免单)
+   * 或 cleanup fail-abort(drain 超时 / bridge 断)路径。
+   * 语义 = codexFinalizer.fail:abort inflight journal + release preCheck
+   * reservation;若 finalizer 已构造则直接委托其 fail(fail-after-commit 由
+   * _done 守门 no-op)。幂等。
+   */
+  abandon(reason: string): Promise<void>;
+}
 
 export interface UserChatBridgeHandler {
   /** Gateway HTTP server 的 'upgrade' 事件入口。返 false → 路径不匹配,gateway 路由别处。 */
@@ -547,16 +779,21 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
   // partial 注入(漏一个)在生产里会让 codex 帧 acquire 但不 settle,等于
   // 静默免费送 token。boot-time fail-closed 防漏注。
   // 测试 mock 三个全 undefined 也合法(纯透传 / 不做计费)。
-  // PR2 v1.0.66 — billing 三件套一致性强校验:partial 注入(漏一个)是部署配置错。
-  // (v5 ccb-only:codex 帧计费分支已删,pgPool 仍用于 repo bind 富化等标准路径。)
-  const billingDepsCount =
+  const codexBillingDepsCount =
     [deps.pgPool, deps.preCheckRedis, deps.pricing].filter((x) => x !== undefined).length;
-  if (billingDepsCount !== 0 && billingDepsCount !== 3) {
+  if (codexBillingDepsCount !== 0 && codexBillingDepsCount !== 3) {
     throw new TypeError(
       "createUserChatBridge: pgPool/preCheckRedis/pricing must be all set or all unset " +
-      "(partial wiring suggests deployment misconfig)",
+      "(partial wiring suggests deployment misconfig that would silently disable codex billing)",
     );
   }
+  if (deps.codexBinding !== undefined && codexBillingDepsCount === 0) {
+    throw new TypeError(
+      "createUserChatBridge: codexBinding requires pgPool+preCheckRedis+pricing " +
+      "(otherwise codex turns acquire slots but never settle billing — silent free codex)",
+    );
+  }
+  const codexBillingEnabled = codexBillingDepsCount === 3;
 
   const maxPerUser = deps.maxPerUser ?? DEFAULT_MAX_PER_USER;
   const maxFrameBytes = deps.maxFrameBytes ?? DEFAULT_MAX_FRAME_BYTES;
@@ -993,8 +1230,43 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     // isFinal 到达 → 收窄到 now+POST_FINAL_GRACE_MS(只缩不延);心跳 now<turnActiveUntil 即放行。
     let turnActiveUntil = 0;
 
-    // (v5 ccb-only:codex per-account 并发槽 / route token / 早释放状态机已随
-    //  codex runner 一并移除。)
+    // plan v3 G5/G7 — codex per-account 并发槽:per-bridge 状态。
+    //   acquiredCodexAccountId !== null → 已持槽,新 codex inbound 应被严格单飞拒绝
+    //   codexAcquireInflight = true → acquire promise 在飞,新 codex inbound 拒
+    //   legacy 容器(codex_account_id IS NULL,决策 N3):acquire() 返回 null,IIFE 内
+    //     不占槽但 PR2 v1.0.66 起每轮仍跑 billing → 不再用 sticky 状态跳过 IIFE。
+    //   codexReleaseTimer → CODEX_SESSION_MAX_MS 兜底释放(决策 G6),防 outbound 丢/
+    //     ws 异常断后槽永久泄漏
+    let acquiredCodexAccountId: bigint | null = null;
+    // B7 per-slot 租约 id,与 acquiredCodexAccountId 同生死(成对 set/reset)。
+    // release 必须传它精确还槽;reaper 兜底"timer 也没跑到"的极端泄漏。
+    let acquiredCodexSlotId: string | null = null;
+    let codexAcquireInflight = false;
+    let codexApiRelayTurnInFlight = false;
+    let codexApiRelayRouteToken: string | null = null;
+    let codexReleaseTimer: ReturnType<typeof setTimeout> | null = null;
+    // plan v3 G6 — outbound 终态早释放(Codex review v2 BLOCKER 1):
+    //   只靠 600s timer + cleanup 释放,正常完成的 turn 会持槽 ≤ 10min,
+    //   单账号 maxConcurrent=10 → 10 个正常 turn 后误判 busy。
+    //   方案:acquire 时记 inbound.peer.id;outbound.message + isFinal:true 或
+    //   outbound.error 且 peer.id 命中 → 立即 release,timer 退化为兜底。
+    //   匹配 peer.id 的原因:同桥可 claude+codex 交错,只看"任意 isFinal"会误释。
+    let codexInboundPeerId: string | null = null;
+    const expireCodexRouteToken = (token: string | null, reason: string): void => {
+      if (token === null) return;
+      if (codexApiRelayRouteToken === token) codexApiRelayRouteToken = null;
+      const expire = deps.expireCodexRoute;
+      if (expire === undefined) return;
+      void expire(token).catch((err) => {
+        bridgeLog?.warn("user-chat-bridge: expire codex route failed", {
+          reason,
+          err: (err as Error)?.message ?? String(err),
+        });
+      });
+    };
+    const expireActiveCodexRoute = (reason: string): void => {
+      expireCodexRouteToken(codexApiRelayRouteToken, reason);
+    };
 
     // Phase 4 — GitHub session-repo auto-rebind:bridge 实例级 cache。
     //   containerWs.on('open') 时 fetch active selections 进 map(无 token);
@@ -1078,9 +1350,20 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       })();
     };
 
-    // (v5 ccb-only:codex 真扣费 inflight Map + billing drain 窗口已随 codex 一并移除;
-    //  bridge cleanup 直接 finalCleanup,不再有 user-close billing drain 阶段。)
-    //   userDetached: 守 detachUserSide 幂等(finalCleanup 跑)
+    // PR2 v1.0.66 — codex 真扣费 per-bridge inflight Map + drain 状态。
+    //   inflightCodexTurns: requestId → snapshot (deferred finalizer + model)
+    //     - 由 codex acquire IIFE 在成功路径 set
+    //     - 由 onContainerMessage 的 outbound.codex_billing 分支**同步先 delete** 再 settle
+    //     - 由 finalCleanup 兜底 fail-clear(drain 超时 / 容器异常 / shutdown 路径残留)
+    //   drainTimer: user_close + Map 非空时启动的 5s(env DRAIN_BILLING_MS)收尾窗口 timer
+    //     - settle 把 Map 减到 0 → checkDrainComplete 提前 finalCleanup
+    //     - 超时仍未 settle → finalCleanup 走 fail 兜底(reconciler 后续清理)
+    //     - 容器异常 / shutdown / force 抢占 drain → 立即 finalCleanup(见 cleanup 状态机)
+    //   drainCause: 进入 drain 时的 trigger cause(稳定保留,避免 mutable cause 干扰)
+    //   userDetached: 守 detachUserSide 幂等(drain 入口 + finalCleanup 都跑)
+    const inflightCodexTurns = new Map<string, CodexTurnSnapshot>();
+    let drainTimer: ReturnType<typeof setTimeout> | null = null;
+    let drainCause: BridgeCloseCause | null = null;
     let userDetached = false;
 
     // 注册到 registry,超额会踢老的
@@ -1189,10 +1472,17 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       //   这条 check **故意没 try/catch** 套整个 if 块:JSON.parse 异常下面已处理,
       //   isAllowed 是纯同步(canUseModel 读 PricingCache cache 命中即返),异常仅
       //   可能来自代码 bug,不该静默吞。
-      // 把 effectiveModel 提到外层(model authz 判定用)。
+      // 把 effectiveModel / 是否 codex 帧 提到外层,后面 codex slot 路径要用
       let effectiveModelForFrame: string | null = null;
-      // inboundParsedFrame:rewrite 帧塞 traceId 时复用,免再次 JSON.parse。
+      let isCodexInboundFrame = false;
+      // plan v3 G6 早释放(BLOCKER 1):codex inbound 帧的 peer.id,acquire 路径捕获后存
+      // codexInboundPeerId,匹配 outbound 终态时用。无 peer.id 即保持 null,降级为 timer 兜底。
+      let inboundPeerIdForFrame: string | null = null;
+      // PR2 v1.0.66 — 把 codex 计费需要用到的 frame 字段提到外层(下面 IIFE 用):
+      //   inboundParsedFrame:rewrite 帧塞 server requestId 时复用,免再次 JSON.parse
+      //   inboundAgentIdForFrame:agent_cost_overrides 查 multiplier 时用,缺省回退 'codex'
       let inboundParsedFrame: Record<string, unknown> | null = null;
+      let inboundAgentIdForFrame: string | null = null;
       // CG2a — 强制 canonical trace。inbound.message 命中时由 master 生成,后续
       // forwardInboundFrame 读注入到 frame.traceId。其他帧(hello / repo_bind /
       // 非 JSON / binary)保持 null,走原 raw 透传(不 rewrite)。
@@ -1424,6 +1714,19 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               return;
             }
             effectiveModelForFrame = effectiveModel;
+            // codex 判定:只看 effectiveModel 前缀(`gpt-*`) 即可。agentId='codex' 已通过
+            // AGENT_AUTHZ_IMPLIED_MODEL 把 effectiveModel 设为 'gpt-5.5',下面的判定一样命中。
+            isCodexInboundFrame = effectiveModel !== null && effectiveModel.startsWith("gpt-");
+            // 提取 peer.id(用于 outbound 终态早释放匹配)。codex 帧才需要;非 codex
+            // 帧不影响 acquiredCodexAccountId,捕不捕没用。
+            if (isCodexInboundFrame) {
+              const peerObj = (parsed as { peer?: { id?: unknown } }).peer;
+              const peerIdRaw = peerObj && typeof peerObj === "object" ? peerObj.id : undefined;
+              inboundPeerIdForFrame = typeof peerIdRaw === "string" ? peerIdRaw : null;
+              // PR2 v1.0.66 — 把 agentId 提到外层供 codex billing IIFE 用
+              // (查 agent_cost_overrides multiplier)。
+              inboundAgentIdForFrame = frameAgentId;
+            }
             // CG2a — canonical trace 生成 + client observation。
             // 任何 inbound.message(codex / 非 codex)都强制注入 master canonical;
             // client 提供的 clientTraceId 仅 observation:
@@ -1442,12 +1745,23 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             } else if (rawClientTrace !== undefined) {
               clientTraceFields.clientTraceIdIssue = clientHint.issue;
             }
-            // sanitize:非法 clientTraceId 不透传给 container(合法 / undefined 保留原 parsed)。
-            // (v5 ccb-only:client __oc_codex_route 剥离已随 codex route 一并移除。)
+            // sanitize:
+            //   - 非法 clientTraceId 不透传给 container — 合法 / undefined 保留原 parsed
+            //   - __oc_codex_route 永远是 master-owned 私有字段;client 输入即使形状合法也必须剥离,
+            //     后面只有 server 侧 createCodexRoute 成功时才会重新注入。
             let sanitizedParsed = parsed as Record<string, unknown>;
-            if (rawClientTrace !== undefined && !clientHint.ok) {
+            const hasClientCodexRoute = Object.prototype.hasOwnProperty.call(
+              sanitizedParsed,
+              "__oc_codex_route",
+            );
+            if ((rawClientTrace !== undefined && !clientHint.ok) || hasClientCodexRoute) {
               sanitizedParsed = { ...sanitizedParsed };
-              delete sanitizedParsed.clientTraceId;
+              if (rawClientTrace !== undefined && !clientHint.ok) {
+                delete sanitizedParsed.clientTraceId;
+              }
+              if (hasClientCodexRoute) {
+                delete sanitizedParsed.__oc_codex_route;
+              }
             }
             // Chat-native paper integration: keep browser/session text unchanged,
             // but enrich the master→container frame with a bounded ScanSci PDF
@@ -1462,8 +1776,535 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         }
       }
 
-      // 让 unused-locals 检查放过(future:可能加 outbound 解析用 effectiveModelForFrame)
-      void effectiveModelForFrame;
+      // plan v3 G5/G7 — codex per-account 槽 acquire / 严格单飞:
+      //   - bridge 看到 codex inbound + 有 codexBinding 注入 + 有 containerId
+      //   - 容器 codex_account_id 是 NULL(legacy)→ acquire() 返回 null,IIFE 内
+      //     不占槽,但 PR2 v1.0.66 起 **billing 路径仍要跑**(每轮 turn 都要扣费 +
+      //     落 journal),所以这里**不**用 codexLegacyContainer 当 outer guard 跳过 IIFE。
+      //     legacy 每轮多一次廉价 SELECT(codexBinding.acquire 内部 row 查),换不漏扣。
+      //   - 已持槽 / acquire 在飞 → reject "previous codex turn still in progress"(G7)
+      //   - 否则:async acquire → 成功 forward;Busy / 其他 fail → fast-fail error 帧
+      //
+      // 非 codex 帧 / 没注入 codexBinding / 没 containerId → 直接走下方原同步 forward
+      if (
+        isCodexInboundFrame &&
+        containerId !== undefined &&
+        (deps.codexBinding !== undefined || deps.createCodexRoute !== undefined)
+      ) {
+        if (acquiredCodexAccountId !== null || codexApiRelayTurnInFlight || codexAcquireInflight) {
+          // G7 严格单飞:不 close bridge,让前端等当前 turn 完成后重发
+          turnLogForFrame?.info("user-chat-bridge: codex turn busy, rejecting frame");
+          sendErrorFrame(
+            userWs,
+            "CODEX_TURN_BUSY",
+            "previous codex turn still in progress, wait for completion",
+          );
+          return;
+        }
+        codexAcquireInflight = true;
+        const codexBinding = deps.codexBinding;
+        const createCodexRoute = deps.createCodexRoute;
+        const cid = containerId;
+        const sessionMaxMs = readCodexSessionMaxMs();
+        // 进 acquire 路径才记 peer.id;G7 拒绝路径(busy)不该覆盖在飞 turn 的 peer.id。
+        const peerIdForAcquire = inboundPeerIdForFrame;
+        // PR2 v1.0.66 — billing 路径的回滚 helper:任意 await 阶段失败 / cleaned
+        // 检测命中时调,把已 set 的 acquiredCodexAccountId / timer / peerId 清理。
+        // legacy 路径 acquiredCodexAccountId 始终 null,是 no-op,安全。
+        const releaseAcquiredSlotForFailure = (): void => {
+          if (codexReleaseTimer !== null) {
+            clearTimeout(codexReleaseTimer);
+            codexReleaseTimer = null;
+          }
+          if (acquiredCodexAccountId !== null && acquiredCodexSlotId !== null && codexBinding !== undefined) {
+            try { codexBinding.release(acquiredCodexAccountId, acquiredCodexSlotId); } catch { /* */ }
+            acquiredCodexAccountId = null;
+            acquiredCodexSlotId = null;
+          }
+          expireActiveCodexRoute("failure");
+          codexApiRelayTurnInFlight = false;
+          codexInboundPeerId = null;
+        };
+        // PR2 v1.0.66 — 把外层 onUserMessage 抓的 effectiveModel / parsed / agentId
+        // 快照进 IIFE 局部,IIFE 跑期间 onUserMessage 不会再修改这几个 let(下一帧
+        // 走 G7 busy 拒绝路径,不会到这里),但稳妥起见还是 capture。
+        const effectiveModelCapture = effectiveModelForFrame;
+        const inboundAgentIdCapture = inboundAgentIdForFrame;
+        const inboundParsedCapture = inboundParsedFrame;
+        // CG2a — capture canonical traceId 给 IIFE 局部用。inbound.message ⇒ isCodexInboundFrame=true
+        // 路径强保证 turnTraceIdForFrame 非 null(invariant 由 IIFE 起手处显式校验)。
+        const turnTraceIdCapture = turnTraceIdForFrame;
+        // CG2b — capture turn-scoped logger;同步 set 一并 capture。
+        const turnLogCapture = turnLogForFrame;
+        void (async () => {
+          try {
+            // CG2a invariant — codex inbound 必经 inbound.message 分支 ⇒ trace + parsed 必非 null。
+            // 这里前置校验(acquire 之前),invariant 破坏 → close 1011,无需 release。
+            // 若放 acquire 之后再校验,要多一份 releaseAcquiredSlotForFailure() 清理负担。
+            if (turnTraceIdCapture === null || inboundParsedCapture === null) {
+              // invariant 命中时 turnLogCapture 也必为 null(同步生成),用 bridgeLog 兜底
+              bridgeLog?.error("user-chat-bridge: codex frame missing trace invariant");
+              if (!cleaned && userWs.readyState === WebSocket.OPEN) {
+                sendErrorFrame(userWs, "ERR_INTERNAL", "trace invariant violated");
+                try { userWs.close(CLOSE_BRIDGE.INTERNAL, "trace invariant"); } catch { /* */ }
+              }
+              return;
+            }
+            let codexRoute: CodexApiRelayRoute | null = null;
+            let officialOAuthGroupId: string | null = null;
+            if (createCodexRoute !== undefined) {
+              if (effectiveModelCapture === null) {
+                throw new Error("codex route requested without effective model");
+              }
+              const decision = await createCodexRoute({
+                containerId: cid,
+                userId: uid,
+                modelId: effectiveModelCapture,
+              });
+              if (decision !== null) {
+                if (decision.kind === "official_oauth") {
+                  officialOAuthGroupId = decision.groupId;
+                } else if (decision.kind === "unavailable") {
+                  throw Object.assign(new Error(decision.reason), { name: "CodexRouteUnavailable" });
+                } else {
+                  codexRoute = decision;
+                  codexApiRelayRouteToken = decision.token;
+                }
+              }
+            }
+
+            let acquired: { account_id: bigint; slotId: string } | null = null;
+            if (codexRoute === null) {
+              if (codexBinding === undefined) {
+                throw Object.assign(new Error("no enabled Codex API relay group"), { name: "CodexRouteUnavailable" });
+              }
+              acquired = await codexBinding.acquire(cid, officialOAuthGroupId);
+              if (officialOAuthGroupId !== null && acquired === null) {
+                throw Object.assign(new Error("selected Codex OAuth group unavailable"), { name: "CodexRouteUnavailable" });
+              }
+            }
+            if (cleaned) {
+              // bridge 在 acquire/route 创建期间被关 — 立即 release 不留泄漏
+              if (codexRoute !== null) {
+                expireCodexRouteToken(codexRoute.token, "cleanup_during_route_creation");
+              }
+              if (acquired !== null && codexBinding !== undefined) {
+                try { codexBinding.release(acquired.account_id, acquired.slotId); } catch { /* */ }
+              }
+              return;
+            }
+            if (codexRoute !== null) {
+              codexApiRelayTurnInFlight = true;
+              codexInboundPeerId = peerIdForAcquire;
+              codexReleaseTimer = setTimeout(() => {
+                expireActiveCodexRoute("timeout");
+                codexApiRelayTurnInFlight = false;
+                codexInboundPeerId = null;
+                codexReleaseTimer = null;
+              }, sessionMaxMs);
+              codexReleaseTimer.unref?.();
+            } else if (acquired === null) {
+              // legacy NULL 容器(决策 N3):不占 per-account 槽,billing 路径下面
+              // 仍跑(accountIdForQuota=0n 占位)。每轮 turn 都会再走一次 IIFE
+              // (acquire() 内部 row 查很轻),持续保持每轮扣费。
+            } else {
+              acquiredCodexAccountId = acquired.account_id;
+              acquiredCodexSlotId = acquired.slotId;
+              codexInboundPeerId = peerIdForAcquire;
+              codexReleaseTimer = setTimeout(() => {
+                // 兜底释放:防 outbound 完成信号丢 / ws 异常断 → 槽永久泄漏
+                if (acquiredCodexAccountId !== null && acquiredCodexSlotId !== null && codexBinding !== undefined) {
+                  try { codexBinding.release(acquiredCodexAccountId, acquiredCodexSlotId); } catch { /* */ }
+                  acquiredCodexAccountId = null;
+                  acquiredCodexSlotId = null;
+                }
+                codexApiRelayTurnInFlight = false;
+                codexInboundPeerId = null;
+                codexReleaseTimer = null;
+              }, sessionMaxMs);
+              codexReleaseTimer.unref?.();
+            }
+
+            // PR2 v1.0.66 → M2 — codex 真扣费 path:preCheck → journal → snapshot
+            //   (finalizer 延迟到 billing 帧构造)→ inflightCodexTurns Map 注册 →
+            //   frame rewrite 注入 server-owned requestId → forward。
+            //   失败任一步:释放已 acquire 的资源 + close ws 关连接。
+            //
+            //   codexBillingEnabled=false(测试 / 个人版上下文,三件套未注入)→ 走
+            //   下方 else 分支:仍 rewrite 注入 traceId(CG2a 合同硬门),只是不动 requestId。
+            const codexRouteFrame = codexRoute !== null ? {
+              baseUrl: codexRoute.baseUrl,
+              modelProvider: codexRoute.modelProvider,
+              providerName: codexRoute.providerName ?? null,
+              wireApi: codexRoute.wireApi ?? "responses",
+              preferredAuthMethod: codexRoute.preferredAuthMethod ?? "apikey",
+              disableResponseStorage: codexRoute.disableResponseStorage ?? true,
+            } : officialOAuthGroupId !== null ? {
+              kind: "official_oauth" as const,
+            } : null;
+            let frameForwardData: RawData;
+            const frameForwardIsBinary = false;
+            let frameForwardLen: number;
+            if (codexBillingEnabled) {
+              // 三件套全注入(createUserChatBridge entry 已强校验)→ non-null assert 安全
+              const pgPool = deps.pgPool!;
+              const preCheckRedis = deps.preCheckRedis!;
+              const pricingCache = deps.pricing!;
+
+              if (effectiveModelCapture === null) {
+                // 不该发生(isCodexInboundFrame=true 蕴含 effectiveModel 非空)
+                turnLogCapture?.error("user-chat-bridge: codex billing without effective model");
+                if (!cleaned && userWs.readyState === WebSocket.OPEN) {
+                  sendErrorFrame(userWs, "CODEX_BILLING", "codex billing internal");
+                  try { userWs.close(CLOSE_BRIDGE.INTERNAL, "codex billing"); } catch { /* */ }
+                }
+                releaseAcquiredSlotForFailure();
+                return;
+              }
+              const effectiveModel = effectiveModelCapture;
+
+              const modelPricing = pricingCache.get(effectiveModel);
+              if (!modelPricing) {
+                // pricing 缓存 miss(authz 通过但 cache 未含此 model — race 窗口
+                // / DB 配置漂移)。fail-closed:不放行 codex turn,免漏扣。
+                turnLogCapture?.error("user-chat-bridge: codex pricing missing", {
+                  model: effectiveModel,
+                });
+                if (!cleaned && userWs.readyState === WebSocket.OPEN) {
+                  sendErrorFrame(userWs, "CODEX_BILLING", `pricing missing for ${effectiveModel}`);
+                  try { userWs.close(CLOSE_BRIDGE.INTERNAL, "pricing missing"); } catch { /* */ }
+                }
+                releaseAcquiredSlotForFailure();
+                return;
+              }
+
+              // agent_cost_overrides:frameAgentId 缺省 fallback 'codex'(codex
+              // implied via gpt-* 前缀,canonical agentId 即 'codex')。
+              const agentForCharge = inboundAgentIdCapture ?? "codex";
+              let agentMul: string;
+              try {
+                agentMul = await getAgentCostMultiplier(pgPool, agentForCharge);
+              } catch (err) {
+                turnLogCapture?.error("user-chat-bridge: getAgentCostMultiplier failed", {
+                  agentId: agentForCharge, err,
+                });
+                if (!cleaned && userWs.readyState === WebSocket.OPEN) {
+                  sendErrorFrame(userWs, "CODEX_BILLING", "billing config unavailable");
+                  try { userWs.close(CLOSE_BRIDGE.INTERNAL, "billing config"); } catch { /* */ }
+                }
+                releaseAcquiredSlotForFailure();
+                return;
+              }
+              if (cleaned) {
+                releaseAcquiredSlotForFailure();
+                return;
+              }
+
+              const composedMultiplier = composeMultiplier(modelPricing.multiplier, agentMul);
+              const derivedPricing: ModelPricing = {
+                ...modelPricing,
+                multiplier: composedMultiplier,
+              };
+
+              const requestId = ensureRequestIdServerSide();
+              let maxCost: bigint;
+              try {
+                maxCost = estimateMaxCost(CODEX_PRECHECK_TOKEN_ESTIMATE, derivedPricing);
+              } catch (err) {
+                turnLogCapture?.error("user-chat-bridge: estimateMaxCost failed", { err });
+                if (!cleaned && userWs.readyState === WebSocket.OPEN) {
+                  sendErrorFrame(userWs, "CODEX_BILLING", "billing internal");
+                  try { userWs.close(CLOSE_BRIDGE.INTERNAL, "billing internal"); } catch { /* */ }
+                }
+                releaseAcquiredSlotForFailure();
+                return;
+              }
+
+              let preCheckResult: Awaited<ReturnType<typeof preCheckWithCost>>;
+              try {
+                preCheckResult = await preCheckWithCost(preCheckRedis, {
+                  userId: uid,
+                  requestId,
+                  maxCost,
+                });
+              } catch (err) {
+                if (err instanceof InsufficientCreditsError) {
+                  turnLogCapture?.info("user-chat-bridge: codex preCheck insufficient credits", {
+                    balance: err.balance.toString(),
+                    required: err.required.toString(),
+                  });
+                  if (!cleaned && userWs.readyState === WebSocket.OPEN) {
+                    sendErrorFrame(
+                      userWs,
+                      "ERR_INSUFFICIENT_CREDITS",
+                      `insufficient credits: balance=${err.balance} required=${err.required}`,
+                    );
+                    try { userWs.close(CLOSE_BRIDGE.BILLING_POLICY, "insufficient_credits"); } catch { /* */ }
+                  }
+                } else {
+                  turnLogCapture?.error("user-chat-bridge: preCheckWithCost failed", { err });
+                  if (!cleaned && userWs.readyState === WebSocket.OPEN) {
+                    sendErrorFrame(userWs, "CODEX_BILLING", "preCheck unavailable");
+                    try { userWs.close(CLOSE_BRIDGE.INTERNAL, "preCheck unavailable"); } catch { /* */ }
+                  }
+                }
+                releaseAcquiredSlotForFailure();
+                return;
+              }
+              if (cleaned) {
+                // 已 preCheck;主动 release 不让 lock 在 Redis 卡 5 分钟
+                await releasePreCheck(preCheckRedis, preCheckResult.reservation).catch(() => {});
+                releaseAcquiredSlotForFailure();
+                return;
+              }
+
+              // M2:usage_records.account_id 恒写 SQL NULL(codexFinalizer v5 形态,
+              // 弃 v3 的 0n 假账号)。这里的 accountIdForQuota **只**服务 rateLimits
+              // 落 claude_accounts.quota_*(maybeUpdateAccountQuotaCodex 对 0n 跳过):
+              // legacy(acquired===null)/ api_relay 路由用 0n 占位 = 无关联账号。
+              const accountIdForQuota = acquired !== null ? acquired.account_id : 0n;
+
+              try {
+                await startInflightJournal(pgPool, {
+                  requestId,
+                  userId: uid,
+                  containerId: BigInt(cid),
+                  model: effectiveModel,
+                  precheckCredits: preCheckResult.maxCost,
+                  ctxJson: {
+                    agentId: agentForCharge,
+                    codexAccountId:
+                      accountIdForQuota === 0n
+                        ? null
+                        : accountIdForQuota.toString(),
+                    source: "codex_bridge",
+                  },
+                });
+              } catch (err) {
+                turnLogCapture?.error("user-chat-bridge: startInflightJournal failed", {
+                  requestId, err,
+                });
+                if (!cleaned && userWs.readyState === WebSocket.OPEN) {
+                  sendErrorFrame(userWs, "CODEX_BILLING", "journal unavailable");
+                  try { userWs.close(CLOSE_BRIDGE.INTERNAL, "journal unavailable"); } catch { /* */ }
+                }
+                await releasePreCheck(preCheckRedis, preCheckResult.reservation).catch(() => {});
+                releaseAcquiredSlotForFailure();
+                return;
+              }
+              if (cleaned) {
+                // journal 已落 inflight — 主动 abort + release reservation,免 reconciler 等 timeout
+                await abortInflightJournal(
+                  pgPool,
+                  requestId,
+                  "bridge_disconnect_before_finalize",
+                ).catch(() => {});
+                await releasePreCheck(preCheckRedis, preCheckResult.reservation).catch(() => {});
+                releaseAcquiredSlotForFailure();
+                return;
+              }
+
+              // M2 — inflight snapshot:finalizer 延迟到 billing 帧构造(engineSessionId
+              // 权威来自帧,settle=waive 同值红线);abandon 承接旧 finalizer.fail 语义
+              // (abort journal + release reservation,不扣费)。snapState 单一状态机
+              // 保证 getFinalizer/abandon 互斥幂等,与旧"构造期单 finalizer + _done
+              // 守门"钱安全不变量等价。
+              const reservationForTurn: ReservationHandle = preCheckResult.reservation;
+              type SnapState =
+                | { kind: "handle"; handle: CodexFinalizeHandle }
+                | { kind: "abandoned"; promise: Promise<void> };
+              let snapState: SnapState | null = null;
+              const snap: CodexTurnSnapshot = {
+                requestId,
+                model: effectiveModel,
+                // Issue A v1.0.108 — codex_billing 分支落 quota 用。
+                accountId: accountIdForQuota,
+                // CG2c — IIFE 起手 invariant 已校验 turnTraceIdCapture !== null,
+                // 这里读出来 TS 推断为 string。本 turn 整个生命周期内固定不可变。
+                traceId: turnTraceIdCapture,
+                codexRouteToken: codexRoute?.token ?? null,
+                getFinalizer(engineSessionIdFromFrame: string): CodexFinalizeHandle | null {
+                  if (snapState !== null) {
+                    return snapState.kind === "handle" ? snapState.handle : null;
+                  }
+                  const handle = makeCodexFinalizer({
+                    pgPool,
+                    preCheckRedis,
+                    userId: uid,
+                    requestId,
+                    engineSessionId: engineSessionIdFromFrame,
+                    model: effectiveModel,
+                    derivedPricing,
+                    reservation: reservationForTurn,
+                  });
+                  snapState = { kind: "handle", handle };
+                  return handle;
+                },
+                async abandon(reason: string): Promise<void> {
+                  if (snapState !== null) {
+                    if (snapState.kind === "handle") {
+                      // finalizer 已构造:委托其 fail(fail-after-commit 由 _done 守门,
+                      // 已扣过费不会再 abort journal)。
+                      await snapState.handle.fail(reason);
+                      return;
+                    }
+                    await snapState.promise.catch(() => {});
+                    return;
+                  }
+                  const promise = (async (): Promise<void> => {
+                    try {
+                      await abortInflightJournal(pgPool, requestId, reason.slice(0, 500));
+                    } catch {
+                      // journal abort 失败 — reconciler 会扫到 stuck inflight 兜底。
+                    } finally {
+                      await releasePreCheck(preCheckRedis, reservationForTurn).catch(() => {});
+                    }
+                  })();
+                  snapState = { kind: "abandoned", promise };
+                  await promise;
+                },
+              };
+              inflightCodexTurns.set(requestId, snap);
+
+              // Frame rewrite:server-owned requestId 覆盖 client 任意值。容器侧
+              // 把这个 requestId 透传到 outbound.codex_billing,master 用它从
+              // inflightCodexTurns Map 找回 snapshot 落账。
+              // CG2a — 同时注入 master canonical traceId(IIFE 起手 invariant 保证非 null)
+              const enrichedParsed = await attachMasterHistoricalMessages(
+                inboundParsedCapture,
+                turnLogCapture,
+              );
+              if (cleaned) {
+                inflightCodexTurns.delete(requestId);
+                await snap.abandon("bridge_disconnect_before_forward").catch(() => {});
+                releaseAcquiredSlotForFailure();
+                return;
+              }
+              const rewrittenObj = {
+                ...enrichedParsed,
+                requestId,
+                traceId: turnTraceIdCapture,
+                ...(codexRouteFrame !== null ? { __oc_codex_route: codexRouteFrame } : {}),
+              };
+              const rewrittenStr = JSON.stringify(rewrittenObj);
+              const rewrittenLen = Buffer.byteLength(rewrittenStr);
+              if (rewrittenLen > maxFrameBytes) {
+                // rewriting 只加 ~100 bytes(`,"requestId":"<32hex>","traceId":"<32hex>"`)
+                // — 几乎不可能越界。命中 = 用户帧本来就贴边,abandon(不扣费)+ close ws。
+                turnLogCapture?.error("user-chat-bridge: rewritten codex frame too big", {
+                  rewrittenLen, max: maxFrameBytes,
+                });
+                inflightCodexTurns.delete(requestId);
+                snap.abandon("rewritten_frame_too_big").catch(() => {});
+                if (!cleaned && userWs.readyState === WebSocket.OPEN) {
+                  sendErrorFrame(
+                    userWs,
+                    "ERR_FRAME_TOO_BIG",
+                    `rewritten frame ${rewrittenLen} > max ${maxFrameBytes}`,
+                  );
+                  try { userWs.close(CLOSE_BRIDGE.TOO_BIG, "frame too big"); } catch { /* */ }
+                }
+                releaseAcquiredSlotForFailure();
+                return;
+              }
+              // ws lib RawData = Buffer | ArrayBuffer | Buffer[];string 不匹配。
+              // 转 Buffer 走文本帧(isBinary=false)— 接收端 .toString() 行为一致。
+              frameForwardData = Buffer.from(rewrittenStr, "utf8");
+              frameForwardLen = rewrittenLen;
+            } else {
+              // CG2a — billing 未启用(legacy NULL 容器无三件套 / 测试)路径仍要 rewrite
+              // 注入 traceId(合同硬门);不动 requestId(client 提供的 requestId 保留 raw)。
+              const enrichedParsed = await attachMasterHistoricalMessages(
+                inboundParsedCapture,
+                turnLogCapture,
+              );
+              if (cleaned) {
+                releaseAcquiredSlotForFailure();
+                return;
+              }
+              const rewrittenObj = {
+                ...enrichedParsed,
+                traceId: turnTraceIdCapture,
+                ...(codexRouteFrame !== null ? { __oc_codex_route: codexRouteFrame } : {}),
+              };
+              const rewrittenStr = JSON.stringify(rewrittenObj);
+              const rewrittenLen = Buffer.byteLength(rewrittenStr);
+              if (rewrittenLen > maxFrameBytes) {
+                turnLogCapture?.error("user-chat-bridge: rewritten codex frame too big (no billing)", {
+                  rewrittenLen, max: maxFrameBytes,
+                });
+                if (!cleaned && userWs.readyState === WebSocket.OPEN) {
+                  sendErrorFrame(
+                    userWs,
+                    "ERR_FRAME_TOO_BIG",
+                    `rewritten frame ${rewrittenLen} > max ${maxFrameBytes}`,
+                  );
+                  try { userWs.close(CLOSE_BRIDGE.TOO_BIG, "frame too big"); } catch { /* */ }
+                }
+                releaseAcquiredSlotForFailure();
+                return;
+              }
+              frameForwardData = Buffer.from(rewrittenStr, "utf8");
+              frameForwardLen = rewrittenLen;
+            }
+
+            // 已 acquire(+ billing 注册若启用)完毕,继续同步 forward 路径
+            // (等价于"放行 frame")。两条分支都已 rewrite 注入 traceId(CG2a 合同)。
+            forwardInboundFrame(frameForwardData, frameForwardIsBinary, frameForwardLen);
+          } catch (err) {
+            const errName = (err as { name?: string } | null | undefined)?.name ?? "";
+            if (errName === "ContainerStaleBindingError") {
+              // codexBinding.acquire 探测到 NULL 绑定但池子非空 — 已在 acquire 内
+              // mark vanished + await stopAndRemoveV3Container 把 docker 实体清掉。
+              // 本 turn 还没 acquire 任何 slot / 没注册 inflight billing(都在 try{}
+              // 块里 acquire 之后),因此**不要**调 releaseAcquiredSlotForFailure
+              // (no-op 但语义混淆)。直接通知前端 + 关连接 — 用户重发会触发
+              // ensureRunning 重 provision,picker 落 per-container mount,然后正常工作。
+              turnLogCapture?.info("user-chat-bridge: codex container stale, recycled", {
+                err: (err as Error)?.message,
+              });
+              if (!cleaned && userWs.readyState === WebSocket.OPEN) {
+                sendErrorFrame(
+                  userWs,
+                  "CODEX_CONTAINER_RECYCLED",
+                  "GPT 账号配置已变更,容器已自动重建,请刷新页面后重发",
+                );
+                try { userWs.close(CLOSE_BRIDGE.ENV_RECYCLED, "codex_container_recycled"); } catch { /* */ }
+              }
+            } else if (errName === "CodexRouteUnavailable") {
+              turnLogCapture?.info("user-chat-bridge: codex api relay route unavailable");
+              if (!cleaned && userWs.readyState === WebSocket.OPEN) {
+                sendErrorFrame(
+                  userWs,
+                  "CODEX_ROUTE_UNAVAILABLE",
+                  "no enabled Codex API relay group for this model",
+                );
+              }
+            } else if (errName === "AccountPoolBusyError") {
+              turnLogCapture?.info("user-chat-bridge: codex pool busy, fast-fail");
+              if (!cleaned && userWs.readyState === WebSocket.OPEN) {
+                sendErrorFrame(
+                  userWs,
+                  "CODEX_POOL_BUSY",
+                  "codex pool busy, retry shortly",
+                );
+              }
+            } else {
+              turnLogCapture?.warn("user-chat-bridge: codex acquire failed", { err });
+              if (!cleaned && userWs.readyState === WebSocket.OPEN) {
+                sendErrorFrame(
+                  userWs,
+                  "CODEX_UNAVAILABLE",
+                  "GPT temporarily unavailable, retry shortly",
+                );
+              }
+            }
+          } finally {
+            codexAcquireInflight = false;
+          }
+        })();
+        return; // 同步路径不再 forward,等 async 完成后由 forwardInboundFrame 走
+      }
       // CG2a — 非 codex 路径(claude-* 文本 / hello / repo_bind / 普通透传):若本帧是
       // inbound.message(已 sanitize parsed + 生成 canonical),把 traceId 注入再 forward;
       // 其他帧(非 JSON / binary / 非 inbound.message)turnTraceIdForFrame === null →
@@ -1591,6 +2432,226 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         firstContainerFrameAtMs = Date.now();
         metrics.onTtft?.(uid, ttftKind, (firstContainerFrameAtMs - firstUserFrameAtMs) / 1000);
       }
+      // PR2 v1.0.66 — outbound.codex_billing 是 container→master 内部侧信道,
+      // **绝不**透传给用户浏览器(用户不可见 billing,且帧含 errorReason 等内部串)。
+      //
+      // **必须在 userWs.readyState 检查之前**:
+      //   - drain 期 userWs 已关(detachUserSide → unregister),但 inflightCodexTurns
+      //     仍有 turn 等 billing 帧 settle。如果先 readyState gate 就 drop,用户跑路
+      //     免费送 token(B.5 plan invariant)
+      //   - 与 G6 早释放同一帧(outbound.message isFinal)无冲突 — 那个走 message
+      //     type,billing 走 codex_billing type,互斥
+      // cheap pre-filter:只对文本帧做 string includes,不解 JSON 影响热路径。
+      if (!isBinary) {
+        let billingPeek: string | null = null;
+        if (typeof data === "string") billingPeek = data;
+        else if (Buffer.isBuffer(data)) {
+          try { billingPeek = data.toString("utf8"); } catch { billingPeek = null; }
+        }
+        if (billingPeek !== null && billingPeek.includes('"outbound.codex_billing"')) {
+          let parsedBilling: unknown = null;
+          try { parsedBilling = JSON.parse(billingPeek); } catch { /* 非 JSON 不该走到这,稳妥起见仍直返 */ }
+          if (
+            parsedBilling !== null && typeof parsedBilling === "object" &&
+            (parsedBilling as { type?: unknown }).type === "outbound.codex_billing"
+          ) {
+            const billing = parsedBilling as {
+              requestId?: unknown;
+              engineSessionId?: unknown;
+              status?: unknown;
+              errorReason?: unknown;
+              usage?: {
+                input_tokens?: number;
+                output_tokens?: number;
+                cache_read_input_tokens?: number;
+                cache_creation_input_tokens?: number;
+                reasoning_output_tokens?: number;
+              };
+            };
+            const reqId = typeof billing.requestId === "string" ? billing.requestId : null;
+            if (reqId === null) {
+              bridgeLog?.warn("user-chat-bridge: codex_billing missing requestId");
+              return;
+            }
+            const snap = inflightCodexTurns.get(reqId);
+            if (snap === undefined) {
+              // billing 帧的 requestId 在本桥 inflight Map 里查不到。可能原因:
+              //   - 我们已经在处理同 reqId 的另一帧 → Map 已 delete(下方先 delete
+              //     再 settle 的 invariant — 防 duplicate 帧重复广播 cost_charged)
+              //   - turn 已 settle 后容器又重发(retry / 误重)
+              //   - bridge 已 finalCleanup 把 Map 清空 → fail 路径已 abort journal
+              //   - 跨桥 misroute(理论不存在,容器只连一个 master 桥)
+              bridgeLog?.info("user-chat-bridge: codex_billing for unknown turn", {
+                requestId: reqId,
+              });
+              return;
+            }
+            // **同步** delete:duplicate billing 帧第二次进这个分支 Map.get 拿
+            // undefined 直接 return,不会再起一个 IIFE 重复广播 cost_charged。
+            // finalizer._done 守门只防 ledger 重复 debit,但两个 IIFE 各自 await commit 后
+            // 都会读 result.debitedCredits>0 各广播一次 — 用 Map.delete 早断。
+            inflightCodexTurns.delete(reqId);
+            // CG2c — billing settle 路径的 log 钉到 turn 的 server-owned trace。
+            // child 一次,后续 quota / commit / persist 三个分支都用 billingLog;
+            // requestId 经 binding 提供,call-site 不再手写。**只读 snap.traceId,
+            // 不解析 frame.traceId** —— 防容器侧伪造影响计费观测。
+            const billingLog = bridgeLog?.child({
+              traceId: snap.traceId,
+              requestId: reqId,
+            }) ?? null;
+            // Issue A v1.0.108 — codex `account/rateLimits/updated` 通知 piggy-back
+            // 到 billing 帧的 rateLimits 字段(runner 已转 Anthropic-shape)。
+            // 与 ledger commit 解耦走独立 fire-and-forget,理由:
+            //   - quota 是 best-effort 可见性,不应被 ledger commit 结果阻塞
+            //   - 写在 commit 之前,避免 commit IIFE swallow exception 时 quota 也被吞
+            //   - quota.ts 内部对 accountId === 0n / "0" 跳过(legacy 无关联账号)
+            //   - quota.ts 30s SQL+JS 双层 throttle 兜底重复写
+            const billingRl = (parsedBilling as { rateLimits?: unknown }).rateLimits;
+            if (
+              billingRl &&
+              typeof billingRl === "object" &&
+              deps.pgPool
+            ) {
+              const r = billingRl as {
+                util5h?: number;
+                reset5h?: string;
+                util7d?: number;
+                reset7d?: string;
+              };
+              void maybeUpdateAccountQuotaCodex(
+                deps.pgPool,
+                snap.accountId,
+                r,
+              ).catch((err) => {
+                billingLog?.debug("user-chat-bridge: codex quota write failed", {
+                  err: (err as Error)?.message,
+                });
+              });
+            }
+            // M2 — engineSessionId fail-closed 校验(方案 §D 红线 2)。
+            // settle 落 usage_records.session_id 的**唯一**权威 = 帧上的
+            // engineSessionId(gateway 经 engineSessionId(sessionKey) 派生,与
+            // idle-timeout waive 上报同值)。缺失(旧容器镜像)/ 形状非法(伪造/
+            // 漂移)→ **不扣费**:abandon(abort journal + release reservation)
+            // + error 告警。宁可少收不可乱扣 —— 口径错的 session_id 一旦入库,
+            // waive 退款窗口(refund.refundSessionWindow)永远圈不到,会变成
+            // "该退不退"的乱扣。与 usage 缺失的 fail-safe 策略(免单并告警)对齐。
+            const engineSidRaw = billing.engineSessionId;
+            const engineSid =
+              typeof engineSidRaw === "string" && ENGINE_SESSION_ID_RE.test(engineSidRaw)
+                ? engineSidRaw
+                : null;
+            if (engineSid === null) {
+              billingLog?.error("user-chat-bridge: codex_billing engineSessionId missing/invalid — waiving turn (fail-closed)", {
+                engineSessionId: typeof engineSidRaw === "string" ? engineSidRaw.slice(0, 80) : typeof engineSidRaw,
+              });
+              void (async () => {
+                try {
+                  await snap.abandon("codex_billing_engine_session_id_invalid");
+                } catch (err) {
+                  billingLog?.error("user-chat-bridge: codex abandon threw", {
+                    err: (err as Error)?.message,
+                  });
+                } finally {
+                  expireCodexRouteToken(snap.codexRouteToken, "billing_engine_session_id_invalid");
+                  checkDrainComplete();
+                }
+              })();
+              return;
+            }
+            const codexStatus: "success" | "error" =
+              billing.status === "error" ? "error" : "success";
+            const errorReason = typeof billing.errorReason === "string"
+              ? billing.errorReason
+              : undefined;
+            const u = billing.usage ?? {};
+            // 防御性 number → 非负整数 BigInt:容器侧理论 emit 合法 number,但坏帧
+            // (NaN / Infinity / 字符串 / 对象)若进来,raw `BigInt(Math.trunc(...))`
+            // 会同步 throw 打崩 onContainerMessage。统一过 sanitizer 兜底归 0。
+            const safeNum = (v: unknown): bigint => {
+              if (typeof v !== "number" || !Number.isFinite(v) || v <= 0) {
+                return 0n;
+              }
+              return BigInt(Math.trunc(v));
+            };
+            // reasoning_output_tokens 折进 output_tokens — codex 内部把推理 token
+            // 单独计,但代理商按总 output 收;cache_*_input_tokens 改名对齐 calculator。
+            const usage: TokenUsage = {
+              input_tokens: safeNum(u.input_tokens),
+              output_tokens:
+                safeNum(u.output_tokens) + safeNum(u.reasoning_output_tokens),
+              cache_read_tokens: safeNum(u.cache_read_input_tokens),
+              cache_write_tokens: safeNum(u.cache_creation_input_tokens),
+            };
+            // fire-and-forget settle:Map 已 delete,duplicate 帧不会再触发;commit
+            // 内部 _done 守门兜底防 finalCleanup 同时调 fail 时重复 debit。
+            // M2:settle 收口 = codexFinalizer → settleUsageAndLedger → spendTwoBucket
+            // (双钱包:期内桶优先/钱包兜底);零输出免单在 finalizer 层;
+            // usage_records.account_id 恒 NULL;session_id = engineSid(上方已校验)。
+            void (async () => {
+              try {
+                const finalizer = snap.getFinalizer(engineSid);
+                if (finalizer === null) {
+                  // abandon 已跑过(Map.delete 纪律下不可达)— 不再 settle,防错账。
+                  billingLog?.error("user-chat-bridge: codex billing after abandon — skip settle");
+                  return;
+                }
+                const result = await finalizer.commit(
+                  usage, codexStatus, errorReason,
+                );
+                // 仅 debit > 0 才广播 cost_charged;0 token / 零输出免单 / 重入 /
+                // settle 失败 / commit-after-fail 合成 skipped(debitedCredits=null)
+                // 都不广播,避免前端误显示 ¥0 扣费条目。
+                if (
+                  result.debitedCredits !== null &&
+                  result.debitedCredits > 0n
+                ) {
+                  // Plan §4.2 改动 4a: persist FIRST so refresh-after-reply
+                  // shows the same value the broadcast carries. Failure is
+                  // metric-only — broadcast still fires.
+                  if (deps.appendCostCredits) {
+                    try {
+                      await deps.appendCostCredits(
+                        reqId,
+                        uid.toString(),
+                        result.debitedCredits.toString(),
+                      );
+                    } catch (err) {
+                      billingLog?.warn("user-chat-bridge: codex persist costCredits threw", {
+                        err: (err as Error)?.message,
+                      });
+                    }
+                  }
+                  // CG2c — broadcast 帧带 traceId 让 outboundRing audit / 前端 trace
+                  // 关联到 inbound canonical。snap.traceId 是 server-owned 唯一可信源。
+                  // M2:balanceAfter = **双钱包总可用**(spendTwoBucket.totalAfter,
+                  // period_credits + users.credits),对齐前端余额气泡口径。
+                  broadcastToUser(uid, {
+                    type: "outbound.cost_charged",
+                    requestId: reqId,
+                    traceId: snap.traceId,
+                    model: snap.model,
+                    costCredits: result.costCredits.toString(),
+                    debitedCredits: result.debitedCredits.toString(),
+                    balanceAfter: result.balanceAfter !== null
+                      ? result.balanceAfter.toString()
+                      : null,
+                    clamped: result.clamped,
+                  });
+                }
+              } catch (err) {
+                billingLog?.error("user-chat-bridge: codex finalizer commit threw", {
+                  err: (err as Error)?.message,
+                });
+              } finally {
+                expireCodexRouteToken(snap.codexRouteToken, "billing_settled");
+                checkDrainComplete();
+              }
+            })();
+            return;
+          }
+        }
+      }
       // Phase 4 — outbound.control.session_repo_status 侧信道(容器→master→user):
       //   master 须**先**落 DB(applyStatusFrame:更新 status / token_invalid 触发
       //   revoke + clear sessions),再让帧流到 userWs 让前端 UI 反映状态。
@@ -1699,7 +2760,60 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         // (was previously a silent-drop bug because there was no ring layer).
         return;
       }
-      // (v5 ccb-only:codex per-account 槽 outbound 终态早释放已随 codex 一并移除。)
+      // plan v3 G6 early release(BLOCKER 1):outbound.message + isFinal:true 或
+      //   outbound.error,且 peer.id 命中本桥在飞 codex turn 的 inbound peer.id →
+      //   立即 release codex slot,timer 退化为兜底。
+      //   - 必须 acquiredCodexAccountId !== null && codexInboundPeerId !== null:
+      //     未持槽 / 没记 peer.id 走纯透传(timer 兜底)
+      //   - 仅文本帧 + cheap pre-filter 减少 JSON.parse 开销(claude 流是高频)
+      //   - peer.id 严格匹配:claude 流 peer.id 不同 → 不误释
+      //   - 释放在 userWs.send 之前完成,失败回滚靠 cleanup 兜底
+      if (
+        (acquiredCodexAccountId !== null || codexApiRelayTurnInFlight) &&
+        codexInboundPeerId !== null &&
+        !isBinary
+      ) {
+        let outText: string | null = null;
+        if (typeof data === "string") outText = data;
+        else if (Buffer.isBuffer(data)) {
+          try { outText = data.toString("utf8"); } catch { outText = null; }
+        }
+        if (
+          outText !== null &&
+          (outText.includes('"isFinal":true') || outText.includes('"outbound.error"'))
+        ) {
+          let parsedOut: unknown = null;
+          try { parsedOut = JSON.parse(outText); } catch { /* 非 JSON 透传 */ }
+          if (parsedOut !== null && typeof parsedOut === "object") {
+            const obj = parsedOut as {
+              type?: unknown;
+              isFinal?: unknown;
+              peer?: { id?: unknown };
+            };
+            const peerId = obj.peer && typeof obj.peer === "object"
+              ? (typeof obj.peer.id === "string" ? obj.peer.id : null)
+              : null;
+            const isFinalMsg = obj.type === "outbound.message" && obj.isFinal === true;
+            const isErr = obj.type === "outbound.error";
+            if ((isFinalMsg || isErr) && peerId !== null && peerId === codexInboundPeerId) {
+              const accountId = acquiredCodexAccountId;
+              const slotId = acquiredCodexSlotId;
+              acquiredCodexAccountId = null;
+              acquiredCodexSlotId = null;
+              codexApiRelayTurnInFlight = false;
+              codexInboundPeerId = null;
+              if (codexReleaseTimer !== null) {
+                clearTimeout(codexReleaseTimer);
+                codexReleaseTimer = null;
+              }
+              if (accountId !== null && slotId !== null && deps.codexBinding !== undefined) {
+                try { deps.codexBinding.release(accountId, slotId); } catch { /* swallow */ }
+              }
+              expireActiveCodexRoute(isFinalMsg ? "turn_final" : "turn_error");
+            }
+          }
+        }
+      }
       // 简单 backpressure:看 userWs.bufferedAmount(ws lib 维护的 socket 待发量)
       if (userWs.bufferedAmount + len > maxBufferedBytes) {
         bridgeLog?.warn("user-chat-bridge: user-side backpressure", {
@@ -1860,18 +2974,26 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       modelCheckerRefreshTimer.unref?.();
     }
     userWs.on("close", (code, reason) => {
-      // 把客户端关闭原因转给容器(透传 code/reason,容器侧也会触发 cleanup)。
-      // (v5 ccb-only:billing drain 已移除,用户关闭直接透传 close + finalCleanup。)
+      // 把客户端关闭原因转给容器(透传 code/reason,容器侧也会触发 cleanup)
+      // **注意**:不要在这里 close containerWs。drain 机制需要容器仍开着接收 billing
+      // 帧 — 关 container 会让 codex turn 半道崩,billing 帧永远到不了 master。
+      // drain timeout (DRAIN_BILLING_MS) / pre-empt (container_close from agent)
+      // 会兜底关闭。
       const passCode = sanitizeCloseCode(code);
       const passReason = reason && reason.length > 0 && reason.length < 120
         ? reason.toString("utf8")
         : "client closed";
-      try {
-        if (containerWs.readyState === WebSocket.OPEN
-          || containerWs.readyState === WebSocket.CONNECTING) {
-          containerWs.close(passCode, passReason);
-        }
-      } catch { /* */ }
+      // 仅在没有 codex inflight 时才透传 close 给容器(走 force final 路径);
+      // 有 inflight 时进 drain,container 留着等 billing,drain 收尾时由 finalCleanup
+      // 统一 terminate。
+      if (inflightCodexTurns.size === 0) {
+        try {
+          if (containerWs.readyState === WebSocket.OPEN
+            || containerWs.readyState === WebSocket.CONNECTING) {
+            containerWs.close(passCode, passReason);
+          }
+        } catch { /* */ }
+      }
       cleanup("client_close");
     });
 
@@ -1885,16 +3007,87 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       onUserMessage(m.data, m.isBinary);
     }
 
-    // ---------- cleanup ----------
+    // ---------- cleanup 状态机(PR2 v1.0.66 drain refactor) ----------
     //
-    // (v5 ccb-only:PR2 codex billing drain 阶段已移除 —— 不再有"user 关闭后留 container
-    //  等 billing 帧"的 drain 窗口。cleanup 直接 finalCleanup,幂等由 cleaned 守门。)
+    // 状态:
+    //   1. 正常运行:cleaned=false, drainTimer=null
+    //   2. drain 期(仅 user_close + 有 inflight codex turn 触发):
+    //      cleaned=false, drainTimer!=null, userDetached=true,
+    //      container WS 仍开,onContainerMessage 仍处理 billing 帧
+    //   3. 完结:cleaned=true,所有资源释放
     //
-    // detachUserSide:unregister + uidToUserWs.delete + user-side timer 清 +
-    //   non-client_close 路径强 terminate userWs(防 heartbeat timeout 留 socket)。
-    function cleanup(triggerCause: BridgeCloseCause, _force = false): void {
+    // 入口:cleanup(triggerCause, force=false) — 参数化避免依赖外部 mutable cause。
+    //   - drain 中再调:container 异常 / shutdown / force 路径 → 立即 finalCleanup
+    //     其它(user_close 重入 / heartbeat)忽略,继续等 billing
+    //   - 未 drain:non-client_close 或 force 或 inflight 空 → 立即 finalCleanup
+    //                client_close + inflight 非空 → 进 drain
+    //
+    // detachUserSide(立即跑,drain / final 都用):unregister + uidToUserWs.delete +
+    //   user-side timer 清 + non-client_close 路径强 terminate userWs(防 heartbeat
+    //   timeout 留 socket)
+    //
+    // checkDrainComplete:billing settle 把 inflightCodexTurns.size→0 时调,提前 final
+    function cleanup(triggerCause: BridgeCloseCause, force = false): void {
       if (cleaned) return;
-      finalCleanup(triggerCause);
+
+      // 已在 drain 中
+      if (drainTimer !== null) {
+        if (
+          force ||
+          triggerCause === "container_close" ||
+          triggerCause === "container_error" ||
+          triggerCause === "shutdown"
+        ) {
+          bridgeLog?.info("user-chat-bridge: drain pre-empt", {
+            triggerCause, leftover: inflightCodexTurns.size,
+          });
+          finalCleanup(triggerCause);
+        }
+        // 其它路径(user_close 重入 / heartbeat 抖动)在 drain 期忽略
+        return;
+      }
+
+      // 还没进 drain
+      // drain 适用条件:user-side 故障(client_close / backpressure / internal_error)
+      // 同时有在飞 codex turn → container 仍可发 billing 帧,窗口内能到的就 settle。
+      // container_* / shutdown / frame_too_big / auth_failed 等路径不走 drain。
+      const shouldDrain =
+        !force &&
+        (triggerCause === "client_close" ||
+          triggerCause === "backpressure" ||
+          triggerCause === "internal_error") &&
+        inflightCodexTurns.size > 0;
+
+      if (!shouldDrain) {
+        finalCleanup(triggerCause);
+        return;
+      }
+
+      // 进 drain 路径(只有 user 主动 close + 有 codex inflight 才会)
+      drainCause = triggerCause;
+      detachUserSide(triggerCause);
+      bridgeLog?.info("user-chat-bridge: enter drain", {
+        inflightCount: inflightCodexTurns.size,
+      });
+      drainTimer = setTimeout(() => {
+        bridgeLog?.warn("user-chat-bridge: drain timeout", {
+          leftover: inflightCodexTurns.size,
+        });
+        finalCleanup(drainCause ?? "client_close");
+      }, readDrainBillingMs());
+      drainTimer.unref?.();
+    }
+
+    /**
+     * billing settle 把 inflightCodexTurns.size 减到 0 时调,提前结束 drain。
+     * 不在 drain 期 / Map 非空时 no-op。
+     */
+    function checkDrainComplete(): void {
+      if (drainTimer !== null && inflightCodexTurns.size === 0) {
+        clearTimeout(drainTimer);
+        drainTimer = null;
+        finalCleanup(drainCause ?? "client_close");
+      }
     }
 
     /**
@@ -1949,11 +3142,40 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       if (cleaned) return;
       cleaned = true;
       cause = finalCause;
+      if (drainTimer !== null) {
+        clearTimeout(drainTimer);
+        drainTimer = null;
+      }
 
       // user 侧 detach(idempotent)
       detachUserSide(finalCause);
 
-      // (v5 ccb-only:codex billing drain / per-account 槽兜底释放已随 codex 一并移除。)
+      // PR2 v1.0.66 → M2 — codex inflight fail-abort:drain 已超时或没进 drain 的
+      // 路径,把 Map 里残留的 turn(acquire 过 preCheck+journal 但没等到可 settle 的
+      // billing 帧)abandon 掉:abort inflight journal + release preCheck。
+      // fire-and-forget。已 settle 的 turn 由 Map.delete 纪律先行摘除,不会被误 fail;
+      // finalizer 已构造的残留(理论不可达)由 _done 守门防重复 debit。
+      for (const [, snap] of inflightCodexTurns) {
+        snap.abandon("bridge_disconnect").catch(() => {});
+      }
+      inflightCodexTurns.clear();
+
+      // plan v3 G6 — codex 槽兜底释放:bridge 关 = 当前 turn 必然终止(用户 ws / 容器
+      //   ws 任一断都进 cleanup)。清掉 timeout timer 后显式 release。即便 acquire 还在
+      //   飞(codexAcquireInflight=true),acquire 内部已检查 cleaned 标志,acquire 成功
+      //   后会立刻 release 自己,不会泄漏。
+      if (codexReleaseTimer !== null) {
+        clearTimeout(codexReleaseTimer);
+        codexReleaseTimer = null;
+      }
+      if (acquiredCodexAccountId !== null && acquiredCodexSlotId !== null && deps.codexBinding) {
+        try { deps.codexBinding.release(acquiredCodexAccountId, acquiredCodexSlotId); } catch { /* */ }
+        acquiredCodexAccountId = null;
+        acquiredCodexSlotId = null;
+      }
+      expireActiveCodexRoute("bridge_cleanup");
+      codexApiRelayTurnInFlight = false;
+      codexInboundPeerId = null;
       try { connectAbort.abort(); } catch { /* */ }
       try {
         // 注意:CLOSING 状态也强 terminate(),不依赖对端 echo,

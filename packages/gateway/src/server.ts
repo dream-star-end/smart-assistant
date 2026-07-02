@@ -8935,13 +8935,16 @@ export class Gateway {
         // _inheritOutboundRouting 从 main `out` 继承(billing 行可按 traceId 反查
         // 产生它的 turn)。
         //
-        // 注意:EngineBillingEvent.engineSessionId(M2 settle/waive 的记账键)
-        // **暂不进 wire 帧** —— protocol 包不在 M1a 改动范围,OutboundCodexBilling
-        // 扩字段与 master 消费在 M2 一并落。
+        // M2 — engineSessionId 进 wire 帧:EngineBillingEvent.engineSessionId
+        // (adapter 构造时经唯一 helper engineSessionId(sessionKey) 派生)是 master
+        // settle 落 usage_records.session_id 的权威值;与 _reportTurnWaive 的
+        // idle-timeout 免单上报同源同值(方案红线:settle=waive 同一
+        // engineSessionId,否则 refund.refundSessionWindow 圈不到 codex 记录)。
         const billingFrame: OutboundCodexBilling & { _userId?: string } = {
           type: 'outbound.codex_billing',
           ..._inheritOutboundRouting(out),
           requestId: e.requestId,
+          engineSessionId: e.engineSessionId,
           status: e.status,
           durationMs: e.durationMs,
           ...(e.usage ? { usage: e.usage } : {}),

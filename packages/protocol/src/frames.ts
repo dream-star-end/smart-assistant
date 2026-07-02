@@ -510,6 +510,19 @@ export const OutboundCodexBilling = Type.Object({
   /** master 写入的 server-owned id;container 必须原样回带。缺这个字段的帧
    *  master 会丢弃(无法定位 inflight 行)。 */
   requestId: Type.String(),
+  /** M2(v5 codex 复活)— engine-reported 计费的稳定记账键。
+   *
+   *  值 = gateway engine/engineSessionId.ts 的 `engineSessionId(sessionKey)`
+   *  (`'oceng-' + sha256(sessionKey).hex.slice(0,48)`,共 54 字符,唯一权威
+   *  helper,禁止各处自行 hash)。master settle 落 usage_records.session_id 与
+   *  容器 idle-timeout turn-waive 上报(masterTurnWaive)**必须同一值**,否则
+   *  退款窗口(refund.refundSessionWindow 按 session_id 圈定)永远圈不到 codex
+   *  记录 —— 钱安全红线。
+   *
+   *  Optional 仅为渐进部署兼容(旧容器镜像不带此字段);master 侧对缺失/形状
+   *  非法的帧 fail-closed:不 settle 扣费,abort journal 免单 + 告警(宁可少收
+   *  不可乱扣,对齐 usage 缺失的 fail-safe 策略)。 */
+  engineSessionId: Type.Optional(Type.String({ pattern: '^oceng-[0-9a-f]{48}$' })),
   /** PR2 范围:codex turn 终态分类。partial 路径在 PR3 加。 */
   status: Type.Union([Type.Literal('success'), Type.Literal('error')]),
   /** turn 实际墙钟时长(ms),codex app-server 报告的 durationMs。 */

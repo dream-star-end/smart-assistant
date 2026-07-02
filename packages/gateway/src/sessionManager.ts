@@ -26,6 +26,7 @@ import type {
   TurnToolEntry,
 } from './engine/engineEvents.js'
 import { createEngine, resolveEngine } from './engine/registry.js'
+import { engineSessionId } from './engine/engineSessionId.js'
 import { eventBus, createEvent } from './eventBus.js'
 import { createLogger } from './logger.js'
 import { sendTurnWaiveBestEffort } from './masterTurnWaive.js'
@@ -692,6 +693,27 @@ function persistServerAuthoredTurn(args: {
     })
 }
 
+/**
+ * M2 — turn-waive 上报的记账键选择(exported for tests)。
+ *
+ * 按 EngineCapabilities.billingMode 能力分支(消灭 provider 字符串 if/else 散点,
+ * 见 engineAdapter.ts 契约):
+ *   - 'engine-reported'(codex 等):记账键 = engineSessionId(sessionKey)——
+ *     与 CodexAdapter 经 billing 事件下发、master settle 落 usage_records.session_id
+ *     的值**同 helper 同入参**,方案红线"settle 与 waive 必须同一值"由构造保证。
+ *     该值恒可派生,不依赖底座学到任何 native id。
+ *   - 'proxy'(CCB)/ 未知:沿用 CCB 原生 session id(anthropicProxy settle 落的
+ *     就是它);未学到(null)→ 返回 null,caller 跳过上报并 warn。
+ */
+export function waiveAccountingSessionId(args: {
+  billingMode: 'proxy' | 'engine-reported' | undefined
+  sessionKey: string
+  ccbSessionId: string | null
+}): string | null {
+  if (args.billingMode === 'engine-reported') return engineSessionId(args.sessionKey)
+  return args.ccbSessionId
+}
+
 export class SessionManager {
   private sessions = new Map<string, AgentSession>()
   private maxIdleMsCron = 30 * 60 * 1000 // 30 min for cron/task sessions
@@ -959,16 +981,26 @@ export class SessionManager {
    *  turns (unavoidable when the JSONL is gone). */
   /** idle-timeout 免单上报(见 masterTurnWaive.ts 头注)。ccb session id 未知
    *  (首 turn 未学到)时无法圈定 master 侧记录,跳过并 warn —— 该场景下本 turn
-   *  多半也没有可退的成功 settle(连首个事件都没等到)。 */
+   *  多半也没有可退的成功 settle(连首个事件都没等到)。
+   *
+   *  M2(codex 复活)— 记账键按 billingMode 能力分支(waiveAccountingSessionId):
+   *  engine-reported 底座(codex)上报 engineSessionId(sessionKey),与 settle
+   *  落 usage_records.session_id 同一 helper 同一入参 —— 方案红线"settle 与
+   *  waive 必须同一值"。M1a 前旧口径(codex 上报 thread id)永远对不上号,
+   *  已随本函数收口修正。 */
   private _reportTurnWaive(session: AgentSession, reason: 'idle_timeout' | 'no_response'): void {
     try {
-      const ccbSessionId = session.ccbSessionId ?? this._resumeMap.get(session.sessionKey) ?? null
-      if (!ccbSessionId) {
+      const sessionId = waiveAccountingSessionId({
+        billingMode: session.runner?.capabilities?.billingMode,
+        sessionKey: session.sessionKey,
+        ccbSessionId: session.ccbSessionId ?? this._resumeMap.get(session.sessionKey) ?? null,
+      })
+      if (!sessionId) {
         log.warn('turn waive skipped — ccb session id unknown', { sessionKey: session.sessionKey })
         return
       }
       const sinceTs = (session._turnStartedAtMs ?? Date.now()) - 15_000
-      sendTurnWaiveBestEffort({ sessionId: ccbSessionId, sinceTs, reason })
+      sendTurnWaiveBestEffort({ sessionId, sinceTs, reason })
     } catch (err) {
       log.warn('turn waive report threw', { sessionKey: session.sessionKey }, err as Error)
     }
