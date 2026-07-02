@@ -303,6 +303,7 @@
           <select id="persona-model-preset" onchange="if(this.value){document.getElementById('persona-model').value=this.value;var g=this.selectedOptions[0]?.parentElement?.label||'';var p=document.getElementById('persona-provider');if(g.startsWith('Claude'))p.value='claude-subscription';else if(g.startsWith('MiniMax'))p.value='minimax';else if(g.startsWith('DeepSeek'))p.value='deepseek';else if(g.startsWith('OpenAI'))p.value='codex-native';p.dispatchEvent(new Event('change'))}">
             <option value="">自定义</option>
             <optgroup label="Claude">
+              <option value="claude-fable-5">Fable 5</option>
               <option value="claude-opus-4-8">Opus 4.8</option>
               <option value="claude-opus-4-7">Opus 4.7</option>
               <option value="claude-opus-4-6">Opus 4.6</option>
