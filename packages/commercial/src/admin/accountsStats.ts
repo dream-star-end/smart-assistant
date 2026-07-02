@@ -74,7 +74,10 @@ export async function getAccountsPoolStats(): Promise<AccountsPoolStats> {
            AND oauth_expires_at >= NOW()
            AND oauth_expires_at < NOW() + INTERVAL '24 hours'
        )                                                                 AS expiring_24h
-     FROM claude_accounts`,
+     FROM claude_accounts
+     WHERE NOT (provider = 'codex' AND runtime_channel <> 'v3')`,
+    // ↑ 0098 channel 划分:v3 池统计只看 v3 权威的行(claude 共享池 + v3 channel
+    //   的 codex),与 admin 列表/告警口径一致。
   );
 
   // 今日请求/错误总计 —— usage_records.created_at 走 idx_ur_created_at(0026)

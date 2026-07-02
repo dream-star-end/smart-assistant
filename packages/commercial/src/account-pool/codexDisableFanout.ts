@@ -107,9 +107,11 @@ async function runFanout(
   const logger = deps.logger
 
   try {
-    // 1) provider 二次确认(防止 caller 误把 claude 账号传进来 fanout)
+    // 1) provider 二次确认(防止 caller 误把 claude 账号传进来 fanout)。
+    //    0098 channel 划分:非 v3 channel 的 codex 行按 not_found 静默 skip ——
+    //    v5 行的 fanout 归 v5 master,v3 不越权(fail-safe:skip 无任何写)。
     const provCheck = await queryFn<{ provider: string; status: string }>(
-      `SELECT provider, status FROM claude_accounts WHERE id = $1`,
+      `SELECT provider, status FROM claude_accounts WHERE id = $1 AND runtime_channel = 'v3'`,
       [String(accountId)],
     )
     if (provCheck.rows.length === 0) {
@@ -127,10 +129,11 @@ async function runFanout(
     // 2) 列受影响容器。这里**不**用 SELECT ... FOR UPDATE —— 锁在 migrate
     //    tx 内每个容器自己拿,FOR UPDATE 范围必须最小,否则限流 N=4 也会撑大
     //    锁集。
+    //    0098 channel 划分:只 fanout 本 channel(v3)容器 —— v5 容器归 v5 master。
     const rows = await queryFn<{ id: string }>(
       `SELECT id::text AS id
        FROM agent_containers
-       WHERE codex_account_id = $1 AND state = 'active'`,
+       WHERE codex_account_id = $1 AND state = 'active' AND runtime_channel = 'v3'`,
       [String(accountId)],
     )
     if (rows.rows.length === 0) {
@@ -274,10 +277,13 @@ export async function findCodexDisableDrift(
   queryFn: typeof defaultQuery = defaultQuery,
 ): Promise<CodexDriftRow[]> {
   const res = await queryFn<{ container_id: string; account_id: string }>(
+    // 0098 channel 划分:drift reconciler 只扫本 channel(v3)容器做迁移/写 auth ——
+    // 否则 v3 会把 v5 active 容器绑定的 codex 账号扫进迁移路径(跨 channel 变更)。
     `SELECT ac.id::text AS container_id, ac.codex_account_id::text AS account_id
        FROM agent_containers ac
        JOIN claude_accounts ca ON ca.id = ac.codex_account_id
       WHERE ac.state = 'active'
+        AND ac.runtime_channel = 'v3'
         AND ac.codex_account_id IS NOT NULL
         AND ca.provider = 'codex'
         AND ca.status <> 'active'

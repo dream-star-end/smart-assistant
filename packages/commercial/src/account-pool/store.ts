@@ -523,6 +523,9 @@ export async function listAccounts(
       whereParts.push(`provider = ANY($${params.length}::text[])`);
     }
   }
+  // 0098 channel 划分:v3 admin 列表只见 v3 权威的行 —— v5 channel 的 codex 账号
+  // 归 v5 admin 管理,v3 侧不可见即不可误操作(claude 行维持共享池语义不过滤)。
+  whereParts.push("NOT (provider = 'codex' AND runtime_channel <> 'v3')");
   const where = whereParts.length ? `WHERE ${whereParts.join(" AND ")}` : "";
   params.push(limit);
   const limitIdx = params.length;

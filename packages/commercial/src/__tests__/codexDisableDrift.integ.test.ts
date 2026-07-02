@@ -98,7 +98,11 @@ async function mkAccount(provider: 'codex' | 'claude', status: string): Promise<
   return BigInt(r.rows[0].id)
 }
 
-async function mkContainer(codexAccountId: bigint | null, state: string): Promise<bigint> {
+async function mkContainer(
+  codexAccountId: bigint | null,
+  state: string,
+  channel: 'v3' | 'v5' = 'v3',
+): Promise<bigint> {
   // 每个容器一个独立 user:agent_containers 有 UNIQUE(user_id) WHERE state='active'。
   _userCtr += 1
   const u = await query<{ id: string }>(
@@ -106,10 +110,10 @@ async function mkContainer(codexAccountId: bigint | null, state: string): Promis
     [`c${_userCtr}@t.co`],
   )
   const r = await query<{ id: string }>(
-    `INSERT INTO agent_containers(user_id, secret_hash, state, codex_account_id)
-     VALUES ($1, decode(repeat('00', 32), 'hex'), $2, $3)
+    `INSERT INTO agent_containers(user_id, secret_hash, state, codex_account_id, runtime_channel)
+     VALUES ($1, decode(repeat('00', 32), 'hex'), $2, $3, $4)
      RETURNING id::text AS id`,
-    [u.rows[0].id, state, codexAccountId === null ? null : codexAccountId.toString()],
+    [u.rows[0].id, state, codexAccountId === null ? null : codexAccountId.toString(), channel],
   )
   return BigInt(r.rows[0].id)
 }
@@ -146,5 +150,17 @@ describe('findCodexDisableDrift (integ)', () => {
     const codexActive = await mkAccount('codex', 'active')
     await mkContainer(codexActive, 'active')
     assert.deepEqual(await findCodexDisableDrift(), [])
+  })
+
+  test('0098 channel 划分:v5 channel 容器不进 v3 drift 扫描(跨 channel 不越权)', async (t) => {
+    if (skipIfNoPg(t)) return
+    const codexDisabled = await mkAccount('codex', 'disabled')
+    const v3Drift = await mkContainer(codexDisabled, 'active', 'v3') // ✓ 本 channel 漂移
+    await mkContainer(codexDisabled, 'active', 'v5') // ✗ v5 容器归 v5 master reconcile
+    const rows = await findCodexDisableDrift()
+    assert.deepEqual(
+      rows.map((r) => r.containerId),
+      [Number(v3Drift)],
+    )
   })
 })

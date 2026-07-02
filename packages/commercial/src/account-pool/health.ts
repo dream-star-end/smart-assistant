@@ -208,6 +208,8 @@ export class AccountHealthTracker {
    */
   async halfOpen(): Promise<AccountHealth[]> {
     const res = await query<RawHealthRow>(
+      // 0098 channel 划分:codex 行的状态权威按 runtime_channel 归属,v3 的
+      // 自动半开恢复不越权翻 v5 codex 行(claude 行维持共享池语义不过滤)。
       `UPDATE claude_accounts
        SET status = 'active',
            health_score = 50,
@@ -216,6 +218,7 @@ export class AccountHealthTracker {
        WHERE status = 'cooldown'
          AND cooldown_until IS NOT NULL
          AND cooldown_until < NOW()
+         AND NOT (provider = 'codex' AND runtime_channel <> 'v3')
        RETURNING id::text AS id, status, health_score, cooldown_until`,
     );
     const recovered = res.rows.map(parseHealth);

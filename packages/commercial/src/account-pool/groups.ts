@@ -487,14 +487,18 @@ export async function hasActiveOfficialOAuthAccountInGroup(
 ): Promise<boolean> {
   const group = await getAccountGroup(groupId);
   if (!group || !group.enabled || group.kind !== "official_oauth" || group.provider !== provider) return false;
+  // 0098 channel 划分:codex 账号池权威按 runtime_channel 归属 —— codex 行
+  // 严格只认本 channel(v3 取不到 v5 行,fail-closed);claude 行维持共享池语义不过滤。
+  const codexChannel = provider === "codex" ? "v3" : null;
   const res = await query<{ ok: number }>(
     `SELECT 1 AS ok
        FROM claude_accounts
       WHERE provider = $1
         AND group_id = $2
         AND status = 'active'
+        AND ($3::text IS NULL OR runtime_channel = $3::text)
       LIMIT 1`,
-    [provider, String(groupId)],
+    [provider, String(groupId), codexChannel],
     runner,
   );
   return res.rows.length > 0;

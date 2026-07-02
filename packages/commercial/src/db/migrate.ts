@@ -227,6 +227,23 @@ async function runMigrationsInner(
 
     const sql = await readFile(path.join(dir, file), "utf8");
 
+    // no-transaction 迁移:文件头部含 `-- no-transaction` 标记时,**不**包 BEGIN/COMMIT。
+    // 用于 `CREATE INDEX CONCURRENTLY` 等 PG 禁止在事务块内执行的 DDL(P1a 唯一索引切换)。
+    // 代价:中途失败无法整体回滚 → 这类迁移必须自身幂等(IF NOT EXISTS / IF EXISTS),
+    // 失败后人工核对再重跑安全。advisory lock(session 级)仍持有,串行化不受影响。
+    const noTransaction = /^--\s*no-transaction\b/im.test(sql);
+    if (noTransaction) {
+      // 逐条裸执行(无事务)。CONCURRENTLY 须是独立语句、不能在 tx 内。
+      await client.query(sql);
+      await client.query(
+        "INSERT INTO schema_migrations(version) VALUES ($1)",
+        [version],
+      );
+      applied.push(version);
+      opts.onApply?.(version);
+      continue;
+    }
+
     // 直接在持锁 client A 上 BEGIN/COMMIT,不借第二个 client:
     //   - advisory lock 是 session 级,不影响 A 自己开事务
     //   - 避免 pool 容量紧张时 A 等 B 的资源死锁边界

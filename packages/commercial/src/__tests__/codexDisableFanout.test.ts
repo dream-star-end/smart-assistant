@@ -119,6 +119,30 @@ describe('codexDisableFanout', () => {
     assert.equal(txRan, 0, 'no containers → tx never opens')
   })
 
+  test("0098 channel 划分:provCheck 与容器枚举 SQL 都圈定 runtime_channel='v3'(v5 行/容器不进 v3 fanout)", async () => {
+    _resetInflightFanoutForTest()
+    const queries: string[] = []
+    const deps: CodexDisableFanoutDeps = {
+      writeAuth: { selfHostId: null, containerUid: 1000, containerGid: 1000, codexContainerDir: '/tmp/x' },
+      queryFn: async (sql: string) => {
+        queries.push(sql)
+        if (queries.length === 1) {
+          return { rows: [{ provider: 'codex', status: 'disabled' }], rowCount: 1 } as never
+        }
+        return { rows: [], rowCount: 0 } as never
+      },
+    }
+    enqueueCodexDisableFanout(OLD_ACCOUNT, deps)
+    await settle()
+    assert.equal(queries.length, 2, 'provider + containers')
+    // provCheck:claude_accounts 按 channel 圈定 —— v5 行按 not_found skip,fanout 不越权。
+    assert.match(queries[0]!, /claude_accounts/, 'first query is the account provCheck')
+    assert.match(queries[0]!, /runtime_channel = 'v3'/, "provCheck 必须带 runtime_channel='v3'")
+    // 容器枚举:agent_containers 按 channel 圈定 —— v5 容器归 v5 master fanout。
+    assert.match(queries[1]!, /agent_containers/, 'second query is the containers list')
+    assert.match(queries[1]!, /runtime_channel = 'v3'/, "容器枚举必须带 runtime_channel='v3'")
+  })
+
   test('happy fanout: rebound → fetch+write+commit per container', async () => {
     _resetInflightFanoutForTest()
     const containers = [11, 22, 33]

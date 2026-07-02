@@ -793,10 +793,13 @@ export async function adminDeleteAccount(
 
   // 决策 B + migration 0054:codex 账号若有 active 容器绑定,先返 409 阻止
   if (before.provider === "codex") {
+    // 0098 channel 划分:删 codex 账号的绑定计数 + force 清绑都只看本 channel(v3)
+    // 容器 —— 否则 v3 admin 删账号会被 v5 active 绑定阻塞、force 还会清掉 v5 非
+    // active 行的 codex_account_id(跨 channel 变更)。
     const activeCount = await query<{ c: string }>(
       `SELECT COUNT(*)::text AS c
        FROM agent_containers
-       WHERE codex_account_id = $1 AND state = 'active'`,
+       WHERE codex_account_id = $1 AND state = 'active' AND runtime_channel = 'v3'`,
       [String(id)],
     );
     const n = Number(activeCount.rows[0]?.c ?? "0");
@@ -809,7 +812,7 @@ export async function adminDeleteAccount(
       await query(
         `UPDATE agent_containers
          SET codex_account_id = NULL
-         WHERE codex_account_id = $1 AND state <> 'active'`,
+         WHERE codex_account_id = $1 AND state <> 'active' AND runtime_channel = 'v3'`,
         [String(id)],
       );
     }

@@ -117,8 +117,10 @@ export async function acquireAndPickInTx(
             ac.host_uuid AS host_uuid
      FROM agent_containers ac
      LEFT JOIN claude_accounts ca ON ca.id = ac.codex_account_id
-     WHERE ac.id = $1
+     WHERE ac.id = $1 AND ac.runtime_channel = 'v3'
      FOR UPDATE OF ac`,
+    // 0098 channel 划分:lazy migrate 用户路径可达,只锁/改本 channel(v3)容器,
+    // 防跨 channel 锁与 rebind(v5 容器归 v5 master)。
     [containerId],
   )
   if (sel.rows.length === 0) return { kind: 'vanished' }
@@ -178,9 +180,11 @@ export async function commitCodexRebindInTx(
   newAccountId: bigint,
 ): Promise<void> {
   await client.query(
+    // 0098 channel 划分:rebind 只写本 channel(v3)容器 —— 与 acquireAndPickInTx
+    // 的锁定条件同口径(防跨 channel 变更)。
     `UPDATE agent_containers
      SET codex_account_id = $1, updated_at = NOW()
-     WHERE id = $2`,
+     WHERE id = $2 AND runtime_channel = 'v3'`,
     [String(newAccountId), containerId],
   )
 }

@@ -429,6 +429,8 @@ export async function getAccountPoolSnapshot(): Promise<AccountPoolSnapshot> {
     banned: string;
     avg_health: string | null;
   }>(
+    // 0098 channel 划分:v3 池快照只统计 v3 权威的行(claude 共享池 + v3 channel
+    // 的 codex),v5 codex 行不进本实例口径。
     `SELECT
        COUNT(*) AS total,
        COUNT(*) FILTER (WHERE status = 'active') AS active,
@@ -436,7 +438,8 @@ export async function getAccountPoolSnapshot(): Promise<AccountPoolSnapshot> {
        COUNT(*) FILTER (WHERE status = 'disabled') AS disabled,
        COUNT(*) FILTER (WHERE status = 'banned') AS banned,
        AVG(health_score)::text AS avg_health
-     FROM claude_accounts`,
+     FROM claude_accounts
+     WHERE NOT (provider = 'codex' AND runtime_channel <> 'v3')`,
   );
 
   const reqRes = await query<{
