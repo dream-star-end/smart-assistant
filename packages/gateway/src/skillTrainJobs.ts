@@ -227,10 +227,10 @@ export class SkillTrainJobStore {
       ev.block.kind === 'text' &&
       typeof ev.block.text === 'string'
     ) {
-      // Keep the latest non-empty text as a rolling summary (truncated).
-      const t = ev.block.text.trim()
+      // parser 发出的 text 是增量片段 —— 累计为 rolling summary(截断)。
+      const t = ev.block.text
       if (t) {
-        run.summary = t.slice(0, 4000)
+        run.summary = `${run.summary ?? ''}${t}`.slice(-4000)
         changed = true
       }
     } else if (ev.kind === 'error') {
