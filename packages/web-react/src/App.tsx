@@ -27,6 +27,14 @@ import { SettingsCenter } from "./components/SettingsCenter";
 import { Sidebar } from "./components/Sidebar";
 import { Alert, Sheet, Spinner, useConfirm, usePrompt } from "./components/ui";
 import { useAgentGate } from "./hooks/useAgentGate";
+import {
+  type PanelParam,
+  parsePanelParam,
+  parseSessionPath,
+  useAppRoute,
+} from "./hooks/useAppRoute";
+import { useAuth } from "./hooks/useAuth";
+import { genWsSessionId, useSessionList } from "./hooks/useSessionList";
 import { type UseChatSocket, useChatSocket } from "./hooks/useChatSocket";
 import { useInbox } from "./hooks/useInbox";
 import { useRepoBinding } from "./hooks/useRepoBinding";
@@ -38,74 +46,11 @@ import type { MediaRef } from "./lib/chat/frames";
 import type { ChatMessage } from "./lib/chat/model";
 import { CONTINUE_PROMPT } from "./lib/chat/render";
 import { DEFAULT_AGENT, agentFromApiRow, type Agent } from "./lib/agents";
-import { ApiError, api } from "./lib/api";
-import type { StoredSession } from "./lib/persist";
+import { api } from "./lib/api";
 import { DEMO_MESSAGES, DEMO_MODELS, DEMO_SESSIONS, DEMO_USER, demoReply } from "./lib/demo";
-import type {
-  AuthSession,
-  Message,
-  PublicConfig,
-  PublicModel,
-  Session,
-  SessionMeta,
-  ToolCard,
-  User,
-} from "./lib/types";
-
-function makeLocalSession(title: string, ownerUserId: string): Session {
-  return {
-    id: `local-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-    title: title || "新对话",
-    ownerUserId,
-    updatedAt: new Date().toISOString(),
-    messageCount: 0,
-  };
-}
-
-/** IndexedDB 注水的 StoredSession → 侧栏 Session（updatedAt 统一 ISO 串，便于排序展示）。*/
-function storedToSession(s: StoredSession, ownerUserId: string): Session {
-  return {
-    id: s.id,
-    title: s.title || "新对话",
-    ownerUserId,
-    updatedAt: new Date(s.updatedAt ?? s.lastAt ?? Date.now()).toISOString(),
-    messageCount: Array.isArray(s.messages) ? s.messages.length : 0,
-  };
-}
-
-/** server canonical SessionMeta（gateway listSessions）→ 侧栏 Session。*/
-function metaToSession(m: SessionMeta, ownerUserId: string): Session {
-  return {
-    id: m.id,
-    title: m.title || "新对话",
-    ownerUserId,
-    updatedAt: new Date(m.updatedAt ?? m.lastAt ?? Date.now()).toISOString(),
-    messageCount: m.messageCount ?? 0,
-  };
-}
-
-/**
- * 合并侧栏会话：union by id，按 updatedAt 倒序。`incomingWins` 决定重叠项谁覆盖元数据
- * （listSessions=server-wins=true；IndexedDB 注水=本地不覆盖既有=false）。
- */
-function upsertSessions(cur: Session[], incoming: Session[], incomingWins: boolean): Session[] {
-  const map = new Map<string, Session>();
-  for (const s of cur) map.set(s.id, s);
-  for (const s of incoming) {
-    const prev = map.get(s.id);
-    map.set(s.id, prev ? (incomingWins ? { ...prev, ...s } : { ...s, ...prev }) : s);
-  }
-  return [...map.values()].sort((a, b) =>
-    a.updatedAt < b.updatedAt ? 1 : a.updatedAt > b.updatedAt ? -1 : 0,
-  );
-}
+import type { Message, PublicConfig, PublicModel, Session, ToolCard } from "./lib/types";
 
 const EMPTY_WS_MESSAGES: ChatMessage[] = [];
-
-/** WS 会话 id（peer.id）：须匹配后端 `[A-Za-z0-9_-]{8,50}`。*/
-function genWsSessionId(): string {
-  return `web${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
-}
 
 export function App() {
   const params = new URLSearchParams(location.search);
@@ -116,30 +61,28 @@ export function App() {
     !demo && location.pathname === "/reset-password"
       ? params.get("token") || undefined
       : undefined;
-  // access token 仅存内存,刷新即丢;但 refresh token 在 HttpOnly cookie 里 —— 启动先做
-  // 一次静默续期(booting 态),成功直接恢复工作区,失败才落首页/登录。商业产品每次 F5
-  // 都要密码+人机验证是致命流失点;IndexedDB"reload 不丢会话"的投入也靠这条腿才有意义。
+  // P7 最小路由（无路由库）：demo / reset-password 特判不启用。boot 时一次性解析
+  // URL 深链（会话 /s/<id> + 面板 ?panel=），此后 URL 是状态的 replaceState 单向镜像。
+  const routingEnabled = !demo && !resetToken;
+  const bootPanel = routingEnabled ? parsePanelParam(params) : null;
+  // 会话深链恢复未决标记：resolve 前 useSessionList 暂停"自动选中上次会话"
+  // （URL 指定 > 最近会话）；resolve/放弃后置 null。
+  const [pendingRouteSession, setPendingRouteSession] = useState<string | null>(() =>
+    routingEnabled ? parseSessionPath(location.pathname) : null,
+  );
+  // 视图态：home=营销首页,app=登录页/工作区。启动静默续期成功（useAuth onBootAuthed）
+  // 直接置 app,失败停在 home。
   const [view, setView] = useState<"home" | "app">(resetToken ? "app" : "home");
-  // demo/重置链接跳过静默续期(重置场景用户就是要走 reset 流程,不劫持进工作区)。
-  const [booting, setBooting] = useState(!demo && !resetToken);
   // AuthGate 初始模式：「登录」入口=login，「免费开始」入口=register，重置链接=reset。
   const [authMode, setAuthMode] = useState<AuthMode>(resetToken ? "reset" : "login");
   // 主题的唯一权威源：useTheme 是「挂载读 localStorage」的单实例，经 props 下传给顶栏快捷开关
   // 与设置中心「偏好·外观」分区，二者共享同一状态——杜绝多个 useTheme 实例各自镜像、互不同步。
   const { theme, setTheme, cycle } = useTheme();
 
-  // access token 仅存内存：放在 ref 里作为唯一权威源，AuthSession.getToken/setToken 读写它，
-  // 静默刷新成功后 api 层直接回写 ref，下一次鉴权请求即拿到新 token（无 stale 闭包）。
-  const tokenRef = useRef<string | null>(null);
-  const [authed, setAuthed] = useState(false);
-  const [user, setUser] = useState<User | null>(demo ? DEMO_USER : null);
-  const [authLoading, setAuthLoading] = useState(false);
-  const [authError, setAuthError] = useState<string | null>(null);
   // 公开配置（Turnstile bypass / site key）：登录页驱动 AuthGate 是否渲染真 widget。
   const [publicCfg, setPublicCfg] = useState<PublicConfig | null>(null);
 
-  const [sessions, setSessions] = useState<Session[]>(demo ? DEMO_SESSIONS : []);
-  const [activeId, setActiveId] = useState<string | undefined>(demo ? DEMO_SESSIONS[0].id : undefined);
+  // demo 展示消息（本地 fixture 流式回放用；非 demo 的消息权威在 WS service）。
   const [messages, setMessages] = useState<Message[]>(demo ? DEMO_MESSAGES : []);
   const [busy, setBusy] = useState(false);
   const [streamText, setStreamText] = useState("");
@@ -163,12 +106,14 @@ export function App() {
   const [modelId, setModelId] = useState<string | undefined>(demo ? DEMO_MODELS[0]?.id : undefined);
   const [modelsLoading, setModelsLoading] = useState(false);
   const [chatError, setChatError] = useState<ChatError | null>(null);
-  const [settingsOpen, setSettingsOpen] = useState(false);
+  // 面板深链：boot 读到 ?panel= 即以打开态初始化（工作区渲染后即呈现；未登录深链则
+  // 登录后呈现）。打开/关闭经 useAppRoute 同步回 query。
+  const [settingsOpen, setSettingsOpen] = useState(bootPanel === "settings");
   const [inboxOpen, setInboxOpen] = useState(false);
   const [repoModalOpen, setRepoModalOpen] = useState(false);
-  const [manageOpen, setManageOpen] = useState(false);
+  const [manageOpen, setManageOpen] = useState(bootPanel === "manage");
   const [manageTab, setManageTab] = useState<ManageTab>("memory");
-  const [marketplaceOpen, setMarketplaceOpen] = useState(false);
+  const [marketplaceOpen, setMarketplaceOpen] = useState(bootPanel === "market");
   const [marketplaceTab, setMarketplaceTab] = useState<MarketplaceTab>("browse");
   const [marketplaceBrowseKind, setMarketplaceBrowseKind] = useState<MarketplaceKind>("skill");
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -187,45 +132,57 @@ export function App() {
 
   // 本地会话消息存储（脚手架，仅 demo 路径用）：activeId → 消息数组。非 demo 走 WS + IndexedDB。
   const localStore = useRef<Map<string, Message[]>>(new Map());
-  // 已拉过 server 历史的会话 id（防 selectSession 每次都重拉；404 的本地会话也记入）。
-  const historyFetchedRef = useRef<Set<string>>(new Set());
-  // 登录后是否已自动选中"上次会话"（仅做一次：避免覆盖用户随后的显式新建/切换/删除）。
-  const autoSelectedRef = useRef(false);
-  // 当前登录 user id 的实时镜像：异步历史请求 await 后比对，防登出/换号后 stale 响应
-  // 把上一个用户的历史污染进单例 WS service / 写进新用户的 IndexedDB 命名空间（隐私）。
-  const userIdRef = useRef<string | null>(null);
-  userIdRef.current = user?.id ?? null;
-
-  // 清空全部鉴权 + 会话状态，回到登录/首页（静默刷新失败或主动登出都走这里）。
-  const clearAuth = useCallback(() => {
-    tokenRef.current = null;
-    localStore.current.clear();
-    historyFetchedRef.current.clear();
-    autoSelectedRef.current = false; // 下次登录重新自动选中最近会话
-    setAuthed(false);
-    setUser(null);
-    setSessions([]);
-    setMessages([]);
-    setActiveId(undefined);
-    setChatError(null);
-    setSettingsOpen(false);
-    setView("home");
-  }, []);
-
-  // AuthSession：access token 的唯一权威源（仅存内存）。整个生命周期复用同一引用，
-  // 传给 api.* 的鉴权请求；命中 401 时 api 内部透明刷新并 setToken 回写本 ref。
-  // onExpired 在刷新失败时触发 → clearAuth 把用户带回登录页（绝不循环重试）。
-  const authRef = useRef<AuthSession>({
-    getToken: () => tokenRef.current ?? "",
-    setToken: (t) => {
-      tokenRef.current = t;
+  // 会话列表域整体重置的稳定间接：useSessionList 在 useAuth 之后调用（需要 auth/user），
+  // clearAuth/登录成功的会话收尾经本 ref 回填（与 sockRef 同款 TDZ 规避）。
+  const sessionsResetRef = useRef<() => void>(() => {});
+  // 鉴权状态机整体收口在 useAuth（access token 内存唯一权威源 / 启动静默续期 / 登录·注册·
+  // 找回密码 / 登出 / refreshMe）。chat 域收尾经回调注入 —— auth 域不反向依赖 chat 域；
+  // 回调在 hook 内经 ref 镜像读最新版本,此处传每渲染新闭包不影响其内部引用稳定性。
+  const {
+    auth,
+    authRef: authSessionRef,
+    authed,
+    user,
+    authLoading,
+    authError,
+    booting,
+    login,
+    register,
+    verifyEmail,
+    resendVerification,
+    requestReset,
+    confirmReset,
+    logout,
+    refreshMe,
+  } = useAuth({
+    demo,
+    resetToken,
+    initialUser: demo ? DEMO_USER : null,
+    // auth 清空（静默刷新失败或主动登出）→ 清会话/消息/面板态,回首页。
+    onClearAuth: () => {
+      localStore.current.clear();
+      sessionsResetRef.current(); // 清列表/选中/已拉历史标记,允许下次登录重新自动选中
+      setMessages([]);
+      setChatError(null);
+      setSettingsOpen(false);
+      setView("home");
     },
-    onExpired: () => clearAuth(),
+    // 登出前清本 user 的 IndexedDB 命名空间（隐私，类比 P5 媒体缓存按 authKey 失效）。
+    onLogout: () => void sockRef.current?.wipePersistence(),
+    // 启动静默续期成功 → 直接恢复工作区。
+    onBootAuthed: () => setView("app"),
+    // 登录成功不预载会话：由 useChatSocket IndexedDB 注水（onHydrated）+ listSessions
+    // 合并 server canonical 列表填侧栏；selectSession 再按需拉取单会话历史。
+    onLoginSuccess: () => {
+      sessionsResetRef.current();
+      setMessages([]);
+    },
   });
-  // clearAuth 每次渲染可能是新引用；让 session.onExpired 始终指向最新版本。
-  authRef.current.onExpired = clearAuth;
-  // 仅当已认证时把 session 暴露给业务逻辑；未认证时为 null。P3/P4 的 REST/WS 调用消费它。
-  const auth = authed ? authRef.current : null;
+
+  // AuthSession 整个生命周期是同一引用（见 useAuth：useRef 初始化后仅就地改 onExpired）。
+  // 经本地 useRef 再持有一次以保留 biome 的稳定 ref 推断 —— 直接使用 hook 返回的 ref 会在
+  // 多处 useCallback/useEffect 误报 useExhaustiveDependencies（lint 只认本地 useRef 为稳定）。
+  const authRef = useRef(authSessionRef.current);
 
   const interrupt = useCallback(() => {
     stopRef.current = true;
@@ -234,173 +191,49 @@ export function App() {
     setChatError(null);
   }, []);
 
-  const login = useCallback(async (email: string, password: string, turnstileToken: string) => {
-    setAuthLoading(true);
-    setAuthError(null);
-    try {
-      // 服务端 /api/auth/login schema 必填 turnstile_token。turnstileToken 由 AuthGate 给出：
-      // canary（turnstile_bypass:true）发占位 'bypass'（服务端接受任意串）；生产（bypass 关闭）
-      // 为真实 Cloudflare Turnstile widget 的 onSuccess token。canary 登录行为不变。
-      // 登录拿到内存态 accessToken + 用户信息；token 只写进 tokenRef（内存），绝不落地。
-      // refresh token 由后端通过 HttpOnly cookie 下发（api.login credentials:'include'）。
-      const { accessToken, user: me } = await api.login(email, password, turnstileToken);
-      tokenRef.current = accessToken;
-      setAuthed(true);
-      setUser(me);
-      // 不在此预载会话：登录后由 useChatSocket 从 IndexedDB 注水（onHydrated）+ listSessions
-      // 合并 server canonical 列表填侧栏；selectSession 再按需拉取单会话历史。
-      setSessions([]);
-      setActiveId(undefined);
+  // 侧栏会话列表域整体收口在 useSessionList（列表权威合并 / 按需拉历史 / 自动选中上次会话 /
+  // rename·delete 三持有方收口）。UI 对话框与 chat 展示态经回调注入（hook 内 ref 镜像读最新，
+  // 此处传每渲染新闭包不影响其 selectSession/newSession 的依赖面）。
+  const {
+    sessions,
+    setSessions,
+    activeId,
+    setActiveId,
+    selectSession,
+    newSession,
+    onHydrated,
+    renameSessionPrompt,
+    deleteSessionConfirm,
+    reset: resetSessionList,
+    serverListSettled,
+  } = useSessionList({
+    demo,
+    auth,
+    authSession: authRef.current,
+    user,
+    agentId: agent.id,
+    sockRef,
+    confirmDialog,
+    promptText,
+    clearChatError: () => setChatError(null),
+    // demo：切会话时换本地 fixture 消息。
+    onDemoSelect: (id) => setMessages(id === DEMO_SESSIONS[0].id ? DEMO_MESSAGES : []),
+    // 新建会话：停 demo 流式回放 + 清空展示消息 + 清错误（原 newSession 前置收尾）。
+    onNewSessionReset: () => {
+      interrupt();
       setMessages([]);
-    } catch (e) {
-      setAuthError((e as Error).message || "登录失败");
-    } finally {
-      setAuthLoading(false);
-    }
-  }, []);
-
-  // 启动静默续期:凭同源 HttpOnly refresh cookie 换 access token → getMe 恢复用户。
-  // api.refresh() 失败恒返 null(绝不抛),无 cookie 时开销一次 401 往返。仅挂载跑一次。
-  useEffect(() => {
-    if (!booting) return;
-    let cancelled = false;
-    void (async () => {
-      const r = await api.refresh();
-      // accessToken 必须真实存在:200 但空 body(异常网关/mock)不算有会话,防半开登录态。
-      if (!r?.accessToken) {
-        if (!cancelled) setBooting(false);
-        return;
-      }
-      tokenRef.current = r.accessToken;
-      try {
-        const me = await api.getMe(authRef.current);
-        if (cancelled) return;
-        setUser(me);
-        setAuthed(true);
-        setView("app");
-      } catch {
-        // token 换到了但 getMe 失败(瞬时网络/服务端抖动):不半开登录态,回首页手动登录。
-        tokenRef.current = null;
-      } finally {
-        if (!cancelled) setBooting(false);
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
-    // booting 仅由本 effect 置 false,等效"挂载跑一次"。
-  }, [booting]);
-
-  // 注册 / 邮箱验证 / 找回密码：透传到 api（错误为带友好中文 message 的 ApiError，AuthGate 自捕展示）。
-  const register = useCallback(
-    (input: { email: string; password: string; displayName?: string; turnstileToken: string }) =>
-      api
-        .register({
-          email: input.email,
-          password: input.password,
-          displayName: input.displayName,
-          turnstileToken: input.turnstileToken,
-        })
-        .then((r) => ({ verifyEmailSent: r.verifyEmailSent })),
-    [],
-  );
-  const verifyEmail = useCallback(
-    (email: string, code: string) => api.verifyEmail(email, code).then(() => undefined),
-    [],
-  );
-  const resendVerification = useCallback(
-    (email: string) => api.resendVerification(email).then(() => undefined),
-    [],
-  );
-  const requestReset = useCallback(
-    (email: string, token: string) => api.requestPasswordReset(email, token).then(() => undefined),
-    [],
-  );
-  const confirmReset = useCallback(
-    (token: string, newPassword: string) =>
-      api.confirmPasswordReset(token, newPassword).then(() => undefined),
-    [],
-  );
-
-  // IndexedDB 注水回调：把本地会话填进侧栏（本地优先；随后 listSessions server-wins 覆盖元数据）。
-  const onHydrated = useCallback(
-    (stored: StoredSession[]) => {
-      const owner = user?.id;
-      if (!owner || stored.length === 0) return;
-      const local = stored.map((s) => storedToSession(s, owner));
-      setSessions((cur) => upsertSessions(cur, local, false));
-    },
-    [user],
-  );
-
-  // 按需拉取单会话 server canonical 历史并合并进 WS service（server-wins / id 幂等）。
-  // 经稳定 sockRef 调用历史方法，避免依赖每帧重建的 chat 引用。
-  const loadHistory = useCallback(
-    async (id: string) => {
-      const owner = userIdRef.current;
-      if (!auth || !owner) return;
-      if (historyFetchedRef.current.has(id)) return;
-      historyFetchedRef.current.add(id);
-      try {
-        const sinceSeq = sockRef.current?.storedMaxSeq(id) ?? 0;
-        const detail = await api.getSession(authRef.current, id, sinceSeq);
-        // 登出/换号守卫：await 期间用户已变 → 丢弃，绝不污染当前会话/新用户 IndexedDB。
-        if (userIdRef.current !== owner) return;
-        const msgs = Array.isArray(detail.messages) ? (detail.messages as ChatMessage[]) : [];
-        sockRef.current?.mergeServerHistory({
-          sessId: id,
-          agentId: detail.agentId || agent.id,
-          messages: msgs,
-          full: !detail.isPartial,
-          maxSeq: detail.maxSeq,
-        });
-      } catch (e) {
-        // 404 = 本地新建/未同步会话，无 server 历史（正常）；其他错误允许下次重选重试。
-        if (!(e instanceof ApiError && e.status === 404)) historyFetchedRef.current.delete(id);
-      }
-    },
-    [auth, agent.id],
-  );
-
-  const selectSession = useCallback(
-    (id: string) => {
-      if (id === activeId) return;
       setChatError(null);
-      setActiveId(id);
-      if (demo) {
-        setMessages(id === DEMO_SESSIONS[0].id ? DEMO_MESSAGES : []);
-        return;
-      }
-      // 非 demo：消息来自 WS service 快照；选中后按需拉 server 历史合并（本地已注水的直接展示）。
-      void loadHistory(id);
     },
-    [activeId, demo, loadHistory],
-  );
-
-  const newSession = useCallback(() => {
-    interrupt();
-    setMessages([]);
-    setChatError(null);
-    if (demo) {
-      const s = makeLocalSession("新对话", "demo");
-      setSessions((c) => [s, ...c]);
-      setActiveId(s.id);
-      return;
-    }
-    if (!user) return;
-    // 非 demo：新建一个 WS 会话占位（peer.id 用真实 id），socket 侧在首次 send 时
-    // 惰性 ensureSession —— 空会话不必提前占用 service 槽位。
-    const id = genWsSessionId();
-    const s: Session = {
-      id,
-      title: "新对话",
-      ownerUserId: user.id,
-      updatedAt: new Date().toISOString(),
-      messageCount: 0,
-    };
-    setSessions((c) => [s, ...c]);
-    setActiveId(id);
-  }, [demo, user, interrupt]);
+    onDeleteSession: (id) => localStore.current.delete(id),
+    onActiveSessionDeleted: () => {
+      setMessages([]);
+      setChatError(null);
+    },
+    // URL 深链恢复未决：暂停自动选中（URL 指定 > 最近会话）。
+    holdAutoSelect: pendingRouteSession !== null,
+  });
+  // 回填给 useAuth 的 chat 域收尾（onClearAuth/onLoginSuccess 经 sessionsResetRef 调用）。
+  sessionsResetRef.current = resetSessionList;
 
   const send = useCallback(
     async (text: string, media?: MediaRef[]) => {
@@ -477,7 +310,9 @@ export function App() {
       });
     },
     // teamMode 必须在依赖里:否则 memoized send 闭包捕获初始 false,用户开开关后仍发 false(Codex 审)。
-    [activeId, demo, user, agent, modelId, teamMode],
+    // setSessions/setActiveId 是 useSessionList 透传的 useState dispatcher(恒稳定),入 deps
+    // 仅为满足 lint(跨 hook 返回值 biome 不再推断稳定性),不改变 send 的重建时机。
+    [activeId, demo, user, agent, modelId, teamMode, setSessions, setActiveId],
   );
 
   // 上传单文件 → MediaRef（kind 以服务端 mimeType 为准，退回 file.type）。供 Composer 附件。
@@ -517,28 +352,6 @@ export function App() {
       }
     }
   }, [demo, messages, activeId, send]);
-
-  const logout = useCallback(() => {
-    // 先请求后端吊销 refresh cookie（错误已在 api 层吞掉），并清本 user 的 IndexedDB
-    // 命名空间（隐私，类比 P5 媒体缓存按 authKey 失效），再清空内存态回到首页。
-    if (!demo) {
-      void api.logout();
-      void sockRef.current?.wipePersistence();
-    }
-    clearAuth();
-  }, [demo, clearAuth]);
-
-  // 刷新账户余额（GET /api/me）：充值到账 / 打开计费面板后调用，让顶栏 balance-pill
-  // 与账户分区拿到权威 credits（字符串大数，原样存进 user）。失败静默（401 会触发 onExpired）。
-  const refreshMe = useCallback(async () => {
-    if (demo || !authed) return;
-    try {
-      const me = await api.getMe(authRef.current);
-      setUser(me);
-    } catch {
-      /* 刷新失败静默：余额停留在上次已知值，不打断当前操作 */
-    }
-  }, [demo, authed]);
 
   // 打开设置中心并顺带刷新余额（顶栏 pill / 侧栏 / AgentGate 充值入口统一走此）。
   const openSettings = useCallback(() => {
@@ -687,40 +500,6 @@ export function App() {
   repoStatusHandlerRef.current = repo.onRepoStatus;
   repoBindErrorHandlerRef.current = repo.onRepoBindError;
 
-  // 历史会话列表：登录后用 listSessions 填侧栏（server canonical 元数据 server-wins）。
-  // 失败保留本地（IndexedDB 注水）会话，不阻断。
-  useEffect(() => {
-    if (demo || !auth || !user) return;
-    let cancelled = false;
-    api
-      .listSessions(authRef.current)
-      .then((metas) => {
-        if (cancelled) return;
-        const server = metas.map((m) => metaToSession(m, user.id));
-        setSessions((cur) => upsertSessions(cur, server, true));
-      })
-      .catch(() => {
-        /* 列表失败：保留本地会话，不打断工作区 */
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [demo, auth, user]);
-
-  // 登录后自动恢复"上次会话"：侧栏（IndexedDB 注水 / listSessions）填好且用户尚未选任何会话时，
-  // 选中最近一条（sessions 已按 updatedAt 倒序，[0]=最近）。仅做一次（autoSelectedRef）——
-  // 之后用户的新建/切换/删除都不被覆盖。修复"每次登录都默认开新会话"。
-  useEffect(() => {
-    if (demo || !auth) return;
-    if (autoSelectedRef.current) return;
-    if (activeId !== undefined) {
-      autoSelectedRef.current = true; // 用户已自行选中 → 标记完成，不再自动接管
-      return;
-    }
-    if (sessions.length === 0) return;
-    autoSelectedRef.current = true;
-    selectSession(sessions[0].id);
-  }, [demo, auth, activeId, sessions, selectSession]);
   // agent 归属单一权威 = 活动会话的 sess.agentId。此前"当前 agent"是独立全局态,切会话
   // 不 reconcile → 在会话 A 切到编程助手后选中旧会话 B(agentId=main),header/send 显示
   // 编程助手而 sess.agentId 仍是 main:stopTurn/hello 续传游标用错 agent(停止停不掉本轮)、
@@ -858,6 +637,33 @@ export function App() {
     return () => window.removeEventListener("keydown", onKey);
   }, [inWorkspace, sending, newSession, stopTurn]);
 
+  // ── P7 最小路由接线：URL 单向镜像（会话路径 + 面板 query）/ popstate / 深链恢复 ──
+  // 面板深链单选优先级：settings > market > manage（同时开多个时 URL 反映最先者）。
+  const activePanel: PanelParam | null = settingsOpen
+    ? "settings"
+    : marketplaceOpen
+      ? "market"
+      : manageOpen
+        ? "manage"
+        : null;
+  useAppRoute({
+    enabled: routingEnabled,
+    inWorkspace,
+    activeId,
+    sessions,
+    serverListSettled,
+    pendingSessionId: pendingRouteSession,
+    clearPendingSession: () => setPendingRouteSession(null),
+    selectSession,
+    // popstate 回 "/"：清选中回空会话态（与删除当前会话的展示收尾一致）。
+    onPopToRoot: () => {
+      setActiveId(undefined);
+      setMessages([]);
+      setChatError(null);
+    },
+    activePanel,
+  });
+
   // 启动续期检查中:极简 splash(避免"闪一下首页又跳工作区"的割裂;通常 <300ms)。
   if (!demo && booting) {
     return (
@@ -918,42 +724,7 @@ export function App() {
   const modelFooter = selectedModel ? modelLabel(selectedModel) : agent.name;
 
   // 侧栏公共 props：桌面内联与移动抽屉两处复用。余额（balanceCents）本期不展示（P3.5 计费中心）。
-  // rename 一次收口三个持有方:App state(侧栏)+ WS service/IndexedDB + 服务端 canonical。
-  // 此前只改 App state → listSessions server-wins 下次直接盖回旧标题(纯本地幻觉)。
-  const renameSessionPrompt = async (s: Session) => {
-    const t = (await promptText({ title: "重命名会话", initial: s.title }))?.trim();
-    if (!t || t === s.title) return;
-    setSessions((c) => c.map((x) => (x.id === s.id ? { ...x, title: t } : x)));
-    if (!demo) {
-      chat.renameSession(s.id, t);
-      void api.patchSessionTitle(authRef.current, s.id, t).catch(() => {
-        /* 服务端失败:本地已改,下次 listSessions server-wins 盖回旧值,用户可重试;不打断 */
-      });
-    }
-  };
-  const deleteSessionConfirm = async (s: Session) => {
-    const ok = await confirmDialog({
-      title: "删除该会话?",
-      body: `「${s.title || "新对话"}」的本地与云端记录都将删除,不可恢复。`,
-      confirmText: "删除",
-      danger: true,
-    });
-    if (!ok) return;
-    localStore.current.delete(s.id);
-    historyFetchedRef.current.delete(s.id);
-    if (!demo) {
-      chat.removeSession(s.id);
-      chat.removePersisted(s.id); // 清 IndexedDB 本地副本
-      // 服务端删除（幂等，best-effort）：否则 reload 后会从 listSessions 复活。
-      void api.deleteSession(authRef.current, s.id).catch(() => {});
-    }
-    setSessions((c) => c.filter((x) => x.id !== s.id));
-    if (s.id === activeId) {
-      setActiveId(undefined);
-      setMessages([]);
-      setChatError(null);
-    }
-  };
+  // rename/delete 的数据收口（三持有方）在 useSessionList。
   const sidebarProps = {
     sessions,
     activeId,

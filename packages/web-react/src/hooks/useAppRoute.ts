@@ -1,0 +1,114 @@
+import { useEffect, useRef } from "react";
+import type { Session } from "../lib/types";
+
+/**
+ * P7 —— 最小路由（无路由库，自写）：URL 是 App 状态的**单向 replaceState 镜像**，
+ * 外加 popstate 监听把浏览器导航反灌回状态。刻意不引入 pushState 历史栈管理 ——
+ * v5 的会话切换高频且轻量，replaceState 语义（当前入口可链接、可刷新恢复、可分享）
+ * 已覆盖诉求，且绝不劫持浏览器后退（后退=离开应用或回到进入前的入口）。
+ *
+ * 规则：
+ * - 选中会话 → `/s/<id>`；无选中 / 新建的空会话（尚无消息的 draft，链接无分享意义）/
+ *   删除当前会话 → `/`。
+ * - 启动深链 `/s/<id>`：进工作区后等会话出现在侧栏（IndexedDB 注水或 listSessions 到达）
+ *   再 selectSession；listSessions 落定仍不存在 → 放弃并回 `/`（随后"自动选中上次会话"
+ *   恢复正常判定）。恢复未决期间 URL 深链优先于最近会话（holdAutoSelect）。
+ * - popstate：按 URL 切会话（/s/<id> → selectSession；/ → 清选中回空会话态）。
+ * - 面板深链 `?panel=settings|market|manage`：boot 由 App 在 useState 初始化时读取
+ *   （parsePanelParam），打开/关闭经本 hook replaceState 同步回 query。
+ * - demo / reset-password 特判不启用（enabled=false，URL 原样保留）。
+ */
+export type PanelParam = "settings" | "market" | "manage";
+
+/** `/s/<id>` → 会话 id（形态对齐后端 peer.id 约束 `[A-Za-z0-9_-]`；不匹配返回 null）。 */
+export function parseSessionPath(pathname: string): string | null {
+  const m = /^\/s\/([A-Za-z0-9_-]{1,64})$/.exec(pathname);
+  return m ? m[1] : null;
+}
+
+/** `?panel=` → 面板名（未知值一律当没有，防深链打开不存在的面板）。 */
+export function parsePanelParam(sp: URLSearchParams): PanelParam | null {
+  const v = sp.get("panel");
+  return v === "settings" || v === "market" || v === "manage" ? v : null;
+}
+
+export type UseAppRouteOptions = {
+  /** 非 demo 且非 reset-password 时启用。 */
+  enabled: boolean;
+  /** 已进入工作区（auth+user 就绪）：深链恢复与 popstate 只在工作区内生效。 */
+  inWorkspace: boolean;
+  activeId: string | undefined;
+  sessions: Session[];
+  /** listSessions 已落定（useSessionList）：判定深链会话"确实不存在"的依据。 */
+  serverListSettled: boolean;
+  /** 启动深链 `/s/<id>` 的未决恢复目标（App 持有该 state 以同步暂停自动选中）。 */
+  pendingSessionId: string | null;
+  clearPendingSession: () => void;
+  selectSession: (id: string) => void;
+  /** popstate 回到 `/`：清除选中（回空会话态）。 */
+  onPopToRoot: () => void;
+  /** 当前打开的面板（App 派生；同开多个时取单一优先级 settings > market > manage）。 */
+  activePanel: PanelParam | null;
+};
+
+export function useAppRoute(opts: UseAppRouteOptions): void {
+  const { enabled, inWorkspace, activeId, sessions, serverListSettled, pendingSessionId } = opts;
+  const { activePanel } = opts;
+  // 回调/最新值经 ref 镜像（App 每渲染传新闭包；popstate 监听只挂一次仍读最新）。
+  const cbRef = useRef(opts);
+  cbRef.current = opts;
+
+  // popstate：浏览器后退/前进 → URL 为权威反灌状态。仅工作区内响应（登录页/首页的
+  // 历史导航不该操作会话态）。
+  useEffect(() => {
+    if (!enabled) return;
+    const onPop = () => {
+      if (!cbRef.current.inWorkspace) return;
+      const id = parseSessionPath(location.pathname);
+      if (id) cbRef.current.selectSession(id);
+      else if (location.pathname === "/") cbRef.current.onPopToRoot();
+    };
+    window.addEventListener("popstate", onPop);
+    return () => window.removeEventListener("popstate", onPop);
+  }, [enabled]);
+
+  // 启动深链恢复：等目标会话出现（IndexedDB 注水或 listSessions 到达）再选中；
+  // listSessions 落定仍不存在 → 放弃（URL 由下方镜像 effect 回写 `/`，自动选中随之解锁）。
+  useEffect(() => {
+    if (!enabled || !inWorkspace || !pendingSessionId) return;
+    if (sessions.some((s) => s.id === pendingSessionId)) {
+      cbRef.current.clearPendingSession();
+      cbRef.current.selectSession(pendingSessionId);
+    } else if (serverListSettled) {
+      cbRef.current.clearPendingSession();
+    }
+  }, [enabled, inWorkspace, pendingSessionId, sessions, serverListSettled]);
+
+  // activeId → URL 路径（replaceState 单向镜像）。空会话 draft（列表里 messageCount=0，
+  // 典型为「新建会话」尚未首发）不占 URL —— 首次发送后计数>0 自然落 /s/<id>；
+  // popstate 到侧栏没有的 id 时列表查不到 → 不视作 draft，URL 保持用户所到之处。
+  const activeEntry = activeId ? sessions.find((s) => s.id === activeId) : undefined;
+  const isEmptyDraft = activeEntry !== undefined && activeEntry.messageCount === 0;
+  const wantPath = activeId && !isEmptyDraft ? `/s/${activeId}` : "/";
+  useEffect(() => {
+    if (!enabled) return;
+    // 深链恢复未决：不回写（否则把 URL 里的 /s/<id> 冲成当前空态的 /）。
+    if (pendingSessionId) return;
+    if (location.pathname === wantPath) return;
+    history.replaceState({}, "", wantPath + location.search + location.hash);
+  }, [enabled, pendingSessionId, wantPath]);
+
+  // 面板 → ?panel= query（replaceState；关闭时清参数）。不限工作区：未登录携带
+  // ?panel= 深链时面板 state 已在 App 初始化为打开（进工作区即呈现），此 effect 恰好
+  // no-op 保参；登出后面板关闭 → 参数即时清理。
+  useEffect(() => {
+    if (!enabled) return;
+    const sp = new URLSearchParams(location.search);
+    const cur = parsePanelParam(sp);
+    if (cur === activePanel) return;
+    if (activePanel) sp.set("panel", activePanel);
+    else sp.delete("panel");
+    const q = sp.toString();
+    history.replaceState({}, "", location.pathname + (q ? `?${q}` : "") + location.hash);
+  }, [enabled, activePanel]);
+}

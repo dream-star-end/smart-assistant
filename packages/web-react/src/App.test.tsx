@@ -431,3 +431,140 @@ describe('Aurora v5 — P6 历史会话加载', () => {
     await waitFor(() => expect(screen.getByText('历史答复正文')).toBeInTheDocument())
   })
 })
+
+// ---------------------------------------------------------------------------
+// P7 最小路由（无路由库）：会话可链接（/s/<id> replaceState 镜像）、boot 深链恢复
+// （URL 指定 > 最近会话）、popstate 切会话、面板深链（?panel=settings|market|manage）。
+// ---------------------------------------------------------------------------
+// 两个历史会话：乙（webother02）updatedAt 更新 = "最近会话"，甲（webhist01）较旧。
+const HIST_META_TWO = {
+  sessions: [
+    {
+      id: 'webother02',
+      agentId: 'main',
+      title: '更近的会话乙',
+      pinned: false,
+      createdAt: 3,
+      lastAt: 4,
+      messageCount: 1,
+      updatedAt: 4,
+    },
+    {
+      id: 'webhist01',
+      agentId: 'main',
+      title: '历史会话甲',
+      pinned: false,
+      createdAt: 1,
+      lastAt: 2,
+      messageCount: 1,
+      updatedAt: 2,
+    },
+  ],
+}
+const OTHER_DETAIL = {
+  ...HIST_DETAIL,
+  id: 'webother02',
+  title: '更近的会话乙',
+  messages: [{ id: 'mm2', role: 'assistant', text: '乙会话正文', ts: 3 }],
+}
+
+/** boot 静默续期成功 + 双历史会话的路由用 fetch mock。 */
+function routedFetchTwoSessions() {
+  return vi.fn(async (url: string) => {
+    const u = String(url)
+    if (u.includes('/api/auth/refresh')) return REFRESH_OK
+    if (u.includes('/api/public/models')) return okJson(MODELS)
+    if (u.includes('/api/sessions/list')) return okJson(HIST_META_TWO)
+    if (u.includes('/api/sessions/webhist01')) return okJson(HIST_DETAIL)
+    if (u.includes('/api/sessions/webother02')) return okJson(OTHER_DETAIL)
+    if (u.includes('/api/agent/status')) return okJson(AGENT_READY)
+    if (u.includes('/api/me'))
+      return okJson({ user: { id: 'u1', email: 'a@b.com', role: 'user', display_name: 'Alice', credits: '300' } })
+    return okJson({})
+  }) as unknown as FetchMock
+}
+
+describe('Aurora v5 — P7 最小路由', () => {
+  test('boot 恢复 /s/<id>：URL 指定的会话优先于"最近会话"自动选中', async () => {
+    // 深链到较旧的甲：若按"最近会话"逻辑会选中乙 —— 本用例锁定 URL 指定 > 最近会话。
+    window.history.replaceState({}, '', '/s/webhist01')
+    fetchMock = routedFetchTwoSessions()
+    vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
+
+    render(<App />)
+    await waitFor(() => expect(screen.getByText('历史答复正文')).toBeInTheDocument())
+    expect(window.location.pathname).toBe('/s/webhist01')
+    // 乙没有被自动选中拉历史（深链恢复期间自动选中被暂停，之后 activeId 已有值不再接管）。
+    expect(
+      fetchMock.mock.calls.some(([u]) => String(u).includes('/api/sessions/webother02')),
+    ).toBe(false)
+  })
+
+  test('boot 深链会话不存在：listSessions 落定后回落，自动选中最近会话', async () => {
+    window.history.replaceState({}, '', '/s/nosuchsession99')
+    fetchMock = routedFetchTwoSessions()
+    vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
+
+    render(<App />)
+    // 放弃深链（瞬间回 /）后"自动选中上次会话"解锁 → 选中最近的乙，URL 镜像之。
+    await waitFor(() => expect(screen.getByText('乙会话正文')).toBeInTheDocument())
+    await waitFor(() => expect(window.location.pathname).toBe('/s/webother02'))
+  })
+
+  test('popstate：按 URL 切会话（后退/前进）', async () => {
+    fetchMock = routedFetchTwoSessions()
+    vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
+
+    render(<App />)
+    // 自动选中最近会话乙，URL 镜像 /s/webother02。
+    await waitFor(() => expect(screen.getByText('乙会话正文')).toBeInTheDocument())
+    await waitFor(() => expect(window.location.pathname).toBe('/s/webother02'))
+
+    // 模拟浏览器后退/前进：URL 变为 /s/webhist01 并派发 popstate。
+    await act(async () => {
+      window.history.replaceState({}, '', '/s/webhist01')
+      window.dispatchEvent(new PopStateEvent('popstate'))
+    })
+    await waitFor(() => expect(screen.getByText('历史答复正文')).toBeInTheDocument())
+    expect(window.location.pathname).toBe('/s/webhist01')
+
+    // popstate 回 /：清选中回空会话态。
+    await act(async () => {
+      window.history.replaceState({}, '', '/')
+      window.dispatchEvent(new PopStateEvent('popstate'))
+    })
+    await waitFor(() => expect(window.location.pathname).toBe('/'))
+  })
+
+  test('选中会话 → URL replaceState /s/<id>；新建会话 → 回 /', async () => {
+    fetchMock = routedFetchTwoSessions()
+    vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
+
+    render(<App />)
+    await waitFor(() => expect(screen.getByText('历史会话甲')).toBeInTheDocument())
+    // 点侧栏选中甲 → URL 镜像。
+    await act(async () => {
+      fireEvent.click(screen.getByText('历史会话甲'))
+    })
+    await waitFor(() => expect(window.location.pathname).toBe('/s/webhist01'))
+    // 新建会话（空 draft 不占 URL）→ 回 /。
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: /新建会话/ }))
+    })
+    await waitFor(() => expect(window.location.pathname).toBe('/'))
+  })
+
+  test('面板深链：?panel=settings boot 后自动打开设置中心并保参', async () => {
+    window.history.replaceState({}, '', '/?panel=settings')
+    fetchMock = routedFetchTwoSessions()
+    vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
+
+    render(<App />)
+    // boot 读到 ?panel=settings → 设置中心随工作区打开（Dialog.Title「设置」）。
+    await waitFor(() =>
+      expect(screen.getByRole('heading', { name: '设置' })).toBeInTheDocument(),
+    )
+    // 打开态与 URL 参数一致（同步 effect no-op 保参）。
+    expect(window.location.search).toContain('panel=settings')
+  })
+})
