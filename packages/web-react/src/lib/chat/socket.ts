@@ -37,6 +37,8 @@ import {
 } from "../persist";
 import {
   AUTO_CONTINUE_DISPLAY,
+  RESTART_CONTINUE_DISPLAY,
+  RESTART_CONTINUE_PROMPT,
   backoffDelay,
   type ChatStatusClass,
   classifyClose,
@@ -545,6 +547,9 @@ export class ChatSocket {
       },
       scheduleAutoContinue: (sessId, targetMsgId, cls) => {
         setTimeout(() => this.autoContinueEmptyTurn(sessId, targetMsgId, cls), 0);
+      },
+      scheduleRestartContinue: (sessId) => {
+        setTimeout(() => this.autoContinueAfterRestart(sessId), 0);
       },
       refreshBalance: () => this.deps.refreshBalance?.(),
       reportTurnError: (p) =>
@@ -1485,6 +1490,54 @@ export class ChatSocket {
       msg._resolved = true;
       msg._behavior = p.behavior;
     }
+    this.scheduleNotify();
+  }
+
+  // ═══════════════ 服务重启中断 → 自动续写(§7 变体)═══════════════
+  //
+  // 容器的模型调用经 master 内部代理,master 部署重启会掐断生成中的上游流,容器
+  // 合成 meta.interrupted='service_restart' 的 isFinal。此处自动续写被截断的回复:
+  //  - 仅当被打断的助手消息**已有内容**(partial 非空)且 10 分钟内 —— 空 turn 走
+  //    原「请重新发送」提示,老会话的迟到中断帧不触发;
+  //  - 确定性幂等键(autocont-restart-<sess>-<msgId>):双 tab/重放只执行一次,
+  //    dedup ack 复用既有清理链路。
+  private restartContinued = new Set<string>();
+  private autoContinueAfterRestart(sessId: string): void {
+    const sess = this.sessions.get(sessId);
+    if (!sess || sess._sendingInFlight) return;
+    if (!(this.ws && this.ws.readyState === 1)) return;
+    const target = [...sess.messages]
+      .reverse()
+      .find((m) => m && m.role === "assistant" && !m._emptyTurn && (m.text ?? "").trim().length > 0);
+    if (!target) return; // 没有被截断的内容 → 保持"请重新发送"提示
+    if (typeof target.ts === "number" && Date.now() - target.ts > 10 * 60_000) return;
+    const idem = `autocont-restart-${sessId}-${target.id}`;
+    if (this.restartContinued.has(idem)) return;
+    this.restartContinued.add(idem);
+    const payload: InboundMessage = {
+      type: "inbound.message",
+      idempotencyKey: idem,
+      channel: "webchat",
+      peer: { id: sess.id, kind: "dm" },
+      agentId: sess.agentId || this.deps.defaultAgentId || "main",
+      content: { text: RESTART_CONTINUE_PROMPT },
+      ts: Date.now(),
+    };
+    const userMsg = addMessage(sess, "user", RESTART_CONTINUE_DISPLAY, {
+      status: "sending",
+      _isAutoRetry: true,
+      _modelText: RESTART_CONTINUE_PROMPT,
+      _idem: idem,
+    });
+    const sent = this.safeWsSend(JSON.stringify(payload));
+    if (!sent) {
+      const ri = sess.messages.indexOf(userMsg);
+      if (ri >= 0) sess.messages.splice(ri, 1);
+      this.restartContinued.delete(idem);
+      return;
+    }
+    userMsg.status = "sent";
+    sess._sendingInFlight = true;
     this.scheduleNotify();
   }
 

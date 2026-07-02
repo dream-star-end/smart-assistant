@@ -324,6 +324,10 @@ export function classifyEmptyTurn(p: {
 
 export const AUTO_CONTINUE_PROMPT = "请基于刚才的思考,继续输出完整的正文回答。";
 export const AUTO_CONTINUE_DISPLAY = "↻ 自动续写";
+/** 服务重启把上游生成流掐断(容器模型调用经 master 内部代理)时的自动续写。 */
+export const RESTART_CONTINUE_PROMPT =
+  "你上一条回复因服务重启被中断。请从中断处继续输出剩余内容,不要重复已经输出的部分,直接接着写。";
+export const RESTART_CONTINUE_DISPLAY = "↻ 服务重启中断,自动续写";
 
 export function isAutoContinueMsg(m: {
   _isAutoRetry?: boolean;
