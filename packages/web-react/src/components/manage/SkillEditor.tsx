@@ -13,6 +13,8 @@ import {
   FilePlus,
   FileText,
   Loader2,
+  PanelLeftClose,
+  PanelLeftOpen,
   Trash2,
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
@@ -55,6 +57,14 @@ export function SkillEditor({
   const [newPath, setNewPath] = useState("");
   const [history, setHistory] = useState<Array<{ version: string; timestamp: string }>>([]);
   const [confirmDialog, confirmDialogEl] = useConfirm();
+  // 目录树开合:移动端默认收起(右侧编辑区太窄),桌面默认展开;选完文件在窄屏自动收起。
+  const [treeOpen, setTreeOpen] = useState(
+    () => typeof window === "undefined" || window.innerWidth >= 640,
+  );
+  const pickFile = useCallback((path: string) => {
+    setSelected(path);
+    if (typeof window !== "undefined" && window.innerWidth < 640) setTreeOpen(false);
+  }, []);
 
   const writable = detail?.writable === true;
 
@@ -222,7 +232,18 @@ export function SkillEditor({
           {err}
         </Alert>
       )}
-      <div className="mb-2 flex gap-1">
+      <div className="mb-2 flex items-center gap-1">
+        {tab === "files" && !loading && (
+          <button
+            type="button"
+            onClick={() => setTreeOpen((o) => !o)}
+            aria-label={treeOpen ? "收起目录" : "展开目录"}
+            title={treeOpen ? "收起目录" : "展开目录"}
+            className="flex size-6 items-center justify-center rounded-md text-faint outline-none transition-colors hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
+          >
+            {treeOpen ? <PanelLeftClose size={14} /> : <PanelLeftOpen size={14} />}
+          </button>
+        )}
         {(
           [
             { id: "files", label: "文件" },
@@ -276,17 +297,18 @@ export function SkillEditor({
         </div>
       ) : (
         <div className="flex min-h-0 flex-1 gap-3" style={{ height: "calc(100% - 2.5rem)" }}>
-          {/* 左:目录树 */}
-          <div className="flex w-56 shrink-0 flex-col overflow-y-auto rounded-lg border border-border bg-bg p-2">
+          {/* 左:目录树(可收起;窄屏 max-w 护栏,不让右侧编辑区被压没) */}
+          {treeOpen && (
+          <div className="flex w-56 max-w-[45vw] shrink-0 flex-col overflow-y-auto rounded-lg border border-border bg-bg p-2">
             <FileNode
               label="SKILL.md"
               active={selected === "SKILL.md"}
-              onClick={() => setSelected("SKILL.md")}
+              onClick={() => pickFile("SKILL.md")}
             />
             {[...tree.entries()].map(([dir, files]) =>
               dir === "" ? (
                 files.map((f) => (
-                  <FileNode key={f} label={f} active={selected === f} onClick={() => setSelected(f)} onDelete={writable ? () => removeFile(f) : undefined} />
+                  <FileNode key={f} label={f} active={selected === f} onClick={() => pickFile(f)} onDelete={writable ? () => removeFile(f) : undefined} />
                 ))
               ) : (
                 <div key={dir} className="mt-1">
@@ -299,7 +321,7 @@ export function SkillEditor({
                       label={f.slice(dir.length + 1)}
                       indent
                       active={selected === f}
-                      onClick={() => setSelected(f)}
+                      onClick={() => pickFile(f)}
                       onDelete={writable ? () => removeFile(f) : undefined}
                     />
                   ))}
@@ -331,6 +353,7 @@ export function SkillEditor({
               </div>
             )}
           </div>
+          )}
 
           {/* 右:编辑器 */}
           <div className="flex min-w-0 flex-1 flex-col gap-2 overflow-y-auto">
