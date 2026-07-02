@@ -1,4 +1,4 @@
-import { Check, Loader2, Sparkles } from "lucide-react";
+import { Check, Loader2, Sparkles, Timer } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
 import { cn } from "../../lib/utils";
 import { ArtifactPreview } from "./ArtifactPreview";
@@ -137,7 +137,7 @@ export function DemoShowcase({ onTry }: { onTry: () => void }) {
           </span>
           <span className="text-[13px] font-medium text-fg">全能助手</span>
           <span className="ml-auto rounded-full border border-border bg-bg px-2 py-0.5 text-[11px] text-faint">
-            动态演示 · 取材真实会话
+            动态演示 · 示意数据
           </span>
         </div>
 
@@ -202,6 +202,14 @@ export function DemoShowcase({ onTry }: { onTry: () => void }) {
                     )}
                   </p>
                 </div>
+              </div>
+            )}
+
+            {/* 长程任务元信息：跑了多少步、多久 —— 「交出去就不用管」的证据 */}
+            {sc.runMeta && shownDone && (
+              <div className="flex items-center gap-1.5 pl-1 text-[12px] text-faint animate-in">
+                <Timer size={13} className="shrink-0 text-accent" />
+                {sc.runMeta}
               </div>
             )}
           </div>

@@ -14,7 +14,7 @@ describe("Landing 落地页", () => {
     // 叙事主题（对比区副文案保留该锚点）
     expect(screen.getByText(/越用越好用，越用越懂你/)).toBeInTheDocument();
     // 动态演示：首个场景的用户提问 + 成果面板交付物文件名均立即可见（不参与打字动画）
-    expect(screen.getAllByText(/转化率/).length).toBeGreaterThanOrEqual(2);
+    expect(screen.getAllByText(/坪效/).length).toBeGreaterThanOrEqual(2);
     // 差异化对比区
     expect(screen.getByText("不是又一个聊天机器人")).toBeInTheDocument();
     // 教程区 + 可复制示例

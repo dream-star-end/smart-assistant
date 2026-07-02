@@ -43,13 +43,6 @@ const COMPARE = {
   },
 };
 
-/** 内测期真实用量（来自生产会话统计），给「真的会干活」以数字背书。 */
-const USAGE_STATS = [
-  { n: "3,500+", label: "次代码执行" },
-  { n: "860+", label: "次联网调研" },
-  { n: "410+", label: "张图片识别" },
-  { n: "250+", label: "次团队委派" },
-];
 
 export function Landing({
   onStart,
@@ -128,23 +121,8 @@ export function Landing({
         </div>
 
         {/* 动态演示 —— 左对话右成果的工作台，让「交付成果」看得见 */}
-        <div id="demo" className="relative mx-auto max-w-5xl scroll-mt-20 px-5 pb-4">
+        <div id="demo" className="relative mx-auto max-w-5xl scroll-mt-20 px-5 pb-14">
           <DemoShowcase onTry={onStart} />
-        </div>
-
-        {/* 真实用量背书：演示不是想象的广告词 */}
-        <div className="mx-auto max-w-4xl px-5 pb-14 text-center">
-          <div className="mt-4 flex flex-wrap items-center justify-center gap-x-8 gap-y-3">
-            {USAGE_STATS.map((s) => (
-              <div key={s.label} className="flex items-baseline gap-1.5">
-                <span className="text-[20px] font-bold tabular-nums tracking-tight text-fg">{s.n}</span>
-                <span className="text-[13px] text-muted">{s.label}</span>
-              </div>
-            ))}
-          </div>
-          <p className="mt-3 text-[12.5px] text-faint">
-            内测期真实用量 · 以上演示场景均取材自真实用户会话，仅做脱敏精简
-          </p>
         </div>
       </section>
 

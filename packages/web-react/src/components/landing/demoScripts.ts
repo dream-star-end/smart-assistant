@@ -8,7 +8,7 @@ import {
   Users,
 } from "lucide-react";
 
-/** 演示中助手「执行动作」的瞬时提示芯片（检索技能 / 跑代码 / 联网 / 委派…），逐条揭示以还原 agent 干活过程。 */
+/** 演示中助手「执行动作」的瞬时提示（拆计划 / 跑代码 / 联网 / 委派…），逐条揭示以还原 agent 干活过程。 */
 export type DemoStep = { label: string };
 
 /**
@@ -28,7 +28,7 @@ export type Artifact =
       kind: "slides";
       title: string;
       /** 幻灯片缩略：首页大标题页 + 内容页（h=页标题，body 决定占位样式）。 */
-      pages: { h: string; body: "cover" | "lines" | "chart" | "table" }[];
+      pages: { h: string; body: "cover" | "lines" | "chart" | "table"; sub?: string }[];
       note: string;
     }
   | {
@@ -70,6 +70,8 @@ export type DemoScenario = {
   steps?: DemoStep[];
   /** 助手回答（逐字打字；\n 保留换行）。 */
   answer: string;
+  /** 长程任务元信息（答案打完后呈现）：自主执行了多少步、跑了多久 —— 体现「交出去就不用管」。 */
+  runMeta?: string;
   /** 任务产出的可交付文件（成果面板头部呈现，体现「交出真实成果」）。 */
   deliverable?: string;
   /** 成果预览面板：交付物长什么样，直接画出来。 */
@@ -79,10 +81,8 @@ export type DemoScenario = {
 };
 
 /**
- * 落地页动态演示脚本 —— 每一幕都取材自商业版 agent 在生产环境处理真实用户任务的**实际会话**：
- * 提示词、执行动作序列（检索技能→制定计划→跑 Python→自检→委派…）、回答要点与交付物类型，
- * 都对齐真实 rollout 记录（门店转化率分层分析 / 芯片良率质量调查 PPT / 简历岗位匹配 /
- * GitHub 加功能并 build 推送 / 编程小组协作改稿 / 联网带来源调研），只做了脱敏与精简。
+ * 落地页动态演示脚本 —— 全部为**虚构的示意场景与示意数据**（不含任何真实用户数据），
+ * 用于展示 agent 处理长程复杂任务的工作方式：拆解计划 → 反复执行 / 自检修正 → 交付成果。
  * 纯展示文案，不发任何真实请求。
  */
 export const DEMO_SCENARIOS: DemoScenario[] = [
@@ -91,159 +91,166 @@ export const DEMO_SCENARIOS: DemoScenario[] = [
     tab: "数据分析",
     icon: LayoutDashboard,
     prompt:
-      "（上传抖音/美团获客数据.xlsx）帮我按人看体验课转正课的转化率，分渠道分课时，哪些值得加投？",
+      "（上传门店经营数据.xlsx）分析 12 家门店上季度的坪效和外卖占比，找出拖后腿的门店和原因，出图给我",
     steps: [
-      { label: "检索技能库" },
-      { label: "制定分析计划" },
-      { label: "跑 Python 清洗透视" },
-      { label: "生成分层转化图" },
+      { label: "制定 6 步分析计划" },
+      { label: "跑 Python 清洗 3 万行流水 · 21 轮" },
+      { label: "发现 2 处口径异常，自动修正重跑" },
+      { label: "逐店交叉验证 · 生成对比图" },
     ],
     answer:
-      "按「体验人数 + 转化率」把课时包分成四层：5 / 8 / 14 课时转化高、量也够，建议加投；1 / 2 课时量大但转化偏低，先优化再投。分层图已生成，可直接拿去分配预算。",
-    deliverable: "转化率分层分析.png",
+      "12 家门店按坪效分了三档：城西、老街两店垫底，主因是外卖占比不足 15%、午市空转严重；中心、湖畔等 4 店健康。图表已生成，附了每家店的原因标注和整改建议。",
+    runMeta: "自主执行 46 步 · 全程 14 分钟，无需盯着",
+    deliverable: "门店坪效诊断.png",
     artifact: {
       kind: "chart",
-      title: "体验课 → 正课 转化率（按课时包）",
+      title: "门店坪效指数（上季度）",
       bars: [
-        { label: "14 课时", value: 68, tier: "hot" },
-        { label: "8 课时", value: 61, tier: "hot" },
-        { label: "5 课时", value: 57, tier: "hot" },
-        { label: "10 课时", value: 44, tier: "mid" },
-        { label: "6 课时", value: 41, tier: "mid" },
-        { label: "2 课时", value: 18, tier: "dim" },
-        { label: "1 课时", value: 12, tier: "dim" },
+        { label: "中心店", value: 86, tier: "mid" },
+        { label: "湖畔店", value: 79, tier: "mid" },
+        { label: "科技园", value: 74, tier: "mid" },
+        { label: "北广场", value: 66, tier: "dim" },
+        { label: "东门店", value: 58, tier: "dim" },
+        { label: "老街店", value: 41, tier: "hot" },
+        { label: "城西店", value: 33, tier: "hot" },
       ],
-      note: "建议加投：5 / 8 / 14 课时包",
+      note: "拖后腿：城西 / 老街 —— 外卖占比 <15%",
     },
   },
   {
     id: "ppt",
     tab: "做 PPT",
     icon: Presentation,
-    prompt: "（上传生产过程数据.xlsx）帮我查一下 1 档芯片良率为什么上不去，做成一份质量异常调查 PPT",
+    prompt: "（上传季度销售数据.xlsx）做一份 10 页的季度经营复盘 PPT，图表齐全，能直接给管理层汇报",
     steps: [
-      { label: "解析 Excel 数据" },
-      { label: "制定排查计划" },
-      { label: "跑相关性 / 分组分析" },
-      { label: "生成 PPT 并自检预览" },
+      { label: "解析数据 · 定 10 页大纲" },
+      { label: "跑分析产出 8 张图表" },
+      { label: "生成 PPT 初稿" },
+      { label: "逐页自检排版 · 3 轮修正" },
     ],
     answer:
-      "已完成 4 页质量异常调查 PPT 并逐页自检：异常背景与 5M1E 排查 → 1 档 vs 非 1 档指标差异 → 通道级差异分析 → 结论与行动计划。关键影响因子已按程度排序。",
-    deliverable: "质量异常调查.pptx",
+      "10 页复盘 PPT 已完成：营收结构 → 渠道对比 → 毛利变化 → 问题诊断 → 下季度行动计划，8 张图表全部由数据现算。逐页预览自检了 3 轮，排版和数字口径都核过，可直接上会。",
+    runMeta: "自主执行 58 步 · 全程 22 分钟，含 3 轮自检修正",
+    deliverable: "季度经营复盘.pptx",
     artifact: {
       kind: "slides",
-      title: "质量异常调查 · 4 页",
+      title: "季度经营复盘 · 10 页",
       pages: [
-        { h: "1档芯片良率异常调查", body: "cover" },
-        { h: "过程指标差异", body: "chart" },
-        { h: "通道级分析", body: "table" },
-        { h: "结论与行动计划", body: "lines" },
+        { h: "Q2 经营复盘", body: "cover", sub: "管理层汇报版 · 数据现算" },
+        { h: "营收结构", body: "chart" },
+        { h: "渠道对比", body: "table" },
+        { h: "下季度行动计划", body: "lines" },
       ],
-      note: "16:9 · 已自检预览",
+      note: "16:9 · 逐页自检 3 轮",
     },
   },
   {
     id: "job",
     tab: "找工作",
     icon: Briefcase,
-    prompt: "（上传我的简历.pdf）帮我推荐能投的公司和岗位，要求 6k+、双休、佛山/杭州/深圳",
+    prompt: "（上传我的简历.pdf）帮我在目标城市找匹配的岗位，筛掉不双休的，按匹配度排一张表",
     steps: [
-      { label: "解析简历经历" },
-      { label: "联网查在招岗位" },
-      { label: "按约束匹配打分" },
+      { label: "解析简历 · 提炼优势画像" },
+      { label: "联网检索 40+ 在招岗位" },
+      { label: "逐条核对薪资与双休线索" },
+      { label: "匹配打分 · 排序成表" },
     ],
     answer:
-      "按你的「英语本科 + 两段 B 端销售经验」匹配，优先投外贸 / 跨境电商 B2B / 医药渠道销售。已按 6k+、双休、目标城市筛出岗位表，每条都附了招聘来源，可点开核对。",
+      "按你的经历匹配出三类优先方向，联网核对了 40 多个在招岗位，筛掉了大小周和线索存疑的，最终留下 12 个，按匹配度排成一张表，每条都附招聘页链接可以直接投。",
+    runMeta: "自主执行 31 步 · 逐条核对来源，全程 9 分钟",
     deliverable: "岗位推荐表.xlsx",
     artifact: {
       kind: "table",
       title: "岗位推荐（按匹配度排序）",
-      head: ["优先级", "公司 · 岗位", "月薪", "匹配"],
+      head: ["优先级", "方向 · 岗位", "月薪", "匹配"],
       rows: [
-        ["P0", "跨境电商 B2B · 外贸销售", "8-12k", "92%"],
-        ["P1", "医药渠道 · 区域销售", "7-10k", "88%"],
-        ["P2", "SaaS 服务商 · 大客户销售", "6-9k", "81%"],
+        ["P0", "智能硬件 · 海外渠道销售", "9-13k", "93%"],
+        ["P1", "跨境电商 · 大客户经理", "8-12k", "87%"],
+        ["P2", "企业服务 · 解决方案销售", "7-10k", "82%"],
       ],
-      note: "每条附招聘来源链接 · 已核双休线索",
+      note: "共 12 条 · 每条附招聘页链接，双休已核",
     },
   },
   {
     id: "code",
     tab: "改代码",
     icon: GitBranch,
-    prompt: "连上我的 GitHub 仓库，加一个「接口开关 + 按 IP 限流」的功能，build 通过后提交推送",
+    prompt: "连上我的 GitHub 仓库，把报表导出从同步接口改成异步任务队列，加上进度查询，测试通过后提交推送",
     steps: [
-      { label: "读代码结构" },
-      { label: "制定实现计划" },
-      { label: "改多个文件" },
-      { label: "npm run build 验证" },
+      { label: "通读仓库结构 · 120+ 文件" },
+      { label: "制定 5 步改造计划" },
+      { label: "改 6 个文件" },
+      { label: "跑测试 · 4 轮修复直到全绿" },
       { label: "git 提交推送" },
     ],
     answer:
-      "已实现并推送：新增全局 ApiManagementGuard —— 按「方法 + 路径」匹配、支持通配、接口可一键关闭返回 403、按 IP 做分钟级限流，并保留恢复通道防误关。build 通过，已推送到 main。",
-    deliverable: "已推送 main · commit 5125c53",
+      "已完成并推送：导出改为异步任务队列，新增进度查询接口，失败自动重试 3 次并保留原同步接口兜底。中途测试挂了 4 次，都自己修好了 —— 最终 42 个测试全绿，没来打扰你一次。",
+    runMeta: "自主执行 73 步 · 全程 26 分钟，含 4 轮测试修复",
+    deliverable: "已推送 main · 测试 42/42",
     artifact: {
       kind: "diff",
-      title: "3 个文件改动",
-      file: "src/guard/api-management.guard.ts",
+      title: "6 个文件改动",
+      file: "src/export/async-export.service.ts",
       lines: [
-        { t: "ctx", code: "@@ 接口开关 + IP 限流 @@" },
-        { t: "add", code: "+ matchRule(method, path)  // 支持通配" },
-        { t: "add", code: "+ if (rule.disabled) throw new 403()" },
-        { t: "add", code: "+ rateLimitByIp(ip, 60/min)" },
-        { t: "del", code: "- // TODO: api management" },
+        { t: "ctx", code: "@@ 导出改异步任务队列 @@" },
+        { t: "add", code: "+ enqueueExportJob(params)  // 入队" },
+        { t: "add", code: "+ GET /exports/:id/progress" },
+        { t: "add", code: "+ retry(3) + fallbackSync()" },
+        { t: "del", code: "- return syncExport(params)" },
       ],
-      note: "✓ build 通过 · 已推送 main · 5125c53",
+      note: "✓ 测试 42/42 全绿 · 已推送 main",
     },
   },
   {
     id: "team",
     tab: "团队协作",
     icon: Users,
-    prompt: "组个小组：帮我把这份 PPT 改成新中式红金风格，保持页序和 16:9，改完再复核一遍",
+    prompt: "组个小组：把这份 30 页的产品手册翻成英文，术语前后要统一，翻完交叉审校一遍再交给我",
     steps: [
-      { label: "队长拆解需求" },
-      { label: "研究员定设计方向" },
-      { label: "工程师重制 PPT" },
-      { label: "审查员独立复核" },
+      { label: "队长拆解 30 页 · 分派子任务" },
+      { label: "翻译员分章推进" },
+      { label: "术语官统一 200+ 术语" },
+      { label: "审校员逐页交叉复核" },
     ],
     answer:
-      "小组按「子任务账本」协作完成：研究员定新中式红金方向，工程师重制 14 页并保持原页序与 16:9，审查员独立复核无阻塞问题。队长汇总交付，并如实标注了未覆盖项（原动画未保留）。",
-    deliverable: "PPT改版_红金版.pptx",
+      "小组按「子任务账本」协作完成：翻译员分章翻完 30 页，术语官统一了 216 条术语，审校员交叉复核修正 37 处。队长汇总交付，全程自主协作，你只需要看最终稿。",
+    runMeta: "3 名成员并行 · 全程 38 分钟自主协作",
+    deliverable: "产品手册_EN.docx",
     artifact: {
       kind: "board",
       title: "子任务账本",
       tasks: [
-        { role: "研究员", task: "分析原稿 · 定红金设计方向", state: "完成" },
-        { role: "工程师", task: "重制 14 页 · 保持页序 16:9", state: "完成" },
-        { role: "审查员", task: "独立复核 · 无阻塞问题", state: "通过" },
+        { role: "翻译员", task: "分章翻译 30 页", state: "完成" },
+        { role: "术语官", task: "统一术语表 216 条", state: "完成" },
+        { role: "审查员", task: "交叉复核 · 修正 37 处", state: "通过" },
       ],
-      note: "队长汇总交付 · 未覆盖项已如实标注",
+      note: "队长汇总交付 · 过程账本可回看",
     },
   },
   {
     id: "research",
     tab: "深度调研",
     icon: Globe,
-    prompt: "帮我联网调研新茶饮赛道：头部品牌、价格带、近期爆品和用户吐槽，出一份带来源的分析",
+    prompt: "调研跨境电商物流赛道：主要玩家、价格模式、近期政策变化，出一份带来源的分析报告",
     steps: [
-      { label: "联网检索 20+ 来源" },
-      { label: "抓取门店与价格数据" },
-      { label: "交叉核对事实" },
-      { label: "汇总成文" },
+      { label: "联网检索 30+ 来源" },
+      { label: "抓取价格与时效数据" },
+      { label: "交叉核对矛盾信息" },
+      { label: "成文 · 逐条核对引用" },
     ],
     answer:
-      "已汇总 6 个头部品牌的价格带、上新节奏与近三月爆品，用户吐槽集中在「排队久 / 甜度不稳」两点，附差异化机会点。全文关键结论都附了来源链接，可逐条核对。",
-    deliverable: "新茶饮赛道分析.pdf",
+      "报告已成文：5 家头部服务商的价格模式与时效对比、近半年 3 项政策变化的影响、以及「时效 vs 成本」的机会区间。检索了 34 个来源，矛盾数据做了交叉核对，关键结论都附来源可点开验证。",
+    runMeta: "检索 34 个来源 · 全程 17 分钟",
+    deliverable: "跨境物流赛道分析.pdf",
     artifact: {
       kind: "report",
-      title: "新茶饮赛道分析",
-      sources: "20+ 来源 · 已交叉核对",
+      title: "跨境电商物流赛道分析",
+      sources: "34 个来源 · 已交叉核对",
       bullets: [
-        { text: "6 大头部品牌价格带与定位对比", refs: "[1][3]" },
-        { text: "近三月爆品与上新节奏", refs: "[5][7]" },
-        { text: "用户吐槽：排队久 / 甜度不稳", refs: "[8][12]" },
-        { text: "差异化机会点 ×3", refs: "[15]" },
+        { text: "5 家头部服务商价格模式对比", refs: "[1][4]" },
+        { text: "近半年 3 项政策变化及影响", refs: "[6][9]" },
+        { text: "时效 vs 成本的机会区间", refs: "[11]" },
+        { text: "风险与合规要点 ×4", refs: "[14]" },
       ],
       note: "关键结论均附来源链接",
     },

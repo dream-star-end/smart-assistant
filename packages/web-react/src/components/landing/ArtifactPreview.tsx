@@ -161,7 +161,7 @@ function SlidesMock({ a }: { a: Extract<Artifact, { kind: "slides" }> }) {
               <>
                 <span className="h-1 w-6 rounded-full bg-accent" />
                 <span className="text-[10px] font-bold leading-tight text-fg">{p.h}</span>
-                <span className="text-[7.5px] text-faint">质量异常调查报告</span>
+                {p.sub && <span className="text-[7.5px] text-faint">{p.sub}</span>}
               </>
             ) : (
               <>
