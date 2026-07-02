@@ -30,11 +30,24 @@ function randomSuffix(): string {
   return Math.random().toString(36).slice(2, 10)
 }
 
+const BUNDLE_PATH_RE = /^(references|assets|evals)\/[A-Za-z0-9][A-Za-z0-9._-]{0,63}(\/[A-Za-z0-9][A-Za-z0-9._-]{0,63})?$/
+
+/** 稳定序列化(键排序)—— 与 master 侧 canonicalBundleJson 完全一致的 hash 输入。 */
+function canonicalBundleJson(bundle: Record<string, string>): string {
+  const keys = Object.keys(bundle).sort()
+  const out: Record<string, string> = {}
+  for (const k of keys) out[k] = bundle[k]
+  return JSON.stringify(out)
+}
+
 interface SyncSkill {
   slug: string
   version: string
   rawSkillMd: string
   artifactHash: string
+  /** 附属文本文件(references/assets/evals);独立 bundleHash 验证后才落盘。 */
+  bundle?: Record<string, string>
+  bundleHash?: string
 }
 
 interface SyncAgent {
@@ -77,11 +90,27 @@ async function fetchInstalled(
             typeof o.artifactHash === 'string' &&
             typeof o.version === 'string'
           ) {
+            let bundle: Record<string, string> | undefined
+            if (o.bundle && typeof o.bundle === 'object' && !Array.isArray(o.bundle)) {
+              const b: Record<string, string> = {}
+              let ok = true
+              for (const [k, v] of Object.entries(o.bundle as Record<string, unknown>)) {
+                if (typeof v !== 'string' || !BUNDLE_PATH_RE.test(k)) {
+                  ok = false
+                  break
+                }
+                b[k] = v
+              }
+              if (ok && Object.keys(b).length > 0) bundle = b
+            }
             skills.push({
               slug: o.slug,
               version: o.version,
               rawSkillMd: o.rawSkillMd,
               artifactHash: o.artifactHash,
+              ...(bundle && typeof o.bundleHash === 'string'
+                ? { bundle, bundleHash: o.bundleHash }
+                : {}),
             })
           }
         }
@@ -140,11 +169,49 @@ async function reconcileSkills(installed: SyncSkill[]): Promise<void> {
       if (st?.isSymbolicLink()) continue
       const mdPath = paths.hubSkillMd(s.slug)
       const cur = await readFile(mdPath, 'utf8').catch(() => null)
-      if (cur === s.rawSkillMd) continue
-      await mkdir(skillDir, { recursive: true })
-      const tmp = `${mdPath}.tmp-${process.pid}-${randomSuffix()}`
-      await writeFile(tmp, s.rawSkillMd, 'utf8')
-      await rename(tmp, mdPath)
+      if (cur !== s.rawSkillMd) {
+        await mkdir(skillDir, { recursive: true })
+        const tmp = `${mdPath}.tmp-${process.pid}-${randomSuffix()}`
+        await writeFile(tmp, s.rawSkillMd, 'utf8')
+        await rename(tmp, mdPath)
+      }
+      // 附属文件:独立验 bundleHash(不信 master 内容),验过才逐文件落盘;
+      // 三个附属目录内不再被 bundle 引用的文件删除(uninstall/改版收敛)。
+      const bundle =
+        s.bundle && s.bundleHash && marketplaceArtifactHash(canonicalBundleJson(s.bundle)) === s.bundleHash
+          ? s.bundle
+          : null
+      for (const sub of ['references', 'assets', 'evals']) {
+        const subDir = join(skillDir, sub)
+        const wanted = new Map<string, string>()
+        if (bundle) {
+          for (const [rel, content] of Object.entries(bundle)) {
+            if (rel.startsWith(`${sub}/`)) wanted.set(rel, content)
+          }
+        }
+        // prune
+        const existing = await readdir(subDir, { recursive: true }).catch(() => [] as string[])
+        for (const e of existing as string[]) {
+          const rel = `${sub}/${e}`.replace(/\\/g, '/')
+          if (!wanted.has(rel)) {
+            const full = join(subDir, e)
+            const est = await lstat(full).catch(() => null)
+            if (est?.isFile() || est?.isSymbolicLink())
+              await rm(full, { force: true }).catch(() => {})
+          }
+        }
+        // write
+        for (const [rel, content] of wanted) {
+          if (!BUNDLE_PATH_RE.test(rel)) continue
+          const full = join(skillDir, rel)
+          const curF = await readFile(full, 'utf8').catch(() => null)
+          if (curF === content) continue
+          await mkdir(join(full, '..'), { recursive: true })
+          const tmpF = `${full}.tmp-${process.pid}-${randomSuffix()}`
+          await writeFile(tmpF, content, 'utf8')
+          await rename(tmpF, full)
+        }
+      }
     } catch {
       /* skip this one; fail-soft */
     }

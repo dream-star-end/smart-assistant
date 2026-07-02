@@ -22,6 +22,8 @@ import {
   listActiveInstalledArtifacts,
   listPlatformPresetAgents,
 } from '../marketplace/marketplaceDb.js'
+import { marketplaceArtifactHash } from '@openclaude/storage'
+import { canonicalBundleJson } from '../marketplace/bundle.js'
 import { platformPresetAgentSlugs } from '../marketplace/platformPresets.js'
 import { REQUEST_ID_HEADER, ensureRequestId, setSecurityHeaders } from './util.js'
 
@@ -82,12 +84,17 @@ export function makeMarketplaceSyncHandler(deps: MarketplaceSyncDeps): Marketpla
         listActiveInstalledAgents(identity.userId),
         listPlatformPresetAgents(presetSlugs),
       ])
+      // bundle 完整性:master 侧对 canonical JSON 计算 hash,容器侧独立复算比对。
+      const skillsOut = skills.map((sk) => {
+        if (!sk.bundle) return sk
+        return { ...sk, bundleHash: marketplaceArtifactHash(canonicalBundleJson(sk.bundle)) }
+      })
       const presetSet = new Set(presetAgents.map((p) => p.slug))
       const agents = [
         ...presetAgents,
         ...installedAgents.filter((a) => !presetSet.has(a.slug)),
       ]
-      sendJson(res, 200, { skills, agents }, requestId)
+      sendJson(res, 200, { skills: skillsOut, agents }, requestId)
     } catch (err) {
       log
         .child({ requestId, uid: identity.userId })

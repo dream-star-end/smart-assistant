@@ -433,6 +433,14 @@ export class CronScheduler {
     }
   }
 
+  /**
+   * 平台内部通知直投:复用 cron 的送达管线(webchat 推送 + 微信主动投递联动),
+   * 但不经过 LLM 执行 —— 给确定性的系统通知(如技能自动回归失败提醒)用。
+   */
+  async deliverNotice(text: string, job: CronJob): Promise<void> {
+    await this.onDeliver(text, job)
+  }
+
   // ── Runtime job management (called by /api/cron) ──
 
   async addJob(job: CronJob): Promise<void> {

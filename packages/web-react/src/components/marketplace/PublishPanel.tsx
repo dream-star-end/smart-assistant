@@ -101,6 +101,11 @@ function SkillPublishForm({ auth, onPublished }: { auth: AuthSession; onPublishe
   const [description, setDescription] = useState("");
   const [tags, setTags] = useState("");
   const [body, setBody] = useState("");
+  // 附属文件(references/assets/evals;scripts 暂不支持)。导入技能时自动带上其
+  // 评测用例与上次实测结果(可删),让「实测有效」成为市场卖点而不是口说无凭。
+  const [files, setFiles] = useState<Array<{ path: string; content: string }>>([]);
+  const [benchmark, setBenchmark] = useState<{ withPassRate: number; withoutPassRate: number; cases: number } | null>(null);
+  const [bundleErrors, setBundleErrors] = useState<string[]>([]);
 
   const [submitting, setSubmitting] = useState(false);
   const [err, setErr] = useState<string | null>(null);
@@ -125,11 +130,31 @@ function SkillPublishForm({ auth, onPublished }: { auth: AuthSession; onPublishe
     setSlugTouched(false);
     setDescription(sk.description ?? "");
     setTags((sk.tags ?? []).join(", "));
+    setFiles([]);
+    setBenchmark(null);
     try {
       const d = await api.getSkill(auth, sk.name);
       setBody(d.body ?? "");
     } catch {
       /* 用户可手填正文 */
+    }
+    // 自动附带评测用例 + 上次 baseline 实测(发布者自报,详情页会标注来源;可手动删)。
+    try {
+      const ev = await api.getSkillEvals(auth, sk.name);
+      if (ev.evals?.cases?.length) {
+        const { autoRegression: _drop, ...pub } = ev.evals;
+        setFiles([{ path: "evals/evals.json", content: `${JSON.stringify(pub, null, 2)}\n` }]);
+      }
+      const b = ev.lastRun?.benchmark;
+      if (b && b.passRate?.with !== undefined && b.passRate?.without !== undefined) {
+        setBenchmark({
+          withPassRate: b.passRate.with,
+          withoutPassRate: b.passRate.without,
+          cases: Math.max(1, Math.min(5, ev.evals?.cases?.length ?? 1)),
+        });
+      }
+    } catch {
+      /* 无评测数据就不带 */
     }
   };
 
@@ -162,14 +187,21 @@ function SkillPublishForm({ auth, onPublished }: { auth: AuthSession; onPublishe
           .split(",")
           .map((t) => t.trim())
           .filter(Boolean),
+        ...(files.length > 0 ? { files } : {}),
+        ...(benchmark ? { benchmark } : {}),
       });
       setOk(true);
       onPublished();
     } catch (e) {
       if (e instanceof ApiError && e.status === 422) {
-        const rf = (e.body as { riskFlags?: MarketplaceRiskFlag[] })?.riskFlags ?? [];
-        setFlags(rf);
-        setErr("发布被安全扫描拦截，请按下面的提示修正后重试。");
+        const eb = e.body as { riskFlags?: MarketplaceRiskFlag[]; errors?: string[] };
+        if (eb?.errors?.length) {
+          setBundleErrors(eb.errors);
+          setErr("附属文件不合法,请按下面的提示修正。");
+        } else {
+          setFlags(eb?.riskFlags ?? []);
+          setErr("发布被安全扫描拦截，请按下面的提示修正后重试。");
+        }
       } else {
         setErr(e instanceof ApiError ? e.message : (e as Error).message || "发布失败");
       }
@@ -281,6 +313,74 @@ function SkillPublishForm({ auth, onPublished }: { auth: AuthSession; onPublishe
           className="font-mono text-[12.5px]"
         />
       </Field>
+
+      {bundleErrors.length > 0 && (
+        <Alert tone="danger" title="附属文件校验未通过">
+          <ul className="list-disc pl-4">
+            {bundleErrors.map((m) => (
+              <li key={m}>{m}</li>
+            ))}
+          </ul>
+        </Alert>
+      )}
+
+      <div>
+        <div className="mb-1.5 flex items-center justify-between">
+          <span className="text-[12px] font-medium text-muted">
+            附属文件（references/ assets/ evals/,可选;scripts/ 暂不支持）
+          </span>
+          <Button
+            variant="ghost"
+            size="sm"
+            disabled={files.length >= 20}
+            onClick={() => setFiles((fs) => [...fs, { path: "references/", content: "" }])}
+          >
+            添加文件
+          </Button>
+        </div>
+        {files.length > 0 && (
+          <ul className="flex flex-col gap-2">
+            {files.map((f, i) => (
+              <li key={i} className="rounded-lg border border-border p-2">
+                <div className="mb-1 flex items-center gap-2">
+                  <Input
+                    value={f.path}
+                    onChange={(e) => {
+                      const v = e.target.value;
+                      setFiles((fs) => fs.map((x, j) => (j === i ? { ...x, path: v } : x)));
+                    }}
+                    placeholder="references/guide.md"
+                    className="h-8 font-mono text-[12px]"
+                  />
+                  <Button variant="ghost" size="sm" onClick={() => setFiles((fs) => fs.filter((_, j) => j !== i))}>
+                    删除
+                  </Button>
+                </div>
+                <Textarea
+                  value={f.content}
+                  onChange={(e) => {
+                    const v = e.target.value;
+                    setFiles((fs) => fs.map((x, j) => (j === i ? { ...x, content: v } : x)));
+                  }}
+                  rows={4}
+                  placeholder="文件内容…"
+                  className="font-mono text-[12px]"
+                />
+              </li>
+            ))}
+          </ul>
+        )}
+        {benchmark && (
+          <div className="mt-2 flex items-center gap-2 text-[12px] text-muted">
+            <Badge tone="info">
+              实测:通过率 {Math.round(benchmark.withoutPassRate * 100)}% → {Math.round(benchmark.withPassRate * 100)}%（{benchmark.cases} 用例,发布者自报）
+            </Badge>
+            <button type="button" className="text-faint hover:text-fg" onClick={() => setBenchmark(null)}>
+              移除
+            </button>
+          </div>
+        )}
+      </div>
 
       <div className="flex items-center justify-between">
         <p className="text-[11.5px] text-faint">提交后进入平台审核，通过后才会上架。</p>

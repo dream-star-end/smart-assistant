@@ -34,6 +34,7 @@ import {
   canonicalizeAgentManifest,
   validateAgentManifest,
 } from './agentManifest.js'
+import { canonicalBundleJson, validateBenchmark, validateBundleFiles } from './bundle.js'
 import { platformPresetAgentSlugs } from './platformPresets.js'
 import { scanSkillArtifact } from './skillScanner.js'
 
@@ -114,6 +115,23 @@ export async function handleMarketplacePublish(
   const skillBody = asStr(body.body, 'body', MAX_BODY)
   const tags = asTags(body.tags)
 
+  // 附属文件(references/assets/evals;scripts 暂拒)+ 发布者自报评测摘要。
+  const bundleV = validateBundleFiles(
+    Array.isArray(body.files) ? (body.files as Array<{ path?: unknown; content?: unknown }>) : undefined,
+  )
+  if (!bundleV.ok) {
+    sendJson(res, 422, {
+      error: { code: 'BAD_BUNDLE', message: '附属文件不合法,请按提示修正' },
+      errors: bundleV.errors,
+    })
+    return
+  }
+  const benchV = validateBenchmark(body.benchmark)
+  if (!benchV.ok) {
+    sendJson(res, 422, { error: { code: 'BAD_BENCHMARK', message: benchV.error } })
+    return
+  }
+
   const scan = scanSkillArtifact({ name, description, tags, body: skillBody })
   if (scan.blocked) {
     sendJson(res, 422, {
@@ -121,6 +139,19 @@ export async function handleMarketplacePublish(
       riskFlags: scan.flags,
     })
     return
+  }
+  // 逐附属文件走同一静态扫描(密钥/注入/内网地址等对文本文件同样适用)。
+  if (bundleV.bundle) {
+    for (const [path, content] of Object.entries(bundleV.bundle)) {
+      const fscan = scanSkillArtifact({ name: slug, description: path, tags: [], body: content })
+      if (fscan.blocked) {
+        sendJson(res, 422, {
+          error: { code: 'SCAN_BLOCKED', message: `附属文件 ${path} 被安全扫描拦截` },
+          riskFlags: fscan.flags,
+        })
+        return
+      }
+    }
   }
 
   // Reconstruct a canonical SKILL.md so the stored artifact == what installs.
@@ -154,6 +185,8 @@ export async function handleMarketplacePublish(
       riskFlags: scan.flags,
       policyVersion: scan.policyVersion,
       submittedBy: uid(user),
+      rawBundle: bundleV.bundle,
+      benchmark: benchV.benchmark,
     })
     sendJson(res, 200, {
       ok: true,

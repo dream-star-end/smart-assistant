@@ -68,6 +68,36 @@ function AgentManifestView({ manifest }: { manifest: unknown }) {
   )
 }
 
+/** 附属文件查看:路径芯片 → 点击展开内容(安装前看清装的全部内容,含附属文件)。 */
+function BundleFilesView({ bundle }: { bundle: Record<string, string> }) {
+  const [open, setOpen] = useState<string | null>(null)
+  const paths = Object.keys(bundle).sort()
+  return (
+    <div>
+      <div className="mb-1.5 text-[12px] font-medium text-muted">附属文件（{paths.length}）</div>
+      <div className="flex flex-wrap gap-1.5">
+        {paths.map((p) => (
+          <button
+            key={p}
+            type="button"
+            onClick={() => setOpen(open === p ? null : p)}
+            className={`rounded-md px-1.5 py-0.5 font-mono text-[11px] transition-colors ${
+              open === p ? 'bg-accent-soft text-accent' : 'bg-hover text-muted hover:text-fg'
+            }`}
+          >
+            {p}
+          </button>
+        ))}
+      </div>
+      {open && (
+        <pre className="mt-1.5 max-h-56 overflow-auto whitespace-pre-wrap break-words rounded-lg border border-border bg-code px-3 py-2 font-mono text-[11.5px] leading-relaxed text-fg">
+          {bundle[open]}
+        </pre>
+      )}
+    </div>
+  )
+}
+
 /**
  * 市场条目详情 + 安装/更新确认。展示完整 SKILL.md(用户安装前看清「装的到底是什么」),
  * 一键安装；已安装但有新上架版本时给「更新」（复用 install 的幂等替换语义）。
@@ -219,6 +249,12 @@ export function DetailModal({
             <Badge tone="neutral">
               <Users size={12} /> {detail.installCount} 人在用
             </Badge>
+            {detail.benchmark && (
+              <Badge tone="info">
+                实测 {Math.round(detail.benchmark.withoutPassRate * 100)}%→
+                {Math.round(detail.benchmark.withPassRate * 100)}%（{detail.benchmark.cases} 用例·发布者提供）
+              </Badge>
+            )}
           </div>
 
           {warns.length > 0 && (
@@ -230,6 +266,10 @@ export function DetailModal({
                 </Alert>
               ))}
             </div>
+          )}
+
+          {detail.rawBundle && Object.keys(detail.rawBundle).length > 0 && (
+            <BundleFilesView bundle={detail.rawBundle} />
           )}
 
           {detail.kind === 'agent' ? (

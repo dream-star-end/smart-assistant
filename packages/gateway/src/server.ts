@@ -820,6 +820,9 @@ export class Gateway {
     // Reconcile skill-training runs persisted across a gateway restart (active → failed).
     void this.skillTrainJobs.loadAll(Date.now())
     void this.skillEvalJobs.loadAll(Date.now())
+    // P3:技能每日自动回归(严格 opt-in:仅 evals.json 里 autoRegression=true 的技能;
+    // 开启入口在管理中心且强制确认每日消耗 —— 平台绝不静默烧用户积分)。
+    this._startSkillAutoRegression()
     // Wire up auth error handler: force-refresh token when 401 detected (bypass expiry check)
     this.sessions.onAuthError = () => this.refreshClaudeOAuthIfNeeded(true)
     // Phase 5:把 _repoWorkspace 的 getRepoSnapshot 当 provider 注入。
@@ -5110,6 +5113,101 @@ export class Gateway {
         .catch(() => {})
     }
 
+  }
+
+  // ── P3:技能每日自动回归(opt-in)────────────────────────────────────────
+  private _skillRegressionTimer: ReturnType<typeof setInterval> | null = null
+
+  private _startSkillAutoRegression(): void {
+    // 检查间隔 1h(可 env 缩短供 e2e),真正执行按「距上次 ≥22h」判定 —— 每技能每日至多一轮。
+    const checkMs = Number(process.env.OC_SKILL_REGRESSION_CHECK_MS) || 60 * 60 * 1000
+    const minGapMs = Number(process.env.OC_SKILL_REGRESSION_MIN_GAP_MS) || 22 * 60 * 60 * 1000
+    this._skillRegressionTimer = setInterval(() => {
+      void this._skillAutoRegressionTick(minGapMs).catch((err) =>
+        this.log.warn('skill auto-regression tick failed', {}, err),
+      )
+    }, checkMs)
+    this._skillRegressionTimer.unref?.()
+  }
+
+  private async _skillAutoRegressionTick(minGapMs: number): Promise<void> {
+    const stampPath = join(paths.skillEvalsDir, 'auto-regression.json')
+    let stamps: Record<string, number> = {}
+    try {
+      stamps = JSON.parse(await readFile(stampPath, 'utf-8')) as Record<string, number>
+    } catch {}
+    const store = buildUserSkillStore()
+    const skills = await store.list({ includePlatform: false }).catch(() => [])
+    for (const sk of skills) {
+      if (!sk?.name) continue
+      const raw = await store.view(sk.name, 'evals/evals.json', { includePlatform: false })
+      if (typeof raw !== 'string') continue
+      const parsed = parseSkillEvalsJson(raw)
+      if (!parsed.ok || parsed.file.autoRegression !== true) continue
+      const last = stamps[sk.name] ?? 0
+      if (Date.now() - last < minGapMs) continue
+      if (!this.skillEvalJobs.canStart(sk.name).ok) continue
+
+      // 记录上一次通过率(回归对比基线);本轮结果由 _runSkillEval 写回 last-run.json。
+      let prevWith: number | null = null
+      const prevRaw = await store.view(sk.name, 'evals/last-run.json', { includePlatform: false })
+      if (typeof prevRaw === 'string') {
+        try {
+          const prev = JSON.parse(prevRaw) as { benchmark?: { passRate?: { with?: number } } }
+          prevWith = prev.benchmark?.passRate?.with ?? null
+        } catch {}
+      }
+
+      stamps[sk.name] = Date.now()
+      await mkdir(paths.skillEvalsDir, { recursive: true }).catch(() => {})
+      await writeFile(stampPath, JSON.stringify(stamps, null, 2)).catch(() => {})
+
+      const run = await this.skillEvalJobs.create({
+        runId: SkillEvalJobStore.newRunId(),
+        skillName: sk.name,
+        userId: 'default',
+        mode: 'baseline',
+        model: SKILL_TRAIN_DEFAULT_MODEL,
+        cases: parsed.file.cases,
+        now: Date.now(),
+      })
+      try {
+        await this._runSkillEval(run, {})
+      } catch (err) {
+        await this.skillEvalJobs.finish(run, Date.now(), { error: String(err) })
+      }
+
+      const b = run.benchmark
+      const withRate = b?.passRate?.with
+      const failed = run.status === 'failed'
+      const regressed =
+        failed ||
+        (b?.verdict ?? '').includes('反而更差') ||
+        (prevWith !== null && withRate !== undefined && withRate < prevWith - 0.05)
+      if (!regressed) continue
+
+      // 推送提醒(不自动改技能、不自动开训练 —— 修复动作由用户在管理中心发起)。
+      const pct = (x?: number | null) => (x == null ? '?' : `${Math.round(x * 100)}%`)
+      const lines = [
+        failed
+          ? `自动回归运行失败:${run.error ?? '未知错误'}`
+          : `断言通过率 ${pct(prevWith)} → ${pct(withRate)}${b?.verdict ? `(${b.verdict})` : ''}`,
+        `本次回归消耗:输入 ${run.usage.inputTokens.toLocaleString()} / 输出 ${run.usage.outputTokens.toLocaleString()} tokens(${run.usage.turns} 轮,实际扣费以账单为准)`,
+        '建议:打开 管理中心 → 技能 → 该技能 → 训练优化,让 AI 基于失败结果起草改进(草稿经你确认才会合并)。',
+        '不再需要提醒可在 管理中心 → 技能 → 评测 里关闭「每日自动回归」。',
+      ]
+      await this.cron
+        ?.deliverNotice(lines.join('\n'), {
+          id: `skill-regression-${sk.name}`,
+          schedule: '0 0 * * *',
+          agent: 'main',
+          prompt: '',
+          deliver: 'webchat',
+          enabled: true,
+          label: `技能回归提醒:${sk.name}`,
+        })
+        .catch(() => {})
+    }
   }
 
   // ── SkillOpt skill-training (async; train → diff → confirm-merge) ──

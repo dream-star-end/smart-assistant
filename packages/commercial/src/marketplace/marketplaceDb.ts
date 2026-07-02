@@ -70,6 +70,10 @@ export interface PublishInput {
   submittedBy: number
   /** Artifact kind; the listing is owner- AND kind-locked. Defaults to 'skill'. */
   kind?: ArtifactKind
+  /** SKILL.md 之外的附属文本文件(references/assets/evals;已过 bundle 校验)。 */
+  rawBundle?: Record<string, string> | null
+  /** 发布者自报评测摘要(展示须标注"发布者提供",非平台背书)。 */
+  benchmark?: { withPassRate: number; withoutPassRate: number; cases: number } | null
 }
 
 /** Create the listing (owner- AND kind-locked) if new, then a pending version. */
@@ -107,8 +111,10 @@ export async function publishSkillVersion(input: PublishInput): Promise<{ versio
       const ins = await query<{ id: string }>(
         `INSERT INTO marketplace_skill_versions
            (slug, version, name, description, tags, raw_skill_md, raw_artifact, manifest,
-            artifact_hash, embedding_hash, status, risk_flags, policy_version, submitted_by)
-         VALUES ($1,$2,$3,$4,$5::jsonb,$6,$7,$8::jsonb,$9,$10,'pending',$11::jsonb,$12,$13)
+            artifact_hash, embedding_hash, status, risk_flags, policy_version, submitted_by,
+            raw_bundle, benchmark)
+         VALUES ($1,$2,$3,$4,$5::jsonb,$6,$7,$8::jsonb,$9,$10,'pending',$11::jsonb,$12,$13,
+                 $14::jsonb,$15::jsonb)
          RETURNING id::text`,
         [
           input.slug,
@@ -124,6 +130,8 @@ export async function publishSkillVersion(input: PublishInput): Promise<{ versio
           JSON.stringify(input.riskFlags),
           input.policyVersion,
           input.submittedBy,
+          input.rawBundle == null ? null : JSON.stringify(input.rawBundle),
+          input.benchmark == null ? null : JSON.stringify(input.benchmark),
         ],
         c,
       )
@@ -154,6 +162,8 @@ export interface PendingVersionRow {
   submittedBy: string
   ownerUserId: string
   createdAt: string
+  rawBundle: Record<string, string> | null
+  benchmark: { withPassRate: number; withoutPassRate: number; cases: number } | null
 }
 
 // Admin-only: the full artifact (raw_artifact) is included so the reviewer can
@@ -176,9 +186,11 @@ export async function listPendingVersions(limit = 100): Promise<PendingVersionRo
     submitted_by: string
     owner_user_id: string
     created_at: string
+    raw_bundle: unknown
+    benchmark: unknown
   }>(
     `SELECT v.id::text, v.slug, l.kind, v.version, v.name, v.description, v.tags,
-            v.raw_artifact, v.raw_skill_md, v.manifest,
+            v.raw_artifact, v.raw_skill_md, v.manifest, v.raw_bundle, v.benchmark,
             v.risk_flags, v.submitted_by::text, l.owner_user_id::text, v.created_at::text
        FROM marketplace_skill_versions v
        JOIN marketplace_skill_listings l ON l.slug = v.slug
@@ -202,6 +214,10 @@ export async function listPendingVersions(limit = 100): Promise<PendingVersionRo
     submittedBy: x.submitted_by,
     ownerUserId: x.owner_user_id,
     createdAt: x.created_at,
+    rawBundle: (x.raw_bundle as Record<string, string> | null) ?? null,
+    benchmark:
+      (x.benchmark as { withPassRate: number; withoutPassRate: number; cases: number } | null) ??
+      null,
   }))
 }
 
@@ -388,6 +404,10 @@ export interface ListingDetail {
   manifest: unknown
   riskFlags: RiskFlag[]
   installCount: number
+  /** 附属文件(references/assets/evals;null = 无)。 */
+  rawBundle: Record<string, string> | null
+  /** 发布者自报评测摘要(展示须标注"发布者提供")。 */
+  benchmark: { withPassRate: number; withoutPassRate: number; cases: number } | null
 }
 
 /** Public detail for an active listing's current approved version (incl. the full artifact for the confirm dialog). */
@@ -407,11 +427,13 @@ export async function getListingDetail(slug: string): Promise<ListingDetail | nu
     raw_skill_md: string | null
     manifest: unknown
     risk_flags: unknown
+    raw_bundle: unknown
+    benchmark: unknown
     install_count: string
   }>(
     `SELECT l.slug, l.kind, l.state, l.owner_user_id::text, v.version, v.id::text AS vid,
             v.name, v.description, v.tags, v.artifact_hash, v.raw_artifact, v.raw_skill_md,
-            v.manifest, v.risk_flags,
+            v.manifest, v.risk_flags, v.raw_bundle, v.benchmark,
             (SELECT count(*) FROM marketplace_installs i
               WHERE i.slug = l.slug AND i.uninstalled_at IS NULL)::text AS install_count
        FROM marketplace_skill_listings l
@@ -437,6 +459,10 @@ export async function getListingDetail(slug: string): Promise<ListingDetail | nu
     manifest: x.manifest ?? null,
     riskFlags: (x.risk_flags as RiskFlag[]) ?? [],
     installCount: Number.parseInt(x.install_count, 10) || 0,
+    rawBundle: (x.raw_bundle as Record<string, string> | null) ?? null,
+    benchmark:
+      (x.benchmark as { withPassRate: number; withoutPassRate: number; cases: number } | null) ??
+      null,
   }
 }
 
@@ -635,6 +661,8 @@ export interface InstalledArtifact {
   version: string
   rawSkillMd: string
   artifactHash: string
+  /** 附属文件(容器侧独立验 bundleHash 后落盘 hub)。 */
+  bundle: Record<string, string> | null
 }
 
 /**
@@ -652,8 +680,9 @@ export async function listActiveInstalledArtifacts(userId: number): Promise<Inst
     version: string
     raw_skill_md: string
     artifact_hash: string
+    raw_bundle: unknown
   }>(
-    `SELECT i.slug, v.version, v.raw_skill_md, i.artifact_hash
+    `SELECT i.slug, v.version, v.raw_skill_md, i.artifact_hash, v.raw_bundle
        FROM marketplace_installs i
        JOIN marketplace_skill_versions v ON v.id = i.version_id
        JOIN marketplace_skill_listings l ON l.slug = i.slug
@@ -667,6 +696,7 @@ export async function listActiveInstalledArtifacts(userId: number): Promise<Inst
     version: x.version,
     rawSkillMd: x.raw_skill_md,
     artifactHash: x.artifact_hash,
+    bundle: (x.raw_bundle as Record<string, string> | null) ?? null,
   }))
 }
 

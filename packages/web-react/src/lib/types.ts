@@ -641,6 +641,10 @@ export type MarketplaceDetail = {
   installCount: number;
   /** 平台预设 agent(开箱即用,无需安装)。 */
   preset?: boolean;
+  /** 附属文件(references/assets/evals;path → content)。 */
+  rawBundle?: Record<string, string> | null;
+  /** 发布者自报评测摘要(展示须标注"发布者提供")。 */
+  benchmark?: { withPassRate: number; withoutPassRate: number; cases: number } | null;
 };
 
 /** 已安装条目（GET /api/marketplace/installed 的 installed 项）。 */
@@ -694,6 +698,8 @@ export type MarketplacePending = {
   submittedBy: string;
   ownerUserId: string;
   createdAt: string;
+  rawBundle?: Record<string, string> | null;
+  benchmark?: { withPassRate: number; withoutPassRate: number; cases: number } | null;
 };
 
 /** 我的智能体项（GET /api/marketplace/my-agents：默认全能助手 + 已安装）。 */
@@ -735,6 +741,10 @@ export type MarketplacePublishInput = {
   description: string;
   body: string;
   tags: string[];
+  /** 附属文本文件(references/ assets/ evals/;scripts 暂不支持)。 */
+  files?: Array<{ path: string; content: string }>;
+  /** 发布者自报评测摘要(来自本地评测 last-run,可选)。 */
+  benchmark?: { withPassRate: number; withoutPassRate: number; cases: number };
 };
 
 /** 发布响应（200 已提交待审）。 */

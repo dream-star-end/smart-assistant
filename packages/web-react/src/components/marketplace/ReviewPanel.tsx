@@ -153,6 +153,23 @@ export function ReviewPanel({ auth }: { auth: AuthSession }) {
                     <pre className="max-h-72 overflow-auto whitespace-pre-wrap break-words rounded-lg border border-border bg-code px-3 py-2 font-mono text-[12px] leading-relaxed text-fg">
                       {r.rawArtifact}
                     </pre>
+                    {r.benchmark && (
+                      <p className="mt-2 text-[12px] text-muted">
+                        发布者自报实测:通过率 {Math.round(r.benchmark.withoutPassRate * 100)}% →{" "}
+                        {Math.round(r.benchmark.withPassRate * 100)}%（{r.benchmark.cases} 用例;未经平台验证）
+                      </p>
+                    )}
+                    {r.rawBundle &&
+                      Object.entries(r.rawBundle).map(([path, content]) => (
+                        <details key={path} className="mt-2">
+                          <summary className="cursor-pointer font-mono text-[11.5px] text-muted hover:text-fg">
+                            附属文件:{path}
+                          </summary>
+                          <pre className="mt-1 max-h-56 overflow-auto whitespace-pre-wrap break-words rounded-lg border border-border bg-code px-3 py-2 font-mono text-[11.5px] text-fg">
+                            {content}
+                          </pre>
+                        </details>
+                      ))}
                   </div>
                 )}
               </li>
