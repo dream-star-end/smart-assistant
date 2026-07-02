@@ -298,10 +298,10 @@ describe('seedPlatformResearchAgents (integ)', () => {
   })
 })
 
-describe('seedPlatformGeneralAgents (integ) — 办公助手', () => {
-  const GENERAL_SLUGS = ['office-assistant']
+describe('seedPlatformGeneralAgents (integ) — 办公助手 + 编程助手', () => {
+  const GENERAL_SLUGS = ['coding-assistant', 'office-assistant']
 
-  test('seed → 办公助手成为已批准、可搜的 agent listing(无条件,不依赖 research_config)', async (t) => {
+  test('seed → 通用 agent(办公+编程)成为已批准、可搜的 agent listing(无条件,不依赖 research_config)', async (t) => {
     if (skip(t)) return
     const admin = await createAdmin('admin@x.com')
     const r = await seedPlatformGeneralAgents({ listPublicModels })
@@ -310,14 +310,18 @@ describe('seedPlatformGeneralAgents (integ) — 办公助手', () => {
     assert.deepEqual(r.errors, [], `不应有错误:${JSON.stringify(r.errors)}`)
 
     const agents = await listApprovedForSearch('agent')
-    assert.deepEqual(agents.map((a) => a.slug).sort(), [...GENERAL_SLUGS].sort(), '办公助手应可搜')
+    assert.deepEqual(
+      agents.map((a) => a.slug).sort(),
+      [...GENERAL_SLUGS].sort(),
+      '通用 agent(办公+编程)应可搜',
+    )
 
-    // kind 隔离:办公 agent 不进 skill 目录。
+    // kind 隔离:通用 agent 不进 skill 目录。
     const skills = await listApprovedForSearch('skill')
     assert.equal(
       skills.filter((s) => GENERAL_SLUGS.includes(s.slug)).length,
       0,
-      '办公 agent 不应出现在 skill 目录',
+      '通用 agent 不应出现在 skill 目录',
     )
   })
 
@@ -332,12 +336,16 @@ describe('seedPlatformGeneralAgents (integ) — 办公助手', () => {
     assert.deepEqual(second.errors, [])
   })
 
-  test('两条入口叠加:市场同时有科研助手与办公助手(互不干扰)', async (t) => {
+  test('两条入口叠加:市场同时有科研助手 + 办公助手 + 编程助手(互不干扰)', async (t) => {
     if (skip(t)) return
     await createAdmin('admin@x.com')
     await seedPlatformResearchAgents({ listPublicModels })
     await seedPlatformGeneralAgents({ listPublicModels })
     const slugs = (await listApprovedForSearch('agent')).map((a) => a.slug).sort()
-    assert.deepEqual(slugs, ['office-assistant', 'research-assistant'], '两类平台 agent 应并存')
+    assert.deepEqual(
+      slugs,
+      ['coding-assistant', 'office-assistant', 'research-assistant'],
+      '三类平台 agent 应并存',
+    )
   })
 })

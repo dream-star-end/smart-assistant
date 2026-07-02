@@ -1225,10 +1225,10 @@ export async function registerCommercial(
           console.error("[commercial] seedPlatformResearchAgents failed:", err);
         }
       })();
-      // 平台官方**通用/办公** agent(办公助手)的幂等 seed。能力全走容器内本地渲染 CLI
-      // (oc-docx/oc-slides/oc-xlsx/oc-pdf/mmx),不依赖 research_config,故**无条件** seed;
-      // 仍受 marketplaceAgentsEnabled 的 v5 渠道门控(v3 渠道 install/search 侧滤掉)。
-      // v3 不含本调用 → 不会 seed。fire-and-forget,幂等。
+      // 平台官方**通用** agent(办公助手 + 编程助手)的幂等 seed。能力全走容器内已就绪的
+      // 本地能力(办公:oc-docx/oc-slides/oc-xlsx/oc-pdf/mmx;编程:内置 Read/Edit/Bash/Grep
+      // + git/node/python),不依赖 research_config,故**无条件** seed;仍受 marketplaceAgentsEnabled
+      // 的 v5 渠道门控(v3 渠道 install/search 侧滤掉)。v3 不含本调用 → 不会 seed。fire-and-forget,幂等。
       void (async () => {
         try {
           const seeded = await seedPlatformGeneralAgents({

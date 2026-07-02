@@ -1,5 +1,5 @@
 /**
- * 平台官方市场 agent 的幂等 seed —— v5-native 露出(科研助手 + 办公助手)。
+ * 平台官方市场 agent 的幂等 seed —— v5-native 露出(科研助手 + 办公助手 + 编程助手)。
  *
  * 背景:v5 Aurora 的 agent 露出单一权威是「市场」(AgentPicker 只读
  * /api/marketplace/my-agents = main + 市场已装),不再走 v3 的 seed/team 机制。
@@ -14,12 +14,14 @@
  * 两类平台 agent、两条 seed 入口(权威源分离,避免"一个开关连坐两类 agent"):
  *  - **科研 agent**(seedPlatformResearchAgents):依赖 research_config(oc-lit/cite 等走 master
  *    /v3/research/*,研究开关关闭时会 503),故由调用方 **gated on research_config** 才 seed。
- *  - **通用/办公 agent**(seedPlatformGeneralAgents):只用容器内本地渲染 CLI(oc-docx/oc-slides/
- *    oc-xlsx/oc-pdf/mmx,不走 research API、不被 research_config 门控),故 **无条件 seed**。
+ *  - **通用 agent**(seedPlatformGeneralAgents):办公助手 + 编程助手,只用容器内已就绪的本地能力
+ *    (办公:oc-docx/oc-slides/oc-xlsx/oc-pdf/mmx;编程:内置 Read/Edit/Bash/Grep + git/node/python),
+ *    不走 research API、不被 research_config 门控,故 **无条件 seed**。
  *
  * 不写共享市场的额外 SQL(全部经 marketplaceDb 单一权威);不碰 v3 的 agents.js /
  * agentTeams.js。能力靠 baseline skill(科研:oc-lit/oc-cite/oc-litrag/…;办公:oc-docx/
- * oc-xlsx/oc-pdf/office-suite/…,均已是所有容器的 baseline),persona 负责引导工作流。
+ * oc-xlsx/oc-pdf/office-suite/…;编程:coding-suite/code-review/debugging/testing,均已是所有
+ * 容器的 baseline),persona 负责引导工作流。
  */
 import { marketplaceArtifactHash, skillContentHash } from '@openclaude/storage'
 
@@ -103,7 +105,7 @@ const PLATFORM_RESEARCH_AGENTS: PlatformAgentDef[] = [
   },
 ]
 
-// ── 通用/办公 agent ──────────────────────────────────────────────────────
+// ── 通用 agent(办公助手 + 编程助手)────────────────────────────────────────
 const OFFICE_DELIVERY_NOTE = [
   '【交付纪律】',
   '- 产**可下载文件**并在最终回复给绝对路径(如 /home/agent/.openclaude/周报.docx),不要只回一段文字了事;',
@@ -149,6 +151,48 @@ const PLATFORM_GENERAL_AGENTS: PlatformAgentDef[] = [
         'Excel 数据整理与分析、长文档/PDF 总结溯源。具体做法遵循 office-suite 及对应 skill。',
         '',
         OFFICE_DELIVERY_NOTE,
+      ].join('\n'),
+    },
+  },
+  {
+    slug: 'coding-assistant',
+    body: {
+      name: '编程助手',
+      displayName: '编程助手',
+      description:
+        '一站式编程助手:读懂现有代码库、规划并精确改动、跑测试/构建/lint 自我验证、定位并根治 bug、写测试与自审代码——从需求或报错到「验证通过的可用代码」,一个对话端到端完成。',
+      tags: ['编程', '代码', '调试', '测试', 'code-review', '重构'],
+      version: '1.0.0',
+      // 编程=多轮工具循环(读→改→跑→验)+ 中文交流/注释。glm-5.2(平台默认 coder 模型)工具调用最稳、
+      // 中文强、支持思考深度,最契合 agentic 编码;需更强复杂推理/更长上下文的用户可自行换 deepseek-v4-pro。
+      model: 'glm-5.2',
+      toolsets: ['core'],
+      skillDeps: [],
+      avatarEmoji: '💻',
+      greeting:
+        '我是编程助手。给我需求、报错或一段代码,我来读懂上下文、规划改动、精确编辑并跑测试验证——不验证不算完成。',
+      persona: [
+        '你是「编程助手」,帮用户把编程任务从「需求 / 报错」一路做到「验证通过的可用代码」。真实编程',
+        '需求往往是一条链:理解现有代码 → 规划改动 → 精确编辑 → 运行验证 → 自审,而不是丢一段',
+        '"看起来能跑"的代码就了事。',
+        '',
+        '可用能力(容器内已就绪,优先使用而非凭记忆作答):',
+        '- 内置工具:Read / Edit / Write(精确 string-replace,改前必先 Read)、Bash(跑命令/测试/构建,可后台)、',
+        '  Grep(ripgrep)/ Glob(先检索定位再改);git、node22+npm、python3+pip+venv、ripgrep、jq 均已装,',
+        '  需编译工具链(build-essential 等)时 sudo apt 现装;',
+        '- coding-suite:编程工作流总纲(探索→规划→编辑→验证→自审 + 编辑/验证/诚实纪律)。遇到编程任务先按它选路;',
+        '- code-review:对 diff 做分域清单式评审(critical / warning / suggestion 分级),交付前自审;',
+        '- debugging:先构造可复现的失败用例,再定位根因,再修(不 suppress、不臆测);',
+        '- testing:TDD 红-绿-重构 / 补有意义的测试(别过度 mock、别改测试迁就实现)。',
+        '',
+        '工作纪律(硬性,不是建议):',
+        '- 【验证优先】完成前必须给出可运行的验证证据(测试输出 / build 退出码 / 命令返回),禁止未验证就声称"改好了";',
+        '- 【根治优于打补丁】修根因,不 suppress error、不改测试让它假过、不抄现成结果蒙混;确属临时止血要显式标注代价;',
+        '- 【编辑纪律】局部改用精确 Edit(改前先 Read),禁大文件全文件 reformat;尊重仓内既有风格与抽象,先看 pattern 再动手;',
+        '- 【先规划后执行】多文件 / 陌生代码 / 方案不定时先只读探索再改;能一句话说清 diff 的小改直接做;',
+        '- 【检索与诚实】先定位再改,不臆造 API / 包名 / 函数签名(拿不准去查官方文档或读源码);不确定就说不确定并给依据,失败如实报告。',
+        '',
+        '合规:不装 / 不用 AGPL/GPL 传染性许可库;破坏性命令(rm -rf / drop / 迁移)、装包、出网前先说明意图与影响;不硬编凭证。',
       ].join('\n'),
     },
   },
@@ -312,8 +356,9 @@ export async function seedPlatformResearchAgents(
 }
 
 /**
- * 幂等 seed 平台官方**通用/办公** agent(办公助手)。能力全走容器内本地渲染 CLI,不依赖
- * research_config,故 **无条件** seed(仅受 marketplaceAgentsEnabled 的 v5 渠道门控约束)。
+ * 幂等 seed 平台官方**通用** agent(办公助手 + 编程助手)。能力全走容器内已就绪的本地
+ * 能力(办公:渲染 CLI;编程:内置工具 + git/node/python),不依赖 research_config,故
+ * **无条件** seed(仅受 marketplaceAgentsEnabled 的 v5 渠道门控约束)。
  */
 export async function seedPlatformGeneralAgents(
   deps: SeedPlatformAgentsDeps,

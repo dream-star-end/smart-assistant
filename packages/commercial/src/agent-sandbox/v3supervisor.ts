@@ -292,6 +292,10 @@ export const V3_CCB_BASELINE_SKILL_NAMES = [
   "office-spreadsheet",
   "office-pdf",
   "office-suite",
+  "coding-suite",
+  "code-review",
+  "debugging",
+  "testing",
 ] as const;
 
 /**
