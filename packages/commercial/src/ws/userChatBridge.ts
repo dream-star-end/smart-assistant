@@ -1344,20 +1344,17 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 for (const f of replay.sent) {
                   try { userWs.send(f.data); } catch { break; }
                 }
-              } else {
-                try {
-                  userWs.send(JSON.stringify({
-                    type: "outbound.resume_failed",
-                    sessionKey,
-                    channel: "webchat",
-                    peer: { id: peer.peerId, kind: "dm" },
-                    from: cursor,
-                    to: replay.to,
-                    reason: replay.reason,
-                    ts: Date.now(),
-                  }));
-                } catch { /* swallow — userWs may be closing */ }
               }
+              // miss 时【刻意不发 resume_failed】—— replay 的唯一裁决者是容器:
+              // hello 会原样转发给容器,其 ring 与 master 生命周期解耦(master 重启
+              // 容器不重启),能重放就重放、真不能才由容器发 resume_failed。
+              // 旧行为(bridge miss 即抢发)在 master 重启后必然触发:bridge ring
+              // 新进程恒空 → 客户端被 resume_failed 打断(游标重置 + REST 快照覆盖
+              // 本地流中 partial),容器随后完好的重放反而作废 —— boss 实测:重启时
+              // 响应中的消息内容永久丢失,只剩重连后的续帧(2026-07-02)。
+              // bridge ring 的定位收敛为「hit 时的近端加速」,不再参与失败裁决;
+              // 容器不可达的场景由既有连接超时/relay 断开路径关闭 userWs → 客户端
+              // 重连,不会死等。
             }
             // Phase 4 — auto-rebind:记录 hello peers,触发 flush(可能等 fetch 完成)。
             //   双触发设计:hello 端记 peer 集合 → tryAutoRebindFlush;

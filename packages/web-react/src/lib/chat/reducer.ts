@@ -94,9 +94,13 @@ function acceptFrameSeq(sess: ChatSession, frame: { frameSeq?: number; sessionKe
   return true;
 }
 
-/** 公开给 resume_failed：把游标直推到 server currentLast（§4）。*/
+/** 公开给 resume_failed：把游标推到 server currentLast（§4）。
+ *  只进不退:重启后的空 ring/陈旧信号可能带 to=0 或倒退值,回退游标会让后续
+ *  重放帧被当新帧重复应用/让本地状态被无谓重置(纵深防御,主修在 bridge 侧)。*/
 export function advanceFrameSeqCursorTo(sess: ChatSession, frame: { sessionKey?: string }, to: number): void {
-  setFrameSeqCursor(sess, frameSeqKey(frame, sess.id), to);
+  const key = frameSeqKey(frame, sess.id);
+  const last = getFrameSeqCursor(sess._lastFrameSeqByKey, sess._lastFrameSeq, key);
+  if (to > last) setFrameSeqCursor(sess, key, to);
 }
 
 // ═══════════════ delegate / subagent helpers（websocket.js:800-1172）═══════════════

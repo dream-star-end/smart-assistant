@@ -594,3 +594,15 @@ describe("ChatSocket auto-continue deterministic idempotencyKey (#3)", () => {
     expect(autocont.idempotencyKey).toBe(`autocont-s1-${userMsg.id}`);
   });
 });
+
+describe("resume_failed 游标只进不退(master 重启空 ring 防御)", () => {
+  test("to 小于当前游标时不回退(容器随后重放的帧不被误判重复/状态不被重置)", () => {
+    const s = sess();
+    applyResumeFailed(s, { type: "outbound.resume_failed", sessionKey: "agent:main:webchat:dm:s1", channel: "webchat", peer: { id: "s1", kind: "dm" }, from: 0, to: 42, reason: "buffer_miss" } as never, {});
+    expect(s._lastFrameSeqByKey?.["agent:main:webchat:dm:s1"]).toBe(42);
+    // 重启后的陈旧信号 to=0 → 游标不动
+    applyResumeFailed(s, { type: "outbound.resume_failed", sessionKey: "agent:main:webchat:dm:s1", channel: "webchat", peer: { id: "s1", kind: "dm" }, from: 0, to: 0, reason: "no_buffer" } as never, {});
+    expect(s._lastFrameSeqByKey?.["agent:main:webchat:dm:s1"]).toBe(42);
+  });
+});
+
