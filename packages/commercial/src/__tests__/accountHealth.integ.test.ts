@@ -279,6 +279,30 @@ describe("halfOpen", () => {
     assert.equal(await redis.get(failKey(idReady)), null);
   });
 
+  test("0098 channel 划分:他 channel 的 codex 行不被本实例 halfOpen 越权恢复", async (t) => {
+    if (skipIfNoDb(t)) return;
+    // 本测试环境 OC_RUNTIME_CHANNEL 未设 → getRuntimeChannel()='v3'。
+    // v5 codex 行(他 channel)cooldown 已到期也不许翻;v3 codex 行(本 channel)照常恢复。
+    const foreign = await createAccount({
+      runtime_channel: "v5", provider: "codex", label: "h-codex-v5", plan: "pro",
+      token: "T", refresh: "R", egress_proxy_id: TEST_EGRESS_PROXY_ID,
+    }, keyFn);
+    const own = await createAccount({
+      runtime_channel: "v3", provider: "codex", label: "h-codex-v3", plan: "pro",
+      token: "T", refresh: "R", egress_proxy_id: TEST_EGRESS_PROXY_ID,
+    }, keyFn);
+    const expired = { status: "cooldown" as const, cooldown_until: new Date(Date.now() - 60_000), health_score: 40 };
+    await updateAccount(foreign.id, expired, keyFn);
+    await updateAccount(own.id, expired, keyFn);
+    const tracker = new AccountHealthTracker({ redis: new InMemoryHealthRedis() });
+    const recovered = await tracker.halfOpen();
+    const ids = recovered.map((h) => h.id);
+    assert.ok(ids.includes(own.id), "本 channel codex 行应恢复");
+    assert.ok(!ids.includes(foreign.id), "他 channel codex 行不得被越权恢复");
+    assert.equal((await getAccount(foreign.id))!.status, "cooldown");
+    assert.equal((await getAccount(own.id))!.status, "active");
+  });
+
   test("无可恢复账号 → 返空数组", async (t) => {
     if (skipIfNoDb(t)) return;
     const tracker = new AccountHealthTracker({ redis: new InMemoryHealthRedis() });

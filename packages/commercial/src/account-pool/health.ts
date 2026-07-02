@@ -29,6 +29,7 @@
 
 import type { QueryResultRow } from "pg";
 import { query } from "../db/queries.js";
+import { getRuntimeChannel } from "../runtimeChannel.js";
 import type { AccountStatus } from "./store.js";
 
 /** 连续失败多少次后熔断。规约值 3,可测试覆盖。 */
@@ -208,6 +209,9 @@ export class AccountHealthTracker {
    */
   async halfOpen(): Promise<AccountHealth[]> {
     const res = await query<RawHealthRow>(
+      // 0098 channel 划分:codex 行的状态权威按 runtime_channel 归属,本实例的
+      // 自动半开恢复不越权翻其他 channel 的 codex 行(claude 行维持共享池语义
+      // 不过滤)。与 v3 侧 fix/v3-codex-channel-filter 的 halfOpen 守卫对称。
       `UPDATE claude_accounts
        SET status = 'active',
            health_score = 50,
@@ -216,7 +220,9 @@ export class AccountHealthTracker {
        WHERE status = 'cooldown'
          AND cooldown_until IS NOT NULL
          AND cooldown_until < NOW()
+         AND NOT (provider = 'codex' AND runtime_channel <> $1)
        RETURNING id::text AS id, status, health_score, cooldown_until`,
+      [getRuntimeChannel()],
     );
     const recovered = res.rows.map(parseHealth);
     for (const h of recovered) {
