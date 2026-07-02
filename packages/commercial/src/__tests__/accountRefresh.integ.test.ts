@@ -167,6 +167,7 @@ describe('refreshAccountToken — 成功路径', () => {
     if (skipIfNoDb(t)) return
     const a = await createAccount(
       {
+        runtime_channel: 'v3',
         label: 'r1',
         plan: 'pro',
         token: 'OLD-ACCESS',
@@ -201,6 +202,7 @@ describe('refreshAccountToken — 成功路径', () => {
     if (skipIfNoDb(t)) return
     const a = await createAccount(
       {
+        runtime_channel: 'v3',
         label: 'r2',
         plan: 'max',
         token: 'OLD-A',
@@ -229,6 +231,7 @@ describe('refreshAccountToken — 成功路径', () => {
     if (skipIfNoDb(t)) return
     const a = await createAccount(
       {
+        runtime_channel: 'v3',
         label: 'r-es',
         plan: 'pro',
         token: 'T',
@@ -251,6 +254,7 @@ describe('refreshAccountToken — 成功路径', () => {
     if (skipIfNoDb(t)) return
     const a = await createAccount(
       {
+        runtime_channel: 'v3',
         label: 'r-em',
         plan: 'pro',
         token: 'T',
@@ -273,6 +277,7 @@ describe('refreshAccountToken — 成功路径', () => {
     if (skipIfNoDb(t)) return
     const a = await createAccount(
       {
+        runtime_channel: 'v3',
         label: 'r-fb',
         plan: 'pro',
         token: 'T',
@@ -294,6 +299,7 @@ describe('refreshAccountToken — 成功路径', () => {
     if (skipIfNoDb(t)) return
     const a = await createAccount(
       {
+        runtime_channel: 'v3',
         label: 'r-le',
         plan: 'pro',
         token: 'T',
@@ -319,6 +325,7 @@ describe('refreshAccountToken — 成功路径', () => {
     if (skipIfNoDb(t)) return
     const a = await createAccount(
       {
+        runtime_channel: 'v3',
         label: 'r-form',
         plan: 'pro',
         token: 'T',
@@ -359,7 +366,7 @@ describe('refreshAccountToken — 失败路径(禁用 + 抛)', () => {
   test('无 refresh_token → 禁用 + 抛 no_refresh_token', async (t) => {
     if (skipIfNoDb(t)) return
     const a = await createAccount(
-      { label: 'nr', plan: 'pro', token: 'T', egress_proxy_id: TEST_EGRESS_PROXY_ID },
+      { runtime_channel: 'v3', label: 'nr', plan: 'pro', token: 'T', egress_proxy_id: TEST_EGRESS_PROXY_ID },
       keyFn,
     )
     await assert.rejects(
@@ -378,6 +385,7 @@ describe('refreshAccountToken — 失败路径(禁用 + 抛)', () => {
     // 再当永久错。Cloudflare/anthropic gateway 抖一次就把整池烧光代价过大。
     const a = await createAccount(
       {
+        runtime_channel: 'v3',
         label: 'h502',
         plan: 'pro',
         token: 'T',
@@ -407,6 +415,7 @@ describe('refreshAccountToken — 失败路径(禁用 + 抛)', () => {
     if (skipIfNoDb(t)) return
     const a = await createAccount(
       {
+        runtime_channel: 'v3',
         label: 'h400',
         plan: 'pro',
         token: 'T',
@@ -437,6 +446,7 @@ describe('refreshAccountToken — 失败路径(禁用 + 抛)', () => {
     if (skipIfNoDb(t)) return
     const a = await createAccount(
       {
+        runtime_channel: 'v3',
         label: 'badjson',
         plan: 'pro',
         token: 'T',
@@ -462,6 +472,7 @@ describe('refreshAccountToken — 失败路径(禁用 + 抛)', () => {
     if (skipIfNoDb(t)) return
     const a = await createAccount(
       {
+        runtime_channel: 'v3',
         label: 'nokey',
         plan: 'pro',
         token: 'T',
@@ -487,6 +498,7 @@ describe('refreshAccountToken — 失败路径(禁用 + 抛)', () => {
     if (skipIfNoDb(t)) return
     const a = await createAccount(
       {
+        runtime_channel: 'v3',
         label: 'net',
         plan: 'pro',
         token: 'T',
@@ -519,6 +531,7 @@ describe('refreshAccountToken — 失败路径(禁用 + 抛)', () => {
     if (skipIfNoDb(t)) return
     const a = await createAccount(
       {
+        runtime_channel: 'v3',
         label: 'h-dep',
         plan: 'pro',
         token: 'T',
@@ -554,6 +567,7 @@ describe('refreshAccountToken — 并发删除', () => {
     if (skipIfNoDb(t)) return
     const a = await createAccount(
       {
+        runtime_channel: 'v3',
         label: 'gone',
         plan: 'pro',
         token: 'T',
@@ -584,7 +598,7 @@ describe('refreshAccountToken — singleflight (#H8)', () => {
   test('同账号 5 个并发 refresh → http.post 只被打 1 次,5 个 waiter 都拿到结果', async (t) => {
     if (skipIfNoDb(t)) return
     const a = await createAccount(
-      { label: 'sf', plan: 'pro', token: 'T', refresh: 'R', egress_proxy_id: TEST_EGRESS_PROXY_ID },
+      { runtime_channel: 'v3', label: 'sf', plan: 'pro', token: 'T', refresh: 'R', egress_proxy_id: TEST_EGRESS_PROXY_ID },
       keyFn,
     )
 
@@ -630,6 +644,7 @@ describe('refreshAccountToken — singleflight (#H8)', () => {
     if (skipIfNoDb(t)) return
     const a = await createAccount(
       {
+        runtime_channel: 'v3',
         label: 'sf-fail',
         plan: 'pro',
         token: 'T',

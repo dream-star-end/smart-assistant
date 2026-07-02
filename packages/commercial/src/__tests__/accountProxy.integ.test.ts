@@ -114,7 +114,7 @@ describe("端到端 - 正常流", () => {
   test("pick → streamClaude → 透传事件", async (t) => {
     if (skipIfNoDb(t)) return;
     const a = await createAccount(
-      { label: "e2e", plan: "pro", token: "VALID-TOKEN", refresh: "R", egress_proxy_id: TEST_EGRESS_PROXY_ID },
+      { runtime_channel: "v3", label: "e2e", plan: "pro", token: "VALID-TOKEN", refresh: "R", egress_proxy_id: TEST_EGRESS_PROXY_ID },
       keyFn,
     );
     // 用 getTokenForUse 读出真明文 buffer
@@ -151,6 +151,7 @@ describe("端到端 - token 过期 → refresh → 重试", () => {
     if (skipIfNoDb(t)) return;
     const a = await createAccount(
       {
+        runtime_channel: "v3",
         label: "e2e-401",
         plan: "pro",
         token: "EXPIRED-TOKEN",
@@ -246,7 +247,7 @@ describe("端到端 - refresh 失败 → 账号禁用", () => {
   test("refresh 返 401 → RefreshError + status=disabled + last_error 记录", async (t) => {
     if (skipIfNoDb(t)) return;
     const a = await createAccount(
-      { label: "e2e-fail", plan: "pro", token: "X", refresh: "BAD-R", egress_proxy_id: TEST_EGRESS_PROXY_ID },
+      { runtime_channel: "v3", label: "e2e-fail", plan: "pro", token: "X", refresh: "BAD-R", egress_proxy_id: TEST_EGRESS_PROXY_ID },
       keyFn,
     );
     const refreshHttp: RefreshHttpClient = {

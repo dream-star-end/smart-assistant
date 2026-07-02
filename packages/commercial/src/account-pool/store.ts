@@ -29,7 +29,11 @@ import { getPool } from "../db/index.js";
 import { query, tx } from "../db/queries.js";
 import { encrypt, decryptToBuffer, AeadError } from "../crypto/aead.js";
 import { loadKmsKey, zeroBuffer } from "../crypto/keys.js";
+import type { RuntimeChannel } from "../runtimeChannel.js";
 import { generatePersona, assertPersona } from "./persona.js";
+
+/** 0098 — runtime_channel 合法值(与 migration CHECK IN ('v3','v5') 同源)。 */
+const RUNTIME_CHANNELS: readonly RuntimeChannel[] = ["v3", "v5"];
 
 export const ACCOUNT_PLANS = ["pro", "max", "team"] as const;
 export type AccountPlan = (typeof ACCOUNT_PLANS)[number];
@@ -112,6 +116,11 @@ export interface AccountRow {
    * lazy refresh 触发条件见 anthropicProxy.ts:1417 / shouldRefresh()。
    */
   has_refresh_token: boolean;
+  /**
+   * 0098 — runtime channel 归属(v3|v5)。codex 账号池的 channel 划分权威:
+   * refresh actor / scheduler / groups 均按它过滤(单账号单刷新权威)。
+   */
+  runtime_channel: RuntimeChannel;
   created_at: Date;
   updated_at: Date;
 }
@@ -209,6 +218,17 @@ export interface CreateAccountInput {
   account_uuid?: string | null;
   /** Optional group binding. Admin layer validates provider/kind compatibility. */
   group_id?: bigint | string | null;
+  /**
+   * 0098(P0-2 修复)—— 账号 runtime channel 归属,**必填**(不允许静默吃 DB
+   * DEFAULT 'v3':v5 实例建号如果落 'v3',codex refresh actor / scheduler /
+   * groups 按 channel 过滤后该行对 v5 不可见 → v5 池子静默为空;而 v3 leader
+   * 会去刷这条本该归 v5 的 refresh 链,双 master 共刷同链会触发 OAuth family
+   * 吊销)。
+   *
+   * 调用方(admin layer)一律传 getRuntimeChannel() —— 本实例建的号归本实例;
+   * 跨 channel 迁移是显式 admin 操作(整行改 runtime_channel),不在 create 面。
+   */
+  runtime_channel: RuntimeChannel;
 }
 
 /**
@@ -290,6 +310,7 @@ const META_COLUMNS = `
   egress_proxy_id::text AS egress_proxy_id,
   egress_host_uuid::text AS egress_host_uuid,
   (oauth_refresh_enc IS NOT NULL AND oauth_refresh_nonce IS NOT NULL) AS has_refresh_token,
+  runtime_channel,
   created_at,
   updated_at
 `;
@@ -319,6 +340,7 @@ interface RawMetaRow extends QueryResultRow {
   egress_proxy_id: string | null;
   egress_host_uuid: string | null;
   has_refresh_token: boolean;
+  runtime_channel: RuntimeChannel;
   created_at: Date;
   updated_at: Date;
 }
@@ -383,6 +405,7 @@ function parseMetaRow(row: RawMetaRow): AccountRow {
     egress_proxy_id: row.egress_proxy_id !== null ? BigInt(row.egress_proxy_id) : null,
     egress_host_uuid: row.egress_host_uuid,
     has_refresh_token: row.has_refresh_token,
+    runtime_channel: row.runtime_channel,
     created_at: row.created_at,
     updated_at: row.updated_at,
   };
@@ -415,6 +438,14 @@ export async function createAccount(
     throw new TypeError("egress_proxy_id is required (0055)");
   }
   const egressProxyId = String(input.egress_proxy_id);
+  // 0098(P0-2):runtime_channel 必填 —— 不允许静默吃 DB DEFAULT 'v3'
+  // (v5 建号落 'v3' = v5 池子静默为空 + v3/v5 双 master 共刷同一 refresh 链)。
+  // 与 provider/plan 同款 runtime 兜底,防 JS 调用方绕过 TS 签名。
+  if (!RUNTIME_CHANNELS.includes(input.runtime_channel)) {
+    throw new TypeError(
+      `invalid runtime_channel: ${String((input as { runtime_channel?: unknown }).runtime_channel)} (expect 'v3'|'v5')`,
+    );
+  }
 
   const key = keyFn();
   try {
@@ -451,9 +482,10 @@ export async function createAccount(
          subscription_end_at,
          egress_proxy, egress_proxy_id,
          account_uuid,
-         persona
+         persona,
+         runtime_channel
        )
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NULL, $11, $12, $13::jsonb)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NULL, $11, $12, $13::jsonb, $14)
        RETURNING ${META_COLUMNS}`,
       [
         provider,
@@ -469,6 +501,7 @@ export async function createAccount(
         egressProxyId,
         accountUuid,
         JSON.stringify(persona),
+        input.runtime_channel,
       ],
     );
     return parseMetaRow(res.rows[0]);

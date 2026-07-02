@@ -145,6 +145,11 @@ import {
 } from './toolsetIntent.js'
 import { resolveOpenClaudeVisionEntry } from './subprocessRunner.js'
 import {
+  handleV3CodexRelayLocal,
+  readV3CodexRelayConfig,
+  V3_CODEX_RELAY_PREFIX,
+} from './v3CodexRelay.js'
+import {
   OPENCLAUDE_VISION_MCP_ID,
   OPENCLAUDE_VISION_TOOLS,
   shouldEnableOpenClaudeVision,
@@ -1682,6 +1687,27 @@ export class Gateway {
       }
     })
 
+
+    // v3 commercial Codex local relay(M1a 复活)。Codex CLI uses Authorization
+    // for its upstream token, so the container gateway must translate it into a
+    // private header and authenticate to master with OPENCLAUDE_V3_CONTAINER_TOKEN.
+    // The handler is loopback-only; other bridge containers cannot use it.
+    if (url.pathname === V3_CODEX_RELAY_PREFIX || url.pathname.startsWith(`${V3_CODEX_RELAY_PREFIX}/`)) {
+      const relayCfg = readV3CodexRelayConfig(process.env)
+      if (!relayCfg) {
+        this.sendJson(res, 404, { error: { code: 'CODEX_RELAY_NOT_CONFIGURED', message: 'codex relay not configured' } })
+        return
+      }
+      handleV3CodexRelayLocal(req, res, relayCfg).catch((err) => {
+        this.log.error('v3 codex local relay crashed', undefined, err)
+        if (!res.headersSent) {
+          try { this.sendJson(res, 500, { error: { code: 'INTERNAL', message: 'codex relay crashed' } }) } catch {}
+        } else {
+          try { res.end() } catch {}
+        }
+      })
+      return
+    }
 
     // ── Multi-user login (no auth required, rate-limited) ──
     if (url.pathname === '/api/auth/login' && req.method === 'POST') {
@@ -8039,18 +8065,18 @@ export class Gateway {
       agent = routed.agent
     }
 
-    // ── plan v3 §B/§B1: model→agent fail-closed routing ──
-    // 把 inferAgentForModel 接到生产 message 链路。在 agent 已确定 + safeModel 已审过
-    // 之后做家族匹配判定:
-    //   - gpt-* 模型 + 显式非 codex agent / 默认 agent + gpt-* → 路由到固定 id 'codex'
-    //   - claude-* / deepseek-* 模型 + 当前仍在 codex agent(用户刚从 GPT 切到
-    //     非 GPT 模型)→ 路由回非 codex agent,让 CCB/Anthropic-compatible
-    //     proxy 承接 Claude/DeepSeek
-    //   - 找不到 codex agent / 不是 codex-native → fail closed(error='no_codex_agent')
-    //   - gpt-* + 显式非 codex agent → fail closed(error='mismatch')
-    // 失败 → 立刻向 user 回 error 帧并 return,不进 sessionManager。这样未授权用户
-    // 即便绕过 modelPicker 直接 POST,也不会暴露 codex agent 的存在 / 配置状态
-    // (canUseModel 在 ws bridge 层已先于此路径拦截,这是 belt-and-suspenders)。
+    // ── model→agent 路由(M1a engine registry 语义)──
+    // 把 inferAgentForModel 接到生产 message 链路。M1a 起底座选择不再由 agent 承载:
+    //   - engine 由 sessionManager.getOrCreate 经 engine/registry 的 resolveEngine
+    //     按 model 判定(gpt-5.5 → 'codex',其余 → 'ccb';codex-native pin 例外),
+    //     **agent 不换** —— 任何 agent 都能以 gpt-5.5 跑 codex 底座,persona/skills/
+    //     记忆随 agent 保持不变;
+    //   - 本 helper 只回答"哪个 agent":requested agent 存在则用之,否则回落
+    //     default(或首个)agent;完全无 agent 可用才 fail closed
+    //     (error='no_compatible_agent',立刻回 error 帧并 return,不进 sessionManager)。
+    // 模型准入由 ALLOWED_INBOUND_MODELS(入站帧)+ resolveExecutionModel
+    // (agent.model 绕过口)收口;canUseModel 在 ws bridge 层已先于此路径拦截,
+    // 这是 belt-and-suspenders。
     const _frameModelRaw = (frame as any).model
     const safeModelForRouting: string | undefined =
       typeof _frameModelRaw === 'string' && ALLOWED_INBOUND_MODELS.has(_frameModelRaw)
@@ -8205,6 +8231,11 @@ export class Gateway {
       // 仅用于**新建** runner 时初始化 effort;既存 session 的切换由 submit() 处理
       // (在那里和 turn 入队原子串行,避免并发 submit 之间互相覆盖)。
       effortLevel: safeEffortLevel,
+      // M1a 跨 engine 切模型:入站 desired model 参与 getOrCreate 的 engine 判定
+      // (resolveEngine 单一权威)。同 sessionKey 上 glm-5.2 ↔ gpt-5.5 切换在此
+      // 触发 engine teardown + compact transcript preamble;同 engine 内的模型
+      // 切换仍由 submit() 的 setModel + shutdown 处理。
+      model: safeModel,
     })
     const wechatDispatchStarted = (frame as any)._wechatDispatchStarted
     if (typeof wechatDispatchStarted === 'function') {
@@ -8888,6 +8919,41 @@ export class Gateway {
         // ts / frameSeq 由 deliver() 在 ring 落地时一并 stamp,这里不预填
         // (与 outbound.codex_billing / outbound.error 同 wire stamp 模式)。
         this.deliver(turnStatusFrame, adapter)
+      } else if (e.kind === 'codex_billing') {
+        // M1a 复活(原 PR2 v1.0.66)— codex turn 终态侧信道。CodexAdapter 在内核
+        // result 帧上经 'billing' 通道 emit,sessionManager 包装成 'codex_billing'
+        // 事件,server.ts 这里发 outbound.codex_billing 帧给 master(走 deliver()
+        // 同样路径,落到 userChatBridge 的 onContainerMessage,master 拦截 settle,
+        // 真扣费接线在 M2)。
+        //
+        // 不影响 turn 流式 UX:这帧与 outbound.message/error 并存,前端不识别此 type
+        // 在 default case 静默忽略。master 拦截后不 forward 到 user。
+        //
+        // 用 deliver() 是因为它已经处理 frameSeq + ring + per-peer 路由。路由三件套
+        // 从 out 复制(同 OutboundError 模式);billing 只去 master,master 从
+        // requestId 找 inflight,不读这三字段做 settle。CG7 — traceId 随
+        // _inheritOutboundRouting 从 main `out` 继承(billing 行可按 traceId 反查
+        // 产生它的 turn)。
+        //
+        // M2 — engineSessionId 进 wire 帧:EngineBillingEvent.engineSessionId
+        // (adapter 构造时经唯一 helper engineSessionId(sessionKey) 派生)是 master
+        // settle 落 usage_records.session_id 的权威值;与 _reportTurnWaive 的
+        // idle-timeout 免单上报同源同值(方案红线:settle=waive 同一
+        // engineSessionId,否则 refund.refundSessionWindow 圈不到 codex 记录)。
+        const billingFrame: OutboundCodexBilling & { _userId?: string } = {
+          type: 'outbound.codex_billing',
+          ..._inheritOutboundRouting(out),
+          requestId: e.requestId,
+          engineSessionId: e.engineSessionId,
+          status: e.status,
+          durationMs: e.durationMs,
+          ...(e.usage ? { usage: e.usage } : {}),
+          ...(e.errorReason ? { errorReason: e.errorReason } : {}),
+          // Issue A v1.0.108 — codex rateLimits 快照,master.userChatBridge 落库到
+          // claude_accounts.quota_*。optional 字段缺省时自然不带。
+          ...(e.rateLimits ? { rateLimits: e.rateLimits } : {}),
+        }
+        this.deliver(billingFrame, adapter)
       } else if (e.kind === 'error') {
         // Plan 2 — turn 终态前清 turn_status cache,语义同 final 分支。
         session.currentTurnStatus = null

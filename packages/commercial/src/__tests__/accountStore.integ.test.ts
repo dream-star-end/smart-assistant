@@ -126,7 +126,7 @@ describe("createAccount", () => {
     if (skipIfNoDb(t)) return;
     const ACCESS = "sk-ant-sid01-ACCESS-TOKEN-xyz-999";
     const row = await createAccount(
-      { label: "pro-boss-1", plan: "pro", token: ACCESS, egress_proxy_id: TEST_EGRESS_PROXY_ID },
+      { runtime_channel: "v3", label: "pro-boss-1", plan: "pro", token: ACCESS, egress_proxy_id: TEST_EGRESS_PROXY_ID },
       keyFn,
     );
     assert.equal(row.label, "pro-boss-1");
@@ -153,7 +153,7 @@ describe("createAccount", () => {
   test("createAccount 含 refresh → refresh 列也加密,且和 access 不同", async (t) => {
     if (skipIfNoDb(t)) return;
     const row = await createAccount(
-      { label: "max-1", plan: "max", token: "ACC_TOKEN", refresh: "REF_TOKEN", egress_proxy_id: TEST_EGRESS_PROXY_ID },
+      { runtime_channel: "v3", label: "max-1", plan: "max", token: "ACC_TOKEN", refresh: "REF_TOKEN", egress_proxy_id: TEST_EGRESS_PROXY_ID },
       keyFn,
     );
     const raw = await readRawSecretColumns(row.id);
@@ -165,10 +165,38 @@ describe("createAccount", () => {
     assert.ok(!raw.oauth_nonce.equals(raw.oauth_refresh_nonce as Buffer));
   });
 
+  // 0098(P0-2)—— 建号必须显式落 runtime_channel(不吃 DB DEFAULT 'v3'):
+  // v5 实例建的 codex 账号若落 'v3',v5 侧 refresh actor / scheduler 按 channel
+  // 过滤后看不见该行(池子静默为空),v3 leader 还会去共刷同一 refresh 链。
+  test("runtime_channel 显式写入:'v5' 建号返回行与 DB 行都是 'v5'", async (t) => {
+    if (skipIfNoDb(t)) return;
+    const row = await createAccount(
+      { runtime_channel: "v5", label: "chan-v5", plan: "pro", token: "T-C5", egress_proxy_id: TEST_EGRESS_PROXY_ID },
+      keyFn,
+    );
+    assert.equal(row.runtime_channel, "v5");
+    const r = await query<{ runtime_channel: string }>(
+      "SELECT runtime_channel FROM claude_accounts WHERE id = $1",
+      [row.id.toString()],
+    );
+    assert.equal(r.rows[0]?.runtime_channel, "v5");
+
+    const v3row = await createAccount(
+      { runtime_channel: "v3", label: "chan-v3", plan: "pro", token: "T-C3", egress_proxy_id: TEST_EGRESS_PROXY_ID },
+      keyFn,
+    );
+    assert.equal(v3row.runtime_channel, "v3");
+    const r3 = await query<{ runtime_channel: string }>(
+      "SELECT runtime_channel FROM claude_accounts WHERE id = $1",
+      [v3row.id.toString()],
+    );
+    assert.equal(r3.rows[0]?.runtime_channel, "v3");
+  });
+
   test("非法 plan → TypeError", async (t) => {
     if (skipIfNoDb(t)) return;
     await assert.rejects(
-      createAccount({ label: "x", plan: "FREE" as unknown as "pro", token: "t", egress_proxy_id: TEST_EGRESS_PROXY_ID }, keyFn),
+      createAccount({ runtime_channel: "v3", label: "x", plan: "FREE" as unknown as "pro", token: "t", egress_proxy_id: TEST_EGRESS_PROXY_ID }, keyFn),
       TypeError,
     );
   });
@@ -176,7 +204,7 @@ describe("createAccount", () => {
   test("空 token → TypeError", async (t) => {
     if (skipIfNoDb(t)) return;
     await assert.rejects(
-      createAccount({ label: "x", plan: "pro", token: "", egress_proxy_id: TEST_EGRESS_PROXY_ID }, keyFn),
+      createAccount({ runtime_channel: "v3", label: "x", plan: "pro", token: "", egress_proxy_id: TEST_EGRESS_PROXY_ID }, keyFn),
       TypeError,
     );
   });
@@ -185,8 +213,8 @@ describe("createAccount", () => {
 describe("listAccounts / getAccount", () => {
   test("listAccounts 不含密文/nonce 列(白名单防回退)", async (t) => {
     if (skipIfNoDb(t)) return;
-    await createAccount({ label: "L1", plan: "pro", token: "T1", egress_proxy_id: TEST_EGRESS_PROXY_ID }, keyFn);
-    await createAccount({ label: "L2", plan: "max", token: "T2", refresh: "R2", egress_proxy_id: TEST_EGRESS_PROXY_ID }, keyFn);
+    await createAccount({ runtime_channel: "v3", label: "L1", plan: "pro", token: "T1", egress_proxy_id: TEST_EGRESS_PROXY_ID }, keyFn);
+    await createAccount({ runtime_channel: "v3", label: "L2", plan: "max", token: "T2", refresh: "R2", egress_proxy_id: TEST_EGRESS_PROXY_ID }, keyFn);
     const list = await listAccounts();
     assert.equal(list.length, 2);
     // 断言返的对象集合的 key 不含密文相关字段
@@ -203,8 +231,8 @@ describe("listAccounts / getAccount", () => {
 
   test("listAccounts 按 id DESC", async (t) => {
     if (skipIfNoDb(t)) return;
-    const a = await createAccount({ label: "first", plan: "pro", token: "T1", egress_proxy_id: TEST_EGRESS_PROXY_ID }, keyFn);
-    const b = await createAccount({ label: "second", plan: "pro", token: "T2", egress_proxy_id: TEST_EGRESS_PROXY_ID }, keyFn);
+    const a = await createAccount({ runtime_channel: "v3", label: "first", plan: "pro", token: "T1", egress_proxy_id: TEST_EGRESS_PROXY_ID }, keyFn);
+    const b = await createAccount({ runtime_channel: "v3", label: "second", plan: "pro", token: "T2", egress_proxy_id: TEST_EGRESS_PROXY_ID }, keyFn);
     const list = await listAccounts();
     assert.equal(list[0].id, b.id);
     assert.equal(list[1].id, a.id);
@@ -212,8 +240,8 @@ describe("listAccounts / getAccount", () => {
 
   test("listAccounts status 过滤", async (t) => {
     if (skipIfNoDb(t)) return;
-    const a = await createAccount({ label: "active", plan: "pro", token: "T1", egress_proxy_id: TEST_EGRESS_PROXY_ID }, keyFn);
-    const d = await createAccount({ label: "disabled", plan: "pro", token: "T2", egress_proxy_id: TEST_EGRESS_PROXY_ID }, keyFn);
+    const a = await createAccount({ runtime_channel: "v3", label: "active", plan: "pro", token: "T1", egress_proxy_id: TEST_EGRESS_PROXY_ID }, keyFn);
+    const d = await createAccount({ runtime_channel: "v3", label: "disabled", plan: "pro", token: "T2", egress_proxy_id: TEST_EGRESS_PROXY_ID }, keyFn);
     await updateAccount(d.id, { status: "disabled" }, keyFn);
     const actives = await listAccounts({ status: "active" });
     assert.equal(actives.length, 1);
@@ -232,7 +260,7 @@ describe("listAccounts / getAccount", () => {
 
   test("getAccount 命中 / 不存在", async (t) => {
     if (skipIfNoDb(t)) return;
-    const a = await createAccount({ label: "g", plan: "pro", token: "T", egress_proxy_id: TEST_EGRESS_PROXY_ID }, keyFn);
+    const a = await createAccount({ runtime_channel: "v3", label: "g", plan: "pro", token: "T", egress_proxy_id: TEST_EGRESS_PROXY_ID }, keyFn);
     const hit = await getAccount(a.id);
     assert.ok(hit);
     assert.equal(hit.id, a.id);
@@ -246,6 +274,7 @@ describe("getTokenForUse", () => {
     const EXPIRES = new Date("2026-12-01T00:00:00.000Z");
     const row = await createAccount(
       {
+        runtime_channel: "v3",
         label: "use-it",
         plan: "pro",
         token: "ACC-SECRET-ABC",
@@ -267,7 +296,7 @@ describe("getTokenForUse", () => {
 
   test("没 refresh → refresh 字段 null", async (t) => {
     if (skipIfNoDb(t)) return;
-    const row = await createAccount({ label: "x", plan: "pro", token: "A", egress_proxy_id: TEST_EGRESS_PROXY_ID }, keyFn);
+    const row = await createAccount({ runtime_channel: "v3", label: "x", plan: "pro", token: "A", egress_proxy_id: TEST_EGRESS_PROXY_ID }, keyFn);
     const t2 = await getTokenForUse(row.id, keyFn);
     assert.ok(t2);
     assert.equal(t2.refresh, null);
@@ -280,7 +309,7 @@ describe("getTokenForUse", () => {
 
   test("密文被篡改 1 byte → AeadError", async (t) => {
     if (skipIfNoDb(t)) return;
-    const row = await createAccount({ label: "tamper", plan: "pro", token: "A", egress_proxy_id: TEST_EGRESS_PROXY_ID }, keyFn);
+    const row = await createAccount({ runtime_channel: "v3", label: "tamper", plan: "pro", token: "A", egress_proxy_id: TEST_EGRESS_PROXY_ID }, keyFn);
     // 翻转密文第 0 字节
     await query(
       `UPDATE claude_accounts
@@ -296,7 +325,7 @@ describe("getTokenForUse", () => {
 
   test("用错 key → AeadError", async (t) => {
     if (skipIfNoDb(t)) return;
-    const row = await createAccount({ label: "wrongkey", plan: "pro", token: "A", egress_proxy_id: TEST_EGRESS_PROXY_ID }, keyFn);
+    const row = await createAccount({ runtime_channel: "v3", label: "wrongkey", plan: "pro", token: "A", egress_proxy_id: TEST_EGRESS_PROXY_ID }, keyFn);
     const otherKey = randomBytes(KMS_KEY_BYTES);
     await assert.rejects(
       getTokenForUse(row.id, () => Buffer.from(otherKey)),
@@ -309,6 +338,7 @@ describe("updateAccount", () => {
   async function createOne(overrides: Partial<{ label: string; token: string; refresh: string }> = {}): Promise<AccountRow> {
     return createAccount(
       {
+        runtime_channel: "v3",
         label: overrides.label ?? "u-acc",
         plan: "pro",
         token: overrides.token ?? "ACC-1",
@@ -407,7 +437,7 @@ describe("deleteAccount", () => {
   test("删除存在的账号 → true,行消失", async (t) => {
     if (skipIfNoDb(t)) return;
     const acc = await createAccount(
-      { label: "to-delete", plan: "pro", token: "T", egress_proxy_id: TEST_EGRESS_PROXY_ID },
+      { runtime_channel: "v3", label: "to-delete", plan: "pro", token: "T", egress_proxy_id: TEST_EGRESS_PROXY_ID },
       keyFn,
     );
     assert.equal(await deleteAccount(acc.id), true);
@@ -422,7 +452,7 @@ describe("deleteAccount", () => {
   test("有 usage_records 引用 → 账号删除成功,历史行保留且 account_id 置 NULL(FK SET NULL)", async (t) => {
     if (skipIfNoDb(t)) return;
     const acc = await createAccount(
-      { label: "has-usage", plan: "pro", token: "T", egress_proxy_id: TEST_EGRESS_PROXY_ID },
+      { runtime_channel: "v3", label: "has-usage", plan: "pro", token: "T", egress_proxy_id: TEST_EGRESS_PROXY_ID },
       keyFn,
     );
     // 造一个 user + 一个 usage_records 引用该 account

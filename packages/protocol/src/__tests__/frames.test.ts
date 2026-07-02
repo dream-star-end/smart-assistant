@@ -204,6 +204,39 @@ describe('OutboundCodexBilling schema', () => {
       false,
     )
   })
+  // M2 — engineSessionId(engine-reported 计费记账键,settle=waive 同值红线)。
+  // Optional(渐进部署:旧容器镜像不带)+ 形状钉死 'oceng-' + 48 hex 小写。
+  it('accepts frame without engineSessionId (渐进部署兼容)', () => {
+    assert.equal(Value.Check(OutboundCodexBilling, baseOutboundCodexBilling()), true)
+  })
+  it('accepts valid engineSessionId (oceng- + 48 hex)', () => {
+    assert.equal(
+      Value.Check(OutboundCodexBilling, {
+        ...(baseOutboundCodexBilling() as object),
+        engineSessionId: `oceng-${'a1'.repeat(24)}`,
+      }),
+      true,
+    )
+  })
+  it('rejects engineSessionId with bad shape', () => {
+    for (const bad of [
+      'oceng-short', // hex 段不足 48
+      `OCENG-${'a'.repeat(48)}`, // 前缀大小写错
+      `oceng-${'A'.repeat(48)}`, // 大写 hex(算法产出恒小写)
+      `oceng-${'a'.repeat(49)}`, // 超长
+      `${'a'.repeat(54)}`, // 无前缀
+      'container-123', // 旧 v3 containerId 占位口径(已废弃)
+    ]) {
+      assert.equal(
+        Value.Check(OutboundCodexBilling, {
+          ...(baseOutboundCodexBilling() as object),
+          engineSessionId: bad,
+        }),
+        false,
+        `must reject: ${bad}`,
+      )
+    }
+  })
 })
 
 describe('OutboundPermissionRequest schema', () => {

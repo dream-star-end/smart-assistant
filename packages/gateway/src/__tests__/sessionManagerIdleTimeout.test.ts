@@ -41,9 +41,14 @@ describe("pickIdleTimeoutMs", () => {
     assert.equal(pickIdleTimeoutMs("compacting", 2), IDLE_TIMEOUT_TOOL_MS);
   });
 
-  test("codex-native 高推理/长上下文首帧前静默 → TOOL 档(15min)", () => {
-    assert.equal(pickIdleTimeoutMs(null, 0, "codex-native"), IDLE_TIMEOUT_TOOL_MS);
-    assert.equal(pickIdleTimeoutMs(undefined, 0, "codex-native"), IDLE_TIMEOUT_TOOL_MS);
+  test("codex engine 高推理/长上下文首帧前静默 → TOOL 档(15min)", () => {
+    // M1a:第三参从 providerTag('codex-native')泛化为 engine id('codex')。
+    assert.equal(pickIdleTimeoutMs(null, 0, "codex"), IDLE_TIMEOUT_TOOL_MS);
+    assert.equal(pickIdleTimeoutMs(undefined, 0, "codex"), IDLE_TIMEOUT_TOOL_MS);
+    // 旧 provider 语义 tag 不再命中 codex 档(engine tag 是唯一入口)。
+    assert.equal(pickIdleTimeoutMs(null, 0, "codex-native"), IDLE_TIMEOUT_DEFAULT_MS);
+    // ccb engine 走 DEFAULT 档不变。
+    assert.equal(pickIdleTimeoutMs(null, 0, "ccb"), IDLE_TIMEOUT_DEFAULT_MS);
   });
 
   test("两档常量值正确(防止有人随手调小 DEFAULT)", () => {

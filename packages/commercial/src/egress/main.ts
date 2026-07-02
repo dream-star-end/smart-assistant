@@ -39,6 +39,19 @@ import { assertPlatformDefaultModelConfigured } from "../http/proxy/staticProvid
 import { ocGatewayIpForChannel, ocInternalProxyPortForChannel } from "../agent-sandbox/v3supervisor.js";
 import { getSelfHost } from "../compute-pool/queries.js";
 import { rootLogger } from "../logging/logger.js";
+import { CODEX_TOKEN_REFRESH_PATH } from "../http/internalCodexTokenRefresh.js";
+import { CODEX_RELAY_PREFIX } from "../http/internalCodexRelay.js";
+import {
+  buildCodexRelayHandler,
+  buildCodexTokenRefreshHandler,
+  putRemoteCodexAuthViaServiceableHost,
+  readCodexContainerDir,
+} from "../http/codexInternalAssembly.js";
+import {
+  type CodexDisableFanoutDeps,
+  enqueueCodexDisableFanout,
+} from "../account-pool/codexDisableFanout.js";
+import { V3_AGENT_GID, V3_AGENT_UID } from "../agent-sandbox/constants.js";
 import { CostEventSink } from "./costEventSink.js";
 import { makeForwarder } from "./forwarder.js";
 
@@ -163,6 +176,34 @@ export async function startEgress(): Promise<void> {
   // hostUuid 参与 bearer 归属校验,两进程必须同值。取失败拒启(egress 无降级路径)。
   const selfHostUuid = (await getSelfHost()).id;
 
+  // ── codex 内部端点(M1b 架构决策:relay 归属 egress 进程)──────────────────
+  // /internal/v3/codex-relay(流式)与 /internal/v3/codex/token-refresh(401 自愈)
+  // 在 egress 本地处理,与 /v1/messages 同理:状态全在 PG,master 重启不掐断 codex
+  // 在飞流/续 token。装配收口 http/codexInternalAssembly.ts(与 master 同一份实现)。
+  // refresh 失败 disable 后的 fanout rebind 在本进程直接跑(FOR UPDATE 串行,
+  // 与 master 的 drift reconciler 跨进程并发安全;两侧都收敛到 codexLazyMigrate helper)。
+  const codexFanoutDeps: CodexDisableFanoutDeps = {
+    writeAuth: {
+      selfHostId: selfHostUuid,
+      containerUid: V3_AGENT_UID,
+      containerGid: V3_AGENT_GID,
+      codexContainerDir: readCodexContainerDir(),
+      putRemoteCodexAuth: putRemoteCodexAuthViaServiceableHost,
+    },
+    concurrency: 4,
+    logger: rootLogger.child({ subsys: "egress", module: "codexDisableFanout" }),
+  };
+  const codexTokenRefreshHandler = buildCodexTokenRefreshHandler({
+    identityRepo,
+    rateLimitRedis,
+    healthTracker,
+    selfHostId: selfHostUuid,
+    triggerCodexDisableFanout: (accountId) => {
+      enqueueCodexDisableFanout(accountId, codexFanoutDeps);
+    },
+  });
+  const codexRelayHandler = buildCodexRelayHandler({ identityRepo });
+
   const forward = makeForwarder({ controlBaseUrl });
 
   const server = createHttpServer((req, res) => {
@@ -183,6 +224,36 @@ export async function startEgress(): Promise<void> {
           } catch {
             /* */
           }
+        }
+      });
+      return;
+    }
+    if (path === CODEX_TOKEN_REFRESH_PATH) {
+      Promise.resolve(
+        codexTokenRefreshHandler(req, res, { hostUuid: selfHostUuid, boundIp: peerIp }),
+      ).catch((err) => {
+        log.error("codex_token_refresh_handler_threw", { err: (err as Error).message });
+        if (!res.headersSent) {
+          res.statusCode = 500;
+          res.setHeader("Content-Type", "application/json");
+          res.end(JSON.stringify({ error: { code: "INTERNAL", message: "egress handler error" } }));
+        } else {
+          try { res.destroy(); } catch { /* */ }
+        }
+      });
+      return;
+    }
+    if (path === CODEX_RELAY_PREFIX || path.startsWith(`${CODEX_RELAY_PREFIX}/`)) {
+      Promise.resolve(
+        codexRelayHandler(req, res, { hostUuid: selfHostUuid, boundIp: peerIp }),
+      ).catch((err) => {
+        log.error("codex_relay_handler_threw", { err: (err as Error).message });
+        if (!res.headersSent) {
+          res.statusCode = 500;
+          res.setHeader("Content-Type", "application/json");
+          res.end(JSON.stringify({ error: { code: "INTERNAL", message: "egress handler error" } }));
+        } else {
+          try { res.destroy(); } catch { /* */ }
         }
       });
       return;

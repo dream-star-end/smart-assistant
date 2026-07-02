@@ -8,7 +8,25 @@
 import { performance } from 'node:perf_hooks'
 import { Buffer } from 'node:buffer'
 import type { OutboundContentBlock } from '@openclaude/protocol'
+import type {
+  DetectedToolResult,
+  DetectedToolUse,
+  SegmentRecord,
+  SessionStreamEvent,
+  TurnToolEntry,
+} from './engine/engineEvents.js'
 import type { SdkMessage } from './subprocessRunner.js'
+
+// M0 engine 适配层:事件/工具快照类型的权威源迁至 engine/engineEvents.ts(engine
+// 中立模块);此处 re-export 兼容存量 import(server/v3MasterSink/commercial/测试)。
+export type {
+  DetectedToolResult,
+  DetectedToolUse,
+  PermissionRequest,
+  SegmentRecord,
+  SessionStreamEvent,
+  TurnToolEntry,
+} from './engine/engineEvents.js'
 
 /** Hard cap on accumulated main-agent thinking bytes per turn. Sonnet 4.6
  *  adaptive thinking can exceed 100 KB on complex turns; we don't want to
@@ -52,128 +70,6 @@ function sliceUtf8Safe(s: string, maxBytes: number): string {
   // buf[end] safely indexable: end < buf.length (since buf.length > maxBytes >= end)
   while (end > 0 && (buf[end]! & 0xc0) === 0x80) end--
   return buf.subarray(0, end).toString('utf8')
-}
-
-/** Permission request from CCB (via stdio control_request protocol) */
-export interface PermissionRequest {
-  requestId: string
-  toolName: string
-  toolUseId?: string
-  input: Record<string, unknown>
-  /** Suggested permission rules the user can adopt */
-  permissionSuggestions?: unknown[]
-}
-
-export type SessionStreamEvent =
-  | { kind: 'block'; block: OutboundContentBlock }
-  | {
-      kind: 'final'
-      meta?: {
-        cost?: number
-        inputTokens?: number
-        outputTokens?: number
-        cacheReadTokens?: number
-        cacheCreationTokens?: number
-        totalCost?: number
-        turn?: number
-        /** Anthropic API stop_reason, extracted from CCB result row.
-         *  Values: 'end_turn' | 'max_tokens' | 'stop_sequence' | 'tool_use'
-         *  | 'pause_turn' | 'refusal'. Used by sessionManager for phantom
-         *  judgment and by frontend for empty-turn notice text. */
-        stopReason?: string
-      }
-    }
-  | { kind: 'error'; error: string }
-  | { kind: 'permission_request'; request: PermissionRequest }
-  // 当前 turn 的 backend-side 非流式阶段状态(目前仅 'compacting' / null)。
-  // 由 CCB stdout `{type:'system', subtype:'status', status:'compacting'|null}`
-  // 触发,gateway 上层包装成 `outbound.turn_status` 帧推给前端。受控枚举,
-  // 不透传任意 SDK status —— 防协议被 CCB 内部状态污染。
-  | { kind: 'turn_status'; status: 'compacting' | null }
-  // PR2 v1.0.66 — codex turn 终态侧信道事件,sessionManager 在收到 codex
-  // RunnerMessage{type:'result', requestId} 时**额外**发一帧(parser 仍照常发
-  // kind:'final')。server.ts 把这个 kind 路由到 outbound.codex_billing 帧给 master
-  // 做真扣费 settle。其它 runner 路径不会发这个 kind。
-  | {
-      kind: 'codex_billing'
-      requestId: string
-      status: 'success' | 'error'
-      durationMs: number
-      usage?: {
-        input_tokens?: number
-        output_tokens?: number
-        cache_read_input_tokens?: number
-        cache_creation_input_tokens?: number
-        reasoning_output_tokens?: number
-      }
-      errorReason?: string
-      // Issue A v1.0.108 — codex account/rateLimits/updated 快照,piggy-back 到 billing
-      // 终态帧让 master.userChatBridge 落库到 claude_accounts。utilization 0..100,
-      // resetsAt ISO8601(runner 已把 epoch sec 转 ISO,bridge 不再二次解析)。
-      rateLimits?: {
-        util5h?: number
-        reset5h?: string
-        util7d?: number
-        reset7d?: string
-      }
-    }
-
-/** Detected tool_use that may need bridging (CronCreate, CronDelete, etc.) */
-export interface DetectedToolUse {
-  name: string
-  id: string
-  input: Record<string, any>
-}
-
-/** Detected tool_result for completed tool calls */
-export interface DetectedToolResult {
-  toolUseId: string
-  toolName: string
-  preview: string
-  isError: boolean
-  /** ms between tool_use finalization and tool_result arrival.
-   *  0 if the tool_use was not observed in this parser (e.g. stale result). */
-  durationMs: number
-  /** Truncated preview of tool input at finalization (<=500 chars). */
-  inputPreview?: string
-}
-
-/** Snapshot of one completed top-level tool call within a turn. Captured by
- *  the parser so SessionManager can hand it to v3MasterSink, which writes it
- *  as a server-authored 'tool' message — the durable copy that survives
- *  refresh / mobile-bg recovery. Subagent-issued tools (parentToolUseId set)
- *  are intentionally excluded; their durability is owned by the parent
- *  Agent card and tracked separately (Phase 2). */
-export interface TurnToolEntry {
-  /** Anthropic tool_use_id — also serves as the stable client blockId */
-  toolUseId: string
-  /** Same value as toolUseId, kept as a separate field so server-authored
-   *  payloads can refer to it by an explicit name without overloading
-   *  toolUseId across protocol layers. */
-  blockId: string
-  toolName: string
-  /** Possibly-capped tool input. May be a structured object or a JSON-encoded
-   *  string when the original exceeded PARSER_TOOL_INPUT_JSON_MAX_BYTES. */
-  inputJson: unknown
-  /** Truncated string preview of the input for compact rendering */
-  inputPreview: string
-  /** Tool stdout / textual output, capped to PARSER_TOOL_OUTPUT_MAX_BYTES */
-  output: string
-  isError: boolean
-  /** ms between tool_use finalization and tool_result arrival; 0 if unknown */
-  durationMs: number
-  /** Wall-clock timestamp (Date.now ms) when the tool_result arrived */
-  ts: number
-  /** Fix B (2026-05-25) — wall-clock timestamp (Date.now ms) when the parser
-   *  FIRST OBSERVED the tool_use content_block_start (or assistant snapshot,
-   *  whichever fires first on the runner path being used). This is the tool
-   *  card's APPEARANCE time, distinct from `ts` (tool_result COMPLETION
-   *  time). Master prefers this for the persisted row's ts so parallel-tool
-   *  refresh order matches the live emit order; falls back to a computed
-   *  offset when absent (pre-Fix-B gateway). Plan §3.5.4. */
-  arrivedAt: number
-  inputTruncated?: boolean
-  outputTruncated?: boolean
 }
 
 /** Accumulated turn result stats */
@@ -223,16 +119,6 @@ export interface TurnResult {
   assistantSegments: SegmentRecord[]
   /** Same as `assistantSegments` for thinking. */
   thinkingSegments: SegmentRecord[]
-}
-
-/** One assistant/thinking text segment within a turn. A new segment starts
- *  after a tool_use boundary, but ONLY if the previous segment has actual
- *  content (pattern `tool → text` keeps text in s0; pattern `text → tool → text`
- *  splits into s0 + s1). Pure tool turns produce no segments. */
-export interface SegmentRecord {
-  index: number
-  text: string
-  ts: number
 }
 
 /** Apply per-tool byte/char caps for the persisted tool snapshot. Mutates a

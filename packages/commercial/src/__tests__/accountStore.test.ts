@@ -35,7 +35,7 @@ describe("createAccount — 预校验在 DB 之前拦截", () => {
   test("非法 plan → TypeError(不触 DB)", async () => {
     await assert.rejects(
       createAccount(
-        { label: "x", plan: "FREE" as unknown as "pro", token: "t", egress_proxy_id: "1" },
+        { runtime_channel: "v3", label: "x", plan: "FREE" as unknown as "pro", token: "t", egress_proxy_id: "1" },
         keyFn,
       ),
       TypeError,
@@ -44,7 +44,7 @@ describe("createAccount — 预校验在 DB 之前拦截", () => {
 
   test("空 token → TypeError", async () => {
     await assert.rejects(
-      createAccount({ label: "x", plan: "pro", token: "", egress_proxy_id: "1" }, keyFn),
+      createAccount({ runtime_channel: "v3", label: "x", plan: "pro", token: "", egress_proxy_id: "1" }, keyFn),
       TypeError,
     );
   });
@@ -52,7 +52,7 @@ describe("createAccount — 预校验在 DB 之前拦截", () => {
   test("非字符串 token → TypeError", async () => {
     await assert.rejects(
       createAccount(
-        { label: "x", plan: "pro", token: 42 as unknown as string, egress_proxy_id: "1" },
+        { runtime_channel: "v3", label: "x", plan: "pro", token: 42 as unknown as string, egress_proxy_id: "1" },
         keyFn,
       ),
       TypeError,
@@ -61,9 +61,33 @@ describe("createAccount — 预校验在 DB 之前拦截", () => {
 
   test("空字符串 refresh → TypeError", async () => {
     await assert.rejects(
-      createAccount({ label: "x", plan: "pro", token: "t", refresh: "", egress_proxy_id: "1" }, keyFn),
+      createAccount({ runtime_channel: "v3", label: "x", plan: "pro", token: "t", refresh: "", egress_proxy_id: "1" }, keyFn),
       TypeError,
     );
+  });
+
+  // 0098(P0-2)—— runtime_channel 必填且只认 v3|v5:v5 建号静默落 DB DEFAULT
+  // 'v3' 会让 v5 池子为空 + v3/v5 双 master 共刷同一 refresh 链(family 吊销)。
+  test("runtime_channel 缺省(JS 调用方绕过 TS)→ TypeError(不触 DB)", async () => {
+    await assert.rejects(
+      createAccount(
+        { label: "x", plan: "pro", token: "t", egress_proxy_id: "1" } as unknown as Parameters<typeof createAccount>[0],
+        keyFn,
+      ),
+      /invalid runtime_channel/,
+    );
+  });
+
+  test("非法 runtime_channel('V5'/'prod')→ TypeError(不触 DB)", async () => {
+    for (const bad of ["V5", "prod", "", " v5"]) {
+      await assert.rejects(
+        createAccount(
+          { runtime_channel: bad as unknown as "v5", label: "x", plan: "pro", token: "t", egress_proxy_id: "1" },
+          keyFn,
+        ),
+        /invalid runtime_channel/,
+      );
+    }
   });
 });
 

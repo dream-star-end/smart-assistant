@@ -37,7 +37,8 @@ import { safeEnqueueAlert } from '../admin/alertOutbox.js'
 import { loadKmsKey } from '../crypto/keys.js'
 import type { AccountHealthTracker } from './health.js'
 import { recordRefreshEvent } from './refreshEvents.js'
-import { type AccountPlan, getTokenForUse, updateAccount } from './store.js'
+import { type AccountPlan, getCodexTokenSnapshot, getTokenForUse, updateAccount } from './store.js'
+import { CodexEgressError, resolveCodexAccountEgressDispatcher } from './codexEgress.js'
 
 /**
  * Fire-and-forget refresh-event 落库。失败仅 console.warn,不打断主流程。
@@ -77,6 +78,12 @@ export const DEFAULT_OAUTH_ENDPOINT = 'https://platform.claude.com/v1/oauth/toke
 /** Claude Code 公共 OAuth client_id(constants/oauth.ts PROD_OAUTH_CONFIG.CLIENT_ID)。
  *  这个 client_id 是 Anthropic 给 Claude Code CLI 的固定 ID,所有 OAuth refresh 都得带。 */
 export const DEFAULT_OAUTH_CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e'
+
+/** Codex (auth.openai.com) refresh endpoint。 */
+export const DEFAULT_CODEX_OAUTH_ENDPOINT = 'https://auth.openai.com/oauth/token'
+
+/** Codex CLI 的 OAuth client_id(personal-version OAUTH_PROVIDERS 同步)。 */
+export const DEFAULT_CODEX_OAUTH_CLIENT_ID = 'app_EMoamEEZ73f0CkXaXp7hrann'
 
 /** Claude Code CLI 风格 User-Agent。Node fetch 默认 `undici/...` 是非 CC 指纹。
  *  与 gateway/server.ts 的 CLAUDE_OAUTH_USER_AGENT 同源同语义,共用 env 覆盖名。 */
@@ -159,6 +166,18 @@ export interface RefreshDeps {
    * 否则已绑账号的 token 刷新会泄漏到默认/全局出口(去匿名化)。
    */
   dispatcher?: unknown
+  /**
+   * v1.0.120 feat/codex-disable-rebind:`disableOnFailure` 把账号标 disabled
+   * 之后,异步触发 fanout actor —— 把仍绑该账号的容器主动 rebind 到新 active
+   * 账号(否则容器要等下条 user inbound 才会触发 acquire 的 lazy migrate)。
+   *
+   * fire-and-forget;trigger 函数内部自己 swallow 错误。
+   * 未注入(单测 / 早期 boot)= 静默忽略,acquire / M1 兜底。
+   *
+   * 注:trigger 不区分 provider — 只在 codex 路径(`refreshCodexAccountToken`
+   * 失败)被调,refresh.ts 内部已经隔离了 codex/anthropic 调用路径。
+   */
+  triggerCodexDisableFanout?: (accountId: bigint) => void
 }
 
 /**
@@ -275,6 +294,19 @@ async function disableOnFailure(
       disabled = true
     } catch {
       /* 同理 */
+    }
+  }
+
+  // v1.0.120 feat/codex-disable-rebind:disable 落库后 fire-and-forget 触发
+  // fanout actor。fanout actor 内部用 `WHERE provider = 'codex'` 做二次确认,
+  // claude 账号传进来也只是查一下 DB → 立刻 return,无副作用。
+  // disable 自身失败(上面两个 catch)就不 fanout —— 状态没变,fanout 也没意义。
+  if (disabled && deps.triggerCodexDisableFanout !== undefined) {
+    try {
+      deps.triggerCodexDisableFanout(BigInt(accountId))
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.warn('[refresh] triggerCodexDisableFanout threw:', err)
     }
   }
 }
@@ -480,5 +512,204 @@ async function refreshAccountTokenInner(
     refresh: newRefreshToken !== null ? Buffer.from(newRefreshToken, 'utf8') : null,
     expires_at: expiresAt,
     plan: current.plan,
+  }
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// Codex (auth.openai.com) refresh — 与 claude 路径并行的实现。
+// 共用 RefreshError / disableOnFailure / safeRecordRefreshEvent / inflight
+// 等基础设施;差异点:
+//   - endpoint = auth.openai.com/oauth/token,client_id 固定 codex CLI 的
+//   - body 是 JSON,**不是** form-urlencoded
+//   - 不带 scope,不带 claude-cli User-Agent
+//   - 读 token 走 `getCodexTokenSnapshot`(provider=codex 强约束)而非
+//     `getTokenForUse`(claude 路径用),避免误读 claude 账号或交叉污染
+// ────────────────────────────────────────────────────────────────────────
+
+export interface RefreshCodexDeps {
+  http?: RefreshHttpClient
+  keyFn?: () => Buffer
+  now?: () => Date
+  endpoint?: string
+  clientId?: string
+  health?: AccountHealthTracker
+  /** 出口 dispatcher;codex 账号也可走 ProxyAgent 走代理(本 PR codex 暂不接,见 plan 决策 U)。 */
+  dispatcher?: unknown
+  /** v1.0.120 feat/codex-disable-rebind:同 RefreshDeps.triggerCodexDisableFanout
+   *  —— refresh 失败 disableOnFailure 后触发 fanout actor rebind 仍绑该账号的活跃
+   *  容器(见 refresh.ts disableOnFailure 实现)。 */
+  triggerCodexDisableFanout?: (accountId: bigint) => void
+}
+
+const refreshCodexInflight = new Map<string, Promise<RefreshedTokens>>()
+
+/**
+ * Codex 账号 refresh:同 `refreshAccountToken` 语义,但走 codex tokenUrl + JSON body。
+ *
+ * **注意**:Phase 2(本 PR)codex 账号一律有 refresh_token(plan 决策 Q),
+ * 因此 `no_refresh_token` 路径理论上只在 active 状态下被 admin 误编辑置空时触发,
+ * 仍按"必禁"处理。
+ */
+export async function refreshCodexAccountToken(
+  accountId: bigint | string,
+  deps: RefreshCodexDeps = {},
+): Promise<RefreshedTokens> {
+  const key = String(accountId)
+  const existing = refreshCodexInflight.get(key)
+  if (existing) {
+    const r = await existing
+    return cloneTokens(r)
+  }
+  const p = refreshCodexAccountTokenInner(accountId, deps)
+  refreshCodexInflight.set(key, p)
+  try {
+    return await p
+  } finally {
+    refreshCodexInflight.delete(key)
+  }
+}
+
+async function refreshCodexAccountTokenInner(
+  accountId: bigint | string,
+  deps: RefreshCodexDeps,
+): Promise<RefreshedTokens> {
+  const http = deps.http ?? defaultHttp
+  const keyFn = deps.keyFn ?? loadKmsKey
+  const endpoint = deps.endpoint ?? DEFAULT_CODEX_OAUTH_ENDPOINT
+  const clientId = deps.clientId ?? DEFAULT_CODEX_OAUTH_CLIENT_ID
+  const now = (deps.now ?? ((): Date => new Date()))()
+
+  const snap = await getCodexTokenSnapshot(accountId, keyFn)
+  if (!snap) {
+    throw new RefreshError('account_not_found', `codex account ${String(accountId)} not found`)
+  }
+  // 仅需 refresh_token;access_token 立即清零
+  snap.token.fill(0)
+  if (!snap.refresh) {
+    // disableOnFailure 复用 RefreshDeps 形状(只读 health/keyFn),safe to cast
+    await disableOnFailure(deps as RefreshDeps, accountId, 'refresh_no_token_on_record')
+    safeRecordRefreshEvent(accountId, false, 'no_refresh_token', 'no refresh_token on record')
+    throw new RefreshError(
+      'no_refresh_token',
+      `codex account ${String(accountId)} has no refresh_token on record`,
+    )
+  }
+  const refreshStr = snap.refresh.toString('utf8')
+  snap.refresh.fill(0)
+
+  let dispatcher = deps.dispatcher
+  if (dispatcher === undefined) {
+    try {
+      dispatcher = (await resolveCodexAccountEgressDispatcher(accountId)).dispatcher
+    } catch (err) {
+      // Egress configuration/proxy failures are operational/transient from the
+      // account-token perspective. Do not disable the account and, critically,
+      // do not fall back to process-global HTTP_PROXY or direct host egress.
+      safeRecordRefreshEvent(accountId, false, 'network_transient', 'egress dispatcher unavailable')
+      throw new RefreshError('network_transient', 'codex refresh egress unavailable', {
+        cause: err instanceof CodexEgressError ? err : err,
+      })
+    }
+  }
+
+  let result: { status: number; body: string }
+  try {
+    result = await http.post(
+      endpoint,
+      {
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+      },
+      JSON.stringify({
+        grant_type: 'refresh_token',
+        client_id: clientId,
+        refresh_token: refreshStr,
+      }),
+      dispatcher,
+    )
+  } catch (err) {
+    safeRecordRefreshEvent(accountId, false, 'network_transient', 'refresh network call failed')
+    throw new RefreshError('network_transient', 'codex refresh network call failed', { cause: err })
+  }
+
+  if (result.status < 200 || result.status >= 300) {
+    if (isTransientHttpStatus(result.status)) {
+      // codex (auth.openai.com) 同样可能瞬时 5xx/429 — 走 transient 不 disable
+      safeRecordRefreshEvent(accountId, false, 'network_transient', `HTTP ${result.status}`)
+      throw new RefreshError(
+        'network_transient',
+        `codex refresh endpoint transient ${result.status}`,
+        { status: result.status },
+      )
+    }
+    await disableOnFailure(deps as RefreshDeps, accountId, `refresh_http_${result.status}`)
+    safeRecordRefreshEvent(accountId, false, 'http_error', `HTTP ${result.status}`)
+    throw new RefreshError('http_error', `codex refresh endpoint returned ${result.status}`, {
+      status: result.status,
+    })
+  }
+
+  let parsed: OAuthRefreshJson
+  try {
+    parsed = JSON.parse(result.body)
+  } catch (err) {
+    await disableOnFailure(deps as RefreshDeps, accountId, 'refresh_bad_json')
+    safeRecordRefreshEvent(accountId, false, 'bad_response', 'invalid JSON')
+    throw new RefreshError('bad_response', 'codex refresh response body is not valid JSON', {
+      cause: err,
+    })
+  }
+  if (typeof parsed.access_token !== 'string' || parsed.access_token.length === 0) {
+    await disableOnFailure(deps as RefreshDeps, accountId, 'refresh_no_access_token')
+    safeRecordRefreshEvent(accountId, false, 'bad_response', 'missing access_token')
+    throw new RefreshError('bad_response', 'codex refresh response missing access_token')
+  }
+
+  const expiresAt = computeExpiresAt(parsed, now)
+  const newAccessToken = parsed.access_token
+  const newRefreshToken =
+    typeof parsed.refresh_token === 'string' && parsed.refresh_token.length > 0
+      ? parsed.refresh_token
+      : null
+
+  const patch: Parameters<typeof updateAccount>[1] = {
+    token: newAccessToken,
+    oauth_expires_at: expiresAt,
+    last_error: null,
+  }
+  if (newRefreshToken !== null) {
+    patch.refresh = newRefreshToken
+  }
+  let updated: Awaited<ReturnType<typeof updateAccount>>
+  try {
+    updated = await updateAccount(accountId, patch, keyFn)
+  } catch (err) {
+    await disableOnFailure(deps as RefreshDeps, accountId, 'refresh_persist_error')
+    safeRecordRefreshEvent(
+      accountId,
+      false,
+      'persist_error',
+      'failed to persist refreshed token to DB',
+    )
+    throw new RefreshError('persist_error', 'failed to persist refreshed codex token to DB', {
+      cause: err,
+    })
+  }
+  if (!updated) {
+    throw new RefreshError(
+      'account_not_found',
+      `codex account ${String(accountId)} vanished after successful refresh`,
+    )
+  }
+
+  safeRecordRefreshEvent(accountId, true)
+
+  return {
+    token: Buffer.from(newAccessToken, 'utf8'),
+    refresh: newRefreshToken !== null ? Buffer.from(newRefreshToken, 'utf8') : null,
+    expires_at: expiresAt,
+    // codex 账号 plan 概念暂沿用 'pro' 占位(未来若引入分级再调整)。
+    // refreshCodexAccountToken 的调用方(actor / lazy migrate)不消费 plan。
+    plan: 'pro',
   }
 }
