@@ -48,6 +48,22 @@ const log = rootLogger.child({ subsys: "egressMain" });
 const EGRESS_DRAIN_MS = Number(process.env.EGRESS_DRAIN_MS ?? 30 * 60_000);
 
 export async function startEgress(): Promise<void> {
+  // 出口拓扑与拆分前的 master 完全对齐(packages/cli gateway.ts 同款):
+  // 有 HTTP(S)_PROXY env(日本 sing-box 节点)→ 装全局 EnvHttpProxyAgent,给
+  // Anthropic/OpenAI 等出海上游用;国内静态 provider(ark glm/deepseek/minimax)
+  // 在 makeStaticKeyUpstream 里显式挂 directEgressDispatcher() 直连,不受全局
+  // 代理影响(staticProviderMeta egress="direct" 是那条链的单一权威)。
+  // 漏装的后果:出海上游从 egress 进程直连出境 → 风控/地域封锁风险。
+  if (
+    process.env.HTTP_PROXY ||
+    process.env.HTTPS_PROXY ||
+    process.env.http_proxy ||
+    process.env.https_proxy
+  ) {
+    const { setGlobalDispatcher, EnvHttpProxyAgent } = await import("undici");
+    setGlobalDispatcher(new EnvHttpProxyAgent());
+    log.info("egress_global_proxy_agent_installed", {});
+  }
   const cfg = loadConfig();
   if (!cfg.OC_EGRESS_SPLIT) {
     throw new Error("[egress] OC_EGRESS_SPLIT!=1 — egress 进程只在 split 模式下运行,拒启");
