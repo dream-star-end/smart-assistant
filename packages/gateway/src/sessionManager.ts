@@ -1191,6 +1191,10 @@ export class SessionManager {
      * and bound to this run. Spawn-time attribute (preserved across model respawn).
      */
     skillTrainRunId?: string
+    /** Skill-eval 会话(隔离跑分):标记 + arm 控制,透传 runner env/prompt slots。 */
+    skillEvalMode?: boolean
+    skillEvalExclude?: string
+    skillEvalDraft?: { name: string; dir: string }
   }): Promise<AgentSession> {
     // 新建时 null 等同 undefined(都让 CCB 用模型默认)
     const initialEffort: string | undefined =
@@ -1274,6 +1278,9 @@ export class SessionManager {
       getRepoSnapshot: this._getRepoSnapshot,
       workload: opts.workload,
       skillTrainRunId: opts.skillTrainRunId,
+      skillEvalMode: opts.skillEvalMode,
+      skillEvalExclude: opts.skillEvalExclude,
+      skillEvalDraft: opts.skillEvalDraft,
     })
     const now = Date.now()
     const session: AgentSession = {

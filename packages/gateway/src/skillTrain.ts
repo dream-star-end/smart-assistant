@@ -128,6 +128,16 @@ Procedure:
    ("create"|"update"|"delete"), description, tags, body (full SKILL.md instructions),
    and a one-paragraph rationale citing the evidence sessions. Stay within the budget.
 
+Evals (评测门 — 草稿的验收基准):
+- If the target skill has evals (see \`skill_view(name, "evals/evals.json")\`), your draft
+  will be AUTO-EVALUATED against the current version after this run (draft vs current,
+  assertion pass-rate). Write the draft to genuinely satisfy those assertions — do not
+  game the wording of assertions.
+- If the target skill has NO evals yet, include an \`evals\` object in your skill_propose
+  call: {version:1, cases:[{id, prompt, assertions:[...]}]} with 2-3 realistic cases
+  (varied phrasing, one edge case) and 3-5 decidable assertions each. These become the
+  skill's acceptance baseline after merge.
+
 Skill writing constraints:
 - Keep skills operational: trigger conditions, prerequisites, steps, commands,
   validation, gotchas. Avoid bloated theory. Preserve repo-specific invariants.

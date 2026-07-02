@@ -97,6 +97,24 @@ export const BRIDGE_API_ALLOWLIST: readonly BridgeApiAllowRule[] = [
   // OWN container skill volume, so they must be proxied to the container (and the
   // container re-validates incoming bridge requests against this same allowlist).
   {
+    label: '/api/skills/:name/evals',
+    re: /^\/api\/skills\/[a-z0-9-]+\/evals$/,
+    methods: M('GET', 'PUT'),
+    proxyFromCommercial: true,
+  },
+  {
+    label: '/api/skills/:name/eval-run',
+    re: /^\/api\/skills\/[a-z0-9-]+\/eval-run$/,
+    methods: M('POST'),
+    proxyFromCommercial: true,
+  },
+  {
+    label: '/api/skill-eval/:runId',
+    re: /^\/api\/skill-eval\/[A-Za-z0-9_-]+$/,
+    methods: M('GET'),
+    proxyFromCommercial: true,
+  },
+  {
     label: '/api/skills/:name/train',
     // skill name segment matches the container route exactly ([a-z0-9-]+) so the
     // bridge gate is no looser than the handler (rejects %2F/%5C/uppercase/dots).

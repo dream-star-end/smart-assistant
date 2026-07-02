@@ -874,6 +874,57 @@ export class SkillStore {
     return { ok: true }
   }
 
+  /**
+   * 写 skill 目录内的辅助文件(如 evals/evals.json、evals/last-run.json)。
+   * 仅允许写 writeRoot 内**已存在**的技能(不隐式创建技能);relPath 由调用方
+   * allowlist(gateway 只放行 evals/ 下固定文件名),这里做路径守卫:
+   * 词法包含 + realpath 容器化 + 目标已存在时拒 symlink,原子写(tmp+rename)。
+   */
+  async saveAuxFile(
+    name: string,
+    relPath: string,
+    content: string,
+  ): Promise<{ ok: boolean; error?: string }> {
+    const v = validateSkillName(name)
+    if (!v.ok) return { ok: false, error: v.error }
+    if (!/^[a-zA-Z0-9._/-]{1,128}$/.test(relPath) || relPath.includes('..') || relPath.startsWith('/')) {
+      return { ok: false, error: 'invalid aux file path' }
+    }
+    const skillDir = join(this.writeRoot, name)
+    if (!existsSync(join(skillDir, 'SKILL.md'))) {
+      return { ok: false, error: 'skill not found in writable library' }
+    }
+    const realRoot = await realpath(this.writeRoot)
+    const realSkillDir = await realpath(skillDir)
+    if (!realSkillDir.startsWith(realRoot + sep)) {
+      return { ok: false, error: 'skill directory resolves outside skills root' }
+    }
+    const lexicalTarget = resolve(realSkillDir, relPath)
+    if (!lexicalTarget.startsWith(realSkillDir + sep)) {
+      return { ok: false, error: 'aux file resolves outside skill directory' }
+    }
+    const targetDir = resolve(lexicalTarget, '..')
+    await mkdir(targetDir, { recursive: true })
+    const realTargetDir = await realpath(targetDir)
+    if (realTargetDir !== realSkillDir && !realTargetDir.startsWith(realSkillDir + sep)) {
+      return { ok: false, error: 'aux directory resolves outside skill directory' }
+    }
+    const target = join(realTargetDir, lexicalTarget.slice(targetDir.length + 1) || relPath.split('/').pop() || '')
+    if (existsSync(target)) {
+      const st = await lstat(target)
+      if (st.isSymbolicLink()) return { ok: false, error: 'aux file target is a symlink' }
+    }
+    const tmp = join(realTargetDir, `.aux.tmp-${randomUUID()}`)
+    try {
+      await writeFile(tmp, content)
+      await rename(tmp, target)
+    } catch (err) {
+      await rm(tmp, { force: true }).catch(() => {})
+      throw err
+    }
+    return { ok: true }
+  }
+
   /** List version history for a skill (from the write root). */
   async history(name: string): Promise<Array<{ version: string; timestamp: string }>> {
     const v = validateSkillName(name)

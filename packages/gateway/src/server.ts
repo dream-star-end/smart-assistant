@@ -39,6 +39,9 @@ import {
 } from '@openclaude/protocol'
 import { classifyDelegateOutputError, classifyRunError } from './errorClassify.js'
 import {
+  parseSkillEvalsJson,
+  serializeSkillEvals,
+  type SkillEvalsFile,
   type AgentDef,
   type AgentsConfig,
   MemoryStore,
@@ -70,6 +73,22 @@ import {
 import { listCollaboratorAgents } from './collaboratorAgents.js'
 import type { SessionStreamEvent } from './ccbMessageParser.js'
 import { type SkillTrainRun, SkillTrainJobStore } from './skillTrainJobs.js'
+import {
+  type SkillEvalRun,
+  SkillEvalJobStore,
+  armsForMode,
+} from './skillEvalJobs.js'
+import {
+  type GraderArmInput,
+  type SkillEvalCaseResult,
+  addUsage,
+  buildEvalCasePrompt,
+  buildGraderPrompt,
+  computeBenchmark,
+  emptyUsage,
+  gradesToAssertions,
+  parseGraderJson,
+} from './skillEval.js'
 import {
   SKILL_TRAIN_DEFAULT_MODEL,
   SKILL_TRAIN_EFFORT,
@@ -546,6 +565,7 @@ export class Gateway {
   // SkillOpt training: async run registry (state machine + per-skill/global concurrency
   // cap). Drafts staged via skill_propose; merge promotes them to the authoritative lib.
   private skillTrainJobs = new SkillTrainJobStore({ maxConcurrent: 2 })
+  private skillEvalJobs = new SkillEvalJobStore({ maxConcurrent: 1 })
   private skillDrafts = new SkillDraftStore()
   private channels = new Map<string, ChannelAdapter>()
   private log = createLogger({ module: 'gateway' })
@@ -799,6 +819,7 @@ export class Gateway {
     this.sessions = new SessionManager(deps.config)
     // Reconcile skill-training runs persisted across a gateway restart (active → failed).
     void this.skillTrainJobs.loadAll(Date.now())
+    void this.skillEvalJobs.loadAll(Date.now())
     // Wire up auth error handler: force-refresh token when 401 detected (bypass expiry check)
     this.sessions.onAuthError = () => this.refreshClaudeOAuthIfNeeded(true)
     // Phase 5:把 _repoWorkspace 的 getRepoSnapshot 当 provider 注入。
@@ -2313,6 +2334,29 @@ export class Gateway {
       )
       return
     }
+    // ── Skill evals(用例 CRUD + 隔离双跑评测)──
+    const skillEvalsFileMatch = url.pathname.match(/^\/api\/skills\/([a-z0-9-]+)\/evals$/)
+    if (skillEvalsFileMatch) {
+      this._handleSkillEvalsFile(req, res, skillEvalsFileMatch[1]).catch((err) =>
+        this.sendInternalError(res, err),
+      )
+      return
+    }
+    const skillEvalStartMatch = url.pathname.match(/^\/api\/skills\/([a-z0-9-]+)\/eval-run$/)
+    if (skillEvalStartMatch) {
+      this._handleSkillEvalStart(req, res, skillEvalStartMatch[1]).catch((err) =>
+        this.sendInternalError(res, err),
+      )
+      return
+    }
+    const skillEvalRunMatch = url.pathname.match(/^\/api\/skill-eval\/([a-zA-Z0-9_-]+)$/)
+    if (skillEvalRunMatch) {
+      this._handleSkillEvalRunStatus(req, res, skillEvalRunMatch[1]).catch((err) =>
+        this.sendInternalError(res, err),
+      )
+      return
+    }
+
     // ── SkillOpt skill-training (async; train → diff → confirm-merge) ──
     const skillTrainStartMatch = url.pathname.match(/^\/api\/skills\/([a-z0-9-]+)\/train$/)
     if (skillTrainStartMatch) {
@@ -4752,6 +4796,322 @@ export class Gateway {
     this.sendError(res, 405, 'method not allowed')
   }
 
+  // ── Skill evals(评测:用例文件 CRUD + 隔离双跑 run)──────────────────────
+  //
+  // 成本纪律:评测跑真模型、消耗用户积分 —— 启动只经显式 POST(前端有估算+确认
+  // 对话框),run.usage 逐 turn 累计供前端实报;用例上限(≤5)即成本上限。
+
+  /** GET: evals 文件 + 上次结果;PUT: 保存 evals(仅可写技能)。 */
+  private async _handleSkillEvalsFile(
+    req: IncomingMessage,
+    res: ServerResponse,
+    skillName: string,
+  ): Promise<void> {
+    const store = buildUserSkillStore()
+    const skill = await store.view(skillName, undefined, { includePlatform: false })
+    if (!skill || typeof skill === 'string') return this.sendError(res, 404, 'skill not found')
+    if (req.method === 'GET') {
+      const raw = await store.view(skillName, 'evals/evals.json', { includePlatform: false })
+      let evals: SkillEvalsFile | null = null
+      let parseErrors: string[] | undefined
+      if (typeof raw === 'string') {
+        const parsed = parseSkillEvalsJson(raw)
+        if (parsed.ok) evals = parsed.file
+        else parseErrors = parsed.errors
+      }
+      let lastRun: unknown = null
+      const lastRaw = await store.view(skillName, 'evals/last-run.json', {
+        includePlatform: false,
+      })
+      if (typeof lastRaw === 'string') {
+        try {
+          lastRun = JSON.parse(lastRaw)
+        } catch {}
+      }
+      this.sendJson(res, 200, {
+        evals,
+        parseErrors,
+        lastRun,
+        writable: skill.writable === true,
+      })
+      return
+    }
+    if (req.method === 'PUT') {
+      if (skill.writable !== true) return this.sendError(res, 403, 'skill is read-only')
+      const body = await this.readBody(req)
+      let parsedBody: { evals?: unknown }
+      try {
+        parsedBody = JSON.parse(body)
+      } catch {
+        return this.sendError(res, 400, 'invalid JSON')
+      }
+      const parsed = parseSkillEvalsJson(JSON.stringify(parsedBody.evals ?? null))
+      if (!parsed.ok) {
+        this.sendJson(res, 422, { error: 'invalid evals', errors: parsed.errors })
+        return
+      }
+      const w = await store.saveAuxFile(skillName, 'evals/evals.json', serializeSkillEvals(parsed.file))
+      if (!w.ok) return this.sendError(res, 400, w.error ?? 'failed to save evals')
+      this.sendJson(res, 200, { ok: true, evals: parsed.file })
+      return
+    }
+    this.sendError(res, 405, 'method not allowed')
+  }
+
+  /** POST /api/skills/:name/eval-run — 启动评测(202 → runId,进度轮询 status)。 */
+  private async _handleSkillEvalStart(
+    req: IncomingMessage,
+    res: ServerResponse,
+    skillName: string,
+  ): Promise<void> {
+    if (req.method !== 'POST') return this.sendError(res, 405, 'method not allowed')
+    const userId = this.getUserId(req)
+    const store = buildUserSkillStore()
+    const skill = await store.view(skillName, undefined, { includePlatform: false })
+    if (!skill || typeof skill === 'string') return this.sendError(res, 404, 'skill not found')
+
+    const body = await this.readJsonBody<{ mode?: string; trainRunId?: string }>(req).catch(
+      () => ({}) as { mode?: string; trainRunId?: string },
+    )
+    const mode = body?.mode === 'draft' ? ('draft' as const) : ('baseline' as const)
+
+    // draft 模式:草稿必须存在且属于本用户的训练 run,用草稿携带的用例(如有)覆盖现版用例。
+    let draftDir: string | undefined
+    let draftEvalsJson: string | undefined
+    let trainRunId: string | null = null
+    if (mode === 'draft') {
+      const trainRun = body?.trainRunId ? this.skillTrainJobs.get(body.trainRunId) : undefined
+      if (!trainRun || trainRun.userId !== userId)
+        return this.sendError(res, 404, 'training run not found')
+      const draft = await this.skillDrafts.readDraft(trainRun.runId, skillName)
+      if (!draft || draft.record.op === 'delete')
+        return this.sendError(res, 400, 'no evaluable draft for this skill in the training run')
+      trainRunId = trainRun.runId
+      draftDir = join(paths.skillDraftRunDir(trainRun.runId), skillName)
+      draftEvalsJson = draft.evalsJson
+    }
+
+    // 用例来源:草稿附带 > 技能自带。没有用例 → 明确 400(而不是空跑烧积分)。
+    let evalsRaw =
+      draftEvalsJson ??
+      ((await store.view(skillName, 'evals/evals.json', { includePlatform: false })) as
+        | string
+        | null)
+    if (typeof evalsRaw !== 'string') evalsRaw = null
+    if (!evalsRaw)
+      return this.sendError(res, 400, 'skill has no evals/evals.json — add eval cases first')
+    const parsed = parseSkillEvalsJson(evalsRaw)
+    if (!parsed.ok) {
+      this.sendJson(res, 422, { error: 'invalid evals', errors: parsed.errors })
+      return
+    }
+
+    const guard = this.skillEvalJobs.canStart(skillName)
+    if (!guard.ok) return this.sendError(res, 409, guard.reason ?? 'cannot start eval')
+
+    const run = await this.skillEvalJobs.create({
+      runId: SkillEvalJobStore.newRunId(),
+      skillName,
+      userId,
+      mode,
+      trainRunId,
+      model: SKILL_TRAIN_DEFAULT_MODEL,
+      cases: parsed.file.cases,
+      now: Date.now(),
+    })
+    void this._runSkillEval(run, { draftDir }).catch((err) => {
+      void this.skillEvalJobs.finish(run, Date.now(), { error: String(err) })
+    })
+    this.sendJson(res, 202, { ok: true, runId: run.runId })
+  }
+
+  /** GET /api/skill-eval/:runId — run 状态(owner 校验,同训练 run 语义)。 */
+  private async _handleSkillEvalRunStatus(
+    req: IncomingMessage,
+    res: ServerResponse,
+    runId: string,
+  ): Promise<void> {
+    if (req.method !== 'GET') return this.sendError(res, 405, 'method not allowed')
+    const run = this.skillEvalJobs.get(runId)
+    if (!run) return this.sendError(res, 404, 'eval run not found')
+    if (run.userId !== this.getUserId(req)) return this.sendError(res, 403, 'forbidden')
+    this.sendJson(res, 200, { run })
+  }
+
+  /** 跑一个被测/评分 turn:一次性会话,收最终文本+用量,完了销毁会话释放资源。 */
+  private async _skillEvalTurn(
+    sessionKey: string,
+    userId: string,
+    prompt: string,
+    model: string,
+    opts: {
+      skillEvalExclude?: string
+      skillEvalDraft?: { name: string; dir: string }
+    },
+  ): Promise<{ text: string; usage?: { inputTokens?: number; outputTokens?: number; cacheReadTokens?: number; cacheCreationTokens?: number } }> {
+    const agent = await this._trainingAgent()
+    if (!agent) throw new Error('no agent available for eval')
+    const session = await this.sessions.getOrCreate({
+      sessionKey,
+      agent,
+      channel: 'skill-eval',
+      peerId: sessionKey,
+      userId,
+      effortLevel: 'high',
+      workload: 'skill-eval',
+      skillEvalMode: true,
+      skillEvalExclude: opts.skillEvalExclude,
+      skillEvalDraft: opts.skillEvalDraft,
+    })
+    try {
+      return await new Promise((resolvePromise, rejectPromise) => {
+        // 文本块按 blockId 聚合(同 block 流式覆盖,不同 block 顺序拼接)。
+        const texts = new Map<string, string>()
+        const order: string[] = []
+        this.sessions
+          .submit(
+            session,
+            prompt,
+            (e) => {
+              if (e.kind === 'block' && e.block.kind === 'text' && typeof e.block.text === 'string') {
+                const id = e.block.messageId ?? 'b0'
+                if (!texts.has(id)) order.push(id)
+                texts.set(id, e.block.text)
+              } else if (e.kind === 'final') {
+                const text = order.map((id) => texts.get(id) ?? '').join('\n').trim()
+                resolvePromise({ text, usage: e.meta })
+              } else if (e.kind === 'error') {
+                rejectPromise(new Error(e.error))
+              }
+            },
+            'high',
+            model,
+          )
+          .catch(rejectPromise)
+      })
+    } finally {
+      // 评测会话一次性:立即销毁,释放子进程/pids;失败不影响结果。
+      await this.sessions.destroySession(sessionKey).catch(() => {})
+    }
+  }
+
+  /** 评测编排:逐 case 逐 arm 隔离跑 → 每 case 一个匿名 grader turn → benchmark。 */
+  private async _runSkillEval(run: SkillEvalRun, opts: { draftDir?: string }): Promise<void> {
+    run.status = 'running'
+    await this.skillEvalJobs.touch(run, Date.now())
+    const arms = armsForMode(run.mode)
+    const preferences: Array<'draft' | 'current' | 'tie'> = []
+
+    for (const c of run.cases) {
+      const armOutputs: Array<{ arm: (typeof arms)[number]; result: SkillEvalCaseResult }> = []
+      for (const arm of arms) {
+        const sessionKey = `skilleval:${run.runId}:${c.id}:${arm}`
+        const result: SkillEvalCaseResult = {
+          caseId: c.id,
+          arm,
+          output: '',
+          usage: emptyUsage(),
+          assertions: [],
+        }
+        try {
+          const { text, usage } = await this._skillEvalTurn(
+            sessionKey,
+            run.userId,
+            buildEvalCasePrompt(c),
+            run.model,
+            {
+              skillEvalExclude: arm === 'without' ? run.skillName : undefined,
+              skillEvalDraft:
+                arm === 'draft' && opts.draftDir
+                  ? { name: run.skillName, dir: opts.draftDir }
+                  : undefined,
+            },
+          )
+          result.output = text.slice(0, 20_000)
+          addUsage(result.usage, usage)
+          addUsage(run.usage, usage)
+        } catch (err) {
+          result.error = String(err)
+        }
+        run.results.push(result)
+        armOutputs.push({ arm, result })
+        run.progress.done++
+        await this.skillEvalJobs.touch(run, Date.now())
+      }
+
+      // grading(仅对无 error 的输出;全挂就跳过本 case)
+      const gradable = armOutputs.filter((a) => !a.result.error)
+      if (gradable.length === 0) continue
+      run.status = 'grading'
+      await this.skillEvalJobs.touch(run, Date.now())
+      // 匿名化 + 随机顺序(盲测防位置偏好)。label→arm 映射只在本进程内存。
+      const shuffled = [...gradable].sort(() => Math.random() - 0.5)
+      const labels = ['A', 'B', 'C']
+      const graderArms: GraderArmInput[] = shuffled.map((a, i) => ({
+        label: labels[i],
+        output: a.result.output,
+      }))
+      try {
+        const { text: gradeText, usage: gradeUsage } = await this._skillEvalTurn(
+          `skilleval:${run.runId}:grade:${c.id}`,
+          run.userId,
+          buildGraderPrompt(c, graderArms, {
+            wantPreference: run.mode === 'draft' && gradable.length >= 2,
+          }),
+          run.model,
+          {},
+        )
+        addUsage(run.usage, gradeUsage)
+        const parsed = parseGraderJson(gradeText)
+        if (!parsed) {
+          for (const a of gradable) a.result.error = 'grader output unparseable'
+        } else {
+          shuffled.forEach((a, i) => {
+            a.result.assertions = gradesToAssertions(c, parsed.grades[labels[i]])
+          })
+          if (parsed.preference && run.mode === 'draft') {
+            const idx = parsed.preference === 'tie' ? -1 : labels.indexOf(parsed.preference)
+            if (idx === -1) preferences.push('tie')
+            else preferences.push(shuffled[idx]?.arm === 'draft' ? 'draft' : 'current')
+          }
+        }
+      } catch (err) {
+        for (const a of gradable) a.result.error = `grading failed: ${String(err)}`
+      }
+      run.status = 'running'
+      await this.skillEvalJobs.touch(run, Date.now())
+    }
+
+    const benchmark = computeBenchmark(run.results, {
+      draftMode: run.mode === 'draft',
+      preferences,
+    })
+    await this.skillEvalJobs.finish(run, Date.now(), { benchmark })
+
+    // 可写技能:落 evals/last-run.json 摘要(面板即开即见;draft 模式不写 —— 未合并)。
+    if (run.mode === 'baseline') {
+      const store = buildUserSkillStore()
+      await store
+        .saveAuxFile(
+          run.skillName,
+          'evals/last-run.json',
+          `${JSON.stringify(
+            {
+              runId: run.runId,
+              mode: run.mode,
+              finishedAt: run.finishedAt,
+              benchmark,
+              usage: run.usage,
+            },
+            null,
+            2,
+          )}\n`,
+        )
+        .catch(() => {})
+    }
+
+  }
+
   // ── SkillOpt skill-training (async; train → diff → confirm-merge) ──
 
   /** The agent that runs training sessions (default 'main', else the first agent). */
@@ -4790,13 +5150,54 @@ export class Gateway {
    */
   private _onTrainEvent(runId: string, e: SessionStreamEvent): void {
     if (e.kind === 'final') {
+      void this.skillTrainJobs.addUsage(runId, e.meta, Date.now())
       void this.skillDrafts
         .listDrafts(runId)
-        .then((d) => this.skillTrainJobs.finalize(runId, d.length, Date.now()))
+        .then(async (d) => {
+          await this.skillTrainJobs.finalize(runId, d.length, Date.now())
+          // 评测门(P1):产出草稿且用户启动时同意 autoEval → 自动对目标技能草稿跑
+          // draft vs 现版评测。成本已在训练确认对话框中披露(autoEval 开关 + 估算)。
+          if (d.length > 0) void this._maybeAutoEvalTrainRun(runId)
+        })
         .catch(() => {})
       return
     }
     void this.skillTrainJobs.applyEvent(runId, e, Date.now())
+  }
+
+  /** 训练完成后的评测门:仅单技能训练 + autoEval + 有可用用例(草稿附带或技能自带)。 */
+  private async _maybeAutoEvalTrainRun(trainRunId: string): Promise<void> {
+    const tr = this.skillTrainJobs.get(trainRunId)
+    if (!tr || !tr.autoEval || !tr.skillName) return
+    const draft = await this.skillDrafts.readDraft(trainRunId, tr.skillName).catch(() => null)
+    if (!draft || draft.record.op === 'delete') return
+    const store = buildUserSkillStore()
+    let evalsRaw =
+      draft.evalsJson ??
+      ((await store.view(tr.skillName, 'evals/evals.json', { includePlatform: false })) as
+        | string
+        | null)
+    if (typeof evalsRaw !== 'string' || !evalsRaw) return // 无用例 → 不评(前端提示补用例)
+    const parsed = parseSkillEvalsJson(evalsRaw)
+    if (!parsed.ok) return
+    const guard = this.skillEvalJobs.canStart(tr.skillName)
+    if (!guard.ok) return
+    const run = await this.skillEvalJobs.create({
+      runId: SkillEvalJobStore.newRunId(),
+      skillName: tr.skillName,
+      userId: tr.userId,
+      mode: 'draft',
+      trainRunId,
+      model: SKILL_TRAIN_DEFAULT_MODEL,
+      cases: parsed.file.cases,
+      now: Date.now(),
+    })
+    await this.skillTrainJobs.setEvalRunId(trainRunId, run.runId, Date.now())
+    void this._runSkillEval(run, {
+      draftDir: join(paths.skillDraftRunDir(trainRunId), tr.skillName),
+    }).catch((err) => {
+      void this.skillEvalJobs.finish(run, Date.now(), { error: String(err) })
+    })
   }
 
   // POST /api/skills/:name/train — start an async DeepSeek training run for ONE
@@ -4823,8 +5224,8 @@ export class Gateway {
     const agent = await this._trainingAgent()
     if (!agent) return this.sendError(res, 500, 'no agent available for training')
 
-    const body = await this.readJsonBody<{ focus?: string }>(req).catch(
-      () => ({}) as { focus?: string },
+    const body = await this.readJsonBody<{ focus?: string; autoEval?: boolean }>(req).catch(
+      () => ({}) as { focus?: string; autoEval?: boolean },
     )
     const runId = SkillTrainJobStore.newRunId()
     const opts = normalizeSkillTrainArgs(
@@ -4838,6 +5239,7 @@ export class Gateway {
       userId,
       model: SKILL_TRAIN_DEFAULT_MODEL,
       effort: SKILL_TRAIN_EFFORT,
+      autoEval: body?.autoEval !== false,
       now: Date.now(),
     })
 
@@ -5035,6 +5437,10 @@ export class Gateway {
               { name: t.name, description: draft.meta.description, tags: draft.meta.tags },
               draft.body,
             )
+      // 草稿携带的评测用例随合并落库(evals/evals.json)—— 训练闭环的验收基准。
+      if (r.ok && draft.record.op !== 'delete' && draft.evalsJson) {
+        await store.saveAuxFile(t.name, 'evals/evals.json', draft.evalsJson).catch(() => {})
+      }
       results.push({ name: t.name, ok: r.ok, error: r.error })
       if (r.ok) await this.skillDrafts.deleteDraft(runId, t.name)
     }

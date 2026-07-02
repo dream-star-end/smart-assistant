@@ -288,6 +288,12 @@ export interface SubprocessRunnerOpts {
    * Spawn-time attribute (read once when the mcp env is built), like delegationDepth.
    */
   skillTrainRunId?: string
+  /** Skill-eval 会话标记(禁 skill 写入,mcp env OPENCLAUDE_SKILL_EVAL_MODE=1)。 */
+  skillEvalMode?: boolean
+  /** Skill-eval 'without' arm:隐藏该技能(prompt SKILLS 摘要 + mcp skill_* 双侧)。 */
+  skillEvalExclude?: string
+  /** Skill-eval 'draft' arm:以草稿目录替换该技能。 */
+  skillEvalDraft?: { name: string; dir: string }
 }
 
 // CCB 输出的 SDK message 类型(简化):兼容 stream-json 输出
@@ -1172,6 +1178,8 @@ export class SubprocessRunner extends EventEmitter {
         effortLevel: this.opts.effortLevel,
         // Phase 5:GitHub repo 当前快照(none / cloning / ready / failed) — 决定是否注入 REPO slot。
         repoSnapshot,
+        skillEvalExclude: this.opts.skillEvalExclude,
+        skillEvalDraft: this.opts.skillEvalDraft,
       })
       if (promptResult.content) {
         const path = resolve(sessionDir, 'extra-prompt.md')
@@ -1244,6 +1252,16 @@ export class SubprocessRunner extends EventEmitter {
               : {}),
             // SkillOpt training: expose the draft-only skill_propose tool bound to
             // this run. Only set for training sessions, so normal sessions never see it.
+            ...(this.opts.skillEvalMode ? { OPENCLAUDE_SKILL_EVAL_MODE: '1' } : {}),
+            ...(this.opts.skillEvalExclude
+              ? { OPENCLAUDE_SKILL_EVAL_EXCLUDE: this.opts.skillEvalExclude }
+              : {}),
+            ...(this.opts.skillEvalDraft
+              ? {
+                  OPENCLAUDE_SKILL_EVAL_DRAFT_NAME: this.opts.skillEvalDraft.name,
+                  OPENCLAUDE_SKILL_EVAL_DRAFT_DIR: this.opts.skillEvalDraft.dir,
+                }
+              : {}),
             ...(this.opts.skillTrainRunId
               ? { OPENCLAUDE_SKILL_TRAIN_RUN_ID: this.opts.skillTrainRunId }
               : {}),

@@ -38,6 +38,14 @@ export type SkillTrainPhase =
   | 'done'
   | 'failed'
 
+export interface SkillTrainUsage {
+  inputTokens: number
+  outputTokens: number
+  cacheReadTokens: number
+  cacheCreationTokens: number
+  turns: number
+}
+
 export interface SkillTrainRun {
   runId: string
   /** Target skill, or null for auto-select among the user's own skills. */
@@ -48,6 +56,12 @@ export interface SkillTrainRun {
   effort: string
   status: SkillTrainStatus
   phase: SkillTrainPhase
+  /** 训练会话累计用量(逐 turn 从 final.meta 累加)——前端据公开费率折算积分实报。 */
+  usage: SkillTrainUsage
+  /** 是否在产出草稿后自动跑评测门(用户启动训练时确认,含成本披露)。 */
+  autoEval: boolean
+  /** 评测门 run(draft vs 现版);null = 未评/无 evals。 */
+  evalRunId: string | null
   /** How many skill_propose calls landed (= candidate drafts). */
   proposalCount: number
   /** Total tool calls observed (for the activity readout). */
@@ -142,6 +156,7 @@ export class SkillTrainJobStore {
     userId: string
     model: string
     effort: string
+    autoEval?: boolean
     now: number
   }): Promise<SkillTrainRun> {
     const run: SkillTrainRun = {
@@ -151,6 +166,9 @@ export class SkillTrainJobStore {
       userId: input.userId,
       model: input.model,
       effort: input.effort,
+      usage: { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0, turns: 0 },
+      autoEval: input.autoEval !== false,
+      evalRunId: null,
       status: 'queued',
       phase: 'queued',
       proposalCount: 0,
@@ -232,6 +250,38 @@ export class SkillTrainJobStore {
       await this.persist(run)
       this.onChange(run)
     }
+  }
+
+  /** 逐 turn 累计训练会话用量(final.meta)——成本实报的数据源。 */
+  async addUsage(
+    runId: string,
+    meta:
+      | { inputTokens?: number; outputTokens?: number; cacheReadTokens?: number; cacheCreationTokens?: number }
+      | undefined,
+    now: number,
+  ): Promise<void> {
+    const run = this.runs.get(runId)
+    if (!run || !meta) return
+    // 兼容重启前旧 run.json(无 usage 字段)。
+    run.usage ??= { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0, turns: 0 }
+    run.usage.inputTokens += meta.inputTokens ?? 0
+    run.usage.outputTokens += meta.outputTokens ?? 0
+    run.usage.cacheReadTokens += meta.cacheReadTokens ?? 0
+    run.usage.cacheCreationTokens += meta.cacheCreationTokens ?? 0
+    run.usage.turns += 1
+    run.updatedAt = now
+    await this.persist(run)
+    this.onChange(run)
+  }
+
+  /** 评测门 run 关联(草稿评测完成后由 eval 编排回填)。 */
+  async setEvalRunId(runId: string, evalRunId: string, now: number): Promise<void> {
+    const run = this.runs.get(runId)
+    if (!run) return
+    run.evalRunId = evalRunId
+    run.updatedAt = now
+    await this.persist(run)
+    this.onChange(run)
   }
 
   /**

@@ -65,6 +65,8 @@ export interface SkillDraftContent {
   body: string
   /** Full candidate SKILL.md as it would be written (empty for op='delete'). */
   rawContent: string
+  /** 随草稿提议的评测用例(序列化 evals.json;缺省=本草稿不带用例变更)。 */
+  evalsJson?: string
   record: SkillDraftRecord
 }
 
@@ -85,6 +87,8 @@ export interface WriteSkillDraftInput {
   op?: SkillDraftOp
   rationale?: string
   authoredBy?: SkillDraftAuthor
+  /** 随草稿提议的评测用例(已由调用方 parseSkillEvalsJson 校验后的序列化文本)。 */
+  evalsJson?: string
   /**
    * Authoritative version this draft is derived from (diff "old" side). Set on the
    * first write of a run; omit on re-writes to preserve the prior value. `null` marks
@@ -175,6 +179,9 @@ export class SkillDraftStore {
 
     const content = `${formatFrontmatter(input.meta)}\n\n${input.body.trim()}\n`
     await this.atomicWrite(join(realDir, 'SKILL.md'), content)
+    if (typeof input.evalsJson === 'string' && input.evalsJson.trim()) {
+      await this.atomicWrite(join(realDir, 'evals.json'), input.evalsJson)
+    }
     await this.atomicWrite(join(realDir, 'draft.json'), `${JSON.stringify(record, null, 2)}\n`)
     return { ok: true }
   }
@@ -207,7 +214,10 @@ export class SkillDraftStore {
     if (!raw) return null
     const { meta, body } = parseFrontmatter(raw)
     if (!meta.name || !meta.description) return null
+    const evalsJson =
+      (await this.safeRead(join(this.runDir(runId), name, 'evals.json'))) ?? undefined
     return {
+      ...(evalsJson ? { evalsJson } : {}),
       meta: {
         name: meta.name,
         description: meta.description,

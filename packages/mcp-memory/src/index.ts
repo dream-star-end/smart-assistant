@@ -32,6 +32,8 @@ import {
   type SkillStore,
   buildAgentSkillStore,
   isPlatformReservedSkillName,
+  parseSkillEvalsJson,
+  serializeSkillEvals,
   validateSkillName,
   archivalAdd,
   archivalCount,
@@ -104,6 +106,40 @@ function buildSkillStore(): SkillStore {
 }
 
 const skills = buildSkillStore()
+
+// ── Skill-eval arm 控制(评测隔离会话专用,普通会话两个 env 均缺省) ──
+// EXCLUDE:'without' 基线 —— 目标技能对本会话完全不可见(list/search/view 全隐藏,
+// 与 promptSlots SKILLS 摘要的同名过滤配对;漏一半就是假基线)。
+// DRAFT:'draft' arm —— 目标技能以草稿目录内容替换现版(view 返草稿,list 描述用草稿)。
+// 评测会话总开关:置 1 时本会话禁止 skill_save/skill_delete(评测跑分不得污染技能库)。
+const SKILL_EVAL_MODE = (process.env.OPENCLAUDE_SKILL_EVAL_MODE ?? '').trim() === '1'
+const SKILL_EVAL_EXCLUDE = (process.env.OPENCLAUDE_SKILL_EVAL_EXCLUDE ?? '').trim()
+const SKILL_EVAL_DRAFT_NAME = (process.env.OPENCLAUDE_SKILL_EVAL_DRAFT_NAME ?? '').trim()
+const SKILL_EVAL_DRAFT_DIR = (process.env.OPENCLAUDE_SKILL_EVAL_DRAFT_DIR ?? '').trim()
+
+function evalDraftRaw(): string | null {
+  if (!SKILL_EVAL_DRAFT_NAME || !SKILL_EVAL_DRAFT_DIR) return null
+  try {
+    return readFileSync(`${SKILL_EVAL_DRAFT_DIR}/SKILL.md`, 'utf8')
+  } catch {
+    return null
+  }
+}
+
+/** list() 结果按评测 arm 调整(exclude 滤掉 / draft 换描述)。 */
+function applyEvalArmToList<T extends { name: string; description: string }>(list: T[]): T[] {
+  let out = list
+  if (SKILL_EVAL_EXCLUDE) out = out.filter((s) => s.name !== SKILL_EVAL_EXCLUDE)
+  if (SKILL_EVAL_DRAFT_NAME) {
+    const raw = evalDraftRaw()
+    if (raw) {
+      const m = raw.match(/^description:\s*(.+)$/m)
+      const desc = m ? m[1].trim().replace(/^"|"$/g, '') : null
+      if (desc) out = out.map((s) => (s.name === SKILL_EVAL_DRAFT_NAME ? { ...s, description: desc } : s))
+    }
+  }
+  return out
+}
 
 // Skill-training run id, set by the gateway ONLY when this mcp-memory subprocess is
 // itself a skill-training session. When present, the draft-only `skill_propose` tool
@@ -498,6 +534,9 @@ const SKILL_PROPOSE_TOOL = {
     '  body        — full SKILL.md instructions (required for create/update)',
     '  tags        — optional topical tags',
     '  rationale   — one paragraph citing the evidence sessions for this change',
+    '  evals       — optional eval cases ({version:1, cases:[{id,prompt,assertions[]}]}).',
+    '                REQUIRED when the target skill has no evals yet (2-3 realistic cases,',
+    '                3-5 decidable assertions each) — they become its acceptance baseline.',
     '',
     'Only USER-AUTHORED skills can be proposed against; platform baseline/agent-seed skills are rejected.',
   ].join('\n'),
@@ -510,6 +549,7 @@ const SKILL_PROPOSE_TOOL = {
       body: { type: 'string' },
       tags: { type: 'array', items: { type: 'string' } },
       rationale: { type: 'string' },
+      evals: { type: 'object' },
     },
     required: ['name', 'op', 'rationale'],
   },
@@ -704,7 +744,7 @@ async function handleSessionSearch(args: {
 }
 
 async function handleSkillList() {
-  const list = await skills.list()
+  const list = applyEvalArmToList(await skills.list())
   if (list.length === 0) {
     return {
       content: [
@@ -796,7 +836,7 @@ async function handleSkillSearch(args: { query: string; limit?: number } | undef
   const query = typeof args?.query === 'string' ? args.query.trim() : ''
   if (!query) return toolError('query required')
 
-  const list = await skills.list()
+  const list = applyEvalArmToList(await skills.list())
 
   // v3: semantic ranking via master relay (key stays on master); any miss → keyword fallback.
   const semantic = await semanticSkillRank(list, query, args?.limit)
@@ -851,6 +891,11 @@ async function handleSkillSearch(args: { query: string; limit?: number } | undef
 }
 
 async function handleSkillView(args: { name: string; subfile?: string }) {
+  if (SKILL_EVAL_EXCLUDE && args.name === SKILL_EVAL_EXCLUDE) return toolError('skill not found')
+  if (SKILL_EVAL_DRAFT_NAME && args.name === SKILL_EVAL_DRAFT_NAME && !args.subfile) {
+    const raw = evalDraftRaw()
+    if (raw) return { content: [{ type: 'text', text: `[source: user]\n\n${raw}` }] }
+  }
   const v = await skills.view(args.name, args.subfile)
   if (!v) return toolError('skill not found')
   if (typeof v === 'string') {
@@ -957,6 +1002,7 @@ async function handleSkillSave(args: {
       )
     }
   }
+  if (SKILL_EVAL_MODE) return toolError('skill writes are disabled in eval sessions')
   const r = await skills.save(
     {
       name: args.name,
@@ -975,6 +1021,7 @@ async function handleSkillDelete(args: { name: string }) {
       'skill_delete is disabled during a training run — use skill_propose op="delete" (draft only)',
     )
   }
+  if (SKILL_EVAL_MODE) return toolError('skill writes are disabled in eval sessions')
   const r = await skills.delete(args.name)
   if (!r.ok) return toolError(r.error ?? 'delete failed')
   // PR4: when a user shadow was removed but the platform baseline remains,
@@ -996,6 +1043,7 @@ async function handleSkillPropose(args: {
   tags?: string[]
   rationale?: string
   runId?: string
+  evals?: unknown
 }) {
   if (!SKILL_TRAIN_RUN_ID) {
     return toolError('skill_propose is only available during a skill-training run')
@@ -1041,9 +1089,19 @@ async function handleSkillPropose(args: {
     const body = typeof args.body === 'string' ? args.body : ''
     if (!description) return toolError('description required for create/update')
     if (!body.trim()) return toolError('body required for create/update')
+    // 随草稿提议的评测用例:先过 schema 校验再落盘(坏用例直接拒,防污染评测门)。
+    let evalsJson: string | undefined
+    if (args.evals !== undefined) {
+      const parsedEvals = parseSkillEvalsJson(JSON.stringify(args.evals))
+      if (!parsedEvals.ok) {
+        return toolError(`evals 不合法: ${parsedEvals.errors.join('; ')}`)
+      }
+      evalsJson = serializeSkillEvals(parsedEvals.file)
+    }
     const res = await drafts.writeDraft({
       runId: SKILL_TRAIN_RUN_ID,
       op,
+      evalsJson,
       meta: { name: args.name, description, tags: args.tags },
       body,
       rationale,

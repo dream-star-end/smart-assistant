@@ -54,6 +54,8 @@ export const paths = {
   // separate store.save()/store.delete() at merge time.
   skillDraftsDir: join(HOME, 'skill-drafts'),
   skillDraftRunDir: (runId: string) => join(HOME, 'skill-drafts', runId),
+  skillEvalsDir: join(HOME, 'skill-evals'),
+  skillEvalRunDir: (runId: string) => join(HOME, 'skill-evals', runId),
   skillDraftDir: (runId: string, skillName: string) =>
     join(HOME, 'skill-drafts', runId, skillName),
   skillDraftMd: (runId: string, skillName: string) =>

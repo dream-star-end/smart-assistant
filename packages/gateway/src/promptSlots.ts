@@ -44,6 +44,11 @@ export interface PromptSlotContext {
    *  hints must not advertise tools that are disabled by env/toolset/entry
    *  resolution, or the model will try to call a non-existent tool. */
   availableMcpTools?: string[]
+  /** Skill-eval 'without' arm:该技能对本会话完全不可见(与 mcp-memory 的
+   *  OPENCLAUDE_SKILL_EVAL_EXCLUDE 配对;SKILLS 摘要漏滤会造成假基线)。 */
+  skillEvalExclude?: string
+  /** Skill-eval 'draft' arm:该技能在 SKILLS 摘要里用草稿描述(view 由 mcp 侧接管)。 */
+  skillEvalDraft?: { name: string; dir: string }
 }
 
 export interface PromptSlot {
@@ -222,7 +227,23 @@ export async function buildAgentsSlot(ctx: PromptSlotContext): Promise<PromptSlo
 
 export async function buildSkillsSlot(ctx: PromptSlotContext): Promise<PromptSlot | null> {
   const skillStore = buildPromptSkillStore(ctx.agentId)
-  const skillList = await skillStore.list()
+  let skillList = await skillStore.list()
+  // Skill-eval arm 控制:exclude 滤掉;draft 用草稿描述替换(内容 view 由 mcp 侧接管)。
+  if (ctx.skillEvalExclude) skillList = skillList.filter((s) => s.name !== ctx.skillEvalExclude)
+  if (ctx.skillEvalDraft) {
+    try {
+      const raw = readFileSync(`${ctx.skillEvalDraft.dir}/SKILL.md`, 'utf-8')
+      const m = raw.match(/^description:\s*(.+)$/m)
+      const desc = m ? m[1].trim().replace(/^"|"$/g, '') : null
+      if (desc) {
+        skillList = skillList.map((s) =>
+          s.name === ctx.skillEvalDraft?.name ? { ...s, description: desc } : s,
+        )
+      }
+    } catch {
+      /* 草稿读不到 → 保持现版描述 */
+    }
+  }
   if (skillList.length === 0) return null
   const top = skillList.slice(0, 15)
   const lines = [
@@ -286,6 +307,7 @@ export function buildToolsSlot(): PromptSlot {
       '4. 好的 skill = 触发场景 + 前提条件 + 步骤 + 验证方式 + 常见坑 + 命令模板。',
       '',
       '创建/更新 skill 时保持泛化,不要把一次性用户隐私、token、短期路径、无复用价值的流水账写进去。',
+      '结构与评测规范见 `skill_view("skill-authoring")`:原则进 SKILL.md(<500行),稳定知识进 references/,重复动作进 scripts/,素材进 assets/,验收用例进 evals/evals.json。',
       '',
       '## 联网检索纪律',
       '',
