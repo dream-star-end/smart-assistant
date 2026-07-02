@@ -1,4 +1,4 @@
-import { ArrowRight, Brain, Check, Plus, Puzzle, Shield, Sparkles } from "lucide-react";
+import { ArrowRight, Check, MessageSquareText, Plus, Puzzle, Shield, Sparkles, X } from "lucide-react";
 import type { Theme } from "../hooks/useTheme";
 import { AGENTS } from "../lib/agents";
 import { AgentAvatar } from "./AgentAvatar";
@@ -21,23 +21,34 @@ function Logo() {
   );
 }
 
-/** 叙事三支柱：开箱即用 / 越用越好用 / 越用越懂你。 */
-const PILLARS = [
-  {
-    icon: Sparkles,
-    t: "开箱即用",
-    d: "全能助手即开即用 —— 不用挑模型、不用调 prompt，张口就问。写作、编程、研究、分析，第一句话就能用。",
+/** 差异化对比：普通 AI 聊天给建议，Aurora 把活儿干完。左右两列逐行对照。 */
+const COMPARE = {
+  chat: {
+    title: "普通 AI 聊天",
+    rows: [
+      "给一段文字建议，活儿还得你自己干",
+      "大文件贴不进去，更别说跑分析、出图表",
+      "关掉窗口就忘了你是谁",
+      "能力固定，专业活儿只能凑合",
+    ],
   },
-  {
-    icon: Puzzle,
-    t: "越用越好用",
-    d: "需要更专业时，从 AI 市场一键加装技能与专家智能体。能力随你的需求生长，用得越久，越趁手。",
+  aurora: {
+    title: "Aurora 全能助手",
+    rows: [
+      "自己拆任务、跑代码、查资料，把整件事干完",
+      "直接读 Excel / PDF / 图片，交回图表、PPT 和报告",
+      "记住你的身份、偏好与项目，下次自动接上",
+      "AI 市场按需加装专家智能体与技能，越用越强",
+    ],
   },
-  {
-    icon: Brain,
-    t: "越用越懂你",
-    d: "长期记住你的身份、偏好与项目背景，下次对话自动带上下文。不必重复交代，它越来越懂你。",
-  },
+};
+
+/** 内测期真实用量（来自生产会话统计），给「真的会干活」以数字背书。 */
+const USAGE_STATS = [
+  { n: "3,500+", label: "次代码执行" },
+  { n: "860+", label: "次联网调研" },
+  { n: "410+", label: "张图片识别" },
+  { n: "250+", label: "次团队委派" },
 ];
 
 export function Landing({
@@ -89,17 +100,17 @@ export function Landing({
         <div className="relative mx-auto max-w-4xl px-5 pb-10 pt-20 text-center md:pt-28">
           <div className="mb-6 inline-flex items-center gap-2 rounded-full border border-border bg-surface px-3.5 py-1.5 text-[13px] text-muted shadow-sm animate-in">
             <span className="size-1.5 rounded-full bg-accent" />
-            {BRAND.company} · 可成长的 AI 助手
+            {BRAND.company} · 会干活的 AI 助手
           </div>
           <h1 className="mx-auto max-w-3xl text-balance text-[40px] font-bold leading-[1.1] tracking-tight md:text-[60px] animate-in">
-            开箱即用的 AI 助手
+            把活儿交给它
             <br className="hidden sm:block" />
             <span className="bg-gradient-to-r from-accent to-info bg-clip-text text-transparent">
-              越用越好用，越用越懂你
+              拿回能直接用的成果
             </span>
           </h1>
-          <p className="mx-auto mt-6 max-w-xl text-[17px] leading-relaxed text-muted animate-in">
-            上传文件、联网调研、跑代码、做分析 —— 把复杂的活交给它，交回看板、报告、PPT、代码等能直接用的成果。需要更专业时从 AI 市场一键加装能力，它还记得你的偏好。
+          <p className="mx-auto mt-6 max-w-2xl text-[17px] leading-relaxed text-muted animate-in">
+            读文件、联网调研、写代码、跑分析 —— 像给同事派活一样吩咐一句，它自己把整件事干完：交回做好的图表、PPT、Excel、报告，和已经推送的代码。
           </p>
           <div className="mt-9 flex flex-col items-center justify-center gap-3 sm:flex-row animate-in">
             <Button variant="primary" shape="pill" size="lg" onClick={onStart} className="group shadow-float">
@@ -116,33 +127,71 @@ export function Landing({
           <p className="mt-5 text-[13px] text-faint">免费版每月 300 积分 · 无需信用卡</p>
         </div>
 
-        {/* 动态演示 —— 让人看到就想用 */}
-        <div id="demo" className="relative mx-auto max-w-3xl scroll-mt-20 px-5 pb-12">
+        {/* 动态演示 —— 左对话右成果的工作台，让「交付成果」看得见 */}
+        <div id="demo" className="relative mx-auto max-w-5xl scroll-mt-20 px-5 pb-4">
           <DemoShowcase onTry={onStart} />
+        </div>
+
+        {/* 真实用量背书：演示不是想象的广告词 */}
+        <div className="mx-auto max-w-4xl px-5 pb-14 text-center">
+          <div className="mt-4 flex flex-wrap items-center justify-center gap-x-8 gap-y-3">
+            {USAGE_STATS.map((s) => (
+              <div key={s.label} className="flex items-baseline gap-1.5">
+                <span className="text-[20px] font-bold tabular-nums tracking-tight text-fg">{s.n}</span>
+                <span className="text-[13px] text-muted">{s.label}</span>
+              </div>
+            ))}
+          </div>
+          <p className="mt-3 text-[12.5px] text-faint">
+            内测期真实用量 · 以上演示场景均取材自真实用户会话，仅做脱敏精简
+          </p>
         </div>
       </section>
 
-      {/* 三支柱叙事 */}
-      <section id="features" className="border-y border-border bg-sidebar/50">
+      {/* 差异化对比：不是又一个聊天机器人 */}
+      <section id="compare" className="border-y border-border bg-sidebar/50">
         <div className="mx-auto max-w-6xl px-5 py-20">
           <div className="mb-12 text-center">
-            <h2 className="text-[32px] font-bold tracking-tight md:text-[40px]">一个助手，陪你一起变强</h2>
-            <p className="mx-auto mt-3 max-w-xl text-[16px] text-muted">不是一次性的工具，而是越用越合手的伙伴。</p>
+            <h2 className="text-[32px] font-bold tracking-tight md:text-[40px]">不是又一个聊天机器人</h2>
+            <p className="mx-auto mt-3 max-w-xl text-[16px] text-muted">
+              普通 AI 给你一段建议；它像同事一样把活儿干完 —— 而且越用越好用，越用越懂你。
+            </p>
           </div>
-          <div className="grid grid-cols-1 gap-6 md:grid-cols-3">
-            {PILLARS.map((f, i) => (
-              <div
-                key={f.t}
-                className="rounded-2xl border border-border bg-surface p-7 animate-in"
-                style={{ animationDelay: `${i * 80}ms` }}
-              >
-                <span className="mb-5 flex size-12 items-center justify-center rounded-xl bg-accent-soft text-accent">
-                  <f.icon size={23} />
+          <div className="mx-auto grid max-w-4xl grid-cols-1 gap-5 md:grid-cols-2">
+            {/* 普通 AI 聊天 */}
+            <div className="rounded-2xl border border-border bg-surface p-7">
+              <div className="mb-5 flex items-center gap-2.5">
+                <span className="flex size-9 items-center justify-center rounded-xl bg-hover text-faint">
+                  <MessageSquareText size={18} />
                 </span>
-                <h3 className="text-[19px] font-semibold">{f.t}</h3>
-                <p className="mt-2.5 text-[14.5px] leading-relaxed text-muted">{f.d}</p>
+                <h3 className="text-[17px] font-semibold text-muted">{COMPARE.chat.title}</h3>
               </div>
-            ))}
+              <ul className="space-y-3.5">
+                {COMPARE.chat.rows.map((r) => (
+                  <li key={r} className="flex items-start gap-2.5 text-[14.5px] leading-relaxed text-faint">
+                    <X size={16} className="mt-1 shrink-0" />
+                    {r}
+                  </li>
+                ))}
+              </ul>
+            </div>
+            {/* Aurora */}
+            <div className="relative rounded-2xl border border-accent/40 bg-surface p-7 shadow-[var(--shadow-float)] ring-1 ring-accent/20">
+              <div className="mb-5 flex items-center gap-2.5">
+                <span className="flex size-9 items-center justify-center rounded-xl bg-grad-cta text-white">
+                  <Sparkles size={18} />
+                </span>
+                <h3 className="text-[17px] font-semibold">{COMPARE.aurora.title}</h3>
+              </div>
+              <ul className="space-y-3.5">
+                {COMPARE.aurora.rows.map((r) => (
+                  <li key={r} className="flex items-start gap-2.5 text-[14.5px] leading-relaxed text-fg">
+                    <Check size={16} className="mt-1 shrink-0 text-accent" />
+                    {r}
+                  </li>
+                ))}
+              </ul>
+            </div>
           </div>
         </div>
       </section>

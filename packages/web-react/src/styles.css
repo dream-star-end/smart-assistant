@@ -175,6 +175,11 @@ body {
   .landing-safe-t { padding-top: env(safe-area-inset-top, 0px); }
   .sidebar-foot-safe-b { padding-bottom: calc(0.5rem + env(safe-area-inset-bottom, 0px)); } /* 叠 p-2 底部 */
   .animate-in { animation: fade-up 0.32s cubic-bezier(0.22, 1, 0.36, 1); }
+  /* 落地页成果预览:条形从 0 生长到目标宽(width 由行内 style 指定,动画只做 scaleX)。 */
+  .chart-bar-grow {
+    transform-origin: left center;
+    animation: bar-grow 0.5s cubic-bezier(0.22, 1, 0.36, 1) backwards;
+  }
   .animate-fade { animation: fade-in 0.4s ease; }
   /* brand gradient surfaces — pastel aurora for decorative glows, grad-cta for marketing CTAs */
   .bg-aurora { background-image: var(--aurora); }
@@ -182,6 +187,7 @@ body {
 }
 
 @keyframes fade-up { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+@keyframes bar-grow { from { transform: scaleX(0); } to { transform: scaleX(1); } }
 @keyframes fade-in { from { opacity: 0; } to { opacity: 1; } }
 @keyframes blink { 0%, 100% { opacity: 1; } 50% { opacity: 0; } }
 .caret-blink { animation: blink 1s step-end infinite; }
