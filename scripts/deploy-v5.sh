@@ -114,12 +114,25 @@ smoke() {
   done
   echo "  /healthz: $hz"
   [[ -z "$hz" ]] && { echo "✗ v5 /healthz 无响应(10 次重试后)" >&2; return 1; }
-  # 断言 channel=v5、控制面静默(schedulers=[])、legacy agentRuntime disabled。
-  # 注:P1+ 后 v5 跑真实 on-demand 容器(v3supervisor),containerRuntime=enabled 为正确态
-  #     (P0 时代曾断言 disabled,空壳阶段已过)。真正的隔离不变量是 schedulers=[](控制面
-  #     静默,follower)+ agentRuntime=disabled(不起 legacy agent 运行时)。
+  # 断言 channel=v5、shared 域 mutator 静默、legacy agentRuntime disabled。
+  # 注:P1+ 后 v5 跑真实 on-demand 容器(v3supervisor),containerRuntime=enabled 为正确态。
+  # mutator 归属矩阵(commit c79d083e)后,v5 合法运行 v5-owned/local 域 scheduler:
+  #   subscriptionRollover(0096 订阅域,v3 树无代码,v5 不跑则全网真空)
+  #   accountSlotReaper(纯进程内 slot 租约自愈)
+  #   researchJobs(claim/recoverStale 均按 channel 过滤,只动 v5 行)
+  # 隔离不变量升级为**白名单**:schedulers 出现任何名单外条目 = shared 域泄漏,FAIL。
+  # (服务端 index.ts 有同语义的 fail-closed 拒启断言,本处是部署面第二道防线。)
   echo "$hz" | grep -q '"channel":"v5"' || { echo "✗ channel != v5" >&2; return 1; }
-  echo "$hz" | grep -q '"schedulers":\[\]' || { echo "✗ schedulers 非空(控制面未静默!)" >&2; return 1; }
+  local scheds allowed bad
+  scheds="$(echo "$hz" | grep -o '"schedulers":\[[^]]*\]' | sed 's/.*\[//;s/\]//;s/"//g')"
+  allowed="subscriptionRollover accountSlotReaper researchJobs"
+  bad=""
+  IFS=',' read -ra _sarr <<<"$scheds"
+  for s in "${_sarr[@]}"; do
+    [[ -z "$s" ]] && continue
+    grep -qw "$s" <<<"$allowed" || bad="$bad $s"
+  done
+  [[ -n "$bad" ]] && { echo "✗ shared 域 scheduler 泄漏到 v5:$bad" >&2; return 1; }
   echo "$hz" | grep -q '"controlPlaneEnabled":false' || { echo "✗ controlPlaneEnabled 非 false" >&2; return 1; }
   echo "$hz" | grep -q '"agentRuntime":"disabled"' || { echo "✗ agentRuntime 非 disabled(不应起 legacy agent 运行时)" >&2; return 1; }
   local ver; ver="$(ssh "$KL_HOST" "curl -fsS http://127.0.0.1:${V5_PORT}/version" 2>/dev/null || true)"
