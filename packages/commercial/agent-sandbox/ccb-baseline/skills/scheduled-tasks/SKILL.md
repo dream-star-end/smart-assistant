@@ -1,7 +1,7 @@
 ---
 name: scheduled-tasks
 description: "定时任务的创建方法: cron 表达式计算、工具调用、常见场景速查"
-version: "1.0.0"
+version: "1.1.0"
 tags: [system, scheduling, cron, task]
 ---
 
@@ -19,12 +19,19 @@ tags: [system, scheduling, cron, task]
 ```
 create_reminder(
   schedule="33 14 * * *",   // crontab 格式: 分 时 日 月 周
-  message="该喝水了",        // 任务内容
-  oneshot=true              // true=一次性, false=重复
+  message="该喝水了",        // 提醒内容(到点原样播报)
+  oneshot=true,             // true=一次性, false=重复
+  kind="reminder"           // "task" = message 是到点要执行的任务指令(如"汇总周报并推送")
 )
 ```
 
-也可以用 `CronCreate(cron="...", prompt="...", recurring=false)`,效果完全相同。
+管理已有任务(与网页「管理中心 → 定时任务」同一份数据,用户在页面建的你也能看到):
+
+```
+list_reminders()                              // 列出全部定时提醒/任务
+update_reminder(id="...", schedule="0 8 * * *")  // 改时间/内容/标题/启停/一次性/送达
+delete_reminder(id="...")                     // 删除
+```
 
 ## Cron 表达式速查
 
@@ -52,4 +59,4 @@ create_reminder(
 - 一次性任务用 `oneshot=true`
 - 重复任务用 `oneshot=false`
 - **不要说"做不到"**,你有完整的定时任务系统
-- 用户可以在 UI 任务中心管理所有定时任务
+- 用户可以在网页「管理中心 → 定时任务」查看/编辑/启停这些任务;你用 list_reminders 看到的和用户看到的是同一份
