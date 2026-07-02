@@ -4977,9 +4977,10 @@ export class Gateway {
             prompt,
             (e) => {
               if (e.kind === 'block' && e.block.kind === 'text' && typeof e.block.text === 'string') {
+                // parser 发出的 text 是**增量片段**(内部才做累计),按 messageId 拼接。
                 const id = e.block.messageId ?? 'b0'
                 if (!texts.has(id)) order.push(id)
-                texts.set(id, e.block.text)
+                texts.set(id, (texts.get(id) ?? '') + e.block.text)
               } else if (e.kind === 'final') {
                 const text = order.map((id) => texts.get(id) ?? '').join('\n').trim()
                 resolvePromise({ text, usage: e.meta })
