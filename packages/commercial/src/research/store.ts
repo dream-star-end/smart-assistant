@@ -10,8 +10,11 @@
  *     旧进程长尾写回污染(同 inbox/email.ts 的 mark* guard 套路)。
  *   - research_documents 是证据权威源:putDocument 存 master 铸造的权威 spans,
  *     getSpan 供 oc-cite check 回查取 canonical quote 文本(主键含 user_id,tenant 隔离)。
+ *   - 保留策略:blob 暂存默认 30 天 TTL(putBlob COALESCE 兜底),artifacts 记录
+ *     180 天;gcExpiredBlobs/gcOldArtifacts 由 scheduler 每日 tick 清(见 scheduler.ts)。
  */
 
+import { unlink } from "node:fs/promises";
 import type { PoolClient } from "pg";
 import type {
   NormalizedDocument,
@@ -448,6 +451,11 @@ interface ArtifactDbRow {
 
 // ─── 暂存输入 blobs ───────────────────────────────────────────────────
 
+/** 新写入 blob 的默认 TTL(天)。blob 只是 ingest 原始字节暂存;文档权威 spans
+ *  已落 research_documents(source_blob_id 列级 ON DELETE SET NULL),过期删 blob
+ *  不影响证据权威。 */
+export const BLOB_DEFAULT_TTL_DAYS = 30;
+
 export interface PutBlobInput {
   blobId: string;
   userId: bigint | number | string;
@@ -455,13 +463,15 @@ export interface PutBlobInput {
   sizeBytes: number;
   storagePath: string;
   mime?: string;
+  /** 过期时间;**未传/null 时 SQL 侧默认 NOW()+30 天**(见 BLOB_DEFAULT_TTL_DAYS)。 */
   expiresAt?: Date | null;
 }
 
 export async function putBlob(input: PutBlobInput): Promise<void> {
   await query(
     `INSERT INTO research_blobs (blob_id, user_id, sha256, size_bytes, storage_path, mime, expires_at)
-     VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+     VALUES ($1, $2, $3, $4, $5, $6,
+             COALESCE($7, NOW() + make_interval(days => ${BLOB_DEFAULT_TTL_DAYS})))`,
     [
       input.blobId,
       String(input.userId),
@@ -507,6 +517,71 @@ export async function getBlob(
     storagePath: row.storage_path,
     mime: row.mime,
   };
+}
+
+// ─── 保留策略 GC(scheduler 每日 tick 调;见 research/scheduler.ts) ────
+
+export interface GcDeps {
+  /** 磁盘文件删除(测试注入)。默认 fs.unlink。 */
+  unlinkImpl?: (p: string) => Promise<void>;
+  /** 非 ENOENT 的文件删除失败上报(不阻断行删)。默认 console.warn。 */
+  onWarn?: (msg: string) => void;
+}
+
+function defaultGcWarn(msg: string): void {
+  // eslint-disable-next-line no-console
+  console.warn(`[research/store] ${msg}`);
+}
+
+/**
+ * 删过期 blob(expires_at < NOW):**先删磁盘文件再删行**;文件删失败(含跨实例
+ * 路径不存在的 ENOENT)不阻断行删,只 warn —— blob 是暂存字节,行是权威索引,
+ * 宁可留孤儿文件(下轮/人工可清)也不留悬空行。
+ * research_documents.source_blob_id 由列级 ON DELETE SET NULL 自动置空。
+ * 返回删除的行数。
+ */
+export async function gcExpiredBlobs(deps: GcDeps = {}): Promise<number> {
+  const unlinkImpl = deps.unlinkImpl ?? ((p: string) => unlink(p));
+  const onWarn = deps.onWarn ?? defaultGcWarn;
+  const sel = await query<{ user_id: string; blob_id: string; storage_path: string }>(
+    `SELECT user_id::text AS user_id, blob_id, storage_path
+       FROM research_blobs
+      WHERE expires_at IS NOT NULL AND expires_at < NOW()`,
+  );
+  if (sel.rows.length === 0) return 0;
+  for (const row of sel.rows) {
+    try {
+      await unlinkImpl(row.storage_path);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException | null)?.code !== "ENOENT") {
+        onWarn(`gcExpiredBlobs: unlink ${row.storage_path} failed: ${clipError(err)}`);
+      }
+    }
+  }
+  // 只删本轮 SELECT 到的行(不用 expires_at<NOW 重删):SELECT→DELETE 窗口内新过期的
+  // 行留给下轮,保证"删行前一定尝试过删文件"的顺序不变量。
+  const del = await query(
+    `DELETE FROM research_blobs b
+      USING unnest($1::bigint[], $2::text[]) AS t(uid, bid)
+      WHERE b.user_id = t.uid AND b.blob_id = t.bid`,
+    [sel.rows.map((r) => r.user_id), sel.rows.map((r) => r.blob_id)],
+  );
+  return del.rowCount ?? 0;
+}
+
+/** 产物索引保留天数:storage_path 指向用户容器卷,容器/卷回收后记录悬空;
+ *  签名下载链接也早已失效 → 半年后只清**记录**(master 摸不到卷文件,不做文件级 GC)。 */
+export const ARTIFACT_RETENTION_DAYS = 180;
+
+/** 删超保留期的 research_artifacts 行(仅记录级 GC,见 ARTIFACT_RETENTION_DAYS)。返回删除行数。 */
+export async function gcOldArtifacts(retentionDays = ARTIFACT_RETENTION_DAYS): Promise<number> {
+  const days = Math.max(1, Math.floor(retentionDays));
+  const r = await query(
+    `DELETE FROM research_artifacts
+      WHERE created_at < NOW() - make_interval(days => $1::int)`,
+    [days],
+  );
+  return r.rowCount ?? 0;
 }
 
 export const _internal = { LOCK_KEY_HI, LOCK_KEY_LO } as const;

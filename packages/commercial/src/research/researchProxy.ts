@@ -3,7 +3,7 @@
  *
  * 拓扑同 literatureProxy:container CLI → master 18791/18443 → dispatchInternal
  * → verifyContainerIdentity 双因子 → 配额闸 → master 侧执行(查 OpenAlex/Crossref/
- * arXiv;读 research_config 的 mailto/secrets)→ JSON 回容器。
+ * arXiv/PubMed/S2;读 research_config 的 mailto/secrets)→ JSON 回容器。
  *
  * 路由:
  *   POST /v3/research/lit/search   {query, sources?, size?, yearMin?, lang?} → {sources, warnings}
@@ -391,7 +391,7 @@ async function handleBlobUpload(
   sendJson(res, 200, { blobId, sha256, sizeBytes: bytes.length }, requestId);
 }
 
-const VALID_SOURCES: LitSourceName[] = ["openalex", "crossref", "arxiv"];
+const VALID_SOURCES: LitSourceName[] = ["openalex", "crossref", "arxiv", "pubmed", "s2"];
 
 async function handleLitSearch(
   res: ServerResponse,
@@ -413,8 +413,11 @@ async function handleLitSearch(
   const yearMin = typeof body.yearMin === "number" && Number.isFinite(body.yearMin) ? body.yearMin : undefined;
   const lang = body.lang === "zh" || body.lang === "en" ? body.lang : undefined;
 
-  // secrets 仅在需要(目前 unpaywall email 在 config 非密;S2 key 是 secret,Phase 1 未接 S2 源)
-  await readSecrets().catch(() => ({}));
+  // secrets 仅在需要时解密(最小权限):只有 s2Enabled 才可能用到 s2ApiKey。
+  // 解密失败 fail-soft(S2 无 key 也可用,只是共享限速池)。
+  const secrets: ResearchSecrets = cfg.config.litSources.s2Enabled
+    ? await readSecrets().catch(() => ({}))
+    : {};
 
   // DeepXiv arXiv 兜底源(域内 RAG):读旧 literature_deepxiv_config(外部服务凭据,token 留 master)。
   // enabled+base+token 才启用;读不到/未配 → 不传(searchMultiSource 主源全空时才会用到)。
@@ -431,6 +434,10 @@ async function handleLitSearch(
     {
       mailto: cfg.config.litSources.crossrefMailto ?? cfg.config.litSources.openalexMailto,
       unpaywallEmail: cfg.config.litSources.unpaywallEmail,
+      pubmedEnabled: cfg.config.litSources.pubmedEnabled,
+      pubmedEmail: cfg.config.litSources.pubmedEmail,
+      s2Enabled: cfg.config.litSources.s2Enabled,
+      s2ApiKey: secrets.s2ApiKey,
       fetchImpl,
       deepxiv,
     },

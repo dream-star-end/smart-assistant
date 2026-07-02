@@ -4,12 +4,14 @@
  * 设计权威:docs/research-agent/IMPLEMENTATION_PLAN.md §2。仿 inbox/email.ts:
  *   - 启动时一次 recoverStale(running 且 locked_at<NOW-staleMs → interrupted,不重发)。
  *   - 每 intervalMs:claimNextJob(batch)→ 按 kind 派发 handler → complete/fail。
+ *   - 保留策略 GC:每日一次 runResearchGc(过期 blob + 老 artifacts 记录),
+ *     跟随本 scheduler 启动(幂等,极端双跑无害),启动即跑一轮。
  *   - 单进程 inflight guard 防 tick 重叠;跨进程靠 store.claimNextJob 的 advisory
  *     lock + FOR UPDATE SKIP LOCKED 双保险。
  *
- * 门控:本 scheduler **必须**只在 master control-plane(controlPlaneEnabled=true,
- * 即 runtimeChannel='v3')启动 —— v5 follower 下 commercial/index.ts 不调
- * startResearchJobScheduler,且 enabledSchedulers 非空会触发 P0 CRASH(纵深兜底)。
+ * 门控:index.ts 在 (controlPlaneEnabled || runtimeChannel==='v5') 时启动本 scheduler
+ * ("v5-owned" —— 研究子系统实际跑在 v5 实例);job 消费按 runtime_channel 行级隔离
+ * (claimNextJob/recoverStale 过滤),两实例不抢彼此的 job。
  *
  * handler 注入(DI seam):Phase 0 wiring 传空/部分 handler;Phase 1/2 逐步补
  * ingest/index/cite_check/lit_search/render 的真实 handler。未注册 kind 的 job →
@@ -22,6 +24,8 @@ import {
   claimNextJob,
   completeJob,
   failJob,
+  gcExpiredBlobs,
+  gcOldArtifacts,
   recordCheckpoint,
   recoverStale,
   transitionPhase,
@@ -34,6 +38,8 @@ export const MIN_INTERVAL_MS = 2_000;
 export const DEFAULT_BATCH_SIZE = 8;
 /** running → interrupted 阈值:科研 op 上限 ~ 多分钟;30min 远超合理,几乎只可能是崩溃。 */
 export const STALE_RUNNING_MS = 30 * 60_000;
+/** 保留策略 GC tick 间隔:每日一次(过期 blob / 老 artifacts 记录,见 store.ts)。 */
+export const GC_INTERVAL_MS = 24 * 60 * 60_000;
 
 // ─── handler 契约 ────────────────────────────────────────────────────
 
@@ -118,6 +124,27 @@ function defaultOnError(err: unknown, job?: ResearchJobRow): void {
   console.warn(`[research/scheduler] job ${job?.id ?? "?"} (${job?.kind ?? "?"}) failed:`, err);
 }
 
+// ─── 保留策略 GC(每日) ─────────────────────────────────────────────
+
+export interface ResearchGcResult {
+  blobsDeleted: number;
+  artifactsDeleted: number;
+}
+
+/**
+ * 跑一轮保留策略 GC:过期 blob(先文件后行)+ 老 artifacts 记录(仅行,180 天)。
+ * 幂等(DELETE 条件式),多实例重复跑无害;调用方负责门控与调度。
+ */
+export async function runResearchGc(): Promise<ResearchGcResult> {
+  const blobsDeleted = await gcExpiredBlobs();
+  const artifactsDeleted = await gcOldArtifacts();
+  // eslint-disable-next-line no-console
+  console.log(
+    `[research/scheduler] retention gc: expired blobs deleted=${blobsDeleted}, old artifacts deleted=${artifactsDeleted}`,
+  );
+  return { blobsDeleted, artifactsDeleted };
+}
+
 // ─── scheduler ───────────────────────────────────────────────────────
 
 export interface ResearchJobSchedulerHandle {
@@ -133,6 +160,14 @@ export interface ResearchJobSchedulerOptions {
   /** 启动时跑一次 stale cleanup;默认 true。 */
   runStaleCleanupOnStart?: boolean;
   staleMs?: number;
+  /**
+   * 保留策略 GC(过期 blob + 老 artifacts 记录):默认 true;**仅在 master
+   * control-plane(runtime channel 'v3')实际生效**——GC 表无 channel 维度,
+   * 全库一把手,与其它全库 sweeper 的门控纪律一致,避免 v3/v5 双跑。
+   * 测试可显式关(false)避免碰 DB。
+   */
+  runRetentionGc?: boolean;
+  gcIntervalMs?: number;
   onError?: (err: unknown, job?: ResearchJobRow) => void;
 }
 
@@ -184,10 +219,39 @@ export function startResearchJobScheduler(
   }, interval);
   if (typeof timer.unref === "function") timer.unref();
 
+  // 保留策略 GC(每日):跟随本 scheduler 的启动门控 —— index.ts 只在
+  // (controlPlaneEnabled || channel==='v5') 时启动 research scheduler,而研究子系统
+  // 实际跑在 v5 实例(OC_RUNTIME_CHANNEL=v5)上;若在这里再按 channel==='v3' 收紧,
+  // GC 会在 v5 上永远不跑(v3 老树无此代码)= 形同虚设。GC 本身幂等
+  // (条件式 DELETE + unlink ENOENT 容忍),极端双跑无害。
+  // 启动即跑一轮(部署重启频繁,纯靠 24h interval 可能永远轮不到)。
+  let gcTimer: NodeJS.Timeout | undefined;
+  let gcInflight = false;
+  const gcTick = async (): Promise<void> => {
+    if (gcInflight || stopped) return;
+    gcInflight = true;
+    try {
+      await runResearchGc();
+    } catch (err) {
+      onError(err);
+    } finally {
+      gcInflight = false;
+    }
+  };
+  if (opts.runRetentionGc !== false) {
+    const gcInterval = Math.max(60_000, opts.gcIntervalMs ?? GC_INTERVAL_MS);
+    void gcTick();
+    gcTimer = setInterval(() => {
+      void gcTick();
+    }, gcInterval);
+    if (typeof gcTimer.unref === "function") gcTimer.unref();
+  }
+
   return {
     stop() {
       stopped = true;
       clearInterval(timer);
+      if (gcTimer) clearInterval(gcTimer);
     },
     runNow: tickOnce,
   };

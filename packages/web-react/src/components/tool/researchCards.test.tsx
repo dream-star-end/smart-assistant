@@ -1,6 +1,7 @@
 import "@testing-library/jest-dom/vitest";
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, test } from "vitest";
+import { MediaSignProvider } from "../chat/media";
 import type { ToolLike } from "./format";
 import { researchToolCard } from "./researchCards";
 
@@ -205,10 +206,48 @@ describe("其余 oc-* 卡片", () => {
     expect(screen.getByText("Elo 1533")).toBeInTheDocument();
   });
 
-  test("oc-docx → 文档卡(从命令解析文件名,无需 JSON 输出)", () => {
+  test("oc-docx → 文档卡(从命令解析文件名,无需 JSON 输出;绝对路径 → 下载卡)", () => {
     render(<div>{researchToolCard("oc-docx report.md -o /home/agent/x.docx", tool({ output: "[pandoc] ok" }))}</div>);
     expect(screen.getByText("Word 文档已生成")).toBeInTheDocument();
-    expect(screen.getByText("x.docx")).toBeInTheDocument();
+    // 标题副标 + 签名下载卡都显示文件名 → 至少出现一次(下载入口存在)。
+    expect(screen.getAllByText("x.docx").length).toBeGreaterThanOrEqual(2);
+  });
+
+  test("oc-pdf 绝对路径 -o → 产物卡 + 签名下载/预览链接(与 oc-report 体验对齐)", async () => {
+    const sign = async (paths: string[]) =>
+      Object.fromEntries(paths.map((p) => [p, `/api/media?sig=x&path=${encodeURIComponent(p)}`]));
+    const { container } = render(
+      <MediaSignProvider sign={sign}>
+        {researchToolCard(
+          "oc-pdf paper.qmd -o /home/agent/out/paper.pdf",
+          tool({ output: "[quarto] Output created: paper.pdf" }),
+        )}
+      </MediaSignProvider>,
+    );
+    expect(screen.getByText("PDF 文档已生成")).toBeInTheDocument();
+    expect(screen.getAllByText("paper.pdf").length).toBeGreaterThanOrEqual(1);
+    // 签名解析完成后出现真正可点的下载 <a download> 与「预览」链接(pdf 可预览)。
+    await waitFor(() => expect(container.querySelector("a[download]")).not.toBeNull());
+    expect(screen.getByText("预览")).toBeInTheDocument();
+  });
+
+  test("oc-xlsx 相对路径 → 退回提示文案(无任何可点链接)", () => {
+    const { container } = render(
+      <div>{researchToolCard("oc-xlsx build data.json -o 结果.xlsx", tool({ output: "[oc-xlsx] wrote 结果.xlsx" }))}</div>,
+    );
+    expect(screen.getByText("Excel 表格已生成")).toBeInTheDocument();
+    expect(screen.getByText("结果.xlsx")).toBeInTheDocument(); // 副标仍显示文件名
+    expect(screen.getByText(/可在文件区下载/)).toBeInTheDocument();
+    expect(container.querySelector("a")).toBeNull();
+  });
+
+  test("oc-pdf 恶意 scheme 输出路径 → 不产生可点 href", () => {
+    const { container } = render(
+      <div>{researchToolCard("oc-pdf x.qmd -o javascript:alert(1)//x.pdf", tool({ output: "ok" }))}</div>,
+    );
+    expect(screen.getByText("PDF 文档已生成")).toBeInTheDocument(); // 卡仍渲染
+    expect(container.querySelector('a[href^="javascript:"]')).toBeNull();
+    expect(container.querySelector("a")).toBeNull(); // 不安全 src → 无下载/预览链接
   });
 
   test("oc-market search → 技能市场卡(数组输出)", () => {

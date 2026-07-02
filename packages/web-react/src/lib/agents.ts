@@ -33,6 +33,20 @@ export type Agent = {
   isDefault?: boolean
 }
 
+/**
+ * 【Landing 专用展示数据,非运行时权威源 —— 不是双入口】
+ *
+ * 这些"预设人设"(代码专家/学术研究/商业分析…)**只**被 Landing.tsx 用作首页
+ * 「AI 市场 · 专业智能体(示例,陆续上新)」的营销示意卡:点击一律走 onStart 进入产品,
+ * 不会作为可选 agent 进入运行时。运行时 agent 列表的唯一权威源是后端
+ * /api/marketplace/my-agents(平台预设助手由 seedPlatformAgents / platformPresets 下发:
+ * 编程助手、办公助手、科研助手 research-assistant);AgentPicker / App 完全数据驱动,
+ * agentById 也刻意不解析本列表(见下)。因此这里的「学术研究」与市场的「科研助手」
+ * 不会同时出现在选择器里。
+ *
+ * 维护约定:新增真实助手请改后端 platformPresets / 市场发布,不要往这里加;
+ * 本列表仅营销文案,`system`/`starters` 是展示占位,不参与真实请求(见文件尾注释)。
+ */
 export const AGENTS: Agent[] = [
   {
     id: 'general',

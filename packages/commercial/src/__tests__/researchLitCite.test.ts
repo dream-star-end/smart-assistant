@@ -16,7 +16,11 @@ import {
   parseArxivAtom,
   parseCrossrefItem,
   parseOpenAlexWork,
+  parsePubmedSummary,
+  parseS2Paper,
   searchOpenAlex,
+  searchPubmed,
+  searchS2,
 } from "../research/sources.js";
 import {
   dedupAndMerge,
@@ -125,6 +129,125 @@ describe("sources: normalize & parse", () => {
     const recs = await searchOpenAlex("q", { size: 5, mailto: "a@b.com", fetchImpl: f });
     assert.equal(recs.length, 1);
     assert.equal(recs[0].doi, "10.1/x");
+  });
+});
+
+// ── sources: PubMed ──────────────────────────────────────────────────
+
+describe("sources: pubmed", () => {
+  const esummaryRec = {
+    uid: "123",
+    title: "CRISPR therapy outcomes",
+    pubdate: "2021 Mar 4",
+    fulljournalname: "Nature Medicine",
+    source: "Nat Med",
+    authors: [{ name: "Smith J", authtype: "Author" }, { name: "CollabGroup", authtype: "CollectiveName" }],
+    articleids: [
+      { idtype: "pubmed", value: "123" },
+      { idtype: "doi", value: "10.1038/S41591-021-0001" },
+    ],
+    pubtype: ["Journal Article"],
+  };
+
+  it("parsePubmedSummary:doi 从 articleids 取 + 年/期刊/作者映射", () => {
+    const rec = parsePubmedSummary(esummaryRec);
+    assert.ok(rec);
+    assert.equal(rec.doi, "10.1038/s41591-021-0001"); // 归一小写 → 与其它源 DOI 去重直接生效
+    assert.equal(rec.id, "doi:10.1038/s41591-021-0001");
+    assert.equal(rec.year, 2021);
+    assert.equal(rec.venue, "Nature Medicine");
+    assert.deepEqual(rec.authors, [{ name: "Smith J" }]); // 非 Author authtype 剔除
+    assert.equal(rec.retracted, null);
+  });
+
+  it("parsePubmedSummary:Retracted Publication → retracted:true;无题名 → null", () => {
+    const rec = parsePubmedSummary({ ...esummaryRec, pubtype: ["Journal Article", "Retracted Publication"] });
+    assert.equal(rec?.retracted, true);
+    assert.equal(parsePubmedSummary({ title: "  " }), null);
+  });
+
+  it("searchPubmed:esearch→esummary 两跳 + tool/email polite 参数", async () => {
+    const urls: string[] = [];
+    const f = (async (url: string | URL | Request) => {
+      const u = String(url);
+      urls.push(u);
+      if (u.includes("esearch.fcgi")) {
+        return new Response(JSON.stringify({ esearchresult: { idlist: ["123"] } }), {
+          status: 200, headers: { "content-type": "application/json" },
+        });
+      }
+      if (u.includes("esummary.fcgi")) {
+        return new Response(JSON.stringify({ result: { uids: ["123"], "123": esummaryRec } }), {
+          status: 200, headers: { "content-type": "application/json" },
+        });
+      }
+      return new Response("nf", { status: 404 });
+    }) as unknown as typeof fetch;
+    const recs = await searchPubmed("crispr", { size: 5, pubmedEmail: "a@b.com", yearMin: 2020, fetchImpl: f });
+    assert.equal(recs.length, 1);
+    assert.equal(recs[0].doi, "10.1038/s41591-021-0001");
+    assert.equal(urls.length, 2);
+    assert.ok(urls[0].includes("esearch.fcgi") && urls[0].includes("tool=openclaude-research"));
+    assert.ok(urls[0].includes("email=a%40b.com"));
+    assert.ok(urls[0].includes("mindate=2020") && urls[0].includes("datetype=pdat"));
+    assert.ok(urls[1].includes("esummary.fcgi") && urls[1].includes("id=123"));
+  });
+
+  it("searchPubmed:esearch 空命中 → 不发 esummary,返回 []", async () => {
+    let calls = 0;
+    const f = (async (url: string | URL | Request) => {
+      calls++;
+      assert.ok(String(url).includes("esearch.fcgi"), "空命中不应再发 esummary");
+      return new Response(JSON.stringify({ esearchresult: { idlist: [] } }), {
+        status: 200, headers: { "content-type": "application/json" },
+      });
+    }) as unknown as typeof fetch;
+    assert.deepEqual(await searchPubmed("nothing", { size: 5, fetchImpl: f }), []);
+    assert.equal(calls, 1);
+  });
+});
+
+// ── sources: Semantic Scholar ────────────────────────────────────────
+
+describe("sources: s2", () => {
+  const s2Paper = {
+    paperId: "p1",
+    title: "Attention is all you need",
+    authors: [{ name: "Ashish Vaswani" }],
+    year: 2017,
+    venue: "NeurIPS",
+    externalIds: { DOI: "10.5555/X", ArXiv: "1706.03762" },
+    citationCount: 99999,
+    isOpenAccess: true,
+    openAccessPdf: { url: "https://oa/x.pdf" },
+  };
+
+  it("parseS2Paper:externalIds → doi/arxivId + OA/引用数映射", () => {
+    const rec = parseS2Paper(s2Paper);
+    assert.ok(rec);
+    assert.equal(rec.doi, "10.5555/x");
+    assert.equal(rec.arxivId, "1706.03762");
+    assert.equal(rec.year, 2017);
+    assert.equal(rec.venue, "NeurIPS");
+    assert.equal(rec.citationCount, 99999);
+    assert.deepEqual(rec.oa, { isOA: true, url: "https://oa/x.pdf", source: "s2" });
+    assert.equal(parseS2Paper({ title: null }), null);
+  });
+
+  it("searchS2:有 apiKey 时带 x-api-key header;无 key 不带", async () => {
+    const seenKeys: Array<string | undefined> = [];
+    const f = (async (_url: string | URL | Request, init?: RequestInit) => {
+      const h = (init?.headers ?? {}) as Record<string, string>;
+      seenKeys.push(h["x-api-key"]);
+      return new Response(JSON.stringify({ data: [s2Paper] }), {
+        status: 200, headers: { "content-type": "application/json" },
+      });
+    }) as unknown as typeof fetch;
+    const withKey = await searchS2("q", { size: 5, fetchImpl: f }, { apiKey: "sk-s2" });
+    assert.equal(withKey.length, 1);
+    assert.equal(withKey[0].doi, "10.5555/x");
+    await searchS2("q", { size: 5, yearMin: 2015, fetchImpl: f });
+    assert.deepEqual(seenKeys, ["sk-s2", undefined]);
   });
 });
 
@@ -284,6 +407,123 @@ describe("litSearch: dedup & merge", () => {
     );
     assert.equal(res.sources.length, 0);
     assert.equal(dxCalls, 0, "用户显式排除 arxiv → 不混入 DeepXiv");
+  });
+});
+
+// ── litSearch: pubmed / s2 门控 ──────────────────────────────────────
+
+describe("litSearch: pubmed/s2 gating", () => {
+  const emptyMain = [
+    { match: "api.openalex.org", json: { results: [] } },
+    { match: "api.crossref.org", json: { message: { items: [] } } },
+    { match: "export.arxiv.org", text: "<feed></feed>" },
+  ];
+
+  it("pubmed 默认参与(免费官方 API),结果并入去重", async () => {
+    const f = mockFetch([
+      ...emptyMain,
+      { match: "esearch.fcgi", json: { esearchresult: { idlist: ["1"] } } },
+      {
+        match: "esummary.fcgi",
+        json: { result: { uids: ["1"], "1": { title: "PubMed hit", pubdate: "2022", articleids: [{ idtype: "doi", value: "10.9/pm" }] } } },
+      },
+    ]);
+    const res = await searchMultiSource({ query: "q" }, { fetchImpl: f, retryDelayMs: 0 });
+    assert.equal(res.sources.length, 1);
+    assert.equal(res.sources[0].doi, "10.9/pm");
+  });
+
+  it("pubmedEnabled=false → pubmed 不出网", async () => {
+    let pubmedCalls = 0;
+    const f = (async (url: string | URL | Request) => {
+      const u = String(url);
+      if (u.includes("eutils.ncbi.nlm.nih.gov")) pubmedCalls++;
+      if (u.includes("export.arxiv.org")) return new Response("<feed></feed>", { status: 200 });
+      if (u.includes("api.crossref.org")) {
+        return new Response(JSON.stringify({ message: { items: [] } }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+      return new Response(JSON.stringify({ results: [] }), { status: 200, headers: { "content-type": "application/json" } });
+    }) as unknown as typeof fetch;
+    await searchMultiSource({ query: "q" }, { fetchImpl: f, retryDelayMs: 0, pubmedEnabled: false });
+    assert.equal(pubmedCalls, 0);
+  });
+
+  it("pubmed 上游错误 → 转 warning 不拖垮整体", async () => {
+    const f = mockFetch([
+      { match: "api.openalex.org", json: { results: [{ title: "OK", doi: "10.1/o" }] } },
+      { match: "api.crossref.org", json: { message: { items: [] } } },
+      { match: "export.arxiv.org", text: "<feed></feed>" },
+      { match: "esearch.fcgi", status: 400 },
+    ]);
+    const res = await searchMultiSource({ query: "q" }, { fetchImpl: f, retryDelayMs: 0 });
+    assert.equal(res.sources.length, 1);
+    assert.ok(res.warnings.some((w) => w.includes("pubmed")));
+  });
+
+  it("s2 默认不参与(s2Enabled 未开)→ 不出网、无 warning", async () => {
+    let s2Calls = 0;
+    const f = (async (url: string | URL | Request) => {
+      const u = String(url);
+      if (u.includes("semanticscholar.org")) s2Calls++;
+      if (u.includes("export.arxiv.org")) return new Response("<feed></feed>", { status: 200 });
+      if (u.includes("api.crossref.org")) {
+        return new Response(JSON.stringify({ message: { items: [] } }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+      if (u.includes("esearch.fcgi")) {
+        return new Response(JSON.stringify({ esearchresult: { idlist: [] } }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+      return new Response(JSON.stringify({ results: [] }), { status: 200, headers: { "content-type": "application/json" } });
+    }) as unknown as typeof fetch;
+    const res = await searchMultiSource({ query: "q" }, { fetchImpl: f, retryDelayMs: 0 });
+    assert.equal(s2Calls, 0, "s2Enabled 未开不应出网");
+    assert.ok(!res.warnings.some((w) => w.includes("s2")), "默认候选剔除应静默");
+  });
+
+  it("显式 --sources s2 但平台未开 → warning + 不出网", async () => {
+    let calls = 0;
+    const f = (async () => {
+      calls++;
+      return new Response("x", { status: 500 });
+    }) as unknown as typeof fetch;
+    const res = await searchMultiSource({ query: "q", sources: ["s2"] }, { fetchImpl: f, retryDelayMs: 0 });
+    assert.equal(calls, 0);
+    assert.equal(res.sources.length, 0);
+    assert.ok(res.warnings.some((w) => w.includes("s2") && w.includes("disabled")));
+  });
+
+  it("s2Enabled=true 无 key 被限速(429)→ 重试后转 warning", async () => {
+    let s2Calls = 0;
+    const f = (async (url: string | URL | Request) => {
+      const u = String(url);
+      if (u.includes("semanticscholar.org")) {
+        s2Calls++;
+        return new Response("rate limited", { status: 429 });
+      }
+      return new Response("nf", { status: 404 });
+    }) as unknown as typeof fetch;
+    const res = await searchMultiSource(
+      { query: "q", sources: ["s2"] },
+      { fetchImpl: f, retryDelayMs: 0, s2Enabled: true },
+    );
+    assert.ok(s2Calls >= 2, `429 属瞬时应重试(实际 ${s2Calls} 次)`);
+    assert.equal(res.sources.length, 0);
+    assert.ok(res.warnings.some((w) => w.includes("s2") && w.includes("upstream_429")));
+  });
+
+  it("s2Enabled=true 正常返回并与其它源 DOI 去重", async () => {
+    const f = mockFetch([
+      { match: "api.openalex.org", json: { results: [{ title: "Same paper", doi: "10.1/x" }] } },
+      { match: "api.crossref.org", json: { message: { items: [] } } },
+      { match: "export.arxiv.org", text: "<feed></feed>" },
+      { match: "esearch.fcgi", json: { esearchresult: { idlist: [] } } },
+      {
+        match: "semanticscholar.org",
+        json: { data: [{ title: "Same paper", year: 2020, externalIds: { DOI: "10.1/X" }, citationCount: 7 }] },
+      },
+    ]);
+    const res = await searchMultiSource({ query: "q" }, { fetchImpl: f, retryDelayMs: 0, s2Enabled: true });
+    assert.equal(res.sources.length, 1, "同 DOI 应去重合并");
+    assert.equal(res.sources[0].citationCount, 7);
   });
 });
 

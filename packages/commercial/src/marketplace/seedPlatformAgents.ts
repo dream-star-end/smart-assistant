@@ -72,7 +72,9 @@ const PLATFORM_RESEARCH_AGENTS: PlatformAgentDef[] = [
       description:
         '一站式科研助手:从选题、多源检索、精读、方法/数据分析到综述论文写作,一个对话端到端跑完,全程引用接地(每条结论可溯源、不臆造文献)。',
       tags: ['科研', '文献', '综述', '论文', '引用接地'],
-      version: '1.0.0',
+      // 1.0.1:persona 点名 scientific-figures(出图纪律)。seed 按 (slug,version) 幂等 +
+      // approvePlatformVersion 校验 hash,改 body 必须 bump,否则同版本 hash 不一致会拒批。
+      version: '1.0.1',
       // 端到端研究的核心难点是分析与引用接地的严谨性(推理),故选强推理模型;写作纪律
       // 由 research-writing-style / scientific-writing skill 兜底。如需更长写作上下文可换 MiniMax-M3。
       model: 'deepseek-v4-pro',

@@ -15,6 +15,7 @@ import {
   ChevronRight,
   Database,
   ExternalLink,
+  FileSpreadsheet,
   FileText,
   FileOutput,
   Package,
@@ -699,16 +700,47 @@ function RankCard({ data, partial }: { data: Record<string, unknown>; partial?: 
   );
 }
 
-// ── 文档产物卡(oc-docx) ─────────────────────────────────────────────────────
+// ── 办公文档产物卡(oc-docx / oc-pdf / oc-xlsx) ──────────────────────────────
 
-function DocxCard({ command }: { command: string }) {
-  // oc-docx 输出是 pandoc/quarto(非 JSON),从命令解析输出文件名。
-  const m = command.match(/(?:-o|--output)\s+(\S+)/) ?? command.match(/(\S+\.docx)\b/);
-  const out = m?.[1] ?? "";
-  const fileName = out ? out.replace(/^['"]|['"]$/g, "").split("/").pop() : "文档.docx";
+/**
+ * 从命令行解析输出文件路径:这三个 CLI 的输出是 pandoc/Quarto/Typst 日志(非 JSON),
+ * 只能从命令本身取输出名。优先 `-o/--output <path>`(含 `--output=path` 形式),
+ * 回落"首个以 .<ext> 结尾的词"。去掉包裹引号;解析不出 → null。
+ */
+function parseOutputPath(command: string, ext: string): string | null {
+  const m =
+    command.match(/(?:^|\s)(?:-o|--output)(?:=|\s+)(\S+)/) ??
+    command.match(new RegExp(`(\\S+\\.${ext})\\b`, "i"));
+  const out = (m?.[1] ?? "").replace(/^['"]|['"]$/g, "");
+  return out || null;
+}
+
+/**
+ * 通用办公产物卡(oc-docx/oc-pdf/oc-xlsx 参数化标题/图标/提示文案)。
+ * 若能从命令解析出**安全产物路径**(容器绝对路径,复用 safeArtifactSrc 白名单)→ 渲染
+ * 签名下载卡 + 预览链接(pdf 等浏览器可原生渲染的类型),与 oc-report 产物卡体验对齐;
+ * 解析不出安全绝对路径 → 退回提示文案(旧 DocxCard 行为)。
+ */
+function OfficeArtifactCard({ command, ext, title, icon, note }: {
+  command: string;
+  ext: string;
+  title: string;
+  icon: ReactNode;
+  note: string;
+}) {
+  const out = parseOutputPath(command, ext);
+  const fileName = out ? out.split("/").pop() || out : undefined;
+  const safeOut = out ? safeArtifactSrc(out) : null; // 白名单后才做 href(防恶意 scheme)
   return (
-    <CardShell icon={<FileText className="size-4" />} title="Word 文档已生成" subtitle={fileName || undefined}>
-      <div className="text-xs text-faint">可在文件区下载;数学公式/排版已按高质量 Word 模板渲染。</div>
+    <CardShell icon={icon} title={title} subtitle={fileName}>
+      {safeOut ? (
+        <div className="flex flex-wrap items-center gap-2">
+          <SignedFileCard src={safeOut} filename={fileName} />
+          <ArtifactPreviewLink src={safeOut} />
+        </div>
+      ) : (
+        <div className="text-xs text-faint">{note}</div>
+      )}
     </CardShell>
   );
 }
@@ -789,8 +821,41 @@ const TOOL_CARD_REGISTRY: CardEntry[] = [
   { match: (c) => matchOcTool(c, "oc-slides"), render: (_c, t) => obj(t, ArtifactCard) },
   { match: (c) => matchOcTool(c, "oc-poster"), render: (_c, t) => obj(t, ArtifactCard) },
   { match: (c) => matchOcTool(c, "oc-rank"), render: (_c, t) => obj(t, RankCard) },
+  // 办公文档 CLI(输出是 pandoc/Quarto/Typst 日志而非 JSON,从命令行解析输出路径)。
+  {
+    match: (c) => matchOcTool(c, "oc-docx"),
+    render: (c) =>
+      OfficeArtifactCard({
+        command: c,
+        ext: "docx",
+        title: "Word 文档已生成",
+        icon: <FileText className="size-4" />,
+        note: "可在文件区下载;数学公式/排版已按高质量 Word 模板渲染。",
+      }),
+  },
+  {
+    match: (c) => matchOcTool(c, "oc-pdf"),
+    render: (c) =>
+      OfficeArtifactCard({
+        command: c,
+        ext: "pdf",
+        title: "PDF 文档已生成",
+        icon: <FileText className="size-4" />,
+        note: "可在文件区下载;已按 Quarto/Typst 模板高质量排版。",
+      }),
+  },
+  {
+    match: (c) => matchOcTool(c, "oc-xlsx"),
+    render: (c) =>
+      OfficeArtifactCard({
+        command: c,
+        ext: "xlsx",
+        title: "Excel 表格已生成",
+        icon: <FileSpreadsheet className="size-4" />,
+        note: "可在文件区下载;数据/图表已按模板写入工作簿。",
+      }),
+  },
   // 其它通用工具。
-  { match: (c) => matchOcTool(c, "oc-docx"), render: (c) => DocxCard({ command: c }) },
   { match: (c) => matchOcTool(c, "oc-market"), render: (_c, t) => MarketCard({ tool: t }) },
 ];
 

@@ -1,12 +1,14 @@
 /**
- * oc-lit 多源文献检索 — 各源 adapter(OpenAlex / Crossref / arXiv)。
+ * oc-lit 多源文献检索 — 各源 adapter(OpenAlex / Crossref / arXiv / PubMed / Semantic Scholar)。
  *
  * 设计:
- *   - 元数据走开放 API(OpenAlex/Crossref 免费,arXiv Atom);**绝不代爬付费墙**。
+ *   - 元数据走开放 API(OpenAlex/Crossref 免费,arXiv Atom,PubMed E-utilities 免费,
+ *     S2 Graph API 无 key 可用但限速);**绝不代爬付费墙**。
  *   - 每个源:fetch(注入 fetchImpl 便于测试)+ 纯 parse(JSON/XML → SourceRecord)。
  *   - 中文文献:OpenAlex 中文覆盖低且 DOI 缺失率高 → 去重靠 标题+作者+年(见 litSearch.ts),
  *     本层只负责把各源记录归一成 SourceRecord。
- *   - polite pool:OpenAlex/Crossref 带 mailto(admin 配)提升配额、降被限风险。
+ *   - polite pool:OpenAlex/Crossref 带 mailto、PubMed 带 tool/email(admin 配)提升配额、
+ *     降被限风险;S2 有 s2ApiKey secret 时带 x-api-key。
  *   - 失败/超时 → 抛错,由 litSearch 收敛进 warnings(单源失败不拖垮整体)。
  */
 
@@ -19,6 +21,8 @@ export interface SourceSearchOpts {
   yearMin?: number;
   /** OpenAlex/Crossref polite pool mailto。 */
   mailto?: string;
+  /** PubMed E-utilities polite email(未配时 litSearch 回落 mailto)。 */
+  pubmedEmail?: string;
   timeoutMs?: number;
   fetchImpl?: FetchLike;
 }
@@ -306,6 +310,163 @@ export async function searchArxiv(query: string, opts: SourceSearchOpts): Promis
   const url = `https://export.arxiv.org/api/query?${params.toString()}`;
   const xml = await fetchText(url, opts);
   return parseArxivAtom(xml);
+}
+
+// ───────────────────────────────────────────────
+// PubMed(NCBI E-utilities;免费无 key,polite via tool/email)
+// 两跳:esearch(term → PMID 列表)→ esummary(PMID → 题录)。生医/临床文献主源。
+// ───────────────────────────────────────────────
+
+const EUTILS_BASE = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils";
+const PUBMED_TOOL = "openclaude-research";
+
+/** esummary 单条记录(retmode=json 的 result[uid] 形态,最小容错子集)。 */
+interface PubmedSummary {
+  uid?: string;
+  title?: string;
+  pubdate?: string;
+  fulljournalname?: string;
+  source?: string;
+  authors?: Array<{ name?: string; authtype?: string }>;
+  articleids?: Array<{ idtype?: string; value?: string }>;
+  pubtype?: string[];
+}
+
+export function parsePubmedSummary(s: PubmedSummary): SourceRecord | null {
+  const title = (s.title ?? "").trim();
+  if (!title) return null;
+  const authors: Author[] = (s.authors ?? [])
+    .filter((a) => (a.authtype ?? "Author") === "Author")
+    .map((a) => ({ name: (a.name ?? "").trim() }))
+    .filter((a) => a.name.length > 0);
+  const yearMatch = (s.pubdate ?? "").match(/\d{4}/);
+  const year = yearMatch ? Number(yearMatch[0]) : undefined;
+  const doi = normalizeDoi(s.articleids?.find((i) => i.idtype === "doi")?.value);
+  // 撤稿:esummary pubtype 含 "Retracted Publication" 即已撤稿;否则未知(null)。
+  const retracted = (s.pubtype ?? []).some((t) => /retracted publication/i.test(t)) ? true : null;
+  return {
+    id: makeSourceId({ doi, title, authors, year }),
+    title,
+    authors,
+    year,
+    venue: s.fulljournalname ?? s.source ?? undefined,
+    doi,
+    lang: guessLang(title),
+    oa: undefined, // PubMed 题录不含 OA 全文链接;OA 富化交给 Unpaywall(litSearch)
+    retracted,
+  };
+}
+
+export async function searchPubmed(query: string, opts: SourceSearchOpts): Promise<SourceRecord[]> {
+  const size = Math.min(Math.max(opts.size, 1), 100);
+  const polite = new URLSearchParams();
+  polite.set("tool", PUBMED_TOOL);
+  if (opts.pubmedEmail) polite.set("email", opts.pubmedEmail);
+
+  const es = new URLSearchParams(polite);
+  es.set("db", "pubmed");
+  es.set("retmode", "json");
+  es.set("retmax", String(size));
+  es.set("term", query);
+  if (opts.yearMin) {
+    // mindate/maxdate 必须成对;maxdate=3000 即"不设上限"
+    es.set("datetype", "pdat");
+    es.set("mindate", String(opts.yearMin));
+    es.set("maxdate", "3000");
+  }
+  const esJson = (await fetchJson(`${EUTILS_BASE}/esearch.fcgi?${es.toString()}`, opts)) as {
+    esearchresult?: { idlist?: unknown };
+  };
+  const idlist = Array.isArray(esJson.esearchresult?.idlist)
+    ? esJson.esearchresult.idlist.filter((x): x is string => typeof x === "string" && /^\d+$/.test(x))
+    : [];
+  if (idlist.length === 0) return [];
+
+  const sm = new URLSearchParams(polite);
+  sm.set("db", "pubmed");
+  sm.set("retmode", "json");
+  sm.set("id", idlist.join(","));
+  const smJson = (await fetchJson(`${EUTILS_BASE}/esummary.fcgi?${sm.toString()}`, opts)) as {
+    result?: Record<string, unknown> & { uids?: unknown };
+  };
+  const result = smJson.result ?? {};
+  const uids = Array.isArray(result.uids)
+    ? result.uids.filter((x): x is string => typeof x === "string")
+    : idlist;
+  const out: SourceRecord[] = [];
+  for (const uid of uids) {
+    const item = result[uid];
+    if (!item || typeof item !== "object") continue;
+    const rec = parsePubmedSummary(item as PubmedSummary);
+    if (rec) out.push(rec);
+  }
+  return out;
+}
+
+// ───────────────────────────────────────────────
+// Semantic Scholar Graph API(无 key 可用但限速;s2ApiKey secret 时带 x-api-key)
+// ───────────────────────────────────────────────
+
+interface S2Paper {
+  paperId?: string;
+  title?: string | null;
+  authors?: Array<{ name?: string | null }>;
+  year?: number | null;
+  venue?: string | null;
+  externalIds?: { DOI?: string | null; ArXiv?: string | null } | null;
+  citationCount?: number | null;
+  isOpenAccess?: boolean | null;
+  openAccessPdf?: { url?: string | null } | null;
+}
+
+export function parseS2Paper(p: S2Paper): SourceRecord | null {
+  const title = (p.title ?? "").trim();
+  if (!title) return null;
+  const doi = normalizeDoi(p.externalIds?.DOI);
+  const arxivId = normalizeArxivId(p.externalIds?.ArXiv);
+  const authors: Author[] = (p.authors ?? [])
+    .map((a) => ({ name: (a.name ?? "").trim() }))
+    .filter((a) => a.name.length > 0);
+  const year = typeof p.year === "number" ? p.year : undefined;
+  const oaUrl = p.openAccessPdf?.url ?? undefined;
+  return {
+    id: makeSourceId({ doi, arxivId, title, authors, year }),
+    title,
+    authors,
+    year,
+    venue: p.venue?.trim() ? p.venue.trim() : undefined,
+    doi,
+    arxivId,
+    citationCount: typeof p.citationCount === "number" ? p.citationCount : undefined,
+    lang: guessLang(title),
+    oa: p.isOpenAccess === true ? { isOA: true, url: oaUrl, source: oaUrl ? "s2" : undefined } : undefined,
+    retracted: null,
+  };
+}
+
+const S2_FIELDS = "title,authors,year,venue,externalIds,citationCount,isOpenAccess,openAccessPdf";
+
+export async function searchS2(
+  query: string,
+  opts: SourceSearchOpts,
+  cfg?: { apiKey?: string },
+): Promise<SourceRecord[]> {
+  const params = new URLSearchParams();
+  params.set("query", query);
+  params.set("limit", String(Math.min(Math.max(opts.size, 1), 100)));
+  params.set("fields", S2_FIELDS);
+  if (opts.yearMin) params.set("year", `${opts.yearMin}-`); // S2 原生年份区间过滤
+  const url = `https://api.semanticscholar.org/graph/v1/paper/search?${params.toString()}`;
+  const headers = cfg?.apiKey ? { "x-api-key": cfg.apiKey } : undefined;
+  const json = (await fetchJson(url, { ...opts, headers })) as { data?: unknown };
+  const data = Array.isArray(json.data) ? json.data : [];
+  const out: SourceRecord[] = [];
+  for (const item of data) {
+    if (!item || typeof item !== "object") continue;
+    const rec = parseS2Paper(item as S2Paper);
+    if (rec) out.push(rec);
+  }
+  return out;
 }
 
 /**

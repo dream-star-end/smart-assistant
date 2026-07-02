@@ -2,7 +2,7 @@
  * 科研 durable 层集成测试(真 PG):
  *   - store:createJob 幂等 / claimNextJob(running 转移)/ complete・fail guard /
  *     recoverStale / checkpoints / documents(tenant 隔离 + getSpan)/ blobs(tenant 隔离)/
- *     artifacts。
+ *     artifacts / 保留策略 GC(blob 默认 30 天 TTL + gcExpiredBlobs + gcOldArtifacts)。
  *   - scheduler:drainResearchJobs 派发 handler → completed / failed;未注册 kind → failed。
  *   - 并发:两个 claimNextJob 不重复领取(advisory lock + FOR UPDATE SKIP LOCKED)。
  *   - researchConfig:public 默认 / patch(校验+持久+audit)/ secret set・clear round-trip。
@@ -25,6 +25,8 @@ import {
   completeJob,
   createJob,
   failJob,
+  gcExpiredBlobs,
+  gcOldArtifacts,
   getBlob,
   getDocument,
   getJob,
@@ -37,7 +39,7 @@ import {
   recoverStale,
   registerArtifact,
 } from "../research/store.js";
-import { drainResearchJobs } from "../research/scheduler.js";
+import { drainResearchJobs, runResearchGc } from "../research/scheduler.js";
 import {
   getResearchConfigPublic,
   getResearchConfigView,
@@ -269,6 +271,89 @@ describe("research store: documents/blobs/artifacts", () => {
     assert.equal(arts[0].kind, "report");
     assert.equal(arts[0].sizeBytes, 1234);
     assert.equal((await listArtifacts(userB)).length, 0);
+  });
+});
+
+// ─── store: 保留策略 GC(blob TTL / artifacts 记录保留) ─────────────
+
+describe("research store: retention gc", () => {
+  it("putBlob 默认 expires_at = NOW()+30 天(未传/null 均兜底)", async (t) => {
+    if (skip(t)) return;
+    await putBlob({ userId: userA, blobId: "b1", sha256: "h", sizeBytes: 1, storagePath: "/m/b1" });
+    await putBlob({ userId: userA, blobId: "b2", sha256: "h", sizeBytes: 1, storagePath: "/m/b2", expiresAt: null });
+    const r = await query<{ blob_id: string; days: number }>(
+      `SELECT blob_id, EXTRACT(EPOCH FROM (expires_at - NOW())) / 86400 AS days
+         FROM research_blobs WHERE user_id = $1 ORDER BY blob_id`,
+      [userA],
+    );
+    assert.equal(r.rows.length, 2);
+    for (const row of r.rows) {
+      assert.ok(row.days !== null, `${row.blob_id} expires_at 不应为 NULL`);
+      assert.ok(Number(row.days) > 29 && Number(row.days) < 31, `默认 TTL 应 ~30 天(实际 ${row.days})`);
+    }
+    // 显式传 expiresAt 仍尊重调用方
+    const explicit = new Date(Date.now() + 3600_000);
+    await putBlob({ userId: userA, blobId: "b3", sha256: "h", sizeBytes: 1, storagePath: "/m/b3", expiresAt: explicit });
+    const r3 = await query<{ expires_at: Date }>(
+      "SELECT expires_at FROM research_blobs WHERE user_id = $1 AND blob_id = 'b3'", [userA],
+    );
+    assert.ok(Math.abs(r3.rows[0].expires_at.getTime() - explicit.getTime()) < 1000);
+  });
+
+  it("gcExpiredBlobs:过期删(先文件后行),未过期保留;doc.source_blob_id 置空", async (t) => {
+    if (skip(t)) return;
+    await putBlob({ userId: userA, blobId: "old", sha256: "h", sizeBytes: 1, storagePath: "/m/old" });
+    await putBlob({ userId: userA, blobId: "fresh", sha256: "h", sizeBytes: 1, storagePath: "/m/fresh" });
+    // 文档指向将被 GC 的 blob:验证列级 ON DELETE SET NULL 生效
+    await putDocument({ userId: userA, doc: { ...sampleDoc("docGc"), sourceBlobId: "old" } });
+    await query("UPDATE research_blobs SET expires_at = NOW() - INTERVAL '1 hour' WHERE blob_id = 'old'");
+    const unlinked: string[] = [];
+    const n = await gcExpiredBlobs({ unlinkImpl: async (p) => { unlinked.push(p); } });
+    assert.equal(n, 1);
+    assert.deepEqual(unlinked, ["/m/old"]);
+    assert.equal(await getBlob(userA, "old"), null);
+    assert.ok(await getBlob(userA, "fresh"), "未过期 blob 应保留");
+    const doc = await query<{ source_blob_id: string | null }>(
+      "SELECT source_blob_id FROM research_documents WHERE user_id = $1 AND doc_id = 'docGc'", [userA],
+    );
+    assert.equal(doc.rows[0].source_blob_id, null, "blob GC 后文档指针应置空(权威 spans 不受影响)");
+  });
+
+  it("gcExpiredBlobs:文件删失败不阻断行删(warn 上报)", async (t) => {
+    if (skip(t)) return;
+    await putBlob({ userId: userA, blobId: "bad", sha256: "h", sizeBytes: 1, storagePath: "/m/bad" });
+    await query("UPDATE research_blobs SET expires_at = NOW() - INTERVAL '1 hour' WHERE blob_id = 'bad'");
+    const warns: string[] = [];
+    const n = await gcExpiredBlobs({
+      unlinkImpl: async () => { throw Object.assign(new Error("EACCES: denied"), { code: "EACCES" }); },
+      onWarn: (m) => warns.push(m),
+    });
+    assert.equal(n, 1, "文件删失败仍应删行");
+    assert.equal(await getBlob(userA, "bad"), null);
+    assert.ok(warns.some((w) => w.includes("/m/bad")));
+  });
+
+  it("gcOldArtifacts:超 180 天记录删,新记录保留", async (t) => {
+    if (skip(t)) return;
+    await registerArtifact({ userId: userA, kind: "report", storagePath: "/vol/old.pdf" });
+    await registerArtifact({ userId: userA, kind: "bib", storagePath: "/vol/new.bib" });
+    await query("UPDATE research_artifacts SET created_at = NOW() - INTERVAL '200 days' WHERE storage_path = '/vol/old.pdf'");
+    const n = await gcOldArtifacts();
+    assert.equal(n, 1);
+    const left = await listArtifacts(userA);
+    assert.equal(left.length, 1);
+    assert.equal(left[0].storagePath, "/vol/new.bib");
+  });
+
+  it("runResearchGc:blob + artifacts 一轮清理(scheduler 每日 tick 入口)", async (t) => {
+    if (skip(t)) return;
+    await putBlob({ userId: userA, blobId: "old", sha256: "h", sizeBytes: 1, storagePath: "/tmp/oc-gc-not-exists" });
+    await query("UPDATE research_blobs SET expires_at = NOW() - INTERVAL '1 hour' WHERE blob_id = 'old'");
+    await registerArtifact({ userId: userA, kind: "report", storagePath: "/vol/old.pdf" });
+    await query("UPDATE research_artifacts SET created_at = NOW() - INTERVAL '200 days'");
+    const res = await runResearchGc(); // 默认 unlink:ENOENT 不阻断行删
+    assert.equal(res.blobsDeleted, 1);
+    assert.equal(res.artifactsDeleted, 1);
   });
 });
 

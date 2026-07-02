@@ -41,7 +41,12 @@ export const ResearchConfigJson = Type.Object(
         crossrefMailto: Type.Optional(Type.String()),
         unpaywallEmail: Type.Optional(Type.String()),
         ncpssdEnabled: Type.Optional(Type.Boolean()),
+        /** S2 源开关(无 key 共享限速池;s2ApiKey secret 可配)。默认关。 */
         s2Enabled: Type.Optional(Type.Boolean()),
+        /** PubMed 源开关(NCBI E-utilities,免费无 key)。默认开(见 DEFAULT)。 */
+        pubmedEnabled: Type.Optional(Type.Boolean()),
+        /** PubMed polite email(E-utilities tool/email 参数;未配回落 mailto 类配置)。 */
+        pubmedEmail: Type.Optional(Type.String()),
       },
       { additionalProperties: false },
     ),
@@ -101,7 +106,7 @@ export type ResearchConfigJson = Static<typeof ResearchConfigJson>
 
 /** 缺省配置:全部走免费公开 API + 进程内 fallback,不依赖任何 secret/外部 infra。 */
 export const DEFAULT_RESEARCH_CONFIG: ResearchConfigJson = {
-  litSources: { ncpssdEnabled: false, s2Enabled: false },
+  litSources: { ncpssdEnabled: false, s2Enabled: false, pubmedEnabled: true },
   ingest: { engine: "auto" },
   litrag: { embedBackend: "local", vectorBackend: "inproc" },
   cite: { retraction: "crossref", strictDomains: ["bio", "clinical", "policy"] },

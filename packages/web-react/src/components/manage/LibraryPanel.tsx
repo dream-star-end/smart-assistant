@@ -1,15 +1,20 @@
-import { BookOpen, Loader2, Trash2, Upload } from "lucide-react";
-import { useCallback, useEffect, useRef, useState } from "react";
-import { api } from "../../lib/api";
-import type { AuthSession, ResearchLibraryDoc } from "../../lib/types";
-import { Alert, Button, EmptyState, PanelHeader, Spinner, useConfirm } from "../ui";
+import { BookOpen, Loader2, Trash2, Upload } from 'lucide-react'
+import { useCallback, useEffect, useRef, useState } from 'react'
+import { api } from '../../lib/api'
+import type { AuthSession, ResearchLibraryDoc } from '../../lib/types'
+import { Alert, Button, EmptyState, PanelHeader, Spinner, useConfirm } from '../ui'
 
-const LANG_LABEL: Record<string, string> = { zh: "中文", en: "英文", other: "其他" };
+const LANG_LABEL: Record<string, string> = { zh: '中文', en: '英文', other: '其他' }
 
 function fmtTime(iso: string): string {
-  const d = new Date(iso);
-  if (Number.isNaN(d.getTime())) return "";
-  return d.toLocaleString("zh-CN", { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" });
+  const d = new Date(iso)
+  if (Number.isNaN(d.getTime())) return ''
+  return d.toLocaleString('zh-CN', {
+    month: 'numeric',
+    day: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+  })
 }
 
 /**
@@ -19,80 +24,80 @@ function fmtTime(iso: string): string {
  * fail-closed 判未核查 —— 与"证据必须可回查"的红线一致。
  */
 export function LibraryPanel({ auth }: { auth: AuthSession }) {
-  const [docs, setDocs] = useState<ResearchLibraryDoc[] | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [err, setErr] = useState<string | null>(null);
-  const [notice, setNotice] = useState<string | null>(null);
-  const [uploading, setUploading] = useState(false);
-  const [reload, setReload] = useState(0);
-  const fileRef = useRef<HTMLInputElement>(null);
-  const [confirmDialog, confirmDialogEl] = useConfirm();
+  const [docs, setDocs] = useState<ResearchLibraryDoc[] | null>(null)
+  const [loading, setLoading] = useState(true)
+  const [err, setErr] = useState<string | null>(null)
+  const [notice, setNotice] = useState<string | null>(null)
+  const [uploading, setUploading] = useState(false)
+  const [reload, setReload] = useState(0)
+  const fileRef = useRef<HTMLInputElement>(null)
+  const [confirmDialog, confirmDialogEl] = useConfirm()
 
   useEffect(() => {
-    let alive = true;
-    setLoading(true);
-    setErr(null);
+    let alive = true
+    setLoading(true)
+    setErr(null)
     api
       .listResearchLibrary(auth)
       .then((d) => {
-        if (alive) setDocs(d);
+        if (alive) setDocs(d)
       })
       .catch((e) => {
-        if (alive) setErr((e as Error).message || "加载文献库失败");
+        if (alive) setErr((e as Error).message || '加载文献库失败')
       })
       .finally(() => {
-        if (alive) setLoading(false);
-      });
+        if (alive) setLoading(false)
+      })
     return () => {
-      alive = false;
-    };
-  }, [auth, reload]);
+      alive = false
+    }
+  }, [auth, reload])
 
-  const refresh = useCallback(() => setReload((n) => n + 1), []);
+  const refresh = useCallback(() => setReload((n) => n + 1), [])
 
   const onUpload = useCallback(
     async (file: File) => {
-      setUploading(true);
-      setErr(null);
-      setNotice(null);
+      setUploading(true)
+      setErr(null)
+      setNotice(null)
       try {
-        const r = await api.uploadResearchDoc(auth, file);
+        const r = await api.uploadResearchDoc(auth, file)
         if (r.needsOcr) {
           setNotice(
             `「${file.name}」是扫描件(无文字层),当前无法自动入库;可先用其他工具 OCR 后再上传。`,
-          );
+          )
         } else {
-          setNotice(`「${r.title || file.name}」已入库(${r.spanCount ?? 0} 个片段)。`);
-          refresh();
+          setNotice(`「${r.title || file.name}」已入库(${r.spanCount ?? 0} 个片段)。`)
+          refresh()
         }
       } catch (e) {
-        setErr((e as Error).message || "上传入库失败");
+        setErr((e as Error).message || '上传入库失败')
       } finally {
-        setUploading(false);
-        if (fileRef.current) fileRef.current.value = "";
+        setUploading(false)
+        if (fileRef.current) fileRef.current.value = ''
       }
     },
     [auth, refresh],
-  );
+  )
 
   const remove = useCallback(
     async (doc: ResearchLibraryDoc) => {
       const ok = await confirmDialog({
         title: `删除文献「${doc.title || doc.docId.slice(0, 12)}」?`,
-        body: "删除后新的引用核查将无法回查到该文档;已生成的报告不受影响。",
-        confirmText: "删除",
+        body: '删除后新的引用核查将无法回查到该文档;已生成的报告不受影响。',
+        confirmText: '删除',
         danger: true,
-      });
-      if (!ok) return;
+      })
+      if (!ok) return
       try {
-        await api.deleteResearchDoc(auth, doc.docId);
-        refresh();
+        await api.deleteResearchDoc(auth, doc.docId)
+        refresh()
       } catch (e) {
-        setErr((e as Error).message || "删除失败");
+        setErr((e as Error).message || '删除失败')
       }
     },
     [auth, confirmDialog, refresh],
-  );
+  )
 
   return (
     <div className="flex flex-col gap-3 px-5 py-4">
@@ -107,8 +112,8 @@ export function LibraryPanel({ auth }: { auth: AuthSession }) {
               accept=".pdf,.txt,.md,.markdown,.html,.htm"
               className="hidden"
               onChange={(e) => {
-                const f = e.target.files?.[0];
-                if (f) void onUpload(f);
+                const f = e.target.files?.[0]
+                if (f) void onUpload(f)
               }}
             />
             <Button size="sm" onClick={() => fileRef.current?.click()} disabled={uploading}>
@@ -138,7 +143,7 @@ export function LibraryPanel({ auth }: { auth: AuthSession }) {
             <li key={d.docId} className="flex items-center gap-3 px-3.5 py-2.5">
               <BookOpen size={15} className="shrink-0 text-muted" />
               <div className="min-w-0 flex-1">
-                <div className="truncate text-[13.5px] text-fg">{d.title || "(无标题文档)"}</div>
+                <div className="truncate text-[13.5px] text-fg">{d.title || '(无标题文档)'}</div>
                 <div className="mt-0.5 flex flex-wrap items-center gap-2 text-[11.5px] text-faint">
                   <span>{LANG_LABEL[d.lang] ?? d.lang}</span>
                   <span>{d.spanCount} 个片段</span>
@@ -160,5 +165,5 @@ export function LibraryPanel({ auth }: { auth: AuthSession }) {
       )}
       {confirmDialogEl}
     </div>
-  );
+  )
 }

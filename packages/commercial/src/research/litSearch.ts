@@ -18,11 +18,18 @@ import {
   searchCrossref,
   searchDeepXiv,
   searchOpenAlex,
+  searchPubmed,
+  searchS2,
 } from "./sources.js";
 
-export type LitSourceName = "openalex" | "crossref" | "arxiv";
+export type LitSourceName = "openalex" | "crossref" | "arxiv" | "pubmed" | "s2";
 
-export const DEFAULT_LIT_SOURCES: LitSourceName[] = ["openalex", "crossref", "arxiv"];
+/**
+ * 默认候选源(未显式传 --sources 时全量候选)。门控在 searchMultiSource:
+ * pubmed 免费官方 API,默认参与(pubmedEnabled=false 时剔除);s2 无 key 限速,
+ * **仅** s2Enabled=true 时参与 —— 所以默认列表带上 s2 也不会在未开启时出网。
+ */
+export const DEFAULT_LIT_SOURCES: LitSourceName[] = ["openalex", "crossref", "arxiv", "pubmed", "s2"];
 
 export interface LitSearchInput {
   query: string;
@@ -37,6 +44,14 @@ export interface LitSearchDeps {
   mailto?: string;
   /** Unpaywall OA 发现 email(配了才启用 OA 富化)。 */
   unpaywallEmail?: string;
+  /** PubMed 源开关(免费官方 API,默认参与;显式 false 才剔除)。 */
+  pubmedEnabled?: boolean;
+  /** PubMed E-utilities polite email;未配回落 mailto。 */
+  pubmedEmail?: string;
+  /** Semantic Scholar 源开关(research_config litSources.s2Enabled;**默认关**,true 才出网)。 */
+  s2Enabled?: boolean;
+  /** S2 API key(secret;无 key 可用但共享限速池,易 429)。 */
+  s2ApiKey?: string;
   fetchImpl?: FetchLike;
   timeoutMs?: number;
   /** 瞬时出站失败的重试退避基数(ms);默认 400,测试可传 0 跑快。 */
@@ -169,13 +184,29 @@ export async function searchMultiSource(
   input: LitSearchInput,
   deps: LitSearchDeps = {},
 ): Promise<LitSearchResult> {
-  const sources = input.sources?.length ? input.sources : DEFAULT_LIT_SOURCES;
+  const requested = input.sources?.length ? input.sources : DEFAULT_LIT_SOURCES;
+  const explicit = Boolean(input.sources?.length);
   const size = Math.min(Math.max(input.size ?? 20, 1), 100);
   const warnings: string[] = [];
+  // 平台门控:s2 仅 s2Enabled=true 参与(默认关,不出网);pubmed 默认参与,
+  // pubmedEnabled=false 才剔除。默认候选被剔除时静默;用户**显式**点名被剔除的源
+  // 时给 warning(让容器知道为什么该源没结果)。
+  const sources = requested.filter((s) => {
+    if (s === "pubmed" && deps.pubmedEnabled === false) {
+      if (explicit) warnings.push("source pubmed disabled by platform config");
+      return false;
+    }
+    if (s === "s2" && deps.s2Enabled !== true) {
+      if (explicit) warnings.push("source s2 disabled by platform config (litSources.s2Enabled)");
+      return false;
+    }
+    return true;
+  });
   const opts: SourceSearchOpts = {
     size,
     yearMin: input.yearMin,
     mailto: deps.mailto,
+    pubmedEmail: deps.pubmedEmail ?? deps.mailto,
     timeoutMs: deps.timeoutMs,
     fetchImpl: deps.fetchImpl,
   };
@@ -184,6 +215,8 @@ export async function searchMultiSource(
     openalex: () => searchOpenAlex(input.query, opts),
     crossref: () => searchCrossref(input.query, opts),
     arxiv: () => searchArxiv(input.query, opts),
+    pubmed: () => searchPubmed(input.query, opts),
+    s2: () => searchS2(input.query, opts, { apiKey: deps.s2ApiKey }),
   };
 
   // 研究 API 出站走 master 全局 EnvHttpProxyAgent(→ 日本 sing-box 代理),偶发瞬时 fetch failed/
