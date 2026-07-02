@@ -41,6 +41,24 @@ import type { RepoSnapshot } from './sessionRepoWorkspace.js'
 
 const log = createLogger({ module: 'sessionManager' })
 
+/**
+ * 是否运行在 commercial 托管运行时(v3/v5 商业版容器 / master 实例)。
+ *
+ * 判定复用仓内既有惯例(不新造信号):
+ *   - `OPENCLAUDE_V3_MASTER_BASE_URL` + `OPENCLAUDE_V3_CONTAINER_TOKEN` 成对
+ *     出现 = v3supervisor spawn 的商业容器(与 v3MasterSink.readV3MasterSinkConfig /
+ *     codexAppServerRunner token-refresh 同一判定,双 env 均由 supervisor 注入);
+ *   - `OC_RUNTIME_CHANNEL` 存在 = commercial 实例 channel 标签(runtimeChannel.ts
+ *     单一权威;systemd EnvironmentFile 注入,个人版永不设置)。
+ *
+ * 消费点:submit() 的 codex 计费 fail-closed guard(P0 计费旁路封堵)。个人版 /
+ * 测试环境两组信号都缺省 → guard 关闭,codex 无 requestId 也照跑(无 bridge 场景)。
+ */
+export function isCommercialManagedRuntime(env: NodeJS.ProcessEnv = process.env): boolean {
+  if (env.OC_RUNTIME_CHANNEL !== undefined && env.OC_RUNTIME_CHANNEL.trim() !== '') return true
+  return Boolean(env.OPENCLAUDE_V3_MASTER_BASE_URL && env.OPENCLAUDE_V3_CONTAINER_TOKEN)
+}
+
 function normalizeToolsetListForCompare(toolsets: unknown): string[] | undefined {
   if (!Array.isArray(toolsets) || toolsets.length === 0) return undefined
   const out: string[] = []
@@ -1539,6 +1557,33 @@ export class SessionManager {
       toolsets?: string[]
     },
   ): Promise<void> {
+    // ── P0 计费旁路封堵(fail-closed 钱安全兜底,gateway seam 单一收口)────
+    // engine-reported 计费的底座(codex,capabilities.needsServerRequestId=true)
+    // 依赖 master bridge 注入的 server-owned requestId 关联 preCheck / inflight
+    // journal / settle。commercial 运行时下 requestId 缺失 ⇒ 该 turn 绕过了
+    // master 的 codex 分类(bridge 没做 preCheck、没开 journal)⇒ CodexAdapter
+    // 不 emit billing ⇒ 免费 codex。此处按 capability 判定(不散点 engine 字符串
+    // if/else),宁可拒 turn 也不静默白跑:任何入口(webchat/cron/tasks/delegate)
+    // 落到 codex engine 都必须持有 server-owned requestId。
+    // 个人版 / 测试环境(无 commercial env)不受影响 —— 无 bridge 也能跑 codex。
+    if (
+      session.runner.capabilities.needsServerRequestId &&
+      requestId === undefined &&
+      isCommercialManagedRuntime()
+    ) {
+      log.error('codex turn rejected: missing server-owned requestId (billing guard)', {
+        sessionKey: session.sessionKey,
+        agentId: session.agentId,
+        engineId: session.runner.engineId,
+        ...(traceId ? { traceId } : {}),
+      })
+      onEvent({
+        kind: 'error',
+        error:
+          'CODEX_BILLING_GUARD: codex turn requires a server-owned requestId in commercial runtime — turn rejected (fail-closed)',
+      })
+      return
+    }
     // 闭包捕获:即便后面再有 submit 也不会改这个常量
     const desiredEffort: string | undefined =
       effortLevel === null ? undefined : effortLevel

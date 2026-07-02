@@ -140,6 +140,7 @@ function throwingHttp(msg: string): RefreshHttpClient {
 async function makeAccount(label: string): Promise<bigint> {
   const a = await createAccount(
     {
+      runtime_channel: 'v3',
       label,
       plan: 'pro',
       token: 'ACC',
@@ -452,6 +453,7 @@ describe('refresh.ts 落事件 — err_msg 固定字符串', () => {
     if (skipIfNoDb(t)) return
     const a = await createAccount(
       {
+        runtime_channel: 'v3',
         label: 'ev-nort',
         plan: 'pro',
         token: 'X',

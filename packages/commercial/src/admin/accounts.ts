@@ -384,6 +384,10 @@ export async function adminCreateAccount(
     egress_proxy_id: egressProxyId,
     account_uuid: accountUuid,
     group_id: normalizedGroupId ?? null,
+    // 0098(P0-2)—— 本实例建号一律归本实例 channel(v5 实例 admin 建/导入
+    // codex 账号强制 runtime_channel='v5';v3 实例落 'v3',与 DB DEFAULT 同值,
+    // 现网零变化)。跨 channel 迁移是显式 admin 操作,不在 create 面。
+    runtime_channel: getRuntimeChannel(),
   };
   let row: AccountRow;
   try {

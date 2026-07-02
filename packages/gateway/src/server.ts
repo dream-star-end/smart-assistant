@@ -8065,18 +8065,18 @@ export class Gateway {
       agent = routed.agent
     }
 
-    // ── plan v3 §B/§B1: model→agent fail-closed routing ──
-    // 把 inferAgentForModel 接到生产 message 链路。在 agent 已确定 + safeModel 已审过
-    // 之后做家族匹配判定:
-    //   - gpt-* 模型 + 显式非 codex agent / 默认 agent + gpt-* → 路由到固定 id 'codex'
-    //   - claude-* / deepseek-* 模型 + 当前仍在 codex agent(用户刚从 GPT 切到
-    //     非 GPT 模型)→ 路由回非 codex agent,让 CCB/Anthropic-compatible
-    //     proxy 承接 Claude/DeepSeek
-    //   - 找不到 codex agent / 不是 codex-native → fail closed(error='no_codex_agent')
-    //   - gpt-* + 显式非 codex agent → fail closed(error='mismatch')
-    // 失败 → 立刻向 user 回 error 帧并 return,不进 sessionManager。这样未授权用户
-    // 即便绕过 modelPicker 直接 POST,也不会暴露 codex agent 的存在 / 配置状态
-    // (canUseModel 在 ws bridge 层已先于此路径拦截,这是 belt-and-suspenders)。
+    // ── model→agent 路由(M1a engine registry 语义)──
+    // 把 inferAgentForModel 接到生产 message 链路。M1a 起底座选择不再由 agent 承载:
+    //   - engine 由 sessionManager.getOrCreate 经 engine/registry 的 resolveEngine
+    //     按 model 判定(gpt-5.5 → 'codex',其余 → 'ccb';codex-native pin 例外),
+    //     **agent 不换** —— 任何 agent 都能以 gpt-5.5 跑 codex 底座,persona/skills/
+    //     记忆随 agent 保持不变;
+    //   - 本 helper 只回答"哪个 agent":requested agent 存在则用之,否则回落
+    //     default(或首个)agent;完全无 agent 可用才 fail closed
+    //     (error='no_compatible_agent',立刻回 error 帧并 return,不进 sessionManager)。
+    // 模型准入由 ALLOWED_INBOUND_MODELS(入站帧)+ resolveExecutionModel
+    // (agent.model 绕过口)收口;canUseModel 在 ws bridge 层已先于此路径拦截,
+    // 这是 belt-and-suspenders。
     const _frameModelRaw = (frame as any).model
     const safeModelForRouting: string | undefined =
       typeof _frameModelRaw === 'string' && ALLOWED_INBOUND_MODELS.has(_frameModelRaw)

@@ -121,11 +121,11 @@ describe('claude_accounts.pinned_user_id schema invariant (0067)', () => {
 
     // store.ts/createAccount 的 INSERT 列表没有 pinned_user_id;DB DEFAULT 应自动注入。
     const a = await createAccount(
-      { label: 'pin-a', plan: 'pro', token: 'T-A', egress_proxy_id: TEST_EGRESS_PROXY_ID },
+      { runtime_channel: 'v3', label: 'pin-a', plan: 'pro', token: 'T-A', egress_proxy_id: TEST_EGRESS_PROXY_ID },
       keyFn,
     )
     const b = await createAccount(
-      { label: 'pin-b', plan: 'pro', token: 'T-B', egress_proxy_id: TEST_EGRESS_PROXY_ID },
+      { runtime_channel: 'v3', label: 'pin-b', plan: 'pro', token: 'T-B', egress_proxy_id: TEST_EGRESS_PROXY_ID },
       keyFn,
     )
 

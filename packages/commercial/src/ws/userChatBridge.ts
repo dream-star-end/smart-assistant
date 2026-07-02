@@ -69,6 +69,8 @@ import type { TokenUsage } from "../billing/calculator.js";
 import { maybeUpdateAccountQuotaCodex } from "../account-pool/quota.js";
 import { OutboundRingBuffer, DEFAULT_RING_CONFIG } from "@openclaude/gateway";
 import {
+  DEFAULT_CODEX_ENGINE_MODEL,
+  isCodexEngineModel,
   newTraceId,
   parseTraceIdCandidate,
   type TraceIdIssue,
@@ -357,6 +359,36 @@ export interface UserChatBridgeDeps {
     role: "user" | "admin",
   ) => Promise<(modelId: string) => boolean>;
   /**
+   * P0 计费旁路封堵(bridge 可信模型推导)—— master 侧 agent 权威:
+   * 「该 uid 语境下 agentId 的有效模型」的 sync 快照 closure。
+   *
+   * 为什么需要:M1a 起容器 gateway 的 engine 判定按 model(resolveEngine),
+   * 帧不带 model 时回落 **agent.model**。bridge 若只信 frame.model /
+   * agentId==='codex' / lastSeenModelId,则「agent.model=gpt-5.5 + 帧无 model」
+   * 的 turn 会被 bridge 当非 codex 透传 —— 不 preCheck、不开 inflight journal、
+   * 不注 server-owned requestId → 免费 codex。bridge 必须用 master 自己的
+   * agent 权威推导有效模型参与 codex 分类,推导不出且帧无 model → fail-closed
+   * 拒帧(不放行)。
+   *
+   * caller(commercial/index.ts)的权威组成(与容器 agents.yaml 的 master 侧
+   * 权威源一一对应):
+   *   - 内置 seed agents:main → PLATFORM_DEFAULT_MODEL、codex → gpt-5.5
+   *     (entrypoint desiredSeedAgents 的 master 侧镜像);
+   *   - marketplace 平台预设 + 用户已装 agent:manifest.model
+   *     (internalMarketplaceSync 同源:listPlatformPresetAgents ∪
+   *     listActiveInstalledAgents,同 slug 预设优先)。
+   * 容器侧用户手改 agents.yaml 的 agent 不在权威内 → 推导失败 → 拒
+   * (gateway seam 的 requestId fail-closed guard 是同问题的容器侧兜底)。
+   *
+   * 生命周期与 loadAllowedModelChecker 完全同构:连接建立时加载一次(load 失败
+   * → 桥关 1011,不静默放行),桥 lifetime 内随 GRANTS_REFRESH_INTERVAL_MS 周期
+   * 刷新(新装 agent 在窗口内生效;推导 miss 时也会即时补触发一次 refresh,
+   * 用户重发即可)。未注入(测试 / 旧装配)→ 桥不做推导,行为与本字段加入前一致。
+   */
+  loadAgentModelResolver?: (
+    uid: bigint,
+  ) => Promise<(agentId: string) => string | null>;
+  /**
    * Commercial v3 authority for browser chat history lives in master's
    * SQLite, not inside the per-user container. When a browser session switches
    * between providers (e.g. DeepSeek/CCB → Codex native), the container needs
@@ -537,7 +569,7 @@ function readCodexSessionMaxMs(): number {
  * 二者偏离不影响安全(本表多列 = 多拦,少列 = 漏拦但 inferAgentForModel 仍兜底)。
  */
 const AGENT_AUTHZ_IMPLIED_MODEL: Record<string, string> = {
-  codex: "gpt-5.5",
+  codex: DEFAULT_CODEX_ENGINE_MODEL,
 };
 
 /**
@@ -993,6 +1025,59 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           };
         }
 
+        // 1.4b) P0 计费旁路封堵 —— agent→model 权威快照(bridge 可信模型推导)。
+        //   语义/生命周期与 modelCheckerHandle 完全同构:load 失败 close(1011)
+        //   不静默放行;refresh 失败保留上次快照。未注入 → null(测试 / 旧装配,
+        //   桥不做推导,行为不变)。
+        let agentModelResolverHandle:
+          | {
+              resolve: (agentId: string) => string | null;
+              refresh: () => Promise<void>;
+            }
+          | null = null;
+        if (deps.loadAgentModelResolver) {
+          const loadResolver = deps.loadAgentModelResolver;
+          let innerResolve: (agentId: string) => string | null;
+          try {
+            innerResolve = await loadResolver(uid);
+          } catch (err) {
+            log?.error("user-chat-bridge: loadAgentModelResolver threw", {
+              uid: uid.toString(),
+              err,
+            });
+            sendErrorFrame(ws, "ERR_INTERNAL", "authorization unavailable");
+            try { ws.close(CLOSE_BRIDGE.INTERNAL, "authorization unavailable"); } catch { /* */ }
+            return;
+          }
+          // refresh 去重:miss 补触发 + 周期 timer 可能并发,同一时刻只放一个在飞
+          // (DB 查询很轻,但没必要放大;后到的直接搭前一班车)。
+          // 注意:此处刻意不写 `finally { }` 块 —— userChatBridge.test.ts 的
+          // tryAutoRebindFlush 源码 tripwire 以「文件内第一个 `finally {`」定位
+          // 目标块,在它之前新增 finally 块会让 tripwire 锚错。.finally() 等价。
+          let refreshInflight: Promise<void> | null = null;
+          agentModelResolverHandle = {
+            resolve: (agentId) => innerResolve(agentId),
+            refresh: async () => {
+              if (refreshInflight !== null) return refreshInflight;
+              refreshInflight = (async () => {
+                try {
+                  const next = await loadResolver(uid);
+                  innerResolve = next;
+                } catch (err) {
+                  // 保留上次成功快照(与 modelChecker.refresh 同语义)。
+                  log?.warn("user-chat-bridge: agentModelResolver refresh failed (keep last good)", {
+                    uid: uid.toString(),
+                    err,
+                  });
+                }
+              })().finally(() => {
+                refreshInflight = null;
+              });
+              return refreshInflight;
+            },
+          };
+        }
+
         // 1.5) V3 Phase 4H+ maintenance 闸门:非 admin 在维护模式下不得建立新 chat 会话。
         //   - admin 判定只看 claims.role —— WS chat 不是"动账/改配置"的破坏性操作,
         //     按 HTTP 中间件那种 DB double-check 会让每次 handshake 多一次 PG roundtrip。
@@ -1121,6 +1206,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           containerWs,
           connectAbort,
           modelCheckerHandle,
+          agentModelResolverHandle,
           connId,
         );
       })().catch((err: unknown) => {
@@ -1165,6 +1251,21 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     modelCheckerHandle:
       | {
           isAllowed: (modelId: string) => boolean;
+          refresh: () => Promise<void>;
+        }
+      | null,
+    /**
+     * P0 计费旁路封堵 —— master 侧 agent→model 权威快照 handle(bridge 可信模型
+     * 推导;null = deps 未注入,桥不做推导,行为与字段加入前一致)。
+     *   - `resolve(agentId)`:已绑定本连接 uid 的 sync 快照 closure;null = 权威
+     *     推导不出(未知 agentId)
+     *   - `refresh()`:重拉快照(周期 timer 与推导 miss 时补触发,幂等去重)
+     * onUserMessage 的 inbound.message 分类用它推导「帧无 model 时该 agent 的
+     * 有效模型」,与容器 gateway resolveEngine 的判定保持同构。
+     */
+    agentModelResolverHandle:
+      | {
+          resolve: (agentId: string) => string | null;
           refresh: () => Promise<void>;
         }
       | null,
@@ -1448,15 +1549,21 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         cleanup("frame_too_big", true);
         return;
       }
-      // 0049 模型授权(plan v3 §B3/§B4 + review v1/v2 follow-up):
+      // 0049 模型授权(plan v3 §B3/§B4 + review v1/v2 follow-up)+ P0 计费旁路
+      // 封堵(agent 权威推导):
       //   inbound.message 帧 sync 检查 visibility OR per-user grants。优先级:
       //     (1) frame.model — 用户/前端显式声明 → 必须有授权
       //     (2) AGENT_AUTHZ_IMPLIED_MODEL[frame.agentId] — agentId 隐含 model
       //         (review v2 finding 1:防 agentId='codex' 不带 model 绕过)
-      //     (3) lastSeenModelId — 本桥之前出现过的 model(review v1 follow-up:
+      //     (3) agentModelResolverHandle.resolve(frame.agentId) — master agent
+      //         权威推导「该 agent 的有效模型」(P0:帧无 model 时容器回落
+      //         agent.model 判 engine,bridge 必须同构分类);带 agentId 但推导
+      //         不出且帧无 model → fail-closed 拒帧(不放行、不猜)
+      //     (4) lastSeenModelId — 本桥之前出现过的 model(review v1 follow-up:
       //         防"已用 gpt-5.5 跑起来的桥被撤销 grant 后,后续无 model/agentId
-      //         的 delta 帧仍能透传"。一旦撤销,继续帧都被拦)
-      //     (4) 三者全无 → 透传(本桥从没碰过受限 model,默认 claude-* visibility=
+      //         的 delta 帧仍能透传"。一旦撤销,继续帧都被拦;仅辅助兜底,
+      //         不作 codex 分类的唯一权威)
+      //     (5) 全无 → 透传(本桥从没碰过受限 model,默认 claude-* visibility=
       //         public 不需要 grant)
       //
       //   命中 (1) / (2) 时也更新 lastSeenModelId — 任一形式提到过受限 model
@@ -1675,22 +1782,62 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             const frameAgentId = typeof frameAgentIdRaw === "string" ? frameAgentIdRaw : null;
             const agentImpliedModel =
               frameAgentId !== null ? AGENT_AUTHZ_IMPLIED_MODEL[frameAgentId] : undefined;
+            // P0 计费旁路封堵 —— master agent 权威推导:帧无 model 时容器 gateway
+            // 会回落 agent.model 做 engine 判定(resolveEngine),bridge 必须用
+            // master 自己的 agent 权威(seed 常量 + marketplace manifest)推导同一
+            // 份「有效模型」,分类才与容器同构。null = 权威推导不出(未知 agentId)。
+            const agentAuthorityModel: string | null =
+              frameAgentId !== null && agentModelResolverHandle !== null
+                ? agentModelResolverHandle.resolve(frameAgentId)
+                : null;
 
-            // 选用顺序:frame.model > agent 隐含 model > lastSeenModelId
+            // 选用顺序:frame.model > agent 隐含 model(安全 contract)> master
+            // agent 权威 > lastSeenModelId(仅辅助:帧连 agentId 都没带时的兜底,
+            // 不作 codex 分类的唯一权威)
             let effectiveModel: string | null = null;
-            let source: "frame.model" | "agentId.implied" | "lastSeen" | null = null;
+            let source:
+              | "frame.model"
+              | "agentId.implied"
+              | "agentAuthority"
+              | "lastSeen"
+              | null = null;
             if (frameModelId !== null) {
               effectiveModel = frameModelId;
               source = "frame.model";
             } else if (agentImpliedModel !== undefined) {
               effectiveModel = agentImpliedModel;
               source = "agentId.implied";
+            } else if (agentAuthorityModel !== null) {
+              effectiveModel = agentAuthorityModel;
+              source = "agentAuthority";
+            } else if (frameAgentId !== null && agentModelResolverHandle !== null) {
+              // fail-closed:帧无 model + agentId 在 master agent 权威里推导不出。
+              // 容器侧会把该 agentId 解析成 agents.yaml 里的某个 agent(未知 id 才
+              // 降级 default),其 agent.model 可能是 gpt-5.5 → 免 requestId 落
+              // codex(计费旁路)。master 推导不出就不放行 —— 与 UNAUTHORIZED_MODEL
+              // 同款拒帧路径。先补触发一次权威快照 refresh(新装 agent 的窗口期
+              // miss,用户重发即可命中),再拒本帧。
+              void agentModelResolverHandle.refresh();
+              bridgeLog?.info("user-chat-bridge: agent model unresolved, frame rejected", {
+                agentId: frameAgentId,
+              });
+              sendErrorFrame(
+                userWs,
+                "UNRESOLVED_AGENT_MODEL",
+                `cannot resolve model for agent '${frameAgentId}' — retry shortly or specify a model`,
+              );
+              try { userWs.close(CLOSE_BRIDGE.PRODUCT_POLICY, "unresolved_agent_model"); } catch { /* */ }
+              // 策略拒绝 → force final;此前无 codex inflight(本帧才进 acquire 路径),无 drain 价值
+              cleanup("client_close", true);
+              return;
             } else if (lastSeenModelId !== null) {
               effectiveModel = lastSeenModelId;
               source = "lastSeen";
             }
             // 命中 frame.model / agentId.implied 时把效果 model 记进 lastSeenModelId,
-            // 后续无 model/agentId 帧仍可继续校验。lastSeen 命中时不更新(就是它自己)。
+            // 后续无 model/agentId 帧仍可继续校验。lastSeen 命中时不更新(就是它自己);
+            // agentAuthority 命中时也不更新 —— 权威快照每帧现算,无需二次缓存,且
+            // agent 卸载后不该靠 stale lastSeen 复活。
             if (source === "frame.model" || source === "agentId.implied") {
               lastSeenModelId = effectiveModel;
             }
@@ -1714,9 +1861,12 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               return;
             }
             effectiveModelForFrame = effectiveModel;
-            // codex 判定:只看 effectiveModel 前缀(`gpt-*`) 即可。agentId='codex' 已通过
-            // AGENT_AUTHZ_IMPLIED_MODEL 把 effectiveModel 设为 'gpt-5.5',下面的判定一样命中。
-            isCodexInboundFrame = effectiveModel !== null && effectiveModel.startsWith("gpt-");
+            // codex 判定:isCodexEngineModel(@openclaude/protocol 单一权威,与容器
+            // gateway resolveEngine 的 MODEL_ENGINE_MAP 同源同构 —— 两处不允许各自
+            // 硬编码 gpt 集合)。agentId='codex' 已通过 AGENT_AUTHZ_IMPLIED_MODEL 把
+            // effectiveModel 设为 gpt-5.5,marketplace/seed agent 经 agentAuthority
+            // 推导,判定一样命中。
+            isCodexInboundFrame = isCodexEngineModel(effectiveModel);
             // 提取 peer.id(用于 outbound 终态早释放匹配)。codex 帧才需要;非 codex
             // 帧不影响 acquiredCodexAccountId,捕不捕没用。
             if (isCodexInboundFrame) {
@@ -2965,10 +3115,13 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
 
     // plan v3 review v1 §F4 follow-up:周期重新拉 grants 让 admin 取消授权能在
     // 已开桥上生效。fire-and-forget;refresh 自己 swallow error,不会 reject。
-    if (modelCheckerHandle !== null) {
+    // P0 计费旁路封堵:agent→model 权威快照共用同一班 timer 刷新(新装/卸载
+    // marketplace agent 在窗口内对已开桥生效;miss 时另有即时补触发)。
+    if (modelCheckerHandle !== null || agentModelResolverHandle !== null) {
       modelCheckerRefreshTimer = setInterval(() => {
         // 注意:不绑 await/then;refresh 内部 swallow error,这里只是触发。
-        modelCheckerHandle.refresh();
+        modelCheckerHandle?.refresh();
+        void agentModelResolverHandle?.refresh();
       }, GRANTS_REFRESH_INTERVAL_MS);
       // 不阻塞进程退出 —— bridge 不在则 timer 也无意义。
       modelCheckerRefreshTimer.unref?.();

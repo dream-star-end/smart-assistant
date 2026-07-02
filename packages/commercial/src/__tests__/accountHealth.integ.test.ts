@@ -99,7 +99,7 @@ function skipIfNoDb(t: { skip: (reason: string) => void }): boolean {
 }
 
 async function freshAccount(): Promise<bigint> {
-  const a = await createAccount({ label: "h-test", plan: "pro", token: "T", egress_proxy_id: TEST_EGRESS_PROXY_ID }, keyFn);
+  const a = await createAccount({ runtime_channel: "v3", label: "h-test", plan: "pro", token: "T", egress_proxy_id: TEST_EGRESS_PROXY_ID }, keyFn);
   return a.id;
 }
 

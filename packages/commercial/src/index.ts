@@ -3015,6 +3015,14 @@ export async function registerCommercial(
       return (modelId: string) =>
         canUseModel({ pricing }, { role, grantedModelIds: grantedSet, modelId });
     },
+    // P0 计费旁路封堵 —— bridge 可信模型推导的 agent 权威(seed 常量 +
+    // marketplace 预设/已装 manifest,详见 ws/agentModelAuthority.ts 头注)。
+    // bridge 用它推导「帧无 model 时该 agentId 的有效模型」参与 codex 分类
+    // (与容器 resolveEngine 同构),推导不出且帧无 model → fail-closed 拒帧。
+    loadAgentModelResolver: async (uid) => {
+      const { loadAgentModelResolverForUser } = await import("./ws/agentModelAuthority.js");
+      return loadAgentModelResolverForUser(uid);
+    },
     loadMasterSessionMessages: async (uid, sessionId) => {
       const session = await getClientSession(sessionId, MASTER_USER_PREFIX + uid.toString());
       return session?.messages ?? null;

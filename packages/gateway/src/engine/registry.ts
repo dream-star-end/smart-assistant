@@ -13,6 +13,7 @@
  *   codex-native 内部再按 runnerKind 收口:仅接受缺省 / 'app-server';
  *   'exec' 与未知 runnerKind 直接 fail-closed('codex exec' legacy 路径不复活)。
  */
+import { CODEX_ENGINE_MODEL_IDS } from '@openclaude/protocol'
 import type { AgentDef } from '@openclaude/storage'
 import type { SubprocessRunnerOpts } from '../subprocessRunner.js'
 import type { EngineAdapter } from './engineAdapter.js'
@@ -38,14 +39,18 @@ export function registeredEngines(): string[] {
 }
 
 /**
- * model → engine 映射(单一权威)。M1a 起登记 gpt-5.5 → 'codex'(app-server 形态,
- * factory 由 engine/codexAdapter.ts 注册)。入站帧的模型合法性仍由
- * ALLOWED_INBOUND_MODELS / resolveExecutionModel 收口(server.ts),本表只回答
- * "合法模型跑哪个底座";新增 codex 系模型在此登记即可,不散点 if/else。
+ * model → engine 映射。M1a 起登记 gpt-5.5 → 'codex'(app-server 形态,factory 由
+ * engine/codexAdapter.ts 注册)。入站帧的模型合法性仍由 ALLOWED_INBOUND_MODELS /
+ * resolveExecutionModel 收口(server.ts),本表只回答"合法模型跑哪个底座"。
+ *
+ * P0 计费旁路封堵:codex 系模型集合的单一权威上收到
+ * `@openclaude/protocol` CODEX_ENGINE_MODEL_IDS(master bridge 的 codex turn
+ * 分类必须与本判定同构,两处不允许各自硬编码)。新增 codex 系模型改 protocol
+ * 一处即可,本表机械派生。
  */
-const MODEL_ENGINE_MAP: Record<string, string> = {
-  'gpt-5.5': 'codex',
-}
+const MODEL_ENGINE_MAP: Record<string, string> = Object.fromEntries(
+  CODEX_ENGINE_MODEL_IDS.map((id) => [id, 'codex']),
+)
 
 /**
  * 判定该 agent/model 应由哪个 engine 执行。只判定 id,不校验注册表 ——

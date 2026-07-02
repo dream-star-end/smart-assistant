@@ -243,6 +243,8 @@ async function startRig(opts: {
   ) => Promise<void>;
   createCodexRoute?: UserChatBridgeDeps["createCodexRoute"];
   expireCodexRoute?: UserChatBridgeDeps["expireCodexRoute"];
+  // P0 计费旁路封堵 — bridge 可信模型推导(fake master agent 权威)。
+  loadAgentModelResolver?: UserChatBridgeDeps["loadAgentModelResolver"];
 } = {}): Promise<BillingRig> {
   // mock 容器 ws
   const containerSockets: WebSocket[] = [];
@@ -294,6 +296,7 @@ async function startRig(opts: {
     codexBinding,
     createCodexRoute: opts.createCodexRoute,
     expireCodexRoute: opts.expireCodexRoute,
+    loadAgentModelResolver: opts.loadAgentModelResolver,
     logger: opts.logger,
     appendCostCredits: opts.appendCostCredits,
   });
@@ -1411,5 +1414,148 @@ describe("userChatBridge / codex billing — partial deps reject", () => {
       }),
       /codexBinding requires pgPool\+preCheckRedis\+pricing/,
     );
+  });
+});
+
+// ---------- P0 计费旁路封堵 — bridge 可信模型推导(agent 权威) ----------------
+//
+// 威胁:M1a 后任意 agent 的 agent.model='gpt-5.5' 都落 codex 底座;帧不带 model
+// 时容器 gateway 回落 agent.model,而旧 bridge 只认 frame.model / agentId='codex'
+// / lastSeen → 该类 turn 不 preCheck、不注 server requestId → 免费 codex。
+// 修复:bridge 从 master agent 权威(fake resolver 注入)推导有效模型参与分类;
+// 推导不出且帧无 model → fail-closed 拒帧。
+
+describe("userChatBridge / codex billing — agent 权威模型推导(P0 封堵)", () => {
+  test("agent 默认 gpt-5.5 + 帧无 model → 经权威分类为 codex:preCheck + 注 server requestId", async () => {
+    const resolverLoads: bigint[] = [];
+    const rig = await startRig({
+      userBalance: 1_000_000n,
+      loadAgentModelResolver: async (uid) => {
+        resolverLoads.push(uid);
+        return (agentId: string) =>
+          agentId === "gpt-helper" ? "gpt-5.5" : agentId === "main" ? "glm-5.2" : null;
+      },
+    });
+    try {
+      const containerOpenP = waitNextContainerSocket(rig);
+      const ws = openClient(rig.gatewayPort, await makeJwt("21"));
+      await waitOpen(ws);
+      const containerWs = await containerOpenP;
+      assert.equal(resolverLoads.length >= 1, true, "连接建立时应加载一次 agent 权威快照");
+
+      // 关键:帧不带 model,agentId 也不是 'codex' —— 旧实现会当非 codex 透传
+      ws.send(JSON.stringify({ type: "inbound.message", agentId: "gpt-helper", content: "hi" }));
+
+      const frameToContainer = await waitContainerNextFrame(containerWs);
+      const parsed = JSON.parse(frameToContainer.data) as Record<string, unknown>;
+      assert.equal(parsed.type, "inbound.message");
+      // codex 分类命中 ⇒ server-owned requestId 已注入(32 hex)
+      assert.match(parsed.requestId as string, /^[0-9a-f]{32}$/);
+      // preCheck / inflight journal 已建立(不再是免费透传)
+      assert.equal(
+        rig.poolCtrl.queries.some((q) =>
+          q.sql.trim().startsWith("INSERT INTO request_finalize_journal"),
+        ),
+        true,
+        "codex turn 必须开 inflight journal",
+      );
+      // per-account 槽也走了 acquire(与显式 model 的 codex 帧同路径)
+      assert.equal(rig.binding.acquireCalls, 1);
+      ws.close();
+    } finally {
+      await stopRig(rig);
+    }
+  });
+
+  test("权威模型非 codex(main→glm)+ 帧无 model → 非 codex 透传,不注 requestId 不占槽", async () => {
+    const rig = await startRig({
+      userBalance: 1_000_000n,
+      loadAgentModelResolver: async () => (agentId: string) =>
+        agentId === "main" ? "glm-5.2" : null,
+    });
+    try {
+      const containerOpenP = waitNextContainerSocket(rig);
+      const ws = openClient(rig.gatewayPort, await makeJwt("22"));
+      await waitOpen(ws);
+      const containerWs = await containerOpenP;
+
+      ws.send(JSON.stringify({ type: "inbound.message", agentId: "main", content: "hi" }));
+
+      const frameToContainer = await waitContainerNextFrame(containerWs);
+      const parsed = JSON.parse(frameToContainer.data) as Record<string, unknown>;
+      assert.equal(parsed.type, "inbound.message");
+      assert.equal(parsed.requestId, undefined, "非 codex 帧不注 server requestId");
+      assert.equal(rig.binding.acquireCalls, 0, "非 codex 帧不进 codex acquire 路径");
+      assert.equal(
+        rig.poolCtrl.queries.some((q) =>
+          q.sql.trim().startsWith("INSERT INTO request_finalize_journal"),
+        ),
+        false,
+        "非 codex 帧不开 journal",
+      );
+      ws.close();
+    } finally {
+      await stopRig(rig);
+    }
+  });
+
+  test("权威推导不出 + 帧无 model → fail-closed 拒帧(UNRESOLVED_AGENT_MODEL)并补触发 refresh", async () => {
+    let loaderCalls = 0;
+    const rig = await startRig({
+      userBalance: 1_000_000n,
+      loadAgentModelResolver: async () => {
+        loaderCalls += 1;
+        return (agentId: string) => (agentId === "main" ? "glm-5.2" : null);
+      },
+    });
+    try {
+      const containerOpenP = waitNextContainerSocket(rig);
+      const ws = openClient(rig.gatewayPort, await makeJwt("23"));
+      await waitOpen(ws);
+      const containerWs = await containerOpenP;
+      const loadsBeforeFrame = loaderCalls;
+
+      const errP = waitJsonFrameOfType(ws, "error");
+      const closedP = new Promise<number>((r) => ws.once("close", (code) => r(code)));
+      // 容器不应收到任何帧(fail-closed 不放行)
+      let containerGotFrame = false;
+      containerWs.on("message", () => { containerGotFrame = true; });
+
+      ws.send(JSON.stringify({ type: "inbound.message", agentId: "user-custom-agent", content: "hi" }));
+
+      const err = await errP;
+      assert.equal(err.code, "UNRESOLVED_AGENT_MODEL");
+      const closeCode = await closedP;
+      assert.equal(closeCode, 4507, "走 PRODUCT_POLICY 拒帧路径(与 UNAUTHORIZED_MODEL 同款)");
+      await waitUntil(() => loaderCalls > loadsBeforeFrame, 1000);
+      assert.equal(containerGotFrame, false, "被拒帧不得转发给容器");
+      assert.equal(rig.binding.acquireCalls, 0);
+    } finally {
+      await stopRig(rig);
+    }
+  });
+
+  test("帧显式带 model 时 frame.model 优先于权威(gpt-5.5 帧在非 gpt agent 上仍走 codex 计费)", async () => {
+    const rig = await startRig({
+      userBalance: 1_000_000n,
+      loadAgentModelResolver: async () => (agentId: string) =>
+        agentId === "main" ? "glm-5.2" : null,
+    });
+    try {
+      const containerOpenP = waitNextContainerSocket(rig);
+      const ws = openClient(rig.gatewayPort, await makeJwt("24"));
+      await waitOpen(ws);
+      const containerWs = await containerOpenP;
+
+      ws.send(JSON.stringify({ type: "inbound.message", agentId: "main", model: "gpt-5.5", content: "hi" }));
+
+      const frameToContainer = await waitContainerNextFrame(containerWs);
+      const parsed = JSON.parse(frameToContainer.data) as Record<string, unknown>;
+      assert.match(parsed.requestId as string, /^[0-9a-f]{32}$/, "frame.model=gpt-5.5 → codex 计费路径");
+      assert.equal(rig.binding.acquireCalls, 1);
+      ws.close();
+    } finally {
+      await stopRig(rig);
+    }
   });
 });
