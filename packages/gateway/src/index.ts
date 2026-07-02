@@ -1,6 +1,12 @@
 export * from './server.js'
 export * from './sessionManager.js'
 export * from './subprocessRunner.js'
+// M0 engine 适配层(EngineAdapter 契约 / 中立事件权威源 / registry / CCB 实现)
+export * from './engine/engineEvents.js'
+export * from './engine/engineAdapter.js'
+export * from './engine/engineSessionId.js'
+export * from './engine/registry.js'
+export * from './engine/ccbAdapter.js'
 export * from './router.js'
 export * from './auth.js'
 export * from './cron.js'

@@ -11,21 +11,23 @@ import {
   paths,
   upsertSessionMeta,
 } from '@openclaude/storage'
-import {
-  CcbMessageParser,
-  type SessionStreamEvent,
-  type TurnToolEntry,
-} from './ccbMessageParser.js'
-import {
-  TelemetryChannel,
-  type OcTelemetryEvent,
-} from './telemetryChannel.js'
+// M0 engine 适配层:CCB 私有件(parser/telemetry/auth 分类)已下沉 CcbAdapter,
+// 本文件只消费 engine 中立契约(EngineAdapter / EngineEvent / TurnSummary /
+// PartialSnapshot)。ccbAdapter 的 import 兼有 registry 注册副作用('ccb' factory)。
+import './engine/ccbAdapter.js'
+import type { EngineAdapter } from './engine/engineAdapter.js'
+import type {
+  EngineEvent,
+  SessionStreamEvent,
+  TurnSummary,
+  TurnToolEntry,
+} from './engine/engineEvents.js'
+import { createEngine, resolveEngine } from './engine/registry.js'
 import { eventBus, createEvent } from './eventBus.js'
 import { createLogger } from './logger.js'
 import { sendTurnWaiveBestEffort } from './masterTurnWaive.js'
 import { getV3MasterSinkOrNull, type V3MasterSinkPayload } from './v3MasterSink.js'
 import { resolveExecutionModel } from './server.js'
-import { SubprocessRunner } from './subprocessRunner.js'
 import {
   type ExecutionTarget,
   type RemoteTargetController,
@@ -259,8 +261,8 @@ export function pickIdleTimeoutMs(
  */
 const MASTER_SINK_PERSIST_CHANNELS: ReadonlySet<string> = new Set(['webchat', 'wechat'])
 
-// 一个 sessionKey 对应一个 SubprocessRunner + 一把 Mutex(同 session 串行)。
-// 跨 session 完全并行。
+// 一个 sessionKey 对应一个 EngineAdapter(CCB = CcbAdapter 组合 SubprocessRunner)
+// + 一把 Mutex(同 session 串行)。跨 session 完全并行。
 export interface AgentSession {
   sessionKey: string
   agentId: string
@@ -285,7 +287,9 @@ export interface AgentSession {
   repoSessionId?: string
   title: string
   startedAt: number
-  runner: SubprocessRunner
+  /** M0 engine 适配层:底座差异收口在 EngineAdapter(CCB = CcbAdapter 组合
+   *  SubprocessRunner)。字段名保留 `runner` —— server.ts 等引用面零扩散。 */
+  runner: EngineAdapter
   ccbSessionId: string | null
   /** 本 turn 起始 ms(submit 进入执行段时打点)。idle-timeout 免单上报用它圈定
    *  master 侧退款窗口(masterTurnWaive),turn 间不清零 — 只在超时路径读。 */
@@ -313,8 +317,6 @@ export interface AgentSession {
   model?: string
   // CCB CronCreate bridge: maps tool_use_id/content_key → gateway cron job ID
   _cronBridgeMap?: Map<string, string>
-  // Current turn parser (for idle-timeout to check pendingToolCalls)
-  _currentParser?: import('./ccbMessageParser.js').CcbMessageParser
   /** Set by onFinish when the CCB result row signals a stale --resume session
    *  id (file no longer exists). Read by the runner.exit handler to evict the
    *  sessionKey's resume-map entry instead of re-persisting it. See
@@ -326,11 +328,6 @@ export interface AgentSession {
    * swap 过程受 `lock` 保护,保证 in-flight turn 看到的是一个一致的 target。
    */
   executionTarget: ExecutionTarget
-  // Cross-turn stdout 'message' listener. Per-turn _runOneTurn replaces
-  // (not removes) this on the next turn so bg-bash bash_output_tail
-  // emitted after the turn's `result` keeps flowing through parser ->
-  // onEvent -> deliver. destroySession/shutdownAll explicitly off().
-  _currentMessageListener?: ((msg: any) => void) | null
   /**
    * Phase 5 G.0:`SessionManager.providerTag(agent.provider)` 的固化结果
    *  ('ccb' / 'codex-native')。recyclePeerForRepoChange 用它判断是否走
@@ -1252,36 +1249,23 @@ export class SessionManager {
     const cwd = opts.agent.cwd ?? process.cwd()
     const persona = opts.agent.persona ?? paths.agentClaudeMd(opts.agent.id)
     const repoSessionId = opts.repoSessionId ?? opts.peerId
-    // provider=codex-native routes to `codex` CLI instead of CCB; runner shape
-    // (EventEmitter with start/submit/shutdown + same events) is compatible,
-    // so upstream session bookkeeping works unchanged.
-    //
-    // Within codex-native, `agent.runnerKind` picks the codex backend:
-    //   'exec'        — legacy `codex exec` per-turn subprocess (no token streaming)
-    //   'app-server'  — `codex app-server` long-lived JSON-RPC (token-level streaming)
-    // Default is 'exec' for backward compat with existing agents.yaml entries.
-    // P1f / v5 ccb 单底座硬不变量:v5 channel 绝不构造 codex runner。v5 不提供 gpt-*/
-    // codex-native agent,走到这里说明配置漏配 → fail-closed,防 v5 误起 codex。
-    // (gateway 对 commercial 零编译期依赖,故直接读 env OC_RUNTIME_CHANNEL 作 channel 权威。)
-    if (
-      (process.env.OC_RUNTIME_CHANNEL?.trim() || 'v3') === 'v5' &&
-      opts.agent.provider === 'codex-native'
-    ) {
-      throw new Error(
-        `[v5] ccb-only invariant violated: codex-native agent '${opts.agent.id}' not allowed on v5 channel`,
-      )
-    }
-    // P1f / v5 ccb 单底座:codex runner 已删,所有 agent 无条件走 SubprocessRunner。
-    // codex-native agent 在 v5 channel 已被上方不变量 fail-closed 拦截。
-    const runner = new SubprocessRunner({
+    // 统一执行模型准入:agent.model(marketplace/seed/delegate)可能是已下线模型(如
+    // stale claude-*),这里收敛到白名单内,否则会以不可路由的 --model spawn。
+    const executionModel = resolveExecutionModel(opts.agent.model, this.config.defaults.model)
+    // M0 engine 适配层:runner 构造收口到 registry factory。
+    //   - resolveEngine 是 model→engine + provider pin 的单一权威(codex-native →
+    //     'codex',其中 runnerKind 仅接受缺省/'app-server','exec'/未知 fail-closed)。
+    //   - createEngine 对未注册 engine fail-closed 抛错 —— 原 v5 channel 硬闸
+    //     (禁 codex-native)的语义升级形态:M0 codex 未注册,codex-native agent
+    //     在任何 channel 都走不到底座构造,v5 行为等价旧硬闸且覆盖面更严。
+    const engineId = resolveEngine(executionModel, opts.agent)
+    const runner = createEngine(engineId, {
       sessionKey: opts.sessionKey,
       agentId: opts.agent.id,
       agentBaseDir: cwd,
       config: this.config,
       persona,
-      // 统一执行模型准入:agent.model(marketplace/seed/delegate)可能是已下线模型(如
-      // stale claude-*),这里收敛到白名单内,否则会以不可路由的 --model spawn。
-      model: resolveExecutionModel(opts.agent.model, this.config.defaults.model),
+      model: executionModel,
       permissionMode: opts.agent.permissionMode ?? this.config.defaults.permissionMode,
       agentProvider: opts.agent.provider,
       agentMcpServers: opts.agent.mcpServers,
@@ -1336,9 +1320,8 @@ export class SessionManager {
       totalCacheCreationTokens: 0,
       turns: 0,
       _lastCcbCumulativeCost: this._lastCostFor(opts.sessionKey, providerTag) ?? 0,
-      // 统一执行模型准入:agent.model(marketplace/seed/delegate)可能是已下线模型(如
-      // stale claude-*),这里收敛到白名单内,否则会以不可路由的 --model spawn。
-      model: resolveExecutionModel(opts.agent.model, this.config.defaults.model),
+      // 与 runner 同一份白名单收敛结果(见上方 executionModel 注释)。
+      model: executionModel,
       toolUseIdToName: new Map(),
       executionTarget: { kind: 'local' },
       // Phase 5 G.0:固化 provider 路由信息,recyclePeerForRepoChange 用 providerTag
@@ -1672,10 +1655,11 @@ export class SessionManager {
       const livenessPromise = new Promise<never>((_, reject) => {
         livenessTimer = setInterval(() => {
           const idleMs = Date.now() - session.runner.lastActivityAt
-          const parser = session._currentParser
+          // pendingToolCalls 经 adapter 读当前活跃 turn 的 parser(turn 间为 0),
+          // 语义与旧 session._currentParser?.pendingToolCalls 一致。
           const threshold = pickIdleTimeoutMs(
             session.currentTurnStatus,
-            parser ? parser.pendingToolCalls : 0,
+            session.runner.pendingToolCalls,
             session.providerTag,
           )
           if (idleMs > threshold) {
@@ -1898,21 +1882,8 @@ export class SessionManager {
     }
   }
 
-  // Auth error keywords — only matched when result.isError is true, so safe to be broad.
-  // Covers CCB's auth-related error strings from src/services/api/errors.ts:
-  //   INVALID_API_KEY_ERROR_MESSAGE           = 'Not logged in · Please run /login'
-  //   INVALID_API_KEY_ERROR_MESSAGE_EXTERNAL  = 'Invalid API key · Fix external API key'
-  //   TOKEN_REVOKED_ERROR_MESSAGE             = 'OAuth token revoked · Please run /login'
-  //   OAUTH_ORG_NOT_ALLOWED_ERROR_MESSAGE     = 'Your account does not have access to Claude Code. Please run /login.'
-  //   Generic 401/403 handler                 = 'Please run /login · API Error: ...' / 'Failed to authenticate. ...'
-  //   ORG_DISABLED_ERROR_MESSAGE_ENV_KEY(_WITH_OAUTH) = 'Your ANTHROPIC_API_KEY belongs to a disabled organization · ...'
-  // The `run /login` substring is the common signal across all CCB login-required
-  // paths; the rest catch status-code / revoke / org-disabled phrasings that
-  // don't necessarily include a /login prompt.
-  private static AUTH_KEYWORDS_RE =
-    /authenticat|credentials|401|unauthorized|run \/login|token (?:has been )?revoked|invalid api key|organization has been disabled/i
-  // CCB's exact error prefix when API auth fails — safe to match even without isError flag.
-  private static AUTH_ERROR_PREFIX_RE = /^Failed to authenticate\b/
+  // (auth 错误关键字分类已下沉 engine/ccbAdapter.ts —— 错误字符串是 CCB 底座私有
+  //  知识;本层只消费 TurnSummary.errorKind === 'auth'。)
 
   private async _runOneTurn(
     session: AgentSession,
@@ -1947,7 +1918,8 @@ export class SessionManager {
     let turnPermissionCount = 0
 
     // Snapshot session totals so we can roll back on auth error / phantom turn
-    // (parser mutates these directly via sessionTotals reference)
+    // (CcbAdapter 的 per-turn parser 经 TurnParams.sessionTotals 引用直接 mutate
+    // 这些字段 —— 成本 delta 基线的单一权威仍是 AgentSession 本身)
     const prevCostUSD = session.totalCostUSD
     const prevTurns = session.turns
     const prevLastCcbCost = session._lastCcbCumulativeCost
@@ -1956,13 +1928,14 @@ export class SessionManager {
       let settled = false
       const settle = (fn: () => void) => { if (!settled) { settled = true; fn() } }
 
-      // Idle timeout — refreshed on every runner message (see handleMessage below).
+      // Idle timeout — refreshed on every adapter 'activity'(底座每条原始消息,
+      // 含 parser 会忽略的消息 —— 与旧 runner 'message' 的 refresh 时机逐条对齐)。
       // A turn is only killed if the agent produces no output for this long, so long
       // active tasks keep running while genuinely stuck turns still get interrupted.
       const IDLE_TIMEOUT_MS = 30 * 60 * 1000 // 30 min of silence from runner
       const timer = setTimeout(
         () => {
-          if (!parser.finalized) {
+          if (!turn.finalized) {
             try { runner.interrupt() } catch {}
             this._reportTurnWaive(session, 'idle_timeout')
             onEvent({ kind: 'error', error: '单轮对话空闲超时 (30 分钟无输出),已中断。请重试。' })
@@ -1975,69 +1948,13 @@ export class SessionManager {
 
       // Buffer 'final' event — only forward to client after auth check passes
       let pendingFinal: SessionStreamEvent | null = null
-      const wrappedOnEvent = (e: SessionStreamEvent) => {
-        // Track all observable output for phantom-turn detection.
-        // permission_request counts as real output too (visible permission card),
-        // so it must NOT be flagged as phantom even if usage is 0.
-        if (e.kind === 'block') turnBlockCount++
-        else if (e.kind === 'permission_request') turnPermissionCount++
-        if (e.kind === 'final') { pendingFinal = e; return }
-        onEvent(e)
-      }
-
-      // Per-turn OpenClaude telemetry sink. Consumes `_oc_telemetry` lines
-      // routed by subprocessRunner (see docs/ccb-telemetry-refactor-plan.md).
-      // Lifecycle: constructed per turn, dropped by `detach()` on every exit
-      // path (normal finish / error / exit / idle timeout / submit catch).
-      const telemetry = new TelemetryChannel()
-      const handleTelemetry = (ev: OcTelemetryEvent) => telemetry.ingest(ev)
-      // Per-turn parse_error listener (previously only installed at runner
-      // construction). Must be detached with the rest to avoid per-turn
-      // listener accumulation (R9).
-      const handleParseError = (payload: { line: string; err: unknown }) => {
-        const err = payload.err as Error | undefined
-        log.warn('ccb stdout parse_error', {
-          sessionKey: session.sessionKey,
-          msg: err?.message,
-          sample: payload.line?.slice(0, 200),
-          ...(traceId ? { traceId } : {}),
-        })
-      }
-
-      let detached = false
-      const detach = () => {
-        if (detached) return
-        detached = true
-        clearTimeout(timer)
-        parser.finish()
-        // Only clear if still pointing to this turn's parser (prevents race
-        // where idle-timeout releases the lock, a new turn starts and sets
-        // a new parser, then this stale detach wipes the new reference).
-        if (session._currentParser === parser) session._currentParser = undefined
-        // 故意不卸载 runner.off('message', handleMessage):
-        // CCB 的 bg bash 在 turn 结束后仍 emit bash_output_tail,
-        // 需要继续流经 parser (允许 finalized 通过 tail) → wrappedOnEvent
-        // → onEvent → this.deliver。下一轮 _runOneTurn 启动时会主动替换
-        // session._currentMessageListener,旧闭包链届时被 GC。
-        runner.off('error', handleError)
-        runner.off('exit', handleExit)
-        runner.off('telemetry', handleTelemetry)
-        runner.off('parse_error', handleParseError)
-      }
-
-      const parser = new CcbMessageParser({
-        toolUseIdToName: session.toolUseIdToName,
-        onEvent: wrappedOnEvent,
-        // V3 v7 — canonical id stamper inputs (undefined for personal-version
-        // legacy paths). Parser passes them through to every main-agent
-        // text/thinking block.
-        assistantMessageId,
-        thinkingMessageId,
-        // V3 v7.1 — tool row id factory (same lifecycle as the assistant /
-        // thinking ids above). Stamped on every main-agent top-level tool_use
-        // block emitted by this parser so client and master agree on row id.
-        toolMessageIdFactory,
-        onToolUse: (tool) => {
+      const handleEngineEvent = (e: EngineEvent) => {
+        // CCB 私有 detected 事件(原 parser onToolUse/onToolResult 回调的升格形态):
+        // cron 桥接 + tool.called 指标属 engine 中立编排,在此就地消费,**不进**
+        // server.ts 的 outbound 流(与旧回调语义一致)。事件与内容 block 同一条
+        // 同步顺序流 —— 触发时序与旧回调逐一对位。
+        if (e.kind === 'tool_use_detected') {
+          const tool = e.tool
           turnToolCallCount++
           // Bridge CCB CronCreate/CronDelete via EventBus
           if (tool.name === 'CronCreate') {
@@ -2058,8 +1975,10 @@ export class SessionManager {
               taskId: gatewayId,
             }))
           }
-        },
-        onToolResult: (tr) => {
+          return
+        }
+        if (e.kind === 'tool_result_detected') {
+          const tr = e.result
           if (tr.toolName === 'CronCreate' && !tr.isError && session._cronBridgeMap) {
             const pendingKey = `_pending:${tr.toolUseId}`
             const gatewayJobId = session._cronBridgeMap.get(pendingKey)
@@ -2084,8 +2003,62 @@ export class SessionManager {
             inputPreview: tr.inputPreview,
             outputPreview: tr.preview ? tr.preview.slice(0, 500) : undefined,
           }))
-        },
-        onFinish: (result) => {
+          return
+        }
+        // Track all observable output for phantom-turn detection.
+        // permission_request counts as real output too (visible permission card),
+        // so it must NOT be flagged as phantom even if usage is 0.
+        if (e.kind === 'block') turnBlockCount++
+        else if (e.kind === 'permission_request') turnPermissionCount++
+        if (e.kind === 'final') { pendingFinal = e; return }
+        onEvent(e)
+      }
+
+      // adapter 'activity' = 底座每条原始消息到达。detach 后不再 refresh:旧实现
+      // 靠 `!detached` guard(listener 跨 turn 保留),现 listener 在 detach 卸载,
+      // guard 留作 belt-and-braces(卸载与 emit 同 tick 竞争时不重臂已清的 timer)。
+      const handleActivity = () => { if (!detached) timer.refresh() }
+      // Per-turn parse_error listener (previously only installed at runner
+      // construction). Must be detached with the rest to avoid per-turn
+      // listener accumulation (R9).
+      const handleParseError = (payload: { line: string; err: unknown }) => {
+        const err = payload.err as Error | undefined
+        log.warn('ccb stdout parse_error', {
+          sessionKey: session.sessionKey,
+          msg: err?.message,
+          sample: payload.line?.slice(0, 200),
+          ...(traceId ? { traceId } : {}),
+        })
+      }
+
+      let detached = false
+      const detach = () => {
+        if (detached) return
+        detached = true
+        clearTimeout(timer)
+        // 等价旧 parser.finish():幂等终结本 turn(summary 以当前累积态 resolve)。
+        // turn-scoped 句柄保证 stale detach 不波及后继 turn(旧
+        // `session._currentParser === parser` identity guard 收在 adapter 内)。
+        turn.end()
+        // 故意不清 adapter 的 stdout 路由:CCB 的 bg bash 在 turn 结束后仍 emit
+        // bash_output_tail,需要继续流经 finalized parser(放行 tail)→
+        // handleEngineEvent → onEvent → this.deliver。下一轮 submitTurn 会替换
+        // 路由,旧闭包链届时被 GC。telemetry 的 per-turn 作用域由 adapter 在
+        // turn 终态时清(旧 runner.off('telemetry') 的对位物)。
+        runner.off('activity', handleActivity)
+        runner.off('error', handleError)
+        runner.off('exit', handleExit)
+        runner.off('parse_error', handleParseError)
+      }
+
+      // == turn 终态后处理(原 parser onFinish 主体,改为消费 TurnSummary)==
+      // 由下方 turn.summary.then(finalizeTurn) 触发:正常终态带 summary(engine
+      // 中立汇总),异常终态(error/exit/timeout 经 detach → turn.end 强制收尾)
+      // 为 null —— 与旧 onFinish(result | null) 语义一致。时序:parser onFinish →
+      // summary resolve → microtask 执行本函数,期间不会有新的 stdout 宏任务插入,
+      // 后处理相对底座输出流的顺序与旧同步实现一致(含 crash 路径下
+      // _pendingStaleResumeClear 先于 getOrCreate 'exit' handler 可见)。
+      const finalizeTurn = (result: TurnSummary | null): void => {
           detach()
 
           // Detect stale --resume session id. CCB emits an error result with
@@ -2108,13 +2081,10 @@ export class SessionManager {
             return
           }
 
-          // Detect auth error in assistant output — roll back counters and reject.
-          // Two signals: (1) isError + broad keyword match, (2) CCB's exact error prefix.
-          const isAuthError = result && (
-            (result.isError && SessionManager.AUTH_KEYWORDS_RE.test(result.assistantText)) ||
-            SessionManager.AUTH_ERROR_PREFIX_RE.test(result.assistantText)
-          )
-          if (isAuthError) {
+          // Detect auth error — roll back counters and reject. 分类逻辑(isError +
+          // 关键字宽匹配 / CCB 精确错误前缀)已下沉 CcbAdapter(底座私有知识),
+          // 本层只消费 errorKind === 'auth'。
+          if (result?.errorKind === 'auth') {
             session.totalCostUSD = prevCostUSD
             session.turns = prevTurns
             session._lastCcbCumulativeCost = prevLastCcbCost
@@ -2143,7 +2113,10 @@ export class SessionManager {
           const isSlashCommand =
             isStringInput && userInputStr!.trimStart().startsWith('/')
 
-          const signals = telemetry.getTurnSignals()
+          // phantom 信号经 turn 句柄读(异常终态 result=null 时仍可读 —— 旧实现
+          // 在 onFinish(null) 里同样消费 telemetry signals;正常终态与
+          // result.phantomSignals 同源同值)。
+          const signals = turn.getPhantomSignals()
           let isPhantomTurn = false
           switch (signals.apiState) {
             case 'skipped':
@@ -2162,21 +2135,22 @@ export class SessionManager {
                 turnBlockCount === 0 &&
                 turnPermissionCount === 0
               ) {
-                telemetry.noteIncomplete()
                 // Correlate with turn.apiResponse (if received) to distinguish
                 // "stream ended mid-flight" from "stream never finished" —
                 // apiResponse fires only after stream loop completes, so its
                 // absence here means CCB's stream completed without producing
-                // an assistant message.
-                const apiResp = telemetry.getTurnApiResponse()
-                const lastTool = telemetry.getLastToolPreUse()
+                // an assistant message. 诊断字段由 CcbAdapter 在汇总时快照
+                // (result.diagnostics);incompleteCount 恒为 1 —— telemetry
+                // channel 是 per-turn 实例,旧 noteIncomplete/getIncompleteCount
+                // 组合在此路径的取值恒等于 1。
+                const diag = result.diagnostics
                 log.warn('telemetry: willCallApi fired but no stop_reason and no blocks', {
                   sessionKey: session.sessionKey,
-                  incompleteCount: telemetry.getIncompleteCount(),
-                  hadApiResponse: !!apiResp,
-                  apiRespStopReason: apiResp?.data.stopReason,
-                  lastToolPreUse: lastTool?.data.toolName,
-                  toolErrorCount: telemetry.getToolErrors().length,
+                  incompleteCount: 1,
+                  hadApiResponse: diag?.hadApiResponse ?? false,
+                  apiRespStopReason: diag?.apiRespStopReason,
+                  lastToolPreUse: diag?.lastToolPreUse,
+                  toolErrorCount: diag?.toolErrorCount ?? 0,
                   ...(traceId ? { traceId } : {}),
                 })
               }
@@ -2188,11 +2162,11 @@ export class SessionManager {
                 isStringInput &&
                 !isSlashCommand &&
                 !result.isError &&
-                result.inputTokens === 0 &&
-                result.outputTokens === 0 &&
-                result.cacheReadTokens === 0 &&
-                result.cacheCreationTokens === 0 &&
-                result.cost === 0 &&
+                result.usage.inputTokens === 0 &&
+                result.usage.outputTokens === 0 &&
+                result.usage.cacheReadTokens === 0 &&
+                result.usage.cacheCreationTokens === 0 &&
+                result.usage.cost === 0 &&
                 turnToolCallCount === 0 &&
                 turnBlockCount === 0 &&
                 turnPermissionCount === 0
@@ -2220,10 +2194,10 @@ export class SessionManager {
 
           // Update session accumulators from turn result
           if (result) {
-            session.totalInputTokens += result.inputTokens
-            session.totalOutputTokens += result.outputTokens
-            session.totalCacheReadTokens += result.cacheReadTokens
-            session.totalCacheCreationTokens += result.cacheCreationTokens
+            session.totalInputTokens += result.usage.inputTokens
+            session.totalOutputTokens += result.usage.outputTokens
+            session.totalCacheReadTokens += result.usage.cacheReadTokens
+            session.totalCacheCreationTokens += result.usage.cacheCreationTokens
             session.currentAssistantBuf = result.assistantText
             // Persist cost-delta baseline after every successful turn so that
             // a gateway crash + restart can re-seed the correct baseline for
@@ -2335,10 +2309,10 @@ export class SessionManager {
                 // (= anthropicProxy 从 LLM metadata.session_id 提取的同一 id)。
                 ...(session.ccbSessionId ? { agentSessionId: session.ccbSessionId } : {}),
                 usage: {
-                  inputTokens: result.inputTokens,
-                  outputTokens: result.outputTokens,
-                  cacheReadTokens: result.cacheReadTokens,
-                  cacheCreationTokens: result.cacheCreationTokens,
+                  inputTokens: result.usage.inputTokens,
+                  outputTokens: result.usage.outputTokens,
+                  cacheReadTokens: result.usage.cacheReadTokens,
+                  cacheCreationTokens: result.usage.cacheCreationTokens,
                   ...(session.model ? { model: session.model } : {}),
                   turn: turnIndex,
                   // Surface the master-owned per-turn traceId so the web UI can
@@ -2365,11 +2339,11 @@ export class SessionManager {
               sessionKey: session.sessionKey,
               turnIndex: session.turns,
               usage: {
-                inputTokens: result.inputTokens,
-                outputTokens: result.outputTokens,
-                cacheReadTokens: result.cacheReadTokens,
-                cacheCreationTokens: result.cacheCreationTokens,
-                costUsd: result.cost,
+                inputTokens: result.usage.inputTokens,
+                outputTokens: result.usage.outputTokens,
+                cacheReadTokens: result.usage.cacheReadTokens,
+                cacheCreationTokens: result.usage.cacheCreationTokens,
+                costUsd: result.usage.cost,
                 model: session.model,
               },
               toolCalls: turnToolCallCount,
@@ -2384,11 +2358,11 @@ export class SessionManager {
               sessionKey: session.sessionKey,
               turnIndex: session.turns,
               usage: {
-                inputTokens: result.inputTokens,
-                outputTokens: result.outputTokens,
-                cacheReadTokens: result.cacheReadTokens,
-                cacheCreationTokens: result.cacheCreationTokens,
-                costUsd: result.cost,
+                inputTokens: result.usage.inputTokens,
+                outputTokens: result.usage.outputTokens,
+                cacheReadTokens: result.usage.cacheReadTokens,
+                cacheCreationTokens: result.usage.cacheCreationTokens,
+                costUsd: result.usage.cost,
                 model: session.model,
               },
               sessionTotalCostUsd: session.totalCostUSD,
@@ -2413,23 +2387,8 @@ export class SessionManager {
             }
           }
           settle(() => resolve())
-        },
-        sessionTotals: session, // parser reads/writes totalCostUSD and turns directly
-      })
-
-      // Expose parser to outer idle-timeout checker
-      session._currentParser = parser
-
-      const handleMessage = (msg: any) => {
-        // Any message from runner means the agent is still active — reset idle timer.
-        // detach 后跳过 timer.refresh():Node Timer.refresh() 即使已 clearTimeout
-        // 也会重新 arm,会让旧 turn 的 idle 回调在 30 分钟后被无意义地触发
-        // (回调内有 !parser.finalized 守卫所以是 no-op,但还是不要触发更干净)。
-        if (!detached) timer.refresh()
-        // P1f / v5 ccb 单底座:codex turn 终态侧信道(outbound.codex_billing 发射)
-        // 已随 codex runner 一并删除。v5 容器永不产生 codex_billing 帧。
-        parser.parse(msg)
       }
+
       const handleError = (err: Error) => {
         onEvent({ kind: 'error', error: err.message })
         detach()
@@ -2459,7 +2418,7 @@ export class SessionManager {
         const flushP = new Promise<void>((resolveFlush) => {
           setTimeout(async () => {
             try {
-              if (!parser.finalized) {
+              if (!turn.finalized) {
                 const reason = info.signal
                   ? `子进程被信号 ${info.signal} 终止`
                   : info.code
@@ -2474,9 +2433,13 @@ export class SessionManager {
                 // 'crashed' (unexpected exit code) so the UI can render a clear
                 // "[was interrupted]" trailer rather than showing a complete-
                 // looking bubble.
-                const partial = parser.assistantBuf
-                const partialThinking = parser.thinkingBuf
-                const partialTools = parser.completedTools
+                // turn-scoped 快照(= 旧 parser.assistantBuf/thinkingBuf/
+                // completedTools/segments 直读;快照在 150ms drain 之后取,
+                // 与旧读取时机一致,交叠 turn 场景只读本 turn 的 parser)。
+                const snap = turn.getPartialSnapshot()
+                const partial = snap.assistantText
+                const partialThinking = snap.thinkingText
+                const partialTools = snap.completedTools
                 const hasPartial = !!partial && partial.length > 0
                 const hasPartialThinking =
                   !!partialThinking && partialThinking.length > 0
@@ -2523,18 +2486,18 @@ export class SessionManager {
                     // Tools that completed before the crash/interrupt — they
                     // produced real outputs and deserve durable persistence
                     // alongside the partial text.
-                    ...(hasPartialTools ? { tools: [...partialTools] } : {}),
+                    ...(hasPartialTools ? { tools: partialTools } : {}),
                     // Fix B (2026-05-25) — per-segment durable rows for the
                     // partial turn. Parser populates assistantSegments /
                     // thinkingSegments incrementally as deltas arrive, so the
                     // partial state at crash/interrupt already reflects every
                     // tool-boundary split that completed before the crash.
-                    // Plan §3.5.1.
-                    ...(parser.assistantSegments.length > 0
-                      ? { assistantSegments: parser.assistantSegments.map((s) => ({ ...s })) }
+                    // (snapshot 数组已是拷贝,无需再 clone。)Plan §3.5.1.
+                    ...(snap.assistantSegments.length > 0
+                      ? { assistantSegments: snap.assistantSegments }
                       : {}),
-                    ...(parser.thinkingSegments.length > 0
-                      ? { thinkingSegments: parser.thinkingSegments.map((s) => ({ ...s })) }
+                    ...(snap.thinkingSegments.length > 0
+                      ? { thinkingSegments: snap.thinkingSegments }
                       : {}),
                   })
                 }
@@ -2553,29 +2516,41 @@ export class SessionManager {
         this._trackPersistence(flushP)
       }
 
-      // Replace any prior turn's stdout listener (kept attached across turn
-      // boundaries to forward bg bash bash_output_tail) before installing
-      // this turn's listener. This ensures there's at most one
-      // 'message' listener per session at any time, so closures from old
-      // turns become unreachable and GC'able.
-      if (session._currentMessageListener) {
-        try { runner.off('message', session._currentMessageListener) } catch {}
-        session._currentMessageListener = null
-      }
-      runner.on('message', handleMessage)
-      session._currentMessageListener = handleMessage
+      runner.on('activity', handleActivity)
       runner.on('error', handleError)
       runner.on('exit', handleExit)
-      runner.on('telemetry', handleTelemetry)
       runner.on('parse_error', handleParseError)
 
-      // PR2 v1.0.66 — runner.submit 现在接 requestId 参数,挂在 queue entry 上,
-      // emitResult 时 codex runner 会回带在 RunnerMessage.requestId。
-      // SubprocessRunner / 其它 runner 的 submit 签名兼容(余数参数被忽略 —— TS
-      // 信任运行时一致性),不影响非 codex 路径。
-      runner.submit(userTextOrBlocks, requestId).catch((err) => {
+      // adapter 在 submitTurn 内构造 per-turn parser + telemetry(CCB 私有生命
+      // 周期)并替换 stdout 路由目标 —— 旧 _currentMessageListener 的替换语义
+      // (每 session 恒一个路由目标,旧 turn 闭包链自此可 GC)收进 adapter。
+      // PR2 v1.0.66 — requestId 挂 queue entry(CCB 路径 noop 透传)。
+      const turn = runner.submitTurn({
+        input: userTextOrBlocks,
+        requestId,
+        traceId,
+        assistantMessageId,
+        thinkingMessageId,
+        toolMessageIdFactory,
+        onEvent: handleEngineEvent,
+        // CCB 成本 delta 基线:parser 直接读写 session.totalCostUSD / turns /
+        // _lastCcbCumulativeCost(单一权威;回滚由上方 finalizeTurn 就地恢复)。
+        sessionTotals: session,
+        toolUseIdToName: session.toolUseIdToName,
+      })
+
+      // 对位旧 runner.submit(...).catch:spawn 失败 / crash-loop backoff 等。
+      turn.submitted.catch((err) => {
         onEvent({ kind: 'error', error: String(err) })
         detach()
+        settle(() => resolve())
+      })
+
+      turn.summary.then(finalizeTurn).catch((err) => {
+        // finalizeTurn 自身抛错(编排层内部 bug)时对位旧实现 parser._parseInner
+        // 的 catch → error 事件;并 settle 防 session lock 悬挂(旧实现此路径
+        // 会悬挂,这里顺手加固,正常路径行为不变)。
+        onEvent({ kind: 'error', error: String(err) })
         settle(() => resolve())
       })
     })
@@ -2704,12 +2679,8 @@ export class SessionManager {
   async destroySession(sessionKey: string): Promise<void> {
     const s = this.sessions.get(sessionKey)
     if (s) {
-      // Detach cross-turn message listener before shutting down to release
-      // the closure chain (parser + per-turn onEvent + frame envelope).
-      if (s._currentMessageListener) {
-        try { s.runner.off('message', s._currentMessageListener) } catch {}
-        s._currentMessageListener = null
-      }
+      // (跨 turn stdout 路由收在 adapter 内:session 引用被删后 adapter → turn
+      //  闭包链整体可 GC,无需再显式卸 'message' listener。)
       await s.runner.shutdown()
       // 释放 remote mux refcount —— destroy 是 session 终结态,refcount 必须归零,
       // 否则 mux 泄漏。release 幂等,失败只 warn 不抛(上游不关心)。
@@ -2751,12 +2722,6 @@ export class SessionManager {
     // 在自 process 内做,是正路)。
     const muxReleases: Array<() => Promise<void>> = []
     for (const s of this.sessions.values()) {
-      // Detach cross-turn message listener (kept attached for bg-bash tail
-      // forwarding) before shutdown to release closure chain.
-      if (s._currentMessageListener) {
-        try { s.runner.off('message', s._currentMessageListener) } catch {}
-        s._currentMessageListener = null
-      }
       if (s.executionTarget.kind === 'remote' && s.userId) {
         const uid = s.userId
         const key = s.sessionKey
@@ -2831,13 +2796,6 @@ export class SessionManager {
           for (const key of toEvict) {
             const s = this.sessions.get(key)
             if (!s) continue
-            // Detach cross-turn message listener (kept attached for bg-bash
-            // bash_output_tail forwarding) before shutdown to release the
-            // closure chain.
-            if (s._currentMessageListener) {
-              try { s.runner.off('message', s._currentMessageListener) } catch {}
-              s._currentMessageListener = null
-            }
             // 先 await shutdown 完成(SIGTERM+SIGKILL 链走完),再清状态
             try {
               await s.runner.shutdown()

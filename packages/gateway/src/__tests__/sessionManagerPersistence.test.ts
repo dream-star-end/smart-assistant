@@ -25,6 +25,9 @@ import { EventEmitter } from "node:events";
 
 import { SessionManager, type AgentSession } from "../sessionManager.js";
 import type { SessionStreamEvent } from "../ccbMessageParser.js";
+import { CcbAdapter } from "../engine/ccbAdapter.js";
+import type { EngineCreateOpts } from "../engine/registry.js";
+import type { SubprocessRunner } from "../subprocessRunner.js";
 import type { OpenClaudeConfig } from "@openclaude/storage";
 
 // ─── Fixtures ────────────────────────────────────────────────────────────
@@ -105,6 +108,12 @@ class FakeTurnRunner extends EventEmitter {
 }
 
 function makeTurnSession(runner: FakeTurnRunner): AgentSession {
+  // M0 engine 适配层:_runOneTurn 消费 EngineAdapter,fake runner 经 CcbAdapter
+  // 注入(机械调整 —— 事件驱动与断言语义不变)。
+  const adapter = new CcbAdapter(
+    {} as EngineCreateOpts,
+    runner as unknown as SubprocessRunner,
+  );
   return {
     sessionKey: "agent:codex:webchat:dm:unit-peer",
     agentId: "codex",
@@ -112,7 +121,7 @@ function makeTurnSession(runner: FakeTurnRunner): AgentSession {
     peerId: "unit-peer",
     title: "Codex Unit",
     startedAt: Date.now(),
-    runner,
+    runner: adapter,
     ccbSessionId: null,
     lock: Promise.resolve(),
     lastUsedAt: 0,

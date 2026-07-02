@@ -1,0 +1,403 @@
+/**
+ * SessionManager × EngineAdapter turn 编排回归测试(M0)。
+ *
+ * 覆盖 spec M0 验收的两块主风险面:
+ *   1. phantom 三态判定(skipped / called / unknown→legacy 9-AND)在 TurnSummary/
+ *      PhantomSignals 消费改造后语义不变,含 totals 回滚;auth / stale-resume
+ *      回滚 + reject 分类同样锁死。
+ *   2. crash/interrupt partial persistence:子进程崩溃/被信号终止时,经
+ *      turn.getPartialSnapshot() 把部分 assistant/thinking/tools/segments 落
+ *      v3 sink(150ms drain 语义、status 'crashed'/'interrupted' 区分)。
+ *
+ * Run: npx tsx --test packages/gateway/src/__tests__/sessionManagerEngineTurn.test.ts
+ */
+
+import { describe, test } from "node:test";
+import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
+
+import { SessionManager, type AgentSession } from "../sessionManager.js";
+import { CcbAdapter } from "../engine/ccbAdapter.js";
+import type { SessionStreamEvent } from "../engine/engineEvents.js";
+import type { EngineCreateOpts } from "../engine/registry.js";
+import type { SubprocessRunner } from "../subprocessRunner.js";
+import {
+  setV3MasterSinkSingleton,
+  type V3MasterSink,
+  type V3MasterSinkPayload,
+} from "../v3MasterSink.js";
+import type { OpenClaudeConfig } from "@openclaude/storage";
+
+function makeConfigStub(): OpenClaudeConfig {
+  return {
+    version: 1,
+    gateway: { bind: "127.0.0.1", port: 0, accessToken: "" },
+    auth: { mode: "subscription", claudeCodePath: "" },
+    sessions: { dbPath: "" },
+  } as unknown as OpenClaudeConfig;
+}
+
+type FakeExitInfo = { code: number | null; signal: string | null; crashed: boolean };
+
+class FakeCcbRunner extends EventEmitter {
+  lastActivityAt = Date.now();
+
+  constructor(private readonly onSubmit: (runner: FakeCcbRunner) => void) {
+    super();
+  }
+
+  interrupt(): boolean {
+    return false;
+  }
+
+  async submit(): Promise<void> {
+    this.onSubmit(this);
+  }
+
+  msg(m: Record<string, unknown>): void {
+    this.emit("message", m);
+  }
+
+  telemetry(event: string, data: Record<string, unknown> = {}): void {
+    this.emit("telemetry", {
+      type: "_oc_telemetry",
+      schemaVersion: 1,
+      event,
+      session_id: "sess-1",
+      data,
+      ts: Date.now(),
+    });
+  }
+
+  emitExit(info: FakeExitInfo): void {
+    this.emit("exit", info);
+  }
+
+  text(text: string): void {
+    this.msg({
+      type: "stream_event",
+      event: { type: "content_block_delta", delta: { type: "text_delta", text } },
+    });
+  }
+
+  thinking(thinking: string): void {
+    this.msg({
+      type: "stream_event",
+      event: { type: "content_block_delta", delta: { type: "thinking_delta", thinking } },
+    });
+  }
+
+  toolPair(id: string, name: string, output: string): void {
+    this.msg({ type: "assistant", message: { content: [{ type: "tool_use", id, name, input: { k: 1 } }] } });
+    this.msg({
+      type: "user",
+      message: { content: [{ type: "tool_result", tool_use_id: id, content: output, is_error: false }] },
+    });
+  }
+
+  result(over: Record<string, unknown> = {}): void {
+    this.msg({
+      type: "result",
+      total_cost_usd: 0,
+      usage: {},
+      is_error: false,
+      ...over,
+    });
+  }
+}
+
+function makeSession(
+  runner: FakeCcbRunner,
+  over: Partial<AgentSession> = {},
+): AgentSession {
+  const adapter = new CcbAdapter({} as EngineCreateOpts, runner as unknown as SubprocessRunner);
+  return {
+    sessionKey: "agent:main:webchat:dm:engine-peer",
+    agentId: "main",
+    channel: "unit",
+    peerId: "engine-peer",
+    title: "Engine Unit",
+    startedAt: Date.now(),
+    runner: adapter,
+    ccbSessionId: "ccb-sess-1",
+    lock: Promise.resolve(),
+    lastUsedAt: 0,
+    totalCostUSD: 0,
+    totalInputTokens: 0,
+    totalOutputTokens: 0,
+    totalCacheReadTokens: 0,
+    totalCacheCreationTokens: 0,
+    turns: 0,
+    _lastCcbCumulativeCost: 0,
+    toolUseIdToName: new Map(),
+    executionTarget: { kind: "local" },
+    providerTag: "ccb",
+    agentProvider: undefined,
+    ...over,
+  } as unknown as AgentSession;
+}
+
+async function runOneTurn(
+  sm: SessionManager,
+  session: AgentSession,
+  events: SessionStreamEvent[],
+  input = "hello",
+): Promise<void> {
+  await (sm as unknown as {
+    _runOneTurn: (
+      session: AgentSession,
+      input: string,
+      onEvent: (e: SessionStreamEvent) => void,
+      requestId?: string,
+    ) => Promise<void>;
+  })._runOneTurn(session, input, (e) => events.push(e), "req-unit");
+}
+
+// ── phantom 三态 ──────────────────────────────────────────────────────────
+
+describe("phantom three-state judgment", () => {
+  test("unknown(无 telemetry)+ 全零 → PHANTOM_TURN reject + totals 回滚", async () => {
+    const sm = new SessionManager(makeConfigStub());
+    const events: SessionStreamEvent[] = [];
+    const runner = new FakeCcbRunner((r) => {
+      setImmediate(() => r.result()); // 全零、无 blocks、无 telemetry
+    });
+    const session = makeSession(runner);
+
+    await assert.rejects(runOneTurn(sm, session, events), /PHANTOM_TURN/);
+    // parser 已 turns+=1,回滚后归 0
+    assert.equal(session.turns, 0);
+    assert.equal(session.totalCostUSD, 0);
+    assert.equal(session._lastCcbCumulativeCost, 0);
+    assert.equal(
+      events.some((e) => e.kind === "final"),
+      false,
+      "phantom 不放行缓冲的 final",
+    );
+  });
+
+  test("skipped(CCB 明示未调 API)+ 全零 → 正常完成,不判 phantom", async () => {
+    const sm = new SessionManager(makeConfigStub());
+    const events: SessionStreamEvent[] = [];
+    const runner = new FakeCcbRunner((r) => {
+      setImmediate(() => {
+        r.telemetry("turn.skipped", { reason: "slash_command" });
+        r.result();
+      });
+    });
+    const session = makeSession(runner);
+
+    await runOneTurn(sm, session, events, "/help");
+    assert.ok(events.some((e) => e.kind === "final"), "final 应放行");
+    assert.equal(events.some((e) => e.kind === "error"), false);
+    assert.equal(session.turns, 1, "skipped 是正常完成,不回滚");
+  });
+
+  test("called(willCallApi 已发)+ 全零 → 不判 phantom(诊断仅告警)", async () => {
+    const sm = new SessionManager(makeConfigStub());
+    const events: SessionStreamEvent[] = [];
+    const runner = new FakeCcbRunner((r) => {
+      setImmediate(() => {
+        r.telemetry("turn.willCallApi");
+        r.result(); // 无 stop_reason、零 blocks → incomplete 诊断路径
+      });
+    });
+    const session = makeSession(runner);
+
+    await runOneTurn(sm, session, events);
+    assert.ok(events.some((e) => e.kind === "final"));
+    assert.equal(session.turns, 1);
+  });
+
+  test("unknown + 有输出(blocks>0)→ 不判 phantom", async () => {
+    const sm = new SessionManager(makeConfigStub());
+    const events: SessionStreamEvent[] = [];
+    const runner = new FakeCcbRunner((r) => {
+      setImmediate(() => {
+        r.text("real answer");
+        r.result({ total_cost_usd: 0.02, usage: { input_tokens: 3, output_tokens: 2 } });
+      });
+    });
+    const session = makeSession(runner);
+
+    await runOneTurn(sm, session, events);
+    assert.ok(events.some((e) => e.kind === "final"));
+    assert.equal(session.totalCostUSD, 0.02);
+    assert.equal(session.totalInputTokens, 3);
+    assert.equal(session.totalOutputTokens, 2);
+  });
+});
+
+// ── auth / stale-resume 分类 + 回滚 ──────────────────────────────────────
+
+describe("auth / stale-resume classification", () => {
+  test("auth 错误(errorKind='auth')→ AUTH_ERROR reject + totals 回滚", async () => {
+    const sm = new SessionManager(makeConfigStub());
+    const events: SessionStreamEvent[] = [];
+    const runner = new FakeCcbRunner((r) => {
+      setImmediate(() => {
+        r.msg({
+          type: "assistant",
+          error: "auth",
+          message: { content: [{ type: "text", text: "Failed to authenticate. run /login" }] },
+        });
+        r.result({ is_error: true, total_cost_usd: 0.3 });
+      });
+    });
+    const session = makeSession(runner);
+
+    await assert.rejects(runOneTurn(sm, session, events), /AUTH_ERROR/);
+    assert.equal(session.turns, 0);
+    assert.equal(session.totalCostUSD, 0);
+    assert.equal(session._lastCcbCumulativeCost, 0);
+    assert.equal(events.some((e) => e.kind === "final"), false, "auth 门拦下缓冲 final");
+  });
+
+  test("stale --resume → STALE_RESUME_ID reject + _pendingStaleResumeClear 置位", async () => {
+    const sm = new SessionManager(makeConfigStub());
+    const events: SessionStreamEvent[] = [];
+    const runner = new FakeCcbRunner((r) => {
+      setImmediate(() =>
+        r.result({
+          is_error: true,
+          errors: ["No conversation found with session ID: dead-beef"],
+        }),
+      );
+    });
+    const session = makeSession(runner);
+
+    await assert.rejects(runOneTurn(sm, session, events), /STALE_RESUME_ID/);
+    assert.equal(session._pendingStaleResumeClear, true);
+    assert.equal(session.turns, 0, "stale 路径同样回滚 totals");
+  });
+});
+
+// ── crash/interrupt partial persistence(getPartialSnapshot 主风险面)─────
+
+interface CapturedSink {
+  sink: V3MasterSink;
+  payloads: V3MasterSinkPayload[];
+}
+
+function makeCapturingSink(): CapturedSink {
+  const payloads: V3MasterSinkPayload[] = [];
+  const sink = {
+    persistOrQueue: async (payload: V3MasterSinkPayload) => {
+      payloads.push(payload);
+      return { ok: true as const };
+    },
+    attemptOnce: async () => {
+      throw new Error("not used in this test");
+    },
+  } as unknown as V3MasterSink;
+  return { sink, payloads };
+}
+
+describe("crash/interrupt partial persistence", () => {
+  test("crash(code!=0)→ 部分 text/thinking/tools/segments 以 status='crashed' 落 sink", async () => {
+    const captured = makeCapturingSink();
+    setV3MasterSinkSingleton(captured.sink);
+    try {
+      const sm = new SessionManager(makeConfigStub());
+      const events: SessionStreamEvent[] = [];
+      const runner = new FakeCcbRunner((r) => {
+        setImmediate(() => {
+          r.thinking("half thought");
+          r.text("partial ans");
+          r.toolPair("tu1", "Bash", "tool output before crash");
+          r.text("wer");
+          r.emitExit({ code: 1, signal: null, crashed: true });
+        });
+      });
+      const session = makeSession(runner, {
+        channel: "webchat",
+        userId: "user-1",
+      } as Partial<AgentSession>);
+
+      await runOneTurn(sm, session, events);
+
+      // 150ms flush 已在 resolve 前完成(settle 在 flush 内)
+      assert.equal(captured.payloads.length, 1);
+      const p = captured.payloads[0];
+      assert.equal(p.status, "crashed");
+      assert.equal(p.sessionId, "engine-peer");
+      assert.equal(p.turnIndex, 1);
+      assert.equal(p.text, "partial answer");
+      assert.equal(p.thinkingText, "half thought");
+      assert.equal(p.requestId, "req-unit");
+      assert.equal(p.agentSessionId, "ccb-sess-1");
+      assert.equal(p.tools?.length, 1);
+      assert.equal(p.tools?.[0].toolName, "Bash");
+      assert.equal(p.tools?.[0].output, "tool output before crash");
+      // Fix B per-segment:text → tool → text 分成 s0/s1
+      assert.deepEqual(
+        p.assistantSegments?.map((s) => ({ index: s.index, text: s.text })),
+        [
+          { index: 0, text: "partial ans" },
+          { index: 1, text: "wer" },
+        ],
+      );
+      assert.equal(p.thinkingSegments?.length, 1);
+
+      // 用户可见错误帧 + turn 正常 resolve
+      assert.ok(
+        events.some((e) => e.kind === "error" && e.error.includes("code 1")),
+        "crash 需产生可见错误帧",
+      );
+      // flush promise 已注册进 pending-persistence 并排空
+      await sm.awaitPendingPersistence();
+    } finally {
+      setV3MasterSinkSingleton(null);
+    }
+  });
+
+  test("interrupt(signal)→ status='interrupted'", async () => {
+    const captured = makeCapturingSink();
+    setV3MasterSinkSingleton(captured.sink);
+    try {
+      const sm = new SessionManager(makeConfigStub());
+      const events: SessionStreamEvent[] = [];
+      const runner = new FakeCcbRunner((r) => {
+        setImmediate(() => {
+          r.text("stopped midway");
+          r.emitExit({ code: null, signal: "SIGTERM", crashed: true });
+        });
+      });
+      const session = makeSession(runner, {
+        channel: "webchat",
+        userId: "user-1",
+      } as Partial<AgentSession>);
+
+      await runOneTurn(sm, session, events);
+
+      assert.equal(captured.payloads.length, 1);
+      assert.equal(captured.payloads[0].status, "interrupted");
+      assert.equal(captured.payloads[0].text, "stopped midway");
+      assert.ok(events.some((e) => e.kind === "error" && e.error.includes("SIGTERM")));
+    } finally {
+      setV3MasterSinkSingleton(null);
+    }
+  });
+
+  test("非 sink 白名单 channel:crash 只发错误帧,不落 sink", async () => {
+    const captured = makeCapturingSink();
+    setV3MasterSinkSingleton(captured.sink);
+    try {
+      const sm = new SessionManager(makeConfigStub());
+      const events: SessionStreamEvent[] = [];
+      const runner = new FakeCcbRunner((r) => {
+        setImmediate(() => {
+          r.text("cron partial");
+          r.emitExit({ code: 137, signal: null, crashed: true });
+        });
+      });
+      const session = makeSession(runner, { channel: "cron" } as Partial<AgentSession>);
+
+      await runOneTurn(sm, session, events);
+      assert.equal(captured.payloads.length, 0);
+      assert.ok(events.some((e) => e.kind === "error"));
+    } finally {
+      setV3MasterSinkSingleton(null);
+    }
+  });
+});
