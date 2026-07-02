@@ -287,7 +287,17 @@ export class ChatSocket {
     };
     // 流式降频:turn 进行中且距上次通知不足 STREAM_NOTIFY_MS → 定时到窗口边界统一 flush
     // (跳过 rAF 路径)。完成帧最多延迟 ~120ms,可接受;非流式路径行为不变。
-    if (this.inFlightSends.size > 0) {
+    // 判据必须是会话级 _sendingInFlight(turn 生命周期权威 flag,final/错误/停止都会清),
+    // 不能借用 inFlightSends —— 那是"冷启窗口 direct-send 未送达"的连接级记录:turn 完成
+    // 不清、drain 路径不记,拿它当 turn 信号会导致首次发送后永久降频/队列 turn 不降频。
+    let turnActive = false;
+    for (const s of this.sessions.values()) {
+      if (s._sendingInFlight) {
+        turnActive = true;
+        break;
+      }
+    }
+    if (turnActive) {
       const since = Date.now() - this.lastNotifyAt;
       if (since < STREAM_NOTIFY_MS) {
         this.notifyFallbackTimer = setTimeout(flush, STREAM_NOTIFY_MS - since);
@@ -901,6 +911,9 @@ export class ChatSocket {
         // readiness 权威统一:冷启时 WS 握手(onopen)早于 relay 就绪,期间发的消息经 P7.8 在离线
         // 队列等待;此处一收到就立即排空 → relay 一就绪即投递,不靠 4503 reconnect 反弹的运气/时延。
         this.relayReady = true;
+        // relay 建立 = 本连接此前 direct-send 已送达容器("relay 从未建立=必未送达"的反命题)。
+        // 清掉冷启窗口的在途记录,防后续 provisioning 关闭把已送达消息误重排(重复发送)。
+        this.inFlightSends.clear();
         this.startOfflineDrainNow();
         this.flushAllRepoBinds(); // relay 就绪:补发 PUT 时 WS 未就绪而积压的仓库绑定
         return;
@@ -1396,7 +1409,12 @@ export class ChatSocket {
       userMsg.status = "sent";
       // 记录 direct-send 在途消息:若本连接随后 4503/provisioning 关闭(relay 从未建立 = 必未送达),
       // onclose 会把它重排回 offlineQueue 重试,修复冷启首条消息丢失(见 inFlightSends 注释)。
-      this.inFlightSends.set(sess.id, { sessId: sess.id, payload, msgId: userMsg.id });
+      // **仅在 relay 未就绪的冷启窗口记录**:relay 已建立时 direct-send 即时送达,记录反而是
+      // 陈旧条目 —— 此前无条件 set 且 turn 完成不清,同连接后续再遇 provisioning 关闭会把
+      // 早已处理完的旧消息重排回 offlineQueue 重复发送。
+      if (!this.relayReady) {
+        this.inFlightSends.set(sess.id, { sessId: sess.id, payload, msgId: userMsg.id });
+      }
       sess._sendingInFlight = true;
       sess._turnStartedAt = Date.now();
       // 新 turn 开始：清跨 turn 计费归因状态（与 drain / auto-continue turn-start 一致）。

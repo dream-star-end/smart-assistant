@@ -120,6 +120,7 @@ async function mapGithubErrToHttp(
       // 触发 retry 而不是误导式"请重连"。
       try {
         await revokeGithubLinkAndClearSessions(pool, userId, 'link_revoked')
+        invalidateReposCacheForUser(userId)
         ctx.log.warn('github_token_invalid_auto_revoked', { sub: userId })
       } catch (subErr) {
         ctx.log.error('github_token_invalid_revoke_failed', {
@@ -195,6 +196,7 @@ export async function handleDeleteMyGithub(
     Number(user.id),
     'user_revoked',
   )
+  invalidateReposCacheForUser(user.id)
   ctx.log.info('github_link_revoked', { sub: user.id, sessionsCleared })
   sendJson(res, 200, { revoked: true, sessionsCleared })
 }
@@ -202,8 +204,18 @@ export async function handleDeleteMyGithub(
 // repos 列表 60s TTL 缓存:GitHub API 经出站代理往返实测 3-6s(现网慢请求 top1),
 // 而仓库列表是低频变更数据(新建仓库最迟 1min 可见,重开弹窗即刷新)。仅缓存成功结果;
 // 测试注入 overrides 时跳过(不破坏用例隔离)。size 防御性 clear(键空间=用户×分页参数)。
+// 失效纪律:unlink/token-revoke/relink 都必须调 invalidateReposCacheForUser —— 否则
+// 换绑后最多 60s 仍能看到旧 GitHub 账号的仓库列表(跨账号数据残留)。
 const REPOS_CACHE_TTL_MS = 60_000
 const reposCache = new Map<string, { items: unknown; exp: number }>()
+
+/** 清某用户全部 repos 缓存条目(key 前缀 = `${userId}:`)。link 生命周期变更时调用。 */
+export function invalidateReposCacheForUser(userId: number | string | bigint): void {
+  const prefix = `${userId}:`
+  for (const k of reposCache.keys()) {
+    if (k.startsWith(prefix)) reposCache.delete(k)
+  }
+}
 
 /** GET /api/me/github/repos */
 export async function handleListMyGithubRepos(

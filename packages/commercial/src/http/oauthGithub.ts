@@ -32,6 +32,7 @@ import {
 import { getPool } from '../db/index.js'
 import { saveGithubLink } from '../github/tokenStore.js'
 import { requireAuth } from './auth.js'
+import { invalidateReposCacheForUser } from './githubApi.js'
 import type { CommercialHttpDeps, RequestContext } from './handlers.js'
 import { HttpError } from './util.js'
 
@@ -208,6 +209,9 @@ export async function handleGithubCallback(
     return
   }
 
+  // 换绑失效缓存:relink 到新 GitHub 账号后,旧账号的 repos 60s 缓存不能再命中
+  // (跨账号数据残留;失效纪律见 githubApi.ts invalidateReposCacheForUser)。
+  invalidateReposCacheForUser(exchanged.userId)
   ctx.log.info('github_callback_success', {
     sub: exchanged.userId,
     ghId: exchanged.result.githubUser.id,

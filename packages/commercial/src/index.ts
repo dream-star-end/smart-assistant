@@ -2489,15 +2489,22 @@ export async function registerCommercial(
   // 科研 durable job worker(v5 科研 agent 子系统)。
   // research_jobs 表持久化容器提交的重 master-side op(ingest/index/cite_check/...);
   // 本 scheduler 周期 drain;启动时一次 stale cleanup(running>30min → interrupted).
-  // **必须 gate 在 controlPlaneEnabled**:v5 follower 不跑(下方 fail-closed 兜底).
+  //
+  // 【域归属 v5-owned(channel-scoped)】claimNextJob/recoverStale 均按本实例
+  // runtime_channel 过滤,createJob 默认落本实例 channel → scheduler 只 mutate 自己
+  // channel 的行。若仍 gate 在 controlPlaneEnabled,v5 创建的 job(runtime_channel='v5')
+  // 会永远无人认领(v5 不跑、v3 只认领 v3 行)—— 与 channel 纪律自相矛盾。
   // 关闭:COMMERCIAL_RESEARCH_JOBS_DISABLED=1.默认 5s tick.
   // handler map:Phase 0 暂空(无 proxy 创建 job);Phase 1/2 逐步注入 ingest/index/
   // cite_check/lit_search/render 真实 handler(DI seam,见 research/scheduler.ts).
   let researchJobScheduler: ResearchJobSchedulerHandle | undefined;
-  if (controlPlaneEnabled && process.env.COMMERCIAL_RESEARCH_JOBS_DISABLED !== "1") {
+  if (
+    (controlPlaneEnabled || runtimeChannel === "v5") &&
+    process.env.COMMERCIAL_RESEARCH_JOBS_DISABLED !== "1"
+  ) {
     const raw = Number(process.env.COMMERCIAL_RESEARCH_JOBS_INTERVAL_MS);
     const intervalMs = Number.isFinite(raw) && raw >= 2000 ? raw : 5_000;
-    researchJobScheduler = trackScheduler("researchJobs", "shared", startResearchJobScheduler({
+    researchJobScheduler = trackScheduler("researchJobs", "v5-owned", startResearchJobScheduler({
       handlers: {},
       intervalMs,
     }));

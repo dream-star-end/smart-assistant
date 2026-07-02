@@ -303,8 +303,9 @@ export async function recoverStale(staleMs: number): Promise<number> {
         SET status = 'interrupted', locked_at = NULL, updated_at = NOW(),
             error = COALESCE(error, 'worker crash / restart before completion')
       WHERE status = 'running'
+        AND runtime_channel = $2
         AND locked_at < NOW() - ($1 || ' milliseconds')::interval`,
-    [staleMs],
+    [staleMs, getRuntimeChannel()],
   );
   return r.rowCount ?? 0;
 }

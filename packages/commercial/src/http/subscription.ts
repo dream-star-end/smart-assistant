@@ -169,8 +169,12 @@ export async function handleSubscribe(
   // 服务端拒绝"期内高档买低档":grantSubscriptionTx 的语义是**重置**期内桶+周期重开,
   // pro 用户误点 basic 会静默清掉剩余期内额度并降级(用户吃亏,投诉/退款风险)。
   // 同档=续费放行;升档走 /upgrade(补差价);要降级的等本期结束自动落 free 再买。
+  // 只拦"仍在有效期内"的高档(status=active 且 period_end 未过):已到期但 rollover
+  // sweeper 尚未把行切回 free 的用户,期内桶本就无可清,买低档是合法诉求,不能误拦。
   const cur = await getUserSubscriptionView(user.id);
-  if (cur.paid && plan.tier < cur.tier) {
+  const curStillActive =
+    cur.status === "active" && new Date(cur.periodEnd).getTime() > Date.now();
+  if (cur.paid && curStillActive && plan.tier < cur.tier) {
     throw new HttpError(
       400,
       "PLAN_DOWNGRADE_BLOCKED",
