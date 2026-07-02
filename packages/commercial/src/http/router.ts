@@ -220,7 +220,7 @@ import {
   handlePatchRemoteHost,
   handleRemoteHostAction,
 } from './remoteHosts.js'
-import { requireUserVerifyDb } from './requireUser.js'
+import { requireActiveAccountVerifyDb, requireUserVerifyDb } from './requireUser.js'
 import { defaultTunnelFetchHealthz } from './tunnelHealthzProbe.js'
 import {
   HttpError,
@@ -1189,7 +1189,13 @@ export function createCommercialHandler(
         // 完全分裂(2026-07-02 会话 45faa1d3… 实测:面板显示宿主平台任务,agent 却说
         // 没有任务)。用户范围 API 的权威源必须恒为「调用者自己的容器」,admin 也不例外。
       } else {
-        const verified = await requireUserVerifyDb(claims.sub, deps.v3Supervisor.pool)
+        // user + admin 都按「自己的容器」验证/代理(admin 也是平台的普通使用者;
+        // requireUserVerifyDb 硬编码 role='user',会把 admin 挡成 403)。
+        const verified = await requireActiveAccountVerifyDb(
+          claims.sub,
+          ['user', 'admin'],
+          deps.v3Supervisor.pool,
+        )
         if (!verified) {
           apiProxyLog.warn('container_api_proxy_user_inactive', { sub: claims.sub })
           sendError(res, 403, 'FORBIDDEN', 'user account not active', requestId)
