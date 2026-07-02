@@ -11,6 +11,8 @@ import {
   AlertTriangle,
   BookOpen,
   CheckCircle2,
+  ChevronDown,
+  ChevronRight,
   Database,
   ExternalLink,
   FileText,
@@ -21,9 +23,11 @@ import {
   Trophy,
   XCircle,
 } from "lucide-react";
-import type { ReactNode } from "react";
+import { type ReactNode, useEffect, useState } from "react";
+import type { EvidenceManifest } from "@openclaude/protocol/research";
 import { cn } from "../../lib/utils";
 import { SignedFileCard, useSignedSrc } from "../chat/media";
+import { ClaimList, CoverageBadge, GatesRow, LiteratureLibraryPanel } from "../chat/researchEvidence";
 import { asArr, asStr, isSafeHttpUrl, type ToolLike } from "./format";
 
 // ── 解析助手 ────────────────────────────────────────────────────────────────
@@ -507,6 +511,96 @@ function ArtifactPreviewLink({ src }: { src: string }) {
   );
 }
 
+/** 引用接地详情区:懒加载 manifest sidecar(经 /api/media-sign 签名取数),渲染闸门 +
+ *  claim↔证据(角标[N]可点查出处)+ 文献库(GB/T7714/BibTeX 导出)。独立组件:需 hook。 */
+function EvidenceSection({ src, coverage }: {
+  src: string;
+  coverage: { verifiedClaims: number; totalClaims: number } | null;
+}) {
+  const [open, setOpen] = useState(false);
+  const [tab, setTab] = useState<"evidence" | "library">("evidence");
+  const [manifest, setManifest] = useState<EvidenceManifest | null>(null);
+  const [error, setError] = useState(false);
+  const { url: signed } = useSignedSrc(open ? src : null);
+
+  useEffect(() => {
+    if (!open || !signed || manifest || error) return;
+    let cancelled = false;
+    fetch(signed)
+      .then((r) => (r.ok ? r.json() : Promise.reject(new Error(String(r.status)))))
+      .then((m: unknown) => {
+        if (cancelled) return;
+        // 轻校验:三个数组 + coverage 对象在(渲染组件按此假设写),畸形则走错误态不崩。
+        if (
+          isRecord(m) && Array.isArray(m.claims) && Array.isArray(m.quotes) &&
+          Array.isArray(m.sources) && isRecord(m.coverage)
+        ) {
+          setManifest(m as unknown as EvidenceManifest);
+        } else setError(true);
+      })
+      .catch(() => {
+        if (!cancelled) setError(true);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [open, signed, manifest, error]);
+
+  const sources = manifest?.sources ?? [];
+  return (
+    <div className="mt-2 rounded-md border border-border">
+      <button
+        type="button"
+        onClick={() => setOpen((o) => !o)}
+        className="flex w-full items-center gap-1.5 px-2.5 py-1.5 text-[12.5px] text-fg hover:bg-hover"
+      >
+        {open ? <ChevronDown className="size-3.5" /> : <ChevronRight className="size-3.5" />}
+        引用接地详情
+        {coverage && <CoverageBadge coverage={coverage} />}
+      </button>
+      {open && (
+        <div className="border-t border-border">
+          {error && <div className="px-2.5 py-2 text-xs text-faint">证据清单不可用(可能已过期或被清理)。</div>}
+          {!error && !manifest && <div className="px-2.5 py-2 text-xs text-faint">加载证据清单…</div>}
+          {manifest && (
+            <>
+              <div className="flex items-center gap-1 px-2.5 pt-2">
+                <button
+                  type="button"
+                  onClick={() => setTab("evidence")}
+                  className={cn(
+                    "rounded-md px-2 py-0.5 text-[12px]",
+                    tab === "evidence" ? "bg-accent-soft text-accent" : "text-muted hover:text-fg",
+                  )}
+                >
+                  证据
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setTab("library")}
+                  className={cn(
+                    "rounded-md px-2 py-0.5 text-[12px]",
+                    tab === "library" ? "bg-accent-soft text-accent" : "text-muted hover:text-fg",
+                  )}
+                >
+                  文献库 {sources.length}
+                </button>
+              </div>
+              {tab === "evidence" && (
+                <div className="px-2.5 pb-2 pt-1.5">
+                  <GatesRow manifest={manifest} />
+                  <ClaimList manifest={manifest} />
+                </div>
+              )}
+              {tab === "library" && <LiteratureLibraryPanel sources={sources} />}
+            </>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function ArtifactCard({ data }: { data: Record<string, unknown> }) {
   const output = asStr(data.output);
   if (!output) return null;
@@ -514,6 +608,12 @@ function ArtifactCard({ data }: { data: Record<string, unknown> }) {
   const safeOut = safeArtifactSrc(output); // 白名单后才做 href(防恶意 scheme)
   const qmd = asStr(data.qmd); // 中间产物(Quarto 源)
   const safeQmd = qmd && qmd !== output ? safeArtifactSrc(qmd) : null;
+  const manifestSrc = safeArtifactSrc(data.manifestPath); // 引用接地 manifest sidecar
+  const cov = isRecord(data.coverage) ? data.coverage : null;
+  const coverage =
+    cov && typeof cov.verifiedClaims === "number" && typeof cov.totalClaims === "number"
+      ? { verifiedClaims: cov.verifiedClaims, totalClaims: cov.totalClaims }
+      : null;
   const warnings = asArr(data.warnings).map((w) => asStr(w)).filter(Boolean);
   const refs = typeof data.references === "number" ? data.references : null;
   const slides = typeof data.slideCount === "number" ? data.slideCount : null;
@@ -530,6 +630,8 @@ function ArtifactCard({ data }: { data: Record<string, unknown> }) {
             <Chip tone="danger">{warnings.length} 处未接地/红标</Chip>
           ))}
       </div>
+      {/* 引用接地详情(claim↔证据/闸门/文献库):manifest sidecar 懒加载 */}
+      {manifestSrc && <EvidenceSection src={manifestSrc} coverage={coverage} />}
       {/* 结果产物:下载 + 预览(仅白名单安全 src) */}
       {safeOut && (
         <div className="mt-2 flex flex-wrap items-center gap-2">

@@ -91,6 +91,8 @@ const PLATFORM_RESEARCH_AGENTS: PlatformAgentDef[] = [
         '- oc-litrag:在已入库文档里定位与问题相关的原文片段(引用句柄来源);',
         '- oc-cite:把陈述与原文 span 绑定并校验(引用接地的权威门禁);',
         '- oc-report:把分析与引用渲染成确定性报告/稿件(未接地的陈述会被红标);',
+        '- scientific-figures:出版级科研图表(matplotlib+SciencePlots 需叠 no-latex,统计图 seaborn,',
+        '  流程/架构图 Mermaid);报告/稿件配图必须走它,严禁生成式 AI 插画;',
         '- research-writing-style / scientific-writing:贴合个人风格 + 学术写作规范。',
         '',
         RESEARCH_GROUNDING_NOTE,

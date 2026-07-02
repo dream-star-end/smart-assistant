@@ -167,6 +167,29 @@ describe("其余 oc-* 卡片", () => {
     expect(screen.getByText(/未接地\/红标/)).toBeInTheDocument();
   });
 
+  test("oc-report → 引用接地详情区(manifest sidecar + coverage 徽章,默认折叠不取数)", () => {
+    const out = JSON.stringify({
+      output: "/tmp/report.pdf",
+      manifestPath: "/tmp/report.manifest.json",
+      coverage: { verifiedClaims: 1, totalClaims: 2 },
+      references: 3,
+      warnings: [],
+    });
+    render(<div>{researchToolCard("oc-report --schema s --manifest m", tool({ output: out }))}</div>);
+    expect(screen.getByText("引用接地详情")).toBeInTheDocument();
+    expect(screen.getByText("接地 1/2")).toBeInTheDocument();
+  });
+
+  test("oc-report 引用接地详情:拒绝恶意 manifestPath scheme(不渲染详情区)", () => {
+    const out = JSON.stringify({
+      output: "/tmp/report.pdf",
+      manifestPath: "javascript:alert(1)//m.json",
+    });
+    render(<div>{researchToolCard("oc-report --schema s --manifest m", tool({ output: out }))}</div>);
+    expect(screen.getByText("报告已生成")).toBeInTheDocument();
+    expect(screen.queryByText("引用接地详情")).toBeNull();
+  });
+
   test("oc-report 产物卡:拒绝恶意 output scheme(不产出可点 href)", () => {
     const out = JSON.stringify({ output: "javascript:alert(1)//.pdf" });
     const { container } = render(<div>{researchToolCard("oc-report --schema s", tool({ output: out }))}</div>);

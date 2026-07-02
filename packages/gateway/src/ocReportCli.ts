@@ -69,6 +69,10 @@ function main(): void {
   const stem = path.basename(output).replace(/\.[^.]+$/, "");
   const mdPath = path.join(dir, `${stem}.qmd`);
   writeFileSync(mdPath, built.markdown, "utf8");
+  // manifest sidecar:前端产物卡经 /api/media-sign 取它渲染引用接地视图(claim↔证据/闸门/文献库)。
+  // 走文件而非 stdout —— manifest 含全文 quote,可到几十 KB,stdout preview 会被截断。
+  const manifestPath = path.join(dir, `${stem}.manifest.json`);
+  writeFileSync(manifestPath, JSON.stringify(manifest), "utf8");
 
   let finalPath = mdPath;
   if (ext === "md" || ext === "qmd") {
@@ -95,7 +99,7 @@ function main(): void {
   }
 
   process.stdout.write(
-    `${JSON.stringify({ output: finalPath, qmd: mdPath, stats: built.stats, references: built.references.length, warnings: built.warnings }, null, 2)}\n`,
+    `${JSON.stringify({ output: finalPath, qmd: mdPath, manifestPath, coverage: manifest.coverage, stats: built.stats, references: built.references.length, warnings: built.warnings }, null, 2)}\n`,
   );
   // 把产物绝对路径单独成行打印,前端渲染成文件卡片(与 scansci-pdf 约定一致)
   process.stdout.write(`${finalPath}\n`);

@@ -1,105 +1,22 @@
 /**
- * ResearchReportCard —— 引用接地结构化产物卡(artifact 驱动,非裸 markdown)。
+ * 引用接地证据视图组件(claim↔证据/闸门/覆盖率/文献库)。
  *
  * 产品差异化核心:让"引用接地"成为第一类公民 —— 每条结论一键查出处,未接地论断
  * 红标。数据来自 master oc-cite check 的已检 EvidenceManifest(status 由平台铸造,
  * 前端只呈现,不改判定)。
  *
- * 三件套:
- *   - 证据视图:claim 列表 + 状态(verified/未核查红标)+ 角标 [N] → EvidencePopover。
- *   - EvidencePopover:点角标内联展开支撑 quote(verbatim)+ 来源(标题/作者/DOI/OA)。
- *   - LiteratureLibraryPanel:检索结果表(标题/作者/年/引用/OA)+ BibTeX/GB-T7714 导出。
+ * 消费方:researchCards.tsx 的 oc-report 产物卡(经签名 URL 拉 manifest sidecar 后渲染)。
+ * 历史:曾按 role="research-report" 消息驱动(ResearchReportCard),但 WS 引擎从不产出
+ * 该角色帧,死代码已删;现改为工具产物驱动,这才是真实会话里走得到的路径。
  */
-import { BookOpen, Check, Copy, Download, FileText, TriangleAlert } from "lucide-react";
+import { BookOpen, Check, Copy, Download, TriangleAlert } from "lucide-react";
 import { useState } from "react";
 import type { Claim, EvidenceManifest, QuoteHandle, SourceRecord } from "@openclaude/protocol/research";
-import type { ChatMessage } from "../../lib/chat/model";
 import { exportLibrary } from "../../lib/research/cite";
 import { cn } from "../../lib/utils";
 import { Badge, Button } from "../ui";
-import { Media } from "./media";
 
-type Tab = "evidence" | "library";
-
-// 注:不外包 memo —— 同 PlanCard/DelegateProgressCard,reducer 就地 mutate + {msg}
-// 同引用会让 memo 永不重渲;父 MessageRenderer 已按 sig memo,内容变即重渲本卡。
-export function ResearchReportCard({ msg }: { msg: ChatMessage }) {
-  const manifest = msg._researchManifest;
-  const library = msg._researchLibrary;
-  const [tab, setTab] = useState<Tab>("evidence");
-
-  const hasEvidence = !!manifest;
-  const hasLibrary = !!library && library.length > 0;
-  if (!hasEvidence && !hasLibrary) {
-    return null;
-  }
-  // 派生有效 tab:只有一类数据时强制用它(防数据后到导致 tab 滞留到不可用页 → 空白)。
-  const effectiveTab: Tab = !hasEvidence ? "library" : !hasLibrary ? "evidence" : tab;
-
-  return (
-    <div className="rounded-lg border border-border bg-surface animate-in">
-      <div className="flex items-center gap-2 border-b border-border px-3.5 py-2.5">
-        <span className="flex size-6 items-center justify-center rounded-md bg-accent-soft text-accent">
-          <FileText size={14} />
-        </span>
-        <span className="text-[13px] font-medium text-fg">{msg.text || "科研报告"}</span>
-        {manifest && <CoverageBadge coverage={manifest.coverage} />}
-        {hasEvidence && hasLibrary && (
-          <div className="ml-auto flex gap-1">
-            <TabButton active={effectiveTab === "evidence"} onClick={() => setTab("evidence")}>
-              证据
-            </TabButton>
-            <TabButton active={effectiveTab === "library"} onClick={() => setTab("library")}>
-              文献库 {library?.length}
-            </TabButton>
-          </div>
-        )}
-      </div>
-
-      {effectiveTab === "evidence" && manifest && (
-        <div className="px-3.5 py-3">
-          <GatesRow manifest={manifest} />
-          {/* artifact 驱动:始终从 manifest 渲染 claim↔证据(非裸 markdown);完整报告
-              全文走可下载产物(_researchArtifacts 的 PDF/docx)。 */}
-          <ClaimList manifest={manifest} />
-        </div>
-      )}
-
-      {effectiveTab === "library" && hasLibrary && <LiteratureLibraryPanel sources={library} />}
-
-      {msg._researchArtifacts && msg._researchArtifacts.length > 0 && (
-        <div className="border-t border-border px-3.5 py-2.5">
-          <div className="mb-1.5 text-[12px] font-medium text-muted">产物</div>
-          <Media
-            media={msg._researchArtifacts.map((a) => ({
-              kind: "file" as const,
-              url: a.signedUrl ?? a.path,
-              filename: a.path.split("/").pop(),
-              mimeType: a.mime,
-            }))}
-          />
-        </div>
-      )}
-    </div>
-  );
-}
-
-function TabButton({ active, onClick, children }: { active: boolean; onClick: () => void; children: React.ReactNode }) {
-  return (
-    <button
-      type="button"
-      onClick={onClick}
-      className={cn(
-        "rounded-md px-2 py-0.5 text-[12px]",
-        active ? "bg-accent-soft text-accent" : "text-muted hover:text-fg",
-      )}
-    >
-      {children}
-    </button>
-  );
-}
-
-function CoverageBadge({ coverage }: { coverage: EvidenceManifest["coverage"] }) {
+export function CoverageBadge({ coverage }: { coverage: EvidenceManifest["coverage"] }) {
   const { verifiedClaims, totalClaims } = coverage;
   const allOk = totalClaims > 0 && verifiedClaims === totalClaims;
   return (
@@ -109,14 +26,17 @@ function CoverageBadge({ coverage }: { coverage: EvidenceManifest["coverage"] })
   );
 }
 
-function GatesRow({ manifest }: { manifest: EvidenceManifest }) {
+export function GatesRow({ manifest }: { manifest: EvidenceManifest }) {
+  // gates 是 oc-cite check 回填的;手工/旧 manifest 可能缺 —— 缺则不渲染闸门行(不崩)。
   const g = manifest.gates;
+  if (!g?.quoteFirst || !g.claimBound || !g.identifier || !g.retraction) return null;
   const items: { label: string; passed: boolean }[] = [
     { label: "quote 接地", passed: g.quoteFirst.passed },
     { label: "claim 绑定", passed: g.claimBound.passed },
     { label: "identifier", passed: g.identifier.passed },
     { label: "撤稿过滤", passed: g.retraction.passed },
   ];
+  if (g.minicheck) items.push({ label: "语义蕴含", passed: g.minicheck.passed });
   return (
     <div className="flex flex-wrap gap-1.5">
       {items.map((it) => (
@@ -137,8 +57,8 @@ function GatesRow({ manifest }: { manifest: EvidenceManifest }) {
 
 // ── claim 列表 + EvidencePopover(内联展开) ─────────────────────────
 
-function ClaimList({ manifest }: { manifest: EvidenceManifest }) {
-  // 每渲染重算(不 useMemo):reducer 就地 mutate 下 manifest 引用稳定,useMemo 会 stale。
+export function ClaimList({ manifest }: { manifest: EvidenceManifest }) {
+  // 每渲染重算(不 useMemo):调用方可能就地 mutate,useMemo 会 stale。
   // 引用顺序编号:sourceId → [N](仅 verified claim 的支撑来源参与)。
   const sourceById = new Map(manifest.sources.map((s) => [s.id, s]));
   const quoteById = new Map(manifest.quotes.map((q) => [q.id, q]));
@@ -255,7 +175,7 @@ function EvidenceItem({ quote, source }: { quote: QuoteHandle; source?: SourceRe
 
 // ── 文献库面板 ────────────────────────────────────────────────────────
 
-function LiteratureLibraryPanel({ sources }: { sources: SourceRecord[] }) {
+export function LiteratureLibraryPanel({ sources }: { sources: SourceRecord[] }) {
   const [copied, setCopied] = useState<string>("");
   const copy = async (style: "gb-t-7714-2015" | "bibtex") => {
     try {

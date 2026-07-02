@@ -16,7 +16,7 @@ function mk(role: ChatMessage["role"], extra: Partial<ChatMessage> = {}): ChatMe
 const CTX = { isLast: true, sending: false };
 
 describe("messageKind 角色分派", () => {
-  test("九类 role 各自映射", () => {
+  test("八类 role 各自映射", () => {
     for (const r of [
       "user",
       "assistant",
@@ -26,7 +26,6 @@ describe("messageKind 角色分派", () => {
       "plan",
       "permission",
       "delegate-progress",
-      "research-report",
       "system",
     ] as const) {
       expect(messageKind({ role: r })).toBe(r);
@@ -88,33 +87,6 @@ describe("messageSignature 流式防闪签名", () => {
   test("usage.traceId / costCredits 到达 → assistant 签名变化（meta 行）", () => {
     const a = mk("assistant", { text: "x" });
     const b = mk("assistant", { text: "x", usage: { traceId: "t1", costCredits: "120" } });
-    expect(messageSignature(a, CTX)).not.toBe(messageSignature(b, CTX));
-  });
-});
-
-describe("research-report 签名", () => {
-  const baseManifest = {
-    sources: [],
-    quotes: [],
-    claims: [],
-    coverage: { verifiedClaims: 1, totalClaims: 2 },
-    gates: {
-      quoteFirst: { passed: true, checked: 0, failed: 0 },
-      claimBound: { passed: true, checked: 0, failed: 0 },
-      identifier: { passed: true, checked: 0, failed: 0 },
-      retraction: { passed: true, checked: 0, failed: 0 },
-    },
-  };
-  test("coverage 变化 → 签名变化(就地 mutate 防漏渲)", () => {
-    const a = mk("research-report", { _researchManifest: { ...baseManifest } });
-    const b = mk("research-report", {
-      _researchManifest: { ...baseManifest, coverage: { verifiedClaims: 2, totalClaims: 2 } },
-    });
-    expect(messageSignature(a, CTX)).not.toBe(messageSignature(b, CTX));
-  });
-  test("文献库条数变化 → 签名变化", () => {
-    const a = mk("research-report", { _researchLibrary: [] });
-    const b = mk("research-report", { _researchLibrary: [{ id: "s1", title: "T", authors: [] }] });
     expect(messageSignature(a, CTX)).not.toBe(messageSignature(b, CTX));
   });
 });
