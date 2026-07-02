@@ -16,6 +16,7 @@ import type {
   SkillSummary,
   MarketplaceDetail,
   MarketplaceInstalled,
+  MarketplaceAgentPublishInput,
   MarketplaceMyAgent,
   MarketplaceMyPublish,
   MarketplacePending,
@@ -1286,6 +1287,22 @@ export const api = {
     jsonOrThrow<MarketplacePublishResult>(
       callWithRefresh(a, (t) =>
         fetch("/api/marketplace/publish", {
+          method: "POST",
+          credentials: "include",
+          headers: bearerHeaders(t, true),
+          body: JSON.stringify(input),
+        }),
+      ),
+    ),
+
+  /**
+   * 发布智能体（POST /api/marketplace/agent/publish）。manifest 走后端严格白名单
+   * 校验(模型∈公开目录/工具集∈vetted/skillDeps 须已上架),422 带 errors/riskFlags。
+   */
+  publishMarketplaceAgent: (a: AuthSession, input: MarketplaceAgentPublishInput) =>
+    jsonOrThrow<MarketplacePublishResult>(
+      callWithRefresh(a, (t) =>
+        fetch("/api/marketplace/agent/publish", {
           method: "POST",
           credentials: "include",
           headers: bearerHeaders(t, true),

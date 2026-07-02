@@ -712,6 +712,34 @@ export async function listActiveInstalledAgents(userId: number): Promise<Install
 }
 
 /**
+ * 平台预设 agent 的 current approved manifest(与 listActiveInstalledAgents 同形,
+ * 供 my-agents 与容器 sync 合并)。预设不 pin 版本 —— 恒取 listing 当前上架版本;
+ * revoke / 无 approved 版本的 slug 自动缺席(kill-switch 优先于预设)。
+ */
+export async function listPlatformPresetAgents(slugs: readonly string[]): Promise<InstalledAgent[]> {
+  if (slugs.length === 0 || !marketplaceAgentsEnabled()) return []
+  const r = await query<{
+    slug: string
+    version: string
+    raw_artifact: string
+    artifact_hash: string
+  }>(
+    `SELECT l.slug, v.version, v.raw_artifact, v.artifact_hash
+       FROM marketplace_skill_listings l
+       JOIN marketplace_skill_versions v ON v.id = l.current_approved_version_id
+      WHERE l.slug = ANY($1::text[]) AND l.state = 'active' AND l.kind = 'agent'
+            AND v.status = 'approved' AND v.raw_artifact IS NOT NULL`,
+    [slugs],
+  )
+  return r.rows.map((x) => ({
+    slug: x.slug,
+    version: x.version,
+    rawManifest: x.raw_artifact,
+    artifactHash: x.artifact_hash,
+  }))
+}
+
+/**
  * For a set of skill slugs, return the current approved version id of each that is
  * an active, approved SKILL listing. Used to (a) validate an agent's skillDeps all
  * resolve to approved skills, and (b) auto-install them with the agent.

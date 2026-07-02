@@ -20,7 +20,9 @@ import { type Logger, rootLogger } from '../logging/logger.js'
 import {
   listActiveInstalledAgents,
   listActiveInstalledArtifacts,
+  listPlatformPresetAgents,
 } from '../marketplace/marketplaceDb.js'
+import { platformPresetAgentSlugs } from '../marketplace/platformPresets.js'
 import { REQUEST_ID_HEADER, ensureRequestId, setSecurityHeaders } from './util.js'
 
 export const MARKETPLACE_SYNC_PATH = '/internal/v3/marketplace/sync'
@@ -72,10 +74,19 @@ export function makeMarketplaceSyncHandler(deps: MarketplaceSyncDeps): Marketpla
     }
 
     try {
-      const [skills, agents] = await Promise.all([
+      // agents = 平台预设(current approved,evergreen)∪ 用户已装;同 slug 预设优先。
+      // 与 my-agents 的合并规则一致 —— 预设对所有用户容器恒下发,无需安装。
+      const presetSlugs = await platformPresetAgentSlugs()
+      const [skills, installedAgents, presetAgents] = await Promise.all([
         listActiveInstalledArtifacts(identity.userId),
         listActiveInstalledAgents(identity.userId),
+        listPlatformPresetAgents(presetSlugs),
       ])
+      const presetSet = new Set(presetAgents.map((p) => p.slug))
+      const agents = [
+        ...presetAgents,
+        ...installedAgents.filter((a) => !presetSet.has(a.slug)),
+      ]
       sendJson(res, 200, { skills, agents }, requestId)
     } catch (err) {
       log

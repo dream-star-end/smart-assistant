@@ -6,6 +6,7 @@ import type {
   AuthSession,
   MarketplaceMyPublish,
   MarketplaceRiskFlag,
+  PublicModel,
   SkillSummary,
 } from "../../lib/types";
 import { cn } from "../../lib/utils";
@@ -25,12 +26,72 @@ function Field({ label, children }: { label: string; children: ReactNode }) {
 const SLUG_RE = /^[a-z0-9][a-z0-9-]{1,63}$/;
 const VERSION_RE = /^\d+\.\d+\.\d+$/;
 
+/** 能力工具集(与后端 VETTED_AGENT_TOOLSETS/详情页 TOOLSET_LABEL 对齐)。core 恒选。 */
+const TOOLSET_OPTIONS: { value: string; label: string; hint: string; locked?: boolean }[] = [
+  { value: "core", label: "核心", hint: "文件/终端/基础工具(必选)", locked: true },
+  { value: "browser", label: "浏览器", hint: "操作真实浏览器" },
+  { value: "research", label: "研究检索", hint: "文献检索与引用" },
+  { value: "web_context", label: "网页提取", hint: "抓取网页/文档" },
+];
+
+/** 发布成功后的通用完成态。 */
+function DoneScreen({ onAgain }: { onAgain: () => void }) {
+  return (
+    <div className="flex flex-col items-center gap-3 px-6 py-16 text-center">
+      <CheckCircle2 size={32} className="text-success" />
+      <p className="text-[14px] font-medium text-fg">已提交，等待平台审核</p>
+      <p className="max-w-sm text-[12.5px] text-muted">
+        审核通过后将上架并对其他用户可见。审核进度可随时回到本页「我的发布」查看。
+      </p>
+      <Button variant="secondary" size="sm" onClick={onAgain}>
+        继续发布
+      </Button>
+    </div>
+  );
+}
+
 /**
- * 发布：从「我的技能」一键导入或手填,提交进入平台审核队列(pending)。
- * 被静态扫描拦截时把命中翻译成可操作的中文修正提示。顶部「我的发布」闭合
- * 反馈环:提交后能看到 审核中/已上架/未通过+理由,不再石沉大海。
+ * 发布：技能(从「我的技能」导入或手填)/ 智能体(模型+能力+人设+依赖技能)双表单,
+ * 提交进入平台审核队列(pending)。顶部「我的发布」闭合反馈环。被静态扫描/manifest
+ * 校验拦截时把命中翻译成可操作的中文修正提示。
  */
 export function PublishPanel({ auth }: { auth: AuthSession }) {
+  const [kind, setKind] = useState<"skill" | "agent">("skill");
+  const [publishReload, setPublishReload] = useState(0);
+  const bump = () => setPublishReload((n) => n + 1);
+
+  return (
+    <div className="flex flex-col gap-4 px-4 py-4">
+      <MyPublishes auth={auth} reload={publishReload} />
+
+      <div className="flex gap-1">
+        {(["skill", "agent"] as const).map((k) => (
+          <button
+            type="button"
+            key={k}
+            onClick={() => setKind(k)}
+            className={cn(
+              "rounded-full px-3 py-1 text-[12.5px] font-medium outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring",
+              kind === k ? "bg-accent-soft text-accent" : "text-muted hover:bg-hover hover:text-fg",
+            )}
+          >
+            {k === "skill" ? "发布技能" : "发布智能体"}
+          </button>
+        ))}
+      </div>
+
+      {kind === "skill" ? (
+        <SkillPublishForm auth={auth} onPublished={bump} />
+      ) : (
+        <AgentPublishForm auth={auth} onPublished={bump} />
+      )}
+    </div>
+  );
+}
+
+// ── 技能发布 ────────────────────────────────────────────────────────────────
+
+function SkillPublishForm({ auth, onPublished }: { auth: AuthSession; onPublished: () => void }) {
   const [mySkills, setMySkills] = useState<SkillSummary[]>([]);
   const [slug, setSlug] = useState("");
   // 用户手动改过 slug 后停止跟随名称联动。
@@ -45,7 +106,6 @@ export function PublishPanel({ auth }: { auth: AuthSession }) {
   const [err, setErr] = useState<string | null>(null);
   const [flags, setFlags] = useState<MarketplaceRiskFlag[]>([]);
   const [ok, setOk] = useState(false);
-  const [publishReload, setPublishReload] = useState(0);
 
   useEffect(() => {
     let alive = true;
@@ -91,7 +151,6 @@ export function PublishPanel({ auth }: { auth: AuthSession }) {
     setSubmitting(true);
     setErr(null);
     setFlags([]);
-    setOk(false);
     try {
       await api.publishMarketplace(auth, {
         slug,
@@ -105,7 +164,7 @@ export function PublishPanel({ auth }: { auth: AuthSession }) {
           .filter(Boolean),
       });
       setOk(true);
-      setPublishReload((n) => n + 1);
+      onPublished();
     } catch (e) {
       if (e instanceof ApiError && e.status === 422) {
         const rf = (e.body as { riskFlags?: MarketplaceRiskFlag[] })?.riskFlags ?? [];
@@ -121,38 +180,24 @@ export function PublishPanel({ auth }: { auth: AuthSession }) {
 
   const friendly = friendlyRiskFlags(flags);
 
-  if (ok) {
+  if (ok)
     return (
-      <div className="flex flex-col items-center gap-3 px-6 py-16 text-center">
-        <CheckCircle2 size={32} className="text-success" />
-        <p className="text-[14px] font-medium text-fg">已提交，等待平台审核</p>
-        <p className="max-w-sm text-[12.5px] text-muted">
-          审核通过后将上架并对其他用户可见。审核进度可随时回到本页「我的发布」查看。
-        </p>
-        <Button
-          variant="secondary"
-          size="sm"
-          onClick={() => {
-            setOk(false);
-            setSlug("");
-            setSlugTouched(false);
-            setName("");
-            setDescription("");
-            setTags("");
-            setBody("");
-            setVersion("1.0.0");
-          }}
-        >
-          继续发布
-        </Button>
-      </div>
+      <DoneScreen
+        onAgain={() => {
+          setOk(false);
+          setSlug("");
+          setSlugTouched(false);
+          setName("");
+          setDescription("");
+          setTags("");
+          setBody("");
+          setVersion("1.0.0");
+        }}
+      />
     );
-  }
 
   return (
-    <div className="flex flex-col gap-4 px-4 py-4">
-      <MyPublishes auth={auth} reload={publishReload} />
-
+    <div className="flex flex-col gap-4">
       {mySkills.length > 0 && (
         <div>
           <div className="mb-1.5 text-[12px] font-medium text-muted">从我的技能导入</div>
@@ -247,6 +292,279 @@ export function PublishPanel({ auth }: { auth: AuthSession }) {
     </div>
   );
 }
+
+// ── 智能体发布 ──────────────────────────────────────────────────────────────
+
+function AgentPublishForm({ auth, onPublished }: { auth: AuthSession; onPublished: () => void }) {
+  const [models, setModels] = useState<PublicModel[]>([]);
+  const [name, setName] = useState("");
+  const [slug, setSlug] = useState("");
+  const [slugTouched, setSlugTouched] = useState(false);
+  const [version, setVersion] = useState("1.0.0");
+  const [tags, setTags] = useState("");
+  const [description, setDescription] = useState("");
+  const [avatarEmoji, setAvatarEmoji] = useState("🤖");
+  const [model, setModel] = useState("");
+  const [toolsets, setToolsets] = useState<string[]>(["core"]);
+  const [skillDeps, setSkillDeps] = useState("");
+  const [persona, setPersona] = useState("");
+
+  const [submitting, setSubmitting] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const [manifestErrors, setManifestErrors] = useState<string[]>([]);
+  const [flags, setFlags] = useState<MarketplaceRiskFlag[]>([]);
+  const [ok, setOk] = useState(false);
+
+  useEffect(() => {
+    let alive = true;
+    api
+      .getPublicModels(auth)
+      .then((ms) => {
+        if (!alive) return;
+        setModels(ms);
+        setModel((cur) => cur || ms[0]?.id || "");
+      })
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
+  }, [auth]);
+
+  const toggleToolset = (v: string) =>
+    setToolsets((ts) => (ts.includes(v) ? ts.filter((x) => x !== v) : [...ts, v]));
+
+  const validate = (): string | null => {
+    if (!name.trim()) return "请填写智能体名称";
+    if (!SLUG_RE.test(slug)) return "标识(slug)须为小写字母/数字/连字符，2–64 位";
+    if (!VERSION_RE.test(version)) return "版本号须为 N.N.N，例如 1.0.0";
+    if (!description.trim()) return "请填写一句话描述";
+    if (!model) return "请选择模型";
+    if (toolsets.length === 0) return "请至少选择一个能力工具集";
+    if (!persona.trim()) return "请填写人设(它决定智能体的行为方式)";
+    const badDep = skillDeps
+      .split(",")
+      .map((t) => t.trim())
+      .filter(Boolean)
+      .find((d) => !SLUG_RE.test(d));
+    if (badDep) return `依赖技能 "${badDep}" 不是合法的市场 slug`;
+    return null;
+  };
+
+  const submit = async () => {
+    const v = validate();
+    if (v) {
+      setErr(v);
+      return;
+    }
+    setSubmitting(true);
+    setErr(null);
+    setManifestErrors([]);
+    setFlags([]);
+    try {
+      await api.publishMarketplaceAgent(auth, {
+        slug,
+        version,
+        name: name.trim(),
+        description: description.trim(),
+        tags: tags
+          .split(",")
+          .map((t) => t.trim())
+          .filter(Boolean),
+        model,
+        toolsets,
+        skillDeps: skillDeps
+          .split(",")
+          .map((t) => t.trim())
+          .filter(Boolean),
+        persona,
+        ...(avatarEmoji.trim() ? { avatarEmoji: avatarEmoji.trim() } : {}),
+      });
+      setOk(true);
+      onPublished();
+    } catch (e) {
+      if (e instanceof ApiError && e.status === 422) {
+        const b = e.body as { errors?: string[]; riskFlags?: MarketplaceRiskFlag[] };
+        if (b?.errors?.length) {
+          setManifestErrors(b.errors);
+          setErr("智能体配置不合法，请按下面的提示修正。");
+        } else if (b?.riskFlags?.length) {
+          setFlags(b.riskFlags);
+          setErr("人设被安全扫描拦截，请修正后重试。");
+        } else {
+          setErr(e.message);
+        }
+      } else {
+        setErr(e instanceof ApiError ? e.message : (e as Error).message || "发布失败");
+      }
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const friendly = friendlyRiskFlags(flags);
+
+  if (ok)
+    return (
+      <DoneScreen
+        onAgain={() => {
+          setOk(false);
+          setName("");
+          setSlug("");
+          setSlugTouched(false);
+          setVersion("1.0.0");
+          setTags("");
+          setDescription("");
+          setPersona("");
+          setSkillDeps("");
+        }}
+      />
+    );
+
+  return (
+    <div className="flex flex-col gap-4">
+      <Alert tone="info">
+        智能体 = 模型 + 能力工具集 + 人设(+ 可选依赖技能)。发布后经平台审核上架，其他用户
+        安装即可在智能体选择器中使用。
+      </Alert>
+
+      {err && <Alert tone="danger">{err}</Alert>}
+      {manifestErrors.length > 0 && (
+        <Alert tone="danger" title="配置校验未通过">
+          <ul className="list-disc pl-4">
+            {manifestErrors.map((m) => (
+              <li key={m}>{m}</li>
+            ))}
+          </ul>
+        </Alert>
+      )}
+      {friendly.length > 0 && (
+        <div className="flex flex-col gap-1.5">
+          {friendly.map((f) => (
+            <Alert key={f.label} tone={f.tone}>
+              <span className="font-medium">{f.label}：</span>
+              {f.message}
+              {f.hint && <span className="mt-0.5 block text-muted">{f.hint}</span>}
+            </Alert>
+          ))}
+        </div>
+      )}
+
+      <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+        <Field label="名称">
+          <Input
+            value={name}
+            onChange={(e) => {
+              setName(e.target.value);
+              if (!slugTouched) setSlug(suggestSlug(e.target.value));
+            }}
+            placeholder="例：法律顾问"
+          />
+        </Field>
+        <Field label="标识 slug">
+          <Input
+            value={slug}
+            onChange={(e) => {
+              setSlug(e.target.value);
+              setSlugTouched(true);
+            }}
+            placeholder="legal-advisor"
+          />
+        </Field>
+        <Field label="版本号">
+          <Input value={version} onChange={(e) => setVersion(e.target.value)} placeholder="1.0.0" />
+        </Field>
+        <Field label="头像 Emoji">
+          <Input
+            value={avatarEmoji}
+            onChange={(e) => setAvatarEmoji(e.target.value)}
+            placeholder="🤖"
+          />
+        </Field>
+        <Field label="模型">
+          <select
+            value={model}
+            onChange={(e) => setModel(e.target.value)}
+            className="h-10 w-full rounded-lg border border-border bg-surface px-3 text-sm text-fg outline-none transition-colors focus:border-accent focus:ring-2 focus:ring-ring"
+          >
+            {models.map((m) => (
+              <option key={m.id} value={m.id}>
+                {typeof m.displayName === "string" && m.displayName ? m.displayName : m.id}
+              </option>
+            ))}
+          </select>
+        </Field>
+        <Field label="标签（逗号分隔）">
+          <Input value={tags} onChange={(e) => setTags(e.target.value)} placeholder="法律, 咨询" />
+        </Field>
+      </div>
+
+      <Field label="一句话描述">
+        <Input
+          value={description}
+          onChange={(e) => setDescription(e.target.value)}
+          placeholder="面向合同审阅与合规问答的法律顾问。"
+        />
+      </Field>
+
+      <div>
+        <div className="mb-1.5 text-[12px] font-medium text-muted">能力（工具集）</div>
+        <div className="flex flex-col gap-1.5 sm:flex-row sm:flex-wrap">
+          {TOOLSET_OPTIONS.map((t) => {
+            const checked = toolsets.includes(t.value);
+            return (
+              <label
+                key={t.value}
+                className={cn(
+                  "flex cursor-pointer items-center gap-2 rounded-lg border px-3 py-2 text-[12.5px] transition-colors",
+                  checked ? "border-accent/50 bg-accent-soft text-fg" : "border-border text-muted",
+                  t.locked && "cursor-not-allowed opacity-90",
+                )}
+              >
+                <input
+                  type="checkbox"
+                  checked={checked}
+                  disabled={t.locked}
+                  onChange={() => toggleToolset(t.value)}
+                  className="accent-[var(--accent,#6d5efc)]"
+                />
+                <span className="font-medium">{t.label}</span>
+                <span className="text-[11px] text-faint">{t.hint}</span>
+              </label>
+            );
+          })}
+        </div>
+      </div>
+
+      <Field label="依赖技能（市场技能 slug，逗号分隔，可空；须已上架）">
+        <Input
+          value={skillDeps}
+          onChange={(e) => setSkillDeps(e.target.value)}
+          placeholder="academic-translate, paper-summary"
+        />
+      </Field>
+
+      <Field label="人设（persona，决定智能体的行为方式与工作流）">
+        <Textarea
+          value={persona}
+          onChange={(e) => setPersona(e.target.value)}
+          rows={10}
+          placeholder={"你是……\n\n工作方式:\n1. ……\n2. ……\n\n纪律:\n- ……"}
+          className="font-mono text-[12.5px]"
+        />
+      </Field>
+
+      <div className="flex items-center justify-between">
+        <p className="text-[11.5px] text-faint">提交后进入平台审核，通过后才会上架。</p>
+        <Button variant="primary" onClick={submit} disabled={submitting}>
+          {submitting ? <Loader2 size={15} className="animate-spin" /> : <Upload size={15} />}
+          发布到市场
+        </Button>
+      </div>
+    </div>
+  );
+}
+
+// ── 我的发布 ────────────────────────────────────────────────────────────────
 
 const STATUS_META: Record<string, { label: string; tone: "warning" | "success" | "danger" }> = {
   pending: { label: "审核中", tone: "warning" },

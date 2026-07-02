@@ -9,9 +9,11 @@ const DELIM = "\n§\n";
 type Target = "memory" | "user";
 type Entry = { id: number; text: string };
 
-const DOCS: { key: Target; label: string; hint: string }[] = [
-  { key: "memory", label: "核心记忆", hint: "智能体长期记住的关键事实与偏好" },
-  { key: "user", label: "用户画像", hint: "关于你的背景信息，帮助智能体更懂你" },
+// 顺序有意:先共享的用户画像,后 per-agent 的核心记忆(与后端语义一致:
+// user → 用户级共享文件,memory → per-agent 文件,见 storage/memoryStore.ts)。
+const DOCS: { key: Target; label: string; hint: string; shared?: boolean }[] = [
+  { key: "user", label: "用户画像", hint: "关于你的背景信息 · 所有智能体共享", shared: true },
+  { key: "memory", label: "核心记忆", hint: "该智能体自己的观察与经验 · 按智能体独立保存" },
 ];
 
 function splitEntries(text: string): string[] {
@@ -26,10 +28,11 @@ function joinEntries(texts: string[]): string {
 }
 
 /**
- * 记忆中心：核心记忆（memory）+ 用户画像（user）。每个文档是 "\n§\n" 分隔的多条目，
- * 这里逐条卡片化编辑（增/删/改），保存时重新拼接为整段经容器代理写回
- * （GET/PUT /api/agents/:id/memory/:target）。记忆按 agent 维度 —— 面板顶部
- * 明示并可切换在看哪个智能体的记忆（默认当前对话 agent），杜绝「静默绑定」。
+ * 记忆中心：用户画像（user,**用户级共享** —— 换哪个智能体都认识你）+ 核心记忆
+ *（memory,**按智能体独立** —— 各智能体自己的观察互不串扰）。每个文档是 "\n§\n"
+ * 分隔的多条目,逐条卡片化编辑,保存时重新拼接为整段经容器代理写回
+ *（GET/PUT /api/agents/:id/memory/:target）。智能体切换器只作用于核心记忆
+ *（画像是共享文件,与所选智能体无关,不给切换器造成"画像也分身"的误导）。
  */
 export function MemoryPanel({
   auth,
@@ -47,31 +50,34 @@ export function MemoryPanel({
   const showPicker = agents.length > 1;
   return (
     <div className="flex flex-col">
-      <PanelHeader
-        title="记忆"
-        hint="这些内容会注入智能体的长期上下文，让它越用越懂你。记忆按智能体独立保存。"
-        action={
-          showPicker ? (
-            <label className="flex items-center gap-1.5 text-[12px] text-faint">
-              智能体
-              <select
-                value={effective}
-                onChange={(e) => setSelected(e.target.value)}
-                className="rounded-lg border border-border bg-surface px-2 py-1.5 text-[12.5px] text-fg outline-none transition-colors focus:border-accent focus:ring-2 focus:ring-ring"
-              >
-                {agents.map((a) => (
-                  <option key={a.id} value={a.id}>
-                    {a.name}
-                  </option>
-                ))}
-              </select>
-            </label>
-          ) : undefined
-        }
-      />
+      <PanelHeader title="记忆" hint="这些内容会注入智能体的长期上下文，让它越用越懂你。" />
       {DOCS.map((d) => (
         <div key={d.key} className="border-t border-border">
-          <MemoryDoc key={`${effective}:${d.key}`} auth={auth} agentId={effective} target={d.key} meta={d} />
+          <MemoryDoc
+            key={`${d.shared ? "shared" : effective}:${d.key}`}
+            auth={auth}
+            agentId={effective}
+            target={d.key}
+            meta={d}
+            picker={
+              !d.shared && showPicker ? (
+                <label className="flex items-center gap-1.5 text-[12px] text-faint">
+                  智能体
+                  <select
+                    value={effective}
+                    onChange={(e) => setSelected(e.target.value)}
+                    className="rounded-lg border border-border bg-surface px-2 py-1 text-[12.5px] text-fg outline-none transition-colors focus:border-accent focus:ring-2 focus:ring-ring"
+                  >
+                    {agents.map((a) => (
+                      <option key={a.id} value={a.id}>
+                        {a.name}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              ) : undefined
+            }
+          />
         </div>
       ))}
     </div>
@@ -83,11 +89,14 @@ function MemoryDoc({
   agentId,
   target,
   meta,
+  picker,
 }: {
   auth: AuthSession;
   agentId: string;
   target: Target;
   meta: { label: string; hint: string };
+  /** 核心记忆分区的智能体切换器(共享的用户画像不传)。 */
+  picker?: React.ReactNode;
 }) {
   const [entries, setEntries] = useState<Entry[]>([]);
   const [orig, setOrig] = useState("");
@@ -147,9 +156,12 @@ function MemoryDoc({
 
   return (
     <div className="px-5 py-4">
-      <div className="flex items-baseline justify-between gap-2">
+      <div className="flex flex-wrap items-center justify-between gap-x-2 gap-y-1">
         <span className="text-[13.5px] font-medium text-fg">{meta.label}</span>
-        <span className="text-[11.5px] text-faint">{meta.hint}</span>
+        <span className="flex items-center gap-2.5">
+          <span className="text-[11.5px] text-faint">{meta.hint}</span>
+          {picker}
+        </span>
       </div>
       {err && (
         <Alert tone="danger" className="mt-2 text-[12.5px]">

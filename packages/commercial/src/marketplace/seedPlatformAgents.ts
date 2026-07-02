@@ -360,6 +360,16 @@ export async function seedPlatformResearchAgents(
  * 能力(办公:渲染 CLI;编程:内置工具 + git/node/python),不依赖 research_config,故
  * **无条件** seed(仅受 marketplaceAgentsEnabled 的 v5 渠道门控约束)。
  */
+/** 平台预设 agent 的 slug 权威(与上面的 seed 定义同源)。预设 = 开箱即用:
+ *  my-agents 与容器 sync 无条件下发 current approved 版本,无需安装、不可卸载。
+ *  科研预设仍受 research_config 门控(关闭时科研能力 503,预设它只会坏)。 */
+export const PLATFORM_GENERAL_AGENT_SLUGS: readonly string[] = PLATFORM_GENERAL_AGENTS.map(
+  (a) => a.slug,
+)
+export const PLATFORM_RESEARCH_AGENT_SLUGS: readonly string[] = PLATFORM_RESEARCH_AGENTS.map(
+  (a) => a.slug,
+)
+
 export async function seedPlatformGeneralAgents(
   deps: SeedPlatformAgentsDeps,
 ): Promise<SeedPlatformAgentsResult> {

@@ -5,7 +5,7 @@ import { api } from '../lib/api'
 import type { AuthSession } from '../lib/types'
 import { cn } from '../lib/utils'
 import { AgentAvatar } from './AgentAvatar'
-import { Modal, Switch } from './ui'
+import { Badge, Modal, Switch } from './ui'
 
 /**
  * B-positioning agent picker: lists the user's agents from /api/marketplace/my-agents
@@ -66,7 +66,7 @@ export function AgentPicker({
       open={open}
       onOpenChange={(o) => !o && onClose()}
       title="选择智能体"
-      description="默认配备「全能助手」，更多专业智能体可从市场安装。"
+      description="全能助手与官方预设助手开箱即用，更多智能体可从市场安装。"
       className="max-w-2xl"
     >
       {loading && (
@@ -144,6 +144,7 @@ export function AgentPicker({
               <span className="min-w-0 flex-1">
                 <span className="flex items-center gap-1.5">
                   <span className="text-[14.5px] font-semibold text-fg">{a.name}</span>
+                  {a.preset && <Badge tone="accent">预设</Badge>}
                   {active && <Check size={14} className="text-accent" />}
                 </span>
                 <span className="mt-0.5 line-clamp-2 text-[12.5px] leading-snug text-muted">

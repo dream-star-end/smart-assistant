@@ -26,6 +26,8 @@ export type Agent = {
   category?: string
   starters?: string[]
   system?: string
+  /** 平台预设(编程/办公/科研):开箱即用、不显示卸载语义。 */
+  preset?: boolean
   /** marketplace provenance (B-positioning picker). */
   installed?: boolean
   isDefault?: boolean
@@ -207,6 +209,7 @@ export function agentFromApiRow(row: {
   avatarEmoji?: string | null
   installed?: boolean
   isDefault?: boolean
+  preset?: boolean
 }): Agent {
   if (row.id === 'main' || row.isDefault) return MAIN_AGENT
   return {
@@ -216,6 +219,7 @@ export function agentFromApiRow(row: {
     grad: 'from-violet-500 to-fuchsia-600',
     description: row.description ?? '',
     installed: row.installed,
+    preset: row.preset,
   }
 }
 

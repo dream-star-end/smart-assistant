@@ -28,18 +28,23 @@ import {
   listApprovedForSearch,
   marketplaceAgentsEnabled,
 } from './marketplaceDb.js'
+import { platformPresetAgentSlugs } from './platformPresets.js'
 
 const cache = makePgSkillEmbedCache()
 
-function toCard(c: ApprovedSearchRow): {
+function toCard(
+  c: ApprovedSearchRow,
+  presetSet: ReadonlySet<string>,
+): {
   slug: string
   kind: string
   name: string
   description: string
   tags: string[]
   installCount: number
+  preset?: boolean
 } {
-  // installCount 是加法字段(v3 vanilla UI 忽略);排序不动,热度排序收在 v5 前端。
+  // installCount/preset 是加法字段(v3 vanilla UI 忽略);排序不动,热度排序收在 v5 前端。
   return {
     slug: c.slug,
     kind: c.kind,
@@ -47,6 +52,7 @@ function toCard(c: ApprovedSearchRow): {
     description: c.description,
     tags: c.tags,
     installCount: c.installCount,
+    ...(presetSet.has(c.slug) ? { preset: true } : {}),
   }
 }
 
@@ -81,8 +87,12 @@ export async function handleMarketplaceSearch(
   }
 
   const catalog = await listApprovedForSearch(kind)
+  const presetSet = new Set(kind === 'agent' ? await platformPresetAgentSlugs() : [])
   if (catalog.length === 0 || !q) {
-    sendJson(res, 200, { results: catalog.slice(0, limit).map(toCard), method: 'all' })
+    sendJson(res, 200, {
+      results: catalog.slice(0, limit).map((c) => toCard(c, presetSet)),
+      method: 'all',
+    })
     return
   }
 
@@ -96,7 +106,7 @@ export async function handleMarketplaceSearch(
           s.tags.some((t) => t.toLowerCase().includes(ql)),
       )
       .slice(0, limit)
-      .map(toCard)
+      .map((c) => toCard(c, presetSet))
   }
 
   if (!isSkillEmbeddingAvailable()) {
@@ -146,7 +156,7 @@ export async function handleMarketplaceSearch(
       .sort((a, b) => b.score - a.score)
       .slice(0, limit)
     sendJson(res, 200, {
-      results: ranked.map((x) => ({ ...toCard(x.c), score: x.score })),
+      results: ranked.map((x) => ({ ...toCard(x.c, presetSet), score: x.score })),
       method: 'embed',
     })
   } catch {

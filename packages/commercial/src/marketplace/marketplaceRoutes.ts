@@ -23,6 +23,7 @@ import {
   listInstalled,
   listMyPublishes,
   listPendingVersions,
+  listPlatformPresetAgents,
   publishSkillVersion,
   recordUninstall,
   reviewVersion,
@@ -33,6 +34,7 @@ import {
   canonicalizeAgentManifest,
   validateAgentManifest,
 } from './agentManifest.js'
+import { platformPresetAgentSlugs } from './platformPresets.js'
 import { scanSkillArtifact } from './skillScanner.js'
 
 const SLUG_RE = /^[a-z0-9][a-z0-9-]{1,63}$/
@@ -290,8 +292,15 @@ export async function handleMarketplaceMyAgents(
   deps: { jwtSecret: string | Uint8Array },
 ): Promise<void> {
   const user = await requireAuth(req, deps.jwtSecret)
-  const installed = await listActiveInstalledAgents(uid(user))
-  const agents = installed.map((a) => {
+  // 预设(编程/办公/科研,current approved,evergreen)+ 用户已装;同 slug 预设优先
+  // (预设不 pin 版本,平台改版全员生效),与容器 sync 的合并规则一致。
+  const presetSlugs = await platformPresetAgentSlugs()
+  const [presets, installed] = await Promise.all([
+    listPlatformPresetAgents(presetSlugs),
+    listActiveInstalledAgents(uid(user)),
+  ])
+  const presetSet = new Set(presets.map((p) => p.slug))
+  const toRow = (a: { slug: string; version: string; rawManifest: string }, preset: boolean) => {
     let m: Record<string, unknown> = {}
     try {
       m = JSON.parse(a.rawManifest) as Record<string, unknown>
@@ -307,8 +316,13 @@ export async function handleMarketplaceMyAgents(
       model: (m.model as string) ?? null,
       version: a.version,
       installed: true,
+      ...(preset ? { preset: true } : {}),
     }
-  })
+  }
+  const agents = [
+    ...presets.map((p) => toRow(p, true)),
+    ...installed.filter((a) => !presetSet.has(a.slug)).map((a) => toRow(a, false)),
+  ]
   sendJson(res, 200, {
     agents: [
       {
@@ -393,7 +407,11 @@ export async function handleMarketplaceInstalled(
   deps: { jwtSecret: string | Uint8Array },
 ): Promise<void> {
   const user = await requireAuth(req, deps.jwtSecret)
-  sendJson(res, 200, { installed: await listInstalled(uid(user)) })
+  // 预设 slug 的历史安装行不展示:预设已平台化(恒在、evergreen、不可卸),
+  // 在「已安装」里露出只会引导出没有意义的卸载/更新操作。
+  const presetSet = new Set(await platformPresetAgentSlugs())
+  const rows = (await listInstalled(uid(user))).filter((r) => !presetSet.has(r.slug))
+  sendJson(res, 200, { installed: rows })
 }
 
 // ── GET /api/marketplace/my-publishes ──────────────────────────────────────
@@ -424,7 +442,9 @@ export async function handleMarketplaceDetail(
   // agent 类仅 v5 露出:v3 渠道上视同不存在(防止据 slug 取 detail→versionId 旁路)。
   if (detail.kind === 'agent' && !marketplaceAgentsEnabled())
     throw new HttpError(404, 'NOT_FOUND', 'skill 不存在或未上架')
-  sendJson(res, 200, { detail })
+  // 平台预设标记(加法字段):前端据此显示「开箱即用」而非安装按钮。
+  const preset = detail.kind === 'agent' && (await platformPresetAgentSlugs()).includes(slug)
+  sendJson(res, 200, { detail: preset ? { ...detail, preset: true } : detail })
 }
 
 // ── DELETE /api/marketplace/installed/:slug ────────────────────────────────
@@ -436,6 +456,9 @@ export async function handleMarketplaceUninstall(
   const user = await requireAuth(req, deps.jwtSecret)
   const slug = slugFromPrefix(req, '/api/marketplace/installed/')
   if (!SLUG_RE.test(slug)) throw new HttpError(400, 'BAD_SLUG', 'invalid slug')
+  // 平台预设与全能助手同级,不可卸载(sync 侧也会恒下发,卸了只会状态漂移)。
+  if ((await platformPresetAgentSlugs()).includes(slug))
+    throw new HttpError(400, 'PRESET_AGENT', '平台预设智能体不可卸载')
   // P2.2 will also remove the on-disk hub copy; this records the soft-uninstall.
   const ok = await recordUninstall(uid(user), slug)
   sendJson(res, 200, { ok })

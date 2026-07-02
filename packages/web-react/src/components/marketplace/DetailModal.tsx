@@ -129,8 +129,10 @@ export function DetailModal({
   }
 
   const warns = friendlyRiskFlags(detail?.riskFlags)
+  const isPreset = !!detail?.preset
   // detail.versionId 是当前上架版本(最新权威);已安装且 pin 的不是它 → 可更新。
-  const canUpdate = !!installed && !!detail && installed.versionId !== detail.versionId
+  // 预设不走安装/更新语义(恒为最新上架版本,开箱即用)。
+  const canUpdate = !isPreset && !!installed && !!detail && installed.versionId !== detail.versionId
   const isAgent = detail?.kind === 'agent'
 
   return (
@@ -145,7 +147,11 @@ export function DetailModal({
             <Button variant="ghost" onClick={onClose}>
               关闭
             </Button>
-            {done ? (
+            {isPreset ? (
+              <Badge tone="success" className="self-center">
+                <ShieldCheck size={13} /> 平台预设 · 开箱即用
+              </Badge>
+            ) : done ? (
               <Badge tone="success" className="self-center">
                 <ShieldCheck size={13} /> {canUpdate ? '更新成功' : '安装成功'}
               </Badge>
@@ -190,6 +196,11 @@ export function DetailModal({
               {isAgent
                 ? '可在输入框上方的智能体选择器中切换使用。'
                 : '将在你的下一次会话中对 AI 可用。'}
+            </Alert>
+          )}
+          {isPreset && (
+            <Alert tone="info" title="平台预设智能体">
+              无需安装,所有用户开箱即用;在输入框上方的智能体选择器中直接切换。
             </Alert>
           )}
           {!done && canUpdate && installed && (

@@ -130,7 +130,7 @@ export function BrowsePanel({
       ) : (
         <ul className="grid grid-cols-1 gap-2.5 px-4 pb-5 sm:grid-cols-2">
           {cards?.map((c) => {
-            const inst = installed.get(c.slug);
+            const inst = c.preset ? undefined : installed.get(c.slug);
             const canUpdate = inst ? updateAvailable(inst) : false;
             const users = formatInstallCount(c.installCount);
             return (
@@ -161,6 +161,7 @@ export function BrowsePanel({
                     </div>
                   </div>
                   <div className="flex flex-wrap items-center gap-1">
+                    {c.preset && <Badge tone="success">预设 · 开箱即用</Badge>}
                     {canUpdate && <Badge tone="accent">可更新</Badge>}
                     {c.tags.slice(0, 4).map((t) => (
                       <Badge key={t} tone="neutral">

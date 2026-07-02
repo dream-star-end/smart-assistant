@@ -514,6 +514,8 @@ export type MarketplaceCard = {
   score?: number;
   /** 当前活跃安装数（≈使用人数；旧后端可能不带）。 */
   installCount?: number;
+  /** 平台预设 agent(开箱即用,无需安装)。 */
+  preset?: boolean;
 };
 
 /** 市场检索响应。method=all 为空查询返全部目录。 */
@@ -545,6 +547,8 @@ export type MarketplaceDetail = {
   manifest?: unknown;
   riskFlags: MarketplaceRiskFlag[];
   installCount: number;
+  /** 平台预设 agent(开箱即用,无需安装)。 */
+  preset?: boolean;
 };
 
 /** 已安装条目（GET /api/marketplace/installed 的 installed 项）。 */
@@ -611,6 +615,24 @@ export type MarketplaceMyAgent = {
   version?: string | null;
   installed: boolean;
   isDefault?: boolean;
+  /** 平台预设(编程/办公/科研):开箱即用、不可卸载、恒为最新上架版本。 */
+  preset?: boolean;
+};
+
+/** 智能体发布入参（POST /api/marketplace/agent/publish；manifest 白名单字段）。 */
+export type MarketplaceAgentPublishInput = {
+  slug: string;
+  version: string;
+  name: string;
+  description: string;
+  tags: string[];
+  model: string;
+  toolsets: string[];
+  skillDeps: string[];
+  persona: string;
+  displayName?: string;
+  avatarEmoji?: string;
+  greeting?: string;
 };
 
 /** 发布入参（POST /api/marketplace/publish）。 */
