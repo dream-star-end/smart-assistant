@@ -33,6 +33,7 @@ export function Composer({
   placeholder = "给 OpenClaude 发消息…",
   onUpload,
   getVoiceToken,
+  prefill,
 }: {
   /** 发送：text + 可选已上传媒体（图片/文件等）。 */
   onSend: (text: string, media?: MediaRef[]) => void;
@@ -45,6 +46,8 @@ export function Composer({
   onUpload?: (file: File) => Promise<MediaRef>;
   /** 语音输入取 token（demo / 未登录省略 → 麦克风禁用）。 */
   getVoiceToken?: () => string | null;
+  /** 外部预填(如「在对话中创建」模板):nonce 变化即覆盖输入框并聚焦。 */
+  prefill?: { text: string; nonce: number } | null;
 }) {
   const [value, setValue] = useState("");
   const [attachments, setAttachments] = useState<Attach[]>([]);
@@ -53,6 +56,15 @@ export function Composer({
   const ref = useRef<HTMLTextAreaElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
   const idRef = useRef(0);
+
+  // 预填:nonce 变化 → 覆盖当前输入并聚焦(仅在用户显式点了「在对话中创建」时触发,
+  // 不会与正常输入竞争;文本可改可删,发送权始终在用户)。
+  useEffect(() => {
+    if (!prefill) return;
+    setValue(prefill.text);
+    requestAnimationFrame(() => ref.current?.focus());
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [prefill?.nonce]);
 
   const onVoiceText = useCallback((text: string) => {
     setVoiceMsg(null);

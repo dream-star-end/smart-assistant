@@ -23,6 +23,7 @@ export function MarketplaceCenter({
   auth,
   isAdmin,
   initialBrowseKind = 'skill',
+  onCreateInChat,
   onTabChange,
   onClose,
 }: {
@@ -32,6 +33,8 @@ export function MarketplaceCenter({
   isAdmin: boolean
   /** Which category the 发现 tab opens to (e.g. 'agent' when opened via「从市场添加智能体」). */
   initialBrowseKind?: MarketplaceKind
+  /** 「在对话中创建」:关闭市场 → 新会话 → 输入框预填引导模板。 */
+  onCreateInChat?: (kind: MarketplaceKind) => void
   onTabChange: (t: MarketplaceTab) => void
   onClose: () => void
 }) {
@@ -115,7 +118,9 @@ export function MarketplaceCenter({
                 {safeTab === 'installed' && (
                   <InstalledPanel auth={auth} onGoBrowse={() => onTabChange('browse')} />
                 )}
-                {safeTab === 'publish' && <PublishPanel auth={auth} />}
+                {safeTab === 'publish' && (
+                  <PublishPanel auth={auth} onCreateInChat={onCreateInChat} />
+                )}
                 {safeTab === 'review' && isAdmin && <ReviewPanel auth={auth} />}
               </>
             )}

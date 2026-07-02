@@ -4,10 +4,10 @@
  *
  * v5 无 codex —— 不含 `_renderCodexItem` 系列。
  */
-import { FileText } from "lucide-react";
+import { Sparkles, FileText } from "lucide-react";
 import type { ReactNode } from "react";
 import { cn } from "../../lib/utils";
-import { Button } from "../ui";
+import { Badge, Button } from "../ui";
 import { useToolCardActions } from "./context";
 import { asArr, asStr, clampStr, formatValue, isSafeHttpUrl, shortPath, type ToolLike } from "./format";
 import { parseMcpName } from "./meta";
@@ -366,8 +366,69 @@ function VisionBody({ input, tool }: BodyProps) {
   );
 }
 
+/** skill_save / skill_propose 的富卡:技能创建流程的核心动作,按技能卡样式呈现
+ *(名称/描述/标签/正文折叠),让「对话中创建技能」所见即所得,而非一坨 KV。 */
+function SkillWriteCard({ op, input, tool }: BodyProps & { op: string }) {
+  const name = typeof input?.name === "string" ? input.name : "";
+  const description = typeof input?.description === "string" ? input.description : "";
+  const tags = Array.isArray(input?.tags) ? (input?.tags as unknown[]).filter((t): t is string => typeof t === "string") : [];
+  const body = typeof input?.body === "string" ? input.body : "";
+  const rationale = typeof input?.rationale === "string" ? input.rationale : "";
+  const done = !!tool._completed && !tool.error;
+  return (
+    <div className="flex flex-col gap-2">
+      <div className="flex items-start gap-2.5 rounded-lg border border-border bg-elevated p-3">
+        <span className="flex size-8 shrink-0 items-center justify-center rounded-lg bg-accent-soft text-accent">
+          <Sparkles size={15} />
+        </span>
+        <div className="min-w-0 flex-1">
+          <div className="flex flex-wrap items-center gap-1.5">
+            <span className="truncate font-mono text-[13px] font-semibold text-fg">{name || "(未命名)"}</span>
+            <Badge tone="accent">{op === "skill_propose" ? "训练草稿" : "技能"}</Badge>
+            {done && <Badge tone="success">{op === "skill_propose" ? "已暂存" : "已保存"}</Badge>}
+          </div>
+          {description && <p className="mt-0.5 text-[12px] leading-snug text-muted">{description}</p>}
+          {tags.length > 0 && (
+            <div className="mt-1 flex flex-wrap gap-1">
+              {tags.slice(0, 6).map((t) => (
+                <Badge key={t} tone="neutral">
+                  {t}
+                </Badge>
+              ))}
+            </div>
+          )}
+          {rationale && <p className="mt-1 text-[11.5px] text-faint">理由:{rationale}</p>}
+        </div>
+      </div>
+      {body && (
+        <details>
+          <summary className="cursor-pointer text-[11.5px] text-accent hover:underline">查看技能正文</summary>
+          <pre className="mt-1 max-h-64 overflow-auto whitespace-pre-wrap break-words rounded-md bg-code px-3 py-2 font-mono text-[11.5px] leading-relaxed text-fg">
+            {body}
+          </pre>
+        </details>
+      )}
+      <OutputBlock output={tool.output} />
+    </div>
+  );
+}
+
 function MemoryBody({ op, input, tool }: BodyProps & { op: string }) {
   const actions = useToolCardActions();
+  if (op === "skill_save" || op === "skill_propose") {
+    return (
+      <>
+        <SkillWriteCard op={op} input={input} tool={tool} />
+        {actions.onOpenSkills && (
+          <div className="mt-2 flex flex-wrap gap-2">
+            <Button variant="ghost" size="sm" onClick={actions.onOpenSkills}>
+              打开技能库
+            </Button>
+          </div>
+        )}
+      </>
+    );
+  }
   let kv: ReactNode = null;
   if (input) {
     if (op === "memory") {

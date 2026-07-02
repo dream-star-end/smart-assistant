@@ -11,6 +11,7 @@ import { GithubRepoModal } from "./components/github/GithubRepoModal";
 import { RepoStatusBanner } from "./components/github/RepoStatusBanner";
 import { InboxDialog } from "./components/InboxDialog";
 import { Landing } from "./components/Landing";
+import { CHAT_CREATE_TEMPLATES } from "./lib/chatCreateTemplates";
 import { ManageCenter, type ManageTab } from "./components/ManageCenter";
 import {
   MarketplaceCenter,
@@ -116,6 +117,8 @@ export function App() {
   const [marketplaceOpen, setMarketplaceOpen] = useState(bootPanel === "market");
   const [marketplaceTab, setMarketplaceTab] = useState<MarketplaceTab>("browse");
   const [marketplaceBrowseKind, setMarketplaceBrowseKind] = useState<MarketplaceKind>("skill");
+  // 「在对话中创建」技能/智能体:关市场 → 新会话 → Composer 预填引导模板(用户改后发送)。
+  const [composerPrefill, setComposerPrefill] = useState<{ text: string; nonce: number } | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const stopRef = useRef(false);
   // 稳定句柄：让早于 useChatSocket 声明的 send/regenerate 回调引用 WS 引擎，避免
@@ -889,6 +892,7 @@ export function App() {
             placeholder={`和「${agent.name}」对话…`}
             onUpload={demo ? undefined : uploadMedia}
             getVoiceToken={demo ? undefined : () => authRef.current.getToken()}
+            prefill={composerPrefill}
           />
         </div>
       </main>
@@ -964,6 +968,11 @@ export function App() {
         auth={auth}
         isAdmin={user?.role === "admin"}
         initialBrowseKind={marketplaceBrowseKind}
+        onCreateInChat={(kind) => {
+          setMarketplaceOpen(false);
+          newSession();
+          setComposerPrefill({ text: CHAT_CREATE_TEMPLATES[kind], nonce: Date.now() });
+        }}
         onTabChange={setMarketplaceTab}
         onClose={() => {
           setMarketplaceOpen(false);

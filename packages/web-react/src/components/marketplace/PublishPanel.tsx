@@ -1,4 +1,4 @@
-import { CheckCircle2, ChevronRight, Loader2, Upload } from "lucide-react";
+import { CheckCircle2, ChevronRight, Loader2, Sparkles, Upload } from "lucide-react";
 import { type ReactNode, useEffect, useState } from "react";
 import { api, ApiError } from "../../lib/api";
 import { suggestSlug } from "../../lib/marketplace";
@@ -55,7 +55,14 @@ function DoneScreen({ onAgain }: { onAgain: () => void }) {
  * 提交进入平台审核队列(pending)。顶部「我的发布」闭合反馈环。被静态扫描/manifest
  * 校验拦截时把命中翻译成可操作的中文修正提示。
  */
-export function PublishPanel({ auth }: { auth: AuthSession }) {
+export function PublishPanel({
+  auth,
+  onCreateInChat,
+}: {
+  auth: AuthSession;
+  /** 「在对话中创建」:AI 引导式创建(小白路径),表单是手动模式。 */
+  onCreateInChat?: (kind: "skill" | "agent") => void;
+}) {
   const [kind, setKind] = useState<"skill" | "agent">("skill");
   const [publishReload, setPublishReload] = useState(0);
   const bump = () => setPublishReload((n) => n + 1);
@@ -79,6 +86,28 @@ export function PublishPanel({ auth }: { auth: AuthSession }) {
           </button>
         ))}
       </div>
+
+      {onCreateInChat && (
+        <button
+          type="button"
+          onClick={() => onCreateInChat(kind)}
+          className="group flex w-full items-center gap-3 rounded-xl border border-accent/30 bg-accent-soft/40 px-4 py-3 text-left outline-none transition-colors hover:border-accent/60 hover:bg-accent-soft focus-visible:ring-2 focus-visible:ring-ring"
+        >
+          <span className="flex size-9 shrink-0 items-center justify-center rounded-lg bg-accent-soft text-accent">
+            <Sparkles size={17} />
+          </span>
+          <span className="min-w-0 flex-1">
+            <span className="block text-[13.5px] font-semibold text-fg">
+              在对话中创建{kind === "skill" ? "技能" : "智能体"}(推荐)
+            </span>
+            <span className="mt-0.5 block text-[12px] leading-snug text-muted">
+              回答几个选择题,AI 帮你完成起草、创建{kind === "skill" ? "、评测用例" : "和发布"}
+              —— 无需了解格式规范。
+            </span>
+          </span>
+          <ChevronRight size={16} className="shrink-0 text-faint transition-transform group-hover:translate-x-0.5" />
+        </button>
+      )}
 
       {kind === "skill" ? (
         <SkillPublishForm auth={auth} onPublished={bump} />
