@@ -47,6 +47,12 @@ const PUBLIC_CONFIG = okJson({
   allow_registration: true,
 })
 
+// 启动静默续期(App boot):无 refresh cookie → 401。mock 必须显式处理本路径,否则
+// catch-all 的 200 空体/LOGIN_OK 会让 boot 自动进工作区,登录流用例找不到 Landing。
+const REFRESH_401 = errJson(401, { error: { code: 'UNAUTHENTICATED', message: '未登录' } })
+// 静默续期成功(自动登录用例):v5 refresh 仅回 access token,user 由 GET /api/me 拿。
+const REFRESH_OK = okJson({ access_token: 'tok-r', access_exp: 1234, remember: true })
+
 // ─── P3 对话前置 fixtures（后端 wire 形态，snake_case） ────────────────────────
 const MODELS = {
   models: [
@@ -107,6 +113,7 @@ function routedFetch(over?: {
   let opened = false
   return vi.fn(async (url: string) => {
     const u = String(url)
+    if (u.includes('/api/auth/refresh')) return REFRESH_401
     if (u.includes('/api/auth/login')) return LOGIN_OK
     if (u.includes('/api/public/config')) return PUBLIC_CONFIG
     if (u.includes('/api/public/models')) return okJson(over?.models ?? MODELS)
@@ -139,7 +146,9 @@ afterEach(() => {
 })
 
 async function loginViaUi() {
-  fireEvent.click(screen.getByRole('button', { name: '登录' })) // Landing 登录 → AuthGate
+  // 启动静默续期期间是 splash(无 Landing):等 refresh 401 落定、Landing 出现再点。
+  const landingLogin = await screen.findByRole('button', { name: '登录' })
+  fireEvent.click(landingLogin) // Landing 登录 → AuthGate
   fireEvent.change(screen.getByPlaceholderText('邮箱'), { target: { value: 'a@b.com' } })
   fireEvent.change(screen.getByPlaceholderText('密码'), { target: { value: 'password123' } })
   // AuthGate fail-closed：公开配置（turnstile_bypass）加载完前登录按钮禁用。等其就绪再提交
@@ -152,9 +161,12 @@ async function loginViaUi() {
 }
 
 describe('Aurora v5 skeleton — landing (de-branded)', () => {
-  test('renders neutral brand, no legacy 乾元 / v4-trial branding', () => {
+  test('renders neutral brand, no legacy 乾元 / v4-trial branding', async () => {
+    fetchMock = vi.fn(async () => REFRESH_401) as unknown as FetchMock
+    vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
     render(<App />)
-    expect(screen.getAllByText('Aurora').length).toBeGreaterThan(0)
+    // 启动续期 401 落定后 Landing 才出现(splash → Landing)。
+    expect((await screen.findAllByText('Aurora')).length).toBeGreaterThan(0)
     expect(document.body.textContent).not.toContain('乾元')
     expect(document.body.textContent).not.toContain('易经')
   })
@@ -163,7 +175,11 @@ describe('Aurora v5 skeleton — landing (de-branded)', () => {
 describe('Aurora v5 skeleton — auth → workspace', () => {
   test('login posts to v5 /api/auth/login (credentials include) and enters workspace', async () => {
     fetchMock = vi.fn(async (url: string) =>
-      String(url).includes('/api/public/config') ? PUBLIC_CONFIG : LOGIN_OK,
+      String(url).includes('/api/auth/refresh')
+        ? REFRESH_401
+        : String(url).includes('/api/public/config')
+          ? PUBLIC_CONFIG
+          : LOGIN_OK,
     ) as unknown as FetchMock
     vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
 
@@ -178,12 +194,36 @@ describe('Aurora v5 skeleton — auth → workspace', () => {
     expect((call![1] as RequestInit).credentials).toBe('include')
   })
 
+  test('boot silent refresh: 有效 refresh cookie → 免登录直接恢复工作区', async () => {
+    // refresh 200 + getMe 200 → 不显示 Landing/AuthGate,直接进工作区(F5 不掉登录)。
+    fetchMock = vi.fn(async (url: string) => {
+      const u = String(url)
+      if (u.includes('/api/auth/refresh')) return REFRESH_OK
+      if (u.includes('/api/public/models')) return okJson(MODELS)
+      if (u.includes('/api/agent/status')) return okJson(AGENT_READY)
+      if (u.includes('/api/me'))
+        return okJson({ user: { id: 'u1', email: 'a@b.com', role: 'user', display_name: 'Alice', credits: '300' } })
+      return okJson({})
+    }) as unknown as FetchMock
+    vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
+
+    render(<App />)
+
+    // 工作区标志(新建会话按钮)直接出现,全程没有点过任何登录 UI。
+    await waitFor(() => expect(screen.getByRole('button', { name: /新建会话/ })).toBeInTheDocument())
+    expect(screen.queryByPlaceholderText('邮箱')).not.toBeInTheDocument()
+    // refresh 走了 cookie(credentials include)。
+    const refreshCall = fetchMock.mock.calls.find(([u]) => String(u).includes('/api/auth/refresh'))
+    expect(refreshCall).toBeTruthy()
+    expect((refreshCall![1] as RequestInit).credentials).toBe('include')
+  })
+
   test('login error surfaces the backend message', async () => {
     fetchMock = vi.fn(async (url: string) =>
       String(url).includes('/api/public/config')
         ? PUBLIC_CONFIG
         : errJson(401, { error: { code: 'INVALID_CREDENTIALS', message: '邮箱或密码错误' } }),
-    ) as unknown as FetchMock
+    ) as unknown as FetchMock // refresh 也命中 401 分支 → boot 落 Landing,符合本用例。
     vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
 
     render(<App />)
@@ -239,9 +279,11 @@ describe('Aurora v5 skeleton — demo mode (no network)', () => {
 })
 
 describe('Aurora v5 skeleton — theme', () => {
-  test('cycling theme toggle persists oc_theme', () => {
+  test('cycling theme toggle persists oc_theme', async () => {
+    fetchMock = vi.fn(async () => REFRESH_401) as unknown as FetchMock
+    vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
     render(<App />)
-    const toggles = screen.getAllByRole('button', { name: /主题|theme/i })
+    const toggles = await screen.findAllByRole('button', { name: /主题|theme/i })
     fireEvent.click(toggles[0])
     expect(['light', 'dark', 'system']).toContain(localStorage.getItem('oc_theme'))
   })
@@ -357,6 +399,7 @@ describe('Aurora v5 — P6 历史会话加载', () => {
   test('listSessions 填侧栏；选中会话 → getSession 拉历史并渲染', async () => {
     fetchMock = vi.fn(async (url: string) => {
       const u = String(url)
+      if (u.includes('/api/auth/refresh')) return REFRESH_401
       if (u.includes('/api/auth/login')) return LOGIN_OK
       if (u.includes('/api/public/config')) return okJson({ turnstile_bypass: true })
       if (u.includes('/api/public/models')) return okJson(MODELS)

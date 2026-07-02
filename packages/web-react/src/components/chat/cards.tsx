@@ -19,7 +19,7 @@ import {
   Volume2,
   Wallet,
 } from "lucide-react";
-import { memo, useEffect, useState } from "react";
+import { useEffect, useState } from "react";
 import type { ChatMessage } from "../../lib/chat/model";
 import {
   CONTINUE_PROMPT,
@@ -225,7 +225,11 @@ const USER_STATUS_LABEL: Record<string, string> = {
   replied: "已回复",
   error: "发送失败",
 };
-export const UserCard = memo(function UserCard({ msg }: { msg: ChatMessage }) {
+// 叶子卡一律不 memo:重渲防抖的唯一权威是上层 MessageRenderer 的 messageSignature 比较层。
+// reducer/socket 对 msg 就地 mutate(同引用),叶子层 {msg} 浅比较要么永不重渲(状态标签
+// 卡死在首帧,如 user status),要么因 ctx 每帧新对象而形同虚设 —— 三种 memo 策略并存徒增
+// 认知负担。sig 层已捕获全部渲染所读字段(render.ts messageSignature),叶子直接裸函数。
+export function UserCard({ msg }: { msg: ChatMessage }) {
   const status = msg.status;
   return (
     <div className="flex flex-col items-end animate-in">
@@ -247,10 +251,10 @@ export const UserCard = memo(function UserCard({ msg }: { msg: ChatMessage }) {
       )}
     </div>
   );
-});
+}
 
 // ═══════════════ assistant ═══════════════
-export const AssistantCard = memo(function AssistantCard({
+export function AssistantCard({
   msg,
   ctx,
   cb,
@@ -347,7 +351,7 @@ export const AssistantCard = memo(function AssistantCard({
       </div>
     </div>
   );
-});
+}
 
 function TypingDots() {
   return (
@@ -361,7 +365,7 @@ function TypingDots() {
 export { TypingDots };
 
 // ═══════════════ thinking（💭 折叠） ═══════════════
-export const ThinkingCard = memo(function ThinkingCard({
+export function ThinkingCard({
   msg,
   ctx,
 }: {
@@ -395,7 +399,7 @@ export const ThinkingCard = memo(function ThinkingCard({
       )}
     </div>
   );
-});
+}
 
 // ═══════════════ plan ═══════════════
 const STEP_DOT: Record<string, string> = {
@@ -472,7 +476,7 @@ export function DelegateProgressCard({ msg }: { msg: ChatMessage }) {
 }
 
 // ═══════════════ system ═══════════════
-export const SystemCard = memo(function SystemCard({ msg }: { msg: ChatMessage }) {
+export function SystemCard({ msg }: { msg: ChatMessage }) {
   if (!msg.text) return null;
   return (
     <div className="flex justify-center animate-in">
@@ -481,4 +485,4 @@ export const SystemCard = memo(function SystemCard({ msg }: { msg: ChatMessage }
       </div>
     </div>
   );
-});
+}

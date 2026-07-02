@@ -38,6 +38,9 @@ function persistSignature(s: StoredSession): string {
 export type UseChatSocket = {
   status: ChatSnapshot["status"];
   provisioning: boolean;
+  /** 快照单调版本号:消息数组是就地 mutation 的同一引用,version 才是变更的权威信号
+   *  (autoscroll 等 effect 的依赖必须用它;依赖数组引用恒等则流式期间永不触发)。*/
+  version: number;
   /** 取某会话当前消息快照（就地 mutation 的数组，随 version 变更触发重渲）。*/
   getMessages: (sessId: string | undefined) => ChatMessage[];
   getSession: (sessId: string | undefined) => ChatSession | undefined;
@@ -411,6 +414,7 @@ export function useChatSocket(opts: {
     () => ({
       status: snap.status,
       provisioning: snap.provisioning,
+      version: snap.version,
       getMessages,
       getSession,
       isSending,

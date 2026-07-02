@@ -25,7 +25,7 @@ import { ToolCardActionsContext } from "./components/tool/context";
 import { modelLabel } from "./components/ModelSelector";
 import { SettingsCenter } from "./components/SettingsCenter";
 import { Sidebar } from "./components/Sidebar";
-import { Alert, Sheet } from "./components/ui";
+import { Alert, Sheet, Spinner } from "./components/ui";
 import { useAgentGate } from "./hooks/useAgentGate";
 import { type UseChatSocket, useChatSocket } from "./hooks/useChatSocket";
 import { useInbox } from "./hooks/useInbox";
@@ -37,7 +37,7 @@ import type { RepoBindErrorWire, RepoStatusWire } from "./lib/chat/frames";
 import type { MediaRef } from "./lib/chat/frames";
 import type { ChatMessage } from "./lib/chat/model";
 import { CONTINUE_PROMPT } from "./lib/chat/render";
-import { DEFAULT_AGENT } from "./lib/agents";
+import { DEFAULT_AGENT, agentFromApiRow, type Agent } from "./lib/agents";
 import { ApiError, api } from "./lib/api";
 import type { StoredSession } from "./lib/persist";
 import { DEMO_MESSAGES, DEMO_MODELS, DEMO_SESSIONS, DEMO_USER, demoReply } from "./lib/demo";
@@ -116,8 +116,12 @@ export function App() {
     !demo && location.pathname === "/reset-password"
       ? params.get("token") || undefined
       : undefined;
-  // access token 仅存内存，刷新即丢失，所以启动一律落到首页/登录（无自动登录）。
+  // access token 仅存内存,刷新即丢;但 refresh token 在 HttpOnly cookie 里 —— 启动先做
+  // 一次静默续期(booting 态),成功直接恢复工作区,失败才落首页/登录。商业产品每次 F5
+  // 都要密码+人机验证是致命流失点;IndexedDB"reload 不丢会话"的投入也靠这条腿才有意义。
   const [view, setView] = useState<"home" | "app">(resetToken ? "app" : "home");
+  // demo/重置链接跳过静默续期(重置场景用户就是要走 reset 流程,不劫持进工作区)。
+  const [booting, setBooting] = useState(!demo && !resetToken);
   // AuthGate 初始模式：「登录」入口=login，「免费开始」入口=register，重置链接=reset。
   const [authMode, setAuthMode] = useState<AuthMode>(resetToken ? "reset" : "login");
   // 主题的唯一权威源：useTheme 是「挂载读 localStorage」的单实例，经 props 下传给顶栏快捷开关
@@ -143,6 +147,11 @@ export function App() {
   const [collapsed, setCollapsed] = useState(false);
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
   const [agent, setAgent] = useState(DEFAULT_AGENT);
+  // 已装智能体目录(agent 归属解析用):登录后拉一次,市场关闭时刷新;AgentPicker 打开时
+  // 自行拉最新,两者互不依赖。ref 镜像供 effect 读最新值而不进依赖。
+  const [myAgents, setMyAgents] = useState<Agent[]>([DEFAULT_AGENT]);
+  const myAgentsRef = useRef(myAgents);
+  myAgentsRef.current = myAgents;
   const [pickerOpen, setPickerOpen] = useState(false);
   // 团队模式(v5 轻量组队):turn 级开关,只对「全能助手」(main)生效——开启后发消息时后端
   // 给 main 队长注入组队引导,由它按任务自主 delegate_task 组已安装 agent 成队。换 agent 不清,
@@ -246,6 +255,38 @@ export function App() {
       setAuthLoading(false);
     }
   }, []);
+
+  // 启动静默续期:凭同源 HttpOnly refresh cookie 换 access token → getMe 恢复用户。
+  // api.refresh() 失败恒返 null(绝不抛),无 cookie 时开销一次 401 往返。仅挂载跑一次。
+  useEffect(() => {
+    if (!booting) return;
+    let cancelled = false;
+    void (async () => {
+      const r = await api.refresh();
+      // accessToken 必须真实存在:200 但空 body(异常网关/mock)不算有会话,防半开登录态。
+      if (!r?.accessToken) {
+        if (!cancelled) setBooting(false);
+        return;
+      }
+      tokenRef.current = r.accessToken;
+      try {
+        const me = await api.getMe(authRef.current);
+        if (cancelled) return;
+        setUser(me);
+        setAuthed(true);
+        setView("app");
+      } catch {
+        // token 换到了但 getMe 失败(瞬时网络/服务端抖动):不半开登录态,回首页手动登录。
+        tokenRef.current = null;
+      } finally {
+        if (!cancelled) setBooting(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // booting 仅由本 effect 置 false,等效"挂载跑一次"。
+  }, [booting]);
 
   // 注册 / 邮箱验证 / 找回密码：透传到 api（错误为带友好中文 message 的 ApiError，AuthGate 自捕展示）。
   const register = useCallback(
@@ -582,6 +623,21 @@ export function App() {
     };
   }, [demo, auth]);
 
+  // 已装智能体目录:登录后拉一次(会话 agent 归属解析用;失败留默认,解析回落 stub 不阻断)。
+  useEffect(() => {
+    if (demo || !auth) return;
+    let cancelled = false;
+    api
+      .listMyAgents(authRef.current)
+      .then((rows) => {
+        if (!cancelled) setMyAgents(rows.map(agentFromApiRow));
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [demo, auth]);
+
   // 对话前置态机：检查订阅/容器、引导开通、轮询容器至就绪。gate.access=false 时由
   // AgentGate 面板占据对话区并禁用 Composer；gate.ready 是 P4 useChatSocket 连接的硬前置。
   const gate = useAgentGate(auth, inWorkspace && !demo);
@@ -651,6 +707,27 @@ export function App() {
     autoSelectedRef.current = true;
     selectSession(sessions[0].id);
   }, [demo, auth, activeId, sessions, selectSession]);
+  // agent 归属单一权威 = 活动会话的 sess.agentId。此前"当前 agent"是独立全局态,切会话
+  // 不 reconcile → 在会话 A 切到编程助手后选中旧会话 B(agentId=main),header/send 显示
+  // 编程助手而 sess.agentId 仍是 main:stopTurn/hello 续传游标用错 agent(停止停不掉本轮)、
+  // §11 跨 agent 污染守卫也未打戳。收口:切会话/历史合并后把 App.agent 同步为会话归属。
+  const activeSessAgentId = !demo && activeId ? chat.getSession(activeId)?.agentId : undefined;
+  useEffect(() => {
+    if (!activeSessAgentId || activeSessAgentId === agent.id) return;
+    const resolved =
+      activeSessAgentId === DEFAULT_AGENT.id
+        ? DEFAULT_AGENT
+        : (myAgentsRef.current.find((a) => a.id === activeSessAgentId) ?? {
+            // 已卸载/目录未含的 agent:退化 stub(id 直显),仍保证 send/stop 归属一致。
+            id: activeSessAgentId,
+            name: activeSessAgentId,
+            avatarEmoji: "🤖",
+            grad: "from-violet-500 to-fuchsia-600",
+            description: "",
+          });
+    setAgent(resolved);
+  }, [activeSessAgentId, agent.id]);
+
   // 非 demo：展示的消息来自 WS service 快照（就地 mutation + version 触发重渲）。
   const wsMessages = !demo && activeId ? chat.getMessages(activeId) : EMPTY_WS_MESSAGES;
   const wsSending = !demo && chat.isSending(activeId);
@@ -726,10 +803,31 @@ export function App() {
     [regenerate, send, demo, openSettings, onFeedback],
   );
 
-  // autoscroll（demo: messages/streamText；非 demo: WS 消息流 + in-flight）
+  // autoscroll 根治(两个对称 bug 一次收口):
+  //  1. 旧依赖 [wsMessages] 是就地 mutation 的同一数组引用 → 流式期间 deps 恒等,effect
+  //     只在 turn 边界跑一次,回复长出视口后不再跟随。变更的权威信号是 chat.version
+  //     (快照单调版本号,与本仓"version 才是变更权威"的约定一致)。
+  //  2. 旧实现无条件劫持:用户上翻回看历史也被拽回底部。改为 near-bottom 粘滞 ——
+  //     只有用户本就贴底(<80px)时才跟随;上翻即解除,拉回底部自动恢复。
+  const stickToBottomRef = useRef(true);
+  const onChatScroll = useCallback(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    stickToBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+  }, []);
+  // 切会话:重置粘滞并瞬时跳底(历史回看从底部开始)。
   useEffect(() => {
-    scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" });
-  }, [messages, streamText, wsMessages, wsSending]);
+    stickToBottomRef.current = true;
+    const el = scrollRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  }, [activeId]);
+  // 内容变更跟随:demo 走 messages/streamText,真实路径走 version/wsSending。
+  // 流式期间高频触发,用瞬时赋值而非 smooth(60fps 下排队的平滑动画反而卡顿)。
+  useEffect(() => {
+    if (!stickToBottomRef.current) return;
+    const el = scrollRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  }, [messages, streamText, chat.version, wsSending]);
 
   useEffect(() => {
     if (!inWorkspace) return;
@@ -746,6 +844,14 @@ export function App() {
     return () => window.removeEventListener("keydown", onKey);
   }, [inWorkspace, sending, newSession, stopTurn]);
 
+  // 启动续期检查中:极简 splash(避免"闪一下首页又跳工作区"的割裂;通常 <300ms)。
+  if (!demo && booting) {
+    return (
+      <div className="flex h-full items-center justify-center bg-bg text-muted">
+        <Spinner size={22} />
+      </div>
+    );
+  }
   if (!demo && view === "home") {
     return (
       <Landing
@@ -898,7 +1004,7 @@ export function App() {
           />
         )}
 
-        <div ref={scrollRef} className="flex-1 overflow-y-auto overflow-x-hidden">
+        <div ref={scrollRef} onScroll={onChatScroll} className="flex-1 overflow-y-auto overflow-x-hidden">
           {gated ? (
             <AgentGate
               phase={gate.phase}
@@ -1060,14 +1166,17 @@ export function App() {
         onTabChange={setMarketplaceTab}
         onClose={() => {
           setMarketplaceOpen(false);
-          // If the currently-selected market agent was just uninstalled, fall back
-          // to 全能助手 so the header/composer don't show a stale agent.
-          if (!demo && auth && agent.id !== "main") {
+          // 市场关闭后刷新已装目录(装/卸都会变);若当前选中的市场 agent 刚被卸载,
+          // 回落全能助手,header/composer 不显示 stale agent。
+          if (!demo && auth) {
             const a = auth;
             api
               .listMyAgents(a)
               .then((rows) => {
-                if (!rows.some((r) => r.id === agent.id)) setAgent(DEFAULT_AGENT);
+                setMyAgents(rows.map(agentFromApiRow));
+                if (agent.id !== "main" && !rows.some((r) => r.id === agent.id)) {
+                  setAgent(DEFAULT_AGENT);
+                }
               })
               .catch(() => {});
           }
