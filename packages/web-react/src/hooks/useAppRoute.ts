@@ -2,10 +2,13 @@ import { useEffect, useRef } from "react";
 import type { Session } from "../lib/types";
 
 /**
- * P7 —— 最小路由（无路由库，自写）：URL 是 App 状态的**单向 replaceState 镜像**，
- * 外加 popstate 监听把浏览器导航反灌回状态。刻意不引入 pushState 历史栈管理 ——
- * v5 的会话切换高频且轻量，replaceState 语义（当前入口可链接、可刷新恢复、可分享）
- * 已覆盖诉求，且绝不劫持浏览器后退（后退=离开应用或回到进入前的入口）。
+ * P7 —— 最小路由（无路由库，自写）：URL 是 App 状态的单向镜像 + popstate 反灌。
+ * 历史栈语义（boss 定夺 2026-07-02）：**后退 = 上一个会话**（ChatGPT 式）——
+ * 用户主动的会话导航（切会话/新建）pushState 压栈；以下四种情形 replace 不压栈：
+ *   1. draft 首发（`/` → `/s/<id>`，同一逻辑位置只是 URL 形态毕业）；
+ *   2. 首次选中（boot 自动选中最近会话/深链恢复，启动噪音不进栈）；
+ *   3. 删除当前会话回 `/`（死条目不留在栈里）；
+ *   4. popstate 反灌（URL 本就是权威，镜像 effect 天然 no-op）。
  *
  * 规则：
  * - 选中会话 → `/s/<id>`；无选中 / 新建的空会话（尚无消息的 draft，链接无分享意义）/
@@ -13,9 +16,10 @@ import type { Session } from "../lib/types";
  * - 启动深链 `/s/<id>`：进工作区后等会话出现在侧栏（IndexedDB 注水或 listSessions 到达）
  *   再 selectSession；listSessions 落定仍不存在 → 放弃并回 `/`（随后"自动选中上次会话"
  *   恢复正常判定）。恢复未决期间 URL 深链优先于最近会话（holdAutoSelect）。
- * - popstate：按 URL 切会话（/s/<id> → selectSession；/ → 清选中回空会话态）。
+ * - popstate：按 URL 切会话（/s/<id> 且会话存在 → selectSession；已删除的死条目 →
+ *   清选中 + replaceState 修正 URL；/ → 清选中回空会话态）。
  * - 面板深链 `?panel=settings|market|manage`：boot 由 App 在 useState 初始化时读取
- *   （parsePanelParam），打开/关闭经本 hook replaceState 同步回 query。
+ *   （parsePanelParam），打开/关闭经本 hook replaceState 同步回 query（面板不压栈）。
  * - demo / reset-password 特判不启用（enabled=false，URL 原样保留）。
  */
 export type PanelParam = "settings" | "market" | "manage";
@@ -65,8 +69,17 @@ export function useAppRoute(opts: UseAppRouteOptions): void {
     const onPop = () => {
       if (!cbRef.current.inWorkspace) return;
       const id = parseSessionPath(location.pathname);
-      if (id) cbRef.current.selectSession(id);
-      else if (location.pathname === "/") cbRef.current.onPopToRoot();
+      if (id) {
+        if (cbRef.current.sessions.some((s) => s.id === id)) {
+          cbRef.current.selectSession(id);
+        } else {
+          // 历史栈里的已删除会话:回空态并 replace 修正 URL(不再制造新条目)。
+          cbRef.current.onPopToRoot();
+          history.replaceState({}, "", "/" + location.search + location.hash);
+        }
+      } else if (location.pathname === "/") {
+        cbRef.current.onPopToRoot();
+      }
     };
     window.addEventListener("popstate", onPop);
     return () => window.removeEventListener("popstate", onPop);
@@ -84,19 +97,40 @@ export function useAppRoute(opts: UseAppRouteOptions): void {
     }
   }, [enabled, inWorkspace, pendingSessionId, sessions, serverListSettled]);
 
-  // activeId → URL 路径（replaceState 单向镜像）。空会话 draft（列表里 messageCount=0，
-  // 典型为「新建会话」尚未首发）不占 URL —— 首次发送后计数>0 自然落 /s/<id>；
-  // popstate 到侧栏没有的 id 时列表查不到 → 不视作 draft，URL 保持用户所到之处。
+  // activeId → URL 路径镜像。空会话 draft（列表里 messageCount=0，典型为「新建会话」
+  // 尚未首发）不占 URL —— 首次发送后计数>0 自然落 /s/<id>；popstate 到侧栏没有的 id 时
+  // 列表查不到 → 不视作 draft，URL 保持用户所到之处。
+  // push/replace 取舍见文件头「历史栈语义」:会话间导航 push,其余 replace。
   const activeEntry = activeId ? sessions.find((s) => s.id === activeId) : undefined;
   const isEmptyDraft = activeEntry !== undefined && activeEntry.messageCount === 0;
   const wantPath = activeId && !isEmptyDraft ? `/s/${activeId}` : "/";
+  const prevIdRef = useRef<string | undefined>(undefined);
   useEffect(() => {
     if (!enabled) return;
     // 深链恢复未决：不回写（否则把 URL 里的 /s/<id> 冲成当前空态的 /）。
     if (pendingSessionId) return;
-    if (location.pathname === wantPath) return;
-    history.replaceState({}, "", wantPath + location.search + location.hash);
-  }, [enabled, pendingSessionId, wantPath]);
+    const prevId = prevIdRef.current;
+    prevIdRef.current = activeId;
+    if (location.pathname === wantPath) return; // popstate 反灌/深链恢复:URL 已是权威
+    const suffix = location.search + location.hash;
+    // 同一会话的 URL 形态毕业(draft 首发 / → /s/<id>):同一逻辑位置,replace;
+    // 首次选中(prevId 空:boot 自动选中最近会话,或落地后的第一次点击):启动噪音不压栈。
+    if ((activeId !== undefined && activeId === prevId) || prevId === undefined) {
+      history.replaceState({}, "", wantPath + suffix);
+      return;
+    }
+    // 回 / 且来源会话已不在列表(删除当前会话):死条目不进历史栈,replace。
+    if (
+      wantPath === "/" &&
+      activeId === undefined &&
+      !cbRef.current.sessions.some((s) => s.id === prevId)
+    ) {
+      history.replaceState({}, "", wantPath + suffix);
+      return;
+    }
+    // 用户会话导航(切会话/新建):pushState —— 后退=上一个会话。
+    history.pushState({}, "", wantPath + suffix);
+  }, [enabled, pendingSessionId, wantPath, activeId]);
 
   // 面板 → ?panel= query（replaceState；关闭时清参数）。不限工作区：未登录携带
   // ?panel= 深链时面板 state 已在 App 初始化为打开（进工作区即呈现），此 effect 恰好

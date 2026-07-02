@@ -433,8 +433,8 @@ describe('Aurora v5 — P6 历史会话加载', () => {
 })
 
 // ---------------------------------------------------------------------------
-// P7 最小路由（无路由库）：会话可链接（/s/<id> replaceState 镜像）、boot 深链恢复
-// （URL 指定 > 最近会话）、popstate 切会话、面板深链（?panel=settings|market|manage）。
+// P7 最小路由（无路由库）：会话可链接（/s/<id> 镜像;会话间导航 pushState,后退=上一个
+// 会话）、boot 深链恢复（URL 指定 > 最近会话）、popstate 切会话、面板深链（?panel=…）。
 // ---------------------------------------------------------------------------
 // 两个历史会话：乙（webother02）updatedAt 更新 = "最近会话"，甲（webhist01）较旧。
 const HIST_META_TWO = {
@@ -536,7 +536,7 @@ describe('Aurora v5 — P7 最小路由', () => {
     await waitFor(() => expect(window.location.pathname).toBe('/'))
   })
 
-  test('选中会话 → URL replaceState /s/<id>；新建会话 → 回 /', async () => {
+  test('选中会话 → URL 镜像 /s/<id>；新建会话 → 回 /', async () => {
     fetchMock = routedFetchTwoSessions()
     vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
 
@@ -552,6 +552,31 @@ describe('Aurora v5 — P7 最小路由', () => {
       fireEvent.click(screen.getByRole('button', { name: /新建会话/ }))
     })
     await waitFor(() => expect(window.location.pathname).toBe('/'))
+  })
+
+  test('会话间导航压栈：history.back() 回上一个会话（首次自动选中不压栈）', async () => {
+    fetchMock = routedFetchTwoSessions()
+    vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
+
+    render(<App />)
+    // boot 自动选中最近会话乙（replace，不压栈）。
+    await waitFor(() => expect(window.location.pathname).toBe('/s/webother02'))
+    const baseLen = window.history.length
+
+    // 用户切到甲 → pushState 压一条。
+    await act(async () => {
+      fireEvent.click(screen.getByText('历史会话甲'))
+    })
+    await waitFor(() => expect(window.location.pathname).toBe('/s/webhist01'))
+    expect(window.history.length).toBe(baseLen + 1)
+
+    // 后退 = 回上一个会话乙（jsdom back() 异步派发 popstate）。
+    await act(async () => {
+      window.history.back()
+      await new Promise((r) => setTimeout(r, 20))
+    })
+    await waitFor(() => expect(window.location.pathname).toBe('/s/webother02'))
+    await waitFor(() => expect(screen.getByText('乙会话正文')).toBeInTheDocument())
   })
 
   test('面板深链：?panel=settings boot 后自动打开设置中心并保参', async () => {
