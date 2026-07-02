@@ -1545,3 +1545,97 @@ describe("isUuidLike", () => {
     assert.equal(isUuidLike("12345678-9abc-def0-1234-56789abcdef0 "), false);
   });
 });
+
+// ─── makeFinalizer.commit — 零输出免单(模型无响应/超时不扣费) ─────────────
+
+describe("makeFinalizer.commit → 零输出免单", () => {
+  function makeStubs() {
+    const queriedSql: string[] = [];
+    const stubClient = {
+      query: async (sql: string, _params?: unknown[]) => {
+        queriedSql.push(sql);
+        if (sql.includes("INSERT INTO usage_records")) {
+          return { rows: [{ id: "9001" }], rowCount: 1 } as never;
+        }
+        // spendTwoBucket 依赖:钱包行锁 / 期内桶行锁 / ledger 插入
+        if (sql.includes("FROM users WHERE id")) {
+          return { rows: [{ credits: "1000000" }], rowCount: 1 } as never;
+        }
+        if (sql.includes("FROM user_subscriptions")) {
+          return { rows: [], rowCount: 0 } as never;
+        }
+        if (sql.includes("INSERT INTO credit_ledger")) {
+          return { rows: [{ id: "7001" }], rowCount: 1 } as never;
+        }
+        return { rows: [], rowCount: 0 } as never;
+      },
+      release: () => {},
+    };
+    const stubPool = {
+      query: async (sql: string, _params?: unknown[]) => {
+        queriedSql.push(sql);
+        return { rows: [], rowCount: 0 } as never;
+      },
+      connect: async () => stubClient,
+    };
+    const stubScheduler = { release: async () => {} };
+    const stubRedis = { releaseReservation: async () => true };
+    return { queriedSql, stubPool, stubScheduler, stubRedis };
+  }
+
+  const baseCtx = {
+    userId: 1n,
+    containerId: 0n,
+    accountId: 42n,
+    slotId: "slot-waive",
+    model: "claude-sonnet-4-6",
+    pricing: sonnet,
+    precheckCredits: 100n,
+    log: rootLogger,
+    sessionId: null,
+  };
+
+  test("kind=final 但 output_tokens=0 → finalCredits=0,不走双钱包扣费", async () => {
+    const { queriedSql, stubPool, stubScheduler, stubRedis } = makeStubs();
+    const f = makeFinalizer(
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      { pgPool: stubPool, preCheckRedis: stubRedis, scheduler: stubScheduler } as any,
+      {
+        ...baseCtx,
+        requestId: "req-waive-1",
+        preCheckReservation: { userId: "u1", requestId: "req-waive-1" },
+      },
+    );
+    const out = await f.commit({
+      kind: "final",
+      usage: { input_tokens: 200_000, output_tokens: 0, cache_read_tokens: 0, cache_write_tokens: 0 },
+    });
+    assert.equal(out.state, "committed");
+    assert.equal(out.finalCredits, 0n, "零输出必须免单(input 成本平台自担)");
+    // usage_records 审计行照写,但绝不能碰双钱包/ledger
+    assert.ok(queriedSql.some((s) => s.includes("INSERT INTO usage_records")), "审计行仍要落");
+    assert.ok(
+      !queriedSql.some((s) => s.includes("period_credits") || s.includes("credit_ledger")),
+      "免单路径不得写 ledger/扣桶",
+    );
+  });
+
+  test("对照:同 input 但 output_tokens>0 → 正常计费(finalCredits>0)", async () => {
+    const { stubPool, stubScheduler, stubRedis } = makeStubs();
+    const f = makeFinalizer(
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      { pgPool: stubPool, preCheckRedis: stubRedis, scheduler: stubScheduler } as any,
+      {
+        ...baseCtx,
+        requestId: "req-waive-2",
+        preCheckReservation: { userId: "u1", requestId: "req-waive-2" },
+      },
+    );
+    const out = await f.commit({
+      kind: "final",
+      usage: { input_tokens: 200_000, output_tokens: 500, cache_read_tokens: 0, cache_write_tokens: 0 },
+    });
+    assert.equal(out.state, "committed");
+    assert.ok(out.finalCredits > 0n, "有输出必须照常计费");
+  });
+});

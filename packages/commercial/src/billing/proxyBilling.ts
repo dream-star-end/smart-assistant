@@ -260,6 +260,13 @@ export function makeFinalizer(deps: FinalizeDeps, ctx: FinalizeContext): Finaliz
     const usage = obs.usage;
     const { cost_credits, snapshot } = computeCost(usage, ctx.pricing);
     const status = obs.kind === "final" ? "success" : "billing_failed";
+    // 免单规则(boss 2026-07-02):模型无响应/超时不向用户收费。代理层可判定的
+    // 形态 = 流按"成功"收尾但 output_tokens 为 0 —— 正常回复(含 tool_use)至少
+    // 产生 1 个 output token,零输出即"上游 hang/超时后吐了个空壳 usage"。此时
+    // input/cache 成本平台自担:usage_records 照写(审计留痕,cost=0),ledger 不扣,
+    // 前端不出 cost_charged。上游直接失败/中断的请求走 fail/abort 路径,本就不扣。
+    const waivedNoOutput = status === "success" && BigInt(usage.output_tokens ?? 0) === 0n && cost_credits > 0n;
+    const effectiveCredits = waivedNoOutput ? 0n : cost_credits;
     // 二阶段:UPDATE → INSERT × 2 + UPDATE。失败任何一步都 catch 掉走 abort 路径。
     try {
       await deps.pgPool.query(
@@ -276,32 +283,33 @@ export function makeFinalizer(deps: FinalizeDeps, ctx: FinalizeContext): Finaliz
         model: ctx.model,
         usage,
         snapshotJson: JSON.stringify(snapshot),
-        costCredits: cost_credits,
+        costCredits: effectiveCredits,
         status,
         sessionId: ctx.sessionId ?? null,
       });
       await finalizeInflightJournal(deps.pgPool, {
         requestId: ctx.requestId,
-        finalCredits: cost_credits,
+        finalCredits: effectiveCredits,
         ledgerId: settled.ledgerId,
         usageId: settled.usageId,
       });
       ctx.log.info("proxy_finalize_committed", {
-        finalCredits: cost_credits.toString(),
+        finalCredits: effectiveCredits.toString(),
         kind: obs.kind,
         usage: usageToLog(usage),
         clamped: settled.clamped,
+        ...(waivedNoOutput ? { waived: "no_output", wouldHaveCharged: cost_credits.toString() } : {}),
       });
       // 2I-2: billing_debit 三态语义重新对齐(Codex 审核结论):
       //   * success      = obs.kind='final' + cost>0 + 余额 >= cost (足额扣款)
       //   * insufficient = obs.kind='final' + cost>0 + 余额 < cost (debit 被夹到 0,欠费)
       //   * (不计数)    = obs.kind='partial' (status='billing_failed' 路径不走 ledger debit,settle 计 partial)
       //   * error        = settle 写库失败 (catch 块)
-      if (status === "success" && cost_credits > 0n) {
+      if (status === "success" && effectiveCredits > 0n) {
         incrBillingDebit(settled.clamped ? "insufficient" : "success");
       }
       return {
-        finalCredits: cost_credits,
+        finalCredits: effectiveCredits,
         debitedCredits: settled.debitedCredits,
         state: "committed",
         requestId: ctx.requestId,
