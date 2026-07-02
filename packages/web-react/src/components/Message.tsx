@@ -2,6 +2,7 @@ import { Check, Copy, RotateCcw, Sparkles } from "lucide-react";
 import { useState } from "react";
 import type { Message as MessageT, ToolCard as ToolCardT } from "../lib/types";
 import { Markdown } from "./Markdown";
+import { OptionsGroupFooter, OptionsGroupProvider } from "./optionsGroup";
 import { Avatar, IconButton } from "./ui";
 
 function CopyBtn({ text }: { text: string }) {
@@ -59,7 +60,10 @@ export function AssistantMessage({
       </Avatar>
       <div className="min-w-0 flex-1">
         {message.content ? (
-          <Markdown>{message.content}</Markdown>
+          <OptionsGroupProvider>
+            <Markdown>{message.content}</Markdown>
+            <OptionsGroupFooter />
+          </OptionsGroupProvider>
         ) : streaming ? (
           <div className="flex items-center gap-1.5 py-1 text-muted">
             <span className="size-2 animate-pulse rounded-full bg-muted" />

@@ -5,6 +5,7 @@
  */
 import { Maximize2, X } from "lucide-react";
 import { useChatInteraction } from "./tool/context";
+import { useOptionsGroup, useOptionsGroupSnapshot } from "./optionsGroup";
 import { useMemo, useEffect, useId, useRef, useState } from "react";
 
 /** 主题响应:观察 <html> class(useTheme 切换写入 .dark)。mermaid/chart 的配色在渲染时
@@ -120,34 +121,61 @@ function parseOptionsBlock(
 
 export function OptionsBlock({ code }: { code: string }) {
   const { sendUserText, busy } = useChatInteraction();
+  const group = useOptionsGroup();
+  const groupSnap = useOptionsGroupSnapshot();
+  const blockKey = useId();
   const [picked, setPicked] = useState<Set<number>>(new Set());
-  const [sent, setSent] = useState<string | null>(null);
+  const [sentLocal, setSentLocal] = useState<string | null>(null);
   const parsed = useMemo(() => parseOptionsBlock(code), [code]);
+
+  // 注册到消息级分组(多题聚合作答的前提;流式半截时不注册,解析成功即补登)。
+  useEffect(() => {
+    if (!group || !parsed) return;
+    group.register(blockKey, { question: parsed.question, multi: parsed.multi });
+    return () => group.unregister(blockKey);
+    // question/multi 变化(流式补全)时重登;blockKey 稳定。
+  }, [group, blockKey, parsed?.question, parsed?.multi, !parsed]); // eslint-disable-line react-hooks/exhaustive-deps
+
   if (!parsed) {
     return (
       <pre className="overflow-auto rounded-lg bg-code px-3 py-2 font-mono text-[12px] text-fg">{code}</pre>
     );
   }
+
+  // 同消息多题 → 聚合模式:点选只记录,由 GroupFooter 统一发送(修 boss 实测:
+  // 点第一题即发送、其余题作废)。单题(或无分组)保持点击即发/块内确认。
+  const grouped = !!group && (groupSnap?.count ?? 0) >= 2;
+  const groupEntry = groupSnap?.entries.find((e) => e.key === blockKey);
+  const sent = grouped ? (groupSnap?.sent ?? false) : sentLocal !== null;
+  const sentText = grouped ? (groupEntry?.labels.join("、") ?? null) : sentLocal;
   const interactive = !!sendUserText && !sent;
+
+  const report = (labels: string[]) => group?.setAnswer(blockKey, labels);
+
   const choose = (i: number) => {
     if (!interactive || busy) return;
+    const label = parsed.options[i].label;
     if (parsed.multi) {
       setPicked((p) => {
         const n = new Set(p);
         if (n.has(i)) n.delete(i);
         else n.add(i);
+        if (grouped) report([...n].sort((a, b) => a - b).map((x) => parsed.options[x].label));
         return n;
       });
+    } else if (grouped) {
+      // 聚合模式单选:标记/换选,不发送。
+      setPicked(new Set([i]));
+      report([label]);
     } else {
-      const label = parsed.options[i].label;
-      setSent(label);
+      setSentLocal(label);
       sendUserText?.(`我选择:${label}`);
     }
   };
   const confirmMulti = () => {
-    if (!interactive || busy || picked.size === 0) return;
+    if (!interactive || busy || picked.size === 0 || grouped) return;
     const labels = [...picked].sort((a, b) => a - b).map((i) => parsed.options[i].label);
-    setSent(labels.join("、"));
+    setSentLocal(labels.join("、"));
     sendUserText?.(`我选择:${labels.join("、")}`);
   };
   return (
@@ -155,7 +183,7 @@ export function OptionsBlock({ code }: { code: string }) {
       {parsed.question && <p className="px-1 text-[13px] font-medium text-fg">{parsed.question}</p>}
       <div className="grid grid-cols-1 gap-1.5 sm:grid-cols-2">
         {parsed.options.map((o, i) => {
-          const chosen = parsed.multi ? picked.has(i) : sent === o.label;
+          const chosen = parsed.multi || grouped ? picked.has(i) : sentText === o.label;
           return (
             <button
               key={`${i}-${o.label}`}
@@ -186,7 +214,7 @@ export function OptionsBlock({ code }: { code: string }) {
           );
         })}
       </div>
-      {parsed.multi && interactive && (
+      {parsed.multi && interactive && !grouped && (
         <button
           type="button"
           disabled={picked.size === 0 || !!busy}
@@ -196,7 +224,10 @@ export function OptionsBlock({ code }: { code: string }) {
           确认选择{picked.size > 0 ? `(${picked.size})` : ""}
         </button>
       )}
-      {sent && <p className="px-1 text-[11.5px] text-faint">已选择:{sent}</p>}
+      {sent && sentText && <p className="px-1 text-[11.5px] text-faint">已选择:{sentText}</p>}
+      {grouped && !sent && (groupEntry?.labels.length ?? 0) > 0 && (
+        <p className="px-1 text-[11.5px] text-faint">已选:{groupEntry?.labels.join("、")}(答完全部问题后统一发送)</p>
+      )}
       {!sendUserText && <p className="px-1 text-[11px] text-faint">(此会话中不可交互)</p>}
     </div>
   );
