@@ -10,7 +10,7 @@ import {
 } from "../../lib/cron";
 import type { AuthSession, CronJob } from "../../lib/types";
 import { cn } from "../../lib/utils";
-import { Alert, Button, Spinner, Switch } from "../ui";
+import { Alert, Button, Spinner, Switch, useConfirm } from "../ui";
 import { EmptyState, PanelHeader } from "./parts";
 
 const DELIVER_OPTIONS = [
@@ -28,6 +28,7 @@ export function CronPanel({ auth }: { auth: AuthSession }) {
   const [err, setErr] = useState<string | null>(null);
   const [reload, setReload] = useState(0);
   const [creating, setCreating] = useState(false);
+  const [confirmDialog, confirmDialogEl] = useConfirm();
 
   useEffect(() => {
     let alive = true;
@@ -65,7 +66,12 @@ export function CronPanel({ auth }: { auth: AuthSession }) {
 
   const remove = useCallback(
     async (job: CronJob) => {
-      if (!confirm(`删除定时任务「${job.label || job.prompt || job.id}」？`)) return;
+      const ok = await confirmDialog({
+        title: `删除定时任务「${job.label || job.prompt || job.id}」?`,
+        confirmText: "删除",
+        danger: true,
+      });
+      if (!ok) return;
       try {
         await api.deleteCron(auth, job.id);
         refresh();
@@ -73,11 +79,12 @@ export function CronPanel({ auth }: { auth: AuthSession }) {
         setErr((e as Error).message || "删除失败");
       }
     },
-    [auth, refresh],
+    [auth, refresh, confirmDialog],
   );
 
   return (
     <div className="flex flex-col">
+      {confirmDialogEl}
       <PanelHeader
         title="定时任务"
         hint="让智能体到点主动干活，并把结果按你选的方式推送。"

@@ -3,7 +3,7 @@ import { useCallback, useEffect, useState } from "react";
 import { api } from "../../lib/api";
 import type { AuthSession, SkillDetail, SkillSummary } from "../../lib/types";
 import { cn } from "../../lib/utils";
-import { Alert, Badge, Spinner } from "../ui";
+import { Alert, Badge, Spinner, useConfirm } from "../ui";
 import { EmptyState, PanelHeader } from "./parts";
 
 /**
@@ -15,6 +15,7 @@ export function SkillsPanel({ auth }: { auth: AuthSession }) {
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState<string | null>(null);
   const [reload, setReload] = useState(0);
+  const [confirmDialog, confirmDialogEl] = useConfirm();
 
   useEffect(() => {
     let alive = true;
@@ -40,7 +41,7 @@ export function SkillsPanel({ auth }: { auth: AuthSession }) {
 
   const remove = useCallback(
     async (name: string) => {
-      if (!confirm(`删除技能「${name}」？`)) return;
+      if (!(await confirmDialog({ title: `删除技能「${name}」?`, confirmText: "删除", danger: true }))) return;
       try {
         await api.deleteSkill(auth, name);
         setReload((n) => n + 1);
@@ -48,11 +49,12 @@ export function SkillsPanel({ auth }: { auth: AuthSession }) {
         setErr((e as Error).message || "删除失败");
       }
     },
-    [auth],
+    [auth, confirmDialog],
   );
 
   return (
     <div className="flex flex-col">
+      {confirmDialogEl}
       <PanelHeader title="技能" hint="完成复杂任务后智能体会把流程沉淀成可复用技能；也可从市场安装。" />
       {err && (
         <div className="px-5 pb-2">

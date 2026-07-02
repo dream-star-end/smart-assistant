@@ -228,8 +228,11 @@ export async function handleAdminStatsAlertEvents7d(
 // 聚合"运维一眼看"页:server / db pool / alerts summary / account pool snapshot。
 // 与 stats.* 同等保护级别 — JWT-only requireAdmin。所有 sub-call 并发,任一失败 → 整体 500。
 
-/** VERSION.json 由部署脚本写到 process.cwd();与 gateway /version 行为一致。 */
+/** VERSION.json 由部署脚本写到 process.cwd();与 gateway /version 行为一致。
+ *  进程生命周期内内容不变(变=重新部署=重启),成功读一次即缓存,免每次诊断请求同步 IO。 */
+let versionJsonCache: { tag: string; builtAt: string | null; commit?: string } | null = null;
 function readVersionJson(): { tag: string; builtAt: string | null; commit?: string } {
+  if (versionJsonCache) return versionJsonCache;
   const out: { tag: string; builtAt: string | null; commit?: string } = {
     tag: "unknown",
     builtAt: null,
@@ -240,6 +243,7 @@ function readVersionJson(): { tag: string; builtAt: string | null; commit?: stri
     if (typeof j.tag === "string") out.tag = j.tag;
     if (typeof j.builtAt === "string") out.builtAt = j.builtAt;
     if (typeof j.commit === "string") out.commit = j.commit;
+    versionJsonCache = out; // 只缓存成功读取;失败保持每次重读(文件可能随后被部署脚本补上)
   } catch {
     // 文件缺失 / 不可读 / 不合法 → 返回默认 unknown。
   }

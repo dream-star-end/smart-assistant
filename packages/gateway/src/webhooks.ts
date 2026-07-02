@@ -51,7 +51,13 @@ async function ensureWebhookFile(): Promise<WebhookFile> {
       const raw = await readFile(WEBHOOK_FILE, 'utf-8')
       return (parseYaml(raw) as WebhookFile) || { webhooks: [] }
     }
-  } catch {}
+  } catch (err) {
+    // 文件存在但读/解析失败(损坏 YAML/权限):**不能**静默当空文件覆写 —— 那会把用户
+    // 已配置的 webhooks 全部清零且无任何痕迹。抛出让本次操作失败可见,由人修文件。
+    throw new Error(
+      `webhooks.yaml 存在但无法读取/解析(拒绝覆写以免丢配置): ${(err as Error)?.message ?? String(err)}`,
+    )
+  }
   const file: WebhookFile = { webhooks: [] }
   await mkdir(dirname(WEBHOOK_FILE), { recursive: true })
   await writeFile(WEBHOOK_FILE, stringifyYaml(file))

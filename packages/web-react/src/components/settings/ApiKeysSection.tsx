@@ -2,7 +2,7 @@ import { Copy, KeyRound, Trash2 } from "lucide-react";
 import { useEffect, useState } from "react";
 import { ApiError, api } from "../../lib/api";
 import type { ApiKeySummary, AuthSession, CreatedApiKey } from "../../lib/types";
-import { Alert, Button, Input, Spinner } from "../ui";
+import { Alert, Button, Input, Spinner, useConfirm } from "../ui";
 import { shortTime } from "./labels";
 
 /**
@@ -20,6 +20,7 @@ export function ApiKeysSection({ auth }: { auth: AuthSession }) {
   const [creating, setCreating] = useState(false);
   const [justCreated, setJustCreated] = useState<CreatedApiKey | null>(null);
   const [copied, setCopied] = useState(false);
+  const [confirmDialog, confirmDialogEl] = useConfirm();
 
   useEffect(() => {
     let alive = true;
@@ -74,7 +75,13 @@ export function ApiKeysSection({ auth }: { auth: AuthSession }) {
   }
 
   async function remove(id: string) {
-    if (!confirm("撤销该 API Key？使用它的集成将立即失效。")) return;
+    const ok = await confirmDialog({
+      title: "撤销该 API Key?",
+      body: "使用它的集成将立即失效,不可恢复。",
+      confirmText: "撤销",
+      danger: true,
+    });
+    if (!ok) return;
     setErr(null);
     try {
       await api.deleteApiKey(auth, id);
@@ -99,6 +106,7 @@ export function ApiKeysSection({ auth }: { auth: AuthSession }) {
 
   return (
     <div className="border-t border-border px-5 py-4">
+      {confirmDialogEl}
       <div className="flex items-center gap-1.5 pb-2 text-[11px] font-medium uppercase tracking-wide text-faint">
         <KeyRound size={13} /> API Key
       </div>

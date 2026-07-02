@@ -6,11 +6,26 @@
 import { Maximize2, X } from "lucide-react";
 import { useEffect, useId, useRef, useState } from "react";
 
+/** 主题响应:观察 <html> class(useTheme 切换写入 .dark)。mermaid/chart 的配色在渲染时
+ *  快照,若不进依赖,切明暗主题后已渲染的图配色错乱(暗底浅字/浅底暗字)。 */
+function useIsDark(): boolean {
+  const [dark, setDark] = useState(() => document.documentElement.classList.contains("dark"));
+  useEffect(() => {
+    const mo = new MutationObserver(() => {
+      setDark(document.documentElement.classList.contains("dark"));
+    });
+    mo.observe(document.documentElement, { attributes: true, attributeFilter: ["class"] });
+    return () => mo.disconnect();
+  }, []);
+  return dark;
+}
+
 /** ```mermaid 代码块 → 渲染成 SVG 流程图;失败回退源码。 */
 export function MermaidBlock({ code }: { code: string }) {
   const [svg, setSvg] = useState<string | null>(null);
   const [err, setErr] = useState(false);
   const rawId = useId();
+  const isDark = useIsDark();
 
   useEffect(() => {
     let alive = true;
@@ -22,7 +37,7 @@ export function MermaidBlock({ code }: { code: string }) {
         mermaid.initialize({
           startOnLoad: false,
           securityLevel: "strict",
-          theme: document.documentElement.classList.contains("dark") ? "dark" : "default",
+          theme: isDark ? "dark" : "default",
         });
         // 先 parse 校验(suppressErrors→只返 bool,不向 document.body 注入错误图)。
         // 流式时代码常是半截 → parse=false → 回退源码,绝不调 render(render 对坏输入会把
@@ -42,7 +57,7 @@ export function MermaidBlock({ code }: { code: string }) {
     return () => {
       alive = false;
     };
-  }, [code, rawId]);
+  }, [code, rawId, isDark]);
 
   if (err) {
     return (
@@ -70,6 +85,7 @@ export function MermaidBlock({ code }: { code: string }) {
 export function ChartBlock({ code }: { code: string }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [err, setErr] = useState(false);
+  const isDark = useIsDark();
 
   useEffect(() => {
     let alive = true;
@@ -87,8 +103,10 @@ export function ChartBlock({ code }: { code: string }) {
         const { Chart, registerables } = await import("chart.js");
         Chart.register(...registerables);
         if (!alive || !canvasRef.current) return;
-        const isDark = document.documentElement.classList.contains("dark");
-        const text = isDark ? "#bcbcc7" : "#51515c";
+        // 从 CSS 变量读 token(权威=styles.css),不手抄 hex 副本 —— token 改版不漂移。
+        const text =
+          getComputedStyle(document.documentElement).getPropertyValue("--muted").trim() ||
+          (isDark ? "#bcbcc7" : "#51515c");
         const grid = isDark ? "rgba(255,255,255,0.08)" : "rgba(0,0,0,0.08)";
         const opts = (config.options ??= {}) as Record<string, any>;
         ((opts.plugins ??= {}).legend ??= {}).labels ??= {};
@@ -115,7 +133,7 @@ export function ChartBlock({ code }: { code: string }) {
         /* ignore */
       }
     };
-  }, [code]);
+  }, [code, isDark]);
 
   if (err) {
     return (

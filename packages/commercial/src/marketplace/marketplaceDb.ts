@@ -317,6 +317,12 @@ export interface ApprovedSearchRow {
 
 /** Current approved version of every active listing — the searchable catalog.
  *  `kind` lets a caller scope the catalog to skills or agents. */
+// 搜索候选集硬上限:search 是"全量拉回内存 → 关键词过滤/embedding 相似度"的实现,
+// 无上限时目录增长线性劣化(每次搜索全表 + 全量 embedding cache lookup)。
+// 500 覆盖上市初期数个量级;命中上限时告警日志 —— 那是"该把检索下沉到 SQL/pgvector"
+// 的偿还触发条件,不是调大数字。
+const SEARCH_CATALOG_CAP = 500
+
 export async function listApprovedForSearch(kind?: ArtifactKind): Promise<ApprovedSearchRow[]> {
   const r = await query<{
     id: string
@@ -331,9 +337,18 @@ export async function listApprovedForSearch(kind?: ArtifactKind): Promise<Approv
        FROM marketplace_skill_listings l
        JOIN marketplace_skill_versions v ON v.id = l.current_approved_version_id
       WHERE l.state = 'active' AND v.status = 'approved'
-            AND ($1::text IS NULL OR l.kind = $1)`,
+            AND ($1::text IS NULL OR l.kind = $1)
+      ORDER BY v.id DESC
+      LIMIT ${SEARCH_CATALOG_CAP + 1}`,
     [kind ?? null],
   )
+  if (r.rows.length > SEARCH_CATALOG_CAP) {
+    // eslint-disable-next-line no-console
+    console.warn(
+      `[marketplace] search catalog exceeded cap (${SEARCH_CATALOG_CAP}); older listings invisible to search — move retrieval into SQL/pgvector`,
+    )
+    r.rows.length = SEARCH_CATALOG_CAP
+  }
   return r.rows.map((x) => ({
     versionId: x.id,
     slug: x.slug,

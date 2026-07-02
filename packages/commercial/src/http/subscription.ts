@@ -166,6 +166,17 @@ export async function handleSubscribe(
   if (plan.code === FREE_PLAN_CODE || plan.priceCents <= 0n) {
     throw new HttpError(400, "PLAN_NOT_PURCHASABLE", "免费版无需购买");
   }
+  // 服务端拒绝"期内高档买低档":grantSubscriptionTx 的语义是**重置**期内桶+周期重开,
+  // pro 用户误点 basic 会静默清掉剩余期内额度并降级(用户吃亏,投诉/退款风险)。
+  // 同档=续费放行;升档走 /upgrade(补差价);要降级的等本期结束自动落 free 再买。
+  const cur = await getUserSubscriptionView(user.id);
+  if (cur.paid && plan.tier < cur.tier) {
+    throw new HttpError(
+      400,
+      "PLAN_DOWNGRADE_BLOCKED",
+      `当前套餐(${cur.planName})高于目标套餐,期内购买低档会清空剩余额度。如需更换,请等本期结束后再购买。`,
+    );
+  }
   // 购买/续费：全价付款，履约时期内桶重置为该档额度 + 周期顺延。
   await createOrderAndQr(
     deps,

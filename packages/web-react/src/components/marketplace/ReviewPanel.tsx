@@ -2,7 +2,7 @@ import { Check, ChevronRight, Loader2, ShieldX, X } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
 import { api } from "../../lib/api";
 import type { AuthSession, MarketplacePending } from "../../lib/types";
-import { Alert, Badge, Button, Input, Spinner } from "../ui";
+import { Alert, Badge, Button, Input, Spinner, useConfirm } from "../ui";
 import { friendlyRiskFlags } from "./riskFlags";
 
 /** 管理员审核：待审队列(批准/拒绝)+ 下架(kill-switch)。后端 requireAdminVerifyDb 二次把关。 */
@@ -13,6 +13,7 @@ export function ReviewPanel({ auth }: { auth: AuthSession }) {
   const [busy, setBusy] = useState<string | null>(null);
   const [reload, setReload] = useState(0);
   const [open, setOpen] = useState<string | null>(null);
+  const [confirmDialog, confirmDialogEl] = useConfirm();
 
   useEffect(() => {
     let alive = true;
@@ -30,7 +31,11 @@ export function ReviewPanel({ auth }: { auth: AuthSession }) {
 
   const review = useCallback(
     async (versionId: string, decision: "approve" | "reject") => {
-      if (decision === "reject" && !confirm("拒绝该版本？")) return;
+      if (
+        decision === "reject" &&
+        !(await confirmDialog({ title: "拒绝该版本?", confirmText: "拒绝", danger: true }))
+      )
+        return;
       setBusy(versionId);
       setErr(null);
       try {
@@ -42,11 +47,12 @@ export function ReviewPanel({ auth }: { auth: AuthSession }) {
         setBusy(null);
       }
     },
-    [auth],
+    [auth, confirmDialog],
   );
 
   return (
     <div className="flex flex-col">
+      {confirmDialogEl}
       {err && (
         <div className="px-4 pt-3">
           <Alert tone="danger">{err}</Alert>
@@ -150,10 +156,17 @@ function RevokeBox({ auth }: { auth: AuthSession }) {
   const [reason, setReason] = useState("");
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState<{ tone: "success" | "danger"; text: string } | null>(null);
+  const [confirmDialog, confirmDialogEl] = useConfirm();
 
   const revoke = async () => {
     if (!slug.trim()) return;
-    if (!confirm(`下架「${slug}」？所有已安装用户将在下次会话被移除该技能。`)) return;
+    const ok = await confirmDialog({
+      title: `下架「${slug}」?`,
+      body: "所有已安装用户将在下次会话被移除该技能。",
+      confirmText: "下架",
+      danger: true,
+    });
+    if (!ok) return;
     setBusy(true);
     setMsg(null);
     try {
@@ -170,6 +183,7 @@ function RevokeBox({ auth }: { auth: AuthSession }) {
 
   return (
     <div className="m-4 mt-2 rounded-xl border border-danger/30 bg-danger-soft/40 p-3.5">
+      {confirmDialogEl}
       <div className="mb-2 flex items-center gap-1.5 text-[13px] font-medium text-danger">
         <ShieldX size={15} /> 下架已上架条目（kill-switch）
       </div>

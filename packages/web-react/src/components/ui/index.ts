@@ -5,6 +5,7 @@ export { Avatar, avatarVariants, type AvatarProps } from "./Avatar";
 export { Badge, badgeVariants } from "./Badge";
 export { Button, buttonVariants, type ButtonProps } from "./Button";
 export { Card } from "./Card";
+export { useConfirm, usePrompt } from "./ConfirmDialog";
 export {
   DropdownMenu,
   DropdownMenuContent,

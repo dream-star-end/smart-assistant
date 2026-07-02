@@ -2,7 +2,7 @@ import { AlertTriangle, PackageOpen, ShieldCheck, Trash2 } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
 import { api } from "../../lib/api";
 import type { AuthSession, MarketplaceInstalled } from "../../lib/types";
-import { Alert, Badge, Button, Spinner } from "../ui";
+import { Alert, Badge, Button, Spinner, useConfirm } from "../ui";
 
 /** 我的已安装：列出当前安装的技能,可卸载;被平台下架(revoked)的条目给出醒目提醒。 */
 export function InstalledPanel({ auth, onGoBrowse }: { auth: AuthSession; onGoBrowse: () => void }) {
@@ -11,6 +11,7 @@ export function InstalledPanel({ auth, onGoBrowse }: { auth: AuthSession; onGoBr
   const [err, setErr] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [reload, setReload] = useState(0);
+  const [confirmDialog, confirmDialogEl] = useConfirm();
 
   useEffect(() => {
     let alive = true;
@@ -28,7 +29,13 @@ export function InstalledPanel({ auth, onGoBrowse }: { auth: AuthSession; onGoBr
 
   const uninstall = useCallback(
     async (slug: string, name: string, isAgent: boolean) => {
-      if (!confirm(`卸载${isAgent ? "智能体" : "技能"}「${name}」？卸载后将不再可用。`)) return;
+      const ok = await confirmDialog({
+        title: `卸载${isAgent ? "智能体" : "技能"}「${name}」?`,
+        body: "卸载后将不再可用,可随时从市场重新安装。",
+        confirmText: "卸载",
+        danger: true,
+      });
+      if (!ok) return;
       setBusy(slug);
       setErr(null);
       try {
@@ -40,11 +47,12 @@ export function InstalledPanel({ auth, onGoBrowse }: { auth: AuthSession; onGoBr
         setBusy(null);
       }
     },
-    [auth],
+    [auth, confirmDialog],
   );
 
   return (
     <div className="flex flex-col">
+      {confirmDialogEl}
       {err && (
         <div className="px-4 pt-3">
           <Alert tone="danger">{err}</Alert>

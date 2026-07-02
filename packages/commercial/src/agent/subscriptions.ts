@@ -29,6 +29,7 @@
 import type { PoolClient } from "pg";
 import { tx, query } from "../db/queries.js";
 import { volumeNamesFor } from "../agent-sandbox/volumes.js";
+import { isV5Channel } from "../runtimeChannel.js";
 
 /** agent_subscriptions.status */
 export type AgentSubscriptionStatus = "active" | "expired" | "canceled" | "suspended";
@@ -156,6 +157,15 @@ export interface OpenAgentSubscriptionResult {
 export async function openAgentSubscription(
   input: OpenAgentSubscriptionInput,
 ): Promise<OpenAgentSubscriptionResult> {
+  // v5 硬闸:本函数是 legacy agent 订阅路径,直接 UPDATE users.credits 扣费,**绕过**
+  // 0096 双钱包唯一扣费收口 spendTwoBucket。v5 下它本应休眠(AGENT_IMAGE 拒启压住),
+  // 但"将来误接线即绕过收口"是定时器 —— 这里再钉一道 fail-closed,作为双轨清理
+  // 删掉本模块前的过渡防线。
+  if (isV5Channel()) {
+    throw new Error(
+      "openAgentSubscription is a legacy v3 path (direct wallet debit, bypasses spendTwoBucket); forbidden on v5 channel",
+    );
+  }
   const uidStr = normUid(input.userId);
   const uid = uidToInt(uidStr);
   const price = input.priceCredits ?? DEFAULT_AGENT_PLAN_PRICE_CREDITS;
