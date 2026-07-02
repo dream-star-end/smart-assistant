@@ -212,7 +212,8 @@ export async function handleMarketplacePublish(
       ok: true,
       versionId,
       status: 'pending',
-      riskFlags: scan.flags,
+      // 含 scripts 危险模式的 warning flag —— 发布者与审核者看到同一份提示。
+      riskFlags: [...scan.flags, ...scriptFlags],
       note: '已提交,平台审核通过后才会上架并对其他用户可见。',
     })
   } catch (e) {
