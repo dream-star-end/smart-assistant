@@ -21,7 +21,16 @@ import {
 import { getSession, isSending, setSending, state } from './state.js'
 
 // ── API layer ──
-import { apiFetch, apiGet, apiJson, authHeaders, onAuthExpired, resetAuthExpired } from './api.js'
+import {
+  apiFetch,
+  apiGet,
+  apiJson,
+  authHeaders,
+  isApiFileUrl,
+  onAuthExpired,
+  resetAuthExpired,
+  ticketedFileUrl,
+} from './api.js'
 
 // ── IndexedDB ──
 import { dbDelete, dbGetAll, dbPut, onIdbUnavailable, openDB } from './db.js'
@@ -613,6 +622,9 @@ document.addEventListener('dblclick', (e) => {
 })
 
 // ── Image action buttons (copy/download/open) ──
+// /api/file 的下载与新标签页打开先换 ticket URL:鸿蒙/华为系浏览器把这两类
+// 导航交给系统组件重新请求,不带 cookie —— 直连 /api/file 会 401。
+// ticket 获取失败(旧网关/未登录)时回退旧行为。
 document.addEventListener('click', (e) => {
   const btn = e.target.closest?.('[data-img-action]')
   if (!btn) return
@@ -626,14 +638,50 @@ document.addEventListener('click', (e) => {
     fallbackCopy(src)
     toast('已复制图片链接')
   } else if (action === 'download') {
-    const a = document.createElement('a')
-    a.href = src
-    a.download = src.split('/').pop()?.split('?')[0] || 'image.jpg'
-    a.target = '_blank'
-    a.click()
+    ;(async () => {
+      const url = await ticketedFileUrl(src, 'attachment')
+      const a = document.createElement('a')
+      a.href = url
+      if (url === src) {
+        // 回退直连:保留 <a download> 提示浏览器落盘(旧行为)
+        a.download = src.split('/').pop()?.split('?')[0] || 'image.jpg'
+        a.target = '_blank'
+      }
+      // ticket URL 由服务端 Content-Disposition: attachment 强制落盘,
+      // 不带 download 属性,绕开华为/Quark 对 <a download> 的拦截。
+      a.click()
+    })()
   } else if (action === 'open') {
-    window.open(src, '_blank', 'noopener,noreferrer')
+    if (!isApiFileUrl(src)) {
+      window.open(src, '_blank', 'noopener,noreferrer')
+      return
+    }
+    // 同步预开空白页占住 user activation(异步取 ticket 后再 window.open 会被
+    // 移动内核当弹窗拦截)。不能带 noopener,否则拿不到句柄导航。
+    const popup = window.open('about:blank', '_blank')
+    ;(async () => {
+      const url = await ticketedFileUrl(src, 'inline')
+      if (popup && !popup.closed) popup.location.replace(url)
+      else window.open(url, '_blank', 'noopener,noreferrer')
+    })()
   }
+})
+
+// ── doc-card(PDF/文档卡片)点击:走 ticket URL + 预开新标签页 ──
+// 华为/Quark/UC 对 <a download> 和裸链接下载有 site-level 拦截;预开 popup 后
+// 用"用户主动顶层导航"接收响应可绕开(对齐 v3 1213709f 模式)。
+document.addEventListener('click', (e) => {
+  const card = e.target.closest?.('a.doc-card')
+  if (!card) return
+  const href = card.getAttribute('href') || ''
+  if (!isApiFileUrl(href)) return
+  e.preventDefault()
+  const popup = window.open('about:blank', '_blank')
+  ;(async () => {
+    const url = await ticketedFileUrl(href, 'inline')
+    if (popup && !popup.closed) popup.location.replace(url)
+    else window.open(url, '_blank', 'noopener,noreferrer')
+  })()
 })
 
 // ── Escape key: close modals, lightbox, palette ──

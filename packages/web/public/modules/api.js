@@ -123,3 +123,35 @@ export async function apiJson(method, path, body, opts = {}) {
   if (!res.ok) throw _httpError(`${method} ${path}`, res.status, data?.error || data?.message)
   return data
 }
+
+// ── Ticketed file download URLs ──
+// 鸿蒙/华为系浏览器把下载/新标签页导航交给系统组件重新请求,该请求不带
+// cookie/Authorization,直连 /api/file 会 401(下载到 {"error":"unauthorized"})。
+// 下载前先在已认证通道换一张短时效 ticket URL(凭证在 URL 里)。
+// 任何失败(未登录、旧网关无端点、超时)都回退直连 URL,行为与旧版一致。
+export async function ticketedFileUrl(src, disposition = 'attachment') {
+  try {
+    const u = new URL(src, location.origin)
+    if (u.origin !== location.origin || u.pathname !== '/api/file') return src
+    const path = u.searchParams.get('path')
+    if (!path) return src
+    const data = await apiJson(
+      'POST',
+      '/api/file/download-ticket',
+      { path, disposition },
+      { timeout: 5000, suppressAuthRedirect: true },
+    )
+    if (data?.ok && typeof data.url === 'string') return data.url
+  } catch {}
+  return src
+}
+
+// 判断一个 URL 是否指向本网关的 /api/file(能走 ticket 流程)
+export function isApiFileUrl(src) {
+  try {
+    const u = new URL(src, location.origin)
+    return u.origin === location.origin && u.pathname === '/api/file'
+  } catch {
+    return false
+  }
+}

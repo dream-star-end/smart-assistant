@@ -26,25 +26,38 @@ export function fileToText(file) {
   })
 }
 
+// 限定 classifyFile 的 'text' 出口。file-input 已无 accept 白名单(鸿蒙/国产内核
+// 的系统选择器会按 accept 灰掉文件不可选),任意文件都可能进来 —— 默认必须是
+// 'file' 而不是 'text',防 ≤5MB 未知 binary 被 fileToText 读成乱码塞进消息。
+const TEXT_EXTS =
+  /\.(txt|md|json|yaml|yml|csv|log|xml|html|htm|js|ts|tsx|py|go|rs|java|c|cpp|h|sh|sql)$/i
+
+// 浏览器对部分压缩档给出的 MIME(application/x-rar-compressed 变体等)不在后端
+// isUploadMimeAllowed 的稳定前缀里,上传时显式降级 application/octet-stream
+// (后端显式接受)。zip/gzip 的标准 MIME 后端本就放行,不需要降级。
+const ARCHIVE_EXTS_OCTET_FALLBACK = /\.(rar|7z|tar|gz|tgz|bz2|xz|zst)$/i
+
 export function classifyFile(file) {
-  const t = file.type || ''
+  const t = (file.type || '').toLowerCase()
+  const name = (file.name || '').toLowerCase()
   if (t.startsWith('image/')) return 'image'
   if (t.startsWith('audio/')) return 'audio'
   if (t.startsWith('video/')) return 'video'
-  // Binary document types → 'file' kind (sent as base64)
-  // 归档类扩展需放 `.tar.gz` / `.tgz` 在单独 alt 分支,`.gz` 放最后避免先匹配到。
-  const binExts = /\.(pdf|doc|docx|xls|xlsx|ppt|pptx|zip|rar|7z|tar\.gz|tgz|tar|bz2|xz|gz)$/i
+  // 明确文本判定 — MIME 是 text/* 或常见文本 application/* 或扩展名命中文本白名单
   if (
-    binExts.test(file.name) ||
-    t === 'application/pdf' ||
-    t.includes('officedocument') ||
-    t.includes('msword') ||
-    t.includes('ms-excel') ||
-    t.includes('ms-powerpoint')
+    t.startsWith('text/') ||
+    t === 'application/json' ||
+    t === 'application/xml' ||
+    t === 'application/javascript' ||
+    t === 'text/javascript' ||
+    TEXT_EXTS.test(name)
   ) {
-    return 'file'
+    return 'text'
   }
-  return 'text' // fallback: treat as text
+  // 其余一律 'file' — 包括已知文档(.pdf/.docx/...)、压缩档(.zip/.rar/.7z/...)
+  // 以及任何浏览器没识别出 MIME 的未知二进制。后端 isUploadMimeAllowed 决定
+  // 哪些 MIME 通得过;uploadAttachment 对压缩档做 octet-stream 兜底。
+  return 'file'
 }
 
 export async function addFiles(fileList) {
@@ -98,7 +111,13 @@ export function removeAttachment(idx) {
 // onProgress(pct) is called with an integer 0–100 as bytes go out.
 export function uploadAttachment(att, onProgress) {
   return new Promise((resolve, reject) => {
-    const qs = new URLSearchParams({ name: att.name, mime: att.type, kind: att.kind })
+    // 压缩档 MIME 浏览器间不稳定(x-rar-compressed 变体等),显式降级
+    // octet-stream 保证过后端 isUploadMimeAllowed;空 MIME 同样兜底。
+    const isArchive = att.kind === 'file' && ARCHIVE_EXTS_OCTET_FALLBACK.test(att.name || '')
+    const uploadMime = isArchive
+      ? 'application/octet-stream'
+      : att.type || 'application/octet-stream'
+    const qs = new URLSearchParams({ name: att.name, mime: uploadMime, kind: att.kind })
     const xhr = new XMLHttpRequest()
     xhr.open('POST', `/api/attachments?${qs}`)
     if (state.token) xhr.setRequestHeader('Authorization', `Bearer ${state.token}`)

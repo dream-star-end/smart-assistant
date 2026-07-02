@@ -314,6 +314,25 @@ describe('ClaudeTerminalManager lifecycle', () => {
     assert.doesNotMatch(SERVER_SRC, /searchParams\.get\(['"]token['"]\)/)
   })
 
+  test('server exposes scoped path-bound tickets for /api/file downloads (HarmonyOS 系统下载组件不带 cookie)', () => {
+    // 签发端点存在且仅 POST
+    assert.match(
+      SERVER_SRC,
+      /url\.pathname === '\/api\/file\/download-ticket' && req\.method === 'POST'/,
+    )
+    // 鉴权闸豁免只针对 /api/file 且必须持有 file-scope 有效 ticket
+    assert.match(
+      SERVER_SRC,
+      /url\.pathname === '\/api\/file' && this\.getFileDownloadTicketUserId\(url\) !== null/,
+    )
+    // 终端票据与文件票据共享一套存储但 scope 隔离,互不通用
+    assert.match(SERVER_SRC, /entry\.scope !== scope/)
+    assert.match(SERVER_SRC, /this\.getDownloadTicketUserId\('terminal', url\)/)
+    assert.match(SERVER_SRC, /this\.getDownloadTicketUserId\('file', url\)/)
+    // 签发不放宽文件访问边界:路径语法校验仍在,GET /api/file 全量安全检查照常
+    assert.match(SERVER_SRC, /rawPath\.includes\('\.\.'\)/)
+  })
+
   test('server terminal routes use the terminal-specific principal', () => {
     assert.match(SERVER_SRC, /private getClaudeTerminalUserId\(req: IncomingMessage\)/)
     assert.match(SERVER_SRC, /configuredUsers\.some\(\(u\) => u\.id === jwtUserId\)/)

@@ -180,7 +180,13 @@ interface TerminalUploadState {
   writing: boolean
 }
 
+// Download tickets carry auth in the URL itself. HarmonyOS/华为系浏览器把下载
+// 转交给系统下载组件重新请求,该请求不带 cookie / Authorization —— 只有 URL 内
+// 凭证能到达。scope 把终端文件下载和 /api/file 下载隔离成两类票据,互不通用。
+type DownloadTicketScope = 'terminal' | 'file'
+
 interface TerminalDownloadTicketState {
+  scope: DownloadTicketScope
   userId: string
   path: string
   expiresAt: number
@@ -1418,6 +1424,8 @@ export class Gateway {
     const hasTerminalDownloadTicketAuth =
       url.pathname === '/api/claude-terminal/download' &&
       this.getClaudeTerminalDownloadTicketUserId(url) !== null
+    const hasFileDownloadTicketAuth =
+      url.pathname === '/api/file' && this.getFileDownloadTicketUserId(url) !== null
     const needsAuth =
       (url.pathname.startsWith('/api/') && url.pathname !== '/api/healthz') ||
       url.pathname.startsWith('/v1/') ||
@@ -1426,7 +1434,8 @@ export class Gateway {
       needsAuth &&
       !this.checkHttpAuth(req) &&
       !hasChatGptWebScopedAuth &&
-      !hasTerminalDownloadTicketAuth
+      !hasTerminalDownloadTicketAuth &&
+      !hasFileDownloadTicketAuth
     ) {
       res.writeHead(401, { 'Content-Type': 'application/json' })
       res.end(JSON.stringify({ error: 'unauthorized' }))
@@ -2142,6 +2151,18 @@ export class Gateway {
       return
     }
 
+    // ── Download ticket for /api/file ──
+    // 鸿蒙/华为系浏览器的系统下载组件重新请求 URL 时不带 cookie/Authorization,
+    // 直连 /api/file 会 401。前端下载/新标签页打开前先在已认证通道换一张短时效
+    // ticket URL(凭证在 URL 里)。路径的 allowlist/denylist/realpath 安全检查
+    // 不在签发时做 —— GET /api/file 对 ticket 请求照常全量执行。
+    if (url.pathname === '/api/file/download-ticket' && req.method === 'POST') {
+      this.handleFileDownloadTicket(req, res).catch((err) => {
+        this.sendError(res, 400, err instanceof Error ? err.message : String(err))
+      })
+      return
+    }
+
     // ── File serving by absolute path (whitelist-restricted) ──
     if (url.pathname === '/api/file') {
       const filePath = url.searchParams.get('path')
@@ -2211,7 +2232,14 @@ export class Gateway {
       const fileContentType = mimeFor(realResolved)
       // C3: Force download for active content types, and for non-previewable
       // documents such as .docx so mobile browsers do not open a blank tab.
-      const fileDispositionMode = shouldServeInline(fileContentType) ? 'inline' : 'attachment'
+      // ?disposition=attachment 允许下载按钮强制落盘(即便是可内联的图片/PDF);
+      // inline 方向仍受 shouldServeInline 约束,不放宽。
+      const fileDispositionMode =
+        url.searchParams.get('disposition') === 'attachment'
+          ? 'attachment'
+          : shouldServeInline(fileContentType)
+            ? 'inline'
+            : 'attachment'
       res.writeHead(200, {
         'Content-Type': fileContentType,
         'Content-Length': fileStat.size,
@@ -4075,13 +4103,14 @@ export class Gateway {
     }
   }
 
-  private getClaudeTerminalDownloadTicketUserId(url: URL): string | null {
+  private getDownloadTicketUserId(scope: DownloadTicketScope, url: URL): string | null {
     const ticket = url.searchParams.get('ticket') || ''
     const rawPath = url.searchParams.get('path')
     if (!ticket || !rawPath) return null
     this.cleanupTerminalDownloadTickets()
     const entry = this._terminalDownloadTickets.get(ticket)
     if (!entry) return null
+    if (entry.scope !== scope) return null
     if (entry.expiresAt <= Date.now()) {
       this._terminalDownloadTickets.delete(ticket)
       return null
@@ -4090,15 +4119,28 @@ export class Gateway {
     return entry.userId
   }
 
-  private createClaudeTerminalDownloadTicket(userId: string, path: string): string {
+  private getClaudeTerminalDownloadTicketUserId(url: URL): string | null {
+    return this.getDownloadTicketUserId('terminal', url)
+  }
+
+  private getFileDownloadTicketUserId(url: URL): string | null {
+    return this.getDownloadTicketUserId('file', url)
+  }
+
+  private createDownloadTicket(scope: DownloadTicketScope, userId: string, path: string): string {
     this.cleanupTerminalDownloadTickets()
     const ticket = randomBytes(32).toString('base64url')
     this._terminalDownloadTickets.set(ticket, {
+      scope,
       userId,
       path,
       expiresAt: Date.now() + TERMINAL_DOWNLOAD_TICKET_TTL_MS,
     })
     return ticket
+  }
+
+  private createClaudeTerminalDownloadTicket(userId: string, path: string): string {
+    return this.createDownloadTicket('terminal', userId, path)
   }
 
   private terminalDownloadUrl(
@@ -4386,6 +4428,29 @@ export class Gateway {
     this.sendJson(res, 200, {
       ok: true,
       url: this.terminalDownloadUrl(rawPath, ticket, disposition),
+      expiresInMs: TERMINAL_DOWNLOAD_TICKET_TTL_MS,
+    })
+  }
+
+  // POST /api/file/download-ticket — 已认证请求换取 /api/file 的短时效下载 URL。
+  // 只做路径语法校验(绝对路径、无 ..);allowlist/denylist/realpath 检查由
+  // GET /api/file 对每次请求全量执行,签发 ticket 不放宽任何文件访问边界。
+  private async handleFileDownloadTicket(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    const body = await this.readJsonBody<Record<string, unknown>>(req, 16 * 1024)
+    const rawPath = typeof body.path === 'string' ? body.path : ''
+    const isAbsolute = rawPath.startsWith('/') || /^[A-Za-z]:[\\\/]/.test(rawPath)
+    if (!rawPath || rawPath.includes('..') || !isAbsolute) {
+      this.sendJson(res, 400, { ok: false, error: 'bad path' })
+      return
+    }
+    const disposition = body.disposition === 'inline' ? 'inline' : 'attachment'
+    const userId = this.getUserId(req)
+    const ticket = this.createDownloadTicket('file', userId, rawPath)
+    const q = new URLSearchParams({ path: rawPath, ticket })
+    if (disposition === 'attachment') q.set('disposition', 'attachment')
+    this.sendJson(res, 200, {
+      ok: true,
+      url: `/api/file?${q.toString()}`,
       expiresInMs: TERMINAL_DOWNLOAD_TICKET_TTL_MS,
     })
   }
