@@ -22,7 +22,7 @@ import { AssistantMessage, UserMessage } from "./components/Message";
 import { MessageList } from "./components/MessageRenderer";
 import type { CardCallbacks } from "./components/chat/cards";
 import { MediaSignProvider } from "./components/chat/media";
-import { ToolCardActionsContext } from "./components/tool/context";
+import { ChatInteractionContext, ToolCardActionsContext } from "./components/tool/context";
 import { modelLabel } from "./components/ModelSelector";
 import { SettingsCenter } from "./components/SettingsCenter";
 import { Sidebar } from "./components/Sidebar";
@@ -588,6 +588,12 @@ export function App() {
     [demo, openManage],
   );
 
+  // 对话交互(```options 选择卡片等):点选即替用户发送。demo 不给发送能力(纯展示)。
+  const chatInteraction = useMemo(
+    () => (demo ? {} : { sendUserText: (t: string) => send(t), busy: sending }),
+    [demo, send, sending],
+  );
+
   // 卡片回调集（稳定引用：作为 MessageRenderer memo 比较键之一，避免无谓重渲）。
   const cardCallbacks: CardCallbacks = useMemo(
     () => ({
@@ -745,6 +751,7 @@ export function App() {
   return (
     <MediaSignProvider sign={demo ? null : signMedia} authKey={user?.id ?? "anon"}>
     <ToolCardActionsContext.Provider value={toolActions}>
+    <ChatInteractionContext.Provider value={chatInteraction}>
     {/* safe-px:横屏侧刘海安全区(竖屏为 0) */}
     <div className="flex h-full overflow-hidden bg-bg text-fg safe-px">
       {/* 桌面：内联侧栏（可折叠）。窄屏隐藏，改用抽屉。 */}
@@ -995,6 +1002,7 @@ export function App() {
       {confirmDialogEl}
       {promptTextEl}
     </div>
+    </ChatInteractionContext.Provider>
     </ToolCardActionsContext.Provider>
     </MediaSignProvider>
   );

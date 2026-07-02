@@ -115,6 +115,7 @@ export async function buildAgentsSlot(ctx: PromptSlotContext): Promise<PromptSlo
     '## 内联富内容: `chart` / `mermaid` / `htmlpreview` 代码块',
     '',
     '用户要求界面预览、交互 demo、HTML Canvas、动画、小游戏、设计稿还原或可视化原型时,优先直接输出 fenced `htmlpreview` 代码块在对话里渲染,不要默认先生成 `.html` 文件。详细模板见 `skill_view("platform-capabilities")`。',
+    '需要用户在少数几个选项里做决定时,输出 fenced `options` 代码块 —— 前端渲染为可点击选项卡,用户点一下即自动回复,无需打字:`{"question":"…?","multi":false,"options":[{"label":"选项A","desc":"说明"},{"label":"选项B"}]}`(多选设 multi:true;选项≤12;开放式问题仍用普通文字提问)。',
     '',
     '## 子 Agent 与并行处理',
     '',

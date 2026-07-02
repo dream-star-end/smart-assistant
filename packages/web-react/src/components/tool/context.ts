@@ -26,3 +26,20 @@ export const ToolCardActionsContext = createContext<ToolCardActions>({});
 export function useToolCardActions(): ToolCardActions {
   return useContext(ToolCardActionsContext);
 }
+
+/**
+ * 对话交互 context —— 让消息渲染层的交互块(如 ```options 选择卡片)能替用户
+ * 发送一条消息。与 ToolCardActions 同一注入哲学:有 provider 才可交互,无则降级
+ * 为纯展示。busy = 正在流式/发送中,交互块应禁用点击。
+ */
+export type ChatInteraction = {
+  sendUserText?: (text: string) => void;
+  busy?: boolean;
+};
+
+export const ChatInteractionContext = createContext<ChatInteraction>({});
+
+export function useChatInteraction(): ChatInteraction {
+  return useContext(ChatInteractionContext);
+}
+

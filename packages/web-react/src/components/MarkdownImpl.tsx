@@ -15,7 +15,7 @@ import "katex/dist/katex.min.css";
 import type { ReactNode } from "react";
 import { SignedAudio, SignedFileCard, SignedImg, SignedVideo } from "./chat/media";
 import { CodeBlock } from "./CodeBlock";
-import { ChartBlock, HtmlPreview, MermaidBlock } from "./RichBlocks";
+import { OptionsBlock, ChartBlock, HtmlPreview, MermaidBlock } from "./RichBlocks";
 import type { MarkdownProps } from "./Markdown";
 import { normalizeMathDelimiters } from "./mathDelimiters";
 
@@ -174,6 +174,7 @@ export default function MarkdownImpl({ children, signMedia }: MarkdownProps) {
               // 富块:mermaid 流程图 / html 沙盒预览(取原文,绕开 highlight 的 span 包裹)。
               if (lang === "mermaid") return <MermaidBlock code={nodeText(children).replace(/\n$/, "")} />;
               if (lang === "chart") return <ChartBlock code={nodeText(children).replace(/\n$/, "")} />;
+              if (lang === "options") return <OptionsBlock code={nodeText(children).replace(/\n$/, "")} />;
               if (lang === "html" || lang === "htmlpreview")
                 return <HtmlPreview code={nodeText(children).replace(/\n$/, "")} />;
               return (

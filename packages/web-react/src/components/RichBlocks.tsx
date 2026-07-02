@@ -4,7 +4,8 @@
  * 独立 chunk(只有真出现 ```mermaid 才下载,不拖累首屏与普通对话)。
  */
 import { Maximize2, X } from "lucide-react";
-import { useEffect, useId, useRef, useState } from "react";
+import { useChatInteraction } from "./tool/context";
+import { useMemo, useEffect, useId, useRef, useState } from "react";
 
 /** 主题响应:观察 <html> class(useTheme 切换写入 .dark)。mermaid/chart 的配色在渲染时
  *  快照,若不进依赖,切明暗主题后已渲染的图配色错乱(暗底浅字/浅底暗字)。 */
@@ -78,6 +79,126 @@ export function MermaidBlock({ code }: { code: string }) {
       // biome-ignore lint/security/noDangerouslySetInnerHtml: mermaid strict-sanitized SVG
       dangerouslySetInnerHTML={{ __html: svg }}
     />
+  );
+}
+
+
+// ── ```options 选择卡片 ──────────────────────────────────────────────────────
+// AI 提问时输出 {"question","multi"?,"options":[{"label","desc"?}]} 的 options 代码块,
+// 渲染为可点击选项卡:单选点击即替用户发送「我选择:<label>」;多选勾选后点「确认选择」。
+// 无 ChatInteractionContext provider(历史/demo)或 JSON 半截(流式)时回退纯展示。
+
+interface OptionItem {
+  label: string;
+  desc?: string;
+}
+
+function parseOptionsBlock(
+  code: string,
+): { question?: string; multi: boolean; options: OptionItem[] } | null {
+  try {
+    const raw = JSON.parse(code) as Record<string, unknown>;
+    if (!raw || typeof raw !== "object" || !Array.isArray(raw.options)) return null;
+    const options: OptionItem[] = [];
+    for (const o of raw.options as unknown[]) {
+      if (typeof o === "string") options.push({ label: o });
+      else if (o && typeof o === "object" && typeof (o as { label?: unknown }).label === "string") {
+        const oo = o as { label: string; desc?: unknown };
+        options.push({ label: oo.label, ...(typeof oo.desc === "string" ? { desc: oo.desc } : {}) });
+      }
+    }
+    if (options.length === 0 || options.length > 12) return null;
+    return {
+      question: typeof raw.question === "string" ? raw.question : undefined,
+      multi: raw.multi === true,
+      options,
+    };
+  } catch {
+    return null; // 流式半截 / 非法 JSON → 调用方回退源码
+  }
+}
+
+export function OptionsBlock({ code }: { code: string }) {
+  const { sendUserText, busy } = useChatInteraction();
+  const [picked, setPicked] = useState<Set<number>>(new Set());
+  const [sent, setSent] = useState<string | null>(null);
+  const parsed = useMemo(() => parseOptionsBlock(code), [code]);
+  if (!parsed) {
+    return (
+      <pre className="overflow-auto rounded-lg bg-code px-3 py-2 font-mono text-[12px] text-fg">{code}</pre>
+    );
+  }
+  const interactive = !!sendUserText && !sent;
+  const choose = (i: number) => {
+    if (!interactive || busy) return;
+    if (parsed.multi) {
+      setPicked((p) => {
+        const n = new Set(p);
+        if (n.has(i)) n.delete(i);
+        else n.add(i);
+        return n;
+      });
+    } else {
+      const label = parsed.options[i].label;
+      setSent(label);
+      sendUserText?.(`我选择:${label}`);
+    }
+  };
+  const confirmMulti = () => {
+    if (!interactive || busy || picked.size === 0) return;
+    const labels = [...picked].sort((a, b) => a - b).map((i) => parsed.options[i].label);
+    setSent(labels.join("、"));
+    sendUserText?.(`我选择:${labels.join("、")}`);
+  };
+  return (
+    <div className="my-1.5 flex flex-col gap-1.5 rounded-xl border border-border bg-surface p-2.5 not-prose">
+      {parsed.question && <p className="px-1 text-[13px] font-medium text-fg">{parsed.question}</p>}
+      <div className="grid grid-cols-1 gap-1.5 sm:grid-cols-2">
+        {parsed.options.map((o, i) => {
+          const chosen = parsed.multi ? picked.has(i) : sent === o.label;
+          return (
+            <button
+              key={`${i}-${o.label}`}
+              type="button"
+              disabled={!interactive || !!busy}
+              onClick={() => choose(i)}
+              className={
+                "flex items-start gap-2 rounded-lg border px-3 py-2 text-left transition-colors outline-none focus-visible:ring-2 focus-visible:ring-ring " +
+                (chosen
+                  ? "border-accent bg-accent-soft"
+                  : "border-border bg-elevated hover:border-accent/40 hover:bg-hover") +
+                (!interactive || busy ? " cursor-default opacity-80" : "")
+              }
+            >
+              <span
+                className={
+                  "mt-0.5 flex size-4 shrink-0 items-center justify-center rounded-full border text-[10px] " +
+                  (chosen ? "border-accent bg-accent text-white" : "border-border text-transparent")
+                }
+              >
+                ✓
+              </span>
+              <span className="min-w-0">
+                <span className="block text-[13px] font-medium text-fg">{o.label}</span>
+                {o.desc && <span className="mt-0.5 block text-[11.5px] leading-snug text-muted">{o.desc}</span>}
+              </span>
+            </button>
+          );
+        })}
+      </div>
+      {parsed.multi && interactive && (
+        <button
+          type="button"
+          disabled={picked.size === 0 || !!busy}
+          onClick={confirmMulti}
+          className="self-end rounded-lg bg-accent px-3.5 py-1.5 text-[12.5px] font-medium text-white transition-opacity disabled:opacity-40"
+        >
+          确认选择{picked.size > 0 ? `(${picked.size})` : ""}
+        </button>
+      )}
+      {sent && <p className="px-1 text-[11.5px] text-faint">已选择:{sent}</p>}
+      {!sendUserText && <p className="px-1 text-[11px] text-faint">(此会话中不可交互)</p>}
+    </div>
   );
 }
 
