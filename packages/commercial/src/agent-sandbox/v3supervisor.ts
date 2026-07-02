@@ -296,6 +296,7 @@ export const V3_CCB_BASELINE_SKILL_NAMES = [
   "code-review",
   "debugging",
   "testing",
+  "skill-authoring",
 ] as const;
 
 /**
