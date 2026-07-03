@@ -14,15 +14,15 @@
  * 重要：调用方必须以**稳定 key（消息 id）**挂载本组件，使展开/折叠的 useState 跨流式
  * 重渲存活（运行中默认展开、完成后保留用户选择的语义依赖于此）。
  *
- * 二级分派：按 toolName 走 {@link ToolBody}（builtin / MCP / generic），不实现 codex 卡。
- * 流式：input 经 resolveToolInput 优先 inputJson、其次容错解析 partialJson —— Edit/Write
+ * 二级分派：按 toolName 走 {@link ToolBody}（builtin / MCP / Codex / generic）。
+ * 流式：input 经 normalizeToolForDisplay/resolveToolInput 优先 inputJson、其次容错解析 partialJson —— Edit/Write
  * 的 diff/内容据此边流边渲；_completed 后切完整 inputJson。
  */
 import { Check, ChevronRight } from "lucide-react";
 import { useState } from "react";
 import { cn } from "../lib/utils";
 import { ToolBody } from "./tool/bodies";
-import { resolveToolInput, type ToolLike } from "./tool/format";
+import { normalizeToolForDisplay, type ToolLike } from "./tool/format";
 import { resolveToolMeta, toolSummary } from "./tool/meta";
 import { Badge, Spinner } from "./ui";
 
@@ -38,19 +38,21 @@ const TONE_TILE: Record<string, string> = {
 };
 
 export function ToolCard({ message }: { message: ToolLike }) {
-  const name = message.toolName || "unknown";
-  const input = resolveToolInput(message);
+  const display = normalizeToolForDisplay(message);
+  const name = display.name;
+  const input = display.input;
+  const renderTool = display.tool;
   const meta = resolveToolMeta(name, input);
   const Icon = meta.icon;
   const summary = toolSummary(name, input);
 
-  const completed = !!message._completed;
-  const isError = !!message.error;
+  const completed = !!renderTool._completed;
+  const isError = !!renderTool.error;
   const isRunning = !completed && !isError;
   const statusLabel = isRunning ? "运行中" : isError ? "失败" : "完成";
 
   const hasInput = !!input && Object.keys(input).length > 0;
-  const hasOutput = !!message.output || !!message.bashTail;
+  const hasOutput = !!renderTool.output || !!renderTool.bashTail;
   const hasBody = hasInput || hasOutput || isError;
 
   // 运行中（流式）默认展开以便边流边看 diff/输出；历史（挂载即完成）默认折叠。
@@ -106,7 +108,7 @@ export function ToolCard({ message }: { message: ToolLike }) {
       </button>
       {open && hasBody && (
         <div className="border-t border-border px-3.5 py-2.5 [&>*:first-child]:mt-0">
-          <ToolBody name={name} input={input} tool={message} />
+          <ToolBody name={name} input={input} tool={renderTool} />
         </div>
       )}
     </div>

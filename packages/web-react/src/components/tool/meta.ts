@@ -2,7 +2,8 @@
  * 工具图标 / 标签 / 摘要的解析层（Aurora 视觉，功能基线对齐现网
  * `_TOOL_ICONS` / `_TOOL_LABELS` / `_MCP_SERVER_META` / `_MCP_OP_META` / `_toolSummary`）。
  *
- * v5 无 codex —— **不实现** `codex:<type>` 与 `Codex:multiAgent` 的图标/标签/摘要。
+ * 兼容 v3/Codex 历史工具名：Codex wrapper 会先在 format 层归一化；
+ * 少量非 wrapper Codex item 在这里给出友好标签/摘要。
  * 图标统一走 lucide-react（Aurora 设计系统的图标权威源），不再内联 SVG 字符串。
  */
 import {
@@ -35,7 +36,7 @@ import {
   Wrench,
   type LucideIcon,
 } from "lucide-react";
-import { asArr, asStr, shortPath } from "./format";
+import { asArr, asStr, parseCodexTypeName, shortPath } from "./format";
 
 /** 工具卡图标底色语义(对齐设计稿 aurora-conversation-cards 的 .tic.tn-* 分色)。 */
 export type ToolTone = "accent" | "success" | "info" | "warning" | "neutral";
@@ -60,6 +61,24 @@ const TOOL_META: Record<string, ToolMeta> = {
   CronList: { icon: Clock, label: "定时任务列表", tone: "accent" },
   CronCreate: { icon: Clock, label: "创建定时任务", tone: "accent" },
   CronDelete: { icon: Clock, label: "删除定时任务", tone: "accent" },
+  // v3/Codex 历史会话里可能出现的非标准 toolName，补语义标签避免裸英文。
+  Skill: { icon: Sparkles, label: "启用技能", tone: "accent" },
+  TaskOutput: { icon: Bot, label: "子任务结果", tone: "accent" },
+  EnterPlanMode: { icon: ListChecks, label: "进入计划模式", tone: "accent" },
+  ExitPlanMode: { icon: ListChecks, label: "退出计划模式", tone: "accent" },
+  TaskStop: { icon: Bot, label: "停止子任务", tone: "warning" },
+  delegate_task: { icon: Bot, label: "委托子任务", tone: "accent" },
+};
+
+const CODEX_TYPE_META: Record<string, ToolMeta> = {
+  imageView: { icon: Eye, label: "查看图片", tone: "warning" },
+  imageGeneration: { icon: ImageIcon, label: "生成图片", tone: "accent" },
+  contextCompaction: { icon: Archive, label: "压缩上下文", tone: "neutral" },
+  enteredReviewMode: { icon: Bot, label: "进入审阅模式", tone: "accent" },
+  exitedReviewMode: { icon: Bot, label: "退出审阅模式", tone: "neutral" },
+  dynamicToolCall: { icon: Wrench, label: "工具调用", tone: "neutral" },
+  mcpToolCall: { icon: Wrench, label: "MCP 工具", tone: "neutral" },
+  userMessage: { icon: Bot, label: "Codex 消息", tone: "neutral" },
 };
 
 // ── 容器内 oc-* CLI(经 Bash 调用)→ 语义卡 ──
@@ -122,6 +141,7 @@ const MCP_SERVER_META: Record<string, ToolMeta> = {
   "openclaude-vision": { icon: Eye, label: "视觉理解", tone: "warning" },
   "openclaude-memory": { icon: Brain, label: "记忆", tone: "accent" },
   "scansci-pdf": { icon: FileText, label: "论文检索", tone: "info" },
+  "web-context": { icon: Globe, label: "网页/文档提取", tone: "info" },
   "quant-system": { icon: BarChart3, label: "量化", tone: "info" },
 };
 
@@ -177,9 +197,14 @@ const MCP_OP_META: Record<string, ToolMeta> = {
   "openclaude-memory:delegate_task": { icon: Bot, label: "委托子任务" },
   "openclaude-memory:send_to_agent": { icon: Send, label: "发送给子 Agent" },
   "openclaude-memory:skill_list": { icon: Sparkles, label: "技能列表" },
+  "openclaude-memory:skill_search": { icon: Sparkles, label: "技能检索" },
   "openclaude-memory:skill_view": { icon: Sparkles, label: "查看技能" },
   "openclaude-memory:skill_save": { icon: Sparkles, label: "保存技能" },
   "openclaude-memory:skill_delete": { icon: Sparkles, label: "删除技能" },
+  "openclaude-memory:ask_gpt55_codex": { icon: Bot, label: "Codex 审查" },
+  // web-context
+  "web-context:web_context_extract_url": { icon: Globe, label: "网页提取" },
+  "web-context:web_context_parse_file": { icon: FileText, label: "文档解析" },
   // scansci-pdf
   "scansci-pdf:scansci_pdf_download": { icon: FileText, label: "下载论文 PDF" },
   "scansci-pdf:scansci_pdf_batch_download": { icon: FilePlus, label: "批量下载论文" },
@@ -223,6 +248,8 @@ export function resolveToolMeta(
     if (cli && OC_CLI_META[cli]) return OC_CLI_META[cli];
   }
   if (TOOL_META[name]) return TOOL_META[name];
+  const codexType = parseCodexTypeName(name);
+  if (codexType && CODEX_TYPE_META[codexType]) return CODEX_TYPE_META[codexType];
   const mcp = parseMcpName(name);
   if (mcp) {
     const srvMeta = MCP_SERVER_META[mcp.server];
@@ -272,7 +299,17 @@ export function toolSummary(name: string, input: Record<string, unknown> | null)
     case "Task":
     case "Agent":
       return (asStr(input.description) || asStr(input.prompt)).slice(0, 60);
+    case "Skill":
+      return asStr(input.skill) || asStr(input.name);
+    case "delegate_task":
+      return `${input.agentId ? `→ ${asStr(input.agentId)} ` : ""}${(
+        asStr(input.goal) ||
+        asStr(input.message) ||
+        asStr(input.prompt)
+      ).slice(0, 60)}`;
   }
+  const codexType = parseCodexTypeName(name);
+  if (codexType) return codexSummary(codexType, input).slice(0, 80);
   const mcp = parseMcpName(name);
   if (!mcp) return "";
   return mcpSummary(mcp.server, mcp.op, input).slice(0, 80);
@@ -319,6 +356,13 @@ function mcpSummary(server: string, op: string, input: Record<string, unknown>):
       return `${tgt}${(asStr(input.goal) || asStr(input.message) || asStr(input.prompt)).slice(0, 60)}`;
     }
     if (op === "skill_view" || op === "skill_delete" || op === "skill_save") return asStr(input.name);
+    if (op === "skill_search") return asStr(input.query);
+    if (op === "ask_gpt55_codex") return (asStr(input.goal) || asStr(input.context)).slice(0, 60);
+    return op;
+  }
+  if (server === "web-context") {
+    if (op === "web_context_extract_url") return asStr(input.url).slice(0, 80);
+    if (op === "web_context_parse_file") return shortPath(input.file_path);
     return op;
   }
   if (server === "scansci-pdf") {
@@ -334,6 +378,19 @@ function mcpSummary(server: string, op: string, input: Record<string, unknown>):
     if (op.includes("health") || op.includes("diagnose") || op.includes("source")) return op;
     if (op.includes("vpnsci")) return asStr(input.school) || asStr(input.query) || asStr(input.doi);
     return op;
+  }
+  return "";
+}
+
+function codexSummary(codexType: string, input: Record<string, unknown>): string {
+  if (codexType === "imageView") return shortPath(input.path || input.url);
+  if (codexType === "imageGeneration") {
+    return (asStr(input.prompt) || asStr(input.revisedPrompt) || shortPath(input.savedPath)).slice(0, 60);
+  }
+  if (codexType === "contextCompaction") return "";
+  if (codexType === "enteredReviewMode" || codexType === "exitedReviewMode") return asStr(input.note);
+  if (codexType === "dynamicToolCall" || codexType === "mcpToolCall") {
+    return asStr(input.tool) || asStr(input.toolName) || asStr(input.name);
   }
   return "";
 }

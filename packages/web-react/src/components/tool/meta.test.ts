@@ -36,8 +36,15 @@ describe("resolveToolMeta 图标/标签解析 (P5)", () => {
   test("完全未知名 → 原样标签", () => {
     expect(resolveToolMeta("Frobnicate").label).toBe("Frobnicate");
   });
-  test("v5 无 codex：codex:webSearch 不命中任何 codex 映射，落通用扳手", () => {
-    expect(resolveToolMeta("codex:webSearch").label).toBe("codex:webSearch");
+  test("Codex 简单 item 有友好标签", () => {
+    expect(resolveToolMeta("codex:imageView").label).toBe("查看图片");
+    expect(resolveToolMeta("codex:contextCompaction").label).toBe("压缩上下文");
+    expect(resolveToolMeta("Codex:userMessage").label).toBe("Codex 消息");
+  });
+  test("v3 历史裸工具名有友好标签", () => {
+    expect(resolveToolMeta("Skill").label).toBe("启用技能");
+    expect(resolveToolMeta("TaskOutput").label).toBe("子任务结果");
+    expect(resolveToolMeta("EnterPlanMode").label).toBe("进入计划模式");
   });
 });
 
@@ -63,6 +70,17 @@ describe("toolSummary 摘要 (P5)", () => {
     expect(
       toolSummary("mcp__openclaude-memory__delegate_task", { agentId: "coder", goal: "修复 bug" }),
     ).toBe("→ coder 修复 bug");
+  });
+  test("MCP memory skill_search / web-context 摘要", () => {
+    expect(toolSummary("mcp__openclaude-memory__skill_search", { query: "literature-search" })).toBe(
+      "literature-search",
+    );
+    expect(toolSummary("mcp__web-context__web_context_parse_file", { file_path: "/a/b/c.docx" })).toBe(
+      "…/a/b/c.docx",
+    );
+  });
+  test("Codex 简单 item 摘要", () => {
+    expect(toolSummary("codex:imageView", { path: "/tmp/a/b.png" })).toBe("…/tmp/a/b.png");
   });
   test("input 为 null → 空摘要", () => {
     expect(toolSummary("Bash", null)).toBe("");

@@ -18,11 +18,14 @@ export type ToolLike = {
   _partial?: boolean;
   _completed?: boolean;
   output?: string | null;
+  text?: string | null;
   error?: boolean;
   bashTail?: BashTail;
+  durationMs?: number | null;
 };
 
 export type ToolInput = Record<string, unknown> | null;
+export type DisplayTool = { name: string; input: ToolInput; tool: ToolLike };
 
 /**
  * 解析工具输入。优先级与现网 `_safeInput` 一致：
@@ -45,6 +48,236 @@ export function resolveToolInput(tool: ToolLike): ToolInput {
     }
   }
   return null;
+}
+
+function parseJsonObject(value: unknown): Record<string, unknown> | null {
+  if (value && typeof value === "object" && !Array.isArray(value)) return value as Record<string, unknown>;
+  if (typeof value !== "string" || !value.trim().startsWith("{")) return null;
+  try {
+    const parsed = JSON.parse(value);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? (parsed as Record<string, unknown>) : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Parse `codex:<itemType>` / legacy `Codex:<itemType>` tool names. */
+export function parseCodexTypeName(name: string | undefined | null): string | null {
+  if (!name) return null;
+  if (name.startsWith("codex:")) return name.slice(6);
+  if (name.startsWith("Codex:")) return name.slice(6);
+  return null;
+}
+
+function asPlainObject(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : {};
+}
+
+function argsFromRaw(raw: unknown): { args: Record<string, unknown>; rawArgs: unknown } {
+  if (raw && typeof raw === "object" && !Array.isArray(raw)) return { args: raw as Record<string, unknown>, rawArgs: raw };
+  if (typeof raw === "string") {
+    try {
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        return { args: parsed as Record<string, unknown>, rawArgs: raw };
+      }
+    } catch {
+      /* show the raw value via fallback below */
+    }
+  }
+  return { args: {}, rawArgs: raw };
+}
+
+function rawArgsDisplay(rawArgs: unknown): string {
+  if (rawArgs == null) return "";
+  if (typeof rawArgs === "string") return rawArgs;
+  if (typeof rawArgs === "number" || typeof rawArgs === "boolean") return String(rawArgs);
+  try {
+    const text = JSON.stringify(rawArgs);
+    return text && text !== "{}" && text !== "[]" ? text : "";
+  } catch {
+    return "";
+  }
+}
+
+function resolveCodexCall(input: Record<string, unknown> | null): {
+  server: string;
+  tool: string;
+  args: Record<string, unknown>;
+  rawArgs: unknown;
+} {
+  if (!input) return { server: "", tool: "", args: {}, rawArgs: undefined };
+  const server = asStr(input.server) || asStr(input.serverName);
+  const tool = asStr(input.tool) || asStr(input.toolName) || asStr(input.name);
+  let rawArgs = input.arguments;
+  if (rawArgs === undefined) rawArgs = input.args;
+  if (rawArgs === undefined) rawArgs = input.params;
+  const { args, rawArgs: originalRawArgs } = argsFromRaw(rawArgs);
+  return { server, tool, args, rawArgs: originalRawArgs };
+}
+
+function normalizeMcpServerName(server: string): string {
+  const map: Record<string, string> = {
+    openclaude_memory: "openclaude-memory",
+    openclaude_vision: "openclaude-vision",
+    minimax_media: "minimax-media",
+    minimax_vision: "minimax-vision",
+    scansci_pdf: "scansci-pdf",
+    web_context: "web-context",
+    quant_system: "quant-system",
+  };
+  return map[server] ?? server;
+}
+
+function pickCodexItem(tool: ToolLike): { inputItem: Record<string, unknown> | null; finalItem: Record<string, unknown> | null } {
+  const inputItem = parseJsonObject(tool.inputJson) ?? parseJsonObject(tool.inputPreview);
+  const finalItem = parseJsonObject(tool.output) ?? parseJsonObject(tool.text) ?? inputItem;
+  return { inputItem, finalItem };
+}
+
+function extractCodexOutput(item: Record<string, unknown> | null): string | null {
+  if (!item) return null;
+  const error = item.error;
+  const result = item.result;
+  if (result && typeof result === "object" && !Array.isArray(result)) {
+    const content = (result as Record<string, unknown>).content;
+    if (Array.isArray(content)) {
+      const texts = content
+        .map((part) => (part && typeof part === "object" ? asStr((part as Record<string, unknown>).text) : ""))
+        .filter(Boolean);
+      if (texts.length > 0) return texts.join("\n");
+    }
+    const structured = (result as Record<string, unknown>).structuredContent;
+    if (structured != null) {
+      try {
+        return JSON.stringify(structured);
+      } catch {
+        return String(structured);
+      }
+    }
+    const usefulResultKeys = Object.keys(result).filter((k) => !["content", "structuredContent", "_meta"].includes(k));
+    if (usefulResultKeys.length > 0) {
+      try {
+        return JSON.stringify(result);
+      } catch {
+        return null;
+      }
+    }
+  }
+  if (typeof result === "string") return result;
+  if (error && typeof error === "object" && !Array.isArray(error)) {
+    const message = asStr((error as Record<string, unknown>).message);
+    if (message) return message;
+  }
+  if (typeof error === "string") return error;
+  return null;
+}
+
+function fallbackNonJsonOutput(tool: ToolLike): string | null {
+  if (typeof tool.output !== "string") return null;
+  const out = tool.output.trim();
+  if (!out || /^codex:/i.test(out)) return null;
+  if (parseJsonObject(out)) return null;
+  return tool.output;
+}
+
+function codexFailed(item: Record<string, unknown> | null): boolean {
+  if (!item) return false;
+  const status = asStr(item.status).toLowerCase();
+  return status === "failed" || status === "error" || status === "cancelled" || item.error != null;
+}
+
+function compactArgs(args: Record<string, unknown>, rawArgs: unknown): Record<string, unknown> {
+  if (Object.keys(args).length > 0) return args;
+  const display = rawArgsDisplay(rawArgs);
+  return display ? { args: display } : {};
+}
+
+function normalizeCodexPlan(input: Record<string, unknown>): Record<string, unknown> {
+  const rawSteps = Array.isArray(input.steps) ? input.steps : Array.isArray(input.items) ? input.items : [];
+  const todos = rawSteps
+    .filter((step): step is Record<string, unknown> => !!step && typeof step === "object" && !Array.isArray(step))
+    .map((step) => {
+      const content = asStr(step.text) || asStr(step.description);
+      const status = asStr(step.status) || (step.completed === true ? "completed" : "pending");
+      return { content, status };
+    });
+  return { todos };
+}
+
+function normalizeCodexTool(message: ToolLike, codexType: string): DisplayTool | null {
+  const { inputItem, finalItem } = pickCodexItem(message);
+  const mergedItem = inputItem && finalItem ? { ...inputItem, ...finalItem } : (inputItem ?? finalItem);
+  const callItem = inputItem ?? finalItem;
+  const outputText = extractCodexOutput(finalItem) ?? fallbackNonJsonOutput(message);
+  const baseTool: ToolLike = {
+    ...message,
+    output: outputText,
+    error: !!message.error || codexFailed(finalItem),
+    durationMs:
+      typeof finalItem?.durationMs === "number" ? (finalItem.durationMs as number) : message.durationMs,
+  };
+
+  if (codexType === "mcpToolCall") {
+    const inputCall = resolveCodexCall(callItem);
+    const finalCall = resolveCodexCall(finalItem);
+    const server = normalizeMcpServerName(inputCall.server || finalCall.server);
+    const op = inputCall.tool || finalCall.tool;
+    const args = Object.keys(inputCall.args).length > 0 ? inputCall.args : finalCall.args;
+    const rawArgs = inputCall.rawArgs !== undefined ? inputCall.rawArgs : finalCall.rawArgs;
+    const input = compactArgs(args, rawArgs);
+    if (server && op) {
+      return {
+        name: `mcp__${server}__${op}`,
+        input,
+        tool: { ...baseTool, toolName: `mcp__${server}__${op}`, inputJson: input },
+      };
+    }
+    return { name: "codex:mcpToolCall", input, tool: { ...baseTool, inputJson: input } };
+  }
+
+  if (codexType === "dynamicToolCall") {
+    const inputCall = resolveCodexCall(callItem);
+    const finalCall = resolveCodexCall(finalItem);
+    const innerName = inputCall.tool || finalCall.tool;
+    const args = Object.keys(inputCall.args).length > 0 ? inputCall.args : finalCall.args;
+    const rawArgs = inputCall.rawArgs !== undefined ? inputCall.rawArgs : finalCall.rawArgs;
+    const input = compactArgs(args, rawArgs);
+    const name = innerName || "codex:dynamicToolCall";
+    return { name, input, tool: { ...baseTool, toolName: name, inputJson: input } };
+  }
+
+  if (codexType === "webSearch") {
+    const item = asPlainObject(mergedItem);
+    const input = { query: asStr(item.query), results: item.results };
+    return { name: "WebSearch", input, tool: { ...baseTool, toolName: "WebSearch", inputJson: input } };
+  }
+
+  if (codexType === "plan" || codexType === "todo_list") {
+    const finalPlan =
+      finalItem && (Array.isArray(finalItem.steps) || Array.isArray(finalItem.items)) ? finalItem : mergedItem;
+    const input = normalizeCodexPlan(asPlainObject(finalPlan));
+    return { name: "TodoWrite", input, tool: { ...baseTool, toolName: "TodoWrite", inputJson: input } };
+  }
+
+  const compactInput = mergedItem ? { ...mergedItem } : resolveToolInput(message);
+  return {
+    name: message.toolName || `codex:${codexType}`,
+    input: compactInput,
+    tool: { ...baseTool, inputJson: compactInput },
+  };
+}
+
+/** Normalize Codex/v3 wrapper tools into the same display contract as native v5 tools. */
+export function normalizeToolForDisplay(message: ToolLike): DisplayTool {
+  const originalName = message.toolName || "unknown";
+  const codexType = parseCodexTypeName(originalName);
+  if (codexType) {
+    const normalized = normalizeCodexTool(message, codexType);
+    if (normalized) return normalized;
+  }
+  const input = resolveToolInput(message);
+  return { name: originalName, input, tool: message };
 }
 
 /** 取末 2-3 段路径（过长时 `…/a/b/c`）。 */
