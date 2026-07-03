@@ -51,8 +51,13 @@ REMOVE_KEYS=(
   EXTERNAL_MTLS_ENABLED EXTERNAL_MTLS_BIND EXTERNAL_MTLS_PORT
   INTERNAL_PROXY_BIND INTERNAL_PROXY_PORT
   FILE_PROXY_ENABLED
-  # OC_CODEX_*(api_relay 中继 provider 配置)自 codex 重接入(feat/v5-codex-engine-adapter)
-  # 起随 v3 env 继承 —— v5 codex 数据面与 v3 同走 Yunwu api_relay 组,键值同源。
+  # OC_CODEX_* 六键自 feat/v5-codex-oauth-egress 起重新剥除:v5 codex 只走
+  # official_oauth(容器 loopback relay → egress 账号代理 → chatgpt backend,
+  # 上游常量在代码内),不再依赖任何 OC_CODEX_* env;防 bootstrap 从 v3 env 回灌。
+  OC_CODEX_BASE_URL OC_CODEX_DISABLE_RESPONSE_STORAGE OC_CODEX_MODEL_PROVIDER
+  OC_CODEX_PREFERRED_AUTH_METHOD OC_CODEX_PROVIDER_NAME OC_CODEX_WIRE_API
+  # v5-owned codex 刷新 actor / drift reconciler 必须自己跑,禁止从 v3 env 继承禁用旗标
+  COMMERCIAL_CODEX_REFRESH_ACTOR_DISABLED COMMERCIAL_CODEX_DRIFT_RECONCILER_DISABLED
 )
 
 DRY=0; MODE="deploy"; ROLLBACK_N=1; RESTART_EGRESS=0

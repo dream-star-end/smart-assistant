@@ -127,6 +127,12 @@ export interface CodexProviderConfigOverride {
   wireApi?: string | null
   preferredAuthMethod?: string | null
   disableResponseStorage?: boolean | null
+  /** v5 official_oauth relay override(方案 A2):true → 追加
+   *  `-c model_providers.<id>.requires_openai_auth=true`,让 codex CLI 对自定义
+   *  provider 仍走 auth.json 的 ChatGPT token(Authorization 发到容器 loopback
+   *  relay,由 master egress 强制代理转发)。仅 override 路径支持 —— env
+   *  OC_CODEX_* 六键属 api_relay 遗产(v5 部署已删),不为它新增第七键。 */
+  requiresOpenaiAuth?: boolean | null
 }
 
 export function buildCodexProviderConfigArgs(
@@ -161,6 +167,9 @@ export function buildCodexProviderConfigArgs(
   const disableResponseStorage = hasOverride
     ? override.disableResponseStorage ?? true
     : envFlagDefaultTrue(env.OC_CODEX_DISABLE_RESPONSE_STORAGE)
+  // requires_openai_auth 只有 override 路径(master 下发 official_oauth relay
+  // override)会置 true;env 路径恒 false(不新增 env 键)。
+  const requiresOpenaiAuth = hasOverride ? override.requiresOpenaiAuth === true : false
 
   return [
     '-c',
@@ -171,6 +180,9 @@ export function buildCodexProviderConfigArgs(
     `model_providers.${providerId}.base_url=${tomlString(baseUrl)}`,
     '-c',
     `model_providers.${providerId}.wire_api=${tomlString(wireApi)}`,
+    ...(requiresOpenaiAuth
+      ? ['-c', `model_providers.${providerId}.requires_openai_auth=true`]
+      : []),
     '-c',
     `preferred_auth_method=${tomlString(authMethod)}`,
     '-c',

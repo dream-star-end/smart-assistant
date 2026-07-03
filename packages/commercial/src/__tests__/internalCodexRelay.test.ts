@@ -11,6 +11,7 @@ import { describe, test } from 'node:test'
 
 import { hashSecret, type ContainerIdentityRepo } from '../auth/containerIdentity.js'
 import {
+  CODEX_OFFICIAL_UPSTREAM_BASE_URL,
   CODEX_RELAY_PREFIX,
   CODEX_UPSTREAM_AUTH_HEADER,
   buildCodexRelayLocalBaseUrl,
@@ -18,6 +19,8 @@ import {
   isRelayCredentialFailureStatus,
   makeCodexRelayHandler,
   mapCodexRelayUrl,
+  mapCodexRelayUrlMulti,
+  resolveCodexRelayUpstreamBases,
   type CodexRelayDb,
 } from '../http/internalCodexRelay.js'
 
@@ -320,6 +323,192 @@ describe('internalCodexRelay handler', () => {
       assert.equal(res.status, 503)
       const body = await res.json() as { error: { code: string } }
       assert.equal(body.error.code, 'NO_BOUND_CODEX_ACCOUNT')
+    } finally {
+      await close(server)
+    }
+  })
+})
+
+// ─── official_oauth 数据面(feat/v5-codex-oauth-egress B5)────────────────────
+
+describe('internalCodexRelay official chatgpt upstream(B5)', () => {
+  test('official 常量与 gateway 侧 loopback base path 成对(parity 锁定)', () => {
+    assert.equal(CODEX_OFFICIAL_UPSTREAM_BASE_URL, 'https://chatgpt.com/backend-api/codex')
+    // gateway 侧 CODEX_OFFICIAL_RELAY_BASE_PATH 被 codexRouteOverride.test.ts 锁死为
+    // 同一字面量('/internal/v3/codex-relay/backend-api/codex')。两侧测试各锁一端,
+    // parity 由字面量传递保证(worktree node_modules 指向 canonical,测试不能跨包
+    // import 新 export)。
+    assert.equal(
+      codexRelayBasePathForUpstream(CODEX_OFFICIAL_UPSTREAM_BASE_URL),
+      '/internal/v3/codex-relay/backend-api/codex',
+    )
+  })
+
+  test('resolveCodexRelayUpstreamBases:official 恒在、最长 base path 优先、撞路径时 official 赢', () => {
+    assert.deepEqual(
+      resolveCodexRelayUpstreamBases('https://yunwu.ai/v1'),
+      [CODEX_OFFICIAL_UPSTREAM_BASE_URL, 'https://yunwu.ai/v1'],
+    )
+    // env 声称同 base path 但不同 host —— 不允许劫持 official 前缀
+    assert.deepEqual(
+      resolveCodexRelayUpstreamBases('https://evil.example/backend-api/codex'),
+      [CODEX_OFFICIAL_UPSTREAM_BASE_URL],
+    )
+  })
+
+  test('mapCodexRelayUrlMulti:official 与 env base 各自映射;official 前缀的非法 suffix 不落到 env base', () => {
+    const bases = resolveCodexRelayUpstreamBases('https://yunwu.ai/v1')
+    const official = mapCodexRelayUrlMulti(
+      `${CODEX_RELAY_PREFIX}/backend-api/codex/responses?stream=true`, 'POST', bases,
+    )
+    assert.ok(!('error' in official), JSON.stringify(official))
+    if (!('error' in official)) {
+      assert.equal(official.url, 'https://chatgpt.com/backend-api/codex/responses?stream=true')
+      assert.equal(official.upstreamHost, 'chatgpt.com')
+    }
+    const env = mapCodexRelayUrlMulti(`${CODEX_RELAY_PREFIX}/v1/responses`, 'POST', bases)
+    assert.ok(!('error' in env))
+    if (!('error' in env)) assert.equal(env.url, 'https://yunwu.ai/v1/responses')
+    // official base path 命中但 suffix 不在 allowlist → 立即拒,不尝试其它 base
+    const bad = mapCodexRelayUrlMulti(`${CODEX_RELAY_PREFIX}/backend-api/codex/files`, 'POST', bases)
+    assert.ok('error' in bad)
+    if ('error' in bad) assert.equal(bad.error.code, 'PATH_NOT_ALLOWED')
+    // 两个 base 都不匹配 → NOT_FOUND
+    const miss = mapCodexRelayUrlMulti(`${CODEX_RELAY_PREFIX}/v2/responses`, 'POST', bases)
+    assert.ok('error' in miss)
+    if ('error' in miss) assert.equal(miss.error.code, 'NOT_FOUND')
+  })
+
+  test('handler:official 路径按绑定账号 dispatcher 转发 chatgpt.com,容器 Authorization + chatgpt-account-id 透传', async () => {
+    const captured: { url?: string; headers?: Headers; dispatcher?: unknown } = {}
+    const handler = makeCodexRelayHandler({
+      identityRepo: makeRepo(),
+      db: makeDb(),
+      resolveDispatcher: async (accountId) => ({ accountId, proxyId: 4n, dispatcher: DISPATCHER }),
+      readBoundAccountAccessToken: async () => { throw new Error('container auth present — must not read DB token') },
+      fetchImpl: (async (input, init) => {
+        captured.url = String(input)
+        captured.headers = new Headers(init?.headers)
+        captured.dispatcher = (init as { dispatcher?: unknown }).dispatcher
+        return new Response('ok', { status: 200 })
+      }) as typeof fetch,
+    })
+    const server = createServer((req, res) => { void handler(req, res, CTX) })
+    const port = await listen(server)
+    try {
+      const res = await fetch(`http://127.0.0.1:${port}${CODEX_RELAY_PREFIX}/backend-api/codex/responses`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${TOKEN}`,
+          [CODEX_UPSTREAM_AUTH_HEADER]: 'Bearer chatgpt-access-token',
+          'chatgpt-account-id': 'acc-uuid-1',
+          originator: 'codex_cli_rs',
+          'content-type': 'application/json',
+        },
+        body: '{"input":"hi"}',
+      })
+      assert.equal(res.status, 200)
+      assert.equal(captured.url, 'https://chatgpt.com/backend-api/codex/responses')
+      assert.strictEqual(captured.dispatcher, DISPATCHER)
+      assert.equal(captured.headers?.get('authorization'), 'Bearer chatgpt-access-token')
+      assert.equal(captured.headers?.get('chatgpt-account-id'), 'acc-uuid-1')
+      assert.equal(captured.headers?.get('originator'), 'codex_cli_rs')
+    } finally {
+      await close(server)
+    }
+  })
+})
+
+describe('internalCodexRelay Authorization 代注 fallback(B5/3b)', () => {
+  test('容器未带上游 Authorization → 按绑定账号 DB 代注,且用后清零', async () => {
+    const captured: { url?: string; headers?: Headers } = {}
+    const readCalls: string[] = []
+    const tokenBuf = Buffer.from('db-access-token', 'utf8')
+    const handler = makeCodexRelayHandler({
+      identityRepo: makeRepo(),
+      db: makeDb(),
+      resolveDispatcher: async (accountId) => ({ accountId, proxyId: 4n, dispatcher: DISPATCHER }),
+      readBoundAccountAccessToken: async (accountId) => {
+        readCalls.push(String(accountId))
+        return tokenBuf
+      },
+      fetchImpl: (async (input, init) => {
+        captured.url = String(input)
+        captured.headers = new Headers(init?.headers)
+        return new Response('ok', { status: 200 })
+      }) as typeof fetch,
+    })
+    const server = createServer((req, res) => { void handler(req, res, CTX) })
+    const port = await listen(server)
+    try {
+      const res = await fetch(`http://127.0.0.1:${port}${CODEX_RELAY_PREFIX}/backend-api/codex/responses`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${TOKEN}`, 'content-type': 'application/json' },
+        body: '{"input":"hi"}',
+      })
+      assert.equal(res.status, 200)
+      assert.deepEqual(readCalls, ['53'])
+      assert.equal(captured.headers?.get('authorization'), 'Bearer db-access-token')
+      assert.ok(tokenBuf.every((b) => b === 0), 'access token buffer 必须用后清零')
+    } finally {
+      await close(server)
+    }
+  })
+
+  test('代注 fail-closed:token 读不到 / 读取抛错 → 503,不打上游', async () => {
+    for (const readFn of [
+      async () => null,
+      async () => { throw new Error('decrypt failed') },
+    ]) {
+      const handler = makeCodexRelayHandler({
+        identityRepo: makeRepo(),
+        db: makeDb(),
+        resolveDispatcher: async (accountId) => ({ accountId, proxyId: 4n, dispatcher: DISPATCHER }),
+        readBoundAccountAccessToken: readFn as (accountId: bigint) => Promise<Buffer | null>,
+        fetchImpl: (async () => { throw new Error('must not call upstream') }) as typeof fetch,
+      })
+      const server = createServer((req, res) => { void handler(req, res, CTX) })
+      const port = await listen(server)
+      try {
+        const res = await fetch(`http://127.0.0.1:${port}${CODEX_RELAY_PREFIX}/backend-api/codex/responses`, {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${TOKEN}` },
+          body: '{"input":"hi"}',
+        })
+        assert.equal(res.status, 503)
+        const body = await res.json() as { error: { code: string } }
+        assert.equal(body.error.code, 'CODEX_ACCOUNT_TOKEN_UNAVAILABLE')
+      } finally {
+        await close(server)
+      }
+    }
+  })
+
+  test('容器带了 Authorization 但上游 401 → 401 原样透传,单次 fetch,绝不改用 DB token 重试', async () => {
+    let fetchCount = 0
+    const handler = makeCodexRelayHandler({
+      identityRepo: makeRepo(),
+      db: makeDb(),
+      resolveDispatcher: async (accountId) => ({ accountId, proxyId: 4n, dispatcher: DISPATCHER }),
+      readBoundAccountAccessToken: async () => { throw new Error('must not fall back to DB token on 401') },
+      fetchImpl: (async () => {
+        fetchCount += 1
+        return new Response('unauthorized', { status: 401 })
+      }) as typeof fetch,
+    })
+    const server = createServer((req, res) => { void handler(req, res, CTX) })
+    const port = await listen(server)
+    try {
+      const res = await fetch(`http://127.0.0.1:${port}${CODEX_RELAY_PREFIX}/backend-api/codex/responses`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${TOKEN}`,
+          [CODEX_UPSTREAM_AUTH_HEADER]: 'Bearer stale-container-token',
+        },
+        body: '{"input":"hi"}',
+      })
+      assert.equal(res.status, 401)
+      assert.equal(fetchCount, 1, '401 必须 fail-closed,不允许静默重试')
     } finally {
       await close(server)
     }
