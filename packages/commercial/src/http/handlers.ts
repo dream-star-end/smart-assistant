@@ -22,6 +22,7 @@ import {
   setRefreshCookie,
   clearRefreshCookie,
   readRefreshCookie,
+  appendSetCookie,
 } from "./cookies.js";
 import { register, RegisterError } from "../auth/register.js";
 import { verifyEmail, requestPasswordReset, confirmPasswordReset, resendVerification, VerifyError } from "../auth/verify.js";
@@ -881,9 +882,11 @@ export async function handleMe(
     credits: string;
     status: string;
     created_at: Date;
+    on_v5: boolean;
   }>(
     `SELECT id::text AS id, email, email_verified, role, display_name, avatar_url,
-            credits::text AS credits, status, created_at
+            credits::text AS credits, status, created_at,
+            (v5_migrated_at IS NOT NULL) AS on_v5
        FROM users WHERE id = $1`,
     [user.id],
   );
@@ -892,6 +895,14 @@ export async function handleMe(
     throw new HttpError(401, "UNAUTHORIZED", "user is not active");
   }
   const u = r.rows[0];
+  // v3→v5 迁移路由:已迁移用户下发 oc_v5 cookie,Caddy 据此把后续请求路由到 v5(React);
+  // 未迁移/已回滚用户清除该 cookie(防 stale cookie 把回滚用户仍钉在 v5)。同 JWT/同域,
+  // v5 侧不需读 cookie(它只服务被路由过来的请求)。/api/me 是 SPA 加载早期调用,作路由 bootstrap。
+  if (u.on_v5) {
+    appendSetCookie(res, "oc_v5=1; Path=/; Max-Age=31536000; Secure; HttpOnly; SameSite=Lax");
+  } else {
+    appendSetCookie(res, "oc_v5=; Path=/; Max-Age=0; Secure; HttpOnly; SameSite=Lax");
+  }
   // 前端 billing.js 根据 features.payment_enabled 决定 pill 显隐与充值模态行为。
   // try/catch fail-safe:getSystemSetting 内部对 row 缺失/zod 失败已 fallback DEFAULTS;
   // 但 query() 自身 PG 抖动会抛,这里兜底为 false —— 既不让 /api/me 因开关读取失败 500
