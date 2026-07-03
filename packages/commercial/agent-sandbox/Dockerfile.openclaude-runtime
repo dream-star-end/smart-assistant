@@ -272,6 +272,14 @@ RUN if [ "$OC_INCLUDE_CODEX" = "1" ]; then \
       && rm -rf /root/.npm; \
     else echo "[v5 ccb-only] skip codex CLI install (OC_INCLUDE_CODEX=0)"; fi
 
+# v5 codex 遥测封堵(feat/v5-codex-telemetry-block · C1 配置面根治)——
+# root-owned managed_config(用户 USER=agent 不可覆盖):关 analytics /
+# otel(trace+metrics)/ startup update check,并把 chatgpt_base_url 顶层键指向
+# 容器 loopback relay(残余 backend-api 请求 → relay allowlist 外 404,不出容器)。
+# COPY 自动创建 /etc/codex(root:root)。codex 缺席(OC_INCLUDE_CODEX=0)时此文件
+# 无害。键名经 codex 0.137 探针实测(见文件头 + docs/wip/v5-codex-telemetry-block.md)。
+COPY --chown=root:root ./runtime/codex-managed-config.toml /etc/codex/managed_config.toml
+
 # ------------------------------------------------------------
 # Playwright MCP + Chromium for the oc-browser daemon
 # ------------------------------------------------------------

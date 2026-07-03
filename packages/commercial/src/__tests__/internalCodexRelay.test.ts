@@ -514,3 +514,56 @@ describe('internalCodexRelay Authorization 代注 fallback(B5/3b)', () => {
     }
   })
 })
+
+// ─── codex 遥测辅助路径封堵(v5 feat/v5-codex-telemetry-block · nit2)──────────
+//
+// C1 把 chatgpt_base_url 引到容器 loopback relay 的 /backend-api/codex base 后,
+// codex 残余的 backend-api 遥测/身份请求(analytics-events / agent-identity)会
+// 落进 relay。它们的 suffix 不在 allowlist(/responses /chat/completions /models)
+// → 必须 PATH_NOT_ALLOWED(404),且**在身份校验/dispatcher/上游 fetch 之前**就拒,
+// 不 fetch、不解析代理、不 mark credential success/failure(=不产生任何计费副作用)。
+describe('internalCodexRelay 遥测辅助路径 fail-closed(nit2)', () => {
+  const AUX_TELEMETRY_PATHS: Array<{ method: string; path: string }> = [
+    { method: 'POST', path: `${CODEX_RELAY_PREFIX}/backend-api/codex/analytics-events/events` },
+    { method: 'GET', path: `${CODEX_RELAY_PREFIX}/backend-api/codex/codex-backend/agent-identity` },
+    { method: 'POST', path: `${CODEX_RELAY_PREFIX}/backend-api/codex/codex-backend/agent-identity` },
+    { method: 'POST', path: `${CODEX_RELAY_PREFIX}/backend-api/codex/otlp/v1/metrics` },
+  ]
+
+  test('辅助遥测路径 → 404 PATH_NOT_ALLOWED,不 fetch / 不解析 dispatcher / 不 mark credential', async () => {
+    for (const { method, path } of AUX_TELEMETRY_PATHS) {
+      let fetchCalls = 0
+      let dispatcherCalls = 0
+      const marks: string[] = []
+      const handler = makeCodexRelayHandler({
+        identityRepo: makeRepo(),
+        db: makeDb(),
+        resolveDispatcher: async (accountId) => {
+          dispatcherCalls += 1
+          return { accountId, proxyId: 4n, dispatcher: DISPATCHER }
+        },
+        readBoundAccountAccessToken: async () => { throw new Error('must not read token for a rejected telemetry path') },
+        markCredentialSuccess: async (id) => { marks.push(`success:${String(id)}`) },
+        markCredentialFailure: async (id, err) => { marks.push(`failure:${String(id)}:${err}`) },
+        fetchImpl: (async () => { fetchCalls += 1; return new Response('nope', { status: 200 }) }) as typeof fetch,
+      })
+      const server = createServer((req, res) => { void handler(req, res, CTX) })
+      const port = await listen(server)
+      try {
+        const res = await fetch(`http://127.0.0.1:${port}${path}`, {
+          method,
+          headers: { Authorization: `Bearer ${TOKEN}` },
+          body: method === 'GET' ? undefined : '{}',
+        })
+        assert.equal(res.status, 404, `${method} ${path} 必须 404`)
+        const body = await res.json() as { error: { code: string } }
+        assert.equal(body.error.code, 'PATH_NOT_ALLOWED', `${method} ${path}`)
+        assert.equal(fetchCalls, 0, `${method} ${path}:绝不打上游`)
+        assert.equal(dispatcherCalls, 0, `${method} ${path}:绝不解析账号 dispatcher`)
+        assert.deepEqual(marks, [], `${method} ${path}:绝不 mark credential(=零计费副作用)`)
+      } finally {
+        await close(server)
+      }
+    }
+  })
+})

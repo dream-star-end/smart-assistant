@@ -1,0 +1,17 @@
+[Unit]
+# 周期触发 ipset atomic swap 刷新,吸收 chatgpt/openai 边缘 IP 轮换。
+# Requires install service:refresh 依赖 ipset + 规则已由 install 建好。
+Description=Periodic refresh of v5 codex telemetry ipset (DNS rotation)
+Requires=openclaude-v5-codex-telemetry-block.service
+After=openclaude-v5-codex-telemetry-block.service
+
+[Timer]
+# boot 后 5min 首刷,之后每 10min 一次(atomic swap,DNS 失败保留旧 set)。
+OnBootSec=5min
+OnUnitActiveSec=10min
+AccuracySec=1min
+Persistent=false
+Unit=openclaude-v5-codex-telemetry-block-refresh.service
+
+[Install]
+WantedBy=timers.target

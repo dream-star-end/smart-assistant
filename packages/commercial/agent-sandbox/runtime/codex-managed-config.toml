@@ -1,0 +1,37 @@
+# codex 0.137 managed config —— root-owned 用户不可覆盖层。
+#
+# 作用(v5 feat/v5-codex-telemetry-block · C1 配置面根治):
+#   封堵 codex CLI 硬编码遥测端点绕容器 loopback relay 直连 chatgpt.com /
+#   ab.chatgpt.com / api.github.com,防账号代理 IP + 宿主机真实 IP 同时暴露给
+#   chatgpt 侧、破坏账号 IP 纯净。数据面(gpt-5.5 模型调用)由 per-turn
+#   `-c model_providers.<id>.base_url` 走 loopback relay,与本文件无关。
+#
+# 落点:COPY --chown=root:root 到 /etc/codex/managed_config.toml。容器 USER=agent
+#   只能读不能写 → 用户 $CODEX_HOME/config.toml 覆盖不了这些键。gateway 每次
+#   spawn 还会再追加同组 `-c`(buildCodexTelemetryHardeningArgs)做双保险,host
+#   侧 ipset REJECT 做网络面终极兜底。
+#
+# 键名/枚举值经 codex 0.137 二进制 + 运行时探针实测(2026-07-03,镜像
+#   v5-ccb-5af8167f):全部 clean load,无 "unknown field"/"Invalid configuration"。
+#   ⚠️ codex 0.137 对已知键的**非法值**会把整份配置丢弃回落默认,任何改动前必探针。
+
+# 关启动期 GitHub release 更新检查(api.github.com/repos/openai/codex/releases/latest)
+check_for_update_on_startup = false
+
+# ChatGPT backend-api 顶层 base(独立于数据面 model_providers.<id>.base_url):
+# 把 agent-identity 等残余 backend-api 请求引到容器 loopback relay;relay
+# allowlist(/responses /chat/completions /models)外 → 404,不出容器、不计费。
+# 端口 18789 = V3_CONTAINER_PORT(容器内 gateway 固定监听端口,不变量)。
+chatgpt_base_url = "http://127.0.0.1:18789/internal/v3/codex-relay/backend-api/codex"
+
+# 关分析事件上报(chatgpt.com/backend-api/codex/analytics-events/events)
+[analytics]
+enabled = false
+
+# 关 OTLP/statsig 遥测导出(traces + metrics → ab.chatgpt.com/otlp/v1/metrics)。
+# 合法枚举实测 = none / statsig / otlp-http / otlp-grpc。方案原列的 log_exporter
+# 在 0.137 非有效键(静默忽略,非真实开关),已剔除;真正承载遥测的是
+# trace_exporter(traces)与 metrics_exporter(statsig 指标),两者置 none 即断流。
+[otel]
+trace_exporter = "none"
+metrics_exporter = "none"
