@@ -27,8 +27,11 @@ export async function migrateUserSessions(
 ): Promise<SessionsMigrationOutcome> {
   const uid = normUid(userId);
   const v3DbPath = join(V3_MASTER_HOME, "sessions.db");
-  return withAudit(uid, "sessions", { v3DbPath }, async () => {
-    const res = await migrateUserClientSessionsFromV3(v3DbPath, uid);
+  // master sessions.db 的 client_sessions/wechat_bindings 按 Gateway.getUserId() 分租,
+  // 商业版为 `c:<uid>`(见 userMedia.parseUserId / v3MasterSink),不是 PG users 表纯数字 id。
+  const sessionUserId = `c:${uid}`;
+  return withAudit(uid, "sessions", { v3DbPath, sessionUserId }, async () => {
+    const res = await migrateUserClientSessionsFromV3(v3DbPath, sessionUserId);
     return {
       result: res,
       detail: {

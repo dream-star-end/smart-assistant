@@ -44,15 +44,20 @@ const WECHAT_BINDING_COLS =
  * OPENCLAUDE_HOME=/root/.openclaude-v5);测试/特殊编排可用 v5DbPath 显式指定目标库。
  *
  * @param v3DbPath v3 master sessions.db 绝对路径(通常 /root/.openclaude/sessions.db)。
- * @param userId   纯数字 user_id(BIGSERIAL 主键的字符串形式)。
+ * @param sessionUserId client_sessions/wechat_bindings 里的 user_id **会话键**。注意:master
+ *   sessions.db 按 Gateway.getUserId() 的形式分租,商业版为 `c:<数字uid>`(不是 PG users 表的
+ *   纯数字 id)。调用方(channelMigration 包装)负责把 PG 数字 uid 映射成 `c:<uid>` 再传入。
  * @param v5DbPath 目标 v5 库路径覆盖(缺省 = paths.sessionsDb;显式给出时调用方须自建 schema)。
  */
 export async function migrateUserClientSessionsFromV3(
   v3DbPath: string,
-  userId: string,
+  sessionUserId: string,
   v5DbPath: string = paths.sessionsDb,
 ): Promise<UserSessionsMigrationResult> {
-  if (!/^\d+$/.test(userId)) throw new TypeError(`bad user_id: ${userId}`)
+  // 会话键安全字符集(商业版 c:<n> / 个人版 default 等);值走参数绑定,校验仅防明显脏输入。
+  if (!/^[A-Za-z0-9:_-]{1,64}$/.test(sessionUserId)) {
+    throw new TypeError(`bad session user_id: ${sessionUserId}`)
+  }
   const usingDefaultTarget = v5DbPath === paths.sessionsDb
   if (v3DbPath === v5DbPath) {
     return { clientSessions: 0, wechatBindings: 0, skipped: 'v3 path == v5 path (自指)' }
@@ -97,7 +102,7 @@ export async function migrateUserClientSessionsFromV3(
           )
           .run({ uid }).changes
       })
-      const clientSessions = csRun(userId)
+      const clientSessions = csRun(sessionUserId)
 
       // wechat_bindings —— best-effort:UNIQUE(account_id) 等边缘冲突不得连累会话迁移。
       let wechatBindings = 0
@@ -122,7 +127,7 @@ export async function migrateUserClientSessionsFromV3(
             )
             .run({ uid }).changes
         })
-        wechatBindings = wbRun(userId)
+        wechatBindings = wbRun(sessionUserId)
       } catch (err) {
         wechatWarning = err instanceof Error ? err.message : String(err)
       }

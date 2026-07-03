@@ -27,13 +27,14 @@ import {
   cutoverUser,
   defaultQuiesceV3,
   getChannelState,
+  migrateUserSessions,
   preseedUser,
   rollbackUser,
 } from "../packages/commercial/src/channelMigration/index.js";
 import { getSelfHost } from "../packages/commercial/src/compute-pool/queries.js";
 
 function usage(): never {
-  console.error("usage: v5-migrate-user.ts <status|preseed|cutover|rollback> <uid>");
+  console.error("usage: v5-migrate-user.ts <status|sessions|preseed|cutover|rollback> <uid>");
   process.exit(2);
 }
 
@@ -52,6 +53,13 @@ async function main(): Promise<void> {
   if (cmd === "status") {
     const st = await getChannelState(uid);
     console.log(JSON.stringify(st ?? { uid, note: "user not found" }, null, 2));
+    process.exit(0);
+  }
+
+  // 仅重跑 L2 会话历史迁移(幂等)。用于已迁移用户补迁会话(如键格式修复后回补)。
+  if (cmd === "sessions") {
+    const r = await migrateUserSessions(uid);
+    console.log(JSON.stringify(r, null, 2));
     process.exit(0);
   }
 
