@@ -82,9 +82,8 @@ export function isDockerNotFound(err: unknown): boolean {
   );
 }
 
-/** 返回卷 Mountpoint;卷确实不存在(404)→ null;其它错误(daemon 不通/权限)→ fail-closed 抛出。 */
 /**
- * cutover 前置 fail-closed:该用户 v3 卷若在远端 host,**在任何状态变更/quiesce 之前**抛错。
+ * cutover 前置 fail-closed:该用户 v3 卷若在远端 host,在 quiesce / 拷贝 / 标 vanished 之前抛错。
  * 防 quiesce 在本机 stop 一个远端不存在的容器拿到 404、误当"已停"后把 PG 行标 vanished
  * (而远端容器仍在跑)。远端场景须先 consolidate 到 self host(P0)。
  */
@@ -97,6 +96,7 @@ export async function assertV3VolumesOnSelfHost(uid: string, selfHostUuid: strin
   }
 }
 
+/** 返回卷 Mountpoint;卷确实不存在(404)→ null;其它错误(daemon 不通/权限)→ fail-closed 抛出。 */
 async function volumeMountpoint(docker: Docker, name: string): Promise<string | null> {
   try {
     const info = await docker.getVolume(name).inspect();
