@@ -1455,14 +1455,27 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     //   inflightCodexTurns: requestId → snapshot (deferred finalizer + model)
     //     - 由 codex acquire IIFE 在成功路径 set
     //     - 由 onContainerMessage 的 outbound.codex_billing 分支**同步先 delete** 再 settle
-    //     - 由 finalCleanup 兜底 fail-clear(drain 超时 / 容器异常 / shutdown 路径残留)
+    //     - 由 finalCleanup 兜底清空(**只清本地簿记,不 abort journal** —— P0 修复
+    //       2026-07-03:桥关 ≠ turn 终止,权威裁决收敛 request_finalize_journal,
+    //       见 finalCleanup 内注释与 handleCrossBridgeCodexBilling)
     //   drainTimer: user_close + Map 非空时启动的 5s(env DRAIN_BILLING_MS)收尾窗口 timer
     //     - settle 把 Map 减到 0 → checkDrainComplete 提前 finalCleanup
-    //     - 超时仍未 settle → finalCleanup 走 fail 兜底(reconciler 后续清理)
+    //     - 超时仍未 settle → finalCleanup(journal 保持 inflight;billing 帧后续到
+    //       任意新桥走跨桥 settle,真死则 reconciler 终态化)
     //     - 容器异常 / shutdown / force 抢占 drain → 立即 finalCleanup(见 cleanup 状态机)
     //   drainCause: 进入 drain 时的 trigger cause(稳定保留,避免 mutable cause 干扰)
     //   userDetached: 守 detachUserSide 幂等(drain 入口 + finalCleanup 都跑)
     const inflightCodexTurns = new Map<string, CodexTurnSnapshot>();
+    // P0 修复(2026-07-03)— 跨桥 settle 的同步去重簿记:同 requestId 的 duplicate
+    // billing 帧在 journal 回查/settle 在途期间直接丢弃(与主路径 Map.delete 先行
+    // 的单次门控同构)。跨进程/跨桥并发仍由 journal CAS + usage_records UNIQUE 兜底。
+    const pendingJournalSettles = new Set<string>();
+    // P0 修复(2026-07-03)— 本桥已进入 settle/abandon 的 requestId 簿记:主路径
+    // Map.delete 后,同桥 duplicate 帧会掉进 unknown-turn 分支;没有这本账,它们会
+    // 走 journal 回查再撞一次 settle(靠 DB UNIQUE 兜底虽不会重复扣,但多一次无谓
+    // settle 尝试 + 依赖时序)。记下后同桥 duplicate 恢复旧语义:同步 info 丢弃。
+    // per-connection 生命周期,量级 = 本连接 turn 数,无泄漏。
+    const locallySettledCodexTurns = new Set<string>();
     let drainTimer: ReturnType<typeof setTimeout> | null = null;
     let drainCause: BridgeCloseCause | null = null;
     let userDetached = false;
@@ -2228,6 +2241,11 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                         ? null
                         : accountIdForQuota.toString(),
                     source: "codex_bridge",
+                    // P0 修复(2026-07-03)— 跨桥 settle 需要:billing 帧到达新桥
+                    // (旧桥已关)时,journal ctx 是恢复 settle 的唯一权威上下文,
+                    // traceId 让跨桥的 cost_charged 广播 / billing 日志仍钉回本
+                    // turn 的 canonical trace。CG2c invariant 保证此处非 null。
+                    traceId: turnTraceIdCapture,
                   },
                 });
               } catch (err) {
@@ -2623,92 +2641,17 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               bridgeLog?.warn("user-chat-bridge: codex_billing missing requestId");
               return;
             }
-            const snap = inflightCodexTurns.get(reqId);
-            if (snap === undefined) {
-              // billing 帧的 requestId 在本桥 inflight Map 里查不到。可能原因:
-              //   - 我们已经在处理同 reqId 的另一帧 → Map 已 delete(下方先 delete
-              //     再 settle 的 invariant — 防 duplicate 帧重复广播 cost_charged)
-              //   - turn 已 settle 后容器又重发(retry / 误重)
-              //   - bridge 已 finalCleanup 把 Map 清空 → fail 路径已 abort journal
-              //   - 跨桥 misroute(理论不存在,容器只连一个 master 桥)
-              bridgeLog?.info("user-chat-bridge: codex_billing for unknown turn", {
-                requestId: reqId,
-              });
-              return;
-            }
-            // **同步** delete:duplicate billing 帧第二次进这个分支 Map.get 拿
-            // undefined 直接 return,不会再起一个 IIFE 重复广播 cost_charged。
-            // finalizer._done 守门只防 ledger 重复 debit,但两个 IIFE 各自 await commit 后
-            // 都会读 result.debitedCredits>0 各广播一次 — 用 Map.delete 早断。
-            inflightCodexTurns.delete(reqId);
-            // CG2c — billing settle 路径的 log 钉到 turn 的 server-owned trace。
-            // child 一次,后续 quota / commit / persist 三个分支都用 billingLog;
-            // requestId 经 binding 提供,call-site 不再手写。**只读 snap.traceId,
-            // 不解析 frame.traceId** —— 防容器侧伪造影响计费观测。
-            const billingLog = bridgeLog?.child({
-              traceId: snap.traceId,
-              requestId: reqId,
-            }) ?? null;
-            // Issue A v1.0.108 — codex `account/rateLimits/updated` 通知 piggy-back
-            // 到 billing 帧的 rateLimits 字段(runner 已转 Anthropic-shape)。
-            // 与 ledger commit 解耦走独立 fire-and-forget,理由:
-            //   - quota 是 best-effort 可见性,不应被 ledger commit 结果阻塞
-            //   - 写在 commit 之前,避免 commit IIFE swallow exception 时 quota 也被吞
-            //   - quota.ts 内部对 accountId === 0n / "0" 跳过(legacy 无关联账号)
-            //   - quota.ts 30s SQL+JS 双层 throttle 兜底重复写
-            const billingRl = (parsedBilling as { rateLimits?: unknown }).rateLimits;
-            if (
-              billingRl &&
-              typeof billingRl === "object" &&
-              deps.pgPool
-            ) {
-              const r = billingRl as {
-                util5h?: number;
-                reset5h?: string;
-                util7d?: number;
-                reset7d?: string;
-              };
-              void maybeUpdateAccountQuotaCodex(
-                deps.pgPool,
-                snap.accountId,
-                r,
-              ).catch((err) => {
-                billingLog?.debug("user-chat-bridge: codex quota write failed", {
-                  err: (err as Error)?.message,
-                });
-              });
-            }
+            // —— 与 snapshot 无关的帧字段解析(主路径与跨桥 fallback 共用)——
             // M2 — engineSessionId fail-closed 校验(方案 §D 红线 2)。
             // settle 落 usage_records.session_id 的**唯一**权威 = 帧上的
             // engineSessionId(gateway 经 engineSessionId(sessionKey) 派生,与
             // idle-timeout waive 上报同值)。缺失(旧容器镜像)/ 形状非法(伪造/
-            // 漂移)→ **不扣费**:abandon(abort journal + release reservation)
-            // + error 告警。宁可少收不可乱扣 —— 口径错的 session_id 一旦入库,
-            // waive 退款窗口(refund.refundSessionWindow)永远圈不到,会变成
-            // "该退不退"的乱扣。与 usage 缺失的 fail-safe 策略(免单并告警)对齐。
+            // 漂移)→ **不扣费**(见下方两个消费点)。
             const engineSidRaw = billing.engineSessionId;
             const engineSid =
               typeof engineSidRaw === "string" && ENGINE_SESSION_ID_RE.test(engineSidRaw)
                 ? engineSidRaw
                 : null;
-            if (engineSid === null) {
-              billingLog?.error("user-chat-bridge: codex_billing engineSessionId missing/invalid — waiving turn (fail-closed)", {
-                engineSessionId: typeof engineSidRaw === "string" ? engineSidRaw.slice(0, 80) : typeof engineSidRaw,
-              });
-              void (async () => {
-                try {
-                  await snap.abandon("codex_billing_engine_session_id_invalid");
-                } catch (err) {
-                  billingLog?.error("user-chat-bridge: codex abandon threw", {
-                    err: (err as Error)?.message,
-                  });
-                } finally {
-                  expireCodexRouteToken(snap.codexRouteToken, "billing_engine_session_id_invalid");
-                  checkDrainComplete();
-                }
-              })();
-              return;
-            }
             const codexStatus: "success" | "error" =
               billing.status === "error" ? "error" : "success";
             const errorReason = typeof billing.errorReason === "string"
@@ -2733,6 +2676,103 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               cache_read_tokens: safeNum(u.cache_read_input_tokens),
               cache_write_tokens: safeNum(u.cache_creation_input_tokens),
             };
+            const billingRl = (parsedBilling as { rateLimits?: unknown }).rateLimits;
+
+            const snap = inflightCodexTurns.get(reqId);
+            if (snap === undefined) {
+              // billing 帧的 requestId 在本桥 inflight Map 里查不到。两类成因:
+              //   - **同桥 duplicate**:同 reqId 的另一帧已进 settle/abandon(下方
+              //     Map.delete + locallySettledCodexTurns.add 先行)→ 同步 info
+              //     丢弃,不重复广播 cost_charged(旧语义保留);
+              //   - **跨桥重连(P0 修复 2026-07-03)**:turn 在旧桥开启(journal
+              //     inflight),用户断 WS 重连后容器把 billing 帧发到了新桥。旧实现
+              //     只打日志丢帧 = 整 turn 免费(收入漏洞)。现在按 request_id 回查
+              //     request_finalize_journal 裁决:inflight 行用 journal ctx 恢复
+              //     settle,committed/finalizing 幂等忽略,aborted 免单 + 告警。
+              if (locallySettledCodexTurns.has(reqId)) {
+                bridgeLog?.info("user-chat-bridge: codex_billing duplicate for locally settled turn — dropped", {
+                  requestId: reqId,
+                });
+                return;
+              }
+              handleCrossBridgeCodexBilling({
+                requestId: reqId,
+                engineSid,
+                engineSidRaw,
+                codexStatus,
+                errorReason,
+                usage,
+                billingRl,
+              });
+              return;
+            }
+            // **同步** delete:duplicate billing 帧第二次进这个分支 Map.get 拿
+            // undefined,由上方 locallySettledCodexTurns 门控直接 return,不会再起
+            // 一个 IIFE 重复广播 cost_charged。finalizer._done 守门只防 ledger 重复
+            // debit,但两个 IIFE 各自 await commit 后都会读 result.debitedCredits>0
+            // 各广播一次 — 用 Map.delete + 本地簿记早断。
+            inflightCodexTurns.delete(reqId);
+            locallySettledCodexTurns.add(reqId);
+            // CG2c — billing settle 路径的 log 钉到 turn 的 server-owned trace。
+            // child 一次,后续 quota / commit / persist 三个分支都用 billingLog;
+            // requestId 经 binding 提供,call-site 不再手写。**只读 snap.traceId,
+            // 不解析 frame.traceId** —— 防容器侧伪造影响计费观测。
+            const billingLog = bridgeLog?.child({
+              traceId: snap.traceId,
+              requestId: reqId,
+            }) ?? null;
+            // Issue A v1.0.108 — codex `account/rateLimits/updated` 通知 piggy-back
+            // 到 billing 帧的 rateLimits 字段(runner 已转 Anthropic-shape)。
+            // 与 ledger commit 解耦走独立 fire-and-forget,理由:
+            //   - quota 是 best-effort 可见性,不应被 ledger commit 结果阻塞
+            //   - 写在 commit 之前,避免 commit IIFE swallow exception 时 quota 也被吞
+            //   - quota.ts 内部对 accountId === 0n / "0" 跳过(legacy 无关联账号)
+            //   - quota.ts 30s SQL+JS 双层 throttle 兜底重复写
+            if (
+              billingRl &&
+              typeof billingRl === "object" &&
+              deps.pgPool
+            ) {
+              const r = billingRl as {
+                util5h?: number;
+                reset5h?: string;
+                util7d?: number;
+                reset7d?: string;
+              };
+              void maybeUpdateAccountQuotaCodex(
+                deps.pgPool,
+                snap.accountId,
+                r,
+              ).catch((err) => {
+                billingLog?.debug("user-chat-bridge: codex quota write failed", {
+                  err: (err as Error)?.message,
+                });
+              });
+            }
+            // engineSessionId fail-closed(解析已上移):缺失 / 形状非法 →
+            // **不扣费**:abandon(abort journal + release reservation)+ error
+            // 告警。宁可少收不可乱扣 —— 口径错的 session_id 一旦入库,waive 退款
+            // 窗口(refund.refundSessionWindow)永远圈不到,会变成"该退不退"的
+            // 乱扣。与 usage 缺失的 fail-safe 策略(免单并告警)对齐。
+            if (engineSid === null) {
+              billingLog?.error("user-chat-bridge: codex_billing engineSessionId missing/invalid — waiving turn (fail-closed)", {
+                engineSessionId: typeof engineSidRaw === "string" ? engineSidRaw.slice(0, 80) : typeof engineSidRaw,
+              });
+              void (async () => {
+                try {
+                  await snap.abandon("codex_billing_engine_session_id_invalid");
+                } catch (err) {
+                  billingLog?.error("user-chat-bridge: codex abandon threw", {
+                    err: (err as Error)?.message,
+                  });
+                } finally {
+                  expireCodexRouteToken(snap.codexRouteToken, "billing_engine_session_id_invalid");
+                  checkDrainComplete();
+                }
+              })();
+              return;
+            }
+            // codexStatus / errorReason / usage 解析已上移(主路径与跨桥 fallback 共用)。
             // fire-and-forget settle:Map 已 delete,duplicate 帧不会再触发;commit
             // 内部 _done 守门兜底防 finalCleanup 同时调 fail 时重复 debit。
             // M2:settle 收口 = codexFinalizer → settleUsageAndLedger → spendTwoBucket
@@ -3244,6 +3284,261 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     }
 
     /**
+     * P0 收入漏洞修复(2026-07-03)— codex billing 帧撞上"本桥不认识的 requestId"
+     * 时,按 request_finalize_journal(唯一权威源)回查裁决,而不是丢帧。
+     *
+     * 背景:inflightCodexTurns 是 per-连接闭包 Map,而 v5 断流续写语义下 codex
+     * turn 跨 WS 重连存活 —— 用户中途断线重连后,容器把 outbound.codex_billing
+     * 发到**新桥**,新桥 Map 查不到 → 旧实现只打日志 = 整 turn 免费。修复后按
+     * journal state 裁决:
+     *   - 'inflight'   → 用 journal ctx(model/agentId/codexAccountId/traceId,
+     *     startInflightJournal 落笔)重构 finalizer 完成 settle —— 双钱包扣费、
+     *     零输出免单、cost_charged 持久化+广播口径与主路径完全一致;
+     *   - 'committed' / 'finalizing' → 幂等忽略(duplicate 帧 / 旧桥 drain 窗口已
+     *     settle / 并发 settle 在途);
+     *   - 'aborted'    → **免单 + error 告警,不补收**。钱安全红线"宁少收不乱扣":
+     *     aborted 行的 preCheck reservation 已释放、免单决策(engineSessionId
+     *     fail-closed / reconciler_timeout / commit 失败等)已对外生效,此处补收
+     *     会绕过既有免单口径;且 journal CAS 不允许 aborted→committed,强行
+     *     settle 会让 ledger 与 journal 终态脱钩。本修复已同时移除 finalCleanup
+     *     的 bridge_disconnect abort,常态下不应再出现 billing 撞 aborted ——
+     *     出现即异常,error 级告警留人工核账(存量 bridge_disconnect abort 行为
+     *     修复前已发生的损失,按"接受不可追回"口径处理,与 reconciler 一致);
+     *   - 无行 → warn 丢弃(容器伪造 / 非本 master 生成的 requestId)。
+     *
+     * 并发/幂等防线(与主路径 Map.delete 单次门控同构):
+     *   1. pendingJournalSettles 同步去重 —— 同 reqId duplicate 帧在 settle 在途
+     *      期间直接丢弃;
+     *   2. settleUsageAndLedger 的 (user_id, request_id) UNIQUE + journal CAS ——
+     *      跨桥并发(旧桥 drain settle vs 新桥 fallback)由 DB 层兜底,后到的
+     *      settle 拿 debitedCredits=null,不重复扣也不重复广播。
+     *
+     * 安全:journal.user_id 必须等于本桥 uid(容器 per-user,不等即伪造/串桥,
+     * 直接拒绝);settle 参数全部取自 journal ctx(master 落笔),不信帧上的
+     * model/agentId(与主路径"只信 snapshot"红线同构);preCheck reservation
+     * handle 按 (userId, requestId) 重建 —— 与原桥 preCheckWithCost 返回的
+     * handle 同值(ReservationHandle 本就只是这两个字段)。
+     */
+    function handleCrossBridgeCodexBilling(frame: {
+      requestId: string;
+      engineSid: string | null;
+      engineSidRaw: unknown;
+      codexStatus: "success" | "error";
+      errorReason: string | undefined;
+      usage: TokenUsage;
+      billingRl: unknown;
+    }): void {
+      const { requestId } = frame;
+      if (!codexBillingEnabled) {
+        // 计费未启用(个人版上下文 / 纯透传测试)— 无 journal 可查,保持旧日志语义。
+        bridgeLog?.info("user-chat-bridge: codex_billing for unknown turn (billing disabled)", {
+          requestId,
+        });
+        return;
+      }
+      // server-owned requestId 恒为 32-hex(ensureRequestIdServerSide;gateway 侧
+      // billing guard 是同一 seam 合同)。形状不符 = 容器伪造/坏帧,不值得打 DB。
+      if (!/^[0-9a-f]{32}$/.test(requestId)) {
+        bridgeLog?.warn("user-chat-bridge: codex_billing unknown turn with malformed requestId — dropped", {
+          requestId: requestId.slice(0, 64),
+        });
+        return;
+      }
+      if (pendingJournalSettles.has(requestId)) {
+        bridgeLog?.info("user-chat-bridge: codex_billing duplicate while cross-bridge settle in flight — dropped", {
+          requestId,
+        });
+        return;
+      }
+      pendingJournalSettles.add(requestId);
+      // 三件套非空由 codexBillingEnabled(boot-time 全有或全无强校验)保证。
+      const pgPool = deps.pgPool!;
+      const preCheckRedisBound = deps.preCheckRedis!;
+      const pricingCache = deps.pricing!;
+      void (async (): Promise<void> => {
+        try {
+          const res = await pgPool.query<{
+            state: string;
+            user_id: string;
+            ctx: unknown;
+          }>(
+            `SELECT state, user_id::text AS user_id, ctx
+               FROM request_finalize_journal
+              WHERE request_id = $1`,
+            [requestId],
+          );
+          const row = res.rows[0];
+          if (row === undefined) {
+            bridgeLog?.warn("user-chat-bridge: codex_billing for unknown turn — no journal row, dropped", {
+              requestId,
+            });
+            return;
+          }
+          if (row.user_id !== uid.toString()) {
+            // 容器只服务单用户;journal 行归属他人 = 伪造 requestId / 串桥,拒绝。
+            bridgeLog?.error("user-chat-bridge: codex_billing journal user mismatch — refusing settle", {
+              requestId,
+              journalUserId: row.user_id,
+            });
+            return;
+          }
+          if (row.state === "committed" || row.state === "finalizing") {
+            bridgeLog?.info("user-chat-bridge: codex_billing for already-settled journal — idempotent ignore", {
+              requestId,
+              state: row.state,
+            });
+            return;
+          }
+          if (row.state === "aborted") {
+            // 见函数头注释:免单 + 告警,不补收(钱安全红线)。
+            bridgeLog?.error("user-chat-bridge: codex_billing hit aborted journal — turn waived, needs investigation (money-safety: never charge over an aborted journal)", {
+              requestId,
+            });
+            return;
+          }
+          // state === 'inflight' — 跨桥恢复 settle。
+          const ctx = (row.ctx !== null && typeof row.ctx === "object"
+            ? row.ctx
+            : {}) as Record<string, unknown>;
+          const model = typeof ctx.model === "string" ? ctx.model : null;
+          const agentId = typeof ctx.agentId === "string" ? ctx.agentId : "codex";
+          const ctxTraceId = typeof ctx.traceId === "string" ? ctx.traceId : null;
+          const reservation: ReservationHandle = {
+            userId: uid.toString(),
+            requestId,
+          };
+          const billingLog = bridgeLog?.child({
+            ...(ctxTraceId !== null ? { traceId: ctxTraceId } : {}),
+            requestId,
+          }) ?? null;
+          // 配置类不可恢复错误 → 与主路径 abandon 同语义:免单(abort journal)
+          // + 释放软预扣 + error 告警。宁可少收不可乱扣。
+          const waive = async (reason: string): Promise<void> => {
+            await abortInflightJournal(pgPool, requestId, reason).catch(() => {});
+            await releasePreCheck(preCheckRedisBound, reservation).catch(() => {});
+          };
+          if (frame.engineSid === null) {
+            billingLog?.error("user-chat-bridge: cross-bridge codex_billing engineSessionId missing/invalid — waiving turn (fail-closed)", {
+              engineSessionId: typeof frame.engineSidRaw === "string"
+                ? frame.engineSidRaw.slice(0, 80)
+                : typeof frame.engineSidRaw,
+            });
+            await waive("codex_billing_engine_session_id_invalid");
+            return;
+          }
+          if (model === null) {
+            billingLog?.error("user-chat-bridge: cross-bridge codex_billing journal ctx missing model — waiving turn");
+            await waive("cross_bridge_journal_ctx_model_missing");
+            return;
+          }
+          const modelPricing = pricingCache.get(model);
+          if (!modelPricing) {
+            billingLog?.error("user-chat-bridge: cross-bridge codex_billing pricing missing — waiving turn", {
+              model,
+            });
+            await waive("cross_bridge_pricing_missing");
+            return;
+          }
+          let agentMul: string;
+          try {
+            agentMul = await getAgentCostMultiplier(pgPool, agentId);
+          } catch (err) {
+            // 瞬态 DB 错误:**不** abort —— journal 保持 inflight,reconciler 兜底
+            // 终态化(与"桥断不 abort 存活 turn"同一裁决权归属),不把临时故障
+            // 固化成免单。
+            billingLog?.error("user-chat-bridge: cross-bridge getAgentCostMultiplier failed — journal left inflight for reconciler", {
+              agentId,
+              err: (err as Error)?.message,
+            });
+            return;
+          }
+          const derivedPricing: ModelPricing = {
+            ...modelPricing,
+            multiplier: composeMultiplier(modelPricing.multiplier, agentMul),
+          };
+          // rateLimits piggyback(best-effort,与主路径同语义;accountId 权威取
+          // journal ctx.codexAccountId —— null = legacy / api_relay 无关联账号)。
+          if (frame.billingRl && typeof frame.billingRl === "object") {
+            const accStr = typeof ctx.codexAccountId === "string" ? ctx.codexAccountId : null;
+            if (accStr !== null && /^[0-9]{1,19}$/.test(accStr)) {
+              void maybeUpdateAccountQuotaCodex(
+                pgPool,
+                BigInt(accStr),
+                frame.billingRl as {
+                  util5h?: number;
+                  reset5h?: string;
+                  util7d?: number;
+                  reset7d?: string;
+                },
+              ).catch((err) => {
+                billingLog?.debug("user-chat-bridge: cross-bridge codex quota write failed", {
+                  err: (err as Error)?.message,
+                });
+              });
+            }
+          }
+          const finalizer = makeCodexFinalizer({
+            pgPool,
+            preCheckRedis: preCheckRedisBound,
+            userId: uid,
+            requestId,
+            engineSessionId: frame.engineSid,
+            model,
+            derivedPricing,
+            reservation,
+          });
+          const result = await finalizer.commit(
+            frame.usage, frame.codexStatus, frame.errorReason,
+          );
+          // settle 已收口 → 后续同桥 duplicate 帧同步丢弃(与主路径簿记同构)。
+          locallySettledCodexTurns.add(requestId);
+          billingLog?.info("user-chat-bridge: codex cross-bridge settle done (recovered turn billing)", {
+            model,
+            debitedCredits: result.debitedCredits?.toString() ?? null,
+            costCredits: result.costCredits.toString(),
+          });
+          // 广播口径与主路径一致:仅 debit>0 才 persist + 广播。
+          if (result.debitedCredits !== null && result.debitedCredits > 0n) {
+            if (deps.appendCostCredits) {
+              try {
+                await deps.appendCostCredits(
+                  requestId,
+                  uid.toString(),
+                  result.debitedCredits.toString(),
+                );
+              } catch (err) {
+                billingLog?.warn("user-chat-bridge: cross-bridge persist costCredits threw", {
+                  err: (err as Error)?.message,
+                });
+              }
+            }
+            broadcastToUser(uid, {
+              type: "outbound.cost_charged",
+              requestId,
+              traceId: ctxTraceId,
+              model,
+              costCredits: result.costCredits.toString(),
+              debitedCredits: result.debitedCredits.toString(),
+              balanceAfter: result.balanceAfter !== null
+                ? result.balanceAfter.toString()
+                : null,
+              clamped: result.clamped,
+            });
+          }
+        } catch (err) {
+          // settle 抛错:commitOnce 内部已 abort journal(codex_commit_failed)
+          // 兜底并 release reservation,这里只 log(与主路径 commit throw 同语义)。
+          bridgeLog?.error("user-chat-bridge: codex cross-bridge settle failed", {
+            requestId,
+            err: (err as Error)?.message,
+          });
+        } finally {
+          pendingJournalSettles.delete(requestId);
+        }
+      })();
+    }
+
+    /**
      * 立即让出 user 侧资源(registry 配额、uidToUserWs、user-side timer)。
      *
      * idempotent — drain 进入时跑一次,finalCleanup 也无脑跑(no-op)。
@@ -3303,13 +3598,28 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       // user 侧 detach(idempotent)
       detachUserSide(finalCause);
 
-      // PR2 v1.0.66 → M2 — codex inflight fail-abort:drain 已超时或没进 drain 的
-      // 路径,把 Map 里残留的 turn(acquire 过 preCheck+journal 但没等到可 settle 的
-      // billing 帧)abandon 掉:abort inflight journal + release preCheck。
-      // fire-and-forget。已 settle 的 turn 由 Map.delete 纪律先行摘除,不会被误 fail;
-      // finalizer 已构造的残留(理论不可达)由 _done 守门防重复 debit。
-      for (const [, snap] of inflightCodexTurns) {
-        snap.abandon("bridge_disconnect").catch(() => {});
+      // P0 修复(2026-07-03)— **桥关 ≠ turn 终止,finalCleanup 不再 abort 残留
+      // inflight turn**。v5 断流续写语义下(turn 跨 WS 重连存活 + ring 重放),用户
+      // 断线/重连/displacement/master 平滑重启后,容器侧 codex turn 继续跑;旧实现
+      // 在这里把残留 snapshot 全部 abandon(abort journal + release reservation),
+      // billing 帧随后到达**新桥**时撞上 aborted journal → 整 turn 免费(收入漏洞,
+      // e2e 实测复现)。桥对"容器侧 turn 是否存活"不可知,裁决权交给权威源:
+      //   - billing 帧到达任意桥(旧桥 drain 窗口 / 新桥 journal 回查)→ settle;
+      //   - turn 真死(容器崩 / billing 帧永失)→ finalizeJournalReconciler 在
+      //     stuck 阈值(≥30min,COMMERCIAL_FINALIZE_RECONCILER_*)后终态化:有
+      //     usage_records 补 committed,无则 aborted('reconciler_timeout',不扣费)
+      //     —— 不产生永久 inflight 泄漏;
+      //   - preCheck 软预扣不在此处提前释放:settle 时由 finalizer release,否则
+      //     Redis TTL(300s)自然回收。代价 = 低余额用户断线后至多 5min 内新 turn
+      //     可能被软预扣挡住 —— 但该 turn 确实仍在消耗,语义正确且有界。
+      // 已 settle 的 turn 由 Map.delete 纪律先行摘除;这里只清本地帧路由簿记,
+      // **不动 journal 权威状态**。
+      if (inflightCodexTurns.size > 0) {
+        bridgeLog?.info("user-chat-bridge: bridge closed with surviving codex turns — journal left inflight (cross-bridge settle / reconciler will adjudicate)", {
+          finalCause,
+          leftover: inflightCodexTurns.size,
+          requestIds: [...inflightCodexTurns.keys()],
+        });
       }
       inflightCodexTurns.clear();
 

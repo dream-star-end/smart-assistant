@@ -1836,6 +1836,99 @@ describe('handleItemStarted — suppression + lowercase prefix (PR1 v1.0.65 A.1)
   })
 })
 
+// ── LOW-1(2026-07-03)— Bash 卡 description 不再硬编码 'codex commandExecution',
+// 改为命令首行摘要(≤60 字符);空命令不带 description 字段。 ──────────────────
+describe('LOW-1 — commandExecution Bash 卡 description 摘要', () => {
+  function startCmd(h: Harness, id: string, command: string): void {
+    feed(h.runner, {
+      jsonrpc: '2.0',
+      method: 'item/started',
+      params: { threadId: 'thr', turnId: 't-desc', item: { id, type: 'commandExecution', command } },
+    })
+  }
+
+  it('description = 命令首行(剥 /bin/bash -lc 壳),不再是 "codex commandExecution"', async () => {
+    const h = await makeHarness()
+    ;(h.runner as any).activeTurnId = 't-desc'
+    startCmd(h, 'c1', "/bin/bash -lc 'ls -la /tmp'")
+    const input = h.messages[0].message.content[0].input
+    assert.equal(input.command, 'ls -la /tmp')
+    assert.equal(input.description, 'ls -la /tmp')
+    assert.notEqual(input.description, 'codex commandExecution')
+    await h.cleanup()
+  })
+
+  it('多行命令 → 只取首个非空行;超 60 字符截断加省略号(总长 ≤60)', async () => {
+    const h = await makeHarness()
+    ;(h.runner as any).activeTurnId = 't-desc'
+    startCmd(h, 'c2', '\n  git status\ngit diff')
+    assert.equal(h.messages[0].message.content[0].input.description, 'git status')
+    const long = 'echo ' + 'x'.repeat(100)
+    startCmd(h, 'c3', long)
+    const desc = h.messages[1].message.content[0].input.description as string
+    assert.equal(desc.length, 60)
+    assert.equal(desc, `${long.slice(0, 59)}…`)
+    await h.cleanup()
+  })
+
+  it('空命令 → 不带 description 字段(不渲染垃圾副标题)', async () => {
+    const h = await makeHarness()
+    ;(h.runner as any).activeTurnId = 't-desc'
+    startCmd(h, 'c4', '')
+    const input = h.messages[0].message.content[0].input
+    assert.equal('description' in input, false)
+    await h.cleanup()
+  })
+})
+
+// ── LOW-2(2026-07-03)— codex turn 终态映射 stop_reason:completed → 'end_turn',
+// interrupted → 'interrupted',failed/异常 → 不带(保持 is_error 语义)。
+// ccbMessageParser._handleResult 读 result.stop_reason 随 final meta 下发。 ────
+describe('LOW-2 — turn 终态 stop_reason 映射', () => {
+  async function runTurnWithStatus(status: string): Promise<{ msg: any; cleanup: () => Promise<void> }> {
+    const h = await makeHarness()
+    const runner = h.runner as any
+    runner.ensureSpawned = async () => {}
+    runner.attached = true
+    runner.threadId = 'thread-stop'
+    runner.sendRequest = async (method: string) => {
+      if (method === 'turn/start') return { turn: { id: 'turn-sr' } }
+      return undefined
+    }
+    setTimeout(() => {
+      runner.handleNotification('turn/completed', {
+        turnId: 'turn-sr',
+        turn: { id: 'turn-sr', status, durationMs: 3 },
+      })
+    }, 1)
+    await runner.runTurn('hi', 'req-sr-1')
+    const msg = h.messages.find((m: any) => m.type === 'result' && m.requestId === 'req-sr-1')
+    assert.ok(msg, 'emitResult must fire')
+    return { msg, cleanup: h.cleanup }
+  }
+
+  it("completed → stop_reason 'end_turn'(subtype success)", async () => {
+    const { msg, cleanup } = await runTurnWithStatus('completed')
+    assert.equal(msg.subtype, 'success')
+    assert.equal(msg.stop_reason, 'end_turn')
+    await cleanup()
+  })
+
+  it("interrupted → stop_reason 'interrupted' + is_error 保持", async () => {
+    const { msg, cleanup } = await runTurnWithStatus('interrupted')
+    assert.equal(msg.is_error, true)
+    assert.equal(msg.stop_reason, 'interrupted')
+    await cleanup()
+  })
+
+  it('failed → 不带 stop_reason(is_error 语义不被伪造终态覆盖)', async () => {
+    const { msg, cleanup } = await runTurnWithStatus('failed')
+    assert.equal(msg.is_error, true)
+    assert.equal(msg.stop_reason, undefined)
+    await cleanup()
+  })
+})
+
 describe('handleNotification — goals', () => {
   it('thread/goal/updated emits an OpenClaude-native goal message', async () => {
     const h = await makeHarness()
