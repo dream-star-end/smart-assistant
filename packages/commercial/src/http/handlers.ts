@@ -22,6 +22,7 @@ import {
   setRefreshCookie,
   clearRefreshCookie,
   readRefreshCookie,
+  appendSetCookie,
 } from "./cookies.js";
 import { register, RegisterError } from "../auth/register.js";
 import { verifyEmail, requestPasswordReset, confirmPasswordReset, resendVerification, VerifyError } from "../auth/verify.js";
@@ -910,12 +911,14 @@ export async function handleMe(
     total_credits: string;
     status: string;
     created_at: Date;
+    on_v5: boolean;
   }>(
     `SELECT u.id::text AS id, u.email, u.email_verified, u.role, u.display_name, u.avatar_url,
             u.credits::text AS wallet_credits,
             COALESCE(us.period_credits, 0)::text AS period_credits,
             (u.credits + COALESCE(us.period_credits, 0))::text AS total_credits,
-            u.status, u.created_at
+            u.status, u.created_at,
+            (u.v5_migrated_at IS NOT NULL) AS on_v5
        FROM users u
        LEFT JOIN user_subscriptions us
          ON us.user_id = u.id AND us.status = 'active' AND us.period_end > NOW()
@@ -927,6 +930,14 @@ export async function handleMe(
     throw new HttpError(401, "UNAUTHORIZED", "user is not active");
   }
   const u = r.rows[0];
+  // v3→v5 迁移路由(对称于 v3 handleMe):已迁移用户刷新 oc_v5 cookie(路由维持在 v5);
+  // 若一个仍带 oc_v5 cookie 的用户其实已被回滚(on_v5=false)命中到 v5,清除 cookie →
+  // 下个请求 Caddy 路由回 v3。使回滚无需用户手动清 cookie。
+  if (u.on_v5) {
+    appendSetCookie(res, "oc_v5=1; Path=/; Max-Age=31536000; Secure; HttpOnly; SameSite=Lax");
+  } else {
+    appendSetCookie(res, "oc_v5=; Path=/; Max-Age=0; Secure; HttpOnly; SameSite=Lax");
+  }
   sendJson(res, 200, {
     user: {
       id: u.id,
