@@ -17,10 +17,12 @@ import {
   _sanitizeThreadId,
   buildCodexEnv,
   buildCodexProviderConfigArgs,
+  buildCodexTelemetryHardeningArgs,
   type CodexProviderConfigOverride,
   codexReasoningEffortConfig,
   copyImagePathsToPublicDir,
 } from './codexShared.js'
+import { V3_CODEX_RELAY_PREFIX } from '../v3CodexRelay.js'
 import { createLogger } from '../logger.js'
 
 const log = createLogger({ module: 'codexAppServerRunner' })
@@ -1252,11 +1254,25 @@ export class CodexAppServerRunner extends EventEmitter {
     const providerSignature = this.codexRouteSignature()
     const providerArgs = buildCodexProviderConfigArgs(process.env, this.codexRouteConfig)
     const effortArgs = codexReasoningEffortConfig(this.effortLevel)
+    // v5 telemetry-block C1(配置面双保险):遥测/自更新关闭 + chatgpt_base_url
+    // 指向容器 loopback relay。**每次 spawn 无条件追加**(不挂 provider override
+    // 成功路径)——即便本 turn 无 route override / managed_config 被非法值整份丢弃,
+    // codex 的遥测直连仍被这组 `-c` 拦下。chatgpt_base_url 的 loopback base 用
+    // 容器 gateway 端口(config.gateway.port,与 official_oauth route override 的
+    // base_url 同拼法);config 缺失(legacy naked 路径)→ 省略该键,仍留 managed
+    // _config 兜底。
+    const relayPort = this.opts.config?.gateway?.port
+    const chatgptRelayBaseUrl =
+      typeof relayPort === 'number' && relayPort > 0
+        ? `http://127.0.0.1:${relayPort}${V3_CODEX_RELAY_PREFIX}/backend-api/codex`
+        : undefined
+    const telemetryArgs = buildCodexTelemetryHardeningArgs(chatgptRelayBaseUrl)
     const args = [
       'app-server',
       ...argvOverrides,
       ...providerArgs,
       ...effortArgs,
+      ...telemetryArgs,
       '--listen',
       'stdio://',
     ]

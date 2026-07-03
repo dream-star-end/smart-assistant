@@ -1,0 +1,13 @@
+[Unit]
+# 定时刷新 ipset(DNS 轮换):setup-codex-telemetry-block.sh refresh —— atomic swap,
+# 只碰 ipset 内容,不动 DOCKER-USER 规则(规则按 set 名引用)。由同名 .timer 触发。
+Description=OpenClaude v5 codex telemetry ipset refresh (atomic swap on DNS rotation)
+After=docker.service network-online.target openclaude-v5-codex-telemetry-block.service
+Wants=openclaude-v5-codex-telemetry-block.service
+ConditionPathExists=/opt/openclaude/openclaude-v5/packages/commercial/scripts/setup-codex-telemetry-block.sh
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash /opt/openclaude/openclaude-v5/packages/commercial/scripts/setup-codex-telemetry-block.sh refresh
+StandardOutput=journal
+StandardError=journal

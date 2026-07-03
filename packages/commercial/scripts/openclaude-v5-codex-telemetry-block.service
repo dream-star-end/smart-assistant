@@ -1,0 +1,25 @@
+[Unit]
+# Boot 后自动装 v5 codex 遥测出网封堵(setup-codex-telemetry-block.sh install):
+#   建 ipset + 挂 DOCKER-USER REJECT 规则(仅 172.31.0.0/16 v5 网段)。
+# After=docker.service:docker daemon 起来后再跑 —— DOCKER-USER 链由 docker 创建,
+#   且避免 docker 重置 iptables 时清掉我们的规则。
+# 只作用 v5 网段,绝不碰 v3(172.30.0.0/16)。
+Description=OpenClaude v5 codex telemetry egress block (ipset + DOCKER-USER REJECT, v5 net only)
+After=docker.service network-online.target
+Wants=docker.service network-online.target
+ConditionPathExists=/opt/openclaude/openclaude-v5/packages/commercial/scripts/setup-codex-telemetry-block.sh
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# 路径与 v5 canonical 部署位置一致(kl-mirror:/opt/openclaude/openclaude-v5)。
+ExecStart=/bin/bash /opt/openclaude/openclaude-v5/packages/commercial/scripts/setup-codex-telemetry-block.sh install
+# 回滚:systemctl disable --now openclaude-v5-codex-telemetry-block.timer \
+#         openclaude-v5-codex-telemetry-block.service
+#       bash /opt/openclaude/openclaude-v5/packages/commercial/scripts/setup-codex-telemetry-block.sh --uninstall
+ExecStop=/bin/bash /opt/openclaude/openclaude-v5/packages/commercial/scripts/setup-codex-telemetry-block.sh --uninstall
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

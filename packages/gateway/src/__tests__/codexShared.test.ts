@@ -17,9 +17,15 @@ import {
   _sanitizeThreadId,
   buildCodexEnv,
   buildCodexProviderConfigArgs,
+  buildCodexTelemetryHardeningArgs,
   codexReasoningEffortConfig,
   copyImagePathsToPublicDir,
 } from '../engine/codexShared.js'
+
+/** 从 `-c a=b -c c=d` 的扁平数组里取出 key=value 对(过滤 '-c' 分隔符)。 */
+function pairsOf(args: string[]): string[] {
+  return args.filter((a) => a !== '-c')
+}
 
 describe('codexReasoningEffortConfig', () => {
   it('returns empty array for missing / empty / invalid input', () => {
@@ -133,6 +139,37 @@ describe('buildCodexProviderConfigArgs', () => {
   })
 })
 
+describe('buildCodexTelemetryHardeningArgs — 遥测/自更新封堵(C1 双保险)', () => {
+  it('总是关 analytics / otel(trace+metrics)/ 启动更新检查', () => {
+    const pairs = pairsOf(buildCodexTelemetryHardeningArgs())
+    assert.ok(pairs.includes('analytics.enabled=false'), pairs.join(' '))
+    assert.ok(pairs.includes('otel.trace_exporter="none"'), pairs.join(' '))
+    assert.ok(pairs.includes('otel.metrics_exporter="none"'), pairs.join(' '))
+    assert.ok(pairs.includes('check_for_update_on_startup=false'), pairs.join(' '))
+    // 每个键前都有 '-c'
+    assert.equal(buildCodexTelemetryHardeningArgs().filter((a) => a === '-c').length, pairs.length)
+  })
+
+  it('探针实测偏离锁定:不使用 log_exporter(0.137 非有效键)', () => {
+    const flat = buildCodexTelemetryHardeningArgs('http://127.0.0.1:18789/x').join(' ')
+    assert.ok(!flat.includes('log_exporter'), flat)
+  })
+
+  it('给了 loopback relay base → 追加 chatgpt_base_url 顶层键(引号包裹)', () => {
+    const base = 'http://127.0.0.1:18789/internal/v3/codex-relay/backend-api/codex'
+    const pairs = pairsOf(buildCodexTelemetryHardeningArgs(base))
+    assert.ok(pairs.includes(`chatgpt_base_url="${base}"`), pairs.join(' '))
+  })
+
+  it('缺 base(legacy naked 路径)→ 省略 chatgpt_base_url,其余照常', () => {
+    for (const empty of [undefined, null, '', '   ']) {
+      const pairs = pairsOf(buildCodexTelemetryHardeningArgs(empty))
+      assert.ok(!pairs.some((p) => p.startsWith('chatgpt_base_url=')), `empty=${JSON.stringify(empty)}`)
+      assert.ok(pairs.includes('analytics.enabled=false'))
+    }
+  })
+})
+
 describe('buildCodexEnv — 凭证 scrub(安全红线)', () => {
   const patched: string[] = []
   const setEnv = (k: string, v: string) => {
@@ -161,6 +198,22 @@ describe('buildCodexEnv — 凭证 scrub(安全红线)', () => {
     assert.equal(env.MINIMAX_API_KEY, undefined)
     assert.equal(env.DEEPSEEK_API_KEY, undefined)
     assert.equal(env.OC_TEST_HARMLESS_VAR, 'keep-me')
+  })
+
+  it('nit1:剥除全大小写 proxy 变体 + 强制 NO_PROXY loopback/网关', () => {
+    setEnv('HTTP_PROXY', 'http://172.31.0.1:18892')
+    setEnv('http_proxy', 'http://172.31.0.1:18892')
+    setEnv('HTTPS_PROXY', 'http://172.31.0.1:18892')
+    setEnv('https_proxy', 'http://172.31.0.1:18892')
+    setEnv('ALL_PROXY', 'socks5://172.31.0.1:1080')
+    setEnv('all_proxy', 'socks5://172.31.0.1:1080')
+    const env = buildCodexEnv()
+    for (const k of ['HTTP_PROXY', 'http_proxy', 'HTTPS_PROXY', 'https_proxy', 'ALL_PROXY', 'all_proxy']) {
+      assert.equal(env[k], undefined, `proxy var ${k} must be scrubbed (A 网络面 fail-closed 前提)`)
+    }
+    // 正向声明:NO_PROXY 两变体都被设成 loopback/网关直连
+    assert.equal(env.NO_PROXY, '127.0.0.1,localhost,172.31.0.1')
+    assert.equal(env.no_proxy, '127.0.0.1,localhost,172.31.0.1')
   })
 })
 

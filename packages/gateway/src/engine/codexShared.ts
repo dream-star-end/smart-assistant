@@ -190,6 +190,50 @@ export function buildCodexProviderConfigArgs(
   ]
 }
 
+/**
+ * Telemetry / self-update hardening `-c` overrides for `codex app-server`
+ * (v5 feat/v5-codex-telemetry-block —— C1 配置面双保险).
+ *
+ * 与 provider 路由(buildCodexProviderConfigArgs)是**不同关注点**,单独成函数
+ * 并在 codexAppServerRunner 每次 spawn **无条件** spread —— 不能挂在 provider
+ * override 成功路径上(那条早返回 [] 时遥测保护会一起丢)。三层防御的中间层:
+ *   1. 镜像 root-owned /etc/codex/managed_config.toml(用户不可覆盖层,主权威)
+ *   2. 本函数的每-spawn `-c`(managed_config 万一被非法值整份丢弃时兜底)
+ *   3. host 侧 ipset REJECT(网络面 fail-closed 终极兜底)
+ *
+ * 键名/枚举值经 codex 0.137 二进制 + 运行时探针实测(2026-07-03,镜像
+ * v5-ccb-5af8167f):
+ *   - `analytics.enabled=false` —— 关 chatgpt.com backend-api analytics-events 上报
+ *   - `otel.trace_exporter="none"` / `otel.metrics_exporter="none"` —— 关 OTLP/statsig
+ *     遥测(合法枚举实测 = none/statsig/otlp-http/otlp-grpc;方案原写的
+ *     `log_exporter` 在 0.137 不是有效键,已剔除,见 commit)
+ *   - `check_for_update_on_startup=false` —— 关启动期 api.github.com release 检查
+ *   - `chatgpt_base_url`(顶层键,独立于数据面 model_providers.<id>.base_url)——
+ *     把 codex 对 ChatGPT backend-api 的残余请求(agent-identity 等)引到容器
+ *     loopback relay;relay allowlist 外 → 404,不出容器、不计费。
+ *
+ * ⚠️ 只放**实测有效**的键 —— codex 0.137 对已知键的非法值会把整份配置丢弃
+ * 回落默认(`Invalid configuration; using defaults`),连带 managed_config 的
+ * 保护也失效。任何新增键必须先探针。
+ */
+export function buildCodexTelemetryHardeningArgs(chatgptRelayBaseUrl?: string | null): string[] {
+  const args: string[] = [
+    '-c',
+    'analytics.enabled=false',
+    '-c',
+    'otel.trace_exporter="none"',
+    '-c',
+    'otel.metrics_exporter="none"',
+    '-c',
+    'check_for_update_on_startup=false',
+  ]
+  const base = chatgptRelayBaseUrl?.trim()
+  if (base) {
+    args.push('-c', `chatgpt_base_url=${tomlString(base)}`)
+  }
+  return args
+}
+
 /** Env keys scrubbed from the codex subprocess environment.
  *  Rationale: codex CLI uses ChatGPT oauth from ~/.codex/auth.json — it has
  *  no need for Anthropic / CCB / gateway auth tokens, and passing them
@@ -214,18 +258,47 @@ const ENV_SCRUB_KEYS = new Set<string>([
 ])
 const ENV_SCRUB_PREFIXES = ['ANTHROPIC_', 'CLAUDE_CODE_', 'OPENCLAUDE_']
 
+/** Proxy env keys scrubbed from the codex subprocess(v5 telemetry-block nit1,
+ *  A 网络面 fail-closed 的前提)。
+ *
+ *  容器把 HTTP(S)_PROXY 指向内部 Anthropic egress 代理(supervisor.ts 注入
+ *  HTTP_PROXY/HTTPS_PROXY=172.31.0.1:18892)。codex reqwest 若继承,它对
+ *  chatgpt.com / ab.chatgpt.com 的遥测直连会先 CONNECT 到内部代理 —— 于是
+ *  host 侧网络层 A(按 dst IP 匹配 chatgpt 网段)看到的 TCP dst 是代理 IP
+ *  而非 chatgpt,规则不命中 → 不 fail-closed → 遥测经代理外泄破坏账号 IP 纯净。
+ *  剥掉全大小写变体后,codex 的唯一合法出口 = 容器 loopback relay(127.0.0.1
+ *  直连),其余对外遥测走直连 → 落进网络层 A 的 dst 匹配 → REJECT。 */
+const ENV_SCRUB_PROXY_KEYS = new Set<string>([
+  'HTTP_PROXY',
+  'http_proxy',
+  'HTTPS_PROXY',
+  'https_proxy',
+  'ALL_PROXY',
+  'all_proxy',
+])
+
+/** codex 子进程强制 NO_PROXY:loopback + v5 网关。正向声明直连,不能只靠
+ *  scrub —— 即便某代理键漏网/被下游重设,loopback relay(数据面)与网关仍直连,
+ *  绝不被代理劫走。172.31.0.1 = v5 桥网关(与本封堵方案同为 v5-image 作用域)。 */
+const CODEX_FORCED_NO_PROXY = '127.0.0.1,localhost,172.31.0.1'
+
 /**
  * Build the env passed to a codex subprocess. Shared scrubbing rules for any
  * codex CLI spawn shape (`codex app-server` today) — codex's own CLI must not
- * see OpenClaude/Anthropic credentials.
+ * see OpenClaude/Anthropic credentials, nor inherit the container-wide egress
+ * proxy(遥测直连必须走直连,才能被 host 网络层 A 按 dst 匹配封堵)。
  */
 export function buildCodexEnv(): NodeJS.ProcessEnv {
   const out: NodeJS.ProcessEnv = {}
   for (const [k, v] of Object.entries(process.env)) {
     if (v === undefined) continue
     if (ENV_SCRUB_KEYS.has(k)) continue
+    if (ENV_SCRUB_PROXY_KEYS.has(k)) continue
     if (ENV_SCRUB_PREFIXES.some((p) => k.startsWith(p))) continue
     out[k] = v
   }
+  // nit1:正向覆盖 NO_PROXY(大小写两变体,reqwest/undici 各认不同大小写)。
+  out.NO_PROXY = CODEX_FORCED_NO_PROXY
+  out.no_proxy = CODEX_FORCED_NO_PROXY
   return out
 }
