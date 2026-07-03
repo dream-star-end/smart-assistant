@@ -101,7 +101,7 @@ const AGENT_OPEN_202 = {
 }
 
 /**
- * 按 URL 路由的 fetch mock。默认：login OK、模型 OK、agent 状态 ready。
+ * 按 URL 路由的 fetch mock。默认：login OK、线路 OK、agent 状态 ready。
  * overrides 可注入 unsubscribed 状态 / open 应答 / 让 open 后状态翻转为 ready。
  */
 function routedFetch(over?: {
@@ -290,10 +290,10 @@ describe('Aurora v5 skeleton — theme', () => {
 })
 
 // ---------------------------------------------------------------------------
-// P3 对话前置：模型选择器（GET /api/public/models 驱动）+ Agent 订阅/容器就绪门
+// P3 对话前置：线路选择器（GET /api/public/models 驱动）+ Agent 订阅/容器就绪门
 // （GET /api/agent/status、POST /api/agent/open 202/402）。WS 对话本体是 P4。
 // ---------------------------------------------------------------------------
-describe('Aurora v5 — P3 对话前置（模型选择器 + 订阅/容器门）', () => {
+describe('Aurora v5 — P3 对话前置（线路选择器 + 订阅/容器门）', () => {
   test('model selector reflects GET /api/public/models (no hardcoded list)', async () => {
     fetchMock = routedFetch() // ready + MODELS（首项 Claude Opus 4.7）
     vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
@@ -301,13 +301,13 @@ describe('Aurora v5 — P3 对话前置（模型选择器 + 订阅/容器门）'
     render(<App />)
     await loginViaUi()
 
-    // 顶栏模型选择器与 Composer 底部均展示后端返回的首个模型名。
+    // 顶栏线路选择器与 Composer 底部均展示后端返回的首个线路名。
     await waitFor(() => expect(screen.getAllByText('Claude Opus 4.7').length).toBeGreaterThan(0))
     const modelsCall = fetchMock.mock.calls.find(([u]) => String(u).includes('/api/public/models'))
     expect(modelsCall).toBeTruthy()
   })
 
-  test('unsubscribed → 开通智能体 calls /api/agent/open then provisions to ready', async () => {
+  test('unsubscribed → 开通工作区 calls /api/agent/open then provisions to ready', async () => {
     // 初次 status=未订阅；open 之后 status 翻转为 running。
     fetchMock = routedFetch({ status: AGENT_UNSUB, statusAfterOpen: AGENT_READY })
     vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
@@ -316,7 +316,7 @@ describe('Aurora v5 — P3 对话前置（模型选择器 + 订阅/容器门）'
     await loginViaUi()
 
     // 未订阅 → 引导面板 + 开通 CTA（Composer 仍禁用）。
-    const openBtn = await screen.findByRole('button', { name: /开通智能体/ })
+    const openBtn = await screen.findByRole('button', { name: /开通工作区/ })
     expect(screen.getByPlaceholderText('和「全能助手」对话…')).toBeDisabled()
 
     await act(async () => {
@@ -348,7 +348,7 @@ describe('Aurora v5 — P3 对话前置（模型选择器 + 订阅/容器门）'
     render(<App />)
     await loginViaUi()
 
-    const openBtn = await screen.findByRole('button', { name: /开通智能体/ })
+    const openBtn = await screen.findByRole('button', { name: /开通工作区/ })
     await act(async () => {
       fireEvent.click(openBtn)
     })

@@ -347,7 +347,7 @@ export class ChatSocket {
     };
     this.boundFocus = () => this.notifyTabVisible();
     this.boundBillingPaid = () => this.retryConnectNow("充值成功，正在重新连接…");
-    this.boundModelFixed = () => this.retryConnectNow("模型已切换，正在重新连接…");
+    this.boundModelFixed = () => this.retryConnectNow("线路已切换，正在重新连接…");
     window.addEventListener("online", this.boundOnline);
     window.addEventListener("offline", this.boundOffline);
     document.addEventListener("visibilitychange", this.boundVisible);
@@ -1506,7 +1506,7 @@ export class ChatSocket {
 
   // ═══════════════ 服务重启中断 → 自动续写(§7 变体)═══════════════
   //
-  // 容器的模型调用经 master 内部代理,master 部署重启会掐断生成中的上游流,容器
+  // 容器的线路调用经 master 内部代理,master 部署重启会掐断生成中的上游流,容器
   // 合成 meta.interrupted='service_restart' 的 isFinal。此处自动续写被截断的回复:
   //  - 仅当被打断的助手消息**已有内容**(partial 非空)且 10 分钟内 —— 空 turn 走
   //    原「请重新发送」提示,老会话的迟到中断帧不触发;

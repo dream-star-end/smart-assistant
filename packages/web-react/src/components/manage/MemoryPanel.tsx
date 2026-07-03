@@ -12,8 +12,8 @@ type Entry = { id: number; text: string };
 // 顺序有意:先共享的用户画像,后 per-agent 的核心记忆(与后端语义一致:
 // user → 用户级共享文件,memory → per-agent 文件,见 storage/memoryStore.ts)。
 const DOCS: { key: Target; label: string; hint: string; shared?: boolean }[] = [
-  { key: "user", label: "用户画像", hint: "关于你的背景信息 · 所有智能体共享", shared: true },
-  { key: "memory", label: "核心记忆", hint: "该智能体自己的观察与经验 · 按智能体独立保存" },
+  { key: "user", label: "用户画像", hint: "关于你的背景信息 · 所有角色共享", shared: true },
+  { key: "memory", label: "核心记忆", hint: "该角色自己的观察与经验 · 按角色独立保存" },
 ];
 
 function splitEntries(text: string): string[] {
@@ -28,11 +28,11 @@ function joinEntries(texts: string[]): string {
 }
 
 /**
- * 记忆中心：用户画像（user,**用户级共享** —— 换哪个智能体都认识你）+ 核心记忆
- *（memory,**按智能体独立** —— 各智能体自己的观察互不串扰）。每个文档是 "\n§\n"
+ * 记忆中心：用户画像（user,**用户级共享** —— 换哪个角色都认识你）+ 核心记忆
+ *（memory,**按角色独立** —— 各角色自己的观察互不串扰）。每个文档是 "\n§\n"
  * 分隔的多条目,逐条卡片化编辑,保存时重新拼接为整段经容器代理写回
- *（GET/PUT /api/agents/:id/memory/:target）。智能体切换器只作用于核心记忆
- *（画像是共享文件,与所选智能体无关,不给切换器造成"画像也分身"的误导）。
+ *（GET/PUT /api/agents/:id/memory/:target）。角色切换器只作用于核心记忆
+ *（画像是共享文件,与所选角色无关,不给切换器造成"画像也分身"的误导）。
  */
 export function MemoryPanel({
   auth,
@@ -50,7 +50,7 @@ export function MemoryPanel({
   const showPicker = agents.length > 1;
   return (
     <div className="flex flex-col">
-      <PanelHeader title="记忆" hint="这些内容会注入智能体的长期上下文，让它越用越懂你。" />
+      <PanelHeader title="记忆" hint="这些内容会注入角色的长期上下文，让它越用越懂你。" />
       {DOCS.map((d) => (
         <div key={d.key} className="border-t border-border">
           <MemoryDoc
@@ -62,7 +62,7 @@ export function MemoryPanel({
             picker={
               !d.shared && showPicker ? (
                 <label className="flex items-center gap-1.5 text-[12px] text-faint">
-                  智能体
+                  角色
                   <select
                     value={effective}
                     onChange={(e) => setSelected(e.target.value)}
@@ -95,7 +95,7 @@ function MemoryDoc({
   agentId: string;
   target: Target;
   meta: { label: string; hint: string };
-  /** 核心记忆分区的智能体切换器(共享的用户画像不传)。 */
+  /** 核心记忆分区的角色切换器(共享的用户画像不传)。 */
   picker?: React.ReactNode;
 }) {
   const [entries, setEntries] = useState<Entry[]>([]);

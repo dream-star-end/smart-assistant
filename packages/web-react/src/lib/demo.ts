@@ -3,9 +3,9 @@ import type { Message, PublicModel, Session, User } from "./types";
 export const DEMO_USER: User = { id: "demo", displayName: "rqmn", roles: ["user"] };
 
 /**
- * 离线预览用的模型列表（?demo=1）。真实工作区一律由 GET /api/public/models 驱动
- * （glm-5.2/deepseek/minimax；Claude 官方模型已全面下线，不再暴露）；这里只是为了
- * 让 demo 模式在零网络下也能展示模型选择器的视觉，刻意与后端权威源解耦、不参与任何请求。
+ * 离线预览用的线路列表（?demo=1）。真实工作区一律由 GET /api/public/models 驱动
+ * （glm-5.2/deepseek/minimax；Claude 官方线路已全面下线，不再暴露）；这里只是为了
+ * 让 demo 模式在零网络下也能展示线路选择器的视觉，刻意与后端权威源解耦、不参与任何请求。
  */
 export const DEMO_MODELS: PublicModel[] = [
   { id: "glm-5.2", display_name: "GLM-5.2" },
@@ -20,7 +20,7 @@ export const DEMO_SESSIONS: Session[] = [
   { id: "s1", title: "把商业版重做成 ChatGPT 风格", ownerUserId: "demo", updatedAt: iso(3), messageCount: 4 },
   { id: "s2", title: "锂金属负极枝晶抑制机理综述", ownerUserId: "demo", updatedAt: iso(40), messageCount: 8 },
   { id: "s3", title: "A 股多 agent 投研平台方案", ownerUserId: "demo", updatedAt: iso(120), messageCount: 12 },
-  { id: "s4", title: "杭州四季青 AI 智能体需求评估", ownerUserId: "demo", updatedAt: iso(1500), messageCount: 6 },
+  { id: "s4", title: "杭州四季青角色需求评估", ownerUserId: "demo", updatedAt: iso(1500), messageCount: 6 },
   { id: "s5", title: "南山 baseline transfer 计划评阅", ownerUserId: "demo", updatedAt: iso(1600), messageCount: 9 },
   { id: "s6", title: "部署链路巡检与上线清单", ownerUserId: "demo", updatedAt: iso(4000), messageCount: 5 },
 ];
@@ -66,7 +66,7 @@ export function demoReply(text: string): string {
 2. **给出方案** —— 兼顾可维护性、扩展性与一致性
 3. **落地验证** —— 用最小可验证的步骤先跑通
 
-> 这是演示模式下的本地回复。连接真实后端后，将由 **MiniMax-M3** 等模型实时流式生成。
+> 这是演示模式下的本地回复。连接真实后端后，将由线上服务实时流式生成。
 
 需要我针对某一步展开吗？`;
 }

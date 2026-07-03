@@ -39,7 +39,7 @@ const NOTIF_FIELDS: { key: keyof PrefsView; label: string; hint?: string }[] = [
 const MAX_HOTKEYS = 32;
 
 /**
- * 偏好 Tab：外观主题（接 useTheme，写穿到 preferences）+ 默认模型 + 思考深度 +
+ * 偏好 Tab：外观主题（接 useTheme，写穿到 preferences）+ 默认线路 + 思考深度 +
  * 通知开关 + 快捷键，最后嵌 API Key 自管。prefs 状态由 SettingsCenter 集中持有，
  * 本组件受控（onPatch 返回后由父刷新快照）。
  *
@@ -72,7 +72,7 @@ export function PreferencesTab({
         if (alive) setModels(m);
       })
       .catch(() => {
-        /* 模型列表拉取失败不致命：default_model 退化为只读展示当前值 */
+        /* 线路列表拉取失败不致命：default_model 退化为只读展示当前值 */
       });
     return () => {
       alive = false;
@@ -128,18 +128,18 @@ export function PreferencesTab({
         </div>
       </div>
 
-      {/* 默认模型 + 思考深度 */}
+      {/* 默认线路 + 思考深度 */}
       <div className="border-t border-border px-5 py-4">
         <div className="pb-2 text-[11px] font-medium uppercase tracking-wide text-faint">
           对话默认
         </div>
         <label className="flex items-center justify-between gap-3 py-1.5">
-          <span className="text-[13.5px] text-fg">默认模型</span>
+          <span className="text-[13.5px] text-fg">默认线路</span>
           <Select
             value={prefs.default_model ?? ""}
             onChange={(v) => patch({ default_model: v === "" ? null : v })}
           >
-            <option value="">跟随智能体默认</option>
+            <option value="">跟随角色默认</option>
             {/* 当前值不在可选列表里时（如已下架）仍补一条，避免显示错位 */}
             {prefs.default_model && !models.some((m) => m.id === prefs.default_model) && (
               <option value={prefs.default_model}>{prefs.default_model}</option>

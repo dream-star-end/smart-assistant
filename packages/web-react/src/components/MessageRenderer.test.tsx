@@ -199,7 +199,7 @@ describe("MessageList coalesceTeam 聚合(零回归关键路径)", () => {
 
   test("连续 ≥2 条 agent-group → 聚成团队面板", () => {
     renderList([g("g1", "任务A"), g("g2", "任务B")]);
-    expect(screen.getByText("团队协作 · 2 个智能体")).toBeInTheDocument();
+    expect(screen.getByText("团队协作 · 2 个角色")).toBeInTheDocument();
   });
 
   test("单条 agent-group → 退化回 AgentGroupCard,不出团队面板", () => {
@@ -217,6 +217,6 @@ describe("MessageList coalesceTeam 聚合(零回归关键路径)", () => {
 
   test("三条连续 → 团队面板计数为 3", () => {
     renderList([g("g1", "A"), g("g2", "B"), g("g3", "C")]);
-    expect(screen.getByText("团队协作 · 3 个智能体")).toBeInTheDocument();
+    expect(screen.getByText("团队协作 · 3 个角色")).toBeInTheDocument();
   });
 });

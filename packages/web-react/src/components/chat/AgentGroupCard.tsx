@@ -86,7 +86,7 @@ export function AgentGroupCard({ msg }: { msg: ChatMessage }) {
         <div className="space-y-2 border-t border-border px-3.5 py-2.5">
           {children.length === 0 && running && (
             <div className="flex items-center gap-2 text-[12.5px] text-faint">
-              <Spinner size={12} /> 子智能体启动中…
+              <Spinner size={12} /> 子角色启动中…
             </div>
           )}
           {children.map((ch, i) => (

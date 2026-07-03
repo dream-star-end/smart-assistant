@@ -34,7 +34,7 @@ export function Sidebar({
   onOpenAccount?: () => void;
   /** 打开管理中心（记忆/定时任务/技能）。省略则不渲染入口（demo）。 */
   onOpenManage?: () => void;
-  /** 打开 AI 市场（技能/智能体）。省略则不渲染入口（demo）。 */
+  /** 打开 能力市场（技能/角色）。省略则不渲染入口（demo）。 */
   onOpenMarketplace?: () => void;
 }) {
   const [q, setQ] = useState("");
@@ -103,7 +103,7 @@ export function Sidebar({
           >
             <Store size={16} className="text-faint" />
             市场
-            <span className="ml-auto text-[11px] text-faint">技能 · 智能体</span>
+            <span className="ml-auto text-[11px] text-faint">技能 · 角色</span>
           </button>
         )}
       </div>
@@ -184,7 +184,7 @@ export function Sidebar({
               {user?.displayName || "未登录"}
             </span>
             <span className="block truncate text-[11.5px] text-faint">
-              {credits != null ? `余额 ${formatCredits(credits)} 积分` : "多模型 · 计量计费"}
+              {credits != null ? `余额 ${formatCredits(credits)} 积分` : "多线路 · 计量计费"}
             </span>
           </span>
         </button>

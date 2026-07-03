@@ -305,8 +305,8 @@ export function AssistantCard({
             <div className="flex flex-1 flex-wrap items-center justify-between gap-2">
               <span>
                 {msg._truncated === "pause_turn"
-                  ? "模型暂停了本轮（通常因长任务超时），可让它继续。"
-                  : "回复达到长度上限被截断，可让模型继续写。"}
+                  ? "本轮已暂停（通常因长任务超时），可让它继续。"
+                  : "回复达到长度上限被截断，可继续写。"}
               </span>
               {cb.onContinue && (
                 <Button size="sm" variant="secondary" shape="pill" onClick={cb.onContinue}>
@@ -321,8 +321,8 @@ export function AssistantCard({
         {msg._emptyTurn && (
           <Alert tone="info" className="mt-2.5" icon={<Info size={16} />}>
             {msg._emptyTurnTimeout
-              ? "本轮模型无响应（超时），可重试。"
-              : "模型本轮没有产生新内容。"}
+              ? "本轮无响应（超时），可重试。"
+              : "本轮没有产生新内容。"}
           </Alert>
         )}
 

@@ -13,7 +13,7 @@ export type MarketplaceTab = 'browse' | 'installed' | 'publish' | 'review'
 export type MarketplaceKind = 'skill' | 'agent'
 
 /**
- * AI 市场：发现 / 已安装 / 发布 /（管理员）审核。
+ * 能力市场：发现 / 已安装 / 发布 /（管理员）审核。
  * 复用 ManageCenter 的 Dialog + Tabs 结构。后端 marketplace 路由不在 bridge
  * allowlist、强制浏览器 JWT —— 容器/agent 无法绕过自装自发。demo/未登录不渲染。
  */
@@ -31,7 +31,7 @@ export function MarketplaceCenter({
   tab: MarketplaceTab
   auth: AuthSession | null
   isAdmin: boolean
-  /** Which category the 发现 tab opens to (e.g. 'agent' when opened via「从市场添加智能体」). */
+  /** Which category the 发现 tab opens to (e.g. 'agent' when opened via「从市场添加角色」). */
   initialBrowseKind?: MarketplaceKind
   /** 「在对话中创建」:关闭市场 → 新会话 → 输入框预填引导模板。 */
   onCreateInChat?: (kind: MarketplaceKind) => void
@@ -48,7 +48,7 @@ export function MarketplaceCenter({
   const safeTab: MarketplaceTab = tab === 'review' && !isAdmin ? 'browse' : tab
 
   const [browseKind, setBrowseKind] = useState<MarketplaceKind>(initialBrowseKind)
-  // when (re)opened, honor the requested category (e.g. opened to 智能体)
+  // when (re)opened, honor the requested category (e.g. opened to 角色)
   useEffect(() => {
     if (open) setBrowseKind(initialBrowseKind)
   }, [open, initialBrowseKind])
@@ -63,9 +63,9 @@ export function MarketplaceCenter({
         >
           <div className="flex items-center justify-between px-5 py-4">
             <div>
-              <Dialog.Title className="text-[15px] font-semibold text-fg">AI 市场</Dialog.Title>
+              <Dialog.Title className="text-[15px] font-semibold text-fg">能力市场</Dialog.Title>
               <p className="mt-0.5 text-[12px] text-faint">
-                发现并安装技能与智能体，也可以把自己的作品分享给大家。
+                发现并安装技能与角色，也可以把自己的作品分享给大家。
               </p>
             </div>
             <Dialog.Close asChild>
@@ -108,7 +108,7 @@ export function MarketplaceCenter({
                               : 'text-muted hover:bg-hover hover:text-fg',
                           )}
                         >
-                          {k === 'skill' ? '技能' : '智能体'}
+                          {k === 'skill' ? '技能' : '角色'}
                         </button>
                       ))}
                     </div>

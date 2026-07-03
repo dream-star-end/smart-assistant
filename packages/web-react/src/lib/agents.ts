@@ -37,7 +37,7 @@ export type Agent = {
  * 【Landing 专用展示数据,非运行时权威源 —— 不是双入口】
  *
  * 这些"预设人设"(代码专家/学术研究/商业分析…)**只**被 Landing.tsx 用作首页
- * 「AI 市场 · 专业智能体(示例,陆续上新)」的营销示意卡:点击一律走 onStart 进入产品,
+ * 「能力市场 · 专业角色(示例,陆续上新)」的营销示意卡:点击一律走 onStart 进入产品,
  * 不会作为可选 agent 进入运行时。运行时 agent 列表的唯一权威源是后端
  * /api/marketplace/my-agents(平台预设助手由 seedPlatformAgents / platformPresets 下发:
  * 编程助手、办公助手、科研助手 research-assistant);AgentPicker / App 完全数据驱动,
@@ -50,11 +50,11 @@ export type Agent = {
 export const AGENTS: Agent[] = [
   {
     id: 'general',
-    name: '全能助手',
+    name: '全能工作台',
     icon: Sparkles,
     grad: 'from-emerald-500 to-teal-600',
     tagline: '日常问答 · 有问必答',
-    description: '通晓百科的贴心助理，写邮件、做规划、查资料、出主意，样样在行。',
+    description: '写邮件、做规划、查资料、出主意，日常工作一站完成。',
     category: '通用',
     starters: [
       '帮我规划一次 5 天的云南旅行',
@@ -62,7 +62,7 @@ export const AGENTS: Agent[] = [
       '用通俗的话解释什么是量子纠缠',
     ],
     system:
-      '你是「全能助手」，一位博学、耐心、可靠的中文 AI 助理。回答要条理清晰、重点突出，必要时用列表与小标题。语气友好专业。',
+      '你是「全能助手」，一位博学、耐心、可靠的中文助理。回答要条理清晰、重点突出，必要时用列表与小标题。语气友好专业。',
   },
   {
     id: 'coder',
@@ -201,7 +201,7 @@ export const MAIN_AGENT: Agent = {
   name: '全能助手',
   icon: Sparkles,
   grad: 'from-emerald-500 to-teal-600',
-  description: '通用全能智能体，内置工具齐全，可随时从市场加装技能与更多智能体。',
+  description: '通用全能工作台，内置工具齐全，可随时从市场加装技能与更多角色。',
   isDefault: true,
   installed: true,
 }
@@ -237,6 +237,6 @@ export function agentFromApiRow(row: {
   }
 }
 
-// 注意：模型与人设(agent→model / persona)的唯一权威源在 v5 后端
+// 注意：线路与人设(agent→model / persona)的唯一权威源在 v5 后端
 // (packages/commercial，internalServerAuthored 等)。前端只发送 agentId、只做展示，
-// 刻意不在此持有模型映射；上面的 `system` 字段仅为占位，不参与真实请求，避免两套权威源漂移。
+// 刻意不在此持有线路映射；上面的 `system` 字段仅为占位，不参与真实请求，避免两套权威源漂移。

@@ -51,7 +51,7 @@ function DoneScreen({ onAgain }: { onAgain: () => void }) {
 }
 
 /**
- * 发布：技能(从「我的技能」导入或手填)/ 智能体(模型+能力+人设+依赖技能)双表单,
+ * 发布：技能(从「我的技能」导入或手填)/ 角色(线路+能力+人设+依赖技能)双表单,
  * 提交进入平台审核队列(pending)。顶部「我的发布」闭合反馈环。被静态扫描/manifest
  * 校验拦截时把命中翻译成可操作的中文修正提示。
  */
@@ -60,7 +60,7 @@ export function PublishPanel({
   onCreateInChat,
 }: {
   auth: AuthSession;
-  /** 「在对话中创建」:AI 引导式创建(小白路径),表单是手动模式。 */
+  /** 「在对话中创建」:引导式创建(小白路径),表单是手动模式。 */
   onCreateInChat?: (kind: "skill" | "agent") => void;
 }) {
   const [kind, setKind] = useState<"skill" | "agent">("skill");
@@ -82,7 +82,7 @@ export function PublishPanel({
               kind === k ? "bg-accent-soft text-accent" : "text-muted hover:bg-hover hover:text-fg",
             )}
           >
-            {k === "skill" ? "发布技能" : "发布智能体"}
+            {k === "skill" ? "发布技能" : "发布角色"}
           </button>
         ))}
       </div>
@@ -98,10 +98,10 @@ export function PublishPanel({
           </span>
           <span className="min-w-0 flex-1">
             <span className="block text-[13.5px] font-semibold text-fg">
-              在对话中创建{kind === "skill" ? "技能" : "智能体"}(推荐)
+              在对话中创建{kind === "skill" ? "技能" : "角色"}(推荐)
             </span>
             <span className="mt-0.5 block text-[12px] leading-snug text-muted">
-              回答几个选择题,AI 帮你完成起草、创建{kind === "skill" ? "、评测用例" : "和发布"}
+              回答几个选择题,系统帮你完成起草、创建{kind === "skill" ? "、评测用例" : "和发布"}
               —— 无需了解格式规范。
             </span>
           </span>
@@ -449,7 +449,7 @@ function SkillPublishForm({ auth, onPublished }: { auth: AuthSession; onPublishe
   );
 }
 
-// ── 智能体发布 ──────────────────────────────────────────────────────────────
+// ── 角色发布 ──────────────────────────────────────────────────────────────
 
 function AgentPublishForm({ auth, onPublished }: { auth: AuthSession; onPublished: () => void }) {
   const [models, setModels] = useState<PublicModel[]>([]);
@@ -504,13 +504,13 @@ function AgentPublishForm({ auth, onPublished }: { auth: AuthSession; onPublishe
     setToolsets((ts) => (ts.includes(v) ? ts.filter((x) => x !== v) : [...ts, v]));
 
   const validate = (): string | null => {
-    if (!name.trim()) return "请填写智能体名称";
+    if (!name.trim()) return "请填写角色名称";
     if (!SLUG_RE.test(slug)) return "标识(slug)须为小写字母/数字/连字符，2–64 位";
     if (!VERSION_RE.test(version)) return "版本号须为 N.N.N，例如 1.0.0";
     if (!description.trim()) return "请填写一句话描述";
-    if (!model) return "请选择模型";
+    if (!model) return "请选择线路";
     if (toolsets.length === 0) return "请至少选择一个能力工具集";
-    if (!persona.trim()) return "请填写人设(它决定智能体的行为方式)";
+    if (!persona.trim()) return "请填写人设(它决定角色的行为方式)";
     return null;
   };
 
@@ -547,7 +547,7 @@ function AgentPublishForm({ auth, onPublished }: { auth: AuthSession; onPublishe
         const b = e.body as { errors?: string[]; riskFlags?: MarketplaceRiskFlag[] };
         if (b?.errors?.length) {
           setManifestErrors(b.errors);
-          setErr("智能体配置不合法，请按下面的提示修正。");
+          setErr("角色配置不合法，请按下面的提示修正。");
         } else if (b?.riskFlags?.length) {
           setFlags(b.riskFlags);
           setErr("人设被安全扫描拦截，请修正后重试。");
@@ -584,8 +584,8 @@ function AgentPublishForm({ auth, onPublished }: { auth: AuthSession; onPublishe
   return (
     <div className="flex flex-col gap-4">
       <Alert tone="info">
-        智能体 = 模型 + 能力工具集 + 人设(+ 可选依赖技能)。发布后经平台审核上架，其他用户
-        安装即可在智能体选择器中使用。
+        角色 = 线路 + 能力工具集 + 人设(+ 可选依赖技能)。发布后经平台审核上架，其他用户
+        安装即可在角色选择器中使用。
       </Alert>
 
       {err && <Alert tone="danger">{err}</Alert>}
@@ -641,7 +641,7 @@ function AgentPublishForm({ auth, onPublished }: { auth: AuthSession; onPublishe
             placeholder="🤖"
           />
         </Field>
-        <Field label="模型">
+        <Field label="线路">
           <select
             value={model}
             onChange={(e) => setModel(e.target.value)}
@@ -699,12 +699,12 @@ function AgentPublishForm({ auth, onPublished }: { auth: AuthSession; onPublishe
       <div>
         <div className="mb-1 text-[12px] font-medium text-muted">依赖技能（可选）</div>
         <p className="mb-1.5 text-[11.5px] leading-snug text-faint">
-          只能选「已上架市场」的技能:别人安装本智能体时,这些依赖会一并自动安装,所以必须是能公开安装的市场技能。
+          只能选「已上架市场」的技能:别人安装本角色时,这些依赖会一并自动安装,所以必须是能公开安装的市场技能。
           你自建的私有技能不会出现在这里 —— 需先在上方「发布技能」把它上架、审核通过后才能作为依赖。
         </p>
         {installedSkills.length === 0 ? (
           <p className="text-[12px] text-faint">
-            你还没有可作依赖的市场技能 —— 先在「发现」里安装,或把自建技能通过「发布技能」上架;也可以不选(智能体可不带依赖技能)。
+            你还没有可作依赖的市场技能 —— 先在「发现」里安装,或把自建技能通过「发布技能」上架;也可以不选(角色可不带依赖技能)。
           </p>
         ) : (
           <div className="flex flex-wrap gap-1.5">
@@ -736,7 +736,7 @@ function AgentPublishForm({ auth, onPublished }: { auth: AuthSession; onPublishe
         )}
       </div>
 
-      <Field label="人设（persona，决定智能体的行为方式与工作流）">
+      <Field label="人设（persona，决定角色的行为方式与工作流）">
         <Textarea
           value={persona}
           onChange={(e) => setPersona(e.target.value)}
@@ -815,7 +815,7 @@ function MyPublishes({ auth, reload }: { auth: AuthSession; reload: number }) {
                 <div className="flex flex-wrap items-center gap-1.5">
                   <span className="text-[13px] font-medium text-fg">{r.name}</span>
                   <Badge tone="neutral">v{r.version}</Badge>
-                  {r.kind === "agent" && <Badge tone="accent">智能体</Badge>}
+                  {r.kind === "agent" && <Badge tone="accent">角色</Badge>}
                   <Badge tone={meta.tone}>{meta.label}</Badge>
                   {revoked && <Badge tone="warning">已被下架</Badge>}
                   {r.status === "approved" && !r.isCurrent && !revoked && (

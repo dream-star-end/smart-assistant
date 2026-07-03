@@ -41,7 +41,7 @@ export function AgentGate({
   onTopUp,
 }: {
   phase: AgentGatePhase;
-  /** 开通智能体（POST /api/agent/open）。 */
+  /** 开通工作区（POST /api/agent/open）。 */
   onOpen: () => void;
   /** 重新查询状态（runtime-unavailable / error 重试）。 */
   onRetry: () => void;
@@ -53,7 +53,7 @@ export function AgentGate({
       return (
         <Panel
           icon={<Spinner size={26} className="text-accent" />}
-          title="正在检查智能体状态"
+          title="正在检查工作区状态"
           desc="确认你的订阅与专属容器状态，稍候片刻…"
         />
       );
@@ -62,11 +62,11 @@ export function AgentGate({
       return (
         <Panel
           icon={<Sparkles size={30} className="text-accent" />}
-          title="开通你的专属智能体"
-          desc="开通后将为你启动一个独立、隔离的运行环境，即可使用全部模型与工具，按用量计费。"
+          title="开通你的专属工作区"
+          desc="开通后将为你启动一个独立、隔离的运行环境，即可使用全部工具，按用量计费。"
         >
           <Button variant="accent" size="lg" shape="pill" onClick={onOpen}>
-            <Sparkles size={16} /> 开通智能体
+            <Sparkles size={16} /> 开通工作区
           </Button>
         </Panel>
       );
@@ -97,8 +97,8 @@ export function AgentGate({
           title="余额不足"
           desc={
             phase.shortfall
-              ? `开通智能体所需积分不足，还差 ${phase.shortfall} 积分。充值后即可开通。`
-              : "开通智能体所需积分不足，充值后即可开通。"
+              ? `开通工作区所需积分不足，还差 ${phase.shortfall} 积分。充值后即可开通。`
+              : "开通工作区所需积分不足，充值后即可开通。"
           }
         >
           <Button variant="accent" size="lg" shape="pill" onClick={onTopUp}>
@@ -114,8 +114,8 @@ export function AgentGate({
       return (
         <Panel
           icon={<AlertTriangle size={28} className="text-warning" />}
-          title="智能体服务暂未就绪"
-          desc="系统的智能体运行时正在准备中，请稍后再试。"
+          title="工作区服务暂未就绪"
+          desc="系统运行环境正在准备中，请稍后再试。"
         >
           <Button variant="secondary" size="md" shape="pill" onClick={onRetry}>
             <RotateCcw size={15} /> 重试

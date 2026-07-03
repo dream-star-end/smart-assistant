@@ -258,7 +258,7 @@ describe("其余 oc-* 卡片", () => {
     render(<div>{researchToolCard("oc-market search 科研", tool({ output: out }))}</div>);
     expect(screen.getByText("技能市场")).toBeInTheDocument();
     expect(screen.getByText("科研助手")).toBeInTheDocument();
-    expect(screen.getByText("智能体")).toBeInTheDocument();
+    expect(screen.getByText("角色")).toBeInTheDocument();
   });
 
   test("oc-market install(非 list 输出)→ null 回落", () => {

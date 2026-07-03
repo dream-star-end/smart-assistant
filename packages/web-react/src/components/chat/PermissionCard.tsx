@@ -198,7 +198,7 @@ function GenericPermissionModal({
       open={open}
       onOpenChange={onOpenChange}
       title="工具权限请求"
-      description="智能体请求执行以下工具，请确认是否允许。"
+      description="角色请求执行以下工具，请确认是否允许。"
       footer={
         <>
           <Button

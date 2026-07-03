@@ -90,7 +90,7 @@ export function CronPanel({ auth }: { auth: AuthSession }) {
       {confirmDialogEl}
       <PanelHeader
         title="定时任务"
-        hint="让智能体到点主动干活，并把结果按你选的方式推送。"
+        hint="让角色到点主动干活，并把结果按你选的方式推送。"
         action={
           <Button
             variant="secondary"
@@ -375,7 +375,7 @@ function CronForm({
         <textarea
           value={prompt}
           onChange={(e) => setPrompt(e.target.value)}
-          placeholder="到点要智能体做什么，例如：汇总本周进展并推送给我"
+          placeholder="到点要角色做什么，例如：汇总本周进展并推送给我"
           className={cn(inputCls, "min-h-[60px] resize-y")}
         />
       </Field>

@@ -196,7 +196,7 @@ export function defaultCollapsed(
   return false;
 }
 
-/** 截断续写的中性提示词（不绑定话题，避免触发模型重做总结）。现网同款。 */
+/** 截断续写的中性复杂说明（不绑定话题，避免触发线路重做总结）。现网同款。 */
 export const CONTINUE_PROMPT =
   "请接着上一条回复被截断的位置继续完成，不要重复已写过的内容，直接续写。";
 
@@ -205,13 +205,13 @@ const ERROR_LABELS: Record<string, string> = {
   insufficient_credits: "积分余额不足",
   rate_limited: "请求过于频繁，请稍后再试",
   context_too_long: "上下文超长，请精简或开新会话",
-  upstream_error: "模型服务暂时不可用",
-  upstream_timeout: "模型响应超时",
+  upstream_error: "服务暂时不可用",
+  upstream_timeout: "响应超时",
   network_error: "网络异常，请重试",
   service_restart: "服务重启，本轮已中断",
   conn_kicked: "连接已断开",
   maintenance: "服务维护中",
-  unauthorized_model: "模型未开通",
+  unauthorized_model: "线路未开通",
   unauthorized: "登录已失效",
   stopped: "已停止本轮生成",
   internal_error: "服务内部错误",

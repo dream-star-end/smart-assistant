@@ -75,7 +75,7 @@ const OC_CLI_META: Record<string, ToolMeta> = {
   "oc-litrag": { icon: Brain, label: "文献问答", tone: "accent" },
   "oc-report": { icon: NotebookPen, label: "研究报告", tone: "accent" },
   "oc-rank": { icon: BarChart3, label: "排序打分", tone: "info" },
-  "oc-market": { icon: Sparkles, label: "AI 市场", tone: "accent" },
+  "oc-market": { icon: Sparkles, label: "能力市场", tone: "accent" },
   "oc-xlsx": { icon: BarChart3, label: "表格生成", tone: "success" },
   "oc-pdf": { icon: FileText, label: "PDF 生成", tone: "success" },
   "oc-docx": { icon: FileText, label: "Word 生成", tone: "success" },

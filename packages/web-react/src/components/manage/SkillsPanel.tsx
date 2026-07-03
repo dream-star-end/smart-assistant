@@ -21,7 +21,7 @@ export function SkillsPanel({ auth }: { auth: AuthSession }) {
   const [rates, setRates] = useState<ModelRates | null>(null);
   const [confirmDialog, confirmDialogEl] = useConfirm();
 
-  // 训练/评测锁定模型的公开费率(成本估算与实报的数据源;拿不到就不给估算数字)。
+  // 训练/评测锁定线路的公开费率(成本估算与实报的数据源;拿不到就不给估算数字)。
   useEffect(() => {
     let alive = true;
     api
@@ -83,7 +83,7 @@ export function SkillsPanel({ auth }: { auth: AuthSession }) {
       {confirmDialogEl}
       <PanelHeader
         title={skills && skills.length > 0 ? `技能（${skills.length}）` : "技能"}
-        hint="完成复杂任务后智能体会把流程沉淀成可复用技能；也可从市场安装。"
+        hint="完成复杂任务后角色会把流程沉淀成可复用技能；也可从市场安装。"
       />
       {err && (
         <div className="px-5 pb-2">
@@ -100,7 +100,7 @@ export function SkillsPanel({ auth }: { auth: AuthSession }) {
         <EmptyState
           icon={Sparkles}
           title="还没有技能"
-          hint="在对话里让智能体「把这个流程存成技能」即可自动沉淀，或从市场安装。"
+          hint="在对话里让角色「把这个流程存成技能」即可自动沉淀，或从市场安装。"
         />
       ) : (
         <>

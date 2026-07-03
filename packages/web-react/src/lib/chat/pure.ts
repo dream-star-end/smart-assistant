@@ -263,20 +263,20 @@ export function emptyTurnNoticeText(
 ): string {
   switch (stopReason) {
     case "end_turn":
-      return "模型本轮主动结束(通常表示它判断不需要再回复或上下文已表达完整)。可继续追问。";
+      return "本轮已主动结束(通常表示无需再回复或上下文已表达完整)。可继续追问。";
     case "pause_turn":
-      return "模型暂停了本轮(通常因长任务超时),可直接重新发送让它继续。";
+      return "本轮已暂停(通常因长任务超时),可直接重新发送让它继续。";
     case "max_tokens":
       return '本轮输出达到 token 上限,内容可能不完整。可让它"继续"。';
     case "refusal":
-      return "模型拒绝回复本轮内容。";
+      return "本轮内容无法回复。";
     case "tool_use":
       return "工具调用流意外中断,请重试。";
     case "stop_sequence":
-      return "模型命中停止序列结束本轮。";
+      return "本轮命中停止序列后结束。";
     default:
-      if (stopReason) return `模型本轮无内容输出 (stop_reason=${stopReason})。可重试或继续追问。`;
-      if (priorTurnHadContent) return "模型本轮未输出新内容,可继续追问或重新提问。";
+      if (stopReason) return `本轮无内容输出 (stop_reason=${stopReason})。可重试或继续追问。`;
+      if (priorTurnHadContent) return "本轮未输出新内容,可继续追问或重新提问。";
       return "未收到回复 — 服务端标记已完成,但没有生成任何内容。请重试。";
   }
 }
@@ -324,7 +324,7 @@ export function classifyEmptyTurn(p: {
 
 export const AUTO_CONTINUE_PROMPT = "请基于刚才的思考,继续输出完整的正文回答。";
 export const AUTO_CONTINUE_DISPLAY = "↻ 自动续写";
-/** 服务重启把上游生成流掐断(容器模型调用经 master 内部代理)时的自动续写。 */
+/** 服务重启把上游生成流掐断(容器线路调用经 master 内部代理)时的自动续写。 */
 export const RESTART_CONTINUE_PROMPT =
   "你上一条回复因服务重启被中断。请从中断处继续输出剩余内容,不要重复已经输出的部分,直接接着写。";
 export const RESTART_CONTINUE_DISPLAY = "↻ 服务重启中断,自动续写";
@@ -438,7 +438,7 @@ export function nonAuthPolicyCloseInfo(code: number, reason: unknown): NonAuthPo
     return { status: "余额不足", toast: "余额不足，请充值后继续。", billing: true };
   }
   if (code === 4507 || r === "unauthorized_model") {
-    return { status: "模型未开通", toast: "当前账号尚未开通该模型，请切换模型或联系管理员。" };
+    return { status: "线路未开通", toast: "当前账号尚未开通该线路，请切换线路或联系管理员。" };
   }
   // 4508 codex_container_recycled v5 已删 codex；保留兜底不会出错。
   if (code === 4508 || r === "codex_container_recycled") {
@@ -533,7 +533,7 @@ export function isBridgeAuthControlError(code: unknown): boolean {
 export function friendlyBridgeErrorMessage(code: unknown, message?: string): string {
   const n = normalizeBridgeErrorCode(code);
   if (n === "insufficient_credits") return "余额不足，充值后即可继续使用。";
-  if (n === "unauthorized_model") return "当前账号尚未开通这个模型，请切换模型或联系管理员。";
+  if (n === "unauthorized_model") return "当前账号尚未开通这个线路，请切换线路或联系管理员。";
   if (n === "maintenance") return "服务正在维护中，请稍后再试。";
   if (n === "conn_kicked") return "连接已断开（服务重启或被新会话顶替），刷新页面即可继续。";
   if (n === "codex_turn_busy") return "上一轮任务仍在运行，请等它结束后再发送。";

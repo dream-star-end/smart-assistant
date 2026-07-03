@@ -20,10 +20,10 @@ function Logo() {
   );
 }
 
-/** 差异化对比：普通 AI 聊天给建议，Aurora 把活儿干完。左右两列逐行对照。 */
+/** 差异化对比：普通聊天工具给建议，Aurora 把活儿干完。左右两列逐行对照。 */
 const COMPARE = {
   chat: {
-    title: "普通 AI 聊天",
+    title: "普通聊天工具",
     rows: [
       "给一段文字建议，活儿还得你自己干",
       "大文件贴不进去，更别说跑分析、出图表",
@@ -32,12 +32,12 @@ const COMPARE = {
     ],
   },
   aurora: {
-    title: "Aurora 全能助手",
+    title: "Aurora 工作台",
     rows: [
       "自己拆任务、跑代码、查资料，把整件事干完",
       "直接读 Excel / PDF / 图片，交回图表、PPT 和报告",
       "记住你的身份、偏好与项目，下次自动接上",
-      "AI 市场按需加装专家智能体与技能，越用越强",
+      "能力市场按需加装专家角色与技能，越用越强",
     ],
   },
 };
@@ -49,7 +49,7 @@ const FAQS = [
     a: "注册即享每月 300 积分，够日常轻度使用；积分按实际消耗计费，不够用时可在应用内升级。",
   },
   {
-    q: "需要会写提示词吗？",
+    q: "需要会写复杂说明吗？",
     a: "不用。像跟同事说话一样描述需求就行，它会自己拆解、执行、交付；不知道说什么，照抄上手区的示例第一句即可。",
   },
   {
@@ -57,7 +57,7 @@ const FAQS = [
     a: "文件只存放在你的专属工作空间、仅用于完成你交代的任务，可随时删除。",
   },
   {
-    q: "和普通 AI 聊天有什么区别？",
+    q: "和普通聊天工具有什么区别？",
     a: "普通聊天给你一段建议；它把活儿干完 —— 自己跑代码、查资料、做文件，最后交回能直接用的成果。",
   },
 ];
@@ -83,7 +83,7 @@ export function Landing({
           <Logo />
           <nav className="hidden items-center gap-7 text-[14.5px] text-muted md:flex">
             <a href="#demo" className="transition-colors hover:text-fg">演示</a>
-            <a href="#agents" className="transition-colors hover:text-fg">智能体</a>
+            <a href="#agents" className="transition-colors hover:text-fg">角色</a>
             <a href="#tutorials" className="transition-colors hover:text-fg">快速上手</a>
             <a href="#faq" className="transition-colors hover:text-fg">常见问题</a>
           </nav>
@@ -112,7 +112,7 @@ export function Landing({
         <div className="relative mx-auto max-w-4xl px-5 pb-10 pt-20 text-center md:pt-28">
           <div className="mb-6 inline-flex items-center gap-2 rounded-full border border-border bg-surface px-3.5 py-1.5 text-[13px] text-muted shadow-sm animate-in">
             <span className="size-1.5 rounded-full bg-accent" />
-            {BRAND.company} · 会干活的 AI 助手
+            {BRAND.company} · 会干活的工作台
           </div>
           <h1 className="mx-auto max-w-3xl text-balance text-[40px] font-bold leading-[1.1] tracking-tight md:text-[60px] animate-in">
             把活儿交给它
@@ -145,17 +145,17 @@ export function Landing({
         </div>
       </section>
 
-      {/* 差异化对比：不是又一个聊天机器人 */}
+      {/* 差异化对比：不是又一个聊天窗口 */}
       <section id="compare" className="border-y border-border bg-sidebar/50">
         <div className="mx-auto max-w-6xl px-5 py-20">
           <div className="mb-12 text-center">
-            <h2 className="text-[32px] font-bold tracking-tight md:text-[40px]">不是又一个聊天机器人</h2>
+            <h2 className="text-[32px] font-bold tracking-tight md:text-[40px]">不是又一个聊天窗口</h2>
             <p className="mx-auto mt-3 max-w-xl text-[16px] text-muted">
-              普通 AI 给你一段建议；它像同事一样把活儿干完 —— 而且越用越好用，越用越懂你。
+              普通工具给你一段建议；它像同事一样把活儿干完 —— 而且越用越好用，越用越懂你。
             </p>
           </div>
           <div className="mx-auto grid max-w-4xl grid-cols-1 gap-5 md:grid-cols-2">
-            {/* 普通 AI 聊天 */}
+            {/* 普通聊天工具 */}
             <div className="rounded-2xl border border-border bg-surface p-7">
               <div className="mb-5 flex items-center gap-2.5">
                 <span className="flex size-9 items-center justify-center rounded-xl bg-hover text-faint">
@@ -196,9 +196,9 @@ export function Landing({
       {/* Agents —— v5 纯市场:默认只配「全能助手」,其余是市场按需加装的示例(非预置 roster)。 */}
       <section id="agents" className="mx-auto max-w-6xl px-5 py-20">
         <div className="mb-12 text-center">
-          <h2 className="text-[32px] font-bold tracking-tight md:text-[40px]">一个全能助手起步，市场按需生长</h2>
+          <h2 className="text-[32px] font-bold tracking-tight md:text-[40px]">一个全能工作台起步，能力按需生长</h2>
           <p className="mx-auto mt-3 max-w-2xl text-[16px] text-muted">
-            默认只配「全能助手」—— 写作、编程、研究、分析张口就用。需要更专业时，从 AI 市场一键加装专家智能体与技能，能力随需求生长。
+            默认配备「全能工作台」—— 写作、编程、研究、分析张口就用。需要更专业时，从能力市场一键加装专家角色与技能，能力随需求生长。
           </p>
         </div>
 
@@ -229,18 +229,18 @@ export function Landing({
           />
         </button>
 
-        {/* 市场:专业智能体(示例,陆续上新) —— 明确"从市场安装",不是预置 */}
+        {/* 市场:专业角色(示例,陆续上新) —— 明确"从市场安装",不是预置 */}
         <div className="mb-4 flex items-center justify-between gap-3">
           <div className="flex items-center gap-2 text-[14px] font-semibold text-muted">
             <Puzzle size={16} className="text-accent" />
-            AI 市场 · 专业智能体（示例，陆续上新）
+            能力市场 · 专业角色（示例，陆续上新）
           </div>
           <button
             type="button"
             onClick={onStart}
             className="inline-flex items-center gap-1 text-[13.5px] font-medium text-accent outline-none hover:underline focus-visible:ring-2 focus-visible:ring-ring"
           >
-            浏览 AI 市场 <ArrowRight size={14} />
+            浏览能力市场 <ArrowRight size={14} />
           </button>
         </div>
         <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
@@ -290,7 +290,7 @@ export function Landing({
             <Shield size={24} />
           </div>
           <h2 className="text-[28px] font-bold tracking-tight md:text-[36px]">现在就开始，越用越懂你</h2>
-          <p className="mx-auto mt-3 max-w-md text-[15.5px] text-muted">免费注册，从全能助手起步，按需从 AI 市场加装更多能力。</p>
+          <p className="mx-auto mt-3 max-w-md text-[15.5px] text-muted">免费注册，从全能工作台起步，按需从能力市场加装更多能力。</p>
           <Button variant="primary" shape="pill" size="lg" onClick={onStart} className="mt-7 shadow-float">
             免费开始使用
             <ArrowRight size={17} />
@@ -310,7 +310,7 @@ export function Landing({
               <div className="flex flex-col gap-2.5">
                 <span className="font-medium text-fg">产品</span>
                 <a href="#demo" className="text-muted hover:text-fg">演示</a>
-                <a href="#agents" className="text-muted hover:text-fg">智能体</a>
+                <a href="#agents" className="text-muted hover:text-fg">角色</a>
                 <a href="#tutorials" className="text-muted hover:text-fg">快速上手</a>
                 <a href="#faq" className="text-muted hover:text-fg">常见问题</a>
               </div>
@@ -324,7 +324,7 @@ export function Landing({
           </div>
           <div className="mt-9 flex flex-col gap-1.5 border-t border-border pt-6 text-[12.5px] text-faint">
             <span>© {BRAND.year} {BRAND.company} 版权所有</span>
-            <span>{BRAND.icp} · 本站内容由 AI 生成，仅供参考</span>
+            <span>{BRAND.icp} · 本站信息仅供参考</span>
           </div>
         </div>
       </footer>

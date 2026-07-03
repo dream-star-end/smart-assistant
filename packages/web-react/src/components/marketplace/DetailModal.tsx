@@ -26,7 +26,7 @@ function AgentManifestView({ manifest }: { manifest: unknown }) {
     <div className="flex flex-col gap-3">
       <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
         <div>
-          <div className="mb-1 text-[12px] font-medium text-muted">模型</div>
+          <div className="mb-1 text-[12px] font-medium text-muted">线路</div>
           <Badge tone="neutral">{m.model || '平台默认'}</Badge>
         </div>
         <div>
@@ -224,13 +224,13 @@ export function DetailModal({
           {done && (
             <Alert tone="success" title={canUpdate ? '已更新' : '已安装'}>
               {isAgent
-                ? '可在输入框上方的智能体选择器中切换使用。'
-                : '将在你的下一次会话中对 AI 可用。'}
+                ? '可在输入框上方的角色选择器中切换使用。'
+                : '将在你的下一次会话中可用。'}
             </Alert>
           )}
           {isPreset && (
-            <Alert tone="info" title="平台预设智能体">
-              无需安装,所有用户开箱即用;在输入框上方的智能体选择器中直接切换。
+            <Alert tone="info" title="平台预设角色">
+              无需安装,所有用户开箱即用;在输入框上方的角色选择器中直接切换。
             </Alert>
           )}
           {!done && canUpdate && installed && (
@@ -272,7 +272,7 @@ export function DetailModal({
             Object.keys(detail.rawBundle).some((p) => p.startsWith('scripts/')) && (
               <Alert tone="warning" title="含可执行脚本">
                 该技能带 {Object.keys(detail.rawBundle).filter((p) => p.startsWith('scripts/')).length}{' '}
-                个脚本文件,安装后可能被智能体执行。脚本已过平台危险模式扫描与人工审核,
+                个脚本文件,安装后可能被角色执行。脚本已过平台危险模式扫描与人工审核,
                 但建议安装前点开逐个查看内容。
               </Alert>
             )}

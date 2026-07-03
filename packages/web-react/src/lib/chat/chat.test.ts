@@ -166,7 +166,7 @@ describe("classifyClose / nonAuthPolicyCloseInfo (§5)", () => {
   });
   test("nonAuthPolicyCloseInfo recognizes reason strings", () => {
     expect(nonAuthPolicyCloseInfo(0, "too_many_connections")?.status).toBe("连接数超限");
-    expect(nonAuthPolicyCloseInfo(0, "unauthorized_model")?.status).toBe("模型未开通");
+    expect(nonAuthPolicyCloseInfo(0, "unauthorized_model")?.status).toBe("线路未开通");
     expect(nonAuthPolicyCloseInfo(1006, "")).toBeNull();
   });
   test("backoff 2/4/8/16/30s ladder + jitter cap", () => {
@@ -400,7 +400,7 @@ describe("applyCostCharged (§3 NOT deduped; 归因严格)", () => {
   });
   test("NO target 但 turn 进行中（委派 cost 在子状态间到达）→ enqueue pending，不丢", () => {
     const s = sess();
-    s._sendingInFlight = true; // 队长等子智能体：无 streamingAssistant，但本 turn 在飞
+    s._sendingInFlight = true; // 队长等子角色：无 streamingAssistant，但本 turn 在飞
     applyCostCharged(s, { type: "outbound.cost_charged", sessionId: "s1", costCredits: "7" }, {});
     applyCostCharged(s, { type: "outbound.cost_charged", sessionId: "s1", costCredits: "3" }, {});
     expect(s._pendingCostCredits).toBe("10"); // 累加，待收尾 flush 到本轮响应

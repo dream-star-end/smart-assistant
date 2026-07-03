@@ -51,7 +51,7 @@ export type AgentGate = {
 /** 由后端状态推导前置 phase（纯函数，无副作用，便于测试/推理）。 */
 function derivePhase(s: AgentStatus): AgentGatePhase {
   if (!s.runtimeReady) return { kind: "runtime-unavailable" };
-  // 按需模型(v5 ccb 单底座):无 legacy 订阅,容器随 user-chat-bridge WS 连接 ensureRunning 起。
+  // 按需线路(v5 ccb 单底座):无 legacy 订阅,容器随 user-chat-bridge WS 连接 ensureRunning 起。
   // 直接 ready 放行 WS 连接;冷启 provisioning 由 useChatSocket 的 4503 重试 + provisioning banner
   // 处理(不走 legacy /api/agent/open 订阅 gate —— v5 无 AGENT_IMAGE,open 会 503)。
   if (s.ondemand) return { kind: "ready", status: s };
@@ -127,7 +127,7 @@ export function useAgentGate(auth: AuthSession | null, enabled: boolean): AgentG
         if (next.kind === "provisioning") void pollToReady(runId, ac);
       } catch (e) {
         if (runId !== runIdRef.current) return;
-        setPhase(toErrorPhase(e, "无法获取智能体状态，请稍后重试。"));
+        setPhase(toErrorPhase(e, "无法获取工作区状态，请稍后重试。"));
       }
     })();
   }, [cancelInflight, pollToReady]);

@@ -18,7 +18,7 @@ describe("TeamPanel 团队协作面板", () => {
       member("c", { _delegateAgentId: "测试工程师", _delegateGoal: "写e2e", _completed: true, _isError: true }),
     ];
     render(<TeamPanel members={members} sig="x" />);
-    expect(screen.getByText("团队协作 · 3 个智能体")).toBeInTheDocument();
+    expect(screen.getByText("团队协作 · 3 个角色")).toBeInTheDocument();
     expect(screen.getByText(/1 运行中/)).toBeInTheDocument();
     expect(screen.getByText(/1 完成/)).toBeInTheDocument();
     expect(screen.getByText(/1 失败/)).toBeInTheDocument();
@@ -35,7 +35,7 @@ describe("TeamPanel 团队协作面板", () => {
     ];
     render(<TeamPanel members={members} sig="y" />);
     expect(screen.queryByText("队员甲")).not.toBeInTheDocument(); // 收起
-    fireEvent.click(screen.getByText("团队协作 · 2 个智能体"));
+    fireEvent.click(screen.getByText("团队协作 · 2 个角色"));
     expect(screen.getByText("队员甲")).toBeInTheDocument();
     expect(screen.getByText("队员乙")).toBeInTheDocument();
   });

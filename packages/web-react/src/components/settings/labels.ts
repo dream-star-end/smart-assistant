@@ -16,7 +16,7 @@ export const LEDGER_REASON_LABEL: Record<string, string> = {
   adjustment: "人工调整",
   monthly_grant: "月度额度",
   subscription: "订阅扣费",
-  agent_open: "开通智能体",
+  agent_open: "开通工作区",
 };
 
 export function ledgerReasonLabel(reason: string): string {

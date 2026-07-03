@@ -25,7 +25,7 @@ export function EmptyState({
         className="mt-4 gap-1.5 text-muted"
       >
         <ArrowLeftRight size={13} />
-        换一个智能体
+        换一个角色
       </Button>
 
       <div className="mt-8 grid w-full max-w-2xl grid-cols-1 gap-2.5 sm:grid-cols-2">

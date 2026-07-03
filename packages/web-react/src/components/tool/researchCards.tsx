@@ -776,7 +776,7 @@ function MarketCard({ tool }: { tool: ToolLike }) {
           <li key={it.slug || `${i}`} className="py-2 first:pt-0 last:pb-0">
             <div className="flex items-center gap-2">
               <span className="text-[13px] text-fg">{asStr(it.name) || asStr(it.slug)}</span>
-              {it.kind && <Chip>{it.kind === "agent" ? "智能体" : "技能"}</Chip>}
+              {it.kind && <Chip>{it.kind === "agent" ? "角色" : "技能"}</Chip>}
               {it.version && <Chip>v{asStr(it.version)}</Chip>}
             </div>
             {it.description && (

@@ -2,7 +2,7 @@
  * SkillOpt 面板 —— 单个技能展开区里的「评测」与「训练优化」两个分区。
  *
  * 成本红线(boss):任何消耗积分的动作(运行评测/启动训练/评论重训)必须
- * 先弹成本确认(模型+费率来源+估算区间+红字提示),运行中/结束后按实际用量
+ * 先弹成本确认(线路+费率来源+估算区间+红字提示),运行中/结束后按实际用量
  * 折算实报(与计费同公式;以账单为准)。绝不静默扣费。
  */
 import {
@@ -38,7 +38,7 @@ import type {
 import { cn } from "../../lib/utils";
 import { Alert, Badge, Button, Spinner, Textarea, useConfirm } from "../ui";
 
-/** 训练/评测锁定的模型(与 gateway SKILL_TRAIN_DEFAULT_MODEL 一致)。 */
+/** 训练/评测锁定的线路(与 gateway SKILL_TRAIN_DEFAULT_MODEL 一致)。 */
 export const SKILL_RUN_MODEL = "deepseek-v4-pro";
 
 const POLL_MS = 3000;
@@ -214,7 +214,7 @@ export function SkillEvalSection({
       body: (
         <CostBody
           lines={[
-            `模型:${rates?.displayName ?? SKILL_RUN_MODEL}(平台锁定)`,
+            `线路:${rates?.displayName ?? SKILL_RUN_MODEL}(平台锁定)`,
             `${n} 个用例 × 2 组对照(有技能 / 无技能)+ 每用例 1 次评分`,
             "全部在隔离会话中运行,不影响你的正常对话与技能库",
           ]}
@@ -533,8 +533,8 @@ export function SkillTrainSection({
       body: (
         <CostBody
           lines={[
-            `模型:${rates?.displayName ?? SKILL_RUN_MODEL}(平台锁定,最高思考档)`,
-            "AI 复盘你近期的真实会话,给这个技能起草改进(只产草稿,合并前不会改动技能)",
+            `线路:${rates?.displayName ?? SKILL_RUN_MODEL}(平台锁定,最高思考档)`,
+            "自动复盘你近期的真实会话,给这个技能起草改进(只产草稿,合并前不会改动技能)",
             "草稿产出后自动跑评测门:草稿 vs 现版实测对比,给出「是否值得合并」的量化结论",
           ]}
           range={total}
@@ -585,7 +585,7 @@ export function SkillTrainSection({
       {!run && (
         <div className="flex items-start justify-between gap-3">
           <p className="text-[12px] leading-relaxed text-muted">
-            AI 复盘你近期的真实使用,起草这个技能的改进;草稿先过评测门(草稿 vs 现版实测),
+            系统复盘你近期的真实使用,起草这个技能的改进;草稿先过评测门(草稿 vs 现版实测),
             再由你决定是否合并 —— 技能库永远不会被自动改动。
           </p>
           <Button variant="primary" size="sm" onClick={start} className="shrink-0">
@@ -714,7 +714,7 @@ function TrainDraftView({
     if (!c || !detail) return;
     const range = rates ? fmtCreditRange(estimateTrainRunCredits(rates)) : "少量";
     const ok = await confirmDialog({
-      title: "让 AI 按评论修订草稿?",
+      title: "按评论修订草稿?",
       body: (
         <CostBody
           lines={["继续同一训练会话修订草稿(修订后可再次评测/合并)"]}
@@ -798,7 +798,7 @@ function TrainDraftView({
         <Button variant="primary" size="sm" onClick={merge} disabled={busy}>
           {busy ? <Loader2 size={13} className="animate-spin" /> : <Check size={13} />} 合并到技能库
         </Button>
-        <span className="text-[11.5px] text-faint">或对草稿留评论让 AI 修订:</span>
+        <span className="text-[11.5px] text-faint">或对草稿留评论并修订:</span>
       </div>
       <div className="flex gap-2">
         <Textarea

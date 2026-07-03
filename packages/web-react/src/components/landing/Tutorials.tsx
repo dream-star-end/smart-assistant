@@ -20,13 +20,13 @@ import { useEffect, useRef, useState } from "react";
  */
 const QUICKSTART: { n: string; title: string; desc: string }[] = [
   { n: "1", title: "邮箱注册", desc: "一分钟拥有专属助手，免费额度即刻到账。" },
-  { n: "2", title: "像派活一样开口", desc: "不用学提示词，把需求像跟同事说话一样讲出来。" },
-  { n: "3", title: "需要时再加装", desc: "更专业的活儿，从 AI 市场一键装上专家智能体。" },
+  { n: "2", title: "像派活一样开口", desc: "不用学复杂说明，把需求像跟同事说话一样讲出来。" },
+  { n: "3", title: "需要时再加装", desc: "更专业的活儿，从能力市场一键装上专家角色。" },
 ];
 
 /**
  * 「开口第一句」：分类可复制的示例指令。空白输入框是新用户最大流失点，
- * 给一句能直接照抄的话；类别刻意覆盖演示区没展开的能力（定时 / 记忆 / 多模型 / GitHub…）。
+ * 给一句能直接照抄的话；类别刻意覆盖演示区没展开的能力（定时 / 记忆 / 多线路 / GitHub…）。
  */
 type Starter = { icon: LucideIcon; tag: string; text: string };
 
@@ -49,7 +49,7 @@ const STARTERS: Starter[] = [
   {
     icon: Globe,
     tag: "联网调研",
-    text: "联网查一下本周新发布的 AI 工具，挑 3 个值得试的，给出理由",
+    text: "联网查一下本周新发布的效率工具，挑 3 个值得试的，给出理由",
   },
   {
     icon: PenLine,
@@ -68,8 +68,8 @@ const STARTERS: Starter[] = [
   },
   {
     icon: SlidersHorizontal,
-    tag: "多模型",
-    text: "换个更擅长推理的模型，再帮我推演一遍这个定价方案",
+    tag: "多线路",
+    text: "换个更擅长推理的线路，再帮我推演一遍这个定价方案",
   },
 ];
 
@@ -131,7 +131,7 @@ export function Tutorials() {
         </span>
         <h2 className="text-[32px] font-bold tracking-tight md:text-[40px]">三步开始，一分钟上手</h2>
         <p className="mx-auto mt-3 max-w-xl text-[16px] text-muted">
-          不用学提示词、不用做配置 —— 注册、开口、需要时再加装。
+          不用学复杂说明、不用做配置 —— 注册、开口、需要时再加装。
         </p>
       </div>
 

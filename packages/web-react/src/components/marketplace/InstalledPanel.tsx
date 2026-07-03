@@ -6,7 +6,7 @@ import type { AuthSession, MarketplaceInstalled } from "../../lib/types";
 import { Alert, Badge, Button, EmptyState, Spinner, useConfirm } from "../ui";
 
 /**
- * 我的已安装：列出当前安装的技能/智能体,可卸载;有新上架版本的给「更新」按钮
+ * 我的已安装：列出当前安装的技能/角色,可卸载;有新上架版本的给「更新」按钮
  * （复用 install 的幂等替换语义,以后端校验为准）;被平台下架(revoked)的醒目提醒。
  */
 export function InstalledPanel({ auth, onGoBrowse }: { auth: AuthSession; onGoBrowse: () => void }) {
@@ -34,7 +34,7 @@ export function InstalledPanel({ auth, onGoBrowse }: { auth: AuthSession; onGoBr
   const uninstall = useCallback(
     async (slug: string, name: string, isAgent: boolean) => {
       const ok = await confirmDialog({
-        title: `卸载${isAgent ? "智能体" : "技能"}「${name}」?`,
+        title: `卸载${isAgent ? "角色" : "技能"}「${name}」?`,
         body: "卸载后将不再可用,可随时从市场重新安装。",
         confirmText: "卸载",
         danger: true,
@@ -89,7 +89,7 @@ export function InstalledPanel({ auth, onGoBrowse }: { auth: AuthSession; onGoBr
       ) : !rows || rows.length === 0 ? (
         <EmptyState
           icon={PackageOpen}
-          title="还没有安装任何技能或智能体"
+          title="还没有安装任何技能或角色"
           hint="去市场发现别人沉淀好的能力，一键安装即可使用。"
           action={
             <Button variant="secondary" size="sm" onClick={onGoBrowse}>
@@ -117,7 +117,7 @@ export function InstalledPanel({ auth, onGoBrowse }: { auth: AuthSession; onGoBr
                 <div className="min-w-0 flex-1">
                   <div className="flex flex-wrap items-center gap-1.5">
                     <span className="truncate text-[13.5px] font-medium text-fg">{r.name}</span>
-                    {r.kind === "agent" && <Badge tone="accent">智能体</Badge>}
+                    {r.kind === "agent" && <Badge tone="accent">角色</Badge>}
                     <Badge tone="neutral">v{r.version}</Badge>
                     {canUpdate && r.latestVersion && (
                       <Badge tone="accent">
@@ -128,7 +128,7 @@ export function InstalledPanel({ auth, onGoBrowse }: { auth: AuthSession; onGoBr
                   </div>
                   <p className="mt-0.5 truncate text-[12px] text-muted">
                     {revoked
-                      ? `平台已下架该${r.kind === "agent" ? "智能体" : "技能"}，将自动从你的会话移除。`
+                      ? `平台已下架该${r.kind === "agent" ? "角色" : "技能"}，将自动从你的会话移除。`
                       : r.slug}
                   </p>
                 </div>

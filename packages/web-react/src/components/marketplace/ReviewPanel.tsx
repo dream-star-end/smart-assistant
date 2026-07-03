@@ -99,7 +99,7 @@ export function ReviewPanel({ auth }: { auth: AuthSession }) {
                     <div className="min-w-0">
                       <div className="flex items-center gap-1.5">
                         <span className="truncate text-[13.5px] font-medium text-fg">{r.name}</span>
-                        {r.kind === "agent" && <Badge tone="accent">智能体</Badge>}
+                        {r.kind === "agent" && <Badge tone="accent">角色</Badge>}
                         <Badge tone="neutral">v{r.version}</Badge>
                         {flags.length > 0 && <Badge tone="warning">{flags.length} 项提示</Badge>}
                       </div>
@@ -185,7 +185,7 @@ export function ReviewPanel({ auth }: { auth: AuthSession }) {
 
 /**
  * 下架(kill-switch)：撤销一个已上架条目,下次容器同步自动从所有用户移除。
- * slug 输入带已上架目录 datalist 提示(技能+智能体),确认框回显条目名防误下架。
+ * slug 输入带已上架目录 datalist 提示(技能+角色),确认框回显条目名防误下架。
  */
 function RevokeBox({ auth }: { auth: AuthSession }) {
   const [slug, setSlug] = useState("");
@@ -255,7 +255,7 @@ function RevokeBox({ auth }: { auth: AuthSession }) {
         <datalist id="revoke-slug-options">
           {catalog.map((c) => (
             <option key={c.slug} value={c.slug}>
-              {c.name}（{c.kind === "agent" ? "智能体" : "技能"}）
+              {c.name}（{c.kind === "agent" ? "角色" : "技能"}）
             </option>
           ))}
         </datalist>

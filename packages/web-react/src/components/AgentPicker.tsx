@@ -65,13 +65,13 @@ export function AgentPicker({
     <Modal
       open={open}
       onOpenChange={(o) => !o && onClose()}
-      title="选择智能体"
-      description="全能助手与官方预设助手开箱即用，更多智能体可从市场安装。"
+      title="选择角色"
+      description="全能助手与官方预设助手开箱即用，更多角色可从市场安装。"
       className="max-w-2xl"
     >
       {loading && (
         <div className="mb-2 flex items-center gap-2 text-[12px] text-faint">
-          <Loader2 size={13} className="animate-spin" /> 加载你的智能体…
+          <Loader2 size={13} className="animate-spin" /> 加载你的角色…
         </div>
       )}
 
@@ -116,7 +116,7 @@ export function AgentPicker({
                 <Users size={13} className="text-accent" /> 团队模式
               </span>
               <span className="mt-0.5 text-[11.5px] leading-snug text-muted">
-                开启后，全能助手按任务自动选调已安装的智能体组队协作；简单任务仍自己完成。
+                开启后，全能助手按任务自动选调已安装的角色组队协作；简单任务仍自己完成。
               </span>
             </span>
             <Switch checked={teamMode} onCheckedChange={onToggleTeamMode} aria-label="启用团队模式" />
@@ -162,7 +162,7 @@ export function AgentPicker({
             className="group flex items-center justify-center gap-2 rounded-xl border border-dashed border-border p-3.5 text-[13.5px] text-muted outline-none transition-colors hover:border-accent/50 hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
           >
             <Store size={16} />
-            从市场添加更多智能体
+            从市场添加更多角色
           </button>
         )}
       </div>

@@ -8,7 +8,7 @@ import type { MarketplaceRiskFlag } from "../../lib/types";
 const CATEGORY_LABEL: Record<string, string> = {
   secret: "疑似密钥/凭证",
   internal: "内部地址/令牌",
-  injection: "疑似提示词注入",
+  injection: "疑似复杂说明注入",
   html: "内联脚本/HTML",
   obfuscation: "隐藏/不可见字符",
   metadata: "元数据格式问题",
@@ -19,7 +19,7 @@ const CATEGORY_LABEL: Record<string, string> = {
 const CATEGORY_HINT: Record<string, string> = {
   secret: "请移除 API Key、token、私钥等敏感信息后重新发布。",
   internal: "请移除内网地址、内部域名或内部令牌。",
-  injection: "请去掉「忽略以上指令」「对用户隐瞒」等可能操纵模型的措辞。",
+  injection: "请去掉「忽略以上指令」「对用户隐瞒」等可能操纵线路的措辞。",
   html: "请移除 <script>/<iframe> 等可执行标记。",
   obfuscation: "请移除零宽字符、双向控制符等不可见内容。",
   metadata: "名称/描述需为纯文本,不能含换行或 HTML。",

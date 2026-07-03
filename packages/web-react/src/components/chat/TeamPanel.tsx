@@ -1,11 +1,11 @@
 /**
  * 团队协作面板 —— 蜂群智能团队模式的前端视图。
  *
- * 把"队长在同一轮里并行委派的多个智能体"(渲染流里连续的 agent-group 消息)聚成**一个**
+ * 把"队长在同一轮里并行委派的多个角色"(渲染流里连续的 agent-group 消息)聚成**一个**
  * 清晰友好的团队面板,而不是散落的多张卡:
  *  - 头部一眼看团队规模 + 状态概览(运行中 / 完成 / 失败 计数);活跃时默认展开,全完成默认收起。
  *  - 每个队员一行:名称 + 任务 + 状态(运行中转圈 / 完成✓ / 失败✕ + 耗时),点开看其工作过程 + 结果。
- *  - 复用已有 delegate/agent-group 数据模型 + ChildBlockView,**无需后端改动**;后端真蜂群
+ *  - 复用已有 delegate/agent-group 数据线路 + ChildBlockView,**无需后端改动**;后端真蜂群
  *    (teammate / 邮箱 / coordinator)落地后,本面板可平滑扩展承载更丰富的协作信息。
  *  - 视觉沿用 Aurora 原语(Badge/Spinner/border/surface/grad-cta),与单个 AgentGroupCard 一致。
  *
@@ -23,7 +23,7 @@ import { ChildBlockView } from "./AgentGroupCard";
 /** 队员显示名:优先委派的 agentId(已是可读标识),空则按序号兜底。 */
 function memberName(msg: ChatMessage, idx: number): string {
   const id = msg._delegateAgentId?.trim();
-  return id || `智能体 ${idx + 1}`;
+  return id || `角色 ${idx + 1}`;
 }
 
 /** 单个队员行:可折叠,运行中默认展开看进度、完成默认收起(显示结果摘要)。 */
@@ -127,7 +127,7 @@ export const TeamPanel = memo(
             <Users size={13} />
           </span>
           <span className="min-w-0 flex-1 truncate text-[13px] font-medium text-fg">
-            团队协作 · {total} 个智能体
+            团队协作 · {total} 个角色
           </span>
           <span className="flex shrink-0 items-center gap-2 text-[11.5px]">
             {running > 0 && (
