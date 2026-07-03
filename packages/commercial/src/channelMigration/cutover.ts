@@ -27,6 +27,7 @@ import {
 } from "./channelState.js";
 import { migrateUserSessions, type SessionsMigrationOutcome } from "./sessionsMigrate.js";
 import {
+  assertV3VolumesOnSelfHost,
   isDockerNotFound,
   migrateUserVolumes,
   type VolumesMigrationOutcome,
@@ -117,6 +118,9 @@ export async function cutoverUser(
     };
   }
   return withAudit(uid, "cutover", { selfHostUuid: deps.selfHostUuid }, async () => {
+    // 0. 前置 fail-closed:v3 卷若在远端 host,在任何状态变更/quiesce 之前就抛(防远端容器
+    //    被本机 quiesce 404 误当已停、错标 vanished)。远端须先 consolidate 到 self host。
+    await assertV3VolumesOnSelfHost(uid, deps.selfHostUuid);
     // 1. quiesce v3:停容器释放卷写者(此后卷内 sessions.db 稳定、无并发写)。
     await deps.quiesceV3(uid);
     // 2. L2 会话历史最后 delta(master client_sessions + wechat_bindings)。

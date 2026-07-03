@@ -107,6 +107,8 @@ const RETRY_AFTER_IMAGE_MISSING_SEC = 300;
  * reason='baseline_missing' 让前端/运维 dashboard 看见 distinct 信号。
  */
 const RETRY_AFTER_BASELINE_MISSING_SEC = 300;
+// 已迁移到 v5:短重试;客户端应据 reason="migrated_to_v5" 重取(命中路由 cookie)导向 v5。
+const RETRY_AFTER_MIGRATED_V5_SEC = 3;
 
 /**
  * ensureRunning 注入项 — 测试可以覆盖 readiness 探活实现。
@@ -555,6 +557,12 @@ export function makeV3EnsureRunning(
           dedupe_key: `container.provision_failed:baseline_missing:${new Date().toISOString().slice(0, 13)}`,
         });
         throw new ContainerUnreadyError(RETRY_AFTER_BASELINE_MISSING_SEC, "baseline_missing");
+      }
+      // v3→v5 迁移门控:该用户已迁移到 v5(migrated)或迁移进行中(migrating),v3 拒建容器。
+      // 不告警、不当"provisioning"重试(那会让用户在 stale v3 路径上死循环重试);给独立
+      // reason,路由层/前端据此把用户导向 v5(正常路径下路由 cookie 已先一步导走,此为兜底)。
+      if (err instanceof SupervisorError && err.code === "MigratedToV5") {
+        throw new ContainerUnreadyError(RETRY_AFTER_MIGRATED_V5_SEC, "migrated_to_v5");
       }
       // NameConflict(同 uid 并发 provision)/ IP 池满 都让前端短重试 — 不告警。
       // 2026-04-25 v1.0.2:之前这里完全吞错,uid=28 12 分钟死循环里 0 条 stack 可查,
