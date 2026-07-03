@@ -20,7 +20,12 @@ import { join, resolve } from 'node:path'
 import { tmpdir } from 'node:os'
 import { randomUUID } from 'node:crypto'
 import { paths } from './paths.js'
-import { parseFrontmatter, type SkillFrontmatter, type SkillMetadata } from './skillStore.js'
+import {
+  normalizeSkillAgentScope,
+  parseFrontmatter,
+  type SkillFrontmatter,
+  type SkillMetadata,
+} from './skillStore.js'
 import { hubDownload, hubSearch, hubDetail, type HubSearchResult, type HubSkillDetail } from './clawhubClient.js'
 
 export { hubSearch, type HubSearchResult, type HubSkillDetail }
@@ -224,6 +229,7 @@ export class HubStore {
           // API, so it is not writable through SkillStore.save/delete.
           layer: 'hub',
           writable: false,
+          agentIds: normalizeSkillAgentScope(undefined),
         })
       } catch {}
     }

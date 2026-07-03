@@ -19,8 +19,9 @@ import {
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { api } from "../../lib/api";
-import type { AuthSession, SkillDetail } from "../../lib/types";
+import type { AuthSession, MarketplaceMyAgent, SkillDetail } from "../../lib/types";
 import { cn } from "../../lib/utils";
+import { AgentScopePicker, AgentScopeSummary, normalizeAgentScope } from "../AgentScopePicker";
 import { Alert, Badge, Button, Input, Modal, Spinner, Textarea, useConfirm } from "../ui";
 
 const AUX_PREFIXES = ["references/", "assets/", "evals/", "scripts/"];
@@ -49,6 +50,9 @@ export function SkillEditor({
   // SKILL.md 编辑态(描述+正文);辅助文件编辑态(原文)。
   const [desc, setDesc] = useState("");
   const [body, setBody] = useState("");
+  const [agents, setAgents] = useState<MarketplaceMyAgent[]>([]);
+  const [scopeIds, setScopeIds] = useState<string[]>(["main"]);
+  const [scopeDirty, setScopeDirty] = useState(false);
   const [fileContent, setFileContent] = useState("");
   const [fileLoading, setFileLoading] = useState(false);
   const [dirty, setDirty] = useState(false);
@@ -67,16 +71,19 @@ export function SkillEditor({
   }, []);
 
   const writable = detail?.writable === true;
+  const scopeEditable = writable && detail?.layer === "shared";
 
   const load = useCallback(() => {
     setLoading(true);
     setErr(null);
-    api
-      .getSkill(auth, skillName)
-      .then((d) => {
+    Promise.all([api.getSkill(auth, skillName), api.listMyAgents(auth).catch(() => [] as MarketplaceMyAgent[])])
+      .then(([d, a]) => {
         setDetail(d);
         setDesc(d.description ?? "");
         setBody(d.body ?? "");
+        setAgents(a.length ? a : [{ id: "main", slug: "main", name: "全能助手", description: "", installed: true, isDefault: true }]);
+        setScopeIds(normalizeAgentScope(d.agentIds));
+        setScopeDirty(false);
         setDirty(false);
       })
       .catch((e) => setErr((e as Error).message || "加载技能失败"))
@@ -132,15 +139,21 @@ export function SkillEditor({
     setErr(null);
     try {
       if (selected === "SKILL.md") {
-        await api.updateSkill(auth, skillName, {
-          description: desc.trim(),
-          body,
-          tags: detail?.tags,
-        });
+        if (scopeDirty && !dirty) {
+          await api.updateSkill(auth, skillName, { agentIds: scopeIds });
+        } else {
+          await api.updateSkill(auth, skillName, {
+            description: desc.trim(),
+            body,
+            tags: detail?.tags,
+            ...(scopeEditable ? { agentIds: scopeIds } : {}),
+          });
+        }
       } else {
         await api.putSkillFile(auth, skillName, selected, fileContent);
       }
       setDirty(false);
+      setScopeDirty(false);
       setSaved(true);
       setTimeout(() => setSaved(false), 1800);
       onChanged();
@@ -218,7 +231,7 @@ export function SkillEditor({
             关闭
           </Button>
           {tab === "files" && writable && (
-            <Button variant="primary" onClick={save} disabled={!dirty || saving}>
+            <Button variant="primary" onClick={save} disabled={(!dirty && !scopeDirty) || saving}>
               {saving ? <Loader2 size={14} className="animate-spin" /> : saved ? <Check size={14} /> : null}
               {saved ? "已保存" : "保存"}
             </Button>
@@ -370,6 +383,23 @@ export function SkillEditor({
                     }}
                   />
                 </label>
+                {agents.length > 0 &&
+                  (scopeEditable ? (
+                    <AgentScopePicker
+                      agents={agents}
+                      selectedIds={scopeIds}
+                      onChange={(ids) => {
+                        setScopeIds(ids);
+                        setScopeDirty(true);
+                      }}
+                      title="适用智能体"
+                      hint="自建共享技能可改归属。"
+                    />
+                  ) : (
+                    <div className="rounded-xl border border-border bg-surface/60 p-3 text-[12px] text-muted">
+                      适用：<AgentScopeSummary agentIds={detail?.agentIds} agents={agents} />
+                    </div>
+                  ))}
                 <label className="flex min-h-0 flex-1 flex-col gap-1">
                   <span className="text-[11.5px] font-medium text-muted">
                     正文(v{detail?.version ?? "?"};保存后旧版自动入历史)

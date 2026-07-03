@@ -48,6 +48,35 @@ test("installMarketplace POSTs versionId to the install route", async () => {
   expect(JSON.parse(String(init.body))).toEqual({ versionId: "42" });
 });
 
+test("installMarketplace can include selected agentIds", async () => {
+  const fetchMock = vi.fn(async (_url: string, _init?: RequestInit) =>
+    ok({ ok: true, slug: "x", version: "1.0.0", note: "ok" }),
+  );
+  vi.stubGlobal("fetch", fetchMock as unknown as typeof fetch);
+
+  await api.installMarketplace(session(), "42", ["main", "office-assistant"]);
+  const init = fetchMock.mock.calls[0][1] as RequestInit;
+  expect(JSON.parse(String(init.body))).toEqual({
+    versionId: "42",
+    agentIds: ["main", "office-assistant"],
+  });
+});
+
+test("updateMarketplaceInstallAgents PATCHes the installed slug scope", async () => {
+  const fetchMock = vi.fn(async (_url: string, _init?: RequestInit) =>
+    ok({ ok: true, agentIds: ["office-assistant"] }),
+  );
+  vi.stubGlobal("fetch", fetchMock as unknown as typeof fetch);
+
+  const r = await api.updateMarketplaceInstallAgents(session(), "my-skill", ["office-assistant"]);
+  expect(r.agentIds).toEqual(["office-assistant"]);
+  const url = fetchMock.mock.calls[0][0];
+  const init = fetchMock.mock.calls[0][1] as RequestInit;
+  expect(String(url)).toBe("/api/marketplace/installed/my-skill");
+  expect(init.method).toBe("PATCH");
+  expect(JSON.parse(String(init.body))).toEqual({ agentIds: ["office-assistant"] });
+});
+
 test("uninstallMarketplace DELETEs the installed slug", async () => {
   const fetchMock = vi.fn(async (_url: string, _init?: RequestInit) => ok({ ok: true }));
   vi.stubGlobal("fetch", fetchMock as unknown as typeof fetch);

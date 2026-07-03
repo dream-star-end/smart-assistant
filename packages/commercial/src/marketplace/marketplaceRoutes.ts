@@ -16,6 +16,7 @@ import { HttpError, readJsonBody, sendJson } from '../http/util.js'
 import {
   MarketplaceError,
   getApprovedSkillVersions,
+  getInstallableVersionTarget,
   getListingDetail,
   installApprovedVersion,
   marketplaceAgentsEnabled,
@@ -28,6 +29,7 @@ import {
   recordUninstall,
   reviewVersion,
   revokeListing,
+  updateInstalledAgentScope,
 } from './marketplaceDb.js'
 import {
   VETTED_AGENT_TOOLSETS,
@@ -45,6 +47,7 @@ import { scanSkillArtifact } from './skillScanner.js'
 
 const SLUG_RE = /^[a-z0-9][a-z0-9-]{1,63}$/
 const VERSION_RE = /^\d+\.\d+\.\d+$/
+const AGENT_ID_RE = /^[A-Za-z0-9_-]+$/
 const MAX_BODY = 64 * 1024
 // tags become a YAML inline-array in the canonical SKILL.md ([a, b]); reject any
 // character that could break/inject that array (comma/bracket/quote/angle/newline).
@@ -77,6 +80,41 @@ function asTags(v: unknown): string[] {
   return out.slice(0, 16)
 }
 
+function asAgentIds(v: unknown, fallback: string[] = ['main']): string[] {
+  const raw = v === undefined ? fallback : v
+  if (!Array.isArray(raw)) throw new HttpError(400, 'BAD_AGENT_SCOPE', 'agentIds must be an array')
+  const out: string[] = []
+  const seen = new Set<string>()
+  for (const item of raw) {
+    if (typeof item !== 'string') throw new HttpError(400, 'BAD_AGENT_SCOPE', 'agentIds must be strings')
+    const id = item.trim()
+    if (!id || !AGENT_ID_RE.test(id))
+      throw new HttpError(400, 'BAD_AGENT_SCOPE', `invalid agentId: ${id}`)
+    if (seen.has(id)) continue
+    seen.add(id)
+    out.push(id)
+  }
+  if (out.length === 0) throw new HttpError(400, 'BAD_AGENT_SCOPE', '至少选择一个智能体')
+  return out
+}
+
+async function assignableAgentIds(userId: number): Promise<Set<string>> {
+  const presetSlugs = await platformPresetAgentSlugs()
+  const [presets, installed] = await Promise.all([
+    listPlatformPresetAgents(presetSlugs),
+    listActiveInstalledAgents(userId),
+  ])
+  return new Set(['main', ...presets.map((a) => a.slug), ...installed.map((a) => a.slug)])
+}
+
+async function validateAssignableAgentScope(userId: number, input: unknown): Promise<string[]> {
+  const agentIds = asAgentIds(input)
+  const allowed = await assignableAgentIds(userId)
+  const bad = agentIds.find((id) => !allowed.has(id))
+  if (bad) throw new HttpError(400, 'BAD_AGENT_SCOPE', `不可分配给未启用智能体: ${bad}`)
+  return agentIds
+}
+
 function slugFromPrefix(req: IncomingMessage, prefix: string): string {
   const path = (req.url ?? '').split('?')[0]
   const rest = decodeURIComponent(path.slice(prefix.length))
@@ -91,7 +129,8 @@ function mapMarketplaceError(e: unknown): HttpError {
         : e.code === 'DUPLICATE_VERSION' ||
             e.code === 'LISTING_REVOKED' ||
             e.code === 'NOT_PENDING' ||
-            e.code === 'KIND_MISMATCH'
+            e.code === 'KIND_MISMATCH' ||
+            e.code === 'INSTALL_CONFLICT'
           ? 409
           : e.code === 'VERSION_NOT_FOUND' || e.code === 'NOT_INSTALLABLE'
             ? 404
@@ -412,7 +451,16 @@ export async function handleMarketplaceInstall(
   const versionId = asStr(body.versionId, 'versionId', 32)
   if (!/^\d+$/.test(versionId)) throw new HttpError(400, 'BAD_ID', 'invalid versionId')
   try {
-    const v = await installApprovedVersion({ userId: uid(user), versionId })
+    const userId = uid(user)
+    const target = await getInstallableVersionTarget(versionId)
+    if (!target) throw new MarketplaceError('NOT_INSTALLABLE', 'skill 不可安装(未上架/已下架/非当前版本)')
+    const selectedAgentIds =
+      target.kind === 'skill' ? await validateAssignableAgentScope(userId, body.agentIds) : undefined
+    const v = await installApprovedVersion({
+      userId,
+      versionId,
+      ...(selectedAgentIds ? { agentIds: selectedAgentIds, scopeMode: 'replace' as const } : {}),
+    })
 
     // Installing an agent pulls in its (already-approved) skill dependencies so the
     // agent works out of the box. Best-effort + idempotent: a dep already installed
@@ -430,7 +478,12 @@ export async function handleMarketplaceInstall(
         const versions = await getApprovedSkillVersions(deps2)
         for (const depVid of versions.values()) {
           try {
-            await installApprovedVersion({ userId: uid(user), versionId: depVid })
+            await installApprovedVersion({
+              userId,
+              versionId: depVid,
+              agentIds: [v.slug],
+              scopeMode: 'merge',
+            })
             installedDeps++
           } catch {
             /* skip a single failing dep; agent install already recorded */
@@ -466,6 +519,27 @@ export async function handleMarketplaceInstalled(
   const presetSet = new Set(await platformPresetAgentSlugs())
   const rows = (await listInstalled(uid(user))).filter((r) => !presetSet.has(r.slug))
   sendJson(res, 200, { installed: rows })
+}
+
+// ── PATCH /api/marketplace/installed/:slug ────────────────────────────────
+export async function handleMarketplaceInstalledScope(
+  req: IncomingMessage,
+  res: ServerResponse,
+  deps: { jwtSecret: string | Uint8Array },
+): Promise<void> {
+  const user = await requireAuth(req, deps.jwtSecret)
+  const userId = uid(user)
+  const slug = slugFromPrefix(req, '/api/marketplace/installed/')
+  if (!SLUG_RE.test(slug)) throw new HttpError(400, 'BAD_SLUG', 'invalid slug')
+  const body = (await readJsonBody(req)) as Record<string, unknown>
+  const agentIds = await validateAssignableAgentScope(userId, body.agentIds)
+  try {
+    const ok = await updateInstalledAgentScope(userId, slug, agentIds)
+    if (!ok) throw new HttpError(404, 'NOT_FOUND', '未找到可修改归属的已安装技能')
+    sendJson(res, 200, { ok: true, agentIds })
+  } catch (e) {
+    throw mapMarketplaceError(e)
+  }
 }
 
 // ── GET /api/marketplace/my-publishes ──────────────────────────────────────

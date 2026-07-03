@@ -36,6 +36,7 @@ import {
   handleMarketplaceDetail,
   handleMarketplaceInstall,
   handleMarketplaceInstalled,
+  handleMarketplaceInstalledScope,
   handleMarketplaceMyAgents,
   handleMarketplaceMyPublishes,
   handleMarketplacePublish,
@@ -621,6 +622,11 @@ export function createCommercialHandler(
       method: 'GET',
       path: '/api/marketplace/installed',
       handler: (req, res) => handleMarketplaceInstalled(req, res, deps),
+    },
+    {
+      method: 'PATCH',
+      pathPrefix: '/api/marketplace/installed/',
+      handler: (req, res) => handleMarketplaceInstalledScope(req, res, deps),
     },
     {
       method: 'GET',

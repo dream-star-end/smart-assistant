@@ -1,7 +1,8 @@
 import { ArrowUpCircle, Download, Loader2, ShieldCheck, Users } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { ApiError, api } from '../../lib/api'
-import type { AuthSession, MarketplaceDetail, MarketplaceInstalled } from '../../lib/types'
+import type { AuthSession, MarketplaceDetail, MarketplaceInstalled, MarketplaceMyAgent } from '../../lib/types'
+import { AgentScopePicker, normalizeAgentScope } from '../AgentScopePicker'
 import { Alert, Badge, Button, Modal } from '../ui'
 import { friendlyRiskFlags } from './riskFlags'
 
@@ -120,7 +121,10 @@ export function DetailModal({
   const [loading, setLoading] = useState(false)
   const [err, setErr] = useState<string | null>(null)
   const [installing, setInstalling] = useState(false)
+  const [scopeSaving, setScopeSaving] = useState(false)
   const [done, setDone] = useState(false)
+  const [agents, setAgents] = useState<MarketplaceMyAgent[]>([])
+  const [scopeIds, setScopeIds] = useState<string[]>(['main'])
 
   useEffect(() => {
     if (!slug) {
@@ -133,9 +137,13 @@ export function DetailModal({
     setLoading(true)
     setErr(null)
     setDone(false)
-    api
-      .getMarketplaceDetail(auth, slug)
-      .then((d) => alive && setDetail(d))
+    Promise.all([api.getMarketplaceDetail(auth, slug), api.listMyAgents(auth).catch(() => [] as MarketplaceMyAgent[])])
+      .then(([d, a]) => {
+        if (!alive) return
+        setDetail(d)
+        setAgents(a.length ? a : [{ id: 'main', slug: 'main', name: '全能助手', description: '', installed: true, isDefault: true }])
+        setScopeIds(normalizeAgentScope(installed?.agentIds))
+      })
       .catch((e) => alive && setErr((e as Error).message || '加载详情失败'))
       .finally(() => alive && setLoading(false))
     return () => {
@@ -143,12 +151,16 @@ export function DetailModal({
     }
   }, [slug, auth])
 
+  useEffect(() => {
+    setScopeIds(normalizeAgentScope(installed?.agentIds))
+  }, [installed?.slug, installed?.agentIds?.join(',')])
+
   const install = async () => {
     if (!detail) return
     setInstalling(true)
     setErr(null)
     try {
-      await api.installMarketplace(auth, detail.versionId)
+      await api.installMarketplace(auth, detail.versionId, detail.kind === 'skill' ? scopeIds : undefined)
       setDone(true)
       onInstalled()
     } catch (e) {
@@ -158,12 +170,32 @@ export function DetailModal({
     }
   }
 
+  const saveScope = async () => {
+    if (!detail) return
+    setScopeSaving(true)
+    setErr(null)
+    try {
+      await api.updateMarketplaceInstallAgents(auth, detail.slug, scopeIds)
+      onInstalled()
+      setDone(true)
+    } catch (e) {
+      setErr(e instanceof ApiError ? e.message : (e as Error).message || '保存归属失败')
+    } finally {
+      setScopeSaving(false)
+    }
+  }
+
   const warns = friendlyRiskFlags(detail?.riskFlags)
   const isPreset = !!detail?.preset
   // detail.versionId 是当前上架版本(最新权威);已安装且 pin 的不是它 → 可更新。
   // 预设不走安装/更新语义(恒为最新上架版本,开箱即用)。
   const canUpdate = !isPreset && !!installed && !!detail && installed.versionId !== detail.versionId
   const isAgent = detail?.kind === 'agent'
+  const scopeChanged =
+    !!installed &&
+    !!detail &&
+    detail.kind === 'skill' &&
+    normalizeAgentScope(installed.agentIds).join('\0') !== normalizeAgentScope(scopeIds).join('\0')
 
   return (
     <Modal
@@ -193,6 +225,11 @@ export function DetailModal({
                   <ArrowUpCircle size={15} />
                 )}
                 更新到 v{detail.version}
+              </Button>
+            ) : scopeChanged ? (
+              <Button variant="primary" onClick={saveScope} disabled={scopeSaving}>
+                {scopeSaving && <Loader2 size={15} className="animate-spin" />}
+                保存归属
               </Button>
             ) : installed ? (
               <Badge tone="success" className="self-center">
@@ -278,6 +315,17 @@ export function DetailModal({
             )}
           {detail.rawBundle && Object.keys(detail.rawBundle).length > 0 && (
             <BundleFilesView bundle={detail.rawBundle} />
+          )}
+
+          {detail.kind === 'skill' && !isPreset && (
+            <AgentScopePicker
+              agents={agents}
+              selectedIds={scopeIds}
+              onChange={setScopeIds}
+              disabled={installing || scopeSaving}
+              title="安装给哪些智能体"
+              hint="默认全能助手，可多选。"
+            />
           )}
 
           {detail.kind === 'agent' ? (

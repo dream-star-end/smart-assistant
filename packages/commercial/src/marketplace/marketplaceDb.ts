@@ -1,4 +1,4 @@
-import { query, tx } from '../db/queries.js'
+import { query, tx, type QueryRunner } from '../db/queries.js'
 /**
  * Postgres data layer for the station-internal skill marketplace (migration 0087).
  *
@@ -27,12 +27,54 @@ export class MarketplaceError extends Error {
       | 'REVIEWER_IS_AUTHOR'
       | 'NOT_INSTALLABLE'
       | 'KIND_MISMATCH'
-      | 'ARTIFACT_MISMATCH',
+      | 'ARTIFACT_MISMATCH'
+      | 'INSTALL_CONFLICT',
     message: string,
   ) {
     super(message)
     this.name = 'MarketplaceError'
   }
+}
+
+export type InstallScopeMode = 'preserve' | 'replace' | 'merge'
+
+const VALID_AGENT_SCOPE_ID_RE = /^[A-Za-z0-9_-]+$/
+const DEFAULT_INSTALL_AGENT_IDS = ['main']
+
+function normalizeInstallAgentIds(
+  input: unknown,
+  fallback: readonly string[] = DEFAULT_INSTALL_AGENT_IDS,
+): string[] {
+  const raw = Array.isArray(input) ? input : fallback
+  const out: string[] = []
+  const seen = new Set<string>()
+  for (const item of raw) {
+    if (typeof item !== 'string') continue
+    const id = item.trim()
+    if (!id || !VALID_AGENT_SCOPE_ID_RE.test(id) || seen.has(id)) continue
+    seen.add(id)
+    out.push(id)
+  }
+  if (out.length > 0) return out
+  const fallbackOut =
+    raw === fallback ? DEFAULT_INSTALL_AGENT_IDS : normalizeInstallAgentIds(fallback, DEFAULT_INSTALL_AGENT_IDS)
+  return fallbackOut.length > 0 ? fallbackOut : DEFAULT_INSTALL_AGENT_IDS
+}
+
+function mergeAgentIds(a: readonly string[], b: readonly string[]): string[] {
+  return normalizeInstallAgentIds([...a, ...b], DEFAULT_INSTALL_AGENT_IDS)
+}
+
+async function lockInstallScope(c: QueryRunner, userId: number, slug: string): Promise<void> {
+  await query(
+    `SELECT pg_advisory_xact_lock(hashtext('marketplace_install_scope'), hashtext($1::text || ':' || $2::text))`,
+    [userId, slug],
+    c,
+  )
+}
+
+function isUniqueViolation(err: unknown): boolean {
+  return typeof err === 'object' && err !== null && (err as { code?: unknown }).code === '23505'
 }
 
 /**
@@ -480,6 +522,8 @@ export async function getListingDetail(slug: string): Promise<ListingDetail | nu
 export async function installApprovedVersion(args: {
   userId: number
   versionId: string
+  agentIds?: string[]
+  scopeMode?: InstallScopeMode
 }): Promise<{ slug: string; version: string; name: string }> {
   return tx(async (c) => {
     const v = await query<{
@@ -508,19 +552,105 @@ export async function installApprovedVersion(args: {
     if (row.kind === 'agent' && !marketplaceAgentsEnabled())
       throw new MarketplaceError('NOT_INSTALLABLE', 'agent 类市场仅在 v5 可用')
 
-    await query(
-      `UPDATE marketplace_installs SET uninstalled_at = NOW()
-        WHERE user_id = $1 AND slug = $2 AND uninstalled_at IS NULL`,
+    await lockInstallScope(c, args.userId, row.slug)
+    const existing = await query<{ id: string; agent_ids: unknown }>(
+      `SELECT id::text, agent_ids
+         FROM marketplace_installs
+        WHERE user_id = $1 AND slug = $2 AND uninstalled_at IS NULL
+        FOR UPDATE`,
       [args.userId, row.slug],
       c,
     )
-    await query(
-      `INSERT INTO marketplace_installs (user_id, slug, version_id, artifact_hash, installed_by)
-            VALUES ($1,$2,$3,$4,$1)`,
-      [args.userId, row.slug, args.versionId, row.artifact_hash],
+    const previous = existing.rows[0]
+    const previousScope = previous
+      ? normalizeInstallAgentIds(previous.agent_ids, DEFAULT_INSTALL_AGENT_IDS)
+      : null
+    const providedScope =
+      args.agentIds !== undefined ? normalizeInstallAgentIds(args.agentIds, []) : null
+    const scopeMode: InstallScopeMode =
+      args.scopeMode ?? (args.agentIds !== undefined ? 'replace' : 'preserve')
+    let finalScope: string[]
+    if (row.kind === 'agent') {
+      finalScope = DEFAULT_INSTALL_AGENT_IDS
+    } else if (scopeMode === 'replace') {
+      finalScope = providedScope && providedScope.length > 0 ? providedScope : DEFAULT_INSTALL_AGENT_IDS
+    } else if (scopeMode === 'merge') {
+      finalScope = mergeAgentIds(previousScope ?? [], providedScope ?? [])
+    } else {
+      finalScope = previousScope ?? (providedScope && providedScope.length > 0 ? providedScope : DEFAULT_INSTALL_AGENT_IDS)
+    }
+
+    if (previous) {
+      await query(
+        `UPDATE marketplace_installs SET uninstalled_at = NOW()
+          WHERE id = $1`,
+        [previous.id],
+        c,
+      )
+    }
+    try {
+      await query(
+        `INSERT INTO marketplace_installs (user_id, slug, version_id, artifact_hash, installed_by, agent_ids)
+              VALUES ($1,$2,$3,$4,$1,$5::jsonb)`,
+        [args.userId, row.slug, args.versionId, row.artifact_hash, JSON.stringify(finalScope)],
+        c,
+      )
+    } catch (err) {
+      if (isUniqueViolation(err)) {
+        throw new MarketplaceError('INSTALL_CONFLICT', '安装状态冲突,请重试')
+      }
+      throw err
+    }
+    return { slug: row.slug, version: row.version, name: row.name }
+  })
+}
+
+export async function getInstallableVersionTarget(versionId: string): Promise<{
+  slug: string
+  kind: ArtifactKind
+  version: string
+} | null> {
+  const r = await query<{ slug: string; kind: string; version: string }>(
+    `SELECT v.slug, l.kind, v.version
+       FROM marketplace_skill_versions v
+       JOIN marketplace_skill_listings l ON l.slug = v.slug
+      WHERE v.id = $1 AND v.status = 'approved' AND l.state = 'active'
+            AND l.current_approved_version_id = v.id`,
+    [versionId],
+  )
+  const row = r.rows[0]
+  if (!row) return null
+  if (row.kind === 'agent' && !marketplaceAgentsEnabled())
+    throw new MarketplaceError('NOT_INSTALLABLE', 'agent 类市场仅在 v5 可用')
+  return { slug: row.slug, kind: row.kind as ArtifactKind, version: row.version }
+}
+
+export async function updateInstalledAgentScope(
+  userId: number,
+  slug: string,
+  agentIds: string[],
+): Promise<boolean> {
+  const finalScope = normalizeInstallAgentIds(agentIds, DEFAULT_INSTALL_AGENT_IDS)
+  return tx(async (c) => {
+    await lockInstallScope(c, userId, slug)
+    const existing = await query<{ id: string }>(
+      `SELECT i.id::text
+         FROM marketplace_installs i
+         JOIN marketplace_skill_listings l ON l.slug = i.slug
+        WHERE i.user_id = $1 AND i.slug = $2 AND i.uninstalled_at IS NULL
+              AND l.kind = 'skill'
+        FOR UPDATE OF i`,
+      [userId, slug],
       c,
     )
-    return { slug: row.slug, version: row.version, name: row.name }
+    const row = existing.rows[0]
+    if (!row) return false
+    await query(
+      `UPDATE marketplace_installs SET agent_ids = $2::jsonb WHERE id = $1`,
+      [row.id, JSON.stringify(finalScope)],
+      c,
+    )
+    return true
   })
 }
 
@@ -540,6 +670,7 @@ export interface InstalledRow {
   versionId: string
   name: string
   artifactHash: string
+  agentIds: string[]
   installedAt: string
   listingState: string
   /** listing 当前上架版本(升级可见性;listing 无 approved 版本时为 null)。 */
@@ -555,6 +686,7 @@ export async function listInstalled(userId: number): Promise<InstalledRow[]> {
     version_id: string
     name: string
     artifact_hash: string
+    agent_ids: unknown
     installed_at: string
     state: string
     latest_version: string | null
@@ -563,6 +695,7 @@ export async function listInstalled(userId: number): Promise<InstalledRow[]> {
     // cv = listing 当前上架版本(升级可见性:安装 pin 旧 versionId,新版获批后
     // latest_version_id ≠ version_id 即「可更新」)。LEFT JOIN:revoked/无 approved 时为 null。
     `SELECT i.slug, l.kind, v.version, i.version_id::text, v.name, i.artifact_hash,
+            i.agent_ids,
             i.installed_at::text, l.state,
             cv.version AS latest_version, cv.id::text AS latest_version_id
        FROM marketplace_installs i
@@ -584,6 +717,7 @@ export async function listInstalled(userId: number): Promise<InstalledRow[]> {
       versionId: x.version_id,
       name: x.name,
       artifactHash: x.artifact_hash,
+      agentIds: normalizeInstallAgentIds(x.agent_ids, DEFAULT_INSTALL_AGENT_IDS),
       installedAt: x.installed_at,
       listingState: x.state,
       latestVersion: x.latest_version,
@@ -661,6 +795,7 @@ export interface InstalledArtifact {
   version: string
   rawSkillMd: string
   artifactHash: string
+  agentIds: string[]
   /** 附属文件(容器侧独立验 bundleHash 后落盘 hub)。 */
   bundle: Record<string, string> | null
 }
@@ -680,9 +815,10 @@ export async function listActiveInstalledArtifacts(userId: number): Promise<Inst
     version: string
     raw_skill_md: string
     artifact_hash: string
+    agent_ids: unknown
     raw_bundle: unknown
   }>(
-    `SELECT i.slug, v.version, v.raw_skill_md, i.artifact_hash, v.raw_bundle
+    `SELECT i.slug, v.version, v.raw_skill_md, i.artifact_hash, i.agent_ids, v.raw_bundle
        FROM marketplace_installs i
        JOIN marketplace_skill_versions v ON v.id = i.version_id
        JOIN marketplace_skill_listings l ON l.slug = i.slug
@@ -696,6 +832,7 @@ export async function listActiveInstalledArtifacts(userId: number): Promise<Inst
     version: x.version,
     rawSkillMd: x.raw_skill_md,
     artifactHash: x.artifact_hash,
+    agentIds: normalizeInstallAgentIds(x.agent_ids, DEFAULT_INSTALL_AGENT_IDS),
     bundle: (x.raw_bundle as Record<string, string> | null) ?? null,
   }))
 }

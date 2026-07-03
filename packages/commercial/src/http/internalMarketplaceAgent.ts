@@ -116,7 +116,12 @@ function asTags(v: unknown): string[] {
 
 function statusForMarketplaceError(code: string): number {
   if (code === 'SLUG_OWNED_BY_OTHER') return 403
-  if (code === 'DUPLICATE_VERSION' || code === 'LISTING_REVOKED' || code === 'KIND_MISMATCH')
+  if (
+    code === 'DUPLICATE_VERSION' ||
+    code === 'LISTING_REVOKED' ||
+    code === 'KIND_MISMATCH' ||
+    code === 'INSTALL_CONFLICT'
+  )
     return 409
   if (code === 'NOT_INSTALLABLE' || code === 'VERSION_NOT_FOUND') return 404
   return 400
@@ -229,7 +234,11 @@ export function makeMarketplaceAgentHandler(deps: MarketplaceAgentDeps): Marketp
             { error: { code: 'NOT_INSTALLABLE', message: '未上架或不存在' } },
             requestId,
           )
-        const v = await installApprovedVersion({ userId, versionId: detail.versionId })
+        const v = await installApprovedVersion({
+          userId,
+          versionId: detail.versionId,
+          scopeMode: 'preserve',
+        })
         let installedDeps = 0
         if (detail.kind === 'agent') {
           const depSlugs = Array.isArray((detail.manifest as { skillDeps?: unknown })?.skillDeps)
@@ -241,7 +250,12 @@ export function makeMarketplaceAgentHandler(deps: MarketplaceAgentDeps): Marketp
             const versions = await getApprovedSkillVersions(depSlugs)
             for (const depVid of versions.values()) {
               try {
-                await installApprovedVersion({ userId, versionId: depVid })
+                await installApprovedVersion({
+                  userId,
+                  versionId: depVid,
+                  agentIds: [v.slug],
+                  scopeMode: 'merge',
+                })
                 installedDeps++
               } catch {
                 /* skip a single failing dep */

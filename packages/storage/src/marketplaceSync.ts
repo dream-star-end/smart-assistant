@@ -21,6 +21,7 @@ import { dirname, join } from 'node:path'
 import { type AgentDef, type AgentsConfig, readAgentsConfig, writeAgentsConfig } from './config.js'
 import { paths } from './paths.js'
 import { marketplaceArtifactHash } from './skillEmbedding.js'
+import { SKILL_AGENT_SCOPE_FILE, normalizeSkillAgentScope } from './skillStore.js'
 
 const SLUG_RE = /^[a-z0-9][a-z0-9-]{1,63}$/
 
@@ -45,6 +46,7 @@ interface SyncSkill {
   version: string
   rawSkillMd: string
   artifactHash: string
+  agentIds: string[]
   /** 附属文本文件(references/assets/evals);独立 bundleHash 验证后才落盘。 */
   bundle?: Record<string, string>
   bundleHash?: string
@@ -108,6 +110,7 @@ async function fetchInstalled(
               version: o.version,
               rawSkillMd: o.rawSkillMd,
               artifactHash: o.artifactHash,
+              agentIds: normalizeSkillAgentScope(o.agentIds),
               ...(bundle && typeof o.bundleHash === 'string'
                 ? { bundle, bundleHash: o.bundleHash }
                 : {}),
@@ -167,13 +170,21 @@ async function reconcileSkills(installed: SyncSkill[]): Promise<void> {
       const skillDir = paths.hubSkillDir(s.slug)
       const st = await lstat(skillDir).catch(() => null)
       if (st?.isSymbolicLink()) continue
+      await mkdir(skillDir, { recursive: true })
       const mdPath = paths.hubSkillMd(s.slug)
       const cur = await readFile(mdPath, 'utf8').catch(() => null)
       if (cur !== s.rawSkillMd) {
-        await mkdir(skillDir, { recursive: true })
         const tmp = `${mdPath}.tmp-${process.pid}-${randomSuffix()}`
         await writeFile(tmp, s.rawSkillMd, 'utf8')
         await rename(tmp, mdPath)
+      }
+      const scopePath = join(skillDir, SKILL_AGENT_SCOPE_FILE)
+      const scopeContent = `${JSON.stringify({ agentIds: normalizeSkillAgentScope(s.agentIds) }, null, 2)}\n`
+      const curScope = await readFile(scopePath, 'utf8').catch(() => null)
+      if (curScope !== scopeContent) {
+        const tmpScope = `${scopePath}.tmp-${process.pid}-${randomSuffix()}`
+        await writeFile(tmpScope, scopeContent, 'utf8')
+        await rename(tmpScope, scopePath)
       }
       // 附属文件:独立验 bundleHash(不信 master 内容),验过才逐文件落盘;
       // 三个附属目录内不再被 bundle 引用的文件删除(uninstall/改版收敛)。

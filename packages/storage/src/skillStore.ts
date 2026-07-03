@@ -50,6 +50,7 @@ export const MAX_SKILL_DESCRIPTION_LENGTH = 1024
 const VALID_SKILL_NAME_RE = /^[a-z0-9][a-z0-9-]*$/
 const VALID_VERSION_RE = /^\d+\.\d+\.\d+$/
 const VALID_AGENT_ID_RE = /^[a-zA-Z0-9_-]+$/
+export const SKILL_AGENT_SCOPE_FILE = '.openclaude-agent-scope.json'
 
 export interface SkillFrontmatter {
   name: string
@@ -71,6 +72,7 @@ export interface SkillMetadata extends SkillFrontmatter {
   source: SkillSource // 'user' = self-authored; 'platform' = platform baseline/seed (ro)
   layer: SkillLayer // precise overlay layer
   writable: boolean // true iff editable/deletable through THIS store (shared, or legacy write-fallback)
+  agentIds: string[] // agents this skill applies to; missing legacy/marketplace scope defaults are normalized
 }
 
 export interface SkillContent extends SkillMetadata {
@@ -91,6 +93,12 @@ export interface SkillContent extends SkillMetadata {
  */
 export interface SkillViewOptions {
   includePlatform?: boolean
+}
+
+export type SkillScopeMode = 'runtime' | 'management'
+
+export interface SkillSaveOptions {
+  agentIds?: string[]
 }
 
 export interface SkillSearchResult extends SkillMetadata {
@@ -235,6 +243,49 @@ export function validateSkillName(name: string): { ok: boolean; error?: string }
   return { ok: true }
 }
 
+function defaultAgentScope(): string[] {
+  return [resolveDefaultAgentId()]
+}
+
+export function normalizeSkillAgentScope(
+  input: unknown,
+  fallback: readonly string[] = defaultAgentScope(),
+): string[] {
+  const raw = Array.isArray(input) ? input : fallback
+  const out: string[] = []
+  const seen = new Set<string>()
+  for (const item of raw) {
+    if (typeof item !== 'string') continue
+    const id = item.trim()
+    if (!id || !VALID_AGENT_ID_RE.test(id) || seen.has(id)) continue
+    seen.add(id)
+    out.push(id)
+  }
+  if (out.length > 0) return out
+  if (raw !== fallback) return normalizeSkillAgentScope(fallback, defaultAgentScope())
+  return defaultAgentScope()
+}
+
+export function validateSkillAgentScope(input: unknown): {
+  ok: boolean
+  agentIds?: string[]
+  error?: string
+} {
+  if (!Array.isArray(input)) return { ok: false, error: 'agentIds must be an array' }
+  const out: string[] = []
+  const seen = new Set<string>()
+  for (const item of input) {
+    if (typeof item !== 'string') return { ok: false, error: 'agentIds must be strings' }
+    const id = item.trim()
+    if (!id || !VALID_AGENT_ID_RE.test(id)) return { ok: false, error: `invalid agentId: ${id}` }
+    if (seen.has(id)) continue
+    seen.add(id)
+    out.push(id)
+  }
+  if (out.length === 0) return { ok: false, error: 'agentIds must not be empty' }
+  return { ok: true, agentIds: out }
+}
+
 // Minimal YAML frontmatter parser — no external dep, handles the subset we care about
 export function parseFrontmatter(raw: string): { meta: Partial<SkillFrontmatter>; body: string } {
   const fmMatch = raw.match(/^---\s*\n([\s\S]*?)\n---\s*\n?([\s\S]*)$/)
@@ -365,6 +416,17 @@ export interface SkillStoreOptions {
    */
   hubDir?: string
   /**
+   * Whether the shared root is writable through this store. Runtime stores for
+   * non-default agents read assigned shared skills but still write new self-authored
+   * skills into their private legacy dir.
+   */
+  sharedWritable?: boolean
+  /**
+   * Runtime mode filters shared/hub skills by `.openclaude-agent-scope.json`.
+   * Management mode lists/views all user/hub skills so the UI can edit ownership.
+   */
+  scopeMode?: SkillScopeMode
+  /**
    * User-level aggregation mode (for the agentId-less `/api/skills` surface).
    * When true, the legacy layer aggregates ALL agents' `agents/<id>/skills` dirs and
    * the per-agent agent-seed layer is NOT loaded. Requires sharedDir.
@@ -384,6 +446,12 @@ export class SkillStore {
   private readonly hubRoot: string | null
   /** Aggregate all agents' legacy dirs on read (user-level surface). */
   private readonly aggregateLegacy: boolean
+  /** True iff writes/deletes should target the shared root. */
+  private readonly writesToShared: boolean
+  /** Shared layer is editable from this store (management/default agent), or read-only (specialists). */
+  private readonly sharedWritable: boolean
+  /** Runtime filters shared/hub by agent scope; management sees all. */
+  private readonly scopeMode: SkillScopeMode
   /** Absolute write target: shared (when sharedRoot set) else per-agent legacy dir. */
   private readonly writeRoot: string
 
@@ -447,15 +515,18 @@ export class SkillStore {
     if (this.aggregateLegacy && !this.sharedRoot) {
       throw new Error('aggregateLegacy requires sharedDir')
     }
+    this.sharedWritable = opts.sharedWritable !== false
+    this.scopeMode = opts.scopeMode ?? 'runtime'
+    this.writesToShared = this.sharedRoot != null && this.sharedWritable
 
-    // Write target: shared if available, else the per-agent legacy dir (back-compat).
-    this.writeRoot = this.sharedRoot ?? paths.agentSkillsDir(agentId)
+    // Write target: shared if available+writable, else per-agent legacy dir (back-compat).
+    this.writeRoot = this.writesToShared ? (this.sharedRoot as string) : paths.agentSkillsDir(agentId)
   }
 
-  /** Legacy (read-only) roots: per-agent dir, or every agent's dir in aggregate mode. */
-  private async legacyRoots(): Promise<string[]> {
+  /** Legacy roots: per-agent dir, or every agent's dir in aggregate mode. */
+  private async legacyRoots(): Promise<Array<{ root: string; agentId: string }>> {
     if (!this.aggregateLegacy) {
-      return [paths.agentSkillsDir(this.agentId)]
+      return [{ root: paths.agentSkillsDir(this.agentId), agentId: this.agentId }]
     }
     const agentsDir = paths.agentsDir
     if (!existsSync(agentsDir)) return []
@@ -465,17 +536,17 @@ export class SkillStore {
     } catch {
       return []
     }
-    const roots: string[] = []
+    const roots: Array<{ root: string; agentId: string }> = []
     for (const entry of entries) {
       if (!entry.isDirectory()) continue
       if (!VALID_AGENT_ID_RE.test(entry.name)) continue
-      roots.push(paths.agentSkillsDir(entry.name))
+      roots.push({ root: paths.agentSkillsDir(entry.name), agentId: entry.name })
     }
     // Deterministic order: readdir() order is filesystem-dependent, and in aggregate
     // mode a same-named skill can now exist under >1 agent (per-agent isolation). Sort
     // by agent id so the aggregate view (main / /api/skills) is stable across calls —
     // the name-dedup then always keeps the same representative rather than a random one.
-    return roots.sort()
+    return roots.sort((a, b) => a.agentId.localeCompare(b.agentId))
   }
 
   async list(opts: SkillViewOptions = {}): Promise<SkillMetadata[]> {
@@ -501,12 +572,20 @@ export class SkillStore {
     }
     // 3) shared (user-level write source)
     if (this.sharedRoot) {
-      push(await this.scanRoot(this.sharedRoot, 'user', 'shared', true))
+      push(await this.scanRoot(this.sharedRoot, 'user', 'shared', this.sharedWritable))
     }
     // 4) legacy per-agent (read-only; write-fallback when no sharedRoot)
-    const legacyWritable = this.sharedRoot == null
+    const legacyWritable = !this.writesToShared
     for (const legacyRoot of await this.legacyRoots()) {
-      push(await this.scanRoot(legacyRoot, 'user', 'legacy', legacyWritable))
+      push(
+        await this.scanRoot(
+          legacyRoot.root,
+          'user',
+          'legacy',
+          legacyWritable && legacyRoot.agentId === this.agentId,
+          legacyRoot.agentId,
+        ),
+      )
     }
     // 5) hub (marketplace-installed, ro; lowest precedence — never shadows the above)
     if (this.hubRoot) {
@@ -520,6 +599,7 @@ export class SkillStore {
     source: SkillSource,
     layer: SkillLayer,
     writable: boolean,
+    ownerAgentId?: string,
   ): Promise<SkillMetadata[]> {
     if (!existsSync(rootDir)) return []
     let entries: Dirent[]
@@ -538,6 +618,8 @@ export class SkillStore {
         if (!raw) continue
         const { meta } = parseFrontmatter(raw)
         if (!meta.name || !meta.description) continue
+        const agentIds = await this.agentScopeForLayer(rootDir, entry.name, layer, ownerAgentId)
+        if (!this.scopeAllows(layer, agentIds)) continue
         result.push({
           name: meta.name,
           description: meta.description,
@@ -550,10 +632,38 @@ export class SkillStore {
           source,
           layer,
           writable,
+          agentIds,
         })
       } catch {}
     }
     return result
+  }
+
+  private async agentScopeForLayer(
+    rootDir: string,
+    name: string,
+    layer: SkillLayer,
+    ownerAgentId?: string,
+  ): Promise<string[]> {
+    if (layer === 'legacy' && ownerAgentId) return [ownerAgentId]
+    if (layer === 'agent-seed') return [this.agentId]
+    if (layer === 'shared' || layer === 'hub') {
+      const raw = await this.safeReadFile(join(rootDir, name, SKILL_AGENT_SCOPE_FILE), rootDir)
+      if (!raw) return defaultAgentScope()
+      try {
+        const parsed = JSON.parse(raw) as { agentIds?: unknown }
+        return normalizeSkillAgentScope(parsed.agentIds, defaultAgentScope())
+      } catch {
+        return defaultAgentScope()
+      }
+    }
+    return defaultAgentScope()
+  }
+
+  private scopeAllows(layer: SkillLayer, agentIds: readonly string[]): boolean {
+    if (this.scopeMode === 'management') return true
+    if (layer !== 'shared' && layer !== 'hub') return true
+    return agentIds.includes(this.agentId)
   }
 
   /**
@@ -580,6 +690,17 @@ export class SkillStore {
     const skillMd = join(rootDir, name, 'SKILL.md')
     const raw = await this.safeReadFile(skillMd, rootDir)
     return raw !== null
+  }
+
+  private async scopedRootHas(
+    rootDir: string | null,
+    name: string,
+    layer: SkillLayer,
+    ownerAgentId?: string,
+  ): Promise<boolean> {
+    if (!(await this.rootHas(rootDir, name)) || !rootDir) return false
+    const agentIds = await this.agentScopeForLayer(rootDir, name, layer, ownerAgentId)
+    return this.scopeAllows(layer, agentIds)
   }
 
   /**
@@ -636,17 +757,32 @@ export class SkillStore {
         false,
       )
     }
-    if (await this.rootHas(this.sharedRoot, name)) {
-      return this.viewFromRoot(name, subfile, this.sharedRoot as string, 'user', 'shared', true)
+    if (await this.scopedRootHas(this.sharedRoot, name, 'shared')) {
+      return this.viewFromRoot(
+        name,
+        subfile,
+        this.sharedRoot as string,
+        'user',
+        'shared',
+        this.sharedWritable,
+      )
     }
-    const legacyWritable = this.sharedRoot == null
+    const legacyWritable = !this.writesToShared
     for (const legacyRoot of await this.legacyRoots()) {
-      if (await this.rootHas(legacyRoot, name)) {
-        return this.viewFromRoot(name, subfile, legacyRoot, 'user', 'legacy', legacyWritable)
+      if (await this.scopedRootHas(legacyRoot.root, name, 'legacy', legacyRoot.agentId)) {
+        return this.viewFromRoot(
+          name,
+          subfile,
+          legacyRoot.root,
+          'user',
+          'legacy',
+          legacyWritable && legacyRoot.agentId === this.agentId,
+          legacyRoot.agentId,
+        )
       }
     }
     // hub (marketplace-installed, ro) — lowest read priority
-    if (await this.rootHas(this.hubRoot, name)) {
+    if (await this.scopedRootHas(this.hubRoot, name, 'hub')) {
       return this.viewFromRoot(name, subfile, this.hubRoot as string, 'user', 'hub', false)
     }
     return null
@@ -659,6 +795,7 @@ export class SkillStore {
     source: SkillSource,
     layer: SkillLayer,
     writable: boolean,
+    ownerAgentId?: string,
   ): Promise<SkillContent | string | null> {
     if (subfile) {
       const base = resolve(join(rootDir, name))
@@ -672,6 +809,7 @@ export class SkillStore {
     const { meta, body } = parseFrontmatter(raw)
     if (!meta.name || !meta.description) return null
     const files = await this.listSkillFiles(rootDir, name)
+    const agentIds = await this.agentScopeForLayer(rootDir, name, layer, ownerAgentId)
     return {
       name: meta.name,
       description: meta.description,
@@ -686,6 +824,7 @@ export class SkillStore {
       source,
       layer,
       writable,
+      agentIds,
       files,
     }
   }
@@ -752,7 +891,7 @@ export class SkillStore {
     // redirect a specialized agent's saves into another agent's dir or the shared
     // library (which would defeat the cross-agent isolation). Shared writeRoot is
     // validated within-home in the constructor and intentionally cross-agent.
-    if (this.sharedRoot == null) {
+    if (!this.writesToShared) {
       const expected = join(realHome, relative(paths.home, this.writeRoot))
       if (realWrite !== expected) {
         return { ok: false, error: 'per-agent skills root must not traverse a symlink' }
@@ -761,9 +900,72 @@ export class SkillStore {
     return { ok: true }
   }
 
-  async save(meta: SkillFrontmatter, body: string): Promise<{ ok: boolean; error?: string }> {
+  private async writeAgentScope(
+    rootDir: string,
+    name: string,
+    agentIds: readonly string[],
+  ): Promise<{ ok: boolean; error?: string }> {
+    const scopeCheck = validateSkillAgentScope(agentIds)
+    if (!scopeCheck.ok || !scopeCheck.agentIds) return { ok: false, error: scopeCheck.error }
+    const skillDir = join(rootDir, name)
+    if (!existsSync(join(skillDir, 'SKILL.md'))) {
+      return { ok: false, error: 'skill not found' }
+    }
+    const realRoot = await realpath(rootDir)
+    const realSkillDir = await realpath(skillDir)
+    if (!realSkillDir.startsWith(realRoot + sep)) {
+      return { ok: false, error: 'skill directory resolves outside skills root' }
+    }
+    const target = join(realSkillDir, SKILL_AGENT_SCOPE_FILE)
+    if (existsSync(target)) {
+      const st = await lstat(target)
+      if (st.isSymbolicLink()) return { ok: false, error: 'scope sidecar is a symlink' }
+    }
+    const tmp = join(realSkillDir, `.${SKILL_AGENT_SCOPE_FILE}.tmp-${randomUUID()}`)
+    try {
+      await writeFile(
+        tmp,
+        `${JSON.stringify({ agentIds: scopeCheck.agentIds }, null, 2)}\n`,
+        'utf8',
+      )
+      await rename(tmp, target)
+    } catch (err) {
+      await rm(tmp, { force: true }).catch(() => {})
+      throw err
+    }
+    return { ok: true }
+  }
+
+  async setAgentScope(
+    name: string,
+    agentIds: readonly string[],
+  ): Promise<{ ok: boolean; error?: string }> {
+    const v = validateSkillName(name)
+    if (!v.ok) return { ok: false, error: v.error }
+    const scopeCheck = validateSkillAgentScope(agentIds)
+    if (!scopeCheck.ok || !scopeCheck.agentIds) return { ok: false, error: scopeCheck.error }
+    if (!this.writesToShared || !this.sharedRoot) {
+      return { ok: false, error: 'skill scope can only be edited for writable shared skills' }
+    }
+    if (!(await this.rootHas(this.sharedRoot, name))) {
+      return { ok: false, error: 'skill not found in writable shared library' }
+    }
+    return this.writeAgentScope(this.sharedRoot, name, scopeCheck.agentIds)
+  }
+
+  async save(
+    meta: SkillFrontmatter,
+    body: string,
+    options: SkillSaveOptions = {},
+  ): Promise<{ ok: boolean; error?: string }> {
     const v = validateSkillName(meta.name)
     if (!v.ok) return { ok: false, error: v.error }
+    let requestedAgentIds: string[] | undefined
+    if (options.agentIds !== undefined) {
+      const scopeCheck = validateSkillAgentScope(options.agentIds)
+      if (!scopeCheck.ok || !scopeCheck.agentIds) return { ok: false, error: scopeCheck.error }
+      requestedAgentIds = scopeCheck.agentIds
+    }
     // Reserved-name guards: platform layers are authoritative; users must pick a
     // different name (otherwise their write would be shadowed and invisible).
     if (await this.rootHas(this.baselineRoot, meta.name)) {
@@ -782,7 +984,7 @@ export class SkillStore {
     // name — otherwise the shared skill would be shadowed (agent-seed > shared) and
     // invisible for that agent. This covers the agentId-less /api/skills path (whose
     // store has no agentSeedRoot) and per-agent stores writing to shared alike.
-    if (this.sharedRoot && (await this.anyAgentSeedHas(meta.name))) {
+    if (this.writesToShared && (await this.anyAgentSeedHas(meta.name))) {
       return {
         ok: false,
         error: `name '${meta.name}' reserved for a platform agent-seed skill — choose a different name`,
@@ -870,6 +1072,12 @@ export class SkillStore {
     } catch (err) {
       await rm(tmpMd, { force: true }).catch(() => {})
       throw err
+    }
+    if (this.writesToShared) {
+      const agentIds =
+        requestedAgentIds ?? (await this.agentScopeForLayer(this.writeRoot, meta.name, 'shared'))
+      const scopeWrite = await this.writeAgentScope(this.writeRoot, meta.name, agentIds)
+      if (!scopeWrite.ok) return scopeWrite
     }
     return { ok: true }
   }
@@ -1069,7 +1277,7 @@ export class SkillStore {
 
     // Shared mode: always sweep legacy residue across all agents.
     let legacyRemoved = 0
-    if (this.sharedRoot) {
+    if (this.writesToShared) {
       legacyRemoved = await this.cleanLegacyResidue(name)
     }
 
@@ -1083,7 +1291,7 @@ export class SkillStore {
     if (baselineExists || seedExists) {
       return { ok: true, note: `removed user copy; platform skill '${name}' remains` }
     }
-    if (this.sharedRoot && !writeExists && legacyRemoved > 0) {
+    if (this.writesToShared && !writeExists && legacyRemoved > 0) {
       return { ok: true, note: 'removed legacy residue' }
     }
     return { ok: true }
@@ -1161,7 +1369,12 @@ export function buildAgentSkillStore(agentId: string): SkillStore {
     // Default/generalist agent → aggregate view (same wiring as buildUserSkillStore).
     const sharedDir = paths.sharedSkillsDir
     try {
-      return new SkillStore(agentId, { baselineDir, sharedDir, aggregateLegacy: true, hubDir })
+      return new SkillStore(agentId, {
+        baselineDir,
+        sharedDir,
+        aggregateLegacy: true,
+        hubDir,
+      })
     } catch {
       try {
         return new SkillStore(agentId, { sharedDir, aggregateLegacy: true, hubDir })
@@ -1171,15 +1384,27 @@ export function buildAgentSkillStore(agentId: string): SkillStore {
     }
   }
 
-  // Specialized agent → scoped to baseline + its own per-agent skills. NO sharedDir,
-  // so writeRoot falls back to agents/<id>/skills and the shared layer is never
-  // scanned — other agents' self-authored skills stay invisible.
+  // Specialized agent → baseline + seed + assigned shared skills + its own
+  // per-agent skills. Shared is read-only here; self-authored skill_save writes to
+  // agents/<id>/skills and remains private unless the user later changes ownership.
   const agentSeedDir = paths.agentSeedSkillsDir(agentId)
+  const sharedDir = paths.sharedSkillsDir
   try {
-    return new SkillStore(agentId, { baselineDir, agentSeedDir, hubDir })
+    return new SkillStore(agentId, {
+      baselineDir,
+      agentSeedDir,
+      sharedDir,
+      sharedWritable: false,
+      hubDir,
+    })
   } catch {
     try {
-      return new SkillStore(agentId, { agentSeedDir, hubDir })
+      return new SkillStore(agentId, {
+        agentSeedDir,
+        sharedDir,
+        sharedWritable: false,
+        hubDir,
+      })
     } catch {
       return new SkillStore(agentId)
     }
@@ -1197,10 +1422,21 @@ export function buildUserSkillStore(agentId = 'main'): SkillStore {
   const sharedDir = paths.sharedSkillsDir
   const hubDir = join(paths.hubDir, 'skills')
   try {
-    return new SkillStore(agentId, { baselineDir, sharedDir, aggregateLegacy: true, hubDir })
+    return new SkillStore(agentId, {
+      baselineDir,
+      sharedDir,
+      aggregateLegacy: true,
+      hubDir,
+      scopeMode: 'management',
+    })
   } catch {
     try {
-      return new SkillStore(agentId, { sharedDir, aggregateLegacy: true, hubDir })
+      return new SkillStore(agentId, {
+        sharedDir,
+        aggregateLegacy: true,
+        hubDir,
+        scopeMode: 'management',
+      })
     } catch {
       return new SkillStore(agentId)
     }

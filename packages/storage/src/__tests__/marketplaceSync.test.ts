@@ -62,13 +62,14 @@ function skillMd(slug: string, description: string, body = 'do the thing'): stri
 }
 
 /** Install one approved skill; artifactHash computed with the shared normalization. */
-function syncPayload(skills: Array<{ slug: string; md: string; hash?: string }>): unknown {
+function syncPayload(skills: Array<{ slug: string; md: string; hash?: string; agentIds?: string[] }>): unknown {
   return {
     skills: skills.map((s) => ({
       slug: s.slug,
       version: '1.0.0',
       rawSkillMd: s.md,
       artifactHash: s.hash ?? marketplaceArtifactHash(s.md),
+      ...(s.agentIds ? { agentIds: s.agentIds } : {}),
     })),
   }
 }
@@ -111,6 +112,20 @@ describe('syncMarketplaceHub', () => {
     assert.ok(found, 'installed skill should surface in SkillStore.list (static prompt)')
     assert.equal(found?.layer, 'hub')
     assert.equal(found?.writable, false)
+    assert.deepEqual(found?.agentIds, ['main'])
+  })
+
+  it('writes hub scope sidecar and only exposes a skill to selected agents', async () => {
+    const md = skillMd('office-only-hub', 'office scoped')
+    fetchPayload = syncPayload([{ slug: 'office-only-hub', md, agentIds: ['office-assistant'] }])
+
+    await syncMarketplaceHub()
+
+    const sidecar = join(paths.hubSkillDir('office-only-hub'), '.openclaude-agent-scope.json')
+    assert.ok(existsSync(sidecar), 'scope sidecar should exist in hub')
+    assert.deepEqual(JSON.parse(await readFile(sidecar, 'utf8')).agentIds, ['office-assistant'])
+    assert.ok((await buildAgentSkillStore('office-assistant').list()).some((s) => s.name === 'office-only-hub'))
+    assert.ok(!(await buildAgentSkillStore('main').list()).some((s) => s.name === 'office-only-hub'))
   })
 
   it('removes a skill that is no longer installed (uninstall / revoke kill-switch)', async () => {

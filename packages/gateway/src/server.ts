@@ -51,6 +51,7 @@ import {
   TaskStore,
   buildAgentSkillStore,
   buildUserSkillStore,
+  validateSkillAgentScope,
   paths,
   readAgentsConfig,
   readConfig,
@@ -5071,6 +5072,21 @@ export class Gateway {
     this.sendJson(res, 200, { ok: true })
   }
 
+  private async validateSkillAgentScopeInput(input: unknown): Promise<string[] | { error: string }> {
+    const parsed = validateSkillAgentScope(input)
+    if (!parsed.ok || !parsed.agentIds) return { error: parsed.error ?? 'invalid agentIds' }
+    let cfg: AgentsConfig
+    try {
+      cfg = await this._getAgentsConfig()
+    } catch {
+      cfg = { agents: [{ id: 'main' }], routes: [], default: 'main' }
+    }
+    const allowed = new Set<string>(['main', cfg.default, ...(cfg.agents ?? []).map((a) => a.id)])
+    const bad = parsed.agentIds.find((id) => !allowed.has(id))
+    if (bad) return { error: `unknown agentId: ${bad}` }
+    return parsed.agentIds
+  }
+
   // GET/PUT/DELETE /api/skills/:name — user-level skill item. Writes/deletes go to
   // the shared library (delete also sweeps same-named legacy residue across agents).
   private async handleUserSkillItem(
@@ -5103,10 +5119,28 @@ export class Gateway {
         description?: string
         body?: string
         tags?: string[]
+        agentIds?: unknown
       }>(req)
+      const hasDescription = Object.prototype.hasOwnProperty.call(body, 'description')
+      const hasBody = Object.prototype.hasOwnProperty.call(body, 'body')
+      const hasTags = Object.prototype.hasOwnProperty.call(body, 'tags')
+      const hasAgentIds = Object.prototype.hasOwnProperty.call(body, 'agentIds')
+      let agentIds: string[] | undefined
+      if (hasAgentIds) {
+        const scope = await this.validateSkillAgentScopeInput(body.agentIds)
+        if (!Array.isArray(scope)) return this.sendError(res, 400, scope.error)
+        agentIds = scope
+      }
+      if (hasAgentIds && !hasDescription && !hasBody && !hasTags) {
+        const r = await store.setAgentScope(skillName, agentIds as string[])
+        if (!r.ok) return this.sendError(res, 400, r.error ?? 'save failed')
+        this.sendJson(res, 200, { ok: true })
+        return
+      }
       const r = await store.save(
         { name: skillName, description: body.description ?? '', tags: body.tags },
         body.body ?? '',
+        agentIds ? { agentIds } : undefined,
       )
       if (!r.ok) return this.sendError(res, 400, r.error ?? 'save failed')
       this.sendJson(res, 200, { ok: true })

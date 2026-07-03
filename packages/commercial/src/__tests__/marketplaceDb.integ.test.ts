@@ -37,6 +37,7 @@ import {
   recordUninstall,
   reviewVersion,
   revokeListing,
+  updateInstalledAgentScope,
 } from '../marketplace/marketplaceDb.js'
 
 const TEST_DB_URL =
@@ -342,6 +343,43 @@ describe('marketplaceDb (integ)', () => {
       [installer],
     )
     assert.equal(activeRows.rows[0].n, '1')
+  })
+
+  test('skill install scope defaults to main, can replace, merge, and feeds sync', async (t) => {
+    if (skipIfNoPg(t)) return
+    const owner = await createUser('owner@x.com')
+    const admin = await createUser('admin@x.com')
+    const installer = await createUser('inst@x.com')
+    const p = buildPublish('scoped-skill', owner)
+    const { versionId } = await publishSkillVersion(p)
+    await reviewVersion({ versionId, reviewerUserId: admin, approve: true })
+
+    await installApprovedVersion({ userId: installer, versionId })
+    assert.deepEqual((await listInstalled(installer))[0].agentIds, ['main'])
+    assert.deepEqual((await listActiveInstalledArtifacts(installer))[0].agentIds, ['main'])
+
+    await updateInstalledAgentScope(installer, 'scoped-skill', ['office-assistant'])
+    assert.deepEqual((await listInstalled(installer))[0].agentIds, ['office-assistant'])
+    assert.deepEqual((await listActiveInstalledArtifacts(installer))[0].agentIds, ['office-assistant'])
+
+    await installApprovedVersion({
+      userId: installer,
+      versionId,
+      agentIds: ['research-assistant'],
+      scopeMode: 'merge',
+    })
+    assert.deepEqual((await listInstalled(installer))[0].agentIds, [
+      'office-assistant',
+      'research-assistant',
+    ])
+
+    await installApprovedVersion({
+      userId: installer,
+      versionId,
+      agentIds: ['main'],
+      scopeMode: 'replace',
+    })
+    assert.deepEqual((await listInstalled(installer))[0].agentIds, ['main'])
   })
 
   test('installing a superseded (non-current) version is refused', async (t) => {

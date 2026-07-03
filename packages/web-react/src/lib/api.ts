@@ -1265,7 +1265,11 @@ export const api = {
     ),
 
   /** 更新技能(描述/正文/标签;PUT /api/skills/:name,旧版自动入 history)。 */
-  updateSkill: (a: AuthSession, name: string, body: { description: string; body: string; tags?: string[] }) =>
+  updateSkill: (
+    a: AuthSession,
+    name: string,
+    body: { description?: string; body?: string; tags?: string[]; agentIds?: string[] },
+  ) =>
     jsonOrThrow<{ ok: boolean }>(
       callWithRefresh(a, (t) =>
         fetch(`/api/skills/${encodeURIComponent(name)}`, {
@@ -1504,14 +1508,27 @@ export const api = {
     ).then((b) => b.detail),
 
   /** 安装一个已批准版本（POST /api/marketplace/install）。 */
-  installMarketplace: (a: AuthSession, versionId: string) =>
+  installMarketplace: (a: AuthSession, versionId: string, agentIds?: string[]) =>
     jsonOrThrow<{ ok: boolean; slug: string; version: string; note: string }>(
       callWithRefresh(a, (t) =>
         fetch("/api/marketplace/install", {
           method: "POST",
           credentials: "include",
           headers: bearerHeaders(t, true),
-          body: JSON.stringify({ versionId }),
+          body: JSON.stringify({ versionId, ...(agentIds ? { agentIds } : {}) }),
+        }),
+      ),
+    ),
+
+  /** 修改已安装市场技能归属（PATCH /api/marketplace/installed/:slug）。 */
+  updateMarketplaceInstallAgents: (a: AuthSession, slug: string, agentIds: string[]) =>
+    jsonOrThrow<{ ok: boolean; agentIds: string[] }>(
+      callWithRefresh(a, (t) =>
+        fetch(`/api/marketplace/installed/${encodeURIComponent(slug)}`, {
+          method: "PATCH",
+          credentials: "include",
+          headers: bearerHeaders(t, true),
+          body: JSON.stringify({ agentIds }),
         }),
       ),
     ),

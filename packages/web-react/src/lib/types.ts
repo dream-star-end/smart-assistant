@@ -504,6 +504,7 @@ export type SkillSummary = {
   /** 精确来源层（shared/legacy/hub…）；用于区分自建与市场安装。平台层后端已剔除。 */
   layer?: string;
   writable?: boolean;
+  agentIds?: string[];
 };
 
 /** 评测用例(skill 目录 evals/evals.json)。 */
@@ -677,6 +678,7 @@ export type MarketplaceInstalled = {
   versionId: string;
   name: string;
   artifactHash: string;
+  agentIds?: string[];
   installedAt: string;
   listingState: string;
   /** listing 当前上架版本（升级可见性；旧后端/无上架版本时缺省）。 */
