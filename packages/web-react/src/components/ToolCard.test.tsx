@@ -135,4 +135,228 @@ describe("ToolCard 二级分派 + 状态 (P5)", () => {
     expect(pre?.textContent).toContain("$ pwd");
     expect(pre?.textContent).toContain("/home");
   });
+
+  test("Codex MCP skill_search 解包为记忆工具卡，不展示 wrapper JSON", () => {
+    const started = {
+      type: "mcpToolCall",
+      id: "call_skill",
+      server: "openclaude_memory",
+      tool: "skill_search",
+      status: "inProgress",
+      arguments: { query: "literature-search", limit: 5 },
+      pluginId: null,
+      result: null,
+      error: null,
+      durationMs: null,
+    };
+    const completed = {
+      ...started,
+      status: "completed",
+      result: {
+        content: [{ type: "text", text: "Found 1 matching skill(s):\n\n### literature-search" }],
+        structuredContent: null,
+        _meta: null,
+      },
+      durationMs: 87,
+    };
+    render(
+      <ToolCard
+        message={{
+          toolName: "codex:mcpToolCall",
+          inputJson: started,
+          inputPreview: JSON.stringify(started),
+          output: JSON.stringify(completed),
+          _completed: true,
+        }}
+      />,
+    );
+    expect(screen.getByText("技能检索")).toBeInTheDocument();
+    expect(screen.getByText("literature-search")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button"));
+    expect(screen.getByText("query")).toBeInTheDocument();
+    expect(screen.getByText(/Found 1 matching skill/)).toBeInTheDocument();
+    const text = document.body.textContent || "";
+    expect(text).not.toContain("codex:mcpToolCall");
+    expect(text).not.toContain("mcpToolCall");
+    expect(text).not.toContain("pluginId");
+    expect(text).not.toContain("structuredContent");
+  });
+
+  test("Codex MCP failed web-context 显示友好标签、参数与错误文本", () => {
+    const started = {
+      type: "mcpToolCall",
+      id: "call_web",
+      server: "web-context",
+      tool: "web_context_extract_url",
+      status: "inProgress",
+      arguments: { url: "https://example.com", max_chars: 2000 },
+    };
+    const failed = {
+      ...started,
+      status: "failed",
+      result: { content: [{ type: "text", text: '{ "ok": false, "error": "Invalid IP address: undefined" }' }] },
+      durationMs: 352,
+    };
+    render(
+      <ToolCard
+        message={{
+          toolName: "codex:mcpToolCall",
+          inputJson: started,
+          output: JSON.stringify(failed),
+          _completed: true,
+        }}
+      />,
+    );
+    expect(screen.getByText("网页提取")).toBeInTheDocument();
+    expect(screen.getByText("失败")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button"));
+    expect(screen.getByText("url")).toBeInTheDocument();
+    expect(screen.getAllByText("https://example.com").length).toBeGreaterThanOrEqual(1);
+    expect(screen.getByText(/Invalid IP address/)).toBeInTheDocument();
+  });
+
+  test("Codex MCP 运行中只展示 args，不展示空 result wrapper", () => {
+    const started = {
+      type: "mcpToolCall",
+      id: "call_running",
+      server: "openclaude_memory",
+      tool: "skill_search",
+      status: "inProgress",
+      arguments: { query: "browser" },
+      pluginId: null,
+      result: null,
+    };
+    const { container } = render(
+      <ToolCard message={{ toolName: "codex:mcpToolCall", inputJson: started, _completed: false }} />,
+    );
+    expect(container.querySelector(".animate-spin")).toBeInTheDocument();
+    expect(screen.getByText("技能检索")).toBeInTheDocument();
+    expect(screen.getAllByText("browser").length).toBeGreaterThanOrEqual(1);
+    const text = document.body.textContent || "";
+    expect(text).not.toContain("pluginId");
+    expect(text).not.toContain("result");
+  });
+
+  test("Codex webSearch（含旧 Codex 前缀）复用 WebSearch 卡", () => {
+    const completed = { type: "webSearch", id: "ws", action: "search", query: "OpenClaude v5", results: 3 };
+    render(
+      <ToolCard
+        message={{
+          toolName: "Codex:webSearch",
+          inputJson: { type: "webSearch", id: "ws", action: "search", query: "OpenClaude v5" },
+          output: JSON.stringify(completed),
+          _completed: true,
+        }}
+      />,
+    );
+    expect(screen.getByText("网页搜索")).toBeInTheDocument();
+    expect(screen.getByText("OpenClaude v5")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button"));
+    expect(screen.getByText("results")).toBeInTheDocument();
+    expect(screen.getByText("3")).toBeInTheDocument();
+  });
+
+  test("Codex plan/todo_list 复用 TodoWrite 列表", () => {
+    render(
+      <ToolCard
+        message={{
+          toolName: "codex:plan",
+          inputJson: {
+            type: "plan",
+            steps: [
+              { text: "调研工具形态", status: "pending" },
+              { text: "实现适配", status: "pending" },
+            ],
+          },
+          output: JSON.stringify({
+            type: "todo_list",
+            items: [
+              { text: "调研工具形态", completed: true },
+              { text: "实现适配", completed: true },
+            ],
+          }),
+          _completed: true,
+        }}
+      />,
+    );
+    expect(screen.getByText("任务列表")).toBeInTheDocument();
+    expect(screen.getByText("2/2")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button"));
+    expect(screen.getByText("调研工具形态")).toBeInTheDocument();
+    expect(screen.getByText("实现适配")).toBeInTheDocument();
+  });
+
+  test("Codex image/context 简单 item 不 raw dump id/type wrapper", () => {
+    render(
+      <ToolCard
+        message={{
+          toolName: "codex:imageView",
+          inputJson: { type: "imageView", id: "img1", path: "/home/agent/.openclaude/uploads/a.png" },
+          _completed: true,
+        }}
+      />,
+    );
+    expect(screen.getByText("查看图片")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button"));
+    expect(screen.getAllByText("…/.openclaude/uploads/a.png").length).toBeGreaterThanOrEqual(1);
+    const text = document.body.textContent || "";
+    expect(text).not.toContain("imageView");
+    expect(text).not.toContain("img1");
+  });
+
+  test("Codex contextCompaction 合并 completed-only 字段", () => {
+    render(
+      <ToolCard
+        message={{
+          toolName: "codex:contextCompaction",
+          inputJson: { type: "contextCompaction", id: "ctx1" },
+          output: JSON.stringify({
+            type: "contextCompaction",
+            id: "ctx1",
+            tokensBefore: 12000,
+            tokensAfter: 7000,
+            note: "已压缩",
+          }),
+          _completed: true,
+        }}
+      />,
+    );
+    expect(screen.getByText("压缩上下文")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button"));
+    expect(screen.getByText("tokens before")).toBeInTheDocument();
+    expect(screen.getByText("12000")).toBeInTheDocument();
+    expect(screen.getByText("tokens after")).toBeInTheDocument();
+    expect(screen.getByText("7000")).toBeInTheDocument();
+    expect(screen.getByText("已压缩")).toBeInTheDocument();
+  });
+
+  test("Codex dynamicToolCall builtin 复用原生 Bash body", () => {
+    const started = {
+      type: "dynamicToolCall",
+      id: "dyn1",
+      name: "Bash",
+      status: "inProgress",
+      arguments: { command: "pwd" },
+    };
+    const completed = {
+      ...started,
+      status: "completed",
+      result: { content: [{ type: "text", text: "/home/agent" }] },
+    };
+    render(
+      <ToolCard
+        message={{
+          toolName: "codex:dynamicToolCall",
+          inputJson: started,
+          output: JSON.stringify(completed),
+          _completed: true,
+        }}
+      />,
+    );
+    expect(screen.getByText("终端")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button"));
+    const pre = document.querySelector("pre");
+    expect(pre?.textContent).toContain("$ pwd");
+    expect(pre?.textContent).toContain("/home/agent");
+  });
 });

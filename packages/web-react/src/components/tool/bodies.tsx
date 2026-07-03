@@ -2,14 +2,24 @@
  * 工具卡**展开体**的二级渲染器（Aurora 视觉，功能 parity 现网
  * `_renderToolBody` 及各 `_render*`）。每个 body 接收已解析的 input 与 tool 对象。
  *
- * v5 无 codex —— 不含 `_renderCodexItem` 系列。
+ * 含 v3/Codex 历史 item 的紧凑渲染；Codex MCP/dynamic wrapper 大多已在
+ * format 层归一化为 native builtin/MCP 工具。
  */
 import { Sparkles, FileText } from "lucide-react";
 import type { ReactNode } from "react";
 import { cn } from "../../lib/utils";
 import { Badge, Button } from "../ui";
 import { useToolCardActions } from "./context";
-import { asArr, asStr, clampStr, formatValue, isSafeHttpUrl, shortPath, type ToolLike } from "./format";
+import {
+  asArr,
+  asStr,
+  clampStr,
+  formatValue,
+  isSafeHttpUrl,
+  parseCodexTypeName,
+  shortPath,
+  type ToolLike,
+} from "./format";
 import { parseMcpName } from "./meta";
 import { researchToolCard } from "./researchCards";
 
@@ -293,7 +303,12 @@ function WebSearchBody({ input, tool }: BodyProps) {
     <>
       {input && (
         <KvList
-          obj={{ query: input.query, allowed_domains: input.allowed_domains, blocked_domains: input.blocked_domains }}
+          obj={{
+            query: input.query,
+            results: input.results,
+            allowed_domains: input.allowed_domains,
+            blocked_domains: input.blocked_domains,
+          }}
         />
       )}
       <OutputBlock output={tool.output} />
@@ -361,6 +376,64 @@ function VisionBody({ input, tool }: BodyProps) {
     <>
       {prompt && <PromptBlock>{prompt}</PromptBlock>}
       {input && <KvList obj={input} skip={["prompt", "question", "query"]} />}
+      <OutputBlock output={tool.output} />
+    </>
+  );
+}
+
+function CodexBody({ type, input, tool }: BodyProps & { type: string }) {
+  if (type === "imageView") {
+    const target = asStr(input?.path) || asStr(input?.url);
+    return (
+      <>
+        {target && <FileMeta>{shortPath(target)}</FileMeta>}
+        <OutputBlock output={tool.output} />
+      </>
+    );
+  }
+  if (type === "imageGeneration") {
+    const prompt = asStr(input?.prompt) || asStr(input?.revisedPrompt);
+    const savedPath = asStr(input?.savedPath) || asStr(input?.path) || asStr(input?.outputPath);
+    return (
+      <>
+        {prompt && <PromptBlock>{prompt}</PromptBlock>}
+        {savedPath && <FileMeta>{shortPath(savedPath)}</FileMeta>}
+        {input && <KvList obj={input} skip={["id", "type", "prompt", "revisedPrompt", "result"]} />}
+        <OutputBlock output={tool.output} />
+      </>
+    );
+  }
+  if (type === "contextCompaction") {
+    return (
+      <>
+        <KvList
+          obj={{
+            "tokens before": input?.tokensBefore ?? input?.beforeTokens,
+            "tokens after": input?.tokensAfter ?? input?.afterTokens,
+            note: input?.note || input?.summary,
+          }}
+        />
+        <OutputBlock output={tool.output} />
+      </>
+    );
+  }
+  if (type === "enteredReviewMode" || type === "exitedReviewMode") {
+    return (
+      <>
+        <StatusLine text={type === "enteredReviewMode" ? "已进入审阅模式" : "已退出审阅模式"} />
+        {(input?.note || input?.summary) && <PromptBlock>{asStr(input?.note) || asStr(input?.summary)}</PromptBlock>}
+        <OutputBlock output={tool.output} />
+      </>
+    );
+  }
+  return (
+    <>
+      {input && (
+        <KvList
+          obj={input}
+          skip={["id", "type", "pluginId", "result", "structuredContent", "_meta", "status", "durationMs"]}
+        />
+      )}
       <OutputBlock output={tool.output} />
     </>
   );
@@ -718,6 +791,8 @@ export function ToolBody({ name, input, tool }: { name: string; input: Input; to
     case "WebSearch":
       return <WebSearchBody input={input} tool={tool} />;
   }
+  const codexType = parseCodexTypeName(name);
+  if (codexType) return <CodexBody type={codexType} input={input} tool={tool} />;
   const mcp = parseMcpName(name);
   if (mcp) {
     if (mcp.server === "browser") return <BrowserBody op={mcp.op} input={input} tool={tool} />;
