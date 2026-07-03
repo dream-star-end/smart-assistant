@@ -1004,14 +1004,9 @@ export async function handleGetPublicConfig(
 // ─── GET /api/public/models ─────────────────────────────────────────
 // 公开路径,不限流、不需要登录;返回启用模型的公开视图(含 per-ktok 积分估价)。
 
-/**
- * P1f / v5 ccb 单底座:v5 channel 对外不暴露 gpt-* 模型(无 codex 底座);
- * v3 不过滤(现网保留 gpt 给存量用户)。直接读 env OC_RUNTIME_CHANNEL 作 channel 权威。
- */
-function dropGptForV5Channel<T extends { id: string }>(models: T[]): T[] {
-  if ((process.env.OC_RUNTIME_CHANNEL?.trim() || "v3") !== "v5") return models;
-  return models.filter((m) => !m.id.toLowerCase().startsWith("gpt-"));
-}
+// (P1f 的 dropGptForV5Channel 已随 codex 重接入删除 —— v5 有 codex 底座后,
+// 模型可见性回归单一权威:model_pricing.visibility + enabled(0049 语义),
+// 不再按 channel 硬编码剔除 gpt-*。engine 可用性由 gateway registry fail-closed 兜底。)
 
 export async function handleListPublicModels(
   req: IncomingMessage,
@@ -1035,7 +1030,7 @@ export async function handleListPublicModels(
   }
   const claims = token ? verifyCommercialJwtSync(token, deps.jwtSecret) : null;
   if (!claims) {
-    sendJson(res, 200, { models: dropGptForV5Channel(deps.pricing.listPublic()) });
+    sendJson(res, 200, { models: deps.pricing.listPublic() });
     return;
   }
   // 登录用户 —— 查一次 grants(per-user 表,无 NOTIFY 重载;每次请求查表是合理代价)
@@ -1043,9 +1038,7 @@ export async function handleListPublicModels(
   const grants = await listGrantsForUser(claims.sub);
   const grantedSet = new Set(grants.map((g) => g.model_id));
   sendJson(res, 200, {
-    models: dropGptForV5Channel(
-      deps.pricing.listForUser({ role: claims.role, grantedModelIds: grantedSet }),
-    ),
+    models: deps.pricing.listForUser({ role: claims.role, grantedModelIds: grantedSet }),
   });
 }
 
