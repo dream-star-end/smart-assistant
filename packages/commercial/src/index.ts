@@ -100,6 +100,7 @@ import {
   stopAndRemoveV3Container,
 } from "./agent-sandbox/v3supervisor.js";
 import { V3_AGENT_GID, V3_AGENT_UID } from "./agent-sandbox/constants.js";
+import { getCodexAccountRuntimeChannel } from "./codexAccountChannel.js";
 import {
   startPendingOrdersExpirer,
   type SweeperHandle as PendingOrdersExpirerHandle,
@@ -2684,10 +2685,10 @@ export async function registerCommercial(
               //            必须 mark vanished + docker rm 让 ensureRunning 重 provision
               //            重新走 picker 路径产出 per-container mount。
               // 池子查询条件必须与 pickCodexAccountForBinding 完全一致(provider='codex'
-              // AND status='active' AND runtime_channel='v3'),否则可能误判为"有账号"
+              // AND status='active' AND runtime_channel=<codex account channel>),否则可能误判为"有账号"
               // 但 picker 实际拿不到。0098 channel 划分:只数本 channel(v3)的行。
-              const poolParams: unknown[] = [];
-              const poolWhere = ["provider = 'codex'", "status = 'active'", "runtime_channel = 'v3'"];
+              const poolParams: unknown[] = [getCodexAccountRuntimeChannel()];
+              const poolWhere = ["provider = 'codex'", "status = 'active'", "runtime_channel = $1"];
               if (desiredGroupId !== null) {
                 poolParams.push(desiredGroupId);
                 poolWhere.push(`group_id = $${poolParams.length}`);

@@ -4,6 +4,7 @@ import type { PoolClient } from "pg";
 import { encrypt, decryptToBuffer } from "../crypto/aead.js";
 import { loadKmsKey, zeroBuffer } from "../crypto/keys.js";
 import { query, tx, type QueryRunner } from "../db/queries.js";
+import { getCodexAccountRuntimeChannel } from "../codexAccountChannel.js";
 
 export const ACCOUNT_GROUP_KINDS = ["official_oauth", "api_relay"] as const;
 export type AccountGroupKind = (typeof ACCOUNT_GROUP_KINDS)[number];
@@ -487,9 +488,10 @@ export async function hasActiveOfficialOAuthAccountInGroup(
 ): Promise<boolean> {
   const group = await getAccountGroup(groupId);
   if (!group || !group.enabled || group.kind !== "official_oauth" || group.provider !== provider) return false;
-  // 0098 channel 划分:codex 账号池权威按 runtime_channel 归属 —— codex 行
-  // 严格只认本 channel(v3 取不到 v5 行,fail-closed);claude 行维持共享池语义不过滤。
-  const codexChannel = provider === "codex" ? "v3" : null;
+  // 0098+ channel 划分:codex 账号池权威按 runtime_channel 归属。
+  // v3 默认只认 v3 行;设置 OC_CODEX_ACCOUNT_RUNTIME_CHANNEL=v5 时,
+  // 仅账号池读 v5 行,不改变 agent_containers/docker/volume 的 v3 身份。
+  const codexChannel = provider === "codex" ? getCodexAccountRuntimeChannel() : null;
   const res = await query<{ ok: number }>(
     `SELECT 1 AS ok
        FROM claude_accounts

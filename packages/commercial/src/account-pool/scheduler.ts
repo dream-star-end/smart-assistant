@@ -33,6 +33,7 @@ import { AeadError } from '../crypto/aead.js'
 import { loadKmsKey } from '../crypto/keys.js'
 import { getPool } from '../db/index.js'
 import { query } from '../db/queries.js'
+import { getCodexAccountRuntimeChannel } from '../codexAccountChannel.js'
 import type { AccountHealthTracker } from './health.js'
 import {
   type AccountPlan,
@@ -1154,7 +1155,10 @@ export class AccountScheduler {
     // 0098 channel 划分:codex 行按 runtime_channel 归属(v3 只见 v3 行,防跨
     // channel 消费);claude 行维持共享池语义不过滤。pick({provider:'codex'})
     // 当前无调用方(codex 走 pickCodexAccountForBindingInTx),这里是同口径防御。
-    if (provider === 'codex') where.push("runtime_channel = 'v3'")
+    if (provider === 'codex') {
+      params.push(getCodexAccountRuntimeChannel())
+      where.push(`runtime_channel = $${params.length}`)
+    }
     if (groupId !== null) {
       params.push(String(groupId))
       where.push(`group_id = $${params.length}`)
@@ -1668,10 +1672,12 @@ export async function pickCodexAccountForBindingInTx(
 
   const params: unknown[] = []
   const where = ["status = 'active'", "provider = 'codex'"]
-  // 0098 channel 划分:codex 账号池权威按 runtime_channel 归属,v3 picker 严格
-  // 只取 runtime_channel='v3' 的行 —— v3 绝不绑定/消费 v5 channel 的 codex 账号
-  // (防 v3/v5 双 master 共刷同一 codex OAuth 账号触发 refresh-token family 吊销)。
-  where.push("runtime_channel = 'v3'")
+  // 0098+ channel 划分:codex 账号池权威按 runtime_channel 归属,picker
+  // 使用 Codex account-pool channel。默认 v3;设置
+  // OC_CODEX_ACCOUNT_RUNTIME_CHANNEL=v5 时,v3 容器可消费 v5-owned 账号池,
+  // 但 agent_containers.runtime_channel 仍保持 v3。
+  params.push(getCodexAccountRuntimeChannel())
+  where.push(`runtime_channel = $${params.length}`)
   if (deps.groupId !== undefined && deps.groupId !== null) {
     params.push(String(deps.groupId))
     where.push(`group_id = $${params.length}`)
