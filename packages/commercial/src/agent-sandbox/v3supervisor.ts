@@ -63,7 +63,7 @@ import { AgentAppError } from "../compute-pool/nodeAgentClient.js";
 import { listAllHosts as defaultListAllHosts } from "../compute-pool/queries.js";
 import type { ComputeHostRow } from "../compute-pool/types.js";
 import { computeInboundNonce } from "../bridgeSecret.js";
-import { getRuntimeChannel } from "../runtimeChannel.js";
+import { getRuntimeChannel, type RuntimeChannel } from "../runtimeChannel.js";
 import { rootLogger } from "../logging/logger.js";
 import { V3_AGENT_GID, V3_AGENT_UID } from "./constants.js";
 import { SupervisorError } from "./types.js";
@@ -613,8 +613,8 @@ export function resolveCcbBaselineMounts(
 }
 
 /** managed label,GC / orphan reconcile 用 */
-const V3_MANAGED_LABEL_KEY = "com.openclaude.v3.managed";
-const V3_UID_LABEL_KEY = "com.openclaude.v3.uid";
+export const V3_MANAGED_LABEL_KEY = "com.openclaude.v3.managed";
+export const V3_UID_LABEL_KEY = "com.openclaude.v3.uid";
 
 /** IP 池 — 排除 .0 (network) / .1 (gateway) / .2-.9 (运维预留) / .255 (broadcast) */
 const V3_IP_OCTET_MIN = 10;
@@ -989,6 +989,33 @@ export function v3UserConfigVolumeNameFor(uid: number): string {
     throw new SupervisorError("InvalidArgument", `invalid uid: ${uid}`);
   }
   return `oc-${getRuntimeChannel()}-userconfig-u${uid}`;
+}
+
+/** 全部 5 个 per-user 卷的 role 键(= 卷名中缀);顺序即 ensureV3Volumes 建卷顺序。 */
+export const V3_VOLUME_ROLES = [
+  "data",
+  "proj",
+  "codex",
+  "userlocal",
+  "userconfig",
+] as const;
+export type V3VolumeRole = (typeof V3_VOLUME_ROLES)[number];
+
+/**
+ * 显式 channel 的 per-user 卷名(v3→v5 迁移等**跨 channel** 工具用)。与上面 5 个
+ * v3*VolumeNameFor 同一命名权威:`oc-<channel>-<role>-u<uid>`。区别仅在 channel 由参数
+ * 显式给出(而非 getRuntimeChannel()),使同一进程能同时构造 v3 源卷名与 v5 目标卷名。
+ * role='data' 等价 v3VolumeNameFor,'proj' 等价 v3ProjectsVolumeNameFor,以此类推。
+ */
+export function volumeNameForChannel(
+  channel: RuntimeChannel,
+  role: V3VolumeRole,
+  uid: number,
+): string {
+  if (!Number.isInteger(uid) || uid <= 0) {
+    throw new SupervisorError("InvalidArgument", `invalid uid: ${uid}`);
+  }
+  return `oc-${channel}-${role}-u${uid}`;
 }
 
 /**

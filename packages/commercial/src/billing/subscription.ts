@@ -158,6 +158,11 @@ async function insertPeriodLedger(
 /**
  * 幂等兜底：用户无订阅行时创建 free 行并发放免费档期内桶（写 'subscription' 流水）。
  * 已有行则 noop。读路径（/api/me、订阅视图、下单前）调用以保证恒有一行。
+ *
+ * v3→v5 抑制二次赠送（迁移 0100，boss 决策 2026-07-03）：首期 300 只对
+ * `users.free_bootstrap_settled = FALSE` 的用户发放（真·新注册）；存量 v3 用户在迁移
+ * backfill 时已置 TRUE → 建 free 行但发放 0，避免与 v3 注册欢迎金二次叠加。发放/抑制
+ * 与建行在同一事务、`SELECT ... FOR UPDATE` 锁 users 行串行化，防并发双发。
  */
 export async function ensureFreeSubscription(
   userId: bigint | number | string,
@@ -172,25 +177,42 @@ export async function ensureFreeSubscription(
   const free = await getPlan(FREE_PLAN_CODE);
   if (!free) throw new Error("free plan not configured");
   await tx(async (client) => {
+    // 锁定用户行读结算标记，使"读标记→决定发放→置位"与建订阅行原子（并发首访不双发）。
+    // 用户不存在（理论不该发生，调用方已鉴权）→ 保守视作已结算，只建 0 行兜底。
+    const urow = await client.query<{ free_bootstrap_settled: boolean }>(
+      "SELECT free_bootstrap_settled FROM users WHERE id = $1 FOR UPDATE",
+      [uid],
+    );
+    const settled = urow.rows[0]?.free_bootstrap_settled ?? true;
+    const grant = settled ? 0n : free.monthlyCredits;
     const ins = await client.query<{ id: string; period_credits: string }>(
       `INSERT INTO user_subscriptions
           (user_id, plan_code, status, period_start, period_end, period_credits)
        VALUES ($1, $2, 'active', NOW(), NOW() + ($3::int || ' days')::interval, $4)
        ON CONFLICT (user_id) DO NOTHING
        RETURNING id::text AS id, period_credits::text AS period_credits`,
-      [uid, FREE_PLAN_CODE, free.periodDays, free.monthlyCredits.toString()],
+      [uid, FREE_PLAN_CODE, free.periodDays, grant.toString()],
     );
-    if (ins.rows.length > 0 && free.monthlyCredits > 0n) {
-      // 新建免费订阅：发放首期 300（进期内桶），审计一条。
-      await insertPeriodLedger(
-        client,
-        uid,
-        free.monthlyCredits,
-        free.monthlyCredits,
-        "subscription",
-        null,
-        "free subscription bootstrap",
-      );
+    if (ins.rows.length > 0) {
+      if (grant > 0n) {
+        // 新建免费订阅且未抑制：发放首期 300（进期内桶），审计一条。
+        await insertPeriodLedger(
+          client,
+          uid,
+          grant,
+          grant,
+          "subscription",
+          null,
+          "free subscription bootstrap",
+        );
+      }
+      // 结算终态：首次建行即置位（未结算的新用户），已 TRUE 的存量用户无需再写。
+      if (!settled) {
+        await client.query(
+          "UPDATE users SET free_bootstrap_settled = TRUE, updated_at = NOW() WHERE id = $1",
+          [uid],
+        );
+      }
     }
   });
 }
