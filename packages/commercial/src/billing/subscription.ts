@@ -178,7 +178,8 @@ export async function ensureFreeSubscription(
   if (!free) throw new Error("free plan not configured");
   await tx(async (client) => {
     // 锁定用户行读结算标记，使"读标记→决定发放→置位"与建订阅行原子（并发首访不双发）。
-    // 用户不存在（理论不该发生，调用方已鉴权）→ 保守视作已结算，只建 0 行兜底。
+    // 用户不存在（理论不该发生，调用方已鉴权）→ settled 兜底 true（不发放）；随后 INSERT
+    // user_subscriptions 因 user_id FK 会失败抛错——即 fail-fast，不会静默产出脏数据。
     const urow = await client.query<{ free_bootstrap_settled: boolean }>(
       "SELECT free_bootstrap_settled FROM users WHERE id = $1 FOR UPDATE",
       [uid],

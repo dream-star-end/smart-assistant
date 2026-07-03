@@ -61,22 +61,39 @@ interface V3ContainerRow {
 
 /** 取该用户"当前" v3 容器行(active 优先,再取最新)。无 v3 footprint 返回 null。 */
 async function latestV3Container(uid: string): Promise<V3ContainerRow | null> {
+  // active 优先(最多一行,唯一索引保证);否则取最近活动过的那行(last_started_at 更能反映
+  // "当前/最后一次真正跑起来的容器落点",防历史残留 vanished 行选到错误 host)。
   const r = await query<V3ContainerRow>(
     `SELECT host_uuid, state FROM agent_containers
       WHERE user_id = $1 AND runtime_channel = 'v3'
-      ORDER BY (state = 'active') DESC, created_at DESC
+      ORDER BY (state = 'active') DESC,
+               COALESCE(last_started_at, created_at) DESC,
+               created_at DESC
       LIMIT 1`,
     [uid],
   );
   return r.rows[0] ?? null;
 }
 
+/** dockerode 错误是否 404(资源确实不存在)。区别于 daemon 不通/权限等真错。 */
+export function isDockerNotFound(err: unknown): boolean {
+  return (
+    typeof err === "object" && err !== null && (err as { statusCode?: number }).statusCode === 404
+  );
+}
+
+/** 返回卷 Mountpoint;卷确实不存在(404)→ null;其它错误(daemon 不通/权限)→ fail-closed 抛出。 */
 async function volumeMountpoint(docker: Docker, name: string): Promise<string | null> {
   try {
     const info = await docker.getVolume(name).inspect();
     return (info as { Mountpoint?: string }).Mountpoint ?? null;
-  } catch {
-    return null; // 卷不存在
+  } catch (err) {
+    if (isDockerNotFound(err)) return null; // 卷确实不存在,合法跳过
+    throw new Error(
+      `docker volume inspect ${name} 失败(非 404,fail-closed 不当作卷缺失): ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    );
   }
 }
 

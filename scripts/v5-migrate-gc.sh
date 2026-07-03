@@ -20,8 +20,9 @@ while [ $# -gt 0 ]; do
     *) echo "unknown arg: $1"; exit 2;;
   esac
 done
-case "$WINDOW" in *d) INTERVAL="${WINDOW%d} days";; *h) INTERVAL="${WINDOW%h} hours";;
-  *) echo "--older-than 需形如 7d / 24h"; exit 2;; esac
+# 严格校验:纯数字 + d/h,防运维参数注入 SQL interval 字符串。
+[[ "$WINDOW" =~ ^[0-9]+[dh]$ ]] || { echo "--older-than 需形如 7d / 24h(纯数字+d/h)"; exit 2; }
+case "$WINDOW" in *d) INTERVAL="${WINDOW%d} days";; *h) INTERVAL="${WINDOW%h} hours";; esac
 
 command -v docker >/dev/null 2>&1 || { echo "需要 docker CLI"; exit 2; }
 

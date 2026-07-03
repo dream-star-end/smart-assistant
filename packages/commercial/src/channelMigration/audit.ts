@@ -58,11 +58,17 @@ export async function withAudit<T>(
   const handle = await auditStart(userId, phase, startDetail);
   try {
     const { result, detail } = await fn(handle);
-    await auditFinish(handle, "ok", detail);
+    // 审计收尾是 best-effort:业务已成功(如 cutover 已 markMigrated),审计写失败绝不能把
+    // 成功当失败重抛(否则调用方误判、可能重复迁移)。降级为 stderr 告警。
+    await auditFinish(handle, "ok", detail).catch((e) => {
+      console.error(`[v5-migration-audit] finish(ok) 写失败(phase=${phase}): ${e}`);
+    });
     return result;
   } catch (err) {
     await auditFinish(handle, "error", {
       error: err instanceof Error ? err.message : String(err),
+    }).catch((e) => {
+      console.error(`[v5-migration-audit] finish(error) 写失败(phase=${phase}): ${e}`);
     });
     throw err;
   }

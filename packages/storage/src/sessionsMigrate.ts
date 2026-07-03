@@ -90,7 +90,10 @@ export async function migrateUserClientSessionsFromV3(
                deleted_at    = excluded.deleted_at,
                next_seq      = MAX(client_sessions.next_seq, excluded.next_seq),
                origin_channel= excluded.origin_channel
-             WHERE excluded.updated_at >= client_sessions.updated_at`,
+             -- 跨租户防线:session id 若与其它用户的行碰撞,不得覆盖(与 sessionsDb 主写路径同款
+             -- user_id guard)。excluded.user_id 恒 = @uid(SELECT 已按 user_id 过滤)。
+             WHERE client_sessions.user_id = excluded.user_id
+               AND excluded.updated_at >= client_sessions.updated_at`,
           )
           .run({ uid }).changes
       })

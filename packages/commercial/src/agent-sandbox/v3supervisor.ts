@@ -63,6 +63,7 @@ import { AgentAppError } from "../compute-pool/nodeAgentClient.js";
 import { listAllHosts as defaultListAllHosts } from "../compute-pool/queries.js";
 import type { ComputeHostRow } from "../compute-pool/types.js";
 import { computeInboundNonce } from "../bridgeSecret.js";
+import { v3MayServe } from "../channelMigration/channelState.js";
 import { getRuntimeChannel, type RuntimeChannel } from "../runtimeChannel.js";
 import { rootLogger } from "../logging/logger.js";
 import { V3_AGENT_GID, V3_AGENT_UID } from "./constants.js";
@@ -1625,6 +1626,17 @@ export async function provisionV3Container(
   }
   if (typeof deps.image !== "string" || deps.image.trim() === "") {
     throw new SupervisorError("InvalidArgument", "deps.image (OC_RUNTIME_IMAGE) is required");
+  }
+
+  // v3→v5 迁移门控:仅 v3 channel 生效。已迁移(migrated)/迁移进行中(migrating)的用户,
+  // v3 不得再为其建/重建容器 —— 否则会重新成为该用户卷的写者、破坏卷迁移一致性,或与已在
+  // v5 的权威撞车。默认(未迁移,v5_migrated_at IS NULL)→ 放行,现网零影响。v5 channel 恒
+  // 放行(v5 正应服务迁移过来的用户)。见 channelMigration/channelState:v3MayServe。
+  if (getRuntimeChannel() === "v3") {
+    const gate = await v3MayServe(uid);
+    if (!gate.ok) {
+      throw new SupervisorError("MigratedToV5", `v3 不再服务该用户(uid=${uid}): ${gate.reason}`);
+    }
   }
 
   const containerName = v3ContainerNameFor(uid);

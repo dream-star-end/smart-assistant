@@ -17,6 +17,7 @@ import {
   markMigrating,
   markSeeding,
   migratedUserIds,
+  releaseSeeding,
   rollbackToV3,
 } from '../channelMigration/channelState.js'
 import { ensureFreeSubscription, getUserSubscription } from '../billing/subscription.js'
@@ -97,17 +98,38 @@ describe('channelState 状态机', () => {
     assert.equal(st?.status, null)
   })
 
-  test('全程生命周期 seeding→migrating→migrated,权威随之翻转', async (t) => {
+  test('全程生命周期 seeding→release→migrating→migrated,权威随之翻转', async (t) => {
     if (skipIfNoPg(t)) return
     const uid = await createUser('b@x.com')
     assert.equal((await markSeeding(uid)).applied, true)
     assert.equal(await isMigratedToV5(uid), false, 'seeding 未翻转权威')
+    assert.equal((await releaseSeeding(uid)).applied, true, 'preseed 结束释放 seeding')
     assert.equal((await markMigrating(uid)).applied, true)
     assert.equal(await isMigratedToV5(uid), false, 'migrating 未翻转权威')
     assert.equal((await markMigrated(uid)).applied, true)
     assert.equal(await isMigratedToV5(uid), true, 'migrated 翻转权威到 v5')
     const st = await getChannelState(uid)
     assert.ok(st?.migratedAt instanceof Date)
+  })
+
+  test('互斥:seeding 进行中 markMigrating 被拒;release 后可进', async (t) => {
+    if (skipIfNoPg(t)) return
+    const uid = await createUser('mx@x.com')
+    assert.equal((await markSeeding(uid)).applied, true)
+    const blocked = await markMigrating(uid)
+    assert.equal(blocked.applied, false, 'preseed 持有 seeding 时 cutover 应被互斥拒绝')
+    assert.equal(blocked.status, 'seeding')
+    assert.equal((await releaseSeeding(uid)).applied, true)
+    assert.equal((await markMigrating(uid)).applied, true, 'release 后可进 migrating')
+  })
+
+  test('releaseSeeding 只清 seeding,绝不动 migrating(防清掉 cutover)', async (t) => {
+    if (skipIfNoPg(t)) return
+    const uid = await createUser('rs@x.com')
+    assert.equal((await markMigrating(uid)).applied, true) // NULL→migrating
+    const r = await releaseSeeding(uid)
+    assert.equal(r.applied, false, 'releaseSeeding 不得命中 migrating')
+    assert.equal((await getChannelState(uid))?.status, 'migrating', 'migrating 状态保持')
   })
 
   test('非法转换 rowCount=0 → applied=false(防脑裂)', async (t) => {

@@ -127,26 +127,32 @@ async function transition(
   return { applied: false, status: cur?.status ?? null };
 }
 
-/** NULL/rolled_back(未迁移)→ seeding。用于后台预热开始。 */
+// 互斥不变量:同一用户任一时刻至多一个进行中操作(preseed=seeding / cutover=migrating)。
+// 因此 markSeeding / markMigrating 的合法起点都**只含空闲态**(NULL / rolled_back),不含
+// seeding / migrating 自身或对方 —— 原子 UPDATE + rowCount 判定即天然串行化:第二个
+// 并发编排器的 WHERE 不再命中,applied=false 得知已被抢占,不会双双进入长 IO 区(rsync/
+// merge 同一批 v5 卷)。卡在 seeding/migrating 的残留态由 releaseSeeding / abortInflight 复位。
+
+/** 空闲(NULL/rolled_back)→ seeding。用于后台预热开始;preseed 进行中拒绝 cutover。 */
 export function markSeeding(userId: bigint | number | string): Promise<TransitionResult> {
   return transition(
     normUid(userId),
     "seeding",
     false,
     false,
-    "v5_migrated_at IS NULL AND (v5_migration_status IS NULL OR v5_migration_status IN ('seeding','rolled_back'))",
+    "v5_migrated_at IS NULL AND (v5_migration_status IS NULL OR v5_migration_status = 'rolled_back')",
     [],
   );
 }
 
-/** NULL/seeding/rolled_back(未迁移)→ migrating。进入切换栅栏(停容器→最后 delta)。 */
+/** 空闲(NULL/rolled_back)→ migrating。进入切换栅栏;preseed(seeding)进行中则拒绝(须先 release)。 */
 export function markMigrating(userId: bigint | number | string): Promise<TransitionResult> {
   return transition(
     normUid(userId),
     "migrating",
     false,
     false,
-    "v5_migrated_at IS NULL AND (v5_migration_status IS NULL OR v5_migration_status IN ('seeding','migrating','rolled_back'))",
+    "v5_migrated_at IS NULL AND (v5_migration_status IS NULL OR v5_migration_status = 'rolled_back')",
     [],
   );
 }
@@ -175,7 +181,25 @@ export function rollbackToV3(userId: bigint | number | string): Promise<Transiti
   );
 }
 
-/** seeding/migrating(未翻转)→ NULL:中止未完成的迁移,复位如未触碰(区别于 rollback)。 */
+/**
+ * seeding → NULL:preseed 结束**只释放自己持有的 seeding**。若期间 cutover 已把状态推进到
+ * migrating(不会,因互斥;但防御性),此 CAS 不命中 → no-op,绝不清掉别人的 migrating(P0)。
+ */
+export function releaseSeeding(userId: bigint | number | string): Promise<TransitionResult> {
+  return transition(
+    normUid(userId),
+    null,
+    false,
+    false,
+    "v5_migrated_at IS NULL AND v5_migration_status = 'seeding'",
+    [],
+  );
+}
+
+/**
+ * seeding/migrating(未翻转)→ NULL:运维显式中止/复位残留的进行中态(如 cutover 中途失败卡在
+ * migrating,operator 复位后重试)。区别于 rollback(rollback 针对已 migrated 的用户)。
+ */
 export function abortInflight(userId: bigint | number | string): Promise<TransitionResult> {
   return transition(
     normUid(userId),

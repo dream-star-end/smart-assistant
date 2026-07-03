@@ -17,16 +17,20 @@ import type Docker from "dockerode";
 import { query } from "../db/queries.js";
 import { withAudit } from "./audit.js";
 import {
-  abortInflight,
   markMigrated,
   markMigrating,
   markSeeding,
   normUid,
+  releaseSeeding,
   rollbackToV3,
   type V5MigrationStatus,
 } from "./channelState.js";
 import { migrateUserSessions, type SessionsMigrationOutcome } from "./sessionsMigrate.js";
-import { migrateUserVolumes, type VolumesMigrationOutcome } from "./volumesMigrate.js";
+import {
+  isDockerNotFound,
+  migrateUserVolumes,
+  type VolumesMigrationOutcome,
+} from "./volumesMigrate.js";
 
 export interface CutoverDeps {
   docker: Docker;
@@ -50,20 +54,31 @@ export function defaultQuiesceV3(docker: Docker): (uid: string) => Promise<void>
     if (!Number.isSafeInteger(uidNum) || uidNum <= 0) throw new TypeError(`bad uid: ${uid}`);
     // 容器名权威 = v3ContainerNameFor;此处显式 v3 form(编排器在 v5 进程,getRuntimeChannel≠v3)。
     const name = `oc-v3-u${uidNum}`;
+    const c = docker.getContainer(name);
+    // fail-closed:只忽略"容器/状态不存在"(404=已删 / 304=已停);daemon 不通、权限、
+    // stop 真失败等**必须抛出**,绝不静默标 vanished 后去拷一个可能仍有写者的卷(P0)。
     try {
-      const c = docker.getContainer(name);
-      try {
-        await c.stop({ t: 10 });
-      } catch {
-        /* 已停 / 404 —— 幂等忽略 */
+      await c.stop({ t: 10 });
+    } catch (err) {
+      const status = (err as { statusCode?: number }).statusCode;
+      if (!isDockerNotFound(err) && status !== 304) {
+        throw new Error(
+          `quiesce: 停 v3 容器 ${name} 失败(非 404/304,fail-closed): ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        );
       }
-      try {
-        await c.remove({ force: true, v: false }); // v:false 保留卷(迁移要用)
-      } catch {
-        /* 404 —— 幂等忽略 */
+    }
+    try {
+      await c.remove({ force: true, v: false }); // v:false 保留卷(迁移要用)
+    } catch (err) {
+      if (!isDockerNotFound(err)) {
+        throw new Error(
+          `quiesce: 移除 v3 容器 ${name} 失败(非 404,fail-closed): ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        );
       }
-    } catch {
-      /* 容器根本不存在 —— 幂等忽略 */
     }
     await query(
       `UPDATE agent_containers SET state='vanished', last_stopped_at=NOW(), updated_at=NOW()
@@ -106,6 +121,10 @@ export async function cutoverUser(
     await deps.quiesceV3(uid);
     // 2. L2 会话历史最后 delta(master client_sessions + wechat_bindings)。
     const sessions = await migrateUserSessions(uid);
+    // 栅栏 fail-closed:L2 被跳过(v3 库缺失 / 路径自指)意味着会话没迁,绝不 markMigrated。
+    if (sessions.skipped) {
+      throw new Error(`L2 会话迁移被跳过(${sessions.skipped});栅栏中止,不翻转权威。检查 OC_V3_MASTER_HOME`);
+    }
     // 3. L3 卷最后 delta(data/proj/userlocal/userconfig)。
     const volumes = await migrateUserVolumes(uid, {
       docker: deps.docker,
@@ -165,8 +184,9 @@ export async function preseedUser(
     });
     return out;
   } finally {
-    // 释放 seeding 认领,复位回 NULL(不影响已养温的 v5 数据)。失败也复位,便于重试。
-    await abortInflight(uid).catch(() => {});
+    // 只释放自己持有的 seeding(CAS);绝不清掉可能已被 cutover 推进的 migrating(P0)。
+    // 不影响已养温的 v5 数据。失败也尝试释放,便于后续重试。
+    await releaseSeeding(uid).catch(() => {});
   }
 }
 

@@ -45,10 +45,13 @@ BEGIN
   IF NOT EXISTS (
     SELECT 1 FROM pg_constraint WHERE conname = 'users_v5_migrated_consistency_check'
   ) THEN
+    -- 用 IS NOT DISTINCT FROM 避免三值逻辑漏洞:status IS NULL 时
+    -- `status = 'migrated'` 求值为 NULL → CHECK 放行(会漏过 status=NULL 但 migrated_at 非空的
+    -- 撕裂态)。IS NOT DISTINCT FROM 恒返 boolean,两侧都是干净布尔,等式无 NULL。
     ALTER TABLE users
       ADD CONSTRAINT users_v5_migrated_consistency_check
       CHECK (
-        (v5_migration_status = 'migrated') = (v5_migrated_at IS NOT NULL)
+        (v5_migrated_at IS NOT NULL) = (v5_migration_status IS NOT DISTINCT FROM 'migrated')
       );
   END IF;
 END $$;
