@@ -32,12 +32,21 @@
  *   - 错误消息不回显 refresh_token / 密文
  */
 
+import type { PoolClient } from 'pg'
+
 import { EVENTS } from '../admin/alertEvents.js'
 import { safeEnqueueAlert } from '../admin/alertOutbox.js'
 import { loadKmsKey } from '../crypto/keys.js'
+import { getPool } from '../db/index.js'
 import type { AccountHealthTracker } from './health.js'
 import { recordRefreshEvent } from './refreshEvents.js'
-import { type AccountPlan, getCodexTokenSnapshot, getTokenForUse, updateAccount } from './store.js'
+import {
+  type AccountPlan,
+  getCodexTokenSnapshotInTx,
+  getTokenForUse,
+  updateAccount,
+  updateCodexTokenSnapshotInTx,
+} from './store.js'
 import { CodexEgressError, resolveCodexAccountEgressDispatcher } from './codexEgress.js'
 
 /**
@@ -527,12 +536,25 @@ export interface RefreshCodexDeps {
   endpoint?: string
   clientId?: string
   health?: AccountHealthTracker
+  skewMs?: number
   /** 出口 dispatcher;codex 账号也可走 ProxyAgent 走代理(本 PR codex 暂不接,见 plan 决策 U)。 */
   dispatcher?: unknown
   /** v1.0.120 feat/codex-disable-rebind:同 RefreshDeps.triggerCodexDisableFanout
    *  —— refresh 失败 disableOnFailure 后触发 fanout actor rebind 仍绑该账号的活跃
    *  容器(见 refresh.ts disableOnFailure 实现)。 */
   triggerCodexDisableFanout?: (accountId: bigint) => void
+}
+
+const CODEX_REFRESH_LOCK_NAMESPACE = 0x0c0dec0dn
+
+function codexRefreshLockKey(accountId: bigint | string): string {
+  const id = BigInt(accountId)
+  const key = (CODEX_REFRESH_LOCK_NAMESPACE << 32n) + id
+  const max = 9_223_372_036_854_775_807n
+  if (key > max || key < -max) {
+    throw new RangeError(`codex refresh advisory lock key out of int8 range for account ${String(accountId)}`)
+  }
+  return key.toString()
 }
 
 const refreshCodexInflight = new Map<string, Promise<RefreshedTokens>>()
@@ -567,15 +589,44 @@ async function refreshCodexAccountTokenInner(
   accountId: bigint | string,
   deps: RefreshCodexDeps,
 ): Promise<RefreshedTokens> {
+  const lockClient = await getPool().connect()
+  const lockKey = codexRefreshLockKey(accountId)
+  let locked = false
+  try {
+    await lockClient.query('SELECT pg_advisory_lock($1::bigint)', [lockKey])
+    locked = true
+    return await refreshCodexAccountTokenInnerLocked(accountId, deps, lockClient)
+  } finally {
+    if (locked) {
+      await lockClient.query('SELECT pg_advisory_unlock($1::bigint)', [lockKey]).catch(() => {})
+    }
+    lockClient.release()
+  }
+}
+
+async function refreshCodexAccountTokenInnerLocked(
+  accountId: bigint | string,
+  deps: RefreshCodexDeps,
+  lockClient: PoolClient,
+): Promise<RefreshedTokens> {
   const http = deps.http ?? defaultHttp
   const keyFn = deps.keyFn ?? loadKmsKey
   const endpoint = deps.endpoint ?? DEFAULT_CODEX_OAUTH_ENDPOINT
   const clientId = deps.clientId ?? DEFAULT_CODEX_OAUTH_CLIENT_ID
   const now = (deps.now ?? ((): Date => new Date()))()
 
-  const snap = await getCodexTokenSnapshot(accountId, keyFn)
+  const snap = await getCodexTokenSnapshotInTx(lockClient, accountId, keyFn)
   if (!snap) {
     throw new RefreshError('account_not_found', `codex account ${String(accountId)} not found`)
+  }
+  const skewMs = deps.skewMs ?? DEFAULT_REFRESH_SKEW_MS
+  if (!shouldRefresh(snap.expires_at, now, skewMs)) {
+    return {
+      token: snap.token,
+      refresh: snap.refresh,
+      expires_at: snap.expires_at ?? now,
+      plan: 'pro',
+    }
   }
   // 仅需 refresh_token;access_token 立即清零
   snap.token.fill(0)
@@ -666,17 +717,14 @@ async function refreshCodexAccountTokenInner(
       ? parsed.refresh_token
       : null
 
-  const patch: Parameters<typeof updateAccount>[1] = {
-    token: newAccessToken,
-    oauth_expires_at: expiresAt,
-    last_error: null,
-  }
-  if (newRefreshToken !== null) {
-    patch.refresh = newRefreshToken
-  }
-  let updated: Awaited<ReturnType<typeof updateAccount>>
+  let updated: boolean
   try {
-    updated = await updateAccount(accountId, patch, keyFn)
+    updated = await updateCodexTokenSnapshotInTx(lockClient, accountId, {
+      token: newAccessToken,
+      ...(newRefreshToken !== null ? { refresh: newRefreshToken } : {}),
+      expires_at: expiresAt,
+      last_error: null,
+    }, keyFn)
   } catch (err) {
     await disableOnFailure(deps as RefreshDeps, accountId, 'refresh_persist_error')
     safeRecordRefreshEvent(

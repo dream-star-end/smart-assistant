@@ -1022,6 +1022,70 @@ export async function getCodexTokenSnapshotInTx(
 }
 
 /**
+ * Update a Codex OAuth token snapshot using the caller's client. Intended for
+ * refresh paths that already hold a cross-process advisory lock on the same
+ * client; do not use for general admin patching.
+ */
+export async function updateCodexTokenSnapshotInTx(
+  client: PoolClient,
+  id: bigint | string,
+  patch: { token: string; refresh?: string | null; expires_at: Date; last_error?: string | null },
+  keyFn: () => Buffer = loadKmsKey,
+): Promise<boolean> {
+  if (typeof patch.token !== "string" || patch.token.length === 0) {
+    throw new TypeError("token must be non-empty string");
+  }
+  const key = keyFn();
+  try {
+    const tok = encrypt(patch.token, key);
+    let refEnc: Buffer | null | undefined;
+    let refNonce: Buffer | null | undefined;
+    if (patch.refresh !== undefined) {
+      if (patch.refresh === null) {
+        refEnc = null;
+        refNonce = null;
+      } else {
+        if (typeof patch.refresh !== "string" || patch.refresh.length === 0) {
+          throw new TypeError("refresh must be non-empty string or null");
+        }
+        const r = encrypt(patch.refresh, key);
+        refEnc = r.ciphertext;
+        refNonce = r.nonce;
+      }
+    }
+
+    const sets = [
+      "oauth_token_enc = $2",
+      "oauth_nonce = $3",
+      "oauth_expires_at = $4",
+      "last_error = $5",
+      "updated_at = NOW()",
+    ];
+    const params: unknown[] = [
+      String(id),
+      tok.ciphertext,
+      tok.nonce,
+      patch.expires_at,
+      patch.last_error ?? null,
+    ];
+    if (patch.refresh !== undefined) {
+      params.push(refEnc ?? null, refNonce ?? null);
+      sets.push(`oauth_refresh_enc = $${params.length - 1}`);
+      sets.push(`oauth_refresh_nonce = $${params.length}`);
+    }
+    const res = await client.query(
+      `UPDATE claude_accounts
+          SET ${sets.join(", ")}
+        WHERE id = $1 AND provider = 'codex'`,
+      params,
+    );
+    return (res.rowCount ?? 0) > 0;
+  } finally {
+    zeroBuffer(key);
+  }
+}
+
+/**
  * Thin wrapper —— 不在 tx 上下文中使用。自申请 pool client、释放。
  * tx 内绝不要调用此函数,改用 `getCodexTokenSnapshotInTx`。
  */
