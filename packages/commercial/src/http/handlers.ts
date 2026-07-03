@@ -901,6 +901,10 @@ export async function handleMe(
   // 同 JWT/同域,v5 侧不需读 cookie(只服务被路由过来的请求);/api/me 是 SPA 加载早期调用,作路由 bootstrap。
   if (u.on_v5) {
     appendSetCookie(res, "oc_v5user=1; Path=/; Max-Age=31536000; Secure; HttpOnly; SameSite=Lax");
+    // 单次刷新即切:cookie 是 HttpOnly(JS 读不到),故额外给前端一个可读的响应头信号。
+    // v3 壳的 apiFetch 见此头 → 硬 reload 一次,让 GET / 带上 oc_v5user cookie 落到 v5 React
+    // (否则用户要手动刷第二次才换到 v5 壳)。
+    res.setHeader("X-OC-Migrated-V5", "1");
   } else {
     appendSetCookie(res, "oc_v5user=; Path=/; Max-Age=0; Secure; HttpOnly; SameSite=Lax");
   }

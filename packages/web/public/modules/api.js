@@ -616,6 +616,16 @@ export async function apiFetch(path, init = {}) {
   } finally {
     cleanup()
   }
+  // v3→v5 迁移路由:后端在已迁移用户的响应上打 X-OC-Migrated-V5=1(见 handlers.ts:handleMe)。
+  // 此刻 v3 已给该用户种下 oc_v5user cookie(HttpOnly,JS 读不到,故靠这个可读头触发),但当前
+  // 页面仍是 v3 壳 → 硬 reload 一次让 GET / 带上 cookie 落到 v5 React。sessionStorage 守卫防
+  // reload 循环(cookie 万一没生效,不会无限刷)。隐私模式无 sessionStorage → try 兜底,退回手动刷。
+  try {
+    if (res.headers.get('X-OC-Migrated-V5') === '1' && !sessionStorage.getItem('oc_v5_switched')) {
+      sessionStorage.setItem('oc_v5_switched', '1')
+      location.reload()
+    }
+  } catch { /* sessionStorage 不可用 → 跳过 */ }
   if (res.status !== 401) return res
   // Auth endpoint or already retried → propagate 401 + maybe trigger logout。
   // 注意:HIGH#4 之后 refresh token 在 HttpOnly cookie 里,JS 看不到 → 不能再像
