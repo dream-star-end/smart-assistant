@@ -90,16 +90,29 @@ const PRICING: ModelPricing = {
 // preCheck 的 getSpendableBalance 走 pool.query(SELECT u.credits ... LEFT JOIN
 // user_subscriptions),返回 wallet+period 总可用。
 
+/** P0 跨桥修复 — fake journal 行(request_finalize_journal 的最小状态机)。 */
+interface FakeJournalRow {
+  state: "inflight" | "finalizing" | "committed" | "aborted";
+  user_id: string;
+  ctx: Record<string, unknown>;
+  precheck_credits: string;
+  error_msg: string | null;
+}
+
 interface FakePoolControl {
   pool: Pool;
   /** 完整 SQL 调用记录 — 测试断言用。 */
   queries: Array<{ sql: string; params: unknown[] | undefined }>;
+  /** P0 跨桥修复 — 有状态 journal 表(INSERT/UPDATE CAS/SELECT 都作用于此),
+   *  测试可直接读断言终态,或预置 synthetic 行(aborted 撞帧 / 串桥用例)。 */
+  journalRows: Map<string, FakeJournalRow>;
 }
 
 function makeFakePool(opts: { userBalance?: bigint; periodCredits?: bigint | null } = {}): FakePoolControl {
   const queries: Array<{ sql: string; params: unknown[] | undefined }> = [];
   const balance = opts.userBalance ?? 1_000_000n;
   const periodCredits = opts.periodCredits ?? null; // null = 无 active 订阅(默认)
+  const journalRows = new Map<string, FakeJournalRow>();
 
   function record(sql: string, params: unknown[] | undefined): void {
     queries.push({ sql, params });
@@ -166,12 +179,43 @@ function makeFakePool(opts: { userBalance?: bigint; periodCredits?: bigint | nul
       if (trimmed.startsWith("SELECT cost_multiplier FROM agent_cost_overrides")) {
         return { rows: [], rowCount: 0 };
       }
-      // request_finalize_journal:INSERT inflight / UPDATE committed/aborted/finalizing
+      // request_finalize_journal — P0 跨桥修复后 fake 变有状态:
+      // INSERT inflight / UPDATE CAS(finalizing|committed|aborted)/ SELECT 回查
+      // 都作用于 journalRows,测试能断言权威终态(而不只是 SQL 形状)。
       if (trimmed.startsWith("INSERT INTO request_finalize_journal")) {
+        const [reqId, userId, , ctxJson, precheck] = params as [string, string, unknown, string, string];
+        if (!journalRows.has(reqId)) { // ON CONFLICT DO NOTHING
+          journalRows.set(reqId, {
+            state: "inflight",
+            user_id: userId,
+            ctx: JSON.parse(ctxJson) as Record<string, unknown>,
+            precheck_credits: precheck,
+            error_msg: null,
+          });
+        }
         return { rows: [], rowCount: 1 };
       }
       if (trimmed.startsWith("UPDATE request_finalize_journal")) {
-        return { rows: [], rowCount: 1 };
+        const reqId = (params as unknown[])[0] as string;
+        const row = journalRows.get(reqId);
+        const casOk = row !== undefined && (row.state === "inflight" || row.state === "finalizing");
+        if (casOk) {
+          if (/state='finalizing'/.test(trimmed)) row!.state = "finalizing";
+          else if (/state='committed'/.test(trimmed)) row!.state = "committed";
+          else if (/state='aborted'/.test(trimmed)) {
+            row!.state = "aborted";
+            row!.error_msg = String((params as unknown[])[1] ?? "");
+          }
+        }
+        return { rows: [], rowCount: casOk ? 1 : 0 };
+      }
+      // P0 跨桥修复 — unknown-turn 分支的 journal 回查
+      if (trimmed.startsWith("SELECT state, user_id::text AS user_id, ctx")) {
+        const reqId = (params as unknown[])[0] as string;
+        const row = journalRows.get(reqId);
+        return row === undefined
+          ? { rows: [], rowCount: 0 }
+          : { rows: [{ state: row.state, user_id: row.user_id, ctx: row.ctx }], rowCount: 1 };
       }
       // preCheck 的 getSpendableBalance(0096 双钱包总可用)走 rootQuery 落
       // commercial/db getPool() —— 测试用 setPoolOverride 把 fakePool 装上。
@@ -186,7 +230,7 @@ function makeFakePool(opts: { userBalance?: bigint; periodCredits?: bigint | nul
     async end(): Promise<void> { /* noop for tests */ },
   };
 
-  return { pool: fakePool as Pool, queries };
+  return { pool: fakePool as Pool, queries, journalRows };
 }
 
 // ---------- Rig with billing deps ------------------------------------------
@@ -245,6 +289,8 @@ async function startRig(opts: {
   expireCodexRoute?: UserChatBridgeDeps["expireCodexRoute"];
   // P0 计费旁路封堵 — bridge 可信模型推导(fake master agent 权威)。
   loadAgentModelResolver?: UserChatBridgeDeps["loadAgentModelResolver"];
+  // P0 跨桥修复 — displacement 用例把 per-user 连接上限压到 1,新连接必踢旧桥。
+  maxPerUser?: number;
 } = {}): Promise<BillingRig> {
   // mock 容器 ws
   const containerSockets: WebSocket[] = [];
@@ -299,6 +345,7 @@ async function startRig(opts: {
     loadAgentModelResolver: opts.loadAgentModelResolver,
     logger: opts.logger,
     appendCostCredits: opts.appendCostCredits,
+    maxPerUser: opts.maxPerUser,
   });
 
   const gateway = http.createServer((_, res) => res.end());
@@ -835,7 +882,10 @@ describe("userChatBridge / codex billing — drain on user close(readyState 前�
   });
 });
 
-describe("userChatBridge / codex billing — drain timeout → fail-abort", () => {
+// P0 修复(2026-07-03):桥关 ≠ turn 终止。drain 超时不再 fail-abort —— journal
+// 保持 inflight,裁决权交给"billing 帧到达任意桥 → settle"或 reconciler 终态化。
+// (旧行为 = abort journal + release reservation,是跨桥重连整 turn 免费的根因。)
+describe("userChatBridge / codex billing — drain timeout 不再 abort 存活 turn(P0 修复)", () => {
   let rig: BillingRig;
   before(async () => {
     // M2:DRAIN_BILLING_MS 改为 env 可覆盖(读时求值)—— 用 300ms 快速验证
@@ -849,7 +899,7 @@ describe("userChatBridge / codex billing — drain timeout → fail-abort", () =
   });
   beforeEach(() => { _resetAgentMultiplierCacheForTests(); });
 
-  test("user close 后,drain 窗口超时未收到 billing → finalCleanup fail-abort(abort journal,无 settle)", async () => {
+  test("user close 后 drain 超时未收到 billing → finalCleanup 关桥但 journal 保持 inflight(不 abort)", async () => {
     const containerOpenP = waitNextContainerSocket(rig);
     const token = await makeJwt("15");
     const ws = openClient(rig.gatewayPort, token);
@@ -860,18 +910,263 @@ describe("userChatBridge / codex billing — drain timeout → fail-abort", () =
       type: "inbound.message", agentId: "codex", model: "gpt-5.5", content: "x",
     }));
     const frameToContainer = await waitContainerNextFrame(containerWs);
-    JSON.parse(frameToContainer.data); // requestId 留在 inflight Map,billing 永不发
+    const serverReqId = (JSON.parse(frameToContainer.data) as { requestId: string }).requestId;
 
     ws.close();
 
-    // 300ms drain + 余量
+    // 300ms drain + 余量:桥的资源(container ws)照常收尾
     const closed = await waitContainerClose(containerWs, 2_000);
     assert.equal(closed, true, "container ws must close after drain timeout");
 
-    // abortInflightJournal 应被调(acquire 未 settle 的 inflight 一致性)
-    await waitUntil(() => journalAborts(rig).length === 1, 1500);
-    // 确认没有 INSERT INTO usage_records(没 settle)
+    // 关键断言(P0):**不** abort journal —— 容器侧 turn 可能仍在跑,权威裁决
+    // 交给后续 billing 帧(跨桥 settle)或 reconciler(stuck 阈值后终态化)。
+    await new Promise<void>((r) => setTimeout(r, 100));
+    assert.equal(journalAborts(rig).length, 0, "bridge teardown must NOT abort inflight journal");
+    assert.equal(rig.poolCtrl.journalRows.get(serverReqId)?.state, "inflight");
+    // 也没有 settle(billing 帧从未到)
     assert.equal(usageInserts(rig).length, 0);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// P0 收入漏洞回归(2026-07-03)— codex turn 中途 WS 重连 → billing 帧到新桥。
+// 复现链:turn 开启(journal inflight)→ 用户断 WS(旧桥 drain)→ 重连(新桥)
+// → 旧桥 finalCleanup → 容器跑完 turn,billing 帧到达新桥 → 旧实现 unknown-turn
+// 只打日志 = 0 usage_records、0 debit。修复后:journal 权威回查 + 跨桥 settle。
+// ─────────────────────────────────────────────────────────────────────────────
+describe("userChatBridge / codex billing — P0 跨桥重连 settle(billing 帧后于重连到达)", () => {
+  let rig: BillingRig;
+  before(async () => {
+    process.env.DRAIN_BILLING_MS = "200";
+    rig = await startRig({ userBalance: 1_000_000n });
+  });
+  after(async () => {
+    delete process.env.DRAIN_BILLING_MS;
+    await stopRig(rig);
+  });
+  beforeEach(() => { _resetAgentMultiplierCacheForTests(); });
+
+  test("旧桥 drain 超时关闭 → 新桥收 billing 帧 → journal 回查 settle + cost_charged 广播(duplicate 帧防重)", async () => {
+    // ── turn 在桥 1 开启 ──
+    const container1P = waitNextContainerSocket(rig);
+    const token = await makeJwt("41");
+    const ws1 = openClient(rig.gatewayPort, token);
+    await waitOpen(ws1);
+    const container1 = await container1P;
+    ws1.send(JSON.stringify({
+      type: "inbound.message", agentId: "codex", model: "gpt-5.5", content: "x",
+    }));
+    const f1 = JSON.parse((await waitContainerNextFrame(container1)).data) as Record<string, unknown>;
+    const serverReqId = f1.requestId as string;
+    const turnTraceId = f1.traceId as string;
+    assert.match(serverReqId, /^[0-9a-f]{32}$/);
+    // journal ctx 必须已带 traceId(跨桥 settle 的 trace 贯穿依赖)
+    assert.equal(rig.poolCtrl.journalRows.get(serverReqId)?.ctx.traceId, turnTraceId);
+
+    // ── 用户断线,旧桥 drain 超时收尾(billing 帧尚未产生)──
+    ws1.close();
+    assert.equal(await waitContainerClose(container1, 2_000), true);
+    assert.equal(journalAborts(rig).length, 0, "old bridge must not abort surviving turn");
+    assert.equal(rig.poolCtrl.journalRows.get(serverReqId)?.state, "inflight");
+
+    // ── 用户重连(新桥、新容器 socket)──
+    const container2P = waitNextContainerSocket(rig);
+    const ws2 = openClient(rig.gatewayPort, token);
+    await waitOpen(ws2);
+    const container2 = await container2P;
+
+    // ── 容器跑完 turn,billing 帧到达**新桥**(发两次:duplicate 防重一并验证)──
+    const billing = JSON.stringify({
+      type: "outbound.codex_billing",
+      requestId: serverReqId,
+      engineSessionId: ENGINE_SID,
+      status: "success",
+      usage: { input_tokens: 100, output_tokens: 200 },
+    });
+    container2.send(billing);
+    container2.send(billing);
+
+    // 新桥的 userWs 收到 cost_charged,trace 贯穿自 journal ctx
+    const cost = await waitJsonFrameOfType(ws2, "outbound.cost_charged");
+    assert.equal(cost.requestId, serverReqId);
+    assert.equal(cost.traceId, turnTraceId, "cost_charged.traceId must come from journal ctx");
+    assert.equal(cost.model, "gpt-5.5");
+    assert.ok(BigInt(cost.debitedCredits as string) > 0n);
+
+    // duplicate 帧不得二次广播 / 二次 settle
+    let second: Record<string, unknown> | null = null;
+    try { second = await waitJsonFrameOfType(ws2, "outbound.cost_charged", 200); } catch { /* */ }
+    assert.equal(second, null, "duplicate cross-bridge billing must NOT broadcast twice");
+    assert.equal(usageInserts(rig).length, 1, "exactly one settle");
+    assert.equal(ledgerInserts(rig).length, 1);
+    // settle 口径与主路径一致:session_id = 帧 engineSessionId,account_id NULL
+    assert.equal(usageInserts(rig)[0]!.params?.[1], null);
+    assert.equal(usageInserts(rig)[0]!.params?.[9], ENGINE_SID);
+    // journal 权威终态 committed
+    assert.equal(rig.poolCtrl.journalRows.get(serverReqId)?.state, "committed");
+
+    ws2.close();
+  });
+});
+
+describe("userChatBridge / codex billing — P0 displacement(新连接顶掉旧桥)不 abort", () => {
+  let rig: BillingRig;
+  before(async () => {
+    process.env.DRAIN_BILLING_MS = "200";
+    rig = await startRig({ userBalance: 1_000_000n, maxPerUser: 1 });
+  });
+  after(async () => {
+    delete process.env.DRAIN_BILLING_MS;
+    await stopRig(rig);
+  });
+  beforeEach(() => { _resetAgentMultiplierCacheForTests(); });
+
+  test("同 user 新连接踢旧桥 → 旧桥不 abort inflight turn;billing 帧经新桥 settle", async () => {
+    const container1P = waitNextContainerSocket(rig);
+    const token = await makeJwt("42");
+    const ws1 = openClient(rig.gatewayPort, token);
+    await waitOpen(ws1);
+    const container1 = await container1P;
+    ws1.send(JSON.stringify({
+      type: "inbound.message", agentId: "codex", model: "gpt-5.5", content: "x",
+    }));
+    const serverReqId = (JSON.parse((await waitContainerNextFrame(container1)).data) as {
+      requestId: string;
+    }).requestId;
+
+    // maxPerUser=1:第二条连接注册即踢旧桥(TOO_MANY_CONNECTIONS)
+    const container2P = waitNextContainerSocket(rig);
+    const ws2 = openClient(rig.gatewayPort, token);
+    await waitOpen(ws2);
+    const container2 = await container2P;
+
+    // 旧桥被踢 → cleanup → drain 超时收尾;等它的容器 socket 关闭
+    assert.equal(await waitContainerClose(container1, 2_000), true);
+    assert.equal(journalAborts(rig).length, 0, "displacement must NOT abort surviving turn");
+    assert.equal(rig.poolCtrl.journalRows.get(serverReqId)?.state, "inflight");
+
+    // billing 帧到新桥 → 跨桥 settle
+    container2.send(JSON.stringify({
+      type: "outbound.codex_billing",
+      requestId: serverReqId,
+      engineSessionId: ENGINE_SID,
+      status: "success",
+      usage: { input_tokens: 60, output_tokens: 120 },
+    }));
+    const cost = await waitJsonFrameOfType(ws2, "outbound.cost_charged");
+    assert.equal(cost.requestId, serverReqId);
+    assert.equal(usageInserts(rig).length, 1);
+    assert.equal(rig.poolCtrl.journalRows.get(serverReqId)?.state, "committed");
+
+    ws2.close();
+  });
+});
+
+describe("userChatBridge / codex billing — P0 journal 回查裁决(aborted 撞帧 / 幂等 / 串桥)", () => {
+  let rig: BillingRig;
+  let logs: CapturedLog[];
+  before(async () => {
+    const cap = makeCaptureLogger();
+    logs = cap.logs;
+    rig = await startRig({ userBalance: 1_000_000n, logger: cap.log });
+  });
+  after(async () => { await stopRig(rig); });
+  beforeEach(() => {
+    _resetAgentMultiplierCacheForTests();
+    logs.length = 0;
+  });
+
+  async function openPair(uidStr: string): Promise<{ ws: WebSocket; containerWs: WebSocket }> {
+    const containerP = waitNextContainerSocket(rig);
+    const ws = openClient(rig.gatewayPort, await makeJwt(uidStr));
+    await waitOpen(ws);
+    return { ws, containerWs: await containerP };
+  }
+
+  function sendBilling(containerWs: WebSocket, reqId: string): void {
+    containerWs.send(JSON.stringify({
+      type: "outbound.codex_billing",
+      requestId: reqId,
+      engineSessionId: ENGINE_SID,
+      status: "success",
+      usage: { input_tokens: 100, output_tokens: 200 },
+    }));
+  }
+
+  test("billing 帧撞 aborted journal → 免单 + error 告警(不补收、不静默)", async () => {
+    const { ws, containerWs } = await openPair("43");
+    const reqId = "a".repeat(32);
+    // 预置 aborted 行(修复前旧桥 bridge_disconnect abort 的存量形态)
+    rig.poolCtrl.journalRows.set(reqId, {
+      state: "aborted",
+      user_id: "43",
+      ctx: { model: "gpt-5.5", agentId: "codex", source: "codex_bridge" },
+      precheck_credits: "100",
+      error_msg: "bridge_disconnect",
+    });
+    sendBilling(containerWs, reqId);
+
+    await waitUntil(() =>
+      logs.some((l) => l.level === "error" && l.msg.includes("aborted journal")), 1500);
+    // 钱安全:不补收
+    assert.equal(usageInserts(rig).length, 0);
+    assert.equal(ledgerInserts(rig).length, 0);
+    let cost: Record<string, unknown> | null = null;
+    try { cost = await waitJsonFrameOfType(ws, "outbound.cost_charged", 200); } catch { /* */ }
+    assert.equal(cost, null, "aborted journal must not charge");
+    // 终态不被翻转
+    assert.equal(rig.poolCtrl.journalRows.get(reqId)?.state, "aborted");
+    ws.close();
+  });
+
+  test("billing 帧撞 committed journal → 幂等忽略(无二次 settle / 广播)", async () => {
+    const { ws, containerWs } = await openPair("44");
+    const reqId = "b".repeat(32);
+    rig.poolCtrl.journalRows.set(reqId, {
+      state: "committed",
+      user_id: "44",
+      ctx: { model: "gpt-5.5", agentId: "codex", source: "codex_bridge" },
+      precheck_credits: "100",
+      error_msg: null,
+    });
+    sendBilling(containerWs, reqId);
+
+    await waitUntil(() =>
+      logs.some((l) => l.msg.includes("already-settled journal")), 1500);
+    assert.equal(usageInserts(rig).length, 0);
+    let cost: Record<string, unknown> | null = null;
+    try { cost = await waitJsonFrameOfType(ws, "outbound.cost_charged", 200); } catch { /* */ }
+    assert.equal(cost, null);
+    ws.close();
+  });
+
+  test("journal 行归属他人(串桥/伪造 requestId)→ 拒绝 settle + error 告警,不动 journal", async () => {
+    const { ws, containerWs } = await openPair("45");
+    const reqId = "c".repeat(32);
+    rig.poolCtrl.journalRows.set(reqId, {
+      state: "inflight",
+      user_id: "99999", // 非本桥 uid
+      ctx: { model: "gpt-5.5", agentId: "codex", source: "codex_bridge" },
+      precheck_credits: "100",
+      error_msg: null,
+    });
+    sendBilling(containerWs, reqId);
+
+    await waitUntil(() =>
+      logs.some((l) => l.level === "error" && l.msg.includes("user mismatch")), 1500);
+    assert.equal(usageInserts(rig).length, 0);
+    // 他人的 journal 行不 abort 也不 commit(留给其归属桥/reconciler)
+    assert.equal(rig.poolCtrl.journalRows.get(reqId)?.state, "inflight");
+    ws.close();
+  });
+
+  test("无 journal 行(容器伪造 requestId)→ warn 丢弃,不 settle", async () => {
+    const { ws, containerWs } = await openPair("46");
+    sendBilling(containerWs, "d".repeat(32));
+    await waitUntil(() =>
+      logs.some((l) => l.level === "warn" && l.msg.includes("no journal row")), 1500);
+    assert.equal(usageInserts(rig).length, 0);
+    ws.close();
   });
 });
 

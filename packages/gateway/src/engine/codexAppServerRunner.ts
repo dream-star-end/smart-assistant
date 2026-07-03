@@ -336,6 +336,13 @@ interface RunnerMessage {
    *  reset)。仅 codex result 帧带,sessionManager 透传到 outbound.codex_billing
    *  的 rateLimits 字段,master.userChatBridge 落库 claude_accounts.quota_*。 */
   rateLimits?: RuntimeRateLimits
+  /** LOW-2(2026-07-03)— codex turn 终态映射到 CCB result 行的 stop_reason 口径,
+   *  ccbMessageParser._handleResult 读取后随 final meta 下发(此前 codex 路径恒缺,
+   *  会触发 telemetry 的"willCallApi fired but no stop_reason"误告警):
+   *    turn status 'completed'   → 'end_turn'
+   *    turn status 'interrupted' → 'interrupted'(用户主动 stop;无 Anthropic 等价枚举)
+   *    failed / unexpected / catch 路径 → 不带(保持 is_error 语义,不伪造终态)。 */
+  stop_reason?: string
   event?: unknown
 }
 
@@ -2086,9 +2093,13 @@ export class CodexAppServerRunner extends EventEmitter {
     const visibleItem = itemType === item.type ? item : { ...item, type: itemType }
     if (itemType === 'commandExecution') {
       const cmd = typeof item.command === 'string' ? item.command : ''
+      const stripped = stripShellWrapper(cmd)
+      // LOW-1(2026-07-03):description 曾硬编码 'codex commandExecution',直接
+      // 泄到前端 Bash 卡片副标题。改为命令首行摘要(≤60 字符);空命令不带该字段。
+      const summary = summarizeCommandForDescription(stripped)
       this.emitAssistantToolUse(itemId, 'Bash', {
-        command: stripShellWrapper(cmd),
-        description: 'codex commandExecution',
+        command: stripped,
+        ...(summary !== '' ? { description: summary } : {}),
       })
       return
     }
@@ -2494,6 +2505,8 @@ export class CodexAppServerRunner extends EventEmitter {
           usage: usagePayload,
           requestId,
           rateLimits: rateLimitsPayload,
+          // LOW-2:codex 'completed' = 正常终态 → Anthropic 口径 'end_turn'。
+          stopReason: 'end_turn',
         })
       } else if (status === 'failed') {
         const errMsg = turn?.error?.message ?? 'codex turn failed'
@@ -2526,6 +2539,9 @@ export class CodexAppServerRunner extends EventEmitter {
           usage: usagePayload,
           requestId,
           rateLimits: rateLimitsPayload,
+          // LOW-2:用户主动 stop —— 无 Anthropic 等价枚举,用自描述 'interrupted'
+          // (下游只对 'max_tokens' 有分支语义,其余值透传展示)。
+          stopReason: 'interrupted',
         })
       } else {
         this.emitResult({
@@ -2639,6 +2655,9 @@ export class CodexAppServerRunner extends EventEmitter {
     /** Issue A v1.0.108 — runTurn 在 emitResult 现场从 instance 字段拿最新已知
      *  rateLimits 快照传进来。null/undefined → 不带本字段。 */
     rateLimits?: RuntimeRateLimits
+    /** LOW-2(2026-07-03)— caller 按 turn status 映射(见 RunnerMessage.stop_reason
+     *  注释);不传 → result 行不带 stop_reason(failed / 异常路径)。 */
+    stopReason?: string
   }): void {
     const msg: RunnerMessage = {
       type: 'result',
@@ -2651,6 +2670,7 @@ export class CodexAppServerRunner extends EventEmitter {
       usage: opts.usage,
       requestId: opts.requestId,
       ...(opts.rateLimits ? { rateLimits: opts.rateLimits } : {}),
+      ...(opts.stopReason ? { stop_reason: opts.stopReason } : {}),
     }
     this.emit('message', msg)
   }
@@ -2663,6 +2683,19 @@ function normalisePrompt(input: string | Array<{ type: string; text?: string }>)
     if (b.type === 'text' && typeof b.text === 'string') parts.push(b.text)
   }
   return parts.join('\n')
+}
+
+/**
+ * LOW-1(2026-07-03)— Bash 卡 description:取命令首个非空行做摘要,≤60 字符
+ * (超长截 59 + '…')。空命令返回 ''(caller 不带 description 字段)。
+ */
+export function summarizeCommandForDescription(cmd: string): string {
+  const firstLine = cmd
+    .split('\n')
+    .map((l) => l.trim())
+    .find((l) => l.length > 0)
+  if (firstLine === undefined) return ''
+  return firstLine.length > 60 ? `${firstLine.slice(0, 59)}…` : firstLine
 }
 
 /**
