@@ -99,14 +99,26 @@ export function Composer({
     setAttachments([]);
   };
 
-  const onFiles = async (files: FileList | null) => {
-    if (!files || !onUpload) return;
+  // 只收已快照的 File[]——FileList 的快照在事件入口(onChange)就完成。
+  // 原因:`e.target.files` 是 input 的**实时 FileList 引用**。部分手机 webview
+  // (鸿蒙 ArkWeb / 华为浏览器等)在 `value=""` 时是**就地清空同一个 FileList 对象**,
+  // 若把 live FileList 传进来、先清 value 再读,就读到空数组 → 一个 chip 都不插、
+  // 连"已忽略"toast 都不弹、请求也不发 → 用户选完图片"附件区什么都没出现",后端亦无记录。
+  // 让业务层永远拿不到 live FileList,从类型上根除这一类"先清后读"的空读 bug。
+  const onFiles = async (picked: File[]) => {
+    if (!onUpload) return;
     if (fileRef.current) fileRef.current.value = ""; // 允许同名文件再次选择
+    // webview 兜底:选择结果为空(取消/被就地清空/webview 返回空)时给出可见反馈,
+    // 把"点了没反应"的静默失败变成可诊断的提示,而不是让用户以为功能坏了。
+    if (picked.length === 0) {
+      toast("未获取到所选文件,请重试", "info");
+      return;
+    }
     // 上限守卫前置:超出配额的文件**不上传**(此前 chip 有守卫但 onUpload 无条件执行 →
     // 超限文件白白上传后结果被丢弃),且截断有明确提示而非静默。
     const room = Math.max(0, MAX_ATTACH - attachments.length);
-    const arr = Array.from(files).slice(0, room);
-    const dropped = files.length - arr.length;
+    const arr = picked.slice(0, room);
+    const dropped = picked.length - arr.length;
     if (dropped > 0) toast(`最多 ${MAX_ATTACH} 个附件,已忽略 ${dropped} 个`, "info");
     for (const file of arr) {
       const id = `att-${idRef.current++}`;
@@ -147,7 +159,7 @@ export function Composer({
             type="file"
             multiple
             className="hidden"
-            onChange={(e) => onFiles(e.target.files)}
+            onChange={(e) => onFiles(Array.from(e.currentTarget.files ?? []))}
           />
           <IconButton
             aria-label="添加附件"
