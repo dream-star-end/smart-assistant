@@ -4866,6 +4866,7 @@ export class Gateway {
       this.sendJson(res, 200, {
         text: store.read(target),
         charCount: store.charCount(target),
+        limit: store.charLimit(target),
         target,
       })
       return
@@ -4874,7 +4875,11 @@ export class Gateway {
       const body = await this.readJsonBody<{ text?: string }>(req)
       const r = await store.overwrite(target, body.text ?? '')
       if (!r.ok) return this.sendError(res, 400, r.error ?? 'save failed')
-      this.sendJson(res, 200, { ok: true, charCount: store.charCount(target) })
+      this.sendJson(res, 200, {
+        ok: true,
+        charCount: store.charCount(target),
+        limit: store.charLimit(target),
+      })
       return
     }
     this.sendError(res, 405, 'method not allowed')

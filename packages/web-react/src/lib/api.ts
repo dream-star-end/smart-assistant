@@ -1126,9 +1126,10 @@ export const api = {
   // (127.0.0.1:18789，按 userId 隔离)。前端只需普通 Bearer fetch，无需特殊 header。
   // 容器未就绪时 router 会先 ensureContainerReady（可能冷启 ~40s），失败返 503/4503。
 
-  /** 取某 agent 的记忆文档（GET /api/agents/:id/memory/:target，target=memory|user）。 */
+  /** 取某 agent 的记忆文档（GET /api/agents/:id/memory/:target，target=memory|user）。
+   *  limit = 该 target 的字符预算（权威源在后端 DEFAULT_LIMITS，前端只做展示）。 */
   getMemory: (a: AuthSession, agentId: string, target: "memory" | "user") =>
-    jsonOrThrow<{ text: string; charCount?: number; target: string }>(
+    jsonOrThrow<{ text: string; charCount?: number; limit?: number; target: string }>(
       callWithRefresh(a, (t) =>
         fetch(`/api/agents/${encodeURIComponent(agentId)}/memory/${target}`, {
           credentials: "include",
@@ -1139,7 +1140,7 @@ export const api = {
 
   /** 写某 agent 的记忆文档（PUT /api/agents/:id/memory/:target）。 */
   putMemory: (a: AuthSession, agentId: string, target: "memory" | "user", text: string) =>
-    jsonOrThrow<{ ok: boolean; charCount?: number }>(
+    jsonOrThrow<{ ok: boolean; charCount?: number; limit?: number }>(
       callWithRefresh(a, (t) =>
         fetch(`/api/agents/${encodeURIComponent(agentId)}/memory/${target}`, {
           method: "PUT",
