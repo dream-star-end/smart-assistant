@@ -142,7 +142,7 @@ function rehypeEmbedMedia() {
   }
 }
 
-export default function MarkdownImpl({ children, signMedia }: MarkdownProps) {
+export default function MarkdownImpl({ children, signMedia, live }: MarkdownProps) {
   return (
     <div className="prose">
       <ReactMarkdown
@@ -176,7 +176,7 @@ export default function MarkdownImpl({ children, signMedia }: MarkdownProps) {
               if (lang === "chart") return <ChartBlock code={nodeText(children).replace(/\n$/, "")} />;
               if (lang === "options") return <OptionsBlock code={nodeText(children).replace(/\n$/, "")} />;
               if (lang === "html" || lang === "htmlpreview")
-                return <HtmlPreview code={nodeText(children).replace(/\n$/, "")} />;
+                return <HtmlPreview code={nodeText(children).replace(/\n$/, "")} live={live} />;
               return (
                 <CodeBlock language={lang}>
                   <span className={className} {...props}>

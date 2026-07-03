@@ -55,7 +55,7 @@ export function AssistantMessage({
 }) {
   return (
     <div className="group flex gap-4 animate-in">
-      <Avatar tone="brand" className="mt-0.5 shadow-sm">
+      <Avatar tone="brand" className="mt-0.5 hidden shadow-sm sm:inline-flex">
         <Sparkles size={16} />
       </Avatar>
       <div className="min-w-0 flex-1">

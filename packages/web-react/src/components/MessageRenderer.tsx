@@ -178,7 +178,8 @@ export function MessageList({
       )}
       {showTyping && (
         <div className="flex gap-4 animate-in">
-          <Avatar tone="brand" className="mt-0.5 shadow-sm">
+          {/* 与 AssistantCard 一致:移动端隐藏头像,窄屏正文占满宽度。 */}
+          <Avatar tone="brand" className="mt-0.5 hidden shadow-sm sm:inline-flex">
             <Sparkles size={16} />
           </Avatar>
           <div className="min-w-0 flex-1">

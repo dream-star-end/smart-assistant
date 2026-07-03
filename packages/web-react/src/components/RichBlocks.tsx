@@ -299,8 +299,11 @@ export function ChartBlock({ code }: { code: string }) {
   );
 }
 
+/** 流式期 HTML 预览的最小重载间隔(ms):压住 iframe 整帧重载频率,轻微闪≠狂闪。 */
+const RENDER_THROTTLE_MS = 800;
+
 /** ```html 代码块 → **默认沙盒预览**(allow-scripts,无 same-origin),可切源码 + 全屏放大。 */
-export function HtmlPreview({ code }: { code: string }) {
+export function HtmlPreview({ code, live }: { code: string; live?: boolean }) {
   const [show, setShow] = useState(true); // 默认预览(boss:html 应默认渲染,而非看源码)
   const [full, setFull] = useState(false);
   // 全屏时按 Esc 退出。
@@ -312,14 +315,33 @@ export function HtmlPreview({ code }: { code: string }) {
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [full]);
+  // 流式渲染节流:iframe 每次换 srcDoc 都会整帧重载(白屏一闪),逐 token 更新会狂闪。
+  // committed=喂给 iframe 的代码,只在它变化时才触发重载。两条 effect 各司其职:
+  const [committed, setCommitted] = useState(code);
+  const codeRef = useRef(code);
+  codeRef.current = code;
+  // ① 非流式(含不传 live 的静态/子 agent 调用方):committed 始终跟最新 code,立即渲染、
+  //    不节流(保持"缺省 live=false 行为不变"契约);也承接 live→false 收尾,最终完整帧即时落地。
+  useEffect(() => {
+    if (!live) setCommitted(code);
+  }, [code, live]);
+  // ② 流式期:仅随 live 变化建/拆一个节流 interval(不随每个 delta 重建),每 RENDER_THROTTLE_MS
+  //    把最新代码(codeRef,避免 stale 闭包)提交一次 → 实时可见但重载频率压到 ~1/0.8s(轻微闪)。
+  //    代码未变时 setCommitted 同值被 React bail,不重载(如 HTML 已写完、仍在写尾注阶段)。
+  useEffect(() => {
+    if (!live) return;
+    const id = window.setInterval(() => setCommitted(codeRef.current), RENDER_THROTTLE_MS);
+    return () => window.clearInterval(id);
+  }, [live]);
   // sandbox 不含 allow-same-origin → 取不到父页 cookie/storage;仅 allow-scripts 跑演示。
+  // 预览用节流后的 committed;看源码(下方 pre)直接用最新 code(纯文本不闪,无需节流)。
   const frame = (cls: string) => (
-    <iframe sandbox="allow-scripts" srcDoc={code} title="HTML 沙盒预览" className={cls} />
+    <iframe sandbox="allow-scripts" srcDoc={committed} title="HTML 沙盒预览" className={cls} />
   );
   return (
     <div className="my-3 overflow-hidden rounded-lg border border-border">
       <div className="flex items-center justify-between border-b border-border bg-hover px-3 py-1.5 text-[12px] text-muted">
-        <span>HTML {show ? "预览(沙盒)" : "源码"}</span>
+        <span>HTML {show ? (live ? "预览(生成中)" : "预览(沙盒)") : "源码"}</span>
         <div className="flex items-center gap-1">
           {show && (
             <button

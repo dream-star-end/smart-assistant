@@ -14,6 +14,12 @@ export type MarkdownProps = {
   /** 富文本里的行内 <img>（含容器路径）经 /api/media-sign 主动签名后渲染（assistant/
    *  tool 正文用）。缺省 false 保持原生 img 行为（demo / 无媒体场景零改动）。 */
   signMedia?: boolean;
+  /**
+   * 本条消息是否仍在流式生成中。传给重型富块（HTML 沙盒预览）：流式期间正文每个 delta
+   * 都会重建 srcDoc → iframe 整帧重载 → 白屏闪烁,且此时 HTML 常是半截。true 时富块只给
+   * 稳定占位,生成结束（false）再一次性挂载渲染。缺省 false（历史/静态消息立即渲染）。
+   */
+  live?: boolean;
 };
 
 const MarkdownImpl = lazy(() => import("./MarkdownImpl"));
@@ -42,12 +48,14 @@ class MarkdownBoundary extends Component<{ fallback: ReactNode; children: ReactN
   }
 }
 
-export const Markdown = memo(function Markdown({ children, signMedia }: MarkdownProps) {
+export const Markdown = memo(function Markdown({ children, signMedia, live }: MarkdownProps) {
   const fallback = <MarkdownFallback>{children}</MarkdownFallback>;
   return (
     <MarkdownBoundary fallback={fallback}>
       <Suspense fallback={fallback}>
-        <MarkdownImpl signMedia={signMedia}>{children}</MarkdownImpl>
+        <MarkdownImpl signMedia={signMedia} live={live}>
+          {children}
+        </MarkdownImpl>
       </Suspense>
     </MarkdownBoundary>
   );

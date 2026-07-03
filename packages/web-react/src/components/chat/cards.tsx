@@ -274,7 +274,8 @@ export function AssistantCard({
 
   return (
     <div className="group flex gap-4 animate-in">
-      <Avatar tone="brand" className="mt-0.5 shadow-sm">
+      {/* 移动端隐藏助手头像:窄屏下头像+间距挤占正文宽度(boss 反馈),≥sm 才显示。 */}
+      <Avatar tone="brand" className="mt-0.5 hidden shadow-sm sm:inline-flex">
         <Sparkles size={16} />
       </Avatar>
       <div className="min-w-0 flex-1">
@@ -288,7 +289,9 @@ export function AssistantCard({
 
         {/* 正文：错误时不在卡外渲染裸正文(友好文案并入下方红卡),避免"server shutting down"式裸文本 */}
         {msg.text && !hasError ? (
-          <Markdown signMedia>{msg.text}</Markdown>
+          <Markdown signMedia live={live}>
+            {msg.text}
+          </Markdown>
         ) : live && !hasError ? (
           <TypingDots />
         ) : null}
