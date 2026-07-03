@@ -98,7 +98,7 @@ import {
   ocGatewayIpForChannel,
   ocInternalProxyPortForChannel,
 } from "./agent-sandbox/v3supervisor.js";
-import { getRuntimeChannel } from "./runtimeChannel.js";
+import { getCodexAccountRuntimeChannel, getRuntimeChannel } from "./runtimeChannel.js";
 import { V3_AGENT_GID, V3_AGENT_UID } from "./agent-sandbox/constants.js";
 import {
   startPendingOrdersExpirer,
@@ -2843,8 +2843,8 @@ export async function registerCommercial(
               //            重新走 picker 路径产出 per-container mount。
               // 池子查询条件必须与 pickCodexAccountForBinding 完全一致(provider='codex'
               // AND status='active'),否则可能误判为"有账号"但 picker 实际拿不到。
-              // 0098:池按 runtime_channel 划分权威,只数本 channel 的行(picker 同口径)。
-              const poolParams: unknown[] = [getRuntimeChannel()];
+              // 0098+:池按 Codex account-pool channel 划分权威,只数 picker 同口径账号行。
+              const poolParams: unknown[] = [getCodexAccountRuntimeChannel()];
               const poolWhere = ["provider = 'codex'", "status = 'active'", "runtime_channel = $1"];
               if (desiredGroupId !== null) {
                 poolParams.push(desiredGroupId);

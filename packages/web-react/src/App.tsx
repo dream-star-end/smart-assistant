@@ -537,14 +537,10 @@ export function App() {
     const resolved =
       activeSessAgentId === DEFAULT_AGENT.id
         ? DEFAULT_AGENT
-        : (myAgents.find((a) => a.id === activeSessAgentId) ?? {
-            // 已卸载/目录未含的 agent:退化 stub(id 直显),仍保证 send/stop 归属一致。
-            id: activeSessAgentId,
-            name: activeSessAgentId,
-            avatarEmoji: "🤖",
-            grad: "from-violet-500 to-fuchsia-600",
-            description: "",
-          });
+        : (myAgents.find((a) => a.id === activeSessAgentId) ?? DEFAULT_AGENT);
+    if (resolved.id === DEFAULT_AGENT.id && activeSessAgentId !== DEFAULT_AGENT.id && activeId) {
+      chat.switchAgent(activeId, DEFAULT_AGENT.id);
+    }
     // myAgents 必须进依赖:刷新/重开会话时目录常晚于会话解析到达,若只看 id 相等就
     // early-return,stub(裸 slug 如 research-assistant)会永久卡在 header,目录到了
     // 也不重算。按展示字段判等:id/名字/头像任一不同才 set(stub→真名会触发,恒等
@@ -556,7 +552,7 @@ export function App() {
     ) {
       setAgent(resolved);
     }
-  }, [activeSessAgentId, agent.id, agent.name, agent.avatarEmoji, myAgents]);
+  }, [activeSessAgentId, activeId, agent.id, agent.name, agent.avatarEmoji, myAgents, chat]);
 
   // 非 demo：展示的消息来自 WS service 快照（就地 mutation + version 触发重渲）。
   const wsMessages = !demo && activeId ? chat.getMessages(activeId) : EMPTY_WS_MESSAGES;

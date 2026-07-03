@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, it } from "node:test";
 
 import {
   dockerContainerOwnedByChannel,
+  getCodexAccountRuntimeChannel,
   getRuntimeChannel,
   isV5Channel,
 } from "../runtimeChannel.js";
@@ -15,12 +16,16 @@ import {
 
 describe("runtimeChannel", () => {
   const saved = process.env.OC_RUNTIME_CHANNEL;
+  const savedCodex = process.env.OC_CODEX_ACCOUNT_RUNTIME_CHANNEL;
   beforeEach(() => {
     delete process.env.OC_RUNTIME_CHANNEL;
+    delete process.env.OC_CODEX_ACCOUNT_RUNTIME_CHANNEL;
   });
   afterEach(() => {
     if (saved === undefined) delete process.env.OC_RUNTIME_CHANNEL;
     else process.env.OC_RUNTIME_CHANNEL = saved;
+    if (savedCodex === undefined) delete process.env.OC_CODEX_ACCOUNT_RUNTIME_CHANNEL;
+    else process.env.OC_CODEX_ACCOUNT_RUNTIME_CHANNEL = savedCodex;
   });
 
   it("未设 env → 默认 v3(现网零行为变化)", () => {
@@ -44,6 +49,21 @@ describe("runtimeChannel", () => {
   it("带前后空白的 'v5' 被 trim 后认作 v5", () => {
     process.env.OC_RUNTIME_CHANNEL = "  v5  ";
     assert.equal(getRuntimeChannel(), "v5");
+  });
+
+
+  it("Codex account channel defaults to runtime channel, but can be overridden", () => {
+    assert.equal(getCodexAccountRuntimeChannel(), "v3");
+    process.env.OC_RUNTIME_CHANNEL = "v5";
+    assert.equal(getCodexAccountRuntimeChannel(), "v5");
+    process.env.OC_CODEX_ACCOUNT_RUNTIME_CHANNEL = "v3";
+    assert.equal(getCodexAccountRuntimeChannel(), "v3");
+  });
+
+  it("invalid Codex account channel fail-closes independently", () => {
+    process.env.OC_RUNTIME_CHANNEL = "v5";
+    process.env.OC_CODEX_ACCOUNT_RUNTIME_CHANNEL = "prod";
+    assert.throws(() => getCodexAccountRuntimeChannel(), /非法 OC_CODEX_ACCOUNT_RUNTIME_CHANNEL/);
   });
 
   it("非法值(大写/typo/其它 channel)fail-closed throw", () => {

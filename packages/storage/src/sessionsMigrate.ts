@@ -38,6 +38,10 @@ const CLIENT_SESSION_COLS =
 const WECHAT_BINDING_COLS =
   'user_id,account_id,login_user_id,bot_token,get_updates_buf,context_tokens,whitelist,status,created_at,updated_at,last_event_at'
 
+// v5 runtime exposes the default assistant plus marketplace/preset agents. Legacy
+// v3 rows can carry old seed ids (notably `codex`), which would otherwise leak
+// back into the v5 picker/header and route turns through an unintended engine.
+// Preserve the transcript but normalize these obsolete ids to the v5 default.
 /**
  * 把 v3 master sessions.db 中某用户的 client_sessions(+ wechat_bindings)迁到 v5 master
  * sessions.db。默认目标 = 当前进程 HOME 的 sessions.db(须为 v5 master,
@@ -83,7 +87,10 @@ export async function migrateUserClientSessionsFromV3(
         return db
           .prepare(
             `INSERT INTO client_sessions (${CLIENT_SESSION_COLS})
-             SELECT ${CLIENT_SESSION_COLS} FROM v3src.client_sessions WHERE user_id = @uid
+             SELECT id,user_id,
+                    'main' AS agent_id,
+                    title,pinned,created_at,last_at,messages,message_count,updated_at,deleted_at,next_seq,origin_channel
+               FROM v3src.client_sessions WHERE user_id = ?
              ON CONFLICT(id) DO UPDATE SET
                agent_id      = excluded.agent_id,
                title         = excluded.title,
@@ -100,7 +107,7 @@ export async function migrateUserClientSessionsFromV3(
              WHERE client_sessions.user_id = excluded.user_id
                AND excluded.updated_at >= client_sessions.updated_at`,
           )
-          .run({ uid }).changes
+          .run(uid).changes
       })
       const clientSessions = csRun(sessionUserId)
 
