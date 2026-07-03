@@ -95,6 +95,25 @@ function OutputBlock({ output, max = 1500 }: { output?: string | null; max?: num
   return <Pre>{text.length > max ? text.slice(0, max) + "\n…" : text}</Pre>;
 }
 
+function extractImageGenerationPath(input: Input, output?: string | null): string {
+  const direct = asStr(input?.savedPath) || asStr(input?.path) || asStr(input?.outputPath);
+  if (direct) return direct;
+  const text = asStr(output);
+  if (!text) return "";
+  const arrowMatch = /imageGeneration\s*→\s*(\S+)/.exec(text);
+  if (arrowMatch) return arrowMatch[1];
+  const imagePathMatch = /((?:\/[\w. -]+)+\.(?:png|jpe?g|webp|gif))/i.exec(text);
+  return imagePathMatch?.[1] ?? "";
+}
+
+function stripDuplicateImageGenerationOutput(output: string | null | undefined, path: string): string | null {
+  if (!output) return null;
+  const text = String(output).trim();
+  if (!text) return null;
+  if (path && (text === path || text === `imageGeneration → ${path}`)) return null;
+  return output;
+}
+
 // ── builtin ───────────────────────────────────────────────────────────────
 
 const MAX_DIFF_LINES = 60;
@@ -393,13 +412,35 @@ function CodexBody({ type, input, tool }: BodyProps & { type: string }) {
   }
   if (type === "imageGeneration") {
     const prompt = asStr(input?.prompt) || asStr(input?.revisedPrompt);
-    const savedPath = asStr(input?.savedPath) || asStr(input?.path) || asStr(input?.outputPath);
+    const savedPath = extractImageGenerationPath(input, tool.output);
+    const running = !tool._completed && !tool.error;
+    const output = stripDuplicateImageGenerationOutput(tool.output, savedPath);
     return (
       <>
         {prompt && <PromptBlock>{prompt}</PromptBlock>}
+        {running && <StatusLine text="图片生成中，通常需要几十秒，请稍候…" />}
+        {!running && !tool.error && <StatusLine text="图片已生成" />}
         {savedPath && <FileMeta>{shortPath(savedPath)}</FileMeta>}
-        {input && <KvList obj={input} skip={["id", "type", "prompt", "revisedPrompt", "result"]} />}
-        <OutputBlock output={tool.output} />
+        {input && (
+          <KvList
+            obj={input}
+            skip={[
+              "id",
+              "type",
+              "status",
+              "prompt",
+              "revisedPrompt",
+              "result",
+              "savedPath",
+              "path",
+              "outputPath",
+              "durationMs",
+              "pluginId",
+              "_meta",
+            ]}
+          />
+        )}
+        <OutputBlock output={output} />
       </>
     );
   }

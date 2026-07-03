@@ -164,7 +164,7 @@ function extractCodexOutput(item: Record<string, unknown> | null): string | null
       }
     }
   }
-  if (typeof result === "string") return result;
+  if (typeof result === "string") return result || null;
   if (error && typeof error === "object" && !Array.isArray(error)) {
     const message = asStr((error as Record<string, unknown>).message);
     if (message) return message;

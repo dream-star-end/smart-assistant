@@ -304,6 +304,76 @@ describe("ToolCard 二级分派 + 状态 (P5)", () => {
     expect(text).not.toContain("img1");
   });
 
+  test("Codex imageGeneration 运行中显示友好等待态，不展示 raw status wrapper", () => {
+    render(
+      <ToolCard
+        message={{
+          toolName: "codex:imageGeneration",
+          inputJson: {
+            type: "imageGeneration",
+            id: "ig_running",
+            status: "in_progress",
+            revisedPrompt: null,
+            result: "",
+          },
+          _completed: false,
+        }}
+      />,
+    );
+    expect(screen.getByText("生成图片")).toBeInTheDocument();
+    expect(screen.getByText("图片生成中，通常需要几十秒，请稍候…")).toBeInTheDocument();
+    const text = document.body.textContent || "";
+    expect(text).not.toContain("in_progress");
+    expect(text).not.toContain("ig_running");
+    expect(text).not.toContain("imageGeneration");
+  });
+
+  test("Codex imageGeneration 完成后显示生成结果，不保留 status in_progress", () => {
+    render(
+      <ToolCard
+        message={{
+          toolName: "codex:imageGeneration",
+          inputJson: {
+            type: "imageGeneration",
+            id: "ig_done",
+            status: "in_progress",
+            revisedPrompt: null,
+            result: "",
+          },
+          output:
+            "imageGeneration → /home/agent/.codex/generated_images/thread/ig_done.png",
+          _completed: true,
+        }}
+      />,
+    );
+    expect(screen.getByText("生成图片")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button"));
+    expect(screen.getByText("图片已生成")).toBeInTheDocument();
+    expect(screen.getByText("…/generated_images/thread/ig_done.png")).toBeInTheDocument();
+    const text = document.body.textContent || "";
+    expect(text).not.toContain("in_progress");
+    expect(text).not.toContain("imageGeneration →");
+  });
+
+  test("Codex imageGeneration 失败仍展示错误输出", () => {
+    render(
+      <ToolCard
+        message={{
+          toolName: "codex:imageGeneration",
+          inputJson: { type: "imageGeneration", id: "ig_error", status: "failed" },
+          output: "imageGeneration failed: quota exceeded",
+          error: true,
+          _completed: true,
+        }}
+      />,
+    );
+    expect(screen.getByText("生成图片")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button"));
+    expect(screen.getByText(/imageGeneration failed: quota exceeded/)).toBeInTheDocument();
+    const text = document.body.textContent || "";
+    expect(text).not.toContain("ig_error");
+  });
+
   test("Codex contextCompaction 合并 completed-only 字段", () => {
     render(
       <ToolCard
