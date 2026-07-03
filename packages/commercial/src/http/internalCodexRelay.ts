@@ -37,10 +37,18 @@ import {
   resolveCodexRouteContext,
   type ResolvedCodexRouteContext,
 } from '../account-pool/groups.js'
+import { getCodexTokenSnapshot } from '../account-pool/store.js'
 import { zeroBuffer } from '../crypto/keys.js'
 
 export const CODEX_RELAY_PREFIX = '/internal/v3/codex-relay'
 export const CODEX_UPSTREAM_AUTH_HEADER = 'x-openclaude-upstream-authorization'
+
+/** official_oauth 数据面的专用上游常量(方案 A3d/B5):代码内固定,不依赖
+ *  OC_CODEX_UPSTREAM_BASE_URL env(那是 api_relay 遗产键,v5 部署已删)。
+ *  对应容器 loopback base path = `${CODEX_RELAY_PREFIX}/backend-api/codex`
+ *  (codexRelayBasePathForUpstream 既有拼法),与 gateway 侧
+ *  CODEX_OFFICIAL_RELAY_BASE_PATH 常量成对 —— parity 由单测锁定。 */
+export const CODEX_OFFICIAL_UPSTREAM_BASE_URL = 'https://chatgpt.com/backend-api/codex'
 
 const HOP_BY_HOP_HEADERS = new Set([
   'connection',
@@ -61,6 +69,13 @@ const SAFE_UPSTREAM_REQUEST_HEADERS = new Set([
   'openai-organization',
   'openai-project',
   'user-agent',
+  // chatgpt.com/backend-api/codex(official_oauth 数据面)必需的非敏感请求元数据:
+  // codex CLI 在 ChatGPT auth 模式下随请求发送 chatgpt-account-id(选择 workspace)、
+  // originator / session_id / conversation_id(客户端指纹与会话关联)。均非凭证。
+  'chatgpt-account-id',
+  'originator',
+  'session_id',
+  'conversation_id',
 ])
 
 export interface CodexRelayCtx {
@@ -100,6 +115,10 @@ export interface CodexRelayDeps {
   resolveRouteContext?: typeof resolveCodexRouteContext
   markCredentialFailure?: typeof markRelayCredentialFailure
   markCredentialSuccess?: typeof markRelayCredentialSuccess
+  /** 非 route 路径的 fallback 代注(方案 B5/3b):仅当容器没带上游 Authorization
+   *  时,按绑定账号读当前 access token 代注。返回 Buffer 由 handler 用后清零。
+   *  返回 null / 抛错 → 503 fail-closed(不静默直连、不裸转发)。 */
+  readBoundAccountAccessToken?: (accountId: bigint) => Promise<Buffer | null>
   fetchImpl?: typeof fetch
   logger?: Logger
 }
@@ -208,6 +227,41 @@ export function mapCodexRelayUrl(
     upstreamPath: upstream.pathname,
     suffix,
   }
+}
+
+/**
+ * 非 route 路径可用的上游 base 集合(方案 B5):official 常量恒在;env base
+ * (api_relay 遗产,v3 兼容)仅在 relay base path 与 official 不撞时保留。
+ * 撞了 official 赢 —— env 不允许把 `/backend-api/codex` 前缀劫持到别的 host。
+ * 返回按 base path 从长到短排序,供最长前缀优先匹配。
+ */
+export function resolveCodexRelayUpstreamBases(envUpstreamBaseUrl: string): string[] {
+  const officialBasePath = normalizeBasePath(CODEX_OFFICIAL_UPSTREAM_BASE_URL)
+  const bases = [CODEX_OFFICIAL_UPSTREAM_BASE_URL]
+  if (normalizeBasePath(envUpstreamBaseUrl) !== officialBasePath) {
+    bases.push(envUpstreamBaseUrl)
+  }
+  return bases.sort((a, b) => normalizeBasePath(b).length - normalizeBasePath(a).length)
+}
+
+/**
+ * 多上游 base 的路径映射:最长 base path 优先。base path 不匹配(NOT_FOUND)
+ * 才尝试下一个;base path 匹配但 suffix 不在 allowlist(PATH_NOT_ALLOWED /
+ * BAD_PATH / BAD_URL)立即返回该错,不给短前缀 base "接盘" 的机会。
+ */
+export function mapCodexRelayUrlMulti(
+  reqUrl: string,
+  method: string,
+  upstreamBaseUrls: string[],
+): ReturnType<typeof mapCodexRelayUrl> {
+  let notFound: ReturnType<typeof mapCodexRelayUrl> | null = null
+  for (const base of upstreamBaseUrls) {
+    const mapped = mapCodexRelayUrl(reqUrl, method, base)
+    if (!('error' in mapped)) return mapped
+    if (mapped.error.code !== 'NOT_FOUND') return mapped
+    notFound ??= mapped
+  }
+  return notFound ?? { error: { status: 404, code: 'NOT_FOUND', message: 'unknown codex relay path' } }
 }
 
 
@@ -337,10 +391,12 @@ export function makeDefaultCodexRelayDb(): CodexRelayDb {
 
 export function makeCodexRelayHandler(deps: CodexRelayDeps): CodexRelayHandler {
   const log = (deps.logger ?? rootLogger).child({ subsys: 'internalCodexRelay' })
-  const upstreamBaseUrl = deps.upstreamBaseUrl ?? readCodexUpstreamBaseUrl()
+  const envUpstreamBaseUrl = deps.upstreamBaseUrl ?? readCodexUpstreamBaseUrl()
   // Validate once at construction; invalid env should fail loudly during boot
   // rather than at first user request.
-  new URL(upstreamBaseUrl)
+  new URL(envUpstreamBaseUrl)
+  // 非 route 路径支持的上游集合:official 常量 + env base(v3 api_relay 兼容)。
+  const upstreamBaseUrls = resolveCodexRelayUpstreamBases(envUpstreamBaseUrl)
   const resolveDispatcher = deps.resolveDispatcher ?? (async (accountId: bigint) => {
     const r = await resolveCodexAccountEgressDispatcher(accountId)
     return { accountId: r.accountId, proxyId: r.proxyId, dispatcher: r.dispatcher }
@@ -348,6 +404,13 @@ export function makeCodexRelayHandler(deps: CodexRelayDeps): CodexRelayHandler {
   const resolveRoute = deps.resolveRouteContext ?? resolveCodexRouteContext
   const markCredentialFailure = deps.markCredentialFailure ?? markRelayCredentialFailure
   const markCredentialSuccess = deps.markCredentialSuccess ?? markRelayCredentialSuccess
+  const readBoundAccountAccessToken = deps.readBoundAccountAccessToken ?? (async (accountId: bigint) => {
+    const snap = await getCodexTokenSnapshot(accountId)
+    if (!snap) return null
+    // 代注只需要 access token;refresh 材料立即清零,不出本闭包。
+    if (snap.refresh) zeroBuffer(snap.refresh)
+    return snap.token
+  })
   const fetchImpl = deps.fetchImpl ?? fetch
 
   return async function handle(req, res, ctx) {
@@ -365,7 +428,7 @@ export function makeCodexRelayHandler(deps: CodexRelayDeps): CodexRelayHandler {
     }
     let mapped: ReturnType<typeof mapCodexRelayUrl> | null = null
     if (routeReq.route === false) {
-      mapped = mapCodexRelayUrl(req.url ?? '/', method, upstreamBaseUrl)
+      mapped = mapCodexRelayUrlMulti(req.url ?? '/', method, upstreamBaseUrls)
       if ('error' in mapped) {
         sendJsonError(res, mapped.error.status, mapped.error.code, mapped.error.message, requestId)
         return
@@ -413,6 +476,14 @@ export function makeCodexRelayHandler(deps: CodexRelayDeps): CodexRelayHandler {
     let egress: CodexRelayDispatcherInfo | null = null
     let routeContext: ResolvedCodexRouteContext | null = null
     let mappedUrl: { url: string; upstreamHost: string; upstreamPath: string }
+    // 非 route 路径的上游 Authorization 来源(B5/3b):
+    //   container         — 容器带了 x-openclaude-upstream-authorization,原样转发;
+    //                        上游 401 → 记日志 + 401 透传 fail-closed,绝不改用
+    //                        DB token 静默重试(防掩盖 codex auth 行为漂移)。
+    //   account_fallback  — 容器没带 → 按绑定账号 DB 读 access token 代注;
+    //                        读不到 / 解密失败 → 503 fail-closed。
+    let hadContainerUpstreamAuth = false
+    let fallbackAccessToken: Buffer | null = null
     if (routeReq.route === true) {
       try {
         routeContext = await resolveRoute({
@@ -461,6 +532,32 @@ export function makeCodexRelayHandler(deps: CodexRelayDeps): CodexRelayHandler {
         return
       }
       mappedUrl = mapped as Exclude<typeof mapped, null | { error: unknown }>
+
+      const upstreamAuthRaw = req.headers[CODEX_UPSTREAM_AUTH_HEADER]
+      hadContainerUpstreamAuth =
+        typeof upstreamAuthRaw === 'string' && upstreamAuthRaw.trim().length > 0
+      if (!hadContainerUpstreamAuth) {
+        try {
+          fallbackAccessToken = await readBoundAccountAccessToken(binding.codexAccountId)
+        } catch (err) {
+          userLog.warn('auth_fallback_token_read_failed', {
+            codexAccountId: String(binding.codexAccountId),
+            err: err instanceof Error ? err.message : String(err),
+          })
+          sendJsonError(res, 503, 'CODEX_ACCOUNT_TOKEN_UNAVAILABLE', 'codex account token unavailable', requestId)
+          return
+        }
+        if (fallbackAccessToken === null || fallbackAccessToken.length === 0) {
+          userLog.warn('auth_fallback_token_missing', {
+            codexAccountId: String(binding.codexAccountId),
+          })
+          sendJsonError(res, 503, 'CODEX_ACCOUNT_TOKEN_UNAVAILABLE', 'codex account token unavailable', requestId)
+          return
+        }
+        userLog.info('auth_fallback_injected', {
+          codexAccountId: String(binding.codexAccountId),
+        })
+      }
     }
 
     const controller = new AbortController()
@@ -494,10 +591,27 @@ export function makeCodexRelayHandler(deps: CodexRelayDeps): CodexRelayHandler {
           zeroBuffer(apiKey)
         }
       }
+      if (fallbackAccessToken !== null) {
+        try {
+          init.headers = init.headers instanceof Headers ? init.headers : new Headers(init.headers as HeadersInit)
+          ;(init.headers as Headers).set('authorization', `Bearer ${fallbackAccessToken.toString('utf8')}`)
+        } finally {
+          zeroBuffer(fallbackAccessToken)
+          fallbackAccessToken = null
+        }
+      }
       const upstream = await fetchImpl(mappedUrl.url, init)
       res.statusCode = upstream.status
       copyResponseHeaders(upstream.headers, res)
       relayLog.info('relay_upstream_response', { status: upstream.status })
+      if (egress !== null && upstream.status === 401 && hadContainerUpstreamAuth) {
+        // fail-closed:容器自带的上游 Authorization 被上游拒 → 只记日志、401 原样
+        // 透传。不允许在这里换 DB token 重试 —— 那会静默掩盖 codex CLI auth 行为
+        // 漂移 / 容器 auth.json 与账号池的失同步。
+        relayLog.warn('upstream_401_container_auth_fail_closed', {
+          codexAccountId: String(egress.accountId),
+        })
+      }
       if (routeContext) {
         if (isRelayCredentialFailureStatus(upstream.status)) {
           void markCredentialFailure(routeContext.credential.id, `http_${upstream.status}`).catch(() => {})

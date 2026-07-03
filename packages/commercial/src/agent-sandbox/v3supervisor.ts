@@ -2052,6 +2052,16 @@ export async function provisionV3Container(
       if (boundCodexAccountId !== null) {
         // per-container subdir 由 writeCodexContainerAuthFile / putRemoteCodexAuth 创建
         codexMountSource = pathJoin(codexContainerDir, String(row.id));
+      } else if (!useRemote && getRuntimeChannel() === "v5") {
+        // v5 channel(方案 B6):绑定失败 / codex_account_id=NULL 时**不挂**
+        // legacy 共享 codex auth 目录 —— 共享 auth.json 里可能残留上游 key,
+        // 挂进去等于把平台凭证暴露给用户容器。不挂 → 容器内 $CODEX_HOME/auth.json
+        // symlink dangling = 干净未授权,官方账号未就位时 gpt-5.5 fail-closed
+        // 报错,不阻塞 provision。v3 channel(下方分支)行为逐字节不动。
+        // eslint-disable-next-line no-console
+        console.error(
+          `[v3supervisor] WARN: v5 container ${String(row.id)} has no codex account binding; skipping legacy shared codex auth mount (fail-closed)`,
+        );
       } else if (!useRemote) {
         // 本地 fallback:legacy shared dir mount
         try {

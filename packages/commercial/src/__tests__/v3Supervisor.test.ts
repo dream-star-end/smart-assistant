@@ -668,6 +668,38 @@ describe("provisionV3Container", () => {
     }
   });
 
+  test("B6:v5 channel 绑定失败/NULL 不挂 legacy 共享 codex auth 目录(fail-closed;v3 对照见 §9.3 测试)", async () => {
+    // 本测试与 §9.3 基线测试同构:无 DATABASE_URL → pickCodexAccountForBinding 抛错
+    // → boundCodexAccountId=null。v3 channel(§9.3 测试)断言共享目录 bind **存在**,
+    // v5 channel 在此断言它**不存在** —— 共享 auth.json 可能残留上游 key,不得暴露
+    // 给 v5 用户容器(feat/v5-codex-oauth-egress B6)。
+    const savedChannel = process.env.OC_RUNTIME_CHANNEL;
+    try {
+      process.env.OC_RUNTIME_CHANNEL = "v5";
+      const { docker, captured } = makeDocker();
+      await provisionV3Container(
+        {
+          docker,
+          pool: pool as unknown as Pool,
+          image: TEST_IMAGE,
+          selfHostId: TEST_HOST,
+          randomIp: () => "172.31.5.44",
+          randomSecret: fixedSecret("d".repeat(64)),
+        },
+        779,
+      );
+      const binds = (captured.containersCreated[0]?.HostConfig?.Binds ?? []) as string[];
+      assert.ok(binds.length > 0, "v5 容器仍需其它 bind(data/proj/codex volume 等)");
+      assert.ok(
+        !binds.some((b) => b.includes(":/run/oc/codex-auth:")),
+        `v5 容器不得挂共享 codex auth fallback,got: ${JSON.stringify(binds)}`,
+      );
+    } finally {
+      if (savedChannel === undefined) delete process.env.OC_RUNTIME_CHANNEL;
+      else process.env.OC_RUNTIME_CHANNEL = savedChannel;
+    }
+  });
+
   test("资源限额 env 覆盖:合法小数 CPU 正确转换 + 非法微值回退默认(Codex round 1 BLOCKER 回归锁)", async () => {
     // Codex round 1 抓到的 bug:OC_V3_MEMORY_MB=0.5 会被 floor 成 0,Docker 当"不限";必须回退默认
     const savedMem = process.env.OC_V3_MEMORY_MB;

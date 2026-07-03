@@ -26,6 +26,7 @@ import type {
   TurnToolEntry,
 } from './engine/engineEvents.js'
 import { createEngine, resolveEngine } from './engine/registry.js'
+import type { CodexProviderConfigOverride } from './engine/codexShared.js'
 import { engineSessionId } from './engine/engineSessionId.js'
 import { eventBus, createEvent } from './eventBus.js'
 import { createLogger } from './logger.js'
@@ -1554,6 +1555,10 @@ export class SessionManager {
     conversationMode?: 'default' | 'plan',
     opts?: {
       historicalMessages?: unknown[]
+      /** v5 codex route 消费链(A1):dispatchInbound 校验后的 per-turn provider
+       *  路由覆盖。每 turn 显式 set(null = 清除 stale route);仅 codex engine
+       *  runner 实现 setCodexRoute,其余 runner duck-type 缺方法 → noop。 */
+      codexRoute?: CodexProviderConfigOverride | null
       toolsets?: string[]
     },
   ): Promise<void> {
@@ -1621,6 +1626,14 @@ export class SessionManager {
       // stdin JSON-RPC 扩展。Lock 保证 setTraceId 与并发 submit() 串行,不会
       // 跨 turn 互踩。
       if (traceId !== undefined) session.runner.setTraceId(traceId)
+      // v5 codex route(A1):与 effort/model 同点、同 lock 串行地在 turn 启动前
+      // 应用。CodexAppServerRunner 在 runTurn 顶部比对 route 签名,变化时自行
+      // shutdown + respawn(spawn 期 -c 参数),这里只 stash,不参与下方
+      // effort/model 的合并 shutdown。
+      const maybeSetCodexRoute = (session.runner as any).setCodexRoute
+      if (typeof maybeSetCodexRoute === 'function') {
+        maybeSetCodexRoute.call(session.runner, opts?.codexRoute ?? null)
+      }
       // effort + model 应用都必须在本 turn 真正启动**之前**完成,且必须在 prev 之后:
       //   - prev 之前:可能中断别人的 in-flight turn
       //   - 本 turn 之后:env / cli args 已被 CCB 启动时读完,改也无效
