@@ -5,21 +5,21 @@
 //   - 单 Agent: switch session agent and adjust the per-user default_model.
 //   - 多 Agent: select a saved team; sendMessage routes through the team leader.
 
-import { apiJson } from './api.js?v=f9e5e54c'
-import { $, htmlSafeEscape } from './dom.js?v=f9e5e54c'
-import { renderModePills } from './effortMode.js?v=f9e5e54c'
-import { openPersonaEditor } from './agents.js?v=f9e5e54c'
+import { apiJson } from './api.js?v=24134090'
+import { $, htmlSafeEscape } from './dom.js?v=24134090'
+import { renderModePills } from './effortMode.js?v=24134090'
+import { openPersonaEditor } from './agents.js?v=24134090'
 import {
   clearSelectedAgentTeam,
   getAgentTeamById,
   openTeamEditor,
   selectAgentTeam,
   teamDisplayPrefix,
-} from './agentTeams.js?v=f9e5e54c'
-import { getSession, state } from './state.js?v=f9e5e54c'
-import { openModal, toast, toastOptsFromError, confirmDialog } from './ui.js?v=f9e5e54c'
-import { getEnabledModels, setCachedPrefField } from './userPrefs.js?v=f9e5e54c'
-import { getEffectiveSingleAgentModel } from './modelPolicy.js?v=f9e5e54c'
+} from './agentTeams.js?v=24134090'
+import { getSession, state } from './state.js?v=24134090'
+import { openModal, toast, toastOptsFromError, confirmDialog } from './ui.js?v=24134090'
+import { getEnabledModels, setCachedPrefField } from './userPrefs.js?v=24134090'
+import { getEffectiveSingleAgentModel } from './modelPolicy.js?v=24134090'
 
 function getCurrentAgentId() {
   const sess = getSession()
