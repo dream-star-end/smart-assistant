@@ -111,6 +111,7 @@ export async function gatewayCmd(_opts: { dev?: boolean }): Promise<void> {
   const webRoot = isV5Channel
     ? resolve(here, '../../../web-react/dist')
     : resolve(here, '../../../web/public')
+  const legacyWebRoot = isV5Channel ? resolve(here, '../../../web/public') : undefined
   const staticMode: 'vanilla' | 'spa' = isV5Channel ? 'spa' : 'vanilla'
 
   const channelFactories: Array<(deps: { config: OpenClaudeConfig }) => ChannelAdapter> = []
@@ -205,6 +206,6 @@ export async function gatewayCmd(_opts: { dev?: boolean }): Promise<void> {
     console.log('[cli] v3 wechat outbound adapter wired (container mode)')
   }
 
-  gw = new Gateway({ config, agentsConfig, webRoot, staticMode, channelFactories, commercial })
+  gw = new Gateway({ config, agentsConfig, webRoot, legacyWebRoot, staticMode, channelFactories, commercial })
   await gw.start()
 }
