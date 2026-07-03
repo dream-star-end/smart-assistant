@@ -138,6 +138,9 @@ export type SupervisorErrorCode =
   | "DockerUnavailable"
   | "InvalidArgument"
   | "HostFull"
+  // v3→v5 迁移门控:该用户已迁移到 v5(migrated)或迁移进行中(migrating),v3 不再为其
+  // 建/重建容器。路由层/HTTP handler 见此 code 应把用户导向 v5(而非当普通错误)。
+  | "MigratedToV5"
   // R2 finding 加固:v3 stopAndRemove 已在 DB 翻 vanished 但 docker stop/remove
   // 后续步骤失败 —— 用户/admin 意图已落库,docker 清理交由后台 reconciler。
   // admin HTTP handler 见到此 code → 502 + 明确提示文案。
