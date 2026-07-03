@@ -12,7 +12,12 @@
  * slug 权威 = seedPlatformAgents 的定义(同源导出),不在此重复列举。
  */
 import { getResearchConfigPublic } from '../admin/researchConfig.js'
-import { marketplaceAgentsEnabled } from './marketplaceDb.js'
+import {
+  type ApprovedSearchRow,
+  type ArtifactKind,
+  listApprovedForSearch,
+  marketplaceAgentsEnabled,
+} from './marketplaceDb.js'
 import {
   PLATFORM_GENERAL_AGENT_SLUGS,
   PLATFORM_RESEARCH_AGENT_SLUGS,
@@ -34,4 +39,23 @@ export async function platformPresetAgentSlugs(): Promise<string[]> {
 /** 同步版判定(不含科研门控信息时不可用;调用方持有 slugs 集时用 Set 判断)。 */
 export function isPresetCandidateSlug(slug: string): boolean {
   return PLATFORM_GENERAL_AGENT_SLUGS.includes(slug) || PLATFORM_RESEARCH_AGENT_SLUGS.includes(slug)
+}
+
+/**
+ * 市场浏览/搜索目录的**单一权威**:approved catalog 去掉平台预设 agent。
+ *
+ * 预设(编程/办公/科研)是"免安装、开箱即用"的,不该出现在市场发现里(与"发现→安装"
+ * 语义冲突 + 冗余)。市场有两个搜索面——浏览器 `/api/marketplace/search`(BrowsePanel)
+ * 与容器 AI `/internal/v3/marketplace/agent/search`(oc-market skill)——**都走此函数**,
+ * 保证一处收口;以后再加市场搜索端点复用它即可,不会漏过滤。
+ *
+ * 注意与 `listApprovedForSearch`(=全部 approved,含预设)语义区分:后者是"上架事实"
+ * (seed/install/detail 依赖它,预设本就在架),此函数是"市场对外可见目录"。
+ * presetSet 仅 agent 类非空(平台预设都是 agent);skill / v3 渠道原样透传。
+ */
+export async function listMarketBrowseCatalog(kind: ArtifactKind): Promise<ApprovedSearchRow[]> {
+  const rows = await listApprovedForSearch(kind)
+  if (kind !== 'agent') return rows
+  const presetSet = new Set(await platformPresetAgentSlugs())
+  return presetSet.size > 0 ? rows.filter((r) => !presetSet.has(r.slug)) : rows
 }

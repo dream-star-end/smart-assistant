@@ -39,12 +39,12 @@ import {
   getApprovedSkillVersions,
   getListingDetail,
   installApprovedVersion,
-  listApprovedForSearch,
   listInstalled,
   marketplaceAgentsEnabled,
   publishSkillVersion,
   recordUninstall,
 } from '../marketplace/marketplaceDb.js'
+import { listMarketBrowseCatalog } from '../marketplace/platformPresets.js'
 import { scanSkillArtifact } from '../marketplace/skillScanner.js'
 import { REQUEST_ID_HEADER, ensureRequestId, setSecurityHeaders } from './util.js'
 
@@ -167,7 +167,8 @@ export function makeMarketplaceAgentHandler(deps: MarketplaceAgentDeps): Marketp
           Math.max(Number.parseInt(url.searchParams.get('limit') ?? '20', 10) || 20, 1),
           50,
         )
-        const catalog = await listApprovedForSearch(kind)
+        // 平台预设 agent 不在市场搜索里露出(与浏览器 /api/marketplace/search 同一权威)。
+        const catalog = await listMarketBrowseCatalog(kind)
         const filtered = q
           ? catalog.filter(
               (c) =>

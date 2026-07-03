@@ -25,26 +25,22 @@ import { sendJson } from '../http/util.js'
 import {
   type ApprovedSearchRow,
   type ArtifactKind,
-  listApprovedForSearch,
   marketplaceAgentsEnabled,
 } from './marketplaceDb.js'
-import { platformPresetAgentSlugs } from './platformPresets.js'
+import { listMarketBrowseCatalog } from './platformPresets.js'
 
 const cache = makePgSkillEmbedCache()
 
-function toCard(
-  c: ApprovedSearchRow,
-  presetSet: ReadonlySet<string>,
-): {
+function toCard(c: ApprovedSearchRow): {
   slug: string
   kind: string
   name: string
   description: string
   tags: string[]
   installCount: number
-  preset?: boolean
 } {
-  // installCount/preset 是加法字段(v3 vanilla UI 忽略);排序不动,热度排序收在 v5 前端。
+  // installCount 是加法字段(v3 vanilla UI 忽略);排序不动,热度排序收在 v5 前端。
+  // 平台预设 agent 已在 handleMarketplaceSearch 收口剔除,不会走到这里,故无 preset 字段。
   return {
     slug: c.slug,
     kind: c.kind,
@@ -52,7 +48,6 @@ function toCard(
     description: c.description,
     tags: c.tags,
     installCount: c.installCount,
-    ...(presetSet.has(c.slug) ? { preset: true } : {}),
   }
 }
 
@@ -86,11 +81,12 @@ export async function handleMarketplaceSearch(
     return
   }
 
-  const catalog = await listApprovedForSearch(kind)
-  const presetSet = new Set(kind === 'agent' ? await platformPresetAgentSlugs() : [])
+  // 市场浏览(空 q)+搜索的对外目录:去掉平台预设 agent(免安装,不在市场发现出现)。
+  // 与容器 AI 的 agent 市场搜索共用同一权威 listMarketBrowseCatalog,一处收口不漏。
+  const catalog = await listMarketBrowseCatalog(kind)
   if (catalog.length === 0 || !q) {
     sendJson(res, 200, {
-      results: catalog.slice(0, limit).map((c) => toCard(c, presetSet)),
+      results: catalog.slice(0, limit).map((c) => toCard(c)),
       method: 'all',
     })
     return
@@ -106,7 +102,7 @@ export async function handleMarketplaceSearch(
           s.tags.some((t) => t.toLowerCase().includes(ql)),
       )
       .slice(0, limit)
-      .map((c) => toCard(c, presetSet))
+      .map((c) => toCard(c))
   }
 
   if (!isSkillEmbeddingAvailable()) {
@@ -156,7 +152,7 @@ export async function handleMarketplaceSearch(
       .sort((a, b) => b.score - a.score)
       .slice(0, limit)
     sendJson(res, 200, {
-      results: ranked.map((x) => ({ ...toCard(x.c, presetSet), score: x.score })),
+      results: ranked.map((x) => ({ ...toCard(x.c), score: x.score })),
       method: 'embed',
     })
   } catch {
