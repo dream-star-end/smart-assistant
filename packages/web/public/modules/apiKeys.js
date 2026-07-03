@@ -13,10 +13,10 @@
 //     "我已保存")都必须清空,且不留 module-level cache
 //   - DELETE :id 用 encodeURIComponent
 
-import { $ } from './dom.js?v=24134090'
-import { apiGet, apiJson } from './api.js?v=24134090'
-import { openModal, closeModal, toast, toastOptsFromError, confirmDialog } from './ui.js?v=24134090'
-import { shortTime } from './util.js?v=24134090'
+import { $ } from './dom.js?v=8bf22747'
+import { apiGet, apiJson } from './api.js?v=8bf22747'
+import { openModal, closeModal, toast, toastOptsFromError, confirmDialog } from './ui.js?v=8bf22747'
+import { shortTime } from './util.js?v=8bf22747'
 
 let _wired = false
 let _observer = null
