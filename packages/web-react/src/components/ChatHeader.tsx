@@ -2,10 +2,9 @@ import { Bell, ChevronDown, Menu, PanelLeft, PenSquare, Wallet } from "lucide-re
 import type { Theme } from "../hooks/useTheme";
 import type { Agent } from "../lib/agents";
 import { AgentAvatar } from "./AgentAvatar";
-import type { PublicModel, RepoSelection } from "../lib/types";
+import type { PublicModel } from "../lib/types";
 import { formatCredits } from "../lib/utils";
 import { ModelSelector } from "./ModelSelector";
-import { RepoPill } from "./github/RepoPill";
 import { ThemeToggle } from "./ThemeToggle";
 import { IconButton } from "./ui";
 
@@ -24,8 +23,6 @@ export function ChatHeader({
   onOpenMobileNav,
   onOpenInbox,
   unreadCount,
-  repoSelection,
-  onOpenRepo,
   theme,
   onCycleTheme,
 }: {
@@ -49,10 +46,6 @@ export function ChatHeader({
   onOpenInbox?: () => void;
   /** 站内信未读数（>0 显红点，>99 显 99+）。 */
   unreadCount?: number;
-  /** 当前会话的仓库绑定（省略 onOpenRepo 则不渲染仓库 pill，如 demo）。 */
-  repoSelection?: RepoSelection | null;
-  /** 打开 GitHub 仓库绑定 modal。 */
-  onOpenRepo?: () => void;
   theme: Theme;
   onCycleTheme: () => void;
 }) {
@@ -95,7 +88,6 @@ export function ChatHeader({
           loading={modelsLoading}
         />
       )}
-      {onOpenRepo && <RepoPill selection={repoSelection ?? null} onClick={onOpenRepo} />}
       <div className="ml-auto flex shrink-0 items-center gap-1.5">
         {onOpenInbox && (
           <div className="relative">

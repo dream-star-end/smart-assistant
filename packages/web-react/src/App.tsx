@@ -23,7 +23,6 @@ import { MessageList } from "./components/MessageRenderer";
 import type { CardCallbacks } from "./components/chat/cards";
 import { MediaSignProvider } from "./components/chat/media";
 import { ChatInteractionContext, ToolCardActionsContext } from "./components/tool/context";
-import { modelLabel } from "./components/ModelSelector";
 import { SettingsCenter } from "./components/SettingsCenter";
 import { Sidebar } from "./components/Sidebar";
 import { Alert, Sheet, Spinner, useConfirm, usePrompt } from "./components/ui";
@@ -329,6 +328,33 @@ export function App() {
           : "file";
     return { kind, url: r.url, mimeType: mime || undefined, filename: file.name };
   }, []);
+
+  // 会话物化:GitHub 绑定是 per-session,新会话未发首条消息前 activeId 为空 → 绑定确定钮
+  // 恒禁用(!sessionId)。需要绑定时先物化一个会话占位(与「+新对话」同款:仅生成 peer.id +
+  // 入侧栏 + 选中,不提前 ensureSession/持久化——空会话不占 service 槽位)。sessionId 立即可用;
+  // 真绑定时 sendRepoBind 内部会自行 ensureSession+hello 注册 peer;首条消息也复用该会话。
+  const ensureActiveSession = useCallback((): string | undefined => {
+    if (demo || !user) return activeId;
+    if (activeId) return activeId;
+    const id = genWsSessionId();
+    const s: Session = {
+      id,
+      title: "新对话",
+      ownerUserId: user.id,
+      updatedAt: new Date().toISOString(),
+      messageCount: 0,
+    };
+    setSessions((c) => [s, ...c]);
+    setActiveId(id);
+    return id;
+  }, [demo, user, activeId, setSessions, setActiveId]);
+
+  // 打开 GitHub 绑定 modal:先确保有承载会话,否则「确认绑定」因 !sessionId 恒禁用
+  // (输入框底部入口 → 发消息前即可绑定)。
+  const openRepo = useCallback(() => {
+    ensureActiveSession();
+    setRepoModalOpen(true);
+  }, [ensureActiveSession]);
 
   const regenerate = useCallback(() => {
     // demo 用本地 messages；非 demo 找 WS 末条 user 重发。
@@ -736,9 +762,6 @@ export function App() {
   // 对话前置门：非 demo 且尚无访问权（容器未就绪/未订阅/出错等）→ 由 AgentGate 占据对话区
   // 并禁用 Composer。demo 与已就绪（ready|dormant）放行正常对话。
   const gated = !demo && !gate.access;
-  const selectedModel = models.find((m) => m.id === modelId);
-  // Composer 底部展示当前对话模型（真实模型名优先，退回 agent 名仅作占位）。
-  const modelFooter = selectedModel ? modelLabel(selectedModel) : agent.name;
 
   // 侧栏公共 props：桌面内联与移动抽屉两处复用。余额（balanceCents）本期不展示（P3.5 计费中心）。
   // rename/delete 的数据收口（三持有方）在 useSessionList。
@@ -808,8 +831,6 @@ export function App() {
           onOpenMobileNav={() => setMobileNavOpen(true)}
           onOpenInbox={demo ? undefined : () => setInboxOpen(true)}
           unreadCount={inbox.unreadCount}
-          repoSelection={repo.selection}
-          onOpenRepo={demo ? undefined : () => setRepoModalOpen(true)}
           theme={theme}
           onCycleTheme={cycle}
         />
@@ -902,12 +923,13 @@ export function App() {
             onSend={send}
             busy={sending}
             onStop={stopTurn}
-            model={modelFooter}
             disabled={gated}
             placeholder={`和「${agent.name}」对话…`}
             onUpload={demo ? undefined : uploadMedia}
             getVoiceToken={demo ? undefined : () => authRef.current.getToken()}
             prefill={composerPrefill}
+            repoSelection={demo ? null : repo.selection}
+            onOpenRepo={demo ? undefined : openRepo}
           />
         </div>
       </main>

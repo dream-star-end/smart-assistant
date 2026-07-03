@@ -697,12 +697,14 @@ function AgentPublishForm({ auth, onPublished }: { auth: AuthSession; onPublishe
       </div>
 
       <div>
-        <div className="mb-1.5 text-[12px] font-medium text-muted">
-          依赖技能（从你已安装的市场技能中多选，安装该智能体时会一并安装）
-        </div>
+        <div className="mb-1 text-[12px] font-medium text-muted">依赖技能（可选）</div>
+        <p className="mb-1.5 text-[11.5px] leading-snug text-faint">
+          只能选「已上架市场」的技能:别人安装本智能体时,这些依赖会一并自动安装,所以必须是能公开安装的市场技能。
+          你自建的私有技能不会出现在这里 —— 需先在上方「发布技能」把它上架、审核通过后才能作为依赖。
+        </p>
         {installedSkills.length === 0 ? (
           <p className="text-[12px] text-faint">
-            你还没有安装任何市场技能 —— 先在「发现」里安装,或不选(智能体也可以不带依赖技能)。
+            你还没有可作依赖的市场技能 —— 先在「发现」里安装,或把自建技能通过「发布技能」上架;也可以不选(智能体可不带依赖技能)。
           </p>
         ) : (
           <div className="flex flex-wrap gap-1.5">

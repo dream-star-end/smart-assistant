@@ -12,7 +12,7 @@ const DOT_CLASS: Record<RepoDot, string> = {
 };
 
 /**
- * 顶栏仓库入口 pill：未绑显"仓库"，已绑显 owner/repo@branch + 状态点。点击开
+ * 输入框底部仓库入口 pill：未绑显"仓库"，已绑显 owner/repo@branch + 状态点。点击开
  * GitHub 仓库 modal（账号关联 + 选仓 + 绑定）。
  */
 export function RepoPill({

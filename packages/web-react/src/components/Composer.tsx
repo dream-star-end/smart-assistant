@@ -1,8 +1,11 @@
-import { ArrowUp, FileText, Image as ImageIcon, Loader2, Mic, Plus, Square, X } from "lucide-react";
+import * as Dialog from "@radix-ui/react-dialog";
+import { ArrowUp, FileText, Loader2, Mic, Plus, Square, X } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useVoiceInput } from "../hooks/useVoiceInput";
 import type { MediaRef } from "../lib/chat/frames";
+import type { RepoSelection } from "../lib/types";
 import { cn } from "../lib/utils";
+import { RepoPill } from "./github/RepoPill";
 import { IconButton, useToast } from "./ui";
 
 type Attach = {
@@ -13,6 +16,8 @@ type Attach = {
   status: "uploading" | "done" | "error";
   media?: MediaRef;
   error?: string;
+  /** 图片本地预览 URL（createObjectURL，选中即生成；移除/发送/卸载时 revoke 防泄漏）。 */
+  previewUrl?: string;
 };
 
 const MAX_ATTACH = 8;
@@ -28,18 +33,18 @@ export function Composer({
   onSend,
   busy,
   onStop,
-  model,
   disabled,
   placeholder = "给 OpenClaude 发消息…",
   onUpload,
   getVoiceToken,
   prefill,
+  repoSelection,
+  onOpenRepo,
 }: {
   /** 发送：text + 可选已上传媒体（图片/文件等）。 */
   onSend: (text: string, media?: MediaRef[]) => void;
   busy?: boolean;
   onStop?: () => void;
-  model?: string;
   disabled?: boolean;
   placeholder?: string;
   /** 上传单文件 → MediaRef（demo / 未登录省略 → 附件按钮禁用）。 */
@@ -48,14 +53,41 @@ export function Composer({
   getVoiceToken?: () => string | null;
   /** 外部预填(如「在对话中创建」模板):nonce 变化即覆盖输入框并聚焦。 */
   prefill?: { text: string; nonce: number } | null;
+  /** 当前会话的 GitHub 仓库绑定（省略 onOpenRepo 则不渲染底部仓库入口，如 demo）。 */
+  repoSelection?: RepoSelection | null;
+  /** 打开 GitHub 仓库绑定 modal（入口在底部左侧）。 */
+  onOpenRepo?: () => void;
 }) {
   const [value, setValue] = useState("");
   const [attachments, setAttachments] = useState<Attach[]>([]);
+  const [preview, setPreview] = useState<{ url: string; name: string } | null>(null);
   const toast = useToast();
   const [voiceMsg, setVoiceMsg] = useState<string | null>(null);
   const ref = useRef<HTMLTextAreaElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
   const idRef = useRef(0);
+  // 已创建的 object URL 集合：卸载时统一 revoke（state 闭包在 cleanup 里是 stale，靠 ref 兜底）。
+  const objectUrlsRef = useRef<Set<string>>(new Set());
+
+  const makePreview = useCallback((file: File): string => {
+    const u = URL.createObjectURL(file);
+    objectUrlsRef.current.add(u);
+    return u;
+  }, []);
+  const revoke = useCallback((u?: string) => {
+    if (u && objectUrlsRef.current.has(u)) {
+      URL.revokeObjectURL(u);
+      objectUrlsRef.current.delete(u);
+    }
+  }, []);
+  // 卸载：revoke 全部残留 object URL。
+  useEffect(
+    () => () => {
+      for (const u of objectUrlsRef.current) URL.revokeObjectURL(u);
+      objectUrlsRef.current.clear();
+    },
+    [],
+  );
 
   // 预填:nonce 变化 → 覆盖当前输入并聚焦(仅在用户显式点了「在对话中创建」时触发,
   // 不会与正常输入竞争;文本可改可删,发送权始终在用户)。
@@ -92,19 +124,25 @@ export function Composer({
     .map((a) => a.media as MediaRef);
   const canSend = (value.trim().length > 0 || doneMedia.length > 0) && !uploading;
 
+  const removeAttach = useCallback(
+    (id: string) => {
+      setAttachments((prev) => {
+        const hit = prev.find((x) => x.id === id);
+        if (hit) revoke(hit.previewUrl);
+        return prev.filter((x) => x.id !== id);
+      });
+    },
+    [revoke],
+  );
+
   const submit = () => {
     if (busy || disabled || !canSend) return;
     onSend(value.trim(), doneMedia.length ? doneMedia : undefined);
     setValue("");
+    for (const a of attachments) revoke(a.previewUrl);
     setAttachments([]);
   };
 
-  // 只收已快照的 File[]——FileList 的快照在事件入口(onChange)就完成。
-  // 原因:`e.target.files` 是 input 的**实时 FileList 引用**。部分手机 webview
-  // (鸿蒙 ArkWeb / 华为浏览器等)在 `value=""` 时是**就地清空同一个 FileList 对象**,
-  // 若把 live FileList 传进来、先清 value 再读,就读到空数组 → 一个 chip 都不插、
-  // 连"已忽略"toast 都不弹、请求也不发 → 用户选完图片"附件区什么都没出现",后端亦无记录。
-  // 让业务层永远拿不到 live FileList,从类型上根除这一类"先清后读"的空读 bug。
   const onFiles = async (picked: File[]) => {
     if (!onUpload) return;
     if (fileRef.current) fileRef.current.value = ""; // 允许同名文件再次选择
@@ -122,9 +160,12 @@ export function Composer({
     if (dropped > 0) toast(`最多 ${MAX_ATTACH} 个附件,已忽略 ${dropped} 个`, "info");
     for (const file of arr) {
       const id = `att-${idRef.current++}`;
+      const kind = mediaKindOf(file.type);
+      // 图片:选中即生成本地预览 URL（无需等上传完成，chip 立刻显缩略图、可点开看大图）。
+      const previewUrl = kind === "image" ? makePreview(file) : undefined;
       setAttachments((prev) => [
         ...prev,
-        { id, name: file.name, size: file.size, kind: mediaKindOf(file.type), status: "uploading" },
+        { id, name: file.name, size: file.size, kind, status: "uploading", previewUrl },
       ]);
       try {
         const media = await onUpload(file);
@@ -136,6 +177,17 @@ export function Composer({
       }
     }
   };
+
+  const voiceStatus =
+    voiceMsg != null ? (
+      <span className="text-danger">{voiceMsg}</span>
+    ) : voice.state === "recording" ? (
+      <span className="text-danger">● 正在录音，点击麦克风停止</span>
+    ) : voice.state === "connecting" ? (
+      <span className="text-faint">正在打开麦克风…</span>
+    ) : voice.state === "transcribing" ? (
+      <span className="text-faint">正在转写…</span>
+    ) : null;
 
   return (
     <div className="mx-auto w-full max-w-3xl px-4">
@@ -149,7 +201,16 @@ export function Composer({
         {attachments.length > 0 && (
           <div className="flex flex-wrap gap-2 px-3.5 pt-3">
             {attachments.map((a) => (
-              <AttachChip key={a.id} a={a} onRemove={() => setAttachments((p) => p.filter((x) => x.id !== a.id))} />
+              <AttachChip
+                key={a.id}
+                a={a}
+                onRemove={() => removeAttach(a.id)}
+                onPreview={
+                  a.kind === "image" && a.previewUrl
+                    ? () => setPreview({ url: a.previewUrl as string, name: a.name })
+                    : undefined
+                }
+              />
             ))}
           </div>
         )}
@@ -203,6 +264,7 @@ export function Composer({
             )}
           </IconButton>
           <button
+            type="button"
             aria-label={busy ? "停止" : "发送"}
             onClick={() => (busy ? onStop?.() : submit())}
             disabled={(!canSend && !busy) || disabled}
@@ -219,21 +281,43 @@ export function Composer({
           </button>
         </div>
       </div>
-      <p className="py-2 text-center text-xs text-faint">
-        {voiceMsg ? (
-          <span className="text-danger">{voiceMsg}</span>
-        ) : voice.state === "recording" ? (
-          <span className="text-danger">● 正在录音，点击麦克风停止</span>
-        ) : voice.state === "connecting" ? (
-          "正在打开麦克风…"
-        ) : voice.state === "transcribing" ? (
-          "正在转写…"
-        ) : (
-          <>
-            {model ? `${model} · ` : ""}内容由 AI 生成，请注意甄别
-          </>
-        )}
-      </p>
+      {/* 底部工具条:左=GitHub 仓库绑定入口;右=语音状态(仅录音/转写时显示)。
+          原「内容由 AI 生成」免责声明已移除。 */}
+      {(onOpenRepo || voiceStatus) && (
+        <div className="flex min-h-[30px] items-center gap-2 px-1.5 py-1.5 text-xs">
+          {onOpenRepo && <RepoPill selection={repoSelection ?? null} onClick={onOpenRepo} />}
+          {voiceStatus && <span className="ml-auto">{voiceStatus}</span>}
+        </div>
+      )}
+
+      {/* 图片附件灯箱:点击缩略图看全图。 */}
+      <Dialog.Root open={!!preview} onOpenChange={(o) => !o && setPreview(null)}>
+        <Dialog.Portal>
+          <Dialog.Overlay className="fixed inset-0 z-50 bg-black/70 backdrop-blur-sm data-[state=open]:animate-fade" />
+          <Dialog.Content
+            aria-describedby={undefined}
+            className="fixed left-1/2 top-1/2 z-50 max-h-[90vh] max-w-[92vw] -translate-x-1/2 -translate-y-1/2 focus:outline-none"
+          >
+            <Dialog.Title className="sr-only">{preview?.name ?? "图片预览"}</Dialog.Title>
+            {preview && (
+              <img
+                src={preview.url}
+                alt={preview.name}
+                className="max-h-[90vh] max-w-[92vw] rounded-lg object-contain shadow-float"
+              />
+            )}
+            <Dialog.Close asChild>
+              <button
+                type="button"
+                aria-label="关闭预览"
+                className="absolute -right-2 -top-2 flex size-8 items-center justify-center rounded-full bg-surface text-fg shadow-float outline-none transition-colors hover:bg-hover focus-visible:ring-2 focus-visible:ring-ring"
+              >
+                <X size={16} />
+              </button>
+            </Dialog.Close>
+          </Dialog.Content>
+        </Dialog.Portal>
+      </Dialog.Root>
     </div>
   );
 }
@@ -244,20 +328,44 @@ function fmtSize(n: number): string {
   return `${(n / 1024 / 1024).toFixed(1)} MB`;
 }
 
-function AttachChip({ a, onRemove }: { a: Attach; onRemove: () => void }) {
-  const Icon = a.kind === "image" ? ImageIcon : FileText;
+function AttachChip({
+  a,
+  onRemove,
+  onPreview,
+}: {
+  a: Attach;
+  onRemove: () => void;
+  /** 图片可点击预览（非图片 / 无预览 URL 时省略）。 */
+  onPreview?: () => void;
+}) {
+  const isImage = a.kind === "image" && !!a.previewUrl;
   return (
     <div
       className={cn(
-        "flex items-center gap-2 rounded-lg border bg-bg px-2.5 py-1.5 text-[12.5px]",
+        "flex items-center gap-2 rounded-lg border bg-bg py-1.5 pr-1.5 text-[12.5px]",
+        isImage ? "pl-1.5" : "pl-2.5",
         a.status === "error" ? "border-danger/40" : "border-border",
       )}
       title={a.status === "error" ? a.error || "上传失败" : `${a.name} · ${fmtSize(a.size)}`}
     >
-      {a.status === "uploading" ? (
+      {isImage ? (
+        <button
+          type="button"
+          onClick={onPreview}
+          aria-label={`预览 ${a.name}`}
+          className="relative size-8 shrink-0 overflow-hidden rounded outline-none focus-visible:ring-2 focus-visible:ring-ring"
+        >
+          <img src={a.previewUrl} alt={a.name} className="size-full object-cover" />
+          {a.status === "uploading" && (
+            <span className="absolute inset-0 flex items-center justify-center bg-black/40">
+              <Loader2 size={13} className="animate-spin text-white" />
+            </span>
+          )}
+        </button>
+      ) : a.status === "uploading" ? (
         <Loader2 size={14} className="shrink-0 animate-spin text-accent" />
       ) : (
-        <Icon size={14} className={cn("shrink-0", a.status === "error" ? "text-danger" : "text-muted")} />
+        <FileText size={14} className={cn("shrink-0", a.status === "error" ? "text-danger" : "text-muted")} />
       )}
       <span className={cn("max-w-[140px] truncate", a.status === "error" ? "text-danger" : "text-fg")}>
         {a.name}
