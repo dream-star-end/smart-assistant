@@ -54,6 +54,7 @@ import { lstatSync, readdirSync, realpathSync } from "node:fs";
 import { mkdir as fsMkdir, chown as fsChown, chmod as fsChmod } from "node:fs/promises";
 import { isAbsolute as pathIsAbsolute, join as pathJoin, normalize as pathNormalize, sep as pathSep } from "node:path";
 import type { Pool, PoolClient } from "pg";
+import { v3MayServe } from "../channelMigration/channelState.js";
 import type { ContainerService, ContainerSpec } from "../compute-pool/containerService.js";
 import { AgentAppError } from "../compute-pool/nodeAgentClient.js";
 import { listAllHosts as defaultListAllHosts } from "../compute-pool/queries.js";
@@ -1548,6 +1549,15 @@ export async function provisionV3Container(
   }
   if (typeof deps.image !== "string" || deps.image.trim() === "") {
     throw new SupervisorError("InvalidArgument", "deps.image (OC_RUNTIME_IMAGE) is required");
+  }
+
+  // v3→v5 迁移门控:已迁移(migrated)/迁移进行中(migrating)的用户,v3 不得再为其建/重建
+  // 容器 —— 否则会重新成为该用户卷的写者、破坏卷迁移一致性,或与已在 v5 的权威撞车。默认
+  // (未迁移,v5_migrated_at IS NULL)→ 放行,现网零影响。v3 恒为 v3 channel,故无条件门控。
+  // 见 channelMigration/channelState:v3MayServe。
+  const migrationGate = await v3MayServe(uid);
+  if (!migrationGate.ok) {
+    throw new SupervisorError("MigratedToV5", `v3 不再服务该用户(uid=${uid}): ${migrationGate.reason}`);
   }
 
   const containerName = v3ContainerNameFor(uid);
