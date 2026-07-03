@@ -930,13 +930,14 @@ export async function handleMe(
     throw new HttpError(401, "UNAUTHORIZED", "user is not active");
   }
   const u = r.rows[0];
-  // v3→v5 迁移路由(对称于 v3 handleMe):已迁移用户刷新 oc_v5 cookie(路由维持在 v5);
-  // 若一个仍带 oc_v5 cookie 的用户其实已被回滚(on_v5=false)命中到 v5,清除 cookie →
-  // 下个请求 Caddy 路由回 v3。使回滚无需用户手动清 cookie。
+  // v3→v5 迁移路由(对称于 v3 handleMe):已迁移用户刷新 oc_v5user cookie(路由维持在 v5);
+  // 若一个仍带 oc_v5user cookie 的用户其实已被回滚(on_v5=false)命中到 v5,清除 cookie →
+  // 下个请求 Caddy 路由回 v3。使回滚无需用户手动清 cookie。cookie 名 oc_v5user 与 canary
+  // 的 oc_v5=<secret> 分离,互不清除。
   if (u.on_v5) {
-    appendSetCookie(res, "oc_v5=1; Path=/; Max-Age=31536000; Secure; HttpOnly; SameSite=Lax");
+    appendSetCookie(res, "oc_v5user=1; Path=/; Max-Age=31536000; Secure; HttpOnly; SameSite=Lax");
   } else {
-    appendSetCookie(res, "oc_v5=; Path=/; Max-Age=0; Secure; HttpOnly; SameSite=Lax");
+    appendSetCookie(res, "oc_v5user=; Path=/; Max-Age=0; Secure; HttpOnly; SameSite=Lax");
   }
   sendJson(res, 200, {
     user: {
