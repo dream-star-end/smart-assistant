@@ -139,11 +139,11 @@
 html, body { height: 100%; margin: 0; }
 /* #root 用动态视口高(dvh):移动端 100vh 含浏览器工具栏区,会比可视视口高 → 整页可下滑
    露出输入框下方空白。100dvh = 当前可视高度;100vh 作不支持 dvh 时的回退(同属性后者覆盖,
-   末个有效值生效)。iOS Safari 截图/地址栏显隐时 100dvh 仍会短暂抖动,React 侧用
-   visualViewport 写入 --oc-visual-height 作最终权威。 */
+   末个有效值生效)。iOS Safari 截图/地址栏/键盘显隐时 100dvh 与 visual viewport
+   offset 仍会短暂抖动,React 侧用 visualViewport 写入 CSS var 作最终权威。 */
 #root {
   position: fixed;
-  top: 0;
+  top: var(--oc-visual-offset-top, 0px);
   right: 0;
   bottom: auto;
   left: 0;

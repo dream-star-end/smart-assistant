@@ -663,20 +663,26 @@ export function App() {
     scrollToChatBottom();
   }, [messages, streamText, chat.version, wsSending, scrollToChatBottom]);
 
-  // iOS Safari 的地址栏/底栏/截图会触发 visualViewport 高度与 scroll anchoring 抖动。
-  // CSS dvh 仍可能短暂大于真实可视区,这里把实测高度写入 CSS var;若用户本就在底部
-  // 或本轮正在生成,下一帧重新贴底,避免截图后跳到上一条输入点。
+  // iOS Safari 的地址栏/底栏/截图/输入键盘会触发 visualViewport 高度与 offset 抖动。
+  // CSS dvh 仍可能短暂大于真实可视区；键盘弹起时 Safari 还会 pan visual viewport,
+  // 让 fixed root 的 top:0 看起来被顶到屏幕上方。这里把实测 height + offsetTop
+  // 写入 CSS var；若用户本就在底部或本轮正在生成，下一帧重新贴底。
   useEffect(() => {
     if (!inWorkspace) return;
     let raf: number | null = null;
-    const setVisualHeight = () => {
-      const h = window.visualViewport?.height || window.innerHeight;
+    const setVisualViewportVars = () => {
+      const vv = window.visualViewport;
+      const h = vv?.height || window.innerHeight;
       if (Number.isFinite(h) && h > 0) {
         document.documentElement.style.setProperty("--oc-visual-height", `${Math.round(h)}px`);
       }
+      const top = vv?.offsetTop || 0;
+      if (Number.isFinite(top)) {
+        document.documentElement.style.setProperty("--oc-visual-offset-top", `${Math.max(0, Math.round(top))}px`);
+      }
     };
     const realign = () => {
-      setVisualHeight();
+      setVisualViewportVars();
       if (!stickToBottomRef.current && !sending) return;
       if (typeof requestAnimationFrame === "function") {
         if (raf !== null) cancelAnimationFrame(raf);
@@ -697,6 +703,8 @@ export function App() {
     window.addEventListener("resize", realign);
     window.addEventListener("pageshow", realign);
     window.addEventListener("focus", realign);
+    document.addEventListener("focusin", realign);
+    document.addEventListener("focusout", realign);
     document.addEventListener("visibilitychange", onVisible);
     return () => {
       if (raf !== null && typeof cancelAnimationFrame === "function") cancelAnimationFrame(raf);
@@ -705,7 +713,11 @@ export function App() {
       window.removeEventListener("resize", realign);
       window.removeEventListener("pageshow", realign);
       window.removeEventListener("focus", realign);
+      document.removeEventListener("focusin", realign);
+      document.removeEventListener("focusout", realign);
       document.removeEventListener("visibilitychange", onVisible);
+      document.documentElement.style.removeProperty("--oc-visual-height");
+      document.documentElement.style.removeProperty("--oc-visual-offset-top");
     };
   }, [inWorkspace, sending, scrollToChatBottom]);
 
