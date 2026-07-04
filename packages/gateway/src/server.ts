@@ -150,6 +150,12 @@ import {
   readV3CodexRelayConfig,
   V3_CODEX_RELAY_PREFIX,
 } from './v3CodexRelay.js'
+import {
+  handleV3MarketplaceRelayLocal,
+  readV3MarketplaceRelayConfig,
+  V3_MARKETPLACE_LOCAL_RELAY_PREFIX,
+} from './v3MarketplaceRelay.js'
+import { startToolFailureReporter } from './v3ToolFailureReporter.js'
 import { resolveEngine } from './engine/registry.js'
 import type { CodexProviderConfigOverride } from './engine/codexShared.js'
 import {
@@ -1364,6 +1370,9 @@ export class Gateway {
     // Start metrics collection (eventBus → prometheus counters)
     startMetricsCollection()
 
+    // Commercial container telemetry: failed tool calls → master agent_audit.
+    startToolFailureReporter()
+
     // Start rate limiter cleanup
     this.rateLimiter.startCleanup()
 
@@ -1843,6 +1852,25 @@ export class Gateway {
         this.log.error('v3 codex local relay crashed', undefined, err)
         if (!res.headersSent) {
           try { this.sendJson(res, 500, { error: { code: 'INTERNAL', message: 'codex relay crashed' } }) } catch {}
+        } else {
+          try { res.end() } catch {}
+        }
+      })
+      return
+    }
+
+    // v3/v5 commercial marketplace relay. Codex subprocesses cannot see
+    // OPENCLAUDE_* env, so oc-market falls back to this loopback-only path.
+    if (url.pathname === V3_MARKETPLACE_LOCAL_RELAY_PREFIX || url.pathname.startsWith(`${V3_MARKETPLACE_LOCAL_RELAY_PREFIX}/`)) {
+      const relayCfg = readV3MarketplaceRelayConfig(process.env)
+      if (!relayCfg) {
+        this.sendJson(res, 404, { error: { code: 'MARKETPLACE_RELAY_NOT_CONFIGURED', message: 'marketplace relay not configured' } })
+        return
+      }
+      handleV3MarketplaceRelayLocal(req, res, relayCfg).catch((err) => {
+        this.log.error('v3 marketplace local relay crashed', undefined, err)
+        if (!res.headersSent) {
+          try { this.sendJson(res, 500, { error: { code: 'INTERNAL', message: 'marketplace relay crashed' } }) } catch {}
         } else {
           try { res.end() } catch {}
         }
