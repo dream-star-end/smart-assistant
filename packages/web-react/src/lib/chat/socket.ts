@@ -878,6 +878,7 @@ export class ChatSocket {
         if (sess) {
           applyLegacyBridgeError(sess, frame, this.effects());
           this.clearThinkingSafety(sess.id);
+          this.deps.persistSession?.(sess.id);
         }
         return;
       }
@@ -1188,8 +1189,8 @@ export class ChatSocket {
   // ═══════════════ 本地持久 / 历史装载（P6）═══════════════
 
   /**
-   * 序列化为可持久化的 StoredSession：只取 reducer 产出的稳定数据 + 断点续传游标，
-   * 剥离流式指针 / Map / in-flight 瞬态（注水时由 rebuildIndexes 重建）。
+   * 序列化为可持久化的 StoredSession：取稳定数据 + 断点续传游标 + 近期 in-flight 标记，
+   * 剥离流式指针 / Map 等瞬态（注水时由 rebuildIndexes 重建）。
    */
   toStored(sessId: string): StoredSession | null {
     const s = this.sessions.get(sessId);
@@ -1204,6 +1205,9 @@ export class ChatSocket {
       updatedAt: s.updatedAt,
       _lastFrameSeqByKey: s._lastFrameSeqByKey ? { ...s._lastFrameSeqByKey } : undefined,
       _lastFrameSeq: s._lastFrameSeq,
+      ...(s._sendingInFlight ? { _sendingInFlight: true } : {}),
+      ...(typeof s._turnStartedAt === "number" ? { _turnStartedAt: s._turnStartedAt } : {}),
+      ...(typeof s._lastFrameAt === "number" ? { _lastFrameAt: s._lastFrameAt } : {}),
       _maxSeq: s._maxSeq,
     };
   }
@@ -1211,7 +1215,8 @@ export class ChatSocket {
   /**
    * 从 IndexedDB 注水会话（boot/登录读回）。**不发任何帧、不连 WS**——纯本地恢复，
    * 让 reload 不丢会话。已存在（live）则跳过：live 状态永远优先于磁盘快照。
-   * 注水后清流式瞬态 + reset in-flight（防 reload 后卡 loading），并重建 block/agent 索引。
+   * 注水后清流式瞬态，并仅恢复近期 in-flight（过期丢弃防 reload 后卡 loading），
+   * 再重建 block/agent 索引。
    */
   loadStored(stored: StoredSession): void {
     if (!stored?.id || this.sessions.has(stored.id)) return;
@@ -1229,9 +1234,24 @@ export class ChatSocket {
     s._maxSeq = stored._maxSeq;
     s._streamingAssistant = null;
     s._streamingThinking = null;
-    s._sendingInFlight = false;
+    const inFlightReference =
+      typeof stored._lastFrameAt === "number"
+        ? stored._lastFrameAt
+        : typeof stored._turnStartedAt === "number"
+          ? stored._turnStartedAt
+          : 0;
+    const inFlightFresh =
+      stored._sendingInFlight === true &&
+      inFlightReference > 0 &&
+      Date.now() - inFlightReference < THINKING_SAFETY_MS;
+    s._sendingInFlight = inFlightFresh;
+    if (inFlightFresh) {
+      s._turnStartedAt = typeof stored._turnStartedAt === "number" ? stored._turnStartedAt : Date.now();
+      s._lastFrameAt = typeof stored._lastFrameAt === "number" ? stored._lastFrameAt : undefined;
+    }
     rebuildIndexes(s);
     this.sessions.set(stored.id, s);
+    if (inFlightFresh) this.resetThinkingSafety(stored.id);
     this.scheduleNotify();
   }
 
@@ -1447,6 +1467,7 @@ export class ChatSocket {
       }
     }
     this.scheduleNotify();
+    this.deps.persistSession?.(sess.id);
   }
 
   /** offlineQueue 软上限（§10）。*/
@@ -1473,6 +1494,7 @@ export class ChatSocket {
     clearTurnTiming(sess);
     resetReplyTracker(sess);
     this.clearThinkingSafety(sess.id);
+    this.deps.persistSession?.(sess.id);
     this.scheduleNotify();
   }
 

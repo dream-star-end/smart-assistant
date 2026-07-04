@@ -139,8 +139,20 @@
 html, body { height: 100%; margin: 0; }
 /* #root 用动态视口高(dvh):移动端 100vh 含浏览器工具栏区,会比可视视口高 → 整页可下滑
    露出输入框下方空白。100dvh = 当前可视高度;100vh 作不支持 dvh 时的回退(同属性后者覆盖,
-   末个有效值生效)。 */
-#root { height: 100vh; height: 100dvh; }
+   末个有效值生效)。iOS Safari 截图/地址栏显隐时 100dvh 仍会短暂抖动,React 侧用
+   visualViewport 写入 --oc-visual-height 作最终权威。 */
+#root {
+  position: fixed;
+  top: 0;
+  right: 0;
+  bottom: auto;
+  left: 0;
+  width: 100%;
+  height: 100vh;
+  height: 100dvh;
+  height: var(--oc-visual-height, 100dvh);
+  overflow: hidden;
+}
 body {
   background: var(--bg);
   color: var(--fg);
@@ -167,6 +179,7 @@ body {
 @layer utilities {
   .no-scrollbar::-webkit-scrollbar { display: none; }
   .no-scrollbar { scrollbar-width: none; }
+  .chat-scroll-area { overflow-anchor: none; }
   /* ── iOS 安全区(刘海/灵动岛/Home 指示条 + 横屏侧刘海),配合 index.html viewport-fit=cover。
      无安全区的设备(安卓/桌面)env() 回退 0px,零影响。各类按"叠加在原内边距之上"用 calc。── */
   .safe-px { padding-left: env(safe-area-inset-left, 0px); padding-right: env(safe-area-inset-right, 0px); }

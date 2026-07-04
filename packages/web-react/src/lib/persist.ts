@@ -21,9 +21,11 @@ const STORE = "sessions";
 
 /**
  * 持久化的会话快照。**刻意只持久 reducer 产出的稳定数据 + 断点续传游标**，剥离流式
- * 指针 / Map / in-flight 等运行期瞬态（注水后由 rebuildIndexes 重建，详见 socket.loadStored）。
+ * 指针 / Map 等运行期瞬态（注水后由 rebuildIndexes 重建，详见 socket.loadStored）。
  * `_lastFrameSeqByKey` / `_lastFrameSeq` 是断点续传游标（resume_failed 推进后必须落地，
  * 否则 reload 后 hello 仍发旧游标 → server 反复 resume 失败 → reload 死循环）。
+ * `_sendingInFlight` / `_turnStartedAt` / `_lastFrameAt` 是 reload 恢复中的近期 turn
+ * 活跃标记；loadStored 会按 THINKING_SAFETY_MS 丢弃过期标记，避免永久 loading。
  * `_maxSeq` 是 server canonical 增量游标（下次 getSession 的 sinceSeq）。
  */
 export type StoredSession = {
@@ -36,6 +38,9 @@ export type StoredSession = {
   updatedAt?: number;
   _lastFrameSeqByKey?: Record<string, number>;
   _lastFrameSeq?: number;
+  _sendingInFlight?: boolean;
+  _turnStartedAt?: number;
+  _lastFrameAt?: number;
   _maxSeq?: number;
 };
 

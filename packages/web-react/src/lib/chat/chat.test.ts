@@ -23,7 +23,7 @@ import {
   applyResumeFailed,
   type FrameEffects,
 } from "./reducer";
-import { ChatSocket } from "./socket";
+import { ChatSocket, type ChatSocketDeps } from "./socket";
 import type { OutboundMessageWire } from "./frames";
 
 // ─── helpers ──────────────────────────────────────────────────────────
@@ -470,12 +470,13 @@ class FakeWS {
   }
 }
 
-function makeSocket() {
+function makeSocket(overrides: Partial<ChatSocketDeps> = {}) {
   return new ChatSocket({
     getToken: () => "tok",
     silentRefresh: async () => null,
     onAuthExpired: () => {},
     defaultAgentId: "main",
+    ...overrides,
   });
 }
 
@@ -497,6 +498,47 @@ describe("ChatSocket safeWsSend backpressure (§2) + offline enqueue (§10)", ()
     const s = sock.sessions.get("s1")!;
     expect(s._sendingInFlight).toBe(true);
     expect(s.messages.find((m) => m.role === "user")?.status).toBe("sent");
+  });
+
+  test("send persists optimistic user row + in-flight marker immediately", () => {
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const persistSession = vi.fn();
+    const sock = makeSocket({ persistSession });
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    ws.open();
+    sock.sendMessage({ sessId: "s1", agentId: "main", text: "hi" });
+    expect(persistSession).toHaveBeenCalledWith("s1");
+    const stored = sock.toStored("s1")!;
+    expect(stored.messages.find((m) => m.role === "user")?.text).toBe("hi");
+    expect(stored._sendingInFlight).toBe(true);
+    expect(typeof stored._turnStartedAt).toBe("number");
+  });
+
+  test("restored in-flight session sends hello with inFlight=true", () => {
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const sock = makeSocket();
+    const now = Date.now();
+    sock.loadStored({
+      id: "s1",
+      agentId: "main",
+      title: "s1",
+      messages: [{ id: "u1", role: "user", text: "hi", ts: now - 1000, status: "sent" }],
+      createdAt: now - 1000,
+      lastAt: now - 1000,
+      _sendingInFlight: true,
+      _turnStartedAt: now - 1000,
+      _lastFrameAt: now - 500,
+      _lastFrameSeqByKey: { "agent:main:webchat:dm:s1": 7 },
+    });
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    ws.open();
+    const helloRaw = ws.sent.find((d) => d.includes('"inbound.hello"'));
+    expect(helloRaw).toBeTruthy();
+    const hello = JSON.parse(helloRaw!);
+    expect(hello.peers[0]).toMatchObject({ peerId: "s1", agentId: "main", inFlight: true, lastFrameSeq: 7 });
+    sock.stop();
   });
 
   test("bufferedAmount ≥ 2MB → close(4000) + requeue offline (no silent drop)", () => {
@@ -635,4 +677,3 @@ describe("resume_failed 游标只进不退(master 重启空 ring 防御)", () =>
     expect(s._lastFrameSeqByKey?.["agent:main:webchat:dm:s1"]).toBe(42);
   });
 });
-

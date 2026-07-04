@@ -51,6 +51,41 @@ describe("socket — loadStored 注水（reload 不丢）", () => {
     expect(sess._sendingInFlight).toBe(false);
   });
 
+  test("注水近期 in-flight 标记：reload 后保留生成中状态供 hello 恢复", () => {
+    const now = Date.now();
+    const s = socket();
+    s.loadStored(
+      storedFix("s1", {
+        messages: [msg("u1", "hi", { role: "user", status: "sent", ts: now - 2000 })],
+        _sendingInFlight: true,
+        _turnStartedAt: now - 2000,
+        _lastFrameAt: now - 1000,
+      }),
+    );
+    const sess = s.sessions.get("s1")!;
+    expect(sess._sendingInFlight).toBe(true);
+    expect(sess._turnStartedAt).toBe(now - 2000);
+    expect(sess._lastFrameAt).toBe(now - 1000);
+    s.stop();
+  });
+
+  test("注水过期 in-flight 标记：丢弃，避免 reload 后永久 loading", () => {
+    const now = Date.now();
+    const s = socket();
+    s.loadStored(
+      storedFix("s1", {
+        messages: [msg("u1", "hi", { role: "user", status: "sent", ts: now - 20 * 60_000 })],
+        _sendingInFlight: true,
+        _turnStartedAt: now - 20 * 60_000,
+        _lastFrameAt: now - 20 * 60_000,
+      }),
+    );
+    const sess = s.sessions.get("s1")!;
+    expect(sess._sendingInFlight).toBe(false);
+    expect(sess._turnStartedAt).toBeUndefined();
+    expect(sess._lastFrameAt).toBeUndefined();
+  });
+
   test("已存在的 live 会话不被磁盘快照覆盖（live 优先）", () => {
     const s = socket();
     const live = s.ensureSession("s1", "main", "live");
@@ -69,12 +104,18 @@ describe("socket — toStored 序列化", () => {
     addMessage(sess, "user", "hello");
     sess._lastFrameSeq = 3;
     sess._maxSeq = 9;
+    sess._sendingInFlight = true;
+    sess._turnStartedAt = 111;
+    sess._lastFrameAt = 222;
     sess._streamingAssistant = msg("stream"); // 瞬态：不应进 StoredSession
     const out = s.toStored("s1")!;
     expect(out.id).toBe("s1");
     expect(out.messages.map((m) => m.text)).toEqual(["hello"]);
     expect(out._lastFrameSeq).toBe(3);
     expect(out._maxSeq).toBe(9);
+    expect(out._sendingInFlight).toBe(true);
+    expect(out._turnStartedAt).toBe(111);
+    expect(out._lastFrameAt).toBe(222);
     expect(Object.keys(out)).not.toContain("_streamingAssistant");
   });
 

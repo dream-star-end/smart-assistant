@@ -22,7 +22,10 @@ function persistSignature(s: StoredSession): string {
     ? `${last.text?.length ?? 0}/${last.output?.length ?? 0}/${last.partialJson?.length ?? 0}/${last._completed ? 1 : 0}/${last.status ?? ""}`
     : "";
   // title 计入:rename 是纯元数据变更,漏掉它 IndexedDB 永远存旧标题(reload 即回退)。
-  return `${s.messages.length}:${lastSig}:${s._lastFrameSeq ?? 0}:${s._maxSeq ?? 0}:${s.updatedAt ?? s.lastAt}:${s.title}`;
+  const inflightSig = s._sendingInFlight
+    ? `1/${s._turnStartedAt ?? 0}/${s._lastFrameAt ?? 0}`
+    : "0";
+  return `${s.messages.length}:${lastSig}:${s._lastFrameSeq ?? 0}:${s._maxSeq ?? 0}:${s.updatedAt ?? s.lastAt}:${s.title}:${inflightSig}`;
 }
 
 /**
