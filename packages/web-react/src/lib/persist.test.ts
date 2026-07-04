@@ -150,6 +150,85 @@ describe("persist — 历史合并纯函数", () => {
     const local = [msg("a")];
     expect(applyServerIncremental(local, [])).toBe(local);
   });
+
+  test("mergeFullServerWins: stripped server team rows do not wipe rich local agent cards", () => {
+    const localGroup: ChatMessage = {
+      id: "g1",
+      role: "agent-group",
+      text: "审查草稿",
+      ts: 10,
+      toolName: "delegate_task",
+      blockId: "call-1",
+      _delegate: true,
+      _delegateAgentId: "hidden-reviewer",
+      _delegateGoal: "审查草稿",
+      _delegateRunId: "run-1",
+      _completed: true,
+      _resultPreview: "PASS",
+      childBlocks: [{ kind: "text", text: "审查结果正文" }],
+    };
+    const serverGroup: ChatMessage = {
+      id: "g1",
+      role: "agent-group",
+      text: "审查草稿",
+      ts: 10,
+      toolName: "delegate_task",
+      blockId: "call-1",
+    };
+
+    const merged = mergeFullServerWins([serverGroup], [localGroup]);
+    const group = merged[0];
+    expect(group._completed).toBe(true);
+    expect(group._delegateAgentId).toBe("hidden-reviewer");
+    expect(group._delegateGoal).toBe("审查草稿");
+    expect(group._resultPreview).toBe("PASS");
+    expect(group.childBlocks?.map((b) => b.text)).toEqual(["审查结果正文"]);
+  });
+
+  test("applyServerIncremental: stripped delegate-progress keeps local entries and summary", () => {
+    const localProgress: ChatMessage = {
+      id: "dp1",
+      role: "delegate-progress",
+      text: "",
+      ts: 20,
+      runId: "run-1",
+      agentId: "hidden-reviewer",
+      goal: "审查草稿",
+      _completed: true,
+      entries: [{ phase: "text", text: "正在审查", ts: 21 }],
+      summary: "PASS",
+    };
+    const incomingProgress: ChatMessage = {
+      id: "dp1",
+      role: "delegate-progress",
+      text: "",
+      ts: 20,
+      agentId: "hidden-reviewer",
+    };
+
+    const merged = applyServerIncremental([localProgress], [incomingProgress]);
+    expect(merged[0].runId).toBe("run-1");
+    expect(merged[0]._completed).toBe(true);
+    expect(merged[0].entries?.map((e) => e.text)).toEqual(["正在审查"]);
+    expect(merged[0].summary).toBe("PASS");
+  });
+
+  test("applyServerIncremental: late server rows interleave by ts after multiple local continues", () => {
+    const u = (id: string, ts: number): ChatMessage => ({ id, role: "user", text: "继续", ts });
+    const a = (id: string, text: string, ts: number): ChatMessage => ({ id, role: "assistant", text, ts });
+    const local = [a("old", "上一段", 100), u("u1", 200), u("u2", 400)];
+    const incoming = [a("mid", "继续后的内容", 300), a("tail", "后续内容", 500)];
+
+    const merged = applyServerIncremental(local, incoming);
+    expect(merged.map((m) => m.id)).toEqual(["old", "u1", "mid", "u2", "tail"]);
+  });
+
+  test("applyServerIncremental: invalid ts falls back to original merge order", () => {
+    const local = [msg("a", "L-a"), { ...msg("b", "L-b"), ts: Number.NaN }];
+    const incoming = [{ ...msg("c", "S-c"), ts: 0 }];
+    const merged = applyServerIncremental(local, incoming);
+    expect(merged.map((m) => m.id)).toEqual(["a", "b", "c"]);
+  });
 });
 
 describe("persist — 命名空间", () => {

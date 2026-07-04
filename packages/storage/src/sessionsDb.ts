@@ -691,6 +691,16 @@ const CLIENT_PUT_ALLOWED_STATUSES: ReadonlySet<string> = new Set<string>([
   'sending', 'queued', 'sent', 'read',
 ])
 
+// Team/delegate cards are client-owned UI structures (agent-group /
+// delegate-progress) that must survive refresh. Keep these scoped to those
+// roles so ordinary assistant/tool ephemeral fields still get stripped.
+const CLIENT_PUT_TEAM_MESSAGE_FIELDS: ReadonlySet<string> = new Set<string>([
+  'startTime', '_completed',
+  '_delegate', '_delegateAgentId', '_delegateGoal', '_delegateRunId',
+  '_duration', '_resultPreview', '_isError',
+  'runId', 'goal', 'entries', 'summary', '_adoptedInto', 'error',
+])
+
 const SERVER_AUTHORITATIVE_FIELDS: ReadonlySet<string> = new Set<string>([
   '_source', '_seq', 'usage',
   '_truncated', '_errorCode', '_errorDetail',
@@ -727,9 +737,13 @@ export function _resetClientPutBlockedFieldCountsForTest(): void {
 export function _stripClientPutMessage(msg: unknown): MessageLike | null {
   if (!msg || typeof msg !== 'object') return null
   const src = msg as Record<string, unknown>
+  const role = typeof src.role === 'string' ? src.role : ''
+  const teamOwned = role === 'agent-group' || role === 'delegate-progress'
   const out: Record<string, unknown> = {}
   for (const k of Object.keys(src)) {
     if (CLIENT_PUT_ALLOWED_FIELDS.has(k)) {
+      out[k] = src[k]
+    } else if (teamOwned && CLIENT_PUT_TEAM_MESSAGE_FIELDS.has(k)) {
       out[k] = src[k]
     } else if (k === 'status') {
       const v = src[k]

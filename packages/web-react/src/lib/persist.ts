@@ -164,6 +164,10 @@ export function dbNameForUser(userId: string | null | undefined): string {
  * 用户消息才能恢复——此修复彻底解决"同浏览器重连"。
  */
 export function mergeFullServerWins(server: ChatMessage[], local: ChatMessage[]): ChatMessage[] {
+  const localById = new Map<string, ChatMessage>();
+  for (const m of local) if (m?.id) localById.set(m.id, m);
+  const serverMerged = server.map((m) => mergeLocalTeamDisplayFields(m, m?.id ? localById.get(m.id) : undefined));
+  const serverChanged = serverMerged.some((m, idx) => m !== server[idx]);
   const serverIds = new Set<string>();
   for (const m of server) if (m?.id) serverIds.add(m.id);
   let i = local.length;
@@ -172,14 +176,16 @@ export function mergeFullServerWins(server: ChatMessage[], local: ChatMessage[])
   const preservedUsers = local
     .slice(0, i)
     .filter((m) => m?.role === "user" && m.id && !serverIds.has(m.id));
-  if (!tail.length && !preservedUsers.length) return server;
+  if (!tail.length && !preservedUsers.length) return serverChanged ? serverMerged : server;
   // 稳定排序（现代 JS Array.sort 稳定）：等 ts 时维持 server→preservedUsers→tail 的插入序。
-  return [...server, ...preservedUsers, ...tail].sort((a, b) => (a?.ts ?? 0) - (b?.ts ?? 0));
+  return stableSortByTs([...serverMerged, ...preservedUsers, ...tail]);
 }
 
 /**
  * 增量合并（getSession ?since 返回的增量）：在 `local` 基础上，按 id 用 `incoming` 覆盖
- * 已有项（server-wins），并追加新 id。保持 local 既有顺序，新增项接在尾部。
+ * 已有项（server-wins），并追加新 id；最后按 ts 稳定归位，避免低 `_seq` 本地"继续"
+ * 后到的 server 消息被机械追加到整段尾部。团队/委派卡是 client-owned 展示结构：若
+ * server 历史只带空壳同 id 行，合并时保留本地更完整的 childBlocks/entries/完成态。
  */
 export function applyServerIncremental(
   local: ChatMessage[],
@@ -188,11 +194,112 @@ export function applyServerIncremental(
   if (!incoming.length) return local;
   const byId = new Map<string, ChatMessage>();
   for (const m of incoming) if (m?.id) byId.set(m.id, m);
-  const merged = local.map((m) => (m?.id && byId.has(m.id) ? byId.get(m.id)! : m));
+  const merged = local.map((m) => (m?.id && byId.has(m.id) ? mergeLocalTeamDisplayFields(byId.get(m.id)!, m) : m));
   const seen = new Set<string>();
   for (const m of local) if (m?.id) seen.add(m.id);
   for (const m of incoming) if (m?.id && !seen.has(m.id)) merged.push(m);
-  return merged;
+  return stableSortByTs(merged);
+}
+
+function isTeamOwnedRole(role: ChatMessage["role"] | undefined): boolean {
+  return role === "agent-group" || role === "delegate-progress";
+}
+
+function nonEmptyString(v: unknown): v is string {
+  return typeof v === "string" && v.length > 0;
+}
+
+function hasOwn(obj: Record<string, unknown>, key: string): boolean {
+  return Object.prototype.hasOwnProperty.call(obj, key);
+}
+
+/**
+ * Team/delegate rows are rendered from client-owned UI state. Older server
+ * rows may contain the same `m-*` id but lack the fields stripped by the
+ * client-session write allow-list; letting that row win makes reopened team
+ * turns look blank. Keep the server row as the base, but fill missing/poorer
+ * display fields from the richer local IndexedDB row.
+ */
+function mergeLocalTeamDisplayFields(serverMsg: ChatMessage, localMsg?: ChatMessage): ChatMessage {
+  if (!localMsg || serverMsg.id !== localMsg.id) return serverMsg;
+  if (!isTeamOwnedRole(serverMsg.role) || serverMsg.role !== localMsg.role) return serverMsg;
+
+  const server = serverMsg as unknown as Record<string, unknown>;
+  const local = localMsg as unknown as Record<string, unknown>;
+  let out: Record<string, unknown> | null = null;
+  const ensureOut = () => {
+    if (!out) out = { ...server };
+    return out;
+  };
+  const copyIfMissing = (key: keyof ChatMessage | "entries" | "summary" | "goal" | "error" | "_adoptedInto") => {
+    const sk = String(key);
+    if (hasOwn(server, sk)) return;
+    if (!hasOwn(local, sk)) return;
+    ensureOut()[sk] = local[sk];
+  };
+  const copyStringIfRicher = (key: keyof ChatMessage | "summary" | "goal" | "_adoptedInto") => {
+    const sk = String(key);
+    const lv = local[sk];
+    if (!nonEmptyString(lv)) return;
+    const sv = server[sk];
+    if (!nonEmptyString(sv) || lv.length > sv.length) ensureOut()[sk] = lv;
+  };
+  const copyArrayIfRicher = (key: "childBlocks" | "entries") => {
+    const la = Array.isArray(local[key]) ? (local[key] as unknown[]) : [];
+    if (la.length === 0) return;
+    const sa = Array.isArray(server[key]) ? (server[key] as unknown[]) : [];
+    if (la.length > sa.length) ensureOut()[key] = local[key];
+  };
+
+  if (!nonEmptyString(server.text) && nonEmptyString(local.text)) ensureOut().text = local.text;
+  copyArrayIfRicher("childBlocks");
+  copyArrayIfRicher("entries");
+  for (const key of [
+    "startTime",
+    "completedAt",
+    "_completed",
+    "_delegate",
+    "_delegateAgentId",
+    "_delegateGoal",
+    "_delegateRunId",
+    "_duration",
+    "_resultPreview",
+    "_isError",
+    "runId",
+    "goal",
+    "summary",
+    "error",
+    "_adoptedInto",
+  ] as const) {
+    copyIfMissing(key);
+  }
+  for (const key of [
+    "_delegateAgentId",
+    "_delegateGoal",
+    "_delegateRunId",
+    "_resultPreview",
+    "runId",
+    "goal",
+    "summary",
+    "_adoptedInto",
+  ] as const) {
+    copyStringIfRicher(key);
+  }
+  return (out as ChatMessage | null) ?? serverMsg;
+}
+
+function stableSortByTs(messages: ChatMessage[]): ChatMessage[] {
+  if (messages.length <= 1) return messages;
+  if (!messages.every((m) => typeof m?.ts === "number" && Number.isFinite(m.ts))) {
+    return messages;
+  }
+  return messages
+    .map((m, idx) => ({ m, idx }))
+    .sort((a, b) => {
+      const dt = a.m.ts - b.m.ts;
+      return dt || a.idx - b.idx;
+    })
+    .map((x) => x.m);
 }
 
 /**
