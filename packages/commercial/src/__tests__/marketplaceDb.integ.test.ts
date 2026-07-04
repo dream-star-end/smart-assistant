@@ -5,7 +5,8 @@
  *   1. publish creates an owner-locked listing + a pending version
  *   2. slug is owner-locked: a 2nd publisher of the same slug is refused
  *   3. duplicate (slug, version) is refused
- *   4. reviewer must differ from submitter
+ *   4. reviewer must differ from submitter by default; admin routes may opt in
+ *      to self-review for administrator-owned submissions
  *   5. approve flips status + sets the listing's current_approved_version_id;
  *      it then appears in the searchable catalog; reject does not
  *   6. install pins (version_id, artifact_hash) and supersedes the prior active row
@@ -219,6 +220,17 @@ describe('marketplaceDb (integ)', () => {
       () => reviewVersion({ versionId, reviewerUserId: owner, approve: true }),
       'REVIEWER_IS_AUTHOR',
     )
+  })
+
+  test('admin route opt-in can approve self-submitted version', async (t) => {
+    if (skipIfNoPg(t)) return
+    const admin = await createUser('admin-self@x.com')
+    const { versionId } = await publishSkillVersion(buildPublish('admin-self-review', admin))
+    await reviewVersion({ versionId, reviewerUserId: admin, approve: true, allowSelfReview: true })
+    const detail = await getListingDetail('admin-self-review')
+    assert.ok(detail)
+    assert.equal(detail.version, '1.0.0')
+    assert.equal((await listApprovedForSearch()).some((x) => x.slug === 'admin-self-review'), true)
   })
 
   test('approve sets current + makes searchable; reject does not', async (t) => {

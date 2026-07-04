@@ -263,12 +263,13 @@ export async function listPendingVersions(limit = 100): Promise<PendingVersionRo
   }))
 }
 
-/** Approve/reject a pending version. Reviewer must differ from submitter. */
+/** Approve/reject a pending version. Reviewer must differ from submitter unless an admin-only caller opts in. */
 export async function reviewVersion(args: {
   versionId: string
   reviewerUserId: number
   approve: boolean
   note?: string
+  allowSelfReview?: boolean
 }): Promise<void> {
   await tx(async (c) => {
     const v = await query<{ slug: string; status: string; submitted_by: string }>(
@@ -279,7 +280,7 @@ export async function reviewVersion(args: {
     const row = v.rows[0]
     if (!row) throw new MarketplaceError('VERSION_NOT_FOUND', 'version 不存在')
     if (row.status !== 'pending') throw new MarketplaceError('NOT_PENDING', '该版本已被审核')
-    if (BigInt(row.submitted_by) === BigInt(args.reviewerUserId))
+    if (!args.allowSelfReview && BigInt(row.submitted_by) === BigInt(args.reviewerUserId))
       throw new MarketplaceError('REVIEWER_IS_AUTHOR', '审核人不能是发布者本人')
 
     await query(
