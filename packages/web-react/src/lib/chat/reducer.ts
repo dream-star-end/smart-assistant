@@ -254,7 +254,11 @@ function adoptStandaloneDelegateRun(sess: ChatSession, groupMsg: ChatMessage): b
   const standalone = candidates[0];
   const standaloneChildBlocks = Array.isArray(standalone.childBlocks) ? standalone.childBlocks : [];
   const standaloneEntries = Array.isArray(standalone.entries) ? standalone.entries : [];
-  if (standaloneChildBlocks.length === 0 && standaloneEntries.length > 0) return false;
+  const hasNonStartEntries = standaloneEntries.some((entry) => entry.phase !== "start");
+  // Start-only entries are the duplicate fallback header from the
+  // progress-before-tool_use race. Preserve non-start legacy entries because
+  // adopting the standalone would otherwise drop visible fallback output.
+  if (hasNonStartEntries) return false;
   groupMsg.childBlocks = standaloneChildBlocks;
   if (standalone.summary && !groupMsg._resultPreview) groupMsg._resultPreview = String(standalone.summary).slice(0, 200);
   if (standalone.error) groupMsg._isError = true;

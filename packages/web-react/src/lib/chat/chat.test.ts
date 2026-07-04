@@ -319,6 +319,262 @@ describe("applyOutboundMessage (§3/§7/§9/§11)", () => {
     );
     expect(s.messages.some((m) => m._emptyTurn)).toBe(true);
   });
+
+  test("delegate_progress start before delegate_task tool_use is adopted into one agent-group", () => {
+    const s = sess();
+    applyOutboundMessage(
+      s,
+      msgFrame({
+        frameSeq: 1,
+        blocks: [
+          {
+            kind: "delegate_progress",
+            runId: "dlg-1",
+            agentId: "hidden-reviewer",
+            phase: "start",
+            text: "开始委派给 hidden-reviewer: 审查草稿",
+            goal: "审查草稿",
+          },
+        ],
+      }),
+    );
+    expect(s.messages.filter((m) => m.role === "delegate-progress")).toHaveLength(1);
+
+    applyOutboundMessage(
+      s,
+      msgFrame({
+        frameSeq: 2,
+        blocks: [
+          {
+            kind: "tool_use",
+            toolName: "delegate_task",
+            blockId: "tool-1",
+            partial: false,
+            inputJson: { agentId: "hidden-reviewer", goal: "审查草稿" },
+          },
+        ],
+      }),
+    );
+
+    const groups = s.messages.filter((m) => m.role === "agent-group");
+    expect(groups).toHaveLength(1);
+    expect(groups[0]._delegateRunId).toBe("dlg-1");
+    expect(s.messages.filter((m) => m.role === "delegate-progress")).toHaveLength(0);
+  });
+
+  test("adopted delegate_progress preserves completed summary on the group", () => {
+    const s = sess();
+    applyOutboundMessage(
+      s,
+      msgFrame({
+        frameSeq: 1,
+        blocks: [
+          {
+            kind: "delegate_progress",
+            runId: "dlg-2",
+            agentId: "hidden-reviewer",
+            phase: "start",
+            text: "开始委派给 hidden-reviewer: 审查草稿",
+            goal: "审查草稿",
+          },
+        ],
+      }),
+    );
+    applyOutboundMessage(
+      s,
+      msgFrame({
+        frameSeq: 2,
+        blocks: [{ kind: "delegate_progress", runId: "dlg-2", agentId: "hidden-reviewer", phase: "done", text: "PASS" }],
+      }),
+    );
+    applyOutboundMessage(
+      s,
+      msgFrame({
+        frameSeq: 3,
+        blocks: [
+          {
+            kind: "tool_use",
+            toolName: "delegate_task",
+            blockId: "tool-2",
+            partial: false,
+            inputJson: { agentId: "hidden-reviewer", goal: "审查草稿" },
+          },
+        ],
+      }),
+    );
+
+    const group = s.messages.find((m) => m.role === "agent-group");
+    expect(group?._delegateRunId).toBe("dlg-2");
+    expect(group?._resultPreview).toBe("PASS");
+    expect(s.messages.some((m) => m.role === "delegate-progress")).toBe(false);
+  });
+
+  test("delegate_task tool_use before progress nests child output into same group", () => {
+    const s = sess();
+    applyOutboundMessage(
+      s,
+      msgFrame({
+        frameSeq: 1,
+        blocks: [
+          {
+            kind: "tool_use",
+            toolName: "delegate_task",
+            blockId: "tool-3",
+            partial: false,
+            inputJson: { agentId: "hidden-reviewer", goal: "审查草稿" },
+          },
+        ],
+      }),
+    );
+    applyOutboundMessage(
+      s,
+      msgFrame({
+        frameSeq: 2,
+        blocks: [
+          {
+            kind: "delegate_progress",
+            runId: "dlg-3",
+            agentId: "hidden-reviewer",
+            phase: "start",
+            text: "开始委派给 hidden-reviewer: 审查草稿",
+            goal: "审查草稿",
+          },
+        ],
+      }),
+    );
+    applyOutboundMessage(
+      s,
+      msgFrame({
+        frameSeq: 3,
+        blocks: [
+          {
+            kind: "delegate_progress",
+            runId: "dlg-3",
+            agentId: "hidden-reviewer",
+            phase: "text",
+            text: "child output",
+            block: { kind: "text", text: "child output" },
+          },
+        ],
+      }),
+    );
+
+    const groups = s.messages.filter((m) => m.role === "agent-group");
+    expect(groups).toHaveLength(1);
+    expect(groups[0]._delegateRunId).toBe("dlg-3");
+    expect(groups[0].childBlocks?.some((b) => b.kind === "text" && b.text === "child output")).toBe(true);
+    expect(s.messages.some((m) => m.role === "delegate-progress")).toBe(false);
+  });
+
+  test("legacy non-start delegate_progress entries stay standalone instead of being dropped", () => {
+    const s = sess();
+    applyOutboundMessage(
+      s,
+      msgFrame({
+        frameSeq: 1,
+        blocks: [
+          {
+            kind: "delegate_progress",
+            runId: "dlg-4",
+            agentId: "hidden-reviewer",
+            phase: "start",
+            text: "开始委派给 hidden-reviewer: 审查草稿",
+            goal: "审查草稿",
+          },
+        ],
+      }),
+    );
+    applyOutboundMessage(
+      s,
+      msgFrame({
+        frameSeq: 2,
+        blocks: [{ kind: "delegate_progress", runId: "dlg-4", agentId: "hidden-reviewer", phase: "text", text: "legacy output" }],
+      }),
+    );
+    applyOutboundMessage(
+      s,
+      msgFrame({
+        frameSeq: 3,
+        blocks: [
+          {
+            kind: "tool_use",
+            toolName: "delegate_task",
+            blockId: "tool-4",
+            partial: false,
+            inputJson: { agentId: "hidden-reviewer", goal: "审查草稿" },
+          },
+        ],
+      }),
+    );
+
+    expect(s.messages.filter((m) => m.role === "agent-group")).toHaveLength(1);
+    const standalone = s.messages.find((m) => m.role === "delegate-progress");
+    expect(standalone?.entries?.some((e) => e.phase === "text" && e.text === "legacy output")).toBe(true);
+  });
+
+  test("mixed legacy entries and rich child blocks stay standalone to avoid dropping entries", () => {
+    const s = sess();
+    applyOutboundMessage(
+      s,
+      msgFrame({
+        frameSeq: 1,
+        blocks: [
+          {
+            kind: "delegate_progress",
+            runId: "dlg-5",
+            agentId: "hidden-reviewer",
+            phase: "start",
+            text: "开始委派给 hidden-reviewer: 审查草稿",
+            goal: "审查草稿",
+          },
+        ],
+      }),
+    );
+    applyOutboundMessage(
+      s,
+      msgFrame({
+        frameSeq: 2,
+        blocks: [{ kind: "delegate_progress", runId: "dlg-5", agentId: "hidden-reviewer", phase: "text", text: "legacy output" }],
+      }),
+    );
+    applyOutboundMessage(
+      s,
+      msgFrame({
+        frameSeq: 3,
+        blocks: [
+          {
+            kind: "delegate_progress",
+            runId: "dlg-5",
+            agentId: "hidden-reviewer",
+            phase: "text",
+            text: "rich output",
+            block: { kind: "text", text: "rich output" },
+          },
+        ],
+      }),
+    );
+    applyOutboundMessage(
+      s,
+      msgFrame({
+        frameSeq: 4,
+        blocks: [
+          {
+            kind: "tool_use",
+            toolName: "delegate_task",
+            blockId: "tool-5",
+            partial: false,
+            inputJson: { agentId: "hidden-reviewer", goal: "审查草稿" },
+          },
+        ],
+      }),
+    );
+
+    const group = s.messages.find((m) => m.role === "agent-group");
+    const standalone = s.messages.find((m) => m.role === "delegate-progress");
+    expect(group?._delegateRunId).toBeUndefined();
+    expect(standalone?.entries?.some((e) => e.phase === "text" && e.text === "legacy output")).toBe(true);
+    expect(standalone?.childBlocks?.some((b) => b.kind === "text" && b.text === "rich output")).toBe(true);
+  });
 });
 
 describe("applyOutboundError double-frame suppression (§11)", () => {
@@ -635,4 +891,3 @@ describe("resume_failed 游标只进不退(master 重启空 ring 防御)", () =>
     expect(s._lastFrameSeqByKey?.["agent:main:webchat:dm:s1"]).toBe(42);
   });
 });
-

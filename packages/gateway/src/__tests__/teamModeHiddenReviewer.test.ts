@@ -18,6 +18,14 @@ describe('team mode hidden reviewer prompt', () => {
     assert.match(src, /hidden-reviewer/)
     assert.match(src, /agentId: "hidden-reviewer"/)
     assert.match(src, /不在成员列表显示/)
+    assert.match(src, /完成用户任务的第一负责人/)
+    assert.match(src, /端到端负责/)
+    assert.match(src, /可选审查资源，不是强制流程/)
+    assert.match(src, /审查结果只是建议，不是命令/)
+    assert.match(src, /自主决定接受、拒绝、部分采纳、修订、直接答复/)
+    assert.match(src, /判断无需审查并跳过，不需要向用户解释流程/)
+    assert.doesNotMatch(src, /隐藏审查员仍需在最终答复前调用一次/)
+    assert.doesNotMatch(src, /必须先形成草稿\/方案，再调用/)
   })
 
   it('keeps hidden reviewer out of user-facing agent management APIs', () => {
