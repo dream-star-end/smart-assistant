@@ -297,6 +297,201 @@ export function asArr(v: unknown): unknown[] {
   return Array.isArray(v) ? v : [];
 }
 
+export type ShellFileWriteSummary = {
+  /** 目标文件路径（按命令顺序去重）。*/
+  paths: string[];
+  /** 原始 Bash 命令，展开体仍展示用于审计。*/
+  rawCommand: string;
+  /** 识别到的 cat heredoc 写入次数。*/
+  writeCount: number;
+};
+
+const SHELL_PATH_TOKEN = `(?:"[^"\\n]+"|'[^'\\n]+'|[^\\s<>|;&]+)`;
+const SHELL_DELIM_TOKEN = `(?:"[^"\\n]+"|'[^'\\n]+'|[A-Za-z_][A-Za-z0-9_.-]*)`;
+const HEREDOC_OUT_FIRST_RE = new RegExp(
+  `^cat\\s+>\\s*(${SHELL_PATH_TOKEN})\\s+<<(\\-?)\\s*(${SHELL_DELIM_TOKEN})\\s*\\n`,
+);
+const HEREDOC_DELIM_FIRST_RE = new RegExp(
+  `^cat\\s+<<(\\-?)\\s*(${SHELL_DELIM_TOKEN})\\s+>\\s*(${SHELL_PATH_TOKEN})\\s*\\n`,
+);
+
+function stripShellTokenQuotes(token: string): string {
+  if (
+    token.length >= 2 &&
+    ((token.startsWith("'") && token.endsWith("'")) || (token.startsWith('"') && token.endsWith('"')))
+  ) {
+    return token.slice(1, -1);
+  }
+  return token;
+}
+
+function isStaticShellPath(path: string): boolean {
+  return !!path && !path.startsWith("-") && !/[`$*?\[\]{}]/.test(path);
+}
+
+function splitSimpleShellTokens(segment: string): string[] | null {
+  const tokens: string[] = [];
+  let cur = "";
+  let quote: "'" | '"' | null = null;
+  for (let i = 0; i < segment.length; i++) {
+    const ch = segment[i];
+    if (quote) {
+      if (ch === quote) {
+        quote = null;
+      } else {
+        cur += ch;
+      }
+      continue;
+    }
+    if (ch === "'" || ch === '"') {
+      quote = ch;
+      continue;
+    }
+    if (/\s/.test(ch)) {
+      if (cur) {
+        tokens.push(cur);
+        cur = "";
+      }
+      continue;
+    }
+    cur += ch;
+  }
+  if (quote) return null;
+  if (cur) tokens.push(cur);
+  return tokens;
+}
+
+function findStatementEnd(src: string, start: number): number {
+  let quote: "'" | '"' | null = null;
+  for (let i = start; i < src.length; i++) {
+    const ch = src[i];
+    if (quote) {
+      if (ch === quote) quote = null;
+      continue;
+    }
+    if (ch === "'" || ch === '"') {
+      quote = ch;
+      continue;
+    }
+    if (ch === "\n" || ch === ";") return i;
+    if (src.startsWith("&&", i) || src.startsWith("||", i)) return i;
+  }
+  return src.length;
+}
+
+function skipShellSeparators(src: string, pos: number): number {
+  let i = pos;
+  for (;;) {
+    while (i < src.length && /\s/.test(src[i])) i++;
+    if (src.startsWith("&&", i)) {
+      i += 2;
+      continue;
+    }
+    if (src[i] === ";") {
+      i += 1;
+      continue;
+    }
+    return i;
+  }
+}
+
+function consumeMkdirP(src: string, pos: number): number | null {
+  const m = /^mkdir\s+-p\s+/.exec(src.slice(pos));
+  if (!m) return null;
+  const argStart = pos + m[0].length;
+  const end = findStatementEnd(src, argStart);
+  const segment = src.slice(argStart, end).trim();
+  if (!segment || /[<>|`$()]/.test(segment)) return null;
+  const tokens = splitSimpleShellTokens(segment);
+  if (!tokens?.length || tokens.some((t) => !isStaticShellPath(t))) return null;
+  return end;
+}
+
+function findHeredocClose(src: string, start: number, delimiter: string, allowTabs: boolean): number | null {
+  let lineStart = start;
+  while (lineStart <= src.length) {
+    const lineEnd = src.indexOf("\n", lineStart);
+    const rawLine = lineEnd === -1 ? src.slice(lineStart) : src.slice(lineStart, lineEnd);
+    const line = rawLine.endsWith("\r") ? rawLine.slice(0, -1) : rawLine;
+    const comparable = allowTabs ? line.replace(/^\t+/, "") : line;
+    if (comparable === delimiter) return lineEnd === -1 ? src.length : lineEnd + 1;
+    if (lineEnd === -1) return null;
+    lineStart = lineEnd + 1;
+  }
+  return null;
+}
+
+function consumeCatHeredoc(src: string, pos: number): { end: number; path: string } | null {
+  const rest = src.slice(pos);
+  let pathToken = "";
+  let delimToken = "";
+  let allowTabs = false;
+  let headerLength = 0;
+
+  const outFirst = HEREDOC_OUT_FIRST_RE.exec(rest);
+  if (outFirst) {
+    pathToken = outFirst[1];
+    allowTabs = outFirst[2] === "-";
+    delimToken = outFirst[3];
+    headerLength = outFirst[0].length;
+  } else {
+    const delimFirst = HEREDOC_DELIM_FIRST_RE.exec(rest);
+    if (!delimFirst) return null;
+    allowTabs = delimFirst[1] === "-";
+    delimToken = delimFirst[2];
+    pathToken = delimFirst[3];
+    headerLength = delimFirst[0].length;
+  }
+
+  const path = stripShellTokenQuotes(pathToken);
+  const delimiter = stripShellTokenQuotes(delimToken);
+  if (!isStaticShellPath(path) || !delimiter || /\s/.test(delimiter)) return null;
+  const end = findHeredocClose(src, pos + headerLength, delimiter, allowTabs);
+  return end == null ? null : { end, path };
+}
+
+/**
+ * 识别 Codex 偶尔用 Bash heredoc 做的「纯写文件」命令：
+ *   mkdir -p dir && cat > file <<'EOF'
+ *   ...
+ *   EOF
+ *
+ * 只接受 `mkdir -p` + 一个或多个 `cat ... <<EOF` 的组合；任何管道、变量路径、
+ * trailing command（如 npm test/chmod）都会返回 null，避免把真正的终端操作误包装成写文件。
+ */
+export function detectShellFileWrites(command: string | undefined | null): ShellFileWriteSummary | null {
+  const rawCommand = asStr(command);
+  const src = rawCommand.replace(/\r\n/g, "\n").trim();
+  if (!src) return null;
+
+  const paths: string[] = [];
+  let writes = 0;
+  let pos = 0;
+  while (pos < src.length) {
+    pos = skipShellSeparators(src, pos);
+    if (pos >= src.length) break;
+
+    const mkdirEnd = consumeMkdirP(src, pos);
+    if (mkdirEnd != null) {
+      pos = mkdirEnd;
+      continue;
+    }
+
+    const heredoc = consumeCatHeredoc(src, pos);
+    if (heredoc) {
+      writes += 1;
+      paths.push(heredoc.path);
+      pos = heredoc.end;
+      continue;
+    }
+
+    return null;
+  }
+
+  if (writes === 0) return null;
+  return { paths: Array.from(new Set(paths)), rawCommand, writeCount: writes };
+}
+
 export function isSafeHttpUrl(s: unknown): s is string {
   return typeof s === "string" && /^https?:\/\//i.test(s);
 }

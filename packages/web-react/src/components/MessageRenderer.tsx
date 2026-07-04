@@ -64,6 +64,9 @@ export const MessageRenderer = memo(
         return <ToolCardSlot message={message} />;
       }
       case "plan":
+        // structured plan steps 已统一进 composer 上方的 PinnedTaskTracker；
+        // 这里只保留 text-only plan/explanation 的 inline 兜底，避免同一执行计划上下重复两张卡。
+        if ((message.steps?.length ?? 0) > 0) return null;
         return <PlanCard msg={message} />;
       case "permission":
         return <PermissionCard msg={message} onRespond={onRespondPermission} />;

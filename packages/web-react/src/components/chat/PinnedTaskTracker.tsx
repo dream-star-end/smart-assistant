@@ -6,7 +6,8 @@
  * 只显示「正在执行的一条」;用户点击可手动展开/折叠(手动后不再自动折叠)。无未完成任务
  * (全部完成或无任务)→ 直接不渲染:不留"完成"残条,打开旧会话也不会闪一下。
  *
- * 数据来自上层从 wsMessages 提取的最新顶层 TodoWrite 的 todos(replace 语义,最后一次=权威)。
+ * 数据来自上层从 wsMessages 提取的最新顶层 TodoWrite todos 或 Codex structured plan steps
+ * (replace 语义,最后一次=权威)。
  */
 import { Check, ChevronDown, ChevronUp, Circle, ListChecks, LoaderCircle } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
@@ -16,22 +17,51 @@ import { asArr, asStr, resolveToolInput } from "../tool/format";
 
 export type TodoItem = { content: string; status: string; activeForm?: string };
 
+function normalizePlanStatus(status: string): string {
+  if (status === "completed") return "completed";
+  if (status === "inProgress" || status === "in_progress") return "in_progress";
+  return "pending";
+}
+
+function normalizePlanSteps(steps: unknown): TodoItem[] {
+  const raw = asArr(steps);
+  return raw
+    .filter((s): s is Record<string, unknown> => !!s && typeof s === "object" && !Array.isArray(s))
+    .map((s) => ({
+      content: asStr(s.step) || asStr(s.text) || asStr(s.description),
+      status: normalizePlanStatus(asStr(s.status)),
+      activeForm: asStr(s.activeForm),
+    }))
+    .filter((t) => t.content || t.activeForm);
+}
+
+function normalizeTodoItems(todos: unknown): TodoItem[] {
+  const raw = asArr(todos);
+  return raw
+    .filter((t): t is Record<string, unknown> => !!t && typeof t === "object" && !Array.isArray(t))
+    .map((t) => ({ content: asStr(t.content), status: asStr(t.status) || "pending", activeForm: asStr(t.activeForm) }))
+    .filter((t) => t.content || t.activeForm);
+}
+
 /**
- * 从消息流提取**最新一次顶层 TodoWrite** 的 todos(主 agent 的任务列表;replace 语义,
- * 最后一次即权威)。只看顶层 role==='tool'(子 agent 的 TodoWrite 是 agent-group 子块,
- * 属委派卡内部,不进主 HUD)。反向扫描,命中即返回。无 → []。
+ * 从消息流提取**最新一次顶层任务源**(主 agent 的任务列表;replace 语义,最后一次即
+ * 权威)。任务源包括:
+ *   1. CCB/legacy TodoWrite tool 的 todos;
+ *   2. Codex app-server structured `role:"plan"` 的 steps。
+ *
+ * 子 agent 的 TodoWrite 是 agent-group 子块,不进主 HUD。反向扫描,命中最近的结构化
+ * 任务源即返回；text-only plan 没有 steps,继续保留 inline PlanCard 兜底。
  */
 export function extractLatestTodos(messages: ChatMessage[]): TodoItem[] {
   for (let i = messages.length - 1; i >= 0; i--) {
     const m = messages[i];
-    if (!m || m.role !== "tool" || m.toolName !== "TodoWrite") continue;
+    if (!m) continue;
+    if (m.role === "plan" && Array.isArray(m.steps)) {
+      return normalizePlanSteps(m.steps);
+    }
+    if (m.role !== "tool" || m.toolName !== "TodoWrite") continue;
     const input = resolveToolInput(m);
-    const raw = asArr(input?.todos);
-    const todos: TodoItem[] = raw
-      .filter((t): t is Record<string, unknown> => !!t && typeof t === "object" && !Array.isArray(t))
-      .map((t) => ({ content: asStr(t.content), status: asStr(t.status) || "pending", activeForm: asStr(t.activeForm) }))
-      .filter((t) => t.content || t.activeForm);
-    return todos;
+    return normalizeTodoItems(input?.todos);
   }
   return [];
 }

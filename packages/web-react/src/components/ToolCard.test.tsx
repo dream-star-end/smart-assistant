@@ -17,6 +17,60 @@ describe("ToolCard 二级分派 + 状态 (P5)", () => {
     expect(screen.getAllByText("ls -la")).toHaveLength(2);
   });
 
+  test("Bash heredoc 纯写文件：显示写入文件语义卡，展开仍保留原始命令", () => {
+    const command = "mkdir -p packages/web-react/src && cat > packages/web-react/src/demo.ts <<'EOF'\nexport const x = 1;\nEOF";
+    render(<ToolCard message={{ toolName: "Bash", inputJson: { command }, _completed: true, output: "ok" }} />);
+    expect(screen.getByText("写入文件")).toBeInTheDocument();
+    expect(screen.getByText("…/web-react/src/demo.ts")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button"));
+    expect(screen.getByText("已写入 1 个文件")).toBeInTheDocument();
+    expect(screen.getByText("原始终端命令")).toBeInTheDocument();
+    const pre = document.querySelector("pre");
+    expect(pre?.textContent).toContain("$ mkdir -p packages/web-react/src");
+    expect(pre?.textContent).toContain("export const x = 1;");
+    expect(pre?.textContent).toContain("ok");
+  });
+
+  test("Bash heredoc 原始命令不截断，长文件内容也可审计", () => {
+    const marker = "TAIL_MARKER_SHOULD_STAY_VISIBLE";
+    const command = `cat > big.txt <<'EOF'\n${"x".repeat(2200)}\n${marker}\nEOF`;
+    render(<ToolCard message={{ toolName: "Bash", inputJson: { command }, _completed: true }} />);
+    fireEvent.click(screen.getByRole("button"));
+    expect(document.querySelector("pre")?.textContent).toContain(marker);
+  });
+
+  test("Bash heredoc 失败：错误输出仍可见，非纯写命令不误标", () => {
+    const command = "cat > a.ts <<'EOF'\ncontent\nEOF";
+    render(
+      <ToolCard
+        message={{
+          toolName: "Bash",
+          inputJson: { command },
+          _completed: true,
+          error: true,
+          output: "Permission denied",
+        }}
+      />,
+    );
+    expect(screen.getByText("写入文件")).toBeInTheDocument();
+    expect(screen.getByText("失败")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button"));
+    expect(screen.getByText("写入文件命令失败")).toBeInTheDocument();
+    expect(document.querySelector("pre")?.textContent).toContain("Permission denied");
+    cleanup();
+
+    render(
+      <ToolCard
+        message={{
+          toolName: "Bash",
+          inputJson: { command: `${command}\nnpm test` },
+          _completed: true,
+        }}
+      />,
+    );
+    expect(screen.getByText("终端")).toBeInTheDocument();
+  });
+
   test("完成态：✓ 无 spinner，默认折叠，点击展开 Edit diff", () => {
     const { container } = render(
       <ToolCard

@@ -85,8 +85,8 @@ describe("MessageRenderer 角色分派 + 非工具卡", () => {
     expect(screen.getByText("推理中...")).toBeInTheDocument();
   });
 
-  test("plan：渲染步骤", () => {
-    renderMsg(
+  test("plan：structured steps 交给 PinnedTaskTracker，inline 不重复渲染", () => {
+    const { container } = renderMsg(
       mk("plan", {
         text: "计划",
         steps: [
@@ -95,8 +95,15 @@ describe("MessageRenderer 角色分派 + 非工具卡", () => {
         ],
       }),
     );
-    expect(screen.getByText("第一步")).toBeInTheDocument();
-    expect(screen.getByText("第二步")).toBeInTheDocument();
+    expect(container.textContent).toBe("");
+    expect(screen.queryByText("第一步")).toBeNull();
+    expect(screen.queryByText("第二步")).toBeNull();
+  });
+
+  test("plan：text-only 仍渲染 inline 兜底", () => {
+    renderMsg(mk("plan", { text: "计划", explanation: "先说明后执行" }));
+    expect(screen.getByText("计划")).toBeInTheDocument();
+    expect(screen.getByText("先说明后执行")).toBeInTheDocument();
   });
 
   test("system：居中提示", () => {

@@ -33,6 +33,7 @@ const CODEX_DEFAULT_MODE_INSTRUCTIONS = [
   'For multi-step, risky, ambiguous, or code-changing tasks, create and maintain a concise plan; keep exactly one active step when work is underway.',
   'For trivial one-step questions or tiny edits, skip the plan and answer or implement directly.',
   'Do not stop after planning unless the user explicitly asks for plan-only; after planning, continue execution in the same turn when execution is allowed.',
+  'When creating or editing files, prefer native fileChange/apply_patch edits so the UI can render Write/Edit cards; avoid Bash heredocs solely for file writes unless the shell command also needs real shell-side effects such as batch scaffolding.',
 ].join(' ')
 
 // ───────────────────────────────────────────────

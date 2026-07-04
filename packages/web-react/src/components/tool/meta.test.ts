@@ -1,4 +1,5 @@
 import { describe, expect, test } from "vitest";
+import { detectShellFileWrites } from "./format";
 import { detectOcCli, parseMcpName, resolveToolMeta, toolSummary } from "./meta";
 
 describe("parseMcpName (P5)", () => {
@@ -131,5 +132,36 @@ describe("oc-* CLI 语义卡 (Bash 特判)", () => {
     expect(
       toolSummary("Bash", { command: "which oc-web 2>/dev/null && oc-web --help" }),
     ).toBe("--help");
+  });
+});
+
+describe("Bash heredoc 写文件语义卡", () => {
+  const writeOne = "mkdir -p packages/web-react/src && cat > packages/web-react/src/demo.ts <<'EOF'\nexport const x = 1;\nEOF";
+  const writeTwo = "cat <<'EOF' > a.ts\none\nEOF\ncat > b.ts <<EOF\ntwo\nEOF";
+
+  test("detectShellFileWrites 识别 mkdir -p + cat heredoc 纯写文件", () => {
+    expect(detectShellFileWrites(writeOne)).toMatchObject({
+      paths: ["packages/web-react/src/demo.ts"],
+      writeCount: 1,
+    });
+    expect(detectShellFileWrites(writeTwo)?.paths).toEqual(["a.ts", "b.ts"]);
+  });
+
+  test("detectShellFileWrites 拒绝 trailing shell side effects", () => {
+    expect(detectShellFileWrites(`${writeOne}\nnpm test`)).toBeNull();
+    expect(detectShellFileWrites("cat > $TARGET <<'EOF'\nx\nEOF")).toBeNull();
+    expect(detectShellFileWrites("cat > a.ts <<'EOF'\nx\nEOF\nchmod +x a.ts")).toBeNull();
+  });
+
+  test("resolveToolMeta / toolSummary 将纯 heredoc Bash 显示为写入文件", () => {
+    expect(resolveToolMeta("Bash", { command: writeOne }).label).toBe("写入文件");
+    expect(toolSummary("Bash", { command: writeOne })).toBe("…/web-react/src/demo.ts");
+    expect(toolSummary("Bash", { command: writeTwo })).toBe("a.ts +1");
+  });
+
+  test("heredoc 内容里出现 oc-* 命令文本时仍优先按写文件显示", () => {
+    const command = "cat > script.sh <<'EOF'\noc-web extract https://example.com\nEOF";
+    expect(resolveToolMeta("Bash", { command }).label).toBe("写入文件");
+    expect(toolSummary("Bash", { command })).toBe("script.sh");
   });
 });

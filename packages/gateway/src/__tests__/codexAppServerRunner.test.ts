@@ -180,6 +180,21 @@ describe('CodexAppServerRunner constructor', () => {
   })
 })
 
+describe('CodexAppServerRunner turn/start params', () => {
+  it('default mode nudges Codex toward native fileChange/apply_patch instead of Bash heredoc file writes', async () => {
+    const h = await makeHarness()
+    const params = (h.runner as any).buildTurnStartParams('hi')
+    const instructions = (params.collaborationMode as any).settings.developer_instructions as string
+    assert.match(instructions, /native fileChange\/apply_patch/)
+    assert.match(instructions, /avoid Bash heredocs solely for file writes/)
+
+    ;(h.runner as any).setConversationMode('plan')
+    const planParams = (h.runner as any).buildTurnStartParams('hi')
+    assert.equal((planParams.collaborationMode as any).settings.developer_instructions, null)
+    await h.cleanup()
+  })
+})
+
 describe('CodexAppServerRunner.start', () => {
   it('emits spawn event synchronously', async () => {
     const h = await makeHarness()

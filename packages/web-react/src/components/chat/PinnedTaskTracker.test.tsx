@@ -10,6 +10,10 @@ function todoMsg(id: string, todos: Array<{ content: string; status: string; act
   return { id, role: "tool", toolName: "TodoWrite", text: "TodoWrite", ts: 0, inputJson: { todos } } as ChatMessage;
 }
 
+function planMsg(id: string, steps: ChatMessage["steps"]): ChatMessage {
+  return { id, role: "plan", text: "执行计划", ts: 0, steps } as ChatMessage;
+}
+
 describe("extractLatestTodos", () => {
   test("取最新一次顶层 TodoWrite 的 todos(replace 语义)", () => {
     const msgs: ChatMessage[] = [
@@ -25,6 +29,31 @@ describe("extractLatestTodos", () => {
     expect(todos[1].activeForm).toBe("正在做任务二");
   });
 
+  test("structured plan steps 进入 HUD，并覆盖更旧 TodoWrite", () => {
+    const msgs: ChatMessage[] = [
+      todoMsg("a", [{ content: "旧 Todo", status: "in_progress" }]),
+      planMsg("p", [
+        { step: "确认现象", status: "completed" },
+        { step: "修复计划卡", status: "inProgress" },
+        { step: "回归测试", status: "pending" },
+      ]),
+    ];
+    const todos = extractLatestTodos(msgs);
+    expect(todos).toEqual([
+      { content: "确认现象", status: "completed", activeForm: "" },
+      { content: "修复计划卡", status: "in_progress", activeForm: "" },
+      { content: "回归测试", status: "pending", activeForm: "" },
+    ]);
+  });
+
+  test("更新的 TodoWrite 可覆盖旧 structured plan", () => {
+    const msgs: ChatMessage[] = [
+      planMsg("p", [{ step: "旧计划", status: "inProgress" }]),
+      todoMsg("t", [{ content: "新任务", status: "pending" }]),
+    ];
+    expect(extractLatestTodos(msgs).map((t) => t.content)).toEqual(["新任务"]);
+  });
+
   test("无 TodoWrite / 非 tool / 畸形项 → 安全", () => {
     expect(extractLatestTodos([])).toEqual([]);
     expect(extractLatestTodos([{ id: "x", role: "assistant", text: "hi", ts: 0 } as ChatMessage])).toEqual([]);
@@ -35,6 +64,15 @@ describe("extractLatestTodos", () => {
     // 畸形 todos 项被过滤,不崩
     const bad = { id: "b", role: "tool", toolName: "TodoWrite", text: "", ts: 0, inputJson: { todos: [null, 1, { content: "真的", status: "pending" }] } } as ChatMessage;
     expect(extractLatestTodos([bad]).map((t) => t.content)).toEqual(["真的"]);
+  });
+
+  test("空/畸形 structured plan 不生成 HUD todos", () => {
+    expect(extractLatestTodos([planMsg("empty", [])])).toEqual([]);
+    expect(
+      extractLatestTodos([
+        { id: "bad-plan", role: "plan", text: "执行计划", ts: 0, steps: [null, { status: "inProgress" }] as any },
+      ]),
+    ).toEqual([]);
   });
 });
 

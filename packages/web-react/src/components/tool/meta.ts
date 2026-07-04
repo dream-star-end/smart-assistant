@@ -36,7 +36,7 @@ import {
   Wrench,
   type LucideIcon,
 } from "lucide-react";
-import { asArr, asStr, parseCodexTypeName, shortPath } from "./format";
+import { asArr, asStr, detectShellFileWrites, parseCodexTypeName, shortPath } from "./format";
 
 /** 工具卡图标底色语义(对齐设计稿 aurora-conversation-cards 的 .tic.tn-* 分色)。 */
 export type ToolTone = "accent" | "success" | "info" | "warning" | "neutral";
@@ -244,7 +244,9 @@ export function resolveToolMeta(
 ): ToolMeta {
   // Bash 命令若调用 oc-* CLI,给专属语义卡而非通用"终端"卡。
   if (name === "Bash" && input) {
-    const cli = detectOcCli(asStr(input.command));
+    const command = asStr(input.command);
+    if (detectShellFileWrites(command)) return TOOL_META.Write;
+    const cli = detectOcCli(command);
     if (cli && OC_CLI_META[cli]) return OC_CLI_META[cli];
   }
   if (TOOL_META[name]) return TOOL_META[name];
@@ -269,6 +271,11 @@ export function toolSummary(name: string, input: Record<string, unknown> | null)
   switch (name) {
     case "Bash": {
       const cmd = asStr(input.command);
+      const fileWrite = detectShellFileWrites(cmd);
+      if (fileWrite) {
+        const first = shortPath(fileWrite.paths[0]);
+        return fileWrite.paths.length > 1 ? `${first} +${fileWrite.paths.length - 1}` : first;
+      }
       const oc = matchOcCli(cmd);
       if (oc) return ocCliSummary(cmd, oc.end);
       return (asStr(input.description) || cmd.split("\n")[0]).slice(0, 60);

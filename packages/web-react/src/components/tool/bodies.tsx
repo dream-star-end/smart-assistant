@@ -14,6 +14,7 @@ import {
   asArr,
   asStr,
   clampStr,
+  detectShellFileWrites,
   formatValue,
   isSafeHttpUrl,
   parseCodexTypeName,
@@ -153,11 +154,13 @@ function DiffView({ oldStr, newStr }: { oldStr: string; newStr: string }) {
 }
 
 function BashBody({ input, tool }: BodyProps) {
-  const command = asStr(input?.command).slice(0, 2000);
+  const rawCommand = asStr(input?.command);
+  const command = rawCommand.slice(0, 2000);
   // oc-* 工具(文献检索/引用核验/…):若命令命中且输出可解析 → 渲染专门卡片,
   // 而非原始"$ 命令 + JSON"终端块。不认/出错 → 回落下方通用渲染。
   const ocCard = researchToolCard(command, tool);
   if (ocCard) return ocCard;
+  const fileWrite = detectShellFileWrites(rawCommand);
   const out = tool.output;
   // bg-bash 的 tool_result.preview 只是占位文案（"Command running in background…"），
   // 不是真实输出；后台进程的真实 stdout/stderr 走 bashTail。识别占位 → 优先 bashTail。
@@ -180,6 +183,41 @@ function BashBody({ input, tool }: BodyProps) {
     outText = out;
   }
   if (!command && !outText) return null;
+  if (fileWrite) {
+    const auditCommand = fileWrite.rawCommand;
+    const status = tool.error
+      ? "写入文件命令失败"
+      : tool._completed
+        ? `已写入 ${fileWrite.paths.length} 个文件`
+        : "正在写入文件…";
+    return (
+      <>
+        <StatusLine text={status} error={tool.error} />
+        <div className={cn("mt-1.5 rounded-md px-3 py-2 text-xs", tool.error ? "bg-danger-soft" : "bg-success-soft")}>
+          <div className={cn("font-medium", tool.error ? "text-danger" : "text-success")}>文件</div>
+          <ul className="mt-1 flex flex-col gap-0.5">
+            {fileWrite.paths.map((path) => (
+              <li key={path} className="font-mono text-muted">
+                {shortPath(path)}
+              </li>
+            ))}
+          </ul>
+        </div>
+        {headTruncated && <FileMeta>… (head 已截断, 共 {totalBytes} 字节)</FileMeta>}
+        <FileMeta>原始终端命令</FileMeta>
+        <Pre>
+          {auditCommand && (
+            <>
+              <span className="text-success">$ </span>
+              {auditCommand}
+              {outText ? "\n" : ""}
+            </>
+          )}
+          {outText}
+        </Pre>
+      </>
+    );
+  }
   return (
     <>
       {headTruncated && <FileMeta>… (head 已截断, 共 {totalBytes} 字节)</FileMeta>}
