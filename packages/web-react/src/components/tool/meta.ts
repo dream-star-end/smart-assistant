@@ -348,7 +348,7 @@ function mcpSummary(server: string, op: string, input: Record<string, unknown>):
     return op;
   }
   if (server === "openclaude-memory") {
-    if (op === "memory") return `${asStr(input.op) || "read"} ${asStr(input.section)}`.trim();
+    if (op === "memory") return `${asStr(input.action) || asStr(input.op) || "read"} ${asStr(input.target) || asStr(input.section)}`.trim();
     if (op === "archival_add" || op === "archival_search" || op === "archival_delete") {
       return asStr(input.query) || asStr(input.id) || asStr(input.text).slice(0, 50);
     }

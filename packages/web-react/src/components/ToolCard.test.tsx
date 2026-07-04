@@ -483,4 +483,178 @@ describe("ToolCard 二级分派 + 状态 (P5)", () => {
     expect(pre?.textContent).toContain("$ pwd");
     expect(pre?.textContent).toContain("/home/agent");
   });
+
+  test("openclaude-memory list_reminders 渲染为友好的定时任务列表", () => {
+    const started = {
+      type: "mcpToolCall",
+      id: "call_cron",
+      server: "openclaude_memory",
+      tool: "list_reminders",
+      status: "inProgress",
+      arguments: {},
+    };
+    const text = [
+      "共 3 个定时提醒/任务:",
+      "- **daily-reflection** (ID: `daily-reflection`) — `17 3 * * *` · 重复 · 启用中 · 仅记录 · 下次 2026-07-04T19:17:00.000Z",
+      "- **weekly-curation** (ID: `weekly-curation`) — `31 4 * * 0` · 重复 · 启用中 · 仅记录 · 下次 2026-07-04T20:31:00.000Z",
+      "- **Quick skill extraction pass** (ID: `skill-check`) — `47 */6 * * *` · 重复 · 已停用 · 推送对话",
+    ].join("\n");
+    render(
+      <ToolCard
+        message={{
+          toolName: "codex:mcpToolCall",
+          inputJson: started,
+          output: JSON.stringify({ ...started, status: "completed", result: { content: [{ type: "text", text }] } }),
+          _completed: true,
+        }}
+      />,
+    );
+    expect(screen.getByText("定时任务列表")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button"));
+    expect(screen.getByText("当前共有 3 个定时任务")).toBeInTheDocument();
+    expect(screen.getAllByText("daily-reflection").length).toBeGreaterThanOrEqual(1);
+    expect(screen.getAllByText("weekly-curation").length).toBeGreaterThanOrEqual(1);
+    expect(screen.getAllByText("skill-check").length).toBeGreaterThanOrEqual(1);
+    expect(document.body.textContent || "").not.toContain("- **daily-reflection**");
+  });
+
+  test("openclaude-memory list_reminders 空列表显示空状态", () => {
+    render(
+      <ToolCard
+        message={{
+          toolName: "mcp__openclaude-memory__list_reminders",
+          inputJson: {},
+          output: "当前没有任何定时提醒/任务。可用 create_reminder 创建。",
+          _completed: true,
+        }}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button"));
+    expect(screen.getByText("还没有定时任务")).toBeInTheDocument();
+    expect(screen.getByText(/每天 9 点提醒我/)).toBeInTheDocument();
+  });
+
+  test("openclaude-memory list_reminders 解析失败时保留 raw fallback", () => {
+    render(
+      <ToolCard
+        message={{
+          toolName: "mcp__openclaude-memory__list_reminders",
+          inputJson: {},
+          output: "共 2 个定时提醒/任务:\n* bad legacy line",
+          _completed: true,
+        }}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button"));
+    expect(screen.queryByText(/当前共有/)).not.toBeInTheDocument();
+    expect(document.querySelector("pre")?.textContent).toContain("bad legacy line");
+  });
+
+  test("openclaude-memory list_reminders 部分解析失败时整段回退 raw，避免漏任务", () => {
+    render(
+      <ToolCard
+        message={{
+          toolName: "mcp__openclaude-memory__list_reminders",
+          inputJson: {},
+          output: [
+            "共 2 个定时提醒/任务:",
+            "- **ok-job** (ID: `ok`) — `0 9 * * *` · 重复 · 启用中 · 推送对话",
+            "- malformed reminder line",
+          ].join("\n"),
+          _completed: true,
+        }}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button"));
+    expect(screen.queryByText(/当前共有/)).not.toBeInTheDocument();
+    const preText = document.querySelector("pre")?.textContent || "";
+    expect(preText).toContain("ok-job");
+    expect(preText).toContain("malformed reminder line");
+  });
+
+  test.each([
+    [
+      "create_reminder",
+      { schedule: "bad cron", message: "喝水" },
+      "error: 创建提醒失败: bad cron",
+      "创建提醒失败",
+      "",
+    ],
+    [
+      "update_reminder",
+      { id: "missing", schedule: "0 9 * * *" },
+      "error: 任务不存在: missing(用 list_reminders 查 ID)",
+      "修改任务失败",
+      "任务信息已更新",
+    ],
+    [
+      "delete_reminder",
+      { id: "missing" },
+      "error: 任务不存在: missing(用 list_reminders 查 ID)",
+      "删除任务失败",
+      "这个任务不会再触发。",
+    ],
+  ])("openclaude-memory %s 失败时展示 raw error 而不是成功文案", (op, inputJson, output, title, misleading) => {
+    render(
+      <ToolCard
+        message={{
+          toolName: `mcp__openclaude-memory__${op}`,
+          inputJson,
+          output,
+          error: true,
+          _completed: true,
+        }}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button"));
+    expect(screen.getByText(title)).toBeInTheDocument();
+    expect(document.body.textContent || "").toContain(output);
+    if (misleading) expect(document.body.textContent || "").not.toContain(misleading);
+  });
+
+  test("openclaude-memory memory(add) 失败时读取 tool.error，不把裸错误输出显示成成功", () => {
+    render(
+      <ToolCard
+        message={{
+          toolName: "mcp__openclaude-memory__memory",
+          inputJson: { action: "add", target: "memory", content: "bad" },
+          output: "rejected: prompt injection pattern",
+          error: true,
+          _completed: true,
+        }}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button"));
+    expect(screen.getByText("新增记忆失败")).toBeInTheDocument();
+    expect(document.body.textContent || "").toContain("rejected: prompt injection pattern");
+    expect(document.body.textContent || "").not.toContain("已新增核心记忆");
+  });
+
+  test("openclaude-memory memory(read) 输出显示为记忆卡片", () => {
+    const started = {
+      type: "mcpToolCall",
+      id: "call_memory_read",
+      server: "openclaude_memory",
+      tool: "memory",
+      status: "inProgress",
+      arguments: { action: "read", target: "user" },
+    };
+    const text = "用户称呼：dengxuan\n§\n项目访问信息：\n- URL: https://example.com";
+    render(
+      <ToolCard
+        message={{
+          toolName: "codex:mcpToolCall",
+          inputJson: started,
+          output: JSON.stringify({ ...started, status: "completed", result: { content: [{ type: "text", text }] } }),
+          _completed: true,
+        }}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button"));
+    expect(screen.getByText("用户画像 · 2 条")).toBeInTheDocument();
+    expect(screen.getByText("用户称呼")).toBeInTheDocument();
+    expect(screen.getByText("项目访问信息")).toBeInTheDocument();
+    expect(document.body.textContent || "").not.toContain("§");
+  });
+
 });

@@ -1,11 +1,10 @@
 import { Check, Loader2, Plus, Trash2 } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api } from "../../lib/api";
+import { deriveMemoryTitle, joinMemoryEntries, splitMemoryEntries } from "../../lib/memoryText";
 import type { AuthSession } from "../../lib/types";
-import { Alert, Button, PanelHeader } from "../ui";
+import { Alert, Badge, Button, PanelHeader } from "../ui";
 
-// 记忆按 "\n§\n" 分隔成多条目（与 storage/memoryStore.ts 的 ENTRY_DELIMITER 一致）。
-const DELIM = "\n§\n";
 type Target = "memory" | "user";
 type Entry = { id: number; text: string };
 
@@ -15,17 +14,6 @@ const DOCS: { key: Target; label: string; hint: string; shared?: boolean }[] = [
   { key: "user", label: "用户画像", hint: "关于你的背景信息 · 所有智能体共享", shared: true },
   { key: "memory", label: "核心记忆", hint: "该智能体自己的观察与经验 · 按智能体独立保存" },
 ];
-
-function splitEntries(text: string): string[] {
-  return text.replace(/\r\n/g, "\n").split(DELIM);
-}
-function joinEntries(texts: string[]): string {
-  // 与后端 MemoryStore.overwrite 对齐：trim 每条并丢弃空条目，保证“保存后规范化”与实际持久化一致。
-  return texts
-    .map((t) => t.replace(/\r\n/g, "\n").trim())
-    .filter((t) => t)
-    .join(DELIM);
-}
 
 /**
  * 记忆中心：用户画像（user,**用户级共享** —— 换哪个智能体都认识你）+ 核心记忆
@@ -107,7 +95,7 @@ function MemoryDoc({
   const nextId = useRef(0);
 
   const toEntries = useCallback((text: string): Entry[] => {
-    return splitEntries(text).map((t) => ({ id: nextId.current++, text: t }));
+    return splitMemoryEntries(text).map((t) => ({ id: nextId.current++, text: t }));
   }, []);
 
   useEffect(() => {
@@ -120,7 +108,7 @@ function MemoryDoc({
         if (!alive) return;
         const text = d.text || "";
         setEntries(toEntries(text));
-        setOrig(joinEntries(splitEntries(text)));
+        setOrig(joinMemoryEntries(splitMemoryEntries(text)));
       })
       .catch((e) => {
         if (alive) setErr((e as Error).message || "加载记忆失败");
@@ -133,7 +121,7 @@ function MemoryDoc({
     };
   }, [auth, agentId, target, toEntries]);
 
-  const current = joinEntries(entries.map((e) => e.text));
+  const current = joinMemoryEntries(entries.map((e) => e.text));
   const dirty = current !== orig;
   const nonEmpty = entries.filter((e) => e.text.trim()).length;
 
@@ -141,7 +129,7 @@ function MemoryDoc({
     setSaving(true);
     setErr(null);
     try {
-      const text = joinEntries(entries.map((e) => e.text));
+      const text = joinMemoryEntries(entries.map((e) => e.text));
       await api.putMemory(auth, agentId, target, text);
       setOrig(text);
       setEntries(toEntries(text)); // 规范化：去掉空条目
@@ -190,32 +178,19 @@ function MemoryDoc({
               暂无{meta.label}，点「新增条目」手写补充。
             </p>
           ) : (
-            <ul className="mt-1 flex flex-col gap-2">
-              {entries.map((entry) => (
-                <li key={entry.id} className="rounded-lg border border-border bg-surface p-2.5">
-                  <textarea
-                    value={entry.text}
-                    disabled={saving}
-                    onChange={(e) =>
-                      setEntries((es) =>
-                        es.map((x) => (x.id === entry.id ? { ...x, text: e.target.value } : x)),
-                      )
-                    }
-                    rows={2}
-                    placeholder="一条记忆…"
-                    className="w-full resize-y bg-transparent font-mono text-[12.5px] leading-relaxed text-fg outline-none placeholder:text-faint disabled:opacity-60"
-                  />
-                  <div className="mt-0.5 flex justify-end">
-                    <button
-                      onClick={() => setEntries((es) => es.filter((x) => x.id !== entry.id))}
-                      disabled={saving}
-                      aria-label="删除条目"
-                      className="flex size-6 items-center justify-center rounded text-faint outline-none transition-colors hover:bg-danger-soft hover:text-danger focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50"
-                    >
-                      <Trash2 size={13} />
-                    </button>
-                  </div>
-                </li>
+            <ul className="mt-2 flex flex-col gap-2.5">
+              {entries.map((entry, index) => (
+                <MemoryEntryCard
+                  key={entry.id}
+                  entry={entry}
+                  index={index}
+                  saving={saving}
+                  dirty={joinMemoryEntries([entry.text]) !== joinMemoryEntries([splitMemoryEntries(orig)[index] || ""])}
+                  onChange={(text) =>
+                    setEntries((es) => es.map((x) => (x.id === entry.id ? { ...x, text } : x)))
+                  }
+                  onDelete={() => setEntries((es) => es.filter((x) => x.id !== entry.id))}
+                />
               ))}
             </ul>
           )}
@@ -229,5 +204,53 @@ function MemoryDoc({
         </>
       )}
     </div>
+  );
+}
+function MemoryEntryCard({
+  entry,
+  index,
+  saving,
+  dirty,
+  onChange,
+  onDelete,
+}: {
+  entry: Entry;
+  index: number;
+  saving: boolean;
+  dirty: boolean;
+  onChange: (text: string) => void;
+  onDelete: () => void;
+}) {
+  const title = deriveMemoryTitle(entry.text, `记忆 ${index + 1}`);
+  const chars = entry.text.replace(/\r\n/g, "\n").trim().length;
+  return (
+    <li className="rounded-2xl border border-border bg-elevated px-3.5 py-3 shadow-soft">
+      <div className="flex items-start justify-between gap-2">
+        <div className="min-w-0">
+          <div className="flex min-w-0 flex-wrap items-center gap-1.5">
+            <Badge tone="accent">#{index + 1}</Badge>
+            <span className="min-w-0 truncate text-[13px] font-semibold text-fg">{title}</span>
+            {dirty && <Badge tone="warning">未保存</Badge>}
+          </div>
+          <p className="mt-0.5 text-[11.5px] text-faint">{chars} 字符</p>
+        </div>
+        <button
+          onClick={onDelete}
+          disabled={saving}
+          aria-label="删除条目"
+          className="flex size-7 shrink-0 items-center justify-center rounded-lg text-faint outline-none transition-colors hover:bg-danger-soft hover:text-danger focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50"
+        >
+          <Trash2 size={14} />
+        </button>
+      </div>
+      <textarea
+        value={entry.text}
+        disabled={saving}
+        onChange={(e) => onChange(e.target.value)}
+        rows={Math.min(6, Math.max(3, entry.text.split("\n").length + 1))}
+        placeholder="一条记忆…"
+        className="mt-2 w-full resize-y rounded-xl border border-border bg-surface px-3 py-2 text-[13px] leading-relaxed text-fg outline-none transition-colors placeholder:text-faint focus:border-accent focus:ring-2 focus:ring-ring disabled:opacity-60"
+      />
+    </li>
   );
 }

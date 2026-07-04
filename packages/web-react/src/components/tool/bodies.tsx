@@ -9,6 +9,12 @@ import { Sparkles, FileText } from "lucide-react";
 import type { ReactNode } from "react";
 import { cn } from "../../lib/utils";
 import { Badge, Button } from "../ui";
+import {
+  MemoryStatusCard,
+  ReminderStatusCard,
+  renderMemoryReadCards,
+  renderReminderListCard,
+} from "./memoryReminderCards";
 import { useToolCardActions } from "./context";
 import {
   asArr,
@@ -581,38 +587,7 @@ function MemoryBody({ op, input, tool }: BodyProps & { op: string }) {
       </>
     );
   }
-  let kv: ReactNode = null;
-  if (input) {
-    if (op === "memory") {
-      kv = <KvList obj={{ op: input.op, section: input.section, content: input.content }} />;
-    } else if (op === "create_reminder") {
-      kv = (
-        <KvList
-          obj={{
-            schedule: input.schedule,
-            message: input.message,
-            label: input.label,
-            oneshot: input.oneshot,
-            deliver: input.deliver,
-          }}
-        />
-      );
-    } else if (op === "delegate_task" || op === "send_to_agent") {
-      kv = (
-        <KvList
-          obj={{
-            agent: input.agentId,
-            goal: input.goal,
-            message: input.message,
-            prompt: input.prompt,
-            context: input.context,
-          }}
-        />
-      );
-    } else {
-      kv = <KvList obj={input} />;
-    }
-  }
+
   const btns: ReactNode[] = [];
   if (["memory", "archival_add", "archival_search", "session_search"].includes(op) && actions.onOpenMemory) {
     btns.push(
@@ -628,17 +603,51 @@ function MemoryBody({ op, input, tool }: BodyProps & { op: string }) {
       </Button>,
     );
   }
-  if (op === "create_reminder" && actions.onOpenTasks) {
+  if (["create_reminder", "list_reminders", "update_reminder", "delete_reminder"].includes(op) && actions.onOpenTasks) {
     btns.push(
       <Button key="tk" variant="ghost" size="sm" onClick={actions.onOpenTasks}>
         查看定时任务
       </Button>,
     );
   }
+
+  let body: ReactNode = null;
+  if (op === "list_reminders") {
+    body = renderReminderListCard(tool.output) ?? <OutputBlock output={tool.output} />;
+  } else if (["create_reminder", "update_reminder", "delete_reminder"].includes(op)) {
+    body = <ReminderStatusCard op={op} input={input} output={tool.output} error={!!tool.error} />;
+  } else if (op === "memory") {
+    const action = asStr(input?.action) || asStr(input?.op) || "read";
+    const target = input?.target ?? input?.section;
+    if (action === "read") {
+      body = renderMemoryReadCards(tool.output, target) ?? <OutputBlock output={tool.output} />;
+    } else if (["add", "replace", "remove"].includes(action)) {
+      body = <MemoryStatusCard action={action} target={target} output={tool.output} error={!!tool.error} />;
+    } else {
+      body = <KvList obj={{ action, target, content: input?.content, needle: input?.needle }} />;
+    }
+  } else if (op === "delegate_task" || op === "send_to_agent") {
+    body = (
+      <KvList
+        obj={{
+          agent: input?.agentId,
+          goal: input?.goal,
+          message: input?.message,
+          prompt: input?.prompt,
+          context: input?.context,
+        }}
+      />
+    );
+  } else {
+    body = <KvList obj={input} />;
+  }
+
   return (
     <>
-      {kv}
-      <OutputBlock output={tool.output} />
+      {body}
+      {!["memory", "create_reminder", "list_reminders", "update_reminder", "delete_reminder"].includes(op) && (
+        <OutputBlock output={tool.output} />
+      )}
       {btns.length > 0 && <div className="mt-2 flex flex-wrap gap-2">{btns}</div>}
     </>
   );
