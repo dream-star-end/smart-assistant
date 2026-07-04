@@ -260,6 +260,42 @@ describe('Aurora v5 skeleton — auth → workspace', () => {
     )
     expect(chatLike.length).toBe(0)
   })
+
+  test('team mode switch persists while reopening the agent picker', async () => {
+    fetchMock = routedFetch()
+    vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
+
+    render(<App />)
+    await loginViaUi()
+
+    fireEvent.click(await screen.findByRole('button', { name: /全能助手/ }))
+    const sw = await screen.findByRole('switch', { name: '启用团队模式' })
+    expect(sw).not.toBeChecked()
+
+    fireEvent.click(sw)
+    expect(sw).toBeChecked()
+    expect(localStorage.getItem('oc_v5_team_mode')).toBe('1')
+
+    fireEvent.click(screen.getByRole('button', { name: '关闭' }))
+    await waitFor(() =>
+      expect(screen.queryByRole('switch', { name: '启用团队模式' })).not.toBeInTheDocument(),
+    )
+
+    fireEvent.click(screen.getByRole('button', { name: /全能助手/ }))
+    expect(await screen.findByRole('switch', { name: '启用团队模式' })).toBeChecked()
+  })
+
+  test('team mode restores from localStorage after a fresh App mount', async () => {
+    localStorage.setItem('oc_v5_team_mode', '1')
+    fetchMock = routedFetch()
+    vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
+
+    render(<App />)
+    await loginViaUi()
+
+    fireEvent.click(await screen.findByRole('button', { name: /全能助手/ }))
+    expect(await screen.findByRole('switch', { name: '启用团队模式' })).toBeChecked()
+  })
 })
 
 describe('Aurora v5 skeleton — demo mode (no network)', () => {

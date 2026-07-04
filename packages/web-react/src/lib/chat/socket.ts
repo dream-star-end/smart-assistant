@@ -20,6 +20,7 @@ import {
   applyResumeFailed,
   applyTurnStatus,
   AUTO_CONTINUE_PROMPT,
+  normalizeDelegateCards,
   type FrameEffects,
 } from "./reducer";
 import {
@@ -1231,6 +1232,7 @@ export class ChatSocket {
     s._streamingThinking = null;
     s._sendingInFlight = false;
     rebuildIndexes(s);
+    normalizeDelegateCards(s);
     this.sessions.set(stored.id, s);
     this.scheduleNotify();
   }
@@ -1258,6 +1260,7 @@ export class ChatSocket {
     s._blockIdToMsgId = new Map();
     s._agentGroups = new Map();
     rebuildIndexes(s);
+    normalizeDelegateCards(s);
     this.scheduleNotify();
   }
 

@@ -136,6 +136,48 @@ describe("tool / agent-group 集成", () => {
     // 运行中默认展开 → 子块文本可见。
     expect(screen.getByText("子代理输出")).toBeInTheDocument();
   });
+
+  test("delegate-progress fallback renders child tool blocks with ToolCard", () => {
+    renderMsg(
+      mk("delegate-progress", {
+        _completed: false,
+        childBlocks: [
+          { kind: "tool_use", blockId: "child-bash", toolName: "Bash", inputJson: { command: "pwd" }, _completed: false },
+        ],
+      }),
+    );
+    expect(screen.getByText("委派子任务")).toBeInTheDocument();
+    expect(screen.getByText("终端")).toBeInTheDocument();
+    expect(screen.getAllByText("pwd").length).toBeGreaterThanOrEqual(1);
+  });
+
+  test("delegate-progress fallback keeps final summary when child blocks exist", () => {
+    renderMsg(
+      mk("delegate-progress", {
+        _completed: true,
+        summary: "委派最终结果",
+        childBlocks: [
+          { kind: "tool_use", blockId: "child-bash", toolName: "Bash", inputJson: { command: "pwd" }, _completed: true },
+        ],
+      }),
+    );
+    expect(screen.getByText("委派最终结果")).toBeInTheDocument();
+    expect(screen.getByText("终端")).toBeInTheDocument();
+  });
+
+  test("delegate-progress fallback keeps legacy entries when child blocks exist", () => {
+    renderMsg(
+      mk("delegate-progress", {
+        _completed: false,
+        entries: [{ phase: "text", text: "legacy output", ts: 1 }],
+        childBlocks: [
+          { kind: "tool_use", blockId: "child-bash", toolName: "Bash", inputJson: { command: "pwd" }, _completed: false },
+        ],
+      }),
+    );
+    expect(screen.getByText("legacy output")).toBeInTheDocument();
+    expect(screen.getByText("终端")).toBeInTheDocument();
+  });
 });
 
 describe("permission 审批", () => {

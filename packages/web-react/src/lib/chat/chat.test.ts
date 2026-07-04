@@ -21,6 +21,7 @@ import {
   applyOutboundError,
   applyOutboundMessage,
   applyResumeFailed,
+  normalizeDelegateCards,
   type FrameEffects,
 } from "./reducer";
 import { ChatSocket } from "./socket";
@@ -391,6 +392,45 @@ describe("applyOutboundMessage (§3/§7/§9/§11)", () => {
     expect(group?._teamFallback).toBe(true);
   });
 
+  test("Agent tool_result keeps JSON result preview on completed group", () => {
+    const s = sess();
+    applyOutboundMessage(
+      s,
+      msgFrame({
+        frameSeq: 1,
+        blocks: [
+          {
+            kind: "tool_use",
+            toolName: "Agent",
+            blockId: "spawn-json",
+            partial: false,
+            inputJson: { description: "return json" },
+          },
+        ],
+      }),
+    );
+    applyOutboundMessage(
+      s,
+      msgFrame({
+        frameSeq: 2,
+        blocks: [
+          {
+            kind: "tool_result",
+            toolName: "Agent",
+            toolUseBlockId: "spawn-json",
+            blockId: "spawn-json:result",
+            preview: '{"ok":true}',
+            isError: false,
+          },
+        ],
+      }),
+    );
+
+    const group = s.messages.find((m) => m.role === "agent-group");
+    expect(group?._completed).toBe(true);
+    expect(group?._resultPreview).toBe('{"ok":true}');
+  });
+
   test("adopted delegate_progress preserves completed summary on the group", () => {
     const s = sess();
     applyOutboundMessage(
@@ -495,7 +535,173 @@ describe("applyOutboundMessage (§3/§7/§9/§11)", () => {
     expect(s.messages.some((m) => m.role === "delegate-progress")).toBe(false);
   });
 
-  test("legacy non-start delegate_progress entries stay standalone instead of being dropped", () => {
+
+  test("Codex mcpToolCall delegate_task tool_use is rendered as one realtime agent-group", () => {
+    const s = sess();
+    const started = {
+      type: "mcpToolCall",
+      id: "call_codex_delegate",
+      server: "openclaude_memory",
+      tool: "delegate_task",
+      status: "inProgress",
+      arguments: { agentId: "coding-assistant", goal: "设计水箱模拟" },
+    };
+    applyOutboundMessage(
+      s,
+      msgFrame({
+        frameSeq: 1,
+        blocks: [
+          {
+            kind: "tool_use",
+            toolName: "codex:mcpToolCall",
+            blockId: "call_codex_delegate",
+            partial: false,
+            inputJson: started,
+          },
+        ],
+      }),
+    );
+    expect(s.messages.filter((m) => m.role === "tool")).toHaveLength(0);
+
+    applyOutboundMessage(
+      s,
+      msgFrame({
+        frameSeq: 2,
+        blocks: [
+          {
+            kind: "delegate_progress",
+            runId: "dlg-codex",
+            agentId: "coding-assistant",
+            phase: "start",
+            text: "开始委派给 coding-assistant: 设计水箱模拟",
+            goal: "设计水箱模拟",
+          },
+        ],
+      }),
+    );
+    applyOutboundMessage(
+      s,
+      msgFrame({
+        frameSeq: 3,
+        blocks: [
+          {
+            kind: "delegate_progress",
+            runId: "dlg-codex",
+            agentId: "coding-assistant",
+            phase: "tool",
+            toolName: "Bash",
+            block: { kind: "tool_use", blockId: "child-bash", toolName: "Bash", inputJson: { command: "pwd" } },
+          },
+        ],
+      }),
+    );
+
+    const groups = s.messages.filter((m) => m.role === "agent-group");
+    expect(groups).toHaveLength(1);
+    expect(groups[0].text).toBe("设计水箱模拟");
+    expect(groups[0]._delegateAgentId).toBe("coding-assistant");
+    expect(groups[0]._delegateRunId).toBe("dlg-codex");
+    expect(groups[0].childBlocks?.some((b) => b.kind === "tool_use" && b.toolName === "Bash")).toBe(true);
+    expect(s.messages.some((m) => m.role === "delegate-progress")).toBe(false);
+  });
+
+  test("partial Codex delegate mcpToolCall converts the early tool row into one agent-group", () => {
+    const s = sess();
+    applyOutboundMessage(
+      s,
+      msgFrame({
+        frameSeq: 1,
+        blocks: [
+          {
+            kind: "tool_use",
+            toolName: "codex:mcpToolCall",
+            blockId: "call_partial_delegate",
+            partial: true,
+            inputPreview: '{"type":"mcpToolCall",',
+          },
+        ],
+      }),
+    );
+    expect(s.messages.filter((m) => m.role === "tool")).toHaveLength(1);
+
+    applyOutboundMessage(
+      s,
+      msgFrame({
+        frameSeq: 2,
+        blocks: [
+          {
+            kind: "tool_use",
+            toolName: "codex:mcpToolCall",
+            blockId: "call_partial_delegate",
+            partial: false,
+            inputJson: {
+              type: "mcpToolCall",
+              id: "call_partial_delegate",
+              server: "openclaude_memory",
+              tool: "delegate_task",
+              arguments: { agentId: "coding-assistant", goal: "设计水箱模拟" },
+            },
+          },
+        ],
+      }),
+    );
+
+    const groups = s.messages.filter((m) => m.role === "agent-group");
+    expect(groups).toHaveLength(1);
+    expect(groups[0].id).toBe(s.messages[0].id);
+    expect(groups[0].text).toBe("设计水箱模拟");
+    expect(s.messages.some((m) => m.role === "tool")).toBe(false);
+  });
+
+  test("Codex delegate progress before mcpToolCall is adopted into the same agent-group", () => {
+    const s = sess();
+    applyOutboundMessage(
+      s,
+      msgFrame({
+        frameSeq: 1,
+        blocks: [
+          {
+            kind: "delegate_progress",
+            runId: "dlg-before-codex",
+            agentId: "coding-assistant",
+            phase: "start",
+            text: "开始委派给 coding-assistant: 设计水箱模拟",
+            goal: "设计水箱模拟",
+          },
+        ],
+      }),
+    );
+    expect(s.messages.filter((m) => m.role === "delegate-progress")).toHaveLength(1);
+
+    applyOutboundMessage(
+      s,
+      msgFrame({
+        frameSeq: 2,
+        blocks: [
+          {
+            kind: "tool_use",
+            toolName: "codex:mcpToolCall",
+            blockId: "call_codex_delegate_2",
+            partial: false,
+            inputJson: {
+              type: "mcpToolCall",
+              id: "call_codex_delegate_2",
+              server: "openclaude_memory",
+              tool: "delegate_task",
+              arguments: { agentId: "coding-assistant", goal: "设计水箱模拟" },
+            },
+          },
+        ],
+      }),
+    );
+
+    const groups = s.messages.filter((m) => m.role === "agent-group");
+    expect(groups).toHaveLength(1);
+    expect(groups[0]._delegateRunId).toBe("dlg-before-codex");
+    expect(s.messages.some((m) => m.role === "delegate-progress")).toBe(false);
+  });
+
+  test("legacy non-start delegate_progress entries are adopted without dropping output", () => {
     const s = sess();
     applyOutboundMessage(
       s,
@@ -535,13 +741,21 @@ describe("applyOutboundMessage (§3/§7/§9/§11)", () => {
         ],
       }),
     );
+    applyOutboundMessage(
+      s,
+      msgFrame({
+        frameSeq: 4,
+        blocks: [{ kind: "delegate_progress", runId: "dlg-4", agentId: "hidden-reviewer", phase: "text", text: " continued" }],
+      }),
+    );
 
-    expect(s.messages.filter((m) => m.role === "agent-group")).toHaveLength(1);
-    const standalone = s.messages.find((m) => m.role === "delegate-progress");
-    expect(standalone?.entries?.some((e) => e.phase === "text" && e.text === "legacy output")).toBe(true);
+    const group = s.messages.find((m) => m.role === "agent-group");
+    expect(group?._delegateRunId).toBe("dlg-4");
+    expect(group?.childBlocks?.some((b) => b.kind === "text" && b.text === "legacy output continued")).toBe(true);
+    expect(s.messages.some((m) => m.role === "delegate-progress")).toBe(false);
   });
 
-  test("mixed legacy entries and rich child blocks stay standalone to avoid dropping entries", () => {
+  test("mixed legacy entries and rich child blocks are adopted into one group", () => {
     const s = sess();
     applyOutboundMessage(
       s,
@@ -599,10 +813,124 @@ describe("applyOutboundMessage (§3/§7/§9/§11)", () => {
     );
 
     const group = s.messages.find((m) => m.role === "agent-group");
+    expect(group?._delegateRunId).toBe("dlg-5");
+    expect(group?.childBlocks?.some((b) => b.kind === "text" && b.text === "legacy output")).toBe(true);
+    expect(group?.childBlocks?.some((b) => b.kind === "text" && b.text === "rich output")).toBe(true);
+    expect(s.messages.some((m) => m.role === "delegate-progress")).toBe(false);
+  });
+
+  test("adopted delegate_progress rebinds nested Agent child routing", () => {
+    const s = sess();
+    applyOutboundMessage(
+      s,
+      msgFrame({
+        frameSeq: 1,
+        blocks: [
+          {
+            kind: "delegate_progress",
+            runId: "dlg-nested",
+            agentId: "hidden-reviewer",
+            phase: "start",
+            text: "开始委派给 hidden-reviewer: 审查草稿",
+            goal: "审查草稿",
+          },
+        ],
+      }),
+    );
+    applyOutboundMessage(
+      s,
+      msgFrame({
+        frameSeq: 2,
+        blocks: [
+          {
+            kind: "delegate_progress",
+            runId: "dlg-nested",
+            agentId: "hidden-reviewer",
+            phase: "tool",
+            block: { kind: "tool_use", blockId: "nested-agent-live", toolName: "Agent", inputJson: { description: "nested" } },
+          },
+        ],
+      }),
+    );
     const standalone = s.messages.find((m) => m.role === "delegate-progress");
-    expect(group?._delegateRunId).toBeUndefined();
-    expect(standalone?.entries?.some((e) => e.phase === "text" && e.text === "legacy output")).toBe(true);
-    expect(standalone?.childBlocks?.some((b) => b.kind === "text" && b.text === "rich output")).toBe(true);
+    expect(s._agentGroups?.get("nested-agent-live")).toBe(standalone?.id);
+
+    applyOutboundMessage(
+      s,
+      msgFrame({
+        frameSeq: 3,
+        blocks: [
+          {
+            kind: "tool_use",
+            toolName: "delegate_task",
+            blockId: "tool-nested",
+            partial: false,
+            inputJson: { agentId: "hidden-reviewer", goal: "审查草稿" },
+          },
+        ],
+      }),
+    );
+    const group = s.messages.find((m) => m.role === "agent-group");
+    expect(s._agentGroups?.get("nested-agent-live")).toBe(group?.id);
+
+    applyOutboundMessage(
+      s,
+      msgFrame({
+        frameSeq: 4,
+        blocks: [{ kind: "text", parentToolUseId: "nested-agent-live", text: "nested output" }],
+      }),
+    );
+
+    expect(group?.childBlocks?.some((b) => b.kind === "text" && b.text === "nested output")).toBe(true);
+    expect(s.messages.some((m) => m.role === "delegate-progress")).toBe(false);
+  });
+
+  test("persisted Codex delegate tool plus progress rows collapse into one agent-group", () => {
+    const s = sess();
+    addMessage(s, "tool", "codex:mcpToolCall", {
+      id: "tool-hist",
+      ts: 1,
+      toolName: "codex:mcpToolCall",
+      blockId: "call_hist",
+      inputJson: {
+        type: "mcpToolCall",
+        id: "call_hist",
+        server: "openclaude_memory",
+        tool: "delegate_task",
+        arguments: { agentId: "coding-assistant", goal: "设计水箱模拟" },
+      },
+      _completed: true,
+      output: JSON.stringify({
+        type: "mcpToolCall",
+        id: "call_hist",
+        server: "openclaude_memory",
+        tool: "delegate_task",
+        status: "completed",
+        result: { content: [{ type: "text", text: "✅ 委派完成\n\n最终方案" }] },
+      }),
+    });
+    addMessage(s, "delegate-progress", "", {
+      id: "progress-hist",
+      ts: 2,
+      runId: "dlg-hist",
+      agentId: "coding-assistant",
+      _delegateGoal: "设计水箱模拟",
+      entries: [{ phase: "text", text: "实时输出", ts: 3 }],
+      childBlocks: [{ kind: "tool_use", blockId: "nested-agent", toolName: "Agent", inputJson: { description: "nested" }, _completed: false }],
+      _completed: true,
+      summary: "最终方案",
+    });
+
+    normalizeDelegateCards(s);
+
+    const groups = s.messages.filter((m) => m.role === "agent-group");
+    expect(groups).toHaveLength(1);
+    expect(groups[0].id).toBe("tool-hist");
+    expect(groups[0]._delegateRunId).toBe("dlg-hist");
+    expect(groups[0]._resultPreview).toContain("委派完成");
+    expect(groups[0].childBlocks?.some((b) => b.kind === "text" && b.text === "实时输出")).toBe(true);
+    expect(s._agentGroups?.get("nested-agent")).toBe("tool-hist");
+    expect(s.messages.some((m) => m.role === "tool" || m.role === "delegate-progress")).toBe(false);
   });
 });
 

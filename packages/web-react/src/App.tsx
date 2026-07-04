@@ -51,6 +51,15 @@ import { DEMO_MESSAGES, DEMO_MODELS, DEMO_SESSIONS, DEMO_USER, demoReply } from 
 import type { Message, PublicConfig, PublicModel, Session, ToolCard } from "./lib/types";
 
 const EMPTY_WS_MESSAGES: ChatMessage[] = [];
+const TEAM_MODE_STORAGE_KEY = "oc_v5_team_mode";
+
+function readStoredTeamMode(): boolean {
+  try {
+    return localStorage.getItem(TEAM_MODE_STORAGE_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
 
 export function App() {
   const params = new URLSearchParams(location.search);
@@ -97,7 +106,16 @@ export function App() {
   // 团队模式(v5 轻量组队):turn 级开关,只对「全能助手」(main)生效——开启后发消息时后端
   // 给 main 队长注入组队引导,由它按任务自主 delegate_task 组已安装 agent 成队。换 agent 不清,
   // 但只在 agent.id==='main' 时随消息发送(见 send)。开关 UI 挂在 AgentPicker 的 main 卡片。
-  const [teamMode, setTeamMode] = useState(false);
+  const [teamMode, setTeamModeState] = useState(readStoredTeamMode);
+  const setTeamMode = useCallback((enabled: boolean) => {
+    setTeamModeState(enabled);
+    try {
+      if (enabled) localStorage.setItem(TEAM_MODE_STORAGE_KEY, "1");
+      else localStorage.removeItem(TEAM_MODE_STORAGE_KEY);
+    } catch {
+      // Storage is best-effort; keep the in-memory switch responsive.
+    }
+  }, []);
   // 对话模型：唯一权威源是后端 GET /api/public/models（v5 仅 claude/glm-5.2/deepseek/minimax）。
   // demo 用本地 fixture 仅作离线视觉，不发请求。选中的 modelId 由 P4 的 WS inbound.message 顶层发送。
   const [models, setModels] = useState<PublicModel[]>(demo ? DEMO_MODELS : []);
