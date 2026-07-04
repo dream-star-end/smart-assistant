@@ -71,6 +71,12 @@ import {
   listUnclaimedSessions,
   claimSession,
 } from '@openclaude/storage'
+import {
+  filterUserVisibleAgentsForManagement,
+  filterUserVisibleRoutesForManagement,
+  isHiddenSystemAgentId,
+  userVisibleDefaultAgentId,
+} from './agentVisibility.js'
 import { listCollaboratorAgents } from './collaboratorAgents.js'
 import type { SessionStreamEvent } from './ccbMessageParser.js'
 import { type SkillTrainRun, SkillTrainJobStore } from './skillTrainJobs.js'
@@ -1379,6 +1385,13 @@ export class Gateway {
     // EventBus: bridge CCB CronCreate/CronDelete to gateway CronScheduler
     eventBus.on('task.created', (ev) => {
       if (!this.cron || ev.source !== 'cron-bridge') return
+      if (isHiddenSystemAgentId(ev.agentId)) {
+        this.log.warn('eventBus task.created hidden system agent rejected', {
+          taskId: ev.taskId,
+          agentId: ev.agentId,
+        })
+        return
+      }
       // Use taskId directly — sessionManager already generates unique ccb-xxx IDs
       this.cron
         .addJob({
@@ -1421,6 +1434,10 @@ export class Gateway {
     // EventBus: route webhook.received → agent execution + delivery
     eventBus.on('webhook.received', (ev) => {
       const { webhookId, agentId, payload } = ev
+      if (isHiddenSystemAgentId(agentId)) {
+        this.log.warn('webhook hidden system agent rejected', { agentId, webhookId })
+        return
+      }
       const { resolvedPrompt } = payload as any
       ;(async () => {
         const cfg = await this._getAgentsConfig()
@@ -2750,7 +2767,7 @@ export class Gateway {
 
     // ── Webhook REST API ──
     if (url.pathname === '/api/webhooks' && req.method === 'GET') {
-      const list = this.webhookRouter?.list() ?? []
+      const list = (this.webhookRouter?.list() ?? []).filter((wh) => !isHiddenSystemAgentId(wh.agent))
       this.sendJson(res, 200, { webhooks: list })
       return
     }
@@ -4804,13 +4821,21 @@ export class Gateway {
   private async handleAgentsCollection(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const cfg = await readAgentsConfig()
     if (req.method === 'GET') {
-      this.sendJson(res, 200, { agents: cfg.agents, default: cfg.default, routes: cfg.routes })
+      this.sendJson(res, 200, {
+        agents: filterUserVisibleAgentsForManagement(cfg.agents),
+        default: userVisibleDefaultAgentId(cfg.default),
+        routes: filterUserVisibleRoutesForManagement(cfg.routes),
+      })
       return
     }
     if (req.method === 'POST') {
       const body = await this.readJsonBody<Partial<AgentDef>>(req)
       if (!body.id || !/^[a-zA-Z0-9_-]+$/.test(body.id)) {
         this.sendError(res, 400, 'invalid agent id (use only a-z 0-9 _ -)')
+        return
+      }
+      if (isHiddenSystemAgentId(body.id)) {
+        this.sendError(res, 403, 'agent id is reserved')
         return
       }
       if (cfg.agents.find((a) => a.id === body.id)) {
@@ -4855,6 +4880,7 @@ export class Gateway {
     res: ServerResponse,
     id: string,
   ): Promise<void> {
+    if (isHiddenSystemAgentId(id)) return this.sendError(res, 404, 'agent not found')
     const cfg = await readAgentsConfig()
     const idx = cfg.agents.findIndex((a) => a.id === id)
     if (idx < 0) return this.sendError(res, 404, 'agent not found')
@@ -4904,6 +4930,7 @@ export class Gateway {
     res: ServerResponse,
     id: string,
   ): Promise<void> {
+    if (isHiddenSystemAgentId(id)) return this.sendError(res, 404, 'agent not found')
     const cfg = await readAgentsConfig()
     const agent = cfg.agents.find((a) => a.id === id)
     if (!agent) return this.sendError(res, 404, 'agent not found')
@@ -4936,6 +4963,7 @@ export class Gateway {
     agentId: string,
     target: 'memory' | 'user',
   ): Promise<void> {
+    if (isHiddenSystemAgentId(agentId)) return this.sendError(res, 404, 'agent not found')
     const store = new MemoryStore(agentId)
     await store.load()
     if (req.method === 'GET') {
@@ -4967,6 +4995,7 @@ export class Gateway {
     res: ServerResponse,
     agentId: string,
   ): Promise<void> {
+    if (isHiddenSystemAgentId(agentId)) return this.sendError(res, 404, 'agent not found')
     if (req.method !== 'GET') return this.sendError(res, 405, 'method not allowed')
     const store = buildAgentSkillStore(agentId)
     // User-facing surface: never enumerate platform baseline/seed skills.
@@ -4981,6 +5010,7 @@ export class Gateway {
     agentId: string,
     skillName: string,
   ): Promise<void> {
+    if (isHiddenSystemAgentId(agentId)) return this.sendError(res, 404, 'agent not found')
     const store = buildAgentSkillStore(agentId)
     if (req.method === 'GET') {
       // User-facing read: platform skills resolve to 404, never leak their body.
@@ -5109,7 +5139,11 @@ export class Gateway {
     } catch {
       cfg = { agents: [{ id: 'main' }], routes: [], default: 'main' }
     }
-    const allowed = new Set<string>(['main', cfg.default, ...(cfg.agents ?? []).map((a) => a.id)])
+    const allowed = new Set<string>(
+      ['main', cfg.default, ...(cfg.agents ?? []).map((a) => a.id)].filter(
+        (id): id is string => typeof id === 'string' && !isHiddenSystemAgentId(id),
+      ),
+    )
     const bad = parsed.agentIds.find((id) => !allowed.has(id))
     if (bad) return { error: `unknown agentId: ${bad}` }
     return parsed.agentIds
@@ -5954,6 +5988,9 @@ export class Gateway {
     }
     const { message, sourceAgent } = parsed
     if (!message) return this.sendError(res, 400, 'message required')
+    if (isHiddenSystemAgentId(targetAgentId)) {
+      return this.sendError(res, 404, `agent "${targetAgentId}" not found`)
+    }
 
     // Find target agent
     const cfg = await this._getAgentsConfig()
@@ -6370,6 +6407,10 @@ export class Gateway {
         this.sendError(res, 404, 'webhook not found')
         return
       }
+      if (isHiddenSystemAgentId(wh.agent)) {
+        this.sendError(res, 404, 'webhook not found')
+        return
+      }
       const body = await this.readBody(req)
       const sig = (req.headers['x-hub-signature-256'] || req.headers['x-signature'] || '') as string
       const result = await this.webhookRouter!.process(wh, body, sig)
@@ -6564,7 +6605,7 @@ export class Gateway {
 
   private async _handleTasksApi(req: IncomingMessage, res: ServerResponse): Promise<void> {
     if (req.method === 'GET') {
-      const tasks = await this._taskStore.list()
+      const tasks = (await this._taskStore.list()).filter((task) => !isHiddenSystemAgentId(task.agent))
       this.sendJson(res, 200, { tasks })
       return
     }
@@ -6578,10 +6619,12 @@ export class Gateway {
       }
       const { id, title, agent, prompt, trigger, schedule, webhookId, eventType, maxRuns } = parsed
       if (!title || !prompt) return this.sendError(res, 400, 'title and prompt required')
+      const taskAgent = typeof agent === 'string' && agent ? agent : 'main'
+      if (isHiddenSystemAgentId(taskAgent)) return this.sendError(res, 404, 'agent not found')
       const task = await this._taskStore.create({
         id: id || `task-${Date.now().toString(36)}`,
         title,
-        agent: agent || 'main',
+        agent: taskAgent,
         prompt,
         trigger: trigger || 'manual',
         schedule,
@@ -6604,6 +6647,7 @@ export class Gateway {
     if (req.method === 'GET') {
       const task = await this._taskStore.get(taskId)
       if (!task) return this.sendError(res, 404, 'task not found')
+      if (isHiddenSystemAgentId(task.agent)) return this.sendError(res, 404, 'task not found')
       this.sendJson(res, 200, { task })
       return
     }
@@ -6615,12 +6659,23 @@ export class Gateway {
       } catch {
         return this.sendError(res, 400, 'invalid JSON')
       }
+      if (parsed.agent !== undefined && isHiddenSystemAgentId(parsed.agent)) {
+        return this.sendError(res, 404, 'agent not found')
+      }
+      const existing = await this._taskStore.get(taskId)
+      if (existing && isHiddenSystemAgentId(existing.agent)) {
+        return this.sendError(res, 404, 'task not found')
+      }
       const ok = await this._taskStore.update(taskId, parsed)
       if (ok) this._invalidateTaskCache()
       this.sendJson(res, ok ? 200 : 404, { ok })
       return
     }
     if (req.method === 'DELETE') {
+      const task = await this._taskStore.get(taskId)
+      if (task && isHiddenSystemAgentId(task.agent)) {
+        return this.sendError(res, 404, 'task not found')
+      }
       const ok = await this._taskStore.remove(taskId)
       if (ok) this._invalidateTaskCache()
       this.sendJson(res, ok ? 200 : 404, { ok })
@@ -6630,6 +6685,7 @@ export class Gateway {
     if (req.method === 'POST') {
       const task = await this._taskStore.get(taskId)
       if (!task) return this.sendError(res, 404, 'task not found')
+      if (isHiddenSystemAgentId(task.agent)) return this.sendError(res, 404, 'task not found')
       if (task.status === 'disabled')
         return this.sendError(res, 409, 'task is disabled (maxRuns reached)')
       this._triggerTask(taskId).catch((err) =>
@@ -6665,6 +6721,10 @@ export class Gateway {
   private async _triggerTask(taskId: string): Promise<void> {
     const task = await this._taskStore.get(taskId)
     if (!task || task.status === 'disabled') return
+    if (isHiddenSystemAgentId(task.agent)) {
+      this.log.warn('task hidden system agent rejected', { taskId, agent: task.agent })
+      return
+    }
     const cfg = await this._getAgentsConfig()
     const agent = cfg.agents.find((a) => a.id === task.agent)
     if (!agent) return
@@ -6721,7 +6781,7 @@ export class Gateway {
   private async handleCronApi(req: IncomingMessage, res: ServerResponse): Promise<void> {
     if (!this.cron) return this.sendError(res, 503, 'cron not initialized')
     if (req.method === 'GET') {
-      const jobs = await this.cron.listJobsWithMeta()
+      const jobs = (await this.cron.listJobsWithMeta()).filter((job) => !isHiddenSystemAgentId(job.agent))
       this.sendJson(res, 200, { jobs })
       return
     }
@@ -6735,11 +6795,13 @@ export class Gateway {
       }
       const { schedule, prompt, deliver, oneshot, label, agent } = parsed
       if (!schedule || !prompt) return this.sendError(res, 400, 'schedule and prompt required')
+      const cronAgent = typeof agent === 'string' && agent ? agent : 'main'
+      if (isHiddenSystemAgentId(cronAgent)) return this.sendError(res, 404, 'agent not found')
       const id = `remind-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`
       const job = {
         id,
         schedule,
-        agent: agent || 'main',
+        agent: cronAgent,
         prompt,
         deliver: deliver || 'webchat',
         enabled: true,
@@ -6760,6 +6822,10 @@ export class Gateway {
   ): Promise<void> {
     if (!this.cron) return this.sendError(res, 503, 'cron not initialized')
     if (req.method === 'DELETE') {
+      const existing = (await this.cron.listJobsWithMeta()).find((job) => job.id === id)
+      if (existing && isHiddenSystemAgentId(existing.agent)) {
+        return this.sendError(res, 404, 'cron job not found')
+      }
       const removed = await this.cron.removeJob(id)
       this.sendJson(res, removed ? 200 : 404, { ok: removed })
       return
@@ -6771,6 +6837,13 @@ export class Gateway {
         parsed = JSON.parse(body)
       } catch {
         return this.sendError(res, 400, 'invalid JSON')
+      }
+      if (parsed.agent !== undefined && isHiddenSystemAgentId(parsed.agent)) {
+        return this.sendError(res, 404, 'agent not found')
+      }
+      const existing = (await this.cron.listJobsWithMeta()).find((job) => job.id === id)
+      if (existing && isHiddenSystemAgentId(existing.agent)) {
+        return this.sendError(res, 404, 'cron job not found')
       }
       const updated = await this.cron.updateJob(id, parsed)
       this.sendJson(res, updated ? 200 : 404, { ok: updated })
@@ -7516,6 +7589,11 @@ export class Gateway {
     sessionKey?: string
   }): Promise<boolean> {
     let sessionKey = frame.sessionKey
+    const explicitStopAgentId = sessionKey?.split(':')[1] ?? frame.agentId
+    if (explicitStopAgentId && isHiddenSystemAgentId(explicitStopAgentId)) {
+      this.log.warn('interrupt hidden system agent rejected', { agentId: explicitStopAgentId })
+      return false
+    }
     if (!sessionKey) {
       if (frame.agentId) {
         sessionKey = `agent:${frame.agentId}:${frame.channel}:${frame.peer.kind}:${frame.peer.id.replace(/[^a-zA-Z0-9_-]/g, '_')}`
@@ -7950,6 +8028,10 @@ export class Gateway {
 
       const parts = sessionKey.split(':')
       const agentId = parts[1]
+      if (isHiddenSystemAgentId(agentId)) {
+        this.log.warn('auto-resume skipped hidden system agent session', { sessionKey })
+        continue
+      }
       const peerId = parts.slice(4).join(':')
 
       this.log.info('auto-resume pre-warming', { sessionKey })
@@ -7996,6 +8078,10 @@ export class Gateway {
       const peerLastFrameSeq = peer.lastFrameSeq
       const peerInFlight = peer.inFlight
       const aid = agentId || 'main'
+      if (isHiddenSystemAgentId(aid)) {
+        this.log.warn('auto-resume hello skipped hidden system agent session', { agentId: aid })
+        continue
+      }
       const safeId = peerId.replace(/[^a-zA-Z0-9_-]/g, '_')
       const sessionKey = `agent:${aid}:webchat:dm:${safeId}`
 
@@ -8295,6 +8381,22 @@ export class Gateway {
     let sessionKey: string
     let agent: AgentDef
     const cfg = await this._getAgentsConfig()
+    if (frame.agentId && isHiddenSystemAgentId(frame.agentId)) {
+      const hiddenAgentUserId: string =
+        typeof (frame as any)._userId === 'string' ? (frame as any)._userId : 'default'
+      const safePeerId = frame.peer.id.replace(/[^a-zA-Z0-9_-]/g, '_')
+      this.deliver({
+        type: 'outbound.message' as const,
+        sessionKey: `agent:${frame.agentId}:${frame.channel}:${frame.peer.kind}:${safePeerId}`,
+        channel: frame.channel,
+        peer: frame.peer,
+        blocks: [{ kind: 'text' as const, text: '[error] agent not found' }],
+        isFinal: true,
+        traceId: turnTraceId,
+        _userId: hiddenAgentUserId,
+      } as OutboundMessage, adapter)
+      return
+    }
     if (frame.agentId) {
       // Unknown agentId → demote to the default agent (全能助手), NEVER a personaless
       // {id} (which would run with no persona/toolsets/model). After the sync above a
@@ -8311,6 +8413,21 @@ export class Gateway {
       const routed = this.router.route(frame)
       sessionKey = routed.sessionKey
       agent = routed.agent
+    }
+    if (isHiddenSystemAgentId(agent.id)) {
+      const hiddenAgentUserId: string =
+        typeof (frame as any)._userId === 'string' ? (frame as any)._userId : 'default'
+      this.deliver({
+        type: 'outbound.message' as const,
+        sessionKey,
+        channel: frame.channel,
+        peer: frame.peer,
+        blocks: [{ kind: 'text' as const, text: '[error] agent not found' }],
+        isFinal: true,
+        traceId: turnTraceId,
+        _userId: hiddenAgentUserId,
+      } as OutboundMessage, adapter)
+      return
     }
 
     // ── model→agent 路由(M1a engine registry 语义)──
@@ -8909,8 +9026,10 @@ export class Gateway {
         '【团队模式已开启】把这次任务当作队长来处理：',
         `可委派的成员（已安装 agent）：\n${memberLines}`,
         '- 任务复杂、可拆解 → 用 `delegate_task(goal, agentId, context)` 委派子任务给最合适的成员组队，拿到各成员结果后你综合成给用户的最终答案。',
-        '- 任务简单、或没有更合适的成员 → 直接自己完成。',
-        '由你自主判断是否组队，不要为了组队而组队。',
+        '- 系统隐藏审查员：`hidden-reviewer`（不在成员列表显示）。团队模式下，在给用户最终答复前必须先形成草稿/方案，再调用 `delegate_task(goal, agentId: "hidden-reviewer", context: "...")` 请它审查。',
+        '- 审查 context 必须包含：用户原始需求、你的最终草稿/关键方案、关键假设和你认为的风险点。收到审查结果后再修订并输出最终答案。',
+        '- 如果隐藏审查员调用失败或超时，最终答案里要明确说明“隐藏审查未完成/失败”，不要假装已经审查。',
+        '- 任务简单、或没有更合适的可见成员 → 可见成员可以不委派；但隐藏审查员仍需在最终答复前调用一次。',
         '',
         '用户任务：',
         '',

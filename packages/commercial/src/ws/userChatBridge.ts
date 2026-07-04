@@ -372,8 +372,9 @@ export interface UserChatBridgeDeps {
    *
    * caller(commercial/index.ts)的权威组成(与容器 agents.yaml 的 master 侧
    * 权威源一一对应):
-   *   - 内置 seed agents:main → PLATFORM_DEFAULT_MODEL、codex → gpt-5.5
-   *     (entrypoint desiredSeedAgents 的 master 侧镜像);
+   *   - 内置 seed agents:main → PLATFORM_DEFAULT_MODEL、codex → gpt-5.5、
+   *     hidden-reviewer → PLATFORM_HIDDEN_REVIEWER_MODEL(entrypoint
+   *     desiredSeedAgents 的 master 侧镜像);
    *   - marketplace 平台预设 + 用户已装 agent:manifest.model
    *     (internalMarketplaceSync 同源:listPlatformPresetAgents ∪
    *     listActiveInstalledAgents,同 slug 预设优先)。
@@ -571,6 +572,10 @@ function readCodexSessionMaxMs(): number {
 const AGENT_AUTHZ_IMPLIED_MODEL: Record<string, string> = {
   codex: DEFAULT_CODEX_ENGINE_MODEL,
 };
+
+// Hidden system agents are callable by trusted in-container delegation only.
+// User-facing WebSocket frames must never be allowed to select them directly.
+const HIDDEN_REVIEWER_AGENT_ID = "hidden-reviewer";
 
 /**
  * PR2 v1.0.66 — codex 真扣费 preCheck 估算用的 max output tokens。
@@ -1562,6 +1567,8 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         cleanup("frame_too_big", true);
         return;
       }
+      let passthroughData: RawData = data;
+      let passthroughLen = len;
       // 0049 模型授权(plan v3 §B3/§B4 + review v1/v2 follow-up)+ P0 计费旁路
       // 封堵(agent 权威推导):
       //   inbound.message 帧 sync 检查 visibility OR per-user grants。优先级:
@@ -1728,9 +1735,23 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           ) {
             const helloPeers = (parsed as { peers?: unknown }).peers;
             const peers = Array.isArray(helloPeers) ? helloPeers : [];
+            const visiblePeers = peers.filter((p) => {
+              if (typeof p !== "object" || p === null) return true;
+              return (p as { agentId?: unknown }).agentId !== HIDDEN_REVIEWER_AGENT_ID;
+            });
+            if (visiblePeers.length !== peers.length) {
+              const sanitizedHello = {
+                ...(parsed as Record<string, unknown>),
+                peers: visiblePeers,
+              };
+              const sanitizedStr = JSON.stringify(sanitizedHello);
+              passthroughData = Buffer.from(sanitizedStr, "utf8");
+              passthroughLen = Buffer.byteLength(sanitizedStr);
+              parsed = sanitizedHello;
+            }
             const cidStr = containerId.toString();
             const uidStr = uid.toString();
-            for (const p of peers) {
+            for (const p of visiblePeers) {
               if (typeof p !== "object" || p === null) continue;
               const peer = p as {
                 peerId?: unknown;
@@ -1772,7 +1793,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             //   Codex Phase 4.7 #2 修:旧实现只在 hello 时同步看 map,fetch 慢于 hello
             //   时 active 选择永不 rebind。
             const helloPeerIds = new Set<string>();
-            for (const p of peers) {
+            for (const p of visiblePeers) {
               if (typeof p === "object" && p !== null) {
                 const pid = (p as { peerId?: unknown }).peerId;
                 if (typeof pid === "string") helloPeerIds.add(pid);
@@ -1793,28 +1814,69 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             const frameModelId = typeof frameModelRaw === "string" ? frameModelRaw : null;
             const frameAgentIdRaw = (parsed as { agentId?: unknown }).agentId;
             const frameAgentId = typeof frameAgentIdRaw === "string" ? frameAgentIdRaw : null;
+            const teamModeRequested = (parsed as { teamMode?: unknown }).teamMode === true;
+            if (frameAgentId === HIDDEN_REVIEWER_AGENT_ID) {
+              bridgeLog?.info("user-chat-bridge: hidden system agent direct frame rejected", {
+                agentId: frameAgentId,
+              });
+              sendErrorFrame(
+                userWs,
+                "AGENT_NOT_FOUND",
+                "agent not found",
+              );
+              try { userWs.close(CLOSE_BRIDGE.PRODUCT_POLICY, "hidden_agent_direct_chat"); } catch { /* */ }
+              cleanup("client_close", true);
+              return;
+            }
+            const frameAgentAuthorityModel: string | null =
+              frameAgentId !== null && agentModelResolverHandle !== null
+                ? agentModelResolverHandle.resolve(frameAgentId)
+                : null;
+            // Gateway 对 unknown explicit agentId 会降级为 default/main。bridge 必须用同
+            // 一谓词:团队模式下 unknown agent 也按 main 队长强制 GPT,否则客户端可传
+            // agentId="bogus"+model="glm-5.2" 让 master 以 GLM 放行、容器却跑 main。
+            // 若测试/旧装配没有 agentModelResolver,bridge 无法证明 explicit non-main
+            // agent 真实存在;teamMode 是 main 队长语义,因此也 fail-safe 归一为 main。
+            const teamModeNonMainAgentDemotesToMain =
+              teamModeRequested &&
+              frameAgentId !== null &&
+              frameAgentId !== "main" &&
+              (agentModelResolverHandle === null || frameAgentAuthorityModel === null);
+            const teamModeMain =
+              teamModeRequested &&
+              (frameAgentId === "main" || frameAgentId === null || teamModeNonMainAgentDemotesToMain);
+            const effectiveFrameAgentId = teamModeMain ? "main" : frameAgentId;
             const agentImpliedModel =
-              frameAgentId !== null ? AGENT_AUTHZ_IMPLIED_MODEL[frameAgentId] : undefined;
+              effectiveFrameAgentId !== null ? AGENT_AUTHZ_IMPLIED_MODEL[effectiveFrameAgentId] : undefined;
             // P0 计费旁路封堵 —— master agent 权威推导:帧无 model 时容器 gateway
             // 会回落 agent.model 做 engine 判定(resolveEngine),bridge 必须用
             // master 自己的 agent 权威(seed 常量 + marketplace manifest)推导同一
             // 份「有效模型」,分类才与容器同构。null = 权威推导不出(未知 agentId)。
             const agentAuthorityModel: string | null =
-              frameAgentId !== null && agentModelResolverHandle !== null
-                ? agentModelResolverHandle.resolve(frameAgentId)
+              effectiveFrameAgentId !== null && agentModelResolverHandle !== null
+                ? effectiveFrameAgentId === frameAgentId
+                  ? frameAgentAuthorityModel
+                  : agentModelResolverHandle.resolve(effectiveFrameAgentId)
                 : null;
 
-            // 选用顺序:frame.model > agent 隐含 model(安全 contract)> master
-            // agent 权威 > lastSeenModelId(仅辅助:帧连 agentId 都没带时的兜底,
-            // 不作 codex 分类的唯一权威)
+            // 选用顺序:teamMode main 强制 GPT > frame.model > agent 隐含 model
+            // (安全 contract)> master agent 权威 > lastSeenModelId(仅辅助:帧连
+            // agentId 都没带时的兜底,不作 codex 分类的唯一权威)
             let effectiveModel: string | null = null;
             let source:
               | "frame.model"
               | "agentId.implied"
               | "agentAuthority"
+              | "teamMode.main"
               | "lastSeen"
               | null = null;
-            if (frameModelId !== null) {
+            if (teamModeMain) {
+              // v5 团队模式方案 B:队长固定用 GPT 5.5,隐藏审查员用 GLM。
+              // 这里必须在 auth/codex 分类前覆盖 effectiveModel,并在下方 rewrite
+              // forwarded frame.model,确保 master 计费链路与容器执行模型一致。
+              effectiveModel = DEFAULT_CODEX_ENGINE_MODEL;
+              source = "teamMode.main";
+            } else if (frameModelId !== null) {
               effectiveModel = frameModelId;
               source = "frame.model";
             } else if (agentImpliedModel !== undefined) {
@@ -1823,7 +1885,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             } else if (agentAuthorityModel !== null) {
               effectiveModel = agentAuthorityModel;
               source = "agentAuthority";
-            } else if (frameAgentId !== null && agentModelResolverHandle !== null) {
+            } else if (effectiveFrameAgentId !== null && agentModelResolverHandle !== null) {
               // fail-closed:帧无 model + agentId 在 master agent 权威里推导不出。
               // 容器侧会把该 agentId 解析成 agents.yaml 里的某个 agent(未知 id 才
               // 降级 default),其 agent.model 可能是 gpt-5.5 → 免 requestId 落
@@ -1832,12 +1894,12 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               // miss,用户重发即可命中),再拒本帧。
               void agentModelResolverHandle.refresh();
               bridgeLog?.info("user-chat-bridge: agent model unresolved, frame rejected", {
-                agentId: frameAgentId,
+                agentId: effectiveFrameAgentId,
               });
               sendErrorFrame(
                 userWs,
                 "UNRESOLVED_AGENT_MODEL",
-                `cannot resolve model for agent '${frameAgentId}' — retry shortly or specify a model`,
+                `cannot resolve model for agent '${effectiveFrameAgentId}' — retry shortly or specify a model`,
               );
               try { userWs.close(CLOSE_BRIDGE.PRODUCT_POLICY, "unresolved_agent_model"); } catch { /* */ }
               // 策略拒绝 → force final;此前无 codex inflight(本帧才进 acquire 路径),无 drain 价值
@@ -1888,7 +1950,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               inboundPeerIdForFrame = typeof peerIdRaw === "string" ? peerIdRaw : null;
               // PR2 v1.0.66 — 把 agentId 提到外层供 codex billing IIFE 用
               // (查 agent_cost_overrides multiplier)。
-              inboundAgentIdForFrame = frameAgentId;
+              inboundAgentIdForFrame = effectiveFrameAgentId;
             }
             // CG2a — canonical trace 生成 + client observation。
             // 任何 inbound.message(codex / 非 codex)都强制注入 master canonical;
@@ -1912,18 +1974,30 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             //   - 非法 clientTraceId 不透传给 container — 合法 / undefined 保留原 parsed
             //   - __oc_codex_route 永远是 master-owned 私有字段;client 输入即使形状合法也必须剥离,
             //     后面只有 server 侧 createCodexRoute 成功时才会重新注入。
+            //   - teamMode main 固定 GPT 队长:即使客户端传/省略其它 model 或省略
+            //     agentId,转发给容器的 frame.agentId/model 也必须归一为
+            //     main/DEFAULT_CODEX_ENGINE_MODEL,否则 master 已按 GPT 预扣/注 requestId,
+            //     容器却可能按 main 默认 GLM 或路由规则执行。
             let sanitizedParsed = parsed as Record<string, unknown>;
             const hasClientCodexRoute = Object.prototype.hasOwnProperty.call(
               sanitizedParsed,
               "__oc_codex_route",
             );
-            if ((rawClientTrace !== undefined && !clientHint.ok) || hasClientCodexRoute) {
+            if (
+              (rawClientTrace !== undefined && !clientHint.ok) ||
+              hasClientCodexRoute ||
+              teamModeMain
+            ) {
               sanitizedParsed = { ...sanitizedParsed };
               if (rawClientTrace !== undefined && !clientHint.ok) {
                 delete sanitizedParsed.clientTraceId;
               }
               if (hasClientCodexRoute) {
                 delete sanitizedParsed.__oc_codex_route;
+              }
+              if (teamModeMain) {
+                sanitizedParsed.agentId = "main";
+                sanitizedParsed.model = DEFAULT_CODEX_ENGINE_MODEL;
               }
             }
             // Chat-native paper integration: keep browser/session text unchanged,
@@ -2514,7 +2588,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         })();
         return;
       }
-      forwardInboundFrame(data, isBinary, len);
+      forwardInboundFrame(passthroughData, isBinary, passthroughLen);
     };
 
     /**

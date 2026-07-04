@@ -12,6 +12,7 @@
 // 对 seed 漂移不免疫。这是"可展示/可协作"视图层，**不是授权层**(委派准入另有硬强制)。
 
 import type { AgentDef, AgentsConfig } from '@openclaude/storage'
+import { isHiddenSystemAgentId } from './agentVisibility.js'
 
 export interface CollaboratorScope {
   /** 当前 agent 自己的 id,结果里排除它。 */
@@ -23,7 +24,7 @@ export interface CollaboratorScope {
 
 /**
  * 返回可展示/可协作的其它 agent = 市场安装集(source==='marketplace') [+ 可选 main]，
- * 排除 self 与幽灵平台 seed。顺序保持 agents.yaml 原顺序。
+ * 排除 self、幽灵平台 seed 与隐藏系统 agent。顺序保持 agents.yaml 原顺序。
  */
 export function listCollaboratorAgents(
   cfg: Pick<AgentsConfig, 'agents'>,
@@ -33,6 +34,7 @@ export function listCollaboratorAgents(
   return agents.filter(
     (a) =>
       a.id !== scope.selfId &&
+      !isHiddenSystemAgentId(a.id) &&
       (a.source === 'marketplace' || (scope.includeMain && a.id === 'main')),
   )
 }

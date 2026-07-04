@@ -287,6 +287,7 @@ async function startRig(opts: {
   ) => Promise<void>;
   createCodexRoute?: UserChatBridgeDeps["createCodexRoute"];
   expireCodexRoute?: UserChatBridgeDeps["expireCodexRoute"];
+  loadAllowedModelChecker?: UserChatBridgeDeps["loadAllowedModelChecker"];
   // P0 计费旁路封堵 — bridge 可信模型推导(fake master agent 权威)。
   loadAgentModelResolver?: UserChatBridgeDeps["loadAgentModelResolver"];
   // P0 跨桥修复 — displacement 用例把 per-user 连接上限压到 1,新连接必踢旧桥。
@@ -342,6 +343,7 @@ async function startRig(opts: {
     codexBinding,
     createCodexRoute: opts.createCodexRoute,
     expireCodexRoute: opts.expireCodexRoute,
+    loadAllowedModelChecker: opts.loadAllowedModelChecker,
     loadAgentModelResolver: opts.loadAgentModelResolver,
     logger: opts.logger,
     appendCostCredits: opts.appendCostCredits,
@@ -1787,6 +1789,270 @@ describe("userChatBridge / codex billing — agent 权威模型推导(P0 封堵)
         ),
         false,
         "非 codex 帧不开 journal",
+      );
+      ws.close();
+    } finally {
+      await stopRig(rig);
+    }
+  });
+
+  test("teamMode main 强制 GPT 队长:即使客户端传 glm 也按 gpt 计费并转发 gpt model", async () => {
+    const rig = await startRig({
+      userBalance: 1_000_000n,
+      loadAllowedModelChecker: async () => (modelId: string) => modelId === "gpt-5.5",
+      loadAgentModelResolver: async () => (agentId: string) =>
+        agentId === "main" ? "glm-5.2" : null,
+    });
+    try {
+      const containerOpenP = waitNextContainerSocket(rig);
+      const ws = openClient(rig.gatewayPort, await makeJwt("25"));
+      await waitOpen(ws);
+      const containerWs = await containerOpenP;
+
+      ws.send(JSON.stringify({
+        type: "inbound.message",
+        agentId: "main",
+        model: "glm-5.2",
+        teamMode: true,
+        content: "hi",
+      }));
+
+      const frameToContainer = await waitContainerNextFrame(containerWs);
+      const parsed = JSON.parse(frameToContainer.data) as Record<string, unknown>;
+      assert.equal(parsed.type, "inbound.message");
+      assert.equal(parsed.agentId, "main");
+      assert.equal(parsed.teamMode, true);
+      assert.equal(parsed.model, "gpt-5.5", "teamMode main must be forwarded as GPT");
+      assert.match(parsed.requestId as string, /^[0-9a-f]{32}$/);
+      assert.equal(rig.binding.acquireCalls, 1, "forced GPT must acquire codex slot");
+      const journal = rig.poolCtrl.journalRows.get(parsed.requestId as string);
+      assert.ok(journal, "forced GPT must open inflight journal");
+      assert.equal(journal.ctx.model, "gpt-5.5", "journal model must match forced GPT");
+      assert.equal(journal.ctx.agentId, "main", "team-mode GPT leader should charge main agent multiplier");
+      ws.close();
+    } finally {
+      await stopRig(rig);
+    }
+  });
+
+  test("teamMode 省略 agentId 也按 main GPT 队长处理,避免 master/container 谓词漂移", async () => {
+    const variants: Array<{ name: string; extra: Record<string, unknown> }> = [
+      { name: "no model", extra: {} },
+      { name: "client glm model", extra: { model: "glm-5.2" } },
+    ];
+    for (const [idx, variant] of variants.entries()) {
+      const rig = await startRig({
+        userBalance: 1_000_000n,
+        loadAllowedModelChecker: async () => (modelId: string) => modelId === "gpt-5.5",
+        loadAgentModelResolver: async () => (agentId: string) =>
+          agentId === "main" ? "glm-5.2" : null,
+      });
+      try {
+        const containerOpenP = waitNextContainerSocket(rig);
+        const ws = openClient(rig.gatewayPort, await makeJwt(`27${idx}`));
+        await waitOpen(ws);
+        const containerWs = await containerOpenP;
+
+        ws.send(JSON.stringify({
+          type: "inbound.message",
+          teamMode: true,
+          content: `hi ${variant.name}`,
+          ...variant.extra,
+        }));
+
+        const frameToContainer = await waitContainerNextFrame(containerWs);
+        const parsed = JSON.parse(frameToContainer.data) as Record<string, unknown>;
+        assert.equal(parsed.type, "inbound.message");
+        assert.equal(parsed.agentId, "main", "missing agentId must be normalized to main");
+        assert.equal(parsed.teamMode, true);
+        assert.equal(parsed.model, "gpt-5.5", "teamMode main must be forwarded as GPT");
+        assert.match(parsed.requestId as string, /^[0-9a-f]{32}$/);
+        assert.equal(rig.binding.acquireCalls, 1, "forced GPT must acquire codex slot");
+        const journal = rig.poolCtrl.journalRows.get(parsed.requestId as string);
+        assert.ok(journal, "forced GPT must open inflight journal");
+        assert.equal(journal.ctx.model, "gpt-5.5", "journal model must match forced GPT");
+        assert.equal(journal.ctx.agentId, "main", "missing agentId team-mode turn should charge main");
+        ws.close();
+      } finally {
+        await stopRig(rig);
+      }
+    }
+  });
+
+  test("teamMode 显式未知 agentId 也按 main GPT 队长处理,避免 gateway 降级漂移", async () => {
+    const rig = await startRig({
+      userBalance: 1_000_000n,
+      loadAllowedModelChecker: async () => (modelId: string) =>
+        modelId === "gpt-5.5" || modelId === "glm-5.2",
+      loadAgentModelResolver: async () => (agentId: string) =>
+        agentId === "main" ? "glm-5.2" : null,
+    });
+    try {
+      const containerOpenP = waitNextContainerSocket(rig);
+      const ws = openClient(rig.gatewayPort, await makeJwt("28"));
+      await waitOpen(ws);
+      const containerWs = await containerOpenP;
+
+      ws.send(JSON.stringify({
+        type: "inbound.message",
+        agentId: "not-installed-agent",
+        model: "glm-5.2",
+        teamMode: true,
+        content: "hi",
+      }));
+
+      const frameToContainer = await waitContainerNextFrame(containerWs);
+      const parsed = JSON.parse(frameToContainer.data) as Record<string, unknown>;
+      assert.equal(parsed.type, "inbound.message");
+      assert.equal(parsed.agentId, "main", "unknown teamMode agentId must be normalized to main");
+      assert.equal(parsed.teamMode, true);
+      assert.equal(parsed.model, "gpt-5.5", "unknown teamMode agentId must still force GPT leader");
+      assert.match(parsed.requestId as string, /^[0-9a-f]{32}$/);
+      assert.equal(rig.binding.acquireCalls, 1, "forced GPT must acquire codex slot");
+      const journal = rig.poolCtrl.journalRows.get(parsed.requestId as string);
+      assert.ok(journal, "forced GPT must open inflight journal");
+      assert.equal(journal.ctx.model, "gpt-5.5", "journal model must match forced GPT");
+      assert.equal(journal.ctx.agentId, "main", "unknown teamMode agent should charge main");
+      ws.close();
+    } finally {
+      await stopRig(rig);
+    }
+  });
+
+  test("teamMode 无 agent 权威快照时,显式 non-main agentId 也 fail-safe 按 main GPT 队长处理", async () => {
+    const rig = await startRig({
+      userBalance: 1_000_000n,
+      loadAllowedModelChecker: async () => (modelId: string) => modelId === "gpt-5.5",
+    });
+    try {
+      const containerOpenP = waitNextContainerSocket(rig);
+      const ws = openClient(rig.gatewayPort, await makeJwt("29"));
+      await waitOpen(ws);
+      const containerWs = await containerOpenP;
+
+      ws.send(JSON.stringify({
+        type: "inbound.message",
+        agentId: "possibly-real-agent",
+        model: "glm-5.2",
+        teamMode: true,
+        content: "hi",
+      }));
+
+      const frameToContainer = await waitContainerNextFrame(containerWs);
+      const parsed = JSON.parse(frameToContainer.data) as Record<string, unknown>;
+      assert.equal(parsed.type, "inbound.message");
+      assert.equal(parsed.agentId, "main", "teamMode without authority must normalize to main");
+      assert.equal(parsed.model, "gpt-5.5", "teamMode without authority must force GPT leader");
+      assert.match(parsed.requestId as string, /^[0-9a-f]{32}$/);
+      assert.equal(rig.binding.acquireCalls, 1, "forced GPT must acquire codex slot");
+      const journal = rig.poolCtrl.journalRows.get(parsed.requestId as string);
+      assert.ok(journal, "forced GPT must open inflight journal");
+      assert.equal(journal.ctx.model, "gpt-5.5", "journal model must match forced GPT");
+      assert.equal(journal.ctx.agentId, "main", "authority-less teamMode turn should charge main");
+      ws.close();
+    } finally {
+      await stopRig(rig);
+    }
+  });
+
+  test("teamMode main 未授权 gpt-5.5 → 拒帧且不转发容器", async () => {
+    const rig = await startRig({
+      userBalance: 1_000_000n,
+      loadAllowedModelChecker: async () => (modelId: string) => modelId !== "gpt-5.5",
+      loadAgentModelResolver: async () => (agentId: string) =>
+        agentId === "main" ? "glm-5.2" : null,
+    });
+    try {
+      const containerOpenP = waitNextContainerSocket(rig);
+      const ws = openClient(rig.gatewayPort, await makeJwt("26"));
+      await waitOpen(ws);
+      const containerWs = await containerOpenP;
+      let containerGotFrame = false;
+      containerWs.on("message", () => { containerGotFrame = true; });
+
+      const errP = waitJsonFrameOfType(ws, "error");
+      const closedP = new Promise<number>((r) => ws.once("close", (code) => r(code)));
+      ws.send(JSON.stringify({
+        type: "inbound.message",
+        agentId: "main",
+        teamMode: true,
+        content: "hi",
+      }));
+
+      const err = await errP;
+      assert.equal(err.code, "UNAUTHORIZED_MODEL");
+      const closeCode = await closedP;
+      assert.equal(closeCode, 4507, "unauthorized forced GPT must use product-policy close");
+      await new Promise((r) => setTimeout(r, 50));
+      assert.equal(containerGotFrame, false, "unauthorized forced GPT must not reach container");
+      assert.equal(rig.binding.acquireCalls, 0);
+      assert.equal(rig.poolCtrl.journalRows.size, 0);
+    } finally {
+      await stopRig(rig);
+    }
+  });
+
+  test("显式直连 hidden-reviewer 被 bridge 拒绝且不转发容器", async () => {
+    const rig = await startRig({
+      userBalance: 1_000_000n,
+      loadAllowedModelChecker: async () => (modelId: string) =>
+        modelId === "gpt-5.5" || modelId === "glm-5.2",
+      loadAgentModelResolver: async () => (agentId: string) =>
+        agentId === "main" ? "glm-5.2"
+          : agentId === "hidden-reviewer" ? "glm-5.2"
+            : null,
+    });
+    try {
+      const containerOpenP = waitNextContainerSocket(rig);
+      const ws = openClient(rig.gatewayPort, await makeJwt("30"));
+      await waitOpen(ws);
+      const containerWs = await containerOpenP;
+      let containerGotFrame = false;
+      containerWs.on("message", () => { containerGotFrame = true; });
+
+      const errP = waitJsonFrameOfType(ws, "error");
+      const closedP = new Promise<number>((r) => ws.once("close", (code) => r(code)));
+      ws.send(JSON.stringify({
+        type: "inbound.message",
+        agentId: "hidden-reviewer",
+        content: "hi",
+      }));
+
+      const err = await errP;
+      assert.equal(err.code, "AGENT_NOT_FOUND");
+      const closeCode = await closedP;
+      assert.equal(closeCode, 4507, "direct hidden reviewer chat must use product-policy close");
+      await new Promise((r) => setTimeout(r, 50));
+      assert.equal(containerGotFrame, false, "direct hidden reviewer chat must not reach container");
+      assert.equal(rig.binding.acquireCalls, 0);
+      assert.equal(rig.poolCtrl.journalRows.size, 0);
+    } finally {
+      await stopRig(rig);
+    }
+  });
+
+  test("inbound.hello 会过滤 hidden-reviewer peer 后再转发容器", async () => {
+    const rig = await startRig({ userBalance: 1_000_000n });
+    try {
+      const containerOpenP = waitNextContainerSocket(rig);
+      const ws = openClient(rig.gatewayPort, await makeJwt("31"));
+      await waitOpen(ws);
+      const containerWs = await containerOpenP;
+
+      ws.send(JSON.stringify({
+        type: "inbound.hello",
+        peers: [
+          { peerId: "p1", agentId: "hidden-reviewer", lastFrameSeq: 10 },
+          { peerId: "p1", agentId: "main", lastFrameSeq: 10 },
+        ],
+      }));
+
+      const frameToContainer = await waitContainerNextFrame(containerWs);
+      const parsed = JSON.parse(frameToContainer.data) as { peers?: Array<{ agentId?: string }> };
+      assert.deepEqual(
+        (parsed.peers ?? []).map((p) => p.agentId ?? "main"),
+        ["main"],
+        "hidden reviewer must not be registered/resumed through user hello",
       );
       ws.close();
     } finally {

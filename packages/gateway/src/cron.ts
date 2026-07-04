@@ -25,6 +25,7 @@ import { type AgentDef, type OpenClaudeConfig, paths, readAgentsConfig } from '@
 import { parse as parseYaml, stringify as stringifyYaml } from 'yaml'
 import { createLogger } from './logger.js'
 import type { SessionManager } from './sessionManager.js'
+import { isHiddenSystemAgentId } from './agentVisibility.js'
 
 const logger = createLogger({ module: 'cron' })
 
@@ -328,6 +329,13 @@ export class CronScheduler {
           if (!cronMatches(job.schedule, localNow)) continue
           // Dedupe: don't run twice in the same minute
           if (lastRun[job.id] === minuteKey) continue
+          if (isHiddenSystemAgentId(job.agent)) {
+            logger.warn(`job ${job.id}: hidden system agent rejected`, {
+              jobId: job.id,
+              agent: job.agent,
+            })
+            continue
+          }
           const agent = agentsConfig.agents.find((a) => a.id === job.agent)
           if (!agent) {
             logger.warn(`job ${job.id}: agent ${job.agent} not found`, {

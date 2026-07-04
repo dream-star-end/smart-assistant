@@ -13,6 +13,11 @@
  */
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { AgentsConfig, OpenClaudeConfig } from '@openclaude/storage'
+import {
+  filterUserVisibleAgentsForManagement,
+  isHiddenSystemAgentId,
+  userVisibleDefaultAgentId,
+} from './agentVisibility.js'
 import type { RunLog } from './runLog.js'
 import type { SessionManager } from './sessionManager.js'
 
@@ -50,7 +55,7 @@ export async function handleOpenAIRequest(
 // ── GET /v1/models ──
 
 async function handleModels(res: ServerResponse, deps: OpenAICompatDeps): Promise<void> {
-  const models = deps.agentsConfig.agents.map((a) => ({
+  const models = filterUserVisibleAgentsForManagement(deps.agentsConfig.agents).map((a) => ({
     id: a.id,
     object: 'model',
     created: Math.floor(Date.now() / 1000),
@@ -92,7 +97,10 @@ async function handleChatCompletions(
   }
 
   // Map model → agent (default to first agent or 'main')
-  const agentId = parsed.model || deps.agentsConfig.default || 'main'
+  const agentId = parsed.model || userVisibleDefaultAgentId(deps.agentsConfig.default)
+  if (isHiddenSystemAgentId(agentId)) {
+    return deps.sendError(res, 404, `model/agent "${agentId}" not found`)
+  }
   const agent = deps.agentsConfig.agents.find((a) => a.id === agentId)
   if (!agent) {
     return deps.sendError(res, 404, `model/agent "${agentId}" not found`)
