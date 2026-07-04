@@ -33,7 +33,7 @@ interface QueuedEvent {
 }
 
 export interface CostEventSinkOpts {
-  /** master 控制口 base,如 http://127.0.0.1:18893 */
+  /** master 控制口 base,如 http://127.0.0.1:18894 */
   controlBaseUrl: string;
   secret: string;
   logger?: Logger;
