@@ -193,6 +193,27 @@ describe('CodexAppServerRunner turn/start params', () => {
     assert.equal((planParams.collaborationMode as any).settings.developer_instructions, null)
     await h.cleanup()
   })
+
+  it('defaults GPT/Codex reasoning_effort to high and maps explicit effort levels', async () => {
+    const h = await makeHarness()
+
+    const defaultParams = (h.runner as any).buildTurnStartParams('hi')
+    assert.equal((defaultParams.collaborationMode as any).settings.reasoning_effort, 'high')
+
+    h.runner.setEffortLevel('low')
+    const lowParams = (h.runner as any).buildTurnStartParams('hi')
+    assert.equal((lowParams.collaborationMode as any).settings.reasoning_effort, 'low')
+
+    h.runner.setEffortLevel('max')
+    const maxParams = (h.runner as any).buildTurnStartParams('hi')
+    assert.equal((maxParams.collaborationMode as any).settings.reasoning_effort, 'xhigh')
+
+    h.runner.setEffortLevel('turbo')
+    const invalidParams = (h.runner as any).buildTurnStartParams('hi')
+    assert.equal((invalidParams.collaborationMode as any).settings.reasoning_effort, 'high')
+
+    await h.cleanup()
+  })
 })
 
 describe('CodexAppServerRunner.start', () => {

@@ -1247,14 +1247,14 @@ export class CodexAppServerRunner extends EventEmitter {
     // `codex app-server` accepts `-c key=value` overrides. They must precede
     // `--listen` so clap's positional/option parser sees the stdio:// last.
     //
-    // v1.0.200:effort 进 codex argv 主通道。`codexReasoningEffortConfig()` 把
-    // 协议级 effortLevel (low/medium/high/xhigh/max) 归一为 codex 接受的
-    // `-c model_reasoning_effort="<low|medium|high|xhigh>"`(max → xhigh)。
-    // 与 codexRunner.ts 同 helper、同语义,任何 normalize 改动一处生效。
-    // 缺失/非法 → 空数组,codex 用 CLI 默认。
+    // v1.0.200:effort 进 codex argv 主通道。v5 GPT/Codex 产品默认要求
+    // "high",所以本 runner 先把缺失/非法归一到 high,再交给共享 helper
+    // 生成 `-c model_reasoning_effort="<low|medium|high|xhigh>"`(max → xhigh)。
+    // 注意:codexReasoningEffortConfig(undefined) 的共享语义仍是不带 flag;
+    // default-high 只属于 app-server runner 的产品策略。
     const providerSignature = this.codexRouteSignature()
     const providerArgs = buildCodexProviderConfigArgs(process.env, this.codexRouteConfig)
-    const effortArgs = codexReasoningEffortConfig(this.effortLevel)
+    const effortArgs = codexReasoningEffortConfig(this.codexReasoningEffort())
     // v5 telemetry-block C1(配置面双保险):遥测/自更新关闭 + chatgpt_base_url
     // 指向容器 loopback relay。**每次 spawn 无条件追加**(不挂 provider override
     // 成功路径)——即便本 turn 无 route override / managed_config 被非法值整份丢弃,
@@ -1673,7 +1673,7 @@ export class CodexAppServerRunner extends EventEmitter {
     } as unknown as RunnerMessage)
   }
 
-  private codexReasoningEffort(): 'low' | 'medium' | 'high' | 'xhigh' | null {
+  private codexReasoningEffort(): 'low' | 'medium' | 'high' | 'xhigh' {
     switch (this.effortLevel) {
       case 'low':
       case 'medium':
@@ -1683,7 +1683,7 @@ export class CodexAppServerRunner extends EventEmitter {
       case 'max':
         return 'xhigh'
       default:
-        return null
+        return 'high'
     }
   }
 
