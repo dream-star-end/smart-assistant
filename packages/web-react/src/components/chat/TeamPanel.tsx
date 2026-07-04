@@ -23,7 +23,11 @@ import { ChildBlockView } from "./AgentGroupCard";
 /** 队员显示名:优先委派的 agentId(已是可读标识),空则按序号兜底。 */
 function memberName(msg: ChatMessage, idx: number): string {
   const id = msg._delegateAgentId?.trim();
-  return id || `智能体 ${idx + 1}`;
+  if (id) return id;
+  if (msg._agentGroupOrigin === "codex-collab" && msg._teamFallback) {
+    return `临时 Codex 子智能体 ${idx + 1}`;
+  }
+  return `临时子智能体 ${idx + 1}`;
 }
 
 /** 单个队员行:可折叠,运行中默认展开看进度、完成默认收起(显示结果摘要)。 */

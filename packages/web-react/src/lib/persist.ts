@@ -261,6 +261,8 @@ function mergeLocalTeamDisplayFields(serverMsg: ChatMessage, localMsg?: ChatMess
     "_delegate",
     "_delegateAgentId",
     "_delegateGoal",
+    "_agentGroupOrigin",
+    "_teamFallback",
     "_delegateRunId",
     "_duration",
     "_resultPreview",
@@ -276,6 +278,7 @@ function mergeLocalTeamDisplayFields(serverMsg: ChatMessage, localMsg?: ChatMess
   for (const key of [
     "_delegateAgentId",
     "_delegateGoal",
+    "_agentGroupOrigin",
     "_delegateRunId",
     "_resultPreview",
     "runId",
@@ -284,6 +287,9 @@ function mergeLocalTeamDisplayFields(serverMsg: ChatMessage, localMsg?: ChatMess
     "_adoptedInto",
   ] as const) {
     copyStringIfRicher(key);
+  }
+  if (localMsg._teamFallback === true && serverMsg._teamFallback !== true) {
+    ensureOut()._teamFallback = true;
   }
   return (out as ChatMessage | null) ?? serverMsg;
 }

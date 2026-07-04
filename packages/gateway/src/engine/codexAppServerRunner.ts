@@ -24,6 +24,7 @@ import {
 } from './codexShared.js'
 import { V3_CODEX_RELAY_PREFIX } from '../v3CodexRelay.js'
 import { createLogger } from '../logger.js'
+import type { CollabAgentPolicy } from './engineAdapter.js'
 
 const log = createLogger({ module: 'codexAppServerRunner' })
 
@@ -130,6 +131,7 @@ interface QueuedTurn {
    *  错的 inflight 行。runTurn(opts.requestId) 从 closure 拿,emitResult 也从同
    *  一 closure 拿,不读 instance 字段。 */
   requestId?: string
+  collabAgentPolicy?: CollabAgentPolicy
 }
 
 interface PendingRequest {
@@ -218,10 +220,13 @@ function shortThreadId(threadId: string): string {
 function collabAgentInput(
   item: Record<string, unknown>,
   description: string,
+  policy?: CollabAgentPolicy,
 ): Record<string, unknown> {
   const prompt = collabPrompt(item)
   const receivers = collabReceiverThreadIds(item)
   const input: Record<string, unknown> = {
+    openclaudeOrigin: 'codex-collab',
+    ...(policy === 'team-mode-prefer-delegate' ? { openclaudeTeamFallback: true } : {}),
     description: description || prompt || 'Codex 子 Agent',
     codexTool: collabTool(item),
   }
@@ -808,6 +813,10 @@ export class CodexAppServerRunner extends EventEmitter {
   private collabReceiverToSpawnId = new Map<string, string>()
   private collabSpawnReceivers = new Map<string, Set<string>>()
   private completedCollabSpawnResults = new Set<string>()
+  /** Active turn's collaboration policy. Set from the queued turn/runTurn arg
+   *  (not from a cross-turn caller-global) so queued turns cannot overwrite
+   *  one another before drain() starts processing them. */
+  private currentCollabAgentPolicy: CollabAgentPolicy | undefined = undefined
 
   /** mkdtempSync'd dir holding the per-spawn `extra-prompt.md`. Created lazily
    *  in `ensureSpawned()` whenever a fresh app-server process needs platform
@@ -1097,6 +1106,7 @@ export class CodexAppServerRunner extends EventEmitter {
     textOrBlocks: string | Array<{ type: string; text?: string }>,
     /** PR2 v1.0.66 — 见 QueuedTurn.requestId 注释。 */
     requestId?: string,
+    collabAgentPolicy?: CollabAgentPolicy,
   ): Promise<void> {
     this.lastActivityAt = Date.now()
     if (!this.spawnEmitted) {
@@ -1105,7 +1115,7 @@ export class CodexAppServerRunner extends EventEmitter {
     }
     const prompt = normalisePrompt(textOrBlocks)
     return new Promise((resolve, reject) => {
-      this.queue.push({ prompt, resolve, reject, requestId })
+      this.queue.push({ prompt, resolve, reject, requestId, collabAgentPolicy })
       void this.drain()
     })
   }
@@ -1148,6 +1158,7 @@ export class CodexAppServerRunner extends EventEmitter {
       this.currentTurnCompleter = null
     }
     this.activeTurnId = null
+    this.currentCollabAgentPolicy = undefined
     this.initialized = false
     this.attached = false
     this.proc = null
@@ -1189,7 +1200,7 @@ export class CodexAppServerRunner extends EventEmitter {
     if (!turn) return
     this.processing = true
     try {
-      await this.runTurn(turn.prompt, turn.requestId)
+      await this.runTurn(turn.prompt, turn.requestId, turn.collabAgentPolicy)
       turn.resolve()
     } catch (err) {
       turn.reject(err as Error)
@@ -2024,7 +2035,11 @@ export class CodexAppServerRunner extends EventEmitter {
     }
   }
 
-  private handleCollabAgentToolStarted(itemId: string, item: Record<string, unknown>): void {
+  private handleCollabAgentToolStarted(
+    itemId: string,
+    item: Record<string, unknown>,
+    policy?: CollabAgentPolicy,
+  ): void {
     const tool = collabTool(item)
     if (tool === 'spawnAgent') {
       const receivers = collabReceiverThreadIds(item)
@@ -2033,7 +2048,7 @@ export class CodexAppServerRunner extends EventEmitter {
       this.emitAssistantToolUse(
         itemId,
         'Agent',
-        collabAgentInput(item, prompt || '启动 Codex 子 Agent'),
+        collabAgentInput(item, prompt || '启动 Codex 子 Agent', policy),
       )
       return
     }
@@ -2041,7 +2056,7 @@ export class CodexAppServerRunner extends EventEmitter {
     this.emitAssistantToolUse(
       itemId,
       'Codex:multiAgent',
-      collabAgentInput(item, `Codex multi-agent: ${tool}`),
+      collabAgentInput(item, `Codex multi-agent: ${tool}`, policy),
     )
   }
 
@@ -2133,7 +2148,7 @@ export class CodexAppServerRunner extends EventEmitter {
       return
     }
     if (itemType === 'collabAgentToolCall') {
-      this.handleCollabAgentToolStarted(itemId, item)
+      this.handleCollabAgentToolStarted(itemId, item, this.currentCollabAgentPolicy)
       return
     }
     // agentMessage / reasoning are streamed via deltas; nothing to surface
@@ -2331,7 +2346,11 @@ export class CodexAppServerRunner extends EventEmitter {
     this.emit('session_id', tid)
   }
 
-  private async runTurn(prompt: string, requestId?: string): Promise<void> {
+  private async runTurn(
+    prompt: string,
+    requestId?: string,
+    collabAgentPolicy?: CollabAgentPolicy,
+  ): Promise<void> {
     const startedAt = Date.now()
     // Phase 5:turn 顶部一次性取 snapshot,贯穿 ensureSpawned / thread/start /
     // thread/resume / launch overrides 四个消费点。任何中途读 snapshot 的写法
@@ -2365,6 +2384,7 @@ export class CodexAppServerRunner extends EventEmitter {
     // refreshed by `thread/tokenUsage/updated` notifications during the turn.
     this.activeTurnTotal = null
     this.currentTurnUsage = null
+    this.currentCollabAgentPolicy = collabAgentPolicy
 
     try {
       if (
@@ -2387,6 +2407,9 @@ export class CodexAppServerRunner extends EventEmitter {
           }
         }
       }
+      // A route-change shutdown above clears active turn state; restore this
+      // queued turn's policy before the actual turn/start notifications arrive.
+      this.currentCollabAgentPolicy = collabAgentPolicy
       await this.ensureSpawned(repoSnap, effectiveCwd)
 
       // Each fresh app-server proc must explicitly attach a thread before
@@ -2599,6 +2622,8 @@ export class CodexAppServerRunner extends EventEmitter {
       })
       // Do NOT re-throw — drain() catches and rejects the queue entry, but
       // upstream sessionManager handles errors via the result message above.
+    } finally {
+      this.currentCollabAgentPolicy = undefined
     }
   }
 

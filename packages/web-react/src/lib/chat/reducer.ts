@@ -623,12 +623,19 @@ export function applyOutboundMessage(
           const preview = (tb.inputPreview || "").replace(/[{}"]/g, "").slice(0, 80);
           let desc: string;
           let delegateFields: Partial<ChatMessage> | null = null;
+          let agentFields: Partial<ChatMessage> = {};
           if (isDelegate) {
             const goalRaw = input && typeof input.goal === "string" ? input.goal : "";
             const agentRaw = input && typeof input.agentId === "string" && input.agentId ? input.agentId : "main";
             desc = (goalRaw && goalRaw.trim()) || preview || "委托子任务";
             delegateFields = { _delegate: true, _delegateAgentId: agentRaw, _delegateGoal: normalizeDelegateGoalKey(goalRaw) };
           } else {
+            const originRaw = input && typeof input.openclaudeOrigin === "string" ? input.openclaudeOrigin : "";
+            const teamFallback = input?.openclaudeTeamFallback === true;
+            agentFields = {
+              ...(originRaw ? { _agentGroupOrigin: originRaw } : {}),
+              ...(teamFallback ? { _teamFallback: true } : {}),
+            };
             desc =
               (input && typeof input.description === "string" && input.description) ||
               (input && typeof input.prompt === "string" && input.prompt.slice(0, 80)) ||
@@ -641,6 +648,7 @@ export function applyOutboundMessage(
               toolName: isDelegate ? tb.toolName || "delegate_task" : "Agent",
               startTime: Date.now(),
               childBlocks: [],
+              ...agentFields,
               ...(delegateFields || {}),
             });
             sess._agentGroups.set(tb.blockId, groupMsg.id);
@@ -656,6 +664,9 @@ export function applyOutboundMessage(
                 groupMsg._delegateAgentId = delegateFields._delegateAgentId;
                 groupMsg._delegateGoal = delegateFields._delegateGoal;
                 adoptStandaloneDelegateRun(sess, groupMsg);
+              } else {
+                if (agentFields._agentGroupOrigin) groupMsg._agentGroupOrigin = agentFields._agentGroupOrigin;
+                if (agentFields._teamFallback) groupMsg._teamFallback = true;
               }
             }
           }

@@ -141,6 +141,8 @@ export function messageSignature(
         // 会让尾采样碰撞导致漏渲；这俩字段短、逐字符比较成本可忽略。
         m._delegateAgentId ?? "",
         m._delegateGoal ?? "",
+        m._agentGroupOrigin ?? "",
+        m._teamFallback ? 1 : 0,
         m._completed ? 1 : 0,
         m._isError ? 1 : 0,
         m._duration ?? 0,

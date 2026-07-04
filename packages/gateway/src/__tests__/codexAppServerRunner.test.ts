@@ -2047,7 +2047,29 @@ describe('handleNotification — collabAgentToolCall', () => {
     assert.equal(c.id, 'spawn-1')
     assert.equal(c.name, 'Agent')
     assert.equal(c.input.description, 'inspect gateway')
+    assert.equal(c.input.openclaudeOrigin, 'codex-collab')
+    assert.equal(c.input.openclaudeTeamFallback, undefined)
     assert.deepEqual(c.input.receiverThreadIds, ['thread-child-1'])
+    await h.cleanup()
+  })
+
+  it('marks Codex native collab Agent as team fallback when team policy is active', async () => {
+    const h = await makeHarness()
+    ;(h.runner as any).activeTurnId = 't-collab-policy'
+    ;(h.runner as any).currentCollabAgentPolicy = 'team-mode-prefer-delegate'
+    feed(
+      h.runner,
+      collabFrame('item/started', 't-collab-policy', {
+        id: 'spawn-1',
+        type: 'collabAgentToolCall',
+        tool: 'spawnAgent',
+        prompt: 'inspect gateway',
+      }),
+    )
+    const c = h.messages[0].message.content[0]
+    assert.equal(c.name, 'Agent')
+    assert.equal(c.input.openclaudeOrigin, 'codex-collab')
+    assert.equal(c.input.openclaudeTeamFallback, true)
     await h.cleanup()
   })
 

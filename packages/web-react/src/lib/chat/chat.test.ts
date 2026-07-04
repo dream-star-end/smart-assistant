@@ -362,6 +362,35 @@ describe("applyOutboundMessage (§3/§7/§9/§11)", () => {
     expect(s.messages.filter((m) => m.role === "delegate-progress")).toHaveLength(0);
   });
 
+  test("Codex native Agent tool_use preserves OpenClaude team fallback origin fields", () => {
+    const s = sess();
+    applyOutboundMessage(
+      s,
+      msgFrame({
+        frameSeq: 1,
+        blocks: [
+          {
+            kind: "tool_use",
+            toolName: "Agent",
+            blockId: "spawn-1",
+            partial: false,
+            inputJson: {
+              description: "inspect repo",
+              openclaudeOrigin: "codex-collab",
+              openclaudeTeamFallback: true,
+            },
+          },
+        ],
+      }),
+    );
+
+    const group = s.messages.find((m) => m.role === "agent-group");
+    expect(group?.text).toBe("inspect repo");
+    expect(group?._delegate).toBeUndefined();
+    expect(group?._agentGroupOrigin).toBe("codex-collab");
+    expect(group?._teamFallback).toBe(true);
+  });
+
   test("adopted delegate_progress preserves completed summary on the group", () => {
     const s = sess();
     applyOutboundMessage(

@@ -185,6 +185,35 @@ describe("persist — 历史合并纯函数", () => {
     expect(group.childBlocks?.map((b) => b.text)).toEqual(["审查结果正文"]);
   });
 
+  test("mergeFullServerWins: stripped server agent rows keep Codex fallback display markers", () => {
+    const localGroup: ChatMessage = {
+      id: "g-codex",
+      role: "agent-group",
+      text: "并行检查仓库",
+      ts: 10,
+      toolName: "Agent",
+      blockId: "spawn-1",
+      _agentGroupOrigin: "codex-collab",
+      _teamFallback: true,
+      _completed: true,
+      childBlocks: [{ kind: "text", text: "检查完成" }],
+    };
+    const serverGroup: ChatMessage = {
+      id: "g-codex",
+      role: "agent-group",
+      text: "并行检查仓库",
+      ts: 10,
+      toolName: "Agent",
+      blockId: "spawn-1",
+    };
+
+    const merged = mergeFullServerWins([serverGroup], [localGroup]);
+    const group = merged[0];
+    expect(group._agentGroupOrigin).toBe("codex-collab");
+    expect(group._teamFallback).toBe(true);
+    expect(group.childBlocks?.map((b) => b.text)).toEqual(["检查完成"]);
+  });
+
   test("applyServerIncremental: stripped delegate-progress keeps local entries and summary", () => {
     const localProgress: ChatMessage = {
       id: "dp1",

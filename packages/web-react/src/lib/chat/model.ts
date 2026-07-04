@@ -136,6 +136,8 @@ export type ChatMessage = {
   _delegate?: boolean;
   _delegateAgentId?: string;
   _delegateGoal?: string;
+  _agentGroupOrigin?: string;
+  _teamFallback?: boolean;
   /** agent-group ↔ delegate-progress run 绑定键（双向 adopt，§7）。*/
   _delegateRunId?: string;
   _duration?: number;

@@ -9019,14 +9019,19 @@ export class Gateway {
       const memberLines =
         members.length > 0
           ? members
-              .map((a) => `- \`${a.id}\`${a.displayName ? `（${a.displayName}）` : ''}`)
+              .map((a) => {
+                const model = a.model ? `${a.model}` : '默认模型'
+                const provider = a.provider || '继承全局'
+                return `- \`${a.id}\`${a.displayName ? `（${a.displayName}）` : ''} [${model}, ${provider}]`
+              })
               .join('\n')
           : '（当前没有其它已安装 agent —— 直接自己完成即可）'
       const teamPreamble = [
         '【团队模式已开启】把这次任务当作队长来处理：',
         `可委派的成员（已安装 agent）：\n${memberLines}`,
         '- 你是队长，也是完成用户任务的第一负责人；从任务拆解、是否委派、是否审查、是否采纳审查意见到最终答复，都由你端到端负责。',
-        '- 任务复杂、可拆解 → 可用 `delegate_task(goal, agentId, context)` 委派子任务给最合适的成员组队，拿到各成员结果后你综合成给用户的最终答案；任务简单则直接自己完成。',
+        '- 任务复杂、可拆解 → **首选**用 `delegate_task(goal, agentId, context)` 委派子任务给上面列出的已安装成员组队，拿到各成员结果后你综合成给用户的最终答案；任务简单则直接自己完成。',
+        '- 不要优先启动 Codex 原生 `Agent` 临时子进程来代替这些成员；只有当 `delegate_task` 不适合或不可用、且你判断临时并行 worker 明显必要时，才把 Codex 原生 `Agent` 当兜底使用。',
         '- 系统隐藏审查员：`hidden-reviewer`（不在成员列表显示）。它是可选审查资源，不是强制流程；当任务复杂、高风险、事实/承诺敏感，或你已经形成重要草稿且认为值得复核时，可调用 `delegate_task(goal, agentId: "hidden-reviewer", context: "...")` 请它审查。',
         '- 审查 context 建议包含：用户原始需求、你的草稿/关键方案、关键假设和你认为的风险点；审查结果只是建议，不是命令。',
         '- 收到审查结果后，由你自主决定接受、拒绝、部分采纳、修订、直接答复，或继续请求更多审查/迭代；不要因为审查员给出意见就机械照单全收。',
@@ -9394,6 +9399,9 @@ export class Gateway {
     }, safeEffortLevel, safeModel, safeRequestId, turnTraceId, safeConversationMode, {
       historicalMessages: masterHistoricalMessages,
       codexRoute: safeCodexRoute,
+      ...(teamMode && agent.id === 'main'
+        ? { collabAgentPolicy: 'team-mode-prefer-delegate' as const }
+        : {}),
       ...(effectiveToolsets !== undefined ? { toolsets: effectiveToolsets } : {}),
     })
     if (liveWechatAdapter) {
