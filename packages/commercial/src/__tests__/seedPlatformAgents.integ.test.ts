@@ -95,6 +95,21 @@ async function createUser(email: string): Promise<number> {
   )
   return Number.parseInt(r.rows[0].id, 10)
 }
+async function listCurrentAgentDefaults(
+  slugs: string[],
+): Promise<Record<string, { version: string; model: string }>> {
+  const r = await query<{ slug: string; version: string; model: string }>(
+    `SELECT l.slug, v.version, v.manifest->>'model' AS model
+       FROM marketplace_skill_listings l
+       JOIN marketplace_skill_versions v ON v.id = l.current_approved_version_id
+      WHERE l.kind = 'agent' AND l.slug = ANY($1::text[])
+      ORDER BY l.slug`,
+    [slugs],
+  )
+  return Object.fromEntries(
+    r.rows.map((row) => [row.slug, { version: row.version, model: row.model }]),
+  )
+}
 
 async function resetSchema(): Promise<void> {
   await query('DROP SCHEMA public CASCADE; CREATE SCHEMA public;')
@@ -314,6 +329,14 @@ describe('seedPlatformGeneralAgents (integ) — 办公助手 + 编程助手', ()
       agents.map((a) => a.slug).sort(),
       [...GENERAL_SLUGS].sort(),
       '通用 agent(办公+编程)应可搜',
+    )
+    assert.deepEqual(
+      await listCurrentAgentDefaults(GENERAL_SLUGS),
+      {
+        'coding-assistant': { version: '1.0.0', model: 'glm-5.2' },
+        'office-assistant': { version: '1.0.1', model: 'MiniMax-M3' },
+      },
+      '当前 approved 版本应体现不同助手的默认模型(办公 MiniMax,编程 GLM)',
     )
 
     // kind 隔离:通用 agent 不进 skill 目录。
