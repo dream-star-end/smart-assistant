@@ -625,6 +625,10 @@ export async function handleAdminMarketplaceReview(
       reviewerUserId: uid(admin),
       approve: decision === 'approve',
       note,
+      // This route is already protected by requireAdminVerifyDb. Admins are allowed
+      // to approve/reject their own marketplace submissions so platform-owned
+      // skills can be published without a second admin account.
+      allowSelfReview: true,
     })
     sendJson(res, 200, { ok: true })
   } catch (e) {
