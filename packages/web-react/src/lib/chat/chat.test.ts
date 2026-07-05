@@ -18,13 +18,14 @@ import { addMessage, type ChatMessage, createSession } from "./model";
 import {
   applyCostCharged,
   applyCostWaived,
+  applyLegacyBridgeError,
   applyOutboundError,
   applyOutboundMessage,
   applyResumeFailed,
   normalizeDelegateCards,
   type FrameEffects,
 } from "./reducer";
-import { ChatSocket } from "./socket";
+import { ChatSocket, type ChatSocketDeps } from "./socket";
 import type { OutboundMessageWire } from "./frames";
 
 // ─── helpers ──────────────────────────────────────────────────────────
@@ -280,6 +281,96 @@ describe("applyOutboundMessage (§3/§7/§9/§11)", () => {
     s._sendingInFlight = true;
     applyOutboundMessage(s, msgFrame({ frameSeq: 1, isFinal: true, ts: 500, blocks: [] }));
     expect(s._sendingInFlight).toBe(true); // dropped → no teardown
+  });
+
+  test("reload 后新非 final 内容帧会在 guard 之后恢复 _sendingInFlight", () => {
+    const s = sess();
+    const onLiveFrame = vi.fn();
+    applyOutboundMessage(
+      s,
+      msgFrame({ frameSeq: 1, blocks: [{ kind: "text", text: "仍在输出", messageId: "srv-1" }] }),
+      { onLiveFrame },
+    );
+    expect(s._sendingInFlight).toBe(true);
+    expect(onLiveFrame).toHaveBeenCalledWith(s);
+  });
+
+  test("stale/agent-switch guard 拦截的非 final 帧不会恢复 _sendingInFlight", () => {
+    const stale = sess();
+    stale._lastFrameSeqByKey = { "agent:main:webchat:dm:s1": 5 };
+    const onLiveFrame = vi.fn();
+    applyOutboundMessage(
+      stale,
+      msgFrame({ frameSeq: 4, blocks: [{ kind: "text", text: "旧帧", messageId: "old" }] }),
+      { onLiveFrame },
+    );
+    expect(stale._sendingInFlight).not.toBe(true);
+    expect(onLiveFrame).not.toHaveBeenCalled();
+
+    const reset = sess();
+    reset._trackerResetAt = Date.now();
+    applyOutboundMessage(
+      reset,
+      msgFrame({
+        frameSeq: 1,
+        ts: reset._trackerResetAt - 1,
+        blocks: [{ kind: "text", text: "stop 后迟到", messageId: "late" }],
+      }),
+      { onLiveFrame },
+    );
+    expect(reset._sendingInFlight).not.toBe(true);
+    expect(reset.messages).toHaveLength(0);
+
+    const localReset = sess();
+    localReset._trackerResetAt = Date.now();
+    localReset._localTeardownAt = localReset._trackerResetAt;
+    applyOutboundMessage(
+      localReset,
+      msgFrame({
+        frameSeq: 1,
+        ts: localReset._trackerResetAt + 1,
+        blocks: [{ kind: "text", text: "stop 后才 stamp 的迟到帧", messageId: "late-stamped" }],
+      }),
+      { onLiveFrame },
+    );
+    expect(localReset._sendingInFlight).not.toBe(true);
+    expect(localReset.messages).toHaveLength(0);
+
+    const localResetNoTs = sess();
+    localResetNoTs._localTeardownAt = Date.now();
+    applyOutboundMessage(
+      localResetNoTs,
+      msgFrame({ frameSeq: 1, ts: undefined, blocks: [{ kind: "text", text: "无 ts 迟到帧", messageId: "late-no-ts" }] }),
+      { onLiveFrame },
+    );
+    expect(localResetNoTs._sendingInFlight).not.toBe(true);
+    expect(localResetNoTs.messages).toHaveLength(0);
+
+    const cron = sess();
+    cron._localTeardownAt = Date.now();
+    onLiveFrame.mockClear();
+    applyOutboundMessage(
+      cron,
+      msgFrame({
+        frameSeq: 1,
+        cronJob: { label: "定时推送" },
+        blocks: [{ kind: "text", text: "合法 cron 推送", messageId: "cron-1" }],
+      }),
+      { onLiveFrame },
+    );
+    expect(cron.messages.some((m) => m.text === "合法 cron 推送" && m.cronPush)).toBe(true);
+    expect(cron._sendingInFlight).not.toBe(true);
+    expect(onLiveFrame).not.toHaveBeenCalled();
+
+    const switched = sess();
+    switched._agentSwitchedAt = Date.now();
+    applyOutboundMessage(
+      switched,
+      msgFrame({ frameSeq: 1, blocks: [{ kind: "text", text: "旧 agent", messageId: "old-agent" }] }),
+      { onLiveFrame },
+    );
+    expect(switched._sendingInFlight).not.toBe(true);
+    expect(switched.messages).toHaveLength(0);
   });
 
   test("isFinal teardown clears _sendingInFlight + streaming pointers", () => {
@@ -939,9 +1030,17 @@ describe("applyOutboundError double-frame suppression (§11)", () => {
     const s = sess();
     addMessage(s, "user", "hi", { status: "sent", ts: 1 });
     s._sendingInFlight = true;
-    applyOutboundError(s, { type: "outbound.error", sessionKey: "k", channel: "webchat", peer: { id: "s1", kind: "dm" }, code: "insufficient_credits", message: "no credits", isFinal: false, frameSeq: 5 } as never);
+    const persistSession = vi.fn();
+    applyOutboundError(
+      s,
+      { type: "outbound.error", sessionKey: "k", channel: "webchat", peer: { id: "s1", kind: "dm" }, code: "insufficient_credits", message: "no credits", isFinal: false, frameSeq: 5 } as never,
+      { persistSession },
+    );
     expect(s.messages.filter((m) => m.role === "assistant")).toHaveLength(1);
     expect(s._suppressErrorBubbleAtSeq).toBe(6);
+    expect(s._sendingInFlight).toBe(false);
+    expect(s.messages.find((m) => m.role === "user")?.status).toBe("error");
+    expect(persistSession).toHaveBeenCalledWith("s1");
     // following [error] text isFinal at seq 6 → suppressed bubble, still teardown.
     applyOutboundMessage(s, msgFrame({ frameSeq: 6, isFinal: true, ts: 999999999999, blocks: [{ kind: "text", text: "[error] no credits" }] }));
     expect(s.messages.filter((m) => m.role === "assistant")).toHaveLength(1);
@@ -954,6 +1053,21 @@ describe("applyOutboundError double-frame suppression (§11)", () => {
     const err = s.messages.filter((m) => m.role === "assistant").at(-1)!;
     expect(err.text).toBe("系统暂时不可用，请稍后重试。"); // 友好通用,不抛裸英文
     expect(err._errorDetail).toBe("server shutting down"); // 原始信息进查看详情,Codex 审防丢失
+  });
+
+  test("legacy bridge error 无 final：本地收尾后立即 persist false", () => {
+    const s = sess();
+    addMessage(s, "user", "hi", { status: "sent", ts: 1 });
+    s._sendingInFlight = true;
+    const persistSession = vi.fn();
+    applyLegacyBridgeError(
+      s,
+      { type: "error", code: "ERR_INTERNAL", message: "boom", traceId: "t1" } as never,
+      { persistSession },
+    );
+    expect(s._sendingInFlight).toBe(false);
+    expect(s.messages.find((m) => m.role === "user")?.status).toBe("error");
+    expect(persistSession).toHaveBeenCalledWith("s1");
   });
 });
 
@@ -1083,12 +1197,13 @@ class FakeWS {
   }
 }
 
-function makeSocket() {
+function makeSocket(overrides: Partial<ChatSocketDeps> = {}) {
   return new ChatSocket({
     getToken: () => "tok",
     silentRefresh: async () => null,
     onAuthExpired: () => {},
     defaultAgentId: "main",
+    ...overrides,
   });
 }
 
@@ -1110,6 +1225,70 @@ describe("ChatSocket safeWsSend backpressure (§2) + offline enqueue (§10)", ()
     const s = sock.sessions.get("s1")!;
     expect(s._sendingInFlight).toBe(true);
     expect(s.messages.find((m) => m.role === "user")?.status).toBe("sent");
+  });
+
+  test("stopTurn clears and persists pending turn state immediately", () => {
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const persistSession = vi.fn();
+    const sock = makeSocket({ persistSession });
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    ws.open();
+    sock.sendMessage({ sessId: "s1", agentId: "main", text: "hi" });
+    persistSession.mockClear();
+
+    sock.stopTurn("s1");
+
+    expect(sock.sessions.get("s1")!._sendingInFlight).toBe(false);
+    const stored = sock.toStored("s1")!;
+    expect(stored._pendingTurnInFlight).toBe(false);
+    expect(typeof stored._trackerResetAt).toBe("number");
+    expect(stored._localTeardownAt).toBe(stored._trackerResetAt);
+    expect(persistSession).toHaveBeenCalledWith("s1");
+    expect(ws.sent.some((d) => d.includes('"inbound.control.stop"'))).toBe(true);
+
+    const reloaded = makeSocket();
+    reloaded.loadStored(stored);
+    const restored = reloaded.sessions.get("s1")!;
+    const onLiveFrame = vi.fn();
+    applyOutboundMessage(
+      restored,
+      msgFrame({
+        frameSeq: 1,
+        ts: stored._trackerResetAt! + 1,
+        blocks: [{ kind: "text", text: "stale after stop+refresh", messageId: "late" }],
+      }),
+      { onLiveFrame },
+    );
+    expect(restored._sendingInFlight).toBe(false);
+    expect(restored.messages.some((m) => m.text === "stale after stop+refresh")).toBe(false);
+    expect(onLiveFrame).not.toHaveBeenCalled();
+  });
+
+  test("deduplicated auto-continue ack clears and persists pending turn state", () => {
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const persistSession = vi.fn();
+    const sock = makeSocket({ persistSession });
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    ws.open();
+    const sess = sock.ensureSession("s1", "main");
+    sess._sendingInFlight = true;
+    sess.messages.push({
+      id: "u-auto",
+      role: "user",
+      text: "继续",
+      ts: 1,
+      status: "sent",
+      _isAutoRetry: true,
+      _idem: "autocont-s1-u1",
+    } as ChatMessage);
+
+    ws.onmessage?.({ data: JSON.stringify({ type: "outbound.ack", deduplicated: true, idempotencyKey: "autocont-s1-u1" }) });
+
+    expect(sess._sendingInFlight).toBe(false);
+    expect(sock.toStored("s1")?._pendingTurnInFlight).toBe(false);
+    expect(persistSession).toHaveBeenCalledWith("s1");
   });
 
   test("bufferedAmount ≥ 2MB → close(4000) + requeue offline (no silent drop)", () => {

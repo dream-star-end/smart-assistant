@@ -208,6 +208,8 @@ export type ChatSession = {
   _replyingToMsgId?: string | null;
   _currentTurnAnswerCount?: number;
   _trackerResetAt?: number;
+  /** 本地 stop/timeout/switch/error 后的非 final 截止戳；防 late frame 在 reload 后复活发送态。*/
+  _localTeardownAt?: number;
   _agentSwitchedAt?: number | null;
   _turnStartedAt?: number | null;
   _lastFrameAt?: number;

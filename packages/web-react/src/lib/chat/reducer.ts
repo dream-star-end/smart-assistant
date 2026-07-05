@@ -641,16 +641,28 @@ export function applyOutboundMessage(
       return; // 早于 tracker reset（stop/switch/timeout 后的 late final）
     }
   }
-
-  // thinking-safety：非 final 帧重置；isFinal 清（由 socket 持 timer）。
-  if (sess._sendingInFlight && !frame.isFinal) effects.onLiveFrame?.(sess);
+  if (
+    !frame.isFinal &&
+    typeof frame.ts === "number" &&
+    typeof sess._trackerResetAt === "number" &&
+    frame.ts < sess._trackerResetAt
+  ) {
+    return; // 早于 tracker reset 的 late 非 final 帧不能恢复 in-flight
+  }
+  if (!frame.isFinal && !frame.cronJob && !sess._sendingInFlight && typeof sess._localTeardownAt === "number") {
+    return; // 本地 stop/timeout/switch/error 后，禁止旧 turn 非 final 复活发送态；cron/proactive 推送仍放行
+  }
 
   // ── §11 agent 切换守卫 ──
   if (sess._agentSwitchedAt && frame.ts && frame.ts < sess._agentSwitchedAt) return;
   if (sess._agentSwitchedAt && !sess._sendingInFlight && !frame.isFinal && Date.now() - sess._agentSwitchedAt < 2000) return;
 
   const hasBlocks = Array.isArray(frame.blocks) && frame.blocks.length > 0;
+  // reload 后若本轮仍有新内容抵达，先通过 frameSeq/stale/agent-switch 守卫，再恢复 in-flight；cron 推送不是用户 turn。
+  if (!frame.isFinal && !frame.cronJob && hasBlocks && !sess._sendingInFlight) sess._sendingInFlight = true;
   if (hasBlocks || frame.isFinal) markFrameReceived(sess);
+  // thinking-safety：通过守卫的非 final 帧重置；isFinal 清（由 socket 持 timer）。
+  if (sess._sendingInFlight && !frame.isFinal) effects.onLiveFrame?.(sess);
 
   // reply tracker 绑定（跳过 queued）。
   if (!sess._replyingToMsgId) {
@@ -1153,6 +1165,21 @@ export function applyOutboundError(sess: ChatSession, frame: OutboundErrorWire, 
     _errorDetail: rawDetail,
     ...(frame.traceId ? { usage: { traceId: frame.traceId } } : {}),
   });
+  // outbound.error is the structured error card; the following [error] text final is only a
+  // compatibility terminator. Clear/persist locally now so a refresh in that tiny gap does not
+  // resurrect the stop button or let late non-final frames revive the failed turn.
+  sess._sendingInFlight = false;
+  clearTurnTiming(sess);
+  resetReplyTracker(sess);
+  sess._localTeardownAt = sess._trackerResetAt;
+  for (let i = sess.messages.length - 1; i >= 0; i--) {
+    const m = sess.messages[i];
+    if (m?.role === "user" && (m.status === "sending" || m.status === "sent" || m.status === "queued")) {
+      m.status = "error";
+      break;
+    }
+  }
+  effects.persistSession?.(sess.id);
   if (!EXPECTED_TURN_ERR_CODES.has(normalized)) {
     effects.reportTurnError?.({
       code: normalized,
@@ -1181,6 +1208,7 @@ export function applyLegacyBridgeError(sess: ChatSession, frame: LegacyBridgeErr
   sess._sendingInFlight = false;
   clearTurnTiming(sess);
   resetReplyTracker(sess);
+  sess._localTeardownAt = sess._trackerResetAt;
   for (let i = sess.messages.length - 1; i >= 0; i--) {
     const m = sess.messages[i];
     if (m?.role === "user" && (m.status === "sending" || m.status === "sent" || m.status === "queued")) {
@@ -1188,6 +1216,7 @@ export function applyLegacyBridgeError(sess: ChatSession, frame: LegacyBridgeErr
       break;
     }
   }
+  effects.persistSession?.(sess.id);
   if (normalized === "insufficient_credits") effects.refreshBalance?.();
 }
 
