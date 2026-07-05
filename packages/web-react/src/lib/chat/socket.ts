@@ -1224,6 +1224,7 @@ export class ChatSocket {
       ...(typeof s._lastFrameAt === "number" ? { _lastFrameAt: s._lastFrameAt } : {}),
       _maxSeq: s._maxSeq,
       _trackerResetAt: typeof s._trackerResetAt === "number" ? s._trackerResetAt : undefined,
+      _trackerResetServerTs: typeof s._trackerResetServerTs === "number" ? s._trackerResetServerTs : undefined,
       _localTeardownAt: typeof s._localTeardownAt === "number" ? s._localTeardownAt : undefined,
       _agentSwitchedAt: typeof s._agentSwitchedAt === "number" ? s._agentSwitchedAt : s._agentSwitchedAt ?? undefined,
     };
@@ -1268,6 +1269,8 @@ export class ChatSocket {
       s._lastFrameAt = typeof stored._lastFrameAt === "number" ? stored._lastFrameAt : undefined;
     }
     s._trackerResetAt = typeof stored._trackerResetAt === "number" ? stored._trackerResetAt : undefined;
+    s._trackerResetServerTs =
+      typeof stored._trackerResetServerTs === "number" ? stored._trackerResetServerTs : undefined;
     s._localTeardownAt = typeof stored._localTeardownAt === "number" ? stored._localTeardownAt : undefined;
     s._agentSwitchedAt = typeof stored._agentSwitchedAt === "number" ? stored._agentSwitchedAt : null;
     rebuildIndexes(s);

@@ -14,7 +14,7 @@ import {
   parsePartialJson,
   shouldAutoContinueEmptyTurn,
 } from "./pure";
-import { addMessage, type ChatMessage, createSession } from "./model";
+import { addMessage, type ChatMessage, createSession, resetReplyTracker } from "./model";
 import {
   applyCostCharged,
   applyCostWaived,
@@ -203,6 +203,53 @@ describe("findOrCreateStreamingRow (§9 canonical id upsert)", () => {
 });
 
 // ═══════════════ reducer: §7/§9/§11 ═══════════════
+describe("§11 stale 守卫 —— server 域截止 + teardown 时间窗", () => {
+  test("teardown 时间窗过期后,非 final 帧正常渲染并复活发送态(多端新 turn 不被无界压制)", () => {
+    const s = sess();
+    s._localTeardownAt = Date.now() - 4 * 60_000; // stop 已过 4 分钟 > 3 分钟窗口
+    applyOutboundMessage(
+      s,
+      msgFrame({ frameSeq: 1, ts: Date.now() - 1000, blocks: [{ kind: "text", text: "新一轮", messageId: "srv-9" }] }),
+    );
+    expect(s.messages.some((m) => m.text === "新一轮")).toBe(true);
+    expect(s._sendingInFlight).toBe(true);
+  });
+
+  test("teardown 时间窗内,旧 turn 非 final 晚到帧仍被压制", () => {
+    const s = sess();
+    s._localTeardownAt = Date.now() - 10_000;
+    applyOutboundMessage(
+      s,
+      msgFrame({ frameSeq: 1, ts: Date.now(), blocks: [{ kind: "text", text: "晚到", messageId: "srv-9" }] }),
+    );
+    expect(s.messages.some((m) => m.text === "晚到")).toBe(false);
+    expect(s._sendingInFlight).toBeFalsy();
+  });
+
+  test("客户端时钟快于 server:reset 后新帧按 server 域截止放行,真 stale 帧仍拒", () => {
+    const s = sess();
+    // 模拟 server 时钟刻度远落后于客户端:reset 前见过的帧 server ts=1000。
+    applyOutboundMessage(
+      s,
+      msgFrame({ frameSeq: 1, ts: 1_000, isFinal: true, blocks: [{ kind: "text", text: "旧轮", messageId: "srv-1" }] }),
+    );
+    resetReplyTracker(s); // stop/switch:_trackerResetAt=Date.now()(客户端钟,远大于 server 刻度)
+    expect(s._trackerResetServerTs).toBe(1_000);
+    // 新一轮:server ts=1500 > 截止 1000 → 放行。旧跨域实现会因 1500 < _trackerResetAt 整轮误杀。
+    applyOutboundMessage(
+      s,
+      msgFrame({ frameSeq: 2, ts: 1_500, blocks: [{ kind: "text", text: "新轮", messageId: "srv-2" }] }),
+    );
+    expect(s.messages.some((m) => m.text === "新轮")).toBe(true);
+    // 真 stale:server ts=900 ≤ 1000 → 拒(final 与非 final 同判)。
+    applyOutboundMessage(
+      s,
+      msgFrame({ frameSeq: 3, ts: 900, blocks: [{ kind: "text", text: "stale", messageId: "srv-3" }] }),
+    );
+    expect(s.messages.some((m) => m.text === "stale")).toBe(false);
+  });
+});
+
 describe("applyOutboundMessage (§3/§7/§9/§11)", () => {
   test("text streaming accumulates into one assistant row", () => {
     const s = sess();

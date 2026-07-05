@@ -34,7 +34,11 @@ import {
   markFrameReceived,
   rebuildIndexes,
   resetReplyTracker,
+  trackServerTs,
 } from "./model";
+
+/** teardown 后非 final 帧的压制时间窗(客户端同域):覆盖 stop 后 server 收尾期,不无界压制多端新 turn。*/
+const TEARDOWN_DROP_WINDOW_MS = 3 * 60_000;
 import type {
   CostChargedWire,
   CostWaivedWire,
@@ -206,7 +210,8 @@ function extractMcpContentText(item: Record<string, unknown> | null): string {
   return str(error?.message) || str(item.error) || str(item.result);
 }
 
-function friendlyDelegateResultPreview(raw: unknown): string {
+// export: persist.mergeLocalTeamDisplayFields 回填 server 工具行输出时复用同一预览语义。
+export function friendlyDelegateResultPreview(raw: unknown): string {
   const text = typeof raw === "string" ? raw : "";
   const parsed = parseJsonObject(raw);
   if (!parsed) return text.trim().startsWith("{") ? "" : text;
@@ -600,6 +605,9 @@ export function applyOutboundMessage(
   // ── §3 frameSeq dedupe ──
   if (!acceptFrameSeq(sess, frame)) return;
 
+  // server ts 跟踪(max 单调):供 resetReplyTracker 定格 server 域 stale 截止(§11)。
+  trackServerTs(sess, frame.ts);
+
   // ── §11 双帧 error 抑制：紧随 outbound.error 的 [error] text isFinal 不渲染气泡 ──
   let suppressLegacyErrorText = false;
   if (
@@ -632,25 +640,39 @@ export function applyOutboundMessage(
     }
   }
 
-  // ── §11 stale-final 守卫（跨时钟域，需 frame.ts）──
+  // ── §11 stale 守卫 ──
+  // stale 判定优先走 **server 时钟域同域比较**（frame.ts ≤ reset 前所见最大 server ts →
+  // 帧发出不晚于 reset 前已见内容 → stale）；仅当从未见过 server ts（_trackerResetServerTs
+  // 缺省）才回退到 frame.ts(server 钟) vs _trackerResetAt(客户端钟) 的跨域比较——跨域比较
+  // 在客户端时钟快于 server 时会把整轮新帧误杀,不能作首选。
+  const staleVsTrackerReset = (ts: number): boolean =>
+    typeof sess._trackerResetServerTs === "number"
+      ? ts <= sess._trackerResetServerTs
+      : typeof sess._trackerResetAt === "number" && ts < sess._trackerResetAt;
   if (frame.isFinal && typeof frame.ts === "number") {
     if (sess._replyingToMsgId) {
       const boundMsg = sess.messages.find((m) => m.id === sess._replyingToMsgId);
       if (boundMsg && typeof boundMsg.ts === "number" && frame.ts < boundMsg.ts) return; // 早于绑定 user msg
-    } else if (typeof sess._trackerResetAt === "number" && frame.ts < sess._trackerResetAt) {
+    } else if (staleVsTrackerReset(frame.ts)) {
       return; // 早于 tracker reset（stop/switch/timeout 后的 late final）
     }
   }
-  if (
-    !frame.isFinal &&
-    typeof frame.ts === "number" &&
-    typeof sess._trackerResetAt === "number" &&
-    frame.ts < sess._trackerResetAt
-  ) {
+  if (!frame.isFinal && typeof frame.ts === "number" && staleVsTrackerReset(frame.ts)) {
     return; // 早于 tracker reset 的 late 非 final 帧不能恢复 in-flight
   }
-  if (!frame.isFinal && !frame.cronJob && !sess._sendingInFlight && typeof sess._localTeardownAt === "number") {
-    return; // 本地 stop/timeout/switch/error 后，禁止旧 turn 非 final 复活发送态；cron/proactive 推送仍放行
+  // 本地 stop/timeout/switch/error 后，禁止旧 turn 非 final 复活发送态；cron/proactive 推送
+  // 仍放行。**时间窗有界**（客户端钟 vs 客户端钟,同域）:该守卫针对的是「stop 后 server 端
+  // turn 尚未被 interrupt 掉的收尾期晚到帧」,量级是秒到分;无界压制会把**另一端设备**在本端
+  // stop 之后发起的新 turn 流式帧也全部吞掉(多端同看回归)。窗口过期后帧正常放行,由下方
+  // in-flight 复活逻辑接管。
+  if (
+    !frame.isFinal &&
+    !frame.cronJob &&
+    !sess._sendingInFlight &&
+    typeof sess._localTeardownAt === "number" &&
+    Date.now() - sess._localTeardownAt < TEARDOWN_DROP_WINDOW_MS
+  ) {
+    return;
   }
 
   // ── §11 agent 切换守卫 ──

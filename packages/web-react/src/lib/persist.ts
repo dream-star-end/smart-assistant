@@ -14,6 +14,7 @@
  *    无需真实 IndexedDB 即可单测核心逻辑。
  */
 import type { ChatMessage } from "./chat/model";
+import { friendlyDelegateResultPreview } from "./chat/reducer";
 
 /** IndexedDB schema 版本 + 唯一对象存储名。*/
 const DB_VERSION = 1;
@@ -45,6 +46,8 @@ export type StoredSession = {
   _lastFrameAt?: number;
   _maxSeq?: number;
   _trackerResetAt?: number;
+  /** server 时钟域的 tracker reset 截止（见 chat/model.ts 字段注释）,随 reload 保留。*/
+  _trackerResetServerTs?: number;
   _localTeardownAt?: number;
   _agentSwitchedAt?: number | null;
 };
@@ -166,12 +169,19 @@ export function dbNameForUser(userId: string | null | undefined): string {
  *     永不以另一 id 重写它们；但 v5 当前不把用户消息 PUT 到 server（server 历史只含
  *     server-authored 的助手/委派/工具）。若像旧逻辑那样只保尾部，重连 server-wins 会丢掉
  *     夹在助手轮之前的用户输入（boss 报"会话不显示用户输入"的根因）。故额外保留这些 user 行。
+ *  ③ **本地独有的团队/委派卡**（agent-group / delegate-progress，中段）——团队卡是
+ *     client-owned 展示结构，v5 server-authored 通道只写 assistant|thinking|tool 三种
+ *     role、从不产出团队行（ccbMessageParser 显式把 Agent 卡排除在 durable 快照外），
+ *     所以「中段 server 不认识的团队行」不是被取代的脏数据，而是 server 端根本没有的
+ *     内容；旧逻辑只保尾部会在「团队轮之后又有新轮」的 reopen 场景整卡丢失。保留后由
+ *     normalizeDelegateCards（loadStored/applyServerMessages 收口处）按 blockId/runId
+ *     兜底折叠,不会与 server 带回的 delegate 工具行形成重复卡。
  *
- * 注意只对 **user** 角色放宽：assistant/thinking/tool/agent-group 等乐观消息可能已被 server
- * 以 `srv-*` 重写，中段保留会出现重复卡片，故它们仍只保尾部（非尾部=已被取代→丢弃）。
+ * 其余角色（assistant/thinking/tool）乐观消息可能已被 server 以 `srv-*` 重写，中段保留
+ * 会出现重复卡片，故仍只保尾部（非尾部=已被取代→丢弃）。
  * 合并后按 ts 稳定排序：user 气泡 ts < 其轮 server 助手 ts → 正确落到该轮助手之前；server
- * 本就 ts 有序、尾部乐观消息 ts 最大 → 各归其位。跨设备（本地无此会话）仍需服务端持久化
- * 用户消息才能恢复——此修复彻底解决"同浏览器重连"。
+ * 本就 ts 有序、尾部乐观消息 ts 最大 → 各归其位。跨设备（本地无此会话）团队卡仍会丢——
+ * 根治需团队卡 server-authored 一等公民化（已登记技术债,偿还触发=跨设备团队历史成为需求）。
  */
 export function mergeFullServerWins(server: ChatMessage[], local: ChatMessage[]): ChatMessage[] {
   const localById = new Map<string, ChatMessage>();
@@ -183,12 +193,19 @@ export function mergeFullServerWins(server: ChatMessage[], local: ChatMessage[])
   let i = local.length;
   while (i > 0 && local[i - 1]?.id && !serverIds.has(local[i - 1].id)) i--;
   const tail = local.slice(i);
-  const preservedUsers = local
+  const preservedMid = local
     .slice(0, i)
-    .filter((m) => m?.role === "user" && m.id && !serverIds.has(m.id));
-  if (!tail.length && !preservedUsers.length) return serverChanged ? serverMerged : server;
-  // 稳定排序（现代 JS Array.sort 稳定）：等 ts 时维持 server→preservedUsers→tail 的插入序。
-  return stableSortByTs([...serverMerged, ...preservedUsers, ...tail]);
+    .filter(
+      (m) =>
+        m?.id &&
+        !serverIds.has(m.id) &&
+        // user 行=客户端权威;团队卡=client-owned(见 docstring ③),被 adopt 吸收的
+        // standalone progress 行(_adoptedInto)已并入 group,不重复保留。
+        (m.role === "user" || (isTeamOwnedRole(m.role) && !m._adoptedInto)),
+    );
+  if (!tail.length && !preservedMid.length) return serverChanged ? serverMerged : server;
+  // 稳定排序（现代 JS Array.sort 稳定）：等 ts 时维持 server→preservedMid→tail 的插入序。
+  return stableSortByTs([...serverMerged, ...preservedMid, ...tail]);
 }
 
 /**
@@ -232,6 +249,19 @@ function hasOwn(obj: Record<string, unknown>, key: string): boolean {
  */
 function mergeLocalTeamDisplayFields(serverMsg: ChatMessage, localMsg?: ChatMessage): ChatMessage {
   if (!localMsg || serverMsg.id !== localMsg.id) return serverMsg;
+  // 本地已把 delegate 工具行**原位转换**成 agent-group 富卡（normalizeDelegateToolRow），
+  // server 同 id 仍是转换前的 tool 行。直接 server-wins 会把富卡打回裸工具行、丢掉流式期
+  // 积累的 childBlocks。此时以本地富卡为底,只从 server 行回填完成态/结果预览（server 可能
+  // 带着客户端离线期间才到达的最终输出）。
+  if (localMsg.role === "agent-group" && localMsg._delegate === true && serverMsg.role === "tool") {
+    let out: ChatMessage | null = null;
+    const ensure = () => (out ??= { ...localMsg });
+    const preview = friendlyDelegateResultPreview(serverMsg.output);
+    if (preview && !localMsg._resultPreview) ensure()._resultPreview = preview.slice(0, 200);
+    if (serverMsg.error && !localMsg._isError) ensure()._isError = true;
+    if (serverMsg._completed && !localMsg._completed) ensure()._completed = true;
+    return out ?? localMsg;
+  }
   if (!isTeamOwnedRole(serverMsg.role) || serverMsg.role !== localMsg.role) return serverMsg;
 
   const server = serverMsg as unknown as Record<string, unknown>;

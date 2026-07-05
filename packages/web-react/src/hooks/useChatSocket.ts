@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { api } from "../lib/api";
 import type { ChatMessage, ChatSession } from "../lib/chat/model";
-import { rebuildIndexes } from "../lib/chat/model";
 import { ChatSocket, type ChatSnapshot } from "../lib/chat/socket";
 import type { InboundMessage, RepoBindErrorWire, RepoStatusWire } from "../lib/chat/frames";
 import { SessionStore, type StoredSession } from "../lib/persist";
@@ -25,7 +24,7 @@ function persistSignature(s: StoredSession): string {
   const inflightSig = s._sendingInFlight
     ? `1/${s._turnStartedAt ?? 0}/${s._lastFrameAt ?? 0}`
     : "0";
-  return `${s.messages.length}:${lastSig}:${s._lastFrameSeq ?? 0}:${s._maxSeq ?? 0}:${s.updatedAt ?? s.lastAt}:${s.title}:${s.agentId}:${inflightSig}:${s._trackerResetAt ?? 0}:${s._localTeardownAt ?? 0}:${s._agentSwitchedAt ?? 0}`;
+  return `${s.messages.length}:${lastSig}:${s._lastFrameSeq ?? 0}:${s._maxSeq ?? 0}:${s.updatedAt ?? s.lastAt}:${s.title}:${s.agentId}:${inflightSig}:${s._trackerResetAt ?? 0}:${s._trackerResetServerTs ?? 0}:${s._localTeardownAt ?? 0}:${s._agentSwitchedAt ?? 0}`;
 }
 
 /**
@@ -161,7 +160,9 @@ export function useChatSocket(opts: {
           body: JSON.stringify(p),
         }).catch(() => {});
       },
-      // resume_failed / 重连 reconcile：REST 全量 sync 作最终权威源（server-wins）。
+      // resume_failed / 重连 reconcile：REST 全量 sync 作最终权威源（server-wins **合并**,
+      // 不是整段替换——替换会抹掉 server 端根本没有的 client-owned 内容:乐观尾/用户行/
+      // 团队卡,走与 loadHistory 同一条 applyServerMessages 收口,含 normalizeDelegateCards）。
       syncSession: async (sessId) => {
         const a = authRef.current;
         if (!a) return;
@@ -171,17 +172,12 @@ export function useChatSocket(opts: {
         try {
           const detail = await api.getSession(a, sessId);
           const serverMsgs = Array.isArray(detail.messages) ? (detail.messages as ChatMessage[]) : null;
-          // 只在 server 返回非空 tape 时做全量替换——绝不用空结果抹掉活转录。
+          // 只在 server 返回非空 tape 时合并——绝不用空结果抹掉活转录。
           if (serverMsgs && serverMsgs.length > 0) {
-            sess.messages = serverMsgs;
-            sess._streamingAssistant = null;
-            sess._streamingThinking = null;
-            sess._blockIdToMsgId = new Map();
-            sess._agentGroups = new Map();
-            rebuildIndexes(sess);
+            socket?.applyServerMessages(sessId, detail.agentId || sess.agentId, serverMsgs, true, detail.maxSeq);
           }
           sess._liveStreamBroken = false;
-          persistRef.current(sessId); // server-wins 替换后落地新 tape + 游标
+          persistRef.current(sessId); // server-wins 合并后落地新 tape + 游标
         } catch {
           /* sync 失败：保留现状，下次重连/前台再试 */
         }
