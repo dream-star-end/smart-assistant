@@ -188,6 +188,7 @@ import {
 } from "./http/internalMarketplaceAgent.js";
 import {
   TOOL_FAILURE_AUDIT_PATH,
+  isToolFailureAuditEnabled,
   makeToolFailureAuditHandler,
   type ToolFailureAuditHandler,
 } from "./http/internalToolFailureAudit.js";
@@ -1328,10 +1329,16 @@ export async function registerCommercial(
       });
       // /internal/v3/agent-audit/tool-failure — 容器 gateway 自动上报失败工具调用。
       // user_id 由 verifyContainerIdentity 推导,不信任容器传入;写入 agent_audit 供后台优化。
-      const toolFailureAuditHandler: ToolFailureAuditHandler = makeToolFailureAuditHandler({
-        identityRepo,
-        queryRunner: getPool(),
-      });
+      // 显式开关 OC_TOOL_FAILURE_AUDIT=1(与容器侧 reporter 同名 env,supervisor 只在
+      // master 设了才透传进容器):未开启 → 不注册路由,path fall through 到
+      // internalProxyHandler 返 404,容器侧按 fatal 直接 drop —— 与"未部署"等价。
+      // v3 env 无此键 = 默认关,代码合回 v3 也不会静默对现网开启明文遥测。
+      const toolFailureAuditHandler: ToolFailureAuditHandler | null = isToolFailureAuditEnabled()
+        ? makeToolFailureAuditHandler({
+            identityRepo,
+            queryRunner: getPool(),
+          })
+        : null;
       // 平台官方**科研** agent 的幂等 seed —— v5-native 露出(市场为 agent 露出单一权威,
       // 不走 v3 seed/team)。**仅当 research_config 已开启时 seed**(关闭时科研能力本就 503,
       // 避免装到只会报错的 agent;v3 不含本调用 → 不会 seed)。fire-and-forget,失败只 log
@@ -1414,7 +1421,7 @@ export async function registerCommercial(
         if (path === TURN_WAIVE_PATH) {
           return turnWaiveHandler(req, res, ctx);
         }
-        if (path === TOOL_FAILURE_AUDIT_PATH) {
+        if (toolFailureAuditHandler && path === TOOL_FAILURE_AUDIT_PATH) {
           return toolFailureAuditHandler(req, res, ctx);
         }
         if (path.startsWith(MARKETPLACE_AGENT_PREFIX)) {

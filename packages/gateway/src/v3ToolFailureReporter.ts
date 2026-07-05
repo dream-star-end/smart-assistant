@@ -29,6 +29,25 @@ const DRAIN_INTERVAL_MS = 30_000
 const RETRY_BACKOFF_BASE_MS = 5_000
 const RETRY_BACKOFF_MAX_MS = 5 * 60_000
 const ATTEMPT_TIMEOUT_MS = 10_000
+/** 磁盘队列条数上限:master 长期不可达时不允许队列无界膨胀(默认 500,测试可注入)。 */
+const MAX_QUEUE_ENTRIES = 500
+/** 队列超限丢弃的 warn 限频窗口:突发失败风暴下防日志刷屏。 */
+const QUEUE_OVERFLOW_WARN_INTERVAL_MS = 60_000
+
+/**
+ * 遥测显式开关 env(与 master 侧 internalToolFailureAudit 路由门控同名,双端一致)。
+ *
+ * 为什么不能只靠 OPENCLAUDE_V3_MASTER_BASE_URL/OPENCLAUDE_V3_CONTAINER_TOKEN 存在性:
+ * 这俩是商业容器的必备 env(server-authored sink 等也依赖),存在性门控等于事实恒开、
+ * 无法关停;且这套代码将来合回 v3 生产分支时会静默对现网用户开启明文遥测。
+ * 本开关由 master 进程 env 显式设置,supervisor(v3supervisor.ts)仅在 master 设了
+ * 才透传进容器 —— 不设即全链关停,隐私默认安全。
+ */
+export const TOOL_FAILURE_AUDIT_ENV = 'OC_TOOL_FAILURE_AUDIT'
+
+export function isToolFailureAuditEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env[TOOL_FAILURE_AUDIT_ENV] === '1'
+}
 
 export interface ToolFailureReportConfig {
   masterBaseUrl: string
@@ -75,6 +94,8 @@ export class ToolFailureReportError extends Error {
 export function readToolFailureReportConfig(
   env: NodeJS.ProcessEnv = process.env,
 ): ToolFailureReportConfig | null {
+  // 显式开关叠加既有 env 条件:OC_TOOL_FAILURE_AUDIT != '1' 时无条件视为未配置。
+  if (!isToolFailureAuditEnabled(env)) return null
   const base = env.OPENCLAUDE_V3_MASTER_BASE_URL?.trim()
   const token = env.OPENCLAUDE_V3_CONTAINER_TOKEN?.trim()
   if (!base || !token) return null
@@ -172,15 +193,20 @@ export function makeToolFailureReporter(deps: {
   fetchImpl?: FetchLike
   now?: () => number
   drainIntervalMs?: number
+  maxQueueEntries?: number
 }): ToolFailureReporter {
   const dir = deps.queueDir ?? defaultToolFailureQueueDir()
   const now = deps.now ?? (() => Date.now())
   const bus = deps.eventBus ?? eventBus
   const drainIntervalMs = deps.drainIntervalMs ?? DRAIN_INTERVAL_MS
+  const maxQueueEntries = deps.maxQueueEntries ?? MAX_QUEUE_ENTRIES
   let timer: ReturnType<typeof setInterval> | null = null
   let draining = false
   let pendingKick = false
   let started = false
+  // enqueue 串行链:事件突发时并发 readdir 会各自看到旧计数,上限被击穿;串行化保证准确。
+  let enqueueChain: Promise<void> = Promise.resolve()
+  let lastOverflowWarnAt = 0
 
   async function ensureDir(): Promise<void> {
     await mkdir(dir, { recursive: true })
@@ -202,8 +228,48 @@ export function makeToolFailureReporter(deps: {
     await rename(tmp, filepath)
   }
 
+  /**
+   * 重试元数据(attempts/lastError*)的就地回写。**必须**用 'r+'(要求文件仍存在),
+   * 不能走 atomicWriteJson:rename 覆盖会把 send 期间刚被队列上限 unlink 的条目
+   * 重建"复活",击穿上限。'r+' 下条目已被丢弃 → ENOENT,返回 false 由调用方按
+   * dropped 处理;open 成功后即使再被 unlink,写的也只是孤儿 inode,无害。
+   * 代价:非原子写,进程崩溃恰在写中 → JSON 残缺 → 下轮 drain 按 unreadable 丢弃
+   * (已有该路径 + warn 日志)—— 对失败遥测队列可接受。
+   */
+  async function updateEntryInPlace(filepath: string, data: unknown): Promise<boolean> {
+    let fh: Awaited<ReturnType<typeof open>>
+    try {
+      fh = await open(filepath, 'r+')
+    } catch {
+      return false
+    }
+    try {
+      const buf = Buffer.from(JSON.stringify(data), 'utf8')
+      await fh.truncate(0)
+      await fh.write(buf, 0, buf.length, 0)
+      await fh.sync()
+    } finally {
+      await fh.close()
+    }
+    return true
+  }
+
   async function enqueue(payload: ToolFailureReportPayload): Promise<void> {
     await ensureDir()
+    // 条数上限:超限先丢最旧(文件名前缀是毫秒时间戳,字典序≈时间序),再写新条目;
+    // warn 限频,避免 master 长期不可达 + 工具失败风暴时日志刷屏。
+    const existing = (await readdir(dir)).filter((f) => f.endsWith('.json')).sort()
+    if (existing.length >= maxQueueEntries) {
+      const overflow = existing.slice(0, existing.length - maxQueueEntries + 1)
+      await Promise.all(overflow.map((f) => unlink(join(dir, f)).catch(() => {})))
+      if (now() - lastOverflowWarnAt >= QUEUE_OVERFLOW_WARN_INTERVAL_MS) {
+        lastOverflowWarnAt = now()
+        log.warn('tool failure queue over capacity: dropped oldest entries', {
+          dropped: overflow.length,
+          max: maxQueueEntries,
+        })
+      }
+    }
     await atomicWriteJson(join(dir, filename()), {
       schemaVersion: 1,
       payload,
@@ -216,9 +282,11 @@ export function makeToolFailureReporter(deps: {
   function onToolCalled(ev: ToolCalledEvent): void {
     const payload = buildToolFailureReportPayload(ev)
     if (!payload) return
-    void enqueue(payload).catch((err) => {
-      log.warn('failed to enqueue tool failure report', { eventId: payload.eventId, toolName: payload.toolName }, err)
-    })
+    enqueueChain = enqueueChain
+      .then(() => enqueue(payload))
+      .catch((err) => {
+        log.warn('failed to enqueue tool failure report', { eventId: payload.eventId, toolName: payload.toolName }, err)
+      })
   }
 
   function kick(): void {
@@ -274,11 +342,15 @@ export function makeToolFailureReporter(deps: {
           log.warn('dropped fatal tool failure report', { eventId: entry.payload?.eventId, status: err.status })
           continue
         }
-        stats.retried += 1
         entry.attempts += 1
         entry.lastErrorAt = now()
         entry.lastErrorMessage = cap(err instanceof Error ? err.message : String(err), 300)
-        await atomicWriteJson(filepath, entry)
+        if (!(await updateEntryInPlace(filepath, entry))) {
+          // send 期间条目已被队列上限 unlink → 不复活,按 dropped 计
+          stats.dropped += 1
+          continue
+        }
+        stats.retried += 1
       }
     }
     return stats
@@ -316,6 +388,12 @@ export function makeToolFailureReporter(deps: {
 }
 
 export function startToolFailureReporter(): ToolFailureReporter | null {
+  // 显式 opt-in:遥测默认关(隐私红线)。未设 OC_TOOL_FAILURE_AUDIT=1 → 打一行日志后 no-op,
+  // 与 OPENCLAUDE_V3_MASTER_BASE_URL/OPENCLAUDE_V3_CONTAINER_TOKEN(容器必备 env)解耦。
+  if (!isToolFailureAuditEnabled(process.env)) {
+    log.info('tool failure reporter disabled: OC_TOOL_FAILURE_AUDIT != 1 (explicit opt-in)')
+    return null
+  }
   const cfg = readToolFailureReportConfig(process.env)
   if (!cfg) {
     log.info('tool failure reporter disabled: commercial master env not configured')

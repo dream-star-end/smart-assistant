@@ -18,6 +18,18 @@ import { REQUEST_ID_HEADER, ensureRequestId, setSecurityHeaders } from './util.j
 
 export const TOOL_FAILURE_AUDIT_PATH = '/internal/v3/agent-audit/tool-failure'
 
+/**
+ * 遥测显式开关(与容器侧 v3ToolFailureReporter 同名 env,双端一致门控)。
+ *
+ * 未开启 → master 不注册本路由(index.ts dispatchInternal 直接 fall through 到
+ * internalProxyHandler 返 404),与"功能未部署"完全等价;容器侧把 404 分类为
+ * fatal 直接 drop,不污染重试队列。必须显式 '1' 才开 —— 防止这套代码合回 v3
+ * 生产分支时,靠容器必备 env 的存在性静默对现网用户开启明文遥测。
+ */
+export function isToolFailureAuditEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env.OC_TOOL_FAILURE_AUDIT === '1'
+}
+
 const MAX_BODY_BYTES = 32 * 1024
 const MAX_ERROR_MSG_CHARS = 2_000
 

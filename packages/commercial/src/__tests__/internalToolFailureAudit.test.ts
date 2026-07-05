@@ -12,6 +12,7 @@ import { hashSecret, type ContainerIdentityRepo } from '../auth/containerIdentit
 import {
   TOOL_FAILURE_AUDIT_PATH,
   insertToolFailureAudit,
+  isToolFailureAuditEnabled,
   makeToolFailureAuditHandler,
   type QueryRunner,
   type ToolFailureAuditBody,
@@ -75,6 +76,18 @@ function makeRes(): ServerResponse & { body: any } {
 function fakeResult(rows: any[] = []) {
   return { rows, rowCount: rows.length }
 }
+
+describe('isToolFailureAuditEnabled', () => {
+  test('route gate requires explicit OC_TOOL_FAILURE_AUDIT=1', () => {
+    // 未开启 → index.ts 不注册路由(path 落到 internalProxyHandler 返 404,
+    // 容器侧 fatal-drop),与"功能未部署"等价;防合回 v3 时静默对现网开启遥测。
+    assert.equal(isToolFailureAuditEnabled({}), false)
+    assert.equal(isToolFailureAuditEnabled({ OC_TOOL_FAILURE_AUDIT: '0' }), false)
+    assert.equal(isToolFailureAuditEnabled({ OC_TOOL_FAILURE_AUDIT: 'true' }), false)
+    assert.equal(isToolFailureAuditEnabled({ OC_TOOL_FAILURE_AUDIT: ' 1' }), false)
+    assert.equal(isToolFailureAuditEnabled({ OC_TOOL_FAILURE_AUDIT: '1' }), true)
+  })
+})
 
 describe('insertToolFailureAudit', () => {
   test('inserts failed audit row and best-effort dedupes by event id', async () => {

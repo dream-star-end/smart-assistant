@@ -1904,6 +1904,15 @@ export async function provisionV3Container(
     ];
     appendCodexRelayEnv(env);
 
+    // 工具失败遥测显式开关透传:仅当 master 进程 env 显式设 OC_TOOL_FAILURE_AUDIT=1
+    // 才注入容器(容器侧 v3ToolFailureReporter 与 master 侧 internalToolFailureAudit
+    // 路由同名 env 双端门控)。不设 → 容器拿不到该键,遥测全链关停 —— 不允许拿
+    // OPENCLAUDE_V3_MASTER_BASE_URL/OPENCLAUDE_V3_CONTAINER_TOKEN(容器必备 env)
+    // 的存在性当开关,否则事实恒开且合回 v3 会静默对现网用户开启明文遥测。
+    if (process.env.OC_TOOL_FAILURE_AUDIT === "1") {
+      env.push("OC_TOOL_FAILURE_AUDIT=1");
+    }
+
     // v3 file proxy:bridgeSecret 就位 → 注入 OC_CONTAINER_ID + OC_BRIDGE_NONCE。
     // 容器内 gateway 靠这两个 env 做 bridge bypass 校验 + /healthz capability 广播。
     // 缺失(deps.bridgeSecret 未注入)→ 容器不广播 file-proxy-v1,HOST 代理探测到
