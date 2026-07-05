@@ -897,6 +897,10 @@ export function App() {
           selectedModelId={modelId}
           onSelectModel={setModelId}
           modelsLoading={modelsLoading}
+          // 团队模式知情指示:与 send 的生效条件同构(teamMode 只对 main 生效,
+          // 见上方 send 的 agent.id === "main" 判定)——顶栏所见 = 实际所发。
+          teamModeActive={!demo && teamMode && agent.id === "main"}
+          onDisableTeamMode={() => setTeamMode(false)}
           credits={demo ? null : (user?.credits ?? null)}
           onOpenBilling={demo ? undefined : openSettings}
           sidebarCollapsed={collapsed}
