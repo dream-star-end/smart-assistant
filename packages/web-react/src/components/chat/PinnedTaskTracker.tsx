@@ -94,36 +94,43 @@ function TodoRow({ t, compact }: { t: TodoItem; compact?: boolean }) {
   );
 }
 
-export function PinnedTaskTracker({ todos }: { todos: TodoItem[] }) {
+export function PinnedTaskTracker({ todos, active }: { todos: TodoItem[]; active: boolean }) {
   const total = todos.length;
   const doneCount = todos.filter(isDone).length;
   const hasIncomplete = todos.some((t) => !isDone(t));
   // 「正在执行的一条」:优先 in_progress,否则第一条未完成(即将执行)。仅在有未完成任务时
   // 渲染,故 active 必非空。
-  const active = todos.find((t) => t.status === "in_progress") ?? todos.find((t) => !isDone(t)) ?? null;
+  const activeTodo = todos.find((t) => t.status === "in_progress") ?? todos.find((t) => !isDone(t)) ?? null;
   // 任务集签名(只看内容,状态变化不触发重展开,避免每完成一条就闪一下)。
   const sig = todos.map((t) => t.content).join("");
 
   const [expanded, setExpanded] = useState(true);
   const [userTouched, setUserTouched] = useState(false);
   const prevSig = useRef(sig);
+  const prevActive = useRef(active);
 
-  // 任务集变化 → 重新展开全部、复位用户态。
+  // 任务集变化 / 新 turn 开始 → 重新展开全部、复位用户态。
   useEffect(() => {
-    if (prevSig.current !== sig) {
+    const becameActive = !prevActive.current && active;
+    if (prevSig.current !== sig || becameActive) {
       prevSig.current = sig;
       setExpanded(true);
       setUserTouched(false);
     }
-  }, [sig]);
+    prevActive.current = active;
+  }, [sig, active]);
 
-  // 展开后 ~3s 自动折叠(用户未手动干预时)。
+  // 展开后 ~3s 自动折叠(用户未手动干预时)。非运行态不启动计时器,避免旧会话
+  // 隐藏 HUD 时悄悄改变下一轮初始展开状态。
   useEffect(() => {
-    if (!expanded || userTouched) return;
+    if (!active || !expanded || userTouched) return;
     const id = setTimeout(() => setExpanded(false), AUTO_COLLAPSE_MS);
     return () => clearTimeout(id);
-  }, [expanded, userTouched, sig]);
+  }, [active, expanded, userTouched, sig]);
 
+  // 只在当前 turn 仍在执行时显示。停止/收尾/打开旧会话后,历史 plan/TodoWrite
+  // 可能仍保留 pending/in_progress 状态用于 transcript,但不能继续钉在输入框上方误导用户。
+  if (!active) return null;
   // 只在有未完成任务时显示:全部完成(或无任务)即隐藏,不留"完成"残条、不在打开旧会话时闪。
   if (!hasIncomplete) return null;
 
@@ -145,15 +152,15 @@ export function PinnedTaskTracker({ todos }: { todos: TodoItem[] }) {
           <span className="shrink-0 text-xs font-medium text-muted">
             任务 {doneCount}/{total}
           </span>
-          {!expanded && active && (
+          {!expanded && activeTodo && (
             <span className="min-w-0 flex-1 truncate text-[13px] text-fg">
               <span className="inline-flex items-center gap-1.5">
-                {active.status === "in_progress" ? (
+                {activeTodo.status === "in_progress" ? (
                   <LoaderCircle className="size-3 shrink-0 animate-spin text-accent" />
                 ) : (
                   <Circle className="size-3 shrink-0 text-faint" />
                 )}
-                {active.status === "in_progress" && active.activeForm ? active.activeForm : active.content}
+                {activeTodo.status === "in_progress" && activeTodo.activeForm ? activeTodo.activeForm : activeTodo.content}
               </span>
             </span>
           )}
