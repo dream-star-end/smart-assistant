@@ -335,7 +335,15 @@ function makeStaticKeyUpstream(
     dispatcher,
     shouldUpdateQuotaFromResponse: false,
     applyUpstreamAuth(safeHeaders, body, _log) {
-      safeHeaders.authorization = `Bearer ${apiKey}`;
+      // 鉴权头风格由 protocol spec 声明:缺省 bearer(deepseek/minimax/ark 逐字节不变);
+      // opencodego 的 /messages 只认 x-api-key(Bearer→401,2026-07-05 实测)。
+      // safeHeaders 出自 buildSafeUpstreamHeaders 白名单构造,进来时不含 authorization,
+      // 故 x-api-key 分支只设自己的头即可,无残留泄漏面。
+      if (spec.authScheme === "x-api-key") {
+        safeHeaders["x-api-key"] = apiKey;
+      } else {
+        safeHeaders.authorization = `Bearer ${apiKey}`;
+      }
       for (const header of spec.stripHeaders) {
         delete safeHeaders[header];
       }

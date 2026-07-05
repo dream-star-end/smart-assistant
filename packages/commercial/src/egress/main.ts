@@ -166,6 +166,8 @@ export async function startEgress(): Promise<void> {
       deepseek: cfg.DEEPSEEK_API_KEY,
       minimax: cfg.ARK_AGENT_PLAN_KEY,
       ark: cfg.ARK_CODING_PLAN_KEY,
+      // 2026-07-05:OpenCode Go(qwen3.7-max/plus)。与 master internalProxyHandler 同口径注入。
+      opencodego: cfg.OPENCODE_GO_API_KEY,
     },
     getPhase6AccountUuidEnforce,
     getSessionPinMode,

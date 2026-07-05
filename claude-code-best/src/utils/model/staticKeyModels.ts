@@ -24,17 +24,25 @@ export function isArkGlmModel(model: string): boolean {
   return m === 'glm-5.1' || m === 'glm-5.2'
 }
 
+/** OpenCode Go(Zen 网关 Go 档)接入的 Qwen 模型:qwen3.7-max + qwen3.7-plus(2026-07-05)。
+ *  精确匹配,大小写/空白不敏感,与 protocol opencodego.matchesRoute 同口径。 */
+export function isOpencodeQwenModel(model: string): boolean {
+  const m = model.trim().toLowerCase()
+  return m === 'qwen3.7-max' || m === 'qwen3.7-plus'
+}
+
 /**
- * 「firstParty 能力基本全关」静态模型集 = MiniMax-M3 + glm-5.1/glm-5.2(**不含 deepseek**)。
- * 命中 → effort/betas/context-management/structured-output/adaptive-thinking 全部不生成。
+ * 「firstParty 能力基本全关」静态模型集 = MiniMax-M3 + glm-5.1/glm-5.2 + qwen3.7-max/plus
+ * (**不含 deepseek**)。命中 → effort/betas/context-management/structured-output/adaptive-thinking
+ * 全部不生成。
  *
- * **例外:thinking**。glm-5.1/glm-5.2 与 MiniMax-M3 虽在本集合(上述能力仍关)，但都是 thinking 模型 ——
- * `thinking.ts` 的 modelSupportsThinking 对 glm-5.1/glm-5.2(isArkGlmModel)/MiniMax-M3(isMiniMaxM3Model)
- * 先判→true，单独放行 thinking(火山 Ark 端点实测接受 thinking 参数)。
- * 所以"是否在本集合"不直接等于"是否支持 thinking"。
+ * **例外:thinking**。glm-5.1/glm-5.2、MiniMax-M3 与 qwen3.7-max/plus 虽在本集合(上述能力仍关),
+ * 但都是 thinking 模型 —— `thinking.ts` 的 modelSupportsThinking 对 isArkGlmModel/isMiniMaxM3Model/
+ * isOpencodeQwenModel 先判→true,单独放行 thinking(各端点实测接受 thinking 参数;qwen 2026-07-05
+ * 实测 enabled/disabled 语义均正确)。所以"是否在本集合"不直接等于"是否支持 thinking"。
  */
 export function isCapabilityZeroStaticModel(model: string): boolean {
-  return isMiniMaxM3Model(model) || isArkGlmModel(model)
+  return isMiniMaxM3Model(model) || isArkGlmModel(model) || isOpencodeQwenModel(model)
 }
 
 /**
@@ -50,6 +58,8 @@ export const STATIC_MODEL_CONTEXT_WINDOW: ReadonlyArray<{
   { matches: isMiniMaxM3Model, contextWindow: 512_000 },
   { matches: (m) => m.trim().toLowerCase() === 'glm-5.2', contextWindow: 1_000_000 },
   { matches: (m) => m.trim().toLowerCase() === 'glm-5.1', contextWindow: 200_000 },
+  // qwen3.7-max/plus 官方规格均 1M(max input 991.8k);两型号同窗,家族函数一条即可。
+  { matches: isOpencodeQwenModel, contextWindow: 1_000_000 },
 ]
 
 /** 命中静态模型 context 特判表 → 返回其 contextWindow;否则 undefined(由 caller 落默认)。 */

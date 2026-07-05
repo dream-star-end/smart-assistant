@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import {
   isArkGlmModel,
   isCapabilityZeroStaticModel,
+  isOpencodeQwenModel,
   getStaticModelContextWindow,
 } from "../staticKeyModels";
 
@@ -21,14 +22,27 @@ describe("isArkGlmModel", () => {
   });
 });
 
-describe("isCapabilityZeroStaticModel — minimax + ark(不含 deepseek)", () => {
-  test("MiniMax-M3 / glm-5.1 / glm-5.2 → true", () => {
+describe("isOpencodeQwenModel", () => {
+  test("精确匹配 qwen3.7-max + qwen3.7-plus,大小写/空白不敏感", () => {
+    expect(isOpencodeQwenModel("qwen3.7-max")).toBe(true);
+    expect(isOpencodeQwenModel("Qwen3.7-Max")).toBe(true);
+    expect(isOpencodeQwenModel("  qwen3.7-plus  ")).toBe(true);
+    expect(isOpencodeQwenModel("qwen3.6-plus")).toBe(false);
+    expect(isOpencodeQwenModel("qwen3.7")).toBe(false);
+    expect(isOpencodeQwenModel("qwen3.7-max-preview")).toBe(false);
+  });
+});
+
+describe("isCapabilityZeroStaticModel — minimax + ark + opencodego qwen(不含 deepseek)", () => {
+  test("MiniMax-M3 / glm-5.1 / glm-5.2 / qwen3.7-max/plus → true", () => {
     expect(isCapabilityZeroStaticModel("MiniMax-M3")).toBe(true);
     expect(isCapabilityZeroStaticModel("minimax-m3")).toBe(true);
     expect(isCapabilityZeroStaticModel("glm-5.1")).toBe(true);
     expect(isCapabilityZeroStaticModel("GLM-5.1")).toBe(true);
     expect(isCapabilityZeroStaticModel("glm-5.2")).toBe(true);
     expect(isCapabilityZeroStaticModel("GLM-5.2")).toBe(true);
+    expect(isCapabilityZeroStaticModel("qwen3.7-max")).toBe(true);
+    expect(isCapabilityZeroStaticModel("qwen3.7-plus")).toBe(true);
   });
   test("deepseek **不在**能力全关集(保留 effort=max 等默认路径能力)", () => {
     expect(isCapabilityZeroStaticModel("deepseek-v4-pro")).toBe(false);
@@ -41,12 +55,14 @@ describe("isCapabilityZeroStaticModel — minimax + ark(不含 deepseek)", () =>
 });
 
 describe("getStaticModelContextWindow", () => {
-  test("minimax=512k, ark glm-5.1=200k / glm-5.2=1M(per-model)", () => {
+  test("minimax=512k, ark glm-5.1=200k / glm-5.2=1M, opencodego qwen=1M(per-model)", () => {
     expect(getStaticModelContextWindow("MiniMax-M3")).toBe(512_000);
     expect(getStaticModelContextWindow("glm-5.1")).toBe(200_000);
     expect(getStaticModelContextWindow("GLM-5.1")).toBe(200_000);
     expect(getStaticModelContextWindow("glm-5.2")).toBe(1_000_000);
     expect(getStaticModelContextWindow("GLM-5.2")).toBe(1_000_000);
+    expect(getStaticModelContextWindow("qwen3.7-max")).toBe(1_000_000);
+    expect(getStaticModelContextWindow("qwen3.7-plus")).toBe(1_000_000);
   });
   test("deepseek 无特判 → undefined(由 caller 落 MODEL_CONTEXT_WINDOW_DEFAULT,等价现状)", () => {
     expect(getStaticModelContextWindow("deepseek-v4-pro")).toBeUndefined();

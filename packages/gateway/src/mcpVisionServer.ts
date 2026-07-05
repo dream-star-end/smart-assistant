@@ -67,7 +67,8 @@ export const OPENCLAUDE_VISION_TOOLS = [TOOL_NAME]
 /**
  * 是否给该 provider/model 注入 understand_image 工具。
  * **纯文本静态模型**(看不到图)启用;**原生多模态模型不启用**。
- *   - deepseek-* / glm-5.1 / glm-5.2(火山 ark,纯文本)→ true
+ *   - deepseek-* / glm-5.1 / glm-5.2(火山 ark,纯文本)/ qwen3.7-max/plus(OpenCode Go,
+ *     纯文本 —— 2026-07-05 实测 image block 400)→ true
  *   - MiniMax-M3(原生多模态,supportsVision)→ **false**(它直接识图,不需要工具,也作为本工具 backend)
  * 显式 allowlist(不用 startsWith('glm-') 等宽匹配,避免误伤未来 glm 多模态模型;与 protocol
  * staticKeyProviders supportsVision 口径一致 —— 新增纯文本静态模型时两处同步)。
@@ -78,6 +79,7 @@ export function shouldEnableOpenClaudeVision(provider?: string, model?: string):
   const m = model?.trim().toLowerCase()
   if (p === 'deepseek' || m?.startsWith('deepseek-')) return true
   if (m === 'glm-5.1' || m === 'glm-5.2') return true
+  if (m === 'qwen3.7-max' || m === 'qwen3.7-plus') return true
 
   const optInProviders = (process.env.OPENCLAUDE_VISION_MCP_PROVIDERS ?? '')
     .split(',')

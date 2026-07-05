@@ -82,6 +82,9 @@ describe('SubprocessRunner.model getter / setModel', () => {
     // glm-5.1/glm-5.2 火山方舟 Ark Coding Plan anthropic-compatible 上游(glm-5.2=平台默认 2026-06-17):
     assert.ok(ALLOWED_INBOUND_MODELS.has('glm-5.1'))
     assert.ok(ALLOWED_INBOUND_MODELS.has('glm-5.2'))
+    // qwen3.7-max/plus OpenCode Go anthropic-compatible 上游(2026-07-05):
+    assert.ok(ALLOWED_INBOUND_MODELS.has('qwen3.7-max'))
+    assert.ok(ALLOWED_INBOUND_MODELS.has('qwen3.7-plus'))
   })
 
   it('ALLOWED_INBOUND_MODELS 全面下线 Claude 官方模型(v3+v5)', () => {

@@ -1,6 +1,10 @@
 /**
- * fail-closed guard 单测:平台默认模型(2026-06-16 起 MiniMax-M3 / minimax)缺 key 时 master 装配
- * internal proxy 必须 loud-fail(throw),而非全员默认模型静默 503。(Codex plan review #4)
+ * fail-closed guard 单测:平台默认模型(2026-06-17 起 glm-5.2 / ark;曾为 MiniMax-M3)缺 key 时
+ * master 装配 internal proxy 必须 loud-fail(throw),而非全员默认模型静默 503。(Codex plan review #4)
+ *
+ * 2026-07-05 修正:本测试曾滞留在 MiniMax-M3 时代的断言,与 platformDefaults 权威(glm-5.2)
+ * 漂移导致常年红。改为**跟随权威推导**:从 PLATFORM_DEFAULT_MODEL → provider → keyConfigField
+ * 动态取字段名断言,未来再切默认模型时本测试自动跟随,不再硬编码某一家。
  *
  * 跑法: npx tsx --test packages/commercial/src/__tests__/staticProviderGuard.test.ts
  */
@@ -9,38 +13,51 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
-import { assertPlatformDefaultModelConfigured } from "../http/proxy/staticProviderMeta.js";
+import {
+  assertPlatformDefaultModelConfigured,
+  STATIC_PROVIDER_META,
+} from "../http/proxy/staticProviderMeta.js";
 import { PLATFORM_DEFAULT_MODEL } from "../platformDefaults.js";
 import { findRouteProviderForModel } from "@openclaude/protocol";
 
+// 跟随权威推导默认模型的 provider 与 key 字段(当前 glm-5.2 → ark → ARK_CODING_PLAN_KEY)。
+const defaultProvider = findRouteProviderForModel(PLATFORM_DEFAULT_MODEL);
+const defaultMeta = defaultProvider ? STATIC_PROVIDER_META[defaultProvider.id] : undefined;
+const defaultKeyField = defaultMeta?.keyConfigField;
+
 describe("assertPlatformDefaultModelConfigured", () => {
-  test("默认模型(MiniMax-M3)路由到 minimax,缺 MINIMAX_TOKEN_PLAN_KEY → throw", () => {
+  test("默认模型路由到静态 provider,缺其 key → throw(报文含字段名)", () => {
+    assert.ok(defaultKeyField, "默认模型必须命中静态 provider(下方不变量测试详述)");
+    const keyFieldRe = new RegExp(defaultKeyField!);
     assert.throws(
       () => assertPlatformDefaultModelConfigured({}),
-      /MINIMAX_TOKEN_PLAN_KEY/,
-      "缺 minimax key 必须 throw",
+      keyFieldRe,
+      `缺 ${defaultKeyField} 必须 throw`,
     );
     assert.throws(
-      () => assertPlatformDefaultModelConfigured({ MINIMAX_TOKEN_PLAN_KEY: "   " }),
-      /MINIMAX_TOKEN_PLAN_KEY/,
+      () => assertPlatformDefaultModelConfigured({ [defaultKeyField!]: "   " }),
+      keyFieldRe,
       "空白 key 视为未配置,必须 throw",
     );
   });
 
-  test("默认模型 minimax key 已配 → 不 throw(无关 provider 的 key 不影响)", () => {
+  test("默认模型自家 key 已配 → 不 throw;只配别家 key → 仍 throw", () => {
     assert.doesNotThrow(() =>
-      assertPlatformDefaultModelConfigured({ MINIMAX_TOKEN_PLAN_KEY: "mm-rotated-key" }),
+      assertPlatformDefaultModelConfigured({ [defaultKeyField!]: "rotated-key" }),
     );
-    // 注入别家 key 但缺 minimax → 仍 throw(只认默认模型自己 provider 的 key)
+    // 注入一个"非默认模型 provider"的 key,但缺默认模型自家 key → 仍 throw。
+    const otherField =
+      defaultKeyField === "DEEPSEEK_API_KEY" ? "ARK_CODING_PLAN_KEY" : "DEEPSEEK_API_KEY";
     assert.throws(() =>
-      assertPlatformDefaultModelConfigured({ ARK_CODING_PLAN_KEY: "ark" }),
+      assertPlatformDefaultModelConfigured({ [otherField]: "other-provider-key" }),
     );
   });
 
   test("不变量:PLATFORM_DEFAULT_MODEL 当前确实路由到一个静态 provider(否则 guard 形同虚设)", () => {
     const p = findRouteProviderForModel(PLATFORM_DEFAULT_MODEL);
     assert.ok(p, `PLATFORM_DEFAULT_MODEL=${PLATFORM_DEFAULT_MODEL} 应命中静态 provider`);
-    assert.equal(p?.id, "minimax");
+    // 2026-06-17 起平台默认 = glm-5.2 → ark(此前 MiniMax-M3 时代本行曾硬编码 minimax 导致漂移红)。
+    assert.equal(p?.id, "ark");
   });
 
   // 结构守护(Codex diff review Blocker):guard 调用必须在 internal-proxy 装配的 try **之前**,

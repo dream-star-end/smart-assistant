@@ -1,7 +1,8 @@
 // 静态 key 文本 provider 注册表 —— 平台持有静态 API key、按 model id 路由到第三方
 // Anthropic 兼容上游(不占 OAuth 账号池)的 provider 的单一权威声明。
 //
-// 当前成员：DeepSeek、MiniMax、火山方舟 Ark(glm-5.2 主力 + glm-5.1 兼容存量)。
+// 当前成员：DeepSeek、MiniMax、火山方舟 Ark(glm-5.2 主力 + glm-5.1 兼容存量)、
+// OpenCode Go(Zen 网关 Go 档,qwen3.7-max/plus,2026-07-05)。
 //
 // 设计边界(只放 commercial + gateway 都消费的"路由元数据"纯数据/纯函数)：
 //   - **不**含 commercial 语义(key 的 config 字段名 / 503 错误码 / metric label) —— 那些在
@@ -16,7 +17,7 @@
 //   route 匹配=大小写敏感前缀家族 / inbound 白名单=2 个精确字面量 / capability=2 个精确字面量(在 CCB) /
 //   pricing canonicalize=不特判(原样)。因此每个关注点是独立字段，不可统一。
 
-export type StaticProviderId = 'deepseek' | 'minimax' | 'ark'
+export type StaticProviderId = 'deepseek' | 'minimax' | 'ark' | 'opencodego'
 
 /**
  * 静态 provider key 解析表:provider id → 该 provider 的静态 key。
@@ -29,6 +30,13 @@ export interface StaticKeyProviderSpec {
   readonly id: StaticProviderId
   /** 上游 Anthropic 兼容 /v1/messages endpoint */
   readonly upstreamEndpoint: string
+  /**
+   * 上游鉴权头风格。缺省(undefined)= bearer → `Authorization: Bearer <key>`(deepseek/minimax/ark
+   * 三家现状,逐字节不变)。'x-api-key' → `x-api-key: <key>`(Anthropic 原生风格)。
+   * opencodego 必须 'x-api-key':其 /messages 实测(2026-07-05)只认 x-api-key,
+   * Authorization Bearer 返回 401 "Missing API key"。upstream.ts makeStaticKeyUpstream 按本字段注入。
+   */
+  readonly authScheme?: 'bearer' | 'x-api-key'
   /**
    * commercial master proxy 路由 gate。命中 → 切到本 provider 静态 key 上游。
    *   - deepseek: **大小写敏感** `modelId.startsWith('deepseek-')`(与 shared.ts 现状逐字节一致)
@@ -156,12 +164,54 @@ const ARK: StaticKeyProviderSpec = {
   maxInputTokens: 1_000_000,
 }
 
-export const STATIC_KEY_PROVIDERS: readonly StaticKeyProviderSpec[] = [DEEPSEEK, MINIMAX, ARK]
+const OPENCODE_GO: StaticKeyProviderSpec = {
+  id: 'opencodego',
+  // OpenCode Zen「Go 计划」网关(https://opencode.ai/docs/go/)—— 订阅制静态 key(Go 订阅
+  // $10/月,配额 5h/$12、周/$30、月/$60,官方允许 opencode 客户端之外直接 API 调用)。
+  // 2026-07-05 接入 v5 缺口的两个 Qwen 旗舰。Go 档还有 kimi/mimo 家族,但其 Anthropic 兼容层
+  // 实测整族 400 "Upstream request failed"(同模型走 OpenAI /chat/completions 正常 → 网关
+  // 转换层问题),等 opencode 修好后追加 inboundModelIds + 定价行即可,不需要新机制。
+  // 实测(2026-07-05,qwen3.7-max/plus 直连探针):非流式/SSE 流式/tool_use/tool_result 回环/
+  // system+cache_control/stop_sequences 全通;usage 含 cache_read/cache_creation 字段。
+  upstreamEndpoint: 'https://opencode.ai/zen/go/v1/messages',
+  // /messages 只认 x-api-key(Bearer→401 Missing API key,2026-07-05 实测;其 /models 反而
+  // 认 Bearer —— 端点风格不一致是 opencode 侧现状,以 /messages 为准)。
+  authScheme: 'x-api-key',
+  matchesRoute(modelId) {
+    const m = modelId.toLowerCase()
+    return m === 'qwen3.7-max' || m === 'qwen3.7-plus'
+  },
+  inboundModelIds: ['qwen3.7-max', 'qwen3.7-plus'],
+  canonicalizeForPricing(modelId) {
+    const m = modelId.toLowerCase()
+    return m === 'qwen3.7-max' ? 'qwen3.7-max' : m === 'qwen3.7-plus' ? 'qwen3.7-plus' : null
+  },
+  stripHeaders: ['anthropic-beta'],
+  // **保留 thinking**:qwen3.7 是思考模型,实测(2026-07-05)网关接受 thinking:{type:enabled,
+  // budget_tokens},且 {type:disabled} 真的关掉思考(返回直答,output_tokens=1)。
+  // 三个 firstParty-only 字段今日实测网关容忍,但第三方兼容层的容忍面不作承诺,按 minimax
+  // 先例仍 strip(CCB 侧 capabilityZero 不生成是根治,这里是兜底)。
+  stripBodyFields: ['output_config', 'context_management', 'service_tier'],
+  // qwen3.7-max/plus 官方规格均 1M 窗口(max input 991.8k / max output 65.5k)。
+  // max_tokens 超限网关自钳制(实测 100k 照收不 400),无需输出 cap 机制。
+  maxInputTokens: 1_000_000,
+  // 实测 image block → 400 InvalidParameter "Unexpected item type in content" → 纯文本接入,
+  // master strip 图,understand_image 工具兜底(mcpVisionServer/promptSlots 已同步登记)。
+  supportsVision: false,
+}
+
+export const STATIC_KEY_PROVIDERS: readonly StaticKeyProviderSpec[] = [
+  DEEPSEEK,
+  MINIMAX,
+  ARK,
+  OPENCODE_GO,
+]
 
 const BY_ID: Record<StaticProviderId, StaticKeyProviderSpec> = {
   deepseek: DEEPSEEK,
   minimax: MINIMAX,
   ark: ARK,
+  opencodego: OPENCODE_GO,
 }
 
 /** commercial proxy 路由判定：返回命中的 provider(用 matchesRoute)，否则 undefined(走 OAuth)。 */
@@ -173,7 +223,7 @@ export function getStaticProvider(id: StaticProviderId): StaticKeyProviderSpec {
   return BY_ID[id]
 }
 
-/** gateway inbound 白名单：所有静态 provider 的精确字面量(deepseek 2 项 + MiniMax-M3 + glm-5.1 + glm-5.2)。 */
+/** gateway inbound 白名单：所有静态 provider 的精确字面量(deepseek 2 项 + MiniMax-M3 + glm-5.1 + glm-5.2 + qwen3.7-max/plus)。 */
 export const STATIC_KEY_INBOUND_MODEL_IDS: readonly string[] = STATIC_KEY_PROVIDERS.flatMap(
   (p) => [...p.inboundModelIds],
 )

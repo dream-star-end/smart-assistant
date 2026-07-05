@@ -7,7 +7,7 @@ import { get3PModelCapabilityOverride } from './model/modelSupportOverrides.js'
 import { getAPIProvider } from './model/providers.js'
 import { getSettingsWithErrors } from './settings/settings.js'
 import { resolveAntModel } from './model/antModels.js'
-import { isArkGlmModel, isCapabilityZeroStaticModel } from './model/staticKeyModels.js'
+import { isArkGlmModel, isCapabilityZeroStaticModel, isOpencodeQwenModel } from './model/staticKeyModels.js'
 import { isMiniMaxM3Model } from './model/minimax.js'
 
 export type ThinkingConfig =
@@ -103,6 +103,13 @@ export function modelSupportsThinking(model: string): boolean {
   // 接受 thinking:{type:enabled,budget_tokens} 并返回带 signature 的 thinking block(同 glm-5.1 走
   // enabled+budget 分支)。故先判,放行 thinking。master 侧 minimax stripBodyFields 已去掉 'thinking'。
   if (isMiniMaxM3Model(model)) {
+    return true
+  }
+  // qwen3.7-max/plus(OpenCode Go)是 thinking 模型 —— 同在 isCapabilityZeroStaticModel 集合
+  // (betas/effort/adaptive-thinking 仍全关),thinking 例外放行:2026-07-05 直连验证
+  // https://opencode.ai/zen/go/v1/messages 接受 thinking:{type:enabled,budget_tokens},且
+  // {type:disabled} 真关思考(直答,output_tokens=1)。同走 enabled+budget 分支。
+  if (isOpencodeQwenModel(model)) {
     return true
   }
   if (isCapabilityZeroStaticModel(model)) {

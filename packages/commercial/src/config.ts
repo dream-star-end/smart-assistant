@@ -443,6 +443,18 @@ export const commercialConfigSchema = z
      */
     DEEPSEEK_API_KEY: z.string().trim().min(1).max(256).optional(),
     /**
+     * OpenCode Zen「Go 计划」API key(2026-07-05 接入,qwen3.7-max/plus)。
+     * - 配置时 anthropicProxy 收到 model 命中 opencodego(qwen3.7-max/plus)的请求 → forward
+     *   到 https://opencode.ai/zen/go/v1/messages,鉴权 `x-api-key: <OPENCODE_GO_API_KEY>`
+     *   (该端点不认 Authorization Bearer);不占 claude_accounts 池
+     * - 未配置 → 503 OPENCODEGO_NOT_CONFIGURED + reject 'opencodego_config'
+     * - **配额是个人订阅规格**(5h/$12、周/$30、月/$60,全 v5 用户共享)。打穿后上游 429/4xx,
+     *   turn 零输出走免单兜底,不误扣用户积分;不适合作平台默认模型上游。
+     * - key 只在 master/egress 进程 env 存在,**绝不注入用户容器**;不入 git,由 systemd
+     *   EnvironmentFile 注入(v3 base commercial.env,v5 经 deploy-v5.sh 继承)。
+     */
+    OPENCODE_GO_API_KEY: z.string().trim().min(1).max(256).optional(),
+    /**
      * Deepgram Nova-3 streaming ASR key for browser voice input.
      *
      * - 只在 master-side `/ws/voice-transcribe` 使用,前端永远不见 key。

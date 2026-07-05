@@ -212,7 +212,10 @@ export async function buildAgentsSlot(ctx: PromptSlotContext): Promise<PromptSlo
     (provider === 'deepseek' ||
       ctx.model?.startsWith('deepseek-') ||
       ctx.model === 'glm-5.1' ||
-      ctx.model === 'glm-5.2')
+      ctx.model === 'glm-5.2' ||
+      // qwen3.7-max/plus(OpenCode Go)纯文本接入,与 mcpVisionServer allowlist 同步(2026-07-05)。
+      ctx.model === 'qwen3.7-max' ||
+      ctx.model === 'qwen3.7-plus')
   ) {
     lines.push('')
     lines.push('## 图片理解提示')
