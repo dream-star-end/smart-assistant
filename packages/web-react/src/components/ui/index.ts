@@ -18,6 +18,7 @@ export {
 export { IconButton, iconButtonVariants, type IconButtonProps } from "./IconButton";
 export { Input } from "./Input";
 export { Modal } from "./Modal";
+export { Popover, PopoverContent, PopoverTrigger } from "./Popover";
 export { EmptyState, PanelHeader } from "./Panel";
 export { Progress } from "./Progress";
 export { Sheet } from "./Sheet";

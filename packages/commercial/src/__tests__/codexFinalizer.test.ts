@@ -362,7 +362,7 @@ describe("makeCodexFinalizer / settleStatus selection", () => {
       q.sql.trim().startsWith("INSERT INTO usage_records"),
     );
     assert.ok(ins, "INSERT INTO usage_records expected");
-    const status = ins.params?.[11]; // 第 12 个参数(status,见 SQL)
+    const status = ins.params?.[14]; // 第 15 个参数(status,见 SQL;0104 归因列插入后位移)
     assert.equal(status, "success");
   });
 
@@ -376,7 +376,7 @@ describe("makeCodexFinalizer / settleStatus selection", () => {
       q.sql.trim().startsWith("INSERT INTO usage_records"),
     );
     assert.ok(ins);
-    assert.equal(ins.params?.[11], "success");
+    assert.equal(ins.params?.[14], "success");
     // 0 cost 不走 ledger
     assert.ok(
       !poolCtrl.queries.some((q) =>
@@ -395,9 +395,9 @@ describe("makeCodexFinalizer / settleStatus selection", () => {
       q.sql.trim().startsWith("INSERT INTO usage_records"),
     );
     assert.ok(ins);
-    assert.equal(ins.params?.[11], "error");
+    assert.equal(ins.params?.[14], "error");
     // snapshotJson 应含 codex_status + codex_error_reason
-    const snapshotJson = ins.params?.[7] as string;
+    const snapshotJson = ins.params?.[8] as string;
     const snap = JSON.parse(snapshotJson);
     assert.equal(snap.codex_status, "error");
     assert.equal(snap.codex_error_reason, "container_crashed");
@@ -456,10 +456,10 @@ describe("makeCodexFinalizer / usage field plumbing", () => {
     //   $1 user_id, $2 account_id, $3 model,
     //   $4 input, $5 output, $6 cache_read, $7 cache_write,
     //   $8 snapshot, $9 cost, $10 session, $11 request, $12 status
-    assert.equal(ins.params?.[3], "11");
-    assert.equal(ins.params?.[4], "22");
-    assert.equal(ins.params?.[5], "33");
-    assert.equal(ins.params?.[6], "44");
+    assert.equal(ins.params?.[4], "11");
+    assert.equal(ins.params?.[5], "22");
+    assert.equal(ins.params?.[6], "33");
+    assert.equal(ins.params?.[7], "44");
   });
 });
 
@@ -495,7 +495,7 @@ describe("makeCodexFinalizer / v5 计费红线(M1b)", () => {
     );
     assert.ok(ins);
     // $2 = account_id(参数下标 1)
-    assert.equal(ins.params?.[1], null, "codex 记账 account_id 必须是 NULL");
+    assert.equal(ins.params?.[2], null, "codex 记账 account_id 必须是 NULL");
   });
 
   test("usage_records.session_id = engineSessionId(退款窗口口径)", async () => {
@@ -507,8 +507,8 @@ describe("makeCodexFinalizer / v5 计费红线(M1b)", () => {
     );
     assert.ok(ins);
     // $10 = session_id(参数下标 9)
-    assert.equal(ins.params?.[9], ctx.engineSessionId);
-    assert.match(String(ins.params?.[9]), ENGINE_SESSION_ID_RE);
+    assert.equal(ins.params?.[10], ctx.engineSessionId);
+    assert.match(String(ins.params?.[10]), ENGINE_SESSION_ID_RE);
   });
 
   test("零输出免单:success + output=0 但本有成本 → cost=0 落库,不 debit,snapshot 记 waived", async () => {
@@ -525,9 +525,9 @@ describe("makeCodexFinalizer / v5 计费红线(M1b)", () => {
     );
     assert.ok(ins);
     // $9 = cost_credits(参数下标 8)落 0;$12 = status 仍 success(audit 痕)。
-    assert.equal(ins.params?.[8], "0");
-    assert.equal(ins.params?.[11], "success");
-    const snap = JSON.parse(ins.params?.[7] as string);
+    assert.equal(ins.params?.[9], "0");
+    assert.equal(ins.params?.[14], "success");
+    const snap = JSON.parse(ins.params?.[8] as string);
     assert.equal(snap.waived, "no_output");
     assert.ok(BigInt(snap.wouldHaveCharged) > 0n, "audit must keep would-have-charged amount");
     // 免单 → 不写 credit_ledger
@@ -547,7 +547,7 @@ describe("makeCodexFinalizer / v5 计费红线(M1b)", () => {
     assert.ok(ins);
     // cost>0 → settleStatus=success(有正 token 就 charge 的既有语义),但零输出免单
     // 覆盖其上 → cost=0。error 状态只落 snapshot。
-    const snap = JSON.parse(ins.params?.[7] as string);
+    const snap = JSON.parse(ins.params?.[8] as string);
     assert.equal(snap.codex_status, "error");
     assert.ok(
       !poolCtrl.queries.some((q) => q.sql.trim().startsWith("INSERT INTO credit_ledger")),

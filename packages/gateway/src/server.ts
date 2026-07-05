@@ -777,6 +777,37 @@ export class HiddenDelegateGuard {
   }
 }
 
+/**
+ * delegate 计费归因 — 解析"父**客户端**会话 id"(usage_records.parent_session_id
+ * 的落库值)。优先级(能拿到 web-* 就绝不落内部键):
+ *
+ *   1. `progressPeerId`:父会话在内存且是 webchat → 其 peerId 即客户端会话 id
+ *      (web-*,userChatBridge sessionKey 模板 `agent:<aid>:webchat:dm:<id>` 的
+ *      第 4 段来源)。
+ *   2. `parentRepoSessionId`:嵌套 delegate(父是 delegate 会话)→ 其
+ *      repoSessionId 在创建时继承自根 webchat 会话的 peerId,仍是 web-*。
+ *   3. parentSessionKey 形如 webchat 键 → 直接截取第 4 段(父会话不在内存 ——
+ *      如 gateway 重启后 —— 的兜底,不依赖 session map)。
+ *   4. 原样返回 parentSessionKey(容器内部会话键,如 cron/webhook 父或更老格式;
+ *      master 侧原样落库,映射链依赖本注释)。
+ *   5. 都拿不到 → undefined(usage_records.parent_session_id 落 NULL,行上仍有
+ *      mode='delegate' + delegate_agent_id 可归因到"某次委派")。
+ *
+ * 纯函数,便于单测;调用点唯一(handleDelegateTask)。
+ */
+export function resolveDelegateParentClientSessionId(args: {
+  progressPeerId?: string
+  parentRepoSessionId?: string
+  parentSessionKey?: unknown
+}): string | undefined {
+  if (args.progressPeerId) return args.progressPeerId
+  if (args.parentRepoSessionId) return args.parentRepoSessionId
+  const key = args.parentSessionKey
+  if (typeof key !== 'string' || !key) return undefined
+  const webchat = /^agent:[^:]+:webchat:dm:(.+)$/.exec(key)
+  return webchat?.[1] ?? key
+}
+
 export class Gateway {
   private wss!: WebSocketServer
   private httpServer!: ReturnType<typeof createServer>
@@ -6336,6 +6367,16 @@ export class Gateway {
       parentSessionKey: parsed.parentSessionKey,
       sourceAgent,
     })
+    // delegate 计费归因:父**客户端**会话 id(web-*)优先,拿不到才落容器内部
+    // parentSessionKey(解析链见 resolveDelegateParentClientSessionId JSDoc)。
+    // 随 usageAttribution → runner CLAUDE_CODE_EXTRA_METADATA env → master 计费点
+    // 落 usage_records.mode='delegate' / parent_session_id / delegate_agent_id,
+    // hidden-reviewer 与嵌套 delegate 同路径打标。
+    const parentClientSessionId = resolveDelegateParentClientSessionId({
+      progressPeerId: progressTarget?.peerId,
+      parentRepoSessionId: delegateParent?.repoSessionId,
+      parentSessionKey: parsed.parentSessionKey,
+    })
 
     const session = await this.sessions.getOrCreate({
       sessionKey,
@@ -6345,6 +6386,11 @@ export class Gateway {
       repoSessionId: progressTarget?.peerId ?? delegateParent?.repoSessionId,
       title: `[delegate] ${goal.slice(0, 40)}`,
       delegationDepth: depth + 1,
+      usageAttribution: {
+        mode: 'delegate',
+        delegateAgentId: targetAgentId,
+        ...(parentClientSessionId ? { parentSessionId: parentClientSessionId } : {}),
+      },
     })
 
     const progressRunId = `dlg-${Date.now().toString(36)}-${randomBytes(4).toString('hex')}`

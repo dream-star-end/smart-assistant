@@ -1,0 +1,144 @@
+name: Aurora v5 CI
+
+# v5(feat/v5-aurora-rewrite)回归自动化。见 docs/V5_CI.md。
+# 与 v3 的 .github/workflows/ci.yml(fix/v3-test-gate 分支)同源:
+# 依赖安装(npm ci + setup-node cache)与 PG/Redis service 配置照抄 v3。
+
+on:
+  pull_request:
+    branches: [feat/v5-aurora-rewrite]
+  push:
+    branches: [feat/v5-aurora-rewrite]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: v5-ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  suite:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ matrix.timeout }}
+    strategy:
+      # 关闭 fail-fast:一个套件失败不取消其余,要看全量结果
+      fail-fast: false
+      matrix:
+        include:
+          - name: typecheck
+            run: npm run typecheck
+            timeout: 20
+          - name: gateway
+            run: npm run test:gateway
+            timeout: 25
+          - name: storage
+            run: npm run test:storage
+            timeout: 15
+          - name: web-react
+            run: npm run test:web-react
+            timeout: 25
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run ${{ matrix.name }}
+        run: ${{ matrix.run }}
+
+  commercial-unit:
+    name: commercial-unit (known-failures diff gate)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    # PG/Redis service 配置照抄 v3 ci.yml(fix/v3-test-gate):
+    # 商业 unit 套件里有 DB 门控测试(REQUIRE_TEST_DB / CI=true 时缺 DB 直接 throw,
+    # 防静默 skip),必须起同款 fixture。
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: openclaude_test
+        ports:
+          - 55432:5432
+        options: >-
+          --health-cmd "pg_isready -U test -d openclaude_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 12
+      redis:
+        image: redis:7
+        ports:
+          - 56379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 12
+
+    env:
+      CI: 'true'
+      REQUIRE_TEST_DB: '1'
+      TEST_DATABASE_URL: postgres://test:test@127.0.0.1:55432/openclaude_test
+      TEST_REDIS_URL: redis://127.0.0.1:56379/0
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Wait for test fixtures
+        shell: bash
+        run: |
+          set -euo pipefail
+          for i in {1..30}; do
+            if docker exec '${{ job.services.postgres.id }}' pg_isready -U test -d openclaude_test; then
+              break
+            fi
+            if [[ "$i" == 30 ]]; then
+              echo 'Postgres did not become ready in time' >&2
+              exit 1
+            fi
+            sleep 2
+          done
+          for i in {1..30}; do
+            if docker exec '${{ job.services.redis.id }}' redis-cli ping; then
+              break
+            fi
+            if [[ "$i" == 30 ]]; then
+              echo 'Redis did not become ready in time' >&2
+              exit 1
+            fi
+            sleep 2
+          done
+
+      - name: Run commercial unit tests (baseline diff gate)
+        run: npm run test:commercial:unit:gate
+
+      - name: Upload TAP output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: commercial-unit-tap
+          path: commercial-unit.tap
+          retention-days: 14

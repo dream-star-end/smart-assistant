@@ -70,7 +70,8 @@ import {
   enforceFieldByteBudgets,
   estimateInputTokens,
   estimateMaxCostBothSides,
-  extractSessionId,
+  extractUsageAttribution,
+  stripUsageAttributionKeys,
   readBoundedJson,
   sendJsonError,
   stripNonTextContentBlocks,
@@ -652,10 +653,17 @@ export function makeAnthropicProxyHandler(
 
       // 9) 装 finalizer(从此 release 唯一调用点 = finalize)
       //
-      // sessionId 由 extractSessionId(body.metadata) 算一次,既作为 finalize 配置
-      // 也作为 RoundTripCtx.sessionId 传给 core.ts —— 单一权威源,避免后续广播
-      // 与 finalize ledger 提取出不同结果(Codex plan v3 修订 J 锁定)。
-      const sessionId = extractSessionId(body.metadata);
+      // 归因四元组(sessionId/mode/parentSessionId/delegateAgentId)由
+      // extractUsageAttribution(body.metadata) 算一次,sessionId 既作为 finalize
+      // 配置也作为 RoundTripCtx.sessionId 传给 core.ts —— 单一权威源,避免后续
+      // 广播与 finalize ledger 提取出不同结果(Codex plan v3 修订 J 锁定)。
+      const attribution = extractUsageAttribution(body.metadata);
+      const sessionId = attribution.sessionId;
+      // 归因键已提取完毕 → 从 user_id JSON 剥掉 oc_ 内部键再转发上游
+      // (内部会话拓扑不出代理;普通 chat 请求无 oc_ 键,原串零改写)。
+      if (body.metadata?.user_id !== undefined) {
+        body.metadata.user_id = stripUsageAttributionKeys(body.metadata.user_id);
+      }
       const finalize = makeFinalizer(
         {
           pgPool: deps.pgPool,
@@ -678,6 +686,11 @@ export function makeAnthropicProxyHandler(
           preCheckReservation: pre.reservation,
           log: userLog,
           sessionId,
+          // delegate 子会话计费归因(mode='delegate' + 父客户端会话 + 目标 agent);
+          // 普通 chat 恒 ('chat', null, null),settle 落库行为与旧版一致。
+          mode: attribution.mode,
+          parentSessionId: attribution.parentSessionId,
+          delegateAgentId: attribution.delegateAgentId,
         },
       );
 

@@ -1,0 +1,12 @@
+# v5 高频探活 timer —— 每 2 分钟触发 openclaude-v5-monitor.service。
+# Persistent=false:探活是即时性检查,停机期间漏掉的轮次没有补跑意义。
+[Unit]
+Description=Run OpenClaude v5 monitor every 2 minutes
+
+[Timer]
+OnCalendar=*:0/2
+AccuracySec=15s
+Persistent=false
+
+[Install]
+WantedBy=timers.target

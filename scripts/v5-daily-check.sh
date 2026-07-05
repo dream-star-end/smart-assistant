@@ -1,0 +1,190 @@
+#!/usr/bin/env bash
+# v5 监控告警最小集 —— 日检 + 日报(roadmap P0.3)
+#
+# 干啥(简单粗暴,ops 极简):每天 09:00 北京时间(openclaude-v5-daily.timer)跑:
+#   1. 计费突增:昨日(北京时间自然日)单用户 credits 消耗 > 该用户前 7 日日均 ×3
+#      且绝对值 >2000 → 告警(共享 PG usage_records,status='success' 口径)
+#   2. 免单率:昨日(零输出免单 + turn 级冲正退款)占成功计费笔数比 >20% → 告警
+#        - 零输出免单:usage_records status='success' AND cost_credits=0 AND
+#          output_tokens=0 AND 有 input/cache tokens(proxyBilling waivedNoOutput
+#          落库形状;waive 标记只进日志不进库,这是库内能取到的最好近似,见文档局限)
+#        - 冲正退款:credit_ledger reason='refund' AND ref_type='usage_record'
+#          (billing/refund.ts 唯一写入形状),按 ref_id 去重计笔
+#   3. 日报正文(无告警也发):v5 近 24h 活跃用户数/会话数(sessions.db
+#      client_sessions)、昨日错误日志行数、昨日计费笔数/总消耗
+#
+# 告警通道:同 v5-monitor.sh(站内信首选 + monitor 日志兜底)。
+# 用法:bash scripts/v5-daily-check.sh [--dry-run]
+# 详见 docs/V5_MONITORING.md。
+
+set -uo pipefail
+
+# ───────────────────────────────────────────────
+# 常量(env 可覆盖 —— 仅为本机 mock 测试留口)
+# ───────────────────────────────────────────────
+# BOSS_UID 依据同 v5-monitor.sh:users.id=1(1193355375@qq.com,最早注册的 admin)。
+BOSS_UID="${V5DAY_BOSS_UID:-1}"
+
+ENV_FILE="${V5DAY_ENV_FILE:-/etc/openclaude/commercial-v5.env}"
+LOG_FILE="${V5DAY_LOG_FILE:-/var/log/openclaude-v5-monitor.log}"
+SESSIONS_DB="${V5DAY_SESSIONS_DB:-/root/.openclaude-v5/sessions.db}"
+V5_LOG="${V5DAY_V5_LOG:-/var/log/openclaude-v5.log}"        # logrotate 每天 00:00(UTC)轮转
+V5_LOG_YDAY="${V5DAY_V5_LOG_YDAY:-/var/log/openclaude-v5.log.1}"
+
+SPIKE_ABS_MIN=2000     # 计费突增:昨日消耗绝对值下限(credits)
+SPIKE_MULT=3           # 计费突增:昨日消耗 > 前 7 日日均 × 此倍数
+WAIVE_PCT_MAX=20       # 免单率上限(%)
+WAIVE_MIN_SAMPLES=10   # 昨日成功笔数低于此值不算免单率(小样本防误报,如 1/2=50%)
+
+DRY_RUN=0
+[ "${1:-}" = "--dry-run" ] && DRY_RUN=1
+
+ts() { TZ=Asia/Shanghai date '+%F %T'; }
+log() { if [ "$DRY_RUN" = 1 ]; then echo "[dry-run] $*"; else echo "$(ts) $*" >> "$LOG_FILE"; fi; }
+
+REPORT_DATE="$(TZ=Asia/Shanghai date -d yesterday +%F)"     # 日报覆盖的自然日(北京时间)
+DBURL="$(grep '^DATABASE_URL=' "$ENV_FILE" 2>/dev/null | head -1 | cut -d= -f2-)"
+
+ALERTS=()   # 告警行(有则 level=warning)
+INFOS=()    # 日报正文行
+
+# ───────────────────────────────────────────────
+# 1. 计费突增(昨日 vs 前 7 日日均;北京时间自然日边界,索引友好)
+# ───────────────────────────────────────────────
+run_billing_checks() {
+  if [ -z "$DBURL" ]; then
+    ALERTS+=("日检取数失败:读不到 DATABASE_URL($ENV_FILE)"); return
+  fi
+  local spikes
+  spikes="$(psql "$DBURL" -At -F'|' -v ON_ERROR_STOP=1 \
+      -v abs_min="$SPIKE_ABS_MIN" -v mult="$SPIKE_MULT" <<'SQL' 2>&1
+WITH b AS (
+  SELECT (date_trunc('day', now() AT TIME ZONE 'Asia/Shanghai') - interval '1 day') AT TIME ZONE 'Asia/Shanghai' AS y0,
+         date_trunc('day', now() AT TIME ZONE 'Asia/Shanghai') AT TIME ZONE 'Asia/Shanghai' AS y1
+), yday AS (
+  SELECT ur.user_id, SUM(ur.cost_credits) AS spent
+    FROM usage_records ur, b
+   WHERE ur.status = 'success' AND ur.created_at >= b.y0 AND ur.created_at < b.y1
+   GROUP BY ur.user_id
+), prior AS (
+  SELECT ur.user_id, SUM(ur.cost_credits) / 7.0 AS daily_avg
+    FROM usage_records ur, b
+   WHERE ur.status = 'success' AND ur.created_at >= b.y0 - interval '7 days' AND ur.created_at < b.y0
+   GROUP BY ur.user_id
+)
+SELECT y.user_id, u.email, y.spent, COALESCE(p.daily_avg, 0)::bigint
+  FROM yday y JOIN users u ON u.id = y.user_id
+  LEFT JOIN prior p ON p.user_id = y.user_id
+ WHERE y.spent > :abs_min::bigint
+   AND y.spent::numeric > COALESCE(p.daily_avg, 0) * :mult::numeric
+ ORDER BY y.spent DESC;
+SQL
+  )" || { ALERTS+=("计费突增查询失败:$(echo "$spikes" | head -c 200)"); return; }
+  if [ -n "$spikes" ]; then
+    while IFS='|' read -r uid email spent avg; do
+      [ -z "$uid" ] && continue
+      ALERTS+=("计费突增:用户 ${uid}(${email})昨日消耗 ${spent} credits,前 7 日日均 ${avg}(阈值:>${SPIKE_ABS_MIN} 且 >均值×${SPIKE_MULT})")
+    done <<< "$spikes"
+  fi
+
+  # ── 2. 免单率 + 昨日计费总量(同一次取数) ──
+  local stats total waived refunded spent_total
+  stats="$(psql "$DBURL" -At -F'|' -v ON_ERROR_STOP=1 <<'SQL' 2>&1
+WITH b AS (
+  SELECT (date_trunc('day', now() AT TIME ZONE 'Asia/Shanghai') - interval '1 day') AT TIME ZONE 'Asia/Shanghai' AS y0,
+         date_trunc('day', now() AT TIME ZONE 'Asia/Shanghai') AT TIME ZONE 'Asia/Shanghai' AS y1
+)
+SELECT
+  (SELECT COUNT(*) FROM usage_records ur, b
+    WHERE ur.status = 'success' AND ur.created_at >= b.y0 AND ur.created_at < b.y1),
+  (SELECT COUNT(*) FROM usage_records ur, b
+    WHERE ur.status = 'success' AND ur.created_at >= b.y0 AND ur.created_at < b.y1
+      AND ur.cost_credits = 0 AND ur.output_tokens = 0
+      AND (ur.input_tokens > 0 OR ur.cache_read_tokens > 0 OR ur.cache_write_tokens > 0)),
+  (SELECT COUNT(DISTINCT cl.ref_id) FROM credit_ledger cl, b
+    WHERE cl.reason = 'refund' AND cl.ref_type = 'usage_record'
+      AND cl.created_at >= b.y0 AND cl.created_at < b.y1),
+  (SELECT COALESCE(SUM(ur.cost_credits), 0) FROM usage_records ur, b
+    WHERE ur.status = 'success' AND ur.created_at >= b.y0 AND ur.created_at < b.y1);
+SQL
+  )" || { ALERTS+=("免单率查询失败:$(echo "$stats" | head -c 200)"); return; }
+  IFS='|' read -r total waived refunded spent_total <<< "$stats"
+  case "$total" in ''|*[!0-9]*) ALERTS+=("免单率查询输出异常:$(echo "$stats" | head -c 200)"); return;; esac
+
+  INFOS+=("昨日计费:成功 ${total} 笔,总消耗 ${spent_total} credits(v3+v5 共库口径)")
+  INFOS+=("昨日免单:零输出免单 ${waived} 笔 + 冲正退款 ${refunded} 笔")
+  if [ "$total" -ge "$WAIVE_MIN_SAMPLES" ]; then
+    local pct
+    pct=$(( (waived + refunded) * 100 / total ))
+    INFOS+=("免单率 ${pct}%(阈值 ${WAIVE_PCT_MAX}%)")
+    if [ "$pct" -gt "$WAIVE_PCT_MAX" ]; then
+      ALERTS+=("免单率过高:昨日 ${pct}%((${waived}+${refunded})/${total}),说明上游 hang/超时面扩大或计费口径出问题")
+    fi
+  else
+    INFOS+=("免单率:样本不足(${total} < ${WAIVE_MIN_SAMPLES}),跳过判定")
+  fi
+}
+
+# ───────────────────────────────────────────────
+# 3. v5 活跃度 + 错误日志(日报正文)
+# ───────────────────────────────────────────────
+run_activity_stats() {
+  local row
+  if row="$(sqlite3 -readonly "$SESSIONS_DB" \
+      "SELECT COUNT(DISTINCT user_id) || '|' || COUNT(*) FROM client_sessions
+        WHERE deleted_at IS NULL
+          AND last_at >= (CAST(strftime('%s','now') AS INTEGER) - 86400) * 1000;" 2>&1)"; then
+    INFOS+=("v5 近 24h:活跃用户 ${row%%|*},活跃会话 ${row##*|}")
+  else
+    ALERTS+=("sessions.db 取数失败:$(echo "$row" | head -c 200)")
+  fi
+
+  # 日志按天 00:00(UTC)轮转:.log.1 = 昨日(UTC)全天,.log = 今日 0 点起。
+  # 匹配 pino 的 "level":"error"(裸 ERROR 在该日志里不出现)。
+  local e_yday=NA e_today=NA
+  [ -f "$V5_LOG_YDAY" ] && e_yday="$(grep -c '"level":"error"' "$V5_LOG_YDAY" || true)"
+  [ -f "$V5_LOG" ]      && e_today="$(grep -c '"level":"error"' "$V5_LOG" || true)"
+  INFOS+=("v5 错误日志行:昨日(UTC)${e_yday},今日 0 点起 ${e_today}")
+}
+
+run_billing_checks
+run_activity_stats
+
+# ───────────────────────────────────────────────
+# 组装日报(无告警也发)并发送
+# ───────────────────────────────────────────────
+if [ "${#ALERTS[@]}" -gt 0 ]; then
+  LEVEL=warning; TITLE="[v5日报] ${REPORT_DATE} 有 ${#ALERTS[@]} 项告警"
+else
+  LEVEL=info; TITLE="[v5日报] ${REPORT_DATE} 一切正常"
+fi
+BODY="v5 日检(${REPORT_DATE},北京时间自然日):"$'\n'
+if [ "${#ALERTS[@]}" -gt 0 ]; then
+  BODY+=$'\n'"**告警:**"$'\n'
+  for a in "${ALERTS[@]}"; do BODY+="- ⚠️ $a"$'\n'; done
+fi
+BODY+=$'\n'"**日报:**"$'\n'
+for i in "${INFOS[@]}"; do BODY+="- $i"$'\n'; done
+BODY+=$'\n'"(阈值与口径见 docs/V5_MONITORING.md)"
+# inbox body CHECK ≤16384 字符;head -c 按字节截可能切半 CJK,iconv -c 丢掉尾部残字节
+BODY="$(echo "$BODY" | head -c 16000 | iconv -f UTF-8 -t UTF-8 -c)"
+
+log "DAILY $TITLE"
+for a in "${ALERTS[@]}"; do log "  ALERT $a"; done
+for i in "${INFOS[@]}"; do log "  INFO  $i"; done
+
+if [ "$DRY_RUN" = 1 ]; then
+  echo "── dry-run:将发送站内信 ─────────────"
+  echo "level: $LEVEL"; echo "title: $TITLE"; echo "$BODY"
+  exit 0
+fi
+
+if [ -z "$DBURL" ]; then log "ALERT-FAIL 读不到 DATABASE_URL,日报只落日志"; exit 0; fi
+if psql "$DBURL" -q -v ON_ERROR_STOP=1 \
+    -v lvl="$LEVEL" -v title="$TITLE" -v body="$BODY" -v uid="$BOSS_UID" <<'SQL'
+INSERT INTO inbox_messages (audience, user_id, title, body_md, level, created_by)
+VALUES ('user', :'uid'::bigint, :'title', :'body', :'lvl', :'uid'::bigint);
+SQL
+then log "ALERT-SENT [$LEVEL] $TITLE"
+else log "ALERT-FAIL 站内信 INSERT 失败(日报正文已在本日志留痕)"; fi
+exit 0

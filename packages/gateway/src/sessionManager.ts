@@ -39,6 +39,7 @@ import {
   RemoteTargetUnavailableError,
 } from './remoteTarget.js'
 import type { RepoSnapshot } from './sessionRepoWorkspace.js'
+import type { UsageAttributionTag } from './subprocessRunner.js'
 
 const log = createLogger({ module: 'sessionManager' })
 
@@ -1286,6 +1287,11 @@ export class SessionManager {
     skillEvalMode?: boolean
     skillEvalExclude?: string
     skillEvalDraft?: { name: string; dir: string }
+    /** delegate 子会话计费归因(仅 handleDelegateTask 设置)→ runner
+     *  CLAUDE_CODE_EXTRA_METADATA env → master 计费点落
+     *  usage_records.mode/parent_session_id/delegate_agent_id。
+     *  Spawn-time attribute(delegate sessionKey 带时间戳一次性,不存在复用)。 */
+    usageAttribution?: UsageAttributionTag
   }): Promise<AgentSession> {
     // 新建时 null 等同 undefined(都让 CCB 用模型默认)
     const initialEffort: string | undefined =
@@ -1373,6 +1379,7 @@ export class SessionManager {
       skillEvalMode: opts.skillEvalMode,
       skillEvalExclude: opts.skillEvalExclude,
       skillEvalDraft: opts.skillEvalDraft,
+      usageAttribution: opts.usageAttribution,
     })
     const now = Date.now()
     const session: AgentSession = {

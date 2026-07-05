@@ -217,6 +217,12 @@ BEGIN; <迁移 SQL>; INSERT INTO schema_migrations(version, applied_at) VALUES (
 | 可见性黑名单散点 | isHiddenSystemAgentId 手工插 ~15 处,新增用户面默认泄漏;正解=读 config 处统一投影"用户可见视图" | 新增任何 agent 枚举面时 |
 | feat/v5-copy-no-ai | 去 AI 措辞 chore(43d0078a)基老未合 | 下次文案批次重做 |
 | oc-browser chrome 通道 | v5 已修(--browser chromium),**v3 同病未修** | v3 浏览器问题报障时 |
+| 委派上下文纯文本 | delegate 只传 goal/context 字符串,无附件/工件协议;共享容器 FS 可交接但无 prompt 教学;回传纯文本经队长转述失真 | 团队产品化(roadmap P2.2b:大产物落文件+蒸馏回传) |
+| 委派并行无机制 | delegate_task 单次单个且同步阻塞,并行完全赖引擎行为;多成员+审查可串行阻塞小时级 | 同上(fan-out 原语) |
+| 普通成员串行无上限 | 熔断只覆盖 hidden-reviewer;同 turn 串行委派普通成员不设限,成本失控面 | 团队止血批次或产品化时一并加 |
+| teamMode 全局粘滞开关 | localStorage 设备级 flag;wave1 只加可见指示,per-session 化未做 | 团队产品化时改会话级 |
+| TeamPanel 聚合脆弱 | 依赖"连续渲染行"聚合;_activeDelegations 容器全局计数,cron/他会话挤兑并发额度 | 改团队渲染/并发时 |
+| landing 团队演示错位 | 动态角色/成员并行/过程账本三点与实现不符 | 产品化后对齐,或先行弱化文案 |
 
 ---
 

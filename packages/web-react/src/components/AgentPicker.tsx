@@ -116,7 +116,7 @@ export function AgentPicker({
                 <Users size={13} className="text-accent" /> 团队模式
               </span>
               <span className="mt-0.5 text-[11.5px] leading-snug text-muted">
-                开启后，全能助手按任务自动选调已安装的智能体组队协作；简单任务仍自己完成。
+                开启后队长引擎将切换为 GPT-5.5（计费高于默认模型），并按需委派已安装智能体组队协作。每次委派按对应智能体的模型计费。
               </span>
             </span>
             <Switch checked={teamMode} onCheckedChange={onToggleTeamMode} aria-label="启用团队模式" />
