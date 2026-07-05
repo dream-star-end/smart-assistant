@@ -62,20 +62,39 @@ describe("socket — loadStored 注水（reload 不丢）", () => {
     expect(sess._sendingInFlight).toBe(false);
   });
 
-  test("短 TTL 内的 pending turn 会恢复 in-flight（refresh 后继续等待 agent）", () => {
-    vi.useFakeTimers();
-    vi.setSystemTime(1_700_000_000_000);
+  test("注水近期 in-flight 标记：reload 后保留生成中状态供 hello 恢复", () => {
+    const now = Date.now();
     const s = socket();
-    s.loadStored(storedFix("s1", { _pendingTurnInFlight: true, _pendingTurnSavedAt: Date.now() - 30_000 }));
-    expect(s.sessions.get("s1")!._sendingInFlight).toBe(true);
+    s.loadStored(
+      storedFix("s1", {
+        messages: [msg("u1", "hi", { role: "user", status: "sent", ts: now - 2000 })],
+        _sendingInFlight: true,
+        _turnStartedAt: now - 2000,
+        _lastFrameAt: now - 1000,
+      }),
+    );
+    const sess = s.sessions.get("s1")!;
+    expect(sess._sendingInFlight).toBe(true);
+    expect(sess._turnStartedAt).toBe(now - 2000);
+    expect(sess._lastFrameAt).toBe(now - 1000);
+    s.stop();
   });
 
-  test("过期 pending turn 不恢复 in-flight（避免长期卡 loading）", () => {
-    vi.useFakeTimers();
-    vi.setSystemTime(1_700_000_000_000);
+  test("注水过期 in-flight 标记：丢弃，避免 reload 后永久 loading", () => {
+    const now = Date.now();
     const s = socket();
-    s.loadStored(storedFix("s1", { _pendingTurnInFlight: true, _pendingTurnSavedAt: Date.now() - 11 * 60_000 }));
-    expect(s.sessions.get("s1")!._sendingInFlight).toBe(false);
+    s.loadStored(
+      storedFix("s1", {
+        messages: [msg("u1", "hi", { role: "user", status: "sent", ts: now - 20 * 60_000 })],
+        _sendingInFlight: true,
+        _turnStartedAt: now - 20 * 60_000,
+        _lastFrameAt: now - 20 * 60_000,
+      }),
+    );
+    const sess = s.sessions.get("s1")!;
+    expect(sess._sendingInFlight).toBe(false);
+    expect(sess._turnStartedAt).toBeUndefined();
+    expect(sess._lastFrameAt).toBeUndefined();
   });
 
   test("已存在的 live 会话不被磁盘快照覆盖（live 优先）", () => {
@@ -99,6 +118,9 @@ describe("socket — toStored 序列化", () => {
     sess._trackerResetAt = 100;
     sess._localTeardownAt = 150;
     sess._agentSwitchedAt = 200;
+    sess._sendingInFlight = true;
+    sess._turnStartedAt = 111;
+    sess._lastFrameAt = 222;
     sess._streamingAssistant = msg("stream"); // 瞬态：不应进 StoredSession
     const out = s.toStored("s1")!;
     expect(out.id).toBe("s1");
@@ -108,20 +130,20 @@ describe("socket — toStored 序列化", () => {
     expect(out._trackerResetAt).toBe(100);
     expect(out._localTeardownAt).toBe(150);
     expect(out._agentSwitchedAt).toBe(200);
-    expect(out._pendingTurnInFlight).toBe(false);
-    expect(out._pendingTurnSavedAt).toBeUndefined();
+    expect(out._sendingInFlight).toBe(true);
+    expect(out._turnStartedAt).toBe(111);
+    expect(out._lastFrameAt).toBe(222);
     expect(Object.keys(out)).not.toContain("_streamingAssistant");
   });
 
-  test("序列化记录仍在响应的 pending turn，用于 reload 恢复发送态", () => {
-    vi.useFakeTimers();
-    vi.setSystemTime(1_700_000_000_000);
+  test("序列化记录仍在响应的 turn（_sendingInFlight），用于 reload 恢复发送态", () => {
     const s = socket();
     const sess = s.ensureSession("s1", "main", "t");
     sess._sendingInFlight = true;
+    sess._turnStartedAt = 1_700_000_000_000;
     const out = s.toStored("s1")!;
-    expect(out._pendingTurnInFlight).toBe(true);
-    expect(out._pendingTurnSavedAt).toBe(1_700_000_000_000);
+    expect(out._sendingInFlight).toBe(true);
+    expect(out._turnStartedAt).toBe(1_700_000_000_000);
   });
 
   test("未知会话 toStored → null", () => {

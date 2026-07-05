@@ -24,9 +24,9 @@ const STORE = "sessions";
  * 指针 / Map 等运行期瞬态（注水后由 rebuildIndexes 重建，详见 socket.loadStored）。
  * `_lastFrameSeqByKey` / `_lastFrameSeq` 是断点续传游标（resume_failed 推进后必须落地，
  * 否则 reload 后 hello 仍发旧游标 → server 反复 resume 失败 → reload 死循环）。
- * `_maxSeq` 是 server canonical 增量游标（下次 getSession 的 sinceSeq）。
- * `_pendingTurnInFlight` 只用于 reload 恢复“本轮仍在响应”的 UI/hello inFlight 状态，
- * 由 socket.loadStored 以短 TTL 解释；不持久化流式指针本身。`_trackerResetAt` /
+ * `_sendingInFlight` / `_turnStartedAt` / `_lastFrameAt` 是 reload 恢复中的近期 turn
+ * 活跃标记；loadStored 会按 THINKING_SAFETY_MS 丢弃过期标记，避免永久 loading。
+ * `_maxSeq` 是 server canonical 增量游标（下次 getSession 的 sinceSeq）。`_trackerResetAt` /
  * `_localTeardownAt` / `_agentSwitchedAt` 是 stop/timeout/switch 后的 late-frame cutoff，
  * 必须随 reload 保留，否则刷新会丢守卫、让旧非 final 帧把发送态复活。
  */
@@ -40,9 +40,10 @@ export type StoredSession = {
   updatedAt?: number;
   _lastFrameSeqByKey?: Record<string, number>;
   _lastFrameSeq?: number;
+  _sendingInFlight?: boolean;
+  _turnStartedAt?: number;
+  _lastFrameAt?: number;
   _maxSeq?: number;
-  _pendingTurnInFlight?: boolean;
-  _pendingTurnSavedAt?: number;
   _trackerResetAt?: number;
   _localTeardownAt?: number;
   _agentSwitchedAt?: number | null;

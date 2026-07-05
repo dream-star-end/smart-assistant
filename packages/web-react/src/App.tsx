@@ -660,6 +660,10 @@ export function App() {
   //  2. 旧实现无条件劫持:用户上翻回看历史也被拽回底部。改为 near-bottom 粘滞 ——
   //     只有用户本就贴底(<80px)时才跟随;上翻即解除,拉回底部自动恢复。
   const stickToBottomRef = useRef(true);
+  const scrollToChatBottom = useCallback(() => {
+    const el = scrollRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  }, []);
   const onChatScroll = useCallback(() => {
     const el = scrollRef.current;
     if (!el) return;
@@ -668,16 +672,72 @@ export function App() {
   // 切会话:重置粘滞并瞬时跳底(历史回看从底部开始)。
   useEffect(() => {
     stickToBottomRef.current = true;
-    const el = scrollRef.current;
-    if (el) el.scrollTop = el.scrollHeight;
-  }, [activeId]);
+    scrollToChatBottom();
+  }, [activeId, scrollToChatBottom]);
   // 内容变更跟随:demo 走 messages/streamText,真实路径走 version/wsSending。
   // 流式期间高频触发,用瞬时赋值而非 smooth(60fps 下排队的平滑动画反而卡顿)。
   useEffect(() => {
     if (!stickToBottomRef.current) return;
-    const el = scrollRef.current;
-    if (el) el.scrollTop = el.scrollHeight;
-  }, [messages, streamText, chat.version, wsSending]);
+    scrollToChatBottom();
+  }, [messages, streamText, chat.version, wsSending, scrollToChatBottom]);
+
+  // iOS Safari 的地址栏/底栏/截图/输入键盘会触发 visualViewport 高度与 offset 抖动。
+  // CSS dvh 仍可能短暂大于真实可视区；键盘弹起时 Safari 还会 pan visual viewport,
+  // 让 fixed root 的 top:0 看起来被顶到屏幕上方。这里把实测 height + offsetTop
+  // 写入 CSS var；若用户本就在底部或本轮正在生成，下一帧重新贴底。
+  useEffect(() => {
+    if (!inWorkspace) return;
+    let raf: number | null = null;
+    const setVisualViewportVars = () => {
+      const vv = window.visualViewport;
+      const h = vv?.height || window.innerHeight;
+      if (Number.isFinite(h) && h > 0) {
+        document.documentElement.style.setProperty("--oc-visual-height", `${Math.round(h)}px`);
+      }
+      const top = vv?.offsetTop || 0;
+      if (Number.isFinite(top)) {
+        document.documentElement.style.setProperty("--oc-visual-offset-top", `${Math.max(0, Math.round(top))}px`);
+      }
+    };
+    const realign = () => {
+      setVisualViewportVars();
+      if (!stickToBottomRef.current && !sending) return;
+      if (typeof requestAnimationFrame === "function") {
+        if (raf !== null) cancelAnimationFrame(raf);
+        raf = requestAnimationFrame(() => {
+          raf = null;
+          scrollToChatBottom();
+        });
+      } else {
+        scrollToChatBottom();
+      }
+    };
+    const onVisible = () => {
+      if (document.visibilityState === "visible") realign();
+    };
+    realign();
+    window.visualViewport?.addEventListener("resize", realign);
+    window.visualViewport?.addEventListener("scroll", realign);
+    window.addEventListener("resize", realign);
+    window.addEventListener("pageshow", realign);
+    window.addEventListener("focus", realign);
+    document.addEventListener("focusin", realign);
+    document.addEventListener("focusout", realign);
+    document.addEventListener("visibilitychange", onVisible);
+    return () => {
+      if (raf !== null && typeof cancelAnimationFrame === "function") cancelAnimationFrame(raf);
+      window.visualViewport?.removeEventListener("resize", realign);
+      window.visualViewport?.removeEventListener("scroll", realign);
+      window.removeEventListener("resize", realign);
+      window.removeEventListener("pageshow", realign);
+      window.removeEventListener("focus", realign);
+      document.removeEventListener("focusin", realign);
+      document.removeEventListener("focusout", realign);
+      document.removeEventListener("visibilitychange", onVisible);
+      document.documentElement.style.removeProperty("--oc-visual-height");
+      document.documentElement.style.removeProperty("--oc-visual-offset-top");
+    };
+  }, [inWorkspace, sending, scrollToChatBottom]);
 
   useEffect(() => {
     if (!inWorkspace) return;
@@ -798,7 +858,7 @@ export function App() {
     <ToolCardActionsContext.Provider value={toolActions}>
     <ChatInteractionContext.Provider value={chatInteraction}>
     {/* safe-px:横屏侧刘海安全区(竖屏为 0) */}
-    <div className="flex h-full overflow-hidden bg-bg text-fg safe-px">
+    <div className="flex h-full min-h-0 overflow-hidden bg-bg text-fg safe-px">
       {/* 桌面：内联侧栏（可折叠）。窄屏隐藏，改用抽屉。 */}
       {!collapsed && (
         <div className="hidden md:contents">
@@ -829,7 +889,7 @@ export function App() {
         />
       </Sheet>
 
-      <main className="flex min-w-0 flex-1 flex-col">
+      <main className="flex min-h-0 min-w-0 flex-1 flex-col">
         <ChatHeader
           agent={agent}
           onAgentClick={() => setPickerOpen(true)}
@@ -857,7 +917,7 @@ export function App() {
           />
         )}
 
-        <div ref={scrollRef} onScroll={onChatScroll} className="flex-1 overflow-y-auto overflow-x-hidden">
+        <div ref={scrollRef} onScroll={onChatScroll} className="chat-scroll-area min-h-0 flex-1 overflow-y-auto overflow-x-hidden">
           {gated ? (
             <AgentGate
               phase={gate.phase}

@@ -1227,6 +1227,47 @@ describe("ChatSocket safeWsSend backpressure (§2) + offline enqueue (§10)", ()
     expect(s.messages.find((m) => m.role === "user")?.status).toBe("sent");
   });
 
+  test("send persists optimistic user row + in-flight marker immediately", () => {
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const persistSession = vi.fn();
+    const sock = makeSocket({ persistSession });
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    ws.open();
+    sock.sendMessage({ sessId: "s1", agentId: "main", text: "hi" });
+    expect(persistSession).toHaveBeenCalledWith("s1");
+    const stored = sock.toStored("s1")!;
+    expect(stored.messages.find((m) => m.role === "user")?.text).toBe("hi");
+    expect(stored._sendingInFlight).toBe(true);
+    expect(typeof stored._turnStartedAt).toBe("number");
+  });
+
+  test("restored in-flight session sends hello with inFlight=true", () => {
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const sock = makeSocket();
+    const now = Date.now();
+    sock.loadStored({
+      id: "s1",
+      agentId: "main",
+      title: "s1",
+      messages: [{ id: "u1", role: "user", text: "hi", ts: now - 1000, status: "sent" }],
+      createdAt: now - 1000,
+      lastAt: now - 1000,
+      _sendingInFlight: true,
+      _turnStartedAt: now - 1000,
+      _lastFrameAt: now - 500,
+      _lastFrameSeqByKey: { "agent:main:webchat:dm:s1": 7 },
+    });
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    ws.open();
+    const helloRaw = ws.sent.find((d) => d.includes('"inbound.hello"'));
+    expect(helloRaw).toBeTruthy();
+    const hello = JSON.parse(helloRaw!);
+    expect(hello.peers[0]).toMatchObject({ peerId: "s1", agentId: "main", inFlight: true, lastFrameSeq: 7 });
+    sock.stop();
+  });
+
   test("stopTurn clears and persists pending turn state immediately", () => {
     vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
     const persistSession = vi.fn();
@@ -1241,7 +1282,7 @@ describe("ChatSocket safeWsSend backpressure (§2) + offline enqueue (§10)", ()
 
     expect(sock.sessions.get("s1")!._sendingInFlight).toBe(false);
     const stored = sock.toStored("s1")!;
-    expect(stored._pendingTurnInFlight).toBe(false);
+    expect(stored._sendingInFlight).toBeFalsy();
     expect(typeof stored._trackerResetAt).toBe("number");
     expect(stored._localTeardownAt).toBe(stored._trackerResetAt);
     expect(persistSession).toHaveBeenCalledWith("s1");
@@ -1287,7 +1328,7 @@ describe("ChatSocket safeWsSend backpressure (§2) + offline enqueue (§10)", ()
     ws.onmessage?.({ data: JSON.stringify({ type: "outbound.ack", deduplicated: true, idempotencyKey: "autocont-s1-u1" }) });
 
     expect(sess._sendingInFlight).toBe(false);
-    expect(sock.toStored("s1")?._pendingTurnInFlight).toBe(false);
+    expect(sock.toStored("s1")?._sendingInFlight).toBeFalsy();
     expect(persistSession).toHaveBeenCalledWith("s1");
   });
 
