@@ -10,7 +10,7 @@ import type {
   SkillSummary,
 } from "../../lib/types";
 import { cn } from "../../lib/utils";
-import { Alert, Badge, Button, Input, Textarea } from "../ui";
+import { Alert, Badge, Button, Input, Textarea, useConfirm } from "../ui";
 import { friendlyRiskFlags } from "./riskFlags";
 
 /** 标签+控件包裹（input 嵌于 label 内即关联，参照 CronPanel.Field 模式）。 */
@@ -759,7 +759,10 @@ function AgentPublishForm({ auth, onPublished }: { auth: AuthSession; onPublishe
 
 // ── 我的发布 ────────────────────────────────────────────────────────────────
 
-const STATUS_META: Record<string, { label: string; tone: "warning" | "success" | "danger" }> = {
+const STATUS_META: Record<
+  string,
+  { label: string; tone: "neutral" | "warning" | "success" | "danger" }
+> = {
   pending: { label: "审核中", tone: "warning" },
   approved: { label: "已上架", tone: "success" },
   rejected: { label: "未通过", tone: "danger" },
@@ -772,6 +775,10 @@ const STATUS_META: Record<string, { label: string; tone: "warning" | "success" |
 function MyPublishes({ auth, reload }: { auth: AuthSession; reload: number }) {
   const [rows, setRows] = useState<MarketplaceMyPublish[] | null>(null);
   const [open, setOpen] = useState(false);
+  const [actionReload, setActionReload] = useState(0);
+  const [busyId, setBusyId] = useState<string | null>(null);
+  const [actionErr, setActionErr] = useState<string | null>(null);
+  const [confirmDialog, confirmEl] = useConfirm();
 
   useEffect(() => {
     let alive = true;
@@ -782,7 +789,48 @@ function MyPublishes({ auth, reload }: { auth: AuthSession; reload: number }) {
     return () => {
       alive = false;
     };
-  }, [auth, reload]);
+  }, [auth, reload, actionReload]);
+
+  const withdraw = async (r: MarketplaceMyPublish) => {
+    const ok = await confirmDialog({
+      title: `撤销 ${r.name} v${r.version}?`,
+      body: "撤销后该版本不会再进入审核；记录会保留在「我的发布」里。",
+      confirmText: "撤销发布",
+      danger: true,
+    });
+    if (!ok) return;
+    setBusyId(`withdraw:${r.versionId}`);
+    setActionErr(null);
+    try {
+      await api.withdrawMarketplacePublish(auth, r.versionId);
+      setActionReload((n) => n + 1);
+    } catch (e) {
+      setActionErr((e as Error).message || "撤销发布失败");
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  const unlist = async (r: MarketplaceMyPublish) => {
+    const ok = await confirmDialog({
+      title: `下架「${r.name}」?`,
+      body:
+        "下架后其他用户不能再搜索或安装；已安装用户的容器下次同步会移除该条目。以后提交新版本并通过审核可重新上架。",
+      confirmText: "下架",
+      danger: true,
+    });
+    if (!ok) return;
+    setBusyId(`unlist:${r.versionId}`);
+    setActionErr(null);
+    try {
+      await api.unlistMarketplaceListing(auth, r.slug);
+      setActionReload((n) => n + 1);
+    } catch (e) {
+      setActionErr((e as Error).message || "下架失败");
+    } finally {
+      setBusyId(null);
+    }
+  };
 
   if (!rows || rows.length === 0) return null;
   const pending = rows.filter((r) => r.status === "pending").length;
@@ -790,6 +838,7 @@ function MyPublishes({ auth, reload }: { auth: AuthSession; reload: number }) {
 
   return (
     <div className="overflow-hidden rounded-xl border border-border bg-elevated">
+      {confirmEl}
       <button
         type="button"
         onClick={() => setOpen((v) => !v)}
@@ -807,9 +856,24 @@ function MyPublishes({ auth, reload }: { auth: AuthSession; reload: number }) {
       </button>
       {open && (
         <ul className="flex flex-col border-t border-border">
+          {actionErr && (
+            <li className="border-b border-border px-3.5 py-2.5">
+              <Alert tone="danger">{actionErr}</Alert>
+            </li>
+          )}
           {rows.map((r) => {
-            const meta = STATUS_META[r.status] ?? { label: r.status, tone: "warning" as const };
+            const withdrawn = r.status === "rejected" && r.reviewNote === "作者撤销发布";
+            const unlisted = r.status === "approved" && r.listingState === "unlisted";
             const revoked = r.status === "approved" && r.listingState === "revoked";
+            const meta = withdrawn
+              ? { label: "已撤销", tone: "neutral" as const }
+              : unlisted
+                ? { label: "已下架", tone: "warning" as const }
+                : revoked
+                  ? { label: "平台下架", tone: "danger" as const }
+                  : (STATUS_META[r.status] ?? { label: r.status, tone: "warning" as const });
+            const canWithdraw = r.status === "pending";
+            const canUnlist = r.status === "approved" && r.isCurrent && r.listingState === "active";
             return (
               <li key={r.versionId} className="border-b border-border px-3.5 py-2.5 last:border-b-0">
                 <div className="flex flex-wrap items-center gap-1.5">
@@ -817,13 +881,45 @@ function MyPublishes({ auth, reload }: { auth: AuthSession; reload: number }) {
                   <Badge tone="neutral">v{r.version}</Badge>
                   {r.kind === "agent" && <Badge tone="accent">智能体</Badge>}
                   <Badge tone={meta.tone}>{meta.label}</Badge>
-                  {revoked && <Badge tone="warning">已被下架</Badge>}
-                  {r.status === "approved" && !r.isCurrent && !revoked && (
+                  {r.status === "approved" && !r.isCurrent && !revoked && !unlisted && (
                     <Badge tone="neutral">已被新版本取代</Badge>
                   )}
                   <span className="ml-auto text-[11px] text-faint">{fmtDate(r.createdAt)}</span>
                 </div>
-                {r.status === "rejected" && r.reviewNote && (
+                {(canWithdraw || canUnlist) && (
+                  <div className="mt-2 flex justify-end">
+                    {canWithdraw && (
+                      <Button
+                        size="sm"
+                        variant="secondary"
+                        onClick={() => withdraw(r)}
+                        disabled={busyId !== null}
+                      >
+                        {busyId === `withdraw:${r.versionId}` ? (
+                          <Loader2 size={14} className="animate-spin" />
+                        ) : null}
+                        撤销发布
+                      </Button>
+                    )}
+                    {canUnlist && (
+                      <Button
+                        size="sm"
+                        variant="danger"
+                        onClick={() => unlist(r)}
+                        disabled={busyId !== null}
+                      >
+                        {busyId === `unlist:${r.versionId}` ? (
+                          <Loader2 size={14} className="animate-spin" />
+                        ) : null}
+                        下架
+                      </Button>
+                    )}
+                  </div>
+                )}
+                {withdrawn && (
+                  <p className="mt-1 text-[12px] leading-relaxed text-muted">你已撤销此提交。</p>
+                )}
+                {!withdrawn && r.status === "rejected" && r.reviewNote && (
                   <p className="mt-1 text-[12px] leading-relaxed text-muted">
                     <span className="text-danger">拒绝理由：</span>
                     {r.reviewNote}

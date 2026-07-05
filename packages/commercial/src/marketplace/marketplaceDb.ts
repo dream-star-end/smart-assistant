@@ -296,13 +296,18 @@ export async function reviewVersion(args: {
       c,
     )
     if (args.approve) {
-      await query(
+      const listing = await query(
         `UPDATE marketplace_skill_listings
-            SET current_approved_version_id = $2, updated_at = NOW()
-          WHERE slug = $1`,
+            SET current_approved_version_id = $2,
+                state = CASE WHEN state = 'unlisted' THEN 'active' ELSE state END,
+                revoked_reason = CASE WHEN state = 'unlisted' THEN NULL ELSE revoked_reason END,
+                updated_at = NOW()
+          WHERE slug = $1 AND state <> 'revoked'`,
         [row.slug, args.versionId],
         c,
       )
+      if ((listing.rowCount ?? 0) === 0)
+        throw new MarketplaceError('LISTING_REVOKED', `slug "${row.slug}" 已被平台下架`)
     }
   })
 }
@@ -823,6 +828,92 @@ export async function listMyPublishes(userId: number): Promise<MyPublishRow[]> {
     isCurrent: x.is_current === true,
     listingState: x.state,
   }))
+}
+
+/**
+ * Publisher self-unlist: remove an active approved listing from search/install/sync without
+ * using the admin kill-switch state. Owners may later publish a new version; approval relists
+ * `unlisted` listings, while `revoked` remains terminal.
+ */
+export async function ownerUnlistListing(
+  slug: string,
+  ownerUserId: number,
+  reason = 'unlisted by owner',
+): Promise<number[]> {
+  return tx(async (c) => {
+    const listing = await query<{
+      owner_user_id: string
+      state: string
+      current_approved_version_id: string | null
+    }>(
+      `SELECT owner_user_id::text, state, current_approved_version_id::text
+         FROM marketplace_skill_listings
+        WHERE slug = $1
+        FOR UPDATE`,
+      [slug],
+      c,
+    )
+    const row = listing.rows[0]
+    if (!row) throw new MarketplaceError('VERSION_NOT_FOUND', `slug "${slug}" 不存在`)
+    if (BigInt(row.owner_user_id) !== BigInt(ownerUserId))
+      throw new MarketplaceError('SLUG_OWNED_BY_OTHER', `slug "${slug}" 不属于当前用户`)
+    if (row.state === 'revoked')
+      throw new MarketplaceError('LISTING_REVOKED', `slug "${slug}" 已被平台下架`)
+    if (row.state !== 'active' || row.current_approved_version_id == null)
+      throw new MarketplaceError('NOT_INSTALLABLE', `slug "${slug}" 当前未上架`)
+
+    await query(
+      `UPDATE marketplace_skill_listings
+          SET state = 'unlisted', revoked_reason = $2, updated_at = NOW()
+        WHERE slug = $1`,
+      [slug, reason],
+      c,
+    )
+    const affected = await query<{ user_id: string }>(
+      `SELECT DISTINCT user_id::text FROM marketplace_installs
+        WHERE slug = $1 AND uninstalled_at IS NULL`,
+      [slug],
+      c,
+    )
+    return affected.rows.map((x) => Number.parseInt(x.user_id, 10))
+  })
+}
+
+/** Publisher self-withdraw: pending versions can be cancelled before admin review. */
+export async function withdrawPublishVersion(versionId: string, ownerUserId: number): Promise<void> {
+  await tx(async (c) => {
+    const v = await query<{
+      status: string
+      submitted_by: string
+      owner_user_id: string
+      slug: string
+    }>(
+      `SELECT v.status, v.submitted_by::text, l.owner_user_id::text, v.slug
+         FROM marketplace_skill_versions v
+         JOIN marketplace_skill_listings l ON l.slug = v.slug
+        WHERE v.id = $1
+        FOR UPDATE OF v, l`,
+      [versionId],
+      c,
+    )
+    const row = v.rows[0]
+    if (!row) throw new MarketplaceError('VERSION_NOT_FOUND', 'version 不存在')
+    if (
+      BigInt(row.submitted_by) !== BigInt(ownerUserId) ||
+      BigInt(row.owner_user_id) !== BigInt(ownerUserId)
+    ) {
+      throw new MarketplaceError('SLUG_OWNED_BY_OTHER', `slug "${row.slug}" 不属于当前用户`)
+    }
+    if (row.status !== 'pending') throw new MarketplaceError('NOT_PENDING', '该版本已被审核')
+
+    await query(
+      `UPDATE marketplace_skill_versions
+          SET status = 'rejected', reviewed_at = NOW(), review_note = '作者撤销发布'
+        WHERE id = $1`,
+      [versionId],
+      c,
+    )
+  })
 }
 
 export interface InstalledArtifact {

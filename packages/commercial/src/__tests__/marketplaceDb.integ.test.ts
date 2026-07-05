@@ -33,13 +33,16 @@ import {
   listActiveInstalledArtifacts,
   listApprovedForSearch,
   listInstalled,
+  listMyPublishes,
   listPendingVersions,
+  ownerUnlistListing,
   publishSkillVersion,
   recordUninstall,
   reviewVersion,
   reviewVersions,
   revokeListing,
   updateInstalledAgentScope,
+  withdrawPublishVersion,
 } from '../marketplace/marketplaceDb.js'
 
 const TEST_DB_URL =
@@ -293,6 +296,37 @@ describe('marketplaceDb (integ)', () => {
     assert.equal((await getListingDetail('batch-still-pending'))?.version, '1.0.0')
   })
 
+  test('batch review rejects multiple pending versions with a shared note', async (t) => {
+    if (skipIfNoPg(t)) return
+    const owner = await createUser('batch-reject-owner@x.com')
+    const admin = await createUser('batch-reject-admin@x.com')
+    const a = await publishSkillVersion(buildPublish('batch-reject-a', owner))
+    const b = await publishSkillVersion(buildPublish('batch-reject-b', owner))
+
+    const results = await reviewVersions({
+      versionIds: [a.versionId, b.versionId],
+      reviewerUserId: admin,
+      approve: false,
+      note: '不符合发布规范',
+    })
+    assert.deepEqual(results, [
+      { versionId: a.versionId, ok: true },
+      { versionId: b.versionId, ok: true },
+    ])
+    const rows = await query<{ status: string; review_note: string | null }>(
+      'SELECT status, review_note FROM marketplace_skill_versions ORDER BY id',
+    )
+    assert.deepEqual(
+      rows.rows.map((r) => [r.status, r.review_note]),
+      [
+        ['rejected', '不符合发布规范'],
+        ['rejected', '不符合发布规范'],
+      ],
+    )
+    assert.equal((await listPendingVersions()).length, 0)
+    assert.equal((await listApprovedForSearch()).length, 0)
+  })
+
   test('M2: skill defaults kind=skill; detail/search expose kind + raw_artifact', async (t) => {
     if (skipIfNoPg(t)) return
     const owner = await createUser('m2skill@x.com')
@@ -474,6 +508,102 @@ describe('marketplaceDb (integ)', () => {
     await expectMarketplaceError(
       () => installApprovedVersion({ userId: installer, versionId }),
       'NOT_INSTALLABLE',
+    )
+  })
+
+  test('owner unlist removes listing from catalog/install/sync but can relist via new approval', async (t) => {
+    if (skipIfNoPg(t)) return
+    const owner = await createUser('unlist-owner@x.com')
+    const admin = await createUser('unlist-admin@x.com')
+    const installer = await createUser('unlist-inst@x.com')
+    const p = await publishSkillVersion(buildPublish('owner-unlist', owner))
+    await reviewVersion({ versionId: p.versionId, reviewerUserId: admin, approve: true })
+    await installApprovedVersion({ userId: installer, versionId: p.versionId })
+    assert.ok((await getListingDetail('owner-unlist')) !== null)
+    assert.equal((await listActiveInstalledArtifacts(installer)).length, 1)
+
+    const affected = await ownerUnlistListing('owner-unlist', owner)
+    assert.deepEqual(affected, [installer])
+    assert.equal(await getListingDetail('owner-unlist'), null)
+    assert.equal((await listApprovedForSearch()).some((x) => x.slug === 'owner-unlist'), false)
+    assert.equal((await listActiveInstalledArtifacts(installer)).length, 0)
+    await expectMarketplaceError(
+      () => installApprovedVersion({ userId: installer, versionId: p.versionId }),
+      'NOT_INSTALLABLE',
+    )
+    assert.equal((await listInstalled(installer))[0].listingState, 'unlisted')
+
+    const v2 = await publishSkillVersion(buildPublish('owner-unlist', owner, '2.0.0'))
+    await reviewVersion({ versionId: v2.versionId, reviewerUserId: admin, approve: true })
+    const detail = await getListingDetail('owner-unlist')
+    assert.equal(detail?.version, '2.0.0')
+    const state = await query<{ state: string }>(
+      'SELECT state FROM marketplace_skill_listings WHERE slug = $1',
+      ['owner-unlist'],
+    )
+    assert.equal(state.rows[0].state, 'active')
+  })
+
+  test('owner unlist enforces owner and cannot undo admin revoke', async (t) => {
+    if (skipIfNoPg(t)) return
+    const owner = await createUser('unlist-guard-owner@x.com')
+    const other = await createUser('unlist-guard-other@x.com')
+    const admin = await createUser('unlist-guard-admin@x.com')
+    const p = await publishSkillVersion(buildPublish('owner-unlist-guard', owner))
+    await reviewVersion({ versionId: p.versionId, reviewerUserId: admin, approve: true })
+
+    await expectMarketplaceError(
+      () => ownerUnlistListing('owner-unlist-guard', other),
+      'SLUG_OWNED_BY_OTHER',
+    )
+    await revokeListing('owner-unlist-guard', 'admin kill-switch')
+    await expectMarketplaceError(
+      () => ownerUnlistListing('owner-unlist-guard', owner),
+      'LISTING_REVOKED',
+    )
+  })
+
+  test('approved pending version cannot relist a revoked listing', async (t) => {
+    if (skipIfNoPg(t)) return
+    const owner = await createUser('revoked-relist-owner@x.com')
+    const admin = await createUser('revoked-relist-admin@x.com')
+    const v1 = await publishSkillVersion(buildPublish('revoked-relist', owner, '1.0.0'))
+    await reviewVersion({ versionId: v1.versionId, reviewerUserId: admin, approve: true })
+    const v2 = await publishSkillVersion(buildPublish('revoked-relist', owner, '2.0.0'))
+    await revokeListing('revoked-relist', 'admin kill-switch')
+
+    await expectMarketplaceError(
+      () => reviewVersion({ versionId: v2.versionId, reviewerUserId: admin, approve: true }),
+      'LISTING_REVOKED',
+    )
+    const state = await query<{ state: string; current_approved_version_id: string }>(
+      'SELECT state, current_approved_version_id::text FROM marketplace_skill_listings WHERE slug = $1',
+      ['revoked-relist'],
+    )
+    assert.equal(state.rows[0].state, 'revoked')
+    assert.equal(state.rows[0].current_approved_version_id, v1.versionId)
+  })
+
+  test('publisher can withdraw pending version and only owner can do it', async (t) => {
+    if (skipIfNoPg(t)) return
+    const owner = await createUser('withdraw-owner@x.com')
+    const other = await createUser('withdraw-other@x.com')
+    const pending = await publishSkillVersion(buildPublish('withdraw-me', owner))
+
+    await expectMarketplaceError(
+      () => withdrawPublishVersion(pending.versionId, other),
+      'SLUG_OWNED_BY_OTHER',
+    )
+    assert.equal((await listPendingVersions()).length, 1)
+
+    await withdrawPublishVersion(pending.versionId, owner)
+    assert.equal((await listPendingVersions()).length, 0)
+    const mine = await listMyPublishes(owner)
+    assert.equal(mine[0].status, 'rejected')
+    assert.equal(mine[0].reviewNote, '作者撤销发布')
+    await expectMarketplaceError(
+      () => withdrawPublishVersion(pending.versionId, owner),
+      'NOT_PENDING',
     )
   })
 

@@ -701,8 +701,16 @@ export type MarketplaceMyPublish = {
   reviewedAt?: string | null;
   /** 该版本是否 listing 当前上架版本。 */
   isCurrent: boolean;
-  /** listing 状态（active/revoked）。 */
+  /** listing 状态（active/unlisted/revoked）。 */
   listingState: string;
+};
+
+/** 批量审核结果（POST /api/admin/marketplace/review-batch）。 */
+export type MarketplaceReviewBatchResult = {
+  ok: boolean;
+  reviewed: number;
+  failed: number;
+  results: Array<{ versionId: string; ok: boolean; code?: string; message?: string }>;
 };
 
 /** 待审版本（GET /api/admin/marketplace/pending 的 pending 项，含完整工件供审核）。 */

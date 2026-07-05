@@ -41,7 +41,9 @@ import {
   handleMarketplaceMyAgents,
   handleMarketplaceMyPublishes,
   handleMarketplacePublish,
+  handleMarketplaceUnlist,
   handleMarketplaceUninstall,
+  handleMarketplaceWithdrawPublish,
 } from '../marketplace/marketplaceRoutes.js'
 import { handleMarketplaceSearch } from '../marketplace/marketplaceSearch.js'
 import { isActiveAdmin, isInMaintenance } from '../middleware/maintenanceMode.js'
@@ -635,9 +637,19 @@ export function createCommercialHandler(
       handler: (req, res) => handleMarketplaceMyPublishes(req, res, deps),
     },
     {
+      method: 'POST',
+      pathPrefix: '/api/marketplace/my-publishes/',
+      handler: (req, res) => handleMarketplaceWithdrawPublish(req, res, deps),
+    },
+    {
       method: 'DELETE',
       pathPrefix: '/api/marketplace/installed/',
       handler: (req, res) => handleMarketplaceUninstall(req, res, deps),
+    },
+    {
+      method: 'POST',
+      pathPrefix: '/api/marketplace/',
+      handler: (req, res) => handleMarketplaceUnlist(req, res, deps),
     },
     // detail by slug — prefix; exact /installed (+ later /search) match first
     {

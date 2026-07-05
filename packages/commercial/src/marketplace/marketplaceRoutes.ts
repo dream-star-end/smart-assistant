@@ -25,12 +25,14 @@ import {
   listMyPublishes,
   listPendingVersions,
   listPlatformPresetAgents,
+  ownerUnlistListing,
   publishSkillVersion,
   recordUninstall,
   reviewVersion,
   reviewVersions,
   revokeListing,
   updateInstalledAgentScope,
+  withdrawPublishVersion,
 } from './marketplaceDb.js'
 import {
   VETTED_AGENT_TOOLSETS,
@@ -65,6 +67,12 @@ function asStr(v: unknown, field: string, max: number): string {
     throw new HttpError(400, 'BAD_REQUEST', `${field} required`)
   if (v.length > max) throw new HttpError(400, 'BAD_REQUEST', `${field} too long`)
   return v
+}
+
+function rejectionNote(v: unknown): string {
+  const note = typeof v === 'string' ? v.trim().slice(0, 2000) : ''
+  if (!note) throw new HttpError(400, 'BAD_REQUEST', '拒绝时必须填写理由')
+  return note
 }
 
 function asTags(v: unknown): string[] {
@@ -556,6 +564,51 @@ export async function handleMarketplaceMyPublishes(
   sendJson(res, 200, { publishes: await listMyPublishes(uid(user)) })
 }
 
+// ── POST /api/marketplace/my-publishes/:id/withdraw ───────────────────────
+// 发布者撤销尚未审核的投稿。保留版本行作为审计/反馈记录,状态转 rejected +
+// review_note='作者撤销发布',让「我的发布」能闭合展示。
+export async function handleMarketplaceWithdrawPublish(
+  req: IncomingMessage,
+  res: ServerResponse,
+  deps: { jwtSecret: string | Uint8Array },
+): Promise<void> {
+  const user = await requireAuth(req, deps.jwtSecret)
+  const m = (req.url ?? '').match(/\/api\/marketplace\/my-publishes\/(\d+)\/withdraw(?:\?|$)/)
+  const versionId = m?.[1]
+  if (!versionId) throw new HttpError(400, 'BAD_ID', 'invalid version id')
+  try {
+    await withdrawPublishVersion(versionId, uid(user))
+    sendJson(res, 200, { ok: true })
+  } catch (e) {
+    throw mapMarketplaceError(e)
+  }
+}
+
+// ── POST /api/marketplace/:slug/unlist ────────────────────────────────────
+// 发布者自助下架自己的 active/current listing。与 admin revoke 不同:这不是
+// kill-switch,未来新版本审核通过会把 unlisted 重新变 active;revoked 绝不复活。
+export async function handleMarketplaceUnlist(
+  req: IncomingMessage,
+  res: ServerResponse,
+  deps: { jwtSecret: string | Uint8Array },
+): Promise<void> {
+  const user = await requireAuth(req, deps.jwtSecret)
+  const m = (req.url ?? '').match(/\/api\/marketplace\/([a-z0-9][a-z0-9-]{1,63})\/unlist(?:\?|$)/)
+  const slug = m?.[1]
+  if (!slug) throw new HttpError(400, 'BAD_SLUG', 'invalid slug')
+  const body = (await readJsonBody(req).catch(() => ({}))) as Record<string, unknown>
+  const reason =
+    typeof body.reason === 'string' && body.reason.trim()
+      ? body.reason.trim().slice(0, 500)
+      : 'unlisted by owner'
+  try {
+    const affectedUserIds = await ownerUnlistListing(slug, uid(user), reason)
+    sendJson(res, 200, { ok: true, affectedInstalls: affectedUserIds.length, affectedUserIds })
+  } catch (e) {
+    throw mapMarketplaceError(e)
+  }
+}
+
 // ── GET /api/marketplace/:slug ─────────────────────────────────────────────
 // Full detail incl. the complete SKILL.md (the install-confirm dialog shows it).
 export async function handleMarketplaceDetail(
@@ -619,7 +672,12 @@ export async function handleAdminMarketplaceReview(
   const decision = body.decision
   if (decision !== 'approve' && decision !== 'reject')
     throw new HttpError(400, 'BAD_REQUEST', 'decision must be approve|reject')
-  const note = typeof body.note === 'string' ? body.note.slice(0, 2000) : undefined
+  const note =
+    decision === 'reject'
+      ? rejectionNote(body.note)
+      : typeof body.note === 'string'
+        ? body.note.trim().slice(0, 2000) || undefined
+        : undefined
   try {
     await reviewVersion({
       versionId: id,
@@ -672,7 +730,12 @@ export async function handleAdminMarketplaceReviewBatch(
   if (versionIds.length === 0)
     throw new HttpError(400, 'BAD_REQUEST', 'versionIds must contain at least one id')
 
-  const note = typeof body.note === 'string' ? body.note.slice(0, 2000) : undefined
+  const note =
+    decision === 'reject'
+      ? rejectionNote(body.note)
+      : typeof body.note === 'string'
+        ? body.note.trim().slice(0, 2000) || undefined
+        : undefined
   const results = await reviewVersions({
     versionIds,
     reviewerUserId: uid(admin),

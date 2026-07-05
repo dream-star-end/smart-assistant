@@ -30,6 +30,7 @@ import type {
   MarketplacePending,
   MarketplacePublishInput,
   MarketplacePublishResult,
+  MarketplaceReviewBatchResult,
   MarketplaceSearchResult,
   HupiCreateResult,
   LoginResult,
@@ -1599,6 +1600,32 @@ export const api = {
       ),
     ).then((b) => b.publishes || []),
 
+  /** 撤销自己的待审发布（POST /api/marketplace/my-publishes/:id/withdraw）。 */
+  withdrawMarketplacePublish: (a: AuthSession, versionId: string) =>
+    jsonOrThrow<{ ok: boolean }>(
+      callWithRefresh(a, (t) =>
+        fetch(`/api/marketplace/my-publishes/${encodeURIComponent(versionId)}/withdraw`, {
+          method: "POST",
+          credentials: "include",
+          headers: bearerHeaders(t, true),
+          body: JSON.stringify({}),
+        }),
+      ),
+    ),
+
+  /** 发布者自助下架自己的当前上架条目（POST /api/marketplace/:slug/unlist）。 */
+  unlistMarketplaceListing: (a: AuthSession, slug: string, reason?: string) =>
+    jsonOrThrow<{ ok: boolean; affectedInstalls: number; affectedUserIds: number[] }>(
+      callWithRefresh(a, (t) =>
+        fetch(`/api/marketplace/${encodeURIComponent(slug)}/unlist`, {
+          method: "POST",
+          credentials: "include",
+          headers: bearerHeaders(t, true),
+          body: JSON.stringify({ reason }),
+        }),
+      ),
+    ),
+
   /** 我的智能体（GET /api/marketplace/my-agents：默认全能助手 + 已安装市场智能体）。 */
   listMyAgents: (a: AuthSession) =>
     jsonOrThrow<{ agents: MarketplaceMyAgent[] }>(
@@ -1637,6 +1664,24 @@ export const api = {
           credentials: "include",
           headers: bearerHeaders(t, true),
           body: JSON.stringify({ decision, note }),
+        }),
+      ),
+    ),
+
+  /** 批量审核(批准/拒绝)多个待审版本（POST /api/admin/marketplace/review-batch）。 */
+  adminMarketplaceReviewBatch: (
+    a: AuthSession,
+    versionIds: string[],
+    decision: "approve" | "reject",
+    note?: string,
+  ) =>
+    jsonOrThrow<MarketplaceReviewBatchResult>(
+      callWithRefresh(a, (t) =>
+        fetch("/api/admin/marketplace/review-batch", {
+          method: "POST",
+          credentials: "include",
+          headers: bearerHeaders(t, true),
+          body: JSON.stringify({ versionIds, decision, note }),
         }),
       ),
     ),
