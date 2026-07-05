@@ -13,6 +13,7 @@
 import { appendFile, readFile, rename, writeFile } from 'node:fs/promises'
 import { mkdir } from 'node:fs/promises'
 import { dirname } from 'node:path'
+import { TEAM_CARD_CLIENT_DISPLAY_FIELDS } from '@openclaude/protocol/teamCards'
 import Database from 'better-sqlite3'
 import { paths } from './paths.js'
 
@@ -694,12 +695,14 @@ const CLIENT_PUT_ALLOWED_STATUSES: ReadonlySet<string> = new Set<string>([
 // Team/delegate cards are client-owned UI structures (agent-group /
 // delegate-progress) that must survive refresh. Keep these scoped to those
 // roles so ordinary assistant/tool ephemeral fields still get stripped.
-const CLIENT_PUT_TEAM_MESSAGE_FIELDS: ReadonlySet<string> = new Set<string>([
-  'startTime', '_completed',
-  '_delegate', '_delegateAgentId', '_delegateGoal', '_delegateRunId',
-  '_duration', '_resultPreview', '_isError',
-  'runId', 'goal', 'entries', 'summary', '_adoptedInto', 'error',
-])
+//
+// 清单权威在 @openclaude/protocol/teamCards 的 TEAM_CARD_CLIENT_DISPLAY_FIELDS
+// (与 web-react persist.ts 的 mergeLocalTeamDisplayFields 共享同一常量),这里
+// 只做 Set 化。别在这里就地加字段 —— 加进共享常量,两侧才不会再漂移
+// (f2272c08 教训:前端加 _agentGroupOrigin/_teamFallback 服务端没跟上)。
+const CLIENT_PUT_TEAM_MESSAGE_FIELDS: ReadonlySet<string> = new Set<string>(
+  TEAM_CARD_CLIENT_DISPLAY_FIELDS,
+)
 
 const SERVER_AUTHORITATIVE_FIELDS: ReadonlySet<string> = new Set<string>([
   '_source', '_seq', 'usage',

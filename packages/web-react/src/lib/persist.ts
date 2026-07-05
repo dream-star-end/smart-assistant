@@ -13,6 +13,7 @@
  *  - **可测性**：IDBFactory 可注入（默认 globalThis.indexedDB），合并/命名空间为纯函数，
  *    无需真实 IndexedDB 即可单测核心逻辑。
  */
+import { TEAM_CARD_CLIENT_DISPLAY_FIELDS } from "@openclaude/protocol/teamCards";
 import type { ChatMessage } from "./chat/model";
 import { friendlyDelegateResultPreview } from "./chat/reducer";
 
@@ -294,25 +295,10 @@ function mergeLocalTeamDisplayFields(serverMsg: ChatMessage, localMsg?: ChatMess
   if (!nonEmptyString(server.text) && nonEmptyString(local.text)) ensureOut().text = local.text;
   copyArrayIfRicher("childBlocks");
   copyArrayIfRicher("entries");
-  for (const key of [
-    "startTime",
-    "completedAt",
-    "_completed",
-    "_delegate",
-    "_delegateAgentId",
-    "_delegateGoal",
-    "_agentGroupOrigin",
-    "_teamFallback",
-    "_delegateRunId",
-    "_duration",
-    "_resultPreview",
-    "_isError",
-    "runId",
-    "goal",
-    "summary",
-    "error",
-    "_adoptedInto",
-  ] as const) {
+  // 字段清单从 @openclaude/protocol/teamCards 单一权威派生(服务端 strip 白名单同源),
+  // 新增团队展示字段只加在那里,两侧自然同步;数组字段上面已按"更富者胜"特判。
+  for (const key of TEAM_CARD_CLIENT_DISPLAY_FIELDS) {
+    if (key === "childBlocks" || key === "entries") continue;
     copyIfMissing(key);
   }
   for (const key of [

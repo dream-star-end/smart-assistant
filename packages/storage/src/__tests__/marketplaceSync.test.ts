@@ -23,7 +23,9 @@ process.env.OPENCLAUDE_HOME = testHome
 process.env.OPENCLAUDE_V3_MASTER_BASE_URL = 'http://master.internal'
 process.env.OPENCLAUDE_V3_CONTAINER_TOKEN = 'tok-test'
 
-const { syncMarketplaceHub } = await import('../marketplaceSync.js')
+const { _resetMarketplaceSyncStateForTest, syncMarketplaceHub } = await import(
+  '../marketplaceSync.js'
+)
 const { marketplaceArtifactHash } = await import('../skillEmbedding.js')
 const { buildAgentSkillStore } = await import('../skillStore.js')
 const { readAgentsConfig } = await import('../config.js')
@@ -75,9 +77,13 @@ function syncPayload(skills: Array<{ slug: string; md: string; hash?: string; ag
 }
 
 let fetchPayload: unknown = { skills: [] }
+let fetchStatus = 200 // 非 200 时模拟 master 侧失败(fetchInstalled → null)
+let fetchCalls = 0 // 单飞/TTL 断言用:实际打到 mock 的 sync 请求数
 const realFetch = globalThis.fetch
 globalThis.fetch = (async (url: string) => {
   if (String(url).includes('/internal/v3/marketplace/sync')) {
+    fetchCalls++
+    if (fetchStatus !== 200) return new Response('boom', { status: fetchStatus })
     return new Response(JSON.stringify(fetchPayload), {
       status: 200,
       headers: { 'content-type': 'application/json' },
@@ -88,6 +94,11 @@ globalThis.fetch = (async (url: string) => {
 
 afterEach(() => {
   fetchPayload = { skills: [] }
+  fetchStatus = 200
+  fetchCalls = 0
+  // 清掉单飞/成功 TTL/告警限频状态 —— 否则上一个用例的成功 sync 会让下一个
+  // 用例的调用被 TTL 短路。
+  _resetMarketplaceSyncStateForTest()
 })
 
 after(() => {
@@ -135,6 +146,8 @@ describe('syncMarketplaceHub', () => {
     assert.ok(existsSync(paths.hubSkillMd('temp-skill')))
 
     // next sync no longer lists it → reconcile removes it
+    // (同一用例内的第二次调用会撞上成功 TTL,先复位)
+    _resetMarketplaceSyncStateForTest()
     fetchPayload = { skills: [] }
     await syncMarketplaceHub()
     assert.ok(!existsSync(paths.hubSkillDir('temp-skill')), 'revoked skill should be removed')
@@ -199,6 +212,8 @@ describe('syncMarketplaceHub — agents (RFC M3)', () => {
     assert.ok((await readAgentsConfig()).agents.find((a) => a.id === 'writer-bot'))
 
     // next sync no longer lists it → reconcile removes the market entry
+    // (同一用例内的第二次调用会撞上成功 TTL,先复位)
+    _resetMarketplaceSyncStateForTest()
     fetchPayload = agentsPayload([])
     await syncMarketplaceHub()
     const cfg = await readAgentsConfig()
@@ -225,5 +240,64 @@ describe('syncMarketplaceHub — agents (RFC M3)', () => {
     const mains = cfg.agents.filter((a) => a.id === 'main')
     assert.equal(mains.length, 1, 'exactly one main, no duplicate')
     assert.notEqual(mains[0].source, 'marketplace', 'platform main must NOT be replaced by a market agent')
+  })
+})
+
+describe('syncMarketplaceHub — 单飞 + 成功 TTL 收口', () => {
+  it('coalesces concurrent calls into one in-flight sync (single fetch)', async () => {
+    fetchPayload = syncPayload([{ slug: 'sf-skill', md: skillMd('sf-skill', 'singleflight') }])
+    // 两个并发调用共享同一个 in-flight promise → mock 只被打一次
+    await Promise.all([syncMarketplaceHub(), syncMarketplaceHub()])
+    assert.equal(fetchCalls, 1, 'concurrent calls must share one fetch')
+    assert.ok(existsSync(paths.hubSkillMd('sf-skill')), 'shared flight still reconciles')
+  })
+
+  it('skips the network within the success TTL; force bypasses it', async () => {
+    fetchPayload = syncPayload([{ slug: 'ttl-skill', md: skillMd('ttl-skill', 'ttl') }])
+    await syncMarketplaceHub()
+    assert.equal(fetchCalls, 1)
+
+    // 距上次成功 <5s → 直接返回,不发请求
+    await syncMarketplaceHub()
+    assert.equal(fetchCalls, 1, 'second call within the TTL must not fetch')
+
+    // force 逃生口:绕过 TTL,真正重新拉取
+    await syncMarketplaceHub({ force: true })
+    assert.equal(fetchCalls, 2, 'force must bypass the TTL')
+  })
+
+  it('a failed sync does not arm the TTL (next call retries)', async () => {
+    fetchStatus = 500
+    await syncMarketplaceHub() // 失败,fail-soft 不抛
+    assert.equal(fetchCalls, 1)
+    await syncMarketplaceHub() // 失败不进 TTL → 立刻重试
+    assert.equal(fetchCalls, 2, 'failure must not be cached by the TTL')
+
+    // master 恢复后照常同步成功,并重新武装 TTL
+    fetchStatus = 200
+    fetchPayload = syncPayload([{ slug: 'recover-skill', md: skillMd('recover-skill', 'ok') }])
+    await syncMarketplaceHub()
+    assert.equal(fetchCalls, 3)
+    assert.ok(existsSync(paths.hubSkillMd('recover-skill')))
+    await syncMarketplaceHub()
+    assert.equal(fetchCalls, 3, 'success re-arms the TTL')
+  })
+
+  it('rate-limits fetch-failure warnings to ≤1 per window, with a reason summary', async () => {
+    const warns: string[] = []
+    const realWarn = console.warn
+    console.warn = (...args: unknown[]) => {
+      warns.push(args.map(String).join(' '))
+    }
+    try {
+      fetchStatus = 500
+      await syncMarketplaceHub()
+      await syncMarketplaceHub() // 同一 60s 窗口内的第二次失败 → 不再告警
+    } finally {
+      console.warn = realWarn
+    }
+    const fetchWarns = warns.filter((w) => w.includes('sync fetch failed'))
+    assert.equal(fetchWarns.length, 1, 'two failures in one window → exactly one warn')
+    assert.ok(fetchWarns[0].includes('HTTP 500'), 'warn must carry the failure reason summary')
   })
 })

@@ -156,6 +156,10 @@ describe('_stripClientPutMessage allow-list (T1, T2)', () => {
       _duration: 1234,
       _resultPreview: 'PASS',
       _isError: false,
+      // f2272c08 前端新增的展示字段 —— 服务端白名单必须同步放行,否则全量
+      // PUT 后"临时 Codex 子智能体"标注跨设备退化(清单权威在 protocol)。
+      _agentGroupOrigin: 'codex-collab',
+      _teamFallback: true,
       childBlocks: [{ kind: 'text', text: '审查结果正文' }],
     })
     assert.equal(group?._completed, true)
@@ -163,6 +167,8 @@ describe('_stripClientPutMessage allow-list (T1, T2)', () => {
     assert.equal(group?._delegateGoal, '审查草稿')
     assert.equal(group?._delegateRunId, 'run-1')
     assert.equal(group?._resultPreview, 'PASS')
+    assert.equal(group?._agentGroupOrigin, 'codex-collab')
+    assert.equal(group?._teamFallback, true)
     assert.deepEqual(group?.childBlocks, [{ kind: 'text', text: '审查结果正文' }])
 
     const progress = _stripClientPutMessage({
@@ -195,10 +201,29 @@ describe('_stripClientPutMessage allow-list (T1, T2)', () => {
       _completed: true,
       summary: 'should drop',
       entries: [{ phase: 'text', text: 'should drop', ts: 31 }],
+      _agentGroupOrigin: 'codex-collab',
+      _teamFallback: true,
     })
     assert.equal(ordinary?._completed, undefined)
     assert.equal(ordinary?.summary, undefined)
     assert.equal(ordinary?.entries, undefined)
+    assert.equal(ordinary?._agentGroupOrigin, undefined, 'team-only field stripped on assistant')
+    assert.equal(ordinary?._teamFallback, undefined, 'team-only field stripped on assistant')
+  })
+
+  it('preserves _agentGroupOrigin / _teamFallback on delegate-progress rows too', () => {
+    // 两个 team-owned role 都放行(清单权威 = protocol TEAM_CARD_CLIENT_DISPLAY_FIELDS)。
+    const progress = _stripClientPutMessage({
+      id: 'dp-origin',
+      role: 'delegate-progress',
+      text: '',
+      ts: 40,
+      runId: 'run-2',
+      _agentGroupOrigin: 'codex-collab',
+      _teamFallback: true,
+    })
+    assert.equal(progress?._agentGroupOrigin, 'codex-collab')
+    assert.equal(progress?._teamFallback, true)
   })
 
   it('preserves status sending/queued/sent/read but drops "replied"', () => {
