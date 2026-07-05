@@ -26,6 +26,8 @@ import { AgentGroupCard } from "./chat/AgentGroupCard";
 import { TeamPanel } from "./chat/TeamPanel";
 import { PermissionCard, type PermissionRespond } from "./chat/PermissionCard";
 import { ToolCardSlot } from "./chat/toolCardSlot";
+import { currentTurnStartIndex } from "./chat/turnSegment";
+import { MessageBoundary } from "./MessageBoundary";
 import { asStr, resolveToolInput } from "./tool/format";
 import { researchToolCard } from "./tool/researchCards";
 import { Avatar } from "./ui";
@@ -36,12 +38,15 @@ type RendererProps = {
   sig: string;
   isLast: boolean;
   sending: boolean;
+  /** 是否属于「当前活跃段」(最后一条 user 消息之后)。判定收口在 chat/turnSegment.ts,
+   *  与 PinnedTaskTracker 的任务源提取共用同一函数——决定 TodoWrite/plan 抑制还是渲染只读卡。*/
+  inActiveTurn: boolean;
   cb: CardCallbacks;
   onRespondPermission: PermissionRespond;
 };
 
 export const MessageRenderer = memo(
-  function MessageRenderer({ message, isLast, sending, cb, onRespondPermission }: RendererProps) {
+  function MessageRenderer({ message, isLast, sending, inActiveTurn, cb, onRespondPermission }: RendererProps) {
     const ctx = { isLast, sending };
     switch (messageKind(message)) {
       case "user":
@@ -51,9 +56,13 @@ export const MessageRenderer = memo(
       case "thinking":
         return <ThinkingCard msg={message} ctx={ctx} />;
       case "tool": {
-        // 任务列表(TodoWrite)改由钉在输入框上方的 PinnedTaskTracker 展示:inline 卡不再
-        // 渲染,避免与 HUD 重复、且不被消息流滚走。其余工具卡照常。
-        if (message.toolName === "TodoWrite") return null;
+        // 任务列表(TodoWrite):当前活跃段且本轮进行中 → 由钉在输入框上方的 PinnedTaskTracker
+        // (HUD)接管,inline 卡抑制避免上下重复;历史段(或 turn 已结束、HUD 隐藏后)渲染
+        // 既有 TodoWrite 只读紧凑卡(含步骤与完成状态),翻旧会话仍能看到当时的计划。
+        if (message.toolName === "TodoWrite") {
+          if (inActiveTurn && sending) return null;
+          return <ToolCardSlot message={message} />;
+        }
         // oc-* 研究工具:直接渲染干净的专属卡片,**去掉"终端 + 命令"外壳**(boss 反馈套壳没必要)。
         // 命令出错时 researchToolCard 返回 null → 回落 ToolCardSlot 终端卡,保证报错可见。
         const ocCmd = asStr(resolveToolInput(message)?.command);
@@ -64,9 +73,10 @@ export const MessageRenderer = memo(
         return <ToolCardSlot message={message} />;
       }
       case "plan":
-        // structured plan steps 已统一进 composer 上方的 PinnedTaskTracker；
-        // 这里只保留 text-only plan/explanation 的 inline 兜底，避免同一执行计划上下重复两张卡。
-        if ((message.steps?.length ?? 0) > 0) return null;
+        // structured plan steps:当前活跃段且本轮进行中 → 统一进 composer 上方的
+        // PinnedTaskTracker,inline 抑制防同一计划上下重复两张卡;历史段渲染 PlanCard
+        // 只读卡(含步骤与状态)。text-only plan(无 steps)恒走 inline 兜底。
+        if ((message.steps?.length ?? 0) > 0 && inActiveTurn && sending) return null;
         return <PlanCard msg={message} />;
       case "permission":
         return <PermissionCard msg={message} onRespond={onRespondPermission} />;
@@ -82,14 +92,19 @@ export const MessageRenderer = memo(
     }
   },
   (a, b) =>
-    a.sig === b.sig && a.cb === b.cb && a.onRespondPermission === b.onRespondPermission,
+    a.sig === b.sig &&
+    // 段归属变化(新 user 消息推进边界)不体现在 sig 里,必须单独参与比较,
+    // 否则上一轮的 TodoWrite/plan 卡在跨轮时不会从"抑制"切到"只读卡"。
+    a.inActiveTurn === b.inActiveTurn &&
+    a.cb === b.cb &&
+    a.onRespondPermission === b.onRespondPermission,
 );
 
 const LOAD_MORE_STEP = 100;
 
-/** 渲染项:普通单条消息,或"连续多个委派智能体聚成的团队"。 */
+/** 渲染项:普通单条消息(idx 为全局下标,供活跃段归属判定),或"连续多个委派智能体聚成的团队"。 */
 type RenderItem =
-  | { kind: "single"; m: ChatMessage; isLast: boolean }
+  | { kind: "single"; m: ChatMessage; isLast: boolean; idx: number }
   | { kind: "team"; members: ChatMessage[]; sig: string };
 
 /**
@@ -119,10 +134,10 @@ function coalesceTeam(
         });
         continue;
       }
-      items.push({ kind: "single", m: members[0], isLast: start + i === total - 1 });
+      items.push({ kind: "single", m: members[0], isLast: start + i === total - 1, idx: start + i });
       continue;
     }
-    items.push({ kind: "single", m, isLast: start + i === total - 1 });
+    items.push({ kind: "single", m, isLast: start + i === total - 1, idx: start + i });
   }
   return items;
 }
@@ -144,6 +159,9 @@ export function MessageList({
   const start = Math.max(0, total - visible);
   const slice = messages.slice(start);
   const last = messages[total - 1];
+  // 当前活跃段起点(最后一条 user 消息之后)——TodoWrite/plan 的 HUD 抑制只作用于该段,
+  // 与 PinnedTaskTracker 的任务源提取共用 turnSegment.ts 同一判定。
+  const turnStart = currentTurnStartIndex(messages);
   // typing 指示：本轮进行中、且末条不是会自渲流式态的卡（assistant/thinking 自带光标，
   // permission 处于等待用户决策态）。
   const showTyping =
@@ -164,21 +182,31 @@ export function MessageList({
           加载更多历史（还有 {start} 条）
         </button>
       )}
-      {coalesceTeam(slice, start, total, sending).map((it) =>
-        it.kind === "team" ? (
-          <TeamPanel key={it.members[0].id} members={it.members} sig={it.sig} />
-        ) : (
-          <MessageRenderer
-            key={it.m.id}
-            message={it.m}
-            sig={messageSignature(it.m, { isLast: it.isLast, sending })}
-            isLast={it.isLast}
-            sending={sending}
-            cb={cb}
-            onRespondPermission={onRespondPermission}
-          />
-        ),
-      )}
+      {/* 每条消息(含团队面板)外包一层 MessageBoundary:单条渲染抛异常只降级该条,
+          不让 React 卸载整棵树白屏。key 稳定在 boundary 上;memo 比较仍由内层组件承担。 */}
+      {coalesceTeam(slice, start, total, sending).map((it) => {
+        if (it.kind === "team") {
+          return (
+            <MessageBoundary key={it.members[0].id} messageId={it.members[0].id} sig={it.sig}>
+              <TeamPanel members={it.members} sig={it.sig} />
+            </MessageBoundary>
+          );
+        }
+        const sig = messageSignature(it.m, { isLast: it.isLast, sending });
+        return (
+          <MessageBoundary key={it.m.id} messageId={it.m.id} sig={sig}>
+            <MessageRenderer
+              message={it.m}
+              sig={sig}
+              isLast={it.isLast}
+              sending={sending}
+              inActiveTurn={it.idx >= turnStart}
+              cb={cb}
+              onRespondPermission={onRespondPermission}
+            />
+          </MessageBoundary>
+        );
+      })}
       {showTyping && (
         <div className="flex gap-4 animate-in">
           {/* 与 AssistantCard 一致:移动端隐藏头像,窄屏正文占满宽度。 */}

@@ -14,6 +14,7 @@ import { useEffect, useRef, useState } from "react";
 import type { ChatMessage } from "../../lib/chat/model";
 import { cn } from "../../lib/utils";
 import { asArr, asStr, resolveToolInput } from "../tool/format";
+import { currentTurnStartIndex } from "./turnSegment";
 
 export type TodoItem = { content: string; status: string; activeForm?: string };
 
@@ -44,16 +45,21 @@ function normalizeTodoItems(todos: unknown): TodoItem[] {
 }
 
 /**
- * 从消息流提取**最新一次顶层任务源**(主 agent 的任务列表;replace 语义,最后一次即
- * 权威)。任务源包括:
+ * 从**当前活跃段**(最后一条 user 消息之后,即当前 turn;判定收口 turnSegment.ts,与
+ * MessageRenderer 的历史段抑制共用同一函数)提取最新顶层任务源(主 agent 的任务列表;
+ * replace 语义,最后一次即权威)。任务源包括:
  *   1. CCB/legacy TodoWrite tool 的 todos;
  *   2. Codex app-server structured `role:"plan"` 的 steps。
  *
+ * 归属判定走内容轴(任务集是否属于当前轮)而非时间轴(是否在发送)——全历史反向扫描
+ * 会让几十轮前的旧任务在下一轮无关提问时复活钉在输入框上。多轮连续任务场景自然成立:
+ * agent 下轮继续更新同一 todo 列表时,新 turn 里有新的 TodoWrite 块。
  * 子 agent 的 TodoWrite 是 agent-group 子块,不进主 HUD。反向扫描,命中最近的结构化
  * 任务源即返回；text-only plan 没有 steps,继续保留 inline PlanCard 兜底。
  */
 export function extractLatestTodos(messages: ChatMessage[]): TodoItem[] {
-  for (let i = messages.length - 1; i >= 0; i--) {
+  const turnStart = currentTurnStartIndex(messages);
+  for (let i = messages.length - 1; i >= turnStart; i--) {
     const m = messages[i];
     if (!m) continue;
     if (m.role === "plan" && Array.isArray(m.steps)) {

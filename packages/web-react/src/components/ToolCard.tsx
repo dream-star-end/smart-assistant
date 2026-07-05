@@ -48,8 +48,10 @@ export function ToolCard({ message }: { message: ToolLike }) {
 
   const completed = !!renderTool._completed;
   const isError = !!renderTool.error;
-  const isRunning = !completed && !isError;
-  const statusLabel = isRunning ? "运行中" : isError ? "失败" : "完成";
+  // 取消(如 Codex item status 'cancelled')是中性终态:≠ 失败(不红)、≠ 运行中(不转圈)。
+  const isCancelled = !isError && !!renderTool.cancelled;
+  const isRunning = !completed && !isError && !isCancelled;
+  const statusLabel = isRunning ? "运行中" : isError ? "失败" : isCancelled ? "已取消" : "完成";
 
   const hasInput = !!input && Object.keys(input).length > 0;
   const hasOutput = !!renderTool.output || !!renderTool.bashTail;
@@ -88,12 +90,14 @@ export function ToolCard({ message }: { message: ToolLike }) {
         <span className="shrink-0 text-[13px] font-medium text-fg">{meta.label}</span>
         {summary && <span className="min-w-0 truncate font-mono text-xs text-muted">{summary}</span>}
         <span className="ml-auto flex shrink-0 items-center gap-2">
-          {/* running/done 的 spinner/✓ 是 aria-hidden，需 sr-only 播报状态；error 的 Badge 自带可见文案，无需重复。 */}
-          {!isError && <span className="sr-only">{statusLabel}</span>}
+          {/* running/done 的 spinner/✓ 是 aria-hidden，需 sr-only 播报状态；error/cancelled 的 Badge 自带可见文案，无需重复。 */}
+          {!isError && !isCancelled && <span className="sr-only">{statusLabel}</span>}
           {isRunning ? (
             <Spinner size={13} className="text-accent" />
           ) : isError ? (
             <Badge tone="danger">失败</Badge>
+          ) : isCancelled ? (
+            <Badge tone="neutral">已取消</Badge>
           ) : (
             <Check size={14} className="text-success" aria-hidden="true" />
           )}

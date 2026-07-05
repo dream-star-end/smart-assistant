@@ -66,6 +66,45 @@ describe("extractLatestTodos", () => {
     expect(extractLatestTodos([bad]).map((t) => t.content)).toEqual(["真的"]);
   });
 
+  test("旧 turn 任务不跨轮复活:turn1 有 todo → turn2 新 user 消息后无任务源 → 空", () => {
+    const msgs: ChatMessage[] = [
+      { id: "u1", role: "user", text: "帮我做任务", ts: 0 } as ChatMessage,
+      todoMsg("t1", [
+        { content: "旧任务一", status: "completed" },
+        { content: "旧任务二", status: "in_progress" },
+      ]),
+      { id: "a1", role: "assistant", text: "进行中", ts: 1 } as ChatMessage,
+      // turn2:用户问无关问题,本轮无 TodoWrite/plan → HUD 不得复活 turn1 的旧任务
+      { id: "u2", role: "user", text: "今天天气如何", ts: 2 } as ChatMessage,
+      { id: "a2", role: "assistant", text: "晴", ts: 3 } as ChatMessage,
+    ];
+    expect(extractLatestTodos(msgs)).toEqual([]);
+  });
+
+  test("多轮连续任务:新 turn 里的新 TodoWrite 正常进 HUD(替代旧 turn 任务集)", () => {
+    const msgs: ChatMessage[] = [
+      { id: "u1", role: "user", text: "开始", ts: 0 } as ChatMessage,
+      todoMsg("t1", [{ content: "旧任务", status: "in_progress" }]),
+      { id: "u2", role: "user", text: "继续", ts: 1 } as ChatMessage,
+      todoMsg("t2", [
+        { content: "旧任务", status: "completed" },
+        { content: "新任务", status: "in_progress" },
+      ]),
+    ];
+    expect(extractLatestTodos(msgs).map((t) => `${t.content}:${t.status}`)).toEqual([
+      "旧任务:completed",
+      "新任务:in_progress",
+    ]);
+  });
+
+  test("旧 turn 的 structured plan 同样不跨轮复活", () => {
+    const msgs: ChatMessage[] = [
+      planMsg("p1", [{ step: "旧计划", status: "inProgress" }]),
+      { id: "u2", role: "user", text: "换个话题", ts: 1 } as ChatMessage,
+    ];
+    expect(extractLatestTodos(msgs)).toEqual([]);
+  });
+
   test("空/畸形 structured plan 不生成 HUD todos", () => {
     expect(extractLatestTodos([planMsg("empty", [])])).toEqual([]);
     expect(

@@ -340,6 +340,48 @@ describe("ToolCard 二级分派 + 状态 (P5)", () => {
     expect(screen.getByText("实现适配")).toBeInTheDocument();
   });
 
+  test("Codex 取消态 → 中性「已取消」徽标,不显示红色失败、不转圈", () => {
+    const item = {
+      type: "mcpToolCall",
+      id: "call_cancel",
+      server: "openclaude_memory",
+      tool: "skill_search",
+      status: "cancelled",
+      arguments: { query: "x" },
+    };
+    const { container } = render(
+      <ToolCard
+        message={{
+          toolName: "codex:mcpToolCall",
+          inputJson: item,
+          output: JSON.stringify(item),
+          _completed: true,
+        }}
+      />,
+    );
+    expect(screen.getByText("已取消")).toBeInTheDocument();
+    expect(screen.queryByText("失败")).toBeNull();
+    expect(container.querySelector(".animate-spin")).toBeNull();
+  });
+
+  test("Codex 取消态在未标 _completed 时也不当运行中(不转圈)", () => {
+    const item = {
+      type: "mcpToolCall",
+      id: "call_cancel2",
+      server: "openclaude_memory",
+      tool: "skill_search",
+      status: "cancelled",
+      arguments: { query: "y" },
+    };
+    const { container } = render(
+      <ToolCard
+        message={{ toolName: "codex:mcpToolCall", inputJson: item, output: JSON.stringify(item), _completed: false }}
+      />,
+    );
+    expect(screen.getByText("已取消")).toBeInTheDocument();
+    expect(container.querySelector(".animate-spin")).toBeNull();
+  });
+
   test("Codex image/context 简单 item 不 raw dump id/type wrapper", () => {
     render(
       <ToolCard

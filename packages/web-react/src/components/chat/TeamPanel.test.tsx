@@ -84,4 +84,16 @@ describe("TeamPanel 团队协作面板", () => {
     expect(screen.getByText("临时子智能体 2")).toBeInTheDocument();
     expect(screen.queryByText("临时 Codex 子智能体 1")).not.toBeInTheDocument();
   });
+
+  test("hidden-reviewer(管理 API 隐藏的系统 agent)显示映射名「质量审查员」而非裸 id", () => {
+    const members = [
+      member("a", { _delegateAgentId: "hidden-reviewer", _delegateGoal: "审查代码质量", _completed: false }),
+      member("b", { _delegateAgentId: "coder", _delegateGoal: "写代码", _completed: false }),
+    ];
+    render(<TeamPanel members={members} sig="hr" />);
+    expect(screen.getByText("质量审查员")).toBeInTheDocument();
+    expect(screen.queryByText("hidden-reviewer")).not.toBeInTheDocument();
+    // 非系统 agent 照常回退裸 id(用户级 id 本身可读)
+    expect(screen.getByText("coder")).toBeInTheDocument();
+  });
 });

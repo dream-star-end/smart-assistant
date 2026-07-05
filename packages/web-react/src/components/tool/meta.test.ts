@@ -1,5 +1,5 @@
 import { describe, expect, test } from "vitest";
-import { detectShellFileWrites } from "./format";
+import { detectShellFileWrites, normalizeToolForDisplay } from "./format";
 import { detectOcCli, parseMcpName, resolveToolMeta, toolSummary } from "./meta";
 
 describe("parseMcpName (P5)", () => {
@@ -71,6 +71,14 @@ describe("toolSummary 摘要 (P5)", () => {
     expect(
       toolSummary("mcp__openclaude-memory__delegate_task", { agentId: "coder", goal: "修复 bug" }),
     ).toBe("→ coder 修复 bug");
+  });
+  test("delegate_task 委派系统 agent(hidden-reviewer)显示映射名而非裸 id", () => {
+    expect(
+      toolSummary("mcp__openclaude-memory__delegate_task", { agentId: "hidden-reviewer", goal: "审查代码" }),
+    ).toBe("→ 质量审查员 审查代码");
+    expect(toolSummary("delegate_task", { agentId: "hidden-reviewer", goal: "审查代码" })).toBe(
+      "→ 质量审查员 审查代码",
+    );
   });
   test("MCP memory skill_search / web-context 摘要", () => {
     expect(toolSummary("mcp__openclaude-memory__skill_search", { query: "literature-search" })).toBe(
@@ -163,5 +171,78 @@ describe("Bash heredoc 写文件语义卡", () => {
     const command = "cat > script.sh <<'EOF'\noc-web extract https://example.com\nEOF";
     expect(resolveToolMeta("Bash", { command }).label).toBe("写入文件");
     expect(toolSummary("Bash", { command })).toBe("script.sh");
+  });
+});
+
+describe("Codex 工具归一化:cancelled 态与 plan 字段对齐 (fix C)", () => {
+  const mcpItem = (status: string) => ({
+    type: "mcpToolCall",
+    id: "call_1",
+    server: "web_context",
+    tool: "web_context_extract_url",
+    status,
+    arguments: { url: "https://example.com" },
+  });
+
+  test("status cancelled → 中性取消态,不再标成失败红卡", () => {
+    const item = mcpItem("cancelled");
+    const d = normalizeToolForDisplay({
+      toolName: "codex:mcpToolCall",
+      inputJson: item,
+      output: JSON.stringify(item),
+      _completed: true,
+    });
+    expect(d.tool.error).toBeFalsy();
+    expect(d.tool.cancelled).toBe(true);
+  });
+
+  test("status failed 仍归失败,cancelled 标志不误置", () => {
+    const item = mcpItem("failed");
+    const d = normalizeToolForDisplay({
+      toolName: "codex:mcpToolCall",
+      inputJson: item,
+      output: JSON.stringify(item),
+      _completed: true,
+    });
+    expect(d.tool.error).toBe(true);
+    expect(d.tool.cancelled).toBeFalsy();
+  });
+
+  test("plan steps 元素读后端权威字段 {step,status}(不再渲染成空列表)", () => {
+    const d = normalizeToolForDisplay({
+      toolName: "codex:plan",
+      inputJson: {
+        type: "plan",
+        steps: [
+          { step: "改代码", status: "inProgress" },
+          { step: "跑测试", status: "pending" },
+        ],
+      },
+      _completed: true,
+    });
+    expect(d.name).toBe("TodoWrite");
+    expect(d.input?.todos).toEqual([
+      { content: "改代码", status: "inProgress" },
+      { content: "跑测试", status: "pending" },
+    ]);
+  });
+
+  test("item 以 {plan:[{step,…}]} 形态下发时兜底可解析", () => {
+    const d = normalizeToolForDisplay({
+      toolName: "codex:todo_list",
+      inputJson: { type: "todo_list", plan: [{ step: "第一步", status: "completed" }] },
+      _completed: true,
+    });
+    expect(d.name).toBe("TodoWrite");
+    expect(d.input?.todos).toEqual([{ content: "第一步", status: "completed" }]);
+  });
+
+  test("legacy text/description 字段仍兼容", () => {
+    const d = normalizeToolForDisplay({
+      toolName: "codex:plan",
+      inputJson: { type: "plan", steps: [{ text: "旧字段", status: "pending" }] },
+      _completed: true,
+    });
+    expect(d.input?.todos).toEqual([{ content: "旧字段", status: "pending" }]);
   });
 });

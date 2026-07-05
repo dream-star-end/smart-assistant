@@ -20,6 +20,8 @@ export type ToolLike = {
   output?: string | null;
   text?: string | null;
   error?: boolean;
+  /** 取消态(如 Codex item status 'cancelled'):中性终态,≠ 失败,卡片显示「已取消」。 */
+  cancelled?: boolean;
   bashTail?: BashTail;
   durationMs?: number | null;
 };
@@ -184,7 +186,14 @@ function fallbackNonJsonOutput(tool: ToolLike): string | null {
 function codexFailed(item: Record<string, unknown> | null): boolean {
   if (!item) return false;
   const status = asStr(item.status).toLowerCase();
-  return status === "failed" || status === "error" || status === "cancelled" || item.error != null;
+  return status === "failed" || status === "error" || item.error != null;
+}
+
+/** cancelled ≠ failed:用户/系统中止是中性终态,单独归类(卡片显示「已取消」而非红色失败)。 */
+function codexCancelled(item: Record<string, unknown> | null): boolean {
+  if (!item) return false;
+  const status = asStr(item.status).toLowerCase();
+  return status === "cancelled" || status === "canceled";
 }
 
 function compactArgs(args: Record<string, unknown>, rawArgs: unknown): Record<string, unknown> {
@@ -194,11 +203,20 @@ function compactArgs(args: Record<string, unknown>, rawArgs: unknown): Record<st
 }
 
 function normalizeCodexPlan(input: Record<string, unknown>): Record<string, unknown> {
-  const rawSteps = Array.isArray(input.steps) ? input.steps : Array.isArray(input.items) ? input.items : [];
+  // 后端结构化 plan 的权威字段是 {step, status}(见 gateway engine codexAppServerRunner
+  // turn/plan/updated 的归一化);item 形态还可能把数组挂在 `plan` 键下({plan:[{step,…}]}),
+  // 与 steps/items 一并兜底,否则这两种形态会渲染成空列表。
+  const rawSteps = Array.isArray(input.steps)
+    ? input.steps
+    : Array.isArray(input.items)
+      ? input.items
+      : Array.isArray(input.plan)
+        ? input.plan
+        : [];
   const todos = rawSteps
     .filter((step): step is Record<string, unknown> => !!step && typeof step === "object" && !Array.isArray(step))
     .map((step) => {
-      const content = asStr(step.text) || asStr(step.description);
+      const content = asStr(step.step) || asStr(step.text) || asStr(step.description);
       const status = asStr(step.status) || (step.completed === true ? "completed" : "pending");
       return { content, status };
     });
@@ -214,6 +232,7 @@ function normalizeCodexTool(message: ToolLike, codexType: string): DisplayTool |
     ...message,
     output: outputText,
     error: !!message.error || codexFailed(finalItem),
+    cancelled: !!message.cancelled || codexCancelled(finalItem),
     durationMs:
       typeof finalItem?.durationMs === "number" ? (finalItem.durationMs as number) : message.durationMs,
   };
@@ -255,7 +274,9 @@ function normalizeCodexTool(message: ToolLike, codexType: string): DisplayTool |
 
   if (codexType === "plan" || codexType === "todo_list") {
     const finalPlan =
-      finalItem && (Array.isArray(finalItem.steps) || Array.isArray(finalItem.items)) ? finalItem : mergedItem;
+      finalItem && (Array.isArray(finalItem.steps) || Array.isArray(finalItem.items) || Array.isArray(finalItem.plan))
+        ? finalItem
+        : mergedItem;
     const input = normalizeCodexPlan(asPlainObject(finalPlan));
     return { name: "TodoWrite", input, tool: { ...baseTool, toolName: "TodoWrite", inputJson: input } };
   }

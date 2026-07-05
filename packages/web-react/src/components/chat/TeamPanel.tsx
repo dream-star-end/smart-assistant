@@ -19,11 +19,13 @@ import { childSignature } from "../../lib/chat/render";
 import { cn } from "../../lib/utils";
 import { Badge, Spinner } from "../ui";
 import { ChildBlockView } from "./AgentGroupCard";
+import { agentDisplayName } from "./agentNames";
 
-/** 队员显示名:优先委派的 agentId(已是可读标识),空则按序号兜底。 */
+/** 队员显示名:优先委派的 agentId(经系统 agent 静态映射转显示名——hidden-reviewer 等被
+ *  管理 API 404 隐藏、解析不到 displayName;用户级 id 本身可读直接回退),空则按序号兜底。 */
 function memberName(msg: ChatMessage, idx: number): string {
-  const id = msg._delegateAgentId?.trim();
-  if (id) return id;
+  const name = agentDisplayName(msg._delegateAgentId);
+  if (name) return name;
   if (msg._agentGroupOrigin === "codex-collab" && msg._teamFallback) {
     return `临时 Codex 子智能体 ${idx + 1}`;
   }
