@@ -5059,14 +5059,23 @@ export class Gateway {
   }
 
   // GET /api/skills — user-level skill library list.
-  // Aggregates baseline + shared + all agents' legacy (NOT per-agent seed), so a
-  // user sees one unified "my skills" library regardless of which agent is active.
+  // Aggregates shared + all agents' legacy + marketplace hub (NOT per-agent seed),
+  // so a user sees one unified "my skills" library regardless of which agent is active.
   private async handleUserSkillsList(req: IncomingMessage, res: ServerResponse): Promise<void> {
     if (req.method !== 'GET') return this.sendError(res, 405, 'method not allowed')
+    await this.syncMarketplaceHubForManagement()
     const store = buildUserSkillStore()
     // User-facing surface: never enumerate platform baseline/seed skills.
     const list = await store.list({ includePlatform: false })
     this.sendJson(res, 200, { skills: list })
+  }
+
+  private async syncMarketplaceHubForManagement(): Promise<void> {
+    try {
+      await syncMarketplaceHub({ timeoutMs: 4000 })
+    } catch {
+      /* fail-soft: management reads must still work if marketplace sync is unavailable */
+    }
   }
 
   // PUT/DELETE /api/skills/:name/files — 技能目录内辅助文件的写/删(编辑器)。
@@ -5172,8 +5181,9 @@ export class Gateway {
     res: ServerResponse,
     skillName: string,
   ): Promise<void> {
-    const store = buildUserSkillStore()
     if (req.method === 'GET') {
+      await this.syncMarketplaceHubForManagement()
+      const store = buildUserSkillStore()
       // User-facing read: platform skills resolve to 404, never leak their body.
       // ?file=<rel> → 读取技能目录内单个文件(编辑器/整目录发布导入用)。
       const fileParam = new URL(req.url ?? '/', 'http://x').searchParams.get('file')
@@ -5192,6 +5202,7 @@ export class Gateway {
       this.sendJson(res, 200, { skill: v })
       return
     }
+    const store = buildUserSkillStore()
     if (req.method === 'PUT') {
       const body = await this.readJsonBody<{
         description?: string
