@@ -31,8 +31,13 @@
    - 容器池水位(并发容器数、镜像拉起失败)。
 4. **运营位补齐**:v5 官方 codex 账号池扩容(池空 fail-closed 会拒服务,boss 加账号);github 残余直连封堵(低危)。
 5. **回归自动化**:把本批次建立的"基线失败集 diff 法"固化进 CI(`npm run check` v5 变体),push 即跑 typecheck+四层测试。
+6. **团队功能止血**(2026-07-05 评估结论并入;数据:全期 60 次委派 59 次来自疑似自测号、失败率 62%、reviewer 零真实调用):
+   - 修 62% 委派失败率(fetch failed 73% 主因 + 内存水位 + spawn EAGAIN,v3 pids 前科可平移);
+   - **诚信三连**:模型选择器在团队模式如实显示队长实际引擎(现静默切 gpt-5.5、单价 3-5 倍且 UI 显示假模型);开关文案写明换引擎+费用;顶栏可见指示 chip;
+   - delegate 子会话计费打标(usage_records 可归因到组队,消 UUID 黑洞);
+   - 止血完成前**降低团队功能曝光**,不作卖点推广。
 
-出口条件:两周内零 P0 事故、真机清单全绿、监控告警可用、账号池有冗余。
+出口条件:两周内零 P0 事故、真机清单(docs/V5_DEVICE_TEST_CHECKLIST.md)全绿、监控告警可用、账号池有冗余、团队功能失败率 <10%。
 
 ## P1 — 全量切换与 v3 收敛(+2 周 → +2 月)
 
@@ -55,6 +60,7 @@
 
 1. **团队卡 server-authored 一等公民化**(登记债):sink 持久化 agent-group/delegate-progress 行,撤销 parser 过时排除;跨设备团队历史打通;顺带把 `_masterHistoricalMessages` 注入语义与前端显示对齐(模型"记得过程"可选)。
 2. **hidden reviewer pipeline 硬编排**(登记债):review 从队长自觉 delegate 升级为 gateway 代码编排的 review pass;结构化 verdict(PASS/NEEDS_FIX 协议字段);迭代/预算代码封顶(替换现在的次数熔断);审查发生与否落 runLog;**审查成本对用户可见披露**。
+2b. **团队功能产品化**(2026-07-05 评估 P1,对照业界共识"读扇出写收口/effort 分档/计划先行"):委派前 plan 卡(拆解+派给谁+成本量级预估,用户可批改);effort scaling 分档写进 preamble+普通成员串行硬上限;委派上下文结构化(大产物落文件+回传 1-2k 蒸馏摘要,绕过队长转述失真);共享任务看板(协调机制兼进度 UI);回放/分享链接;landing 团队演示与实际能力对齐。业界参照与 Top10 机制清单见当日评估调研(Anthropic multi-agent research/Claude Code agent teams/OpenAI Agents SDK/Manus 等)。
 3. **可见性投影收口**(登记债):isHiddenSystemAgentId 散点过滤 → 单一"用户可见视图"。
 4. **移动端体验专项**:PWA(安装/离线壳/推送)评估;长会话性能(虚拟滚动);弱网重连体验。
 5. **检索与知识**:科研子系统开放项(OCR/MiniCheck 外部凭证、图表提取、litrag 语义召回);WebSearch/WebFetch 质量迭代。
