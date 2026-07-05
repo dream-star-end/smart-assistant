@@ -1,0 +1,35 @@
+# v5 commercial-unit 已知存量失败清单(顶层 test/suite 名,与 TAP `not ok` 行一致)
+# 生成/维护方法见 docs/V5_CI.md。修掉一个存量失败就从这里删掉对应行。
+# 基线取自 2026-07-05 本机两次实跑(HEAD=151f7b41)的并集:
+admin-route-inventory (S3 PoC hard gate \#1)
+getV3ContainerStatus
+makeV3EnsureRunning
+preCheck — BINV-5: cost multiplier 不进 preCheck 路径
+provisionV3Container
+provisionV3Container — CCB baseline 挂载分支
+provisionV3Container — RemoteContractViolation 守门(v1.0.8)
+provisionV3Container — image label guard (v1.0.84 PR \#4)
+provisionV3Container — per-host bridge gateway env injection
+provisionV3Container — per-host max_containers cap (3I)
+stopAndRemoveV3Container
+userChatBridge — Phase 0.4 ring replay
+userChatBridge — container frame too big
+userChatBridge — happy path
+userChatBridge — model authorization
+userChatBridge — per-user concurrency
+userChatBridge — shutdown
+v3 agent_migrations ledger — INV-8 留 placeholder
+v3 agent_migrations reconciler — INV-10 (planned phase bottom-line, R6.11 §14.2.6)
+v3 reconciler — INV-7 占位(Phase 2.D)
+v3 reconciler — 非 planned phase 静默 skip(Phase 2.C MVP, Phase 2.D 待落)
+v3 supervisor.ensureRunning — open-migration guard (R6.11 §13.3)
+v3 sweepers — INV-2 open migration exclusion(NOT EXISTS + UPDATE guard + Direction A 保护)
+v3migrationLedger — INV-6 (createPlannedMigration contract)
+v3migrationLedger — TERMINAL_PHASES 常量正确性(防 future bug)
+v3migrationLedger — findOpenByContainer / listStale (reader side)
+v3migrationLedger — findOpenByUser(§13.3 reader 闸门入口)
+v3migrationLedger — markPhase / 终态 markers
+v3migrationLedger — markPhase 入参 guard(Codex Phase 2.A review v2 BLOCKER)
+v3migrationLedger — terminal guard(Codex Phase 2.A review BLOCKER 1/2)
+# 下一条为负载敏感 flaky(同日更早一轮本机跑观测到,近两轮未复现;若长期不再出现可删):
+assertPlatformDefaultModelConfigured
