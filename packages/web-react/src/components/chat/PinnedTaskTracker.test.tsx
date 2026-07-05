@@ -87,7 +87,7 @@ describe("PinnedTaskTracker 交互", () => {
   ];
 
   test("初始展开全部 → 3s 后自动折叠成只显示正在执行的一条", () => {
-    render(<PinnedTaskTracker todos={TODOS} />);
+    render(<PinnedTaskTracker todos={TODOS} active={true} />);
     // 初始:全部任务可见 + 进度
     expect(screen.getByText("任务 1/3")).toBeInTheDocument();
     expect(screen.getByText("任务一")).toBeInTheDocument();
@@ -101,12 +101,17 @@ describe("PinnedTaskTracker 交互", () => {
   });
 
   test("空任务 → 不渲染", () => {
-    const { container } = render(<PinnedTaskTracker todos={[]} />);
+    const { container } = render(<PinnedTaskTracker todos={[]} active={true} />);
     expect(container.firstChild).toBeNull();
   });
 
   test("全部完成 → 不渲染(不留完成残条,打开旧会话不闪)", () => {
-    const { container } = render(<PinnedTaskTracker todos={[{ content: "唯一任务", status: "completed" }]} />);
+    const { container } = render(<PinnedTaskTracker todos={[{ content: "唯一任务", status: "completed" }]} active={true} />);
+    expect(container.firstChild).toBeNull();
+  });
+
+  test("当前 turn 非运行态 → 未完成历史任务也不渲染", () => {
+    const { container } = render(<PinnedTaskTracker todos={TODOS} active={false} />);
     expect(container.firstChild).toBeNull();
   });
 });
