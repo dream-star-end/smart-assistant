@@ -37,6 +37,7 @@ import {
   publishSkillVersion,
   recordUninstall,
   reviewVersion,
+  reviewVersions,
   revokeListing,
   updateInstalledAgentScope,
 } from '../marketplace/marketplaceDb.js'
@@ -249,6 +250,47 @@ describe('marketplaceDb (integ)', () => {
     const rej = await publishSkillVersion(buildPublish('reject-me', owner))
     await reviewVersion({ versionId: rej.versionId, reviewerUserId: admin, approve: false })
     assert.equal(await getListingDetail('reject-me'), null)
+  })
+
+  test('batch review approves multiple pending versions', async (t) => {
+    if (skipIfNoPg(t)) return
+    const owner = await createUser('batch-owner@x.com')
+    const admin = await createUser('batch-admin@x.com')
+    const a = await publishSkillVersion(buildPublish('batch-a', owner))
+    const b = await publishSkillVersion(buildPublish('batch-b', owner))
+
+    const results = await reviewVersions({
+      versionIds: [a.versionId, b.versionId],
+      reviewerUserId: admin,
+      approve: true,
+    })
+    assert.deepEqual(results, [
+      { versionId: a.versionId, ok: true },
+      { versionId: b.versionId, ok: true },
+    ])
+    assert.equal((await listPendingVersions()).length, 0)
+    const slugs = new Set((await listApprovedForSearch()).map((x) => x.slug))
+    assert.equal(slugs.has('batch-a'), true)
+    assert.equal(slugs.has('batch-b'), true)
+  })
+
+  test('batch review reports per-item failures and keeps processing', async (t) => {
+    if (skipIfNoPg(t)) return
+    const owner = await createUser('batch-partial-owner@x.com')
+    const admin = await createUser('batch-partial-admin@x.com')
+    const already = await publishSkillVersion(buildPublish('batch-already', owner))
+    await reviewVersion({ versionId: already.versionId, reviewerUserId: admin, approve: true })
+    const pending = await publishSkillVersion(buildPublish('batch-still-pending', owner))
+
+    const results = await reviewVersions({
+      versionIds: [already.versionId, pending.versionId],
+      reviewerUserId: admin,
+      approve: true,
+    })
+    assert.equal(results[0].ok, false)
+    assert.equal(results[0].code, 'NOT_PENDING')
+    assert.deepEqual(results[1], { versionId: pending.versionId, ok: true })
+    assert.equal((await getListingDetail('batch-still-pending'))?.version, '1.0.0')
   })
 
   test('M2: skill defaults kind=skill; detail/search expose kind + raw_artifact', async (t) => {

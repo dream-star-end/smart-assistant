@@ -31,6 +31,7 @@ import { type Logger, rootLogger } from '../logging/logger.js'
 import {
   handleAdminMarketplacePending,
   handleAdminMarketplaceReview,
+  handleAdminMarketplaceReviewBatch,
   handleAdminMarketplaceRevoke,
   handleMarketplaceAgentPublish,
   handleMarketplaceDetail,
@@ -648,6 +649,11 @@ export function createCommercialHandler(
       method: 'GET',
       path: '/api/admin/marketplace/pending',
       handler: (req, res) => handleAdminMarketplacePending(req, res, deps),
+    },
+    {
+      method: 'POST',
+      path: '/api/admin/marketplace/review-batch',
+      handler: (req, res) => handleAdminMarketplaceReviewBatch(req, res, deps),
     },
     {
       method: 'POST',

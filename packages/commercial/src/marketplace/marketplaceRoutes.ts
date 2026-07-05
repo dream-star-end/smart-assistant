@@ -28,6 +28,7 @@ import {
   publishSkillVersion,
   recordUninstall,
   reviewVersion,
+  reviewVersions,
   revokeListing,
   updateInstalledAgentScope,
 } from './marketplaceDb.js'
@@ -634,6 +635,60 @@ export async function handleAdminMarketplaceReview(
   } catch (e) {
     throw mapMarketplaceError(e)
   }
+}
+
+// ── POST /api/admin/marketplace/review-batch ───────────────────────────────
+export async function handleAdminMarketplaceReviewBatch(
+  req: IncomingMessage,
+  res: ServerResponse,
+  deps: { jwtSecret: string | Uint8Array },
+): Promise<void> {
+  const admin = await requireAdminVerifyDb(req, deps.jwtSecret)
+  const body = (await readJsonBody(req)) as Record<string, unknown>
+  const decision = body.decision
+  if (decision !== 'approve' && decision !== 'reject')
+    throw new HttpError(400, 'BAD_REQUEST', 'decision must be approve|reject')
+  if (!Array.isArray(body.versionIds))
+    throw new HttpError(400, 'BAD_REQUEST', 'versionIds must be an array')
+  if (body.versionIds.length === 0)
+    throw new HttpError(400, 'BAD_REQUEST', 'versionIds must not be empty')
+  if (body.versionIds.length > 100)
+    throw new HttpError(400, 'BAD_REQUEST', '最多一次审核 100 个版本')
+
+  const versionIds: string[] = []
+  const seen = new Set<string>()
+  for (const raw of body.versionIds) {
+    const id =
+      typeof raw === 'number' && Number.isInteger(raw)
+        ? String(raw)
+        : typeof raw === 'string'
+          ? raw.trim()
+          : ''
+    if (!/^\d+$/.test(id)) throw new HttpError(400, 'BAD_ID', 'invalid version id')
+    if (seen.has(id)) continue
+    seen.add(id)
+    versionIds.push(id)
+  }
+  if (versionIds.length === 0)
+    throw new HttpError(400, 'BAD_REQUEST', 'versionIds must contain at least one id')
+
+  const note = typeof body.note === 'string' ? body.note.slice(0, 2000) : undefined
+  const results = await reviewVersions({
+    versionIds,
+    reviewerUserId: uid(admin),
+    approve: decision === 'approve',
+    note,
+    // Same policy as the single admin review route: this route is admin-only,
+    // so platform-owned submissions can be reviewed without a second admin.
+    allowSelfReview: true,
+  })
+  const failed = results.filter((r) => !r.ok).length
+  sendJson(res, 200, {
+    ok: failed === 0,
+    reviewed: results.length - failed,
+    failed,
+    results,
+  })
 }
 
 // ── POST /api/admin/marketplace/:slug/revoke ──────────────────────────────

@@ -5685,6 +5685,11 @@ function _ensureMktAdmStyles() {
 .mkt-adm-low{border-left:3px solid #5a8fc2}
 .mkt-adm-block{border-left:3px solid #b3202f;color:#ffb3bd}
 .mkt-adm-flag code{font-family:var(--font-mono,monospace);font-size:11px;background:rgba(0,0,0,.25);border-radius:4px;padding:0 4px}
+.mkt-adm-toolbar{display:flex;align-items:center;gap:10px;margin:0 0 12px;padding:9px 10px;border:1px solid var(--border,#2a2a30);border-radius:8px;background:var(--bg-secondary,#1e1e22)}
+.mkt-adm-toolbar .btn{margin-left:auto}
+.mkt-adm-select-wrap{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--text-secondary,#9f9c96);white-space:nowrap}
+.mkt-adm-selected{font-size:12px;color:var(--text-secondary,#9f9c96)}
+.mkt-adm-head-main{flex:1;min-width:0}
 .mkt-adm-details{margin:8px 0}
 .mkt-adm-details summary{cursor:pointer;font-size:12px;color:var(--accent,#d97757)}
 .mkt-adm-pre{font-family:var(--font-mono,monospace);font-size:12px;white-space:pre-wrap;word-break:break-word;background:#1a1a1e;color:#eceae6;border:1px solid var(--border,#2a2a30);border-radius:8px;padding:10px;max-height:360px;overflow:auto;margin-top:6px}
@@ -5732,13 +5737,45 @@ async function _loadMktPending() {
     host.innerHTML = '<div class="empty">没有待审投稿</div>'
     return
   }
-  host.innerHTML = ''
+  host.innerHTML = `
+    <div class="mkt-adm-toolbar">
+      <label class="mkt-adm-select-wrap"><input type="checkbox" id="mkt-adm-select-all" /> 全选</label>
+      <span class="mkt-adm-selected" id="mkt-adm-selected-count">已选 0</span>
+      <button class="btn btn-primary" id="mkt-adm-batch-approve" disabled>批量通过选中</button>
+    </div>
+    <div id="mkt-adm-list"></div>`
+  const list = host.querySelector('#mkt-adm-list')
+  const selectAll = host.querySelector('#mkt-adm-select-all')
+  const selectedCount = host.querySelector('#mkt-adm-selected-count')
+  const batchApprove = host.querySelector('#mkt-adm-batch-approve')
+  const updateSelection = () => {
+    const boxes = [...host.querySelectorAll('.mkt-adm-select')]
+    const selected = boxes.filter((x) => x.checked)
+    if (selectedCount) selectedCount.textContent = `已选 ${selected.length}`
+    if (batchApprove) batchApprove.disabled = selected.length === 0
+    if (selectAll) {
+      selectAll.checked = selected.length > 0 && selected.length === boxes.length
+      selectAll.indeterminate = selected.length > 0 && selected.length < boxes.length
+    }
+  }
+  selectAll?.addEventListener('change', () => {
+    const checked = Boolean(selectAll.checked)
+    for (const box of host.querySelectorAll('.mkt-adm-select')) box.checked = checked
+    updateSelection()
+  })
+  batchApprove?.addEventListener('click', (ev) => {
+    const versionIds = [...host.querySelectorAll('.mkt-adm-select:checked')].map((x) => x.value)
+    if (versionIds.length === 0) return
+    if (!confirm(`确定通过并上架选中的 ${versionIds.length} 个投稿？`)) return
+    withBtnLoading(ev.currentTarget, () => _reviewMktBatch(versionIds, 'approve'))
+  })
   for (const p of pending) {
     const card = document.createElement('div')
     card.className = 'mkt-adm-card'
     card.innerHTML = `
       <div class="mkt-adm-head">
-        <div>
+        <label class="mkt-adm-select-wrap"><input type="checkbox" class="mkt-adm-select" value="${escapeHtml(String(p.versionId))}" /> 选择</label>
+        <div class="mkt-adm-head-main">
           <strong>${escapeHtml(p.name || p.slug)}</strong>
           <span class="mkt-adm-meta"><code>${escapeHtml(p.slug)}</code> · v${escapeHtml(p.version)} · 投稿 user #${escapeHtml(String(p.submittedBy))} · ${escapeHtml((p.createdAt || '').slice(0, 19).replace('T', ' '))}</span>
         </div>
@@ -5759,8 +5796,10 @@ async function _loadMktPending() {
     card.querySelector('.mkt-adm-reject').addEventListener('click', (ev) =>
       withBtnLoading(ev.currentTarget, () => _reviewMkt(p.versionId, 'reject', note())),
     )
-    host.appendChild(card)
+    card.querySelector('.mkt-adm-select').addEventListener('change', updateSelection)
+    list.appendChild(card)
   }
+  updateSelection()
 }
 
 async function _reviewMkt(versionId, decision, note) {
@@ -5773,6 +5812,23 @@ async function _reviewMkt(versionId, decision, note) {
     await Promise.all([_loadMktPending(), _loadMktLive()])
   } catch (err) {
     toast(`操作失败:${err.message}`, 'danger', toastOptsFromError(err))
+  }
+}
+
+async function _reviewMktBatch(versionIds, decision) {
+  try {
+    const r = await apiJson('POST', '/api/admin/marketplace/review-batch', {
+      versionIds,
+      decision,
+    })
+    if (r.failed > 0) {
+      toast(`批量处理完成:${r.reviewed || 0} 成功,${r.failed} 失败`, 'warn')
+    } else {
+      toast(`已批量通过并上架 ${r.reviewed || versionIds.length} 个投稿`, 'ok')
+    }
+    await Promise.all([_loadMktPending(), _loadMktLive()])
+  } catch (err) {
+    toast(`批量操作失败:${err.message}`, 'danger', toastOptsFromError(err))
   }
 }
 

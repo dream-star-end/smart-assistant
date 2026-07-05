@@ -307,6 +307,40 @@ export async function reviewVersion(args: {
   })
 }
 
+export interface ReviewVersionBatchResult {
+  versionId: string
+  ok: boolean
+  code?: MarketplaceError['code']
+  message?: string
+}
+
+/** Batch review helper. Keeps single-version semantics by reusing reviewVersion. */
+export async function reviewVersions(args: {
+  versionIds: string[]
+  reviewerUserId: number
+  approve: boolean
+  note?: string
+  allowSelfReview?: boolean
+}): Promise<ReviewVersionBatchResult[]> {
+  const results: ReviewVersionBatchResult[] = []
+  for (const versionId of args.versionIds) {
+    try {
+      await reviewVersion({
+        versionId,
+        reviewerUserId: args.reviewerUserId,
+        approve: args.approve,
+        note: args.note,
+        allowSelfReview: args.allowSelfReview,
+      })
+      results.push({ versionId, ok: true })
+    } catch (e) {
+      if (!(e instanceof MarketplaceError)) throw e
+      results.push({ versionId, ok: false, code: e.code, message: e.message })
+    }
+  }
+  return results
+}
+
 /**
  * Platform-official seed approval. Marks (slug, version) approved + points the
  * listing's current_approved_version_id at it. UNLIKE {@link reviewVersion} this
