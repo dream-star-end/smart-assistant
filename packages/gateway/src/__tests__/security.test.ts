@@ -1,6 +1,6 @@
 import * as assert from 'node:assert/strict'
 import { mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { homedir, tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 /**
  * Security tests for OpenClaude Gateway.
@@ -131,13 +131,17 @@ describe('T01: isFileBlocked — sensitive file blocking', () => {
 })
 
 // ── T01b: isFileAllowed — allowlist directory check ──
+// 允许目录随 HOME 派生(paths 模块同源):测试机 HOME=/root、CI runner HOME=/home/runner,
+// 硬编码 /root 会在 CI 上误红(2026-07-05 首跑教训)。
+const OC_HOME = join(homedir(), '.openclaude')
+
 describe('T01b: isFileAllowed — allowlist directory check', () => {
   // Should ALLOW — static allowed dirs
   it('allows files in generated dir', () => {
-    assert.ok(isFileAllowed(resolve('/root/.openclaude/generated/speech.mp3')))
+    assert.ok(isFileAllowed(resolve(join(OC_HOME, 'generated/speech.mp3'))))
   })
   it('allows files in uploads dir', () => {
-    assert.ok(isFileAllowed(resolve('/root/.openclaude/uploads/photo.jpg')))
+    assert.ok(isFileAllowed(resolve(join(OC_HOME, 'uploads/photo.jpg'))))
   })
   // Should ALLOW — temp files matching /tmp/openclaude-*
   it('allows /tmp/openclaude-* temp files', () => {
@@ -191,7 +195,7 @@ describe('T01b: isFileAllowed — allowlist directory check', () => {
   // Prefix attack: /tmp/openclaude- should not match /tmp/openclaude (exact dir)
   it('denies dir name that is a prefix of allowed but not child', () => {
     // e.g. /root/.openclaude/generatedEVIL/file should NOT match generatedDir
-    assert.ok(!isFileAllowed(resolve('/root/.openclaude/generatedEVIL/file.txt')))
+    assert.ok(!isFileAllowed(resolve(join(OC_HOME, 'generatedEVIL/file.txt'))))
   })
 
   // V3 multi-tenant per-user media volume: gateway constructs a
@@ -216,7 +220,7 @@ describe('T01b: isFileAllowed — allowlist directory check', () => {
   })
   it('extraAllowedPredicate undefined → behaves like 2-arg call (backward compat)', () => {
     // Static allow still works without the 3rd arg.
-    assert.ok(isFileAllowed(resolve('/root/.openclaude/uploads/photo.jpg')))
+    assert.ok(isFileAllowed(resolve(join(OC_HOME, 'uploads/photo.jpg'))))
     // Static deny still denies without 3rd arg.
     assert.ok(!isFileAllowed(resolve('/etc/passwd')))
   })
@@ -790,7 +794,7 @@ describe('T07: v3 trusted-backend mode (OC_V3_TRUSTED_FILE_SERVE=1)', () => {
     })
     it('legacy: static FILE_ALLOWED_DIRS still works when trusted env is off', () => {
       delete process.env[ENV_KEY]
-      assert.ok(isFileAllowed(resolve('/root/.openclaude/uploads/x.png')))
+      assert.ok(isFileAllowed(resolve(join(OC_HOME, 'uploads/x.png'))))
     })
   })
 
