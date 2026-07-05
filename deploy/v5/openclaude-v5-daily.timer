@@ -1,0 +1,12 @@
+# v5 日检 timer —— 每天 09:00 北京时间(服务器是 UTC,用 OnCalendar 时区后缀换算)。
+# Persistent=true:09:00 恰逢停机/重启时,起来后补跑一次,日报不缺天。
+[Unit]
+Description=Run OpenClaude v5 daily check at 09:00 Beijing time
+
+[Timer]
+OnCalendar=*-*-* 09:00:00 Asia/Shanghai
+AccuracySec=5min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

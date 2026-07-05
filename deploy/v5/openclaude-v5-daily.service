@@ -1,0 +1,15 @@
+# v5 日检 + 日报(roadmap P0.3 监控告警最小集)—— 每天 09:00 北京时间由
+# openclaude-v5-daily.timer 触发 scripts/v5-daily-check.sh:计费突增/免单率/
+# 活跃度/错误日志统计,无告警也发一条日报站内信给 boss。
+[Unit]
+Description=OpenClaude v5 daily check (billing anomalies + daily report)
+After=network.target postgresql.service
+Wants=postgresql.service
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/opt/openclaude/openclaude-v5
+Environment="PATH=/root/.bun/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+ExecStart=/usr/bin/bash scripts/v5-daily-check.sh
+TimeoutStartSec=300

@@ -1,0 +1,16 @@
+# v5 高频探活(roadmap P0.3 监控告警最小集)—— 每 2 分钟由 openclaude-v5-monitor.timer
+# 触发一次 scripts/v5-monitor.sh:服务/healthz/磁盘/内存/容器池/镜像 tag 十项检查,
+# 状态翻转才发站内信(去重),全量兜底落 /var/log/openclaude-v5-monitor.log。
+# 不挂 openclaude-v5 的依赖:v5 挂了正是它要报警的时刻,不能跟着一起不跑。
+[Unit]
+Description=OpenClaude v5 monitor (health probes, every 2min)
+After=network.target
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/opt/openclaude/openclaude-v5
+Environment="PATH=/root/.bun/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+ExecStart=/usr/bin/bash scripts/v5-monitor.sh
+# 脚本自己写监控日志;stdout/stderr 进 journal 仅兜底脚本本身报错
+TimeoutStartSec=90
