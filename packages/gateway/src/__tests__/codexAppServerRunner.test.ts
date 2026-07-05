@@ -22,6 +22,7 @@ import {
   CodexAppServerRunner,
   _classifyJsonRpcLine,
   _codexUsageToAnthropicShape,
+  _stringifyItemBounded,
 } from '../engine/codexAppServerRunner.js'
 
 // ── helpers ─────────────────────────────────────────────────────────────────
@@ -2989,5 +2990,146 @@ describe('PR2 v1.0.66 — requestId queue-entry transit', () => {
     assert.equal(resultMsg.is_error, true)
     assert.match(resultMsg.result, /synthetic spawn failure/)
     await h.cleanup()
+  })
+})
+
+describe('item/completed — 大 result 完成事件保持合法 JSON(_stringifyItemBounded)', () => {
+  it('mcpToolCall result 文本超 2000 字符 → payload 可 JSON.parse,内层截断带尾标,wrapper 字段完整', async () => {
+    const h = await makeHarness()
+    ;(h.runner as any).activeTurnId = 't-mcp-big'
+    // 混入换行/引号,验证转义膨胀后整体仍不超预算
+    const bigText = 'web 检索结果行 "quoted"\n'.repeat(300)
+    assert.ok(bigText.length > 2000)
+    feed(h.runner, {
+      jsonrpc: '2.0',
+      method: 'item/completed',
+      params: {
+        threadId: 'thr-1',
+        turnId: 't-mcp-big',
+        item: {
+          id: 'mcp-1',
+          type: 'mcpToolCall',
+          server: 'web_context',
+          tool: 'web_search',
+          status: 'completed',
+          result: { content: [{ type: 'text', text: bigText }] },
+        },
+      },
+    })
+    await new Promise((r) => setImmediate(r))
+    const result = h.messages.find(
+      (m) => m.type === 'user' && m.message.content[0].type === 'tool_result',
+    )
+    assert.ok(result, 'tool_result must be emitted')
+    const payload = result.message.content[0].content as string
+    assert.ok(payload.length <= 2000, `payload ${payload.length} chars exceeds budget`)
+    // 核心契约:整体 slice 时代这里必然 throw(截成非法 JSON)
+    const parsed = JSON.parse(payload)
+    assert.equal(parsed.id, 'mcp-1')
+    assert.equal(parsed.type, 'mcpToolCall')
+    assert.equal(parsed.server, 'web_context')
+    assert.equal(parsed.tool, 'web_search')
+    assert.equal(parsed.status, 'completed')
+    const innerText = parsed.result.content[0].text as string
+    assert.ok(innerText.endsWith('…[truncated]'), 'inner text must carry truncate tail')
+    assert.ok(innerText.length < bigText.length, 'inner text must actually shrink')
+    await h.cleanup()
+  })
+
+  it('小 item 不受影响 — 原样完整 stringify(不带尾标)', async () => {
+    const h = await makeHarness()
+    ;(h.runner as any).activeTurnId = 't-mcp-small'
+    const item = {
+      id: 'mcp-2',
+      type: 'mcpToolCall',
+      server: 'openclaude_memory',
+      tool: 'memory_read',
+      status: 'completed',
+      result: { content: [{ type: 'text', text: 'ok' }] },
+    }
+    feed(h.runner, {
+      jsonrpc: '2.0',
+      method: 'item/completed',
+      params: { threadId: 'thr-1', turnId: 't-mcp-small', item },
+    })
+    await new Promise((r) => setImmediate(r))
+    const result = h.messages.find(
+      (m) => m.type === 'user' && m.message.content[0].type === 'tool_result',
+    )
+    assert.ok(result)
+    assert.equal(result.message.content[0].content, JSON.stringify(item))
+    await h.cleanup()
+  })
+
+  it('webSearch 多条大 results 走同一发射点 → 合法 JSON 且逐条截断', async () => {
+    const h = await makeHarness()
+    ;(h.runner as any).activeTurnId = 't-ws-big'
+    feed(h.runner, {
+      jsonrpc: '2.0',
+      method: 'item/completed',
+      params: {
+        threadId: 'thr-1',
+        turnId: 't-ws-big',
+        item: {
+          id: 'ws-1',
+          type: 'webSearch',
+          query: '深度检索',
+          results: Array.from({ length: 6 }, (_, i) => ({
+            title: `结果${i}`,
+            snippet: `摘要内容${i} `.repeat(120),
+          })),
+        },
+      },
+    })
+    await new Promise((r) => setImmediate(r))
+    const result = h.messages.find(
+      (m) => m.type === 'user' && m.message.content[0].type === 'tool_result',
+    )
+    assert.ok(result)
+    const payload = result.message.content[0].content as string
+    assert.ok(payload.length <= 2000)
+    const parsed = JSON.parse(payload)
+    assert.equal(parsed.type, 'webSearch')
+    assert.equal(parsed.query, '深度检索')
+    assert.equal(parsed.results.length, 6, 'array structure preserved')
+    assert.ok(parsed.results[0].snippet.endsWith('…[truncated]'))
+    await h.cleanup()
+  })
+
+  it('_stringifyItemBounded 病态形状(海量键,叶子截完仍超预算)退化为骨架且仍合法', () => {
+    const pathological: Record<string, unknown> = {
+      id: 'mcp-3',
+      type: 'mcpToolCall',
+      server: 'web_context',
+      tool: 'web_fetch',
+    }
+    for (let i = 0; i < 500; i++) pathological[`key_${i}`] = `value_${i}`
+    const out = _stringifyItemBounded(pathological)
+    assert.ok(out.length <= 2000)
+    const parsed = JSON.parse(out)
+    assert.equal(parsed.truncated, true)
+    assert.equal(parsed.type, 'mcpToolCall')
+    assert.equal(parsed.tool, 'web_fetch')
+  })
+
+  it('_stringifyItemBounded 不在代理对中间断字符串', () => {
+    // 全 emoji(代理对)长文本:任何截断点都可能落在代理对中间,守卫必须让
+    // 截断后的文本仍是成对的码点(JSON.parse 后无孤立代理)。
+    const item = { id: 'e-1', type: 'mcpToolCall', result: '😀'.repeat(3000) }
+    const out = _stringifyItemBounded(item)
+    assert.ok(out.length <= 2000)
+    const parsed = JSON.parse(out)
+    const text = parsed.result as string
+    const body = text.slice(0, -'…[truncated]'.length)
+    for (let i = 0; i < body.length; i++) {
+      const code = body.charCodeAt(i)
+      if (code >= 0xd800 && code <= 0xdbff) {
+        const next = body.charCodeAt(i + 1)
+        assert.ok(next >= 0xdc00 && next <= 0xdfff, `lone high surrogate at ${i}`)
+        i++
+      } else {
+        assert.ok(!(code >= 0xdc00 && code <= 0xdfff), `lone low surrogate at ${i}`)
+      }
+    }
   })
 })

@@ -460,6 +460,64 @@ function _isContextCompactionItem(item: unknown): item is Record<string, unknown
   return _normaliseCodexItemType((item as Record<string, unknown>).type) === 'contextCompaction'
 }
 
+/** item 完成事件 fallback 发射的 JSON payload 预算(字符)。 */
+const _ITEM_RESULT_JSON_BUDGET = 2000
+/** 截断尾标 — 与 ccbMessageParser 的 `…[truncated]` 惯例一致。 */
+const _ITEM_TRUNCATE_TAIL = '…[truncated]'
+
+/** 递归截断字符串叶子(mcpToolCall 的 result.content[].text、webSearch 的
+ *  results[].snippet 等大文本都在叶子上),结构与短 wrapper 字段原样保留。 */
+function _truncateStringLeaves(value: unknown, cap: number): unknown {
+  if (typeof value === 'string') {
+    if (value.length <= cap) return value
+    let head = value.slice(0, cap)
+    // 不在代理对中间断开(断开虽仍是合法 JSON——stringify 会把孤立代理转义成
+    // \uXXXX——但前端回显会出现 U+FFFD)。
+    const last = head.charCodeAt(head.length - 1)
+    if (last >= 0xd800 && last <= 0xdbff) head = head.slice(0, -1)
+    return head + _ITEM_TRUNCATE_TAIL
+  }
+  if (Array.isArray(value)) return value.map((v) => _truncateStringLeaves(v, cap))
+  if (value && typeof value === 'object') {
+    const out: Record<string, unknown> = {}
+    for (const [k, v] of Object.entries(value)) out[k] = _truncateStringLeaves(v, cap)
+    return out
+  }
+  return value
+}
+
+/** 把 item 序列化成 ≤budget 字符的**合法 JSON**。历史实现对 stringify 结果整体
+ *  `.slice(0, 2000)`,超预算的 item(大结果 MCP 调用如 web 检索)被截成非法 JSON,
+ *  前端 pickCodexItem 解析失败退回丑 JSON dump。现改为先截内层字符串叶子再完整
+ *  stringify:逐级收紧叶子上限直到整体进预算;极端形状(海量键/超长数组,叶子
+ *  截完仍超)退化为只保留定位字段的骨架 —— 任何分支发出的都是可 parse 的 JSON。 */
+export function _stringifyItemBounded(
+  item: unknown,
+  budget = _ITEM_RESULT_JSON_BUDGET,
+): string {
+  let full: string
+  try {
+    full = JSON.stringify(item) ?? 'null'
+  } catch {
+    // item 来自 JSON-RPC 解析,理论上必可序列化;纯防御。
+    return JSON.stringify({ truncated: true })
+  }
+  if (full.length <= budget) return full
+  // 叶子上限逐级减半:字符串转义(\n → \\n 等)可能放大序列化长度,一档不够就
+  // 收紧下一档。上限 1200 给 wrapper(type/server/tool/status 等)留足余量。
+  for (const cap of [1200, 600, 300, 120, 48]) {
+    const bounded = JSON.stringify(_truncateStringLeaves(item, cap))
+    if (bounded.length <= budget) return bounded
+  }
+  // 骨架兜底:类型/工具名等定位信息不丢,前端至少能渲染出正确的卡片标题。
+  const o = (item && typeof item === 'object' ? item : {}) as Record<string, unknown>
+  const skeleton: Record<string, unknown> = { truncated: true }
+  for (const key of ['id', 'type', 'status', 'server', 'tool', 'name', 'query']) {
+    if (typeof o[key] === 'string') skeleton[key] = (o[key] as string).slice(0, 120)
+  }
+  return JSON.stringify(skeleton)
+}
+
 /** Issue A v1.0.108 — Anthropic-shape 配额快照(0..100% + ISO8601 reset)。
  *  落到 OutboundCodexBilling.rateLimits 字段,master.userChatBridge 直接传 quota.ts。
  *  字段全 optional,允许 plan 类型只有单窗口的情况(e.g. free 只发 7d)。 */
@@ -2018,7 +2076,7 @@ export class CodexAppServerRunner extends EventEmitter {
       this.emitAssistantToolUse(itemId, 'codex:contextCompaction', visibleItem)
       return
     }
-    this.emitToolResult(itemId, JSON.stringify(visibleItem).slice(0, 2000), false)
+    this.emitToolResult(itemId, _stringifyItemBounded(visibleItem), false)
     this.emitTurnStatus(null)
   }
 
@@ -2215,7 +2273,7 @@ export class CodexAppServerRunner extends EventEmitter {
       const saved = typeof item.savedPath === 'string' ? item.savedPath : ''
       const resultB64 = typeof item.result === 'string' ? item.result : ''
       if (!this.threadId || (!saved && !resultB64)) {
-        this.emitToolResult(itemId, JSON.stringify(item).slice(0, 2000), false)
+        this.emitToolResult(itemId, _stringifyItemBounded(item), false)
         return
       }
       let publicPaths: string[] = []
@@ -2301,12 +2359,14 @@ export class CodexAppServerRunner extends EventEmitter {
       return
     }
     if (itemType === 'contextCompaction') {
-      this.emitToolResult(itemId, JSON.stringify(visibleItem).slice(0, 2000), false)
+      this.emitToolResult(itemId, _stringifyItemBounded(visibleItem), false)
       this.emitTurnStatus(null)
       return
     }
-    // Generic completion for unknown item types
-    this.emitToolResult(itemId, JSON.stringify(item).slice(0, 2000), false)
+    // Generic completion for unknown item types (mcpToolCall / webSearch /
+    // dynamicToolCall / plan / error / …):内层截断 + 完整 stringify,
+    // 保证前端 pickCodexItem 永远拿到可 parse 的 JSON。
+    this.emitToolResult(itemId, _stringifyItemBounded(item), false)
   }
 
   /** Spawn a brand-new codex thread and wire its id into runner state +

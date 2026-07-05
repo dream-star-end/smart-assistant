@@ -727,6 +727,56 @@ function readDelegateMemoryPressure(): { current: number; max: number; ratio: nu
   return { current, max, ratio: current / max }
 }
 
+// ── hidden 系统 agent 串行委派熔断 ──────────────────────────────────────────
+/** 同一父 turn 内对 hidden 系统 agent(隐藏审查员)的委派次数硬上限。
+ *  team-mode prompt 的"NEEDS_FIX→修→再审→迭代到 PASS"闭环只有 prompt 级约束,
+ *  每轮 review 都是全新 delegate session 全额计费;delegation depth 只管嵌套、
+ *  MAX_CONCURRENT_DELEGATIONS 只管并行,都拦不住串行重试,这里是第三条腿。 */
+export const MAX_HIDDEN_DELEGATIONS_PER_TURN = 3
+
+/** hidden 委派计数器。计数键 = **父会话 sessionKey**,依据:
+ *  delegate 请求(mcp-memory handleDelegateTaskToAgent)只携带 parentSessionKey
+ *  (取自 OPENCLAUDE_SESSION_KEY env)和 x-delegation-depth 头,请求里拿不到任何
+ *  turn 级标识,因此退而按父会话维度计数,turn 边界由 dispatchInbound 在同一
+ *  sessionKey 收到下一条用户消息时调用 resetForParent 划定。子 delegate 会话的
+ *  sessionKey 自带时间戳(一次性,不能当计数键),但它作为"父"再委派时天然就是
+ *  turn 粒度,其计数在该 delegate 请求收尾时清理。TTL 惰性清扫兜底 cron/task 等
+ *  永远等不到下一条用户消息的父会话 —— 既防 Map 泄漏,也防"额度永久锁死"。 */
+export class HiddenDelegateGuard {
+  private counts = new Map<string, { count: number; touchedAt: number }>()
+
+  constructor(
+    private readonly limit = MAX_HIDDEN_DELEGATIONS_PER_TURN,
+    /** 远大于 delegate hard timeout 上限(2h)和现实单 turn 时长,只兜内存/锁死。 */
+    private readonly staleMs = 12 * 60 * 60_000,
+  ) {}
+
+  /** 为一次 hidden 委派占额度:未达上限 → 计数 +1 放行;已达上限 → 拒绝。 */
+  tryAcquire(parentKey: string, now = Date.now()): boolean {
+    this.prune(now)
+    const entry = this.counts.get(parentKey)
+    if (!entry) {
+      this.counts.set(parentKey, { count: 1, touchedAt: now })
+      return true
+    }
+    if (entry.count >= this.limit) return false
+    entry.count++
+    entry.touchedAt = now
+    return true
+  }
+
+  /** 父会话开启新用户 turn / 父 delegate 会话收尾时清零。 */
+  resetForParent(parentKey: string): void {
+    this.counts.delete(parentKey)
+  }
+
+  private prune(now: number): void {
+    for (const [key, entry] of this.counts) {
+      if (now - entry.touchedAt > this.staleMs) this.counts.delete(key)
+    }
+  }
+}
+
 export class Gateway {
   private wss!: WebSocketServer
   private httpServer!: ReturnType<typeof createServer>
@@ -6076,6 +6126,9 @@ export class Gateway {
   private _activeDelegations = 0
   private static MAX_CONCURRENT_DELEGATIONS = 5
   private _activeDelegationsByParent = new Map<string, Set<string>>()
+  /** hidden 审查员串行委派熔断(见 HiddenDelegateGuard 注释)。gateway 是容器内
+   *  单进程,内存计数即权威。 */
+  private _hiddenDelegateGuard = new HiddenDelegateGuard()
 
   private _resolveDelegateProgressTarget(args: {
     parentSessionKey?: unknown
@@ -6192,6 +6245,30 @@ export class Gateway {
     const depth = depthHeader ? Number.parseInt(String(depthHeader), 10) : 0
     if (depth >= 3) {
       return this.sendError(res, 400, 'delegation depth limit exceeded (max 3)')
+    }
+
+    // Serial guard: hidden 系统 agent(隐藏审查员)同一父 turn 内委派次数硬上限。
+    // 计数键优先取 parentSessionKey(delegate 请求里唯一的父上下文,turn 级标识
+    // 拿不到 —— 依据见 HiddenDelegateGuard 注释);极端情况下 body 缺
+    // parentSessionKey 时退化为按 sourceAgent 计数,由 TTL 清扫兜底回收。
+    // 失败/超时的审查同样占额度:每次尝试都是全额计费的 delegate session。
+    if (isHiddenSystemAgentId(targetAgentId)) {
+      const guardKey =
+        typeof parsed.parentSessionKey === 'string' && parsed.parentSessionKey
+          ? parsed.parentSessionKey
+          : `delegate-src:${typeof sourceAgent === 'string' && sourceAgent ? sourceAgent : 'system'}`
+      if (!this._hiddenDelegateGuard.tryAcquire(guardKey)) {
+        this.log.warn('delegate_hidden_limit', {
+          targetAgentId,
+          guardKey,
+          limit: MAX_HIDDEN_DELEGATIONS_PER_TURN,
+        })
+        return this.sendError(
+          res,
+          429,
+          `审查委派已达本轮上限(${MAX_HIDDEN_DELEGATIONS_PER_TURN}次),请基于已有审查结论收尾,不要再发起新的审查委派`,
+        )
+      }
     }
 
     // Find target agent
@@ -6407,6 +6484,10 @@ export class Gateway {
       clearTimeoutTimer()
       unregisterDelegation?.()
       this._activeDelegations--
+      // 本次 delegate 的子会话(sessionKey 带时间戳,一次性)在生命周期内可能
+      // 作为"父"再委派 hidden 审查员;它收尾后计数键永远不会复用,这里清理防泄漏。
+      // 注意清的是子会话自己的键,不动 guardKey(父会话的额度要跨多次 delegate 累计)。
+      this._hiddenDelegateGuard.resetForParent(sessionKey)
     }
 
     eventBus.emit('agent.completed', createEvent('agent.completed', targetAgentId, {
@@ -9083,6 +9164,10 @@ export class Gateway {
         : sessionKey.includes(':inter:')
           ? ('inter-agent' as const)
           : ('chat' as const)
+    // 新用户 turn 开启 → 清零本会话对 hidden 审查员的串行委派计数。delegate 请求
+    // 只带 parentSessionKey(没有 turn 级标识),所以"每 turn 上限"的 turn 边界由
+    // 这里定义:同一 sessionKey 收到下一条入站用户消息即视为新 turn。
+    this._hiddenDelegateGuard.resetForParent(sessionKey)
     const _run = this._runLog.start({ agentId: session.agentId, sessionKey, taskType })
     // P1-3 续 — CCB 用 createAssistantAPIErrorMessage 把 API 调用错误包成
     // "API Error: ..." 文本作为正常 assistant text 流出(不抛 process error),
