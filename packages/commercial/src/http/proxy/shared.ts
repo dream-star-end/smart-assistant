@@ -205,7 +205,12 @@ export const proxyBodySchema = z
     stop_sequences: z.array(z.string().max(64)).max(8).optional(),
     metadata: z
       .object({
-        user_id: z.string().max(256).optional(),
+        // 512(原 256):CCB 会把 `CLAUDE_CODE_EXTRA_METADATA` env(gateway 对
+        // delegate 子会话注入的计费归因 oc_mode / oc_parent_session_id /
+        // oc_delegate_agent_id,见 extractUsageAttribution)spread 进
+        // device_id/account_uuid/session_id 同一个 JSON 串;基础 ~200 字节 +
+        // 归因 ~130 字节,维持 256 会把 delegate 子会话的请求整条 400 掉。
+        user_id: z.string().max(512).optional(),
         session_id: z.string().max(256).optional(),
       })
       .strict()
@@ -292,26 +297,113 @@ export function enforceFieldByteBudgets(body: ProxyBody): void {
 export function extractSessionId(
   metadata: { user_id?: string; session_id?: string } | undefined,
 ): string | null {
-  // 1) 显式顶层优先
-  const explicit = metadata?.session_id?.trim();
-  if (explicit) return explicit.slice(0, 256);
+  return extractUsageAttribution(metadata).sessionId;
+}
 
-  // 2) fallback: 从 user_id JSON 提取
+/** delegate 计费归因在 `metadata.user_id` JSON 里占用的键(gateway 经 CCB
+ *  `CLAUDE_CODE_EXTRA_METADATA` env 注入;`oc_` 前缀 = OpenClaude 内部键命名空间,
+ *  CCB 自有键 device_id/account_uuid/session_id 永不冲突)。 */
+export const OC_ATTR_MODE_KEY = "oc_mode";
+export const OC_ATTR_PARENT_SESSION_KEY = "oc_parent_session_id";
+export const OC_ATTR_DELEGATE_AGENT_KEY = "oc_delegate_agent_id";
+
+/**
+ * 计费归因(usage_records 落库维度)。
+ *
+ * - `sessionId`:既有语义不变 —— 引擎原生会话 id(CCB UUID),refund/turn-waive
+ *   的圈定窗口靠它,**禁止**改成客户端会话 id。
+ * - `mode`:'delegate' 当且仅当 user_id JSON 带 `oc_mode:"delegate"`(gateway 只对
+ *   delegate 子会话注入);其余(普通 chat/cron/webhook/未打标旧容器)一律 'chat',
+ *   与既有行为逐字节一致。
+ * - `parentSessionId`:delegate 所属的父**客户端**会话 id(web-*;父会话不在内存时
+ *   退化为容器内部 parentSessionKey,映射链见 gateway server.ts delegate 注入点)。
+ * - `delegateAgentId`:委派目标 agent id(hidden-reviewer 同样打标)。
+ *
+ * 非 delegate 模式下 parent/delegateAgent 强制 null —— 防止客户端只伪造零散键
+ * 造成"chat 行挂 delegate 归因"的脏组合。伪造整套 delegate 键的影响面与
+ * extractSessionId 相同:只污染伪造者自己的聚合视图(settle SQL 恒 WHERE user_id)。
+ */
+export interface UsageAttribution {
+  sessionId: string | null;
+  mode: "chat" | "delegate";
+  parentSessionId: string | null;
+  delegateAgentId: string | null;
+}
+
+const CHAT_ATTRIBUTION: Omit<UsageAttribution, "sessionId"> = {
+  mode: "chat",
+  parentSessionId: null,
+  delegateAgentId: null,
+};
+
+function cleanAttrString(v: unknown): string | null {
+  if (typeof v !== "string") return null;
+  const trimmed = v.trim();
+  return trimmed ? trimmed.slice(0, 256) : null;
+}
+
+export function extractUsageAttribution(
+  metadata: { user_id?: string; session_id?: string } | undefined,
+): UsageAttribution {
+  // user_id JSON 只 parse 一次,session_id 与归因键同源提取。
+  let parsed: Record<string, unknown> | null = null;
   const uid = metadata?.user_id;
-  if (typeof uid !== "string" || uid.length === 0) return null;
-  try {
-    const parsed: unknown = JSON.parse(uid);
-    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-      const sid = (parsed as Record<string, unknown>).session_id;
-      if (typeof sid === "string") {
-        const trimmed = sid.trim();
-        return trimmed ? trimmed.slice(0, 256) : null;
+  if (typeof uid === "string" && uid.length > 0) {
+    try {
+      const p: unknown = JSON.parse(uid);
+      if (p && typeof p === "object" && !Array.isArray(p)) {
+        parsed = p as Record<string, unknown>;
       }
+    } catch {
+      /* user_id 不是 JSON(普通字符串),正常情况,静默 */
     }
-  } catch {
-    /* user_id 不是 JSON(普通字符串),正常情况,静默 */
   }
-  return null;
+
+  // session_id:1) 显式顶层优先 2) fallback 从 user_id JSON 提取(语义与旧
+  // extractSessionId 逐字节一致)。
+  const explicit = metadata?.session_id?.trim();
+  const sessionId = explicit
+    ? explicit.slice(0, 256)
+    : cleanAttrString(parsed?.session_id);
+
+  if (parsed?.[OC_ATTR_MODE_KEY] !== "delegate") {
+    return { sessionId, ...CHAT_ATTRIBUTION };
+  }
+  return {
+    sessionId,
+    mode: "delegate",
+    parentSessionId: cleanAttrString(parsed[OC_ATTR_PARENT_SESSION_KEY]),
+    delegateAgentId: cleanAttrString(parsed[OC_ATTR_DELEGATE_AGENT_KEY]),
+  };
+}
+
+/**
+ * 把 `metadata.user_id` JSON 里的 `oc_` 前缀内部归因键剥掉后重新序列化。
+ *
+ * 归因键只服务 master 计费落库,**不该出容器代理**:上游(Ark/DeepSeek/MiniMax
+ * 的 Anthropic 兼容端点,或未来任何 OAuth 上游)拿到内部会话拓扑没有任何正当
+ * 用途,徒增指纹面。handler 在 extractUsageAttribution 之后、转发上游之前调用。
+ *
+ * fail-open 口径与 rewriteMetadataDeviceId 对齐:非 JSON / 非 plain object /
+ * 无 oc_ 键 → 原值原样返回(零改写,普通 chat 请求字节不变)。
+ */
+export function stripUsageAttributionKeys(
+  userIdStr: string | undefined,
+): string | undefined {
+  if (!userIdStr) return userIdStr;
+  try {
+    const parsed: unknown = JSON.parse(userIdStr);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return userIdStr;
+    }
+    const obj = parsed as Record<string, unknown>;
+    const keys = Object.keys(obj).filter((k) => k.startsWith("oc_"));
+    if (keys.length === 0) return userIdStr;
+    for (const k of keys) delete obj[k];
+    return JSON.stringify(obj);
+  } catch {
+    return userIdStr;
+  }
 }
 
 /**

@@ -551,13 +551,13 @@ describe("userChatBridge / codex billing — happy path(双钱包 settle)", () =
     // settle 真的发了 INSERT INTO usage_records,且落账口径符合 M2 红线:
     const inserts = usageInserts(rig);
     assert.equal(inserts.length, 1);
-    // 红线 3:account_id 恒 SQL NULL(params[1];不再是 v3 的 '0' 假账号)
-    assert.equal(inserts[0]!.params?.[1], null, "usage_records.account_id must be NULL");
-    // 红线 2:session_id(params[9])= billing 帧携带的 engineSessionId ——
+    // 红线 3:account_id 恒 SQL NULL(params[2],0104 后 mode 占 $2;不再是 v3 的 '0' 假账号)
+    assert.equal(inserts[0]!.params?.[2], null, "usage_records.account_id must be NULL");
+    // 红线 2:session_id(params[10],0104 参数位)= billing 帧携带的 engineSessionId ——
     // 与 gateway idle-timeout waive 上报(engineSessionId(sessionKey))同一 helper
     // 同一入参 ⇒ settle=waive 同值,refund.refundSessionWindow 才能圈到本记录。
-    assert.equal(inserts[0]!.params?.[9], ENGINE_SID, "usage_records.session_id must equal wire engineSessionId");
-    assert.equal(inserts[0]!.params?.[10], serverReqId);
+    assert.equal(inserts[0]!.params?.[10], ENGINE_SID, "usage_records.session_id must equal wire engineSessionId");
+    assert.equal(inserts[0]!.params?.[13], serverReqId);
 
     ws.close();
   });
@@ -711,10 +711,10 @@ describe("userChatBridge / codex billing — 零输出免单(M2 红线)", () => 
 
     await waitUntil(() => usageInserts(rig).length === 1);
     const ins = usageInserts(rig)[0]!;
-    // cost_credits(params[8])= '0'(免单后 effectiveCredits)
-    assert.equal(ins.params?.[8], "0", "免单 turn 的 usage_records.cost_credits 必须为 0");
-    // snapshot(params[7])留免单痕:waived=no_output + wouldHaveCharged
-    const snapshot = String(ins.params?.[7] ?? "");
+    // cost_credits(params[9],0104 参数位)= '0'(免单后 effectiveCredits)
+    assert.equal(ins.params?.[9], "0", "免单 turn 的 usage_records.cost_credits 必须为 0");
+    // snapshot(params[8],0104 参数位)留免单痕:waived=no_output + wouldHaveCharged
+    const snapshot = String(ins.params?.[8] ?? "");
     assert.match(snapshot, /"waived":"no_output"/);
     assert.match(snapshot, /"wouldHaveCharged":"1000"/);
     // 不 debit
@@ -1002,8 +1002,8 @@ describe("userChatBridge / codex billing — P0 跨桥重连 settle(billing 帧�
     assert.equal(usageInserts(rig).length, 1, "exactly one settle");
     assert.equal(ledgerInserts(rig).length, 1);
     // settle 口径与主路径一致:session_id = 帧 engineSessionId,account_id NULL
-    assert.equal(usageInserts(rig)[0]!.params?.[1], null);
-    assert.equal(usageInserts(rig)[0]!.params?.[9], ENGINE_SID);
+    assert.equal(usageInserts(rig)[0]!.params?.[2], null);
+    assert.equal(usageInserts(rig)[0]!.params?.[10], ENGINE_SID);
     // journal 权威终态 committed
     assert.equal(rig.poolCtrl.journalRows.get(serverReqId)?.state, "committed");
 
@@ -1217,7 +1217,7 @@ describe("userChatBridge / codex billing — legacy NULL container per-turn bill
     const inserts = usageInserts(rig);
     assert.equal(inserts.length, 2);
     for (const ins of inserts) {
-      assert.equal(ins.params?.[1], null, "M2: usage_records.account_id must be NULL (legacy 亦然)");
+      assert.equal(ins.params?.[2], null, "M2: usage_records.account_id must be NULL (legacy 亦然)");
     }
 
     ws.close();

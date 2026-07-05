@@ -81,6 +81,61 @@ export function _buildCcbSpawnTraceEnv(
 }
 
 /**
+ * delegate 子会话计费归因标(usage_records 落库维度,与 UX 无关)。
+ *
+ * handleDelegateTask 在创建 delegate 子会话时构造并经 sessionManager.getOrCreate
+ * → createEngine opts 传入;**只有 delegate 会话设置**,普通 webchat/cron/webhook
+ * 会话恒 undefined(→ CLAUDE_CODE_EXTRA_METADATA='',CCB 视为未设置,请求
+ * metadata 字节与旧版完全一致 —— 非团队普通聊天零影响的硬约束)。
+ */
+export interface UsageAttributionTag {
+  mode: 'delegate'
+  /** 父**客户端**会话 id(web-*)。映射链:handleDelegateTask 的
+   *  progressTarget.peerId(父是 webchat)→ delegateParent.repoSessionId(嵌套
+   *  delegate,== 根 webchat 会话 id)→ 容器内部 parentSessionKey(父会话不在
+   *  内存的兜底,master 侧原样落库并注明为内部键)。 */
+  parentSessionId?: string
+  /** 委派目标 agent id(hidden-reviewer 同样打标)。 */
+  delegateAgentId: string
+}
+
+/**
+ * delegate 计费归因 → CCB `CLAUDE_CODE_EXTRA_METADATA` env。
+ *
+ * CCB getAPIMetadata()(claude-code-best/src/services/api/claude.ts:485-510)把
+ * 该 env 解析为 JSON object 后 spread 进 `metadata.user_id` JSON(device_id /
+ * account_uuid / session_id 在 spread 之后写入,`oc_` 前缀键永不冲突),随每次
+ * LLM 请求直达 master anthropicProxy 计费点(extractUsageAttribution 提取,
+ * settle 落 usage_records.mode/parent_session_id/delegate_agent_id,转发上游前
+ * 剥除)。
+ *
+ * 设计要点(与 _buildCcbSpawnTraceEnv 同构):
+ *   - **空串而非省略**:env 块以 `...process.env` 起,省 key 会让 gateway 自身
+ *     process.env 里意外存在的 CLAUDE_CODE_EXTRA_METADATA 泄进 CCB;CCB 对空串
+ *     按未设置处理(`if (extraStr)` falsy)。
+ *   - **值长度截断**:metadata.user_id 有 512 字节 zod 预算(proxy/shared.ts),
+ *     基础键 ~200 字节;parentSessionId ≤128 / delegateAgentId ≤64 兜底防超预算
+ *     把 delegate 请求整条 400 掉(正常值远短于此:web-* ~21 字符,agent id 常
+ *     ≤32 字符)。
+ *   - **codex 引擎不消费此 env**(gpt-5.5 delegate 成员走 bridge journal 计费,
+ *     mode 维持 'chat',已知缺口 —— 当前 v5 组队成员与 hidden-reviewer 全部
+ *     锁定 glm-5.2/CCB 路径)。
+ */
+export function _buildCcbUsageAttributionEnv(
+  tag: UsageAttributionTag | undefined,
+): { CLAUDE_CODE_EXTRA_METADATA: string } {
+  if (!tag) return { CLAUDE_CODE_EXTRA_METADATA: '' }
+  const extra: Record<string, string> = {
+    oc_mode: tag.mode,
+    oc_delegate_agent_id: tag.delegateAgentId.slice(0, 64),
+  }
+  if (tag.parentSessionId) {
+    extra.oc_parent_session_id = tag.parentSessionId.slice(0, 128)
+  }
+  return { CLAUDE_CODE_EXTRA_METADATA: JSON.stringify(extra) }
+}
+
+/**
  * The model CCB uses for its hidden secondary calls — notably WebFetch's
  * applyPromptToMarkdown (queryHaiku → getSmallFastModel), plus a few hook /
  * search helpers. Upstream CCB defaults this to Haiku via ANTHROPIC_SMALL_FAST_MODEL.
@@ -229,6 +284,9 @@ export interface SubprocessRunnerOpts {
   agentMcpServers?: McpServerConfig[] // agent 专属 MCP servers
   agentToolsets?: string[] // resolved toolsets for this agent (filters MCP servers)
   delegationDepth?: number // current delegation recursion depth (0 = top-level)
+  /** delegate 子会话计费归因(→ CLAUDE_CODE_EXTRA_METADATA env,见
+   *  _buildCcbUsageAttributionEnv)。仅 delegate 会话由 handleDelegateTask 设置。 */
+  usageAttribution?: UsageAttributionTag
   // Optional CCB effort level passed via env (CLAUDE_CODE_EFFORT_LEVEL).
   // When undefined, no env var is set and CCB falls back to its model-default
   // effort (typically "high" on Opus 4.7 per Anthropic API). Only set values
@@ -813,6 +871,10 @@ export class SubprocessRunner extends EventEmitter {
           // 因此这里把 hostMeta.controlPath/knownHostsPath 的 `/u<uid>` 部分
           // 剥掉后注入(substitute 宿主路径为容器内视图)。
           ...buildRemoteTargetEnv(this.opts.executionTarget),
+          // delegate 计费归因 → CCB metadata.user_id JSON(仅 delegate 会话非空;
+          // 空串 = 未设置,同 trace env 的"覆盖继承"语义)。见
+          // `_buildCcbUsageAttributionEnv` JSDoc。
+          ..._buildCcbUsageAttributionEnv(this.opts.usageAttribution),
           // V3 S12e CG8 — contract C 段 trace env(best-effort,放最末永远覆盖
           // process.env 继承)。空串 = "本 spawn 无 trace stash",见
           // `_buildCcbSpawnTraceEnv` JSDoc。

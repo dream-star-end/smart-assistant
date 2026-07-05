@@ -88,6 +88,18 @@ export interface FinalizeContext {
    * 不参与调度 / 鉴权 / 限流;旧记录 session_id=NULL 属于 legacy 归属数据。
    */
   sessionId: string | null;
+  /**
+   * delegate 子会话计费归因(0104 migration)。三字段由 handler 从
+   * extractUsageAttribution(body.metadata) 一次提取(权威源:gateway 对 delegate
+   * 子会话 CCB 注入的 CLAUDE_CODE_EXTRA_METADATA env → metadata.user_id JSON)。
+   *
+   * 缺省语义(可选字段):mode 'chat' + null/null —— 未打标路径(codexFinalizer /
+   * 旧容器镜像 / 普通 chat)与 0104 之前的落库行为完全一致。
+   * 只做归因展示,不参与扣费判定 / 调度 / 限流。
+   */
+  mode?: "chat" | "delegate";
+  parentSessionId?: string | null;
+  delegateAgentId?: string | null;
 }
 
 export interface FinalizeOutcome {
@@ -286,6 +298,9 @@ export function makeFinalizer(deps: FinalizeDeps, ctx: FinalizeContext): Finaliz
         costCredits: effectiveCredits,
         status,
         sessionId: ctx.sessionId ?? null,
+        mode: ctx.mode,
+        parentSessionId: ctx.parentSessionId,
+        delegateAgentId: ctx.delegateAgentId,
       });
       await finalizeInflightJournal(deps.pgPool, {
         requestId: ctx.requestId,
@@ -465,6 +480,14 @@ export async function settleUsageAndLedger(
     costCredits: bigint;
     status: "success" | "billing_failed" | "error";
     sessionId: string | null;
+    /**
+     * delegate 计费归因(0104):缺省 'chat' + null/null = 0104 前落库行为。
+     * mode CHECK 约束允许 ('chat','agent','delegate');'agent' 是 v3 legacy 值,
+     * 本函数不产出。
+     */
+    mode?: "chat" | "delegate";
+    parentSessionId?: string | null;
+    delegateAgentId?: string | null;
   },
 ): Promise<SettleResult> {
   const client = await pool.connect();
@@ -480,11 +503,13 @@ export async function settleUsageAndLedger(
         `INSERT INTO usage_records
           (user_id, mode, account_id, model,
            input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
-           price_snapshot, cost_credits, session_id, request_id, status)
-         VALUES ($1, 'chat', $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10, $11, $12)
+           price_snapshot, cost_credits, session_id, parent_session_id,
+           delegate_agent_id, request_id, status)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11, $12, $13, $14, $15)
          RETURNING id::text AS id`,
         [
           args.userId.toString(),
+          args.mode ?? "chat",
           // accountId === null → SQL NULL(deepseek 路径)
           args.accountId === null ? null : args.accountId.toString(),
           args.model,
@@ -495,6 +520,8 @@ export async function settleUsageAndLedger(
           args.snapshotJson,
           args.costCredits.toString(),
           args.sessionId,
+          args.parentSessionId ?? null,
+          args.delegateAgentId ?? null,
           args.requestId,
           args.status,
         ],
