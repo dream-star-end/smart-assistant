@@ -522,6 +522,8 @@ export type ProxyRejectReason =
   | "upstream_auth"
   | "deepseek_config"
   | "minimax_config"
+  // OpenCode Go(Zen 网关 Go 档,qwen3.7-max/plus,2026-07-05):缺 OPENCODE_GO_API_KEY 时独立打点。
+  | "opencodego_config"
   // glm-5.1 命中但 ARK_CODING_PLAN_KEY 未配置(火山方舟 Coding Plan 文本路由 503)
   | "ark_config"
   // Phase 5 platform envelope rewriter:**handler-level** deps.platformContextLoader

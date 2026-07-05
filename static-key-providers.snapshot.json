@@ -27,6 +27,15 @@
       "capabilityZero": true,
       "contextWindow": 1000000,
       "supportsVision": false
+    },
+    {
+      "id": "opencodego",
+      "inboundModelIds": ["qwen3.7-max", "qwen3.7-plus"],
+      "maxInputTokens": 1000000,
+      "upstreamEndpoint": "https://opencode.ai/zen/go/v1/messages",
+      "capabilityZero": true,
+      "contextWindow": 1000000,
+      "supportsVision": false
     }
   ]
 }

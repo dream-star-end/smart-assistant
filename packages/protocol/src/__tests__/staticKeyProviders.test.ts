@@ -46,6 +46,16 @@ describe('staticKeyProviders — matchesRoute', () => {
     assert.equal(ark.matchesRoute('glm-5'), false)
     assert.equal(ark.matchesRoute('glm-5.3'), false)
   })
+  it('opencodego(qwen3.7-max/plus)精确,大小写不敏感', () => {
+    const og = getStaticProvider('opencodego')
+    assert.equal(og.matchesRoute('qwen3.7-max'), true)
+    assert.equal(og.matchesRoute('Qwen3.7-Max'), true)
+    assert.equal(og.matchesRoute('qwen3.7-plus'), true)
+    assert.equal(og.matchesRoute('QWEN3.7-PLUS'), true)
+    assert.equal(og.matchesRoute('qwen3.6-plus'), false)
+    assert.equal(og.matchesRoute('qwen3.7'), false)
+    assert.equal(og.matchesRoute('qwen3.7-max-preview'), false)
+  })
 })
 
 describe('staticKeyProviders — findRouteProviderForModel', () => {
@@ -54,6 +64,8 @@ describe('staticKeyProviders — findRouteProviderForModel', () => {
     assert.equal(findRouteProviderForModel('MiniMax-M3')?.id, 'minimax')
     assert.equal(findRouteProviderForModel('glm-5.1')?.id, 'ark')
     assert.equal(findRouteProviderForModel('glm-5.2')?.id, 'ark')
+    assert.equal(findRouteProviderForModel('qwen3.7-max')?.id, 'opencodego')
+    assert.equal(findRouteProviderForModel('qwen3.7-plus')?.id, 'opencodego')
     assert.equal(findRouteProviderForModel('claude-opus-4-7'), undefined)
     assert.equal(findRouteProviderForModel('DeepSeek-v4-pro'), undefined)
     assert.equal(findRouteProviderForModel(''), undefined)
@@ -67,9 +79,13 @@ describe('staticKeyProviders — inboundModelIds(与 route 面故意不同)', ()
       'deepseek-v4-pro',
     ])
   })
-  it('minimax 1 项 / ark 2 项(glm-5.1 兼容 + glm-5.2 主力)', () => {
+  it('minimax 1 项 / ark 2 项(glm-5.1 兼容 + glm-5.2 主力)/ opencodego 2 项', () => {
     assert.deepEqual([...getStaticProvider('minimax').inboundModelIds], ['MiniMax-M3'])
     assert.deepEqual([...getStaticProvider('ark').inboundModelIds], ['glm-5.2', 'glm-5.1'])
+    assert.deepEqual([...getStaticProvider('opencodego').inboundModelIds], [
+      'qwen3.7-max',
+      'qwen3.7-plus',
+    ])
   })
   it('STATIC_KEY_INBOUND_MODEL_IDS = 全 provider 字面量展开', () => {
     assert.deepEqual([...STATIC_KEY_INBOUND_MODEL_IDS], [
@@ -78,6 +94,8 @@ describe('staticKeyProviders — inboundModelIds(与 route 面故意不同)', ()
       'MiniMax-M3',
       'glm-5.2',
       'glm-5.1',
+      'qwen3.7-max',
+      'qwen3.7-plus',
     ])
   })
 })
@@ -101,6 +119,14 @@ describe('staticKeyProviders — canonicalizeForPricing', () => {
     assert.equal(ark.canonicalizeForPricing('GLM-5.2'), 'glm-5.2')
     assert.equal(ark.canonicalizeForPricing('glm-5.2'), 'glm-5.2')
     assert.equal(ark.canonicalizeForPricing('glm-5.3'), null)
+  })
+  it('opencodego → qwen3.7-max / qwen3.7-plus(小写归一)', () => {
+    const og = getStaticProvider('opencodego')
+    assert.equal(og.canonicalizeForPricing('qwen3.7-max'), 'qwen3.7-max')
+    assert.equal(og.canonicalizeForPricing('Qwen3.7-Max'), 'qwen3.7-max')
+    assert.equal(og.canonicalizeForPricing('qwen3.7-plus'), 'qwen3.7-plus')
+    assert.equal(og.canonicalizeForPricing('QWEN3.7-PLUS'), 'qwen3.7-plus')
+    assert.equal(og.canonicalizeForPricing('qwen3.6-plus'), null)
   })
 })
 
@@ -143,6 +169,27 @@ describe('staticKeyProviders — strip / endpoint', () => {
       'https://ark.cn-beijing.volces.com/api/coding/v1/messages',
     )
   })
+  it('opencodego strip anthropic-beta + 3 body 字段(**保留 thinking**,2026-07-05 实测)+ 1M cap', () => {
+    const og = getStaticProvider('opencodego')
+    assert.deepEqual([...og.stripHeaders], ['anthropic-beta'])
+    assert.deepEqual([...og.stripBodyFields], [
+      'output_config',
+      'context_management',
+      'service_tier',
+    ])
+    assert.equal(og.stripBodyFields.includes('thinking'), false, 'opencodego 不能 strip thinking(实测 enabled/disabled 语义均正确)')
+    assert.equal(og.maxInputTokens, 1_000_000)
+    assert.equal(og.upstreamEndpoint, 'https://opencode.ai/zen/go/v1/messages')
+  })
+})
+
+describe('staticKeyProviders — authScheme(上游鉴权头风格)', () => {
+  it('opencodego = x-api-key(/messages 不认 Bearer,2026-07-05 实测);其余三家缺省 bearer', () => {
+    assert.equal(getStaticProvider('opencodego').authScheme, 'x-api-key')
+    assert.equal(getStaticProvider('deepseek').authScheme, undefined)
+    assert.equal(getStaticProvider('minimax').authScheme, undefined)
+    assert.equal(getStaticProvider('ark').authScheme, undefined)
+  })
 })
 
 describe('staticKeyProviders — allowedOutputConfigEfforts(思考深度白名单)', () => {
@@ -153,6 +200,7 @@ describe('staticKeyProviders — allowedOutputConfigEfforts(思考深度白名�
     ])
     assert.equal(getStaticProvider('deepseek').allowedOutputConfigEfforts, undefined)
     assert.equal(getStaticProvider('minimax').allowedOutputConfigEfforts, undefined)
+    assert.equal(getStaticProvider('opencodego').allowedOutputConfigEfforts, undefined)
   })
   it('硬约束:声明 allowedOutputConfigEfforts 的 provider 不能把 output_config 放进 stripBodyFields', () => {
     for (const p of STATIC_KEY_PROVIDERS) {
@@ -168,10 +216,12 @@ describe('staticKeyProviders — allowedOutputConfigEfforts(思考深度白名�
 })
 
 describe('staticKeyProviders — supportsVision(原生多模态标记)', () => {
-  it('minimax(MiniMax-M3)=true;deepseek/ark(纯文本)=false', () => {
+  it('minimax(MiniMax-M3)=true;deepseek/ark/opencodego(纯文本)=false', () => {
     assert.equal(getStaticProvider('minimax').supportsVision, true)
     assert.equal(getStaticProvider('deepseek').supportsVision ?? false, false)
     assert.equal(getStaticProvider('ark').supportsVision ?? false, false)
+    // opencodego 2026-07-05 实测 image block → 400 InvalidParameter,纯文本接入。
+    assert.equal(getStaticProvider('opencodego').supportsVision ?? false, false)
   })
 })
 
@@ -197,7 +247,7 @@ describe('staticKeyProviders — snapshot 漂移守护(protocol-owned)', () => {
       'provider id 集/顺序漂移 —— 更新 snapshot 或 registry',
     )
     for (const sp of snap.providers) {
-      const p = getStaticProvider(sp.id as 'deepseek' | 'minimax' | 'ark')
+      const p = getStaticProvider(sp.id as 'deepseek' | 'minimax' | 'ark' | 'opencodego')
       assert.deepEqual([...p.inboundModelIds], sp.inboundModelIds, `${sp.id} inboundModelIds 漂移`)
       assert.equal(p.maxInputTokens ?? null, sp.maxInputTokens, `${sp.id} maxInputTokens 漂移`)
       assert.equal(p.upstreamEndpoint, sp.upstreamEndpoint, `${sp.id} upstreamEndpoint 漂移`)

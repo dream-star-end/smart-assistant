@@ -19,14 +19,20 @@ export interface StaticProviderCommercialMeta {
     | "DEEPSEEK_API_KEY"
     | "MINIMAX_TOKEN_PLAN_KEY"
     | "ARK_CODING_PLAN_KEY"
-    | "ARK_AGENT_PLAN_KEY";
+    | "ARK_AGENT_PLAN_KEY"
+    | "OPENCODE_GO_API_KEY";
   /** 缺 key → 503 错误码 */
   readonly notConfiguredHttpCode:
     | "DEEPSEEK_NOT_CONFIGURED"
     | "MINIMAX_NOT_CONFIGURED"
-    | "ARK_NOT_CONFIGURED";
+    | "ARK_NOT_CONFIGURED"
+    | "OPENCODEGO_NOT_CONFIGURED";
   /** 缺 key → reject metric label(须与 admin/metrics.ts ProxyRejectReason 一致) */
-  readonly rejectMetricLabel: "deepseek_config" | "minimax_config" | "ark_config";
+  readonly rejectMetricLabel:
+    | "deepseek_config"
+    | "minimax_config"
+    | "ark_config"
+    | "opencodego_config";
   /**
    * 出站出口策略(commercial 部署网络拓扑语义,非 protocol 路由契约,故落本表)。
    *
@@ -69,6 +75,14 @@ export const STATIC_PROVIDER_META: Record<StaticProviderId, StaticProviderCommer
     // ark.cn-beijing.volces.com:火山北京端点,直连 TLS ~0.3s 且稳;绕日本双重跨境 ~6s 且半路断。
     egress: "direct",
   },
+  opencodego: {
+    keyConfigField: "OPENCODE_GO_API_KEY",
+    notConfiguredHttpCode: "OPENCODEGO_NOT_CONFIGURED",
+    rejectMetricLabel: "opencodego_config",
+    // opencode.ai:Cloudflare 全球 anycast(Go 档服务器美/欧/新加坡),海外部署机直连可达
+    // (2026-07-05 部署机直连探针全通);无需绕日本节点。若未来直连劣化再评估切 "proxy"。
+    egress: "direct",
+  },
 };
 
 /**
@@ -86,6 +100,7 @@ export function assertPlatformDefaultModelConfigured(cfg: {
   MINIMAX_TOKEN_PLAN_KEY?: string;
   ARK_CODING_PLAN_KEY?: string;
   ARK_AGENT_PLAN_KEY?: string;
+  OPENCODE_GO_API_KEY?: string;
 }): void {
   const provider = findRouteProviderForModel(PLATFORM_DEFAULT_MODEL);
   if (!provider) return;

@@ -1205,6 +1205,8 @@ export async function registerCommercial(
           // (媒体 proxy tokenPlanKey 仍走 MINIMAX_TOKEN_PLAN_KEY,待 P2/P3 切火山后统一。)
           minimax: cfg.ARK_AGENT_PLAN_KEY,
           ark: cfg.ARK_CODING_PLAN_KEY,
+          // 2026-07-05:OpenCode Go(qwen3.7-max/plus)。个人订阅配额,缺 key 命中时 503。
+          opencodego: cfg.OPENCODE_GO_API_KEY,
         },
         // v1.0.207 起 Phase 6 account_uuid 锚定(plan §3.0)+ csap session pin 三态
         // (0072+0073+0074),从 env-only 迁到 `system_settings` 表(admin UI 立即可改,
