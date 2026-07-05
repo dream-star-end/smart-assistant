@@ -2,14 +2,31 @@
  * 工具卡**展开体**的二级渲染器（Aurora 视觉，功能 parity 现网
  * `_renderToolBody` 及各 `_render*`）。每个 body 接收已解析的 input 与 tool 对象。
  *
- * v5 无 codex —— 不含 `_renderCodexItem` 系列。
+ * 含 v3/Codex 历史 item 的紧凑渲染；Codex MCP/dynamic wrapper 大多已在
+ * format 层归一化为 native builtin/MCP 工具。
  */
 import { Sparkles, FileText } from "lucide-react";
 import type { ReactNode } from "react";
 import { cn } from "../../lib/utils";
 import { Badge, Button } from "../ui";
+import {
+  MemoryStatusCard,
+  ReminderStatusCard,
+  renderMemoryReadCards,
+  renderReminderListCard,
+} from "./memoryReminderCards";
 import { useToolCardActions } from "./context";
-import { asArr, asStr, clampStr, formatValue, isSafeHttpUrl, shortPath, type ToolLike } from "./format";
+import {
+  asArr,
+  asStr,
+  clampStr,
+  detectShellFileWrites,
+  formatValue,
+  isSafeHttpUrl,
+  parseCodexTypeName,
+  shortPath,
+  type ToolLike,
+} from "./format";
 import { parseMcpName } from "./meta";
 import { researchToolCard } from "./researchCards";
 
@@ -85,6 +102,25 @@ function OutputBlock({ output, max = 1500 }: { output?: string | null; max?: num
   return <Pre>{text.length > max ? text.slice(0, max) + "\n…" : text}</Pre>;
 }
 
+function extractImageGenerationPath(input: Input, output?: string | null): string {
+  const direct = asStr(input?.savedPath) || asStr(input?.path) || asStr(input?.outputPath);
+  if (direct) return direct;
+  const text = asStr(output);
+  if (!text) return "";
+  const arrowMatch = /imageGeneration\s*→\s*(\S+)/.exec(text);
+  if (arrowMatch) return arrowMatch[1];
+  const imagePathMatch = /((?:\/[\w. -]+)+\.(?:png|jpe?g|webp|gif))/i.exec(text);
+  return imagePathMatch?.[1] ?? "";
+}
+
+function stripDuplicateImageGenerationOutput(output: string | null | undefined, path: string): string | null {
+  if (!output) return null;
+  const text = String(output).trim();
+  if (!text) return null;
+  if (path && (text === path || text === `imageGeneration → ${path}`)) return null;
+  return output;
+}
+
 // ── builtin ───────────────────────────────────────────────────────────────
 
 const MAX_DIFF_LINES = 60;
@@ -124,11 +160,13 @@ function DiffView({ oldStr, newStr }: { oldStr: string; newStr: string }) {
 }
 
 function BashBody({ input, tool }: BodyProps) {
-  const command = asStr(input?.command).slice(0, 2000);
+  const rawCommand = asStr(input?.command);
+  const command = rawCommand.slice(0, 2000);
   // oc-* 工具(文献检索/引用核验/…):若命令命中且输出可解析 → 渲染专门卡片,
   // 而非原始"$ 命令 + JSON"终端块。不认/出错 → 回落下方通用渲染。
   const ocCard = researchToolCard(command, tool);
   if (ocCard) return ocCard;
+  const fileWrite = detectShellFileWrites(rawCommand);
   const out = tool.output;
   // bg-bash 的 tool_result.preview 只是占位文案（"Command running in background…"），
   // 不是真实输出；后台进程的真实 stdout/stderr 走 bashTail。识别占位 → 优先 bashTail。
@@ -151,6 +189,41 @@ function BashBody({ input, tool }: BodyProps) {
     outText = out;
   }
   if (!command && !outText) return null;
+  if (fileWrite) {
+    const auditCommand = fileWrite.rawCommand;
+    const status = tool.error
+      ? "写入文件命令失败"
+      : tool._completed
+        ? `已写入 ${fileWrite.paths.length} 个文件`
+        : "正在写入文件…";
+    return (
+      <>
+        <StatusLine text={status} error={tool.error} />
+        <div className={cn("mt-1.5 rounded-md px-3 py-2 text-xs", tool.error ? "bg-danger-soft" : "bg-success-soft")}>
+          <div className={cn("font-medium", tool.error ? "text-danger" : "text-success")}>文件</div>
+          <ul className="mt-1 flex flex-col gap-0.5">
+            {fileWrite.paths.map((path) => (
+              <li key={path} className="font-mono text-muted">
+                {shortPath(path)}
+              </li>
+            ))}
+          </ul>
+        </div>
+        {headTruncated && <FileMeta>… (head 已截断, 共 {totalBytes} 字节)</FileMeta>}
+        <FileMeta>原始终端命令</FileMeta>
+        <Pre>
+          {auditCommand && (
+            <>
+              <span className="text-success">$ </span>
+              {auditCommand}
+              {outText ? "\n" : ""}
+            </>
+          )}
+          {outText}
+        </Pre>
+      </>
+    );
+  }
   return (
     <>
       {headTruncated && <FileMeta>… (head 已截断, 共 {totalBytes} 字节)</FileMeta>}
@@ -293,7 +366,12 @@ function WebSearchBody({ input, tool }: BodyProps) {
     <>
       {input && (
         <KvList
-          obj={{ query: input.query, allowed_domains: input.allowed_domains, blocked_domains: input.blocked_domains }}
+          obj={{
+            query: input.query,
+            results: input.results,
+            allowed_domains: input.allowed_domains,
+            blocked_domains: input.blocked_domains,
+          }}
         />
       )}
       <OutputBlock output={tool.output} />
@@ -366,6 +444,86 @@ function VisionBody({ input, tool }: BodyProps) {
   );
 }
 
+function CodexBody({ type, input, tool }: BodyProps & { type: string }) {
+  if (type === "imageView") {
+    const target = asStr(input?.path) || asStr(input?.url);
+    return (
+      <>
+        {target && <FileMeta>{shortPath(target)}</FileMeta>}
+        <OutputBlock output={tool.output} />
+      </>
+    );
+  }
+  if (type === "imageGeneration") {
+    const prompt = asStr(input?.prompt) || asStr(input?.revisedPrompt);
+    const savedPath = extractImageGenerationPath(input, tool.output);
+    const running = !tool._completed && !tool.error;
+    const output = stripDuplicateImageGenerationOutput(tool.output, savedPath);
+    return (
+      <>
+        {prompt && <PromptBlock>{prompt}</PromptBlock>}
+        {running && <StatusLine text="图片生成中，通常需要几十秒，请稍候…" />}
+        {!running && !tool.error && <StatusLine text="图片已生成" />}
+        {savedPath && <FileMeta>{shortPath(savedPath)}</FileMeta>}
+        {input && (
+          <KvList
+            obj={input}
+            skip={[
+              "id",
+              "type",
+              "status",
+              "prompt",
+              "revisedPrompt",
+              "result",
+              "savedPath",
+              "path",
+              "outputPath",
+              "durationMs",
+              "pluginId",
+              "_meta",
+            ]}
+          />
+        )}
+        <OutputBlock output={output} />
+      </>
+    );
+  }
+  if (type === "contextCompaction") {
+    return (
+      <>
+        <KvList
+          obj={{
+            "tokens before": input?.tokensBefore ?? input?.beforeTokens,
+            "tokens after": input?.tokensAfter ?? input?.afterTokens,
+            note: input?.note || input?.summary,
+          }}
+        />
+        <OutputBlock output={tool.output} />
+      </>
+    );
+  }
+  if (type === "enteredReviewMode" || type === "exitedReviewMode") {
+    return (
+      <>
+        <StatusLine text={type === "enteredReviewMode" ? "已进入审阅模式" : "已退出审阅模式"} />
+        {(input?.note || input?.summary) && <PromptBlock>{asStr(input?.note) || asStr(input?.summary)}</PromptBlock>}
+        <OutputBlock output={tool.output} />
+      </>
+    );
+  }
+  return (
+    <>
+      {input && (
+        <KvList
+          obj={input}
+          skip={["id", "type", "pluginId", "result", "structuredContent", "_meta", "status", "durationMs"]}
+        />
+      )}
+      <OutputBlock output={tool.output} />
+    </>
+  );
+}
+
 /** skill_save / skill_propose 的富卡:技能创建流程的核心动作,按技能卡样式呈现
  *(名称/描述/标签/正文折叠),让「对话中创建技能」所见即所得,而非一坨 KV。 */
 function SkillWriteCard({ op, input, tool }: BodyProps & { op: string }) {
@@ -429,38 +587,7 @@ function MemoryBody({ op, input, tool }: BodyProps & { op: string }) {
       </>
     );
   }
-  let kv: ReactNode = null;
-  if (input) {
-    if (op === "memory") {
-      kv = <KvList obj={{ op: input.op, section: input.section, content: input.content }} />;
-    } else if (op === "create_reminder") {
-      kv = (
-        <KvList
-          obj={{
-            schedule: input.schedule,
-            message: input.message,
-            label: input.label,
-            oneshot: input.oneshot,
-            deliver: input.deliver,
-          }}
-        />
-      );
-    } else if (op === "delegate_task" || op === "send_to_agent") {
-      kv = (
-        <KvList
-          obj={{
-            agent: input.agentId,
-            goal: input.goal,
-            message: input.message,
-            prompt: input.prompt,
-            context: input.context,
-          }}
-        />
-      );
-    } else {
-      kv = <KvList obj={input} />;
-    }
-  }
+
   const btns: ReactNode[] = [];
   if (["memory", "archival_add", "archival_search", "session_search"].includes(op) && actions.onOpenMemory) {
     btns.push(
@@ -476,17 +603,51 @@ function MemoryBody({ op, input, tool }: BodyProps & { op: string }) {
       </Button>,
     );
   }
-  if (op === "create_reminder" && actions.onOpenTasks) {
+  if (["create_reminder", "list_reminders", "update_reminder", "delete_reminder"].includes(op) && actions.onOpenTasks) {
     btns.push(
       <Button key="tk" variant="ghost" size="sm" onClick={actions.onOpenTasks}>
         查看定时任务
       </Button>,
     );
   }
+
+  let body: ReactNode = null;
+  if (op === "list_reminders") {
+    body = renderReminderListCard(tool.output) ?? <OutputBlock output={tool.output} />;
+  } else if (["create_reminder", "update_reminder", "delete_reminder"].includes(op)) {
+    body = <ReminderStatusCard op={op} input={input} output={tool.output} error={!!tool.error} />;
+  } else if (op === "memory") {
+    const action = asStr(input?.action) || asStr(input?.op) || "read";
+    const target = input?.target ?? input?.section;
+    if (action === "read") {
+      body = renderMemoryReadCards(tool.output, target) ?? <OutputBlock output={tool.output} />;
+    } else if (["add", "replace", "remove"].includes(action)) {
+      body = <MemoryStatusCard action={action} target={target} output={tool.output} error={!!tool.error} />;
+    } else {
+      body = <KvList obj={{ action, target, content: input?.content, needle: input?.needle }} />;
+    }
+  } else if (op === "delegate_task" || op === "send_to_agent") {
+    body = (
+      <KvList
+        obj={{
+          agent: input?.agentId,
+          goal: input?.goal,
+          message: input?.message,
+          prompt: input?.prompt,
+          context: input?.context,
+        }}
+      />
+    );
+  } else {
+    body = <KvList obj={input} />;
+  }
+
   return (
     <>
-      {kv}
-      <OutputBlock output={tool.output} />
+      {body}
+      {!["memory", "create_reminder", "list_reminders", "update_reminder", "delete_reminder"].includes(op) && (
+        <OutputBlock output={tool.output} />
+      )}
       {btns.length > 0 && <div className="mt-2 flex flex-wrap gap-2">{btns}</div>}
     </>
   );
@@ -718,6 +879,8 @@ export function ToolBody({ name, input, tool }: { name: string; input: Input; to
     case "WebSearch":
       return <WebSearchBody input={input} tool={tool} />;
   }
+  const codexType = parseCodexTypeName(name);
+  if (codexType) return <CodexBody type={codexType} input={input} tool={tool} />;
   const mcp = parseMcpName(name);
   if (mcp) {
     if (mcp.server === "browser") return <BrowserBody op={mcp.op} input={input} tool={tool} />;

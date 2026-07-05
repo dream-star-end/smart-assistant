@@ -3,7 +3,8 @@ import { describe, it } from 'node:test'
 import type { AgentDef } from '@openclaude/storage'
 import { listCollaboratorAgents } from '../collaboratorAgents.js'
 
-// v5 纯市场:可协作 agent = 市场安装集(source==='marketplace') [+ 可选 main]。排除幽灵平台 seed。
+// v5 纯市场:可协作 agent = 市场安装集(source==='marketplace') [+ 可选 main]。
+// 排除幽灵平台 seed 与隐藏系统 agent。
 function cfg(agents: AgentDef[]) {
   return { agents }
 }
@@ -13,6 +14,12 @@ const market1: AgentDef = { id: 'office-assistant', source: 'marketplace' }
 const market2: AgentDef = { id: 'research-assistant', source: 'marketplace' }
 // 存量容器里残留的、已退役的平台预置子 agent(无 source 标记):必须被排除。
 const ghostSeed: AgentDef = { id: 'coder', displayName: '代码工程师' }
+const hiddenReviewer: AgentDef = { id: 'hidden-reviewer', displayName: '隐藏审查员' }
+const staleMarketHiddenReviewer: AgentDef = {
+  id: 'hidden-reviewer',
+  displayName: '旧市场隐藏审查员',
+  source: 'marketplace',
+}
 
 describe('listCollaboratorAgents', () => {
   it('队长组队引导(includeMain:false):只返回市场安装 agent,排除 main 与幽灵 seed', () => {
@@ -48,8 +55,8 @@ describe('listCollaboratorAgents', () => {
     )
   })
 
-  it('对 seed 漂移免疫:只有幽灵 seed(无市场 agent)时,组队成员为空', () => {
-    const members = listCollaboratorAgents(cfg([main, ghostSeed]), {
+  it('对 seed 漂移免疫:幽灵 seed/隐藏系统 agent 不进入组队成员', () => {
+    const members = listCollaboratorAgents(cfg([main, ghostSeed, hiddenReviewer, staleMarketHiddenReviewer]), {
       selfId: 'main',
       includeMain: false,
     })

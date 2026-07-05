@@ -84,6 +84,16 @@ describe("messageSignature 流式防闪签名", () => {
     expect(messageSignature(base(""), CTX)).not.toBe(messageSignature(base("output-arrived"), CTX));
   });
 
+  test("agent-group origin/fallback 变化 → 签名变化（TeamPanel 名称更新）", () => {
+    const a = mk("agent-group", { text: "子任务" });
+    const b = mk("agent-group", {
+      text: "子任务",
+      _agentGroupOrigin: "codex-collab",
+      _teamFallback: true,
+    });
+    expect(messageSignature(a, CTX)).not.toBe(messageSignature(b, CTX));
+  });
+
   test("usage.traceId / costCredits 到达 → assistant 签名变化（meta 行）", () => {
     const a = mk("assistant", { text: "x" });
     const b = mk("assistant", { text: "x", usage: { traceId: "t1", costCredits: "120" } });

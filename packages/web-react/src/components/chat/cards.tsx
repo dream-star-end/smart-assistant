@@ -23,6 +23,7 @@ import { useEffect, useState } from "react";
 import type { ChatMessage } from "../../lib/chat/model";
 import {
   CONTINUE_PROMPT,
+  childSignature,
   defaultCollapsed,
   errorLabel,
   isLive,
@@ -31,6 +32,7 @@ import {
 import { cn, groupDigits } from "../../lib/utils";
 import { Markdown } from "../Markdown";
 import { Alert, Avatar, Badge, Button, IconButton } from "../ui";
+import { ChildBlockView } from "./AgentGroupCard";
 import { Media } from "./media";
 
 export type RenderCtx = { isLast: boolean; sending: boolean };
@@ -452,6 +454,7 @@ export function PlanCard({ msg }: { msg: ChatMessage }) {
 // 不外包 memo(同 PlanCard:就地 mutate + {msg} 会永不重渲)。
 export function DelegateProgressCard({ msg }: { msg: ChatMessage }) {
   const entries = msg.entries ?? [];
+  const children = msg.childBlocks ?? [];
   const done = !!msg._completed;
   return (
     <div className="rounded-lg border border-border bg-surface animate-in">
@@ -468,6 +471,13 @@ export function DelegateProgressCard({ msg }: { msg: ChatMessage }) {
           )}
         </span>
       </div>
+      {children.length > 0 && (
+        <div className="space-y-2 border-t border-border px-3.5 py-2.5">
+          {children.map((ch, i) => (
+            <ChildBlockView key={`${i}-${ch.blockId ?? ch.kind}`} child={ch} sig={childSignature(ch)} />
+          ))}
+        </div>
+      )}
       {entries.length > 0 && (
         <ul className="border-t border-border px-3.5 py-2 text-[12.5px] text-muted">
           {entries.slice(-6).map((e, i) => (

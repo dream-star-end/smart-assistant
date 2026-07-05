@@ -24,11 +24,72 @@ export type MarkdownProps = {
 
 const MarkdownImpl = lazy(() => import("./MarkdownImpl"));
 
-/** 重 chunk 加载中 / 加载失败时的轻量占位：纯文本（pre-wrap 保留换行），无任何重依赖。 */
-function MarkdownFallback({ children }: { children: string }) {
+type HtmlFenceFallback = {
+  before: string;
+  code: string;
+  after: string;
+};
+
+function extractHtmlFenceFallback(source: string): HtmlFenceFallback | null {
+  const open = /(^|\r?\n)```(htmlpreview|html)[^\r\n]*(?:\r?\n|$)/i.exec(source);
+  if (!open) return null;
+  const fenceStart = open.index + open[1].length;
+  const codeStart = open.index + open[0].length;
+  const rest = source.slice(codeStart);
+  const close = /\r?\n```[ \t]*(?:\r?\n|$)/.exec(rest);
+  if (!close) {
+    return { before: source.slice(0, fenceStart), code: rest, after: "" };
+  }
+  return {
+    before: source.slice(0, fenceStart),
+    code: rest.slice(0, close.index),
+    after: rest.slice(close.index + close[0].length),
+  };
+}
+
+function PlainFallbackText({ children }: { children: string }) {
+  if (!children) return null;
+  return <div className="whitespace-pre-wrap break-words">{children}</div>;
+}
+
+function HtmlPreviewFallback({ code, live }: { code: string; live?: boolean }) {
+  return (
+    <div className="not-prose my-3 overflow-hidden rounded-lg border border-border bg-background shadow-sm">
+      <div className="border-b border-border bg-muted/40 px-3 py-2 text-xs font-medium text-muted-foreground">
+        HTML {live ? "预览(生成中)" : "预览"}
+      </div>
+      {live ? (
+        <div className="flex h-28 items-center justify-center bg-surface px-3 text-xs text-muted">
+          生成完成后显示 HTML 预览
+        </div>
+      ) : (
+        <iframe
+          title="HTML 沙盒预览"
+          className="h-72 w-full bg-white"
+          sandbox="allow-scripts"
+          referrerPolicy="no-referrer"
+          srcDoc={code}
+        />
+      )}
+    </div>
+  );
+}
+
+/** 重 chunk 加载中 / 加载失败时的轻量占位：纯文本（pre-wrap 保留换行）；htmlpreview 仍给沙盒预览。 */
+function MarkdownFallback({ children, live }: { children: string; live?: boolean }) {
+  const html = extractHtmlFenceFallback(children);
+  if (html) {
+    return (
+      <div className="prose">
+        <PlainFallbackText>{html.before}</PlainFallbackText>
+        <HtmlPreviewFallback code={html.code} live={live} />
+        <PlainFallbackText>{html.after}</PlainFallbackText>
+      </div>
+    );
+  }
   return (
     <div className="prose">
-      <div className="whitespace-pre-wrap break-words">{children}</div>
+      <PlainFallbackText>{children}</PlainFallbackText>
     </div>
   );
 }
@@ -49,7 +110,7 @@ class MarkdownBoundary extends Component<{ fallback: ReactNode; children: ReactN
 }
 
 export const Markdown = memo(function Markdown({ children, signMedia, live }: MarkdownProps) {
-  const fallback = <MarkdownFallback>{children}</MarkdownFallback>;
+  const fallback = <MarkdownFallback live={live}>{children}</MarkdownFallback>;
   return (
     <MarkdownBoundary fallback={fallback}>
       <Suspense fallback={fallback}>

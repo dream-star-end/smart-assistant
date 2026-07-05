@@ -320,6 +320,7 @@ export class CodexAdapter extends EventEmitter implements EngineAdapter {
     const submitted = this.kernel.submit(
       params.input as string | Array<{ type: string; text?: string }>,
       params.requestId,
+      params.collabAgentPolicy,
     )
     return {
       submitted,

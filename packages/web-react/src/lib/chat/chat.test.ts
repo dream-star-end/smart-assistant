@@ -14,16 +14,18 @@ import {
   parsePartialJson,
   shouldAutoContinueEmptyTurn,
 } from "./pure";
-import { addMessage, type ChatMessage, createSession } from "./model";
+import { addMessage, type ChatMessage, createSession, resetReplyTracker } from "./model";
 import {
   applyCostCharged,
   applyCostWaived,
+  applyLegacyBridgeError,
   applyOutboundError,
   applyOutboundMessage,
   applyResumeFailed,
+  normalizeDelegateCards,
   type FrameEffects,
 } from "./reducer";
-import { ChatSocket } from "./socket";
+import { ChatSocket, type ChatSocketDeps } from "./socket";
 import type { OutboundMessageWire } from "./frames";
 
 // ─── helpers ──────────────────────────────────────────────────────────
@@ -201,6 +203,53 @@ describe("findOrCreateStreamingRow (§9 canonical id upsert)", () => {
 });
 
 // ═══════════════ reducer: §7/§9/§11 ═══════════════
+describe("§11 stale 守卫 —— server 域截止 + teardown 时间窗", () => {
+  test("teardown 时间窗过期后,非 final 帧正常渲染并复活发送态(多端新 turn 不被无界压制)", () => {
+    const s = sess();
+    s._localTeardownAt = Date.now() - 4 * 60_000; // stop 已过 4 分钟 > 3 分钟窗口
+    applyOutboundMessage(
+      s,
+      msgFrame({ frameSeq: 1, ts: Date.now() - 1000, blocks: [{ kind: "text", text: "新一轮", messageId: "srv-9" }] }),
+    );
+    expect(s.messages.some((m) => m.text === "新一轮")).toBe(true);
+    expect(s._sendingInFlight).toBe(true);
+  });
+
+  test("teardown 时间窗内,旧 turn 非 final 晚到帧仍被压制", () => {
+    const s = sess();
+    s._localTeardownAt = Date.now() - 10_000;
+    applyOutboundMessage(
+      s,
+      msgFrame({ frameSeq: 1, ts: Date.now(), blocks: [{ kind: "text", text: "晚到", messageId: "srv-9" }] }),
+    );
+    expect(s.messages.some((m) => m.text === "晚到")).toBe(false);
+    expect(s._sendingInFlight).toBeFalsy();
+  });
+
+  test("客户端时钟快于 server:reset 后新帧按 server 域截止放行,真 stale 帧仍拒", () => {
+    const s = sess();
+    // 模拟 server 时钟刻度远落后于客户端:reset 前见过的帧 server ts=1000。
+    applyOutboundMessage(
+      s,
+      msgFrame({ frameSeq: 1, ts: 1_000, isFinal: true, blocks: [{ kind: "text", text: "旧轮", messageId: "srv-1" }] }),
+    );
+    resetReplyTracker(s); // stop/switch:_trackerResetAt=Date.now()(客户端钟,远大于 server 刻度)
+    expect(s._trackerResetServerTs).toBe(1_000);
+    // 新一轮:server ts=1500 > 截止 1000 → 放行。旧跨域实现会因 1500 < _trackerResetAt 整轮误杀。
+    applyOutboundMessage(
+      s,
+      msgFrame({ frameSeq: 2, ts: 1_500, blocks: [{ kind: "text", text: "新轮", messageId: "srv-2" }] }),
+    );
+    expect(s.messages.some((m) => m.text === "新轮")).toBe(true);
+    // 真 stale:server ts=900 ≤ 1000 → 拒(final 与非 final 同判)。
+    applyOutboundMessage(
+      s,
+      msgFrame({ frameSeq: 3, ts: 900, blocks: [{ kind: "text", text: "stale", messageId: "srv-3" }] }),
+    );
+    expect(s.messages.some((m) => m.text === "stale")).toBe(false);
+  });
+});
+
 describe("applyOutboundMessage (§3/§7/§9/§11)", () => {
   test("text streaming accumulates into one assistant row", () => {
     const s = sess();
@@ -281,6 +330,96 @@ describe("applyOutboundMessage (§3/§7/§9/§11)", () => {
     expect(s._sendingInFlight).toBe(true); // dropped → no teardown
   });
 
+  test("reload 后新非 final 内容帧会在 guard 之后恢复 _sendingInFlight", () => {
+    const s = sess();
+    const onLiveFrame = vi.fn();
+    applyOutboundMessage(
+      s,
+      msgFrame({ frameSeq: 1, blocks: [{ kind: "text", text: "仍在输出", messageId: "srv-1" }] }),
+      { onLiveFrame },
+    );
+    expect(s._sendingInFlight).toBe(true);
+    expect(onLiveFrame).toHaveBeenCalledWith(s);
+  });
+
+  test("stale/agent-switch guard 拦截的非 final 帧不会恢复 _sendingInFlight", () => {
+    const stale = sess();
+    stale._lastFrameSeqByKey = { "agent:main:webchat:dm:s1": 5 };
+    const onLiveFrame = vi.fn();
+    applyOutboundMessage(
+      stale,
+      msgFrame({ frameSeq: 4, blocks: [{ kind: "text", text: "旧帧", messageId: "old" }] }),
+      { onLiveFrame },
+    );
+    expect(stale._sendingInFlight).not.toBe(true);
+    expect(onLiveFrame).not.toHaveBeenCalled();
+
+    const reset = sess();
+    reset._trackerResetAt = Date.now();
+    applyOutboundMessage(
+      reset,
+      msgFrame({
+        frameSeq: 1,
+        ts: reset._trackerResetAt - 1,
+        blocks: [{ kind: "text", text: "stop 后迟到", messageId: "late" }],
+      }),
+      { onLiveFrame },
+    );
+    expect(reset._sendingInFlight).not.toBe(true);
+    expect(reset.messages).toHaveLength(0);
+
+    const localReset = sess();
+    localReset._trackerResetAt = Date.now();
+    localReset._localTeardownAt = localReset._trackerResetAt;
+    applyOutboundMessage(
+      localReset,
+      msgFrame({
+        frameSeq: 1,
+        ts: localReset._trackerResetAt + 1,
+        blocks: [{ kind: "text", text: "stop 后才 stamp 的迟到帧", messageId: "late-stamped" }],
+      }),
+      { onLiveFrame },
+    );
+    expect(localReset._sendingInFlight).not.toBe(true);
+    expect(localReset.messages).toHaveLength(0);
+
+    const localResetNoTs = sess();
+    localResetNoTs._localTeardownAt = Date.now();
+    applyOutboundMessage(
+      localResetNoTs,
+      msgFrame({ frameSeq: 1, ts: undefined, blocks: [{ kind: "text", text: "无 ts 迟到帧", messageId: "late-no-ts" }] }),
+      { onLiveFrame },
+    );
+    expect(localResetNoTs._sendingInFlight).not.toBe(true);
+    expect(localResetNoTs.messages).toHaveLength(0);
+
+    const cron = sess();
+    cron._localTeardownAt = Date.now();
+    onLiveFrame.mockClear();
+    applyOutboundMessage(
+      cron,
+      msgFrame({
+        frameSeq: 1,
+        cronJob: { label: "定时推送" },
+        blocks: [{ kind: "text", text: "合法 cron 推送", messageId: "cron-1" }],
+      }),
+      { onLiveFrame },
+    );
+    expect(cron.messages.some((m) => m.text === "合法 cron 推送" && m.cronPush)).toBe(true);
+    expect(cron._sendingInFlight).not.toBe(true);
+    expect(onLiveFrame).not.toHaveBeenCalled();
+
+    const switched = sess();
+    switched._agentSwitchedAt = Date.now();
+    applyOutboundMessage(
+      switched,
+      msgFrame({ frameSeq: 1, blocks: [{ kind: "text", text: "旧 agent", messageId: "old-agent" }] }),
+      { onLiveFrame },
+    );
+    expect(switched._sendingInFlight).not.toBe(true);
+    expect(switched.messages).toHaveLength(0);
+  });
+
   test("isFinal teardown clears _sendingInFlight + streaming pointers", () => {
     const s = sess();
     addMessage(s, "user", "hi", { status: "sent", ts: 1 });
@@ -319,6 +458,618 @@ describe("applyOutboundMessage (§3/§7/§9/§11)", () => {
     );
     expect(s.messages.some((m) => m._emptyTurn)).toBe(true);
   });
+
+  test("delegate_progress start before delegate_task tool_use is adopted into one agent-group", () => {
+    const s = sess();
+    applyOutboundMessage(
+      s,
+      msgFrame({
+        frameSeq: 1,
+        blocks: [
+          {
+            kind: "delegate_progress",
+            runId: "dlg-1",
+            agentId: "hidden-reviewer",
+            phase: "start",
+            text: "开始委派给 hidden-reviewer: 审查草稿",
+            goal: "审查草稿",
+          },
+        ],
+      }),
+    );
+    expect(s.messages.filter((m) => m.role === "delegate-progress")).toHaveLength(1);
+
+    applyOutboundMessage(
+      s,
+      msgFrame({
+        frameSeq: 2,
+        blocks: [
+          {
+            kind: "tool_use",
+            toolName: "delegate_task",
+            blockId: "tool-1",
+            partial: false,
+            inputJson: { agentId: "hidden-reviewer", goal: "审查草稿" },
+          },
+        ],
+      }),
+    );
+
+    const groups = s.messages.filter((m) => m.role === "agent-group");
+    expect(groups).toHaveLength(1);
+    expect(groups[0]._delegateRunId).toBe("dlg-1");
+    expect(s.messages.filter((m) => m.role === "delegate-progress")).toHaveLength(0);
+  });
+
+  test("Codex native Agent tool_use preserves OpenClaude team fallback origin fields", () => {
+    const s = sess();
+    applyOutboundMessage(
+      s,
+      msgFrame({
+        frameSeq: 1,
+        blocks: [
+          {
+            kind: "tool_use",
+            toolName: "Agent",
+            blockId: "spawn-1",
+            partial: false,
+            inputJson: {
+              description: "inspect repo",
+              openclaudeOrigin: "codex-collab",
+              openclaudeTeamFallback: true,
+            },
+          },
+        ],
+      }),
+    );
+
+    const group = s.messages.find((m) => m.role === "agent-group");
+    expect(group?.text).toBe("inspect repo");
+    expect(group?._delegate).toBeUndefined();
+    expect(group?._agentGroupOrigin).toBe("codex-collab");
+    expect(group?._teamFallback).toBe(true);
+  });
+
+  test("Agent tool_result keeps JSON result preview on completed group", () => {
+    const s = sess();
+    applyOutboundMessage(
+      s,
+      msgFrame({
+        frameSeq: 1,
+        blocks: [
+          {
+            kind: "tool_use",
+            toolName: "Agent",
+            blockId: "spawn-json",
+            partial: false,
+            inputJson: { description: "return json" },
+          },
+        ],
+      }),
+    );
+    applyOutboundMessage(
+      s,
+      msgFrame({
+        frameSeq: 2,
+        blocks: [
+          {
+            kind: "tool_result",
+            toolName: "Agent",
+            toolUseBlockId: "spawn-json",
+            blockId: "spawn-json:result",
+            preview: '{"ok":true}',
+            isError: false,
+          },
+        ],
+      }),
+    );
+
+    const group = s.messages.find((m) => m.role === "agent-group");
+    expect(group?._completed).toBe(true);
+    expect(group?._resultPreview).toBe('{"ok":true}');
+  });
+
+  test("adopted delegate_progress preserves completed summary on the group", () => {
+    const s = sess();
+    applyOutboundMessage(
+      s,
+      msgFrame({
+        frameSeq: 1,
+        blocks: [
+          {
+            kind: "delegate_progress",
+            runId: "dlg-2",
+            agentId: "hidden-reviewer",
+            phase: "start",
+            text: "开始委派给 hidden-reviewer: 审查草稿",
+            goal: "审查草稿",
+          },
+        ],
+      }),
+    );
+    applyOutboundMessage(
+      s,
+      msgFrame({
+        frameSeq: 2,
+        blocks: [{ kind: "delegate_progress", runId: "dlg-2", agentId: "hidden-reviewer", phase: "done", text: "PASS" }],
+      }),
+    );
+    applyOutboundMessage(
+      s,
+      msgFrame({
+        frameSeq: 3,
+        blocks: [
+          {
+            kind: "tool_use",
+            toolName: "delegate_task",
+            blockId: "tool-2",
+            partial: false,
+            inputJson: { agentId: "hidden-reviewer", goal: "审查草稿" },
+          },
+        ],
+      }),
+    );
+
+    const group = s.messages.find((m) => m.role === "agent-group");
+    expect(group?._delegateRunId).toBe("dlg-2");
+    expect(group?._resultPreview).toBe("PASS");
+    expect(s.messages.some((m) => m.role === "delegate-progress")).toBe(false);
+  });
+
+  test("delegate_task tool_use before progress nests child output into same group", () => {
+    const s = sess();
+    applyOutboundMessage(
+      s,
+      msgFrame({
+        frameSeq: 1,
+        blocks: [
+          {
+            kind: "tool_use",
+            toolName: "delegate_task",
+            blockId: "tool-3",
+            partial: false,
+            inputJson: { agentId: "hidden-reviewer", goal: "审查草稿" },
+          },
+        ],
+      }),
+    );
+    applyOutboundMessage(
+      s,
+      msgFrame({
+        frameSeq: 2,
+        blocks: [
+          {
+            kind: "delegate_progress",
+            runId: "dlg-3",
+            agentId: "hidden-reviewer",
+            phase: "start",
+            text: "开始委派给 hidden-reviewer: 审查草稿",
+            goal: "审查草稿",
+          },
+        ],
+      }),
+    );
+    applyOutboundMessage(
+      s,
+      msgFrame({
+        frameSeq: 3,
+        blocks: [
+          {
+            kind: "delegate_progress",
+            runId: "dlg-3",
+            agentId: "hidden-reviewer",
+            phase: "text",
+            text: "child output",
+            block: { kind: "text", text: "child output" },
+          },
+        ],
+      }),
+    );
+
+    const groups = s.messages.filter((m) => m.role === "agent-group");
+    expect(groups).toHaveLength(1);
+    expect(groups[0]._delegateRunId).toBe("dlg-3");
+    expect(groups[0].childBlocks?.some((b) => b.kind === "text" && b.text === "child output")).toBe(true);
+    expect(s.messages.some((m) => m.role === "delegate-progress")).toBe(false);
+  });
+
+
+  test("Codex mcpToolCall delegate_task tool_use is rendered as one realtime agent-group", () => {
+    const s = sess();
+    const started = {
+      type: "mcpToolCall",
+      id: "call_codex_delegate",
+      server: "openclaude_memory",
+      tool: "delegate_task",
+      status: "inProgress",
+      arguments: { agentId: "coding-assistant", goal: "设计水箱模拟" },
+    };
+    applyOutboundMessage(
+      s,
+      msgFrame({
+        frameSeq: 1,
+        blocks: [
+          {
+            kind: "tool_use",
+            toolName: "codex:mcpToolCall",
+            blockId: "call_codex_delegate",
+            partial: false,
+            inputJson: started,
+          },
+        ],
+      }),
+    );
+    expect(s.messages.filter((m) => m.role === "tool")).toHaveLength(0);
+
+    applyOutboundMessage(
+      s,
+      msgFrame({
+        frameSeq: 2,
+        blocks: [
+          {
+            kind: "delegate_progress",
+            runId: "dlg-codex",
+            agentId: "coding-assistant",
+            phase: "start",
+            text: "开始委派给 coding-assistant: 设计水箱模拟",
+            goal: "设计水箱模拟",
+          },
+        ],
+      }),
+    );
+    applyOutboundMessage(
+      s,
+      msgFrame({
+        frameSeq: 3,
+        blocks: [
+          {
+            kind: "delegate_progress",
+            runId: "dlg-codex",
+            agentId: "coding-assistant",
+            phase: "tool",
+            toolName: "Bash",
+            block: { kind: "tool_use", blockId: "child-bash", toolName: "Bash", inputJson: { command: "pwd" } },
+          },
+        ],
+      }),
+    );
+
+    const groups = s.messages.filter((m) => m.role === "agent-group");
+    expect(groups).toHaveLength(1);
+    expect(groups[0].text).toBe("设计水箱模拟");
+    expect(groups[0]._delegateAgentId).toBe("coding-assistant");
+    expect(groups[0]._delegateRunId).toBe("dlg-codex");
+    expect(groups[0].childBlocks?.some((b) => b.kind === "tool_use" && b.toolName === "Bash")).toBe(true);
+    expect(s.messages.some((m) => m.role === "delegate-progress")).toBe(false);
+  });
+
+  test("partial Codex delegate mcpToolCall converts the early tool row into one agent-group", () => {
+    const s = sess();
+    applyOutboundMessage(
+      s,
+      msgFrame({
+        frameSeq: 1,
+        blocks: [
+          {
+            kind: "tool_use",
+            toolName: "codex:mcpToolCall",
+            blockId: "call_partial_delegate",
+            partial: true,
+            inputPreview: '{"type":"mcpToolCall",',
+          },
+        ],
+      }),
+    );
+    expect(s.messages.filter((m) => m.role === "tool")).toHaveLength(1);
+
+    applyOutboundMessage(
+      s,
+      msgFrame({
+        frameSeq: 2,
+        blocks: [
+          {
+            kind: "tool_use",
+            toolName: "codex:mcpToolCall",
+            blockId: "call_partial_delegate",
+            partial: false,
+            inputJson: {
+              type: "mcpToolCall",
+              id: "call_partial_delegate",
+              server: "openclaude_memory",
+              tool: "delegate_task",
+              arguments: { agentId: "coding-assistant", goal: "设计水箱模拟" },
+            },
+          },
+        ],
+      }),
+    );
+
+    const groups = s.messages.filter((m) => m.role === "agent-group");
+    expect(groups).toHaveLength(1);
+    expect(groups[0].id).toBe(s.messages[0].id);
+    expect(groups[0].text).toBe("设计水箱模拟");
+    expect(s.messages.some((m) => m.role === "tool")).toBe(false);
+  });
+
+  test("Codex delegate progress before mcpToolCall is adopted into the same agent-group", () => {
+    const s = sess();
+    applyOutboundMessage(
+      s,
+      msgFrame({
+        frameSeq: 1,
+        blocks: [
+          {
+            kind: "delegate_progress",
+            runId: "dlg-before-codex",
+            agentId: "coding-assistant",
+            phase: "start",
+            text: "开始委派给 coding-assistant: 设计水箱模拟",
+            goal: "设计水箱模拟",
+          },
+        ],
+      }),
+    );
+    expect(s.messages.filter((m) => m.role === "delegate-progress")).toHaveLength(1);
+
+    applyOutboundMessage(
+      s,
+      msgFrame({
+        frameSeq: 2,
+        blocks: [
+          {
+            kind: "tool_use",
+            toolName: "codex:mcpToolCall",
+            blockId: "call_codex_delegate_2",
+            partial: false,
+            inputJson: {
+              type: "mcpToolCall",
+              id: "call_codex_delegate_2",
+              server: "openclaude_memory",
+              tool: "delegate_task",
+              arguments: { agentId: "coding-assistant", goal: "设计水箱模拟" },
+            },
+          },
+        ],
+      }),
+    );
+
+    const groups = s.messages.filter((m) => m.role === "agent-group");
+    expect(groups).toHaveLength(1);
+    expect(groups[0]._delegateRunId).toBe("dlg-before-codex");
+    expect(s.messages.some((m) => m.role === "delegate-progress")).toBe(false);
+  });
+
+  test("legacy non-start delegate_progress entries are adopted without dropping output", () => {
+    const s = sess();
+    applyOutboundMessage(
+      s,
+      msgFrame({
+        frameSeq: 1,
+        blocks: [
+          {
+            kind: "delegate_progress",
+            runId: "dlg-4",
+            agentId: "hidden-reviewer",
+            phase: "start",
+            text: "开始委派给 hidden-reviewer: 审查草稿",
+            goal: "审查草稿",
+          },
+        ],
+      }),
+    );
+    applyOutboundMessage(
+      s,
+      msgFrame({
+        frameSeq: 2,
+        blocks: [{ kind: "delegate_progress", runId: "dlg-4", agentId: "hidden-reviewer", phase: "text", text: "legacy output" }],
+      }),
+    );
+    applyOutboundMessage(
+      s,
+      msgFrame({
+        frameSeq: 3,
+        blocks: [
+          {
+            kind: "tool_use",
+            toolName: "delegate_task",
+            blockId: "tool-4",
+            partial: false,
+            inputJson: { agentId: "hidden-reviewer", goal: "审查草稿" },
+          },
+        ],
+      }),
+    );
+    applyOutboundMessage(
+      s,
+      msgFrame({
+        frameSeq: 4,
+        blocks: [{ kind: "delegate_progress", runId: "dlg-4", agentId: "hidden-reviewer", phase: "text", text: " continued" }],
+      }),
+    );
+
+    const group = s.messages.find((m) => m.role === "agent-group");
+    expect(group?._delegateRunId).toBe("dlg-4");
+    expect(group?.childBlocks?.some((b) => b.kind === "text" && b.text === "legacy output continued")).toBe(true);
+    expect(s.messages.some((m) => m.role === "delegate-progress")).toBe(false);
+  });
+
+  test("mixed legacy entries and rich child blocks are adopted into one group", () => {
+    const s = sess();
+    applyOutboundMessage(
+      s,
+      msgFrame({
+        frameSeq: 1,
+        blocks: [
+          {
+            kind: "delegate_progress",
+            runId: "dlg-5",
+            agentId: "hidden-reviewer",
+            phase: "start",
+            text: "开始委派给 hidden-reviewer: 审查草稿",
+            goal: "审查草稿",
+          },
+        ],
+      }),
+    );
+    applyOutboundMessage(
+      s,
+      msgFrame({
+        frameSeq: 2,
+        blocks: [{ kind: "delegate_progress", runId: "dlg-5", agentId: "hidden-reviewer", phase: "text", text: "legacy output" }],
+      }),
+    );
+    applyOutboundMessage(
+      s,
+      msgFrame({
+        frameSeq: 3,
+        blocks: [
+          {
+            kind: "delegate_progress",
+            runId: "dlg-5",
+            agentId: "hidden-reviewer",
+            phase: "text",
+            text: "rich output",
+            block: { kind: "text", text: "rich output" },
+          },
+        ],
+      }),
+    );
+    applyOutboundMessage(
+      s,
+      msgFrame({
+        frameSeq: 4,
+        blocks: [
+          {
+            kind: "tool_use",
+            toolName: "delegate_task",
+            blockId: "tool-5",
+            partial: false,
+            inputJson: { agentId: "hidden-reviewer", goal: "审查草稿" },
+          },
+        ],
+      }),
+    );
+
+    const group = s.messages.find((m) => m.role === "agent-group");
+    expect(group?._delegateRunId).toBe("dlg-5");
+    expect(group?.childBlocks?.some((b) => b.kind === "text" && b.text === "legacy output")).toBe(true);
+    expect(group?.childBlocks?.some((b) => b.kind === "text" && b.text === "rich output")).toBe(true);
+    expect(s.messages.some((m) => m.role === "delegate-progress")).toBe(false);
+  });
+
+  test("adopted delegate_progress rebinds nested Agent child routing", () => {
+    const s = sess();
+    applyOutboundMessage(
+      s,
+      msgFrame({
+        frameSeq: 1,
+        blocks: [
+          {
+            kind: "delegate_progress",
+            runId: "dlg-nested",
+            agentId: "hidden-reviewer",
+            phase: "start",
+            text: "开始委派给 hidden-reviewer: 审查草稿",
+            goal: "审查草稿",
+          },
+        ],
+      }),
+    );
+    applyOutboundMessage(
+      s,
+      msgFrame({
+        frameSeq: 2,
+        blocks: [
+          {
+            kind: "delegate_progress",
+            runId: "dlg-nested",
+            agentId: "hidden-reviewer",
+            phase: "tool",
+            block: { kind: "tool_use", blockId: "nested-agent-live", toolName: "Agent", inputJson: { description: "nested" } },
+          },
+        ],
+      }),
+    );
+    const standalone = s.messages.find((m) => m.role === "delegate-progress");
+    expect(s._agentGroups?.get("nested-agent-live")).toBe(standalone?.id);
+
+    applyOutboundMessage(
+      s,
+      msgFrame({
+        frameSeq: 3,
+        blocks: [
+          {
+            kind: "tool_use",
+            toolName: "delegate_task",
+            blockId: "tool-nested",
+            partial: false,
+            inputJson: { agentId: "hidden-reviewer", goal: "审查草稿" },
+          },
+        ],
+      }),
+    );
+    const group = s.messages.find((m) => m.role === "agent-group");
+    expect(s._agentGroups?.get("nested-agent-live")).toBe(group?.id);
+
+    applyOutboundMessage(
+      s,
+      msgFrame({
+        frameSeq: 4,
+        blocks: [{ kind: "text", parentToolUseId: "nested-agent-live", text: "nested output" }],
+      }),
+    );
+
+    expect(group?.childBlocks?.some((b) => b.kind === "text" && b.text === "nested output")).toBe(true);
+    expect(s.messages.some((m) => m.role === "delegate-progress")).toBe(false);
+  });
+
+  test("persisted Codex delegate tool plus progress rows collapse into one agent-group", () => {
+    const s = sess();
+    addMessage(s, "tool", "codex:mcpToolCall", {
+      id: "tool-hist",
+      ts: 1,
+      toolName: "codex:mcpToolCall",
+      blockId: "call_hist",
+      inputJson: {
+        type: "mcpToolCall",
+        id: "call_hist",
+        server: "openclaude_memory",
+        tool: "delegate_task",
+        arguments: { agentId: "coding-assistant", goal: "设计水箱模拟" },
+      },
+      _completed: true,
+      output: JSON.stringify({
+        type: "mcpToolCall",
+        id: "call_hist",
+        server: "openclaude_memory",
+        tool: "delegate_task",
+        status: "completed",
+        result: { content: [{ type: "text", text: "✅ 委派完成\n\n最终方案" }] },
+      }),
+    });
+    addMessage(s, "delegate-progress", "", {
+      id: "progress-hist",
+      ts: 2,
+      runId: "dlg-hist",
+      agentId: "coding-assistant",
+      _delegateGoal: "设计水箱模拟",
+      entries: [{ phase: "text", text: "实时输出", ts: 3 }],
+      childBlocks: [{ kind: "tool_use", blockId: "nested-agent", toolName: "Agent", inputJson: { description: "nested" }, _completed: false }],
+      _completed: true,
+      summary: "最终方案",
+    });
+
+    normalizeDelegateCards(s);
+
+    const groups = s.messages.filter((m) => m.role === "agent-group");
+    expect(groups).toHaveLength(1);
+    expect(groups[0].id).toBe("tool-hist");
+    expect(groups[0]._delegateRunId).toBe("dlg-hist");
+    expect(groups[0]._resultPreview).toContain("委派完成");
+    expect(groups[0].childBlocks?.some((b) => b.kind === "text" && b.text === "实时输出")).toBe(true);
+    expect(s._agentGroups?.get("nested-agent")).toBe("tool-hist");
+    expect(s.messages.some((m) => m.role === "tool" || m.role === "delegate-progress")).toBe(false);
+  });
 });
 
 describe("applyOutboundError double-frame suppression (§11)", () => {
@@ -326,9 +1077,17 @@ describe("applyOutboundError double-frame suppression (§11)", () => {
     const s = sess();
     addMessage(s, "user", "hi", { status: "sent", ts: 1 });
     s._sendingInFlight = true;
-    applyOutboundError(s, { type: "outbound.error", sessionKey: "k", channel: "webchat", peer: { id: "s1", kind: "dm" }, code: "insufficient_credits", message: "no credits", isFinal: false, frameSeq: 5 } as never);
+    const persistSession = vi.fn();
+    applyOutboundError(
+      s,
+      { type: "outbound.error", sessionKey: "k", channel: "webchat", peer: { id: "s1", kind: "dm" }, code: "insufficient_credits", message: "no credits", isFinal: false, frameSeq: 5 } as never,
+      { persistSession },
+    );
     expect(s.messages.filter((m) => m.role === "assistant")).toHaveLength(1);
     expect(s._suppressErrorBubbleAtSeq).toBe(6);
+    expect(s._sendingInFlight).toBe(false);
+    expect(s.messages.find((m) => m.role === "user")?.status).toBe("error");
+    expect(persistSession).toHaveBeenCalledWith("s1");
     // following [error] text isFinal at seq 6 → suppressed bubble, still teardown.
     applyOutboundMessage(s, msgFrame({ frameSeq: 6, isFinal: true, ts: 999999999999, blocks: [{ kind: "text", text: "[error] no credits" }] }));
     expect(s.messages.filter((m) => m.role === "assistant")).toHaveLength(1);
@@ -341,6 +1100,21 @@ describe("applyOutboundError double-frame suppression (§11)", () => {
     const err = s.messages.filter((m) => m.role === "assistant").at(-1)!;
     expect(err.text).toBe("系统暂时不可用，请稍后重试。"); // 友好通用,不抛裸英文
     expect(err._errorDetail).toBe("server shutting down"); // 原始信息进查看详情,Codex 审防丢失
+  });
+
+  test("legacy bridge error 无 final：本地收尾后立即 persist false", () => {
+    const s = sess();
+    addMessage(s, "user", "hi", { status: "sent", ts: 1 });
+    s._sendingInFlight = true;
+    const persistSession = vi.fn();
+    applyLegacyBridgeError(
+      s,
+      { type: "error", code: "ERR_INTERNAL", message: "boom", traceId: "t1" } as never,
+      { persistSession },
+    );
+    expect(s._sendingInFlight).toBe(false);
+    expect(s.messages.find((m) => m.role === "user")?.status).toBe("error");
+    expect(persistSession).toHaveBeenCalledWith("s1");
   });
 });
 
@@ -470,12 +1244,13 @@ class FakeWS {
   }
 }
 
-function makeSocket() {
+function makeSocket(overrides: Partial<ChatSocketDeps> = {}) {
   return new ChatSocket({
     getToken: () => "tok",
     silentRefresh: async () => null,
     onAuthExpired: () => {},
     defaultAgentId: "main",
+    ...overrides,
   });
 }
 
@@ -497,6 +1272,111 @@ describe("ChatSocket safeWsSend backpressure (§2) + offline enqueue (§10)", ()
     const s = sock.sessions.get("s1")!;
     expect(s._sendingInFlight).toBe(true);
     expect(s.messages.find((m) => m.role === "user")?.status).toBe("sent");
+  });
+
+  test("send persists optimistic user row + in-flight marker immediately", () => {
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const persistSession = vi.fn();
+    const sock = makeSocket({ persistSession });
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    ws.open();
+    sock.sendMessage({ sessId: "s1", agentId: "main", text: "hi" });
+    expect(persistSession).toHaveBeenCalledWith("s1");
+    const stored = sock.toStored("s1")!;
+    expect(stored.messages.find((m) => m.role === "user")?.text).toBe("hi");
+    expect(stored._sendingInFlight).toBe(true);
+    expect(typeof stored._turnStartedAt).toBe("number");
+  });
+
+  test("restored in-flight session sends hello with inFlight=true", () => {
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const sock = makeSocket();
+    const now = Date.now();
+    sock.loadStored({
+      id: "s1",
+      agentId: "main",
+      title: "s1",
+      messages: [{ id: "u1", role: "user", text: "hi", ts: now - 1000, status: "sent" }],
+      createdAt: now - 1000,
+      lastAt: now - 1000,
+      _sendingInFlight: true,
+      _turnStartedAt: now - 1000,
+      _lastFrameAt: now - 500,
+      _lastFrameSeqByKey: { "agent:main:webchat:dm:s1": 7 },
+    });
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    ws.open();
+    const helloRaw = ws.sent.find((d) => d.includes('"inbound.hello"'));
+    expect(helloRaw).toBeTruthy();
+    const hello = JSON.parse(helloRaw!);
+    expect(hello.peers[0]).toMatchObject({ peerId: "s1", agentId: "main", inFlight: true, lastFrameSeq: 7 });
+    sock.stop();
+  });
+
+  test("stopTurn clears and persists pending turn state immediately", () => {
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const persistSession = vi.fn();
+    const sock = makeSocket({ persistSession });
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    ws.open();
+    sock.sendMessage({ sessId: "s1", agentId: "main", text: "hi" });
+    persistSession.mockClear();
+
+    sock.stopTurn("s1");
+
+    expect(sock.sessions.get("s1")!._sendingInFlight).toBe(false);
+    const stored = sock.toStored("s1")!;
+    expect(stored._sendingInFlight).toBeFalsy();
+    expect(typeof stored._trackerResetAt).toBe("number");
+    expect(stored._localTeardownAt).toBe(stored._trackerResetAt);
+    expect(persistSession).toHaveBeenCalledWith("s1");
+    expect(ws.sent.some((d) => d.includes('"inbound.control.stop"'))).toBe(true);
+
+    const reloaded = makeSocket();
+    reloaded.loadStored(stored);
+    const restored = reloaded.sessions.get("s1")!;
+    const onLiveFrame = vi.fn();
+    applyOutboundMessage(
+      restored,
+      msgFrame({
+        frameSeq: 1,
+        ts: stored._trackerResetAt! + 1,
+        blocks: [{ kind: "text", text: "stale after stop+refresh", messageId: "late" }],
+      }),
+      { onLiveFrame },
+    );
+    expect(restored._sendingInFlight).toBe(false);
+    expect(restored.messages.some((m) => m.text === "stale after stop+refresh")).toBe(false);
+    expect(onLiveFrame).not.toHaveBeenCalled();
+  });
+
+  test("deduplicated auto-continue ack clears and persists pending turn state", () => {
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const persistSession = vi.fn();
+    const sock = makeSocket({ persistSession });
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    ws.open();
+    const sess = sock.ensureSession("s1", "main");
+    sess._sendingInFlight = true;
+    sess.messages.push({
+      id: "u-auto",
+      role: "user",
+      text: "继续",
+      ts: 1,
+      status: "sent",
+      _isAutoRetry: true,
+      _idem: "autocont-s1-u1",
+    } as ChatMessage);
+
+    ws.onmessage?.({ data: JSON.stringify({ type: "outbound.ack", deduplicated: true, idempotencyKey: "autocont-s1-u1" }) });
+
+    expect(sess._sendingInFlight).toBe(false);
+    expect(sock.toStored("s1")?._sendingInFlight).toBeFalsy();
+    expect(persistSession).toHaveBeenCalledWith("s1");
   });
 
   test("bufferedAmount ≥ 2MB → close(4000) + requeue offline (no silent drop)", () => {
@@ -635,4 +1515,3 @@ describe("resume_failed 游标只进不退(master 重启空 ring 防御)", () =>
     expect(s._lastFrameSeqByKey?.["agent:main:webchat:dm:s1"]).toBe(42);
   });
 });
-

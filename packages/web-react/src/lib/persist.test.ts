@@ -150,6 +150,197 @@ describe("persist — 历史合并纯函数", () => {
     const local = [msg("a")];
     expect(applyServerIncremental(local, [])).toBe(local);
   });
+
+  test("mergeFullServerWins: stripped server team rows do not wipe rich local agent cards", () => {
+    const localGroup: ChatMessage = {
+      id: "g1",
+      role: "agent-group",
+      text: "审查草稿",
+      ts: 10,
+      toolName: "delegate_task",
+      blockId: "call-1",
+      _delegate: true,
+      _delegateAgentId: "hidden-reviewer",
+      _delegateGoal: "审查草稿",
+      _delegateRunId: "run-1",
+      _completed: true,
+      _resultPreview: "PASS",
+      childBlocks: [{ kind: "text", text: "审查结果正文" }],
+    };
+    const serverGroup: ChatMessage = {
+      id: "g1",
+      role: "agent-group",
+      text: "审查草稿",
+      ts: 10,
+      toolName: "delegate_task",
+      blockId: "call-1",
+    };
+
+    const merged = mergeFullServerWins([serverGroup], [localGroup]);
+    const group = merged[0];
+    expect(group._completed).toBe(true);
+    expect(group._delegateAgentId).toBe("hidden-reviewer");
+    expect(group._delegateGoal).toBe("审查草稿");
+    expect(group._resultPreview).toBe("PASS");
+    expect(group.childBlocks?.map((b) => b.text)).toEqual(["审查结果正文"]);
+  });
+
+  test("mergeFullServerWins: stripped server agent rows keep Codex fallback display markers", () => {
+    const localGroup: ChatMessage = {
+      id: "g-codex",
+      role: "agent-group",
+      text: "并行检查仓库",
+      ts: 10,
+      toolName: "Agent",
+      blockId: "spawn-1",
+      _agentGroupOrigin: "codex-collab",
+      _teamFallback: true,
+      _completed: true,
+      childBlocks: [{ kind: "text", text: "检查完成" }],
+    };
+    const serverGroup: ChatMessage = {
+      id: "g-codex",
+      role: "agent-group",
+      text: "并行检查仓库",
+      ts: 10,
+      toolName: "Agent",
+      blockId: "spawn-1",
+    };
+
+    const merged = mergeFullServerWins([serverGroup], [localGroup]);
+    const group = merged[0];
+    expect(group._agentGroupOrigin).toBe("codex-collab");
+    expect(group._teamFallback).toBe(true);
+    expect(group.childBlocks?.map((b) => b.text)).toEqual(["检查完成"]);
+  });
+
+  test("applyServerIncremental: stripped delegate-progress keeps local entries and summary", () => {
+    const localProgress: ChatMessage = {
+      id: "dp1",
+      role: "delegate-progress",
+      text: "",
+      ts: 20,
+      runId: "run-1",
+      agentId: "hidden-reviewer",
+      goal: "审查草稿",
+      _completed: true,
+      entries: [{ phase: "text", text: "正在审查", ts: 21 }],
+      summary: "PASS",
+    };
+    const incomingProgress: ChatMessage = {
+      id: "dp1",
+      role: "delegate-progress",
+      text: "",
+      ts: 20,
+      agentId: "hidden-reviewer",
+    };
+
+    const merged = applyServerIncremental([localProgress], [incomingProgress]);
+    expect(merged[0].runId).toBe("run-1");
+    expect(merged[0]._completed).toBe(true);
+    expect(merged[0].entries?.map((e) => e.text)).toEqual(["正在审查"]);
+    expect(merged[0].summary).toBe("PASS");
+  });
+
+  test("applyServerIncremental: late server rows interleave by ts after multiple local continues", () => {
+    const u = (id: string, ts: number): ChatMessage => ({ id, role: "user", text: "继续", ts });
+    const a = (id: string, text: string, ts: number): ChatMessage => ({ id, role: "assistant", text, ts });
+    const local = [a("old", "上一段", 100), u("u1", 200), u("u2", 400)];
+    const incoming = [a("mid", "继续后的内容", 300), a("tail", "后续内容", 500)];
+
+    const merged = applyServerIncremental(local, incoming);
+    expect(merged.map((m) => m.id)).toEqual(["old", "u1", "mid", "u2", "tail"]);
+  });
+
+  test("applyServerIncremental: invalid ts falls back to original merge order", () => {
+    const local = [msg("a", "L-a"), { ...msg("b", "L-b"), ts: Number.NaN }];
+    const incoming = [{ ...msg("c", "S-c"), ts: 0 }];
+    const merged = applyServerIncremental(local, incoming);
+    expect(merged.map((m) => m.id)).toEqual(["a", "b", "c"]);
+  });
+
+  // v5 真实 reopen 场景:server-authored 历史只有 assistant/tool 行,团队卡是 client-owned。
+  // 团队轮之后又有新一轮 → 团队卡落在「最后一个 server 已知 id」之前(中段),旧逻辑整卡丢弃。
+  test("mergeFullServerWins: 保留中段 local-only 团队卡(agent-group/delegate-progress 不随 server-wins 丢弃)", () => {
+    const server = [
+      { ...msg("srv-1", "第一轮答案"), ts: 100 },
+      { ...msg("srv-2", "第二轮答案"), ts: 500 },
+    ];
+    const group: ChatMessage = {
+      id: "m-group",
+      role: "agent-group",
+      text: "委托研究",
+      ts: 200,
+      _delegate: true,
+      _delegateRunId: "run-9",
+      _completed: true,
+      childBlocks: [{ kind: "text", text: "子代理产出" }],
+    };
+    const progress: ChatMessage = {
+      id: "m-prog",
+      role: "delegate-progress",
+      text: "",
+      ts: 300,
+      runId: "run-8",
+      agentId: "coder",
+      _completed: true,
+      entries: [{ phase: "text", text: "进行中", ts: 301 }],
+    };
+    // 中段还有一条非团队的 local-only assistant → 仍按旧语义丢弃(可能已被 srv-* 重写)。
+    const staleAssistant = { ...msg("m-stale", "被取代的乐观助手行"), ts: 250 };
+    const local = [server[0], group, staleAssistant, progress, server[1]];
+
+    const merged = mergeFullServerWins(server, local);
+    expect(merged.map((m) => m.id)).toEqual(["srv-1", "m-group", "m-prog", "srv-2"]);
+    expect(merged.find((m) => m.id === "m-group")!.childBlocks?.length).toBe(1);
+  });
+
+  test("mergeFullServerWins: 被 adopt 吸收的 standalone progress(_adoptedInto)不重复保留", () => {
+    const server = [{ ...msg("srv-1", "答案"), ts: 100 }, { ...msg("srv-2", "尾"), ts: 500 }];
+    const adopted: ChatMessage = {
+      id: "m-adopted",
+      role: "delegate-progress",
+      text: "",
+      ts: 200,
+      runId: "run-1",
+      _adoptedInto: "m-group",
+    };
+    const merged = mergeFullServerWins(server, [server[0], adopted, server[1]]);
+    expect(merged.map((m) => m.id)).toEqual(["srv-1", "srv-2"]);
+  });
+
+  // 本地把 delegate 工具行原位转成 agent-group(同 id),server 同 id 仍是 tool 行:
+  // 富卡为底,从 server 行回填完成态/结果预览,不被打回裸工具行。
+  test("mergeFullServerWins: 同 id server tool 行 vs 本地 agent-group 富卡 → 富卡保留并回填完成态", () => {
+    const serverTool: ChatMessage = {
+      id: "srv-tool-1",
+      role: "tool",
+      text: "",
+      ts: 100,
+      toolName: "mcp__openclaude-memory__delegate_task",
+      output: JSON.stringify({
+        server: "openclaude-memory",
+        tool: "delegate_task",
+        result: { content: [{ text: "审查通过:PASS" }] },
+      }),
+      _completed: true,
+    };
+    const localGroup: ChatMessage = {
+      id: "srv-tool-1",
+      role: "agent-group",
+      text: "审查草稿",
+      ts: 100,
+      _delegate: true,
+      _delegateAgentId: "hidden-reviewer",
+      childBlocks: [{ kind: "text", text: "审查过程输出" }],
+    };
+    const merged = mergeFullServerWins([serverTool], [localGroup]);
+    const row = merged[0];
+    expect(row.role).toBe("agent-group");
+    expect(row.childBlocks?.map((b) => b.text)).toEqual(["审查过程输出"]);
+    expect(row._completed).toBe(true); // 从 server 行回填
+    expect(row._resultPreview).toBe("审查通过:PASS"); // friendlyDelegateResultPreview 语义
+  });
 });
 
 describe("persist — 命名空间", () => {

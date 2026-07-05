@@ -253,6 +253,12 @@ export class MemoryStore {
     return entries.length === 0 ? 0 : entries.join(ENTRY_DELIMITER).length
   }
 
+  /** Public read of the per-target char budget. Single authority = DEFAULT_LIMITS;
+   *  surfaced so the Web UI can render remaining budget instead of hard-coding it. */
+  charLimit(target: MemoryTarget): number {
+    return this.limitFor(target)
+  }
+
   async add(target: MemoryTarget, content: string): Promise<{ ok: boolean; error?: string }> {
     content = content.trim()
     if (!content) return { ok: false, error: 'empty content' }

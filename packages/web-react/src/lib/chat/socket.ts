@@ -20,6 +20,7 @@ import {
   applyResumeFailed,
   applyTurnStatus,
   AUTO_CONTINUE_PROMPT,
+  normalizeDelegateCards,
   type FrameEffects,
 } from "./reducer";
 import {
@@ -490,9 +491,7 @@ export class ChatSocket {
             agentId: s.agentId || this.deps.defaultAgentId || "main",
           }),
         );
-        s._sendingInFlight = false;
-        clearTurnTiming(s);
-        resetReplyTracker(s);
+        this.clearSendingState(s, { persist: false });
         const lastMsg = s.messages[s.messages.length - 1];
         const dup = lastMsg && lastMsg._emptyTurn && lastMsg._emptyTurnTargetMsgId === timedOutMsgId;
         if (!dup) {
@@ -503,6 +502,7 @@ export class ChatSocket {
             _emptyTurnTargetMsgId: timedOutMsgId,
           });
         }
+        this.deps.persistSession?.(s.id);
         this.scheduleNotify();
       }
     }, THINKING_SAFETY_MS);
@@ -515,6 +515,23 @@ export class ChatSocket {
       clearTimeout(t);
       this.thinkingTimers.delete(sessId);
     }
+  }
+
+  private clearSendingState(
+    sess: ChatSession,
+    opts: {
+      clearTiming?: boolean;
+      resetTracker?: boolean;
+      clearThinking?: boolean;
+      persist?: boolean;
+    } = {},
+  ): void {
+    sess._sendingInFlight = false;
+    if (opts.clearTiming !== false) clearTurnTiming(sess);
+    if (opts.resetTracker !== false) resetReplyTracker(sess);
+    sess._localTeardownAt = typeof sess._trackerResetAt === "number" ? sess._trackerResetAt : Date.now();
+    if (opts.clearThinking) this.clearThinkingSafety(sess.id);
+    if (opts.persist !== false) this.deps.persistSession?.(sess.id);
   }
 
   // ═══════════════ reducer effects ═══════════════
@@ -764,10 +781,7 @@ export class ChatSocket {
             // 关键(Codex 审 BLOCKER):必须回退 in-flight 态,否则 drainNextOfflineItem 因
             // _sendingInFlight===true 跳过该项;冷启 4503 下 relay 未建立、无 final/resume 清此
             // flag → 重排进去的消息永久卡 queued 不 drain。把会话退回"待发"态让 drain 能真发。
-            s._sendingInFlight = false;
-            clearTurnTiming(s);
-            resetReplyTracker(s);
-            this.clearThinkingSafety(s.id);
+            this.clearSendingState(s, { clearThinking: true });
           }
         }
       }
@@ -878,6 +892,7 @@ export class ChatSocket {
         if (sess) {
           applyLegacyBridgeError(sess, frame, this.effects());
           this.clearThinkingSafety(sess.id);
+          this.deps.persistSession?.(sess.id);
         }
         return;
       }
@@ -1188,8 +1203,8 @@ export class ChatSocket {
   // ═══════════════ 本地持久 / 历史装载（P6）═══════════════
 
   /**
-   * 序列化为可持久化的 StoredSession：只取 reducer 产出的稳定数据 + 断点续传游标，
-   * 剥离流式指针 / Map / in-flight 瞬态（注水时由 rebuildIndexes 重建）。
+   * 序列化为可持久化的 StoredSession：取稳定数据 + 断点续传游标 + 近期 in-flight 标记，
+   * 剥离流式指针 / Map 等瞬态（注水时由 rebuildIndexes 重建）。
    */
   toStored(sessId: string): StoredSession | null {
     const s = this.sessions.get(sessId);
@@ -1204,14 +1219,23 @@ export class ChatSocket {
       updatedAt: s.updatedAt,
       _lastFrameSeqByKey: s._lastFrameSeqByKey ? { ...s._lastFrameSeqByKey } : undefined,
       _lastFrameSeq: s._lastFrameSeq,
+      ...(s._sendingInFlight ? { _sendingInFlight: true } : {}),
+      ...(typeof s._turnStartedAt === "number" ? { _turnStartedAt: s._turnStartedAt } : {}),
+      ...(typeof s._lastFrameAt === "number" ? { _lastFrameAt: s._lastFrameAt } : {}),
       _maxSeq: s._maxSeq,
+      _trackerResetAt: typeof s._trackerResetAt === "number" ? s._trackerResetAt : undefined,
+      _trackerResetServerTs: typeof s._trackerResetServerTs === "number" ? s._trackerResetServerTs : undefined,
+      _localTeardownAt: typeof s._localTeardownAt === "number" ? s._localTeardownAt : undefined,
+      _agentSwitchedAt: typeof s._agentSwitchedAt === "number" ? s._agentSwitchedAt : s._agentSwitchedAt ?? undefined,
     };
   }
 
   /**
    * 从 IndexedDB 注水会话（boot/登录读回）。**不发任何帧、不连 WS**——纯本地恢复，
    * 让 reload 不丢会话。已存在（live）则跳过：live 状态永远优先于磁盘快照。
-   * 注水后清流式瞬态 + reset in-flight（防 reload 后卡 loading），并重建 block/agent 索引。
+   * 注水后清流式瞬态；仅恢复**近期** in-flight（按 _lastFrameAt 新鲜度判定,refresh 后等待
+   * hello/resume 接回仍在响应的 agent），过期快照丢弃防长期卡 loading;cutoff 守卫戳
+   * （tracker reset / teardown / agent 切换）一并恢复,再重建 block/agent 索引。
    */
   loadStored(stored: StoredSession): void {
     if (!stored?.id || this.sessions.has(stored.id)) return;
@@ -1229,9 +1253,30 @@ export class ChatSocket {
     s._maxSeq = stored._maxSeq;
     s._streamingAssistant = null;
     s._streamingThinking = null;
-    s._sendingInFlight = false;
+    const inFlightReference =
+      typeof stored._lastFrameAt === "number"
+        ? stored._lastFrameAt
+        : typeof stored._turnStartedAt === "number"
+          ? stored._turnStartedAt
+          : 0;
+    const inFlightFresh =
+      stored._sendingInFlight === true &&
+      inFlightReference > 0 &&
+      Date.now() - inFlightReference < THINKING_SAFETY_MS;
+    s._sendingInFlight = inFlightFresh;
+    if (inFlightFresh) {
+      s._turnStartedAt = typeof stored._turnStartedAt === "number" ? stored._turnStartedAt : Date.now();
+      s._lastFrameAt = typeof stored._lastFrameAt === "number" ? stored._lastFrameAt : undefined;
+    }
+    s._trackerResetAt = typeof stored._trackerResetAt === "number" ? stored._trackerResetAt : undefined;
+    s._trackerResetServerTs =
+      typeof stored._trackerResetServerTs === "number" ? stored._trackerResetServerTs : undefined;
+    s._localTeardownAt = typeof stored._localTeardownAt === "number" ? stored._localTeardownAt : undefined;
+    s._agentSwitchedAt = typeof stored._agentSwitchedAt === "number" ? stored._agentSwitchedAt : null;
     rebuildIndexes(s);
+    normalizeDelegateCards(s);
     this.sessions.set(stored.id, s);
+    if (inFlightFresh) this.resetThinkingSafety(stored.id);
     this.scheduleNotify();
   }
 
@@ -1258,6 +1303,7 @@ export class ChatSocket {
     s._blockIdToMsgId = new Map();
     s._agentGroups = new Map();
     rebuildIndexes(s);
+    normalizeDelegateCards(s);
     this.scheduleNotify();
   }
 
@@ -1273,6 +1319,7 @@ export class ChatSocket {
     sess.agentId = agentId;
     sess._agentSwitchedAt = Date.now();
     resetReplyTracker(sess);
+    sess._localTeardownAt = sess._trackerResetAt;
     this.scheduleNotify();
   }
 
@@ -1411,6 +1458,7 @@ export class ChatSocket {
     sess._streamingThinking = null;
     sess._blockIdToMsgId = new Map();
     sess._agentSwitchedAt = null;
+    sess._localTeardownAt = undefined;
 
     const hasQueuedForSess =
       this.offlineQueue.some((i) => i.sessId === sess.id) ||
@@ -1432,6 +1480,7 @@ export class ChatSocket {
         this.inFlightSends.set(sess.id, { sessId: sess.id, payload, msgId: userMsg.id });
       }
       sess._sendingInFlight = true;
+      sess._localTeardownAt = undefined;
       sess._turnStartedAt = Date.now();
       // 新 turn 开始：清跨 turn 计费归因状态（与 drain / auto-continue turn-start 一致）。
       sess._pendingCostCredits = "0";
@@ -1447,6 +1496,7 @@ export class ChatSocket {
       }
     }
     this.scheduleNotify();
+    this.deps.persistSession?.(sess.id);
   }
 
   /** offlineQueue 软上限（§10）。*/
@@ -1469,10 +1519,7 @@ export class ChatSocket {
       }),
     );
     // 本地立即收尾（不等后端 isFinal）。
-    sess._sendingInFlight = false;
-    clearTurnTiming(sess);
-    resetReplyTracker(sess);
-    this.clearThinkingSafety(sess.id);
+    this.clearSendingState(sess, { clearThinking: true });
     this.scheduleNotify();
   }
 
@@ -1549,6 +1596,7 @@ export class ChatSocket {
     }
     userMsg.status = "sent";
     sess._sendingInFlight = true;
+    sess._localTeardownAt = undefined;
     this.scheduleNotify();
   }
 
@@ -1607,6 +1655,7 @@ export class ChatSocket {
     }
     userMsg.status = "sent";
     sess._sendingInFlight = true;
+    sess._localTeardownAt = undefined;
     sess._turnStartedAt = Date.now();
     sess._pendingCostCredits = "0";
     sess._lastFinaledAssistantId = null;
@@ -1620,8 +1669,7 @@ export class ChatSocket {
     for (const sess of this.sessions.values()) {
       if (!sess.messages.some((m) => m && m._isAutoRetry && m._idem === idem)) continue;
       if (!sess._sendingInFlight) return;
-      sess._sendingInFlight = false;
-      this.clearThinkingSafety(sess.id);
+      this.clearSendingState(sess, { clearTiming: false, resetTracker: false, clearThinking: true });
       this.scheduleNotify();
       return;
     }
@@ -1732,6 +1780,7 @@ export class ChatSocket {
       const msg = sess.messages.find((m) => m.id === item.msgId);
       if (msg) msg.status = "sent";
       sess._sendingInFlight = true;
+      sess._localTeardownAt = undefined;
       sess._turnStartedAt = Date.now();
       sess._pendingCostCredits = "0";
       sess._lastFinaledAssistantId = null;

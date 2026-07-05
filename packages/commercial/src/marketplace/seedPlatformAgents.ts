@@ -130,10 +130,10 @@ const PLATFORM_GENERAL_AGENTS: PlatformAgentDef[] = [
       description:
         '一站式办公助手:写周报月报/方案/公文、做汇报 PPT、整理 Excel 与数据分析、生成/解析 PDF、会议纪要、简历与邮件——从读资料到出可下载成品,一个对话端到端搞定。',
       tags: ['办公', '文档', 'PPT', 'Excel', '周报', '公文'],
-      version: '1.0.0',
-      // 办公场景=中文写作 + 密集工具调用(文档/表格/PPT/PDF 生成),glm-5.2(平台默认模型)
-      // 中文强、工具调用稳、支持思考深度,最契合;需更长上下文的长文档总结可由用户换 MiniMax-M3。
-      model: 'glm-5.2',
+      // 1.0.1:基于 2026-07 v5 预置 agent 横评,办公类纪要/材料整理 MiniMax-M3
+      // 结构更稳、少臆造且长上下文更合适;通过版本 bump 让 current_approved_version_id 指向新默认。
+      version: '1.0.1',
+      model: 'MiniMax-M3',
       toolsets: ['core'],
       skillDeps: [],
       avatarEmoji: '📊',
@@ -167,8 +167,8 @@ const PLATFORM_GENERAL_AGENTS: PlatformAgentDef[] = [
         '一站式编程助手:读懂现有代码库、规划并精确改动、跑测试/构建/lint 自我验证、定位并根治 bug、写测试与自审代码——从需求或报错到「验证通过的可用代码」,一个对话端到端完成。',
       tags: ['编程', '代码', '调试', '测试', 'code-review', '重构'],
       version: '1.0.0',
-      // 编程=多轮工具循环(读→改→跑→验)+ 中文交流/注释。glm-5.2(平台默认 coder 模型)工具调用最稳、
-      // 中文强、支持思考深度,最契合 agentic 编码;需更强复杂推理/更长上下文的用户可自行换 deepseek-v4-pro。
+      // 2026-07 v5 横评后仍保留 glm-5.2:编程类更看重多轮工具循环(读→改→跑→验)
+      // 与中文沟通稳定性;deepseek-v4-pro 可作为用户手动切换的复杂推理备选。
       model: 'glm-5.2',
       toolsets: ['core'],
       skillDeps: [],

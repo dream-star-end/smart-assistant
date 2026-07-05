@@ -31,15 +31,19 @@ import { type Logger, rootLogger } from '../logging/logger.js'
 import {
   handleAdminMarketplacePending,
   handleAdminMarketplaceReview,
+  handleAdminMarketplaceReviewBatch,
   handleAdminMarketplaceRevoke,
   handleMarketplaceAgentPublish,
   handleMarketplaceDetail,
   handleMarketplaceInstall,
   handleMarketplaceInstalled,
+  handleMarketplaceInstalledScope,
   handleMarketplaceMyAgents,
   handleMarketplaceMyPublishes,
   handleMarketplacePublish,
+  handleMarketplaceUnlist,
   handleMarketplaceUninstall,
+  handleMarketplaceWithdrawPublish,
 } from '../marketplace/marketplaceRoutes.js'
 import { handleMarketplaceSearch } from '../marketplace/marketplaceSearch.js'
 import { isActiveAdmin, isInMaintenance } from '../middleware/maintenanceMode.js'
@@ -623,14 +627,29 @@ export function createCommercialHandler(
       handler: (req, res) => handleMarketplaceInstalled(req, res, deps),
     },
     {
+      method: 'PATCH',
+      pathPrefix: '/api/marketplace/installed/',
+      handler: (req, res) => handleMarketplaceInstalledScope(req, res, deps),
+    },
+    {
       method: 'GET',
       path: '/api/marketplace/my-publishes',
       handler: (req, res) => handleMarketplaceMyPublishes(req, res, deps),
     },
     {
+      method: 'POST',
+      pathPrefix: '/api/marketplace/my-publishes/',
+      handler: (req, res) => handleMarketplaceWithdrawPublish(req, res, deps),
+    },
+    {
       method: 'DELETE',
       pathPrefix: '/api/marketplace/installed/',
       handler: (req, res) => handleMarketplaceUninstall(req, res, deps),
+    },
+    {
+      method: 'POST',
+      pathPrefix: '/api/marketplace/',
+      handler: (req, res) => handleMarketplaceUnlist(req, res, deps),
     },
     // detail by slug — prefix; exact /installed (+ later /search) match first
     {
@@ -642,6 +661,11 @@ export function createCommercialHandler(
       method: 'GET',
       path: '/api/admin/marketplace/pending',
       handler: (req, res) => handleAdminMarketplacePending(req, res, deps),
+    },
+    {
+      method: 'POST',
+      path: '/api/admin/marketplace/review-batch',
+      handler: (req, res) => handleAdminMarketplaceReviewBatch(req, res, deps),
     },
     {
       method: 'POST',

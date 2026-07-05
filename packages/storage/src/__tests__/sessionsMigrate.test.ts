@@ -51,17 +51,18 @@ function freshDb(prefix: string): { path: string; db: Database.Database } {
 
 function insertCs(
   db: Database.Database,
-  row: { id: string; user_id: string; messages?: string; updated_at?: number; next_seq?: number },
+  row: { id: string; user_id: string; messages?: string; updated_at?: number; next_seq?: number; agent_id?: string },
 ): void {
   db.prepare(
     `INSERT INTO client_sessions (id,user_id,agent_id,title,pinned,created_at,last_at,messages,message_count,updated_at,deleted_at,next_seq,origin_channel)
-     VALUES (@id,@user_id,'main','t',0,1000,@ua,@messages,0,@ua,NULL,@seq,NULL)`,
+     VALUES (@id,@user_id,@agent_id,'t',0,1000,@ua,@messages,0,@ua,NULL,@seq,NULL)`,
   ).run({
     id: row.id,
     user_id: row.user_id,
     messages: row.messages ?? '[]',
     ua: row.updated_at ?? 2000,
     seq: row.next_seq ?? 1,
+    agent_id: row.agent_id ?? 'main',
   })
 }
 
@@ -86,6 +87,28 @@ describe('migrateUserClientSessionsFromV3', () => {
     await migrateUserClientSessionsFromV3(v3.path, 'c:42', v5.path)
     const cnt = (v5.db.prepare('SELECT COUNT(*) AS n FROM client_sessions').get() as { n: number }).n
     assert.equal(cnt, 2, '重跑不产生重复行')
+    v5.db.close()
+  })
+
+
+  it('all legacy v3 agent ids normalize to main during migrate', async () => {
+    const v3 = freshDb('oc-v3-sm-')
+    insertCs(v3.db, { id: 's-codex', user_id: 'c:42', agent_id: 'codex' })
+    insertCs(v3.db, { id: 's-general', user_id: 'c:42', agent_id: 'general' })
+    insertCs(v3.db, { id: 's-market', user_id: 'c:42', agent_id: 'research-assistant' })
+    v3.db.close()
+
+    const v5 = freshDb('oc-v5-sm-')
+    await migrateUserClientSessionsFromV3(v3.path, 'c:42', v5.path)
+
+    const rows = v5.db
+      .prepare('SELECT id,agent_id FROM client_sessions ORDER BY id')
+      .all() as Array<{ id: string; agent_id: string }>
+    assert.deepEqual(rows, [
+      { id: 's-codex', agent_id: 'main' },
+      { id: 's-general', agent_id: 'main' },
+      { id: 's-market', agent_id: 'main' },
+    ])
     v5.db.close()
   })
 

@@ -56,4 +56,44 @@ describe("TeamPanel 团队协作面板", () => {
     expect(screen.getByText("甲")).toBeInTheDocument(); // 仍展开(曾活跃→不自动收起)
     expect(screen.getByText("乙")).toBeInTheDocument();
   });
+
+  test("team fallback 的 Codex 原生 Agent 显示为临时 Codex 子智能体", () => {
+    const members = [
+      member("a", {
+        _delegate: false,
+        _completed: false,
+        _agentGroupOrigin: "codex-collab",
+        _teamFallback: true,
+        text: "并行检查仓库",
+      }),
+      member("b", { _delegate: false, _completed: false, text: "普通临时任务" }),
+    ];
+    render(<TeamPanel members={members} sig="fallback" />);
+    expect(screen.getByText("临时 Codex 子智能体 1")).toBeInTheDocument();
+    expect(screen.getByText("临时子智能体 2")).toBeInTheDocument();
+    expect(screen.queryByText("智能体 1")).not.toBeInTheDocument();
+  });
+
+  test("非 Codex origin 的无名 agent-group 使用中性临时子智能体兜底名", () => {
+    const members = [
+      member("a", { _delegate: false, _completed: false, text: "临时任务A" }),
+      member("b", { _delegate: false, _completed: false, text: "临时任务B" }),
+    ];
+    render(<TeamPanel members={members} sig="neutral" />);
+    expect(screen.getByText("临时子智能体 1")).toBeInTheDocument();
+    expect(screen.getByText("临时子智能体 2")).toBeInTheDocument();
+    expect(screen.queryByText("临时 Codex 子智能体 1")).not.toBeInTheDocument();
+  });
+
+  test("hidden-reviewer(管理 API 隐藏的系统 agent)显示映射名「质量审查员」而非裸 id", () => {
+    const members = [
+      member("a", { _delegateAgentId: "hidden-reviewer", _delegateGoal: "审查代码质量", _completed: false }),
+      member("b", { _delegateAgentId: "coder", _delegateGoal: "写代码", _completed: false }),
+    ];
+    render(<TeamPanel members={members} sig="hr" />);
+    expect(screen.getByText("质量审查员")).toBeInTheDocument();
+    expect(screen.queryByText("hidden-reviewer")).not.toBeInTheDocument();
+    // 非系统 agent 照常回退裸 id(用户级 id 本身可读)
+    expect(screen.getByText("coder")).toBeInTheDocument();
+  });
 });

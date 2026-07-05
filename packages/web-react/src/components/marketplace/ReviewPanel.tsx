@@ -16,6 +16,7 @@ export function ReviewPanel({ auth }: { auth: AuthSession }) {
   const [busy, setBusy] = useState<string | null>(null);
   const [reload, setReload] = useState(0);
   const [open, setOpen] = useState<string | null>(null);
+  const [selected, setSelected] = useState<Set<string>>(new Set());
   const [promptText, promptTextEl] = usePrompt();
 
   useEffect(() => {
@@ -61,6 +62,55 @@ export function ReviewPanel({ auth }: { auth: AuthSession }) {
     [auth, promptText],
   );
 
+  const batchReview = useCallback(
+    async (decision: "approve" | "reject") => {
+      const versionIds = (rows || [])
+        .filter((r) => selected.has(r.versionId))
+        .map((r) => r.versionId);
+      if (versionIds.length === 0) return;
+      let note: string | undefined;
+      if (decision === "reject") {
+        const reason = await promptText({
+          title: `批量拒绝 ${versionIds.length} 个投稿`,
+          body: "理由会展示给这些发布者，请写明需要修正什么。",
+          placeholder: "例：正文包含内网地址，请移除后重新提交",
+          confirmText: "批量拒绝",
+          maxLength: 500,
+        });
+        if (reason === null) return;
+        note = reason;
+      }
+      setBusy(`batch:${decision}`);
+      setErr(null);
+      try {
+        const r = await api.adminMarketplaceReviewBatch(auth, versionIds, decision, note);
+        setSelected(new Set());
+        setReload((n) => n + 1);
+        if (r.failed > 0) setErr(`批量处理完成：${r.reviewed} 成功，${r.failed} 失败。`);
+      } catch (e) {
+        setErr((e as Error).message || "批量审核失败");
+      } finally {
+        setBusy(null);
+      }
+    },
+    [auth, promptText, rows, selected],
+  );
+
+  const visibleIds = rows?.map((r) => r.versionId) || [];
+  const selectedVisibleIds = visibleIds.filter((id) => selected.has(id));
+  const allSelected = visibleIds.length > 0 && selectedVisibleIds.length === visibleIds.length;
+  const toggleAll = (checked: boolean) => {
+    setSelected(checked ? new Set(visibleIds) : new Set());
+  };
+  const toggleOne = (versionId: string, checked: boolean) => {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (checked) next.add(versionId);
+      else next.delete(versionId);
+      return next;
+    });
+  };
+
   return (
     <div className="flex flex-col">
       {promptTextEl}
@@ -77,60 +127,100 @@ export function ReviewPanel({ auth }: { auth: AuthSession }) {
       ) : !rows || rows.length === 0 ? (
         <EmptyState icon={Inbox} title="暂无待审版本" hint="用户提交发布后会出现在这里。" />
       ) : (
-        <ul className="flex flex-col gap-2 px-4 py-4">
-          {rows.map((r) => {
-            const isOpen = open === r.versionId;
-            const flags = friendlyRiskFlags(r.riskFlags);
-            return (
-              <li
-                key={r.versionId}
-                className="overflow-hidden rounded-xl border border-border bg-elevated"
+        <div className="flex flex-col gap-3 px-4 py-4">
+          <div className="flex flex-wrap items-center gap-2 rounded-xl border border-border bg-surface px-3 py-2">
+            <label className="flex items-center gap-2 text-[12.5px] text-muted">
+              <input
+                type="checkbox"
+                checked={allSelected}
+                ref={(el) => {
+                  if (el) el.indeterminate = selectedVisibleIds.length > 0 && !allSelected;
+                }}
+                onChange={(e) => toggleAll(e.currentTarget.checked)}
+              />
+              全选
+            </label>
+            <span className="text-[12px] text-faint">已选 {selectedVisibleIds.length}</span>
+            <div className="ml-auto flex gap-2">
+              <Button
+                size="sm"
+                variant="secondary"
+                onClick={() => batchReview("reject")}
+                disabled={selectedVisibleIds.length === 0 || busy !== null}
               >
-                <div className="flex items-center gap-2 px-3.5 py-3">
-                  <button
-                    type="button"
-                    onClick={() => setOpen(isOpen ? null : r.versionId)}
-                    className="flex min-w-0 flex-1 items-center gap-2 text-left outline-none"
-                  >
-                    <ChevronRight
-                      size={15}
-                      className={`shrink-0 text-faint transition-transform ${isOpen ? "rotate-90" : ""}`}
+                批量拒绝
+              </Button>
+              <Button
+                size="sm"
+                variant="primary"
+                onClick={() => batchReview("approve")}
+                disabled={selectedVisibleIds.length === 0 || busy !== null}
+              >
+                {busy === "batch:approve" ? <Loader2 size={14} className="animate-spin" /> : null}
+                批量批准
+              </Button>
+            </div>
+          </div>
+          <ul className="flex flex-col gap-2">
+            {rows.map((r) => {
+              const isOpen = open === r.versionId;
+              const flags = friendlyRiskFlags(r.riskFlags);
+              return (
+                <li
+                  key={r.versionId}
+                  className="overflow-hidden rounded-xl border border-border bg-elevated"
+                >
+                  <div className="flex items-center gap-2 px-3.5 py-3">
+                    <input
+                      type="checkbox"
+                      checked={selected.has(r.versionId)}
+                      onChange={(e) => toggleOne(r.versionId, e.currentTarget.checked)}
+                      aria-label={`选择 ${r.name}`}
                     />
-                    <div className="min-w-0">
-                      <div className="flex items-center gap-1.5">
-                        <span className="truncate text-[13.5px] font-medium text-fg">{r.name}</span>
-                        {r.kind === "agent" && <Badge tone="accent">智能体</Badge>}
-                        <Badge tone="neutral">v{r.version}</Badge>
-                        {flags.length > 0 && <Badge tone="warning">{flags.length} 项提示</Badge>}
+                    <button
+                      type="button"
+                      onClick={() => setOpen(isOpen ? null : r.versionId)}
+                      className="flex min-w-0 flex-1 items-center gap-2 text-left outline-none"
+                    >
+                      <ChevronRight
+                        size={15}
+                        className={`shrink-0 text-faint transition-transform ${isOpen ? "rotate-90" : ""}`}
+                      />
+                      <div className="min-w-0">
+                        <div className="flex items-center gap-1.5">
+                          <span className="truncate text-[13.5px] font-medium text-fg">{r.name}</span>
+                          {r.kind === "agent" && <Badge tone="accent">智能体</Badge>}
+                          <Badge tone="neutral">v{r.version}</Badge>
+                          {flags.length > 0 && <Badge tone="warning">{flags.length} 项提示</Badge>}
+                        </div>
+                        <p className="truncate text-[12px] text-muted">
+                          {r.slug} · 提交者 #{r.submittedBy}
+                        </p>
                       </div>
-                      <p className="truncate text-[12px] text-muted">
-                        {r.slug} · 提交者 #{r.submittedBy}
-                      </p>
-                    </div>
-                  </button>
-                  <Button
-                    variant="ghost"
-                    size="sm"
-                    onClick={() => review(r.versionId, "reject")}
-                    disabled={busy === r.versionId}
-                    aria-label="拒绝"
-                  >
-                    <X size={15} />
-                  </Button>
-                  <Button
-                    variant="primary"
-                    size="sm"
-                    onClick={() => review(r.versionId, "approve")}
-                    disabled={busy === r.versionId}
-                  >
-                    {busy === r.versionId ? (
-                      <Loader2 size={14} className="animate-spin" />
-                    ) : (
-                      <Check size={14} />
-                    )}
-                    批准
-                  </Button>
-                </div>
+                    </button>
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      onClick={() => review(r.versionId, "reject")}
+                      disabled={busy !== null}
+                      aria-label="拒绝"
+                    >
+                      <X size={15} />
+                    </Button>
+                    <Button
+                      variant="primary"
+                      size="sm"
+                      onClick={() => review(r.versionId, "approve")}
+                      disabled={busy !== null}
+                    >
+                      {busy === r.versionId ? (
+                        <Loader2 size={14} className="animate-spin" />
+                      ) : (
+                        <Check size={14} />
+                      )}
+                      批准
+                    </Button>
+                  </div>
 
                 {isOpen && (
                   <div className="border-t border-border px-3.5 py-3">
@@ -174,8 +264,9 @@ export function ReviewPanel({ auth }: { auth: AuthSession }) {
                 )}
               </li>
             );
-          })}
-        </ul>
+            })}
+          </ul>
+        </div>
       )}
 
       <RevokeBox auth={auth} />

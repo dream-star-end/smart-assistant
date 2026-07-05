@@ -18,6 +18,7 @@ function renderMsg(
   opts: {
     isLast?: boolean;
     sending?: boolean;
+    inActiveTurn?: boolean;
     cb?: CardCallbacks;
     onRespond?: PermissionRespond;
   } = {},
@@ -30,6 +31,7 @@ function renderMsg(
       sig={messageSignature(message, { isLast, sending })}
       isLast={isLast}
       sending={sending}
+      inActiveTurn={opts.inActiveTurn ?? true}
       cb={opts.cb ?? {}}
       onRespondPermission={opts.onRespond ?? (() => {})}
     />,
@@ -85,7 +87,23 @@ describe("MessageRenderer 角色分派 + 非工具卡", () => {
     expect(screen.getByText("推理中...")).toBeInTheDocument();
   });
 
-  test("plan：渲染步骤", () => {
+  test("plan：活跃段 + 本轮进行中 → structured steps 交给 PinnedTaskTracker，inline 不重复渲染", () => {
+    const { container } = renderMsg(
+      mk("plan", {
+        text: "计划",
+        steps: [
+          { step: "第一步", status: "completed" },
+          { step: "第二步", status: "inProgress" },
+        ],
+      }),
+      { inActiveTurn: true, sending: true },
+    );
+    expect(container.textContent).toBe("");
+    expect(screen.queryByText("第一步")).toBeNull();
+    expect(screen.queryByText("第二步")).toBeNull();
+  });
+
+  test("plan：历史段 structured steps 渲染只读 PlanCard(翻历史可见当时计划)", () => {
     renderMsg(
       mk("plan", {
         text: "计划",
@@ -94,9 +112,24 @@ describe("MessageRenderer 角色分派 + 非工具卡", () => {
           { step: "第二步", status: "inProgress" },
         ],
       }),
+      { inActiveTurn: false, sending: false },
     );
     expect(screen.getByText("第一步")).toBeInTheDocument();
     expect(screen.getByText("第二步")).toBeInTheDocument();
+  });
+
+  test("plan：活跃段但本轮已结束(sending=false,HUD 已隐藏)→ 渲染只读卡兜底", () => {
+    renderMsg(mk("plan", { text: "计划", steps: [{ step: "第一步", status: "pending" }] }), {
+      inActiveTurn: true,
+      sending: false,
+    });
+    expect(screen.getByText("第一步")).toBeInTheDocument();
+  });
+
+  test("plan：text-only 仍渲染 inline 兜底", () => {
+    renderMsg(mk("plan", { text: "计划", explanation: "先说明后执行" }));
+    expect(screen.getByText("计划")).toBeInTheDocument();
+    expect(screen.getByText("先说明后执行")).toBeInTheDocument();
   });
 
   test("system：居中提示", () => {
@@ -116,6 +149,38 @@ describe("tool / agent-group 集成", () => {
     expect(screen.getByText("完成")).toBeInTheDocument();
   });
 
+  const TODO_TOOL = () =>
+    mk("tool", {
+      toolName: "TodoWrite",
+      inputJson: {
+        todos: [
+          { content: "步骤一", status: "completed" },
+          { content: "步骤二", status: "pending" },
+        ],
+      },
+      _completed: true,
+    });
+
+  test("TodoWrite：活跃段 + 本轮进行中 → 抑制 inline(HUD 接管)", () => {
+    const { container } = renderMsg(TODO_TOOL(), { inActiveTurn: true, sending: true });
+    expect(container.textContent).toBe("");
+  });
+
+  test("TodoWrite：历史段渲染只读紧凑卡(含步骤与完成状态)", () => {
+    renderMsg(TODO_TOOL(), { inActiveTurn: false, sending: false });
+    expect(screen.getByText("任务列表")).toBeInTheDocument();
+    expect(screen.getByText("1/2")).toBeInTheDocument();
+    // 展开可见各步骤与状态
+    fireEvent.click(screen.getByRole("button"));
+    expect(screen.getByText("步骤一")).toBeInTheDocument();
+    expect(screen.getByText("步骤二")).toBeInTheDocument();
+  });
+
+  test("TodoWrite：活跃段但本轮已结束(HUD 已隐藏)→ 渲染只读卡兜底", () => {
+    renderMsg(TODO_TOOL(), { inActiveTurn: true, sending: false });
+    expect(screen.getByText("任务列表")).toBeInTheDocument();
+  });
+
   test("agent-group → 折叠头 + 运行中 + 递归子块（文本）", () => {
     renderMsg(
       mk("agent-group", {
@@ -128,6 +193,48 @@ describe("tool / agent-group 集成", () => {
     expect(screen.getByText("运行中")).toBeInTheDocument();
     // 运行中默认展开 → 子块文本可见。
     expect(screen.getByText("子代理输出")).toBeInTheDocument();
+  });
+
+  test("delegate-progress fallback renders child tool blocks with ToolCard", () => {
+    renderMsg(
+      mk("delegate-progress", {
+        _completed: false,
+        childBlocks: [
+          { kind: "tool_use", blockId: "child-bash", toolName: "Bash", inputJson: { command: "pwd" }, _completed: false },
+        ],
+      }),
+    );
+    expect(screen.getByText("委派子任务")).toBeInTheDocument();
+    expect(screen.getByText("终端")).toBeInTheDocument();
+    expect(screen.getAllByText("pwd").length).toBeGreaterThanOrEqual(1);
+  });
+
+  test("delegate-progress fallback keeps final summary when child blocks exist", () => {
+    renderMsg(
+      mk("delegate-progress", {
+        _completed: true,
+        summary: "委派最终结果",
+        childBlocks: [
+          { kind: "tool_use", blockId: "child-bash", toolName: "Bash", inputJson: { command: "pwd" }, _completed: true },
+        ],
+      }),
+    );
+    expect(screen.getByText("委派最终结果")).toBeInTheDocument();
+    expect(screen.getByText("终端")).toBeInTheDocument();
+  });
+
+  test("delegate-progress fallback keeps legacy entries when child blocks exist", () => {
+    renderMsg(
+      mk("delegate-progress", {
+        _completed: false,
+        entries: [{ phase: "text", text: "legacy output", ts: 1 }],
+        childBlocks: [
+          { kind: "tool_use", blockId: "child-bash", toolName: "Bash", inputJson: { command: "pwd" }, _completed: false },
+        ],
+      }),
+    );
+    expect(screen.getByText("legacy output")).toBeInTheDocument();
+    expect(screen.getByText("终端")).toBeInTheDocument();
   });
 });
 
@@ -218,5 +325,37 @@ describe("MessageList coalesceTeam 聚合(零回归关键路径)", () => {
   test("三条连续 → 团队面板计数为 3", () => {
     renderList([g("g1", "A"), g("g2", "B"), g("g3", "C")]);
     expect(screen.getByText("团队协作 · 3 个智能体")).toBeInTheDocument();
+  });
+});
+
+describe("MessageList 活跃段归属(turnSegment 收口)", () => {
+  const todoTool = (id: string): ChatMessage =>
+    mk("tool", {
+      id,
+      toolName: "TodoWrite",
+      inputJson: { todos: [{ content: "旧任务", status: "in_progress" }] },
+      _completed: true,
+    });
+  function renderList(messages: ChatMessage[], sending: boolean) {
+    return render(
+      <MessageList messages={messages} sending={sending} cb={{}} onRespondPermission={() => {}} />,
+    );
+  }
+
+  test("当前 turn 的 TodoWrite 在发送中被抑制(HUD 接管)", () => {
+    renderList([mk("user", { id: "u1", text: "做任务" }), todoTool("t1")], true);
+    expect(screen.queryByText("任务列表")).toBeNull();
+  });
+
+  test("上一轮的 TodoWrite 在新 turn 中按历史段渲染只读卡(不再被抑制)", () => {
+    renderList(
+      [
+        mk("user", { id: "u1", text: "做任务" }),
+        todoTool("t1"),
+        mk("user", { id: "u2", text: "换个话题" }),
+      ],
+      true,
+    );
+    expect(screen.getByText("任务列表")).toBeInTheDocument();
   });
 });

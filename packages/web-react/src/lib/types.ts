@@ -504,6 +504,7 @@ export type SkillSummary = {
   /** 精确来源层（shared/legacy/hub…）；用于区分自建与市场安装。平台层后端已剔除。 */
   layer?: string;
   writable?: boolean;
+  agentIds?: string[];
 };
 
 /** 评测用例(skill 目录 evals/evals.json)。 */
@@ -677,6 +678,7 @@ export type MarketplaceInstalled = {
   versionId: string;
   name: string;
   artifactHash: string;
+  agentIds?: string[];
   installedAt: string;
   listingState: string;
   /** listing 当前上架版本（升级可见性；旧后端/无上架版本时缺省）。 */
@@ -699,8 +701,16 @@ export type MarketplaceMyPublish = {
   reviewedAt?: string | null;
   /** 该版本是否 listing 当前上架版本。 */
   isCurrent: boolean;
-  /** listing 状态（active/revoked）。 */
+  /** listing 状态（active/unlisted/revoked）。 */
   listingState: string;
+};
+
+/** 批量审核结果（POST /api/admin/marketplace/review-batch）。 */
+export type MarketplaceReviewBatchResult = {
+  ok: boolean;
+  reviewed: number;
+  failed: number;
+  results: Array<{ versionId: string; ok: boolean; code?: string; message?: string }>;
 };
 
 /** 待审版本（GET /api/admin/marketplace/pending 的 pending 项，含完整工件供审核）。 */

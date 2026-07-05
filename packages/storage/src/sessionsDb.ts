@@ -13,6 +13,7 @@
 import { appendFile, readFile, rename, writeFile } from 'node:fs/promises'
 import { mkdir } from 'node:fs/promises'
 import { dirname } from 'node:path'
+import { TEAM_CARD_CLIENT_DISPLAY_FIELDS } from '@openclaude/protocol/teamCards'
 import Database from 'better-sqlite3'
 import { paths } from './paths.js'
 
@@ -691,6 +692,18 @@ const CLIENT_PUT_ALLOWED_STATUSES: ReadonlySet<string> = new Set<string>([
   'sending', 'queued', 'sent', 'read',
 ])
 
+// Team/delegate cards are client-owned UI structures (agent-group /
+// delegate-progress) that must survive refresh. Keep these scoped to those
+// roles so ordinary assistant/tool ephemeral fields still get stripped.
+//
+// 清单权威在 @openclaude/protocol/teamCards 的 TEAM_CARD_CLIENT_DISPLAY_FIELDS
+// (与 web-react persist.ts 的 mergeLocalTeamDisplayFields 共享同一常量),这里
+// 只做 Set 化。别在这里就地加字段 —— 加进共享常量,两侧才不会再漂移
+// (f2272c08 教训:前端加 _agentGroupOrigin/_teamFallback 服务端没跟上)。
+const CLIENT_PUT_TEAM_MESSAGE_FIELDS: ReadonlySet<string> = new Set<string>(
+  TEAM_CARD_CLIENT_DISPLAY_FIELDS,
+)
+
 const SERVER_AUTHORITATIVE_FIELDS: ReadonlySet<string> = new Set<string>([
   '_source', '_seq', 'usage',
   '_truncated', '_errorCode', '_errorDetail',
@@ -727,9 +740,13 @@ export function _resetClientPutBlockedFieldCountsForTest(): void {
 export function _stripClientPutMessage(msg: unknown): MessageLike | null {
   if (!msg || typeof msg !== 'object') return null
   const src = msg as Record<string, unknown>
+  const role = typeof src.role === 'string' ? src.role : ''
+  const teamOwned = role === 'agent-group' || role === 'delegate-progress'
   const out: Record<string, unknown> = {}
   for (const k of Object.keys(src)) {
     if (CLIENT_PUT_ALLOWED_FIELDS.has(k)) {
+      out[k] = src[k]
+    } else if (teamOwned && CLIENT_PUT_TEAM_MESSAGE_FIELDS.has(k)) {
       out[k] = src[k]
     } else if (k === 'status') {
       const v = src[k]

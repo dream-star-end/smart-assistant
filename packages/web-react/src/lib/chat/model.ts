@@ -136,6 +136,8 @@ export type ChatMessage = {
   _delegate?: boolean;
   _delegateAgentId?: string;
   _delegateGoal?: string;
+  _agentGroupOrigin?: string;
+  _teamFallback?: boolean;
   /** agent-group ↔ delegate-progress run 绑定键（双向 adopt，§7）。*/
   _delegateRunId?: string;
   _duration?: number;
@@ -206,6 +208,17 @@ export type ChatSession = {
   _replyingToMsgId?: string | null;
   _currentTurnAnswerCount?: number;
   _trackerResetAt?: number;
+  /**
+   * server 时钟域的 tracker reset 截止戳 = reset 时刻已见过的最大 frame.ts。stale 判定
+   * 优先用它与 frame.ts **同域比较**（frame.ts ≤ 此值 → 帧发出不晚于 reset 前所见 → stale），
+   * 消掉「客户端时钟快于 server → 整轮新帧被 _trackerResetAt 跨域比较误杀」一类风险；
+   * _trackerResetAt（客户端钟）仅在从未见过 server ts 时作回退。
+   */
+  _trackerResetServerTs?: number;
+  /** 迄今所见最大 server frame.ts（运行期跟踪 + 持久化,供 reset 时定格 server 域截止）。*/
+  _lastServerTs?: number;
+  /** 本地 stop/timeout/switch/error 后的非 final 截止戳；防 late frame 在 reload 后复活发送态。*/
+  _localTeardownAt?: number;
   _agentSwitchedAt?: number | null;
   _turnStartedAt?: number | null;
   _lastFrameAt?: number;
@@ -295,6 +308,14 @@ export function resetReplyTracker(sess: ChatSession): void {
   sess._replyingToMsgId = null;
   sess._currentTurnAnswerCount = 0;
   sess._trackerResetAt = Date.now();
+  // server 域截止定格:此后凡 frame.ts ≤ 该值的帧都视为 stale(同域比较,见字段注释)。
+  if (typeof sess._lastServerTs === "number") sess._trackerResetServerTs = sess._lastServerTs;
+}
+
+/** 每见一帧带 server ts 就推进(max);reset 时定格进 _trackerResetServerTs。*/
+export function trackServerTs(sess: ChatSession, ts: unknown): void {
+  if (typeof ts !== "number" || !Number.isFinite(ts)) return;
+  if (typeof sess._lastServerTs !== "number" || ts > sess._lastServerTs) sess._lastServerTs = ts;
 }
 
 export function markFrameReceived(sess: ChatSession): void {

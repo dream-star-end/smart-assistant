@@ -17,7 +17,7 @@ import {
 // ('ccb' / 'codex' factory)。
 import './engine/ccbAdapter.js'
 import './engine/codexAdapter.js'
-import type { EngineAdapter } from './engine/engineAdapter.js'
+import type { CollabAgentPolicy, EngineAdapter } from './engine/engineAdapter.js'
 import type {
   EngineBillingEvent,
   EngineEvent,
@@ -1560,6 +1560,7 @@ export class SessionManager {
        *  runner 实现 setCodexRoute,其余 runner duck-type 缺方法 → noop。 */
       codexRoute?: CodexProviderConfigOverride | null
       toolsets?: string[]
+      collabAgentPolicy?: CollabAgentPolicy
     },
   ): Promise<void> {
     // ── P0 计费旁路封堵(fail-closed 钱安全兜底,gateway seam 单一收口)────
@@ -1800,7 +1801,14 @@ export class SessionManager {
       })
       try {
         await Promise.race([
-          this.runOneTurnWithRetry(session, runnerPayload, onEvent, requestId, traceId),
+          this.runOneTurnWithRetry(
+            session,
+            runnerPayload,
+            onEvent,
+            requestId,
+            traceId,
+            opts?.collabAgentPolicy,
+          ),
           livenessPromise,
         ])
       } finally {
@@ -1855,6 +1863,7 @@ export class SessionManager {
      *  operator grepping on traceId sees the entire turn's gateway-side trail.
      *  Sub-30 minute lifetime — scoped to this turn's retry budget. */
     traceId?: string,
+    collabAgentPolicy?: CollabAgentPolicy,
   ): Promise<void> {
     const MAX_RETRIES = 3
     const BASE_DELAY = 2000
@@ -1906,6 +1915,7 @@ export class SessionManager {
           onEvent,
           requestId,
           traceId,
+          collabAgentPolicy,
           assistantMessageId,
           thinkingMessageId,
           toolMessageIdFactory,
@@ -2026,6 +2036,7 @@ export class SessionManager {
      *  so undefined values don't insert a `traceId: undefined` key. See parent
      *  fn JSDoc for the full log-tagging inventory. */
     traceId?: string,
+    collabAgentPolicy?: CollabAgentPolicy,
     /** V3 v7 — canonical assistant/thinking message ids computed once by
      *  runOneTurnWithRetry and shared across retries within this user turn.
      *  Passed into CcbMessageParser so every main-agent text/thinking block
@@ -2676,6 +2687,7 @@ export class SessionManager {
         assistantMessageId,
         thinkingMessageId,
         toolMessageIdFactory,
+        collabAgentPolicy,
         onEvent: handleEngineEvent,
         // CCB 成本 delta 基线:parser 直接读写 session.totalCostUSD / turns /
         // _lastCcbCumulativeCost(单一权威;回滚由上方 finalizeTurn 就地恢复)。

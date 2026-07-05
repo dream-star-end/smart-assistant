@@ -1,8 +1,9 @@
 import { ChevronRight, FileText, Loader2, Pencil, Search, Sparkles, Trash2 } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
 import { api } from "../../lib/api";
-import type { AuthSession, SkillDetail, SkillSummary } from "../../lib/types";
+import type { AuthSession, MarketplaceMyAgent, SkillDetail, SkillSummary } from "../../lib/types";
 import { cn } from "../../lib/utils";
+import { AgentScopeSummary } from "../AgentScopePicker";
 import { Alert, Badge, EmptyState, Input, PanelHeader, Spinner, useConfirm } from "../ui";
 import { ratesFromPublicModel, type ModelRates } from "../../lib/skillRunCost";
 import { SKILL_RUN_MODEL, SkillEvalSection, SkillTrainSection } from "./SkillOptPanel";
@@ -14,6 +15,7 @@ import { SkillEditor } from "./SkillEditor";
  */
 export function SkillsPanel({ auth }: { auth: AuthSession }) {
   const [skills, setSkills] = useState<SkillSummary[] | null>(null);
+  const [agents, setAgents] = useState<MarketplaceMyAgent[]>([]);
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState<string | null>(null);
   const [reload, setReload] = useState(0);
@@ -37,12 +39,14 @@ export function SkillsPanel({ auth }: { auth: AuthSession }) {
     let alive = true;
     setLoading(true);
     setErr(null);
-    api
-      .listSkills(auth)
-      .then((s) => {
+    Promise.all([api.listSkills(auth), api.listMyAgents(auth).catch(() => [] as MarketplaceMyAgent[])])
+      .then(([s, a]) => {
         // 纵深防御：平台内置技能绝不展示。后端容器已 includePlatform:false 不返回平台技能；
         // 这里再过滤一道，万一后端回归也不会漏到 UI。
-        if (alive) setSkills(s.filter((sk) => sk.source !== "platform"));
+        if (alive) {
+          setSkills(s.filter((sk) => sk.source !== "platform"));
+          setAgents(a.length ? a : [{ id: "main", slug: "main", name: "全能助手", description: "", installed: true, isDefault: true }]);
+        }
       })
       .catch((e) => {
         if (alive) setErr((e as Error).message || "加载技能失败");
@@ -125,7 +129,15 @@ export function SkillsPanel({ auth }: { auth: AuthSession }) {
           ) : (
             <ul className="flex flex-col gap-1.5 px-4 pb-4">
               {visible.map((sk) => (
-                <SkillRow key={sk.name} auth={auth} skill={sk} rates={rates} onDelete={() => remove(sk.name)} />
+                <SkillRow
+                  key={sk.name}
+                  auth={auth}
+                  skill={sk}
+                  agents={agents}
+                  rates={rates}
+                  onDelete={() => remove(sk.name)}
+                  onChanged={() => setReload((n) => n + 1)}
+                />
               ))}
             </ul>
           )}
@@ -138,13 +150,17 @@ export function SkillsPanel({ auth }: { auth: AuthSession }) {
 function SkillRow({
   auth,
   skill,
+  agents,
   rates,
   onDelete,
+  onChanged,
 }: {
   auth: AuthSession;
   skill: SkillSummary;
+  agents: MarketplaceMyAgent[];
   rates: ModelRates | null;
   onDelete: () => void;
+  onChanged: () => void;
 }) {
   const [open, setOpen] = useState(false);
   const [detail, setDetail] = useState<SkillDetail | null>(null);
@@ -210,6 +226,7 @@ function SkillRow({
         onChanged={() => {
           // 编辑器改动后使已加载的正文缓存失效(下次展开重新拉)。
           setDetail(null);
+          onChanged();
         }}
       />
       <div className="flex flex-wrap gap-1.5 px-3.5 pb-2">
@@ -217,6 +234,9 @@ function SkillRow({
           {skill.layer === "hub" ? "市场" : "自建"}
         </Badge>
         {skill.writable === false && <Badge tone="neutral">只读</Badge>}
+        <span className="inline-flex items-center gap-1 text-[12px] text-muted">
+          适用：<AgentScopeSummary agentIds={skill.agentIds} agents={agents} />
+        </span>
         {(skill.tags ?? []).slice(0, 6).map((t) => (
           <Badge key={t} tone="neutral">
             {t}

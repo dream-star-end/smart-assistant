@@ -120,13 +120,29 @@ describe('CODEX_PREAMBLE', () => {
       CODEX_PREAMBLE.includes('openclaude_memory'),
       'preamble must name the MCP server',
     )
+    assert.ok(
+      CODEX_PREAMBLE.includes('memory(action, target, content/needle)'),
+      'preamble must document the actual memory tool schema',
+    )
     assert.ok(CODEX_PREAMBLE.includes('skill_search'), 'preamble must mention skill_search')
+    for (const tool of [
+      'create_reminder',
+      'list_reminders',
+      'update_reminder',
+      'delete_reminder',
+    ]) {
+      assert.ok(CODEX_PREAMBLE.includes(tool), `preamble must mention ${tool}`)
+    }
   })
 
   it('explicitly forbids using codex native ~/.codex/memories', () => {
     assert.ok(
       CODEX_PREAMBLE.includes('~/.codex/memories/'),
       'preamble must reference codex native memory dir to forbid',
+    )
+    assert.ok(
+      CODEX_PREAMBLE.includes('~/.codex/skills/'),
+      'preamble must reference codex native skills dir to forbid',
     )
     // Loose phrasing check — wording may evolve, but the intent must be
     // negative ("do not" / "Do not").
@@ -224,6 +240,10 @@ describe('buildCodexLaunchOverrides', () => {
     // Platform context content follows — the preamble is non-empty so a
     // simple length check confirms more than just the preamble was rendered.
     assert.ok(out.instructionsContent.length > CODEX_PREAMBLE.length)
+    assert.match(out.instructionsContent, /# 学习系统/)
+    assert.match(out.instructionsContent, /## 定时任务/)
+    assert.match(out.instructionsContent, /create_reminder/)
+    assert.match(out.instructionsContent, /list_reminders/)
   })
 
   it('mcp-memory keys appear in stable order when entry resolves', async () => {

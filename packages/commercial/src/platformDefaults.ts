@@ -13,3 +13,7 @@
 
 export const PLATFORM_DEFAULT_MODEL = "glm-5.2";
 export const PLATFORM_DEFAULT_PROVIDER = "ark";
+// 团队模式隐藏审查员的 master 侧镜像常量。runtime entrypoint 因 Docker COPY 限制
+// 仍本地定义 COMMERCIAL_HIDDEN_REVIEWER_*；一致性由 runtimeEntrypointPolicy.test.ts 守护。
+export const PLATFORM_HIDDEN_REVIEWER_MODEL = "glm-5.2";
+export const PLATFORM_HIDDEN_REVIEWER_PROVIDER = "ark";

@@ -1,4 +1,5 @@
 import { describe, expect, test } from "vitest";
+import { detectShellFileWrites, normalizeToolForDisplay } from "./format";
 import { detectOcCli, parseMcpName, resolveToolMeta, toolSummary } from "./meta";
 
 describe("parseMcpName (P5)", () => {
@@ -36,8 +37,15 @@ describe("resolveToolMeta 图标/标签解析 (P5)", () => {
   test("完全未知名 → 原样标签", () => {
     expect(resolveToolMeta("Frobnicate").label).toBe("Frobnicate");
   });
-  test("v5 无 codex：codex:webSearch 不命中任何 codex 映射，落通用扳手", () => {
-    expect(resolveToolMeta("codex:webSearch").label).toBe("codex:webSearch");
+  test("Codex 简单 item 有友好标签", () => {
+    expect(resolveToolMeta("codex:imageView").label).toBe("查看图片");
+    expect(resolveToolMeta("codex:contextCompaction").label).toBe("压缩上下文");
+    expect(resolveToolMeta("Codex:userMessage").label).toBe("Codex 消息");
+  });
+  test("v3 历史裸工具名有友好标签", () => {
+    expect(resolveToolMeta("Skill").label).toBe("启用技能");
+    expect(resolveToolMeta("TaskOutput").label).toBe("子任务结果");
+    expect(resolveToolMeta("EnterPlanMode").label).toBe("进入计划模式");
   });
 });
 
@@ -63,6 +71,25 @@ describe("toolSummary 摘要 (P5)", () => {
     expect(
       toolSummary("mcp__openclaude-memory__delegate_task", { agentId: "coder", goal: "修复 bug" }),
     ).toBe("→ coder 修复 bug");
+  });
+  test("delegate_task 委派系统 agent(hidden-reviewer)显示映射名而非裸 id", () => {
+    expect(
+      toolSummary("mcp__openclaude-memory__delegate_task", { agentId: "hidden-reviewer", goal: "审查代码" }),
+    ).toBe("→ 质量审查员 审查代码");
+    expect(toolSummary("delegate_task", { agentId: "hidden-reviewer", goal: "审查代码" })).toBe(
+      "→ 质量审查员 审查代码",
+    );
+  });
+  test("MCP memory skill_search / web-context 摘要", () => {
+    expect(toolSummary("mcp__openclaude-memory__skill_search", { query: "literature-search" })).toBe(
+      "literature-search",
+    );
+    expect(toolSummary("mcp__web-context__web_context_parse_file", { file_path: "/a/b/c.docx" })).toBe(
+      "…/a/b/c.docx",
+    );
+  });
+  test("Codex 简单 item 摘要", () => {
+    expect(toolSummary("codex:imageView", { path: "/tmp/a/b.png" })).toBe("…/tmp/a/b.png");
   });
   test("input 为 null → 空摘要", () => {
     expect(toolSummary("Bash", null)).toBe("");
@@ -113,5 +140,109 @@ describe("oc-* CLI 语义卡 (Bash 特判)", () => {
     expect(
       toolSummary("Bash", { command: "which oc-web 2>/dev/null && oc-web --help" }),
     ).toBe("--help");
+  });
+});
+
+describe("Bash heredoc 写文件语义卡", () => {
+  const writeOne = "mkdir -p packages/web-react/src && cat > packages/web-react/src/demo.ts <<'EOF'\nexport const x = 1;\nEOF";
+  const writeTwo = "cat <<'EOF' > a.ts\none\nEOF\ncat > b.ts <<EOF\ntwo\nEOF";
+
+  test("detectShellFileWrites 识别 mkdir -p + cat heredoc 纯写文件", () => {
+    expect(detectShellFileWrites(writeOne)).toMatchObject({
+      paths: ["packages/web-react/src/demo.ts"],
+      writeCount: 1,
+    });
+    expect(detectShellFileWrites(writeTwo)?.paths).toEqual(["a.ts", "b.ts"]);
+  });
+
+  test("detectShellFileWrites 拒绝 trailing shell side effects", () => {
+    expect(detectShellFileWrites(`${writeOne}\nnpm test`)).toBeNull();
+    expect(detectShellFileWrites("cat > $TARGET <<'EOF'\nx\nEOF")).toBeNull();
+    expect(detectShellFileWrites("cat > a.ts <<'EOF'\nx\nEOF\nchmod +x a.ts")).toBeNull();
+  });
+
+  test("resolveToolMeta / toolSummary 将纯 heredoc Bash 显示为写入文件", () => {
+    expect(resolveToolMeta("Bash", { command: writeOne }).label).toBe("写入文件");
+    expect(toolSummary("Bash", { command: writeOne })).toBe("…/web-react/src/demo.ts");
+    expect(toolSummary("Bash", { command: writeTwo })).toBe("a.ts +1");
+  });
+
+  test("heredoc 内容里出现 oc-* 命令文本时仍优先按写文件显示", () => {
+    const command = "cat > script.sh <<'EOF'\noc-web extract https://example.com\nEOF";
+    expect(resolveToolMeta("Bash", { command }).label).toBe("写入文件");
+    expect(toolSummary("Bash", { command })).toBe("script.sh");
+  });
+});
+
+describe("Codex 工具归一化:cancelled 态与 plan 字段对齐 (fix C)", () => {
+  const mcpItem = (status: string) => ({
+    type: "mcpToolCall",
+    id: "call_1",
+    server: "web_context",
+    tool: "web_context_extract_url",
+    status,
+    arguments: { url: "https://example.com" },
+  });
+
+  test("status cancelled → 中性取消态,不再标成失败红卡", () => {
+    const item = mcpItem("cancelled");
+    const d = normalizeToolForDisplay({
+      toolName: "codex:mcpToolCall",
+      inputJson: item,
+      output: JSON.stringify(item),
+      _completed: true,
+    });
+    expect(d.tool.error).toBeFalsy();
+    expect(d.tool.cancelled).toBe(true);
+  });
+
+  test("status failed 仍归失败,cancelled 标志不误置", () => {
+    const item = mcpItem("failed");
+    const d = normalizeToolForDisplay({
+      toolName: "codex:mcpToolCall",
+      inputJson: item,
+      output: JSON.stringify(item),
+      _completed: true,
+    });
+    expect(d.tool.error).toBe(true);
+    expect(d.tool.cancelled).toBeFalsy();
+  });
+
+  test("plan steps 元素读后端权威字段 {step,status}(不再渲染成空列表)", () => {
+    const d = normalizeToolForDisplay({
+      toolName: "codex:plan",
+      inputJson: {
+        type: "plan",
+        steps: [
+          { step: "改代码", status: "inProgress" },
+          { step: "跑测试", status: "pending" },
+        ],
+      },
+      _completed: true,
+    });
+    expect(d.name).toBe("TodoWrite");
+    expect(d.input?.todos).toEqual([
+      { content: "改代码", status: "inProgress" },
+      { content: "跑测试", status: "pending" },
+    ]);
+  });
+
+  test("item 以 {plan:[{step,…}]} 形态下发时兜底可解析", () => {
+    const d = normalizeToolForDisplay({
+      toolName: "codex:todo_list",
+      inputJson: { type: "todo_list", plan: [{ step: "第一步", status: "completed" }] },
+      _completed: true,
+    });
+    expect(d.name).toBe("TodoWrite");
+    expect(d.input?.todos).toEqual([{ content: "第一步", status: "completed" }]);
+  });
+
+  test("legacy text/description 字段仍兼容", () => {
+    const d = normalizeToolForDisplay({
+      toolName: "codex:plan",
+      inputJson: { type: "plan", steps: [{ text: "旧字段", status: "pending" }] },
+      _completed: true,
+    });
+    expect(d.input?.todos).toEqual([{ content: "旧字段", status: "pending" }]);
   });
 });

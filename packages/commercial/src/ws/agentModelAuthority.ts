@@ -14,7 +14,7 @@
  *   2. marketplace 平台预设 agent(listPlatformPresetAgents)→ manifest.model,
  *      同 slug 覆盖已装(与 internalMarketplaceSync 的「预设优先」合并规则一致)
  *   3. 内置 seed agents(entrypoint desiredSeedAgents 的 master 侧镜像):
- *      main → PLATFORM_DEFAULT_MODEL、codex → gpt-5.5;
+ *      main → PLATFORM_DEFAULT_MODEL、codex → gpt-5.5、hidden-reviewer → GLM;
  *      内置 id 最后写入 = 最高优先(容器 reconcileAgents 对 reserved id 同样跳过
  *      marketplace 同名项,语义对齐)
  *
@@ -30,7 +30,7 @@ import {
   type InstalledAgent,
 } from "../marketplace/marketplaceDb.js";
 import { platformPresetAgentSlugs } from "../marketplace/platformPresets.js";
-import { PLATFORM_DEFAULT_MODEL } from "../platformDefaults.js";
+import { PLATFORM_DEFAULT_MODEL, PLATFORM_HIDDEN_REVIEWER_MODEL } from "../platformDefaults.js";
 
 /** manifest JSON → model 字段(形状防御:非法 JSON / 非 string model → null)。 */
 function manifestModel(rawManifest: string): string | null {
@@ -62,6 +62,7 @@ export function buildAgentModelSnapshot(
   // 内置 seed(最高优先;容器侧 reserved id 同语义)。
   map.set("main", PLATFORM_DEFAULT_MODEL);
   map.set("codex", DEFAULT_CODEX_ENGINE_MODEL);
+  map.set("hidden-reviewer", PLATFORM_HIDDEN_REVIEWER_MODEL);
   return map;
 }
 

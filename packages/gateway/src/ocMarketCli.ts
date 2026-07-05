@@ -15,24 +15,71 @@
  *   oc-market publish-agent --slug <s> --name <n> --version <v> --description <d> --model <m> --toolsets a,b --persona-file <f> [--skill-deps a,b] [--tags a,b]
  */
 import { readFileSync } from 'node:fs'
+import { homedir } from 'node:os'
+import { join } from 'node:path'
+import { pathToFileURL } from 'node:url'
 
 function fail(msg: string): never {
   process.stderr.write(`oc-market: ${msg}\n`)
   process.exit(1)
 }
 
-function readContainerToken(): string {
-  const tok = process.env.OPENCLAUDE_V3_CONTAINER_TOKEN?.trim()
+type FileReader = (path: string, encoding: BufferEncoding) => string
+
+function readContainerTokenIfAvailable(
+  env: NodeJS.ProcessEnv = process.env,
+  readFile: FileReader = readFileSync,
+): string | null {
+  const tok = env.OPENCLAUDE_V3_CONTAINER_TOKEN?.trim()
   if (tok) return tok
-  const file = process.env.OPENCLAUDE_V3_CONTAINER_TOKEN_FILE?.trim()
-  if (file) {
-    try {
-      return readFileSync(file, 'utf8').trim()
-    } catch {
-      fail('container token file unreadable')
+  const file = env.OPENCLAUDE_V3_CONTAINER_TOKEN_FILE?.trim()
+  if (!file) return null
+  try {
+    const fromFile = readFile(file, 'utf8').trim()
+    return fromFile || null
+  } catch {
+    return null
+  }
+}
+
+export interface MarketplaceEndpoint {
+  baseUrl: string
+  token?: string
+  mode: 'master' | 'local'
+}
+
+export function resolveLocalGatewayBase(
+  env: NodeJS.ProcessEnv = process.env,
+  readFile: FileReader = readFileSync,
+): string | null {
+  const home = env.OPENCLAUDE_HOME?.trim() || join(env.HOME?.trim() || homedir(), '.openclaude')
+  try {
+    const cfg = JSON.parse(readFile(join(home, 'openclaude.json'), 'utf8')) as { gateway?: { port?: unknown } }
+    const port = typeof cfg.gateway?.port === 'number' ? cfg.gateway.port : Number(cfg.gateway?.port)
+    if (!Number.isInteger(port) || port <= 0 || port > 65535) return null
+    return `http://127.0.0.1:${port}/internal/v3/marketplace/agent-local`
+  } catch {
+    return null
+  }
+}
+
+export function resolveMarketplaceEndpoint(
+  env: NodeJS.ProcessEnv = process.env,
+  readFile: FileReader = readFileSync,
+): MarketplaceEndpoint {
+  const masterBase = env.OPENCLAUDE_V3_MASTER_BASE_URL?.trim()
+  const token = readContainerTokenIfAvailable(env, readFile)
+  if (masterBase && token) {
+    return {
+      baseUrl: `${masterBase.replace(/\/+$/, '')}/internal/v3/marketplace/agent`,
+      token,
+      mode: 'master',
     }
   }
-  fail('not in a commercial container (no container token)')
+  const localBase = resolveLocalGatewayBase(env, readFile)
+  if (localBase) return { baseUrl: localBase, mode: 'local' }
+  if (masterBase) throw new Error('not in a commercial container (no container token and no local gateway config)')
+  throw new Error('not in a commercial container (no master base url or local gateway config)')
 }
 
 function parseFlags(args: string[]): { positional: string[]; flags: Record<string, string> } {
@@ -57,18 +104,16 @@ async function call(
   query?: Record<string, string>,
   body?: unknown,
 ): Promise<any> {
-  const base = process.env.OPENCLAUDE_V3_MASTER_BASE_URL?.trim()
-  if (!base) fail('not in a commercial container (no master base url)')
-  const token = readContainerToken()
+  const endpoint = resolveMarketplaceEndpoint()
   const qs = query ? `?${new URLSearchParams(query).toString()}` : ''
-  const url = `${base.replace(/\/+$/, '')}/internal/v3/marketplace/agent/${op}${qs}`
+  const url = `${endpoint.baseUrl.replace(/\/+$/, '')}/${op}${qs}`
   const ctl = new AbortController()
   const timer = setTimeout(() => ctl.abort(), 30_000)
   try {
     const res = await fetch(url, {
       method,
       headers: {
-        Authorization: `Bearer ${token}`,
+        ...(endpoint.token ? { Authorization: `Bearer ${endpoint.token}` } : {}),
         ...(body ? { 'content-type': 'application/json' } : {}),
       },
       body: body ? JSON.stringify(body) : undefined,
@@ -200,4 +245,6 @@ async function main(): Promise<void> {
   }
 }
 
-main().catch((e) => fail(e instanceof Error ? e.message : String(e)))
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  main().catch((e) => fail(e instanceof Error ? e.message : String(e)))
+}

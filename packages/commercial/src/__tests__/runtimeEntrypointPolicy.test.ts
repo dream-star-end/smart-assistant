@@ -268,7 +268,7 @@ describe("openclaude-runtime entrypoint env-scrub policy", () => {
     );
   });
 
-  test("entrypoint.ts seeds only main + codex agents (v5 纯市场:其它子 agent 走市场安装)", () => {
+  test("entrypoint.ts seeds main + codex + hidden reviewer agents (v5 纯市场:其它可见子 agent 走市场安装)", () => {
     const src = readFileSync(ENTRYPOINT_TS_PATH, "utf-8");
     // 默认模型仍是 glm-5.2 / ark(火山方舟)
     assert.match(
@@ -281,18 +281,35 @@ describe("openclaude-runtime entrypoint env-scrub policy", () => {
       /const COMMERCIAL_DEFAULT_PROVIDER\s*=\s*"ark"/,
       "commercial runtime default provider must be ark (火山方舟)",
     );
-    // 纯市场 + M1b codex 复活:初始 agents.yaml 只 seed main + codex,
-    // 恰为 [desiredMainAgent, desiredCodexAgent](其它 agent 一律走市场安装)。
+    // 纯市场 + M1b codex 复活 + 团队模式隐藏审查员:
+    // 初始 agents.yaml 只 seed main + codex + hidden-reviewer。其它用户可见 agent 一律走市场安装。
     assert.match(
       src,
-      /const desiredSeedAgents\s*=\s*\[desiredMainAgent, desiredCodexAgent\]/,
-      "v5 纯市场:initial agents.yaml must seed exactly main + codex (其它 agent 走市场安装)",
+      /const desiredSeedAgents\s*=\s*\[desiredMainAgent, desiredCodexAgent, desiredHiddenReviewerAgent\]/,
+      "v5 纯市场:initial agents.yaml must seed exactly main + codex + hidden reviewer (其它可见 agent 走市场安装)",
     );
     const mainAgent = extractConstObjectFromSource(src, "desiredMainAgent");
     assert.match(mainAgent, /id:\s*"main"/, "main agent id must be stable");
     assert.match(mainAgent, /model:\s*COMMERCIAL_DEFAULT_MODEL/, "main must use DEFAULT model (glm-5.2)");
     assert.match(mainAgent, /provider:\s*COMMERCIAL_DEFAULT_PROVIDER/, "main must use DEFAULT provider (ark)");
     assert.match(mainAgent, /permissionMode:\s*"bypassPermissions"/, "main must bypass permissions in the sandbox");
+    const hiddenReviewerAgent = extractConstObjectFromSource(src, "desiredHiddenReviewerAgent");
+    assert.match(hiddenReviewerAgent, /id:\s*"hidden-reviewer"/, "hidden reviewer id must be stable");
+    assert.match(src, /const COMMERCIAL_HIDDEN_REVIEWER_MODEL\s*=\s*"glm-5\.2"/, "hidden reviewer model must pin GLM");
+    assert.match(src, /const COMMERCIAL_HIDDEN_REVIEWER_PROVIDER\s*=\s*"ark"/, "hidden reviewer provider must pin ark");
+    assert.match(hiddenReviewerAgent, /model:\s*COMMERCIAL_HIDDEN_REVIEWER_MODEL/, "hidden reviewer must use pinned GLM model");
+    assert.match(hiddenReviewerAgent, /provider:\s*COMMERCIAL_HIDDEN_REVIEWER_PROVIDER/, "hidden reviewer must use pinned ark provider");
+    assert.match(hiddenReviewerAgent, /permissionMode:\s*"bypassPermissions"/, "hidden reviewer must bypass permissions in the sandbox");
+    assert.match(hiddenReviewerAgent, /toolsets:\s*\[CORE_TOOLSET_ID\]/, "hidden reviewer only needs core toolset");
+    assert.doesNotMatch(hiddenReviewerAgent, /\bsource\s*:/, "hidden reviewer must not be marked marketplace-visible");
+    assert.match(src, /desired\.id === "hidden-reviewer"/, "hidden reviewer must have a dedicated reserved-id repair path");
+    assert.match(src, /"source", "cwd", "greeting", "mcpServers"/, "hidden reviewer repair must strip user/marketplace-controlled fields");
+    assert.match(src, /delete next\[key\]/, "hidden reviewer repair must remove stale source/cwd/mcp fields");
+    assert.match(src, /setField\("toolsets", desired\.toolsets\)/, "hidden reviewer repair must force core-only toolsets");
+    assert.match(src, /ensureAgentPersona\(\s*"hidden-reviewer"[\s\S]*\{\s*force:\s*true\s*\}/, "hidden reviewer persona file must be force-refreshed");
+    assert.match(src, /function isHiddenSystemAgentId\(id: unknown\)/, "entrypoint must recognize hidden system ids during agents.yaml repair");
+    assert.match(src, /const routes = rawRoutes\.filter\(\(route\) => !isHiddenSystemAgentRoute\(route\)\)/, "entrypoint must strip stale routes targeting hidden reviewer");
+    assert.match(src, /agentIds\.has\(doc\.default\) && !isHiddenSystemAgentId\(doc\.default\)/, "entrypoint must not preserve hidden reviewer as default agent");
     // 退役的平台预置子 agent / 团队定义不得再出现(纯市场根治 agent 数据分裂)。
     for (const removed of [
       "desiredResearcherAgent",
@@ -378,7 +395,7 @@ describe("openclaude-runtime entrypoint env-scrub policy", () => {
     assert.match(codexAgent, /permissionMode:\s*"bypassPermissions"/, "codex agent must bypass permissions in the sandbox");
     assert.match(
       src,
-      /const desiredSeedAgents = \[desiredMainAgent, desiredCodexAgent\];/,
+      /const desiredSeedAgents = \[desiredMainAgent, desiredCodexAgent, desiredHiddenReviewerAgent\];/,
       "codex agent must be part of the seed list",
     );
   });
@@ -566,10 +583,15 @@ describe("platform default model — entrypoint ↔ platformDefaults 一致性",
     const src = readFileSync(ENTRYPOINT_TS_PATH, "utf-8");
     const epModel = extractConst(src, "COMMERCIAL_DEFAULT_MODEL");
     const epProvider = extractConst(src, "COMMERCIAL_DEFAULT_PROVIDER");
+    const epHiddenReviewerModel = extractConst(src, "COMMERCIAL_HIDDEN_REVIEWER_MODEL");
+    const epHiddenReviewerProvider = extractConst(src, "COMMERCIAL_HIDDEN_REVIEWER_PROVIDER");
 
-    const { PLATFORM_DEFAULT_MODEL, PLATFORM_DEFAULT_PROVIDER } = await import(
-      "../platformDefaults.js"
-    );
+    const {
+      PLATFORM_DEFAULT_MODEL,
+      PLATFORM_DEFAULT_PROVIDER,
+      PLATFORM_HIDDEN_REVIEWER_MODEL,
+      PLATFORM_HIDDEN_REVIEWER_PROVIDER,
+    } = await import("../platformDefaults.js");
 
     assert.equal(
       epModel,
@@ -581,8 +603,20 @@ describe("platform default model — entrypoint ↔ platformDefaults 一致性",
       PLATFORM_DEFAULT_PROVIDER,
       "entrypoint.ts COMMERCIAL_DEFAULT_PROVIDER 与 platformDefaults.PLATFORM_DEFAULT_PROVIDER 漂移",
     );
+    assert.equal(
+      epHiddenReviewerModel,
+      PLATFORM_HIDDEN_REVIEWER_MODEL,
+      "entrypoint.ts COMMERCIAL_HIDDEN_REVIEWER_MODEL 与 platformDefaults.PLATFORM_HIDDEN_REVIEWER_MODEL 漂移",
+    );
+    assert.equal(
+      epHiddenReviewerProvider,
+      PLATFORM_HIDDEN_REVIEWER_PROVIDER,
+      "entrypoint.ts COMMERCIAL_HIDDEN_REVIEWER_PROVIDER 与 platformDefaults.PLATFORM_HIDDEN_REVIEWER_PROVIDER 漂移",
+    );
     // 当前期望值(2026-06-17 起 glm-5.2 / ark —— boss 决定替换 glm-5.1、队长全切 glm-5.2,接受跨境风险)
     assert.equal(PLATFORM_DEFAULT_MODEL, "glm-5.2");
     assert.equal(PLATFORM_DEFAULT_PROVIDER, "ark");
+    assert.equal(PLATFORM_HIDDEN_REVIEWER_MODEL, "glm-5.2");
+    assert.equal(PLATFORM_HIDDEN_REVIEWER_PROVIDER, "ark");
   });
 });

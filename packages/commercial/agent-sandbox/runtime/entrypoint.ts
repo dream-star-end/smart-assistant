@@ -115,12 +115,15 @@ const WEB_CONTEXT_TOOLSET_ID = "web_context";
 // 守护 —— 改这里必须同步改 platformDefaults.ts。
 const COMMERCIAL_DEFAULT_MODEL = "glm-5.2";
 const COMMERCIAL_DEFAULT_PROVIDER = "ark";
-// v5 纯市场模型:容器只 seed「全能助手」(main)+「GPT 5.5」(codex) → 其它 agent
-// 一律走市场安装(见下方 desiredSeedAgents)。历史内置子 agent(researcher/scientist/
-// coder/reviewer/scholar)已退役,其各角色专用的 model/provider 常量随之移除。
+// v5 纯市场模型:容器只 seed「全能助手」(main)+「GPT 5.5」(codex)+隐藏审查员
+// (hidden-reviewer) → 其它用户可见 agent 一律走市场安装(见下方 desiredSeedAgents)。
+// 历史内置子 agent(researcher/scientist/coder/reviewer/scholar)已退役,其各角色专用
+// 的 model/provider 常量随之移除。
 // M1b codex 复活:codex seed agent 回归 —— provider:'codex-native' + runnerKind:
 // 'app-server' 是 gateway runner 路由依据,必须落 agents.yaml。
 const COMMERCIAL_CODEX_MODEL = "gpt-5.5";
+const COMMERCIAL_HIDDEN_REVIEWER_MODEL = "glm-5.2";
+const COMMERCIAL_HIDDEN_REVIEWER_PROVIDER = "ark";
 
 // Retired MCP server — id retained only so upsertPlatformMcpIntegrations can
 // strip stale platform-owned entries from existing user volumes. Browser is now
@@ -528,11 +531,12 @@ try {
     agentId: string,
     content: string,
     legacyContents: readonly string[] = [],
+    opts: { force?: boolean } = {},
   ): string {
     const personaDir = join(ocConfigDir, "agents", agentId);
     const personaPath = join(personaDir, "CLAUDE.md");
     mkdirSync(personaDir, { recursive: true });
-    if (!existsSync(personaPath)) {
+    if (opts.force || !existsSync(personaPath)) {
       writeFileSync(personaPath, content, { mode: 0o644 });
     } else if (legacyContents.length > 0) {
       try {
@@ -907,6 +911,14 @@ try {
     return isRecord(value) && value.id === id;
   }
 
+  function isHiddenSystemAgentId(id: unknown): boolean {
+    return id === "hidden-reviewer";
+  }
+
+  function isHiddenSystemAgentRoute(route: unknown): boolean {
+    return isRecord(route) && isHiddenSystemAgentId(route.agent);
+  }
+
   const PLATFORM_SEED_DISPLAY_NAMES = new Set([
     "main",
     "MiniMax M3 助手",
@@ -994,6 +1006,24 @@ try {
       }
     }
 
+    // hidden-reviewer 是新保留的系统 agent。存量容器可能已有用户/市场同名
+    // agent；必须强制收敛成隐藏系统 seed,不能保留 source/persona/toolsets/cwd
+    // 等用户可控字段,否则会暴露到协作列表或扩大隐藏审查员工具面。
+    if (desired.id === "hidden-reviewer") {
+      for (const key of ["source", "cwd", "greeting", "mcpServers"]) {
+        if (next[key] !== undefined) {
+          delete next[key];
+          patched = true;
+        }
+      }
+      for (const key of ["persona", "permissionMode", "displayName", "avatarEmoji"] as const) {
+        if (desired[key] !== undefined) setField(key, desired[key]);
+      }
+      if (Array.isArray(desired.toolsets) && !sameStringArray(next.toolsets, desired.toolsets)) {
+        setField("toolsets", desired.toolsets);
+      }
+    }
+
     return patched ? next : null;
   }
 
@@ -1018,11 +1048,33 @@ try {
     avatarEmoji: "🧠",
   };
 
+  const desiredHiddenReviewerAgent = {
+    id: "hidden-reviewer",
+    model: COMMERCIAL_HIDDEN_REVIEWER_MODEL,
+    persona: ensureAgentPersona(
+      "hidden-reviewer",
+      [
+        "你是 OpenClaude v5 团队模式的隐藏审查员。",
+        "你的职责是在队长给出最终答复前，对草稿做独立审查：找事实错误、遗漏、过度承诺、执行风险和用户需求偏离。",
+        "只输出简洁审查结论：PASS / NEEDS_FIX，并列出必须修改的问题和建议改法。不要接管任务、不要展开重写全文。",
+        "",
+      ].join("\n"),
+      [],
+      { force: true },
+    ),
+    permissionMode: "bypassPermissions",
+    provider: COMMERCIAL_HIDDEN_REVIEWER_PROVIDER,
+    displayName: "隐藏审查员",
+    avatarEmoji: "🕵️",
+    toolsets: [CORE_TOOLSET_ID],
+  };
+
   // v5 纯市场模型:容器默认只 seed「全能助手」(main)。历史平台预置子 agent
-  // (researcher/scientist/coder/reviewer/scholar)已退役 —— 其它 agent 一律走市场安装
-  // (syncMarketplaceHub 直写 agents.yaml + source:marketplace 标记)。存量容器里的幽灵
-  // seed 不 prune,但 listCollaboratorAgents 的 marketplace-source 过滤已让它们在所有面惰性。
-  const desiredSeedAgents = [desiredMainAgent, desiredCodexAgent];
+  // (researcher/scientist/coder/reviewer/scholar)已退役 —— 其它用户可见 agent 一律走市场安装
+  // (syncMarketplaceHub 直写 agents.yaml + source:marketplace 标记)。hidden-reviewer 是团队
+  // 模式专用系统审查员,不带 source:marketplace,因此不会进入 AgentPicker/协作成员列表。
+  // 存量容器里的幽灵 seed 不 prune,但 listCollaboratorAgents 的 marketplace-source 过滤已让它们在所有面惰性。
+  const desiredSeedAgents = [desiredMainAgent, desiredCodexAgent, desiredHiddenReviewerAgent];
 
   // v5 轻量组队重构:不再预置团队(队长 turn 级自主 delegate_task 组队)。保留空数组,
   // 让下方 bootstrap 的 .map(cloneSeedTeam) 与 merge 团队循环自然成为 no-op —— 团队相关
@@ -1221,13 +1273,19 @@ try {
           .map((a) => a.id)
           .filter((id): id is string => typeof id === "string"),
       );
-      const nextDefault = typeof doc.default === "string" && agentIds.has(doc.default) ? doc.default : "main";
+      const rawRoutes = Array.isArray(doc.routes) ? [...(doc.routes as unknown[])] : [];
+      const routes = rawRoutes.filter((route) => !isHiddenSystemAgentRoute(route));
+      if (!Array.isArray(doc.routes) || routes.length !== rawRoutes.length) mutated = true;
+      const nextDefault =
+        typeof doc.default === "string" && agentIds.has(doc.default) && !isHiddenSystemAgentId(doc.default)
+          ? doc.default
+          : "main";
       if (doc.default !== nextDefault) mutated = true;
       if (mutated) {
         const newDoc = {
           ...doc,
           agents,
-          routes: Array.isArray(doc.routes) ? doc.routes : [],
+          routes,
           default: nextDefault,
           teams,
         };

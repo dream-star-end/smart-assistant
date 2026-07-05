@@ -30,6 +30,7 @@ import type {
   MarketplacePending,
   MarketplacePublishInput,
   MarketplacePublishResult,
+  MarketplaceReviewBatchResult,
   MarketplaceSearchResult,
   HupiCreateResult,
   LoginResult,
@@ -1126,9 +1127,10 @@ export const api = {
   // (127.0.0.1:18789，按 userId 隔离)。前端只需普通 Bearer fetch，无需特殊 header。
   // 容器未就绪时 router 会先 ensureContainerReady（可能冷启 ~40s），失败返 503/4503。
 
-  /** 取某 agent 的记忆文档（GET /api/agents/:id/memory/:target，target=memory|user）。 */
+  /** 取某 agent 的记忆文档（GET /api/agents/:id/memory/:target，target=memory|user）。
+   *  limit = 该 target 的字符预算（权威源在后端 DEFAULT_LIMITS，前端只做展示）。 */
   getMemory: (a: AuthSession, agentId: string, target: "memory" | "user") =>
-    jsonOrThrow<{ text: string; charCount?: number; target: string }>(
+    jsonOrThrow<{ text: string; charCount?: number; limit?: number; target: string }>(
       callWithRefresh(a, (t) =>
         fetch(`/api/agents/${encodeURIComponent(agentId)}/memory/${target}`, {
           credentials: "include",
@@ -1139,7 +1141,7 @@ export const api = {
 
   /** 写某 agent 的记忆文档（PUT /api/agents/:id/memory/:target）。 */
   putMemory: (a: AuthSession, agentId: string, target: "memory" | "user", text: string) =>
-    jsonOrThrow<{ ok: boolean; charCount?: number }>(
+    jsonOrThrow<{ ok: boolean; charCount?: number; limit?: number }>(
       callWithRefresh(a, (t) =>
         fetch(`/api/agents/${encodeURIComponent(agentId)}/memory/${target}`, {
           method: "PUT",
@@ -1264,7 +1266,11 @@ export const api = {
     ),
 
   /** 更新技能(描述/正文/标签;PUT /api/skills/:name,旧版自动入 history)。 */
-  updateSkill: (a: AuthSession, name: string, body: { description: string; body: string; tags?: string[] }) =>
+  updateSkill: (
+    a: AuthSession,
+    name: string,
+    body: { description?: string; body?: string; tags?: string[]; agentIds?: string[] },
+  ) =>
     jsonOrThrow<{ ok: boolean }>(
       callWithRefresh(a, (t) =>
         fetch(`/api/skills/${encodeURIComponent(name)}`, {
@@ -1503,14 +1509,27 @@ export const api = {
     ).then((b) => b.detail),
 
   /** 安装一个已批准版本（POST /api/marketplace/install）。 */
-  installMarketplace: (a: AuthSession, versionId: string) =>
+  installMarketplace: (a: AuthSession, versionId: string, agentIds?: string[]) =>
     jsonOrThrow<{ ok: boolean; slug: string; version: string; note: string }>(
       callWithRefresh(a, (t) =>
         fetch("/api/marketplace/install", {
           method: "POST",
           credentials: "include",
           headers: bearerHeaders(t, true),
-          body: JSON.stringify({ versionId }),
+          body: JSON.stringify({ versionId, ...(agentIds ? { agentIds } : {}) }),
+        }),
+      ),
+    ),
+
+  /** 修改已安装市场技能归属（PATCH /api/marketplace/installed/:slug）。 */
+  updateMarketplaceInstallAgents: (a: AuthSession, slug: string, agentIds: string[]) =>
+    jsonOrThrow<{ ok: boolean; agentIds: string[] }>(
+      callWithRefresh(a, (t) =>
+        fetch(`/api/marketplace/installed/${encodeURIComponent(slug)}`, {
+          method: "PATCH",
+          credentials: "include",
+          headers: bearerHeaders(t, true),
+          body: JSON.stringify({ agentIds }),
         }),
       ),
     ),
@@ -1581,6 +1600,32 @@ export const api = {
       ),
     ).then((b) => b.publishes || []),
 
+  /** 撤销自己的待审发布（POST /api/marketplace/my-publishes/:id/withdraw）。 */
+  withdrawMarketplacePublish: (a: AuthSession, versionId: string) =>
+    jsonOrThrow<{ ok: boolean }>(
+      callWithRefresh(a, (t) =>
+        fetch(`/api/marketplace/my-publishes/${encodeURIComponent(versionId)}/withdraw`, {
+          method: "POST",
+          credentials: "include",
+          headers: bearerHeaders(t, true),
+          body: JSON.stringify({}),
+        }),
+      ),
+    ),
+
+  /** 发布者自助下架自己的当前上架条目（POST /api/marketplace/:slug/unlist）。 */
+  unlistMarketplaceListing: (a: AuthSession, slug: string, reason?: string) =>
+    jsonOrThrow<{ ok: boolean; affectedInstalls: number; affectedUserIds: number[] }>(
+      callWithRefresh(a, (t) =>
+        fetch(`/api/marketplace/${encodeURIComponent(slug)}/unlist`, {
+          method: "POST",
+          credentials: "include",
+          headers: bearerHeaders(t, true),
+          body: JSON.stringify({ reason }),
+        }),
+      ),
+    ),
+
   /** 我的智能体（GET /api/marketplace/my-agents：默认全能助手 + 已安装市场智能体）。 */
   listMyAgents: (a: AuthSession) =>
     jsonOrThrow<{ agents: MarketplaceMyAgent[] }>(
@@ -1619,6 +1664,24 @@ export const api = {
           credentials: "include",
           headers: bearerHeaders(t, true),
           body: JSON.stringify({ decision, note }),
+        }),
+      ),
+    ),
+
+  /** 批量审核(批准/拒绝)多个待审版本（POST /api/admin/marketplace/review-batch）。 */
+  adminMarketplaceReviewBatch: (
+    a: AuthSession,
+    versionIds: string[],
+    decision: "approve" | "reject",
+    note?: string,
+  ) =>
+    jsonOrThrow<MarketplaceReviewBatchResult>(
+      callWithRefresh(a, (t) =>
+        fetch("/api/admin/marketplace/review-batch", {
+          method: "POST",
+          credentials: "include",
+          headers: bearerHeaders(t, true),
+          body: JSON.stringify({ versionIds, decision, note }),
         }),
       ),
     ),

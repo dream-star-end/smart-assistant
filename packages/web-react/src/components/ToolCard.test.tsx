@@ -17,6 +17,60 @@ describe("ToolCard 二级分派 + 状态 (P5)", () => {
     expect(screen.getAllByText("ls -la")).toHaveLength(2);
   });
 
+  test("Bash heredoc 纯写文件：显示写入文件语义卡，展开仍保留原始命令", () => {
+    const command = "mkdir -p packages/web-react/src && cat > packages/web-react/src/demo.ts <<'EOF'\nexport const x = 1;\nEOF";
+    render(<ToolCard message={{ toolName: "Bash", inputJson: { command }, _completed: true, output: "ok" }} />);
+    expect(screen.getByText("写入文件")).toBeInTheDocument();
+    expect(screen.getByText("…/web-react/src/demo.ts")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button"));
+    expect(screen.getByText("已写入 1 个文件")).toBeInTheDocument();
+    expect(screen.getByText("原始终端命令")).toBeInTheDocument();
+    const pre = document.querySelector("pre");
+    expect(pre?.textContent).toContain("$ mkdir -p packages/web-react/src");
+    expect(pre?.textContent).toContain("export const x = 1;");
+    expect(pre?.textContent).toContain("ok");
+  });
+
+  test("Bash heredoc 原始命令不截断，长文件内容也可审计", () => {
+    const marker = "TAIL_MARKER_SHOULD_STAY_VISIBLE";
+    const command = `cat > big.txt <<'EOF'\n${"x".repeat(2200)}\n${marker}\nEOF`;
+    render(<ToolCard message={{ toolName: "Bash", inputJson: { command }, _completed: true }} />);
+    fireEvent.click(screen.getByRole("button"));
+    expect(document.querySelector("pre")?.textContent).toContain(marker);
+  });
+
+  test("Bash heredoc 失败：错误输出仍可见，非纯写命令不误标", () => {
+    const command = "cat > a.ts <<'EOF'\ncontent\nEOF";
+    render(
+      <ToolCard
+        message={{
+          toolName: "Bash",
+          inputJson: { command },
+          _completed: true,
+          error: true,
+          output: "Permission denied",
+        }}
+      />,
+    );
+    expect(screen.getByText("写入文件")).toBeInTheDocument();
+    expect(screen.getByText("失败")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button"));
+    expect(screen.getByText("写入文件命令失败")).toBeInTheDocument();
+    expect(document.querySelector("pre")?.textContent).toContain("Permission denied");
+    cleanup();
+
+    render(
+      <ToolCard
+        message={{
+          toolName: "Bash",
+          inputJson: { command: `${command}\nnpm test` },
+          _completed: true,
+        }}
+      />,
+    );
+    expect(screen.getByText("终端")).toBeInTheDocument();
+  });
+
   test("完成态：✓ 无 spinner，默认折叠，点击展开 Edit diff", () => {
     const { container } = render(
       <ToolCard
@@ -135,4 +189,514 @@ describe("ToolCard 二级分派 + 状态 (P5)", () => {
     expect(pre?.textContent).toContain("$ pwd");
     expect(pre?.textContent).toContain("/home");
   });
+
+  test("Codex MCP skill_search 解包为记忆工具卡，不展示 wrapper JSON", () => {
+    const started = {
+      type: "mcpToolCall",
+      id: "call_skill",
+      server: "openclaude_memory",
+      tool: "skill_search",
+      status: "inProgress",
+      arguments: { query: "literature-search", limit: 5 },
+      pluginId: null,
+      result: null,
+      error: null,
+      durationMs: null,
+    };
+    const completed = {
+      ...started,
+      status: "completed",
+      result: {
+        content: [{ type: "text", text: "Found 1 matching skill(s):\n\n### literature-search" }],
+        structuredContent: null,
+        _meta: null,
+      },
+      durationMs: 87,
+    };
+    render(
+      <ToolCard
+        message={{
+          toolName: "codex:mcpToolCall",
+          inputJson: started,
+          inputPreview: JSON.stringify(started),
+          output: JSON.stringify(completed),
+          _completed: true,
+        }}
+      />,
+    );
+    expect(screen.getByText("技能检索")).toBeInTheDocument();
+    expect(screen.getByText("literature-search")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button"));
+    expect(screen.getByText("query")).toBeInTheDocument();
+    expect(screen.getByText(/Found 1 matching skill/)).toBeInTheDocument();
+    const text = document.body.textContent || "";
+    expect(text).not.toContain("codex:mcpToolCall");
+    expect(text).not.toContain("mcpToolCall");
+    expect(text).not.toContain("pluginId");
+    expect(text).not.toContain("structuredContent");
+  });
+
+  test("Codex MCP failed web-context 显示友好标签、参数与错误文本", () => {
+    const started = {
+      type: "mcpToolCall",
+      id: "call_web",
+      server: "web-context",
+      tool: "web_context_extract_url",
+      status: "inProgress",
+      arguments: { url: "https://example.com", max_chars: 2000 },
+    };
+    const failed = {
+      ...started,
+      status: "failed",
+      result: { content: [{ type: "text", text: '{ "ok": false, "error": "Invalid IP address: undefined" }' }] },
+      durationMs: 352,
+    };
+    render(
+      <ToolCard
+        message={{
+          toolName: "codex:mcpToolCall",
+          inputJson: started,
+          output: JSON.stringify(failed),
+          _completed: true,
+        }}
+      />,
+    );
+    expect(screen.getByText("网页提取")).toBeInTheDocument();
+    expect(screen.getByText("失败")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button"));
+    expect(screen.getByText("url")).toBeInTheDocument();
+    expect(screen.getAllByText("https://example.com").length).toBeGreaterThanOrEqual(1);
+    expect(screen.getByText(/Invalid IP address/)).toBeInTheDocument();
+  });
+
+  test("Codex MCP 运行中只展示 args，不展示空 result wrapper", () => {
+    const started = {
+      type: "mcpToolCall",
+      id: "call_running",
+      server: "openclaude_memory",
+      tool: "skill_search",
+      status: "inProgress",
+      arguments: { query: "browser" },
+      pluginId: null,
+      result: null,
+    };
+    const { container } = render(
+      <ToolCard message={{ toolName: "codex:mcpToolCall", inputJson: started, _completed: false }} />,
+    );
+    expect(container.querySelector(".animate-spin")).toBeInTheDocument();
+    expect(screen.getByText("技能检索")).toBeInTheDocument();
+    expect(screen.getAllByText("browser").length).toBeGreaterThanOrEqual(1);
+    const text = document.body.textContent || "";
+    expect(text).not.toContain("pluginId");
+    expect(text).not.toContain("result");
+  });
+
+  test("Codex webSearch（含旧 Codex 前缀）复用 WebSearch 卡", () => {
+    const completed = { type: "webSearch", id: "ws", action: "search", query: "OpenClaude v5", results: 3 };
+    render(
+      <ToolCard
+        message={{
+          toolName: "Codex:webSearch",
+          inputJson: { type: "webSearch", id: "ws", action: "search", query: "OpenClaude v5" },
+          output: JSON.stringify(completed),
+          _completed: true,
+        }}
+      />,
+    );
+    expect(screen.getByText("网页搜索")).toBeInTheDocument();
+    expect(screen.getByText("OpenClaude v5")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button"));
+    expect(screen.getByText("results")).toBeInTheDocument();
+    expect(screen.getByText("3")).toBeInTheDocument();
+  });
+
+  test("Codex plan/todo_list 复用 TodoWrite 列表", () => {
+    render(
+      <ToolCard
+        message={{
+          toolName: "codex:plan",
+          inputJson: {
+            type: "plan",
+            steps: [
+              { text: "调研工具形态", status: "pending" },
+              { text: "实现适配", status: "pending" },
+            ],
+          },
+          output: JSON.stringify({
+            type: "todo_list",
+            items: [
+              { text: "调研工具形态", completed: true },
+              { text: "实现适配", completed: true },
+            ],
+          }),
+          _completed: true,
+        }}
+      />,
+    );
+    expect(screen.getByText("任务列表")).toBeInTheDocument();
+    expect(screen.getByText("2/2")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button"));
+    expect(screen.getByText("调研工具形态")).toBeInTheDocument();
+    expect(screen.getByText("实现适配")).toBeInTheDocument();
+  });
+
+  test("Codex 取消态 → 中性「已取消」徽标,不显示红色失败、不转圈", () => {
+    const item = {
+      type: "mcpToolCall",
+      id: "call_cancel",
+      server: "openclaude_memory",
+      tool: "skill_search",
+      status: "cancelled",
+      arguments: { query: "x" },
+    };
+    const { container } = render(
+      <ToolCard
+        message={{
+          toolName: "codex:mcpToolCall",
+          inputJson: item,
+          output: JSON.stringify(item),
+          _completed: true,
+        }}
+      />,
+    );
+    expect(screen.getByText("已取消")).toBeInTheDocument();
+    expect(screen.queryByText("失败")).toBeNull();
+    expect(container.querySelector(".animate-spin")).toBeNull();
+  });
+
+  test("Codex 取消态在未标 _completed 时也不当运行中(不转圈)", () => {
+    const item = {
+      type: "mcpToolCall",
+      id: "call_cancel2",
+      server: "openclaude_memory",
+      tool: "skill_search",
+      status: "cancelled",
+      arguments: { query: "y" },
+    };
+    const { container } = render(
+      <ToolCard
+        message={{ toolName: "codex:mcpToolCall", inputJson: item, output: JSON.stringify(item), _completed: false }}
+      />,
+    );
+    expect(screen.getByText("已取消")).toBeInTheDocument();
+    expect(container.querySelector(".animate-spin")).toBeNull();
+  });
+
+  test("Codex image/context 简单 item 不 raw dump id/type wrapper", () => {
+    render(
+      <ToolCard
+        message={{
+          toolName: "codex:imageView",
+          inputJson: { type: "imageView", id: "img1", path: "/home/agent/.openclaude/uploads/a.png" },
+          _completed: true,
+        }}
+      />,
+    );
+    expect(screen.getByText("查看图片")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button"));
+    expect(screen.getAllByText("…/.openclaude/uploads/a.png").length).toBeGreaterThanOrEqual(1);
+    const text = document.body.textContent || "";
+    expect(text).not.toContain("imageView");
+    expect(text).not.toContain("img1");
+  });
+
+  test("Codex imageGeneration 运行中显示友好等待态，不展示 raw status wrapper", () => {
+    render(
+      <ToolCard
+        message={{
+          toolName: "codex:imageGeneration",
+          inputJson: {
+            type: "imageGeneration",
+            id: "ig_running",
+            status: "in_progress",
+            revisedPrompt: null,
+            result: "",
+          },
+          _completed: false,
+        }}
+      />,
+    );
+    expect(screen.getByText("生成图片")).toBeInTheDocument();
+    expect(screen.getByText("图片生成中，通常需要几十秒，请稍候…")).toBeInTheDocument();
+    const text = document.body.textContent || "";
+    expect(text).not.toContain("in_progress");
+    expect(text).not.toContain("ig_running");
+    expect(text).not.toContain("imageGeneration");
+  });
+
+  test("Codex imageGeneration 完成后显示生成结果，不保留 status in_progress", () => {
+    render(
+      <ToolCard
+        message={{
+          toolName: "codex:imageGeneration",
+          inputJson: {
+            type: "imageGeneration",
+            id: "ig_done",
+            status: "in_progress",
+            revisedPrompt: null,
+            result: "",
+          },
+          output:
+            "imageGeneration → /home/agent/.codex/generated_images/thread/ig_done.png",
+          _completed: true,
+        }}
+      />,
+    );
+    expect(screen.getByText("生成图片")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button"));
+    expect(screen.getByText("图片已生成")).toBeInTheDocument();
+    expect(screen.getByText("…/generated_images/thread/ig_done.png")).toBeInTheDocument();
+    const text = document.body.textContent || "";
+    expect(text).not.toContain("in_progress");
+    expect(text).not.toContain("imageGeneration →");
+  });
+
+  test("Codex imageGeneration 失败仍展示错误输出", () => {
+    render(
+      <ToolCard
+        message={{
+          toolName: "codex:imageGeneration",
+          inputJson: { type: "imageGeneration", id: "ig_error", status: "failed" },
+          output: "imageGeneration failed: quota exceeded",
+          error: true,
+          _completed: true,
+        }}
+      />,
+    );
+    expect(screen.getByText("生成图片")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button"));
+    expect(screen.getByText(/imageGeneration failed: quota exceeded/)).toBeInTheDocument();
+    const text = document.body.textContent || "";
+    expect(text).not.toContain("ig_error");
+  });
+
+  test("Codex contextCompaction 合并 completed-only 字段", () => {
+    render(
+      <ToolCard
+        message={{
+          toolName: "codex:contextCompaction",
+          inputJson: { type: "contextCompaction", id: "ctx1" },
+          output: JSON.stringify({
+            type: "contextCompaction",
+            id: "ctx1",
+            tokensBefore: 12000,
+            tokensAfter: 7000,
+            note: "已压缩",
+          }),
+          _completed: true,
+        }}
+      />,
+    );
+    expect(screen.getByText("压缩上下文")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button"));
+    expect(screen.getByText("tokens before")).toBeInTheDocument();
+    expect(screen.getByText("12000")).toBeInTheDocument();
+    expect(screen.getByText("tokens after")).toBeInTheDocument();
+    expect(screen.getByText("7000")).toBeInTheDocument();
+    expect(screen.getByText("已压缩")).toBeInTheDocument();
+  });
+
+  test("Codex dynamicToolCall builtin 复用原生 Bash body", () => {
+    const started = {
+      type: "dynamicToolCall",
+      id: "dyn1",
+      name: "Bash",
+      status: "inProgress",
+      arguments: { command: "pwd" },
+    };
+    const completed = {
+      ...started,
+      status: "completed",
+      result: { content: [{ type: "text", text: "/home/agent" }] },
+    };
+    render(
+      <ToolCard
+        message={{
+          toolName: "codex:dynamicToolCall",
+          inputJson: started,
+          output: JSON.stringify(completed),
+          _completed: true,
+        }}
+      />,
+    );
+    expect(screen.getByText("终端")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button"));
+    const pre = document.querySelector("pre");
+    expect(pre?.textContent).toContain("$ pwd");
+    expect(pre?.textContent).toContain("/home/agent");
+  });
+
+  test("openclaude-memory list_reminders 渲染为友好的定时任务列表", () => {
+    const started = {
+      type: "mcpToolCall",
+      id: "call_cron",
+      server: "openclaude_memory",
+      tool: "list_reminders",
+      status: "inProgress",
+      arguments: {},
+    };
+    const text = [
+      "共 3 个定时提醒/任务:",
+      "- **daily-reflection** (ID: `daily-reflection`) — `17 3 * * *` · 重复 · 启用中 · 仅记录 · 下次 2026-07-04T19:17:00.000Z",
+      "- **weekly-curation** (ID: `weekly-curation`) — `31 4 * * 0` · 重复 · 启用中 · 仅记录 · 下次 2026-07-04T20:31:00.000Z",
+      "- **Quick skill extraction pass** (ID: `skill-check`) — `47 */6 * * *` · 重复 · 已停用 · 推送对话",
+    ].join("\n");
+    render(
+      <ToolCard
+        message={{
+          toolName: "codex:mcpToolCall",
+          inputJson: started,
+          output: JSON.stringify({ ...started, status: "completed", result: { content: [{ type: "text", text }] } }),
+          _completed: true,
+        }}
+      />,
+    );
+    expect(screen.getByText("定时任务列表")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button"));
+    expect(screen.getByText("当前共有 3 个定时任务")).toBeInTheDocument();
+    expect(screen.getAllByText("daily-reflection").length).toBeGreaterThanOrEqual(1);
+    expect(screen.getAllByText("weekly-curation").length).toBeGreaterThanOrEqual(1);
+    expect(screen.getAllByText("skill-check").length).toBeGreaterThanOrEqual(1);
+    expect(document.body.textContent || "").not.toContain("- **daily-reflection**");
+  });
+
+  test("openclaude-memory list_reminders 空列表显示空状态", () => {
+    render(
+      <ToolCard
+        message={{
+          toolName: "mcp__openclaude-memory__list_reminders",
+          inputJson: {},
+          output: "当前没有任何定时提醒/任务。可用 create_reminder 创建。",
+          _completed: true,
+        }}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button"));
+    expect(screen.getByText("还没有定时任务")).toBeInTheDocument();
+    expect(screen.getByText(/每天 9 点提醒我/)).toBeInTheDocument();
+  });
+
+  test("openclaude-memory list_reminders 解析失败时保留 raw fallback", () => {
+    render(
+      <ToolCard
+        message={{
+          toolName: "mcp__openclaude-memory__list_reminders",
+          inputJson: {},
+          output: "共 2 个定时提醒/任务:\n* bad legacy line",
+          _completed: true,
+        }}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button"));
+    expect(screen.queryByText(/当前共有/)).not.toBeInTheDocument();
+    expect(document.querySelector("pre")?.textContent).toContain("bad legacy line");
+  });
+
+  test("openclaude-memory list_reminders 部分解析失败时整段回退 raw，避免漏任务", () => {
+    render(
+      <ToolCard
+        message={{
+          toolName: "mcp__openclaude-memory__list_reminders",
+          inputJson: {},
+          output: [
+            "共 2 个定时提醒/任务:",
+            "- **ok-job** (ID: `ok`) — `0 9 * * *` · 重复 · 启用中 · 推送对话",
+            "- malformed reminder line",
+          ].join("\n"),
+          _completed: true,
+        }}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button"));
+    expect(screen.queryByText(/当前共有/)).not.toBeInTheDocument();
+    const preText = document.querySelector("pre")?.textContent || "";
+    expect(preText).toContain("ok-job");
+    expect(preText).toContain("malformed reminder line");
+  });
+
+  test.each([
+    [
+      "create_reminder",
+      { schedule: "bad cron", message: "喝水" },
+      "error: 创建提醒失败: bad cron",
+      "创建提醒失败",
+      "",
+    ],
+    [
+      "update_reminder",
+      { id: "missing", schedule: "0 9 * * *" },
+      "error: 任务不存在: missing(用 list_reminders 查 ID)",
+      "修改任务失败",
+      "任务信息已更新",
+    ],
+    [
+      "delete_reminder",
+      { id: "missing" },
+      "error: 任务不存在: missing(用 list_reminders 查 ID)",
+      "删除任务失败",
+      "这个任务不会再触发。",
+    ],
+  ])("openclaude-memory %s 失败时展示 raw error 而不是成功文案", (op, inputJson, output, title, misleading) => {
+    render(
+      <ToolCard
+        message={{
+          toolName: `mcp__openclaude-memory__${op}`,
+          inputJson,
+          output,
+          error: true,
+          _completed: true,
+        }}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button"));
+    expect(screen.getByText(title)).toBeInTheDocument();
+    expect(document.body.textContent || "").toContain(output);
+    if (misleading) expect(document.body.textContent || "").not.toContain(misleading);
+  });
+
+  test("openclaude-memory memory(add) 失败时读取 tool.error，不把裸错误输出显示成成功", () => {
+    render(
+      <ToolCard
+        message={{
+          toolName: "mcp__openclaude-memory__memory",
+          inputJson: { action: "add", target: "memory", content: "bad" },
+          output: "rejected: prompt injection pattern",
+          error: true,
+          _completed: true,
+        }}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button"));
+    expect(screen.getByText("新增记忆失败")).toBeInTheDocument();
+    expect(document.body.textContent || "").toContain("rejected: prompt injection pattern");
+    expect(document.body.textContent || "").not.toContain("已新增核心记忆");
+  });
+
+  test("openclaude-memory memory(read) 输出显示为记忆卡片", () => {
+    const started = {
+      type: "mcpToolCall",
+      id: "call_memory_read",
+      server: "openclaude_memory",
+      tool: "memory",
+      status: "inProgress",
+      arguments: { action: "read", target: "user" },
+    };
+    const text = "用户称呼：dengxuan\n§\n项目访问信息：\n- URL: https://example.com";
+    render(
+      <ToolCard
+        message={{
+          toolName: "codex:mcpToolCall",
+          inputJson: started,
+          output: JSON.stringify({ ...started, status: "completed", result: { content: [{ type: "text", text }] } }),
+          _completed: true,
+        }}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button"));
+    expect(screen.getByText("用户画像 · 2 条")).toBeInTheDocument();
+    expect(screen.getByText("用户称呼")).toBeInTheDocument();
+    expect(screen.getByText("项目访问信息")).toBeInTheDocument();
+    expect(document.body.textContent || "").not.toContain("§");
+  });
+
 });

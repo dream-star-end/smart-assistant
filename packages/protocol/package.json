@@ -7,6 +7,7 @@
   "exports": {
     ".": "./src/index.ts",
     "./frames": "./src/frames.ts",
+    "./teamCards": "./src/teamCards.ts",
     "./sessionKey": "./src/sessionKey.ts",
     "./traceId": "./src/traceId.ts",
     "./research": "./src/research.ts"

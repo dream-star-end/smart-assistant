@@ -51,6 +51,15 @@ import { DEMO_MESSAGES, DEMO_MODELS, DEMO_SESSIONS, DEMO_USER, demoReply } from 
 import type { Message, PublicConfig, PublicModel, Session, ToolCard } from "./lib/types";
 
 const EMPTY_WS_MESSAGES: ChatMessage[] = [];
+const TEAM_MODE_STORAGE_KEY = "oc_v5_team_mode";
+
+function readStoredTeamMode(): boolean {
+  try {
+    return localStorage.getItem(TEAM_MODE_STORAGE_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
 
 export function App() {
   const params = new URLSearchParams(location.search);
@@ -97,7 +106,16 @@ export function App() {
   // 团队模式(v5 轻量组队):turn 级开关,只对「全能助手」(main)生效——开启后发消息时后端
   // 给 main 队长注入组队引导,由它按任务自主 delegate_task 组已安装 agent 成队。换 agent 不清,
   // 但只在 agent.id==='main' 时随消息发送(见 send)。开关 UI 挂在 AgentPicker 的 main 卡片。
-  const [teamMode, setTeamMode] = useState(false);
+  const [teamMode, setTeamModeState] = useState(readStoredTeamMode);
+  const setTeamMode = useCallback((enabled: boolean) => {
+    setTeamModeState(enabled);
+    try {
+      if (enabled) localStorage.setItem(TEAM_MODE_STORAGE_KEY, "1");
+      else localStorage.removeItem(TEAM_MODE_STORAGE_KEY);
+    } catch {
+      // Storage is best-effort; keep the in-memory switch responsive.
+    }
+  }, []);
   // 对话模型：唯一权威源是后端 GET /api/public/models（v5 仅 claude/glm-5.2/deepseek/minimax）。
   // demo 用本地 fixture 仅作离线视觉，不发请求。选中的 modelId 由 P4 的 WS inbound.message 顶层发送。
   const [models, setModels] = useState<PublicModel[]>(demo ? DEMO_MODELS : []);
@@ -537,14 +555,10 @@ export function App() {
     const resolved =
       activeSessAgentId === DEFAULT_AGENT.id
         ? DEFAULT_AGENT
-        : (myAgents.find((a) => a.id === activeSessAgentId) ?? {
-            // 已卸载/目录未含的 agent:退化 stub(id 直显),仍保证 send/stop 归属一致。
-            id: activeSessAgentId,
-            name: activeSessAgentId,
-            avatarEmoji: "🤖",
-            grad: "from-violet-500 to-fuchsia-600",
-            description: "",
-          });
+        : (myAgents.find((a) => a.id === activeSessAgentId) ?? DEFAULT_AGENT);
+    if (resolved.id === DEFAULT_AGENT.id && activeSessAgentId !== DEFAULT_AGENT.id && activeId) {
+      chat.switchAgent(activeId, DEFAULT_AGENT.id);
+    }
     // myAgents 必须进依赖:刷新/重开会话时目录常晚于会话解析到达,若只看 id 相等就
     // early-return,stub(裸 slug 如 research-assistant)会永久卡在 header,目录到了
     // 也不重算。按展示字段判等:id/名字/头像任一不同才 set(stub→真名会触发,恒等
@@ -556,7 +570,7 @@ export function App() {
     ) {
       setAgent(resolved);
     }
-  }, [activeSessAgentId, agent.id, agent.name, agent.avatarEmoji, myAgents]);
+  }, [activeSessAgentId, activeId, agent.id, agent.name, agent.avatarEmoji, myAgents, chat]);
 
   // 非 demo：展示的消息来自 WS service 快照（就地 mutation + version 触发重渲）。
   const wsMessages = !demo && activeId ? chat.getMessages(activeId) : EMPTY_WS_MESSAGES;
@@ -646,6 +660,10 @@ export function App() {
   //  2. 旧实现无条件劫持:用户上翻回看历史也被拽回底部。改为 near-bottom 粘滞 ——
   //     只有用户本就贴底(<80px)时才跟随;上翻即解除,拉回底部自动恢复。
   const stickToBottomRef = useRef(true);
+  const scrollToChatBottom = useCallback(() => {
+    const el = scrollRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  }, []);
   const onChatScroll = useCallback(() => {
     const el = scrollRef.current;
     if (!el) return;
@@ -654,16 +672,72 @@ export function App() {
   // 切会话:重置粘滞并瞬时跳底(历史回看从底部开始)。
   useEffect(() => {
     stickToBottomRef.current = true;
-    const el = scrollRef.current;
-    if (el) el.scrollTop = el.scrollHeight;
-  }, [activeId]);
+    scrollToChatBottom();
+  }, [activeId, scrollToChatBottom]);
   // 内容变更跟随:demo 走 messages/streamText,真实路径走 version/wsSending。
   // 流式期间高频触发,用瞬时赋值而非 smooth(60fps 下排队的平滑动画反而卡顿)。
   useEffect(() => {
     if (!stickToBottomRef.current) return;
-    const el = scrollRef.current;
-    if (el) el.scrollTop = el.scrollHeight;
-  }, [messages, streamText, chat.version, wsSending]);
+    scrollToChatBottom();
+  }, [messages, streamText, chat.version, wsSending, scrollToChatBottom]);
+
+  // iOS Safari 的地址栏/底栏/截图/输入键盘会触发 visualViewport 高度与 offset 抖动。
+  // CSS dvh 仍可能短暂大于真实可视区；键盘弹起时 Safari 还会 pan visual viewport,
+  // 让 fixed root 的 top:0 看起来被顶到屏幕上方。这里把实测 height + offsetTop
+  // 写入 CSS var；若用户本就在底部或本轮正在生成，下一帧重新贴底。
+  useEffect(() => {
+    if (!inWorkspace) return;
+    let raf: number | null = null;
+    const setVisualViewportVars = () => {
+      const vv = window.visualViewport;
+      const h = vv?.height || window.innerHeight;
+      if (Number.isFinite(h) && h > 0) {
+        document.documentElement.style.setProperty("--oc-visual-height", `${Math.round(h)}px`);
+      }
+      const top = vv?.offsetTop || 0;
+      if (Number.isFinite(top)) {
+        document.documentElement.style.setProperty("--oc-visual-offset-top", `${Math.max(0, Math.round(top))}px`);
+      }
+    };
+    const realign = () => {
+      setVisualViewportVars();
+      if (!stickToBottomRef.current && !sending) return;
+      if (typeof requestAnimationFrame === "function") {
+        if (raf !== null) cancelAnimationFrame(raf);
+        raf = requestAnimationFrame(() => {
+          raf = null;
+          scrollToChatBottom();
+        });
+      } else {
+        scrollToChatBottom();
+      }
+    };
+    const onVisible = () => {
+      if (document.visibilityState === "visible") realign();
+    };
+    realign();
+    window.visualViewport?.addEventListener("resize", realign);
+    window.visualViewport?.addEventListener("scroll", realign);
+    window.addEventListener("resize", realign);
+    window.addEventListener("pageshow", realign);
+    window.addEventListener("focus", realign);
+    document.addEventListener("focusin", realign);
+    document.addEventListener("focusout", realign);
+    document.addEventListener("visibilitychange", onVisible);
+    return () => {
+      if (raf !== null && typeof cancelAnimationFrame === "function") cancelAnimationFrame(raf);
+      window.visualViewport?.removeEventListener("resize", realign);
+      window.visualViewport?.removeEventListener("scroll", realign);
+      window.removeEventListener("resize", realign);
+      window.removeEventListener("pageshow", realign);
+      window.removeEventListener("focus", realign);
+      document.removeEventListener("focusin", realign);
+      document.removeEventListener("focusout", realign);
+      document.removeEventListener("visibilitychange", onVisible);
+      document.documentElement.style.removeProperty("--oc-visual-height");
+      document.documentElement.style.removeProperty("--oc-visual-offset-top");
+    };
+  }, [inWorkspace, sending, scrollToChatBottom]);
 
   useEffect(() => {
     if (!inWorkspace) return;
@@ -784,7 +858,7 @@ export function App() {
     <ToolCardActionsContext.Provider value={toolActions}>
     <ChatInteractionContext.Provider value={chatInteraction}>
     {/* safe-px:横屏侧刘海安全区(竖屏为 0) */}
-    <div className="flex h-full overflow-hidden bg-bg text-fg safe-px">
+    <div className="flex h-full min-h-0 overflow-hidden bg-bg text-fg safe-px">
       {/* 桌面：内联侧栏（可折叠）。窄屏隐藏，改用抽屉。 */}
       {!collapsed && (
         <div className="hidden md:contents">
@@ -815,7 +889,7 @@ export function App() {
         />
       </Sheet>
 
-      <main className="flex min-w-0 flex-1 flex-col">
+      <main className="flex min-h-0 min-w-0 flex-1 flex-col">
         <ChatHeader
           agent={agent}
           onAgentClick={() => setPickerOpen(true)}
@@ -843,7 +917,7 @@ export function App() {
           />
         )}
 
-        <div ref={scrollRef} onScroll={onChatScroll} className="flex-1 overflow-y-auto overflow-x-hidden">
+        <div ref={scrollRef} onScroll={onChatScroll} className="chat-scroll-area min-h-0 flex-1 overflow-y-auto overflow-x-hidden">
           {gated ? (
             <AgentGate
               phase={gate.phase}
@@ -896,7 +970,7 @@ export function App() {
         <div className="shrink-0 composer-safe-b">
           {/* 任务列表 HUD:钉在输入框上方,始终可见(取代会滚走的 inline TodoWrite 卡)。
               初始展开全部 → ~3s 自动折叠成「正在执行的一条」;无任务时组件自渲染 null。 */}
-          {!demo && !gated && <PinnedTaskTracker todos={extractLatestTodos(wsMessages)} />}
+          {!demo && !gated && <PinnedTaskTracker todos={extractLatestTodos(wsMessages)} active={wsSending} />}
           {!demo && gate.phase.kind === "dormant" && (
             <div className="mx-auto mb-2 max-w-3xl px-4">
               <Alert tone="info">容器已休眠，发送消息后将自动唤醒。</Alert>

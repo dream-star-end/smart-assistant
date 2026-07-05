@@ -65,11 +65,11 @@ take precedence over any default codex personality.
 
 Use the **\`openclaude_memory\`** MCP server. Its tools are your access path:
 
-- \`memory(op, scope, ...)\` — read/append to short Core memory.
+- \`memory(action, target, content/needle)\` — read/append/update short Core memory.
 - \`archival_search\` / \`archival_add\` / \`archival_delete\` — long-form notes.
 - \`skill_search\` / \`skill_list\` / \`skill_view\` / \`skill_save\` / \`skill_delete\` — platform skills.
 - \`session_search\` — recall prior conversations.
-- \`create_reminder\` — schedule a cron-driven reminder.
+- \`create_reminder\` / \`list_reminders\` / \`update_reminder\` / \`delete_reminder\` — manage scheduled reminders/tasks.
 - \`delegate_task\` (sync) / \`send_to_agent\` (async) — talk to sibling agents.
 
 Do **not** read OR write codex's built-in \`~/.codex/memories/\` or

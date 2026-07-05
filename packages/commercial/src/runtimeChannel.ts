@@ -22,6 +22,27 @@ export function getRuntimeChannel(): RuntimeChannel {
   return raw;
 }
 
+/**
+ * Codex account-pool channel. This is intentionally narrower than
+ * getRuntimeChannel(): it may be overridden so an older v3 master can consume
+ * the v5-owned Codex subscription pool while its containers/volumes/identity
+ * remain v3-scoped.
+ *
+ * Use this ONLY for claude_accounts.runtime_channel filters where
+ * provider='codex'. Never use it for agent_containers.runtime_channel, Docker
+ * names/labels, volume paths, media paths, or container identity.
+ */
+export function getCodexAccountRuntimeChannel(): RuntimeChannel {
+  const raw = process.env.OC_CODEX_ACCOUNT_RUNTIME_CHANNEL?.trim();
+  if (!raw) return getRuntimeChannel();
+  if (raw !== "v3" && raw !== "v5") {
+    throw new Error(
+      `[runtimeChannel] 非法 OC_CODEX_ACCOUNT_RUNTIME_CHANNEL='${raw}'(只允许 'v3' 或 'v5')`,
+    );
+  }
+  return raw;
+}
+
 /** 是否 v5 灰度实例。 */
 export function isV5Channel(): boolean {
   return getRuntimeChannel() === "v5";

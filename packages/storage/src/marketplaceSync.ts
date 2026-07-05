@@ -21,6 +21,7 @@ import { dirname, join } from 'node:path'
 import { type AgentDef, type AgentsConfig, readAgentsConfig, writeAgentsConfig } from './config.js'
 import { paths } from './paths.js'
 import { marketplaceArtifactHash } from './skillEmbedding.js'
+import { SKILL_AGENT_SCOPE_FILE, normalizeSkillAgentScope } from './skillStore.js'
 
 const SLUG_RE = /^[a-z0-9][a-z0-9-]{1,63}$/
 
@@ -28,6 +29,20 @@ const SLUG_RE = /^[a-z0-9][a-z0-9-]{1,63}$/
  *  tmp path (process.pid alone isn't unique within a process). */
 function randomSuffix(): string {
   return Math.random().toString(36).slice(2, 10)
+}
+
+// ── 限频告警 ──
+// 整链路 fail-soft(fetch 失败 / 逐项 skip 全部静默吞掉)导致"装了技能不显示"
+// 运维完全不可见。这里给每类失败留一条 ≤1 条/60s 的 console.warn 出口:能在
+// 日志里看到失败原因摘要,又不会在 turn 级高频调用下刷屏。
+const WARN_INTERVAL_MS = 60_000
+const _lastWarnAt = new Map<string, number>()
+
+function warnRateLimited(key: string, message: string): void {
+  const now = Date.now()
+  if (now - (_lastWarnAt.get(key) ?? 0) < WARN_INTERVAL_MS) return
+  _lastWarnAt.set(key, now)
+  console.warn(`[marketplaceSync] ${message}`)
 }
 
 const BUNDLE_PATH_RE = /^(references|assets|evals|scripts)\/[A-Za-z0-9][A-Za-z0-9._-]{0,63}(\/[A-Za-z0-9][A-Za-z0-9._-]{0,63})?$/
@@ -45,6 +60,7 @@ interface SyncSkill {
   version: string
   rawSkillMd: string
   artifactHash: string
+  agentIds: string[]
   /** 附属文本文件(references/assets/evals);独立 bundleHash 验证后才落盘。 */
   bundle?: Record<string, string>
   bundleHash?: string
@@ -76,7 +92,10 @@ async function fetchInstalled(
         headers: { Authorization: `Bearer ${token}` },
         signal: ctl.signal,
       })
-      if (!res.ok) return null
+      if (!res.ok) {
+        warnRateLimited('fetch', `sync fetch failed: HTTP ${res.status}`)
+        return null
+      }
       const data = (await res.json()) as { skills?: unknown; agents?: unknown }
       const skills: SyncSkill[] = []
       if (Array.isArray(data.skills)) {
@@ -108,6 +127,7 @@ async function fetchInstalled(
               version: o.version,
               rawSkillMd: o.rawSkillMd,
               artifactHash: o.artifactHash,
+              agentIds: normalizeSkillAgentScope(o.agentIds),
               ...(bundle && typeof o.bundleHash === 'string'
                 ? { bundle, bundleHash: o.bundleHash }
                 : {}),
@@ -140,7 +160,10 @@ async function fetchInstalled(
     } finally {
       clearTimeout(timer)
     }
-  } catch {
+  } catch (e) {
+    // AbortError = 超时;其余多为网络/DNS。摘要进限频日志,行为保持 fail-soft。
+    const msg = e instanceof Error ? `${e.name}: ${e.message}` : String(e)
+    warnRateLimited('fetch', `sync fetch failed: ${msg}`)
     return null // fail-soft
   }
 }
@@ -157,7 +180,10 @@ async function reconcileSkills(installed: SyncSkill[]): Promise<void> {
   // Independently re-verify the artifact hash — do NOT trust master's content.
   const desired = new Map<string, SyncSkill>()
   for (const s of installed) {
-    if (marketplaceArtifactHash(s.rawSkillMd) !== s.artifactHash) continue
+    if (marketplaceArtifactHash(s.rawSkillMd) !== s.artifactHash) {
+      warnRateLimited('skill-skip', `skill "${s.slug}" skipped: artifactHash mismatch`)
+      continue
+    }
     desired.set(s.slug, s)
   }
 
@@ -167,13 +193,21 @@ async function reconcileSkills(installed: SyncSkill[]): Promise<void> {
       const skillDir = paths.hubSkillDir(s.slug)
       const st = await lstat(skillDir).catch(() => null)
       if (st?.isSymbolicLink()) continue
+      await mkdir(skillDir, { recursive: true })
       const mdPath = paths.hubSkillMd(s.slug)
       const cur = await readFile(mdPath, 'utf8').catch(() => null)
       if (cur !== s.rawSkillMd) {
-        await mkdir(skillDir, { recursive: true })
         const tmp = `${mdPath}.tmp-${process.pid}-${randomSuffix()}`
         await writeFile(tmp, s.rawSkillMd, 'utf8')
         await rename(tmp, mdPath)
+      }
+      const scopePath = join(skillDir, SKILL_AGENT_SCOPE_FILE)
+      const scopeContent = `${JSON.stringify({ agentIds: normalizeSkillAgentScope(s.agentIds) }, null, 2)}\n`
+      const curScope = await readFile(scopePath, 'utf8').catch(() => null)
+      if (curScope !== scopeContent) {
+        const tmpScope = `${scopePath}.tmp-${process.pid}-${randomSuffix()}`
+        await writeFile(tmpScope, scopeContent, 'utf8')
+        await rename(tmpScope, scopePath)
       }
       // 附属文件:独立验 bundleHash(不信 master 内容),验过才逐文件落盘;
       // 三个附属目录内不再被 bundle 引用的文件删除(uninstall/改版收敛)。
@@ -212,8 +246,10 @@ async function reconcileSkills(installed: SyncSkill[]): Promise<void> {
           await rename(tmpF, full)
         }
       }
-    } catch {
-      /* skip this one; fail-soft */
+    } catch (e) {
+      // skip this one; fail-soft(原因进限频日志,否则"装了技能不显示"不可查)
+      const msg = e instanceof Error ? e.message : String(e)
+      warnRateLimited('skill-skip', `skill "${s.slug}" reconcile failed: ${msg}`)
     }
   }
 
@@ -250,7 +286,10 @@ async function reconcileAgents(installed: SyncAgent[]): Promise<void> {
   const desired = new Map<string, Record<string, unknown>>()
   for (const a of installed) {
     if (!SLUG_RE.test(a.slug)) continue
-    if (marketplaceArtifactHash(a.rawManifest) !== a.artifactHash) continue
+    if (marketplaceArtifactHash(a.rawManifest) !== a.artifactHash) {
+      warnRateLimited('agent-skip', `agent "${a.slug}" skipped: artifactHash mismatch`)
+      continue
+    }
     try {
       const m = JSON.parse(a.rawManifest)
       if (m && typeof m === 'object' && !Array.isArray(m)) {
@@ -258,7 +297,8 @@ async function reconcileAgents(installed: SyncAgent[]): Promise<void> {
         desired.set(a.slug, m as Record<string, unknown>)
       }
     } catch {
-      /* skip malformed */
+      // skip malformed(manifest 不是合法 JSON —— 装了 agent 却不出现的一类根因)
+      warnRateLimited('agent-skip', `agent "${a.slug}" skipped: malformed manifest JSON`)
     }
   }
 
@@ -290,8 +330,10 @@ async function reconcileAgents(installed: SyncAgent[]): Promise<void> {
         await rename(tmp, personaPath)
       }
       marketDefs.push(marketAgentDef(slug, m, personaPath))
-    } catch {
-      /* skip this agent; fail-soft */
+    } catch (e) {
+      // skip this agent; fail-soft(原因进限频日志)
+      const msg = e instanceof Error ? e.message : String(e)
+      warnRateLimited('agent-skip', `agent "${slug}" reconcile failed: ${msg}`)
     }
   }
 
@@ -310,21 +352,56 @@ async function reconcileAgents(installed: SyncAgent[]): Promise<void> {
   //  to avoid any risk of deleting a platform/user agent's files.)
 }
 
+// ── 单飞 + 短 TTL 收口 ──
+// gateway turn 级 + 两个管理读接口都会裸调本函数;不去重的话,每次管理页打开
+// 都对 master 全量拉一遍,并发打开还会重复 reconcile。收口全部内聚在这里,
+// 调用点不动:
+//   1. 单飞:并发调用共享同一个 in-flight promise;
+//   2. 短 TTL:距上次【成功】sync < SYNC_TTL_MS 直接返回(跳过网络)。失败
+//      不进 TTL —— 下次调用仍会重试,不会把故障"缓存"住;
+//   3. opts.force 逃生口:绕过 TTL(仍参与单飞),留给未来"装完立刻刷新"
+//      这类必须见最新的调用方。
+const SYNC_TTL_MS = 5_000
+let _inflight: Promise<void> | null = null
+let _lastSuccessAt = 0
+
+/** Tests only — clear singleflight/TTL/warn-rate-limit state between cases. */
+export function _resetMarketplaceSyncStateForTest(): void {
+  _inflight = null
+  _lastSuccessAt = 0
+  _lastWarnAt.clear()
+}
+
 /**
  * Reconcile the container's marketplace state (skills + agents).
  *
  * `timeoutMs` bounds the master fetch — latency-sensitive callers (runner
  * pre-prompt / agent resolution) pass a small value; the background mcp-memory
- * startup hook uses the default.
+ * startup hook uses the default. `force` bypasses the success-TTL (still
+ * coalesces with an in-flight sync).
  */
-export async function syncMarketplaceHub(opts?: { timeoutMs?: number }): Promise<void> {
+export async function syncMarketplaceHub(opts?: { timeoutMs?: number; force?: boolean }): Promise<void> {
   const base = process.env.OPENCLAUDE_V3_MASTER_BASE_URL?.trim()
   const token = process.env.OPENCLAUDE_V3_CONTAINER_TOKEN?.trim()
   if (!base || !token) return // not a commercial container → nothing to sync
 
-  const installed = await fetchInstalled(base, token, opts?.timeoutMs ?? 8000)
-  if (installed === null) return // fetch failed → leave everything as-is
+  // 单飞:已有同步在跑 → 共享它(即使本次带 force,in-flight 本身就是在拉最新)。
+  if (_inflight) return _inflight
+  // 短 TTL:刚成功同步过 → 直接返回,省掉 turn 级/管理页高频重复拉取。
+  if (!opts?.force && _lastSuccessAt > 0 && Date.now() - _lastSuccessAt < SYNC_TTL_MS) return
 
-  await reconcileSkills(installed.skills)
-  await reconcileAgents(installed.agents)
+  const flight = (async () => {
+    const installed = await fetchInstalled(base, token, opts?.timeoutMs ?? 8000)
+    if (installed === null) return // fetch failed → leave everything as-is(不进 TTL)
+
+    await reconcileSkills(installed.skills)
+    await reconcileAgents(installed.agents)
+    _lastSuccessAt = Date.now()
+  })()
+  _inflight = flight
+  try {
+    await flight
+  } finally {
+    _inflight = null
+  }
 }

@@ -139,6 +139,93 @@ describe('_stripClientPutMessage allow-list (T1, T2)', () => {
     })
   })
 
+  it('preserves team/delegate card display fields only for team-owned roles', () => {
+    const group = _stripClientPutMessage({
+      id: 'g1',
+      role: 'agent-group',
+      text: '审查草稿',
+      ts: 10,
+      toolName: 'delegate_task',
+      blockId: 'call-1',
+      startTime: 9,
+      _completed: true,
+      _delegate: true,
+      _delegateAgentId: 'hidden-reviewer',
+      _delegateGoal: '审查草稿',
+      _delegateRunId: 'run-1',
+      _duration: 1234,
+      _resultPreview: 'PASS',
+      _isError: false,
+      // f2272c08 前端新增的展示字段 —— 服务端白名单必须同步放行,否则全量
+      // PUT 后"临时 Codex 子智能体"标注跨设备退化(清单权威在 protocol)。
+      _agentGroupOrigin: 'codex-collab',
+      _teamFallback: true,
+      childBlocks: [{ kind: 'text', text: '审查结果正文' }],
+    })
+    assert.equal(group?._completed, true)
+    assert.equal(group?._delegateAgentId, 'hidden-reviewer')
+    assert.equal(group?._delegateGoal, '审查草稿')
+    assert.equal(group?._delegateRunId, 'run-1')
+    assert.equal(group?._resultPreview, 'PASS')
+    assert.equal(group?._agentGroupOrigin, 'codex-collab')
+    assert.equal(group?._teamFallback, true)
+    assert.deepEqual(group?.childBlocks, [{ kind: 'text', text: '审查结果正文' }])
+
+    const progress = _stripClientPutMessage({
+      id: 'dp1',
+      role: 'delegate-progress',
+      text: '',
+      ts: 20,
+      runId: 'run-1',
+      agentId: 'hidden-reviewer',
+      goal: '审查草稿',
+      entries: [{ phase: 'text', text: '正在审查', ts: 21 }],
+      summary: 'PASS',
+      _completed: true,
+      _isError: false,
+      error: false,
+      _adoptedInto: 'g1',
+    })
+    assert.equal(progress?.runId, 'run-1')
+    assert.equal(progress?.goal, '审查草稿')
+    assert.deepEqual(progress?.entries, [{ phase: 'text', text: '正在审查', ts: 21 }])
+    assert.equal(progress?.summary, 'PASS')
+    assert.equal(progress?._completed, true)
+    assert.equal(progress?._adoptedInto, 'g1')
+
+    const ordinary = _stripClientPutMessage({
+      id: 'a1',
+      role: 'assistant',
+      text: 'hi',
+      ts: 30,
+      _completed: true,
+      summary: 'should drop',
+      entries: [{ phase: 'text', text: 'should drop', ts: 31 }],
+      _agentGroupOrigin: 'codex-collab',
+      _teamFallback: true,
+    })
+    assert.equal(ordinary?._completed, undefined)
+    assert.equal(ordinary?.summary, undefined)
+    assert.equal(ordinary?.entries, undefined)
+    assert.equal(ordinary?._agentGroupOrigin, undefined, 'team-only field stripped on assistant')
+    assert.equal(ordinary?._teamFallback, undefined, 'team-only field stripped on assistant')
+  })
+
+  it('preserves _agentGroupOrigin / _teamFallback on delegate-progress rows too', () => {
+    // 两个 team-owned role 都放行(清单权威 = protocol TEAM_CARD_CLIENT_DISPLAY_FIELDS)。
+    const progress = _stripClientPutMessage({
+      id: 'dp-origin',
+      role: 'delegate-progress',
+      text: '',
+      ts: 40,
+      runId: 'run-2',
+      _agentGroupOrigin: 'codex-collab',
+      _teamFallback: true,
+    })
+    assert.equal(progress?._agentGroupOrigin, 'codex-collab')
+    assert.equal(progress?._teamFallback, true)
+  })
+
   it('preserves status sending/queued/sent/read but drops "replied"', () => {
     for (const ok of ['sending', 'queued', 'sent', 'read']) {
       const c = _stripClientPutMessage({ id: 'x', role: 'user', text: '', ts: 1, status: ok })

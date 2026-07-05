@@ -12,7 +12,7 @@ import { test } from 'node:test'
 import type { ChannelAdapter } from '@openclaude/plugin-sdk'
 import type { InboundFrame, OutboundMessage } from '@openclaude/protocol'
 
-import { Gateway } from '../server.js'
+import { Gateway, HiddenDelegateGuard } from '../server.js'
 
 const SESSION_ID = 'wsess-0123456789abcdef'
 const SENDER_ID = 'wx-sender-abc'
@@ -34,6 +34,7 @@ function makeGateway(events: any[], delivered: any[] = []): any {
   gateway.clientsByPeer = new Map()
   gateway.lastActiveChannel = new Map()
   gateway._seenIdempotencyKeys = new Map()
+  gateway._hiddenDelegateGuard = new HiddenDelegateGuard()
   gateway.log = {
     debug: () => {},
     info: () => {},

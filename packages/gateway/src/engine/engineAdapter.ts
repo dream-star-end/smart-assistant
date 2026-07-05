@@ -49,6 +49,8 @@ export interface EngineSessionTotals {
   turns: number
 }
 
+export type CollabAgentPolicy = 'team-mode-prefer-delegate'
+
 /** 一次 turn 的入参。spec 契约字段之外,M0 为保 CCB 成本 delta 基线逐字节不变,
  *  额外携带 sessionTotals ref / toolUseIdToName(spec 明示允许 totals ref 方案)。 */
 export interface TurnParams {
@@ -61,6 +63,8 @@ export interface TurnParams {
   thinkingMessageId?: string
   /** V3 v7.1 — canonical tool row id factory。 */
   toolMessageIdFactory?: (blockId: string) => string
+  /** OpenClaude team-mode hint for Codex native collaboration tool calls. */
+  collabAgentPolicy?: CollabAgentPolicy
   /** turn 事件流(内容事件 + tool_use/result_detected)。同步、按底座输出顺序回调。 */
   onEvent: (e: EngineEvent) => void
   /**

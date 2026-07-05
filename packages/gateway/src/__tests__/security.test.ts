@@ -18,6 +18,7 @@ import {
   isFileBlocked,
   isTrustedContainerFileServeEnabled,
   isUploadMimeAllowed,
+  legacyAdminStaticPath,
   makeUserScopedMediaPredicate,
   staticCacheControl,
 } from '../server.js'
@@ -393,6 +394,32 @@ describe('T04b: staticCacheControl — channel-aware cache headers', () => {
     it('does NOT special-case sw.js in spa mode (v5 ships no service worker)', () => {
       assert.equal(staticCacheControl('/sw.js', 'spa'), 'no-cache')
     })
+  })
+})
+
+// ── T04c: v5 spa legacy admin allowlist ───────────────────────────────
+describe('T04c: legacyAdminStaticPath — v5 admin console fallback allowlist', () => {
+  it('allows only legacy admin shell dependencies', () => {
+    assert.equal(legacyAdminStaticPath('/admin.html'), true)
+    assert.equal(legacyAdminStaticPath('/icon.svg'), true)
+    assert.equal(legacyAdminStaticPath('/modules/admin.js'), true)
+    assert.equal(legacyAdminStaticPath('/modules/api.js'), true)
+    assert.equal(legacyAdminStaticPath('/modules/auth.js'), true)
+    assert.equal(legacyAdminStaticPath('/modules/broadcast.js'), true)
+    assert.equal(legacyAdminStaticPath('/vendor/chart.umd.min.js'), true)
+    assert.equal(legacyAdminStaticPath('/vendor/qrcode.min.js'), true)
+  })
+
+  it('does not expose the legacy app shell or API paths', () => {
+    assert.equal(legacyAdminStaticPath('/index.html'), false)
+    assert.equal(legacyAdminStaticPath('/style.css'), false)
+    assert.equal(legacyAdminStaticPath('/sw.js'), false)
+    assert.equal(legacyAdminStaticPath('/modules/main.js'), false)
+    assert.equal(legacyAdminStaticPath('/vendor/docx.min.js'), false)
+    assert.equal(legacyAdminStaticPath('/vendor/marked.min.js'), false)
+    assert.equal(legacyAdminStaticPath('/assets/index-AbC123.js'), false)
+    assert.equal(legacyAdminStaticPath('/api/admin/users'), false)
+    assert.equal(legacyAdminStaticPath('/api/me'), false)
   })
 })
 

@@ -1,9 +1,10 @@
-import { AlertTriangle, ArrowUpCircle, Loader2, PackageOpen, ShieldCheck, Trash2 } from "lucide-react";
+import { AlertTriangle, ArrowUpCircle, Loader2, PackageOpen, Settings2, ShieldCheck, Trash2 } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
 import { api } from "../../lib/api";
 import { updateAvailable } from "../../lib/marketplace";
-import type { AuthSession, MarketplaceInstalled } from "../../lib/types";
-import { Alert, Badge, Button, EmptyState, Spinner, useConfirm } from "../ui";
+import type { AuthSession, MarketplaceInstalled, MarketplaceMyAgent } from "../../lib/types";
+import { AgentScopePicker, AgentScopeSummary, normalizeAgentScope } from "../AgentScopePicker";
+import { Alert, Badge, Button, EmptyState, Modal, Spinner, useConfirm } from "../ui";
 
 /**
  * 我的已安装：列出当前安装的技能/智能体,可卸载;有新上架版本的给「更新」按钮
@@ -11,9 +12,12 @@ import { Alert, Badge, Button, EmptyState, Spinner, useConfirm } from "../ui";
  */
 export function InstalledPanel({ auth, onGoBrowse }: { auth: AuthSession; onGoBrowse: () => void }) {
   const [rows, setRows] = useState<MarketplaceInstalled[] | null>(null);
+  const [agents, setAgents] = useState<MarketplaceMyAgent[]>([]);
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
+  const [editing, setEditing] = useState<MarketplaceInstalled | null>(null);
+  const [editScope, setEditScope] = useState<string[]>(["main"]);
   const [reload, setReload] = useState(0);
   const [confirmDialog, confirmDialogEl] = useConfirm();
 
@@ -21,9 +25,15 @@ export function InstalledPanel({ auth, onGoBrowse }: { auth: AuthSession; onGoBr
     let alive = true;
     setLoading(true);
     setErr(null);
-    api
-      .listMarketplaceInstalled(auth)
-      .then((r) => alive && setRows(r))
+    Promise.all([
+      api.listMarketplaceInstalled(auth),
+      api.listMyAgents(auth).catch(() => [] as MarketplaceMyAgent[]),
+    ])
+      .then(([r, a]) => {
+        if (!alive) return;
+        setRows(r);
+        setAgents(a.length ? a : [{ id: "main", slug: "main", name: "全能助手", description: "", installed: true, isDefault: true }]);
+      })
       .catch((e) => alive && setErr((e as Error).message || "加载已安装失败"))
       .finally(() => alive && setLoading(false));
     return () => {
@@ -62,7 +72,7 @@ export function InstalledPanel({ auth, onGoBrowse }: { auth: AuthSession; onGoBr
       setBusy(row.slug);
       setErr(null);
       try {
-        await api.installMarketplace(auth, row.latestVersionId);
+        await api.installMarketplace(auth, row.latestVersionId, row.kind === "skill" ? normalizeAgentScope(row.agentIds) : undefined);
         setReload((n) => n + 1);
       } catch (e) {
         setErr((e as Error).message || "更新失败");
@@ -74,9 +84,48 @@ export function InstalledPanel({ auth, onGoBrowse }: { auth: AuthSession; onGoBr
     [auth],
   );
 
+  const openScopeEditor = (row: MarketplaceInstalled) => {
+    setEditing(row);
+    setEditScope(normalizeAgentScope(row.agentIds));
+  };
+
+  const saveScope = async () => {
+    if (!editing) return;
+    setBusy(editing.slug);
+    setErr(null);
+    try {
+      await api.updateMarketplaceInstallAgents(auth, editing.slug, editScope);
+      setEditing(null);
+      setReload((n) => n + 1);
+    } catch (e) {
+      setErr((e as Error).message || "保存归属失败");
+    } finally {
+      setBusy(null);
+    }
+  };
+
   return (
     <div className="flex flex-col">
       {confirmDialogEl}
+      <Modal
+        open={!!editing}
+        onOpenChange={(o) => !o && setEditing(null)}
+        title="修改技能归属"
+        description={editing ? `选择「${editing.name}」要安装给哪些智能体` : undefined}
+        footer={
+          <>
+            <Button variant="ghost" onClick={() => setEditing(null)}>
+              取消
+            </Button>
+            <Button variant="primary" onClick={saveScope} disabled={!editing || busy === editing.slug}>
+              {editing && busy === editing.slug && <Loader2 size={14} className="animate-spin" />}
+              保存
+            </Button>
+          </>
+        }
+      >
+        <AgentScopePicker agents={agents} selectedIds={editScope} onChange={setEditScope} />
+      </Modal>
       {err && (
         <div className="px-4 pt-3">
           <Alert tone="danger">{err}</Alert>
@@ -131,6 +180,12 @@ export function InstalledPanel({ auth, onGoBrowse }: { auth: AuthSession; onGoBr
                       ? `平台已下架该${r.kind === "agent" ? "智能体" : "技能"}，将自动从你的会话移除。`
                       : r.slug}
                   </p>
+                  {r.kind === "skill" && !revoked && (
+                    <div className="mt-1 flex items-center gap-1.5 text-[12px] text-muted">
+                      <span>适用：</span>
+                      <AgentScopeSummary agentIds={r.agentIds} agents={agents} />
+                    </div>
+                  )}
                 </div>
                 {canUpdate && (
                   <Button
@@ -141,6 +196,17 @@ export function InstalledPanel({ auth, onGoBrowse }: { auth: AuthSession; onGoBr
                   >
                     {busy === r.slug ? <Loader2 size={14} className="animate-spin" /> : <ArrowUpCircle size={14} />}
                     更新
+                  </Button>
+                )}
+                {r.kind === "skill" && !revoked && (
+                  <Button
+                    variant="secondary"
+                    size="sm"
+                    onClick={() => openScopeEditor(r)}
+                    disabled={busy === r.slug}
+                  >
+                    <Settings2 size={14} />
+                    归属
                   </Button>
                 )}
                 <Button

@@ -1020,8 +1020,9 @@ function _bindDelegateRunToGroup(sess, block) {
 //   - exactly ONE unadopted standalone delegate-progress run matches that key
 //     (a real same-goal/same-agent fan-out stays separate rather than risk
 //     grafting onto the wrong card);
-//   - that standalone isn't a legacy entries-only card (old gateway w/o goal
-//     never matches anyway, but guard against losing visible entries content).
+//   - that standalone has no non-start legacy entries. Start-only entries are
+//     duplicate headers; non-start entries stay standalone so visible content
+//     is not dropped when the fallback card is removed.
 // Returns true iff it adopted a run. Caller re-renders the group.
 function _adoptStandaloneDelegateRun(sess, groupMsg) {
   if (!groupMsg || !groupMsg._delegate || groupMsg._delegateRunId) return false
@@ -1043,9 +1044,11 @@ function _adoptStandaloneDelegateRun(sess, groupMsg) {
 
   const standaloneChildBlocks = Array.isArray(standalone.childBlocks) ? standalone.childBlocks : []
   const standaloneEntries = Array.isArray(standalone.entries) ? standalone.entries : []
-  // Legacy entries-only card with no rich blocks → don't adopt (would drop the
-  // entries view). Can't realistically co-occur with a goal, but stay safe.
-  if (standaloneChildBlocks.length === 0 && standaloneEntries.length > 0) return false
+  const hasNonStartEntries = standaloneEntries.some((entry) => entry.phase !== 'start')
+  // Non-start legacy entries → don't adopt (would drop the entries view).
+  // Start-only is just the duplicate group header from the pre-tool_use race,
+  // so it is safe to merge away.
+  if (hasNonStartEntries) return false
 
   // Take over the (already coalesced) child blocks. group is empty (guarded
   // above) so a direct hand-off preserves order; future frames keep coalescing

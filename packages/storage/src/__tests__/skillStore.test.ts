@@ -378,7 +378,8 @@ describe('SkillStore — four-layer overlay (baseline > agent-seed > shared > le
     await mkdir(sharedDir, { recursive: true })
   })
 
-  const mkStore = () => new SkillStore(OA, { baselineDir, agentSeedDir: seedDir, sharedDir })
+  const mkStore = () =>
+    new SkillStore(OA, { baselineDir, agentSeedDir: seedDir, sharedDir, scopeMode: 'management' })
 
   it('read priority dedups same-named skill: baseline wins', async () => {
     await writeSkillMd(baselineDir, 'pri', fm('pri', 'from-baseline'))
@@ -482,7 +483,7 @@ describe('SkillStore — four-layer overlay (baseline > agent-seed > shared > le
   })
 })
 
-describe('buildAgentSkillStore — agent-scoped visibility (main aggregates, others isolated)', () => {
+describe('buildAgentSkillStore — agent-scoped visibility (shared/hub ownership + legacy isolation)', () => {
   const baselineDir = join(testHome, 'factory-baseline')
   const OFFICE = 'office-assistant'
   const RESEARCH = 'research-assistant'
@@ -495,20 +496,52 @@ describe('buildAgentSkillStore — agent-scoped visibility (main aggregates, oth
     await writeSkillMd(paths.agentSkillsDir(RESEARCH), 'research-own', fm('research-own', 'research private'))
   })
 
-  it('non-default agent sees ONLY platform baseline + its own skills (no shared, no other agents)', async () => {
+  it('non-default agent sees platform baseline + assigned shared + own skills (no unassigned shared, no peers)', async () => {
     const names = (await buildAgentSkillStore(OFFICE).list()).map((s) => s.name)
     assert.ok(names.includes('plat-x'), 'sees platform baseline')
     assert.ok(names.includes('office-own'), 'sees its own per-agent skill')
-    assert.ok(!names.includes('shared-x'), 'must NOT see shared/user-level skill')
+    assert.ok(!names.includes('shared-x'), 'unscoped shared defaults to main only')
     assert.ok(!names.includes('research-own'), "must NOT see another agent's skill")
   })
 
-  it('default agent (main) aggregates everything: shared + every agent own skills', async () => {
+  it('default agent (main) sees main-scoped shared + every agent legacy skill', async () => {
     const names = (await buildAgentSkillStore('main').list()).map((s) => s.name)
     assert.ok(names.includes('plat-x'), 'sees platform baseline')
-    assert.ok(names.includes('shared-x'), 'sees shared')
+    assert.ok(names.includes('shared-x'), 'sees default-main shared')
     assert.ok(names.includes('office-own'), 'aggregates office skill')
     assert.ok(names.includes('research-own'), 'aggregates research skill')
+  })
+
+  it('shared skills can be assigned to a non-default agent, and management still sees all scopes', async () => {
+    const r = await buildUserSkillStore().save(
+      { name: 'office-shared', description: 'assigned to office' },
+      'body',
+      { agentIds: [OFFICE] },
+    )
+    assert.equal(r.ok, true, r.error)
+    const office = await buildAgentSkillStore(OFFICE).view('office-shared')
+    assert.ok(office && typeof office === 'object')
+    assert.deepEqual((office as any).agentIds, [OFFICE])
+    assert.equal(await buildAgentSkillStore(RESEARCH).view('office-shared'), null)
+    assert.equal(await buildAgentSkillStore('main').view('office-shared'), null)
+    const managed = (await buildUserSkillStore().list({ includePlatform: false })).find(
+      (s) => s.name === 'office-shared',
+    )
+    assert.deepEqual(managed?.agentIds, [OFFICE])
+  })
+
+  it('scoped-out shared skills do not shadow a visible lower legacy skill', async () => {
+    const r = await buildUserSkillStore().save(
+      { name: 'scoped-shadow', description: 'research shared' },
+      'shared body',
+      { agentIds: [RESEARCH] },
+    )
+    assert.equal(r.ok, true, r.error)
+    await writeSkillMd(paths.agentSkillsDir(OFFICE), 'scoped-shadow', fm('scoped-shadow', 'office legacy'))
+    const v = await buildAgentSkillStore(OFFICE).view('scoped-shadow')
+    assert.ok(v && typeof v === 'object')
+    assert.equal((v as any).layer, 'legacy')
+    assert.equal((v as any).description, 'office legacy')
   })
 
   it('non-default skill_save writes to its own namespace; invisible to peers, visible to main', async () => {
@@ -529,7 +562,7 @@ describe('buildAgentSkillStore — agent-scoped visibility (main aggregates, oth
 
   it('view() honors the same scoping (no cross-agent read / existence leak)', async () => {
     assert.equal(await buildAgentSkillStore(OFFICE).view('research-own'), null, 'no peer skill')
-    assert.equal(await buildAgentSkillStore(OFFICE).view('shared-x'), null, 'no shared skill')
+    assert.equal(await buildAgentSkillStore(OFFICE).view('shared-x'), null, 'no unassigned shared skill')
     const own = await buildAgentSkillStore(OFFICE).view('office-own')
     assert.ok(own && typeof own === 'object' && (own as { name: string }).name === 'office-own')
     assert.ok(await buildAgentSkillStore('main').view('shared-x'), 'main can view shared')
@@ -538,7 +571,12 @@ describe('buildAgentSkillStore — agent-scoped visibility (main aggregates, oth
 
   it('buildUserSkillStore (/api/skills surface) stays aggregate (user sees all their skills)', async () => {
     const names = (await buildUserSkillStore().list({ includePlatform: false })).map((s) => s.name)
-    assert.ok(names.includes('shared-x') && names.includes('office-own') && names.includes('research-own'))
+    assert.ok(
+      names.includes('shared-x') &&
+        names.includes('office-own') &&
+        names.includes('research-own') &&
+        names.includes('office-shared'),
+    )
     assert.ok(!names.includes('plat-x'), 'platform hidden from user surface')
   })
 

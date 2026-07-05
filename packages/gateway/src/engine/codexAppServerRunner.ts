@@ -24,6 +24,7 @@ import {
 } from './codexShared.js'
 import { V3_CODEX_RELAY_PREFIX } from '../v3CodexRelay.js'
 import { createLogger } from '../logger.js'
+import type { CollabAgentPolicy } from './engineAdapter.js'
 
 const log = createLogger({ module: 'codexAppServerRunner' })
 
@@ -33,6 +34,7 @@ const CODEX_DEFAULT_MODE_INSTRUCTIONS = [
   'For multi-step, risky, ambiguous, or code-changing tasks, create and maintain a concise plan; keep exactly one active step when work is underway.',
   'For trivial one-step questions or tiny edits, skip the plan and answer or implement directly.',
   'Do not stop after planning unless the user explicitly asks for plan-only; after planning, continue execution in the same turn when execution is allowed.',
+  'When creating or editing files, prefer native fileChange/apply_patch edits so the UI can render Write/Edit cards; avoid Bash heredocs solely for file writes unless the shell command also needs real shell-side effects such as batch scaffolding.',
 ].join(' ')
 
 // ───────────────────────────────────────────────
@@ -129,6 +131,7 @@ interface QueuedTurn {
    *  错的 inflight 行。runTurn(opts.requestId) 从 closure 拿,emitResult 也从同
    *  一 closure 拿,不读 instance 字段。 */
   requestId?: string
+  collabAgentPolicy?: CollabAgentPolicy
 }
 
 interface PendingRequest {
@@ -217,10 +220,13 @@ function shortThreadId(threadId: string): string {
 function collabAgentInput(
   item: Record<string, unknown>,
   description: string,
+  policy?: CollabAgentPolicy,
 ): Record<string, unknown> {
   const prompt = collabPrompt(item)
   const receivers = collabReceiverThreadIds(item)
   const input: Record<string, unknown> = {
+    openclaudeOrigin: 'codex-collab',
+    ...(policy === 'team-mode-prefer-delegate' ? { openclaudeTeamFallback: true } : {}),
     description: description || prompt || 'Codex 子 Agent',
     codexTool: collabTool(item),
   }
@@ -452,6 +458,64 @@ function _normaliseCodexItemType(type: unknown): string | null {
 function _isContextCompactionItem(item: unknown): item is Record<string, unknown> {
   if (!item || typeof item !== 'object') return false
   return _normaliseCodexItemType((item as Record<string, unknown>).type) === 'contextCompaction'
+}
+
+/** item 完成事件 fallback 发射的 JSON payload 预算(字符)。 */
+const _ITEM_RESULT_JSON_BUDGET = 2000
+/** 截断尾标 — 与 ccbMessageParser 的 `…[truncated]` 惯例一致。 */
+const _ITEM_TRUNCATE_TAIL = '…[truncated]'
+
+/** 递归截断字符串叶子(mcpToolCall 的 result.content[].text、webSearch 的
+ *  results[].snippet 等大文本都在叶子上),结构与短 wrapper 字段原样保留。 */
+function _truncateStringLeaves(value: unknown, cap: number): unknown {
+  if (typeof value === 'string') {
+    if (value.length <= cap) return value
+    let head = value.slice(0, cap)
+    // 不在代理对中间断开(断开虽仍是合法 JSON——stringify 会把孤立代理转义成
+    // \uXXXX——但前端回显会出现 U+FFFD)。
+    const last = head.charCodeAt(head.length - 1)
+    if (last >= 0xd800 && last <= 0xdbff) head = head.slice(0, -1)
+    return head + _ITEM_TRUNCATE_TAIL
+  }
+  if (Array.isArray(value)) return value.map((v) => _truncateStringLeaves(v, cap))
+  if (value && typeof value === 'object') {
+    const out: Record<string, unknown> = {}
+    for (const [k, v] of Object.entries(value)) out[k] = _truncateStringLeaves(v, cap)
+    return out
+  }
+  return value
+}
+
+/** 把 item 序列化成 ≤budget 字符的**合法 JSON**。历史实现对 stringify 结果整体
+ *  `.slice(0, 2000)`,超预算的 item(大结果 MCP 调用如 web 检索)被截成非法 JSON,
+ *  前端 pickCodexItem 解析失败退回丑 JSON dump。现改为先截内层字符串叶子再完整
+ *  stringify:逐级收紧叶子上限直到整体进预算;极端形状(海量键/超长数组,叶子
+ *  截完仍超)退化为只保留定位字段的骨架 —— 任何分支发出的都是可 parse 的 JSON。 */
+export function _stringifyItemBounded(
+  item: unknown,
+  budget = _ITEM_RESULT_JSON_BUDGET,
+): string {
+  let full: string
+  try {
+    full = JSON.stringify(item) ?? 'null'
+  } catch {
+    // item 来自 JSON-RPC 解析,理论上必可序列化;纯防御。
+    return JSON.stringify({ truncated: true })
+  }
+  if (full.length <= budget) return full
+  // 叶子上限逐级减半:字符串转义(\n → \\n 等)可能放大序列化长度,一档不够就
+  // 收紧下一档。上限 1200 给 wrapper(type/server/tool/status 等)留足余量。
+  for (const cap of [1200, 600, 300, 120, 48]) {
+    const bounded = JSON.stringify(_truncateStringLeaves(item, cap))
+    if (bounded.length <= budget) return bounded
+  }
+  // 骨架兜底:类型/工具名等定位信息不丢,前端至少能渲染出正确的卡片标题。
+  const o = (item && typeof item === 'object' ? item : {}) as Record<string, unknown>
+  const skeleton: Record<string, unknown> = { truncated: true }
+  for (const key of ['id', 'type', 'status', 'server', 'tool', 'name', 'query']) {
+    if (typeof o[key] === 'string') skeleton[key] = (o[key] as string).slice(0, 120)
+  }
+  return JSON.stringify(skeleton)
 }
 
 /** Issue A v1.0.108 — Anthropic-shape 配额快照(0..100% + ISO8601 reset)。
@@ -807,6 +871,10 @@ export class CodexAppServerRunner extends EventEmitter {
   private collabReceiverToSpawnId = new Map<string, string>()
   private collabSpawnReceivers = new Map<string, Set<string>>()
   private completedCollabSpawnResults = new Set<string>()
+  /** Active turn's collaboration policy. Set from the queued turn/runTurn arg
+   *  (not from a cross-turn caller-global) so queued turns cannot overwrite
+   *  one another before drain() starts processing them. */
+  private currentCollabAgentPolicy: CollabAgentPolicy | undefined = undefined
 
   /** mkdtempSync'd dir holding the per-spawn `extra-prompt.md`. Created lazily
    *  in `ensureSpawned()` whenever a fresh app-server process needs platform
@@ -1096,6 +1164,7 @@ export class CodexAppServerRunner extends EventEmitter {
     textOrBlocks: string | Array<{ type: string; text?: string }>,
     /** PR2 v1.0.66 — 见 QueuedTurn.requestId 注释。 */
     requestId?: string,
+    collabAgentPolicy?: CollabAgentPolicy,
   ): Promise<void> {
     this.lastActivityAt = Date.now()
     if (!this.spawnEmitted) {
@@ -1104,7 +1173,7 @@ export class CodexAppServerRunner extends EventEmitter {
     }
     const prompt = normalisePrompt(textOrBlocks)
     return new Promise((resolve, reject) => {
-      this.queue.push({ prompt, resolve, reject, requestId })
+      this.queue.push({ prompt, resolve, reject, requestId, collabAgentPolicy })
       void this.drain()
     })
   }
@@ -1147,6 +1216,7 @@ export class CodexAppServerRunner extends EventEmitter {
       this.currentTurnCompleter = null
     }
     this.activeTurnId = null
+    this.currentCollabAgentPolicy = undefined
     this.initialized = false
     this.attached = false
     this.proc = null
@@ -1188,7 +1258,7 @@ export class CodexAppServerRunner extends EventEmitter {
     if (!turn) return
     this.processing = true
     try {
-      await this.runTurn(turn.prompt, turn.requestId)
+      await this.runTurn(turn.prompt, turn.requestId, turn.collabAgentPolicy)
       turn.resolve()
     } catch (err) {
       turn.reject(err as Error)
@@ -1246,14 +1316,14 @@ export class CodexAppServerRunner extends EventEmitter {
     // `codex app-server` accepts `-c key=value` overrides. They must precede
     // `--listen` so clap's positional/option parser sees the stdio:// last.
     //
-    // v1.0.200:effort 进 codex argv 主通道。`codexReasoningEffortConfig()` 把
-    // 协议级 effortLevel (low/medium/high/xhigh/max) 归一为 codex 接受的
-    // `-c model_reasoning_effort="<low|medium|high|xhigh>"`(max → xhigh)。
-    // 与 codexRunner.ts 同 helper、同语义,任何 normalize 改动一处生效。
-    // 缺失/非法 → 空数组,codex 用 CLI 默认。
+    // v1.0.200:effort 进 codex argv 主通道。v5 GPT/Codex 产品默认要求
+    // "high",所以本 runner 先把缺失/非法归一到 high,再交给共享 helper
+    // 生成 `-c model_reasoning_effort="<low|medium|high|xhigh>"`(max → xhigh)。
+    // 注意:codexReasoningEffortConfig(undefined) 的共享语义仍是不带 flag;
+    // default-high 只属于 app-server runner 的产品策略。
     const providerSignature = this.codexRouteSignature()
     const providerArgs = buildCodexProviderConfigArgs(process.env, this.codexRouteConfig)
-    const effortArgs = codexReasoningEffortConfig(this.effortLevel)
+    const effortArgs = codexReasoningEffortConfig(this.codexReasoningEffort())
     // v5 telemetry-block C1(配置面双保险):遥测/自更新关闭 + chatgpt_base_url
     // 指向容器 loopback relay。**每次 spawn 无条件追加**(不挂 provider override
     // 成功路径)——即便本 turn 无 route override / managed_config 被非法值整份丢弃,
@@ -1672,7 +1742,7 @@ export class CodexAppServerRunner extends EventEmitter {
     } as unknown as RunnerMessage)
   }
 
-  private codexReasoningEffort(): 'low' | 'medium' | 'high' | 'xhigh' | null {
+  private codexReasoningEffort(): 'low' | 'medium' | 'high' | 'xhigh' {
     switch (this.effortLevel) {
       case 'low':
       case 'medium':
@@ -1682,7 +1752,7 @@ export class CodexAppServerRunner extends EventEmitter {
       case 'max':
         return 'xhigh'
       default:
-        return null
+        return 'high'
     }
   }
 
@@ -2006,7 +2076,7 @@ export class CodexAppServerRunner extends EventEmitter {
       this.emitAssistantToolUse(itemId, 'codex:contextCompaction', visibleItem)
       return
     }
-    this.emitToolResult(itemId, JSON.stringify(visibleItem).slice(0, 2000), false)
+    this.emitToolResult(itemId, _stringifyItemBounded(visibleItem), false)
     this.emitTurnStatus(null)
   }
 
@@ -2023,7 +2093,11 @@ export class CodexAppServerRunner extends EventEmitter {
     }
   }
 
-  private handleCollabAgentToolStarted(itemId: string, item: Record<string, unknown>): void {
+  private handleCollabAgentToolStarted(
+    itemId: string,
+    item: Record<string, unknown>,
+    policy?: CollabAgentPolicy,
+  ): void {
     const tool = collabTool(item)
     if (tool === 'spawnAgent') {
       const receivers = collabReceiverThreadIds(item)
@@ -2032,7 +2106,7 @@ export class CodexAppServerRunner extends EventEmitter {
       this.emitAssistantToolUse(
         itemId,
         'Agent',
-        collabAgentInput(item, prompt || '启动 Codex 子 Agent'),
+        collabAgentInput(item, prompt || '启动 Codex 子 Agent', policy),
       )
       return
     }
@@ -2040,7 +2114,7 @@ export class CodexAppServerRunner extends EventEmitter {
     this.emitAssistantToolUse(
       itemId,
       'Codex:multiAgent',
-      collabAgentInput(item, `Codex multi-agent: ${tool}`),
+      collabAgentInput(item, `Codex multi-agent: ${tool}`, policy),
     )
   }
 
@@ -2132,7 +2206,7 @@ export class CodexAppServerRunner extends EventEmitter {
       return
     }
     if (itemType === 'collabAgentToolCall') {
-      this.handleCollabAgentToolStarted(itemId, item)
+      this.handleCollabAgentToolStarted(itemId, item, this.currentCollabAgentPolicy)
       return
     }
     // agentMessage / reasoning are streamed via deltas; nothing to surface
@@ -2199,7 +2273,7 @@ export class CodexAppServerRunner extends EventEmitter {
       const saved = typeof item.savedPath === 'string' ? item.savedPath : ''
       const resultB64 = typeof item.result === 'string' ? item.result : ''
       if (!this.threadId || (!saved && !resultB64)) {
-        this.emitToolResult(itemId, JSON.stringify(item).slice(0, 2000), false)
+        this.emitToolResult(itemId, _stringifyItemBounded(item), false)
         return
       }
       let publicPaths: string[] = []
@@ -2285,12 +2359,14 @@ export class CodexAppServerRunner extends EventEmitter {
       return
     }
     if (itemType === 'contextCompaction') {
-      this.emitToolResult(itemId, JSON.stringify(visibleItem).slice(0, 2000), false)
+      this.emitToolResult(itemId, _stringifyItemBounded(visibleItem), false)
       this.emitTurnStatus(null)
       return
     }
-    // Generic completion for unknown item types
-    this.emitToolResult(itemId, JSON.stringify(item).slice(0, 2000), false)
+    // Generic completion for unknown item types (mcpToolCall / webSearch /
+    // dynamicToolCall / plan / error / …):内层截断 + 完整 stringify,
+    // 保证前端 pickCodexItem 永远拿到可 parse 的 JSON。
+    this.emitToolResult(itemId, _stringifyItemBounded(item), false)
   }
 
   /** Spawn a brand-new codex thread and wire its id into runner state +
@@ -2330,7 +2406,11 @@ export class CodexAppServerRunner extends EventEmitter {
     this.emit('session_id', tid)
   }
 
-  private async runTurn(prompt: string, requestId?: string): Promise<void> {
+  private async runTurn(
+    prompt: string,
+    requestId?: string,
+    collabAgentPolicy?: CollabAgentPolicy,
+  ): Promise<void> {
     const startedAt = Date.now()
     // Phase 5:turn 顶部一次性取 snapshot,贯穿 ensureSpawned / thread/start /
     // thread/resume / launch overrides 四个消费点。任何中途读 snapshot 的写法
@@ -2364,6 +2444,7 @@ export class CodexAppServerRunner extends EventEmitter {
     // refreshed by `thread/tokenUsage/updated` notifications during the turn.
     this.activeTurnTotal = null
     this.currentTurnUsage = null
+    this.currentCollabAgentPolicy = collabAgentPolicy
 
     try {
       if (
@@ -2386,6 +2467,9 @@ export class CodexAppServerRunner extends EventEmitter {
           }
         }
       }
+      // A route-change shutdown above clears active turn state; restore this
+      // queued turn's policy before the actual turn/start notifications arrive.
+      this.currentCollabAgentPolicy = collabAgentPolicy
       await this.ensureSpawned(repoSnap, effectiveCwd)
 
       // Each fresh app-server proc must explicitly attach a thread before
@@ -2598,6 +2682,8 @@ export class CodexAppServerRunner extends EventEmitter {
       })
       // Do NOT re-throw — drain() catches and rejects the queue entry, but
       // upstream sessionManager handles errors via the result message above.
+    } finally {
+      this.currentCollabAgentPolicy = undefined
     }
   }
 

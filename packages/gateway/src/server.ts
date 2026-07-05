@@ -51,6 +51,7 @@ import {
   TaskStore,
   buildAgentSkillStore,
   buildUserSkillStore,
+  validateSkillAgentScope,
   paths,
   readAgentsConfig,
   readConfig,
@@ -70,6 +71,12 @@ import {
   listUnclaimedSessions,
   claimSession,
 } from '@openclaude/storage'
+import {
+  filterUserVisibleAgentsForManagement,
+  filterUserVisibleRoutesForManagement,
+  isHiddenSystemAgentId,
+  userVisibleDefaultAgentId,
+} from './agentVisibility.js'
 import { listCollaboratorAgents } from './collaboratorAgents.js'
 import type { SessionStreamEvent } from './ccbMessageParser.js'
 import { type SkillTrainRun, SkillTrainJobStore } from './skillTrainJobs.js'
@@ -149,6 +156,12 @@ import {
   readV3CodexRelayConfig,
   V3_CODEX_RELAY_PREFIX,
 } from './v3CodexRelay.js'
+import {
+  handleV3MarketplaceRelayLocal,
+  readV3MarketplaceRelayConfig,
+  V3_MARKETPLACE_LOCAL_RELAY_PREFIX,
+} from './v3MarketplaceRelay.js'
+import { startToolFailureReporter } from './v3ToolFailureReporter.js'
 import { resolveEngine } from './engine/registry.js'
 import type { CodexProviderConfigOverride } from './engine/codexShared.js'
 import {
@@ -171,6 +184,22 @@ const CLAUDE_OAUTH_USER_AGENT = `claude-cli/${process.env.OPENCLAUDE_CC_VERSION_
 const V3_WECHAT_OUTBOUND_ADAPTER_ID = 'v3-wechat-outbound'
 const WECHAT_FINAL_EMPTY_TEXT =
   '✅ 任务已完成，但这轮没有生成可直接发送到微信的文本结果。请打开实时过程链接查看详细过程。'
+
+function teamMemberCapabilityHint(agent: AgentDef): string {
+  let hint = ''
+  try {
+    const personaPath = agent.persona || paths.agentClaudeMd(agent.id)
+    if (existsSync(personaPath)) {
+      hint = readFileSync(personaPath, 'utf8')
+        .split('\n')
+        .map((line) => line.trim())
+        .find((line) => line && !line.startsWith('#')) ?? ''
+    }
+  } catch {}
+  if (!hint && typeof agent.greeting === 'string') hint = agent.greeting
+  hint = hint.replace(/\s+/g, ' ').trim()
+  return hint ? ` — 能力: ${hint.slice(0, 100)}` : ''
+}
 
 /**
  * 协议级允许的 InboundMessage.model 值(2026-04-26 v1.0.4 加)。
@@ -626,6 +655,12 @@ export interface GatewayDeps {
   agentsConfig: AgentsConfig
   webRoot?: string // 静态 web UI 目录
   /**
+   * v5/spa 专用:React 主站服务 packages/web-react/dist,但超管后台仍是 legacy
+   * packages/web/public/admin.html + modules/vendor。只对白名单 admin 资产 fallback,
+   * 不把整个 legacy web 重新暴露给 v5。
+   */
+  legacyWebRoot?: string
+  /**
    * 静态托管语义模式(单一权威在 cli launcher 按 runtime channel 选定,与 webRoot 同源决定):
    *   - 'vanilla'(默认,v3/personal): 服务 packages/web/public,沿用 ?v=hash cache-bust
    *     约定 → 资产 `public, max-age=3600`、sw.js 不缓存。**未设即 vanilla,v3 行为零变化**。
@@ -690,6 +725,56 @@ function readDelegateMemoryPressure(): { current: number; max: number; ratio: nu
   // Docker/cgroup v1 sometimes reports a huge sentinel for "unlimited".
   if (max > Number.MAX_SAFE_INTEGER / 4) return null
   return { current, max, ratio: current / max }
+}
+
+// ── hidden 系统 agent 串行委派熔断 ──────────────────────────────────────────
+/** 同一父 turn 内对 hidden 系统 agent(隐藏审查员)的委派次数硬上限。
+ *  team-mode prompt 的"NEEDS_FIX→修→再审→迭代到 PASS"闭环只有 prompt 级约束,
+ *  每轮 review 都是全新 delegate session 全额计费;delegation depth 只管嵌套、
+ *  MAX_CONCURRENT_DELEGATIONS 只管并行,都拦不住串行重试,这里是第三条腿。 */
+export const MAX_HIDDEN_DELEGATIONS_PER_TURN = 3
+
+/** hidden 委派计数器。计数键 = **父会话 sessionKey**,依据:
+ *  delegate 请求(mcp-memory handleDelegateTaskToAgent)只携带 parentSessionKey
+ *  (取自 OPENCLAUDE_SESSION_KEY env)和 x-delegation-depth 头,请求里拿不到任何
+ *  turn 级标识,因此退而按父会话维度计数,turn 边界由 dispatchInbound 在同一
+ *  sessionKey 收到下一条用户消息时调用 resetForParent 划定。子 delegate 会话的
+ *  sessionKey 自带时间戳(一次性,不能当计数键),但它作为"父"再委派时天然就是
+ *  turn 粒度,其计数在该 delegate 请求收尾时清理。TTL 惰性清扫兜底 cron/task 等
+ *  永远等不到下一条用户消息的父会话 —— 既防 Map 泄漏,也防"额度永久锁死"。 */
+export class HiddenDelegateGuard {
+  private counts = new Map<string, { count: number; touchedAt: number }>()
+
+  constructor(
+    private readonly limit = MAX_HIDDEN_DELEGATIONS_PER_TURN,
+    /** 远大于 delegate hard timeout 上限(2h)和现实单 turn 时长,只兜内存/锁死。 */
+    private readonly staleMs = 12 * 60 * 60_000,
+  ) {}
+
+  /** 为一次 hidden 委派占额度:未达上限 → 计数 +1 放行;已达上限 → 拒绝。 */
+  tryAcquire(parentKey: string, now = Date.now()): boolean {
+    this.prune(now)
+    const entry = this.counts.get(parentKey)
+    if (!entry) {
+      this.counts.set(parentKey, { count: 1, touchedAt: now })
+      return true
+    }
+    if (entry.count >= this.limit) return false
+    entry.count++
+    entry.touchedAt = now
+    return true
+  }
+
+  /** 父会话开启新用户 turn / 父 delegate 会话收尾时清零。 */
+  resetForParent(parentKey: string): void {
+    this.counts.delete(parentKey)
+  }
+
+  private prune(now: number): void {
+    for (const [key, entry] of this.counts) {
+      if (now - entry.touchedAt > this.staleMs) this.counts.delete(key)
+    }
+  }
 }
 
 export class Gateway {
@@ -1357,12 +1442,22 @@ export class Gateway {
     // Start metrics collection (eventBus → prometheus counters)
     startMetricsCollection()
 
+    // Commercial container telemetry: failed tool calls → master agent_audit.
+    startToolFailureReporter()
+
     // Start rate limiter cleanup
     this.rateLimiter.startCleanup()
 
     // EventBus: bridge CCB CronCreate/CronDelete to gateway CronScheduler
     eventBus.on('task.created', (ev) => {
       if (!this.cron || ev.source !== 'cron-bridge') return
+      if (isHiddenSystemAgentId(ev.agentId)) {
+        this.log.warn('eventBus task.created hidden system agent rejected', {
+          taskId: ev.taskId,
+          agentId: ev.agentId,
+        })
+        return
+      }
       // Use taskId directly — sessionManager already generates unique ccb-xxx IDs
       this.cron
         .addJob({
@@ -1405,6 +1500,10 @@ export class Gateway {
     // EventBus: route webhook.received → agent execution + delivery
     eventBus.on('webhook.received', (ev) => {
       const { webhookId, agentId, payload } = ev
+      if (isHiddenSystemAgentId(agentId)) {
+        this.log.warn('webhook hidden system agent rejected', { agentId, webhookId })
+        return
+      }
       const { resolvedPrompt } = payload as any
       ;(async () => {
         const cfg = await this._getAgentsConfig()
@@ -1836,6 +1935,25 @@ export class Gateway {
         this.log.error('v3 codex local relay crashed', undefined, err)
         if (!res.headersSent) {
           try { this.sendJson(res, 500, { error: { code: 'INTERNAL', message: 'codex relay crashed' } }) } catch {}
+        } else {
+          try { res.end() } catch {}
+        }
+      })
+      return
+    }
+
+    // v3/v5 commercial marketplace relay. Codex subprocesses cannot see
+    // OPENCLAUDE_* env, so oc-market falls back to this loopback-only path.
+    if (url.pathname === V3_MARKETPLACE_LOCAL_RELAY_PREFIX || url.pathname.startsWith(`${V3_MARKETPLACE_LOCAL_RELAY_PREFIX}/`)) {
+      const relayCfg = readV3MarketplaceRelayConfig(process.env)
+      if (!relayCfg) {
+        this.sendJson(res, 404, { error: { code: 'MARKETPLACE_RELAY_NOT_CONFIGURED', message: 'marketplace relay not configured' } })
+        return
+      }
+      handleV3MarketplaceRelayLocal(req, res, relayCfg).catch((err) => {
+        this.log.error('v3 marketplace local relay crashed', undefined, err)
+        if (!res.headersSent) {
+          try { this.sendJson(res, 500, { error: { code: 'INTERNAL', message: 'marketplace relay crashed' } }) } catch {}
         } else {
           try { res.end() } catch {}
         }
@@ -2715,7 +2833,7 @@ export class Gateway {
 
     // ── Webhook REST API ──
     if (url.pathname === '/api/webhooks' && req.method === 'GET') {
-      const list = this.webhookRouter?.list() ?? []
+      const list = (this.webhookRouter?.list() ?? []).filter((wh) => !isHiddenSystemAgentId(wh.agent))
       this.sendJson(res, 200, { webhooks: list })
       return
     }
@@ -2825,6 +2943,47 @@ export class Gateway {
       // Cache-Control 按托管模式分流(规则单一权威 = staticCacheControl)。两模式共用下方的
       // ETag/304、路径白名单与 SPA 回退;仅本头不同 → vanilla 分支与历史完全一致(v3 零变化)。
       const cacheHeader = staticCacheControl(safePath, this.deps.staticMode)
+      if (
+        this.deps.staticMode === 'spa' &&
+        this.deps.legacyWebRoot &&
+        legacyAdminStaticPath(safePath)
+      ) {
+        const legacyFilePath = resolve(this.deps.legacyWebRoot, `.${safePath}`)
+        if (legacyFilePath.startsWith(resolve(this.deps.legacyWebRoot))) {
+          const cached = this._staticFileCache.get(legacyFilePath)
+          if (cached) {
+            if (req.headers['if-none-match'] === cached.etag) {
+              res.writeHead(304)
+              res.end()
+              return
+            }
+            res.writeHead(200, { 'Content-Type': cached.mime, 'ETag': cached.etag, 'Cache-Control': cacheHeader })
+            res.end(cached.content)
+            return
+          }
+          try {
+            const s = statSync(legacyFilePath)
+            if (s.isFile()) {
+              const content = readFileSync(legacyFilePath)
+              const mime = mimeFor(legacyFilePath)
+              const etag = `"${createHash('md5').update(content).digest('hex').slice(0, 16)}"`
+              if (this._staticFileCache.size >= 200) {
+                const firstKey = this._staticFileCache.keys().next().value
+                if (firstKey !== undefined) this._staticFileCache.delete(firstKey)
+              }
+              this._staticFileCache.set(legacyFilePath, { content, mime, etag })
+              if (req.headers['if-none-match'] === etag) {
+                res.writeHead(304)
+                res.end()
+                return
+              }
+              res.writeHead(200, { 'Content-Type': mime, 'ETag': etag, 'Cache-Control': cacheHeader })
+              res.end(content)
+              return
+            }
+          } catch {}
+        }
+      }
       const filePath = resolve(this.deps.webRoot, `.${safePath}`)
       if (filePath.startsWith(resolve(this.deps.webRoot))) {
         const cached = this._staticFileCache.get(filePath)
@@ -4728,13 +4887,21 @@ export class Gateway {
   private async handleAgentsCollection(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const cfg = await readAgentsConfig()
     if (req.method === 'GET') {
-      this.sendJson(res, 200, { agents: cfg.agents, default: cfg.default, routes: cfg.routes })
+      this.sendJson(res, 200, {
+        agents: filterUserVisibleAgentsForManagement(cfg.agents),
+        default: userVisibleDefaultAgentId(cfg.default),
+        routes: filterUserVisibleRoutesForManagement(cfg.routes),
+      })
       return
     }
     if (req.method === 'POST') {
       const body = await this.readJsonBody<Partial<AgentDef>>(req)
       if (!body.id || !/^[a-zA-Z0-9_-]+$/.test(body.id)) {
         this.sendError(res, 400, 'invalid agent id (use only a-z 0-9 _ -)')
+        return
+      }
+      if (isHiddenSystemAgentId(body.id)) {
+        this.sendError(res, 403, 'agent id is reserved')
         return
       }
       if (cfg.agents.find((a) => a.id === body.id)) {
@@ -4779,6 +4946,7 @@ export class Gateway {
     res: ServerResponse,
     id: string,
   ): Promise<void> {
+    if (isHiddenSystemAgentId(id)) return this.sendError(res, 404, 'agent not found')
     const cfg = await readAgentsConfig()
     const idx = cfg.agents.findIndex((a) => a.id === id)
     if (idx < 0) return this.sendError(res, 404, 'agent not found')
@@ -4828,6 +4996,7 @@ export class Gateway {
     res: ServerResponse,
     id: string,
   ): Promise<void> {
+    if (isHiddenSystemAgentId(id)) return this.sendError(res, 404, 'agent not found')
     const cfg = await readAgentsConfig()
     const agent = cfg.agents.find((a) => a.id === id)
     if (!agent) return this.sendError(res, 404, 'agent not found')
@@ -4860,12 +5029,14 @@ export class Gateway {
     agentId: string,
     target: 'memory' | 'user',
   ): Promise<void> {
+    if (isHiddenSystemAgentId(agentId)) return this.sendError(res, 404, 'agent not found')
     const store = new MemoryStore(agentId)
     await store.load()
     if (req.method === 'GET') {
       this.sendJson(res, 200, {
         text: store.read(target),
         charCount: store.charCount(target),
+        limit: store.charLimit(target),
         target,
       })
       return
@@ -4874,7 +5045,11 @@ export class Gateway {
       const body = await this.readJsonBody<{ text?: string }>(req)
       const r = await store.overwrite(target, body.text ?? '')
       if (!r.ok) return this.sendError(res, 400, r.error ?? 'save failed')
-      this.sendJson(res, 200, { ok: true, charCount: store.charCount(target) })
+      this.sendJson(res, 200, {
+        ok: true,
+        charCount: store.charCount(target),
+        limit: store.charLimit(target),
+      })
       return
     }
     this.sendError(res, 405, 'method not allowed')
@@ -4886,6 +5061,7 @@ export class Gateway {
     res: ServerResponse,
     agentId: string,
   ): Promise<void> {
+    if (isHiddenSystemAgentId(agentId)) return this.sendError(res, 404, 'agent not found')
     if (req.method !== 'GET') return this.sendError(res, 405, 'method not allowed')
     const store = buildAgentSkillStore(agentId)
     // User-facing surface: never enumerate platform baseline/seed skills.
@@ -4900,6 +5076,7 @@ export class Gateway {
     agentId: string,
     skillName: string,
   ): Promise<void> {
+    if (isHiddenSystemAgentId(agentId)) return this.sendError(res, 404, 'agent not found')
     const store = buildAgentSkillStore(agentId)
     if (req.method === 'GET') {
       // User-facing read: platform skills resolve to 404, never leak their body.
@@ -4932,14 +5109,23 @@ export class Gateway {
   }
 
   // GET /api/skills — user-level skill library list.
-  // Aggregates baseline + shared + all agents' legacy (NOT per-agent seed), so a
-  // user sees one unified "my skills" library regardless of which agent is active.
+  // Aggregates shared + all agents' legacy + marketplace hub (NOT per-agent seed),
+  // so a user sees one unified "my skills" library regardless of which agent is active.
   private async handleUserSkillsList(req: IncomingMessage, res: ServerResponse): Promise<void> {
     if (req.method !== 'GET') return this.sendError(res, 405, 'method not allowed')
+    await this.syncMarketplaceHubForManagement()
     const store = buildUserSkillStore()
     // User-facing surface: never enumerate platform baseline/seed skills.
     const list = await store.list({ includePlatform: false })
     this.sendJson(res, 200, { skills: list })
+  }
+
+  private async syncMarketplaceHubForManagement(): Promise<void> {
+    try {
+      await syncMarketplaceHub({ timeoutMs: 4000 })
+    } catch {
+      /* fail-soft: management reads must still work if marketplace sync is unavailable */
+    }
   }
 
   // PUT/DELETE /api/skills/:name/files — 技能目录内辅助文件的写/删(编辑器)。
@@ -5019,6 +5205,25 @@ export class Gateway {
     this.sendJson(res, 200, { ok: true })
   }
 
+  private async validateSkillAgentScopeInput(input: unknown): Promise<string[] | { error: string }> {
+    const parsed = validateSkillAgentScope(input)
+    if (!parsed.ok || !parsed.agentIds) return { error: parsed.error ?? 'invalid agentIds' }
+    let cfg: AgentsConfig
+    try {
+      cfg = await this._getAgentsConfig()
+    } catch {
+      cfg = { agents: [{ id: 'main' }], routes: [], default: 'main' }
+    }
+    const allowed = new Set<string>(
+      ['main', cfg.default, ...(cfg.agents ?? []).map((a) => a.id)].filter(
+        (id): id is string => typeof id === 'string' && !isHiddenSystemAgentId(id),
+      ),
+    )
+    const bad = parsed.agentIds.find((id) => !allowed.has(id))
+    if (bad) return { error: `unknown agentId: ${bad}` }
+    return parsed.agentIds
+  }
+
   // GET/PUT/DELETE /api/skills/:name — user-level skill item. Writes/deletes go to
   // the shared library (delete also sweeps same-named legacy residue across agents).
   private async handleUserSkillItem(
@@ -5026,8 +5231,9 @@ export class Gateway {
     res: ServerResponse,
     skillName: string,
   ): Promise<void> {
-    const store = buildUserSkillStore()
     if (req.method === 'GET') {
+      await this.syncMarketplaceHubForManagement()
+      const store = buildUserSkillStore()
       // User-facing read: platform skills resolve to 404, never leak their body.
       // ?file=<rel> → 读取技能目录内单个文件(编辑器/整目录发布导入用)。
       const fileParam = new URL(req.url ?? '/', 'http://x').searchParams.get('file')
@@ -5046,15 +5252,34 @@ export class Gateway {
       this.sendJson(res, 200, { skill: v })
       return
     }
+    const store = buildUserSkillStore()
     if (req.method === 'PUT') {
       const body = await this.readJsonBody<{
         description?: string
         body?: string
         tags?: string[]
+        agentIds?: unknown
       }>(req)
+      const hasDescription = Object.prototype.hasOwnProperty.call(body, 'description')
+      const hasBody = Object.prototype.hasOwnProperty.call(body, 'body')
+      const hasTags = Object.prototype.hasOwnProperty.call(body, 'tags')
+      const hasAgentIds = Object.prototype.hasOwnProperty.call(body, 'agentIds')
+      let agentIds: string[] | undefined
+      if (hasAgentIds) {
+        const scope = await this.validateSkillAgentScopeInput(body.agentIds)
+        if (!Array.isArray(scope)) return this.sendError(res, 400, scope.error)
+        agentIds = scope
+      }
+      if (hasAgentIds && !hasDescription && !hasBody && !hasTags) {
+        const r = await store.setAgentScope(skillName, agentIds as string[])
+        if (!r.ok) return this.sendError(res, 400, r.error ?? 'save failed')
+        this.sendJson(res, 200, { ok: true })
+        return
+      }
       const r = await store.save(
         { name: skillName, description: body.description ?? '', tags: body.tags },
         body.body ?? '',
+        agentIds ? { agentIds } : undefined,
       )
       if (!r.ok) return this.sendError(res, 400, r.error ?? 'save failed')
       this.sendJson(res, 200, { ok: true })
@@ -5840,6 +6065,9 @@ export class Gateway {
     }
     const { message, sourceAgent } = parsed
     if (!message) return this.sendError(res, 400, 'message required')
+    if (isHiddenSystemAgentId(targetAgentId)) {
+      return this.sendError(res, 404, `agent "${targetAgentId}" not found`)
+    }
 
     // Find target agent
     const cfg = await this._getAgentsConfig()
@@ -5898,6 +6126,9 @@ export class Gateway {
   private _activeDelegations = 0
   private static MAX_CONCURRENT_DELEGATIONS = 5
   private _activeDelegationsByParent = new Map<string, Set<string>>()
+  /** hidden 审查员串行委派熔断(见 HiddenDelegateGuard 注释)。gateway 是容器内
+   *  单进程,内存计数即权威。 */
+  private _hiddenDelegateGuard = new HiddenDelegateGuard()
 
   private _resolveDelegateProgressTarget(args: {
     parentSessionKey?: unknown
@@ -6014,6 +6245,30 @@ export class Gateway {
     const depth = depthHeader ? Number.parseInt(String(depthHeader), 10) : 0
     if (depth >= 3) {
       return this.sendError(res, 400, 'delegation depth limit exceeded (max 3)')
+    }
+
+    // Serial guard: hidden 系统 agent(隐藏审查员)同一父 turn 内委派次数硬上限。
+    // 计数键优先取 parentSessionKey(delegate 请求里唯一的父上下文,turn 级标识
+    // 拿不到 —— 依据见 HiddenDelegateGuard 注释);极端情况下 body 缺
+    // parentSessionKey 时退化为按 sourceAgent 计数,由 TTL 清扫兜底回收。
+    // 失败/超时的审查同样占额度:每次尝试都是全额计费的 delegate session。
+    if (isHiddenSystemAgentId(targetAgentId)) {
+      const guardKey =
+        typeof parsed.parentSessionKey === 'string' && parsed.parentSessionKey
+          ? parsed.parentSessionKey
+          : `delegate-src:${typeof sourceAgent === 'string' && sourceAgent ? sourceAgent : 'system'}`
+      if (!this._hiddenDelegateGuard.tryAcquire(guardKey)) {
+        this.log.warn('delegate_hidden_limit', {
+          targetAgentId,
+          guardKey,
+          limit: MAX_HIDDEN_DELEGATIONS_PER_TURN,
+        })
+        return this.sendError(
+          res,
+          429,
+          `审查委派已达本轮上限(${MAX_HIDDEN_DELEGATIONS_PER_TURN}次),请基于已有审查结论收尾,不要再发起新的审查委派`,
+        )
+      }
     }
 
     // Find target agent
@@ -6229,6 +6484,10 @@ export class Gateway {
       clearTimeoutTimer()
       unregisterDelegation?.()
       this._activeDelegations--
+      // 本次 delegate 的子会话(sessionKey 带时间戳,一次性)在生命周期内可能
+      // 作为"父"再委派 hidden 审查员;它收尾后计数键永远不会复用,这里清理防泄漏。
+      // 注意清的是子会话自己的键,不动 guardKey(父会话的额度要跨多次 delegate 累计)。
+      this._hiddenDelegateGuard.resetForParent(sessionKey)
     }
 
     eventBus.emit('agent.completed', createEvent('agent.completed', targetAgentId, {
@@ -6253,6 +6512,10 @@ export class Gateway {
     if (req.method === 'POST') {
       const wh = this.webhookRouter?.find(whId)
       if (!wh) {
+        this.sendError(res, 404, 'webhook not found')
+        return
+      }
+      if (isHiddenSystemAgentId(wh.agent)) {
         this.sendError(res, 404, 'webhook not found')
         return
       }
@@ -6450,7 +6713,7 @@ export class Gateway {
 
   private async _handleTasksApi(req: IncomingMessage, res: ServerResponse): Promise<void> {
     if (req.method === 'GET') {
-      const tasks = await this._taskStore.list()
+      const tasks = (await this._taskStore.list()).filter((task) => !isHiddenSystemAgentId(task.agent))
       this.sendJson(res, 200, { tasks })
       return
     }
@@ -6464,10 +6727,12 @@ export class Gateway {
       }
       const { id, title, agent, prompt, trigger, schedule, webhookId, eventType, maxRuns } = parsed
       if (!title || !prompt) return this.sendError(res, 400, 'title and prompt required')
+      const taskAgent = typeof agent === 'string' && agent ? agent : 'main'
+      if (isHiddenSystemAgentId(taskAgent)) return this.sendError(res, 404, 'agent not found')
       const task = await this._taskStore.create({
         id: id || `task-${Date.now().toString(36)}`,
         title,
-        agent: agent || 'main',
+        agent: taskAgent,
         prompt,
         trigger: trigger || 'manual',
         schedule,
@@ -6490,6 +6755,7 @@ export class Gateway {
     if (req.method === 'GET') {
       const task = await this._taskStore.get(taskId)
       if (!task) return this.sendError(res, 404, 'task not found')
+      if (isHiddenSystemAgentId(task.agent)) return this.sendError(res, 404, 'task not found')
       this.sendJson(res, 200, { task })
       return
     }
@@ -6501,12 +6767,23 @@ export class Gateway {
       } catch {
         return this.sendError(res, 400, 'invalid JSON')
       }
+      if (parsed.agent !== undefined && isHiddenSystemAgentId(parsed.agent)) {
+        return this.sendError(res, 404, 'agent not found')
+      }
+      const existing = await this._taskStore.get(taskId)
+      if (existing && isHiddenSystemAgentId(existing.agent)) {
+        return this.sendError(res, 404, 'task not found')
+      }
       const ok = await this._taskStore.update(taskId, parsed)
       if (ok) this._invalidateTaskCache()
       this.sendJson(res, ok ? 200 : 404, { ok })
       return
     }
     if (req.method === 'DELETE') {
+      const task = await this._taskStore.get(taskId)
+      if (task && isHiddenSystemAgentId(task.agent)) {
+        return this.sendError(res, 404, 'task not found')
+      }
       const ok = await this._taskStore.remove(taskId)
       if (ok) this._invalidateTaskCache()
       this.sendJson(res, ok ? 200 : 404, { ok })
@@ -6516,6 +6793,7 @@ export class Gateway {
     if (req.method === 'POST') {
       const task = await this._taskStore.get(taskId)
       if (!task) return this.sendError(res, 404, 'task not found')
+      if (isHiddenSystemAgentId(task.agent)) return this.sendError(res, 404, 'task not found')
       if (task.status === 'disabled')
         return this.sendError(res, 409, 'task is disabled (maxRuns reached)')
       this._triggerTask(taskId).catch((err) =>
@@ -6551,6 +6829,10 @@ export class Gateway {
   private async _triggerTask(taskId: string): Promise<void> {
     const task = await this._taskStore.get(taskId)
     if (!task || task.status === 'disabled') return
+    if (isHiddenSystemAgentId(task.agent)) {
+      this.log.warn('task hidden system agent rejected', { taskId, agent: task.agent })
+      return
+    }
     const cfg = await this._getAgentsConfig()
     const agent = cfg.agents.find((a) => a.id === task.agent)
     if (!agent) return
@@ -6607,7 +6889,7 @@ export class Gateway {
   private async handleCronApi(req: IncomingMessage, res: ServerResponse): Promise<void> {
     if (!this.cron) return this.sendError(res, 503, 'cron not initialized')
     if (req.method === 'GET') {
-      const jobs = await this.cron.listJobsWithMeta()
+      const jobs = (await this.cron.listJobsWithMeta()).filter((job) => !isHiddenSystemAgentId(job.agent))
       this.sendJson(res, 200, { jobs })
       return
     }
@@ -6621,11 +6903,13 @@ export class Gateway {
       }
       const { schedule, prompt, deliver, oneshot, label, agent } = parsed
       if (!schedule || !prompt) return this.sendError(res, 400, 'schedule and prompt required')
+      const cronAgent = typeof agent === 'string' && agent ? agent : 'main'
+      if (isHiddenSystemAgentId(cronAgent)) return this.sendError(res, 404, 'agent not found')
       const id = `remind-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`
       const job = {
         id,
         schedule,
-        agent: agent || 'main',
+        agent: cronAgent,
         prompt,
         deliver: deliver || 'webchat',
         enabled: true,
@@ -6646,6 +6930,10 @@ export class Gateway {
   ): Promise<void> {
     if (!this.cron) return this.sendError(res, 503, 'cron not initialized')
     if (req.method === 'DELETE') {
+      const existing = (await this.cron.listJobsWithMeta()).find((job) => job.id === id)
+      if (existing && isHiddenSystemAgentId(existing.agent)) {
+        return this.sendError(res, 404, 'cron job not found')
+      }
       const removed = await this.cron.removeJob(id)
       this.sendJson(res, removed ? 200 : 404, { ok: removed })
       return
@@ -6657,6 +6945,13 @@ export class Gateway {
         parsed = JSON.parse(body)
       } catch {
         return this.sendError(res, 400, 'invalid JSON')
+      }
+      if (parsed.agent !== undefined && isHiddenSystemAgentId(parsed.agent)) {
+        return this.sendError(res, 404, 'agent not found')
+      }
+      const existing = (await this.cron.listJobsWithMeta()).find((job) => job.id === id)
+      if (existing && isHiddenSystemAgentId(existing.agent)) {
+        return this.sendError(res, 404, 'cron job not found')
       }
       const updated = await this.cron.updateJob(id, parsed)
       this.sendJson(res, updated ? 200 : 404, { ok: updated })
@@ -7402,6 +7697,11 @@ export class Gateway {
     sessionKey?: string
   }): Promise<boolean> {
     let sessionKey = frame.sessionKey
+    const explicitStopAgentId = sessionKey?.split(':')[1] ?? frame.agentId
+    if (explicitStopAgentId && isHiddenSystemAgentId(explicitStopAgentId)) {
+      this.log.warn('interrupt hidden system agent rejected', { agentId: explicitStopAgentId })
+      return false
+    }
     if (!sessionKey) {
       if (frame.agentId) {
         sessionKey = `agent:${frame.agentId}:${frame.channel}:${frame.peer.kind}:${frame.peer.id.replace(/[^a-zA-Z0-9_-]/g, '_')}`
@@ -7836,6 +8136,10 @@ export class Gateway {
 
       const parts = sessionKey.split(':')
       const agentId = parts[1]
+      if (isHiddenSystemAgentId(agentId)) {
+        this.log.warn('auto-resume skipped hidden system agent session', { sessionKey })
+        continue
+      }
       const peerId = parts.slice(4).join(':')
 
       this.log.info('auto-resume pre-warming', { sessionKey })
@@ -7882,6 +8186,10 @@ export class Gateway {
       const peerLastFrameSeq = peer.lastFrameSeq
       const peerInFlight = peer.inFlight
       const aid = agentId || 'main'
+      if (isHiddenSystemAgentId(aid)) {
+        this.log.warn('auto-resume hello skipped hidden system agent session', { agentId: aid })
+        continue
+      }
       const safeId = peerId.replace(/[^a-zA-Z0-9_-]/g, '_')
       const sessionKey = `agent:${aid}:webchat:dm:${safeId}`
 
@@ -8181,6 +8489,22 @@ export class Gateway {
     let sessionKey: string
     let agent: AgentDef
     const cfg = await this._getAgentsConfig()
+    if (frame.agentId && isHiddenSystemAgentId(frame.agentId)) {
+      const hiddenAgentUserId: string =
+        typeof (frame as any)._userId === 'string' ? (frame as any)._userId : 'default'
+      const safePeerId = frame.peer.id.replace(/[^a-zA-Z0-9_-]/g, '_')
+      this.deliver({
+        type: 'outbound.message' as const,
+        sessionKey: `agent:${frame.agentId}:${frame.channel}:${frame.peer.kind}:${safePeerId}`,
+        channel: frame.channel,
+        peer: frame.peer,
+        blocks: [{ kind: 'text' as const, text: '[error] agent not found' }],
+        isFinal: true,
+        traceId: turnTraceId,
+        _userId: hiddenAgentUserId,
+      } as OutboundMessage, adapter)
+      return
+    }
     if (frame.agentId) {
       // Unknown agentId → demote to the default agent (全能助手), NEVER a personaless
       // {id} (which would run with no persona/toolsets/model). After the sync above a
@@ -8197,6 +8521,21 @@ export class Gateway {
       const routed = this.router.route(frame)
       sessionKey = routed.sessionKey
       agent = routed.agent
+    }
+    if (isHiddenSystemAgentId(agent.id)) {
+      const hiddenAgentUserId: string =
+        typeof (frame as any)._userId === 'string' ? (frame as any)._userId : 'default'
+      this.deliver({
+        type: 'outbound.message' as const,
+        sessionKey,
+        channel: frame.channel,
+        peer: frame.peer,
+        blocks: [{ kind: 'text' as const, text: '[error] agent not found' }],
+        isFinal: true,
+        traceId: turnTraceId,
+        _userId: hiddenAgentUserId,
+      } as OutboundMessage, adapter)
+      return
     }
 
     // ── model→agent 路由(M1a engine registry 语义)──
@@ -8788,15 +9127,28 @@ export class Gateway {
       const memberLines =
         members.length > 0
           ? members
-              .map((a) => `- \`${a.id}\`${a.displayName ? `（${a.displayName}）` : ''}`)
+              .map((a) => {
+                const model = a.model ? `${a.model}` : '默认模型'
+                const provider = a.provider || '继承全局'
+                return `- \`${a.id}\`${a.displayName ? `（${a.displayName}）` : ''} [${model}, ${provider}]${teamMemberCapabilityHint(a)}`
+              })
               .join('\n')
           : '（当前没有其它已安装 agent —— 直接自己完成即可）'
       const teamPreamble = [
         '【团队模式已开启】把这次任务当作队长来处理：',
         `可委派的成员（已安装 agent）：\n${memberLines}`,
-        '- 任务复杂、可拆解 → 用 `delegate_task(goal, agentId, context)` 委派子任务给最合适的成员组队，拿到各成员结果后你综合成给用户的最终答案。',
-        '- 任务简单、或没有更合适的成员 → 直接自己完成。',
-        '由你自主判断是否组队，不要为了组队而组队。',
+        '- 你是队长，也是完成用户任务的第一负责人；从任务拆解、是否委派、是否审查、是否采纳审查意见到最终答复，都由你端到端负责。',
+        '- 领域匹配优先于泛泛并行：用户任务明显属于某个已安装成员的领域时，优先把对应部分委派给该成员；多领域任务则拆给对应成员后由你综合。常见路由：代码/调试/测试/重构/代码库 → `coding-assistant`；科研/文献/论文/引用/学术分析 → `research-assistant`；文档/PPT/Excel/PDF/周报/公文/邮件/办公交付 → `office-assistant`。如果对应成员未安装，你可以自己完成或选择最接近的已安装成员。',
+        '- 任务复杂、可拆解 → **首选**用 `delegate_task(goal, agentId, context)` 委派子任务给上面列出的已安装成员组队，拿到各成员结果后你综合成给用户的最终答案；任务简单则直接自己完成。',
+        '- 不要优先启动 Codex 原生 `Agent` 临时子进程来代替这些成员；只有当 `delegate_task` 不适合或不可用、且你判断临时并行 worker 明显必要时，才把 Codex 原生 `Agent` 当兜底使用。',
+        '- 系统隐藏审查员：`hidden-reviewer`（不在成员列表显示）。如果本轮实际调用了任何非队长成员（无论是已安装 agent 的 `delegate_task`，还是 Codex 原生 `Agent` 兜底临时子进程），在最终答复前默认要再调用 `delegate_task(goal, agentId: "hidden-reviewer", context: "...")` 请它审查你的草稿/综合结论。',
+        '- 只有纯机械低风险任务、用户明确要求快速/低成本、或隐藏审查失败/超时时，才可以跳过或继续；如果你尝试隐藏审查但失败或超时，最终答案里要明确说明“隐藏审查未完成/失败”。',
+        '- 审查 context 必须包含：用户原始需求、你准备给用户的草稿/关键方案、关键假设、已采纳的成员结论和你认为的风险点；审查结果只是建议，不是命令。',
+        '- 审查迭代闭环：如果隐藏审查返回 PASS 或无阻塞问题，你可以最终答复；如果返回 NEEDS_FIX 或指出具体问题，你不能直接结束，必须先选择接受并修复、委派对应领域成员修复、查询/验证证据，或明确判定该意见是误报/非问题/范围外并说明理由。',
+        '- 做出实质修复后，需要再次调用 `hidden-reviewer` 审查修订稿；再次审查 context 要包含修订后的草稿、已修复项、未采纳意见及理由、关键证据。迭代直到隐藏审查 PASS，或你基于证据判断剩余意见是误报/非问题/范围外。',
+        '- 避免无限循环：如果隐藏审查反复失败/超时、重复没有新信息，或你已给出充分证据反驳剩余意见，可以停止迭代并承担最终责任；除非审查失败/超时或剩余限制会影响答案可信度，最终回复不要展开内部审查过程。',
+        '- 收到审查结果后，由你自主决定接受、拒绝、部分采纳、修订、再次审查或直接答复；不要因为审查员给出意见就机械照单全收。',
+        '- 如果本轮没有调用任何非队长成员，仍可在任务复杂、高风险、事实/承诺敏感时主动请隐藏审查；如果你判断无需审查并跳过，不需要向用户解释流程。',
         '',
         '用户任务：',
         '',
@@ -8812,6 +9164,10 @@ export class Gateway {
         : sessionKey.includes(':inter:')
           ? ('inter-agent' as const)
           : ('chat' as const)
+    // 新用户 turn 开启 → 清零本会话对 hidden 审查员的串行委派计数。delegate 请求
+    // 只带 parentSessionKey(没有 turn 级标识),所以"每 turn 上限"的 turn 边界由
+    // 这里定义:同一 sessionKey 收到下一条入站用户消息即视为新 turn。
+    this._hiddenDelegateGuard.resetForParent(sessionKey)
     const _run = this._runLog.start({ agentId: session.agentId, sessionKey, taskType })
     // P1-3 续 — CCB 用 createAssistantAPIErrorMessage 把 API 调用错误包成
     // "API Error: ..." 文本作为正常 assistant text 流出(不抛 process error),
@@ -9160,6 +9516,9 @@ export class Gateway {
     }, safeEffortLevel, safeModel, safeRequestId, turnTraceId, safeConversationMode, {
       historicalMessages: masterHistoricalMessages,
       codexRoute: safeCodexRoute,
+      ...(teamMode && agent.id === 'main'
+        ? { collabAgentPolicy: 'team-mode-prefer-delegate' as const }
+        : {}),
       ...(effectiveToolsets !== undefined ? { toolsets: effectiveToolsets } : {}),
     })
     if (liveWechatAdapter) {
@@ -10119,6 +10478,31 @@ export function staticCacheControl(safePath: string, mode: 'vanilla' | 'spa' | u
       : 'no-cache'
   }
   return safePath === '/sw.js' ? 'no-cache, no-store, must-revalidate' : 'public, max-age=3600'
+}
+
+const LEGACY_ADMIN_MODULE_PATHS = new Set([
+  '/modules/admin.js',
+  '/modules/api.js',
+  '/modules/auth.js',
+  '/modules/broadcast.js',
+  '/modules/charts.js',
+  '/modules/dom.js',
+  '/modules/state.js',
+])
+const LEGACY_ADMIN_VENDOR_PATHS = new Set([
+  '/vendor/chart.umd.min.js',
+  '/vendor/qrcode.min.js',
+])
+
+/**
+ * v5/spa 下允许从 legacy web/public 透传的超管后台静态资产。
+ * 主站 React/Vite 资产仍只走 /assets/*；这里不要扩大到 style.css / index.html。
+ */
+export function legacyAdminStaticPath(safePath: string): boolean {
+  return safePath === '/admin.html' ||
+    safePath === '/icon.svg' ||
+    LEGACY_ADMIN_MODULE_PATHS.has(safePath) ||
+    LEGACY_ADMIN_VENDOR_PATHS.has(safePath)
 }
 
 /** MIME types that can execute scripts in the browser and must be force-downloaded. */

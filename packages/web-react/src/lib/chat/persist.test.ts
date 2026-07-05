@@ -1,4 +1,4 @@
-import { describe, expect, test, vi } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
 import { addMessage, type ChatMessage, createSession } from "./model";
 import { applyResumeFailed, type FrameEffects } from "./reducer";
 import { ChatSocket } from "./socket";
@@ -28,8 +28,13 @@ function storedFix(id: string, over: Partial<StoredSession> = {}): StoredSession
   return { id, agentId: "main", title: id, messages: [], createdAt: 1, lastAt: 1, ...over };
 }
 
+afterEach(() => {
+  vi.clearAllTimers();
+  vi.useRealTimers();
+});
+
 describe("socket — loadStored 注水（reload 不丢）", () => {
-  test("注水消息 + 游标 + 重建 block 索引 + reset in-flight", () => {
+  test("注水消息 + 游标 + 重建 block 索引 + 无 pending 时 reset in-flight", () => {
     const s = socket();
     s.loadStored(
       storedFix("s1", {
@@ -38,6 +43,9 @@ describe("socket — loadStored 注水（reload 不丢）", () => {
         _lastFrameSeq: 7,
         _lastFrameSeqByKey: { "agent:main:webchat:dm:s1": 7 },
         _maxSeq: 12,
+        _trackerResetAt: 1000,
+        _localTeardownAt: 1050,
+        _agentSwitchedAt: 1100,
       }),
     );
     const sess = s.sessions.get("s1")!;
@@ -45,10 +53,48 @@ describe("socket — loadStored 注水（reload 不丢）", () => {
     expect(sess.messages.map((m) => m.id)).toEqual(["m1"]);
     expect(sess._lastFrameSeq).toBe(7);
     expect(sess._maxSeq).toBe(12);
+    expect(sess._trackerResetAt).toBe(1000);
+    expect(sess._localTeardownAt).toBe(1050);
+    expect(sess._agentSwitchedAt).toBe(1100);
     // rebuildIndexes 重建 blockId→msgId（否则 subagent live 块会回退主流）。
     expect(sess._blockIdToMsgId?.get("blk-1")).toBe("m1");
-    // 注水后 in-flight 必须复位，避免 reload 后卡 loading。
+    // 无 pending 标记的旧快照仍复位，避免 reload 后长期卡 loading。
     expect(sess._sendingInFlight).toBe(false);
+  });
+
+  test("注水近期 in-flight 标记：reload 后保留生成中状态供 hello 恢复", () => {
+    const now = Date.now();
+    const s = socket();
+    s.loadStored(
+      storedFix("s1", {
+        messages: [msg("u1", "hi", { role: "user", status: "sent", ts: now - 2000 })],
+        _sendingInFlight: true,
+        _turnStartedAt: now - 2000,
+        _lastFrameAt: now - 1000,
+      }),
+    );
+    const sess = s.sessions.get("s1")!;
+    expect(sess._sendingInFlight).toBe(true);
+    expect(sess._turnStartedAt).toBe(now - 2000);
+    expect(sess._lastFrameAt).toBe(now - 1000);
+    s.stop();
+  });
+
+  test("注水过期 in-flight 标记：丢弃，避免 reload 后永久 loading", () => {
+    const now = Date.now();
+    const s = socket();
+    s.loadStored(
+      storedFix("s1", {
+        messages: [msg("u1", "hi", { role: "user", status: "sent", ts: now - 20 * 60_000 })],
+        _sendingInFlight: true,
+        _turnStartedAt: now - 20 * 60_000,
+        _lastFrameAt: now - 20 * 60_000,
+      }),
+    );
+    const sess = s.sessions.get("s1")!;
+    expect(sess._sendingInFlight).toBe(false);
+    expect(sess._turnStartedAt).toBeUndefined();
+    expect(sess._lastFrameAt).toBeUndefined();
   });
 
   test("已存在的 live 会话不被磁盘快照覆盖（live 优先）", () => {
@@ -69,13 +115,35 @@ describe("socket — toStored 序列化", () => {
     addMessage(sess, "user", "hello");
     sess._lastFrameSeq = 3;
     sess._maxSeq = 9;
+    sess._trackerResetAt = 100;
+    sess._localTeardownAt = 150;
+    sess._agentSwitchedAt = 200;
+    sess._sendingInFlight = true;
+    sess._turnStartedAt = 111;
+    sess._lastFrameAt = 222;
     sess._streamingAssistant = msg("stream"); // 瞬态：不应进 StoredSession
     const out = s.toStored("s1")!;
     expect(out.id).toBe("s1");
     expect(out.messages.map((m) => m.text)).toEqual(["hello"]);
     expect(out._lastFrameSeq).toBe(3);
     expect(out._maxSeq).toBe(9);
+    expect(out._trackerResetAt).toBe(100);
+    expect(out._localTeardownAt).toBe(150);
+    expect(out._agentSwitchedAt).toBe(200);
+    expect(out._sendingInFlight).toBe(true);
+    expect(out._turnStartedAt).toBe(111);
+    expect(out._lastFrameAt).toBe(222);
     expect(Object.keys(out)).not.toContain("_streamingAssistant");
+  });
+
+  test("序列化记录仍在响应的 turn（_sendingInFlight），用于 reload 恢复发送态", () => {
+    const s = socket();
+    const sess = s.ensureSession("s1", "main", "t");
+    sess._sendingInFlight = true;
+    sess._turnStartedAt = 1_700_000_000_000;
+    const out = s.toStored("s1")!;
+    expect(out._sendingInFlight).toBe(true);
+    expect(out._turnStartedAt).toBe(1_700_000_000_000);
   });
 
   test("未知会话 toStored → null", () => {
