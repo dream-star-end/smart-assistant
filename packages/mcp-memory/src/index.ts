@@ -1222,10 +1222,12 @@ async function handleSendToAgent(args: { agentId: string; message: string }) {
   const gatewayToken = readGatewayToken()
   const sourceAgent = process.env.OPENCLAUDE_AGENT_ID || 'unknown'
   try {
-    const res = await fetch(
+    // 与 delegate_task 同款收口 postJsonToGateway:对端 handleAgentMessage 同样是
+    // "子 turn 跑完才写响应"的长阻塞端点,裸 fetch 会在 undici 5min headersTimeout
+    // 精确复刻历史 fetch failed(ecb4ee38 修 delegate 时的同类残留)。
+    const res = await postJsonToGateway(
       `http://127.0.0.1:${gatewayPort}/api/agents/${encodeURIComponent(args.agentId)}/message`,
       {
-        method: 'POST',
         headers: {
           'Content-Type': 'application/json',
           Authorization: `Bearer ${gatewayToken}`,
@@ -1234,18 +1236,19 @@ async function handleSendToAgent(args: { agentId: string; message: string }) {
           message: args.message,
           sourceAgent,
         }),
+        timeoutMs: DELEGATE_CLIENT_TIMEOUT_MS,
       },
     )
-    if (!res.ok) {
-      const err = await res.text()
-      return toolError(`发送失败: ${err}`)
+    if (res.statusCode < 200 || res.statusCode >= 300) {
+      return toolError(`发送失败: ${res.body}`)
     }
-    const data = (await res.json()) as any
+    const data = JSON.parse(res.body) as any
     return toolOk(
       `✅ 已发送给 agent "${args.agentId}": "${args.message.slice(0, 50)}${args.message.length > 50 ? '...' : ''}"\n目标 agent 将在后台处理,结果会推送给用户。`,
     )
   } catch (err: any) {
-    return toolError(`发送失败: ${err?.message ?? String(err)}`)
+    // 带 transport code 上浮(ECONNREFUSED/ETIMEDOUT…),不吞 cause。
+    return toolError(`发送失败: ${describeDelegateTransportError(err)}`)
   }
 }
 
