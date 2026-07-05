@@ -185,6 +185,22 @@ const V3_WECHAT_OUTBOUND_ADAPTER_ID = 'v3-wechat-outbound'
 const WECHAT_FINAL_EMPTY_TEXT =
   '✅ 任务已完成，但这轮没有生成可直接发送到微信的文本结果。请打开实时过程链接查看详细过程。'
 
+function teamMemberCapabilityHint(agent: AgentDef): string {
+  let hint = ''
+  try {
+    const personaPath = agent.persona || paths.agentClaudeMd(agent.id)
+    if (existsSync(personaPath)) {
+      hint = readFileSync(personaPath, 'utf8')
+        .split('\n')
+        .map((line) => line.trim())
+        .find((line) => line && !line.startsWith('#')) ?? ''
+    }
+  } catch {}
+  if (!hint && typeof agent.greeting === 'string') hint = agent.greeting
+  hint = hint.replace(/\s+/g, ' ').trim()
+  return hint ? ` — 能力: ${hint.slice(0, 100)}` : ''
+}
+
 /**
  * 协议级允许的 InboundMessage.model 值(2026-04-26 v1.0.4 加)。
  *
@@ -9022,7 +9038,7 @@ export class Gateway {
               .map((a) => {
                 const model = a.model ? `${a.model}` : '默认模型'
                 const provider = a.provider || '继承全局'
-                return `- \`${a.id}\`${a.displayName ? `（${a.displayName}）` : ''} [${model}, ${provider}]`
+                return `- \`${a.id}\`${a.displayName ? `（${a.displayName}）` : ''} [${model}, ${provider}]${teamMemberCapabilityHint(a)}`
               })
               .join('\n')
           : '（当前没有其它已安装 agent —— 直接自己完成即可）'
@@ -9030,12 +9046,14 @@ export class Gateway {
         '【团队模式已开启】把这次任务当作队长来处理：',
         `可委派的成员（已安装 agent）：\n${memberLines}`,
         '- 你是队长，也是完成用户任务的第一负责人；从任务拆解、是否委派、是否审查、是否采纳审查意见到最终答复，都由你端到端负责。',
+        '- 领域匹配优先于泛泛并行：用户任务明显属于某个已安装成员的领域时，优先把对应部分委派给该成员；多领域任务则拆给对应成员后由你综合。常见路由：代码/调试/测试/重构/代码库 → `coding-assistant`；科研/文献/论文/引用/学术分析 → `research-assistant`；文档/PPT/Excel/PDF/周报/公文/邮件/办公交付 → `office-assistant`。如果对应成员未安装，你可以自己完成或选择最接近的已安装成员。',
         '- 任务复杂、可拆解 → **首选**用 `delegate_task(goal, agentId, context)` 委派子任务给上面列出的已安装成员组队，拿到各成员结果后你综合成给用户的最终答案；任务简单则直接自己完成。',
         '- 不要优先启动 Codex 原生 `Agent` 临时子进程来代替这些成员；只有当 `delegate_task` 不适合或不可用、且你判断临时并行 worker 明显必要时，才把 Codex 原生 `Agent` 当兜底使用。',
-        '- 系统隐藏审查员：`hidden-reviewer`（不在成员列表显示）。它是可选审查资源，不是强制流程；当任务复杂、高风险、事实/承诺敏感，或你已经形成重要草稿且认为值得复核时，可调用 `delegate_task(goal, agentId: "hidden-reviewer", context: "...")` 请它审查。',
-        '- 审查 context 建议包含：用户原始需求、你的草稿/关键方案、关键假设和你认为的风险点；审查结果只是建议，不是命令。',
+        '- 系统隐藏审查员：`hidden-reviewer`（不在成员列表显示）。如果本轮实际调用了任何非队长成员（无论是已安装 agent 的 `delegate_task`，还是 Codex 原生 `Agent` 兜底临时子进程），在最终答复前默认要再调用 `delegate_task(goal, agentId: "hidden-reviewer", context: "...")` 请它审查你的草稿/综合结论。',
+        '- 只有纯机械低风险任务、用户明确要求快速/低成本、或隐藏审查失败/超时时，才可以跳过或继续；如果你尝试隐藏审查但失败或超时，最终答案里要明确说明“隐藏审查未完成/失败”。',
+        '- 审查 context 必须包含：用户原始需求、你准备给用户的草稿/关键方案、关键假设、已采纳的成员结论和你认为的风险点；审查结果只是建议，不是命令。',
         '- 收到审查结果后，由你自主决定接受、拒绝、部分采纳、修订、直接答复，或继续请求更多审查/迭代；不要因为审查员给出意见就机械照单全收。',
-        '- 如果你调用了隐藏审查员但它失败或超时，最终答案里要明确说明“隐藏审查未完成/失败”；如果你判断无需审查并跳过，不需要向用户解释流程。',
+        '- 如果本轮没有调用任何非队长成员，仍可在任务复杂、高风险、事实/承诺敏感时主动请隐藏审查；如果你判断无需审查并跳过，不需要向用户解释流程。',
         '',
         '用户任务：',
         '',
