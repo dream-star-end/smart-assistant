@@ -42,6 +42,9 @@ export interface CostEventPersist {
   uid: string;
   costCredits: string;
   sessionId?: string | null;
+  /** delegate 子会话的父客户端会话 id(web-*);普通 chat / codex 自费为 null。
+   *  egress→master 必须透传,否则委派成本 durable 归并(Fix A)在 split 模式失效。 */
+  parentSessionId?: string | null;
 }
 
 export interface CostEventBroadcast {
@@ -61,6 +64,7 @@ export interface CostEventHandlerDeps {
     rawUserId: string,
     costCredits: string,
     sessionId?: string | null,
+    parentSessionId?: string | null,
   ) => Promise<unknown>;
   broadcastToUser: (uid: bigint, payload: unknown) => void;
   logger?: Logger;
@@ -110,7 +114,13 @@ export function makeCostEventHandler(deps: CostEventHandlerDeps): CostEventHandl
       if (!ev) continue;
       try {
         if (ev.kind === "persist") {
-          await deps.appendCostCredits(ev.requestId, ev.uid, ev.costCredits, ev.sessionId ?? null);
+          await deps.appendCostCredits(
+            ev.requestId,
+            ev.uid,
+            ev.costCredits,
+            ev.sessionId ?? null,
+            ev.parentSessionId ?? null,
+          );
         } else {
           deps.broadcastToUser(BigInt(ev.uid), ev.payload);
         }
@@ -142,6 +152,7 @@ function parseEvent(raw: unknown): CostEvent | null {
       uid: raw.uid,
       costCredits: raw.costCredits,
       sessionId: typeof raw.sessionId === "string" ? raw.sessionId : null,
+      parentSessionId: typeof raw.parentSessionId === "string" ? raw.parentSessionId : null,
     };
   }
   if (raw.kind === "broadcast") {

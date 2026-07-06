@@ -84,6 +84,7 @@ export interface RoundTripCtx {
     userId: string,
     costCredits: string,
     sessionId?: string | null,
+    parentSessionId?: string | null,
   ) => Promise<unknown>;
   broadcastToUser?: (uid: bigint, payload: unknown) => void;
   req: IncomingMessage;
@@ -94,6 +95,15 @@ export interface RoundTripCtx {
   session: PreparedUpstreamSession;
   finalize: FinalizerHandle;
   sessionId: string | null;
+  /**
+   * delegate 子会话的父**客户端**会话 id(web-*)。仅 attribution.mode==='delegate'
+   * 时非空(extractUsageAttribution 已保证非 delegate 恒 null)。
+   *   - `appendCostCredits` park key:委派成本按此归并到队长助手行(durable,Fix A);
+   *     普通 chat null → 走既有 session_id / by-user drain,零影响。
+   *   - `outbound.cost_charged` 广播:前端据此把委派成本精确路由到父客户端会话
+   *     (Fix B,消 60s TTL 脆弱);普通 chat null → 前端回落既有启发式。
+   */
+  parentSessionId: string | null;
   userLog: Logger;
 }
 
@@ -129,6 +139,7 @@ export async function runUpstreamRoundTrip(ctx: RoundTripCtx): Promise<void> {
     session,
     finalize,
     sessionId,
+    parentSessionId,
     userLog,
   } = ctx;
 
@@ -292,6 +303,10 @@ export async function runUpstreamRoundTrip(ctx: RoundTripCtx): Promise<void> {
             // agent session id(ccb getSessionId,= cost 帧 sessionId)→ park 进 pending.session_id,
             // 供 ccb 助手落库按 session 精确 drain(per-turn 精确,消除 by-user 跨会话归并)。
             sessionId,
+            // delegate 子会话:父客户端会话 id(web-*)→ park 进 pending.parent_session_id,
+            // 供队长助手行落库按父客户端会话精确归并(Fix A durable)。普通 chat 恒 null,
+            // 走上面的 session_id / by-user drain,零影响。
+            parentSessionId,
           );
         } catch (err) {
           userLog.warn("proxy_persist_costcredits_failed", {
@@ -314,6 +329,9 @@ export async function runUpstreamRoundTrip(ctx: RoundTripCtx): Promise<void> {
               ? null
               : outcome.balanceAfter.toString(),
             sessionId,
+            // Fix B — delegate 成本的父客户端会话 id(web-*)。前端据此把 cost_charged
+            // 精确路由到父会话(消 60s TTL / 多会话并发误算);普通 chat null → 回落启发式。
+            parentSessionId,
           });
         } catch (err) {
           userLog.warn("proxy_broadcast_cost_failed", { err: errSummary(err) });

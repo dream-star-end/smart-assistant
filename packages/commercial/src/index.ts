@@ -201,6 +201,7 @@ import {
   appendServerAuthoredMessage,
   appendServerAuthoredMessageForRequest,
   appendServerAuthoredMessageDrainByUser,
+  drainDelegateCostForClientSession,
   getClientSession,
   // P1.7 slice 7c — broker assembly 需要的 master sqlite helpers
   upsertMasterClientSession,
@@ -1088,6 +1089,8 @@ export async function registerCommercial(
     rawUserId: string,
     costCredits: string,
     sessionId?: string | null,
+    // delegate 子会话的父客户端会话 id(web-*);普通 chat / codex 自费恒 undefined。
+    parentSessionId?: string | null,
   ) =>
     appendCostCredits(
       requestId,
@@ -1095,6 +1098,7 @@ export async function registerCommercial(
       rawUserId.startsWith(MASTER_USER_PREFIX) ? rawUserId : MASTER_USER_PREFIX + rawUserId,
       costCredits,
       sessionId,
+      parentSessionId,
     );
   // P1.7 slice 7c — broker 前向引用。dispatchInternal 在 line ~883 装配,需要路由
   // `/internal/v3/wechat-outbound` → broker.outboundHandler;但 broker 本身依赖
@@ -1235,6 +1239,7 @@ export async function registerCommercial(
           appendServerAuthoredMessage,
           appendServerAuthoredMessageForRequest,
           appendServerAuthoredMessageDrainByUser,
+          drainDelegateCostForClientSession,
         },
       });
       // Codex reverse-RPC `account/chatgptAuthTokens/refresh` over HTTP.

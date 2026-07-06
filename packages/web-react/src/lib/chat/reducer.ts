@@ -1261,10 +1261,19 @@ export function applyCostCharged(sess: ChatSession | null, frame: CostChargedWir
     return;
   }
   // target：streamingAssistant（turn 进行中）OR 60s 内 lastFinaled（刚 final 完晚到）。
+  //
+  // Fix B — 委派成本精确归属:frame.parentSessionId 存在 = 这是委派子智能体的成本,它属于
+  // **父会话当前在飞的队长 turn**(委派 LLM 调用发生在队长 isFinal 之前)。此时若无
+  // streamingAssistant 又命中 60s 内的 lastFinaled(那是**上一** turn 的助手消息),旧逻辑会把
+  // 本轮委派成本错算到上一轮响应上。故委派 + 在飞(_sendingInFlight)时**跳过** lastFinaled 分支
+  // → 落入下方 (a) 入队 _pendingCostCredits,由本轮队长 isFinal 的 meta-drain/收尾兜底落到本轮
+  // 队长响应。普通 chat(无 parentSessionId)行为完全不变。
+  const isDelegateInFlight = !!frame.parentSessionId && sess._sendingInFlight;
   let target: ChatMessage | null = null;
   if (sess._streamingAssistant) {
     target = sess._streamingAssistant;
   } else if (
+    !isDelegateInFlight &&
     sess._lastFinaledAssistantId &&
     sess._lastFinaledAt &&
     Date.now() - sess._lastFinaledAt < COST_CHARGED_LAST_FINAL_TTL_MS

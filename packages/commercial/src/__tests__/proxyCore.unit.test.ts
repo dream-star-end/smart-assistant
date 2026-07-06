@@ -288,6 +288,7 @@ interface BuildCtxOpts {
   finalizerOutcome?: Partial<FinalizeOutcome>;
   fetchImpl: (url: string, init: RequestInit) => Promise<Response>;
   sessionId?: string | null;
+  parentSessionId?: string | null;
   appendCostCredits?: RoundTripCtx["appendCostCredits"];
   broadcastToUser?: RoundTripCtx["broadcastToUser"];
 }
@@ -315,6 +316,7 @@ function buildCtx(opts: BuildCtxOpts) {
     session: session.session,
     finalize: finalize.finalize,
     sessionId: opts.sessionId ?? null,
+    parentSessionId: opts.parentSessionId ?? null,
     userLog: log,
   };
   return { ctx, req, res, session, finalize };
@@ -457,6 +459,54 @@ describe("runUpstreamRoundTrip — happy path commit + post-commit", () => {
     );
 
     assert.equal(session.zeroizeCount, 1);
+  });
+
+  test("delegate 模式:parentSessionId 进 park(第5参)+ broadcast payload(Fix A/B)", async () => {
+    const persistArgs: Array<{ sessionId?: string | null; parentSessionId?: string | null }> = [];
+    const broadcastPayloads: unknown[] = [];
+    const { ctx } = buildCtx({
+      fetchImpl: async () => sseFullResponse({ inputTok: 100, outputTok: 50 }),
+      sessionId: "engine-delegate-uuid", // 委派子进程自己的引擎会话
+      parentSessionId: "web-parent-01", // 父客户端会话(web-*)
+      finalizerOutcome: { state: "committed", debitedCredits: 42n, balanceAfter: 100n },
+      appendCostCredits: async (_rid, _uid, _cents, sessionId, parentSessionId) => {
+        persistArgs.push({ sessionId, parentSessionId });
+      },
+      broadcastToUser: (_uid, payload) => {
+        broadcastPayloads.push(payload);
+      },
+    });
+    await runUpstreamRoundTrip(ctx);
+
+    assert.equal(persistArgs.length, 1);
+    assert.equal(persistArgs[0].sessionId, "engine-delegate-uuid", "session_id 仍是委派引擎会话");
+    assert.equal(persistArgs[0].parentSessionId, "web-parent-01", "parentSessionId 进 park(durable 归并 key)");
+
+    const payload = broadcastPayloads[0] as { sessionId: string | null; parentSessionId: string | null };
+    assert.equal(payload.sessionId, "engine-delegate-uuid");
+    assert.equal(payload.parentSessionId, "web-parent-01", "broadcast 带 parentSessionId(前端精确路由)");
+  });
+
+  test("普通 chat(非委派):parentSessionId=null 进 park + broadcast(零影响)", async () => {
+    const persistArgs: Array<{ parentSessionId?: string | null }> = [];
+    const broadcastPayloads: unknown[] = [];
+    const { ctx } = buildCtx({
+      fetchImpl: async () => sseFullResponse({ inputTok: 100, outputTok: 50 }),
+      sessionId: "engine-chat-uuid",
+      // parentSessionId 缺省 → buildCtx 填 null(普通 chat)
+      finalizerOutcome: { state: "committed", debitedCredits: 30n, balanceAfter: 70n },
+      appendCostCredits: async (_rid, _uid, _cents, _sessionId, parentSessionId) => {
+        persistArgs.push({ parentSessionId });
+      },
+      broadcastToUser: (_uid, payload) => {
+        broadcastPayloads.push(payload);
+      },
+    });
+    await runUpstreamRoundTrip(ctx);
+
+    assert.equal(persistArgs[0].parentSessionId, null, "普通 chat park 的 parentSessionId 恒 null");
+    const payload = broadcastPayloads[0] as { parentSessionId: string | null };
+    assert.equal(payload.parentSessionId, null, "普通 chat broadcast parentSessionId=null → 前端回落启发式");
   });
 
   test("debited=null(billing_failed)→ 跳过 persist + broadcast", async () => {
@@ -617,6 +667,7 @@ describe("runUpstreamRoundTrip — stream / fetch error 分支", () => {
       session: session.session,
       finalize: finalize.finalize,
       sessionId: null,
+      parentSessionId: null,
       userLog: log,
     };
     await runUpstreamRoundTrip(ctx);

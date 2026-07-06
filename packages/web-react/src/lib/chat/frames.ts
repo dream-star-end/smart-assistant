@@ -86,7 +86,12 @@ export type LegacyBridgeErrorWire = {
 /** 商业版扣费广播（master→user）。**不进 frameSeq 去重**（§3）。*/
 export type CostChargedWire = {
   type: "outbound.cost_charged";
+  /** agent 内部会话 UUID（引擎会话，非 client peer 键）。历史字段，直接 sessions.get 必失配。*/
   sessionId?: string;
+  /** delegate 成本的父**客户端**会话 id（web-*，= sess.id / peerId）。仅委派 cost 非空。
+   *  前端据此把 cost_charged **精确路由**到父客户端会话，消 60s TTL 启发式在多会话并发下的
+   *  误算/丢弃（Fix B）；普通 chat 恒 undefined → 回落既有启发式。*/
+  parentSessionId?: string;
   balanceAfter?: string | null;
   costCredits?: string | null;
 };

@@ -151,15 +151,23 @@ export async function startEgress(): Promise<void> {
     broadcastToUser: (uid, payload) => {
       costSink.enqueue({ kind: "broadcast", uid: uid.toString(), payload: payload as Record<string, unknown> });
     },
-    appendCostCredits: async (requestId: string, rawUserId: string, costCredits: string, sessionId?: string | null) => {
+    appendCostCredits: async (
+      requestId: string,
+      rawUserId: string,
+      costCredits: string,
+      sessionId?: string | null,
+      parentSessionId?: string | null,
+    ) => {
       // 裸 uid 原样传;master 侧 appendCostCreditsForUser 统一加 c: 前缀(命名
-      // 空间对齐逻辑留在唯一写入方,防两处漂移)。
+      // 空间对齐逻辑留在唯一写入方,防两处漂移)。parentSessionId(委派父客户端会话)
+      // 随 persist 事件过 egress→master,不能在 egress 边界丢弃否则 durable 归并失效。
       costSink.enqueue({
         kind: "persist",
         requestId,
         uid: rawUserId,
         costCredits,
         sessionId: sessionId ?? null,
+        parentSessionId: parentSessionId ?? null,
       });
     },
     staticProviderKeys: {

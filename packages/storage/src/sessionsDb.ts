@@ -280,6 +280,11 @@ export async function getSessionsDb(): Promise<Database.Database> {
       request_id   TEXT NOT NULL,
       user_id      TEXT NOT NULL,
       session_id   TEXT,
+      -- delegate 成本归因:父**客户端**会话 id(web-*)。仅委派子会话 park 时非空
+      -- (proxy 从 attribution.parentSessionId 传入,= gateway 注入的 oc_parent_session_id
+      -- 解析出的父 webchat 会话)。普通 chat / codex 自费恒 NULL —— 语义诚实,与
+      -- session_id(引擎会话)不复用,drain 用它按父客户端会话精确归并到队长助手行。
+      parent_session_id TEXT,
       cost_credits TEXT NOT NULL,
       created_at   INTEGER NOT NULL DEFAULT (CAST(strftime('%s','now') AS INTEGER)*1000),
       PRIMARY KEY (request_id, user_id)
@@ -288,7 +293,27 @@ export async function getSessionsDb(): Promise<Database.Database> {
     -- by-user drain(ccb-spawn 路径 appendServerAuthoredMessageDrainByUser 的 WHERE user_id)
     -- 走索引,避免 pending 积压时全表扫。
     CREATE INDEX IF NOT EXISTS idx_pup_user ON pending_usage_patches(user_id);
+    -- delegate drain(drainDelegateCostForClientSession 的 WHERE user_id AND parent_session_id)
+    -- 走部分索引(只覆盖委派行,普通/自费行 parent_session_id 为 NULL 不入索引)。
+    CREATE INDEX IF NOT EXISTS idx_pup_parent
+      ON pending_usage_patches(user_id, parent_session_id)
+      WHERE parent_session_id IS NOT NULL;
   `)
+  // Migration: add parent_session_id column to pending_usage_patches (existing DBs).
+  // ADD COLUMN with default NULL is metadata-only + fast; the partial index above is
+  // created idempotently by the DDL block, but only takes effect once the column exists,
+  // so create it again after the ALTER for pre-existing DBs.
+  try {
+    const cols = db.pragma('table_info(pending_usage_patches)') as Array<{ name: string }>
+    if (!cols.some(c => c.name === 'parent_session_id')) {
+      db.exec('ALTER TABLE pending_usage_patches ADD COLUMN parent_session_id TEXT')
+      db.exec(
+        `CREATE INDEX IF NOT EXISTS idx_pup_parent
+           ON pending_usage_patches(user_id, parent_session_id)
+           WHERE parent_session_id IS NOT NULL`,
+      )
+    }
+  } catch { /* table just created with column already */ }
 
   // 旧重量级团队模式(team_runs / team_delegations)已整套删除:schema 不再声明,
   // 存量本地 DB 里已建的表留着无害(不写 DROP TABLE,不迁移)。
@@ -1709,6 +1734,12 @@ export async function appendCostCredits(
   // 记入 pending.session_id,供 ccb 助手落库时按 session 精确 drain(消除 by-user 跨会话归并)。
   // 缺省 → 存 NULL,退回 by-user 兜底(老 proxy / 拿不到 session 的路径)。
   sessionId?: string | null,
+  // 父**客户端**会话 id(web-*)。仅委派子会话非空(proxy 从 attribution.parentSessionId
+  // 传入)。park 时记入 pending.parent_session_id,供队长助手行落库时经
+  // drainDelegateCostForClientSession 按父客户端会话精确归并成本。普通 chat / codex 自费恒
+  // NULL —— 与 session_id 池 disjoint,不会被队长的 requestId / by-agent-session drain 命中,
+  // 也不会命中队长自己的成本,保证不重复计费。
+  parentSessionId?: string | null,
 ): Promise<AppendCostCreditsResult> {
   const db = await getSessionsDb()
   const txn = db.transaction((): AppendCostCreditsResult => {
@@ -1791,14 +1822,118 @@ export async function appendCostCredits(
     }
 
     db.prepare(
-      `INSERT INTO pending_usage_patches (request_id, user_id, session_id, cost_credits)
-       VALUES (?, ?, ?, ?)
+      `INSERT INTO pending_usage_patches (request_id, user_id, session_id, parent_session_id, cost_credits)
+       VALUES (?, ?, ?, ?, ?)
        ON CONFLICT (request_id, user_id) DO UPDATE SET
          cost_credits = excluded.cost_credits,
          session_id = excluded.session_id,
+         parent_session_id = excluded.parent_session_id,
          created_at = (CAST(strftime('%s','now') AS INTEGER)*1000)`
-    ).run(requestId, userId, sessionId ?? null, costCredits)
+    ).run(requestId, userId, sessionId ?? null, parentSessionId ?? null, costCredits)
     return { applied: 'pending' }
+  })
+  return txn()
+}
+
+export interface DrainDelegateCostResult {
+  /** 本次归并进队长助手行的 delegate 成本总和(十进制字符串;无委派成本 → '0')。 */
+  merged: string
+  /** 本次排空的 pending 行数(= 命中的委派子请求数;0 = 无委派成本 / 目标行缺位)。 */
+  drained: number
+}
+
+/**
+ * **委派成本按父客户端会话归并(Fix A durable)。**
+ *
+ * 队长助手行落库后调用:把该 user 下所有 `parent_session_id = clientSessionId` 的委派
+ * pending 成本**求和累加**进队长助手消息(msgId)的 `usage.costCredits`,并删除已排空的行。
+ *
+ * 与既有两条 drain 的关系(**disjoint 池,保证不重复计费**):
+ *   - 队长自费(codex)走 {@link appendServerAuthoredMessageForRequest} 按 `request_id` 排空,
+ *     其 pending 行 `parent_session_id` 恒 NULL → 本函数的 WHERE 过滤不到,不会被二次计。
+ *   - 队长自费(ccb)走 {@link appendServerAuthoredMessageDrainByUser} 按 `session_id`(引擎会话)
+ *     排空,其 pending 行 `parent_session_id` 亦恒 NULL → 同样过滤不到。
+ *   - 委派成本 park 时只写 `parent_session_id`(引擎会话 `session_id` 是委派子进程自己的、
+ *     无人以它为 key drain)→ **只有本函数**会排空它。每行至多被一条机制排空一次。
+ *
+ * 语义要点:
+ *   - **累加不替换**:读取当前 blob(可能已含队长自费 costCredits),base + Σdelegate 后回写。
+ *   - **无委派成本 → 零副作用**:Σ=0 时不写库、不 bump `_seq`(避免每个普通 turn 白 bump)。
+ *   - **目标行缺位保守**:session 不存在 / 找不到 msgId(尚未 sink / 被删)→ **不删 pending**,
+ *     留给下一 turn 的队长行 drain 命中(与既有 pending "还没找到目标" 语义一致)。
+ *   - **只删本次读到的行**:并发新 park(SELECT 之后到达)不在列表里,留给下一轮。
+ *   - **size guard**:超 MAX_SESSION_BYTES 拒绝 in-place 增长(同 appendCostCredits 口径),
+ *     成本这轮丢展示但 pending 保留 → 下一轮或 admin 修 blob 后仍可归并。
+ *
+ * 幂等:pending 行排空即删,sink POST 重放(already_exists)时二次调用只会命中"新到的"
+ * 委派 pending(若有),已排空的不会重复累加。
+ */
+export async function drainDelegateCostForClientSession(
+  clientSessionId: string,
+  userId: string,
+  msgId: string,
+): Promise<DrainDelegateCostResult> {
+  const db = await getSessionsDb()
+  const txn = db.transaction((): DrainDelegateCostResult => {
+    const pendings = db.prepare(
+      'SELECT request_id, cost_credits FROM pending_usage_patches WHERE user_id = ? AND parent_session_id = ?'
+    ).all(userId, clientSessionId) as { request_id: string; cost_credits: string }[]
+    if (pendings.length === 0) return { merged: '0', drained: 0 }
+
+    let sum = 0n
+    for (const p of pendings) {
+      try { const v = BigInt(p.cost_credits); if (v > 0n) sum += v } catch { /* skip malformed */ }
+    }
+    if (sum <= 0n) {
+      // 只有非正/畸形成本 → 清掉这些行(无归并价值),不写库、不 bump _seq。
+      const del = db.prepare('DELETE FROM pending_usage_patches WHERE user_id = ? AND request_id = ?')
+      for (const p of pendings) del.run(userId, p.request_id)
+      return { merged: '0', drained: pendings.length }
+    }
+
+    const sess = db.prepare(
+      'SELECT messages, next_seq FROM client_sessions WHERE id = ? AND user_id = ? AND deleted_at IS NULL'
+    ).get(clientSessionId, userId) as { messages: string; next_seq: number | null } | undefined
+    // 目标会话缺位(尚未 sink / 已删)→ 保守:保留 pending,下一 turn 再试。
+    if (!sess) return { merged: '0', drained: 0 }
+
+    let msgs: MessageLike[]
+    try {
+      const parsed = JSON.parse(sess.messages)
+      msgs = Array.isArray(parsed) ? (parsed as MessageLike[]) : []
+    } catch {
+      msgs = []
+    }
+    const idx = msgs.findIndex((m) => m && m.id === msgId && m._source === 'server')
+    // 找不到队长助手行(未落库 / 被删)→ 保守保留 pending,下一 turn 再归并。
+    if (idx < 0) return { merged: '0', drained: 0 }
+
+    const existing = msgs[idx] as MessageLike & { usage?: Record<string, unknown> }
+    let base = 0n
+    try { base = BigInt((existing.usage?.costCredits as string) ?? '0') } catch { base = 0n }
+    const nextCost = (base + sum).toString()
+    const currentNextSeq = typeof sess.next_seq === 'number' && sess.next_seq > 0 ? sess.next_seq : 1
+    const patched: MessageLike = {
+      ...existing,
+      _seq: currentNextSeq,
+      usage: { ...(existing.usage ?? {}), costCredits: nextCost },
+    }
+    const next: MessageLike[] = [...msgs]
+    next[idx] = patched
+    const nextJson = JSON.stringify(next)
+    // 超限拒绝(同 appendCostCredits):保留 pending,不写库(下一轮/修 blob 后仍可归并)。
+    if (Buffer.byteLength(nextJson, 'utf8') > MAX_SESSION_BYTES) {
+      return { merged: '0', drained: 0 }
+    }
+    const nowMs = Date.now()
+    db.prepare(
+      'UPDATE client_sessions SET messages = ?, last_at = ?, updated_at = ?, next_seq = next_seq + 1 WHERE id = ? AND user_id = ?'
+    ).run(nextJson, nowMs, nowMs, clientSessionId, userId)
+
+    // 只删本次读到的行——并发新 park 不在列表里,留给下一轮。
+    const del = db.prepare('DELETE FROM pending_usage_patches WHERE user_id = ? AND request_id = ?')
+    for (const p of pendings) del.run(userId, p.request_id)
+    return { merged: sum.toString(), drained: pendings.length }
   })
   return txn()
 }

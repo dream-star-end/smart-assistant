@@ -402,6 +402,14 @@ export interface ServerAuthoredStorage {
     | { applied: true }
     | { applied: false; reason: "session_not_found" | "session_deleted" | "already_exists" | "malformed" | "oversized" }
   >;
+  /** Fix A durable — 队长助手行落库后,把该 user 下 `parent_session_id = clientSessionId`
+   *  的委派 pending 成本求和累加进该行(msgId)的 usage.costCredits。无委派成本 → 零副作用。
+   *  与 requestId / by-agent-session drain 池 disjoint(委派行 session_id 池不相交),不重复计费。 */
+  drainDelegateCostForClientSession(
+    clientSessionId: string,
+    userId: string,
+    msgId: string,
+  ): Promise<{ merged: string; drained: number }>;
 }
 
 export interface ServerAuthoredHandlerDeps {
@@ -1127,6 +1135,48 @@ export function makeServerAuthoredHandler(
         requestId,
       );
       return;
+    }
+
+    // ── Fix A durable — 委派成本按父客户端会话归并(两条 sink 路径的统一收口)──
+    //
+    // 队长助手行落库后(requestId 路径 appendServerAuthoredMessageForRequest / drain-by-user
+    // 路径 appendServerAuthoredMessageDrainByUser 都在此汇合),把该 user 下
+    // parent_session_id = body.sessionId(父**客户端**会话 web-*,= 委派 pending park 时记录的
+    // oc_parent_session_id 解析值)的委派 pending 成本**求和累加**进这条队长助手行
+    // (lastAssistant.id)的 usage.costCredits。
+    //
+    // 触发条件 = applied || already_exists(行已存在、可 patch);无委派成本 → 零副作用
+    // (drainDelegateCostForClientSession 内部 Σ=0 时不写库、不 bump _seq,普通 turn 不受影响)。
+    //
+    // **不重复计费**:委派 pending 行 parent_session_id 非空 / session_id 是委派子进程自己的引擎
+    // 会话;队长自费走 requestId(其 pending parent_session_id=NULL)或 by-agent-session(WHERE
+    // session_id=队长引擎会话)排空 —— 两池 disjoint,本 drain 只命中委派行,不碰队长自费行。
+    //
+    // best-effort:失败仅 log,不改 HTTP 结论(assistantResult 已定);pending 未排空的由下一
+    // turn 队长行 drain 或 GC sweep 兜底。晚到的委派 pending(本轮 sink 之后到达)不在本次 SELECT
+    // 里,留给下一 turn 归并(与既有 pending 语义一致)。
+    if (assistantResult.applied || assistantResult.reason === "already_exists") {
+      try {
+        const drained = await deps.storage.drainDelegateCostForClientSession(
+          body.sessionId,
+          userId,
+          lastAssistant.id,
+        );
+        if (drained.drained > 0) {
+          userLog.info("delegate_cost_merged", {
+            sessionId: body.sessionId,
+            msgId: lastAssistant.id,
+            merged: drained.merged,
+            drainedRows: drained.drained,
+          });
+        }
+      } catch (err) {
+        userLog.warn("delegate_cost_drain_failed", {
+          sessionId: body.sessionId,
+          msgId: lastAssistant.id,
+          err: err as Error,
+        });
+      }
     }
 
     if (assistantResult.applied) {

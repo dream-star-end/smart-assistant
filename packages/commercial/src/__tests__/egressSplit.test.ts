@@ -138,6 +138,37 @@ describe("internalCostEvent — 秘钥闸", () => {
     assert.equal(r.status, 200);
     assert.deepEqual(applied, ["persist:r1", "broadcast"]);
   });
+
+  test("persist 事件 parentSessionId 经 egress→master 透传给 appendCostCredits(Fix A durable hop)", async () => {
+    const seen: Array<{ sessionId?: string | null; parentSessionId?: string | null }> = [];
+    const h = makeCostEventHandler({
+      secret: "super-secret-egress-key",
+      appendCostCredits: async (
+        _rid: string,
+        _uid: string,
+        _cents: string,
+        sessionId?: string | null,
+        parentSessionId?: string | null,
+      ) => {
+        seen.push({ sessionId, parentSessionId });
+      },
+      broadcastToUser: () => {},
+    });
+    const r = await invokeHandler(h, {
+      headers: { [EGRESS_SECRET_HEADER]: "super-secret-egress-key" },
+      body: {
+        events: [
+          // 委派 persist:带 parent_session_id;缺 parentSessionId 的老事件解析成 null。
+          { kind: "persist", requestId: "rd", uid: "7", costCredits: "5", sessionId: "eng-d", parentSessionId: "web-parent-01" },
+          { kind: "persist", requestId: "rc", uid: "7", costCredits: "9", sessionId: "eng-leader" },
+        ],
+      },
+    });
+    assert.equal(r.status, 200);
+    assert.equal(seen.length, 2);
+    assert.deepEqual(seen[0], { sessionId: "eng-d", parentSessionId: "web-parent-01" }, "委派事件透传 parentSessionId");
+    assert.deepEqual(seen[1], { sessionId: "eng-leader", parentSessionId: null }, "无 parentSessionId → null(不丢字段)");
+  });
 });
 
 // ─── forwarder deny-list ────────────────────────────────────────────────────

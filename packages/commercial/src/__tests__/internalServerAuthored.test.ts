@@ -113,6 +113,10 @@ function fakeStorage(impl: ServerAuthoredStorage["appendServerAuthoredMessage"])
       if (r.applied) return { applied: true };
       return { applied: false, reason: r.reason ?? "malformed" };
     },
+    // 委派成本归并 by storage 单测覆盖;handler 路由测试用 no-op 桩(无委派成本语义)。
+    async drainDelegateCostForClientSession() {
+      return { merged: "0", drained: 0 };
+    },
   };
 }
 
@@ -636,11 +640,13 @@ describe("internalServerAuthored handler — requestId dispatch (cost-late-patch
     plainCalls: Array<{ sessId: string; userId: string; msgId: string; role: string }>;
     forRequestCalls: Array<{ requestId: string; sessId: string; userId: string; msgId: string; role: string }>;
     drainByUserCalls: Array<{ sessId: string; userId: string; msgId: string; role: string; agentSessionId?: string | null }>;
+    delegateDrainCalls: Array<{ clientSessionId: string; userId: string; msgId: string }>;
     storage: ServerAuthoredStorage;
   } {
     const plainCalls: Array<{ sessId: string; userId: string; msgId: string; role: string }> = [];
     const forRequestCalls: Array<{ requestId: string; sessId: string; userId: string; msgId: string; role: string }> = [];
     const drainByUserCalls: Array<{ sessId: string; userId: string; msgId: string; role: string; agentSessionId?: string | null }> = [];
+    const delegateDrainCalls: Array<{ clientSessionId: string; userId: string; msgId: string }> = [];
     const storage: ServerAuthoredStorage = {
       async appendServerAuthoredMessage(sessId, userId, msg) {
         plainCalls.push({ sessId, userId, msgId: msg.id, role: msg.role });
@@ -654,8 +660,12 @@ describe("internalServerAuthored handler — requestId dispatch (cost-late-patch
         drainByUserCalls.push({ sessId, userId, msgId: msg.id, role: msg.role, agentSessionId });
         return { applied: true };
       },
+      async drainDelegateCostForClientSession(clientSessionId, userId, msgId) {
+        delegateDrainCalls.push({ clientSessionId, userId, msgId });
+        return { merged: "0", drained: 0 };
+      },
     };
-    return { plainCalls, forRequestCalls, drainByUserCalls, storage };
+    return { plainCalls, forRequestCalls, drainByUserCalls, delegateDrainCalls, storage };
   }
 
   test("assistant text + requestId → routes to appendServerAuthoredMessageForRequest", async () => {
@@ -779,6 +789,69 @@ describe("internalServerAuthored handler — requestId dispatch (cost-late-patch
     assert.deepEqual(spy.drainByUserCalls.map((c) => c.role).sort(), ["assistant"]);
   });
 
+  // ── Fix A durable — 两条 sink 路径落库后都触发 client-session 委派 drain ──
+  //
+  // 委派成本按父客户端会话(= body.sessionId)归并进队长助手行。requestId 路径(codex)与
+  // drain-by-user 路径(ccb)都必须触发这一步——统一收口,别只加一条留另一条死。drain key =
+  // (body.sessionId 客户端会话, lastAssistant.id 队长行)。
+
+  test("requestId(codex) 路径落库后触发 drainDelegateCostForClientSession(body.sessionId, msgId)", async () => {
+    const spy = spyStorage();
+    const h = makeServerAuthoredHandler({
+      identityRepo: makeRepoFor(VALID_TOKEN, VALID_HOST, VALID_IP),
+      storage: spy.storage,
+    });
+    const { res, rec } = makeRes();
+    await h(
+      authed(JSON.stringify({
+        sessionId: "sess12345",
+        agentId: "main",
+        turnIndex: 3,
+        status: "completed",
+        text: "队长综合回答",
+        requestId: "req-leader-codex",
+      })),
+      res,
+      CTX,
+    );
+    assert.equal(rec.status, 200);
+    assert.equal(spy.forRequestCalls.length, 1, "codex 走 ForRequest");
+    // 委派 drain 触发一次,key = (客户端会话 body.sessionId, 队长助手行 id)。
+    assert.equal(spy.delegateDrainCalls.length, 1);
+    assert.equal(spy.delegateDrainCalls[0].clientSessionId, "sess12345", "按父客户端会话(body.sessionId)");
+    assert.equal(spy.delegateDrainCalls[0].userId, "c:42");
+    assert.equal(spy.delegateDrainCalls[0].msgId, "srv-sess12345-main-t3", "归并进队长助手行(lastAssistant.id)");
+  });
+
+  test("drain-by-user(ccb) 路径落库后同样触发 drainDelegateCostForClientSession", async () => {
+    const spy = spyStorage();
+    const h = makeServerAuthoredHandler({
+      identityRepo: makeRepoFor(VALID_TOKEN, VALID_HOST, VALID_IP),
+      storage: spy.storage,
+    });
+    const { res, rec } = makeRes();
+    await h(
+      authed(JSON.stringify({
+        sessionId: "sess12345",
+        agentId: "main",
+        turnIndex: 4,
+        status: "completed",
+        text: "队长回答",
+        agentSessionId: "engine-leader-uuid",
+        // requestId 缺省 → ccb drain-by-user 路径
+      })),
+      res,
+      CTX,
+    );
+    assert.equal(rec.status, 200);
+    assert.equal(spy.forRequestCalls.length, 0);
+    assert.equal(spy.drainByUserCalls.length, 1, "ccb 走 drainByUser");
+    // 两条路径统一收口:委派 drain 同样触发一次。
+    assert.equal(spy.delegateDrainCalls.length, 1);
+    assert.equal(spy.delegateDrainCalls[0].clientSessionId, "sess12345");
+    assert.equal(spy.delegateDrainCalls[0].msgId, "srv-sess12345-main-t4");
+  });
+
   // 2026-06-18 — per-turn traceId 透传:gateway 把 master canonical traceId 折进
   // usage.traceId,master schema(.strict() usage)必须接受并原样传给 storage,
   // 最终落 messages[i].usage.traceId 供前端"请求ID"芯片 + 刷新后反查日志。
@@ -795,6 +868,9 @@ describe("internalServerAuthored handler — requestId dispatch (cost-late-patch
       async appendServerAuthoredMessageDrainByUser(_sessId, _userId, msg) {
         capturedUsage = (msg as { usage?: unknown }).usage;
         return { applied: true };
+      },
+      async drainDelegateCostForClientSession() {
+        return { merged: "0", drained: 0 };
       },
     };
     const h = makeServerAuthoredHandler({
@@ -1148,6 +1224,9 @@ describe("internalServerAuthored handler — thinking durability", () => {
           const r = await this.appendServerAuthoredMessage(sessId, userId, msg);
           if (r.applied) return { applied: true };
           return { applied: false, reason: r.reason ?? "malformed" };
+        },
+        async drainDelegateCostForClientSession() {
+          return { merged: "0", drained: 0 };
         },
       },
     };
@@ -1538,6 +1617,9 @@ describe("internalServerAuthored handler — tool durability", () => {
           const r = await this.appendServerAuthoredMessage(sessId, userId, msg);
           if (r.applied) return { applied: true };
           return { applied: false, reason: r.reason ?? "malformed" };
+        },
+        async drainDelegateCostForClientSession() {
+          return { merged: "0", drained: 0 };
         },
       },
     };

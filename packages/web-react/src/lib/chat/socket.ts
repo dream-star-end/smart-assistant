@@ -916,10 +916,16 @@ export class ChatSocket {
       }
       case "outbound.cost_charged": {
         const frame = f as CostChargedWire;
-        // frame.sessionId 是 agent 内部会话 UUID(LLM metadata 口径),与前端 client peer 会话键
-        // 失配,直接 get 必空。优先按 sessionId(若将来口径对齐),否则路由到在飞/刚收尾 turn 的会话。
+        // 路由优先级(Fix B):
+        //   1. frame.parentSessionId(委派成本的父**客户端**会话 web-*,= sess.id)→ 精确命中
+        //      父会话,消 costTargetSession 60s 启发式在多会话并发下的误算/丢弃。
+        //   2. frame.sessionId(agent 内部引擎会话 UUID,与 client peer 键失配)→ 历史字段,
+        //      直接 get 今天恒空,保留以防将来口径对齐。
+        //   3. costTargetSession() → 普通 chat(无 parentSessionId)的既有启发式回落。
         const sess =
-          (frame.sessionId ? this.sessions.get(frame.sessionId) : undefined) ?? this.costTargetSession();
+          (frame.parentSessionId ? this.sessions.get(frame.parentSessionId) : undefined) ??
+          (frame.sessionId ? this.sessions.get(frame.sessionId) : undefined) ??
+          this.costTargetSession();
         applyCostCharged(sess, frame, this.effects());
         return;
       }
@@ -1003,8 +1009,11 @@ export class ChatSocket {
    * "活跃"区分 cost 属于谁,盲猜会把 A 的 cost 算到 B。故只在**候选唯一**时归因;0 个或 ≥2 个
    * 候选 → 返回 null(applyCostCharged 仅刷余额、不误挂任何消息)。候选 = streaming/sending
    * 或 60s 内刚收尾的会话。单会话(canary/绝大多数实际)恒唯一,正常归因。
-   * TODO 后端 cost_charged 带的 requestId(=usage.traceId 口径)→ 可精确按 traceId 匹配消息,
-   *      届时替换此启发式即可支持并发归因。
+   *
+   * 本函数只是**回落**路径:委派成本 cost_charged 已带 parentSessionId(父客户端会话),
+   * caller 先按它精确路由(见 outbound.cost_charged 分支),命中就不进这里;并发多会话下的
+   * 委派归因由此消除脆弱性。普通(非委派)chat 无 parentSessionId,仍走本启发式 —— 那是
+   * boss 明确保留的 latent gap(durable 在刷新后兜底,见 §计费)。
    */
   private costTargetSession(): ChatSession | null {
     const now = Date.now();
