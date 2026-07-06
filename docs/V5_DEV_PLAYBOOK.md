@@ -134,7 +134,7 @@ ssh kl-mirror 'curl -fsS http://127.0.0.1:18789/healthz'   # v3 应始终不受�
 - full 合并 `mergeFullServerWins`:server 权威在前,保留尾部乐观段 + 中段 local-only user 行 + 中段 local-only 团队卡;
 - 同 id"server tool 行 vs 本地已转 agent-group 富卡"→ 富卡为底回填完成态;
 - `syncSession`(resume_failed reconcile)走 applyServerMessages 同一收口,**禁止整段替换**。
-- 已知残留:跨设备/清缓存团队历史必丢(根治=团队卡 server-authored 化,见 roadmap P2)。
+- ~~跨设备/清缓存团队历史必丢~~ **已根治**(P2 批次2):handleDelegateTask 收尾产出 server-authored agent-group 骨架行(runId 去重 local-wins),跨设备可见团队结构+终态+成本;过程 childBlocks 树仍仅本设备 IndexedDB(有意取舍)。
 
 ### 3.4 计费问题
 usage_records + journal 双查;零输出免单/turn 级 idle 免单已内建;codex 跨桥重连计费走 journal 权威。造数验证用 psql 必须显式 COMMIT。
