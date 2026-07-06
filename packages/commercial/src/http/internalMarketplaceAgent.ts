@@ -43,6 +43,7 @@ import {
   marketplaceAgentsEnabled,
   publishSkillVersion,
   recordUninstall,
+  resolveCallerOrgId,
 } from '../marketplace/marketplaceDb.js'
 import { listMarketBrowseCatalog } from '../marketplace/platformPresets.js'
 import { scanSkillArtifact } from '../marketplace/skillScanner.js'
@@ -154,6 +155,9 @@ export function makeMarketplaceAgentHandler(deps: MarketplaceAgentDeps): Marketp
     const op = url.pathname.slice(MARKETPLACE_AGENT_PREFIX.length).replace(/\/+$/, '')
 
     try {
+      // org 可见性收口:容器 AI 市场操作与容器所属用户同口径可见 org-private 技能
+      // (公开 ∪ 本 org 私有)。无 org 归属 → 仅公开(null 天然 fail-closed)。
+      const callerOrgId = await resolveCallerOrgId(userId)
       // ── read-only ──
       if (req.method === 'GET' && op === 'search') {
         const kindParam = url.searchParams.get('kind')
@@ -173,7 +177,8 @@ export function makeMarketplaceAgentHandler(deps: MarketplaceAgentDeps): Marketp
           50,
         )
         // 平台预设 agent 不在市场搜索里露出(与浏览器 /api/marketplace/search 同一权威)。
-        const catalog = await listMarketBrowseCatalog(kind)
+        // callerOrgId 收口 org 可见性:org-private 技能只对本 org 成员搜出。
+        const catalog = await listMarketBrowseCatalog(kind, callerOrgId)
         const filtered = q
           ? catalog.filter(
               (c) =>
@@ -203,7 +208,8 @@ export function makeMarketplaceAgentHandler(deps: MarketplaceAgentDeps): Marketp
       if (req.method === 'GET' && op === 'detail') {
         const slug = url.searchParams.get('slug') ?? ''
         if (!SLUG_RE.test(slug)) return send(res, 400, { error: { code: 'BAD_SLUG' } }, requestId)
-        const detail = await getListingDetail(slug)
+        // org 可见性收口:org-private listing 对非本 org 容器视同不存在(404)。
+        const detail = await getListingDetail(slug, callerOrgId)
         // agent 类仅 v5 露出:v3 渠道视同不存在(防 slug→detail→versionId 旁路装坏 agent)。
         if (!detail || (detail.kind === 'agent' && !marketplaceAgentsEnabled()))
           return send(
@@ -226,7 +232,8 @@ export function makeMarketplaceAgentHandler(deps: MarketplaceAgentDeps): Marketp
         const slug = asStr(body.slug, 64)
         if (!slug || !SLUG_RE.test(slug))
           return send(res, 400, { error: { code: 'BAD_SLUG' } }, requestId)
-        const detail = await getListingDetail(slug)
+        // org 可见性收口:org-private 技能仅本 org 容器可见/可装(非成员 → detail null → 404)。
+        const detail = await getListingDetail(slug, callerOrgId)
         if (!detail)
           return send(
             res,
@@ -237,6 +244,7 @@ export function makeMarketplaceAgentHandler(deps: MarketplaceAgentDeps): Marketp
         const v = await installApprovedVersion({
           userId,
           versionId: detail.versionId,
+          callerOrgId,
           scopeMode: 'preserve',
         })
         let installedDeps = 0
@@ -247,12 +255,13 @@ export function makeMarketplaceAgentHandler(deps: MarketplaceAgentDeps): Marketp
               ) as string[])
             : []
           if (depSlugs.length > 0) {
-            const versions = await getApprovedSkillVersions(depSlugs)
+            const versions = await getApprovedSkillVersions(depSlugs, callerOrgId)
             for (const depVid of versions.values()) {
               try {
                 await installApprovedVersion({
                   userId,
                   versionId: depVid,
+                  callerOrgId,
                   agentIds: [v.slug],
                   scopeMode: 'merge',
                 })
@@ -280,7 +289,7 @@ export function makeMarketplaceAgentHandler(deps: MarketplaceAgentDeps): Marketp
         return
       }
       if (req.method === 'POST' && op === 'publish') {
-        await handlePublish(req, res, requestId, userId, deps)
+        await handlePublish(req, res, requestId, userId, callerOrgId, deps)
         return
       }
 
@@ -321,6 +330,7 @@ async function handlePublish(
   res: ServerResponse,
   requestId: string,
   userId: number,
+  callerOrgId: string | null,
   deps: MarketplaceAgentDeps,
 ): Promise<void> {
   const body = await readBody(req)
@@ -328,6 +338,15 @@ async function handlePublish(
   const slug = asStr(body.slug, 64)
   if (!slug || !SLUG_RE.test(slug))
     return send(res, 400, { error: { code: 'BAD_SLUG' } }, requestId)
+  // 可见范围(企业版 P3.1):visibility='org' 要求容器用户是 org active 成员 → listing.org_id=其 org。
+  const orgId = body.visibility === 'org' ? callerOrgId : null
+  if (body.visibility === 'org' && !orgId)
+    return send(
+      res,
+      403,
+      { error: { code: 'NOT_ORG_MEMBER', message: '仅组织成员可发布「仅本组织」可见的技能' } },
+      requestId,
+    )
   const version = asStr(body.version, 16)
   if (!version || !VERSION_RE.test(version))
     return send(res, 400, { error: { code: 'BAD_VERSION' } }, requestId)
@@ -378,6 +397,7 @@ async function handlePublish(
       policyVersion: scan.policyVersion,
       submittedBy: userId,
       kind: 'skill',
+      orgId,
     })
     send(
       res,
@@ -431,7 +451,7 @@ async function handlePublish(
       requestId,
     )
   if (manifest.skillDeps.length > 0) {
-    const found = await getApprovedSkillVersions(manifest.skillDeps)
+    const found = await getApprovedSkillVersions(manifest.skillDeps, orgId)
     const missing = manifest.skillDeps.filter((s) => !found.has(s))
     if (missing.length > 0)
       return send(
@@ -462,6 +482,7 @@ async function handlePublish(
     riskFlags: scan.flags,
     policyVersion: scan.policyVersion,
     submittedBy: userId,
+    orgId,
   })
   send(
     res,

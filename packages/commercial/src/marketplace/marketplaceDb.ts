@@ -1,4 +1,5 @@
 import { query, tx, type QueryRunner } from '../db/queries.js'
+import { getActiveMembership } from '../org/memberships.js'
 /**
  * Postgres data layer for the station-internal skill marketplace (migration 0087).
  *
@@ -39,9 +40,9 @@ export class MarketplaceError extends Error {
 export type InstallScopeMode = 'preserve' | 'replace' | 'merge'
 
 const VALID_AGENT_SCOPE_ID_RE = /^[A-Za-z0-9_-]+$/
-const DEFAULT_INSTALL_AGENT_IDS = ['main']
+export const DEFAULT_INSTALL_AGENT_IDS = ['main']
 
-function normalizeInstallAgentIds(
+export function normalizeInstallAgentIds(
   input: unknown,
   fallback: readonly string[] = DEFAULT_INSTALL_AGENT_IDS,
 ): string[] {
@@ -92,6 +93,41 @@ export function marketplaceAgentsEnabled(
   return channel === 'v5'
 }
 
+/**
+ * caller 的 org 归属(V1 单 org)。null = 无归属 / 只看公开目录。
+ *
+ * org 可见性 / 越权判定的**单一权威**:任何 listing 枚举/读取/安装校验都传这个值 →
+ * 走 orgVisibleFrag 谓词。它决定"我能看见/装哪些 org-private listing"。
+ */
+export type CallerOrgId = string | null
+
+/**
+ * org listing 可见性谓词片段(单一收口):listing 别名 alias 的行对 caller 可见 iff
+ * 公开(org_id IS NULL)或属于 caller 的 org($idx)。
+ *
+ * callerOrgId 传 null 时,`alias.org_id = NULL::bigint` 对任何行都为 UNKNOWN(≠true),
+ * 故整个谓词退化为"仅公开"——无需分支 SQL,null 天然 fail-closed(只见公开)。
+ * 这正是防泄露 oracle 所需:无 org 归属者永远看不到、也搜不出任何 org-private listing。
+ */
+function orgVisibleFrag(alias: string, idx: number): string {
+  return `(${alias}.org_id IS NULL OR ${alias}.org_id = $${idx}::bigint)`
+}
+
+/**
+ * 从 uid 解析 caller 的 active org id(复用批次 A 的 getActiveMembership,不重写成员 SQL)。
+ * marketplaceRoutes / internalMarketplaceAgent 现有 handler 都 requireAuth 拿 uid,
+ * 需要 org 可见性时调本函数。无 active 归属 → null(只见公开)。
+ *
+ * 注:这里按成员 active 归属解析(getActiveMembership 语义),不额外判 org.status;org
+ * 停用的强制点在 /api/org/*(requireOrgRole 403)与 sync 的 org 分支(见
+ * listActiveInstalledArtifacts 内 JOIN orgs status='active')。停用 org 成员仍能浏览/个人
+ * 安装本 org 私有技能属良性边界(是本 org 自己的内容),不构成跨 org 泄露。
+ */
+export async function resolveCallerOrgId(userId: string | number): Promise<CallerOrgId> {
+  const m = await getActiveMembership(String(userId))
+  return m?.org_id ?? null
+}
+
 export interface PublishInput {
   slug: string
   ownerUserId: number
@@ -112,6 +148,13 @@ export interface PublishInput {
   submittedBy: number
   /** Artifact kind; the listing is owner- AND kind-locked. Defaults to 'skill'. */
   kind?: ArtifactKind
+  /**
+   * 可见范围(企业版 P3.1):null/缺省 = 公开;非空 = 仅该 org 成员可见/可装(listing.org_id)。
+   * 仅在**首次创建 listing** 时落库(org_id 与 owner/kind 同为 listing 级不可变属性,
+   * 后续新版本不改可见性——ON CONFLICT DO NOTHING 保留原 org_id)。路由层保证:传非空时
+   * 发布者必须是该 org 的 active 成员。
+   */
+  orgId?: string | null
   /** SKILL.md 之外的附属文本文件(references/assets/evals;已过 bundle 校验)。 */
   rawBundle?: Record<string, string> | null
   /** 发布者自报评测摘要(展示须标注"发布者提供",非平台背书)。 */
@@ -134,9 +177,11 @@ export async function publishSkillVersion(input: PublishInput): Promise<{ versio
     throw new MarketplaceError('VERSION_NOT_FOUND', 'missing artifact content')
   return tx(async (c) => {
     await query(
-      `INSERT INTO marketplace_skill_listings (slug, owner_user_id, kind)
-            VALUES ($1, $2, $3) ON CONFLICT (slug) DO NOTHING`,
-      [input.slug, input.ownerUserId, kind],
+      // org_id 仅在首次创建 listing 时落(ON CONFLICT DO NOTHING → 已存在的 listing 保留
+      // 其原 org_id,可见性不因新版本发布而变;与 owner/kind 同为 listing 级不可变属性)。
+      `INSERT INTO marketplace_skill_listings (slug, owner_user_id, kind, org_id)
+            VALUES ($1, $2, $3, $4::bigint) ON CONFLICT (slug) DO NOTHING`,
+      [input.slug, input.ownerUserId, kind, input.orgId ?? null],
       c,
     )
     const listing = await query<{ owner_user_id: string; state: string; kind: string }>(
@@ -685,7 +730,10 @@ export interface ApprovedSearchRow {
 // 的偿还触发条件,不是调大数字。
 const SEARCH_CATALOG_CAP = 500
 
-export async function listApprovedForSearch(kind?: ArtifactKind): Promise<ApprovedSearchRow[]> {
+export async function listApprovedForSearch(
+  kind?: ArtifactKind,
+  callerOrgId: CallerOrgId = null,
+): Promise<ApprovedSearchRow[]> {
   const r = await query<{
     id: string
     slug: string
@@ -699,6 +747,7 @@ export async function listApprovedForSearch(kind?: ArtifactKind): Promise<Approv
   }>(
     // install_count 走一次性聚合 JOIN(而非逐行 correlated 子查询):目录上限 500 行,
     // 逐行子查询会对共享的 v3 search 端点放大 500 次 installs 扫描。
+    // org 可见性收口:org-private listing 仅本 org 成员可搜出(callerOrgId=null → 仅公开)。
     `SELECT v.id::text, v.slug, l.kind, v.name, v.description, v.tags, v.embedding_hash,
             v.benchmark, ic.n::text AS install_count
        FROM marketplace_skill_listings l
@@ -707,9 +756,10 @@ export async function listApprovedForSearch(kind?: ArtifactKind): Promise<Approv
                    WHERE uninstalled_at IS NULL GROUP BY slug) ic ON ic.slug = l.slug
       WHERE l.state = 'active' AND v.status = 'approved'
             AND ($1::text IS NULL OR l.kind = $1)
+            AND ${orgVisibleFrag('l', 2)}
       ORDER BY v.id DESC
       LIMIT ${SEARCH_CATALOG_CAP + 1}`,
-    [kind ?? null],
+    [kind ?? null, callerOrgId],
   )
   if (r.rows.length > SEARCH_CATALOG_CAP) {
     // eslint-disable-next-line no-console
@@ -758,8 +808,17 @@ export interface ListingDetail {
   benchmark: { withPassRate: number; withoutPassRate: number; cases: number } | null
 }
 
-/** Public detail for an active listing's current approved version (incl. the full artifact for the confirm dialog). */
-export async function getListingDetail(slug: string): Promise<ListingDetail | null> {
+/**
+ * Public detail for an active listing's current approved version (incl. the full artifact for the confirm dialog).
+ *
+ * org 可见性收口:org-private listing 对非本 org caller **返回 null**(路由层据此 404,
+ * 不是 403——对齐既有 hidden/pending listing 的处理语义,不泄露存在性 oracle)。
+ * callerOrgId=null → 仅公开 listing。
+ */
+export async function getListingDetail(
+  slug: string,
+  callerOrgId: CallerOrgId = null,
+): Promise<ListingDetail | null> {
   const r = await query<{
     slug: string
     kind: string
@@ -786,8 +845,9 @@ export async function getListingDetail(slug: string): Promise<ListingDetail | nu
               WHERE i.slug = l.slug AND i.uninstalled_at IS NULL)::text AS install_count
        FROM marketplace_skill_listings l
        JOIN marketplace_skill_versions v ON v.id = l.current_approved_version_id
-      WHERE l.slug = $1 AND l.state = 'active' AND v.status = 'approved'`,
-    [slug],
+      WHERE l.slug = $1 AND l.state = 'active' AND v.status = 'approved'
+            AND ${orgVisibleFrag('l', 2)}`,
+    [slug, callerOrgId],
   )
   const x = r.rows[0]
   if (!x) return null
@@ -830,7 +890,10 @@ export async function installApprovedVersion(args: {
   versionId: string
   agentIds?: string[]
   scopeMode?: InstallScopeMode
+  /** org 可见性收口:org-private 版本仅本 org 成员可装(null=仅公开)。不可见 → NOT_INSTALLABLE(404)。 */
+  callerOrgId?: CallerOrgId
 }): Promise<{ slug: string; version: string; name: string }> {
+  const callerOrgId = args.callerOrgId ?? null
   return tx(async (c) => {
     const v = await query<{
       slug: string
@@ -841,13 +904,16 @@ export async function installApprovedVersion(args: {
     }>(
       // Kind-agnostic delivery (skill→hub/skills, agent→agents.yaml), but the
       // install row carries the listing kind so we can channel-gate agents below.
+      // org 可见性谓词与 approved/active/current 的 TOCTOU 再校验同事务、同 FOR UPDATE OF l:
+      // 越权(org-private 且非本 org)→ 行不匹配 → NOT_INSTALLABLE(404,不泄露存在性)。
       `SELECT v.slug, v.version, v.name, v.artifact_hash, l.kind
          FROM marketplace_skill_versions v
          JOIN marketplace_skill_listings l ON l.slug = v.slug
         WHERE v.id = $1 AND v.status = 'approved' AND l.state = 'active'
               AND l.current_approved_version_id = v.id
+              AND ${orgVisibleFrag('l', 2)}
         FOR UPDATE OF l`,
-      [args.versionId],
+      [args.versionId, callerOrgId],
       c,
     )
     const row = v.rows[0]
@@ -911,18 +977,23 @@ export async function installApprovedVersion(args: {
   })
 }
 
-export async function getInstallableVersionTarget(versionId: string): Promise<{
+export async function getInstallableVersionTarget(
+  versionId: string,
+  callerOrgId: CallerOrgId = null,
+): Promise<{
   slug: string
   kind: ArtifactKind
   version: string
 } | null> {
   const r = await query<{ slug: string; kind: string; version: string }>(
+    // org 可见性收口:org-private 版本对非本 org caller 视同不存在(→ 路由 NOT_INSTALLABLE 404)。
     `SELECT v.slug, l.kind, v.version
        FROM marketplace_skill_versions v
        JOIN marketplace_skill_listings l ON l.slug = v.slug
       WHERE v.id = $1 AND v.status = 'approved' AND l.state = 'active'
-            AND l.current_approved_version_id = v.id`,
-    [versionId],
+            AND l.current_approved_version_id = v.id
+            AND ${orgVisibleFrag('l', 2)}`,
+    [versionId, callerOrgId],
   )
   const row = r.rows[0]
   if (!row) return null
@@ -1200,8 +1271,18 @@ export interface InstalledArtifact {
  * Hard-scoped to kind='skill' with a non-null raw_skill_md so an approved agent
  * (whose raw_skill_md is NULL) can never leak into the skill hub feed. Agent
  * delivery is a separate M3 reconcile against agents.yaml.
+ *
+ * 企业版 P3.1(方案 §5):个人 install ∪ caller **active org(且 org active)** 的
+ * org_installs。同 slug 冲突时**个人优先**(priority 0 < 1:用户自留地不被组织覆盖)。
+ * org 分支 JOIN orgs status='active' —— 成员离开(getActiveMembership 返 null → 无 org 行)
+ * 或 org 停用(JOIN 滤掉)→ 该分支自然为空 → 容器 sync 差集比对删除,无需主动清理。
+ * 个人分支不做 org 可见性过滤:个人 install 是安装时已按可见性授权的自留地,离开 org 后
+ * 仍保留(与"个人优先"一致),不构成新增泄露(内容安装时已合法取得)。
+ * org install 的 agent_ids 与个人 install 同语义,容器侧 sidecar 零改动。
  */
 export async function listActiveInstalledArtifacts(userId: number): Promise<InstalledArtifact[]> {
+  const membership = await getActiveMembership(String(userId))
+  const orgId = membership?.org_id ?? null
   const r = await query<{
     slug: string
     version: string
@@ -1210,14 +1291,32 @@ export async function listActiveInstalledArtifacts(userId: number): Promise<Inst
     agent_ids: unknown
     raw_bundle: unknown
   }>(
-    `SELECT i.slug, v.version, v.raw_skill_md, i.artifact_hash, i.agent_ids, v.raw_bundle
-       FROM marketplace_installs i
-       JOIN marketplace_skill_versions v ON v.id = i.version_id
-       JOIN marketplace_skill_listings l ON l.slug = i.slug
-      WHERE i.user_id = $1 AND i.uninstalled_at IS NULL AND l.state = 'active'
-            AND l.kind = 'skill' AND v.raw_skill_md IS NOT NULL
-            AND i.artifact_hash = v.artifact_hash`,
-    [userId],
+    `SELECT DISTINCT ON (m.slug) m.slug, m.version, m.raw_skill_md, m.artifact_hash,
+            m.agent_ids, m.raw_bundle
+       FROM (
+         -- 个人 install(priority 0 = 同 slug 优先)
+         SELECT i.slug, v.version, v.raw_skill_md, i.artifact_hash, i.agent_ids, v.raw_bundle,
+                0 AS priority
+           FROM marketplace_installs i
+           JOIN marketplace_skill_versions v ON v.id = i.version_id
+           JOIN marketplace_skill_listings l ON l.slug = i.slug
+          WHERE i.user_id = $1 AND i.uninstalled_at IS NULL AND l.state = 'active'
+                AND l.kind = 'skill' AND v.raw_skill_md IS NOT NULL
+                AND i.artifact_hash = v.artifact_hash
+         UNION ALL
+         -- org install(priority 1):仅当 caller 有 active org 且该 org active
+         SELECT oi.slug, v.version, v.raw_skill_md, oi.artifact_hash, oi.agent_ids, v.raw_bundle,
+                1 AS priority
+           FROM org_installs oi
+           JOIN orgs o ON o.id = oi.org_id AND o.status = 'active'
+           JOIN marketplace_skill_versions v ON v.id = oi.version_id
+           JOIN marketplace_skill_listings l ON l.slug = oi.slug
+          WHERE oi.org_id = $2::bigint AND oi.uninstalled_at IS NULL AND l.state = 'active'
+                AND l.kind = 'skill' AND v.raw_skill_md IS NOT NULL
+                AND oi.artifact_hash = v.artifact_hash
+       ) m
+      ORDER BY m.slug, m.priority`,
+    [userId, orgId],
   )
   return r.rows.map((x) => ({
     slug: x.slug,
@@ -1303,16 +1402,23 @@ export async function listPlatformPresetAgents(slugs: readonly string[]): Promis
  * an active, approved SKILL listing. Used to (a) validate an agent's skillDeps all
  * resolve to approved skills, and (b) auto-install them with the agent.
  */
-export async function getApprovedSkillVersions(slugs: string[]): Promise<Map<string, string>> {
+export async function getApprovedSkillVersions(
+  slugs: string[],
+  callerOrgId: CallerOrgId = null,
+): Promise<Map<string, string>> {
   const out = new Map<string, string>()
   if (slugs.length === 0) return out
   const r = await query<{ slug: string; vid: string }>(
+    // org 可见性收口:skillDep 解析(发布校验 + agent 装配时自动装依赖)只认 caller 可见的
+    // skill(公开 ∪ 本 org 私有)。org-private 依赖对非本 org caller 不解析 → 视为未上架,
+    // 与 install 层的可见性双重防护一致(不会把他 org 私有技能经依赖旁路装进容器)。
     `SELECT l.slug, l.current_approved_version_id::text AS vid
        FROM marketplace_skill_listings l
        JOIN marketplace_skill_versions v ON v.id = l.current_approved_version_id
       WHERE l.slug = ANY($1::text[]) AND l.kind = 'skill'
-            AND l.state = 'active' AND v.status = 'approved'`,
-    [slugs],
+            AND l.state = 'active' AND v.status = 'approved'
+            AND ${orgVisibleFrag('l', 2)}`,
+    [slugs, callerOrgId],
   )
   for (const row of r.rows) out.set(row.slug, row.vid)
   return out

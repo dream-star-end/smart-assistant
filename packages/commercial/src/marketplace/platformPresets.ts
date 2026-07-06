@@ -15,6 +15,7 @@ import { getResearchConfigPublic } from '../admin/researchConfig.js'
 import {
   type ApprovedSearchRow,
   type ArtifactKind,
+  type CallerOrgId,
   listApprovedForSearch,
   marketplaceAgentsEnabled,
 } from './marketplaceDb.js'
@@ -52,9 +53,15 @@ export function isPresetCandidateSlug(slug: string): boolean {
  * 注意与 `listApprovedForSearch`(=全部 approved,含预设)语义区分:后者是"上架事实"
  * (seed/install/detail 依赖它,预设本就在架),此函数是"市场对外可见目录"。
  * presetSet 仅 agent 类非空(平台预设都是 agent);skill / v3 渠道原样透传。
+ *
+ * callerOrgId(企业版 P3.1):透传给 listApprovedForSearch 做 org 可见性收口——org-private
+ * listing 只对本 org 成员出现在浏览/搜索目录。null = 仅公开(v3 及无 org 归属者)。
  */
-export async function listMarketBrowseCatalog(kind: ArtifactKind): Promise<ApprovedSearchRow[]> {
-  const rows = await listApprovedForSearch(kind)
+export async function listMarketBrowseCatalog(
+  kind: ArtifactKind,
+  callerOrgId: CallerOrgId = null,
+): Promise<ApprovedSearchRow[]> {
+  const rows = await listApprovedForSearch(kind, callerOrgId)
   if (kind !== 'agent') return rows
   const presetSet = new Set(await platformPresetAgentSlugs())
   return presetSet.size > 0 ? rows.filter((r) => !presetSet.has(r.slug)) : rows
