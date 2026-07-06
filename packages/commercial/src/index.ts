@@ -140,6 +140,10 @@ import {
   type ProviderHealthSchedulerHandle,
 } from "./admin/providerHealthScheduler.js";
 import {
+  startWecomAlertDispatcher,
+  type WecomAlertDispatcherHandle,
+} from "./admin/wecomAlertDispatcher.js";
+import {
   makeAnthropicProxyHandler,
   type AnthropicProxyHandler,
 } from "./http/anthropicProxy.js";
@@ -3331,6 +3335,26 @@ export async function registerCommercial(
     providerHealthScheduler = trackScheduler("providerHealth", "v5-owned", startProviderHealthScheduler({ intervalMs }));
   }
 
+  // 企业微信群机器人告警投递(v5-owned)。偿「v5 告警只入库不推送」债(playbook 债表
+  // af1b054f):iLink/Telegram 投递 worker 寄生 shared 域 startAlertScheduler,v5
+  // controlPlaneEnabled=false 把整个 shared scheduler 关掉 → 告警只 enqueue 不推送。
+  // 本 dispatcher 独立,直接把 admin_alert_outbox 里 channel_type='wecom_bot' 的行推企微 webhook。
+  //
+  // 【域归属 v5-owned】gate 在 runtimeChannel==='v5',**不加 controlPlaneEnabled 分支**:
+  //   - v3 跑旧代码不认 'wecom_bot'(其 shared dispatcher else 分支 markFailed,从不发)→ 无双发。
+  //   - 若 v5 也 gate 在 controlPlaneEnabled(v5 恒 false)则 v5 禁跑 + v3 不发 → wecom 告警全网真空。
+  //   仅 v5 跑,消除双跑双发。claim 显式过滤 wecom_bot(对称只认领自己能处理的类型,详见 dispatcher 头注)。
+  //   sender 走 directEgressDispatcher 直连(qyapi 国内域名)。关停:OC_WECOM_ALERT_DISABLED=1。
+  let wecomAlertDispatcher: WecomAlertDispatcherHandle | undefined;
+  if (
+    runtimeChannel === "v5" &&
+    process.env.OC_WECOM_ALERT_DISABLED !== "1"
+  ) {
+    const raw = Number(process.env.OC_WECOM_ALERT_INTERVAL_MS);
+    const intervalMs = Number.isFinite(raw) && raw >= 1000 ? raw : 5_000;
+    wecomAlertDispatcher = trackScheduler("wecomAlert", "v5-owned", startWecomAlertDispatcher({ dispatchIntervalMs: intervalMs }));
+  }
+
   // v5 灰度可观测 — runtimeStatus 暴露给 gateway /healthz,作为"控制面静默 / 运行时隔离 /
   // 灰度归属"的只读断言面(P4 可观测前移)。
   // enabledSchedulers 由归属登记表派生 —— 不再手工维护清单(此前 subscriptionRollover /
@@ -3450,6 +3474,9 @@ export async function registerCommercial(
       }
       if (providerHealthScheduler) {
         try { providerHealthScheduler.stop(); } catch { /* ignore */ }
+      }
+      if (wecomAlertDispatcher) {
+        try { await wecomAlertDispatcher.stop(); } catch { /* ignore */ }
       }
       if (baselineSrv) {
         try { await baselineSrv.stop(); } catch { /* ignore */ }

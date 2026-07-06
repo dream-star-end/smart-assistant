@@ -7405,12 +7405,13 @@ async function renderAlertsTab() {
     </div>
 
     <div class="panel">
-      <h2>告警通道 <small>微信 iLink / Telegram,只发给绑定了的超管</small></h2>
+      <h2>告警通道 <small>微信 iLink / Telegram / 企业微信群机器人,只发给绑定了的超管</small></h2>
       <div class="toolbar">
         <button class="btn" id="al-ch-refresh">刷新</button>
         <span class="spacer"></span>
         <button class="btn btn-primary" id="al-ch-bind">+ 绑定 iLink 微信</button>
         <button class="btn btn-primary" id="al-ch-tg">+ 添加 Telegram</button>
+        <button class="btn btn-primary" id="al-ch-wecom">+ 添加企业微信</button>
       </div>
       <div id="al-channels">加载中…</div>
     </div>
@@ -7473,6 +7474,7 @@ async function renderAlertsTab() {
   $('al-ch-refresh').addEventListener('click', _refreshAlertChannels)
   $('al-ch-bind').addEventListener('click', _openBindIlinkModal)
   $('al-ch-tg').addEventListener('click', _openCreateTelegramModal)
+  $('al-ch-wecom').addEventListener('click', _openCreateWecomModal)
   $('al-ob-refresh').addEventListener('click', () => {
     ALERTS_STATE.outboxFilter.event_type = $('al-ob-event').value
     ALERTS_STATE.outboxFilter.severity = $('al-ob-severity').value
@@ -7622,7 +7624,9 @@ function _renderChannelRow(c) {
     ? '<span class="badge muted">微信 iLink</span>'
     : c.channel_type === 'telegram'
       ? '<span class="badge muted">Telegram</span>'
-      : `<span class="badge muted">${escapeHtml(c.channel_type)}</span>`
+      : c.channel_type === 'wecom_bot'
+        ? '<span class="badge muted">企业微信</span>'
+        : `<span class="badge muted">${escapeHtml(c.channel_type)}</span>`
   return `
     <tr>
       <td class="mono">${escapeHtml(c.id)}</td>
@@ -7647,9 +7651,10 @@ function _renderChannelRow(c) {
 }
 
 function _activationBadge(c) {
-  // Telegram 通道没有 context_token / pending 等 iLink 专属阶段 —— 创建即 active,
-  // 只有 permanent-error (401/403/404) 会把 activation_status 推到 error。
-  if (c.channel_type === 'telegram') {
+  // Telegram / 企业微信 通道没有 context_token / pending 等 iLink 专属阶段 —— 创建即 active,
+  // 只有 permanent-error(telegram 401/403/404,wecom errcode=93000 invalid key)会把
+  // activation_status 推到 error。
+  if (c.channel_type === 'telegram' || c.channel_type === 'wecom_bot') {
     if (c.activation_status === 'active') return '<span class="badge ok">就绪</span>'
     if (c.activation_status === 'disabled') return '<span class="badge muted">disabled</span>'
     return `<span class="badge danger" title="${escapeHtml(c.last_error || '')}">${escapeHtml(c.activation_status)}</span>`
@@ -8022,6 +8027,90 @@ async function _openCreateTelegramModal() {
       try {
         const r = await apiJson('POST', '/api/admin/alerts/channels/telegram', {
           label, bot_token, chat_id, severity_min, event_types,
+        })
+        toast(`通道已创建: ${r.channel?.label ?? label}`)
+        closeModal()
+        _refreshAlertChannels()
+      } catch (e) {
+        toast(`失败: ${e.message}`, 'danger', toastOptsFromError(e))
+      }
+    })
+  })
+}
+
+async function _openCreateWecomModal() {
+  // 企业微信群机器人:群设置 → 群机器人 → 添加 → 拿到 webhook URL
+  // (https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=XXX)。
+  // 无扫码 / 无 inbound,直接填表创建;后端宽容解析(粘整条 URL 或裸 key 都行)。
+  const groups = {}
+  for (const e of (ALERTS_STATE.events || [])) {
+    groups[e.group] = groups[e.group] || []
+    groups[e.group].push(e)
+  }
+  const groupNames = Object.keys(groups)
+  const eventsHtml = groupNames.length === 0
+    ? '<div class="muted" style="font-size:12px">事件目录未加载</div>'
+    : groupNames.map((g) => `
+        <div style="margin-bottom:6px">
+          <div style="font-weight:600;font-size:12px;color:var(--muted);margin-bottom:2px">${escapeHtml(g)}</div>
+          ${groups[g].map((e) => `
+            <label style="display:inline-block;margin-right:8px;font-weight:normal;font-size:12px">
+              <input type="checkbox" data-event="${escapeHtml(e.event_type)}">
+              ${escapeHtml(e.event_type)}
+            </label>
+          `).join('')}
+        </div>
+      `).join('')
+  openModal(`
+    <h3>添加企业微信群机器人告警通道</h3>
+    <div style="color:var(--muted);font-size:12px;margin-bottom:10px;line-height:1.5">
+      步骤:<br>
+      1. 在目标企业微信群里:群设置 → 群机器人 → 添加机器人<br>
+      2. 复制机器人的 Webhook 地址(形如 <code>https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=…</code>)<br>
+      3. 整条 URL 直接粘到下面即可(也可只粘 <code>key</code> 值)
+    </div>
+    <div class="form-row">
+      <label>标签 label(必填,1..64)</label>
+      <input type="text" id="al-wc-label" maxlength="64" placeholder="例如 ops-alert-wecom" />
+    </div>
+    <div class="form-row">
+      <label>Webhook 地址 或 key(必填)</label>
+      <input type="password" id="al-wc-webhook" autocomplete="new-password" placeholder="https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=…" spellcheck="false" />
+    </div>
+    <div class="form-row">
+      <label>最低严重度</label>
+      <select id="al-wc-severity">
+        <option value="info">info</option>
+        <option value="warning" selected>warning</option>
+        <option value="critical">critical</option>
+      </select>
+    </div>
+    <div class="form-row">
+      <label>订阅事件(留空 = 全部)</label>
+      <div id="al-wc-events" style="max-height:180px;overflow:auto;border:1px solid var(--border);padding:8px;border-radius:4px">
+        ${eventsHtml}
+      </div>
+    </div>
+    <div class="form-actions">
+      <button id="al-wc-cancel">取消</button>
+      <button class="btn-primary" id="al-wc-ok">创建</button>
+    </div>
+  `)
+  $('al-wc-cancel').addEventListener('click', closeModal)
+  $('al-wc-ok').addEventListener('click', async (ev) => {
+    const label = $('al-wc-label').value.trim()
+    const webhook = $('al-wc-webhook').value.trim()
+    const severity_min = $('al-wc-severity').value
+    if (!label) { toast('label 必填', 'danger'); return }
+    if (!webhook) { toast('webhook 必填', 'danger'); return }
+    const event_types = []
+    for (const cb of $('al-wc-events').querySelectorAll('input[type=checkbox]')) {
+      if (cb.checked) event_types.push(cb.dataset.event)
+    }
+    await withBtnLoading(ev.currentTarget, async () => {
+      try {
+        const r = await apiJson('POST', '/api/admin/alerts/channels/wecom', {
+          label, webhook, severity_min, event_types,
         })
         toast(`通道已创建: ${r.channel?.label ?? label}`)
         closeModal()

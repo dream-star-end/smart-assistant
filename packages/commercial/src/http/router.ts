@@ -128,6 +128,7 @@ import {
   handleAdminAlertsAckRule,
   handleAdminAlertsCreateSilence,
   handleAdminAlertsCreateTelegramChannel,
+  handleAdminAlertsCreateWecomChannel,
   handleAdminAlertsDeleteChannel,
   handleAdminAlertsDeleteSilence,
   handleAdminAlertsIlinkPoll,
@@ -923,6 +924,11 @@ export function createCommercialHandler(
       method: 'POST',
       path: '/api/admin/alerts/channels/telegram',
       handler: handleAdminAlertsCreateTelegramChannel,
+    },
+    {
+      method: 'POST',
+      path: '/api/admin/alerts/channels/wecom',
+      handler: handleAdminAlertsCreateWecomChannel,
     },
     {
       method: 'PATCH',
