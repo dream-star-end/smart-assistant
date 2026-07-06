@@ -64,7 +64,7 @@ import { listAllHosts as defaultListAllHosts } from "../compute-pool/queries.js"
 import type { ComputeHostRow } from "../compute-pool/types.js";
 import { computeInboundNonce } from "../bridgeSecret.js";
 import { v3MayServe } from "../channelMigration/channelState.js";
-import { getRuntimeChannel, type RuntimeChannel } from "../runtimeChannel.js";
+import { dockerContainerOwnedByChannel, getRuntimeChannel, type RuntimeChannel } from "../runtimeChannel.js";
 import { rootLogger } from "../logging/logger.js";
 import { V3_AGENT_GID, V3_AGENT_UID } from "./constants.js";
 import { SupervisorError } from "./types.js";
@@ -1284,6 +1284,21 @@ function isNotModified(err: unknown): boolean {
     && (err as { statusCode: number }).statusCode === 304;
 }
 
+/**
+ * docker create "name already in use" 冲突判定。
+ *
+ * dockerode 本地路径抛 `{ statusCode: 409 }`(docker daemon "Conflict. The
+ * container name ... is already in use");远端 node-agent 路径抛
+ * `AgentAppError { httpStatus: 409 }`。两种形状统一识别 —— **只按状态码判定,
+ * 不 match 文案**(v3-multihost-404 教训:错误识别只看结构化 statusCode/httpStatus,
+ * 不靠 message 正则,避免 docker 文案漂移导致漏判或误判)。
+ */
+function isNameConflict(err: unknown): boolean {
+  if (typeof err !== "object" || err === null) return false;
+  const e = err as { statusCode?: unknown; httpStatus?: unknown };
+  return e.statusCode === 409 || e.httpStatus === 409;
+}
+
 // ───────────────────────────────────────────────────────────────────────
 // Volume:幂等创建 + label 校验(防同名被运维劫持)
 // ───────────────────────────────────────────────────────────────────────
@@ -1582,6 +1597,162 @@ async function allocateBoundIpAndInsertRow(
     "InvalidArgument",
     `failed to allocate bound_ip after ${V3_IP_ALLOC_MAX_ATTEMPTS} attempts; subnet ${V3_SUBNET_CIDR} likely exhausted`,
   );
+}
+
+// ───────────────────────────────────────────────────────────────────────
+// docker create NameConflict 自愈(2026-07-06 事故根治)
+// ───────────────────────────────────────────────────────────────────────
+
+/**
+ * self-heal 允许 rm 的冲突容器状态白名单 —— 只清确定"不活着"的态。
+ *
+ * 故意用显式白名单而非"非 running":`paused`(卷迁移期 pause 旧容器)/ `restarting`
+ * 都可能是活容器,不在白名单即绝不删(纵深防御 + 与 orphanReconcile 的 migration
+ * guard 语义一致)。`created`(占名但从未 start,即本次事故僵尸态)/ `exited` / `dead`
+ * 三态可安全 rm。
+ */
+const NAME_CONFLICT_REMOVABLE_STATES: ReadonlySet<string> = new Set([
+  "created",
+  "exited",
+  "dead",
+]);
+
+/**
+ * docker create 撞 409 NameConflict 时的**受控自愈(恰一次)**。
+ *
+ * 事故根因(2026-07-06):master 崩溃(PG idle-in-transaction 断连 → 未捕获
+ * client 'error' → 紧急关停)恰好发生在某次 provision 的 `docker create` 之后、
+ * catch 块 rollback+rm 清理之前 → 留下一个卡在 `created` 态、占住容器名的僵尸。
+ * 此后每次 provision `docker create` 同名 → 409 → 用户前端死循环重连数分钟。
+ * v5 上 orphanReconcile/idleSweep 因 controlPlaneEnabled=false + *_DISABLED 全部
+ * 关闭(见 index.ts / commercial-v5.env.overrides)—— **v5 无后台孤儿回收网**,
+ * 故此进程内自愈是 v5 该类僵尸的**唯一**自愈路径。
+ *
+ * 自愈契约:
+ *   1. `docker create` 抛非 409 → 直接 wrapDockerError 抛出(行为不变)。
+ *   2. 撞 409 → 按名字 `inspect` 冲突容器,**三重校验**它确属本实例管理:
+ *        · label `com.openclaude.v3.managed === "1"`
+ *        · label `com.openclaude.v3.uid === String(uid)`
+ *        · label `runtime_channel` 归属当前 channel(dockerContainerOwnedByChannel,
+ *          与 orphanReconcile 同一权威判定;v5 实例绝不认无 label / v3 容器)
+ *      且状态 ∈ {created,exited,dead} → `rm --force` 后**重试 create 恰一次**。
+ *   3. 任一校验不过 / running / inspect 失败 → **绝不删**,保留原 NameConflict 失败
+ *      (结构化日志带冲突容器 id/state/labels,便于排障),上层 catch-all 短重试。
+ *   4. `rm` 撞 404 → 视作别的组件(v3 orphanReconcile / 并发 provision)已删,**吞掉**
+ *      并继续重试(与 reaper 幂等共存,不双删竞态 —— rm 前 inspect、404 吞掉)。
+ *   5. 重试仍失败(含二次 409:并发 provision 重建同名)→ **不循环**,交上层短重试。
+ *
+ * 仅本地(deps.docker)路径。远端(node-agent)由 v3 orphanReconcile 兜底;v5 恒本地
+ * (useRemote=false)不会走远端,故本地自愈已完整覆盖事故 channel。
+ */
+async function createV3ContainerLocalWithSelfHeal(
+  docker: Docker,
+  uid: number,
+  containerName: string,
+  createOpts: Parameters<Docker["createContainer"]>[0],
+): Promise<Awaited<ReturnType<Docker["createContainer"]>>> {
+  let firstErr: unknown;
+  try {
+    return await docker.createContainer(createOpts);
+  } catch (err) {
+    if (!isNameConflict(err)) throw wrapDockerError(err);
+    firstErr = err;
+  }
+
+  // ── 撞 409:inspect 冲突容器判定死活 + 归属 ──
+  let info: Awaited<ReturnType<ReturnType<Docker["getContainer"]>["inspect"]>>;
+  try {
+    info = await docker.getContainer(containerName).inspect();
+  } catch (inspectErr) {
+    if (isNotFound(inspectErr)) {
+      // TOCTOU:create 与 inspect 之间冲突容器已被清掉(名字已释放)→ 直接重试一次。
+      log.info("[v3supervisor] name-conflict self-heal: conflict vanished before inspect, retrying create", {
+        uid,
+        containerName,
+      });
+      return retryCreateOnce(docker, uid, containerName, createOpts);
+    }
+    // inspect 失败(daemon / 权限 / 临时故障)→ 无法确认死活,绝不删,保留原 409 失败。
+    log.warn("[v3supervisor] name-conflict self-heal: inspect failed, not removing (preserving failure)", {
+      uid,
+      containerName,
+      err: inspectErr instanceof Error ? inspectErr.message : String(inspectErr),
+    });
+    throw wrapDockerError(firstErr);
+  }
+
+  const labels = (info.Config?.Labels ?? {}) as Record<string, string>;
+  const state = info.State?.Status ?? "unknown";
+  const conflictId = info.Id ?? containerName;
+  const managedOk = labels[V3_MANAGED_LABEL_KEY] === "1";
+  const uidOk = labels[V3_UID_LABEL_KEY] === String(uid);
+  const channelOk = dockerContainerOwnedByChannel(labels[RUNTIME_CHANNEL_LABEL_KEY], getRuntimeChannel());
+  const stateRemovable = NAME_CONFLICT_REMOVABLE_STATES.has(state);
+
+  if (!(managedOk && uidOk && channelOk && stateRemovable)) {
+    // running/paused/restarting,或非本实例管理的容器(label 不匹配)→ 绝不删,
+    // 保留原 NameConflict 失败(结构化日志留证据)。
+    log.warn("[v3supervisor] name-conflict: refusing to remove conflicting container", {
+      uid,
+      containerName,
+      conflictId,
+      state,
+      managedLabel: labels[V3_MANAGED_LABEL_KEY] ?? null,
+      uidLabel: labels[V3_UID_LABEL_KEY] ?? null,
+      channelLabel: labels[RUNTIME_CHANNEL_LABEL_KEY] ?? null,
+      reason: !managedOk
+        ? "not-managed"
+        : !uidOk
+          ? "uid-mismatch"
+          : !channelOk
+            ? "channel-mismatch"
+            : "alive", // running/paused/restarting/unknown
+    });
+    throw wrapDockerError(firstErr);
+  }
+
+  // 三重校验通过 + 非 running → rm(force);404 吞掉(幂等共存 orphanReconcile / 并发 provision)。
+  try {
+    await docker.getContainer(conflictId).remove({ force: true });
+  } catch (rmErr) {
+    if (!isNotFound(rmErr)) {
+      // rm 真失败(非 404)→ 放弃自愈,保留原 409 失败(上层短重试,下一轮再判)。
+      log.warn("[v3supervisor] name-conflict self-heal: rm failed, aborting heal (preserving failure)", {
+        uid,
+        containerName,
+        conflictId,
+        err: rmErr instanceof Error ? rmErr.message : String(rmErr),
+      });
+      throw wrapDockerError(firstErr);
+    }
+    // 404:已被别的组件删除,视作 rm 成功,继续重试。
+  }
+  log.info("[v3supervisor] name-conflict self-heal: removed stale conflicting container, retrying create", {
+    uid,
+    containerName,
+    conflictId,
+    state,
+  });
+  return retryCreateOnce(docker, uid, containerName, createOpts);
+}
+
+/** self-heal rm 后重试 `docker create` **恰一次**;二次失败不再循环,交上层短重试。 */
+async function retryCreateOnce(
+  docker: Docker,
+  uid: number,
+  containerName: string,
+  createOpts: Parameters<Docker["createContainer"]>[0],
+): Promise<Awaited<ReturnType<Docker["createContainer"]>>> {
+  try {
+    return await docker.createContainer(createOpts);
+  } catch (retryErr) {
+    log.warn("[v3supervisor] name-conflict self-heal: retry create failed after rm", {
+      uid,
+      containerName,
+      err: retryErr instanceof Error ? retryErr.message : String(retryErr),
+    });
+    throw wrapDockerError(retryErr);
+  }
 }
 
 // ───────────────────────────────────────────────────────────────────────
@@ -2216,9 +2387,8 @@ export async function provisionV3Container(
         throw wrapDockerError(err);
       }
     } else {
-      let container;
-      try {
-        container = await deps.docker.createContainer({
+        // docker create 撞 409 NameConflict 时的受控自愈见 createV3ContainerLocalWithSelfHeal。
+        const createOpts: Parameters<Docker["createContainer"]>[0] = {
           name: containerName,
           Image: deps.image,
           Env: env,
@@ -2322,11 +2492,14 @@ export async function provisionV3Container(
             ShmSize: 64 * 1024 * 1024,
             UsernsMode: "",
           },
-        });
+        };
+        const container = await createV3ContainerLocalWithSelfHeal(
+          deps.docker,
+          uid,
+          containerName,
+          createOpts,
+        );
         createdDockerId = container.id;
-      } catch (createErr) {
-        throw wrapDockerError(createErr);
-      }
 
       try {
         await container.start();
