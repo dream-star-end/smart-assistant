@@ -38,9 +38,12 @@ function toCard(c: ApprovedSearchRow): {
   description: string
   tags: string[]
   installCount: number
+  benchmark: { withPassRate: number; withoutPassRate: number; cases: number } | null
 } {
   // installCount 是加法字段(v3 vanilla UI 忽略);排序不动,热度排序收在 v5 前端。
   // 平台预设 agent 已在 handleMarketplaceSearch 收口剔除,不会走到这里,故无 preset 字段。
+  // benchmark 仅透出聚合值(withPassRate/withoutPassRate/cases),不暴露逐用例明细;
+  // 前端徽记须标注"发布者提供·未经平台验证"(v3 vanilla UI 忽略该加法字段)。
   return {
     slug: c.slug,
     kind: c.kind,
@@ -48,6 +51,7 @@ function toCard(c: ApprovedSearchRow): {
     description: c.description,
     tags: c.tags,
     installCount: c.installCount,
+    benchmark: c.benchmark,
   }
 }
 

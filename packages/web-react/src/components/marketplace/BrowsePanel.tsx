@@ -1,7 +1,12 @@
 import { ArrowUpCircle, PackageSearch, Search, ShieldCheck, Sparkles, Users } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api } from "../../lib/api";
-import { formatInstallCount, sortByPopularity, updateAvailable } from "../../lib/marketplace";
+import {
+  benchmarkBadgeLabel,
+  formatInstallCount,
+  sortByPopularity,
+  updateAvailable,
+} from "../../lib/marketplace";
 import type { AuthSession, MarketplaceCard, MarketplaceInstalled } from "../../lib/types";
 import { Alert, Badge, EmptyState, Input, Skeleton } from "../ui";
 import { DetailModal } from "./DetailModal";
@@ -133,6 +138,7 @@ export function BrowsePanel({
             const inst = c.preset ? undefined : installed.get(c.slug);
             const canUpdate = inst ? updateAvailable(inst) : false;
             const users = formatInstallCount(c.installCount);
+            const bench = benchmarkBadgeLabel(c.benchmark);
             return (
               <li key={c.slug}>
                 <button
@@ -174,6 +180,15 @@ export function BrowsePanel({
                       </span>
                     )}
                   </div>
+                  {/* 评测徽记:仅在发布者提供 benchmark 时渲染(无数据不占位不噪音);
+                      title 标注"发布者提供·未经平台验证",不当平台背书。 */}
+                  {bench && (
+                    <div className="flex">
+                      <Badge tone="info" title={bench.title}>
+                        {bench.label}
+                      </Badge>
+                    </div>
+                  )}
                 </button>
               </li>
             );
