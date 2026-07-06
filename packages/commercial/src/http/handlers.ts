@@ -1207,7 +1207,20 @@ export async function handleGetMyUsage(
         WHERE ur.user_id = $1 AND ur.status = 'success' AND cl.delta < 0`,
       [uid],
     ),
-    // 4) sessions 分页:GROUP BY session_id,非 NULL,稳定排序,LIMIT+1 探 has_more
+    // 4) sessions 分页:按「归组键」GROUP BY,稳定排序,LIMIT+1 探 has_more。
+    //
+    //    归组键(0104 delegate 计费打标的读侧收口):
+    //      - mode='delegate' 且 parent_session_id 非空 → parent_session_id
+    //        (父**客户端**会话 id,web*)—— delegate 子会话的引擎 UUID 行不再
+    //        散落成无名行,并入"一次组队"的父会话行;若父会话自己的行与该键
+    //        同键(写侧未来对齐客户端会话 id 时)则自然合并。
+    //      - 其余(chat / parent 缺失的 delegate 孤儿行)→ session_id,
+    //        与旧行为逐字节一致;孤儿 delegate 行退化为独立行,靠 delegate_only 标注。
+    //    delegate_credits / delegate_requests = 组内 delegate 行小计(FILTER),
+    //    delegate_only = 组内全为 delegate 行(孤儿行 / 纯组队归组)。
+    //
+    //    ⚠️ GROUP BY 1 / ORDER BY 1 必须用位置引用:输出别名与源列同名
+    //    (session_id),按名引用 PG 会解析回源列,分组退化成旧语义。
     query<{
       session_id: string;
       requests: string;
@@ -1216,20 +1229,31 @@ export async function handleGetMyUsage(
       cache_read_tokens: string;
       cache_write_tokens: string;
       billed_credits: string;
+      delegate_credits: string;
+      delegate_requests: string;
+      delegate_only: boolean;
       last_used_at: Date;
     }>(
-      `SELECT session_id,
+      `SELECT COALESCE(
+                CASE WHEN mode = 'delegate' THEN parent_session_id END,
+                session_id
+              )                                          AS session_id,
               COUNT(*)::bigint::text                     AS requests,
               COALESCE(SUM(input_tokens),0)::text        AS input_tokens,
               COALESCE(SUM(output_tokens),0)::text       AS output_tokens,
               COALESCE(SUM(cache_read_tokens),0)::text   AS cache_read_tokens,
               COALESCE(SUM(cache_write_tokens),0)::text  AS cache_write_tokens,
               COALESCE(SUM(cost_credits),0)::text        AS billed_credits,
+              COALESCE(SUM(cost_credits) FILTER (WHERE mode = 'delegate'),0)::text
+                                                         AS delegate_credits,
+              COUNT(*) FILTER (WHERE mode = 'delegate')::bigint::text
+                                                         AS delegate_requests,
+              bool_and(mode = 'delegate')                AS delegate_only,
               MAX(created_at)                            AS last_used_at
          FROM usage_records
         WHERE user_id = $1 AND status = 'success' AND session_id IS NOT NULL
-        GROUP BY session_id
-        ORDER BY MAX(created_at) DESC, session_id DESC
+        GROUP BY 1
+        ORDER BY MAX(created_at) DESC, 1 DESC
         LIMIT $2 OFFSET $3`,
       [uid, sessionsLimit + 1, sessionsOffset],
     ),
@@ -1311,16 +1335,66 @@ export async function handleGetMyUsage(
   const fetched = sessionsRows.rows;
   const hasMore = fetched.length > sessionsLimit;
   const rowsPage = hasMore ? fetched.slice(0, sessionsLimit) : fetched;
-  const sessions = rowsPage.map((r) => ({
-    session_id: r.session_id,
-    requests: r.requests,
-    input_tokens: r.input_tokens,
-    output_tokens: r.output_tokens,
-    cache_read_tokens: r.cache_read_tokens,
-    cache_write_tokens: r.cache_write_tokens,
-    billed_credits: r.billed_credits,
-    last_used_at: r.last_used_at.toISOString(),
-  }));
+
+  // ── delegate 明细:仅取当前页中含 delegate 行的归组键(纯 chat 用户零开销)──
+  //    键表达式与查询 4 的归组键对 delegate 行完全一致:
+  //    COALESCE(parent_session_id, session_id)。按 (agent, model) 分桶,
+  //    组内按积分降序 —— 前端展开明细直接按序渲染。
+  type DelegateDetail = {
+    delegate_agent_id: string | null;
+    model: string;
+    requests: string;
+    billed_credits: string;
+  };
+  const delegatesByKey = new Map<string, DelegateDetail[]>();
+  const delegateKeys = rowsPage
+    .filter((r) => r.delegate_requests !== "0")
+    .map((r) => r.session_id);
+  if (delegateKeys.length > 0) {
+    const detail = await query<DelegateDetail & { session_key: string }>(
+      `SELECT COALESCE(parent_session_id, session_id) AS session_key,
+              delegate_agent_id,
+              model,
+              COUNT(*)::bigint::text                  AS requests,
+              COALESCE(SUM(cost_credits),0)::text     AS billed_credits
+         FROM usage_records
+        WHERE user_id = $1 AND status = 'success' AND mode = 'delegate'
+          AND session_id IS NOT NULL
+          AND COALESCE(parent_session_id, session_id) = ANY($2::text[])
+        GROUP BY 1, 2, 3
+        ORDER BY 1, SUM(cost_credits) DESC, 2 NULLS LAST, 3`,
+      [uid, delegateKeys],
+    );
+    for (const d of detail.rows) {
+      const list = delegatesByKey.get(d.session_key) ?? [];
+      list.push({
+        delegate_agent_id: d.delegate_agent_id,
+        model: d.model,
+        requests: d.requests,
+        billed_credits: d.billed_credits,
+      });
+      delegatesByKey.set(d.session_key, list);
+    }
+  }
+
+  const sessions = rowsPage.map((r) => {
+    const delegates = delegatesByKey.get(r.session_id);
+    return {
+      session_id: r.session_id,
+      requests: r.requests,
+      input_tokens: r.input_tokens,
+      output_tokens: r.output_tokens,
+      cache_read_tokens: r.cache_read_tokens,
+      cache_write_tokens: r.cache_write_tokens,
+      billed_credits: r.billed_credits,
+      last_used_at: r.last_used_at.toISOString(),
+      // 0104 delegate 归组附加字段(纯增量,不改既有字段语义):
+      delegate_credits: r.delegate_credits,
+      delegate_requests: r.delegate_requests,
+      delegate_only: r.delegate_only,
+      ...(delegates && delegates.length > 0 ? { delegates } : {}),
+    };
+  });
 
   // ── ledger 分页:复用 admin/ledger 的 id 游标 keyset ───────────────────
   //   用户自查不限 reason,也不允许按 reason 过滤(UI 首版不做 filter)
