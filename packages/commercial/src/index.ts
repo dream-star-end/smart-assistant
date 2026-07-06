@@ -132,6 +132,10 @@ import {
   type ResearchJobSchedulerHandle,
 } from "./research/scheduler.js";
 import {
+  startMarketplaceAiReviewScheduler,
+  type MarketplaceAiReviewSchedulerHandle,
+} from "./marketplace/aiReview.js";
+import {
   makeAnthropicProxyHandler,
   type AnthropicProxyHandler,
 } from "./http/anthropicProxy.js";
@@ -3273,6 +3277,35 @@ export async function registerCommercial(
     }));
   }
 
+  // 市场发布 AI 自动审批 worker(deepseek-v4-pro)。仅 v5 启动:marketplace 表 v3/v5 共享
+  // 无 channel 列,但 v3 跑旧代码不写 ai_review_state → 恒 NULL → 永不被 claim,故 v3 保持
+  // 纯人审、零行为变更。domain 'v5-owned'(v5 合法后台职责;写共享 marketplace 表但由
+  // FOR UPDATE SKIP LOCKED 协调,v3 不参与)。关停:OC_MARKETPLACE_AI_REVIEW_DISABLED=1。
+  // key 缺席不崩:worker 把 queued backlog 转人工 + 启动 warn(fail-closed)。
+  let marketplaceAiReviewScheduler: MarketplaceAiReviewSchedulerHandle | undefined;
+  if (
+    runtimeChannel === "v5" &&
+    process.env.OC_MARKETPLACE_AI_REVIEW_DISABLED !== "1"
+  ) {
+    const raw = Number(process.env.OC_MARKETPLACE_AI_REVIEW_INTERVAL_MS);
+    const intervalMs = Number.isFinite(raw) && raw >= 5000 ? raw : 15_000;
+    marketplaceAiReviewScheduler = trackScheduler("marketplaceAiReview", "v5-owned", startMarketplaceAiReviewScheduler({
+      apiKey: cfg.DEEPSEEK_API_KEY,
+      intervalMs,
+      logger: {
+        info: (m) => rootLogger.info(m, { subsys: "commercial", module: "marketplaceAiReview" }),
+        warn: (m) => rootLogger.warn(m, { subsys: "commercial", module: "marketplaceAiReview" }),
+      },
+      onError: (err, versionId) =>
+        rootLogger.warn(
+          `[marketplace/aiReview] error${versionId ? ` (version ${versionId})` : ""}: ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+          { subsys: "commercial", module: "marketplaceAiReview" },
+        ),
+    }));
+  }
+
   // v5 灰度可观测 — runtimeStatus 暴露给 gateway /healthz,作为"控制面静默 / 运行时隔离 /
   // 灰度归属"的只读断言面(P4 可观测前移)。
   // enabledSchedulers 由归属登记表派生 —— 不再手工维护清单(此前 subscriptionRollover /
@@ -3386,6 +3419,9 @@ export async function registerCommercial(
       }
       if (researchJobScheduler) {
         try { researchJobScheduler.stop(); } catch { /* ignore */ }
+      }
+      if (marketplaceAiReviewScheduler) {
+        try { marketplaceAiReviewScheduler.stop(); } catch { /* ignore */ }
       }
       if (baselineSrv) {
         try { await baselineSrv.stop(); } catch { /* ignore */ }

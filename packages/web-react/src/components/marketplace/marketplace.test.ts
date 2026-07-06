@@ -124,6 +124,22 @@ test("publishMarketplace surfaces a 422 scan block as ApiError with riskFlags on
   }
 });
 
+test("adminMarketplaceAiReviews GETs the ai-reviews route and unwraps reviews", async () => {
+  const fetchMock = vi.fn(async (_url: string) =>
+    ok({
+      reviews: [
+        { versionId: "7", slug: "x", kind: "skill", version: "1.0.0", name: "X", status: "approved", aiNote: "合规", reviewedAt: "2026-07-06T00:00:00Z" },
+      ],
+    }),
+  );
+  vi.stubGlobal("fetch", fetchMock as unknown as typeof fetch);
+
+  const r = await api.adminMarketplaceAiReviews(session());
+  expect(r).toHaveLength(1);
+  expect(r[0].status).toBe("approved");
+  expect(String(fetchMock.mock.calls[0][0])).toBe("/api/admin/marketplace/ai-reviews");
+});
+
 test("friendlyRiskFlags translates categories and dedups same category to most severe", () => {
   const f = friendlyRiskFlags([
     { category: "secret", severity: "high", code: "a", message: "m1", block: true },

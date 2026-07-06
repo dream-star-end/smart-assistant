@@ -29,6 +29,7 @@ import { getHostById as computePoolGetHostById } from '../compute-pool/queries.j
 import { getPool } from '../db/index.js'
 import { type Logger, rootLogger } from '../logging/logger.js'
 import {
+  handleAdminMarketplaceAiReviews,
   handleAdminMarketplacePending,
   handleAdminMarketplaceReview,
   handleAdminMarketplaceReviewBatch,
@@ -662,6 +663,11 @@ export function createCommercialHandler(
       method: 'GET',
       path: '/api/admin/marketplace/pending',
       handler: (req, res) => handleAdminMarketplacePending(req, res, deps),
+    },
+    {
+      method: 'GET',
+      path: '/api/admin/marketplace/ai-reviews',
+      handler: (req, res) => handleAdminMarketplaceAiReviews(req, res, deps),
     },
     {
       method: 'POST',

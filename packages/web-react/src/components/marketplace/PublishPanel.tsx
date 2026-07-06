@@ -41,7 +41,7 @@ function DoneScreen({ onAgain }: { onAgain: () => void }) {
       <CheckCircle2 size={32} className="text-success" />
       <p className="text-[14px] font-medium text-fg">已提交，等待平台审核</p>
       <p className="max-w-sm text-[12.5px] text-muted">
-        审核通过后将上架并对其他用户可见。审核进度可随时回到本页「我的发布」查看。
+        AI 审核通常几分钟内完成；通过后将上架并对其他用户可见，需要人工复核的会稍慢。审核进度可随时回到本页「我的发布」查看。
       </p>
       <Button variant="secondary" size="sm" onClick={onAgain}>
         继续发布

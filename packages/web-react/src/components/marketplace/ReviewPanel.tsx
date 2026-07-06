@@ -1,8 +1,13 @@
-import { Check, ChevronRight, Inbox, Loader2, ShieldX, X } from "lucide-react";
+import { Check, ChevronRight, Inbox, Loader2, ShieldX, Sparkles, X } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
 import { api } from "../../lib/api";
 import { benchmarkSuspect } from "../../lib/marketplace";
-import type { AuthSession, MarketplaceCard, MarketplacePending } from "../../lib/types";
+import type {
+  AuthSession,
+  MarketplaceAiReview,
+  MarketplaceCard,
+  MarketplacePending,
+} from "../../lib/types";
 import { Alert, Badge, Button, EmptyState, Input, Spinner, useConfirm, usePrompt } from "../ui";
 import { friendlyRiskFlags } from "./riskFlags";
 
@@ -236,6 +241,17 @@ export function ReviewPanel({ auth }: { auth: AuthSession }) {
                 {isOpen && (
                   <div className="border-t border-border px-3.5 py-3">
                     <p className="mb-2 text-[12.5px] text-fg">{r.description}</p>
+                    {/* AI 意见(供参考):escalate/warn 降级/解析失败时 AI 给出的转人工原因。
+                        仅在待审队列里出现的项 = AI 未直接放行,人审据此复核。 */}
+                    {r.aiNote && (
+                      <div className="mb-2 flex items-start gap-1.5 rounded-lg border border-accent/30 bg-accent-soft/40 px-2.5 py-2">
+                        <Sparkles size={14} className="mt-0.5 shrink-0 text-accent" />
+                        <p className="text-[12px] leading-relaxed text-fg">
+                          <span className="font-medium text-accent">AI 意见（供参考）：</span>
+                          {r.aiNote}
+                        </p>
+                      </div>
+                    )}
                     {flags.length > 0 && (
                       <div className="mb-2 flex flex-col gap-1.5">
                         {flags.map((f) => (
@@ -280,9 +296,114 @@ export function ReviewPanel({ auth }: { auth: AuthSession }) {
         </div>
       )}
 
+      <AiReviewLog auth={auth} reloadKey={reload} />
       <RevokeBox auth={auth} />
     </div>
   );
+}
+
+/**
+ * AI 审批记录（折叠）：AI 已自动 approve/reject 的版本（review_source='ai'）。
+ * escalate 项不在此（它们仍 pending，在上方待审队列以「AI 意见」呈现）。admin 覆盖权:
+ * 误批可用下方 kill-switch 下架；escalate 天然进人审队列。默认折叠,展开时才拉取。
+ */
+function AiReviewLog({ auth, reloadKey }: { auth: AuthSession; reloadKey: number }) {
+  const [open, setOpen] = useState(false);
+  const [rows, setRows] = useState<MarketplaceAiReview[] | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    let alive = true;
+    setLoading(true);
+    setErr(null);
+    api
+      .adminMarketplaceAiReviews(auth)
+      .then((r) => alive && setRows(r))
+      .catch((e) => alive && setErr((e as Error).message || "加载 AI 审批记录失败"))
+      .finally(() => alive && setLoading(false));
+    return () => {
+      alive = false;
+    };
+  }, [auth, open, reloadKey]);
+
+  return (
+    <div className="m-4 mt-2 rounded-xl border border-border bg-surface p-3.5">
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        className="flex w-full items-center gap-1.5 text-left text-[13px] font-medium text-fg outline-none"
+      >
+        <ChevronRight
+          size={15}
+          className={`shrink-0 text-faint transition-transform ${open ? "rotate-90" : ""}`}
+        />
+        <Sparkles size={15} className="text-accent" />
+        AI 审批记录
+        <span className="ml-1 text-[11.5px] font-normal text-faint">
+          （AI 自动批准/拒绝的版本；转人工的项见上方待审队列）
+        </span>
+      </button>
+      {open && (
+        <div className="mt-3">
+          {err && (
+            <Alert tone="danger">{err}</Alert>
+          )}
+          {loading ? (
+            <div className="flex items-center gap-2 py-3 text-[12.5px] text-faint">
+              <Spinner /> 加载中…
+            </div>
+          ) : !rows || rows.length === 0 ? (
+            <p className="py-2 text-[12.5px] text-faint">暂无 AI 自动审批记录。</p>
+          ) : (
+            <ul className="flex flex-col gap-1.5">
+              {rows.map((r) => (
+                <li
+                  key={r.versionId}
+                  className="rounded-lg border border-border bg-elevated px-3 py-2"
+                >
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    <span className="truncate text-[12.5px] font-medium text-fg">{r.name}</span>
+                    {r.kind === "agent" && <Badge tone="accent">智能体</Badge>}
+                    <Badge tone="neutral">v{r.version}</Badge>
+                    <Badge tone={r.status === "approved" ? "success" : "danger"}>
+                      {r.status === "approved" ? "已批准" : "已拒绝"}
+                    </Badge>
+                    {r.reviewedAt && (
+                      <span className="ml-auto text-[11px] text-faint">{fmtDateTime(r.reviewedAt)}</span>
+                    )}
+                  </div>
+                  <p className="mt-0.5 text-[11.5px] text-muted">{r.slug}</p>
+                  {r.aiNote && (
+                    <p className="mt-1 text-[12px] leading-relaxed text-fg">
+                      <span className="font-medium text-accent">AI：</span>
+                      {r.aiNote}
+                    </p>
+                  )}
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function fmtDateTime(t: string): string {
+  try {
+    const d = new Date(t);
+    if (Number.isNaN(d.getTime())) return t;
+    return d.toLocaleString("zh-CN", {
+      month: "numeric",
+      day: "numeric",
+      hour: "2-digit",
+      minute: "2-digit",
+    });
+  } catch {
+    return t;
+  }
 }
 
 /**
