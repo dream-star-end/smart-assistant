@@ -42,6 +42,11 @@ import type { MediaRef } from "./lib/chat/frames";
 import type { ChatMessage } from "./lib/chat/model";
 import { CONTINUE_PROMPT } from "./lib/chat/render";
 import { deriveConnBanner } from "./lib/chat/pure";
+import {
+  clearTeamModeForSession,
+  readTeamModeForSession,
+  writeTeamMode,
+} from "./lib/teamMode";
 import { DEFAULT_AGENT, agentFromApiRow, type Agent } from "./lib/agents";
 import { api } from "./lib/api";
 import { DEMO_MESSAGES, DEMO_MODELS, DEMO_SESSIONS, DEMO_USER, demoReply } from "./lib/demo";
@@ -58,6 +63,24 @@ const ManageCenter = lazy(() => import("./components/ManageCenter").then((m) => 
 const MarketplaceCenter = lazy(() =>
   import("./components/MarketplaceCenter").then((m) => ({ default: m.MarketplaceCenter })),
 );
+
+// UX 体验对冲（红线:优化不得降低体验）:懒加载省首屏,但慢网下首开中心会多一个
+// loading 瞬间。首屏渲染完成后在浏览器空闲期预取四个懒块——Vite 对同一 specifier
+// 的动态 import 去重,预取后 React.lazy 解析即命中,首开零延迟;弱网下预取失败静默,
+// 行为退化为按需加载,不比没有预取更差。
+export function prefetchLazyCentersOnIdle(): void {
+  const prefetch = () => {
+    void import("./components/Landing").catch(() => {});
+    void import("./components/SettingsCenter").catch(() => {});
+    void import("./components/ManageCenter").catch(() => {});
+    void import("./components/MarketplaceCenter").catch(() => {});
+  };
+  if (typeof requestIdleCallback === "function") {
+    requestIdleCallback(prefetch, { timeout: 8000 });
+  } else {
+    setTimeout(prefetch, 3000);
+  }
+}
 
 /** 全屏懒块加载态（营销首页 chunk 下载期）——与启动续期 splash 同视觉,不割裂。*/
 function SplashFallback() {
@@ -78,20 +101,11 @@ function DialogFallback() {
 }
 
 const EMPTY_WS_MESSAGES: ChatMessage[] = [];
-const TEAM_MODE_STORAGE_KEY = "oc_v5_team_mode";
 // 冷会话骨架屏窗口（见 HistorySkeleton.shouldShowHistorySkeleton）：
 //  - GRACE：meta 未知（深链/列表未落定）时的兜底窗，过后放行 EmptyState。
 //  - CAP：确知有历史但迟迟不到（getSession 慢/失败）的安全封顶，防骨架永停。
 const HISTORY_SKELETON_GRACE_MS = 800;
 const HISTORY_SKELETON_CAP_MS = 8000;
-
-function readStoredTeamMode(): boolean {
-  try {
-    return localStorage.getItem(TEAM_MODE_STORAGE_KEY) === "1";
-  } catch {
-    return false;
-  }
-}
 
 export function App() {
   const params = new URLSearchParams(location.search);
@@ -135,19 +149,6 @@ export function App() {
   // 自行拉最新,两者互不依赖。目录**必须**参与会话归属解析的依赖(见下方 effect 注释)。
   const [myAgents, setMyAgents] = useState<Agent[]>([DEFAULT_AGENT]);
   const [pickerOpen, setPickerOpen] = useState(false);
-  // 团队模式(v5 轻量组队):turn 级开关,只对「全能助手」(main)生效——开启后发消息时后端
-  // 给 main 队长注入组队引导,由它按任务自主 delegate_task 组已安装 agent 成队。换 agent 不清,
-  // 但只在 agent.id==='main' 时随消息发送(见 send)。开关 UI 挂在 AgentPicker 的 main 卡片。
-  const [teamMode, setTeamModeState] = useState(readStoredTeamMode);
-  const setTeamMode = useCallback((enabled: boolean) => {
-    setTeamModeState(enabled);
-    try {
-      if (enabled) localStorage.setItem(TEAM_MODE_STORAGE_KEY, "1");
-      else localStorage.removeItem(TEAM_MODE_STORAGE_KEY);
-    } catch {
-      // Storage is best-effort; keep the in-memory switch responsive.
-    }
-  }, []);
   // 对话模型：唯一权威源是后端 GET /api/public/models（v5 仅 claude/glm-5.2/deepseek/minimax）。
   // demo 用本地 fixture 仅作离线视觉，不发请求。选中的 modelId 由 P4 的 WS inbound.message 顶层发送。
   const [models, setModels] = useState<PublicModel[]>(demo ? DEMO_MODELS : []);
@@ -274,7 +275,10 @@ export function App() {
       setMessages([]);
       setChatError(null);
     },
-    onDeleteSession: (id) => localStore.current.delete(id),
+    onDeleteSession: (id) => {
+      localStore.current.delete(id);
+      clearTeamModeForSession(id); // 顺手清该会话的团队模式 per-session 键(不留孤儿键)
+    },
     onActiveSessionDeleted: () => {
       setMessages([]);
       setChatError(null);
@@ -284,6 +288,27 @@ export function App() {
   });
   // 回填给 useAuth 的 chat 域收尾（onClearAuth/onLoginSuccess 经 sessionsResetRef 调用）。
   sessionsResetRef.current = resetSessionList;
+
+  // 团队模式(v5 轻量组队):**会话级**开关(清「设备级粘滞开关」债)。每个会话独立记忆,
+  // per-session 键 `oc_v5_team_mode:<sessionId>` 承载;新会话继承全局偏好默认值
+  // (`oc_v5_team_mode`,镜像用户最近一次选择——老用户习惯不变:上次开着新会话也开着)。
+  // 切会话按 activeId 重读(下方 effect);开关切换同时写 per-session + 全局默认
+  // (见 lib/teamMode)。语义仍为 turn 级 flag,只对「全能助手」(main)生效,只在
+  // agent.id==='main' 时随消息发送(见 send)。开关 UI 挂在 AgentPicker 的 main 卡片。
+  // 声明在 useSessionList 之后:setTeamMode/重读 effect 需要 activeId 定位当前会话。
+  const [teamMode, setTeamModeState] = useState(() => readTeamModeForSession(activeId));
+  const setTeamMode = useCallback(
+    (enabled: boolean) => {
+      setTeamModeState(enabled);
+      writeTeamMode(activeId, enabled);
+    },
+    [activeId],
+  );
+  // 切会话:按目标会话的 per-session 键重读(缺失回退全局默认)。activeId 为空(空会话态)
+  // 读全局默认;首条消息在 send 里把当前 intent 落地为该会话的 per-session 键。
+  useEffect(() => {
+    setTeamModeState(readTeamModeForSession(activeId));
+  }, [activeId]);
 
   const send = useCallback(
     async (text: string, media?: MediaRef[]) => {
@@ -330,6 +355,9 @@ export function App() {
         };
         setSessions((c) => [createdSession!, ...c]);
         setActiveId(sessionId);
+        // 空会话态用户可能已在全能助手卡上开/关了团队模式;把当前 intent 落地为新会话的
+        // per-session 键 —— 否则该会话只靠全局默认,会被其它会话的开关翻动(切走再回来变样)。
+        writeTeamMode(sessionId, teamMode);
       }
       sockRef.current?.ensureSession(sessionId, agent.id, text.slice(0, 24));
       // model：选中的真实模型 id（顶层字段，非 content 内）。effortLevel 本期不接（P5/后续）。
