@@ -231,6 +231,7 @@ BEGIN; <迁移 SQL>; INSERT INTO schema_migrations(version, applied_at) VALUES (
 | ~~TeamPanel 聚合脆弱~~ **已偿还**(批次2渲染+批次3并发) | coalesceTeam 改按 turn 锚点(最近 user 消息边界)归组;_activeDelegations 加 per-parent 分桶+review 保留槽 | — |
 | ~~landing 团队演示错位~~ **已偿还**(P2 批次4 前端) | 角色=真实三预设+审查员;并行≤3 与 per-parent 并发诚实对齐;账本字段对齐 TeamPanel;仍全虚构示意 | — |
 | provision 事务窗口过宽 | provisionV3Container 单 BEGIN 跨 docker create/start 慢操作,idle-in-tx(60s)可杀连接(07-06 事故根因;pg client error 已挂监听不再崩进程 90202532,僵尸 409 已有自愈) | idle-in-tx 规模化 reject 时,把 docker 副作用移出事务(需重构 per-uid lock+cap 门控原子性) |
+| v5 告警只入库不推送 | iLink/Telegram 投递 worker 寄生 shared 域 startAlertScheduler,v5 被 controlPlane 门关;PROVIDER_DEGRADED 等事件 enqueue 进 outbox(admin 面板可见)但不主动推微信 | 下次动告警面时给 v5 补 v5-owned 投递(注意与 v3 leader dispatcher 双跑去重) |
 | ~~v5 无后台孤儿回收网~~ **部分偿还**(02878333,07-06) | orphanReconcile 已放开 v5-owned(channel 双侧隔离,与 409 自愈错峰幂等,smoke 白名单已登记);**idleSweep/volumeGc 仍钉死**(活跃容器误杀窗口/不可逆删卷) | idleSweep:补 turn 级活跃屏障后再放;volumeGc:v3 退役收尾+观察期结束后单独评估 |
 
 ---
