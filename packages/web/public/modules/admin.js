@@ -17,10 +17,10 @@
 //   - 任何 list 接口 4xx → 提示 + 跳转 /;不要在 admin 页面里"匿名展示空列表"
 //   - PATCH/DELETE 操作前必须有 confirm 提示
 
-import { _clearStoredAccessToken, state } from './state.js?v=fb8211eb'
-import { htmlSafeEscape } from './dom.js?v=fb8211eb'
-import { apiGet, apiJson, apiText, apiFetch, authHeaders, onAuthExpired, silentRefresh } from './api.js?v=fb8211eb'
-import { lineChart, barChart, donutChart, destroyChart, fmt as cfmt } from './charts.js?v=fb8211eb'
+import { _clearStoredAccessToken, state } from './state.js?v=501cba4f'
+import { htmlSafeEscape } from './dom.js?v=501cba4f'
+import { apiGet, apiJson, apiText, apiFetch, authHeaders, onAuthExpired, silentRefresh } from './api.js?v=501cba4f'
+import { lineChart, barChart, donutChart, destroyChart, fmt as cfmt } from './charts.js?v=501cba4f'
 
 // 与后端 packages/commercial/src/admin/ledger.ts 的 LEDGER_REASONS 枚举严格同步。
 // 新增/删除 reason 必须两端同步改,否则 ledger tab filter 会把错误值发给后端
@@ -621,6 +621,10 @@ const TAB_CLEANUPS = {
     _destroyHealthCharts()
   },
   pricing() {
+    if (MODEL_OPS_STATE.statsTimer) {
+      clearInterval(MODEL_OPS_STATE.statsTimer)
+      MODEL_OPS_STATE.statsTimer = null
+    }
     _destroyModelOpsCharts()
   },
   ledger() {
@@ -4540,12 +4544,21 @@ async function openOrderDetailModal(orderNo) {
 // ─── Tab: 模型与服务商 (model-ops,原「定价」tab 原地升级) ─────────
 //
 // 一次 GET /api/admin/model-ops 拉齐两块数据:
-//   providers[] → 上半服务商卡片(key 配置 / 订阅到期 / 探测延迟 sparkline)
-//   models[]   → 下半模型行内编辑表(定价 / 倍率 / 可见性 / 思考深度 / 上下线)
+//   providers[] → 上半服务商卡片(key 配置 / 订阅到期 / 探测延迟 sparkline /
+//                 并发上限+利用率 / 24h 用量合计)
+//   models[]   → 下半模型行内编辑表(定价 / 倍率 / 可见性 / 思考深度 / 上下线
+//                 / 当前并发+峰值 / 24h 用量)
+// 容量面(本批新增):
+//   models[].inflight {current,peak,peak_at}(null=无记录),peak 口径=自 egress
+//   启动累计(stats.started_at),重启归零;usage.d1/.d7 里 token/credits 是
+//   BIGINT 字符串,只做展示,Number() 精度损失可接受。
+//   GET /api/admin/model-ops/stats — 轻量并发快照,tab 激活期间 30s 轮询,
+//   只更新并发 badge / 服务商当前并发+利用率条,不重拉全量、不打断行内编辑。
 // 写路径:
 //   PATCH /api/admin/pricing/:model_id — 只发被修改字段 + if_match_updated_at
 //     (乐观锁 = GET 拿到的 updated_at 原样带上;409 = 页面数据过期,提示刷新)
-//   PUT   /api/admin/providers/:id — {subscription_expires_at, notes, display_name}
+//   PUT   /api/admin/providers/:id — {subscription_expires_at, notes,
+//     display_name, concurrency_limit}(空输入=null 清除上限)
 //     全量替换语义:display_name 本页不提供编辑,透传原值防被清空。
 // 保存成功后做局部刷新:重拉 model-ops 只替换该行/卡片 DOM,不整页重渲染,
 // 避免冲掉其他行未保存的编辑(事件委托绑在容器上,替换后无需重绑)。
@@ -4558,6 +4571,8 @@ const MODEL_OPS_STATE = {
   sparklines: new Map(),
   models: new Map(),     // model_id → 服务端原始行(dirty diff + if_match 基准)
   providers: new Map(),  // provider id → 服务端原始行
+  statsTimer: null,      // 30s 并发快照轮询 interval id(TAB_CLEANUPS.pricing 清)
+  statsMeta: null,       // {source, started_at} — peak 口径 / local_fallback 提示
 }
 
 function _destroyModelOpsCharts() {
@@ -4581,6 +4596,11 @@ const MODEL_OPS_VISIBILITY = [
 async function renderModelOpsTab() {
   const mySeq = ++MODEL_OPS_STATE.renderSeq
   _destroyModelOpsCharts()
+  // 同 tab 重渲染(刷新按钮走 applyHash)不经过 TAB_CLEANUPS:先停上一轮轮询
+  if (MODEL_OPS_STATE.statsTimer) {
+    clearInterval(MODEL_OPS_STATE.statsTimer)
+    MODEL_OPS_STATE.statsTimer = null
+  }
   let data
   try {
     data = await apiGet('/api/admin/model-ops')
@@ -4595,10 +4615,12 @@ async function renderModelOpsTab() {
   const models = Array.isArray(data?.models) ? data.models : []
   MODEL_OPS_STATE.providers = new Map(providers.map((p) => [p.id, p]))
   MODEL_OPS_STATE.models = new Map(models.map((m) => [m.model_id, m]))
+  MODEL_OPS_STATE.statsMeta = data?.stats ?? null
 
   view().innerHTML = `
     <div class="panel">
-      <h2>服务商 <small>共 ${providers.length} 家 · key / 订阅 / 探测延迟</small></h2>
+      <h2>服务商 <small>共 ${providers.length} 家 · key / 订阅 / 探测延迟 / 并发</small></h2>
+      <div class="mo-stats-note" id="mo-stats-note" ${MODEL_OPS_STATE.statsMeta?.source === 'local_fallback' ? '' : 'hidden'}>egress 统计不可达,并发数据可能不完整</div>
       ${providers.length === 0
         ? '<div class="empty">无服务商</div>'
         : `<div class="modelops-providers" id="mo-providers">${providers.map(_renderProviderCard).join('')}</div>`}
@@ -4615,6 +4637,8 @@ async function renderModelOpsTab() {
             <table class="data modelops-table">
               <thead>
                 <tr><th>模型ID</th><th>显示名</th><th>服务商</th>
+                    <th title="当前并发;峰值自 egress 启动累计,重启归零">并发</th>
+                    <th title="24h:请求 · tokens(in+out) · 积分;悬浮看 7d 与 cache_read">24h 用量</th>
                     <th title="分/Mtok">输入价</th><th title="分/Mtok">输出价</th>
                     <th title="分/Mtok">缓存读</th><th title="分/Mtok">缓存写</th>
                     <th>multiplier</th><th>思考深度</th><th>可见性</th><th>状态</th>
@@ -4630,6 +4654,135 @@ async function renderModelOpsTab() {
   $('mo-providers')?.addEventListener('click', _onProviderGridClick)
   $('mo-models')?.addEventListener('click', _onModelTableClick)
   for (const p of providers) _drawProviderSparkline(p)
+
+  // 30s 并发快照轮询:只 GET /stats 更新并发 badge / 卡片当前并发 / 利用率条,
+  // 不重拉全量、不碰任何 input(行内编辑不受影响)。seq 捕获 idiom 同 dashboard;
+  // 页面不可见(document.hidden)时跳过该轮,回到前台下一轮自然追上。
+  const timerSeq = mySeq
+  MODEL_OPS_STATE.statsTimer = setInterval(() => {
+    if (document.hidden) return
+    if (timerSeq !== MODEL_OPS_STATE.renderSeq || _currentTab !== 'pricing') return
+    _pollModelOpsStats(timerSeq).catch(() => {})
+  }, 30_000)
+}
+
+// ── 容量面:格式化 / 并发快照轮询 ──
+
+/** 数字缩写:>=1M → "1.2M",>=1K → "3.4K",其余原样。接受 BIGINT 字符串
+ *  (Number() 精度损失对展示可接受),非法值 → "—"。 */
+function _fmtCompactNum(v) {
+  const n = typeof v === 'number' ? v : Number(v ?? 0)
+  if (!Number.isFinite(n)) return '—'
+  const abs = Math.abs(n)
+  if (abs >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`
+  if (abs >= 1_000) return `${(n / 1_000).toFixed(1)}K`
+  return String(n)
+}
+
+/** 模型并发单元格内容:current 大字 badge(>0 ok 色,0 灰)+ 峰值小字。
+ *  inflight=null(该模型无记录)→ 灰 "—"。 */
+function _inflightBadgeHtml(fl) {
+  if (!fl) return '<span class="badge muted" title="该模型暂无并发记录">—</span>'
+  const cur = Number(fl.current ?? 0)
+  const startedAt = MODEL_OPS_STATE.statsMeta?.started_at
+  const peakTitle = `峰值自 egress 启动累计,重启归零${startedAt ? `(启动于 ${fmtDate(startedAt)})` : ''}`
+    + (fl.peak_at ? `;峰值出现于 ${fmtDate(fl.peak_at)}` : '')
+  return `<span class="badge ${cur > 0 ? 'ok' : 'muted'} mo-inflight-cur">${escapeHtml(String(cur))}</span>
+    <small class="mo-inflight-peak" title="${escapeHtml(peakTitle)}">峰值 ${escapeHtml(String(fl.peak ?? 0))}</small>`
+}
+
+/** 一段用量摘要:"N 请求 · X tok · Y 积分"。模型口径 tokens=in+out 自加。 */
+function _usageLine(u) {
+  if (!u) return '—'
+  const tokens = Number(u.input_tokens ?? 0) + Number(u.output_tokens ?? 0)
+  return `${_fmtCompactNum(u.requests ?? 0)} 请求 · ${_fmtCompactNum(tokens)} tok · ${_fmtCompactNum(u.credits ?? 0)} 积分`
+}
+
+/** 模型 24h 用量单元格:d1 摘要,title 悬浮 7d 同口径 + cache_read 明细。 */
+function _usageCellHtml(m) {
+  const d1 = m.usage?.d1
+  const d7 = m.usage?.d7
+  if (!d1 && !d7) return '<td class="mo-usage"><span class="badge muted">—</span></td>'
+  const titleLines = [`7d: ${_usageLine(d7)}`]
+  if (d1?.cache_read_tokens != null || d7?.cache_read_tokens != null) {
+    titleLines.push(`cache_read: 24h ${_fmtCompactNum(d1?.cache_read_tokens ?? 0)} · 7d ${_fmtCompactNum(d7?.cache_read_tokens ?? 0)}`)
+  }
+  return `<td class="mo-usage" title="${escapeHtml(titleLines.join('\n'))}">${escapeHtml(_usageLine(d1))}</td>`
+}
+
+/** 服务商「当前并发 X / 上限 Y」+ 利用率横条;无上限时只显示当前值不画条。 */
+function _provInflightHtml(p) {
+  const cur = Number(p.inflight_current ?? 0)
+  const limit = p.concurrency_limit
+  if (limit == null || !(Number(limit) > 0)) {
+    return `<span>当前并发 <b class="mo-inflight-cur">${escapeHtml(String(cur))}</b></span>
+      <span class="badge muted">无上限</span>`
+  }
+  const ratio = (cur / Number(limit)) * 100
+  const cls = ratio > 80 ? 'danger' : ratio > 50 ? 'warn' : 'ok'
+  return `<span>当前并发 <b class="mo-inflight-cur">${escapeHtml(String(cur))}</b> / 上限 ${escapeHtml(String(limit))}</span>
+    <div class="mo-util-bar" title="利用率 ${escapeHtml(String(Math.round(ratio)))}%">
+      <div class="mo-util-fill ${cls}" style="width:${Math.min(100, Math.max(0, Math.round(ratio)))}%"></div>
+    </div>`
+}
+
+/** 服务商 24h 用量行(tokens 后端已合计为字符串)。 */
+function _provUsageLine(u) {
+  if (!u) return '24h:—'
+  return `24h:${_fmtCompactNum(u.requests ?? 0)} 请求 · ${_fmtCompactNum(u.tokens ?? 0)} tokens · ${_fmtCompactNum(u.credits ?? 0)} 积分`
+}
+
+async function _pollModelOpsStats(seq) {
+  let stats
+  try {
+    stats = await apiGet('/api/admin/model-ops/stats')
+  } catch {
+    return // 静默失败,30s 后下一轮再试;不 toast 打扰行内编辑
+  }
+  if (seq !== MODEL_OPS_STATE.renderSeq || _currentTab !== 'pricing') return
+  _applyModelOpsStats(stats)
+}
+
+// 用 /stats 快照做定点 DOM 更新:只碰并发 badge / 卡片并发区 / fallback 提示,
+// 不替换行与卡片本体 → 未保存的行内编辑安然无恙。
+function _applyModelOpsStats(stats) {
+  const byModel = stats?.by_model ?? {}
+  MODEL_OPS_STATE.statsMeta = {
+    source: stats?.source ?? MODEL_OPS_STATE.statsMeta?.source ?? null,
+    started_at: stats?.started_at ?? MODEL_OPS_STATE.statsMeta?.started_at ?? null,
+  }
+  // 模型行并发 badge(dataset 读回原文,不吃 selector 注入,idiom 同局部刷新)
+  for (const el of view().querySelectorAll('[data-mo-inflight]')) {
+    const id = el.dataset.moInflight
+    const m = MODEL_OPS_STATE.models.get(id)
+    const fresh = Object.prototype.hasOwnProperty.call(byModel, id) ? byModel[id] : null
+    let next
+    if (fresh) {
+      next = { current: fresh.current ?? 0, peak: fresh.peak ?? 0, peak_at: fresh.peak_at ?? null }
+    } else if (m?.inflight) {
+      // 快照里没条目但历史有记录 → 当前并发归 0,峰值保留(峰值只由后端权威)
+      next = { ...m.inflight, current: 0 }
+    } else {
+      next = null // 从未有记录:保持 "—"
+    }
+    if (m) m.inflight = next
+    el.innerHTML = _inflightBadgeHtml(next)
+  }
+  // 服务商当前并发 = 名下模型 current 合计(与全量响应 inflight_current 同口径)
+  const sums = new Map()
+  for (const m of MODEL_OPS_STATE.models.values()) {
+    const pid = m.provider?.id
+    if (!pid) continue
+    sums.set(pid, (sums.get(pid) ?? 0) + Number(m.inflight?.current ?? 0))
+  }
+  for (const el of view().querySelectorAll('[data-mo-prov-inflight]')) {
+    const p = MODEL_OPS_STATE.providers.get(el.dataset.moProvInflight)
+    if (!p) continue
+    p.inflight_current = sums.get(p.id) ?? 0
+    el.innerHTML = _provInflightHtml(p)
+  }
+  const note = document.getElementById('mo-stats-note')
+  if (note) note.hidden = MODEL_OPS_STATE.statsMeta.source !== 'local_fallback'
 }
 
 // ── 服务商卡片 ──
@@ -4671,6 +4824,16 @@ function _renderProviderCard(p) {
       </div>
       <div class="modelops-provider-row"><label>延迟</label>${latencyHtml}</div>
       ${sparkHtml}
+      <div class="modelops-provider-row">
+        <label>并发</label>
+        <span class="mo-prov-inflight" data-mo-prov-inflight="${escapeHtml(p.id)}">${_provInflightHtml(p)}</span>
+      </div>
+      <div class="modelops-provider-row">
+        <label>并发上限</label>
+        <input type="number" min="1" step="1" data-field="climit" placeholder="空=不限"
+               value="${escapeHtml(p.concurrency_limit == null ? '' : String(p.concurrency_limit))}" />
+      </div>
+      <div class="modelops-provider-row mo-prov-usage">${escapeHtml(_provUsageLine(p.usage_d1))}</div>
       <div class="modelops-provider-row">
         <label>订阅到期</label>
         <input type="date" data-field="sub"
@@ -4764,6 +4927,16 @@ async function _saveProvider(id, card, btn) {
   if (!orig) { toast('卡片数据缺失,请刷新', 'danger'); return }
   const dateVal = card.querySelector('input[data-field="sub"]')?.value || ''
   const notesRaw = (card.querySelector('input[data-field="notes"]')?.value ?? '').trim()
+  // 并发上限:空=null(清除);否则必须正整数(number input 非法内容 .value 为 '')
+  const climitRaw = (card.querySelector('input[data-field="climit"]')?.value ?? '').trim()
+  let climit = null
+  if (climitRaw !== '') {
+    if (!/^\d{1,9}$/.test(climitRaw) || Number(climitRaw) < 1) {
+      toast('并发上限必须是正整数(留空=不限)', 'danger')
+      return
+    }
+    climit = Number(climitRaw)
+  }
   // 订阅到期:日期没改 → 原 ISO 原样回传(PUT 全量语义),避免把原时刻"本地化"漂移;
   // 改了 → 取本地当天 23:59:59(到期语义 = 当天仍可用)
   let subIso
@@ -4783,6 +4956,7 @@ async function _saveProvider(id, card, btn) {
         notes: notesRaw === '' ? null : notesRaw,
         // display_name 本页不编辑:透传原值,防 PUT 全量替换把它清掉
         display_name: orig.display_name ?? null,
+        concurrency_limit: climit,
       })
       toast(`${orig.display_name || id} 已保存`)
       await _refreshProviderCard(id)
@@ -4846,6 +5020,8 @@ function _renderModelRow(m) {
       <td><input type="text" data-field="display_name" maxlength="120"
                  value="${escapeHtml(m.display_name ?? '')}" placeholder="—" /></td>
       <td><span class="chip chip-muted" style="font-family:var(--font-mono)">${escapeHtml(m.provider?.id || '—')}</span></td>
+      <td class="mo-concurrency" data-mo-inflight="${escapeHtml(m.model_id)}">${_inflightBadgeHtml(m.inflight)}</td>
+      ${_usageCellHtml(m)}
       ${priceCells}
       <td class="num"><input type="text" data-field="multiplier"
                  value="${escapeHtml(String(m.multiplier ?? ''))}" /></td>

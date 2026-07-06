@@ -79,6 +79,7 @@ import {
   errSummary,
   applyModelDefaultEffort,
 } from "./shared.js";
+import { trackModelRequestStart, trackModelRequestEnd } from "./inflightTracker.js";
 
 import { runUpstreamRoundTrip } from "./core.js";
 import { buildPlatformEnvelope } from "../../platform/platformEnvelopeBuilder.js";
@@ -294,6 +295,14 @@ export function makeAnthropicProxyHandler(
       // 5b') per-model 默认思考深度注入(0105 model_pricing.default_effort,admin 运维页可配)。
       // client 显式 effort 优先、合并不覆盖;详见 shared.applyModelDefaultEffort 注释。
       applyModelDefaultEffort(body, pricing.default_effort);
+
+      // 5b'') per-model 在飞计量(0106,admin 容量面)。res 'close' 在正常完结/断流/超时都
+      // 恰好触发一次 → 单次递减无泄漏;放在模型校验/授权之后,计的是真正进入上游链路的请求。
+      trackModelRequestStart(body.model);
+      {
+        const inflightModel = body.model;
+        res.once("close", () => trackModelRequestEnd(inflightModel));
+      }
 
       // 5c) Upstream route 选择 + 配置早拒绝(2026-05-18 Phase 3 §3.4 切出)。
       //
