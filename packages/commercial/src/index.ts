@@ -2243,10 +2243,15 @@ export async function registerCommercial(
 
   // V3 Phase 3H:orphan reconcile(gateway 启动立刻 + 1h tick)。docker↔DB 双向对账。
   // cfg.OC_ORPHAN_RECONCILE_DISABLED=1 可关闭(运维灾备 / 数据冷恢复时用)。
+  // 归属域 v5-owned(07-06 债偿):扫描/写入两侧全程 runtime_channel 隔离(listManagedContainers
+  // dockerContainerOwnedByChannel + listActiveRows/stopAndRemove SQL 均带 channel 过滤),
+  // v3(leader)与 v5 双跑各扫各的,互不可见;SAFETY_RACE_WINDOW(300s)与进程内 409 自愈
+  // (createV3ContainerLocalWithSelfHeal)天然错峰,双方 rm 均 404 吞幂等。idleSweep/volumeGc
+  // 仍留 shared 钉死(活跃容器误杀窗口/不可逆删卷,见 roadmap 07-06 晚登记)。
   let orphanReconcileScheduler: OrphanReconcileScheduler | undefined;
-  if (controlPlaneEnabled && v3Deps && process.env.OC_ORPHAN_RECONCILE_DISABLED !== "1") {
+  if ((controlPlaneEnabled || runtimeChannel === "v5") && v3Deps && process.env.OC_ORPHAN_RECONCILE_DISABLED !== "1") {
     const orphanReconcileLog = rootLogger.child({ subsys: "v3/orphanReconcile" });
-    orphanReconcileScheduler = trackScheduler("orphanReconcile", "shared", startOrphanReconcileScheduler(v3Deps, {
+    orphanReconcileScheduler = trackScheduler("orphanReconcile", "v5-owned", startOrphanReconcileScheduler(v3Deps, {
       logger: orphanReconcileLog,
       // 默认 runOnStart=true(§3H 明确"gateway 启动 reconcile")
     }));
