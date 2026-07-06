@@ -197,7 +197,14 @@ BEGIN; <迁移 SQL>; INSERT INTO schema_migrations(version, applied_at) VALUES (
 ```
 版本记账格式=文件名去 `.sql`(必须与既有行一致,否则 runner 对账守卫会炸);psql 造数/迁移**必须显式 COMMIT**。
 
-### 4.6 上线后核验清单
+### 4.6 发版节奏(2026-07-06 起,P1.5 制度化)
+全量现网后告别"随改随发"。规则(可按运营数据调整):
+- **常规批次攒窗口发**:非紧急改动合并 canonical 后不立即部署,攒到当日发版窗口(默认每日 1-2 个,北京时间午后/晚间)一次上线;一窗一条面向用户 changelog(改动可感知时)。
+- **hotfix 例外**:现网事故/计费错账/安全面可即时发,但仍必须走 deploy-v5.sh+smoke,并在下一窗口补 changelog。
+- **发版门**:check:v5 全绿(typecheck+gateway+mcp-memory+storage+web-react+commercial 基线集 diff)+生效面矩阵分类;镜像面改动放量前 canary(agent uid)。
+- **单日多批合并**:允许(canonical 持续集成),但部署窗口是节流阀;并行会话共用窗口,部署前必 fetch 核对 tip 与镜像 tag,避免互覆(07-06 教训:egress 面被并行部署漏掉)。
+
+### 4.6b 上线后核验清单
 - [ ] `/version` = 预期 commit;smoke 通过(含 OC_EGRESS_SPLIT=1 时 egress 无条件断言)
 - [ ] v3 `/healthz` 正常(零影响红线)
 - [ ] 前端特征串在 dist 产物里 grep 得到
