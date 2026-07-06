@@ -20,7 +20,9 @@ function extractMethodBody(source: string, methodName: string): string {
   return source.slice(startIdx, endIdx)
 }
 
-const handleDelegateTask = extractMethodBody(SERVER_TS, 'handleDelegateTask')
+// P2 债C:委派执行核心已从 HTTP 端点 handleDelegateTask 抽到 _runDelegateTask(HTTP 壳
+// 与内部硬编排两调用方共用)。下面的身份/repo 绑定/资源闸结构护栏断言都在核心体里,故提取核心。
+const delegateCore = extractMethodBody(SERVER_TS, '_runDelegateTask')
 const handleStop = extractMethodBody(SERVER_TS, 'handleStop')
 const getOrCreate = extractMethodBody(SESSION_MANAGER_TS, 'getOrCreate')
 
@@ -61,23 +63,23 @@ test('delegate sessions inherit repo lookup without rewriting delegate peer iden
     'repoSessionId must not mutate the peer/session reverse index',
   )
   assert.match(
-    handleDelegateTask,
+    delegateCore,
     /peerId:\s*sourceAgent\s*\|\|\s*'system'/,
     'delegate identity/routing peerId must stay sourceAgent',
   )
   assert.match(
-    handleDelegateTask,
+    delegateCore,
     /repoSessionId:\s*progressTarget\?\.peerId\s*\?\?\s*delegateParent\?\.repoSessionId/,
     'validated parent webchat peerId or parent delegate repo binding must be passed only as repoSessionId',
   )
   assert.doesNotMatch(
-    handleDelegateTask,
+    delegateCore,
     /peerId:\s*progressTarget\?\.peerId/,
     'delegate session must not impersonate the parent webchat peerId',
   )
 
-  const resolveIdx = handleDelegateTask.indexOf('_resolveDelegateProgressTarget')
-  const getOrCreateIdx = handleDelegateTask.indexOf('this.sessions.getOrCreate')
+  const resolveIdx = delegateCore.indexOf('_resolveDelegateProgressTarget')
+  const getOrCreateIdx = delegateCore.indexOf('this.sessions.getOrCreate')
   assert.ok(
     resolveIdx >= 0 && getOrCreateIdx > resolveIdx,
     'parent target must be resolved before delegate getOrCreate',
@@ -101,7 +103,7 @@ test('stop interrupts active delegate children for the stopped parent session', 
     'gateway must expose a recursive helper to interrupt active delegate children',
   )
   assert.match(
-    handleDelegateTask,
+    delegateCore,
     /const\s+delegateParent\s*=\s*this\._resolveDelegateParent/,
     'delegate runs must resolve a parent session key and repo binding separately from webchat progress',
   )
@@ -111,12 +113,12 @@ test('stop interrupts active delegate children for the stopped parent session', 
     'nested delegate children must be allowed to register under delegate parent sessions',
   )
   assert.match(
-    handleDelegateTask,
+    delegateCore,
     /const\s+unregisterDelegation\s*=\s*this\._registerActiveDelegation\([\s\S]*delegateParent\?\.sessionKey[\s\S]*sessionKey[\s\S]*\)/,
     'validated parent delegates must be registered while submit is in flight',
   )
   assert.match(
-    handleDelegateTask,
+    delegateCore,
     /unregisterDelegation\?\.\(\)/,
     'delegate registration must be removed in finally',
   )
@@ -147,12 +149,12 @@ test('delegate handler wires the unified additive toolset resolver (no fatal int
   // behaviorally by resolveDelegateToolsets.test.ts; here we only guard the
   // server.ts wiring + the removal of the old hard-fail path.
   assert.match(
-    handleDelegateTask,
+    delegateCore,
     /resolveDelegateToolsets\(\s*targetAgent,\s*this\.deps\.config,/,
     'delegate handler must resolve toolsets via the unified resolver with full config',
   )
   assert.match(
-    handleDelegateTask,
+    delegateCore,
     /const\s+delegateIntentText\s*=\s*\[goal,\s*context\]/,
     'delegate handler must derive intent text from goal+context (symmetry with WS path)',
   )
@@ -162,7 +164,7 @@ test('delegate handler wires the unified additive toolset resolver (no fatal int
     'empty/unknown delegate toolset requests must degrade to the merged baseline, not a hard 400',
   )
   assert.doesNotMatch(
-    handleDelegateTask,
+    delegateCore,
     /toolsets \? \{ \.\.\.targetAgent, toolsets \} : targetAgent/,
     'delegate toolsets must not blindly replace target agent configuration',
   )
@@ -177,7 +179,7 @@ test('delegate admission has a best-effort cgroup memory pressure guard (bounded
   // 这里只守 server.ts 的接线不被回退成"立即 503/429")。
   assert.match(SERVER_TS, /OPENCLAUDE_DELEGATE_QUEUE_WAIT_MS/)
   assert.match(SERVER_TS, /_readDelegateMemoryPressure\(\)/)
-  assert.match(handleDelegateTask, /await this\._waitForDelegateCapacity\(/)
-  assert.match(handleDelegateTask, /delegate resource pressure/)
-  assert.match(handleDelegateTask, /too many concurrent delegations/)
+  assert.match(delegateCore, /await this\._waitForDelegateCapacity\(/)
+  assert.match(delegateCore, /delegate resource pressure/)
+  assert.match(delegateCore, /too many concurrent delegations/)
 })

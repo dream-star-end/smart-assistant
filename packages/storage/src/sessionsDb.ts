@@ -13,7 +13,7 @@
 import { appendFile, readFile, rename, writeFile } from 'node:fs/promises'
 import { mkdir } from 'node:fs/promises'
 import { dirname } from 'node:path'
-import { TEAM_CARD_CLIENT_DISPLAY_FIELDS } from '@openclaude/protocol/teamCards'
+import { TEAM_CARD_CLIENT_DISPLAY_FIELDS, type MessageUsageDelegate } from '@openclaude/protocol/teamCards'
 import Database from 'better-sqlite3'
 import { paths } from './paths.js'
 
@@ -285,6 +285,10 @@ export async function getSessionsDb(): Promise<Database.Database> {
       -- 解析出的父 webchat 会话)。普通 chat / codex 自费恒 NULL —— 语义诚实,与
       -- session_id(引擎会话)不复用,drain 用它按父客户端会话精确归并到队长助手行。
       parent_session_id TEXT,
+      -- P2 债D — 委派子 agent id(= attribution.delegateAgentId,proxy 从 park 时透传)。
+      -- 仅委派行非空;普通 chat / codex 自费恒 NULL。drain 时按它分组求和,产出队长助手行
+      -- usage.delegates[] 的 per-agent 明细(纯展示投影,不参与扣费)。
+      delegate_agent_id TEXT,
       cost_credits TEXT NOT NULL,
       created_at   INTEGER NOT NULL DEFAULT (CAST(strftime('%s','now') AS INTEGER)*1000),
       PRIMARY KEY (request_id, user_id)
@@ -306,6 +310,11 @@ export async function getSessionsDb(): Promise<Database.Database> {
     const cols = db.pragma('table_info(pending_usage_patches)') as Array<{ name: string }>
     if (!cols.some(c => c.name === 'parent_session_id')) {
       db.exec('ALTER TABLE pending_usage_patches ADD COLUMN parent_session_id TEXT')
+    }
+    // P2 债D — delegate_agent_id 后加列。同 parent_session_id 教训:存量库靠 ALTER 补,
+    // CREATE TABLE IF NOT EXISTS 对存量库 no-op 不会补。default NULL,metadata-only。
+    if (!cols.some(c => c.name === 'delegate_agent_id')) {
+      db.exec('ALTER TABLE pending_usage_patches ADD COLUMN delegate_agent_id TEXT')
     }
   } catch { /* table just created with column already */ }
   // delegate drain(drainDelegateCostForClientSession 的 WHERE user_id AND parent_session_id)
@@ -1820,6 +1829,11 @@ export async function appendCostCredits(
   // NULL —— 与 session_id 池 disjoint,不会被队长的 requestId / by-agent-session drain 命中,
   // 也不会命中队长自己的成本,保证不重复计费。
   parentSessionId?: string | null,
+  // P2 债D — 委派子 agent id(= attribution.delegateAgentId)。仅委派子会话非空,与
+  // parentSessionId 同源(proxy 同一个 attribution 一起透传)。park 进 pending.delegate_agent_id,
+  // drainDelegateCostForClientSession 据此按 agent 分组求和,产出队长助手行 usage.delegates[]
+  // 的 per-agent 明细。纯展示投影 —— 不进任何扣费 WHERE,不影响 drain 的归并总额。
+  delegateAgentId?: string | null,
 ): Promise<AppendCostCreditsResult> {
   const db = await getSessionsDb()
   const txn = db.transaction((): AppendCostCreditsResult => {
@@ -1902,14 +1916,15 @@ export async function appendCostCredits(
     }
 
     db.prepare(
-      `INSERT INTO pending_usage_patches (request_id, user_id, session_id, parent_session_id, cost_credits)
-       VALUES (?, ?, ?, ?, ?)
+      `INSERT INTO pending_usage_patches (request_id, user_id, session_id, parent_session_id, delegate_agent_id, cost_credits)
+       VALUES (?, ?, ?, ?, ?, ?)
        ON CONFLICT (request_id, user_id) DO UPDATE SET
          cost_credits = excluded.cost_credits,
          session_id = excluded.session_id,
          parent_session_id = excluded.parent_session_id,
+         delegate_agent_id = excluded.delegate_agent_id,
          created_at = (CAST(strftime('%s','now') AS INTEGER)*1000)`
-    ).run(requestId, userId, sessionId ?? null, parentSessionId ?? null, costCredits)
+    ).run(requestId, userId, sessionId ?? null, parentSessionId ?? null, delegateAgentId ?? null, costCredits)
     return { applied: 'pending' }
   })
   return txn()
@@ -1920,6 +1935,9 @@ export interface DrainDelegateCostResult {
   merged: string
   /** 本次排空的 pending 行数(= 命中的委派子请求数;0 = 无委派成本 / 目标行缺位)。 */
   drained: number
+  /** P2 债D — 归并后队长助手行 usage.delegates[] 的当前快照(按 delegate_agent_id 分组
+   *  求和,含历史已归并 + 本次新增;merged=0 / 目标缺位时省略)。纯展示投影。 */
+  delegates?: MessageUsageDelegate[]
 }
 
 /**
@@ -1956,13 +1974,25 @@ export async function drainDelegateCostForClientSession(
   const db = await getSessionsDb()
   const txn = db.transaction((): DrainDelegateCostResult => {
     const pendings = db.prepare(
-      'SELECT request_id, cost_credits FROM pending_usage_patches WHERE user_id = ? AND parent_session_id = ?'
-    ).all(userId, clientSessionId) as { request_id: string; cost_credits: string }[]
+      'SELECT request_id, cost_credits, delegate_agent_id FROM pending_usage_patches WHERE user_id = ? AND parent_session_id = ?'
+    ).all(userId, clientSessionId) as {
+      request_id: string
+      cost_credits: string
+      delegate_agent_id: string | null
+    }[]
     if (pendings.length === 0) return { merged: '0', drained: 0 }
 
     let sum = 0n
+    // P2 债D — per-agent 明细:按 delegate_agent_id 分组求和(仅正成本计入)。缺 agentId
+    // (老 park / 拿不到归因)的成本仍进 sum(总额不丢),只是不出现在 delegates[] 明细里。
+    const perAgent = new Map<string, bigint>()
     for (const p of pendings) {
-      try { const v = BigInt(p.cost_credits); if (v > 0n) sum += v } catch { /* skip malformed */ }
+      let v: bigint
+      try { v = BigInt(p.cost_credits) } catch { continue /* skip malformed */ }
+      if (v <= 0n) continue
+      sum += v
+      const aid = p.delegate_agent_id
+      if (aid) perAgent.set(aid, (perAgent.get(aid) ?? 0n) + v)
     }
     if (sum <= 0n) {
       // 只有非正/畸形成本 → 清掉这些行(无归并价值),不写库、不 bump _seq。
@@ -1992,11 +2022,34 @@ export async function drainDelegateCostForClientSession(
     let base = 0n
     try { base = BigInt((existing.usage?.costCredits as string) ?? '0') } catch { base = 0n }
     const nextCost = (base + sum).toString()
+    // P2 债D — 累加合并 usage.delegates[](与 costCredits 同"累加不替换"语义):先把已归并
+    // 的历史明细读进 map(sink 重放/多轮委派下本行可能已被 drain 过),再叠加本次 perAgent。
+    // 每行至多被本函数排空一次(pending 排空即删),所以不会重复累加同一笔成本。
+    const mergedAgent = new Map<string, bigint>()
+    const prevDelegates = existing.usage?.delegates
+    if (Array.isArray(prevDelegates)) {
+      for (const d of prevDelegates as unknown[]) {
+        if (!d || typeof d !== 'object') continue
+        const aid = (d as { agentId?: unknown }).agentId
+        const cc = (d as { costCredits?: unknown }).costCredits
+        if (typeof aid !== 'string' || !aid) continue
+        try { mergedAgent.set(aid, (mergedAgent.get(aid) ?? 0n) + BigInt(String(cc ?? '0'))) } catch { /* skip */ }
+      }
+    }
+    for (const [aid, v] of perAgent) mergedAgent.set(aid, (mergedAgent.get(aid) ?? 0n) + v)
+    // 确定性顺序(按 agentId 排序)便于快照稳定/测试可断言。
+    const delegates: MessageUsageDelegate[] = [...mergedAgent.entries()]
+      .sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))
+      .map(([agentId, v]) => ({ agentId, costCredits: v.toString() }))
     const currentNextSeq = typeof sess.next_seq === 'number' && sess.next_seq > 0 ? sess.next_seq : 1
     const patched: MessageLike = {
       ...existing,
       _seq: currentNextSeq,
-      usage: { ...(existing.usage ?? {}), costCredits: nextCost },
+      usage: {
+        ...(existing.usage ?? {}),
+        costCredits: nextCost,
+        ...(delegates.length > 0 ? { delegates } : {}),
+      },
     }
     const next: MessageLike[] = [...msgs]
     next[idx] = patched
@@ -2013,7 +2066,11 @@ export async function drainDelegateCostForClientSession(
     // 只删本次读到的行——并发新 park 不在列表里,留给下一轮。
     const del = db.prepare('DELETE FROM pending_usage_patches WHERE user_id = ? AND request_id = ?')
     for (const p of pendings) del.run(userId, p.request_id)
-    return { merged: sum.toString(), drained: pendings.length }
+    return {
+      merged: sum.toString(),
+      drained: pendings.length,
+      ...(delegates.length > 0 ? { delegates } : {}),
+    }
   })
   return txn()
 }

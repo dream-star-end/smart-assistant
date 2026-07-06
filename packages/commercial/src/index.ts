@@ -1091,6 +1091,8 @@ export async function registerCommercial(
     sessionId?: string | null,
     // delegate 子会话的父客户端会话 id(web-*);普通 chat / codex 自费恒 undefined。
     parentSessionId?: string | null,
+    // P2 债D — 委派目标 agent id(与 parentSessionId 同源);普通 chat / codex 自费恒 undefined。
+    delegateAgentId?: string | null,
   ) =>
     appendCostCredits(
       requestId,
@@ -1099,6 +1101,7 @@ export async function registerCommercial(
       costCredits,
       sessionId,
       parentSessionId,
+      delegateAgentId,
     );
   // P1.7 slice 7c — broker 前向引用。dispatchInternal 在 line ~883 装配,需要路由
   // `/internal/v3/wechat-outbound` → broker.outboundHandler;但 broker 本身依赖

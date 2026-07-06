@@ -408,6 +408,87 @@ describe("AgentGroupCard server-authored 骨架行渲染(债A)", () => {
   });
 });
 
+describe("审查裁决徽记 + per-delegate 成本(债C/债D)", () => {
+  function g(id: string, text: string, extra: Partial<ChatMessage> = {}): ChatMessage {
+    return { id, role: "agent-group", text, ts: 1000, _delegate: true, ...extra };
+  }
+  function renderList(messages: ChatMessage[]) {
+    return render(
+      <MessageList messages={messages} sending={false} cb={{}} onRespondPermission={() => {}} />,
+    );
+  }
+
+  test("单个审查员委派卡(退化态,经 MessageRenderer)→ 头部 PASS 徽记 + delegateCost 积分", () => {
+    render(
+      <MessageRenderer
+        message={mk("agent-group", {
+          text: "审查草稿",
+          _delegate: true,
+          _delegateAgentId: "hidden-reviewer",
+          _completed: true,
+          _delegateStatus: "ok",
+          _reviewVerdict: "PASS",
+        })}
+        sig="agverdict"
+        isLast={false}
+        sending={false}
+        inActiveTurn={false}
+        delegateCost="7"
+        cb={{}}
+        onRespondPermission={() => {}}
+      />,
+    );
+    expect(screen.getByText("PASS")).toBeInTheDocument();
+    expect(screen.getByText("7 积分")).toBeInTheDocument();
+  });
+
+  test("单个审查员卡 NEEDS_FIX → 「未通过」徽记(执行态 ok 与裁决正交)", () => {
+    render(
+      <MessageRenderer
+        message={mk("agent-group", {
+          text: "审查草稿",
+          _delegate: true,
+          _delegateAgentId: "hidden-reviewer",
+          _completed: true,
+          _delegateStatus: "ok",
+          _reviewVerdict: "NEEDS_FIX",
+        })}
+        sig="agnf"
+        isLast={false}
+        sending={false}
+        inActiveTurn={false}
+        cb={{}}
+        onRespondPermission={() => {}}
+      />,
+    );
+    expect(screen.getByText("未通过")).toBeInTheDocument();
+    expect(screen.getByText("完成")).toBeInTheDocument(); // 执行态徽记照常
+  });
+
+  test("coalesceTeam:队长助手行 usage.delegates → 团队卡按 agentId 显示 per-delegate 成本", () => {
+    renderList([
+      mk("user", { id: "u1", text: "组队" }),
+      g("g1", "审查", { _delegateAgentId: "hidden-reviewer", _completed: true, _reviewVerdict: "PASS" }),
+      g("g2", "写代码", { _delegateAgentId: "coding-assistant", _completed: true }),
+      mk("assistant", {
+        id: "a1",
+        text: "完成",
+        usage: {
+          delegates: [
+            { agentId: "hidden-reviewer", costCredits: "3" },
+            { agentId: "coding-assistant", costCredits: "5" },
+          ],
+        },
+      }),
+    ]);
+    // 全完成默认收起 → 点头部展开看队员行。
+    fireEvent.click(screen.getByText("团队协作 · 2 个智能体"));
+    expect(screen.getByText("3 积分")).toBeInTheDocument();
+    expect(screen.getByText("5 积分")).toBeInTheDocument();
+    expect(screen.getByText("PASS")).toBeInTheDocument();
+  });
+});
+
 describe("MessageList 活跃段归属(turnSegment 收口)", () => {
   const todoTool = (id: string): ChatMessage =>
     mk("tool", {

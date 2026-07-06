@@ -289,6 +289,7 @@ interface BuildCtxOpts {
   fetchImpl: (url: string, init: RequestInit) => Promise<Response>;
   sessionId?: string | null;
   parentSessionId?: string | null;
+  delegateAgentId?: string | null;
   appendCostCredits?: RoundTripCtx["appendCostCredits"];
   broadcastToUser?: RoundTripCtx["broadcastToUser"];
 }
@@ -317,6 +318,7 @@ function buildCtx(opts: BuildCtxOpts) {
     finalize: finalize.finalize,
     sessionId: opts.sessionId ?? null,
     parentSessionId: opts.parentSessionId ?? null,
+    delegateAgentId: opts.delegateAgentId ?? null,
     userLog: log,
   };
   return { ctx, req, res, session, finalize };
@@ -668,6 +670,7 @@ describe("runUpstreamRoundTrip — stream / fetch error 分支", () => {
       finalize: finalize.finalize,
       sessionId: null,
       parentSessionId: null,
+      delegateAgentId: null,
       userLog: log,
     };
     await runUpstreamRoundTrip(ctx);

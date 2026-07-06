@@ -85,6 +85,7 @@ export interface RoundTripCtx {
     costCredits: string,
     sessionId?: string | null,
     parentSessionId?: string | null,
+    delegateAgentId?: string | null,
   ) => Promise<unknown>;
   broadcastToUser?: (uid: bigint, payload: unknown) => void;
   req: IncomingMessage;
@@ -104,6 +105,10 @@ export interface RoundTripCtx {
    *     (Fix B,消 60s TTL 脆弱);普通 chat null → 前端回落既有启发式。
    */
   parentSessionId: string | null;
+  /** P2 债D — delegate 子会话的目标 agent id(= attribution.delegateAgentId)。仅
+   *  delegate 模式非空。随 appendCostCredits park 进 pending.delegate_agent_id,供
+   *  drain 时产出队长助手行 usage.delegates[] 的 per-agent 明细。普通 chat 恒 null。 */
+  delegateAgentId: string | null;
   userLog: Logger;
 }
 
@@ -140,6 +145,7 @@ export async function runUpstreamRoundTrip(ctx: RoundTripCtx): Promise<void> {
     finalize,
     sessionId,
     parentSessionId,
+    delegateAgentId,
     userLog,
   } = ctx;
 
@@ -307,6 +313,9 @@ export async function runUpstreamRoundTrip(ctx: RoundTripCtx): Promise<void> {
             // 供队长助手行落库按父客户端会话精确归并(Fix A durable)。普通 chat 恒 null,
             // 走上面的 session_id / by-user drain,零影响。
             parentSessionId,
+            // P2 债D — 委派目标 agent id → park 进 pending.delegate_agent_id,drain 时按 agent
+            // 分组产出 usage.delegates[] 明细。普通 chat 恒 null(不进 delegates[])。
+            delegateAgentId,
           );
         } catch (err) {
           userLog.warn("proxy_persist_costcredits_failed", {

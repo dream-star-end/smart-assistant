@@ -26,6 +26,14 @@ export interface RunLogEntry {
   toolCalls?: string[] // tool names used in this run
   // Error info
   error?: string
+  // ── P2 债C — hidden reviewer 硬编排打标 ──
+  /** true = 本 run 是 gateway 硬编排触发的隐藏审查员委派(非用户/队长自发委派)。
+   *  仅 taskType='delegate' 且 target 为隐藏审查员的硬编排 run 打此标,便于 doctor
+   *  区分"审查开销"与普通委派开销。 */
+  isReview?: boolean
+  /** 审查 run 的结构化裁决(PASS / NEEDS_FIX)。解析不出裁决(降级/超时)→ undefined。
+   *  仅 isReview run 有值。 */
+  verdict?: string
 }
 
 const MAX_ENTRIES = 200
@@ -34,7 +42,10 @@ export class RunLog {
   private entries: RunLogEntry[] = []
 
   /** Start a new run, returns the entry for later update. */
-  start(init: Pick<RunLogEntry, 'agentId' | 'sessionKey' | 'taskType'>): RunLogEntry {
+  start(
+    init: Pick<RunLogEntry, 'agentId' | 'sessionKey' | 'taskType'> &
+      Partial<Pick<RunLogEntry, 'isReview'>>,
+  ): RunLogEntry {
     const entry: RunLogEntry = {
       id: `run-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`,
       ...init,
@@ -60,6 +71,8 @@ export class RunLog {
       turn?: number
       toolCalls?: string[]
       error?: string
+      /** 审查 run 的结构化裁决(PASS / NEEDS_FIX);非审查 run 省略。 */
+      verdict?: string
     },
   ): void {
     entry.completedAt = Date.now()
@@ -71,6 +84,7 @@ export class RunLog {
     entry.turn = result.turn
     entry.toolCalls = result.toolCalls
     entry.error = result.error
+    if (result.verdict !== undefined) entry.verdict = result.verdict
   }
 
   /** Get recent entries (newest first). */
