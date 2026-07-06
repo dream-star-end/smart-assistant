@@ -26,6 +26,7 @@
     "lint": "biome check packages",
     "format": "biome format --write packages",
     "test:gateway": "npx tsx --test packages/gateway/src/__tests__/*.test.ts",
+    "test:mcp-memory": "npx tsx --test packages/mcp-memory/src/__tests__/*.test.ts",
     "test:web": "npx tsx --test packages/web/__tests__/*.test.ts",
     "lint:agent-containers-sql": "tsx packages/commercial/scripts/lint-agent-containers-sql.ts",
     "lint:scheduler-wiring": "tsx scripts/check-schedulers.ts",
@@ -41,7 +42,7 @@
     "test": "npm run test:gateway && npm run test:web && npm run test:storage && npm run test:commercial",
     "migrate:commercial": "tsx packages/commercial/src/db/migrate.ts",
     "typecheck": "tsc --build",
-    "check:v5": "npm run typecheck && npm run test:gateway && npm run test:storage && npm run test:web-react && npm run test:commercial:unit:gate",
+    "check:v5": "npm run typecheck && npm run test:gateway && npm run test:mcp-memory && npm run test:storage && npm run test:web-react && npm run test:commercial:unit:gate",
     "typecheck:clean": "tsc --build --clean",
     "typecheck:watch": "tsc --build --watch",
     "check": "npm run lint && npm run lint:agent-containers-sql && npm run lint:scheduler-wiring && npm run lint:undefined-refs && npm run typecheck && npm run test"

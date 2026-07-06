@@ -17,7 +17,7 @@ import { describe, it } from 'node:test'
 
 import type { InboundFrame } from '@openclaude/protocol'
 
-import { Gateway, HiddenDelegateGuard, MAX_HIDDEN_DELEGATIONS_PER_TURN } from '../server.js'
+import { Gateway, PerTurnDelegationGuard, MAX_HIDDEN_DELEGATIONS_PER_TURN } from '../server.js'
 
 const PARENT_KEY = 'agent:main:webchat:dm:wsess-hidden-limit'
 
@@ -32,7 +32,7 @@ function makeGateway(): any {
   gw._seenIdempotencyKeys = new Map()
   gw._activeDelegations = 0
   gw._activeDelegationsByParent = new Map()
-  gw._hiddenDelegateGuard = new HiddenDelegateGuard()
+  gw._hiddenDelegateGuard = new PerTurnDelegationGuard()
   gw.log = { debug: () => {}, info: () => {}, warn: () => {}, error: () => {} }
   gw.rateLimiter = { check: () => true }
   gw.router = { route: () => ({ sessionKey: PARENT_KEY, agent }) }
@@ -112,11 +112,11 @@ async function newUserTurn(gw: any): Promise<void> {
   await gw.dispatchInbound(frame)
 }
 
-// ── HiddenDelegateGuard 单元行为 ─────────────────────────────────────────────
+// ── PerTurnDelegationGuard 单元行为 ─────────────────────────────────────────────
 
-describe('HiddenDelegateGuard — 计数器单元行为', () => {
+describe('PerTurnDelegationGuard — 计数器单元行为', () => {
   it('同一 key 前 N 次放行,第 N+1 次拒绝;reset 后额度恢复', () => {
-    const guard = new HiddenDelegateGuard(3)
+    const guard = new PerTurnDelegationGuard(3)
     assert.equal(guard.tryAcquire('p1'), true)
     assert.equal(guard.tryAcquire('p1'), true)
     assert.equal(guard.tryAcquire('p1'), true)
@@ -127,7 +127,7 @@ describe('HiddenDelegateGuard — 计数器单元行为', () => {
   })
 
   it('不同 key 互不影响', () => {
-    const guard = new HiddenDelegateGuard(1)
+    const guard = new PerTurnDelegationGuard(1)
     assert.equal(guard.tryAcquire('p1'), true)
     assert.equal(guard.tryAcquire('p2'), true)
     assert.equal(guard.tryAcquire('p1'), false)
@@ -135,7 +135,7 @@ describe('HiddenDelegateGuard — 计数器单元行为', () => {
   })
 
   it('TTL 惰性清扫:超过 staleMs 的旧条目在下次 tryAcquire 时回收(防泄漏/防永久锁死)', () => {
-    const guard = new HiddenDelegateGuard(1, 60_000)
+    const guard = new PerTurnDelegationGuard(1, 60_000)
     const t0 = 1_000_000
     assert.equal(guard.tryAcquire('cron-parent', t0), true)
     assert.equal(guard.tryAcquire('cron-parent', t0 + 1), false, 'TTL 内仍受限')

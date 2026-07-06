@@ -814,6 +814,10 @@ interface RunDelegateInput {
   parentSessionKey?: string
   streamProgress?: boolean
   depth: number
+  /** P2 批次4 — 子任务思考量级(low/medium/high),透传给 delegate session 的
+   *  sessions.submit effortLevel(参照顶层会话 safeEffortLevel 传法)。缺省/非法 →
+   *  undefined,不动子会话 runner 的默认 effort(= 该成员默认档位)。 */
+  effort?: string
   /** gateway 硬编排触发的隐藏审查员委派。影响:runLog isReview / 资源闸走保留槽 + 免
    *  per-parent 桶 / 完成后解析结构化 verdict / 不置位"本 turn 有非隐藏委派"跟踪。 */
   isReview?: boolean
@@ -845,15 +849,46 @@ type DelegateTaskResult =
  *  只管嵌套、MAX_CONCURRENT_DELEGATIONS 只管并行,都拦不住串行重试,这里是第三条腿。 */
 export const MAX_HIDDEN_DELEGATIONS_PER_TURN = 3
 
-/** hidden 委派计数器。计数键 = **父会话 sessionKey**,依据:
- *  delegate 请求(mcp-memory handleDelegateTaskToAgent)只携带 parentSessionKey
- *  (取自 OPENCLAUDE_SESSION_KEY env)和 x-delegation-depth 头,请求里拿不到任何
- *  turn 级标识,因此退而按父会话维度计数,turn 边界由 dispatchInbound 在同一
- *  sessionKey 收到下一条用户消息时调用 resetForParent 划定。子 delegate 会话的
- *  sessionKey 自带时间戳(一次性,不能当计数键),但它作为"父"再委派时天然就是
- *  turn 粒度,其计数在该 delegate 请求收尾时清理。TTL 惰性清扫兜底 cron/task 等
- *  永远等不到下一条用户消息的父会话 —— 既防 Map 泄漏,也防"额度永久锁死"。 */
-export class HiddenDelegateGuard {
+/** P2 批次4 — 普通成员(队长直接委派的已安装 agent,非 hidden 非 review)每 turn
+ *  委派次数上限。消"串行无上限"债:队长可以持续 fan-out,但单 turn 不该无界地把
+ *  同一批成员反复委派(失控的串行重试/发散拆分会烧钱且拖长 turn)。超限返回结构化
+ *  错误引导队长收敛(见 _runDelegateTask member guard 分支),不是静默失败。默认 8,
+ *  env 可配(下限 1);比 hidden 熔断(3)宽,因为正常复杂任务的合理 fan-out 会多于审查。 */
+export const MEMBER_DELEGATIONS_PER_TURN_DEFAULT = 8
+function resolveMemberDelegationsPerTurn(): number {
+  const raw = Number(process.env.OPENCLAUDE_TEAM_MEMBER_DELEGATIONS_PER_TURN)
+  return Number.isFinite(raw) && raw >= 1 ? Math.floor(raw) : MEMBER_DELEGATIONS_PER_TURN_DEFAULT
+}
+
+/** P2 批次4 — 委派回传给队长的 output 兜底封顶(字符数)。消"回传全量不裁剪"债:
+ *  子 agent 的大产物应落文件、回传只给路径 + 蒸馏摘要(prompt 已教);本封顶是模型
+ *  不照做时的最后一道保险,防超大回传把队长上下文撑爆 / 拖慢。仅对普通成员委派生效,
+ *  **不裁 review 委派**(其 output 要经 buildTeamReviewContinuation 全量喂回队长续写)。
+ *  截断时尾注引导落文件。默认 4000,env 可配(下限 500)。 */
+export const DELEGATE_OUTPUT_CAP_DEFAULT = 4000
+function resolveDelegateOutputCap(): number {
+  const raw = Number(process.env.OPENCLAUDE_DELEGATE_OUTPUT_CAP)
+  return Number.isFinite(raw) && raw >= 500 ? Math.floor(raw) : DELEGATE_OUTPUT_CAP_DEFAULT
+}
+function capDelegateOutput(raw: string): string {
+  const cap = resolveDelegateOutputCap()
+  if (raw.length <= cap) return raw
+  return `${raw.slice(0, cap)}\n\n[输出过长已截断至 ${cap} 字;完整产物应落文件——若上文无文件路径,请让该成员重做并把大产物写入 /home/agent/.openclaude/generated/ 后只回传路径+摘要]`
+}
+
+/** 「每 turn、按父会话」的委派计数器 —— 一套通用机制,当前服务两条策略:
+ *   1. hidden 审查员串行熔断(_hiddenDelegateGuard,上限 MAX_HIDDEN_DELEGATIONS_PER_TURN);
+ *   2. P2 批次4 普通成员每 turn 委派上限(_memberDelegateGuard,env 可配默认 8)。
+ *  两者机制完全一致(仅上限值与计数范围不同),故复用同一个类而非另起并行实现。
+ *
+ *  计数键 = **父会话 sessionKey**,依据:delegate 请求(mcp-memory
+ *  handleDelegateTaskToAgent)只携带 parentSessionKey(取自 OPENCLAUDE_SESSION_KEY env)
+ *  和 x-delegation-depth 头,请求里拿不到任何 turn 级标识,因此退而按父会话维度计数,
+ *  turn 边界由 dispatchInbound 在同一 sessionKey 收到下一条用户消息时调用 resetForParent
+ *  划定。子 delegate 会话的 sessionKey 自带时间戳(一次性,不能当计数键),但它作为"父"
+ *  再委派时天然就是 turn 粒度,其计数在该 delegate 请求收尾时清理。TTL 惰性清扫兜底
+ *  cron/task 等永远等不到下一条用户消息的父会话 —— 既防 Map 泄漏,也防"额度永久锁死"。 */
+export class PerTurnDelegationGuard {
   private counts = new Map<string, { count: number; touchedAt: number }>()
 
   constructor(
@@ -6362,9 +6397,14 @@ export class Gateway {
    *  turn 起始清零(与 _hiddenDelegateGuard.resetForParent 同点),_runDelegateTask 里对
    *  非隐藏 + webchat 父的委派置位。使用处惰性 ??=(同上)。 */
   private _turnDelegatedNonHiddenByParent: Set<string> | undefined
-  /** hidden 审查员串行委派熔断(见 HiddenDelegateGuard 注释)。gateway 是容器内
+  /** hidden 审查员串行委派熔断(见 PerTurnDelegationGuard 注释)。gateway 是容器内
    *  单进程,内存计数即权威。 */
-  private _hiddenDelegateGuard = new HiddenDelegateGuard()
+  private _hiddenDelegateGuard = new PerTurnDelegationGuard()
+  /** P2 批次4 — 普通成员(非 hidden 非 review)每 turn 委派上限,消"串行无上限"债。
+   *  与 _hiddenDelegateGuard 同款按父会话计数、turn 边界复位(9863 同点),仅上限值
+   *  不同(env OPENCLAUDE_TEAM_MEMBER_DELEGATIONS_PER_TURN,默认 8)。测试脚手架
+   *  Object.create(Gateway.prototype) 不跑字段初始化 → 使用处惰性 ??=(同 _delegateQueueWaiters)。 */
+  private _memberDelegateGuard: PerTurnDelegationGuard | undefined
   /** 资源闸排队中的委派:childSessionKey → 中止等待回调。用户 Stop 级联
    *  (_interruptDelegationsForParent)对"还没 spawn、只在排队"的委派经此打断。
    *  测试脚手架 Object.create(Gateway.prototype) 不跑字段初始化,使用处惰性 ??=。 */
@@ -6649,6 +6689,12 @@ export class Gateway {
     if (!goal) return this.sendError(res, 400, 'goal required')
     const depthHeader = req.headers['x-delegation-depth']
     const depth = depthHeader ? Number.parseInt(String(depthHeader), 10) : 0
+    // P2 批次4 — effort 仅接受 low/medium/high(delegate schema enum),其余(含缺省/非法)
+    // → undefined,不动子会话默认档位。防御性白名单(body 非 typebox 校验)。
+    const effort =
+      typeof parsed.effort === 'string' && ['low', 'medium', 'high'].includes(parsed.effort)
+        ? parsed.effort
+        : undefined
 
     // HTTP 入口:解析 body → 结构化 input → _runDelegateTask 核心 → 结果映射回 res。
     // 委派执行核心与 HTTP req/res 解耦(P2 债C),让 gateway 硬编排 review pass
@@ -6664,6 +6710,7 @@ export class Gateway {
         typeof parsed.parentSessionKey === 'string' ? parsed.parentSessionKey : undefined,
       streamProgress: parsed.streamProgress === true,
       depth,
+      effort,
     })
     if (result.kind === 'rejected') return this.sendError(res, result.httpStatus, result.message)
     if (result.kind === 'error') return this.sendError(res, 500, result.message)
@@ -6697,28 +6744,45 @@ export class Gateway {
       return { kind: 'rejected', httpStatus: 400, message: 'delegation depth limit exceeded (max 3)' }
     }
 
-    // Serial guard: hidden 系统 agent(隐藏审查员)同一父 turn 内委派次数硬上限。
-    // 计数键优先取 parentSessionKey(delegate 请求里唯一的父上下文,turn 级标识
-    // 拿不到 —— 依据见 HiddenDelegateGuard 注释);极端情况下 body 缺
-    // parentSessionKey 时退化为按 sourceAgent 计数,由 TTL 清扫兜底回收。
-    // 失败/超时的审查同样占额度:每次尝试都是全额计费的 delegate session。
-    // 本闸同样先于资源闸排队:per-turn 额度等不出来,fail fast 不占等待名额;
-    // 代价是"排队超时"的审查委派也已扣一次额度(保守偏置,与上一行语义一致)。
+    // Per-turn 委派熔断(两条策略共用 PerTurnDelegationGuard,互斥分派):
+    //   - hidden 系统 agent(隐藏审查员)→ 串行硬上限 MAX_HIDDEN_DELEGATIONS_PER_TURN(3);
+    //   - 普通成员(非 hidden 非 review)→ 每 turn 委派上限(env 默认 8),消"串行无上限"债。
+    // 计数键优先取 parentSessionKey(delegate 请求里唯一的父上下文,turn 级标识拿不到 ——
+    // 依据见 PerTurnDelegationGuard 注释);极端情况下 body 缺 parentSessionKey 时退化为按
+    // sourceAgent 计数,由 TTL 清扫兜底回收(无绕过口)。失败/超时的委派同样占额度:每次
+    // 尝试都是全额计费的 delegate session。本闸先于资源闸排队:per-turn 额度等不出来 fail
+    // fast、不占等待名额(保守偏置)。
+    const delegateGuardKey =
+      typeof parentSessionKey === 'string' && parentSessionKey
+        ? parentSessionKey
+        : `delegate-src:${typeof sourceAgent === 'string' && sourceAgent ? sourceAgent : 'system'}`
     if (isHiddenSystemAgentId(targetAgentId)) {
-      const guardKey =
-        typeof parentSessionKey === 'string' && parentSessionKey
-          ? parentSessionKey
-          : `delegate-src:${typeof sourceAgent === 'string' && sourceAgent ? sourceAgent : 'system'}`
-      if (!this._hiddenDelegateGuard.tryAcquire(guardKey)) {
+      if (!this._hiddenDelegateGuard.tryAcquire(delegateGuardKey)) {
         this.log.warn('delegate_hidden_limit', {
           targetAgentId,
-          guardKey,
+          guardKey: delegateGuardKey,
           limit: MAX_HIDDEN_DELEGATIONS_PER_TURN,
         })
         return {
           kind: 'rejected',
           httpStatus: 429,
           message: `审查委派已达本轮上限(${MAX_HIDDEN_DELEGATIONS_PER_TURN}次),请基于已有审查结论收尾,不要再发起新的审查委派`,
+        }
+      }
+    } else if (!isReview) {
+      // 普通成员委派(队长直接派给已安装成员)。isReview 豁免(那是内部硬编排,走 hidden 分支)。
+      const memberLimit = resolveMemberDelegationsPerTurn()
+      const memberGuard = (this._memberDelegateGuard ??= new PerTurnDelegationGuard(memberLimit))
+      if (!memberGuard.tryAcquire(delegateGuardKey)) {
+        this.log.warn('delegate_member_limit', {
+          targetAgentId,
+          guardKey: delegateGuardKey,
+          limit: memberLimit,
+        })
+        return {
+          kind: 'rejected',
+          httpStatus: 429,
+          message: `本轮委派已达上限(${memberLimit} 次/turn)。请先整合已经收到的成员结果,基于现有产出继续推进;若确实还需要更多子任务,合并为更少的委派或分两轮进行,不要在同一轮内持续拆分委派。`,
         }
       }
     }
@@ -6966,10 +7030,20 @@ export class Gateway {
       ;(this._turnDelegatedNonHiddenByParent ??= new Set()).add(progressTarget.sessionKey)
     }
 
-    // Build prompt with context
-    const prompt = context
-      ? `[委派任务]\n\n目标: ${goal}\n\n上下文:\n${context}\n\n请完成上述任务并返回结果摘要。`
-      : `[委派任务]\n\n目标: ${goal}\n\n请完成上述任务并返回结果摘要。`
+    // Build prompt with context.
+    // P2 批次4(1a)— 委派上下文结构化:给非 review 子任务加"产物纪律"preamble。父子同容器
+    // 共享 FS(generated/uploads 天然共享)但历史上 prompt 零教学 → 子 agent 常把完整大产物
+    // 整段回传,撑爆队长上下文。这里教:大产物落文件、回传只给路径+蒸馏摘要;小结果直接回传。
+    // review 委派豁免(其 goal/context 已由 buildTeamReviewContext 精确指定为"审查+输出 VERDICT",
+    // 不产文件产物,加纪律只会稀释指令)。与 _runDelegateTask 回传封顶(capDelegateOutput)配套:
+    // prompt 是"请正确落文件"的软引导,封顶是"没照做时"的硬保险。
+    const artifactDiscipline = isReview
+      ? ''
+      : '\n\n【产物纪律】你和委派方在同一台容器、共享文件系统。若本任务会产出大产物(完整代码/长文档/数据文件/报告),请写入 `/home/agent/.openclaude/generated/<描述性文件名>`,回传只给「文件路径 + ≤1500 字的蒸馏摘要」(委派方可用 Read 按路径取回完整内容);小结果(结论/短答案)直接回传即可,不要把超长完整内容整段回传。'
+    const prompt =
+      (context
+        ? `[委派任务]\n\n目标: ${goal}\n\n上下文:\n${context}\n\n请完成上述任务并返回结果摘要。`
+        : `[委派任务]\n\n目标: ${goal}\n\n请完成上述任务并返回结果摘要。`) + artifactDiscipline
 
     const _dlgRun = this._runLog.start({
       agentId: targetAgentId,
@@ -7009,15 +7083,22 @@ export class Gateway {
         reject(err)
       }, timeoutConfig.checkIntervalMs)
     })
-    const submitPromise = this.sessions.submit(session, prompt, (e) => {
-      const progressBlock = makeDelegateBlockPassthrough(e, progressRunId, targetAgentId)
-      if (progressBlock || e.kind === 'block' || e.kind === 'error') markChildActivity()
-      if (!timedOut) {
-        if (e.kind === 'block' && e.block.kind === 'text') output += e.block.text
-        if (e.kind === 'error') error = e.error
-        if (streamProgress) emitProgress(progressBlock)
-      }
-    })
+    const submitPromise = this.sessions.submit(
+      session,
+      prompt,
+      (e) => {
+        const progressBlock = makeDelegateBlockPassthrough(e, progressRunId, targetAgentId)
+        if (progressBlock || e.kind === 'block' || e.kind === 'error') markChildActivity()
+        if (!timedOut) {
+          if (e.kind === 'block' && e.block.kind === 'text') output += e.block.text
+          if (e.kind === 'error') error = e.error
+          if (streamProgress) emitProgress(progressBlock)
+        }
+      },
+      // P2 批次4 — effort 透传:子会话是新建的,首次 submit 的 effortLevel 在 runner
+      // spawn 前生效(与顶层会话 safeEffortLevel 同法)。undefined = 不指定 → 成员默认档位。
+      input.effort,
+    )
     try {
       await Promise.race([submitPromise, timeoutPromise])
       clearTimeoutTimer()
@@ -7087,9 +7168,11 @@ export class Gateway {
       unregisterDelegation?.()
       this._releaseDelegateSlot(slotOpts)
       // 本次 delegate 的子会话(sessionKey 带时间戳,一次性)在生命周期内可能
-      // 作为"父"再委派 hidden 审查员;它收尾后计数键永远不会复用,这里清理防泄漏。
-      // 注意清的是子会话自己的键,不动 guardKey(父会话的额度要跨多次 delegate 累计)。
+      // 作为"父"再委派(hidden 审查员 / 嵌套成员);它收尾后计数键永远不会复用,
+      // 两个 per-turn 计数器都清理防泄漏。注意清的是子会话自己的键,不动 delegateGuardKey
+      //(父会话的额度要跨多次 delegate 累计,turn 边界才复位)。
       this._hiddenDelegateGuard.resetForParent(sessionKey)
+      this._memberDelegateGuard?.resetForParent(sessionKey)
     }
 
     eventBus.emit('agent.completed', createEvent('agent.completed', targetAgentId, {
@@ -7131,7 +7214,10 @@ export class Gateway {
     return {
       kind: 'completed',
       ok: !error,
-      output: output.trim(),
+      // P2 批次4(1b)— 回传封顶:普通成员委派的 output 兜底截断(env 默认 4000 字,截断尾注
+      // 引导落文件)。**不裁 review**:review.output 要经 buildTeamReviewContinuation 全量喂回
+      // 队长续写(内部编排,不面向用户),截断会丢审查意见。团队卡 resultSummary(上方 2KB)独立。
+      output: isReview ? output.trim() : capDelegateOutput(output.trim()),
       error: error || undefined,
       timedOut,
       runId: progressRunId,
@@ -9840,8 +9926,12 @@ export class Gateway {
         `可委派的成员（已安装 agent）：\n${memberLines}`,
         '- 你是队长，也是完成用户任务的第一负责人；从任务拆解、是否委派到最终答复，都由你端到端负责。',
         '- 领域匹配优先于泛泛并行：用户任务明显属于某个已安装成员的领域时，优先把对应部分委派给该成员；多领域任务则拆给对应成员后由你综合。常见路由：代码/调试/测试/重构/代码库 → `coding-assistant`；科研/文献/论文/引用/学术分析 → `research-assistant`；文档/PPT/Excel/PDF/周报/公文/邮件/办公交付 → `office-assistant`。如果对应成员未安装，你可以自己完成或选择最接近的已安装成员。',
+        '- 需要多个成员协作的复杂任务：先用 `TodoWrite` 列出一份简明的拆解计划（每一步派给谁、预期产出什么），再照计划委派；简单任务无需列计划，直接做即可。',
         '- 任务复杂、可拆解 → **首选**用 `delegate_task(goal, agentId, context)` 委派子任务给上面列出的已安装成员组队，拿到各成员结果后你综合成给用户的最终答案；任务简单则直接自己完成。',
-        '- 委派**只走 `delegate_task`**：这是平台唯一的组队/委派通道（有实时进度回传、计费与资源约束）。平台已停用 codex 原生 `Agent`/子进程编排，不存在这样的工具，不要尝试启动；需要拆分的子任务一律用 `delegate_task`，不确定或不适合委派时就自己完成。',
+        '- 多个**互相独立、可同时进行**的子任务 → 用 `delegate_tasks`（tasks 列表，单次最多 4 个）一次性并行派发，比逐个 `delegate_task` 更快拿齐结果；若子任务之间有先后依赖（B 要用到 A 的产出），仍用 `delegate_task` 分步串行。',
+        '- 按子任务量级选 `effort`：机械/简单子任务填 `low`，常规填 `medium`，攻坚/高难度填 `high`；拿不准就不填（用该成员默认档位），不要把简单活儿也开到 `high` 徒增开销与耗时。',
+        '- 成员的大产物（完整代码/长文档/数据文件）会以「文件路径 + 摘要」的形式回传（大产物落在共享目录 `/home/agent/.openclaude/generated/`）；你综合最终答案时，需要完整内容就用 `Read` 按回传的路径读回来，别只凭摘要臆测。',
+        '- 委派**只走 `delegate_task` / `delegate_tasks`**：这是平台唯一的组队/委派通道（有实时进度回传、计费与资源约束）。平台已停用 codex 原生 `Agent`/子进程编排，不存在这样的工具，不要尝试启动；需要拆分的子任务一律用这两个工具，不确定或不适合委派时就自己完成。',
         '',
         '用户任务：',
         '',
@@ -9857,10 +9947,12 @@ export class Gateway {
         : sessionKey.includes(':inter:')
           ? ('inter-agent' as const)
           : ('chat' as const)
-    // 新用户 turn 开启 → 清零本会话对 hidden 审查员的串行委派计数。delegate 请求
-    // 只带 parentSessionKey(没有 turn 级标识),所以"每 turn 上限"的 turn 边界由
-    // 这里定义:同一 sessionKey 收到下一条入站用户消息即视为新 turn。
+    // 新用户 turn 开启 → 清零本会话的两个 per-turn 委派计数(hidden 审查员串行熔断 +
+    // 普通成员每 turn 上限)。delegate 请求只带 parentSessionKey(没有 turn 级标识),
+    // 所以"每 turn 上限"的 turn 边界由这里定义:同一 sessionKey 收到下一条入站用户消息
+    // 即视为新 turn。
     this._hiddenDelegateGuard.resetForParent(sessionKey)
+    this._memberDelegateGuard?.resetForParent(sessionKey)
     // P2 债C — 新 turn 起始清零"本 turn 是否发生过非隐藏委派"跟踪(与上面的熔断重置同点)。
     ;(this._turnDelegatedNonHiddenByParent ??= new Set()).delete(sessionKey)
     // P2 债C — hidden reviewer 硬编排状态。orchestrateReview:仅 teamMode 队长(main)且
