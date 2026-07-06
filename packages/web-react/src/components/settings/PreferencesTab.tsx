@@ -29,11 +29,14 @@ const THEME_OPTIONS: { value: Theme; label: string; icon: typeof Sun }[] = [
 /** UI 主题枚举 ↔ 后端 preferences 枚举（system ↔ auto）。 */
 const uiToServerTheme = (t: Theme): "light" | "dark" | "auto" => (t === "system" ? "auto" : t);
 
+// 微信两开关(wechat_show_tool_calls / wechat_proactive_push)在 v5 通道下是死开关:
+// v5 作为控制面 follower 硬关 wechat broker(index.ts controlPlaneEnabled 恒 false),
+// binding/inbound/outbound/proactive 全链缺席,推送尝试被 master 404 静默回退 webchat。
+// 在 v5 微信通道接通前(roadmap P1.2 专项决策)不渲染这两个开关,避免 UI 承诺做不到的事。
+// 偏好字段本身保留(preferences.ts allowlist),将来通道接通再放回渲染。
 const NOTIF_FIELDS: { key: keyof PrefsView; label: string; hint?: string }[] = [
   { key: "notify_email", label: "邮件通知" },
   { key: "notify_telegram", label: "Telegram 通知" },
-  { key: "wechat_show_tool_calls", label: "微信展示工具调用过程" },
-  { key: "wechat_proactive_push", label: "微信主动推送", hint: "定时任务 / 提醒结果推送到微信" },
 ];
 
 const MAX_HOTKEYS = 32;
