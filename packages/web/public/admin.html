@@ -2070,8 +2070,58 @@
         color: var(--muted);
         font-size: 12px;
       }
-      /* 12 列表格:压缩单元格留白,数字输入右对齐等宽字体 */
+      /* 14 列表格(含并发/24h 用量):压缩单元格留白,数字输入右对齐等宽字体 */
       .modelops-table th, .modelops-table td { padding: 8px 10px; }
+      /* ── 容量面:并发 badge / 用量列 / 服务商利用率条 ── */
+      .mo-inflight-cur {
+        font-size: 14px;
+        font-weight: 700;
+        font-family: var(--font-mono);
+      }
+      .modelops-table td.mo-concurrency { white-space: nowrap; }
+      .mo-inflight-peak {
+        color: var(--muted);
+        font-size: 11px;
+        margin-left: 4px;
+        white-space: nowrap;
+      }
+      .modelops-table td.mo-usage {
+        font-family: var(--font-mono);
+        font-size: 11.5px;
+        color: var(--text-soft);
+        white-space: nowrap;
+      }
+      .mo-prov-inflight {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        flex: 1 1 auto;
+        min-width: 0;
+      }
+      .mo-util-bar {
+        flex: 1 1 60px;
+        min-width: 40px;
+        height: 6px;
+        border-radius: 3px;
+        background: var(--bg-subtle);
+        border: 1px solid var(--border-subtle);
+        overflow: hidden;
+      }
+      .mo-util-fill { height: 100%; border-radius: 3px; transition: width var(--t-fast, 0.15s); }
+      .mo-util-fill.ok { background: var(--ok); }
+      .mo-util-fill.warn { background: var(--warn); }
+      .mo-util-fill.danger { background: var(--danger); }
+      .mo-prov-usage { color: var(--muted); font-size: 12px; }
+      .mo-stats-note {
+        color: var(--muted);
+        font-size: 12px;
+        margin: -4px 0 12px;
+      }
+      .modelops-provider-row input[type="number"][data-field="climit"] {
+        width: 96px;
+        text-align: right;
+        font-family: var(--font-mono);
+      }
       .modelops-table input[type="number"] {
         width: 88px;
         text-align: right;
@@ -2209,6 +2259,6 @@
     <script src="/vendor/qrcode.min.js"></script>
     <!-- Chart.js (MIT) 用于 dashboard 折线/柱/饼图。UMD bundle,挂到 window.Chart。 -->
     <script src="/vendor/chart.umd.min.js"></script>
-    <script type="module" src="/modules/admin.js?v=fb8211eb"></script>
+    <script type="module" src="/modules/admin.js?v=501cba4f"></script>
   </body>
 </html>

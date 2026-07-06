@@ -37,6 +37,7 @@ import { makeLoadUserModelAuthz } from "../auth/userModelAuthz.js";
 import { makeAnthropicProxyHandler } from "../http/anthropicProxy.js";
 import { assertPlatformDefaultModelConfigured } from "../http/proxy/staticProviderMeta.js";
 import { startLatencyProber } from "./latencyProber.js";
+import { snapshotInflight } from "../http/proxy/inflightTracker.js";
 import { ocGatewayIpForChannel, ocInternalProxyPortForChannel } from "../agent-sandbox/v3supervisor.js";
 import { getSelfHost } from "../compute-pool/queries.js";
 import { rootLogger } from "../logging/logger.js";
@@ -282,6 +283,14 @@ export async function startEgress(): Promise<void> {
       res.statusCode = 200;
       res.setHeader("Content-Type", "application/json");
       res.end(JSON.stringify({ ok: true, role: "egress", pendingCostEvents: costSink.pending }));
+      return;
+    }
+    // 0106 — per-model 在飞快照(admin 容量面;master 的 model-ops 端点拉取,egress 是
+    // /v1/messages 的独占进程,这里的计数即全量权威)。与 egress-health 同级内网只读面。
+    if (path === "/internal/v5/egress-stats") {
+      res.statusCode = 200;
+      res.setHeader("Content-Type", "application/json");
+      res.end(JSON.stringify({ ok: true, role: "egress", inflight: snapshotInflight() }));
       return;
     }
     forward(req, res, peerIp);

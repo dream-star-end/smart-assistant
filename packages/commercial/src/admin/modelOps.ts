@@ -71,6 +71,8 @@ export interface ProviderOpsView {
   probeEnabled: boolean;
   subscription_expires_at: string | null;
   notes: string | null;
+  /** 0106 — 服务商并发上限(订阅规格手填,展示/利用率用,不做请求期强制)。 */
+  concurrency_limit: number | null;
   ops_updated_at: string | null;
   latest: {
     probed_at: string;
@@ -87,6 +89,7 @@ type OpsRow = {
   display_name: string | null;
   subscription_expires_at: Date | null;
   notes: string | null;
+  concurrency_limit: number | null;
   updated_at: Date;
 };
 
@@ -105,7 +108,7 @@ export async function listProvidersOverview(
   keyConfigured: Record<string, boolean>,
 ): Promise<ProviderOpsView[]> {
   const ops = await query<OpsRow>(
-    `SELECT provider_id, display_name, subscription_expires_at, notes, updated_at
+    `SELECT provider_id, display_name, subscription_expires_at, notes, concurrency_limit, updated_at
        FROM provider_ops`,
   );
   const opsById = new Map(ops.rows.map((r) => [r.provider_id, r]));
@@ -143,6 +146,7 @@ export async function listProvidersOverview(
       probeEnabled: !isCodex,
       subscription_expires_at: opsRow?.subscription_expires_at?.toISOString() ?? null,
       notes: opsRow?.notes ?? null,
+      concurrency_limit: opsRow?.concurrency_limit ?? null,
       ops_updated_at: opsRow?.updated_at.toISOString() ?? null,
       latest: last
         ? {
@@ -163,6 +167,70 @@ export async function listProvidersOverview(
   return out;
 }
 
+// ─── 用量聚合(0106 容量面) ───────────────────────────────────────────
+
+export interface ModelUsageWindow {
+  requests: number;
+  input_tokens: string;
+  output_tokens: string;
+  cache_read_tokens: string;
+  credits: string;
+}
+
+export interface ModelUsageAgg {
+  d1: ModelUsageWindow;
+  d7: ModelUsageWindow;
+}
+
+type UsageAggRow = {
+  model: string;
+  req_1d: string; in_1d: string; out_1d: string; cache_1d: string; credits_1d: string;
+  req_7d: string; in_7d: string; out_7d: string; cache_7d: string; credits_7d: string;
+};
+
+/**
+ * per-model 24h/7d 用量聚合(usage_records 单次 7 天窗扫描 + FILTER 拆 24h;
+ * 走 0106 的 (model, created_at) 索引)。BIGINT 一律 ::text 防 JS 精度丢失。
+ */
+export async function listModelUsageAggregates(): Promise<Record<string, ModelUsageAgg>> {
+  const r = await query<UsageAggRow>(
+    `SELECT model,
+       COUNT(*)                    FILTER (WHERE created_at > NOW() - interval '24 hours')::text AS req_1d,
+       COALESCE(SUM(input_tokens)      FILTER (WHERE created_at > NOW() - interval '24 hours'), 0)::text AS in_1d,
+       COALESCE(SUM(output_tokens)     FILTER (WHERE created_at > NOW() - interval '24 hours'), 0)::text AS out_1d,
+       COALESCE(SUM(cache_read_tokens) FILTER (WHERE created_at > NOW() - interval '24 hours'), 0)::text AS cache_1d,
+       COALESCE(SUM(cost_credits)      FILTER (WHERE created_at > NOW() - interval '24 hours'), 0)::text AS credits_1d,
+       COUNT(*)::text AS req_7d,
+       COALESCE(SUM(input_tokens), 0)::text AS in_7d,
+       COALESCE(SUM(output_tokens), 0)::text AS out_7d,
+       COALESCE(SUM(cache_read_tokens), 0)::text AS cache_7d,
+       COALESCE(SUM(cost_credits), 0)::text AS credits_7d
+     FROM usage_records
+     WHERE created_at > NOW() - interval '7 days'
+     GROUP BY model`,
+  );
+  const out: Record<string, ModelUsageAgg> = {};
+  for (const row of r.rows) {
+    out[row.model] = {
+      d1: {
+        requests: Number(row.req_1d),
+        input_tokens: row.in_1d,
+        output_tokens: row.out_1d,
+        cache_read_tokens: row.cache_1d,
+        credits: row.credits_1d,
+      },
+      d7: {
+        requests: Number(row.req_7d),
+        input_tokens: row.in_7d,
+        output_tokens: row.out_7d,
+        cache_read_tokens: row.cache_7d,
+        credits: row.credits_7d,
+      },
+    };
+  }
+  return out;
+}
+
 // ─── PUT /api/admin/providers/:id ───────────────────────────────────
 
 export class UnknownProviderError extends Error {
@@ -176,6 +244,8 @@ export interface PutProviderOpsInput {
   subscription_expires_at?: string | null;
   notes?: string | null;
   display_name?: string | null;
+  /** 0106 — null=清除;正整数 1..100000(展示/利用率语义,非限流)。 */
+  concurrency_limit?: number | null;
 }
 
 export interface PutProviderOpsCtx {
@@ -190,6 +260,13 @@ function normalizeExpiry(v: string | null | undefined): Date | null | undefined 
   const d = new Date(v);
   if (Number.isNaN(d.getTime())) throw new RangeError("invalid_subscription_expires_at");
   return d;
+}
+
+function normalizeConcurrencyLimit(v: number | null | undefined): number | null | undefined {
+  if (v === undefined) return undefined;
+  if (v === null) return null;
+  if (!Number.isInteger(v) || v < 1 || v > 100_000) throw new RangeError("invalid_concurrency_limit");
+  return v;
 }
 
 function normalizeText(v: string | null | undefined, max: number, field: string): string | null | undefined {
@@ -214,10 +291,11 @@ export async function putProviderOps(
   const expiry = normalizeExpiry(input.subscription_expires_at);
   const notes = normalizeText(input.notes, 2000, "notes");
   const displayName = normalizeText(input.display_name, 128, "display_name");
+  const concurrencyLimit = normalizeConcurrencyLimit(input.concurrency_limit);
 
   await tx(async (client: PoolClient) => {
     const before = await client.query<OpsRow>(
-      `SELECT provider_id, display_name, subscription_expires_at, notes, updated_at
+      `SELECT provider_id, display_name, subscription_expires_at, notes, concurrency_limit, updated_at
          FROM provider_ops WHERE provider_id = $1 FOR UPDATE`,
       [id],
     );
@@ -226,17 +304,20 @@ export async function putProviderOps(
       display_name: displayName !== undefined ? displayName : (b?.display_name ?? null),
       subscription_expires_at: expiry !== undefined ? expiry : (b?.subscription_expires_at ?? null),
       notes: notes !== undefined ? notes : (b?.notes ?? null),
+      concurrency_limit:
+        concurrencyLimit !== undefined ? concurrencyLimit : (b?.concurrency_limit ?? null),
     };
     await client.query(
-      `INSERT INTO provider_ops (provider_id, display_name, subscription_expires_at, notes, updated_at, updated_by)
-       VALUES ($1, $2, $3, $4, NOW(), $5::bigint)
+      `INSERT INTO provider_ops (provider_id, display_name, subscription_expires_at, notes, concurrency_limit, updated_at, updated_by)
+       VALUES ($1, $2, $3, $4, $5, NOW(), $6::bigint)
        ON CONFLICT (provider_id) DO UPDATE SET
          display_name = EXCLUDED.display_name,
          subscription_expires_at = EXCLUDED.subscription_expires_at,
          notes = EXCLUDED.notes,
+         concurrency_limit = EXCLUDED.concurrency_limit,
          updated_at = NOW(),
          updated_by = EXCLUDED.updated_by`,
-      [id, next.display_name, next.subscription_expires_at, next.notes, String(ctx.adminId)],
+      [id, next.display_name, next.subscription_expires_at, next.notes, next.concurrency_limit, String(ctx.adminId)],
     );
     await writeAdminAudit(client, {
       adminId: ctx.adminId,
@@ -246,11 +327,13 @@ export async function putProviderOps(
         display_name: b?.display_name ?? null,
         subscription_expires_at: b?.subscription_expires_at?.toISOString() ?? null,
         notes: b?.notes ?? null,
+        concurrency_limit: b?.concurrency_limit ?? null,
       },
       after: {
         display_name: next.display_name,
         subscription_expires_at: next.subscription_expires_at?.toISOString?.() ?? null,
         notes: next.notes,
+        concurrency_limit: next.concurrency_limit,
       },
       ip: ctx.ip ?? null,
       userAgent: ctx.userAgent ?? null,

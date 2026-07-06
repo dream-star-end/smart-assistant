@@ -15,12 +15,19 @@ import { listPricing } from "../../admin/pricing.js";
 import { serializePricing } from "./pricing.js";
 import {
   listProvidersOverview,
+  listModelUsageAggregates,
   putProviderOps,
   effortMetaForModel,
   UnknownProviderError,
   CODEX_PROVIDER_ID,
   type PutProviderOpsInput,
+  type ModelUsageWindow,
 } from "../../admin/modelOps.js";
+import { snapshotInflight, type InflightSnapshot } from "../proxy/inflightTracker.js";
+import {
+  ocGatewayIpForChannel,
+  ocInternalProxyPortForChannel,
+} from "../../agent-sandbox/v3supervisor.js";
 import { findRouteProviderForModel } from "@openclaude/protocol";
 import { loadConfig } from "../../config.js";
 import type { CommercialHttpDeps, RequestContext } from "../handlers.js";
@@ -47,6 +54,45 @@ function keyConfiguredMap(): Record<string, boolean> {
   };
 }
 
+// ─── 0106 容量面:在飞快照获取 ───────────────────────────────────────
+//
+// v5 拓扑下 /v1/messages 由 egress 进程独占 → egress 的计数是权威;master 经内网
+// /internal/v5/egress-stats 拉取(地址用与 egress bind **同一推导函数**,不猜 env)。
+// egress split 未开或拉取失败 → fail-soft 回落本进程快照并标注 source。
+
+interface StatsResult {
+  by_model: InflightSnapshot["by_model"];
+  source: "egress" | "local" | "local_fallback";
+  started_at: string;
+}
+
+async function fetchInflightStats(): Promise<StatsResult> {
+  const local = (source: StatsResult["source"]): StatsResult => {
+    const snap = snapshotInflight();
+    return { by_model: snap.by_model, source, started_at: snap.started_at };
+  };
+  if (process.env.OC_EGRESS_SPLIT !== "1") return local("local");
+  // 地址推导与 egress bind 用同一权威函数(内部按 OC_RUNTIME_CHANNEL 判定),不猜 env。
+  const url = `http://${ocGatewayIpForChannel()}:${ocInternalProxyPortForChannel()}/internal/v5/egress-stats`;
+  try {
+    const res = await fetch(url, { signal: AbortSignal.timeout(2000) });
+    if (!res.ok) return local("local_fallback");
+    const j = (await res.json()) as { inflight?: InflightSnapshot };
+    if (!j?.inflight?.by_model) return local("local_fallback");
+    return { by_model: j.inflight.by_model, source: "egress", started_at: j.inflight.started_at };
+  } catch {
+    return local("local_fallback");
+  }
+}
+
+const ZERO_WINDOW: ModelUsageWindow = {
+  requests: 0,
+  input_tokens: "0",
+  output_tokens: "0",
+  cache_read_tokens: "0",
+  credits: "0",
+};
+
 /** 模型 → 服务商归属 chip:静态路由按注册表;gpt-* → codex;其余 → oauth。 */
 function providerIdForModel(modelId: string): string {
   const p = findRouteProviderForModel(modelId);
@@ -64,14 +110,64 @@ export async function handleAdminModelOpsOverview(
   deps: CommercialHttpDeps,
 ): Promise<void> {
   await requireAdmin(req, deps.jwtSecret);
-  const rows = await listPricing();
+  const [rows, providersBase, usageAgg, stats] = await Promise.all([
+    listPricing(),
+    listProvidersOverview(keyConfiguredMap()),
+    listModelUsageAggregates(),
+    fetchInflightStats(),
+  ]);
   const models = rows.map((r) => ({
     ...serializePricing(r),
     provider: { id: providerIdForModel(r.model_id) },
     effort: effortMetaForModel(r.model_id),
+    inflight: stats.by_model[r.model_id] ?? null,
+    usage: usageAgg[r.model_id] ?? { d1: ZERO_WINDOW, d7: ZERO_WINDOW },
   }));
-  const providers = await listProvidersOverview(keyConfiguredMap());
-  sendJson(res, 200, { models, providers });
+  // provider 级汇总:当前并发合计(含 pricing 表以外的历史模型,按路由归属)+ 24h 用量。
+  const inflightByProvider = new Map<string, number>();
+  for (const [model, v] of Object.entries(stats.by_model)) {
+    const pid = providerIdForModel(model);
+    inflightByProvider.set(pid, (inflightByProvider.get(pid) ?? 0) + v.current);
+  }
+  const usageByProvider = new Map<string, { requests: number; tokens: bigint; credits: bigint }>();
+  for (const [model, agg] of Object.entries(usageAgg)) {
+    const pid = providerIdForModel(model);
+    const cur = usageByProvider.get(pid) ?? { requests: 0, tokens: 0n, credits: 0n };
+    cur.requests += agg.d1.requests;
+    cur.tokens += BigInt(agg.d1.input_tokens) + BigInt(agg.d1.output_tokens);
+    cur.credits += BigInt(agg.d1.credits);
+    usageByProvider.set(pid, cur);
+  }
+  const providers = providersBase.map((p) => {
+    const u = usageByProvider.get(p.id);
+    return {
+      ...p,
+      inflight_current: inflightByProvider.get(p.id) ?? 0,
+      usage_d1: {
+        requests: u?.requests ?? 0,
+        tokens: (u?.tokens ?? 0n).toString(),
+        credits: (u?.credits ?? 0n).toString(),
+      },
+    };
+  });
+  sendJson(res, 200, {
+    models,
+    providers,
+    stats: { source: stats.source, started_at: stats.started_at },
+  });
+}
+
+// ─── GET /api/admin/model-ops/stats(轻量,前端 30s 轮询) ─────────────
+
+export async function handleAdminModelOpsStats(
+  req: IncomingMessage,
+  res: ServerResponse,
+  _ctx: RequestContext,
+  deps: CommercialHttpDeps,
+): Promise<void> {
+  await requireAdmin(req, deps.jwtSecret);
+  const stats = await fetchInflightStats();
+  sendJson(res, 200, stats);
 }
 
 // ─── PUT /api/admin/providers/:id ───────────────────────────────────
@@ -100,6 +196,12 @@ export async function handleAdminPutProviderOps(
       }
       input[f] = v as string | null;
     }
+  }
+  if (b.concurrency_limit !== undefined) {
+    if (b.concurrency_limit !== null && typeof b.concurrency_limit !== "number") {
+      throw new HttpError(400, "VALIDATION", "concurrency_limit must be number or null");
+    }
+    input.concurrency_limit = b.concurrency_limit as number | null;
   }
 
   try {

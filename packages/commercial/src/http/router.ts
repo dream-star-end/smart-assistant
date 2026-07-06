@@ -108,7 +108,7 @@ import { handleAdminRemoveUserModelGrant } from './admin/modelGrants.js'
 import { handleAdminGetOrder, handleAdminListOrders, handleAdminOrdersKpi } from './admin/orders.js'
 import { handleAdminListPlans, handleAdminPatchPlan } from './admin/plans.js'
 import { handleAdminListPricing, handleAdminPatchPricing } from './admin/pricing.js'
-import { handleAdminModelOpsOverview, handleAdminPutProviderOps } from './admin/modelOps.js'
+import { handleAdminModelOpsOverview, handleAdminModelOpsStats, handleAdminPutProviderOps } from './admin/modelOps.js'
 import { handleAdminGetSession } from './admin/sessions.js'
 import {
   handleAdminGetSetting,
@@ -706,6 +706,8 @@ export function createCommercialHandler(
     { method: 'PATCH', pathPrefix: '/api/admin/pricing/', handler: handleAdminPatchPricing },
     // 0105 模型与服务商统一运维页(models+providers 总览 / provider 运维字段编辑)
     { method: 'GET', path: '/api/admin/model-ops', handler: handleAdminModelOpsOverview },
+    // 0106 轻量在飞快照(前端 30s 轮询)
+    { method: 'GET', path: '/api/admin/model-ops/stats', handler: handleAdminModelOpsStats },
     { method: 'PUT', pathPrefix: '/api/admin/providers/', handler: handleAdminPutProviderOps },
     // DeepXiv 文献检索(平台级,单例) — exact-path 在 test 子资源之前
     { method: 'GET', path: '/api/admin/literature', handler: handleAdminGetLiterature },
