@@ -16,6 +16,7 @@ import { getSettings_DEPRECATED } from '../../utils/settings/settings.js'
 import { asSystemPrompt } from '../../utils/systemPromptType.js'
 import { isPreapprovedHost } from './preapproved.js'
 import { makeSecondaryModelPrompt } from './prompt.js'
+import { smartTruncateMarkdown } from './truncate.js'
 
 // Custom error classes for domain blocking
 class DomainBlockedError extends Error {
@@ -488,12 +489,12 @@ export async function applyPromptToMarkdown(
   isNonInteractiveSession: boolean,
   isPreapprovedDomain: boolean,
 ): Promise<string> {
-  // Truncate content to avoid "Prompt is too long" errors from the secondary model
-  const truncatedContent =
-    markdownContent.length > MAX_MARKDOWN_LENGTH
-      ? markdownContent.slice(0, MAX_MARKDOWN_LENGTH) +
-        '\n\n[Content truncated due to length...]'
-      : markdownContent
+  // Structure-aware truncation to avoid "Prompt is too long" errors from the
+  // secondary model. Same 100K budget, but instead of a head-only slice that
+  // drops the entire tail, keep head + section outline (headings + first para)
+  // + tail so conclusions/references and later structure survive. Single model
+  // call is preserved — we never chunk-and-resummarize (that would multiply cost).
+  const truncatedContent = smartTruncateMarkdown(markdownContent, MAX_MARKDOWN_LENGTH)
 
   const modelPrompt = makeSecondaryModelPrompt(
     truncatedContent,

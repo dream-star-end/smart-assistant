@@ -28,7 +28,7 @@ import {
   type ToolLike,
 } from "./format";
 import { parseMcpName } from "./meta";
-import { researchToolCard } from "./researchCards";
+import { researchToolCard, WebSearchResultsCard } from "./researchCards";
 
 type Input = Record<string, unknown> | null;
 type BodyProps = { input: Input; tool: ToolLike };
@@ -362,6 +362,8 @@ function WebFetchBody({ input, tool }: BodyProps) {
 }
 
 function WebSearchBody({ input, tool }: BodyProps) {
+  // 富卡:把结果文本解析成来源列表;解析不出(空/畸形/出错)→ 回落通用 OutputBlock(UX 铁律)。
+  const card = tool.error ? null : WebSearchResultsCard({ tool });
   return (
     <>
       {input && (
@@ -374,7 +376,7 @@ function WebSearchBody({ input, tool }: BodyProps) {
           }}
         />
       )}
-      <OutputBlock output={tool.output} />
+      {card ?? <OutputBlock output={tool.output} />}
     </>
   );
 }
