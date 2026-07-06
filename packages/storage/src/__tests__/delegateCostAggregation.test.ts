@@ -218,3 +218,82 @@ describe('delegate cost aggregation — 无委派成本零副作用', () => {
     assert.equal(await leaderCost(CLIENT_SESSION, userId, leaderMsgId), undefined, '不臆造 costCredits')
   })
 })
+
+describe('delegate cost aggregation — P2 债D per-delegate 明细(usage.delegates[])', () => {
+  beforeEach(async () => { await clearTables() })
+
+  async function leaderDelegates(sessId: string, userId: string, msgId: string) {
+    const m = (await getMessages(sessId, userId)).find((x) => x.id === msgId)
+    return (m?.usage as { delegates?: Array<{ agentId: string; costCredits: string }> } | undefined)?.delegates
+  }
+
+  it('drain 按 delegate_agent_id 分组求和写进队长行 usage.delegates[](确定性排序);总额仍进 costCredits', async () => {
+    const userId = 'c:deleg-detail'
+    await ensureSession(userId)
+    const leaderMsgId = 'srv-web-leader-01-main-t1'
+    await appendServerAuthoredMessageDrainByUser(CLIENT_SESSION, userId, {
+      id: leaderMsgId, role: 'assistant' as const, text: '队长综合', ts: 1000, status: 'completed', usage: {},
+    }, 'engine-leader')
+
+    // 两个 coding-assistant 委派(3+2)+ 一个 hidden-reviewer 审查(4)。第 6 参 = delegateAgentId。
+    await appendCostCredits('req-d1', userId, '3', 'engine-d1', CLIENT_SESSION, 'coding-assistant')
+    await appendCostCredits('req-d2', userId, '2', 'engine-d2', CLIENT_SESSION, 'coding-assistant')
+    await appendCostCredits('req-rev', userId, '4', 'engine-rev', CLIENT_SESSION, 'hidden-reviewer')
+
+    const d = await drainDelegateCostForClientSession(CLIENT_SESSION, userId, leaderMsgId)
+    assert.equal(d.merged, '9', '3+2+4 = 9 归并总额')
+    assert.equal(d.drained, 3)
+    // 明细按 agentId 分组求和、agentId 升序:coding-assistant=5, hidden-reviewer=4。
+    assert.deepEqual(d.delegates, [
+      { agentId: 'coding-assistant', costCredits: '5' },
+      { agentId: 'hidden-reviewer', costCredits: '4' },
+    ])
+    assert.equal(await leaderCost(CLIENT_SESSION, userId, leaderMsgId), '9', '总额进 costCredits')
+    assert.deepEqual(await leaderDelegates(CLIENT_SESSION, userId, leaderMsgId), [
+      { agentId: 'coding-assistant', costCredits: '5' },
+      { agentId: 'hidden-reviewer', costCredits: '4' },
+    ], '明细落队长行 usage.delegates[]')
+  })
+
+  it('第二轮委派 drain 累加合并进已有 delegates[](不替换),支持多轮审查', async () => {
+    const userId = 'c:deleg-merge'
+    await ensureSession(userId)
+    const leaderMsgId = 'srv-web-leader-01-main-t1'
+    await appendServerAuthoredMessageDrainByUser(CLIENT_SESSION, userId, {
+      id: leaderMsgId, role: 'assistant' as const, text: 'x', ts: 1000, status: 'completed', usage: {},
+    }, 'engine-leader')
+
+    // 第一轮:reviewer 审查花 4。
+    await appendCostCredits('req-rev1', userId, '4', 'engine-rev1', CLIENT_SESSION, 'hidden-reviewer')
+    await drainDelegateCostForClientSession(CLIENT_SESSION, userId, leaderMsgId)
+    assert.deepEqual(await leaderDelegates(CLIENT_SESSION, userId, leaderMsgId), [
+      { agentId: 'hidden-reviewer', costCredits: '4' },
+    ])
+
+    // 第二轮(NEEDS_FIX 后再审):reviewer 再花 3 → 累加成 7,不覆盖。
+    await appendCostCredits('req-rev2', userId, '3', 'engine-rev2', CLIENT_SESSION, 'hidden-reviewer')
+    const d2 = await drainDelegateCostForClientSession(CLIENT_SESSION, userId, leaderMsgId)
+    assert.equal(d2.merged, '3')
+    assert.deepEqual(d2.delegates, [{ agentId: 'hidden-reviewer', costCredits: '7' }], '快照含历史合并')
+    assert.equal(await leaderCost(CLIENT_SESSION, userId, leaderMsgId), '7', 'costCredits 4→7')
+    assert.deepEqual(await leaderDelegates(CLIENT_SESSION, userId, leaderMsgId), [
+      { agentId: 'hidden-reviewer', costCredits: '7' },
+    ], 'delegates[] 累加不替换')
+  })
+
+  it('缺 delegate_agent_id 的委派成本仍进总额、但不出现在 delegates[] 明细', async () => {
+    const userId = 'c:deleg-null'
+    await ensureSession(userId)
+    const leaderMsgId = 'srv-web-leader-01-main-t1'
+    await appendServerAuthoredMessageDrainByUser(CLIENT_SESSION, userId, {
+      id: leaderMsgId, role: 'assistant' as const, text: 'x', ts: 1000, status: 'completed', usage: {},
+    }, 'engine-leader')
+    // 老 park(5 参,无 agentId)+ 一条带 agentId。
+    await appendCostCredits('req-old', userId, '6', 'engine-old', CLIENT_SESSION)
+    await appendCostCredits('req-new', userId, '2', 'engine-new', CLIENT_SESSION, 'office-assistant')
+    const d = await drainDelegateCostForClientSession(CLIENT_SESSION, userId, leaderMsgId)
+    assert.equal(d.merged, '8', '6+2 总额不丢')
+    assert.deepEqual(d.delegates, [{ agentId: 'office-assistant', costCredits: '2' }], '仅带 agentId 的进明细')
+    assert.equal(await leaderCost(CLIENT_SESSION, userId, leaderMsgId), '8')
+  })
+})

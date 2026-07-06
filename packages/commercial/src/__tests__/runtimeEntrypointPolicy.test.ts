@@ -21,6 +21,10 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
+// P2 债C 两源一致性:reviewer 裁决词汇的单一权威源。commercial 是 tsc/node-test(可 import
+// protocol,已有 staticProviderGuard/agentModelAuthority 等测试先例);entrypoint.ts 则因是
+// 容器内运行时脚本、非 tsc 编译只能硬编码字面量 → 用本测试把这两源锁在一起。
+import { REVIEW_VERDICTS } from "@openclaude/protocol";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -354,6 +358,59 @@ describe("openclaude-runtime entrypoint env-scrub policy", () => {
       src,
       /provider:\s*"claude-subscription"/,
       "entrypoint must not seed Claude subscription provider for the default commercial agent",
+    );
+  });
+
+  // ───────────────────────────────────────────────
+  // P2 债C:reviewer persona ↔ @openclaude/protocol 裁决词汇 两源一致性
+  // ───────────────────────────────────────────────
+  // 历史断裂:reviewer persona 让模型"输出 PASS / NEEDS_FIX"(自由文本),而 gateway 的
+  // parseVerificationVerdict 只认结构化行 `VERDICT: <值>`,两条管线互不相认 → 硬编排解析不到
+  // 裁决。现在 persona 必须在末行输出结构化裁决行,词汇由 @openclaude/protocol REVIEW_VERDICTS
+  // 单一权威。本测试把两源锁在一起:任一源改动裁决词而另一源没跟 → 红。
+  // 漂移后果:gateway 解析不到 VERDICT 行 → 判"审查未完成"并降级放行,团队模式隐藏审查形同虚设。
+  test("hidden reviewer persona 的结构化裁决词汇与 @openclaude/protocol REVIEW_VERDICTS 两源一致", () => {
+    const src = readFileSync(ENTRYPOINT_TS_PATH, "utf-8");
+    const personaSrc = extractConstObjectFromSource(src, "desiredHiddenReviewerAgent");
+
+    // 源2 = protocol 权威裁决词(不再手抄,直接 import);当前应为 ['PASS','NEEDS_FIX']。
+    // 兜底断言:如果哪天 protocol 词汇集变了,下面遍历会用新集合逐个校验 persona 是否跟进。
+    assert.ok(
+      REVIEW_VERDICTS.length >= 2,
+      "REVIEW_VERDICTS 至少应含 PASS / NEEDS_FIX 两个裁决值(protocol teamCards.ts 单一权威)",
+    );
+
+    // 1) persona(源1,entrypoint.ts 源码文本)必须包含结构化裁决行形态,gateway 正则
+    //    /^VERDICT:\s*(PASS|FAIL|PARTIAL|NEEDS_FIX)\s*$/m 才解析得到裁决。
+    assert.match(
+      personaSrc,
+      /VERDICT:\s*PASS/,
+      "reviewer persona 必须指示输出结构化裁决行 `VERDICT: PASS`;缺失则 gateway 解析不到裁决 → 降级放行",
+    );
+    assert.match(
+      personaSrc,
+      /VERDICT:\s*NEEDS_FIX/,
+      "reviewer persona 必须指示输出结构化裁决行 `VERDICT: NEEDS_FIX`;缺失则 NEEDS_FIX 无法触发 continuation",
+    );
+
+    // 2) 遍历断言:protocol 权威里的**每个**裁决值,persona 都必须以结构化行形态提到。
+    //    这样将来 protocol 加/改裁决词而 persona 没跟,这里就会红(锁死两源)。
+    for (const verdict of REVIEW_VERDICTS) {
+      assert.match(
+        personaSrc,
+        new RegExp(`VERDICT:\\s*${verdict}`),
+        `@openclaude/protocol REVIEW_VERDICTS 含 "${verdict}",但 entrypoint reviewer persona 未指示输出 ` +
+          `\`VERDICT: ${verdict}\` —— 两源漂移:gateway 解析器认这个词,persona 却不产出它,` +
+          `团队硬编排会解析不到裁决而降级放行。protocol 改裁决词必须同步改 entrypoint persona。`,
+      );
+    }
+
+    // 3) 证明已从旧自由文本形态改造:旧文案只让模型"输出 PASS / NEEDS_FIX",无结构化 VERDICT 行,
+    //    gateway parseVerificationVerdict 认不出。改造后这句旧文案必须消失。
+    assert.doesNotMatch(
+      personaSrc,
+      /只输出简洁审查结论：PASS \/ NEEDS_FIX/,
+      "reviewer persona 仍是旧自由文本形态(未产出结构化 VERDICT 行)—— gateway 认不出裁决,硬编排失效",
     );
   });
 

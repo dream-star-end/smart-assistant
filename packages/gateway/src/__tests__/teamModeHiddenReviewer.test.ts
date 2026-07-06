@@ -1,16 +1,54 @@
+/**
+ * 团队模式隐藏审查员 —— 硬编排 review pass 行为测试 + 可见性守护回归。
+ *
+ * P2 债C 重写:审查触发权威从 prompt 软约束收归 gateway 硬编排(dispatchInbound
+ * 队长 final 放行前的 review pass,状态机在 Gateway._runTeamReviewPass)。因此本文件
+ * 的第一组断言从"逐条匹配 preamble 审查文案"改为:
+ *   1. preamble 只保留**协作**语义(拆解/委派/领域路由/综合),审查软约束整体删除;
+ *   2. _runTeamReviewPass 的**编排行为**(mock 副作用):PASS 放行 / NEEDS_FIX 续写 /
+ *      迭代封顶 / 降级放行 / continuation 报错不放行。
+ * 其余(可见性/管理面/直连拒绝/执行面拒绝)仍是源码守护断言,守护意图不变。
+ *
+ * Run: npx tsx --test packages/gateway/src/__tests__/teamModeHiddenReviewer.test.ts
+ */
 import * as assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { describe, it } from 'node:test'
 import { fileURLToPath } from 'node:url'
 
+import { Gateway } from '../server.js'
+
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = dirname(__filename)
 const SERVER_TS = join(__dirname, '..', 'server.ts')
 const CRON_TS = join(__dirname, '..', 'cron.ts')
 
-describe('team mode hidden reviewer prompt', () => {
-  it('routes specialist tasks to matching installed agents and defaults to hidden review after collaboration', () => {
+// ── 编排行为测试脚手架(沿用 hiddenDelegateLimit.test.ts 的 Object.create 先例)──
+function makeReviewGateway(): any {
+  const gw = Object.create(Gateway.prototype) as any
+  gw.log = { debug: () => {}, info: () => {}, warn: () => {}, error: () => {} }
+  return gw
+}
+const PASS_RESULT = {
+  kind: 'completed' as const,
+  ok: true,
+  output: 'looks good\nVERDICT: PASS',
+  timedOut: false,
+  runId: 'rev-1',
+  verdict: 'PASS' as const,
+}
+const NEEDS_FIX_RESULT = {
+  kind: 'completed' as const,
+  ok: true,
+  output: 'fix the thing\nVERDICT: NEEDS_FIX',
+  timedOut: false,
+  runId: 'rev-1',
+  verdict: 'NEEDS_FIX' as const,
+}
+
+describe('team mode preamble — 只保留协作语义,审查软约束已删', () => {
+  it('preamble 保留组队/委派/领域路由/综合语义', () => {
     const src = readFileSync(SERVER_TS, 'utf8')
     assert.match(src, /if \(teamMode && agent\.id === 'main'\)/)
     assert.match(src, /可委派的成员（已安装 agent）/)
@@ -18,7 +56,6 @@ describe('team mode hidden reviewer prompt', () => {
     assert.match(src, /const model = a\.model/)
     assert.match(src, /const provider = a\.provider/)
     assert.match(src, /teamMemberCapabilityHint\(a\)/)
-    assert.match(src, /\[\$\{model\}, \$\{provider\}\]/)
     assert.match(src, /领域匹配优先于泛泛并行/)
     assert.match(src, /代码\/调试\/测试\/重构\/代码库 → `coding-assistant`/)
     assert.match(src, /科研\/文献\/论文\/引用\/学术分析 → `research-assistant`/)
@@ -26,33 +63,160 @@ describe('team mode hidden reviewer prompt', () => {
     assert.match(src, /首选.*delegate_task/)
     assert.match(src, /不要优先启动 Codex 原生 `Agent`/)
     assert.match(src, /collabAgentPolicy: 'team-mode-prefer-delegate'/)
-    assert.match(src, /hidden-reviewer/)
-    assert.match(src, /agentId: "hidden-reviewer"/)
-    assert.match(src, /不在成员列表显示/)
-    assert.match(src, /完成用户任务的第一负责人/)
-    assert.match(src, /端到端负责/)
-    assert.match(src, /如果本轮实际调用了任何非队长成员/)
-    assert.match(src, /在最终答复前默认要再调用/)
-    assert.match(src, /纯机械低风险任务、用户明确要求快速\/低成本、或隐藏审查失败\/超时/)
-    assert.match(src, /审查结果只是建议，不是命令/)
-    assert.match(src, /已采纳的成员结论/)
-    assert.match(src, /审查迭代闭环/)
-    assert.match(src, /返回 PASS 或无阻塞问题/)
-    assert.match(src, /返回 NEEDS_FIX 或指出具体问题/)
-    assert.match(src, /不能直接结束/)
-    assert.match(src, /接受并修复、委派对应领域成员修复、查询\/验证证据/)
-    assert.match(src, /误报\/非问题\/范围外/)
-    assert.match(src, /再次调用 `hidden-reviewer` 审查修订稿/)
-    assert.match(src, /已修复项、未采纳意见及理由、关键证据/)
-    assert.match(src, /迭代直到隐藏审查 PASS/)
-    assert.match(src, /避免无限循环/)
-    assert.match(src, /反复失败\/超时、重复没有新信息/)
-    assert.match(src, /自主决定接受、拒绝、部分采纳、修订、再次审查或直接答复/)
-    assert.match(src, /判断无需审查并跳过，不需要向用户解释流程/)
-    assert.doesNotMatch(src, /可选审查资源，不是强制流程/)
-    assert.doesNotMatch(src, /必须先形成草稿\/方案，再调用/)
   })
 
+  it('preamble 已删除"自觉调用审查 / verdict 解读 / 迭代自律"软约束(审查改由 gateway 硬编排)', () => {
+    const src = readFileSync(SERVER_TS, 'utf8')
+    // 这些审查软约束都随硬编排上线整体删除;若哪天有人把它们加回 preamble 就会形成
+    // 两套并行审查机制(prompt 软约束 + gateway 硬编排),本断言防回退。
+    assert.doesNotMatch(src, /在最终答复前默认要再调用/)
+    assert.doesNotMatch(src, /审查迭代闭环/)
+    assert.doesNotMatch(src, /再次调用 `hidden-reviewer` 审查修订稿/)
+    assert.doesNotMatch(src, /迭代直到隐藏审查 PASS/)
+    assert.doesNotMatch(src, /避免无限循环/)
+    assert.doesNotMatch(src, /审查结果只是建议，不是命令/)
+    assert.doesNotMatch(src, /隐藏审查未完成\/失败/)
+  })
+})
+
+describe('_runTeamReviewPass — 硬编排状态机行为', () => {
+  it('PASS → 放行 final,不触发 continuation', async () => {
+    const gw = makeReviewGateway()
+    let continued = 0
+    const outcome = await gw._runTeamReviewPass({
+      sessionKey: 'agent:main:webchat:dm:w1',
+      maxRounds: 2,
+      runReview: async () => PASS_RESULT,
+      submitContinuation: async () => {
+        continued++
+        return 'held'
+      },
+    })
+    assert.deepEqual(outcome, { deliver: true })
+    assert.equal(continued, 0, 'PASS 不应触发续写')
+  })
+
+  it('NEEDS_FIX 后续写、再审 PASS → 放行(无披露)', async () => {
+    const gw = makeReviewGateway()
+    const verdicts = [NEEDS_FIX_RESULT, PASS_RESULT]
+    let round = 0
+    let continued = 0
+    const outcome = await gw._runTeamReviewPass({
+      sessionKey: 'w2',
+      maxRounds: 2,
+      runReview: async () => verdicts[round++],
+      submitContinuation: async () => {
+        continued++
+        return 'held'
+      },
+    })
+    assert.equal(outcome.deliver, true)
+    assert.equal(outcome.disclosure, undefined, '再审 PASS 不应有披露')
+    assert.equal(continued, 1, 'NEEDS_FIX→PASS 恰好续写一次')
+    assert.equal(round, 2, '共审查两轮')
+  })
+
+  it('NEEDS_FIX 反复到迭代封顶 → 强制放行 + 披露"达上限"', async () => {
+    const gw = makeReviewGateway()
+    let reviewCalls = 0
+    let continued = 0
+    const outcome = await gw._runTeamReviewPass({
+      sessionKey: 'w3',
+      maxRounds: 2,
+      runReview: async () => {
+        reviewCalls++
+        return NEEDS_FIX_RESULT
+      },
+      submitContinuation: async () => {
+        continued++
+        return 'held'
+      },
+    })
+    assert.equal(outcome.deliver, true, '到顶必须强制放行,绝不卡死')
+    assert.match(outcome.disclosure ?? '', /迭代上限/)
+    assert.equal(reviewCalls, 2, 'maxRounds=2 → 审查两轮')
+    assert.equal(continued, 1, '第 2 轮到顶不再续写')
+  })
+
+  it('review 委派被闸拒(rejected) → 降级放行 + 披露"审查未完成"', async () => {
+    const gw = makeReviewGateway()
+    let continued = 0
+    const outcome = await gw._runTeamReviewPass({
+      sessionKey: 'w4',
+      maxRounds: 2,
+      runReview: async () => ({ kind: 'rejected', httpStatus: 429, message: 'too many' }),
+      submitContinuation: async () => {
+        continued++
+        return 'held'
+      },
+    })
+    assert.equal(outcome.deliver, true, '闸拒也必须放行队长 final')
+    assert.match(outcome.disclosure ?? '', /审查未能完成/)
+    assert.equal(continued, 0)
+  })
+
+  it('review 完成但解析不出 VERDICT → 降级放行 + 披露', async () => {
+    const gw = makeReviewGateway()
+    const outcome = await gw._runTeamReviewPass({
+      sessionKey: 'w5',
+      maxRounds: 2,
+      runReview: async () => ({
+        kind: 'completed',
+        ok: true,
+        output: '审查员忘了输出裁决行',
+        timedOut: false,
+        runId: 'rev-x',
+        verdict: undefined,
+      }),
+      submitContinuation: async () => 'held',
+    })
+    assert.equal(outcome.deliver, true)
+    assert.match(outcome.disclosure ?? '', /审查未能完成/)
+  })
+
+  it('review 超时 → 降级放行', async () => {
+    const gw = makeReviewGateway()
+    const outcome = await gw._runTeamReviewPass({
+      sessionKey: 'w6',
+      maxRounds: 2,
+      runReview: async () => ({
+        kind: 'completed',
+        ok: false,
+        output: '',
+        error: 'DelegateTimeoutError',
+        timedOut: true,
+        runId: 'rev-t',
+      }),
+      submitContinuation: async () => 'held',
+    })
+    assert.equal(outcome.deliver, true)
+    assert.match(outcome.disclosure ?? '', /审查未能完成/)
+  })
+
+  it('NEEDS_FIX 后 continuation 报错 → 不放行 held final(错误终态帧已由队长 turn 自投递)', async () => {
+    const gw = makeReviewGateway()
+    const outcome = await gw._runTeamReviewPass({
+      sessionKey: 'w7',
+      maxRounds: 2,
+      runReview: async () => NEEDS_FIX_RESULT,
+      submitContinuation: async () => 'errored',
+    })
+    assert.equal(outcome.deliver, false, 'continuation 报错 → 交给错误分支收尾,不重复放行')
+  })
+
+  it('NEEDS_FIX 后 continuation 非常规终态(other) → 防御性收尾放行,防挂起', async () => {
+    const gw = makeReviewGateway()
+    const outcome = await gw._runTeamReviewPass({
+      sessionKey: 'w8',
+      maxRounds: 2,
+      runReview: async () => NEEDS_FIX_RESULT,
+      submitContinuation: async () => 'other',
+    })
+    assert.equal(outcome.deliver, true, 'other 必须收尾放行,绝不让 turn 挂起')
+  })
+})
+
+describe('team mode hidden reviewer — 可见性守护(不变)', () => {
   it('keeps hidden reviewer out of user-facing agent management APIs', () => {
     const src = readFileSync(SERVER_TS, 'utf8')
     assert.match(src, /filterUserVisibleAgentsForManagement\(cfg\.agents\)/)
@@ -71,7 +235,9 @@ describe('team mode hidden reviewer prompt', () => {
     assert.match(src, /autoResumeFromHello[\s\S]*isHiddenSystemAgentId\(aid\)/)
     assert.match(src, /handleStop[\s\S]*explicitStopAgentId[\s\S]*isHiddenSystemAgentId\(explicitStopAgentId\)/)
     assert.match(src, /handleAgentMessage[\s\S]*isHiddenSystemAgentId\(targetAgentId\)[\s\S]*agent "[^"]+" not found/)
-    assert.match(src, /handleDelegateTask[\s\S]*const targetAgent = cfg\.agents\.find\(\(a\) => a\.id === targetAgentId\)/)
+    // P2 债C:委派执行核心已从 handleDelegateTask 抽到 _runDelegateTask(HTTP 壳 + 内部
+    // 硬编排两个调用方共用),按 id 找 target 的逻辑随之搬到核心。
+    assert.match(src, /_runDelegateTask[\s\S]*const targetAgent = cfg\.agents\.find\(\(a\) => a\.id === targetAgentId\)/)
   })
 
   it('rejects hidden reviewer from other user-controlled execution and mutation surfaces', () => {
