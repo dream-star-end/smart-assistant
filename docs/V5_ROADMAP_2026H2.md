@@ -68,7 +68,7 @@
 
 按届时数据取舍,方向性列举:
 
-1. **企业/团队版**:组织账号、成员管理、共享技能库/知识库的组织维度、用量报表、发票。双钱包模型天然可扩展到组织钱包。
+1. **企业/团队版** 🔄 **下一活跃工作流(2026-07-06 boss 定,新会话承接)**:组织账号、成员管理、共享技能库/知识库的组织维度、用量报表、发票。双钱包模型天然可扩展到组织钱包。**开工骨架+设计锚点已备:`docs/plans/v5-enterprise-edition-kickoff.md`**(四主干 spend.ts/users+jwt/requireAdmin+canUseModel/uid 隔离全以单 uid 为租户单元、零 org 骨架;五处 -u<uid> 单人假设+IDOR 防线是核心改造点;方案先做"共享粒度"决策题再设计)。
 2. **模型矩阵运营**:provider 健康度自动探测与降级路由(现在坏 provider 靠人工);价格/成本看板;新 provider 接入模板化(v3-token-plan-provider-integration 模式泛化)。
 3. **开放能力**:openaiCompat 对外 API 商业化(API key 计费面已有雏形);webhook/自动化触达。
 4. **多模态深化**:图/视频生成(seedream/seedance 已接火山)产品化入口;语音(seed-tts)对话。
