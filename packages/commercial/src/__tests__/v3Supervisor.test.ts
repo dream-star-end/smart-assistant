@@ -88,6 +88,22 @@ type DockerBehavior = {
     | { kind: "labels"; labels: Record<string, string> }
     | { kind: "missing" }
     | { kind: "throw"; err: Error };
+  /**
+   * NameConflict 自愈测试用:前 N 次 `docker.createContainer()` 抛 statusCode=409
+   * (docker "name already in use")。第 N+1 次起正常创建。默认 0(不注入冲突)。
+   */
+  createConflictCount?: number;
+  /**
+   * NameConflict 自愈测试用:控制 `getContainer(name).inspect()`(冲突容器 inspect)
+   * 返回的 labels + state。未设 → 走默认 inspect(现有测试不受影响)。
+   */
+  conflictInspectResult?: { labels: Record<string, string>; state: string; id?: string };
+  /** 冲突容器 inspect 抛 404(TOCTOU:inspect 前已被清)。 */
+  conflictInspectMissing?: boolean;
+  /** 冲突容器 inspect 抛非 404 错误(daemon/权限/临时故障)。 */
+  conflictInspectThrows?: Error;
+  /** 自愈 rm 冲突容器时抛 404(别的 reaper / 并发 provision 已删)。 */
+  conflictRemoveMissing?: boolean;
 };
 
 function httpError(code: number, msg: string): Error {
@@ -126,8 +142,13 @@ function makeDocker(behavior: DockerBehavior = {}): { docker: Docker; captured: 
     },
   });
 
+  let createCalls = 0;
   const createContainer = async (opts: Parameters<Docker["createContainer"]>[0]) => {
+    createCalls++;
     if (behavior.imageMissing) throw httpError(404, "No such image: openclaude/openclaude-runtime:test");
+    if (behavior.createConflictCount && createCalls <= behavior.createConflictCount) {
+      throw httpError(409, 'Conflict. The container name "/oc-v3-u1" is already in use');
+    }
     captured.containersCreated.push(opts);
     return {
       id: `dockerid-${captured.containersCreated.length}`,
@@ -144,6 +165,17 @@ function makeDocker(behavior: DockerBehavior = {}): { docker: Docker; captured: 
   const getContainer = (_id: string) => ({
     inspect: async () => {
       captured.inspected++;
+      // NameConflict 自愈路径:冲突容器 inspect(优先于默认 inspect)。
+      if (behavior.conflictInspectMissing) throw httpError(404, "no such container");
+      if (behavior.conflictInspectThrows) throw behavior.conflictInspectThrows;
+      if (behavior.conflictInspectResult) {
+        const ci = behavior.conflictInspectResult;
+        return {
+          Id: ci.id ?? "conflict-docker-id",
+          Config: { Labels: ci.labels },
+          State: { Status: ci.state, Running: ci.state === "running" },
+        } as unknown as Awaited<ReturnType<ReturnType<Docker["getContainer"]>["inspect"]>>;
+      }
       if (behavior.inspectMissing) throw httpError(404, "no such container");
       return {
         Id: _id,
@@ -154,6 +186,7 @@ function makeDocker(behavior: DockerBehavior = {}): { docker: Docker; captured: 
       captured.stopped++;
     },
     remove: async () => {
+      if (behavior.conflictRemoveMissing) throw httpError(404, "no such container");
       captured.removed++;
     },
   });
@@ -877,6 +910,177 @@ describe("provisionV3Container", () => {
       ),
       (err: Error) => err instanceof SupervisorError && err.code === "InvalidArgument",
     );
+  });
+});
+
+// ───────────────────────────────────────────────────────────────────────
+//  provisionV3Container — docker create NameConflict 自愈(2026-07-06 事故根治)
+// ───────────────────────────────────────────────────────────────────────
+
+describe("provisionV3Container — docker create NameConflict 自愈", () => {
+  let pool: FakePool;
+  let prevOptional: string | undefined;
+  let savedChannel: string | undefined;
+  before(() => {
+    prevOptional = process.env.OC_V3_CCB_BASELINE_OPTIONAL;
+    process.env.OC_V3_CCB_BASELINE_OPTIONAL = "1";
+    // 事故 channel = v5(容器名 oc-v5-u1)。v5 provision 跳过 v3MayServe 门控
+    // (它走全局 getPool → 无 DATABASE_URL 会抛 ConfigError,是既有基线失败源),
+    // 故这里显式 v5:既忠实复现事故,又让自愈用例可在无 DB 的单元环境里独立跑过。
+    savedChannel = process.env.OC_RUNTIME_CHANNEL;
+    process.env.OC_RUNTIME_CHANNEL = "v5";
+  });
+  after(() => {
+    if (prevOptional === undefined) delete process.env.OC_V3_CCB_BASELINE_OPTIONAL;
+    else process.env.OC_V3_CCB_BASELINE_OPTIONAL = prevOptional;
+    if (savedChannel === undefined) delete process.env.OC_RUNTIME_CHANNEL;
+    else process.env.OC_RUNTIME_CHANNEL = savedChannel;
+  });
+  beforeEach(() => {
+    pool = new FakePool();
+  });
+
+  // v5 channel;"我们管理的" v5 容器 labels(managed/uid label key 恒含 "v3" 是历史命名,
+  // channel 由 com.openclaude.runtime_channel 区分)。
+  const OURS_V3 = {
+    "com.openclaude.v3.managed": "1",
+    "com.openclaude.v3.uid": "1",
+    "com.openclaude.runtime_channel": "v5",
+  };
+  const depsFor = (docker: Docker, ip: string, secretChar: string) => ({
+    docker,
+    pool: pool as unknown as Pool,
+    image: TEST_IMAGE,
+    selfHostId: TEST_HOST,
+    randomIp: () => ip,
+    randomSecret: fixedSecret(secretChar.repeat(64)),
+  });
+
+  test("(a) create 409 + 冲突容器 created 态 + 三重 label 匹配 → rm 后重试成功", async () => {
+    const { docker, captured } = makeDocker({
+      createConflictCount: 1,
+      conflictInspectResult: { labels: OURS_V3, state: "created", id: "zombie-cd2a410d" },
+    });
+    const result = await provisionV3Container(depsFor(docker, "172.30.9.1", "a"), 1);
+    assert.equal(captured.removed, 1, "created 态僵尸应被 rm(force)一次");
+    assert.equal(captured.containersCreated.length, 1, "create 重试成功(仅第二次进 push)");
+    assert.equal(captured.started, 1, "容器已 start");
+    assert.equal(result.userId, 1);
+    assert.equal(result.boundIp, "172.30.9.1");
+    assert.ok(result.dockerContainerId.length > 0);
+  });
+
+  test("(b) 冲突容器 running 态 → 绝不删,保留 NameConflict 失败", async () => {
+    const { docker, captured } = makeDocker({
+      createConflictCount: 1,
+      conflictInspectResult: { labels: OURS_V3, state: "running" },
+    });
+    await assert.rejects(
+      provisionV3Container(depsFor(docker, "172.30.9.2", "b"), 1),
+      (err: Error) => err instanceof SupervisorError && err.code === "NameConflict",
+    );
+    assert.equal(captured.removed, 0, "running 活容器绝不删");
+    assert.equal(captured.containersCreated.length, 0, "不重试 create");
+  });
+
+  test("(c1) 冲突容器 uid label 不匹配 → 绝不删", async () => {
+    const { docker, captured } = makeDocker({
+      createConflictCount: 1,
+      conflictInspectResult: {
+        labels: { ...OURS_V3, "com.openclaude.v3.uid": "999" },
+        state: "created",
+      },
+    });
+    await assert.rejects(
+      provisionV3Container(depsFor(docker, "172.30.9.3", "c"), 1),
+      (err: Error) => err instanceof SupervisorError && err.code === "NameConflict",
+    );
+    assert.equal(captured.removed, 0);
+    assert.equal(captured.containersCreated.length, 0);
+  });
+
+  test("(c2) 冲突容器 runtime_channel 归属对方(v3)→ v5 实例绝不删", async () => {
+    const { docker, captured } = makeDocker({
+      createConflictCount: 1,
+      conflictInspectResult: {
+        labels: { ...OURS_V3, "com.openclaude.runtime_channel": "v3" },
+        state: "created",
+      },
+    });
+    await assert.rejects(
+      provisionV3Container(depsFor(docker, "172.30.9.4", "d"), 1),
+      (err: Error) => err instanceof SupervisorError && err.code === "NameConflict",
+    );
+    assert.equal(captured.removed, 0, "跨 channel 容器绝不删");
+    assert.equal(captured.containersCreated.length, 0);
+  });
+
+  test("(c3) 冲突容器缺 managed label → 绝不删", async () => {
+    const { docker, captured } = makeDocker({
+      createConflictCount: 1,
+      conflictInspectResult: {
+        labels: { "com.openclaude.v3.uid": "1", "com.openclaude.runtime_channel": "v5" },
+        state: "created",
+      },
+    });
+    await assert.rejects(
+      provisionV3Container(depsFor(docker, "172.30.9.5", "e"), 1),
+      (err: Error) => err instanceof SupervisorError && err.code === "NameConflict",
+    );
+    assert.equal(captured.removed, 0, "非 managed 容器绝不删");
+    assert.equal(captured.containersCreated.length, 0);
+  });
+
+  test("(d) 自愈 rm 撞 404(别的 reaper / 并发 provision 已删)→ 吞掉并重试成功", async () => {
+    const { docker, captured } = makeDocker({
+      createConflictCount: 1,
+      conflictInspectResult: { labels: OURS_V3, state: "exited" },
+      conflictRemoveMissing: true,
+    });
+    const result = await provisionV3Container(depsFor(docker, "172.30.9.6", "f"), 1);
+    assert.equal(captured.removed, 0, "rm 抛 404 未计数(幂等共存,吞掉)");
+    assert.equal(captured.containersCreated.length, 1, "404 后仍重试 create 成功");
+    assert.equal(captured.started, 1);
+    assert.ok(result.dockerContainerId.length > 0);
+  });
+
+  test("(e) 冲突容器 inspect 前已消失(TOCTOU 404)→ 直接重试成功", async () => {
+    const { docker, captured } = makeDocker({
+      createConflictCount: 1,
+      conflictInspectMissing: true,
+    });
+    const result = await provisionV3Container(depsFor(docker, "172.30.9.7", "0"), 1);
+    assert.equal(captured.removed, 0, "名字已释放,无需 rm");
+    assert.equal(captured.containersCreated.length, 1, "直接重试 create 成功");
+    assert.equal(captured.started, 1);
+    assert.ok(result.dockerContainerId.length > 0);
+  });
+
+  test("(f) 冲突容器 inspect 非 404 失败(daemon 抖动)→ 无法判定死活,绝不删", async () => {
+    const { docker, captured } = makeDocker({
+      createConflictCount: 1,
+      conflictInspectThrows: httpError(500, "docker daemon error"),
+    });
+    await assert.rejects(
+      provisionV3Container(depsFor(docker, "172.30.9.8", "1"), 1),
+      (err: Error) => err instanceof SupervisorError && err.code === "NameConflict",
+    );
+    assert.equal(captured.removed, 0, "inspect 失败绝不删");
+    assert.equal(captured.containersCreated.length, 0);
+  });
+
+  test("(g) 自愈仅一次:rm 后重试仍撞 409(并发 provision 重建同名)→ 不循环,抛 NameConflict", async () => {
+    const { docker, captured } = makeDocker({
+      // 前两次 create 都 409:第一次触发自愈,rm 后重试(第二次)仍 409 → 不再循环。
+      createConflictCount: 2,
+      conflictInspectResult: { labels: OURS_V3, state: "created" },
+    });
+    await assert.rejects(
+      provisionV3Container(depsFor(docker, "172.30.9.9", "2"), 1),
+      (err: Error) => err instanceof SupervisorError && err.code === "NameConflict",
+    );
+    assert.equal(captured.removed, 1, "只 rm 一次");
+    assert.equal(captured.containersCreated.length, 0, "两次 create 都 409,均未进 push");
   });
 });
 

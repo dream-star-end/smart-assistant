@@ -55,11 +55,41 @@ export function createPool(opts: CreatePoolOptions = {}): Pool {
     application_name: "openclaude-commercial",
   };
   const p = new Pool(cfg);
-  // 防止未处理的 pool 级错误静默:转换为明确日志 + process 不崩
+  // 防止未处理的 pool 级错误静默:转换为明确日志 + process 不崩。
+  // 注意:pg 的 `Pool#error` **只**在 pool 内 *idle* client(已归还池、尚未 checkout)
+  // 出错时触发,**覆盖不到 checked-out client**(见下方 connect 监听)。
   p.on("error", (err) => {
     // 使用 stderr 直接输出,避免在 T-01 阶段引入 logger
     // eslint-disable-next-line no-console
     console.error("[commercial/db] idle client error:", err.message);
+  });
+  // 2026-07-06 事故根治:idle-in-transaction 断连不再崩进程。
+  //
+  // 根因:provision/recycle 事务在 `BEGIN` 后跨越 docker create+start(及 codex 远端
+  // 绑定 HTTP)全程**持有该连接**,期间不发 SQL —— 此时该 client 是 *checked-out* 且
+  // idle-in-transaction。压力下 docker 步骤一旦超过 `idle_in_transaction_session_timeout`
+  // (上方 60s),PG 服务端强制终止该连接,pg 在 **CLIENT 对象**上 emit 'error'。
+  // `Pool#error` 只覆盖 pool 内 *idle* client,覆盖不到 checked-out client;若该 client
+  // 此刻无 'error' 监听,Node 会把 EventEmitter 'error' 冒成**进程级 uncaughtException**
+  // → gateway 紧急关停(事故当天正是如此,崩溃恰发生在某次 provision 的 docker create
+  // 之后、catch 块 rollback+rm 清理之前 → 留下占名僵尸容器)。
+  //
+  // 修复:`Pool#connect` 在每个新 client 建连时触发一次,这里给它挂一个贯穿其整个
+  // 生命周期(idle 或 checked-out 都在)的 no-op 'error' 监听 —— 结构化日志 + **不退出**。
+  // 该 client 若正持有事务被强断,下一条 `client.query()` 会在 provision 的 try 内 reject,
+  // 走既有 catch → ROLLBACK + `docker rm createdDockerId` 清理(僵尸不再产生),再交上层
+  // 短重试。进程级 uncaughtException 兜底(cli/gateway.ts emergencyExit)保留不动。
+  //
+  // 未加 Prometheus counter:metrics.ts → db/queries.ts → db/index.ts 形成 import 环,
+  // 本文件刻意保持零内部依赖(见文件顶注)。可观测由结构化 stderr 承担;需要 counter
+  // 时应在无环的更外层(如 renderPrometheus 采集器)统计,不在此处引环。
+  p.on("connect", (client) => {
+    client.on("error", (err) => {
+      // eslint-disable-next-line no-console
+      console.error("[commercial/db] client error (idle-in-tx / server-terminated), not exiting:", {
+        message: (err as Error)?.message,
+      });
+    });
   });
   return p;
 }
