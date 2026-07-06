@@ -21,6 +21,7 @@ import {
 } from "./components/MarketplaceCenter";
 import { AssistantMessage, UserMessage } from "./components/Message";
 import { MessageList } from "./components/MessageRenderer";
+import { MessageListSkeleton, shouldShowHistorySkeleton } from "./components/chat/HistorySkeleton";
 import type { CardCallbacks } from "./components/chat/cards";
 import { MediaSignProvider } from "./components/chat/media";
 import { ChatInteractionContext, ToolCardActionsContext } from "./components/tool/context";
@@ -53,6 +54,11 @@ import type { Message, PublicConfig, PublicModel, Session, ToolCard } from "./li
 
 const EMPTY_WS_MESSAGES: ChatMessage[] = [];
 const TEAM_MODE_STORAGE_KEY = "oc_v5_team_mode";
+// 冷会话骨架屏窗口（见 HistorySkeleton.shouldShowHistorySkeleton）：
+//  - GRACE：meta 未知（深链/列表未落定）时的兜底窗，过后放行 EmptyState。
+//  - CAP：确知有历史但迟迟不到（getSession 慢/失败）的安全封顶，防骨架永停。
+const HISTORY_SKELETON_GRACE_MS = 800;
+const HISTORY_SKELETON_CAP_MS = 8000;
 
 function readStoredTeamMode(): boolean {
   try {
@@ -602,6 +608,23 @@ export function App() {
     // chat.version 是就地 mutation 会话的变更权威信号（同引用，须显式入依赖才随帧刷新）。
   }, [demo, activeSess, teamLeaderActive, agent.name, wsMessages, chat.version]);
 
+  // ── 冷会话加载骨架屏窗口计时 ──────────────────────────────────────────
+  // activeId 变化即重置两个截止标记；GRACE 用于 meta 未知（深链）分支，CAP 是安全封顶。
+  // 骨架本身随 wsMessages 到达（cachedCount>0）立即隐藏，计时器只做「永不停」兜底。
+  const [historyGraceExpired, setHistoryGraceExpired] = useState(false);
+  const [historyCapExpired, setHistoryCapExpired] = useState(false);
+  useEffect(() => {
+    setHistoryGraceExpired(false);
+    setHistoryCapExpired(false);
+    if (demo || !activeId) return;
+    const t1 = setTimeout(() => setHistoryGraceExpired(true), HISTORY_SKELETON_GRACE_MS);
+    const t2 = setTimeout(() => setHistoryCapExpired(true), HISTORY_SKELETON_CAP_MS);
+    return () => {
+      clearTimeout(t1);
+      clearTimeout(t2);
+    };
+  }, [demo, activeId]);
+
   // 会话级 transient 软提示（"较长时间未收到新内容…"）：非消息卡片、不落库；随快照读回。
   const transientNotice = !demo && activeId ? chat.getTransientNotice(activeId) : null;
   // 停止当前轮：demo 本地停回放；非 demo 发 inbound.control.stop 并本地收尾。
@@ -881,6 +904,23 @@ export function App() {
   // 并禁用 Composer。demo 与已就绪（ready|dormant）放行正常对话。
   const gated = !demo && !gate.access;
 
+  // 冷会话加载骨架：切换/深链到本地无缓存会话、getSession 拉取期间显示消息形骨架，
+  // 取代「空白 → 突然填满」。meta（messageCount）取自侧栏当前选中会话，metaKnown
+  // 需 listSessions 已落定且命中列表（否则视为深链未决走 800ms 兜底窗）。
+  const activeMeta = !demo && activeId ? sessions.find((s) => s.id === activeId) : undefined;
+  const loadingHistory =
+    !demo &&
+    shouldShowHistorySkeleton({
+      selected: !!activeId,
+      gated,
+      cachedCount: wsMessages.length,
+      sending: wsSending,
+      knownMessageCount: activeMeta?.messageCount ?? 0,
+      metaKnown: serverListSettled && !!activeMeta,
+      graceExpired: historyGraceExpired,
+      capExpired: historyCapExpired,
+    });
+
   // 侧栏公共 props：桌面内联与移动抽屉两处复用。余额（balanceCents）本期不展示（P3.5 计费中心）。
   // rename/delete 的数据收口（三持有方）在 useSessionList。
   const sidebarProps = {
@@ -973,6 +1013,9 @@ export function App() {
               onRetry={gate.check}
               onTopUp={openSettings}
             />
+          ) : loadingHistory ? (
+            // 冷会话历史拉取期：消息形骨架占位，避免「空白 → 突然填满」的突变。
+            <MessageListSkeleton />
           ) : showEmpty ? (
             <EmptyState agent={agent} onPick={send} onChangeAgent={() => setPickerOpen(true)} />
           ) : demo ? (

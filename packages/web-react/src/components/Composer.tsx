@@ -1,5 +1,5 @@
 import * as Dialog from "@radix-ui/react-dialog";
-import { ArrowUp, FileText, Loader2, Mic, Plus, Square, X } from "lucide-react";
+import { ArrowUp, FileText, Loader2, Mic, Plus, RotateCcw, Square, X } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useVoiceInput } from "../hooks/useVoiceInput";
 import type { MediaRef } from "../lib/chat/frames";
@@ -18,6 +18,8 @@ type Attach = {
   error?: string;
   /** 图片本地预览 URL（createObjectURL，选中即生成；移除/发送/卸载时 revoke 防泄漏）。 */
   previewUrl?: string;
+  /** 原始 File 对象：上传失败后仍持有，供「重试」原地重传（不必删 chip 重选文件）。 */
+  file?: File;
 };
 
 const MAX_ATTACH = 8;
@@ -143,6 +145,26 @@ export function Composer({
     setAttachments([]);
   };
 
+  // 单文件上传（首传与「重试」共用）：置 uploading（清旧错误）→ onUpload → done / error。
+  // 复用原 File 对象，重试无需重选文件；成功后携带 media，供 doneMedia 汇总发送。
+  const uploadOne = useCallback(
+    async (id: string, file: File) => {
+      if (!onUpload) return;
+      setAttachments((prev) =>
+        prev.map((a) => (a.id === id ? { ...a, status: "uploading", error: undefined } : a)),
+      );
+      try {
+        const media = await onUpload(file);
+        setAttachments((prev) => prev.map((a) => (a.id === id ? { ...a, status: "done", media } : a)));
+      } catch (e) {
+        setAttachments((prev) =>
+          prev.map((a) => (a.id === id ? { ...a, status: "error", error: (e as Error).message } : a)),
+        );
+      }
+    },
+    [onUpload],
+  );
+
   const onFiles = async (picked: File[]) => {
     if (!onUpload) return;
     if (fileRef.current) fileRef.current.value = ""; // 允许同名文件再次选择
@@ -163,18 +185,12 @@ export function Composer({
       const kind = mediaKindOf(file.type);
       // 图片:选中即生成本地预览 URL（无需等上传完成，chip 立刻显缩略图、可点开看大图）。
       const previewUrl = kind === "image" ? makePreview(file) : undefined;
+      // 持有原始 File：失败后「重试」复用它原地重传，多文件混合状态各 chip 独立重试。
       setAttachments((prev) => [
         ...prev,
-        { id, name: file.name, size: file.size, kind, status: "uploading", previewUrl },
+        { id, name: file.name, size: file.size, kind, status: "uploading", previewUrl, file },
       ]);
-      try {
-        const media = await onUpload(file);
-        setAttachments((prev) => prev.map((a) => (a.id === id ? { ...a, status: "done", media } : a)));
-      } catch (e) {
-        setAttachments((prev) =>
-          prev.map((a) => (a.id === id ? { ...a, status: "error", error: (e as Error).message } : a)),
-        );
-      }
+      void uploadOne(id, file);
     }
   };
 
@@ -209,6 +225,9 @@ export function Composer({
                   a.kind === "image" && a.previewUrl
                     ? () => setPreview({ url: a.previewUrl as string, name: a.name })
                     : undefined
+                }
+                onRetry={
+                  a.status === "error" && a.file ? () => void uploadOne(a.id, a.file as File) : undefined
                 }
               />
             ))}
@@ -328,15 +347,18 @@ function fmtSize(n: number): string {
   return `${(n / 1024 / 1024).toFixed(1)} MB`;
 }
 
-function AttachChip({
+export function AttachChip({
   a,
   onRemove,
   onPreview,
+  onRetry,
 }: {
   a: Attach;
   onRemove: () => void;
   /** 图片可点击预览（非图片 / 无预览 URL 时省略）。 */
   onPreview?: () => void;
+  /** 上传失败重试（复用原 File 原地重传；非 error 态 / 无持有 File 时省略）。 */
+  onRetry?: () => void;
 }) {
   const isImage = a.kind === "image" && !!a.previewUrl;
   return (
@@ -370,11 +392,24 @@ function AttachChip({
       <span className={cn("max-w-[140px] truncate", a.status === "error" ? "text-danger" : "text-fg")}>
         {a.name}
       </span>
+      {/* 上传失败:就地「重试」按钮(复用原 File),移动端触控目标 h-6 足够点按。
+          替代原来「必须删除 chip 重新选文件」的痛点。 */}
+      {a.status === "error" && onRetry && (
+        <button
+          type="button"
+          onClick={onRetry}
+          aria-label={`重试上传 ${a.name}`}
+          className="flex h-6 shrink-0 items-center gap-1 rounded-md px-1.5 font-medium text-danger hover:bg-danger/10"
+        >
+          <RotateCcw size={12} />
+          重试
+        </button>
+      )}
       <button
         type="button"
         onClick={onRemove}
         aria-label={`移除 ${a.name}`}
-        className="flex size-4 shrink-0 items-center justify-center rounded text-faint hover:text-danger"
+        className="flex size-6 shrink-0 items-center justify-center rounded text-faint hover:text-danger"
       >
         <X size={13} />
       </button>

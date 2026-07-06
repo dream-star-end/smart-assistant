@@ -6,10 +6,17 @@
  * 多张卡 / 多次重渲反复签名。深层组件（用户卡媒体格、markdown 行内图）经 useSignedSrc /
  * <Media> 主动 effect 签名，替代"占位永停"。
  */
-import { createContext, useContext, useEffect, useRef, useState } from "react";
-import { Download, FileText } from "lucide-react";
+import { createContext, useCallback, useContext, useEffect, useRef, useState } from "react";
+import { AlertCircle, Download, FileText, RotateCcw, X } from "lucide-react";
 import type { MediaRef } from "../../lib/chat/frames";
 import { classifyMediaRef, isContainerPath, type ResolvedMedia } from "../../lib/chat/media";
+import {
+  downloadPercent,
+  formatBytes,
+  nativeDownload,
+  pickDownloadStrategy,
+  saveBlob,
+} from "../../lib/chat/download";
 import { cn } from "../../lib/utils";
 
 type SignFn = (paths: string[]) => Promise<Record<string, string>>;
@@ -178,40 +185,186 @@ export function SignedAudio(props: React.AudioHTMLAttributes<HTMLAudioElement> &
   return <audio src={resolved} controls onError={onError} className="my-2 w-full max-w-sm" {...rest} />;
 }
 
+/** 下载态机（SignedFileCard 用）：idle=可点；downloading=流式进度；error=失败(留重试+直接下载)。*/
+type DownloadState =
+  | { phase: "idle" }
+  | { phase: "downloading"; loaded: number; total: number | null }
+  | { phase: "error" };
+
+/**
+ * 大文件下载接线：点击 idle 卡 → fetch 同一签名 URL → 按 Content-Length 决策
+ * （见 pickDownloadStrategy）。仅 3MB~100MB 走 body.getReader() 流读 + Blob 存盘并渲染进度；
+ * 小/超大/未知一律回落原生 `<a download>`（nativeDownload）。任何异常 → error 态（重试 + 直接下载兜底）。
+ */
+function useSignedDownload(url: string | null, name: string) {
+  const [state, setState] = useState<DownloadState>({ phase: "idle" });
+  const abortRef = useRef<AbortController | null>(null);
+  const cancelledRef = useRef(false);
+  // 卸载即中止在途下载，防 setState-after-unmount。
+  useEffect(() => () => abortRef.current?.abort(), []);
+
+  const start = useCallback(async () => {
+    if (!url) return;
+    cancelledRef.current = false;
+    const controller = new AbortController();
+    abortRef.current = controller;
+    setState({ phase: "downloading", loaded: 0, total: null });
+    try {
+      const res = await fetch(url, { signal: controller.signal });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const total = Number(res.headers.get("content-length")) || null;
+      // 尺寸决策：仅 3MB~100MB 走流式；其余(小/超大/未知/无流)交原生 <a download>。
+      if (pickDownloadStrategy(total) === "native" || !res.body) {
+        controller.abort(); // 放弃流式：小文件几乎未下正文；超大文件不入 JS 内存
+        setState({ phase: "idle" });
+        nativeDownload(url, name);
+        return;
+      }
+      const reader = res.body.getReader();
+      const chunks: Uint8Array[] = [];
+      let loaded = 0;
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (value) {
+          chunks.push(value);
+          loaded += value.length;
+          setState({ phase: "downloading", loaded, total });
+        }
+      }
+      const type = res.headers.get("content-type") || "application/octet-stream";
+      saveBlob(new Blob(chunks as BlobPart[], { type }), name);
+      setState({ phase: "idle" });
+    } catch {
+      // 用户取消 → 回 idle；真失败(网络/中断/blob 异常)→ error（重试 + 直接下载兜底）。
+      setState(cancelledRef.current ? { phase: "idle" } : { phase: "error" });
+    } finally {
+      abortRef.current = null;
+    }
+  }, [url, name]);
+
+  const cancel = useCallback(() => {
+    cancelledRef.current = true;
+    abortRef.current?.abort();
+  }, []);
+
+  return { state, start, cancel };
+}
+
 /** markdown 行内/正文里的容器文件路径 → 可下载文件卡(doc-card)。非媒体文件(txt/docx/pdf/zip…)。
- * 经 /api/media-sign 把容器路径换成同源签名 URL,再用 <a download> 真下载(同源 download 生效)。 */
+ * 经 /api/media-sign 把容器路径换成同源签名 URL；小文件原生 <a download>，大文件 fetch 流式带进度。 */
 export function SignedFileCard({ src, filename }: { src?: string; filename?: string }) {
-  // 文件卡是 <a download>,无媒体加载事件可挂 onError;点击 403 由 TTL 缓存过期重签兜底。
+  // 文件卡无媒体加载事件可挂 onError；点击 403 由 TTL 缓存过期重签兜底。
   const { url: resolved } = useSignedSrc(typeof src === "string" ? src : null);
   const name = (filename || (typeof src === "string" ? src.split("/").pop() : "") || "文件").trim();
-  const inner = (
-    <>
-      <span className="flex size-8 shrink-0 items-center justify-center rounded-md bg-accent-soft text-accent">
-        <FileText size={16} />
-      </span>
-      <span className="min-w-0 flex-1 truncate text-[13px] text-fg">{name}</span>
-      <Download size={15} className={resolved ? "shrink-0 text-muted" : "shrink-0 text-faint"} />
-    </>
+  const { state, start, cancel } = useSignedDownload(resolved ?? null, name);
+
+  const fileIcon = (
+    <span className="flex size-8 shrink-0 items-center justify-center rounded-md bg-accent-soft text-accent">
+      <FileText size={16} />
+    </span>
   );
+  const nameLabel = <span className="min-w-0 flex-1 truncate text-[13px] text-fg">{name}</span>;
+
+  // 未签名(容器冷启)：占位，不可点。
   if (!resolved) {
     return (
       <span
         className="my-1.5 inline-flex max-w-full items-center gap-2.5 rounded-lg border border-border bg-surface px-3 py-2"
         title="文件准备中…(容器冷启时稍候)"
       >
-        {inner}
+        {fileIcon}
+        {nameLabel}
+        <Download size={15} className="shrink-0 text-faint" />
       </span>
     );
   }
+
+  // 下载中：细进度条 + 百分比 + 取消（移动端 h-1.5 条 + ≥h-7 取消目标，进度可见）。
+  if (state.phase === "downloading") {
+    const pct = downloadPercent(state.loaded, state.total);
+    return (
+      <span className="my-1.5 inline-flex w-full max-w-[320px] flex-col gap-1.5 rounded-lg border border-border bg-surface px-3 py-2">
+        <span className="flex items-center gap-2.5">
+          {fileIcon}
+          {nameLabel}
+          <button
+            type="button"
+            onClick={cancel}
+            aria-label="取消下载"
+            className="flex size-7 shrink-0 items-center justify-center rounded-md text-faint hover:text-danger"
+          >
+            <X size={15} />
+          </button>
+        </span>
+        <span className="flex items-center gap-2">
+          <span className="h-1.5 flex-1 overflow-hidden rounded-full bg-hover" role="progressbar">
+            {/* total 未知时不确定态(1/3 宽脉冲)；已知则按百分比推进 */}
+            <span
+              className={cn(
+                "block h-full rounded-full bg-accent transition-[width] duration-150",
+                pct == null && "w-1/3 animate-pulse",
+              )}
+              style={pct != null ? { width: `${pct}%` } : undefined}
+            />
+          </span>
+          <span className="shrink-0 text-[11px] tabular-nums text-muted">
+            {pct != null ? `${pct}%` : formatBytes(state.loaded)}
+          </span>
+        </span>
+      </span>
+    );
+  }
+
+  // 失败：下载失败 + 重试 + 直接下载（原生兜底：iOS blob 异常等不可检测场景的逃生门）。
+  if (state.phase === "error") {
+    return (
+      <span className="my-1.5 inline-flex max-w-full flex-col gap-1.5 rounded-lg border border-danger/40 bg-surface px-3 py-2">
+        <span className="flex items-center gap-2.5">
+          <span className="flex size-8 shrink-0 items-center justify-center rounded-md bg-danger/10 text-danger">
+            <AlertCircle size={16} />
+          </span>
+          {nameLabel}
+        </span>
+        <span className="flex items-center gap-3 pl-[42px] text-[12px]">
+          <span className="text-danger">下载失败</span>
+          <button
+            type="button"
+            onClick={() => void start()}
+            className="flex h-6 items-center gap-1 font-medium text-accent hover:underline"
+          >
+            <RotateCcw size={12} /> 重试
+          </button>
+          <a
+            href={resolved}
+            download={name}
+            target="_blank"
+            rel="noreferrer"
+            className="flex h-6 items-center font-medium text-muted no-underline hover:text-fg hover:underline"
+          >
+            直接下载
+          </a>
+        </span>
+      </span>
+    );
+  }
+
+  // idle：拦截点击 → start()（内部按尺寸决定流式或原生兜底）。
   return (
     <a
       href={resolved}
       download={name}
       target="_blank"
       rel="noreferrer"
+      onClick={(e) => {
+        e.preventDefault();
+        void start();
+      }}
       className="my-1.5 inline-flex max-w-full items-center gap-2.5 rounded-lg border border-border bg-surface px-3 py-2 no-underline transition-colors hover:border-border-strong hover:bg-hover"
     >
-      {inner}
+      {fileIcon}
+      {nameLabel}
+      <Download size={15} className="shrink-0 text-muted" />
     </a>
   );
 }
