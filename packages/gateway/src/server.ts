@@ -727,6 +727,27 @@ function readDelegateMemoryPressure(): { current: number; max: number; ratio: nu
   return { current, max, ratio: current / max }
 }
 
+// ── delegate 资源闸有界排队 ──────────────────────────────────────────────────
+/** 资源闸(并发上限/内存水位)命中时的最长排队等待,超时按原闸形状(429/503)拒绝。
+ *  客户端余量:mcp-memory postJsonToGateway 超时 2h,delegate idle/hard 计时在
+ *  排队放行**之后**才起表,90s 等待不挤占执行预算。 */
+const DELEGATE_QUEUE_WAIT_DEFAULT_MS = 90_000
+/** 排队复查间隔(每 2-3s 复查一次两道闸)。 */
+const DELEGATE_QUEUE_POLL_DEFAULT_MS = 2_500
+/** 同时排队者上限:内存高压期每个等待者都挂着一条 HTTP 请求,不设上限会把
+ *  "排队"本身堆成第二波雪崩;超出直接按原闸形状立即拒。 */
+export const DELEGATE_QUEUE_MAX_WAITERS = 8
+
+function parseDelegateQueueWaitMs(): number {
+  const raw = Number(process.env.OPENCLAUDE_DELEGATE_QUEUE_WAIT_MS)
+  return Number.isFinite(raw) && raw >= 0 ? raw : DELEGATE_QUEUE_WAIT_DEFAULT_MS
+}
+
+/** 资源闸拦截原因 —— 两道闸共用一个判定/拒绝收口,避免两套并行机制。 */
+type DelegateGateBlock =
+  | { kind: 'concurrency' }
+  | { kind: 'memory'; pct: number; limitPct: number }
+
 // ── hidden 系统 agent 串行委派熔断 ──────────────────────────────────────────
 /** 同一父 turn 内对 hidden 系统 agent(隐藏审查员)的委派次数硬上限。
  *  team-mode prompt 的"NEEDS_FIX→修→再审→迭代到 PASS"闭环只有 prompt 级约束,
@@ -6160,6 +6181,115 @@ export class Gateway {
   /** hidden 审查员串行委派熔断(见 HiddenDelegateGuard 注释)。gateway 是容器内
    *  单进程,内存计数即权威。 */
   private _hiddenDelegateGuard = new HiddenDelegateGuard()
+  /** 资源闸排队中的委派:childSessionKey → 中止等待回调。用户 Stop 级联
+   *  (_interruptDelegationsForParent)对"还没 spawn、只在排队"的委派经此打断。
+   *  测试脚手架 Object.create(Gateway.prototype) 不跑字段初始化,使用处惰性 ??=。 */
+  private _delegateQueueWaiters: Map<string, () => void> | undefined
+  /** 排队复查间隔;测试覆写加速,生产走 DELEGATE_QUEUE_POLL_DEFAULT_MS。 */
+  private _delegateQueuePollMs: number | undefined
+
+  /** 内存水位读取的实例挂钩:生产=模块级 readDelegateMemoryPressure(cgroup 文件),
+   *  测试直接覆写本方法注入假读数。 */
+  private _readDelegateMemoryPressure(): { current: number; max: number; ratio: number } | null {
+    return readDelegateMemoryPressure()
+  }
+
+  /** 两道资源闸共用的判定。并发在前 —— 与历史行为的拒绝优先级一致
+   *  (旧代码并发 429 判在内存 503 之前)。 */
+  private _checkDelegateResourceGate(): DelegateGateBlock | null {
+    if (this._activeDelegations >= Gateway.MAX_CONCURRENT_DELEGATIONS) {
+      return { kind: 'concurrency' }
+    }
+    const pressure = this._readDelegateMemoryPressure()
+    const limit = parseDelegateMemoryPressureRatio()
+    if (pressure && pressure.ratio >= limit) {
+      return {
+        kind: 'memory',
+        pct: Math.round(pressure.ratio * 100),
+        limitPct: Math.round(limit * 100),
+      }
+    }
+    return null
+  }
+
+  /** 预占一个并发名额(判定+自增在同一同步段,单线程下原子,等待者间无超发);
+   *  被闸拦截则返回原因、不占名额。 */
+  private _tryReserveDelegateSlot(): DelegateGateBlock | null {
+    const blocked = this._checkDelegateResourceGate()
+    if (blocked) return blocked
+    this._activeDelegations++
+    return null
+  }
+
+  /**
+   * delegate 资源闸有界排队:命中「并发 ≥ 上限」或「内存 ≥ 阈值」→ 轮询复查等待
+   * 放行,而非立即 429/503(历史实况:并行 fanout 同秒双拒,队长收 503 后放弃委派
+   * 自己兜底)。放行时已同步预占并发名额,调用方所有后续路径必须负责释放。
+   *
+   * 溯源:P5(f7453f4d)曾为旧重团队轨实现过"撞闸排队"(teamRunStore DB FIFO 队列),
+   * 07-02 双轨清理(1ca107a8)删除旧 team_run 子系统时**连带**删除(非有意废弃)。
+   * 本实现改为进程内等待收口:gateway 是容器内单进程,内存计数即权威,无需 DB 队列,
+   * 且对所有 delegate(普通成员/hidden 审查员/嵌套)统一生效。
+   *
+   * 边界:
+   * - 等待封顶 OPENCLAUDE_DELEGATE_QUEUE_WAIT_MS(默认 90s)→ 'timeout';
+   * - 排队人数封顶 DELEGATE_QUEUE_MAX_WAITERS(8,防雪崩)→ 'queue_full'(不等待);
+   * - 用户 Stop 级联经 _delegateQueueWaiters 回调即时唤醒 → 'aborted';
+   * - 无放行顺序保证(非 FIFO):等待者靠轮询抢占,依赖公平性的场景目前不存在。
+   */
+  private async _waitForDelegateCapacity(args: {
+    sessionKey: string
+    onQueued?: (blocked: DelegateGateBlock) => void
+  }): Promise<
+    | { status: 'ok' }
+    | { status: 'queue_full'; blocked: DelegateGateBlock }
+    | { status: 'timeout'; blocked: DelegateGateBlock; waitedMs: number }
+    | { status: 'aborted'; waitedMs: number }
+  > {
+    const first = this._tryReserveDelegateSlot()
+    if (!first) return { status: 'ok' }
+    const waiters = (this._delegateQueueWaiters ??= new Map())
+    if (waiters.size >= DELEGATE_QUEUE_MAX_WAITERS) {
+      return { status: 'queue_full', blocked: first }
+    }
+    const waitBudgetMs = parseDelegateQueueWaitMs()
+    const pollMs = Math.max(1, this._delegateQueuePollMs ?? DELEGATE_QUEUE_POLL_DEFAULT_MS)
+    const startedAt = Date.now()
+    let aborted = false
+    let wake: (() => void) | null = null
+    waiters.set(args.sessionKey, () => {
+      aborted = true
+      wake?.()
+    })
+    try {
+      args.onQueued?.(first)
+      let lastBlocked = first
+      while (true) {
+        await new Promise<void>((resolve) => {
+          const timer = setTimeout(() => {
+            wake = null
+            resolve()
+          }, pollMs)
+          wake = () => {
+            clearTimeout(timer)
+            wake = null
+            resolve()
+          }
+        })
+        if (aborted || this._shuttingDown) {
+          return { status: 'aborted', waitedMs: Date.now() - startedAt }
+        }
+        const blocked = this._tryReserveDelegateSlot()
+        if (!blocked) return { status: 'ok' }
+        lastBlocked = blocked
+        if (Date.now() - startedAt >= waitBudgetMs) {
+          return { status: 'timeout', blocked: lastBlocked, waitedMs: Date.now() - startedAt }
+        }
+      }
+    } finally {
+      waiters.delete(args.sessionKey)
+    }
+  }
 
   private _resolveDelegateProgressTarget(args: {
     parentSessionKey?: unknown
@@ -6230,6 +6360,15 @@ export class Gateway {
     for (const childSessionKey of [...childSessionKeys]) {
       attempted++
       const descendantInterrupted = this._interruptDelegationsForParent(childSessionKey, visited)
+      // 还在资源闸排队等待的委派(尚未 spawn,session 不存在):唤醒并中止其等待,
+      // 否则 Stop 级联对它不可达,要干等到排队超时。
+      const abortQueuedWait = this._delegateQueueWaiters?.get(childSessionKey)
+      if (abortQueuedWait) {
+        abortQueuedWait()
+        childSessionKeys.delete(childSessionKey)
+        interrupted = true
+        continue
+      }
       if (!this.sessions.getByKey(childSessionKey)) {
         childSessionKeys.delete(childSessionKey)
         interrupted = descendantInterrupted || interrupted
@@ -6262,16 +6401,10 @@ export class Gateway {
     const { goal, context, sourceAgent, toolsets } = parsed
     if (!goal) return this.sendError(res, 400, 'goal required')
 
-    // Concurrency guard
-    if (this._activeDelegations >= Gateway.MAX_CONCURRENT_DELEGATIONS) {
-      return this.sendError(
-        res,
-        429,
-        `too many concurrent delegations (max ${Gateway.MAX_CONCURRENT_DELEGATIONS})`,
-      )
-    }
-
-    // Recursion guard: check delegation depth via header
+    // Recursion guard: check delegation depth via header。深度闸必须先于资源闸:
+    // 超深嵌套是硬错误,等不出结果 —— 直接 400,不进入排队、不占等待名额。
+    // (并发闸不再在此立即 429:与内存闸一起并入下方 _waitForDelegateCapacity
+    //  有界排队收口。)
     const depthHeader = req.headers['x-delegation-depth']
     const depth = depthHeader ? Number.parseInt(String(depthHeader), 10) : 0
     if (depth >= 3) {
@@ -6283,6 +6416,8 @@ export class Gateway {
     // 拿不到 —— 依据见 HiddenDelegateGuard 注释);极端情况下 body 缺
     // parentSessionKey 时退化为按 sourceAgent 计数,由 TTL 清扫兜底回收。
     // 失败/超时的审查同样占额度:每次尝试都是全额计费的 delegate session。
+    // 本闸同样先于资源闸排队:per-turn 额度等不出来,fail fast 不占等待名额;
+    // 代价是"排队超时"的审查委派也已扣一次额度(保守偏置,与上一行语义一致)。
     if (isHiddenSystemAgentId(targetAgentId)) {
       const guardKey =
         typeof parsed.parentSessionKey === 'string' && parsed.parentSessionKey
@@ -6333,24 +6468,6 @@ export class Gateway {
     const delegatedAgent =
       resolvedToolsets === undefined ? targetAgent : { ...targetAgent, toolsets: resolvedToolsets }
 
-    const memoryPressure = readDelegateMemoryPressure()
-    const memoryPressureLimit = parseDelegateMemoryPressureRatio()
-    if (memoryPressure && memoryPressure.ratio >= memoryPressureLimit) {
-      const pct = Math.round(memoryPressure.ratio * 100)
-      this.log.warn('delegate_resource_pressure', {
-        targetAgentId,
-        current: memoryPressure.current,
-        max: memoryPressure.max,
-        ratio: memoryPressure.ratio,
-        limit: memoryPressureLimit,
-      })
-      return this.sendError(
-        res,
-        503,
-        `delegate resource pressure: memory ${pct}% >= ${Math.round(memoryPressureLimit * 100)}%; please retry later`,
-      )
-    }
-
     const sessionKey = `agent:${targetAgentId}:delegate:${sourceAgent || 'system'}:${Date.now()}`
     this.log.info('delegate', {
       sourceAgent,
@@ -6378,21 +6495,6 @@ export class Gateway {
       parentSessionKey: parsed.parentSessionKey,
     })
 
-    const session = await this.sessions.getOrCreate({
-      sessionKey,
-      agent: delegatedAgent,
-      channel: 'delegate',
-      peerId: sourceAgent || 'system',
-      repoSessionId: progressTarget?.peerId ?? delegateParent?.repoSessionId,
-      title: `[delegate] ${goal.slice(0, 40)}`,
-      delegationDepth: depth + 1,
-      usageAttribution: {
-        mode: 'delegate',
-        delegateAgentId: targetAgentId,
-        ...(parentClientSessionId ? { parentSessionId: parentClientSessionId } : {}),
-      },
-    })
-
     const progressRunId = `dlg-${Date.now().toString(36)}-${randomBytes(4).toString('hex')}`
     const emitProgress = (block: DelegateProgressBlock | null) => {
       if (!progressTarget || !block) return
@@ -6407,19 +6509,129 @@ export class Gateway {
       }
       this.deliver(out as OutboundMessage & { _userId?: string })
     }
-    if (progressTarget && parsed.streamProgress === true) {
-      emitProgress(
-        makeDelegateProgressBlock({
-          runId: progressRunId,
-          agentId: targetAgentId,
-          phase: 'start',
-          text: `开始委派给 ${targetAgentId}: ${goal}`,
-          // Correlation key: lets the frontend nest this run's live blocks into
-          // the leader's delegate_task tool_use card (matched by agentId+goal)
-          // instead of spawning a separate progress card.
-          goal,
-        }),
-      )
+    const streamProgress = progressTarget && parsed.streamProgress === true
+
+    // ── 资源闸有界排队(并发上限 + 内存水位共用 _waitForDelegateCapacity 收口)──
+    // 父→子注册必须先于等待:排队期间用户 Stop 级联(_interruptDelegationsForParent)
+    // 才能经 _delegateQueueWaiters 回调打断等待(此时子 session 尚不存在)。
+    const unregisterDelegation = this._registerActiveDelegation(
+      delegateParent?.sessionKey,
+      sessionKey,
+    )
+    let queuedNoticeSent = false
+    const gate = await this._waitForDelegateCapacity({
+      sessionKey,
+      onQueued: (blocked) => {
+        this.log.info('delegate_queue_wait', {
+          targetAgentId,
+          reason: blocked.kind,
+          waiters: this._delegateQueueWaiters?.size ?? 0,
+          depth,
+        })
+        // 复用既有 delegate progress 通道:start 帧带 goal,前端把这张卡挂回队长的
+        // delegate_task 工具卡;排队文案让用户看到"在排队"而不是无声卡住。
+        if (streamProgress) {
+          queuedNoticeSent = true
+          emitProgress(
+            makeDelegateProgressBlock({
+              runId: progressRunId,
+              agentId: targetAgentId,
+              phase: 'start',
+              text: `排队中:容器资源紧张(${blocked.kind === 'memory' ? '内存水位' : '并发已满'}),等待放行…`,
+              goal,
+            }),
+          )
+        }
+      },
+    })
+    if (gate.status !== 'ok') {
+      unregisterDelegation?.()
+      const waitedS = gate.status === 'queue_full' ? 0 : Math.round(gate.waitedMs / 1000)
+      let httpStatus: number
+      let message: string
+      if (gate.status === 'aborted') {
+        httpStatus = 503
+        message = `delegate 排队等待已被中断(用户停止,已等待 ${waitedS}s)`
+      } else if (gate.blocked.kind === 'memory') {
+        // 与排队机制引入前的内存闸同形:503 + "delegate resource pressure" 前缀。
+        httpStatus = 503
+        const base = `delegate resource pressure: memory ${gate.blocked.pct}% >= ${gate.blocked.limitPct}%`
+        message =
+          gate.status === 'timeout'
+            ? `${base}; 已等待 ${waitedS}s 资源仍紧张,请稍后重试`
+            : `${base}; please retry later(排队等待者已满 ${DELEGATE_QUEUE_MAX_WAITERS} 个)`
+        this.log.warn('delegate_resource_pressure', {
+          targetAgentId,
+          outcome: gate.status,
+          pct: gate.blocked.pct,
+          limitPct: gate.blocked.limitPct,
+          waitedMs: gate.status === 'timeout' ? gate.waitedMs : 0,
+        })
+      } else {
+        // 与排队机制引入前的并发闸同形:429 + "too many concurrent delegations"。
+        httpStatus = 429
+        const base = `too many concurrent delegations (max ${Gateway.MAX_CONCURRENT_DELEGATIONS})`
+        message =
+          gate.status === 'timeout'
+            ? `${base}; 已等待 ${waitedS}s 资源仍紧张,请稍后重试`
+            : `${base}; 排队等待者已满(${DELEGATE_QUEUE_MAX_WAITERS} 个)`
+        this.log.warn('delegate_queue_reject', {
+          targetAgentId,
+          outcome: gate.status,
+          waitedMs: gate.status === 'timeout' ? gate.waitedMs : 0,
+        })
+      }
+      // 已发过"排队中"进度卡 → 补终止帧收口卡片,不留悬挂的进行中状态。
+      if (queuedNoticeSent) {
+        emitProgress(
+          makeDelegateProgressBlock({
+            runId: progressRunId,
+            agentId: targetAgentId,
+            phase: 'error',
+            isError: true,
+            text: message,
+            maxLen: 2_000,
+          }),
+        )
+      }
+      return this.sendError(res, httpStatus, message)
+    }
+    // 已过闸:并发名额已在 _tryReserveDelegateSlot 同步预占,此后所有路径必须释放
+    // —— 正常路径走下方 finally,session 创建/开始帧投递抛错走本 catch。
+    let session
+    try {
+      session = await this.sessions.getOrCreate({
+        sessionKey,
+        agent: delegatedAgent,
+        channel: 'delegate',
+        peerId: sourceAgent || 'system',
+        repoSessionId: progressTarget?.peerId ?? delegateParent?.repoSessionId,
+        title: `[delegate] ${goal.slice(0, 40)}`,
+        delegationDepth: depth + 1,
+        usageAttribution: {
+          mode: 'delegate',
+          delegateAgentId: targetAgentId,
+          ...(parentClientSessionId ? { parentSessionId: parentClientSessionId } : {}),
+        },
+      })
+      if (streamProgress) {
+        emitProgress(
+          makeDelegateProgressBlock({
+            runId: progressRunId,
+            agentId: targetAgentId,
+            phase: 'start',
+            text: `开始委派给 ${targetAgentId}: ${goal}`,
+            // Correlation key: lets the frontend nest this run's live blocks into
+            // the leader's delegate_task tool_use card (matched by agentId+goal)
+            // instead of spawning a separate progress card.
+            goal,
+          }),
+        )
+      }
+    } catch (err) {
+      this._activeDelegations--
+      unregisterDelegation?.()
+      throw err // 路由层 .catch → sendInternalError(500),与既往一致
     }
 
     // Build prompt with context
@@ -6427,16 +6639,10 @@ export class Gateway {
       ? `[委派任务]\n\n目标: ${goal}\n\n上下文:\n${context}\n\n请完成上述任务并返回结果摘要。`
       : `[委派任务]\n\n目标: ${goal}\n\n请完成上述任务并返回结果摘要。`
 
-    this._activeDelegations++
-    const unregisterDelegation = this._registerActiveDelegation(
-      delegateParent?.sessionKey,
-      sessionKey,
-    )
     const _dlgRun = this._runLog.start({ agentId: targetAgentId, sessionKey, taskType: 'delegate' })
     let output = ''
     let error = ''
     let timedOut = false
-    const streamProgress = progressTarget && parsed.streamProgress === true
     const timeoutConfig = resolveDelegateTimeoutConfig()
     const startedAt = Date.now()
     let lastChildActivityAt = startedAt

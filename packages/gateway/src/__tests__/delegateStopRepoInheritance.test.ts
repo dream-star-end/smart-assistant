@@ -168,14 +168,16 @@ test('delegate handler wires the unified additive toolset resolver (no fatal int
   )
 })
 
-test('delegate admission has a best-effort cgroup memory pressure guard', () => {
+test('delegate admission has a best-effort cgroup memory pressure guard (bounded queue)', () => {
   assert.match(SERVER_TS, /OPENCLAUDE_DELEGATE_MEMORY_PRESSURE_RATIO/)
   assert.match(SERVER_TS, /DELEGATE_MEMORY_PRESSURE_DEFAULT_RATIO\s*=\s*0\.85/)
   assert.match(SERVER_TS, /\/sys\/fs\/cgroup\/memory\.current/)
   assert.match(SERVER_TS, /\/sys\/fs\/cgroup\/memory\.max/)
-  assert.match(handleDelegateTask, /readDelegateMemoryPressure\(\)/)
-  assert.match(
-    handleDelegateTask,
-    /this\.sendError\(\s*res,\s*503,[\s\S]*delegate resource pressure/,
-  )
+  // 内存闸 + 并发闸并入同一个有界排队收口(行为断言见 delegateResourceQueue.test.ts,
+  // 这里只守 server.ts 的接线不被回退成"立即 503/429")。
+  assert.match(SERVER_TS, /OPENCLAUDE_DELEGATE_QUEUE_WAIT_MS/)
+  assert.match(SERVER_TS, /_readDelegateMemoryPressure\(\)/)
+  assert.match(handleDelegateTask, /await this\._waitForDelegateCapacity\(/)
+  assert.match(handleDelegateTask, /delegate resource pressure/)
+  assert.match(handleDelegateTask, /too many concurrent delegations/)
 })
