@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AgentGate } from "./components/AgentGate";
 import { AgentPicker } from "./components/AgentPicker";
 import { AuthGate, type AuthMode } from "./components/AuthGate";
@@ -11,21 +11,15 @@ import { type ChatError, ErrorBanner } from "./components/ErrorBanner";
 import { GithubRepoModal } from "./components/github/GithubRepoModal";
 import { RepoStatusBanner } from "./components/github/RepoStatusBanner";
 import { InboxDialog } from "./components/InboxDialog";
-import { Landing } from "./components/Landing";
 import { CHAT_CREATE_TEMPLATES } from "./lib/chatCreateTemplates";
-import { ManageCenter, type ManageTab } from "./components/ManageCenter";
-import {
-  MarketplaceCenter,
-  type MarketplaceKind,
-  type MarketplaceTab,
-} from "./components/MarketplaceCenter";
+import type { ManageTab } from "./components/ManageCenter";
+import type { MarketplaceKind, MarketplaceTab } from "./components/MarketplaceCenter";
 import { AssistantMessage, UserMessage } from "./components/Message";
 import { MessageList } from "./components/MessageRenderer";
 import { MessageListSkeleton, shouldShowHistorySkeleton } from "./components/chat/HistorySkeleton";
 import type { CardCallbacks } from "./components/chat/cards";
 import { MediaSignProvider } from "./components/chat/media";
 import { ChatInteractionContext, ToolCardActionsContext } from "./components/tool/context";
-import { SettingsCenter } from "./components/SettingsCenter";
 import { Sidebar } from "./components/Sidebar";
 import { Alert, Sheet, Spinner, useConfirm, usePrompt } from "./components/ui";
 import { useAgentGate } from "./hooks/useAgentGate";
@@ -47,10 +41,41 @@ import type { RepoBindErrorWire, RepoStatusWire } from "./lib/chat/frames";
 import type { MediaRef } from "./lib/chat/frames";
 import type { ChatMessage } from "./lib/chat/model";
 import { CONTINUE_PROMPT } from "./lib/chat/render";
+import { deriveConnBanner } from "./lib/chat/pure";
 import { DEFAULT_AGENT, agentFromApiRow, type Agent } from "./lib/agents";
 import { api } from "./lib/api";
 import { DEMO_MESSAGES, DEMO_MODELS, DEMO_SESSIONS, DEMO_USER, demoReply } from "./lib/demo";
 import type { Message, PublicConfig, PublicModel, Session, ToolCard } from "./lib/types";
+
+// 首屏瘦身:四大中心（营销首页 + 三个全屏对话框）改按需异步加载,移出 entry chunk。
+// 命名导出 → default 适配。渲染点各自套 Suspense（对话框仅在 open 时挂载 → 首屏零下载,
+// 首次打开时才拉块并短暂显 loading；React.lazy 解析后模块常驻,再次打开无回退闪烁）。
+const Landing = lazy(() => import("./components/Landing").then((m) => ({ default: m.Landing })));
+const SettingsCenter = lazy(() =>
+  import("./components/SettingsCenter").then((m) => ({ default: m.SettingsCenter })),
+);
+const ManageCenter = lazy(() => import("./components/ManageCenter").then((m) => ({ default: m.ManageCenter })));
+const MarketplaceCenter = lazy(() =>
+  import("./components/MarketplaceCenter").then((m) => ({ default: m.MarketplaceCenter })),
+);
+
+/** 全屏懒块加载态（营销首页 chunk 下载期）——与启动续期 splash 同视觉,不割裂。*/
+function SplashFallback() {
+  return (
+    <div className="flex h-full items-center justify-center bg-bg text-muted">
+      <Spinner size={22} />
+    </div>
+  );
+}
+/** 对话框懒块加载态——铺一层与 Dialog.Overlay 同款的半透明遮罩 + 居中 spinner,
+ *  首次打开拉块的短暂空窗内给出「正在打开」的视觉,避免点击后无反馈。*/
+function DialogFallback() {
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-sm">
+      <Spinner size={22} />
+    </div>
+  );
+}
 
 const EMPTY_WS_MESSAGES: ChatMessage[] = [];
 const TEAM_MODE_STORAGE_KEY = "oc_v5_team_mode";
@@ -627,6 +652,16 @@ export function App() {
 
   // 会话级 transient 软提示（"较长时间未收到新内容…"）：非消息卡片、不落库；随快照读回。
   const transientNotice = !demo && activeId ? chat.getTransientNotice(activeId) : null;
+  // 弱网/重连状态条三态分流（离线 / 环境启动中 / 服务端重连中）。文案与 tone 收口在
+  // deriveConnBanner（纯函数，单测锁定）；返回 null 时不显条。demo 恒不显（本地回放无 WS）。
+  const connBanner = demo
+    ? null
+    : deriveConnBanner({
+        cls: chat.status.cls,
+        label: chat.status.label,
+        browserOnline: chat.browserOnline,
+        provisioning: chat.provisioning,
+      });
   // 停止当前轮：demo 本地停回放；非 demo 发 inbound.control.stop 并本地收尾。
   const stopTurn = useCallback(() => {
     if (demo) {
@@ -858,18 +893,20 @@ export function App() {
   }
   if (!demo && view === "home") {
     return (
-      <Landing
-        onStart={() => {
-          setAuthMode("register");
-          setView("app");
-        }}
-        onLogin={() => {
-          setAuthMode("login");
-          setView("app");
-        }}
-        theme={theme}
-        onCycleTheme={cycle}
-      />
+      <Suspense fallback={<SplashFallback />}>
+        <Landing
+          onStart={() => {
+            setAuthMode("register");
+            setView("app");
+          }}
+          onLogin={() => {
+            setAuthMode("login");
+            setView("app");
+          }}
+          theme={theme}
+          onCycleTheme={cycle}
+        />
+      </Suspense>
     );
   }
   if (!demo && (!auth || !user)) {
@@ -1069,10 +1106,10 @@ export function App() {
               <Alert tone="info">容器已休眠，发送消息后将自动唤醒。</Alert>
             </div>
           )}
-          {/* WS 连接状态条（连接中/重连/补发离线消息/容器初始化等）。仅非 demo。*/}
-          {!demo && !gated && chat.status.cls !== "connected" && (
+          {/* WS 连接状态条三态（离线 / 环境启动中 / 服务端重连中，见 deriveConnBanner）。仅非 demo。*/}
+          {!gated && connBanner && (
             <div className="mx-auto mb-2 max-w-3xl px-4">
-              <Alert tone={chat.status.cls === "disconnected" ? "warning" : "info"}>{chat.status.label}</Alert>
+              <Alert tone={connBanner.tone}>{connBanner.text}</Alert>
             </div>
           )}
           {chatError && (
@@ -1126,16 +1163,22 @@ export function App() {
         }}
       />
 
-      <SettingsCenter
-        open={settingsOpen}
-        auth={auth}
-        user={user}
-        theme={theme}
-        demo={demo}
-        onClose={() => setSettingsOpen(false)}
-        onSetTheme={setTheme}
-        onRefreshMe={refreshMe}
-      />
+      {/* 仅在打开时挂载 → 懒块首屏零下载;Dialog 无 exit 动画(仅 data-[state=open]),
+          即时卸载无视觉回退。tab 等状态由 App 持有或组件 open 时自 resync,卸载安全。*/}
+      {settingsOpen && (
+        <Suspense fallback={<DialogFallback />}>
+          <SettingsCenter
+            open={settingsOpen}
+            auth={auth}
+            user={user}
+            theme={theme}
+            demo={demo}
+            onClose={() => setSettingsOpen(false)}
+            onSetTheme={setTheme}
+            onRefreshMe={refreshMe}
+          />
+        </Suspense>
+      )}
 
       <InboxDialog
         open={inboxOpen}
@@ -1156,46 +1199,54 @@ export function App() {
         toast={toast}
       />
 
-      <ManageCenter
-        open={manageOpen}
-        tab={manageTab}
-        auth={auth}
-        agentId={agent.id}
-        agents={myAgents}
-        onTabChange={setManageTab}
-        onClose={() => setManageOpen(false)}
-      />
+      {manageOpen && (
+        <Suspense fallback={<DialogFallback />}>
+          <ManageCenter
+            open={manageOpen}
+            tab={manageTab}
+            auth={auth}
+            agentId={agent.id}
+            agents={myAgents}
+            onTabChange={setManageTab}
+            onClose={() => setManageOpen(false)}
+          />
+        </Suspense>
+      )}
 
-      <MarketplaceCenter
-        open={marketplaceOpen}
-        tab={marketplaceTab}
-        auth={auth}
-        isAdmin={user?.role === "admin"}
-        initialBrowseKind={marketplaceBrowseKind}
-        onCreateInChat={(kind) => {
-          setMarketplaceOpen(false);
-          newSession();
-          setComposerPrefill({ text: CHAT_CREATE_TEMPLATES[kind], nonce: Date.now() });
-        }}
-        onTabChange={setMarketplaceTab}
-        onClose={() => {
-          setMarketplaceOpen(false);
-          // 市场关闭后刷新已装目录(装/卸都会变);若当前选中的市场 agent 刚被卸载,
-          // 回落全能助手,header/composer 不显示 stale agent。
-          if (!demo && auth) {
-            const a = auth;
-            api
-              .listMyAgents(a)
-              .then((rows) => {
-                setMyAgents(rows.map(agentFromApiRow));
-                if (agent.id !== "main" && !rows.some((r) => r.id === agent.id)) {
-                  setAgent(DEFAULT_AGENT);
-                }
-              })
-              .catch(() => {});
-          }
-        }}
-      />
+      {marketplaceOpen && (
+        <Suspense fallback={<DialogFallback />}>
+          <MarketplaceCenter
+            open={marketplaceOpen}
+            tab={marketplaceTab}
+            auth={auth}
+            isAdmin={user?.role === "admin"}
+            initialBrowseKind={marketplaceBrowseKind}
+            onCreateInChat={(kind) => {
+              setMarketplaceOpen(false);
+              newSession();
+              setComposerPrefill({ text: CHAT_CREATE_TEMPLATES[kind], nonce: Date.now() });
+            }}
+            onTabChange={setMarketplaceTab}
+            onClose={() => {
+              setMarketplaceOpen(false);
+              // 市场关闭后刷新已装目录(装/卸都会变);若当前选中的市场 agent 刚被卸载,
+              // 回落全能助手,header/composer 不显示 stale agent。
+              if (!demo && auth) {
+                const a = auth;
+                api
+                  .listMyAgents(a)
+                  .then((rows) => {
+                    setMyAgents(rows.map(agentFromApiRow));
+                    if (agent.id !== "main" && !rows.some((r) => r.id === agent.id)) {
+                      setAgent(DEFAULT_AGENT);
+                    }
+                  })
+                  .catch(() => {});
+              }
+            }}
+          />
+        </Suspense>
+      )}
       {confirmDialogEl}
       {promptTextEl}
     </div>
