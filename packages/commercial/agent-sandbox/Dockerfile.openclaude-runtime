@@ -316,7 +316,7 @@ RUN set -eux; \
 RUN if [ "$OC_INCLUDE_CODEX" = "1" ]; then set -eux; \
       git init --bare --initial-branch=main /opt/codex-empty-marketplace.git; \
       chmod -R a+rX /opt/codex-empty-marketplace.git; \
-      printf '[url "file:///opt/codex-empty-marketplace.git/"]\n\tinsteadOf = https://github.com/openai/plugins.git\n\tinsteadOf = https://github.com/openai/plugins\n' >> /etc/gitconfig; \
+      printf '[url "file:///opt/codex-empty-marketplace.git/"]\n\tinsteadOf = https://github.com/openai/plugins.git\n\tinsteadOf = https://github.com/openai/plugins\n[safe]\n\tdirectory = /opt/codex-empty-marketplace.git\n' >> /etc/gitconfig; \
     fi
 
 # ------------------------------------------------------------
