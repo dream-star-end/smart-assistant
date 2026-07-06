@@ -40,7 +40,15 @@ import {
   putDocument as storePutDocument,
 } from "./store.js";
 import { ingestBlob, litragQuery, runCheck, runCiteFix } from "./researchHandlers.js";
-import { queryDocuments } from "./litrag.js";
+import { type SemanticQueryDeps, queryDocuments } from "./litrag.js";
+import {
+  getSkillEmbeddingProvider,
+  isSkillEmbeddingAvailable,
+  skillEmbeddingBackendId,
+  skillEmbeddingConfigFromEnv,
+} from "@openclaude/storage";
+import { directEgressDispatcher } from "../account-pool/egressDispatcher.js";
+import { makePgSkillEmbedCache } from "../http/skillEmbedCachePg.js";
 import type { FetchLike } from "./sources.js";
 import { type LitSourceName, searchMultiSource } from "./litSearch.js";
 import { type SnowballDirection, snowball } from "./snowball.js";
@@ -331,7 +339,7 @@ export function makeResearchProxyHandler(deps: ResearchProxyDeps): ResearchProxy
         return;
       }
       if (reqPath === `${RESEARCH_PREFIX}litrag/query`) {
-        await handleLitragQuery(res, body, identity.userId, store, requestId);
+        await handleLitragQuery(res, body, cfg, identity.userId, store, requestId);
         return;
       }
       if (reqPath === `${RESEARCH_PREFIX}cite/check`) {
@@ -550,9 +558,40 @@ async function handleIngest(
   sendJson(res, 200, outcome.outline, requestId);
 }
 
+/**
+ * 构造 litrag 语义召回依赖(master 侧)。接线既有 config 桩 `litrag.embedBackend`:
+ *   - "local"(默认)→ undefined → 纯 TF(确定性,行为字节不变),语义 OFF。
+ *   - "http" → 复用平台 skill-embedding 栈(DashScope provider + skill_embedding_cache 通用
+ *     content-hash 缓存 + directEgress 直连,平台 key 不进容器)做语义召回。若平台 key 缺失
+ *     (isSkillEmbeddingAvailable=false)→ 同样 undefined → fail-soft 纯 TF(不报错)。
+ * 复用 skill_embedding_cache 免新迁移:该表键 (content_hash, backend_id, dimensions) 是
+ * "per (内容, 模型)" 的通用向量缓存;span 向量按 span 文本内容 hash 缓存,与 skill 条目
+ * (hash 的是 skill 规范 JSON)天然不冲突(sha256 不同前像)。研究 ops 不按 token 计费,
+ * embedding 走平台 key + 缓存摊薄 → 不增用户成本(铁律②)。
+ */
+function buildLitragSemanticDeps(cfg: ResearchConfigPublic): SemanticQueryDeps | undefined {
+  if (cfg.config.litrag.embedBackend !== "http") return undefined;
+  if (!isSkillEmbeddingAvailable()) return undefined;
+  // 复用共享 singleton provider(与 marketplaceSearch/internalSkillEmbed 同一权威),
+  // dispatcher 首次初始化时锁定直连(DashScope 国内端点须绕过全局海外代理)。
+  const provider = getSkillEmbeddingProvider({
+    ...skillEmbeddingConfigFromEnv(),
+    dispatcher: directEgressDispatcher(),
+  });
+  const backendId = `${skillEmbeddingBackendId()}/${provider.modelId}`;
+  const dim = provider.dimensions;
+  const cache = makePgSkillEmbedCache();
+  return {
+    embed: (texts, kind) => provider.embed(texts, kind),
+    getCached: (hashes) => cache.getMany(hashes, backendId, dim),
+    putCached: (entries) => cache.putMany(entries, backendId, dim),
+  };
+}
+
 async function handleLitragQuery(
   res: ServerResponse,
   body: Record<string, unknown>,
+  cfg: ResearchConfigPublic,
   userId: number,
   store: ResearchStoreDeps,
   requestId: string,
@@ -566,7 +605,10 @@ async function handleLitragQuery(
     return;
   }
   const topK = typeof body.topK === "number" && Number.isFinite(body.topK) ? body.topK : undefined;
-  const result = await litragQuery(userId, docIds, query, { topK }, { getDocument: store.getDocument });
+  const result = await litragQuery(userId, docIds, query, { topK }, {
+    getDocument: store.getDocument,
+    semantic: buildLitragSemanticDeps(cfg),
+  });
   sendJson(res, 200, result, requestId);
 }
 

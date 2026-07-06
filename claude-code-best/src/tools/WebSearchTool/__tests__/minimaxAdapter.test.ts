@@ -57,7 +57,8 @@ test('POSTs {q} to master proxy with bearer token, maps organic→SearchResult',
   expect(body).toEqual({ q: '抖音运营' })
   expect(cfg.headers.Authorization).toBe(`Bearer ${TOKEN}`)
   expect(results).toEqual([
-    { title: '抖音起号技巧', url: 'https://www.toutiao.com/a/1', snippet: '1.定位...' },
+    // date present → prepended to snippet head so the model perceives recency.
+    { title: '抖音起号技巧', url: 'https://www.toutiao.com/a/1', snippet: '(2026-01-01) 1.定位...' },
     { title: '算法解析', url: 'https://blog.csdn.net/x', snippet: '完播率退出核心' },
   ])
 })

@@ -104,11 +104,18 @@ export class MiniMaxSearchAdapter implements WebSearchAdapter {
         ? ((data as { organic: unknown[] }).organic as Array<Record<string, unknown>>)
         : []
     const mapped: SearchResult[] = organic
-      .map((r) => ({
-        title: typeof r.title === 'string' ? r.title : '',
-        url: typeof r.url === 'string' ? r.url : '',
-        snippet: typeof r.snippet === 'string' && r.snippet ? r.snippet : undefined,
-      }))
+      .map((r) => {
+        const snippet = typeof r.snippet === 'string' && r.snippet ? r.snippet : undefined
+        // Surface upstream recency into the snippet head so the model can weigh
+        // freshness (the master proxy already time-reranked; this makes the date
+        // visible in the text the model reads). No date → snippet unchanged.
+        const date = typeof r.date === 'string' && r.date ? r.date : undefined
+        return {
+          title: typeof r.title === 'string' ? r.title : '',
+          url: typeof r.url === 'string' ? r.url : '',
+          snippet: date ? `(${date}) ${snippet ?? ''}`.trim() : snippet,
+        }
+      })
       .filter((r) => r.url)
 
     const results = filterByDomain(mapped, allowedDomains, blockedDomains)

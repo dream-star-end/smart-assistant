@@ -18,6 +18,7 @@ import {
   FileSpreadsheet,
   FileText,
   FileOutput,
+  Globe,
   Package,
   Quote,
   Search,
@@ -789,6 +790,136 @@ function MarketCard({ tool }: { tool: ToolLike }) {
   );
 }
 
+// ── WebSearch 来源列表富卡(内置工具,非 oc-* CLI) ──────────────────────────
+
+/** 从 url 取展示域名(去 www. 前缀);非法 url → undefined。 */
+function domainOf(url: string): string | undefined {
+  try {
+    return new URL(url).hostname.replace(/^www\./, "");
+  } catch {
+    return undefined;
+  }
+}
+
+export interface WebSearchHit {
+  title: string;
+  url: string;
+  snippet?: string;
+}
+
+// 后端 WebSearchTool 把结果拼成 `  - [title](url): snippet` 行(见 minimaxAdapter/
+// WebSearchTool.mapToolResultToToolResultBlockParam)。逐行解析,非结果行(标题/REMINDER)
+// 自然不匹配。纯函数:解析失败/空/畸形 → [](卡片据此回落通用文本块,UX 铁律)。
+const WEB_SEARCH_LINE = /^\s*-\s+\[(.+?)\]\(([^)]+)\)(?::\s*(.*))?$/;
+
+export function parseWebSearchResults(text: string | null | undefined): WebSearchHit[] {
+  if (!text) return [];
+  const hits: WebSearchHit[] = [];
+  for (const line of text.split("\n")) {
+    const m = WEB_SEARCH_LINE.exec(line);
+    if (!m) continue;
+    const url = (m[2] ?? "").trim();
+    if (!url) continue;
+    hits.push({ title: (m[1] ?? "").trim(), url, snippet: m[3]?.trim() || undefined });
+  }
+  return hits;
+}
+
+/** WebSearch 结果 → 来源列表富卡;解析不出结果 → null(调用方回落通用 OutputBlock)。 */
+export function WebSearchResultsCard({ tool }: { tool: ToolLike }): ReactNode | null {
+  const hits = parseWebSearchResults(outputText(tool));
+  if (hits.length === 0) return null;
+  return (
+    <CardShell icon={<Search className="size-4" />} title="网页搜索" subtitle={`${hits.length} 条来源`}>
+      <ul className="flex flex-col divide-y divide-border">
+        {hits.slice(0, 20).map((h, i) => {
+          const domain = domainOf(h.url);
+          return (
+            <li key={`${i}-${h.url}`} className="py-2 first:pt-0 last:pb-0">
+              {isSafeHttpUrl(h.url) ? (
+                <a
+                  className="text-[13px] leading-snug text-accent hover:underline break-words"
+                  href={h.url}
+                  target="_blank"
+                  rel="noreferrer noopener"
+                >
+                  {h.title || h.url}
+                </a>
+              ) : (
+                <div className="text-[13px] leading-snug text-fg break-words">{h.title || h.url}</div>
+              )}
+              {domain && <div className="mt-0.5 text-xs text-faint">{domain}</div>}
+              {h.snippet && <div className="mt-1 text-xs text-faint line-clamp-2">{h.snippet}</div>}
+            </li>
+          );
+        })}
+      </ul>
+    </CardShell>
+  );
+}
+
+// ── oc-web 抽取富卡(摘要 + 折叠全文) ──────────────────────────────────────
+
+interface OcWebContent {
+  body: string;
+  url?: string;
+  truncated?: boolean;
+}
+
+/** oc-web 输出:默认是抽取的 markdown 正文;`--json` 模式是 {ok,markdown,final_url,truncated,…}。 */
+function ocWebContent(tool: ToolLike): OcWebContent | null {
+  const text = outputText(tool);
+  if (!text) return null;
+  const t = text.trim();
+  if (t.startsWith("{")) {
+    try {
+      const j = JSON.parse(t);
+      if (isRecord(j) && (typeof j.markdown === "string" || typeof j.text === "string")) {
+        const body = (asStr(j.markdown) || asStr(j.text)).trim();
+        if (!body) return null;
+        return { body, url: asStr(j.final_url) || asStr(j.url), truncated: j.truncated === true };
+      }
+    } catch {
+      /* 非 JSON → 当作 markdown 正文处理 */
+    }
+  }
+  return t ? { body: t } : null;
+}
+
+/** 取首个非空段落作摘要(至多 240 字);标题行也可作首段。 */
+function firstParagraph(md: string): string {
+  const para = md.trim().split(/\n\s*\n/)[0] ?? md.trim();
+  return para.length > 240 ? `${para.slice(0, 240)}…` : para;
+}
+
+/** oc-web 抽取 → 摘要富卡 + 折叠全文;无正文 → null(回落通用 BashBody)。 */
+function OcWebExtractCard({ tool }: { tool: ToolLike }): ReactNode | null {
+  const content = ocWebContent(tool);
+  if (!content) return null;
+  const { body, url, truncated } = content;
+  const summary = firstParagraph(body);
+  const domain = url ? domainOf(url) : undefined;
+  return (
+    <CardShell icon={<Globe className="size-4" />} title="网页/文档提取" subtitle={domain}>
+      <div className="whitespace-pre-wrap break-words text-[13px] leading-snug text-fg">{summary}</div>
+      {(url || truncated) && (
+        <div className="mt-1 flex flex-wrap items-center gap-1.5">
+          {url && <Chip href={url}>{domain ?? "来源"}</Chip>}
+          {truncated && <Chip tone="muted">已截断</Chip>}
+        </div>
+      )}
+      {body.length > summary.length && (
+        <details className="mt-2">
+          <summary className="cursor-pointer text-[11.5px] text-accent hover:underline">查看抽取全文</summary>
+          <pre className="mt-1 max-h-64 overflow-auto whitespace-pre-wrap break-words rounded-md bg-code px-3 py-2 font-mono text-[11.5px] leading-relaxed text-fg">
+            {body}
+          </pre>
+        </details>
+      )}
+    </CardShell>
+  );
+}
+
 // ── 注册表 + 分派入口 ────────────────────────────────────────────────────────
 
 interface CardEntry {
@@ -855,6 +986,8 @@ const TOOL_CARD_REGISTRY: CardEntry[] = [
         note: "可在文件区下载;数据/图表已按模板写入工作簿。",
       }),
   },
+  // 网页/文档提取(输出是抽取的 markdown 正文,非 JSON)。
+  { match: (c) => matchOcTool(c, "oc-web"), render: (_c, t) => OcWebExtractCard({ tool: t }) },
   // 其它通用工具。
   { match: (c) => matchOcTool(c, "oc-market"), render: (_c, t) => MarketCard({ tool: t }) },
 ];

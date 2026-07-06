@@ -40,6 +40,10 @@ const SEARCH_PATH = "/v1/coding_plan/search";
 const UPSTREAM_TIMEOUT_MS = 30_000;
 /** MiniMax coding_plan/search 单次最多返 10 条;上限 organic 结果数防止巨包。 */
 const MAX_RESULTS = 10;
+/** 同 host 最多保留几条(超出折叠丢弃):提升来源多样性,防单站刷屏。 */
+const MAX_PER_HOST = 3;
+/** 解析上游 organic 的原始条数上界(上游本就 ≤10;防御性防巨包)。 */
+const RAW_PARSE_CAP = 50;
 
 // 每容器固定窗口限流:身份校验能保证"活跃容器",但挡不住某容器循环打本路由耗尽共享
 // MINIMAX_TOKEN_PLAN_KEY 的搜索额度(media 走计费、literature 有 cap;本路由无按次计费,
@@ -108,11 +112,22 @@ function baseRespMessage(json: unknown): string {
   return "upstream error";
 }
 
-/** 只保留 CCB adapter 需要的字段,裁剪到 MAX_RESULTS,避免把原始大包透给容器。 */
-function trimOrganic(json: unknown): Array<{ title: string; url: string; snippet: string; date?: string }> {
+type Organic = { title: string; url: string; snippet: string; date?: string };
+
+function hostOf(url: string): string | null {
+  try {
+    return new URL(url).hostname.toLowerCase();
+  } catch {
+    return null;
+  }
+}
+
+/** 解析+裁字段(link→url,保留 title/snippet/date);不排序、不去重(交由后续步骤)。 */
+function parseOrganic(json: unknown): Organic[] {
   const organic = isObj(json) && Array.isArray(json.organic) ? json.organic : [];
-  const out: Array<{ title: string; url: string; snippet: string; date?: string }> = [];
+  const out: Organic[] = [];
   for (const item of organic) {
+    if (out.length >= RAW_PARSE_CAP) break;
     if (!isObj(item)) continue;
     const url = typeof item.link === "string" ? item.link : "";
     if (!url) continue;
@@ -122,13 +137,78 @@ function trimOrganic(json: unknown): Array<{ title: string; url: string; snippet
       snippet: typeof item.snippet === "string" ? item.snippet : "",
       ...(typeof item.date === "string" && item.date ? { date: item.date } : {}),
     });
-    if (out.length >= MAX_RESULTS) break;
   }
   return out;
 }
 
+/**
+ * 时效前移分:有 date 且越新 → 越大正向前移(至多 3 档);无 date/无法解析 → 0
+ * (**不惩罚**,保持相关性原位)。未来日期(上游异常)按最新档处理。
+ */
+function recencyBonus(date: string | undefined, now: number): number {
+  if (!date) return 0;
+  const t = Date.parse(date);
+  if (Number.isNaN(t)) return 0;
+  const ageDays = (now - t) / 86_400_000;
+  if (ageDays <= 7) return 3; // 一周内
+  if (ageDays <= 30) return 2; // 一月内
+  if (ageDays <= 180) return 1; // 半年内
+  if (ageDays <= 365) return 0.5; // 一年内
+  return 0; // 更旧不惩罚(与无 date 同)
+}
+
+/**
+ * 时效重排:effectiveRank = 原始名次 − recencyBonus。有 date 的新结果适度前移(至多 3 位),
+ * 无 date 不惩罚(bonus=0 → 保持原位基准)。稳定:tie 用原始名次(相关性)兜底。
+ */
+function rerankByRecency(items: Organic[], now: number): Organic[] {
+  return items
+    .map((it, idx) => ({ it, idx, eff: idx - recencyBonus(it.date, now) }))
+    .sort((a, b) => a.eff - b.eff || a.idx - b.idx)
+    .map((x) => x.it);
+}
+
+/**
+ * 同 host 折叠:按当前顺序遍历,每 host 至多留 maxPerHost 条,超出丢弃
+ * (无法解析 host 的不折叠,原样保留)。
+ */
+function dedupeByHost(items: Organic[], maxPerHost: number): Organic[] {
+  const seen = new Map<string, number>();
+  const out: Organic[] = [];
+  for (const it of items) {
+    const h = hostOf(it.url);
+    if (h === null) {
+      out.push(it);
+      continue;
+    }
+    const n = seen.get(h) ?? 0;
+    if (n >= maxPerHost) continue;
+    seen.set(h, n + 1);
+    out.push(it);
+  }
+  return out;
+}
+
+/**
+ * 裁剪 organic → CCB adapter 需要的字段,并做:①时效加权重排(新结果适度前移,无 date
+ * 不惩罚)②同 host 去重(超 MAX_PER_HOST 条折叠)③截断 MAX_RESULTS。字段透传
+ * title/url/snippet/date。now 可注入(测试用),线上取 Date.now()。
+ */
+function trimOrganic(json: unknown, now: number = Date.now()): Organic[] {
+  const parsed = parseOrganic(json);
+  const reranked = rerankByRecency(parsed, now);
+  const deduped = dedupeByHost(reranked, MAX_PER_HOST);
+  return deduped.slice(0, MAX_RESULTS);
+}
+
 /** Test-only surface (mirrors mediaProxy's `__internal_*`). */
-export const __internal_minimaxSearch = { trimOrganic, baseRespOk };
+export const __internal_minimaxSearch = {
+  trimOrganic,
+  baseRespOk,
+  recencyBonus,
+  rerankByRecency,
+  dedupeByHost,
+};
 
 export function makeMiniMaxWebSearchHandler(deps: MiniMaxWebSearchHandlerDeps): MiniMaxWebSearchHandler {
   const log = (deps.logger ?? rootLogger).child({ subsys: "minimaxWebSearchProxy" });

@@ -23,7 +23,12 @@ import {
   isNeedsOcr,
   mintDocument,
 } from "./ingest.js";
-import { type QueryOpts, queryDocuments } from "./litrag.js";
+import {
+  type QueryOpts,
+  type SemanticQueryDeps,
+  queryDocuments,
+  queryDocumentsSemantic,
+} from "./litrag.js";
 import { type CheckManifestDeps, checkManifest } from "./checkManifest.js";
 import { type CiteFixChange, realignUnsupportedClaims } from "./citeFix.js";
 
@@ -107,6 +112,12 @@ function buildOutline(doc: NormalizedDocument): DocumentOutline["sections"] {
 
 export interface LitragDeps {
   getDocument: (userId: number, docId: string) => Promise<NormalizedDocument | null>;
+  /**
+   * 可选语义召回(master 侧 embedding + 内容 hash 缓存)。存在则先走语义 RRF,
+   * 任何 embedding 失败 → **fail-soft 回落纯 TF `queryDocuments`**(字节一致,铁律①)。
+   * 不存在(未开通/无平台 key)→ 直接纯 TF,行为完全不变。
+   */
+  semantic?: SemanticQueryDeps;
 }
 
 /** 在用户的权威文档集上检索 → quote handles(master 铸造 canonical 文本)。 */
@@ -123,6 +134,15 @@ export async function litragQuery(
     const d = await deps.getDocument(userId, id);
     if (d) docs.push(d);
     else missing.push(id);
+  }
+  // 语义路径 fail-soft:embedding 抖动/不可用绝不让检索变差 —— 回落确定性纯 TF。
+  if (deps.semantic) {
+    try {
+      const quotes = await queryDocumentsSemantic(docs, query, opts, deps.semantic);
+      return { quotes, missing };
+    } catch {
+      // 落回纯 TF(下方),保证与未开通语义时完全一致的兜底行为。
+    }
   }
   return { quotes: queryDocuments(docs, query, opts), missing };
 }

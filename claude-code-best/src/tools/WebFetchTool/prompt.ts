@@ -25,9 +25,17 @@ export function makeSecondaryModelPrompt(
   prompt: string,
   isPreapprovedDomain: boolean,
 ): string {
+  // The content above may be structure-truncated: it can contain markers like
+  // "[⋯ 中段省略 … ⋯]" separating the page head, a section outline (headings +
+  // first paragraph), and the page tail. Answer only from the text that is
+  // present; if the specific detail asked for sits in an elided section, say so
+  // rather than inventing it.
+  const fidelity = `Preserve key facts verbatim: keep exact numbers, dates, quantities, and the source's stated conclusions unchanged. When you quote or rely on a specific passage, cite where it came from (the nearest section heading, or "head"/"tail"). If part of the page was omitted (elision markers), do not fabricate the missing content.`
+
   const guidelines = isPreapprovedDomain
-    ? `Provide a concise response based on the content above. Include relevant details, code examples, and documentation excerpts as needed.`
+    ? `Provide a concise response based on the content above. Include relevant details, code examples, and documentation excerpts as needed. ${fidelity}`
     : `Provide a concise response based only on the content above. In your response:
+ - ${fidelity}
  - Enforce a strict 125-character maximum for quotes from any source document. Open Source Software is ok as long as we respect the license.
  - Use quotation marks for exact language from articles; any language outside of the quotation should never be word-for-word the same.
  - You are not a lawyer and never comment on the legality of your own prompts and responses.
