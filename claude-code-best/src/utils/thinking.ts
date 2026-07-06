@@ -7,7 +7,7 @@ import { get3PModelCapabilityOverride } from './model/modelSupportOverrides.js'
 import { getAPIProvider } from './model/providers.js'
 import { getSettingsWithErrors } from './settings/settings.js'
 import { resolveAntModel } from './model/antModels.js'
-import { isArkGlmModel, isCapabilityZeroStaticModel, isOpencodeQwenModel } from './model/staticKeyModels.js'
+import { isArkGlmModel, isArkPlanKimiModel, isCapabilityZeroStaticModel, isOpencodeQwenModel } from './model/staticKeyModels.js'
 import { isMiniMaxM3Model } from './model/minimax.js'
 
 export type ThinkingConfig =
@@ -110,6 +110,13 @@ export function modelSupportsThinking(model: string): boolean {
   // https://opencode.ai/zen/go/v1/messages 接受 thinking:{type:enabled,budget_tokens},且
   // {type:disabled} 真关思考(直答,output_tokens=1)。同走 enabled+budget 分支。
   if (isOpencodeQwenModel(model)) {
+    return true
+  }
+  // kimi-k2.7-code(火山 Agent Plan)是**恒思考**模型 —— 在 isCapabilityZeroStaticModel 集合
+  // (betas/effort/adaptive-thinking 全关),thinking 例外放行:2026-07-06 直连验证火山 plan 端点
+  // 接受 thinking:{type:enabled,budget_tokens}(同走 enabled+budget 分支)。注意它不支持
+  // disabled(火山 400),master 侧 spec.stripDisabledThinking 删参兜底。
+  if (isArkPlanKimiModel(model)) {
     return true
   }
   if (isCapabilityZeroStaticModel(model)) {

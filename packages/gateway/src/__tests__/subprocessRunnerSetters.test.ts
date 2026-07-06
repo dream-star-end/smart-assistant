@@ -85,6 +85,8 @@ describe('SubprocessRunner.model getter / setModel', () => {
     // qwen3.7-max/plus OpenCode Go anthropic-compatible 上游(2026-07-05):
     assert.ok(ALLOWED_INBOUND_MODELS.has('qwen3.7-max'))
     assert.ok(ALLOWED_INBOUND_MODELS.has('qwen3.7-plus'))
+    // kimi-k2.7-code 火山方舟 Agent Plan anthropic-compatible 上游(2026-07-06):
+    assert.ok(ALLOWED_INBOUND_MODELS.has('kimi-k2.7-code'))
   })
 
   it('ALLOWED_INBOUND_MODELS 全面下线 Claude 官方模型(v3+v5)', () => {

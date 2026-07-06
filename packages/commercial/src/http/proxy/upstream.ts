@@ -351,6 +351,20 @@ function makeStaticKeyUpstream(
       for (const field of spec.stripBodyFields) {
         delete mutableBody[field];
       }
+      // 恒思考模型兜底(kimi-k2.7-code):上游不支持 thinking:{type:'disabled'}(火山 400
+      // "does not support disabling thinking"),删参退回上游默认(照常思考)。覆盖一切调用方
+      // (含 CCB 内部 side-query 显式 disabled 的路径)。语义见 protocol spec 注释。
+      if (spec.stripDisabledThinking) {
+        const th = mutableBody.thinking;
+        if (
+          th !== null &&
+          typeof th === "object" &&
+          !Array.isArray(th) &&
+          (th as Record<string, unknown>).type === "disabled"
+        ) {
+          delete mutableBody.thinking;
+        }
+      }
       // outputConfig effort 白名单(火山 ark glm):output_config 不整体 strip,但**只保留合法 effort**。
       // 火山端点仅识别 output_config.effort(其余 CCB firstParty-only 子字段 task_budget/format 等会拒/忽略),
       // 且 glm-5.2 产品只暴露高/最高两档。按 protocol 权威白名单收口:effort ∈ allowlist → 重建为 { effort };

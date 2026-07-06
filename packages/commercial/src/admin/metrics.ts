@@ -524,6 +524,8 @@ export type ProxyRejectReason =
   | "minimax_config"
   // OpenCode Go(Zen 网关 Go 档,qwen3.7-max/plus,2026-07-05):缺 OPENCODE_GO_API_KEY 时独立打点。
   | "opencodego_config"
+  // 火山 Agent Plan Kimi(kimi-k2.7-code,2026-07-06):缺 ARK_AGENT_PLAN_KEY 时独立打点(与 minimax 共 key 不共标签)。
+  | "kimi_config"
   // glm-5.1 命中但 ARK_CODING_PLAN_KEY 未配置(火山方舟 Coding Plan 文本路由 503)
   | "ark_config"
   // Phase 5 platform envelope rewriter:**handler-level** deps.platformContextLoader
