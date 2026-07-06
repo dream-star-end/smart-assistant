@@ -221,8 +221,24 @@ export async function enqueueAlert(
 /**
  * 捞 ready 的 outbox 行,按 next_attempt_at 顺序。
  * LIMIT 避免一口气吃太多行。调用方在 worker loop 里反复调。
+ *
+ * `channelType`(可选):只认领关联通道 channel_type 等于该值的行。**单一 claim
+ * 权威源**,不派生并行 claim 函数。用于类型分区的 dispatcher —— 每个 dispatcher 只
+ * 认领自己能处理的类型,消除"类型无关 claim 让 A dispatcher 误碰 B 类型行"的 split-brain。
+ *   - 不传(undefined):认领所有类型(含 channel 已删的 NULL 行 → markFailed 'channel missing'),
+ *     保持既有 iLink/telegram catch-all worker 语义不变。
+ *   - 传 'wecom_bot':仅认领 wecom 行(channel 已删的 NULL 行不匹配 → 由 CASCADE 删除,不需认领)。
  */
-export async function claimReadyAlerts(limit = 20): Promise<OutboxDispatchRow[]> {
+export async function claimReadyAlerts(
+  limit = 20,
+  channelType?: string,
+): Promise<OutboxDispatchRow[]> {
+  const params: unknown[] = [MAX_ATTEMPTS, limit];
+  let typeClause = "";
+  if (channelType !== undefined) {
+    params.push(channelType);
+    typeClause = `AND c.channel_type = $${params.length}`;
+  }
   const r = await query<Record<string, unknown>>(
     `SELECT o.id::text AS id,
             o.event_type, o.severity, o.status,
@@ -241,9 +257,10 @@ export async function claimReadyAlerts(limit = 20): Promise<OutboxDispatchRow[]>
       WHERE o.status IN ('pending', 'failed')
         AND o.next_attempt_at <= NOW()
         AND o.attempts < $1
+        ${typeClause}
       ORDER BY o.next_attempt_at ASC, o.id ASC
       LIMIT $2`,
-    [MAX_ATTEMPTS, limit],
+    params,
   );
   return r.rows.map(toDispatchRow);
 }

@@ -13,13 +13,14 @@
  *     admin 禁用 → disabled
  */
 
+import { createHash } from 'node:crypto'
 import type { PoolClient } from 'pg'
 import { query, tx, type QueryRunner } from '../db/queries.js'
 import { encrypt, decrypt, AeadError } from '../crypto/aead.js'
 import { loadKmsKey } from '../crypto/keys.js'
 import { writeAdminAudit } from './audit.js'
 
-export type ChannelType = 'ilink_wechat' | 'telegram'
+export type ChannelType = 'ilink_wechat' | 'telegram' | 'wecom_bot'
 export type Severity = 'info' | 'warning' | 'critical'
 export type ActivationStatus = 'pending' | 'active' | 'disabled' | 'error'
 
@@ -389,6 +390,140 @@ export async function createTelegramChannel(
         severity_min: row.severity_min,
         event_types: row.event_types,
         tg_chat_id: row.tg_chat_id,
+      },
+      ip: input.ip ?? null,
+      userAgent: input.userAgent ?? null,
+    })
+    return row
+  })
+}
+
+// ─── WeCom(企业微信群机器人)channel creation ───────────────────────
+
+/**
+ * 解析企业微信群机器人 webhook key。宽容处理(boss 直接粘整条 URL 也要能用):
+ *   - 整条 URL(https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=XXX)→ 抽 key 参数
+ *   - 裸 "key=XXX" / "?key=XXX" 片段(没带协议)→ 正则抽 XXX
+ *   - 裸 key → 直接用
+ * 企微 key 是 uuid-ish(hex + 连字符);放宽为 [A-Za-z0-9._-]{16,128},真正合法性
+ * 靠企微 webhook 的 errcode=93000 反馈。
+ */
+export function validateWecomWebhook(s: unknown): string {
+  if (typeof s !== 'string') throw new RangeError('webhook must be string')
+  let raw = s.trim()
+  if (raw.length === 0) throw new RangeError('webhook required')
+  if (/^https?:\/\//i.test(raw)) {
+    let u: URL
+    try {
+      u = new URL(raw)
+    } catch {
+      throw new RangeError('webhook URL invalid')
+    }
+    const key = u.searchParams.get('key')
+    if (!key) throw new RangeError('webhook URL missing key param')
+    raw = key.trim()
+  } else {
+    // 没带协议但粘了 "key=xxx" 片段(如 "?key=abc" 或 "send?key=abc")
+    const m = raw.match(/[?&]?key=([^&\s]+)/)
+    if (m) raw = m[1].trim()
+  }
+  if (!/^[A-Za-z0-9._-]{16,128}$/.test(raw)) {
+    throw new RangeError('webhook key format invalid')
+  }
+  return raw
+}
+
+/** webhook key 的 SHA-256 hex 指纹(非密、不可逆),仅用于同 admin 幂等去重。 */
+function wecomKeyFingerprint(webhookKey: string): string {
+  return createHash('sha256').update(webhookKey, 'utf8').digest('hex')
+}
+
+export interface CreateWecomChannelInput {
+  adminId: bigint | number | string
+  label: string
+  /** 整条 webhook URL 或裸 key(validateWecomWebhook 归一化)。 */
+  webhook: string
+  severityMin?: Severity
+  eventTypes?: string[]
+  ip?: string | null
+  userAgent?: string | null
+}
+
+/**
+ * 落库一条 WeCom 群机器人通道。无扫码 / 无 inbound,activation_status 直接 = 'active'。
+ * webhook key AES-GCM 加密入 bot_token_enc / nonce(同 iLink/telegram 共享密钥);
+ * wecom_key_fp = SHA-256(key) 供幂等去重。iLink/telegram 专属字段强制 NULL。
+ *
+ * 并发幂等:同 (admin_id, wecom_key_fp) 命中 partial unique idx_aac_wecom_identity →
+ * 返回已有行(不重复 audit)。防 admin 多 tab / 重复点击提交同一 webhook 多插几份。
+ */
+export async function createWecomChannel(
+  input: CreateWecomChannelInput,
+): Promise<AlertChannelRow> {
+  const label = validateLabel(input.label)
+  const severity = validateSeverity(input.severityMin ?? 'warning')
+  const events = normalizeEventTypes(input.eventTypes ?? [])
+  const webhookKey = validateWecomWebhook(input.webhook)
+  const fp = wecomKeyFingerprint(webhookKey)
+
+  const kmsKey = loadKmsKey()
+  const enc = encrypt(webhookKey, kmsKey)
+  kmsKey.fill(0)
+
+  return tx(async (client: PoolClient) => {
+    const ins = await client.query<Record<string, unknown>>(
+      `INSERT INTO admin_alert_channels(
+         admin_id, channel_type, label, enabled, severity_min, event_types,
+         bot_token_enc, bot_token_nonce,
+         wecom_key_fp,
+         activation_status,
+         updated_by
+       ) VALUES (
+         $1::bigint, 'wecom_bot', $2, TRUE, $3, $4::jsonb,
+         $5, $6,
+         $7,
+         'active',
+         $1::bigint
+       )
+       ON CONFLICT (admin_id, wecom_key_fp)
+         WHERE channel_type = 'wecom_bot' AND wecom_key_fp IS NOT NULL
+         DO NOTHING
+       RETURNING ${SELECT_COLUMNS}`,
+      [
+        String(input.adminId),
+        label,
+        severity,
+        JSON.stringify(events),
+        enc.ciphertext,
+        enc.nonce,
+        fp,
+      ],
+    )
+
+    if (ins.rows.length === 0) {
+      const existing = await client.query<Record<string, unknown>>(
+        `SELECT ${SELECT_COLUMNS} FROM admin_alert_channels
+          WHERE admin_id = $1::bigint
+            AND channel_type = 'wecom_bot'
+            AND wecom_key_fp = $2`,
+        [String(input.adminId), fp],
+      )
+      if (existing.rows.length === 0) {
+        throw new Error('wecom channel upsert conflicted but cannot find existing row')
+      }
+      return rowToView(existing.rows[0])
+    }
+
+    const row = rowToView(ins.rows[0])
+    await writeAdminAudit(client, {
+      adminId: input.adminId,
+      action: 'alert_channel.create',
+      target: `channel:${row.id}`,
+      after: {
+        channel_type: row.channel_type,
+        label: row.label,
+        severity_min: row.severity_min,
+        event_types: row.event_types,
       },
       ip: input.ip ?? null,
       userAgent: input.userAgent ?? null,

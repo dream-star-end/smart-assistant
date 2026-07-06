@@ -35,6 +35,7 @@ import {
   listAlertChannels,
   createIlinkChannel,
   createTelegramChannel,
+  createWecomChannel,
   patchAlertChannel,
   deleteAlertChannel,
   getAlertChannel,
@@ -349,6 +350,62 @@ export async function handleAdminAlertsCreateTelegramChannel(
       label: body.label,
       botToken: body.bot_token,
       chatId: body.chat_id,
+      severityMin,
+      eventTypes,
+      ip: ctx.clientIp,
+      userAgent: ctx.userAgent,
+    })
+    sendJson(res, 200, { channel: serializeChannel(ch) })
+  } catch (err) {
+    if (err instanceof RangeError) translateRangeError(err)
+    throw err
+  }
+}
+
+// ─── POST /api/admin/alerts/channels/wecom ────────────────────────────
+//
+// 直接创建企业微信群机器人通道:无扫码 / 无 inbound,activation_status='active'。
+// body: { label, webhook, severity_min?, event_types? }
+// webhook:整条 URL(https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=XXX)或裸 key,
+// 后端 validateWecomWebhook 宽容解析。
+
+export async function handleAdminAlertsCreateWecomChannel(
+  req: IncomingMessage,
+  res: ServerResponse,
+  ctx: RequestContext,
+  deps: CommercialHttpDeps,
+): Promise<void> {
+  const admin = await requireAdminVerifyDb(req, deps.jwtSecret)
+  const body = assertObjectBody((await readJsonBody(req)) ?? {})
+
+  if (typeof body.label !== 'string') {
+    throw new HttpError(400, 'VALIDATION', 'label required')
+  }
+  if (typeof body.webhook !== 'string') {
+    throw new HttpError(400, 'VALIDATION', 'webhook required')
+  }
+  const severityMin =
+    typeof body.severity_min === 'string' && SEVERITIES.has(body.severity_min as Severity)
+      ? (body.severity_min as Severity)
+      : 'warning'
+  const eventTypes: string[] = []
+  if (body.event_types !== undefined) {
+    if (!Array.isArray(body.event_types)) {
+      throw new HttpError(400, 'VALIDATION', 'event_types must be array')
+    }
+    for (const t of body.event_types) {
+      if (typeof t !== 'string' || !EVENT_TYPE_RE.test(t)) {
+        throw new HttpError(400, 'VALIDATION', `invalid event_type: ${String(t)}`)
+      }
+      eventTypes.push(t)
+    }
+  }
+
+  try {
+    const ch = await createWecomChannel({
+      adminId: admin.id,
+      label: body.label,
+      webhook: body.webhook,
       severityMin,
       eventTypes,
       ip: ctx.clientIp,
