@@ -56,6 +56,12 @@ import {
   upsertSessionMeta,
 } from '@openclaude/storage'
 
+import {
+  type FanoutItemResult,
+  aggregateDelegateFanoutResults,
+  normalizeFanoutTasks,
+} from './delegateFanout.js'
+
 const AGENT_ID = process.env.OPENCLAUDE_AGENT_ID ?? 'main'
 
 /**
@@ -148,10 +154,6 @@ function applyEvalArmToList<T extends { name: string; description: string }>(lis
 // run via tool args (guarded in handleSkillPropose). Absent in normal sessions, where
 // skill_propose is neither listed nor usable.
 const SKILL_TRAIN_RUN_ID = (process.env.OPENCLAUDE_SKILL_TRAIN_RUN_ID ?? '').trim()
-// Team run id, set by the gateway ONLY when this mcp-memory subprocess is a team
-// leader session. When present, submit_team_final is exposed and bound to this run
-// via env — the model can't redirect finalization to another run via tool args.
-const TEAM_RUN_ID = (process.env.OPENCLAUDE_TEAM_RUN_ID ?? '').trim()
 const drafts = new SkillDraftStore()
 
 // Track in-flight embedding tasks to prevent add/delete race conditions
@@ -489,14 +491,19 @@ const TOOLS = [
   {
     name: 'delegate_task',
     description: [
-      '将任务委派给另一个 agent 并等待结果返回。与 send_to_agent 不同,这是同步操作 — 你会直接收到子 agent 的执行结果。',
+      '将单个任务委派给另一个 agent 并等待结果返回。与 send_to_agent 不同,这是同步操作 — 你会直接收到子 agent 的执行结果。',
       '',
       '适用场景:',
       '- 需要专业 agent 处理后你还要继续用结果的场景',
-      '- 并行分发多个研究/分析任务',
       '- 需要隔离上下文的子任务',
+      '(多个互相独立的子任务请改用 `delegate_tasks` 一次并行派发,不要连续多次单独调用本工具。)',
       '',
-      '限制: 最大递归深度 3 层,最大并发 5 个。',
+      '产物纪律(重要):你和子 agent 在同一台容器、共享文件系统。子 agent 的大产物',
+      '(完整代码/长文档/数据文件/报告)应写入 `/home/agent/.openclaude/generated/<描述性文件名>`,',
+      '回传只给「文件路径 + ≤1500 字的蒸馏摘要」;小结果(结论/短答案)直接回传即可。',
+      '因此本工具的返回是「摘要/路径」,不是完整产物 —— 需要完整内容时用 Read 读回传路径。',
+      '',
+      '限制: 最大递归深度 3 层,最大并发 5 个,单个队长每 turn 委派次数有上限(超限会返回可读错误,请先整合已有结果再决定是否继续)。',
     ].join('\n'),
     inputSchema: {
       type: 'object',
@@ -504,6 +511,12 @@ const TOOLS = [
         agentId: { type: 'string', description: '目标 agent ID (可选,不填则自动选择)' },
         goal: { type: 'string', description: '委派任务的目标描述' },
         context: { type: 'string', description: '传递给子 agent 的上下文信息 (可选)' },
+        effort: {
+          type: 'string',
+          enum: ['low', 'medium', 'high'],
+          description:
+            '可选:子 agent 本次任务的思考量级 —— 机械/简单子任务用 "low",常规用 "medium",攻坚/高难度用 "high";不填则用该成员的默认档位。',
+        },
         toolsets: {
           type: 'array',
           items: { type: 'string' },
@@ -512,6 +525,51 @@ const TOOLS = [
         },
       },
       required: ['goal'],
+    },
+  },
+  // ── 并行 fan-out 委派 ──
+  {
+    name: 'delegate_tasks',
+    description: [
+      '一次把多个**互相独立**的子任务并行委派给成员并等待全部返回(fan-out)。',
+      '各子任务并发执行、互不依赖,单个失败不影响其余(每项独立标注 ✅/❌)。',
+      '',
+      '仅用于「彼此独立、可同时进行」的子任务;有先后依赖(B 需要 A 的产出)时,',
+      '请分步用 `delegate_task` 串行委派,不要塞进本工具。单次最多 4 个并行子任务。',
+      '',
+      '产物纪律同 `delegate_task`:大产物落 `/home/agent/.openclaude/generated/<文件名>`,',
+      '回传给路径 + ≤1500 字摘要;拿到聚合结果后由你综合成给用户的最终答案。',
+    ].join('\n'),
+    inputSchema: {
+      type: 'object',
+      properties: {
+        tasks: {
+          type: 'array',
+          minItems: 1,
+          maxItems: 4,
+          description: '并行委派的子任务列表(1-4 项,彼此独立)。',
+          items: {
+            type: 'object',
+            properties: {
+              agentId: { type: 'string', description: '目标 agent ID (可选,不填则自动选择)' },
+              goal: { type: 'string', description: '该子任务的目标描述' },
+              context: { type: 'string', description: '传递给子 agent 的上下文信息 (可选)' },
+              effort: {
+                type: 'string',
+                enum: ['low', 'medium', 'high'],
+                description: '可选:该子任务的思考量级 low/medium/high,不填则用成员默认档位。',
+              },
+              toolsets: {
+                type: 'array',
+                items: { type: 'string' },
+                description: '可选:为该子 agent 额外授予的平台工具集名(同 delegate_task)。',
+              },
+            },
+            required: ['goal'],
+          },
+        },
+      },
+      required: ['tasks'],
     },
   },
   // (v5 ccb-only:ask_gpt55_codex direct bridge 已移除 —— 无 codex agent。)
@@ -555,28 +613,6 @@ const SKILL_PROPOSE_TOOL = {
   },
 }
 
-// Exposed ONLY in a team leader session (OPENCLAUDE_TEAM_RUN_ID set). The single way
-// to finalize a team run; gateway hard-enforces leader identity + requireReview gate.
-const SUBMIT_TEAM_FINAL_TOOL = {
-  name: 'submit_team_final',
-  description: [
-    '提交团队协作的最终答案（这是团队 run 唯一的收尾方式，只在你是团队队长时可用）。',
-    '调用后 team run 被服务端标记完成。',
-    '若团队配置了强制复核，必须先把最终草稿委派给复核者并等其返回，否则本工具会被服务端拒绝。',
-    '',
-    '  content — 交付给用户的最终答案全文（必填）',
-    '  summary — 可选的一句话摘要',
-  ].join('\n'),
-  inputSchema: {
-    type: 'object',
-    properties: {
-      content: { type: 'string' },
-      summary: { type: 'string' },
-    },
-    required: ['content'],
-  },
-}
-
 server.setRequestHandler(ListToolsRequestSchema, async () => {
   // Training session REMOVES authoritative-write tools (only skill_propose drafts).
   const base = SKILL_TRAIN_RUN_ID
@@ -585,8 +621,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         SKILL_PROPOSE_TOOL,
       ]
     : TOOLS
-  // Team leader session ADDS submit_team_final.
-  return { tools: TEAM_RUN_ID ? [...base, SUBMIT_TEAM_FINAL_TOOL] : base }
+  return { tools: base }
 })
 
 // ─────────────────────────────────────────────────────────────
@@ -630,8 +665,8 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
         return await handleSendToAgent(args as any)
       case 'delegate_task':
         return await handleDelegateTask(args as any)
-      case 'submit_team_final':
-        return await handleSubmitTeamFinal(args as any)
+      case 'delegate_tasks':
+        return await handleDelegateTasks(args as any)
       default:
         return { content: [{ type: 'text', text: `unknown tool: ${name}` }], isError: true }
     }
@@ -1256,14 +1291,61 @@ async function handleDelegateTask(args: {
   agentId?: string
   goal: string
   context?: string
+  effort?: string
   toolsets?: string[]
 }) {
   return handleDelegateTaskToAgent(args.agentId || 'main', {
     goal: args.goal,
     context: args.context,
+    effort: args.effort,
     toolsets: args.toolsets,
     label: args.agentId || 'main',
   })
+}
+
+/**
+ * fan-out 并行委派:一次派发多个**互相独立**的子任务,Promise.all 并发走既有
+ * /delegate 端点(gateway 端零改动 —— per-parent 分桶 3 + 全局闸 5 + 有界排队本就
+ * 为并发设计,超出的会排队而非硬拒)。单项失败经 handleDelegateTaskToAgent 的
+ * try/catch 收敛成 toolError(从不 throw),故 Promise.all 不会因单项拒绝而整体失败,
+ * 结果按输入顺序聚合、每项独立标注 ✅/❌。校验/聚合逻辑抽到纯函数 delegateFanout.ts
+ * (可单测),本处只负责调用编排。
+ */
+async function handleDelegateTasks(args: { tasks?: unknown }) {
+  const normalized = normalizeFanoutTasks(args?.tasks)
+  if (!normalized.ok) return toolError(normalized.error)
+  const tasks = normalized.tasks
+  const items = await Promise.all(
+    tasks.map(async (t): Promise<FanoutItemResult> => {
+      const label = t.agentId || 'main'
+      try {
+        const r = await handleDelegateTaskToAgent(label, {
+          goal: t.goal,
+          context: t.context,
+          effort: t.effort,
+          toolsets: t.toolsets,
+          label,
+        })
+        // toolOk 返回体无 isError 字段、toolError 有 → 联合类型下按可选属性安全取值。
+        return {
+          label,
+          goal: t.goal,
+          isError: (r as { isError?: boolean }).isError === true,
+          text: r.content?.[0]?.text ?? '(无输出)',
+        }
+      } catch (err: any) {
+        // 兜底:handleDelegateTaskToAgent 已自带 try/catch(理论到不了这里),
+        // 仍隔离单项异常,避免一个子任务的意外把整个 fan-out 拖垮。
+        return {
+          label,
+          goal: t.goal,
+          isError: true,
+          text: `委派失败: ${describeDelegateTransportError(err)}`,
+        }
+      }
+    }),
+  )
+  return toolOk(aggregateDelegateFanoutResults(items))
 }
 
 // (v5 ccb-only:handleAskGpt55Codex 已移除 —— 无 codex agent。)
@@ -1333,42 +1415,12 @@ function postJsonToGateway(
   })
 }
 
-// submit_team_final: POST 最终答案到 gateway 的 team-run finalize 端点。经 env
-// 绑定到本 run（OPENCLAUDE_TEAM_RUN_ID），并带 leader session key 供 gateway 校验
-// 调用者身份（三绑定：teamRunId + leaderSessionKey + SESSION_KEY）。
-async function handleSubmitTeamFinal(args: { content?: string; summary?: string }) {
-  if (!TEAM_RUN_ID) return toolError('submit_team_final 仅在团队队长会话可用')
-  const content = typeof args?.content === 'string' ? args.content : ''
-  if (!content.trim()) return toolError('content required')
-  const gatewayPort = process.env.OPENCLAUDE_GATEWAY_PORT || '18789'
-  const gatewayToken = readGatewayToken()
-  const finalizeToken = process.env.OPENCLAUDE_TEAM_FINALIZE_TOKEN || ''
-  try {
-    const res = await postJsonToGateway(
-      `http://127.0.0.1:${gatewayPort}/api/team-runs/${encodeURIComponent(TEAM_RUN_ID)}/finalize`,
-      {
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${gatewayToken}`,
-        },
-        body: JSON.stringify({ content, summary: args?.summary, token: finalizeToken }),
-        timeoutMs: DELEGATE_CLIENT_TIMEOUT_MS,
-      },
-    )
-    if (res.statusCode < 200 || res.statusCode >= 300) {
-      return toolError(`团队最终答案提交失败: ${res.body}`)
-    }
-    return { content: [{ type: 'text', text: '已提交团队最终答案，team run 标记完成。' }] }
-  } catch (err: any) {
-    return toolError(`submit_team_final 调用失败: ${err?.message ?? String(err)}`)
-  }
-}
-
 async function handleDelegateTaskToAgent(
   targetAgent: string,
   args: {
     goal: string
     context?: string
+    effort?: string
     toolsets?: string[]
     label: string
   },
@@ -1391,6 +1443,7 @@ async function handleDelegateTaskToAgent(
         body: JSON.stringify({
           goal: args.goal,
           context: args.context,
+          ...(args.effort ? { effort: args.effort } : {}),
           sourceAgent,
           toolsets: args.toolsets,
           ...(parentSessionKey ? { streamProgress: true, parentSessionKey } : {}),

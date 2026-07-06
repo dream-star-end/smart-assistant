@@ -13,7 +13,7 @@
 import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
 
-import { Gateway, HiddenDelegateGuard } from '../server.js'
+import { Gateway, PerTurnDelegationGuard } from '../server.js'
 import type { DurableAgentGroup } from '@openclaude/protocol'
 
 const PARENT_KEY = 'agent:main:webchat:dm:wsess-teamcard'
@@ -42,7 +42,7 @@ function makeGateway(opts: { submit: SubmitImpl; withParent?: boolean }): {
   gw._shuttingDown = false
   gw._activeDelegations = 0
   gw._activeDelegationsByParent = new Map()
-  gw._hiddenDelegateGuard = new HiddenDelegateGuard()
+  gw._hiddenDelegateGuard = new PerTurnDelegationGuard()
   gw._delegateQueuePollMs = 10
   gw._readDelegateMemoryPressure = () => null
   gw.log = { debug: () => {}, info: () => {}, warn: () => {}, error: () => {} }

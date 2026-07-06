@@ -18,7 +18,7 @@
 import assert from 'node:assert/strict'
 import { afterEach, describe, it } from 'node:test'
 
-import { DELEGATE_QUEUE_MAX_WAITERS, Gateway, HiddenDelegateGuard } from '../server.js'
+import { DELEGATE_QUEUE_MAX_WAITERS, Gateway, PerTurnDelegationGuard } from '../server.js'
 
 const PARENT_KEY = 'agent:main:webchat:dm:wsess-queue-test'
 const PARENT_PEER = 'wsess-queue-test'
@@ -48,7 +48,7 @@ function makeGateway(): any {
   gw._shuttingDown = false
   gw._activeDelegations = 0
   gw._activeDelegationsByParent = new Map()
-  gw._hiddenDelegateGuard = new HiddenDelegateGuard()
+  gw._hiddenDelegateGuard = new PerTurnDelegationGuard()
   // 排队参数:轮询提速到 10ms,等待封顶由各用例经 env 控制。
   gw._delegateQueuePollMs = 10
   // 默认无内存压力(确定性:不读真实 cgroup);用例按需覆写。
