@@ -293,27 +293,29 @@ export async function getSessionsDb(): Promise<Database.Database> {
     -- by-user drain(ccb-spawn 路径 appendServerAuthoredMessageDrainByUser 的 WHERE user_id)
     -- 走索引,避免 pending 积压时全表扫。
     CREATE INDEX IF NOT EXISTS idx_pup_user ON pending_usage_patches(user_id);
-    -- delegate drain(drainDelegateCostForClientSession 的 WHERE user_id AND parent_session_id)
-    -- 走部分索引(只覆盖委派行,普通/自费行 parent_session_id 为 NULL 不入索引)。
-    CREATE INDEX IF NOT EXISTS idx_pup_parent
-      ON pending_usage_patches(user_id, parent_session_id)
-      WHERE parent_session_id IS NOT NULL;
   `)
   // Migration: add parent_session_id column to pending_usage_patches (existing DBs).
-  // ADD COLUMN with default NULL is metadata-only + fast; the partial index above is
-  // created idempotently by the DDL block, but only takes effect once the column exists,
-  // so create it again after the ALTER for pre-existing DBs.
+  // ADD COLUMN with default NULL is metadata-only + fast.
+  //
+  // 不变式:CREATE TABLE IF NOT EXISTS 对存量库是 no-op,**不会**补新列。任何引用
+  // "后加列"的 index 必须放在对应 ALTER migration 之后单独建,不得写进上面的初始
+  // DDL 块 —— 否则存量库 open 时整个 exec 抛 "no such column",getSessionsDb 每次
+  // 调用都失败,所有 sessions.db 路径(list/save/server-authored 落库)全体 500
+  // (2026-07-06 线上事故根因,丢 2 小时对话落库)。
   try {
     const cols = db.pragma('table_info(pending_usage_patches)') as Array<{ name: string }>
     if (!cols.some(c => c.name === 'parent_session_id')) {
       db.exec('ALTER TABLE pending_usage_patches ADD COLUMN parent_session_id TEXT')
-      db.exec(
-        `CREATE INDEX IF NOT EXISTS idx_pup_parent
-           ON pending_usage_patches(user_id, parent_session_id)
-           WHERE parent_session_id IS NOT NULL`,
-      )
     }
   } catch { /* table just created with column already */ }
+  // delegate drain(drainDelegateCostForClientSession 的 WHERE user_id AND parent_session_id)
+  // 走部分索引(只覆盖委派行,普通/自费行 parent_session_id 为 NULL 不入索引)。
+  // 放在 migration 之后:新库/存量库两条路径在此汇合,统一建索引。
+  db.exec(
+    `CREATE INDEX IF NOT EXISTS idx_pup_parent
+       ON pending_usage_patches(user_id, parent_session_id)
+       WHERE parent_session_id IS NOT NULL`,
+  )
 
   // 旧重量级团队模式(team_runs / team_delegations)已整套删除:schema 不再声明,
   // 存量本地 DB 里已建的表留着无害(不写 DROP TABLE,不迁移)。
