@@ -291,6 +291,15 @@ export type UsageSavings = {
   savings_rows_skipped: number;
 };
 
+/** 会话行内的组队(delegate)per-agent×model 明细(积分降序)。 */
+export type UsageDelegateDetail = {
+  /** 委派目标 agent id(如 coder / hidden-reviewer);展示经 agentDisplayName 解析。 */
+  delegate_agent_id: string | null;
+  model: string;
+  requests: string;
+  billed_credits: string;
+};
+
 export type UsageSessionRow = {
   session_id: string;
   requests: string;
@@ -300,6 +309,15 @@ export type UsageSessionRow = {
   cache_write_tokens: string;
   billed_credits: string;
   last_used_at: string;
+  /** 组队(delegate)并入部分的积分小计(字符串大数;无组队时 "0")。
+   *  可选:兼容尚未升级的后端。 */
+  delegate_credits?: string;
+  /** 组队并入的请求次数(字符串大数;无组队时 "0")。 */
+  delegate_requests?: string;
+  /** 该行完全由 delegate 行构成(孤儿 delegate 独立行 / 纯组队归组行)。 */
+  delegate_only?: boolean;
+  /** per-agent×model 组队明细;仅含 delegate 行时下发。 */
+  delegates?: UsageDelegateDetail[];
 };
 
 export type UsageSessionsPage = {

@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import { api } from "../../lib/api";
 import type { AuthSession, UsageResponse, UsageSessionRow } from "../../lib/types";
 import { cn, formatCompactCount, formatCredits, groupDigits, ratioPct } from "../../lib/utils";
+import { agentDisplayName } from "../chat/agentNames";
 import { Alert, Progress, Spinner } from "../ui";
 import { shortTime } from "./labels";
 
@@ -42,6 +43,19 @@ export function UsageTab({ auth }: { auth: AuthSession }) {
   const [offset, setOffset] = useState(0);
   const [hasMore, setHasMore] = useState(false);
   const [loadingMore, setLoadingMore] = useState(false);
+  /** 展开了组队明细的会话行(session_id 集合)。 */
+  const [expandedDelegates, setExpandedDelegates] = useState<ReadonlySet<string>>(
+    () => new Set<string>(),
+  );
+
+  const toggleDelegates = useCallback((sessionId: string) => {
+    setExpandedDelegates((prev) => {
+      const next = new Set(prev);
+      if (next.has(sessionId)) next.delete(sessionId);
+      else next.add(sessionId);
+      return next;
+    });
+  }, []);
 
   useEffect(() => {
     let alive = true;
@@ -196,23 +210,73 @@ export function UsageTab({ auth }: { auth: AuthSession }) {
             <ul className="flex flex-col gap-0.5">
               {sessions.map((row) => {
                 const tok = sumBig(row.input_tokens, row.output_tokens);
+                // 组队(delegate)归组:后端只对含 delegate 行的会话下发 delegates
+                // 明细;无组队数据时以下分支全部关闭,行渲染与旧版一致。
+                const delegates = row.delegates ?? [];
+                const hasDelegate = delegates.length > 0;
+                const isOpen = hasDelegate && expandedDelegates.has(row.session_id);
                 return (
-                  <li
-                    key={row.session_id}
-                    className="flex items-center gap-3 rounded-lg px-2 py-2 hover:bg-hover"
-                  >
-                    <span className="min-w-0 flex-1">
-                      <span className="block truncate font-mono text-[12.5px] text-fg">
-                        {row.session_id}
+                  <li key={row.session_id} className="rounded-lg px-2 py-2 hover:bg-hover">
+                    <div className="flex items-center gap-3">
+                      <span className="min-w-0 flex-1">
+                        <span className="flex min-w-0 items-center gap-1.5">
+                          <span className="truncate font-mono text-[12.5px] text-fg">
+                            {row.session_id}
+                          </span>
+                          {row.delegate_only ? (
+                            <span className="shrink-0 rounded-full bg-hover px-1.5 py-px text-[10.5px] text-muted">
+                              组队
+                            </span>
+                          ) : null}
+                        </span>
+                        <span className="block truncate text-[11.5px] text-faint">
+                          {groupDigits(row.requests)} 次 · {formatCompactCount(tok)} token ·{" "}
+                          {shortTime(row.last_used_at)}
+                        </span>
                       </span>
-                      <span className="block truncate text-[11.5px] text-faint">
-                        {groupDigits(row.requests)} 次 · {formatCompactCount(tok)} token ·{" "}
-                        {shortTime(row.last_used_at)}
+                      <span className="shrink-0 text-[13px] font-medium tabular-nums text-fg">
+                        {formatCredits(row.billed_credits)}
                       </span>
-                    </span>
-                    <span className="shrink-0 text-[13px] font-medium tabular-nums text-fg">
-                      {formatCredits(row.billed_credits)}
-                    </span>
+                    </div>
+                    {hasDelegate && (
+                      <button
+                        type="button"
+                        onClick={() => toggleDelegates(row.session_id)}
+                        aria-expanded={isOpen}
+                        className="mt-1 inline-flex items-center gap-1 rounded-full border border-border bg-surface px-2 py-0.5 text-[11px] text-muted outline-none hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
+                      >
+                        含组队 {formatCredits(row.delegate_credits ?? "0")} 积分
+                        <span
+                          aria-hidden
+                          className={cn("transition-transform", isOpen && "rotate-180")}
+                        >
+                          ▾
+                        </span>
+                      </button>
+                    )}
+                    {isOpen && (
+                      <ul className="mt-1.5 flex flex-col gap-1 border-l-2 border-border pl-3">
+                        {delegates.map((d, i) => (
+                          <li
+                            key={`${d.delegate_agent_id ?? "unknown"}:${d.model}:${i}`}
+                            className="flex items-center gap-2 text-[11.5px]"
+                          >
+                            <span className="min-w-0 flex-1 truncate">
+                              <span className="text-fg">
+                                {agentDisplayName(d.delegate_agent_id) || "未知成员"}
+                              </span>
+                              <span className="text-faint">
+                                {" "}
+                                · {d.model} · {groupDigits(d.requests)} 次
+                              </span>
+                            </span>
+                            <span className="shrink-0 tabular-nums text-muted">
+                              {formatCredits(d.billed_credits)}
+                            </span>
+                          </li>
+                        ))}
+                      </ul>
+                    )}
                   </li>
                 );
               })}

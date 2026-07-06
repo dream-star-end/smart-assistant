@@ -302,6 +302,24 @@ RUN set -eux; \
     rm -rf /root/.npm
 
 # ------------------------------------------------------------
+# Codex marketplace github 残余直连封堵(git insteadOf → 本地空 bare 仓)
+# ------------------------------------------------------------
+# codex app-server 启动时会无条件对默认 marketplace(github.com/openai/plugins)
+# 发一次匿名 `git ls-remote`(无凭证,但暴露宿主机出口 IP+版本指纹);配置面穷举
+# 证实无合法键可关(enable_plugins=false 会让整份 managed_config 被丢弃,连遥测
+# 保护一起失效)。根治=系统级 git 配置把该前缀重定向到本地空 bare 仓:git 走
+# 本地文件、不 spawn git-remote-https、零外连;空仓 ls-remote 返回空,codex 视为
+# 「无插件」优雅继续。
+# 误伤面=零:用户仓 clone 走 GIT_CONFIG_NOSYSTEM=1(sessionRepoWorkspace)不读
+# /etc/gitconfig;insteadOf 仅匹配 openai/plugins 前缀。须在下方 populate RUN
+# 之前生效,build 期那次 app-server 同样走本地。详见 docs/V5_GITHUB_EGRESS_PLAN.md。
+RUN if [ "$OC_INCLUDE_CODEX" = "1" ]; then set -eux; \
+      git init --bare --initial-branch=main /opt/codex-empty-marketplace.git; \
+      chmod -R a+rX /opt/codex-empty-marketplace.git; \
+      printf '[url "file:///opt/codex-empty-marketplace.git/"]\n\tinsteadOf = https://github.com/openai/plugins.git\n\tinsteadOf = https://github.com/openai/plugins\n' >> /etc/gitconfig; \
+    fi
+
+# ------------------------------------------------------------
 # Codex system skills 预 populate(image_gen / openai-docs / document-writing / ...)
 # ------------------------------------------------------------
 # codex 0.125 的内建 image_gen 工具是通过 `~/.codex/skills/.system/imagegen/`
