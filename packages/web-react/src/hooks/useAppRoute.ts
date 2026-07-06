@@ -22,7 +22,7 @@ import type { Session } from "../lib/types";
  *   （parsePanelParam），打开/关闭经本 hook replaceState 同步回 query（面板不压栈）。
  * - demo / reset-password 特判不启用（enabled=false，URL 原样保留）。
  */
-export type PanelParam = "settings" | "market" | "manage";
+export type PanelParam = "settings" | "market" | "manage" | "org";
 
 /** `/s/<id>` → 会话 id（形态对齐后端 peer.id 约束 `[A-Za-z0-9_-]`；不匹配返回 null）。 */
 export function parseSessionPath(pathname: string): string | null {
@@ -33,7 +33,7 @@ export function parseSessionPath(pathname: string): string | null {
 /** `?panel=` → 面板名（未知值一律当没有，防深链打开不存在的面板）。 */
 export function parsePanelParam(sp: URLSearchParams): PanelParam | null {
   const v = sp.get("panel");
-  return v === "settings" || v === "market" || v === "manage" ? v : null;
+  return v === "settings" || v === "market" || v === "manage" || v === "org" ? v : null;
 }
 
 export type UseAppRouteOptions = {

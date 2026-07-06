@@ -29,6 +29,7 @@ import {
   ownerUnlistListing,
   publishSkillVersion,
   recordUninstall,
+  resolveCallerOrgId,
   reviewVersion,
   reviewVersions,
   revokeListing,
@@ -61,6 +62,19 @@ function uid(user: { id: string }): number {
   const n = Number.parseInt(user.id, 10)
   if (!Number.isInteger(n) || n <= 0) throw new HttpError(401, 'UNAUTHORIZED', 'bad subject')
   return n
+}
+
+/**
+ * 解析发布可见范围(企业版 P3.1,方案 §3)。
+ *   - visibility='org' → 要求发布者是某 org 的 active 成员,listing.org_id = 其 org。
+ *   - 缺省 / 'public' / 其它 → 公开(返回 null)。
+ * AI 审核链对 org-private 与公开一视同仁(照常跑)。
+ */
+async function resolvePublishOrgId(userId: number, visibility: unknown): Promise<string | null> {
+  if (visibility !== 'org') return null
+  const orgId = await resolveCallerOrgId(userId)
+  if (!orgId) throw new HttpError(403, 'NOT_ORG_MEMBER', '仅组织成员可发布「仅本组织」可见的技能')
+  return orgId
 }
 
 function asStr(v: unknown, field: string, max: number): string {
@@ -240,6 +254,7 @@ export async function handleMarketplacePublish(
   ].join('\n')
   const rawSkillMd = `${fm + skillBody.replace(/\r\n/g, '\n').trimEnd()}\n`
 
+  const orgId = await resolvePublishOrgId(uid(user), body.visibility)
   try {
     const { versionId } = await publishSkillVersion({
       slug,
@@ -256,6 +271,7 @@ export async function handleMarketplacePublish(
       submittedBy: uid(user),
       rawBundle: bundleV.bundle,
       benchmark: benchV.benchmark,
+      orgId,
     })
     sendJson(res, 200, {
       ok: true,
@@ -333,9 +349,12 @@ export async function handleMarketplaceAgentPublish(
     return
   }
 
-  // every skillDep must resolve to an approved, active marketplace skill
+  const orgId = await resolvePublishOrgId(uid(user), body.visibility)
+
+  // every skillDep must resolve to an approved, active marketplace skill visible to the
+  // publisher(公开 ∪ 本 org 私有);org-private 依赖对非本 org 发布者不解析 → 判未上架。
   if (manifest.skillDeps.length > 0) {
-    const found = await getApprovedSkillVersions(manifest.skillDeps)
+    const found = await getApprovedSkillVersions(manifest.skillDeps, orgId)
     const missing = manifest.skillDeps.filter((s) => !found.has(s))
     if (missing.length > 0) {
       sendJson(res, 422, {
@@ -370,6 +389,7 @@ export async function handleMarketplaceAgentPublish(
       riskFlags: scan.flags,
       policyVersion: scan.policyVersion,
       submittedBy: uid(user),
+      orgId,
     })
     sendJson(res, 200, {
       ok: true,
@@ -462,13 +482,16 @@ export async function handleMarketplaceInstall(
   if (!/^\d+$/.test(versionId)) throw new HttpError(400, 'BAD_ID', 'invalid versionId')
   try {
     const userId = uid(user)
-    const target = await getInstallableVersionTarget(versionId)
+    // org 可见性收口:org-private 版本仅本 org 成员可装(非成员 → target null → NOT_INSTALLABLE 404)。
+    const callerOrgId = await resolveCallerOrgId(userId)
+    const target = await getInstallableVersionTarget(versionId, callerOrgId)
     if (!target) throw new MarketplaceError('NOT_INSTALLABLE', 'skill 不可安装(未上架/已下架/非当前版本)')
     const selectedAgentIds =
       target.kind === 'skill' ? await validateAssignableAgentScope(userId, body.agentIds) : undefined
     const v = await installApprovedVersion({
       userId,
       versionId,
+      callerOrgId,
       ...(selectedAgentIds ? { agentIds: selectedAgentIds, scopeMode: 'replace' as const } : {}),
     })
 
@@ -477,7 +500,7 @@ export async function handleMarketplaceInstall(
     // is re-pinned to its current approved version; a failure on one dep never fails
     // the agent install.
     let installedDeps = 0
-    const detail = await getListingDetail(v.slug)
+    const detail = await getListingDetail(v.slug, callerOrgId)
     if (detail?.kind === 'agent') {
       const deps2 = Array.isArray((detail.manifest as { skillDeps?: unknown })?.skillDeps)
         ? ((detail.manifest as { skillDeps: unknown[] }).skillDeps.filter(
@@ -485,12 +508,13 @@ export async function handleMarketplaceInstall(
           ) as string[])
         : []
       if (deps2.length > 0) {
-        const versions = await getApprovedSkillVersions(deps2)
+        const versions = await getApprovedSkillVersions(deps2, callerOrgId)
         for (const depVid of versions.values()) {
           try {
             await installApprovedVersion({
               userId,
               versionId: depVid,
+              callerOrgId,
               agentIds: [v.slug],
               scopeMode: 'merge',
             })
@@ -617,10 +641,12 @@ export async function handleMarketplaceDetail(
   res: ServerResponse,
   deps: { jwtSecret: string | Uint8Array },
 ): Promise<void> {
-  await requireAuth(req, deps.jwtSecret)
+  const user = await requireAuth(req, deps.jwtSecret)
   const slug = slugFromPrefix(req, '/api/marketplace/')
   if (!SLUG_RE.test(slug)) throw new HttpError(400, 'BAD_SLUG', 'invalid slug')
-  const detail = await getListingDetail(slug)
+  // org 可见性收口:org-private listing 对非本 org caller 视同不存在(404,不泄露存在性 oracle)。
+  const callerOrgId = await resolveCallerOrgId(user.id)
+  const detail = await getListingDetail(slug, callerOrgId)
   if (!detail) throw new HttpError(404, 'NOT_FOUND', 'skill 不存在或未上架')
   // agent 类仅 v5 露出:v3 渠道上视同不存在(防止据 slug 取 detail→versionId 旁路)。
   if (detail.kind === 'agent' && !marketplaceAgentsEnabled())

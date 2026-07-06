@@ -26,6 +26,7 @@ import {
   type ApprovedSearchRow,
   type ArtifactKind,
   marketplaceAgentsEnabled,
+  resolveCallerOrgId,
 } from './marketplaceDb.js'
 import { listMarketBrowseCatalog } from './platformPresets.js'
 
@@ -60,7 +61,8 @@ export async function handleMarketplaceSearch(
   res: ServerResponse,
   deps: { jwtSecret: string | Uint8Array },
 ): Promise<void> {
-  await requireAuth(req, deps.jwtSecret)
+  const user = await requireAuth(req, deps.jwtSecret)
+  const callerOrgId = await resolveCallerOrgId(user.id)
   const url = new URL(req.url ?? '/', 'http://internal')
   const q = (url.searchParams.get('q') ?? '').trim().slice(0, 4000)
   const limit = Math.min(
@@ -87,7 +89,8 @@ export async function handleMarketplaceSearch(
 
   // 市场浏览(空 q)+搜索的对外目录:去掉平台预设 agent(免安装,不在市场发现出现)。
   // 与容器 AI 的 agent 市场搜索共用同一权威 listMarketBrowseCatalog,一处收口不漏。
-  const catalog = await listMarketBrowseCatalog(kind)
+  // callerOrgId 收口 org 可见性:org-private 技能只对本 org 成员搜出。
+  const catalog = await listMarketBrowseCatalog(kind, callerOrgId)
   if (catalog.length === 0 || !q) {
     sendJson(res, 200, {
       results: catalog.slice(0, limit).map((c) => toCard(c)),

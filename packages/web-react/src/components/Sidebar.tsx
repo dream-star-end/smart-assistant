@@ -1,4 +1,4 @@
-import { LayoutGrid, LogOut, PanelLeftClose, Pencil, Plus, Search, Sparkles, Store, Trash2 } from "lucide-react";
+import { Building2, LayoutGrid, LogOut, PanelLeftClose, Pencil, Plus, Search, Sparkles, Store, Trash2 } from "lucide-react";
 import { useMemo, useState } from "react";
 import { BRAND } from "../lib/brand";
 import type { Session, User } from "../lib/types";
@@ -19,6 +19,7 @@ export function Sidebar({
   onOpenAccount,
   onOpenManage,
   onOpenMarketplace,
+  onOpenOrg,
 }: {
   sessions: Session[];
   activeId?: string;
@@ -36,6 +37,8 @@ export function Sidebar({
   onOpenManage?: () => void;
   /** 打开 AI 市场（技能/智能体）。省略则不渲染入口（demo）。 */
   onOpenMarketplace?: () => void;
+  /** 打开组织中心（企业版）。仅 org owner/admin 提供，省略则不渲染入口。 */
+  onOpenOrg?: () => void;
 }) {
   const [q, setQ] = useState("");
 
@@ -104,6 +107,17 @@ export function Sidebar({
             <Store size={16} className="text-faint" />
             市场
             <span className="ml-auto text-[11px] text-faint">技能 · 智能体</span>
+          </button>
+        )}
+
+        {onOpenOrg && (
+          <button
+            onClick={onOpenOrg}
+            className="flex items-center gap-2.5 rounded-lg px-3 py-2 text-left text-[13.5px] font-medium text-muted outline-none transition-colors hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
+          >
+            <Building2 size={16} className="text-faint" />
+            组织
+            <span className="ml-auto text-[11px] text-faint">成员 · 报表 · 发票</span>
           </button>
         )}
       </div>

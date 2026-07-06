@@ -1,6 +1,7 @@
 import type { Pool } from "pg";
 
 import { spendTwoBucket } from "../billing/spend.js";
+import { resolveOrgBillingContext } from "../org/orgBilling.js";
 import type { MiniMaxMediaCostResult } from "./mediaPricing.js";
 
 export interface MiniMaxMediaSettleInput {
@@ -43,6 +44,11 @@ export async function settleMiniMaxMediaSuccess(
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
+    // org 归属解析(0112 企业版):billing_enabled=true 的成员 → org 钱包为第 0 优先桶。
+    // minimax_media_usage_records 无 org_id 列(0112 未加),org 归属经 credit_ledger.org_id
+    // (org_wallet 流水)表达 —— §5 报表按 usage_records 聚合用量 / credit_ledger 聚合流水,
+    // 媒体用量不进 /api/org/usage,故媒体侧无需 usage 表打戳。
+    const orgCtx = await resolveOrgBillingContext(client, input.userId);
     let usageId: bigint;
     let ledgerId: bigint | null = null;
     let clamped = false;
@@ -114,6 +120,7 @@ export async function settleMiniMaxMediaSuccess(
         reason: "minimax_media",
         ref: { type: "minimax_media_usage_record", id: usageId.toString() },
         memo: `cost=${input.cost.costCredits}`,
+        orgId: orgCtx && orgCtx.billingEnabled ? orgCtx.orgId : undefined,
       });
       clamped = spend.clamped;
       balanceAfter = spend.totalAfter;

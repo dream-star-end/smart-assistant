@@ -16,7 +16,8 @@
  *     (reason='refund' AND ref_type='usage_record' AND ref_id=usageId)跳过。
  *     锁到 commit 才释放,并发第二笔进来时必能看到第一笔的 refund 行。
  *   - **锁序**:先 users FOR UPDATE 再 user_subscriptions FOR UPDATE(全仓不变量,
- *     与 spendTwoBucket 对齐,防死锁)。
+ *     与 spendTwoBucket 对齐,防死锁)。**若未来退款触 org 钱包桶(org_wallet),必须先锁 orgs**
+ *     ——全局单向锁序 orgs → users → user_subscriptions(0112 企业版);本期退款不触 org 桶。
  *   - **桶语义**:period 部分优先退回当前 active 订阅的期内桶(它到期仍会清零,
  *     不构成永久资产泄漏);无 active 订阅(已到期/取消)则退到钱包,memo 标注改道。
  *   - BIGINT 贯穿,不经 Number。

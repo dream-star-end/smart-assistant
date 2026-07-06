@@ -124,6 +124,19 @@ import {
   handleAdminPatchUser,
   handleAdminUsersStats,
 } from './admin/users.js'
+// 企业版(P3.1)批次 A:org 平台超管运维 + org 成员管理分发器。
+import {
+  handleAdminListOrgs,
+  handleAdminCreateOrg,
+  handleAdminPatchOrg,
+  handleAdminAdjustOrgCredits,
+} from './admin/orgs.js'
+// 企业版(P3.1)批次 D:平台超管开票申请处理。
+import {
+  handleAdminListOrgInvoices,
+  handleAdminPatchOrgInvoice,
+} from './admin/orgInvoices.js'
+import { dispatchOrgRoute } from './org/routes.js'
 import {
   handleAdminAlertsAckRule,
   handleAdminAlertsCreateSilence,
@@ -570,6 +583,17 @@ export function createCommercialHandler(
     { method: 'GET', path: '/api/me/research/library', handler: handleListResearchLibrary },
     { method: 'POST', path: '/api/me/research/library', handler: handleUploadResearchLibraryDoc },
     { method: 'DELETE', pathPrefix: '/api/me/research/library/', handler: handleDeleteResearchLibraryDoc },
+    // ── 企业版(P3.1)org 成员管理面 ──
+    // 全部转发到 dispatchOrgRoute:声明式路由表 + requireOrgRole 单一鉴权收口
+    // (见 http/org/routes.ts)。org 由服务端从 caller membership 推导,不接受
+    // 客户端传 org_id。**不**落入 BLOCKED_FOR_USER_RULES / 容器代理(浏览器用户 JWT
+    // 路径,容器不持有;/api/org 也不在 BRIDGE 白名单)。exact `/api/org` = 概要,
+    // prefix `/api/org/*` = 子资源;各方法均转发,真正的 method/404/405 判定在分发器内。
+    { method: 'GET', path: '/api/org', handler: dispatchOrgRoute },
+    { method: 'GET', pathPrefix: '/api/org/', handler: dispatchOrgRoute },
+    { method: 'POST', pathPrefix: '/api/org/', handler: dispatchOrgRoute },
+    { method: 'PATCH', pathPrefix: '/api/org/', handler: dispatchOrgRoute },
+    { method: 'DELETE', pathPrefix: '/api/org/', handler: dispatchOrgRoute },
     { method: 'GET', path: '/api/public/config', handler: handleGetPublicConfig },
     { method: 'GET', path: '/api/public/models', handler: handleListPublicModels },
     // V3 Phase 2 Task 2F: 容器/前端按 spec 用 /api/models;沿用 /api/public/models 同一 handler
@@ -707,6 +731,16 @@ export function createCommercialHandler(
     // 0049 model-grants:DELETE /api/admin/users/:id/model-grants/:model_id —— 撤销授权
     // /api/admin/users/ prefix 下目前只这一个 DELETE 子资源,handler 自带 path 校验
     { method: 'DELETE', pathPrefix: '/api/admin/users/', handler: handleAdminRemoveUserModelGrant },
+    // 企业版(P3.1)超管 org 运维。全部经 /api/admin/* 全局 gate(requireAdminVerifyDb)。
+    // exact `/api/admin/orgs`(list/create)优先于 prefix `/api/admin/orgs/`(patch/credits)。
+    { method: 'GET', path: '/api/admin/orgs', handler: handleAdminListOrgs },
+    { method: 'POST', path: '/api/admin/orgs', handler: handleAdminCreateOrg },
+    { method: 'PATCH', pathPrefix: '/api/admin/orgs/', handler: handleAdminPatchOrg },
+    // POST /api/admin/orgs/:id/credits(批次 A 返 501 占位);handler 自校验 path 尾段。
+    { method: 'POST', pathPrefix: '/api/admin/orgs/', handler: handleAdminAdjustOrgCredits },
+    // 企业版(P3.1)批次 D:平台开票申请处理。exact list 优先于 prefix patch。
+    { method: 'GET', path: '/api/admin/org-invoices', handler: handleAdminListOrgInvoices },
+    { method: 'PATCH', pathPrefix: '/api/admin/org-invoices/', handler: handleAdminPatchOrgInvoice },
     // T-60 超管审计记录
     { method: 'GET', path: '/api/admin/audit', handler: handleAdminListAudit },
     // T-60 超管定价
@@ -1059,6 +1093,10 @@ export function createCommercialHandler(
     '/api/subscription/',
     '/api/agent/',
     '/api/admin/',
+    // 企业版(P3.1)org 管理面。匹配 exact `/api/org` 与 prefix `/api/org/*`。
+    // 注:BLOCKED_FOR_USER_RULES 不含 /api/org,BRIDGE 白名单也不含 → 容器无法代理,
+    // 只服务浏览器用户 JWT;dispatchOrgRoute 内做 requireOrgRole 单一鉴权收口。
+    '/api/org',
     // 匹配 exact `/api/remote-hosts` 与 prefix `/api/remote-hosts/`
     '/api/remote-hosts',
     // P0/P1:commercial user 的 memory/skills/tasks/agent 管理 API 由 master

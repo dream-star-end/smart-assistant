@@ -48,8 +48,13 @@ export const LEDGER_REASONS = [
 ] as const;
 export type LedgerReason = (typeof LEDGER_REASONS)[number];
 
-/** credit_ledger.bucket 的 CHECK 白名单（0096）：wallet=users.credits 持久钱包, period=套餐期内桶。 */
-export const LEDGER_BUCKETS = ["wallet", "period"] as const;
+/**
+ * credit_ledger.bucket 的 CHECK 白名单（与 0096 / 0112 迁移的 DB CHECK 单一权威对齐）：
+ *   - wallet     = users.credits 持久钱包
+ *   - period     = 套餐期内桶（0096）
+ *   - org_wallet = 组织钱包（0112 企业版 P3.1，balance_after=org 扣/加后 orgs.credits）
+ */
+export const LEDGER_BUCKETS = ["wallet", "period", "org_wallet"] as const;
 export type LedgerBucket = (typeof LEDGER_BUCKETS)[number];
 
 export interface LedgerRef {

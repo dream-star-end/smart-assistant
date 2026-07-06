@@ -320,6 +320,8 @@ export type UpgradeOrRefundResult =
  *
  * **锁序（全仓不变量 users → user_subscriptions）**：无条件先锁 users 再锁 user_subscriptions，
  * 与 spendTwoBucket 同序，杜绝退款路径与扣费路径成环死锁。退款 1 分 = 1 积分（系统基准）。
+ * **若未来升档/退款触 org 钱包桶,必须先锁 orgs**——全局单向锁序 orgs → users → user_subscriptions
+ * (0112 企业版);本期升档退款只触个人钱包,不涉 org 桶。
  */
 export async function applyUpgradeOrRefundTx(
   client: PoolClient,

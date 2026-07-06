@@ -53,6 +53,19 @@ import type {
   UsageResponse,
   User,
   VerifyEmailResult,
+  OrgSummary,
+  OrgMember,
+  OrgInvitation,
+  OrgRole,
+  OrgUsageReport,
+  OrgUsageWindow,
+  OrgInvoiceProfile,
+  OrgInvoiceProfileInput,
+  OrgInvoiceRequest,
+  OrgTopupResult,
+  OrgOrder,
+  OrgLedgerRow,
+  OrgSkillsResponse,
 } from "./types";
 
 /**
@@ -263,6 +276,14 @@ type WireUser = {
   avatar_url?: string | null;
   credits?: string;
   created_at?: string;
+  // 企业版(P3.1):org 归属(handleMe LEFT JOIN;无归属 → null)。
+  org?: {
+    id: string;
+    name: string;
+    role: "owner" | "admin" | "member";
+    status: "active" | "suspended" | "deleting" | "deleted";
+    billing_enabled: boolean;
+  } | null;
 };
 
 /** v5 `/api/me` / login user → 前端 User。displayName/roles 由后端字段适配，组件层零改动。 */
@@ -277,6 +298,8 @@ function adaptUser(u: WireUser): User {
     avatarUrl: u.avatar_url ?? null,
     credits: u.credits, // 字符串大数，原样保留，绝不数值化
     createdAt: u.created_at,
+    // org 字段原样透传(大数已是字符串);无归属 → null。
+    org: u.org ?? null,
   };
 }
 
@@ -1870,6 +1893,197 @@ export const api = {
         }),
       ),
     ),
+
+  // ── 企业版(P3.1)org 自助后台 ─────────────────────────────────────────
+  // org 由服务端从 caller membership 推导,前端**不带** org_id。批次 D 端点(usage/
+  // invoice)本文件权威;批次 B(topup/balance/orders/ledger)、批次 C(skills)按方案契约
+  // 调用(字段名以后端为准)。大数一律字符串贯穿。
+
+  /** GET /api/org 概要(member+)。403=无 org 归属 / org 停用。 */
+  getOrg: (a: AuthSession): Promise<OrgSummary> =>
+    jsonOrThrow<{ org: OrgSummary }>(
+      callWithRefresh(a, (t) => fetch("/api/org", { credentials: "include", headers: bearerHeaders(t) })),
+    ).then((b) => b.org),
+
+  // ── 成员(A 批次后端已就绪) ──────────────────────────────────────────
+  listOrgMembers: (a: AuthSession): Promise<OrgMember[]> =>
+    jsonOrThrow<{ members: OrgMember[] }>(
+      callWithRefresh(a, (t) => fetch("/api/org/members", { credentials: "include", headers: bearerHeaders(t) })),
+    ).then((b) => b.members),
+
+  patchOrgMember: (
+    a: AuthSession,
+    uid: string,
+    patch: { org_role?: OrgRole; billing_enabled?: boolean; status?: "active" | "suspended" },
+  ): Promise<void> =>
+    jsonOrThrow<unknown>(
+      callWithRefresh(a, (t) =>
+        fetch(`/api/org/members/${encodeURIComponent(uid)}`, {
+          method: "PATCH",
+          credentials: "include",
+          headers: bearerHeaders(t, true),
+          body: JSON.stringify(patch),
+        }),
+      ),
+    ).then(() => undefined),
+
+  removeOrgMember: (a: AuthSession, uid: string): Promise<void> =>
+    jsonOrThrow<unknown>(
+      callWithRefresh(a, (t) =>
+        fetch(`/api/org/members/${encodeURIComponent(uid)}`, {
+          method: "DELETE",
+          credentials: "include",
+          headers: bearerHeaders(t),
+        }),
+      ),
+    ).then(() => undefined),
+
+  listOrgInvitations: (a: AuthSession): Promise<OrgInvitation[]> =>
+    jsonOrThrow<{ invitations: OrgInvitation[] }>(
+      callWithRefresh(a, (t) => fetch("/api/org/invitations", { credentials: "include", headers: bearerHeaders(t) })),
+    ).then((b) => b.invitations),
+
+  createOrgInvitation: (a: AuthSession, email: string, orgRole: OrgRole): Promise<void> =>
+    jsonOrThrow<unknown>(
+      callWithRefresh(a, (t) =>
+        fetch("/api/org/invitations", {
+          method: "POST",
+          credentials: "include",
+          headers: bearerHeaders(t, true),
+          body: JSON.stringify({ email, org_role: orgRole }),
+        }),
+      ),
+    ).then(() => undefined),
+
+  revokeOrgInvitation: (a: AuthSession, id: string): Promise<void> =>
+    jsonOrThrow<unknown>(
+      callWithRefresh(a, (t) =>
+        fetch(`/api/org/invitations/${encodeURIComponent(id)}`, {
+          method: "DELETE",
+          credentials: "include",
+          headers: bearerHeaders(t),
+        }),
+      ),
+    ).then(() => undefined),
+
+  /** POST /api/org/invitations/accept(受邀者尚非成员,仅 requireAuth)。 */
+  acceptOrgInvitation: (a: AuthSession, token: string): Promise<{ org_id: string; org_role: OrgRole }> =>
+    jsonOrThrow<{ joined: boolean; org_id: string; org_role: OrgRole }>(
+      callWithRefresh(a, (t) =>
+        fetch("/api/org/invitations/accept", {
+          method: "POST",
+          credentials: "include",
+          headers: bearerHeaders(t, true),
+          body: JSON.stringify({ token }),
+        }),
+      ),
+    ).then((b) => ({ org_id: b.org_id, org_role: b.org_role })),
+
+  // ── 报表(D 批次,本文件权威) ────────────────────────────────────────
+  getOrgUsage: (a: AuthSession, window: OrgUsageWindow): Promise<OrgUsageReport> =>
+    jsonOrThrow<OrgUsageReport>(
+      callWithRefresh(a, (t) =>
+        fetch(`/api/org/usage?window=${encodeURIComponent(window)}`, {
+          credentials: "include",
+          headers: bearerHeaders(t),
+        }),
+      ),
+    ),
+
+  // ── 发票(D 批次,本文件权威) ────────────────────────────────────────
+  getOrgInvoiceProfile: (a: AuthSession): Promise<OrgInvoiceProfile | null> =>
+    jsonOrThrow<{ profile: OrgInvoiceProfile | null }>(
+      callWithRefresh(a, (t) =>
+        fetch("/api/org/invoice-profile", { credentials: "include", headers: bearerHeaders(t) }),
+      ),
+    ).then((b) => b.profile),
+
+  putOrgInvoiceProfile: (a: AuthSession, input: OrgInvoiceProfileInput): Promise<OrgInvoiceProfile> =>
+    jsonOrThrow<{ profile: OrgInvoiceProfile }>(
+      callWithRefresh(a, (t) =>
+        fetch("/api/org/invoice-profile", {
+          method: "PUT",
+          credentials: "include",
+          headers: bearerHeaders(t, true),
+          body: JSON.stringify(input),
+        }),
+      ),
+    ).then((b) => b.profile),
+
+  listOrgInvoices: (a: AuthSession): Promise<OrgInvoiceRequest[]> =>
+    jsonOrThrow<{ invoices: OrgInvoiceRequest[] }>(
+      callWithRefresh(a, (t) => fetch("/api/org/invoices", { credentials: "include", headers: bearerHeaders(t) })),
+    ).then((b) => b.invoices),
+
+  createOrgInvoice: (a: AuthSession, orderIds: string[]): Promise<OrgInvoiceRequest> =>
+    jsonOrThrow<{ invoice: OrgInvoiceRequest }>(
+      callWithRefresh(a, (t) =>
+        fetch("/api/org/invoices", {
+          method: "POST",
+          credentials: "include",
+          headers: bearerHeaders(t, true),
+          body: JSON.stringify({ order_ids: orderIds }),
+        }),
+      ),
+    ).then((b) => b.invoice),
+
+  // ── 充值(批次 B 契约;topup 返 {order_no, qr},orders keyset 轮询到账) ──
+  orgTopup: (a: AuthSession, amountCents: string): Promise<OrgTopupResult> =>
+    jsonOrThrow<{ order_no: string; qr: string; amount_cents?: string }>(
+      callWithRefresh(a, (t) =>
+        fetch("/api/org/topup", {
+          method: "POST",
+          credentials: "include",
+          headers: bearerHeaders(t, true),
+          body: JSON.stringify({ amount_cents: amountCents }),
+        }),
+      ),
+    ).then((b) => ({ orderNo: b.order_no, qr: b.qr, amountCents: b.amount_cents })),
+
+  /** GET /api/org/balance → {credits}(批次 B)。轮询到账用。 */
+  getOrgBalance: (a: AuthSession): Promise<string> =>
+    jsonOrThrow<{ credits: string }>(
+      callWithRefresh(a, (t) => fetch("/api/org/balance", { credentials: "include", headers: bearerHeaders(t) })),
+    ).then((b) => b.credits),
+
+  listOrgOrders: (a: AuthSession): Promise<OrgOrder[]> =>
+    jsonOrThrow<{ rows: OrgOrder[] }>(
+      callWithRefresh(a, (t) => fetch("/api/org/orders", { credentials: "include", headers: bearerHeaders(t) })),
+    ).then((b) => b.rows ?? []),
+
+  listOrgLedger: (a: AuthSession): Promise<OrgLedgerRow[]> =>
+    jsonOrThrow<{ rows: OrgLedgerRow[] }>(
+      callWithRefresh(a, (t) => fetch("/api/org/ledger", { credentials: "include", headers: bearerHeaders(t) })),
+    ).then((b) => b.rows ?? []),
+
+  // ── 技能(批次 C 契约) ───────────────────────────────────────────────
+  getOrgSkills: (a: AuthSession): Promise<OrgSkillsResponse> =>
+    jsonOrThrow<OrgSkillsResponse>(
+      callWithRefresh(a, (t) => fetch("/api/org/skills", { credentials: "include", headers: bearerHeaders(t) })),
+    ).then((b) => ({ installed: b.installed ?? [], available: b.available ?? [] })),
+
+  installOrgSkill: (a: AuthSession, slug: string): Promise<void> =>
+    jsonOrThrow<unknown>(
+      callWithRefresh(a, (t) =>
+        fetch("/api/org/skills/install", {
+          method: "POST",
+          credentials: "include",
+          headers: bearerHeaders(t, true),
+          body: JSON.stringify({ slug }),
+        }),
+      ),
+    ).then(() => undefined),
+
+  uninstallOrgSkill: (a: AuthSession, slug: string): Promise<void> =>
+    jsonOrThrow<unknown>(
+      callWithRefresh(a, (t) =>
+        fetch(`/api/org/skills/${encodeURIComponent(slug)}`, {
+          method: "DELETE",
+          credentials: "include",
+          headers: bearerHeaders(t),
+        }),
+      ),
+    ).then(() => undefined),
 
   // ── 对话传输（P4 已接入：WS user-chat-bridge） ────────────────────────
   //

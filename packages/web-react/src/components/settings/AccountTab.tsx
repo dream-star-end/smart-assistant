@@ -1,4 +1,4 @@
-import { Crown, Plus, Wallet } from "lucide-react";
+import { Building2, Crown, Plus, Wallet } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
 import { api } from "../../lib/api";
 import type { AuthSession, MySubscription, UsageLedgerRow, User } from "../../lib/types";
@@ -97,8 +97,43 @@ export function AccountTab({
     }
   }, [auth, nextBefore, loadingMore]);
 
+  const org = user?.org ?? null;
+  const orgRoleLabel = org
+    ? org.role === "owner"
+      ? "拥有者"
+      : org.role === "admin"
+        ? "管理员"
+        : "成员"
+    : "";
+
   return (
     <div className="flex flex-col">
+      {/* 我的组织(只读展示;管理功能在组织中心,仅 owner/admin 有入口) */}
+      {org && (
+        <div className="border-b border-border px-5 py-4">
+          <div className="flex items-center gap-1.5 text-[12px] text-faint">
+            <Building2 size={13} /> 我的组织
+          </div>
+          <div className="mt-1 flex items-center gap-2">
+            <span className="text-[16px] font-semibold text-fg">{org.name}</span>
+            <span className="rounded-full bg-hover px-2 py-0.5 text-[11px] font-medium text-muted">
+              {orgRoleLabel}
+            </span>
+          </div>
+          {org.status === "suspended" ? (
+            <Alert tone="warning" className="mt-2 text-[12.5px]">
+              该组织已被暂停,组织钱包与共享技能暂不可用。
+            </Alert>
+          ) : (
+            <p className="mt-1 text-[12px] text-faint">
+              {org.billing_enabled
+                ? "你的对话用量可由组织钱包统一结算。"
+                : "该组织未对你开启统一结算,用量按个人账户计费。"}
+            </p>
+          )}
+        </div>
+      )}
+
       {/* 当前套餐 */}
       <div className="border-b border-border px-5 py-4">
         <div className="flex items-center justify-between gap-3">

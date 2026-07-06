@@ -20,6 +20,19 @@ export type User = {
   /** 余额（积分），字符串大数，勿 Number() 化。 */
   credits?: string;
   createdAt?: string;
+  /** 企业版(P3.1):caller 的 active org 归属。无归属 → null / 缺省。 */
+  org?: OrgMembershipBrief | null;
+};
+
+/** /api/me 注入的 org 归属摘要(handleMe LEFT JOIN)。org suspended 仍返回(带 status)。 */
+export type OrgRole = "owner" | "admin" | "member";
+export type OrgStatus = "active" | "suspended" | "deleting" | "deleted";
+export type OrgMembershipBrief = {
+  id: string;
+  name: string;
+  role: OrgRole;
+  status: OrgStatus;
+  billing_enabled: boolean;
 };
 
 /**
@@ -883,3 +896,143 @@ export type RepoSelection =
       error_message?: string;
       selection_version: number;
     };
+
+// ─── 企业版(P3.1)org 自助后台 ─────────────────────────────────────────────
+// 全部大数(credits / tokens / amount_cents)一律字符串,组件层禁止 Number() 化。
+// org 由服务端从 caller membership 推导,前端任何请求**不带** org_id。
+
+/** GET /api/org 概要(队长/管理员 + 成员均可读)。 */
+export type OrgSummary = {
+  id: string;
+  name: string;
+  status: OrgStatus;
+  role: OrgRole;
+  billing_enabled: boolean;
+  member_count: number;
+  max_members: number;
+  /** 组织钱包余额(积分,字符串大数)。 */
+  credits: string;
+};
+
+/** 成员(GET /api/org/members)。 */
+export type OrgMember = {
+  user_id: string;
+  email: string;
+  display_name: string | null;
+  org_role: OrgRole;
+  status: "active" | "suspended";
+  billing_enabled: boolean;
+  user_status: string;
+  invited_by: string | null;
+  joined_at: string;
+};
+
+/** 邀请(GET /api/org/invitations)。 */
+export type OrgInvitation = {
+  id: string;
+  email: string;
+  org_role: OrgRole;
+  status: "pending" | "accepted" | "revoked" | "expired";
+  invited_by: string | null;
+  expires_at: string;
+  accepted_at: string | null;
+  revoked_at: string | null;
+  created_at: string;
+};
+
+// ─── 报表(GET /api/org/usage?window=24h|7d|30d) ────────────────────────────
+export type OrgUsageWindow = "24h" | "7d" | "30d";
+
+/** 四项 token + 请求数 + 扣费(全部字符串大数)。 */
+export type OrgUsageTotals = {
+  requests: string;
+  input_tokens: string;
+  output_tokens: string;
+  cache_read_tokens: string;
+  cache_write_tokens: string;
+  credits: string;
+};
+
+export type OrgMemberUsage = OrgUsageTotals & {
+  user_id: string;
+  email: string;
+  display_name: string | null;
+};
+
+export type OrgModelUsage = OrgUsageTotals & { model: string };
+
+export type OrgUsageTrendPoint = { bucket: string; requests: string; credits: string };
+
+export type OrgUsageReport = {
+  window: OrgUsageWindow;
+  summary: OrgUsageTotals;
+  members: OrgMemberUsage[];
+  models: OrgModelUsage[];
+  trend: OrgUsageTrendPoint[];
+};
+
+// ─── 发票(GET/PUT /api/org/invoice-profile · GET/POST /api/org/invoices) ────
+export type OrgInvoiceProfile = {
+  org_id: string;
+  title: string;
+  tax_id: string | null;
+  address: string | null;
+  email: string | null;
+  updated_by: string | null;
+  updated_at: string;
+};
+
+export type OrgInvoiceProfileInput = {
+  title: string;
+  tax_id?: string | null;
+  address?: string | null;
+  email?: string | null;
+};
+
+export type OrgInvoiceRequest = {
+  id: string;
+  org_id: string;
+  order_ids: string[];
+  amount_cents: string;
+  profile_snapshot: { title?: string; tax_id?: string | null; address?: string | null; email?: string | null };
+  status: "pending" | "issued" | "rejected";
+  requested_by: string | null;
+  admin_note: string | null;
+  processed_by: string | null;
+  processed_at: string | null;
+  created_at: string;
+};
+
+// ─── 计费(批次 B 契约,前端只调用)────────────────────────────────────────
+// POST /api/org/topup {amount_cents} → {order_no, qr};GET /api/org/balance → {credits};
+// GET /api/org/orders(keyset)。前端按此契约调用,字段名以方案 §3 为准。
+export type OrgTopupResult = { orderNo: string; qr: string; amountCents?: string };
+export type OrgOrder = {
+  order_no: string;
+  status: string;
+  amount_cents: string;
+  credits: string;
+  created_at: string;
+  paid_at: string | null;
+};
+export type OrgLedgerRow = {
+  id: string;
+  delta: string;
+  balance_after: string;
+  reason: string;
+  memo: string | null;
+  created_at: string;
+};
+
+// ─── 技能(批次 C 契约,前端只调用)────────────────────────────────────────
+// GET /api/org/skills → {installed[], available[]};POST /api/org/skills/install {slug};
+// DELETE /api/org/skills/:slug。
+export type OrgSkill = {
+  slug: string;
+  name: string;
+  summary?: string | null;
+  version?: string | null;
+  installed_by?: string | null;
+  installed_at?: string | null;
+};
+export type OrgSkillsResponse = { installed: OrgSkill[]; available: OrgSkill[] };
