@@ -1287,6 +1287,10 @@ export interface AnthropicProxyDeps {
     requestId: string,
     userId: string,
     costCredits: string,
+    // agent 引擎会话 id(ccb getSessionId)→ pending.session_id,ccb 助手落库按 session 精确 drain。
+    sessionId?: string | null,
+    // delegate 子会话的父客户端会话 id(web-*)→ pending.parent_session_id,队长助手行按父会话归并。
+    parentSessionId?: string | null,
   ) => Promise<unknown>;
   /**
    * 静态 key 文本 provider(deepseek/minimax/ark)的 key 解析表。

@@ -1198,6 +1198,45 @@ describe("applyCostCharged (§3 NOT deduped; 归因严格)", () => {
     expect(prev.usage?.costCredits).toBe("5"); // 上一轮 assistant 不被错算（不跨 turn）
     expect(s._pendingCostCredits).toBe("0"); // 本轮无响应可落 → 丢展示、清零防泄漏
   });
+
+  // ── Fix B — 委派成本(parentSessionId)在飞时跳过陈旧 lastFinaled ──
+  test("委派 cost + 队长 turn 在飞 + 60s 内 lastFinaled(上一轮)→ 入队本轮 pending,不错算上一轮", () => {
+    const s = sess();
+    const prevTurn = addMessage(s, "assistant", "上一轮响应", { ts: 1, usage: { costCredits: "5" } });
+    s._lastFinaledAssistantId = prevTurn.id; // 上一轮刚 final(<60s)
+    s._lastFinaledAt = Date.now();
+    s._sendingInFlight = true; // 队长本轮在飞、等委派,无 streamingAssistant
+    // 委派子智能体成本到达(带 parentSessionId)。旧逻辑会命中 60s lastFinaled → 错算到上一轮;
+    // Fix B:委派 + 在飞 → 跳过 lastFinaled,入队本轮 pending。
+    applyCostCharged(s, {
+      type: "outbound.cost_charged", sessionId: "engine-deleg", parentSessionId: "s1", costCredits: "8",
+    }, {});
+    expect(prevTurn.usage?.costCredits).toBe("5"); // 上一轮不被污染
+    expect(s._pendingCostCredits).toBe("8"); // 归入本轮,待队长 isFinal flush
+  });
+
+  test("普通 chat(无 parentSessionId)行为不变:在飞 + 60s lastFinaled → 仍累加到 lastFinaled", () => {
+    const s = sess();
+    const last = addMessage(s, "assistant", "刚收尾", { ts: 1, usage: { costCredits: "5" } });
+    s._lastFinaledAssistantId = last.id;
+    s._lastFinaledAt = Date.now();
+    s._sendingInFlight = true;
+    // 无 parentSessionId → 走既有启发式(命中 lastFinaled)。锁定普通 chat 零行为变化。
+    applyCostCharged(s, { type: "outbound.cost_charged", sessionId: "s1", costCredits: "3" }, {});
+    expect(last.usage?.costCredits).toBe("8"); // 5 + 3
+    expect(s._pendingCostCredits).toBe("0");
+  });
+
+  test("委派 cost + 有 streamingAssistant → 仍直接落流式助手(优先级不变)", () => {
+    const s = sess();
+    const a = addMessage(s, "assistant", "队长流式", { ts: 1, usage: {} });
+    s._streamingAssistant = a;
+    s._sendingInFlight = true;
+    applyCostCharged(s, {
+      type: "outbound.cost_charged", sessionId: "engine-deleg", parentSessionId: "s1", costCredits: "6",
+    }, {});
+    expect(a.usage?.costCredits).toBe("6"); // streamingAssistant 优先,不受 parentSessionId 影响
+  });
 });
 
 describe("applyResumeFailed (§4 layer 3)", () => {
@@ -1377,6 +1416,31 @@ describe("ChatSocket safeWsSend backpressure (§2) + offline enqueue (§10)", ()
     expect(sess._sendingInFlight).toBe(false);
     expect(sock.toStored("s1")?._sendingInFlight).toBeFalsy();
     expect(persistSession).toHaveBeenCalledWith("s1");
+  });
+
+  test("Fix B — cost_charged 带 parentSessionId → 精确路由到父会话(多会话并发下不丢)", () => {
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const sock = makeSocket();
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    ws.open();
+    // 两条会话同时"活跃":父会话 s-parent 队长在飞;另一会话 s-other 正流式。
+    // 旧 costTargetSession 启发式此时 ≥2 候选 → 返回 null → 委派 cost 丢展示(只刷余额)。
+    const parent = sock.ensureSession("s-parent", "main");
+    parent._sendingInFlight = true;
+    const other = sock.ensureSession("s-other", "main");
+    const streaming = { id: "a-other", role: "assistant" as const, text: "x", ts: 1, usage: {} } as ChatMessage;
+    other.messages.push(streaming);
+    other._streamingAssistant = streaming;
+
+    // 委派 cost_charged:sessionId=委派引擎会话(前端无此会话),parentSessionId=父客户端会话。
+    ws.onmessage?.({ data: JSON.stringify({
+      type: "outbound.cost_charged", sessionId: "engine-deleg", parentSessionId: "s-parent", costCredits: "12",
+    }) });
+
+    // 精确命中父会话 → 入队本轮 pending(在飞、无 streamingAssistant);绝不误挂到 s-other。
+    expect(sock.sessions.get("s-parent")!._pendingCostCredits).toBe("12");
+    expect(streaming.usage?.costCredits).toBeUndefined(); // 另一会话零污染
   });
 
   test("bufferedAmount ≥ 2MB → close(4000) + requeue offline (no silent drop)", () => {
