@@ -37,6 +37,7 @@ const sonnet: ModelPricing = {
   sort_order: 100,
   visibility: "public",
   extra_system_prompt: null,
+  default_effort: null,
   updated_at: new Date("2026-04-01T00:00:00Z"),
 };
 
@@ -417,6 +418,7 @@ describe("preCheck — BINV-5: cost multiplier 不进 preCheck 路径", () => {
             sort_order: 1,
             visibility: "public",
             extra_system_prompt: null,
+            default_effort: null,
             updated_at: new Date(0),
           };
         },

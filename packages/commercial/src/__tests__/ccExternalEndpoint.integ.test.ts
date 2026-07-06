@@ -92,6 +92,7 @@ const FIXED_PRICING: ModelPricing = {
   sort_order: 100,
   visibility: "public",
   extra_system_prompt: null,
+  default_effort: null,
   updated_at: new Date("2026-04-01T00:00:00Z"),
 };
 

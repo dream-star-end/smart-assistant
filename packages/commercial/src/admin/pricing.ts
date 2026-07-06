@@ -2,11 +2,14 @@
  * T-60 — 超管 model_pricing 管理。
  *
  * ### 允许改哪些字段
- * - `multiplier`:NUMERIC(6,3),线上 0.1 ~ 999.999 范围内(超出无业务意义且容易打错)
- * - `enabled`:boolean
- *
- * 其它(display_name / 各 *_per_mtok)改起来牵涉外部价目,MVP 不开入口;要动
- * 走 migration/seed 手工改,再 NOTIFY reload。避免有人误手把 opus 开成 1/1000 倍。
+ * - `multiplier`:NUMERIC(6,3),线上 0.001 ~ 999.999
+ * - `enabled`:boolean(模型上/下线)
+ * - `extra_system_prompt`(0060)/ `visibility`(0049)/ `display_name`
+ * - `default_effort`(0105):per-model 默认思考深度,按 protocol 适用性校验(modelOps.ts)
+ * - 四个 `*_per_mtok` 价格列(0105 放开)。原「要动走 migration/seed」的安全初衷改由
+ *   四重护栏承接(Codex 方案评审):API 整数分校验(normalizePriceCents,0..1e8)+
+ *   DB CHECK >= 0(0105)+ 逐列 before/after 审计 + `if_match_updated_at` 乐观并发
+ *   (UI 行内编辑带读取时的 updated_at,中途被他人改过 → PricingStaleError/409,防脏写)。
  *
  * ### NOTIFY pricing_changed
  * 由 0008 的 trigger 自动发出(`AFTER INSERT OR UPDATE OR DELETE`),
@@ -24,6 +27,7 @@ import { query, tx } from "../db/queries.js";
 import { writeAdminAudit } from "./audit.js";
 import { safeEnqueueAlert } from "./alertOutbox.js";
 import { EVENTS } from "./alertEvents.js";
+import { EFFORT_ENUM, effortMetaForModel } from "./modelOps.js";
 
 export interface ModelPricingRowView {
   model_id: string;
@@ -48,6 +52,10 @@ export interface ModelPricingRowView {
    * 上限 4096 字符,DB CHECK 约束兜底。
    */
   extra_system_prompt: string | null;
+  /** 0105 引入 — per-model 默认思考深度(proxy 注入;NULL=不注入)。 */
+  default_effort: string | null;
+  /** 0105 引入 — 乐观并发版本号(每次 PATCH 成功 +1;整数精确比较,无时间戳截断坑)。 */
+  lock_version: number;
 }
 
 const PRICING_COLS = `
@@ -63,7 +71,9 @@ const PRICING_COLS = `
   updated_at,
   updated_by::text           AS updated_by,
   visibility,
-  extra_system_prompt
+  extra_system_prompt,
+  default_effort,
+  lock_version
 `;
 
 /** extra_system_prompt 长度上限,与 0060 migration 的 CHECK 约束对齐。 */
@@ -91,7 +101,31 @@ export interface PatchPricingInput {
    * - 非空字串:trim 后存(长度 ≤ EXTRA_SYSTEM_PROMPT_MAX_LEN,否则 RangeError)
    */
   extra_system_prompt?: string | null;
+  // ─── 0105 运维页放开字段 ───
+  display_name?: string;
+  visibility?: string;
+  /** null=清除(回落"不注入");string=EFFORT_ENUM 且须过 per-model 适用性校验。 */
+  default_effort?: string | null;
+  input_per_mtok?: string | number;
+  output_per_mtok?: string | number;
+  cache_read_per_mtok?: string | number;
+  cache_write_per_mtok?: string | number;
+  /**
+   * 乐观并发:GET 返回的 lock_version 原样回传;不匹配 → PricingStaleError(HTTP 409)。
+   * **价格列出现时强制要求本字段**(缺失 → RangeError,四重护栏之一);其他字段可选带。
+   * 用整数版本号而非 updated_at 时间戳:timestamptz 微秒被 pg→JS Date 截到毫秒,
+   * 同毫秒并发会误判匹配(Codex 审计)。
+   */
+  if_match_lock_version?: number;
 }
+
+const PRICE_FIELDS = [
+  "input_per_mtok",
+  "output_per_mtok",
+  "cache_read_per_mtok",
+  "cache_write_per_mtok",
+] as const;
+type PriceField = (typeof PRICE_FIELDS)[number];
 
 export interface PatchPricingCtx {
   adminId: bigint | number | string;
@@ -101,6 +135,62 @@ export interface PatchPricingCtx {
 
 export class PricingNotFoundError extends Error {
   constructor(modelId: string) { super(`model_pricing not found: ${modelId}`); this.name = "PricingNotFoundError"; }
+}
+
+/** 0105 — 乐观并发冲突(if_match_updated_at 与行当前 updated_at 不符)→ HTTP 409。 */
+export class PricingStaleError extends Error {
+  constructor(modelId: string) {
+    super(`model_pricing row changed since read: ${modelId}`);
+    this.name = "PricingStaleError";
+  }
+}
+
+/**
+ * 0105 — 价格列(分/Mtok):非负整数,上限 1e8(=¥100 万/Mtok,再高必是手滑)。
+ * 字符串只认十进制数字(拒 "1e3"/"0x10" 这类 Number() 可解析的旁门写法,Codex nit)。
+ */
+export function normalizePriceCents(v: unknown, field: string): string {
+  let n: number;
+  if (typeof v === "number") {
+    n = v;
+  } else if (typeof v === "string" && /^\d+$/.test(v.trim())) {
+    n = Number(v.trim());
+  } else {
+    throw new RangeError(`invalid_${field}`);
+  }
+  if (!Number.isInteger(n) || n < 0 || n > 100_000_000) throw new RangeError(`invalid_${field}`);
+  return String(n);
+}
+
+const VISIBILITY_ENUM = ["public", "admin", "hidden"] as const;
+export function normalizeVisibility(v: unknown): string {
+  if (typeof v !== "string" || !(VISIBILITY_ENUM as readonly string[]).includes(v)) {
+    throw new RangeError("invalid_visibility");
+  }
+  return v;
+}
+
+export function normalizeDisplayName(v: unknown): string {
+  if (typeof v !== "string") throw new RangeError("invalid_display_name");
+  const t = v.trim();
+  if (t === "" || t.length > 128) throw new RangeError("invalid_display_name");
+  return t;
+}
+
+/**
+ * 0105 — default_effort:null=清除;string 须 ∈ EFFORT_ENUM 且 ∈ 该模型 provider 的
+ * 适用档位(protocol 推导,见 modelOps.effortMetaForModel —— capability-zero 静态模型
+ * 的 output_config 会被 upstream 整体 strip,配了也无效,这里直接拒,不做静默无效配置)。
+ */
+export function normalizeDefaultEffort(modelId: string, v: unknown): string | null {
+  if (v === null) return null;
+  if (typeof v !== "string" || !(EFFORT_ENUM as readonly string[]).includes(v)) {
+    throw new RangeError("invalid_default_effort");
+  }
+  const meta = effortMetaForModel(modelId);
+  if (!meta.applicable) throw new RangeError("effort_not_applicable_for_model");
+  if (!meta.allowed.includes(v)) throw new RangeError("effort_not_allowed_for_provider");
+  return v;
 }
 
 /**
@@ -173,7 +263,11 @@ export async function patchPricing(
   const touched =
     patch.multiplier !== undefined ||
     patch.enabled !== undefined ||
-    patch.extra_system_prompt !== undefined;
+    patch.extra_system_prompt !== undefined ||
+    patch.display_name !== undefined ||
+    patch.visibility !== undefined ||
+    patch.default_effort !== undefined ||
+    PRICE_FIELDS.some((f) => patch[f] !== undefined);
   if (!touched) {
     const cur = await query<ModelPricingRowView>(
       `SELECT ${PRICING_COLS} FROM model_pricing WHERE model_id = $1`, [modelId],
@@ -195,12 +289,47 @@ export async function patchPricing(
     extraNorm = normalizeExtraSystemPrompt(patch.extra_system_prompt);
   }
 
+  // 0105 — 运维页放开字段归一化(全部先于事务,校验失败零 DB 交互)。
+  const displayNameNorm =
+    patch.display_name !== undefined ? normalizeDisplayName(patch.display_name) : undefined;
+  const visibilityNorm =
+    patch.visibility !== undefined ? normalizeVisibility(patch.visibility) : undefined;
+  const EFFORT_UNSET = Symbol("effort_unset");
+  let effortNorm: string | null | typeof EFFORT_UNSET = EFFORT_UNSET;
+  if (patch.default_effort !== undefined) {
+    effortNorm = normalizeDefaultEffort(modelId, patch.default_effort);
+  }
+  const priceNorm: Partial<Record<PriceField, string>> = {};
+  for (const f of PRICE_FIELDS) {
+    if (patch[f] !== undefined) priceNorm[f] = normalizePriceCents(patch[f], f);
+  }
+
+  // 0105 — 价格列**强制**乐观并发(Codex 审计:可选=可绕过=不算护栏)。同步抛,零 DB 交互。
+  if (Object.keys(priceNorm).length > 0 && patch.if_match_lock_version === undefined) {
+    throw new RangeError("if_match_required_for_price_changes");
+  }
+  if (
+    patch.if_match_lock_version !== undefined &&
+    (!Number.isInteger(patch.if_match_lock_version) || patch.if_match_lock_version < 0)
+  ) {
+    throw new RangeError("invalid_if_match_lock_version");
+  }
+
   return tx(async (client: PoolClient) => {
     const before = await client.query<ModelPricingRowView>(
       `SELECT ${PRICING_COLS} FROM model_pricing WHERE model_id = $1 FOR UPDATE`,
       [modelId],
     );
     if (before.rows.length === 0) throw new PricingNotFoundError(modelId);
+
+    // 0105 — 乐观并发:UI 带上读取时的 lock_version,中途被他人改过 → 409 防脏写(价格列
+    // 即改即生效,脏写=直接改错线上计费,必须 fail-closed;整数比较无时间戳截断坑)。
+    if (
+      patch.if_match_lock_version !== undefined &&
+      before.rows[0].lock_version !== patch.if_match_lock_version
+    ) {
+      throw new PricingStaleError(modelId);
+    }
 
     const sets: string[] = [];
     const params: unknown[] = [];
@@ -210,6 +339,13 @@ export async function patchPricing(
     if (multiplierNorm !== null) push("multiplier", multiplierNorm);
     if (patch.enabled !== undefined) push("enabled", patch.enabled);
     if (extraNorm !== EXTRA_UNSET) push("extra_system_prompt", extraNorm);
+    if (displayNameNorm !== undefined) push("display_name", displayNameNorm);
+    if (visibilityNorm !== undefined) push("visibility", visibilityNorm);
+    if (effortNorm !== EFFORT_UNSET) push("default_effort", effortNorm);
+    for (const f of PRICE_FIELDS) {
+      if (priceNorm[f] !== undefined) push(f, priceNorm[f]);
+    }
+    sets.push("lock_version = lock_version + 1");
     sets.push("updated_at = NOW()");
     params.push(String(ctx.adminId));
     sets.push(`updated_by = $${params.length}::bigint`);
@@ -232,6 +368,13 @@ export async function patchPricing(
     if (extraNorm !== EXTRA_UNSET) {
       changedBefore.extra_system_prompt = summarizeExtraPrompt(b.extra_system_prompt);
       changedAfter.extra_system_prompt = summarizeExtraPrompt(a.extra_system_prompt);
+    }
+    // 0105 — 新放开字段逐列 before/after(价格列审计是放开编辑的护栏之一,不许省)。
+    if (displayNameNorm !== undefined) { changedBefore.display_name = b.display_name; changedAfter.display_name = a.display_name; }
+    if (visibilityNorm !== undefined) { changedBefore.visibility = b.visibility; changedAfter.visibility = a.visibility; }
+    if (effortNorm !== EFFORT_UNSET) { changedBefore.default_effort = b.default_effort; changedAfter.default_effort = a.default_effort; }
+    for (const f of PRICE_FIELDS) {
+      if (priceNorm[f] !== undefined) { changedBefore[f] = b[f]; changedAfter[f] = a[f]; }
     }
 
     await writeAdminAudit(client, {

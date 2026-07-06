@@ -36,6 +36,7 @@ import { makeContainerIdentityStrategy } from "../auth/proxyIdentity.js";
 import { makeLoadUserModelAuthz } from "../auth/userModelAuthz.js";
 import { makeAnthropicProxyHandler } from "../http/anthropicProxy.js";
 import { assertPlatformDefaultModelConfigured } from "../http/proxy/staticProviderMeta.js";
+import { startLatencyProber } from "./latencyProber.js";
 import { ocGatewayIpForChannel, ocInternalProxyPortForChannel } from "../agent-sandbox/v3supervisor.js";
 import { getSelfHost } from "../compute-pool/queries.js";
 import { rootLogger } from "../logging/logger.js";
@@ -138,6 +139,17 @@ export async function startEgress(): Promise<void> {
   const controlBaseUrl = `http://${controlBind}:${controlPort}`;
   const costSink = new CostEventSink({ controlBaseUrl, secret });
 
+  // 静态 key 解析表 —— proxyHandler 与延迟探测器(0105)共用同一份,防两处漂移。
+  const staticProviderKeys = {
+    deepseek: cfg.DEEPSEEK_API_KEY,
+    minimax: cfg.ARK_AGENT_PLAN_KEY,
+    ark: cfg.ARK_CODING_PLAN_KEY,
+    // 2026-07-05:OpenCode Go(qwen3.7-max/plus)。与 master internalProxyHandler 同口径注入。
+    opencodego: cfg.OPENCODE_GO_API_KEY,
+    // 2026-07-06:火山 Agent Plan Kimi(kimi-k2.7-code),与 minimax 共 ARK_AGENT_PLAN_KEY。
+    kimi: cfg.ARK_AGENT_PLAN_KEY,
+  };
+
   const proxyHandler = makeAnthropicProxyHandler({
     pgPool: getPool(),
     pricing,
@@ -170,19 +182,15 @@ export async function startEgress(): Promise<void> {
         parentSessionId: parentSessionId ?? null,
       });
     },
-    staticProviderKeys: {
-      deepseek: cfg.DEEPSEEK_API_KEY,
-      minimax: cfg.ARK_AGENT_PLAN_KEY,
-      ark: cfg.ARK_CODING_PLAN_KEY,
-      // 2026-07-05:OpenCode Go(qwen3.7-max/plus)。与 master internalProxyHandler 同口径注入。
-      opencodego: cfg.OPENCODE_GO_API_KEY,
-      // 2026-07-06:火山 Agent Plan Kimi(kimi-k2.7-code),与 minimax 共 ARK_AGENT_PLAN_KEY。
-      kimi: cfg.ARK_AGENT_PLAN_KEY,
-    },
+    staticProviderKeys,
     getPhase6AccountUuidEnforce,
     getSessionPinMode,
     listEnabledAccountGroupsForModel: listEnabledGroupsForModel,
   });
+
+  // 0105:上游延迟探测器(admin「模型与服务商」页数据源)。挂 egress 因为这里才是真实 LLM
+  // 流量的出口进程(dispatcher direct/proxy 语义一致);任何失败只告警,不影响在飞流主职。
+  const latencyProber = startLatencyProber({ staticProviderKeys, log });
 
   // self-host uuid 与 master 同权威(PG compute host 表)——identity 双因子里
   // hostUuid 参与 bearer 归属校验,两进程必须同值。取失败拒启(egress 无降级路径)。
@@ -297,6 +305,7 @@ export async function startEgress(): Promise<void> {
   const shutdown = () => {
     if (shuttingDown) return;
     shuttingDown = true;
+    latencyProber?.stop();
     // eslint-disable-next-line no-console
     console.log(`[egress] SIGTERM — draining in-flight streams (max ${EGRESS_DRAIN_MS}ms)…`);
     // close() 停接新连接,已建立连接(在飞流)自然完结;到 drain 上限强制退出。

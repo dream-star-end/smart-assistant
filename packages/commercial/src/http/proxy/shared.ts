@@ -249,6 +249,34 @@ export const proxyBodySchema = z
 export type ProxyBody = z.infer<typeof proxyBodySchema>;
 
 /**
+ * 0105 — per-model 默认思考深度注入(model_pricing.default_effort,admin 运维页可配)。
+ *
+ * 语义(Codex 方案评审吸收):
+ * - client 显式 output_config.effort **永远优先**,本函数只在缺失时补;
+ * - **合并不覆盖**:output_config 其他子字段保留(OAuth 透传路径需要;静态 ark 的
+ *   effort 白名单归一/capability-zero 的整体 strip 在 upstream 层照常兜底);
+ * - 在 proxy handler 的 pricing/authorize 之后、selectUpstreamRoute/estimateInputTokens
+ *   之前调用 —— 注入的少量字节计入 input 估算,与真实转发内容一致。
+ */
+export function applyModelDefaultEffort(
+  body: ProxyBody,
+  defaultEffort: string | null | undefined,
+): void {
+  if (!defaultEffort) return;
+  const oc = body.output_config;
+  if (oc === undefined || oc === null) {
+    body.output_config = { effort: defaultEffort };
+    return;
+  }
+  if (typeof oc === "object" && !Array.isArray(oc)) {
+    const rec = oc as Record<string, unknown>;
+    if (rec.effort === undefined) {
+      body.output_config = { ...rec, effort: defaultEffort };
+    }
+  }
+}
+
+/**
  * 字段字节预算校验。zod schema 不做大小,这里单独算。
  *
  * 用 Buffer.byteLength(JSON.stringify(...), 'utf8'):base64 image 自然计入,符合 R3 口径。
