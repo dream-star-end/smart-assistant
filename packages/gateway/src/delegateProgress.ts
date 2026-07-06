@@ -241,3 +241,152 @@ export function makeDelegateBlockPassthrough(
     block: sanitizeBlockForDelegate(b),
   }
 }
+
+/**
+ * 沿委派父链向上追溯所需的最小会话视图(解耦具体 SessionManager,便于纯函数单测)。
+ */
+export type DelegateChainSession = {
+  sessionKey: string
+  channel: string
+  peerId: string
+  agentId: string
+  userId?: string
+  /** 直接父会话键;仅 delegate 子会话在创建时物化(webchat 根会话为 undefined)。 */
+  parentSessionKey?: string
+  /** 本(delegate)会话进度卡的 runId;嵌套子委派复用**一级**委派的该值挂回同一张卡。 */
+  progressRunId?: string
+}
+
+/**
+ * 委派进度路由决策:进度帧要投递到哪个 webchat 祖先会话,以及(嵌套时)如何挂回
+ * 用户可见的那张**一级**委派卡。
+ */
+export type DelegateProgressRouting = {
+  /** 进度投递目标 = 最近的 webchat 祖先会话。非嵌套(一级)时即直接 webchat 父。 */
+  target: { sessionKey: string; channel: string; peerId: string; userId?: string }
+  /** 直接父是否为 delegate 会话(true = 二级+嵌套委派,进度要挂到一级卡)。 */
+  nested: boolean
+  /** 一级委派会话(其父为 webchat)的进度卡 runId;嵌套帧复用它 append 到同一张卡。
+   *  非嵌套时 undefined(调用方用本委派自身 runId)。一级会话未开进度时也可能缺失,
+   *  调用方退回自身 runId → 独立进度卡兜底(仍可见,不丢)。 */
+  firstLevelRunId?: string
+  /** 从一级委派到直接父的 agent 名链(top-down);给嵌套帧文本打层级前缀用。
+   *  非嵌套时为空数组。 */
+  ancestorAgentPath: string[]
+}
+
+/**
+ * 从「本次委派请求携带的直接父会话键」出发,沿父链向上追溯到**最近的 webchat 祖先会话**,
+ * 得到进度投递目标与嵌套挂卡信息。取代旧的「父非 webchat 即返回 null(丢弃嵌套进度)」。
+ *
+ * 语义与不变量:
+ *   - 一级(直接父即 webchat):`nested=false`,`target` 与旧 `_resolveDelegateProgressTarget`
+ *     完全一致(sessionKey/channel/peerId/userId),`firstLevelRunId=undefined`,路径为空。
+ *   - 二级+(直接父是 delegate):沿 `parentSessionKey` 逐跳向上,跳过中间 delegate 会话,
+ *     命中 webchat 祖先即为 `target`;`nested=true`,`firstLevelRunId` = 链中**最后一个**
+ *     delegate(其父即 webchat = 一级委派)的 `progressRunId`。
+ *   - 反 spoof:`sourceAgent` 只在**直接父**这一跳校验(祖先 agent 天然不同,不校验)。
+ *   - 防御性一律返回 null(丢弃,与旧行为一致,绝不抛错):
+ *       · 直接父键缺失/非字符串;
+ *       · 父链某跳会话不在内存(断链);
+ *       · 出现环(visited)或深度超上限(maxDepth,默认 5);
+ *       · 途中碰到既非 webchat 也非 delegate 的祖先(cron/webhook 等);
+ *       · 走到链尾仍未碰到 webchat。
+ */
+export function resolveDelegateProgressRouting(args: {
+  parentSessionKey: unknown
+  sourceAgent?: unknown
+  getSession: (key: string) => DelegateChainSession | undefined
+  maxDepth?: number
+}): DelegateProgressRouting | null {
+  const startKey = args.parentSessionKey
+  if (typeof startKey !== 'string' || !startKey) return null
+  const maxDepth = args.maxDepth ?? 5
+  const visited = new Set<string>()
+  const delegateChain: DelegateChainSession[] = [] // bottom-up: [直接父, …, 一级委派]
+  let key: string | undefined = startKey
+  let hops = 0
+  let isImmediate = true
+  while (typeof key === 'string' && key) {
+    if (++hops > maxDepth) return null // 防超深/兜底防环
+    if (visited.has(key)) return null // 防环
+    visited.add(key)
+    const s = args.getSession(key)
+    if (!s) return null // 断链
+    if (
+      isImmediate &&
+      typeof args.sourceAgent === 'string' &&
+      args.sourceAgent &&
+      s.agentId !== args.sourceAgent
+    ) {
+      return null // 反 spoof:直接父归属校验失败
+    }
+    if (s.channel === 'webchat') {
+      const nested = delegateChain.length > 0
+      const firstLevel = nested ? delegateChain[delegateChain.length - 1] : undefined
+      return {
+        target: {
+          sessionKey: s.sessionKey,
+          channel: s.channel,
+          peerId: s.peerId,
+          userId: s.userId,
+        },
+        nested,
+        firstLevelRunId: firstLevel?.progressRunId,
+        // reverse → top-down(一级委派名在前,直接父名在后)
+        ancestorAgentPath: delegateChain.map((d) => d.agentId).reverse(),
+      }
+    }
+    if (s.channel !== 'delegate') return null // 非 webchat/delegate 祖先 → 丢弃
+    delegateChain.push(s)
+    key = s.parentSessionKey
+    isImmediate = false
+  }
+  return null // 链尾仍无 webchat 祖先
+}
+
+/**
+ * 把「本(嵌套)委派自己的一帧进度」重写成「挂到用户可见的**一级**委派卡上的一行带层级
+ * 前缀的**非终态**文本」。不新增任何协议字段 —— 产物仍是既有 DelegateProgressBlock。
+ *
+ *   - `runId` 复用一级委派卡的 runId(args.runId)→ 前端按 runId 把本行 append 进那张卡;
+ *   - `agentId` 保留本嵌套委派的目标 agent;
+ *   - `phase` 一律降为 'text'(**非终态**):嵌套委派的 done/error 绝不能用 done/error 帧
+ *     关掉一级卡(一级 agent 往往在子委派返回后继续跑),故 done/error 也转成文本行;
+ *   - 文本前缀 `↳ <一级名↳…↳本级名>: ` 让用户一眼区分这是「子 agent 的子委派」进度;
+ *   - 结尾补 '\n' 便于前端把连续文本子块 coalesce 成多行而不粘连。
+ *
+ * 返回 null(丢弃)的两类:
+ *   - thinking:嵌套子 agent 私有思考,不外泄(与 summarize 一致);
+ *   - text:嵌套子 agent 的原始文本增量太碎、无法逐 delta 打标(最终结果仍在 done 行给出)。
+ */
+export function toNestedDelegateProgressLine(
+  source: DelegateProgressBlock,
+  args: { runId: string; agentId: string; label: string },
+): DelegateProgressBlock | null {
+  let detail: string | undefined
+  switch (source.phase) {
+    case 'thinking':
+    case 'text':
+      return null
+    case 'done':
+      detail = source.text ? `完成:${source.text}` : '完成'
+      break
+    case 'error':
+      detail = source.text ? `失败:${source.text}` : '失败'
+      break
+    default:
+      // start / plan / tool:直接用摘要文本
+      detail = source.text
+  }
+  const trimmed = (detail ?? '').trim()
+  if (!trimmed) return null
+  return makeDelegateProgressBlock({
+    runId: args.runId,
+    agentId: args.agentId,
+    phase: 'text',
+    text: `↳ ${args.label}: ${trimmed}\n`,
+    preserveWhitespace: true,
+    maxLen: 1_200,
+  })
+}

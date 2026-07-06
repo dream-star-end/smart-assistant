@@ -312,6 +312,19 @@ export interface AgentSession {
    * webchat peerId here so nested delegate_task calls stay in the same repo.
    */
   repoSessionId?: string
+  /**
+   * 直接父会话键。仅 delegate 子会话在创建时物化(handleDelegateTask 传入已校验的
+   * 直接父 sessionKey);webchat 根会话为 undefined。用于委派进度**沿父链向上追溯**到
+   * 最近的 webchat 祖先(resolveDelegateProgressRouting)——把二级+嵌套委派的进度路由
+   * 回用户可见的一级委派卡。只增不改的父指针,使会话委派图可导航。
+   */
+  parentSessionKey?: string
+  /**
+   * 本(delegate)会话进度卡的 runId(handleDelegateTask 生成后回填)。嵌套子委派沿父链
+   * 追溯到**一级**委派会话后复用其该值作为进度帧 runId,从而把嵌套进度 append 到同一张
+   * 一级委派卡。webchat / 普通会话为 undefined。
+   */
+  progressRunId?: string
   title: string
   startedAt: number
   /** M0 engine 适配层:底座差异收口在 EngineAdapter(CCB = CcbAdapter 组合
@@ -1283,6 +1296,12 @@ export class SessionManager {
      * impersonating that parent session identity.
      */
     repoSessionId?: string
+    /**
+     * 直接父会话键(仅 delegate 子会话传入,已由 handleDelegateTask 经 _resolveDelegateParent
+     * 校验存在于内存 + channel 合法 + sourceAgent 匹配)。物化到 AgentSession.parentSessionKey,
+     * 供委派进度沿父链向上追溯 webchat 祖先。webchat/普通会话不传。
+     */
+    parentSessionKey?: string
     title?: string
     delegationDepth?: number
     /** 仅用于**新建** runner 时初始化 CLAUDE_CODE_EFFORT_LEVEL:
@@ -1366,6 +1385,8 @@ export class SessionManager {
         // different authenticated user to redirect another user's persistence.
         if (opts.userId && !existing.userId) existing.userId = opts.userId
         if (opts.repoSessionId && !existing.repoSessionId) existing.repoSessionId = opts.repoSessionId
+        if (opts.parentSessionKey && !existing.parentSessionKey)
+          existing.parentSessionKey = opts.parentSessionKey
         return existing
       }
     }
@@ -1416,6 +1437,9 @@ export class SessionManager {
       userId: opts.userId,
       repoSessionId,
       title: opts.title ?? 'New conversation',
+      // delegate 子会话的直接父指针(webchat/普通会话为 undefined)。物化父链使委派进度
+      // 可向上追溯 webchat 祖先;不影响 _sessionIdToKey / peerId 身份。
+      parentSessionKey: opts.parentSessionKey,
       startedAt: now,
       runner,
       ccbSessionId: null,

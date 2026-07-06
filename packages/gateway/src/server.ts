@@ -112,7 +112,10 @@ import { parseDocument } from './documentParser.js'
 import {
   makeDelegateProgressBlock,
   makeDelegateBlockPassthrough,
+  resolveDelegateProgressRouting,
+  toNestedDelegateProgressLine,
   type DelegateProgressBlock,
+  type DelegateProgressRouting,
 } from './delegateProgress.js'
 import {
   getDelegateTimeoutReason,
@@ -6366,23 +6369,40 @@ export class Gateway {
     }
   }
 
+  /**
+   * 解析委派进度路由:沿父链向上追溯到最近的 webchat 祖先会话(取代旧的「父非 webchat
+   * 即 null」——那会让二级+嵌套委派的进度整段丢弃,一级卡长时间无进展)。
+   *
+   * 返回 `DelegateProgressRouting`:
+   *   - `target` 与旧实现在**一级(直接 webchat 父)**场景下完全一致 → `.target` 即旧返回值;
+   *   - `nested` / `firstLevelRunId` / `ancestorAgentPath` 供 handleDelegateTask 把嵌套进度以
+   *     既有帧形态挂到用户可见的**一级**委派卡上(见 toNestedDelegateProgressLine)。
+   *
+   * 追溯纯逻辑在 resolveDelegateProgressRouting(delegateProgress.ts,可单测);本方法只做
+   * SessionManager → 追溯所需最小会话视图的适配。断链/环/超深一律返回 null(丢弃,不抛错)。
+   */
   private _resolveDelegateProgressTarget(args: {
     parentSessionKey?: unknown
     sourceAgent?: unknown
-  }): { sessionKey: string; channel: string; peerId: string; userId?: string } | null {
-    if (typeof args.parentSessionKey !== 'string' || !args.parentSessionKey) return null
-    const parent = this.sessions.getByKey(args.parentSessionKey)
-    if (!parent) return null
-    if (parent.channel !== 'webchat') return null
-    if (typeof args.sourceAgent === 'string' && args.sourceAgent && parent.agentId !== args.sourceAgent) {
-      return null
-    }
-    return {
-      sessionKey: parent.sessionKey,
-      channel: parent.channel,
-      peerId: parent.peerId,
-      userId: parent.userId,
-    }
+  }): DelegateProgressRouting | null {
+    return resolveDelegateProgressRouting({
+      parentSessionKey: args.parentSessionKey,
+      sourceAgent: args.sourceAgent,
+      maxDepth: 5,
+      getSession: (key) => {
+        const s = this.sessions.getByKey(key)
+        if (!s) return undefined
+        return {
+          sessionKey: s.sessionKey,
+          channel: s.channel,
+          peerId: s.peerId,
+          agentId: s.agentId,
+          userId: s.userId,
+          parentSessionKey: s.parentSessionKey,
+          progressRunId: s.progressRunId,
+        }
+      },
+    })
   }
 
   private _resolveDelegateParent(args: {
@@ -6551,10 +6571,15 @@ export class Gateway {
       depth,
     })
 
-    const progressTarget = this._resolveDelegateProgressTarget({
+    const progressRouting = this._resolveDelegateProgressTarget({
       parentSessionKey: parsed.parentSessionKey,
       sourceAgent,
     })
+    // 进度投递目标 = 最近的 webchat 祖先(一级时即直接 webchat 父,值与旧实现一致)。
+    const progressTarget = progressRouting?.target ?? null
+    // 嵌套(二级+):直接父是 delegate 会话 → 进度要挂到用户可见的一级委派卡,而非
+    // 另开一张卡或(旧行为)整段丢弃。
+    const nestedProgress = progressRouting?.nested === true
     const delegateParent = this._resolveDelegateParent({
       parentSessionKey: parsed.parentSessionKey,
       sourceAgent,
@@ -6571,14 +6596,34 @@ export class Gateway {
     })
 
     const progressRunId = `dlg-${Date.now().toString(36)}-${randomBytes(4).toString('hex')}`
+    // 嵌套帧复用**一级**委派卡的 runId,把二级进度 append 回用户可见的那张卡;拿不到
+    // 一级 runId(如一级未开进度)时退回本委派自身 runId → 独立进度卡兜底(仍可见,不丢)。
+    const emitProgressRunId =
+      nestedProgress && progressRouting?.firstLevelRunId
+        ? progressRouting.firstLevelRunId
+        : progressRunId
+    // 层级前缀「一级名↳…↳本级名」,给嵌套文本行打标,让用户区分「子 agent 的子委派」。
+    const nestLabel = nestedProgress
+      ? [...(progressRouting?.ancestorAgentPath ?? []), targetAgentId].join('↳')
+      : ''
     const emitProgress = (block: DelegateProgressBlock | null) => {
       if (!progressTarget || !block) return
+      // 嵌套:把本委派的原始进度帧统一重写成「挂到一级卡上的带层级前缀非终态文本行」
+      // (done/error 也降为 text,避免嵌套子委派的终态帧提前关掉一级卡)。返回 null → 丢弃。
+      const outBlock = nestedProgress
+        ? toNestedDelegateProgressLine(block, {
+            runId: emitProgressRunId,
+            agentId: targetAgentId,
+            label: nestLabel,
+          })
+        : block
+      if (!outBlock) return
       const out = {
         type: 'outbound.message' as const,
         sessionKey: progressTarget.sessionKey,
         channel: progressTarget.channel,
         peer: { id: progressTarget.peerId, kind: 'dm' as const },
-        blocks: [block as any],
+        blocks: [outBlock as any],
         isFinal: false,
         _userId: progressTarget.userId,
       }
@@ -6681,6 +6726,8 @@ export class Gateway {
         channel: 'delegate',
         peerId: sourceAgent || 'system',
         repoSessionId: progressTarget?.peerId ?? delegateParent?.repoSessionId,
+        // 物化直接父指针(已校验的父会话键),供本 delegate 的子委派沿父链向上追溯 webchat 祖先。
+        parentSessionKey: delegateParent?.sessionKey,
         title: `[delegate] ${goal.slice(0, 40)}`,
         delegationDepth: depth + 1,
         usageAttribution: {
@@ -6689,6 +6736,8 @@ export class Gateway {
           ...(parentClientSessionId ? { parentSessionId: parentClientSessionId } : {}),
         },
       })
+      // 回填本委派的进度卡 runId:子委派追溯到**一级**委派时复用它,把嵌套进度挂回同一张卡。
+      session.progressRunId = progressRunId
       if (streamProgress) {
         emitProgress(
           makeDelegateProgressBlock({
@@ -6826,15 +6875,17 @@ export class Gateway {
     // ── P2 债A — buffer this delegation as a server-authored team card ──
     //
     // Attach it to the LEADER (parent webchat) session so it drains into that
-    // session's turn-end persist (persistServerAuthoredTurn). `progressTarget`
-    // is webchat-only, matching MASTER_SINK_PERSIST_CHANNELS — a null target
-    // (nested delegate / non-webchat parent / raced-away session) degrades to
-    // client-only team cards (no regression). runId reuses the delegate
-    // progress runId so the server row's `_delegateRunId` folds onto the same
-    // local `m-*` agent-group row (local-wins in mergePreservingServerAuthored).
-    // resultSummary is truncated here at the generation point (master caps at
-    // 2KB; the frontend's own preview stays 200 chars via the local m-* row).
-    if (progressTarget) {
+    // session's turn-end persist (persistServerAuthoredTurn). Only a **first-level**
+    // delegation (direct webchat parent) durably persists a team card, matching
+    // MASTER_SINK_PERSIST_CHANNELS. A nested/嵌套 delegation (`nestedProgress`) —
+    // whose `progressTarget` now resolves to a webchat *ancestor* rather than null —
+    // must NOT buffer its own durable card: its live progress已作为文本行挂到一级卡,
+    // 用 progressRunId(≠ 一级 runId)另铸一张 server 行反而会折叠失败 → 冗余卡。故显式
+    // 用 `!nestedProgress` 保持旧「嵌套 → client-only(无回归)」语义。非嵌套(一级)时
+    // runId 复用本委派 progressRunId,server 行 `_delegateRunId` 折叠到同一张本地 `m-*`
+    // agent-group 行(mergePreservingServerAuthored 里 local-wins)。resultSummary 在生成点
+    // 截断(master 上限 2KB;前端本地 m-* 行仍保 200 字预览)。
+    if (progressTarget && !nestedProgress) {
       const status: AgentGroupStatus = timedOut ? 'timeout' : error ? 'failed' : 'ok'
       const rawSummary = error ? error : output.trim()
       const resultSummary =
