@@ -324,7 +324,7 @@ export function Landing({
           </div>
           <div className="mt-9 flex flex-col gap-1.5 border-t border-border pt-6 text-[12.5px] text-faint">
             <span>© {BRAND.year} {BRAND.company} 版权所有</span>
-            <span>{BRAND.icp} · 本站内容由 AI 生成，仅供参考</span>
+            <span>{BRAND.icp}</span>
           </div>
         </div>
       </footer>
