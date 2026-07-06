@@ -341,6 +341,120 @@ describe("persist — 历史合并纯函数", () => {
     expect(row._completed).toBe(true); // 从 server 行回填
     expect(row._resultPreview).toBe("审查通过:PASS"); // friendlyDelegateResultPreview 语义
   });
+
+  // ── 债A：server-authored 团队骨架行 按 runId 去重 ───────────────────────────
+  // server 现会带回 agent-group 骨架行(id srv-*、_source:'server'、无 childBlocks 过程树)。
+  // 去重维度是 runId(骨架 id 与本地富卡 id 天然不同,碰不到 id 维度 server-wins 覆盖)。
+  test("mergeFullServerWins(债A): server 骨架与本地富卡同 runId → local-wins,骨架被丢、childBlocks 不被吞(2c73030d 回归)", () => {
+    const localRich: ChatMessage = {
+      id: "m-group",
+      role: "agent-group",
+      text: "研究任务",
+      ts: 200,
+      _delegate: true,
+      _delegateAgentId: "coder",
+      _delegateGoal: "研究任务",
+      _delegateRunId: "run-1",
+      _completed: true,
+      _resultPreview: "本地富卡结果",
+      childBlocks: [{ kind: "text", text: "子代理过程输出" }],
+    };
+    const serverSkeleton: ChatMessage = {
+      id: "srv-group-1",
+      role: "agent-group",
+      text: "研究任务",
+      ts: 210,
+      _source: "server",
+      _delegate: true,
+      _delegateAgentId: "coder",
+      _delegateGoal: "研究任务",
+      _delegateRunId: "run-1",
+      _completed: true,
+      _delegateStatus: "ok",
+      _resultPreview: "server 骨架摘要",
+    };
+    const server = [{ ...msg("srv-a", "答"), ts: 100 }, serverSkeleton];
+    const local = [{ ...msg("srv-a", ""), ts: 100 }, localRich];
+    const merged = mergeFullServerWins(server, local);
+    // 骨架行(srv-group-1)被丢弃,本地富卡(m-group)保留
+    expect(merged.map((m) => m.id)).toEqual(["srv-a", "m-group"]);
+    const g = merged.find((m) => m.id === "m-group")!;
+    // 2c73030d:server 行绝不吞本地富卡的 childBlocks / 展示字段
+    expect(g.childBlocks?.map((b) => b.text)).toEqual(["子代理过程输出"]);
+    expect(g._resultPreview).toBe("本地富卡结果");
+  });
+
+  test("mergeFullServerWins(债A): 跨设备(本地无此团队 run)→ 采用 server 骨架行渲染", () => {
+    const serverSkeleton: ChatMessage = {
+      id: "srv-g1",
+      role: "agent-group",
+      text: "跨设备研究",
+      ts: 100,
+      _source: "server",
+      _delegate: true,
+      _delegateAgentId: "coder",
+      _delegateGoal: "跨设备研究",
+      _delegateRunId: "run-x",
+      _completed: true,
+      _delegateStatus: "ok",
+      _resultPreview: "跨设备摘要",
+    };
+    const server = [serverSkeleton];
+    const merged = mergeFullServerWins(server, []); // 本地缺席
+    expect(merged.map((m) => m.id)).toEqual(["srv-g1"]);
+    expect(merged[0]._delegateRunId).toBe("run-x");
+    expect(merged).toBe(server); // 无剔除 + 无乐观尾 → 零拷贝返回原引用
+  });
+
+  test("applyServerIncremental(债A): 增量 server 骨架与本地富卡同 runId → 丢弃骨架,富卡保留", () => {
+    const localRich: ChatMessage = {
+      id: "m-g",
+      role: "agent-group",
+      text: "x",
+      ts: 10,
+      _delegate: true,
+      _delegateRunId: "run-2",
+      _completed: true,
+      childBlocks: [{ kind: "text", text: "富卡过程" }],
+    };
+    const incoming: ChatMessage = {
+      id: "srv-g",
+      role: "agent-group",
+      text: "x",
+      ts: 12,
+      _source: "server",
+      _delegateRunId: "run-2",
+      _completed: true,
+      _delegateStatus: "ok",
+    };
+    const merged = applyServerIncremental([localRich], [incoming]);
+    expect(merged.map((m) => m.id)).toEqual(["m-g"]); // 骨架不追加
+    expect(merged[0].childBlocks?.length).toBe(1);
+  });
+
+  test("applyServerIncremental(债A): 跨设备 server 骨架(本地无同 run)→ 追加渲染", () => {
+    const localRich: ChatMessage = {
+      id: "m-g",
+      role: "agent-group",
+      text: "已有",
+      ts: 10,
+      _delegate: true,
+      _delegateRunId: "run-a",
+      _completed: true,
+    };
+    const incoming: ChatMessage = {
+      id: "srv-g2",
+      role: "agent-group",
+      text: "新 run",
+      ts: 20,
+      _source: "server",
+      _delegateRunId: "run-b",
+      _completed: true,
+      _delegateStatus: "failed",
+    };
+    const merged = applyServerIncremental([localRich], [incoming]);
+    expect(merged.map((m) => m.id)).toEqual(["m-g", "srv-g2"]);
+  });
 });
 
 describe("persist — 命名空间", () => {

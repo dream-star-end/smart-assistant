@@ -67,6 +67,7 @@
  */
 
 import { request as undiciRequest } from 'undici'
+import type { DurableAgentGroup } from '@openclaude/protocol'
 
 import { createLogger } from './logger.js'
 import type { TurnToolEntry } from './ccbMessageParser.js'
@@ -99,6 +100,13 @@ const MAX_BODY_BYTES = 256 * 1024
  *  preserves the more important invariant (assistant-never-cut). The
  *  parser-side per-tool caps still apply; only the count gate fires here. */
 const MAX_TOOLS_PER_PAYLOAD = 50
+
+/** P2 债A — mirrors master's `SCHEMA_AGENT_GROUPS_MAX_LEN`. A leader turn over
+ *  this many delegations gets its agentGroups[] dropped here (best-effort,
+ *  preserve the assistant write) rather than risking a 400 INVALID_BODY that
+ *  fatal-drops the whole payload including assistant text. Same policy as
+ *  MAX_TOOLS_PER_PAYLOAD. */
+const MAX_AGENT_GROUPS_PER_PAYLOAD = 50
 
 /** HTTP timeout per single attempt — short enough that a hung master
  *  doesn't pile up turn callbacks; long enough that a slow first SQLite
@@ -221,6 +229,17 @@ export interface V3MasterSinkWirePayload {
   /** Fix B (2026-05-25) — same per-segment treatment for thinking rows
    *  (`srv-...-tN-thinking-s${idx}`). */
   thinkingSegments?: Array<{ index: number; text: string; ts: number }>
+  /** P2 债A — completed delegations (team cards) for this leader turn. Buffered
+   *  on the parent session as delegates finish and drained with the turn-end
+   *  persist. Master writes each as a server-authored `role: 'agent-group'`
+   *  row so team structure survives cross-device / cleared cache / a missed
+   *  client PUT (the durability gap: server-authored channel previously only
+   *  carried assistant/thinking/tool). Body-cap policy (see attemptSend):
+   *  agentGroups[] is dropped AFTER tools[] and thinkingText but BEFORE the
+   *  assistant 正文 is ever sacrificed — team structure is the most valuable
+   *  non-assistant artifact (cross-device recovery is the whole point) yet
+   *  still "process/structure" that yields to the conversation text. */
+  agentGroups?: DurableAgentGroup[]
 }
 
 /**
@@ -376,40 +395,60 @@ export async function attemptSend(
       bodyObj.tools = payload.tools
     }
   }
-  let body = JSON.stringify(bodyObj)
-  let bodyBytes = Buffer.byteLength(body, 'utf8')
-  if (bodyBytes > MAX_BODY_BYTES) {
-    const hasTools = bodyObj.tools !== undefined
-    // Truncation order (most-droppable first):
-    //   1. tools[]       — durable redundancy of streaming tool rows; client
-    //                      already has the bare tool_use/result blocks from
-    //                      the live stream, so dropping the durable copy
-    //                      degrades refresh-recovery only (no live impact).
-    //   2. thinkingText  — auxiliary debug content; conversation survives.
-    //   3. else fatal    — assistant text alone over 256 KB is a CCB bug
-    //                      worth surfacing rather than silently truncating.
-    if (hasTools) {
-      log.warn('v3 sink dropped tools[] to fit body cap', {
+  if (payload.agentGroups && payload.agentGroups.length > 0) {
+    // Count cap (must precede byte cap), same rationale as tools[]: master
+    // rejects > MAX_AGENT_GROUPS_PER_PAYLOAD with 400 INVALID_BODY (fatal
+    // here → would drop assistant too). Drop agentGroups[] to preserve the
+    // assistant write; team cards degrade to client-only for this turn.
+    if (payload.agentGroups.length > MAX_AGENT_GROUPS_PER_PAYLOAD) {
+      log.warn('v3 sink dropped agentGroups[] to fit master count cap', {
         sessionId: payload.sessionId,
         turnIndex: payload.turnIndex,
-        originalBytes: bodyBytes,
-        toolCount: (payload.tools ?? []).length,
+        agentGroupCount: payload.agentGroups.length,
+        cap: MAX_AGENT_GROUPS_PER_PAYLOAD,
       })
-      delete bodyObj.tools
-      body = JSON.stringify(bodyObj)
-      bodyBytes = Buffer.byteLength(body, 'utf8')
+    } else {
+      bodyObj.agentGroups = payload.agentGroups
     }
   }
-  if (bodyBytes > MAX_BODY_BYTES) {
+  let body = JSON.stringify(bodyObj)
+  let bodyBytes = Buffer.byteLength(body, 'utf8')
+  // ── Body-cap cascade (256 KB). Drop least→most valuable, ALWAYS preserving
+  // assistant 正文:
+  //   1. tools[]        — durable redundancy of live tool rows (re-inferable).
+  //   2. thinking       — auxiliary debug content (both encodings, atomically).
+  //   3. agentGroups[]  — cross-device team structure (债A's whole point);
+  //                       most valuable non-assistant artifact, so dropped LAST
+  //                       before assistant — but "structure/process" that still
+  //                       yields to the conversation text (结构可丢过程,不可丢正文).
+  // After the cascade, if still over cap the only remaining content is
+  // assistant (or an un-droppable thinking/agentGroups-only body) → fatal.
+  const recompute = (): void => {
+    body = JSON.stringify(bodyObj)
+    bodyBytes = Buffer.byteLength(body, 'utf8')
+  }
+  // step 1: tools[]
+  if (bodyBytes > MAX_BODY_BYTES && bodyObj.tools !== undefined) {
+    log.warn('v3 sink dropped tools[] to fit body cap', {
+      sessionId: payload.sessionId,
+      turnIndex: payload.turnIndex,
+      originalBytes: bodyBytes,
+      toolCount: (payload.tools ?? []).length,
+    })
+    delete bodyObj.tools
+    recompute()
+  }
+  // step 2: thinking (both encodings). Don't drop when it's the only content
+  // left (would emit a schema-invalid empty body) — parser cap (8 KB) should
+  // make thinking-only-over-cap unreachable; log loud if it happens.
+  if (
+    bodyBytes > MAX_BODY_BYTES &&
+    (bodyObj.thinkingText !== undefined || bodyObj.thinkingSegments !== undefined)
+  ) {
     const hasAssistant =
       (bodyObj.text as string).length > 0 || bodyObj.assistantSegments !== undefined
-    const hasThinking =
-      bodyObj.thinkingText !== undefined || bodyObj.thinkingSegments !== undefined
-    if (hasAssistant && hasThinking) {
-      // Combined over cap — drop BOTH thinkingText and thinkingSegments
-      // (atomically: they describe the same thinking content in two encodings)
-      // to preserve assistant. Thinking is auxiliary debug content; the
-      // conversation can survive without it.
+    const hasAgentGroups = bodyObj.agentGroups !== undefined
+    if (hasAssistant || hasAgentGroups) {
       log.warn('v3 sink dropped thinking content to fit body cap', {
         sessionId: payload.sessionId,
         turnIndex: payload.turnIndex,
@@ -419,36 +458,44 @@ export async function attemptSend(
       })
       delete bodyObj.thinkingText
       delete bodyObj.thinkingSegments
-      body = JSON.stringify(bodyObj)
-      bodyBytes = Buffer.byteLength(body, 'utf8')
-      if (bodyBytes > MAX_BODY_BYTES) {
-        // Assistant alone still over cap — fatal. Master's contract caps at
-        // MAX_BODY_BYTES; sending invalid body would just 413 with retry.
-        // Never partial-drop assistantSegments: dropping a middle segment
-        // would let tool rows sandwich incorrectly on refresh.
-        throw new V3SinkError('assistant-only payload exceeds master body cap', 'fatal')
-      }
-    } else if (hasThinking && !hasAssistant) {
-      // Thinking-only over cap. Parser-side MAX_THINKING_BUFFER_BYTES = 8 KB
-      // should prevent this; if we hit it, log loudly because it indicates
-      // the parser cap leaked. Don't strip thinkingText/thinkingSegments —
-      // that would yield a schema-invalid body (master refines
-      // text>0 || thinkingText || assistantSegments || thinkingSegments
-      // is present).
+      recompute()
+    } else {
       log.error(
         'v3 sink thinking-only payload exceeds body cap (parser cap should have prevented this)',
-        {
-          sessionId: payload.sessionId,
-          turnIndex: payload.turnIndex,
-          bodyBytes,
-        },
+        { sessionId: payload.sessionId, turnIndex: payload.turnIndex, bodyBytes },
       )
       throw new V3SinkError('thinking-only payload exceeds master body cap', 'fatal')
-    } else {
-      // Assistant alone over cap (no thinking content to drop). Never
-      // partial-drop assistantSegments.
-      throw new V3SinkError('assistant-only payload exceeds master body cap', 'fatal')
     }
+  }
+  // step 3: agentGroups[]. Same guard: don't drop when it's the only content
+  // (schema-empty). agentGroups is bounded (≤ per-group 2KB × 50 ≈ 100KB) so
+  // agentGroups-only-over-cap should be unreachable; surface loud if hit.
+  if (bodyBytes > MAX_BODY_BYTES && bodyObj.agentGroups !== undefined) {
+    const hasAssistant =
+      (bodyObj.text as string).length > 0 || bodyObj.assistantSegments !== undefined
+    const hasThinking =
+      bodyObj.thinkingText !== undefined || bodyObj.thinkingSegments !== undefined
+    if (hasAssistant || hasThinking) {
+      log.warn('v3 sink dropped agentGroups[] to fit body cap', {
+        sessionId: payload.sessionId,
+        turnIndex: payload.turnIndex,
+        originalBytes: bodyBytes,
+        agentGroupCount: (payload.agentGroups ?? []).length,
+      })
+      delete bodyObj.agentGroups
+      recompute()
+    } else {
+      log.error(
+        'v3 sink agentGroups-only payload exceeds body cap (unexpected — bounded per-group ≤ 2KB)',
+        { sessionId: payload.sessionId, turnIndex: payload.turnIndex, bodyBytes },
+      )
+      throw new V3SinkError('agentGroups-only payload exceeds master body cap', 'fatal')
+    }
+  }
+  // step 4: assistant alone still over cap. Never partial-drop assistantSegments
+  // (dropping a middle segment would let tool rows sandwich incorrectly on refresh).
+  if (bodyBytes > MAX_BODY_BYTES) {
+    throw new V3SinkError('assistant-only payload exceeds master body cap', 'fatal')
   }
 
   const controller = new AbortController()

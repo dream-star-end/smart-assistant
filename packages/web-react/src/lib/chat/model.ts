@@ -89,6 +89,13 @@ export type ChatMessage = {
   ts: number;
   /** turn 结束/最后内容到达时刻。*/
   completedAt?: number;
+  /**
+   * 行的产出来源。`'server'` = 后端 server-authored 行(getSession/listSessions 带回的
+   * durable 快照,id 形如 `srv-*`);缺省/`'local'` = 本设备 reducer 就地产出的行。
+   * 团队卡去重按此区分:server-authored agent-group 是跨设备团队结构+终态骨架(无 childBlocks
+   * 过程树),本地富卡(m-*)同 runId 存在时 local-wins。判定统一走 isServerAuthoredRow()。
+   */
+  _source?: "server" | "local";
 
   // ── user ──
   status?: UserMsgStatus;
@@ -143,6 +150,12 @@ export type ChatMessage = {
   _duration?: number;
   _resultPreview?: string;
   _isError?: boolean;
+  /**
+   * 终态三态(server-authored 行权威):'ok' 完成 / 'failed' 失败 / 'timeout' 超时。
+   * 本地富卡只有 _isError 两态,server 骨架行额外区分超时。渲染徽记 & 团队面板计数按此。
+   * 缺省时回退 _isError('failed' 语义)。
+   */
+  _delegateStatus?: "ok" | "failed" | "timeout";
 
   // ── delegate-progress（委派进度兜底卡）──
   runId?: string;
@@ -342,4 +355,29 @@ export function rebuildIndexes(sess: ChatSession): void {
       }
     }
   }
+}
+
+/**
+ * 该行是否为后端 server-authored 行(债A 团队卡跨设备骨架)。判定单一权威:
+ * 显式 `_source === 'server'` 优先;回退到 canonical id 前缀 `srv-`(server 重写/持久化
+ * 行的既有命名惯例,见 persist.ts docstring)。团队卡去重、live progress 绑定守卫共用它,
+ * 保证「server 骨架行永不接收 live childBlocks / 永不吞本地富卡」。
+ */
+export function isServerAuthoredRow(
+  m: Pick<ChatMessage, "id" | "_source"> | null | undefined,
+): boolean {
+  if (!m) return false;
+  if (m._source === "server") return true;
+  return typeof m.id === "string" && m.id.startsWith("srv-");
+}
+
+/**
+ * agent-group 行的委派 run 标识(去重折叠键)。本地富卡写 `_delegateRunId`;server-authored
+ * 行可能只带 `runId`(durable 载荷字段)——两者取其一,容忍后端契约命名(见报告待对齐点)。
+ * 非 agent-group 行返回 undefined。
+ */
+export function agentGroupRunId(m: ChatMessage): string | undefined {
+  if (m.role !== "agent-group") return undefined;
+  const rid = m._delegateRunId || m.runId;
+  return typeof rid === "string" && rid.length > 0 ? rid : undefined;
 }

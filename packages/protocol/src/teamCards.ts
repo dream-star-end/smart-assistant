@@ -31,6 +31,12 @@ export const TEAM_CARD_CLIENT_DISPLAY_FIELDS = [
   '_delegateAgentId',
   '_delegateGoal',
   '_delegateRunId',
+  // 委派终态三态(ok/failed/timeout)。历史上前端只有 `_completed`+`_isError` 两个
+  // 布尔,timeout 与 failed 无法区分(都落 _isError=true)。server-authored 化
+  // (P2 债A)引入本字段承载完整终态,let 前端可分别渲染"超时/失败";server 行同时
+  // 仍写 _isError=(status!=='ok')兼容既有渲染读取。是 f2272c08 教训之后新增的
+  // 团队展示字段,加在此权威 → strip 白名单/客户端回填两侧自动同步。
+  '_delegateStatus',
   '_duration',
   '_resultPreview',
   '_isError',
@@ -49,3 +55,40 @@ export const TEAM_CARD_CLIENT_DISPLAY_FIELDS = [
 ] as const
 
 export type TeamCardClientDisplayField = (typeof TEAM_CARD_CLIENT_DISPLAY_FIELDS)[number]
+
+// ───────────────────────────────────────────────
+// 委派终态三态 + server-authored durable 载荷(单一权威)
+// ───────────────────────────────────────────────
+// P2 债A:团队卡(role 'agent-group')server-authored 化的 wire 契约。
+// 生成点 = gateway handleDelegateTask 收尾;经 v3MasterSink 随
+// persistServerAuthoredTurn 下发给 master;master 落库为 role 'agent-group'
+// 的 server 行,字段映射成上面的 TEAM_CARD_CLIENT_DISPLAY_FIELDS 展示名。
+//
+// 显式权衡(见 docs/plans batch2 §2.1):childBlocks 过程树不进本载荷
+// (sink body cap 256KB;live 富树仍走 delegate_progress 帧 + 本设备 IndexedDB)。
+// 跨设备/清缓存时 server 行提供"完整团队结构 + 结果摘要 + 终态",过程细节降级。
+//
+// 契约不可擅改字段语义:gateway(V3MasterSinkWirePayload.agentGroups[])与 master
+// (internalServerAuthored BodySchema,.strict())两侧同批同步。
+export const AGENT_GROUP_STATUSES = ['ok', 'failed', 'timeout'] as const
+export type AgentGroupStatus = (typeof AGENT_GROUP_STATUSES)[number]
+
+export interface DurableAgentGroup {
+  /** 委派 run 关联键(= gateway progressRunId `dlg-…`)。落库映射为行的
+   *  `_delegateRunId`,是 server 行 ↔ 本地 `m-*` agent-group 行的去重合并键
+   *  (server-wins 禁用,local 富行胜)。 */
+  runId: string
+  /** 被委派的子 agent id(落库 `_delegateAgentId`;前端经 agentDisplayName 映射,
+   *  隐藏审查员显示为"质量审查员")。 */
+  agentId: string
+  /** 委派目标文本(落库 `_delegateGoal` + 行 `text`)。 */
+  goal: string
+  /** 委派终态(落库 `_delegateStatus`;并派生 `_isError = status !== 'ok'`)。 */
+  status: AgentGroupStatus
+  /** 结果/错误摘要,生成点已截断 ≤ 2KB(落库 `_resultPreview`)。可空
+   *  (无文本输出的成功委派)。 */
+  resultSummary?: string
+  /** 委派实际完成时刻(epoch ms)。落库同时作行 `ts`(turn 内插序)与
+   *  `completedAt`(展示)。 */
+  completedAt: number
+}

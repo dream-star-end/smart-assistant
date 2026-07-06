@@ -15,6 +15,7 @@
  */
 import { TEAM_CARD_CLIENT_DISPLAY_FIELDS } from "@openclaude/protocol/teamCards";
 import type { ChatMessage } from "./chat/model";
+import { agentGroupRunId, isServerAuthoredRow } from "./chat/model";
 import { friendlyDelegateResultPreview } from "./chat/reducer";
 
 /** IndexedDB schema 版本 + 唯一对象存储名。*/
@@ -181,10 +182,19 @@ export function dbNameForUser(userId: string | null | undefined): string {
  * 其余角色（assistant/thinking/tool）乐观消息可能已被 server 以 `srv-*` 重写，中段保留
  * 会出现重复卡片，故仍只保尾部（非尾部=已被取代→丢弃）。
  * 合并后按 ts 稳定排序：user 气泡 ts < 其轮 server 助手 ts → 正确落到该轮助手之前；server
- * 本就 ts 有序、尾部乐观消息 ts 最大 → 各归其位。跨设备（本地无此会话）团队卡仍会丢——
- * 根治需团队卡 server-authored 一等公民化（已登记技术债,偿还触发=跨设备团队历史成为需求）。
+ * 本就 ts 有序、尾部乐观消息 ts 最大 → 各归其位。
+ *
+ * **债A 偿还(server-authored 团队卡)**：server 现会带回 agent-group 骨架行(id `srv-*`、
+ * `_source:'server'`、无 childBlocks),用于跨设备/清缓存场景保住团队结构+终态。去重按 runId:
+ *  - 本地富卡(m-*)同 runId 存在 → **local-wins**:丢弃 server 骨架行(它没有过程树,渲染会
+ *    退化),本地富卡经下方 team-owned 保留逻辑存活 → 富卡不被吞、childBlocks 不丢(2c73030d);
+ *  - 本地缺席(跨设备/清缓存)→ 采用 server 骨架行,渲染成无 childBlocks 的骨架卡。
+ * server 骨架行与本地行按 id 天然不同(srv-* vs m-*),故 id 维度的 server-wins 覆盖路径
+ * 碰不到它们;唯一的去重维度是 runId,收口在这里 + normalizeDelegateCards(reducer)。
  */
 export function mergeFullServerWins(server: ChatMessage[], local: ChatMessage[]): ChatMessage[] {
+  // 债A：本地富卡拥有的 run → 丢弃 server 同 run 骨架行(local-wins,保住 childBlocks)。
+  server = dropServerTeamSkeletonsOwnedLocally(server, local);
   const localById = new Map<string, ChatMessage>();
   for (const m of local) if (m?.id) localById.set(m.id, m);
   const serverMerged = server.map((m) => mergeLocalTeamDisplayFields(m, m?.id ? localById.get(m.id) : undefined));
@@ -220,6 +230,9 @@ export function applyServerIncremental(
   incoming: ChatMessage[],
 ): ChatMessage[] {
   if (!incoming.length) return local;
+  // 债A：增量带回的 server 团队骨架行,若本地富卡已拥有同 run → 丢弃(local-wins,同 full 合并)。
+  incoming = dropServerTeamSkeletonsOwnedLocally(incoming, local);
+  if (!incoming.length) return local;
   const byId = new Map<string, ChatMessage>();
   for (const m of incoming) if (m?.id) byId.set(m.id, m);
   const merged = local.map((m) => (m?.id && byId.has(m.id) ? mergeLocalTeamDisplayFields(byId.get(m.id)!, m) : m));
@@ -231,6 +244,35 @@ export function applyServerIncremental(
 
 function isTeamOwnedRole(role: ChatMessage["role"] | undefined): boolean {
   return role === "agent-group" || role === "delegate-progress";
+}
+
+/** 本地**富卡**(非 server-authored)agent-group 行拥有的 runId 集合(债A 去重键)。 */
+function collectLocalRichAgentGroupRunIds(local: ChatMessage[]): Set<string> {
+  const runIds = new Set<string>();
+  for (const m of local) {
+    if (m?.role === "agent-group" && !isServerAuthoredRow(m)) {
+      const rid = agentGroupRunId(m);
+      if (rid) runIds.add(rid);
+    }
+  }
+  return runIds;
+}
+
+/**
+ * 债A 去重:从 `rows` 中剔除「本地富卡已拥有同 runId」的 server-authored agent-group 骨架行。
+ * 只针对 server 骨架(srv-* 或 _source:'server' 的 agent-group),不碰本地富卡,也不碰同 id 覆盖路径
+ * (骨架 id 与本地富卡 id 天然不同,唯一去重维度是 runId)。无剔除时**返回原引用**,保住零拷贝
+ * 语义(mergeFullServerWins 的 `.toBe(server)` / applyServerIncremental 空增量短路)。
+ */
+function dropServerTeamSkeletonsOwnedLocally(rows: ChatMessage[], local: ChatMessage[]): ChatMessage[] {
+  const localRunIds = collectLocalRichAgentGroupRunIds(local);
+  if (localRunIds.size === 0) return rows;
+  const kept = rows.filter((m) => {
+    if (m?.role !== "agent-group" || !isServerAuthoredRow(m)) return true;
+    const rid = agentGroupRunId(m);
+    return !(rid && localRunIds.has(rid));
+  });
+  return kept.length === rows.length ? rows : kept;
 }
 
 function nonEmptyString(v: unknown): v is string {

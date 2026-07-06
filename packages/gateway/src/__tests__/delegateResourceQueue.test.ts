@@ -81,6 +81,9 @@ function makeGateway(): any {
       onEvent({ kind: 'block', block: { kind: 'text', text: '子任务完成' } })
       onEvent({ kind: 'final', meta: { cost: 0, inputTokens: 1, outputTokens: 1, turn: 1 } })
     },
+    // P2 债A — handleDelegateTask 收尾把团队卡 buffer 到父会话;此测试不验团队卡,
+    // 提供 no-op 桩即可(真实 SessionManager 有此方法)。
+    bufferPendingAgentGroup: () => true,
   }
   gw.delivered = [] as any[]
   gw.deliver = (out: any) => {

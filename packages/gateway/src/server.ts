@@ -33,6 +33,7 @@ import {
   type OutboundMessage,
   type OutboundTurnStatus,
   type Peer,
+  type AgentGroupStatus,
   newTraceId,
   parseTraceIdCandidate,
   STATIC_KEY_INBOUND_MODEL_IDS,
@@ -6812,6 +6813,32 @@ export class Gateway {
       output: output.trim(),
       error: error || undefined,
     }))
+
+    // ── P2 债A — buffer this delegation as a server-authored team card ──
+    //
+    // Attach it to the LEADER (parent webchat) session so it drains into that
+    // session's turn-end persist (persistServerAuthoredTurn). `progressTarget`
+    // is webchat-only, matching MASTER_SINK_PERSIST_CHANNELS — a null target
+    // (nested delegate / non-webchat parent / raced-away session) degrades to
+    // client-only team cards (no regression). runId reuses the delegate
+    // progress runId so the server row's `_delegateRunId` folds onto the same
+    // local `m-*` agent-group row (local-wins in mergePreservingServerAuthored).
+    // resultSummary is truncated here at the generation point (master caps at
+    // 2KB; the frontend's own preview stays 200 chars via the local m-* row).
+    if (progressTarget) {
+      const status: AgentGroupStatus = timedOut ? 'timeout' : error ? 'failed' : 'ok'
+      const rawSummary = error ? error : output.trim()
+      const resultSummary =
+        rawSummary.length > 2000 ? `${rawSummary.slice(0, 2000)}…` : rawSummary
+      this.sessions.bufferPendingAgentGroup(progressTarget.sessionKey, {
+        runId: progressRunId,
+        agentId: targetAgentId,
+        goal,
+        status,
+        ...(resultSummary.length > 0 ? { resultSummary } : {}),
+        completedAt: Date.now(),
+      })
+    }
 
     this.sendJson(res, 200, {
       ok: !error,

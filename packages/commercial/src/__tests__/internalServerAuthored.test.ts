@@ -2250,3 +2250,206 @@ describe("internalServerAuthored handler — tool durability", () => {
     assert.equal(sdCalls.length, 3, "every assistant segment write emits its own metric");
   });
 });
+
+// ── P2 债A — agent-group (team card) durability ─────────────────────────────
+describe("internalServerAuthored handler — agent-group durability (P2 债A)", () => {
+  type Call = [V3SinkPersistOutcome, V3SinkPersistRole | undefined];
+  function captureMetricRich(): { calls: Call[]; metric: (o: V3SinkPersistOutcome, r?: V3SinkPersistRole) => void } {
+    const calls: Call[] = [];
+    return { calls, metric: (o, r) => calls.push([o, r]) };
+  }
+  function authed(body: string) {
+    return makeReq({ body, auth: `Bearer ${VALID_TOKEN}` });
+  }
+  function ag(over: Partial<{
+    runId: string; agentId: string; goal: string;
+    status: "ok" | "failed" | "timeout"; resultSummary: string; completedAt: number;
+  }> = {}): Record<string, unknown> {
+    return {
+      runId: over.runId ?? "dlg-abc",
+      agentId: over.agentId ?? "coding-assistant",
+      goal: over.goal ?? "重构模块",
+      status: over.status ?? "ok",
+      completedAt: over.completedAt ?? 1720000000000,
+      ...(over.resultSummary !== undefined ? { resultSummary: over.resultSummary } : {}),
+    };
+  }
+  /** Recording storage capturing full agent-group display fields. */
+  function recStore(): {
+    storage: ServerAuthoredStorage;
+    rows: Array<Record<string, unknown>>;
+    setAgentGroupResult: (runId: string, r: Awaited<ReturnType<ServerAuthoredStorage["appendServerAuthoredMessage"]>>) => void;
+    setAgentGroupThrow: (runId: string, e: Error) => void;
+  } {
+    const rows: Array<Record<string, unknown>> = [];
+    const agOverrides = new Map<string, Awaited<ReturnType<ServerAuthoredStorage["appendServerAuthoredMessage"]>>>();
+    const agThrowers = new Map<string, Error>();
+    const store: ServerAuthoredStorage = {
+      async appendServerAuthoredMessage(_s, _u, msg) {
+        if (msg.role === "agent-group") {
+          const rid = String(msg._delegateRunId ?? "");
+          const t = agThrowers.get(rid);
+          if (t) throw t;
+        }
+        rows.push({ ...(msg as unknown as Record<string, unknown>) });
+        if (msg.role === "agent-group") {
+          return agOverrides.get(String(msg._delegateRunId ?? "")) ?? { applied: true };
+        }
+        return { applied: true };
+      },
+      async appendServerAuthoredMessageForRequest(_r, s, u, msg) {
+        const r = await store.appendServerAuthoredMessage(s, u, msg);
+        return r.applied ? { applied: true } : { applied: false, reason: r.reason ?? "malformed" };
+      },
+      async appendServerAuthoredMessageDrainByUser(s, u, msg) {
+        const r = await store.appendServerAuthoredMessage(s, u, msg);
+        return r.applied ? { applied: true } : { applied: false, reason: r.reason ?? "malformed" };
+      },
+      async drainDelegateCostForClientSession() { return { merged: "0", drained: 0 }; },
+    };
+    return {
+      storage: store,
+      rows,
+      setAgentGroupResult(rid, r) { agOverrides.set(rid, r); },
+      setAgentGroupThrow(rid, e) { agThrowers.set(rid, e); },
+    };
+  }
+  function handler(rec: ReturnType<typeof recStore>, m: ReturnType<typeof captureMetricRich>) {
+    return makeServerAuthoredHandler({
+      identityRepo: makeRepoFor(VALID_TOKEN, VALID_HOST, VALID_IP),
+      storage: rec.storage,
+      metric: m.metric,
+    });
+  }
+
+  test("ok: writes an agent-group row with mapped display fields; assistant still decides HTTP 200", async () => {
+    const rec = recStore();
+    const m = captureMetricRich();
+    const { res, rec: resRec } = makeRes();
+    await handler(rec, m)(authed(JSON.stringify({
+      sessionId: "sess12345", agentId: "main", turnIndex: 2, status: "completed",
+      text: "队长总结", requestId: "req-12345abc",
+      agentGroups: [ag({ runId: "dlg-1", agentId: "coding-assistant", goal: "重构", resultSummary: "完成", completedAt: 1720000000500 })],
+    })), res, CTX);
+    assert.equal(resRec.status, 200);
+    const agr = rec.rows.find((r) => r.role === "agent-group");
+    assert.ok(agr, "an agent-group row was written");
+    assert.equal(agr!.id, "srv-sess12345-main-t2-agentgroup-dlg-1");
+    assert.equal(agr!.ts, 1720000000500, "ts = completedAt (turn插序)");
+    assert.equal(agr!._delegate, true);
+    assert.equal(agr!._delegateRunId, "dlg-1", "runId → _delegateRunId (dedupe key)");
+    assert.equal(agr!._delegateAgentId, "coding-assistant");
+    assert.equal(agr!._delegateGoal, "重构");
+    assert.equal(agr!.text, "重构", "text carries goal");
+    assert.equal(agr!._delegateStatus, "ok");
+    assert.equal(agr!._isError, false, "ok → _isError false");
+    assert.equal(agr!._resultPreview, "完成");
+    assert.equal(agr!._completed, true);
+    // agent-group metric emitted; assistant metric also emitted (HTTP decider).
+    assert.ok(m.calls.some((c) => c[0] === "ok" && c[1] === "agent-group"));
+  });
+
+  test("failed status → _isError true, _delegateStatus 'failed'", async () => {
+    const rec = recStore();
+    const m = captureMetricRich();
+    const { res, rec: resRec } = makeRes();
+    await handler(rec, m)(authed(JSON.stringify({
+      sessionId: "sess12345", agentId: "main", turnIndex: 1, status: "completed",
+      text: "总结", requestId: "req-12345abc",
+      agentGroups: [ag({ runId: "dlg-f", status: "failed", resultSummary: "子任务报错" })],
+    })), res, CTX);
+    assert.equal(resRec.status, 200);
+    const agr = rec.rows.find((r) => r.role === "agent-group")!;
+    assert.equal(agr._delegateStatus, "failed");
+    assert.equal(agr._isError, true);
+    assert.equal(agr._resultPreview, "子任务报错");
+  });
+
+  test("timeout status → _isError true, _delegateStatus 'timeout' (distinguishable from failed)", async () => {
+    const rec = recStore();
+    const m = captureMetricRich();
+    const { res, rec: resRec } = makeRes();
+    await handler(rec, m)(authed(JSON.stringify({
+      sessionId: "sess12345", agentId: "main", turnIndex: 1, status: "completed",
+      text: "总结", requestId: "req-12345abc",
+      agentGroups: [ag({ runId: "dlg-t", status: "timeout", resultSummary: "超时" })],
+    })), res, CTX);
+    assert.equal(resRec.status, 200);
+    const agr = rec.rows.find((r) => r.role === "agent-group")!;
+    assert.equal(agr._delegateStatus, "timeout");
+    assert.equal(agr._isError, true);
+  });
+
+  test("agentGroups-only turn (crash flush: no assistant/thinking/tools) persists + 200", async () => {
+    // Leader crashed right after delegating; refine + Branch A must accept it.
+    const rec = recStore();
+    const m = captureMetricRich();
+    const { res, rec: resRec } = makeRes();
+    await handler(rec, m)(authed(JSON.stringify({
+      sessionId: "sess12345", agentId: "main", turnIndex: 3, status: "crashed",
+      text: "",
+      agentGroups: [ag({ runId: "dlg-only", completedAt: 1720000009000 })],
+    })), res, CTX);
+    assert.equal(resRec.status, 200, "first agent-group outcome decides HTTP");
+    const agr = rec.rows.find((r) => r.role === "agent-group")!;
+    assert.equal(agr.id, "srv-sess12345-main-t3-agentgroup-dlg-only");
+    assert.ok(m.calls.some((c) => c[0] === "ok" && c[1] === "agent-group"));
+  });
+
+  test("multiple delegations → one agent-group row each, ts = each completedAt", async () => {
+    const rec = recStore();
+    const m = captureMetricRich();
+    const { res, rec: resRec } = makeRes();
+    await handler(rec, m)(authed(JSON.stringify({
+      sessionId: "sess12345", agentId: "main", turnIndex: 1, status: "completed",
+      text: "总结", requestId: "req-12345abc",
+      agentGroups: [
+        ag({ runId: "dlg-a", completedAt: 1720000001000 }),
+        ag({ runId: "dlg-b", status: "failed", completedAt: 1720000002000 }),
+      ],
+    })), res, CTX);
+    assert.equal(resRec.status, 200);
+    const agRows = rec.rows.filter((r) => r.role === "agent-group");
+    assert.equal(agRows.length, 2);
+    assert.deepEqual(agRows.map((r) => r.ts).sort(), [1720000001000, 1720000002000]);
+  });
+
+  test("agentGroups is best-effort under assistant path: a thrown agent-group write doesn't change HTTP 200", async () => {
+    const rec = recStore();
+    rec.setAgentGroupThrow("dlg-x", new Error("storage boom"));
+    const m = captureMetricRich();
+    const { res, rec: resRec } = makeRes();
+    await handler(rec, m)(authed(JSON.stringify({
+      sessionId: "sess12345", agentId: "main", turnIndex: 1, status: "completed",
+      text: "队长答案", requestId: "req-12345abc",
+      agentGroups: [ag({ runId: "dlg-x" })],
+    })), res, CTX);
+    assert.equal(resRec.status, 200, "assistant write is authoritative; agent-group throw is best-effort");
+    assert.ok(m.calls.some((c) => c[0] === "error" && c[1] === "agent-group"));
+  });
+
+  test("schema rejects unknown field in an agentGroups entry (.strict())", async () => {
+    const rec = recStore();
+    const m = captureMetricRich();
+    const { res, rec: resRec } = makeRes();
+    const bad = { ...ag(), wat: "nope" };
+    await handler(rec, m)(authed(JSON.stringify({
+      sessionId: "sess12345", agentId: "main", turnIndex: 1, status: "completed",
+      text: "answer", requestId: "req-12345abc", agentGroups: [bad],
+    })), res, CTX);
+    assert.equal(resRec.status, 400);
+    assert.equal(rec.rows.length, 0);
+  });
+
+  test("schema rejects invalid agentGroups status enum", async () => {
+    const rec = recStore();
+    const m = captureMetricRich();
+    const { res, rec: resRec } = makeRes();
+    await handler(rec, m)(authed(JSON.stringify({
+      sessionId: "sess12345", agentId: "main", turnIndex: 1, status: "completed",
+      text: "answer", requestId: "req-12345abc",
+      agentGroups: [{ ...ag(), status: "cancelled" }],
+    })), res, CTX);
+    assert.equal(resRec.status, 400);
+  });
+})

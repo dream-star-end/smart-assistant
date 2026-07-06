@@ -944,15 +944,27 @@ export class CcbMessageParser {
           const pending = this.pendingToolUses.get(useId)
           if (pending) this.pendingToolUses.delete(useId)
           // V3 v7.1 — exclude the `Agent` tool from the durable server-authored
-          // snapshot. The web client renders Agent tools as `role: 'agent-group'`
-          // cards owning a `childBlocks` tree (subagent text / thinking /
-          // tool_use), not a flat `role: 'tool'` row. Persisting them as
-          // `srv-*-tool-*` rows server-side would (a) duplicate the agent
-          // card after refresh (server row coexists with client `m-* agent-group`),
-          // (b) fight back through `_localMessageSupersedes` (role mismatch
-          // → server wins, blowing away the childBlocks tree). Agent card
-          // durability is the client PUT path's responsibility (the full
-          // session including `agent-group` rows lands in `client_sessions.messages`).
+          // TOOL snapshot. The web client renders Agent tools as
+          // `role: 'agent-group'` cards owning a `childBlocks` tree (subagent
+          // text / thinking / tool_use), not a flat `role: 'tool'` row.
+          // Persisting them as `srv-*-tool-*` rows server-side would (a)
+          // duplicate the agent card after refresh (server tool row coexists
+          // with client `m-* agent-group`), (b) fight back through the id-level
+          // takeover (role mismatch → server wins, blowing away the childBlocks
+          // tree — the 2c73030d incident). This exclusion STAYS.
+          //
+          // P2 债A (team-card server-authored化) does NOT change this: team
+          // cards get their own dedicated durable channel — a `role:
+          // 'agent-group'` server row written by master from the
+          // `V3MasterSinkWirePayload.agentGroups[]`载荷 (generated at
+          // handleDelegateTask 收尾, buffered on the leader session, drained by
+          // persistServerAuthoredTurn). That row uses a distinct
+          // `srv-*-agentgroup-${runId}` id and merges **local-wins** by
+          // `_delegateRunId` (storage mergePreservingServerAuthored), so it
+          // never collides with, nor swallows the childBlocks of, the client
+          // `m-*` agent-group row. Routing Agent tools through THIS tool
+          // snapshot would reintroduce the exact 2c73030d double-card / tree-
+          // swallow fault, hence the exclusion is intentional and permanent.
           // Regex match is case-insensitive to mirror the web side's
           // `/^Agent$/i.test(...)` discriminator and stay aligned if CCB
           // ever varies the casing.

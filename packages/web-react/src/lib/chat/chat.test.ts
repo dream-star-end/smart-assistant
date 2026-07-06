@@ -1072,6 +1072,116 @@ describe("applyOutboundMessage (§3/§7/§9/§11)", () => {
   });
 });
 
+describe("normalizeDelegateCards — server-authored 团队行折叠(债A)", () => {
+  test("本地富卡与 server 骨架同 runId → 丢弃 server 骨架(local-wins,保住 childBlocks)", () => {
+    const s = sess();
+    addMessage(s, "agent-group", "研究", {
+      id: "m-g",
+      ts: 1,
+      _delegate: true,
+      _delegateAgentId: "coder",
+      _delegateGoal: "研究",
+      _delegateRunId: "run-1",
+      _completed: true,
+      childBlocks: [{ kind: "text", text: "过程输出" }],
+    });
+    addMessage(s, "agent-group", "研究", {
+      id: "srv-g",
+      ts: 2,
+      _source: "server",
+      _delegate: true,
+      _delegateRunId: "run-1",
+      _completed: true,
+      _delegateStatus: "ok",
+      _resultPreview: "server 摘要",
+    });
+
+    normalizeDelegateCards(s);
+
+    const groups = s.messages.filter((m) => m.role === "agent-group");
+    expect(groups.map((g) => g.id)).toEqual(["m-g"]);
+    expect(groups[0].childBlocks?.length).toBe(1);
+  });
+
+  test("多个 server 骨架共享同一 runId → 只留首个(去重)", () => {
+    const s = sess();
+    addMessage(s, "agent-group", "A", { id: "srv-a", ts: 1, _source: "server", _delegateRunId: "run-9", _completed: true, _delegateStatus: "ok" });
+    addMessage(s, "agent-group", "A", { id: "srv-b", ts: 2, _source: "server", _delegateRunId: "run-9", _completed: true, _delegateStatus: "ok" });
+
+    normalizeDelegateCards(s);
+
+    const groups = s.messages.filter((m) => m.role === "agent-group");
+    expect(groups.map((g) => g.id)).toEqual(["srv-a"]);
+  });
+
+  test("跨设备仅 server 骨架(无本地富卡)→ 保留渲染", () => {
+    const s = sess();
+    addMessage(s, "agent-group", "研究", {
+      id: "srv-g",
+      ts: 1,
+      _source: "server",
+      _delegate: true,
+      _delegateRunId: "run-x",
+      _completed: true,
+      _delegateStatus: "ok",
+      _resultPreview: "摘要",
+    });
+
+    normalizeDelegateCards(s);
+
+    const groups = s.messages.filter((m) => m.role === "agent-group");
+    expect(groups.map((g) => g.id)).toEqual(["srv-g"]);
+  });
+
+  test("live delegate_progress 绑回本地富卡,不落到同 runId 的 server 骨架(债A 守卫)", () => {
+    const s = sess();
+    // 本地富卡:delegate tool_use 产出,尚无 _delegateRunId。
+    addMessage(s, "agent-group", "审查草稿", {
+      id: "m-g",
+      ts: 1,
+      _delegate: true,
+      _delegateAgentId: "hidden-reviewer",
+      _delegateGoal: "审查草稿",
+      childBlocks: [],
+    });
+    // server 骨架:同 runId,已带 _delegateRunId(跨设备终态)。
+    addMessage(s, "agent-group", "审查草稿", {
+      id: "srv-g",
+      ts: 2,
+      _source: "server",
+      _delegate: true,
+      _delegateAgentId: "hidden-reviewer",
+      _delegateGoal: "审查草稿",
+      _delegateRunId: "run-1",
+      _completed: true,
+      _delegateStatus: "ok",
+    });
+
+    applyOutboundMessage(
+      s,
+      msgFrame({
+        frameSeq: 1,
+        blocks: [{ kind: "delegate_progress", runId: "run-1", agentId: "hidden-reviewer", goal: "审查草稿", phase: "start" }],
+      }),
+    );
+    applyOutboundMessage(
+      s,
+      msgFrame({
+        frameSeq: 2,
+        blocks: [{ kind: "delegate_progress", runId: "run-1", agentId: "hidden-reviewer", phase: "text", text: "审查进行中" }],
+      }),
+    );
+
+    const local = s.messages.find((m) => m.id === "m-g")!;
+    const server = s.messages.find((m) => m.id === "srv-g")!;
+    expect(local._delegateRunId).toBe("run-1"); // 绑到本地富卡
+    expect(local.childBlocks?.some((b) => b.kind === "text" && b.text === "审查进行中")).toBe(true);
+    expect(server.childBlocks ?? []).toHaveLength(0); // server 骨架不接收 live childBlocks
+    // 不新建独立 delegate-progress 兜底卡
+    expect(s.messages.some((m) => m.role === "delegate-progress")).toBe(false);
+  });
+});
+
 describe("applyOutboundError double-frame suppression (§11)", () => {
   test("[error] text isFinal at suppressed seq does not add a second bubble", () => {
     const s = sess();

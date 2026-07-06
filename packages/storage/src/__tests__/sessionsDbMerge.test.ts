@@ -848,3 +848,141 @@ describe('appendServerAuthoredPure', () => {
     assert.equal(existing[1].text, 'streaming', 'placeholder unchanged in place')
   })
 })
+
+// ── P2 债A — agent-group (team card) local-wins dedupe ───────────────────
+//
+// Unlike assistant/thinking/tool (server-wins), agent-group rows merge
+// local-wins by runId: when a client `m-*` row exists for the same
+// `_delegateRunId`, the server `srv-*-agentgroup-*` row is DROPPED and the
+// client row (with its rich `childBlocks` subagent tree) is preserved. The
+// server row only renders when the client row is absent (cross-device /
+// cleared cache / client PUT never landed). This is the storage-side guard
+// against the 2c73030d incident (server row swallowing local childBlocks).
+describe('mergePreservingServerAuthored — agent-group local-wins (P2 债A)', () => {
+  const srvAgentGroup = (
+    id: string,
+    ts: number,
+    runId: string,
+    extra: Record<string, unknown> = {},
+  ): Msg => ({
+    id,
+    role: 'agent-group',
+    text: 'goal',
+    ts,
+    _source: 'server',
+    _delegate: true,
+    _delegateRunId: runId,
+    _delegateAgentId: 'coding-assistant',
+    _delegateGoal: 'goal',
+    _delegateStatus: 'ok',
+    _isError: false,
+    _completed: true,
+    ...extra,
+  })
+  const cliAgentGroup = (
+    id: string,
+    ts: number,
+    runId: string,
+    extra: Record<string, unknown> = {},
+  ): Msg => ({
+    id,
+    role: 'agent-group',
+    text: 'goal',
+    ts,
+    _delegate: true,
+    _delegateRunId: runId,
+    _delegateAgentId: 'coding-assistant',
+    ...extra,
+  })
+
+  it('renders the server row when no local agent-group row exists (cross-device recovery)', () => {
+    const server: Msg[] = [
+      cli('u1', 100),
+      srv('srv-p-main-t0', 300, 'leader answer'),
+      srvAgentGroup('srv-p-main-t0-agentgroup-dlg1', 250, 'dlg1'),
+    ]
+    // Client has the user turn + its own assistant, but NOT the team card.
+    const client: Msg[] = [cli('u1', 100)]
+    const out = mergePreservingServerAuthored(server, client) as Msg[]
+    const ag = out.filter((m) => m.role === 'agent-group')
+    assert.equal(ag.length, 1, 'server team card kept when no local row')
+    assert.equal(ag[0].id, 'srv-p-main-t0-agentgroup-dlg1')
+    assert.equal(ag[0]._source, 'server')
+  })
+
+  it('2c73030d regression: server row is dropped and local childBlocks preserved when runIds match', () => {
+    const childBlocks = [
+      { kind: 'text', text: 'subagent reasoning result' },
+      { kind: 'tool_use', toolName: 'Read', blockId: 'b1', _completed: true },
+    ]
+    const local = cliAgentGroup('m-123-abc', 240, 'dlg1', {
+      childBlocks,
+      _resultPreview: 'short preview',
+    })
+    const server: Msg[] = [
+      cli('u1', 100),
+      srvAgentGroup('srv-p-main-t0-agentgroup-dlg1', 250, 'dlg1', {
+        _resultPreview: 'server-side 2KB summary',
+      }),
+    ]
+    const client: Msg[] = [cli('u1', 100), local]
+    const out = mergePreservingServerAuthored(server, client) as Msg[]
+    const ag = out.filter((m) => m.role === 'agent-group')
+    assert.equal(ag.length, 1, 'exactly one team card after dedupe (no double)')
+    assert.equal(ag[0].id, 'm-123-abc', 'LOCAL row wins (not the srv-* server row)')
+    assert.notEqual(ag[0]._source, 'server', 'kept row is the client row')
+    assert.deepEqual(
+      ag[0].childBlocks,
+      childBlocks,
+      'local childBlocks subagent tree preserved (never swallowed by server row)',
+    )
+  })
+
+  it('keeps both when runIds differ (distinct delegations)', () => {
+    const local = cliAgentGroup('m-1', 240, 'dlgA', { childBlocks: [{ kind: 'text', text: 'A' }] })
+    const server: Msg[] = [
+      cli('u1', 100),
+      srvAgentGroup('srv-p-main-t0-agentgroup-dlgB', 250, 'dlgB'),
+    ]
+    const client: Msg[] = [cli('u1', 100), local]
+    const out = mergePreservingServerAuthored(server, client) as Msg[]
+    const ag = out.filter((m) => m.role === 'agent-group')
+    assert.equal(ag.length, 2, 'different runIds → both team cards kept')
+    const ids = ag.map((m) => m.id).sort()
+    assert.deepEqual(ids, ['m-1', 'srv-p-main-t0-agentgroup-dlgB'])
+  })
+
+  it('mixed fan-out: matched server rows dropped, unmatched server rows kept', () => {
+    const localA = cliAgentGroup('m-A', 230, 'dlgA', { childBlocks: [{ kind: 'text', text: 'A' }] })
+    const localB = cliAgentGroup('m-B', 235, 'dlgB', { childBlocks: [{ kind: 'text', text: 'B' }] })
+    const server: Msg[] = [
+      cli('u1', 100),
+      srvAgentGroup('srv-agentgroup-dlgA', 250, 'dlgA'), // matches localA → drop
+      srvAgentGroup('srv-agentgroup-dlgC', 255, 'dlgC'), // no local → keep
+    ]
+    const client: Msg[] = [cli('u1', 100), localA, localB]
+    const out = mergePreservingServerAuthored(server, client) as Msg[]
+    const ag = out.filter((m) => m.role === 'agent-group')
+    const ids = ag.map((m) => m.id).sort()
+    assert.deepEqual(
+      ids,
+      ['m-A', 'm-B', 'srv-agentgroup-dlgC'],
+      'local A/B kept, server dlgA dropped (matched), server dlgC kept (cross-device)',
+    )
+  })
+
+  it('does NOT drop a same-runId server row across a turn boundary (different turn group)', () => {
+    // Local card in turn 1; a server card with the same runId string but in
+    // turn 2 (after a user message) must not be folded — dedupe is per turn.
+    const local = cliAgentGroup('m-1', 150, 'dlg1', { childBlocks: [{ kind: 'text', text: 'x' }] })
+    const server: Msg[] = [
+      cli('u1', 100),
+      cli('u2', 300),
+      srvAgentGroup('srv-agentgroup-dlg1-t2', 350, 'dlg1'),
+    ]
+    const client: Msg[] = [cli('u1', 100), local, cli('u2', 300)]
+    const out = mergePreservingServerAuthored(server, client) as Msg[]
+    const ag = out.filter((m) => m.role === 'agent-group')
+    assert.equal(ag.length, 2, 'same runId in a different turn group is not folded')
+  })
+})
