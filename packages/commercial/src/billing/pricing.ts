@@ -54,6 +54,13 @@ export interface ModelPricing {
    * - 修改后**仅对新 spawn 生效**;运行中的 CCB/codex subprocess 不会被换文案
    */
   extra_system_prompt: string | null;
+  /**
+   * 0105 引入。per-model 默认思考深度 —— proxy 在 client 未显式带 output_config.effort 时
+   * 合并注入(applyModelDefaultEffort,http/proxy/shared.ts)。NULL = 不注入。
+   * 合法值 low/medium/high/xhigh/max(DB CHECK);对被 upstream 整体 strip output_config 的
+   * capability-zero 静态模型无效果,admin PATCH 侧已按 protocol 适用性拒配(admin/modelOps.ts)。
+   */
+  default_effort: string | null;
   updated_at: Date;
 }
 
@@ -86,6 +93,7 @@ type RawRow = {
   sort_order: number;
   visibility: string;
   extra_system_prompt: string | null;
+  default_effort: string | null;
   updated_at: Date;
 };
 
@@ -104,6 +112,7 @@ function rowToPricing(r: RawRow): ModelPricing {
     sort_order: r.sort_order,
     visibility: vis,
     extra_system_prompt: r.extra_system_prompt,
+    default_effort: r.default_effort,
     updated_at: r.updated_at,
   };
 }
@@ -217,7 +226,7 @@ export class PricingCache {
               cache_read_per_mtok::text  AS cache_read_per_mtok,
               cache_write_per_mtok::text AS cache_write_per_mtok,
               multiplier::text           AS multiplier,
-              enabled, sort_order, visibility, extra_system_prompt, updated_at
+              enabled, sort_order, visibility, extra_system_prompt, default_effort, updated_at
          FROM model_pricing`,
     );
     const next = new Map<string, ModelPricing>();

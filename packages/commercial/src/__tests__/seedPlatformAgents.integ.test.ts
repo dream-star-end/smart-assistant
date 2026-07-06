@@ -333,10 +333,10 @@ describe('seedPlatformGeneralAgents (integ) — 办公助手 + 编程助手', ()
     assert.deepEqual(
       await listCurrentAgentDefaults(GENERAL_SLUGS),
       {
-        'coding-assistant': { version: '1.0.0', model: 'glm-5.2' },
+        'coding-assistant': { version: '1.0.1', model: 'kimi-k2.7-code' },
         'office-assistant': { version: '1.0.1', model: 'MiniMax-M3' },
       },
-      '当前 approved 版本应体现不同助手的默认模型(办公 MiniMax,编程 GLM)',
+      '当前 approved 版本应体现不同助手的默认模型(办公 MiniMax,编程 Kimi K2.7 Code)',
     )
 
     // kind 隔离:通用 agent 不进 skill 目录。

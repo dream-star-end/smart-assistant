@@ -77,6 +77,7 @@ import {
   stripNonTextContentBlocks,
   errMessageShort,
   errSummary,
+  applyModelDefaultEffort,
 } from "./shared.js";
 
 import { runUpstreamRoundTrip } from "./core.js";
@@ -289,6 +290,10 @@ export function makeAnthropicProxyHandler(
         }
         throw err;
       }
+
+      // 5b') per-model 默认思考深度注入(0105 model_pricing.default_effort,admin 运维页可配)。
+      // client 显式 effort 优先、合并不覆盖;详见 shared.applyModelDefaultEffort 注释。
+      applyModelDefaultEffort(body, pricing.default_effort);
 
       // 5c) Upstream route 选择 + 配置早拒绝(2026-05-18 Phase 3 §3.4 切出)。
       //
