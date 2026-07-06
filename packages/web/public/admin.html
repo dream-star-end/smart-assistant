@@ -2018,6 +2018,98 @@
         body.admin-shell-body .admin-context-header h1 { font-size: 24px; }
       }
 
+      /* ══════════ 模型与服务商 (model-ops,原定价 tab) ══════════ */
+      .modelops-providers {
+        display: grid;
+        grid-template-columns: repeat(auto-fill, minmax(330px, 1fr));
+        gap: var(--s-4);
+      }
+      /* 服务商卡片复用 .chart-card 外观,但内容是信息行不是大图,收掉 320px 最小高 */
+      .modelops-providers .chart-card { min-height: 0; gap: var(--s-2); }
+      .modelops-endpoint {
+        font-family: var(--font-mono);
+        font-size: 11.5px;
+        color: var(--muted);
+        word-break: break-all;
+      }
+      .modelops-provider-row {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        flex-wrap: wrap;
+        font-size: 12.5px;
+      }
+      .modelops-provider-row > label {
+        color: var(--muted);
+        font-size: 12px;
+        flex: 0 0 auto;
+      }
+      .modelops-provider-row input,
+      .modelops-table input,
+      .modelops-table select {
+        background: var(--bg-subtle);
+        border: 1px solid var(--border);
+        border-radius: var(--r-sm);
+        color: var(--text);
+        padding: 5px 8px;
+        font-size: 12.5px;
+      }
+      .modelops-provider-row input[type="text"] { flex: 1 1 140px; min-width: 0; }
+      .modelops-provider-row input:focus,
+      .modelops-table input:focus,
+      .modelops-table select:focus {
+        outline: none;
+        border-color: var(--accent);
+      }
+      .modelops-spark { position: relative; height: 40px; }
+      .modelops-spark canvas { max-width: 100%; }
+      .modelops-spark-empty {
+        height: 40px;
+        display: flex;
+        align-items: center;
+        color: var(--muted);
+        font-size: 12px;
+      }
+      /* 12 列表格:压缩单元格留白,数字输入右对齐等宽字体 */
+      .modelops-table th, .modelops-table td { padding: 8px 10px; }
+      .modelops-table input[type="number"] {
+        width: 88px;
+        text-align: right;
+        font-family: var(--font-mono);
+      }
+      .modelops-table input[data-field="display_name"] { width: 120px; }
+      .modelops-table input[data-field="multiplier"] {
+        width: 64px;
+        text-align: right;
+        font-family: var(--font-mono);
+      }
+      .modelops-table select { max-width: 150px; }
+      .modelops-table td > button {
+        padding: 5px 12px;
+        border: 1px solid var(--border);
+        background: transparent;
+        color: var(--text-soft);
+        border-radius: var(--r-sm);
+        cursor: pointer;
+        font-size: 12px;
+        font-weight: 500;
+        font-family: inherit;
+        min-height: 28px;
+        transition: all var(--t-fast);
+        white-space: nowrap;
+      }
+      .modelops-table td > button:hover:not(:disabled) {
+        border-color: var(--accent);
+        color: var(--accent);
+        background: var(--accent-soft);
+      }
+      .modelops-table td > button.mo-on {
+        color: var(--ok);
+        border-color: color-mix(in srgb, var(--ok) 45%, transparent);
+        background: var(--ok-soft);
+      }
+      .modelops-table td > button.mo-off { color: var(--muted); }
+
       /* Reduced motion */
       @media (prefers-reduced-motion: reduce) {
         *, *::before, *::after {
@@ -2060,7 +2152,7 @@
       <span class="tab-group-label" role="presentation" aria-hidden="true">财务与商业</span>
       <button data-tab="ledger" role="tab" aria-selected="false">积分流水</button>
       <button data-tab="orders" role="tab" aria-selected="false">订单</button>
-      <button data-tab="pricing" role="tab" aria-selected="false">定价</button>
+      <button data-tab="pricing" role="tab" aria-selected="false">模型与服务商</button>
       <button data-tab="plans" role="tab" aria-selected="false">充值套餐</button>
       <button data-tab="modelGrants" role="tab" aria-selected="false">用户模型授权</button>
       <span class="tab-group-label" role="presentation" aria-hidden="true">用户触达</span>
@@ -2117,6 +2209,6 @@
     <script src="/vendor/qrcode.min.js"></script>
     <!-- Chart.js (MIT) 用于 dashboard 折线/柱/饼图。UMD bundle,挂到 window.Chart。 -->
     <script src="/vendor/chart.umd.min.js"></script>
-    <script type="module" src="/modules/admin.js?v=7e6fc8e6"></script>
+    <script type="module" src="/modules/admin.js?v=0c63cd08"></script>
   </body>
 </html>

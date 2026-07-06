@@ -17,10 +17,10 @@
 //   - 任何 list 接口 4xx → 提示 + 跳转 /;不要在 admin 页面里"匿名展示空列表"
 //   - PATCH/DELETE 操作前必须有 confirm 提示
 
-import { _clearStoredAccessToken, state } from './state.js?v=7e6fc8e6'
-import { htmlSafeEscape } from './dom.js?v=7e6fc8e6'
-import { apiGet, apiJson, apiText, apiFetch, authHeaders, onAuthExpired, silentRefresh } from './api.js?v=7e6fc8e6'
-import { lineChart, barChart, donutChart, destroyChart, fmt as cfmt } from './charts.js?v=7e6fc8e6'
+import { _clearStoredAccessToken, state } from './state.js?v=0c63cd08'
+import { htmlSafeEscape } from './dom.js?v=0c63cd08'
+import { apiGet, apiJson, apiText, apiFetch, authHeaders, onAuthExpired, silentRefresh } from './api.js?v=0c63cd08'
+import { lineChart, barChart, donutChart, destroyChart, fmt as cfmt } from './charts.js?v=0c63cd08'
 
 // 与后端 packages/commercial/src/admin/ledger.ts 的 LEDGER_REASONS 枚举严格同步。
 // 新增/删除 reason 必须两端同步改,否则 ledger tab filter 会把错误值发给后端
@@ -419,7 +419,7 @@ const TABS = {
   hosts: renderHostsTab,
   ledger: renderLedgerTab,
   orders: renderOrdersTab,
-  pricing: renderPricingTab,
+  pricing: renderModelOpsTab,
   plans: renderPlansTab,
   modelGrants: renderModelGrantsTab,
   feedback: renderFeedbackTab,
@@ -442,7 +442,7 @@ const ADMIN_TAB_META = {
   hosts: { group: '运行资源', label: '虚机池', desc: '磁盘、容量和调度状态', key: '07', chips: [{ label: '水位', value: 'Disk / Mem / Load' }, { label: '调度', value: 'slots / drain' }, { label: '维护', value: 'bootstrap / 到期' }] },
   ledger: { group: '财务与商业', label: '积分流水', desc: '账务明细和 CSV 导出', key: '08', chips: [{ label: '过滤', value: 'reason / 时间' }, { label: '方向', value: '扣减 / 入账' }, { label: '导出', value: 'CSV 审计' }] },
   orders: { group: '财务与商业', label: '订单', desc: '支付状态和回调详情', key: '09', chips: [{ label: '状态', value: 'paid / pending' }, { label: '金额', value: '订单 / 积分' }, { label: '异常', value: '回调详情' }] },
-  pricing: { group: '财务与商业', label: '定价', desc: '模型倍率和启用策略', key: '10', chips: [{ label: '成本', value: 'input / output' }, { label: '缓存', value: 'read / write' }, { label: '策略', value: 'multiplier' }] },
+  pricing: { group: '财务与商业', label: '模型与服务商', desc: '模型定价、可见性与服务商健康', key: '10', chips: [{ label: '价格', value: '分/Mtok 行内改' }, { label: '策略', value: '可见性 / 上下线' }, { label: '服务商', value: 'key / 订阅 / 延迟' }] },
   plans: { group: '财务与商业', label: '充值套餐', desc: '金额、积分和排序', key: '11', chips: [{ label: '金额', value: 'CNY' }, { label: '权益', value: 'credits' }, { label: '展示', value: 'sort / active' }] },
   modelGrants: { group: '财务与商业', label: '用户模型授权', desc: '按用户放行特殊模型', key: '12', chips: [{ label: '用户', value: 'email / uid' }, { label: '模型', value: 'admin only' }, { label: '动作', value: 'grant / revoke' }] },
   feedback: { group: '用户触达', label: '反馈', desc: '用户问题、优先级和确认', key: '13', chips: [{ label: '队列', value: 'open / acked' }, { label: '上下文', value: '用户详情' }, { label: '动作', value: '确认处理' }] },
@@ -619,6 +619,9 @@ const TAB_CLEANUPS = {
   },
   health() {
     _destroyHealthCharts()
+  },
+  pricing() {
+    _destroyModelOpsCharts()
   },
   ledger() {
     _destroyLedgerCharts()
@@ -4534,91 +4537,485 @@ async function openOrderDetailModal(orderNo) {
   $('o-close')?.addEventListener('click', closeModal)
 }
 
-// ─── Tab: Pricing ──────────────────────────────────────────────────
+// ─── Tab: 模型与服务商 (model-ops,原「定价」tab 原地升级) ─────────
+//
+// 一次 GET /api/admin/model-ops 拉齐两块数据:
+//   providers[] → 上半服务商卡片(key 配置 / 订阅到期 / 探测延迟 sparkline)
+//   models[]   → 下半模型行内编辑表(定价 / 倍率 / 可见性 / 思考深度 / 上下线)
+// 写路径:
+//   PATCH /api/admin/pricing/:model_id — 只发被修改字段 + if_match_updated_at
+//     (乐观锁 = GET 拿到的 updated_at 原样带上;409 = 页面数据过期,提示刷新)
+//   PUT   /api/admin/providers/:id — {subscription_expires_at, notes, display_name}
+//     全量替换语义:display_name 本页不提供编辑,透传原值防被清空。
+// 保存成功后做局部刷新:重拉 model-ops 只替换该行/卡片 DOM,不整页重渲染,
+// 避免冲掉其他行未保存的编辑(事件委托绑在容器上,替换后无需重绑)。
 
-async function renderPricingTab() {
-  const data = await apiGet('/api/admin/pricing')
-  const rows = data?.rows ?? []
-  view().innerHTML = `
-    <div class="panel">
-      <h2>模型定价 <small>共 ${rows.length} 个</small></h2>
-      ${rows.length === 0
-        ? '<div class="empty">无定价</div>'
-        : `
-        <table class="data">
-          <thead>
-            <tr><th>model_id</th><th>显示名</th><th>input/Mtok</th>
-                <th>output/Mtok</th><th>cache_read</th><th>cache_write</th>
-                <th>multiplier</th><th>启用</th><th class="actions">操作</th></tr>
-          </thead>
-          <tbody>
-            ${rows.map((p) => `
-              <tr>
-                <td class="mono">${escapeHtml(p.model_id)}</td>
-                <td>${escapeHtml(p.display_name || '')}</td>
-                <td class="num">${fmtCents(p.input_per_mtok)}</td>
-                <td class="num">${fmtCents(p.output_per_mtok)}</td>
-                <td class="num">${fmtCents(p.cache_read_per_mtok)}</td>
-                <td class="num">${fmtCents(p.cache_write_per_mtok)}</td>
-                <td class="num">×${escapeHtml(p.multiplier)}</td>
-                <td>${p.enabled ? '<span class="badge ok">on</span>' : '<span class="badge muted">off</span>'}</td>
-                <td class="actions">
-                  <button data-act="edit-pricing" data-id="${escapeHtml(p.model_id)}"
-                          data-mult="${escapeHtml(p.multiplier)}"
-                          data-enabled="${p.enabled ? '1' : '0'}"
-                          data-extra="${escapeHtml(p.extra_system_prompt ?? '')}">编辑</button>
-                </td>
-              </tr>`).join('')}
-          </tbody>
-        </table>`}
-    </div>
-  `
-  for (const b of view().querySelectorAll('button[data-act="edit-pricing"]')) {
-    b.addEventListener('click', () =>
-      openEditPricingModal(b.dataset.id, b.dataset.mult, b.dataset.enabled === '1', b.dataset.extra ?? ''))
-  }
+const MODEL_OPS_STATE = {
+  renderSeq: 0,
+  // provider id → 原生 Chart 实例。sparkline 需要逐点着色(失败点红)+ 全隐轴,
+  // charts.js 的 lineChart 不支持,这里直接 new window.Chart 并自管销毁
+  // (charts.js 的 destroyChart 只认自己 registry 里的实例)。
+  sparklines: new Map(),
+  models: new Map(),     // model_id → 服务端原始行(dirty diff + if_match 基准)
+  providers: new Map(),  // provider id → 服务端原始行
 }
 
-function openEditPricingModal(modelId, multiplier, enabled, extraSystemPrompt) {
+function _destroyModelOpsCharts() {
+  for (const c of MODEL_OPS_STATE.sparklines.values()) { try { c.destroy() } catch {} }
+  MODEL_OPS_STATE.sparklines = new Map()
+}
+
+// 价格四列:字段名 + 中文标签(单位统一:分/Mtok)
+const MODEL_OPS_PRICE_FIELDS = [
+  ['input_per_mtok', '输入价'],
+  ['output_per_mtok', '输出价'],
+  ['cache_read_per_mtok', '缓存读'],
+  ['cache_write_per_mtok', '缓存写'],
+]
+const MODEL_OPS_VISIBILITY = [
+  ['public', 'public(所有人)'],
+  ['admin', 'admin(仅超管)'],
+  ['hidden', 'hidden(隐藏)'],
+]
+
+async function renderModelOpsTab() {
+  const mySeq = ++MODEL_OPS_STATE.renderSeq
+  _destroyModelOpsCharts()
+  let data
+  try {
+    data = await apiGet('/api/admin/model-ops')
+  } catch (e) {
+    if (mySeq !== MODEL_OPS_STATE.renderSeq || _currentTab !== 'pricing') return
+    showError(`加载模型与服务商失败: ${e.message}`, e)
+    return
+  }
+  // 过期保护:await 期间用户可能切走 tab / 又触发一次 render(idiom 同 health)
+  if (mySeq !== MODEL_OPS_STATE.renderSeq || _currentTab !== 'pricing') return
+  const providers = Array.isArray(data?.providers) ? data.providers : []
+  const models = Array.isArray(data?.models) ? data.models : []
+  MODEL_OPS_STATE.providers = new Map(providers.map((p) => [p.id, p]))
+  MODEL_OPS_STATE.models = new Map(models.map((m) => [m.model_id, m]))
+
+  view().innerHTML = `
+    <div class="panel">
+      <h2>服务商 <small>共 ${providers.length} 家 · key / 订阅 / 探测延迟</small></h2>
+      ${providers.length === 0
+        ? '<div class="empty">无服务商</div>'
+        : `<div class="modelops-providers" id="mo-providers">${providers.map(_renderProviderCard).join('')}</div>`}
+    </div>
+    <div class="panel">
+      <h2>模型 <small>共 ${models.length} 个 · 行内编辑,逐行保存</small></h2>
+      <div class="toolbar">
+        <button class="btn" id="mo-refresh">刷新</button>
+        <span style="color:var(--muted);font-size:12px">价格单位:分/百万token;上下线即时生效(NOTIFY 热加载)</span>
+      </div>
+      ${models.length === 0
+        ? '<div class="empty">无模型</div>'
+        : `<div class="table-scroll">
+            <table class="data modelops-table">
+              <thead>
+                <tr><th>模型ID</th><th>显示名</th><th>服务商</th>
+                    <th title="分/Mtok">输入价</th><th title="分/Mtok">输出价</th>
+                    <th title="分/Mtok">缓存读</th><th title="分/Mtok">缓存写</th>
+                    <th>multiplier</th><th>思考深度</th><th>可见性</th><th>状态</th>
+                    <th class="actions">操作</th></tr>
+              </thead>
+              <tbody id="mo-models">${models.map(_renderModelRow).join('')}</tbody>
+            </table>
+          </div>`}
+    </div>
+  `
+  $('mo-refresh')?.addEventListener('click', applyHash)
+  // 事件委托绑在容器上:局部刷新替换行/卡片 DOM 后无需重绑
+  $('mo-providers')?.addEventListener('click', _onProviderGridClick)
+  $('mo-models')?.addEventListener('click', _onModelTableClick)
+  for (const p of providers) _drawProviderSparkline(p)
+}
+
+// ── 服务商卡片 ──
+
+function _renderProviderCard(p) {
+  const keyBadge = p.keyConfigured
+    ? '<span class="badge ok">已配置</span>'
+    : '<span class="badge danger">缺 key</span>'
+  const egressChip = p.egress === 'proxy'
+    ? '<span class="chip chip-ok">proxy</span>'
+    : `<span class="chip chip-muted">${escapeHtml(p.egress || 'direct')}</span>`
+  // 延迟区:codex 等 probeEnabled=false 的服务商不做直连探测
+  let latencyHtml
+  if (p.probeEnabled === false) {
+    latencyHtml = '<span class="badge muted">不探测(经账号代理)</span>'
+  } else if (p.latest) {
+    const l = p.latest
+    const cls = l.ok ? 'ok' : 'danger'
+    const title = l.ok ? '' : ` title="${escapeHtml(l.error || `HTTP ${l.status_code ?? '?'}`)}"`
+    latencyHtml = `<span class="badge ${cls}"${title}>${escapeHtml(String(l.latency_ms ?? '—'))}ms</span>
+      <small style="color:var(--muted)">${escapeHtml(fmtRelative(l.probed_at))}</small>`
+  } else {
+    latencyHtml = '<span class="badge muted">未探测</span>'
+  }
+  const samples = Array.isArray(p.samples) ? p.samples : []
+  const sparkHtml = p.probeEnabled === false ? ''
+    : samples.length === 0
+      ? '<div class="modelops-spark-empty">暂无探测样本</div>'
+      : `<div class="modelops-spark"><canvas id="mo-spark-${escapeHtml(p.id)}"></canvas></div>`
+  return `
+    <div class="chart-card" data-provider-id="${escapeHtml(p.id)}">
+      <div class="chart-card-head">
+        <h3>${escapeHtml(p.display_name || p.id)}
+          <span class="chip chip-muted" style="font-family:var(--font-mono)">${escapeHtml(p.id)}</span></h3>
+        ${keyBadge}
+      </div>
+      <div class="modelops-provider-row">
+        <span class="modelops-endpoint">${escapeHtml(p.endpoint || '—')}</span>${egressChip}
+      </div>
+      <div class="modelops-provider-row"><label>延迟</label>${latencyHtml}</div>
+      ${sparkHtml}
+      <div class="modelops-provider-row">
+        <label>订阅到期</label>
+        <input type="date" data-field="sub"
+               value="${escapeHtml(_isoToLocalDateInput(p.subscription_expires_at))}" />
+        ${_subCountdownBadge(p.subscription_expires_at)}
+      </div>
+      <div class="modelops-provider-row">
+        <label>备注</label>
+        <input type="text" data-field="notes" maxlength="500"
+               placeholder="账号归属 / 续费渠道等" value="${escapeHtml(p.notes ?? '')}" />
+        <button class="btn" data-act="save-provider">保存</button>
+      </div>
+    </div>
+  `
+}
+
+/** ISO → date input 的本地日期 "yyyy-mm-dd"(订阅到期按本地日期显示/编辑) */
+function _isoToLocalDateInput(iso) {
+  if (!iso) return ''
+  const d = new Date(iso)
+  if (Number.isNaN(d.getTime())) return ''
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
+}
+
+/** 订阅到期倒计时 badge:<7天 danger / <30天 warn / 其余 muted;null=长期 */
+function _subCountdownBadge(iso) {
+  if (!iso) return '<span class="badge muted">长期/未登记</span>'
+  const t = new Date(iso).getTime()
+  if (Number.isNaN(t)) return '<span class="badge muted">—</span>'
+  const days = Math.ceil((t - Date.now()) / 86400000)
+  if (days <= 0) return '<span class="badge danger">已到期</span>'
+  const cls = days < 7 ? 'danger' : days < 30 ? 'warn' : 'muted'
+  return `<span class="badge ${cls}">${days}天后到期</span>`
+}
+
+// 迷你延迟趋势:无轴 line,失败点标红。样本 ≤48 条升序(后端契约)。
+function _drawProviderSparkline(p) {
+  if (!p || p.probeEnabled === false) return
+  const samples = Array.isArray(p.samples) ? p.samples : []
+  if (samples.length === 0) return
+  const canvas = document.getElementById(`mo-spark-${p.id}`)
+  if (!canvas || typeof window.Chart !== 'function') return
+  const old = MODEL_OPS_STATE.sparklines.get(p.id)
+  if (old) { try { old.destroy() } catch {} MODEL_OPS_STATE.sparklines.delete(p.id) }
+  const css = (name, fb) =>
+    getComputedStyle(document.documentElement).getPropertyValue(name).trim() || fb
+  const accent = css('--accent', '#d97757')
+  const danger = css('--danger', '#e06c6c')
+  const chart = new window.Chart(canvas, {
+    type: 'line',
+    data: {
+      labels: samples.map((s) => `${fmtDate(s.probed_at)}${s.ok ? '' : ' · fail'}`),
+      datasets: [{
+        // 失败样本可能没有 latency_ms:置 null 走 spanGaps 断点,不硬造数值
+        data: samples.map((s) => (typeof s.latency_ms === 'number' ? s.latency_ms : null)),
+        borderColor: accent,
+        borderWidth: 1.5,
+        backgroundColor: 'transparent',
+        pointRadius: samples.map((s) => (s.ok ? 0 : 2.5)),
+        pointHoverRadius: 3,
+        pointBackgroundColor: samples.map((s) => (s.ok ? accent : danger)),
+        pointBorderColor: samples.map((s) => (s.ok ? accent : danger)),
+        tension: 0.3,
+        spanGaps: true,
+        fill: false,
+      }],
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      animation: false,
+      plugins: {
+        legend: { display: false },
+        tooltip: { callbacks: { label: (ctx) => (ctx.parsed.y == null ? '失败' : `${ctx.parsed.y} ms`) } },
+      },
+      scales: { x: { display: false }, y: { display: false } },
+    },
+  })
+  MODEL_OPS_STATE.sparklines.set(p.id, chart)
+}
+
+function _onProviderGridClick(e) {
+  const btn = e.target.closest('button[data-act="save-provider"]')
+  if (!btn) return
+  const card = btn.closest('[data-provider-id]')
+  if (card) _saveProvider(card.dataset.providerId, card, btn)
+}
+
+async function _saveProvider(id, card, btn) {
+  const orig = MODEL_OPS_STATE.providers.get(id)
+  if (!orig) { toast('卡片数据缺失,请刷新', 'danger'); return }
+  const dateVal = card.querySelector('input[data-field="sub"]')?.value || ''
+  const notesRaw = (card.querySelector('input[data-field="notes"]')?.value ?? '').trim()
+  // 订阅到期:日期没改 → 原 ISO 原样回传(PUT 全量语义),避免把原时刻"本地化"漂移;
+  // 改了 → 取本地当天 23:59:59(到期语义 = 当天仍可用)
+  let subIso
+  if (dateVal === _isoToLocalDateInput(orig.subscription_expires_at)) {
+    subIso = orig.subscription_expires_at ?? null
+  } else if (dateVal === '') {
+    subIso = null
+  } else {
+    const d = new Date(`${dateVal}T23:59:59`)
+    if (Number.isNaN(d.getTime())) { toast('订阅到期日期无效', 'danger'); return }
+    subIso = d.toISOString()
+  }
+  await withBtnLoading(btn, async () => {
+    try {
+      await apiJson('PUT', `/api/admin/providers/${encodeURIComponent(id)}`, {
+        subscription_expires_at: subIso,
+        notes: notesRaw === '' ? null : notesRaw,
+        // display_name 本页不编辑:透传原值,防 PUT 全量替换把它清掉
+        display_name: orig.display_name ?? null,
+      })
+      toast(`${orig.display_name || id} 已保存`)
+      await _refreshProviderCard(id)
+    } catch (e) {
+      toast(`保存失败: ${e.message}`, 'danger', toastOptsFromError(e))
+    }
+  })
+}
+
+// 局部刷新:重拉 model-ops 只替换目标卡片,其余区域(含模型行未保存编辑)不动。
+// 目标已消失 / DOM 找不到时退化为整 tab 重渲染。
+async function _refreshProviderCard(id) {
+  let data
+  try {
+    data = await apiGet('/api/admin/model-ops')
+  } catch (e) {
+    toast(`刷新失败: ${e.message}`, 'danger', toastOptsFromError(e))
+    return
+  }
+  if (_currentTab !== 'pricing') return
+  const fresh = (data?.providers ?? []).find((p) => p.id === id)
+  const card = Array.from(view().querySelectorAll('[data-provider-id]'))
+    .find((el) => el.dataset.providerId === id)
+  if (!fresh || !card) { applyHash(); return }
+  MODEL_OPS_STATE.providers.set(id, fresh)
+  const old = MODEL_OPS_STATE.sparklines.get(id)
+  if (old) { try { old.destroy() } catch {} MODEL_OPS_STATE.sparklines.delete(id) }
+  card.outerHTML = _renderProviderCard(fresh)
+  _drawProviderSparkline(fresh)
+}
+
+// ── 模型行内编辑表 ──
+
+function _renderModelRow(m) {
+  const eff = m.effort || {}
+  const effApplicable = eff.applicable !== false
+  const allowed = Array.isArray(eff.allowed) ? eff.allowed : []
+  // default_effort 有值但不在 allowed(历史残留)也要展示出来,
+  // 避免"看着是未设,一保存被静默清掉"
+  const effValues = (m.default_effort && !allowed.includes(m.default_effort))
+    ? [...allowed, m.default_effort]
+    : allowed
+  const effSelect = effApplicable
+    ? `<select data-field="default_effort">
+        <option value="">未设</option>
+        ${effValues.map((v) => `<option value="${escapeHtml(v)}" ${m.default_effort === v ? 'selected' : ''}>${escapeHtml(v)}</option>`).join('')}
+      </select>`
+    : '<select data-field="default_effort" disabled title="该模型不支持档位"><option selected>不适用</option></select>'
+  const visSelect = `<select data-field="visibility">
+      ${MODEL_OPS_VISIBILITY.map(([v, label]) => `<option value="${v}" ${m.visibility === v ? 'selected' : ''}>${label}</option>`).join('')}
+    </select>`
+  const priceCells = MODEL_OPS_PRICE_FIELDS.map(([f]) => `
+    <td class="num"><input type="number" min="0" step="1" data-field="${f}"
+        value="${escapeHtml(String(m[f] ?? 0))}" /></td>`).join('')
+  const toggleBtn = m.enabled
+    ? '<button data-act="toggle-enabled" class="mo-on" title="点击下线">上线中</button>'
+    : '<button data-act="toggle-enabled" class="mo-off" title="点击上线">已下线</button>'
+  return `
+    <tr data-model-id="${escapeHtml(m.model_id)}">
+      <td class="mono">${escapeHtml(m.model_id)}</td>
+      <td><input type="text" data-field="display_name" maxlength="120"
+                 value="${escapeHtml(m.display_name ?? '')}" placeholder="—" /></td>
+      <td><span class="chip chip-muted" style="font-family:var(--font-mono)">${escapeHtml(m.provider?.id || '—')}</span></td>
+      ${priceCells}
+      <td class="num"><input type="text" data-field="multiplier"
+                 value="${escapeHtml(String(m.multiplier ?? ''))}" /></td>
+      <td>${effSelect}</td>
+      <td>${visSelect}</td>
+      <td>${toggleBtn}</td>
+      <td class="actions">
+        <button data-act="edit-extra"
+                title="extra_system_prompt 行为补丁${m.extra_system_prompt ? '(已设置)' : ''}">${m.extra_system_prompt ? '补丁 ●' : '补丁'}</button>
+        <button data-act="save-model">保存</button>
+      </td>
+    </tr>
+  `
+}
+
+function _onModelTableClick(e) {
+  const btn = e.target.closest('button[data-act]')
+  if (!btn) return
+  const tr = btn.closest('tr[data-model-id]')
+  const modelId = tr?.dataset.modelId
+  if (!modelId) return
+  const act = btn.dataset.act
+  if (act === 'save-model') _saveModelRow(modelId, tr, btn)
+  else if (act === 'toggle-enabled') _toggleModelEnabled(modelId, btn)
+  else if (act === 'edit-extra') _openExtraPromptModal(modelId)
+}
+
+async function _saveModelRow(modelId, tr, btn) {
+  const orig = MODEL_OPS_STATE.models.get(modelId)
+  if (!orig) { toast('行数据缺失,请刷新', 'danger'); return }
+  const read = (f) => tr.querySelector(`[data-field="${f}"]`)
+  const patch = {}
+  const priceChanges = []
+  for (const [f, label] of MODEL_OPS_PRICE_FIELDS) {
+    const raw = (read(f)?.value ?? '').trim()
+    if (!/^\d{1,12}$/.test(raw)) { toast(`${label}必须是非负整数(分/Mtok)`, 'danger'); return }
+    const v = Number(raw)
+    const from = Number(orig[f] ?? 0)
+    if (v !== from) { patch[f] = v; priceChanges.push({ label, from, to: v }) }
+  }
+  const mult = (read('multiplier')?.value ?? '').trim()
+  if (!/^\d+(\.\d{1,3})?$/.test(mult)) { toast('multiplier 格式不对(如 2.000)', 'danger'); return }
+  if (mult !== String(orig.multiplier ?? '')) patch.multiplier = mult
+  const dn = (read('display_name')?.value ?? '').trim()
+  if (dn !== String(orig.display_name ?? '').trim()) patch.display_name = dn === '' ? null : dn
+  const vis = read('visibility')?.value
+  if (vis && vis !== orig.visibility) patch.visibility = vis
+  const effEl = read('default_effort')
+  if (effEl && !effEl.disabled) {
+    const effVal = effEl.value === '' ? null : effEl.value
+    if (effVal !== (orig.default_effort ?? null)) patch.default_effort = effVal
+  }
+  if (Object.keys(patch).length === 0) { toast('没有改动'); return }
+  // 价格改动必须显式确认:计费立即生效,防手滑
+  if (priceChanges.length > 0) {
+    const ok = await _confirmPriceChanges(orig, priceChanges)
+    if (!ok) return
+  }
+  patch.if_match_updated_at = orig.updated_at
+  await withBtnLoading(btn, async () => {
+    try {
+      await apiJson('PATCH', `/api/admin/pricing/${encodeURIComponent(modelId)}`, patch)
+      toast(`${modelId} 已保存`)
+      await _refreshModelRow(modelId)
+    } catch (e) {
+      if (e.status === 409) toast('数据已被他人修改,请刷新', 'danger', toastOptsFromError(e))
+      else toast(`保存失败: ${e.message}`, 'danger', toastOptsFromError(e))
+    }
+  })
+}
+
+// 价格改动确认弹窗:逐项列 旧→新(分/Mtok)。resolve(false) 覆盖 Esc/点背景关闭。
+function _confirmPriceChanges(m, changes) {
+  return new Promise((resolve) => {
+    openModal(`
+      <h3>确认价格改动 · ${escapeHtml(m.display_name || m.model_id)}</h3>
+      <table class="data" style="margin:12px 0">
+        <thead><tr><th>项</th><th class="num">旧(分/Mtok)</th><th class="num">新(分/Mtok)</th></tr></thead>
+        <tbody>
+          ${changes.map((c) => `
+            <tr><td>${escapeHtml(c.label)}</td>
+                <td class="num mono">${escapeHtml(String(c.from))}</td>
+                <td class="num mono"><strong>${escapeHtml(String(c.to))}</strong></td></tr>`).join('')}
+        </tbody>
+      </table>
+      <div style="color:var(--warn);font-size:12.5px;margin-bottom:8px">保存后计费立即生效,请核对每 Mtok 分值。</div>
+      <div class="form-actions">
+        <button id="mo-price-cancel">取消</button>
+        <button class="btn-primary" id="mo-price-ok">确认保存</button>
+      </div>
+    `)
+    _modalCloseHook = () => resolve(false)
+    const finish = (v) => { _modalCloseHook = null; closeModal(); resolve(v) }
+    $('mo-price-ok')?.addEventListener('click', () => finish(true))
+    $('mo-price-cancel')?.addEventListener('click', () => finish(false))
+  })
+}
+
+async function _toggleModelEnabled(modelId, btn) {
+  const orig = MODEL_OPS_STATE.models.get(modelId)
+  if (!orig) { toast('行数据缺失,请刷新', 'danger'); return }
+  const next = !orig.enabled
+  if (!next && !window.confirm(`确认下线 ${orig.display_name || modelId}?现网用户立即不可选`)) return
+  await withBtnLoading(btn, async () => {
+    try {
+      await apiJson('PATCH', `/api/admin/pricing/${encodeURIComponent(modelId)}`,
+        { enabled: next, if_match_updated_at: orig.updated_at })
+      toast(next ? `${modelId} 已上线` : `${modelId} 已下线`)
+      await _refreshModelRow(modelId)
+    } catch (e) {
+      if (e.status === 409) toast('数据已被他人修改,请刷新', 'danger', toastOptsFromError(e))
+      else toast(`操作失败: ${e.message}`, 'danger', toastOptsFromError(e))
+    }
+  })
+}
+
+// extra_system_prompt 是长文本,不占表格列:行内「补丁」按钮进 modal 单独编辑。
+// 语义沿用旧定价 modal:trim 后空 → 显式发 null(清空);非空 → 原文(后端再 trim)。
+function _openExtraPromptModal(modelId) {
+  const orig = MODEL_OPS_STATE.models.get(modelId)
+  if (!orig) { toast('行数据缺失,请刷新', 'danger'); return }
   openModal(`
-    <h3>编辑定价 · ${escapeHtml(modelId)}</h3>
-    <div class="form-row">
-      <label>multiplier(decimal,例如 2.000)</label>
-      <input type="text" id="p-mult" value="${escapeHtml(multiplier)}" />
-    </div>
-    <div class="form-row">
-      <label><input type="checkbox" id="p-enabled" ${enabled ? 'checked' : ''} /> 启用</label>
-    </div>
+    <h3>行为补丁 · ${escapeHtml(modelId)}</h3>
     <div class="form-row">
       <label>extra_system_prompt(per-model 行为补丁)</label>
-      <textarea id="p-extra" rows="4" maxlength="4096"
-                placeholder="留空=不注入。例:完成一个步骤后,不要 yield,继续推进至全部目标完成">${escapeHtml(extraSystemPrompt)}</textarea>
+      <textarea id="mo-extra" rows="5" maxlength="4096"
+                placeholder="留空=不注入。例:完成一个步骤后,不要 yield,继续推进至全部目标完成">${escapeHtml(orig.extra_system_prompt ?? '')}</textarea>
       <small class="muted">作为 system prompt 注入到 extra-prompt.md 末尾,与 persona/tools/research 冲突时以后置优先级为准。修改仅对<b>新 spawn</b>的 CCB/codex 生效,运行中的会话不会被换文案。上限 4096 字。</small>
     </div>
     <div class="form-actions">
-      <button id="p-cancel">取消</button>
-      <button class="btn-primary" id="p-ok">保存</button>
+      <button id="mo-extra-cancel">取消</button>
+      <button class="btn-primary" id="mo-extra-ok">保存</button>
     </div>
   `)
-  $('p-cancel').addEventListener('click', closeModal)
-  $('p-ok').addEventListener('click', async (ev) => {
-    const m = $('p-mult').value.trim()
-    if (!/^\d+(\.\d{1,3})?$/.test(m)) { toast('multiplier 格式不对', 'danger'); return }
-    // extra_system_prompt:trim 后空 → 显式发 null(清空);非空 → 原文(后端再 trim)
-    const extraRaw = $('p-extra').value
-    const extra = extraRaw.trim() === '' ? null : extraRaw
+  $('mo-extra-cancel')?.addEventListener('click', closeModal)
+  $('mo-extra-ok')?.addEventListener('click', async (ev) => {
+    const raw = $('mo-extra').value
+    const value = raw.trim() === '' ? null : raw
     await withBtnLoading(ev.currentTarget, async () => {
       try {
         await apiJson('PATCH', `/api/admin/pricing/${encodeURIComponent(modelId)}`,
-          { multiplier: m, enabled: $('p-enabled').checked, extra_system_prompt: extra })
-        toast('已保存')
+          { extra_system_prompt: value, if_match_updated_at: orig.updated_at })
+        toast(`${modelId} 行为补丁已保存`)
         closeModal()
-        applyHash()
+        await _refreshModelRow(modelId)
       } catch (e) {
-        toast(`失败: ${e.message}`, 'danger', toastOptsFromError(e))
+        if (e.status === 409) toast('数据已被他人修改,请刷新', 'danger', toastOptsFromError(e))
+        else toast(`保存失败: ${e.message}`, 'danger', toastOptsFromError(e))
       }
     })
   })
+}
+
+// 局部刷新:重拉 model-ops 只替换目标行(tbody 上的委托监听不受影响),
+// 其余行未保存的编辑不动。目标已消失 / DOM 找不到时退化为整 tab 重渲染。
+async function _refreshModelRow(modelId) {
+  let data
+  try {
+    data = await apiGet('/api/admin/model-ops')
+  } catch (e) {
+    toast(`刷新失败: ${e.message}`, 'danger', toastOptsFromError(e))
+    return
+  }
+  if (_currentTab !== 'pricing') return
+  const fresh = (data?.models ?? []).find((m) => m.model_id === modelId)
+  const tr = Array.from(view().querySelectorAll('tr[data-model-id]'))
+    .find((el) => el.dataset.modelId === modelId)
+  if (!fresh || !tr) { applyHash(); return }
+  MODEL_OPS_STATE.models.set(modelId, fresh)
+  tr.outerHTML = _renderModelRow(fresh)
 }
 
 // ─── Tab: Plans ────────────────────────────────────────────────────
