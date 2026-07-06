@@ -181,21 +181,70 @@ export interface AdjustOrgCreditsInput {
   userAgent?: string | null;
 }
 
+export interface AdjustOrgCreditsResult {
+  ledger_id: bigint;
+  /** 调整后 orgs.credits(= org_wallet 流水 balance_after)。 */
+  balance_after: bigint;
+  audit_id: bigint;
+}
+
 /**
- * **批次 A 占位 —— 不放开无流水的资金变动面**(方案 §5 决策)。
+ * 平台超管手工调整 org 钱包(可正可负,0112 放开)。tx 内锁 orgs FOR UPDATE → credits += delta
+ * → INSERT credit_ledger(bucket='org_wallet', org_id, user_id=操作 admin) → writeAdminAudit
+ * (action='org.credits.adjust'),原子提交。
  *
- * org 钱包变动必须带 ledger 流水(credit_ledger.org_id),该列在 0112(批次 B)才落地。
- * 在此之前调 org 余额只动 orgs.credits + admin_audit 会留下"资金变了但无流水"的审计缺口。
- * 宁可晚开功能,不留无流水资金变动面。
- *
- * 批次 B 打通 0112 后放开:tx 内 SELECT credits FROM orgs FOR UPDATE → UPDATE credits →
- * INSERT credit_ledger(org_id, bucket='org_wallet', ...) → writeAdminAudit(action='org.credits.adjust')。
+ * 规则(镜像 users 的 adminAdjust,billing/ledger.ts):
+ *   - delta != 0、memo 非空(审计合规)
+ *   - delta < 0 且会打到负 → 拒(org 钱包不可负,等同"余额不足以扣")
+ *   - 金额上限(±¥100 万)由 HTTP 层守(handleAdminAdjustOrgCredits),与 users 同 cap 处
  */
-// eslint-disable-next-line @typescript-eslint/no-unused-vars
-export async function adjustOrgCredits(_input: AdjustOrgCreditsInput): Promise<never> {
-  throw new OrgError(
-    501,
-    "NOT_IMPLEMENTED",
-    "org credit adjustment requires the billing batch (0112 org ledger); not enabled yet",
-  );
+export async function adjustOrgCredits(input: AdjustOrgCreditsInput): Promise<AdjustOrgCreditsResult> {
+  if (input.delta === 0n) throw new OrgError(400, "VALIDATION", "delta must be non-zero");
+  if (!input.memo || input.memo.trim().length === 0) {
+    throw new OrgError(400, "VALIDATION", "memo is required (non-empty)");
+  }
+  const orgId = String(input.orgId);
+  return tx(async (client: PoolClient) => {
+    const before = await client.query<{ credits: string }>(
+      `SELECT credits::text AS credits FROM orgs WHERE id = $1::bigint FOR UPDATE`,
+      [orgId],
+    );
+    if (before.rows.length === 0) throw new OrgError(404, "NOT_FOUND", "org not found");
+    const balance = BigInt(before.rows[0].credits);
+    const newBalance = balance + input.delta;
+    if (newBalance < 0n) {
+      throw new OrgError(
+        400,
+        "INSUFFICIENT_ORG_CREDITS",
+        `adjustment would drive org credits below zero (balance=${balance}, delta=${input.delta})`,
+      );
+    }
+    await client.query(
+      `UPDATE orgs SET credits = $1, updated_at = NOW() WHERE id = $2::bigint`,
+      [newBalance.toString(), orgId],
+    );
+    const ledgerRow = await client.query<{ id: string }>(
+      `INSERT INTO credit_ledger
+          (user_id, org_id, delta, balance_after, reason, bucket, ref_type, ref_id, memo)
+       VALUES ($1, $2::bigint, $3, $4, 'admin_adjust', 'org_wallet', 'org', $5, $6)
+       RETURNING id::text AS id`,
+      [String(input.adminId), orgId, input.delta.toString(), newBalance.toString(), orgId, input.memo],
+    );
+    const ledgerId = BigInt(ledgerRow.rows[0].id);
+    const auditId = await writeAdminAudit(client, {
+      adminId: input.adminId,
+      action: "org.credits.adjust",
+      target: `org:${orgId}`,
+      before: { credits: balance.toString() },
+      after: {
+        credits: newBalance.toString(),
+        delta: input.delta.toString(),
+        memo: input.memo,
+        ledger_id: ledgerId.toString(),
+      },
+      ip: input.ip ?? null,
+      userAgent: input.userAgent ?? null,
+    });
+    return { ledger_id: ledgerId, balance_after: newBalance, audit_id: auditId };
+  });
 }

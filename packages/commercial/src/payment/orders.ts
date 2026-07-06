@@ -75,6 +75,8 @@ export interface OrderRow {
   plan_code: string | null;
   /** 0096 upgrade 单的源套餐档快照（履约校验当前订阅仍 == 此档；仅 upgrade 非 null）。 */
   from_plan_code: string | null;
+  /** 0112 企业版:org 充值单归属(kind='topup' 时非 null;个人单 null)。user_id=经办人。 */
+  org_id: bigint | null;
   paid_at: Date | null;
   expires_at: Date;
   ledger_id: bigint | null;
@@ -234,16 +236,17 @@ type OrderDbRow = {
   id: string; order_no: string; user_id: string; provider: "hupijiao";
   provider_order: string | null; amount_cents: string; credits: string;
   status: OrderStatus; kind: string; plan_code: string | null; from_plan_code: string | null;
+  org_id: string | null;
   paid_at: Date | null; expires_at: Date;
   ledger_id: string | null; refunded_ledger_id: string | null;
   created_at: Date; updated_at: Date;
 };
 
-/** 所有 orders SELECT 复用的列清单（含 0096 kind/plan_code/from_plan_code）。 */
+/** 所有 orders SELECT 复用的列清单（含 0096 kind/plan_code/from_plan_code + 0112 org_id）。 */
 const ORDER_COLS =
   `id::text AS id, order_no, user_id::text AS user_id, provider,
    provider_order, amount_cents::text AS amount_cents, credits::text AS credits,
-   status, kind, plan_code, from_plan_code, paid_at, expires_at,
+   status, kind, plan_code, from_plan_code, org_id::text AS org_id, paid_at, expires_at,
    ledger_id::text AS ledger_id, refunded_ledger_id::text AS refunded_ledger_id,
    created_at, updated_at`;
 
@@ -260,6 +263,7 @@ function rowToOrder(r: OrderDbRow): OrderRow {
     kind: (ORDER_KINDS as ReadonlyArray<string>).includes(r.kind) ? (r.kind as OrderKind) : "topup",
     plan_code: r.plan_code,
     from_plan_code: r.from_plan_code,
+    org_id: r.org_id ? BigInt(r.org_id) : null,
     paid_at: r.paid_at,
     expires_at: r.expires_at,
     ledger_id: r.ledger_id ? BigInt(r.ledger_id) : null,
@@ -442,6 +446,60 @@ export async function createPackOrder(input: {
   return { order: rowToOrder(r.rows[0]), plan };
 }
 
+/** org 充值单金额上限(分):¥100 万,镜像 admin 调额 cap,防误操作巨额单。 */
+export const ORG_TOPUP_MAX_AMOUNT_CENTS = 100_000_000n;
+
+/** org_id 严格归一化为数字串(来自服务端解析的 auth.orgId)。 */
+function normalizeOrgId(orgId: bigint | number | string): string {
+  if (typeof orgId === "bigint") return orgId.toString();
+  const s = String(orgId);
+  if (!/^[1-9][0-9]{0,19}$/.test(s)) throw new TypeError(`org_id must be positive integer, got ${s}`);
+  return s;
+}
+
+export interface CreateOrgTopupOrderInput {
+  orgId: string | bigint;
+  /** 经办人(操作 owner/admin)的 user_id → orders.user_id(NOT NULL,语义=经办人)。 */
+  operatorUserId: bigint | number | string;
+  /** 本单应付(分),1..ORG_TOPUP_MAX_AMOUNT_CENTS。 */
+  amountCents: bigint;
+  ttlMs?: number;
+  orderNo?: string;
+  nowFn?: () => Date;
+}
+
+/**
+ * 创建 org 钱包充值单(pending)。org 钱包积分按**系统基准 1 分 = 1 积分**入账
+ * (credits = amount_cents,V1 无赠送档;org 套餐/赠送由 boss 定企业定价后再引入)。
+ * orders.org_id 落库 + kind='topup' + user_id=经办人。虎皮椒建单/二维码链路与个人单同构
+ * (调用方拿到 order 后调 hupijiao.createQr);履约由 markOrderPaid → fulfillOrgTopupTx 分支
+ * (order.org_id 非空)入 orgs.credits + org_wallet 流水。金额纵深防御(markOrderPaid
+ * expectedAmountCents 比对 order.amount_cents)对 org 单同样生效。
+ */
+export async function createOrgTopupOrder(input: CreateOrgTopupOrderInput): Promise<OrderRow> {
+  const orgId = normalizeOrgId(input.orgId);
+  const uid = normalizeUserId(input.operatorUserId);
+  if (input.amountCents <= 0n) throw new TypeError(`amountCents must be > 0, got ${input.amountCents}`);
+  if (input.amountCents > ORG_TOPUP_MAX_AMOUNT_CENTS) {
+    throw new TypeError(`amountCents exceeds cap ${ORG_TOPUP_MAX_AMOUNT_CENTS}, got ${input.amountCents}`);
+  }
+  const credits = input.amountCents; // 系统基准 1 分 = 1 积分(与 refund/subscription 口径一致)
+
+  const nowFn = input.nowFn ?? (() => new Date());
+  const ttlMs = Math.max(1, input.ttlMs ?? 15 * 60 * 1000);
+  const expiresAt = new Date(nowFn().getTime() + ttlMs);
+  const orderNo = input.orderNo ?? generateOrderNo(nowFn);
+
+  const r = await query<OrderDbRow>(
+    `INSERT INTO orders
+      (order_no, user_id, org_id, provider, amount_cents, credits, status, kind, expires_at)
+     VALUES ($1, $2, $3::bigint, 'hupijiao', $4, $5, 'pending', 'topup', $6)
+     RETURNING ${ORDER_COLS}`,
+    [orderNo, uid, orgId, credits.toString(), credits.toString(), expiresAt],
+  );
+  return rowToOrder(r.rows[0]);
+}
+
 export interface GetOrderOptions {
   /** 要求订单属于指定用户(用于 GET /api/payment/orders/:no) */
   userId?: bigint | number | string;
@@ -541,10 +599,59 @@ async function fulfillWalletTopupTx(client: PoolClient, order: OrderRow): Promis
 }
 
 /**
+ * org 钱包充值履约(0112,同 tx,与 orders→paid 原子)。遵守全局锁序 orgs→users→user_subscriptions:
+ * fulfill 场景只锁 orgs 一层(不触 users/subscriptions)。org deleted/deleting → 拒绝履约(抛错,
+ * 订单保持 pending,走既有 5xx/人工退款路径);suspended 仍可充值(余额保留待恢复,充值是恢复手段)。
+ * 返回 org_wallet 流水 id(回写 orders.ledger_id)。
+ */
+async function fulfillOrgTopupTx(client: PoolClient, order: OrderRow): Promise<bigint> {
+  const orgId = (order.org_id as bigint).toString();
+  const orgSel = await client.query<{ credits: string; status: string }>(
+    "SELECT credits::text AS credits, status FROM orgs WHERE id = $1::bigint FOR UPDATE",
+    [orgId],
+  );
+  if (orgSel.rows.length === 0) {
+    throw new TypeError(`org not found for order ${order.order_no}: ${orgId}`);
+  }
+  const status = orgSel.rows[0].status;
+  if (status === "deleted" || status === "deleting") {
+    throw new TypeError(`org ${orgId} is ${status}, cannot fulfill topup for order ${order.order_no}`);
+  }
+  const newBalance = BigInt(orgSel.rows[0].credits) + order.credits;
+  await client.query(
+    "UPDATE orgs SET credits = $1, updated_at = NOW() WHERE id = $2::bigint",
+    [newBalance.toString(), orgId],
+  );
+  const ledgerRow = await client.query<{ id: string }>(
+    `INSERT INTO credit_ledger
+        (user_id, org_id, delta, balance_after, reason, bucket, ref_type, ref_id, memo)
+     VALUES ($1, $2::bigint, $3, $4, 'topup', 'org_wallet', 'order', $5, $6)
+     RETURNING id::text AS id`,
+    [
+      order.user_id.toString(), // 经办人(orders.user_id);org 归属由 org_id 列表达
+      orgId,
+      order.credits.toString(),
+      newBalance.toString(),
+      order.id.toString(),
+      `org topup amount_cents=${order.amount_cents} order_no=${order.order_no}`,
+    ],
+  );
+  return BigInt(ledgerRow.rows[0].id);
+}
+
+/**
  * 按订单 kind 履约（同一 tx 内，与 orders→paid 原子）。返回回写 orders.ledger_id 的钱包流水 id
  * （期内桶路径返回 null —— 流水以 ref_id=order_no 关联，不占 orders.ledger_id）。
  */
 async function fulfillPaidOrderTx(client: PoolClient, order: OrderRow): Promise<bigint | null> {
+  // 0112 企业版:org 充值单(org_id 非空)独立分支。本期 org 只有充值(kind='topup'),
+  // 其它 kind 拒绝履约(防未来误配 org 订阅/升档单走错个人履约路径)。
+  if (order.org_id !== null) {
+    if (order.kind !== "topup") {
+      throw new TypeError(`org order ${order.order_no} must be kind=topup, got ${order.kind}`);
+    }
+    return fulfillOrgTopupTx(client, order);
+  }
   switch (order.kind) {
     case "topup":
       return fulfillWalletTopupTx(client, order);

@@ -106,6 +106,11 @@ function makeFakePool(opts: { userBalance?: bigint } = {}): FakePoolControl {
       if (trimmed === "BEGIN" || trimmed === "COMMIT" || trimmed === "ROLLBACK") {
         return { rows: [], rowCount: 0 };
       }
+      // 0112 企业版:settle 收口 tx 内的 org 归属解析(resolveOrgBillingContext)。
+      // 本套件不测 org 计费 → 无成员归属,返回空 → orgCtx=null(纯个人扣费,行为不变)。
+      if (trimmed.startsWith("SELECT m.org_id")) {
+        return { rows: [], rowCount: 0 };
+      }
       if (trimmed.startsWith("INSERT INTO usage_records")) {
         if (pendingUsageInsertErr !== null) {
           const e = pendingUsageInsertErr;

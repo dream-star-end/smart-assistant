@@ -19,6 +19,7 @@ import {
   listOrgs,
   createOrgByEmail,
   patchOrg,
+  adjustOrgCredits,
   type OrgWithStatsRow,
   type PatchOrgInput,
 } from "../../admin/orgs.js";
@@ -178,27 +179,83 @@ export async function handleAdminPatchOrg(
   }
 }
 
-// ─── POST /api/admin/orgs/:id/credits(批次 A 占位 → 501)────────────
+// ─── POST /api/admin/orgs/:id/credits(0112 放开)───────────────────
 
 export async function handleAdminAdjustOrgCredits(
   req: IncomingMessage,
   res: ServerResponse,
-  _ctx: RequestContext,
+  ctx: RequestContext,
   deps: CommercialHttpDeps,
 ): Promise<void> {
-  // 仍先过 admin gate(不向非 admin 泄露路由存在性),再返回 501。
-  await requireAdminVerifyDb(req, deps.jwtSecret);
+  // 调 org 余额能凭空发积分(= 钱),走 VerifyDb 拿 admin 身份写审计(同 users credits handler)。
+  const admin = await requireAdminVerifyDb(req, deps.jwtSecret);
   const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "x.invalid"}`);
   const prefix = "/api/admin/orgs/";
   const suffix = "/credits";
   if (!url.pathname.startsWith(prefix) || !url.pathname.endsWith(suffix)) {
     throw new HttpError(404, "NOT_FOUND", "route not found");
   }
-  // 不放开无流水的资金变动面(方案 §5):org 钱包变动必须带 ledger 流水,
-  // credit_ledger.org_id 列在 0112(批次 B)落地后再放开。
-  throw new HttpError(
-    501,
-    "NOT_IMPLEMENTED",
-    "org credit adjustment is enabled by the billing batch (0112 org ledger); not available yet",
-  );
+  const idPart = url.pathname.slice(prefix.length, url.pathname.length - suffix.length);
+  if (!/^[1-9][0-9]{0,19}$/.test(idPart)) {
+    throw new HttpError(400, "VALIDATION", "invalid org id");
+  }
+  const body = (await readJsonBody(req)) ?? {};
+  if (typeof body !== "object" || Array.isArray(body)) {
+    throw new HttpError(400, "VALIDATION", "request body must be JSON object");
+  }
+  const b = body as Record<string, unknown>;
+  // delta 可以是数字(小额)或字符串(大额 → bigint);都走 BigInt(同 users credits)。
+  let delta: bigint;
+  try {
+    if (typeof b.delta === "number") {
+      if (!Number.isInteger(b.delta)) throw new TypeError("delta must be integer");
+      delta = BigInt(b.delta);
+    } else if (typeof b.delta === "string") {
+      if (!/^-?[0-9]+$/.test(b.delta)) throw new TypeError("delta must be integer string");
+      delta = BigInt(b.delta);
+    } else {
+      throw new TypeError("delta is required");
+    }
+  } catch (err) {
+    throw new HttpError(400, "VALIDATION", (err as Error).message, {
+      issues: [{ path: "delta", message: String(b.delta) }],
+    });
+  }
+  if (delta === 0n) {
+    throw new HttpError(400, "VALIDATION", "delta must be non-zero", {
+      issues: [{ path: "delta", message: "0" }],
+    });
+  }
+  // 服务端硬 cap ±¥100 万(= 1 亿 credits),镜像 users 调额上限(前端可被绕过,服务端独立守)。
+  const MAX_ADMIN_DELTA = 100_000_000n;
+  const absDelta = delta < 0n ? -delta : delta;
+  if (absDelta > MAX_ADMIN_DELTA) {
+    throw new HttpError(400, "VALIDATION", "delta exceeds ±100,000,000 (¥1,000,000) cap", {
+      issues: [{ path: "delta", message: delta.toString() }],
+    });
+  }
+  if (typeof b.memo !== "string" || b.memo.trim().length === 0) {
+    throw new HttpError(400, "VALIDATION", "memo is required", { issues: [{ path: "memo", message: "" }] });
+  }
+  if (b.memo.length > 500) {
+    throw new HttpError(400, "VALIDATION", "memo too long (max 500 chars)");
+  }
+
+  try {
+    const r = await adjustOrgCredits({
+      orgId: idPart,
+      delta,
+      memo: b.memo,
+      adminId: admin.id,
+      ip: ctx.clientIp,
+      userAgent: ctx.userAgent,
+    });
+    sendJson(res, 200, {
+      ledger_id: r.ledger_id.toString(),
+      balance_after: r.balance_after.toString(),
+      audit_id: r.audit_id.toString(),
+    });
+  } catch (err) {
+    throwOrg(err);
+  }
 }

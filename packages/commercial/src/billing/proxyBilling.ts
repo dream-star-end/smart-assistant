@@ -36,6 +36,7 @@ import type { Pool } from "pg";
 import type { Logger } from "../logging/logger.js";
 import { computeCost, type TokenUsage } from "./calculator.js";
 import { spendTwoBucket } from "./spend.js";
+import { resolveOrgBillingContext } from "../org/orgBilling.js";
 import type { ModelPricing } from "./pricing.js";
 import {
   releasePreCheck,
@@ -493,6 +494,10 @@ export async function settleUsageAndLedger(
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
+    // org 归属解析(0112 企业版):tx 内、锁前一次索引点查。成员在某 active org 语境 →
+    // 打戳 usage_records.org_id(**与扣费桶解耦**:只看成员是否在 org,无论钱从哪个桶扣);
+    // billing_enabled=true 才让 org 钱包参与扣费(下面 spendTwoBucket 传 orgId)。
+    const orgCtx = await resolveOrgBillingContext(client, args.userId);
     let usageId: bigint;
     let ledgerId: bigint | null = null;
     let clamped = false;
@@ -504,8 +509,8 @@ export async function settleUsageAndLedger(
           (user_id, mode, account_id, model,
            input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
            price_snapshot, cost_credits, session_id, parent_session_id,
-           delegate_agent_id, request_id, status)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11, $12, $13, $14, $15)
+           delegate_agent_id, request_id, status, org_id)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11, $12, $13, $14, $15, $16)
          RETURNING id::text AS id`,
         [
           args.userId.toString(),
@@ -524,6 +529,8 @@ export async function settleUsageAndLedger(
           args.delegateAgentId ?? null,
           args.requestId,
           args.status,
+          // org 语境即打戳(orgCtx 非空),不受 billing_enabled 影响。
+          orgCtx?.orgId ?? null,
         ],
       );
       usageId = BigInt(ins.rows[0]!.id);
@@ -569,6 +576,9 @@ export async function settleUsageAndLedger(
         reason: "chat",
         ref: { type: "usage_record", id: usageId.toString() },
         memo: `cost=${args.costCredits}`,
+        // billing_enabled=false 的成员:打戳但个人桶付(不传 orgId)。org 非 active 时
+        // spendTwoBucket 内 FOR UPDATE 会再兜底 fail-open 降级个人桶。
+        orgId: orgCtx && orgCtx.billingEnabled ? orgCtx.orgId : undefined,
       });
       clamped = spend.clamped;
       // balance_after 对外广播取"总可用"(期内桶+钱包)，对齐前端余额气泡语义。
