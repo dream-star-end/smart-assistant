@@ -217,12 +217,12 @@ BEGIN; <迁移 SQL>; INSERT INTO schema_migrations(version, applied_at) VALUES (
 | ~~可见性黑名单散点~~ **已偿还**(781108ce,P2 批次1) | 权威源上移 @openclaude/protocol agentVisibility(entrypoint 编译期共享,不再手抄);枚举面统一走 `_getAgentsConfigUserView()`/`filterUserVisibleByAgentField`,判定/执行面保留全量 predicate。新增枚举面必须走投影,新增系统 agent 只改 protocol 一处 | — |
 | feat/v5-copy-no-ai | 去 AI 措辞 chore(43d0078a)基老未合 | 下次文案批次重做 |
 | oc-browser chrome 通道 | v5 已修(--browser chromium),**v3 同病未修** | v3 浏览器问题报障时 |
-| 委派上下文纯文本 | delegate 只传 goal/context 字符串,无附件/工件协议;共享容器 FS 可交接但无 prompt 教学;回传纯文本经队长转述失真 | 团队产品化(roadmap P2.2b:大产物落文件+蒸馏回传) |
-| 委派并行无机制 | delegate_task 单次单个且同步阻塞,并行完全赖引擎行为;多成员+审查可串行阻塞小时级 | 同上(fan-out 原语) |
-| 普通成员串行无上限 | 熔断只覆盖 hidden-reviewer;同 turn 串行委派普通成员不设限,成本失控面 | 团队止血批次或产品化时一并加 |
-| teamMode 全局粘滞开关 | localStorage 设备级 flag;wave1 只加可见指示,per-session 化未做 | 团队产品化时改会话级 |
+| ~~委派上下文纯文本~~ **已偿还**(774fa941,P2 批次4) | 委派 prompt 产物纪律(大产物落 generated/ 回传路径+≤1500 字摘要)+回传兜底封顶 4k(OPENCLAUDE_DELEGATE_OUTPUT_CAP,review 输出豁免);显式取舍=基于共享 FS+prompt 纪律,无正式工件 schema | — |
+| ~~委派并行无机制~~ **已偿还**(774fa941) | delegate_tasks 复数工具(≤4,Promise.all 走既有端点,per-parent 分桶+有界排队消化) | — |
+| ~~普通成员串行无上限~~ **已偿还**(774fa941) | PerTurnDelegationGuard 一套机制两策略:成员默认 8/turn(OPENCLAUDE_TEAM_MEMBER_DELEGATIONS_PER_TURN),超限结构化 429 引导收敛;UX 铁律观察项:正常用户撞线即调大 | — |
+| ~~teamMode 全局粘滞开关~~ **已偿还**(P2 批次4 前端) | 会话级 per-session 键+全局偏好默认继承(lib/teamMode.ts),A 关不影响 B,新会话承习惯 | — |
 | ~~TeamPanel 聚合脆弱~~ **已偿还**(批次2渲染+批次3并发) | coalesceTeam 改按 turn 锚点(最近 user 消息边界)归组;_activeDelegations 加 per-parent 分桶+review 保留槽 | — |
-| landing 团队演示错位 | 动态角色/成员并行/过程账本三点与实现不符 | 产品化后对齐,或先行弱化文案 |
+| ~~landing 团队演示错位~~ **已偿还**(P2 批次4 前端) | 角色=真实三预设+审查员;并行≤3 与 per-parent 并发诚实对齐;账本字段对齐 TeamPanel;仍全虚构示意 | — |
 | provision 事务窗口过宽 | provisionV3Container 单 BEGIN 跨 docker create/start 慢操作,idle-in-tx(60s)可杀连接(07-06 事故根因;pg client error 已挂监听不再崩进程 90202532,僵尸 409 已有自愈) | idle-in-tx 规模化 reject 时,把 docker 副作用移出事务(需重构 per-uid lock+cap 门控原子性) |
 | v5 无后台孤儿回收网 | orphanReconcile/idleSweep/volumeGc 在 v5 全禁(controlPlane+env 双关),僵尸只有进程内 409 自愈一道防线 | 下次动容器生命周期时,给 v5 放开 v5-owned 域的 orphanReconcile(触碰 mutator 归属矩阵) |
 
