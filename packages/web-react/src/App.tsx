@@ -63,6 +63,8 @@ const ManageCenter = lazy(() => import("./components/ManageCenter").then((m) => 
 const MarketplaceCenter = lazy(() =>
   import("./components/MarketplaceCenter").then((m) => ({ default: m.MarketplaceCenter })),
 );
+// 企业版(P3.1)第四中心。仅 org owner/admin 有入口(成员在设置·账户页只读展示)。
+const OrgCenter = lazy(() => import("./components/OrgCenter").then((m) => ({ default: m.OrgCenter })));
 
 // UX 体验对冲（红线:优化不得降低体验）:懒加载省首屏,但慢网下首开中心会多一个
 // loading 瞬间。首屏渲染完成后在浏览器空闲期预取四个懒块——Vite 对同一 specifier
@@ -74,6 +76,7 @@ export function prefetchLazyCentersOnIdle(): void {
     void import("./components/SettingsCenter").catch(() => {});
     void import("./components/ManageCenter").catch(() => {});
     void import("./components/MarketplaceCenter").catch(() => {});
+    void import("./components/OrgCenter").catch(() => {});
   };
   if (typeof requestIdleCallback === "function") {
     requestIdleCallback(prefetch, { timeout: 8000 });
@@ -163,6 +166,7 @@ export function App() {
   const [manageOpen, setManageOpen] = useState(bootPanel === "manage");
   const [manageTab, setManageTab] = useState<ManageTab>("memory");
   const [marketplaceOpen, setMarketplaceOpen] = useState(bootPanel === "market");
+  const [orgOpen, setOrgOpen] = useState(bootPanel === "org");
   const [marketplaceTab, setMarketplaceTab] = useState<MarketplaceTab>("browse");
   const [marketplaceBrowseKind, setMarketplaceBrowseKind] = useState<MarketplaceKind>("skill");
   // 「在对话中创建」技能/智能体:关市场 → 新会话 → Composer 预填引导模板(用户改后发送)。
@@ -216,6 +220,7 @@ export function App() {
       setMessages([]);
       setChatError(null);
       setSettingsOpen(false);
+      setOrgOpen(false);
       setView("home");
     },
     // 登出前清本 user 的 IndexedDB 命名空间（隐私，类比 P5 媒体缓存按 authKey 失效）。
@@ -477,6 +482,12 @@ export function App() {
     setMarketplaceOpen(true);
   }, []);
 
+  // 打开组织中心(企业版第四中心;仅 owner/admin 有入口)。顺带刷新余额/归属。
+  const openOrg = useCallback(() => {
+    void refreshMe();
+    setOrgOpen(true);
+  }, [refreshMe]);
+
   // 键盘快捷键：⌘/Ctrl+K 新会话；Esc 停止当前（demo）流式。仅在进入工作区后生效。
   const inWorkspace = demo || (view === "app" && !!auth && !!user);
 
@@ -510,6 +521,42 @@ export function App() {
       );
     }
   }, [demo, toast]);
+
+  // 组织邀请接受流:URL 带 ?orgInvite=<token>。已登录 → 确认弹层 → accept → 刷新 /api/me;
+  // 未登录 → token 留在 URL(不清),先走 AuthGate 登录/注册,进工作区后本 effect 再触发续接。
+  const orgInviteTokenRef = useRef<string | null>(
+    !demo && routingEnabled ? new URLSearchParams(location.search).get("orgInvite") : null,
+  );
+  const orgInviteHandledRef = useRef(false);
+  useEffect(() => {
+    if (demo || orgInviteHandledRef.current) return;
+    const token = orgInviteTokenRef.current;
+    if (!token) return;
+    // 未进工作区(未登录)→ 保留 token,等登录完成后再处理(effect 依赖变化会重跑)。
+    if (!inWorkspace || !auth || !user) return;
+    orgInviteHandledRef.current = true;
+    const a = auth;
+    void (async () => {
+      const ok = await confirmDialog({
+        title: "接受组织邀请?",
+        body: "你被邀请加入一个组织。接受后你的对话用量将可计入该组织钱包。",
+        confirmText: "接受邀请",
+      });
+      // 无论接受与否都清掉 query,避免刷新重复弹层。
+      const sp = new URLSearchParams(window.location.search);
+      sp.delete("orgInvite");
+      const q = sp.toString();
+      window.history.replaceState({}, "", window.location.pathname + (q ? `?${q}` : "") + window.location.hash);
+      if (!ok) return;
+      try {
+        await api.acceptOrgInvitation(a, token);
+        await refreshMe();
+        toast("已加入组织", "success");
+      } catch (e) {
+        toast(`接受邀请失败：${(e as Error).message}`, "error");
+      }
+    })();
+  }, [demo, inWorkspace, auth, user, confirmDialog, refreshMe, toast]);
 
   // 进入登录页（view=app 且未认证）时拉一次公开配置：决定 AuthGate 是否渲染真 Turnstile
   // widget。停在首页（home）/demo/已登录均不拉，避免无谓请求（与无网络测试用例兼容）。
@@ -892,7 +939,9 @@ export function App() {
       ? "market"
       : manageOpen
         ? "manage"
-        : null;
+        : orgOpen
+          ? "org"
+          : null;
   useAppRoute({
     enabled: routingEnabled,
     inWorkspace,
@@ -1000,6 +1049,11 @@ export function App() {
     onLogout: demo ? undefined : logout,
     onOpenManage: demo ? undefined : () => openManage("memory"),
     onOpenMarketplace: demo ? undefined : () => openMarketplace("browse"),
+    // 组织入口:仅 org owner/admin 可见(成员无管理面,只在设置·账户页只读展示归属)。
+    onOpenOrg:
+      demo || !(user?.org && (user.org.role === "owner" || user.org.role === "admin"))
+        ? undefined
+        : openOrg,
   };
 
   return (
@@ -1272,6 +1326,18 @@ export function App() {
                   .catch(() => {});
               }
             }}
+          />
+        </Suspense>
+      )}
+
+      {orgOpen && (
+        <Suspense fallback={<DialogFallback />}>
+          <OrgCenter
+            open={orgOpen}
+            auth={auth}
+            user={user}
+            onClose={() => setOrgOpen(false)}
+            onRefreshMe={refreshMe}
           />
         </Suspense>
       )}

@@ -131,6 +131,11 @@ import {
   handleAdminPatchOrg,
   handleAdminAdjustOrgCredits,
 } from './admin/orgs.js'
+// 企业版(P3.1)批次 D:平台超管开票申请处理。
+import {
+  handleAdminListOrgInvoices,
+  handleAdminPatchOrgInvoice,
+} from './admin/orgInvoices.js'
 import { dispatchOrgRoute } from './org/routes.js'
 import {
   handleAdminAlertsAckRule,
@@ -733,6 +738,9 @@ export function createCommercialHandler(
     { method: 'PATCH', pathPrefix: '/api/admin/orgs/', handler: handleAdminPatchOrg },
     // POST /api/admin/orgs/:id/credits(批次 A 返 501 占位);handler 自校验 path 尾段。
     { method: 'POST', pathPrefix: '/api/admin/orgs/', handler: handleAdminAdjustOrgCredits },
+    // 企业版(P3.1)批次 D:平台开票申请处理。exact list 优先于 prefix patch。
+    { method: 'GET', path: '/api/admin/org-invoices', handler: handleAdminListOrgInvoices },
+    { method: 'PATCH', pathPrefix: '/api/admin/org-invoices/', handler: handleAdminPatchOrgInvoice },
     // T-60 超管审计记录
     { method: 'GET', path: '/api/admin/audit', handler: handleAdminListAudit },
     // T-60 超管定价

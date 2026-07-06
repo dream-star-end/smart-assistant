@@ -421,6 +421,7 @@ const TABS = {
   orders: renderOrdersTab,
   pricing: renderModelOpsTab,
   plans: renderPlansTab,
+  org: renderOrgTab,
   modelGrants: renderModelGrantsTab,
   feedback: renderFeedbackTab,
   inbox: renderInboxTab,
@@ -444,6 +445,7 @@ const ADMIN_TAB_META = {
   orders: { group: '财务与商业', label: '订单', desc: '支付状态和回调详情', key: '09', chips: [{ label: '状态', value: 'paid / pending' }, { label: '金额', value: '订单 / 积分' }, { label: '异常', value: '回调详情' }] },
   pricing: { group: '财务与商业', label: '模型与服务商', desc: '模型定价、可见性与服务商健康', key: '10', chips: [{ label: '价格', value: '分/Mtok 行内改' }, { label: '策略', value: '可见性 / 上下线' }, { label: '服务商', value: 'key / 订阅 / 延迟' }] },
   plans: { group: '财务与商业', label: '充值套餐', desc: '金额、积分和排序', key: '11', chips: [{ label: '金额', value: 'CNY' }, { label: '权益', value: 'credits' }, { label: '展示', value: 'sort / active' }] },
+  org: { group: '财务与商业', label: '组织', desc: '组织账户、成员和开票申请', key: '11b', chips: [{ label: '定位', value: '名称 / UID' }, { label: '动作', value: '建 / 停用 / 调额' }, { label: '联动', value: '发票申请处理' }] },
   modelGrants: { group: '财务与商业', label: '用户模型授权', desc: '按用户放行特殊模型', key: '12', chips: [{ label: '用户', value: 'email / uid' }, { label: '模型', value: 'admin only' }, { label: '动作', value: 'grant / revoke' }] },
   feedback: { group: '用户触达', label: '反馈', desc: '用户问题、优先级和确认', key: '13', chips: [{ label: '队列', value: 'open / acked' }, { label: '上下文', value: '用户详情' }, { label: '动作', value: '确认处理' }] },
   inbox: { group: '用户触达', label: '站内信', desc: '发送、历史和触达记录', key: '14', chips: [{ label: '范围', value: '全员 / 单人' }, { label: '级别', value: 'info / warning' }, { label: '历史', value: 'sent / deleted' }] },
@@ -5397,6 +5399,355 @@ function openEditPlanModal(d) {
       }
     })
   })
+}
+
+// ─── Tab: Org(组织账户 + 开票申请)─────────────────────────────────
+//
+// 数据流:
+//   组织:GET /api/admin/orgs → 列表;POST 新建(按 owner 邮箱);
+//         PATCH :id 改名 / 状态 / 成员上限;POST :id/credits 调余额
+//         (批次 B 未上线前返回 501,按后端 message 提示,不崩溃)。
+//   开票:GET /api/admin/org-invoices?status= → 申请列表;
+//         PATCH :id { status:'issued'|'rejected', admin_note? } 处理
+//         (pending → 终态,二次处理返 409 ALREADY_PROCESSED)。
+// org-invoices 端点只支持 status 过滤,不支持 org_id;行内「发票」按钮
+// 走客户端按 org_id 过滤(rows 自带 org_id / org_name),不新增后端参数。
+
+const ORG_STATE = {
+  invoiceStatus: 'pending',   // pending | issued | rejected | ''(全部)
+  invoiceOrgFilter: null,     // { id, name } —— 行内「发票」触发的客户端过滤
+}
+
+const ORG_STATUS_OPTIONS = ['active', 'suspended', 'deleting', 'deleted']
+const ORG_STATUS_BADGE = {
+  active: 'ok',
+  suspended: 'warn',
+  deleting: 'warn',
+  deleted: 'muted',
+}
+const ORG_INVOICE_STATUS_LABELS = {
+  pending: '待处理',
+  issued: '已开票',
+  rejected: '已拒绝',
+}
+const ORG_INVOICE_STATUS_BADGE = {
+  pending: 'warn',
+  issued: 'ok',
+  rejected: 'danger',
+}
+
+async function renderOrgTab() {
+  view().innerHTML = `
+    <div class="panel">
+      <h2>组织 <small id="org-count">加载中…</small></h2>
+      <div class="toolbar">
+        <input type="text" id="org-new-name" placeholder="组织名称" style="min-width:200px;" />
+        <input type="text" id="org-new-owner" placeholder="owner 邮箱" style="min-width:220px;" />
+        <input type="number" id="org-new-max" placeholder="成员上限(可选)" min="1" style="width:150px;" />
+        <button class="btn btn-primary" id="org-new-go">新建组织</button>
+      </div>
+      <div id="org-table-container"><div class="skeleton-row"><div class="skeleton-bar w60"></div></div></div>
+    </div>
+    <div class="panel">
+      <h2>开票申请 <small id="org-inv-count"></small></h2>
+      <div class="toolbar">
+        <select id="org-inv-status">
+          <option value="pending">待处理</option>
+          <option value="issued">已开票</option>
+          <option value="rejected">已拒绝</option>
+          <option value="">全部</option>
+        </select>
+        <span id="org-inv-orgfilter"></span>
+        <button class="btn" id="org-inv-refresh">刷新</button>
+      </div>
+      <div id="org-inv-container"><div class="empty">加载中…</div></div>
+    </div>
+  `
+  $('org-inv-status').value = ORG_STATE.invoiceStatus
+  $('org-new-go').addEventListener('click', (ev) => withBtnLoading(ev.currentTarget, _createOrg))
+  $('org-inv-status').addEventListener('change', () => {
+    ORG_STATE.invoiceStatus = $('org-inv-status').value
+    _loadOrgInvoices()
+  })
+  $('org-inv-refresh').addEventListener('click', (ev) => withBtnLoading(ev.currentTarget, _loadOrgInvoices))
+  await Promise.all([_loadOrgs(), _loadOrgInvoices()])
+}
+
+async function _createOrg() {
+  const name = $('org-new-name').value.trim()
+  const owner = $('org-new-owner').value.trim()
+  const maxRaw = $('org-new-max').value.trim()
+  if (!name) { toast('请填写组织名称', 'danger'); return }
+  if (!owner) { toast('请填写 owner 邮箱', 'danger'); return }
+  const body = { name, owner_email: owner }
+  if (maxRaw) {
+    const n = Number(maxRaw)
+    if (!Number.isInteger(n) || n < 1) { toast('成员上限必须是正整数', 'danger'); return }
+    body.max_members = n
+  }
+  try {
+    await apiJson('POST', '/api/admin/orgs', body)
+    toast('组织已创建', 'ok')
+    applyHash()
+  } catch (e) {
+    toast(`创建失败:${e.message}`, 'danger', toastOptsFromError(e))
+  }
+}
+
+async function _loadOrgs() {
+  let data
+  try {
+    data = await apiGet('/api/admin/orgs')
+  } catch (e) {
+    if (_currentTab !== 'org') return
+    const c = $('org-table-container')
+    if (c) c.innerHTML = `<div class="empty" style="color:var(--danger)">加载失败:${escapeHtml(e.message || String(e))}</div>`
+    return
+  }
+  if (_currentTab !== 'org') return
+  const rows = data?.rows ?? []
+  const cnt = $('org-count'); if (cnt) cnt.textContent = `共 ${rows.length} 个`
+  const c = $('org-table-container')
+  if (!c) return
+  if (rows.length === 0) { c.innerHTML = '<div class="empty">暂无组织</div>'; return }
+  c.innerHTML = `
+    <table class="data">
+      <thead>
+        <tr><th>名称</th><th>状态</th><th>成员</th><th>余额</th><th>创建时间</th><th class="actions">操作</th></tr>
+      </thead>
+      <tbody>
+        ${rows.map((o) => {
+          const badge = ORG_STATUS_BADGE[o.status] || 'muted'
+          const members = o.max_members != null
+            ? `${escapeHtml(String(o.member_count ?? 0))} / ${escapeHtml(String(o.max_members))}`
+            : escapeHtml(String(o.member_count ?? 0))
+          return `
+          <tr>
+            <td>${escapeHtml(o.name)} <code style="opacity:0.6">#${escapeHtml(String(o.id))}</code></td>
+            <td><span class="badge ${badge}">${escapeHtml(o.status || '—')}</span></td>
+            <td class="num">${members}</td>
+            <td class="num">${fmtCents(o.credits)}</td>
+            <td>${escapeHtml(fmtDate(o.created_at))}</td>
+            <td class="actions">
+              <button data-act="org-edit"
+                      data-id="${escapeHtml(String(o.id))}"
+                      data-name="${escapeHtml(o.name)}"
+                      data-status="${escapeHtml(o.status || '')}"
+                      data-max="${escapeHtml(o.max_members == null ? '' : String(o.max_members))}">编辑</button>
+              <button data-act="org-credits"
+                      data-id="${escapeHtml(String(o.id))}"
+                      data-name="${escapeHtml(o.name)}"
+                      data-credits="${escapeHtml(String(o.credits ?? '0'))}">调余额</button>
+              <button data-act="org-invoices"
+                      data-id="${escapeHtml(String(o.id))}"
+                      data-name="${escapeHtml(o.name)}">发票</button>
+            </td>
+          </tr>`
+        }).join('')}
+      </tbody>
+    </table>`
+  for (const b of c.querySelectorAll('button[data-act="org-edit"]')) {
+    b.addEventListener('click', () => _openOrgEditModal(b.dataset))
+  }
+  for (const b of c.querySelectorAll('button[data-act="org-credits"]')) {
+    b.addEventListener('click', () => _openOrgCreditsModal(b.dataset))
+  }
+  for (const b of c.querySelectorAll('button[data-act="org-invoices"]')) {
+    b.addEventListener('click', () => {
+      ORG_STATE.invoiceOrgFilter = { id: b.dataset.id, name: b.dataset.name }
+      ORG_STATE.invoiceStatus = ''
+      const sel = $('org-inv-status'); if (sel) sel.value = ''
+      _loadOrgInvoices()
+      $('org-inv-container')?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+    })
+  }
+}
+
+function _openOrgEditModal(d) {
+  openModal(`
+    <h3>编辑组织 · ${escapeHtml(d.name)} <code style="opacity:0.6">#${escapeHtml(d.id)}</code></h3>
+    <div class="form-row"><label>名称</label>
+      <input type="text" id="org-e-name" value="${escapeHtml(d.name)}" /></div>
+    <div class="form-row"><label>状态</label>
+      <select id="org-e-status">
+        ${ORG_STATUS_OPTIONS.map((s) => `<option value="${s}" ${d.status === s ? 'selected' : ''}>${s}</option>`).join('')}
+      </select></div>
+    <div class="form-row"><label>成员上限(留空=不改)</label>
+      <input type="number" id="org-e-max" min="1" value="${escapeHtml(d.max)}" /></div>
+    <div class="form-actions">
+      <button id="org-e-cancel">取消</button>
+      <button class="btn-primary" id="org-e-ok">保存</button>
+    </div>
+  `)
+  $('org-e-cancel').addEventListener('click', closeModal)
+  $('org-e-ok').addEventListener('click', (ev) => withBtnLoading(ev.currentTarget, async () => {
+    const name = $('org-e-name').value.trim()
+    if (!name) { toast('名称不能为空', 'danger'); return }
+    const body = { name, status: $('org-e-status').value }
+    const maxRaw = $('org-e-max').value.trim()
+    if (maxRaw) {
+      const n = Number(maxRaw)
+      if (!Number.isInteger(n) || n < 1) { toast('成员上限必须是正整数', 'danger'); return }
+      body.max_members = n
+    }
+    try {
+      await apiJson('PATCH', `/api/admin/orgs/${encodeURIComponent(d.id)}`, body)
+      toast('已保存', 'ok')
+      closeModal()
+      applyHash()
+    } catch (e) {
+      toast(`保存失败:${e.message}`, 'danger', toastOptsFromError(e))
+    }
+  }))
+}
+
+function _openOrgCreditsModal(d) {
+  openModal(`
+    <h3>调整组织余额 · ${escapeHtml(d.name)}</h3>
+    <div class="form-row"><label>当前余额</label>
+      <input type="text" value="${escapeHtml(fmtCents(d.credits))}" disabled /></div>
+    <div class="form-row"><label>变动金额(¥,正数入账 / 负数扣减,如 1.50 或 -0.25)</label>
+      <input type="text" id="org-c-delta" placeholder="¥ 金额" />
+      <small class="hint" id="org-c-preview">解析后:—</small></div>
+    <div class="form-row"><label>备注(memo)</label>
+      <input type="text" id="org-c-memo" placeholder="调整原因" /></div>
+    <div class="form-actions">
+      <button id="org-c-cancel">取消</button>
+      <button class="btn-primary" id="org-c-ok">提交</button>
+    </div>
+  `)
+  const preview = $('org-c-preview')
+  $('org-c-delta').addEventListener('input', () => {
+    const raw = $('org-c-delta').value
+    const cents = parseYuanToCents(raw)
+    preview.textContent = cents == null
+      ? (raw.trim() === '' ? '解析后:—' : '解析后:无效金额')
+      : `解析后:${fmtCents(cents)}(${cents} 分)`
+  })
+  $('org-c-cancel').addEventListener('click', closeModal)
+  $('org-c-ok').addEventListener('click', (ev) => withBtnLoading(ev.currentTarget, async () => {
+    const cents = parseYuanToCents($('org-c-delta').value)
+    if (cents == null) { toast('金额必须是非零数字,最多 2 位小数(如 1.00 / -0.50)', 'danger'); return }
+    const memo = $('org-c-memo').value.trim()
+    if (!memo) { toast('memo 不能为空', 'danger'); return }
+    try {
+      await apiJson('POST', `/api/admin/orgs/${encodeURIComponent(d.id)}/credits`,
+        { delta: String(cents), memo })
+      toast('余额已调整', 'ok')
+      closeModal()
+      applyHash()
+    } catch (e) {
+      // 批次 B 未上线前后端返回 501(body 带 message)—— 按 message 提示,功能占位不崩溃
+      toast(e.message, e.status === 501 ? 'warn' : 'danger', toastOptsFromError(e))
+      if (e.status === 501) closeModal()
+    }
+  }))
+}
+
+async function _loadOrgInvoices() {
+  const sp = new URLSearchParams()
+  if (ORG_STATE.invoiceStatus) sp.set('status', ORG_STATE.invoiceStatus)
+  const qs = sp.toString()
+  let data
+  try {
+    data = await apiGet(`/api/admin/org-invoices${qs ? `?${qs}` : ''}`)
+  } catch (e) {
+    if (_currentTab !== 'org') return
+    const c = $('org-inv-container')
+    if (c) c.innerHTML = `<div class="empty" style="color:var(--danger)">加载失败:${escapeHtml(e.message || String(e))}</div>`
+    return
+  }
+  if (_currentTab !== 'org') return
+  _renderOrgInvoices(data?.rows ?? [])
+}
+
+function _renderOrgInvoices(allRows) {
+  const filter = ORG_STATE.invoiceOrgFilter
+  const rows = filter
+    ? allRows.filter((r) => String(r.org_id) === String(filter.id))
+    : allRows
+
+  const chipHost = $('org-inv-orgfilter')
+  if (chipHost) {
+    chipHost.innerHTML = filter
+      ? `已筛选组织:<strong>${escapeHtml(filter.name)}</strong> <button class="btn btn-link" data-act="org-inv-clearfilter" style="padding:2px 8px;">清除</button>`
+      : ''
+    chipHost.querySelector('button[data-act="org-inv-clearfilter"]')?.addEventListener('click', () => {
+      ORG_STATE.invoiceOrgFilter = null
+      _loadOrgInvoices()
+    })
+  }
+
+  const cnt = $('org-inv-count'); if (cnt) cnt.textContent = `共 ${rows.length} 条`
+  const c = $('org-inv-container')
+  if (!c) return
+  if (rows.length === 0) { c.innerHTML = '<div class="empty">暂无开票申请</div>'; return }
+  c.innerHTML = `
+    <table class="data">
+      <thead>
+        <tr><th>组织</th><th>金额</th><th>订单</th><th>状态</th><th>申请时间</th><th>备注</th><th class="actions">操作</th></tr>
+      </thead>
+      <tbody>
+        ${rows.map((r) => {
+          const badge = ORG_INVOICE_STATUS_BADGE[r.status] || 'muted'
+          const orderIds = Array.isArray(r.order_ids) ? r.order_ids.join(', ') : String(r.order_ids ?? '')
+          const note = r.admin_note ? escapeHtml(r.admin_note) : '<span style="opacity:0.5">—</span>'
+          const actions = r.status === 'pending'
+            ? `<button data-act="inv-issue" data-id="${escapeHtml(String(r.id))}">开票</button>
+               <button class="btn-danger" data-act="inv-reject" data-id="${escapeHtml(String(r.id))}">拒绝</button>`
+            : '<span style="opacity:0.5">已处理</span>'
+          return `
+          <tr>
+            <td>${escapeHtml(r.org_name || '')} <code style="opacity:0.6">#${escapeHtml(String(r.org_id))}</code></td>
+            <td class="num">${fmtCents(r.amount_cents)}</td>
+            <td class="mono" style="max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${escapeHtml(orderIds)}">${escapeHtml(orderIds) || '—'}</td>
+            <td><span class="badge ${badge}">${escapeHtml(ORG_INVOICE_STATUS_LABELS[r.status] || r.status || '—')}</span></td>
+            <td>${escapeHtml(fmtDate(r.created_at))}</td>
+            <td>${note}</td>
+            <td class="actions">${actions}</td>
+          </tr>`
+        }).join('')}
+      </tbody>
+    </table>`
+  for (const b of c.querySelectorAll('button[data-act="inv-issue"]')) {
+    b.addEventListener('click', (ev) => withBtnLoading(ev.currentTarget, () => _processOrgInvoice(b.dataset.id, 'issued')))
+  }
+  for (const b of c.querySelectorAll('button[data-act="inv-reject"]')) {
+    b.addEventListener('click', () => _openInvoiceRejectModal(b.dataset.id))
+  }
+}
+
+async function _processOrgInvoice(id, status, note) {
+  const body = { status }
+  if (note != null) body.admin_note = note
+  try {
+    await apiJson('PATCH', `/api/admin/org-invoices/${encodeURIComponent(id)}`, body)
+    toast(status === 'issued' ? '已开票' : '已拒绝', 'ok')
+    await _loadOrgInvoices()
+    return true
+  } catch (e) {
+    toast(`操作失败:${e.message}`, 'danger', toastOptsFromError(e))
+    return false
+  }
+}
+
+function _openInvoiceRejectModal(id) {
+  openModal(`
+    <h3>拒绝开票申请</h3>
+    <div class="form-row"><label>拒绝理由(admin_note,会记录并展示)</label>
+      <textarea id="org-inv-note" rows="3" placeholder="填写拒绝原因"></textarea></div>
+    <div class="form-actions">
+      <button id="org-inv-cancel">取消</button>
+      <button class="btn-danger" id="org-inv-reject-ok">确认拒绝</button>
+    </div>
+  `)
+  $('org-inv-cancel').addEventListener('click', closeModal)
+  $('org-inv-reject-ok').addEventListener('click', (ev) => withBtnLoading(ev.currentTarget, async () => {
+    const note = $('org-inv-note').value.trim()
+    if (!note) { toast('请填写拒绝理由', 'danger'); return }
+    const ok = await _processOrgInvoice(id, 'rejected', note)
+    if (ok) closeModal()
+  }))
 }
 
 // ─── Tab: Model Grants(0049 模型可见性 / 用户级灰度授权)─────────
