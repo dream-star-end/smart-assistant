@@ -140,12 +140,14 @@ smoke() {
   #   codexRefresh / codexDriftReconciler(codex OAuth 重接入后 v5-owned:账号池查询
   #     按 runtime_channel 圈定只动 v5 codex 行;v5 不跑则 v5 codex token 无人续期、
   #     禁用账号绑定漂移无人对账。feat/v5-codex-oauth-egress 删两个 DISABLED 旗标后启用)
+  #   providerHealth(P3.2:egress 写 provider_health_samples,master 判定写 provider_ops
+  #     健康列,均 v5 引入表 / v3 树无代码;仅 health_mode='auto' 自动转移)
   # 隔离不变量升级为**白名单**:schedulers 出现任何名单外条目 = shared 域泄漏,FAIL。
   # (服务端 index.ts 有同语义的 fail-closed 拒启断言,本处是部署面第二道防线。)
   echo "$hz" | grep -q '"channel":"v5"' || { echo "✗ channel != v5" >&2; return 1; }
   local scheds allowed bad
   scheds="$(echo "$hz" | grep -o '"schedulers":\[[^]]*\]' | sed 's/.*\[//;s/\]//;s/"//g')"
-  allowed="subscriptionRollover accountSlotReaper researchJobs codexRefresh codexDriftReconciler marketplaceAiReview orphanReconcile"
+  allowed="subscriptionRollover accountSlotReaper researchJobs codexRefresh codexDriftReconciler marketplaceAiReview orphanReconcile providerHealth"
   bad=""
   IFS=',' read -ra _sarr <<<"$scheds"
   for s in "${_sarr[@]}"; do

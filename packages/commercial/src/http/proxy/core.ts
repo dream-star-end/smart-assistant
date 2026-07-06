@@ -51,6 +51,7 @@ import {
   incrAnthropicProxySettle,
   incrAnthropicProxyReject,
 } from "../../admin/metrics.js";
+import { recordProviderHealthSample } from "./providerHealthSink.js";
 
 // ─── 上下文 ────────────────────────────────────────────────────────────────
 
@@ -222,6 +223,11 @@ export async function runUpstreamRoundTrip(ctx: RoundTripCtx): Promise<void> {
         await finalize.fail(observed, err);
       }
       incrAnthropicProxySettle("aborted");
+      // P3.2 健康信号:上游 5xx / 429(过载)算 provider 侧失败;4xx(含 400 客户端 body 损坏、
+      // 内容策略拒绝)不归 provider 健康,避免误判(fire-and-forget,只静态 provider 记)。
+      if (!isClientBadRequest && (upstream.status >= 500 || upstream.status === 429)) {
+        recordProviderHealthSample(body.model, "upstream_5xx");
+      }
       sendJsonError(res, 502, "UPSTREAM_ERROR", `upstream returned ${upstream.status}`, requestId);
       return;
     }
@@ -229,6 +235,7 @@ export async function runUpstreamRoundTrip(ctx: RoundTripCtx): Promise<void> {
       const err = new Error(`upstream ${upstream.status} but no body`);
       await finalize.fail(observed, err);
       incrAnthropicProxySettle("aborted");
+      recordProviderHealthSample(body.model, "upstream_5xx"); // 2xx 却无 body = provider 返回畸形
       sendJsonError(res, 502, "UPSTREAM_NO_BODY", "upstream returned no body", requestId);
       return;
     }
@@ -276,11 +283,14 @@ export async function runUpstreamRoundTrip(ctx: RoundTripCtx): Promise<void> {
     if (result.error !== null) {
       if (isClientAbort(result.error)) {
         outcome = await finalize.failClient(observed, result.error);
+        recordProviderHealthSample(body.model, "aborted"); // 客户端断:judgement 排除,不算 provider 失败
       } else {
         outcome = await finalize.fail(observed, result.error);
+        recordProviderHealthSample(body.model, "partial"); // 中途断流 = provider 侧失败
       }
     } else {
       outcome = await finalize.commit(observed);
+      recordProviderHealthSample(body.model, "final"); // 完整完成:抽样 1/10
     }
     // 把真实扣费的积分 + 扣费后余额推给该 uid 的前端 WS,前端会替换响应 meta
     // 行里 $0.xxxx(容器侧估算,口径不一致)为真实扣费积分。
@@ -360,8 +370,10 @@ export async function runUpstreamRoundTrip(ctx: RoundTripCtx): Promise<void> {
     // 仅按 err 形状判定,见 isClientAbort 注释。
     if (isClientAbort(err)) {
       await finalize.failClient(observed, err);
+      recordProviderHealthSample(body.model, "aborted"); // 客户端断:judgement 排除
     } else {
       await finalize.fail(observed, err);
+      recordProviderHealthSample(body.model, "timeout"); // fetch 抛错:超时/DNS/socket = provider 不可达
     }
     incrAnthropicProxySettle("aborted");
     // 字节是否已 flush 决定怎么发错误

@@ -136,6 +136,10 @@ import {
   type MarketplaceAiReviewSchedulerHandle,
 } from "./marketplace/aiReview.js";
 import {
+  startProviderHealthScheduler,
+  type ProviderHealthSchedulerHandle,
+} from "./admin/providerHealthScheduler.js";
+import {
   makeAnthropicProxyHandler,
   type AnthropicProxyHandler,
 } from "./http/anthropicProxy.js";
@@ -3311,6 +3315,22 @@ export async function registerCommercial(
     }));
   }
 
+  // provider 健康度自动探测判定器(P3.2)。egress 在流 settle 写 provider_health_samples,
+  // 本 scheduler(master)每 60s 评估近窗口失败率/连续失败 → 写 provider_ops 健康列并在状态
+  // 转移时告警(仅 health_mode='auto' 自动转移;forced_* 尊重 admin)。默认影子(判定+标注开,
+  // 503 拦截另由 OC_PROVIDER_HEALTH_ENFORCE 控)。domain 'v5-owned':provider_ops /
+  // provider_health_samples 是 v5 引入表、样本由 v5 egress 写、v3 树无对应代码。关停:
+  // OC_PROVIDER_HEALTH_DISABLED=1。
+  let providerHealthScheduler: ProviderHealthSchedulerHandle | undefined;
+  if (
+    runtimeChannel === "v5" &&
+    process.env.OC_PROVIDER_HEALTH_DISABLED !== "1"
+  ) {
+    const raw = Number(process.env.OC_PROVIDER_HEALTH_INTERVAL_MS);
+    const intervalMs = Number.isFinite(raw) && raw >= 10_000 ? raw : 60_000;
+    providerHealthScheduler = trackScheduler("providerHealth", "v5-owned", startProviderHealthScheduler({ intervalMs }));
+  }
+
   // v5 灰度可观测 — runtimeStatus 暴露给 gateway /healthz,作为"控制面静默 / 运行时隔离 /
   // 灰度归属"的只读断言面(P4 可观测前移)。
   // enabledSchedulers 由归属登记表派生 —— 不再手工维护清单(此前 subscriptionRollover /
@@ -3427,6 +3447,9 @@ export async function registerCommercial(
       }
       if (marketplaceAiReviewScheduler) {
         try { marketplaceAiReviewScheduler.stop(); } catch { /* ignore */ }
+      }
+      if (providerHealthScheduler) {
+        try { providerHealthScheduler.stop(); } catch { /* ignore */ }
       }
       if (baselineSrv) {
         try { await baselineSrv.stop(); } catch { /* ignore */ }

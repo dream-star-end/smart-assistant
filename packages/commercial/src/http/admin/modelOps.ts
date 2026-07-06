@@ -23,6 +23,7 @@ import {
   type PutProviderOpsInput,
   type ModelUsageWindow,
 } from "../../admin/modelOps.js";
+import { invalidateDegradedProvidersCache } from "../../admin/providerHealthGate.js";
 import { snapshotInflight, type InflightSnapshot } from "../proxy/inflightTracker.js";
 import {
   ocGatewayIpForChannel,
@@ -203,6 +204,13 @@ export async function handleAdminPutProviderOps(
     }
     input.concurrency_limit = b.concurrency_limit as number | null;
   }
+  if (b.health_mode !== undefined) {
+    if (typeof b.health_mode !== "string") {
+      throw new HttpError(400, "VALIDATION", "health_mode must be string");
+    }
+    // 具体枚举校验在 putProviderOps.normalizeHealthMode(RangeError → translateRangeError → 400)。
+    input.health_mode = b.health_mode as PutProviderOpsInput["health_mode"];
+  }
 
   try {
     await putProviderOps(id, input, {
@@ -210,6 +218,8 @@ export async function handleAdminPutProviderOps(
       ip: ctx.clientIp,
       userAgent: ctx.userAgent,
     });
+    // health_mode 改动即时生效:清本进程 gate 缓存(egress 进程按其 TTL 自然刷新)。
+    invalidateDegradedProvidersCache();
   } catch (err) {
     if (err instanceof UnknownProviderError) throw new HttpError(404, "NOT_FOUND", err.message);
     if (err instanceof RangeError) translateRangeError(err);

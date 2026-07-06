@@ -1,14 +1,22 @@
 import { DEFAULT_CODEX_ENGINE_MODEL } from "@openclaude/protocol";
-import { Check, ChevronDown, Cpu, Users } from "lucide-react";
+import { AlertTriangle, Check, ChevronDown, Cpu, Users } from "lucide-react";
 import type { PublicModel } from "../lib/types";
 import { cn } from "../lib/utils";
 import {
+  Badge,
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
   DropdownMenuLabel,
   DropdownMenuTrigger,
 } from "./ui";
+
+/**
+ * 模型是否被后端标注为降级(0108 provider 健康度)。前端类型宽松透传,运行时 narrowing。
+ */
+export function isDegraded(m: PublicModel): boolean {
+  return (m as { degraded?: unknown }).degraded === true;
+}
 
 /**
  * 模型展示名。后端 PublicModel.display_name 是权威标签（pricing.ts），但前端类型
@@ -57,6 +65,9 @@ export function ModelSelector({
   teamEngineActive?: boolean;
 }) {
   const selected = models.find((m) => m.id === selectedId);
+  // 已选模型被降级(且非团队模式覆盖态)→ 菜单顶部提示条建议换模;可用替代 = 下方未降级模型。
+  const selectedDegraded = selected ? isDegraded(selected) : false;
+  const hasAlternatives = models.some((m) => !isDegraded(m) && m.id !== selectedId);
   const engineLabel = teamEngineLabel(models);
   const label = teamEngineActive
     ? `团队模式 · ${engineLabel}`
@@ -107,23 +118,43 @@ export function ModelSelector({
             </span>
           </div>
         )}
+        {selectedDegraded && !teamEngineActive && (
+          <div
+            role="note"
+            className="mx-1 mb-1 rounded-md bg-danger-soft px-2.5 py-2 text-xs leading-relaxed"
+          >
+            <span className="flex items-center gap-1.5 font-medium text-danger">
+              <AlertTriangle size={12} className="shrink-0" /> 当前模型暂不可用
+            </span>
+            <span className="mt-0.5 block text-muted">
+              {hasAlternatives
+                ? "该服务商暂时降级,建议改用下方可用模型。"
+                : "该服务商暂时降级,暂无同类可用模型,请稍后重试。"}
+            </span>
+          </div>
+        )}
         {models.map((m) => {
           const active = m.id === selectedId;
+          const degraded = isDegraded(m);
           return (
             <DropdownMenuItem
               key={m.id}
-              onSelect={() => onSelect(m.id)}
+              disabled={degraded}
+              onSelect={degraded ? undefined : () => onSelect(m.id)}
               className="justify-between"
             >
               <span className="truncate">{modelLabel(m)}</span>
-              {active && (
-                <span className="flex shrink-0 items-center gap-1.5">
-                  {teamEngineActive && (
-                    <span className="text-[11px] text-faint">团队模式关闭后生效</span>
-                  )}
-                  <Check size={14} className="shrink-0 text-accent" />
-                </span>
-              )}
+              <span className="flex shrink-0 items-center gap-1.5">
+                {degraded && <Badge tone="danger">暂不可用</Badge>}
+                {active && !degraded && (
+                  <>
+                    {teamEngineActive && (
+                      <span className="text-[11px] text-faint">团队模式关闭后生效</span>
+                    )}
+                    <Check size={14} className="shrink-0 text-accent" />
+                  </>
+                )}
+              </span>
             </DropdownMenuItem>
           );
         })}

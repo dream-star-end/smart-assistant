@@ -4884,6 +4884,10 @@ function _renderProviderCard(p) {
         <span class="modelops-endpoint">${escapeHtml(p.endpoint || '—')}</span>${egressChip}
       </div>
       <div class="modelops-provider-row"><label>延迟</label>${latencyHtml}</div>
+      <div class="modelops-provider-row"><label>健康</label>${_healthBadge(p)}</div>
+      <div class="modelops-provider-row modelops-health-modes">
+        <label>降级策略</label>${_healthModeButtons(p)}
+      </div>
       ${sparkHtml}
       <div class="modelops-provider-row">
         <label>并发</label>
@@ -4917,6 +4921,50 @@ function _isoToLocalDateInput(iso) {
   const d = new Date(iso)
   if (Number.isNaN(d.getTime())) return ''
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
+}
+
+/** 健康 badge(0108):healthy 绿 / degraded 红;forced 标注 + 生效理由/since 走 title+small。 */
+function _healthBadge(p) {
+  const h = p.health || { effective: 'healthy', mode: 'auto', observed: 'healthy', since: null, reason: null }
+  const deg = h.effective === 'degraded'
+  const cls = deg ? 'danger' : 'ok'
+  const modeTag = h.mode === 'forced_degraded' ? ' · 强制降级' : h.mode === 'forced_healthy' ? ' · 强制健康' : ''
+  const notes = []
+  if (deg && h.since) notes.push(`${fmtRelative(h.since)}起`)
+  if (deg && h.reason) notes.push(h.reason)
+  // forced 模式下观测与生效相反 → 提示真相(强制健康压住了实测降级,反之亦然)
+  if ((h.mode === 'forced_healthy' && h.observed === 'degraded') ||
+      (h.mode === 'forced_degraded' && h.observed === 'healthy')) {
+    notes.push(`实测${h.observed === 'degraded' ? '降级' : '健康'}`)
+  }
+  const title = notes.length ? ` title="${escapeHtml(notes.join(' · '))}"` : ''
+  const small = notes.length ? ` <small style="color:var(--muted)">${escapeHtml(notes.join(' · '))}</small>` : ''
+  return `<span class="badge ${cls}"${title}>${deg ? '降级' : '健康'}${modeTag}</span>${small}`
+}
+
+/** 健康三态手动按钮:auto(自动)/ forced_degraded(强制降级)/ forced_healthy(强制健康)。当前档禁点。 */
+function _healthModeButtons(p) {
+  const mode = (p.health && p.health.mode) || 'auto'
+  const btn = (act, m, label) =>
+    `<button class="btn" data-act="${act}"${mode === m ? ' disabled' : ''}>${mode === m ? '✓ ' : ''}${label}</button>`
+  return btn('health-auto', 'auto', '自动') +
+    btn('health-force-degrade', 'forced_degraded', '强制降级') +
+    btn('health-force-recover', 'forced_healthy', '强制健康')
+}
+
+/** 三态按钮 → PUT provider_ops health_mode(稀疏合并:只发 health_mode,后端保留其余字段)。 */
+async function _setProviderHealthMode(id, mode, card, btn) {
+  const orig = MODEL_OPS_STATE.providers.get(id)
+  await withBtnLoading(btn, async () => {
+    try {
+      await apiJson('PUT', `/api/admin/providers/${encodeURIComponent(id)}`, { health_mode: mode })
+      const label = mode === 'auto' ? '自动' : mode === 'forced_degraded' ? '强制降级' : '强制健康'
+      toast(`${(orig && orig.display_name) || id} 降级策略 → ${label}`)
+      await _refreshProviderCard(id)
+    } catch (e) {
+      toast(`设置失败: ${e.message}`, 'danger', toastOptsFromError(e))
+    }
+  })
 }
 
 /** 订阅到期倒计时 badge:<7天 danger / <30天 warn / 其余 muted;null=长期 */
@@ -4977,10 +5025,17 @@ function _drawProviderSparkline(p) {
 }
 
 function _onProviderGridClick(e) {
-  const btn = e.target.closest('button[data-act="save-provider"]')
+  const btn = e.target.closest('button[data-act]')
   if (!btn) return
   const card = btn.closest('[data-provider-id]')
-  if (card) _saveProvider(card.dataset.providerId, card, btn)
+  if (!card) return
+  const id = card.dataset.providerId
+  switch (btn.dataset.act) {
+    case 'save-provider': _saveProvider(id, card, btn); break
+    case 'health-auto': _setProviderHealthMode(id, 'auto', card, btn); break
+    case 'health-force-degrade': _setProviderHealthMode(id, 'forced_degraded', card, btn); break
+    case 'health-force-recover': _setProviderHealthMode(id, 'forced_healthy', card, btn); break
+  }
 }
 
 async function _saveProvider(id, card, btn) {
