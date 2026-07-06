@@ -161,6 +161,15 @@ describe("auth.register (integ)", () => {
     assert.equal(u.rows[0].role, "user");
     assert.equal(u.rows[0].status, "active");
 
+    // v3 退役:新号建号即 v5 原生(v5_migrated_at 非空 + status=migrated),
+    // 满足 0099 consistency CHECK,永不落 v3。
+    const v5row = await query<{ migrated_at: string | null; mstatus: string | null }>(
+      "SELECT v5_migrated_at::text AS migrated_at, v5_migration_status AS mstatus FROM users WHERE id = $1",
+      [result.user_id],
+    );
+    assert.notEqual(v5row.rows[0].migrated_at, null, "新号应即 v5 原生(v5_migrated_at 非空)");
+    assert.equal(v5row.rows[0].mstatus, "migrated");
+
     // 2026-04-29 反薅羊毛改造:注册时不再发赠金,credits=0,ledger 0 行。
     // 赠金延后到 verifyEmail 时刻发(防"批量注册不读邮件"的薅羊毛 pipeline)。
     const credRow = await query<{ credits: string }>(

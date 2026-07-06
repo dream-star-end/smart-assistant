@@ -258,9 +258,12 @@ export async function register(
     userId = await tx<string>(async (client) => {
       // INSERT user;email UNIQUE 约束撞了会抛 23505。
       // credits 不带,默认 0 —— 注册赠金延后到 verifyEmail 时刻发放(反薅羊毛)。
+      // v3 退役:新号直接 v5 原生(v5_migrated_at=NOW()+status=migrated,满足 0099
+      // consistency CHECK)。新号无 v3 数据,迁移是 no-op,故在建号时就置权威源,
+      // routeChannelForUser 恒返回 v5、v3MayServe 恒 false → 永不 provisioning v3 容器。
       const ins = await client.query<{ id: string }>(
-        `INSERT INTO users(email, password_hash)
-         VALUES ($1, $2)
+        `INSERT INTO users(email, password_hash, v5_migrated_at, v5_migration_status)
+         VALUES ($1, $2, NOW(), 'migrated')
          RETURNING id::text AS id`,
         [input.email, passwordHash],
       );

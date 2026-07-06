@@ -294,10 +294,12 @@ export async function socialLoginOrCreate(
     await client.query('SAVEPOINT social_user_insert')
     let newUserId: string
     try {
+      // v3 退役:社交登录建的新号同样 v5 原生(见 register.ts 同款注释)。
       const insUser = await client.query<{ id: string }>(
         `INSERT INTO users(email, password_hash, email_verified,
-                           display_name, avatar_url, credits)
-         VALUES ($1, $2, TRUE, $3, $4, $5::bigint)
+                           display_name, avatar_url, credits,
+                           v5_migrated_at, v5_migration_status)
+         VALUES ($1, $2, TRUE, $3, $4, $5::bigint, NOW(), 'migrated')
          RETURNING id::text AS id`,
         [synEmail, placeholderHash, input.username, input.avatarUrl, bonusCents.toString()],
       )
