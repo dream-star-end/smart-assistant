@@ -229,3 +229,9 @@ BEGIN; <迁移 SQL>; INSERT INTO schema_migrations(version, applied_at) VALUES (
 ## 6. 本手册的维护
 
 每次踩到新坑/建立新机制,**当场更新本文对应小节**(部署类进 §4,定位类进 §3,债进 §5),并同步 bump 相关 skill(`~/.claude/skills/v5-*`)。文档腐烂比没有文档更危险。
+
+### 0105 模型与服务商运维页(2026-07-06)速记
+- 服务商枚举权威 = protocol STATIC_KEY_PROVIDERS(+codex 虚拟条目);provider_ops 表**稀疏**只存运维字段,首次 PUT 建行 —— 新增 provider 本页零改动,严禁再造种子清单。
+- model_pricing 放开价格列编辑的四重护栏:normalizePriceCents 十进制整数分 + DB CHECK>=0 + 逐列审计 + **lock_version 整数乐观锁**(价格列强制 if_match;不要用 updated_at 毫秒比较,timestamptz 微秒会被 pg→JS 截断)。
+- per-model default_effort:注入点在 proxy authorize 后(合并不覆盖 client 显式值);适用性按 spec 推导(allowedOutputConfigEfforts 白名单 / strip output_config→不适用 / deepseek+OAuth 透传全枚举)。
+- egress latencyProber:transport 语义(GET 上游端点,零配额),dispatcher 必须按 STATIC_PROVIDER_META.egress 复刻;in-flight guard 防 tick 重叠。
