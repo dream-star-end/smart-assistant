@@ -212,8 +212,8 @@ BEGIN; <迁移 SQL>; INSERT INTO schema_migrations(version, applied_at) VALUES (
 | 债 | 内容 | 偿还触发 |
 |---|---|---|
 | ~~团队卡 server-authored 化~~ **已偿还**(4202986b+ac966d6f,P2 批次2) | 生成点=handleDelegateTask 收尾(parser Agent 排除保留);sink agentGroups[]→master role 'agent-group'(srv-*,_delegateStatus 三态)→storage/前端按 _delegateRunId **local-wins** 去重;server 行=骨架+终态(过程树有意不持久化,本设备 IndexedDB 承载)。**部署红线:master-first**(strict schema 新字段,新 gateway→旧 master 400 fatal-drop 整包)。TeamPanel 同批改按 turn 锚点归组 | — |
-| hidden reviewer pipeline 硬编排 | 审查行为纯 prompt 驱动(何时审/verdict 解读/披露全是软约束),现只有次数熔断止血;正解=gateway 代码触发 review pass+结构化 verdict+落 runLog | 团队模式质量投诉,或下次改团队编排 |
-| 审查成本用户披露 | reviewer GLM turn 实扣用户钱但无提示 | 计费透明度需求 |
+| ~~hidden reviewer pipeline 硬编排~~ **已偿还**(9c36c34a,P2 批次3) | 审查触发权威=gateway `_runTeamReviewPass`(队长 final 放行前代码触发,verdict 协议 PASS/NEEDS_FIX 统一,迭代封顶2轮);preamble 软约束已退役;12 条失败路径全 fail-open(队长绝不卡死);runLog isReview/verdict 打标 | — |
+| ~~审查成本用户披露~~ **已偿还**(9c36c34a+167f1628) | drain 时按 agent 分组附队长行 usage.delegates[](纯展示,不碰扣费收口);前端裁决徽记+积分明细;粒度=同 agentId 多轮合计 | — |
 | ~~可见性黑名单散点~~ **已偿还**(781108ce,P2 批次1) | 权威源上移 @openclaude/protocol agentVisibility(entrypoint 编译期共享,不再手抄);枚举面统一走 `_getAgentsConfigUserView()`/`filterUserVisibleByAgentField`,判定/执行面保留全量 predicate。新增枚举面必须走投影,新增系统 agent 只改 protocol 一处 | — |
 | feat/v5-copy-no-ai | 去 AI 措辞 chore(43d0078a)基老未合 | 下次文案批次重做 |
 | oc-browser chrome 通道 | v5 已修(--browser chromium),**v3 同病未修** | v3 浏览器问题报障时 |
@@ -221,7 +221,7 @@ BEGIN; <迁移 SQL>; INSERT INTO schema_migrations(version, applied_at) VALUES (
 | 委派并行无机制 | delegate_task 单次单个且同步阻塞,并行完全赖引擎行为;多成员+审查可串行阻塞小时级 | 同上(fan-out 原语) |
 | 普通成员串行无上限 | 熔断只覆盖 hidden-reviewer;同 turn 串行委派普通成员不设限,成本失控面 | 团队止血批次或产品化时一并加 |
 | teamMode 全局粘滞开关 | localStorage 设备级 flag;wave1 只加可见指示,per-session 化未做 | 团队产品化时改会话级 |
-| TeamPanel 聚合脆弱 | 依赖"连续渲染行"聚合;_activeDelegations 容器全局计数,cron/他会话挤兑并发额度 | 改团队渲染/并发时 |
+| ~~TeamPanel 聚合脆弱~~ **已偿还**(批次2渲染+批次3并发) | coalesceTeam 改按 turn 锚点(最近 user 消息边界)归组;_activeDelegations 加 per-parent 分桶+review 保留槽 | — |
 | landing 团队演示错位 | 动态角色/成员并行/过程账本三点与实现不符 | 产品化后对齐,或先行弱化文案 |
 
 ---
