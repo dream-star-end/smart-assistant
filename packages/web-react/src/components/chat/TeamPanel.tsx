@@ -12,14 +12,19 @@
  * memo:本组件收 {members, sig},reducer 就地 mutate 成员对象(引用不变),故以合并 sig 比较
  * (上层 MessageList 用每个成员的 messageSignature 拼出),sig 变才重渲——同 MessageRenderer 防闪模式。
  */
-import { Check, ChevronRight, Users, X } from "lucide-react";
+import { Check, ChevronRight, Clock, Users, X } from "lucide-react";
 import { memo, useEffect, useState } from "react";
-import type { ChatMessage } from "../../lib/chat/model";
-import { childSignature } from "../../lib/chat/render";
+import { type ChatMessage, isServerAuthoredRow } from "../../lib/chat/model";
+import { agentTerminalStatus, childSignature } from "../../lib/chat/render";
 import { cn } from "../../lib/utils";
 import { Badge, Spinner } from "../ui";
 import { ChildBlockView } from "./AgentGroupCard";
 import { agentDisplayName } from "./agentNames";
+
+/** 队员是否运行中:server-authored 骨架行是终态快照,永不"运行中"。 */
+function memberRunning(msg: ChatMessage): boolean {
+  return !msg._completed && !isServerAuthoredRow(msg);
+}
 
 /** 队员显示名:优先委派的 agentId(经系统 agent 静态映射转显示名——hidden-reviewer 等被
  *  管理 API 404 隐藏、解析不到 displayName;用户级 id 本身可读直接回退),空则按序号兜底。 */
@@ -34,13 +39,15 @@ function memberName(msg: ChatMessage, idx: number): string {
 
 /** 单个队员行:可折叠,运行中默认展开看进度、完成默认收起(显示结果摘要)。 */
 function TeamMemberRow({ msg, idx }: { msg: ChatMessage; idx: number }) {
-  const running = !msg._completed;
-  const isError = !!msg._isError;
+  const isServerRow = isServerAuthoredRow(msg);
+  const running = memberRunning(msg);
+  const status = agentTerminalStatus(msg);
   const [userOpen, setUserOpen] = useState<boolean | null>(null);
   const open = userOpen ?? running;
   const children = msg.childBlocks ?? [];
   const name = memberName(msg, idx);
   const goal = msg._delegateGoal || msg.text || "";
+  const terminalNoChildren = !running && children.length === 0;
 
   return (
     <div className="overflow-hidden rounded-lg border border-border/70 bg-bg">
@@ -54,12 +61,22 @@ function TeamMemberRow({ msg, idx }: { msg: ChatMessage; idx: number }) {
             "flex size-5 shrink-0 items-center justify-center rounded-md",
             running
               ? "bg-accent-soft text-accent"
-              : isError
-                ? "bg-danger-soft text-danger"
-                : "bg-success-soft text-success",
+              : status.tone === "warning"
+                ? "bg-warning-soft text-warning"
+                : status.tone === "danger"
+                  ? "bg-danger-soft text-danger"
+                  : "bg-success-soft text-success",
           )}
         >
-          {running ? <Spinner size={11} /> : isError ? <X size={11} /> : <Check size={11} />}
+          {running ? (
+            <Spinner size={11} />
+          ) : status.tone === "warning" ? (
+            <Clock size={11} />
+          ) : status.tone === "danger" ? (
+            <X size={11} />
+          ) : (
+            <Check size={11} />
+          )}
         </span>
         <span className="min-w-0 flex-1">
           <span className="block truncate text-[12.5px] font-medium text-fg">{name}</span>
@@ -69,8 +86,8 @@ function TeamMemberRow({ msg, idx }: { msg: ChatMessage; idx: number }) {
           {running ? (
             <Badge tone="accent">运行中</Badge>
           ) : (
-            <Badge tone={isError ? "danger" : "success"}>
-              {isError ? "失败" : "完成"}
+            <Badge tone={status.tone}>
+              {status.label}
               {typeof msg._duration === "number" && msg._duration > 0
                 ? ` · ${Math.round(msg._duration / 1000)}s`
                 : ""}
@@ -87,13 +104,24 @@ function TeamMemberRow({ msg, idx }: { msg: ChatMessage; idx: number }) {
               <Spinner size={11} /> 启动中…
             </div>
           )}
+          {/* server 骨架队员(无 childBlocks 过程树):展开态展示结果摘要 + 过程降级说明。 */}
+          {terminalNoChildren && (msg._resultPreview || isServerRow) && (
+            <div className="space-y-1.5">
+              {msg._resultPreview && (
+                <div className="whitespace-pre-wrap break-words text-[12px] leading-relaxed text-muted">
+                  {msg._resultPreview}
+                </div>
+              )}
+              {isServerRow && <div className="text-[11px] text-faint">过程明细仅在发起设备可见</div>}
+            </div>
+          )}
           {children.map((ch, i) => (
             <ChildBlockView key={`${i}-${ch.blockId ?? ch.kind}`} child={ch} sig={childSignature(ch)} />
           ))}
         </div>
       )}
 
-      {!open && msg._completed && msg._resultPreview && (
+      {!open && !running && msg._resultPreview && (
         <div className="flex items-start gap-1.5 border-t border-border/70 px-3 py-1.5 text-[12px] text-muted">
           <Check size={12} className="mt-0.5 shrink-0 text-success" />
           <span className="line-clamp-1">{msg._resultPreview}</span>
@@ -106,9 +134,12 @@ function TeamMemberRow({ msg, idx }: { msg: ChatMessage; idx: number }) {
 export const TeamPanel = memo(
   function TeamPanel({ members }: { members: ChatMessage[]; sig: string }) {
     const total = members.length;
-    const running = members.filter((m) => !m._completed).length;
-    const failed = members.filter((m) => m._completed && m._isError).length;
-    const done = total - running - failed;
+    const running = members.filter((m) => memberRunning(m)).length;
+    // 终态成员按三态分桶(server 行区分超时);运行中不计。
+    const terminal = members.filter((m) => !memberRunning(m));
+    const failed = terminal.filter((m) => agentTerminalStatus(m).tone === "danger").length;
+    const timedOut = terminal.filter((m) => agentTerminalStatus(m).tone === "warning").length;
+    const done = terminal.length - failed - timedOut;
     const allDone = running === 0;
     const [userCollapsed, setUserCollapsed] = useState<boolean | null>(null);
     // 「曾经活跃过」高水位锁存:面板若在用户眼前从运行跑到完成,保持展开(继续展示各队员结果),
@@ -143,6 +174,7 @@ export const TeamPanel = memo(
             )}
             {done > 0 && <span className="text-success">✓ {done} 完成</span>}
             {failed > 0 && <span className="text-danger">✕ {failed} 失败</span>}
+            {timedOut > 0 && <span className="text-warning">⏱ {timedOut} 超时</span>}
             <ChevronRight size={15} className={cn("text-faint transition-transform", !collapsed && "rotate-90")} />
           </span>
         </button>

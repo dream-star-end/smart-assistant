@@ -326,6 +326,86 @@ describe("MessageList coalesceTeam 聚合(零回归关键路径)", () => {
     renderList([g("g1", "A"), g("g2", "B"), g("g3", "C")]);
     expect(screen.getByText("团队协作 · 3 个智能体")).toBeInTheDocument();
   });
+
+  // ── 债A：按 turn 锚点归组(取代相邻连续启发式) ──────────────────────────────
+  test("同一 turn 内穿插非 agent-group 行 → 仍聚成一个团队面板(不再被劈裂)", () => {
+    renderList([
+      mk("user", { id: "u1", text: "组队" }),
+      g("g1", "任务A"),
+      mk("assistant", { id: "a1", text: "队长补充说明" }),
+      g("g2", "任务B"),
+    ]);
+    expect(screen.getByText("团队协作 · 2 个智能体")).toBeInTheDocument();
+  });
+
+  test("跨两轮的委派各自成面板(user 边界 = 独立 turn,不跨轮合并)", () => {
+    renderList([
+      mk("user", { id: "u1", text: "轮1" }),
+      g("g1", "A1"),
+      g("g2", "A2"),
+      mk("user", { id: "u2", text: "轮2" }),
+      g("g3", "B1"),
+      g("g4", "B2"),
+    ]);
+    expect(screen.getAllByText("团队协作 · 2 个智能体")).toHaveLength(2);
+  });
+
+  test("server 骨架行与本地富卡混排同一 turn → 聚一个面板,超时成员单独计数", () => {
+    const serverMember: ChatMessage = {
+      id: "srv-g2",
+      role: "agent-group",
+      text: "server 队员",
+      ts: 1000,
+      _source: "server",
+      _delegate: true,
+      _delegateGoal: "server 队员",
+      _completed: true,
+      _delegateStatus: "timeout",
+    };
+    renderList([
+      mk("user", { id: "u1", text: "组队" }),
+      g("g1", "本地队员", { _completed: true }),
+      mk("assistant", { id: "a1", text: "过渡" }),
+      serverMember,
+    ]);
+    expect(screen.getByText("团队协作 · 2 个智能体")).toBeInTheDocument();
+    expect(screen.getByText(/1 完成/)).toBeInTheDocument();
+    expect(screen.getByText(/1 超时/)).toBeInTheDocument();
+  });
+});
+
+describe("AgentGroupCard server-authored 骨架行渲染(债A)", () => {
+  test("无 childBlocks 的 server 骨架行 → 骨架卡:目标 + 完成徽记 + 结果摘要", () => {
+    renderMsg(
+      mk("agent-group", {
+        id: "srv-g",
+        _source: "server",
+        _delegate: true,
+        text: "跨设备研究",
+        _delegateGoal: "跨设备研究",
+        _completed: true,
+        _delegateStatus: "ok",
+        _resultPreview: "server 端结果摘要",
+      }),
+    );
+    expect(screen.getByText("跨设备研究")).toBeInTheDocument(); // 目标(表头)
+    expect(screen.getByText("完成")).toBeInTheDocument(); // 终态徽记
+    expect(screen.getByText("server 端结果摘要")).toBeInTheDocument(); // resultSummary(折叠态页脚)
+  });
+
+  test("server 骨架行 status=timeout → 超时徽记(即使 _completed 缺省)", () => {
+    renderMsg(
+      mk("agent-group", {
+        id: "srv-t",
+        _source: "server",
+        _delegate: true,
+        text: "超时任务",
+        _delegateStatus: "timeout",
+      }),
+    );
+    expect(screen.getByText("超时")).toBeInTheDocument();
+    expect(screen.queryByText("运行中")).not.toBeInTheDocument(); // server 行永不"运行中"
+  });
 });
 
 describe("MessageList 活跃段归属(turnSegment 收口)", () => {

@@ -27,10 +27,12 @@ import {
 } from "./pure";
 import {
   addMessage,
+  agentGroupRunId,
   type ChatMessage,
   type ChatSession,
   type ChildBlock,
   clearTurnTiming,
+  isServerAuthoredRow,
   markFrameReceived,
   rebuildIndexes,
   resetReplyTracker,
@@ -333,6 +335,8 @@ function bindDelegateRunToGroup(sess: ChatSession, block: { agentId?: string; go
   const candidates = sess.messages.filter(
     (m) =>
       m.role === "agent-group" &&
+      // server-authored 骨架行是跨设备终态快照,永不接收 live 委派绑定/childBlocks(债A)。
+      !isServerAuthoredRow(m) &&
       m._delegate &&
       !m._delegateRunId &&
       m._delegateAgentId === agentId &&
@@ -396,6 +400,8 @@ function mergeDelegateProgressIntoGroup(sess: ChatSession, groupMsg: ChatMessage
 
 function matchesDelegateProgress(groupMsg: ChatMessage, progress: ChatMessage): boolean {
   if (groupMsg.role !== "agent-group" || !groupMsg._delegate || progress.role !== "delegate-progress") return false;
+  // live progress 只绑本地富卡,不落到 server 骨架行(债A：骨架行无过程树,不接收 childBlocks)。
+  if (isServerAuthoredRow(groupMsg)) return false;
   if (progress.runId && groupMsg._delegateRunId === progress.runId) return true;
   if (groupMsg._delegateRunId && progress.runId && groupMsg._delegateRunId !== progress.runId) return false;
   const agentId = groupMsg._delegateAgentId || "";
@@ -452,6 +458,40 @@ function normalizeDelegateToolRow(sess: ChatSession, msg: ChatMessage): boolean 
   return true;
 }
 
+/**
+ * 债A：折叠 server-authored agent-group 骨架行(srv-* 或 _source:'server')按 runId 去重。
+ *  - 本地富卡(m-*)同 runId 存在 → 丢弃 server 骨架(local-wins,保住 childBlocks,永不吞富卡);
+ *  - 多个 server 骨架共享同一 runId → 只留首个(防重复卡)。
+ * 收口在 normalizeDelegateCards(loadStored / applyServerMessages 后),与 persist 合并去重双保险:
+ * 合并去重防「同一数组同时含富卡+骨架」重复渲染;本 fold 兜住其它路径塞进来的重复骨架。
+ */
+function foldServerAuthoredAgentGroups(sess: ChatSession): boolean {
+  const localRichRunIds = new Set<string>();
+  for (const m of sess.messages) {
+    if (m.role === "agent-group" && !isServerAuthoredRow(m)) {
+      const rid = agentGroupRunId(m);
+      if (rid) localRichRunIds.add(rid);
+    }
+  }
+  const seenServerRunIds = new Set<string>();
+  let changed = false;
+  for (const m of [...sess.messages]) {
+    if (m.role !== "agent-group" || !isServerAuthoredRow(m)) continue;
+    const rid = agentGroupRunId(m);
+    if (!rid) continue;
+    if (localRichRunIds.has(rid) || seenServerRunIds.has(rid)) {
+      const idx = sess.messages.indexOf(m);
+      if (idx >= 0) {
+        sess.messages.splice(idx, 1);
+        changed = true;
+      }
+      continue;
+    }
+    seenServerRunIds.add(rid);
+  }
+  return changed;
+}
+
 /** Collapse old/persisted delegate tool + delegate-progress duplicate rows into one agent-group. */
 export function normalizeDelegateCards(sess: ChatSession): void {
   let changed = false;
@@ -461,6 +501,9 @@ export function normalizeDelegateCards(sess: ChatSession): void {
     const group = findSingleMatchingDelegateGroup(sess, progress);
     if (group) changed = mergeDelegateProgressIntoGroup(sess, group, progress) || changed;
   }
+  // 债A：server-authored 骨架行按 runId 折叠(local-wins + 去重)。放在富卡物化之后,
+  // 使 localRichRunIds 已含本轮 tool→agent-group 转换出的富卡。
+  changed = foldServerAuthoredAgentGroups(sess) || changed;
   if (!changed) return;
   sess._blockIdToMsgId = new Map();
   sess._agentGroups = new Map();
@@ -489,7 +532,10 @@ function handleDelegateProgressBlock(sess: ChatSession, block: DelegateProgressB
   if (!block.runId) return;
   let groupMsgId = sess._delegateRunGroups?.get(block.runId);
   if (groupMsgId === undefined) {
-    const bound = sess.messages.find((m) => m.role === "agent-group" && m._delegateRunId === block.runId);
+    // 只绑本地富卡:server-authored 骨架行同 runId 也不接收 live 帧(债A)。
+    const bound = sess.messages.find(
+      (m) => m.role === "agent-group" && !isServerAuthoredRow(m) && m._delegateRunId === block.runId,
+    );
     if (bound) {
       if (!sess._delegateRunGroups) sess._delegateRunGroups = new Map();
       sess._delegateRunGroups.set(block.runId, bound.id);
