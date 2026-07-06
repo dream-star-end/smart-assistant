@@ -77,19 +77,22 @@ describe('team mode hidden reviewer prompt', () => {
   it('rejects hidden reviewer from other user-controlled execution and mutation surfaces', () => {
     const src = readFileSync(SERVER_TS, 'utf8')
     const cronSrc = readFileSync(CRON_TS, 'utf8')
-    assert.match(src, /validateSkillAgentScopeInput[\s\S]*!isHiddenSystemAgentId\(id\)/)
+    // 枚举面(P2 债E 收口):skill 作用域 / webhook·task·cron 列表改走用户可见投影
+    // (_getAgentsConfigUserView / filterUserVisibleByAgentField),不再各自手工过滤;
+    // 守护意图不变=隐藏系统 agent 不进这些枚举面。判定面(下方 404/拒绝)仍用 predicate。
+    assert.match(src, /validateSkillAgentScopeInput[\s\S]*_getAgentsConfigUserView\(\)/)
     assert.match(src, /eventBus\.on\('task\.created'[\s\S]*isHiddenSystemAgentId\(ev\.agentId\)/)
     assert.match(src, /eventBus\.on\('webhook\.received'[\s\S]*isHiddenSystemAgentId\(agentId\)/)
-    assert.match(src, /webhookRouter\?\.list\(\) \?\? \[\]\)\.filter\(\(wh\) => !isHiddenSystemAgentId\(wh\.agent\)\)/)
+    assert.match(src, /filterUserVisibleByAgentField\(this\.webhookRouter\?\.list\(\) \?\? \[\]\)/)
     assert.match(src, /if \(isHiddenSystemAgentId\(wh\.agent\)\)[\s\S]*webhook not found/)
-    assert.match(src, /this\._taskStore\.list\(\)\)\.filter\(\(task\) => !isHiddenSystemAgentId\(task\.agent\)\)/)
+    assert.match(src, /filterUserVisibleByAgentField\(await this\._taskStore\.list\(\)\)/)
     assert.match(src, /const taskAgent = typeof agent === 'string' && agent \? agent : 'main'/)
     assert.match(src, /if \(isHiddenSystemAgentId\(taskAgent\)\) return this\.sendError\(res, 404, 'agent not found'\)/)
     assert.match(src, /if \(parsed\.agent !== undefined && isHiddenSystemAgentId\(parsed\.agent\)\)/)
     assert.match(src, /if \(isHiddenSystemAgentId\(task\.agent\)\)/)
     assert.match(src, /const cronAgent = typeof agent === 'string' && agent \? agent : 'main'/)
     assert.match(src, /if \(isHiddenSystemAgentId\(cronAgent\)\) return this\.sendError\(res, 404, 'agent not found'\)/)
-    assert.match(src, /this\.cron\.listJobsWithMeta\(\)\)\.filter\(\(job\) => !isHiddenSystemAgentId\(job\.agent\)\)/)
+    assert.match(src, /filterUserVisibleByAgentField\(await this\.cron\.listJobsWithMeta\(\)\)/)
     assert.match(cronSrc, /if \(isHiddenSystemAgentId\(job\.agent\)\)/)
   })
 })

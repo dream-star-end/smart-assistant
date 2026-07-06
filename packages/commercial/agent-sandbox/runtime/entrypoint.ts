@@ -37,6 +37,12 @@ import {
 import { createRequire } from "node:module";
 import { join } from "node:path";
 import { isProviderManagedEnvVar } from "/opt/openclaude/claude-code-best/src/utils/managedEnvConstants.ts";
+// 隐藏系统 agent id 的单一权威(与 gateway 编译期共享,不再手抄黑名单)。绝对路径
+// import 与上面 managedEnvConstants 同构:容器内整棵 packages 树在 /opt/openclaude/,
+// entrypoint 用 tsx 直接跑、被 Dockerfile COPY 到 /usr/local/lib/openclaude(父链无
+// node_modules),故用工作区根的绝对源码路径。本文件不进 commercial tsconfig 编译图,
+// 一致性由 runtimeEntrypointPolicy.test.ts 守护。
+import { isHiddenSystemAgentId as isHiddenSystemAgentIdShared } from "/opt/openclaude/packages/protocol/src/agentVisibility.ts";
 
 // entrypoint.ts 文件被 Dockerfile COPY 到 /usr/local/lib/openclaude/,而 yaml 模块装在
 // 容器内 /opt/openclaude/node_modules/yaml(npm workspaces 装到根)。Node ESM/require
@@ -911,8 +917,10 @@ try {
     return isRecord(value) && value.id === id;
   }
 
+  // unknown → 类型收窄适配器,实际成员判定委派给 @openclaude/protocol 单一权威
+  // (上方 isHiddenSystemAgentIdShared)。此处不再手抄 'hidden-reviewer' 字面量。
   function isHiddenSystemAgentId(id: unknown): boolean {
-    return id === "hidden-reviewer";
+    return typeof id === "string" && isHiddenSystemAgentIdShared(id);
   }
 
   function isHiddenSystemAgentRoute(route: unknown): boolean {

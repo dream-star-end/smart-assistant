@@ -13,17 +13,16 @@
  */
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { AgentsConfig, OpenClaudeConfig } from '@openclaude/storage'
-import {
-  filterUserVisibleAgentsForManagement,
-  isHiddenSystemAgentId,
-  userVisibleDefaultAgentId,
-} from './agentVisibility.js'
+import { isHiddenSystemAgentId, userVisibleDefaultAgentId } from './agentVisibility.js'
 import type { RunLog } from './runLog.js'
 import type { SessionManager } from './sessionManager.js'
 
 export interface OpenAICompatDeps {
   config: OpenClaudeConfig
+  /** 全量 agents 配置 —— 用于 /v1/chat/completions 的目标解析与拒绝(判定面)。 */
   agentsConfig: AgentsConfig
+  /** 用户可见投影(隐藏系统 agent 已剔除)—— /v1/models 枚举面消费。 */
+  agentsConfigUserView: AgentsConfig
   sessions: SessionManager
   runLog: RunLog
   readBody: (req: IncomingMessage) => Promise<string>
@@ -55,7 +54,8 @@ export async function handleOpenAIRequest(
 // ── GET /v1/models ──
 
 async function handleModels(res: ServerResponse, deps: OpenAICompatDeps): Promise<void> {
-  const models = filterUserVisibleAgentsForManagement(deps.agentsConfig.agents).map((a) => ({
+  // 枚举面:直接消费用户可见投影(隐藏系统 agent 已在 server 侧剔除)。
+  const models = deps.agentsConfigUserView.agents.map((a) => ({
     id: a.id,
     object: 'model',
     created: Math.floor(Date.now() / 1000),
