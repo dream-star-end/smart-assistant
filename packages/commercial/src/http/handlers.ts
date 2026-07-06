@@ -914,16 +914,28 @@ export async function handleMe(
     status: string;
     created_at: Date;
     on_v5: boolean;
+    // 企业版(P3.1):caller 的 active org 归属(uq_user_active_org 保证至多一行 → 无 cartesian)。
+    // org suspended 仍返回(带 status,前端提示用),故 orgs LEFT JOIN 不按 o.status 过滤。
+    org_id: string | null;
+    org_name: string | null;
+    org_role: "owner" | "admin" | "member" | null;
+    org_status: string | null;
+    org_billing_enabled: boolean | null;
   }>(
     `SELECT u.id::text AS id, u.email, u.email_verified, u.role, u.display_name, u.avatar_url,
             u.credits::text AS wallet_credits,
             COALESCE(us.period_credits, 0)::text AS period_credits,
             (u.credits + COALESCE(us.period_credits, 0))::text AS total_credits,
             u.status, u.created_at,
-            (u.v5_migrated_at IS NOT NULL) AS on_v5
+            (u.v5_migrated_at IS NOT NULL) AS on_v5,
+            o.id::text AS org_id, o.name AS org_name, om.org_role,
+            o.status AS org_status, om.billing_enabled AS org_billing_enabled
        FROM users u
        LEFT JOIN user_subscriptions us
          ON us.user_id = u.id AND us.status = 'active' AND us.period_end > NOW()
+       LEFT JOIN org_memberships om
+         ON om.user_id = u.id AND om.status = 'active'
+       LEFT JOIN orgs o ON o.id = om.org_id
       WHERE u.id = $1`,
     [user.id],
   );
@@ -954,6 +966,17 @@ export async function handleMe(
       wallet_credits: u.wallet_credits,
       period_credits: u.period_credits,
       created_at: u.created_at instanceof Date ? u.created_at.toISOString() : u.created_at,
+      // 企业版(P3.1):org 归属。无 active 成员归属 → null。org suspended 仍返回(带 status)。
+      org:
+        u.org_id !== null
+          ? {
+              id: u.org_id,
+              name: u.org_name,
+              role: u.org_role,
+              status: u.org_status,
+              billing_enabled: u.org_billing_enabled,
+            }
+          : null,
     },
   });
 }
