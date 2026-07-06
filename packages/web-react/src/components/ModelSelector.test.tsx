@@ -85,3 +85,49 @@ describe("ModelSelector 团队模式诚信显示", () => {
     expect(modelLabel({ id: "x" })).toBe("x");
   });
 });
+
+describe("ModelSelector provider 健康度降级(0108)", () => {
+  const DEG_MODELS: PublicModel[] = [
+    { id: "glm-5.2", display_name: "GLM-5.2", degraded: true },
+    { id: "deepseek-v4", display_name: "DeepSeek-V4" },
+    { id: "gpt-5.5", display_name: "GPT-5.5" },
+  ];
+
+  it("degraded 模型显示「暂不可用」徽记且禁选(aria-disabled)", async () => {
+    render(<ModelSelector models={DEG_MODELS} selectedId="deepseek-v4" onSelect={() => {}} />);
+    openMenu(screen.getByRole("button", { name: "选择对话模型" }));
+    const items = await screen.findAllByRole("menuitem");
+    const deg = items.find((i) => i.textContent?.includes("GLM-5.2"));
+    expect(deg).toBeTruthy();
+    expect(deg?.textContent).toContain("暂不可用");
+    expect(deg?.getAttribute("aria-disabled")).toBe("true");
+    // 非降级模型不带徽记
+    const ok = items.find((i) => i.textContent?.includes("DeepSeek-V4"));
+    expect(ok?.textContent).not.toContain("暂不可用");
+  });
+
+  it("degraded 模型点击不触发 onSelect(禁选)", async () => {
+    const onSelect = vi.fn();
+    render(<ModelSelector models={DEG_MODELS} selectedId="deepseek-v4" onSelect={onSelect} />);
+    openMenu(screen.getByRole("button", { name: "选择对话模型" }));
+    const items = await screen.findAllByRole("menuitem");
+    const deg = items.find((i) => i.textContent?.includes("GLM-5.2"));
+    if (deg) fireEvent.click(deg);
+    expect(onSelect).not.toHaveBeenCalled();
+  });
+
+  it("已选模型 degraded → 菜单顶部提示条建议换模", async () => {
+    render(<ModelSelector models={DEG_MODELS} selectedId="glm-5.2" onSelect={() => {}} />);
+    openMenu(screen.getByRole("button", { name: "选择对话模型" }));
+    const note = await screen.findByRole("note");
+    expect(note.textContent).toContain("当前模型暂不可用");
+    expect(note.textContent).toContain("建议改用下方可用模型");
+  });
+
+  it("已选模型健康 → 无降级提示条", async () => {
+    render(<ModelSelector models={DEG_MODELS} selectedId="deepseek-v4" onSelect={() => {}} />);
+    openMenu(screen.getByRole("button", { name: "选择对话模型" }));
+    await screen.findAllByRole("menuitem");
+    expect(screen.queryByRole("note")).toBeNull();
+  });
+});

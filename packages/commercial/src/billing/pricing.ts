@@ -79,6 +79,12 @@ export interface PublicModel {
   cache_read_per_ktok_credits: string;
   cache_write_per_ktok_credits: string;
   multiplier: string;
+  /**
+   * 0108 provider 健康度:该模型归属 provider 生效降级时由 /api/models handler 注解 true
+   * (**注解不过滤**,前端据此标「暂不可用」+ 禁选)。PricingCache 本身不产出此字段
+   * (健康是 provider_ops 独立权威,与 pricing.enabled/visibility 正交,不入定价缓存)。
+   */
+  degraded?: boolean;
 }
 
 type RawRow = {

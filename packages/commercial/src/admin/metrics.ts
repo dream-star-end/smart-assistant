@@ -544,7 +544,9 @@ export type ProxyRejectReason =
   // - session_pin_temporarily_unavailable: 钉死账号短期不可用(健康分耗尽 / 在 cooldown / 池外),
   //   HTTP 503 + Retry-After,可由客户端重试。区分两者方便仪表盘看"被踢出 vs 临时抖动"。
   | "session_pin_unbound"
-  | "session_pin_temporarily_unavailable";
+  | "session_pin_temporarily_unavailable"
+  // P3.2 provider 健康度:OC_PROVIDER_HEALTH_ENFORCE=1 时,degraded provider 的模型被 503 拦截。
+  | "provider_degraded";
 export function incrAnthropicProxyReject(reason: ProxyRejectReason): void {
   anthropicProxyReject.inc({ reason });
 }

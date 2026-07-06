@@ -53,7 +53,9 @@ import { checkRateLimit, recordRateLimitEvent, type RateLimitConfig, type RateLi
 import { FallbackRateLimiter } from "./proxy/shared.js";
 import { getSystemSetting } from "../admin/systemSettings.js";
 import type { Mailer } from "../auth/mail.js";
-import type { PricingCache } from "../billing/pricing.js";
+import type { PricingCache, PublicModel } from "../billing/pricing.js";
+import { findRouteProviderForModel } from "@openclaude/protocol";
+import { getDegradedProviders } from "../admin/providerHealthGate.js";
 import type { PreCheckRedis } from "../billing/preCheck.js";
 import { ensureFreeSubscription } from "../billing/subscription.js";
 import { rootLogger, type Logger } from "../logging/logger.js";
@@ -1041,8 +1043,11 @@ export async function handleListPublicModels(
     token = authHeader.replace(/^Bearer\s+/i, "").trim();
   }
   const claims = token ? verifyCommercialJwtSync(token, deps.jwtSecret) : null;
+  // 0108 provider 健康度:degraded provider 的模型附 degraded:true(**只注解不过滤**;
+  // 前端标「暂不可用」+ 禁选)。fail-soft:读失败返回空集 → 不误标降级(UX 红线)。
+  const degraded = await getDegradedProviders();
   if (!claims) {
-    sendJson(res, 200, { models: deps.pricing.listPublic() });
+    sendJson(res, 200, { models: annotateDegraded(deps.pricing.listPublic(), degraded) });
     return;
   }
   // 登录用户 —— 查一次 grants(per-user 表,无 NOTIFY 重载;每次请求查表是合理代价)
@@ -1050,7 +1055,22 @@ export async function handleListPublicModels(
   const grants = await listGrantsForUser(claims.sub);
   const grantedSet = new Set(grants.map((g) => g.model_id));
   sendJson(res, 200, {
-    models: deps.pricing.listForUser({ role: claims.role, grantedModelIds: grantedSet }),
+    models: annotateDegraded(
+      deps.pricing.listForUser({ role: claims.role, grantedModelIds: grantedSet }),
+      degraded,
+    ),
+  });
+}
+
+/**
+ * 给受影响模型注解 degraded:true(归属 provider 生效降级时)。归属只认静态 provider
+ * (findRouteProviderForModel 命中);OAuth/claude 由 account-pool 健康体系管,不在此标注。
+ */
+function annotateDegraded(models: PublicModel[], degraded: ReadonlySet<string>): PublicModel[] {
+  if (degraded.size === 0) return models;
+  return models.map((m) => {
+    const pid = findRouteProviderForModel(m.id)?.id;
+    return pid && degraded.has(pid) ? { ...m, degraded: true } : m;
   });
 }
 

@@ -49,6 +49,8 @@ import {
   type PreparedUpstreamSession,
 } from "./upstream.js";
 import { STATIC_PROVIDER_META } from "./staticProviderMeta.js";
+import { findRouteProviderForModel } from "@openclaude/protocol";
+import { getDegradedProviders } from "../../admin/providerHealthGate.js";
 import {
   incrAnthropicProxyReject,
   incrPrecheckCapped,
@@ -256,6 +258,40 @@ export function makeAnthropicProxyHandler(
         incrAnthropicProxyReject("unknown_model");
         sendJsonError(res, 400, "UNKNOWN_MODEL", `model '${body.model}' not enabled`, requestId);
         return;
+      }
+
+      // 5a') provider 健康度拦截(P3.2)。**默认影子模式放行**:仅 OC_PROVIDER_HEALTH_ENFORCE=1
+      // 才对 degraded provider 的模型 503(误判降级=拦好模型是最坏 UX,故拦截显式开关控)。
+      // degraded 权威 = provider_ops 健康列(effectiveHealth 派生,与 pricing.enabled/visibility
+      // 正交,红线②)。只治理静态 provider;OAuth/claude 归 account-pool。fail-soft:读失败空集放行。
+      // 不做隐式换模型(红线①):只 503 + 建议同类可用清单,用户/客户端自己换。
+      if (process.env.OC_PROVIDER_HEALTH_ENFORCE === "1") {
+        const providerId = findRouteProviderForModel(body.model)?.id;
+        if (providerId) {
+          const degradedSet = await getDegradedProviders();
+          if (degradedSet.has(providerId)) {
+            const alts = deps.pricing
+              .listPublic()
+              .filter((m) => {
+                const pid = findRouteProviderForModel(m.id)?.id;
+                return !pid || !degradedSet.has(pid);
+              })
+              .map((m) => m.id)
+              .slice(0, 8);
+            userLog.warn("proxy_provider_degraded", { model: body.model, provider: providerId });
+            incrAnthropicProxyReject("provider_degraded");
+            sendJsonError(
+              res,
+              503,
+              "PROVIDER_DEGRADED",
+              `${providerId} 服务商暂时不可用,建议改用:${alts.join("、") || "(暂无同类可用模型)"}`,
+              requestId,
+              { "retry-after": "60" },
+              { provider: providerId, alternatives: alts, retry_after_ms: 60_000 },
+            );
+            return;
+          }
+        }
       }
 
       // 5b) 模型授权(2026-05-02 deepseek 接入引入,Codex review BLOCKER 修)。

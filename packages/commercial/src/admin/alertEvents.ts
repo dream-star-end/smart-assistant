@@ -72,6 +72,9 @@ export const EVENTS = {
   SYSTEM_PRICING_CHANGED: "system.pricing_changed",
   // ── 健康(新增 1)──────────────────────────────────────────
   COMPUTE_HOST_DISK_HIGH: "health.compute_host_disk_high",
+  // ── 健康(P3.2 provider 健康度自动探测)────────────────────
+  PROVIDER_DEGRADED: "health.provider_degraded",
+  PROVIDER_RECOVERED: "health.provider_recovered",
 } as const;
 
 export const EVENT_META: EventMeta[] = [
@@ -132,6 +135,10 @@ export const EVENT_META: EventMeta[] = [
     description: "模型定价 / 套餐被修改", trigger: "passive" },
   { event_type: EVENTS.COMPUTE_HOST_DISK_HIGH, severity: "warning", group: "health",
     description: "远端 compute_host 磁盘使用率超阈值(默认 warn>=85% / critical>=95%,5min 轮询)", trigger: "polled" },
+  { event_type: EVENTS.PROVIDER_DEGRADED, severity: "critical", group: "health",
+    description: "上游服务商自动判定为降级(近窗口失败率/连续失败达阈值,60s 轮询;默认影子模式仅标注,OC_PROVIDER_HEALTH_ENFORCE=1 才 503 拦截)", trigger: "polled" },
+  { event_type: EVENTS.PROVIDER_RECOVERED, severity: "info", group: "health",
+    description: "上游服务商健康恢复(恢复窗口失败率回落且有成功样本)", trigger: "polled" },
 ];
 
 export const ALL_EVENT_TYPES: string[] = EVENT_META.map((e) => e.event_type);

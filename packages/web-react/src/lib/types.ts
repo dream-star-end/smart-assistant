@@ -109,6 +109,11 @@ export type PublicConfig = {
  */
 export type PublicModel = {
   id: string;
+  /**
+   * 0108 provider 健康度:后端 /api/models 对归属 provider 生效降级的模型注解 true
+   * (只注解不过滤)。ModelSelector 据此标「暂不可用」徽记 + 禁选。
+   */
+  degraded?: boolean;
   [k: string]: unknown;
 };
 
