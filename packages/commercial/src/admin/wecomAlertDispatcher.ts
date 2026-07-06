@@ -5,16 +5,17 @@
  * 与 iLink/Telegram 的架构差异:iLink/Telegram 投递寄生 shared 域 startAlertScheduler
  * (ilinkAlertWorker.doDispatch),v5 下 controlPlaneEnabled=false 把整个 shared scheduler
  * 关掉 → v5 告警只 enqueue 进 admin_alert_outbox 不推送。本 dispatcher **独立**、gate 在
- * runtimeChannel==='v5'(不加 controlPlaneEnabled 分支),直接把 outbox 里
- * channel_type='wecom_bot' 的行推到企微 webhook。
+ * runtimeChannel==='v5'(不加 controlPlaneEnabled 分支),把 outbox 里
+ * channel_type IN ('wecom_bot','wecom_aibot') 的行分别推到企微群机器人 webhook /
+ * 企微智能机器人长连接(经连接管理器)。
  *
  * 为什么 v5-only 而非 controlPlane 分支(消除双跑双发):
  *   - v3 跑旧代码,其 shared dispatcher 不认 'wecom_bot' → else 分支 markFailed,**从不发**
  *     wecom(无双发)。
  *   - 但 v3 旧 shared dispatcher 的 outbox claim 是**类型无关**的(claimReadyAlerts 无 type
  *     过滤),会误 claim wecom 行 markFailed。本 dispatcher 的 claim **对称地**只认领
- *     channel_type='wecom_bot'(claimReadyAlerts(limit, 'wecom_bot')),v5 侧绝不误碰
- *     ilink/telegram 行。v3 侧影响面(误 markFailed 竞争)详见交接报告。
+ *     channel_type IN ('wecom_bot','wecom_aibot')(claimReadyAlerts(limit, [...])),v5 侧绝不
+ *     误碰 ilink/telegram 行。v3 侧影响面(误 markFailed 竞争)详见交接报告。
  *
  * 限速:企微群机器人 20 条/分/机器人。这里 **per-channel 滑窗** 节流 ≤18/min(留余量),
  * 超限的行本 tick 跳过、留待下 tick(不动 next_attempt_at、不计失败 attempts)。
@@ -35,9 +36,23 @@ import {
   type ChannelSecrets,
 } from './alertChannels.js'
 import { sendWecomAlert as realSendWecomAlert, WecomPermanentError } from './wecomAlertSender.js'
+import { AibotPermanentError, getWecomAibotConnectionManager } from './wecomAibotConnection.js'
 
-const WECOM_CHANNEL_TYPE = 'wecom_bot'
+/**
+ * 本 dispatcher 认领的类型:企微群机器人 webhook(wecom_bot)+ 企微智能机器人长连接
+ * (wecom_aibot)。同族两类型一个 dispatcher 认领(= ANY),各自走不同发送路径。
+ */
+const WECOM_CHANNEL_TYPES = ['wecom_bot', 'wecom_aibot'] as const
+const WECOM_CHANNEL_TYPE_SET: ReadonlySet<string> = new Set(WECOM_CHANNEL_TYPES)
 const RATE_WINDOW_MS = 60_000
+
+/**
+ * 默认 aibot 发送实现:走连接管理器单例。未注入时(测试/未接线)由单例 send 抛
+ * AibotSendError(transient)—— 无连接即 markFailed 退避,不静默丢。
+ */
+async function defaultSendAibotAlert(channelId: string, markdown: string): Promise<void> {
+  await getWecomAibotConnectionManager().send(channelId, markdown)
+}
 
 // ─── 消息格式化 ───────────────────────────────────────────────────────
 
@@ -75,13 +90,18 @@ export function formatOutboxMarkdown(row: {
 export interface WecomDispatcherDeps {
   // 显式签名(非 typeof):dispatcher 恒以 number limit 调用,避免 typeof 的
   // optional-limit 型变让注入的 mock 函数不可赋值。
-  claimReadyAlerts: (limit: number, channelType?: string) => Promise<OutboxDispatchRow[]>
+  claimReadyAlerts: (
+    limit: number,
+    channelType?: string | readonly string[],
+  ) => Promise<OutboxDispatchRow[]>
   loadChannelSecrets: (id: string | number | bigint) => Promise<ChannelSecrets | null>
   markSent: typeof realMarkSent
   markFailed: typeof realMarkFailed
   markChannelSendSuccess: typeof realMarkChannelSendSuccess
   markChannelError: typeof realMarkChannelError
   sendWecomAlert: typeof realSendWecomAlert
+  /** wecom_aibot 行经此发送(默认走连接管理器单例)。抛 AibotPermanentError → 降级通道。 */
+  sendAibotAlert: (channelId: string, markdown: string) => Promise<void>
   now: () => number
 }
 
@@ -125,6 +145,7 @@ export function startWecomAlertDispatcher(
     markChannelSendSuccess: opts.deps?.markChannelSendSuccess ?? realMarkChannelSendSuccess,
     markChannelError: opts.deps?.markChannelError ?? realMarkChannelError,
     sendWecomAlert: opts.deps?.sendWecomAlert ?? realSendWecomAlert,
+    sendAibotAlert: opts.deps?.sendAibotAlert ?? defaultSendAibotAlert,
     now: opts.deps?.now ?? (() => Date.now()),
   }
 
@@ -151,7 +172,7 @@ export function startWecomAlertDispatcher(
     let sent = 0
     let ready: OutboxDispatchRow[]
     try {
-      ready = await deps.claimReadyAlerts(claimLimit, WECOM_CHANNEL_TYPE)
+      ready = await deps.claimReadyAlerts(claimLimit, WECOM_CHANNEL_TYPES)
     } catch (err) {
       onError('claimReady', err)
       return 0
@@ -164,11 +185,10 @@ export function startWecomAlertDispatcher(
         await deps.markFailed(row.id, 'channel missing').catch(() => {})
         continue
       }
-      // claim 已过滤 wecom_bot,这里双保险(防将来 claim 语义漂移误伤别的类型行)。
-      if (row.channel.channel_type !== WECOM_CHANNEL_TYPE) {
-        await deps
-          .markFailed(row.id, `unexpected channel_type ${row.channel.channel_type}`)
-          .catch(() => {})
+      // claim 已过滤两类型,这里双保险(防将来 claim 语义漂移误伤别的类型行)。
+      const chType = row.channel.channel_type
+      if (!WECOM_CHANNEL_TYPE_SET.has(chType)) {
+        await deps.markFailed(row.id, `unexpected channel_type ${chType}`).catch(() => {})
         continue
       }
       if (!row.channel.enabled || row.channel.activation_status !== 'active') {
@@ -184,25 +204,31 @@ export function startWecomAlertDispatcher(
       if (!underRate(row.channel_id)) {
         continue
       }
-      const secrets = await deps.loadChannelSecrets(row.channel_id).catch(() => null)
-      if (!secrets || !secrets.botToken) {
-        await deps.markFailed(row.id, 'channel secrets unavailable').catch(() => {})
-        continue
-      }
       const markdown = formatOutboxMarkdown(row)
       // 记在真正发之前:成功/失败都是一次真实请求,都占企微限速额度。
       recordSend(row.channel_id)
       try {
-        await deps.sendWecomAlert({ webhookKey: secrets.botToken, markdown })
+        if (chType === 'wecom_aibot') {
+          // 长连接投递:凭据由连接管理器在 connect 时持有,发送期无需 loadChannelSecrets;
+          // 连接不在 / 未绑定 chatid → sendAibotAlert 抛 AibotSendError(transient)。
+          await deps.sendAibotAlert(row.channel_id, markdown)
+        } else {
+          // webhook 投递:需解密 webhook key。
+          const secrets = await deps.loadChannelSecrets(row.channel_id).catch(() => null)
+          if (!secrets || !secrets.botToken) {
+            throw new Error('channel secrets unavailable')
+          }
+          await deps.sendWecomAlert({ webhookKey: secrets.botToken, markdown })
+        }
         await deps.markSent(row.id)
         await deps.markChannelSendSuccess(row.channel_id).catch(() => {})
         sent++
       } catch (err) {
         const msg = (err as Error)?.message ?? String(err)
         await deps.markFailed(row.id, msg).catch(() => {})
-        // permanent(errcode=93000 invalid key 等)→ 降级 activation_status=error,
-        // 写 last_error,UI 显示红字。admin 需删重建(webhook 换新 key)。
-        if (err instanceof WecomPermanentError) {
+        // permanent(webhook errcode=93000 invalid key / aibot 参数错 ack)→ 降级
+        // activation_status=error,写 last_error,UI 显示红字。admin 需删重建。
+        if (err instanceof WecomPermanentError || err instanceof AibotPermanentError) {
           await deps.markChannelError(row.channel_id, msg, 'permanent').catch(() => {})
         }
       }

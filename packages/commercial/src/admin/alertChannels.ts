@@ -20,7 +20,7 @@ import { encrypt, decrypt, AeadError } from '../crypto/aead.js'
 import { loadKmsKey } from '../crypto/keys.js'
 import { writeAdminAudit } from './audit.js'
 
-export type ChannelType = 'ilink_wechat' | 'telegram' | 'wecom_bot'
+export type ChannelType = 'ilink_wechat' | 'telegram' | 'wecom_bot' | 'wecom_aibot'
 export type Severity = 'info' | 'warning' | 'critical'
 export type ActivationStatus = 'pending' | 'active' | 'disabled' | 'error'
 
@@ -46,6 +46,12 @@ export interface AlertChannelRow {
   has_context_token: boolean
   /** Telegram chat_id(数字或 @username);non-telegram 行为 null */
   tg_chat_id: string | null
+  /** WeCom aibot BotID(非密);non-aibot 行为 null */
+  aibot_bot_id: string | null
+  /** WeCom aibot 已学习的推送目标 chatid;未绑定 / non-aibot 行为 null */
+  aibot_chat_id: string | null
+  /** WeCom aibot 已学习的推送目标会话类型 single|group;未绑定 / non-aibot 行为 null */
+  aibot_chat_type: string | null
   created_at: string
   updated_at: string
 }
@@ -66,6 +72,12 @@ export interface ChannelSecrets {
   ilinkAccountId: string | null
   /** Telegram 通道有值;iLink 通道为 null。 */
   tgChatId: string | null
+  /** WeCom aibot BotID(非密);non-aibot 通道为 null。 */
+  aibotBotId: string | null
+  /** WeCom aibot 已学习推送目标 chatid;未绑定 / non-aibot 通道为 null。 */
+  aibotChatId: string | null
+  /** WeCom aibot 已学习推送目标会话类型 single|group;未绑定 / non-aibot 通道为 null。 */
+  aibotChatType: string | null
 }
 
 const LABEL_RE = /^[\p{L}\p{N} _./:()\-]{1,64}$/u
@@ -117,6 +129,9 @@ function rowToView(r: Record<string, unknown>): AlertChannelRow {
     last_error: (r.last_error as string | null) ?? null,
     has_context_token: Boolean(r.has_context_token),
     tg_chat_id: (r.tg_chat_id as string | null) ?? null,
+    aibot_bot_id: (r.aibot_bot_id as string | null) ?? null,
+    aibot_chat_id: (r.aibot_chat_id as string | null) ?? null,
+    aibot_chat_type: (r.aibot_chat_type as string | null) ?? null,
     created_at: (r.created_at as Date).toISOString(),
     updated_at: (r.updated_at as Date).toISOString(),
   }
@@ -139,6 +154,9 @@ const SELECT_COLUMNS = `
   last_error,
   (context_token IS NOT NULL AND length(context_token) > 0) AS has_context_token,
   tg_chat_id,
+  aibot_bot_id,
+  aibot_chat_id,
+  aibot_chat_type,
   created_at,
   updated_at
 `
@@ -532,6 +550,158 @@ export async function createWecomChannel(
   })
 }
 
+// ─── WeCom 智能机器人(aibot 长连接)channel creation ────────────────────
+
+/**
+ * 校验 WeCom aibot BotID(非机密,机器人唯一标识)。BotID 是机器人管理后台生成的
+ * 标识串;放宽为 [A-Za-z0-9._-]{6,128},真正合法性靠订阅帧鉴权(errcode)反馈。
+ */
+export function validateAibotBotId(s: unknown): string {
+  if (typeof s !== 'string') throw new RangeError('botid must be string')
+  const t = s.trim()
+  if (!/^[A-Za-z0-9._-]{6,128}$/.test(t)) {
+    throw new RangeError('botid format invalid (6..128 of [A-Za-z0-9._-])')
+  }
+  return t
+}
+
+/**
+ * 校验 WeCom aibot 长连接专用 Secret(机密,AEAD 加密落库)。放宽为
+ * [A-Za-z0-9._-]{16,256},真正合法性靠订阅帧鉴权(errcode!=0)反馈。
+ */
+export function validateAibotSecret(s: unknown): string {
+  if (typeof s !== 'string') throw new RangeError('secret must be string')
+  const t = s.trim()
+  if (!/^[A-Za-z0-9._-]{16,256}$/.test(t)) {
+    throw new RangeError('secret format invalid (16..256 of [A-Za-z0-9._-])')
+  }
+  return t
+}
+
+export interface CreateWecomAibotChannelInput {
+  adminId: bigint | number | string
+  label: string
+  /** 机器人 BotID(非密)。 */
+  botId: string
+  /** 长连接专用 Secret(机密,AEAD 加密落库)。 */
+  secret: string
+  severityMin?: Severity
+  eventTypes?: string[]
+  ip?: string | null
+  userAgent?: string | null
+}
+
+/**
+ * 落库一条 WeCom aibot 长连接通道。无扫码 / 无 webhook,activation_status 直接 = 'active'
+ * (配置齐全即 active;推送目标 chatid 运行时由连接管理器学习后 UPDATE 回写,与 activation
+ * 正交)。Secret AEAD 加密入 bot_token_enc / nonce(共享 KMS 密钥);BotID 非密明文存
+ * aibot_bot_id。iLink/telegram/wecom_bot 专属字段(含 wecom_key_fp)强制 NULL。
+ *
+ * 并发/重复幂等:同 BotID 命中**全局** partial unique idx_aac_wecom_aibot_identity →
+ * 返回已有行(不重复 audit)。全局唯一(非 per-admin)物理保证「一机器人一连接」。
+ */
+export async function createWecomAibotChannel(
+  input: CreateWecomAibotChannelInput,
+): Promise<AlertChannelRow> {
+  const label = validateLabel(input.label)
+  const severity = validateSeverity(input.severityMin ?? 'warning')
+  const events = normalizeEventTypes(input.eventTypes ?? [])
+  const botId = validateAibotBotId(input.botId)
+  const secret = validateAibotSecret(input.secret)
+
+  const kmsKey = loadKmsKey()
+  const enc = encrypt(secret, kmsKey)
+  kmsKey.fill(0)
+
+  return tx(async (client: PoolClient) => {
+    const ins = await client.query<Record<string, unknown>>(
+      `INSERT INTO admin_alert_channels(
+         admin_id, channel_type, label, enabled, severity_min, event_types,
+         bot_token_enc, bot_token_nonce,
+         aibot_bot_id,
+         activation_status,
+         updated_by
+       ) VALUES (
+         $1::bigint, 'wecom_aibot', $2, TRUE, $3, $4::jsonb,
+         $5, $6,
+         $7,
+         'active',
+         $1::bigint
+       )
+       ON CONFLICT (aibot_bot_id)
+         WHERE channel_type = 'wecom_aibot' AND aibot_bot_id IS NOT NULL
+         DO NOTHING
+       RETURNING ${SELECT_COLUMNS}`,
+      [
+        String(input.adminId),
+        label,
+        severity,
+        JSON.stringify(events),
+        enc.ciphertext,
+        enc.nonce,
+        botId,
+      ],
+    )
+
+    if (ins.rows.length === 0) {
+      const existing = await client.query<Record<string, unknown>>(
+        `SELECT ${SELECT_COLUMNS} FROM admin_alert_channels
+          WHERE channel_type = 'wecom_aibot'
+            AND aibot_bot_id = $1`,
+        [botId],
+      )
+      if (existing.rows.length === 0) {
+        throw new Error('wecom aibot channel upsert conflicted but cannot find existing row')
+      }
+      return rowToView(existing.rows[0])
+    }
+
+    const row = rowToView(ins.rows[0])
+    await writeAdminAudit(client, {
+      adminId: input.adminId,
+      action: 'alert_channel.create',
+      target: `channel:${row.id}`,
+      after: {
+        channel_type: row.channel_type,
+        label: row.label,
+        severity_min: row.severity_min,
+        event_types: row.event_types,
+        aibot_bot_id: row.aibot_bot_id,
+      },
+      ip: input.ip ?? null,
+      userAgent: input.userAgent ?? null,
+    })
+    return row
+  })
+}
+
+/**
+ * 连接管理器收到 aibot_msg_callback 后学习 / 更新推送目标绑定:写 aibot_chat_id +
+ * aibot_chat_type,刷新 last_inbound_at,清 last_error。activation 恢复语义同
+ * updateChannelInbound(pending/error→active,不动 disabled)。
+ * 返回被更新的行数(0 = 通道已删,连接管理器应据此收敛该连接)。
+ */
+export async function updateAibotBinding(
+  id: string | number | bigint,
+  input: { chatId: string; chatType: 'single' | 'group' },
+): Promise<number> {
+  const r = await query(
+    `UPDATE admin_alert_channels SET
+       aibot_chat_id = $2,
+       aibot_chat_type = $3,
+       last_inbound_at = NOW(),
+       activation_status = CASE
+         WHEN activation_status IN ('pending', 'error') THEN 'active'
+         ELSE activation_status
+       END,
+       last_error = NULL,
+       updated_at = NOW()
+     WHERE id = $1 AND channel_type = 'wecom_aibot'`,
+    [String(id), input.chatId, input.chatType],
+  )
+  return r.rowCount ?? 0
+}
+
 export interface PatchAlertChannelInput {
   adminId: bigint | number | string
   id: string | number | bigint
@@ -663,10 +833,13 @@ export async function loadChannelSecrets(
     target_sender_id: string | null
     ilink_account_id: string | null
     tg_chat_id: string | null
+    aibot_bot_id: string | null
+    aibot_chat_id: string | null
+    aibot_chat_type: string | null
   }>(
     `SELECT bot_token_enc, bot_token_nonce,
             context_token, get_updates_buf, target_sender_id, ilink_account_id,
-            tg_chat_id
+            tg_chat_id, aibot_bot_id, aibot_chat_id, aibot_chat_type
        FROM admin_alert_channels WHERE id = $1`,
     [String(id)],
   )
@@ -691,6 +864,9 @@ export async function loadChannelSecrets(
     targetSenderId: row.target_sender_id ?? null,
     ilinkAccountId: row.ilink_account_id ?? null,
     tgChatId: row.tg_chat_id ?? null,
+    aibotBotId: row.aibot_bot_id ?? null,
+    aibotChatId: row.aibot_chat_id ?? null,
+    aibotChatType: row.aibot_chat_type ?? null,
   }
 }
 

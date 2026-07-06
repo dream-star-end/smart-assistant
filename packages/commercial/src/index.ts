@@ -144,6 +144,10 @@ import {
   type WecomAlertDispatcherHandle,
 } from "./admin/wecomAlertDispatcher.js";
 import {
+  getWecomAibotConnectionManager,
+  type WecomAibotConnectionManager,
+} from "./admin/wecomAibotConnection.js";
+import {
   makeAnthropicProxyHandler,
   type AnthropicProxyHandler,
 } from "./http/anthropicProxy.js";
@@ -3345,14 +3349,21 @@ export async function registerCommercial(
   //   - 若 v5 也 gate 在 controlPlaneEnabled(v5 恒 false)则 v5 禁跑 + v3 不发 → wecom 告警全网真空。
   //   仅 v5 跑,消除双跑双发。claim 显式过滤 wecom_bot(对称只认领自己能处理的类型,详见 dispatcher 头注)。
   //   sender 走 directEgressDispatcher 直连(qyapi 国内域名)。关停:OC_WECOM_ALERT_DISABLED=1。
+  // 企业微信智能机器人(aibot)长连接管理器 —— 随 wecomAlert 同一 v5-only gate 启停,
+  // **不注册为 scheduler**(命名 *Manager,不进 schedulerRegistry / smoke 白名单)。每个
+  // wecom_aibot 通道一条 wss 长连接;dispatcher 的 wecom_aibot 行经 aibotConn.send 投递。
+  // 详见 wecomAibotConnection 头注(单连接约束 + 国内域名直连出口红线)。
   let wecomAlertDispatcher: WecomAlertDispatcherHandle | undefined;
+  let wecomAibotConn: WecomAibotConnectionManager | undefined;
   if (
     runtimeChannel === "v5" &&
     process.env.OC_WECOM_ALERT_DISABLED !== "1"
   ) {
     const raw = Number(process.env.OC_WECOM_ALERT_INTERVAL_MS);
     const intervalMs = Number.isFinite(raw) && raw >= 1000 ? raw : 5_000;
-    wecomAlertDispatcher = trackScheduler("wecomAlert", "v5-owned", startWecomAlertDispatcher({ dispatchIntervalMs: intervalMs }));
+    wecomAibotConn = getWecomAibotConnectionManager();
+    void wecomAibotConn.start();
+    wecomAlertDispatcher = trackScheduler("wecomAlert", "v5-owned", startWecomAlertDispatcher({ dispatchIntervalMs: intervalMs, deps: { sendAibotAlert: (id, md) => wecomAibotConn!.send(id, md) } }));
   }
 
   // v5 灰度可观测 — runtimeStatus 暴露给 gateway /healthz,作为"控制面静默 / 运行时隔离 /
@@ -3477,6 +3488,9 @@ export async function registerCommercial(
       }
       if (wecomAlertDispatcher) {
         try { await wecomAlertDispatcher.stop(); } catch { /* ignore */ }
+      }
+      if (wecomAibotConn) {
+        try { await wecomAibotConn.stop(); } catch { /* ignore */ }
       }
       if (baselineSrv) {
         try { await baselineSrv.stop(); } catch { /* ignore */ }

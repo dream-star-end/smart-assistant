@@ -18,6 +18,7 @@ import {
   type WecomDispatcherDeps,
 } from '../admin/wecomAlertDispatcher.js'
 import { WecomPermanentError } from '../admin/wecomAlertSender.js'
+import { AibotPermanentError, AibotSendError } from '../admin/wecomAibotConnection.js'
 import type { OutboxDispatchRow } from '../admin/alertOutbox.js'
 import type { ChannelSecrets } from '../admin/alertChannels.js'
 
@@ -55,10 +56,14 @@ const SECRETS: ChannelSecrets = {
   targetSenderId: null,
   ilinkAccountId: null,
   tgChatId: null,
+  aibotBotId: null,
+  aibotChatId: null,
+  aibotChatType: null,
 }
 
 interface Spies {
-  claimCalls: Array<{ limit: number; channelType?: string }>
+  claimCalls: Array<{ limit: number; channelType?: string | readonly string[] }>
+  aibotSent: Array<{ channelId: string; markdown: string }>
   markSent: string[]
   markFailed: Array<{ id: string; err: string }>
   markChannelSendSuccess: string[]
@@ -71,6 +76,7 @@ function buildDeps(
   opts: {
     spies: Spies
     sendBehavior?: (input: { webhookKey: string; markdown: string }) => Promise<void>
+    aibotBehavior?: (input: { channelId: string; markdown: string }) => Promise<void>
     secrets?: ChannelSecrets | null
     now?: () => number
   },
@@ -79,11 +85,15 @@ function buildDeps(
   // claim 首次返回 rows,之后返回空(避免 dispatchNow 被反复喂同一批)。
   let served = false
   return {
-    claimReadyAlerts: async (limit: number, channelType?: string) => {
+    claimReadyAlerts: async (limit: number, channelType?: string | readonly string[]) => {
       spies.claimCalls.push({ limit, channelType })
       if (served) return []
       served = true
       return rows
+    },
+    sendAibotAlert: async (channelId: string, markdown: string) => {
+      spies.aibotSent.push({ channelId, markdown })
+      if (opts.aibotBehavior) return opts.aibotBehavior({ channelId, markdown })
     },
     loadChannelSecrets: async () => (opts.secrets === undefined ? SECRETS : opts.secrets),
     markSent: async (id) => {
@@ -109,6 +119,7 @@ function buildDeps(
 function emptySpies(): Spies {
   return {
     claimCalls: [],
+    aibotSent: [],
     markSent: [],
     markFailed: [],
     markChannelSendSuccess: [],
@@ -117,8 +128,27 @@ function emptySpies(): Spies {
   }
 }
 
+/** 造一条 wecom_aibot outbox 行(channel_type=wecom_aibot)。 */
+function makeAibotRow(
+  id: string,
+  channelId: string,
+  over: Partial<OutboxDispatchRow> = {},
+): OutboxDispatchRow {
+  return makeRow(id, channelId, {
+    channel: {
+      id: channelId,
+      channel_type: 'wecom_aibot',
+      label: 'ops-aibot',
+      enabled: true,
+      activation_status: 'active',
+      has_context_token: false,
+    },
+    ...over,
+  })
+}
+
 describe('startWecomAlertDispatcher', () => {
-  it("claims with channel_type='wecom_bot' filter", async () => {
+  it("claims with channel_type IN ('wecom_bot','wecom_aibot') filter", async () => {
     const spies = emptySpies()
     const d = startWecomAlertDispatcher({
       dispatchIntervalMs: 60_000,
@@ -127,7 +157,10 @@ describe('startWecomAlertDispatcher', () => {
     await d.dispatchNow()
     await d.stop()
     assert.equal(spies.claimCalls.length, 1)
-    assert.equal(spies.claimCalls[0].channelType, 'wecom_bot')
+    assert.deepEqual([...(spies.claimCalls[0].channelType as readonly string[])], [
+      'wecom_bot',
+      'wecom_aibot',
+    ])
   })
 
   it('success → markSent + markChannelSendSuccess + forwards webhook key & markdown', async () => {
@@ -262,5 +295,63 @@ describe('startWecomAlertDispatcher', () => {
     assert.equal(spies.sent.length, 0)
     assert.equal(spies.markFailed.length, 1)
     assert.match(spies.markFailed[0].err, /secrets unavailable/)
+  })
+
+  // ─── wecom_aibot(长连接)路由 ───────────────────────────────────────
+
+  it('aibot row → sendAibotAlert (not webhook), markSent + markChannelSendSuccess', async () => {
+    const spies = emptySpies()
+    const d = startWecomAlertDispatcher({
+      dispatchIntervalMs: 60_000,
+      deps: buildDeps([makeAibotRow('1', 'ch-aibot')], { spies }),
+    })
+    const sent = await d.dispatchNow()
+    await d.stop()
+    assert.equal(sent, 1)
+    assert.equal(spies.sent.length, 0, 'aibot must not go through webhook sender')
+    assert.equal(spies.aibotSent.length, 1)
+    assert.equal(spies.aibotSent[0].channelId, 'ch-aibot')
+    assert.match(spies.aibotSent[0].markdown, /provider degraded/)
+    assert.deepEqual(spies.markSent, ['1'])
+    assert.deepEqual(spies.markChannelSendSuccess, ['ch-aibot'])
+  })
+
+  it('aibot not bound (AibotSendError) → markFailed transient, channel NOT degraded', async () => {
+    const spies = emptySpies()
+    const d = startWecomAlertDispatcher({
+      dispatchIntervalMs: 60_000,
+      deps: buildDeps([makeAibotRow('1', 'ch-aibot')], {
+        spies,
+        aibotBehavior: async () => {
+          throw new AibotSendError('等待绑定:请在企业微信里给该机器人发一条消息完成告警会话绑定')
+        },
+      }),
+    })
+    const sent = await d.dispatchNow()
+    await d.stop()
+    assert.equal(sent, 0)
+    assert.equal(spies.markSent.length, 0)
+    assert.equal(spies.markFailed.length, 1)
+    assert.match(spies.markFailed[0].err, /等待绑定/)
+    assert.equal(spies.markChannelError.length, 0, 'transient must not degrade channel')
+  })
+
+  it('aibot permanent (AibotPermanentError) → markFailed + markChannelError(permanent)', async () => {
+    const spies = emptySpies()
+    const d = startWecomAlertDispatcher({
+      dispatchIntervalMs: 60_000,
+      deps: buildDeps([makeAibotRow('1', 'ch-aibot')], {
+        spies,
+        aibotBehavior: async () => {
+          throw new AibotPermanentError('aibot send errcode=40058: invalid request param')
+        },
+      }),
+    })
+    await d.dispatchNow()
+    await d.stop()
+    assert.equal(spies.markFailed.length, 1)
+    assert.equal(spies.markChannelError.length, 1)
+    assert.equal(spies.markChannelError[0].id, 'ch-aibot')
+    assert.equal(spies.markChannelError[0].kind, 'permanent')
   })
 })

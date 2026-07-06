@@ -7405,13 +7405,14 @@ async function renderAlertsTab() {
     </div>
 
     <div class="panel">
-      <h2>告警通道 <small>微信 iLink / Telegram / 企业微信群机器人,只发给绑定了的超管</small></h2>
+      <h2>告警通道 <small>微信 iLink / Telegram / 企业微信群机器人 / 企业微信智能机器人,只发给绑定了的超管</small></h2>
       <div class="toolbar">
         <button class="btn" id="al-ch-refresh">刷新</button>
         <span class="spacer"></span>
         <button class="btn btn-primary" id="al-ch-bind">+ 绑定 iLink 微信</button>
         <button class="btn btn-primary" id="al-ch-tg">+ 添加 Telegram</button>
         <button class="btn btn-primary" id="al-ch-wecom">+ 添加企业微信</button>
+        <button class="btn btn-primary" id="al-ch-aibot">+ 添加智能机器人</button>
       </div>
       <div id="al-channels">加载中…</div>
     </div>
@@ -7475,6 +7476,7 @@ async function renderAlertsTab() {
   $('al-ch-bind').addEventListener('click', _openBindIlinkModal)
   $('al-ch-tg').addEventListener('click', _openCreateTelegramModal)
   $('al-ch-wecom').addEventListener('click', _openCreateWecomModal)
+  $('al-ch-aibot').addEventListener('click', _openCreateAibotModal)
   $('al-ob-refresh').addEventListener('click', () => {
     ALERTS_STATE.outboxFilter.event_type = $('al-ob-event').value
     ALERTS_STATE.outboxFilter.severity = $('al-ob-severity').value
@@ -7625,8 +7627,10 @@ function _renderChannelRow(c) {
     : c.channel_type === 'telegram'
       ? '<span class="badge muted">Telegram</span>'
       : c.channel_type === 'wecom_bot'
-        ? '<span class="badge muted">企业微信</span>'
-        : `<span class="badge muted">${escapeHtml(c.channel_type)}</span>`
+        ? '<span class="badge muted">企业微信群机器人</span>'
+        : c.channel_type === 'wecom_aibot'
+          ? '<span class="badge muted">企业微信智能机器人</span>'
+          : `<span class="badge muted">${escapeHtml(c.channel_type)}</span>`
   return `
     <tr>
       <td class="mono">${escapeHtml(c.id)}</td>
@@ -7651,7 +7655,27 @@ function _renderChannelRow(c) {
 }
 
 function _activationBadge(c) {
-  // Telegram / 企业微信 通道没有 context_token / pending 等 iLink 专属阶段 —— 创建即 active,
+  // 企业微信智能机器人:连接态(aibot_conn_state,连接管理器实时)+ 绑定态(aibot_bound,
+  // 已学习 chatid)双维度。activation_status=error = 订阅鉴权失败(Secret 错,需删重建)。
+  if (c.channel_type === 'wecom_aibot') {
+    if (c.activation_status === 'disabled') return '<span class="badge muted">disabled</span>'
+    if (c.activation_status === 'error') {
+      return `<span class="badge danger" title="${escapeHtml(c.last_error || 'Secret 被拒绝(订阅鉴权失败),请删除后用新 Secret 重建')}">鉴权失败</span>`
+    }
+    const cs = c.aibot_conn_state || 'unknown'
+    const boundTxt = c.aibot_bound ? '已绑定' : '待绑定'
+    if (cs === 'connected') {
+      return c.aibot_bound
+        ? '<span class="badge ok">就绪(已连接·已绑定)</span>'
+        : '<span class="badge warn" title="长连接已就绪,但还没绑定推送会话。请在企业微信里给该机器人发一条消息完成绑定。">已连接·待绑定</span>'
+    }
+    if (cs === 'connecting' || cs === 'reconnecting' || cs === 'unknown') {
+      return `<span class="badge warn" title="长连接建立/重连中(${escapeHtml(cs)})。">连接中·${boundTxt}</span>`
+    }
+    // closed / auth_failed 等
+    return `<span class="badge danger" title="${escapeHtml(c.last_error || '')}">未连接·${boundTxt}</span>`
+  }
+  // Telegram / 企业微信群机器人 通道没有 context_token / pending 等 iLink 专属阶段 —— 创建即 active,
   // 只有 permanent-error(telegram 401/403/404,wecom errcode=93000 invalid key)会把
   // activation_status 推到 error。
   if (c.channel_type === 'telegram' || c.channel_type === 'wecom_bot') {
@@ -8113,6 +8137,95 @@ async function _openCreateWecomModal() {
           label, webhook, severity_min, event_types,
         })
         toast(`通道已创建: ${r.channel?.label ?? label}`)
+        closeModal()
+        _refreshAlertChannels()
+      } catch (e) {
+        toast(`失败: ${e.message}`, 'danger', toastOptsFromError(e))
+      }
+    })
+  })
+}
+
+async function _openCreateAibotModal() {
+  // 企业微信智能机器人(aibot 长连接):无群机器人入口 / 无可信 IP 也能用。
+  // 后台拿 BotID + 长连接专用 Secret,master 主动 wss 连企微;创建后给机器人发条
+  // 消息即完成绑定(连接管理器学习 chatid),之后告警推到该会话。
+  const groups = {}
+  for (const e of (ALERTS_STATE.events || [])) {
+    groups[e.group] = groups[e.group] || []
+    groups[e.group].push(e)
+  }
+  const groupNames = Object.keys(groups)
+  const eventsHtml = groupNames.length === 0
+    ? '<div class="muted" style="font-size:12px">事件目录未加载</div>'
+    : groupNames.map((g) => `
+        <div style="margin-bottom:6px">
+          <div style="font-weight:600;font-size:12px;color:var(--muted);margin-bottom:2px">${escapeHtml(g)}</div>
+          ${groups[g].map((e) => `
+            <label style="display:inline-block;margin-right:8px;font-weight:normal;font-size:12px">
+              <input type="checkbox" data-event="${escapeHtml(e.event_type)}">
+              ${escapeHtml(e.event_type)}
+            </label>
+          `).join('')}
+        </div>
+      `).join('')
+  openModal(`
+    <h3>添加企业微信智能机器人告警通道</h3>
+    <div style="color:var(--muted);font-size:12px;margin-bottom:10px;line-height:1.5">
+      步骤:<br>
+      1. 企业微信管理后台 → 安全与管理 → 管理工具 → 智能机器人 → 创建/选择机器人<br>
+      2. 在机器人的「API 模式」里选 <b>长连接</b>,拿到 <code>BotID</code> 与长连接专用 <code>Secret</code><br>
+      3. 填到下面创建;创建后 <b>在企业微信里给该机器人发一条消息</b>完成绑定(之后告警推到该会话)
+    </div>
+    <div class="form-row">
+      <label>标签 label(必填,1..64)</label>
+      <input type="text" id="al-ab-label" maxlength="64" placeholder="例如 ops-alert-aibot" />
+    </div>
+    <div class="form-row">
+      <label>BotID(必填,非机密)</label>
+      <input type="text" id="al-ab-botid" autocomplete="off" placeholder="机器人 BotID" spellcheck="false" />
+    </div>
+    <div class="form-row">
+      <label>长连接 Secret(必填,机密)</label>
+      <input type="password" id="al-ab-secret" autocomplete="new-password" placeholder="长连接专用 Secret" spellcheck="false" />
+    </div>
+    <div class="form-row">
+      <label>最低严重度</label>
+      <select id="al-ab-severity">
+        <option value="info">info</option>
+        <option value="warning" selected>warning</option>
+        <option value="critical">critical</option>
+      </select>
+    </div>
+    <div class="form-row">
+      <label>订阅事件(留空 = 全部)</label>
+      <div id="al-ab-events" style="max-height:180px;overflow:auto;border:1px solid var(--border);padding:8px;border-radius:4px">
+        ${eventsHtml}
+      </div>
+    </div>
+    <div class="form-actions">
+      <button id="al-ab-cancel">取消</button>
+      <button class="btn-primary" id="al-ab-ok">创建</button>
+    </div>
+  `)
+  $('al-ab-cancel').addEventListener('click', closeModal)
+  $('al-ab-ok').addEventListener('click', async (ev) => {
+    const label = $('al-ab-label').value.trim()
+    const botid = $('al-ab-botid').value.trim()
+    const secret = $('al-ab-secret').value.trim()
+    if (!label) { toast('label 必填', 'danger'); return }
+    if (!botid) { toast('BotID 必填', 'danger'); return }
+    if (!secret) { toast('Secret 必填', 'danger'); return }
+    const event_types = []
+    for (const cb of $('al-ab-events').querySelectorAll('input[type=checkbox]')) {
+      if (cb.checked) event_types.push(cb.dataset.event)
+    }
+    await withBtnLoading(ev.currentTarget, async () => {
+      try {
+        const r = await apiJson('POST', '/api/admin/alerts/channels/wecom-aibot', {
+          label, botid, secret, severity_min: $('al-ab-severity').value, event_types,
+        })
+        toast(`通道已创建: ${r.channel?.label ?? label}。请给机器人发一条消息完成绑定。`)
         closeModal()
         _refreshAlertChannels()
       } catch (e) {
