@@ -168,6 +168,8 @@ export async function startEgress(): Promise<void> {
       ark: cfg.ARK_CODING_PLAN_KEY,
       // 2026-07-05:OpenCode Go(qwen3.7-max/plus)。与 master internalProxyHandler 同口径注入。
       opencodego: cfg.OPENCODE_GO_API_KEY,
+      // 2026-07-06:火山 Agent Plan Kimi(kimi-k2.7-code),与 minimax 共 ARK_AGENT_PLAN_KEY。
+      kimi: cfg.ARK_AGENT_PLAN_KEY,
     },
     getPhase6AccountUuidEnforce,
     getSessionPinMode,

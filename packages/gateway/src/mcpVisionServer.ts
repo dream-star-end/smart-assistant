@@ -80,6 +80,7 @@ export function shouldEnableOpenClaudeVision(provider?: string, model?: string):
   if (p === 'deepseek' || m?.startsWith('deepseek-')) return true
   if (m === 'glm-5.1' || m === 'glm-5.2') return true
   if (m === 'qwen3.7-max' || m === 'qwen3.7-plus') return true
+  if (m === 'kimi-k2.7-code') return true
 
   const optInProviders = (process.env.OPENCLAUDE_VISION_MCP_PROVIDERS ?? '')
     .split(',')

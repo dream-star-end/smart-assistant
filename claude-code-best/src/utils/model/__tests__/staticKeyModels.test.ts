@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url";
 
 import {
   isArkGlmModel,
+  isArkPlanKimiModel,
   isCapabilityZeroStaticModel,
   isOpencodeQwenModel,
   getStaticModelContextWindow,
@@ -33,6 +34,17 @@ describe("isOpencodeQwenModel", () => {
   });
 });
 
+describe("isArkPlanKimiModel", () => {
+  test("精确匹配 kimi-k2.7-code,大小写/空白不敏感", () => {
+    expect(isArkPlanKimiModel("kimi-k2.7-code")).toBe(true);
+    expect(isArkPlanKimiModel("Kimi-K2.7-Code")).toBe(true);
+    expect(isArkPlanKimiModel("  kimi-k2.7-code  ")).toBe(true);
+    expect(isArkPlanKimiModel("kimi-k2.7")).toBe(false);
+    expect(isArkPlanKimiModel("kimi-k2.6")).toBe(false);
+    expect(isArkPlanKimiModel("kimi-k2.7-code-preview")).toBe(false);
+  });
+});
+
 describe("isCapabilityZeroStaticModel — minimax + ark + opencodego qwen(不含 deepseek)", () => {
   test("MiniMax-M3 / glm-5.1 / glm-5.2 / qwen3.7-max/plus → true", () => {
     expect(isCapabilityZeroStaticModel("MiniMax-M3")).toBe(true);
@@ -43,6 +55,7 @@ describe("isCapabilityZeroStaticModel — minimax + ark + opencodego qwen(不含
     expect(isCapabilityZeroStaticModel("GLM-5.2")).toBe(true);
     expect(isCapabilityZeroStaticModel("qwen3.7-max")).toBe(true);
     expect(isCapabilityZeroStaticModel("qwen3.7-plus")).toBe(true);
+    expect(isCapabilityZeroStaticModel("kimi-k2.7-code")).toBe(true);
   });
   test("deepseek **不在**能力全关集(保留 effort=max 等默认路径能力)", () => {
     expect(isCapabilityZeroStaticModel("deepseek-v4-pro")).toBe(false);
@@ -63,6 +76,7 @@ describe("getStaticModelContextWindow", () => {
     expect(getStaticModelContextWindow("GLM-5.2")).toBe(1_000_000);
     expect(getStaticModelContextWindow("qwen3.7-max")).toBe(1_000_000);
     expect(getStaticModelContextWindow("qwen3.7-plus")).toBe(1_000_000);
+    expect(getStaticModelContextWindow("kimi-k2.7-code")).toBe(256_000);
   });
   test("deepseek 无特判 → undefined(由 caller 落 MODEL_CONTEXT_WINDOW_DEFAULT,等价现状)", () => {
     expect(getStaticModelContextWindow("deepseek-v4-pro")).toBeUndefined();

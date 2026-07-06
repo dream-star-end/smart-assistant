@@ -56,6 +56,14 @@ describe('staticKeyProviders — matchesRoute', () => {
     assert.equal(og.matchesRoute('qwen3.7'), false)
     assert.equal(og.matchesRoute('qwen3.7-max-preview'), false)
   })
+  it('kimi(kimi-k2.7-code)精确,大小写不敏感', () => {
+    const km = getStaticProvider('kimi')
+    assert.equal(km.matchesRoute('kimi-k2.7-code'), true)
+    assert.equal(km.matchesRoute('Kimi-K2.7-Code'), true)
+    assert.equal(km.matchesRoute('kimi-k2.7'), false)
+    assert.equal(km.matchesRoute('kimi-k2.6'), false)
+    assert.equal(km.matchesRoute('kimi-k2.7-code-preview'), false)
+  })
 })
 
 describe('staticKeyProviders — findRouteProviderForModel', () => {
@@ -66,6 +74,7 @@ describe('staticKeyProviders — findRouteProviderForModel', () => {
     assert.equal(findRouteProviderForModel('glm-5.2')?.id, 'ark')
     assert.equal(findRouteProviderForModel('qwen3.7-max')?.id, 'opencodego')
     assert.equal(findRouteProviderForModel('qwen3.7-plus')?.id, 'opencodego')
+    assert.equal(findRouteProviderForModel('kimi-k2.7-code')?.id, 'kimi')
     assert.equal(findRouteProviderForModel('claude-opus-4-7'), undefined)
     assert.equal(findRouteProviderForModel('DeepSeek-v4-pro'), undefined)
     assert.equal(findRouteProviderForModel(''), undefined)
@@ -86,6 +95,7 @@ describe('staticKeyProviders — inboundModelIds(与 route 面故意不同)', ()
       'qwen3.7-max',
       'qwen3.7-plus',
     ])
+    assert.deepEqual([...getStaticProvider('kimi').inboundModelIds], ['kimi-k2.7-code'])
   })
   it('STATIC_KEY_INBOUND_MODEL_IDS = 全 provider 字面量展开', () => {
     assert.deepEqual([...STATIC_KEY_INBOUND_MODEL_IDS], [
@@ -96,6 +106,7 @@ describe('staticKeyProviders — inboundModelIds(与 route 面故意不同)', ()
       'glm-5.1',
       'qwen3.7-max',
       'qwen3.7-plus',
+      'kimi-k2.7-code',
     ])
   })
 })
@@ -127,6 +138,12 @@ describe('staticKeyProviders — canonicalizeForPricing', () => {
     assert.equal(og.canonicalizeForPricing('qwen3.7-plus'), 'qwen3.7-plus')
     assert.equal(og.canonicalizeForPricing('QWEN3.7-PLUS'), 'qwen3.7-plus')
     assert.equal(og.canonicalizeForPricing('qwen3.6-plus'), null)
+  })
+  it('kimi → kimi-k2.7-code(小写归一)', () => {
+    const km = getStaticProvider('kimi')
+    assert.equal(km.canonicalizeForPricing('kimi-k2.7-code'), 'kimi-k2.7-code')
+    assert.equal(km.canonicalizeForPricing('Kimi-K2.7-Code'), 'kimi-k2.7-code')
+    assert.equal(km.canonicalizeForPricing('kimi-k2.6'), null)
   })
 })
 
@@ -181,14 +198,41 @@ describe('staticKeyProviders — strip / endpoint', () => {
     assert.equal(og.maxInputTokens, 1_000_000)
     assert.equal(og.upstreamEndpoint, 'https://opencode.ai/zen/go/v1/messages')
   })
+  it('kimi strip anthropic-beta + 3 body 字段(**保留 thinking**)+ 256k cap + Agent Plan 端点', () => {
+    const km = getStaticProvider('kimi')
+    assert.deepEqual([...km.stripHeaders], ['anthropic-beta'])
+    assert.deepEqual([...km.stripBodyFields], [
+      'output_config',
+      'context_management',
+      'service_tier',
+    ])
+    assert.equal(km.stripBodyFields.includes('thinking'), false, 'kimi 不能 strip thinking(恒思考模型,enabled+budget 实测可用)')
+    assert.equal(km.maxInputTokens, 256_000)
+    assert.equal(
+      km.upstreamEndpoint,
+      'https://ark.cn-beijing.volces.com/api/plan/v1/messages',
+      'kimi 与 minimax 同 Agent Plan 端点(同订阅同 key,独立 spec)',
+    )
+  })
 })
 
 describe('staticKeyProviders — authScheme(上游鉴权头风格)', () => {
-  it('opencodego = x-api-key(/messages 不认 Bearer,2026-07-05 实测);其余三家缺省 bearer', () => {
+  it('opencodego = x-api-key(/messages 不认 Bearer,2026-07-05 实测);其余缺省 bearer', () => {
     assert.equal(getStaticProvider('opencodego').authScheme, 'x-api-key')
     assert.equal(getStaticProvider('deepseek').authScheme, undefined)
     assert.equal(getStaticProvider('minimax').authScheme, undefined)
     assert.equal(getStaticProvider('ark').authScheme, undefined)
+    assert.equal(getStaticProvider('kimi').authScheme, undefined)
+  })
+})
+
+describe('staticKeyProviders — stripDisabledThinking(恒思考模型删参兜底)', () => {
+  it('kimi = true(火山 400 does not support disabling thinking,2026-07-06 实测);其余未声明', () => {
+    assert.equal(getStaticProvider('kimi').stripDisabledThinking, true)
+    assert.equal(getStaticProvider('deepseek').stripDisabledThinking, undefined)
+    assert.equal(getStaticProvider('minimax').stripDisabledThinking, undefined)
+    assert.equal(getStaticProvider('ark').stripDisabledThinking, undefined)
+    assert.equal(getStaticProvider('opencodego').stripDisabledThinking, undefined)
   })
 })
 
@@ -201,6 +245,7 @@ describe('staticKeyProviders — allowedOutputConfigEfforts(思考深度白名�
     assert.equal(getStaticProvider('deepseek').allowedOutputConfigEfforts, undefined)
     assert.equal(getStaticProvider('minimax').allowedOutputConfigEfforts, undefined)
     assert.equal(getStaticProvider('opencodego').allowedOutputConfigEfforts, undefined)
+    assert.equal(getStaticProvider('kimi').allowedOutputConfigEfforts, undefined)
   })
   it('硬约束:声明 allowedOutputConfigEfforts 的 provider 不能把 output_config 放进 stripBodyFields', () => {
     for (const p of STATIC_KEY_PROVIDERS) {
@@ -216,12 +261,14 @@ describe('staticKeyProviders — allowedOutputConfigEfforts(思考深度白名�
 })
 
 describe('staticKeyProviders — supportsVision(原生多模态标记)', () => {
-  it('minimax(MiniMax-M3)=true;deepseek/ark/opencodego(纯文本)=false', () => {
+  it('minimax(MiniMax-M3)=true;deepseek/ark/opencodego/kimi(纯文本)=false', () => {
     assert.equal(getStaticProvider('minimax').supportsVision, true)
     assert.equal(getStaticProvider('deepseek').supportsVision ?? false, false)
     assert.equal(getStaticProvider('ark').supportsVision ?? false, false)
     // opencodego 2026-07-05 实测 image block → 400 InvalidParameter,纯文本接入。
     assert.equal(getStaticProvider('opencodego').supportsVision ?? false, false)
+    // kimi 2026-07-06 实测 image block → 400 InvalidParameter(同 lane 的 M3 反而是多模态)。
+    assert.equal(getStaticProvider('kimi').supportsVision ?? false, false)
   })
 })
 
@@ -247,7 +294,7 @@ describe('staticKeyProviders — snapshot 漂移守护(protocol-owned)', () => {
       'provider id 集/顺序漂移 —— 更新 snapshot 或 registry',
     )
     for (const sp of snap.providers) {
-      const p = getStaticProvider(sp.id as 'deepseek' | 'minimax' | 'ark' | 'opencodego')
+      const p = getStaticProvider(sp.id as 'deepseek' | 'minimax' | 'ark' | 'opencodego' | 'kimi')
       assert.deepEqual([...p.inboundModelIds], sp.inboundModelIds, `${sp.id} inboundModelIds 漂移`)
       assert.equal(p.maxInputTokens ?? null, sp.maxInputTokens, `${sp.id} maxInputTokens 漂移`)
       assert.equal(p.upstreamEndpoint, sp.upstreamEndpoint, `${sp.id} upstreamEndpoint 漂移`)

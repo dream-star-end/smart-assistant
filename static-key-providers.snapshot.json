@@ -36,6 +36,15 @@
       "capabilityZero": true,
       "contextWindow": 1000000,
       "supportsVision": false
+    },
+    {
+      "id": "kimi",
+      "inboundModelIds": ["kimi-k2.7-code"],
+      "maxInputTokens": 256000,
+      "upstreamEndpoint": "https://ark.cn-beijing.volces.com/api/plan/v1/messages",
+      "capabilityZero": true,
+      "contextWindow": 256000,
+      "supportsVision": false
     }
   ]
 }

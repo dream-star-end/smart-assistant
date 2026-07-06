@@ -2,7 +2,8 @@
 // Anthropic 兼容上游(不占 OAuth 账号池)的 provider 的单一权威声明。
 //
 // 当前成员：DeepSeek、MiniMax、火山方舟 Ark(glm-5.2 主力 + glm-5.1 兼容存量)、
-// OpenCode Go(Zen 网关 Go 档,qwen3.7-max/plus,2026-07-05)。
+// OpenCode Go(Zen 网关 Go 档,qwen3.7-max/plus,2026-07-05)、Ark Agent Plan Kimi
+// (kimi-k2.7-code,与 minimax 同订阅同 key,2026-07-06)。
 //
 // 设计边界(只放 commercial + gateway 都消费的"路由元数据"纯数据/纯函数)：
 //   - **不**含 commercial 语义(key 的 config 字段名 / 503 错误码 / metric label) —— 那些在
@@ -17,7 +18,7 @@
 //   route 匹配=大小写敏感前缀家族 / inbound 白名单=2 个精确字面量 / capability=2 个精确字面量(在 CCB) /
 //   pricing canonicalize=不特判(原样)。因此每个关注点是独立字段，不可统一。
 
-export type StaticProviderId = 'deepseek' | 'minimax' | 'ark' | 'opencodego'
+export type StaticProviderId = 'deepseek' | 'minimax' | 'ark' | 'opencodego' | 'kimi'
 
 /**
  * 静态 provider key 解析表:provider id → 该 provider 的静态 key。
@@ -37,6 +38,14 @@ export interface StaticKeyProviderSpec {
    * Authorization Bearer 返回 401 "Missing API key"。upstream.ts makeStaticKeyUpstream 按本字段注入。
    */
   readonly authScheme?: 'bearer' | 'x-api-key'
+  /**
+   * 上游不支持 `thinking:{type:'disabled'}` 时置 true:master 转发前若 body.thinking.type
+   * === 'disabled' 则**删掉整个 thinking 字段**(退回上游默认=照常思考),而非透传吃 400。
+   * 用于恒思考模型(kimi-k2.7-code,火山实测 disabled → 400 "does not support disabling
+   * thinking",2026-07-06)。语义注意:用户"关思考"对这类模型退化为"照常思考"(模型能力使然)。
+   * 未声明(undefined)= 透传不动(glm 支持 disabled/qwen disabled 生效/minimax 容忍)。
+   */
+  readonly stripDisabledThinking?: boolean
   /**
    * commercial master proxy 路由 gate。命中 → 切到本 provider 静态 key 上游。
    *   - deepseek: **大小写敏感** `modelId.startsWith('deepseek-')`(与 shared.ts 现状逐字节一致)
@@ -200,11 +209,45 @@ const OPENCODE_GO: StaticKeyProviderSpec = {
   supportsVision: false,
 }
 
+const ARK_PLAN_KIMI: StaticKeyProviderSpec = {
+  id: 'kimi',
+  // 火山方舟 Agent Plan 托管的 Kimi K2.7 Code(2026-07-06 接入)—— 与 minimax(MiniMax-M3)
+  // 同 lane 同 key(/api/plan + ARK_AGENT_PLAN_KEY,订阅制),但**独立 spec**:supportsVision 是
+  // provider 级语义(M3 多模态=true / kimi 纯文本=false),且 kimi 不支持关闭思考(见
+  // stripDisabledThinking),不能与 M3 合并声明。spec=路由组而非端点唯一(ark glm 双型号同构先例)。
+  // 实测(2026-07-06,kl-mirror 直连探针):非流式/SSE 流式/tool_use/tool_result 回环(**含 thinking
+  // 块回放**,CCB 多轮硬依赖)/system+cache_control 全通;usage 含 cache_read_input_tokens。
+  // kimi-k2.6 同样可用(未接,需要时加 inboundModelIds + 定价行);kimi-k2.7(非 code)不在
+  // Agent Plan(404 UnsupportedModel)。
+  upstreamEndpoint: 'https://ark.cn-beijing.volces.com/api/plan/v1/messages',
+  matchesRoute(modelId) {
+    return modelId.toLowerCase() === 'kimi-k2.7-code'
+  },
+  inboundModelIds: ['kimi-k2.7-code'],
+  canonicalizeForPricing(modelId) {
+    return modelId.toLowerCase() === 'kimi-k2.7-code' ? 'kimi-k2.7-code' : null
+  },
+  stripHeaders: ['anthropic-beta'],
+  // **保留 thinking**:kimi-k2.7-code 恒思考,实测接受 thinking:{type:enabled,budget_tokens};
+  // 但 {type:disabled} → 火山 400 "The current model does not support disabling thinking" →
+  // stripDisabledThinking 在 master 侧删参兜底(退回默认=照常思考)。
+  stripBodyFields: ['output_config', 'context_management', 'service_tier'],
+  stripDisabledThinking: true,
+  // kimi-k2.7-code 官方规格 256K 窗口;max output 上游硬顶 32768(实测 100k → 400
+  // "expected a value <= 32768";CCB 未知静态模型默认 max_tokens=32000 < 顶,安全。
+  // **已知限制**:容器若设 CLAUDE_CODE_MAX_OUTPUT_TOKENS > 32768 会被上游拒)。
+  maxInputTokens: 256_000,
+  // 实测 image block → 400 InvalidParameter → 纯文本接入,master strip 图,
+  // understand_image 工具兜底(mcpVisionServer/promptSlots 已同步登记)。
+  supportsVision: false,
+}
+
 export const STATIC_KEY_PROVIDERS: readonly StaticKeyProviderSpec[] = [
   DEEPSEEK,
   MINIMAX,
   ARK,
   OPENCODE_GO,
+  ARK_PLAN_KIMI,
 ]
 
 const BY_ID: Record<StaticProviderId, StaticKeyProviderSpec> = {
@@ -212,6 +255,7 @@ const BY_ID: Record<StaticProviderId, StaticKeyProviderSpec> = {
   minimax: MINIMAX,
   ark: ARK,
   opencodego: OPENCODE_GO,
+  kimi: ARK_PLAN_KIMI,
 }
 
 /** commercial proxy 路由判定：返回命中的 provider(用 matchesRoute)，否则 undefined(走 OAuth)。 */
@@ -223,7 +267,7 @@ export function getStaticProvider(id: StaticProviderId): StaticKeyProviderSpec {
   return BY_ID[id]
 }
 
-/** gateway inbound 白名单：所有静态 provider 的精确字面量(deepseek 2 项 + MiniMax-M3 + glm-5.1 + glm-5.2 + qwen3.7-max/plus)。 */
+/** gateway inbound 白名单：所有静态 provider 的精确字面量(deepseek 2 项 + MiniMax-M3 + glm-5.1 + glm-5.2 + qwen3.7-max/plus + kimi-k2.7-code)。 */
 export const STATIC_KEY_INBOUND_MODEL_IDS: readonly string[] = STATIC_KEY_PROVIDERS.flatMap(
   (p) => [...p.inboundModelIds],
 )
