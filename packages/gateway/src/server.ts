@@ -73,6 +73,7 @@ import {
 } from '@openclaude/storage'
 import {
   filterUserVisibleAgentsForManagement,
+  filterUserVisibleByAgentField,
   filterUserVisibleRoutesForManagement,
   isHiddenSystemAgentId,
   userVisibleDefaultAgentId,
@@ -990,6 +991,32 @@ export class Gateway {
       this._agentsConfigMtime = 0
       return this._agentsConfigCache
     }
+  }
+
+  // ── User-facing projection of the agents config (single authority) ──
+  // 枚举/展示消费面(agent 管理 GET、/v1/models、技能作用域等)统一走这里:
+  // agents/routes 剔除隐藏系统 agent、default 收敛到用户可见值。判定/授权/执行面
+  // 不走此视图(继续用 isHiddenSystemAgentId predicate 看全量)。
+  // 投影结果按底层缓存对象**身份**复用:_getAgentsConfig 只在 YAML mtime 变化时
+  // 换新对象,故身份不变即可复用投影;换新(或错误路径每次 fresh read)即重算,
+  // 无陈旧风险,也不改动底层缓存对象。
+  private _agentsConfigUserViewSource: AgentsConfig | null = null
+  private _agentsConfigUserViewCache: AgentsConfig | null = null
+
+  private async _getAgentsConfigUserView(): Promise<AgentsConfig> {
+    const cfg = await this._getAgentsConfig()
+    if (this._agentsConfigUserViewCache && this._agentsConfigUserViewSource === cfg) {
+      return this._agentsConfigUserViewCache
+    }
+    const view: AgentsConfig = {
+      ...cfg,
+      agents: filterUserVisibleAgentsForManagement(cfg.agents),
+      routes: filterUserVisibleRoutesForManagement(cfg.routes),
+      default: userVisibleDefaultAgentId(cfg.default),
+    }
+    this._agentsConfigUserViewSource = cfg
+    this._agentsConfigUserViewCache = view
+    return view
   }
 
   // ── In-memory cache for static web UI files ──
@@ -2081,15 +2108,21 @@ export class Gateway {
 
     // OpenAI-compatible API: /v1/chat/completions, /v1/models
     if (url.pathname.startsWith('/v1/')) {
-      handleOpenAIRequest(req, res, url, {
-        config: this.deps.config,
-        agentsConfig: this.deps.agentsConfig,
-        sessions: this.sessions,
-        runLog: this._runLog,
-        readBody: (r) => this.readBody(r),
-        sendJson: (r, c, b) => this.sendJson(r, c, b),
-        sendError: (r, c, m) => this.sendError(r, c, m),
-      })
+      // /v1/models 枚举面走用户可见投影(隐藏系统 agent 不列);/v1/chat/completions
+      // 目标解析/拒绝仍用全量 agentsConfig + predicate(判定面)。
+      this._getAgentsConfigUserView()
+        .then((agentsConfigUserView) =>
+          handleOpenAIRequest(req, res, url, {
+            config: this.deps.config,
+            agentsConfig: this.deps.agentsConfig,
+            agentsConfigUserView,
+            sessions: this.sessions,
+            runLog: this._runLog,
+            readBody: (r) => this.readBody(r),
+            sendJson: (r, c, b) => this.sendJson(r, c, b),
+            sendError: (r, c, m) => this.sendError(r, c, m),
+          }),
+        )
         .then((handled) => {
           if (!handled) this.sendError(res, 404, 'unknown v1 endpoint')
         })
@@ -2885,7 +2918,7 @@ export class Gateway {
 
     // ── Webhook REST API ──
     if (url.pathname === '/api/webhooks' && req.method === 'GET') {
-      const list = (this.webhookRouter?.list() ?? []).filter((wh) => !isHiddenSystemAgentId(wh.agent))
+      const list = filterUserVisibleByAgentField(this.webhookRouter?.list() ?? [])
       this.sendJson(res, 200, { webhooks: list })
       return
     }
@@ -4937,16 +4970,20 @@ export class Gateway {
   // GET /api/agents         → { agents, default }
   // POST /api/agents        → create { id, model?, persona? }
   private async handleAgentsCollection(req: IncomingMessage, res: ServerResponse): Promise<void> {
-    const cfg = await readAgentsConfig()
     if (req.method === 'GET') {
+      // 枚举面:走用户可见投影(隐藏系统 agent 已剔除、default 已收敛)。
+      const view = await this._getAgentsConfigUserView()
       this.sendJson(res, 200, {
-        agents: filterUserVisibleAgentsForManagement(cfg.agents),
-        default: userVisibleDefaultAgentId(cfg.default),
-        routes: filterUserVisibleRoutesForManagement(cfg.routes),
+        agents: view.agents,
+        default: view.default,
+        routes: view.routes,
       })
       return
     }
     if (req.method === 'POST') {
+      // 建 agent 是 mutation 面:必须读/写全量 config(不能用投影视图,否则写回
+      // agents.yaml 会把隐藏系统 agent 一并删掉)。保留 id 拒绝仍用 predicate 看全量。
+      const cfg = await readAgentsConfig()
       const body = await this.readJsonBody<Partial<AgentDef>>(req)
       if (!body.id || !/^[a-zA-Z0-9_-]+$/.test(body.id)) {
         this.sendError(res, 400, 'invalid agent id (use only a-z 0-9 _ -)')
@@ -5260,15 +5297,17 @@ export class Gateway {
   private async validateSkillAgentScopeInput(input: unknown): Promise<string[] | { error: string }> {
     const parsed = validateSkillAgentScope(input)
     if (!parsed.ok || !parsed.agentIds) return { error: parsed.error ?? 'invalid agentIds' }
+    // 枚举面:走用户可见投影 —— view.agents 已剔除隐藏系统 agent、view.default 已
+    // 收敛,故 allowed 集合天然不含隐藏 id(无需再手工 !isHiddenSystemAgentId 过滤)。
     let cfg: AgentsConfig
     try {
-      cfg = await this._getAgentsConfig()
+      cfg = await this._getAgentsConfigUserView()
     } catch {
       cfg = { agents: [{ id: 'main' }], routes: [], default: 'main' }
     }
     const allowed = new Set<string>(
       ['main', cfg.default, ...(cfg.agents ?? []).map((a) => a.id)].filter(
-        (id): id is string => typeof id === 'string' && !isHiddenSystemAgentId(id),
+        (id): id is string => typeof id === 'string',
       ),
     )
     const bad = parsed.agentIds.find((id) => !allowed.has(id))
@@ -6965,7 +7004,7 @@ export class Gateway {
 
   private async _handleTasksApi(req: IncomingMessage, res: ServerResponse): Promise<void> {
     if (req.method === 'GET') {
-      const tasks = (await this._taskStore.list()).filter((task) => !isHiddenSystemAgentId(task.agent))
+      const tasks = filterUserVisibleByAgentField(await this._taskStore.list())
       this.sendJson(res, 200, { tasks })
       return
     }
@@ -7141,7 +7180,7 @@ export class Gateway {
   private async handleCronApi(req: IncomingMessage, res: ServerResponse): Promise<void> {
     if (!this.cron) return this.sendError(res, 503, 'cron not initialized')
     if (req.method === 'GET') {
-      const jobs = (await this.cron.listJobsWithMeta()).filter((job) => !isHiddenSystemAgentId(job.agent))
+      const jobs = filterUserVisibleByAgentField(await this.cron.listJobsWithMeta())
       this.sendJson(res, 200, { jobs })
       return
     }

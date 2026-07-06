@@ -307,7 +307,25 @@ describe("openclaude-runtime entrypoint env-scrub policy", () => {
     assert.match(src, /delete next\[key\]/, "hidden reviewer repair must remove stale source/cwd/mcp fields");
     assert.match(src, /setField\("toolsets", desired\.toolsets\)/, "hidden reviewer repair must force core-only toolsets");
     assert.match(src, /ensureAgentPersona\(\s*"hidden-reviewer"[\s\S]*\{\s*force:\s*true\s*\}/, "hidden reviewer persona file must be force-refreshed");
-    assert.match(src, /function isHiddenSystemAgentId\(id: unknown\)/, "entrypoint must recognize hidden system ids during agents.yaml repair");
+    // P2 债E 收口:隐藏 agent id 权威已上移 @openclaude/protocol,entrypoint 不再手抄
+    // 黑名单,改 import 共享权威;本地 isHiddenSystemAgentId(id:unknown) 只做类型收窄后
+    // 委派。守护意图从「entrypoint 自持一份识别逻辑(两源约定同步)」升级为「entrypoint
+    // 与 gateway 编译期共享唯一权威(一源)」—— 防止回退成手抄字面量。
+    assert.match(
+      src,
+      /import \{ isHiddenSystemAgentId as isHiddenSystemAgentIdShared \} from "\/opt\/openclaude\/packages\/protocol\/src\/agentVisibility\.ts"/,
+      "entrypoint must import the hidden-agent id authority from @openclaude/protocol (single source, no hand-copied blacklist)",
+    );
+    assert.match(
+      src,
+      /function isHiddenSystemAgentId\(id: unknown\): boolean \{\s*return typeof id === "string" && isHiddenSystemAgentIdShared\(id\);/,
+      "entrypoint's isHiddenSystemAgentId must delegate to the shared protocol authority (type-narrow adapter only)",
+    );
+    assert.doesNotMatch(
+      src,
+      /function isHiddenSystemAgentId\(id: unknown\): boolean \{\s*return id === "hidden-reviewer";/,
+      "entrypoint must not re-introduce a hand-copied hidden-reviewer literal in the recognizer",
+    );
     assert.match(src, /const routes = rawRoutes\.filter\(\(route\) => !isHiddenSystemAgentRoute\(route\)\)/, "entrypoint must strip stale routes targeting hidden reviewer");
     assert.match(src, /agentIds\.has\(doc\.default\) && !isHiddenSystemAgentId\(doc\.default\)/, "entrypoint must not preserve hidden reviewer as default agent");
     // 退役的平台预置子 agent / 团队定义不得再出现(纯市场根治 agent 数据分裂)。
