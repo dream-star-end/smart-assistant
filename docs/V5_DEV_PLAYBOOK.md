@@ -223,6 +223,8 @@ BEGIN; <迁移 SQL>; INSERT INTO schema_migrations(version, applied_at) VALUES (
 | teamMode 全局粘滞开关 | localStorage 设备级 flag;wave1 只加可见指示,per-session 化未做 | 团队产品化时改会话级 |
 | ~~TeamPanel 聚合脆弱~~ **已偿还**(批次2渲染+批次3并发) | coalesceTeam 改按 turn 锚点(最近 user 消息边界)归组;_activeDelegations 加 per-parent 分桶+review 保留槽 | — |
 | landing 团队演示错位 | 动态角色/成员并行/过程账本三点与实现不符 | 产品化后对齐,或先行弱化文案 |
+| provision 事务窗口过宽 | provisionV3Container 单 BEGIN 跨 docker create/start 慢操作,idle-in-tx(60s)可杀连接(07-06 事故根因;pg client error 已挂监听不再崩进程 90202532,僵尸 409 已有自愈) | idle-in-tx 规模化 reject 时,把 docker 副作用移出事务(需重构 per-uid lock+cap 门控原子性) |
+| v5 无后台孤儿回收网 | orphanReconcile/idleSweep/volumeGc 在 v5 全禁(controlPlane+env 双关),僵尸只有进程内 409 自愈一道防线 | 下次动容器生命周期时,给 v5 放开 v5-owned 域的 orphanReconcile(触碰 mutator 归属矩阵) |
 
 ---
 
