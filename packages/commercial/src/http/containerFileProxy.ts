@@ -51,8 +51,16 @@ import type { ComputeHostRow } from "../compute-pool/types.js";
 import { pipeBodyByContentLength, pipeBodyChunked, readResponseHead } from "./tunnelHttpReader.js";
 
 const CONNECT_MS = 3_000;
-const IDLE_MS = 120_000;
-const PER_UID_MAX = 4;
+// body idle 超时(非 connect 超时):上游 socket 在**已建连、传输中**连续无字节的
+// 最长等待。D2:120s→300s。跨境慢速大文件下载在网络抖动时可能长时间(>2min)吐不
+// 出一个包,却并非真断线;120s 会把这类慢速下载误杀成断流,用户被迫从头重下。放宽
+// 到 300s 给跨境抖动足够容忍窗口。connect 超时(CONNECT_MS=3s,建连阶段)不放宽 ——
+// 那是"容器活没活"的快速判定,与传输中慢速是两个关注点。
+const IDLE_MS = 300_000;
+// 同一 uid 的并发下载上限。D3:4→6。同一页多附件(如一条消息带 4~5 个交付物)用户
+// 点"全部下载"会并发拉多个,4 太紧会 429 报障;放到 6 覆盖常见多附件场景,又不至于
+// 让单用户占满 master 出站。
+const PER_UID_MAX = 6;
 const MAX_HEADER_BYTES = 64 * 1024;
 
 /** per-uid 并发计数。key = uid string。release() 幂等。 */

@@ -16,7 +16,9 @@ import { afterEach, describe, it } from 'node:test'
 import {
   _sanitizeThreadId,
   buildCodexEnv,
+  buildCodexMultiAgentDisableArgs,
   buildCodexProviderConfigArgs,
+  buildCodexReasoningSummaryArgs,
   buildCodexTelemetryHardeningArgs,
   codexReasoningEffortConfig,
   copyImagePathsToPublicDir,
@@ -238,6 +240,68 @@ describe('_sanitizeThreadId / copyImagePathsToPublicDir', () => {
     } finally {
       await rm(src, { recursive: true, force: true })
       await rm(dst, { recursive: true, force: true })
+    }
+  })
+})
+
+describe('buildCodexMultiAgentDisableArgs (T1)', () => {
+  it('默认(未设 env)关闭原生多 agent', () => {
+    assert.deepEqual(buildCodexMultiAgentDisableArgs({}), [
+      '-c',
+      'features.multi_agent_v2=false',
+    ])
+  })
+
+  it('OC_CODEX_NATIVE_MULTI_AGENT 显式打开 → 不追加(恢复原生)', () => {
+    for (const v of ['on', '1', 'true', 'yes', 'ON', 'True']) {
+      assert.deepEqual(
+        buildCodexMultiAgentDisableArgs({ OC_CODEX_NATIVE_MULTI_AGENT: v }),
+        [],
+        `env=${v} 应恢复原生多 agent`,
+      )
+    }
+  })
+
+  it('非"显式打开"的杂值(含 off/0/false)仍保持关闭', () => {
+    for (const v of ['off', '0', 'false', 'no', 'maybe', '']) {
+      assert.deepEqual(buildCodexMultiAgentDisableArgs({ OC_CODEX_NATIVE_MULTI_AGENT: v }), [
+        '-c',
+        'features.multi_agent_v2=false',
+      ])
+    }
+  })
+})
+
+describe('buildCodexReasoningSummaryArgs (T3)', () => {
+  it('codex-native provider 默认追加 summary=auto', () => {
+    assert.deepEqual(buildCodexReasoningSummaryArgs('codex-native', {}), [
+      '-c',
+      'model_reasoning_summary="auto"',
+    ])
+  })
+
+  it('非 codex-native provider → 零变化', () => {
+    assert.deepEqual(buildCodexReasoningSummaryArgs('minimax', {}), [])
+    assert.deepEqual(buildCodexReasoningSummaryArgs(undefined, {}), [])
+    assert.deepEqual(buildCodexReasoningSummaryArgs('', {}), [])
+  })
+
+  it('OC_CODEX_REASONING_SUMMARY=off/0/false/no → 不追加(可秒关)', () => {
+    for (const v of ['off', '0', 'false', 'no', 'OFF']) {
+      assert.deepEqual(
+        buildCodexReasoningSummaryArgs('codex-native', { OC_CODEX_REASONING_SUMMARY: v }),
+        [],
+        `env=${v} 应关闭 summary`,
+      )
+    }
+  })
+
+  it('env 为其它真值/杂值时保持打开(default-true)', () => {
+    for (const v of ['auto', 'on', '1', 'true', 'whatever']) {
+      assert.deepEqual(
+        buildCodexReasoningSummaryArgs('codex-native', { OC_CODEX_REASONING_SUMMARY: v }),
+        ['-c', 'model_reasoning_summary="auto"'],
+      )
     }
   })
 })

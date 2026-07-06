@@ -16,7 +16,9 @@ import type { RepoSnapshot } from '../sessionRepoWorkspace.js'
 import {
   _sanitizeThreadId,
   buildCodexEnv,
+  buildCodexMultiAgentDisableArgs,
   buildCodexProviderConfigArgs,
+  buildCodexReasoningSummaryArgs,
   buildCodexTelemetryHardeningArgs,
   type CodexProviderConfigOverride,
   codexReasoningEffortConfig,
@@ -1324,6 +1326,17 @@ export class CodexAppServerRunner extends EventEmitter {
     const providerSignature = this.codexRouteSignature()
     const providerArgs = buildCodexProviderConfigArgs(process.env, this.codexRouteConfig)
     const effortArgs = codexReasoningEffortConfig(this.codexReasoningEffort())
+    // T3:reasoning summary 与 effort 是同一 provider 的推理配置,co-locate 在这里
+    // 一起拼(仅 codex-native/gpt-5.5 官方 OAuth 路径生效,env 可秒关)。让队长思考
+    // 阶段吐 summary → thinking 卡可见。
+    const reasoningSummaryArgs = buildCodexReasoningSummaryArgs(
+      this.opts.agentProvider,
+      process.env,
+    )
+    // T1:每次 spawn 无条件关闭 codex 原生多 agent(features.multi_agent_v2),与
+    // telemetry hardening 同为"无条件安全兜底"——即便 launch overrides 构建失败走
+    // naked launch,原生 spawnAgent 也不会复活来绕开 delegate_task。见 helper 注释。
+    const multiAgentDisableArgs = buildCodexMultiAgentDisableArgs(process.env)
     // v5 telemetry-block C1(配置面双保险):遥测/自更新关闭 + chatgpt_base_url
     // 指向容器 loopback relay。**每次 spawn 无条件追加**(不挂 provider override
     // 成功路径)——即便本 turn 无 route override / managed_config 被非法值整份丢弃,
@@ -1342,6 +1355,8 @@ export class CodexAppServerRunner extends EventEmitter {
       ...argvOverrides,
       ...providerArgs,
       ...effortArgs,
+      ...reasoningSummaryArgs,
+      ...multiAgentDisableArgs,
       ...telemetryArgs,
       '--listen',
       'stdio://',

@@ -100,6 +100,70 @@ export function codexReasoningEffortConfig(level: string | undefined | null): st
   return ['-c', `model_reasoning_effort="${normalized}"`]
 }
 
+/** env 值是否为"显式打开"(on/1/true/yes)。默认关的开关用它。 */
+function envFlagExplicitOn(value: string | undefined): boolean {
+  if (value === undefined) return false
+  const v = value.trim().toLowerCase()
+  return v === '1' || v === 'true' || v === 'yes' || v === 'on'
+}
+
+/**
+ * T1 根治 —— 关闭 codex app-server 的原生多 agent 能力(`features.multi_agent_v2`)。
+ *
+ * 背景:codex 0.138 的 `features.multi_agent_v2` 一旦启用(gpt-5.5 服务端会推该
+ * 能力),模型工具集里就会出现原生 `spawnAgent/sendInput/wait/closeAgent` 这套
+ * 子 agent 编排工具。队长(gpt-5.5)倾向直接调原生 `spawnAgent`,而这条路径:
+ *   - 子 agent 跑在 codex app-server 进程内部,openclaude 只能观测到"启动/终态"
+ *     两个点(见 codexAppServerRunner.handleCollabAgentToolStarted),**全程零实时
+ *     进度**——正是"任务卡出来但消息区长时间空白"的根因之一。
+ *   - 绕开了 openclaude 的 `delegate_task`,也就绕开了计费 / 递归深度闸 / 并发资源
+ *     闸 / 实时进度透传。等于在 delegate_task 之外又开了第二套委派权威源。
+ *
+ * v5 的委派唯一权威源是 `delegate_task`(mcp-memory 内置 MCP 工具,与本 feature
+ * 完全解耦,恒带 streamProgress:true)。因此这里**每次 spawn 无条件关闭**原生多
+ * agent(不仅团队模式),从底座消除"无计费/无进度的原生子 agent"一整类风险,而
+ * 不是只堵团队模式这一个症状——config 是 per-spawn(app-server 长驻跨多 turn),
+ * 按 turn 级 teamMode 切换需要反复 respawn,得不偿失;而原生 spawnAgent 在任何模式
+ * 下都不该替代 delegate_task,全局关闭反而是对称、干净的根治。
+ *
+ * 逃生舱:`OC_CODEX_NATIVE_MULTI_AGENT=on`(或 1/true/yes)→ 不追加关闭参数,恢复
+ * codex 原生多 agent,线上万一需要临时放开可即时切。默认(未设/其它值)= 关闭。
+ *
+ * 与 `delegate_task` 的关系已在 mcp-memory 侧核实:delegate_task 是纯 MCP 工具,
+ * 不依赖 collaborationMode / multi_agent_v2,关闭本 feature 不影响其可用性。
+ */
+export function buildCodexMultiAgentDisableArgs(
+  env: NodeJS.ProcessEnv = process.env,
+): string[] {
+  if (envFlagExplicitOn(env.OC_CODEX_NATIVE_MULTI_AGENT)) return []
+  return ['-c', 'features.multi_agent_v2=false']
+}
+
+/**
+ * T3 思考可见 —— 给 chatgpt/官方 OAuth(codex-native)provider 的 codex 启动追加
+ * `model_reasoning_summary="auto"`,让 gpt-5.5 队长的思考阶段吐出 summary 流。
+ *
+ * codex 把 `item/reasoning/summaryTextDelta` 映射成 CCB `thinking_delta`(见
+ * codexAppServerRunner.handleNotification),前端渲染 💭 思考卡;不加本参数时
+ * gpt-5.5 relay 不产 summary,队长思考阶段一张 thinking 卡都不出。
+ *
+ * 作用面收敛:仅当 provider === 'codex-native' 时才加(codex app-server 底座
+ * 的 agentProvider 被 codexAdapter 强制归一为 'codex-native',即 v5 的 gpt-5.5
+ * 官方 OAuth 路径)。别的 provider / 别的引擎(CCB 走 subprocessRunner,根本不经
+ * 本 helper)零变化。
+ *
+ * env 开关:`OC_CODEX_REASONING_SUMMARY=off`(0/false/no/off)→ 不加该参数,线上
+ * 出问题可秒关。默认(未设)= 打开。
+ */
+export function buildCodexReasoningSummaryArgs(
+  provider: string | undefined,
+  env: NodeJS.ProcessEnv = process.env,
+): string[] {
+  if (provider !== 'codex-native') return []
+  if (!envFlagDefaultTrue(env.OC_CODEX_REASONING_SUMMARY)) return []
+  return ['-c', 'model_reasoning_summary="auto"']
+}
+
 const CODEX_PROVIDER_ID_RE = /^[A-Za-z0-9_-]+$/
 
 function tomlString(value: string): string {

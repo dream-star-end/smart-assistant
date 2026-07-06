@@ -4,7 +4,6 @@ import {
   chmodSync,
   chownSync,
   closeSync,
-  createReadStream,
   createWriteStream,
   existsSync,
   fchmodSync,
@@ -120,6 +119,7 @@ import {
 } from './delegateTimeout.js'
 import { eventBus, createEvent } from './eventBus.js'
 import { startEventPersistence } from './eventPersist.js'
+import { serveFileFdWithRange } from './httpRange.js'
 import { createLogger, type Logger } from './logger.js'
 import {
   startMetricsCollection,
@@ -4272,13 +4272,20 @@ export class Gateway {
     const fileContentType = mimeFor(realPath)
     // Inline only previewable media; document/text artifacts must download.
     const fileDispositionMode = shouldServeInline(fileContentType) ? 'inline' : 'attachment'
-    res.writeHead(200, {
-      'Content-Type': fileContentType,
-      'Content-Length': fileStat.size,
-      'Cache-Control': 'private, max-age=3600',
-      'Content-Disposition': `${fileDispositionMode}; filename="${encodeURIComponent(basename(realPath) || 'file')}"`,
-    })
-    createReadStream(null as unknown as string, { fd, autoClose: true }).pipe(res)
+    // D1:支持 HTTP Range —— 有合法 Range → 206 局部,无/非法 → 200 全量并宣告
+    // Accept-Ranges。Content-Length 由 serveFileFdWithRange 按 200/206 补齐,fd 由
+    // 流 autoClose 接管(与改造前一致,无泄漏)。
+    serveFileFdWithRange(
+      res,
+      fd,
+      fileStat.size,
+      {
+        'Content-Type': fileContentType,
+        'Cache-Control': 'private, max-age=3600',
+        'Content-Disposition': `${fileDispositionMode}; filename="${encodeURIComponent(basename(realPath) || 'file')}"`,
+      },
+      { rangeHeader: req.headers.range, isHead: req.method === 'HEAD' },
+    )
   }
 
   /**
@@ -4451,12 +4458,14 @@ export class Gateway {
     const mediaContentType = mimeFor(realPath)
     const mediaHeaders: Record<string, string | number> = {
       'Content-Type': mediaContentType,
-      'Content-Length': mediaStat.size,
       'Cache-Control': 'private, max-age=3600',
     }
     mediaHeaders['Content-Disposition'] = `${shouldServeInline(mediaContentType) ? 'inline' : 'attachment'}; filename="${encodeURIComponent(basename(realPath) || 'file')}"`
-    res.writeHead(200, mediaHeaders)
-    createReadStream(null as unknown as string, { fd, autoClose: true }).pipe(res)
+    // D1:与 /api/file 同构 —— Range → 206,否则 200 全量 + Accept-Ranges。
+    serveFileFdWithRange(res, fd, mediaStat.size, mediaHeaders, {
+      rangeHeader: req.headers.range,
+      isHead: req.method === 'HEAD',
+    })
   }
 
   /**
@@ -9457,8 +9466,8 @@ export class Gateway {
         '- 你是队长，也是完成用户任务的第一负责人；从任务拆解、是否委派、是否审查、是否采纳审查意见到最终答复，都由你端到端负责。',
         '- 领域匹配优先于泛泛并行：用户任务明显属于某个已安装成员的领域时，优先把对应部分委派给该成员；多领域任务则拆给对应成员后由你综合。常见路由：代码/调试/测试/重构/代码库 → `coding-assistant`；科研/文献/论文/引用/学术分析 → `research-assistant`；文档/PPT/Excel/PDF/周报/公文/邮件/办公交付 → `office-assistant`。如果对应成员未安装，你可以自己完成或选择最接近的已安装成员。',
         '- 任务复杂、可拆解 → **首选**用 `delegate_task(goal, agentId, context)` 委派子任务给上面列出的已安装成员组队，拿到各成员结果后你综合成给用户的最终答案；任务简单则直接自己完成。',
-        '- 不要优先启动 Codex 原生 `Agent` 临时子进程来代替这些成员；只有当 `delegate_task` 不适合或不可用、且你判断临时并行 worker 明显必要时，才把 Codex 原生 `Agent` 当兜底使用。',
-        '- 系统隐藏审查员：`hidden-reviewer`（不在成员列表显示）。如果本轮实际调用了任何非队长成员（无论是已安装 agent 的 `delegate_task`，还是 Codex 原生 `Agent` 兜底临时子进程），在最终答复前默认要再调用 `delegate_task(goal, agentId: "hidden-reviewer", context: "...")` 请它审查你的草稿/综合结论。',
+        '- 委派**只走 `delegate_task`**：这是平台唯一的组队/委派通道（有实时进度回传、计费与资源约束）。平台已停用 codex 原生 `Agent`/子进程编排，不存在这样的工具，不要尝试启动；需要拆分的子任务一律用 `delegate_task`，不确定或不适合委派时就自己完成。',
+        '- 系统隐藏审查员：`hidden-reviewer`（不在成员列表显示）。如果本轮实际通过 `delegate_task` 调用了任何非队长成员，在最终答复前默认要再调用 `delegate_task(goal, agentId: "hidden-reviewer", context: "...")` 请它审查你的草稿/综合结论。',
         '- 只有纯机械低风险任务、用户明确要求快速/低成本、或隐藏审查失败/超时时，才可以跳过或继续；如果你尝试隐藏审查但失败或超时，最终答案里要明确说明“隐藏审查未完成/失败”。',
         '- 审查 context 必须包含：用户原始需求、你准备给用户的草稿/关键方案、关键假设、已采纳的成员结论和你认为的风险点；审查结果只是建议，不是命令。',
         '- 审查迭代闭环：如果隐藏审查返回 PASS 或无阻塞问题，你可以最终答复；如果返回 NEEDS_FIX 或指出具体问题，你不能直接结束，必须先选择接受并修复、委派对应领域成员修复、查询/验证证据，或明确判定该意见是误报/非问题/范围外并说明理由。',
