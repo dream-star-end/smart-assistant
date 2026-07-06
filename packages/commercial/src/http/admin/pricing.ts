@@ -42,6 +42,7 @@ export function serializePricing(r: ModelPricingRowView): Record<string, unknown
     visibility: r.visibility,
     extra_system_prompt: r.extra_system_prompt,
     default_effort: r.default_effort,
+    lock_version: r.lock_version,
   };
 }
 
@@ -131,11 +132,11 @@ export async function handleAdminPatchPricing(
       patch[f] = b[f] as string | number;
     }
   }
-  if (b.if_match_updated_at !== undefined) {
-    if (typeof b.if_match_updated_at !== "string") {
-      throw new HttpError(400, "VALIDATION", "if_match_updated_at must be ISO string");
+  if (b.if_match_lock_version !== undefined) {
+    if (typeof b.if_match_lock_version !== "number") {
+      throw new HttpError(400, "VALIDATION", "if_match_lock_version must be number");
     }
-    patch.if_match_updated_at = b.if_match_updated_at;
+    patch.if_match_lock_version = b.if_match_lock_version;
   }
 
   try {

@@ -17,10 +17,10 @@
 //   - 任何 list 接口 4xx → 提示 + 跳转 /;不要在 admin 页面里"匿名展示空列表"
 //   - PATCH/DELETE 操作前必须有 confirm 提示
 
-import { _clearStoredAccessToken, state } from './state.js?v=0c63cd08'
-import { htmlSafeEscape } from './dom.js?v=0c63cd08'
-import { apiGet, apiJson, apiText, apiFetch, authHeaders, onAuthExpired, silentRefresh } from './api.js?v=0c63cd08'
-import { lineChart, barChart, donutChart, destroyChart, fmt as cfmt } from './charts.js?v=0c63cd08'
+import { _clearStoredAccessToken, state } from './state.js?v=fb8211eb'
+import { htmlSafeEscape } from './dom.js?v=fb8211eb'
+import { apiGet, apiJson, apiText, apiFetch, authHeaders, onAuthExpired, silentRefresh } from './api.js?v=fb8211eb'
+import { lineChart, barChart, donutChart, destroyChart, fmt as cfmt } from './charts.js?v=fb8211eb'
 
 // 与后端 packages/commercial/src/admin/ledger.ts 的 LEDGER_REASONS 枚举严格同步。
 // 新增/删除 reason 必须两端同步改,否则 ledger tab filter 会把错误值发给后端
@@ -4890,7 +4890,12 @@ async function _saveModelRow(modelId, tr, btn) {
   if (!/^\d+(\.\d{1,3})?$/.test(mult)) { toast('multiplier 格式不对(如 2.000)', 'danger'); return }
   if (mult !== String(orig.multiplier ?? '')) patch.multiplier = mult
   const dn = (read('display_name')?.value ?? '').trim()
-  if (dn !== String(orig.display_name ?? '').trim()) patch.display_name = dn === '' ? null : dn
+  // 显示名不许清空(后端 normalizeDisplayName 会 400);空值保留原值并提示
+  if (dn === '') {
+    if (String(orig.display_name ?? '').trim() !== '') toast('显示名不能为空,已保留原值', 'warn')
+  } else if (dn !== String(orig.display_name ?? '').trim()) {
+    patch.display_name = dn
+  }
   const vis = read('visibility')?.value
   if (vis && vis !== orig.visibility) patch.visibility = vis
   const effEl = read('default_effort')
@@ -4904,7 +4909,8 @@ async function _saveModelRow(modelId, tr, btn) {
     const ok = await _confirmPriceChanges(orig, priceChanges)
     if (!ok) return
   }
-  patch.if_match_updated_at = orig.updated_at
+  // 乐观并发:整数版本号(后端 lock_version,每次保存 +1;比 updated_at 时间戳无微秒截断坑)
+  patch.if_match_lock_version = orig.lock_version
   await withBtnLoading(btn, async () => {
     try {
       await apiJson('PATCH', `/api/admin/pricing/${encodeURIComponent(modelId)}`, patch)

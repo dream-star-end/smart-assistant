@@ -74,8 +74,10 @@ export function startLatencyProber(opts: {
     );
   };
 
+  let running = false; // in-flight guard:全员超时一轮可近 50s,防最小 interval(30s)下 tick 重叠
   const tick = async (): Promise<void> => {
-    if (stopped) return;
+    if (stopped || running) return;
+    running = true;
     try {
       for (let i = 0; i < STATIC_KEY_PROVIDERS.length; i++) {
         if (stopped) return;
@@ -88,6 +90,8 @@ export function startLatencyProber(opts: {
     } catch (err) {
       // 探测器任何失败都不能影响 egress 主职(在飞 LLM 流);只告警不冒泡。
       opts.log.warn("latency_prober_tick_failed", { err: String((err as Error)?.message ?? err) });
+    } finally {
+      running = false;
     }
   };
 

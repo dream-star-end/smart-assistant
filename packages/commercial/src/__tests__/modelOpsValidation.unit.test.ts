@@ -78,6 +78,32 @@ describe("normalizePriceCents — 整数分 + 边界", () => {
       assert.throws(() => normalizePriceCents(bad, "input_per_mtok"), /invalid_input_per_mtok/, String(bad));
     }
   });
+  it("字符串只认十进制数字(拒 1e3/0x10 等 Number() 旁门写法)", () => {
+    for (const bad of ["1e3", "0x10", "+12", "12.0", "１２"]) {
+      assert.throws(() => normalizePriceCents(bad, "input_per_mtok"), /invalid_input_per_mtok/, bad);
+    }
+  });
+});
+
+describe("patchPricing — 价格列强制乐观锁(同步抛,零 DB 交互)", () => {
+  it("带价格列但缺 if_match_lock_version → 拒", async () => {
+    const { patchPricing } = await import("../admin/pricing.js");
+    await assert.rejects(
+      patchPricing("glm-5.2", { input_per_mtok: 1 }, { adminId: 1 }),
+      /if_match_required_for_price_changes/,
+    );
+  });
+  it("if_match_lock_version 非法值 → 拒", async () => {
+    const { patchPricing } = await import("../admin/pricing.js");
+    await assert.rejects(
+      patchPricing("glm-5.2", { input_per_mtok: 1, if_match_lock_version: -1 }, { adminId: 1 }),
+      /invalid_if_match_lock_version/,
+    );
+    await assert.rejects(
+      patchPricing("glm-5.2", { input_per_mtok: 1, if_match_lock_version: 1.5 }, { adminId: 1 }),
+      /invalid_if_match_lock_version/,
+    );
+  });
 });
 
 describe("normalizeVisibility / normalizeDisplayName", () => {

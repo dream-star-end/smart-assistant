@@ -54,6 +54,8 @@ export interface ModelPricingRowView {
   extra_system_prompt: string | null;
   /** 0105 引入 — per-model 默认思考深度(proxy 注入;NULL=不注入)。 */
   default_effort: string | null;
+  /** 0105 引入 — 乐观并发版本号(每次 PATCH 成功 +1;整数精确比较,无时间戳截断坑)。 */
+  lock_version: number;
 }
 
 const PRICING_COLS = `
@@ -70,7 +72,8 @@ const PRICING_COLS = `
   updated_by::text           AS updated_by,
   visibility,
   extra_system_prompt,
-  default_effort
+  default_effort,
+  lock_version
 `;
 
 /** extra_system_prompt 长度上限,与 0060 migration 的 CHECK 约束对齐。 */
@@ -107,8 +110,13 @@ export interface PatchPricingInput {
   output_per_mtok?: string | number;
   cache_read_per_mtok?: string | number;
   cache_write_per_mtok?: string | number;
-  /** 乐观并发:GET 返回的 updated_at(ISO)原样回传;不匹配 → PricingStaleError(HTTP 409)。 */
-  if_match_updated_at?: string;
+  /**
+   * 乐观并发:GET 返回的 lock_version 原样回传;不匹配 → PricingStaleError(HTTP 409)。
+   * **价格列出现时强制要求本字段**(缺失 → RangeError,四重护栏之一);其他字段可选带。
+   * 用整数版本号而非 updated_at 时间戳:timestamptz 微秒被 pg→JS Date 截到毫秒,
+   * 同毫秒并发会误判匹配(Codex 审计)。
+   */
+  if_match_lock_version?: number;
 }
 
 const PRICE_FIELDS = [
@@ -137,10 +145,19 @@ export class PricingStaleError extends Error {
   }
 }
 
-/** 0105 — 价格列(分/Mtok):非负整数,上限 1e8(=¥100 万/Mtok,再高必是手滑)。 */
+/**
+ * 0105 — 价格列(分/Mtok):非负整数,上限 1e8(=¥100 万/Mtok,再高必是手滑)。
+ * 字符串只认十进制数字(拒 "1e3"/"0x10" 这类 Number() 可解析的旁门写法,Codex nit)。
+ */
 export function normalizePriceCents(v: unknown, field: string): string {
-  const n =
-    typeof v === "number" ? v : typeof v === "string" && v.trim() !== "" ? Number(v.trim()) : NaN;
+  let n: number;
+  if (typeof v === "number") {
+    n = v;
+  } else if (typeof v === "string" && /^\d+$/.test(v.trim())) {
+    n = Number(v.trim());
+  } else {
+    throw new RangeError(`invalid_${field}`);
+  }
   if (!Number.isInteger(n) || n < 0 || n > 100_000_000) throw new RangeError(`invalid_${field}`);
   return String(n);
 }
@@ -287,6 +304,17 @@ export async function patchPricing(
     if (patch[f] !== undefined) priceNorm[f] = normalizePriceCents(patch[f], f);
   }
 
+  // 0105 — 价格列**强制**乐观并发(Codex 审计:可选=可绕过=不算护栏)。同步抛,零 DB 交互。
+  if (Object.keys(priceNorm).length > 0 && patch.if_match_lock_version === undefined) {
+    throw new RangeError("if_match_required_for_price_changes");
+  }
+  if (
+    patch.if_match_lock_version !== undefined &&
+    (!Number.isInteger(patch.if_match_lock_version) || patch.if_match_lock_version < 0)
+  ) {
+    throw new RangeError("invalid_if_match_lock_version");
+  }
+
   return tx(async (client: PoolClient) => {
     const before = await client.query<ModelPricingRowView>(
       `SELECT ${PRICING_COLS} FROM model_pricing WHERE model_id = $1 FOR UPDATE`,
@@ -294,13 +322,13 @@ export async function patchPricing(
     );
     if (before.rows.length === 0) throw new PricingNotFoundError(modelId);
 
-    // 0105 — 乐观并发:UI 带上读取时的 updated_at,中途被他人改过 → 409 防脏写(价格列
-    // 即改即生效,脏写=直接改错线上计费,必须 fail-closed)。
-    if (patch.if_match_updated_at !== undefined) {
-      const expect = new Date(patch.if_match_updated_at).getTime();
-      if (!Number.isFinite(expect) || before.rows[0].updated_at.getTime() !== expect) {
-        throw new PricingStaleError(modelId);
-      }
+    // 0105 — 乐观并发:UI 带上读取时的 lock_version,中途被他人改过 → 409 防脏写(价格列
+    // 即改即生效,脏写=直接改错线上计费,必须 fail-closed;整数比较无时间戳截断坑)。
+    if (
+      patch.if_match_lock_version !== undefined &&
+      before.rows[0].lock_version !== patch.if_match_lock_version
+    ) {
+      throw new PricingStaleError(modelId);
     }
 
     const sets: string[] = [];
@@ -317,6 +345,7 @@ export async function patchPricing(
     for (const f of PRICE_FIELDS) {
       if (priceNorm[f] !== undefined) push(f, priceNorm[f]);
     }
+    sets.push("lock_version = lock_version + 1");
     sets.push("updated_at = NOW()");
     params.push(String(ctx.adminId));
     sets.push(`updated_by = $${params.length}::bigint`);

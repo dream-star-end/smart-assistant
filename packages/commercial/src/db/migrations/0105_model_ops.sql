@@ -20,6 +20,11 @@ ALTER TABLE model_pricing
   ADD COLUMN default_effort TEXT
   CHECK (default_effort IN ('low','medium','high','xhigh','max'));
 
+-- 乐观并发版本号:整数精确比较(timestamptz 有微秒精度,pg→JS Date 截断到毫秒,同毫秒并发
+-- 编辑会误判匹配 —— Codex 审计指出;价格列改动强制要求 if_match_lock_version,见 admin/pricing.ts)。
+ALTER TABLE model_pricing
+  ADD COLUMN lock_version INTEGER NOT NULL DEFAULT 0;
+
 ALTER TABLE model_pricing
   ADD CONSTRAINT model_pricing_prices_nonneg CHECK (
     input_per_mtok >= 0 AND output_per_mtok >= 0
