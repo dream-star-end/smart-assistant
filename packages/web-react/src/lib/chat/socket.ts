@@ -48,16 +48,19 @@ import {
   type EmptyTurnDecision,
   emptyTurnNoticeText,
   KEEPALIVE_INTERVAL_MS,
+  LIVENESS_CONFIRM_MS,
   MAX_OFFLINE_QUEUE,
   OFFLINE_DRAIN_START_DELAY_MS,
   OFFLINE_LATCH_GRACE_MS,
   onopenSetInitialStatus,
   PROBE_TIMEOUT_KEEPALIVE_MS,
   PROBE_TIMEOUT_VISIBILITY_MS,
+  RECENT_INFLIGHT_WINDOW_MS,
   RECONNECT_RECONCILE_GRACE_MS,
   SAFE_WS_BUFFER_BYTES,
   safeSessionKeyForAgent,
   shouldAutoContinueEmptyTurn,
+  SYNC_DEBOUNCE_MS,
   THINKING_SAFETY_MS,
   VISIBILITY_RECONNECT_COOLDOWN_MS,
   WS_AUTH_REFRESH_MIN_GAP_MS,
@@ -191,9 +194,24 @@ export class ChatSocket {
   private pingNonce = 0;
   private pendingPing: { id: number; ws: WebSocket; timeoutId: ReturnType<typeof setTimeout>; label: string } | null = null;
   private keepAliveTimer: ReturnType<typeof setInterval> | null = null;
+  /** 最近一次收到 pong 的时刻（连接 liveness 判定：近 45s 内有 pong = 链路确认存活）。*/
+  private lastPongAt = 0;
 
   // ── thinking-safety（§6）──
   private thinkingTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  /**
+   * 会话级 transient 软提示（"较长时间未收到新内容…"）。**刻意不进 s.messages、不落 IndexedDB**：
+   * toStored 是显式字段白名单、从不读它 → 天然不持久化，刷新即消失，绝不与 server 恢复的真实
+   * 内容同屏矛盾（旧实现把超时提示 addMessage 落库 → reload 后与真内容打架，用户报障②的一半）。
+   * 渲染经 getTransientNotice 快照读回；set/clear 都 scheduleNotify 让 UI 及时更新。
+   */
+  private readonly transientNotices = new Map<string, { text: string; ts: number }>();
+
+  // ── 对账（S1：切回前台 / 重连成功 → REST syncSession 追回静默丢失）──
+  /** 同会话对账去抖戳（SYNC_DEBOUNCE_MS 内至多一次）。*/
+  private readonly lastSyncAt = new Map<string, number>();
+  /** 当前选中会话（App 经 setActiveSession 告知）：对账时无条件优先拉它。*/
+  private activeSessionId: string | undefined;
 
   // ── 重连 reconcile（§4）──
   private reconnectInFlightSet: Set<string> | null = null;
@@ -469,44 +487,132 @@ export class ChatSocket {
     this.pendingPing = { id, ws, timeoutId, label };
   }
 
-  // ═══════════════ thinking-safety（§6）═══════════════
+  // ═══════════════ thinking-safety（§6，S3 重构）═══════════════
+  //
+  // 旧实现：10min 无帧 → 发 stop + clearSendingState + addMessage 一条持久"超时"消息。三重
+  // 后果：① clearSendingState 关死重连 reconcile / hello inFlight / resume 补帧三条自愈路径；
+  // ② 持久"超时"消息落库，刷新后与 server 恢复的真实内容同屏矛盾；③ 移动端锁屏后 WS 静默
+  // 死亡、定时器解冻抢先触发，误报"本轮无响应（超时）"（用户报障②）。
+  //
+  // 新实现按"连接是否确认存活"分流，turn 生死交给 server 权威判定，绝不再自动 stop / 落库：
+  //  (a) 连接未确认存活（锁屏静默死链）→ 不动 in-flight、不发 stop、不插消息，强制重连
+  //      （重连成功后 onopen 自动走 REST 对账 S1），并重新 arm 下一轮监控；
+  //  (b) 连接确认存活但 10min 无帧 → 只挂会话级 transient 软提示（不入 messages / 不落盘），
+  //      继续 arm 观察。用户可继续等待或手动停止后重发。
   private resetThinkingSafety(sessId: string): void {
     const existing = this.thinkingTimers.get(sessId);
     if (existing) clearTimeout(existing);
     const tid = setTimeout(() => {
       this.thinkingTimers.delete(sessId);
       const s = this.sessions.get(sessId);
-      if (s && s._sendingInFlight) {
-        const sinceLastFrame = Date.now() - (s._lastFrameAt || 0);
-        if (s._lastFrameAt && sinceLastFrame < THINKING_SAFETY_MS) {
-          this.resetThinkingSafety(sessId); // liveness 复检：窗口内有帧 → reschedule
-          return;
-        }
-        const timedOutMsgId = s._replyingToMsgId || null;
-        this.safeWsSend(
-          JSON.stringify({
-            type: "inbound.control.stop",
-            channel: "webchat",
-            peer: { id: sessId, kind: "dm" },
-            agentId: s.agentId || this.deps.defaultAgentId || "main",
-          }),
-        );
-        this.clearSendingState(s, { persist: false });
-        const lastMsg = s.messages[s.messages.length - 1];
-        const dup = lastMsg && lastMsg._emptyTurn && lastMsg._emptyTurnTargetMsgId === timedOutMsgId;
-        if (!dup) {
-          addMessage(s, "assistant", '约 10 分钟未收到新内容,本轮可能已中断。可重新发送,或直接说"继续"。', {
-            _emptyTurn: true,
-            _emptyTurnSoft: false,
-            _emptyTurnTimeout: true,
-            _emptyTurnTargetMsgId: timedOutMsgId,
-          });
-        }
-        this.deps.persistSession?.(s.id);
-        this.scheduleNotify();
+      if (!s || !s._sendingInFlight) return;
+      const sinceLastFrame = Date.now() - (s._lastFrameAt || 0);
+      if (s._lastFrameAt && sinceLastFrame < THINKING_SAFETY_MS) {
+        this.resetThinkingSafety(sessId); // liveness 复检：窗口内有帧 → 只是慢，reschedule
+        return;
       }
+      // (a) 连接未确认存活 → 强制重连自愈（不误报），重新 arm。
+      if (!this.isConnectionLive()) {
+        this.forceReconnectForLiveness();
+        this.resetThinkingSafety(sessId);
+        return;
+      }
+      // (b) 连接活但久无帧 → transient 软提示，保持 _sendingInFlight 不变，继续 arm。
+      this.setTransientNotice(
+        sessId,
+        "较长时间未收到新内容，可能仍在处理。可继续等待，或停止后重新发送。",
+      );
+      this.resetThinkingSafety(sessId);
     }, THINKING_SAFETY_MS);
     this.thinkingTimers.set(sessId, tid);
+  }
+
+  /**
+   * 连接是否"确认存活"：ws 处于 OPEN，且最近 LIVENESS_CONFIRM_MS 内收到过 pong 或任意帧。
+   * 未确认存活 = 静默死链（移动端锁屏典型态：readyState 仍显 OPEN 但收发都断）。
+   */
+  private isConnectionLive(): boolean {
+    const ws = this.ws;
+    if (!ws || ws.readyState !== 1) return false;
+    const now = Date.now();
+    if (this.lastPongAt > 0 && now - this.lastPongAt < LIVENESS_CONFIRM_MS) return true;
+    for (const s of this.sessions.values()) {
+      if (s._lastFrameAt && now - s._lastFrameAt < LIVENESS_CONFIRM_MS) return true;
+    }
+    return false;
+  }
+
+  /** 静默死链自愈：OPEN 则 close（触发 onclose→reconnect），否则直接 connect。重连成功走 S1 对账。*/
+  private forceReconnectForLiveness(): void {
+    const ws = this.ws;
+    if (ws && ws.readyState === 1) {
+      try {
+        ws.close(WS_CLOSE_CODE_STALLED, "liveness reconnect");
+      } catch {
+        /* ignore */
+      }
+      return;
+    }
+    this.clearReconnectTimers();
+    this.connect();
+  }
+
+  // ═══════════════ transient 软提示（会话级、非持久，S3）═══════════════
+  private setTransientNotice(sessId: string, text: string): void {
+    const s = this.sessions.get(sessId);
+    if (!s || !s._sendingInFlight) return; // 仅在 turn 仍进行时提示
+    const prev = this.transientNotices.get(sessId);
+    if (prev && prev.text === text) {
+      prev.ts = Date.now(); // 同文案仅刷新时间，不触发无谓重渲
+      return;
+    }
+    this.transientNotices.set(sessId, { text, ts: Date.now() });
+    this.scheduleNotify();
+  }
+
+  private clearTransientNotice(sessId: string): void {
+    if (this.transientNotices.delete(sessId)) this.scheduleNotify();
+  }
+
+  /** 快照读回（useChatSocket 经 snap.version 订阅；不属于持久会话模型）。*/
+  getTransientNotice(sessId: string): { text: string; ts: number } | null {
+    return this.transientNotices.get(sessId) ?? null;
+  }
+
+  // ═══════════════ REST 对账（S1）═══════════════
+  /** 告知当前选中会话：对账时无条件优先拉它（用户正盯着的那条）。*/
+  setActiveSession(sessId: string | undefined): void {
+    this.activeSessionId = sessId;
+  }
+
+  /** 对单会话触发 syncSession（去抖：同会话 SYNC_DEBOUNCE_MS 内至多一次）。*/
+  private reconcileSession(sessId: string): void {
+    if (!this.deps.syncSession) return;
+    const now = Date.now();
+    const last = this.lastSyncAt.get(sessId) || 0;
+    if (now - last < SYNC_DEBOUNCE_MS) return;
+    this.lastSyncAt.set(sessId, now);
+    void this.deps.syncSession(sessId);
+  }
+
+  /**
+   * 无条件对账"当前选中会话 + 近期有过 in-flight 的会话"（切回前台 / 重连成功后调）。
+   * syncSession = REST getSession + server-wins 合并，幂等无副作用；追回锁屏/死链期间
+   * WS 静默丢失、resume 覆盖不到的内容。
+   */
+  private reconcileVisibleAndInFlight(): void {
+    const now = Date.now();
+    const active = this.activeSessionId;
+    if (active && this.sessions.has(active)) this.reconcileSession(active);
+    for (const [id, s] of this.sessions) {
+      if (id === active) continue;
+      const recentInFlight =
+        !!s._sendingInFlight ||
+        (typeof s._turnStartedAt === "number" && s._turnStartedAt > 0 && now - s._turnStartedAt < RECENT_INFLIGHT_WINDOW_MS) ||
+        (typeof s._lastFrameAt === "number" && now - s._lastFrameAt < RECENT_INFLIGHT_WINDOW_MS) ||
+        (typeof s._localTeardownAt === "number" && now - s._localTeardownAt < RECENT_INFLIGHT_WINDOW_MS);
+      if (recentInFlight) this.reconcileSession(id);
+    }
   }
 
   private clearThinkingSafety(sessId: string): void {
@@ -539,6 +645,7 @@ export class ChatSocket {
     return {
       onFinal: (sess, _frame, isCronOrHeartbeat) => {
         this.clearThinkingSafety(sess.id);
+        this.clearTransientNotice(sess.id); // turn 收尾：清 transient 软提示
         if (this.reconnectInFlightSet) {
           this.reconnectInFlightSet.delete(sess.id);
           if (this.reconnectInFlightSet.size === 0 && this.reconnectInFlightTimer) {
@@ -562,7 +669,10 @@ export class ChatSocket {
         this.deps.persistSession?.(sess.id);
       },
       onLiveFrame: (sess) => {
-        if (sess._sendingInFlight) this.resetThinkingSafety(sess.id);
+        if (sess._sendingInFlight) {
+          this.resetThinkingSafety(sess.id);
+          this.clearTransientNotice(sess.id); // 有新 live 帧 = 内容仍在流，清软提示
+        }
       },
       scheduleAutoContinue: (sessId, targetMsgId, cls) => {
         setTimeout(() => this.autoContinueEmptyTurn(sessId, targetMsgId, cls), 0);
@@ -654,21 +764,24 @@ export class ChatSocket {
       // hello 发完(peer 已注册)后补发积压的仓库绑定(reconnect 兜底,见 pendingRepoBind)。
       this.flushAllRepoBinds();
 
-      // 4s grace 主动 reconcile（§4）：补 resume_failed 覆盖不到的静默丢失。
-      if (this.reconnectInFlightSet && this.reconnectInFlightSet.size > 0) {
+      // 4s grace 主动 reconcile（§4 + S1 无条件对账）：等 replay 先赢，再 REST 补静默丢失。
+      // 恒 arm（不再仅在有 in-flight 时）——即使本次重连没有 in-flight，也要对账当前选中会话，
+      // 追回锁屏/死链期间静默丢失且 resume 覆盖不到的内容（用户报障②的另一半）。
+      {
         const reconnectAt = Date.now();
-        const reconcileSet = new Set(this.reconnectInFlightSet);
+        const reconcileSet = this.reconnectInFlightSet ? new Set(this.reconnectInFlightSet) : new Set<string>();
         if (this.reconnectReconcileTimer) clearTimeout(this.reconnectReconcileTimer);
         this.reconnectReconcileTimer = setTimeout(() => {
           this.reconnectReconcileTimer = null;
           if (this.ws !== ws || ws.readyState !== 1) return; // 按 ws 实例校验，防旧 timer 误 reconcile 新连接
+          // 断流 in-flight 会话先标 _liveStreamBroken（UI 提示），再统一走对账拉回。
           for (const sessId of reconcileSet) {
             const s = this.sessions.get(sessId);
             if (s?._sendingInFlight && (!s._lastFrameAt || s._lastFrameAt < reconnectAt)) {
               s._liveStreamBroken = true;
-              void this.deps.syncSession?.(sessId);
             }
           }
+          this.reconcileVisibleAndInFlight();
         }, RECONNECT_RECONCILE_GRACE_MS);
       }
 
@@ -705,6 +818,7 @@ export class ChatSocket {
       }
       // pong 必须先于一切 session handler（无 peer/frameSeq）。
       if (f.type === "pong") {
+        this.lastPongAt = Date.now(); // 连接 liveness 信号（thinking-safety 分流据此判活）
         if (this.pendingPing && this.pendingPing.ws === ws && this.pendingPing.id === (f as { id?: number }).id) {
           clearTimeout(this.pendingPing.timeoutId);
           this.pendingPing = null;
@@ -1151,6 +1265,7 @@ export class ChatSocket {
     if (!this.isBrowserOnline) return;
     if (this.wsAuthRefreshInFlight) return;
     if (!this.ws || this.ws.readyState >= 2) {
+      // 已断/关闭 → 重连（带 cooldown 去抖）。重连成功后 onopen 会做 S1 对账。
       const now = Date.now();
       if (now - this.lastVisibilityReconnectAt < VISIBILITY_RECONNECT_COOLDOWN_MS) return;
       this.lastVisibilityReconnectAt = now;
@@ -1158,7 +1273,11 @@ export class ChatSocket {
       this.connect();
       return;
     }
+    // 看似 OPEN：1.5s 快探活（真死链更早 close→reconnect，健康则 pong 立即返回无副作用）。
     this.probeWsAlive(this.ws, PROBE_TIMEOUT_VISIBILITY_MS, "visibility");
+    // S1：切回前台无条件 REST 对账当前选中 + 近期 in-flight 会话——WS 探活只能发现死连接，
+    // 追不回锁屏期间已在服务端生成的内容；对账才能拉回并覆盖本地陈旧态。
+    this.reconcileVisibleAndInFlight();
   }
 
   /** 主动 bump epoch（登出/换号时由 hook 调，作废在飞续期）。*/
@@ -1191,6 +1310,8 @@ export class ChatSocket {
     this.serverSessionInflight.delete(sessId);
     this.inFlightSends.delete(sessId);
     this.pendingRepoBind.delete(sessId);
+    this.transientNotices.delete(sessId);
+    this.lastSyncAt.delete(sessId);
     if (this.sessions.delete(sessId)) this.scheduleNotify();
   }
 
@@ -1204,6 +1325,9 @@ export class ChatSocket {
     this.serverSessionInflight.clear();
     this.inFlightSends.clear();
     this.pendingRepoBind.clear();
+    this.transientNotices.clear();
+    this.lastSyncAt.clear();
+    this.activeSessionId = undefined;
     if (this.sessions.size === 0) return;
     this.sessions.clear();
     this.scheduleNotify();
@@ -1329,6 +1453,7 @@ export class ChatSocket {
     sess._agentSwitchedAt = Date.now();
     resetReplyTracker(sess);
     sess._localTeardownAt = sess._trackerResetAt;
+    this.clearTransientNotice(sess.id); // 切 agent = 换轮，清 transient 软提示
     this.scheduleNotify();
   }
 
@@ -1409,25 +1534,9 @@ export class ChatSocket {
   }): void {
     const sess = this.ensureSession(p.sessId, p.agentId);
     // 主控 session 建行(每会话一次):必须在容器跑完 turn 回传 authored 消息之前落地,
-    // 否则 session_not_found 风暴。**只在 PUT 确认成功(返回 true)后才标 ensured**;失败则清
-    // inflight、下次发送重试(Codex 审 MAJOR:旧实现发送即标 ensured,PUT 失败被吞 → 永不重建)。
-    // ensurePromise:用于把"用户消息持久化"排在主控建行之后(行须先存在,否则 append 404)。
-    let ensurePromise: Promise<boolean> = Promise.resolve(this.serverSessionEnsured.has(sess.id));
-    if (!this.serverSessionEnsured.has(sess.id) && !this.serverSessionInflight.has(sess.id)) {
-      this.serverSessionInflight.add(sess.id);
-      const sid = sess.id;
-      ensurePromise = Promise.resolve(this.deps.ensureServerSession?.(sid, p.agentId, sess.title))
-        .then((ok) => {
-          this.serverSessionInflight.delete(sid);
-          // 仅当会话仍在(PUT pending 期间未被 remove/reset)才标 ensured,避免给已删会话留残 marker。
-          if (ok && this.sessions.has(sid)) this.serverSessionEnsured.add(sid);
-          return !!ok;
-        })
-        .catch(() => {
-          this.serverSessionInflight.delete(sid);
-          return false;
-        });
-    }
+    // 否则 session_not_found 风暴。ensurePromise:用于把"用户消息持久化"排在主控建行之后
+    // (行须先存在,否则 append 404)。
+    const ensurePromise = this.ensureServerSessionOnce(sess, p.agentId);
     const media = p.media && p.media.length > 0 ? p.media : undefined;
     const payload: InboundMessage = {
       type: "inbound.message",
@@ -1463,6 +1572,39 @@ export class ChatSocket {
           /* 持久化失败:best-effort,跨设备该条不显,本地仍在 */
         });
     }
+    this.dispatchPayload(sess, userMsg, payload);
+  }
+
+  /**
+   * 主控建行（每会话一次，幂等）。**只在 PUT 确认成功(返回 true)后才标 ensured**;失败则清
+   * inflight、下次发送/重试重建(Codex 审 MAJOR:旧实现发送即标 ensured,PUT 失败被吞 → 永不重建)。
+   * 已 ensured → resolve(true);inflight 中 → resolve(false)。sendMessage / retryMessage 共用。
+   */
+  private ensureServerSessionOnce(sess: ChatSession, agentId: string): Promise<boolean> {
+    if (this.serverSessionEnsured.has(sess.id)) return Promise.resolve(true);
+    if (this.serverSessionInflight.has(sess.id)) return Promise.resolve(false);
+    this.serverSessionInflight.add(sess.id);
+    const sid = sess.id;
+    return Promise.resolve(this.deps.ensureServerSession?.(sid, agentId, sess.title))
+      .then((ok) => {
+        this.serverSessionInflight.delete(sid);
+        // 仅当会话仍在(PUT pending 期间未被 remove/reset)才标 ensured,避免给已删会话留残 marker。
+        if (ok && this.sessions.has(sid)) this.serverSessionEnsured.add(sid);
+        return !!ok;
+      })
+      .catch(() => {
+        this.serverSessionInflight.delete(sid);
+        return false;
+      });
+  }
+
+  /**
+   * 把一条已构造好的 inbound.message payload 投递出去（direct-send 或离线入队）并推进 turn 态。
+   * sendMessage / retryMessage 共用的**单一发送收口**：据 ws 就绪与队列情况选路，回填 userMsg
+   * 状态（sent/queued/error），成功则起新 turn（计时 + 计费归因复位 + arm thinking-safety）。
+   */
+  private dispatchPayload(sess: ChatSession, userMsg: ChatMessage, payload: InboundMessage): void {
+    this.clearTransientNotice(sess.id); // 新一轮发送：清上一轮遗留的 transient 软提示
     sess._streamingAssistant = null;
     sess._streamingThinking = null;
     sess._blockIdToMsgId = new Map();
@@ -1498,14 +1640,47 @@ export class ChatSocket {
       this.resetThinkingSafety(sess.id);
     } else {
       const enqueued = this.tryEnqueueOffline({ sessId: sess.id, payload, msgId: userMsg.id });
-      if (!enqueued) {
-        userMsg.status = "error";
-      } else {
-        userMsg.status = "queued";
-      }
+      userMsg.status = enqueued ? "queued" : "error";
     }
     this.scheduleNotify();
     this.deps.persistSession?.(sess.id);
+  }
+
+  /**
+   * 重试一条发送失败(status==='error')的用户消息（用户报障：发送失败仅红字、无重试）。
+   * 复用原消息 payload（含附件引用 _media / 保真文本 _modelText），走既有 dispatchPayload
+   * 单一发送收口**原地**重发（不新增气泡）；model/effort/teamMode 用当前上下文（App 传入）。
+   */
+  retryMessage(p: {
+    sessId: string;
+    msgId: string;
+    agentId: string;
+    model?: string;
+    effortLevel?: InboundMessage["effortLevel"];
+    teamMode?: boolean;
+  }): void {
+    const sess = this.sessions.get(p.sessId);
+    if (!sess) return;
+    const userMsg = sess.messages.find((m) => m.id === p.msgId && m.role === "user");
+    if (!userMsg || userMsg.status !== "error") return;
+    // 主控建行可能在首发失败时未确保 → 幂等补一次(best-effort,不阻塞发送)。
+    void this.ensureServerSessionOnce(sess, p.agentId);
+    const media = userMsg._media && userMsg._media.length > 0 ? userMsg._media : undefined;
+    const text = userMsg._modelText ?? userMsg.text ?? "";
+    const payload: InboundMessage = {
+      type: "inbound.message",
+      idempotencyKey: `web-retry-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      channel: "webchat",
+      peer: { id: sess.id, kind: "dm" },
+      agentId: p.agentId,
+      content: { text, ...(media ? { media } : {}) },
+      ...(p.effortLevel !== undefined ? { effortLevel: p.effortLevel } : {}),
+      ...(p.model ? { model: p.model } : {}),
+      ...(p.teamMode ? { teamMode: true } : {}),
+      ts: Date.now(),
+    };
+    userMsg.status = "sending"; // 立即回显；dispatchPayload 据结果改 sent/queued/error
+    this.dispatchPayload(sess, userMsg, payload);
   }
 
   /** offlineQueue 软上限（§10）。*/
@@ -1529,6 +1704,7 @@ export class ChatSocket {
     );
     // 本地立即收尾（不等后端 isFinal）。
     this.clearSendingState(sess, { clearThinking: true });
+    this.clearTransientNotice(sess.id); // 用户手动停止：清 transient 软提示
     this.scheduleNotify();
   }
 

@@ -26,9 +26,18 @@ export const OFFLINE_LATCH_GRACE_MS = 60_000;
 export const VISIBILITY_RECONNECT_COOLDOWN_MS = 2000;
 /** 1008 续期：同一全局窗口最多一次（websocket.js:96）。*/
 export const WS_AUTH_REFRESH_MIN_GAP_MS = 30_000;
-/** ping 探活超时（websocket.js:87-88）。*/
-export const PROBE_TIMEOUT_VISIBILITY_MS = 5000;
+/** ping 探活超时（websocket.js:87-88）。切回前台的探活收紧到 1.5s：移动端锁屏后 WS 常
+ *  变"看似 OPEN 实则死链",5s 才发现太慢、超时定时器可能抢先误报；1.5s 内无 pong 即 close
+ *  自愈重连（健康连接 pong 立刻返回、无副作用），是比"每次切回都强制重连"风险更低的选择。*/
+export const PROBE_TIMEOUT_VISIBILITY_MS = 1500;
 export const PROBE_TIMEOUT_KEEPALIVE_MS = 10000;
+/** 连接"确认存活"窗口：最近这段时间内收到过 pong 或任意帧即视为链路仍活。thinking-safety
+ *  超时判定据此分流——未确认存活=静默死链→强制重连而非误报本轮超时（见 socket.resetThinkingSafety）。*/
+export const LIVENESS_CONFIRM_MS = 45_000;
+/** REST 对账去抖：同一会话 5s 内至多触发一次 syncSession（切回前台/重连成功都会打）。*/
+export const SYNC_DEBOUNCE_MS = 5000;
+/** "近期有过 in-flight"的会话窗口：切回/重连时对账这些会话，追回锁屏期静默丢失的帧。*/
+export const RECENT_INFLIGHT_WINDOW_MS = 15 * 60_000;
 /** keepalive 心跳间隔（websocket.js:2113）。*/
 export const KEEPALIVE_INTERVAL_MS = 30_000;
 /** THINKING_SAFETY 兜底：10min 无新帧才杀 turn（websocket.js:274）。*/

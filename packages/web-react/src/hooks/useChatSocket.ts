@@ -65,6 +65,19 @@ export type UseChatSocket = {
     teamMode?: boolean;
   }) => void;
   stop: (sessId: string) => void;
+  /** 重试一条发送失败的用户消息（复用原 payload 走既有发送入口原地重发）。*/
+  retryMessage: (p: {
+    sessId: string;
+    msgId: string;
+    agentId: string;
+    model?: string;
+    effortLevel?: InboundMessage["effortLevel"];
+    teamMode?: boolean;
+  }) => void;
+  /** 告知当前选中会话（S1 对账无条件优先拉它）。*/
+  setActiveSession: (sessId: string | undefined) => void;
+  /** 会话级 transient 软提示（"较长时间未收到新内容…"，非持久，随 version 快照读回）。*/
+  getTransientNotice: (sessId: string | undefined) => { text: string; ts: number } | null;
   respondPermission: (p: {
     sessId: string;
     requestId: string;
@@ -378,6 +391,15 @@ export function useChatSocket(opts: {
   const switchAgent = useCallback((sessId: string, agentId: string) => socket.switchAgent(sessId, agentId), [socket]);
   const send = useCallback<UseChatSocket["send"]>((p) => socket.sendMessage(p), [socket]);
   const stop = useCallback((sessId: string) => socket.stopTurn(sessId), [socket]);
+  const retryMessage = useCallback<UseChatSocket["retryMessage"]>((p) => socket.retryMessage(p), [socket]);
+  const setActiveSession = useCallback((sessId: string | undefined) => socket.setActiveSession(sessId), [socket]);
+  const getTransientNotice = useCallback(
+    (sessId: string | undefined) => {
+      void snap.version; // 随快照版本触发重算（transient 提示 set/clear 都 scheduleNotify）
+      return sessId ? socket.getTransientNotice(sessId) : null;
+    },
+    [snap, socket],
+  );
   const respondPermission = useCallback<UseChatSocket["respondPermission"]>(
     (p) => socket.respondPermission(p),
     [socket],
@@ -430,6 +452,9 @@ export function useChatSocket(opts: {
       switchAgent,
       send,
       stop,
+      retryMessage,
+      setActiveSession,
+      getTransientNotice,
       respondPermission,
       mergeServerHistory,
       storedMaxSeq,
@@ -449,6 +474,9 @@ export function useChatSocket(opts: {
       switchAgent,
       send,
       stop,
+      retryMessage,
+      setActiveSession,
+      getTransientNotice,
       respondPermission,
       mergeServerHistory,
       storedMaxSeq,

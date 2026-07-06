@@ -5,6 +5,7 @@ import { AuthGate, type AuthMode } from "./components/AuthGate";
 import { ChatHeader } from "./components/ChatHeader";
 import { Composer } from "./components/Composer";
 import { extractLatestTodos, PinnedTaskTracker } from "./components/chat/PinnedTaskTracker";
+import { deriveActivePlanStep, type TurnActivityInfo } from "./components/chat/TurnActivity";
 import { EmptyState } from "./components/EmptyState";
 import { type ChatError, ErrorBanner } from "./components/ErrorBanner";
 import { GithubRepoModal } from "./components/github/GithubRepoModal";
@@ -577,6 +578,32 @@ export function App() {
   const wsSending = !demo && chat.isSending(activeId);
   // 统一“本轮进行中”信号：demo 用本地 busy，非 demo 用 WS in-flight。
   const sending = demo ? busy : wsSending;
+
+  // 当前选中会话（对账/本轮活动指示的数据源）。告知 WS service 供 S1 对账无条件优先拉它。
+  const activeSess = !demo && activeId ? chat.getSession(activeId) : undefined;
+  useEffect(() => {
+    if (demo) return;
+    sockRef.current?.setActiveSession(activeId);
+  }, [demo, activeId]);
+
+  // 本轮活动快照（喂给 MessageList → TurnActivity）：模型慢时把阶段反馈显性化，取代裸三个点。
+  // 团队模式额外带队长当前 plan step（消息区常长时间纯空白时用它填充等待文案）。
+  const teamLeaderActive = !demo && teamMode && agent.id === "main";
+  const turnActivity = useMemo<TurnActivityInfo | null>(() => {
+    if (demo || !activeSess || !activeSess._sendingInFlight) return null;
+    return {
+      startedAt: activeSess._turnStartedAt ?? null,
+      lastFrameAt: activeSess._lastFrameAt,
+      turnStatus: activeSess._turnStatus ?? null,
+      coldStart: !!activeSess._isFirstTurnAfterReady,
+      agentName: agent.name || "助手",
+      leaderStep: teamLeaderActive ? deriveActivePlanStep(extractLatestTodos(wsMessages)) : null,
+    };
+    // chat.version 是就地 mutation 会话的变更权威信号（同引用，须显式入依赖才随帧刷新）。
+  }, [demo, activeSess, teamLeaderActive, agent.name, wsMessages, chat.version]);
+
+  // 会话级 transient 软提示（"较长时间未收到新内容…"）：非消息卡片、不落库；随快照读回。
+  const transientNotice = !demo && activeId ? chat.getTransientNotice(activeId) : null;
   // 停止当前轮：demo 本地停回放；非 demo 发 inbound.control.stop 并本地收尾。
   const stopTurn = useCallback(() => {
     if (demo) {
@@ -642,6 +669,22 @@ export function App() {
     [demo, send, sending],
   );
 
+  // 发送失败重试：复用原消息 payload（含附件引用）走 WS service 既有发送收口原地重发；
+  // model/teamMode 用当前上下文（与 send 同构：teamMode 只对 main 队长生效）。
+  const retrySend = useCallback(
+    (msg: ChatMessage) => {
+      if (demo || !activeId) return;
+      sockRef.current?.retryMessage({
+        sessId: activeId,
+        msgId: msg.id,
+        agentId: agent.id,
+        model: modelId,
+        teamMode: agent.id === "main" ? teamMode : false,
+      });
+    },
+    [demo, activeId, agent.id, modelId, teamMode],
+  );
+
   // 卡片回调集（稳定引用：作为 MessageRenderer memo 比较键之一，避免无谓重渲）。
   const cardCallbacks: CardCallbacks = useMemo(
     () => ({
@@ -649,8 +692,9 @@ export function App() {
       onContinue: () => send(CONTINUE_PROMPT),
       onTopUp: demo ? undefined : openSettings,
       onFeedback,
+      onRetrySend: demo ? undefined : retrySend,
     }),
-    [regenerate, send, demo, openSettings, onFeedback],
+    [regenerate, send, demo, openSettings, onFeedback, retrySend],
   );
 
   // autoscroll 根治(两个对称 bug 一次收口):
@@ -964,6 +1008,8 @@ export function App() {
             <MessageList
               messages={wsMessages}
               sending={wsSending}
+              turnActivity={turnActivity}
+              transientNotice={transientNotice}
               cb={cardCallbacks}
               onRespondPermission={onRespondPermission}
             />

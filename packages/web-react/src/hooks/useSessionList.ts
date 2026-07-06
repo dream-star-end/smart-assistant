@@ -6,6 +6,9 @@ import type { StoredSession } from "../lib/persist";
 import type { AuthSession, Session, SessionMeta, User } from "../lib/types";
 import type { UseChatSocket } from "./useChatSocket";
 
+/** 历史重拉冷却（S2）：同会话此窗口内只拉一次；过后允许增量重拉（sinceSeq + server-wins 幂等）。*/
+const HISTORY_REFETCH_COOLDOWN_MS = 5000;
+
 /** WS 会话 id（peer.id）：须匹配后端 `[A-Za-z0-9_-]{8,50}`。*/
 export function genWsSessionId(): string {
   return `web${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
@@ -114,7 +117,7 @@ export type UseSessionList = {
 /**
  * 侧栏会话列表域（从 App.tsx 整体收口，语义逐条保留）：
  * - 列表权威合并：IndexedDB 注水（本地不覆盖既有）+ listSessions（server-wins）；
- * - 按需拉取单会话 server 历史合并进 WS service（historyFetchedRef 防重拉）；
+ * - 按需拉取单会话 server 历史合并进 WS service（防并发 + 短时去重，冷却过后允许增量重拉）；
  * - 登录后自动选中"上次会话"仅做一次（autoSelectedRef）；
  * - rename/delete 一次收口三个持有方（App state + WS service/IndexedDB + 服务端）。
  * UI（确认/输入对话框）与 chat 展示态（demo messages/chatError）经回调注入，
@@ -131,8 +134,13 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
   const [activeId, setActiveId] = useState<string | undefined>(
     demo ? DEMO_SESSIONS[0].id : undefined,
   );
-  // 已拉过 server 历史的会话 id（防 selectSession 每次都重拉；404 的本地会话也记入）。
-  const historyFetchedRef = useRef<Set<string>>(new Set());
+  // 历史拉取守卫（S2）：语义从"整页生命周期只拉一次"改为"只防并发 + 短时重复"。
+  //  - historyFetchingRef：正在拉取的会话（防并发重入）；
+  //  - historyFetchedAtRef：上次拉取时刻，HISTORY_REFETCH_COOLDOWN_MS 内不重拉。
+  // 冷却过后允许重拉：sinceSeq 增量 + server-wins 合并幂等、重拉无副作用，这样切回前台/
+  // 重连后重新选中会话能增量补齐（旧的永久守卫会让锁屏后再选中的会话拿不到新内容）。
+  const historyFetchingRef = useRef<Set<string>>(new Set());
+  const historyFetchedAtRef = useRef<Map<string, number>>(new Map());
   // 登录后是否已自动选中"上次会话"（仅做一次：避免覆盖用户随后的显式新建/切换/删除）。
   const autoSelectedRef = useRef(false);
   // 当前登录 user id 的实时镜像：异步历史请求 await 后比对，防登出/换号后 stale 响应
@@ -157,8 +165,10 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
     async (id: string) => {
       const owner = userIdRef.current;
       if (!auth || !owner) return;
-      if (historyFetchedRef.current.has(id)) return;
-      historyFetchedRef.current.add(id);
+      if (historyFetchingRef.current.has(id)) return; // 并发中：不重入
+      const lastAt = historyFetchedAtRef.current.get(id) ?? 0;
+      if (Date.now() - lastAt < HISTORY_REFETCH_COOLDOWN_MS) return; // 短时重复：不重拉
+      historyFetchingRef.current.add(id);
       try {
         const sinceSeq = cbRef.current.sockRef.current?.storedMaxSeq(id) ?? 0;
         const detail = await api.getSession(cbRef.current.authSession, id, sinceSeq);
@@ -172,9 +182,14 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
           full: !detail.isPartial,
           maxSeq: detail.maxSeq,
         });
+        historyFetchedAtRef.current.set(id, Date.now());
       } catch (e) {
-        // 404 = 本地新建/未同步会话，无 server 历史（正常）；其他错误允许下次重选重试。
-        if (!(e instanceof ApiError && e.status === 404)) historyFetchedRef.current.delete(id);
+        // 404 = 本地新建/未同步会话，无 server 历史（正常）：打冷却戳，避免每次重选都空打 404，
+        // 但仍非永久（会话后续被 server 持久化后，冷却过去可正常增量拉到）。其他错误不打戳 →
+        // 允许下次重选立即重试。
+        if (e instanceof ApiError && e.status === 404) historyFetchedAtRef.current.set(id, Date.now());
+      } finally {
+        historyFetchingRef.current.delete(id);
       }
     },
     [auth, agentId],
@@ -284,7 +299,8 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
     });
     if (!ok) return;
     cbRef.current.onDeleteSession?.(s.id);
-    historyFetchedRef.current.delete(s.id);
+    historyFetchedAtRef.current.delete(s.id);
+    historyFetchingRef.current.delete(s.id);
     if (!demo) {
       cbRef.current.sockRef.current?.removeSession(s.id);
       cbRef.current.sockRef.current?.removePersisted(s.id); // 清 IndexedDB 本地副本
@@ -300,7 +316,8 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
 
   // 登出/登录时的整体重置（App 的 useAuth onClearAuth/onLoginSuccess 经 ref 回填调用）。
   const reset = useCallback(() => {
-    historyFetchedRef.current.clear();
+    historyFetchedAtRef.current.clear();
+    historyFetchingRef.current.clear();
     autoSelectedRef.current = false; // 下次登录重新自动选中最近会话
     setSessions([]);
     setActiveId(undefined);

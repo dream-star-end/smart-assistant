@@ -8,7 +8,7 @@
  * MessageList：把会话消息流渲成卡片列表 + 流式 typing 指示 + 溢出 load-more（>100 条）。
  * 上层（App）只需把 WS 引擎产出的 ChatMessage[] 与回调传进来。
  */
-import { Sparkles } from "lucide-react";
+import { Info, Sparkles } from "lucide-react";
 import { memo, useState } from "react";
 import type { ChatMessage } from "../lib/chat/model";
 import { messageKind, messageSignature } from "../lib/chat/render";
@@ -19,18 +19,18 @@ import {
   PlanCard,
   SystemCard,
   ThinkingCard,
-  TypingDots,
   UserCard,
 } from "./chat/cards";
 import { AgentGroupCard } from "./chat/AgentGroupCard";
 import { TeamPanel } from "./chat/TeamPanel";
 import { PermissionCard, type PermissionRespond } from "./chat/PermissionCard";
 import { ToolCardSlot } from "./chat/toolCardSlot";
+import { TurnActivity, type TurnActivityInfo } from "./chat/TurnActivity";
 import { currentTurnStartIndex } from "./chat/turnSegment";
 import { MessageBoundary } from "./MessageBoundary";
 import { asStr, resolveToolInput } from "./tool/format";
 import { researchToolCard } from "./tool/researchCards";
-import { Avatar } from "./ui";
+import { Alert, Avatar } from "./ui";
 
 type RendererProps = {
   message: ChatMessage;
@@ -41,16 +41,19 @@ type RendererProps = {
   /** 是否属于「当前活跃段」(最后一条 user 消息之后)。判定收口在 chat/turnSegment.ts,
    *  与 PinnedTaskTracker 的任务源提取共用同一函数——决定 TodoWrite/plan 抑制还是渲染只读卡。*/
   inActiveTurn: boolean;
+  /** 当前活跃会话的本轮活动快照（AssistantCard 流式空正文分支据此渲染阶段反馈）。透传，
+   *  不进 memo 比较键——TurnActivity 自带 1s tick，无需靠父级重渲驱动秒数。 */
+  turnActivity?: TurnActivityInfo | null;
   cb: CardCallbacks;
   onRespondPermission: PermissionRespond;
 };
 
 export const MessageRenderer = memo(
-  function MessageRenderer({ message, isLast, sending, inActiveTurn, cb, onRespondPermission }: RendererProps) {
-    const ctx = { isLast, sending };
+  function MessageRenderer({ message, isLast, sending, inActiveTurn, turnActivity, cb, onRespondPermission }: RendererProps) {
+    const ctx = { isLast, sending, turnActivity };
     switch (messageKind(message)) {
       case "user":
-        return <UserCard msg={message} />;
+        return <UserCard msg={message} cb={cb} />;
       case "assistant":
         return <AssistantCard msg={message} ctx={ctx} cb={cb} />;
       case "thinking":
@@ -145,11 +148,17 @@ function coalesceTeam(
 export function MessageList({
   messages,
   sending,
+  turnActivity,
+  transientNotice,
   cb,
   onRespondPermission,
 }: {
   messages: ChatMessage[];
   sending: boolean;
+  /** 本轮活动快照（TurnActivity 阶段反馈）；null=无活跃轮。*/
+  turnActivity?: TurnActivityInfo | null;
+  /** 会话级 transient 软提示（"较长时间未收到新内容…"，非消息卡片，末尾 info 条渲染）。*/
+  transientNotice?: { text: string } | null;
   cb: CardCallbacks;
   onRespondPermission: PermissionRespond;
 }) {
@@ -201,12 +210,14 @@ export function MessageList({
               isLast={it.isLast}
               sending={sending}
               inActiveTurn={it.idx >= turnStart}
+              turnActivity={turnActivity}
               cb={cb}
               onRespondPermission={onRespondPermission}
             />
           </MessageBoundary>
         );
       })}
+      {/* 独立本轮活动指示（末条不是自渲流式态的卡时）：裸三个点 → 阶段反馈文案。 */}
       {showTyping && (
         <div className="flex gap-4 animate-in">
           {/* 与 AssistantCard 一致:移动端隐藏头像,窄屏正文占满宽度。 */}
@@ -214,9 +225,15 @@ export function MessageList({
             <Sparkles size={16} />
           </Avatar>
           <div className="min-w-0 flex-1">
-            <TypingDots />
+            <TurnActivity info={turnActivity ?? { startedAt: null, agentName: "助手" }} />
           </div>
         </div>
+      )}
+      {/* 会话级 transient 软提示（超时软提示等，非消息卡片、不落库；刷新即消失，不与真内容矛盾）。 */}
+      {transientNotice && (
+        <Alert tone="info" icon={<Info size={16} />}>
+          {transientNotice.text}
+        </Alert>
       )}
     </div>
   );

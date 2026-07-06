@@ -34,8 +34,10 @@ import { Markdown } from "../Markdown";
 import { Alert, Avatar, Badge, Button, IconButton } from "../ui";
 import { ChildBlockView } from "./AgentGroupCard";
 import { Media } from "./media";
+import { TurnActivity, type TurnActivityInfo } from "./TurnActivity";
 
-export type RenderCtx = { isLast: boolean; sending: boolean };
+/** 渲染上下文。turnActivity=当前活跃会话本轮活动快照（流式空正文分支的阶段反馈源）。*/
+export type RenderCtx = { isLast: boolean; sending: boolean; turnActivity?: TurnActivityInfo | null };
 
 /** 逐条反馈上下文（请求ID + 关联键）。P6 反馈弹窗消费；本期由 App 兜底。 */
 export type FeedbackContext = {
@@ -51,6 +53,8 @@ export type CardCallbacks = {
   onContinue?: () => void;
   onTopUp?: () => void;
   onFeedback?: (ctx: FeedbackContext) => void;
+  /** 重试一条发送失败的用户消息（复用原 payload 走既有发送入口原地重发）。*/
+  onRetrySend?: (msg: ChatMessage) => void;
 };
 
 function buildFeedbackCtx(m: ChatMessage): FeedbackContext {
@@ -237,7 +241,7 @@ const USER_STATUS_LABEL: Record<string, string> = {
 // reducer/socket 对 msg 就地 mutate(同引用),叶子层 {msg} 浅比较要么永不重渲(状态标签
 // 卡死在首帧,如 user status),要么因 ctx 每帧新对象而形同虚设 —— 三种 memo 策略并存徒增
 // 认知负担。sig 层已捕获全部渲染所读字段(render.ts messageSignature),叶子直接裸函数。
-export function UserCard({ msg }: { msg: ChatMessage }) {
+export function UserCard({ msg, cb }: { msg: ChatMessage; cb?: CardCallbacks }) {
   const status = msg.status;
   return (
     <div className="flex flex-col items-end animate-in">
@@ -250,11 +254,21 @@ export function UserCard({ msg }: { msg: ChatMessage }) {
       {status && (
         <div
           className={cn(
-            "mt-1 text-[11px]",
+            "mt-1 flex items-center gap-2 text-[11px]",
             status === "error" ? "text-danger" : "text-faint",
           )}
         >
-          {USER_STATUS_LABEL[status] ?? status}
+          <span>{USER_STATUS_LABEL[status] ?? status}</span>
+          {/* 发送失败 → 「重试」：复用原消息 payload（含附件引用）走既有发送入口原地重发。 */}
+          {status === "error" && cb?.onRetrySend && (
+            <button
+              type="button"
+              onClick={() => cb.onRetrySend?.(msg)}
+              className="inline-flex items-center gap-1 rounded-full bg-danger-soft px-2 py-0.5 font-medium text-danger transition-colors hover:brightness-95"
+            >
+              <RotateCcw size={11} /> 重试
+            </button>
+          )}
         </div>
       )}
     </div>
@@ -295,7 +309,8 @@ export function AssistantCard({
             {msg.text}
           </Markdown>
         ) : live && !hasError ? (
-          <TypingDots />
+          // 流式已起但正文尚空：用本轮活动指示（阶段反馈）取代裸三个点；无活动快照时回退三点。
+          ctx.turnActivity ? <TurnActivity info={ctx.turnActivity} /> : <TypingDots />
         ) : null}
         {live && msg.text && !hasError && (
           <span className="caret-blink ml-0.5 inline-block h-[1.1em] w-[2px] translate-y-[3px] bg-fg" />
@@ -319,11 +334,13 @@ export function AssistantCard({
           </Alert>
         )}
 
-        {/* 空轮提示 */}
+        {/* 空轮提示。_emptyTurnTimeout 仅存量落库消息会命中（新代码不再产生此类消息，改用
+            非持久 transient 软提示）；文案改诚实版：不再断言"无响应"，而是提示内容可能已在
+            服务端生成、刷新/同步后可见，避免与真实内容同屏矛盾。 */}
         {msg._emptyTurn && (
           <Alert tone="info" className="mt-2.5" icon={<Info size={16} />}>
             {msg._emptyTurnTimeout
-              ? "本轮模型无响应（超时），可重试。"
+              ? "当时与服务器的连接中断，内容可能已在服务端生成（刷新或同步后可见）。"
               : "模型本轮没有产生新内容。"}
           </Alert>
         )}
