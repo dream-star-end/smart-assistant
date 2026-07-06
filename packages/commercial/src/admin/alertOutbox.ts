@@ -227,17 +227,26 @@ export async function enqueueAlert(
  * 认领自己能处理的类型,消除"类型无关 claim 让 A dispatcher 误碰 B 类型行"的 split-brain。
  *   - 不传(undefined):认领所有类型(含 channel 已删的 NULL 行 → markFailed 'channel missing'),
  *     保持既有 iLink/telegram catch-all worker 语义不变。
- *   - 传 'wecom_bot':仅认领 wecom 行(channel 已删的 NULL 行不匹配 → 由 CASCADE 删除,不需认领)。
+ *   - 传 'wecom_bot' 单值 / ['wecom_bot','wecom_aibot'] 数组:仅认领这些类型的行
+ *     (channel 已删的 NULL 行不匹配 → 由 CASCADE 删除,不需认领)。数组用 = ANY()
+ *     支持一个 dispatcher 认领多种同族类型(企微 webhook + 智能机器人长连接)。
  */
 export async function claimReadyAlerts(
   limit = 20,
-  channelType?: string,
+  channelType?: string | readonly string[],
 ): Promise<OutboxDispatchRow[]> {
   const params: unknown[] = [MAX_ATTEMPTS, limit];
   let typeClause = "";
   if (channelType !== undefined) {
-    params.push(channelType);
-    typeClause = `AND c.channel_type = $${params.length}`;
+    if (Array.isArray(channelType)) {
+      // 空数组按「认领无」处理(避免 = ANY('{}') 认领全部的反直觉语义)。
+      if (channelType.length === 0) return [];
+      params.push(channelType);
+      typeClause = `AND c.channel_type = ANY($${params.length}::text[])`;
+    } else {
+      params.push(channelType);
+      typeClause = `AND c.channel_type = $${params.length}`;
+    }
   }
   const r = await query<Record<string, unknown>>(
     `SELECT o.id::text AS id,

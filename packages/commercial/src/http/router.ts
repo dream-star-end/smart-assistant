@@ -129,6 +129,7 @@ import {
   handleAdminAlertsCreateSilence,
   handleAdminAlertsCreateTelegramChannel,
   handleAdminAlertsCreateWecomChannel,
+  handleAdminAlertsCreateWecomAibotChannel,
   handleAdminAlertsDeleteChannel,
   handleAdminAlertsDeleteSilence,
   handleAdminAlertsIlinkPoll,
@@ -929,6 +930,12 @@ export function createCommercialHandler(
       method: 'POST',
       path: '/api/admin/alerts/channels/wecom',
       handler: handleAdminAlertsCreateWecomChannel,
+    },
+    // 智能机器人(aibot 长连接);exact path 在 prefix 之前,不被 :id dispatcher 吞。
+    {
+      method: 'POST',
+      path: '/api/admin/alerts/channels/wecom-aibot',
+      handler: handleAdminAlertsCreateWecomAibotChannel,
     },
     {
       method: 'PATCH',

@@ -36,6 +36,7 @@ import {
   createIlinkChannel,
   createTelegramChannel,
   createWecomChannel,
+  createWecomAibotChannel,
   patchAlertChannel,
   deleteAlertChannel,
   getAlertChannel,
@@ -62,6 +63,10 @@ import {
 } from '../admin/alertOutbox.js'
 import { EVENT_META } from '../admin/alertEvents.js'
 import { getEventCoverage } from '../admin/alertCoverage.js'
+import {
+  getWecomAibotConnectionManager,
+  type AibotConnStatus,
+} from '../admin/wecomAibotConnection.js'
 import {
   fetchIlinkQrcode,
   pollIlinkQrcodeStatus,
@@ -133,8 +138,16 @@ function translateRangeError(err: unknown): never {
 
 // ─── serializers ─────────────────────────────────────────────────────
 
-function serializeChannel(c: AlertChannelRow): Record<string, unknown> {
-  return {
+/**
+ * @param connStatus wecom_aibot 通道的活跃连接状态(channelId → {state,bound})。
+ *   来自连接管理器单例(仅 v5 启动后有值);非 aibot 行忽略。前端据此渲染
+ *   「已连接/重连中」+「已绑定会话/待绑定」双状态。
+ */
+function serializeChannel(
+  c: AlertChannelRow,
+  connStatus?: Map<string, AibotConnStatus>,
+): Record<string, unknown> {
+  const out: Record<string, unknown> = {
     id: c.id,
     admin_id: c.admin_id,
     channel_type: c.channel_type,
@@ -154,6 +167,16 @@ function serializeChannel(c: AlertChannelRow): Record<string, unknown> {
     created_at: c.created_at,
     updated_at: c.updated_at,
   }
+  if (c.channel_type === 'wecom_aibot') {
+    out.aibot_bot_id = c.aibot_bot_id
+    out.aibot_chat_type = c.aibot_chat_type
+    // 绑定态权威源 = DB 里已学习的 aibot_chat_id(持久,重启后仍在)。
+    out.aibot_bound = Boolean(c.aibot_chat_id)
+    // 连接态 = 连接管理器实时;未在 map(未启动/未连)→ 'unknown'。
+    const st = connStatus?.get(c.id)
+    out.aibot_conn_state = st ? st.state : 'unknown'
+  }
+  return out
 }
 
 function serializeOutbox(r: OutboxRowView): Record<string, unknown> {
@@ -206,7 +229,8 @@ export async function handleAdminAlertsListChannels(
 ): Promise<void> {
   await requireAdmin(req, deps.jwtSecret)
   const rows = await listAlertChannels()
-  sendJson(res, 200, { rows: rows.map(serializeChannel) })
+  const connStatus = getWecomAibotConnectionManager().statusAll()
+  sendJson(res, 200, { rows: rows.map((c) => serializeChannel(c, connStatus)) })
 }
 
 // ─── POST /api/admin/alerts/ilink/qrcode ─────────────────────────────
@@ -418,6 +442,71 @@ export async function handleAdminAlertsCreateWecomChannel(
   }
 }
 
+// ─── POST /api/admin/alerts/channels/wecom-aibot ──────────────────────
+//
+// 直接创建企业微信智能机器人(aibot)长连接通道:无 webhook / 无扫码,
+// activation_status='active'(推送目标 chatid 运行时自动学习,与 activation 正交)。
+// body: { label, botid, secret, severity_min?, event_types? }
+// botid:机器人 BotID(非密);secret:长连接专用 Secret(机密,AEAD 加密落库)。
+// 创建后需给机器人发一条消息完成绑定(连接管理器学习 chatid)。
+
+export async function handleAdminAlertsCreateWecomAibotChannel(
+  req: IncomingMessage,
+  res: ServerResponse,
+  ctx: RequestContext,
+  deps: CommercialHttpDeps,
+): Promise<void> {
+  const admin = await requireAdminVerifyDb(req, deps.jwtSecret)
+  const body = assertObjectBody((await readJsonBody(req)) ?? {})
+
+  if (typeof body.label !== 'string') {
+    throw new HttpError(400, 'VALIDATION', 'label required')
+  }
+  if (typeof body.botid !== 'string') {
+    throw new HttpError(400, 'VALIDATION', 'botid required')
+  }
+  if (typeof body.secret !== 'string') {
+    throw new HttpError(400, 'VALIDATION', 'secret required')
+  }
+  const severityMin =
+    typeof body.severity_min === 'string' && SEVERITIES.has(body.severity_min as Severity)
+      ? (body.severity_min as Severity)
+      : 'warning'
+  const eventTypes: string[] = []
+  if (body.event_types !== undefined) {
+    if (!Array.isArray(body.event_types)) {
+      throw new HttpError(400, 'VALIDATION', 'event_types must be array')
+    }
+    for (const t of body.event_types) {
+      if (typeof t !== 'string' || !EVENT_TYPE_RE.test(t)) {
+        throw new HttpError(400, 'VALIDATION', `invalid event_type: ${String(t)}`)
+      }
+      eventTypes.push(t)
+    }
+  }
+
+  try {
+    const ch = await createWecomAibotChannel({
+      adminId: admin.id,
+      label: body.label,
+      botId: body.botid,
+      secret: body.secret,
+      severityMin,
+      eventTypes,
+      ip: ctx.clientIp,
+      userAgent: ctx.userAgent,
+    })
+    // 热启动:连接管理器就位则立刻起该通道连接(v5;非 v5 未 start → no-op)。
+    void getWecomAibotConnectionManager()
+      .onChannelChanged(ch.id)
+      .catch(() => {})
+    sendJson(res, 200, { channel: serializeChannel(ch) })
+  } catch (err) {
+    if (err instanceof RangeError) translateRangeError(err)
+    throw err
+  }
+}
+
 // ─── PATCH /api/admin/alerts/channels/:id ────────────────────────────
 
 export async function handleAdminAlertsPatchChannel(
@@ -477,6 +566,10 @@ export async function handleAdminAlertsPatchChannel(
       ip: ctx.clientIp,
       userAgent: ctx.userAgent,
     })
+    // enabled 切换等可能影响 aibot 连接:通知管理器 reconcile(非 aibot 行 → no-op)。
+    void getWecomAibotConnectionManager()
+      .onChannelChanged(ch.id)
+      .catch(() => {})
     sendJson(res, 200, { channel: serializeChannel(ch) })
   } catch (err) {
     if (err instanceof ChannelNotFoundError) throw new HttpError(404, 'NOT_FOUND', err.message)
@@ -502,6 +595,8 @@ export async function handleAdminAlertsDeleteChannel(
     if (err instanceof ChannelNotFoundError) throw new HttpError(404, 'NOT_FOUND', err.message)
     throw err
   }
+  // 关掉对应 aibot 连接(非 aibot id → 管理器无此连接 → no-op)。
+  getWecomAibotConnectionManager().onChannelRemoved(id)
   sendJson(res, 200, { deleted: true })
 }
 
