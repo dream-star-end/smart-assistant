@@ -116,6 +116,14 @@ export interface PublishInput {
   rawBundle?: Record<string, string> | null
   /** 发布者自报评测摘要(展示须标注"发布者提供",非平台背书)。 */
   benchmark?: { withPassRate: number; withoutPassRate: number; cases: number } | null
+  /**
+   * 是否将本 pending 版本纳入 AI 自动审批队列(ai_review_state='queued')。默认 **true**:
+   * 所有用户面发布路径(web 发布 / oc-market AI 自助发布)自动入列,未来新增发布路径也
+   * 默认受审 —— fail toward review。唯一 opt-out 是 platform seed(seedPlatformAgents 直接
+   * approvePlatformVersion,不走人审/AI),它显式传 false → ai_review_state 恒 NULL → worker
+   * 永不 claim,确保「platform seed 不走 AI」这条红线在数据层结构性成立(非依赖时序竞态)。
+   */
+  queueAiReview?: boolean
 }
 
 /** Create the listing (owner- AND kind-locked) if new, then a pending version. */
@@ -150,13 +158,17 @@ export async function publishSkillVersion(input: PublishInput): Promise<{ versio
       )
 
     try {
+      // ai_review_state 在 INSERT 内原子写入(而非发布后再 UPDATE),消除「pending 但
+      // ai_review_state=NULL」的时序窗口。默认 'queued';platform seed 传 queueAiReview:false
+      // → NULL → worker 永不 claim(见 PublishInput.queueAiReview 注释)。
+      const aiReviewState = input.queueAiReview === false ? null : 'queued'
       const ins = await query<{ id: string }>(
         `INSERT INTO marketplace_skill_versions
            (slug, version, name, description, tags, raw_skill_md, raw_artifact, manifest,
             artifact_hash, embedding_hash, status, risk_flags, policy_version, submitted_by,
-            raw_bundle, benchmark)
+            raw_bundle, benchmark, ai_review_state)
          VALUES ($1,$2,$3,$4,$5::jsonb,$6,$7,$8::jsonb,$9,$10,'pending',$11::jsonb,$12,$13,
-                 $14::jsonb,$15::jsonb)
+                 $14::jsonb,$15::jsonb,$16)
          RETURNING id::text`,
         [
           input.slug,
@@ -174,6 +186,7 @@ export async function publishSkillVersion(input: PublishInput): Promise<{ versio
           input.submittedBy,
           input.rawBundle == null ? null : JSON.stringify(input.rawBundle),
           input.benchmark == null ? null : JSON.stringify(input.benchmark),
+          aiReviewState,
         ],
         c,
       )
@@ -206,6 +219,8 @@ export interface PendingVersionRow {
   createdAt: string
   rawBundle: Record<string, string> | null
   benchmark: { withPassRate: number; withoutPassRate: number; cases: number } | null
+  /** AI 审核意见(escalate/warn 降级/解析失败/skip 时的原因),供人审「供参考」展示;null=AI 未表态。 */
+  aiNote: string | null
 }
 
 // Admin-only: the full artifact (raw_artifact) is included so the reviewer can
@@ -230,10 +245,12 @@ export async function listPendingVersions(limit = 100): Promise<PendingVersionRo
     created_at: string
     raw_bundle: unknown
     benchmark: unknown
+    ai_note: string | null
   }>(
     `SELECT v.id::text, v.slug, l.kind, v.version, v.name, v.description, v.tags,
             v.raw_artifact, v.raw_skill_md, v.manifest, v.raw_bundle, v.benchmark,
-            v.risk_flags, v.submitted_by::text, l.owner_user_id::text, v.created_at::text
+            v.risk_flags, v.submitted_by::text, l.owner_user_id::text, v.created_at::text,
+            v.ai_note
        FROM marketplace_skill_versions v
        JOIN marketplace_skill_listings l ON l.slug = v.slug
       WHERE v.status = 'pending'
@@ -260,17 +277,33 @@ export async function listPendingVersions(limit = 100): Promise<PendingVersionRo
     benchmark:
       (x.benchmark as { withPassRate: number; withoutPassRate: number; cases: number } | null) ??
       null,
+    aiNote: x.ai_note ?? null,
   }))
 }
 
-/** Approve/reject a pending version. Reviewer must differ from submitter unless an admin-only caller opts in. */
+/**
+ * Approve/reject a pending version. Reviewer must differ from submitter unless an admin-only
+ * caller opts in.
+ *
+ * `source` 记录最终决策来源(review_source 列):
+ *   - 'human'(默认):admin 人审。reviewerUserId 为 admin uid,写 reviewed_by。
+ *   - 'ai':AI 自动审批(marketplace/aiReview.ts)。reviewerUserId 传 null → reviewed_by=NULL
+ *     (schema 允许;AI 非任何用户,不占平台账号),并同事务把 ai_review_state 落 'done' +
+ *     ai_note + ai_reviewed_at —— worker claim 时已置 'running',这里在同一 status='pending'
+ *     守卫下原子翻到终态,无需二次写。AI 从不是发布者本人,故 reviewerUserId=null 时跳过
+ *     REVIEWER_IS_AUTHOR 检查(否则 BigInt(null) 会抛)。
+ */
 export async function reviewVersion(args: {
   versionId: string
-  reviewerUserId: number
+  reviewerUserId: number | null
   approve: boolean
   note?: string
   allowSelfReview?: boolean
+  source?: 'human' | 'ai'
+  /** source='ai' 时落 ai_note(AI 审批意见);human 路径忽略(不覆盖既有 ai_note)。 */
+  aiNote?: string | null
 }): Promise<void> {
+  const source = args.source ?? 'human'
   await tx(async (c) => {
     const v = await query<{ slug: string; status: string; submitted_by: string }>(
       'SELECT slug, status, submitted_by::text FROM marketplace_skill_versions WHERE id = $1 FOR UPDATE',
@@ -280,18 +313,30 @@ export async function reviewVersion(args: {
     const row = v.rows[0]
     if (!row) throw new MarketplaceError('VERSION_NOT_FOUND', 'version 不存在')
     if (row.status !== 'pending') throw new MarketplaceError('NOT_PENDING', '该版本已被审核')
-    if (!args.allowSelfReview && BigInt(row.submitted_by) === BigInt(args.reviewerUserId))
+    if (
+      args.reviewerUserId != null &&
+      !args.allowSelfReview &&
+      BigInt(row.submitted_by) === BigInt(args.reviewerUserId)
+    )
       throw new MarketplaceError('REVIEWER_IS_AUTHOR', '审核人不能是发布者本人')
 
+    const isAi = source === 'ai'
     await query(
       `UPDATE marketplace_skill_versions
-          SET status = $2, reviewed_by = $3, reviewed_at = NOW(), review_note = $4
+          SET status = $2, reviewed_by = $3, reviewed_at = NOW(), review_note = $4,
+              review_source = $5,
+              ai_review_state = CASE WHEN $6::boolean THEN 'done' ELSE ai_review_state END,
+              ai_note = CASE WHEN $6::boolean THEN $7 ELSE ai_note END,
+              ai_reviewed_at = CASE WHEN $6::boolean THEN NOW() ELSE ai_reviewed_at END
         WHERE id = $1`,
       [
         args.versionId,
         args.approve ? 'approved' : 'rejected',
         args.reviewerUserId,
         args.note ?? null,
+        source,
+        isAi,
+        isAi ? (args.aiNote ?? null) : null,
       ],
       c,
     )
@@ -388,7 +433,7 @@ export async function approvePlatformVersion(
     await query(
       `UPDATE marketplace_skill_versions
           SET status = 'approved', reviewed_by = submitted_by, reviewed_at = NOW(),
-              review_note = 'platform-official seed'
+              review_note = 'platform-official seed', review_source = 'platform'
         WHERE id = $1`,
       [row.id],
       c,
@@ -401,6 +446,221 @@ export async function approvePlatformVersion(
       c,
     )
   })
+}
+
+// ── AI 自动审批数据层(worker=marketplace/aiReview.ts;SQL 单一权威留在本文件)──────
+//
+// 单一权威:worker 直接扫版本表(不建第二张 job 表)。状态机与列语义见 0107 迁移头注。
+// claim 用 FOR UPDATE SKIP LOCKED(仿 research/store.ts claimNextJob),即便多实例并跑
+// 也不会认领同一行;escalate/skip 只翻 ai_review_state(绝不碰 status),status 由
+// reviewVersion(approve/reject)或人审改写 —— 职责单一,写回互不越界。
+
+/** worker claim 到的待审版本(PendingVersionRow 的全部字段 + 已 claim 次数)。 */
+export interface AiReviewCandidate extends PendingVersionRow {
+  /** 本次 claim 后的累计尝试次数(僵尸回收判据)。 */
+  aiAttempts: number
+}
+
+function mapAiCandidateRow(x: {
+  id: string
+  slug: string
+  kind: string
+  version: string
+  name: string
+  description: string
+  tags: unknown
+  raw_artifact: string
+  raw_skill_md: string | null
+  manifest: unknown
+  risk_flags: unknown
+  submitted_by: string
+  owner_user_id: string
+  created_at: string
+  raw_bundle: unknown
+  benchmark: unknown
+  ai_note: string | null
+  ai_attempts: number | string
+}): AiReviewCandidate {
+  return {
+    versionId: x.id,
+    slug: x.slug,
+    kind: x.kind as ArtifactKind,
+    version: x.version,
+    name: x.name,
+    description: x.description,
+    tags: (x.tags as string[]) ?? [],
+    rawArtifact: x.raw_artifact,
+    rawSkillMd: x.raw_skill_md,
+    manifest: x.manifest ?? null,
+    riskFlags: (x.risk_flags as RiskFlag[]) ?? [],
+    submittedBy: x.submitted_by,
+    ownerUserId: x.owner_user_id,
+    createdAt: x.created_at,
+    rawBundle: (x.raw_bundle as Record<string, string> | null) ?? null,
+    benchmark:
+      (x.benchmark as { withPassRate: number; withoutPassRate: number; cases: number } | null) ??
+      null,
+    aiNote: x.ai_note ?? null,
+    aiAttempts: typeof x.ai_attempts === 'string' ? Number.parseInt(x.ai_attempts, 10) : x.ai_attempts,
+  }
+}
+
+/**
+ * Claim 下一个 pending+queued 版本给本 worker 处理:置 running / ai_locked_at=NOW() /
+ * ai_attempts+1,返回全量内容(供 LLM 审)。无候选返回 null。FOR UPDATE SKIP LOCKED
+ * 保证并发 worker 不抢同一行。
+ */
+export async function claimNextAiReview(): Promise<AiReviewCandidate | null> {
+  return tx(async (c) => {
+    const sel = await query<{ id: string }>(
+      `SELECT id::text AS id
+         FROM marketplace_skill_versions
+        WHERE status = 'pending' AND ai_review_state = 'queued'
+        ORDER BY created_at ASC
+        LIMIT 1
+        FOR UPDATE SKIP LOCKED`,
+      [],
+      c,
+    )
+    const id = sel.rows[0]?.id
+    if (!id) return null
+    await query(
+      `UPDATE marketplace_skill_versions
+          SET ai_review_state = 'running', ai_locked_at = NOW(), ai_attempts = ai_attempts + 1
+        WHERE id = $1`,
+      [id],
+      c,
+    )
+    const full = await query<Parameters<typeof mapAiCandidateRow>[0]>(
+      `SELECT v.id::text, v.slug, l.kind, v.version, v.name, v.description, v.tags,
+              v.raw_artifact, v.raw_skill_md, v.manifest, v.raw_bundle, v.benchmark,
+              v.risk_flags, v.submitted_by::text, l.owner_user_id::text, v.created_at::text,
+              v.ai_note, v.ai_attempts
+         FROM marketplace_skill_versions v
+         JOIN marketplace_skill_listings l ON l.slug = v.slug
+        WHERE v.id = $1`,
+      [id],
+      c,
+    )
+    const row = full.rows[0]
+    return row ? mapAiCandidateRow(row) : null
+  })
+}
+
+/**
+ * 僵尸回收:running 且 ai_locked_at 超过 staleMs 的行(worker 崩在半路)。attempts≥maxAttempts
+ * → 'skipped'(转人工,不再重试);否则回 'queued' 重新排队。返回两类计数。
+ */
+export async function recoverStaleAiReviews(
+  staleMs: number,
+  maxAttempts: number,
+): Promise<{ requeued: number; skipped: number }> {
+  const r = await query<{ ai_review_state: string }>(
+    `UPDATE marketplace_skill_versions
+        SET ai_review_state = CASE WHEN ai_attempts >= $2 THEN 'skipped' ELSE 'queued' END,
+            ai_note = CASE WHEN ai_attempts >= $2
+                           THEN 'AI 审核多次未完成(疑似中断),已转人工复核' ELSE ai_note END,
+            ai_reviewed_at = CASE WHEN ai_attempts >= $2 THEN NOW() ELSE ai_reviewed_at END,
+            ai_locked_at = NULL
+      WHERE status = 'pending'
+        AND ai_review_state = 'running'
+        AND ai_locked_at < NOW() - ($1 * INTERVAL '1 millisecond')
+    RETURNING ai_review_state`,
+    [staleMs, maxAttempts],
+  )
+  let requeued = 0
+  let skipped = 0
+  for (const row of r.rows) {
+    if (row.ai_review_state === 'skipped') skipped++
+    else requeued++
+  }
+  return { requeued, skipped }
+}
+
+/**
+ * ESCALATE:LLM 给出 escalate / warn 降级 / 输出解析失败 —— 保持 pending 进人审队列,
+ * 只把 ai_review_state 落 'done' + 记录 AI 意见。**绝不改 status**。仅当行仍 'running'
+ * (本 worker 持有)时生效,避免覆盖并发人审已翻的终态。
+ */
+export async function finishAiReviewEscalate(versionId: string, note: string): Promise<void> {
+  await query(
+    `UPDATE marketplace_skill_versions
+        SET ai_review_state = 'done', ai_note = $2, ai_reviewed_at = NOW(), ai_locked_at = NULL
+      WHERE id = $1 AND ai_review_state = 'running'`,
+    [versionId, note],
+  )
+}
+
+/**
+ * SKIP:worker 无法给出可用决策(缺 key / 网络失败重试耗尽 / 写回时版本已被人审抢先)。
+ * 保持 pending,ai_review_state 落 'skipped' + 原因。同样只在 'running' 时生效。
+ */
+export async function markAiReviewSkipped(versionId: string, note: string): Promise<void> {
+  await query(
+    `UPDATE marketplace_skill_versions
+        SET ai_review_state = 'skipped', ai_note = $2, ai_reviewed_at = NOW(), ai_locked_at = NULL
+      WHERE id = $1 AND ai_review_state = 'running'`,
+    [versionId, note],
+  )
+}
+
+/**
+ * 缺 key 时的兜底:把所有 queued 且未 claim 的版本批量置 'skipped'(转人工),避免
+ * 无人处理的 queued backlog 无声堆积。返回处理行数(worker 仅在 >0 时记日志)。
+ */
+export async function skipQueuedAiReviews(note: string): Promise<number> {
+  const r = await query(
+    `UPDATE marketplace_skill_versions
+        SET ai_review_state = 'skipped', ai_note = $1, ai_reviewed_at = NOW()
+      WHERE status = 'pending' AND ai_review_state = 'queued'`,
+    [note],
+  )
+  return r.rowCount ?? 0
+}
+
+/** admin「AI 审批记录」:AI 最终决策过(approved/rejected)的版本,按 reviewed_at DESC。 */
+export interface AiReviewRecord {
+  versionId: string
+  slug: string
+  kind: ArtifactKind
+  version: string
+  name: string
+  /** AI 的最终裁决落到 status:'approved' | 'rejected'。 */
+  status: string
+  aiNote: string | null
+  reviewedAt: string | null
+}
+
+export async function listRecentAiReviews(limit = 50): Promise<AiReviewRecord[]> {
+  const r = await query<{
+    id: string
+    slug: string
+    kind: string
+    version: string
+    name: string
+    status: string
+    ai_note: string | null
+    reviewed_at: string | null
+  }>(
+    `SELECT v.id::text, v.slug, l.kind, v.version, v.name, v.status, v.ai_note,
+            v.reviewed_at::text
+       FROM marketplace_skill_versions v
+       JOIN marketplace_skill_listings l ON l.slug = v.slug
+      WHERE v.review_source = 'ai'
+      ORDER BY v.reviewed_at DESC NULLS LAST
+      LIMIT $1`,
+    [Math.min(Math.max(1, limit), 200)],
+  )
+  return r.rows.map((x) => ({
+    versionId: x.id,
+    slug: x.slug,
+    kind: x.kind as ArtifactKind,
+    version: x.version,
+    name: x.name,
+    status: x.status,
+    aiNote: x.ai_note ?? null,
+    reviewedAt: x.reviewed_at ?? null,
+  }))
 }
 
 export interface ApprovedSearchRow {

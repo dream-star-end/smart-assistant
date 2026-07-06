@@ -752,6 +752,21 @@ export type MarketplacePending = {
   createdAt: string;
   rawBundle?: Record<string, string> | null;
   benchmark?: { withPassRate: number; withoutPassRate: number; cases: number } | null;
+  /** AI 审核意见（escalate/warn 降级/解析失败时的原因）；人审展开区「供参考」展示。 */
+  aiNote?: string | null;
+};
+
+/** AI 自动审批记录项（GET /api/admin/marketplace/ai-reviews；review_source='ai'）。 */
+export type MarketplaceAiReview = {
+  versionId: string;
+  slug: string;
+  kind: MarketplaceKind;
+  version: string;
+  name: string;
+  /** AI 最终裁决落到 status。 */
+  status: "approved" | "rejected" | string;
+  aiNote?: string | null;
+  reviewedAt?: string | null;
 };
 
 /** 我的智能体项（GET /api/marketplace/my-agents：默认全能助手 + 已安装）。 */

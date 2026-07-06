@@ -24,6 +24,7 @@ import {
   listInstalled,
   listMyPublishes,
   listPendingVersions,
+  listRecentAiReviews,
   listPlatformPresetAgents,
   ownerUnlistListing,
   publishSkillVersion,
@@ -654,6 +655,18 @@ export async function handleAdminMarketplacePending(
 ): Promise<void> {
   await requireAdminVerifyDb(req, deps.jwtSecret)
   sendJson(res, 200, { pending: await listPendingVersions() })
+}
+
+// ── GET /api/admin/marketplace/ai-reviews ──────────────────────────────────
+// AI 自动审批记录(review_source='ai',已 approved/rejected),供 admin 可见性 + 复核。
+// escalate 项 status 仍 pending → 不在这里,而在 /pending 队列以「AI 意见」展示。
+export async function handleAdminMarketplaceAiReviews(
+  req: IncomingMessage,
+  res: ServerResponse,
+  deps: { jwtSecret: string | Uint8Array },
+): Promise<void> {
+  await requireAdminVerifyDb(req, deps.jwtSecret)
+  sendJson(res, 200, { reviews: await listRecentAiReviews() })
 }
 
 // ── POST /api/admin/marketplace/:id/review ─────────────────────────────────

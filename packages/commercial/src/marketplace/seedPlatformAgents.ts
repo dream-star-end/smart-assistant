@@ -321,6 +321,9 @@ async function seedAgentDefs(
           riskFlags: scan.flags,
           policyVersion: scan.policyVersion,
           submittedBy: ownerUserId,
+          // platform seed 立即 approvePlatformVersion,绝不走 AI 审批(红线):不入 AI 队列
+          // → ai_review_state 恒 NULL → worker 永不 claim,结构性隔离(非时序竞态)。
+          queueAiReview: false,
         })
         freshlyPublished = true
       } catch (e) {

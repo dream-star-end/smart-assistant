@@ -26,6 +26,7 @@ import type {
   SkillEvalsFile,
   SkillRunUsage,
   SkillTrainRun,
+  MarketplaceAiReview,
   MarketplaceMyPublish,
   MarketplacePending,
   MarketplacePublishInput,
@@ -1649,6 +1650,17 @@ export const api = {
         }),
       ),
     ).then((b) => b.pending || []),
+
+  /** AI 自动审批记录（GET /api/admin/marketplace/ai-reviews；review_source='ai'）。 */
+  adminMarketplaceAiReviews: (a: AuthSession) =>
+    jsonOrThrow<{ reviews: MarketplaceAiReview[] }>(
+      callWithRefresh(a, (t) =>
+        fetch("/api/admin/marketplace/ai-reviews", {
+          credentials: "include",
+          headers: bearerHeaders(t),
+        }),
+      ),
+    ).then((b) => b.reviews || []),
 
   /** 审核(批准/拒绝)一个版本（POST /api/admin/marketplace/:id/review）。 */
   adminMarketplaceReview: (
