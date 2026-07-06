@@ -36,6 +36,11 @@ export interface OrgBillingContext {
  * 解析成员在 settle 那一刻的 org 归属上下文。**tx 内、锁前**一次索引点查
  * (idx_org_memberships_user + orgs PK)。成员非 active / org 非 active → null(纯个人计费)。
  *
+ * 已知并接受的竞态语义:本读不加行锁,settle 期间管理员并发改 billing_enabled/移除成员,
+ * 该 turn 仍按解析时刻的归属计费(turn 边界内的毫秒窗口)。锁 membership 行会给
+ * 扣费热路径引入与成员管理事务的锁交叉,收益(一个 turn 的归属精度)不值代价——
+ * 权威裁决记录于方案文档 + Codex 审计 P1b。
+ *
  * @param runner tx 内的 PoolClient(settle 收口传自己的事务 client),或 Pool(独立解析)。
  */
 export async function resolveOrgBillingContext(
@@ -54,6 +59,28 @@ export async function resolveOrgBillingContext(
   const row = r.rows[0];
   if (!row) return null;
   return { orgId: row.org_id, billingEnabled: row.billing_enabled };
+}
+
+/**
+ * 成员可动用的 org 钱包余额(preCheck 预检门用,poolside 只读)。
+ *
+ * 语义与 resolveOrgBillingContext + spendTwoBucket 的 org 桶参与条件严格一致:
+ * 成员 active + billing_enabled + org active,否则 0n(org 钱包不参与该成员付费)。
+ * 若不同步此条件,会出现"预检放行但扣费落不到 org 桶"或反向的 402 误拒
+ * (企业核心场景 = 公司付费、成员个人余额为 0)。
+ */
+export async function getOrgSpendableForUser(userId: bigint | number | string): Promise<bigint> {
+  const r = await query<{ credits: string }>(
+    `SELECT o.credits::text AS credits
+       FROM org_memberships m
+       JOIN orgs o ON o.id = m.org_id
+      WHERE m.user_id = $1::bigint AND m.status = 'active' AND m.billing_enabled
+        AND o.status = 'active'
+      LIMIT 1`,
+    [String(userId)],
+  );
+  const row = r.rows[0];
+  return row ? BigInt(row.credits) : 0n;
 }
 
 // ─── 只读读路径(GET /api/org/*)────────────────────────────────────────

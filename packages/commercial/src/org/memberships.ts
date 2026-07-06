@@ -102,11 +102,33 @@ export interface UpdateMemberPatch {
 }
 
 /**
+ * 授权矩阵(单一权威,在锁内行上判定):caller 能否管理(改/踢)目标成员。
+ * owner 管 admin+member;admin 只管 member;owner 行不可被管理(只能 transfer-owner)。
+ */
+export function assertCanManage(callerRole: OrgRole, targetRole: OrgRole): void {
+  if (targetRole === "owner") {
+    throw new OrgError(403, "OWNER_IMMUTABLE", "cannot manage the organization owner");
+  }
+  if (callerRole === "owner") return; // owner 管 admin + member
+  if (callerRole === "admin" && targetRole === "member") return; // admin 只管 member
+  throw new OrgError(403, "FORBIDDEN", "insufficient role to manage this member");
+}
+
+/** 成员管理操作的执行者(授权矩阵在事务内按 FOR UPDATE 后的目标行判定,消 TOCTOU)。 */
+export interface MemberActor {
+  role: OrgRole;
+  userId: string;
+}
+
+/**
  * 更新成员的 org_role / billing_enabled / status。
  *
- * 结构不变量兜底(不替代 HTTP 层授权矩阵):
- *   - 目标是 owner 行 → 一律拒绝(owner 变更只能走 transferOwner)。
- *   - org_role 不允许被设为 'owner'(升 owner 只能 transfer);只接受 admin/member。
+ * 授权矩阵在**事务内、FOR UPDATE 之后**按目标行最新角色判定(Codex 审计 P1:
+ * 若只在 HTTP 层事前判定,目标在窗口内被 owner 升为 admin 后,admin 仍可改/踢它):
+ *   - assertCanManage(actor.role, 目标当前角色);
+ *   - 改 org_role 仅 owner;
+ *   - 目标是 owner 行 → 一律拒绝(owner 变更只能走 transferOwner);
+ *   - org_role 不允许被设为 'owner'(升 owner 只能 transfer)。
  *
  * 在调用方事务内执行(与 audit 同事务)。目标不存在 → 404。
  */
@@ -115,6 +137,7 @@ export async function updateMember(
   userId: string | bigint,
   patch: UpdateMemberPatch,
   client: PoolClient,
+  actor: MemberActor,
 ): Promise<MembershipRow> {
   const cur = await client.query<MembershipRow>(
     `SELECT ${MEMBERSHIP_COLUMNS} FROM org_memberships
@@ -124,6 +147,10 @@ export async function updateMember(
   if (cur.rows.length === 0) throw new OrgError(404, "NOT_FOUND", "member not found");
   if (cur.rows[0].org_role === "owner") {
     throw new OrgError(403, "OWNER_IMMUTABLE", "the organization owner row cannot be modified here");
+  }
+  assertCanManage(actor.role, cur.rows[0].org_role);
+  if (patch.orgRole !== undefined && actor.role !== "owner") {
+    throw new OrgError(403, "FORBIDDEN", "only the owner can change member roles");
   }
   if (patch.orgRole !== undefined && patch.orgRole === "owner") {
     throw new OrgError(400, "VALIDATION", "cannot promote to owner via member update; use transfer-owner");
@@ -161,13 +188,16 @@ export async function updateMember(
 }
 
 /**
- * 移除成员。结构防线:拒绝移除 owner(owner 必须先 transfer-owner)。
+ * 移除成员。授权矩阵在事务内 FOR UPDATE 后判定(同 updateMember,消 TOCTOU);
+ * 自离(actor.userId == 目标)豁免矩阵(admin/member 都可自行退出,owner 除外)。
+ * 结构防线:拒绝移除 owner(owner 必须先 transfer-owner)。
  * 在调用方事务内执行。返回被移除行(供审计/日志)。
  */
 export async function removeMember(
   orgId: string | bigint,
   userId: string | bigint,
   client: PoolClient,
+  actor: MemberActor,
 ): Promise<MembershipRow> {
   const cur = await client.query<MembershipRow>(
     `SELECT ${MEMBERSHIP_COLUMNS} FROM org_memberships
@@ -175,6 +205,9 @@ export async function removeMember(
     [String(orgId), String(userId)],
   );
   if (cur.rows.length === 0) throw new OrgError(404, "NOT_FOUND", "member not found");
+  if (actor.userId !== String(userId)) {
+    assertCanManage(actor.role, cur.rows[0].org_role);
+  }
   if (cur.rows[0].org_role === "owner") {
     throw new OrgError(403, "OWNER_IMMUTABLE", "cannot remove the organization owner; transfer ownership first");
   }

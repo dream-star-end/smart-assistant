@@ -37,6 +37,13 @@ ALTER TABLE credit_ledger DROP CONSTRAINT IF EXISTS credit_ledger_bucket_check;
 ALTER TABLE credit_ledger ADD CONSTRAINT credit_ledger_bucket_check
   CHECK (bucket IN ('wallet', 'period', 'org_wallet'));
 
+-- org 钱包流水完整性:bucket='org_wallet' 必须带 org_id,否则该流水会被
+-- org ledger 查询(WHERE org_id=$1)漏掉,审计对不上账(Codex 审计 P2)。
+-- 应用写路径均传 org_id,此为 DB 层兜底防未来手写 SQL/新路径漏传。
+ALTER TABLE credit_ledger DROP CONSTRAINT IF EXISTS ck_cl_org_wallet_has_org;
+ALTER TABLE credit_ledger ADD CONSTRAINT ck_cl_org_wallet_has_org
+  CHECK (bucket <> 'org_wallet' OR org_id IS NOT NULL);
+
 -- org 桶流水按 org 时间线倒序查(GET /api/org/ledger);partial 谓词让索引不背个人流水。
 -- **必须排在 ADD COLUMN org_id 之后**(引用新列)。
 CREATE INDEX IF NOT EXISTS idx_cl_org_time

@@ -16,7 +16,6 @@ import type { CommercialHttpDeps, RequestContext } from "../handlers.js";
 import { OrgError, type OrgRole } from "../../org/types.js";
 import { getOrgById, getOrgSummary } from "../../org/orgs.js";
 import {
-  getMembership,
   listMembers,
   updateMember,
   removeMember,
@@ -45,16 +44,6 @@ function gated(auth: OrgRouteAuth): { userId: string; orgId: string; orgRole: Or
     throw new HttpError(500, "INTERNAL", "missing org auth context");
   }
   return { userId: auth.userId, orgId: auth.orgId, orgRole: auth.orgRole, billingEnabled: auth.billingEnabled };
-}
-
-/** 授权矩阵:caller 能否管理(改/踢)目标成员。 */
-function assertCanManage(callerRole: OrgRole, targetRole: OrgRole): void {
-  if (targetRole === "owner") {
-    throw new OrgError(403, "OWNER_IMMUTABLE", "cannot manage the organization owner");
-  }
-  if (callerRole === "owner") return; // owner 管 admin + member
-  if (callerRole === "admin" && targetRole === "member") return; // admin 只管 member
-  throw new OrgError(403, "FORBIDDEN", "insufficient role to manage this member");
 }
 
 function requireBigintId(raw: string | undefined, field: string): string {
@@ -164,10 +153,8 @@ async function handlePatchMember(
     if (b.org_role !== "admin" && b.org_role !== "member") {
       throw new HttpError(400, "VALIDATION", "org_role must be admin or member");
     }
-    // 仅 owner 可改角色
-    if (orgRole !== "owner") {
-      throw new HttpError(403, "FORBIDDEN", "only the owner can change member roles");
-    }
+    // 「仅 owner 可改角色」与管理矩阵的权威判定在数据层事务内(updateMember,
+    // FOR UPDATE 后按目标行最新角色判,消 TOCTOU)——HTTP 层不重复判定。
     patch.orgRole = b.org_role;
   }
   if (b.billing_enabled !== undefined) {
@@ -187,10 +174,9 @@ async function handlePatchMember(
   }
 
   try {
-    const target = await getMembership(orgId, uid);
-    if (!target) throw new HttpError(404, "NOT_FOUND", "member not found");
-    assertCanManage(orgRole, target.org_role);
-    const updated = await tx((client) => updateMember(orgId, uid, patch, client));
+    const updated = await tx((client) =>
+      updateMember(orgId, uid, patch, client, { role: orgRole, userId: auth.userId }),
+    );
     sendJson(res, 200, {
       member: {
         user_id: updated.user_id,
@@ -217,10 +203,7 @@ async function handleRemoveMember(
   const { orgId, orgRole } = gated(auth);
   const uid = requireBigintId(params.uid, "uid");
   try {
-    const target = await getMembership(orgId, uid);
-    if (!target) throw new HttpError(404, "NOT_FOUND", "member not found");
-    assertCanManage(orgRole, target.org_role);
-    await tx((client) => removeMember(orgId, uid, client));
+    await tx((client) => removeMember(orgId, uid, client, { role: orgRole, userId: auth.userId }));
     sendJson(res, 200, { removed: true, user_id: uid });
   } catch (err) {
     throwOrg(err);
@@ -241,7 +224,8 @@ async function handleLeave(
     throw new HttpError(403, "OWNER_MUST_TRANSFER", "owner must transfer ownership before leaving");
   }
   try {
-    await tx((client) => removeMember(orgId, userId, client));
+    // 自离:actor==目标,removeMember 豁免管理矩阵(owner 已在上方拦截)。
+    await tx((client) => removeMember(orgId, userId, client, { role: orgRole, userId }));
     sendJson(res, 200, { left: true });
   } catch (err) {
     throwOrg(err);
@@ -277,7 +261,7 @@ async function handleCreateInvitation(
   deps: CommercialHttpDeps,
   auth: OrgRouteAuth,
 ): Promise<void> {
-  const { orgId, userId } = gated(auth);
+  const { orgId, userId, orgRole: callerRole } = gated(auth);
   const b = asObject(await readJsonBody(req));
   if (typeof b.email !== "string" || b.email.trim().length === 0) {
     throw new HttpError(400, "VALIDATION", "email is required");
@@ -285,6 +269,11 @@ async function handleCreateInvitation(
   const orgRole = b.org_role === undefined ? "member" : b.org_role;
   if (orgRole !== "admin" && orgRole !== "member") {
     throw new HttpError(400, "VALIDATION", "org_role must be admin or member");
+  }
+  // 邀请 admin = 造 admin,与"仅 owner 可改角色"同级权限:admin 若能邀 admin,
+  // 就绕过了 owner-only 角色矩阵(Codex 审计 P0)。
+  if (orgRole === "admin" && callerRole !== "owner") {
+    throw new HttpError(403, "FORBIDDEN", "only the owner can invite admins");
   }
 
   let result;

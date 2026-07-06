@@ -687,3 +687,64 @@ describe("admin org 运维数据层", () => {
     );
   });
 });
+
+// ─── Codex 审计修复回归(2026-07-06:P0 邀请提权 / P1 预检 org 余额)────────
+
+describe("Codex 审计修复回归", () => {
+  test("admin 邀请 admin → 403(仅 owner 可造 admin,P0)", async (t) => {
+    if (skipIfNoPg(t)) return;
+    const owner = await createUser("audit-owner@x.com");
+    const orgId = await makeOrg(owner, "AuditOrg");
+    const admin = await createUser("audit-admin@x.com");
+    await addMember(orgId, admin, "admin");
+    const r = await callOrg("POST", "/api/org/invitations", await token(admin), {
+      email: "newadmin@x.com",
+      org_role: "admin",
+    });
+    assert.equal(r.status, 403);
+  });
+
+  test("owner 邀请 admin → 201;admin 邀请 member 仍可 → 201", async (t) => {
+    if (skipIfNoPg(t)) return;
+    const owner = await createUser("audit-owner2@x.com");
+    const orgId = await makeOrg(owner, "AuditOrg2");
+    const admin = await createUser("audit-admin2@x.com");
+    await addMember(orgId, admin, "admin");
+    const r1 = await callOrg("POST", "/api/org/invitations", await token(owner), {
+      email: "newadmin2@x.com",
+      org_role: "admin",
+    });
+    assert.equal(r1.status, 201);
+    const r2 = await callOrg("POST", "/api/org/invitations", await token(admin), {
+      email: "newmember2@x.com",
+      org_role: "member",
+    });
+    assert.equal(r2.status, 201);
+  });
+
+  test("getOrgSpendableForUser:enabled 成员见 org 余额;billing_enabled=false/org suspended → 0", async (t) => {
+    if (skipIfNoPg(t)) return;
+    const { getOrgSpendableForUser } = await import("../org/orgBilling.js");
+    const owner = await createUser("audit-owner3@x.com");
+    const orgId = await makeOrg(owner, "AuditOrg3");
+    await query(`UPDATE orgs SET credits = 12345 WHERE id = $1::bigint`, [orgId]);
+    // owner 默认 billing_enabled=true → 见 org 余额
+    assert.equal(await getOrgSpendableForUser(owner), 12345n);
+    // 关 billing_enabled → 0(org 钱包不参与该成员付费,预检与扣费口径一致)
+    await query(
+      `UPDATE org_memberships SET billing_enabled = FALSE WHERE org_id = $1::bigint AND user_id = $2::bigint`,
+      [orgId, owner],
+    );
+    assert.equal(await getOrgSpendableForUser(owner), 0n);
+    await query(
+      `UPDATE org_memberships SET billing_enabled = TRUE WHERE org_id = $1::bigint AND user_id = $2::bigint`,
+      [orgId, owner],
+    );
+    // org suspended → 0
+    await query(`UPDATE orgs SET status = 'suspended' WHERE id = $1::bigint`, [orgId]);
+    assert.equal(await getOrgSpendableForUser(owner), 0n);
+    // 非成员 → 0
+    const stranger = await createUser("audit-stranger@x.com");
+    assert.equal(await getOrgSpendableForUser(stranger), 0n);
+  });
+});
