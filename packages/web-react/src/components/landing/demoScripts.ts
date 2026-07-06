@@ -48,7 +48,19 @@ export type Artifact =
   | {
       kind: "board";
       title: string;
-      tasks: { role: string; task: string; state: string }[];
+      /**
+       * 子任务行(对齐真实 TeamPanel 展示):role=成员名 / task=任务 / state=状态标签;
+       * dur=示意性耗时、credit=示意性积分明细(全为虚构示意值);review=true 的行是隐藏
+       * 质量审查员,以「审查通过」裁决徽记呈现(非普通完成徽记)。
+       */
+      tasks: {
+        role: string;
+        task: string;
+        state: string;
+        dur?: string;
+        credit?: string;
+        review?: boolean;
+      }[];
       note: string;
     }
   | {
@@ -205,24 +217,27 @@ export const DEMO_SCENARIOS: DemoScenario[] = [
     id: "team",
     tab: "团队协作",
     icon: Users,
-    prompt: "组个小组：把这份 30 页的产品手册翻成英文，术语前后要统一，翻完交叉审校一遍再交给我",
+    prompt:
+      "组个小组：先调研三家主流向量数据库的选型对比，写一个连接与查询性能的测试脚本各跑一轮，最后把结论排成一份带图表的选型报告给我",
     steps: [
-      { label: "队长拆解 30 页 · 分派子任务" },
-      { label: "翻译员分章推进" },
-      { label: "术语官统一 200+ 术语" },
-      { label: "审校员逐页交叉复核" },
+      { label: "队长拆解任务 · 分派 3 名成员" },
+      { label: "科研助手调研选型维度" },
+      { label: "编程助手写脚本实测性能" },
+      { label: "办公助手排版选型报告" },
+      { label: "质量审查员交叉复核" },
     ],
     answer:
-      "小组按「子任务账本」协作完成：翻译员分章翻完 30 页，术语官统一了 216 条术语，审校员交叉复核修正 37 处。队长汇总交付，全程自主协作，你只需要看最终稿。",
-    runMeta: "3 名成员并行 · 全程 38 分钟自主协作",
-    deliverable: "产品手册_EN.docx",
+      "小组按「子任务账本」并行协作：科研助手梳理了 3 家向量库的选型维度，编程助手写了连接与查询性能脚本各实测一轮，办公助手把结论排成带图表的选型报告。质量审查员交叉复核数据口径后通过，队长汇总交付，你只需要看最终稿。",
+    runMeta: "3 名成员并行协作 · 全程自主，审查通过后交付",
+    deliverable: "向量数据库选型报告.docx",
     artifact: {
       kind: "board",
       title: "子任务账本",
       tasks: [
-        { role: "翻译员", task: "分章翻译 30 页", state: "完成" },
-        { role: "术语官", task: "统一术语表 216 条", state: "完成" },
-        { role: "审查员", task: "交叉复核 · 修正 37 处", state: "通过" },
+        { role: "科研助手", task: "调研 3 家选型维度", state: "完成", dur: "6m", credit: "820" },
+        { role: "编程助手", task: "性能脚本 · 实测一轮", state: "完成", dur: "8m", credit: "1,240" },
+        { role: "办公助手", task: "排版带图表报告", state: "完成", dur: "5m", credit: "560" },
+        { role: "质量审查员", task: "交叉复核数据口径", state: "通过", review: true, credit: "180" },
       ],
       note: "队长汇总交付 · 过程账本可回看",
     },

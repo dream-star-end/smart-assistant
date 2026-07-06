@@ -276,7 +276,11 @@ function DiffMock({ a }: { a: Extract<Artifact, { kind: "diff" }> }) {
   );
 }
 
-/** 团队协作子任务账本 mock。 */
+/**
+ * 团队协作子任务账本 mock —— 对齐真实 TeamPanel 展示:成员 / 任务 / 状态(含示意耗时)/
+ * 审查通过裁决徽记 / 示意积分明细。全为虚构示意数据(见 demoScripts 顶部声明)。
+ * 右侧集群保持至多两项(积分 + 状态徽记),任务文本 min-w-0 truncate 让位,防横向溢出。
+ */
 function BoardMock({ a }: { a: Extract<Artifact, { kind: "board" }> }) {
   return (
     <MockFrame title={a.title} note={a.note}>
@@ -284,18 +288,31 @@ function BoardMock({ a }: { a: Extract<Artifact, { kind: "board" }> }) {
         {a.tasks.map((t) => (
           <div
             key={t.role}
-            className="flex items-center gap-2.5 rounded-lg border border-border bg-bg px-2.5 py-2"
+            className="flex items-center gap-2 rounded-lg border border-border bg-bg px-2.5 py-2"
           >
             <span className="flex size-6 shrink-0 items-center justify-center rounded-md bg-accent-soft text-[10px] font-bold text-accent">
               {t.role.slice(0, 1)}
             </span>
             <span className="min-w-0 flex-1">
-              <span className="block text-[10.5px] font-semibold text-fg">{t.role}</span>
+              <span className="block truncate text-[10.5px] font-semibold text-fg">{t.role}</span>
               <span className="block truncate text-[10px] text-muted">{t.task}</span>
             </span>
-            <span className="inline-flex shrink-0 items-center gap-1 rounded-full bg-success-soft px-1.5 py-0.5 text-[9.5px] font-medium text-success">
-              <Check size={10} /> {t.state}
-            </span>
+            {/* 积分明细:对齐 TeamPanel 每成员「N 积分」(示意值)。 */}
+            {t.credit && (
+              <span className="shrink-0 text-[9.5px] tabular-nums text-faint">{t.credit} 积分</span>
+            )}
+            {/* 审查通过 → 强调色裁决徽记(对齐 TeamPanel reviewVerdictBadge);其余 → 成功态
+                完成徽记 + 示意耗时(对齐状态徽记的「· Ns」)。 */}
+            {t.review ? (
+              <span className="inline-flex shrink-0 items-center gap-1 rounded-full bg-accent-soft px-1.5 py-0.5 text-[9.5px] font-medium text-accent">
+                <Check size={10} /> {t.state}
+              </span>
+            ) : (
+              <span className="inline-flex shrink-0 items-center gap-1 rounded-full bg-success-soft px-1.5 py-0.5 text-[9.5px] font-medium text-success">
+                <Check size={10} /> {t.state}
+                {t.dur ? <span className="font-normal text-success/70">· {t.dur}</span> : null}
+              </span>
+            )}
           </div>
         ))}
       </div>
