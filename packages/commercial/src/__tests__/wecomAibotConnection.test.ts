@@ -36,11 +36,11 @@ import {
 } from '../admin/wecomAibotConnection.js'
 
 describe('buildSubscribeFrame', () => {
-  it('carries botid + secret + req_id under aibot_subscribe', () => {
+  it('carries bot_id + secret + req_id under aibot_subscribe', () => {
     const f = buildSubscribeFrame('BOT123456', 'super-secret-value-000', 'r-1')
     assert.equal(f.cmd, 'aibot_subscribe')
     assert.equal(f.headers.req_id, 'r-1')
-    assert.deepEqual(f.body, { botid: 'BOT123456', secret: 'super-secret-value-000' })
+    assert.deepEqual(f.body, { bot_id: 'BOT123456', secret: 'super-secret-value-000' })
   })
 })
 
@@ -51,14 +51,14 @@ describe('buildSendMsgFrame', () => {
     assert.equal(f.headers.req_id, 'r-2')
     assert.deepEqual(f.body, {
       chatid: 'CHAT_A',
-      chat_type: 'single',
+      chat_type: 1,
       msgtype: 'markdown',
       markdown: { content: '**alert** body' },
     })
   })
-  it('group chat_type preserved', () => {
+  it('group chat_type maps to uint32 2', () => {
     const f = buildSendMsgFrame('CHAT_G', 'group', 'x', 'r-3')
-    assert.equal((f.body as { chat_type: string }).chat_type, 'group')
+    assert.equal((f.body as { chat_type: number }).chat_type, 2)
   })
 })
 

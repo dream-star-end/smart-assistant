@@ -116,7 +116,8 @@ export function buildSubscribeFrame(botId: string, secret: string, reqId: string
   return {
     cmd: 'aibot_subscribe',
     headers: { req_id: reqId },
-    body: { botid: botId, secret },
+    // 官方订阅帧字段名是 bot_id(下划线),非 botid —— 写错会返 853000 invalid bot_id。
+    body: { bot_id: botId, secret },
   }
 }
 
@@ -132,7 +133,9 @@ export function buildSendMsgFrame(
     headers: { req_id: reqId },
     body: {
       chatid: chatId,
-      chat_type: chatType,
+      // 官方 send 帧 chat_type 是 uint32(1=单聊/2=群聊),不是入站回调那种字符串
+      // chattype(single/group)—— 两处命名与类型都不同,发字符串会被拒/误解析。
+      chat_type: chatType === 'group' ? 2 : 1,
       msgtype: 'markdown',
       markdown: { content: markdown },
     },
