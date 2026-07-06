@@ -458,6 +458,11 @@ export function nonAuthPolicyCloseInfo(code: number, reason: unknown): NonAuthPo
 
 const PROVISIONING_REASONS = new Set(["provisioning", "starting"]);
 const CLOSE_REASON_LABELS: Record<string, string> = {
+  // provisioning/starting 也进表:4503 时 `provisioning` 布尔已置(App 三态优先命中「环境启动中」),
+  // 但 4504 携同 reason 不置 provisioning 布尔(见下方 code===4503 门控),补此二项保证 4504
+  // 供给类 close 的 status.label 也有可读文案,不落裸倒计时。
+  provisioning: "环境启动中，正在为你准备工作区",
+  starting: "环境启动中，正在为你准备工作区",
   host_full: "资源繁忙，正在排队重试",
   migration_in_progress: "环境迁移中，稍后自动重试",
   image_missing: "运行镜像未就绪，管理员处理中",
@@ -509,6 +514,24 @@ export function classifyClose(code: number, reason: unknown): CloseDecision {
     }
   }
   return { action: "reconnect", serverHintedDelay, provisioning, closeReasonLabel };
+}
+
+/** 弱网/重连状态条的三态文案（单一权威，抽纯函数便于单测锁定）。优先级：
+ *   1. `!browserOnline` → 「网络已断开」：明确归因用户侧断网（非服务端故障），不显倒计时（联网即自动重连）；
+ *   2. `provisioning`（4503 provisioning/starting）→ 「环境启动中」：首次开机 / 唤醒等待，非故障；
+ *   3. 其余未连接 → 直接呈现 `label`（socket 已把 closeReasonLabel + 倒计时组装进 status.label）。
+ *  `cls === "connected"` 返回 null（不显条）。tone 贴 Alert：disconnected=warning，connecting=info。*/
+export type ConnBanner = { tone: "info" | "warning"; text: string } | null;
+export function deriveConnBanner(input: {
+  cls: ChatStatusClass;
+  label: string;
+  browserOnline: boolean;
+  provisioning: boolean;
+}): ConnBanner {
+  if (input.cls === "connected") return null;
+  if (!input.browserOnline) return { tone: "warning", text: "网络已断开，恢复后自动重连" };
+  if (input.provisioning) return { tone: "info", text: "环境启动中，正在为你准备工作区…" };
+  return { tone: input.cls === "disconnected" ? "warning" : "info", text: input.label };
 }
 
 /** 标准指数退避 + jitter（websocket.js:2313）：2/4/8/16/30s 上限 + 0–1000ms。*/

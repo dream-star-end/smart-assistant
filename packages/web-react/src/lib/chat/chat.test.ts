@@ -5,6 +5,7 @@ import {
   classifyClose,
   classifyEmptyTurn,
   countAnswerBlocks,
+  deriveConnBanner,
   findOrCreateStreamingRow,
   friendlyBridgeErrorMessage,
   getFrameSeqCursor,
@@ -171,10 +172,62 @@ describe("classifyClose / nonAuthPolicyCloseInfo (§5)", () => {
     expect(nonAuthPolicyCloseInfo(0, "unauthorized_model")?.status).toBe("模型未开通");
     expect(nonAuthPolicyCloseInfo(1006, "")).toBeNull();
   });
+  test("4503 provisioning now carries a friendly closeReasonLabel too", () => {
+    const d = classifyClose(4503, JSON.stringify({ retryAfterSec: 3, reason: "provisioning" }));
+    expect(d.provisioning).toBe(true);
+    expect(d.closeReasonLabel).toContain("环境启动中");
+  });
+  test("4504 starting sets label but NOT provisioning boolean (gate is 4503-only)", () => {
+    const d = classifyClose(4504, JSON.stringify({ retryAfterSec: 3, reason: "starting" }));
+    expect(d.provisioning).toBe(false);
+    expect(d.closeReasonLabel).toContain("环境启动中");
+  });
+  test("known error reason still maps to its label", () => {
+    const d = classifyClose(4503, JSON.stringify({ retryAfterSec: 3, reason: "image_outdated" }));
+    expect(d.closeReasonLabel).toBe("运行镜像更新中，稍后自动重试");
+  });
   test("backoff 2/4/8/16/30s ladder + jitter cap", () => {
     expect(backoffDelay(0)).toBeGreaterThanOrEqual(2000);
     expect(backoffDelay(0)).toBeLessThan(3001);
     expect(backoffDelay(10)).toBeLessThan(31001); // capped 30s + jitter
+  });
+});
+
+describe("deriveConnBanner (弱网重连三态)", () => {
+  test("connected → 不显条 (null)", () => {
+    expect(
+      deriveConnBanner({ cls: "connected", label: "已连接", browserOnline: true, provisioning: false }),
+    ).toBeNull();
+  });
+  test("浏览器离线 → 「网络已断开」warning (无倒计时归因用户侧断网)", () => {
+    const b = deriveConnBanner({ cls: "disconnected", label: "离线", browserOnline: false, provisioning: false });
+    expect(b).toEqual({ tone: "warning", text: "网络已断开，恢复后自动重连" });
+  });
+  test("provisioning(在线) → 「环境启动中」info", () => {
+    const b = deriveConnBanner({
+      cls: "disconnected",
+      label: "环境启动中，正在为你准备工作区 · 3 秒后重试…",
+      browserOnline: true,
+      provisioning: true,
+    });
+    expect(b).toEqual({ tone: "info", text: "环境启动中，正在为你准备工作区…" });
+  });
+  test("服务端重连(在线,非供给) → 呈现 status.label(含 closeReasonLabel + 倒计时)", () => {
+    const b = deriveConnBanner({
+      cls: "disconnected",
+      label: "运行镜像更新中，稍后自动重试 · 8 秒后重试…",
+      browserOnline: true,
+      provisioning: false,
+    });
+    expect(b).toEqual({ tone: "warning", text: "运行镜像更新中，稍后自动重试 · 8 秒后重试…" });
+  });
+  test("connecting cls → info tone", () => {
+    const b = deriveConnBanner({ cls: "connecting", label: "连接中…", browserOnline: true, provisioning: false });
+    expect(b).toEqual({ tone: "info", text: "连接中…" });
+  });
+  test("离线优先级高于 provisioning(两者同真时归因断网)", () => {
+    const b = deriveConnBanner({ cls: "disconnected", label: "x", browserOnline: false, provisioning: true });
+    expect(b?.text).toBe("网络已断开，恢复后自动重连");
   });
 });
 

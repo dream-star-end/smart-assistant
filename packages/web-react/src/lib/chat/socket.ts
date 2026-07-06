@@ -135,6 +135,9 @@ export type ChatSnapshot = {
   status: { label: string; cls: ChatStatusClass };
   /** 容器初始化期 banner（4503 provisioning）。*/
   provisioning: boolean;
+  /** 浏览器联网态（socket 内 latched，比裸 navigator.onLine 更权威；§5 grace）。
+   *  App 三态状态条据此把「网络已断开」与「服务端重连中」区分开。*/
+  browserOnline: boolean;
   sessions: Map<string, ChatSession>;
 };
 
@@ -265,6 +268,7 @@ export class ChatSocket {
       version: 0,
       status: { label: this.statusLabel, cls: this.statusCls },
       provisioning: this.provisioning,
+      browserOnline: this.isBrowserOnline,
       sessions: this.sessions,
     };
   }
@@ -284,6 +288,7 @@ export class ChatSocket {
       version: this.version,
       status: { label: this.statusLabel, cls: this.statusCls },
       provisioning: this.provisioning,
+      browserOnline: this.isBrowserOnline,
       sessions: this.sessions,
     };
   }

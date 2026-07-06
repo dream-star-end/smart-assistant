@@ -6,6 +6,15 @@
     <meta name="theme-color" content="#ffffff" />
     <meta name="description" content="预置智能体平台 — 为每一件事，备好一位专家。开箱即用，无需挑模型、调提示词。" />
     <title>Aurora · 预置智能体平台</title>
+    <!-- PWA:可安装到主屏 / 独立窗口运行。sw.js 在 main.tsx 内按需注册(仅安全上下文+生产)。 -->
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <link rel="icon" type="image/svg+xml" href="/icons/icon.svg" />
+    <link rel="apple-touch-icon" href="/icons/apple-touch-icon.png" />
+    <!-- iOS 独立模式:全屏 + 状态栏透明(配合 viewport-fit=cover 铺满刘海/圆角安全区)。 -->
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="Aurora" />
     <script>
       try {
         var t = localStorage.getItem("oc_theme") || "system";
