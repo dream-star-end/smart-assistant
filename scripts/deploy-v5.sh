@@ -127,6 +127,10 @@ smoke() {
   done
   echo "  /healthz: $hz"
   [[ -z "$hz" ]] && { echo "✗ v5 /healthz 无响应(10 次重试后)" >&2; return 1; }
+  # 深度健康断言(fail-closed):ok=true 含 sessions.db 探活。2026-07-06 存量库
+  # schema 事故教训:进程活着但 sessions API 全 500,当时 smoke 只看有响应就放行。
+  echo "$hz" | grep -q '"ok":true' || { echo "✗ /healthz ok != true(sessions.db 探活失败?deps 见上方输出)" >&2; return 1; }
+  echo "$hz" | grep -q '"sessionsDb":"ok"' || { echo "✗ /healthz deps.sessionsDb != ok(master 形态必须带深度探活字段)" >&2; return 1; }
   # 断言 channel=v5、shared 域 mutator 静默、legacy agentRuntime disabled。
   # 注:P1+ 后 v5 跑真实 on-demand 容器(v3supervisor),containerRuntime=enabled 为正确态。
   # mutator 归属矩阵(commit c79d083e)后,v5 合法运行 v5-owned/local 域 scheduler:

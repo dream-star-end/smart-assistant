@@ -42,7 +42,7 @@ process.env.OPENCLAUDE_HOME = testHome
   legacy.close()
 }
 
-const { getSessionsDb } = await import('../sessionsDb.js')
+const { getSessionsDb, probeSessionsDb } = await import('../sessionsDb.js')
 
 describe('pending_usage_patches 存量库 migration', () => {
   it('旧 schema 库 open 不抛,列/索引补齐,旧行保留', async () => {
@@ -65,5 +65,9 @@ describe('pending_usage_patches 存量库 migration', () => {
       .get('req-legacy-1') as { cost_credits: string; parent_session_id: string | null }
     assert.equal(row.cost_credits, '42', '旧行数据应原样保留')
     assert.equal(row.parent_session_id, null, '旧行新列应回填为 NULL')
+  })
+
+  it('probeSessionsDb 好库返回 ok:true(healthz 深度探活正常路径)', async () => {
+    assert.deepEqual(await probeSessionsDb(), { ok: true })
   })
 })

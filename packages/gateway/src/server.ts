@@ -70,6 +70,7 @@ import {
   renameClientSession,
   listUnclaimedSessions,
   claimSession,
+  probeSessionsDb,
 } from '@openclaude/storage'
 import {
   filterUserVisibleAgentsForManagement,
@@ -2305,6 +2306,31 @@ export class Gateway {
       const instanceId = process.env.OC_INSTANCE_ID?.trim()
       if (instanceId) body.instance = instanceId
       if (c?.runtimeStatus) body.runtime = c.runtimeStatus
+      if (c) {
+        // master 形态深度探活:sessions.db open 失败 = 会话 list/save/落库全崩,
+        // ok 必须翻 false 让监控(断言 .ok==true)与 deploy smoke 抓到 —— 2026-07-06
+        // 存量库 schema 事故中进程活着但全站 500 两小时无告警的盲区收口。
+        // 保持 HTTP 200:深度不健康 ≠ 完全不可服务(聊天引擎/静态资源仍在跑),
+        // 不给上游 LB 摘流量的信号,只翻 ok 供告警面消费。
+        // 容器内 gateway(c 为空)不探活:HOST probe 消费 capabilities 语义,不动。
+        void probeSessionsDb()
+          .then((p) => {
+            body.deps = p.ok
+              ? { sessionsDb: 'ok' }
+              : { sessionsDb: 'error', sessionsDbError: p.error }
+            if (!p.ok) body.ok = false
+            res.writeHead(200, { 'Content-Type': 'application/json' })
+            res.end(JSON.stringify(body))
+          })
+          .catch(() => {
+            // probeSessionsDb 从不 reject;兜底防 healthz 挂起
+            body.ok = false
+            body.deps = { sessionsDb: 'error', sessionsDbError: 'probe rejected' }
+            res.writeHead(200, { 'Content-Type': 'application/json' })
+            res.end(JSON.stringify(body))
+          })
+        return
+      }
       res.writeHead(200, { 'Content-Type': 'application/json' })
       res.end(JSON.stringify(body))
       return

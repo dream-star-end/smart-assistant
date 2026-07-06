@@ -42,7 +42,7 @@ tail -f /var/log/openclaude-v5-monitor.log       # 2 分钟内应出现 "RUN ok(
 |---|---|---|---|
 | `svc_v5` | `systemctl is-active openclaude-v5` | ≠active | master 进程死 = v5 全站不可用 |
 | `svc_egress` | `systemctl is-active openclaude-v5-egress` | ≠active | LLM 出站面死 = 所有生成挂 |
-| `http_v5` | `GET 127.0.0.1:18790/healthz` | 非 `"ok":true` + `channel:"v5"` | 进程活但端口不响应/串台(channel 断言防 v3/v5 错位) |
+| `http_v5` | `GET 127.0.0.1:18790/healthz` | 非 `"ok":true` + `channel:"v5"` | 进程活但端口不响应/串台(channel 断言防 v3/v5 错位)。`ok` 含 **sessions.db 深度探活**(`deps.sessionsDb`,master 形态 open+SELECT 1):DB open 失败 = list/save/落库全崩但进程活着,2026-07-06 事故正是此形态两小时无告警;探活失败 healthz 仍回 HTTP 200(不给 LB 摘流量信号),仅 `ok:false` 供本监控与 deploy smoke 消费 |
 | `http_egress` | `GET 172.31.0.1:18892/internal/v5/egress-health` | 非 `"ok":true` + `role:"egress"` | 容器出站面探活(容器网段视角) |
 | `http_v3` | `GET 127.0.0.1:18789/healthz` | 非 `"ok":true` | 同机共库,v3 挂了殃及池鱼,同样要报 |
 | `disk_root` / `disk_var` | `df /` 与 `df /var` 使用率 | >85% | PG/docker/日志都在盘上;85% 留出扩容反应时间(线上当前 73%) |

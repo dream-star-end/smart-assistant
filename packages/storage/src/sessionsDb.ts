@@ -323,6 +323,26 @@ export async function getSessionsDb(): Promise<Database.Database> {
   return db
 }
 
+/**
+ * 健康探活:sessions.db 可开且可查。供 /healthz 深度探活 —— 2026-07-06 事故教训:
+ * getSessionsDb open 抛(存量库 schema 事故)时 list/save/server-authored 落库全体
+ * 500,而进程级 healthz 依然绿、监控两小时无告警。健康的定义收口在 storage 自己,
+ * healthz/监控只消费结果。
+ *
+ * 成功路径开销 ≈ 缓存连接上一条 SELECT 1(getSessionsDb 成功后缓存 _db),高频
+ * 探测无压力;失败路径每次重试 open,与业务 API 的失败行为一致(持续暴露 bad,
+ * 修复后自动转好)。从不 throw。
+ */
+export async function probeSessionsDb(): Promise<{ ok: true } | { ok: false; error: string }> {
+  try {
+    const db = await getSessionsDb()
+    db.prepare('SELECT 1').get()
+    return { ok: true }
+  } catch (err) {
+    return { ok: false, error: String((err as Error)?.message ?? err).slice(0, 200) }
+  }
+}
+
 export interface SessionMeta {
   id: string
   agentId: string
