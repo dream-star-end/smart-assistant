@@ -214,7 +214,7 @@ BEGIN; <迁移 SQL>; INSERT INTO schema_migrations(version, applied_at) VALUES (
 | 团队卡 server-authored 化 | 团队卡只在 IndexedDB,跨设备/清缓存必丢;正解=sink 持久化 agent-group 行,撤销 ccbMessageParser 对 Agent 卡的过时排除 | 跨设备团队历史成为需求,或下次动 server-authored 通道 |
 | hidden reviewer pipeline 硬编排 | 审查行为纯 prompt 驱动(何时审/verdict 解读/披露全是软约束),现只有次数熔断止血;正解=gateway 代码触发 review pass+结构化 verdict+落 runLog | 团队模式质量投诉,或下次改团队编排 |
 | 审查成本用户披露 | reviewer GLM turn 实扣用户钱但无提示 | 计费透明度需求 |
-| 可见性黑名单散点 | isHiddenSystemAgentId 手工插 ~15 处,新增用户面默认泄漏;正解=读 config 处统一投影"用户可见视图" | 新增任何 agent 枚举面时 |
+| ~~可见性黑名单散点~~ **已偿还**(781108ce,P2 批次1) | 权威源上移 @openclaude/protocol agentVisibility(entrypoint 编译期共享,不再手抄);枚举面统一走 `_getAgentsConfigUserView()`/`filterUserVisibleByAgentField`,判定/执行面保留全量 predicate。新增枚举面必须走投影,新增系统 agent 只改 protocol 一处 | — |
 | feat/v5-copy-no-ai | 去 AI 措辞 chore(43d0078a)基老未合 | 下次文案批次重做 |
 | oc-browser chrome 通道 | v5 已修(--browser chromium),**v3 同病未修** | v3 浏览器问题报障时 |
 | 委派上下文纯文本 | delegate 只传 goal/context 字符串,无附件/工件协议;共享容器 FS 可交接但无 prompt 教学;回传纯文本经队长转述失真 | 团队产品化(roadmap P2.2b:大产物落文件+蒸馏回传) |
