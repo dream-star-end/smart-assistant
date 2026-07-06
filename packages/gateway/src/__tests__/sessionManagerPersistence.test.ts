@@ -329,3 +329,54 @@ describe("SessionManager turn-scoped runner exits", () => {
     );
   });
 });
+
+// ── P2 债A — team-card buffer/drain (bufferPendingAgentGroup / drainPendingAgentGroups) ──
+describe("SessionManager team-card buffer (P2 债A)", () => {
+  function agentGroup(runId: string) {
+    return {
+      runId,
+      agentId: "coding-assistant",
+      goal: "子任务",
+      status: "ok" as const,
+      completedAt: 1_720_000_000_000,
+    };
+  }
+
+  test("bufferPendingAgentGroup accumulates on the parent session; returns true", () => {
+    const sm = new SessionManager(makeConfigStub());
+    const session = makeTurnSession(new FakeTurnRunner(() => {}));
+    (sm as unknown as { sessions: Map<string, AgentSession> }).sessions.set(
+      session.sessionKey,
+      session,
+    );
+    assert.equal(sm.bufferPendingAgentGroup(session.sessionKey, agentGroup("dlg-1")), true);
+    assert.equal(sm.bufferPendingAgentGroup(session.sessionKey, agentGroup("dlg-2")), true);
+    assert.equal(session._pendingAgentGroups?.length, 2, "parallel delegations accumulate");
+    assert.deepEqual(
+      session._pendingAgentGroups?.map((g) => g.runId),
+      ["dlg-1", "dlg-2"],
+    );
+  });
+
+  test("bufferPendingAgentGroup returns false when parent session is absent (graceful degrade)", () => {
+    const sm = new SessionManager(makeConfigStub());
+    assert.equal(sm.bufferPendingAgentGroup("agent:main:webchat:dm:gone", agentGroup("dlg-x")), false);
+  });
+
+  test("drainPendingAgentGroups take-and-clears (no cross-turn leak)", () => {
+    const sm = new SessionManager(makeConfigStub());
+    const session = makeTurnSession(new FakeTurnRunner(() => {}));
+    session._pendingAgentGroups = [agentGroup("dlg-1"), agentGroup("dlg-2")];
+    const first = sm.drainPendingAgentGroups(session);
+    assert.equal(first.length, 2, "drain returns buffered cards");
+    assert.equal(session._pendingAgentGroups, undefined, "buffer cleared after drain");
+    const second = sm.drainPendingAgentGroups(session);
+    assert.deepEqual(second, [], "second drain is empty — turn N cards don't leak into turn N+1");
+  });
+
+  test("drainPendingAgentGroups returns [] when nothing buffered", () => {
+    const sm = new SessionManager(makeConfigStub());
+    const session = makeTurnSession(new FakeTurnRunner(() => {}));
+    assert.deepEqual(sm.drainPendingAgentGroups(session), []);
+  });
+});

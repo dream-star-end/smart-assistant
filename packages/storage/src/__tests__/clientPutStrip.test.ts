@@ -153,6 +153,10 @@ describe('_stripClientPutMessage allow-list (T1, T2)', () => {
       _delegateAgentId: 'hidden-reviewer',
       _delegateGoal: '审查草稿',
       _delegateRunId: 'run-1',
+      // P2 债A 新增三态字段 —— 权威在 protocol TEAM_CARD_CLIENT_DISPLAY_FIELDS,
+      // strip 白名单必须同步放行(否则 server-authored 团队行经全量 PUT 后
+      // 丢掉 timeout/failed 语义)。
+      _delegateStatus: 'timeout',
       _duration: 1234,
       _resultPreview: 'PASS',
       _isError: false,
@@ -166,6 +170,7 @@ describe('_stripClientPutMessage allow-list (T1, T2)', () => {
     assert.equal(group?._delegateAgentId, 'hidden-reviewer')
     assert.equal(group?._delegateGoal, '审查草稿')
     assert.equal(group?._delegateRunId, 'run-1')
+    assert.equal(group?._delegateStatus, 'timeout')
     assert.equal(group?._resultPreview, 'PASS')
     assert.equal(group?._agentGroupOrigin, 'codex-collab')
     assert.equal(group?._teamFallback, true)

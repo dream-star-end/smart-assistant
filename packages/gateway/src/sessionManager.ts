@@ -32,6 +32,7 @@ import { eventBus, createEvent } from './eventBus.js'
 import { createLogger } from './logger.js'
 import { sendTurnWaiveBestEffort } from './masterTurnWaive.js'
 import { getV3MasterSinkOrNull, type V3MasterSinkPayload } from './v3MasterSink.js'
+import type { DurableAgentGroup } from '@openclaude/protocol'
 import { resolveExecutionModel } from './server.js'
 import {
   type ExecutionTarget,
@@ -320,6 +321,20 @@ export interface AgentSession {
   /** 本 turn 起始 ms(submit 进入执行段时打点)。idle-timeout 免单上报用它圈定
    *  master 侧退款窗口(masterTurnWaive),turn 间不清零 — 只在超时路径读。 */
   _turnStartedAtMs?: number
+  /**
+   * P2 债A — 本 turn 内已完成的委派(团队卡)server-authored durable 缓冲。
+   *
+   * 委派跑在**独立子会话**,但 agent-group 卡属于**本(队长)会话/turn**:
+   * handleDelegateTask 收尾时经 `bufferPendingAgentGroup` 按父 sessionKey 推入
+   * 这里(delegate_task 是队长工具调用,同步 await,故子委派完成必早于队长本
+   * turn 结束)。turn 收尾(persistServerAuthoredTurn 调用点)drain 本数组并清空,
+   * 随同一 POST 下发给 master 落库为 role 'agent-group' 行。
+   *
+   * 只在 webchat 队长会话上累积(buffering 走 progressTarget,webchat-only,与
+   * MASTER_SINK_PERSIST_CHANNELS 一致);嵌套 delegate / 非 webchat 父不物化本
+   * 缓冲(团队结构仍走本地 IndexedDB + delegate_progress 帧,无回归)。
+   */
+  _pendingAgentGroups?: DurableAgentGroup[]
   lock: Promise<void>
   lastUsedAt: number
   // 跨 turn 累积
@@ -539,6 +554,12 @@ function persistServerAuthoredTurn(args: {
   assistantSegments?: { index: number; text: string; ts: number }[]
   /** Fix B (2026-05-25) — same per-segment treatment for thinking rows. */
   thinkingSegments?: { index: number; text: string; ts: number }[]
+  /** P2 债A — completed delegations (team cards) for this turn, drained from
+   *  the leader session's `_pendingAgentGroups` buffer. v3 sink path forwards
+   *  to master which writes each as a server-authored `role: 'agent-group'`
+   *  row. Legacy/personal path ignores it (team cards are client-owned there;
+   *  no container→master sink). */
+  agentGroups?: DurableAgentGroup[]
 }): Promise<void> {
   const sink = getV3MasterSinkOrNull()
   if (sink) {
@@ -571,6 +592,11 @@ function persistServerAuthoredTurn(args: {
         : {}),
       ...(args.thinkingSegments && args.thinkingSegments.length > 0
         ? { thinkingSegments: args.thinkingSegments }
+        : {}),
+      // P2 债A — team cards. Forward when non-empty; master writes one
+      // server-authored `role: 'agent-group'` row per delegation.
+      ...(args.agentGroups && args.agentGroups.length > 0
+        ? { agentGroups: args.agentGroups }
         : {}),
     }
     return sink
@@ -2424,9 +2450,21 @@ export class SessionManager {
             // tool rows would only land when assistantText|thinkingText is
             // also non-empty — losing the durability fix in the rare case.
             const completedHasTools = !!result.tools && result.tools.length > 0
+            // P2 债A — drain the leader session's buffered team cards. Drained
+            // unconditionally (take-and-clear) so a completed turn never leaks
+            // its delegations into the next turn's persist, even if the persist
+            // gate below is false (non-persisting channel). Added to the gate so
+            // a delegation-only turn (leader produced no text/thinking/tools —
+            // Agent tool is excluded from tools[] by ccbMessageParser) still
+            // persists its team cards.
+            const completedAgentGroups = this.drainPendingAgentGroups(session)
+            const completedHasAgentGroups = completedAgentGroups.length > 0
             if (
               MASTER_SINK_PERSIST_CHANNELS.has(session.channel) &&
-              (completedHasAssistant || completedHasThinking || completedHasTools)
+              (completedHasAssistant ||
+                completedHasThinking ||
+                completedHasTools ||
+                completedHasAgentGroups)
             ) {
               const peerId = session.peerId
               const assistantText = result.assistantText ?? ''
@@ -2491,6 +2529,8 @@ export class SessionManager {
                 ...(result.thinkingSegments.length > 0
                   ? { thinkingSegments: result.thinkingSegments }
                   : {}),
+                // P2 债A — team cards drained above.
+                ...(completedHasAgentGroups ? { agentGroups: completedAgentGroups } : {}),
               }))
             }
 
@@ -2605,9 +2645,19 @@ export class SessionManager {
                 const hasPartialThinking =
                   !!partialThinking && partialThinking.length > 0
                 const hasPartialTools = partialTools.length > 0
+                // P2 债A — drain buffered team cards for delegations that
+                // completed before the crash/interrupt. Take-and-clear so they
+                // don't leak into the next turn; added to the gate so a leader
+                // that crashed right after delegating (no partial text/thinking/
+                // tools) still persists its team structure.
+                const partialAgentGroups = this.drainPendingAgentGroups(session)
+                const hasPartialAgentGroups = partialAgentGroups.length > 0
                 if (
                   MASTER_SINK_PERSIST_CHANNELS.has(session.channel) &&
-                  (hasPartial || hasPartialThinking || hasPartialTools)
+                  (hasPartial ||
+                    hasPartialThinking ||
+                    hasPartialTools ||
+                    hasPartialAgentGroups)
                 ) {
                   const status: 'interrupted' | 'crashed' = info.signal ? 'interrupted' : 'crashed'
                   const peerId = session.peerId
@@ -2660,6 +2710,9 @@ export class SessionManager {
                     ...(snap.thinkingSegments.length > 0
                       ? { thinkingSegments: snap.thinkingSegments }
                       : {}),
+                    // P2 债A — team cards drained above (delegations completed
+                    // before the crash/interrupt).
+                    ...(hasPartialAgentGroups ? { agentGroups: partialAgentGroups } : {}),
                   })
                 }
                 onEvent({ kind: 'error', error: reason })
@@ -2727,6 +2780,38 @@ export class SessionManager {
 
   getByKey(sessionKey: string): AgentSession | undefined {
     return this.sessions.get(sessionKey)
+  }
+
+  /**
+   * P2 债A — buffer a completed delegation (team card) onto the leader session
+   * so it drains into that session's turn-end server-authored persist.
+   *
+   * Called from `handleDelegateTask` collection at delegate完成/失败/超时 收尾,
+   * keyed by the parent (leader) sessionKey. Returns false when the parent
+   * session isn't live (raced away, or a non-webchat parent that the caller
+   * shouldn't have targeted) — the caller degrades to client-only team cards
+   * (no regression) in that case.
+   *
+   * Array.push is safe under concurrent parallel delegations (single-threaded
+   * event loop, no torn writes). The buffer is drained + cleared at turn-end
+   * (`persistServerAuthoredTurn` call sites); it only accumulates within the
+   * leader turn a delegation belongs to.
+   */
+  bufferPendingAgentGroup(parentSessionKey: string, group: DurableAgentGroup): boolean {
+    const parent = this.sessions.get(parentSessionKey)
+    if (!parent) return false
+    ;(parent._pendingAgentGroups ??= []).push(group)
+    return true
+  }
+
+  /** P2 债A — take-and-clear the leader session's buffered team cards for the
+   *  turn-end persist. Returns [] when empty. Clearing here prevents a turn's
+   *  delegations from leaking into the next turn's persist. */
+  drainPendingAgentGroups(session: AgentSession): DurableAgentGroup[] {
+    const pending = session._pendingAgentGroups
+    if (!pending || pending.length === 0) return []
+    session._pendingAgentGroups = undefined
+    return pending
   }
 
   /**

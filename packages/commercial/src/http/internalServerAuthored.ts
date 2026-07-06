@@ -110,6 +110,19 @@ const SCHEMA_TOOLS_MAX_LEN = 50;
  *  risk of legitimate turns getting 400-rejected. */
 const SCHEMA_SEGMENTS_MAX_LEN = 64;
 
+/** P2 债A — per-turn agent-group (team card) caps. A leader turn can fan out
+ *  to several delegates; 50 mirrors SCHEMA_TOOLS_MAX_LEN and is well past any
+ *  realistic team fan-out (bounded by delegate resource/concurrency gates).
+ *  resultSummary is already truncated to ≤2KB at the gateway generation point;
+ *  the schema cap here matches that budget (a few chars of headroom for the
+ *  UTF-8 truncation sentinel). goal is user/leader-authored intent text —
+ *  cap at 4KB so an unusually verbose delegation goal doesn't 400 the turn. */
+const SCHEMA_AGENT_GROUPS_MAX_LEN = 50;
+const SCHEMA_AGENT_GROUP_RESULT_MAX_CHARS = 2 * 1024;
+const SCHEMA_AGENT_GROUP_GOAL_MAX_CHARS = 4 * 1024;
+const SCHEMA_AGENT_GROUP_RUNID_MAX_CHARS = 128;
+const SCHEMA_AGENT_GROUP_AGENTID_MAX_CHARS = 128;
+
 /** One completed tool call within the turn. Mirrors the gateway-side
  *  `TurnToolEntry` shape. Master persists each as a server-authored row
  *  with `role: 'tool'`, sandwiched between thinking and assistant by ts. */
@@ -158,6 +171,35 @@ const ToolEntrySchema = z
     },
     { message: "inputJson exceeds size cap or is unserializable", path: ["inputJson"] },
   );
+
+/** P2 债A — one completed delegation (team card) within the leader turn.
+ *  Mirrors the gateway-side `DurableAgentGroup` wire shape
+ *  (@openclaude/protocol teamCards.ts). Master persists each as a
+ *  server-authored row with `role: 'agent-group'`, mapping the wire fields to
+ *  the client display field names (`_delegateRunId` / `_delegateAgentId` /
+ *  `_delegateGoal` / `_resultPreview` / `_delegateStatus` / `_isError`).
+ *  ts = completedAt (real wall-clock) so it interleaves inside the turn.
+ *
+ *  Charsets: `runId` is embedded into the persisted messageId
+ *  (`srv-…-agentgroup-${runId}`) so it must stay URL/log safe and bounded,
+ *  same rationale as the top-level agentId. `agentId` is display-only (not in
+ *  the id) so its charset is looser to accommodate v5 marketplace agent ids. */
+const AgentGroupEntrySchema = z
+  .object({
+    runId: z
+      .string()
+      .min(1)
+      .max(SCHEMA_AGENT_GROUP_RUNID_MAX_CHARS)
+      .regex(/^[A-Za-z0-9_-]+$/, {
+        message: "runId must match [A-Za-z0-9_-]{1,128}",
+      }),
+    agentId: z.string().min(1).max(SCHEMA_AGENT_GROUP_AGENTID_MAX_CHARS),
+    goal: z.string().max(SCHEMA_AGENT_GROUP_GOAL_MAX_CHARS),
+    status: z.enum(["ok", "failed", "timeout"]),
+    resultSummary: z.string().max(SCHEMA_AGENT_GROUP_RESULT_MAX_CHARS).optional(),
+    completedAt: z.number().int().positive(),
+  })
+  .strict();
 
 /** Request body — strict, unknown keys rejected. peerId / userId / id / role
  *  are NOT accepted from the wire to keep the trust boundary tight.
@@ -298,6 +340,17 @@ const BodySchema = z
       )
       .max(SCHEMA_SEGMENTS_MAX_LEN)
       .optional(),
+    /** P2 债A — completed delegations for this leader turn. Each persists as a
+     *  server-authored `role: 'agent-group'` row (team card). Buffered on the
+     *  parent session as delegates finish and drained with the turn-end
+     *  persist. Included in the refine below as a content field: a
+     *  delegation-only turn (leader crashed/interrupted after delegating,
+     *  before producing text) must still persist its team cards rather than
+     *  400-drop the whole POST. */
+    agentGroups: z
+      .array(AgentGroupEntrySchema)
+      .max(SCHEMA_AGENT_GROUPS_MAX_LEN)
+      .optional(),
   })
   .strict()
   .refine(
@@ -306,10 +359,11 @@ const BodySchema = z
       v.thinkingText !== undefined ||
       (v.tools !== undefined && v.tools.length > 0) ||
       (v.assistantSegments !== undefined && v.assistantSegments.length > 0) ||
-      (v.thinkingSegments !== undefined && v.thinkingSegments.length > 0),
+      (v.thinkingSegments !== undefined && v.thinkingSegments.length > 0) ||
+      (v.agentGroups !== undefined && v.agentGroups.length > 0),
     {
       message:
-        "either text, thinkingText, tools[], assistantSegments[], or thinkingSegments[] must be non-empty",
+        "either text, thinkingText, tools[], assistantSegments[], thinkingSegments[], or agentGroups[] must be non-empty",
     },
   );
 
@@ -326,7 +380,7 @@ export type ServerAuthoredMessageInput = {
   /** 'thinking' for Phase 0.4 reasoning persistence; 'assistant' for the
    *  user-visible turn text; 'tool' for refresh-durable tool details
    *  (Phase 1 — replaces the ephemeral client-stripped tool rows). */
-  role: "assistant" | "thinking" | "tool";
+  role: "assistant" | "thinking" | "tool" | "agent-group";
   text: string;
   ts: number;
   status: "completed" | "interrupted" | "crashed";
@@ -363,6 +417,22 @@ export type ServerAuthoredMessageInput = {
   inputTruncated?: boolean;
   outputTruncated?: boolean;
   _completed?: boolean;
+  // ── role: 'agent-group' fields (P2 债A team card) ───────────────────
+  // Field names reuse the client display names authored in
+  // @openclaude/protocol teamCards.ts TEAM_CARD_CLIENT_DISPLAY_FIELDS so the
+  // server row renders through the frontend's existing AgentGroupCard/
+  // TeamPanel readers with no client changes on the shared fields. `_delegate`
+  // marks it a delegate_task card; `_delegateRunId` is the runId dedupe key;
+  // `_delegateStatus` carries the ok/failed/timeout tristate (NEW field) while
+  // `_isError` keeps the legacy boolean the current UI reads.
+  _delegate?: boolean;
+  _delegateRunId?: string;
+  _delegateAgentId?: string;
+  _delegateGoal?: string;
+  _delegateStatus?: "ok" | "failed" | "timeout";
+  _resultPreview?: string;
+  _isError?: boolean;
+  completedAt?: number;
 };
 
 export type ServerAuthoredStorageResult = {
@@ -787,13 +857,102 @@ export function makeServerAuthoredHandler(
       }
     };
 
-    // ── Branch A: no-assistant path — thinking-only, tools-only, or both ──
+    // ── Write agent-group (team card) rows — P2 债A ──
     //
-    // HTTP outcome priority:
-    //   hasThinking → thinking decides HTTP, tools are best-effort.
-    //   tools-only  → first tool decides HTTP, remaining tools best-effort.
+    // Each completed delegation persists as a server-authored
+    // `role: 'agent-group'` row with a stable per-(turn,run) id
+    // `srv-${idPart}-t${turnIndex}-agentgroup-${runId}` (runId is
+    // per-delegation unique → idempotent on sink retry). ts = completedAt
+    // (the delegate's real completion wall-clock) so the card interleaves
+    // inside the turn's thinking/tool/assistant rows by the same ts-sort.
+    // Wire fields map to the client display names (see AgentGroupEntrySchema)
+    // so the row renders through the frontend's existing AgentGroupCard /
+    // TeamPanel readers. Storage's `mergePreservingServerAuthored` applies
+    // agent-group **local-wins** (a same-runId client `m-*` row keeps its
+    // childBlocks tree and this server row is dropped) — this row is what
+    // fills the durability gap when the client row is absent (cross-device /
+    // cleared cache / client PUT never landed). All writes are best-effort
+    // EXCEPT the agentGroups-only path (Branch A) where the first row's
+    // outcome decides HTTP, mirroring the tools-only treatment.
+    const agentGroups = body.agentGroups ?? [];
+    const agentGroupsCount = agentGroups.length;
+    const hasAgentGroups = agentGroupsCount > 0;
+    const agentGroupResults: (StorageResult | null)[] = new Array(agentGroupsCount).fill(null);
+    const agentGroupThrew: boolean[] = new Array(agentGroupsCount).fill(false);
+    for (let i = 0; i < agentGroupsCount; i++) {
+      const ag = agentGroups[i]!;
+      const agMessageId = `srv-${idPart}-t${body.turnIndex}-agentgroup-${ag.runId}`;
+      try {
+        agentGroupResults[i] = await deps.storage.appendServerAuthoredMessage(
+          body.sessionId,
+          userId,
+          {
+            id: agMessageId,
+            role: "agent-group",
+            // `text` carries the goal so legacy renderers reading msg.text (and
+            // AgentGroupCard's `{msg.text || "子任务"}`) show the delegation goal.
+            text: ag.goal,
+            ts: ag.completedAt,
+            status: body.status,
+            _delegate: true,
+            _delegateRunId: ag.runId,
+            _delegateAgentId: ag.agentId,
+            _delegateGoal: ag.goal,
+            // Tristate (NEW display field) + legacy boolean the current UI reads.
+            _delegateStatus: ag.status,
+            _isError: ag.status !== "ok",
+            _completed: true,
+            completedAt: ag.completedAt,
+            ...(ag.resultSummary !== undefined
+              ? { _resultPreview: ag.resultSummary }
+              : {}),
+          },
+        );
+      } catch (err) {
+        agentGroupThrew[i] = true;
+        userLog.error("agent_group_storage_threw", {
+          sessionId: body.sessionId,
+          turnIndex: body.turnIndex,
+          runId: ag.runId,
+          delegateAgentId: ag.agentId,
+          err: err as Error,
+        });
+      }
+    }
+
+    // Emit per-agent-group metrics exactly once, inline (agent-group rows are
+    // best-effort in every terminal path except agentGroups-only, where the
+    // HTTP outcome is derived from the same results without re-emitting).
+    for (let i = 0; i < agentGroupsCount; i++) {
+      if (agentGroupThrew[i]) {
+        metric("error", "agent-group");
+        continue;
+      }
+      const r = agentGroupResults[i];
+      if (!r) {
+        metric("error", "agent-group");
+        continue;
+      }
+      if (r.applied) metric("ok", "agent-group");
+      else if (r.reason === "already_exists") metric("deduped", "agent-group");
+      else if (r.reason === "session_not_found")
+        metric("reject_session_missing", "agent-group");
+      else if (r.reason === "session_deleted")
+        metric("reject_session_deleted", "agent-group");
+      else if (r.reason === "oversized")
+        metric("reject_oversized", "agent-group");
+      else metric("error", "agent-group"); // malformed
+    }
+
+    // ── Branch A: no-assistant path — thinking-only, tools-only,
+    //    agentGroups-only, or a mix ──
+    //
+    // HTTP outcome priority (highest-priority present content decides):
+    //   hasThinking      → thinking decides HTTP; tools/agentGroups best-effort.
+    //   tools-only       → first tool decides HTTP; agentGroups best-effort.
+    //   agentGroups-only → first agent-group decides HTTP.
     if (!hasAssistant) {
-      // Schema refine guarantees hasThinking || hasTools here.
+      // Schema refine guarantees hasThinking || hasTools || hasAgentGroups here.
       if (hasThinking) {
         // Fix B — emit per-segment metrics for non-last thinking writes
         // first (they're best-effort under the segment path); the last
@@ -913,7 +1072,9 @@ export function makeServerAuthoredHandler(
 
       // tools-only path — first tool's outcome decides HTTP. Remaining
       // tools' outcomes are still emitted via emitToolsMetric (which
-      // covers index 0 too — counted exactly once).
+      // covers index 0 too — counted exactly once). agentGroups (if any) are
+      // best-effort here (metrics already emitted inline above).
+      if (hasTools) {
       if (toolThrew[0]) {
         emitToolsMetric();
         sendJsonError(
@@ -995,6 +1156,81 @@ export function makeServerAuthoredHandler(
         requestId,
       );
       return;
+      } else {
+        // agentGroups-only path — no assistant, no thinking, no tools (leader
+        // crashed/interrupted after delegating, before producing text). Schema
+        // refine guarantees hasAgentGroups here. First agent-group's outcome
+        // decides HTTP; metrics already emitted inline above.
+        if (agentGroupThrew[0]) {
+          sendJsonError(res, 500, "STORAGE_ERROR", "storage write failed", requestId);
+          return;
+        }
+        const ag0 = agentGroupResults[0]!;
+        if (ag0.applied || ag0.reason === "already_exists") {
+          sendJsonOk(
+            res,
+            200,
+            ag0.applied ? { ok: true } : { ok: true, idempotent: true },
+            requestId,
+          );
+          return;
+        }
+        if (ag0.reason === "session_not_found") {
+          userLog.info("agent_group_only_session_not_found", {
+            sessionId: body.sessionId,
+            turnIndex: body.turnIndex,
+          });
+          sendJsonError(
+            res,
+            404,
+            "SESSION_NOT_FOUND",
+            "no client_sessions row for sessionId+userId",
+            requestId,
+          );
+          return;
+        }
+        if (ag0.reason === "session_deleted") {
+          userLog.info("agent_group_only_session_deleted", {
+            sessionId: body.sessionId,
+            turnIndex: body.turnIndex,
+          });
+          sendJsonError(
+            res,
+            410,
+            "SESSION_DELETED",
+            "client_sessions row is soft-deleted",
+            requestId,
+          );
+          return;
+        }
+        if (ag0.reason === "oversized") {
+          userLog.warn("agent_group_only_session_oversized", {
+            sessionId: body.sessionId,
+            turnIndex: body.turnIndex,
+          });
+          sendJsonError(
+            res,
+            413,
+            "SESSION_OVERSIZED",
+            "client_sessions row exceeds MAX_SESSION_BYTES; admin must strip before further writes",
+            requestId,
+          );
+          return;
+        }
+        // malformed
+        userLog.error("master_row_malformed_agent_group", {
+          sessionId: body.sessionId,
+          turnIndex: body.turnIndex,
+        });
+        sendJsonError(
+          res,
+          500,
+          "ROW_MALFORMED",
+          "master row data corrupt",
+          requestId,
+        );
+        return;
+      }
     }
 
     // ── Branch B: has assistant (with optional thinking) ──
