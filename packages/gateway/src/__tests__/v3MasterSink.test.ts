@@ -719,3 +719,110 @@ describe("V3MasterSink module singleton", () => {
     assert.equal(getV3MasterSinkOrNull(), null);
   });
 });
+
+// ── P2 债A — agentGroups[] serialization + body-cap drop ordering ──────────
+// Drop cascade order (least→most valuable): tools[] → thinking → agentGroups[]
+// → (fatal on assistant). agentGroups carries the cross-device team structure
+// (the whole point of 债A), so it's the LAST non-assistant artifact dropped —
+// but still yields to the assistant 正文. These tests pin that ordering so a
+// future cap refactor can't silently invert it.
+describe("attemptSend — agentGroups[] body cap ordering (P2 债A)", () => {
+  function makeCapturingFetcher(): {
+    fetcher: typeof import("undici").request;
+    captures: Array<{ url: string; body: string }>;
+  } {
+    const captures: Array<{ url: string; body: string }> = [];
+    const fn = async (url: string, init: any) => {
+      captures.push({ url, body: typeof init?.body === "string" ? init.body : "" });
+      return {
+        statusCode: 200, headers: {}, trailers: {}, opaque: undefined, context: {},
+        body: {
+          async *[Symbol.asyncIterator]() { yield Buffer.from('{"ok":true}', "utf8"); },
+          text: async () => '{"ok":true}',
+        } as any,
+      };
+    };
+    return { fetcher: fn as unknown as typeof import("undici").request, captures };
+  }
+  function ag(runId: string, summaryKb: number): import("@openclaude/protocol").DurableAgentGroup {
+    return {
+      runId,
+      agentId: "coding-assistant",
+      goal: "子任务",
+      status: "ok",
+      completedAt: 1_720_000_000_000,
+      ...(summaryKb > 0 ? { resultSummary: "s".repeat(summaryKb * 1024) } : {}),
+    };
+  }
+  function tinyTool(blockId: string): import("../ccbMessageParser.js").TurnToolEntry {
+    return {
+      toolUseId: blockId, blockId, toolName: "Bash",
+      inputJson: { cmd: "x" }, inputPreview: "x", output: "y",
+      isError: false, durationMs: 1, ts: 1_000_000, arrivedAt: 1_000_000,
+    };
+  }
+
+  test("under-cap agentGroups forwarded as-is; absent → key omitted", async () => {
+    const { fetcher, captures } = makeCapturingFetcher();
+    await attemptSend({ ...PAYLOAD, text: "answer", agentGroups: [ag("dlg-1", 0)] }, { config: CFG, fetcher });
+    const sent = JSON.parse(captures[0].body) as Record<string, unknown>;
+    assert.ok(Array.isArray(sent.agentGroups));
+    assert.equal((sent.agentGroups as unknown[]).length, 1);
+
+    const { fetcher: f2, captures: c2 } = makeCapturingFetcher();
+    await attemptSend({ ...PAYLOAD, text: "answer" }, { config: CFG, fetcher: f2 });
+    assert.equal("agentGroups" in (JSON.parse(c2[0].body) as Record<string, unknown>), false);
+  });
+
+  test("assistant + big agentGroups over cap → agentGroups dropped, assistant preserved", async () => {
+    const { fetcher, captures } = makeCapturingFetcher();
+    const payload: V3MasterSinkPayload = {
+      ...PAYLOAD,
+      text: "x".repeat(200 * 1024),
+      agentGroups: [ag("dlg-big", 80)], // pushes combined over 256 KB
+    };
+    await attemptSend(payload, { config: CFG, fetcher });
+    const sent = JSON.parse(captures[0].body) as Record<string, unknown>;
+    assert.equal(sent.text, "x".repeat(200 * 1024), "assistant 正文 preserved");
+    assert.equal("agentGroups" in sent, false, "agentGroups dropped to fit cap");
+  });
+
+  test("dropping thinking alone suffices → agentGroups PRESERVED (thinking dropped before agentGroups)", async () => {
+    const { fetcher, captures } = makeCapturingFetcher();
+    const payload: V3MasterSinkPayload = {
+      ...PAYLOAD,
+      text: "x".repeat(200 * 1024),
+      thinkingText: "y".repeat(80 * 1024), // dropping this alone brings under cap
+      agentGroups: [ag("dlg-keep", 2)],
+    };
+    await attemptSend(payload, { config: CFG, fetcher });
+    const sent = JSON.parse(captures[0].body) as Record<string, unknown>;
+    assert.equal(sent.thinkingText, undefined, "thinking dropped first");
+    assert.ok(Array.isArray(sent.agentGroups), "agentGroups preserved (more valuable than thinking)");
+    assert.equal(sent.text, "x".repeat(200 * 1024));
+  });
+
+  test("dropping tools alone suffices → agentGroups PRESERVED (tools dropped before agentGroups)", async () => {
+    const { fetcher, captures } = makeCapturingFetcher();
+    const payload: V3MasterSinkPayload = {
+      ...PAYLOAD,
+      text: "x".repeat(200 * 1024),
+      // one big tool ~80 KB; dropping it brings under cap
+      tools: [{ ...tinyTool("blk-big"), output: "y".repeat(80 * 1024) }],
+      agentGroups: [ag("dlg-keep", 2)],
+    };
+    await attemptSend(payload, { config: CFG, fetcher });
+    const sent = JSON.parse(captures[0].body) as Record<string, unknown>;
+    assert.equal("tools" in sent, false, "tools dropped first");
+    assert.ok(Array.isArray(sent.agentGroups), "agentGroups preserved (more valuable than tools)");
+  });
+
+  test("count > MAX_AGENT_GROUPS_PER_PAYLOAD → agentGroups dropped, assistant preserved", async () => {
+    const { fetcher, captures } = makeCapturingFetcher();
+    const many = Array.from({ length: 51 }, (_, i) => ag(`dlg-${i}`, 0));
+    await attemptSend({ ...PAYLOAD, text: "answer", agentGroups: many }, { config: CFG, fetcher });
+    const sent = JSON.parse(captures[0].body) as Record<string, unknown>;
+    assert.equal("agentGroups" in sent, false, "over count cap → dropped (best-effort)");
+    assert.equal(sent.text, "answer", "assistant preserved");
+  });
+});

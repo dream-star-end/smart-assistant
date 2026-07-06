@@ -111,25 +111,54 @@ type RenderItem =
   | { kind: "team"; members: ChatMessage[]; sig: string };
 
 /**
- * 把渲染切片里**连续的 agent-group 消息**(队长同一轮并行委派的多个智能体)聚成一个
- * 团队项(≥2 个 → TeamPanel);单个委派退化为原 AgentGroupCard(走 MessageRenderer)。
- * 团队 sig = 各成员 messageSignature 拼接(任一成员变 → 面板重渲,防闪)。
+ * 把「队长同一轮委派的多个 agent-group」聚成一个团队项(≥2 → TeamPanel;单个退化回
+ * AgentGroupCard)。团队 sig = 各成员 messageSignature 拼接(任一成员变 → 面板重渲,防闪)。
+ *
+ * **按 turn 锚点归组**(取代旧"相邻连续行"启发式):一行的 turn 锚点 = 其前最近一条 user
+ * 消息的下标——与 turnSegment.currentTurnStartIndex 同一"轮"定义(user 消息是唯一 turn
+ * 边界,且 user 行客户端权威、server 从不以另一 id 重写/重排,是最稳定的归属标识)。同一
+ * turn 的 agent-group 归一个面板,穿插的非 agent-group/非 user 行(队长文本、工具调用、
+ * server-authored 与本地行混排)不再劈裂面板;新一轮 user 提问后的委派天然落到新锚点 →
+ * 独立面板。无 user 消息(cron 会话)时全部锚点 = -1,归一段。
+ *
+ * 锚点用**完整 messages**(非仅渲染切片)计算:切片起点可能落在某轮中段,靠全量数组才能
+ * 找到该轮真正的 user 边界。面板渲染在该轮**首个** agent-group 的位置,后续同轮成员被吸收;
+ * 夹在成员之间的非 agent-group 行仍按各自位置渲染(可能落到面板之后,属可接受的次序取舍)。
  */
-function coalesceTeam(
-  slice: ChatMessage[],
-  start: number,
-  total: number,
-  sending: boolean,
-): RenderItem[] {
+function coalesceTeam(messages: ChatMessage[], start: number, sending: boolean): RenderItem[] {
+  const total = messages.length;
+  const slice = messages.slice(start);
+  // 全量前缀扫描:anchorOf[i] = 第 i 行之前(含自身若为 user)最近的 user 下标,无则 -1。
+  const anchorOf: number[] = new Array(total);
+  let lastUser = -1;
+  for (let i = 0; i < total; i++) {
+    if (messages[i]?.role === "user") lastUser = i;
+    anchorOf[i] = lastUser;
+  }
+  // 每个锚点在**渲染切片内**的 agent-group 计数(≥2 才成团;切片外成员不计入本屏面板)。
+  const teamCount = new Map<number, number>();
+  for (let i = 0; i < slice.length; i++) {
+    if (messageKind(slice[i]) === "agent-group") {
+      const a = anchorOf[start + i];
+      teamCount.set(a, (teamCount.get(a) ?? 0) + 1);
+    }
+  }
   const items: RenderItem[] = [];
+  const emittedTeam = new Set<number>();
   for (let i = 0; i < slice.length; i++) {
     const m = slice[i];
+    const absIdx = start + i;
     if (messageKind(m) === "agent-group") {
-      const members: ChatMessage[] = [m];
-      while (i + 1 < slice.length && messageKind(slice[i + 1]) === "agent-group") {
-        members.push(slice[++i]);
-      }
-      if (members.length >= 2) {
+      const anchor = anchorOf[absIdx];
+      if ((teamCount.get(anchor) ?? 0) >= 2) {
+        if (emittedTeam.has(anchor)) continue; // 已并入该轮面板 → 吸收跳过
+        emittedTeam.add(anchor);
+        const members: ChatMessage[] = [];
+        for (let j = 0; j < slice.length; j++) {
+          if (messageKind(slice[j]) === "agent-group" && anchorOf[start + j] === anchor) {
+            members.push(slice[j]);
+          }
+        }
         items.push({
           kind: "team",
           members,
@@ -137,10 +166,10 @@ function coalesceTeam(
         });
         continue;
       }
-      items.push({ kind: "single", m: members[0], isLast: start + i === total - 1, idx: start + i });
+      items.push({ kind: "single", m, isLast: absIdx === total - 1, idx: absIdx });
       continue;
     }
-    items.push({ kind: "single", m, isLast: start + i === total - 1, idx: start + i });
+    items.push({ kind: "single", m, isLast: absIdx === total - 1, idx: absIdx });
   }
   return items;
 }
@@ -166,7 +195,6 @@ export function MessageList({
   const [visible, setVisible] = useState(LOAD_MORE_STEP);
   const total = messages.length;
   const start = Math.max(0, total - visible);
-  const slice = messages.slice(start);
   const last = messages[total - 1];
   // 当前活跃段起点(最后一条 user 消息之后)——TodoWrite/plan 的 HUD 抑制只作用于该段,
   // 与 PinnedTaskTracker 的任务源提取共用 turnSegment.ts 同一判定。
@@ -193,7 +221,7 @@ export function MessageList({
       )}
       {/* 每条消息(含团队面板)外包一层 MessageBoundary:单条渲染抛异常只降级该条,
           不让 React 卸载整棵树白屏。key 稳定在 boundary 上;memo 比较仍由内层组件承担。 */}
-      {coalesceTeam(slice, start, total, sending).map((it) => {
+      {coalesceTeam(messages, start, sending).map((it) => {
         if (it.kind === "team") {
           return (
             <MessageBoundary key={it.members[0].id} messageId={it.members[0].id} sig={it.sig}>

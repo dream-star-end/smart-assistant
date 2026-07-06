@@ -465,7 +465,7 @@ export type V3SinkPersistOutcome =
   | "reject_bad_body"
   | "error";
 
-export type V3SinkPersistRole = "thinking" | "assistant" | "tool";
+export type V3SinkPersistRole = "thinking" | "assistant" | "tool" | "agent-group";
 
 /** Increment v3 sink persist counter.
  *

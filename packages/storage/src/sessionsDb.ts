@@ -863,6 +863,21 @@ export function _stripClientPutMessages(messages: readonly unknown[]): MessageLi
  *      rule the user sees doubled tool cards on refresh — one rich, one
  *      bare. Tools inside `childBlocks` (subagent tools, Phase 2) are
  *      untouched because they are nested, not top-level merged[] entries.
+ *   7. **Agent-group local-wins dedupe** (P2 债A, team-card server-authored):
+ *      client and server both hold `role: 'agent-group'` rows for the same
+ *      delegation, keyed by runId (client `m-*` row carries `_delegateRunId`;
+ *      server `srv-*` row is written by `appendServerAuthoredMessage` with the
+ *      same `_delegateRunId`). Unlike rules 3/6 (server-wins for assistant/
+ *      thinking/tool), agent-group is **local-wins**: when a same-runId client
+ *      row exists in the turn group we DROP the server row and keep the client
+ *      one, because the client row owns the rich `childBlocks` subagent tree
+ *      (text/thinking/tool) that the server row (summary skeleton only) lacks.
+ *      The server row renders ONLY when the client row is absent (cross-device
+ *      / cleared cache / client PUT never landed), filling the durability gap.
+ *      This is the storage-side of the 2c73030d regression guard: a server row
+ *      must never overwrite/swallow a local agent-group's childBlocks. (The
+ *      id-level takeover in `appendServerAuthoredPure` is already structurally
+ *      safe here — `srv-*` and `m-*` ids never collide, so no takeover fires.)
  */
 export function mergePreservingServerAuthored<T extends MessageLike>(
   serverSideMsgs: readonly T[],
@@ -927,6 +942,15 @@ export function mergePreservingServerAuthored<T extends MessageLike>(
   const isAssistant = (m: T) => (m as { role?: string }).role === 'assistant'
   const isThinking = (m: T) => (m as { role?: string }).role === 'thinking'
   const isTool = (m: T) => (m as { role?: string }).role === 'tool'
+  const isAgentGroup = (m: T) => (m as { role?: string }).role === 'agent-group'
+  /** agent-group 去重合并键(P2 债A):优先读既有 `_delegateRunId`(前端 agent-group
+   *  行实际承载的 run 键),兼容顶层 `runId`。null = 无键(不参与 runId 折叠)。 */
+  const agentGroupRunId = (m: T): string | null => {
+    const r = m as { _delegateRunId?: unknown; runId?: unknown }
+    if (typeof r._delegateRunId === 'string' && r._delegateRunId.length > 0) return r._delegateRunId
+    if (typeof r.runId === 'string' && r.runId.length > 0) return r.runId
+    return null
+  }
   const isTurnBoundary = (m: T) => {
     const role = (m as { role?: string }).role
     return role === 'user' || role === 'system'
@@ -938,10 +962,15 @@ export function mergePreservingServerAuthored<T extends MessageLike>(
   const groupHasServerAsst: boolean[] = []
   const groupHasServerThinking: boolean[] = []
   const groupServerToolBlockIds: Array<Set<string>> = []
+  // P2 债A — 每组内**本地(非 server)**agent-group 行携带的 runId 集合。第二遍
+  // 据此把同 runId 的 server agent-group 行丢掉(local-wins:本地 m-* 富行带
+  // childBlocks 子树,server srv-* 行只有骨架摘要,禁止 server 行覆盖/吞子树)。
+  const groupClientAgentGroupRunIds: Array<Set<string>> = []
   let groupId = 0
   let curGroupServerAsst = false
   let curGroupServerThinking = false
   let curGroupServerToolBlockIds = new Set<string>()
+  let curGroupClientAgentGroupRunIds = new Set<string>()
   for (let i = 0; i < merged.length; i++) {
     const cur = merged[i]
     if (cur && isTurnBoundary(cur)) {
@@ -949,10 +978,12 @@ export function mergePreservingServerAuthored<T extends MessageLike>(
       groupHasServerAsst.push(curGroupServerAsst)
       groupHasServerThinking.push(curGroupServerThinking)
       groupServerToolBlockIds.push(curGroupServerToolBlockIds)
+      groupClientAgentGroupRunIds.push(curGroupClientAgentGroupRunIds)
       groupId++
       curGroupServerAsst = false
       curGroupServerThinking = false
       curGroupServerToolBlockIds = new Set<string>()
+      curGroupClientAgentGroupRunIds = new Set<string>()
     }
     turnGroup[i] = groupId
     if (cur && cur._source === 'server') {
@@ -964,16 +995,39 @@ export function mergePreservingServerAuthored<T extends MessageLike>(
           curGroupServerToolBlockIds.add(bid)
         }
       }
+    } else if (cur && isAgentGroup(cur)) {
+      // Non-server (client m-*) agent-group row — record its runId so the
+      // matching server srv-* row is dropped in the second pass.
+      const rid = agentGroupRunId(cur)
+      if (rid !== null) curGroupClientAgentGroupRunIds.add(rid)
     }
   }
   groupHasServerAsst.push(curGroupServerAsst)
   groupHasServerThinking.push(curGroupServerThinking)
   groupServerToolBlockIds.push(curGroupServerToolBlockIds)
+  groupClientAgentGroupRunIds.push(curGroupClientAgentGroupRunIds)
 
   for (let i = 0; i < merged.length; i++) {
     const cur = merged[i]
     if (!cur) { deduped.push(cur); continue }
+    const g = turnGroup[i]
+    // P2 债A — agent-group **local-wins**(与 assistant/thinking/tool 的
+    // server-wins 相反):当同组内存在同 runId 的本地 client agent-group 行时,
+    // 丢弃 server 行,保留本地富行(childBlocks 子树)。server 行只在本地行缺席
+    // (跨设备 / 清缓存 / 客户端 PUT 未落)时渲染,补齐团队历史。这条必须在下面
+    // "无条件保留 server 行"分支之前拦截,否则 server 行会与本地行重复出卡
+    // (2c73030d:禁止 role-mismatch server-wins 吞掉本地 agent-group 子树)。
+    if (cur._source === 'server' && isAgentGroup(cur)) {
+      const rid = agentGroupRunId(cur)
+      if (rid !== null && groupClientAgentGroupRunIds[g].has(rid)) {
+        continue // local rich row supersedes → drop server row
+      }
+      deduped.push(cur)
+      continue
+    }
     // Keep server-authored messages and non-(assistant|thinking|tool) messages.
+    // (Client agent-group rows fall here — always preserved, never deduped by
+    //  the server; the server row is what gives way, handled above.)
     if (
       cur._source === 'server' ||
       (!isAssistant(cur) && !isThinking(cur) && !isTool(cur))
@@ -981,7 +1035,6 @@ export function mergePreservingServerAuthored<T extends MessageLike>(
       deduped.push(cur)
       continue
     }
-    const g = turnGroup[i]
     if (isAssistant(cur) && groupHasServerAsst[g]) continue
     if (isThinking(cur) && groupHasServerThinking[g]) continue
     if (isTool(cur)) {
@@ -1541,8 +1594,13 @@ export async function appendServerAuthoredMessage(
     /** 'thinking' added to support v3 server-authored thinking persistence
      *  (mobile-stream durability for Sonnet 4.6 adaptive thinking). Same
      *  storage path as 'assistant'; phantom-dedupe applies independently
-     *  to each role inside `mergePreservingServerAuthored`. */
-    role: 'assistant' | 'user' | 'system' | 'thinking' | 'tool'
+     *  to each role inside `mergePreservingServerAuthored`.
+     *
+     *  'agent-group' (P2 债A):server-authored 团队卡。落库路径与其它 role 相同,
+     *  但 `mergePreservingServerAuthored` 对它做 **local-wins**(与 assistant/
+     *  thinking/tool 的 server-wins 相反)—— 本地 `m-*` 富行(带 childBlocks 子树)
+     *  存在时丢弃 server `srv-*` 行,禁止 server 行吞掉子树(2c73030d 回归)。 */
+    role: 'assistant' | 'user' | 'system' | 'thinking' | 'tool' | 'agent-group'
     text?: string
     ts?: number
     [k: string]: unknown

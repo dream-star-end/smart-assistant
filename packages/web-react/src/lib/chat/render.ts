@@ -145,6 +145,8 @@ export function messageSignature(
         m._teamFallback ? 1 : 0,
         m._completed ? 1 : 0,
         m._isError ? 1 : 0,
+        // 终态三态(server 行区分超时):变则徽记要重渲。
+        m._delegateStatus ?? "",
         m._duration ?? 0,
         m._resultPreview ? m._resultPreview.length : 0,
         m._delegate ? 1 : 0,
@@ -168,6 +170,19 @@ export function messageSignature(
     default:
       return [head, textSig(m.text)].join("|");
   }
+}
+
+/**
+ * agent-group / 团队队员的**终态徽记**(单一权威,AgentGroupCard 与 TeamPanel 共用)。
+ * 三态优先看 server-authored 行的 `_delegateStatus`(区分超时),缺省回退本地富卡的 `_isError`
+ * 两态。仅在非运行态(已完成 / server 骨架)使用——运行态由调用方单独渲染"运行中"。
+ */
+export function agentTerminalStatus(
+  m: Pick<ChatMessage, "_isError" | "_delegateStatus">,
+): { label: string; tone: "success" | "danger" | "warning" } {
+  if (m._delegateStatus === "timeout") return { label: "超时", tone: "warning" };
+  if (m._isError || m._delegateStatus === "failed") return { label: "失败", tone: "danger" };
+  return { label: "完成", tone: "success" };
 }
 
 /**
