@@ -41,12 +41,16 @@ type RendererProps = {
   /** 是否属于「当前活跃段」(最后一条 user 消息之后)。判定收口在 chat/turnSegment.ts,
    *  与 PinnedTaskTracker 的任务源提取共用同一函数——决定 TodoWrite/plan 抑制还是渲染只读卡。*/
   inActiveTurn: boolean;
+  /** 债D:agent-group 单卡(未成团的退化委派)本 turn 的委派成本(十进制大数字符串)。
+   *  来自队长助手行 usage.delegates,按 _delegateAgentId 匹配;非 agent-group 行恒 undefined。
+   *  值来自**别的行**(助手行)故不在 message sig 内,单列进 memo 比较器,成本后到时正常重渲。*/
+  delegateCost?: string;
   cb: CardCallbacks;
   onRespondPermission: PermissionRespond;
 };
 
 export const MessageRenderer = memo(
-  function MessageRenderer({ message, isLast, sending, inActiveTurn, cb, onRespondPermission }: RendererProps) {
+  function MessageRenderer({ message, isLast, sending, inActiveTurn, delegateCost, cb, onRespondPermission }: RendererProps) {
     const ctx = { isLast, sending };
     switch (messageKind(message)) {
       case "user":
@@ -81,7 +85,7 @@ export const MessageRenderer = memo(
       case "permission":
         return <PermissionCard msg={message} onRespond={onRespondPermission} />;
       case "agent-group":
-        return <AgentGroupCard msg={message} />;
+        return <AgentGroupCard msg={message} delegateCost={delegateCost} />;
       case "delegate-progress":
         return <DelegateProgressCard msg={message} />;
       case "system":
@@ -96,16 +100,20 @@ export const MessageRenderer = memo(
     // 段归属变化(新 user 消息推进边界)不体现在 sig 里,必须单独参与比较,
     // 否则上一轮的 TodoWrite/plan 卡在跨轮时不会从"抑制"切到"只读卡"。
     a.inActiveTurn === b.inActiveTurn &&
+    // 债D 委派成本来自别的行(助手行 usage.delegates),不进 message sig,单列比较,
+    // 否则成本在 agent-group 完成后才到达时 memo 会跳过重渲、单卡不显示「N 积分」。
+    a.delegateCost === b.delegateCost &&
     a.cb === b.cb &&
     a.onRespondPermission === b.onRespondPermission,
 );
 
 const LOAD_MORE_STEP = 100;
 
-/** 渲染项:普通单条消息(idx 为全局下标,供活跃段归属判定),或"连续多个委派智能体聚成的团队"。 */
+/** 渲染项:普通单条消息(idx 为全局下标,供活跃段归属判定),或"连续多个委派智能体聚成的团队"。
+ *  delegateCost / delegateCosts = 债D per-delegate 成本(见 coalesceTeam)。 */
 type RenderItem =
-  | { kind: "single"; m: ChatMessage; isLast: boolean; idx: number }
-  | { kind: "team"; members: ChatMessage[]; sig: string };
+  | { kind: "single"; m: ChatMessage; isLast: boolean; idx: number; delegateCost?: string }
+  | { kind: "team"; members: ChatMessage[]; sig: string; delegateCosts?: Record<string, string> };
 
 /**
  * 把「队长同一轮委派的多个 agent-group」聚成一个团队项(≥2 → TeamPanel;单个退化回
@@ -132,6 +140,25 @@ function coalesceTeam(messages: ChatMessage[], start: number, sending: boolean):
     if (messages[i]?.role === "user") lastUser = i;
     anchorOf[i] = lastUser;
   }
+  // 债D per-delegate 成本:队长**助手行**(role 'assistant',同一 turn 的最终答复)的
+  // usage.delegates 已由 master 按 agentId 分组求和。按 turn 锚点归拢成 anchor → {agentId:
+  // costCredits},供该轮团队卡/委派卡按 `_delegateAgentId` 匹配显示「· N 积分」。同一 agentId
+  // 一轮被多次委派(如审查跑 2 轮)时是合计值 → 多张同名卡显示相同合计,已知可接受粒度。
+  const delegateCostByAnchor = new Map<number, Record<string, string>>();
+  for (let i = 0; i < total; i++) {
+    const mm = messages[i];
+    if (mm?.role !== "assistant" || !mm.usage?.delegates?.length) continue;
+    const rec = delegateCostByAnchor.get(anchorOf[i]) ?? {};
+    for (const d of mm.usage.delegates) {
+      // 同 turn 若多条助手行都带 delegates,后者(最终答复行)胜。
+      if (d && typeof d.agentId === "string" && typeof d.costCredits === "string") {
+        rec[d.agentId] = d.costCredits;
+      }
+    }
+    delegateCostByAnchor.set(anchorOf[i], rec);
+  }
+  const costFor = (absIdx: number, m: ChatMessage): string | undefined =>
+    delegateCostByAnchor.get(anchorOf[absIdx])?.[m._delegateAgentId ?? ""];
   // 每个锚点在**渲染切片内**的 agent-group 计数(≥2 才成团;切片外成员不计入本屏面板)。
   const teamCount = new Map<number, number>();
   for (let i = 0; i < slice.length; i++) {
@@ -151,19 +178,30 @@ function coalesceTeam(messages: ChatMessage[], start: number, sending: boolean):
         if (emittedTeam.has(anchor)) continue; // 已并入该轮面板 → 吸收跳过
         emittedTeam.add(anchor);
         const members: ChatMessage[] = [];
+        const memberIdx: number[] = [];
         for (let j = 0; j < slice.length; j++) {
           if (messageKind(slice[j]) === "agent-group" && anchorOf[start + j] === anchor) {
             members.push(slice[j]);
+            memberIdx.push(start + j);
           }
         }
+        const delegateCosts = delegateCostByAnchor.get(anchor);
         items.push({
           kind: "team",
           members,
-          sig: members.map((mm) => messageSignature(mm, { isLast: false, sending })).join("||"),
+          // 成本值取自别的行(助手行),不在成员 message sig 内 → 折进团队 sig(每成员 cost 拼入),
+          // 否则成本后到时 TeamPanel 的 sig-only memo 会跳过重渲(见 TeamPanel 尾 memo 注释)。
+          sig: members
+            .map(
+              (mm, k) =>
+                `${messageSignature(mm, { isLast: false, sending })}|c:${costFor(memberIdx[k], mm) ?? ""}`,
+            )
+            .join("||"),
+          delegateCosts,
         });
         continue;
       }
-      items.push({ kind: "single", m, isLast: absIdx === total - 1, idx: absIdx });
+      items.push({ kind: "single", m, isLast: absIdx === total - 1, idx: absIdx, delegateCost: costFor(absIdx, m) });
       continue;
     }
     items.push({ kind: "single", m, isLast: absIdx === total - 1, idx: absIdx });
@@ -216,7 +254,7 @@ export function MessageList({
         if (it.kind === "team") {
           return (
             <MessageBoundary key={it.members[0].id} messageId={it.members[0].id} sig={it.sig}>
-              <TeamPanel members={it.members} sig={it.sig} />
+              <TeamPanel members={it.members} sig={it.sig} delegateCosts={it.delegateCosts} />
             </MessageBoundary>
           );
         }
@@ -229,6 +267,7 @@ export function MessageList({
               isLast={it.isLast}
               sending={sending}
               inActiveTurn={it.idx >= turnStart}
+              delegateCost={it.delegateCost}
               cb={cb}
               onRespondPermission={onRespondPermission}
             />

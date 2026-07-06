@@ -9,14 +9,16 @@
  *    (teammate / 邮箱 / coordinator)落地后,本面板可平滑扩展承载更丰富的协作信息。
  *  - 视觉沿用 Aurora 原语(Badge/Spinner/border/surface/grad-cta),与单个 AgentGroupCard 一致。
  *
- * memo:本组件收 {members, sig},reducer 就地 mutate 成员对象(引用不变),故以合并 sig 比较
- * (上层 MessageList 用每个成员的 messageSignature 拼出),sig 变才重渲——同 MessageRenderer 防闪模式。
+ * memo:本组件收 {members, sig, delegateCosts},reducer 就地 mutate 成员对象(引用不变),故以合并
+ * sig 比较(上层 MessageList 用每个成员的 messageSignature 拼出),sig 变才重渲——同 MessageRenderer
+ * 防闪模式。delegateCosts(债D per-delegate 成本)每帧新建对象,不能进比较器(否则永不相等失效
+ * memo);其取值已由上层折进 sig(每个成员的 cost 拼入),故成本变 → sig 变 → 正常重渲。
  */
 import { Check, ChevronRight, Clock, Users, X } from "lucide-react";
 import { memo, useEffect, useState } from "react";
 import { type ChatMessage, isServerAuthoredRow } from "../../lib/chat/model";
-import { agentTerminalStatus, childSignature } from "../../lib/chat/render";
-import { cn } from "../../lib/utils";
+import { agentTerminalStatus, childSignature, reviewVerdictBadge } from "../../lib/chat/render";
+import { cn, groupDigits } from "../../lib/utils";
 import { Badge, Spinner } from "../ui";
 import { ChildBlockView } from "./AgentGroupCard";
 import { agentDisplayName } from "./agentNames";
@@ -37,11 +39,14 @@ function memberName(msg: ChatMessage, idx: number): string {
   return `临时子智能体 ${idx + 1}`;
 }
 
-/** 单个队员行:可折叠,运行中默认展开看进度、完成默认收起(显示结果摘要)。 */
-function TeamMemberRow({ msg, idx }: { msg: ChatMessage; idx: number }) {
+/** 单个队员行:可折叠,运行中默认展开看进度、完成默认收起(显示结果摘要)。
+ *  cost = 该队员本 turn 的委派成本(债D,来自队长助手行 usage.delegates,按 agentId 匹配)。 */
+function TeamMemberRow({ msg, idx, cost }: { msg: ChatMessage; idx: number; cost?: string }) {
   const isServerRow = isServerAuthoredRow(msg);
   const running = memberRunning(msg);
   const status = agentTerminalStatus(msg);
+  // 审查裁决徽记:仅隐藏审查员行返回非 null(PASS/未通过),与执行态徽记并列展示。
+  const verdict = reviewVerdictBadge(msg);
   const [userOpen, setUserOpen] = useState<boolean | null>(null);
   const open = userOpen ?? running;
   const children = msg.childBlocks ?? [];
@@ -93,6 +98,8 @@ function TeamMemberRow({ msg, idx }: { msg: ChatMessage; idx: number }) {
                 : ""}
             </Badge>
           )}
+          {verdict && <Badge tone={verdict.tone}>{verdict.label}</Badge>}
+          {cost && <span className="text-[11px] font-medium text-faint">{groupDigits(cost)} 积分</span>}
           <ChevronRight size={14} className={cn("text-faint transition-transform", open && "rotate-90")} />
         </span>
       </button>
@@ -132,7 +139,17 @@ function TeamMemberRow({ msg, idx }: { msg: ChatMessage; idx: number }) {
 }
 
 export const TeamPanel = memo(
-  function TeamPanel({ members }: { members: ChatMessage[]; sig: string }) {
+  function TeamPanel({
+    members,
+    delegateCosts,
+  }: {
+    members: ChatMessage[];
+    sig: string;
+    /** 债D:agentId → 本 turn 委派成本(十进制大数字符串)。由上层 coalesceTeam 从队长助手行
+     *  usage.delegates 按 turn 锚点拼出。**必须已折进 sig**(见组件尾 memo 注释),否则成本
+     *  后到时 memo 会跳过重渲。同 agentId 一轮多次委派 → 合计值,多张同名卡显示相同值(可接受粒度)。*/
+    delegateCosts?: Record<string, string>;
+  }) {
     const total = members.length;
     const running = members.filter((m) => memberRunning(m)).length;
     // 终态成员按三态分桶(server 行区分超时);运行中不计。
@@ -182,7 +199,7 @@ export const TeamPanel = memo(
         {!collapsed && (
           <div className="space-y-2 border-t border-border px-3 py-2.5">
             {members.map((m, i) => (
-              <TeamMemberRow key={m.id} msg={m} idx={i} />
+              <TeamMemberRow key={m.id} msg={m} idx={i} cost={delegateCosts?.[m._delegateAgentId ?? ""]} />
             ))}
           </div>
         )}

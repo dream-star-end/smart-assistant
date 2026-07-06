@@ -9,6 +9,7 @@
  * 重要：reducer 对 `session.messages` **就地 mutation**（push / 改字段），不每帧
  * 重建数组（streaming delta 频率极高）。订阅侧靠 `version` 单调递增触发重渲。
  */
+import type { MessageUsageDelegate, ReviewVerdict } from "@openclaude/protocol/teamCards";
 import type { MediaRef } from "./frames";
 
 /** 用户消息状态机（派生展示，不持久化 'replied'，§9）。*/
@@ -42,6 +43,12 @@ export type MsgUsage = {
   costCredits?: string;
   /** 本轮已免单（idle-timeout 无响应退款,cost_waived 帧置位）。*/
   waived?: boolean;
+  /**
+   * 债D per-delegate 成本明细(纯展示投影)。master 排空委派 pending 时按 agentId 分组
+   * 求和,写进队长**助手行**;前端团队卡/委派卡按 `_delegateAgentId` 匹配显示「· N 积分」。
+   * costCredits 为十进制大数字符串,与 `costCredits` 同单位/精度(禁 Number 化)。
+   */
+  delegates?: MessageUsageDelegate[];
 };
 
 /** Bash 实时 tail 快照（单调守卫：totalBytes 不回退）。*/
@@ -156,6 +163,13 @@ export type ChatMessage = {
    * 缺省时回退 _isError('failed' 语义)。
    */
   _delegateStatus?: "ok" | "failed" | "timeout";
+  /**
+   * 债C — 隐藏审查员委派行的结构化审查裁决(PASS / NEEDS_FIX)。仅
+   * `_delegateAgentId === 'hidden-reviewer'` 的行携带;普通成员委派行缺省。
+   * 与 `_delegateStatus`(执行态)**正交**:一次成功执行的审查照样可裁决 NEEDS_FIX,
+   * 故 PASS/未通过必须读本字段,禁止从执行态反推。渲染裁决徽记(reviewVerdictBadge)按此。
+   */
+  _reviewVerdict?: ReviewVerdict;
 
   // ── delegate-progress（委派进度兜底卡）──
   runId?: string;

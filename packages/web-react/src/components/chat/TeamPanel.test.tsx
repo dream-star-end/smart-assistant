@@ -97,3 +97,68 @@ describe("TeamPanel 团队协作面板", () => {
     expect(screen.getByText("coder")).toBeInTheDocument();
   });
 });
+
+describe("TeamPanel 审查裁决徽记 + per-delegate 成本(债C/债D)", () => {
+  // 全完成默认收起 → 先点头部展开才能看到队员行徽记。
+  function renderExpanded(members: ChatMessage[], props: Partial<{ delegateCosts: Record<string, string> }> = {}) {
+    render(<TeamPanel members={members} sig="v" delegateCosts={props.delegateCosts} />);
+    const header = screen.getByText(/团队协作 · \d+ 个智能体/);
+    fireEvent.click(header);
+  }
+
+  test("审查员行 verdict=PASS → 渲染「质量审查员」+「PASS」通过徽记", () => {
+    renderExpanded([
+      member("a", { _delegateAgentId: "hidden-reviewer", _completed: true, _reviewVerdict: "PASS" }),
+      member("b", { _delegateAgentId: "coder", _completed: true }),
+    ]);
+    expect(screen.getByText("质量审查员")).toBeInTheDocument();
+    expect(screen.getByText("PASS")).toBeInTheDocument();
+  });
+
+  test("审查员行 verdict=NEEDS_FIX → 渲染「未通过」（即使执行态为完成）", () => {
+    renderExpanded([
+      member("a", {
+        _delegateAgentId: "hidden-reviewer",
+        _completed: true,
+        _delegateStatus: "ok",
+        _reviewVerdict: "NEEDS_FIX",
+      }),
+      member("b", { _delegateAgentId: "coder", _completed: true }),
+    ]);
+    // 执行成功(完成徽记)与裁决未通过并存 —— 二者正交。
+    expect(screen.getByText("未通过")).toBeInTheDocument();
+    // 两名队员均完成 → 多个「完成」执行态徽记;审查员行同时带「未通过」裁决徽记。
+    expect(screen.getAllByText("完成").length).toBeGreaterThanOrEqual(1);
+  });
+
+  test("审查员行无裁决 → 不渲染裁决徽记（执行态徽记照常）", () => {
+    renderExpanded([
+      member("a", { _delegateAgentId: "hidden-reviewer", _completed: true }),
+      member("b", { _delegateAgentId: "coder", _completed: true }),
+    ]);
+    expect(screen.queryByText("PASS")).not.toBeInTheDocument();
+    expect(screen.queryByText("未通过")).not.toBeInTheDocument();
+  });
+
+  test("普通成员行误带 verdict → 不渲染裁决徽记（仅审查员行渲染）", () => {
+    renderExpanded([
+      member("a", { _delegateAgentId: "coder", _completed: true, _reviewVerdict: "PASS" }),
+      member("b", { _delegateAgentId: "hidden-reviewer", _completed: true, _reviewVerdict: "NEEDS_FIX" }),
+    ]);
+    // 只有审查员的「未通过」出现；coder 的 PASS 被吞。
+    expect(screen.getByText("未通过")).toBeInTheDocument();
+    expect(screen.queryByText("PASS")).not.toBeInTheDocument();
+  });
+
+  test("delegateCosts 匹配 agentId → 队员行显示「N 积分」（千分位）", () => {
+    renderExpanded(
+      [
+        member("a", { _delegateAgentId: "hidden-reviewer", _completed: true, _reviewVerdict: "PASS" }),
+        member("b", { _delegateAgentId: "coding-assistant", _completed: true }),
+      ],
+      { delegateCosts: { "hidden-reviewer": "3", "coding-assistant": "12345" } },
+    );
+    expect(screen.getByText("3 积分")).toBeInTheDocument();
+    expect(screen.getByText("12,345 积分")).toBeInTheDocument();
+  });
+});

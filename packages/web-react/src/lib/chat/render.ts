@@ -10,7 +10,16 @@
  *  3. 折叠态默认值（thinking 完成折叠 / agent-group 运行展开完成折叠），用户显式切换
  *     后由组件本地 state 锁定，不被签名重渲覆盖。
  */
+import { REVIEW_VERDICT_NEEDS_FIX, REVIEW_VERDICT_PASS } from "@openclaude/protocol/teamCards";
 import type { ChatMessage, ChildBlock } from "./model";
+
+/**
+ * 隐藏审查员(平台内置、管理 API 404 隐藏的系统 agent)的 agentId —— 单一权威。
+ * 团队卡据此判定「该委派行是否为审查员行」(审查裁决徽记仅审查员行渲染),
+ * agentNames.ts 的显示名映射(hidden-reviewer→质量审查员)也复用此常量做键。
+ * 放在纯逻辑层:两处消费方(render 裁决守卫 + agentNames 显示名)从此不再各写字面量。
+ */
+export const HIDDEN_REVIEWER_AGENT_ID = "hidden-reviewer";
 
 export type MessageKind =
   | "user"
@@ -147,6 +156,9 @@ export function messageSignature(
         m._isError ? 1 : 0,
         // 终态三态(server 行区分超时):变则徽记要重渲。
         m._delegateStatus ?? "",
+        // 审查裁决(仅审查员行携带):与执行态正交,可能在委派完成后才到达,
+        // 漏进签名 → memo 跳过 → PASS/未通过徽记不出现。
+        m._reviewVerdict ?? "",
         m._duration ?? 0,
         m._resultPreview ? m._resultPreview.length : 0,
         m._delegate ? 1 : 0,
@@ -183,6 +195,27 @@ export function agentTerminalStatus(
   if (m._delegateStatus === "timeout") return { label: "超时", tone: "warning" };
   if (m._isError || m._delegateStatus === "failed") return { label: "失败", tone: "danger" };
   return { label: "完成", tone: "success" };
+}
+
+/**
+ * 隐藏审查员委派行的**质量审查裁决徽记**(单一权威,AgentGroupCard 与 TeamPanel 共用)。
+ * 仅 `_delegateAgentId === 'hidden-reviewer'` 的行渲染;普通成员委派行(protocol 契约上
+ * 不携带 `_reviewVerdict`)恒返回 null。
+ *
+ * ⚠️ 裁决(`_reviewVerdict`)与执行态(`_delegateStatus` ok/failed/timeout)**正交**:
+ * 一次成功执行(status='ok')的审查照样可裁决 NEEDS_FIX。因此 PASS/未通过必须读
+ * `_reviewVerdict`,禁止从执行态反推。裁决缺省(审查未产出/降级)→ null(执行态徽记照常)。
+ *
+ * tone 语义:PASS→success(通过态);NEEDS_FIX→warning(需修改的负向裁决,不用 danger 以
+ * 免与「执行失败」的红色徽记混淆——审查本身执行成功,只是内容需返工)。未知裁决值 fail-safe 返回 null。
+ */
+export function reviewVerdictBadge(
+  m: Pick<ChatMessage, "_delegateAgentId" | "_reviewVerdict">,
+): { label: string; tone: "success" | "warning" } | null {
+  if (m._delegateAgentId !== HIDDEN_REVIEWER_AGENT_ID) return null;
+  if (m._reviewVerdict === REVIEW_VERDICT_PASS) return { label: "PASS", tone: "success" };
+  if (m._reviewVerdict === REVIEW_VERDICT_NEEDS_FIX) return { label: "未通过", tone: "warning" };
+  return null;
 }
 
 /**
