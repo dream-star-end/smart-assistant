@@ -1,6 +1,7 @@
 import { Check, ChevronRight, Inbox, Loader2, ShieldX, X } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
 import { api } from "../../lib/api";
+import { benchmarkSuspect } from "../../lib/marketplace";
 import type { AuthSession, MarketplaceCard, MarketplacePending } from "../../lib/types";
 import { Alert, Badge, Button, EmptyState, Input, Spinner, useConfirm, usePrompt } from "../ui";
 import { friendlyRiskFlags } from "./riskFlags";
@@ -192,6 +193,16 @@ export function ReviewPanel({ auth }: { auth: AuthSession }) {
                           {r.kind === "agent" && <Badge tone="accent">智能体</Badge>}
                           <Badge tone="neutral">v{r.version}</Badge>
                           {flags.length > 0 && <Badge tone="warning">{flags.length} 项提示</Badge>}
+                          {/* 自报评测黄牌:增益≤0 或通过率<50% 时提示人审留意;数据为发布者
+                              自报、未经平台验证,仅提示不阻断。无 benchmark 不渲染。 */}
+                          {benchmarkSuspect(r.benchmark) && r.benchmark && (
+                            <Badge
+                              tone="warning"
+                              title={`自报实测 ${Math.round(r.benchmark.withoutPassRate * 100)}%→${Math.round(r.benchmark.withPassRate * 100)}%（${r.benchmark.cases} 用例）：增益≤0 或通过率<50%。发布者提供·未经平台验证`}
+                            >
+                              自报增益存疑
+                            </Badge>
+                          )}
                         </div>
                         <p className="truncate text-[12px] text-muted">
                           {r.slug} · 提交者 #{r.submittedBy}

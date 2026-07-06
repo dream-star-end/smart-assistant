@@ -649,6 +649,8 @@ export type MarketplaceCard = {
   installCount?: number;
   /** 平台预设 agent(开箱即用,无需安装)。 */
   preset?: boolean;
+  /** 发布者自报评测摘要(仅有数据时渲染徽记;展示须标注"发布者提供·未经平台验证")。 */
+  benchmark?: { withPassRate: number; withoutPassRate: number; cases: number } | null;
 };
 
 /** 市场检索响应。method=all 为空查询返全部目录。 */

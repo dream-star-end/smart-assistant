@@ -413,6 +413,8 @@ export interface ApprovedSearchRow {
   embeddingHash: string
   /** 当前活跃安装数(卸载不计;每用户同 slug 至多一条活跃安装,即≈使用人数)。 */
   installCount: number
+  /** 发布者自报评测摘要(聚合值;展示须标注"发布者提供,未经平台验证")。null=未提供。 */
+  benchmark: { withPassRate: number; withoutPassRate: number; cases: number } | null
 }
 
 /** Current approved version of every active listing — the searchable catalog.
@@ -432,12 +434,13 @@ export async function listApprovedForSearch(kind?: ArtifactKind): Promise<Approv
     description: string
     tags: unknown
     embedding_hash: string
+    benchmark: unknown
     install_count: string | null
   }>(
     // install_count 走一次性聚合 JOIN(而非逐行 correlated 子查询):目录上限 500 行,
     // 逐行子查询会对共享的 v3 search 端点放大 500 次 installs 扫描。
     `SELECT v.id::text, v.slug, l.kind, v.name, v.description, v.tags, v.embedding_hash,
-            ic.n::text AS install_count
+            v.benchmark, ic.n::text AS install_count
        FROM marketplace_skill_listings l
        JOIN marketplace_skill_versions v ON v.id = l.current_approved_version_id
        LEFT JOIN (SELECT slug, count(*) AS n FROM marketplace_installs
@@ -464,6 +467,9 @@ export async function listApprovedForSearch(kind?: ArtifactKind): Promise<Approv
     tags: (x.tags as string[]) ?? [],
     embeddingHash: x.embedding_hash,
     installCount: Number.parseInt(x.install_count ?? '0', 10) || 0,
+    benchmark:
+      (x.benchmark as { withPassRate: number; withoutPassRate: number; cases: number } | null) ??
+      null,
   }))
 }
 

@@ -255,6 +255,33 @@ describe('marketplaceDb (integ)', () => {
     assert.equal(await getListingDetail('reject-me'), null)
   })
 
+  test('benchmark 自报评测在搜索目录透出聚合值(有/无两分支)', async (t) => {
+    if (skipIfNoPg(t)) return
+    const owner = await createUser('bench-owner@x.com')
+    const admin = await createUser('bench-admin@x.com')
+    // 带 benchmark 发布 → 批准:listApprovedForSearch 应原样透出聚合值。
+    const withB = await publishSkillVersion({
+      ...buildPublish('bench-skill', owner),
+      benchmark: { withPassRate: 0.91, withoutPassRate: 0.62, cases: 4 },
+    })
+    await reviewVersion({ versionId: withB.versionId, reviewerUserId: admin, approve: true })
+    // 不带 benchmark 发布 → 批准:搜索行 benchmark 应为 null(卡片不渲染徽记)。
+    const noB = await publishSkillVersion(buildPublish('plain-skill', owner))
+    await reviewVersion({ versionId: noB.versionId, reviewerUserId: admin, approve: true })
+
+    const cat = await listApprovedForSearch()
+    const b = cat.find((c) => c.slug === 'bench-skill')
+    assert.deepEqual(b?.benchmark, { withPassRate: 0.91, withoutPassRate: 0.62, cases: 4 })
+    const p = cat.find((c) => c.slug === 'plain-skill')
+    assert.equal(p?.benchmark, null)
+    // 详情页口径一致(getListingDetail 早有 benchmark;此处只做交叉校验)。
+    assert.deepEqual((await getListingDetail('bench-skill'))?.benchmark, {
+      withPassRate: 0.91,
+      withoutPassRate: 0.62,
+      cases: 4,
+    })
+  })
+
   test('batch review approves multiple pending versions', async (t) => {
     if (skipIfNoPg(t)) return
     const owner = await createUser('batch-owner@x.com')

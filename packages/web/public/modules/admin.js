@@ -616,6 +616,10 @@ const TAB_CLEANUPS = {
       clearInterval(HOSTS_STATE.refreshTimer)
       HOSTS_STATE.refreshTimer = null
     }
+    _destroyHostsCharts()
+  },
+  accounts() {
+    _destroyAccountsCharts()
   },
   health() {
     _destroyHealthCharts()
@@ -2550,10 +2554,14 @@ const ACCOUNT_STATUSES = ['active', 'cooldown', 'disabled', 'banned']
 const ACCOUNTS_STATE = {
   renderSeq: 0, loadSeq: 0,
   rows: [], filterStatus: '',
+  charts: {},  // { pool: canvas } — 账号池状态构成 donut,切 tab / 重渲时统一销毁防泄漏
 }
 
 async function renderAccountsTab() {
   const mySeq = ++ACCOUNTS_STATE.renderSeq
+  // 重渲(刷新 / 切筛选)会替换 innerHTML → 旧 canvas 脱离 DOM,先销毁旧 chart 实例防泄漏。
+  // 切 tab 走 TAB_CLEANUPS.accounts,与此互补覆盖两条路径。
+  _destroyAccountsCharts()
   ACCOUNTS_STATE.rows = []
   ACCOUNTS_STATE.filterStatus = sessionStorage.getItem('admin_acc_status') || ''
 
@@ -2567,6 +2575,13 @@ async function renderAccountsTab() {
         <div class="stat-card"><div class="stat-label">可用 / 冷却</div><div class="stat-value is-loading">—</div><div class="stat-delta stat-muted">加载中…</div></div>
         <div class="stat-card"><div class="stat-label">OAuth 过期风险</div><div class="stat-value is-loading">—</div><div class="stat-delta stat-muted">加载中…</div></div>
         <div class="stat-card"><div class="stat-label">今日请求</div><div class="stat-value is-loading">—</div><div class="stat-delta stat-muted">加载中…</div></div>
+      </div>
+
+      <!-- 账号池状态构成 donut + 平均健康(数据 /api/admin/stats/account-pool;v5 CCB-only,仅 Claude 账号口径)。
+           图表拉取失败 → 仅本卡落"加载失败"占位,不影响上方 KPI 卡与下方账号表。 -->
+      <div class="chart-card" style="margin-bottom:18px">
+        <div class="chart-card-head"><h3>账号池状态构成</h3><span class="chart-sub" id="acc-pool-sub">加载中…</span></div>
+        <div class="chart-card-body"><canvas id="acc-chart-pool"></canvas></div>
       </div>
 
       <div class="toolbar">
@@ -2599,7 +2614,53 @@ async function renderAccountsTab() {
   await Promise.all([
     _loadAccountsKpis(mySeq),
     _loadAccounts(mySeq),
+    _loadAccountsPoolChart(mySeq),
   ])
+}
+
+// 账号池状态构成 donut + 平均健康。独立于 KPI(/accounts/stats)与表(/accounts):
+// 走 /api/admin/stats/account-pool(唯一带 avg_health 的口径)。内部 try/catch 吞错,
+// 绝不让本图表的失败冒泡出 Promise.all 去连累 KPI / 表(优雅降级红线)。
+async function _loadAccountsPoolChart(renderSeq) {
+  const canvas = $('acc-chart-pool')
+  const sub = $('acc-pool-sub')
+  let s
+  try {
+    s = await apiGet('/api/admin/stats/account-pool')
+  } catch {
+    if (renderSeq !== ACCOUNTS_STATE.renderSeq || _currentTab !== 'accounts') return
+    if (ACCOUNTS_STATE.charts.pool) { destroyChart(canvas); ACCOUNTS_STATE.charts.pool = null }
+    _renderChartError(canvas, '加载失败')
+    if (sub) sub.textContent = '图表加载失败'
+    return
+  }
+  if (renderSeq !== ACCOUNTS_STATE.renderSeq || _currentTab !== 'accounts') return
+  if (!canvas) return
+
+  // avg_health ∈ [0,100](claude_accounts.health_score 均值);today_success_rate ∈ [0,1]。
+  if (sub) {
+    const hp = (Number(s.avg_health) || 0).toFixed(1)
+    const sr = ((Number(s.today_success_rate) || 0) * 100).toFixed(1)
+    sub.textContent = `平均健康 ${hp} / 100 · 今日成功率 ${sr}%`
+  }
+
+  const segs = [
+    { label: '可用 active', value: Number(s.active) || 0, color: '--ok' },
+    { label: '冷却 cooldown', value: Number(s.cooldown) || 0, color: '--warn' },
+    { label: '停用 disabled', value: Number(s.disabled) || 0, color: '--muted' },
+    { label: '封禁 banned', value: Number(s.banned) || 0, color: '--danger' },
+  ].filter((x) => x.value > 0)
+  if (segs.length === 0) {
+    if (ACCOUNTS_STATE.charts.pool) { destroyChart(canvas); ACCOUNTS_STATE.charts.pool = null }
+    _renderChartError(canvas, '无账号')
+    return
+  }
+  ACCOUNTS_STATE.charts.pool = canvas
+  donutChart(canvas, {
+    labels: segs.map((x) => x.label),
+    values: segs.map((x) => x.value),
+    colors: segs.map((x) => x.color),
+  })
 }
 
 async function _loadAccountsKpis(renderSeq) {
@@ -6957,6 +7018,8 @@ function _destroyLedgerCharts() { _destroyChartMap(LEDGER_STATE.charts); LEDGER_
 function _destroyOrdersCharts() { _destroyChartMap(ORDERS_STATE.charts); ORDERS_STATE.charts = {} }
 function _destroyUsersCharts() { _destroyChartMap(USERS_STATE.charts); USERS_STATE.charts = {} }
 function _destroyContainersCharts() { _destroyChartMap(CONTAINERS_STATE.charts); CONTAINERS_STATE.charts = {} }
+function _destroyAccountsCharts() { _destroyChartMap(ACCOUNTS_STATE.charts); ACCOUNTS_STATE.charts = {} }
+function _destroyHostsCharts() { _destroyChartMap(HOSTS_STATE.charts); HOSTS_STATE.charts = {} }
 
 // HTTP 状态码 → 语义色 CSS 变量名(2xx ok / 3xx info / 4xx warn / 5xx danger)。
 function _statusColorVar(code) {
@@ -8277,10 +8340,14 @@ const HOSTS_STATE = {
   renderSeq: 0,
   refreshTimer: null,
   focusUuid: '',  // deeplink 高亮用,render 时读 sessionStorage / pendingDeeplink
+  charts: {},     // { util: canvas } — per-host 利用率堆叠柱,切 tab / 重渲时统一销毁防泄漏
 }
 
 async function renderHostsTab() {
   const mySeq = ++HOSTS_STATE.renderSeq
+  // 重渲会替换 innerHTML → 旧 canvas 脱离 DOM,先销毁旧 chart 实例防泄漏。
+  // 切 tab 走 TAB_CLEANUPS.hosts,与此互补覆盖两条路径。
+  _destroyHostsCharts()
 
   // deeplink:pendingDeeplink 优先,fallback sessionStorage(刷新页保活)
   HOSTS_STATE.focusUuid = sessionStorage.getItem('admin_h_focus_uuid') || ''
@@ -8294,6 +8361,16 @@ async function renderHostsTab() {
     <div class="panel">
       <h1 style="margin-top:0">虚机池 <small style="color:var(--muted);font-weight:400;font-size:14px" id="h-count">加载中…</small></h1>
       <div id="h-baseline" style="margin-bottom:16px"></div>
+
+      <!-- per-host 利用率堆叠柱(已用 / 剩余)。数据复用与下方表格同源的 /api/admin/v3/compute-hosts
+           行(active_containers / max_containers)—— 与 /api/admin/stats/hosts-utilization 同一
+           listComputeHostsForAdmin 口径,复用已加载行 = 零额外查询 + 图表/表格恒一致 + 随 5s 轮询自动刷新。
+           数据失败时下方表格已显式报错,本卡首屏落占位、轮询失败保留上一帧,不阻塞 tab。 -->
+      <div class="chart-card" style="margin-bottom:16px">
+        <div class="chart-card-head"><h3>虚机利用率分布</h3><span class="chart-sub" id="h-util-sub">—</span></div>
+        <div class="chart-card-body"><canvas id="h-chart-util"></canvas></div>
+      </div>
+
       <div class="toolbar">
         <button class="btn" id="h-refresh">刷新</button>
         <span class="spacer"></span>
@@ -8327,6 +8404,9 @@ async function _loadHostsData(renderSeq) {
     const el = $('h-table-container')
     if (el) el.innerHTML = `<div class="empty" style="color:var(--danger)">加载失败:${escapeHtml(err.message)}</div>`
     const cnt = $('h-count'); if (cnt) cnt.textContent = '—'
+    // 图表与表格同源:首屏(尚无图)落"加载失败"占位;轮询期(已有图)保留上一帧不闪。
+    const canvas = $('h-chart-util')
+    if (canvas && !HOSTS_STATE.charts.util) _renderChartError(canvas, '加载失败')
     return
   }
   if (renderSeq !== HOSTS_STATE.renderSeq || _currentTab !== 'hosts') return
@@ -8335,6 +8415,49 @@ async function _loadHostsData(renderSeq) {
   HOSTS_STATE.baseline = baselineRes ?? null
   _renderBaselineCard()
   _renderHostsTable()
+  _renderHostsChart()
+}
+
+// per-host 利用率堆叠柱。复用 HOSTS_STATE.rows(与表格同源),名字过长截断 16 字。
+// canvas 在外层模板中(不随 _renderHostsTable 的 innerHTML 重建),故每轮轮询在同一
+// canvas 上重绘(barChart 内部 destroyIfAny,无泄漏)。空池落占位。
+function _renderHostsChart() {
+  const canvas = $('h-chart-util')
+  const sub = $('h-util-sub')
+  if (!canvas) return
+  const rows = HOSTS_STATE.rows || []
+  if (rows.length === 0) {
+    if (HOSTS_STATE.charts.util) { destroyChart(canvas); HOSTS_STATE.charts.util = null }
+    _renderChartError(canvas, '无虚机')
+    if (sub) sub.textContent = '—'
+    return
+  }
+  let used = 0
+  let capacity = 0
+  const labels = []
+  const usedData = []
+  const freeData = []
+  for (const h of rows) {
+    const active = Number(h.active_containers) || 0
+    const max = Number(h.max_containers) || 0
+    used += active
+    capacity += max
+    labels.push((h.name || h.id || '').slice(0, 16))
+    usedData.push(active)
+    freeData.push(Math.max(0, max - active))
+  }
+  if (sub) sub.textContent = `已用 ${used} / 容量 ${capacity}`
+  HOSTS_STATE.charts.util = canvas
+  barChart(canvas, {
+    labels,
+    stacked: true,
+    series: [
+      { label: '已用', data: usedData },
+      { label: '剩余', data: freeData,
+        color: getComputedStyle(document.documentElement).getPropertyValue('--muted').trim() || '#888' },
+    ],
+    yFormatter: (v) => Number.isInteger(v) ? String(v) : v.toFixed(1),
+  })
 }
 
 function _renderBaselineCard() {
