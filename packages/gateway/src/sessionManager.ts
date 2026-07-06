@@ -3118,15 +3118,23 @@ export class SessionManager {
 }
 
 // ── Verification verdict parser ──────────────────
-// Detects "VERDICT: PASS|FAIL|PARTIAL" and "### Check:" blocks in assistant text.
+// Detects "VERDICT: PASS|FAIL|PARTIAL|NEEDS_FIX" and "### Check:" blocks in
+// assistant text.
+//
+// P2 债C — 词汇统一:历史上本解析器(为科研/校验类 turn 而生)只认 PASS/FAIL/
+// PARTIAL,而团队模式隐藏审查员 persona 输出的是 PASS / NEEDS_FIX,两条管线互不
+// 相认(解析器解析不出审查裁决 → 审查结果无法回流)。现吸收 NEEDS_FIX 作为 FAIL
+// 语义(= 未通过 / passed=false),让同一个解析器同时服务两条管线。NEEDS_FIX 的
+// 词汇权威源 = @openclaude/protocol REVIEW_VERDICT_NEEDS_FIX(reviewer persona 与
+// gateway 硬编排 review pass 共用),此处正则与之对齐。
 
 interface ParsedVerdict {
-  verdict: 'PASS' | 'FAIL' | 'PARTIAL'
+  verdict: 'PASS' | 'FAIL' | 'PARTIAL' | 'NEEDS_FIX'
   passed: boolean
   evidence: Array<{ check: string; passed: boolean; detail?: string }>
 }
 
-const VERDICT_RE = /^VERDICT:\s*(PASS|FAIL|PARTIAL)\s*$/m
+const VERDICT_RE = /^VERDICT:\s*(PASS|FAIL|PARTIAL|NEEDS_FIX)\s*$/m
 
 /** Strip fenced code blocks to prevent false matches inside output. */
 function stripCodeFences(text: string): string {
@@ -3140,7 +3148,7 @@ export function parseVerificationVerdict(text: string): ParsedVerdict | null {
   const verdictMatch = VERDICT_RE.exec(cleaned)
   if (!verdictMatch) return null
 
-  const verdict = verdictMatch[1] as 'PASS' | 'FAIL' | 'PARTIAL'
+  const verdict = verdictMatch[1] as 'PASS' | 'FAIL' | 'PARTIAL' | 'NEEDS_FIX'
   const evidence: ParsedVerdict['evidence'] = []
 
   // Split text into check blocks (each starts with "### Check:" at line start)

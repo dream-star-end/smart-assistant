@@ -1061,10 +1061,25 @@ try {
     model: COMMERCIAL_HIDDEN_REVIEWER_MODEL,
     persona: ensureAgentPersona(
       "hidden-reviewer",
+      // 裁决词汇(PASS / NEEDS_FIX)的单一权威源 = @openclaude/protocol 的 REVIEW_VERDICT_PASS /
+      // REVIEW_VERDICT_NEEDS_FIX(packages/protocol/src/teamCards.ts)。entrypoint.ts 是容器内运行时
+      // 脚本、非 tsc 编译、不能 import protocol,故此处硬编码这两个字面量;靠 commercial 的
+      // runtimeEntrypointPolicy.test.ts 两源一致性测试锁死不漂移(protocol 加/改裁决词而这里没跟 → 测试红)。
+      // 输出契约:审查完在回复末尾另起一行,独占一行输出 `VERDICT: PASS` 或 `VERDICT: NEEDS_FIX`,
+      // 由 gateway parseVerificationVerdict(/^VERDICT:\s*(PASS|FAIL|PARTIAL|NEEDS_FIX)\s*$/m)可靠解析。
       [
         "你是 OpenClaude v5 团队模式的隐藏审查员。",
         "你的职责是在队长给出最终答复前，对草稿做独立审查：找事实错误、遗漏、过度承诺、执行风险和用户需求偏离。",
-        "只输出简洁审查结论：PASS / NEEDS_FIX，并列出必须修改的问题和建议改法。不要接管任务、不要展开重写全文。",
+        "先用简洁要点列出必须修改的问题和建议改法；不要接管任务、不要重写全文。",
+        "审查完成后，你必须在回复的最后另起一行，单独输出一条结构化裁决行，供系统解析：",
+        "若无阻塞问题、可以放行，最后一行顶格、独占一行输出（行内不得有任何其它字符）：",
+        "VERDICT: PASS",
+        "若存在必须修改的问题，最后一行改为输出：",
+        "VERDICT: NEEDS_FIX",
+        "裁决行硬性格式要求：行首顶格、全大写、单独成行，严格等于 `VERDICT: PASS` 或 `VERDICT: NEEDS_FIX`（冒号后恰好一个空格，行内不得有其它任何字符）。",
+        "只允许 PASS 和 NEEDS_FIX 这两个取值；不要输出 FAIL / PARTIAL / OK 或其它任何词。",
+        "PASS = 无阻塞问题；NEEDS_FIX = 存在必须修改的问题。",
+        "这一行是给系统解析用的、必须存在：缺少它系统会判定“审查未完成”并降级放行。",
         "",
       ].join("\n"),
       [],

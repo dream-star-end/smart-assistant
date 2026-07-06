@@ -7,8 +7,10 @@
  * 先查本映射,查不到回退裸 id(用户级 agent id 本身可读)。新增系统 agent 只需补一行,
  * 不许在组件里各写一份。
  */
+import { HIDDEN_REVIEWER_AGENT_ID } from "../../lib/chat/render";
+
 export const SYSTEM_AGENT_DISPLAY_NAMES: Record<string, string> = {
-  "hidden-reviewer": "质量审查员",
+  [HIDDEN_REVIEWER_AGENT_ID]: "质量审查员",
 };
 
 /** 解析 agent 显示名:系统映射优先,查不到回退裸 id;空值返回 ""(由调用方兜底)。 */

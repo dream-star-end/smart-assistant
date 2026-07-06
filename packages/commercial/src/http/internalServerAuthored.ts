@@ -198,6 +198,10 @@ const AgentGroupEntrySchema = z
     status: z.enum(["ok", "failed", "timeout"]),
     resultSummary: z.string().max(SCHEMA_AGENT_GROUP_RESULT_MAX_CHARS).optional(),
     completedAt: z.number().int().positive(),
+    // P2 债C — 隐藏审查员委派专属结构化裁决(与 @openclaude/protocol
+    // teamCards.ts REVIEW_VERDICTS 手抄对齐,同 status 手抄 z.enum 风格)。仅审查员
+    // 委派行携带,落库映射为 `_reviewVerdict`;普通成员委派恒 undefined。
+    verdict: z.enum(["PASS", "NEEDS_FIX"]).optional(),
   })
   .strict();
 
@@ -433,6 +437,8 @@ export type ServerAuthoredMessageInput = {
   _resultPreview?: string;
   _isError?: boolean;
   completedAt?: number;
+  // P2 债C — 审查裁决展示字段(仅隐藏审查员委派行带);前端渲染 PASS/未通过。
+  _reviewVerdict?: "PASS" | "NEEDS_FIX";
 };
 
 export type ServerAuthoredStorageResult = {
@@ -906,6 +912,8 @@ export function makeServerAuthoredHandler(
             ...(ag.resultSummary !== undefined
               ? { _resultPreview: ag.resultSummary }
               : {}),
+            // P2 债C — 审查裁决展示字段(仅审查员委派行带);前端据此渲染 PASS/未通过。
+            ...(ag.verdict !== undefined ? { _reviewVerdict: ag.verdict } : {}),
           },
         );
       } catch (err) {

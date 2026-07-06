@@ -9,8 +9,8 @@
 import { Check, ChevronRight, Clock, Users, X } from "lucide-react";
 import { memo, useState } from "react";
 import { type ChatMessage, type ChildBlock, isServerAuthoredRow } from "../../lib/chat/model";
-import { agentTerminalStatus, childSignature } from "../../lib/chat/render";
-import { cn } from "../../lib/utils";
+import { agentTerminalStatus, childSignature, reviewVerdictBadge } from "../../lib/chat/render";
+import { cn, groupDigits } from "../../lib/utils";
 import { Badge, Spinner } from "../ui";
 import { Markdown } from "../Markdown";
 import { ToolCardSlot } from "./toolCardSlot";
@@ -50,14 +50,18 @@ export const ChildBlockView = memo(
   (a, b) => a.sig === b.sig,
 );
 
-// 不外包 memo:本卡只收 {msg},而 reducer 就地 mutate(msg 引用不变)→ 默认浅比较会永不
+// 不外包 memo:本卡只收 {msg, delegateCost},而 reducer 就地 mutate(msg 引用不变)→ 默认浅比较会永不
 // 重渲(_completed/childBlocks 改了画面不更新,曾致委托卡永远"运行中")。重渲已由上层
-// MessageRenderer 的 messageSignature memo 把关(sig 变才渲染本卡),这层 memo 冗余且有害。
-export function AgentGroupCard({ msg }: { msg: ChatMessage }) {
+// MessageRenderer 的 messageSignature memo(sig 变)+ 比较器(delegateCost 变)把关,这层 memo 冗余且有害。
+// delegateCost = 该委派本 turn 的成本(债D,来自队长助手行 usage.delegates,按 agentId 匹配);
+// 单个委派退化态(未成团)在此显示「· N 积分」。
+export function AgentGroupCard({ msg, delegateCost }: { msg: ChatMessage; delegateCost?: string }) {
   // server-authored 骨架行是跨设备终态快照,永远不是"运行中"(无 childBlocks 过程树)。
   const isServerRow = isServerAuthoredRow(msg);
   const running = !msg._completed && !isServerRow;
   const status = agentTerminalStatus(msg);
+  // 审查裁决徽记:仅隐藏审查员行返回非 null(PASS/未通过),与执行态徽记并列。
+  const verdict = reviewVerdictBadge(msg);
   const [userCollapsed, setUserCollapsed] = useState<boolean | null>(null);
   const collapsed = userCollapsed ?? (!!msg._completed || isServerRow);
   const children = msg.childBlocks ?? [];
@@ -84,6 +88,10 @@ export function AgentGroupCard({ msg }: { msg: ChatMessage }) {
                 ? ` · ${Math.round(msg._duration / 1000)}s`
                 : ""}
             </Badge>
+          )}
+          {verdict && <Badge tone={verdict.tone}>{verdict.label}</Badge>}
+          {delegateCost && (
+            <span className="text-[11px] font-medium text-faint">{groupDigits(delegateCost)} 积分</span>
           )}
           <ChevronRight
             size={15}

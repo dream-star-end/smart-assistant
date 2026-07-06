@@ -717,6 +717,9 @@ export function makeAnthropicProxyHandler(
         // delegate 子会话的父客户端会话 id(web-*);普通 chat 恒 null
         // (extractUsageAttribution 保证)。core 据此 park 委派成本(durable)+ 广播路由。
         parentSessionId: attribution.parentSessionId,
+        // P2 债D — 委派目标 agent id(与 parentSessionId 同源 attribution);普通 chat 恒 null。
+        // core park 进 pending.delegate_agent_id,drain 产出 usage.delegates[] 明细。
+        delegateAgentId: attribution.delegateAgentId,
         userLog,
       });
     } finally {

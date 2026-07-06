@@ -7,6 +7,7 @@ import {
   isLive,
   messageKind,
   messageSignature,
+  reviewVerdictBadge,
   stripMarkdown,
 } from "./render";
 
@@ -98,6 +99,62 @@ describe("messageSignature 流式防闪签名", () => {
     const a = mk("assistant", { text: "x" });
     const b = mk("assistant", { text: "x", usage: { traceId: "t1", costCredits: "120" } });
     expect(messageSignature(a, CTX)).not.toBe(messageSignature(b, CTX));
+  });
+
+  test("agent-group 审查裁决到达 → 签名变化（PASS/未通过徽记后到时重渲）", () => {
+    const a = mk("agent-group", { text: "审查", _delegateAgentId: "hidden-reviewer", _completed: true });
+    const b = mk("agent-group", {
+      text: "审查",
+      _delegateAgentId: "hidden-reviewer",
+      _completed: true,
+      _reviewVerdict: "PASS",
+    });
+    const c = mk("agent-group", {
+      text: "审查",
+      _delegateAgentId: "hidden-reviewer",
+      _completed: true,
+      _reviewVerdict: "NEEDS_FIX",
+    });
+    expect(messageSignature(a, CTX)).not.toBe(messageSignature(b, CTX));
+    expect(messageSignature(b, CTX)).not.toBe(messageSignature(c, CTX));
+  });
+});
+
+describe("reviewVerdictBadge 审查裁决徽记（单一权威纯函数）", () => {
+  test("审查员行 PASS → success 通过徽记", () => {
+    expect(
+      reviewVerdictBadge({ _delegateAgentId: "hidden-reviewer", _reviewVerdict: "PASS" }),
+    ).toEqual({ label: "PASS", tone: "success" });
+  });
+
+  test("审查员行 NEEDS_FIX → warning「未通过」徽记（不用 danger 以免与执行失败混淆）", () => {
+    expect(
+      reviewVerdictBadge({ _delegateAgentId: "hidden-reviewer", _reviewVerdict: "NEEDS_FIX" }),
+    ).toEqual({ label: "未通过", tone: "warning" });
+  });
+
+  test("审查员行无裁决（审查未产出/降级）→ null（执行态徽记照常）", () => {
+    expect(reviewVerdictBadge({ _delegateAgentId: "hidden-reviewer" })).toBeNull();
+  });
+
+  test("普通成员行即使误带 verdict → null（裁决仅审查员行渲染）", () => {
+    expect(
+      reviewVerdictBadge({ _delegateAgentId: "coding-assistant", _reviewVerdict: "PASS" }),
+    ).toBeNull();
+    expect(reviewVerdictBadge({ _reviewVerdict: "NEEDS_FIX" })).toBeNull();
+  });
+
+  test("未知裁决值 → null（fail-safe，不渲染裁决徽记）", () => {
+    expect(
+      reviewVerdictBadge({ _delegateAgentId: "hidden-reviewer", _reviewVerdict: "WAT" as never }),
+    ).toBeNull();
+  });
+
+  test("裁决与执行态正交：status=ok 的审查照样可裁决 NEEDS_FIX", () => {
+    // 一次成功执行(_delegateStatus 'ok')的审查行仍可裁 NEEDS_FIX；徽记只读 _reviewVerdict。
+    expect(
+      reviewVerdictBadge({ _delegateAgentId: "hidden-reviewer", _reviewVerdict: "NEEDS_FIX" }),
+    ).toEqual({ label: "未通过", tone: "warning" });
   });
 });
 

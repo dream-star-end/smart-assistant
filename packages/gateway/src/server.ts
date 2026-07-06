@@ -33,6 +33,9 @@ import {
   type OutboundTurnStatus,
   type Peer,
   type AgentGroupStatus,
+  type ReviewVerdict,
+  REVIEW_VERDICT_PASS,
+  REVIEW_VERDICT_NEEDS_FIX,
   newTraceId,
   parseTraceIdCandidate,
   STATIC_KEY_INBOUND_MODEL_IDS,
@@ -145,7 +148,7 @@ import {
   type SessionRepoBindFrame,
   type SessionRepoStatusOut,
 } from './sessionRepoWorkspace.js'
-import { SessionManager } from './sessionManager.js'
+import { SessionManager, parseVerificationVerdict } from './sessionManager.js'
 import { WebhookRouter } from './webhooks.js'
 import { inferAgentForModel } from './inferAgentForModel.js'
 import {
@@ -746,16 +749,97 @@ function parseDelegateQueueWaitMs(): number {
   return Number.isFinite(raw) && raw >= 0 ? raw : DELEGATE_QUEUE_WAIT_DEFAULT_MS
 }
 
+// ── P2 债C — hidden reviewer 硬编排 review pass 参数/文案 ──────────────────
+/** gateway 硬编排 review pass 的隐藏审查员 agent id(权威 = protocol
+ *  HIDDEN_SYSTEM_AGENT_IDS,此处引用其唯一成员的字面量;isHiddenSystemAgentId 恒真)。 */
+const HIDDEN_REVIEWER_AGENT_ID = 'hidden-reviewer'
+/** NEEDS_FIX → continuation → 再审 的迭代封顶(预算封顶,env 可配)。到顶强制放行 +
+ *  披露"仍有未决意见"。默认 2;非法/缺省回退默认。硬护栏另见 MAX_HIDDEN_DELEGATIONS_PER_TURN。 */
+export const TEAM_REVIEW_MAX_ROUNDS_DEFAULT = 2
+function resolveTeamReviewMaxRounds(): number {
+  const raw = Number(process.env.OPENCLAUDE_TEAM_REVIEW_MAX_ROUNDS)
+  if (!Number.isFinite(raw)) return TEAM_REVIEW_MAX_ROUNDS_DEFAULT
+  // 下限 1(至少审一次)、上限对齐硬护栏(不让 env 把轮数抬过熔断)。
+  const n = Math.floor(raw)
+  return Math.min(Math.max(n, 1), MAX_HIDDEN_DELEGATIONS_PER_TURN)
+}
+/** 审查委派的 context:喂给隐藏审查员的用户原始需求 + 队长待提交草稿。 */
+function buildTeamReviewContext(userTask: string, leaderDraft: string): string {
+  const task = userTask.trim().slice(0, 8000)
+  const draft = leaderDraft.trim().slice(0, 16000)
+  return [
+    '【审查任务】队长(全能助手)在团队协作后准备把下面的草稿作为最终答复提交给用户。',
+    '请独立审查该草稿:找事实错误、遗漏、过度承诺、执行风险、以及与用户需求的偏离。',
+    '',
+    '## 用户原始需求',
+    task || '(未提供)',
+    '',
+    '## 队长待提交草稿',
+    draft || '(队长本轮没有产出文本草稿)',
+    '',
+    '审查完成后,按你的 persona 要求在最后单独一行输出结构化裁决:`VERDICT: PASS` 或 `VERDICT: NEEDS_FIX`。',
+  ].join('\n')
+}
+/** NEEDS_FIX 后喂回队长的 system continuation:带上审查意见,要求队长修订或据理反驳后重新给出最终答复。 */
+function buildTeamReviewContinuation(reviewOutput: string): string {
+  const review = reviewOutput.trim().slice(0, 16000)
+  return [
+    '【系统 · 质量审查反馈】隐藏审查员对你上面的草稿给出了 NEEDS_FIX 裁决,审查意见如下:',
+    '',
+    review || '(审查员未给出具体意见文本)',
+    '',
+    '请据此修订你给用户的最终答复:接受并修复真实问题,或对你判定为误报/非问题/范围外的意见给出简明理由。',
+    '然后直接输出修订后的最终答复(面向用户,不要复述本审查过程)。系统会在你完成后再次自动审查。',
+  ].join('\n')
+}
+
 /** 资源闸拦截原因 —— 两道闸共用一个判定/拒绝收口,避免两套并行机制。 */
 type DelegateGateBlock =
   | { kind: 'concurrency' }
   | { kind: 'memory'; pct: number; limitPct: number }
 
+/** P2 债C — `_runDelegateTask` 的结构化入参(HTTP 壳从请求 body 组装;gateway 硬编排
+ *  review pass 直接构造)。把委派执行核心与 HTTP req/res 解耦,让编排能内部直调同一路径
+ *  拿到结构化结果(verdict/output),不必伪造 req/res。 */
+interface RunDelegateInput {
+  targetAgentId: string
+  goal: string
+  context?: string
+  sourceAgent?: string
+  toolsets?: unknown
+  /** 父会话 sessionKey(容器内部键):委派归因 + 进度回传 + per-parent 分桶的解析源。 */
+  parentSessionKey?: string
+  streamProgress?: boolean
+  depth: number
+  /** gateway 硬编排触发的隐藏审查员委派。影响:runLog isReview / 资源闸走保留槽 + 免
+   *  per-parent 桶 / 完成后解析结构化 verdict / 不置位"本 turn 有非隐藏委派"跟踪。 */
+  isReview?: boolean
+}
+/** `_runDelegateTask` 结果。rejected=闸/校验拒(HTTP 壳映射 4xx/429/503);error=session
+ *  创建等意外(映射 500);completed=真正执行完(ok/output/error/timedOut,review 还带 verdict)。 */
+type DelegateTaskResult =
+  | { kind: 'rejected'; httpStatus: number; message: string }
+  | { kind: 'error'; message: string }
+  | {
+      kind: 'completed'
+      ok: boolean
+      output: string
+      error?: string
+      timedOut: boolean
+      runId: string
+      verdict?: ReviewVerdict
+    }
+
 // ── hidden 系统 agent 串行委派熔断 ──────────────────────────────────────────
 /** 同一父 turn 内对 hidden 系统 agent(隐藏审查员)的委派次数硬上限。
- *  team-mode prompt 的"NEEDS_FIX→修→再审→迭代到 PASS"闭环只有 prompt 级约束,
- *  每轮 review 都是全新 delegate session 全额计费;delegation depth 只管嵌套、
- *  MAX_CONCURRENT_DELEGATIONS 只管并行,都拦不住串行重试,这里是第三条腿。 */
+ *
+ *  P2 债C 后语义变更:审查触发权威已从 prompt 软约束**收归 gateway 硬编排**
+ *  (dispatchInbound teamMode-main-webchat 的 review pass),队长 preamble 不再自觉
+ *  调用 hidden-reviewer。本熔断因此从"拦队长 prompt 级串行重试"变为**硬编排重试的
+ *  后备保险**:硬编排自身把迭代封顶在 OPENCLAUDE_TEAM_REVIEW_MAX_ROUNDS(默认 2)轮,
+ *  本上限(3)是更外层的绝对护栏——即便编排逻辑有 bug 或未来放宽轮数,单 turn 对审查员
+ *  的委派也不会失控(每轮 review 都是全新 delegate session 全额计费)。delegation depth
+ *  只管嵌套、MAX_CONCURRENT_DELEGATIONS 只管并行,都拦不住串行重试,这里是第三条腿。 */
 export const MAX_HIDDEN_DELEGATIONS_PER_TURN = 3
 
 /** hidden 委派计数器。计数键 = **父会话 sessionKey**,依据:
@@ -6252,7 +6336,29 @@ export class Gateway {
   /** Active delegation count for recursion/concurrency limits */
   private _activeDelegations = 0
   private static MAX_CONCURRENT_DELEGATIONS = 5
+  /** P2 债C/3.5 — 硬编排 review 保留槽:非 review 委派最多用到
+   *  (MAX_CONCURRENT_DELEGATIONS − 保留槽),给质量审查留位,消 cron/他会话把并发占满
+   *  导致队长的 review delegate 拿不到槽而降级放行。review 委派本身可用满全局上限。 */
+  private static DELEGATE_REVIEW_RESERVED_SLOTS = 1
+  /** P2 债C/3.5 — 单父会话(队长)并行 fan-out 上限。非 review 委派按父分桶计数,
+   *  超上限进排队;review 委派豁免此桶(有独立保留槽)。消"一个队长把 5 个全局槽占光"。
+   *  env 可配(下限 1)。 */
+  private static get MAX_CONCURRENT_DELEGATIONS_PER_PARENT(): number {
+    const raw = Number(process.env.OPENCLAUDE_DELEGATE_MAX_PER_PARENT)
+    return Number.isFinite(raw) && raw >= 1 ? Math.floor(raw) : 3
+  }
   private _activeDelegationsByParent = new Map<string, Set<string>>()
+  /** P2 债C/3.5 — 每父会话**运行中**(已过闸、占槽)的非 review 委派计数,per-parent 并发
+   *  分桶的权威。区别于 _activeDelegationsByParent(那是含排队中的 childSessionKey Set,
+   *  供 Stop 级联);本 Map 只在 slot 预占/释放时同步增减,是"运行中"的精确计数。
+   *  测试脚手架 Object.create(Gateway.prototype) 不跑字段初始化,使用处惰性 ??=
+   *  (同 _delegateQueueWaiters)。 */
+  private _runningDelegationsByParent: Map<string, number> | undefined
+  /** P2 债C — 本 turn 发生过**非隐藏**委派的父(队长)webchat sessionKey 集合。
+   *  硬编排 review pass 据此判定"本 turn 是否实际组队"→ 决定队长 final 放行前是否触发审查。
+   *  turn 起始清零(与 _hiddenDelegateGuard.resetForParent 同点),_runDelegateTask 里对
+   *  非隐藏 + webchat 父的委派置位。使用处惰性 ??=(同上)。 */
+  private _turnDelegatedNonHiddenByParent: Set<string> | undefined
   /** hidden 审查员串行委派熔断(见 HiddenDelegateGuard 注释)。gateway 是容器内
    *  单进程,内存计数即权威。 */
   private _hiddenDelegateGuard = new HiddenDelegateGuard()
@@ -6270,10 +6376,29 @@ export class Gateway {
   }
 
   /** 两道资源闸共用的判定。并发在前 —— 与历史行为的拒绝优先级一致
-   *  (旧代码并发 429 判在内存 503 之前)。 */
-  private _checkDelegateResourceGate(): DelegateGateBlock | null {
-    if (this._activeDelegations >= Gateway.MAX_CONCURRENT_DELEGATIONS) {
+   *  (旧代码并发 429 判在内存 503 之前)。
+   *
+   *  P2 债C/3.5 — 分桶 + review 保留槽:
+   *   - 全局:review 委派可用满 MAX;非 review 委派最多用到 MAX − 保留槽,给审查留位。
+   *   - per-parent:非 review 委派按父分桶计数,单父超上限即 concurrency block(进排队);
+   *     review 委派豁免此桶(它有独立保留槽,不受某父 fan-out 挤占)。
+   *   缺 parentBucketKey(cron/webhook 父不在内存)→ 只受全局闸,不分桶(与既有行为一致)。 */
+  private _checkDelegateResourceGate(opts?: {
+    parentBucketKey?: string
+    isReview?: boolean
+  }): DelegateGateBlock | null {
+    const isReview = opts?.isReview === true
+    const globalCap = isReview
+      ? Gateway.MAX_CONCURRENT_DELEGATIONS
+      : Gateway.MAX_CONCURRENT_DELEGATIONS - Gateway.DELEGATE_REVIEW_RESERVED_SLOTS
+    if (this._activeDelegations >= globalCap) {
       return { kind: 'concurrency' }
+    }
+    if (!isReview && opts?.parentBucketKey) {
+      const running = (this._runningDelegationsByParent ??= new Map()).get(opts.parentBucketKey) ?? 0
+      if (running >= Gateway.MAX_CONCURRENT_DELEGATIONS_PER_PARENT) {
+        return { kind: 'concurrency' }
+      }
     }
     const pressure = this._readDelegateMemoryPressure()
     const limit = parseDelegateMemoryPressureRatio()
@@ -6288,12 +6413,34 @@ export class Gateway {
   }
 
   /** 预占一个并发名额(判定+自增在同一同步段,单线程下原子,等待者间无超发);
-   *  被闸拦截则返回原因、不占名额。 */
-  private _tryReserveDelegateSlot(): DelegateGateBlock | null {
-    const blocked = this._checkDelegateResourceGate()
+   *  被闸拦截则返回原因、不占名额。P2 债C:非 review + 有父桶 → 同步 bump per-parent 运行计数。 */
+  private _tryReserveDelegateSlot(opts?: {
+    parentBucketKey?: string
+    isReview?: boolean
+  }): DelegateGateBlock | null {
+    const blocked = this._checkDelegateResourceGate(opts)
     if (blocked) return blocked
     this._activeDelegations++
+    if (opts && !opts.isReview && opts.parentBucketKey) {
+      const m = (this._runningDelegationsByParent ??= new Map())
+      m.set(opts.parentBucketKey, (m.get(opts.parentBucketKey) ?? 0) + 1)
+    }
     return null
+  }
+
+  /** 释放一个已预占的并发名额(全局 + per-parent)。所有过闸后的路径必须经此释放,
+   *  与 _tryReserveDelegateSlot 的增量口径严格对称(否则 per-parent 计数漂移锁死后续委派)。 */
+  private _releaseDelegateSlot(opts?: {
+    parentBucketKey?: string
+    isReview?: boolean
+  }): void {
+    this._activeDelegations--
+    if (opts && !opts.isReview && opts.parentBucketKey) {
+      const m = (this._runningDelegationsByParent ??= new Map())
+      const cur = m.get(opts.parentBucketKey) ?? 0
+      if (cur <= 1) m.delete(opts.parentBucketKey)
+      else m.set(opts.parentBucketKey, cur - 1)
+    }
   }
 
   /**
@@ -6314,6 +6461,10 @@ export class Gateway {
    */
   private async _waitForDelegateCapacity(args: {
     sessionKey: string
+    /** P2 债C/3.5 — per-parent 分桶键(队长会话 sessionKey);缺省 → 只走全局闸。 */
+    parentBucketKey?: string
+    /** P2 债C — review 委派:走保留槽、豁免 per-parent 桶。 */
+    isReview?: boolean
     onQueued?: (blocked: DelegateGateBlock) => void
   }): Promise<
     | { status: 'ok' }
@@ -6321,7 +6472,8 @@ export class Gateway {
     | { status: 'timeout'; blocked: DelegateGateBlock; waitedMs: number }
     | { status: 'aborted'; waitedMs: number }
   > {
-    const first = this._tryReserveDelegateSlot()
+    const reserveOpts = { parentBucketKey: args.parentBucketKey, isReview: args.isReview }
+    const first = this._tryReserveDelegateSlot(reserveOpts)
     if (!first) return { status: 'ok' }
     const waiters = (this._delegateQueueWaiters ??= new Map())
     if (waiters.size >= DELEGATE_QUEUE_MAX_WAITERS) {
@@ -6354,7 +6506,7 @@ export class Gateway {
         if (aborted || this._shuttingDown) {
           return { status: 'aborted', waitedMs: Date.now() - startedAt }
         }
-        const blocked = this._tryReserveDelegateSlot()
+        const blocked = this._tryReserveDelegateSlot(reserveOpts)
         if (!blocked) return { status: 'ok' }
         lastBlocked = blocked
         if (Date.now() - startedAt >= waitBudgetMs) {
@@ -6475,15 +6627,54 @@ export class Gateway {
     }
     const { goal, context, sourceAgent, toolsets } = parsed
     if (!goal) return this.sendError(res, 400, 'goal required')
-
-    // Recursion guard: check delegation depth via header。深度闸必须先于资源闸:
-    // 超深嵌套是硬错误,等不出结果 —— 直接 400,不进入排队、不占等待名额。
-    // (并发闸不再在此立即 429:与内存闸一起并入下方 _waitForDelegateCapacity
-    //  有界排队收口。)
     const depthHeader = req.headers['x-delegation-depth']
     const depth = depthHeader ? Number.parseInt(String(depthHeader), 10) : 0
+
+    // HTTP 入口:解析 body → 结构化 input → _runDelegateTask 核心 → 结果映射回 res。
+    // 委派执行核心与 HTTP req/res 解耦(P2 债C),让 gateway 硬编排 review pass
+    // (dispatchInbound)能内部直调同一委派路径拿到结构化结果(verdict/output),
+    // 无需伪造 req/res。
+    const result = await this._runDelegateTask({
+      targetAgentId,
+      goal,
+      context: typeof context === 'string' ? context : undefined,
+      sourceAgent: typeof sourceAgent === 'string' ? sourceAgent : undefined,
+      toolsets,
+      parentSessionKey:
+        typeof parsed.parentSessionKey === 'string' ? parsed.parentSessionKey : undefined,
+      streamProgress: parsed.streamProgress === true,
+      depth,
+    })
+    if (result.kind === 'rejected') return this.sendError(res, result.httpStatus, result.message)
+    if (result.kind === 'error') return this.sendError(res, 500, result.message)
+    return this.sendJson(res, 200, {
+      ok: result.ok,
+      agentId: targetAgentId,
+      output: result.output,
+      error: result.error || undefined,
+    })
+  }
+
+  /**
+   * P2 债C — handleDelegateTask 的 HTTP-无关委派执行核心。
+   *
+   * 承接原 handleDelegateTask 的全部执行逻辑(深度/熔断/资源闸有界排队/session 创建/
+   * submit/timeout/进度回传/团队卡缓冲),但以结构化 {@link RunDelegateInput} 入、
+   * {@link DelegateTaskResult} 出,不碰 req/res。两个调用方:
+   *   1. handleDelegateTask —— HTTP 委派端点(队长/成员经 delegate_task MCP 工具);
+   *   2. dispatchInbound 的硬编排 review pass —— 队长 final 放行前直调,isReview:true。
+   *
+   * `isReview` 语义:走资源闸保留槽 + 免 per-parent 桶(审查不受某父 fan-out 挤占);
+   * runLog 打 isReview;完成后从审查输出解析结构化 verdict 一并回带 + 落团队卡。
+   */
+  private async _runDelegateTask(input: RunDelegateInput): Promise<DelegateTaskResult> {
+    const { targetAgentId, goal, context, sourceAgent, toolsets, depth } = input
+    const isReview = input.isReview === true
+    const parentSessionKey = input.parentSessionKey
+
+    // Recursion guard: 深度闸必须先于资源闸(超深嵌套是硬错误,不进排队/不占等待名额)。
     if (depth >= 3) {
-      return this.sendError(res, 400, 'delegation depth limit exceeded (max 3)')
+      return { kind: 'rejected', httpStatus: 400, message: 'delegation depth limit exceeded (max 3)' }
     }
 
     // Serial guard: hidden 系统 agent(隐藏审查员)同一父 turn 内委派次数硬上限。
@@ -6495,8 +6686,8 @@ export class Gateway {
     // 代价是"排队超时"的审查委派也已扣一次额度(保守偏置,与上一行语义一致)。
     if (isHiddenSystemAgentId(targetAgentId)) {
       const guardKey =
-        typeof parsed.parentSessionKey === 'string' && parsed.parentSessionKey
-          ? parsed.parentSessionKey
+        typeof parentSessionKey === 'string' && parentSessionKey
+          ? parentSessionKey
           : `delegate-src:${typeof sourceAgent === 'string' && sourceAgent ? sourceAgent : 'system'}`
       if (!this._hiddenDelegateGuard.tryAcquire(guardKey)) {
         this.log.warn('delegate_hidden_limit', {
@@ -6504,18 +6695,18 @@ export class Gateway {
           guardKey,
           limit: MAX_HIDDEN_DELEGATIONS_PER_TURN,
         })
-        return this.sendError(
-          res,
-          429,
-          `审查委派已达本轮上限(${MAX_HIDDEN_DELEGATIONS_PER_TURN}次),请基于已有审查结论收尾,不要再发起新的审查委派`,
-        )
+        return {
+          kind: 'rejected',
+          httpStatus: 429,
+          message: `审查委派已达本轮上限(${MAX_HIDDEN_DELEGATIONS_PER_TURN}次),请基于已有审查结论收尾,不要再发起新的审查委派`,
+        }
       }
     }
 
     // Find target agent
     const cfg = await this._getAgentsConfig()
     const targetAgent = cfg.agents.find((a) => a.id === targetAgentId)
-    if (!targetAgent) return this.sendError(res, 404, `agent "${targetAgentId}" not found`)
+    if (!targetAgent) return { kind: 'rejected', httpStatus: 404, message: `agent "${targetAgentId}" not found` }
 
     // Resolve the delegated member's toolsets the same way the normal message
     // path does: member baseline + on-demand grant (task intent on goal/context)
@@ -6552,11 +6743,11 @@ export class Gateway {
     })
 
     const progressTarget = this._resolveDelegateProgressTarget({
-      parentSessionKey: parsed.parentSessionKey,
+      parentSessionKey,
       sourceAgent,
     })
     const delegateParent = this._resolveDelegateParent({
-      parentSessionKey: parsed.parentSessionKey,
+      parentSessionKey,
       sourceAgent,
     })
     // delegate 计费归因:父**客户端**会话 id(web-*)优先,拿不到才落容器内部
@@ -6567,7 +6758,7 @@ export class Gateway {
     const parentClientSessionId = resolveDelegateParentClientSessionId({
       progressPeerId: progressTarget?.peerId,
       parentRepoSessionId: delegateParent?.repoSessionId,
-      parentSessionKey: parsed.parentSessionKey,
+      parentSessionKey,
     })
 
     const progressRunId = `dlg-${Date.now().toString(36)}-${randomBytes(4).toString('hex')}`
@@ -6584,7 +6775,13 @@ export class Gateway {
       }
       this.deliver(out as OutboundMessage & { _userId?: string })
     }
-    const streamProgress = progressTarget && parsed.streamProgress === true
+    const streamProgress = progressTarget && input.streamProgress === true
+
+    // P2 债C/3.5 — per-parent 分桶键 = 队长(父)会话 sessionKey(仅父在内存 webchat/delegate
+    // 时非空;cron/webhook 父 null → 只受全局闸)。review 委派豁免分桶、走保留槽。slotOpts 是
+    // 预占/释放的对称口径,过闸后所有释放路径必须用它(否则 per-parent 运行计数漂移锁死)。
+    const parentBucketKey = delegateParent?.sessionKey
+    const slotOpts = { parentBucketKey, isReview }
 
     // ── 资源闸有界排队(并发上限 + 内存水位共用 _waitForDelegateCapacity 收口)──
     // 父→子注册必须先于等待:排队期间用户 Stop 级联(_interruptDelegationsForParent)
@@ -6596,6 +6793,8 @@ export class Gateway {
     let queuedNoticeSent = false
     const gate = await this._waitForDelegateCapacity({
       sessionKey,
+      parentBucketKey,
+      isReview,
       onQueued: (blocked) => {
         this.log.info('delegate_queue_wait', {
           targetAgentId,
@@ -6669,7 +6868,7 @@ export class Gateway {
           }),
         )
       }
-      return this.sendError(res, httpStatus, message)
+      return { kind: 'rejected', httpStatus, message }
     }
     // 已过闸:并发名额已在 _tryReserveDelegateSlot 同步预占,此后所有路径必须释放
     // —— 正常路径走下方 finally,session 创建/开始帧投递抛错走本 catch。
@@ -6704,9 +6903,18 @@ export class Gateway {
         )
       }
     } catch (err) {
-      this._activeDelegations--
+      this._releaseDelegateSlot(slotOpts)
       unregisterDelegation?.()
-      throw err // 路由层 .catch → sendInternalError(500),与既往一致
+      // 原为 throw → 路由 .catch → 500;现由 HTTP 壳把 {kind:'error'} 映射成 sendError(500),
+      // 内部编排调用则据此走降级放行,语义等价、可结构化处理。
+      return { kind: 'error', message: (err as Error)?.message ?? String(err) }
+    }
+
+    // P2 债C — 标记"本 turn 队长实际发生过非隐藏委派"(据此在队长 final 放行前触发硬编排
+    // 审查)。审查员自身(isReview / hidden)不置位,避免"审查=组队"的自指。progressTarget
+    // 是 webchat 父(与硬编排 orchestrateReview 判定同源),null 父(cron/嵌套)不置位。
+    if (!isReview && !isHiddenSystemAgentId(targetAgentId) && progressTarget) {
+      ;(this._turnDelegatedNonHiddenByParent ??= new Set()).add(progressTarget.sessionKey)
     }
 
     // Build prompt with context
@@ -6714,10 +6922,18 @@ export class Gateway {
       ? `[委派任务]\n\n目标: ${goal}\n\n上下文:\n${context}\n\n请完成上述任务并返回结果摘要。`
       : `[委派任务]\n\n目标: ${goal}\n\n请完成上述任务并返回结果摘要。`
 
-    const _dlgRun = this._runLog.start({ agentId: targetAgentId, sessionKey, taskType: 'delegate' })
+    const _dlgRun = this._runLog.start({
+      agentId: targetAgentId,
+      sessionKey,
+      taskType: 'delegate',
+      ...(isReview ? { isReview: true } : {}),
+    })
     let output = ''
     let error = ''
     let timedOut = false
+    // P2 债C — review 委派结束时从审查输出解析出的结构化裁决(PASS/NEEDS_FIX);
+    // 非 review / 解析不出 → undefined(编排据 undefined 走降级放行)。
+    let verdict: ReviewVerdict | undefined
     const timeoutConfig = resolveDelegateTimeoutConfig()
     const startedAt = Date.now()
     let lastChildActivityAt = startedAt
@@ -6762,6 +6978,15 @@ export class Gateway {
           error = `${delegatedApiError.message}\n\n${delegatedApiError.detail}`
         }
       }
+      // P2 债C — review 委派干净完成(无 error)→ 从输出解析结构化 VERDICT 行。解析器
+      // 认 PASS/FAIL/PARTIAL/NEEDS_FIX,passed=(verdict==='PASS')。审查员漏输出裁决行 →
+      // parsed=null → verdict 保持 undefined → 编排判定"审查未完成"降级放行(fail-safe)。
+      if (isReview && !error) {
+        const parsedVerdict = parseVerificationVerdict(output)
+        if (parsedVerdict) {
+          verdict = parsedVerdict.passed ? REVIEW_VERDICT_PASS : REVIEW_VERDICT_NEEDS_FIX
+        }
+      }
       if (streamProgress) {
         emitProgress(
           makeDelegateProgressBlock({
@@ -6777,6 +7002,7 @@ export class Gateway {
       this._runLog.complete(_dlgRun, {
         status: error ? 'failed' : 'completed',
         error: error || undefined,
+        ...(verdict ? { verdict } : {}),
       })
     } catch (err: any) {
       error = error || err?.message || String(err)
@@ -6810,7 +7036,7 @@ export class Gateway {
     } finally {
       clearTimeoutTimer()
       unregisterDelegation?.()
-      this._activeDelegations--
+      this._releaseDelegateSlot(slotOpts)
       // 本次 delegate 的子会话(sessionKey 带时间戳,一次性)在生命周期内可能
       // 作为"父"再委派 hidden 审查员;它收尾后计数键永远不会复用,这里清理防泄漏。
       // 注意清的是子会话自己的键,不动 guardKey(父会话的额度要跨多次 delegate 累计)。
@@ -6846,15 +7072,82 @@ export class Gateway {
         status,
         ...(resultSummary.length > 0 ? { resultSummary } : {}),
         completedAt: Date.now(),
+        // P2 债C — 审查员委派行带上裁决,前端渲染「质量审查员 · PASS/未通过」。
+        ...(verdict ? { verdict } : {}),
       })
     }
 
-    this.sendJson(res, 200, {
+    return {
+      kind: 'completed',
       ok: !error,
-      agentId: targetAgentId,
       output: output.trim(),
       error: error || undefined,
-    })
+      timedOut,
+      runId: progressRunId,
+      verdict,
+    }
+  }
+
+  /**
+   * P2 债C — hidden reviewer 硬编排的审查状态机(纯编排,副作用以回调注入)。
+   *
+   * dispatchInbound 在 teamMode 队长(webchat)turn 完成、且本 turn 实际组队后调用。
+   * 返回 { deliver, disclosure }:deliver=是否放行被扣住的队长 final(false 仅当
+   * continuation 'errored' —— 终态错误帧已由队长 turn 自投递,无需再放行);disclosure=
+   * 放行时附带的披露文案(降级/到顶时非空)。
+   *
+   * 红线(队长绝不卡死等 verdict):review 委派任何非"完成且解析出裁决"的结果
+   * (闸拒/429/503/session 抛错/超时/无 VERDICT)一律降级放行 + 披露;continuation
+   * 'other'(非常规终态)也收敛为放行,防挂起。副作用注入让本状态机可脱离
+   * dispatchInbound 单测(mock runReview 返回 PASS/NEEDS_FIX/rejected + mock
+   * submitContinuation 断言 PASS 放行 / NEEDS_FIX 续写 / 降级放行 / 迭代封顶)。
+   */
+  private async _runTeamReviewPass(args: {
+    sessionKey: string
+    maxRounds: number
+    /** 跑一轮审查委派(isReview)。返回 DelegateTaskResult。 */
+    runReview: () => Promise<DelegateTaskResult>
+    /** NEEDS_FIX → 把审查意见喂回队长续写。返回续写终态:
+     *  'held'(完成并再次扣住 final,继续下一轮)/ 'errored'(报错,终态帧已投递)/
+     *  'other'(非常规终态,防御性收尾放行)。 */
+    submitContinuation: (reviewOutput: string) => Promise<'held' | 'errored' | 'other'>
+  }): Promise<{ deliver: boolean; disclosure?: string }> {
+    const { sessionKey, maxRounds } = args
+    let round = 0
+    while (true) {
+      round++
+      const rev = await args.runReview()
+      if (rev.kind !== 'completed' || rev.timedOut || rev.error || !rev.verdict) {
+        const reason =
+          rev.kind === 'rejected'
+            ? `gate_${rev.httpStatus}`
+            : rev.kind === 'error'
+              ? 'error'
+              : rev.timedOut
+                ? 'timeout'
+                : rev.error
+                  ? 'delegate_error'
+                  : 'no_verdict'
+        this.log.info('team_review_degraded', { sessionKey, round, reason })
+        return {
+          deliver: true,
+          disclosure: '（说明:本轮团队质量审查未能完成,已直接返回队长的结论。）',
+        }
+      }
+      this.log.info('team_review', { sessionKey, round, verdict: rev.verdict })
+      if (rev.verdict === REVIEW_VERDICT_PASS) return { deliver: true }
+      // NEEDS_FIX
+      if (round >= maxRounds) {
+        return {
+          deliver: true,
+          disclosure: '（说明:质量审查仍有未决意见,已达审查迭代上限,返回队长当前结论。）',
+        }
+      }
+      const cont = await args.submitContinuation(rev.output)
+      if (cont === 'errored') return { deliver: false }
+      if (cont === 'other') return { deliver: true } // 防御:非常规终态 → 收尾放行,防挂起
+      // 'held' → 继续下一轮审查
+    }
   }
 
   private async _handleWebhook(
@@ -9487,21 +9780,17 @@ export class Gateway {
               })
               .join('\n')
           : '（当前没有其它已安装 agent —— 直接自己完成即可）'
+      // P2 债C — preamble 只保留**协作**语义(拆解/委派/领域路由/综合)。审查已由 gateway
+      // 硬编排接管(见 dispatchInbound 队长 final 放行前的 review pass):队长不再被 prompt
+      // 要求"自觉调用 hidden-reviewer / 解读 verdict / 迭代到 PASS / 说明审查失败" —— 那套
+      // 软约束整体删除,审查触发权威唯一 = gateway 代码,消"prompt 说要审查但模型不照做"的漂移。
       const teamPreamble = [
         '【团队模式已开启】把这次任务当作队长来处理：',
         `可委派的成员（已安装 agent）：\n${memberLines}`,
-        '- 你是队长，也是完成用户任务的第一负责人；从任务拆解、是否委派、是否审查、是否采纳审查意见到最终答复，都由你端到端负责。',
+        '- 你是队长，也是完成用户任务的第一负责人；从任务拆解、是否委派到最终答复，都由你端到端负责。',
         '- 领域匹配优先于泛泛并行：用户任务明显属于某个已安装成员的领域时，优先把对应部分委派给该成员；多领域任务则拆给对应成员后由你综合。常见路由：代码/调试/测试/重构/代码库 → `coding-assistant`；科研/文献/论文/引用/学术分析 → `research-assistant`；文档/PPT/Excel/PDF/周报/公文/邮件/办公交付 → `office-assistant`。如果对应成员未安装，你可以自己完成或选择最接近的已安装成员。',
         '- 任务复杂、可拆解 → **首选**用 `delegate_task(goal, agentId, context)` 委派子任务给上面列出的已安装成员组队，拿到各成员结果后你综合成给用户的最终答案；任务简单则直接自己完成。',
         '- 委派**只走 `delegate_task`**：这是平台唯一的组队/委派通道（有实时进度回传、计费与资源约束）。平台已停用 codex 原生 `Agent`/子进程编排，不存在这样的工具，不要尝试启动；需要拆分的子任务一律用 `delegate_task`，不确定或不适合委派时就自己完成。',
-        '- 系统隐藏审查员：`hidden-reviewer`（不在成员列表显示）。如果本轮实际通过 `delegate_task` 调用了任何非队长成员，在最终答复前默认要再调用 `delegate_task(goal, agentId: "hidden-reviewer", context: "...")` 请它审查你的草稿/综合结论。',
-        '- 只有纯机械低风险任务、用户明确要求快速/低成本、或隐藏审查失败/超时时，才可以跳过或继续；如果你尝试隐藏审查但失败或超时，最终答案里要明确说明“隐藏审查未完成/失败”。',
-        '- 审查 context 必须包含：用户原始需求、你准备给用户的草稿/关键方案、关键假设、已采纳的成员结论和你认为的风险点；审查结果只是建议，不是命令。',
-        '- 审查迭代闭环：如果隐藏审查返回 PASS 或无阻塞问题，你可以最终答复；如果返回 NEEDS_FIX 或指出具体问题，你不能直接结束，必须先选择接受并修复、委派对应领域成员修复、查询/验证证据，或明确判定该意见是误报/非问题/范围外并说明理由。',
-        '- 做出实质修复后，需要再次调用 `hidden-reviewer` 审查修订稿；再次审查 context 要包含修订后的草稿、已修复项、未采纳意见及理由、关键证据。迭代直到隐藏审查 PASS，或你基于证据判断剩余意见是误报/非问题/范围外。',
-        '- 避免无限循环：如果隐藏审查反复失败/超时、重复没有新信息，或你已给出充分证据反驳剩余意见，可以停止迭代并承担最终责任；除非审查失败/超时或剩余限制会影响答案可信度，最终回复不要展开内部审查过程。',
-        '- 收到审查结果后，由你自主决定接受、拒绝、部分采纳、修订、再次审查或直接答复；不要因为审查员给出意见就机械照单全收。',
-        '- 如果本轮没有调用任何非队长成员，仍可在任务复杂、高风险、事实/承诺敏感时主动请隐藏审查；如果你判断无需审查并跳过，不需要向用户解释流程。',
         '',
         '用户任务：',
         '',
@@ -9521,7 +9810,18 @@ export class Gateway {
     // 只带 parentSessionKey(没有 turn 级标识),所以"每 turn 上限"的 turn 边界由
     // 这里定义:同一 sessionKey 收到下一条入站用户消息即视为新 turn。
     this._hiddenDelegateGuard.resetForParent(sessionKey)
-    const _run = this._runLog.start({ agentId: session.agentId, sessionKey, taskType })
+    // P2 债C — 新 turn 起始清零"本 turn 是否发生过非隐藏委派"跟踪(与上面的熔断重置同点)。
+    ;(this._turnDelegatedNonHiddenByParent ??= new Set()).delete(sessionKey)
+    // P2 债C — hidden reviewer 硬编排状态。orchestrateReview:仅 teamMode 队长(main)且
+    // webchat(!adapter,team 是 webchat-only 功能)启用;此时队长 turn 的 final 被"扣住"
+    // (finalHeld),由下方 review pass 决定放行/续写/降级。currentRun 让 continuation 每轮
+    // 各记一条 runLog(callback 引用 currentRun 而非 _run)。turnErrored:error/apiError 分支
+    // 已投递终态错误帧,编排不再介入。
+    const orchestrateReview = teamMode && agent.id === 'main' && !adapter
+    let currentRun = this._runLog.start({ agentId: session.agentId, sessionKey, taskType })
+    let heldFinalMeta: Extract<SessionStreamEvent, { kind: 'final' }>['meta']
+    let finalHeld = false
+    let turnErrored = false
     // P1-3 续 — CCB 用 createAssistantAPIErrorMessage 把 API 调用错误包成
     // "API Error: ..." 文本作为正常 assistant text 流出(不抛 process error),
     // 因此走的是 e.kind === 'block' + 'final' 的正常 turn 路径,绕开了下面
@@ -9535,7 +9835,10 @@ export class Gateway {
     // 永远拦不到。
     let _apiErrorIntercepted = false
     let _apiErrorText = ''
-    await this.sessions.submit(session, payload, (e) => {
+    // P2 债C — 提取为具名回调,供硬编排 review pass 的 continuation 复用同一份流式处理
+    // (再次 submit 时 block 照常流给客户端、final 照常被 finalHeld 扣住)。非 team 路径
+    // 语义与原内联回调逐字节一致。
+    const onLeaderEvent = (e: SessionStreamEvent) => {
       if (e.kind === 'block') {
         const b = e.block as any
         // tool_output_tail 是替换语义的快照(1Hz),且 sessionManager 现在让
@@ -9616,10 +9919,12 @@ export class Gateway {
         // 不会粘住。前端拿到 isFinal=true 自然回到空闲态,不依赖额外帧。
         session.currentTurnStatus = null
         if (_apiErrorIntercepted) {
+          // P2 债C — 已识别 API 错误 = 终态错误帧自投递,硬编排 review pass 不介入。
+          turnErrored = true
           // 替代原 final:发 [error] text final 关闭 turn。不附 e.meta(boss
           // 决策:错误卡不显示 cost),与 e.kind === 'error' 分支一致;runLog
           // 也按 failed 记账,idempotency key 释放允许 client retry。
-          this._runLog.complete(_run, { status: 'failed', error: _apiErrorText })
+          this._runLog.complete(currentRun, { status: 'failed', error: _apiErrorText })
           if (frame.idempotencyKey && (frame as any)._idempotencyPreReserved) {
             this._updateWechatIdempotency(frame.idempotencyKey, { completed: true })
           }
@@ -9657,13 +9962,23 @@ export class Gateway {
           aggregatedBlocks.length = 0
           return
         }
-        this._runLog.complete(_run, {
+        this._runLog.complete(currentRun, {
           status: 'completed',
           cost: e.meta?.cost,
           inputTokens: e.meta?.inputTokens,
           outputTokens: e.meta?.outputTokens,
           turn: e.meta?.turn,
         })
+        // ── P2 债C — 扣住队长 final ──
+        // teamMode 队长(webchat)turn 完成 → 不在此立即投递终态 final,而是 hold 住,
+        // 交给 submit 之后的硬编排 review pass 决定放行/续写/降级。runLog 已按本轮 completed
+        // 记账;idempotency 完成标记推迟到真正放行(deliverHeldFinal)。out.blocks 不清空
+        // (跨轮 continuation 仍复用本闭包流式;最终 deliverHeldFinal 清)。
+        if (orchestrateReview) {
+          heldFinalMeta = e.meta
+          finalHeld = true
+          return
+        }
         if (frame.idempotencyKey && (frame as any)._idempotencyPreReserved) {
           this._updateWechatIdempotency(frame.idempotencyKey, { completed: true })
         }
@@ -9812,7 +10127,9 @@ export class Gateway {
       } else if (e.kind === 'error') {
         // Plan 2 — turn 终态前清 turn_status cache,语义同 final 分支。
         session.currentTurnStatus = null
-        this._runLog.complete(_run, { status: 'failed', error: e.error })
+        // P2 债C — turn 报错 = 终态错误帧自投递,硬编排 review pass 不介入。
+        turnErrored = true
+        this._runLog.complete(currentRun, { status: 'failed', error: e.error })
         if (frame.idempotencyKey && (frame as any)._idempotencyPreReserved) {
           this._updateWechatIdempotency(frame.idempotencyKey, { completed: true })
         }
@@ -9866,14 +10183,103 @@ export class Gateway {
           )
         }
       }
-    }, safeEffortLevel, safeModel, safeRequestId, turnTraceId, safeConversationMode, {
+    }
+    const leaderSubmitOpts = {
       historicalMessages: masterHistoricalMessages,
       codexRoute: safeCodexRoute,
       ...(teamMode && agent.id === 'main'
         ? { collabAgentPolicy: 'team-mode-prefer-delegate' as const }
         : {}),
       ...(effectiveToolsets !== undefined ? { toolsets: effectiveToolsets } : {}),
-    })
+    }
+    await this.sessions.submit(
+      session,
+      payload,
+      onLeaderEvent,
+      safeEffortLevel,
+      safeModel,
+      safeRequestId,
+      turnTraceId,
+      safeConversationMode,
+      leaderSubmitOpts,
+    )
+
+    // ── P2 债C — hidden reviewer 硬编排 review pass(仅 teamMode 队长 + webchat)──
+    //
+    // 队长 turn 已完成但 final 被扣住(finalHeld)。此处是审查触发的**唯一权威**:
+    //   - 本 turn 没发生过非隐藏委派 → 无需审查,立即放行扣住的 final;
+    //   - 发生过 → 由 gateway 代码触发 review delegate(内部直调 _runDelegateTask,
+    //     isReview:true),解析 verdict:PASS 放行 / NEEDS_FIX 把审查意见以 system
+    //     continuation 喂回队长续写并再审(封顶 resolveTeamReviewMaxRounds 轮)。
+    //
+    // 红线(降级全部放行,队长绝不卡死等 verdict):review 委派的任何非"完成且有裁决"
+    // 结果(闸拒/排队超时/429/503/session 抛错/超时/解析不出 VERDICT),以及 continuation
+    // 本身出错(turnErrored),一律放行队长 final + 卡片/文案披露"审查未完成"。重启中断
+    // 由 submit reject 走 turnErrored 或 review rejected/error → 同样降级放行。
+    if (orchestrateReview) {
+      const deliverHeldFinal = (disclosure?: string) => {
+        // 披露作为一条独立 assistant 文本 block 追加(preamble 已删"队长自述审查失败",
+        // 改由 gateway 在此如实披露);无披露(PASS)则只发终态 final。
+        if (disclosure) {
+          const discBlock = { kind: 'text' as const, text: disclosure }
+          out.blocks.push(discBlock as (typeof out.blocks)[number])
+          this.deliver(
+            { ...out, blocks: [discBlock as (typeof out.blocks)[number]], isFinal: false },
+            undefined,
+          )
+        }
+        this.deliver({ ...out, blocks: [], isFinal: true, meta: heldFinalMeta }, undefined)
+        if (frame.idempotencyKey && (frame as any)._idempotencyPreReserved) {
+          this._updateWechatIdempotency(frame.idempotencyKey, { completed: true })
+        }
+        out.blocks.length = 0
+        aggregatedBlocks.length = 0
+      }
+      if (turnErrored) {
+        // 队长 turn 报错:error/apiError 分支已投递终态错误帧,无草稿可审、无 final 待放行。
+      } else if (!finalHeld) {
+        // 防御:正常 completed turn 一定命中 final 分支扣住;未扣住说明是非常规终态,不介入。
+      } else if (!(this._turnDelegatedNonHiddenByParent ??= new Set()).has(sessionKey)) {
+        // 本 turn 队长没真正组队(自己答完)→ 无需审查,直接放行扣住的 final。
+        deliverHeldFinal()
+      } else {
+        // 组队发生 → 跑审查状态机。副作用(跑审查 / 续写)以回调注入,便于单测断言
+        // PASS 放行 / NEEDS_FIX 续写 / 降级放行 三路 + 迭代封顶,而不必驱动整条 dispatchInbound。
+        const outcome = await this._runTeamReviewPass({
+          sessionKey,
+          maxRounds: resolveTeamReviewMaxRounds(),
+          runReview: () =>
+            this._runDelegateTask({
+              targetAgentId: HIDDEN_REVIEWER_AGENT_ID,
+              goal: '对队长准备提交给用户的最终答复草稿做独立质量审查,给出结构化裁决。',
+              context: buildTeamReviewContext(text, (session.currentAssistantBuf ?? '').trim()),
+              sourceAgent: 'main',
+              parentSessionKey: sessionKey,
+              streamProgress: true,
+              depth: 0,
+              isReview: true,
+            }),
+          submitContinuation: async (reviewOutput) => {
+            // 审查意见喂回队长续写;复用 onLeaderEvent(block 继续流、final 再被扣住)。
+            finalHeld = false
+            currentRun = this._runLog.start({ agentId: session.agentId, sessionKey, taskType })
+            await this.sessions.submit(
+              session,
+              buildTeamReviewContinuation(reviewOutput),
+              onLeaderEvent,
+              safeEffortLevel,
+              safeModel,
+              safeRequestId,
+              turnTraceId,
+              safeConversationMode,
+              leaderSubmitOpts,
+            )
+            return turnErrored ? 'errored' : finalHeld ? 'held' : 'other'
+          },
+        })
+        if (outcome.deliver) deliverHeldFinal(outcome.disclosure)
+      }
+    }
     if (liveWechatAdapter) {
       await liveWechatSendQueue
     }
