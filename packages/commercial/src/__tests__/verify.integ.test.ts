@@ -172,35 +172,21 @@ describe("auth.verify.verifyEmail (integ)", () => {
     );
     assert.notEqual(ev.rows[0].used_at, null, "code must be marked used");
 
-    // 2026-04-29 反薅羊毛改造:赠金在 verifyEmail 时刻发,不在 register。
-    // 2026-05-12:金额从 ¥3 → ¥5(SIGNUP_BONUS_CENTS=500n)。
-    // 验证后 users.credits=500,credit_ledger 出 1 行 promotion + ref_type='signup_bonus'。
+    // 注册赠金机制已下线(2026-07-07):邮箱验证只翻 flag,零积分、零 ledger。
+    // 新用户免费额度走免费档订阅(ensureFreeSubscription),不在本路径。
     const cred = await query<{ credits: string }>(
       "SELECT credits::text AS credits FROM users WHERE id = $1",
       [userId],
     );
-    assert.equal(cred.rows[0].credits, "500", "verifyEmail 应发放 ¥5 注册赠金");
-    const led = await query<{
-      delta: string;
-      balance_after: string;
-      reason: string;
-      ref_type: string | null;
-      memo: string | null;
-    }>(
-      `SELECT delta::text AS delta, balance_after::text AS balance_after,
-              reason, ref_type, memo
-         FROM credit_ledger WHERE user_id = $1`,
+    assert.equal(cred.rows[0].credits, "0", "verifyEmail 不再发放注册赠金");
+    const led = await query<{ cnt: string }>(
+      "SELECT COUNT(*)::text AS cnt FROM credit_ledger WHERE user_id = $1",
       [userId],
     );
-    assert.equal(led.rows.length, 1, "应只有 1 条赠送 ledger 行");
-    assert.equal(led.rows[0].delta, "500");
-    assert.equal(led.rows[0].balance_after, "500");
-    assert.equal(led.rows[0].reason, "promotion");
-    assert.equal(led.rows[0].ref_type, "signup_bonus");
-    assert.match(led.rows[0].memo ?? "", /邮箱验证赠送/);
+    assert.equal(led.rows[0].cnt, "0", "不应产生任何 ledger 行");
   });
 
-  test("idempotent bonus: admin resets email_verified→false, re-verify does NOT double-credit", async (t) => {
+  test("re-verify after admin reset: email_verified 翻回 TRUE,恒零积分零 ledger(赠金已下线)", async (t) => {
     if (skipIfNoPg(t)) return;
     const { userId, rawCode, verifyEmail: email } =
       await registerAndCaptureVerifyToken("idem@example.com", "pwd idem long");
@@ -224,12 +210,12 @@ describe("auth.verify.verifyEmail (integ)", () => {
       "SELECT credits::text AS credits FROM users WHERE id = $1",
       [userId],
     );
-    assert.equal(cred.rows[0].credits, "500", "credits 不应被重复发放");
+    assert.equal(cred.rows[0].credits, "0", "赠金已下线,重复验证也恒为 0");
     const led = await query<{ cnt: string }>(
       "SELECT COUNT(*)::text AS cnt FROM credit_ledger WHERE user_id = $1 AND reason = 'promotion'",
       [userId],
     );
-    assert.equal(led.rows[0].cnt, "1", "promotion ledger 仍应只有 1 行");
+    assert.equal(led.rows[0].cnt, "0", "不应有任何 promotion ledger 行");
   });
 
   test("legacy unverified user with pre-existing promotion row: re-verify keeps credits=300, no new ledger", async (t) => {
@@ -250,7 +236,7 @@ describe("auth.verify.verifyEmail (integ)", () => {
     const r = await verifyEmail(email, rawCode);
     assert.equal(r.newly_verified, true);
 
-    // 旧 promotion 行存在 → dup 命中 → 不再加 credits / 不再写新行
+    // 赠金分支已整体移除:历史 credits/ledger 原样保留,verify 只翻 flag
     const cred = await query<{ credits: string }>(
       "SELECT credits::text AS credits FROM users WHERE id = $1",
       [userId],
@@ -426,7 +412,7 @@ describe("auth.verify.verifyEmail (integ)", () => {
       "SELECT COUNT(*)::text AS cnt FROM credit_ledger WHERE user_id = $1 AND reason = 'promotion'",
       [u.userId],
     );
-    assert.equal(led.rows[0].cnt, "1", "解禁后正常发赠金");
+    assert.equal(led.rows[0].cnt, "0", "赠金已下线,解禁后验证也零 ledger");
   });
 });
 
