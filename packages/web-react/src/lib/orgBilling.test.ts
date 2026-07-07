@@ -1,10 +1,13 @@
 import { describe, expect, test } from "vitest";
 import type { OrgPlan } from "./types";
 import {
+  budgetView,
   canLeaveNameStep,
   canLeavePlanStep,
+  canManageOrgBilling,
   clampSeats,
   computeSeatTotal,
+  minSeatPriceYuan,
   normalizeOrgPlan,
   normalizeOrgSubscription,
   ratioPct,
@@ -228,5 +231,80 @@ describe("ratioPct（进度条百分比，BigInt 精确）", () => {
   });
   test("超大值不丢精度", () => {
     expect(ratioPct("9007199254740993", "18014398509481986")).toBe(50);
+  });
+});
+
+describe("canManageOrgBilling（计费写面门控派生，三期）", () => {
+  test("owner 恒可", () => {
+    expect(canManageOrgBilling("owner", false)).toBe(true);
+    expect(canManageOrgBilling("owner", undefined)).toBe(true);
+    expect(canManageOrgBilling("owner", null)).toBe(true);
+  });
+  test("admin / member 仅在被授予财务委派时可", () => {
+    expect(canManageOrgBilling("admin", true)).toBe(true);
+    expect(canManageOrgBilling("member", true)).toBe(true);
+    expect(canManageOrgBilling("admin", false)).toBe(false);
+    expect(canManageOrgBilling("member", undefined)).toBe(false);
+  });
+  test("空角色 + 无委派 → 不可", () => {
+    expect(canManageOrgBilling(null, null)).toBe(false);
+    expect(canManageOrgBilling(undefined, undefined)).toBe(false);
+  });
+});
+
+describe("budgetView（成员月度限额展示态，三期）", () => {
+  test("null 预算 → 不限（hasBudget=false，不超限）", () => {
+    const v = budgetView(null, "3000");
+    expect(v.hasBudget).toBe(false);
+    expect(v.over).toBe(false);
+    expect(v.pct).toBe(0);
+  });
+  test("预算内：进度与剩余精确", () => {
+    const v = budgetView("10000", "2500");
+    expect(v.hasBudget).toBe(true);
+    expect(v.over).toBe(false);
+    expect(v.pct).toBe(25);
+    expect(v.remaining).toBe("7500");
+  });
+  test("恰好达限 → over=true，剩余 0", () => {
+    const v = budgetView("10000", "10000");
+    expect(v.over).toBe(true);
+    expect(v.pct).toBe(100);
+    expect(v.remaining).toBe("0");
+  });
+  test("超限 → over=true，剩余 floor 到 0（不出现负数）", () => {
+    const v = budgetView("10000", "13000");
+    expect(v.over).toBe(true);
+    expect(v.pct).toBe(100);
+    expect(v.remaining).toBe("0");
+  });
+  test("预算 0 视为不限的宽松展示（hasBudget=false）", () => {
+    const v = budgetView("0", "500");
+    expect(v.hasBudget).toBe(false);
+    expect(v.over).toBe(false);
+  });
+  test("大数不丢精度", () => {
+    const v = budgetView("9007199254740993", "9007199254740992");
+    expect(v.over).toBe(false);
+    expect(v.remaining).toBe("1");
+  });
+});
+
+describe("minSeatPriceYuan（落地页锚点价，取最低每席价→整元）", () => {
+  test("多档取最低，去分到整元", () => {
+    expect(
+      minSeatPriceYuan([
+        { code: "a", name: "A", seatPriceCents: "29800", perSeatCredits: "0", minSeats: 3, periodDays: 30 },
+        { code: "b", name: "B", seatPriceCents: "8800", perSeatCredits: "0", minSeats: 3, periodDays: 30 },
+      ]),
+    ).toBe("88");
+  });
+  test("空列表 / 全 0 → null（调用方静态兜底）", () => {
+    expect(minSeatPriceYuan([])).toBeNull();
+    expect(
+      minSeatPriceYuan([
+        { code: "z", name: "Z", seatPriceCents: "0", perSeatCredits: "0", minSeats: 1, periodDays: 30 },
+      ]),
+    ).toBeNull();
   });
 });

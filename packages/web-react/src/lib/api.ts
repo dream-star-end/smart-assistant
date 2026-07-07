@@ -302,6 +302,7 @@ type WireUser = {
     role: "owner" | "admin" | "member";
     status: "active" | "suspended" | "deleting" | "deleted";
     billing_enabled: boolean;
+    billing_delegate?: boolean;
   } | null;
 };
 
@@ -1088,6 +1089,27 @@ export const api = {
       periodDays: p.period_days,
       tier: p.tier,
     }));
+  },
+
+  /**
+   * 企业套餐档(GET /api/subscription/plans?scope=org,公开;登录不必需)——落地页锚点价用。
+   * 定价本就是公开信息,故走公开端点。响应形容错:兼容 `{ ok, data: { plans } }` 包裹与
+   * 裸 `{ plans }`;字段名经 normalizeOrgPlan 归一(含 min_seats)。失败/空由调用方静态兜底。
+   */
+  async listOrgPlansPublic(): Promise<OrgPlan[]> {
+    const b = await jsonOrThrow<{
+      ok?: boolean;
+      plans?: unknown[];
+      data?: { plans?: unknown[] };
+    }>(
+      fetch("/api/subscription/plans?scope=org", { headers: { Accept: "application/json" } }),
+    );
+    const raw = Array.isArray(b.data?.plans)
+      ? b.data.plans
+      : Array.isArray(b.plans)
+        ? b.plans
+        : [];
+    return raw.map(normalizeOrgPlan);
   },
 
   /** 当前订阅 + 双钱包余额明细（GET /api/subscription/me，Bearer）。 */
@@ -1933,7 +1955,15 @@ export const api = {
   patchOrgMember: (
     a: AuthSession,
     uid: string,
-    patch: { org_role?: OrgRole; billing_enabled?: boolean; status?: "active" | "suspended" },
+    patch: {
+      org_role?: OrgRole;
+      billing_enabled?: boolean;
+      status?: "active" | "suspended";
+      /** 财务委派(三期):仅 owner 可改。 */
+      billing_delegate?: boolean;
+      /** 月度组织用量限额(积分;null=不限,字符串大数或数值;admin 可改)。 */
+      monthly_org_budget?: string | number | null;
+    },
   ): Promise<void> =>
     jsonOrThrow<unknown>(
       callWithRefresh(a, (t) =>

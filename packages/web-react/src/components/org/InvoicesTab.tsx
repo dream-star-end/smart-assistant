@@ -59,7 +59,14 @@ function sumCents(vals: string[]): string {
  * 抬头/申请列表走批次 D（本文件权威）；订单列表走批次 B（可能 404/501），失败时该区
  * 独立降级为 Alert，不影响抬头与申请列表。大数（amount_cents）全程字符串。
  */
-export function InvoicesTab({ auth }: { auth: AuthSession }) {
+export function InvoicesTab({
+  auth,
+  canManageBilling = false,
+}: {
+  auth: AuthSession;
+  /** owner∥财务委派才可管理抬头 / 申请开票(三期);否则只读申请记录。 */
+  canManageBilling?: boolean;
+}) {
   const [loading, setLoading] = useState(true);
   const [profile, setProfile] = useState<OrgInvoiceProfile | null>(null);
   const [orders, setOrders] = useState<OrgOrder[]>([]);
@@ -184,7 +191,16 @@ export function InvoicesTab({ auth }: { auth: AuthSession }) {
 
   return (
     <div className="flex flex-col">
-      {/* 发票抬头 */}
+      {!canManageBilling && (
+        <div className="px-5 pt-4">
+          <Alert tone="info" className="text-[12.5px]">
+            仅组织拥有者或财务委派人可管理发票抬头与申请开票，下方为开票申请记录（只读）。
+          </Alert>
+        </div>
+      )}
+
+      {/* 发票抬头(写:owner∥财务委派) */}
+      {canManageBilling && (
       <form onSubmit={saveProfile} className="px-5 py-4">
         <div className="flex items-center gap-1.5 pb-2 text-[11px] font-medium uppercase tracking-wide text-faint">
           <FileText size={13} /> 发票抬头
@@ -236,8 +252,10 @@ export function InvoicesTab({ auth }: { auth: AuthSession }) {
           )}
         </div>
       </form>
+      )}
 
-      {/* 按订单申请开票 */}
+      {/* 按订单申请开票(写:owner∥财务委派) */}
+      {canManageBilling && (
       <div className="border-t border-border px-5 py-4">
         <div className="pb-2 text-[11px] font-medium uppercase tracking-wide text-faint">
           选择已支付订单申请开票
@@ -305,8 +323,9 @@ export function InvoicesTab({ auth }: { auth: AuthSession }) {
           </>
         )}
       </div>
+      )}
 
-      {/* 申请状态 */}
+      {/* 申请状态(读:全员可见) */}
       <div className="border-t border-border px-5 py-4">
         <div className="flex items-center gap-1.5 pb-2 text-[11px] font-medium uppercase tracking-wide text-faint">
           <ReceiptText size={13} /> 开票申请

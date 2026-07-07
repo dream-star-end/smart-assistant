@@ -258,16 +258,20 @@ export function OverviewTab({
           {formatCredits(org.credits)}
           <span className="text-[14px] font-normal text-faint">积分</span>
         </div>
-        <div className="mt-3 flex flex-wrap gap-2">
-          <Button
-            variant="primary"
-            size="sm"
-            onClick={() => setTopupOpen(true)}
-            disabled={suspended}
-          >
-            <Plus size={15} /> 组织充值
-          </Button>
-        </div>
+        {canManageBilling ? (
+          <div className="mt-3 flex flex-wrap gap-2">
+            <Button
+              variant="primary"
+              size="sm"
+              onClick={() => setTopupOpen(true)}
+              disabled={suspended}
+            >
+              <Plus size={15} /> 组织充值
+            </Button>
+          </div>
+        ) : (
+          <p className="mt-2 text-[11.5px] text-faint">如需充值，请联系组织拥有者或财务委派人。</p>
+        )}
         <p className="mt-2 text-[12px] text-faint">
           组织钱包承接期内池超额与非订阅用量，永久有效。成员对话用量可由组织钱包统一结算
           （按成员的「组织结算」开关生效）。

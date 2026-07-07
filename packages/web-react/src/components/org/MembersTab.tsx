@@ -1,6 +1,7 @@
-import { UserPlus, Users } from "lucide-react";
+import { UserPlus, Users, Wallet } from "lucide-react";
 import { type FormEvent, useEffect, useState } from "react";
 import { api } from "../../lib/api";
+import { budgetView } from "../../lib/orgBilling";
 import type {
   AuthSession,
   OrgInvitation,
@@ -8,7 +9,8 @@ import type {
   OrgRole,
   OrgSubscriptionView,
 } from "../../lib/types";
-import { Alert, Badge, Button, Input, Spinner, Switch, useConfirm, useToast } from "../ui";
+import { formatCredits } from "../../lib/utils";
+import { Alert, Badge, Button, Input, Progress, Spinner, Switch, useConfirm, useToast } from "../ui";
 import { shortTime } from "../settings/labels";
 import { orgErrText, orgRoleLabel } from "./orgShared";
 
@@ -70,9 +72,16 @@ export function MembersTab({
   const [inviteRole, setInviteRole] = useState<Exclude<OrgRole, "owner">>("member");
   const [inviting, setInviting] = useState(false);
 
+  // 月度限额内联编辑:同一时刻仅一行可编辑。draft 空串=清空=不限。
+  const [budgetEditUid, setBudgetEditUid] = useState<string | null>(null);
+  const [budgetDraft, setBudgetDraft] = useState("");
+  const [savingBudget, setSavingBudget] = useState(false);
+
   const [confirm, confirmEl] = useConfirm();
   const toast = useToast();
   const isOwner = callerRole === "owner";
+  // 限额是支出策略(非动钱):admin 亦可改。财务委派开关(动权限)仅 owner。
+  const canEditBudget = callerRole === "owner" || callerRole === "admin";
 
   // 首次挂载拉成员 + 邀请（依赖数组不含 loading，防转圈）。
   useEffect(() => {
@@ -128,6 +137,52 @@ export function MembersTab({
       );
       toast(orgErrText(e, "修改组织结算失败"), "error");
     } finally {
+      setBusyUid(null);
+    }
+  }
+
+  // 财务委派开关(仅 owner):乐观更新 + 失败回退。授予后该成员可执行组织计费写操作。
+  async function toggleDelegate(m: OrgMember, next: boolean) {
+    setBusyUid(m.user_id);
+    setMembers((prev) =>
+      prev.map((x) => (x.user_id === m.user_id ? { ...x, billing_delegate: next } : x)),
+    );
+    try {
+      await api.patchOrgMember(auth, m.user_id, { billing_delegate: next });
+      toast(next ? "已授予财务委派" : "已回收财务委派", "success");
+    } catch (e) {
+      setMembers((prev) =>
+        prev.map((x) =>
+          x.user_id === m.user_id ? { ...x, billing_delegate: m.billing_delegate } : x,
+        ),
+      );
+      toast(orgErrText(e, "修改财务委派失败"), "error");
+    } finally {
+      setBusyUid(null);
+    }
+  }
+
+  // 月度限额保存(owner/admin):draft 空串=清空=不限(null);否则须为非负整数积分。
+  async function saveBudget(m: OrgMember) {
+    const raw = budgetDraft.trim();
+    const next: string | null = raw === "" ? null : raw;
+    if (next != null && !/^\d+$/.test(next)) {
+      toast("限额须为非负整数积分，或清空表示不限", "error");
+      return;
+    }
+    setSavingBudget(true);
+    setBusyUid(m.user_id);
+    try {
+      await api.patchOrgMember(auth, m.user_id, { monthly_org_budget: next });
+      setMembers((prev) =>
+        prev.map((x) => (x.user_id === m.user_id ? { ...x, monthly_org_budget: next } : x)),
+      );
+      setBudgetEditUid(null);
+      toast(next == null ? "已取消该成员限额" : "已更新月度限额", "success");
+    } catch (e) {
+      toast(orgErrText(e, "修改月度限额失败"), "error");
+    } finally {
+      setSavingBudget(false);
       setBusyUid(null);
     }
   }
@@ -245,6 +300,7 @@ export function MembersTab({
                   </div>
                   <div className="flex shrink-0 items-center gap-1.5">
                     <Badge tone={roleTone(m.org_role)}>{orgRoleLabel(m.org_role)}</Badge>
+                    {m.billing_delegate && <Badge tone="accent">财务</Badge>}
                     {m.status === "suspended" && <Badge tone="warning">已暂停</Badge>}
                   </div>
                 </div>
@@ -259,6 +315,19 @@ export function MembersTab({
                     />
                     组织结算
                   </label>
+
+                  {/* 财务委派开关:仅 owner 可见可操作;owner 行本身恒有权限,不显开关。 */}
+                  {isOwner && !ownerRow && (
+                    <label className="flex items-center gap-2 text-[12px] text-muted">
+                      <Switch
+                        checked={m.billing_delegate}
+                        onCheckedChange={(v) => toggleDelegate(m, v)}
+                        disabled={busy}
+                        aria-label="财务委派"
+                      />
+                      财务委派
+                    </label>
+                  )}
 
                   {isOwner && !ownerRow && (
                     <label className="flex items-center gap-1.5 text-[12px] text-muted">
@@ -291,6 +360,25 @@ export function MembersTab({
                     </Button>
                   )}
                 </div>
+
+                {/* 组织用量 · 月度限额(本月已用 + 预算进度 + 限额编辑)。owner 行不设限额。 */}
+                {!ownerRow && (
+                  <MemberUsageRow
+                    member={m}
+                    busy={busy}
+                    canEditBudget={canEditBudget}
+                    editing={budgetEditUid === m.user_id}
+                    draft={budgetDraft}
+                    saving={savingBudget}
+                    onEditStart={() => {
+                      setBudgetEditUid(m.user_id);
+                      setBudgetDraft(m.monthly_org_budget ?? "");
+                    }}
+                    onEditCancel={() => setBudgetEditUid(null)}
+                    onDraftChange={setBudgetDraft}
+                    onSave={() => saveBudget(m)}
+                  />
+                )}
               </li>
             );
           })}
@@ -385,6 +473,91 @@ export function MembersTab({
       </div>
 
       {confirmEl}
+    </div>
+  );
+}
+
+/**
+ * 成员组织用量 · 月度限额行:本月已用(month_org_spent)+ 预算进度 + 限额编辑。
+ * budget=null → 不限;超限(budgetView.over)标灰提示「本月已达限额，正用个人余额」。
+ * 编辑权限 canEditBudget(owner/admin);无权限只读展示限额值。
+ */
+function MemberUsageRow({
+  member,
+  busy,
+  canEditBudget,
+  editing,
+  draft,
+  saving,
+  onEditStart,
+  onEditCancel,
+  onDraftChange,
+  onSave,
+}: {
+  member: OrgMember;
+  busy: boolean;
+  canEditBudget: boolean;
+  editing: boolean;
+  draft: string;
+  saving: boolean;
+  onEditStart: () => void;
+  onEditCancel: () => void;
+  onDraftChange: (v: string) => void;
+  onSave: () => void;
+}) {
+  const bv = budgetView(member.monthly_org_budget, member.month_org_spent);
+  const budgetLabel = member.monthly_org_budget == null ? "不限" : formatCredits(member.monthly_org_budget);
+
+  return (
+    <div className="mt-2 flex flex-wrap items-center justify-between gap-x-4 gap-y-2 border-t border-border/60 pt-2">
+      <div className="min-w-[11rem] flex-1">
+        <div className="flex items-center justify-between text-[11.5px]">
+          <span className="flex items-center gap-1 text-faint">
+            <Wallet size={12} /> 本月组织用量
+          </span>
+          <span className="tabular-nums text-muted">
+            {formatCredits(member.month_org_spent)}
+            {bv.hasBudget && <span className="text-faint"> / {budgetLabel}</span>}
+          </span>
+        </div>
+        {bv.hasBudget && (
+          <Progress value={bv.pct} className="mt-1" aria-label="月度限额用量" />
+        )}
+        {bv.over && (
+          <p className="mt-1 text-[11px] text-faint">本月已达限额，正用个人余额。</p>
+        )}
+      </div>
+
+      {canEditBudget ? (
+        editing ? (
+          <div className="flex items-center gap-1.5">
+            <Input
+              value={draft}
+              onChange={(e) => onDraftChange(e.target.value)}
+              placeholder="不限"
+              inputMode="numeric"
+              aria-label="月度限额"
+              className="h-8 w-24"
+            />
+            <Button size="sm" variant="primary" onClick={onSave} disabled={saving}>
+              {saving ? <Spinner size={13} /> : null}
+              保存
+            </Button>
+            <Button size="sm" variant="ghost" onClick={onEditCancel} disabled={saving}>
+              取消
+            </Button>
+          </div>
+        ) : (
+          <div className="flex items-center gap-1.5 text-[12px] text-muted">
+            限额 <span className="tabular-nums text-fg">{budgetLabel}</span>
+            <Button size="sm" variant="ghost" onClick={onEditStart} disabled={busy}>
+              编辑
+            </Button>
+          </div>
+        )
+      ) : (
+        <span className="text-[11.5px] text-faint">限额 {budgetLabel}</span>
+      )}
     </div>
   );
 }

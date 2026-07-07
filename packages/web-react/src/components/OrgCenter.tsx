@@ -2,6 +2,7 @@ import * as Dialog from "@radix-ui/react-dialog";
 import { X } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
 import { api } from "../lib/api";
+import { canManageOrgBilling } from "../lib/orgBilling";
 import type { AuthSession, OrgRole, OrgSubscriptionInfo, User } from "../lib/types";
 import { Tabs } from "./ui";
 import { CreateOrgWizard } from "./org/CreateOrgWizard";
@@ -58,7 +59,8 @@ export function OrgCenter({
 
   const noOrg = !user?.org;
   const callerRole: OrgRole = user?.org?.role ?? "member";
-  const canManageBilling = callerRole === "owner";
+  // 计费写面门:owner 恒可 + 财务委派被授予者(三期)。派生自 /api/me 的 org.billing_delegate。
+  const canManageBilling = canManageOrgBilling(callerRole, user?.org?.billing_delegate);
 
   // ── 订阅单一权威源(二期):OrgCenter 顶层拉一次,概览渲染 + 成员满席闸共用。 ──
   const [subInfo, setSubInfo] = useState<OrgSubscriptionInfo | null>(null);
@@ -180,7 +182,9 @@ export function OrgCenter({
                 )}
                 {section === "skills" && <SkillsTab auth={auth} />}
                 {section === "reports" && <ReportsTab auth={auth} />}
-                {section === "invoices" && <InvoicesTab auth={auth} />}
+                {section === "invoices" && (
+                  <InvoicesTab auth={auth} canManageBilling={canManageBilling} />
+                )}
               </>
             )}
           </div>
