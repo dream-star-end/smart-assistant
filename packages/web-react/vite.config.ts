@@ -1,9 +1,35 @@
-import { defineConfig } from 'vite'
+import { createHash } from 'node:crypto'
+import { defineConfig, type Plugin } from 'vite'
 import react from '@vitejs/plugin-react'
 import tailwindcss from '@tailwindcss/vite'
 
+/**
+ * 前端构建身份(版本握手单一权威):对最终 index.html(资产标签已注入)取
+ * sha256 前 16 hex,写成 `<meta name="oc-build" content="…">`。
+ *  - 内容派生:源码没变的重复构建产出相同 id → 不触发客户端无谓刷新。
+ *  - 仅 build 注入(apply:'build');dev 无此 meta → 客户端 reload governor 恒 inert。
+ *  - 服务端(commercial frontendBuild probe)与客户端(lib/appUpdate)都只读这同一个
+ *    meta,不允许出现第二套版本推导。
+ */
+function ocBuildMeta(): Plugin {
+  return {
+    name: 'oc-build-meta',
+    apply: 'build',
+    transformIndexHtml: {
+      order: 'post',
+      handler(html) {
+        const id = createHash('sha256').update(html).digest('hex').slice(0, 16)
+        if (!html.includes('</head>')) {
+          throw new Error('oc-build-meta: index.html 缺 </head>,无法注入构建身份')
+        }
+        return html.replace('</head>', `  <meta name="oc-build" content="${id}">\n  </head>`)
+      },
+    },
+  }
+}
+
 export default defineConfig({
-  plugins: [react(), tailwindcss()],
+  plugins: [react(), tailwindcss(), ocBuildMeta()],
   server: {
     host: '127.0.0.1',
     port: 5174,

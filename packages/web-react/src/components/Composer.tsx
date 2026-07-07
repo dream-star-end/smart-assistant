@@ -3,6 +3,7 @@ import { MAX_ATTACHMENTS_PER_MESSAGE } from "@openclaude/protocol";
 import { ArrowUp, FileText, Loader2, Mic, Plus, RotateCcw, Square, X } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useVoiceInput } from "../hooks/useVoiceInput";
+import { appUpdate } from "../lib/appUpdate";
 import type { MediaRef } from "../lib/chat/frames";
 import type { RepoSelection } from "../lib/types";
 import { cn } from "../lib/utils";
@@ -82,6 +83,12 @@ export function Composer({
   const idRef = useRef(0);
   // 已创建的 object URL 集合：卸载时统一 revoke（state 闭包在 cleanup 里是 stale，靠 ref 兜底）。
   const objectUrlsRef = useRef<Set<string>>(new Set());
+
+  // 版本握手 busy 探针:有未发送草稿/附件 → 软刷新推迟(reload 会丢 useState 里的
+  // 草稿,composer 草稿当前不持久化)。ref 镜像 state 让探针零依赖渲染闭包。
+  const draftBusyRef = useRef(false);
+  draftBusyRef.current = value.trim().length > 0 || attachments.length > 0;
+  useEffect(() => appUpdate.registerBusyProbe(() => draftBusyRef.current), []);
 
   const makePreview = useCallback((file: File): string => {
     const u = URL.createObjectURL(file);

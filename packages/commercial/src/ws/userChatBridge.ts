@@ -276,6 +276,14 @@ export interface UserChatBridgeDeps {
   jwtSecret: string | Uint8Array;
   /** 解析 uid → 容器 host/port。Phase 3D 接 supervisor.ensureRunning;Phase 2 单测自行 mock。 */
   resolveContainerEndpoint: ResolveContainerEndpoint;
+  /**
+   * 版本握手(v5 spa):返回当前 dist 前端构建 id(index.html `<meta name="oc-build">`,
+   * 见 ws/frontendBuild.ts probe)。注入后 bridge 在每个 userWs accept 时发一帧
+   * `{type:"sys.frontend_build", build}` —— 客户端 reload governor 据此在安全点软刷新,
+   * 收敛"长驻旧 bundle 撞新服务端语义"(2026-07-07 CODEX_BILLING_GUARD 旧前端复发事故)。
+   * 未注入(v3 / 测试)或返回 null → 不发帧,零行为变化。
+   */
+  getFrontendBuildId?: () => string | null;
   /** 可选:每用户最大并发(默认 3)。 */
   maxPerUser?: number;
   /** 可选:单帧上限(双向,默认 1MB)。 */
@@ -915,6 +923,14 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
 
     // 同 agent.ts:先 upgrade,认证错也走 ws frame 报告,前端体验比 HTTP 401 直接关好。
     wss.handleUpgrade(req, socket, head, (ws) => {
+      // 版本握手:accept 即发当前前端构建 id(auth 之前——build id 本就公开,任何人
+      // GET / 都能看到 meta;放在 auth 前保证"拿着过期 token 的旧前端"也能收到并自救,
+      // 401 重试环里的旧客户端正是最需要刷新的那批)。失败/未注入 → 静默跳过,
+      // 版本握手是 best-effort 自愈通道,绝不影响桥主链路。
+      try {
+        const feBuild = deps.getFrontendBuildId?.();
+        if (feBuild) ws.send(JSON.stringify({ type: "sys.frontend_build", build: feBuild }));
+      } catch { /* best-effort */ }
       // 早到帧暂存(auth + ensureRunning 是 async)
       // receivedAtMs 用于 bridge TTFT 起点 — 早到帧也算"用户已发首条消息"。
       const pendingMessages: Array<{ data: RawData; isBinary: boolean; receivedAtMs: number }> = [];

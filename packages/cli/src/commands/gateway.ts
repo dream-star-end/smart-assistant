@@ -129,7 +129,11 @@ export async function gatewayCmd(_opts: { dev?: boolean }): Promise<void> {
   if (process.env.COMMERCIAL_ENABLED === '1') {
     try {
       const mod = await import('@openclaude/commercial')
-      commercial = await mod.registerCommercial(null)
+      // webDistDir:版本握手用的前端 dist 目录。路径权威 = 上面的 webRoot 决策
+      // (spa=web-react/dist);透传避免 commercial 侧二次推导。vanilla(v3)不传 → 功能 inert。
+      commercial = await mod.registerCommercial(null, {
+        webDistDir: staticMode === 'spa' ? webRoot : undefined,
+      })
       console.log('[cli] commercial module registered (v3 mode)')
     } catch (err) {
       console.error('[cli] COMMERCIAL_ENABLED=1 但 registerCommercial 失败:', err)

@@ -66,6 +66,7 @@ async function startRig(opts: {
   ) => Promise<(modelId: string) => boolean>;
   loadMasterSessionMessages?: (uid: bigint, sessionId: string) => Promise<unknown[] | null>;
   logger?: Logger;
+  getFrontendBuildId?: () => string | null;
 } = {}): Promise<TestRig> {
   // 1) mock 容器 ws server
   const containerSeen: Array<{ data: string | Buffer; isBinary: boolean }> = [];
@@ -100,6 +101,7 @@ async function startRig(opts: {
     loadAllowedModelChecker: opts.loadAllowedModelChecker,
     loadMasterSessionMessages: opts.loadMasterSessionMessages,
     logger: opts.logger,
+    getFrontendBuildId: opts.getFrontendBuildId,
   });
 
   // 3) gateway HTTP server,只挂 bridge upgrade
@@ -1728,5 +1730,48 @@ describe("userChatBridge — CG2a canonical traceId injection", () => {
 
     ws.close();
     await waitClose(ws);
+  });
+});
+
+// ------- 版本握手:sys.frontend_build ------------------------------------
+
+describe("frontend build handshake", () => {
+  test("注入 getFrontendBuildId → accept 即发 sys.frontend_build(auth 之前)", async () => {
+    const rig = await startRig({ getFrontendBuildId: () => "a1b2c3d4e5f60718" });
+    try {
+      // 用非法 token 连:首帧仍必须是 sys.frontend_build(pre-auth 发送的语义锚点
+      // ——过期 token 的旧前端也要能收到并自救),之后才是 UNAUTHORIZED 错误帧。
+      const ws = new WebSocket(
+        `ws://127.0.0.1:${rig.gatewayPort}${BRIDGE_WS_PATH}`,
+        ["bearer", "not-a-jwt"],
+      );
+      const first = JSON.parse(String((await waitMessage(ws)).data)) as {
+        type: string; build?: string;
+      };
+      assert.equal(first.type, "sys.frontend_build");
+      assert.equal(first.build, "a1b2c3d4e5f60718");
+      const second = JSON.parse(String((await waitMessage(ws)).data)) as { type: string };
+      assert.notEqual(second.type, "sys.frontend_build");
+      await waitClose(ws);
+    } finally {
+      await stopRig(rig);
+    }
+  });
+
+  test("probe 返回 null / 未注入 → 不发帧(v3 与既有行为零变化)", async () => {
+    for (const probe of [undefined, () => null] as const) {
+      const rig = await startRig(probe ? { getFrontendBuildId: probe } : {});
+      try {
+        const ws = new WebSocket(
+          `ws://127.0.0.1:${rig.gatewayPort}${BRIDGE_WS_PATH}`,
+          ["bearer", "not-a-jwt"],
+        );
+        const first = JSON.parse(String((await waitMessage(ws)).data)) as { type: string };
+        assert.notEqual(first.type, "sys.frontend_build");
+        await waitClose(ws);
+      } finally {
+        await stopRig(rig);
+      }
+    }
   });
 });
