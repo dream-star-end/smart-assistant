@@ -21,7 +21,13 @@
 import { promises as fsp } from "node:fs";
 import { join } from "node:path";
 
-import { cronMatches, validateCronSchedule, type CronFile, type CronJob } from "@openclaude/gateway";
+import {
+  cronMatches,
+  isUserInitiatedCronJob,
+  validateCronSchedule,
+  type CronFile,
+  type CronJob,
+} from "@openclaude/gateway";
 import { parse as parseYaml } from "yaml";
 
 import { rootLogger, type Logger } from "../logging/logger.js";
@@ -190,9 +196,15 @@ export interface MinNextFire {
 }
 
 /**
- * 解析 cron.yaml 文本,对所有 enabled 任务用 nextRunAfter 求最早的下一次触发。
- * 返回 { nextFireAt, jobsEnabled }。无 enabled 任务 / 全无合法 schedule → nextFireAt=null。
+ * 解析 cron.yaml 文本,对**用户发起的** enabled 任务用 nextRunAfter 求最早的下一次触发。
+ * 返回 { nextFireAt, jobsEnabled }。无符合任务 / 全无合法 schedule → nextFireAt=null。
  * 解析失败(坏 yaml)→ 保守当作无任务(null, 0),由 caller 落 next_fire_at=NULL。
+ *
+ * isUserInitiatedCronJob 过滤(与容器侧 maybePushCronIndex 同一判定,勿单侧改):
+ * v3 迁移卷遗留的系统自省 seed(daily-reflection/weekly-curation/skill-check/heartbeat)
+ * 不值得为其唤醒容器烧用户积分——线上实测 2026-07-07 迁移用户卷里存量普遍,若不过滤,
+ * 唤醒机制会把这批用户无感的僵尸任务变成"主动烧钱"。它们仅在容器因其他原因活着时
+ * 机会性运行(与无唤醒机制时的旧行为一致)。
  */
 export function computeMinNextFire(cronYamlText: string, from: Date): MinNextFire {
   let file: CronFile;
@@ -208,6 +220,7 @@ export function computeMinNextFire(cronYamlText: string, from: Date): MinNextFir
   let min: Date | null = null;
   for (const job of file.jobs) {
     if (!job || typeof job.schedule !== "string" || !isJobEnabled(job)) continue;
+    if (!isUserInitiatedCronJob(job)) continue;
     jobsEnabled++;
     // 非法 schedule(AI 幻觉出的 `60 25 * * *` 等)cronMatches 永不命中 → nextRunAfter 返 null,
     // 跳过(不拉低 min);validateCronSchedule 提前短路省 1440 次迭代。

@@ -24,6 +24,7 @@ const {
   getMaxPerHour,
   countMinuteHitsPerHour,
   frequencyQuotaError,
+  deriveCronIndexPayload,
   CronScheduler,
 } = await import('../cron.js')
 const { paths } = await import('@openclaude/storage')
@@ -328,5 +329,25 @@ describe('CronScheduler.addJob — 配额闸', () => {
     const sched = makeScheduler()
     await sched.addJob({ id: 'y', schedule: '*/5 * * * *', agent: 'main', prompt: 'p' })
     assert.ok((await sched.listJobs()).some((j) => j.id === 'y'))
+  })
+})
+
+describe('deriveCronIndexPayload — 唤醒索引只计用户任务', () => {
+  it('系统 seed(daily-reflection/heartbeat/skill-check/weekly-curation)不参与唤醒', () => {
+    const seeds = [
+      { id: 'daily-reflection', schedule: '17 3 * * *', prompt: 'x', enabled: true },
+      { id: 'heartbeat', schedule: '13 */4 * * *', prompt: 'x', enabled: true, heartbeat: true },
+      { id: 'skill-check', schedule: '47 */6 * * *', prompt: 'x', enabled: true },
+      { id: 'weekly-curation', schedule: '31 4 * * 0', prompt: 'x', enabled: true },
+    ] as any[]
+    const now = new Date('2026-07-07T10:30:20.000Z')
+    assert.deepEqual(deriveCronIndexPayload({ jobs: seeds } as any, now), {
+      nextFireAt: null,
+      enabledCount: 0,
+    })
+    const withUser = [...seeds, { id: 'remind-a-b', schedule: '* * * * *', prompt: 'x', enabled: true }]
+    const r = deriveCronIndexPayload({ jobs: withUser } as any, now)
+    assert.equal(r.enabledCount, 1)
+    assert.equal(r.nextFireAt, '2026-07-07T10:31:00.000Z')
   })
 })

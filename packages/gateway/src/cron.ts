@@ -529,29 +529,12 @@ export class CronScheduler {
   ) {}
 
   /**
-   * Derive (nextFireAt = min over enabled jobs' computeNextRun, enabledCount) from
-   * the given file and, if it differs from the last reported value, push it to
-   * master fire-and-forget. Sync + cheap: computeNextRun is a brute-force scan but
-   * bounded to 24h/1440 iterations per job. No-op entirely when master env absent.
+   * Push the derived wake-index payload to master when it changed since the last
+   * report. Fire-and-forget; no-op entirely when master env absent.
    */
   private maybePushCronIndex(file: CronFile): void {
     if (!this.cronIndexCfg) return
-    const now = new Date()
-    let minTs: number | null = null
-    let enabledCount = 0
-    for (const job of file.jobs ?? []) {
-      if (job.enabled === false) continue
-      enabledCount++
-      const next = computeNextRun(job.schedule, now)
-      if (next) {
-        const ts = Date.parse(next)
-        if (!Number.isNaN(ts) && (minTs === null || ts < minTs)) minTs = ts
-      }
-    }
-    const payload: CronIndexPayload = {
-      nextFireAt: minTs === null ? null : new Date(minTs).toISOString(),
-      enabledCount,
-    }
+    const payload = deriveCronIndexPayload(file, new Date())
     if (
       this.lastCronIndex &&
       this.lastCronIndex.nextFireAt === payload.nextFireAt &&
@@ -886,4 +869,31 @@ export function computeNextRun(schedule: string, from: Date): string | undefined
     d.setMinutes(d.getMinutes() + 1)
   }
   return undefined
+}
+
+/**
+ * 从 cron 文件派生上报给 master 的唤醒索引载荷(纯函数,供单测锁定过滤语义)。
+ *
+ * 只统计**用户发起的**任务(isUserInitiatedCronJob):系统自省 seed(daily-reflection/
+ * skill-check/heartbeat 等,v3 迁移卷有存量遗留)不值得为其唤醒容器烧用户积分——
+ * 它们仅在容器因其他原因活着时机会性运行(与无唤醒机制时的旧行为一致)。
+ * master 侧 rescan(cronWake computeMinNextFire)用同一判定,两侧语义必须对齐。
+ */
+export function deriveCronIndexPayload(file: CronFile, now: Date): CronIndexPayload {
+  let minTs: number | null = null
+  let enabledCount = 0
+  for (const job of file.jobs ?? []) {
+    if (job.enabled === false) continue
+    if (!isUserInitiatedCronJob(job)) continue
+    enabledCount++
+    const next = computeNextRun(job.schedule, now)
+    if (next) {
+      const ts = Date.parse(next)
+      if (!Number.isNaN(ts) && (minTs === null || ts < minTs)) minTs = ts
+    }
+  }
+  return {
+    nextFireAt: minTs === null ? null : new Date(minTs).toISOString(),
+    enabledCount,
+  }
 }

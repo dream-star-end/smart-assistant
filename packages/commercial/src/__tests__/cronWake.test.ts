@@ -176,6 +176,22 @@ describe("computeMinNextFire", () => {
     assert.equal(r.nextFireAt?.toISOString(), "2026-07-08T01:00:00.000Z");
   });
 
+  test("system seed jobs (v3 migrated volumes) excluded from wake index", () => {
+    // 系统自省 seed 不参与唤醒(不烧离线用户积分);用户任务照常计入。
+    const seeds =
+      "jobs:\n" +
+      "  - id: daily-reflection\n    schedule: '17 3 * * *'\n    agent: main\n    enabled: true\n" +
+      "  - id: heartbeat\n    schedule: '13 */4 * * *'\n    agent: main\n    enabled: true\n    heartbeat: true\n" +
+      "  - id: skill-check\n    schedule: '47 */6 * * *'\n    agent: main\n    enabled: true\n" +
+      "  - id: weekly-curation\n    schedule: '31 4 * * 0'\n    agent: main\n    enabled: true\n";
+    assert.deepEqual(computeMinNextFire(seeds, FROM), { nextFireAt: null, jobsEnabled: 0 });
+    const withUser =
+      seeds + "  - id: remind-abc-def\n    schedule: '* * * * *'\n    agent: main\n    enabled: true\n";
+    const r = computeMinNextFire(withUser, FROM);
+    assert.equal(r.jobsEnabled, 1); // 只计用户任务
+    assert.equal(r.nextFireAt?.toISOString(), "2026-07-07T10:31:00.000Z");
+  });
+
   test("invalid schedule counted enabled but never fires → nextFireAt null", () => {
     const yaml = "jobs:\n  - id: a\n    schedule: '99 99 * * *'\n    agent: main\n    enabled: true\n";
     const r = computeMinNextFire(yaml, FROM);
