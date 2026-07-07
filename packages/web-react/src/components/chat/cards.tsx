@@ -6,9 +6,12 @@
 import {
   AlertTriangle,
   Brain,
+  ChevronDown,
   ChevronRight,
+  ChevronUp,
   Check,
   Copy,
+  FileText,
   Info,
   ListTodo,
   RotateCcw,
@@ -284,6 +287,38 @@ export function UserCard({ msg, cb }: { msg: ChatMessage; cb?: CardCallbacks }) 
 }
 
 // ═══════════════ assistant ═══════════════
+/**
+ * 团队审查修订后的"初稿"卡:草稿正文默认折叠(修订稿才是本轮唯一主体,与持久化
+ * 只留终稿的 replace 语义对齐),点击可展开对照。刷新后草稿行随 server-wins 消失,
+ * 本卡只存在于修订发生的那次 live 会话中。
+ */
+export function SupersededDraftCard({ msg }: { msg: ChatMessage }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <div className="px-0.5 py-1">
+      <div className="rounded-lg border border-border bg-surface/60">
+        <button
+          type="button"
+          aria-expanded={open}
+          onClick={() => setOpen((v) => !v)}
+          className="flex w-full items-center gap-2 px-3.5 py-2 text-left outline-none transition-colors hover:bg-hover focus-visible:ring-2 focus-visible:ring-ring"
+        >
+          <FileText size={13} className="shrink-0 text-faint" />
+          <span className="text-[12.5px] font-medium text-muted">初稿 · 已按质量审查意见修订</span>
+          <span className="ml-auto text-faint">
+            {open ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
+          </span>
+        </button>
+        {open && (
+          <div className="border-t border-border px-3.5 py-2.5 opacity-75">
+            <Markdown signMedia>{msg.text ?? ""}</Markdown>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 export function AssistantCard({
   msg,
   ctx,

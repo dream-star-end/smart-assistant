@@ -10058,6 +10058,10 @@ export class Gateway {
         '- 按子任务量级选 `effort`：机械/简单子任务填 `low`，常规填 `medium`，攻坚/高难度填 `high`；拿不准就不填（用该成员默认档位），不要把简单活儿也开到 `high` 徒增开销与耗时。',
         '- 成员的大产物（完整代码/长文档/数据文件）会以「文件路径 + 摘要」的形式回传（大产物落在共享目录 `/home/agent/.openclaude/generated/`）；你综合最终答案时，需要完整内容就用 `Read` 按回传的路径读回来，别只凭摘要臆测。',
         '- 委派**只走 `delegate_task` / `delegate_tasks`**：这是平台唯一的组队/委派通道（有实时进度回传、计费与资源约束）。平台已停用 codex 原生 `Agent`/子进程编排，不存在这样的工具，不要尝试启动；需要拆分的子任务一律用这两个工具，不确定或不适合委派时就自己完成。',
+        // 审查**感知**(非触发):触发权威唯一在 gateway 硬编排(见 dispatchInbound review
+        // pass),这里只被动告知机制存在与反馈应对方式,不要求模型做任何审查动作 ——
+        // 与 P2 债C 删掉的"自觉调用审查员"软约束有本质区别,无漂移面。
+        '- 质量审查：你组队完成的最终答复会先经平台**强制质量审查**再送达用户（无需你触发）。按"可直接提交"的标准写答复；若之后收到【系统 · 质量审查反馈】，直接输出修订后的**完整**最终答复即可——平台会把初稿折叠，仅以你的修订稿作为呈现给用户的最终答案，不要复述审查过程、不要致歉。',
         '',
         '用户任务：',
         '',
@@ -10536,6 +10540,13 @@ export class Gateway {
                 isReview: true,
               }),
             submitContinuation: async (reviewOutput) => {
+              // 修订标记帧:前端据此把已流出的草稿正文折叠为"初稿(已修订)",让修订稿成为
+              // 本轮唯一主体 —— 与持久化 server-wins 只留终稿的 replace 语义对齐(此前草稿
+              // 与修订稿并排全量展示,用户看到两份近重复长文,2026-07-07 boss 反馈)。
+              this.deliver(
+                { ...out, blocks: [], isFinal: false, meta: { teamRevision: true } as any },
+                undefined,
+              )
               // 审查意见喂回队长续写;复用 onLeaderEvent(block 继续流、final 再被扣住)。
               finalHeld = false
               currentRun = this._runLog.start({ agentId: session.agentId, sessionKey, taskType })
