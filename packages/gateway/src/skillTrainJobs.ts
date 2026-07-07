@@ -15,7 +15,7 @@ import { randomUUID } from 'node:crypto'
 import { existsSync, realpathSync } from 'node:fs'
 import { mkdir, readFile, readdir, realpath, rename, writeFile } from 'node:fs/promises'
 import { join, resolve, sep } from 'node:path'
-import { paths } from '@openclaude/storage'
+import { paths, validateSkillName } from '@openclaude/storage'
 import type { SessionStreamEvent } from './ccbMessageParser.js'
 
 /** Same shape as SkillTrainJobStore.newRunId() output; guards path construction. */
@@ -355,8 +355,11 @@ export class SkillTrainJobStore {
   }
 
   /**
-   * Reload persisted runs after a gateway restart. Any run still marked active is
-   * reconciled to 'failed' — its background session did not survive the restart.
+   * Reload persisted runs after a gateway restart. A run still marked active lost its
+   * background session in the restart, but it may already have STAGED DRAFTS. So it is
+   * reconciled by the same rule as finalize(): staged drafts present → 'diff_ready'
+   * (the user can still diff / comment-revise / merge them); none → 'failed'. This stops
+   * a restart from silently discarding drafts the training already produced.
    */
   async loadAll(now: number): Promise<void> {
     const root = this._safeRoot()
@@ -379,14 +382,43 @@ export class SkillTrainJobStore {
         // The on-disk runId must match its directory — reject mismatched/forged rows.
         if (!parsed?.runId || parsed.runId !== runId) continue
         if (ACTIVE_STATUSES.has(parsed.status)) {
-          parsed.status = 'failed'
-          parsed.phase = 'failed'
-          parsed.error = 'gateway restarted during training'
-          parsed.finishedAt = now
+          const draftCount = await this._countStagedDrafts(join(root, runId))
+          if (draftCount > 0) {
+            // Same terminal derivation as finalize() for the drafts-present case.
+            parsed.status = 'diff_ready'
+            parsed.phase = 'diff_ready'
+            parsed.proposalCount = draftCount
+            parsed.finishedAt = now
+            parsed.updatedAt = now
+            parsed.summary = `${parsed.summary ?? ''}\n\n(gateway 重启,已恢复暂存草稿 —— 可继续查看差异/评论修订/合并)`
+          } else {
+            parsed.status = 'failed'
+            parsed.phase = 'failed'
+            parsed.error = 'gateway restarted during training'
+            parsed.finishedAt = now
+          }
         }
         this.runs.set(parsed.runId, parsed)
       } catch {}
     }
+  }
+
+  /**
+   * Count staged drafts under a run dir: a draft is `<runId>/<skill-name>/` carrying a
+   * SKILL.md (a delete proposal has no SKILL.md and is not a reviewable diff, so it is
+   * not counted). Directory names pass the same lenient skill-name check SkillDraftStore
+   * uses, which also excludes run.json and any stray temp files.
+   */
+  private async _countStagedDrafts(runDir: string): Promise<number> {
+    let count = 0
+    try {
+      for (const entry of await readdir(runDir, { withFileTypes: true })) {
+        if (!entry.isDirectory()) continue
+        if (!validateSkillName(entry.name).ok) continue
+        if (existsSync(join(runDir, entry.name, 'SKILL.md'))) count++
+      }
+    } catch {}
+    return count
   }
 
   /**

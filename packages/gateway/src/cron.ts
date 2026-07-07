@@ -249,6 +249,94 @@ function matchPart(part: string, val: number): boolean {
   return false
 }
 
+/** 单字段的取值边界(matcher 语义:dow 用 getDay() 取 0-6,7 永不命中)。 */
+interface CronFieldSpec {
+  label: string
+  min: number
+  max: number
+  /** dow=7 是"周日应写 0"的常见笔误,越界时追加提示。 */
+  sundayHint?: boolean
+}
+
+const CRON_FIELDS: readonly CronFieldSpec[] = [
+  { label: 'minute', min: 0, max: 59 },
+  { label: 'hour', min: 0, max: 23 },
+  { label: 'day-of-month', min: 1, max: 31 },
+  { label: 'month', min: 1, max: 12 },
+  { label: 'day-of-week', min: 0, max: 6, sundayHint: true },
+]
+
+function cronValueError(n: number, raw: string, spec: CronFieldSpec): string | null {
+  if (n < spec.min || n > spec.max) {
+    const hint = spec.sundayHint && n === 7 ? ' (use 0 for Sunday)' : ''
+    return `${spec.label} field "${raw}" out of range ${spec.min}-${spec.max}${hint}`
+  }
+  return null
+}
+
+function cronRangeError(startStr: string, endStr: string, raw: string, spec: CronFieldSpec): string | null {
+  return (
+    cronValueError(Number(startStr), startStr, spec) ??
+    cronValueError(Number(endStr), endStr, spec) ??
+    (Number(startStr) > Number(endStr)
+      ? `${spec.label} field "${raw}" has an inverted range (${startStr} > ${endStr})`
+      : null)
+  )
+}
+
+function cronPartError(part: string, spec: CronFieldSpec): string | null {
+  const { label } = spec
+  // 空 part:matcher 里 Number('')===0 会误匹配 0(尾逗号 / 连续逗号)——显式拒绝。
+  if (part === '') return `${label} field has an empty part (stray or trailing comma)`
+  if (part === '*') return null
+  // step 形态 base/S:matcher 只认 base ∈ {*, N-M} 且 S 为正整数;数字底的 step
+  // (如 5/2)matcher 恒 false,*/0 因 val%0===NaN 永不命中——都拒绝。
+  const slash = part.indexOf('/')
+  if (slash !== -1) {
+    const base = part.slice(0, slash)
+    const step = part.slice(slash + 1)
+    if (!/^\d+$/.test(step) || Number(step) < 1) {
+      return `${label} field "${part}" has invalid step "${step}" (step must be an integer >= 1)`
+    }
+    if (base === '*') return null
+    const range = base.match(/^(\d+)-(\d+)$/)
+    if (!range) {
+      return `${label} field "${part}" has invalid step base "${base}" (only * or N-M can take a step)`
+    }
+    return cronRangeError(range[1], range[2], part, spec)
+  }
+  const range = part.match(/^(\d+)-(\d+)$/)
+  if (range) return cronRangeError(range[1], range[2], part, spec)
+  if (/^\d+$/.test(part)) return cronValueError(Number(part), part, spec)
+  return `${label} field "${part}" is not a valid cron term`
+}
+
+/**
+ * 校验 crontab 表达式的字段数与每字段的数值范围/形态。返回 null=合法,否则返回具体
+ * 错误信息(英文,指明字段与非法值,如 `minute field "60" out of range 0-59`)。
+ *
+ * 与 matcher(cronMatches/matchPart)严格对齐——只接受 matcher 真正能命中的形态:
+ * 星号、N、N-M(N<=M)、星号/S(S>=1)、N-M/S(S>=1)、以及以上的逗号列表。
+ * (形态描述用"星号"是因为字面星号斜杠会终止本块注释。)
+ * 纯字符正则(旧实现)拦不住越界与静默失效写法:AI 走 create_reminder 幻觉出的
+ * `60 25 * * *` 能过旧校验却让 cronMatches 永不命中(落库即失效)。
+ */
+export function validateCronSchedule(expr: string): string | null {
+  const trimmed = expr.trim()
+  const fields = trimmed === '' ? [] : trimmed.split(/\s+/)
+  if (fields.length !== 5) {
+    return `expected 5 fields (minute hour dom month dow), got ${fields.length}`
+  }
+  for (let i = 0; i < 5; i++) {
+    const spec = CRON_FIELDS[i]
+    for (const part of fields[i].split(',')) {
+      const err = cronPartError(part, spec)
+      if (err) return err
+    }
+  }
+  return null
+}
+
 export class CronScheduler {
   private timer: NodeJS.Timeout | null = null
   private bootTickTimer: NodeJS.Timeout | null = null
@@ -452,12 +540,10 @@ export class CronScheduler {
   // ── Runtime job management (called by /api/cron) ──
 
   async addJob(job: CronJob): Promise<void> {
-    // M6: Validate cron schedule before persisting
-    const schedFields = job.schedule.trim().split(/\s+/)
-    if (schedFields.length !== 5 || !schedFields.every((f) => /^[\d*/,\-]+$/.test(f))) {
-      throw new Error(
-        `Invalid cron schedule "${job.schedule}": must be a 5-field expression (minute hour dom month dow)`,
-      )
+    // 字段数 + 数值范围/形态校验(纯字符正则拦不住 60 分 / 25 时 / dow 7 这类静默失效)。
+    const schedErr = validateCronSchedule(job.schedule)
+    if (schedErr) {
+      throw new Error(`Invalid cron schedule "${job.schedule}": ${schedErr}`)
     }
     const file = await ensureCronFile()
     // Replace if same ID exists
@@ -488,12 +574,9 @@ export class CronScheduler {
     if (!job) return false
     if (updates.enabled !== undefined) job.enabled = updates.enabled
     if (updates.schedule) {
-      // Validate new schedule before applying
-      const schedFields = updates.schedule.trim().split(/\s+/)
-      if (schedFields.length !== 5 || !schedFields.every((f) => /^[\d*/,\-]+$/.test(f))) {
-        throw new Error(
-          `Invalid cron schedule "${updates.schedule}": must be a 5-field expression (minute hour dom month dow)`,
-        )
+      const schedErr = validateCronSchedule(updates.schedule)
+      if (schedErr) {
+        throw new Error(`Invalid cron schedule "${updates.schedule}": ${schedErr}`)
       }
       job.schedule = updates.schedule
     }

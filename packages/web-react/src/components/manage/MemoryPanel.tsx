@@ -3,10 +3,20 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { api } from "../../lib/api";
 import { deriveMemoryTitle, joinMemoryEntries, splitMemoryEntries } from "../../lib/memoryText";
 import type { AuthSession } from "../../lib/types";
+import { cn } from "../../lib/utils";
 import { Alert, Badge, Button, PanelHeader } from "../ui";
 
 type Target = "memory" | "user";
-type Entry = { id: number; text: string };
+/**
+ * 条目携带稳定身份(key)与基线原文(originalText):
+ * - key：React key + 增删/重排后仍能对齐（不再用数组 index 判 dirty，unshift 不错位）;
+ * - originalText：载入/保存时的原文，null 表示「新增未保存」→ 恒 dirty。
+ * per-card dirty = text !== originalText。
+ */
+type Entry = { key: string; text: string; originalText: string | null };
+
+/** 归一化用于条目去重比较（CRLF + 去首尾空白）。 */
+const normEntry = (s: string) => String(s || "").replace(/\r\n/g, "\n").trim();
 
 // 顺序有意:先共享的用户画像,后 per-agent 的核心记忆(与后端语义一致:
 // user → 用户级共享文件,memory → per-agent 文件,见 storage/memoryStore.ts)。
@@ -87,28 +97,36 @@ function MemoryDoc({
   picker?: React.ReactNode;
 }) {
   const [entries, setEntries] = useState<Entry[]>([]);
-  const [orig, setOrig] = useState("");
+  // baseline = 最近一次已知的服务端权威态（text + 乐观锁 version），冲突并入后刷新。
+  const [baseline, setBaseline] = useState<{ text: string; version: string }>({ text: "", version: "" });
+  const [limit, setLimit] = useState(0); // 字符预算（来自 GET）；0 = 未知则不强制。
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
   const [err, setErr] = useState<string | null>(null);
-  const nextId = useRef(0);
+  const [notice, setNotice] = useState<string | null>(null); // 冲突并入提示（info，非报错）。
+  const nextKey = useRef(0);
 
-  const toEntries = useCallback((text: string): Entry[] => {
-    return splitMemoryEntries(text).map((t) => ({ id: nextId.current++, text: t }));
-  }, []);
+  // 从整段文本切成携带稳定 key 的条目；originalText=原文 → 已保存态（不 dirty）。
+  const toEntries = useCallback(
+    (text: string): Entry[] =>
+      splitMemoryEntries(text).map((t) => ({ key: `e${nextKey.current++}`, text: t, originalText: t })),
+    [],
+  );
 
   useEffect(() => {
     let alive = true;
     setLoading(true);
     setErr(null);
+    setNotice(null);
     api
       .getMemory(auth, agentId, target)
       .then((d) => {
         if (!alive) return;
         const text = d.text || "";
         setEntries(toEntries(text));
-        setOrig(joinMemoryEntries(splitMemoryEntries(text)));
+        setBaseline({ text, version: d.version ?? "" });
+        setLimit(typeof d.limit === "number" ? d.limit : 0);
       })
       .catch((e) => {
         if (alive) setErr((e as Error).message || "加载记忆失败");
@@ -122,25 +140,52 @@ function MemoryDoc({
   }, [auth, agentId, target, toEntries]);
 
   const current = joinMemoryEntries(entries.map((e) => e.text));
-  const dirty = current !== orig;
+  const baselineJoined = joinMemoryEntries(splitMemoryEntries(baseline.text));
+  const dirty = current !== baselineJoined;
   const nonEmpty = entries.filter((e) => e.text.trim()).length;
+  const overLimit = limit > 0 && current.length > limit;
 
   const save = useCallback(async () => {
     setSaving(true);
     setErr(null);
+    setNotice(null);
     try {
       const text = joinMemoryEntries(entries.map((e) => e.text));
-      await api.putMemory(auth, agentId, target, text);
-      setOrig(text);
-      setEntries(toEntries(text)); // 规范化：去掉空条目
-      setSaved(true);
-      setTimeout(() => setSaved(false), 1800);
+      const res = await api.putMemory(auth, agentId, target, text, baseline.version || undefined);
+      if (res.ok) {
+        setBaseline({ text, version: res.version });
+        setEntries(toEntries(text)); // 规范化：去空条目 + originalText 归位 = 全部已保存。
+        setSaved(true);
+        setTimeout(() => setSaved(false), 1800);
+        return;
+      }
+      // 版本冲突：条目级并入服务端新增内容，不自动保存，等用户确认后再存。
+      const conflict = res.conflict;
+      const baseSet = new Set(
+        splitMemoryEntries(baseline.text).map(normEntry).filter(Boolean),
+      );
+      const serverAdded = splitMemoryEntries(conflict.text).filter(
+        (t) => normEntry(t) && !baseSet.has(normEntry(t)),
+      );
+      const localSet = new Set(entries.map((e) => normEntry(e.text)).filter(Boolean));
+      const toAppend = serverAdded.filter((t) => !localSet.has(normEntry(t)));
+      if (toAppend.length > 0) {
+        setEntries((es) => [
+          ...es,
+          ...toAppend.map((t) => ({ key: `e${nextKey.current++}`, text: t, originalText: t })),
+        ]);
+        setNotice(`智能体在你编辑期间更新了记忆，已并入 ${toAppend.length} 条新增内容，请确认后重新保存`);
+      } else {
+        setNotice("智能体在你编辑期间修改了记忆，已刷新基线，重新保存将以你的版本为准");
+      }
+      // 无论有无并入，都把基线刷新到服务端最新态（下次 PUT 带新 version 才能写入）。
+      setBaseline({ text: conflict.text, version: conflict.version });
     } catch (e) {
       setErr((e as Error).message || "保存失败");
     } finally {
       setSaving(false);
     }
-  }, [auth, agentId, target, entries, toEntries]);
+  }, [auth, agentId, target, entries, baseline.text, baseline.version, toEntries]);
 
   return (
     <div className="px-5 py-4">
@@ -156,6 +201,11 @@ function MemoryDoc({
           {err}
         </Alert>
       )}
+      {notice && (
+        <Alert tone="info" className="mt-2 text-[12.5px]">
+          {notice}
+        </Alert>
+      )}
       {loading ? (
         <div className="mt-2 flex items-center gap-2 py-6 text-[13px] text-faint">
           <Loader2 size={14} className="animate-spin" /> 加载中…
@@ -168,7 +218,12 @@ function MemoryDoc({
               variant="ghost"
               size="sm"
               disabled={saving}
-              onClick={() => setEntries((es) => [{ id: nextId.current++, text: "" }, ...es])}
+              onClick={() =>
+                setEntries((es) => [
+                  { key: `e${nextKey.current++}`, text: "", originalText: null },
+                  ...es,
+                ])
+              }
             >
               <Plus size={14} /> 新增条目
             </Button>
@@ -181,25 +236,38 @@ function MemoryDoc({
             <ul className="mt-2 flex flex-col gap-2.5">
               {entries.map((entry, index) => (
                 <MemoryEntryCard
-                  key={entry.id}
+                  key={entry.key}
                   entry={entry}
                   index={index}
                   saving={saving}
-                  dirty={joinMemoryEntries([entry.text]) !== joinMemoryEntries([splitMemoryEntries(orig)[index] || ""])}
+                  dirty={entry.text !== entry.originalText}
                   onChange={(text) =>
-                    setEntries((es) => es.map((x) => (x.id === entry.id ? { ...x, text } : x)))
+                    setEntries((es) => es.map((x) => (x.key === entry.key ? { ...x, text } : x)))
                   }
-                  onDelete={() => setEntries((es) => es.filter((x) => x.id !== entry.id))}
+                  onDelete={() => setEntries((es) => es.filter((x) => x.key !== entry.key))}
                 />
               ))}
             </ul>
           )}
           <div className="mt-2 flex items-center gap-2">
-            <Button variant="primary" size="sm" onClick={save} disabled={!dirty || saving}>
+            <Button
+              variant="primary"
+              size="sm"
+              onClick={save}
+              disabled={!dirty || saving || overLimit}
+              title={
+                overLimit
+                  ? `已超出字符预算（${current.length}/${limit}），请精简后再保存`
+                  : undefined
+              }
+            >
               {saving ? <Loader2 size={14} className="animate-spin" /> : saved ? <Check size={14} /> : null}
               {saved ? "已保存" : "保存"}
             </Button>
-            <span className="text-[11.5px] text-faint">{current.length} 字符</span>
+            <span className={cn("text-[11.5px]", overLimit ? "font-medium text-danger" : "text-faint")}>
+              {current.length}
+              {limit > 0 ? `/${limit}` : ""} 字符
+            </span>
           </div>
         </>
       )}

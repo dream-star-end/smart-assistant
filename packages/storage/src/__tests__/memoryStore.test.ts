@@ -71,3 +71,82 @@ describe('MemoryStore — USER.md user-level shared, MEMORY.md per-agent', () =>
     assert.equal(other.read('user'), 'OVERWRITTEN-IDENTITY')
   })
 })
+
+describe('MemoryStore — per-agent memory 跨进程锁 + overwrite 乐观并发', () => {
+  it('concurrent memory writes to the SAME agent do not lose updates (per-agent lock)', async () => {
+    // 同一个 agent 的 MEMORY.md 在 v5 下有两个写进程(gateway UI + mcp-memory 子进程)。
+    // 用相同 agentId 的两个 MemoryStore 实例模拟双进程交替写,断言无丢条目。
+    const p1 = new MemoryStore('concurrent-mem-agent')
+    await p1.load()
+    const p2 = new MemoryStore('concurrent-mem-agent')
+    await p2.load()
+    await Promise.all([p1.add('memory', 'mem-fact-P1'), p2.add('memory', 'mem-fact-P2')])
+    const reader = new MemoryStore('concurrent-mem-agent')
+    await reader.load()
+    const txt = reader.read('memory')
+    assert.ok(txt.includes('mem-fact-P1'), 'P1 survived')
+    assert.ok(txt.includes('mem-fact-P2'), 'P2 survived (no lost update, per-agent lock 生效)')
+  })
+
+  it('overwrite with a stale expectedVersion returns conflict and does NOT write disk', async () => {
+    // A 打开编辑器(拿到 version)→ B(AI)并发写入新条目 → A 用旧 version 保存。
+    const a = new MemoryStore('ov-conflict-agent')
+    await a.load()
+    await a.add('memory', 'seed-entry') // A 先落一条种子内容到盘
+    const staleVersion = a.version('memory') // A 编辑器持有的快照版本 = [seed-entry]
+
+    const b = new MemoryStore('ov-conflict-agent')
+    await b.load()
+    const rb = await b.add('memory', 'concurrent-AI-entry') // B 并发写入(mcp-memory)
+    assert.equal(rb.ok, true)
+
+    // A 用陈旧 version 整段覆盖 → 必须冲突,不写盘。
+    const conflict = await a.overwrite('memory', 'A-edited-content', staleVersion)
+    assert.equal(conflict.ok, false, '陈旧版本必须被拒')
+    assert.equal(conflict.error, 'version conflict')
+    assert.ok(conflict.conflict, 'conflict payload 回带')
+    assert.ok(
+      conflict.conflict?.text.includes('concurrent-AI-entry'),
+      'conflict.text 反映盘上最新内容(含 B 的条目)',
+    )
+
+    // 盘上内容未被 A 覆盖:B 的条目还在,A 的编辑内容没落盘。
+    const r1 = new MemoryStore('ov-conflict-agent')
+    await r1.load()
+    assert.ok(r1.read('memory').includes('concurrent-AI-entry'), 'B 的条目仍在盘上')
+    assert.ok(!r1.read('memory').includes('A-edited-content'), 'A 的覆盖没有落盘')
+
+    // A 用 conflict 回带的最新 version 重试 → 成功覆盖。
+    const retry = await a.overwrite('memory', 'A-edited-content', conflict.conflict?.version)
+    assert.equal(retry.ok, true, '用最新 version 重试成功')
+    const r2 = new MemoryStore('ov-conflict-agent')
+    await r2.load()
+    assert.equal(r2.read('memory'), 'A-edited-content', '重试后盘上是 A 的新内容')
+  })
+
+  it('overwrite without expectedVersion keeps last-writer-wins (兼容旧调用)', async () => {
+    const a = new MemoryStore('ov-compat-agent')
+    await a.load()
+    await a.add('memory', 'old-entry')
+    // 不传 version → 直接覆盖,不做冲突检查。
+    const r = await a.overwrite('memory', 'brand-new-content')
+    assert.equal(r.ok, true)
+    const reader = new MemoryStore('ov-compat-agent')
+    await reader.load()
+    assert.equal(reader.read('memory'), 'brand-new-content')
+  })
+
+  it('version() is stable for identical content and empty content is hashable', async () => {
+    const a = new MemoryStore('ov-version-agent')
+    await a.load()
+    // 空内容也能算 version(hash of '')。
+    const empty = a.version('memory')
+    assert.equal(typeof empty, 'string')
+    assert.equal(empty.length, 16)
+    await a.add('memory', 'stable-entry')
+    const v1 = a.version('memory')
+    const b = new MemoryStore('ov-version-agent')
+    await b.load()
+    assert.equal(b.version('memory'), v1, '相同内容跨实例 version 一致')
+  })
+})
