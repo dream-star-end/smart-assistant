@@ -12,16 +12,22 @@
  *     （余额不足不抛错，按可用扣完——对齐 proxyBilling 既有 clamp 语义：流已交付，字节回不来）。
  *   - `getSpendableBalance / getBalanceBreakdown` 只读：preCheck 预检与 /api/me 展示用「总可用」。
  *
- * 死锁规避（全仓不变量，全局锁序**单向**）：**orgs → users → user_subscriptions**。
- *   - 触 org 钱包的扣费（传 orgId,0112 企业版第 0 优先桶）：先
- *     `SELECT credits FROM orgs WHERE id=$1 AND status='active' FOR UPDATE`，再锁 users、
- *     再锁 user_subscriptions。org 行不存在/非 active → 静默跳过 org 桶,降级纯个人两桶
- *     （settle 解析与扣费之间 org 可能被停用,fail-open 保证"流已交付必须记账"）。
+ * 死锁规避（全仓不变量，全局锁序**单向**）：
+ *   **orgs → org_subscriptions → users → user_subscriptions**（0115 企业版席位订阅扩入
+ *   org_subscriptions,位于 orgs 之后、users 之前)。
+ *   - 触 org 桶的扣费（传 orgId,0112/0115 企业版 org_period+org_wallet 优先桶）：先
+ *     `SELECT credits FROM orgs WHERE id=$1 AND status='active' FOR UPDATE`,紧接
+ *     `SELECT period_credits FROM org_subscriptions WHERE org_id=$1 AND status='active'
+ *      AND period_end>NOW() FOR UPDATE`(谓词与个人期内桶同款,过期未轮转不可花),
+ *     再锁 users、再锁 user_subscriptions。org 行不存在/非 active → 静默跳过 org 两桶,
+ *     降级纯个人两桶（settle 解析与扣费之间 org 可能被停用,fail-open 保证"流已交付必须记账"）。
  *   - 纯个人扣费（无 orgId）：锁 users → user_subscriptions（org 层不参与,序仍单向)。
- *   - 仅锁期内桶的操作（订阅发放/轮转）不锁 users/orgs,故与本扣费路径无锁序环。
- *   - **任何未来新触 org 层的兄弟路径(refund/upgrade 等)必须把 orgs 锁在最前**。
+ *   - 仅锁期内桶的操作（个人/org 订阅发放/轮转）:个人只锁 user_subscriptions;org
+ *     订阅发放/轮转锁 orgs→org_subscriptions(见 org/orgSubscriptions.ts),均是本序前缀,无环。
+ *   - **任何未来新触 org 层的兄弟路径(refund/upgrade 等)必须把 orgs→org_subscriptions 锁在最前**。
  *
- * 扣费顺序（第 0 优先桶）：org_wallet → user_period → user_wallet（企业买单优先、个人兜底）。
+ * 扣费顺序（优先桶在前）：org_period → org_wallet → user_period → user_wallet
+ *   （企业订阅池优先、企业钱包次之、个人期内桶再次、个人钱包兜底）。
  * clamp 语义不变：org+user 总额不足按可用扣完。
  *
  * BIGINT/bigint 贯穿，禁止 Number 化。
@@ -39,8 +45,9 @@ export interface SpendTwoBucketInput {
   ref?: LedgerRef;
   memo?: string;
   /**
-   * org 钱包（0112 企业版第 0 优先桶）。传入即尝试先扣 org 钱包。
-   *   - org 行存在且 status='active' → 参与,`org_wallet → period → wallet` 顺序扣。
+   * org 桶（0112 org 钱包 + 0115 org 期内池，企业版优先桶）。传入即尝试先扣 org 桶。
+   *   - org 行存在且 status='active' → 参与,`org_period → org_wallet → period → wallet` 顺序扣
+   *     （org 期内池=席位订阅池,active+未过期才计入;org 钱包=充值兜底）。
    *   - org 行不存在 / 非 active → **静默跳过**（不抛错），降级为纯个人两桶
    *     （fail-open:settle 解析与扣费之间 org 可能被停用,已交付的流必须记账）。
    * 由 settle 收口从成员 active membership 推导(billing_enabled=true 才传),
@@ -56,27 +63,37 @@ export interface SpendTwoBucketResult {
   debited: bigint;
   /** true = 余额不足按可用扣完（实扣 < 期望；含 org+个人总额不足）。 */
   clamped: boolean;
+  /** 从 org 期内池（席位订阅，0115）扣的部分（org 桶未参与 / 无 active org 订阅则 0n）。 */
+  fromOrgPeriod: bigint;
   /** 从 org 钱包扣的部分（org 桶未参与则 0n）。 */
   fromOrg: bigint;
-  /** 从期内桶扣的部分。 */
+  /** 从个人期内桶扣的部分。 */
   fromPeriod: bigint;
   /** 从持久钱包扣的部分。 */
   fromWallet: bigint;
+  /** 扣后 org 期内池余额；org 桶未参与（无 orgId / org 非 active）→ null。 */
+  orgPeriodAfter: bigint | null;
   /** 扣后 org 钱包余额；org 桶未参与（无 orgId / org 非 active）→ null。 */
   orgAfter: bigint | null;
-  /** 扣后期内桶余额。 */
+  /** 扣后个人期内桶余额。 */
   periodAfter: bigint;
   /** 扣后钱包余额。 */
   walletAfter: bigint;
-  /** 扣后**个人**总可用（period + wallet）。org 桶不并入(归属主体不同)。 */
+  /** 扣后**个人**总可用（period + wallet）。org 两桶不并入(归属主体不同)。 */
   totalAfter: bigint;
+  /** org 期内池那条流水 id（无则 null）。 */
+  ledgerOrgPeriodId: bigint | null;
   /** org 钱包那条流水 id（无则 null）。 */
   ledgerOrgId: bigint | null;
-  /** 期内桶那条流水 id（无则 null）。 */
+  /** 个人期内桶那条流水 id（无则 null）。 */
   ledgerPeriodId: bigint | null;
   /** 钱包那条流水 id（无则 null）。 */
   ledgerWalletId: bigint | null;
-  /** 供 usage_records.ledger_id 关联的主流水：钱包 → 期内桶 → org 钱包 → null。 */
+  /**
+   * 供 usage_records.ledger_id 关联的主流水：钱包 → 个人期内桶 → org 钱包 → org 期内池 → null。
+   * 个人位次零变（wallet→period 在前），org 两桶垫底（org_wallet→org_period），
+   * 保证 org 独付（仅动 org 桶）时主流水仍非 null。
+   */
   primaryLedgerId: bigint | null;
 }
 
@@ -144,13 +161,15 @@ function normOrgId(orgId: bigint | number | string): string {
 /**
  * 在调用方既有事务内执行扣费（clamp 到可用总额，不抛余额不足）。
  *
- * 桶与锁序（全局单向 orgs → users → user_subscriptions）：
- *   0) （orgId 存在时）`SELECT credits FROM orgs WHERE id=$1 AND status='active' FOR UPDATE`。
- *      无行 → 静默跳过 org 桶（降级纯个人两桶,fail-open）。
+ * 桶与锁序（全局单向 orgs → org_subscriptions → users → user_subscriptions）：
+ *   0a) （orgId 存在时）`SELECT credits FROM orgs WHERE id=$1 AND status='active' FOR UPDATE`。
+ *       无行 → 静默跳过 org 两桶（降级纯个人两桶,fail-open）。
+ *   0b) （org 参与时）`SELECT period_credits FROM org_subscriptions WHERE org_id=$1 AND
+ *       status='active' AND period_end>NOW() FOR UPDATE`（过期未轮转不可花,谓词同个人期内桶）。
  *   1) `SELECT credits FROM users FOR UPDATE`（持久钱包）。
  *   2) `SELECT period_credits FROM user_subscriptions WHERE status='active' AND period_end>NOW() FOR UPDATE`。
- * 扣费顺序 org_wallet → period → wallet；各桶分别写 credit_ledger（balance_after=该桶扣后值,
- * org 桶行带 org_id + user_id=消费成员）。
+ * 扣费顺序 org_period → org_wallet → period → wallet；各桶分别写 credit_ledger（balance_after=该桶
+ * 扣后值,org 两桶行带 org_id + user_id=消费成员）。
  */
 export async function spendTwoBucket(
   client: PoolClient,
@@ -159,8 +178,8 @@ export async function spendTwoBucket(
   if (input.amount <= 0n) throw new TypeError(`amount must be > 0, got ${input.amount}`);
   const uid = normUid(input.userId);
 
-  // 0) （第 0 优先桶）锁 org 钱包 —— **锁序最前**。org 不存在/非 active → 不参与(orgParticipates=false),
-  //    降级为纯个人两桶(fail-open:流已交付必须记账)。
+  // 0a) （org 桶）锁 org 钱包 —— **锁序最前**。org 不存在/非 active → 不参与(orgParticipates=false),
+  //     降级为纯个人两桶(fail-open:流已交付必须记账)。
   let orgId: string | null = null;
   let orgParticipates = false;
   let orgCredits = 0n;
@@ -174,6 +193,23 @@ export async function spendTwoBucket(
       orgParticipates = true;
       orgCredits = BigInt(oRow.rows[0].credits);
     }
+  }
+
+  // 0b) （org 参与时）锁 org 期内池（**仅 active 且未过期**的席位订阅,0115）。锁序紧接 orgs、
+  //     先于 users —— 全局单向 orgs → org_subscriptions → users → user_subscriptions。
+  //     过期但 sweeper 未轮转的行不计入可用(谓词 period_end>NOW(),同个人期内桶,防到期后花旧池)。
+  let orgSubId: string | null = null;
+  let orgPeriod = 0n;
+  if (orgParticipates && orgId !== null) {
+    const osRow = await client.query<{ id: string; period_credits: string }>(
+      `SELECT id::text AS id, period_credits::text AS period_credits
+         FROM org_subscriptions
+        WHERE org_id = $1::bigint AND status = 'active' AND period_end > NOW()
+        FOR UPDATE`,
+      [orgId],
+    );
+    orgSubId = osRow.rows[0]?.id ?? null;
+    orgPeriod = osRow.rows[0] ? BigInt(osRow.rows[0].period_credits) : 0n;
   }
 
   // 1) 锁钱包（持久）
@@ -196,15 +232,22 @@ export async function spendTwoBucket(
   const subId = sRow.rows[0]?.id ?? null;
   const period = sRow.rows[0] ? BigInt(sRow.rows[0].period_credits) : 0n;
 
-  // 可用总额 = org 桶(参与时) + 期内桶 + 钱包;扣费顺序 org → period → wallet。
-  const orgAvail = orgParticipates ? orgCredits : 0n;
-  const total = orgAvail + period + wallet;
+  // 可用总额 = org 期内池 + org 钱包(均 org 参与时) + 个人期内桶 + 个人钱包;
+  // 扣费顺序（瀑布）org_period → org_wallet → period → wallet。
+  const orgPeriodAvail = orgParticipates ? orgPeriod : 0n;
+  const orgWalletAvail = orgParticipates ? orgCredits : 0n;
+  const total = orgPeriodAvail + orgWalletAvail + period + wallet;
   const debited = input.amount < total ? input.amount : total;
   const clamped = debited < input.amount;
-  const fromOrg = debited < orgAvail ? debited : orgAvail;
-  const afterOrg = debited - fromOrg;
-  const fromPeriod = afterOrg < period ? afterOrg : period;
-  const fromWallet = afterOrg - fromPeriod;
+  let rem = debited;
+  const fromOrgPeriod = rem < orgPeriodAvail ? rem : orgPeriodAvail;
+  rem -= fromOrgPeriod;
+  const fromOrg = rem < orgWalletAvail ? rem : orgWalletAvail;
+  rem -= fromOrg;
+  const fromPeriod = rem < period ? rem : period;
+  rem -= fromPeriod;
+  const fromWallet = rem; // 保证 rem <= wallet（total 已含 wallet）
+  const orgPeriodAfter = orgParticipates ? orgPeriod - fromOrgPeriod : null;
   const orgAfter = orgParticipates ? orgCredits - fromOrg : null;
   const periodAfter = period - fromPeriod;
   const walletAfter = wallet - fromWallet;
@@ -214,10 +257,27 @@ export async function spendTwoBucket(
     ? `${input.memo ?? ""} clamped requested=${input.amount} total=${total}`.trim()
     : input.memo;
 
+  let ledgerOrgPeriodId: bigint | null = null;
   let ledgerOrgId: bigint | null = null;
   let ledgerPeriodId: bigint | null = null;
   let ledgerWalletId: bigint | null = null;
 
+  if (fromOrgPeriod > 0n && orgSubId && orgId !== null) {
+    await client.query(
+      "UPDATE org_subscriptions SET period_credits = $1, updated_at = NOW() WHERE id = $2",
+      [(orgPeriodAfter as bigint).toString(), orgSubId],
+    );
+    ledgerOrgPeriodId = await insertLedger(client, {
+      uid, // 消费成员(经办人),org 桶归属由 orgId 列表达
+      orgId,
+      delta: -fromOrgPeriod,
+      balanceAfter: orgPeriodAfter as bigint,
+      reason: input.reason,
+      bucket: "org_period",
+      ref: input.ref,
+      memo,
+    });
+  }
   if (fromOrg > 0n && orgParticipates && orgId !== null) {
     await client.query(
       "UPDATE orgs SET credits = $1, updated_at = NOW() WHERE id = $2::bigint",
@@ -266,18 +326,22 @@ export async function spendTwoBucket(
     requested: input.amount,
     debited,
     clamped,
+    fromOrgPeriod,
     fromOrg,
     fromPeriod,
     fromWallet,
+    orgPeriodAfter,
     orgAfter,
     periodAfter,
     walletAfter,
     totalAfter: periodAfter + walletAfter,
+    ledgerOrgPeriodId,
     ledgerOrgId,
     ledgerPeriodId,
     ledgerWalletId,
-    // usage_records.ledger_id 主流水关联:钱包 → 期内桶 → org 钱包（保证 org 独付时也非 null）。
-    primaryLedgerId: ledgerWalletId ?? ledgerPeriodId ?? ledgerOrgId,
+    // usage_records.ledger_id 主流水关联:钱包 → 个人期内桶 → org 钱包 → org 期内池
+    //（个人位次零变、org 桶垫底,保证 org 独付时也非 null）。
+    primaryLedgerId: ledgerWalletId ?? ledgerPeriodId ?? ledgerOrgId ?? ledgerOrgPeriodId,
   };
 }
 

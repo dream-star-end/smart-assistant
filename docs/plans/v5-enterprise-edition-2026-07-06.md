@@ -115,3 +115,45 @@ CREATE TABLE org_invitations (…token_hash 模式,仿 email_verifications;org_r
 ## 9. 部署生效面预分类(v5-commercial-deploy 矩阵)
 
 master(A/B/C/D 全部)+ **egress(B 计费必 --egress)** + web-react dist(D)+ 迁移 0111-0114 人工 apply(0096+ 惯例)。**无 runtime image 重建**(方案 5 已把容器面挡在外)。admin.js 属 master 静态树,随 deploy-v5.sh rsync 生效。
+
+---
+
+# 二期(P3.1 第二波,2026-07-07)—— 席位订阅 + 自助开通(boss 授权:按 Claude/GPT 范式,计费参照个人版套餐)
+
+## 10. 行业范式对齐(取证:OpenAI/Anthropic 官方文档,2026-07)
+两家共同范式:统一账号+org 维度(我们一期已对齐)/**开通全面自助化**(连 Anthropic Enterprise 都自助)/成员进入三级递进(邀请→domain capture→SCIM)/角色 owner-admin-member 且 **billing 默认只归 owner**/计费以席位为锚(Claude=seat 费+用量另计,与我们"org 订阅+org 钱包"天然同构)。
+本期做:席位订阅+自助开通+billing 权限收紧。**不做**(登记):domain capture(中期最划算,验 DNS TXT 同域自动入组)、SSO/SCIM(大客户触发)、自定义 RBAC。
+
+## 11. 企业套餐定价(裁决:参照个人版,席位制+积分池化)
+个人版锚点(0096):pro ¥88/1万分、max ¥298/3.5万、ultra ¥498/6万,30 天期。
+企业档 = **每席位价 ≈ 个人档 9 折,每席积分与个人档同量,全部入 org 期内池(池化=闲置席位积分不浪费,即企业版核心增值)**;org 钱包(一期已上线)承接超额与非订阅用量:
+
+| plan_code | 名称 | 每席/月 | 每席积分入池 | 最低席位 |
+|---|---|---|---|---|
+| org-pro | 企业标准 | ¥78(7800 分) | 10000 | 2 |
+| org-max | 企业专业 | ¥268(26800 分) | 35000 | 2 |
+| org-ultra | 企业旗舰 | ¥448(44800 分) | 60000 | 2 |
+
+期 30 天;**期中加席**=按整席全价购,整份积分即时入池,period 不变(宽松,UX 铁律);续费=手动再购(与个人版一致);到期=sweeper 清零期内池(写 subscription_expire 负流水),org 无 free 档,状态置 expired,**不踢成员**(席位闸只拦新进,不清存量——宽松)。
+
+## 12. 数据与计费扩展
+- **单一 plans 权威**:subscription_plans 加 `scope TEXT CHECK ('user','org') DEFAULT 'user'` + `min_seats INTEGER`(org 档专用),不建第二张 plans 表;seed 三个 org 档。
+- **org_subscriptions**(0115):org_id UNIQUE、plan_code、seats、period_start/end、period_credits(池)、status(active/expired),结构镜像 user_subscriptions。
+- **四桶扣费**:org_period → org_wallet → user_period → user_wallet;**锁序全局单向扩展:orgs → org_subscriptions → users → user_subscriptions**;ledger bucket 扩 'org_period',完整性 CHECK 扩为"org 桶必须带 org_id"。预检口径同步(getOrgSpendableForUser 加期内池,与扣费参与条件成对改)。
+- 订单:kind CHECK 扩 'org_provision'(自助开通)+ 复用 'subscription'(org_id 非空=org 订阅/续费/加席,plan_code+seats 落单)。
+
+## 13. 自助开通(Claude/GPT 式)
+无 active org 的用户 → "创建组织"向导(组织名+选档+席位数)→ 支付 → **fulfill 时一个事务建 org+owner membership+org 订阅**(org 不提前建,无 pending 僵尸;fulfill 时若用户已入他 org(uq_user_active_org 冲突)→ 订单置 paid+发 critical 告警人工处置,极小概率窗口显式接受);组织名等参数落订单新列。平台超管代建通道(一期)保留=销售路径,与自助并行(对齐 Claude 双通道)。
+
+## 14. 席位闸与权限收紧
+- 席位闸:有 active 订阅 → 生效成员上限 = min(seats, max_members);无订阅(钱包型/超管代建)→ 沿用 max_members。**只拦新进**(createInvitation/acceptInvitation),不清存量、不拦续费降席(降席后超编=只读警示)。
+- **billing 收紧 owner-only**(对齐两家默认):topup/subscribe/加席/invoice-profile 写/发票申请 → minRole 'owner';读面(balance/ledger/orders/usage)与成员/技能管理保持 admin。自定义 billing 委派(Claude 式 Finance 角色)登记为后续。
+
+## 15. 二期批次与所有权
+- E 计费核心:0115 + spend.ts 四桶 + org/orgSubscriptions.ts(grant/加席/轮转)+ org 到期 sweeper + 预检同步
+- F 购买开通链:orders fulfill 分支 + /api/org/subscribe|seats + 自助开通订单 + 席位闸(invitations)+ billingRoutes/invoicesRoutes 权限收紧
+- G 前端:OrgCenter 订阅面板 + 创建组织向导 + AccountTab CTA + owner 门 + admin.js
+E 先行,F/G 并行;生效面 = master + egress + dist + 0115(零 runtime image)。
+
+## 16. 二期登记债
+domain capture / SSO+SCIM / 自定义 RBAC(billing 委派)/ 降席超编的软处置策略 / org 订阅自动续费(扣钱包)——均待真实客户信号。

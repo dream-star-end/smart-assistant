@@ -231,6 +231,11 @@ function makeFakePool(opts: { userBalance?: bigint; periodCredits?: bigint | nul
           rowCount: 1,
         };
       }
+      // 企业版预检:getOrgSpendableForUser(org 钱包+期内池)。本套件不测 org 计费
+      // → 无成员归属,返回空 → org 可用额 0n(纯个人预检,行为不变)。
+      if (trimmed.startsWith("SELECT (o.credits")) {
+        return { rows: [], rowCount: 0 };
+      }
       throw new Error(`fakePool: unhandled SQL: ${trimmed.slice(0, 80)}`);
     },
     async end(): Promise<void> { /* noop for tests */ },

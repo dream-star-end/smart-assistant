@@ -1036,3 +1036,46 @@ export type OrgSkill = {
   installed_at?: string | null;
 };
 export type OrgSkillsResponse = { installed: OrgSkill[]; available: OrgSkill[] };
+
+// ─── 席位订阅(二期 P3.1;批次 F 契约,前端 api.ts 做适配层)─────────────────────
+// 单一 plans 权威(subscription_plans scope='org')。字段名以 F 实际为准 —— api.ts
+// 的 normalizeOrgPlan / normalizeOrgSubscription 做容错适配,UI 只吃这里的归一化类型。
+// 大数(每席价分 / 每席积分 / 期内池)一律字符串,组件层禁止 Number() 化。
+
+/** 企业套餐档(GET /api/org/plans · GET /api/org/subscription.plans;无 org 也可读)。 */
+export type OrgPlan = {
+  code: string;
+  name: string;
+  /** 每席/月价格(分,字符串大数)。 */
+  seatPriceCents: string;
+  /** 每席入池积分(字符串大数)。 */
+  perSeatCredits: string;
+  /** 档位最低席位数。 */
+  minSeats: number;
+  /** 计费周期天数。 */
+  periodDays: number;
+};
+
+/** 当前 org 订阅(GET /api/org/subscription.subscription;无订阅 → null)。 */
+export type OrgSubscriptionView = {
+  planCode: string;
+  /** 展示名:后端 subscription 不含 plan_name 时回落 code,UI 优先用 plans 列表里的名。 */
+  planName: string;
+  /** 订阅状态(active / expired;到期 sweeper 置 expired 并清空期内池)。 */
+  status: string;
+  seats: number;
+  periodStart: string;
+  periodEnd: string;
+  /** 期内池当前余额(字符串大数)。 */
+  periodCredits: string;
+} | null;
+
+/** GET /api/org/subscription 响应:当前订阅 + 可选档列表。 */
+export type OrgSubscriptionInfo = {
+  subscription: OrgSubscriptionView;
+  plans: OrgPlan[];
+};
+
+/** 席位订单下单结果(provision/subscribe/seats 统一形):{order_no, qr}。
+ *  到账判定复用 GET /api/payment/orders/:order_no(api.getOrder,status→'paid')。 */
+export type OrgPayResult = { orderNo: string; qr: string };

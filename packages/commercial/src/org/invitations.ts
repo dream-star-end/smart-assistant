@@ -12,12 +12,46 @@
  */
 
 import { randomBytes, createHash } from "node:crypto";
+import type { PoolClient } from "pg";
 import { query, tx } from "../db/queries.js";
 import { OrgError, type OrgRole } from "./types.js";
 import { countActiveMembers } from "./memberships.js";
 
 /** 邀请有效期:7 天。 */
 export const INVITATION_TTL_SECONDS = 7 * 24 * 60 * 60;
+
+// ─── 席位闸(§14:只拦新进,不清存量、不拦续费降席)────────────────────
+
+/**
+ * 生效成员上限 = 有 active(未过期)订阅 → min(seats, max_members);无订阅 → max_members。
+ * 纯函数;订阅席位与成员上限取较小者(闲置席位不放大可入组人数,超编不倒扣)。
+ */
+function seatCap(subSeats: number | null, maxMembers: number): number {
+  return subSeats == null ? maxMembers : Math.min(subSeats, maxMembers);
+}
+
+/**
+ * 读某 org 当前 active 且未过期(period_end>NOW())订阅的席位数;无 → null。
+ * 谓词与 spend.ts / addOrgSeatsTx 一致:过期未轮转的订阅不再收紧席位闸(回退 max_members)。
+ */
+async function activeSubSeats(client: PoolClient, orgId: string): Promise<number | null> {
+  const r = await client.query<{ seats: number }>(
+    `SELECT seats FROM org_subscriptions
+      WHERE org_id = $1::bigint AND status = 'active' AND period_end > NOW()`,
+    [orgId],
+  );
+  return r.rows[0]?.seats ?? null;
+}
+
+/** 解析某 org 的生效席位上限(读 max_members + active 订阅席位)。org 不存在 → 404。 */
+async function resolveSeatCap(client: PoolClient, orgId: string): Promise<number> {
+  const o = await client.query<{ max_members: number }>(
+    `SELECT max_members FROM orgs WHERE id = $1::bigint`,
+    [orgId],
+  );
+  if (o.rows.length === 0) throw new OrgError(404, "NOT_FOUND", "org not found");
+  return seatCap(await activeSubSeats(client, orgId), o.rows[0].max_members);
+}
 
 export type InvitationStatus = "pending" | "accepted" | "revoked" | "expired";
 
@@ -76,6 +110,14 @@ export async function createInvitation(
   const expiresAt = new Date(Date.now() + INVITATION_TTL_SECONDS * 1000);
 
   return tx(async (client) => {
+    // 席位软闸(§14 只拦新进):邀请创建时若已满员即明确拒绝,避免造出无法接受的邀请。
+    // 权威闸在 acceptInvitation(接受时事务内再校验);此处仅提前给出结构化错误。
+    const cap = await resolveSeatCap(client, String(input.orgId));
+    const active = await countActiveMembers(String(input.orgId), client);
+    if (active >= cap) {
+      throw new OrgError(409, "SEATS_FULL", "organization has no available seats; add seats or raise the member cap");
+    }
+
     // 撤销同 org 同 email 的所有 pending(未接受未撤销)邀请
     await client.query(
       `UPDATE org_invitations SET revoked_at = NOW()
@@ -163,7 +205,7 @@ export async function acceptInvitation(
       throw new OrgError(409, "ALREADY_IN_ORG", "you already belong to an organization");
     }
 
-    // org 必须 active + 席位未满
+    // org 必须 active + 席位未满(锁 org 行串行化并发接受)
     const org = await client.query<{ status: string; max_members: number }>(
       `SELECT status, max_members FROM orgs WHERE id = $1::bigint FOR UPDATE`,
       [row.org_id],
@@ -171,9 +213,12 @@ export async function acceptInvitation(
     if (org.rows.length === 0 || org.rows[0].status !== "active") {
       throw new OrgError(409, "ORG_UNAVAILABLE", "organization is not accepting members");
     }
+    // 席位闸(§14 权威点,只拦新进):生效上限 = 有 active(未过期)订阅 ? min(seats, max_members) : max_members。
+    // 无订阅(钱包型 / 超管代建)回退 max_members;存量超编不受影响(只在 active < cap 时才放新人)。
+    const cap = seatCap(await activeSubSeats(client, row.org_id), org.rows[0].max_members);
     const active = await countActiveMembers(row.org_id, client);
-    if (active >= org.rows[0].max_members) {
-      throw new OrgError(409, "SEATS_FULL", "organization has no available seats");
+    if (active >= cap) {
+      throw new OrgError(409, "SEATS_FULL", "organization has no available seats; ask an owner to add seats");
     }
 
     await client.query(

@@ -1,14 +1,20 @@
 import * as Dialog from "@radix-ui/react-dialog";
 import { X } from "lucide-react";
-import { useEffect, useState } from "react";
-import { ApiError } from "../lib/api";
-import type { AuthSession, OrgRole, User } from "../lib/types";
+import { useCallback, useEffect, useState } from "react";
+import { api } from "../lib/api";
+import type { AuthSession, OrgRole, OrgSubscriptionInfo, User } from "../lib/types";
 import { Tabs } from "./ui";
+import { CreateOrgWizard } from "./org/CreateOrgWizard";
 import { InvoicesTab } from "./org/InvoicesTab";
 import { MembersTab } from "./org/MembersTab";
+import { OrgSubscribeDialog, type OrgSubMode } from "./org/OrgSubscribeDialog";
+import { orgErrText } from "./org/orgShared";
 import { OverviewTab } from "./org/OverviewTab";
 import { ReportsTab } from "./org/ReportsTab";
 import { SkillsTab } from "./org/SkillsTab";
+
+// 共享 helper 已迁至叶子模块 org/orgShared(权威源);此处 re-export 兼容既有引用点。
+export { orgErrText, orgRoleLabel } from "./org/orgShared";
 
 type Section = "overview" | "members" | "skills" | "reports" | "invoices";
 
@@ -50,12 +56,61 @@ export function OrgCenter({
 }) {
   const [section, setSection] = useState<Section>("overview");
 
+  const noOrg = !user?.org;
+  const callerRole: OrgRole = user?.org?.role ?? "member";
+  const canManageBilling = callerRole === "owner";
+
+  // ── 订阅单一权威源(二期):OrgCenter 顶层拉一次,概览渲染 + 成员满席闸共用。 ──
+  const [subInfo, setSubInfo] = useState<OrgSubscriptionInfo | null>(null);
+  const [subLoading, setSubLoading] = useState(false);
+  const [subErr, setSubErr] = useState<string | null>(null);
+  const [subReload, setSubReload] = useState(0);
+  // 到账后概览重拉(org 钱包 / 成员数),bump 传入 OverviewTab 的 reloadKey。
+  const [overviewReload, setOverviewReload] = useState(0);
+  // owner 订阅 / 加席弹层(两模式);OrgCenter 托管,概览与成员页均可触发。
+  const [payDialog, setPayDialog] = useState<OrgSubMode | null>(null);
+
   // 关闭面板：复位分区（避免重开残留在非概览页）。
   useEffect(() => {
-    if (!open) setSection("overview");
+    if (!open) {
+      setSection("overview");
+      setPayDialog(null);
+    }
   }, [open]);
 
-  const callerRole: OrgRole = user?.org?.role ?? "member";
+  // 有 org 时拉订阅(member 可读)。依赖不含 subLoading(防转圈);noOrg / 未登录不拉。
+  useEffect(() => {
+    if (!open || !auth || noOrg) {
+      setSubInfo(null);
+      return;
+    }
+    let alive = true;
+    setSubLoading(true);
+    setSubErr(null);
+    api
+      .getOrgSubscription(auth)
+      .then((info) => {
+        if (alive) setSubInfo(info);
+      })
+      .catch((e) => {
+        if (alive) setSubErr(orgErrText(e, "加载订阅信息失败"));
+      })
+      .finally(() => {
+        if (alive) setSubLoading(false);
+      });
+    return () => {
+      alive = false;
+    };
+  }, [open, auth, noOrg, subReload]);
+
+  // 订阅 / 加席到账:刷新归属 + 重拉订阅 + 概览。
+  const onSubPaid = useCallback(() => {
+    onRefreshMe?.();
+    setSubReload((n) => n + 1);
+    setOverviewReload((n) => n + 1);
+  }, [onRefreshMe]);
+
+  const showWizard = !!auth && noOrg;
 
   return (
     <Dialog.Root open={open} onOpenChange={(o) => !o && onClose()}>
@@ -67,7 +122,7 @@ export function OrgCenter({
         >
           <div className="flex items-center justify-between gap-3 px-5 py-4">
             <Dialog.Title className="min-w-0 truncate text-[15px] font-semibold text-fg">
-              {user?.org?.name ?? "组织"}
+              {showWizard ? "创建组织" : (user?.org?.name ?? "组织")}
             </Dialog.Title>
             <Dialog.Close asChild>
               <button
@@ -79,27 +134,49 @@ export function OrgCenter({
             </Dialog.Close>
           </div>
 
-          <div className="border-b border-border px-4 pb-3">
-            <div className="overflow-x-auto">
-              <Tabs
-                aria-label="组织分区"
-                value={section}
-                onValueChange={(v) => setSection(v as Section)}
-                items={SECTIONS.map((s) => ({ value: s.id, label: s.label }))}
-              />
+          {/* 无 org 用户(如深链 ?panel=org):直呈创建向导,不显分区 Tabs。 */}
+          {!showWizard && (
+            <div className="border-b border-border px-4 pb-3">
+              <div className="overflow-x-auto">
+                <Tabs
+                  aria-label="组织分区"
+                  value={section}
+                  onValueChange={(v) => setSection(v as Section)}
+                  items={SECTIONS.map((s) => ({ value: s.id, label: s.label }))}
+                />
+              </div>
             </div>
-          </div>
+          )}
 
           <div className="min-h-0 flex-1 overflow-y-auto">
             {!auth ? (
               <p className="px-5 py-10 text-center text-[13px] text-faint">请先登录。</p>
+            ) : showWizard ? (
+              <CreateOrgWizard auth={auth} onCreated={() => onRefreshMe?.()} onCancel={onClose} />
             ) : (
               <>
                 {section === "overview" && (
-                  <OverviewTab auth={auth} onRefreshMe={onRefreshMe} />
+                  <OverviewTab
+                    auth={auth}
+                    onRefreshMe={onRefreshMe}
+                    reloadKey={overviewReload}
+                    subInfo={subInfo}
+                    subLoading={subLoading}
+                    subErr={subErr}
+                    canManageBilling={canManageBilling}
+                    onSubscribe={() => setPayDialog("subscribe")}
+                    onAddSeats={() => setPayDialog("seats")}
+                  />
                 )}
                 {section === "members" && (
-                  <MembersTab auth={auth} callerRole={callerRole} onRefreshMe={onRefreshMe} />
+                  <MembersTab
+                    auth={auth}
+                    callerRole={callerRole}
+                    onRefreshMe={onRefreshMe}
+                    subscription={subInfo?.subscription ?? null}
+                    canManageBilling={canManageBilling}
+                    onAddSeats={() => setPayDialog("seats")}
+                  />
                 )}
                 {section === "skills" && <SkillsTab auth={auth} />}
                 {section === "reports" && <ReportsTab auth={auth} />}
@@ -109,23 +186,18 @@ export function OrgCenter({
           </div>
         </Dialog.Content>
       </Dialog.Portal>
+
+      {/* owner 订阅 / 加席弹层(概览与成员页共用触发)。 */}
+      {auth && !noOrg && (
+        <OrgSubscribeDialog
+          open={payDialog != null}
+          auth={auth}
+          mode={payDialog ?? "subscribe"}
+          subInfo={subInfo}
+          onClose={() => setPayDialog(null)}
+          onPaid={onSubPaid}
+        />
+      )}
     </Dialog.Root>
   );
-}
-
-// ─── 组织中心共享纯函数（唯一权威源，各 Tab 复用；须为 function 声明以规避循环导入 TDZ） ──
-
-/** org 角色 → 中文标签。 */
-export function orgRoleLabel(role: OrgRole): string {
-  return role === "owner" ? "拥有者" : role === "admin" ? "管理员" : "成员";
-}
-
-/**
- * 错误 → 展示文案：优先后端原文（ApiError.message 已含 501 NOT_IMPLEMENTED / 404 等），
- * 退化到通用 Error.message，最后 fallback。集成期批次 B/C 端点未上线时的友好提示由此产出。
- */
-export function orgErrText(e: unknown, fallback: string): string {
-  if (e instanceof ApiError) return e.message || fallback;
-  if (e instanceof Error) return e.message || fallback;
-  return fallback;
 }
