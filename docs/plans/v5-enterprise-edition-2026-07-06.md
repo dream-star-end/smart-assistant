@@ -157,3 +157,21 @@ E 先行,F/G 并行;生效面 = master + egress + dist + 0115(零 runtime image)
 
 ## 16. 二期登记债
 domain capture / SSO+SCIM / 自定义 RBAC(billing 委派)/ 降席超编的软处置策略 / org 订阅自动续费(扣钱包)——均待真实客户信号。
+
+---
+
+# 三期(P3.1 商业化收尾,2026-07-07)—— 落地页外显 + 低水位预警 + billing 委派 + 成员限额
+
+## 17. 范围与裁决(boss 拍板"做吧")
+1. **落地页企业版外显**:叙事区块(共享池/成员管理/报表发票卖点)+ CTA「创建组织」(深链 /?panel=org,AuthGate 自然门);**不加大定价表**(尊重 boss 前一轮"删套餐区"的落地页裁决,档位定价在创建向导内看);公开档位数据经 GET /api/subscription/plans 加 scope=org 参数(定价本就是公开信息)。
+2. **组织余额预警**:master 侧 sweeper(并入 subscriptionRolloverSweeper 第三域,不造新 timer)5min 扫:org 总可用(期内池+钱包)< max(2000, 10%×本期池) → owner 站内信+邮件(best-effort);orgs.low_balance_notified_at 去重,充值/续费/调额 fulfill 时清标记允许再触发。**不走 wecom 运维告警通道**(那是 ops 面,这是用户通知)。
+3. **billing 委派**:org_memberships.billing_delegate BOOLEAN DEFAULT FALSE;授予/回收 **owner-only**(数据层事务内判,同 org_role 纪律);路由表新增伪角色 minRole:'billing' = owner ∥ billing_delegate,覆盖全部计费写面(topup/subscribe/seats/invoice-profile 写/发票申请);/api/me org 字段与成员列表暴露该标志。
+4. **成员级用量限额**:org_memberships.monthly_org_budget BIGINT NULL(NULL=不限,默认宽松);口径=**自然月(Asia/Shanghai)内该成员花掉的 org 资金**(ledger org 两桶负 delta 求和,0116 加 (org_id,user_id,created_at) partial 索引);spendTwoBucket org 桶可用额 = min(org 资金, 剩余预算),超限静默落个人桶(打戳不变,无报错);设置权限=admin 可改(支出策略,非动钱);成员列表展示预算与本月已用。
+
+## 18. 批次与所有权
+- H 后端:0116 迁移;requireOrgRole/routes 'billing' 伪角色;membersRoutes PATCH 两新字段;spend.ts 预算钳制;resolveOrgBillingContext 带 budget;低水位 sweeper+inbox/邮件;fulfill/调额清标记;plans scope 参数;/api/me;测试
+- I 前端:landing 企业区块+CTA;MembersTab 委派开关(owner)+预算编辑(admin)+本月已用;OrgCenter 计费 UI 门从 owner 扩为 owner∥delegate;api/types;vitest
+生效面 = master + egress(spend/settle)+ dist + 0116;零 runtime image。
+
+## 19. 显式边界
+成员自视预算余量(账户页)、预算到限的主动通知、按 agent/技能维度限额、落地页 A/B——均不做,登记候补。
