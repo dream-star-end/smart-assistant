@@ -363,4 +363,35 @@ describe("provisionV3Container saga — 真 PG 事务窗口", () => {
       await pool.end();
     }
   });
+
+  test("在途 provisioning 可见性:中段(cid=NULL)并发观察者 getV3ContainerStatus → 'provisioning' 且不扰动在途行(Codex MAJOR)", async (t) => {
+    if (skip(t)) return;
+    const hostId = await insertSelfHost(10);
+    const pool = createPool({ connectionString: TEST_DB_URL, max: 10 });
+    try {
+      await seedUser(4260);
+      const { docker } = makeIntegFakeDocker({ createDelayMs: 1500 });
+      // 不 await:provision 停在中段(docker create 睡 1.5s),Tx1 已提交 active/cid=NULL 占位行。
+      const inflight = provisionV3Container(makeDeps(pool, docker, hostId), 4260, hostId);
+      await sleep(500); // Tx1 已提交但仍在中段(< createDelayMs)
+      // 观察者(模拟另一闭包的 WS ensureRunning 先手 getV3ContainerStatus)看到在途态。
+      const mid = await getV3ContainerStatus(makeDeps(pool, docker, hostId), 4260);
+      assert.ok(mid, "中段占位行可见");
+      assert.strictEqual(mid!.state, "provisioning", "young cid=NULL → provisioning(非可销毁的 stopped)");
+      assert.strictEqual(mid!.dockerContainerId, "");
+      const midRow = await query<{ state: string }>(
+        `SELECT state FROM agent_containers WHERE user_id=$1::bigint`,
+        ["4260"],
+      );
+      assert.strictEqual(midRow.rows[0]!.state, "active", "在途行未被观察者销毁");
+      // provision 完成 → running + cid 落库(观察者若曾 provisioning-wait,下轮命中 running)。
+      const res = await inflight;
+      assert.ok(res.containerId > 0);
+      const done = await getV3ContainerStatus(makeDeps(pool, docker, hostId), 4260);
+      assert.strictEqual(done!.state, "running");
+      assert.strictEqual(done!.dockerContainerId, "dockerid-1");
+    } finally {
+      await pool.end();
+    }
+  });
 });

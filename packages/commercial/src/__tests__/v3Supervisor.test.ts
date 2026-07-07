@@ -1736,7 +1736,7 @@ describe("getV3ContainerStatus", () => {
     assert.equal(r!.state, "missing");
   });
 
-  test("active row 但 container_internal_id 为 NULL + age<15s → state='stopped'(commit 后极短窗口 grace)", async () => {
+  test("active row 但 container_internal_id 为 NULL + age<15s → state='provisioning'(saga 中段合法在途,ensureRunning 等待而非销毁)", async () => {
     const { docker } = makeDocker();
     const pool = new FakePool();
     pool.rows.push({
@@ -1758,7 +1758,8 @@ describe("getV3ContainerStatus", () => {
       5,
     );
     assert.ok(r);
-    assert.equal(r!.state, "stopped");
+    // saga 修复(Codex MAJOR):young cid=NULL 是并发 provision 在途态,不再是可销毁的 'stopped'。
+    assert.equal(r!.state, "provisioning");
     assert.equal(r!.dockerContainerId, "");
   });
 

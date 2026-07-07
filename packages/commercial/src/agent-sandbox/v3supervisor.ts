@@ -910,8 +910,13 @@ export interface V3ContainerStatus {
   boundIp: string;
   port: number;
   dockerContainerId: string;
-  /** docker inspect 后的标准化态。docker missing 也归 stopped(由 caller 决定 vanish) */
-  state: "running" | "stopped" | "missing";
+  /**
+   * docker inspect 后的标准化态。docker missing 也归 stopped(由 caller 决定 vanish)。
+   * `provisioning`:active 行但 `container_internal_id IS NULL` 且 age<15s ——
+   * saga 中段合法在途态(并发 provision 正在建容器,cid 尚未由 Tx2 落库)。caller
+   * **绝不能**当 stopped/missing 去 stopAndRemove(会销毁在途容器),应短重试等待。
+   */
+  state: "running" | "provisioning" | "stopped" | "missing";
   /**
    * agent_containers.host_uuid。null = 单机 MVP 遗留行 / 本机;非 null 且 !==
    * deps.selfHostId = remote host(caller 的 readiness/stop 要走 node-tunnel)。
@@ -2997,18 +3002,20 @@ export async function getV3ContainerStatus(
   if (r.rowCount === 0) return null;
   const row = r.rows[0]!;
   if (!row.container_internal_id) {
-    // 行被外部 SELECT 看到 = 事务已 COMMIT;但 container_internal_id IS NULL 是
-    // 异常态(provisionV3Container 正常 COMMIT 都会 UPDATE container_internal_id)。
-    // 成因:
-    //   1) 远端 createAndStart 返回空 containerInternalId(v1.0.8 已被 RemoteContractViolation 守门)
-    //   2) 进程异常崩溃留下的边缘状态 / migration 前的旧数据
+    // 行被外部 SELECT 看到 = Tx1 已 COMMIT;container_internal_id IS NULL 有**两种**语义
+    // (saga 化后按 age 二分,不再一律当孤儿清理):
+    //   · young(age<15s)= **合法在途 provisioning**:并发 saga 中段正在建容器,cid 尚未
+    //     由 Tx2 落库(尤其 makeUidSingleflight 覆盖不到的跨闭包并发,如 prewarm 独立闭包
+    //     vs WS 独立闭包)。→ state='provisioning',caller(ensureRunning)必须**等待短重试**,
+    //     **绝不 stopAndRemove**(否则销毁在途容器 → 在途者 Tx2 rowCount=0 补偿 rm,与同名
+    //     create 交错把前台用户打进 NameConflict)。几秒后在途者 Tx2 落 cid → 下轮 ensure 命中 running。
+    //   · old(age>=15s)= 真孤儿:进程崩溃留下的边缘态 / migration 前旧数据 / 远端 createAndStart
+    //     返回空 cid(v1.0.8 已被 RemoteContractViolation 守门)。→ state='missing',ensureRunning
+    //     走既有 stopAndRemove + re-provision 自愈(stopAndRemove 对 NULL cid 提前 return,只翻
+    //     vanished 不动 docker)。若一次 provision 真的 >15s(慢 docker),在途者会被误判成孤儿——
+    //     由 Tx2 的 `WHERE state='active'` guard 兜底(在途者 rowCount=0 → 补偿,不写脏 cid)。
     //
-    // 15s grace 仅遮蔽 commit 后极短窗口内并发 SELECT 的理论可能;真实跑这个分支
-    // 基本是孤儿。超 15s → 视作 missing,ensureRunning 自愈走 stopAndRemove +
-    // re-provision(stopAndRemoveV3Container 对 NULL container_internal_id 提前
-    // return,只翻 state='vanished',不动 docker)。
-    //
-    // 修复 v1.0.7 报告的死循环:row 1120 这种孤儿 row 让用户看到 "5秒后重连" 无穷循环。
+    // 15s 阈值同时是"正常 saga 中段上限"启发值:docker create/start + codex 绑定通常 <10s。
     const ageMs = Date.now() - new Date(row.created_at).getTime();
     return {
       containerId: Number.parseInt(row.id, 10),
@@ -3016,7 +3023,7 @@ export async function getV3ContainerStatus(
       boundIp: row.bound_ip,
       port: row.port ?? V3_CONTAINER_PORT,
       dockerContainerId: "",
-      state: ageMs < 15_000 ? "stopped" : "missing",
+      state: ageMs < 15_000 ? "provisioning" : "missing",
       hostId: row.host_uuid,
     };
   }

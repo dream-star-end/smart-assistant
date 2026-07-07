@@ -9,6 +9,8 @@
  *                      │
  *                      ├─ 1. status = getV3ContainerStatus(uid)
  *                      ├─ 2. if status == null  → provisionV3Container(uid)
+ *                      ├─ 2a-bis. if status.state == 'provisioning'(young cid=NULL,saga 中段在途)
+ *                      │         → 短重试等待(绝不 stopAndRemove,否则销毁并发在途容器)
  *                      ├─ 2. if status.state == 'stopped'/'missing' → stopAndRemove + provision
  *                      │     (v1.0.117:stopped 与 missing 合并走 reprovision —— 原 MVP 行为
  *                      │      "stopped 抛 ContainerUnreadyError 等 3F idle sweep" 实测会让用户在
@@ -373,6 +375,17 @@ export function makeV3EnsureRunning(
       };
     }
 
+    // 2a-bis) provisioning —— young cid=NULL:saga 中段并发 provision 正在建容器(合法在途态,
+    //   见 getV3ContainerStatus 的二分注释)。**绝不 stopAndRemove**:那会销毁在途容器 → 在途者
+    //   Tx2 rowCount=0 走补偿 rm,与同名 docker create 交错把前台用户打进 NameConflict 短重试。
+    //   这里改为**等待**:短重试,几秒后在途者 Tx2 落 cid → 下轮 ensure 命中 running,零 churn
+    //   零 vanish。此路收口 makeUidSingleflight 覆盖不到的**跨闭包**并发(prewarm 独立闭包
+    //   vs WS 独立闭包,两个 in-flight map 不合并)。真 young 孤儿(刚崩)重试几轮 age 过 15s →
+    //   getV3ContainerStatus 转 'missing' → 落下方 2b 既有 stopAndRemove 自愈(最多多等 ~15s,可接受)。
+    if (status && status.state === "provisioning") {
+      throw new ContainerUnreadyError(RETRY_AFTER_PROVISIONING_SEC, "provisioning");
+    }
+
     // 2b) stopped / missing —— DB row 仍 'active' 但容器不 Running:
     //       - stopped: docker exited(典型场景:gateway 进程被 SIGKILL 时容器一起被
     //         tear down / OOM kill / docker daemon restart / 容器内 OpenClaude 自杀)
@@ -390,10 +403,9 @@ export function makeV3EnsureRunning(
     //     释放,新 provision 能拿到同 host 上的新 slot(advisory lock + uniq_ac_user_id_active
     //     防止并发 ensureRunning 留两条 active 行)。
     //
-    //     注:此分支也覆盖 getV3ContainerStatus 中的 `container_internal_id IS NULL &&
-    //     age<15s` 边界(provision 事务刚 COMMIT 的极短窗口)。原本那也归 'stopped'
-    //     让用户 3s 重试,但实际容器并不存在所以怎么也不会转 running,旧行为反而是
-    //     死循环。新逻辑直接清掉重建,uniq + lock 保证不会留多份 active row。
+    //     注:cid=NULL 的 young 行(age<15s)现由上方 2a-bis 'provisioning' 分支处理
+    //     (saga 中段合法在途,等待而非销毁);只有 old(age>=15s)cid=NULL 孤儿归 'missing'
+    //     落本分支,由 stopAndRemove(对 NULL cid 提前 return,只翻 vanished 不动 docker)+ 重建自愈。
     // imageStale(running 但镜像过期)也走这里:stopAndRemove 对 running 容器先 stop 再 remove,
     // 然后 fall through 到 (3) 用 deps.image 重建 → 滚动升级抵达存量长活容器。
     if (status && (status.state === "stopped" || status.state === "missing" || imageStale)) {
