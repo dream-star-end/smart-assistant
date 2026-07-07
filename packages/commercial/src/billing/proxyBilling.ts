@@ -579,6 +579,8 @@ export async function settleUsageAndLedger(
         // billing_enabled=false 的成员:打戳但个人桶付(不传 orgId)。org 非 active 时
         // spendTwoBucket 内 FOR UPDATE 会再兜底 fail-open 降级个人桶。
         orgId: orgCtx && orgCtx.billingEnabled ? orgCtx.orgId : undefined,
+        // 成员月度 org 预算(§17.4):随 orgId 一并传入,org 桶超限静默落个人桶。
+        monthlyOrgBudget: orgCtx && orgCtx.billingEnabled ? orgCtx.monthlyOrgBudget : undefined,
       });
       clamped = spend.clamped;
       // balance_after 对外广播取"总可用"(期内桶+钱包)，对齐前端余额气泡语义。

@@ -921,6 +921,7 @@ export async function handleMe(
     org_role: "owner" | "admin" | "member" | null;
     org_status: string | null;
     org_billing_enabled: boolean | null;
+    org_billing_delegate: boolean | null;
   }>(
     `SELECT u.id::text AS id, u.email, u.email_verified, u.role, u.display_name, u.avatar_url,
             u.credits::text AS wallet_credits,
@@ -929,7 +930,8 @@ export async function handleMe(
             u.status, u.created_at,
             (u.v5_migrated_at IS NOT NULL) AS on_v5,
             o.id::text AS org_id, o.name AS org_name, om.org_role,
-            o.status AS org_status, om.billing_enabled AS org_billing_enabled
+            o.status AS org_status, om.billing_enabled AS org_billing_enabled,
+            om.billing_delegate AS org_billing_delegate
        FROM users u
        LEFT JOIN user_subscriptions us
          ON us.user_id = u.id AND us.status = 'active' AND us.period_end > NOW()
@@ -975,6 +977,9 @@ export async function handleMe(
               role: u.org_role,
               status: u.org_status,
               billing_enabled: u.org_billing_enabled,
+              // §17.3 财务委派:前端据此把计费 UI 门从 owner 扩为 owner ∥ delegate。
+              // owner 恒视为具备计费权(与 requireOrgRole 归一化一致)。
+              billing_delegate: u.org_role === "owner" ? true : u.org_billing_delegate,
             }
           : null,
     },

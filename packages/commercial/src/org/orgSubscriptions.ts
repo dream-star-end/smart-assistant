@@ -247,12 +247,17 @@ export async function grantOrgSubscriptionTx(
   const seats = normSeats(input.seats);
   const refId = input.orderRef ?? null;
 
-  // 锁 orgs(全局锁序最前 + 校验存在)。不修改 orgs,只为守序 + 与 spend 的 org 桶串行化。
+  // 锁 orgs(全局锁序最前 + 校验存在)。只清低水位戳(订阅发放抬高可用额,§17.2),
+  // 不动 orgs.credits(钱包由 payment/admin 管)。
   const orgRow = await client.query<{ id: string }>(
     "SELECT id::text AS id FROM orgs WHERE id = $1::bigint FOR UPDATE",
     [orgId],
   );
   if (orgRow.rows.length === 0) throw new OrgError(404, "NOT_FOUND", `org not found: ${orgId}`);
+  await client.query(
+    "UPDATE orgs SET low_balance_notified_at = NULL WHERE id = $1::bigint AND low_balance_notified_at IS NOT NULL",
+    [orgId],
+  );
 
   const plan = await getOrgPlan(input.planCode, client);
   if (!plan) throw new OrgError(400, "PLAN_NOT_ORG", `plan not found or not an org plan: ${input.planCode}`);
@@ -356,6 +361,11 @@ export async function addOrgSeatsTx(
     [orgId],
   );
   if (orgRow.rows.length === 0) throw new OrgError(404, "NOT_FOUND", `org not found: ${orgId}`);
+  // 加席抬高期内池(可用额)→ 清低水位戳(§17.2)。
+  await client.query(
+    "UPDATE orgs SET low_balance_notified_at = NULL WHERE id = $1::bigint AND low_balance_notified_at IS NOT NULL",
+    [orgId],
+  );
 
   const sel = await client.query<{
     id: string; plan_code: string; seats: number; period_credits: string; status: string; period_end: Date;

@@ -845,8 +845,9 @@ async function fulfillOrgTopupTx(client: PoolClient, order: OrderRow): Promise<b
     throw new TypeError(`org ${orgId} is ${status}, cannot fulfill topup for order ${order.order_no}`);
   }
   const newBalance = BigInt(orgSel.rows[0].credits) + order.credits;
+  // 充值抬高可用额 → 清低水位预警去重戳(§17.2),允许余额再次跌破阈值时重新预警。
   await client.query(
-    "UPDATE orgs SET credits = $1, updated_at = NOW() WHERE id = $2::bigint",
+    "UPDATE orgs SET credits = $1, low_balance_notified_at = NULL, updated_at = NOW() WHERE id = $2::bigint",
     [newBalance.toString(), orgId],
   );
   const ledgerRow = await client.query<{ id: string }>(

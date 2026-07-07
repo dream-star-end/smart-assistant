@@ -15,13 +15,18 @@ import type { IncomingMessage } from "node:http";
 import type { Pool } from "pg";
 import { requireAuth } from "../http/auth.js";
 import { HttpError } from "../http/util.js";
-import { roleAtLeast, type OrgRole } from "./types.js";
+import { roleAtLeast, type OrgRole, type OrgRoleGate } from "./types.js";
 
 export interface OrgAuthContext {
   userId: string;
   orgId: string;
   orgRole: OrgRole;
   billingEnabled: boolean;
+  /**
+   * 财务委派(§17.3):org_memberships.billing_delegate。owner 恒视为具备计费权,
+   * 故 owner 行的 billingDelegate 也归一化为 true(单一权威:computeBillingAuthorized)。
+   */
+  billingDelegate: boolean;
 }
 
 /**
@@ -37,14 +42,21 @@ export async function requireOrgRole(
   req: IncomingMessage,
   jwtSecret: string | Uint8Array,
   pool: Pool,
-  minRole: OrgRole,
+  minRole: OrgRoleGate,
 ): Promise<OrgAuthContext> {
   const user = await requireAuth(req, jwtSecret); // 401 on bad token(透传)
 
-  let row: { org_id: string; org_role: OrgRole; billing_enabled: boolean } | undefined;
+  let row:
+    | { org_id: string; org_role: OrgRole; billing_enabled: boolean; billing_delegate: boolean }
+    | undefined;
   try {
-    const r = await pool.query<{ org_id: string; org_role: OrgRole; billing_enabled: boolean }>(
-      `SELECT m.org_id::text AS org_id, m.org_role, m.billing_enabled
+    const r = await pool.query<{
+      org_id: string;
+      org_role: OrgRole;
+      billing_enabled: boolean;
+      billing_delegate: boolean;
+    }>(
+      `SELECT m.org_id::text AS org_id, m.org_role, m.billing_enabled, m.billing_delegate
          FROM org_memberships m
          JOIN orgs o ON o.id = m.org_id
         WHERE m.user_id = $1::bigint AND m.status = 'active' AND o.status = 'active'
@@ -60,7 +72,14 @@ export async function requireOrgRole(
   if (!row) {
     throw new HttpError(403, "FORBIDDEN", "no active organization membership");
   }
-  if (!roleAtLeast(row.org_role, minRole)) {
+  // owner 恒具备计费权(即便 billing_delegate 未打开),归一化为单一权威。
+  const billingAuthorized = row.org_role === "owner" || row.billing_delegate;
+  if (minRole === "billing") {
+    // 计费伪角色:owner ∥ 财务委派,否则 403(错误信息说明需 owner 或财务委派)。
+    if (!billingAuthorized) {
+      throw new HttpError(403, "FORBIDDEN", "requires organization owner or billing delegate");
+    }
+  } else if (!roleAtLeast(row.org_role, minRole)) {
     throw new HttpError(403, "FORBIDDEN", "insufficient organization role");
   }
   return {
@@ -68,5 +87,6 @@ export async function requireOrgRole(
     orgId: row.org_id,
     orgRole: row.org_role,
     billingEnabled: row.billing_enabled,
+    billingDelegate: billingAuthorized,
   };
 }

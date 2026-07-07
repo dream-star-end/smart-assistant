@@ -661,7 +661,7 @@ describe("org plans 分区 + org_period 完整性 CHECK", () => {
     const pro = await getOrgPlan("org-pro");
     assert.equal(pro!.monthlyCredits, 10000n);
     assert.equal(pro!.minSeats, 2);
-    assert.equal(pro!.priceCents, 7800n);
+    assert.equal(pro!.priceCents, 8800n); // 0117 与个人版对齐
     // 个人档不被当 org 档
     assert.equal(await getOrgPlan("pro"), null);
     assert.equal(await getOrgPlan("free"), null);

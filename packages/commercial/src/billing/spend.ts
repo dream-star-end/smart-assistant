@@ -35,6 +35,7 @@
 
 import type { PoolClient } from "pg";
 import { query } from "../db/queries.js";
+import { sumMemberOrgMonthSpend } from "../org/orgBilling.js";
 import type { LedgerBucket, LedgerRef, LedgerReason } from "./ledger.js";
 
 export interface SpendTwoBucketInput {
@@ -54,6 +55,13 @@ export interface SpendTwoBucketInput {
    * 调用方**不接受客户端直传**(防越权花别的 org 钱)。
    */
   orgId?: bigint | number | string;
+  /**
+   * 成员月度 org 预算(§17.4,org_memberships.monthly_org_budget)。仅 orgId 参与时有意义:
+   * 非 null 时 org 桶总可用额钳到 `min(org 期内池+org 钱包, max(0, budget - 本自然月已用))`,
+   * org_period 优先耗尽再 org_wallet;预算耗尽 → org 两桶出 0,静默落个人桶(打戳不变、零报错)。
+   * null / undefined = 不限(默认宽松)。由 settle 从 resolveOrgBillingContext 一并传入。
+   */
+  monthlyOrgBudget?: bigint | null;
 }
 
 export interface SpendTwoBucketResult {
@@ -212,6 +220,25 @@ export async function spendTwoBucket(
     orgPeriod = osRow.rows[0] ? BigInt(osRow.rows[0].period_credits) : 0n;
   }
 
+  // 0c) 成员月度 org 预算钳制（§17.4）。budget 非 null 且 org 参与时:
+  //     org 两桶总可用额 = min(org 资金, max(0, budget - 本自然月已用))。
+  //     SUM 走 0118 idx_cl_org_user_time(org_id,user_id,created_at),在本 tx 内点查
+  //     (与扣费/写流水同事务,读到的月度已用不含本 turn 未提交的负 delta,正确)。
+  //     预算耗尽 → orgSpendCap=0 → org 两桶出 0,静默落个人桶(usage_records.org_id 打戳在
+  //     settle 侧、与桶解耦,故"打戳不变")。budget 为 null → orgSpendCap=null(不限)。
+  let orgSpendCap: bigint | null = null;
+  if (orgParticipates && orgId !== null && input.monthlyOrgBudget != null) {
+    const budget = input.monthlyOrgBudget;
+    if (budget > 0n) {
+      const monthSpent = await sumMemberOrgMonthSpend(client, orgId, uid);
+      const remaining = budget - monthSpent;
+      orgSpendCap = remaining > 0n ? remaining : 0n;
+    } else {
+      // 防御:预算非正(数据层 CHECK 已挡 <=0,此处兜底)→ 不给 org 桶花。
+      orgSpendCap = 0n;
+    }
+  }
+
   // 1) 锁钱包（持久）
   const wRow = await client.query<{ credits: string }>(
     "SELECT credits::text AS credits FROM users WHERE id = $1 FOR UPDATE",
@@ -232,10 +259,17 @@ export async function spendTwoBucket(
   const subId = sRow.rows[0]?.id ?? null;
   const period = sRow.rows[0] ? BigInt(sRow.rows[0].period_credits) : 0n;
 
-  // 可用总额 = org 期内池 + org 钱包(均 org 参与时) + 个人期内桶 + 个人钱包;
+  // 可用总额 = org 期内池 + org 钱包(均 org 参与时,且经预算钳制) + 个人期内桶 + 个人钱包;
   // 扣费顺序（瀑布）org_period → org_wallet → period → wallet。
-  const orgPeriodAvail = orgParticipates ? orgPeriod : 0n;
-  const orgWalletAvail = orgParticipates ? orgCredits : 0n;
+  // 预算钳制(§17.4):org 两桶总可用 = min(orgPeriod+orgCredits, orgSpendCap),org_period 优先耗;
+  // orgSpendCap=null → 不限(等价旧行为)。钳制只缩 org 桶,个人桶不受影响(超限落个人桶)。
+  const orgPeriodRaw = orgParticipates ? orgPeriod : 0n;
+  const orgWalletRaw = orgParticipates ? orgCredits : 0n;
+  const orgTotalRaw = orgPeriodRaw + orgWalletRaw;
+  const orgTotalAvail =
+    orgSpendCap === null ? orgTotalRaw : orgTotalRaw < orgSpendCap ? orgTotalRaw : orgSpendCap;
+  const orgPeriodAvail = orgTotalAvail < orgPeriodRaw ? orgTotalAvail : orgPeriodRaw;
+  const orgWalletAvail = orgTotalAvail - orgPeriodAvail;
   const total = orgPeriodAvail + orgWalletAvail + period + wallet;
   const debited = input.amount < total ? input.amount : total;
   const clamped = debited < input.amount;

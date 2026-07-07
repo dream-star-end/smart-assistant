@@ -9,6 +9,15 @@ export type OrgRole = "owner" | "admin" | "member";
 export type OrgStatus = "active" | "suspended" | "deleting" | "deleted";
 export type MembershipStatus = "active" | "suspended";
 
+/**
+ * 路由鉴权门槛(§17.3):真实 org 角色 + 计费伪角色 'billing'。
+ *   - 真实角色('owner'/'admin'/'member')走角色序 roleAtLeast。
+ *   - 伪角色 'billing' = owner ∥ billing_delegate(财务委派),不进角色序,由 requireOrgRole
+ *     单独判定。伪角色只用于计费写面(topup/subscribe/seats/invoice 写),让 owner 可把
+ *     计费能力授予非 admin 的财务成员而不放开成员管理。
+ */
+export type OrgRoleGate = OrgRole | "billing";
+
 /** 角色权限序:owner > admin > member。数值仅用于比较,不外泄。 */
 const ROLE_RANK: Record<OrgRole, number> = { owner: 3, admin: 2, member: 1 };
 

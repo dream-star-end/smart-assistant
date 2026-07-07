@@ -244,8 +244,11 @@ export async function adjustOrgCredits(input: AdjustOrgCreditsInput): Promise<Ad
         `adjustment would drive org credits below zero (balance=${balance}, delta=${input.delta})`,
       );
     }
+    // 正向调额抬高可用额 → 清低水位预警去重戳(§17.2),允许再次触发;负调不清(可能仍低)。
     await client.query(
-      `UPDATE orgs SET credits = $1, updated_at = NOW() WHERE id = $2::bigint`,
+      input.delta > 0n
+        ? `UPDATE orgs SET credits = $1, low_balance_notified_at = NULL, updated_at = NOW() WHERE id = $2::bigint`
+        : `UPDATE orgs SET credits = $1, updated_at = NOW() WHERE id = $2::bigint`,
       [newBalance.toString(), orgId],
     );
     const ledgerRow = await client.query<{ id: string }>(

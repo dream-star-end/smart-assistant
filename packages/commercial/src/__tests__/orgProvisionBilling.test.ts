@@ -208,7 +208,7 @@ describe("createOrgSubscriptionOrder — 建单校验 + fulfill(grant 建池)", 
     assert.equal(order.org_id?.toString(), orgId);
     assert.equal(order.plan_code, "org-pro");
     assert.equal(order.plan_seats, 3);
-    assert.equal(order.amount_cents, 7800n * 3n); // 23400
+    assert.equal(order.amount_cents, 8800n * 3n); // 26400(0117 与个人版对齐)
     assert.equal(order.credits, 10000n * 3n); // 30000(展示快照)
     assert.equal(order.status, "pending");
   });
@@ -244,7 +244,7 @@ describe("createOrgSubscriptionOrder — 建单校验 + fulfill(grant 建池)", 
     const { orgId, ownerId } = await makeOrg();
     const order = await createOrgSubscriptionOrder({ orgId, planCode: "org-pro", seats: 3, operatorUserId: ownerId });
 
-    const first = await markOrderPaid({ orderNo: order.order_no, callbackPayload: {}, expectedAmountCents: 23400n });
+    const first = await markOrderPaid({ orderNo: order.order_no, callbackPayload: {}, expectedAmountCents: 26400n });
     assert.equal(first.newlyPaid, true);
     assert.equal(first.order.status, "paid");
 
@@ -256,7 +256,7 @@ describe("createOrgSubscriptionOrder — 建单校验 + fulfill(grant 建池)", 
     assert.equal(sub!.status, "active");
 
     // 幂等重放:不再翻状态、不再加池
-    const replay = await markOrderPaid({ orderNo: order.order_no, callbackPayload: {}, expectedAmountCents: 23400n });
+    const replay = await markOrderPaid({ orderNo: order.order_no, callbackPayload: {}, expectedAmountCents: 26400n });
     assert.equal(replay.newlyPaid, false);
     const sub2 = await getOrgSubscription(orgId);
     assert.equal(sub2!.periodCredits, 30000n, "重放不重复入池");
@@ -278,9 +278,9 @@ describe("createOrgSeatsOrder — 加席(kind='upgrade' 增量)+ fulfill", () =>
     assert.equal(order.org_id?.toString(), orgId);
     assert.equal(order.plan_seats, 3); // 增量
     assert.equal(order.from_plan_code, null);
-    assert.equal(order.amount_cents, 7800n * 3n);
+    assert.equal(order.amount_cents, 8800n * 3n);
 
-    await markOrderPaid({ orderNo: order.order_no, callbackPayload: {}, expectedAmountCents: 23400n });
+    await markOrderPaid({ orderNo: order.order_no, callbackPayload: {}, expectedAmountCents: 26400n });
     const sub = await getOrgSubscription(orgId);
     assert.equal(sub!.seats, 5); // 2 + 3
     assert.equal(sub!.periodCredits, 50000n); // 20000 + 3×10000
@@ -304,7 +304,7 @@ describe("createOrgSeatsOrder — 加席(kind='upgrade' 增量)+ fulfill", () =>
     // 建单后、支付前订阅过期(sweeper 尚未轮转)
     await query(`UPDATE org_subscriptions SET period_end = NOW() - INTERVAL '1 day' WHERE org_id=$1::bigint`, [orgId]);
 
-    const r = await markOrderPaid({ orderNo: order.order_no, callbackPayload: {}, expectedAmountCents: 23400n });
+    const r = await markOrderPaid({ orderNo: order.order_no, callbackPayload: {}, expectedAmountCents: 26400n });
     assert.equal(r.order.status, "paid");
     // 降级:等额 30000 入 org 钱包,不进期内池
     assert.equal(await orgCredits(orgId), 30000n);
@@ -332,9 +332,9 @@ describe("createOrgProvisionOrder + fulfill — 自助开通全链", () => {
     assert.equal(order.org_id, null);
     assert.equal(order.org_name, "新公司");
     assert.equal(order.plan_seats, 2);
-    assert.equal(order.amount_cents, 7800n * 2n);
+    assert.equal(order.amount_cents, 8800n * 2n);
 
-    const r = await markOrderPaid({ orderNo: order.order_no, callbackPayload: {}, expectedAmountCents: 15600n });
+    const r = await markOrderPaid({ orderNo: order.order_no, callbackPayload: {}, expectedAmountCents: 17600n });
     assert.equal(r.order.status, "paid");
     assert.notEqual(r.order.org_id, null, "开通单回填 org_id");
 
@@ -375,7 +375,7 @@ describe("createOrgProvisionOrder + fulfill — 自助开通全链", () => {
     await addMember(otherOrg, payer, "member");
 
     // 3) fulfill:检测冲突 → paid + 告警 + 不建 org
-    const r = await markOrderPaid({ orderNo: order.order_no, callbackPayload: {}, expectedAmountCents: 15600n });
+    const r = await markOrderPaid({ orderNo: order.order_no, callbackPayload: {}, expectedAmountCents: 17600n });
     assert.equal(r.order.status, "paid", "订单照常 paid");
     assert.equal(r.order.org_id, null, "冲突单不回填 org_id");
 
@@ -483,16 +483,18 @@ describe("席位闸 — min(seats, max_members) 拦新进,存量不受影响", (
 // 权限收紧(§14)—— 路由表 minRole 声明式断言(结构性 gate)
 // ====================================================================
 
-describe("权限收紧 — 计费写面 owner-only,读面不动", () => {
+// 计费写面门:§14 owner-only → §17.3(批次 H)放开给财务委派,minRole 从 'owner' 改
+// 'billing'(=owner ∥ billing_delegate,requireOrgRole 单独判)。此结构断言随之更新。
+describe("权限门 — 计费写面 billing(owner ∥ 委派),读面不动", () => {
   function roleOf(routes: OrgRoute[], method: string, pattern: string): string | null | undefined {
     return routes.find((r) => r.method === method && r.pattern === pattern)?.minRole;
   }
 
-  test("billingRoutes:写面 owner,读面 member/admin,自助开通 null", () => {
+  test("billingRoutes:写面 billing,读面 member/admin,自助开通 null", () => {
     // 纯路由表断言,不需 DB。
-    assert.equal(roleOf(billingRoutes, "POST", "/api/org/topup"), "owner");
-    assert.equal(roleOf(billingRoutes, "POST", "/api/org/subscribe"), "owner");
-    assert.equal(roleOf(billingRoutes, "POST", "/api/org/seats"), "owner");
+    assert.equal(roleOf(billingRoutes, "POST", "/api/org/topup"), "billing");
+    assert.equal(roleOf(billingRoutes, "POST", "/api/org/subscribe"), "billing");
+    assert.equal(roleOf(billingRoutes, "POST", "/api/org/seats"), "billing");
     assert.equal(roleOf(billingRoutes, "GET", "/api/org/subscription"), "member");
     assert.equal(roleOf(billingRoutes, "GET", "/api/org/balance"), "member");
     assert.equal(roleOf(billingRoutes, "GET", "/api/org/orders"), "admin");
@@ -501,9 +503,9 @@ describe("权限收紧 — 计费写面 owner-only,读面不动", () => {
     assert.equal(roleOf(billingRoutes, "GET", "/api/org/plans"), null);
   });
 
-  test("invoicesRoutes:写面(PUT profile / POST invoices)owner,读面 admin", () => {
-    assert.equal(roleOf(invoicesRoutes, "PUT", "/api/org/invoice-profile"), "owner");
-    assert.equal(roleOf(invoicesRoutes, "POST", "/api/org/invoices"), "owner");
+  test("invoicesRoutes:写面(PUT profile / POST invoices)billing,读面 admin", () => {
+    assert.equal(roleOf(invoicesRoutes, "PUT", "/api/org/invoice-profile"), "billing");
+    assert.equal(roleOf(invoicesRoutes, "POST", "/api/org/invoices"), "billing");
     assert.equal(roleOf(invoicesRoutes, "GET", "/api/org/invoice-profile"), "admin");
     assert.equal(roleOf(invoicesRoutes, "GET", "/api/org/invoices"), "admin");
   });

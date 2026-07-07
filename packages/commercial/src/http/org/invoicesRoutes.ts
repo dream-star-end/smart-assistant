@@ -1,13 +1,13 @@
 /**
  * `/api/org/*` 发票路由(批次 D — 方案 §5)。
  *
- *   GET  /api/org/invoice-profile  (admin) → 抬头(无 → null)
- *   PUT  /api/org/invoice-profile  (owner) → upsert 抬头(§14 billing 写面收紧 admin→owner)
- *   GET  /api/org/invoices         (admin) → 本 org 开票申请列表
- *   POST /api/org/invoices         (owner) → 对已付订单发起开票申请(§14 收紧)
+ *   GET  /api/org/invoice-profile  (admin)   → 抬头(无 → null)
+ *   PUT  /api/org/invoice-profile  (billing) → upsert 抬头(§14 收紧 + §17.3 财务委派)
+ *   GET  /api/org/invoices         (admin)   → 本 org 开票申请列表
+ *   POST /api/org/invoices         (billing) → 对已付订单发起开票申请
  *
  * org 由 auth.orgId(requireOrgRole 推导)唯一决定;金额由服务端合计,**不接受**客户端金额。
- * 权限收紧只动写面(PUT profile / POST invoices),读面(GET profile / GET invoices)保持 admin。
+ * 计费写面(PUT profile / POST invoices)门 = owner ∥ billing_delegate;读面保持 admin。
  */
 
 import type { IncomingMessage, ServerResponse } from "node:http";
@@ -151,7 +151,8 @@ async function handleCreateInvoice(
 
 export const invoicesRoutes: OrgRoute[] = [
   { method: "GET", pattern: "/api/org/invoice-profile", minRole: "admin", handler: handleGetProfile },
-  { method: "PUT", pattern: "/api/org/invoice-profile", minRole: "owner", handler: handlePutProfile },
+  // 计费写面:§14 owner-only → §17.3 放开给财务委派(minRole='billing'=owner ∥ billing_delegate)。
+  { method: "PUT", pattern: "/api/org/invoice-profile", minRole: "billing", handler: handlePutProfile },
   { method: "GET", pattern: "/api/org/invoices", minRole: "admin", handler: handleListInvoices },
-  { method: "POST", pattern: "/api/org/invoices", minRole: "owner", handler: handleCreateInvoice },
+  { method: "POST", pattern: "/api/org/invoices", minRole: "billing", handler: handleCreateInvoice },
 ];

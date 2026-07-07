@@ -60,6 +60,29 @@ function asObject(body: unknown): Record<string, unknown> {
   return body as Record<string, unknown>;
 }
 
+/**
+ * 解析成员月度 org 预算(§17.4):null → 清除限额;正整数(number 小额 / 数字串大额)→ 上限。
+ * 其它(0、负数、非整、非数字串、布尔等)→ 400。
+ */
+function parseMonthlyBudget(raw: unknown): bigint | null {
+  if (raw === null) return null;
+  let v: bigint;
+  if (typeof raw === "number") {
+    if (!Number.isInteger(raw)) {
+      throw new HttpError(400, "VALIDATION", "monthly_org_budget must be an integer or null");
+    }
+    v = BigInt(raw);
+  } else if (typeof raw === "string" && /^[0-9]+$/.test(raw)) {
+    v = BigInt(raw);
+  } else {
+    throw new HttpError(400, "VALIDATION", "monthly_org_budget must be a positive integer or null");
+  }
+  if (v <= 0n) {
+    throw new HttpError(400, "VALIDATION", "monthly_org_budget must be > 0 (use null to clear)");
+  }
+  return v;
+}
+
 /** OrgError → HttpError 统一映射(携带 status/code)。 */
 function throwOrg(err: unknown): never {
   if (err instanceof OrgError) throw new HttpError(err.status, err.code, err.message);
@@ -74,6 +97,10 @@ function serializeMember(m: MemberView): Record<string, unknown> {
     org_role: m.org_role,
     status: m.status,
     billing_enabled: m.billing_enabled,
+    // §17.3/§17.4 财务委派 + 成员月度预算 + 本月已用(BIGINT ::text,前端大数不失真)。
+    billing_delegate: m.billing_delegate,
+    monthly_org_budget: m.monthly_org_budget === null ? null : m.monthly_org_budget.toString(),
+    month_org_spent: m.month_org_spent.toString(),
     user_status: m.user_status,
     invited_by: m.invited_by,
     joined_at: m.joined_at instanceof Date ? m.joined_at.toISOString() : m.joined_at,
@@ -148,7 +175,13 @@ async function handlePatchMember(
   const uid = requireBigintId(params.uid, "uid");
   const b = asObject(await readJsonBody(req));
 
-  const patch: { orgRole?: OrgRole; billingEnabled?: boolean; status?: "active" | "suspended" } = {};
+  const patch: {
+    orgRole?: OrgRole;
+    billingEnabled?: boolean;
+    status?: "active" | "suspended";
+    billingDelegate?: boolean;
+    monthlyOrgBudget?: bigint | null;
+  } = {};
   if (b.org_role !== undefined) {
     if (b.org_role !== "admin" && b.org_role !== "member") {
       throw new HttpError(400, "VALIDATION", "org_role must be admin or member");
@@ -163,13 +196,30 @@ async function handlePatchMember(
     }
     patch.billingEnabled = b.billing_enabled;
   }
+  // §17.3 财务委派:授予/回收 owner-only,权威判定在数据层事务内(updateMember)——HTTP 层不判角色。
+  if (b.billing_delegate !== undefined) {
+    if (typeof b.billing_delegate !== "boolean") {
+      throw new HttpError(400, "VALIDATION", "billing_delegate must be boolean");
+    }
+    patch.billingDelegate = b.billing_delegate;
+  }
+  // §17.4 成员月度 org 预算:正整数(number 小额 / 数字串大额)设上限;null 清除。admin 可改。
+  if (b.monthly_org_budget !== undefined) {
+    patch.monthlyOrgBudget = parseMonthlyBudget(b.monthly_org_budget);
+  }
   if (b.status !== undefined) {
     if (b.status !== "active" && b.status !== "suspended") {
       throw new HttpError(400, "VALIDATION", "status must be active or suspended");
     }
     patch.status = b.status;
   }
-  if (patch.orgRole === undefined && patch.billingEnabled === undefined && patch.status === undefined) {
+  if (
+    patch.orgRole === undefined &&
+    patch.billingEnabled === undefined &&
+    patch.status === undefined &&
+    patch.billingDelegate === undefined &&
+    patch.monthlyOrgBudget === undefined
+  ) {
     throw new HttpError(400, "VALIDATION", "no updatable fields provided");
   }
 
@@ -183,6 +233,9 @@ async function handlePatchMember(
         org_role: updated.org_role,
         status: updated.status,
         billing_enabled: updated.billing_enabled,
+        billing_delegate: updated.billing_delegate,
+        monthly_org_budget:
+          updated.monthly_org_budget === null ? null : updated.monthly_org_budget.toString(),
       },
     });
   } catch (err) {

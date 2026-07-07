@@ -121,6 +121,8 @@ export async function settleMiniMaxMediaSuccess(
         ref: { type: "minimax_media_usage_record", id: usageId.toString() },
         memo: `cost=${input.cost.costCredits}`,
         orgId: orgCtx && orgCtx.billingEnabled ? orgCtx.orgId : undefined,
+        // 成员月度 org 预算(§17.4):随 orgId 一并传入,org 桶超限静默落个人桶。
+        monthlyOrgBudget: orgCtx && orgCtx.billingEnabled ? orgCtx.monthlyOrgBudget : undefined,
       });
       clamped = spend.clamped;
       balanceAfter = spend.totalAfter;
