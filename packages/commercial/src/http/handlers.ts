@@ -196,9 +196,10 @@ export interface CommercialHttpDeps {
    * 用"验证 → 首消息"的 p50=215s 间隔覆盖 docker run 冷启(5-8s),
    * 让用户首条消息直接命中 running 容器,无等待。
    *
-   * 装配:v3Deps 配齐时由 `makePrewarmContainer` 包装 `makeV3EnsureRunning(v3Deps)`
-   * 注入(见 commercial/src/index.ts)。v3Deps 未配 → undefined,
-   * handler 端 `deps.prewarmContainer?.()` 变 no-op。
+   * 装配:v3Deps 配齐时由 `makePrewarmContainer` 复用 `sharedEnsureRunning`(与 WS /
+   * media-signed / cronWake 同一 per-uid singleflight in-flight map;2026-07-07 修 Codex MAJOR,
+   * 不再独立包装裸 makeV3EnsureRunning)注入(见 commercial/src/index.ts)。v3Deps 未配 →
+   * undefined,handler 端 `deps.prewarmContainer?.()` 变 no-op。
    *
    * 约定:此函数同步 return void,**绝不抛**(任何错误内部 swallow + log)。
    * handler 调用方不需要 try/catch。详见 agent-sandbox/v3prewarm.ts JSDoc。

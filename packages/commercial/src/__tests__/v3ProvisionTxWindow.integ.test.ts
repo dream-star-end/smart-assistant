@@ -37,6 +37,7 @@ import {
   type V3SupervisorDeps,
 } from "../agent-sandbox/index.js";
 import { listContainers } from "../admin/containers.js";
+import { userHasRunningContainer } from "../compute-pool/queries.js";
 import { closePool, createPool, resetPool, setPoolOverride } from "../db/index.js";
 import { runMigrations } from "../db/migrate.js";
 import { query } from "../db/queries.js";
@@ -462,5 +463,42 @@ describe("provisionV3Container saga — 真 PG 事务窗口", () => {
     const prov = await listContainers({ status: "provisioning", limit: 100 });
     assert.ok(prov.some((r) => r.user_id === "4280"), "provisioning 过滤含 young cid=NULL 行");
     assert.ok(prov.every((r) => r.user_id !== "4281"), "provisioning 过滤不含 old(>grace)cid=NULL 行");
+
+    // Codex MINOR:'missing' 入白名单可筛选 = grace 外 cid=NULL 孤儿(与 provisioning 互补)。
+    const missing = await listContainers({ status: "missing", limit: 100 });
+    assert.ok(missing.some((r) => r.user_id === "4281"), "missing 过滤含 old(>grace)cid=NULL 行");
+    assert.ok(
+      missing.every((r) => r.user_id !== "4280" && r.user_id !== "4282"),
+      "missing 过滤不含 young cid=NULL / 正常 running 行",
+    );
+  });
+
+  test("cronWake 自愈:isContainerActive(userHasRunningContainer)对 active+cid=NULL 孤儿返 false → 不 skip、照常唤醒(Codex MAJOR)", async (t) => {
+    if (skip(t)) return;
+    const hostId = await insertSelfHost(10);
+    await seedUser(4290); // active + cid=NULL 孤儿(saga Tx1 提交、Tx2 前崩溃)
+    await seedUser(4291); // active + cid 已落库(真·在跑)
+    await seedUser(4292); // vanished
+    const ins = (uid: string, ip: string, cid: string | null, state: string) =>
+      query(
+        `INSERT INTO agent_containers(user_id, host_uuid, bound_ip, secret_hash, state, port,
+             runtime_channel, container_internal_id, last_ws_activity, created_at, updated_at)
+         VALUES ($1::bigint, $2::uuid, $3::inet, decode(repeat('01',32),'hex'), $4, 18789, 'v5', $5, NOW(), NOW(), NOW())`,
+        [uid, hostId, ip, state, cid],
+      );
+    await ins("4290", "172.31.8.20", null, "active");
+    await ins("4291", "172.31.8.21", "runningcid", "active");
+    await ins("4292", "172.31.8.22", "vanishedcid", "vanished");
+
+    // 修复语义:cid=NULL 孤儿**不算**在跑 → false → cronWake 不 skip、照常 wakeContainer→
+    // sharedEnsureRunning 自愈(否则 heartbeat 等 cron 永不 fire)。
+    assert.strictEqual(await userHasRunningContainer(4290), false, "active+cid=NULL 孤儿 → false(照常唤醒)");
+    assert.strictEqual(await userHasRunningContainer(4291), true, "active+cid 已落 → true(在跑,跳过唤醒)");
+    assert.strictEqual(await userHasRunningContainer(4292), false, "vanished → false");
+    assert.strictEqual(await userHasRunningContainer(999999), false, "无行 → false");
+
+    // 语义闭合:isContainerActive 闭包(= cronWake 注入的那个)对孤儿返回 false。
+    const isContainerActive = (uid: bigint) => userHasRunningContainer(Number(uid));
+    assert.strictEqual(await isContainerActive(4290n), false, "cronWake 预检不把孤儿当 active");
   });
 });

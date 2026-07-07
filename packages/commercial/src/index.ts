@@ -3405,12 +3405,14 @@ export async function registerCommercial(
           horizonSec,
           scanLimit,
         }),
-      // active 判定复用 findUserDataHost(本 channel);active 容器无需唤醒。
-      // agent_containers 只反映在跑容器,故它只做「跳过 active」优化,不做发现源(发现源=cron_wake_index)。
-      isContainerActive: async (uid) => {
-        const h = await computeQueries.findUserDataHost(Number(uid));
-        return h?.containerState === "active";
-      },
+      // active 判定:**有在跑容器**(state='active' 且 cid 已落库)才跳过唤醒。
+      // 修 Codex MAJOR:不再用 findUserDataHost(纯按 state 派生、不看 cid)—— 否则 saga
+      // 孤儿(active+cid=NULL,master 在 Tx1/Tx2 间崩溃/重启留下)被当 active → skippedActive
+      // → 永不唤醒 → 永不进 sharedEnsureRunning 自愈 → cron 驱动用户 cron 永不 fire。
+      // userHasRunningContainer 用 cid IS NOT NULL 排除孤儿(返回 false),让 cronWake 照常
+      // 唤醒:在途→join singleflight;孤儿→getV3ContainerStatus provisioning/missing 自愈。
+      // (agent_containers 只做「跳过 active」优化,不做发现源;发现源=cron_wake_index。)
+      isContainerActive: async (uid) => computeQueries.userHasRunningContainer(Number(uid)),
       wakeContainer: (uid) => wakeFn(uid),
       runRescan: () => runCronWakeRescan({ runner: cronWakeRunner }),
       logger: rootLogger,

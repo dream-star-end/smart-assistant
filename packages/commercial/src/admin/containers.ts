@@ -157,9 +157,11 @@ export interface ListContainersInput {
    * status=NULL(0017 drop NOT NULL 后 v3 只写 state),过滤 "running" 时
    * v3 active 容器全被隐藏 → admin UI 看不到 v3 侧 running 行,影响排障。
    *
-   * 改成 lifecycle 语义,与 `row_kind`/`lifecycle` 列 + containersStats 对齐:
-   *   - running      = v2 status='running'       OR v3 state='active'
-   *   - provisioning = v2 status='provisioning'  (v3 无此态)
+   * 改成 lifecycle 语义,与 `row_kind`/`lifecycle` 列 + containersStats 对齐
+   * (v3 saga 化后 active+cid 三分,见 PROVISION_INFLIGHT_GRACE_MS):
+   *   - running      = v2 status='running'       OR v3 state='active' 且 cid 已落库(非 NULL)
+   *   - provisioning = v2 status='provisioning'  OR v3 state='active' 且 cid=NULL 且 grace 内(saga 中段在途)
+   *   - missing      = v3 state='active' 且 cid=NULL 且 grace 外(崩溃/重启孤儿,待自愈)
    *   - stopped      = v2 status='stopped'       (v3 无此态)
    *   - error        = v2 status='error'         (v3 CHECK 只有 active/vanished)
    *   - removed      = v2 status='removed'       OR v3 state='vanished'
@@ -171,7 +173,7 @@ export interface ListContainersInput {
   host_uuid?: string;
 }
 
-const CONTAINER_STATUSES = ["provisioning", "running", "stopped", "removed", "error"] as const;
+const CONTAINER_STATUSES = ["provisioning", "running", "stopped", "removed", "error", "missing"] as const;
 
 /** 把 lifecycle 过滤值翻成 SQL 条件(已防 SQL 注入 —— 白名单映射,无参数)。 */
 function lifecycleWhereSql(lifecycle: string): string {
@@ -188,6 +190,10 @@ function lifecycleWhereSql(lifecycle: string): string {
       return "(c.subscription_id IS NOT NULL AND c.status = 'error')";
     case "removed":
       return "((c.subscription_id IS NOT NULL AND c.status = 'removed') OR (c.subscription_id IS NULL AND c.state = 'vanished'))";
+    case "missing":
+      // v3 active+cid=NULL 且 grace 外(异常孤儿)。与 provisioning(grace 内)互补,同一 grace 常量。
+      // v2 无此态(status 机不含 missing)。
+      return `(c.subscription_id IS NULL AND c.state = 'active' AND c.container_internal_id IS NULL AND c.created_at <= NOW() - ${cidNullGraceInterval})`;
     default:
       throw new RangeError("invalid_status");
   }
