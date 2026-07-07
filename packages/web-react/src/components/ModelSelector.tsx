@@ -69,15 +69,16 @@ export function ModelSelector({
   const selectedDegraded = selected ? isDegraded(selected) : false;
   const hasAlternatives = models.some((m) => !isDegraded(m) && m.id !== selectedId);
   const engineLabel = teamEngineLabel(models);
-  const label = teamEngineActive
-    ? `团队模式 · ${engineLabel}`
-    : selected
-      ? modelLabel(selected)
-      : loading
-        ? "加载模型…"
-        : models[0]
-          ? modelLabel(models[0])
-          : "暂无可用模型";
+  // 团队态标签拆前缀/主体:移动端只显引擎名(前缀与头部 chip 冗余,Users 图标已表意),
+  // sm+ 恢复"团队模式 · "全称。
+  const baseLabel = selected
+    ? modelLabel(selected)
+    : loading
+      ? "加载模型…"
+      : models[0]
+        ? modelLabel(models[0])
+        : "暂无可用模型";
+  const label = teamEngineActive ? engineLabel : baseLabel;
   const disabled = loading || models.length === 0;
 
   return (
@@ -99,7 +100,8 @@ export function ModelSelector({
           ) : (
             <Cpu size={14} className="text-faint" />
           )}
-          <span className="max-w-[180px] truncate">{label}</span>
+          {teamEngineActive && <span className="hidden sm:inline">{"团队模式 · "}</span>}
+          <span className="max-w-[6.5rem] truncate sm:max-w-[180px]">{label}</span>
           <ChevronDown size={14} className="text-faint" />
         </button>
       </DropdownMenuTrigger>
