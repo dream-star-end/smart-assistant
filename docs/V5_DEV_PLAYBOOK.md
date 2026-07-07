@@ -127,7 +127,8 @@ ssh kl-mirror 'curl -fsS http://127.0.0.1:18789/healthz'   # v3 应始终不受�
    `ssh kl-mirror 'docker ps --format "{{.Names}} {{.Image}}"'` 找到容器 → `docker exec <c> sh -c "cat /proc/<pid>/environ | tr '\0' '\n' | grep -E 'OPENCLAUDE_AGENT_ID|SESSION_KEY|ANTHROPIC_BASE_URL'"`。
 2. 会话/消息落库查 master:`sqlite3 /root/.openclaude-v5/sessions.db "select ... from client_sessions"`(键形如 `c:<uid>` 分租)。
 3. codex 引擎:官方 OAuth only,数据面必须走绑定账号的 egress 代理(拔代理应 503=fail-closed);账号池按 runtime_channel 圈定;遥测面已双层封堵。
-4. 委派/团队:hidden-reviewer 有每父 turn ≤3 次硬熔断(server.ts HiddenDelegateGuard,429);delegate 有 idle 5min/hard 45min 超时,Stop 级联中断。
+4. 委派/团队:hidden-reviewer 有每父 turn ≤3 次硬熔断(server.ts HiddenDelegateGuard,429);delegate 有 idle 5min/hard 45min 超时,Stop 级联中断;一次性委派子会话收尾即 destroySession(2026-07-07,warm runner 不留存)。
+5. **"客户端转圈不止但服务端其实跑完了"**(团队模式高发,2026-07-07 事故):turn 是否真在飞看 session 双计数(`_activeTurnCount` engine 级 + `_activeClientTurnCount` 客户 turn 级,含 review 编排窗口),**别看 runner.isRunning(warm runner 恒 true)**。恢复链权威:hello 重连对账(`_shouldPushTurnInterruptedFinal`→completed 推 meta.reconcile 静默 final / errored 推 service_restart 文案)+ resume_failed→REST 全量对账 + review 迟到团队卡 persistLateTurnArtifacts 补 drain。ring 帧分级(delegate_progress/turn_status=progress 级先淘,contentLossSeq 水位线判回放),团队进度帧 >15帧/s 冲穿 ring 属预期,content 不应受累。取证三件套:容器 docker logs 的 `delegate`/`team_review`/`verification verdict` 行 + master /var/log/openclaude-v5.log 的 `userChatBridge closed(cause)`/`resume replay miss` + client_sessions.last_at 对时间线。
 
 ### 3.3 会话历史/持久化问题(高频类)
 心智模型:**server 历史(sessions.db)只有 assistant|thinking|tool;用户行走 POST /user-message;团队卡只在客户端 IndexedDB**。合并语义在 `lib/persist.ts`:
@@ -239,6 +240,10 @@ BEGIN; <迁移 SQL>; INSERT INTO schema_migrations(version, applied_at) VALUES (
 | 多 org 归属 | V1 单 active org(uq_user_active_org);放开=删索引+payer 选择+/api/org 显式 org_id | 真实客户需求 |
 | org 钱包锁竞争 | 同 org 高并发扣费串行化于 orgs 行锁(spendTwoBucket FOR UPDATE) | 大客户并发异常时改乐观扣减 |
 | org settle 归属竞态(接受) | resolveOrgBillingContext 不锁 membership,turn 边界毫秒窗口按解析时刻归属(裁决见该函数注释) | — |
+| review 降级披露不入 REST 副本 | deliverHeldFinal 的 disclosure 文案只走流式帧(requestId 复用会撞 request_map 去重,故不随补 persist 落库);客户端恰在该窗口离线且 ring 冲穿才会丢,纯 UX 文案面 | 用户报"审查降级说明刷新后消失" |
+| dispatchInbound 预处理窗口不计入 client turn | getOrCreate→首次 submit 之间(mkdir/parseDocument 等 ms 级)hello 重连仍可能误判 turn 未开始(Plan1 既有 follow-up,团队批次未扩) | 该窗口误判实际报障时 |
+| reviewer 委派成本归并晚一轮 | review 委派完成晚于 engine persist,其 pending 成本按既有"晚到 pending"语义并入**下一** turn 队长行(钱不丢,行归属晚一轮);根治=master 对 agentGroups-only persist 也 drain(需查同 turn 末条助手行) | 用户逐 turn 对账投诉归属 |
+| master bridge ring 未接帧分级 | userChatBridge 的 storeStamped 恒 content 级(v5 回放权威在容器 ring,master 侧仅兜底),暂不影响 | master 侧 resume miss 成为主要报障源时 |
 
 ### P3.1 企业版速记(2026-07-06)
 - **org 面三层前缀**:`/api/me`(自己)/`/api/org/*`(org-owner/admin 自助,dispatchOrgRoute 单一鉴权收口 + requireOrgRole 每请求 DB 复核)/`/api/admin/orgs*`(平台超管)。org 一律服务端从 membership 推导,不接受客户端 org_id。
