@@ -5513,7 +5513,7 @@ async function _loadOrgs() {
   c.innerHTML = `
     <table class="data">
       <thead>
-        <tr><th>名称</th><th>状态</th><th>成员</th><th>余额</th><th>创建时间</th><th class="actions">操作</th></tr>
+        <tr><th>名称</th><th>状态</th><th>成员</th><th>订阅</th><th>余额</th><th>创建时间</th><th class="actions">操作</th></tr>
       </thead>
       <tbody>
         ${rows.map((o) => {
@@ -5521,11 +5521,17 @@ async function _loadOrgs() {
           const members = o.max_members != null
             ? `${escapeHtml(String(o.member_count ?? 0))} / ${escapeHtml(String(o.max_members))}`
             : escapeHtml(String(o.member_count ?? 0))
+          // 0115 席位订阅摘要:档位 × 席位,到期日;expired 灰显。无订阅=钱包型 org。
+          const sub = o.subscription
+            ? `${escapeHtml(o.subscription.plan_code)} × ${escapeHtml(String(o.subscription.seats))}`
+              + `<br /><small style="opacity:0.65">${o.subscription.status === 'active' ? '至 ' : '已到期 '}${escapeHtml(fmtDate(o.subscription.period_end))}</small>`
+            : '<span class="badge muted">无</span>'
           return `
           <tr>
             <td>${escapeHtml(o.name)} <code style="opacity:0.6">#${escapeHtml(String(o.id))}</code></td>
             <td><span class="badge ${badge}">${escapeHtml(o.status || '—')}</span></td>
             <td class="num">${members}</td>
+            <td>${sub}</td>
             <td class="num">${fmtCents(o.credits)}</td>
             <td>${escapeHtml(fmtDate(o.created_at))}</td>
             <td class="actions">
