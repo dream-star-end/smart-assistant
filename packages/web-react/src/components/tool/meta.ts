@@ -32,6 +32,7 @@ import {
   Send,
   Sparkles,
   Terminal,
+  Users,
   Video,
   Wrench,
   type LucideIcon,
@@ -69,6 +70,7 @@ const TOOL_META: Record<string, ToolMeta> = {
   ExitPlanMode: { icon: ListChecks, label: "退出计划模式", tone: "accent" },
   TaskStop: { icon: Bot, label: "停止子任务", tone: "warning" },
   delegate_task: { icon: Bot, label: "委托子任务", tone: "accent" },
+  delegate_tasks: { icon: Users, label: "并行委派", tone: "accent" },
 };
 
 const CODEX_TYPE_META: Record<string, ToolMeta> = {
@@ -196,6 +198,7 @@ const MCP_OP_META: Record<string, ToolMeta> = {
   "openclaude-memory:update_reminder": { icon: Clock, label: "修改定时任务" },
   "openclaude-memory:delete_reminder": { icon: Clock, label: "删除定时任务" },
   "openclaude-memory:delegate_task": { icon: Bot, label: "委托子任务" },
+  "openclaude-memory:delegate_tasks": { icon: Users, label: "并行委派" },
   "openclaude-memory:send_to_agent": { icon: Send, label: "发送给子 Agent" },
   "openclaude-memory:skill_list": { icon: Sparkles, label: "技能列表" },
   "openclaude-memory:skill_search": { icon: Sparkles, label: "技能检索" },
@@ -266,6 +269,17 @@ export function resolveToolMeta(
   return { icon: Wrench, label: name, tone: "neutral" };
 }
 
+/** delegate_tasks(并行 fan-out)摘要:`N 个并行子任务`,尽量带首个 goal 截断(防御非数组)。 */
+function delegateTasksSummary(input: Record<string, unknown>): string {
+  const tasks = asArr(input.tasks);
+  const head = `${tasks.length} 个并行子任务`;
+  const firstGoal =
+    tasks[0] && typeof tasks[0] === "object"
+      ? asStr((tasks[0] as Record<string, unknown>).goal)
+      : "";
+  return firstGoal ? `${head}: ${firstGoal.slice(0, 40)}` : head;
+}
+
 /** 工具卡 header 行的紧凑摘要（文件路径 / 命令 / 查询等）。 */
 export function toolSummary(name: string, input: Record<string, unknown> | null): string {
   if (!input) return "";
@@ -316,6 +330,8 @@ export function toolSummary(name: string, input: Record<string, unknown> | null)
         asStr(input.message) ||
         asStr(input.prompt)
       ).slice(0, 60)}`;
+    case "delegate_tasks":
+      return delegateTasksSummary(input);
   }
   const codexType = parseCodexTypeName(name);
   if (codexType) return codexSummary(codexType, input).slice(0, 80);
@@ -360,6 +376,7 @@ function mcpSummary(server: string, op: string, input: Record<string, unknown>):
     if (op === "update_reminder" || op === "delete_reminder") {
       return (asStr(input.message) || asStr(input.label) || asStr(input.id)).slice(0, 50);
     }
+    if (op === "delegate_tasks") return delegateTasksSummary(input);
     if (op === "delegate_task" || op === "send_to_agent") {
       // 同 toolSummary 的 delegate_task:系统 agent(如 hidden-reviewer)显示映射名而非裸 id。
       const tgt = input.agentId ? `→ ${agentDisplayName(asStr(input.agentId))} ` : "";

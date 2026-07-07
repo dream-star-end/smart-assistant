@@ -200,6 +200,39 @@ function parseDelegateToolInfo(toolName?: string, inputJson?: unknown, inputPrev
   return delegateInfoFromArgs(parseArgsObject(rawArgs));
 }
 
+/**
+ * 该 tool 行是否为**复数 fan-out 委派** `delegate_tasks`(区别于单数 delegate_task)。
+ * fan-out 的 tool 卡故意不转 agent-group(一对多语义不成立),但它的存在是判定「后续按 runId
+ * 落不到组的 delegate_progress 帧属于 fan-out 成员(→ 物化成 live agent-group)」的信号:
+ * fan-out 里每个子任务只有独立 progressRunId、没有 per-subtask delegate_task tool_use 可 adopt。
+ */
+function isFanoutDelegateToolRow(msg: ChatMessage): boolean {
+  if (msg.role !== "tool") return false;
+  const name = msg.toolName || "";
+  const mcp = parseMcpToolName(name);
+  if (mcp?.server === "openclaude-memory" && mcp.op === "delegate_tasks") return true;
+  if (/(?:^|_)delegate_tasks$/.test(name) && parseCodexTypeName(name) !== "mcpToolCall") return true;
+  if (parseCodexTypeName(name) === "mcpToolCall") {
+    const input = parseToolInputObject(msg.inputJson, msg.inputPreview) ?? {};
+    const server = normalizeMcpServerName(str(input.server) || str(input.serverName));
+    const op = str(input.tool) || str(input.toolName) || str(input.name);
+    return server === "openclaude-memory" && op === "delegate_tasks";
+  }
+  return false;
+}
+
+/** 当前活跃 turn(最近一条 user 消息之后)是否存在 fan-out `delegate_tasks` tool 卡。
+ *  fan-out 的 tool_use 恒早于其子任务 progress 帧(MCP 服务端拿到完整 tool 调用后才 spawn 子任务),
+ *  故 progress 落兜底时该 tool 卡已在本轮消息里;限定「本轮」避免上一轮的 fan-out 误判本轮单数委派。*/
+function hasActiveFanoutDelegate(sess: ChatSession): boolean {
+  for (let i = sess.messages.length - 1; i >= 0; i--) {
+    const m = sess.messages[i];
+    if (m.role === "user") return false; // 到达本轮 turn 边界
+    if (isFanoutDelegateToolRow(m)) return true;
+  }
+  return false;
+}
+
 function extractMcpContentText(item: Record<string, unknown> | null): string {
   if (!item) return "";
   const result = asPlainObject(item.result);
@@ -414,6 +447,41 @@ function findSingleMatchingDelegateGroup(sess: ChatSession, progress: ChatMessag
   return matches.length === 1 ? matches[0] : null;
 }
 
+/**
+ * mixed turn(同一轮里既调了 fan-out `delegate_tasks`、又调了单数 `delegate_task`)且单数委派的
+ * progress 早于其 tool_use 到达时:兜底会因 hasActiveFanoutDelegate 命中而先把该单数 run 物化成一张
+ * fan-out 成员 agent-group。此处让随后到达的单数 delegate_task tool_use **复用**那张已物化的组
+ * (按 (agentId, goalKey) 唯一匹配一条「无 blockId、未完成、已绑 runId」的本地富组),避免重复卡。
+ * 纯单数场景(兜底走 delegate-progress standalone、无此类组)与纯 fan-out(无单数 tool_use 进本分支)
+ * 都不命中 → 零回归。`candidates.length !== 1` 的歧义一律 bail(与既有 bind/adopt 同纪律)。
+ */
+function adoptMaterializedFanoutGroupForTool(
+  sess: ChatSession,
+  info: DelegateToolInfo,
+  blockId: string,
+  desc: string,
+): string | null {
+  const candidates = sess.messages.filter(
+    (m) =>
+      m.role === "agent-group" &&
+      !isServerAuthoredRow(m) &&
+      !!m._delegate &&
+      !m.blockId &&
+      !m._completed &&
+      typeof m._delegateRunId === "string" &&
+      m._delegateAgentId === info.agentId &&
+      m._delegateGoal === info.goalKey,
+  );
+  if (candidates.length !== 1) return null;
+  const groupMsg = candidates[0];
+  groupMsg.blockId = blockId;
+  if (desc && groupMsg.text !== desc) groupMsg.text = desc;
+  if (!sess._agentGroups) sess._agentGroups = new Map();
+  sess._agentGroups.set(blockId, groupMsg.id);
+  sess._blockIdToMsgId?.set(blockId, groupMsg.id);
+  return groupMsg.id;
+}
+
 /** 反向 adopt：standalone delegate-progress 卡并入后绑定的 agent-group。*/
 function adoptStandaloneDelegateRun(sess: ChatSession, groupMsg: ChatMessage): boolean {
   if (!groupMsg || !groupMsg._delegate) return false;
@@ -528,6 +596,25 @@ type DelegateProgressBlock = {
   block?: OutboundContentBlock;
 };
 
+/** 把一个 delegate_progress 帧落到已绑定的 agent-group 富卡(done/error → 终态;block → 富子块;
+ *  legacy text → 降级子块)。fan-out 物化的组与既有单数委派组共用同一套落地语义。 */
+function applyDelegatePhaseToGroup(sess: ChatSession, groupMsg: ChatMessage, block: DelegateProgressBlock): void {
+  if (block.phase === "done" || block.phase === "error") {
+    groupMsg._completed = true;
+    groupMsg.completedAt = Date.now();
+    if (block.text && !groupMsg._resultPreview) groupMsg._resultPreview = String(block.text).slice(0, 200);
+    if (block.phase === "error") groupMsg._isError = true;
+  } else if (block.block && typeof block.block === "object") {
+    const child = block.block;
+    const childText = typeof (child as { text?: unknown }).text === "string" ? (child as { text: string }).text : "";
+    appendSubagentBlock(sess, groupMsg, child, childText);
+  } else {
+    const text = typeof block.text === "string" ? block.text : "";
+    const child = legacyDelegateTextToChildBlock(block.phase, text);
+    if (child) appendSubagentBlock(sess, groupMsg, child as OutboundContentBlock, child.text || "");
+  }
+}
+
 function handleDelegateProgressBlock(sess: ChatSession, block: DelegateProgressBlock): void {
   if (!block.runId) return;
   let groupMsgId = sess._delegateRunGroups?.get(block.runId);
@@ -547,25 +634,38 @@ function handleDelegateProgressBlock(sess: ChatSession, block: DelegateProgressB
   if (groupMsgId) {
     const groupMsg = sess.messages.find((m) => m.id === groupMsgId);
     if (groupMsg) {
-      if (block.phase === "done" || block.phase === "error") {
-        groupMsg._completed = true;
-        groupMsg.completedAt = Date.now();
-        if (block.text && !groupMsg._resultPreview) groupMsg._resultPreview = String(block.text).slice(0, 200);
-        if (block.phase === "error") groupMsg._isError = true;
-      } else if (block.block && typeof block.block === "object") {
-        const child = block.block;
-        const childText = typeof (child as { text?: unknown }).text === "string" ? (child as { text: string }).text : "";
-        appendSubagentBlock(sess, groupMsg, child, childText);
-      } else {
-        const text = typeof block.text === "string" ? block.text : "";
-        const child = legacyDelegateTextToChildBlock(block.phase, text);
-        if (child) appendSubagentBlock(sess, groupMsg, child as OutboundContentBlock, child.text || "");
-      }
+      applyDelegatePhaseToGroup(sess, groupMsg, block);
       return;
     }
   }
+
+  // ── 兜底 ── 已持久化的 standalone delegate-progress 行(旧会话 / 尚未被 adopt)按 runId 继续原地更新。
+  const legacy =
+    sess.messages.find((m) => m.role === "delegate-progress" && m.runId === block.runId && !m._adoptedInto) || null;
+
+  // fan-out 成员:队长本轮调用的是复数 `delegate_tasks`(tool 卡不转组、无 per-subtask delegate_task
+  // tool_use 可 adopt),直接把该 run 物化成 live agent-group —— 同轮 ≥2 个自动聚成 TeamPanel,turn 末
+  // server-authored 骨架行按 runId 折叠去重(债A),消除「兜底卡 + 团队面板」三卡并存。单数委派(无 fan-out
+  // tool 卡)则保留下方 delegate-progress standalone 兜底,由后到的 delegate_task tool_use adopt(零回归)。
+  if (!legacy && hasActiveFanoutDelegate(sess)) {
+    const goalRaw = typeof block.goal === "string" ? block.goal : "";
+    const groupMsg = addMessage(sess, "agent-group", goalRaw.trim() || "子任务", {
+      startTime: Date.now(),
+      childBlocks: [],
+      _delegate: true,
+      _delegateRunId: block.runId,
+      _delegateAgentId: block.agentId || "",
+      _delegateGoal: goalRaw ? normalizeDelegateGoalKey(goalRaw) : "",
+      _completed: false,
+    });
+    if (!sess._delegateRunGroups) sess._delegateRunGroups = new Map();
+    sess._delegateRunGroups.set(block.runId, groupMsg.id);
+    applyDelegatePhaseToGroup(sess, groupMsg, block);
+    return;
+  }
+
   // Fallback: standalone delegate-progress card keyed by runId.
-  let msg = sess.messages.find((m) => m.role === "delegate-progress" && m.runId === block.runId) || null;
+  let msg = legacy;
   if (!msg) {
     msg = addMessage(sess, "delegate-progress", "", {
       runId: block.runId,
@@ -684,6 +784,20 @@ export function applyOutboundMessage(
       effects.onFinal?.(sess, frame, true);
       return;
     }
+  }
+
+  // ── reconcile 合成 final：hello 重连对账时 server 判定该轮**已在服务端正常收尾**、但客户端仍挂
+  //    发送态(missed 真 final)。清发送态收口本轮 UI,但**不走空轮分类**(空 blocks 不合成空气泡——
+  //    内容其实已在服务端生成),并强制 REST 全量对账拉回客户端丢失的内容(参考 applyResumeFailed)。──
+  if (frame.isFinal && frame.meta?.reconcile === "turn_completed") {
+    sess._streamingAssistant = null;
+    sess._streamingThinking = null;
+    sess._sendingInFlight = false;
+    clearTurnTiming(sess);
+    resetReplyTracker(sess);
+    effects.onFinal?.(sess, frame, false);
+    effects.forceSync?.(sess.id);
+    return;
   }
 
   // ── §11 stale 守卫 ──
@@ -954,6 +1068,8 @@ export function applyOutboundMessage(
               adoptStandaloneDelegateRun(sess, existingTool);
               continue;
             }
+            // mixed turn:复用本轮已被 fan-out 兜底物化、实属本单数委派的组(见 helper),消重复卡。
+            if (adoptMaterializedFanoutGroupForTool(sess, delegateInfo!, tb.blockId, desc)) continue;
           }
           if (!sess._agentGroups.has(tb.blockId)) {
             const groupMsg = addMessage(sess, "agent-group", desc, {

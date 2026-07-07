@@ -468,34 +468,46 @@ export function PlanCard({ msg }: { msg: ChatMessage }) {
 }
 
 // ═══════════════ delegate-progress（委派进度兜底卡） ═══════════════
-// 不外包 memo(同 PlanCard:就地 mutate + {msg} 会永不重渲)。
+// 不外包 memo(同 PlanCard:就地 mutate + {msg} 会永不重渲)。可折叠:进行中默认展开(看实时进度)、
+// 完成默认折叠(收成一行摘要),与 AgentGroupCard 同款头部 chevron 交互;用户点击后本地锁定。
 export function DelegateProgressCard({ msg }: { msg: ChatMessage }) {
   const entries = msg.entries ?? [];
   const children = msg.childBlocks ?? [];
   const done = !!msg._completed;
+  const [userCollapsed, setUserCollapsed] = useState<boolean | null>(null);
+  const collapsed = userCollapsed ?? done;
   return (
     <div className="rounded-lg border border-border bg-surface animate-in">
-      <div className="flex items-center gap-2 px-3.5 py-2.5">
+      <button
+        type="button"
+        onClick={() => setUserCollapsed(!collapsed)}
+        aria-expanded={!collapsed}
+        className="flex w-full items-center gap-2 px-3.5 py-2.5 text-left hover:bg-hover"
+      >
         <span className="flex size-6 items-center justify-center rounded-md bg-accent-soft text-accent">
           <Sparkles size={13} />
         </span>
-        <span className="text-[13px] font-medium text-fg">{msg.text || "委派子任务"}</span>
-        <span className="ml-auto">
+        <span className="min-w-0 truncate text-[13px] font-medium text-fg">{msg.text || "委派子任务"}</span>
+        <span className="ml-auto flex items-center gap-2">
           {done ? (
             <Badge tone={msg._isError ? "danger" : "success"}>{msg._isError ? "失败" : "完成"}</Badge>
           ) : (
             <Badge tone="accent">进行中</Badge>
           )}
+          <ChevronRight
+            size={15}
+            className={cn("text-faint transition-transform", !collapsed && "rotate-90")}
+          />
         </span>
-      </div>
-      {children.length > 0 && (
+      </button>
+      {!collapsed && children.length > 0 && (
         <div className="space-y-2 border-t border-border px-3.5 py-2.5">
           {children.map((ch, i) => (
             <ChildBlockView key={`${i}-${ch.blockId ?? ch.kind}`} child={ch} sig={childSignature(ch)} />
           ))}
         </div>
       )}
-      {entries.length > 0 && (
+      {!collapsed && entries.length > 0 && (
         <ul className="border-t border-border px-3.5 py-2 text-[12.5px] text-muted">
           {entries.slice(-6).map((e, i) => (
             <li key={i} className="truncate">
@@ -504,8 +516,15 @@ export function DelegateProgressCard({ msg }: { msg: ChatMessage }) {
           ))}
         </ul>
       )}
-      {done && msg.summary && (
+      {!collapsed && done && msg.summary && (
         <div className="border-t border-border px-3.5 py-2 text-[12.5px] text-muted">{msg.summary}</div>
+      )}
+      {/* 折叠态展示结果摘要（完成后）——与 AgentGroupCard 折叠页脚一致。 */}
+      {collapsed && done && msg.summary && (
+        <div className="flex items-start gap-1.5 border-t border-border px-3.5 py-2 text-[12.5px] text-muted">
+          <Check size={13} className="mt-0.5 shrink-0 text-success" />
+          <span className="line-clamp-2">{msg.summary}</span>
+        </div>
       )}
     </div>
   );

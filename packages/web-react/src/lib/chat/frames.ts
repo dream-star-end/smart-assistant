@@ -54,10 +54,16 @@ export type CronPushMeta = {
   label?: string;
 };
 
-/** outbound.message.meta + 运行期 interrupted 标记（service_restart 合成 final）。*/
+/** outbound.message.meta + 运行期 interrupted / reconcile 标记（合成 final）。*/
 export type OutboundMessageMeta = NonNullable<OutboundMessage["meta"]> & {
   /** 'service_restart' = 重连期 gateway 推的带外清理 final（§11）。*/
   interrupted?: string;
+  /**
+   * 'turn_completed' = 重连 hello 对账时,server 判定该轮**已在服务端正常收尾**但客户端仍挂
+   * 发送态(missed final)而合成的空 blocks final。前端据此清发送态 + 强制 REST 对账拉回丢失内容,
+   * 且**不合成空轮气泡**(它不是真正的空轮,内容在服务端已生成)。见 applyOutboundMessage。
+   */
+  reconcile?: string;
 };
 
 // ─── 出站帧（gateway → client，消费侧）───────────────────────────────
