@@ -14,7 +14,7 @@ import { describe, it, before, after, beforeEach } from 'node:test'
 import * as assert from 'node:assert/strict'
 import { parse as parseYaml } from 'yaml'
 
-const { ensureCronFile, isUserInitiatedCronJob } = await import('../cron.js')
+const { ensureCronFile, isUserInitiatedCronJob, validateCronSchedule } = await import('../cron.js')
 const { paths } = await import('@openclaude/storage')
 
 describe('ensureCronFile — OC_SEED_DEFAULT_CRON gate', () => {
@@ -87,5 +87,41 @@ describe('isUserInitiatedCronJob — proactive wechat eligibility', () => {
     assert.equal(isUserInitiatedCronJob({ id: 'daily-reflection' }), false)
     assert.equal(isUserInitiatedCronJob({ id: 'weekly-curation' }), false)
     assert.equal(isUserInitiatedCronJob({ id: 'skill-check' }), false)
+  })
+})
+
+describe('validateCronSchedule — 数值范围/形态校验(matcher 对齐)', () => {
+  const cases: Array<[string, boolean]> = [
+    // 合法:matcher 真正能命中的形态
+    ['0 9 * * *', true],
+    ['*/5 0-23/2 1,15 * 0', true],
+    ['59 23 31 12 6', true],
+    ['30 8 * * 1-5', true],
+    // 非法:越界(纯字符正则拦不住的静默失效写法)
+    ['60 9 * * *', false], // minute 60
+    ['0 25 * * *', false], // hour 25
+    ['0 9 32 * *', false], // dom 32
+    ['0 9 * 13 *', false], // month 13
+    ['0 9 * * 7', false], // dow 7(matcher getDay() 0-6,7 永不命中)
+    ['0-60 * * * *', false], // range 端点越界
+    ['10-5 * * * *', false], // 倒置区间
+    // 非法:形态(matcher 恒 false 或误匹配)
+    ['1, 9 * * *', false], // 空 part(Number('')===0 会误匹配 0)
+    ['*/0 * * * *', false], // 步长 0 永不命中
+    ['5/2 * * * *', false], // 数字底 step,matcher 不支持
+    ['0 9 * *', false], // 4 字段
+    ['a b c d e', false],
+  ]
+  for (const [expr, ok] of cases) {
+    it(`${JSON.stringify(expr)} → ${ok ? 'valid' : 'invalid'}`, () => {
+      const err = validateCronSchedule(expr)
+      if (ok) assert.equal(err, null, `expected valid, got: ${err}`)
+      else assert.notEqual(err, null, 'expected an error message')
+    })
+  }
+
+  it('错误信息指明字段与非法值', () => {
+    assert.match(validateCronSchedule('60 25 * * *') ?? '', /minute field "60" out of range 0-59/)
+    assert.match(validateCronSchedule('0 9 * * 7') ?? '', /use 0 for Sunday/)
   })
 })
