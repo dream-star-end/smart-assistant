@@ -1,42 +1,60 @@
 /**
  * 前端版本握手 + 安全点软刷新(reload governor,唯一权威)。
  *
- * 背景:SPA 标签页(尤其移动端)可长驻数小时旧 bundle;dist 高频发版时,旧前端撞新
- * 服务端语义(2026-07-07 旧前端合成续写被 CODEX_BILLING_GUARD 拒的复发事故)。
- * bridge 在每个 WS accept 时下发 `{type:"sys.frontend_build", build}`(服务端读
- * dist/index.html 的 `<meta name="oc-build">`);本模块比对客户端 DOM 里的同一 meta,
- * 不一致时在安全点 location.reload() 拿新前端。
+ * 背景:SPA 标签页(尤其移动端内嵌 webview)可长驻数小时旧 bundle;dist 高频发版时,
+ * 旧前端撞新服务端语义(2026-07-07 鸿蒙 ArkWeb 长驻旧 JS,合成续写被 CODEX_BILLING_GUARD
+ * 拒的"无响应"复发)。bridge 每次 WS accept 下发 {type:"sys.frontend_build", build}
+ * (服务端读 dist/index.html 的 <meta name="oc-build">);本模块比对客户端 DOM 的同一
+ * meta,不一致时在安全点 location.reload() 拿新前端。
  *
- * ── 防无限刷新硬机制(缺一不可,动任何一条前先想清楚)────────────────────────
- *  G1 目标一次性:每个 server build 目标,本 tab 只允许一次自动 reload。attempt 记录
- *     写 sessionStorage(跨 reload 存活、tab 关闭即弃):reload 后若仍不匹配(中间层
- *     缓存了旧 index.html / 双端探测源漂移),第二帧命中 G1 → 永不再自动刷,只挂手动横幅。
- *  G2 全局冷却:距上次自动 reload(attempt.ts,不分目标)≥ 10min 才允许下一次。
- *     发版列车(一天 10+ 次 dist)下用户至多每 10min 被刷一次,中间版本自然跳过。
- *  G3 storage 不可用(Safari 隐私模式等)→ 永不自动 reload:G1 无法持久化,宁可
- *     只出横幅。写入后还会读回校验,读不回同样放弃自动刷。
- *  G4 安全点:所有 busy 探针为假(无在飞 turn、composer 无草稿/附件——由各归属方
- *     registerBusyProbe 注入,本模块不伸手进别人状态)且距最近用户输入 ≥ 30s。
- *     不安全每 5s 重估;挂起 >5min 出横幅(带「立即刷新」,可忽略)。
- *  G5 形态校验:双端 id 均为 8-32 hex 且不相等才动作。dev 构建无 meta → 恒 inert。
- *  时钟纪律:全部比较只用本地 now(),不掺服务器时间戳(B 类跨时钟域红线)。
+ * ── 防无限刷新:硬上限不依赖任何存储(失忆也兜底)────────────────────────────
+ * 核心不变量:**一条 reload 谱系最多自动刷 MAX_AUTO_RELOADS 次,之后只出手动横幅。**
+ * 谱系计数器写在 URL hash(#ocr=N)里——URL 是 reload 的固有部分,任何能正常 reload
+ * 的浏览器/webview 都保留它,即使 sessionStorage/localStorage 被清空也照样存活。
+ * 这根治 Codex P0(ArkWeb reload 清 storage → 存储层守卫全废 → 死循环):
+ *   page0(无标记,n=0)→ 自动刷写 #ocr=1 → page1 读到 1 → 仍不匹配 → 刷写 #ocr=2
+ *   → page2 读到 2 ≥ MAX → 只出横幅,永不再自动刷。无论 storage 是否存活、build 如何
+ *   在 B/C 间漂移(P1),自动刷都被这个计数器封顶。
+ * 关键:计数器**只在版本匹配(成功拿到新前端)时才清零**;仍不匹配期间保留 #ocr=N,
+ * 这样即便页面被自发 reload(浏览器刷新键 / webview 恢复重载),谱系是延续而非重置,
+ * 预算不会被"刷新→到顶→清零→再获满预算"的乒乓重开(否则又是一类无限刷新)。
+ * 若 URL 计数器不可写(history.replaceState 抛错,极罕见)→ 一次都不自动刷(只横幅)。
+ *
+ * ── 之上的最佳努力层(需 localStorage,失效仅降级不失安全)──────────────────
+ *  D1 目标记账:某目标在本机曾把谱系顶到 MAX(刷了也没用)→ 记 localStorage;以后
+ *     新标签页见同一目标直接横幅,省掉那 MAX 次无用刷新(多 tab/重开的观感风暴收敛)。
+ *     storage 没了 → 退回纯谱系封顶(每条谱系仍 ≤ MAX 次)。
+ * ── 安全点(与存储无关)────────────────────────────────────────────────────
+ *  S1 无在飞 turn(_sendingInFlight 探针)+ 无草稿附件 + 距用户输入 ≥30s;不安全每 5s
+ *     重估,挂起 >5min 出横幅;探针抛错按 busy(保守)。
+ *  S2 形态校验:双端 id 均 8-32 hex 且不等才动作;dev 无 meta → 恒 inert。
+ *  全程只用本地 now(),不掺服务器时间戳(跨时钟域红线)。
+ *
+ * 刻意不做 reload 冷却:谱系硬顶已限总次数(≤MAX),再加"两次刷之间等 10min"只会
+ * 拖延真正需要的第二次刷新(快速修复版发布后用户被迫干等),弊大于利。
  */
 
 const BUILD_ID_RE = /^[0-9a-f]{8,32}$/;
 const STORAGE_KEY = "oc-build-reload";
-const RELOAD_COOLDOWN_MS = 10 * 60_000;
+const MAX_AUTO_RELOADS = 2; // 每条 reload 谱系的硬上限(URL 承载,失忆也生效)
 const INPUT_IDLE_MS = 30_000;
 const RECHECK_MS = 5_000;
 const BANNER_AFTER_PENDING_MS = 5 * 60_000;
 
-type AttemptRecord = { target: string; ts: number };
+/** localStorage 里的最佳努力记账(D1);缺失一律降级,不影响谱系硬上限。 */
+type PersistState = { maxedTargets?: string[] };
 
 export type AppUpdateDeps = {
   getClientBuild: () => string | null;
   reload: () => void;
   now: () => number;
-  /** 已探活的 sessionStorage;null = 不可用(G3 → 永不自动刷)。 */
+  /** 最佳努力持久化(生产=localStorage);null = 不可用,退化为纯谱系封顶。 */
   storage: Storage | null;
+  /** 读当前 reload 谱系计数(生产=URL hash #ocr=N)。失忆兜底的核心。 */
+  readLineage: () => number;
+  /** 写 reload 谱系计数,返回是否**写入并读回成功**(生产=history.replaceState + 读回)。
+   *  返回 false = 无法持久化谱系 → 一次都不自动刷(fail-safe)。 */
+  writeLineage: (n: number) => boolean;
 };
 
 export class AppUpdateGovernor {
@@ -50,48 +68,52 @@ export class AppUpdateGovernor {
   private bannerDismissedFor: string | null = null;
   private timer: ReturnType<typeof setTimeout> | null = null;
   private reloaded = false;
+  /** 本页所处 reload 谱系的已刷次数(构造时从 URL 读一次,之后只增不减)。 */
+  private reloadsSoFar: number;
+  /** URL 谱系计数器是否可写(构造时非破坏性探活);false → 永不自动刷。 */
+  private lineageWritable: boolean;
 
   constructor(deps: AppUpdateDeps) {
     this.deps = deps;
-    // 初始视作"刚有输入":新加载的页面至少静默 IDLE 时长才可能被刷,
-    // 防止用户刚打开页面就被脚下抽毯。
+    // 页面加载即视作"刚有输入":新页面至少静默 INPUT_IDLE_MS 才可能被刷,防止用户
+    // 刚打开就被脚下抽毯。
     this.lastActivityAt = deps.now();
+    this.reloadsSoFar = clampCount(deps.readLineage());
+    // 非破坏性写回同一值作为"谱系可写"探针(不改计数,只验证 history 可写 + 读回一致)。
+    // 抛错/读不回 → lineageWritable=false → 下面一次都不自动刷。
+    this.lineageWritable = deps.writeLineage(this.reloadsSoFar);
   }
 
-  /** busy 探针:返回 true = 现在不能刷(在飞 turn/草稿/上传中)。返回注销函数。 */
   registerBusyProbe(probe: () => boolean): () => void {
     this.busyProbes.add(probe);
     return () => this.busyProbes.delete(probe);
   }
 
-  /** 用户输入活动(keydown/pointerdown/touchstart/回到前台)。 */
   noteUserActivity(): void {
     this.lastActivityAt = this.deps.now();
   }
 
-  /** 服务端握手帧入口。非法/缺失一律 no-op(G5)。 */
+  /** 服务端握手帧入口。非法/缺失一律 no-op(S2)。 */
   onServerBuild(raw: unknown): void {
     const server = typeof raw === "string" && BUILD_ID_RE.test(raw) ? raw : null;
     if (!server || this.reloaded) return;
     const client = this.deps.getClientBuild();
     if (!client || !BUILD_ID_RE.test(client)) return; // dev / meta 缺失 → inert
     if (server === client) {
-      // 已是最新(典型:成功软刷后的下一帧)。attempt 记录**故意不清**:
-      // G2 冷却依赖 attempt.ts 给"发版列车"限频,清了冷却就失效。
+      // 已是最新(典型:成功软刷后的下一帧)。清空 pending + 清 URL 谱系标记(谱系完成,
+      // 地址栏归位;此后自发 reload 从 0 重新计,因为已经是对的版本了)。
       this.pendingTarget = null;
       this.pendingSince = null;
       this.stopTimer();
       this.setBanner(false);
+      if (this.reloadsSoFar > 0) {
+        this.deps.writeLineage(0);
+        this.reloadsSoFar = 0;
+      }
       return;
     }
-    const attempt = this.readAttempt();
-    if (attempt?.target === server) {
-      // G1:该目标已自动刷过仍不匹配 → 永不再自动刷,横幅兜底。
-      this.showBanner(server);
-      return;
-    }
-    if (!this.deps.storage) {
-      // G3:记录无处持久化 → 自动刷会失去 G1 保护,只出横幅。
+    // D1:本机曾对该目标刷到 MAX 仍没用 → 直接横幅,省无用刷新(best-effort)。
+    if (this.readPersist().maxedTargets?.includes(server)) {
       this.showBanner(server);
       return;
     }
@@ -102,10 +124,11 @@ export class AppUpdateGovernor {
     this.check();
   }
 
-  /** 横幅「立即刷新」:用户主动,绕过安全点,但仍写 attempt(保住 G1/G2 记账)。 */
+  /** 横幅「立即刷新」:用户主动,绕过安全点。仍推进谱系计数(手动刷也计入封顶,防
+   *  "手动刷→回旧HTML→自动刷"乒乓);写失败也照刷一次(用户点一次=一次,非循环)。 */
   reloadNow(): void {
-    const target = this.pendingTarget ?? "manual";
-    this.writeAttempt({ target, ts: this.deps.now() });
+    if (this.reloaded) return;
+    this.deps.writeLineage(this.reloadsSoFar + 1);
     this.reloaded = true;
     this.stopTimer();
     this.deps.reload();
@@ -131,18 +154,21 @@ export class AppUpdateGovernor {
     if (!target || this.reloaded) return;
     const now = this.deps.now();
 
-    // G2 全局冷却
-    const attempt = this.readAttempt();
-    const sinceLastReload = attempt ? now - attempt.ts : Number.POSITIVE_INFINITY;
-    if (sinceLastReload < RELOAD_COOLDOWN_MS) {
-      this.maybePendingBanner(now, target);
-      this.timer = setTimeout(this.check, Math.max(RELOAD_COOLDOWN_MS - sinceLastReload, RECHECK_MS));
+    // 硬上限(失忆也生效):本谱系已刷够 MAX → 记账 + 横幅,永不再自动刷。
+    if (this.reloadsSoFar >= MAX_AUTO_RELOADS) {
+      this.markTargetMaxed(target);
+      this.showBanner(target);
+      return;
+    }
+    // 谱系不可写 → 无法保证封顶 → 一次都不自动刷(fail-safe)。
+    if (!this.lineageWritable) {
+      this.showBanner(target);
       return;
     }
 
-    // G4 安全点
+    // S1 安全点
     const busy = [...this.busyProbes].some((p) => {
-      try { return p(); } catch { return true; } // 探针抛错按 busy 处理(保守)
+      try { return p(); } catch { return true; } // 探针抛错按 busy(保守)
     });
     if (busy || now - this.lastActivityAt < INPUT_IDLE_MS) {
       this.maybePendingBanner(now, target);
@@ -150,10 +176,9 @@ export class AppUpdateGovernor {
       return;
     }
 
-    // 全绿 → 记账后刷。写入必须读回核验:核验失败视同 G3,放弃自动刷。
-    this.writeAttempt({ target, ts: now });
-    if (this.readAttempt()?.target !== target) {
-      this.showBanner(target);
+    // 全绿 → 推进谱系计数(reload 前再确认一次可写),然后刷。
+    if (!this.deps.writeLineage(this.reloadsSoFar + 1)) {
+      this.showBanner(target); // 此刻写不进 → 不冒险
       return;
     }
     this.reloaded = true;
@@ -184,37 +209,75 @@ export class AppUpdateGovernor {
     }
   }
 
-  private readAttempt(): AttemptRecord | null {
+  private markTargetMaxed(target: string): void {
+    const s = this.readPersist();
+    const set = new Set(s.maxedTargets ?? []);
+    if (set.has(target)) return;
+    set.add(target);
+    this.writePersist({ maxedTargets: [...set].slice(-8) }); // 只留最近若干,防无限增长
+  }
+
+  private readPersist(): PersistState {
     const s = this.deps.storage;
-    if (!s) return null;
+    if (!s) return {};
     try {
       const raw = s.getItem(STORAGE_KEY);
-      if (!raw) return null;
-      const j = JSON.parse(raw) as Partial<AttemptRecord>;
-      if (typeof j.target === "string" && typeof j.ts === "number") {
-        return { target: j.target, ts: j.ts };
-      }
-      s.removeItem(STORAGE_KEY); // 形态坏 → 当无记录并清掉
-      return null;
+      if (!raw) return {};
+      const j = JSON.parse(raw) as PersistState;
+      return j && typeof j === "object" ? j : {};
     } catch {
-      return null;
+      return {};
     }
   }
 
-  private writeAttempt(rec: AttemptRecord): void {
+  private writePersist(patch: PersistState): void {
+    const s = this.deps.storage;
+    if (!s) return;
     try {
-      this.deps.storage?.setItem(STORAGE_KEY, JSON.stringify(rec));
+      s.setItem(STORAGE_KEY, JSON.stringify({ ...this.readPersist(), ...patch }));
     } catch {
-      /* quota/隐私模式:writeAttempt 后的读回核验会兜住 */
+      /* quota/隐私模式:best-effort,谱系硬上限仍兜底 */
     }
   }
 }
 
+function clampCount(n: unknown): number {
+  return typeof n === "number" && Number.isFinite(n) && n > 0 ? Math.min(Math.floor(n), 99) : 0;
+}
+
 // ── 生产单例(测试直接 new AppUpdateGovernor 注入假 deps,不走这里)──
 
-function probeSessionStorage(): Storage | null {
+const LINEAGE_RE = /(?:^|[#&])ocr=(\d{1,3})(?:&|$)/;
+
+/** 读 reload 谱系计数:URL hash 的 #ocr=N。URL 是 reload 的固有部分,storage 被清也存活。 */
+function readLineageFromUrl(): number {
   try {
-    const s = window.sessionStorage;
+    const m = LINEAGE_RE.exec(window.location.hash);
+    return m ? clampCount(parseInt(m[1], 10)) : 0;
+  } catch {
+    return 0;
+  }
+}
+
+/**
+ * 写 reload 谱系计数到 URL hash,返回是否写入并读回成功。
+ * 独占 hash(经核实 web-react 用 pathname/search 路由,hash 无语义,仅被 useAppRoute 透传)。
+ * n<=0 时清空 hash(地址栏干净)。history.replaceState 不压历史栈。
+ */
+function writeLineageToUrl(n: number): boolean {
+  try {
+    const base = window.location.pathname + window.location.search;
+    const url = n > 0 ? `${base}#ocr=${n}` : base;
+    window.history.replaceState(window.history.state, "", url);
+    return readLineageFromUrl() === (n > 0 ? clampCount(n) : 0);
+  } catch {
+    return false;
+  }
+}
+
+function probeLocalStorage(): Storage | null {
+  try {
+    const s = window.localStorage;
     const k = `${STORAGE_KEY}::probe`;
     s.setItem(k, "1");
     if (s.getItem(k) !== "1") return null;
@@ -238,7 +301,9 @@ export const appUpdate = new AppUpdateGovernor({
   getClientBuild: readClientBuild,
   reload: () => window.location.reload(),
   now: () => Date.now(),
-  storage: typeof window === "undefined" ? null : probeSessionStorage(),
+  storage: typeof window === "undefined" ? null : probeLocalStorage(),
+  readLineage: readLineageFromUrl,
+  writeLineage: writeLineageToUrl,
 });
 
 if (typeof window !== "undefined") {
@@ -246,8 +311,8 @@ if (typeof window !== "undefined") {
   window.addEventListener("keydown", activity, { capture: true, passive: true });
   window.addEventListener("pointerdown", activity, { capture: true, passive: true });
   window.addEventListener("touchstart", activity, { capture: true, passive: true });
-  // 回到前台按一次输入算:用户刚回来那一眼不许刷(后台静置时定时器照跑,
-  // 真正的静默软刷大多发生在后台,对用户完全无感)。
+  // 回到前台按一次输入算:用户刚回来那一眼不许刷(后台静置时定时器照跑,真正的静默
+  // 软刷大多发生在后台,对用户无感)。
   document.addEventListener("visibilitychange", () => {
     if (document.visibilityState === "visible") activity();
   });
