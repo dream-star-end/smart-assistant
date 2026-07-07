@@ -11,7 +11,7 @@
 import { Info, Sparkles } from "lucide-react";
 import { memo, useState } from "react";
 import type { ChatMessage } from "../lib/chat/model";
-import { messageKind, messageSignature } from "../lib/chat/render";
+import { HIDDEN_REVIEWER_AGENT_ID, messageKind, messageSignature } from "../lib/chat/render";
 import {
   AssistantCard,
   type CardCallbacks,
@@ -54,7 +54,7 @@ type RendererProps = {
 
 export const MessageRenderer = memo(
   function MessageRenderer({ message, isLast, sending, inActiveTurn, turnActivity, delegateCost, cb, onRespondPermission }: RendererProps) {
-    const ctx = { isLast, sending, turnActivity };
+    const ctx = { isLast, sending, turnActivity, inActiveTurn };
     switch (messageKind(message)) {
       case "user":
         return <UserCard msg={message} cb={cb} />;
@@ -119,30 +119,51 @@ type RenderItem =
   | { kind: "team"; members: ChatMessage[]; sig: string; delegateCosts?: Record<string, string> };
 
 /**
- * 把「队长同一轮委派的多个 agent-group」聚成一个团队项(≥2 → TeamPanel;单个退化回
- * AgentGroupCard)。团队 sig = 各成员 messageSignature 拼接(任一成员变 → 面板重渲,防闪)。
+ * 把「队长**同一并行批次**委派的多个 agent-group」聚成一个团队项(≥2 → TeamPanel;单个
+ * 退化回 AgentGroupCard)。团队 sig = 各成员 messageSignature 拼接(任一成员变 → 面板重渲,防闪)。
  *
- * **按 turn 锚点归组**(取代旧"相邻连续行"启发式):一行的 turn 锚点 = 其前最近一条 user
- * 消息的下标——与 turnSegment.currentTurnStartIndex 同一"轮"定义(user 消息是唯一 turn
- * 边界,且 user 行客户端权威、server 从不以另一 id 重写/重排,是最稳定的归属标识)。同一
- * turn 的 agent-group 归一个面板,穿插的非 agent-group/非 user 行(队长文本、工具调用、
- * server-authored 与本地行混排)不再劈裂面板;新一轮 user 提问后的委派天然落到新锚点 →
- * 独立面板。无 user 消息(cron 会话)时全部锚点 = -1,归一段。
+ * **按 (turn 锚点, 叙事阶段) 归组**(2026-07-07,boss 时序反直觉反馈):
+ *   - turn 锚点 = 其前最近一条 user 消息下标(与 turnSegment 同一"轮"定义,user 行客户端
+ *     权威、server 从不重写/重排,最稳定)。
+ *   - 叙事阶段 = 同 turn 内被**队长 assistant 叙事文本行**(非空 text)切开的段序号。聚天线
+ *     只允许"同时并行"的委派共面板;队长叙事之后才启动的阶段(如 hidden-reviewer 审查)
+ *     属于新阶段 → **按时间顺序独立出现在叙事之后**,绝不吸回上方旧面板(旧行为把审查卡
+ *     塞回面板,造成"上面又动了/会话早就结束了"的错觉)。
+ *   - 隐藏审查员(hidden-reviewer)卡**永不入面板**:它语义上是编排阶段而非并行队员,恒走
+ *     单卡按时序渲染。
+ *   - 只有 assistant 叙事行断组;工具行/thinking/server-authored 骨架混排**不隔断**——保留
+ *     turn 锚点方案修掉的"混排劈裂面板"抗性(这是当年放弃纯相邻启发式的原因,勿回退)。
  *
- * 锚点用**完整 messages**(非仅渲染切片)计算:切片起点可能落在某轮中段,靠全量数组才能
- * 找到该轮真正的 user 边界。面板渲染在该轮**首个** agent-group 的位置,后续同轮成员被吸收;
+ * 锚点/阶段用**完整 messages**(非仅渲染切片)计算:切片起点可能落在某轮中段,靠全量数组
+ * 才能找到该轮真正的边界。面板渲染在该批次**首个** agent-group 的位置,后续同批成员被吸收;
  * 夹在成员之间的非 agent-group 行仍按各自位置渲染(可能落到面板之后,属可接受的次序取舍)。
  */
 function coalesceTeam(messages: ChatMessage[], start: number, sending: boolean): RenderItem[] {
   const total = messages.length;
   const slice = messages.slice(start);
-  // 全量前缀扫描:anchorOf[i] = 第 i 行之前(含自身若为 user)最近的 user 下标,无则 -1。
+  // 全量前缀扫描:anchorOf[i] = 第 i 行之前(含自身若为 user)最近的 user 下标,无则 -1;
+  // stageOf[i] = 该行在本 turn 内的叙事阶段序号(assistant 非空文本行使**后续**行阶段 +1,
+  // user 行重置为 0)。
   const anchorOf: number[] = new Array(total);
+  const stageOf: number[] = new Array(total);
   let lastUser = -1;
+  let stage = 0;
   for (let i = 0; i < total; i++) {
-    if (messages[i]?.role === "user") lastUser = i;
+    const row = messages[i];
+    if (row?.role === "user") {
+      lastUser = i;
+      stage = 0;
+    }
     anchorOf[i] = lastUser;
+    stageOf[i] = stage;
+    if (row?.role === "assistant" && typeof row.text === "string" && row.text.trim().length > 0) {
+      stage++;
+    }
   }
+  // 面板成员资格:agent-group 且非隐藏审查员(审查卡恒单卡,按时序独立渲染)。
+  const isPanelMember = (m: ChatMessage | undefined): boolean =>
+    !!m && messageKind(m) === "agent-group" && m._delegateAgentId !== HIDDEN_REVIEWER_AGENT_ID;
+  const batchKeyOf = (absIdx: number): string => `${anchorOf[absIdx]}:${stageOf[absIdx]}`;
   // 债D per-delegate 成本:队长**助手行**(role 'assistant',同一 turn 的最终答复)的
   // usage.delegates 已由 master 按 agentId 分组求和。按 turn 锚点归拢成 anchor → {agentId:
   // costCredits},供该轮团队卡/委派卡按 `_delegateAgentId` 匹配显示「· N 积分」。同一 agentId
@@ -162,33 +183,33 @@ function coalesceTeam(messages: ChatMessage[], start: number, sending: boolean):
   }
   const costFor = (absIdx: number, m: ChatMessage): string | undefined =>
     delegateCostByAnchor.get(anchorOf[absIdx])?.[m._delegateAgentId ?? ""];
-  // 每个锚点在**渲染切片内**的 agent-group 计数(≥2 才成团;切片外成员不计入本屏面板)。
-  const teamCount = new Map<number, number>();
+  // 每个批次键在**渲染切片内**的可入面板 agent-group 计数(≥2 才成团;切片外成员不计入本屏面板)。
+  const teamCount = new Map<string, number>();
   for (let i = 0; i < slice.length; i++) {
-    if (messageKind(slice[i]) === "agent-group") {
-      const a = anchorOf[start + i];
-      teamCount.set(a, (teamCount.get(a) ?? 0) + 1);
+    if (isPanelMember(slice[i])) {
+      const k = batchKeyOf(start + i);
+      teamCount.set(k, (teamCount.get(k) ?? 0) + 1);
     }
   }
   const items: RenderItem[] = [];
-  const emittedTeam = new Set<number>();
+  const emittedTeam = new Set<string>();
   for (let i = 0; i < slice.length; i++) {
     const m = slice[i];
     const absIdx = start + i;
-    if (messageKind(m) === "agent-group") {
-      const anchor = anchorOf[absIdx];
-      if ((teamCount.get(anchor) ?? 0) >= 2) {
-        if (emittedTeam.has(anchor)) continue; // 已并入该轮面板 → 吸收跳过
-        emittedTeam.add(anchor);
+    if (isPanelMember(m)) {
+      const batchKey = batchKeyOf(absIdx);
+      if ((teamCount.get(batchKey) ?? 0) >= 2) {
+        if (emittedTeam.has(batchKey)) continue; // 已并入该批次面板 → 吸收跳过
+        emittedTeam.add(batchKey);
         const members: ChatMessage[] = [];
         const memberIdx: number[] = [];
         for (let j = 0; j < slice.length; j++) {
-          if (messageKind(slice[j]) === "agent-group" && anchorOf[start + j] === anchor) {
+          if (isPanelMember(slice[j]) && batchKeyOf(start + j) === batchKey) {
             members.push(slice[j]);
             memberIdx.push(start + j);
           }
         }
-        const delegateCosts = delegateCostByAnchor.get(anchor);
+        const delegateCosts = delegateCostByAnchor.get(anchorOf[absIdx]);
         items.push({
           kind: "team",
           members,
@@ -204,6 +225,11 @@ function coalesceTeam(messages: ChatMessage[], start: number, sending: boolean):
         });
         continue;
       }
+      items.push({ kind: "single", m, isLast: absIdx === total - 1, idx: absIdx, delegateCost: costFor(absIdx, m) });
+      continue;
+    }
+    if (messageKind(m) === "agent-group") {
+      // 面板外的 agent-group(隐藏审查员卡/独居成员):单卡按时序渲染,委派成本徽记照常。
       items.push({ kind: "single", m, isLast: absIdx === total - 1, idx: absIdx, delegateCost: costFor(absIdx, m) });
       continue;
     }

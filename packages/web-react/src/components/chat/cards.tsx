@@ -37,7 +37,15 @@ import { Media } from "./media";
 import { TurnActivity, type TurnActivityInfo } from "./TurnActivity";
 
 /** 渲染上下文。turnActivity=当前活跃会话本轮活动快照（流式空正文分支的阶段反馈源）。*/
-export type RenderCtx = { isLast: boolean; sending: boolean; turnActivity?: TurnActivityInfo | null };
+export type RenderCtx = {
+  isLast: boolean;
+  sending: boolean;
+  turnActivity?: TurnActivityInfo | null;
+  /** 是否属于当前活跃段(最后一条 user 之后)。与 sending 联合门控 MetaRow:团队模式下
+   *  队长引擎收笔后 gateway 还要跑审查编排,积分/请求ID 尾注若此刻就出现会制造"回合已
+   *  结束"的错觉(2026-07-07 boss 反馈)——终态帧到达(sending=false)才渲染。 */
+  inActiveTurn?: boolean;
+};
 
 /** 逐条反馈上下文（请求ID + 关联键）。P6 反馈弹窗消费；本期由 App 兜底。 */
 export type FeedbackContext = {
@@ -375,7 +383,7 @@ export function AssistantCard({
         {!live && (msg.text || hasError) && (
           <MessageActions msg={msg} cb={cb} showRegen={ctx.isLast && !hasError} />
         )}
-        {!live && <MetaRow msg={msg} />}
+        {!live && !(ctx.sending && ctx.inActiveTurn) && <MetaRow msg={msg} />}
       </div>
     </div>
   );
