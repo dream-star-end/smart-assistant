@@ -155,7 +155,7 @@ usage_records + journal 双查;零输出免单/turn 级 idle 免单已内建;cod
 | 改动位置 | 生效面 | 必做动作 |
 |---|---|---|
 | master 侧代码(commercial/storage/cli 等) | master 进程 | `deploy-v5.sh`(rsync+restart+smoke) |
-| `packages/web-react` 前端 | dist 静态资源 | vite build → 单独 rsync dist → **再重启 master**(SPA 缓存) |
+| `packages/web-react` 前端 | dist 静态资源 | **`deploy-v5.sh --dist`**(vite build + 竞态安全 rsync + 资产 GC + restart + 版本握手 smoke);SPA 缓存必重启 |
 | 容器内 gateway/CCB/baseline skill/entrypoint(packages/gateway、claude-code-best、agent-sandbox/runtime、ccb-baseline*) | **runtime image** | 重建镜像+切 tag(§4.3);纯 baseline skill 例外:bind-mount 源码树,rsync 即生效 |
 | `packages/commercial/src/egress/` | egress 进程 | `deploy-v5.sh --egress`(否则 egress 跑旧代码!) |
 | `deploy/v5/commercial-v5.env.overrides` | 线上 env | **手动同步** /etc/openclaude/commercial-v5.env(增量部署不重生成 env!)改后重启对应进程 |
@@ -166,11 +166,17 @@ usage_records + journal 双查;零输出免单/turn 级 idle 免单已内建;cod
 cd /opt/openclaude/openclaude-v5-aurora     # 部署树;必须 clean(脏文件会被 rsync 上去)
 git status --porcelain                       # 必须为空
 bash scripts/deploy-v5.sh [--egress]         # 快照(.prev.1..5 可 --rollback)+rsync+restart+smoke
-# 前端:
-cd packages/web-react && npx vite build
-rsync -az --delete dist/ kl-mirror:/opt/openclaude/openclaude-v5/packages/web-react/dist/
-ssh kl-mirror 'systemctl restart openclaude-v5'
+# 前端(涉及 web-react):走 --dist,勿再手敲 rsync --delete(会造成部署窗口 404 白屏)。
+#   竞态安全=资产加法先行 + 根文件后替换(新 index.html 永远只引用已就位资产);
+#   资产 14 天 GC;版本握手 smoke 断言线上 oc-build == 本地构建。
+bash scripts/deploy-v5.sh --dist
 bash scripts/deploy-v5.sh --smoke
+
+# 版本握手(2026-07-07):bridge 每次 WS accept 下发 sys.frontend_build(服务端读 dist
+# index.html 的 <meta name="oc-build">,vite build 插件按最终 HTML 内容 sha256 注入),
+# 前端 lib/appUpdate.ts governor 在安全点软刷新拿新前端。防无限刷新硬上限=URL hash
+# 谱系计数(#ocr=N,失忆也生效,一条谱系 ≤2 次自动刷);只在版本匹配时清零。
+# 老 bundle(无 governor)收到帧会忽略 → 需一次手动刷新 bootstrap 到新 bundle,之后自愈。
 ```
 红线:只从部署树发;绝不手工 rsync+restart 绕过脚本;v3 的 service/env/Caddy 一律不碰。
 
