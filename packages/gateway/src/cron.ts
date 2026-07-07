@@ -11,8 +11,19 @@
 //       deliver: local                 # local | webchat | telegram
 //       deliverTarget: {}              # optional { channel, peerId } for non-local
 //
-// The scheduler runs every 60 seconds. If the current time matches a cron
-// expression AND the job hasn't run in the current minute, it fires.
+// The scheduler runs every 60 seconds. If the current minute matches a cron
+// expression AND the job hasn't run in that minute, it fires.
+//
+// Bounded catch-up (OC_CRON_CATCHUP_MIN, default 15, 0=off): when the current
+// minute does not match but the container was asleep/evicted across a scheduled
+// minute, the tick scans backwards up to N minutes for the MOST RECENT missed
+// match M and fires it once (only that one — multiple missed fires collapse to
+// one, same semantics as Claude Code). Guarded by lastRun (cross-restart
+// idempotent, last-run.json rides the volume) and job.createdAt (never re-fire
+// a schedule point that predates the job's creation). This is what lets a
+// master-woken container actually run a "9am daily" job it slept through, while
+// staying bounded so a long sleep never replays a full backlog.
+//
 // Last-run times are persisted to ~/.openclaude/cron/last-run.json.
 //
 // Job output: run_id + timestamp written to ~/.openclaude/cron/outputs/<id>-<ts>.md.
@@ -26,6 +37,12 @@ import { parse as parseYaml, stringify as stringifyYaml } from 'yaml'
 import { createLogger } from './logger.js'
 import type { SessionManager } from './sessionManager.js'
 import { isHiddenSystemAgentId } from './agentVisibility.js'
+import {
+  postCronIndex,
+  readV3CronIndexConfig,
+  type CronIndexPayload,
+} from './v3CronIndexPush.js'
+import type { V3WechatOutboundConfig } from './v3WechatOutbound.js'
 
 const logger = createLogger({ module: 'cron' })
 
@@ -45,6 +62,14 @@ export interface CronJob {
   // hint (frontend uses it to style the push and skip the "system cron"
   // badge). Execution uses an isolated session just like any other cron job.
   heartbeat?: boolean
+  // Epoch ms when the job was created (stamped by every creation entry point:
+  // POST /api/cron + the CCB CronCreate bridge). Optional so legacy jobs and
+  // personal DEFAULT_JOBS (no field on disk) still load. Used by bounded
+  // catch-up to refuse re-firing a scheduled minute that predates creation —
+  // otherwise a job created at 09:03 whose schedule is "0 9 * * *" would be
+  // falsely "caught up" for the 09:00 tick it never missed. Legacy jobs
+  // without createdAt are only bounded by the catch-up window itself.
+  createdAt?: number
 }
 
 /**
@@ -337,6 +362,138 @@ export function validateCronSchedule(expr: string): string | null {
   return null
 }
 
+// ── Bounded catch-up (see file header) ──────────────────────────────────────
+
+/** Parse OC_CRON_CATCHUP_MIN. Default 15; "0" disables catch-up; invalid/negative
+ *  → default (fail-safe: a garbage env never silently turns catch-up off). */
+export function getCatchupMinutes(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = env.OC_CRON_CATCHUP_MIN
+  if (raw === undefined || raw.trim() === '') return 15
+  const n = Number(raw)
+  if (!Number.isFinite(n) || n < 0) return 15
+  return Math.trunc(n)
+}
+
+/**
+ * Decide, for a single job, which minute (if any) should fire on this tick, and
+ * return the minuteKey to record into lastRun — or null if nothing is due.
+ *
+ * Pure & side-effect-free so it can be unit-tested without a live scheduler /
+ * sessions. tick() layers agent-existence + hidden-agent checks on top and only
+ * writes lastRun with the returned key.
+ *
+ * Two clocks, deliberately separated:
+ *   - real epoch ms (nowEpoch, minute boundaries) → minuteKey / createdAt compare.
+ *     Cross-restart idempotency lives here; must not drift with the TZ view.
+ *   - wall-clock view (localNow, already TZ-shifted by getLocalDate) → cronMatches.
+ *     Shifting it back k minutes with getTime()-k*60000 keeps the same TZ offset,
+ *     so matching a past minute uses the same calendar fields the live tick would.
+ *
+ * Current minute wins over any catch-up. Catch-up scans k=1..catchupMin looking
+ * for the MOST RECENT missed match and fires only that one; older misses are
+ * intentionally dropped (collapse a long sleep to a single run). The most-recent
+ * miss's guards (lastRun strictly behind it; its fire boundary >= createdAt)
+ * subsume all older misses, so breaking at the first match loses nothing.
+ */
+export function resolveDueMinute(
+  job: Pick<CronJob, 'id' | 'schedule' | 'createdAt'>,
+  lastRun: Record<string, number>,
+  nowEpoch: number,
+  localNow: Date,
+  catchupMin: number,
+): number | null {
+  const nowMinuteKey = Math.floor(nowEpoch / 60_000)
+  const last = lastRun[job.id]
+  // Current minute: exact same rule as the pre-catch-up scheduler.
+  if (cronMatches(job.schedule, localNow) && last !== nowMinuteKey) {
+    return nowMinuteKey
+  }
+  if (catchupMin <= 0) return null
+  for (let k = 1; k <= catchupMin; k++) {
+    // Subtracting exact 60000-ms multiples preserves the sub-minute remainder,
+    // so this minuteKey equals nowMinuteKey - k regardless of nowEpoch's offset.
+    const missedMinuteKey = nowMinuteKey - k
+    const localCandidate = new Date(localNow.getTime() - k * 60_000)
+    if (!cronMatches(job.schedule, localCandidate)) continue
+    // Most recent missed match. Fire once iff we have not already run at/after
+    // this minute AND the schedule point is not older than the job's creation.
+    // createdAt compared against the minute's fire boundary (missedMinuteKey*60000):
+    // a cron nominally fires at the minute start, so a job created strictly after
+    // that boundary never actually missed this fire — refuse it (false catch-up).
+    const notYetRun = last === undefined || last < missedMinuteKey
+    const afterCreation =
+      job.createdAt === undefined || missedMinuteKey * 60_000 >= job.createdAt
+    if (notYetRun && afterCreation) return missedMinuteKey
+    // Most recent miss is stale (already run) or predates creation; all older
+    // misses are even more so → stop, do not catch up further.
+    return null
+  }
+  return null
+}
+
+// ── Runtime quotas (container API create/update paths only) ──────────────────
+
+/** OC_CRON_MAX_JOBS: cap total jobs in cron.yaml. Default 50, "0"/invalid → 50.
+ *  Only enforced on addJob (API/tool create), never on personal seed. */
+export function getMaxJobs(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = env.OC_CRON_MAX_JOBS
+  if (raw === undefined || raw.trim() === '') return 50
+  const n = Number(raw)
+  if (!Number.isFinite(n) || n <= 0) return 50
+  return Math.trunc(n)
+}
+
+/** OC_CRON_MAX_PER_HOUR: cap how many minutes in an hour a schedule may hit.
+ *  Default 12 (=every 5 minutes). "0"/invalid → 12. */
+export function getMaxPerHour(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = env.OC_CRON_MAX_PER_HOUR
+  if (raw === undefined || raw.trim() === '') return 12
+  const n = Number(raw)
+  if (!Number.isFinite(n) || n <= 0) return 12
+  return Math.trunc(n)
+}
+
+/**
+ * Count how many of minutes 0-59 the schedule's minute field matches — i.e. the
+ * per-hour firing frequency for schedules whose other fields let the hour run.
+ * Uses the same matcher (fieldMatches) as execution so the quota can never
+ * disagree with what actually fires. Returns 0 for an invalid expression
+ * (validateCronSchedule already rejects those upstream).
+ */
+export function countMinuteHitsPerHour(schedule: string): number {
+  const fields = schedule.trim().split(/\s+/)
+  if (fields.length !== 5) return 0
+  const minuteField = fields[0]
+  let hits = 0
+  for (let m = 0; m <= 59; m++) {
+    if (fieldMatches(minuteField, m)) hits++
+  }
+  return hits
+}
+
+/**
+ * Return an English rejection message (透传给模型) when a schedule fires more
+ * often than OC_CRON_MAX_PER_HOUR per hour, else null. Prefixed with
+ * `Invalid cron schedule` so tool callers surface it consistently with the
+ * range/shape validator; the message tells the model how to fix it (5-min floor).
+ * (字面星号斜杠会终止本块注释,故文中用 "N-minute" 而非符号写法。)
+ */
+export function frequencyQuotaError(
+  schedule: string,
+  env: NodeJS.ProcessEnv = process.env,
+): string | null {
+  const max = getMaxPerHour(env)
+  const hits = countMinuteHitsPerHour(schedule)
+  if (hits > max) {
+    return (
+      `Invalid cron schedule "${schedule}": fires ${hits} times per hour, ` +
+      `exceeding the limit of ${max}. Use a coarser minute field ` +
+      `(recommended minimum interval is 5 minutes) or raise OC_CRON_MAX_PER_HOUR.`
+    )
+  }
+  return null
+}
+
 export class CronScheduler {
   private timer: NodeJS.Timeout | null = null
   private bootTickTimer: NodeJS.Timeout | null = null
@@ -355,6 +512,15 @@ export class CronScheduler {
       at: number
     }
   >
+  /** Master wake-index push config; null on personal/dev (no master env) → every
+   *  maybePushCronIndex is a cheap no-op. Read once in start() (env is fixed for
+   *  the process lifetime), so a personal container never even computes the index. */
+  private cronIndexCfg: V3WechatOutboundConfig | null = null
+  /** Last (nextFireAt, enabledCount) actually reported to master. Push only when
+   *  the value changes — avoids a POST every tick. Updated optimistically (before
+   *  the fire-and-forget send resolves): a dropped push is recovered by master's
+   *  periodic rescan, so we trade at-least-once for far fewer POSTs. */
+  private lastCronIndex: CronIndexPayload | null = null
 
   constructor(
     private config: OpenClaudeConfig,
@@ -362,8 +528,48 @@ export class CronScheduler {
     private onDeliver: (text: string, job: CronJob) => void | Promise<void>,
   ) {}
 
+  /**
+   * Derive (nextFireAt = min over enabled jobs' computeNextRun, enabledCount) from
+   * the given file and, if it differs from the last reported value, push it to
+   * master fire-and-forget. Sync + cheap: computeNextRun is a brute-force scan but
+   * bounded to 24h/1440 iterations per job. No-op entirely when master env absent.
+   */
+  private maybePushCronIndex(file: CronFile): void {
+    if (!this.cronIndexCfg) return
+    const now = new Date()
+    let minTs: number | null = null
+    let enabledCount = 0
+    for (const job of file.jobs ?? []) {
+      if (job.enabled === false) continue
+      enabledCount++
+      const next = computeNextRun(job.schedule, now)
+      if (next) {
+        const ts = Date.parse(next)
+        if (!Number.isNaN(ts) && (minTs === null || ts < minTs)) minTs = ts
+      }
+    }
+    const payload: CronIndexPayload = {
+      nextFireAt: minTs === null ? null : new Date(minTs).toISOString(),
+      enabledCount,
+    }
+    if (
+      this.lastCronIndex &&
+      this.lastCronIndex.nextFireAt === payload.nextFireAt &&
+      this.lastCronIndex.enabledCount === payload.enabledCount
+    ) {
+      return
+    }
+    this.lastCronIndex = payload
+    void postCronIndex(payload, { config: this.cronIndexCfg }).catch(() => {})
+  }
+
   async start(): Promise<void> {
-    await ensureCronFile()
+    // Read wake-index config once (env fixed for process lifetime).
+    this.cronIndexCfg = readV3CronIndexConfig()
+    const initialFile = await ensureCronFile()
+    // Seed master with the current index right after boot so a just-restarted
+    // container advertises its next fire even before the first tick.
+    this.maybePushCronIndex(initialFile)
     // Tick once per minute
     this.timer = setInterval(() => {
       if (this.stopped) return
@@ -409,14 +615,15 @@ export class CronScheduler {
       // Cleanup: delete output files older than 7 days
       this._cleanupOldOutputs().catch(() => {})
 
-      const minuteKey = Math.floor(now.getTime() / 60_000)
+      const catchupMin = getCatchupMinutes()
       let lastRunDirty = false
       try {
         for (const job of file.jobs ?? []) {
           if (job.enabled === false) continue
-          if (!cronMatches(job.schedule, localNow)) continue
-          // Dedupe: don't run twice in the same minute
-          if (lastRun[job.id] === minuteKey) continue
+          // Current-minute match OR most-recent bounded catch-up (see header).
+          // Returns the minuteKey to record; null = nothing due for this job.
+          const dueMinuteKey = resolveDueMinute(job, lastRun, now.getTime(), localNow, catchupMin)
+          if (dueMinuteKey === null) continue
           if (isHiddenSystemAgentId(job.agent)) {
             logger.warn(`job ${job.id}: hidden system agent rejected`, {
               jobId: job.id,
@@ -433,7 +640,9 @@ export class CronScheduler {
             continue
           }
           await this.runJob(job, agent)
-          lastRun[job.id] = minuteKey
+          // Record the minute that actually fired (catch-up records the missed
+          // minute M, not "now") so it stays idempotent across restarts.
+          lastRun[job.id] = dueMinuteKey
           lastRunDirty = true
         }
       } finally {
@@ -443,6 +652,10 @@ export class CronScheduler {
           await saveLastRun(lastRun)
         }
       }
+      // Refresh master's wake index if the derived (nextFireAt, enabledCount)
+      // changed this tick (jobs may have been disabled by oneshot cleanup/run).
+      // Fire-and-forget; personal version (no master env) no-ops.
+      this.maybePushCronIndex(file)
     } finally {
       this.running = false
     }
@@ -545,12 +758,28 @@ export class CronScheduler {
     if (schedErr) {
       throw new Error(`Invalid cron schedule "${job.schedule}": ${schedErr}`)
     }
+    // 频率闸:分钟字段每小时命中次数超上限即拒(默认 12 = 星号/5,最短建议 5 分钟间隔)。
+    // 错误信息经工具透传给模型,给出可执行的整改方向而非只报错。
+    const freqErr = frequencyQuotaError(job.schedule)
+    if (freqErr) throw new Error(freqErr)
     const file = await ensureCronFile()
-    // Replace if same ID exists
-    file.jobs = file.jobs.filter((j) => j.id !== job.id)
-    file.jobs.push(job)
+    // Replace if same ID exists — filter first so the count check treats a
+    // replace as size-neutral (only genuinely new IDs grow the file).
+    const filtered = file.jobs.filter((j) => j.id !== job.id)
+    const maxJobs = getMaxJobs()
+    if (filtered.length >= maxJobs) {
+      // 数量闸:仅 addJob 计数(个人版 seed 走 ensureCronFile 不经此路,不受限)。
+      throw new Error(
+        `Invalid cron schedule: reminder limit reached (${filtered.length}/${maxJobs} jobs). ` +
+          `Delete an existing reminder before creating a new one, or raise OC_CRON_MAX_JOBS.`,
+      )
+    }
+    filtered.push(job)
+    file.jobs = filtered
     await atomicWriteYaml(paths.cronYaml, file)
     logger.info(`added job ${job.id}`, { jobId: job.id, schedule: job.schedule })
+    // 增删后刷新 master 唤醒索引(handler 不用重复调,scheduler 收口)。
+    this.maybePushCronIndex(file)
   }
 
   async removeJob(id: string): Promise<boolean> {
@@ -560,6 +789,7 @@ export class CronScheduler {
     if (file.jobs.length === before) return false
     await atomicWriteYaml(paths.cronYaml, file)
     logger.info(`removed job ${id}`, { jobId: id })
+    this.maybePushCronIndex(file)
     return true
   }
 
@@ -578,6 +808,9 @@ export class CronScheduler {
       if (schedErr) {
         throw new Error(`Invalid cron schedule "${updates.schedule}": ${schedErr}`)
       }
+      // 改 schedule 同样过频率闸(否则可绕过 addJob 闸把任务改成每分钟)。
+      const freqErr = frequencyQuotaError(updates.schedule)
+      if (freqErr) throw new Error(freqErr)
       job.schedule = updates.schedule
     }
     if (updates.prompt) job.prompt = updates.prompt
@@ -594,6 +827,7 @@ export class CronScheduler {
     if (updates.oneshot !== undefined) job.oneshot = !!updates.oneshot
     await atomicWriteYaml(paths.cronYaml, file)
     logger.info(`updated job ${id}`, { jobId: id })
+    this.maybePushCronIndex(file)
     return true
   }
 
@@ -640,8 +874,10 @@ async function saveCronFile(file: CronFile, updatedJob: CronJob): Promise<void> 
   await atomicWriteYaml(paths.cronYaml, file)
 }
 
-/** Brute-force scan the next 1440 minutes (24h) to find the next matching time */
-function computeNextRun(schedule: string, from: Date): string | undefined {
+/** Brute-force scan the next 1440 minutes (24h) to find the next matching time.
+ *  Exported so the wake-index push (maybePushCronIndex) uses the exact same cron
+ *  parser as execution — the master index must never diverge from what fires. */
+export function computeNextRun(schedule: string, from: Date): string | undefined {
   const d = new Date(from.getTime())
   d.setSeconds(0, 0)
   d.setMinutes(d.getMinutes() + 1) // start from next minute
