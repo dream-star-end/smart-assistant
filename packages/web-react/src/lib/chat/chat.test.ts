@@ -1974,6 +1974,83 @@ describe("ChatSocket auto-continue deterministic idempotencyKey (#3)", () => {
     // 确定性：同 (sessId,targetMsgId) 再算一次必得同 key（跨 tab/replay 可被 server dedup）。
     expect(autocont.idempotencyKey).toBe(`autocont-s1-${userMsg.id}`);
   });
+
+  test("合成续写复用被中断 turn 的路由字段(model/teamMode)——缺失会被 codex 计费闸拒", () => {
+    // 2026-07-07 事故:服务重启自动续写不带 model/teamMode → 桥不做 codex 改写
+    // (无 server requestId)→ 暖 codex 会话续写被 CODEX_BILLING_GUARD fail-closed。
+    vi.useFakeTimers();
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const sock = makeSocket();
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    ws.open();
+    sock.sendMessage({ sessId: "s1", agentId: "main", text: "hi", model: "gpt-5.5", teamMode: true, effortLevel: "high" });
+    // 空轮 end_turn → 自动续写
+    ws.onmessage?.({
+      data: JSON.stringify({
+        type: "outbound.message",
+        sessionKey: "agent:main:webchat:dm:s1",
+        channel: "webchat",
+        peer: { id: "s1", kind: "dm" },
+        frameSeq: 1,
+        isFinal: true,
+        ts: 9e12,
+        blocks: [],
+        meta: { stopReason: "end_turn" },
+      }),
+    });
+    vi.advanceTimersByTime(10);
+    const autocont = ws.sent
+      .map((d) => JSON.parse(d))
+      .find((p) => typeof p.idempotencyKey === "string" && p.idempotencyKey.startsWith("autocont-"));
+    expect(autocont).toBeTruthy();
+    expect(autocont.model).toBe("gpt-5.5");
+    expect(autocont.teamMode).toBe(true);
+    expect(autocont.effortLevel).toBe("high");
+  });
+
+  test("服务重启自动续写同样复用路由字段", () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const sock = makeSocket();
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    ws.open();
+    sock.sendMessage({ sessId: "s1", agentId: "main", text: "跑团队任务", model: "gpt-5.5", teamMode: true });
+    // 有内容的助手行 + service_restart 中断 final → 触发重启续写。
+    ws.onmessage?.({
+      data: JSON.stringify({
+        type: "outbound.message",
+        sessionKey: "agent:main:webchat:dm:s1",
+        channel: "webchat",
+        peer: { id: "s1", kind: "dm" },
+        frameSeq: 1,
+        isFinal: false,
+        ts: 9e12,
+        blocks: [{ kind: "text", text: "已经写了一半的回复…" }],
+      }),
+    });
+    ws.onmessage?.({
+      data: JSON.stringify({
+        type: "outbound.message",
+        sessionKey: "agent:main:webchat:dm:s1",
+        channel: "webchat",
+        peer: { id: "s1", kind: "dm" },
+        frameSeq: 2,
+        isFinal: true,
+        ts: 9e12 + 1,
+        blocks: [],
+        meta: { interrupted: "service_restart" },
+      }),
+    });
+    vi.advanceTimersByTime(10);
+    const cont = ws.sent
+      .map((d) => JSON.parse(d))
+      .find((p) => typeof p.idempotencyKey === "string" && p.idempotencyKey.startsWith("autocont-restart-"));
+    expect(cont).toBeTruthy();
+    expect(cont.model).toBe("gpt-5.5");
+    expect(cont.teamMode).toBe(true);
+  });
 });
 
 describe("resume_failed 游标只进不退(master 重启空 ring 防御)", () => {

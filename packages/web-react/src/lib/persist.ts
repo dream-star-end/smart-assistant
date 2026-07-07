@@ -52,6 +52,9 @@ export type StoredSession = {
   _trackerResetServerTs?: number;
   _localTeardownAt?: number;
   _agentSwitchedAt?: number | null;
+  /** 最近一次发送的路由字段快照(model/teamMode/effort);reload 后合成续写复用,
+   *  缺失会让暖 codex 会话的续写被计费闸拒(见 chat/model.ts 同名字段注释)。 */
+  _lastRouting?: { model?: string; teamMode?: boolean; effortLevel?: string | null };
 };
 
 /** 解析可用的 IDBFactory；不可用（SSR/jsdom/禁用）返回 null。*/

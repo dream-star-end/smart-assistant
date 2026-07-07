@@ -1372,6 +1372,7 @@ export class ChatSocket {
       _trackerResetServerTs: typeof s._trackerResetServerTs === "number" ? s._trackerResetServerTs : undefined,
       _localTeardownAt: typeof s._localTeardownAt === "number" ? s._localTeardownAt : undefined,
       _agentSwitchedAt: typeof s._agentSwitchedAt === "number" ? s._agentSwitchedAt : s._agentSwitchedAt ?? undefined,
+      ...(s._lastRouting ? { _lastRouting: { ...s._lastRouting } } : {}),
     };
   }
 
@@ -1418,6 +1419,7 @@ export class ChatSocket {
       typeof stored._trackerResetServerTs === "number" ? stored._trackerResetServerTs : undefined;
     s._localTeardownAt = typeof stored._localTeardownAt === "number" ? stored._localTeardownAt : undefined;
     s._agentSwitchedAt = typeof stored._agentSwitchedAt === "number" ? stored._agentSwitchedAt : null;
+    s._lastRouting = stored._lastRouting ? { ...stored._lastRouting } : undefined;
     rebuildIndexes(s);
     normalizeDelegateCards(s);
     this.sessions.set(stored.id, s);
@@ -1549,6 +1551,9 @@ export class ChatSocket {
     // 否则 session_not_found 风暴。ensurePromise:用于把"用户消息持久化"排在主控建行之后
     // (行须先存在,否则 append 404)。
     const ensurePromise = this.ensureServerSessionOnce(sess, p.agentId);
+    // 路由字段快照:合成续写(服务重启/空轮)复用同一路由,保证桥的 codex 分类
+    // (server requestId 注入/preCheck)与被中断 turn 一致。
+    sess._lastRouting = { model: p.model, teamMode: !!p.teamMode, effortLevel: p.effortLevel ?? null };
     const media = p.media && p.media.length > 0 ? p.media : undefined;
     const payload: InboundMessage = {
       type: "inbound.message",
@@ -1702,6 +1707,7 @@ export class ChatSocket {
     void this.ensureServerSessionOnce(sess, p.agentId);
     const media = userMsg._media && userMsg._media.length > 0 ? userMsg._media : undefined;
     const text = userMsg._modelText ?? userMsg.text ?? "";
+    sess._lastRouting = { model: p.model, teamMode: !!p.teamMode, effortLevel: p.effortLevel ?? null };
     const payload: InboundMessage = {
       type: "inbound.message",
       idempotencyKey: `web-retry-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
@@ -1792,6 +1798,9 @@ export class ChatSocket {
     const idem = `autocont-restart-${sessId}-${target.id}`;
     if (this.restartContinued.has(idem)) return;
     this.restartContinued.add(idem);
+    // 复用被中断 turn 的路由字段(model/teamMode/effort):缺了它桥按默认模型分类,
+    // 暖 codex 会话的续写会被 CODEX_BILLING_GUARD fail-closed 拒绝(2026-07-07 事故)。
+    const routing = sess._lastRouting;
     const payload: InboundMessage = {
       type: "inbound.message",
       idempotencyKey: idem,
@@ -1799,6 +1808,9 @@ export class ChatSocket {
       peer: { id: sess.id, kind: "dm" },
       agentId: sess.agentId || this.deps.defaultAgentId || "main",
       content: { text: RESTART_CONTINUE_PROMPT },
+      ...(routing?.effortLevel != null ? { effortLevel: routing.effortLevel as InboundMessage["effortLevel"] } : {}),
+      ...(routing?.model ? { model: routing.model } : {}),
+      ...(routing?.teamMode ? { teamMode: true } : {}),
       ts: Date.now(),
     };
     const userMsg = addMessage(sess, "user", RESTART_CONTINUE_DISPLAY, {
@@ -1851,6 +1863,8 @@ export class ChatSocket {
     }
 
     const idem = `autocont-${sessId}-${targetMsgId}`;
+    // 同服务重启续写:复用被中断 turn 的路由字段,保证桥的 codex 分类一致。
+    const routing = sess._lastRouting;
     const payload: InboundMessage = {
       type: "inbound.message",
       idempotencyKey: idem,
@@ -1858,6 +1872,9 @@ export class ChatSocket {
       peer: { id: sess.id, kind: "dm" },
       agentId: sess.agentId || this.deps.defaultAgentId || "main",
       content: { text: AUTO_CONTINUE_PROMPT },
+      ...(routing?.effortLevel != null ? { effortLevel: routing.effortLevel as InboundMessage["effortLevel"] } : {}),
+      ...(routing?.model ? { model: routing.model } : {}),
+      ...(routing?.teamMode ? { teamMode: true } : {}),
       ts: Date.now(),
     };
     const userMsg = addMessage(sess, "user", AUTO_CONTINUE_DISPLAY, {
