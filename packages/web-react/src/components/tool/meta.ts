@@ -104,6 +104,10 @@ const OC_CLI_META: Record<string, ToolMeta> = {
   "oc-slides": { icon: AppWindow, label: "幻灯片生成", tone: "success" },
   "oc-poster": { icon: ImageIcon, label: "海报生成", tone: "success" },
   "oc-minimax": { icon: Sparkles, label: "媒体生成", tone: "accent" },
+  // 识图/记忆从 MCP 工具迁到 CLI(2026-07-07)后经 Bash 调用,补专属卡沿用旧语义
+  //(understand_image → "图片理解"眼睛;memory/archival/session_search → "记忆")。
+  "oc-vision": { icon: Eye, label: "图片理解", tone: "info" },
+  "oc-memory": { icon: Brain, label: "记忆", tone: "accent" },
 };
 
 // oc-* 程序名只在【命令位置】才算调用:行首(可有前导空白),或 shell 分隔符
