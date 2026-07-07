@@ -64,15 +64,21 @@ REMOVE_KEYS=(
   COMMERCIAL_CODEX_REFRESH_ACTOR_DISABLED COMMERCIAL_CODEX_DRIFT_RECONCILER_DISABLED
 )
 
-# 守卫:overrides 文件不得含任何 REMOVE_KEYS —— env 生成顺序是"删 REMOVE_KEYS 再追加
-# overrides",若 overrides 里又出现被剥离的键,会覆盖剥离让它复活(如 CODEX_REFRESH_ACTOR_DISABLED
-# 复活 → 重 bootstrap/DR 后 v5 codex token 无人续期,静默烂池)。让这类矛盾在部署时爆而非 DR 时爆。
+# REMOVE_KEYS 有两类:①"剥 v3 值 → overrides 设 v5 专属值"(AGENT_*/OC_RUNTIME_IMAGE/
+# INTERNAL_PROXY_*/EXTERNAL_MTLS_* 等,overrides 里合法出现);②"必须绝不出现"——从 v3
+# 继承会重新禁掉 v5-owned 职能的禁用旗标。守卫只拦第②类。
+# 第②类:v5-owned codex 刷新 actor / drift reconciler 必须自己跑,overrides 里出现其
+# *_DISABLED=1 会在"删 REMOVE_KEYS 再追加 overrides"时复活 → 重 bootstrap/DR 后 v5 codex
+# token 无人续期,静默烂池。让这类矛盾在部署时爆而非 DR 时爆。
+FORBIDDEN_IN_OVERRIDES=(
+  COMMERCIAL_CODEX_REFRESH_ACTOR_DISABLED COMMERCIAL_CODEX_DRIFT_RECONCILER_DISABLED
+)
 assert_overrides_no_remove_keys() {
   local ov="$REPO_ROOT/deploy/v5/commercial-v5.env.overrides" k bad=0
   [ -f "$ov" ] || { echo "FATAL: overrides 文件缺失: $ov" >&2; exit 1; }
-  for k in "${REMOVE_KEYS[@]}"; do
+  for k in "${FORBIDDEN_IN_OVERRIDES[@]}"; do
     if grep -Eq "^[[:space:]]*${k}=" "$ov"; then
-      echo "FATAL: overrides 含 REMOVE_KEYS 键 '${k}' —— 会覆盖 deploy 的剥离,禁止。删掉该行。" >&2
+      echo "FATAL: overrides 含禁用旗标 '${k}' —— 会覆盖 REMOVE_KEYS 的剥离让 v5-owned 职能被禁,禁止。删掉该行。" >&2
       bad=1
     fi
   done
