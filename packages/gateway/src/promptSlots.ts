@@ -27,7 +27,7 @@ import {
 import { request as undiciRequest } from 'undici'
 import type { RepoSnapshot } from './sessionRepoWorkspace.js'
 import { listCollaboratorAgents } from './collaboratorAgents.js'
-import { isTextOnlyStaticVisionModel } from './mcpVisionServer.js'
+import { isTextOnlyStaticVisionModel, shouldEnableOpenClaudeVision } from './mcpVisionServer.js'
 
 export interface PromptSlotContext {
   agentId: string
@@ -88,7 +88,14 @@ export async function buildUserSlot(ctx: PromptSlotContext): Promise<PromptSlot 
 
 export async function buildAgentsSlot(ctx: PromptSlotContext): Promise<PromptSlot> {
   const provider = ctx.provider
-  const hasUnderstandImageTool = ctx.availableMcpTools?.includes('understand_image') === true
+  // 识图从 openclaude-vision MCP 迁到 oc-vision CLI(baseline skill)后,是否提示识图
+  // 不再看"MCP 工具是否注入"(那个值已恒 false),而看**平台是否认定该模型需要识图兜底**。
+  // 判定权威 = shouldEnableOpenClaudeVision —— 它正是迁移前决定注入 understand_image 的
+  // 同一个函数(纯文本静态模型 supportsVision!==true,或 OPENCLAUDE_VISION_MCP_PROVIDERS
+  // 显式 opt-in 的 provider),所以 `needsVisionCli` 与旧 `availableMcpTools.includes(
+  // 'understand_image')` 语义完全等价。**原生多模态模型(gpt-5.5/claude 等)默认 false**,
+  // 不会拿到误导性的"用 CLI 识图"提示(保持迁移前行为,不给它们加噪音)。
+  const needsVisionCli = shouldEnableOpenClaudeVision(provider, ctx.model)
   const lines = [
     '# Platform capabilities',
     '',
@@ -104,9 +111,9 @@ export async function buildAgentsSlot(ctx: PromptSlotContext): Promise<PromptSlo
     '',
     '如果当前对话来自微信,或用户要求在微信里收发文件、图片、视频、语音/音频、附件,按以下规则操作:',
     '',
-    hasUnderstandImageTool
-      ? '- 微信收到的图片、视频、语音/音频、文件会以容器内路径提供,通常在 `/home/agent/.openclaude/uploads/<安全文件名>`。看到本地图片路径时,应先调用 `understand_image` 工具识别,不要说“不支持图片/没有上传图片”。'
-      : '- 微信收到的图片、视频、语音/音频、文件会以容器内路径提供,通常在 `/home/agent/.openclaude/uploads/<安全文件名>`。看到本地图片路径时,不要说“不支持图片/没有上传图片”;如果当前工具列表中有图片理解工具,先调用它识别。',
+    needsVisionCli
+      ? '- 微信收到的图片、视频、语音/音频、文件会以容器内路径提供,通常在 `/home/agent/.openclaude/uploads/<安全文件名>`。当前模型看不到图,看到本地图片路径时,先用 Bash 调 `oc-vision understand <该路径> --prompt "<问题>"` 识别,再据此回答,不要说“不支持图片/没有上传图片”。'
+      : '- 微信收到的图片、视频、语音/音频、文件会以容器内路径提供,通常在 `/home/agent/.openclaude/uploads/<安全文件名>`。看到本地图片路径时,直接读图回答,不要说“不支持图片/没有上传图片”。',
     '- 要通过微信发回真实附件,不能只读取文件或口头描述。必须先创建或复制资源到 `/home/agent/.openclaude/generated/<安全文件名>`;也可以复用已存在的 `/home/agent/.openclaude/uploads/<安全文件名>`。',
     '- 最终回复里必须写出精确的绝对路径,例如 `/home/agent/.openclaude/generated/example.txt`;微信网关会把该路径转换成真实附件发送。路径要出现在**最终回答**中,不要只放在思考过程或工具调用说明里。',
     '- 安全文件名只能匹配 `[A-Za-z0-9._@+=,-]{1,180}`,最长 180 字符;不要使用子目录、`..`、URL 编码、软链接、`/tmp` 或任意系统路径。',
@@ -212,20 +219,21 @@ export async function buildAgentsSlot(ctx: PromptSlotContext): Promise<PromptSlo
   // staticKeyProviders 的 supportsVision(经 isTextOnlyStaticVisionModel 派生),与
   // mcpVisionServer 注入侧同源 —— 消掉此前逐字面量硬编码的第二权威源(新增静态
   // 模型忘同步就漏发提示的漂移)。
-  if (hasUnderstandImageTool && isTextOnlyStaticVisionModel(ctx.model)) {
+  if (needsVisionCli && isTextOnlyStaticVisionModel(ctx.model)) {
     lines.push('')
     lines.push('## 图片理解提示')
     lines.push('')
     lines.push(
-      '当前模型按纯文本接入、看不到图。用户上传图片时,先调用 `understand_image` MCP 工具,' +
-        '传 `image_file="绝对路径"`(从上传提示里取该图的本地路径),再基于工具返回的图片描述回答。',
+      '当前模型按纯文本接入、看不到图。用户上传图片时,用 Bash 调 ' +
+        '`oc-vision understand <图片绝对路径> --prompt "<问题>"`(路径从上传提示里取),' +
+        '再基于命令返回的图片内容回答。细节见 `skill_view("oc-vision")`。',
     )
   }
-  // M1a 复活(P1f 删):GPT/Codex 路径的 understand_image 提示段。CodexAdapter
-  // 构造内核时强制 provider='codex-native'(engine 路由后任意 agent 都可能落
-  // codex 底座),model 前缀判定保留作 belt-and-braces。
+  // GPT/Codex 路径的识图提示段。CodexAdapter 构造内核时强制 provider='codex-native'
+  // (engine 路由后任意 agent 都可能落 codex 底座),model 前缀判定保留作 belt-and-braces。
+  // 这些模型经常无法用普通文件工具"看到"图像内容,oc-vision 是可靠兜底。
   if (
-    hasUnderstandImageTool &&
+    needsVisionCli &&
     (provider === 'codex-native' ||
       provider === 'codex' ||
       ctx.model?.startsWith('gpt-') ||
@@ -235,7 +243,9 @@ export async function buildAgentsSlot(ctx: PromptSlotContext): Promise<PromptSlo
     lines.push('## GPT/Codex 图片理解提示')
     lines.push('')
     lines.push(
-      '用户消息中出现本地图片路径时,先调用 `understand_image` MCP 工具,传 `image_file="绝对路径"`,再基于工具返回的图片内容回答。不要声称用户没有上传图片。',
+      '用户消息中出现本地图片路径、而你无法直接看到图像内容时,用 Bash 调 ' +
+        '`oc-vision understand <图片绝对路径> --prompt "<问题>"`,再基于命令返回的内容回答。' +
+        '不要声称用户没有上传图片。细节见 `skill_view("oc-vision")`。',
     )
   }
 

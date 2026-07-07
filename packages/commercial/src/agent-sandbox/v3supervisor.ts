@@ -459,6 +459,7 @@ export const V3_CCB_BASELINE_SKILL_NAMES = [
   "debugging",
   "testing",
   "skill-authoring",
+  "oc-vision",
 ] as const;
 
 /**

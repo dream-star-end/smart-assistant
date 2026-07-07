@@ -311,12 +311,10 @@ export async function buildCodexLaunchOverrides(
   // because that file is provider-agnostic and shouldn't carry adapter
   // concerns — keeping it here means promptSlots stays clean and the codex
   // adapter can evolve without touching the slot pipeline.
-  const openClaudeVisionEntry =
-    process.env.OPENCLAUDE_VISION_MCP_DISABLED === '1'
-      ? null
-      : resolveOpenClaudeVisionEntry(ctx.claudeCodePath)
-  // web-context retired from the codex MCP path → oc-web CLI (baseline skill).
-  const availableMcpTools = [...(openClaudeVisionEntry ? ['understand_image'] : [])]
+  // vision retired from the codex MCP path → oc-vision CLI (baseline skill),
+  // same as web-context/browser. No MCP tool is injected on the codex path now;
+  // mcp-memory below is the only remaining codex-side MCP server.
+  const availableMcpTools: string[] = []
   const platformResult = await buildPromptContext({
     agentId: ctx.agentId,
     persona: ctx.persona,
@@ -359,8 +357,6 @@ export async function buildCodexLaunchOverrides(
   const mcpEntry = resolveMcpMemoryEntry(ctx.claudeCodePath)
   let tokenFile: string | null = null
   let tokenContent: string | null = null
-  let visionTokenFile: string | null = null
-  let visionTokenContent: string | null = null
   if (mcpEntry) {
     // v3 hardening: the gateway token NEVER lands in argv. Instead, we point
     // mcp-memory at a 0600 file via OPENCLAUDE_GATEWAY_TOKEN_FILE; the caller
@@ -394,35 +390,16 @@ export async function buildCodexLaunchOverrides(
     )
   }
 
-  if (openClaudeVisionEntry) {
-    const rawContainerToken = process.env.OPENCLAUDE_V3_CONTAINER_TOKEN?.trim()
-    if (rawContainerToken) {
-      visionTokenFile = resolve(ctx.sessionDir, 'v3-container-token')
-      visionTokenContent = rawContainerToken
-    }
-    argvOverrides.push(
-      '-c',
-      `mcp_servers.openclaude-vision.command=${tomlValue('npx')}`,
-      '-c',
-      `mcp_servers.openclaude-vision.args=${tomlValue(['tsx', openClaudeVisionEntry])}`,
-      '-c',
-      `mcp_servers.openclaude-vision.env=${tomlValue(
-        buildOpenClaudeVisionMcpEnv(ctx.agentId, {
-          containerTokenFile: visionTokenFile ?? undefined,
-        }),
-      )}`,
-      '-c',
-      `mcp_servers.openclaude-vision.default_tools_approval_mode=${tomlValue('approve')}`,
-    )
-  }
-
   return {
     instructionsFile,
     instructionsContent,
     tokenFile,
     tokenContent,
-    visionTokenFile,
-    visionTokenContent,
+    // vision MCP retired → oc-vision CLI (baseline skill); no vision token is
+    // written on the codex path anymore. Fields kept on the interface (always
+    // null) until the codex vision-token plumbing is fully removed.
+    visionTokenFile: null,
+    visionTokenContent: null,
     argvOverrides,
   }
 }
