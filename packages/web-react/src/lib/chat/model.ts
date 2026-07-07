@@ -223,6 +223,11 @@ export type ChatSession = {
   lastAt: number;
   updatedAt?: number;
 
+  /** 最近一次用户发送的路由字段快照(model/teamMode/effortLevel)。合成续写
+   *  (服务重启自动续写/空轮续写)必须复用——否则桥按默认模型分类,不做 codex
+   *  改写(无 server requestId/无 preCheck),暖 codex 会话续写被计费闸 fail-closed
+   *  拒绝(2026-07-07 boss 团队模式"一直无响应"事故:CODEX_BILLING_GUARD)。 */
+  _lastRouting?: { model?: string; teamMode?: boolean; effortLevel?: string | null };
   // ── frameSeq 去重游标（§3）──
   _lastFrameSeqByKey?: Record<string, number>;
   _lastFrameSeq?: number;
