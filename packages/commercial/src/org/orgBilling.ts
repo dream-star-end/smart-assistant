@@ -62,25 +62,32 @@ export async function resolveOrgBillingContext(
 }
 
 /**
- * 成员可动用的 org 钱包余额(preCheck 预检门用,poolside 只读)。
+ * 成员可动用的 org 桶总额(preCheck 预检门用,poolside 只读)= org 期内池(0115 席位订阅)
+ * + org 钱包(0112)。
  *
- * 语义与 resolveOrgBillingContext + spendTwoBucket 的 org 桶参与条件严格一致:
- * 成员 active + billing_enabled + org active,否则 0n(org 钱包不参与该成员付费)。
+ * 语义与 resolveOrgBillingContext + spendTwoBucket 的 org 桶参与条件**成对严格一致**
+ * (一期审计教训:预检口径与扣费参与条件必须同增同减,否则错账/误拒):
+ *   - 成员 active + billing_enabled + org active → org 桶参与;
+ *   - org 期内池仅计入 active + 未过期(period_end>NOW())的 org 订阅(与 spend 0b 谓词同款,
+ *     过期未轮转不计,防"到期后预检放行但扣费落不到 org 期内池");
+ *   - 否则 0n(org 桶不参与该成员付费)。
  * 若不同步此条件,会出现"预检放行但扣费落不到 org 桶"或反向的 402 误拒
  * (企业核心场景 = 公司付费、成员个人余额为 0)。
  */
 export async function getOrgSpendableForUser(userId: bigint | number | string): Promise<bigint> {
-  const r = await query<{ credits: string }>(
-    `SELECT o.credits::text AS credits
+  const r = await query<{ spendable: string }>(
+    `SELECT (o.credits + COALESCE(os.period_credits, 0))::text AS spendable
        FROM org_memberships m
        JOIN orgs o ON o.id = m.org_id
+       LEFT JOIN org_subscriptions os
+         ON os.org_id = o.id AND os.status = 'active' AND os.period_end > NOW()
       WHERE m.user_id = $1::bigint AND m.status = 'active' AND m.billing_enabled
         AND o.status = 'active'
       LIMIT 1`,
     [String(userId)],
   );
   const row = r.rows[0];
-  return row ? BigInt(row.credits) : 0n;
+  return row ? BigInt(row.spendable) : 0n;
 }
 
 // ─── 只读读路径(GET /api/org/*)────────────────────────────────────────

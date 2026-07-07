@@ -90,10 +90,17 @@ const PLAN_COLS =
   `code, name, price_cents::text AS price_cents, monthly_credits::text AS monthly_credits,
    period_days, tier, sort_order, enabled`;
 
-/** 列所有 enabled 套餐档（sort_order DESC）。 */
+/**
+ * 列所有 enabled 的**个人**套餐档（sort_order DESC）。
+ *
+ * `AND scope = 'user'`（0115 企业版):subscription_plans 是个人档+org 档单一权威表,
+ * 加 org 档后个人档端点(http/subscription.ts)必须按 scope 分区,否则企业席位档泄漏进
+ * 个人订阅卡片。org 档枚举走 org/orgSubscriptions.ts:listOrgSubscriptionPlans(scope='org')。
+ */
 export async function listSubscriptionPlans(): Promise<SubscriptionPlan[]> {
   const r = await query<Parameters<typeof rowToPlan>[0]>(
-    `SELECT ${PLAN_COLS} FROM subscription_plans WHERE enabled = TRUE ORDER BY sort_order DESC, tier ASC`,
+    `SELECT ${PLAN_COLS} FROM subscription_plans
+      WHERE enabled = TRUE AND scope = 'user' ORDER BY sort_order DESC, tier ASC`,
   );
   return r.rows.map(rowToPlan);
 }

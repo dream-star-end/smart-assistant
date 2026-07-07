@@ -263,9 +263,14 @@ export async function preCheckWithCost(
   // 企业版(0112):org 成员(billing_enabled + org active)加上 org 钱包——预检口径
   // 必须与 spendTwoBucket 的 org 第 0 优先桶一致,否则"公司付费、个人零余额"的成员
   // 会被 402 误拒(企业版核心场景)。
+  // org 可用额是**加法项**:查询失败绝不阻断聊天(fail-open 到纯个人余额,最坏=
+  // 零个人余额的 org 成员被 402,等价于无此特性;可用性优先于该边缘精度)。
   const [personal, orgSpendable] = await Promise.all([
     getSpendableBalance(input.userId),
-    getOrgSpendableForUser(input.userId),
+    getOrgSpendableForUser(input.userId).catch((err) => {
+      console.error("[preCheck] org spendable lookup failed, fail-open to personal", err);
+      return 0n;
+    }),
   ]);
   const balance = personal + orgSpendable;
 

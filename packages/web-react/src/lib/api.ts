@@ -66,7 +66,11 @@ import type {
   OrgOrder,
   OrgLedgerRow,
   OrgSkillsResponse,
+  OrgPlan,
+  OrgSubscriptionInfo,
+  OrgPayResult,
 } from "./types";
+import { normalizeOrgPlan, normalizeOrgSubscription } from "./orgBilling";
 
 /**
  * v5 商业版前端网络层。
@@ -246,6 +250,21 @@ async function jsonOrThrow<T>(p: Promise<Response> | Response): Promise<T> {
   const res = await p;
   if (!res.ok) await throwApi(res);
   return (await res.json()) as T;
+}
+
+/**
+ * 企业席位订单下单响应 → OrgPayResult。与批次 F issueOrderQr 同形：
+ * `{ ok, data: { order_no, qrcode_url, mobile_url, amount_cents, credits, expires_at } }`。
+ * 归一为 {orderNo, qr}(qr=qrcode_url,可扫码二维码图片 URL);到账轮询走 getOrder。
+ */
+function parseOrgOrder(p: Promise<Response>): Promise<OrgPayResult> {
+  return jsonOrThrow<{
+    ok?: boolean;
+    data?: { order_no: string; qrcode_url: string };
+  }>(p).then((b) => ({
+    orderNo: b.data?.order_no ?? "",
+    qr: b.data?.qrcode_url ?? "",
+  }));
 }
 
 /** 订阅/升档下单响应 → HupiCreateResult（与 hupi/create 同形，复用 QR + 订单轮询）。 */
@@ -2084,6 +2103,79 @@ export const api = {
         }),
       ),
     ).then(() => undefined),
+
+  // ── 席位订阅 + 自助开通(二期批次 F 契约;已按 F 实际响应形对齐,normalizeOrg* 适配字段名)──
+  //
+  // 到账判定统一复用 GET /api/payment/orders/:order_no(getOrder,status→'paid')。
+  // 下单响应形(与 F issueOrderQr 对齐):{ ok, data: { order_no, qrcode_url, ... } }。
+  // qrcode_url = 可扫码二维码图片 URL(个人版虎皮椒同款),经 parseOrgOrder 归一为 {orderNo, qr}。
+  // GET plans / subscription 为顶层裸对象(无 ok/data 包裹)。大数全字符串贯穿。
+  // owner 门在 UI 层按 role 控制,403 响应兜底 toast(防降权窗口)。
+
+  /** GET /api/org/plans:企业套餐档(无 org 也可读,创建向导用)。normalizeOrgPlan 适配字段名。 */
+  getOrgPlans: (a: AuthSession): Promise<OrgPlan[]> =>
+    jsonOrThrow<{ plans?: unknown[] }>(
+      callWithRefresh(a, (t) =>
+        fetch("/api/org/plans", { credentials: "include", headers: bearerHeaders(t) }),
+      ),
+    ).then((b) => (Array.isArray(b.plans) ? b.plans : []).map(normalizeOrgPlan)),
+
+  /** POST /api/org/provision:自助开通(组织名+档+席位)→ 扫码。401 未登录;已有 org → 结构化错。 */
+  provisionOrg: (
+    a: AuthSession,
+    input: { orgName: string; planCode: string; seats: number },
+  ): Promise<OrgPayResult> =>
+    parseOrgOrder(
+      callWithRefresh(a, (t) =>
+        fetch("/api/org/provision", {
+          method: "POST",
+          credentials: "include",
+          headers: bearerHeaders(t, true),
+          body: JSON.stringify({ org_name: input.orgName, plan_code: input.planCode, seats: input.seats }),
+        }),
+      ),
+    ),
+
+  /** GET /api/org/subscription:当前订阅 + 档列表(member 可读)。normalizeOrg* 适配。 */
+  getOrgSubscription: (a: AuthSession): Promise<OrgSubscriptionInfo> =>
+    jsonOrThrow<{ subscription?: unknown; plans?: unknown[] }>(
+      callWithRefresh(a, (t) =>
+        fetch("/api/org/subscription", { credentials: "include", headers: bearerHeaders(t) }),
+      ),
+    ).then((b) => ({
+      subscription: normalizeOrgSubscription(b.subscription),
+      plans: (Array.isArray(b.plans) ? b.plans : []).map(normalizeOrgPlan),
+    })),
+
+  /** POST /api/org/subscribe(owner):订阅 / 续费(档+**总席位**)→ 扫码。403 非 owner。 */
+  subscribeOrg: (
+    a: AuthSession,
+    input: { planCode: string; seats: number },
+  ): Promise<OrgPayResult> =>
+    parseOrgOrder(
+      callWithRefresh(a, (t) =>
+        fetch("/api/org/subscribe", {
+          method: "POST",
+          credentials: "include",
+          headers: bearerHeaders(t, true),
+          body: JSON.stringify({ plan_code: input.planCode, seats: input.seats }),
+        }),
+      ),
+    ),
+
+  /** POST /api/org/seats(owner):加席。**seats = 席位增量(>0)**,对齐 F createOrgSeatsOrder
+   *  「席位增量」语义(kind='upgrade',整份即时入池,period 不变)。403 非 owner。 */
+  addOrgSeats: (a: AuthSession, seatsDelta: number): Promise<OrgPayResult> =>
+    parseOrgOrder(
+      callWithRefresh(a, (t) =>
+        fetch("/api/org/seats", {
+          method: "POST",
+          credentials: "include",
+          headers: bearerHeaders(t, true),
+          body: JSON.stringify({ seats: seatsDelta }),
+        }),
+      ),
+    ),
 
   // ── 对话传输（P4 已接入：WS user-chat-bridge） ────────────────────────
   //

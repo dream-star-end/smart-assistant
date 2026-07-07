@@ -19,6 +19,8 @@ import { OrgError, type OrgStatus } from "../org/types.js";
 
 export interface OrgWithStatsRow extends OrgRow {
   member_count: number;
+  /** 订阅摘要(0115;无订阅 → null)。运营可视:档位/席位/到期/状态。 */
+  subscription: { plan_code: string; seats: number; period_end: string; status: string } | null;
 }
 
 export interface ListOrgsInput {
@@ -44,12 +46,23 @@ export async function listOrgs(input: ListOrgsInput = {}): Promise<ListOrgsResul
   const status = input.status ?? null;
   const cursor = input.cursor && /^[1-9][0-9]{0,19}$/.test(input.cursor) ? input.cursor : null;
 
-  const r = await query<OrgRow & { member_count: string }>(
+  const r = await query<
+    OrgRow & {
+      member_count: string;
+      sub_plan_code: string | null;
+      sub_seats: number | null;
+      sub_period_end: Date | string | null;
+      sub_status: string | null;
+    }
+  >(
     `SELECT o.id::text AS id, o.name, o.status, o.credits::text AS credits, o.max_members,
             o.created_by::text AS created_by, o.created_at, o.updated_at,
             (SELECT COUNT(*) FROM org_memberships m
-              WHERE m.org_id = o.id AND m.status = 'active')::text AS member_count
+              WHERE m.org_id = o.id AND m.status = 'active')::text AS member_count,
+            os.plan_code AS sub_plan_code, os.seats AS sub_seats,
+            os.period_end AS sub_period_end, os.status AS sub_status
        FROM orgs o
+       LEFT JOIN org_subscriptions os ON os.org_id = o.id
       WHERE ($1::text IS NULL OR o.name ILIKE '%' || $1 || '%')
         AND ($2::text IS NULL OR o.status = $2)
         AND ($3::bigint IS NULL OR o.id < $3::bigint)
@@ -59,10 +72,22 @@ export async function listOrgs(input: ListOrgsInput = {}): Promise<ListOrgsResul
   );
   const hasMore = r.rows.length > limit;
   const page = hasMore ? r.rows.slice(0, limit) : r.rows;
-  const rows: OrgWithStatsRow[] = page.map(({ member_count, ...org }) => ({
-    ...org,
-    member_count: Number(member_count),
-  }));
+  const rows: OrgWithStatsRow[] = page.map(
+    ({ member_count, sub_plan_code, sub_seats, sub_period_end, sub_status, ...org }) => ({
+      ...org,
+      member_count: Number(member_count),
+      subscription:
+        sub_plan_code !== null && sub_seats !== null && sub_period_end !== null && sub_status !== null
+          ? {
+              plan_code: sub_plan_code,
+              seats: sub_seats,
+              period_end:
+                sub_period_end instanceof Date ? sub_period_end.toISOString() : String(sub_period_end),
+              status: sub_status,
+            }
+          : null,
+    }),
+  );
   return { rows, next_cursor: hasMore ? rows[rows.length - 1].id : null };
 }
 
