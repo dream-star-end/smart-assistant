@@ -368,6 +368,34 @@ import {
 import type { ServerResponse } from "node:http";
 
 /**
+ * 控制面 leader 判定(单一权威,可测)。返回 true = 本实例是控制面 leader
+ * (controlPlaneEnabled),运行 shared 域后台 mutator(账号池 cooldown 恢复 /
+ * finalize 对账 / 磁盘·OOM 监控 / 告警轮询 / 订单过期 等)。
+ *
+ * leader 权威从 channel 解耦为显式信号 OC_CONTROL_PLANE_LEADER —— v3 退役后 v5 需成为
+ * 唯一 leader 接管这些职责,否则它们随 v3 停服真空(账号池只减不增 / 崩溃 journal 不对账 /
+ * 磁盘无告警)。判定优先级:
+ *   - OC_CONTROL_PLANE_LEADER="1" → leader(true)
+ *   - OC_CONTROL_PLANE_LEADER="0" → follower(false,应急 kill-switch)
+ *   - 未设 → 回落旧 channel 派生:runtimeChannel==="v5" → follower(保留 P0 期"防 v5
+ *     启动写共享现网"初衷);其它 channel(v3)→ 默认 leader,除非 COMMERCIAL_CONTROL_PLANE_DISABLED=1。
+ *
+ * 【全网单 leader 铁律】同一时刻只能有一个实例是 leader,否则 shared 全表 mutator 双跑
+ * (双 settle / 双恢复 / 竞态)。cutover 纪律:先停旧 leader(v3)再给新实例(v5)设 =1,
+ * 严禁两实例同时 leader。
+ */
+export function resolveControlPlaneLeader(
+  env: Record<string, string | undefined>,
+  runtimeChannel: string,
+): boolean {
+  const explicit = env.OC_CONTROL_PLANE_LEADER?.trim();
+  if (explicit === "1") return true;
+  if (explicit === "0") return false;
+  if (runtimeChannel === "v5") return false;
+  return env.COMMERCIAL_CONTROL_PLANE_DISABLED !== "1";
+}
+
+/**
  * T-02: 是否在 registerCommercial 时自动执行 migrations。
  *
  * 规约:
@@ -567,6 +595,12 @@ export interface RegisterCommercialResult {
    * `unknown` 让 caller 不感知 BrokerInboundOutcome 内部 union;broker 自己
    * never-throw,caller 不需要 try/catch。
    */
+  /**
+   * healthz 深度探活:gateway healthz 经此 seam 探 commercial 强依赖(PG/Redis),
+   * 补"依赖宕机但 healthz 仍绿零告警"的盲区。返回 { pg, redis } 各自 ok/err,
+   * 内部 2s 超时;gateway 未拿到该函数(旧接线/个人版)时退回仅探 sessions.db。
+   */
+  probeDeps?: () => Promise<Record<string, { ok: true } | { ok: false; error: string }>>;
   wechatBroker?: {
     onInbound(evt: {
       bindingUserId: string;
@@ -777,17 +811,14 @@ export async function registerCommercial(
   // 直接 AND 进每个后台 mutator 的启动条件 —— 根除"漏关某个 *_DISABLED 即污染共享现网"
   // 的整类风险(个别 *_DISABLED 仍保留为 v3 细粒度运维开关)。
   const runtimeChannel = process.env.OC_RUNTIME_CHANNEL?.trim() || "v3";
-  // channel=v5 是控制面的【绝对权威】:恒静默,无任何 env 可翻盘 —— 防 P0 期误设
-  // COMMERCIAL_CONTROL_PLANE_ENABLED=1 等重开"v5 启动期写共享 PG/账号池/订单"的洞(Codex 评审)。
-  // P1 给 v5 放开部分控制面将走 leader 选举,而非粗暴 env override。
-  // v3(及其它非 v5 channel):默认开,COMMERCIAL_CONTROL_PLANE_DISABLED=1 为应急 kill-switch。
-  const controlPlaneEnabled =
-    runtimeChannel === "v5" ? false : process.env.COMMERCIAL_CONTROL_PLANE_DISABLED !== "1";
+  // 控制面 leader 权威从 channel 解耦为显式信号 OC_CONTROL_PLANE_LEADER(见
+  // resolveControlPlaneLeader 文档)。未设时行为与旧代码完全一致(v3=leader / v5=follower)。
+  const controlPlaneEnabled = resolveControlPlaneLeader(process.env, runtimeChannel);
 
   // ── mutator 归属矩阵(单一权威源)─────────────────────────────────────────
   // 每个后台 scheduler/worker 创建即经 trackScheduler 登记,登记必须声明数据域归属:
   //   "shared"   共享现网数据域(订单/账号池/容器面/邮件等) → 只允许 controlPlaneEnabled
-  //              (即 v3 leader)运行;v5 下出现即 fail-closed 拒启。
+  //              (即当前 leader,由 OC_CONTROL_PLANE_LEADER 决定)运行;follower 下出现即 fail-closed 拒启。
   //   "v5-owned" v5 独有数据域(0096 订阅周期等 v3 现网树根本没有对应代码的表) →
   //              channel=v5 也必须运行,否则该域权威真空(free 月度重置/到期降级无人执行)。
   //   "local"    纯进程内自愈(无 DB/网络副作用,如 slot 租约回收) → 任何 channel 都运行。
@@ -3374,11 +3405,11 @@ export async function registerCommercial(
   // imagePromote 漏登记,让下方 fail-closed 断言出现盲区)。
   const enabledSchedulers: string[] = schedulerRegistry.map((s) => s.name);
   // 注:shared 域(compute-pool init / image-promote / preheat / 容器面全部 scheduler /
-  // 订单·账号池·邮件 sweeper)一律 gate 在 controlPlaneEnabled(channel=v5 恒 false,无 env
-  // 可翻盘)→ v5 下不会启动,连 runOnStart mutate 都不发生。v5 下合法存活的只有
-  // v5-owned(subscriptionRollover:0096 订阅域 v3 无代码,v5 不跑则全网真空)与
-  // local(accountSlotReaper:纯进程内自愈)。下方 fail-closed 按域断言,防 env 漏配
-  // 或 gate 被误改让 shared mutator 在 v5 写共享现网 —— 宁可拒启。
+  // 订单·账号池·邮件 sweeper)一律 gate 在 controlPlaneEnabled(= 当前 leader,由
+  // OC_CONTROL_PLANE_LEADER 决定;follower 恒 false)→ follower 下不会启动,连 runOnStart
+  // mutate 都不发生。follower 下合法存活的只有 v5-owned(subscriptionRollover:0096 订阅域
+  // v3 无代码,v5 不跑则全网真空)与 local(accountSlotReaper:纯进程内自愈)。下方
+  // fail-closed 按域断言,防 gate 漏配让 follower 的 shared mutator 写共享现网 —— 宁可拒启。
   // baseline server 不是 mutator(只读 serve ccb tarball + mTLS/PSK 鉴权),不在此列。
   const runtimeStatus: CommercialRuntimeStatus = {
     channel: runtimeChannel,
@@ -3388,15 +3419,17 @@ export async function registerCommercial(
     containerRuntime: v3Deps ? "enabled" : "disabled",
     schedulers: enabledSchedulers,
   };
-  // fail-closed:v5 下绝不允许任何 shared 域 mutator 存活 —— 防 env 漏配让 v5 后台
-  // mutator 写共享现网(订单/账号池/容器面/邮件)。宁可 v5 拒启,也不污染现网。
-  // v5-owned(订阅轮转)与 local(进程内自愈)域是 v5 的合法职责,放行。
-  const sharedOnV5 = schedulerRegistry.filter((s) => s.domain === "shared").map((s) => s.name);
-  if (runtimeChannel === "v5" && sharedOnV5.length > 0) {
+  // fail-closed:非 leader(controlPlaneEnabled=false)绝不允许任何 shared 域 mutator 存活 ——
+  // 防 gate 漏 controlPlaneEnabled 让 follower 写共享现网(订单/账号池/容器面/邮件)。宁可拒启,
+  // 也不污染现网。channel 无关:leader 权威已由 OC_CONTROL_PLANE_LEADER 解耦,v5 作为 leader
+  // 运行 shared 是合法的;此断言只拦"follower 却跑了 shared"这类 gate 漏配。
+  // v5-owned(订阅轮转)与 local(进程内自愈)域任何角色都合法,放行。
+  const sharedOnFollower = schedulerRegistry.filter((s) => s.domain === "shared").map((s) => s.name);
+  if (!controlPlaneEnabled && sharedOnFollower.length > 0) {
     throw new Error(
-      `[commercial] v5 invariant violated: shared-domain schedulers active=[${sharedOnV5.join(
+      `[commercial] control-plane invariant violated: follower has shared-domain schedulers active=[${sharedOnFollower.join(
         ",",
-      )}]. v5 只允许 v5-owned/local 域 mutator。`,
+      )}]. 非 leader 只允许 v5-owned/local 域 mutator。`,
     );
   }
   rootLogger.info(
@@ -3590,6 +3623,34 @@ export async function registerCommercial(
       } finally {
         target.psk?.fill(0);
       }
+    },
+    // healthz 深度探活:gateway healthz 经此 seam 探 PG/Redis(gateway 对二者零编译依赖)。
+    // 任一失败 → healthz body.ok=false(HTTP 仍 200,monitor 消费 ok 字段自动告警),补上
+    // "PG/Redis 宕机但 healthz 仍绿零告警"的盲区(2026-07-06 sessions.db 事故的同构面)。
+    // 2s 超时:探活不能被慢依赖拖住 healthz;timer unref 不阻止进程退出。
+    probeDeps: async () => {
+      const withTimeout = <T>(p: Promise<T>, ms: number): Promise<T> => {
+        let timer: NodeJS.Timeout | undefined;
+        const timeout = new Promise<never>((_, rej) => {
+          timer = setTimeout(() => rej(new Error(`probe timeout ${ms}ms`)), ms);
+          timer.unref?.();
+        });
+        return Promise.race([p, timeout]).finally(() => clearTimeout(timer)) as Promise<T>;
+      };
+      const out: Record<string, { ok: true } | { ok: false; error: string }> = {};
+      try {
+        await withTimeout(getPool().query("SELECT 1"), 2000);
+        out.pg = { ok: true };
+      } catch (err) {
+        out.pg = { ok: false, error: (err as Error).message };
+      }
+      try {
+        await withTimeout(redis.ping(), 2000);
+        out.redis = { ok: true };
+      } catch (err) {
+        out.redis = { ok: false, error: (err as Error).message };
+      }
+      return out;
     },
     // P1.7 slice 7c — broker 装配成功(WECHAT_BROKER_ENABLED=1 + bridgeSecret 齐)
     // 才暴露。gateway cli 把 commercial.wechatBroker 作为 onInboundOverride 透传给
