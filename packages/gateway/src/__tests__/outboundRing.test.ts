@@ -472,3 +472,93 @@ describe('OutboundRingBuffer.pruneAll', () => {
     assert.deepEqual(rep.sent.map((f) => f.seq), [2])
   })
 })
+
+// ── team-durability(2026-07-07):帧分级淘汰 + content 丢失水位线 ──
+
+describe('OutboundRingBuffer frame-class tiering', () => {
+  const store = (
+    r: OutboundRingBuffer,
+    key: string,
+    cls: 'content' | 'progress',
+    ts = 1000,
+  ) => {
+    const seq = r.nextSeq(key)
+    r.store(key, seq, ts, frame(seq), cls)
+    return seq
+  }
+
+  it('evicts oldest progress frames before any content frame under entries pressure', () => {
+    const r = new OutboundRingBuffer({ maxEntries: 4, maxAgeMs: 60_000, maxBytes: 1 << 20 })
+    store(r, 's1', 'content')   // seq 1
+    store(r, 's1', 'progress')  // seq 2
+    store(r, 's1', 'progress')  // seq 3
+    store(r, 's1', 'content')   // seq 4
+    store(r, 's1', 'content')   // seq 5 → 超限,应淘 seq2(最老 progress),content 全保
+    const rep = r.peekReplay('s1', 1, 1000)
+    assert.equal(rep.ok, true, 'content 无损 → 游标 1 可回放')
+    assert.deepEqual(
+      rep.sent.map((f) => f.seq),
+      [3, 4, 5],
+      'seq2(progress)被淘,剩余帧带空洞照常回放',
+    )
+  })
+
+  it('replays across progress-only gaps but misses once a content frame is lost', () => {
+    const r = new OutboundRingBuffer({ maxEntries: 3, maxAgeMs: 60_000, maxBytes: 1 << 20 })
+    store(r, 's1', 'progress')  // 1
+    store(r, 's1', 'progress')  // 2
+    store(r, 's1', 'content')   // 3
+    store(r, 's1', 'content')   // 4 → 淘 seq1(progress)
+    store(r, 's1', 'content')   // 5 → 淘 seq2(progress);ring=[3,4,5] 全 content
+    let rep = r.peekReplay('s1', 0 + 1, 1000) // 游标1:丢的只有 progress(1..2 中 >1 的是 2)
+    assert.equal(rep.ok, true)
+    assert.deepEqual(rep.sent.map((f) => f.seq), [3, 4, 5])
+    store(r, 's1', 'content')   // 6 → 无 progress 可淘 → 淘 seq3(content),水位线=3
+    rep = r.peekReplay('s1', 1, 1000)
+    assert.equal(rep.ok, false, '游标 1 < 水位线 3 → content 有损必须 miss')
+    assert.equal(rep.ok === false && rep.reason, 'buffer_miss')
+    const repOk = r.peekReplay('s1', 3, 1000)
+    assert.equal(repOk.ok, true, '游标 ≥ 水位线 → 剩余帧可回放')
+    assert.deepEqual(repOk.sent.map((f) => f.seq), [4, 5, 6])
+  })
+
+  it('age eviction of a content frame also advances the loss watermark', () => {
+    const r = new OutboundRingBuffer({ maxEntries: 100, maxAgeMs: 1_000, maxBytes: 1 << 20 })
+    store(r, 's1', 'content', 1000)   // 1
+    store(r, 's1', 'progress', 1000)  // 2
+    store(r, 's1', 'content', 5000)   // 3 → 淘龄:1、2 都过期(头部起),水位线=1... 淘完 1、2
+    const rep = r.peekReplay('s1', 0 + 0, 5000)
+    // 游标 0 + currentLast>0 → no_buffer(既有 P1-3 语义,与分级无关)
+    assert.equal(rep.ok, false)
+    const rep2 = r.peekReplay('s1', 1, 5000)
+    assert.equal(rep2.ok, true, '游标 1 ≥ 水位线 1(seq1 content 被淘)→ 可回放')
+    assert.deepEqual(rep2.sent.map((f) => f.seq), [3])
+    const rep3 = r.peekReplay('s1', 2, 5000)
+    assert.equal(rep3.ok, true)
+  })
+
+  it('ring struct recreation after pruneAll keeps the conservative watermark', () => {
+    const r = new OutboundRingBuffer({ maxEntries: 100, maxAgeMs: 1_000, maxBytes: 1 << 20 })
+    store(r, 's1', 'content', 1000)  // 1
+    store(r, 's1', 'content', 1000)  // 2
+    r.pruneAll(10_000)               // 全部过期 → ring struct 被回收
+    assert.equal(r.size('s1'), 0)
+    store(r, 's1', 'content', 10_000) // 3 → 重建 ring,水位线保守=seq-1=2
+    const rep = r.peekReplay('s1', 1, 10_000)
+    assert.equal(rep.ok, false, '重建前的 content 丢失不可静默跳过')
+    assert.equal(rep.ok === false && rep.reason, 'buffer_miss')
+    const repOk = r.peekReplay('s1', 2, 10_000)
+    assert.equal(repOk.ok, true)
+    assert.deepEqual(repOk.sent.map((f) => f.seq), [3])
+  })
+
+  it('store() defaults to content class (callers without cls keep old strictness)', () => {
+    const r = new OutboundRingBuffer({ maxEntries: 2, maxAgeMs: 60_000, maxBytes: 1 << 20 })
+    for (let i = 0; i < 4; i++) {
+      const seq = r.nextSeq('s1')
+      r.store('s1', seq, 1000, frame(seq)) // 无 cls → content
+    }
+    const rep = r.peekReplay('s1', 1, 1000)
+    assert.equal(rep.ok, false, '默认 content:淘汰即有损,游标落后必 miss')
+  })
+})

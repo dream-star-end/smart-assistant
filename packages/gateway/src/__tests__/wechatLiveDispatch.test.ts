@@ -74,6 +74,10 @@ function makeGateway(events: any[], delivered: any[] = []): any {
     submit: async (_session: unknown, _payload: string, onEvent: (e: any) => void) => {
       for (const e of events) onEvent(e)
     },
+    // team-durability — dispatchInbound 的客户 turn 计数/迟到产物钩子(fake no-op)
+    beginClientTurn: () => {},
+    endClientTurn: () => {},
+    persistLateTurnArtifacts: () => {},
   }
   gateway.deliver = (out: unknown, adapter?: ChannelAdapter) => {
     delivered.push({ out, adapter })
