@@ -1,0 +1,13 @@
+# v5 文件级备份 timer —— 每天 04:00 北京时间(低峰,避开 09:00 日检 / 白天流量)。
+# Persistent=true:04:00 恰逢停机/重启时,起来后补跑一次,备份不缺天(缺一天比补跑更糟)。
+[Unit]
+Description=Run OpenClaude v5 file-level backup daily at 04:00 Beijing time
+
+[Timer]
+OnCalendar=*-*-* 04:00:00 Asia/Shanghai
+AccuracySec=5min
+Persistent=true
+Unit=openclaude-v5-backup.service
+
+[Install]
+WantedBy=timers.target

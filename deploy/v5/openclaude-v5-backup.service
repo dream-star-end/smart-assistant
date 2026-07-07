@@ -1,0 +1,33 @@
+# OpenClaude v5 权威数据文件级备份(P0 数据面:sessions.db + 运行时配置 + secrets)。
+# 由 openclaude-v5-backup.timer 每日触发 scripts/v5-backup.sh —— 补齐此前 v5 侧零自动
+# 备份的盲区(v3 备份脚本只覆盖 v3 路径)。PG 库另由 pg-backup-openclaude timer 覆盖。
+#
+# 安装(kl-mirror,root):
+#   cp deploy/v5/openclaude-v5-backup.{service,timer} /etc/systemd/system/
+#   systemctl daemon-reload && systemctl enable --now openclaude-v5-backup.timer
+# 立即验证一次:  systemctl start openclaude-v5-backup.service; tail /var/log/openclaude-v5-backup.log
+[Unit]
+Description=OpenClaude v5 file-level backup (sessions.db + config + env)
+After=network.target
+# 失败走统一 timer alert template(与 pg-backup 同惯例;template 未部署时 systemd silent skip,
+# 后续补 template 时此引用立即生效)。
+OnFailure=v3-timer-failure-alert@openclaude-v5-backup.service
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/opt/openclaude/openclaude-v5
+Environment="PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+# 异机备份:取消下一行注释并填 rsync 目标(默认空 = 只本地)。保留天数同理。
+#Environment="V5_BACKUP_REMOTE=user@host:/var/backups/openclaude-v5-offsite"
+#Environment="V5_BACKUP_RETAIN_DAYS=14"
+# RuntimeDirectory 自动建 /run/openclaude 供 flock 用。
+RuntimeDirectory=openclaude
+# flock 防 timer Persistent 回放 / 手工触发 / 长跑重叠。
+ExecStart=/usr/bin/flock -n /run/openclaude/openclaude-v5-backup.lock /usr/bin/bash scripts/v5-backup.sh
+# sessions.db 可达数百 MB,sqlite .backup + 可选 rsync;30min 给足冗余。
+TimeoutStartSec=30min
+TimeoutStopSec=10s
+# 不 starve prod IO/CPU。
+Nice=10
+IOSchedulingClass=idle
