@@ -21,6 +21,10 @@ export const paths = {
   agentUserMd: (agentId: string) => join(HOME, 'agents', agentId, 'USER.md'),
   sharedUserMd: join(HOME, 'user.md'),
   sharedUserLock: join(HOME, 'user.md.lock'),
+  // per-agent MEMORY.md 的跨进程写锁(= agentMemoryMd + '.lock',同目录语义)。v5 下
+  // 该文件被容器 gateway(UI PUT overwrite)与 mcp-memory 子进程(AI add/replace/remove)
+  // 两个进程写,不再是单 writer → 写路径必须取此锁做 read-modify-write 互斥。
+  agentMemoryLock: (agentId: string) => join(HOME, 'agents', agentId, 'MEMORY.md.lock'),
   // Skills system (L3): per-agent skill directory.
   // NOTE: with the user-level shared skill library (see sharedSkillsDir below),
   // this per-agent dir is a read-only "legacy" overlay layer kept only for

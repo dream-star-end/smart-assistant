@@ -36,6 +36,9 @@ import type {
   HupiCreateResult,
   LoginResult,
   MediaSignResult,
+  MemoryDocResponse,
+  MemoryConflict,
+  PutMemoryResult,
   PaymentOrder,
   PaymentPlan,
   Preferences,
@@ -1171,9 +1174,10 @@ export const api = {
   // 容器未就绪时 router 会先 ensureContainerReady（可能冷启 ~40s），失败返 503/4503。
 
   /** 取某 agent 的记忆文档（GET /api/agents/:id/memory/:target，target=memory|user）。
-   *  limit = 该 target 的字符预算（权威源在后端 DEFAULT_LIMITS，前端只做展示）。 */
+   *  limit = 该 target 的字符预算（权威源在后端 DEFAULT_LIMITS，前端只做展示）；
+   *  version = 乐观锁令牌，PUT 时回传以检测并发写。 */
   getMemory: (a: AuthSession, agentId: string, target: "memory" | "user") =>
-    jsonOrThrow<{ text: string; charCount?: number; limit?: number; target: string }>(
+    jsonOrThrow<MemoryDocResponse>(
       callWithRefresh(a, (t) =>
         fetch(`/api/agents/${encodeURIComponent(agentId)}/memory/${target}`, {
           credentials: "include",
@@ -1182,18 +1186,47 @@ export const api = {
       ),
     ),
 
-  /** 写某 agent 的记忆文档（PUT /api/agents/:id/memory/:target）。 */
-  putMemory: (a: AuthSession, agentId: string, target: "memory" | "user", text: string) =>
-    jsonOrThrow<{ ok: boolean; charCount?: number; limit?: number }>(
-      callWithRefresh(a, (t) =>
-        fetch(`/api/agents/${encodeURIComponent(agentId)}/memory/${target}`, {
-          method: "PUT",
-          credentials: "include",
-          headers: bearerHeaders(t, true),
-          body: JSON.stringify({ text }),
-        }),
-      ),
-    ),
+  /**
+   * 写某 agent 的记忆文档（PUT /api/agents/:id/memory/:target）。
+   * 带乐观锁 version：后端在 version 落后时返 409 `{ conflict }`（智能体在用户
+   * 编辑期间改了记忆）。409 不当作错误抛，解析 conflict 交回上层做条目级并入；
+   * 其余非 2xx 仍走统一 ApiError。返回判别式结果，成功回传新 version。
+   */
+  putMemory: async (
+    a: AuthSession,
+    agentId: string,
+    target: "memory" | "user",
+    text: string,
+    version?: string,
+  ): Promise<PutMemoryResult> => {
+    const res = await callWithRefresh(a, (t) =>
+      fetch(`/api/agents/${encodeURIComponent(agentId)}/memory/${target}`, {
+        method: "PUT",
+        credentials: "include",
+        headers: bearerHeaders(t, true),
+        body: JSON.stringify(version !== undefined ? { text, version } : { text }),
+      }),
+    );
+    if (res.status === 409) {
+      const body = (await res.json().catch(() => null)) as { conflict?: Partial<MemoryConflict> } | null;
+      const c = body?.conflict;
+      if (c && typeof c.text === "string") {
+        return {
+          ok: false,
+          conflict: {
+            text: c.text,
+            version: String(c.version ?? ""),
+            charCount: Number(c.charCount ?? 0),
+            limit: Number(c.limit ?? 0),
+          },
+        };
+      }
+      // 非预期的 409（无 conflict 载荷）：按普通错误抛，保持统一错误信封。
+      throw new ApiError({ status: 409, message: withReqId("记忆写入冲突", res), body });
+    }
+    const out = await jsonOrThrow<{ ok: boolean; version: string; charCount?: number; limit?: number }>(res);
+    return { ok: true, version: out.version, charCount: out.charCount, limit: out.limit };
+  },
 
   /** 定时任务列表（GET /api/cron）。 */
   listCron: (a: AuthSession) =>
@@ -1452,6 +1485,15 @@ export const api = {
         }),
       ),
     ),
+
+  /** 训练 run 列表（GET /api/skill-training，按 startedAt 降序）。
+   *  用于页面刷新/服务重启后找回未完成或有草稿(diff_ready)的训练 run。 */
+  listSkillTrainRuns: (a: AuthSession) =>
+    jsonOrThrow<{ runs: SkillTrainRun[] }>(
+      callWithRefresh(a, (t) =>
+        fetch("/api/skill-training", { credentials: "include", headers: bearerHeaders(t) }),
+      ),
+    ).then((b) => b.runs || []),
 
   /** 训练 run 状态（GET /api/skill-training/:runId）。 */
   getSkillTrainRun: (a: AuthSession, runId: string) =>

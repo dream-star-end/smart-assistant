@@ -530,6 +530,29 @@ export type CronCreateInput = {
   agent?: string;
 };
 
+// ── 记忆文档（GET/PUT /api/agents/:id/memory/:target） ──────────────────────
+
+/** 记忆文档读取响应（version 为乐观锁令牌，PUT 回传以检测并发写）。 */
+export type MemoryDocResponse = {
+  target: string;
+  text: string;
+  /** 乐观锁版本；后端权威。缺省（旧后端）时前端按空串处理，不参与冲突检测。 */
+  version?: string;
+  charCount?: number;
+  limit?: number;
+};
+
+/** 记忆写入冲突（后端 409：智能体在用户编辑期间改动了记忆）。 */
+export type MemoryConflict = { text: string; version: string; charCount: number; limit: number };
+
+/**
+ * PUT 记忆结果：成功带新 version（更新基线），或 409 冲突数据（触发条目级并入）。
+ * 用判别式 `ok` 分流，让上层无需 catch 也能区分「写成功」与「版本冲突」。
+ */
+export type PutMemoryResult =
+  | { ok: true; version: string; charCount?: number; limit?: number }
+  | { ok: false; conflict: MemoryConflict };
+
 /** 技能列表项（GET /api/skills 的 skills 项）。 */
 export type SkillSummary = {
   name: string;

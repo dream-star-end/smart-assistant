@@ -141,6 +141,13 @@ export const BRIDGE_API_ALLOWLIST: readonly BridgeApiAllowRule[] = [
     proxyFromCommercial: true,
   },
   {
+    // 集合端点:训练 run 列表(找回入口)。精确匹配,不吞 :runId 形态。
+    label: '/api/skill-training',
+    re: /^\/api\/skill-training$/,
+    methods: M('GET'),
+    proxyFromCommercial: true,
+  },
+  {
     label: '/api/skill-training/:runId',
     re: /^\/api\/skill-training\/[A-Za-z0-9_-]+$/,
     methods: M('GET', 'DELETE'),

@@ -1,14 +1,14 @@
 /**
  * Tests for the skill-training Job registry: deterministic tool→phase mapping,
  * monotonic phase advance, proposal counting, terminal transitions, concurrency
- * guard, and durable reload (active runs reconciled to failed after restart).
+ * guard, and durable reload (restart reconciliation: staged drafts → diff_ready, none → failed).
  *
  * Run:
  *   npx tsx --test packages/gateway/src/__tests__/skillTrainJobs.test.ts
  */
 import * as assert from 'node:assert/strict'
 import { existsSync } from 'node:fs'
-import { mkdtemp } from 'node:fs/promises'
+import { mkdir, mkdtemp, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, it } from 'node:test'
@@ -134,7 +134,7 @@ describe('SkillTrainJobStore.applyEvent', () => {
 })
 
 describe('SkillTrainJobStore durability', () => {
-  it('persists run.json and reconciles active runs to failed on reload', async () => {
+  it('persists run.json and reconciles a draftless active run to failed on reload', async () => {
     const store = new SkillTrainJobStore()
     await freshRun(store, 'r-persist')
     await store.applyEvent('r-persist', tool('skill_list'), T0 + 1) // now "running"
@@ -144,7 +144,28 @@ describe('SkillTrainJobStore durability', () => {
     await reloaded.loadAll(T0 + 100)
     const r = reloaded.get('r-persist')
     assert.ok(r)
-    assert.equal(r?.status, 'failed') // was running → reconciled
+    assert.equal(r?.status, 'failed') // running + 无草稿 → 会话没了也没产物,如实 failed
     assert.equal(r?.error, 'gateway restarted during training')
+  })
+
+  it('recovers an active run WITH staged drafts to diff_ready on reload (paid drafts stay mergeable)', async () => {
+    const store = new SkillTrainJobStore()
+    await freshRun(store, 'r-recover', 'deploy-flow')
+    await store.applyEvent('r-recover', tool('skill_propose'), T0 + 1) // running + 1 proposal
+    // 模拟 skill_propose 已落盘的暂存草稿:<runId>/<skill-name>/SKILL.md
+    const draftDir = join(paths.skillDraftRunDir('r-recover'), 'deploy-flow')
+    await mkdir(draftDir, { recursive: true })
+    await writeFile(join(draftDir, 'SKILL.md'), '---\nname: deploy-flow\n---\ndraft body\n')
+
+    const reloaded = new SkillTrainJobStore()
+    await reloaded.loadAll(T0 + 100)
+    const r = reloaded.get('r-recover')
+    assert.ok(r)
+    assert.equal(r?.status, 'diff_ready') // 有草稿 → 与 finalize 同一推导,可继续合并/修订
+    assert.equal(r?.phase, 'diff_ready')
+    assert.equal(r?.proposalCount, 1) // 以盘上草稿数为准
+    assert.equal(r?.error, null)
+    assert.match(r?.summary ?? '', /已恢复暂存草稿/)
+    assert.equal(r?.finishedAt, T0 + 100)
   })
 })

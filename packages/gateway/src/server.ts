@@ -3001,6 +3001,11 @@ export class Gateway {
       )
       return
     }
+    // 集合端点在 :runId 之前精确匹配 —— 训练 run 的找回入口(刷新/重启后 runId 不再只活在前端 state)。
+    if (url.pathname === '/api/skill-training') {
+      this._handleSkillTrainList(req, res).catch((err) => this.sendInternalError(res, err))
+      return
+    }
     const skillTrainRunMatch = url.pathname.match(/^\/api\/skill-training\/([a-zA-Z0-9_-]+)$/)
     if (skillTrainRunMatch) {
       this._handleSkillTrainRun(req, res, skillTrainRunMatch[1]).catch((err) =>
@@ -5342,18 +5347,28 @@ export class Gateway {
         text: store.read(target),
         charCount: store.charCount(target),
         limit: store.charLimit(target),
+        // 乐观并发指纹:UI 拿到后随 PUT 回传,后端锁内重读比对防覆盖并发写入。
+        version: store.version(target),
         target,
       })
       return
     }
     if (req.method === 'PUT') {
-      const body = await this.readJsonBody<{ text?: string }>(req)
-      const r = await store.overwrite(target, body.text ?? '')
+      const body = await this.readJsonBody<{ text?: string; version?: string }>(req)
+      const r = await store.overwrite(target, body.text ?? '', body.version)
+      // 版本冲突(面板打开期间被别的进程写过)→ 409 + 当前盘上内容/版本,交由前端三方合并。
+      if (r.conflict) {
+        return this.sendJson(res, 409, {
+          error: 'memory conflict',
+          conflict: { ...r.conflict, limit: store.charLimit(target) },
+        })
+      }
       if (!r.ok) return this.sendError(res, 400, r.error ?? 'save failed')
       this.sendJson(res, 200, {
         ok: true,
         charCount: store.charCount(target),
         limit: store.charLimit(target),
+        version: store.version(target),
       })
       return
     }
@@ -5968,6 +5983,9 @@ export class Gateway {
       const run = await this.skillEvalJobs.create({
         runId: SkillEvalJobStore.newRunId(),
         skillName: sk.name,
+        // 'default' 即容器内 HTTP 侧的归属权威:商业代理刻意不转发 auth 头
+        // (containerApiProxy FORWARD_REQUEST_HEADERS),getUserId 对代理请求恒为
+        // 'default' —— 后台定时 run 用同值才能过 owner 校验,别改成别的。
         userId: 'default',
         mode: 'baseline',
         model: SKILL_TRAIN_DEFAULT_MODEL,
@@ -6168,6 +6186,14 @@ export class Gateway {
         void this.skillTrainJobs.setStatus(runId, 'failed', Date.now(), String(err))
       })
     this.sendJson(res, 202, { ok: true, runId })
+  }
+
+  // GET /api/skill-training — 当前用户的训练 run 列表(startedAt 降序)。归属权威与
+  // _ownedTrainRun 同一来源(getUserId):runId 不再只活在前端组件 state 里,刷新页面 /
+  // gateway 重启后前端凭此找回 running(续轮询)或 diff_ready(续合并/修订)的 run。
+  private async _handleSkillTrainList(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    if (req.method !== 'GET') return this.sendError(res, 405, 'method not allowed')
+    this.sendJson(res, 200, { runs: this.skillTrainJobs.list(this.getUserId(req)) })
   }
 
   // GET /api/skill-training/:runId — run status. DELETE — discard run + its drafts.

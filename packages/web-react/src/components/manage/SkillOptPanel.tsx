@@ -26,6 +26,7 @@ import {
   fmtCredits,
   type ModelRates,
 } from "../../lib/skillRunCost";
+import { pickResumableTrainRun } from "../../lib/skillTrainReentry";
 import type {
   AuthSession,
   SkillDraftDetail,
@@ -510,6 +511,8 @@ export function SkillTrainSection({
 }) {
   const [err, setErr] = useState<string | null>(null);
   const [runId, setRunId] = useState<string | null>(null);
+  // 刷新/服务重启后找回未处理草稿时的提示条（info，非报错）。
+  const [resumeNotice, setResumeNotice] = useState<string | null>(null);
   const [confirmDialog, confirmDialogEl] = useConfirm();
 
   const trainFetcher = useCallback(
@@ -521,6 +524,31 @@ export function SkillTrainSection({
     [],
   );
   const [run, setRun] = usePollingRun(runId ? trainFetcher : null, isActive);
+
+  // 挂载时从「全部训练 run」里找回本技能未完成/有草稿的 run（runId 原本只存
+  // 组件 state，刷新即失联）。active → 恢复轮询；diff_ready → 恢复 diff 入口 + 提示。
+  // 只补「找回入口」，不改成本披露/合并/放弃流程本身。
+  useEffect(() => {
+    let alive = true;
+    api
+      .listSkillTrainRuns(auth)
+      .then((runs) => {
+        if (!alive) return;
+        const picked = pickResumableTrainRun(runs, skillName);
+        if (!picked) return;
+        setRunId(picked.run.runId);
+        setRun(picked.run); // 立即渲染入口，轮询首拍会刷新为权威态。
+        if (picked.kind === "draft") {
+          setResumeNotice(
+            "发现一个未处理的训练草稿（可能因页面刷新或服务重启中断），可继续查看差异并决定合并/放弃",
+          );
+        }
+      })
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
+  }, [auth, skillName, setRun]);
 
   const start = async () => {
     const trainRange = rates ? estimateTrainRunCredits(rates) : null;
@@ -550,6 +578,7 @@ export function SkillTrainSection({
     });
     if (!ok) return;
     setErr(null);
+    setResumeNotice(null);
     try {
       const r = await api.startSkillTrain(auth, skillName, { autoEval: true });
       setRunId(r.runId);
@@ -565,6 +594,7 @@ export function SkillTrainSection({
     await api.discardSkillTrainRun(auth, runId).catch(() => {});
     setRunId(null);
     setRun(null);
+    setResumeNotice(null);
   };
 
   const PHASE_LABEL: Record<string, string> = {
@@ -581,6 +611,7 @@ export function SkillTrainSection({
     <div className="flex flex-col gap-3">
       {confirmDialogEl}
       {err && <Alert tone="danger">{err}</Alert>}
+      {resumeNotice && <Alert tone="info">{resumeNotice}</Alert>}
 
       {!run && (
         <div className="flex items-start justify-between gap-3">
@@ -628,6 +659,7 @@ export function SkillTrainSection({
               onMergedOrDiscarded={() => {
                 setRunId(null);
                 setRun(null);
+                setResumeNotice(null);
               }}
               confirmDialog={confirmDialog}
             />
