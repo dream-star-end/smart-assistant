@@ -312,6 +312,7 @@ import {
   type UserChatBridgeHandler,
   type BridgeMetricSink,
 } from "./ws/userChatBridge.js";
+import { createFrontendBuildProbe } from "./ws/frontendBuild.js";
 import {
   createVoiceTranscribeHandler,
   type VoiceTranscribeHandler,
@@ -817,6 +818,13 @@ export async function registerCommercial(
      * 生产侧由 cli launcher 显式置 false 让代理上线;dev/CI 不需要。
      */
     skipInternalProxy?: boolean;
+    /**
+     * 版本握手(v5 spa):静态前端 dist 目录。webRoot 的路径决策权威在 cli launcher
+     * (commands/gateway.ts,按 OC_RUNTIME_CHANNEL 分流),此处只透传,不做第二次推导。
+     * 注入后 userChatBridge 会在每个 userWs accept 时下发 `sys.frontend_build` 帧
+     * (见 ws/frontendBuild.ts)。v3 / 测试不传 → 功能整体 inert。
+     */
+    webDistDir?: string;
   } = {},
 ): Promise<RegisterCommercialResult> {
   void app;
@@ -3125,6 +3133,11 @@ export async function registerCommercial(
     resolveContainerEndpoint,
     metrics: bridgeMetrics,
     markContainerActivity: markActivityForBridge,
+    // 版本握手:cli launcher 注入 dist 目录(spa 才有)→ probe 读 index.html 的
+    // oc-build meta;v3/测试 undefined → bridge 不发 sys.frontend_build,零变化。
+    getFrontendBuildId: options.webDistDir
+      ? createFrontendBuildProbe(options.webDistDir)
+      : undefined,
     // 跨 host 容器:bridge 用 node-agent tunnel 拉容器 WS(direct dial 必然 EHOSTUNREACH)。
     // 工厂内部走 mTLS+pin 预拨 + ws.createConnection hijack;maxFrameBytes 与 bridge 默认对齐
     // (factory 内会用同一上限;不显式传则 ws 默认无限,有 OOM 风险)。

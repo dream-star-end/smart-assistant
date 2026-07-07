@@ -18,6 +18,7 @@
 #   scripts/deploy-v5.sh --bootstrap   # 首次:建源码树/HOME/openclaude.json/env/unit + 拷依赖 + 起服务
 #   scripts/deploy-v5.sh               # 增量部署:快照 + rsync 源码 + restart v5 + smoke
 #   scripts/deploy-v5.sh --smoke       # 仅跑 v5 健康/隔离断言
+#   scripts/deploy-v5.sh --dist        # 前端生效面:vite build + 竞态安全 rsync + 资产GC + restart + 版本握手 smoke
 #   scripts/deploy-v5.sh --rollback    # 恢复 .prev.1 + restart
 #   scripts/deploy-v5.sh --rollback=N  # 恢复 .prev.N(N=1..5)+ restart
 #   scripts/deploy-v5.sh --dry-run     # 只打印将执行的动作
@@ -91,6 +92,7 @@ for arg in "$@"; do
     --dry-run) DRY=1 ;;
     --bootstrap) MODE="bootstrap" ;;
     --smoke) MODE="smoke" ;;
+    --dist) MODE="dist" ;;
     --rollback) MODE="rollback"; ROLLBACK_N=1 ;;
     --rollback=*) MODE="rollback"; ROLLBACK_N="${arg#*=}" ;;
     # egress split(2026-07-02):openclaude-v5-egress 持有在飞 LLM 流,默认部署
@@ -295,6 +297,49 @@ deploy() {
   echo "✓ deploy 完成。"
 }
 
+# ───────────────────────── dist:前端生效面(web-react)─────────────────────────
+# dist 被默认 deploy 的 RSYNC_EXCLUDES 排除——前端是独立生效面。本模式收口旧的
+# "手敲 vite build + rsync --delete" 流程(playbook §生效面矩阵同步改),三点语义:
+#   1. 竞态安全:资产**加法**同步(无 --delete)且先资产后根文件 → 新 index.html 永远
+#      只引用已就位的哈希资产,部署窗口内也无 404;旧资产保留给长驻旧 index.html 的
+#      标签页(2026-07-07 07:31 实测 --delete 造成过 404 白屏)。
+#   2. GC:assets 下 mtime +14 天(=14 天未被任何构建重新 ship,rsync -a 保留构建时
+#      间戳)删除,防无限膨胀。
+#   3. restart + 版本握手 smoke:SPA 缓存与 sys.frontend_build 握手都要求 dist 变更后
+#      重启 master(全量 WS 重连 → 客户端拿到新 build id → 安全点软刷新);线上 / 的
+#      oc-build meta 必须等于本地构建值,fail-closed。
+# 回滚:index.html 回滚 = checkout 旧源码重跑 --dist;旧资产 14 天窗口内一直在线。
+deploy_dist() {
+  echo "══ v5 dist deploy(前端生效面)on $KL_HOST ══"
+  echo "── vite build ──"
+  run "(cd '$REPO_ROOT/packages/web-react' && npx vite build)"
+  local dist="$REPO_ROOT/packages/web-react/dist"
+  local build_id=""
+  if [[ "$DRY" != 1 ]]; then
+    build_id="$(grep -o 'name="oc-build" content="[0-9a-f]\{8,32\}"' "$dist/index.html" | grep -o '[0-9a-f]\{8,32\}' | head -1)"
+    [[ -n "$build_id" ]] || { echo "✗ dist/index.html 缺 oc-build meta(vite ocBuildMeta 插件失效?)" >&2; exit 1; }
+    echo "  本地构建 oc-build: $build_id"
+  fi
+  echo "── rsync assets(加法,必须先于根文件)──"
+  run "rsync -az '$dist/assets/' '$KL_HOST:$REMOTE_SRC/packages/web-react/dist/assets/'"
+  echo "── rsync 根文件(--delete,排除 assets)──"
+  run "rsync -az --delete --exclude assets '$dist/' '$KL_HOST:$REMOTE_SRC/packages/web-react/dist/'"
+  echo "── GC:清 14 天未被任何构建 ship 的旧资产 ──"
+  sshk "find '$REMOTE_SRC/packages/web-react/dist/assets' -type f -mtime +14 -delete"
+  echo "── restart openclaude-v5(dist 生效面必重启,版本握手依赖此纪律)──"
+  sshk "systemctl restart $V5_UNIT"
+  run "sleep 4"
+  if [[ "$DRY" != 1 ]]; then
+    smoke
+    echo "── 版本握手 smoke:线上 oc-build == 本地构建(fail-closed)──"
+    local live_id
+    live_id="$(ssh "$KL_HOST" "curl -fsS http://127.0.0.1:${V5_PORT}/" | grep -o 'name="oc-build" content="[0-9a-f]\{8,32\}"' | grep -o '[0-9a-f]\{8,32\}' | head -1)"
+    [[ "$live_id" == "$build_id" ]] || { echo "✗ 线上 oc-build=${live_id:-空} ≠ 本地 $build_id(rsync 目标/静态层缓存有诈)" >&2; exit 1; }
+    echo "  ✓ 线上 oc-build: $live_id"
+  fi
+  echo "✓ dist deploy 完成。"
+}
+
 # ───────────────────────── rollback ─────────────────────────
 rollback() {
   echo "══ v5 rollback ← .prev.$ROLLBACK_N ══"
@@ -310,5 +355,6 @@ case "$MODE" in
   bootstrap) bootstrap ;;
   deploy)    deploy ;;
   smoke)     smoke ;;
+  dist)      deploy_dist ;;
   rollback)  rollback ;;
 esac

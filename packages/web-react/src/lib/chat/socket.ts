@@ -37,6 +37,7 @@ import {
   mergeFullServerWins,
   type StoredSession,
 } from "../persist";
+import { appUpdate } from "../appUpdate";
 import {
   AUTO_CONTINUE_DISPLAY,
   RESTART_CONTINUE_DISPLAY,
@@ -271,6 +272,13 @@ export class ChatSocket {
       browserOnline: this.isBrowserOnline,
       sessions: this.sessions,
     };
+    // 版本握手 busy 探针:任一会话有在飞 turn → 软刷新推迟(governor 每 5s 重估)。
+    // 在飞权威 = _sendingInFlight(团队/委派 turn 同样置位),与 hello/resume 恢复
+    // loading 用的是同一字段,不另造第二真值源。
+    appUpdate.registerBusyProbe(() => {
+      for (const s of this.sessions.values()) if (s._sendingInFlight) return true;
+      return false;
+    });
   }
 
   // ═══════════════ 订阅 ═══════════════
@@ -1067,6 +1075,13 @@ export class ChatSocket {
       case "sys.cold_start": {
         const sess = this.firstSession();
         if (sess) sess._isFirstTurnAfterReady = true;
+        return;
+      }
+      case "sys.frontend_build": {
+        // 版本握手(bridge 在 userWs accept 时发,服务端权威=dist/index.html 的 oc-build meta)。
+        // 全部防无限刷新守卫(形态/目标一次性/冷却/安全点/storage)在 appUpdate governor
+        // 内收口,这里只透传,不允许出现第二套判断。
+        appUpdate.onServerBuild((f as { build?: unknown }).build);
         return;
       }
       case "sys.relay_ready": {

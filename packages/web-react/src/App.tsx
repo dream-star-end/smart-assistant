@@ -9,6 +9,7 @@ import { extractLatestTodos, PinnedTaskTracker } from "./components/chat/PinnedT
 import { deriveActivePlanStep, type TurnActivityInfo } from "./components/chat/TurnActivity";
 import { EmptyState } from "./components/EmptyState";
 import { type ChatError, ErrorBanner } from "./components/ErrorBanner";
+import { UpdateBanner } from "./components/UpdateBanner";
 import { GithubRepoModal } from "./components/github/GithubRepoModal";
 import { RepoStatusBanner } from "./components/github/RepoStatusBanner";
 import { InboxDialog } from "./components/InboxDialog";
@@ -1206,6 +1207,8 @@ export function App() {
               <Alert tone={connBanner.tone}>{connBanner.text}</Alert>
             </div>
           )}
+          {/* 版本更新横幅:仅 governor 判定不能自动软刷时出现(自动刷成功的用户无感)。*/}
+          {!demo && <UpdateBanner />}
           {chatError && (
             <ErrorBanner
               error={chatError}
