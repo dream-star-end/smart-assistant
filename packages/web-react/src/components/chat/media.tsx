@@ -6,8 +6,9 @@
  * 多张卡 / 多次重渲反复签名。深层组件（用户卡媒体格、markdown 行内图）经 useSignedSrc /
  * <Media> 主动 effect 签名，替代"占位永停"。
  */
+import * as Dialog from "@radix-ui/react-dialog";
 import { createContext, useCallback, useContext, useEffect, useRef, useState } from "react";
-import { AlertCircle, Download, FileText, RotateCcw, X } from "lucide-react";
+import { AlertCircle, Download, ExternalLink, FileText, RotateCcw, X } from "lucide-react";
 import type { MediaRef } from "../../lib/chat/frames";
 import { classifyMediaRef, isContainerPath, type ResolvedMedia } from "../../lib/chat/media";
 import {
@@ -141,6 +142,70 @@ export function useSignedSrc(src: string | null | undefined): {
   return { url, onError };
 }
 
+/**
+ * 可放大图片(共享灯箱):点击开全屏预览(2026-07-07 boss 反馈"agent 响应的图表
+ * 不支持放大")。覆盖 assistant 响应里图片的两条渲染路径 —— markdown 行内 <img>
+ * (SignedImg)与媒体附件卡(MediaItem image)。灯箱内提供"新标签打开原图"
+ * (移动端可借浏览器原生缩放细看图表)。Composer 的附件灯箱是上传预览语义,独立保留。
+ */
+export function ZoomableImage({
+  src,
+  alt,
+  imgClassName,
+  onError,
+}: {
+  src: string;
+  alt: string;
+  /** 缩略态 <img> 的样式(灯箱内恒全尺寸 object-contain)。 */
+  imgClassName?: string;
+  onError?: React.ReactEventHandler<HTMLImageElement>;
+}) {
+  const [open, setOpen] = useState(false);
+  return (
+    <>
+      <button
+        type="button"
+        aria-label={`放大查看${alt ? ` ${alt}` : "图片"}`}
+        onClick={() => setOpen(true)}
+        className="block max-w-full cursor-zoom-in rounded-lg outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg"
+      >
+        <img src={src} alt={alt} loading="lazy" onError={onError} className={imgClassName} />
+      </button>
+      <Dialog.Root open={open} onOpenChange={setOpen}>
+        <Dialog.Portal>
+          <Dialog.Overlay className="fixed inset-0 z-50 bg-black/70 backdrop-blur-sm data-[state=open]:animate-fade" />
+          <Dialog.Content
+            aria-describedby={undefined}
+            className="fixed left-1/2 top-1/2 z-50 max-h-[92vh] max-w-[94vw] -translate-x-1/2 -translate-y-1/2 focus:outline-none"
+          >
+            <Dialog.Title className="sr-only">{alt || "图片预览"}</Dialog.Title>
+            <img src={src} alt={alt} className="max-h-[88vh] max-w-[94vw] rounded-lg object-contain shadow-float" />
+            <div className="mt-2 flex items-center justify-center gap-3">
+              <a
+                href={src}
+                target="_blank"
+                rel="noreferrer"
+                className="flex items-center gap-1 rounded-full bg-surface px-3 py-1 text-xs font-medium text-fg no-underline shadow-float transition-colors hover:bg-hover"
+              >
+                <ExternalLink size={12} /> 新标签打开原图
+              </a>
+            </div>
+            <Dialog.Close asChild>
+              <button
+                type="button"
+                aria-label="关闭预览"
+                className="absolute -right-2 -top-2 flex size-8 items-center justify-center rounded-full bg-surface text-fg shadow-float outline-none transition-colors hover:bg-hover focus-visible:ring-2 focus-visible:ring-ring"
+              >
+                <X size={16} />
+              </button>
+            </Dialog.Close>
+          </Dialog.Content>
+        </Dialog.Portal>
+      </Dialog.Root>
+    </>
+  );
+}
+
 /** markdown 行内 <img>：容器路径主动签名后渲染，否则直渲。签不出时显示替代文本。 */
 export function SignedImg(props: React.ImgHTMLAttributes<HTMLImageElement>) {
   const { src, alt, ...rest } = props;
@@ -152,8 +217,14 @@ export function SignedImg(props: React.ImgHTMLAttributes<HTMLImageElement>) {
       </span>
     );
   }
-  // biome-ignore lint/a11y/useAltText: alt 经 props 透传
-  return <img src={resolved} alt={alt || ""} loading="lazy" onError={onError} {...rest} />;
+  return (
+    <ZoomableImage
+      src={resolved}
+      alt={typeof alt === "string" ? alt : ""}
+      onError={onError}
+      imgClassName={typeof rest.className === "string" ? rest.className : undefined}
+    />
+  );
 }
 
 /** markdown 行内 <video>：容器路径签名后渲染（rehypeEmbedMedia 把媒体路径行内码转成 video 节点用）。 */
@@ -393,15 +464,12 @@ function MediaItem({ item }: { item: ResolvedMedia }) {
   }
   if (item.kind === "image") {
     return (
-      <a href={url} target="_blank" rel="noreferrer" className="block">
-        <img
-          src={url}
-          alt={item.filename || "图片"}
-          loading="lazy"
-          onError={onError}
-          className="max-h-72 max-w-full rounded-lg border border-border object-contain"
-        />
-      </a>
+      <ZoomableImage
+        src={url}
+        alt={item.filename || "图片"}
+        onError={onError}
+        imgClassName="max-h-72 max-w-full rounded-lg border border-border object-contain"
+      />
     );
   }
   if (item.kind === "video") {

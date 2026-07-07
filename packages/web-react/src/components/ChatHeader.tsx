@@ -106,7 +106,8 @@ export function ChatHeader({
               className="flex shrink-0 items-center gap-1 rounded-full bg-accent-soft px-2 py-0.5 text-[11px] font-medium text-accent outline-none transition-colors hover:bg-accent/15 focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg active:scale-[0.98]"
             >
               <Users size={11} className="shrink-0" />
-              团队模式
+              {/* 移动端只留图标(选择器同排还有引擎标签,文案冗余挤爆头部);sm+ 显示全称。 */}
+              <span className="hidden sm:inline">团队模式</span>
             </button>
           </PopoverTrigger>
           <PopoverContent>
