@@ -199,8 +199,15 @@ COPY --chown=root:root ./runtime/oc-rank.sh /usr/local/bin/oc-rank
 # 文档见 office-spreadsheet / office-pdf baseline skill。
 COPY --chown=root:root ./runtime/oc-xlsx.py /usr/local/bin/oc-xlsx
 COPY --chown=root:root ./runtime/oc-pdf.sh /usr/local/bin/oc-pdf
+# oc-vision: 识图 CLI(纯文本模型看图兜底,复用 mcpVisionServer 核心 / 默认 MiniMax-M3
+# 后端)。取代已退役的常驻 openclaude-vision MCP stdio server。文档见 oc-vision baseline skill。
+COPY --chown=root:root ./runtime/oc-vision.sh /usr/local/bin/oc-vision
+# oc-memory: 长期记忆 CLI(Core/Recall/Archival 三层,复用 mcp-memory memoryTools 核心)。
+# 取代常驻 openclaude_memory MCP 里的 memory/session_search/archival_* 工具(常驻 stdio
+# 传输脆弱 → codex 死等)。delegate/cron/skill 仍留 MCP。文档见 memory-management baseline skill。
+COPY --chown=root:root ./runtime/oc-memory.sh /usr/local/bin/oc-memory
 RUN set -eux; \
-    chmod 0755 /usr/local/bin/oc-docx /usr/local/bin/oc-minimax /usr/local/bin/oc-web-context /usr/local/bin/oc-web /usr/local/bin/oc-browser /usr/local/bin/oc-market /usr/local/bin/oc-lit /usr/local/bin/oc-cite /usr/local/bin/oc-ingest /usr/local/bin/oc-litrag /usr/local/bin/oc-report /usr/local/bin/oc-slides /usr/local/bin/oc-poster /usr/local/bin/oc-rank /usr/local/bin/oc-xlsx /usr/local/bin/oc-pdf /usr/local/lib/openclaude/create-docgen-reference.py; \
+    chmod 0755 /usr/local/bin/oc-docx /usr/local/bin/oc-minimax /usr/local/bin/oc-web-context /usr/local/bin/oc-web /usr/local/bin/oc-browser /usr/local/bin/oc-market /usr/local/bin/oc-lit /usr/local/bin/oc-cite /usr/local/bin/oc-ingest /usr/local/bin/oc-litrag /usr/local/bin/oc-report /usr/local/bin/oc-slides /usr/local/bin/oc-poster /usr/local/bin/oc-rank /usr/local/bin/oc-xlsx /usr/local/bin/oc-pdf /usr/local/bin/oc-vision /usr/local/bin/oc-memory /usr/local/lib/openclaude/create-docgen-reference.py; \
     ln -sf /usr/local/bin/oc-minimax /usr/local/bin/mmx; \
     python3 /usr/local/lib/openclaude/create-docgen-reference.py /usr/local/share/openclaude-docgen/reference.docx; \
     printf '%s\n' '# DOCX smoke' 'Inline $a^2+b^2=c^2$.' '' '$$' 'E = mc^2' '$$' > /tmp/oc-docx-smoke.md; \

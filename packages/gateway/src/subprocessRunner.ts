@@ -7,11 +7,6 @@ import { type McpServerConfig, type OpenClaudeConfig, paths } from '@openclaude/
 import { createLogger } from './logger.js'
 import { isV3ContainerRuntime, resolveHostStaticProviderEnv } from './hostStaticProviders.js'
 import type { StaticProviderKeys } from '@openclaude/protocol'
-import {
-  OPENCLAUDE_VISION_MCP_ID,
-  OPENCLAUDE_VISION_TOOLS,
-  shouldEnableOpenClaudeVision,
-} from './mcpVisionServer.js'
 import { modelHintAppliedTotal } from './metrics.js'
 import { buildPromptContext } from './promptSlots.js'
 import type { ExecutionTarget } from './remoteTarget.js'
@@ -1248,25 +1243,13 @@ export class SubprocessRunner extends EventEmitter {
         if (ids) for (const id of ids) allowedMcpIds.add(id)
       }
       // Built-in 平台 MCP **总是豁免 toolset 过滤**(各自有独立 gating):
-      //   - openclaude-memory:总开;
-      //   - openclaude-vision:由 shouldEnableOpenClaudeVision 控制(纯文本模型 understand_image)。
-      // 注:vision 之前漏了这行,导致**有 toolset 的 agent(如 main/全能助手 core toolset)拿不到
-      // understand_image** —— 纯文本模型上传图被 strip 后又没工具兜底,表现为"不支持图片识别"。
+      //   - openclaude-memory:总开。
+      // (vision 已从 MCP 迁到 oc-vision CLI / baseline skill,不再作为内置 MCP 注入。)
       allowedMcpIds.add('openclaude-memory')
-      allowedMcpIds.add(OPENCLAUDE_VISION_MCP_ID)
     }
-    const openClaudeVisionAllowed =
-      shouldEnableOpenClaudeVision(effectiveProvider, this.opts.model) &&
-      (!allowedMcpIds || allowedMcpIds.has(OPENCLAUDE_VISION_MCP_ID))
-    const openClaudeVisionEntry = openClaudeVisionAllowed
-      ? resolveOpenClaudeVisionEntry(this.opts.config.auth.claudeCodePath)
-      : null
     const availableMcpTools = new Set<string>()
     const addAvailableTools = (tools?: readonly string[]) => {
       for (const tool of tools ?? []) availableMcpTools.add(tool)
-    }
-    if (openClaudeVisionEntry) {
-      addAvailableTools(OPENCLAUDE_VISION_TOOLS)
     }
     for (const srv of this.opts.config.mcpServers ?? []) {
       if (srv.enabled === false) continue
@@ -1399,23 +1382,10 @@ export class SubprocessRunner extends EventEmitter {
       // Toolset filter: if agent has toolsets configured, only include MCPs
       // whose id appears in at least one of the agent's toolset definitions.
 
-      // Built-in: openclaude-vision. This gives DeepSeek (and explicitly
-      // opted-in text-only providers) an understand_image tool without
-      // routing native multimodal providers through a Codex fallback.
-      if (openClaudeVisionAllowed) {
-        if (openClaudeVisionEntry) {
-          mcpServers[OPENCLAUDE_VISION_MCP_ID] = {
-            type: 'stdio',
-            command: 'npx',
-            args: ['tsx', openClaudeVisionEntry],
-            env: buildOpenClaudeVisionMcpEnv(this.opts.agentId),
-          }
-        } else {
-          runnerLog.warn('openclaude-vision entry not found, skipping built-in MCP', {
-            sessionKey: this.opts.sessionKey,
-          })
-        }
-      }
+      // Built-in vision (openclaude-vision) retired from the MCP path → oc-vision
+      // CLI + baseline skill (same MiniMax-M3 backend, no long-lived stdio
+      // transport that can die and hang the turn). Text-only models discover it
+      // via the skill index + the vision prompt hint (see promptSlots/server).
 
       // Layer 1 + 2: Global MCPs
       for (const srv of this.opts.config.mcpServers ?? []) {

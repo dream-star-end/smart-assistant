@@ -10016,7 +10016,7 @@ export class Gateway {
         let step = 1
         if (hasUnderstandImage) {
           lines.push(
-            `${step}. 优先调用 \`understand_image\` MCP 工具,传图片的**本地文件路径**作为 \`image_file\` 参数。`,
+            `${step}. 优先用 Bash 调 \`oc-vision understand <图片本地绝对路径> --prompt "<问题>"\` 命令识图(纯文本模型看不到图时的兜底;细节见 \`skill_view("oc-vision")\`)。`,
           )
           step++
         }

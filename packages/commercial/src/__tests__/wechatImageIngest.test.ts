@@ -106,8 +106,7 @@ describe("wechat image ingest save", () => {
       assert.match(result.images[0]!.containerPath, /^\/home\/agent\/\.openclaude\/uploads\/wechat-/);
       assert.deepEqual(readFileSync(join(dir, result.images[0]!.filename)), JPG);
       assert.match(result.promptText, /这图讲了啥/);
-      assert.match(result.promptText, /understand_image/);
-      assert.match(result.promptText, /image_file/);
+      assert.match(result.promptText, /oc-vision understand/);
       assert.match(result.promptText, /不要说用户没有上传图片/);
     } finally {
       rmSync(dir, { recursive: true, force: true });

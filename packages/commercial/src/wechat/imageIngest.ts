@@ -374,7 +374,7 @@ function buildWechatImagePrompt(text: string | undefined, images: SavedWechatIma
   }
   lines.push(
     "",
-    "请先调用 `understand_image` MCP 工具，传 `image_file` 为上述本地路径，再基于图片内容回答。不要说用户没有上传图片。",
+    '如果你看不到图片内容，先用 Bash 调 `oc-vision understand <上述本地路径> --prompt "<问题>"` 命令识图，再基于返回内容回答。不要说用户没有上传图片。',
   );
   return lines.join("\n");
 }
@@ -392,7 +392,7 @@ function buildWechatMediaPrompt(text: string | undefined, media: SavedWechatMedi
     }
   }
   if (media.some((m) => m.kind === "image")) {
-    lines.push("", "图片请先调用 `understand_image` MCP 工具，传 `image_file` 为图片本地路径，再基于图片内容回答。不要说用户没有上传图片。");
+    lines.push("", '图片如果你看不到内容，先用 Bash 调 `oc-vision understand <图片本地路径> --prompt "<问题>"` 命令识图，再基于返回内容回答。不要说用户没有上传图片。');
   }
   if (media.some((m) => m.kind !== "image")) {
     lines.push("", "对于文件、视频或音频/语音，请优先基于上述本地路径进行读取、检查或转写；如果当前模型/工具无法直接解析某种媒体，请明确告诉用户已收到该附件并说明可行的下一步，而不是说没有收到附件。");

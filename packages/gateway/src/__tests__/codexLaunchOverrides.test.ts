@@ -118,11 +118,21 @@ describe('CODEX_PREAMBLE', () => {
   it('mentions openclaude_memory MCP server as the canonical access path', () => {
     assert.ok(
       CODEX_PREAMBLE.includes('openclaude_memory'),
-      'preamble must name the MCP server',
+      'preamble must name the MCP server (skills / scheduling / agents still live there)',
+    )
+    // Phase 2: memory / session-search / archival moved OFF the MCP server onto
+    // the one-shot `oc-memory` CLI. The preamble must route memory ops there.
+    assert.ok(
+      CODEX_PREAMBLE.includes('oc-memory memory --action'),
+      'preamble must document the oc-memory CLI for Core memory',
     )
     assert.ok(
-      CODEX_PREAMBLE.includes('memory(action, target, content/needle)'),
-      'preamble must document the actual memory tool schema',
+      CODEX_PREAMBLE.includes('oc-memory session-search'),
+      'preamble must document the oc-memory CLI for session recall',
+    )
+    assert.ok(
+      CODEX_PREAMBLE.includes('oc-memory archival-add'),
+      'preamble must document the oc-memory CLI for archival memory',
     )
     assert.ok(CODEX_PREAMBLE.includes('skill_search'), 'preamble must mention skill_search')
     for (const tool of [
@@ -431,7 +441,7 @@ describe('buildCodexLaunchOverrides', () => {
     assert.ok(out.argvOverrides.length >= 2)
   })
 
-  it('mounts openclaude-vision for Codex without leaking the v3 container token into argv', async () => {
+  it('不再注入 openclaude-vision MCP(已迁 oc-vision CLI):argv 无 vision 块、token 字段空', async () => {
     const { buildCodexLaunchOverrides } = await import('../codexLaunchOverrides.js')
     const TOKEN = 'container-token-MUST-NOT-LEAK'
     await withEnv(
@@ -449,20 +459,20 @@ describe('buildCodexLaunchOverrides', () => {
           gatewayPort: 18789,
           gatewayToken: 'gateway-token',
         })
-        const visionEnv = out.argvOverrides.find((s) =>
-          s.startsWith('mcp_servers.openclaude-vision.env='),
+        // vision MCP 注入已删:argv 里不应再出现任何 openclaude-vision 块。
+        assert.ok(
+          !out.argvOverrides.some((s) => s.startsWith('mcp_servers.openclaude-vision')),
+          'openclaude-vision MCP override 应已移除',
         )
-        assert.ok(visionEnv, 'expected openclaude-vision MCP env override')
-        assert.ok(visionEnv!.includes('OPENCLAUDE_V3_CONTAINER_TOKEN_FILE'))
-        assert.ok(visionEnv!.includes(`${dir}/v3-container-token`))
-        assert.ok(!visionEnv!.includes(TOKEN), 'argv must not contain container token literal')
-        assert.ok(!/"OPENCLAUDE_V3_CONTAINER_TOKEN"\s*=/.test(visionEnv!))
+        // 迁移后 vision token 不再随 codex 注入,字段恒空(死字段,待清理批次连同 MCP 包装删)。
+        assert.ok(out.visionTokenFile == null)
+        assert.ok(out.visionTokenContent == null)
+        // 容器 token 绝不泄漏进 argv(memory 注入仍走 tokenFile,不含 literal)。
         for (const arg of out.argvOverrides) {
           assert.ok(!arg.includes(TOKEN), `argv leaked token in: ${arg}`)
         }
-        assert.equal(out.visionTokenFile, `${dir}/v3-container-token`)
-        assert.equal(out.visionTokenContent, TOKEN)
-        assert.match(out.instructionsContent, /GPT\/Codex 图片理解提示/)
+        // gpt-5.5 原生多模态:不再发 GPT/Codex 识图提示(shouldEnableOpenClaudeVision=false)。
+        assert.doesNotMatch(out.instructionsContent, /GPT\/Codex 图片理解提示/)
       },
     )
   })

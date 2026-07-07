@@ -855,7 +855,7 @@ export const runMinimaxVisionForTest = runMinimaxVision
 // backend 路由:默认 MiniMax-M3(boss 2026-06-17);OPENCLAUDE_VISION_BACKEND=codex 时走 gpt-5.5。
 // **不做自动 fallback**:minimax 业务错误(4xx/余额/413)不绕到 codex(避免绕过 authz/计费语义),
 // 直接把错误返回给调用方模型。
-async function runVision(input: ResolvedVisionInput): Promise<string> {
+export async function runVision(input: ResolvedVisionInput): Promise<string> {
   return visionBackend() === 'codex' ? runCodexVision(input) : runMinimaxVision(input)
 }
 

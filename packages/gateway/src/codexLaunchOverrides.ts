@@ -52,8 +52,10 @@ const overridesLog = createLogger({ module: 'codexLaunchOverrides' })
 //     Codex must rely on its own tool/MCP list for what it can actually call.
 //   - Explicit instruction to NOT use codex's native memory subsystem: codex
 //     has its own `~/.codex/memories/` phase1/phase2 LLM-backed writer that
-//     would silently fork-out a parallel memory store; we route everything
-//     through `openclaude_memory` MCP to keep one source of truth.
+//     would silently fork-out a parallel memory store; we route memory through
+//     the `oc-memory` CLI (Phase 2 — moved off the openclaude_memory MCP) and
+//     skills/scheduling/agents through the `openclaude_memory` MCP, keeping one
+//     source of truth.
 const CODEX_PREAMBLE = `# OpenClaude Platform Context (codex adapter)
 
 You are running inside the OpenClaude platform as a codex-backed agent. The
@@ -63,21 +65,31 @@ take precedence over any default codex personality.
 
 ## How the OpenClaude memory / skill / scheduling system reaches you
 
-Use the **\`openclaude_memory\`** MCP server. Its tools are your access path:
+Two access paths, split by tool:
 
-- \`memory(action, target, content/needle)\` — read/append/update short Core memory.
-- \`archival_search\` / \`archival_add\` / \`archival_delete\` — long-form notes.
+**Long-term memory → run the \`oc-memory\` CLI in your shell** (a one-shot
+command; there is no memory MCP tool):
+
+- \`oc-memory memory --action <add|replace|remove|read> --target <memory|user> [--content "..."] [--needle "..."]\` — short Core memory (MEMORY.md / USER.md).
+- \`oc-memory session-search "<query>" [--limit N] [--summarize]\` — recall prior conversations.
+- \`oc-memory archival-add "<text>" [--tags a,b]\` / \`oc-memory archival-search "<query>"\` / \`oc-memory archival-delete <id>\` — long-form notes (unlimited, search-only).
+
+See the \`memory-management\` skill for details.
+
+**Skills, scheduling and sibling agents → the \`openclaude_memory\` MCP server**
+(these ARE MCP tools):
+
 - \`skill_search\` / \`skill_list\` / \`skill_view\` / \`skill_save\` / \`skill_delete\` — platform skills.
-- \`session_search\` — recall prior conversations.
 - \`create_reminder\` / \`list_reminders\` / \`update_reminder\` / \`delete_reminder\` — manage scheduled reminders/tasks.
 - \`delegate_task\` (sync) / \`send_to_agent\` (async) — talk to sibling agents.
 
 Do **not** read OR write codex's built-in \`~/.codex/memories/\` or
 \`~/.codex/skills/\` to manage platform state — those are codex-private and
-would fork the source of truth. Always go through the \`openclaude_memory\`
-MCP tools above. (The only exception is if the user *explicitly* asks you to
-inspect a codex-native rollout file — and even then, do not migrate that
-content into a parallel store.)
+would fork the source of truth. Always go through the \`oc-memory\` CLI (memory)
+and the \`openclaude_memory\` MCP tools (skills / scheduling / agents) above.
+(The only exception is if the user *explicitly* asks you to inspect a
+codex-native rollout file — and even then, do not migrate that content into a
+parallel store.)
 
 For reusable workflows, be proactive: after a complex multi-step task, call
 \`skill_search\` to check existing coverage, then \`skill_save\` to create or
@@ -311,12 +323,10 @@ export async function buildCodexLaunchOverrides(
   // because that file is provider-agnostic and shouldn't carry adapter
   // concerns — keeping it here means promptSlots stays clean and the codex
   // adapter can evolve without touching the slot pipeline.
-  const openClaudeVisionEntry =
-    process.env.OPENCLAUDE_VISION_MCP_DISABLED === '1'
-      ? null
-      : resolveOpenClaudeVisionEntry(ctx.claudeCodePath)
-  // web-context retired from the codex MCP path → oc-web CLI (baseline skill).
-  const availableMcpTools = [...(openClaudeVisionEntry ? ['understand_image'] : [])]
+  // vision retired from the codex MCP path → oc-vision CLI (baseline skill),
+  // same as web-context/browser. No MCP tool is injected on the codex path now;
+  // mcp-memory below is the only remaining codex-side MCP server.
+  const availableMcpTools: string[] = []
   const platformResult = await buildPromptContext({
     agentId: ctx.agentId,
     persona: ctx.persona,
@@ -359,8 +369,6 @@ export async function buildCodexLaunchOverrides(
   const mcpEntry = resolveMcpMemoryEntry(ctx.claudeCodePath)
   let tokenFile: string | null = null
   let tokenContent: string | null = null
-  let visionTokenFile: string | null = null
-  let visionTokenContent: string | null = null
   if (mcpEntry) {
     // v3 hardening: the gateway token NEVER lands in argv. Instead, we point
     // mcp-memory at a 0600 file via OPENCLAUDE_GATEWAY_TOKEN_FILE; the caller
@@ -394,35 +402,16 @@ export async function buildCodexLaunchOverrides(
     )
   }
 
-  if (openClaudeVisionEntry) {
-    const rawContainerToken = process.env.OPENCLAUDE_V3_CONTAINER_TOKEN?.trim()
-    if (rawContainerToken) {
-      visionTokenFile = resolve(ctx.sessionDir, 'v3-container-token')
-      visionTokenContent = rawContainerToken
-    }
-    argvOverrides.push(
-      '-c',
-      `mcp_servers.openclaude-vision.command=${tomlValue('npx')}`,
-      '-c',
-      `mcp_servers.openclaude-vision.args=${tomlValue(['tsx', openClaudeVisionEntry])}`,
-      '-c',
-      `mcp_servers.openclaude-vision.env=${tomlValue(
-        buildOpenClaudeVisionMcpEnv(ctx.agentId, {
-          containerTokenFile: visionTokenFile ?? undefined,
-        }),
-      )}`,
-      '-c',
-      `mcp_servers.openclaude-vision.default_tools_approval_mode=${tomlValue('approve')}`,
-    )
-  }
-
   return {
     instructionsFile,
     instructionsContent,
     tokenFile,
     tokenContent,
-    visionTokenFile,
-    visionTokenContent,
+    // vision MCP retired → oc-vision CLI (baseline skill); no vision token is
+    // written on the codex path anymore. Fields kept on the interface (always
+    // null) until the codex vision-token plumbing is fully removed.
+    visionTokenFile: null,
+    visionTokenContent: null,
     argvOverrides,
   }
 }
