@@ -33,6 +33,8 @@ export type OrgMembershipBrief = {
   role: OrgRole;
   status: OrgStatus;
   billing_enabled: boolean;
+  /** 财务委派(三期 P3.1):owner 授予后可执行组织计费写操作(充值/订阅/加席/发票)。缺省 false。 */
+  billing_delegate?: boolean;
 };
 
 /**
@@ -922,6 +924,12 @@ export type OrgMember = {
   org_role: OrgRole;
   status: "active" | "suspended";
   billing_enabled: boolean;
+  /** 财务委派标志(三期):仅 owner 可授予/回收。 */
+  billing_delegate: boolean;
+  /** 月度组织用量限额(积分,字符串大数;null=不限)。admin 可改。 */
+  monthly_org_budget: string | null;
+  /** 本月(Asia/Shanghai 自然月)该成员消耗的组织资金(积分,字符串大数)。 */
+  month_org_spent: string;
   user_status: string;
   invited_by: string | null;
   joined_at: string;

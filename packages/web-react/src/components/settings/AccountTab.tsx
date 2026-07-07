@@ -119,11 +119,16 @@ export function AccountTab({
           <div className="flex items-center gap-1.5 text-[12px] text-faint">
             <Building2 size={13} /> 我的组织
           </div>
-          <div className="mt-1 flex items-center gap-2">
+          <div className="mt-1 flex flex-wrap items-center gap-2">
             <span className="text-[16px] font-semibold text-fg">{org.name}</span>
             <span className="rounded-full bg-hover px-2 py-0.5 text-[11px] font-medium text-muted">
               {orgRoleLabel}
             </span>
+            {org.billing_delegate && (
+              <span className="rounded-full bg-accent-soft px-2 py-0.5 text-[11px] font-medium text-accent">
+                财务委派
+              </span>
+            )}
           </div>
           {org.status === "suspended" ? (
             <Alert tone="warning" className="mt-2 text-[12.5px]">

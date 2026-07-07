@@ -983,6 +983,15 @@ export function App() {
             setAuthMode("login");
             setView("app");
           }}
+          onCreateOrg={() => {
+            // 「创建组织」深链(/?panel=org 等价):置 org 打开态 → 进 app。
+            // 未登录 → AuthGate(login 模式,与深链默认一致);登录后工作区渲染即呈现
+            // OrgCenter(无 org→向导 / 有 org→正常视图);useAppRoute 会把 orgOpen 镜像回
+            // ?panel=org。已登录用户不经此路径(booted authed 已在 app 视图)。
+            setAuthMode("login");
+            setOrgOpen(true);
+            setView("app");
+          }}
           theme={theme}
           onCycleTheme={cycle}
         />

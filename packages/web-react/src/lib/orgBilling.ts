@@ -1,7 +1,7 @@
 // 企业版席位订阅纯函数层(二期 P3.1)—— 唯一权威源,供 api.ts 适配、组件计价、单测复用。
 // 全程字符串 / BigInt,绝不数值化大数(每席价分 / 每席积分 / 期内池)。无 React 依赖,可纯测。
 
-import type { OrgPlan, OrgSubscriptionView } from "./types";
+import type { OrgPlan, OrgRole, OrgSubscriptionView } from "./types";
 
 /** 容错读字符串大数:number/bigint 转字符串,其余回落默认值。 */
 function readStr(v: unknown, d = "0"): string {
@@ -126,6 +126,55 @@ export function seatsUsage(
   const cap = Number.isFinite(maxMembers) && maxMembers > 0 ? Math.floor(maxMembers) : 0;
   const total = subscription ? Math.min(subscription.seats, cap || subscription.seats) : cap;
   return { used, total, full: total > 0 && used >= total };
+}
+
+/**
+ * 组织计费写面门控(三期,唯一权威源)——供 OrgCenter 派生 + 单测复用。
+ * owner 恒可;billing_delegate 被授予者亦可。覆盖充值/订阅/加席/发票写。
+ * 后端鉴权仍是权威(降权窗口 403 由 UI 兜底 toast);此函数只决定按钮可见性。
+ */
+export function canManageOrgBilling(
+  role: OrgRole | null | undefined,
+  billingDelegate: boolean | null | undefined,
+): boolean {
+  return role === "owner" || billingDelegate === true;
+}
+
+/**
+ * 成员月度限额展示态(三期,纯函数)。budget=null → 不限(hasBudget=false)。
+ * pct 供进度条(0–100);over=已用达/超预算(预算>0 时);remaining=剩余额度(floor 0,字符串大数)。
+ * 全 BigInt,绝不数值化大数。
+ */
+export function budgetView(
+  budget: string | null,
+  spent: string,
+): { hasBudget: boolean; pct: number; over: boolean; remaining: string } {
+  const b = budget == null ? null : safeBig(budget);
+  const s = safeBig(spent);
+  if (b == null || b <= 0n) {
+    // null=不限;预算 ≤0 亦视为不限的宽松展示(后端 0 语义由其定义,这里不硬扣)。
+    return { hasBudget: false, pct: 0, over: false, remaining: "0" };
+  }
+  const rem = b - s;
+  return {
+    hasBudget: true,
+    pct: ratioPct(spent, budget as string),
+    over: s >= b,
+    remaining: (rem > 0n ? rem : 0n).toString(),
+  };
+}
+
+/**
+ * 落地页锚点价:企业档中最低「每席价」→ 整元字符串(去分,"起"锚点无需精确到分)。
+ * 无有效档 / 全 0 → null(调用方静态兜底文案,不硬编码全价)。
+ */
+export function minSeatPriceYuan(plans: OrgPlan[]): string | null {
+  let min: bigint | null = null;
+  for (const p of plans) {
+    const c = safeBig(p.seatPriceCents);
+    if (c > 0n && (min == null || c < min)) min = c;
+  }
+  return min == null ? null : (min / 100n).toString();
 }
 
 /** 占比百分数(0–100,BigInt 精确,仅用于进度条宽度)。whole ≤ 0 → 0;part ≥ whole → 100。 */

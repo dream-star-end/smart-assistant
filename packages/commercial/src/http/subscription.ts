@@ -29,15 +29,41 @@ import {
   getUserSubscriptionView,
   listSubscriptionPlans,
 } from "../billing/subscription.js";
+import { listOrgSubscriptionPlans } from "../org/orgSubscriptions.js";
 import { getBalanceBreakdown } from "../billing/spend.js";
 import { createPackOrder, createSubscriptionOrder } from "../payment/orders.js";
 import { HupijiaoError } from "../payment/hupijiao/client.js";
 
 // ─── GET /api/subscription/plans ─────────────────────────────────────────
+// 公开档位数据(定价本就是公开信息)。?scope=user(默认,向后兼容)| org。
+// scope=org 返回企业席位档(含 min_seats),供落地页「创建组织」向导读取(§17.1)。
+// org 档单一权威 = org/orgSubscriptions.ts:listOrgSubscriptionPlans(scope='org' 分区)。
 export async function handleListSubscriptionPlans(
-  _req: IncomingMessage,
+  req: IncomingMessage,
   res: ServerResponse,
 ): Promise<void> {
+  const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "x.invalid"}`);
+  const scope = url.searchParams.get("scope") === "org" ? "org" : "user";
+
+  if (scope === "org") {
+    const plans = await listOrgSubscriptionPlans();
+    sendJson(res, 200, {
+      ok: true,
+      data: {
+        plans: plans.map((p) => ({
+          code: p.code,
+          name: p.name,
+          price_cents: p.priceCents.toString(),
+          monthly_credits: p.monthlyCredits.toString(),
+          period_days: p.periodDays,
+          tier: p.tier,
+          min_seats: p.minSeats,
+        })),
+      },
+    });
+    return;
+  }
+
   const plans = await listSubscriptionPlans();
   sendJson(res, 200, {
     ok: true,

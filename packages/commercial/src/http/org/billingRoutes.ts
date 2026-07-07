@@ -3,9 +3,9 @@
  *
  * 路由(minRole 由分发器 requireOrgRole 统一先跑;org 从 caller membership 推导,
  * 不接受客户端传 org_id,防 IDOR):
- *   POST /api/org/topup        (owner)  → 建 org 充值单 + 二维码(§14 admin→owner 收紧)
- *   POST /api/org/subscribe    (owner)  → 建 org 订阅/续费单 + 二维码
- *   POST /api/org/seats        (owner)  → 建 org 加席单 + 二维码
+ *   POST /api/org/topup     (billing) → 建 org 充值单 + 二维码(§14 收紧 + §17.3 财务委派)
+ *   POST /api/org/subscribe (billing) → 建 org 订阅/续费单 + 二维码
+ *   POST /api/org/seats     (billing) → 建 org 加席单 + 二维码
  *   GET  /api/org/subscription (member) → 当前订阅(档/席位/周期/期内池余额)+ 可购档位
  *   GET  /api/org/orders       (admin)  → org 订单列表(keyset 分页)
  *   GET  /api/org/ledger       (admin)  → org 桶流水(keyset 分页)
@@ -435,10 +435,11 @@ async function handleOrgBalance(
 // ─── 路由表 ────────────────────────────────────────────────────────
 
 export const billingRoutes: OrgRoute[] = [
-  // 计费写面(§14 billing owner-only 收紧):topup admin→owner;subscribe/seats 亦 owner。
-  { method: "POST", pattern: "/api/org/topup", minRole: "owner", handler: handleOrgTopup },
-  { method: "POST", pattern: "/api/org/subscribe", minRole: "owner", handler: handleOrgSubscribe },
-  { method: "POST", pattern: "/api/org/seats", minRole: "owner", handler: handleOrgSeats },
+  // 计费写面:§14 收紧为 owner-only,§17.3 再放开给财务委派 → minRole='billing'
+  // (owner ∥ billing_delegate)。topup/subscribe/seats 均计费写面,统一 'billing'。
+  { method: "POST", pattern: "/api/org/topup", minRole: "billing", handler: handleOrgTopup },
+  { method: "POST", pattern: "/api/org/subscribe", minRole: "billing", handler: handleOrgSubscribe },
+  { method: "POST", pattern: "/api/org/seats", minRole: "billing", handler: handleOrgSeats },
   // 读面保持原 minRole 不动。
   { method: "GET", pattern: "/api/org/subscription", minRole: "member", handler: handleOrgSubscription },
   { method: "GET", pattern: "/api/org/orders", minRole: "admin", handler: handleOrgOrders },

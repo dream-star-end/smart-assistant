@@ -30,6 +30,13 @@ export interface OrgBillingContext {
    *   - false → 仍打戳 usage_records.org_id(org 语境),但个人桶付费(不传 orgId)
    */
   billingEnabled: boolean;
+  /**
+   * 成员月度 org 预算(§17.4,org_memberships.monthly_org_budget)。NULL=不限。
+   * billingEnabled=true 时随 orgId 一并传入 spendTwoBucket:org 桶可用额钳到
+   * min(org 资金, max(0, budget - 本自然月已用))。billingEnabled=false 时不参与
+   * org 扣费,预算无意义(不传)。
+   */
+  monthlyOrgBudget: bigint | null;
 }
 
 /**
@@ -47,8 +54,13 @@ export async function resolveOrgBillingContext(
   runner: QueryRunner,
   userId: bigint | number | string,
 ): Promise<OrgBillingContext | null> {
-  const r = await query<{ org_id: string; billing_enabled: boolean }>(
-    `SELECT m.org_id::text AS org_id, m.billing_enabled
+  const r = await query<{
+    org_id: string;
+    billing_enabled: boolean;
+    monthly_org_budget: string | null;
+  }>(
+    `SELECT m.org_id::text AS org_id, m.billing_enabled,
+            m.monthly_org_budget::text AS monthly_org_budget
        FROM org_memberships m
        JOIN orgs o ON o.id = m.org_id
       WHERE m.user_id = $1::bigint AND m.status = 'active' AND o.status = 'active'
@@ -58,7 +70,68 @@ export async function resolveOrgBillingContext(
   );
   const row = r.rows[0];
   if (!row) return null;
-  return { orgId: row.org_id, billingEnabled: row.billing_enabled };
+  return {
+    orgId: row.org_id,
+    billingEnabled: row.billing_enabled,
+    monthlyOrgBudget: row.monthly_org_budget === null ? null : BigInt(row.monthly_org_budget),
+  };
+}
+
+// ─── 成员月度 org 支出口径(单一权威)────────────────────────────────────
+//
+// spendTwoBucket 预算钳制(§17.4)与 listMembers 的 month_org_spent 展示共用**同一 SUM
+// 口径**(方案:抽公共函数进 orgBilling.ts,两处一个权威,防口径漂移)。口径 =
+// 该成员该 org 本自然月(Asia/Shanghai)从 org 两桶(org_period+org_wallet)花掉的额度
+// = credit_ledger 负 delta 之和(只计支出;topup/续费/调额的正 delta 不计)。
+// 时区手法抄 admin/stats.ts:101-106:date_trunc('month', NOW() AT TIME ZONE 'Asia/Shanghai')
+// 得 +08:00 墙上时钟的月初(naive),再 AT TIME ZONE 'Asia/Shanghai' 转回 timestamptz 与
+// created_at 类型对齐。命中 0118 partial index idx_cl_org_user_time。
+
+/** 自然月(Asia/Shanghai)起点的 timestamptz 下界表达式。 */
+const ORG_MONTH_START = `(date_trunc('month', NOW() AT TIME ZONE 'Asia/Shanghai') AT TIME ZONE 'Asia/Shanghai')`;
+
+/** org 两桶支出过滤(负 delta = 花出;正 delta = 充值/发放,不计)+ 本自然月窗口。 */
+const ORG_MONTH_SPEND_FILTER = `cl.bucket IN ('org_period', 'org_wallet') AND cl.delta < 0
+  AND cl.created_at >= ${ORG_MONTH_START}`;
+
+/**
+ * 单成员本自然月 org 支出(spendTwoBucket 预算钳制用,tx 内 runner)。
+ * 返回 >= 0 的 bigint(无支出 → 0n)。
+ */
+export async function sumMemberOrgMonthSpend(
+  runner: QueryRunner,
+  orgId: string | bigint,
+  userId: string | bigint,
+): Promise<bigint> {
+  const r = await query<{ spent: string }>(
+    `SELECT COALESCE(SUM(-cl.delta), 0)::text AS spent
+       FROM credit_ledger cl
+      WHERE cl.org_id = $1::bigint AND cl.user_id = $2::bigint
+        AND ${ORG_MONTH_SPEND_FILTER}`,
+    [String(orgId), String(userId)],
+    runner,
+  );
+  return BigInt(r.rows[0]?.spent ?? "0");
+}
+
+/**
+ * 某 org 全体成员本自然月 org 支出映射(listMembers 展示用,一次 GROUP BY)。
+ * 与 sumMemberOrgMonthSpend 共用 ORG_MONTH_SPEND_FILTER(单一口径)。无支出的成员不在 map 中
+ * (调用方缺省 0n)。
+ */
+export async function mapOrgMonthSpendByMember(
+  orgId: string | bigint,
+): Promise<Map<string, bigint>> {
+  const r = await query<{ user_id: string; spent: string }>(
+    `SELECT cl.user_id::text AS user_id, COALESCE(SUM(-cl.delta), 0)::text AS spent
+       FROM credit_ledger cl
+      WHERE cl.org_id = $1::bigint AND ${ORG_MONTH_SPEND_FILTER}
+      GROUP BY cl.user_id`,
+    [String(orgId)],
+  );
+  const m = new Map<string, bigint>();
+  for (const row of r.rows) m.set(row.user_id, BigInt(row.spent));
+  return m;
 }
 
 /**

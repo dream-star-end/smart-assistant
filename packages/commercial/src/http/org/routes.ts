@@ -100,7 +100,13 @@ export async function dispatchOrgRoute(
     auth = { userId: u.id };
   } else {
     const c = await requireOrgRole(req, deps.jwtSecret, getPool(), chosen.r.minRole);
-    auth = { userId: c.userId, orgId: c.orgId, orgRole: c.orgRole, billingEnabled: c.billingEnabled };
+    auth = {
+      userId: c.userId,
+      orgId: c.orgId,
+      orgRole: c.orgRole,
+      billingEnabled: c.billingEnabled,
+      billingDelegate: c.billingDelegate,
+    };
   }
 
   await chosen.r.handler(req, res, ctx, deps, auth, chosen.params);

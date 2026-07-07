@@ -46,6 +46,8 @@ const MEMBER: MembershipRow = {
   org_role: "member",
   status: "active",
   billing_enabled: false, // owner 已关掉计费
+  billing_delegate: false,
+  monthly_org_budget: null,
   invited_by: null,
   joined_at: new Date(),
 };
