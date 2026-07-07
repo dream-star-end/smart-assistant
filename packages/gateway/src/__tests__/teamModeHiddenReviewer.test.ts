@@ -64,6 +64,20 @@ describe('team mode preamble — 只保留协作语义,审查软约束已删', (
     // 合并消解(P2批次3 × ux-reliability):委派通道语义已收敛为「只走 delegate_task,停用原生 Agent」
     assert.match(src, /只走 `delegate_task`/)
     assert.match(src, /collabAgentPolicy: 'team-mode-prefer-delegate'/)
+    // 审查**感知**(2026-07-07):被动告知强制审查机制的存在与反馈应对方式。与下面
+    // doesNotMatch 防回退的"触发侧软约束"(自觉调用/迭代自律)有本质区别 —— 触发权威
+    // 仍唯一在 gateway 硬编排。
+    assert.match(src, /强制质量审查\*\*再送达用户/)
+    assert.match(src, /平台会把初稿折叠/)
+  })
+
+  it('NEEDS_FIX 续写前发修订标记帧(前端折叠草稿的 server 权威信号)', () => {
+    const src = readFileSync(SERVER_TS, 'utf8')
+    assert.match(src, /meta: \{ teamRevision: true \}/)
+    // 标记必须先于 continuation 的 sessions.submit(顺序保证前端在修订稿首块到达前完成折叠)。
+    const marker = src.indexOf('teamRevision: true')
+    const contSubmit = src.indexOf('buildTeamReviewContinuation(reviewOutput)')
+    assert.ok(marker > 0 && contSubmit > 0 && marker < contSubmit, '标记帧代码应在 continuation submit 之前')
   })
 
   it('preamble 已删除"自觉调用审查 / verdict 解读 / 迭代自律"软约束(审查改由 gateway 硬编排)', () => {

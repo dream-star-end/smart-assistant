@@ -99,6 +99,7 @@ export function messageSignature(
         m._truncated ?? "",
         m._errorCode ?? "",
         m._errorDetail ? m._errorDetail.length : 0,
+        m._supersededDraft ? 1 : 0,
         m._emptyTurn ? 1 : 0,
         m._emptyTurnSoft ? 1 : 0,
         m._emptyTurnTimeout ? 1 : 0,
