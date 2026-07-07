@@ -364,13 +364,16 @@ describe("org 邀请生命周期", () => {
     await assert.rejects(() => acceptInvitation(inv.rawToken, invitee), isOrgError("INVITATION_EXPIRED"));
   });
 
-  test("席位满 → SEATS_FULL", async (t) => {
+  test("席位满 → SEATS_FULL(批次 F:软席位闸提前到 createInvitation)", async (t) => {
     if (skipIfNoPg(t)) return;
     const owner = await createUser("o@x.com");
     const orgId = await makeOrg(owner, "Tiny", 1); // 上限 1,owner 已占满
-    const invitee = await createUser("invitee@x.com");
-    const inv = await createInvitation({ orgId, email: "invitee@x.com", orgRole: "member", invitedBy: owner });
-    await assert.rejects(() => acceptInvitation(inv.rawToken, invitee), isOrgError("SEATS_FULL"));
+    // §14 席位闸(只拦新进):满员时创建邀请即被软闸拒,不再造出无法接受的邀请。
+    // 接受时的权威席位闸另由 orgProvisionBilling.test.ts 覆盖(邀请创建时有位、接受前被填满)。
+    await assert.rejects(
+      () => createInvitation({ orgId, email: "invitee@x.com", orgRole: "member", invitedBy: owner }),
+      isOrgError("SEATS_FULL"),
+    );
   });
 
   test("已属于其他 org → ALREADY_IN_ORG", async (t) => {

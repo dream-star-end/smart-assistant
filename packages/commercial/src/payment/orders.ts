@@ -30,12 +30,30 @@ import {
   grantSubscriptionTx,
   type SubscriptionPlan,
 } from "../billing/subscription.js";
+import { OrgError } from "../org/types.js";
+import { getOrgById } from "../org/orgs.js";
+import { getActiveMembership } from "../org/memberships.js";
+import {
+  addOrgSeatsTx,
+  getOrgPlan,
+  getOrgSubscription,
+  grantOrgSubscriptionTx,
+} from "../org/orgSubscriptions.js";
+import { DEFAULT_ORG_MAX_MEMBERS, fulfillOrgProvisionTx } from "../org/orgProvision.js";
 
 /**
- * 订单种类（0096）。topup→钱包；pack→期内桶(加量包)；subscription→订阅/续费(期内桶重置+周期顺延)；
+ * 订单种类。topup→钱包；pack→期内桶(加量包)；subscription→订阅/续费(期内桶重置+周期顺延)；
  * upgrade→升档(期内桶补到新档额度+周期不变)。
+ *
+ * 企业版(0112/0115)对 org 复用既有 kind,不新增歧义种类:
+ *   - kind='topup'        + org_id 非空 → org 钱包充值(fulfillOrgTopupTx)
+ *   - kind='subscription' + org_id 非空 → org **订阅/续费**(grantOrgSubscriptionTx,重置期内池)
+ *   - kind='upgrade'      + org_id 非空 → org **加席**(addOrgSeatsTx,整份即时入池;from_plan_code=NULL)
+ *   - kind='org_provision'(org_id 建单时为 NULL)→ 自助开通(履约时建 org+owner+订阅,fulfill 回填 org_id)
+ * 选型依据:subscription(重置)与 upgrade(增量)语义在个人版已分立,org 沿用同一语义分区可让
+ * fulfill 分支无歧义(重置 vs 加席),避免"单一 kind 混两种履约"的歧义单。见 0115 迁移注释。
  */
-export const ORDER_KINDS = ["topup", "pack", "subscription", "upgrade"] as const;
+export const ORDER_KINDS = ["topup", "pack", "subscription", "upgrade", "org_provision"] as const;
 export type OrderKind = (typeof ORDER_KINDS)[number];
 
 /** 订单状态的字面量类型。数据库 CHECK 同步。 */
@@ -75,8 +93,16 @@ export interface OrderRow {
   plan_code: string | null;
   /** 0096 upgrade 单的源套餐档快照（履约校验当前订阅仍 == 此档；仅 upgrade 非 null）。 */
   from_plan_code: string | null;
-  /** 0112 企业版:org 充值单归属(kind='topup' 时非 null;个人单 null)。user_id=经办人。 */
+  /**
+   * 0112/0115 企业版:org 订单归属。user_id=经办人。
+   *   - org 充值/订阅/加席单:建单即落 org_id;
+   *   - 自助开通单(kind='org_provision'):建单为 NULL,履约建 org 后回填。
+   */
   org_id: bigint | null;
+  /** 0115 企业版:自助开通单(kind='org_provision')新建 org 的名称快照;非开通单 null。 */
+  org_name: string | null;
+  /** 0115 企业版:org 订阅/开通/加席的席位数(subscription/org_provision=总席位;upgrade=加席增量)。 */
+  plan_seats: number | null;
   paid_at: Date | null;
   expires_at: Date;
   ledger_id: bigint | null;
@@ -236,17 +262,18 @@ type OrderDbRow = {
   id: string; order_no: string; user_id: string; provider: "hupijiao";
   provider_order: string | null; amount_cents: string; credits: string;
   status: OrderStatus; kind: string; plan_code: string | null; from_plan_code: string | null;
-  org_id: string | null;
+  org_id: string | null; org_name: string | null; plan_seats: number | null;
   paid_at: Date | null; expires_at: Date;
   ledger_id: string | null; refunded_ledger_id: string | null;
   created_at: Date; updated_at: Date;
 };
 
-/** 所有 orders SELECT 复用的列清单（含 0096 kind/plan_code/from_plan_code + 0112 org_id）。 */
+/** 所有 orders SELECT 复用的列清单（含 0096 kind/plan_code/from_plan_code + 0112 org_id + 0115 org_name/plan_seats）。 */
 const ORDER_COLS =
   `id::text AS id, order_no, user_id::text AS user_id, provider,
    provider_order, amount_cents::text AS amount_cents, credits::text AS credits,
-   status, kind, plan_code, from_plan_code, org_id::text AS org_id, paid_at, expires_at,
+   status, kind, plan_code, from_plan_code, org_id::text AS org_id, org_name, plan_seats,
+   paid_at, expires_at,
    ledger_id::text AS ledger_id, refunded_ledger_id::text AS refunded_ledger_id,
    created_at, updated_at`;
 
@@ -264,6 +291,8 @@ function rowToOrder(r: OrderDbRow): OrderRow {
     plan_code: r.plan_code,
     from_plan_code: r.from_plan_code,
     org_id: r.org_id ? BigInt(r.org_id) : null,
+    org_name: r.org_name,
+    plan_seats: r.plan_seats,
     paid_at: r.paid_at,
     expires_at: r.expires_at,
     ledger_id: r.ledger_id ? BigInt(r.ledger_id) : null,
@@ -500,6 +529,204 @@ export async function createOrgTopupOrder(input: CreateOrgTopupOrderInput): Prom
   return rowToOrder(r.rows[0]);
 }
 
+// ─── org 席位订阅 / 加席 / 自助开通订单(0115,批次 F)──────────────────────
+
+/** 席位数强校验(正整数)。抛结构化 OrgError,路由层映射为 400。 */
+function normOrgSeats(seats: unknown): number {
+  if (typeof seats !== "number" || !Number.isInteger(seats) || seats <= 0) {
+    throw new OrgError(400, "VALIDATION", `seats must be a positive integer, got ${String(seats)}`);
+  }
+  return seats;
+}
+
+/** org 名称强校验(1..200,复用 orgs CHECK / createOrg 语义)。 */
+function normOrgName(name: unknown): string {
+  const s = typeof name === "string" ? name.trim() : "";
+  if (s.length === 0 || s.length > 200) {
+    throw new OrgError(400, "VALIDATION", "org name must be 1..200 chars");
+  }
+  return s;
+}
+
+export interface CreateOrgSubscriptionOrderInput {
+  orgId: string | bigint;
+  /** 目标 org 套餐 code(必须 scope='org' 且 enabled)。 */
+  planCode: string;
+  /** 席位数(>= plan.min_seats 且 <= org.max_members)。 */
+  seats: number;
+  /** 经办人(owner;§14 billing owner-only,路由层收口)→ orders.user_id。 */
+  operatorUserId: bigint | number | string;
+  ttlMs?: number;
+  orderNo?: string;
+  nowFn?: () => Date;
+}
+
+/**
+ * 建 org 订阅/续费单(kind='subscription' + org_id + plan_code + plan_seats)。
+ * 金额=每席价×seats(快照,支付 + 篡改纵深防御的基准);credits=每席积分×seats(快照,仅展示——
+ * 履约由 grantOrgSubscriptionTx 按 fulfill 时的 plan.monthly_credits 现值发放,池化重置)。
+ * 校验:plan scope='org' enabled、seats>=min_seats、org active、seats<=org.max_members。
+ * 履约:markOrderPaid → fulfillPaidOrderTx(org_id 非空 + kind='subscription')→ grantOrgSubscriptionTx。
+ */
+export async function createOrgSubscriptionOrder(
+  input: CreateOrgSubscriptionOrderInput,
+): Promise<OrderRow> {
+  const orgId = normalizeOrgId(input.orgId);
+  const uid = normalizeUserId(input.operatorUserId);
+  const seats = normOrgSeats(input.seats);
+
+  const plan = await getOrgPlan(input.planCode);
+  if (!plan) throw new OrgError(400, "PLAN_NOT_ORG", `plan not found or not an org plan: ${input.planCode}`);
+  if (!plan.enabled) throw new OrgError(400, "PLAN_DISABLED", `org plan disabled: ${input.planCode}`);
+  if (plan.minSeats != null && seats < plan.minSeats) {
+    throw new OrgError(400, "SEAT_BELOW_MIN", `seats (${seats}) below plan min_seats (${plan.minSeats})`);
+  }
+
+  const org = await getOrgById(orgId);
+  if (!org) throw new OrgError(404, "NOT_FOUND", `org not found: ${orgId}`);
+  if (org.status !== "active") throw new OrgError(409, "ORG_UNAVAILABLE", "organization is not active");
+  if (seats > org.max_members) {
+    throw new OrgError(400, "SEAT_ABOVE_MAX", `seats (${seats}) exceeds org max_members (${org.max_members})`);
+  }
+
+  const amountCents = plan.priceCents * BigInt(seats);
+  const credits = plan.monthlyCredits * BigInt(seats);
+
+  const nowFn = input.nowFn ?? (() => new Date());
+  const ttlMs = Math.max(1, input.ttlMs ?? 15 * 60 * 1000);
+  const expiresAt = new Date(nowFn().getTime() + ttlMs);
+  const orderNo = input.orderNo ?? generateOrderNo(nowFn);
+
+  const r = await query<OrderDbRow>(
+    `INSERT INTO orders
+      (order_no, user_id, org_id, provider, amount_cents, credits, status, kind, plan_code, plan_seats, expires_at)
+     VALUES ($1, $2, $3::bigint, 'hupijiao', $4, $5, 'pending', 'subscription', $6, $7, $8)
+     RETURNING ${ORDER_COLS}`,
+    [orderNo, uid, orgId, amountCents.toString(), credits.toString(), plan.code, seats, expiresAt],
+  );
+  return rowToOrder(r.rows[0]);
+}
+
+export interface CreateOrgSeatsOrderInput {
+  orgId: string | bigint;
+  /** 席位**增量**(> 0),按整席全价购,整份积分即时入池。 */
+  seats: number;
+  operatorUserId: bigint | number | string;
+  ttlMs?: number;
+  orderNo?: string;
+  nowFn?: () => Date;
+}
+
+/**
+ * 建 org 加席单(kind='upgrade' + org_id;plan_seats=**增量**;from_plan_code=NULL)。
+ * 选型:复用 'upgrade'(个人版语义=期内桶增量/周期不变)表达 org 加席(整份即时入池/period 不变),
+ * 与 'subscription'(重置)分立,fulfill 分支无歧义。from_plan_code 留 NULL——org 加席不需源档快照
+ * (履约 addOrgSeatsTx 从 org_subscriptions 现值读当前档,不走 applyUpgradeOrRefundTx 的 from 校验)。
+ * 校验:org 有 active 且未过期订阅、org active、加席后总席位 <= org.max_members。
+ * 金额=当前档每席价×增量;credits=每席积分×增量(快照,展示用)。
+ */
+export async function createOrgSeatsOrder(input: CreateOrgSeatsOrderInput): Promise<OrderRow> {
+  const orgId = normalizeOrgId(input.orgId);
+  const uid = normalizeUserId(input.operatorUserId);
+  const addSeats = normOrgSeats(input.seats);
+
+  const sub = await getOrgSubscription(orgId);
+  if (!sub) throw new OrgError(400, "NO_ORG_SUBSCRIPTION", "org has no subscription; subscribe before adding seats");
+  if (sub.status !== "active" || sub.periodEnd.getTime() <= Date.now()) {
+    throw new OrgError(400, "ORG_SUBSCRIPTION_INACTIVE", "org subscription is expired or ended; renew before adding seats");
+  }
+
+  const plan = await getOrgPlan(sub.planCode);
+  if (!plan) throw new OrgError(400, "PLAN_NOT_ORG", `plan not found or not an org plan: ${sub.planCode}`);
+
+  const org = await getOrgById(orgId);
+  if (!org) throw new OrgError(404, "NOT_FOUND", `org not found: ${orgId}`);
+  if (org.status !== "active") throw new OrgError(409, "ORG_UNAVAILABLE", "organization is not active");
+  if (sub.seats + addSeats > org.max_members) {
+    throw new OrgError(
+      400,
+      "SEAT_ABOVE_MAX",
+      `seats after add (${sub.seats + addSeats}) exceeds org max_members (${org.max_members})`,
+    );
+  }
+
+  const amountCents = plan.priceCents * BigInt(addSeats);
+  const credits = plan.monthlyCredits * BigInt(addSeats);
+
+  const nowFn = input.nowFn ?? (() => new Date());
+  const ttlMs = Math.max(1, input.ttlMs ?? 15 * 60 * 1000);
+  const expiresAt = new Date(nowFn().getTime() + ttlMs);
+  const orderNo = input.orderNo ?? generateOrderNo(nowFn);
+
+  const r = await query<OrderDbRow>(
+    `INSERT INTO orders
+      (order_no, user_id, org_id, provider, amount_cents, credits, status, kind, plan_code, plan_seats, expires_at)
+     VALUES ($1, $2, $3::bigint, 'hupijiao', $4, $5, 'pending', 'upgrade', $6, $7, $8)
+     RETURNING ${ORDER_COLS}`,
+    [orderNo, uid, orgId, amountCents.toString(), credits.toString(), plan.code, addSeats, expiresAt],
+  );
+  return rowToOrder(r.rows[0]);
+}
+
+export interface CreateOrgProvisionOrderInput {
+  /** 付款人(自助开通者)→ orders.user_id;履约建 org 时成为 owner。 */
+  userId: bigint | number | string;
+  /** 新建组织名(1..200)。 */
+  orgName: string;
+  /** 目标 org 套餐 code(scope='org' 且 enabled)。 */
+  planCode: string;
+  /** 席位数(>= plan.min_seats 且 <= 默认组织席位上限)。 */
+  seats: number;
+  ttlMs?: number;
+  orderNo?: string;
+  nowFn?: () => Date;
+}
+
+/**
+ * 建自助开通单(kind='org_provision';org_id 建单为 NULL——org 不提前建,避免 pending 僵尸;
+ * org_name/plan_seats 落列)。校验:用户当前无 active org(预检,fulfill 再校验为权威)、
+ * orgName 合法、plan scope='org' enabled、seats>=min_seats 且 <= 默认组织席位上限。
+ * 金额=每席价×seats;credits=每席积分×seats(快照)。
+ * 履约:markOrderPaid → fulfillPaidOrderTx(kind='org_provision')→ **一个事务**建 org+owner+订阅
+ * 并回填 orders.org_id;若届时用户已入他 org → 订单照常 paid + critical 告警 + 不建 org(§13)。
+ */
+export async function createOrgProvisionOrder(input: CreateOrgProvisionOrderInput): Promise<OrderRow> {
+  const uid = normalizeUserId(input.userId);
+  const orgName = normOrgName(input.orgName);
+  const seats = normOrgSeats(input.seats);
+
+  const plan = await getOrgPlan(input.planCode);
+  if (!plan) throw new OrgError(400, "PLAN_NOT_ORG", `plan not found or not an org plan: ${input.planCode}`);
+  if (!plan.enabled) throw new OrgError(400, "PLAN_DISABLED", `org plan disabled: ${input.planCode}`);
+  if (plan.minSeats != null && seats < plan.minSeats) {
+    throw new OrgError(400, "SEAT_BELOW_MIN", `seats (${seats}) below plan min_seats (${plan.minSeats})`);
+  }
+  if (seats > DEFAULT_ORG_MAX_MEMBERS) {
+    throw new OrgError(400, "SEAT_ABOVE_MAX", `seats (${seats}) exceeds default org member cap (${DEFAULT_ORG_MAX_MEMBERS})`);
+  }
+
+  // 预检:用户当前无 active org(V1 单 org)。fulfill 时在 payer 行锁下再校验为权威。
+  const existing = await getActiveMembership(uid);
+  if (existing) throw new OrgError(409, "ALREADY_IN_ORG", "you already belong to an organization");
+
+  const amountCents = plan.priceCents * BigInt(seats);
+  const credits = plan.monthlyCredits * BigInt(seats);
+
+  const nowFn = input.nowFn ?? (() => new Date());
+  const ttlMs = Math.max(1, input.ttlMs ?? 15 * 60 * 1000);
+  const expiresAt = new Date(nowFn().getTime() + ttlMs);
+  const orderNo = input.orderNo ?? generateOrderNo(nowFn);
+
+  const r = await query<OrderDbRow>(
+    `INSERT INTO orders
+      (order_no, user_id, provider, amount_cents, credits, status, kind, plan_code, plan_seats, org_name, expires_at)
+     VALUES ($1, $2, 'hupijiao', $3, $4, 'pending', 'org_provision', $5, $6, $7, $8)
+     RETURNING ${ORDER_COLS}`,
+    [orderNo, uid, amountCents.toString(), credits.toString(), plan.code, seats, orgName, expiresAt],
+  );
+  return rowToOrder(r.rows[0]);
+}
+
 export interface GetOrderOptions {
   /** 要求订单属于指定用户(用于 GET /api/payment/orders/:no) */
   userId?: bigint | number | string;
@@ -644,13 +871,71 @@ async function fulfillOrgTopupTx(client: PoolClient, order: OrderRow): Promise<b
  * （期内桶路径返回 null —— 流水以 ref_id=order_no 关联，不占 orders.ledger_id）。
  */
 async function fulfillPaidOrderTx(client: PoolClient, order: OrderRow): Promise<bigint | null> {
-  // 0112 企业版:org 充值单(org_id 非空)独立分支。本期 org 只有充值(kind='topup'),
-  // 其它 kind 拒绝履约(防未来误配 org 订阅/升档单走错个人履约路径)。
-  if (order.org_id !== null) {
-    if (order.kind !== "topup") {
-      throw new TypeError(`org order ${order.order_no} must be kind=topup, got ${order.kind}`);
+  // 0115 企业版:自助开通单(kind='org_provision',建单时 org_id=NULL)。**一个事务**建
+  // org+owner+订阅并回填 orders.org_id;若 payer 届时已入他 org → 不建 org、订单照常 paid、
+  // 发 critical 告警人工处置(§13 显式接受的极小概率窗口)。开通单不产生个人钱包流水 → 返回 null。
+  if (order.kind === "org_provision") {
+    if (order.org_name == null || order.plan_code == null || order.plan_seats == null) {
+      throw new TypeError(
+        `malformed org_provision order ${order.order_no}: org_name/plan_code/plan_seats required`,
+      );
     }
-    return fulfillOrgTopupTx(client, order);
+    await fulfillOrgProvisionTx(client, {
+      orderId: order.id.toString(),
+      orderNo: order.order_no,
+      payerUserId: order.user_id.toString(),
+      orgName: order.org_name,
+      planCode: order.plan_code,
+      seats: order.plan_seats,
+    });
+    return null;
+  }
+
+  // 0112/0115 企业版:org 归属单(org_id 非空)白名单履约。topup=org 钱包充值;
+  // subscription=org 订阅/续费(重置期内池);upgrade=org 加席(整份即时入池)。
+  // 白名单外的 kind 拒绝履约(防未来误配走错个人履约路径)。
+  if (order.org_id !== null) {
+    switch (order.kind) {
+      case "topup":
+        return fulfillOrgTopupTx(client, order);
+      case "subscription": {
+        // org 订阅/续费:按订单席位重置期内池(池化)。plan_code/plan_seats 建单已落。
+        await grantOrgSubscriptionTx(client, {
+          orgId: order.org_id,
+          planCode: order.plan_code ?? "",
+          seats: order.plan_seats ?? 0,
+          operatorUserId: order.user_id,
+          orderRef: order.order_no,
+        });
+        return null;
+      }
+      case "upgrade": {
+        // org 加席:plan_seats=增量,整份即时入池、period 不变。若订阅已在窗口内过期/失效
+        // (stale window),不丢已付款项——退而将等额积分入 org 钱包(镜像个人版 upgrade 的
+        // refund-to-wallet 语义,orders.ledger_id 回写该 org_wallet 流水),保证订单始终成单。
+        try {
+          await addOrgSeatsTx(client, {
+            orgId: order.org_id,
+            seats: order.plan_seats ?? 0,
+            operatorUserId: order.user_id,
+            orderRef: order.order_no,
+          });
+          return null;
+        } catch (err) {
+          if (
+            err instanceof OrgError &&
+            (err.code === "ORG_SUBSCRIPTION_INACTIVE" || err.code === "NO_ORG_SUBSCRIPTION")
+          ) {
+            return fulfillOrgTopupTx(client, order); // 降级:等额积分入 org 钱包,不丢款
+          }
+          throw err;
+        }
+      }
+      default:
+        throw new TypeError(
+          `org order ${order.order_no} has unsupported kind ${order.kind} (allowed: topup/subscription/upgrade)`,
+        );
+    }
   }
   switch (order.kind) {
     case "topup":
