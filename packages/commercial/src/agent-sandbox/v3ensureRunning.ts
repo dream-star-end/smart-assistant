@@ -375,13 +375,13 @@ export function makeV3EnsureRunning(
       };
     }
 
-    // 2a-bis) provisioning —— young cid=NULL:saga 中段并发 provision 正在建容器(合法在途态,
-    //   见 getV3ContainerStatus 的二分注释)。**绝不 stopAndRemove**:那会销毁在途容器 → 在途者
-    //   Tx2 rowCount=0 走补偿 rm,与同名 docker create 交错把前台用户打进 NameConflict 短重试。
-    //   这里改为**等待**:短重试,几秒后在途者 Tx2 落 cid → 下轮 ensure 命中 running,零 churn
-    //   零 vanish。此路收口 makeUidSingleflight 覆盖不到的**跨闭包**并发(prewarm 独立闭包
-    //   vs WS 独立闭包,两个 in-flight map 不合并)。真 young 孤儿(刚崩)重试几轮 age 过 15s →
-    //   getV3ContainerStatus 转 'missing' → 落下方 2b 既有 stopAndRemove 自愈(最多多等 ~15s,可接受)。
+    // 2a-bis) provisioning —— active + cid=NULL 且 age<grace。**根治前提**:本进程所有 provision
+    //   入口(WS / media-signed / cronWake / prewarm)已汇入唯一 makeUidSingleflight(index.ts
+    //   sharedEnsureRunning),有在途 provision 时并发观察者一律 join 同一 promise、不会走到这里。
+    //   故落到本分支 ⟺ 无在途 provision ⟺ 该行是崩溃/重启残留的**孤儿**(见 getV3ContainerStatus
+    //   二分注释)。→ **短重试等待**(不 stopAndRemove):孤儿的有界自愈缓冲,重试几轮 age 过
+    //   grace → 转 'missing' → 落下方 2b stopAndRemove + 重建自愈(上界 = grace ≈ 15s,不慢愈退化)。
+    //   同时是纵深防御:万一未来出现 singleflight 覆盖不到的路径观察到真·在途行,等待也不误销毁。
     if (status && status.state === "provisioning") {
       throw new ContainerUnreadyError(RETRY_AFTER_PROVISIONING_SEC, "provisioning");
     }

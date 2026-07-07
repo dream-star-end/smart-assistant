@@ -6,7 +6,9 @@
  *   - active+running+healthz timeout → ContainerUnreadyError("starting")
  *   - active+stopped → stopAndRemove + provision + waitHealthz → 成功(v1.0.117)
  *   - active+stopped + stopAndRemove 失败 → ContainerUnreadyError("supervisor_error")
- *   - active+stopped(orphan: container_internal_id=NULL, age<15s)→ vanished + reprovision 成功
+ *   - active + provisioning(cid=NULL, age<grace)→ ContainerUnreadyError("provisioning") 短重试等待
+ *     (不 stopAndRemove、不销毁在途/孤儿行;单一 singleflight 统一后 = 孤儿有界自愈缓冲)
+ *   - active + missing(cid=NULL, age>=grace)→ stopAndRemove 翻 vanished + reprovision 自愈
  *   - active+missing → stopAndRemove + provision + waitHealthz → 成功
  *   - 并发 ensureRunning 输家保护(uniq_ac_user_id_active)留 integ 覆盖(FakePool 当前只模拟 bound_ip uniq)
  *   - 无 active 行 → provision + waitHealthz → 成功

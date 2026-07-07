@@ -32,9 +32,11 @@ process.env.OC_V3_IMAGE_GUARD = "off";
 import {
   provisionV3Container,
   getV3ContainerStatus,
+  makeUidSingleflight,
   SupervisorError,
   type V3SupervisorDeps,
 } from "../agent-sandbox/index.js";
+import { listContainers } from "../admin/containers.js";
 import { closePool, createPool, resetPool, setPoolOverride } from "../db/index.js";
 import { runMigrations } from "../db/migrate.js";
 import { query } from "../db/queries.js";
@@ -393,5 +395,72 @@ describe("provisionV3Container saga — 真 PG 事务窗口", () => {
     } finally {
       await pool.end();
     }
+  });
+
+  test("单一 singleflight 统一:并发同 uid 经同一 wrapper 合并 → 只跑一次 provision、在途行不被销毁(>15s 慢 IO 亦然)", async (t) => {
+    if (skip(t)) return;
+    const hostId = await insertSelfHost(10);
+    const pool = createPool({ connectionString: TEST_DB_URL, max: 10 });
+    try {
+      await seedUser(4270);
+      // 慢中段(1.2s;语义上任意慢——join 不看时长):即使超过 15s grace,后来者也是 join 而非观察。
+      const { docker, captured } = makeIntegFakeDocker({ createDelayMs: 1200 });
+      // 模拟 index.ts sharedEnsureRunning:所有 provision 入口(WS/media/cronWake/prewarm)统一进
+      // 唯一 makeUidSingleflight。并发同 uid → 后来者 join 同一 in-flight promise,绝不独立走
+      // getV3ContainerStatus 观察 cid=NULL 在途行去销毁它(修 Codex MAJOR 的根治保证)。
+      const shared = makeUidSingleflight((uid: bigint) =>
+        provisionV3Container(makeDeps(pool, docker, hostId), Number(uid), hostId),
+      );
+      const [a, b] = await Promise.all([shared(4270n), shared(4270n)]);
+      assert.strictEqual(a, b, "并发同 uid 必须 join 同一 promise(拿同一结果对象)");
+      assert.strictEqual(captured.created, 1, "只跑一次 provision(第二路 join,未另起观察/销毁)");
+      const rows = await query<{ n: string; v: string }>(
+        `SELECT count(*) FILTER (WHERE state='active')::text AS n,
+                count(*) FILTER (WHERE state='vanished')::text AS v
+           FROM agent_containers WHERE user_id=$1::bigint`,
+        ["4270"],
+      );
+      assert.strictEqual(rows.rows[0]!.n, "1", "恰一条 active");
+      assert.strictEqual(rows.rows[0]!.v, "0", "在途行绝不被并发观察者销毁翻 vanished");
+    } finally {
+      await pool.end();
+    }
+  });
+
+  test("admin 列表:v3 active+cid=NULL grace 内显 'provisioning' / grace 外显 'missing',不再误显示 running(Codex MINOR)", async (t) => {
+    if (skip(t)) return;
+    const hostId = await insertSelfHost(10);
+    // listContainers / query 走 before() 装配的全局 pool(getPool());无需本地 pool。
+    await seedUser(4280);
+    await seedUser(4281);
+    await seedUser(4282);
+    const insertRow = (uid: string, ip: string, cid: string | null, ageSec: number) =>
+      query(
+        `INSERT INTO agent_containers(user_id, host_uuid, bound_ip, secret_hash, state, port,
+             runtime_channel, container_internal_id, created_at, updated_at)
+         VALUES ($1::bigint, $2::uuid, $3::inet, decode(repeat('01', 32), 'hex'), 'active', 18789, 'v5', $4,
+             NOW() - ($5::text || ' seconds')::interval, NOW())`,
+        [uid, hostId, ip, cid, String(ageSec)],
+      );
+    await insertRow("4280", "172.31.9.10", null, 1); // young cid=NULL
+    await insertRow("4281", "172.31.9.11", null, 60); // old cid=NULL(>grace)
+    await insertRow("4282", "172.31.9.12", "deadbeefcid", 1); // 正常 running
+
+    const list = await listContainers({ limit: 100 });
+    const lc = (uid: string) => list.find((r) => r.user_id === uid)?.lifecycle;
+    assert.strictEqual(lc("4280"), "provisioning", "young cid=NULL → provisioning(不再 running)");
+    assert.strictEqual(lc("4281"), "missing", "old cid=NULL → missing");
+    assert.strictEqual(lc("4282"), "active", "cid 已落 → active(running)");
+
+    // 过滤一致性:running 过滤排除 cid=NULL 行;provisioning 过滤含 young cid=NULL 行。
+    const running = await listContainers({ status: "running", limit: 100 });
+    assert.ok(
+      running.every((r) => r.user_id !== "4280" && r.user_id !== "4281"),
+      "running 过滤不含 cid=NULL 行",
+    );
+    assert.ok(running.some((r) => r.user_id === "4282"), "running 过滤含正常 running 行");
+    const prov = await listContainers({ status: "provisioning", limit: 100 });
+    assert.ok(prov.some((r) => r.user_id === "4280"), "provisioning 过滤含 young cid=NULL 行");
+    assert.ok(prov.every((r) => r.user_id !== "4281"), "provisioning 过滤不含 old(>grace)cid=NULL 行");
   });
 });

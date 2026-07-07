@@ -155,6 +155,18 @@ export function gatewayIpFromV3Cidr(cidr: string): string {
  */
 export const V3_CONTAINER_PORT = 18789;
 
+/**
+ * active + container_internal_id IS NULL 的 grace 窗口(ms)—— young/old 二分**唯一权威**。
+ *
+ * 语义(saga + 单一 singleflight 统一后):本进程所有 provision 入口汇入唯一 makeUidSingleflight
+ * (index.ts sharedEnsureRunning),故有在途 provision 时并发观察者一律 join 同一 promise、
+ * 不会独立观察到 cid=NULL 在途行 —— 因此观察到 active+cid=NULL ⟺ 无在途 provision ⟺ 该行是
+ * 崩溃/重启残留的孤儿。grace 内(young)按 provisioning 有界等待(≤grace 后转 missing 自愈),
+ * grace 外(old)按 missing 走 stopAndRemove + 重建。getV3ContainerStatus 与 admin/containers.ts
+ * 列表渲染共用本常量,禁止再散魔数(Codex review 2026-07-07)。
+ */
+export const PROVISION_INFLIGHT_GRACE_MS = 15_000;
+
 /** CLAUDE_CONFIG_DIR tmpfs 挂载点(防 settings.json 残留) */
 export const V3_CONFIG_TMPFS_PATH = "/run/oc/claude-config";
 
@@ -1843,11 +1855,14 @@ async function compensateProvisionFailure(
  *   └─ 补偿(catch,compensateProvisionFailure)
  *      12. 中段 / Tx2 任一失败 → 短事务 UPDATE state='vanished' + best-effort docker rm -f
  *
- * 中段 cid=NULL 窗口的读者兼容性(天然,无需改读者):getV3ContainerStatus 对 cid=NULL
- * 有 15s grace、orphanReconcile Dir-A 300s 安全窗 + Dir-B 排除 cid=NULL、stopAndRemove /
- * idleSweep / 管理面 stop 对 cid=NULL 提前 return、codex acquire 60s young-guard —— 均为
- * 本窗口设计;同进程并发同 uid 由 makeUidSingleflight 合并(Tx2 在 singleflight settle 前
- * 已提交 cid),不重入本窗口。
+ * 中段 cid=NULL 窗口的并发正确性(**单一 singleflight 权威**):本进程所有 provision 入口
+ * (WS / media-signed / cronWake / prewarm)汇入唯一 makeUidSingleflight(index.ts
+ * sharedEnsureRunning),同 uid 有在途 provision 时并发观察者一律 **join 同一 promise**,
+ * 不重入本窗口去观察/销毁在途 cid=NULL 行(singleflight 在 ensureRunning 完整 settle 才 unwrap,
+ * 那时 Tx2 已提交 cid)。故观察到 active+cid=NULL ⟺ 无在途 provision ⟺ 崩溃/重启孤儿(见
+ * getV3ContainerStatus 的 young/old 二分自愈)。其余读者天然兼容:orphanReconcile Dir-A 300s
+ * 安全窗 + Dir-B 排除 cid=NULL、stopAndRemove / idleSweep / 管理面 stop 对 cid=NULL 提前
+ * return、codex acquire 60s young-guard —— 均为本窗口设计。
  *
  * 为什么 ensureV3Volume 改在事务内:
  *   - GC 在持有 per-uid lock 期间删 volume;provision 也必须在持锁期间 ensureV3Volume,
@@ -3002,20 +3017,19 @@ export async function getV3ContainerStatus(
   if (r.rowCount === 0) return null;
   const row = r.rows[0]!;
   if (!row.container_internal_id) {
-    // 行被外部 SELECT 看到 = Tx1 已 COMMIT;container_internal_id IS NULL 有**两种**语义
-    // (saga 化后按 age 二分,不再一律当孤儿清理):
-    //   · young(age<15s)= **合法在途 provisioning**:并发 saga 中段正在建容器,cid 尚未
-    //     由 Tx2 落库(尤其 makeUidSingleflight 覆盖不到的跨闭包并发,如 prewarm 独立闭包
-    //     vs WS 独立闭包)。→ state='provisioning',caller(ensureRunning)必须**等待短重试**,
-    //     **绝不 stopAndRemove**(否则销毁在途容器 → 在途者 Tx2 rowCount=0 补偿 rm,与同名
-    //     create 交错把前台用户打进 NameConflict)。几秒后在途者 Tx2 落 cid → 下轮 ensure 命中 running。
-    //   · old(age>=15s)= 真孤儿:进程崩溃留下的边缘态 / migration 前旧数据 / 远端 createAndStart
-    //     返回空 cid(v1.0.8 已被 RemoteContractViolation 守门)。→ state='missing',ensureRunning
-    //     走既有 stopAndRemove + re-provision 自愈(stopAndRemove 对 NULL cid 提前 return,只翻
-    //     vanished 不动 docker)。若一次 provision 真的 >15s(慢 docker),在途者会被误判成孤儿——
-    //     由 Tx2 的 `WHERE state='active'` guard 兜底(在途者 rowCount=0 → 补偿,不写脏 cid)。
+    // 行被外部 SELECT 看到 = Tx1 已 COMMIT;但 container_internal_id IS NULL。
     //
-    // 15s 阈值同时是"正常 saga 中段上限"启发值:docker create/start + codex 绑定通常 <10s。
+    // **前提(单一 singleflight 统一后,index.ts sharedEnsureRunning 汇聚全部 provision 入口)**:
+    // 本进程有在途 provision 时,并发观察者一律 join 同一 in-flight promise,不会走到这里独立
+    // 观察 cid=NULL 行。所以能观察到 active+cid=NULL ⟺ **本进程无在途 provision** ⟺ 该行是
+    // **崩溃/重启残留的孤儿**(Tx1 提交后进程异常 / migration 前旧数据 / 远端 createAndStart
+    // 返回空 cid[v1.0.8 已被 RemoteContractViolation 守门])。→ 按 grace 二分自愈:
+    //   · young(age<grace)→ 'provisioning':孤儿的**有界自愈等待**。ensureRunning 短重试
+    //     (不 stopAndRemove);重试几轮 age 过 grace → 转 'missing' → 走下方自愈。上界 = grace,
+    //     不引入慢愈退化。**同时**是纵深防御:万一未来出现 singleflight 覆盖不到的路径观察到
+    //     真·在途行,'provisioning' 等待也不会误销毁它。
+    //   · old(age>=grace)→ 'missing':真孤儿,ensureRunning stopAndRemove(对 NULL cid 提前
+    //     return,只翻 vanished 不动 docker)+ re-provision 自愈。
     const ageMs = Date.now() - new Date(row.created_at).getTime();
     return {
       containerId: Number.parseInt(row.id, 10),
@@ -3023,7 +3037,7 @@ export async function getV3ContainerStatus(
       boundIp: row.bound_ip,
       port: row.port ?? V3_CONTAINER_PORT,
       dockerContainerId: "",
-      state: ageMs < 15_000 ? "provisioning" : "missing",
+      state: ageMs < PROVISION_INFLIGHT_GRACE_MS ? "provisioning" : "missing",
       hostId: row.host_uuid,
     };
   }
