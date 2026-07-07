@@ -350,15 +350,41 @@ describe("MessageList coalesceTeam 聚合(零回归关键路径)", () => {
     expect(screen.getByText("团队协作 · 3 个智能体")).toBeInTheDocument();
   });
 
-  // ── 债A：按 turn 锚点归组(取代相邻连续启发式) ──────────────────────────────
-  test("同一 turn 内穿插非 agent-group 行 → 仍聚成一个团队面板(不再被劈裂)", () => {
+  // ── (turn 锚点, 叙事阶段) 归组:工具/thinking/骨架混排不劈裂,队长叙事文本才断组 ──
+  test("同一 turn 内穿插工具行/thinking → 仍聚成一个团队面板(混排不劈裂)", () => {
     renderList([
       mk("user", { id: "u1", text: "组队" }),
       g("g1", "任务A"),
-      mk("assistant", { id: "a1", text: "队长补充说明" }),
+      mk("tool", { id: "t1", toolName: "Bash", _completed: true }),
+      mk("thinking", { id: "th1", text: "思考下一步" }),
       g("g2", "任务B"),
     ]);
     expect(screen.getByText("团队协作 · 2 个智能体")).toBeInTheDocument();
+  });
+
+  test("队长叙事文本行断组:文本之后的委派另起阶段,不吸回上方面板(时序诚实)", () => {
+    renderList([
+      mk("user", { id: "u1", text: "组队" }),
+      g("g1", "任务A"),
+      mk("assistant", { id: "a1", text: "队长阶段性整合" }),
+      g("g2", "任务B"),
+    ]);
+    // 两个阶段各只有 1 个委派 → 都退化为单卡,不出面板;g2 按时序在文本之后。
+    expect(screen.queryByText(/团队协作/)).not.toBeInTheDocument();
+    expect(screen.getByText("任务A")).toBeInTheDocument();
+    expect(screen.getByText("任务B")).toBeInTheDocument();
+  });
+
+  test("叙事断组后各阶段独立聚合:2 并行 + 文本 + 2 并行 → 两个面板", () => {
+    renderList([
+      mk("user", { id: "u1", text: "组队" }),
+      g("g1", "A1"),
+      g("g2", "A2"),
+      mk("assistant", { id: "a1", text: "第一批完成,继续" }),
+      g("g3", "B1"),
+      g("g4", "B2"),
+    ]);
+    expect(screen.getAllByText("团队协作 · 2 个智能体")).toHaveLength(2);
   });
 
   test("跨两轮的委派各自成面板(user 边界 = 独立 turn,不跨轮合并)", () => {
@@ -388,7 +414,7 @@ describe("MessageList coalesceTeam 聚合(零回归关键路径)", () => {
     renderList([
       mk("user", { id: "u1", text: "组队" }),
       g("g1", "本地队员", { _completed: true }),
-      mk("assistant", { id: "a1", text: "过渡" }),
+      mk("tool", { id: "t1", toolName: "Bash", _completed: true }),
       serverMember,
     ]);
     expect(screen.getByText("团队协作 · 2 个智能体")).toBeInTheDocument();
@@ -488,7 +514,7 @@ describe("审查裁决徽记 + per-delegate 成本(债C/债D)", () => {
     expect(screen.getByText("完成")).toBeInTheDocument(); // 执行态徽记照常
   });
 
-  test("coalesceTeam:队长助手行 usage.delegates → 团队卡按 agentId 显示 per-delegate 成本", () => {
+  test("coalesceTeam:审查员卡永不入面板;usage.delegates 按 agentId 落到各自单卡", () => {
     renderList([
       mk("user", { id: "u1", text: "组队" }),
       g("g1", "审查", { _delegateAgentId: "hidden-reviewer", _completed: true, _reviewVerdict: "PASS" }),
@@ -504,11 +530,76 @@ describe("审查裁决徽记 + per-delegate 成本(债C/债D)", () => {
         },
       }),
     ]);
-    // 全完成默认收起 → 点头部展开看队员行。
-    fireEvent.click(screen.getByText("团队协作 · 2 个智能体"));
+    // 审查员被排除后本阶段只剩 1 个可入面板成员 → 无面板,两张单卡各带成本/裁决。
+    expect(screen.queryByText(/团队协作/)).not.toBeInTheDocument();
     expect(screen.getByText("3 积分")).toBeInTheDocument();
     expect(screen.getByText("5 积分")).toBeInTheDocument();
     expect(screen.getByText("PASS")).toBeInTheDocument();
+  });
+
+  test("典型团队叙事流:并行批次面板 → 队长整合文本 → 审查卡按时序独立在后(债D 成本齐全)", () => {
+    const { container } = renderList([
+      mk("user", { id: "u1", text: "组队" }),
+      g("g1", "调研", { _delegateAgentId: "research-assistant", _completed: true }),
+      g("g2", "写代码", { _delegateAgentId: "coding-assistant", _completed: true }),
+      mk("assistant", {
+        id: "a1",
+        text: "队长整合结论",
+        usage: {
+          delegates: [
+            { agentId: "research-assistant", costCredits: "2" },
+            { agentId: "coding-assistant", costCredits: "5" },
+            { agentId: "hidden-reviewer", costCredits: "3" },
+          ],
+        },
+      }),
+      g("g3", "审查草稿", { _delegateAgentId: "hidden-reviewer", _completed: true, _reviewVerdict: "PASS" }),
+    ]);
+    // 面板只含并行两人;审查卡独立出现,且 DOM 顺序在整合文本之后。
+    expect(screen.getByText("团队协作 · 2 个智能体")).toBeInTheDocument();
+    expect(screen.getByText("PASS")).toBeInTheDocument();
+    const html = container.innerHTML;
+    expect(html.indexOf("队长整合结论")).toBeGreaterThan(html.indexOf("团队协作"));
+    expect(html.indexOf("审查草稿")).toBeGreaterThan(html.indexOf("队长整合结论"));
+    // 审查卡自己的成本徽记(单卡 delegateCost 路径)。
+    expect(screen.getByText("3 积分")).toBeInTheDocument();
+  });
+});
+
+describe("MetaRow turn 终态门控(积分/请求ID 不得先于 turn 结束出现)", () => {
+  const withUsage = (): ChatMessage[] => [
+    mk("user", { id: "u1", text: "提问" }),
+    mk("assistant", {
+      id: "a1",
+      text: "队长引擎已收笔,但审查编排还在跑",
+      _completed: true,
+      usage: { traceId: "trace1234abcd", costCredits: "42" },
+    }),
+  ];
+  test("turn 进行中(sending=true)且行属活跃段 → 尾注不渲染", () => {
+    render(
+      <MessageList messages={withUsage()} sending={true} cb={{}} onRespondPermission={() => {}} />,
+    );
+    expect(screen.queryByText(/42 积分/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/#trace123/)).not.toBeInTheDocument();
+  });
+  test("turn 结束(sending=false)→ 尾注照常渲染", () => {
+    render(
+      <MessageList messages={withUsage()} sending={false} cb={{}} onRespondPermission={() => {}} />,
+    );
+    expect(screen.getByText(/42 积分/)).toBeInTheDocument();
+    expect(screen.getByText(/#trace123/)).toBeInTheDocument();
+  });
+  test("历史段行(后有新 user)在新 turn 进行中仍显示尾注(门控只作用于活跃段)", () => {
+    render(
+      <MessageList
+        messages={[...withUsage(), mk("user", { id: "u2", text: "下一问" })]}
+        sending={true}
+        cb={{}}
+        onRespondPermission={() => {}}
+      />,
+    );
+    expect(screen.getByText(/42 积分/)).toBeInTheDocument();
   });
 });
 
