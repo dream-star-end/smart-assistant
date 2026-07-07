@@ -4,7 +4,7 @@ import { api } from "../../lib/api";
 import type { AuthSession, OrgTopupResult } from "../../lib/types";
 import { cn, formatCentsYuan } from "../../lib/utils";
 import { Alert, Button, Modal, Spinner } from "../ui";
-import { orgErrText } from "../OrgCenter";
+import { orgErrText } from "./orgShared";
 
 const POLL_INTERVAL_MS = 3000;
 /** 二维码轮询上限（防悬挂）：超时后停轮询并提示去概览核对余额。 */

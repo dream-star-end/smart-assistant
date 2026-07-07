@@ -148,6 +148,7 @@ export function SettingsCenter({
                     user={user}
                     onManageSub={() => setSubOpen(true)}
                     reloadKey={ledgerReload}
+                    onRefreshMe={onRefreshMe}
                   />
                 )}
 

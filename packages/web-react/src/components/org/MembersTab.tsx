@@ -1,10 +1,16 @@
-import { UserPlus } from "lucide-react";
+import { UserPlus, Users } from "lucide-react";
 import { type FormEvent, useEffect, useState } from "react";
 import { api } from "../../lib/api";
-import type { AuthSession, OrgInvitation, OrgMember, OrgRole } from "../../lib/types";
+import type {
+  AuthSession,
+  OrgInvitation,
+  OrgMember,
+  OrgRole,
+  OrgSubscriptionView,
+} from "../../lib/types";
 import { Alert, Badge, Button, Input, Spinner, Switch, useConfirm, useToast } from "../ui";
 import { shortTime } from "../settings/labels";
-import { orgErrText, orgRoleLabel } from "../OrgCenter";
+import { orgErrText, orgRoleLabel } from "./orgShared";
 
 /** org 角色 → 徽章色调。 */
 function roleTone(role: OrgRole): "accent" | "info" | "neutral" {
@@ -39,10 +45,18 @@ export function MembersTab({
   auth,
   callerRole,
   onRefreshMe,
+  subscription = null,
+  canManageBilling = false,
+  onAddSeats,
 }: {
   auth: AuthSession;
   callerRole: OrgRole;
   onRefreshMe?: () => void;
+  /** 当前订阅(席位闸:有订阅时以 seats 为上限,来自 OrgCenter 单一权威)。 */
+  subscription?: OrgSubscriptionView;
+  /** owner 才可加席。 */
+  canManageBilling?: boolean;
+  onAddSeats?: () => void;
 }) {
   const [members, setMembers] = useState<OrgMember[]>([]);
   const [invitations, setInvitations] = useState<OrgInvitation[]>([]);
@@ -203,6 +217,10 @@ export function MembersTab({
   const selectCls =
     "h-8 rounded-md border border-border bg-surface px-2 text-[12.5px] text-fg outline-none transition-colors focus:border-accent focus:ring-2 focus:ring-ring disabled:cursor-not-allowed disabled:opacity-50";
 
+  // 席位闸(友好前置提示;后端 SEATS_FULL 仍是权威):有订阅时活跃成员达 seats 即满。
+  const activeMembers = members.filter((m) => m.status === "active").length;
+  const seatFull = subscription != null && activeMembers >= subscription.seats;
+
   return (
     <div className="flex flex-col">
       {/* 成员列表 */}
@@ -284,34 +302,53 @@ export function MembersTab({
         <div className="flex items-center gap-1.5 pb-2 text-[11px] font-medium uppercase tracking-wide text-faint">
           <UserPlus size={13} /> 邀请成员
         </div>
-        <form onSubmit={submitInvite} className="flex flex-wrap items-center gap-2">
-          <Input
-            type="email"
-            value={inviteEmail}
-            onChange={(e) => setInviteEmail(e.target.value)}
-            placeholder="成员邮箱"
-            className="h-9 min-w-[12rem] flex-1"
-            required
-          />
-          <select
-            className={selectCls.replace("h-8", "h-9")}
-            value={inviteRole}
-            onChange={(e) => setInviteRole(e.target.value as Exclude<OrgRole, "owner">)}
-            aria-label="邀请角色"
-          >
-            <option value="member">成员</option>
-            <option value="admin">管理员</option>
-          </select>
-          <Button
-            type="submit"
-            variant="primary"
-            size="sm"
-            disabled={inviting || inviteEmail.trim().length === 0}
-          >
-            {inviting ? <Spinner size={14} /> : null}
-            发送邀请
-          </Button>
-        </form>
+
+        {seatFull ? (
+          <div className="rounded-lg border border-border bg-warning-soft px-3.5 py-3">
+            <div className="flex items-center gap-1.5 text-[12.5px] font-medium text-warning">
+              <Users size={14} /> 席位已满（{activeMembers} / {subscription?.seats} 席）
+            </div>
+            <p className="mt-1 text-[12px] text-muted">
+              {canManageBilling
+                ? "当前席位已用满，加席后即可继续邀请新成员。"
+                : "当前席位已用满，如需邀请更多成员，请联系组织拥有者加席。"}
+            </p>
+            {canManageBilling && (
+              <Button variant="primary" size="sm" onClick={onAddSeats} className="mt-2">
+                <Users size={15} /> 去加席
+              </Button>
+            )}
+          </div>
+        ) : (
+          <form onSubmit={submitInvite} className="flex flex-wrap items-center gap-2">
+            <Input
+              type="email"
+              value={inviteEmail}
+              onChange={(e) => setInviteEmail(e.target.value)}
+              placeholder="成员邮箱"
+              className="h-9 min-w-[12rem] flex-1"
+              required
+            />
+            <select
+              className={selectCls.replace("h-8", "h-9")}
+              value={inviteRole}
+              onChange={(e) => setInviteRole(e.target.value as Exclude<OrgRole, "owner">)}
+              aria-label="邀请角色"
+            >
+              <option value="member">成员</option>
+              <option value="admin">管理员</option>
+            </select>
+            <Button
+              type="submit"
+              variant="primary"
+              size="sm"
+              disabled={inviting || inviteEmail.trim().length === 0}
+            >
+              {inviting ? <Spinner size={14} /> : null}
+              发送邀请
+            </Button>
+          </form>
+        )}
 
         {invitations.length > 0 && (
           <ul className="mt-3 flex flex-col gap-0.5">

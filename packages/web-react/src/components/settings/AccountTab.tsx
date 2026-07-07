@@ -4,6 +4,7 @@ import { api } from "../../lib/api";
 import type { AuthSession, MySubscription, UsageLedgerRow, User } from "../../lib/types";
 import { cn, formatCredits } from "../../lib/utils";
 import { Alert, Button, Spinner } from "../ui";
+import { CreateOrgDialog } from "../org/CreateOrgWizard";
 import { ledgerReasonLabel, shortTime } from "./labels";
 
 function fmtDate(iso: string): string {
@@ -24,6 +25,7 @@ export function AccountTab({
   user,
   onManageSub,
   reloadKey,
+  onRefreshMe,
 }: {
   auth: AuthSession;
   user: User | null;
@@ -31,8 +33,11 @@ export function AccountTab({
   onManageSub: () => void;
   /** 外部（订阅/加量包到账）变更时 +1，触发流水 + 订阅重拉。 */
   reloadKey: number;
+  /** 组织创建到账后刷新 /api/me（org 字段出现）。 */
+  onRefreshMe?: () => void;
 }) {
   const [rows, setRows] = useState<UsageLedgerRow[]>([]);
+  const [createOrgOpen, setCreateOrgOpen] = useState(false);
   const [nextBefore, setNextBefore] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [loadingMore, setLoadingMore] = useState(false);
@@ -131,6 +136,23 @@ export function AccountTab({
                 : "该组织未对你开启统一结算,用量按个人账户计费。"}
             </p>
           )}
+        </div>
+      )}
+
+      {/* 无 org:自助开通入口(Claude/GPT 式)。 */}
+      {!org && (
+        <div className="border-b border-border px-5 py-4">
+          <div className="flex items-center gap-1.5 text-[12px] text-faint">
+            <Building2 size={13} /> 组织
+          </div>
+          <p className="mt-1 text-[13px] text-muted">
+            创建组织，按席位订阅企业套餐，团队共享积分池、技能与统一发票。
+          </p>
+          <div className="mt-3">
+            <Button variant="primary" size="sm" onClick={() => setCreateOrgOpen(true)}>
+              <Building2 size={15} /> 创建组织
+            </Button>
+          </div>
         </div>
       )}
 
@@ -260,6 +282,16 @@ export function AccountTab({
           </>
         )}
       </div>
+
+      <CreateOrgDialog
+        open={createOrgOpen}
+        auth={auth}
+        onClose={() => setCreateOrgOpen(false)}
+        onCreated={() => {
+          setCreateOrgOpen(false);
+          onRefreshMe?.();
+        }}
+      />
     </div>
   );
 }

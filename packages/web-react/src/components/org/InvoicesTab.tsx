@@ -14,7 +14,7 @@ import type {
 import { cn, formatCentsYuan } from "../../lib/utils";
 import { Alert, Badge, Button, Input, Spinner, useToast } from "../ui";
 import { shortTime } from "../settings/labels";
-import { orgErrText } from "../OrgCenter";
+import { orgErrText } from "./orgShared";
 
 /** 订单主键：优先 id（批次 B 可能补），退化 order_no。见文件顶部契约注释。 */
 function orderPk(o: OrgOrder): string {

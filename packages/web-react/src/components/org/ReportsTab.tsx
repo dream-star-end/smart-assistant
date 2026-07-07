@@ -9,7 +9,7 @@ import type {
 } from "../../lib/types";
 import { cn, formatCompactCount, formatCredits, groupDigits, ratioPct } from "../../lib/utils";
 import { Alert, Spinner, Tabs } from "../ui";
-import { orgErrText } from "../OrgCenter";
+import { orgErrText } from "./orgShared";
 
 const WINDOWS: { value: OrgUsageWindow; label: string }[] = [
   { value: "24h", label: "24 小时" },

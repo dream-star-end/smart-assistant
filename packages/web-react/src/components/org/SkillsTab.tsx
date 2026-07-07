@@ -3,7 +3,7 @@ import { type ReactNode, useEffect, useState } from "react";
 import { api } from "../../lib/api";
 import type { AuthSession, OrgSkill, OrgSkillsResponse } from "../../lib/types";
 import { Alert, Button, EmptyState, Spinner, useToast } from "../ui";
-import { orgErrText } from "../OrgCenter";
+import { orgErrText } from "./orgShared";
 
 /**
  * 技能：组织共享技能库。installed 区 + available 区两栏，install/uninstall。
