@@ -448,6 +448,23 @@ export interface AgentSession {
    * 注入的 session 不被 TS 波及。
    */
   _activeTurnCount?: number
+
+  /** team-durability(2026-07-07)— **客户 turn** 级 in-flight 计数,scope 比
+   * `_activeTurnCount`(engine submit 级)更宽:由 server.ts dispatchInbound 在
+   * 首次 submit 前 ++、整个 turn 编排(含 hidden-reviewer 硬编排的 review 委派 +
+   * continuation 再 submit)收尾的 finally 里 --。修的洞:团队模式下 engine turn
+   * 完成(_activeTurnCount 归零)后 gateway 编排还要跑数分钟审查,期间 hello 重连
+   * 若只看 engine 计数会误判"turn 已结束"。判定 turn 是否在飞必须两个计数都看
+   * (`_shouldPushTurnInterruptedFinal`)。语义细节同 `_activeTurnCount`:counter
+   * 而非 boolean、不持久化、重启后 undefined 读 ?? 0。 */
+  _activeClientTurnCount?: number
+
+  /** team-durability — 最近一次客户 turn 的收尾方式(dispatchInbound finally 记录)。
+   * hello 重连对账用:客户端报 inFlight 而两个 turn 计数均为 0 时,'completed' →
+   * 推静默 reconcile final(turn 已正常完成,客户端只是错过了终态帧,不该提示
+   * "被中断请重发"——那会诱导用户重发重付费);'errored'/undefined → 维持原
+   * service_restart 中断文案语义。 */
+  _lastClientTurnOutcome?: 'completed' | 'errored'
 }
 
 // Re-export from ccbMessageParser so existing imports keep working
@@ -2836,6 +2853,49 @@ export class SessionManager {
     if (!pending || pending.length === 0) return []
     session._pendingAgentGroups = undefined
     return pending
+  }
+
+  /** team-durability — 客户 turn 进入执行段(dispatchInbound 首次 submit 前)。
+   *  与 endClientTurn 严格 try/finally 配对。语义见 AgentSession._activeClientTurnCount。 */
+  beginClientTurn(session: AgentSession): void {
+    session._activeClientTurnCount = (session._activeClientTurnCount ?? 0) + 1
+  }
+
+  /** team-durability — 客户 turn 收尾(含 review 编排在内的整个 turn 生命周期结束)。
+   *  outcome 记入 _lastClientTurnOutcome 供 hello 重连对账区分"正常完成 vs 中断"。 */
+  endClientTurn(session: AgentSession, outcome: 'completed' | 'errored'): void {
+    session._activeClientTurnCount = Math.max(0, (session._activeClientTurnCount ?? 0) - 1)
+    session._lastClientTurnOutcome = outcome
+  }
+
+  /**
+   * team-durability — turn 真正终点(review 编排收尾后)的迟到产物补 persist。
+   *
+   * 修的洞:engine turn 完成时的 persist(handleResult 钩子)发生在 hidden-reviewer
+   * 硬编排**之前**,审查委派完成后 buffer 进来的团队卡(带 verdict)错过了当轮
+   * drain,只能漏到下一轮 persist(归错 turn)或随会话回收丢失(2026-07-07 事故:
+   * reviewer PASS 卡 + 终态全部不在 REST 权威副本里,客户端全量重拉救不回)。
+   *
+   * dispatchInbound 在 review 编排结束后调用:无条件 drain(防跨 turn 泄漏),
+   * 有货才补一次 persist(agentGroups-only,text 空 → master 侧仅写 agent-group
+   * 行,messageId 按 runId 派生,与 engine persist 的 s0..sN 行天然不冲突)。
+   */
+  persistLateTurnArtifacts(session: AgentSession): void {
+    const groups = this.drainPendingAgentGroups(session)
+    if (groups.length === 0) return
+    if (!MASTER_SINK_PERSIST_CHANNELS.has(session.channel)) return
+    this._trackPersistence(
+      persistServerAuthoredTurn({
+        sessionKey: session.sessionKey,
+        peerId: session.peerId,
+        agentId: session.agentId,
+        userId: session.userId,
+        turnIndex: session.turns,
+        text: '',
+        status: 'completed',
+        agentGroups: groups,
+      }),
+    )
   }
 
   /**

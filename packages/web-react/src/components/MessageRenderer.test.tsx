@@ -209,7 +209,7 @@ describe("tool / agent-group 集成", () => {
     expect(screen.getAllByText("pwd").length).toBeGreaterThanOrEqual(1);
   });
 
-  test("delegate-progress fallback keeps final summary when child blocks exist", () => {
+  test("delegate-progress fallback keeps final summary when child blocks exist（完成默认折叠，展开见子块）", () => {
     renderMsg(
       mk("delegate-progress", {
         _completed: true,
@@ -219,7 +219,30 @@ describe("tool / agent-group 集成", () => {
         ],
       }),
     );
+    // 完成态默认折叠：摘要在折叠页脚可见，子块暂隐藏。
     expect(screen.getByText("委派最终结果")).toBeInTheDocument();
+    expect(screen.queryByText("终端")).toBeNull();
+    // 点击头部展开 → 子工具卡可见。
+    fireEvent.click(screen.getByRole("button"));
+    expect(screen.getByText("终端")).toBeInTheDocument();
+  });
+
+  test("delegate-progress：点击头部折叠/展开（进行中默认展开）", () => {
+    renderMsg(
+      mk("delegate-progress", {
+        _completed: false,
+        childBlocks: [
+          { kind: "tool_use", blockId: "child-bash", toolName: "Bash", inputJson: { command: "pwd" }, _completed: false },
+        ],
+      }),
+    );
+    // 进行中默认展开 → 子块可见。
+    expect(screen.getByText("终端")).toBeInTheDocument();
+    // 点击头部（进行中态此时有头部 + 子工具卡两个 button，取首个=头部）收起。
+    fireEvent.click(screen.getAllByRole("button")[0]);
+    expect(screen.queryByText("终端")).toBeNull();
+    // 再点头部展开。
+    fireEvent.click(screen.getByRole("button"));
     expect(screen.getByText("终端")).toBeInTheDocument();
   });
 

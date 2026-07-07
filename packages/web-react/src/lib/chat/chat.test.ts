@@ -15,7 +15,7 @@ import {
   parsePartialJson,
   shouldAutoContinueEmptyTurn,
 } from "./pure";
-import { addMessage, type ChatMessage, createSession, resetReplyTracker } from "./model";
+import { addMessage, type ChatMessage, createSession, isServerAuthoredRow, resetReplyTracker } from "./model";
 import {
   applyCostCharged,
   applyCostWaived,
@@ -551,6 +551,158 @@ describe("applyOutboundMessage (§3/§7/§9/§11)", () => {
     const groups = s.messages.filter((m) => m.role === "agent-group");
     expect(groups).toHaveLength(1);
     expect(groups[0]._delegateRunId).toBe("dlg-1");
+    expect(s.messages.filter((m) => m.role === "delegate-progress")).toHaveLength(0);
+  });
+
+  test("fan-out delegate_tasks: 各 runId 物化独立 agent-group(非 delegate-progress), server 行折叠不重复", () => {
+    const s = sess();
+    // 队长复数 fan-out tool_use —— **不转组**,保持 role:"tool" 作紧凑头部。
+    applyOutboundMessage(
+      s,
+      msgFrame({
+        frameSeq: 1,
+        blocks: [
+          {
+            kind: "tool_use",
+            toolName: "mcp__openclaude-memory__delegate_tasks",
+            blockId: "tool-fanout",
+            partial: false,
+            inputJson: {
+              tasks: [
+                { agentId: "coding-assistant", goal: "任务A" },
+                { agentId: "office-assistant", goal: "任务B" },
+              ],
+            },
+          },
+        ],
+      }),
+    );
+    expect(s.messages.filter((m) => m.role === "tool")).toHaveLength(1);
+    expect(s.messages.filter((m) => m.role === "agent-group")).toHaveLength(0);
+
+    // 两个子任务各自 start(独立 runId)。
+    applyOutboundMessage(
+      s,
+      msgFrame({
+        frameSeq: 2,
+        blocks: [{ kind: "delegate_progress", runId: "dlg-a", agentId: "coding-assistant", phase: "start", goal: "任务A", text: "开始 A" }],
+      }),
+    );
+    applyOutboundMessage(
+      s,
+      msgFrame({
+        frameSeq: 3,
+        blocks: [{ kind: "delegate_progress", runId: "dlg-b", agentId: "office-assistant", phase: "start", goal: "任务B", text: "开始 B" }],
+      }),
+    );
+
+    // 兜底路径产出 agent-group(非 delegate-progress standalone)。
+    expect(s.messages.filter((m) => m.role === "delegate-progress")).toHaveLength(0);
+    const groups = s.messages.filter((m) => m.role === "agent-group");
+    expect(groups).toHaveLength(2);
+    expect(groups.map((g) => g._delegateRunId).sort()).toEqual(["dlg-a", "dlg-b"]);
+    expect(groups.map((g) => g.text).sort()).toEqual(["任务A", "任务B"]);
+
+    // 终态帧:A 完成 / B 失败,分别落到各自的组。
+    applyOutboundMessage(
+      s,
+      msgFrame({ frameSeq: 4, blocks: [{ kind: "delegate_progress", runId: "dlg-a", agentId: "coding-assistant", phase: "done", text: "A 完成" }] }),
+    );
+    applyOutboundMessage(
+      s,
+      msgFrame({ frameSeq: 5, blocks: [{ kind: "delegate_progress", runId: "dlg-b", agentId: "office-assistant", phase: "error", text: "B 失败" }] }),
+    );
+    const ga = s.messages.find((m) => m._delegateRunId === "dlg-a")!;
+    const gb = s.messages.find((m) => m._delegateRunId === "dlg-b")!;
+    expect(ga._completed).toBe(true);
+    expect(ga._isError).toBeFalsy();
+    expect(ga._resultPreview).toBe("A 完成");
+    expect(gb._completed).toBe(true);
+    expect(gb._isError).toBe(true);
+
+    // turn 末 server-authored agent-group 骨架行(同 runId)到达 → normalizeDelegateCards 按 runId 折叠,
+    // 本地富卡 local-wins,不产生第三/四张卡。
+    s.messages.push({
+      id: "srv-a",
+      role: "agent-group",
+      text: "任务A",
+      ts: Date.now(),
+      _source: "server",
+      _delegate: true,
+      runId: "dlg-a",
+      _delegateAgentId: "coding-assistant",
+      _delegateGoal: "任务A",
+      _completed: true,
+      _delegateStatus: "ok",
+    } as ChatMessage);
+    s.messages.push({
+      id: "srv-b",
+      role: "agent-group",
+      text: "任务B",
+      ts: Date.now(),
+      _source: "server",
+      _delegate: true,
+      runId: "dlg-b",
+      _delegateAgentId: "office-assistant",
+      _delegateGoal: "任务B",
+      _completed: true,
+      _delegateStatus: "failed",
+    } as ChatMessage);
+    normalizeDelegateCards(s);
+    const finalGroups = s.messages.filter((m) => m.role === "agent-group");
+    expect(finalGroups).toHaveLength(2);
+    expect(finalGroups.every((m) => !isServerAuthoredRow(m))).toBe(true);
+    // fan-out tool 卡始终保持 role:"tool"(未被 normalizeDelegateCards 误转组)。
+    expect(s.messages.filter((m) => m.role === "tool")).toHaveLength(1);
+  });
+
+  test("mixed turn(fan-out tool 在场)+ 单数委派 progress 早于 tool_use → 复用物化组,不产生重复卡", () => {
+    const s = sess();
+    // 本轮已有 fan-out delegate_tasks tool 卡在场(令 hasActiveFanoutDelegate 命中)。
+    applyOutboundMessage(
+      s,
+      msgFrame({
+        frameSeq: 1,
+        blocks: [
+          {
+            kind: "tool_use",
+            toolName: "mcp__openclaude-memory__delegate_tasks",
+            blockId: "tool-fanout",
+            partial: false,
+            inputJson: { tasks: [{ agentId: "coding-assistant", goal: "并行A" }] },
+          },
+        ],
+      }),
+    );
+    // 单数委派的 progress start 先到(ordering-1)→ 兜底命中 fan-out 分支,物化成一张 agent-group。
+    applyOutboundMessage(
+      s,
+      msgFrame({
+        frameSeq: 2,
+        blocks: [{ kind: "delegate_progress", runId: "dlg-solo", agentId: "hidden-reviewer", phase: "start", goal: "审查草稿", text: "开始审查" }],
+      }),
+    );
+    expect(s.messages.filter((m) => m.role === "agent-group")).toHaveLength(1);
+    // 随后单数 delegate_task tool_use 到达 → 复用同一张物化组,不新建重复卡。
+    applyOutboundMessage(
+      s,
+      msgFrame({
+        frameSeq: 3,
+        blocks: [
+          {
+            kind: "tool_use",
+            toolName: "delegate_task",
+            blockId: "tool-solo",
+            partial: false,
+            inputJson: { agentId: "hidden-reviewer", goal: "审查草稿" },
+          },
+        ],
+      }),
+    );
+    const groups = s.messages.filter((m) => m.role === "agent-group");
+    expect(groups).toHaveLength(1);
+    expect(groups[0]._delegateRunId).toBe("dlg-solo");
+    expect(groups[0].blockId).toBe("tool-solo");
     expect(s.messages.filter((m) => m.role === "delegate-progress")).toHaveLength(0);
   });
 
@@ -1410,6 +1562,43 @@ describe("applyResumeFailed (§4 layer 3)", () => {
     expect(s._lastFrameSeqByKey?.["agent:main:webchat:dm:s1"]).toBe(42);
     expect(s._liveStreamBroken).toBe(true);
     expect(forceSync).toHaveBeenCalledWith("s1");
+  });
+});
+
+describe("reconcile 合成 final (meta.reconcile==='turn_completed')", () => {
+  test("清发送态 + forceSync + 不新增空 assistant 气泡", () => {
+    const s = sess();
+    const u = addMessage(s, "user", "问题", { status: "sent" });
+    s._replyingToMsgId = u.id;
+    s._sendingInFlight = true;
+    const forceSync = vi.fn();
+    const before = s.messages.length;
+    applyOutboundMessage(
+      s,
+      msgFrame({ frameSeq: 1, isFinal: true, ts: Date.now(), blocks: [], meta: { reconcile: "turn_completed" } }),
+      { forceSync },
+    );
+    expect(s._sendingInFlight).toBe(false);
+    expect(forceSync).toHaveBeenCalledWith("s1");
+    // 空 blocks final 不合成空轮气泡(内容其实已在服务端生成,靠 forceSync 拉回)。
+    expect(s.messages.length).toBe(before);
+    expect(s.messages.some((m) => m.role === "assistant")).toBe(false);
+    expect(s.messages.some((m) => m._emptyTurn)).toBe(false);
+  });
+
+  test("普通空 blocks final(无 reconcile 标记)仍走既有空轮路径,不误触发 forceSync", () => {
+    const s = sess();
+    const u = addMessage(s, "user", "问题", { status: "sent" });
+    s._replyingToMsgId = u.id;
+    s._sendingInFlight = true;
+    const forceSync = vi.fn();
+    applyOutboundMessage(
+      s,
+      msgFrame({ frameSeq: 1, isFinal: true, ts: Date.now(), blocks: [], meta: { stopReason: "end_turn" } }),
+      { forceSync },
+    );
+    expect(forceSync).not.toHaveBeenCalled();
+    expect(s._sendingInFlight).toBe(false);
   });
 });
 

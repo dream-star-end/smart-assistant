@@ -7173,6 +7173,18 @@ export class Gateway {
       //(父会话的额度要跨多次 delegate 累计,turn 边界才复位)。
       this._hiddenDelegateGuard.resetForParent(sessionKey)
       this._memberDelegateGuard?.resetForParent(sessionKey)
+      // team-durability — 一次性子会话收尾即销毁:sessionKey 带时间戳永不复用,
+      // warm runner 留着是纯泄漏(2026-07-07 事故:4 个 delegate runner 各挂
+      // mcp-memory+vision 子进程,完成后 45+ 分钟不退,团队模式高频使用会堆
+      // 内存/pids —— v3 同类曾致 spawn EAGAIN)。fire-and-forget:runner.shutdown
+      // 是优雅退出可能耗秒级,不阻塞委派结果回传;destroySession 幂等,失败仅记日志
+      // (容器回收兜底)。嵌套委派在本 turn 内已全部收尾,销毁无悬挂引用。
+      this.sessions.destroySession(sessionKey).catch((err) =>
+        this.log.warn('delegate session destroy failed', {
+          sessionKey,
+          err: String(err),
+        }),
+      )
     }
 
     eventBus.emit('agent.completed', createEvent('agent.completed', targetAgentId, {
@@ -9126,31 +9138,59 @@ export class Gateway {
         session &&
         _shouldPushTurnInterruptedFinal(
           peerInFlight,
-          session.runner.isRunning,
           session._activeTurnCount,
+          session._activeClientTurnCount,
         )
       ) {
         try {
           // Single-ws send (only the hello-ing client should see this notice),
           // so deliver() isn't appropriate here — stamp ts inline.
-          const interruptFrame = JSON.stringify({
-            type: 'outbound.message',
-            sessionKey,
-            channel: 'webchat',
-            peer: { id: peerId, kind: 'dm' },
-            agentId: aid,
-            blocks: [
-              {
-                kind: 'text',
-                text: '\n\n⚠️ 上一轮对话被服务重启中断，请重新发送消息继续。',
-              },
-            ],
-            meta: { interrupted: 'service_restart' } as any,
-            isFinal: true,
-            ts: Date.now(),
-          })
-          ws.send(interruptFrame)
-          this.log.info('auto-resume pushed turn-interrupted isFinal', { sessionKey })
+          //
+          // team-durability — 按最近客户 turn 的收尾方式分流:
+          //   - 'completed':turn 已在服务端正常完成,客户端只是错过了终态帧
+          //     (断连窗口 + ring 冲穿)。推**静默 reconcile final**(空 blocks +
+          //     meta.reconcile),前端清发送态并 force-sync 拉回 REST 权威内容。
+          //     绝不能用"被中断请重发"文案 —— turn 已计费,诱导重发=重复付费。
+          //   - 'errored'/undefined(重启后 warm session 丢字段等):维持原
+          //     service_restart 中断语义。
+          const completedNormally = session._lastClientTurnOutcome === 'completed'
+          const reconcileFrame = JSON.stringify(
+            completedNormally
+              ? {
+                  type: 'outbound.message',
+                  sessionKey,
+                  channel: 'webchat',
+                  peer: { id: peerId, kind: 'dm' },
+                  agentId: aid,
+                  blocks: [],
+                  meta: { reconcile: 'turn_completed' } as any,
+                  isFinal: true,
+                  ts: Date.now(),
+                }
+              : {
+                  type: 'outbound.message',
+                  sessionKey,
+                  channel: 'webchat',
+                  peer: { id: peerId, kind: 'dm' },
+                  agentId: aid,
+                  blocks: [
+                    {
+                      kind: 'text',
+                      text: '\n\n⚠️ 上一轮对话被服务重启中断，请重新发送消息继续。',
+                    },
+                  ],
+                  meta: { interrupted: 'service_restart' } as any,
+                  isFinal: true,
+                  ts: Date.now(),
+                },
+          )
+          ws.send(reconcileFrame)
+          this.log.info(
+            completedNormally
+              ? 'auto-resume pushed turn-completed reconcile isFinal'
+              : 'auto-resume pushed turn-interrupted isFinal',
+            { sessionKey },
+          )
         } catch {}
       }
     }
@@ -10335,93 +10375,115 @@ export class Gateway {
         : {}),
       ...(effectiveToolsets !== undefined ? { toolsets: effectiveToolsets } : {}),
     }
-    await this.sessions.submit(
-      session,
-      payload,
-      onLeaderEvent,
-      safeEffortLevel,
-      safeModel,
-      safeRequestId,
-      turnTraceId,
-      safeConversationMode,
-      leaderSubmitOpts,
-    )
+    // team-durability — 客户 turn 级 in-flight 计数:从首次 submit 到 review 编排
+    // 收尾(含 continuation 再 submit 与 deliverHeldFinal)整段视为"turn 在飞"。
+    // engine 级 _activeTurnCount 在 submit 返回后归零,团队模式下 review pass 还要
+    // 跑数分钟 —— 没有这层计数,hello 重连会在编排窗口误判 turn 已结束并推终态帧。
+    this.sessions.beginClientTurn(session)
+    let clientTurnThrew = false
+    try {
+      await this.sessions.submit(
+        session,
+        payload,
+        onLeaderEvent,
+        safeEffortLevel,
+        safeModel,
+        safeRequestId,
+        turnTraceId,
+        safeConversationMode,
+        leaderSubmitOpts,
+      )
 
-    // ── P2 债C — hidden reviewer 硬编排 review pass(仅 teamMode 队长 + webchat)──
-    //
-    // 队长 turn 已完成但 final 被扣住(finalHeld)。此处是审查触发的**唯一权威**:
-    //   - 本 turn 没发生过非隐藏委派 → 无需审查,立即放行扣住的 final;
-    //   - 发生过 → 由 gateway 代码触发 review delegate(内部直调 _runDelegateTask,
-    //     isReview:true),解析 verdict:PASS 放行 / NEEDS_FIX 把审查意见以 system
-    //     continuation 喂回队长续写并再审(封顶 resolveTeamReviewMaxRounds 轮)。
-    //
-    // 红线(降级全部放行,队长绝不卡死等 verdict):review 委派的任何非"完成且有裁决"
-    // 结果(闸拒/排队超时/429/503/session 抛错/超时/解析不出 VERDICT),以及 continuation
-    // 本身出错(turnErrored),一律放行队长 final + 卡片/文案披露"审查未完成"。重启中断
-    // 由 submit reject 走 turnErrored 或 review rejected/error → 同样降级放行。
-    if (orchestrateReview) {
-      const deliverHeldFinal = (disclosure?: string) => {
-        // 披露作为一条独立 assistant 文本 block 追加(preamble 已删"队长自述审查失败",
-        // 改由 gateway 在此如实披露);无披露(PASS)则只发终态 final。
-        if (disclosure) {
-          const discBlock = { kind: 'text' as const, text: disclosure }
-          out.blocks.push(discBlock as (typeof out.blocks)[number])
-          this.deliver(
-            { ...out, blocks: [discBlock as (typeof out.blocks)[number]], isFinal: false },
-            undefined,
-          )
-        }
-        this.deliver({ ...out, blocks: [], isFinal: true, meta: heldFinalMeta }, undefined)
-        if (frame.idempotencyKey && (frame as any)._idempotencyPreReserved) {
-          this._updateWechatIdempotency(frame.idempotencyKey, { completed: true })
-        }
-        out.blocks.length = 0
-        aggregatedBlocks.length = 0
-      }
-      if (turnErrored) {
-        // 队长 turn 报错:error/apiError 分支已投递终态错误帧,无草稿可审、无 final 待放行。
-      } else if (!finalHeld) {
-        // 防御:正常 completed turn 一定命中 final 分支扣住;未扣住说明是非常规终态,不介入。
-      } else if (!(this._turnDelegatedNonHiddenByParent ??= new Set()).has(sessionKey)) {
-        // 本 turn 队长没真正组队(自己答完)→ 无需审查,直接放行扣住的 final。
-        deliverHeldFinal()
-      } else {
-        // 组队发生 → 跑审查状态机。副作用(跑审查 / 续写)以回调注入,便于单测断言
-        // PASS 放行 / NEEDS_FIX 续写 / 降级放行 三路 + 迭代封顶,而不必驱动整条 dispatchInbound。
-        const outcome = await this._runTeamReviewPass({
-          sessionKey,
-          maxRounds: resolveTeamReviewMaxRounds(),
-          runReview: () =>
-            this._runDelegateTask({
-              targetAgentId: HIDDEN_REVIEWER_AGENT_ID,
-              goal: '对队长准备提交给用户的最终答复草稿做独立质量审查,给出结构化裁决。',
-              context: buildTeamReviewContext(text, (session.currentAssistantBuf ?? '').trim()),
-              sourceAgent: 'main',
-              parentSessionKey: sessionKey,
-              streamProgress: true,
-              depth: 0,
-              isReview: true,
-            }),
-          submitContinuation: async (reviewOutput) => {
-            // 审查意见喂回队长续写;复用 onLeaderEvent(block 继续流、final 再被扣住)。
-            finalHeld = false
-            currentRun = this._runLog.start({ agentId: session.agentId, sessionKey, taskType })
-            await this.sessions.submit(
-              session,
-              buildTeamReviewContinuation(reviewOutput),
-              onLeaderEvent,
-              safeEffortLevel,
-              safeModel,
-              safeRequestId,
-              turnTraceId,
-              safeConversationMode,
-              leaderSubmitOpts,
+      // ── P2 债C — hidden reviewer 硬编排 review pass(仅 teamMode 队长 + webchat)──
+      //
+      // 队长 turn 已完成但 final 被扣住(finalHeld)。此处是审查触发的**唯一权威**:
+      //   - 本 turn 没发生过非隐藏委派 → 无需审查,立即放行扣住的 final;
+      //   - 发生过 → 由 gateway 代码触发 review delegate(内部直调 _runDelegateTask,
+      //     isReview:true),解析 verdict:PASS 放行 / NEEDS_FIX 把审查意见以 system
+      //     continuation 喂回队长续写并再审(封顶 resolveTeamReviewMaxRounds 轮)。
+      //
+      // 红线(降级全部放行,队长绝不卡死等 verdict):review 委派的任何非"完成且有裁决"
+      // 结果(闸拒/排队超时/429/503/session 抛错/超时/解析不出 VERDICT),以及 continuation
+      // 本身出错(turnErrored),一律放行队长 final + 卡片/文案披露"审查未完成"。重启中断
+      // 由 submit reject 走 turnErrored 或 review rejected/error → 同样降级放行。
+      if (orchestrateReview) {
+        const deliverHeldFinal = (disclosure?: string) => {
+          // 披露作为一条独立 assistant 文本 block 追加(preamble 已删"队长自述审查失败",
+          // 改由 gateway 在此如实披露);无披露(PASS)则只发终态 final。
+          if (disclosure) {
+            const discBlock = { kind: 'text' as const, text: disclosure }
+            out.blocks.push(discBlock as (typeof out.blocks)[number])
+            this.deliver(
+              { ...out, blocks: [discBlock as (typeof out.blocks)[number]], isFinal: false },
+              undefined,
             )
-            return turnErrored ? 'errored' : finalHeld ? 'held' : 'other'
-          },
-        })
-        if (outcome.deliver) deliverHeldFinal(outcome.disclosure)
+          }
+          this.deliver({ ...out, blocks: [], isFinal: true, meta: heldFinalMeta }, undefined)
+          if (frame.idempotencyKey && (frame as any)._idempotencyPreReserved) {
+            this._updateWechatIdempotency(frame.idempotencyKey, { completed: true })
+          }
+          out.blocks.length = 0
+          aggregatedBlocks.length = 0
+        }
+        if (turnErrored) {
+          // 队长 turn 报错:error/apiError 分支已投递终态错误帧,无草稿可审、无 final 待放行。
+        } else if (!finalHeld) {
+          // 防御:正常 completed turn 一定命中 final 分支扣住;未扣住说明是非常规终态,不介入。
+        } else if (!(this._turnDelegatedNonHiddenByParent ??= new Set()).has(sessionKey)) {
+          // 本 turn 队长没真正组队(自己答完)→ 无需审查,直接放行扣住的 final。
+          deliverHeldFinal()
+        } else {
+          // 组队发生 → 跑审查状态机。副作用(跑审查 / 续写)以回调注入,便于单测断言
+          // PASS 放行 / NEEDS_FIX 续写 / 降级放行 三路 + 迭代封顶,而不必驱动整条 dispatchInbound。
+          const outcome = await this._runTeamReviewPass({
+            sessionKey,
+            maxRounds: resolveTeamReviewMaxRounds(),
+            runReview: () =>
+              this._runDelegateTask({
+                targetAgentId: HIDDEN_REVIEWER_AGENT_ID,
+                goal: '对队长准备提交给用户的最终答复草稿做独立质量审查,给出结构化裁决。',
+                context: buildTeamReviewContext(text, (session.currentAssistantBuf ?? '').trim()),
+                sourceAgent: 'main',
+                parentSessionKey: sessionKey,
+                streamProgress: true,
+                depth: 0,
+                isReview: true,
+              }),
+            submitContinuation: async (reviewOutput) => {
+              // 审查意见喂回队长续写;复用 onLeaderEvent(block 继续流、final 再被扣住)。
+              finalHeld = false
+              currentRun = this._runLog.start({ agentId: session.agentId, sessionKey, taskType })
+              await this.sessions.submit(
+                session,
+                buildTeamReviewContinuation(reviewOutput),
+                onLeaderEvent,
+                safeEffortLevel,
+                safeModel,
+                safeRequestId,
+                turnTraceId,
+                safeConversationMode,
+                leaderSubmitOpts,
+              )
+              return turnErrored ? 'errored' : finalHeld ? 'held' : 'other'
+            },
+          })
+          if (outcome.deliver) deliverHeldFinal(outcome.disclosure)
+        }
+        // team-durability — turn 真正终点的迟到产物补 persist:review 委派完成后
+        // buffer 的团队卡(带 verdict)发生在 engine persist 之后,错过当轮 drain。
+        // 此处无条件 drain(防跨 turn 泄漏到下一轮)、有货才补一次 agentGroups-only
+        // persist,REST 权威副本才含完整 turn 尾段(2026-07-07 事故:reviewer PASS
+        // 卡丢失,客户端全量重拉救不回)。
+        this.sessions.persistLateTurnArtifacts(session)
       }
+    } catch (err) {
+      clientTurnThrew = true
+      throw err
+    } finally {
+      this.sessions.endClientTurn(
+        session,
+        turnErrored || clientTurnThrew ? 'errored' : 'completed',
+      )
     }
     if (liveWechatAdapter) {
       await liveWechatSendQueue
@@ -10513,7 +10575,25 @@ export class Gateway {
     if (sessionKey) {
       const frameSeq = this._outboundRing.nextSeq(sessionKey)
       data = JSON.stringify({ ...wire, ts: now, frameSeq })
-      const evicted = this._outboundRing.store(sessionKey, frameSeq, now, data)
+      // team-durability 帧分级:delegate_progress-only 的 outbound.message 与
+      // turn_status sideband 是易失 UX 帧(REST 权威副本不含、也不需要),归
+      // 'progress' 级 —— ring 超限时先淘它们,保住正文/终态帧的回放窗口。团队模式
+      // review/嵌套委派以 >15 帧/s 刷进度帧,不分级时 2 分钟就冲穿整个 ring。
+      const blocks = (wire as { blocks?: Array<{ kind?: string }> }).blocks
+      const isProgressFrame =
+        wire.type === 'outbound.turn_status' ||
+        (wire.type === 'outbound.message' &&
+          Array.isArray(blocks) &&
+          blocks.length > 0 &&
+          !(wire as { isFinal?: boolean }).isFinal &&
+          blocks.every((b) => b?.kind === 'delegate_progress'))
+      const evicted = this._outboundRing.store(
+        sessionKey,
+        frameSeq,
+        now,
+        data,
+        isProgressFrame ? 'progress' : 'content',
+      )
       this._recordRingEvictions(evicted)
     } else {
       data = JSON.stringify({ ...wire, ts: now })
@@ -10731,18 +10811,29 @@ export function _inheritOutboundRouting(
  * try / finally). See `AgentSession._activeTurnCount` jsdoc for the
  * counter's full contract.
  *
+ * ── team-durability(2026-07-07)改判据 ──
+ *
+ * 旧判据还看 `runner.isRunning`(peerInFlight && isRunning → 不推)。这在 warm
+ * runner 架构下是死条件:codex app-server 与 warm CCB runner 在 turn **之间**
+ * 常驻(isRunning 恒 true),导致"turn 已在服务端正常结束、客户端错过终态帧还
+ * 挂着发送态"的会话永远等不到对账 —— 2026-07-07 团队模式事故里客户端重连 6 次
+ * 都没被救回,spinner 无限计数。turn 是否在飞的真值源是两个 turn 级计数,进程级
+ * isRunning 不再参与判定:turn 活着 ⇒ 必有 submit 在飞 ⇒ engine counter > 0;
+ * 团队模式 review 编排窗口(engine turn 已结束、编排未收尾)⇒ client counter > 0。
+ * 旧判据护住的三个 respawn 窗口(phantom-turn / auth-refresh / effort swap)全在
+ * submit try/finally 内,engine counter 覆盖,语义无回退。
+ *
  * Decision table:
  *
- * | peerInFlight | isRunning | activeTurnCount | result |
- * |--------------|-----------|-----------------|--------|
- * | false        | *         | *               | false (nothing stuck to clear) |
- * | true         | true      | *               | false (process alive, will drive turn) |
- * | true         | false     | > 0             | false (turn still alive — Plan 1 fix) |
- * | true         | false     | 0 or undefined  | **true** (turn genuinely interrupted) |
+ * | peerInFlight | engineTurnCount | clientTurnCount | result |
+ * |--------------|-----------------|-----------------|--------|
+ * | false        | *               | *               | false (nothing stuck to clear) |
+ * | true         | > 0             | *               | false (engine turn in flight) |
+ * | true         | *               | > 0             | false (turn 编排在飞,含 review pass) |
+ * | true         | 0/undefined     | 0/undefined     | **true** (turn 已终结,客户端悬空) |
  *
- * `activeTurnCount` is `undefined` for historical session objects / test
- * fakes / sessions created before Plan 1 — treat as 0(`?? 0`), preserving
- * the pre-Plan-1 behavior for those cases.
+ * counters are `undefined` for historical session objects / test fakes —
+ * treat as 0(`?? 0`).
  *
  * Exported as `_`-prefixed test seam — single-call-site internal helper,
  * underscore signals "do not import from outside gateway". Pure function,
@@ -10750,12 +10841,12 @@ export function _inheritOutboundRouting(
  */
 export function _shouldPushTurnInterruptedFinal(
   peerInFlight: boolean | undefined,
-  isRunning: boolean,
-  activeTurnCount: number | undefined,
+  engineTurnCount: number | undefined,
+  clientTurnCount: number | undefined,
 ): boolean {
   if (!peerInFlight) return false
-  if (isRunning) return false
-  if ((activeTurnCount ?? 0) > 0) return false
+  if ((engineTurnCount ?? 0) > 0) return false
+  if ((clientTurnCount ?? 0) > 0) return false
   return true
 }
 

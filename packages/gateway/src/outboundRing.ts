@@ -10,10 +10,24 @@
 // misses, we emit `outbound.resume_failed` and the client escalates to REST.
 //
 // Bounds per sessionKey:
-//   - max entries (default 2000)
+//   - max entries (default 4000)
 //   - max wall-clock age in ms (default 10 min)
-//   - max cumulative serialized bytes (default 5 MB)
-// Whichever fires first evicts the oldest entry.
+//   - max cumulative serialized bytes (default 8 MB)
+// Whichever fires first evicts an entry.
+//
+// ── 帧分级(team-durability 2026-07-07)──
+// 帧分两级:`content`(正文/thinking/tool/final 等终态或 REST 权威内容)与
+// `progress`(delegate_progress 进度行、turn_status sideband 等易失 UX 帧)。
+// 团队模式 review/嵌套委派以 >15 帧/s 刷 progress 帧,2 分钟离线窗口即可冲穿
+// 旧 2000 帧配额,把同窗口内的正文和 final 一起挤掉(resume buffer_miss,
+// 2026-07-07 事故)。规则:
+//   - entries/bytes 超限时**先淘汰最老的 progress 帧**,无 progress 可淘才动 content;
+//   - 每个 ring 维护 `contentLossSeq` = 已被淘汰的 content 帧的最大 seq;
+//   - 回放判据从"最老帧必须与游标连续"改为"游标 ≥ contentLossSeq":纯 progress
+//     空洞可安全跳过(客户端 frameSeq 游标只单调去重、不要求连续),content 有损
+//     才升级 buffer_miss → REST 全量重拉。
+
+export type FrameClass = 'content' | 'progress'
 
 export interface RingConfig {
   maxEntries: number
@@ -22,9 +36,9 @@ export interface RingConfig {
 }
 
 export const DEFAULT_RING_CONFIG: RingConfig = {
-  maxEntries: 2000,
+  maxEntries: 4000,
   maxAgeMs: 10 * 60_000,
-  maxBytes: 5 * 1024 * 1024,
+  maxBytes: 8 * 1024 * 1024,
 }
 
 interface RingEntry {
@@ -32,11 +46,16 @@ interface RingEntry {
   ts: number
   data: string
   bytes: number
+  cls: FrameClass
 }
 
 interface SessionRing {
   frames: RingEntry[]
   totalBytes: number
+  /** 已被淘汰(entries/bytes/age 任一原因)的 content 帧的最大 seq;0=从未丢 content。
+   *  SessionRing 结构体被 pruneAll 整体回收时它随之消失 —— 那时 peekReplay 走
+   *  no_buffer 路径(fromSeq>0),同样升级 REST,判定不放松。 */
+  contentLossSeq: number
 }
 
 export type ReplayMissReason = 'no_buffer' | 'buffer_miss' | 'sequence_mismatch'
@@ -85,14 +104,23 @@ export class OutboundRingBuffer {
    * monotonic. Calls prune() after insertion and returns the eviction
    * cause counts produced by that prune so the caller can feed metrics.
    */
-  store(sessionKey: string, seq: number, now: number, data: string): EvictionStats {
+  store(
+    sessionKey: string,
+    seq: number,
+    now: number,
+    data: string,
+    cls: FrameClass = 'content',
+  ): EvictionStats {
     let ring = this.rings.get(sessionKey)
     if (!ring) {
-      ring = { frames: [], totalBytes: 0 }
+      // 重建 ring(pruneAll 曾整体回收 / 首帧)时,seq>1 说明此前有帧且已不可回放,
+      // 水位线保守初始化为 seq-1 —— 否则"回收后重建"的 ring 会把重建前丢失的
+      // content 帧误判为可跳过的 progress 空洞。
+      ring = { frames: [], totalBytes: 0, contentLossSeq: Math.max(0, seq - 1) }
       this.rings.set(sessionKey, ring)
     }
     const bytes = Buffer.byteLength(data, 'utf8')
-    ring.frames.push({ seq, ts: now, data, bytes })
+    ring.frames.push({ seq, ts: now, data, bytes, cls })
     ring.totalBytes += bytes
     return this.prune(ring, now)
   }
@@ -117,7 +145,13 @@ export class OutboundRingBuffer {
    * with the previous container's seq=1. This keeps `storeStamped` purely
    * idempotent — no in-band reset detection.
    */
-  storeStamped(sessionKey: string, seq: number, now: number, data: string): EvictionStats {
+  storeStamped(
+    sessionKey: string,
+    seq: number,
+    now: number,
+    data: string,
+    cls: FrameClass = 'content',
+  ): EvictionStats {
     const prevLast = this.lastSeq.get(sessionKey) ?? 0
     if (seq <= prevLast) {
       // Multi-bridge duplicate or upstream-bug retransmit. Skip silently.
@@ -126,11 +160,12 @@ export class OutboundRingBuffer {
     this.lastSeq.set(sessionKey, seq)
     let ring = this.rings.get(sessionKey)
     if (!ring) {
-      ring = { frames: [], totalBytes: 0 }
+      // 同 store():重建 ring 时水位线保守初始化为 seq-1(见 store 内注释)。
+      ring = { frames: [], totalBytes: 0, contentLossSeq: Math.max(0, seq - 1) }
       this.rings.set(sessionKey, ring)
     }
     const bytes = Buffer.byteLength(data, 'utf8')
-    ring.frames.push({ seq, ts: now, data, bytes })
+    ring.frames.push({ seq, ts: now, data, bytes, cls })
     ring.totalBytes += bytes
     return this.prune(ring, now)
   }
@@ -203,8 +238,10 @@ export class OutboundRingBuffer {
       // edits reorder the branches.
       return { ok: true, sent: [], to: currentLast, evicted }
     }
-    const earliest = ring.frames[0].seq
-    if (earliest > fromSeq + 1) {
+    // 帧分级判据:游标之后只要丢过任何 content 帧就 miss(client 必须 REST 重拉);
+    // 只丢过 progress 帧(contentLossSeq ≤ fromSeq)则照常回放 —— 留存帧之间的
+    // seq 空洞全部是 progress 损耗,客户端游标单调去重、天然容忍空洞。
+    if (ring.contentLossSeq > fromSeq) {
       return { ok: false, sent: [], to: currentLast, reason: 'buffer_miss', evicted }
     }
     const frames = ring.frames.filter((f) => f.seq > fromSeq)
@@ -279,6 +316,11 @@ export class OutboundRingBuffer {
    *  prevents one frame from being counted under two causes (which would
    *  double-count in metrics) while still trimming the ring to satisfy all
    *  bounds. Returns the per-cause counts so callers can feed Prometheus.
+   *
+   *  帧分级淘汰:entries/bytes 压力下先淘最老的 progress 帧(mid-array splice,
+   *  frames 保持 seq 有序;n≤maxEntries,线性扫描代价可忽略),无 progress 才淘
+   *  frames[0]。age 淘汰始终从头部走(ts 随 seq 单调,头部即最老)。任何 content
+   *  帧被淘汰都推进 contentLossSeq 水位线。
    */
   private prune(ring: SessionRing, now: number): EvictionStats {
     const stats: EvictionStats = { entries: 0, age: 0, bytes: 0 }
@@ -289,8 +331,19 @@ export class OutboundRingBuffer {
       else if (ring.totalBytes > this.config.maxBytes) cause = 'bytes'
       else if (ring.frames[0].ts < cutoff) cause = 'age'
       if (!cause) break
-      const dropped = ring.frames.shift()
-      if (dropped) ring.totalBytes -= dropped.bytes
+      let dropped: RingEntry | undefined
+      if (cause === 'age') {
+        dropped = ring.frames.shift()
+      } else {
+        const pi = ring.frames.findIndex((f) => f.cls === 'progress')
+        dropped = pi >= 0 ? ring.frames.splice(pi, 1)[0] : ring.frames.shift()
+      }
+      if (dropped) {
+        ring.totalBytes -= dropped.bytes
+        if (dropped.cls === 'content' && dropped.seq > ring.contentLossSeq) {
+          ring.contentLossSeq = dropped.seq
+        }
+      }
       stats[cause]++
     }
     return stats

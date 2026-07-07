@@ -80,6 +80,18 @@ describe("toolSummary 摘要 (P5)", () => {
       "→ 质量审查员 审查代码",
     );
   });
+  test("delegate_tasks(并行委派)标签为「并行委派」+ 摘要为 N 个并行子任务(带首个 goal)", () => {
+    expect(resolveToolMeta("mcp__openclaude-memory__delegate_tasks").label).toBe("并行委派");
+    expect(resolveToolMeta("delegate_tasks").label).toBe("并行委派");
+    expect(
+      toolSummary("mcp__openclaude-memory__delegate_tasks", {
+        tasks: [{ agentId: "coding-assistant", goal: "写代码" }, { goal: "查资料" }],
+      }),
+    ).toBe("2 个并行子任务: 写代码");
+    expect(toolSummary("delegate_tasks", { tasks: [{ goal: "只有一个" }] })).toBe("1 个并行子任务: 只有一个");
+    // 防御非数组 tasks。
+    expect(toolSummary("mcp__openclaude-memory__delegate_tasks", { tasks: "oops" })).toBe("0 个并行子任务");
+  });
   test("MCP memory skill_search / web-context 摘要", () => {
     expect(toolSummary("mcp__openclaude-memory__skill_search", { query: "literature-search" })).toBe(
       "literature-search",

@@ -522,10 +522,13 @@ export class ChatSocket {
         this.resetThinkingSafety(sessId);
         return;
       }
-      // (b) 连接活但久无帧 → transient 软提示，保持 _sendingInFlight 不变，继续 arm。
+      // (b) 连接活但久无帧 → 主动去抖对账服务端记录(追回 WS 静默漏掉、resume 覆盖不到的内容;
+      //     若该轮其实已在服务端收尾,对账会拉回真实内容并清发送态),再挂 transient 软提示,
+      //     保持 _sendingInFlight 不变、继续 arm。turn 生死仍交给 server 权威,绝不自动 stop。
+      this.reconcileSession(sessId);
       this.setTransientNotice(
         sessId,
-        "较长时间未收到新内容，可能仍在处理。可继续等待，或停止后重新发送。",
+        "较长时间未收到新内容，已自动核对服务端记录；可继续等待，或停止后重新发送。",
       );
       this.resetThinkingSafety(sessId);
     }, THINKING_SAFETY_MS);

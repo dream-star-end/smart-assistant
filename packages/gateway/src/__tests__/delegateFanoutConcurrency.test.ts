@@ -66,6 +66,8 @@ function makeGateway(): any {
   })
   gw._releaseHold = () => releaseHold()
   gw.sessions = {
+    // team-durability — 一次性委派子会话收尾即销毁(fake 为 no-op,防泄漏语义在生产实现)
+    destroySession: async () => {},
     getByKey: (key: string) => (key === PARENT_KEY ? parentSession : undefined),
     interrupt: () => false,
     getOrCreate: async () => ({

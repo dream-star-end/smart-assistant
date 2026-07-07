@@ -1,13 +1,21 @@
 /**
- * turn-alive-heartbeat (Plan 1) — `_shouldPushTurnInterruptedFinal` unit tests.
+ * `_shouldPushTurnInterruptedFinal` unit tests(autoResumeFromHello 合成终态帧判据)。
  *
- * Helper is the autoResumeFromHello synthetic-isFinal judgment for v3 commercial
- * chat. The pre-Plan-1 condition was `peerInFlight && !runner.isRunning`, which
- * uses process-level liveness as a stand-in for turn-level liveness and races
- * against in-turn subprocess respawn windows (phantom-turn / auth-refresh /
- * effort+model swap). Plan 1 introduces `AgentSession._activeTurnCount` as the
- * turn-level truth source; this helper is the single judgment point exercised
- * by `Gateway.autoResumeFromHello`.
+ * 历史:Plan 1(turn-alive-heartbeat)把判据从进程级 `runner.isRunning` 升级为
+ * engine turn 计数 `_activeTurnCount`,堵 submit 内 subprocess respawn 窗口误推。
+ *
+ * team-durability(2026-07-07)再升级:去掉 isRunning 参与(warm runner 架构下
+ * codex app-server / warm CCB runner 在 turn 之间常驻,isRunning 恒 true,导致
+ * "turn 已正常结束、客户端错过终态帧"的会话永远等不到对账 —— 团队模式事故里
+ * 客户端重连 6 次都没被救回),并加入 client turn 计数 `_activeClientTurnCount`
+ * (覆盖 engine turn 结束后 gateway 还在跑 hidden-reviewer 硬编排的窗口)。
+ *
+ * 新决策表(helper jsdoc 同步):
+ * | peerInFlight | engineTurnCount | clientTurnCount | result |
+ * | false        | *               | *               | false  |
+ * | true         | > 0             | *               | false  |
+ * | true         | *               | > 0             | false  |
+ * | true         | 0/undefined     | 0/undefined     | true   |
  *
  * Repository convention: import from `../server.js` (TS source resolves via
  * tsx). See `deliverStripAndConnTrace.test.ts` for the same pattern.
@@ -18,73 +26,75 @@ import assert from 'node:assert/strict'
 
 import { _shouldPushTurnInterruptedFinal } from '../server.js'
 
-// ── core 4-case matrix from the helper jsdoc decision table ──
+// ── core matrix from the helper jsdoc decision table ──
 
 test('peer not in-flight → false (nothing stuck to clear)', () => {
-  // Even with proc down and no active turn, if the peer itself is not marked
-  // in-flight there is no stuck client state to release.
-  assert.equal(_shouldPushTurnInterruptedFinal(false, false, 0), false)
+  // Even with both counters at 0, if the peer itself is not marked in-flight
+  // there is no stuck client state to release.
+  assert.equal(_shouldPushTurnInterruptedFinal(false, 0, 0), false)
   // undefined peer.inFlight should be treated as not-in-flight too.
-  assert.equal(_shouldPushTurnInterruptedFinal(undefined, false, 0), false)
+  assert.equal(_shouldPushTurnInterruptedFinal(undefined, 0, 0), false)
 })
 
-test('peer in-flight + runner alive → false (process will drive turn)', () => {
-  // Old judgment also returned false here; preserved.  Active turn count is
-  // intentionally irrelevant when the process is alive.
-  assert.equal(_shouldPushTurnInterruptedFinal(true, true, 0), false)
-  assert.equal(_shouldPushTurnInterruptedFinal(true, true, 1), false)
-  assert.equal(_shouldPushTurnInterruptedFinal(true, true, 5), false)
-})
-
-test('peer in-flight + proc dead + active turn → false (Plan 1 fix)', () => {
-  // This is the core regression the fix addresses: subprocess respawn windows
-  // (phantom-turn / auth-refresh / effort+model swap) leave runner.isRunning
-  // momentarily false while the same submit() promise is still pending.
-  // Sending a synthetic isFinal here strands the user.
-  assert.equal(_shouldPushTurnInterruptedFinal(true, false, 1), false)
+test('peer in-flight + engine turn in flight → false', () => {
+  // submit() promise pending — covers phantom-turn / auth-refresh / effort+
+  // model swap respawn windows (all inside submit try/finally).
+  assert.equal(_shouldPushTurnInterruptedFinal(true, 1, 0), false)
   // Defensive: counter > 1 (queued submit waiting on prev) should also block.
-  assert.equal(_shouldPushTurnInterruptedFinal(true, false, 2), false)
+  assert.equal(_shouldPushTurnInterruptedFinal(true, 2, 0), false)
 })
 
-test('peer in-flight + proc dead + no active turn → true (push isFinal)', () => {
-  // This is the genuine "turn interrupted, client stuck" path the original
-  // code targeted.  Counter 0 means no submit() is pending — proc really is
-  // gone and the turn really did end.
-  assert.equal(_shouldPushTurnInterruptedFinal(true, false, 0), true)
+test('peer in-flight + client turn orchestration in flight → false', () => {
+  // 团队模式核心窗口:engine turn 已结束(engine counter 0)但 gateway 还在跑
+  // hidden-reviewer review pass / continuation。此时 hello 重连绝不能推终态帧
+  // (turn 还活着,后续帧会继续流)。
+  assert.equal(_shouldPushTurnInterruptedFinal(true, 0, 1), false)
+  // Both alive (initial submit inside client-turn scope) — still false.
+  assert.equal(_shouldPushTurnInterruptedFinal(true, 1, 1), false)
 })
 
-// ── compatibility: activeTurnCount field missing ──
+test('peer in-flight + both counters 0 → true (push reconcile/interrupted isFinal)', () => {
+  // "turn 已终结、客户端悬空"的对账路径。warm runner(isRunning=true)不再
+  // 挡住这条路 —— 这正是 2026-07-07 事故修的洞。
+  assert.equal(_shouldPushTurnInterruptedFinal(true, 0, 0), true)
+})
 
-test('activeTurnCount undefined → treated as 0 (preserves pre-Plan-1 behavior)', () => {
-  // Historical session objects, test fakes, or sessions created in a code
-  // path that bypasses submit() won't have the field set.  Treating undefined
-  // as 0 preserves the pre-Plan-1 judgment for those cases.  This is also a
-  // future-proofing guard: if a refactor accidentally drops the `?? 0` fallback,
-  // this test will catch it.
+// ── compatibility: counter fields missing ──
+
+test('undefined counters → treated as 0', () => {
+  // Historical session objects, test fakes, or sessions created in code paths
+  // that bypass submit()/dispatchInbound won't have the fields set. Treating
+  // undefined as 0 preserves the reconcile push for those cases. Also a
+  // future-proofing guard: if a refactor drops the `?? 0` fallback, this
+  // test catches it.
   assert.equal(
-    _shouldPushTurnInterruptedFinal(true, false, undefined),
+    _shouldPushTurnInterruptedFinal(true, undefined, undefined),
     true,
-    'undefined active count + interrupted turn → push isFinal (matches counter=0)',
+    'both undefined + peer in-flight → push (matches counters=0)',
   )
   assert.equal(
-    _shouldPushTurnInterruptedFinal(true, true, undefined),
+    _shouldPushTurnInterruptedFinal(true, 1, undefined),
     false,
-    'undefined active count but proc alive → still no push',
+    'engine turn alive → no push regardless of missing client counter',
   )
   assert.equal(
-    _shouldPushTurnInterruptedFinal(false, false, undefined),
+    _shouldPushTurnInterruptedFinal(true, undefined, 1),
     false,
-    'undefined active count but peer not in-flight → still no push',
+    'client turn alive → no push regardless of missing engine counter',
+  )
+  assert.equal(
+    _shouldPushTurnInterruptedFinal(false, undefined, undefined),
+    false,
+    'peer not in-flight → still no push',
   )
 })
 
 // ── defensive: stale negative counter values ──
 
-test('negative activeTurnCount → treated as 0 (defense against double-finally)', () => {
+test('negative counters → treated as 0 (defense against double-finally)', () => {
   // Math.max(0, n - 1) in sessionManager already guards the producer side,
-  // but defense-in-depth: if a future regression lets a negative value slip
-  // in, the consumer should treat it as "no active turn" (the same as 0)
+  // but defense-in-depth: negative values must read as "no active turn"
   // rather than "turn alive" (which would silently suppress legitimate
-  // isFinal pushes).
-  assert.equal(_shouldPushTurnInterruptedFinal(true, false, -1), true)
+  // reconcile pushes).
+  assert.equal(_shouldPushTurnInterruptedFinal(true, -1, -1), true)
 })
