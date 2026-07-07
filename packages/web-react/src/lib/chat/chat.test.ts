@@ -374,13 +374,41 @@ describe("applyOutboundMessage (§3/§7/§9/§11)", () => {
     expect(tool?.bashTail?.totalBytes).toBe(100);
   });
 
-  test("§11 stale-final predating bound user msg is dropped (no false teardown)", () => {
+  test("§11 stale-final 早于最近 turn 边界的 server 截止 → 丢弃(不误 teardown)", () => {
     const s = sess();
     const u = addMessage(s, "user", "hi", { status: "sent", ts: 1000 });
     s._replyingToMsgId = u.id;
     s._sendingInFlight = true;
+    // 上一轮 turn 边界(resetReplyTracker)定格的 server 域截止 = 1000。
+    s._lastServerTs = 1000;
+    s._trackerResetServerTs = 1000;
+    // server ts=500 ≤ 截止 → stale late final → 丢弃,不误 teardown。
     applyOutboundMessage(s, msgFrame({ frameSeq: 1, isFinal: true, ts: 500, blocks: [] }));
     expect(s._sendingInFlight).toBe(true); // dropped → no teardown
+  });
+
+  test("§11 客户端钟快于 server:本轮合法 final 不被吞 → 正常 teardown(消除跨钟域卡「回复中」)", () => {
+    const s = sess();
+    // 设备钟比 server 快 5min:user 行客户端 ts 很大(addMessage 用 Date.now())。
+    const u = addMessage(s, "user", "hi", { status: "sent", ts: Date.now() + 5 * 60_000 });
+    s._replyingToMsgId = u.id;
+    s._sendingInFlight = true;
+    // server 域 turn 边界截止只有 1000(远小于客户端钟)。
+    s._lastServerTs = 1000;
+    s._trackerResetServerTs = 1000;
+    // 本轮答案帧(server ts=1400 > 1000 → 放行,绑定并流出内容)。
+    applyOutboundMessage(
+      s,
+      msgFrame({ frameSeq: 1, ts: 1400, blocks: [{ kind: "text", text: "答", messageId: "srv-1" }] }),
+    );
+    // 本轮合法 final(server ts=1500 > 截止 1000)。旧跨钟域实现会因 1500 < boundMsg.ts(客户端
+    // +5min)误判 stale 丢弃 → _sendingInFlight 永不清 → 永久卡「回复中」。
+    applyOutboundMessage(
+      s,
+      msgFrame({ frameSeq: 2, isFinal: true, ts: 1500, blocks: [], meta: { stopReason: "end_turn" } }),
+    );
+    expect(s._sendingInFlight).toBe(false); // 正常收尾
+    expect(s.messages.some((m) => m.text === "答")).toBe(true);
   });
 
   test("reload 后新非 final 内容帧会在 guard 之后恢复 _sendingInFlight", () => {
@@ -1678,6 +1706,33 @@ describe("ChatSocket safeWsSend backpressure (§2) + offline enqueue (§10)", ()
     expect(stored.messages.find((m) => m.role === "user")?.text).toBe("hi");
     expect(stored._sendingInFlight).toBe(true);
     expect(typeof stored._turnStartedAt).toBe("number");
+  });
+
+  test("生成中(busy)再发 → 入队 queued 不并轨;turn 结束后 drain 自动发出", async () => {
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const sock = makeSocket();
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    ws.open();
+    // 第一条:正常直发 → in-flight。
+    sock.sendMessage({ sessId: "s1", agentId: "main", text: "first" });
+    const s = sock.sessions.get("s1")!;
+    expect(s._sendingInFlight).toBe(true);
+    const inboundAfterFirst = ws.sent.filter((d) => d.includes('"inbound.message"')).length;
+    expect(inboundAfterFirst).toBe(1);
+
+    // 第二条:生成中 → 入本地队列标 queued,**不并轨直发**(防 mid-turn 并发 + 重复计费)。
+    sock.sendMessage({ sessId: "s1", agentId: "main", text: "second" });
+    expect(s.messages.find((m) => m.text === "second")?.status).toBe("queued");
+    expect(ws.sent.filter((d) => d.includes('"inbound.message"')).length).toBe(1);
+
+    // 本轮结束(此处以 stop 收尾清 _sendingInFlight)→ kickQueuedDrainIfIdle(deferred)自动发出。
+    sock.stopTurn("s1");
+    expect(s._sendingInFlight).toBe(false);
+    await new Promise((r) => setTimeout(r, 0)); // flush 延迟一个 macrotask 的 drain 触发
+    expect(ws.sent.some((d) => d.includes('"inbound.message"') && d.includes("second"))).toBe(true);
+    expect(s.messages.find((m) => m.text === "second")?.status).toBe("sent");
+    sock.stop();
   });
 
   test("restored in-flight session sends hello with inFlight=true", () => {

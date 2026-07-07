@@ -103,6 +103,13 @@ export type ChatMessage = {
    * 过程树),本地富卡(m-*)同 runId 存在时 local-wins。判定统一走 isServerAuthoredRow()。
    */
   _source?: "server" | "local";
+  /**
+   * server 权威单调序号(getSession 按 `_seq > since` 增量下发,随每行带回)。**跨会话历史
+   * 排序的权威源**:server-authored 行携带,本地乐观行(user 气泡 / 团队卡在被 server echo 回
+   * 之前)缺省。排序优先用它(纯 server 域,免受客户端时钟偏移影响);缺省行回退到 ts。
+   * 见 persist.stableSortByTs。
+   */
+  _seq?: number;
 
   // ── user ──
   status?: UserMsgStatus;

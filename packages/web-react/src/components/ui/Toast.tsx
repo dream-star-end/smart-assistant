@@ -46,7 +46,9 @@ export function ToastProvider({ children }: { children: ReactNode }) {
       if (!message) return;
       const id = ++seq.current;
       setItems((cur) => [...cur, { id, message, tone }]);
-      window.setTimeout(() => dismiss(id), AUTO_DISMISS_MS);
+      // 错误提示不自动消失(可达性:屏幕阅读器/慢读用户不会因 3.5s 自隐而错过失败原因;
+      // 用户可点 X 关闭)。成功/信息类保持短暂自隐。
+      if (tone !== "error") window.setTimeout(() => dismiss(id), AUTO_DISMISS_MS);
     },
     [dismiss],
   );
@@ -61,8 +63,9 @@ export function ToastProvider({ children }: { children: ReactNode }) {
           return (
             <div
               key={t.id}
-              role="status"
-              aria-live="polite"
+              // 错误提示用 alert/assertive 立即打断朗读;成功/信息用 status/polite 不打断。
+              role={t.tone === "error" ? "alert" : "status"}
+              aria-live={t.tone === "error" ? "assertive" : "polite"}
               className={cn(
                 "pointer-events-auto flex max-w-[92vw] items-center gap-2 rounded-xl border px-3.5 py-2.5 text-[13px] font-medium shadow-float backdrop-blur data-[state=open]:animate-in sm:max-w-md",
                 s.cls,

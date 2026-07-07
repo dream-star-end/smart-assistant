@@ -18,7 +18,11 @@ export function ErrorBanner({
   onDismiss: () => void;
 }) {
   return (
-    <div className="mx-auto mb-2 flex max-w-3xl items-start gap-3 rounded-lg border border-danger/30 bg-danger-soft px-4 py-3">
+    <div
+      role="alert"
+      aria-live="assertive"
+      className="mx-auto mb-2 flex max-w-3xl items-start gap-3 rounded-lg border border-danger/30 bg-danger-soft px-4 py-3"
+    >
       <span className="mt-0.5 flex size-6 shrink-0 items-center justify-center rounded-md bg-danger-soft text-danger">
         <AlertTriangle size={14} />
       </span>

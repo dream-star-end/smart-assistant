@@ -646,6 +646,8 @@ export class ChatSocket {
     sess._localTeardownAt = typeof sess._trackerResetAt === "number" ? sess._trackerResetAt : Date.now();
     if (opts.clearThinking) this.clearThinkingSafety(sess.id);
     if (opts.persist !== false) this.deps.persistSession?.(sess.id);
+    // stop / 超时 / 错误清 in-flight 后,若有生成中排队的消息 → 顺序发出。
+    this.kickQueuedDrainIfIdle();
   }
 
   // ═══════════════ reducer effects ═══════════════
@@ -673,6 +675,8 @@ export class ChatSocket {
           else this.offlineQueueDraining = false;
           this.maybePromoteToConnected();
         }
+        // 生成中排队的后续消息:本轮 final 已清 _sendingInFlight → 顺序发出下一条。
+        if (!isCronOrHeartbeat) this.kickQueuedDrainIfIdle();
         // turn 收尾：落地完成轮（reload 不丢；游标 + 完整 tape durable）。
         this.deps.persistSession?.(sess.id);
       },
@@ -1580,7 +1584,30 @@ export class ChatSocket {
           /* 持久化失败:best-effort,跨设备该条不显,本地仍在 */
         });
     }
+    // 生成中排队(P2 易用性):本会话仍有 in-flight turn 时,后续消息不并轨直发 —— bridge 对
+    // mid-turn 并发 inbound 语义未定,且并发会重复计费。改标 queued 入本地队列,本轮 final /
+    // stop / 错误清 _sendingInFlight 后由 drain 单条顺序发出(对标 ChatGPT/Claude,见
+    // kickQueuedDrainIfIdle)。复用既有 offlineQueue:drainNextOfflineItem 本就"等本会话
+    // _sendingInFlight 结束才发",天然具备单飞 + 保序语义,无需并行第二套队列。
+    if (sess._sendingInFlight) {
+      const enqueued = this.tryEnqueueOffline({ sessId: sess.id, payload, msgId: userMsg.id });
+      userMsg.status = enqueued ? "queued" : "error";
+      this.scheduleNotify();
+      this.deps.persistSession?.(sess.id);
+      return;
+    }
     this.dispatchPayload(sess, userMsg, payload);
+  }
+
+  /**
+   * 本会话 turn 结束(final / stop / 错误)后,若在线且尚有排队消息 → 启动一轮 drain 发出。
+   * startOfflineDrainNow 自带单飞 + ws 就绪守卫(空队列 / 正在 drain 时 no-op);deferred 一个
+   * macrotask,避免在 reducer 处理 final 帧的同步栈里 re-enter 发送。
+   */
+  private kickQueuedDrainIfIdle(): void {
+    if (this.offlineQueue.length === 0) return;
+    if (!this.ws || this.ws.readyState !== 1) return;
+    setTimeout(() => this.startOfflineDrainNow(), 0);
   }
 
   /**
