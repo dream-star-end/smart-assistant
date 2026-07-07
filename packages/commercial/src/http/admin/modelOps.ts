@@ -45,7 +45,7 @@ function keyConfiguredMap(): Record<string, boolean> {
   const c = cfg();
   return {
     deepseek: !!c.DEEPSEEK_API_KEY,
-    minimax: !!c.ARK_AGENT_PLAN_KEY,
+    minimax: !!c.MINIMAX_TOKEN_PLAN_KEY,
     ark: !!c.ARK_CODING_PLAN_KEY,
     opencodego: !!c.OPENCODE_GO_API_KEY,
     kimi: !!c.ARK_AGENT_PLAN_KEY,

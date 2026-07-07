@@ -143,7 +143,8 @@ export async function startEgress(): Promise<void> {
   // 静态 key 解析表 —— proxyHandler 与延迟探测器(0105)共用同一份,防两处漂移。
   const staticProviderKeys = {
     deepseek: cfg.DEEPSEEK_API_KEY,
-    minimax: cfg.ARK_AGENT_PLAN_KEY,
+    // 2026-07-07:切回 MiniMax 官方(回退 06-30 火山迁移;火山 Ark 大图识图挂死,官方 4.9s)。
+    minimax: cfg.MINIMAX_TOKEN_PLAN_KEY,
     ark: cfg.ARK_CODING_PLAN_KEY,
     // 2026-07-05:OpenCode Go(qwen3.7-max/plus)。与 master internalProxyHandler 同口径注入。
     opencodego: cfg.OPENCODE_GO_API_KEY,

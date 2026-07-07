@@ -282,8 +282,8 @@ describe("pickUpstream — MiniMax route", () => {
     // 静态 provider 走显式直连 dispatcher,绕开全局日本代理。
     assert.equal(session.dispatcher, directEgressDispatcher());
     assert.equal(session.shouldUpdateQuotaFromResponse, false);
-    // 2026-06-30:MiniMax-M3 文本/识图上游切火山方舟 Agent Plan(同名托管 minimax-m3,Anthropic 兼容)。
-    assert.ok(session.endpoint.includes("ark.cn-beijing.volces.com/api/plan/v1/messages"));
+    // 2026-07-07:MiniMax-M3 文本/识图上游切回 MiniMax 官方(回退 06-30 火山迁移;火山 Ark 大图识图挂死)。
+    assert.ok(session.endpoint.includes("api.minimaxi.com/anthropic/v1/messages"));
 
     const safeHeaders: Record<string, string> = {
       "anthropic-beta": "interleaved-thinking-2025-05-14",

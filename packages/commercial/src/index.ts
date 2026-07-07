@@ -1313,9 +1313,9 @@ export async function registerCommercial(
         // ARK_AGENT_PLAN_KEY)/deepseek 不被该 guard 拦,缺失则命中其模型时 503。
         staticProviderKeys: {
           deepseek: cfg.DEEPSEEK_API_KEY,
-          // 2026-06-30:minimax provider 文本上游切火山 Agent Plan,key 来源改 ARK_AGENT_PLAN_KEY。
-          // (媒体 proxy tokenPlanKey 仍走 MINIMAX_TOKEN_PLAN_KEY,待 P2/P3 切火山后统一。)
-          minimax: cfg.ARK_AGENT_PLAN_KEY,
+          // 2026-07-07:minimax 文本/识图上游切回 MiniMax 官方,key 来源改回 MINIMAX_TOKEN_PLAN_KEY
+          //(与媒体/搜索 proxy 同 key;回退 06-30 火山迁移,因火山 Ark 大图识图挂死)。
+          minimax: cfg.MINIMAX_TOKEN_PLAN_KEY,
           ark: cfg.ARK_CODING_PLAN_KEY,
           // 2026-07-05:OpenCode Go(qwen3.7-max/plus)。个人订阅配额,缺 key 命中时 503。
           opencodego: cfg.OPENCODE_GO_API_KEY,
