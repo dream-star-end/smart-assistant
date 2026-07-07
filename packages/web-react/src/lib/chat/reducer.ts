@@ -786,24 +786,6 @@ export function applyOutboundMessage(
     }
   }
 
-  // ── 团队审查修订标记：NEEDS_FIX 后队长将重写完整最终稿。把本轮(最近 user 之后)已流出的
-  //    助手草稿正文标记为 superseded(渲染折叠"初稿"卡),并断开流式指针让修订稿另起新行 ——
-  //    live 视图与持久化(server-wins 只留终稿)的 replace 语义对齐。多轮审查(≤2)幂等:
-  //    第二轮把第一版修订稿同样折叠。──
-  if (!frame.isFinal && frame.meta?.teamRevision) {
-    for (let i = sess.messages.length - 1; i >= 0; i--) {
-      const m = sess.messages[i];
-      if (m.role === "user") break;
-      if (m.role === "assistant" && !m._supersededDraft && (m.text ?? "").trim().length > 0) {
-        m._supersededDraft = true;
-      }
-    }
-    sess._streamingAssistant = null;
-    sess._streamingThinking = null;
-    effects.persistSession?.(sess.id);
-    return;
-  }
-
   // ── reconcile 合成 final：hello 重连对账时 server 判定该轮**已在服务端正常收尾**、但客户端仍挂
   //    发送态(missed 真 final)。清发送态收口本轮 UI,但**不走空轮分类**(空 blocks 不合成空气泡——
   //    内容其实已在服务端生成),并强制 REST 全量对账拉回客户端丢失的内容(参考 applyResumeFailed)。──

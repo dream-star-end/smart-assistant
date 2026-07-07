@@ -58,8 +58,9 @@ function makeGateway(): any {
     destroySession: async () => {},
     beginClientTurn: () => {},
     endClientTurn: () => {},
-    persistLateTurnArtifacts: () => {},
-    getByKey: () => undefined,
+    // 队长自主送审(2026-07-07):hidden 目标委派要过团队门 —— fake 父会话恒为
+    // 团队模式队长 turn,让本文件继续专注串行硬上限语义。
+    getByKey: () => ({ _teamModeTurn: true, _currentTurnUserText: '测试任务' }),
     getOrCreate: async () => ({
       agentId: 'main',
       currentTurnStatus: null,
@@ -209,14 +210,25 @@ describe('handleDelegateTask — hidden 审查员串行硬上限', () => {
     assert.equal(other.status, 200)
   })
 
-  it('body 缺 parentSessionKey 时退化为按 sourceAgent 计数,硬上限仍生效(无绕过口)', async () => {
+  it('body 缺 parentSessionKey → 团队门 409 直接拒绝(比退化计数更强的无绕过口)', async () => {
+    // 队长自主送审(2026-07-07):无父会话键 = 无法核验团队 turn = 审查 fail-closed。
+    // 旧语义(退化按 sourceAgent 计数)由团队门取代 —— 连首个请求都进不来,防绕过更强。
     const gw = makeGateway()
     const body = { goal: '审查', sourceAgent: 'main' }
-    for (let i = 0; i < MAX_HIDDEN_DELEGATIONS_PER_TURN; i++) {
-      assert.equal((await delegate(gw, 'hidden-reviewer', body)).status, 200)
-    }
     const blocked = await delegate(gw, 'hidden-reviewer', body)
-    assert.equal(blocked.status, 429)
-    assert.match(blocked.body.error, /审查委派已达本轮上限/)
+    assert.equal(blocked.status, 409)
+    assert.match(blocked.body.error, /仅在团队模式/)
+  })
+
+  it('父会话非团队 turn → 审查 409 拒绝(非团队会话防误触发计费)', async () => {
+    const gw = makeGateway()
+    gw.sessions.getByKey = () => ({ _teamModeTurn: false })
+    const blocked = await delegate(gw, 'hidden-reviewer', {
+      goal: '审查',
+      sourceAgent: 'main',
+      parentSessionKey: PARENT_KEY,
+    })
+    assert.equal(blocked.status, 409)
+    assert.match(blocked.body.error, /仅在团队模式/)
   })
 })

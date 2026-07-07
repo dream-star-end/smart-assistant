@@ -572,6 +572,33 @@ const TOOLS = [
       required: ['tasks'],
     },
   },
+  // ── 团队质量审查(队长自主送审,2026-07-07) ──
+  {
+    name: 'request_review',
+    description: [
+      '【仅团队模式】把你准备提交给用户的**完整答复草稿**送独立质量审查员审查,',
+      '返回审查意见与结构化裁决(`VERDICT: PASS` / `VERDICT: NEEDS_FIX`)。',
+      '',
+      '使用纪律:除非任务明显简单(单一事实问答/寒暄/无实质交付物),组队完成的任务',
+      '在写最终答复**之前**都应送审;草稿只放本工具参数,不要先写进给用户的正文。',
+      'NEEDS_FIX → 修订草稿后可再送审一次(对误报可在 revisionNote 据理反驳);',
+      'PASS → 直接输出最终答复。审查有每轮次数上限,达到上限就输出当前最优终稿。',
+    ].join('\n'),
+    inputSchema: {
+      type: 'object',
+      properties: {
+        draft: {
+          type: 'string',
+          description: '准备提交给用户的完整答复草稿(全文,不是摘要)。',
+        },
+        revisionNote: {
+          type: 'string',
+          description: '可选:二次送审时说明你针对上轮审查意见做了什么修订/反驳了哪些误报。',
+        },
+      },
+      required: ['draft'],
+    },
+  },
   // (v5 ccb-only:ask_gpt55_codex direct bridge 已移除 —— 无 codex agent。)
 ]
 
@@ -667,6 +694,8 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
         return await handleDelegateTask(args as any)
       case 'delegate_tasks':
         return await handleDelegateTasks(args as any)
+      case 'request_review':
+        return await handleRequestReview(args as any)
       default:
         return { content: [{ type: 'text', text: `unknown tool: ${name}` }], isError: true }
     }
@@ -1412,6 +1441,28 @@ function postJsonToGateway(
       req.destroy(err)
     })
     req.end(opts.body)
+  })
+}
+
+/**
+ * 团队质量审查(队长自主送审):草稿经 gateway 委派给隐藏审查员 hidden-reviewer。
+ * gateway 侧按目标身份派生审查语义(资源闸保留槽/回传不封顶/结构化 verdict),并做
+ * 团队门(非团队 turn 409 拒绝)与审查任务书包装(用户原始需求取服务端权威快照)。
+ * 熔断:hidden guard ≤3 次/turn,超限 429 —— 直接把结构化错误回给队长收敛。
+ */
+async function handleRequestReview(args: { draft?: string; revisionNote?: string }) {
+  const draft = typeof args?.draft === 'string' ? args.draft.trim() : ''
+  if (!draft) {
+    return toolError('draft 必填:请把准备提交给用户的完整答复草稿放进 draft 参数')
+  }
+  const note =
+    typeof args?.revisionNote === 'string' && args.revisionNote.trim()
+      ? `\n\n【队长修订说明】\n${args.revisionNote.trim().slice(0, 4000)}`
+      : ''
+  return handleDelegateTaskToAgent('hidden-reviewer', {
+    goal: '对队长准备提交给用户的最终答复草稿做独立质量审查,给出结构化裁决。',
+    context: draft.slice(0, 16000) + note,
+    label: '质量审查',
   })
 }
 

@@ -220,7 +220,7 @@ BEGIN; <迁移 SQL>; INSERT INTO schema_migrations(version, applied_at) VALUES (
 | 债 | 内容 | 偿还触发 |
 |---|---|---|
 | ~~团队卡 server-authored 化~~ **已偿还**(4202986b+ac966d6f,P2 批次2) | 生成点=handleDelegateTask 收尾(parser Agent 排除保留);sink agentGroups[]→master role 'agent-group'(srv-*,_delegateStatus 三态)→storage/前端按 _delegateRunId **local-wins** 去重;server 行=骨架+终态(过程树有意不持久化,本设备 IndexedDB 承载)。**部署红线:master-first**(strict schema 新字段,新 gateway→旧 master 400 fatal-drop 整包)。TeamPanel 同批改按 turn 锚点归组 | — |
-| ~~hidden reviewer pipeline 硬编排~~ **已偿还**(9c36c34a,P2 批次3) | 审查触发权威=gateway `_runTeamReviewPass`(队长 final 放行前代码触发,verdict 协议 PASS/NEEDS_FIX 统一,迭代封顶2轮);preamble 软约束已退役;12 条失败路径全 fail-open(队长绝不卡死);runLog isReview/verdict 打标 | — |
+| ~~hidden reviewer pipeline 硬编排~~ **已退役**(2026-07-07 boss 裁决,被队长自主送审取代) | 演化:preamble 软约束(漂移)→ gateway 硬编排(9c36c34a)→ **队长自主送审**:preamble 纪律"除明显简单任务外都送审"+`request_review` 工具(mcp-memory→delegate hidden-reviewer);平台保证收敛为三件=isReview 按目标身份派生 / hidden guard ≤3次/turn / 团队门(父 turn 非团队 409,权威快照 `session._teamModeTurn`+`_currentTurnUserText`)。final 不再扣住,状态机/continuation/修订标记帧全删(防复活断言在 teamModeHiddenReviewer.test.ts)。**取舍(boss 知情选择)**:低遵循度队长模型可能漏送审,质量门从强制变纪律引导 | 若实测漏审率不可接受 → 复活 gateway 兜底(turn 结束未送审则补审) |
 | ~~审查成本用户披露~~ **已偿还**(9c36c34a+167f1628) | drain 时按 agent 分组附队长行 usage.delegates[](纯展示,不碰扣费收口);前端裁决徽记+积分明细;粒度=同 agentId 多轮合计 | — |
 | ~~可见性黑名单散点~~ **已偿还**(781108ce,P2 批次1) | 权威源上移 @openclaude/protocol agentVisibility(entrypoint 编译期共享,不再手抄);枚举面统一走 `_getAgentsConfigUserView()`/`filterUserVisibleByAgentField`,判定/执行面保留全量 predicate。新增枚举面必须走投影,新增系统 agent 只改 protocol 一处 | — |
 | feat/v5-copy-no-ai | 去 AI 措辞 chore(43d0078a)基老未合 | 下次文案批次重做 |
@@ -240,9 +240,9 @@ BEGIN; <迁移 SQL>; INSERT INTO schema_migrations(version, applied_at) VALUES (
 | 多 org 归属 | V1 单 active org(uq_user_active_org);放开=删索引+payer 选择+/api/org 显式 org_id | 真实客户需求 |
 | org 钱包锁竞争 | 同 org 高并发扣费串行化于 orgs 行锁(spendTwoBucket FOR UPDATE) | 大客户并发异常时改乐观扣减 |
 | org settle 归属竞态(接受) | resolveOrgBillingContext 不锁 membership,turn 边界毫秒窗口按解析时刻归属(裁决见该函数注释) | — |
-| review 降级披露不入 REST 副本 | deliverHeldFinal 的 disclosure 文案只走流式帧(requestId 复用会撞 request_map 去重,故不随补 persist 落库);客户端恰在该窗口离线且 ring 冲穿才会丢,纯 UX 文案面 | 用户报"审查降级说明刷新后消失" |
+| ~~review 降级披露不入 REST 副本~~ **已消失**(2026-07-07) | 随硬编排退役:不再有 gateway 侧降级披露文案(审查失败即工具错误,队长自行叙述) | — |
 | dispatchInbound 预处理窗口不计入 client turn | getOrCreate→首次 submit 之间(mkdir/parseDocument 等 ms 级)hello 重连仍可能误判 turn 未开始(Plan1 既有 follow-up,团队批次未扩) | 该窗口误判实际报障时 |
-| reviewer 委派成本归并晚一轮 | review 委派完成晚于 engine persist,其 pending 成本按既有"晚到 pending"语义并入**下一** turn 队长行(钱不丢,行归属晚一轮);根治=master 对 agentGroups-only persist 也 drain(需查同 turn 末条助手行) | 用户逐 turn 对账投诉归属 |
+| ~~reviewer 委派成本归并晚一轮~~ **已消失**(2026-07-07) | 随队长自主送审:审查委派在 engine turn 内完成,先于 engine persist → 正常当轮归因;迟到团队卡补 drain(persistLateTurnArtifacts)同步退役 | — |
 | master bridge ring 未接帧分级 | userChatBridge 的 storeStamped 恒 content 级(v5 回放权威在容器 ring,master 侧仅兜底),暂不影响 | master 侧 resume miss 成为主要报障源时 |
 
 ### P3.1 企业版速记(2026-07-06)

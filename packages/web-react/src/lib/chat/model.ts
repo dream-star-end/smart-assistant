@@ -128,9 +128,6 @@ export type ChatMessage = {
   _errorCode?: string;
   _errorDetail?: string;
   /** 空轮 notice 标记。*/
-  /** 团队审查修订:该助手草稿已被修订稿取代(teamRevision 标记帧落位),渲染为折叠
-   *  "初稿"卡。仅本地字段;刷新后 server-wins 只留终稿,草稿行整体消失(语义一致)。 */
-  _supersededDraft?: boolean;
   _emptyTurn?: boolean;
   _emptyTurnSoft?: boolean;
   _emptyTurnStopReason?: string | null;

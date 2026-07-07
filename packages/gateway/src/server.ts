@@ -804,14 +804,6 @@ function parseDelegateQueueWaitMs(): number {
 const HIDDEN_REVIEWER_AGENT_ID = 'hidden-reviewer'
 /** NEEDS_FIX → continuation → 再审 的迭代封顶(预算封顶,env 可配)。到顶强制放行 +
  *  披露"仍有未决意见"。默认 2;非法/缺省回退默认。硬护栏另见 MAX_HIDDEN_DELEGATIONS_PER_TURN。 */
-export const TEAM_REVIEW_MAX_ROUNDS_DEFAULT = 2
-function resolveTeamReviewMaxRounds(): number {
-  const raw = Number(process.env.OPENCLAUDE_TEAM_REVIEW_MAX_ROUNDS)
-  if (!Number.isFinite(raw)) return TEAM_REVIEW_MAX_ROUNDS_DEFAULT
-  // 下限 1(至少审一次)、上限对齐硬护栏(不让 env 把轮数抬过熔断)。
-  const n = Math.floor(raw)
-  return Math.min(Math.max(n, 1), MAX_HIDDEN_DELEGATIONS_PER_TURN)
-}
 /** 审查委派的 context:喂给隐藏审查员的用户原始需求 + 队长待提交草稿。 */
 function buildTeamReviewContext(userTask: string, leaderDraft: string): string {
   const task = userTask.trim().slice(0, 8000)
@@ -827,18 +819,6 @@ function buildTeamReviewContext(userTask: string, leaderDraft: string): string {
     draft || '(队长本轮没有产出文本草稿)',
     '',
     '审查完成后,按你的 persona 要求在最后单独一行输出结构化裁决:`VERDICT: PASS` 或 `VERDICT: NEEDS_FIX`。',
-  ].join('\n')
-}
-/** NEEDS_FIX 后喂回队长的 system continuation:带上审查意见,要求队长修订或据理反驳后重新给出最终答复。 */
-function buildTeamReviewContinuation(reviewOutput: string): string {
-  const review = reviewOutput.trim().slice(0, 16000)
-  return [
-    '【系统 · 质量审查反馈】隐藏审查员对你上面的草稿给出了 NEEDS_FIX 裁决,审查意见如下:',
-    '',
-    review || '(审查员未给出具体意见文本)',
-    '',
-    '请据此修订你给用户的最终答复:接受并修复真实问题,或对你判定为误报/非问题/范围外的意见给出简明理由。',
-    '然后直接输出修订后的最终答复(面向用户,不要复述本审查过程)。系统会在你完成后再次自动审查。',
   ].join('\n')
 }
 
@@ -909,7 +889,7 @@ function resolveMemberDelegationsPerTurn(): number {
 /** P2 批次4 — 委派回传给队长的 output 兜底封顶(字符数)。消"回传全量不裁剪"债:
  *  子 agent 的大产物应落文件、回传只给路径 + 蒸馏摘要(prompt 已教);本封顶是模型
  *  不照做时的最后一道保险,防超大回传把队长上下文撑爆 / 拖慢。仅对普通成员委派生效,
- *  **不裁 review 委派**(其 output 要经 buildTeamReviewContinuation 全量喂回队长续写)。
+ *  **不裁 review 委派**(其 output 作为送审工具结果全量回给队长,截断会丢审查意见)。
  *  截断时尾注引导落文件。默认 4000,env 可配(下限 500)。 */
 export const DELEGATE_OUTPUT_CAP_DEFAULT = 4000
 function resolveDelegateOutputCap(): number {
@@ -6841,9 +6821,31 @@ export class Gateway {
    * runLog 打 isReview;完成后从审查输出解析结构化 verdict 一并回带 + 落团队卡。
    */
   private async _runDelegateTask(input: RunDelegateInput): Promise<DelegateTaskResult> {
-    const { targetAgentId, goal, context, sourceAgent, toolsets, depth } = input
-    const isReview = input.isReview === true
+    const { targetAgentId, goal, sourceAgent, toolsets, depth } = input
+    let context = input.context
+    let isReview = input.isReview === true
     const parentSessionKey = input.parentSessionKey
+
+    // 队长自主送审(2026-07-07):目标是隐藏审查员 ⇒ 一律按审查语义执行(资源闸保留槽/
+    // 免 per-parent 桶/回传不封顶/结构化 verdict)。单一权威 = 目标身份,不采信调用方自报。
+    if (!isReview && isHiddenSystemAgentId(targetAgentId)) {
+      isReview = true
+      const parent =
+        typeof parentSessionKey === 'string' && parentSessionKey
+          ? this.sessions.getByKey(parentSessionKey)
+          : undefined
+      // 审查仅团队模式 turn 可用:结构化拒绝防非团队会话/嵌套委派误触发额外计费。
+      if (!parent?._teamModeTurn) {
+        return {
+          kind: 'rejected',
+          httpStatus: 409,
+          message: '质量审查仅在团队模式的队长回合中可用;当前回合请直接完成任务。',
+        }
+      }
+      // 外部送审(request_review 工具)的 context = 草稿正文;统一包装成审查任务书。
+      // 用户原始需求取父会话本 turn 入站文本的服务端权威快照,不采信模型自报。
+      context = buildTeamReviewContext(parent._currentTurnUserText ?? '', (context ?? '').trim())
+    }
 
     // Recursion guard: 深度闸必须先于资源闸(超深嵌套是硬错误,不进排队/不占等待名额)。
     if (depth >= 3) {
@@ -7131,7 +7133,7 @@ export class Gateway {
 
     // P2 债C — 标记"本 turn 队长实际发生过非隐藏委派"(据此在队长 final 放行前触发硬编排
     // 审查)。审查员自身(isReview / hidden)不置位,避免"审查=组队"的自指。progressTarget
-    // 是 webchat 父(与硬编排 orchestrateReview 判定同源),null 父(cron/嵌套)不置位。
+    // 是 webchat 父,null 父(cron/嵌套)不置位。
     if (!isReview && !isHiddenSystemAgentId(targetAgentId) && progressTarget) {
       ;(this._turnDelegatedNonHiddenByParent ??= new Set()).add(progressTarget.sessionKey)
     }
@@ -7333,8 +7335,8 @@ export class Gateway {
       kind: 'completed',
       ok: !error,
       // P2 批次4(1b)— 回传封顶:普通成员委派的 output 兜底截断(env 默认 4000 字,截断尾注
-      // 引导落文件)。**不裁 review**:review.output 要经 buildTeamReviewContinuation 全量喂回
-      // 队长续写(内部编排,不面向用户),截断会丢审查意见。团队卡 resultSummary(上方 2KB)独立。
+      // 引导落文件)。**不裁 review**:review.output 作为送审工具结果全量回给队长
+      // (内部流程,不面向用户),截断会丢审查意见。团队卡 resultSummary(上方 2KB)独立。
       output: isReview ? output.trim() : capDelegateOutput(output.trim()),
       error: error || undefined,
       timedOut,
@@ -7343,67 +7345,6 @@ export class Gateway {
     }
   }
 
-  /**
-   * P2 债C — hidden reviewer 硬编排的审查状态机(纯编排,副作用以回调注入)。
-   *
-   * dispatchInbound 在 teamMode 队长(webchat)turn 完成、且本 turn 实际组队后调用。
-   * 返回 { deliver, disclosure }:deliver=是否放行被扣住的队长 final(false 仅当
-   * continuation 'errored' —— 终态错误帧已由队长 turn 自投递,无需再放行);disclosure=
-   * 放行时附带的披露文案(降级/到顶时非空)。
-   *
-   * 红线(队长绝不卡死等 verdict):review 委派任何非"完成且解析出裁决"的结果
-   * (闸拒/429/503/session 抛错/超时/无 VERDICT)一律降级放行 + 披露;continuation
-   * 'other'(非常规终态)也收敛为放行,防挂起。副作用注入让本状态机可脱离
-   * dispatchInbound 单测(mock runReview 返回 PASS/NEEDS_FIX/rejected + mock
-   * submitContinuation 断言 PASS 放行 / NEEDS_FIX 续写 / 降级放行 / 迭代封顶)。
-   */
-  private async _runTeamReviewPass(args: {
-    sessionKey: string
-    maxRounds: number
-    /** 跑一轮审查委派(isReview)。返回 DelegateTaskResult。 */
-    runReview: () => Promise<DelegateTaskResult>
-    /** NEEDS_FIX → 把审查意见喂回队长续写。返回续写终态:
-     *  'held'(完成并再次扣住 final,继续下一轮)/ 'errored'(报错,终态帧已投递)/
-     *  'other'(非常规终态,防御性收尾放行)。 */
-    submitContinuation: (reviewOutput: string) => Promise<'held' | 'errored' | 'other'>
-  }): Promise<{ deliver: boolean; disclosure?: string }> {
-    const { sessionKey, maxRounds } = args
-    let round = 0
-    while (true) {
-      round++
-      const rev = await args.runReview()
-      if (rev.kind !== 'completed' || rev.timedOut || rev.error || !rev.verdict) {
-        const reason =
-          rev.kind === 'rejected'
-            ? `gate_${rev.httpStatus}`
-            : rev.kind === 'error'
-              ? 'error'
-              : rev.timedOut
-                ? 'timeout'
-                : rev.error
-                  ? 'delegate_error'
-                  : 'no_verdict'
-        this.log.info('team_review_degraded', { sessionKey, round, reason })
-        return {
-          deliver: true,
-          disclosure: '（说明:本轮团队质量审查未能完成,已直接返回队长的结论。）',
-        }
-      }
-      this.log.info('team_review', { sessionKey, round, verdict: rev.verdict })
-      if (rev.verdict === REVIEW_VERDICT_PASS) return { deliver: true }
-      // NEEDS_FIX
-      if (round >= maxRounds) {
-        return {
-          deliver: true,
-          disclosure: '（说明:质量审查仍有未决意见,已达审查迭代上限,返回队长当前结论。）',
-        }
-      }
-      const cont = await args.submitContinuation(rev.output)
-      if (cont === 'errored') return { deliver: false }
-      if (cont === 'other') return { deliver: true } // 防御:非常规终态 → 收尾放行,防挂起
-      // 'held' → 继续下一轮审查
-    }
-  }
 
   private async _handleWebhook(
     req: IncomingMessage,
@@ -10083,10 +10024,10 @@ export class Gateway {
         '- 按子任务量级选 `effort`：机械/简单子任务填 `low`，常规填 `medium`，攻坚/高难度填 `high`；拿不准就不填（用该成员默认档位），不要把简单活儿也开到 `high` 徒增开销与耗时。',
         '- 成员的大产物（完整代码/长文档/数据文件）会以「文件路径 + 摘要」的形式回传（大产物落在共享目录 `/home/agent/.openclaude/generated/`）；你综合最终答案时，需要完整内容就用 `Read` 按回传的路径读回来，别只凭摘要臆测。',
         '- 委派**只走 `delegate_task` / `delegate_tasks`**：这是平台唯一的组队/委派通道（有实时进度回传、计费与资源约束）。平台已停用 codex 原生 `Agent`/子进程编排，不存在这样的工具，不要尝试启动；需要拆分的子任务一律用这两个工具，不确定或不适合委派时就自己完成。',
-        // 审查**感知**(非触发):触发权威唯一在 gateway 硬编排(见 dispatchInbound review
-        // pass),这里只被动告知机制存在与反馈应对方式,不要求模型做任何审查动作 ——
-        // 与 P2 债C 删掉的"自觉调用审查员"软约束有本质区别,无漂移面。
-        '- 质量审查：你组队完成的最终答复会先经平台**强制质量审查**再送达用户（无需你触发）。按"可直接提交"的标准写答复；若之后收到【系统 · 质量审查反馈】，直接输出修订后的**完整**最终答复即可——平台会把初稿折叠，仅以你的修订稿作为呈现给用户的最终答案，不要复述审查过程、不要致歉。',
+        // 队长自主送审(2026-07-07 boss 裁决):审查触发权在队长,prompt 纪律强引导
+        // "除明显简单任务外都送审"。平台侧保证 = request_review 通道 + hidden guard
+        // 熔断(≤3/turn)+ 团队门;不再有 gateway 硬编排兜底(已整体退役)。
+        '- 质量审查（重要纪律）：写给用户的最终答复**之前**，先用 `request_review(draft)` 把准备提交的完整答复草稿送独立审查员——**草稿只放在工具参数里，不要先写进正文**。除非任务明显简单（单一事实问答、寒暄、无实质交付物），否则都必须送审。拿到 `VERDICT: PASS` 再输出最终答复；`NEEDS_FIX` 就修订草稿后再送审一次（对误报可在修订说明中据理反驳）。审查是内部流程：最终答复不要复述审查意见、不要致歉。送审有每轮次数上限，达到上限时直接输出你当前最优的最终答复。',
         '',
         '用户任务：',
         '',
@@ -10110,15 +10051,16 @@ export class Gateway {
     this._memberDelegateGuard?.resetForParent(sessionKey)
     // P2 债C — 新 turn 起始清零"本 turn 是否发生过非隐藏委派"跟踪(与上面的熔断重置同点)。
     ;(this._turnDelegatedNonHiddenByParent ??= new Set()).delete(sessionKey)
-    // P2 债C — hidden reviewer 硬编排状态。orchestrateReview:仅 teamMode 队长(main)且
-    // webchat(!adapter,team 是 webchat-only 功能)启用;此时队长 turn 的 final 被"扣住"
-    // (finalHeld),由下方 review pass 决定放行/续写/降级。currentRun 让 continuation 每轮
-    // 各记一条 runLog(callback 引用 currentRun 而非 _run)。turnErrored:error/apiError 分支
-    // 已投递终态错误帧,编排不再介入。
-    const orchestrateReview = teamMode && agent.id === 'main' && !adapter
-    let currentRun = this._runLog.start({ agentId: session.agentId, sessionKey, taskType })
-    let heldFinalMeta: Extract<SessionStreamEvent, { kind: 'final' }>['meta']
-    let finalHeld = false
+    // 队长自主送审(2026-07-07 boss 裁决,取代 P2 债C 的 gateway 硬编排):审查触发权
+    // 交还队长(preamble 纪律:除明显简单任务外都应经 request_review 送审),平台只提供
+    // 送审通道 + 熔断(hidden guard ≤3/turn)+ 团队门(非团队 turn 拒绝)。final 不再被
+    // 扣住,审查状态机/continuation/修订标记帧全部退役 —— 审查回到 turn
+    // 内部后,"审查成本晚一轮归因"与"迟到团队卡补 drain"两笔债自然消失(审查委派在
+    // engine persist 之前完成,走正常归因/drain)。此处只 stash 两个服务端权威快照,
+    // 供 _runDelegateTask 的审查门与审查任务书包装读取:
+    session._teamModeTurn = teamMode && agent.id === 'main' && !adapter
+    session._currentTurnUserText = (text ?? '').slice(0, 8000)
+    const currentRun = this._runLog.start({ agentId: session.agentId, sessionKey, taskType })
     let turnErrored = false
     // P1-3 续 — CCB 用 createAssistantAPIErrorMessage 把 API 调用错误包成
     // "API Error: ..." 文本作为正常 assistant text 流出(不抛 process error),
@@ -10133,9 +10075,6 @@ export class Gateway {
     // 永远拦不到。
     let _apiErrorIntercepted = false
     let _apiErrorText = ''
-    // P2 债C — 提取为具名回调,供硬编排 review pass 的 continuation 复用同一份流式处理
-    // (再次 submit 时 block 照常流给客户端、final 照常被 finalHeld 扣住)。非 team 路径
-    // 语义与原内联回调逐字节一致。
     const onLeaderEvent = (e: SessionStreamEvent) => {
       if (e.kind === 'block') {
         const b = e.block as any
@@ -10267,16 +10206,6 @@ export class Gateway {
           outputTokens: e.meta?.outputTokens,
           turn: e.meta?.turn,
         })
-        // ── P2 债C — 扣住队长 final ──
-        // teamMode 队长(webchat)turn 完成 → 不在此立即投递终态 final,而是 hold 住,
-        // 交给 submit 之后的硬编排 review pass 决定放行/续写/降级。runLog 已按本轮 completed
-        // 记账;idempotency 完成标记推迟到真正放行(deliverHeldFinal)。out.blocks 不清空
-        // (跨轮 continuation 仍复用本闭包流式;最终 deliverHeldFinal 清)。
-        if (orchestrateReview) {
-          heldFinalMeta = e.meta
-          finalHeld = true
-          return
-        }
         if (frame.idempotencyKey && (frame as any)._idempotencyPreReserved) {
           this._updateWechatIdempotency(frame.idempotencyKey, { completed: true })
         }
@@ -10490,10 +10419,11 @@ export class Gateway {
         : {}),
       ...(effectiveToolsets !== undefined ? { toolsets: effectiveToolsets } : {}),
     }
-    // team-durability — 客户 turn 级 in-flight 计数:从首次 submit 到 review 编排
-    // 收尾(含 continuation 再 submit 与 deliverHeldFinal)整段视为"turn 在飞"。
-    // engine 级 _activeTurnCount 在 submit 返回后归零,团队模式下 review pass 还要
-    // 跑数分钟 —— 没有这层计数,hello 重连会在编排窗口误判 turn 已结束并推终态帧。
+    // team-durability — 客户 turn 级 in-flight 计数(与 engine 级 _activeTurnCount 双计数,
+    // hello 重连对账据此判 turn 是否在飞)。历史上审查硬编排在 submit 之后还要跑数分钟,
+    // 这层计数覆盖了那段窗口;硬编排退役(2026-07-07 队长自主送审)后 client turn 与
+    // engine turn 范围重合,保留计数是对账判据的稳定契约(未来任何 post-submit 编排
+    // 复活时也无需再改 hello 判据)。
     this.sessions.beginClientTurn(session)
     let clientTurnThrew = false
     try {
@@ -10509,95 +10439,6 @@ export class Gateway {
         leaderSubmitOpts,
       )
 
-      // ── P2 债C — hidden reviewer 硬编排 review pass(仅 teamMode 队长 + webchat)──
-      //
-      // 队长 turn 已完成但 final 被扣住(finalHeld)。此处是审查触发的**唯一权威**:
-      //   - 本 turn 没发生过非隐藏委派 → 无需审查,立即放行扣住的 final;
-      //   - 发生过 → 由 gateway 代码触发 review delegate(内部直调 _runDelegateTask,
-      //     isReview:true),解析 verdict:PASS 放行 / NEEDS_FIX 把审查意见以 system
-      //     continuation 喂回队长续写并再审(封顶 resolveTeamReviewMaxRounds 轮)。
-      //
-      // 红线(降级全部放行,队长绝不卡死等 verdict):review 委派的任何非"完成且有裁决"
-      // 结果(闸拒/排队超时/429/503/session 抛错/超时/解析不出 VERDICT),以及 continuation
-      // 本身出错(turnErrored),一律放行队长 final + 卡片/文案披露"审查未完成"。重启中断
-      // 由 submit reject 走 turnErrored 或 review rejected/error → 同样降级放行。
-      if (orchestrateReview) {
-        const deliverHeldFinal = (disclosure?: string) => {
-          // 披露作为一条独立 assistant 文本 block 追加(preamble 已删"队长自述审查失败",
-          // 改由 gateway 在此如实披露);无披露(PASS)则只发终态 final。
-          if (disclosure) {
-            const discBlock = { kind: 'text' as const, text: disclosure }
-            out.blocks.push(discBlock as (typeof out.blocks)[number])
-            this.deliver(
-              { ...out, blocks: [discBlock as (typeof out.blocks)[number]], isFinal: false },
-              undefined,
-            )
-          }
-          this.deliver({ ...out, blocks: [], isFinal: true, meta: heldFinalMeta }, undefined)
-          if (frame.idempotencyKey && (frame as any)._idempotencyPreReserved) {
-            this._updateWechatIdempotency(frame.idempotencyKey, { completed: true })
-          }
-          out.blocks.length = 0
-          aggregatedBlocks.length = 0
-        }
-        if (turnErrored) {
-          // 队长 turn 报错:error/apiError 分支已投递终态错误帧,无草稿可审、无 final 待放行。
-        } else if (!finalHeld) {
-          // 防御:正常 completed turn 一定命中 final 分支扣住;未扣住说明是非常规终态,不介入。
-        } else if (!(this._turnDelegatedNonHiddenByParent ??= new Set()).has(sessionKey)) {
-          // 本 turn 队长没真正组队(自己答完)→ 无需审查,直接放行扣住的 final。
-          deliverHeldFinal()
-        } else {
-          // 组队发生 → 跑审查状态机。副作用(跑审查 / 续写)以回调注入,便于单测断言
-          // PASS 放行 / NEEDS_FIX 续写 / 降级放行 三路 + 迭代封顶,而不必驱动整条 dispatchInbound。
-          const outcome = await this._runTeamReviewPass({
-            sessionKey,
-            maxRounds: resolveTeamReviewMaxRounds(),
-            runReview: () =>
-              this._runDelegateTask({
-                targetAgentId: HIDDEN_REVIEWER_AGENT_ID,
-                goal: '对队长准备提交给用户的最终答复草稿做独立质量审查,给出结构化裁决。',
-                context: buildTeamReviewContext(text, (session.currentAssistantBuf ?? '').trim()),
-                sourceAgent: 'main',
-                parentSessionKey: sessionKey,
-                streamProgress: true,
-                depth: 0,
-                isReview: true,
-              }),
-            submitContinuation: async (reviewOutput) => {
-              // 修订标记帧:前端据此把已流出的草稿正文折叠为"初稿(已修订)",让修订稿成为
-              // 本轮唯一主体 —— 与持久化 server-wins 只留终稿的 replace 语义对齐(此前草稿
-              // 与修订稿并排全量展示,用户看到两份近重复长文,2026-07-07 boss 反馈)。
-              this.deliver(
-                { ...out, blocks: [], isFinal: false, meta: { teamRevision: true } as any },
-                undefined,
-              )
-              // 审查意见喂回队长续写;复用 onLeaderEvent(block 继续流、final 再被扣住)。
-              finalHeld = false
-              currentRun = this._runLog.start({ agentId: session.agentId, sessionKey, taskType })
-              await this.sessions.submit(
-                session,
-                buildTeamReviewContinuation(reviewOutput),
-                onLeaderEvent,
-                safeEffortLevel,
-                safeModel,
-                safeRequestId,
-                turnTraceId,
-                safeConversationMode,
-                leaderSubmitOpts,
-              )
-              return turnErrored ? 'errored' : finalHeld ? 'held' : 'other'
-            },
-          })
-          if (outcome.deliver) deliverHeldFinal(outcome.disclosure)
-        }
-        // team-durability — turn 真正终点的迟到产物补 persist:review 委派完成后
-        // buffer 的团队卡(带 verdict)发生在 engine persist 之后,错过当轮 drain。
-        // 此处无条件 drain(防跨 turn 泄漏到下一轮)、有货才补一次 agentGroups-only
-        // persist,REST 权威副本才含完整 turn 尾段(2026-07-07 事故:reviewer PASS
-        // 卡丢失,客户端全量重拉救不回)。
-        this.sessions.persistLateTurnArtifacts(session)
-      }
     } catch (err) {
       clientTurnThrew = true
       throw err
