@@ -237,7 +237,7 @@ BEGIN; <迁移 SQL>; INSERT INTO schema_migrations(version, applied_at) VALUES (
 | ~~teamMode 全局粘滞开关~~ **已偿还**(P2 批次4 前端) | 会话级 per-session 键+全局偏好默认继承(lib/teamMode.ts),A 关不影响 B,新会话承习惯 | — |
 | ~~TeamPanel 聚合脆弱~~ **已偿还**(批次2渲染+批次3并发) | coalesceTeam 改按 turn 锚点(最近 user 消息边界)归组;_activeDelegations 加 per-parent 分桶+review 保留槽 | — |
 | ~~landing 团队演示错位~~ **已偿还**(P2 批次4 前端) | 角色=真实三预设+审查员;并行≤3 与 per-parent 并发诚实对齐;账本字段对齐 TeamPanel;仍全虚构示意 | — |
-| provision 事务窗口过宽 | provisionV3Container 单 BEGIN 跨 docker create/start 慢操作,idle-in-tx(60s)可杀连接(07-06 事故根因;pg client error 已挂监听不再崩进程 90202532,僵尸 409 已有自愈) | idle-in-tx 规模化 reject 时,把 docker 副作用移出事务(需重构 per-uid lock+cap 门控原子性) |
+| ~~provision 事务窗口过宽~~ **已偿还**(07-07,saga 化,merge ae9036c0) | provisionV3Container 拆 saga 三段:Tx1 短事务(持 uid+host 双锁,cap 门控+ensureV3Volumes+INSERT 占位行 active/cid=NULL,COMMIT 释锁)→ 中段无事务无连接跑 docker+codex 慢 IO → Tx2 短事务落 cid → 补偿翻 vanished+docker rm。消除 idle-in-tx 强断(3/天)+ 部署惊群 statement_timeout 57014 串行失败(33/天)。**新常态**:active+cid=NULL 是合法 provisioning 中间态(≤PROVISION_INFLIGHT_GRACE_MS=15s),所有 provision 入口(WS/media/cronWake/prewarm)汇入唯一 makeUidSingleflight → cid-NULL 观察即孤儿→自愈;cronWake 预检 userHasRunningContainer 排除 cid-NULL。详见 [[v5-provision-saga-cron-codex-fix]] | — |
 | ~~v5 告警只入库不推送~~ **已偿还**(3a7e6f53,企微通道) | wecom_bot 通道+v5-only dispatcher(claim 按类型过滤);v3 侧告警亦经共享 outbox 送达企微。**过渡窗口**:v3 旧类型无关 claim 误抢 wecom 行→延迟 1-2min(退役即消失,勿关 v3 告警调度——轮询规则引擎全网唯一)。**v3 退役收尾新增项:轮询告警规则(accountPoolAllDown/LowCapacity 等)必须挪 v5,否则 v3 停服后检测面真空** | — |
 | ~~v5 无后台孤儿回收网~~ **部分偿还**(02878333,07-06) | orphanReconcile 已放开 v5-owned(channel 双侧隔离,与 409 自愈错峰幂等,smoke 白名单已登记);**idleSweep/volumeGc 仍钉死**(活跃容器误杀窗口/不可逆删卷) | idleSweep:补 turn 级活跃屏障后再放;volumeGc:v3 退役收尾+观察期结束后单独评估 |
 
