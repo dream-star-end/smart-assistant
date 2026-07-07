@@ -528,10 +528,21 @@ describe("成员管理权限矩阵(HTTP 端到端)", () => {
     assert.equal(r.json.member.org_role, "admin");
   });
 
-  test("admin 改 member 的 billing_enabled → 200", async (t) => {
+  // §2 越权修复:billing_enabled 与 org_role 同权级,仅 owner 可改。此前本用例断言
+  // "admin 改 billing_enabled → 200",即固化了越权行为(非-owner admin 能重开 owner
+  // 关掉的成员计费,让其重新消耗 org 钱包)。改为断言 admin 被拒 + owner 可改。
+  test("admin 改 member 的 billing_enabled → 403(仅 owner 可改计费)", async (t) => {
     if (skipIfNoPg(t)) return;
     const { admin, member } = await setupOrg();
     const r = await callOrg("PATCH", `/api/org/members/${member}`, await token(admin), { billing_enabled: false });
+    assert.equal(r.status, 403);
+    assert.equal(r.json.error.code, "FORBIDDEN");
+  });
+
+  test("owner 改 member 的 billing_enabled → 200", async (t) => {
+    if (skipIfNoPg(t)) return;
+    const { owner, member } = await setupOrg();
+    const r = await callOrg("PATCH", `/api/org/members/${member}`, await token(owner), { billing_enabled: false });
     assert.equal(r.status, 200);
     assert.equal(r.json.member.billing_enabled, false);
   });

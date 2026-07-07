@@ -300,12 +300,20 @@ export function AuthGate({
   );
 
   const errBox = shownErr && (
-    <div className="rounded-xl border border-danger/30 bg-danger-soft px-3.5 py-2.5 text-[13px] text-danger">
+    <div
+      role="alert"
+      aria-live="assertive"
+      className="rounded-xl border border-danger/30 bg-danger-soft px-3.5 py-2.5 text-[13px] text-danger"
+    >
       {shownErr}
     </div>
   );
   const noticeBox = notice && (
-    <div className="flex items-start gap-2 rounded-xl border border-success/30 bg-success-soft px-3.5 py-2.5 text-[13px] text-success">
+    <div
+      role="status"
+      aria-live="polite"
+      className="flex items-start gap-2 rounded-xl border border-success/30 bg-success-soft px-3.5 py-2.5 text-[13px] text-success"
+    >
       <Check size={15} className="mt-0.5 shrink-0" />
       <span>{notice}</span>
     </div>

@@ -1,4 +1,5 @@
 import * as Dialog from "@radix-ui/react-dialog";
+import { MAX_ATTACHMENTS_PER_MESSAGE } from "@openclaude/protocol";
 import { ArrowUp, FileText, Loader2, Mic, Plus, RotateCcw, Square, X } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useVoiceInput } from "../hooks/useVoiceInput";
@@ -22,7 +23,9 @@ type Attach = {
   file?: File;
 };
 
-const MAX_ATTACH = 8;
+// 附件件数上限:与后端 gateway 帧准入共用 protocol 单一权威常量,消除历史上前端 8 / 后端 5
+// 的漂移(用户挂 6-8 个上传成功却被后端拒)。
+const MAX_ATTACH = MAX_ATTACHMENTS_PER_MESSAGE;
 
 function mediaKindOf(mime: string): MediaRef["kind"] {
   if (mime.startsWith("image/")) return "image";
@@ -61,6 +64,15 @@ export function Composer({
   onOpenRepo?: () => void;
 }) {
   const [value, setValue] = useState("");
+  // 指针类型:粗指针(触屏/移动)下 Enter=换行(否则打不出多段消息),发送交给按钮;
+  // 细指针(桌面鼠标)下 Enter=发送。指针类型运行期几乎不变,挂载读一次即可;
+  // matchMedia 缺省(jsdom/SSR)回退细指针,保持桌面「Enter 发送」既有行为与测试稳定。
+  const [coarsePointer] = useState(
+    () =>
+      typeof window !== "undefined" &&
+      typeof window.matchMedia === "function" &&
+      window.matchMedia("(pointer: coarse)").matches,
+  );
   const [attachments, setAttachments] = useState<Attach[]>([]);
   const [preview, setPreview] = useState<{ url: string; name: string } | null>(null);
   const toast = useToast();
@@ -138,7 +150,10 @@ export function Composer({
   );
 
   const submit = () => {
-    if (busy || disabled || !canSend) return;
+    // 生成中(busy)不再拒发:发送经 WS service 的"排队"路径(status=queued),本轮结束自动
+    // 发出(对标 ChatGPT/Claude),用户不再干等。并轨安全由 service 侧保证——排队项只在
+    // 本会话 _sendingInFlight 清除后才真正下发,绝不 mid-turn 并发送(见 socket.dispatchPayload)。
+    if (disabled || !canSend) return;
     onSend(value.trim(), doneMedia.length ? doneMedia : undefined);
     setValue("");
     for (const a of attachments) revoke(a.previewUrl);
@@ -258,12 +273,13 @@ export function Composer({
             onChange={(e) => setValue(e.target.value)}
             onKeyDown={(e) => {
               if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
+                // 粗指针(移动/触屏):Enter=换行,发送交给按钮 —— 否则无法输入多段消息。
+                if (coarsePointer) return;
                 e.preventDefault();
-                // 生成中 Enter 一律 no-op:流式期间打字回车是高频误触,直接停掉本轮
-                // 损失整个回复。停止只留给显式按钮 / Esc。
-                if (!busy) submit();
+                submit();
               }
             }}
+            enterKeyHint={coarsePointer ? "enter" : "send"}
             placeholder={placeholder}
             className="max-h-[240px] min-h-[24px] flex-1 resize-none bg-transparent py-2 text-[16px] leading-relaxed text-fg outline-none placeholder:text-faint disabled:opacity-50"
           />

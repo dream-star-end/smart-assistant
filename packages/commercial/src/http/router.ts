@@ -498,7 +498,20 @@ type RouteHandler = (
  */
 const ADMIN_SELF_AUTH_ROUTES = new Set<string>(['GET /api/admin/metrics'])
 
+/**
+ * method 通配符。route.method = ANY_METHOD 时,该 path/pathPrefix 匹配**任意** HTTP method,
+ * method 判定完全下放给 handler 自身(如 dispatchOrgRoute 依 ORG_ROUTES 判定 method / 405)。
+ *
+ * 用途(§1 根治):把"某前缀下 method 的唯一权威"收口到子分发器,消除"外层 router 与子分发器
+ * 各维护一份 method 列表"的重复。此前 `/api/org/` 在 router 里逐个列 GET/POST/PATCH/DELETE,
+ * 而 invoicesRoutes 新增了 PUT /api/org/invoice-profile —— router 漏注册 PUT,请求在 router
+ * 层被判 405,永远到不了 dispatchOrgRoute → 整个 org 发票抬头功能死路由。改用通配后,
+ * ORG_ROUTES 成为 method 唯一权威,新增任何 method 的 org 路由都无需再动 router。
+ */
+const ANY_METHOD = '*'
+
 interface Route {
+  /** HTTP method,或 ANY_METHOD('*')= 该路径任意 method 都转发给 handler(见 ANY_METHOD)。 */
   method: string
   /**
    * 精确路径。动态参数路由(如 `/api/payment/orders/:order_no`)用 `pathPrefix` 字段,
@@ -588,12 +601,13 @@ export function createCommercialHandler(
     // (见 http/org/routes.ts)。org 由服务端从 caller membership 推导,不接受
     // 客户端传 org_id。**不**落入 BLOCKED_FOR_USER_RULES / 容器代理(浏览器用户 JWT
     // 路径,容器不持有;/api/org 也不在 BRIDGE 白名单)。exact `/api/org` = 概要,
-    // prefix `/api/org/*` = 子资源;各方法均转发,真正的 method/404/405 判定在分发器内。
-    { method: 'GET', path: '/api/org', handler: dispatchOrgRoute },
-    { method: 'GET', pathPrefix: '/api/org/', handler: dispatchOrgRoute },
-    { method: 'POST', pathPrefix: '/api/org/', handler: dispatchOrgRoute },
-    { method: 'PATCH', pathPrefix: '/api/org/', handler: dispatchOrgRoute },
-    { method: 'DELETE', pathPrefix: '/api/org/', handler: dispatchOrgRoute },
+    // prefix `/api/org/*` = 子资源。
+    // §1 根治:用 ANY_METHOD 通配转发 —— method / 404 / 405(含正确 Allow 头)判定全部
+    // 下放给 dispatchOrgRoute(依 ORG_ROUTES 判)。ORG_ROUTES 成为 method 唯一权威,
+    // 消除"router 逐个列 method"与"ORG_ROUTES 声明 method"两份清单漂移(此前漏 PUT
+    // 导致 /api/org/invoice-profile 死路由)。新增任何 method 的 org 路由无需再动 router。
+    { method: ANY_METHOD, path: '/api/org', handler: dispatchOrgRoute },
+    { method: ANY_METHOD, pathPrefix: '/api/org/', handler: dispatchOrgRoute },
     { method: 'GET', path: '/api/public/config', handler: handleGetPublicConfig },
     { method: 'GET', path: '/api/public/models', handler: handleListPublicModels },
     // V3 Phase 2 Task 2F: 容器/前端按 spec 用 /api/models;沿用 /api/public/models 同一 handler
@@ -1560,7 +1574,11 @@ export function createCommercialHandler(
         ? routes.filter((r) => r.pathPrefix !== undefined && path.startsWith(r.pathPrefix))
         : []
     const candidates = exactCandidates.length > 0 ? exactCandidates : prefixCandidates
-    const route = candidates.find((r) => r.method === method)
+    // 精确 method 命中优先;未命中再退到 ANY_METHOD 通配路由(§1:把某前缀的 method 权威
+    // 下放给 handler,如 dispatchOrgRoute)。无通配 → undefined,走既有 405 分支不受影响。
+    const route =
+      candidates.find((r) => r.method === method) ??
+      candidates.find((r) => r.method === ANY_METHOD)
     // route label —— 同时给 metrics 与 access log 使用
     const labelRoute =
       route?.path ??

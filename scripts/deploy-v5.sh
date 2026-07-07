@@ -64,6 +64,21 @@ REMOVE_KEYS=(
   COMMERCIAL_CODEX_REFRESH_ACTOR_DISABLED COMMERCIAL_CODEX_DRIFT_RECONCILER_DISABLED
 )
 
+# 守卫:overrides 文件不得含任何 REMOVE_KEYS —— env 生成顺序是"删 REMOVE_KEYS 再追加
+# overrides",若 overrides 里又出现被剥离的键,会覆盖剥离让它复活(如 CODEX_REFRESH_ACTOR_DISABLED
+# 复活 → 重 bootstrap/DR 后 v5 codex token 无人续期,静默烂池)。让这类矛盾在部署时爆而非 DR 时爆。
+assert_overrides_no_remove_keys() {
+  local ov="$REPO_ROOT/deploy/v5/commercial-v5.env.overrides" k bad=0
+  [ -f "$ov" ] || { echo "FATAL: overrides 文件缺失: $ov" >&2; exit 1; }
+  for k in "${REMOVE_KEYS[@]}"; do
+    if grep -Eq "^[[:space:]]*${k}=" "$ov"; then
+      echo "FATAL: overrides 含 REMOVE_KEYS 键 '${k}' —— 会覆盖 deploy 的剥离,禁止。删掉该行。" >&2
+      bad=1
+    fi
+  done
+  [ "$bad" = 0 ] || exit 1
+}
+
 DRY=0; MODE="deploy"; ROLLBACK_N=1; RESTART_EGRESS=0
 for arg in "$@"; do
   case "$arg" in
@@ -187,6 +202,8 @@ smoke() {
 # ───────────────────────── bootstrap:首次建立 v5 ─────────────────────────
 bootstrap() {
   echo "══ v5 bootstrap on $KL_HOST ══"
+  echo "── 守卫:overrides 不得含 REMOVE_KEYS ──"
+  assert_overrides_no_remove_keys
   # 1) 源码树
   echo "── 1) rsync v5 源码 → $REMOTE_SRC ──"
   run "rsync -az --delete ${RSYNC_EXCLUDES[*]} '$REPO_ROOT/' '$KL_HOST:$REMOTE_SRC/'"
@@ -229,6 +246,8 @@ bootstrap() {
 # ───────────────────────── deploy:增量 ─────────────────────────
 deploy() {
   echo "══ v5 deploy on $KL_HOST ══"
+  echo "── 守卫:overrides 不得含 REMOVE_KEYS ──"
+  assert_overrides_no_remove_keys
   # 快照轮转 .prev.1..5
   echo "── 快照 $REMOTE_SRC → .prev.1(轮转 1..5)──"
   # 轮转用 if(非 && 链)——避免 set -e 下 `[ test ] && cmd` 在 test 失败时整体非零退出;

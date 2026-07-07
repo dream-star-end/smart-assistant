@@ -127,6 +127,7 @@ export interface MemberActor {
  * 若只在 HTTP 层事前判定,目标在窗口内被 owner 升为 admin 后,admin 仍可改/踢它):
  *   - assertCanManage(actor.role, 目标当前角色);
  *   - 改 org_role 仅 owner;
+ *   - 改 billing_enabled 仅 owner(§2:计费开关 = 花不花 org 钱包,与 org_role 同权级);
  *   - 目标是 owner 行 → 一律拒绝(owner 变更只能走 transferOwner);
  *   - org_role 不允许被设为 'owner'(升 owner 只能 transfer)。
  *
@@ -151,6 +152,12 @@ export async function updateMember(
   assertCanManage(actor.role, cur.rows[0].org_role);
   if (patch.orgRole !== undefined && actor.role !== "owner") {
     throw new OrgError(403, "FORBIDDEN", "only the owner can change member roles");
+  }
+  // §2 越权修复:billing_enabled 与 org_role 同权级,只有 owner 可改。否则非-owner admin
+  // 能把 owner 关掉的成员计费重新打开,让该成员重新消耗 org 钱包(= 钱)。守卫放在事务内
+  // 按 FOR UPDATE 后的行判定(与 org_role 同款),不放 HTTP 层——避免第二权威源 + TOCTOU。
+  if (patch.billingEnabled !== undefined && actor.role !== "owner") {
+    throw new OrgError(403, "FORBIDDEN", "only the owner can change member billing");
   }
   if (patch.orgRole !== undefined && patch.orgRole === "owner") {
     throw new OrgError(400, "VALIDATION", "cannot promote to owner via member update; use transfer-owner");

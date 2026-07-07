@@ -119,6 +119,9 @@ export interface UpdateOrgPatch {
 /**
  * 受控更新 org 的 name/status/max_members。**在调用方事务内执行**(与 audit 同事务)。
  * 空 patch → 返回当前行(FOR UPDATE 锁定)。降 max_members 低于当前活跃成员数 → 400。
+ *
+ * §3 软删除级联:status 置 'deleted' 时,同事务把该 org 全部 active 成员挂起
+ * (释放 uq_user_active_org),避免成员被永久锁死无法转投新 org。
  */
 export async function updateOrg(
   orgId: string | bigint,
@@ -177,5 +180,19 @@ export async function updateOrg(
     `UPDATE orgs SET ${sets.join(", ")} WHERE id = $${params.length} RETURNING ${ORG_COLUMNS}`,
     params,
   );
+
+  // §3 软删除级联:org 置 deleted 时,把该 org 下所有 active 成员挂起
+  // (status→'suspended',org_memberships CHECK 允许的唯一非 active 态),释放
+  // uq_user_active_org 部分唯一索引——否则 org 软删后成员仍占该索引,被永久锁死,
+  // 无法接受任何新 org 邀请。与 org 状态变更同事务原子提交。
+  // 后续项(不在本修复范围):org 钱包余额结算/退款、org 订阅关停、成员容器回收——
+  // 这些需 ledger.org_id 流水与订阅生命周期联动,另行处理。
+  if (patch.status === "deleted") {
+    await client.query(
+      `UPDATE org_memberships SET status = 'suspended'
+        WHERE org_id = $1::bigint AND status = 'active'`,
+      [String(orgId)],
+    );
+  }
   return r.rows[0];
 }

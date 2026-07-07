@@ -161,7 +161,17 @@ export function makeTurnWaiveHandler(deps: TurnWaiveHandlerDeps): TurnWaiveHandl
         reason,
         refundedCredits: result.refundedCredits.toString(),
         recordCount: result.recordCount,
+        // >0 = org 桶退款落空(org 已停用/无可退目标),需人工核对(监控按此字段告警)。
+        skippedOrgCredits: result.skippedOrgCredits.toString(),
       });
+      if (result.skippedOrgCredits > 0n) {
+        reqLog.warn("turn_waive_org_refund_skipped", {
+          userId: uidKey,
+          sessionId,
+          reason,
+          skippedOrgCredits: result.skippedOrgCredits.toString(),
+        });
+      }
       sendJson(res, 200, {
         ok: true,
         refundedCredits: result.refundedCredits.toString(),

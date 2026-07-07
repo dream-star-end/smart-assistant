@@ -208,7 +208,7 @@ function MessageActions({
   showRegen: boolean;
 }) {
   return (
-    <div className="mt-1.5 flex items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100 focus-within:opacity-100">
+    <div className="mt-1.5 flex items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100 focus-within:opacity-100 [@media(hover:none)]:opacity-100">
       <CopyIconButton getText={() => msg.text || ""} label="复制" icon={<Copy size={15} />} />
       <CopyIconButton
         getText={() => stripMarkdown(msg.text || "")}

@@ -367,11 +367,20 @@ function stableSortByTs(messages: ChatMessage[]): ChatMessage[] {
   if (!messages.every((m) => typeof m?.ts === "number" && Number.isFinite(m.ts))) {
     return messages;
   }
+  const seqOf = (m: ChatMessage): number | null =>
+    typeof m._seq === "number" && Number.isFinite(m._seq) ? m._seq : null;
   return messages
     .map((m, idx) => ({ m, idx }))
     .sort((a, b) => {
-      const dt = a.m.ts - b.m.ts;
-      return dt || a.idx - b.idx;
+      // 排序权威源 = server 单调序号 `_seq`(两行都携带时才用):纯 server 时钟域,免受客户端
+      // 时钟偏移影响。修正「设备钟快于 server → user 气泡(客户端 ts,且 server 侧也按客户端
+      // ts 存档)被排到本轮 server 助手行之后」的错序 —— 凡被 server echo 回、带 _seq 的行都
+      // 恒按 server 顺序落位。任一行缺 _seq(本地乐观行在 echo 回来之前)→ 回退 ts(既有行为;
+      // 同一域内的行仍正确,仅乐观窗内的短暂错序不可避免,echo 回后自愈)。
+      const sa = seqOf(a.m);
+      const sb = seqOf(b.m);
+      if (sa !== null && sb !== null) return sa - sb || a.idx - b.idx;
+      return a.m.ts - b.m.ts || a.idx - b.idx;
     })
     .map((x) => x.m);
 }

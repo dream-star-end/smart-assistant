@@ -809,16 +809,15 @@ export function applyOutboundMessage(
     typeof sess._trackerResetServerTs === "number"
       ? ts <= sess._trackerResetServerTs
       : typeof sess._trackerResetAt === "number" && ts < sess._trackerResetAt;
-  if (frame.isFinal && typeof frame.ts === "number") {
-    if (sess._replyingToMsgId) {
-      const boundMsg = sess.messages.find((m) => m.id === sess._replyingToMsgId);
-      if (boundMsg && typeof boundMsg.ts === "number" && frame.ts < boundMsg.ts) return; // 早于绑定 user msg
-    } else if (staleVsTrackerReset(frame.ts)) {
-      return; // 早于 tracker reset（stop/switch/timeout 后的 late final）
-    }
-  }
-  if (!frame.isFinal && typeof frame.ts === "number" && staleVsTrackerReset(frame.ts)) {
-    return; // 早于 tracker reset 的 late 非 final 帧不能恢复 in-flight
+  // final 与非 final **同走 server 时钟域截止**(staleVsTrackerReset:frame.ts ≤ 最近一次
+  // tracker reset 所见最大 server ts → 帧发出不晚于上一轮 turn 边界 → stale)。
+  // 旧实现在 _replyingToMsgId 绑定时改用 `frame.ts(server 钟) < boundMsg.ts(客户端钟)` 跨钟域
+  // 比较:设备钟快于 server 且超过「发送→final」间隔时,本轮**合法 final** 被误判 stale 丢弃 →
+  // _sendingInFlight 永不清 → 本轮永久卡「回复中」。统一到 server 域后消除这一整类跨钟域误吞
+  // (frame.ts 与 _trackerResetServerTs 同为 server 钟;仅在从未见过 server ts 的首轮回退客户端钟,
+  //  此时无「上一轮遗留 late final」风险)。
+  if (typeof frame.ts === "number" && staleVsTrackerReset(frame.ts)) {
+    return; // final:不误 teardown;非 final:不恢复 in-flight
   }
   // 本地 stop/timeout/switch/error 后，禁止旧 turn 非 final 复活发送态；cron/proactive 推送
   // 仍放行。**时间窗有界**（客户端钟 vs 客户端钟,同域）:该守卫针对的是「stop 后 server 端
@@ -836,7 +835,11 @@ export function applyOutboundMessage(
   }
 
   // ── §11 agent 切换守卫 ──
-  if (sess._agentSwitchedAt && frame.ts && frame.ts < sess._agentSwitchedAt) return;
+  // 旧的 `frame.ts(server 钟) < _agentSwitchedAt(客户端钟)` 跨钟域比较已删除:switchAgent 会
+  // resetReplyTracker → 定格 _trackerResetServerTs(切换时刻的 server ts),故切 agent 前发出的
+  // 旧 agent 帧已被上方 server 域 staleVsTrackerReset 统一拦下(与 final/非 final 同一判据)。
+  // 保留下面这条**同为客户端钟**(Date.now() vs _agentSwitchedAt)的 2s 窗:压制切换后短暂
+  // settle 期里旧 agent 尚未被 server interrupt 的非 final 收尾帧恢复发送态(无跨钟域问题)。
   if (sess._agentSwitchedAt && !sess._sendingInFlight && !frame.isFinal && Date.now() - sess._agentSwitchedAt < 2000) return;
 
   const hasBlocks = Array.isArray(frame.blocks) && frame.blocks.length > 0;

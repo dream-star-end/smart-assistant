@@ -259,6 +259,30 @@ describe("persist — 历史合并纯函数", () => {
     expect(merged.map((m) => m.id)).toEqual(["a", "b", "c"]);
   });
 
+  test("applyServerIncremental: _seq(server 权威序)优先于 ts,消客户端时钟偏移错序", () => {
+    // 设备钟快 → user 气泡(server 侧也按客户端 ts 存档,ts=9000)大于本轮助手 server ts(1001),
+    // 但两行都被 server echo 回、带单调 _seq(user=10 在前、助手=11 在后)。按 _seq 应回 user→助手;
+    // 旧的纯 ts 排序会因 9000 > 1001 把 user 气泡错排到答案之后。
+    const local = [
+      { id: "srv-u", role: "user", text: "问", ts: 9000, _source: "server", _seq: 10 } as ChatMessage,
+    ];
+    const incoming = [
+      { id: "srv-a", role: "assistant", text: "答", ts: 1001, _source: "server", _seq: 11 } as ChatMessage,
+    ];
+    const merged = applyServerIncremental(local, incoming);
+    expect(merged.map((m) => m.id)).toEqual(["srv-u", "srv-a"]);
+  });
+
+  test("applyServerIncremental: 任一行缺 _seq(本地乐观行)→ 回退 ts 排序(既有行为保留)", () => {
+    // 本地 user 气泡尚未 echo(无 _seq);incoming 助手带 _seq。混合对回退 ts,ts 100 < 200。
+    const local = [{ id: "u-local", role: "user", text: "问", ts: 100 } as ChatMessage];
+    const incoming = [
+      { id: "srv-a", role: "assistant", text: "答", ts: 200, _source: "server", _seq: 5 } as ChatMessage,
+    ];
+    const merged = applyServerIncremental(local, incoming);
+    expect(merged.map((m) => m.id)).toEqual(["u-local", "srv-a"]);
+  });
+
   // v5 真实 reopen 场景:server-authored 历史只有 assistant/tool 行,团队卡是 client-owned。
   // 团队轮之后又有新一轮 → 团队卡落在「最后一个 server 已知 id」之前(中段),旧逻辑整卡丢弃。
   test("mergeFullServerWins: 保留中段 local-only 团队卡(agent-group/delegate-progress 不随 server-wins 丢弃)", () => {

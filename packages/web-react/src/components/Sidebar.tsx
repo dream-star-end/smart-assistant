@@ -150,7 +150,7 @@ export function Sidebar({
                 >
                   {s.title || "新对话"}
                 </button>
-                <span className="flex shrink-0 items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100 group-focus-within:opacity-100">
+                <span className="flex shrink-0 items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100 group-focus-within:opacity-100 [@media(hover:none)]:opacity-100">
                   <IconButton
                     aria-label="重命名"
                     variant="muted"

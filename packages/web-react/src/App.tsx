@@ -1,5 +1,6 @@
-import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { lazy, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AgentGate } from "./components/AgentGate";
+import { LazyBoundary } from "./components/ChunkErrorBoundary";
 import { AgentPicker } from "./components/AgentPicker";
 import { AuthGate, type AuthMode } from "./components/AuthGate";
 import { ChatHeader } from "./components/ChatHeader";
@@ -53,8 +54,10 @@ import { DEMO_MESSAGES, DEMO_MODELS, DEMO_SESSIONS, DEMO_USER, demoReply } from 
 import type { Message, PublicConfig, PublicModel, Session, ToolCard } from "./lib/types";
 
 // 首屏瘦身:四大中心（营销首页 + 三个全屏对话框）改按需异步加载,移出 entry chunk。
-// 命名导出 → default 适配。渲染点各自套 Suspense（对话框仅在 open 时挂载 → 首屏零下载,
-// 首次打开时才拉块并短暂显 loading；React.lazy 解析后模块常驻,再次打开无回退闪烁）。
+// 命名导出 → default 适配。渲染点各自套 LazyBoundary（= chunk 加载失败兜底 + Suspense：
+// 对话框仅在 open 时挂载 → 首屏零下载,首次打开拉块时短暂显 loading；React.lazy 解析后模块
+// 常驻,再次打开无回退闪烁。发新版后旧标签页拉不到旧 chunk 时由 ChunkErrorBoundary 兜底,
+// 提示刷新而非白屏——见 components/ChunkErrorBoundary）。
 const Landing = lazy(() => import("./components/Landing").then((m) => ({ default: m.Landing })));
 const SettingsCenter = lazy(() =>
   import("./components/SettingsCenter").then((m) => ({ default: m.SettingsCenter })),
@@ -970,7 +973,7 @@ export function App() {
   }
   if (!demo && view === "home") {
     return (
-      <Suspense fallback={<SplashFallback />}>
+      <LazyBoundary fallback={<SplashFallback />}>
         <Landing
           onStart={() => {
             setAuthMode("register");
@@ -983,7 +986,7 @@ export function App() {
           theme={theme}
           onCycleTheme={cycle}
         />
-      </Suspense>
+      </LazyBoundary>
     );
   }
   if (!demo && (!auth || !user)) {
@@ -1248,7 +1251,7 @@ export function App() {
       {/* 仅在打开时挂载 → 懒块首屏零下载;Dialog 无 exit 动画(仅 data-[state=open]),
           即时卸载无视觉回退。tab 等状态由 App 持有或组件 open 时自 resync,卸载安全。*/}
       {settingsOpen && (
-        <Suspense fallback={<DialogFallback />}>
+        <LazyBoundary fallback={<DialogFallback />}>
           <SettingsCenter
             open={settingsOpen}
             auth={auth}
@@ -1259,7 +1262,7 @@ export function App() {
             onSetTheme={setTheme}
             onRefreshMe={refreshMe}
           />
-        </Suspense>
+        </LazyBoundary>
       )}
 
       <InboxDialog
@@ -1282,7 +1285,7 @@ export function App() {
       />
 
       {manageOpen && (
-        <Suspense fallback={<DialogFallback />}>
+        <LazyBoundary fallback={<DialogFallback />}>
           <ManageCenter
             open={manageOpen}
             tab={manageTab}
@@ -1292,11 +1295,11 @@ export function App() {
             onTabChange={setManageTab}
             onClose={() => setManageOpen(false)}
           />
-        </Suspense>
+        </LazyBoundary>
       )}
 
       {marketplaceOpen && (
-        <Suspense fallback={<DialogFallback />}>
+        <LazyBoundary fallback={<DialogFallback />}>
           <MarketplaceCenter
             open={marketplaceOpen}
             tab={marketplaceTab}
@@ -1327,11 +1330,11 @@ export function App() {
               }
             }}
           />
-        </Suspense>
+        </LazyBoundary>
       )}
 
       {orgOpen && (
-        <Suspense fallback={<DialogFallback />}>
+        <LazyBoundary fallback={<DialogFallback />}>
           <OrgCenter
             open={orgOpen}
             auth={auth}
@@ -1339,7 +1342,7 @@ export function App() {
             onClose={() => setOrgOpen(false)}
             onRefreshMe={refreshMe}
           />
-        </Suspense>
+        </LazyBoundary>
       )}
       {confirmDialogEl}
       {promptTextEl}

@@ -145,7 +145,8 @@ export interface AcceptInvitationResult {
  *   1. token_hash 命中且未接受未撤销(FOR UPDATE)
  *   2. 未过期(expires_at > NOW())
  *   3. 受邀邮箱 == 当前账号邮箱(lower 比对)—— 防转发链接被他人接受
- *   4. caller 无其他 active org(撞 uq_user_active_org → ALREADY_IN_ORG)
+ *   4. caller 无其他 active org(其 org 仍 active → ALREADY_IN_ORG;org 已停用/软删则不阻塞,
+ *      并顺手挂起该 stale active 行以释放 uq_user_active_org,§3)
  *   5. 席位未满(countActiveMembers < org.max_members)
  *   6. org active
  * 通过 → INSERT membership(org_role 取自邀请,invited_by 取自邀请)+ 标记 accepted_at。
@@ -195,14 +196,30 @@ export async function acceptInvitation(
       throw new OrgError(403, "EMAIL_MISMATCH", "invitation was issued to a different email address");
     }
 
-    // caller 无其他 active org(V1 单 org)
-    const existing = await client.query<{ org_id: string }>(
-      `SELECT org_id::text AS org_id FROM org_memberships
-        WHERE user_id = $1::bigint AND status = 'active' LIMIT 1`,
+    // caller 无其他【active org 的】active membership(V1 单 org)。§3:JOIN orgs 过滤
+    // ——uq_user_active_org 保证至多一行 active membership;若该行的 org 已非 active
+    // (suspended/deleting/deleted,照 resolveOrgBillingContext 的 o.status='active' 口径),
+    // 不算"已属 org",否则 org 软删后成员被 uq_user_active_org 永久锁死无法转投新 org。
+    // 并发同一用户的 accept 已由上方 `users FOR UPDATE` 串行化,故此处无需再锁。
+    const existing = await client.query<{ org_status: string }>(
+      `SELECT o.status AS org_status
+         FROM org_memberships m
+         JOIN orgs o ON o.id = m.org_id
+        WHERE m.user_id = $1::bigint AND m.status = 'active'`,
       [String(userId)],
     );
     if (existing.rows.length > 0) {
-      throw new OrgError(409, "ALREADY_IN_ORG", "you already belong to an organization");
+      if (existing.rows[0].org_status === "active") {
+        throw new OrgError(409, "ALREADY_IN_ORG", "you already belong to an organization");
+      }
+      // stale active membership 指向已非 active 的 org:先挂起解锁 uq_user_active_org,
+      // 否则下面 INSERT 新 membership 会撞该部分唯一索引。这也是 org.updateOrg 未级联到的
+      // suspended/deleting 态的接受侧兜底(deleted 态 updateOrg 已在删除时挂起)。
+      await client.query(
+        `UPDATE org_memberships SET status = 'suspended'
+          WHERE user_id = $1::bigint AND status = 'active'`,
+        [String(userId)],
+      );
     }
 
     // org 必须 active + 席位未满(锁 org 行串行化并发接受)
