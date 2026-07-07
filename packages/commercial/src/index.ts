@@ -3194,15 +3194,17 @@ export async function registerCommercial(
     pendingOrdersExpirer = trackScheduler("pendingOrdersExpirer", "shared", startPendingOrdersExpirer({ intervalMs }));
   }
 
-  // 0096 — 订阅周期轮转 sweeper(默认 5min tick,boot 即结算已到期订阅)。
-  // period_end < now 的 active 订阅:付费档到期未续→降级 free+重置 300;free 档→月度续期。
+  // 0096 / 0115 — 订阅周期轮转 sweeper(默认 5min tick,boot 即结算已到期订阅)。
+  // 每 tick 先排空个人订阅轮转(付费档到期→降级 free+重置 300;free→月度续期),再排空
+  // org 席位订阅轮转(0115:到期→清零 org 期内池+status='expired',不降档/不动钱包/不踢成员)。
   // 钱包不动。非法/空/NaN→5min;下限 1s。
   //
-  // 【域归属 v5-owned】0096 订阅数据域(user_subscriptions/period_credits)只有 v5 树有
-  // 对应代码 —— v3 现网树 grep period_credits 零命中。若沿用 controlPlaneEnabled gate,
-  // v5 被禁跑、v3 没代码 → 全网无人执行:free 月度 300 永不重置、付费到期永不降级
+  // 【域归属 v5-owned】0096/0115 订阅数据域(user_subscriptions/org_subscriptions/period_credits)
+  // 只有 v5 树有对应代码 —— v3 现网树 grep period_credits 零命中。若沿用 controlPlaneEnabled gate,
+  // v5 被禁跑、v3 没代码 → 全网无人执行:个人 free 月度 300 永不重置、付费/org 到期永不结算
   // (产品语义断供;spendTwoBucket 排除过期桶所以钱是安全的)。故 channel=v5 必须自己跑。
   // 并发安全:rollover 内部 FOR UPDATE SKIP LOCKED,多实例同跑无双重结算。
+  // org 轮转并入本 sweeper(同 v5-owned 域/同 tick/同认领模式),不新建独立 scheduler。
   let subscriptionRolloverSweeper: SubscriptionRolloverHandle | undefined;
   if (
     (controlPlaneEnabled || runtimeChannel === "v5") &&
