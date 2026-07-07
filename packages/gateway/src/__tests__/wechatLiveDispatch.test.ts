@@ -77,7 +77,6 @@ function makeGateway(events: any[], delivered: any[] = []): any {
     // team-durability — dispatchInbound 的客户 turn 计数/迟到产物钩子(fake no-op)
     beginClientTurn: () => {},
     endClientTurn: () => {},
-    persistLateTurnArtifacts: () => {},
   }
   gateway.deliver = (out: unknown, adapter?: ChannelAdapter) => {
     delivered.push({ out, adapter })

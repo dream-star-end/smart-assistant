@@ -43,6 +43,9 @@ function makeGateway(): any {
     agentId: 'main',
     userId: '1',
     repoSessionId: undefined,
+    // 队长自主送审(2026-07-07):hidden 目标委派要过团队门。
+    _teamModeTurn: true,
+    _currentTurnUserText: '测试任务',
   }
   const gw = Object.create(Gateway.prototype) as any
   gw._shuttingDown = false

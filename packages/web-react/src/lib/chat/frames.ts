@@ -64,12 +64,6 @@ export type OutboundMessageMeta = NonNullable<OutboundMessage["meta"]> & {
    * 且**不合成空轮气泡**(它不是真正的空轮,内容在服务端已生成)。见 applyOutboundMessage。
    */
   reconcile?: string;
-  /**
-   * true = 团队模式质量审查 NEEDS_FIX 后、队长续写修订稿**之前**的标记帧(空 blocks 非
-   * final)。前端据此把本轮已流出的草稿正文折叠为"初稿(已修订)",让随后的修订稿成为
-   * 唯一主体 —— 与持久化 server-wins 只留终稿的 replace 语义对齐。见 applyOutboundMessage。
-   */
-  teamRevision?: boolean;
 };
 
 // ─── 出站帧（gateway → client，消费侧）───────────────────────────────

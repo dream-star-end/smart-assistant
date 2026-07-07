@@ -20,7 +20,6 @@ import {
   SystemCard,
   ThinkingCard,
   UserCard,
-  SupersededDraftCard,
 } from "./chat/cards";
 import { AgentGroupCard } from "./chat/AgentGroupCard";
 import { TeamPanel } from "./chat/TeamPanel";
@@ -60,8 +59,6 @@ export const MessageRenderer = memo(
       case "user":
         return <UserCard msg={message} cb={cb} />;
       case "assistant":
-        // 团队审查修订:被修订稿取代的草稿折叠为"初稿"卡(replace 语义,修订稿是唯一主体)。
-        if (message._supersededDraft) return <SupersededDraftCard msg={message} />;
         return <AssistantCard msg={message} ctx={ctx} cb={cb} />;
       case "thinking":
         return <ThinkingCard msg={message} ctx={ctx} />;

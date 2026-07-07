@@ -75,8 +75,8 @@ function makeGateway(): any {
     destroySession: async () => {},
     beginClientTurn: () => {},
     endClientTurn: () => {},
-    persistLateTurnArtifacts: () => {},
-    getByKey: () => undefined,
+    // 队长自主送审(2026-07-07):hidden 目标委派要过团队门 —— fake 父会话恒为团队 turn。
+    getByKey: () => ({ _teamModeTurn: true, _currentTurnUserText: '测试任务' }),
     getOrCreate: async () => ({
       agentId: 'coding-assistant',
       currentTurnStatus: null,

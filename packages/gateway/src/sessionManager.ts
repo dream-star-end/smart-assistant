@@ -465,6 +465,14 @@ export interface AgentSession {
    * "被中断请重发"——那会诱导用户重发重付费);'errored'/undefined → 维持原
    * service_restart 中断文案语义。 */
   _lastClientTurnOutcome?: 'completed' | 'errored'
+
+  /** 队长自主送审(2026-07-07)— 本 turn 是否为团队模式队长回合(dispatchInbound 每
+   *  turn 刷新)。_runDelegateTask 的审查门读它:目标为隐藏审查员的委派仅在 true 时放行。 */
+  _teamModeTurn?: boolean
+
+  /** 本 turn 入站用户文本的服务端权威快照(≤8000 字,dispatchInbound 每 turn 刷新)。
+   *  审查任务书(buildTeamReviewContext)的"用户原始需求"取此,不采信模型自报。 */
+  _currentTurnUserText?: string
 }
 
 // Re-export from ccbMessageParser so existing imports keep working
@@ -2868,35 +2876,6 @@ export class SessionManager {
     session._lastClientTurnOutcome = outcome
   }
 
-  /**
-   * team-durability — turn 真正终点(review 编排收尾后)的迟到产物补 persist。
-   *
-   * 修的洞:engine turn 完成时的 persist(handleResult 钩子)发生在 hidden-reviewer
-   * 硬编排**之前**,审查委派完成后 buffer 进来的团队卡(带 verdict)错过了当轮
-   * drain,只能漏到下一轮 persist(归错 turn)或随会话回收丢失(2026-07-07 事故:
-   * reviewer PASS 卡 + 终态全部不在 REST 权威副本里,客户端全量重拉救不回)。
-   *
-   * dispatchInbound 在 review 编排结束后调用:无条件 drain(防跨 turn 泄漏),
-   * 有货才补一次 persist(agentGroups-only,text 空 → master 侧仅写 agent-group
-   * 行,messageId 按 runId 派生,与 engine persist 的 s0..sN 行天然不冲突)。
-   */
-  persistLateTurnArtifacts(session: AgentSession): void {
-    const groups = this.drainPendingAgentGroups(session)
-    if (groups.length === 0) return
-    if (!MASTER_SINK_PERSIST_CHANNELS.has(session.channel)) return
-    this._trackPersistence(
-      persistServerAuthoredTurn({
-        sessionKey: session.sessionKey,
-        peerId: session.peerId,
-        agentId: session.agentId,
-        userId: session.userId,
-        turnIndex: session.turns,
-        text: '',
-        status: 'completed',
-        agentGroups: groups,
-      }),
-    )
-  }
 
   /**
    * 切换 session 的执行目标 (local ⇄ remote)。
