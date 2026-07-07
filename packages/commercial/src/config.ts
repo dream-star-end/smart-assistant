@@ -386,6 +386,18 @@ export const commercialConfigSchema = z
     DATABASE_URL: databaseUrl,
     REDIS_URL: redisUrl,
     COMMERCIAL_ENABLED: enabledFlag,
+    /**
+     * §5 JWT 验签密钥长度收口。HS256 建议 secret ≥ 32 bytes;`auth/jwt.ts` 的 async
+     * 路径(secretToKey)已在用到时校验字节长度,但 `auth/jwtSync.ts`(router deny-by-default
+     * 拦截热路径)直接把 raw secret 喂进 HMAC,**不**校长度 —— 短 secret 两条路径行为漂移。
+     * 在此启动期 zod schema 里 fail-closed:env 里给了 COMMERCIAL_JWT_SECRET / JWT_SECRET
+     * 但 < 32 字符即拒绝启动(loadConfig 在 index.ts 启动早期调用),让"短 secret"结构上
+     * 不可达运行态,两条验签路径共享同一长度保证。二者都 optional:生产至少配一个(空值/
+     * 缺失由 index.ts 的非空校验兜底),这里只在"给了但太短"时拒。**不 trim**:与 index.ts
+     * 实际使用的 raw env 值口径一致,避免"配置校验值 ≠ 运行时值"的漂移。
+     */
+    COMMERCIAL_JWT_SECRET: z.string().min(32, "COMMERCIAL_JWT_SECRET must be at least 32 chars").optional(),
+    JWT_SECRET: z.string().min(32, "JWT_SECRET must be at least 32 chars").optional(),
     TURNSTILE_SECRET: turnstileSecret,
     TURNSTILE_TEST_BYPASS: turnstileBypass,
     TURNSTILE_SITE_KEY: turnstileSiteKey,

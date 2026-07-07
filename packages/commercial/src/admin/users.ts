@@ -662,6 +662,21 @@ export async function patchUser(
        RETURNING ${USER_COLUMNS}`,
       params,
     );
+
+    // §4 封号即时生效:status 改为非 active(banned/deleting/deleted)时,同事务撤销该用户
+    // 全部未撤销 refresh token。否则封号只挡新登录,用户手里已签发的 access token(≤15min)
+    // 仍能用,更能拿 refresh token 无限续签,封号形同虚设。revoked_reason='admin'
+    // (migration 0019 CHECK 枚举内)。用改密码路径(auth/verify.ts)同款撤销语义。
+    // 注:已建立的 WS 长连 / 计费 precheck 对 users.status 的即时复核涉及 ws/、billing/
+    // (不在本次范围),需另做才能"秒断"活跃会话;本修复先堵住 token(续签)面。
+    if (patch.status !== undefined && patch.status !== "active") {
+      await client.query(
+        `UPDATE refresh_tokens SET revoked_at = NOW(), revoked_reason = 'admin'
+          WHERE user_id = $1 AND revoked_at IS NULL`,
+        [idStr],
+      );
+    }
+
     // before/after 只记变化字段 —— audit 的目的是"变了什么",不是"所有字段"
     const changedBefore: Record<string, unknown> = {};
     const changedAfter: Record<string, unknown> = {};

@@ -985,6 +985,33 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           return;
         }
 
+        // 1.35) 封号即时生效:WS 建连时复核 users.status(每连接一次,非每 turn,低成本)。
+        //   封号后持有效 access token(≤15min)仍能建新桥聊天/扣费是历史缺口;admin patchUser
+        //   封号已同步撤 refresh(≤15min 后自愈),此处再堵住"建连"这条最直接的花钱入口。
+        //   deps.pgPool 未注入(测试/个人版)→ 跳过(行为与本检查加入前一致)。
+        //   status 查询失败(DB 抖动)→ fail-open 放行 + 告警:封号非实时安全闸(refresh 撤销
+        //   已是主机制),不为一次 DB 故障把全体用户锁在门外(可用性优先,与 model-authz 的
+        //   fail-closed 取舍不同——那是防 hidden model 数据/成本泄漏,权重更高)。
+        if (deps.pgPool) {
+          try {
+            const st = await deps.pgPool.query<{ status: string }>(
+              "SELECT status FROM users WHERE id = $1",
+              [uid.toString()],
+            );
+            const status = st.rows[0]?.status;
+            if (status !== undefined && status !== "active") {
+              log?.info("user-chat-bridge: rejected non-active user", { uid: uid.toString(), status });
+              sendErrorFrame(ws, "FORBIDDEN", "account is not active");
+              try { ws.close(CLOSE_BRIDGE.POLICY, "account inactive"); } catch { /* */ }
+              return;
+            }
+          } catch (err) {
+            log?.warn("user-chat-bridge: user status check failed (fail-open)", {
+              uid: uid.toString(), err: (err as Error).message,
+            });
+          }
+        }
+
         // 1.4) 0049 模型授权 checker —— 在 ensureRunning 之前拉一次 grants。
         //   - load 失败 throw → close(1011)。grants DB 故障期间不做"放行"假设,
         //     不然付费用户能在故障窗口里调到任何 hidden model。
