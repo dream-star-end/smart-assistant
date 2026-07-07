@@ -68,7 +68,7 @@
 
 按届时数据取舍,方向性列举:
 
-1. **企业/团队版** ✅ **第一波已上线(2026-07-06 深夜,v5-0a71232b,迁移 0111-0114 已 apply)**:org 账号/成员管理(邀请+角色矩阵)/org 钱包第 0 优先桶+充值/org 共享技能(marketplace 扩 org→hub 层)/org 用量报表(写时打戳)/发票 V1(抬头+申请+平台人工处理)/OrgCenter 自助后台+admin org 面板。方案与债表:`docs/plans/v5-enterprise-edition-2026-07-06.md`(org 订阅期内桶待企业定价、知识库 org 化、多 org、自助建 org 均登记后续)。Codex 聚焦审计 P0/P1 已修(邀请提权/矩阵 TOCTOU/预检 org 余额)。原开工骨架:组织账号、成员管理、共享技能库/知识库的组织维度、用量报表、发票。双钱包模型天然可扩展到组织钱包。**开工骨架+设计锚点已备:`docs/plans/v5-enterprise-edition-kickoff.md`**(四主干 spend.ts/users+jwt/requireAdmin+canUseModel/uid 隔离全以单 uid 为租户单元、零 org 骨架;五处 -u<uid> 单人假设+IDOR 防线是核心改造点;方案先做"共享粒度"决策题再设计)。
+1. **企业/团队版** ✅ **一二期均已上线(二期 2026-07-07,v5-974aa737,0115 已 apply:席位订阅 9 折池化+自助开通+席位闸+billing owner-only;剩余债=domain capture/SSO+SCIM/自定义 RBAC/自动续费)**。第一波(07-06,v5-0a71232b):org 账号/成员管理(邀请+角色矩阵)/org 钱包第 0 优先桶+充值/org 共享技能(marketplace 扩 org→hub 层)/org 用量报表(写时打戳)/发票 V1(抬头+申请+平台人工处理)/OrgCenter 自助后台+admin org 面板。方案与债表:`docs/plans/v5-enterprise-edition-2026-07-06.md`(org 订阅期内桶待企业定价、知识库 org 化、多 org、自助建 org 均登记后续)。Codex 聚焦审计 P0/P1 已修(邀请提权/矩阵 TOCTOU/预检 org 余额)。原开工骨架:组织账号、成员管理、共享技能库/知识库的组织维度、用量报表、发票。双钱包模型天然可扩展到组织钱包。**开工骨架+设计锚点已备:`docs/plans/v5-enterprise-edition-kickoff.md`**(四主干 spend.ts/users+jwt/requireAdmin+canUseModel/uid 隔离全以单 uid 为租户单元、零 org 骨架;五处 -u<uid> 单人假设+IDOR 防线是核心改造点;方案先做"共享粒度"决策题再设计)。
 2. **模型矩阵运营**:provider 健康度自动探测与降级路由(现在坏 provider 靠人工);价格/成本看板;新 provider 接入模板化(v3-token-plan-provider-integration 模式泛化)。
 3. **开放能力**:openaiCompat 对外 API 商业化(API key 计费面已有雏形);webhook/自动化触达。
 4. **多模态深化**:图/视频生成(seedream/seedance 已接火山)产品化入口;语音(seed-tts)对话。

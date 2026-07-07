@@ -234,7 +234,7 @@ BEGIN; <迁移 SQL>; INSERT INTO schema_migrations(version, applied_at) VALUES (
 | ~~v5 告警只入库不推送~~ **已偿还**(3a7e6f53,企微通道) | wecom_bot 通道+v5-only dispatcher(claim 按类型过滤);v3 侧告警亦经共享 outbox 送达企微。**过渡窗口**:v3 旧类型无关 claim 误抢 wecom 行→延迟 1-2min(退役即消失,勿关 v3 告警调度——轮询规则引擎全网唯一)。**v3 退役收尾新增项:轮询告警规则(accountPoolAllDown/LowCapacity 等)必须挪 v5,否则 v3 停服后检测面真空** | — |
 | ~~v5 无后台孤儿回收网~~ **部分偿还**(02878333,07-06) | orphanReconcile 已放开 v5-owned(channel 双侧隔离,与 409 自愈错峰幂等,smoke 白名单已登记);**idleSweep/volumeGc 仍钉死**(活跃容器误杀窗口/不可逆删卷) | idleSweep:补 turn 级活跃屏障后再放;volumeGc:v3 退役收尾+观察期结束后单独评估 |
 
-| org 订阅期内桶(第四桶) | P3.1 只做 org 钱包;spend.ts 桶序扩展点已预留(org_period 排 org_wallet 前) | boss 定企业定价 |
+| ~~org 订阅期内桶~~ **已偿还**(二期 8a4c14a9,0115) | 四桶+席位订阅(org-pro/max/ultra 9折池化)+自助开通+席位闸 | — |
 | 知识库 org 化 | research_documents/artifacts 租户主键 (user_id,doc_id) + 引用权威链须跨 user 重构 | P3.1 稳定后单独立项 |
 | 多 org 归属 | V1 单 active org(uq_user_active_org);放开=删索引+payer 选择+/api/org 显式 org_id | 真实客户需求 |
 | org 钱包锁竞争 | 同 org 高并发扣费串行化于 orgs 行锁(spendTwoBucket FOR UPDATE) | 大客户并发异常时改乐观扣减 |
@@ -245,7 +245,8 @@ BEGIN; <迁移 SQL>; INSERT INTO schema_migrations(version, applied_at) VALUES (
 - **计费桶序** org_wallet → user_period → user_wallet;全局锁序 **orgs → users → user_subscriptions**(任何未来触 org 层的事务必须先锁 orgs);预检口径含 org 钱包(getOrgSpendableForUser,与扣费参与条件严格一致,两处必须同步改)。
 - **org 技能 = marketplace 单机制**:listing.org_id 可见性(orgVisibleFrag 单一谓词)+ org_installs → sync UNION → hub 层;同 slug 个人优先;容器/storage 零改动。
 - **报表权威 = 写时打戳**(usage_records.org_id/credit_ledger.org_id),不按当前成员集推导。
-- 迁移 0111-0114 已 apply;成员管理授权矩阵权威在数据层事务内(updateMember/removeMember FOR UPDATE 后判),HTTP 层不重复判。
+- 迁移 0111-0115 已 apply;成员管理授权矩阵权威在数据层事务内(updateMember/removeMember FOR UPDATE 后判),HTTP 层不重复判。
+- **二期(07-07)**:席位订阅 org-pro/max/ultra(scope='org' 进 subscription_plans 单一权威,个人枚举必须 scope='user');四桶 org_period→org_wallet→user_period→user_wallet;自助开通=org_provision 订单 fulfill 原子建 org(冲突→paid+critical 告警人工处置);billing 写面 owner-only;席位闸只拦新进。**教训:preCheck/settle 任何新增 PG 查询,必须同步 userChatBridgeCodexBilling 等 fakePool 测试替身(unhandled SQL 直接 throw→帧超时),且集成门必须实跑该套件**(一期 5d194bb0 漏此,二期二分定位补修)。
 
 ---
 
