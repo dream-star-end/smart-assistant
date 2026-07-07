@@ -170,9 +170,16 @@ smoke() {
   # 隔离不变量升级为**白名单**:schedulers 出现任何名单外条目 = shared 域泄漏,FAIL。
   # (服务端 index.ts 有同语义的 fail-closed 拒启断言,本处是部署面第二道防线。)
   echo "$hz" | grep -q '"channel":"v5"' || { echo "✗ channel != v5" >&2; return 1; }
+  # v3 退役后 leader 形态(OC_CONTROL_PLANE_LEADER=1,9ecfc97d):v5 接管 shared 域调度器,
+  # 白名单语义不变(名单外条目仍 FAIL),只是 leader 下名单扩入 shared 域合法集。
+  local leader
+  leader="$(ssh "$KL_HOST" "test -r '$V5_ENV' && grep -E '^OC_CONTROL_PLANE_LEADER=' '$V5_ENV' | tail -n 1 | cut -d= -f2-" 2>/dev/null || true)"
   local scheds allowed bad
   scheds="$(echo "$hz" | grep -o '"schedulers":\[[^]]*\]' | sed 's/.*\[//;s/\]//;s/"//g')"
   allowed="subscriptionRollover accountSlotReaper researchJobs codexRefresh codexDriftReconciler marketplaceAiReview orphanReconcile providerHealth wecomAlert"
+  if [[ "$leader" == "1" ]]; then
+    allowed="$allowed containerEvents alert refreshEventsSweep cooldownRecovery pendingOrdersExpirer finalizeReconciler onboarding inboxEmail"
+  fi
   bad=""
   IFS=',' read -ra _sarr <<<"$scheds"
   for s in "${_sarr[@]}"; do
@@ -180,14 +187,24 @@ smoke() {
     grep -qw "$s" <<<"$allowed" || bad="$bad $s"
   done
   [[ -n "$bad" ]] && { echo "✗ shared 域 scheduler 泄漏到 v5:$bad" >&2; return 1; }
-  echo "$hz" | grep -q '"controlPlaneEnabled":false' || { echo "✗ controlPlaneEnabled 非 false" >&2; return 1; }
+  if [[ "$leader" == "1" ]]; then
+    echo "$hz" | grep -q '"controlPlaneEnabled":true' || { echo "✗ leader 模式下 controlPlaneEnabled 非 true" >&2; return 1; }
+  else
+    echo "$hz" | grep -q '"controlPlaneEnabled":false' || { echo "✗ controlPlaneEnabled 非 false" >&2; return 1; }
+  fi
   echo "$hz" | grep -q '"agentRuntime":"disabled"' || { echo "✗ agentRuntime 非 disabled(不应起 legacy agent 运行时)" >&2; return 1; }
   local ver; ver="$(ssh "$KL_HOST" "curl -fsS http://127.0.0.1:${V5_PORT}/version" 2>/dev/null || true)"
   echo "  /version: $ver"
-  # 现网 v3 零影响断言:v3:18789 仍健康
-  local v3hz; v3hz="$(ssh "$KL_HOST" "curl -fsS http://127.0.0.1:18789/healthz" 2>/dev/null || true)"
-  echo "  v3 /healthz(应不受影响): $v3hz"
-  [[ -z "$v3hz" ]] && { echo "✗ v3 /healthz 异常 —— 现网受影响!" >&2; return 1; }
+  # 现网 v3 零影响断言:v3 服务仍在跑才断言;已退役停服(inactive)则跳过。
+  local v3active
+  v3active="$(ssh "$KL_HOST" "systemctl is-active openclaude-v3 2>/dev/null" || true)"
+  if [[ "$v3active" == "active" ]]; then
+    local v3hz; v3hz="$(ssh "$KL_HOST" "curl -fsS http://127.0.0.1:18789/healthz" 2>/dev/null || true)"
+    echo "  v3 /healthz(应不受影响): $v3hz"
+    [[ -z "$v3hz" ]] && { echo "✗ v3 /healthz 异常 —— 现网受影响!" >&2; return 1; }
+  else
+    echo "  v3 已停服(退役,is-active=$v3active),跳过 v3 零影响断言"
+  fi
   # egress split:V5_ENV 声明 OC_EGRESS_SPLIT=1 → 【无条件】断言 egress active + 健康。
   # 旧写法"is-enabled 才查"会在 unit 未安装的坏实例上静默跳过 —— 恰是最该 fail 的场景
   # (master 以 split 模式起,容器 LLM 流量 18892 无人监听、聊天全挂),绿灯放行坏实例。
