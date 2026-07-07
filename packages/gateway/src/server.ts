@@ -112,6 +112,7 @@ import { type WebSocket, WebSocketServer } from 'ws'
 import { checkToken, verifyPassword, signJwt, verifyJwt, type JwtPayload } from './auth.js'
 import { CronScheduler, isUserInitiatedCronJob } from './cron.js'
 import { sendV3WechatProactive, readV3WechatProactiveConfig } from './v3WechatProactive.js'
+import { postInboxMessage } from './v3InboxPost.js'
 import { parseDocument } from './documentParser.js'
 import {
   makeDelegateProgressBlock,
@@ -1666,7 +1667,9 @@ export class Gateway {
       // 3. Fallback: broadcast to all connected webchat clients.
       // This path can't use deliver() (which is scoped to a single peerKey) —
       // inline the ts stamp so the client's stale-final/ts-guard invariant
-      // stays intact here too.
+      // stays intact here too. Count actual sends so we can tell "reached an
+      // online client" from "landed nowhere" for the inbox fallback below.
+      let broadcastSent = 0
       if (!delivered) {
         const data = JSON.stringify({
           ...buildOut('__reflection__'),
@@ -1676,9 +1679,25 @@ export class Gateway {
           for (const ws of set) {
             try {
               ws.send(data)
+              broadcastSent++
             } catch {}
           }
         }
+      }
+
+      // 4. Offline-delivery inbox fallback (commercial only; no-op without master
+      // env). Reaching here means WeChat proactive did NOT take over (that path
+      // returns early on `delivered`). If nothing reached the user online either
+      // — no last-active/target adapter delivery AND the broadcast hit zero
+      // clients — persist the output as a station inbox message so it isn't
+      // silently lost while the user is away. We suppress it whenever ANY channel
+      // delivered (delivered===true) to honor the "don't double-notify" UX rule;
+      // bodyMd is the raw output, not the wechat-fallback-prefixed text.
+      if (!delivered && broadcastSent === 0) {
+        void postInboxMessage({
+          title: job.label || 'AI定时任务结果',
+          bodyMd: text,
+        }).catch(() => {})
       }
     })
     this.cron.lastActiveChannel = this.lastActiveChannel
@@ -1717,6 +1736,9 @@ export class Gateway {
           enabled: true,
           oneshot: ev.oneshot ?? true,
           label: ev.prompt.slice(0, 50),
+          // Same creation stamp as the /api/cron path — every user-facing cron
+          // entry point must set createdAt so catch-up can't backfire pre-creation.
+          createdAt: Date.now(),
         })
         .then(() =>
           this.log.info('eventBus task.created → gateway job', { taskId: ev.taskId }),
@@ -7794,6 +7816,9 @@ export class Gateway {
         enabled: true,
         oneshot: oneshot ?? true,
         label: label || prompt.slice(0, 50),
+        // Stamp creation time so bounded catch-up never "makes up" a missed fire
+        // for a schedule point that predates this job (see cron.ts resolveDueMinute).
+        createdAt: Date.now(),
       }
       await this.cron.addJob(job)
       this.sendJson(res, 201, { ok: true, job })

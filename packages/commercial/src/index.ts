@@ -132,6 +132,14 @@ import {
   type ResearchJobSchedulerHandle,
 } from "./research/scheduler.js";
 import {
+  startCronWakeScheduler,
+  findDueCronWakeUsers,
+  runCronWakeRescan,
+  type CronWakeSchedulerHandle,
+  type CronWakeRunner,
+} from "./agent-sandbox/cronWake.js";
+import { createInboxMessage } from "./inbox/inbox.js";
+import {
   startMarketplaceAiReviewScheduler,
   type MarketplaceAiReviewSchedulerHandle,
 } from "./marketplace/aiReview.js";
@@ -208,6 +216,16 @@ import {
   makeToolFailureAuditHandler,
   type ToolFailureAuditHandler,
 } from "./http/internalToolFailureAudit.js";
+import {
+  CRON_INDEX_PATH,
+  makeCronIndexHandler,
+  type CronIndexHandler,
+} from "./http/internalCronIndex.js";
+import {
+  INBOX_POST_PATH,
+  makeInboxPostHandler,
+  type InboxPostHandler,
+} from "./http/internalInboxPost.js";
 import {
   makePgSkillEmbedCache,
   makePgSkillSearchLogger,
@@ -1442,6 +1460,34 @@ export async function registerCommercial(
         appendCostCredits: appendCostCreditsForUser,
         broadcastToUser: (uid, payload) => bridgeBroadcastRef.current(uid, payload),
       });
+      // /internal/v3/cron-index — 容器 gateway 上报「派生唤醒索引」(nextFireAt/enabledCount)。
+      // uid 由 verifyContainerIdentity 推导;upsert cron_wake_index(runtime_channel=当前)。
+      // 见 http/internalCronIndex.ts + agent-sandbox/cronWake.ts。runner 用 getPool()(结构上
+      // 满足 CronWakeRunner 宽松契约,同 toolFailureAudit 传 getPool() 的取舍)。
+      const cronIndexHandler: CronIndexHandler = makeCronIndexHandler({
+        identityRepo,
+        runner: getPool() as unknown as CronWakeRunner,
+      });
+      // /internal/v3/inbox-post — 容器 onDeliver「离线送达兜底写站内信」。uid 由容器身份推导,
+      // audience 硬编码 'user' 只给自己写;created_by = MIN active admin(同 onboarding 语义,
+      // 每次现解析,不缓存)。无 admin → 抛错 → handler 500。见 http/internalInboxPost.ts。
+      const inboxPostHandler: InboxPostHandler = makeInboxPostHandler({
+        identityRepo,
+        postMessage: async (uid, msg) => {
+          const adminRow = await getPool().query<{ id: string }>(
+            `SELECT id::text AS id FROM users WHERE role = 'admin' AND status = 'active' ORDER BY id ASC LIMIT 1`,
+          );
+          const senderId = adminRow.rows[0]?.id;
+          if (!senderId) throw new Error("inbox-post: no active admin sender");
+          await createInboxMessage(senderId, {
+            audience: "user",
+            user_id: uid,
+            title: msg.title,
+            body_md: msg.bodyMd,
+            level: msg.level,
+          });
+        },
+      });
       dispatchInternal = (req, res, ctx) => {
         const path = (req.url ?? "/").split("?")[0];
         if (egressSplitEnabled && path === COST_EVENT_PATH) {
@@ -1482,6 +1528,12 @@ export async function registerCommercial(
         }
         if (toolFailureAuditHandler && path === TOOL_FAILURE_AUDIT_PATH) {
           return toolFailureAuditHandler(req, res, ctx);
+        }
+        if (path === CRON_INDEX_PATH) {
+          return cronIndexHandler(req, res, ctx);
+        }
+        if (path === INBOX_POST_PATH) {
+          return inboxPostHandler(req, res, ctx);
         }
         if (path.startsWith(MARKETPLACE_AGENT_PREFIX)) {
           return marketplaceAgentHandler(req, res, ctx);
@@ -3327,6 +3379,45 @@ export async function registerCommercial(
     }));
   }
 
+  // cron 触发权威上移 master:到点确保容器活着(方案 docs/plans/v5-cron-master-wake-2026-07-07.md §3)。
+  // 【域归属 v5-owned(channel-scoped)】cron_wake_index 按 runtime_channel 行级隔离,due 查询/
+  // upsert/rescan 全过滤 getRuntimeChannel();v3 现网不含本代码 → 永不读写该表,零影响。故 gate 同
+  // researchJobs:(controlPlaneEnabled || channel==='v5')。ensureContainerReady 不可用(无 docker
+  // 运行时,如 external-proxy-only 拓扑)则不启(唤醒无从谈起)。关停:COMMERCIAL_CRON_WAKE_DISABLED=1。
+  // rescan 是 self-host 假设(v5 现状全本机卷);多机化时改走 node-agent 读卷(方案已登记为已知边界)。
+  let cronWakeScheduler: CronWakeSchedulerHandle | undefined;
+  if (
+    (controlPlaneEnabled || runtimeChannel === "v5") &&
+    process.env.COMMERCIAL_CRON_WAKE_DISABLED !== "1" &&
+    ensureContainerReady
+  ) {
+    const wakeFn = ensureContainerReady; // 已 guard 非空
+    const cronWakeRunner = getPool() as unknown as CronWakeRunner;
+    const maxRaw = Number(process.env.COMMERCIAL_CRON_WAKE_MAX_PER_TICK);
+    const maxPerTick = Number.isFinite(maxRaw) && maxRaw >= 1 ? Math.trunc(maxRaw) : undefined;
+    const cdRaw = Number(process.env.COMMERCIAL_CRON_WAKE_COOLDOWN_MIN);
+    const cooldownMs = Number.isFinite(cdRaw) && cdRaw >= 0 ? Math.trunc(cdRaw) * 60_000 : undefined;
+    cronWakeScheduler = trackScheduler("cronWake", "v5-owned", startCronWakeScheduler({
+      findDueUsers: (scanLimit, horizonSec) =>
+        findDueCronWakeUsers(cronWakeRunner, {
+          runtimeChannel: getRuntimeChannel(),
+          horizonSec,
+          scanLimit,
+        }),
+      // active 判定复用 findUserDataHost(本 channel);active 容器无需唤醒。
+      // agent_containers 只反映在跑容器,故它只做「跳过 active」优化,不做发现源(发现源=cron_wake_index)。
+      isContainerActive: async (uid) => {
+        const h = await computeQueries.findUserDataHost(Number(uid));
+        return h?.containerState === "active";
+      },
+      wakeContainer: (uid) => wakeFn(uid),
+      runRescan: () => runCronWakeRescan({ runner: cronWakeRunner }),
+      logger: rootLogger,
+      maxPerTick,
+      cooldownMs,
+    }));
+  }
+
   // 市场发布 AI 自动审批 worker(deepseek-v4-pro)。仅 v5 启动:marketplace 表 v3/v5 共享
   // 无 channel 列,但 v3 跑旧代码不写 ai_review_state → 恒 NULL → 永不被 claim,故 v3 保持
   // 纯人审、零行为变更。domain 'v5-owned'(v5 合法后台职责;写共享 marketplace 表但由
@@ -3514,6 +3605,9 @@ export async function registerCommercial(
       }
       if (researchJobScheduler) {
         try { researchJobScheduler.stop(); } catch { /* ignore */ }
+      }
+      if (cronWakeScheduler) {
+        try { cronWakeScheduler.stop(); } catch { /* ignore */ }
       }
       if (marketplaceAiReviewScheduler) {
         try { marketplaceAiReviewScheduler.stop(); } catch { /* ignore */ }
