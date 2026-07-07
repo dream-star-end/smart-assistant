@@ -25,11 +25,9 @@
  *    存 argon2(randomBytes(32)) 一个**永不可能匹配**的真实哈希,login.ts 不需
  *    要任何特殊路径,verify 永远 false → INVALID_CREDENTIALS。schema 不动。
  *
- * 4) **首登统一赠送 ¥5**:同 tx INSERT users(credits=500) +
- *    INSERT credit_ledger(reason='promotion'),所有 LDC 用户首登一律 ¥5 / 500
- *    cents,与 trust_level 无关(见 LINUXDO_BONUS_CENTS 注释)。memo 仍标注
- *    用户当时的 effective TL,便于运营审计 + 历史分群。
- *    **赠金只在首登一次性结算**,后续 trust_level 升级不补差。
+ * 4) **首登赠金已下线**(2026-07-07 boss 决策,与邮箱验证赠金同批):新建 users 行
+ *    credits=0,不写 promotion ledger。新用户免费额度统一走免费档订阅
+ *    (ensureFreeSubscription,300 期内积分/月)。历史已发放赠金不追回。
  */
 
 import { randomBytes } from 'node:crypto'
@@ -38,42 +36,7 @@ import { query, tx } from '../db/queries.js'
 import { REFRESH_TOKEN_TTL_SECONDS, issueRefresh, signAccess } from './jwt.js'
 import { hashPassword } from './passwords.js'
 
-/**
- * LDC 首登统一赠金(1¥ = 100 cents)。
- *
- * 历史:曾按 trust_level 分阶(TL0=¥3 / TL1=¥5 / TL2=¥10 / TL3=¥20 / TL4=¥30),
- * 2026-04-29 boss 决策改为统一 ¥5,不分级。已注册用户不补差(本来就不补差)。
- *
- * **赠金只在首登一次性结算**:用户后续 SSO 登录只 UPDATE oauth_identities
- * 的 trust_level / username / avatar 快照,credits/ledger 不动。
- */
-const LINUXDO_BONUS_CENTS = 500n // ¥5
 
-export interface BonusForTrustLevelResult {
-  bonusCents: bigint
-  /** clamp/normalize 后的 TL(0..4),仅用于 ledger memo + 审计标签;不再决定金额 */
-  effectiveTrustLevel: 0 | 1 | 2 | 3 | 4
-}
-
-/**
- * 计算 LDC 首登赠金 + effective TL 标签。
- *
- * - bonusCents 永远 = LINUXDO_BONUS_CENTS(¥5),与 trust_level 无关。
- * - effectiveTrustLevel 仍按原规则规范化(null/undefined/非整数/负数 → 0;
- *   >=4 → clamp 到 4),供 ledger memo 写入审计标签;LDC 数据异常时(raw=NaN
- *   / Infinity / >4)退回 TL0 标记,与 raw TL 一并落 memo 便于运营排查。
- *
- * 纯函数,无副作用。在 tx 外或内调用都安全。函数名保留向后兼容(测试 +
- * 内部调用方都 import 这个名字),语义已改成"始终 ¥5"。
- */
-export function bonusForTrustLevel(tl: number | null | undefined): BonusForTrustLevelResult {
-  if (tl == null || !Number.isInteger(tl) || tl < 0) {
-    return { bonusCents: LINUXDO_BONUS_CENTS, effectiveTrustLevel: 0 }
-  }
-  if (tl >= 4) return { bonusCents: LINUXDO_BONUS_CENTS, effectiveTrustLevel: 4 }
-  const lvl = tl as 0 | 1 | 2 | 3 | 4
-  return { bonusCents: LINUXDO_BONUS_CENTS, effectiveTrustLevel: lvl }
-}
 
 /**
  * 合成 email 域名 — 不收件,只占 UNIQUE 槽位。改这个域名前查清现存合成 email。
@@ -185,9 +148,8 @@ function nowSec(deps?: { now?: () => number }): number {
  *   3a. 命中: 校 user.status='active'(否则抛 USER_DISABLED),UPDATE identity
  *       的 username/avatar_url/trust_level 快照(LDC 侧改昵称/升 trust 同步)
  *   3b. 未命中: argon2(random32) → INSERT users(合成 email, email_verified=
- *       TRUE, credits=bonus) → INSERT credit_ledger(promotion, bonus) → INSERT
- *       identity。bonus 由 bonusForTrustLevel(input.trustLevel) 一次性算出,见
- *       顶部 TRUST_LEVEL_BONUS 阶梯。**23505 兜底**:advisory lock 理论上排除并发,但若数据库历史
+ *       TRUE, credits 默认 0 —— 首登赠金已下线) → INSERT
+ *       identity。**23505 兜底**:advisory lock 理论上排除并发,但若数据库历史
  *       脏数据(0042 之前手工补过 oauth_identities 等)导致 INSERT users 撞
  *       email 唯一约束,捕获后 reselect identity 一次再决断;再撞抛 USER_DISABLED
  *       (说明数据状态需要人工介入)
@@ -283,8 +245,6 @@ export async function socialLoginOrCreate(
 
     const placeholderHash = await hashPassword(randomBytes(32).toString('base64url'))
     const synEmail = syntheticEmail(input.provider, input.providerUserId)
-    // 按 LDC trust_level 计算赠金(纯函数,SAVEPOINT 之前算好,tx 内只用结果)
-    const { bonusCents, effectiveTrustLevel } = bonusForTrustLevel(input.trustLevel)
 
     // SAVEPOINT 包 INSERT users —— Postgres 一旦在 tx 中 raise 错(包括 23505),
     // 整个 tx 进入 aborted 状态,后续任何 query 都返 "current transaction is aborted"。
@@ -295,13 +255,14 @@ export async function socialLoginOrCreate(
     let newUserId: string
     try {
       // v3 退役:社交登录建的新号同样 v5 原生(见 register.ts 同款注释)。
+      // 首登赠金已下线:credits 不再写入,列默认 0(免费额度走 ensureFreeSubscription)。
       const insUser = await client.query<{ id: string }>(
         `INSERT INTO users(email, password_hash, email_verified,
-                           display_name, avatar_url, credits,
+                           display_name, avatar_url,
                            v5_migrated_at, v5_migration_status)
-         VALUES ($1, $2, TRUE, $3, $4, $5::bigint, NOW(), 'migrated')
+         VALUES ($1, $2, TRUE, $3, $4, NOW(), 'migrated')
          RETURNING id::text AS id`,
-        [synEmail, placeholderHash, input.username, input.avatarUrl, bonusCents.toString()],
+        [synEmail, placeholderHash, input.username, input.avatarUrl],
       )
       newUserId = insUser.rows[0].id
       await client.query('RELEASE SAVEPOINT social_user_insert')
@@ -358,21 +319,6 @@ export async function socialLoginOrCreate(
       throw err
     }
 
-    // ledger 行(同 register.ts,绕过 billing/credit() helper 防 tx 跳出)。
-    // memo 标注 effective TL,raw TL 与 effective 不同(>4 clamp)时一并记录,
-    // 便于运营审计区分新旧赠金策略 + 排查异常 LDC 数据。
-    const yuanLabel = (bonusCents / 100n).toString()
-    const tlLabel =
-      input.trustLevel != null && input.trustLevel !== effectiveTrustLevel
-        ? `TL${effectiveTrustLevel}, raw=${input.trustLevel}`
-        : `TL${effectiveTrustLevel}`
-    const ledgerMemo = `LINUX DO 一键注册赠送 ¥${yuanLabel} (${tlLabel})`
-    await client.query(
-      `INSERT INTO credit_ledger(user_id, delta, balance_after, reason, memo)
-       VALUES ($1::bigint, $2::bigint, $3::bigint, 'promotion', $4)`,
-      [newUserId, bonusCents.toString(), bonusCents.toString(), ledgerMemo],
-    )
-
     // identity 行
     await client.query(
       `INSERT INTO oauth_identities(user_id, provider, provider_user_id,
@@ -395,7 +341,7 @@ export async function socialLoginOrCreate(
       emailVerified: true,
       displayName: input.username,
       avatarUrl: input.avatarUrl,
-      credits: bonusCents.toString(),
+      credits: '0',
       role: 'user' as const,
     }
   })
