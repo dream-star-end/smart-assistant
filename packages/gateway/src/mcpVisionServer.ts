@@ -10,6 +10,8 @@
  * without changing the agent-facing tool name.
  */
 
+// 必须第一个 import:stdout 只留给 JSON-RPC + 未捕获异常不退出(见 mcpStdioGuard 注释)。
+import './mcpStdioGuard.js'
 import { type ChildProcessByStdio, spawn } from 'node:child_process'
 import {
   chmodSync,
