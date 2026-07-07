@@ -112,11 +112,12 @@ const DEEPSEEK: StaticKeyProviderSpec = {
 
 const MINIMAX: StaticKeyProviderSpec = {
   id: 'minimax',
-  // 2026-06-30:MiniMax-M3 接入从 MiniMax 官方直连切到火山方舟 Agent Plan。火山 Agent Plan
-  // 同名托管 minimax-m3(Anthropic 兼容 /v1/messages,实测返回带 thinking block + usage.input/output_tokens,
-  // 多模态 base64 识图通)。模型名/matchesRoute/canonicalize/supportsVision **全不变**,仅上游通道与
-  // key(MINIMAX_TOKEN_PLAN_KEY → ARK_AGENT_PLAN_KEY,见 staticProviderMeta)更换。
-  upstreamEndpoint: 'https://ark.cn-beijing.volces.com/api/plan/v1/messages',
+  // 2026-07-07:识图/文本上游从火山方舟 Agent Plan 切回 MiniMax 官方(回退 06-30 迁移)。
+  // 原因:火山 Ark 托管的 minimax-m3 对**大图识图直接挂死**(实测 895KB→125s 超时,1024px→65s
+  // 超时),而 MiniMax 官方 Anthropic 端点同一张图 4.9s 且描述准确(input_tokens=1284 真识图)。
+  // 官方 /anthropic/v1/messages 本就 Anthropic 兼容(2026-06-17 实测接受 image block),格式无需转换;
+  // key 改回 MINIMAX_TOKEN_PLAN_KEY(见 staticProviderMeta)。api.minimaxi.com 新加坡端点必须直连。
+  upstreamEndpoint: 'https://api.minimaxi.com/anthropic/v1/messages',
   matchesRoute(modelId) {
     return modelId.toLowerCase() === 'minimax-m3'
   },

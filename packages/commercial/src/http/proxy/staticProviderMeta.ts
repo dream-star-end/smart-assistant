@@ -62,12 +62,12 @@ export const STATIC_PROVIDER_META: Record<StaticProviderId, StaticProviderCommer
     egress: "direct",
   },
   minimax: {
-    // 2026-06-30:上游切火山方舟 Agent Plan,key 改用 ARK_AGENT_PLAN_KEY(与 ARK_CODING_PLAN_KEY 对称)。
-    // provider id 仍 'minimax'(路由的模型还是 minimax-m3,语义正确);metric/错误码保持 minimax_* 连续性。
-    keyConfigField: "ARK_AGENT_PLAN_KEY",
+    // 2026-07-07:切回 MiniMax 官方(回退 06-30 火山迁移;火山 Ark 大图识图挂死,官方 4.9s)。
+    // key 改回 MINIMAX_TOKEN_PLAN_KEY;上游 api.minimaxi.com/anthropic/v1/messages(见 staticKeyProviders)。
+    keyConfigField: "MINIMAX_TOKEN_PLAN_KEY",
     notConfiguredHttpCode: "MINIMAX_NOT_CONFIGURED",
     rejectMetricLabel: "minimax_config",
-    // ark.cn-beijing.volces.com:火山北京端点,直连 TLS ~0.3s 且稳;绕日本双重跨境 ~6s 且半路断 → 必须 direct。
+    // api.minimaxi.com:新加坡端点,海外直连最快;绕日本 TLS 抖到 ~6s 且半路断 → 必须 direct。
     egress: "direct",
   },
   ark: {
