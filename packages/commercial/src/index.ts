@@ -23,7 +23,7 @@ import IORedis from "ioredis";
 import Docker from "dockerode";
 import { runMigrations } from "./db/migrate.js";
 import { closePool, getPool } from "./db/index.js";
-import { loadConfig } from "./config.js";
+import { loadConfig, type CommercialConfig } from "./config.js";
 import { stubMailer, createResendMailer } from "./auth/mail.js";
 import { wrapIoredis } from "./middleware/rateLimit.js";
 import { createCommercialHandler, type CommercialHandler } from "./http/router.js";
@@ -34,7 +34,7 @@ import { warmupLoginDummyHash } from "./auth/login.js";
 import { secretToKey } from "./auth/jwt.js";
 import { PricingCache, createModelHintProvider, type ModelPricing } from "./billing/pricing.js";
 import { canUseModel } from "./billing/authzModels.js";
-import { ALLOWED_INBOUND_MODELS, setModelHintProvider, setLiteratureSkillProvider } from "@openclaude/gateway";
+import { ALLOWED_INBOUND_MODELS, setModelHintProvider, setLiteratureSkillProvider, setHostStaticProviderKeys } from "@openclaude/gateway";
 import { getPreferences, patchPreferences } from "./user/preferences.js";
 import { getLiteratureSkillConfig } from "./admin/literatureConfig.js";
 import {
@@ -159,7 +159,8 @@ import {
   makeAnthropicProxyHandler,
   type AnthropicProxyHandler,
 } from "./http/anthropicProxy.js";
-import { assertPlatformDefaultModelConfigured } from "./http/proxy/staticProviderMeta.js";
+import { assertPlatformDefaultModelConfigured, STATIC_PROVIDER_META } from "./http/proxy/staticProviderMeta.js";
+import type { StaticProviderId, StaticProviderKeys } from "@openclaude/protocol";
 import { makePlatformContextLoader } from "./platform/platformContextLoader.js";
 import { makeDefaultVolumeContextReader } from "./platform/volumeContextReader.js";
 import {
@@ -787,6 +788,24 @@ async function handleExternalMtls(
 }
 
 /**
+ * 从 commercial config 派生 host 静态 provider 平台 key 表(注入 gateway seam)。
+ *
+ * 单一权威:遍历 STATIC_PROVIDER_META,按各 provider 的 `keyConfigField` 从 cfg 取 key 值
+ * (不硬编码 id→字段名映射,与 proxy 侧共用同一份权威,零漂移)。全体静态 provider 都是**非
+ * codex**(codex 走 OAuth,不在 STATIC_KEY_PROVIDERS)—— 即"只注入非 codex 静态 provider 的
+ * key"。缺某个 key → 该 id 留 undefined(resolveHostStaticProviderEnv 命中其模型时 fail-closed,
+ * resolveSyntheticTurnModel 的 routable 自检据此不降级,符合预期)。
+ */
+function buildHostStaticProviderKeys(cfg: CommercialConfig): StaticProviderKeys {
+  const keys: StaticProviderKeys = {};
+  for (const id of Object.keys(STATIC_PROVIDER_META) as StaticProviderId[]) {
+    const raw = cfg[STATIC_PROVIDER_META[id].keyConfigField];
+    if (typeof raw === "string" && raw.trim()) keys[id] = raw;
+  }
+  return keys;
+}
+
+/**
  * 注册商业化模块。
  *
  * 1. 校验 env(loadConfig)— 缺失/非法直接抛 ConfigError
@@ -974,6 +993,13 @@ export async function registerCommercial(
   // 不会影响 prompt 构建。
   // canonical id 直接取 PricingCache 命中行的 model_id(详见 createModelHintProvider 注释)。
   setModelHintProvider(createModelHintProvider(pricing));
+
+  // 2026-07-07 MAJOR-1 — host 静态 provider 平台直连 key seam。
+  // host 平台 agent(main)的合成首帧(cron/webhook/task/inter-agent/openai-compat)解析到
+  // 非 codex 静态模型(默认 deepseek-v4-pro)后,host CCB 子进程需平台静态 key 直连上游
+  // (见 gateway/hostStaticProviders + subprocessRunner 注入点)。个人版不 import commercial →
+  // seam 恒 null = 整块 no-op,settings.json 继续掌权。与 setModelHintProvider 同注册/清理生命周期。
+  setHostStaticProviderKeys(buildHostStaticProviderKeys(cfg));
 
   // 0069 — SKILLS_LITERATURE slot 反向钩子:容器 spawn 重建 system prompt 时读窄配置,
   // admin 改完下次 spawn 自然生效(无 cache / 无 LISTEN/NOTIFY,见 0069 migration 注释)。
@@ -3646,6 +3672,8 @@ export async function registerCommercial(
       // 0060 — 清空 model hint provider,避免 shutdown 后还有人持 stale closure
       // (用于测试热重启场景:同一进程多次 register/shutdown 不能让旧 cache 被新 cache 引用)
       try { setModelHintProvider(null); } catch { /* ignore */ }
+      // MAJOR-1 — 清空 host 静态 provider key seam(同进程热重启场景,避免旧 key 表被新进程引用)
+      try { setHostStaticProviderKeys(null); } catch { /* ignore */ }
       // 0069 — 同理清空 literature skill provider(同进程热重启场景,且 closure 持
       // pg pool 句柄,留着会阻止 closePool 释放最后引用)
       try { setLiteratureSkillProvider(null); } catch { /* ignore */ }

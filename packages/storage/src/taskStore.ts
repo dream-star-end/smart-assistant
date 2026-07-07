@@ -49,6 +49,8 @@ export interface TaskExecution {
   status: 'running' | 'completed' | 'failed'
   output?: string
   error?: string
+  /** 合成首帧因 codex 无计费主体被降级到的实际执行(非 codex)模型;未降级则省略(MAJOR-2 透明化)。 */
+  effectiveModel?: string
 }
 
 interface TaskFile {

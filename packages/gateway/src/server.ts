@@ -40,8 +40,12 @@ import {
   parseTraceIdCandidate,
   STATIC_KEY_INBOUND_MODEL_IDS,
   MAX_ATTACHMENTS_PER_MESSAGE,
+  isCodexEngineModel,
 } from '@openclaude/protocol'
 import { classifyDelegateOutputError, classifyRunError } from './errorClassify.js'
+// 合成首帧降级兜底模型的 routable 自检(MAJOR-1):兜底模型在当前进程形态下不可路由
+// (host 无对应平台静态 key)时**不降级**,保持 CODEX_BILLING_GUARD fail-closed。
+import { isHostRoutableStaticModel } from './hostStaticProviders.js'
 import {
   parseSkillEvalsJson,
   serializeSkillEvals,
@@ -263,6 +267,69 @@ export function resolveExecutionModel(
     if (typeof m === 'string' && ALLOWED_INBOUND_MODELS.has(m)) return m
   }
   return EXECUTION_MODEL_FALLBACK
+}
+
+/**
+ * 服务端**合成首帧**(cron / webhook / scheduled task / inter-agent / openai-compat 等
+ * gateway 进程内直接派发、不经 master bridge 计费编排的新会话首帧)的执行模型解析。
+ *
+ * 背景(P0 计费旁路封堵铁律的对偶面):codex engine(needsServerRequestId)的真扣费
+ * 依赖 master bridge 铸造的 server-owned requestId + preCheck / inflight journal 编排
+ * (见 sessionManager 的 CODEX_BILLING_GUARD)。这些合成路径是进程内首帧,拿不到也
+ * 铸不出该 requestId —— 尤其 host 平台 agent(如 master 侧 `main`)的 cron **无 per-user
+ * 计费主体(session 无 user_id = 无钱包)**,codex turn 落地会被 guard 100% fail-closed
+ * 拒(线上实测 agent:main:cron:dm:* 全拒)。因此这类首帧不该落 codex:它既无法被编排,
+ * 也没有可扣费的主体。
+ *
+ * 单一权威:codex 归属判定复用 `resolveExecutionModel`(收敛下线/缺省模型)+ protocol
+ * `isCodexEngineModel`(codex 系模型集合的唯一权威),不另立第二套 gpt 集合。
+ *
+ * 语义(返回 `SyntheticTurnModel | undefined`):
+ *   - agent/默认模型解析为**非 codex** → 返回 `undefined`,尊重原配置,合成路径行为不变;
+ *   - 解析为 **codex(模型驱动)** → 返回 `{ model, originalModel, downgraded:true }`:`model` 是
+ *     显式非 codex 兜底模型(env `OPENCLAUDE_SYNTHETIC_TURN_MODEL` 覆盖,默认 `deepseek-v4-pro`),
+ *     `originalModel` 是若不降级本会落地的 codex 模型(供用户面/审计**透明披露**降级,不静默换
+ *     模型 —— MAJOR-2)。同时补齐这些路径一直缺失的 `model` 路由字段(合成 inbound 铁律)。
+ *   - agent.provider === 'codex-native'(**硬 pin**)→ 返回 `undefined`:model 替换救不了它
+ *     (resolveEngine 的 provider pin 恒判 codex),这类 agent 的合成 turn 保持 fail-closed
+ *     (显式 codex pin + 无扣费主体 = 按显式意图拒,不静默降级到 CCB)。当前 host `main`
+ *     无 pin,不受此分支影响。
+ *   - 兜底模型在**当前进程形态**下不可路由(host 无对应平台静态 key,见 hostStaticProviders)
+ *     → 返回 `undefined`:换成一个必 401 的模型比闸的显式错误更糟,故保持 fail-closed(MAJOR-1)。
+ */
+export interface SyntheticTurnModel {
+  /** 降级后实际执行的非 codex 模型(getOrCreate 决定 runner engine + submit 路由字段同源)。 */
+  model: string
+  /** 若不降级本会落地的 codex 执行模型 —— 用于对有计费主体路径透明披露"从什么降下来"。 */
+  originalModel: string
+  /** 恒 true:本结构只在真正发生 codex → 非 codex 降级时返回(undefined = 不干预)。 */
+  downgraded: true
+}
+
+export const SYNTHETIC_TURN_NON_CODEX_MODEL_DEFAULT = 'deepseek-v4-pro'
+export function resolveSyntheticTurnModel(
+  agent: Pick<AgentDef, 'id' | 'model' | 'provider'>,
+  defaultModel: string | undefined | null,
+): SyntheticTurnModel | undefined {
+  // 硬 pin 的 codex-native:model 替换无效(见 registry.resolveEngine),保持 fail-closed。
+  if (agent.provider === 'codex-native') return undefined
+  const effective = resolveExecutionModel(agent.model, defaultModel)
+  if (!isCodexEngineModel(effective)) return undefined
+  const raw = process.env.OPENCLAUDE_SYNTHETIC_TURN_MODEL?.trim()
+  // env 兜底自身必须**非 codex 且在入站白名单内**,否则忽略回默认 —— 防"把 bug 换个门再引入"
+  // (例如误配成 gpt-5.5 又绕回 codex,或配一个会被 resolveExecutionModel 收敛掉的下线模型)。
+  const candidate =
+    raw && ALLOWED_INBOUND_MODELS.has(raw) && !isCodexEngineModel(raw)
+      ? raw
+      : SYNTHETIC_TURN_NON_CODEX_MODEL_DEFAULT
+  // ── routable 自检(MAJOR-1)──────────────────────────────────────────────
+  // 兜底模型必须在当前进程形态下真正可达:host 上走静态 provider 平台直连,若该 provider 的
+  // 平台 key 未经 commercial seam 注入(缺配 / 个人版),换成 deepseek-v4-pro 也是必 401。此时
+  // **不降级**,返回 undefined 让 CODEX_BILLING_GUARD 按原样 fail-closed(Codex 明确:闸的显式
+  // 错误优于换一个必 401 的模型)。容器身份 isHostRoutableStaticModel 恒 true(经 master
+  // internal proxy 按模型名路由可达),不受影响。
+  if (!isHostRoutableStaticModel(candidate)) return undefined
+  return { model: candidate, originalModel: effective, downgraded: true }
 }
 
 /**
@@ -1763,21 +1830,38 @@ export class Gateway {
           return
         }
         const sessionKey = `agent:${agentId}:webhook:${webhookId}:${Date.now()}`
+        // 合成首帧路由字段补齐(同 cron):webhook 触发的会话首帧绕过 master bridge
+        // 计费编排,落 codex 会被 CODEX_BILLING_GUARD 拒 → 解析为非 codex 执行模型。
+        const _whRoute = resolveSyntheticTurnModel(agent, this.deps.config.defaults.model)
+        const _whModel = _whRoute?.model
         const session = await this.sessions.getOrCreate({
           sessionKey,
           agent,
+          ...(_whModel ? { model: _whModel } : {}),
           channel: 'webhook',
           peerId: webhookId,
           title: `[webhook] ${webhookId}`,
         })
-        const _whRun = this._runLog.start({ agentId, sessionKey, taskType: 'webhook' })
+        // MAJOR-2 透明化:降级不静默 —— effective_model 落 runLog(doctor 面可见)。
+        const _whRun = this._runLog.start({
+          agentId,
+          sessionKey,
+          taskType: 'webhook',
+          ...(_whRoute ? { effectiveModel: _whRoute.model } : {}),
+        })
         let output = ''
         let _whError = ''
         try {
-          await this.sessions.submit(session, resolvedPrompt, (e) => {
-            if (e.kind === 'block' && e.block.kind === 'text') output += (e.block as any).text
-            if (e.kind === 'error') _whError = e.error
-          })
+          await this.sessions.submit(
+            session,
+            resolvedPrompt,
+            (e) => {
+              if (e.kind === 'block' && e.block.kind === 'text') output += (e.block as any).text
+              if (e.kind === 'error') _whError = e.error
+            },
+            undefined,
+            _whModel,
+          )
           this._runLog.complete(_whRun, {
             status: _whError ? 'failed' : 'completed',
             error: _whError || undefined,
@@ -6417,9 +6501,14 @@ export class Gateway {
     })
 
     // Create/reuse session for the target agent
+    // 合成首帧路由字段补齐(同 cron):agent 间消息的会话首帧绕过 master bridge
+    // 计费编排,落 codex 会被 CODEX_BILLING_GUARD 拒 → 解析为非 codex 执行模型。
+    const _iaRoute = resolveSyntheticTurnModel(targetAgent, this.deps.config.defaults.model)
+    const _iaModel = _iaRoute?.model
     const session = await this.sessions.getOrCreate({
       sessionKey,
       agent: targetAgent,
+      ...(_iaModel ? { model: _iaModel } : {}),
       channel: 'inter-agent',
       peerId: sourceAgent || 'system',
       title: `[from ${sourceAgent}] ${message.slice(0, 30)}`,
@@ -6433,9 +6522,12 @@ export class Gateway {
       (e) => {
         if (e.kind === 'block' && e.block.kind === 'text') output += e.block.text
       },
+      undefined,
+      _iaModel,
     )
 
     // Push result to user's active channel
+    // (MAJOR-2 透明化:降级后的 effective_model 随 API 响应元数据回给调用方,见下方 sendJson。)
     const lastActive =
       this.lastActiveChannel.get('main') || this.lastActiveChannel.values().next().value
     if (lastActive && output.trim()) {
@@ -6454,7 +6546,12 @@ export class Gateway {
       } as OutboundMessage)
     }
 
-    this.sendJson(res, 200, { ok: true, agentId: targetAgentId, outputLength: output.length })
+    this.sendJson(res, 200, {
+      ok: true,
+      agentId: targetAgentId,
+      outputLength: output.length,
+      ...(_iaRoute ? { effectiveModel: _iaRoute.model } : {}),
+    })
   }
 
   /** Active delegation count for recursion/concurrency limits */
@@ -7679,21 +7776,38 @@ export class Gateway {
     const agent = cfg.agents.find((a) => a.id === task.agent)
     if (!agent) return
     const sessionKey = `agent:${task.agent}:task:${taskId}:${Date.now()}`
+    // 合成首帧路由字段补齐(同 cron):定时任务的会话首帧绕过 master bridge 计费编排,
+    // 落 codex 会被 CODEX_BILLING_GUARD 拒 → 解析为非 codex 执行模型。
+    const _taskRoute = resolveSyntheticTurnModel(agent, this.deps.config.defaults.model)
+    const _taskModel = _taskRoute?.model
     const session = await this.sessions.getOrCreate({
       sessionKey,
       agent,
+      ...(_taskModel ? { model: _taskModel } : {}),
       channel: 'task',
       peerId: taskId,
       title: `[task] ${task.title}`,
     })
-    const runEntry = this._runLog.start({ agentId: task.agent, sessionKey, taskType: 'task' })
+    // MAJOR-2 透明化:effective_model 落 runLog(doctor 面)+ 下方 recordExecution(执行台账)。
+    const runEntry = this._runLog.start({
+      agentId: task.agent,
+      sessionKey,
+      taskType: 'task',
+      ...(_taskRoute ? { effectiveModel: _taskRoute.model } : {}),
+    })
     let output = ''
     let error = ''
     try {
-      await this.sessions.submit(session, task.prompt, (e) => {
-        if (e.kind === 'block' && e.block.kind === 'text') output += (e.block as any).text
-        if (e.kind === 'error') error = e.error
-      })
+      await this.sessions.submit(
+        session,
+        task.prompt,
+        (e) => {
+          if (e.kind === 'block' && e.block.kind === 'text') output += (e.block as any).text
+          if (e.kind === 'error') error = e.error
+        },
+        undefined,
+        _taskModel,
+      )
     } catch (err: any) {
       error = String(err)
     }
@@ -7708,6 +7822,7 @@ export class Gateway {
       status: error ? 'failed' : 'completed',
       output: output.slice(0, 2000),
       error: error || undefined,
+      ...(_taskRoute ? { effectiveModel: _taskRoute.model } : {}),
     })
   }
 

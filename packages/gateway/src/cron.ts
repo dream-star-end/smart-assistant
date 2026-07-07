@@ -37,6 +37,13 @@ import { parse as parseYaml, stringify as stringifyYaml } from 'yaml'
 import { createLogger } from './logger.js'
 import type { SessionManager } from './sessionManager.js'
 import { isHiddenSystemAgentId } from './agentVisibility.js'
+// 合成首帧执行模型解析(codex 计费旁路封堵的对偶面):cron 无 per-user 计费主体,
+// 落 codex 会被 CODEX_BILLING_GUARD fail-closed 拒 —— 解析为 codex 时改用显式非 codex
+// 兜底模型。与 sessionManager.getOrCreate 的 engine 判定同点收口(单一权威)。
+// 注:server.ts ↔ cron.ts 已存在被容忍的模块循环(server import CronScheduler;
+// sessionManager 亦 `import { resolveExecutionModel } from './server.js'`),本函数只在
+// runJob 运行期调用,非模块初始化期,live-binding 安全,沿用既有模式。
+import { resolveSyntheticTurnModel } from './server.js'
 import {
   postCronIndex,
   readV3CronIndexConfig,
@@ -655,9 +662,27 @@ export class CronScheduler {
     // (see onDeliver), which reads lastActiveChannel independently.
     const sessionKey = `agent:${agent.id}:cron:dm:${job.id}:${Date.now()}`
 
+    // 合成首帧路由字段补齐:cron 是进程内直接派发的会话首帧,完全绕过 master bridge
+    // 的 codex 计费编排(preCheck / server-owned requestId / inflight journal)。host
+    // 平台 agent(如 `main`)的 cron 又无 per-user 计费主体,因此**不能落 codex engine**
+    // (会被 CODEX_BILLING_GUARD 100% fail-closed 拒)。这里显式解析出非 codex 执行模型,
+    // 与 agent 交互态默认(可能是 gpt-5.5=codex)解耦;非 codex agent 返回 undefined,
+    // 沿用原默认(行为不变)。同点传入 getOrCreate(决定 runner engine)+ submit(路由字段)。
+    const cronRoute = resolveSyntheticTurnModel(agent, this.config.defaults.model)
+    const cronModel = cronRoute?.model
+    // MAJOR-2 透明化:cron 是 host 平台维护 turn(无用户面),降级记 runLog/日志即可,不需用户可见。
+    if (cronRoute?.downgraded) {
+      logger.info(`job ${job.id} synthetic model downgraded off codex`, {
+        jobId: job.id,
+        from: cronRoute.originalModel,
+        to: cronRoute.model,
+      })
+    }
+
     const session = await this.sessions.getOrCreate({
       sessionKey,
       agent,
+      ...(cronModel ? { model: cronModel } : {}),
       channel: 'cron',
       peerId: job.id,
       title: job.heartbeat ? '[heartbeat]' : `[cron] ${job.id}`,
@@ -671,9 +696,17 @@ export class CronScheduler {
     })
     let output = ''
     try {
-      await this.sessions.submit(session, job.prompt, (e) => {
-        if (e.kind === 'block' && e.block.kind === 'text') output += e.block.text
-      })
+      await this.sessions.submit(
+        session,
+        job.prompt,
+        (e) => {
+          if (e.kind === 'block' && e.block.kind === 'text') output += e.block.text
+        },
+        // effortLevel: 不指定(cron 用模型默认档位)
+        undefined,
+        // model: 与 getOrCreate 同源;非 codex agent 为 undefined(不覆盖)。
+        cronModel,
+      )
     } finally {
       // All jobs use isolated sessions — always destroy, even if submit()
       // threw, otherwise the subprocess + resume-map entry would leak until

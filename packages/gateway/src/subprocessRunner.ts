@@ -5,6 +5,8 @@ import { tmpdir } from 'node:os'
 import { dirname, isAbsolute, resolve } from 'node:path'
 import { type McpServerConfig, type OpenClaudeConfig, paths } from '@openclaude/storage'
 import { createLogger } from './logger.js'
+import { isV3ContainerRuntime, resolveHostStaticProviderEnv } from './hostStaticProviders.js'
+import type { StaticProviderKeys } from '@openclaude/protocol'
 import {
   OPENCLAUDE_VISION_MCP_ID,
   OPENCLAUDE_VISION_TOOLS,
@@ -168,6 +170,89 @@ export function _buildSecondaryUtilityModelEnv(): Record<string, string> {
   const model =
     process.env.OPENCLAUDE_SECONDARY_MODEL?.trim() || DEFAULT_SECONDARY_UTILITY_MODEL
   return { ANTHROPIC_SMALL_FAST_MODEL: model }
+}
+
+export interface HostSpawnProviderEnvInput {
+  /** 已解析的执行模型(sessionManager.executionModel;可能 undefined=沿用 CCB 默认)。 */
+  model: string | undefined
+  /** agent.provider ?? config.provider(claude-subscription 触发 OAuth direct-Anthropic)。 */
+  effectiveProvider: string | undefined
+  /** host claude OAuth access token(仅 claude-subscription 且有 token 时 direct-Anthropic)。 */
+  claudeOAuthAccessToken?: string
+  /** 测试注入平台静态 key 表;省略(undefined)→ 用 hostStaticProviders 模块级 seam。 */
+  hostStaticKeys?: StaticProviderKeys | null
+  /** 测试注入 env;省略 → process.env(容器判定 / NO_PROXY 追加)。 */
+  env?: NodeJS.ProcessEnv
+}
+
+export interface HostSpawnProviderEnv {
+  /** 注入 spawn 的 provider 路由 env(合并进 providerEnv)。 */
+  env: Record<string, string>
+  /**
+   * 实际选中的出站路由(单一权威,决定 spawn 行为):
+   *   - 'host-static'      : 平台静态 provider 直连(BASE_URL+平台 key);
+   *   - 'oauth-direct'     : claude OAuth 直连 api.anthropic.com(清空 BASE_URL/AUTH_TOKEN);
+   *   - 'settings-default' : 不注入 provider auth,靠 settings.json / 容器 proxy env。
+   */
+  routing: 'host-static' | 'oauth-direct' | 'settings-default'
+  /** routing==='host-static' 时命中的 provider id(日志用)。 */
+  providerId?: string
+}
+
+/**
+ * host CCB spawn 的 **provider 路由 env 决策**(单一收口)。
+ *
+ * 出站路由优先级(**host 静态直连高于 agent 的 provider 配置**):
+ *   1. host 静态 provider 命中(resolveHostStaticProviderEnv 非 null:仅 host 非容器 + commercial
+ *      seam 已注入 + 模型属静态 provider)→ **静态路由优先**,claude-subscription / settings.json
+ *      分支整体让位。这与 resolveSyntheticTurnModel 的 `isHostRoutableStaticModel` 自检**严格对称**:
+ *      helper 判"可降级到静态模型" ⟺ spawn 一定按静态路由起进程。否则会出现"自检说 deepseek 可路由、
+ *      但 agent=claude-subscription 时 spawn 走 OAuth direct-Anthropic 把 deepseek 发去 api.anthropic.com
+ *      必挂"的对称性缺陷(Codex MAJOR 2026-07-07)。
+ *   2. 否则 claude-subscription + 有 OAuth token → direct-Anthropic(清空 BASE_URL/AUTH_TOKEN)。
+ *   3. 否则 settings.json / 容器 proxy env 掌权。
+ *
+ * secondary utility model(CCB 隐藏 WebFetch/hook/search 调用的 ANTHROPIC_SMALL_FAST_MODEL):
+ *   - host-static:必须**同 provider 可路由**(否则 deepseek-v4-flash 会被打到本 provider 端点如
+ *     ark 被拒 —— Codex MINOR)。protocol spec 无专门 small/utility 字段 → 保守用主执行模型兜底
+ *     (它就是路由依据,一定同 provider);
+ *   - oauth-direct:不注入(留 CCB 的 Anthropic-native Haiku 默认,deepseek 不可路由到 api.anthropic.com);
+ *   - settings-default:注入 deepseek-v4-flash(容器经 internal proxy 按模型名可达),行为不变。
+ *
+ * key 缺失时 resolveHostStaticProviderEnv **throw**(fail-closed)→ 由本函数原样冒泡,调用方 spawn 前
+ * 清理 starting/binding 并 rethrow。
+ */
+export function buildHostSpawnProviderEnv(input: HostSpawnProviderEnvInput): HostSpawnProviderEnv {
+  const providerEnv: Record<string, string> = {}
+  const hostStatic = resolveHostStaticProviderEnv(input.model, {
+    keys: input.hostStaticKeys,
+    env: input.env,
+  })
+  if (hostStatic) {
+    // 静态路由优先:provider 分支整体让位。
+    Object.assign(providerEnv, hostStatic.env)
+    // secondary 同 provider 可路由,用主执行模型兜底(不跨 provider 打错)。
+    if (input.model) providerEnv.ANTHROPIC_SMALL_FAST_MODEL = input.model
+    return { env: providerEnv, routing: 'host-static', providerId: hostStatic.providerId }
+  }
+  if (input.effectiveProvider === 'claude-subscription') {
+    // Claude subscription: 让 host 掌握 provider 路由(CCB 从 settings.json strip provider vars)。
+    providerEnv.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST = '1'
+    if (input.claudeOAuthAccessToken) {
+      providerEnv.CLAUDE_CODE_OAUTH_TOKEN = input.claudeOAuthAccessToken
+      // direct-Anthropic:清空继承的 BASE_URL/AUTH_TOKEN,防 settings.json 把 OAuth 流量重定向到
+      // 兼容端点窃取。防御纵深(MANAGED_BY_HOST 已 strip settings 来源,这里再防 shell env 泄漏)。
+      providerEnv.ANTHROPIC_BASE_URL = ''
+      providerEnv.ANTHROPIC_AUTH_TOKEN = ''
+      providerEnv.ANTHROPIC_MODEL = ''
+      // direct-Anthropic 路径不 pin deepseek-v4-flash(不可路由到 api.anthropic.com),留 Haiku 默认。
+      return { env: providerEnv, routing: 'oauth-direct' }
+    }
+    // 无 host OAuth:容器 boot 时已注入 ANTHROPIC_* 指向 internal proxy,不动;仍走 secondary pin。
+  }
+  // settings.json / 容器 proxy env 掌权;secondary 走全局 deepseek-v4-flash(容器可达)。
+  Object.assign(providerEnv, _buildSecondaryUtilityModelEnv())
+  return { env: providerEnv, routing: 'settings-default' }
 }
 
 /** Three-candidate fallback for resolving the bundled `openclaude-memory`
@@ -757,69 +842,41 @@ export class SubprocessRunner extends EventEmitter {
       mcpConfigFile: learningContext.mcpConfigFile,
       addDir: effectiveAddDir,
       resumeSessionId: this.currentSessionId,
-      // v3 商业版用户容器判定。双信号 OR 兜底:
-      //  - OC_CONTAINER_ID:私有 env,v3supervisor 仅在 bridgeSecret 就位时注入(语义最清晰)。
-      //  - CLAUDE_CONFIG_DIR === '/run/oc/claude-config':v3supervisor.ts:1189 无条件注入,
-      //    即使 bridgeSecret 缺失(降级模式,容器无 OC_CONTAINER_ID)依然能识别为 v3 容器。
-      // 个人版 master / dev 都不会出现这两条之一,信号空间不重叠。
-      restrictedMemorySources:
-        !!process.env.OC_CONTAINER_ID ||
-        process.env.CLAUDE_CONFIG_DIR === '/run/oc/claude-config',
+      // v3 商业版用户容器判定 —— 双信号 OR 兜底,单一权威已收口
+      // hostStaticProviders.isV3ContainerRuntime(注释/语义见该函数 JSDoc)。
+      restrictedMemorySources: isV3ContainerRuntime(),
       workload: this.opts.workload,
     })
 
     // ── Provider-aware auth injection ──
     // CCB auth priority: ANTHROPIC_AUTH_TOKEN > CLAUDE_CODE_OAUTH_TOKEN > settings.json
-    // We must inject the right env vars per provider so CCB routes to the correct API.
+    // provider 路由 env 决策收口到 buildHostSpawnProviderEnv(单一权威,便于单测对称性):
+    //   host 静态直连(优先)> claude-subscription OAuth direct-Anthropic > settings.json 默认;
+    //   secondary utility model 也在内一并按 routing 决定(host-static 同 provider 兜底,不跨打错)。
+    //   本函数决策与 resolveSyntheticTurnModel 的 isHostRoutableStaticModel 自检严格对称:
+    //   helper 判可降级到静态模型 ⟺ 这里 routing==='host-static',spawn 必按静态路由起。
+    // key 缺失 → resolveHostStaticProviderEnv throw → 在此 spawn 前 fail-closed + 清理
+    //   starting/binding(语义同上方 buildLearningContext 的 catch)。
     const providerEnv: Record<string, string> = {}
-    const effectiveProvider = this.opts.agentProvider ?? this.opts.config.provider
-
-    // True only when host OAuth is injected below and CCB is pointed DIRECT at
-    // api.anthropic.com (ANTHROPIC_BASE_URL wiped). In that mode the hidden
-    // secondary model must stay an Anthropic-native model, so we skip the
-    // deepseek-v4-flash pin (deepseek is not routable at api.anthropic.com).
-    let routesDirectToAnthropic = false
-
-    if (effectiveProvider === 'claude-subscription') {
-      // Claude subscription: inject OAuth token, route to Anthropic API
-      //
-      // CRITICAL: Tell CCB that the host owns provider routing.
-      // Without this, CCB's managedEnv.ts will Object.assign settings.json env
-      // (ANTHROPIC_BASE_URL=minimax, ANTHROPIC_AUTH_TOKEN=minimax_key) OVER our
-      // spawn env, routing Claude requests to MiniMax instead of Anthropic.
-      // With this flag, CCB strips provider vars from settings.json during load.
-      providerEnv.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST = '1'
-      if (this.opts.config.auth.claudeOAuth?.accessToken) {
-        providerEnv.CLAUDE_CODE_OAUTH_TOKEN = this.opts.config.auth.claudeOAuth.accessToken
-        // Host is injecting its own Claude OAuth for direct Anthropic routing.
-        // Wipe any inherited ANTHROPIC_BASE_URL / ANTHROPIC_AUTH_TOKEN so a user
-        // settings.json can't redirect CCB to a Minimax-compatible endpoint and
-        // steal OAuth-authed traffic. MANAGED_BY_HOST alone strips these from
-        // settings-sourced env, but a stray export in the gateway's own shell
-        // env could still bleed through — defense in depth.
-        providerEnv.ANTHROPIC_BASE_URL = ''
-        providerEnv.ANTHROPIC_AUTH_TOKEN = ''
-        providerEnv.ANTHROPIC_MODEL = ''
-        routesDirectToAnthropic = true
-      }
-      // else: no host OAuth to inject — some upstream (e.g. v3 commercial
-      // supervisor) has already put ANTHROPIC_BASE_URL / ANTHROPIC_AUTH_TOKEN
-      // into process.env at container-boot time, pointing CCB at the internal
-      // proxy. Leave those alone; MANAGED_BY_HOST still protects against
-      // settings.json overrides.
-    } else {
-      // MiniMax / DeepSeek / custom provider: DON'T inject any OAuth token.
-      // Let CCB fall through to settings.json (which has ANTHROPIC_BASE_URL +
-      // ANTHROPIC_AUTH_TOKEN pointing to the provider's Anthropic-compatible endpoint).
-      // This is the "default" path — settings.json controls routing.
+    let hostSpawnRouting: HostSpawnProviderEnv
+    try {
+      hostSpawnRouting = buildHostSpawnProviderEnv({
+        model: this.opts.model,
+        effectiveProvider: this.opts.agentProvider ?? this.opts.config.provider,
+        claudeOAuthAccessToken: this.opts.config.auth.claudeOAuth?.accessToken,
+      })
+    } catch (err) {
+      this.starting = false
+      this._boundRepoBinding = null
+      throw err
     }
-    // Pin CCB's hidden secondary model (WebFetch/hook/search) to a cheap static
-    // model — but ONLY when the container routes through the commercial proxy
-    // (which dispatches by model name and can reach deepseek-v4-flash). In the
-    // direct-Anthropic path above, leave ANTHROPIC_SMALL_FAST_MODEL unset so CCB
-    // keeps its Anthropic-native Haiku default.
-    if (!routesDirectToAnthropic) {
-      Object.assign(providerEnv, _buildSecondaryUtilityModelEnv())
+    Object.assign(providerEnv, hostSpawnRouting.env)
+    if (hostSpawnRouting.routing === 'host-static') {
+      runnerLog.info('host static provider direct routing injected', {
+        sessionKey: this.opts.sessionKey,
+        model: this.opts.model,
+        provider: hostSpawnRouting.providerId,
+      })
     }
 
     let proc: ReturnType<TerminalBackend['spawn']>
