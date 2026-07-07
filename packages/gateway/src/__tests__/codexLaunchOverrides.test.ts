@@ -118,11 +118,21 @@ describe('CODEX_PREAMBLE', () => {
   it('mentions openclaude_memory MCP server as the canonical access path', () => {
     assert.ok(
       CODEX_PREAMBLE.includes('openclaude_memory'),
-      'preamble must name the MCP server',
+      'preamble must name the MCP server (skills / scheduling / agents still live there)',
+    )
+    // Phase 2: memory / session-search / archival moved OFF the MCP server onto
+    // the one-shot `oc-memory` CLI. The preamble must route memory ops there.
+    assert.ok(
+      CODEX_PREAMBLE.includes('oc-memory memory --action'),
+      'preamble must document the oc-memory CLI for Core memory',
     )
     assert.ok(
-      CODEX_PREAMBLE.includes('memory(action, target, content/needle)'),
-      'preamble must document the actual memory tool schema',
+      CODEX_PREAMBLE.includes('oc-memory session-search'),
+      'preamble must document the oc-memory CLI for session recall',
+    )
+    assert.ok(
+      CODEX_PREAMBLE.includes('oc-memory archival-add'),
+      'preamble must document the oc-memory CLI for archival memory',
     )
     assert.ok(CODEX_PREAMBLE.includes('skill_search'), 'preamble must mention skill_search')
     for (const tool of [

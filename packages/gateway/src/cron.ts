@@ -113,13 +113,13 @@ const DEFAULT_JOBS: CronJob[] = [
     deliver: 'local',
     prompt: `You are doing a DAILY REFLECTION pass. It is currently early morning.
 
-1. Call \`session_search\` with query terms that cover yesterday's activity (e.g. the current date, common topics).
+1. Run \`oc-memory session-search "<query>"\` in the shell with query terms that cover yesterday's activity (e.g. the current date, common topics).
 2. Review the last 5-10 turns you find.
 3. Extract durable facts, user preferences, and patterns that should persist across sessions.
-4. Use the \`memory\` tool to \`add\` new entries to either "memory" (your observations) or "user" (what you know about the user). Be selective — only things that will actually help next time.
+4. Run \`oc-memory memory --action add --target <memory|user> --content "..."\` to add new entries — "memory" (your observations) or "user" (what you know about the user). Be selective — only things that will actually help next time.
 5. If you notice a pattern of tasks that could be reused, use \`skill_save\` to distill it into a reusable skill.
 6. IMPORTANT: 重点检查今天是否有超过 3 次工具调用的复杂任务。如果有且没有对应 skill,立即用 skill_save 创建。
-7. 如果 MEMORY.md 中有冗长条目,考虑用 archival_add 迁移到归档记忆,然后从 Core 中 remove。
+7. 如果 MEMORY.md 中有冗长条目,考虑用 \`oc-memory archival-add "..."\` 迁移到归档记忆,然后 \`oc-memory memory --action remove --target memory --needle "..."\` 从 Core 删除。
 8. Write a SHORT summary of what you learned today (max 200 words).
 9. If you learned nothing significant, reply with exactly "[SILENT]" and nothing else.`,
   },
@@ -131,15 +131,15 @@ const DEFAULT_JOBS: CronJob[] = [
     deliver: 'local',
     prompt: `You are doing a WEEKLY CURATION pass.
 
-1. Call \`memory(action=read, target=memory)\` and \`memory(action=read, target=user)\` to see everything currently stored.
+1. Run \`oc-memory memory --action read --target memory\` and \`oc-memory memory --action read --target user\` to see everything currently stored.
 2. Call \`skill_list()\` to see accumulated skills.
-3. Call \`archival_search("*")\` to review archival memory entries.
+3. Run \`oc-memory archival-search "*"\` to review archival memory entries.
 4. Look for:
-   - Duplicate or contradictory entries → use \`memory(replace, ...)\` to consolidate.
-   - Obsolete facts (outdated preferences, stale technical details) → use \`memory(remove, ...)\`.
+   - Duplicate or contradictory entries → use \`oc-memory memory --action replace --target <t> --needle "old" --content "new"\` to consolidate.
+   - Obsolete facts (outdated preferences, stale technical details) → use \`oc-memory memory --action remove --target <t> --needle "..."\`.
    - Skills that are too narrow/specific → consider deleting with \`skill_delete\`.
    - Skills with updated_at 超过 30 天 → 检查是否需要刷新或删除。
-   - Archival 中过时的知识 → \`archival_delete\`。
+   - Archival 中过时的知识 → \`oc-memory archival-delete <id>\`。
 5. Write a SHORT summary of curation actions taken (max 200 words).
 6. If no curation was needed, reply with exactly "[SILENT]".`,
   },
@@ -151,11 +151,11 @@ const DEFAULT_JOBS: CronJob[] = [
     deliver: 'local',
     prompt: `Quick skill extraction pass (every 6 hours). Use the current local time to search.
 
-1. \`session_search\` with today's date or recent keywords to find conversations from the last 6 hours.
+1. \`oc-memory session-search "<query>"\` with today's date or recent keywords to find conversations from the last 6 hours.
 2. If no results, try broader search terms (e.g. common topics the user discusses).
 3. For any multi-step task found (3+ tool calls), check \`skill_list()\` for existing coverage.
 4. If a useful new skill pattern is found, \`skill_save\` immediately with concrete steps and commands.
-5. Also \`memory(action=read, target=memory)\` — if any entry is stale or incorrect, update it.
+5. Also \`oc-memory memory --action read --target memory\` — if any entry is stale or incorrect, update it.
 6. If genuinely nothing new to extract or update, reply with exactly "[SILENT]".`,
   },
   {
@@ -167,9 +167,9 @@ const DEFAULT_JOBS: CronJob[] = [
     heartbeat: true, // UI hint only — execution is isolated like other cron jobs
     prompt: `Periodic heartbeat check (every 4 hours). You are proactively checking on the user's standing items.
 
-1. \`memory(action=read, target=memory)\` — scan for any time-sensitive items, deadlines, or follow-ups.
-2. \`archival_search("pending OR reminder OR TODO OR deadline")\` — check for stored reminders/tasks.
-3. \`session_search\` with the current date or recent keywords — look for conversations where the user said "later", "tomorrow", or "remind me".
+1. \`oc-memory memory --action read --target memory\` — scan for any time-sensitive items, deadlines, or follow-ups.
+2. \`oc-memory archival-search "pending OR reminder OR TODO OR deadline"\` — check for stored reminders/tasks.
+3. \`oc-memory session-search "<query>"\` with the current date or recent keywords — look for conversations where the user said "later", "tomorrow", or "remind me".
 4. If you find something actionable (missed deadline, pending follow-up, stale reminder), compose a SHORT proactive update for the user.
 5. If everything is normal and nothing to report, reply with exactly "HEARTBEAT_OK".
 6. DO NOT report that you checked and found nothing — that's what HEARTBEAT_OK is for.`,

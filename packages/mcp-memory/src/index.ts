@@ -5,13 +5,21 @@
  * MCP server that exposes OpenClaude's learning loop to the spawned CCB
  * subprocess. This is how the agent gains the ability to:
  *
- *   • `memory`         — curate its own MEMORY.md and USER.md across sessions
- *   • `session_search` — recall past conversations (SQLite FTS5 + second-pass summary)
  *   • `skill_list`     — discover its own accumulated skills (tier-1 progressive disclosure)
  *   • `skill_search`   — find relevant skills by metadata before loading bodies
  *   • `skill_view`     — load a skill's full instructions (tier-2/3)
  *   • `skill_save`     — distill a successful task into a reusable skill
  *   • `skill_delete`
+ *   • reminder / delegate tools (see TOOLS below)
+ *
+ * NOTE (Phase 2): the memory-class tools (`memory`, `session_search`,
+ * `archival_add`, `archival_search`, `archival_delete`) used to live here too.
+ * They were moved OUT of this long-lived stdio server into the one-shot
+ * `oc-memory` CLI (packages/mcp-memory/src/ocMemoryCli.ts, shared logic in
+ * memoryTools.ts) — a persistent stdio transport is fragile (console pollution
+ * or a crash kills the whole transport → codex hangs). skill / reminder /
+ * delegate tools remain here (lower frequency, delegate needs the long-lived
+ * gateway-callback socket).
  *
  * Configuration: the server is spawned per-session by the gateway with
  *   env OPENCLAUDE_AGENT_ID=<id>   (which agent this subprocess belongs to)
@@ -28,34 +36,15 @@ import { Server } from '@modelcontextprotocol/sdk/server/index.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js'
 import {
-  type EmbeddingProvider,
-  MemoryStore,
   SkillDraftStore,
   type SkillStore,
   buildAgentSkillStore,
   isPlatformReservedSkillName,
   parseSkillEvalsJson,
-  serializeSkillEvals,
-  validateSkillName,
-  archivalAdd,
-  archivalCount,
-  archivalDelete,
-  deleteArchivalVector,
-  getEmbeddingProvider,
-  getSessionsDb,
-  // P1: Hybrid search (BM25 + Vector + RRF)
-  hybridArchivalSearch,
-  hybridSessionSearch,
-  indexTurn,
-  initVectorStore,
-  isEmbeddingAvailable,
-  loadSessionTurns,
-  recordAccess,
-  searchSessions,
   searchSkillMetadata,
+  serializeSkillEvals,
   syncMarketplaceHub,
-  upsertArchivalVector,
-  upsertSessionMeta,
+  validateSkillName,
 } from '@openclaude/storage'
 
 import {
@@ -102,9 +91,6 @@ function readGatewayToken(): string {
   }
   return process.env.OPENCLAUDE_GATEWAY_TOKEN || ''
 }
-
-const memory = new MemoryStore(AGENT_ID)
-await memory.load()
 
 function buildSkillStore(): SkillStore {
   // Overlay (single wiring in @openclaude/storage): platform baseline (ro env)
@@ -158,34 +144,14 @@ function applyEvalArmToList<T extends { name: string; description: string }>(lis
 const SKILL_TRAIN_RUN_ID = (process.env.OPENCLAUDE_SKILL_TRAIN_RUN_ID ?? '').trim()
 const drafts = new SkillDraftStore()
 
-// Track in-flight embedding tasks to prevent add/delete race conditions
-const pendingEmbeds = new Map<string, Promise<void>>()
-
-// ── P1: Initialize archival schema + embedding + vector store ─
-// archivalCount triggers ensureSchema() which creates archival + archival_fts tables.
-// Must run before hybridArchivalSearch which queries archival_fts directly.
-await archivalCount(AGENT_ID)
-
 // Reconcile installed marketplace skills into the hub layer (v3 only; no-op
 // otherwise). Fire-and-forget + fail-soft so it never delays mcp readiness.
 void syncMarketplaceHub()
 
-let embeddingProvider: EmbeddingProvider | null = null
-
-if (isEmbeddingAvailable()) {
-  try {
-    embeddingProvider = getEmbeddingProvider()
-    await initVectorStore(embeddingProvider.dimensions)
-    process.stderr.write(
-      `[mcp-memory] embedding enabled: ${embeddingProvider.providerId}/${embeddingProvider.modelId} (${embeddingProvider.dimensions}d)\n`,
-    )
-  } catch (err: any) {
-    process.stderr.write(
-      `[mcp-memory] embedding init failed (falling back to BM25-only): ${err?.message}\n`,
-    )
-    embeddingProvider = null
-  }
-}
+// NOTE (Phase 2): memory / session_search / archival_* moved to the oc-memory
+// CLI. The MemoryStore instance, archival schema bootstrap and embedding-provider
+// init that used to live here now live in createMemoryToolsContext (memoryTools.ts),
+// constructed per CLI invocation. This server no longer touches memory state.
 
 const server = new Server(
   { name: 'openclaude-memory', version: '0.1.0' },
@@ -195,59 +161,11 @@ const server = new Server(
 // ─────────────────────────────────────────────────────────────
 // Tool definitions
 // ─────────────────────────────────────────────────────────────
+// NOTE (Phase 2): the memory-class tools (`memory`, `session_search`,
+// `archival_add`, `archival_search`, `archival_delete`) are intentionally NOT
+// in this list — they moved to the one-shot `oc-memory` CLI. Do not re-add them
+// here; keep them on the CLI so a persistent-transport crash can't hang codex.
 const TOOLS = [
-  {
-    name: 'memory',
-    description: [
-      'Curate long-term memory across sessions. Two targets:',
-      '  - "memory": your own observations (environment facts, conventions, tool quirks, lessons learned)',
-      '  - "user":   what you know about the user (preferences, communication style, workflow)',
-      '',
-      'Use this tool when you learn something durable that should persist across sessions.',
-      'Entries are injected into the system prompt at the start of every future session.',
-      '',
-      'Actions:',
-      '  add(target, content)           — append a new entry. Char-budgeted; oldest entries are trimmed first.',
-      '  replace(target, needle, new)   — replace the entry matching `needle` substring (must be unique).',
-      '  remove(target, needle)         — delete the entry matching `needle`.',
-      '  read(target)                   — dump current entries as text.',
-      '',
-      'Writes are scanned for prompt-injection patterns and will be rejected.',
-    ].join('\n'),
-    inputSchema: {
-      type: 'object',
-      properties: {
-        action: { type: 'string', enum: ['add', 'replace', 'remove', 'read'] },
-        target: { type: 'string', enum: ['memory', 'user'] },
-        content: { type: 'string' },
-        needle: { type: 'string' },
-      },
-      required: ['action', 'target'],
-    },
-  },
-  {
-    name: 'session_search',
-    description: [
-      'Hybrid search across past sessions (BM25 full-text + vector similarity when available).',
-      "Set agentId to search another agent's sessions (cross-agent memory access).",
-      '',
-      'Returns up to `limit` (default 5) top sessions with snippet + metadata.',
-    ].join('\n'),
-    inputSchema: {
-      type: 'object',
-      properties: {
-        query: { type: 'string', description: 'Search query (keywords or natural language)' },
-        limit: { type: 'number', default: 5 },
-        agentId: { type: 'string', description: '搜索指定 agent 的会话(默认搜索自己的)' },
-        summarize: {
-          type: 'boolean',
-          default: false,
-          description: 'Return LLM-summarized transcripts',
-        },
-      },
-      required: ['query'],
-    },
-  },
   {
     name: 'skill_list',
     description: [
@@ -339,58 +257,6 @@ const TOOLS = [
       type: 'object',
       properties: { name: { type: 'string' } },
       required: ['name'],
-    },
-  },
-  // ── Archival Memory (Letta-inspired tier-3 long-term storage) ──
-  {
-    name: 'archival_add',
-    description: [
-      'Store a piece of knowledge in long-term archival memory (unlimited capacity, FTS5 searchable).',
-      'Use for: detailed API docs, project architecture notes, code patterns, procedures that are too long for MEMORY.md.',
-      'Unlike Core Memory (MEMORY.md/USER.md), archival entries are NOT in the system prompt — you must search for them.',
-      'Returns the entry ID.',
-    ].join('\n'),
-    inputSchema: {
-      type: 'object',
-      properties: {
-        content: {
-          type: 'string',
-          description:
-            'The knowledge to store. Be specific and include keywords for future retrieval.',
-        },
-        tags: {
-          type: 'string',
-          description: 'Comma-separated tags for categorization, e.g. "api,minimax,tts"',
-        },
-      },
-      required: ['content'],
-    },
-  },
-  {
-    name: 'archival_search',
-    description: [
-      'Search archival memory using hybrid search (BM25 full-text + vector similarity + RRF fusion).',
-      "Use when you need detailed knowledge that's too large for Core Memory.",
-      'Supports both keyword queries and natural language questions.',
-    ].join('\n'),
-    inputSchema: {
-      type: 'object',
-      properties: {
-        query: { type: 'string', description: 'Search query (keywords or natural language)' },
-        limit: { type: 'number', default: 5, description: 'Max results to return' },
-      },
-      required: ['query'],
-    },
-  },
-  {
-    name: 'archival_delete',
-    description: 'Delete an archival entry by ID. Use when knowledge is outdated or wrong.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        id: { type: 'string', description: 'Entry ID (from archival_search results)' },
-      },
-      required: ['id'],
     },
   },
   // ── Reminder / scheduled task ──
@@ -660,10 +526,6 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
   const { name, arguments: args } = req.params
   try {
     switch (name) {
-      case 'memory':
-        return await handleMemory(args as any)
-      case 'session_search':
-        return await handleSessionSearch(args as any)
       case 'skill_list':
         return await handleSkillList()
       case 'skill_search':
@@ -676,12 +538,6 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
         return await handleSkillDelete(args as any)
       case 'skill_propose':
         return await handleSkillPropose(args as any)
-      case 'archival_add':
-        return await handleArchivalAdd(args as any)
-      case 'archival_search':
-        return await handleArchivalSearch(args as any)
-      case 'archival_delete':
-        return await handleArchivalDelete(args as any)
       case 'create_reminder':
         return await handleCreateReminder(args as any)
       case 'list_reminders':
@@ -708,106 +564,6 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
     }
   }
 })
-
-async function handleMemory(args: {
-  action: string
-  target: 'memory' | 'user'
-  content?: string
-  needle?: string
-}) {
-  await memory.load() // refresh from disk every call (in case user edited via UI)
-  const target = args.target
-  switch (args.action) {
-    case 'read': {
-      const text = memory.read(target)
-      return {
-        content: [
-          {
-            type: 'text',
-            text:
-              text ||
-              `(${target} is empty — use memory(add, ${target}, "...") to populate it with things worth remembering across sessions)`,
-          },
-        ],
-      }
-    }
-    case 'add': {
-      if (!args.content) return toolError('content required for add')
-      const r = await memory.add(target, args.content)
-      if (!r.ok) return toolError(r.error ?? 'add failed')
-      return toolOk(`Added to ${target}. Current size: ${memory.charCount(target)} chars.`)
-    }
-    case 'replace': {
-      if (!args.needle || !args.content) return toolError('needle and content required for replace')
-      const r = await memory.replace(target, args.needle, args.content)
-      if (!r.ok) return toolError(r.error ?? 'replace failed')
-      return toolOk(`Replaced in ${target}.`)
-    }
-    case 'remove': {
-      if (!args.needle) return toolError('needle required for remove')
-      const r = await memory.remove(target, args.needle)
-      if (!r.ok) return toolError(r.error ?? 'remove failed')
-      return toolOk(`Removed from ${target}.`)
-    }
-    default:
-      return toolError(`unknown action: ${args.action}`)
-  }
-}
-
-async function handleSessionSearch(args: {
-  query: string
-  limit?: number
-  agentId?: string
-  summarize?: boolean
-}) {
-  // Default: search only THIS agent's sessions. Pass agentId to search another agent.
-  const searchAgentId = args.agentId ?? AGENT_ID
-  const limit = args.limit ?? 5
-
-  // Use hybrid search (BM25 + vector) when embedding is available, else BM25-only
-  const hits = embeddingProvider
-    ? await hybridSessionSearch(args.query, embeddingProvider, limit, searchAgentId)
-    : (await searchSessions(args.query, limit, searchAgentId)).map((h) => ({
-        ...h,
-        bm25Rank: null as number | null,
-        vecRank: null as number | null,
-      }))
-
-  if (hits.length === 0) {
-    const scope = args.agentId ? ` (agent: ${args.agentId})` : ''
-    return { content: [{ type: 'text', text: `No past sessions match "${args.query}"${scope}.` }] }
-  }
-  const scope = args.agentId ? ` (agent: ${args.agentId})` : ''
-  const mode = embeddingProvider ? 'hybrid' : 'BM25'
-  const lines: string[] = [
-    `Found ${hits.length} past sessions matching "${args.query}"${scope} (${mode}):`,
-    '',
-  ]
-  for (const h of hits) {
-    const when = new Date(h.lastAt).toISOString().slice(0, 19).replace('T', ' ')
-    lines.push(`• ${h.title} — ${when} [${h.channel}] (score ${h.score.toFixed(2)})`)
-    const cleanSnippet = h.snippet.replace(/<\/?mark>/g, '**').slice(0, 300)
-    lines.push(`  ${cleanSnippet}`)
-    lines.push('')
-  }
-  // Second-pass summary: optional, per-hit, capped for token budget
-  if (args.summarize) {
-    lines.push('---')
-    lines.push('Full summaries:')
-    lines.push('')
-    for (const h of hits.slice(0, 3)) {
-      const turns = await loadSessionTurns(h.sessionId)
-      const text = turns
-        .map((t) => `[${t.role}] ${t.content}`)
-        .join('\n')
-        .slice(0, 4000)
-      lines.push(`### ${h.title}`)
-      lines.push(text)
-      lines.push('')
-    }
-  }
-  return { content: [{ type: 'text', text: lines.join('\n') }] }
-}
 
 async function handleSkillList() {
   const list = applyEvalArmToList(await skills.list())
@@ -1190,96 +946,6 @@ async function handleSkillPropose(args: {
   return toolOk(
     `Staged ${op} draft for "${args.name}" (run ${SKILL_TRAIN_RUN_ID}). Awaiting user review in the diff panel.`,
   )
-}
-
-// ── Archival Memory handlers ──
-async function handleArchivalAdd(args: { content: string; tags?: string }) {
-  // Guard against missing/empty content — the archival table's `content` column
-  // is NOT NULL, so reaching the INSERT with undefined surfaces a cryptic
-  // "constraint failed" SQL error. Callers sometimes pass `title`/other
-  // unsupported fields (schema only accepts `content` and `tags`, unknown
-  // props are silently dropped by MCP), leaving `args.content` undefined.
-  if (typeof args.content !== 'string' || args.content.trim() === '') {
-    return toolError(
-      'archival_add requires a non-empty `content` string (schema only accepts `content` and optional `tags` — any `title` or other fields are dropped by MCP)',
-    )
-  }
-  const id = await archivalAdd(AGENT_ID, args.content, args.tags)
-
-  // P1: Generate embedding and store vector (fire-and-forget to avoid blocking response)
-  // Tracked in pendingEmbeds so archival_delete can await before cleanup.
-  if (embeddingProvider) {
-    const provider = embeddingProvider
-    const task = (async () => {
-      try {
-        const [vec] = await provider.embed([args.content], 'document')
-        // Verify the archival row still exists before inserting vector
-        // (a concurrent delete may have removed it during embedding)
-        const db = await getSessionsDb()
-        const row = db.prepare('SELECT 1 FROM archival WHERE id = ?').get(id)
-        if (row) await upsertArchivalVector(id, vec)
-      } catch (err: any) {
-        process.stderr.write(`[mcp-memory] embedding failed for archival ${id}: ${err?.message}\n`)
-      } finally {
-        pendingEmbeds.delete(id)
-      }
-    })()
-    // embed() is async — task always suspends at first await before finally runs,
-    // so set() always registers before delete() fires.
-    pendingEmbeds.set(id, task)
-  }
-
-  const count = await archivalCount(AGENT_ID)
-  return toolOk(`Stored in archival memory (id=${id}). Total entries: ${count}`)
-}
-
-async function handleArchivalSearch(args: { query: string; limit?: number }) {
-  if (typeof args.query !== 'string' || args.query.trim() === '') {
-    return toolError('archival_search requires a non-empty `query` string')
-  }
-  const limit = args.limit ?? 5
-  const results = await hybridArchivalSearch(AGENT_ID, args.query, embeddingProvider, limit)
-  if (results.length === 0) return toolOk(`No archival entries match "${args.query}".`)
-
-  // Track access for lifecycle (non-blocking)
-  recordAccess(results.map((r) => r.id)).catch(() => {})
-
-  const mode = embeddingProvider ? 'hybrid (BM25+vector)' : 'BM25-only'
-  const lines = results.map((r, i) => {
-    const ranks: string[] = []
-    if (r.bm25Rank != null) ranks.push(`bm25:#${r.bm25Rank}`)
-    if (r.vecRank != null) ranks.push(`vec:#${r.vecRank}`)
-    const rankInfo = ranks.length > 0 ? ` [${ranks.join(', ')}]` : ''
-    return `[${i + 1}] id=${r.id} tags=${r.tags || '(none)'}${rankInfo}\n${r.content}`
-  })
-  return toolOk(
-    `Found ${results.length} archival entries (${mode}):\n\n${lines.join('\n\n---\n\n')}`,
-  )
-}
-
-async function handleArchivalDelete(args: { id: string }) {
-  if (typeof args.id !== 'string' || args.id.trim() === '') {
-    return toolError(
-      'archival_delete requires a non-empty `id` string (from archival_search results)',
-    )
-  }
-  const ok = await archivalDelete(AGENT_ID, args.id)
-  if (!ok) return toolError(`Entry ${args.id} not found.`)
-
-  // P1: Await any in-flight embedding before deleting vector (prevents add/delete race)
-  const pending = pendingEmbeds.get(args.id)
-  if (pending) await pending
-
-  if (embeddingProvider) {
-    try {
-      await deleteArchivalVector(args.id)
-    } catch (err: any) {
-      // deleteArchivalVector does not throw on missing rows —
-      // any error here is a real DB/vec issue, so log it.
-      process.stderr.write(`[mcp-memory] vector delete failed for ${args.id}: ${err?.message}\n`)
-    }
-  }
-  return toolOk(`Deleted archival entry ${args.id}.`)
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -1670,11 +1336,6 @@ function toolOk(msg: string) {
 function toolError(msg: string) {
   return { content: [{ type: 'text', text: `error: ${msg}` }], isError: true }
 }
-
-// ─────────────────────────────────────────────────────────────
-// Expose session indexing to the gateway via env-controlled IPC-free path:
-// the gateway writes directly to the same SQLite file; we re-export the API
-// from @openclaude/storage so both processes can use it.
 
 const transport = new StdioServerTransport()
 await server.connect(transport)

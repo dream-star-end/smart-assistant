@@ -1367,7 +1367,14 @@ export class CodexAppServerRunner extends EventEmitter {
     const proc = _spawnFn('codex', args, {
       cwd: effectiveCwd,
       stdio: ['pipe', 'pipe', 'pipe'],
-      env: buildCodexEnv(),
+      // buildCodexEnv() scrub 掉全部 OPENCLAUDE_*(安全红线,防内部 token/URL 泄漏给
+      // codex/chatgpt 后端)。但 oc-memory CLI(模型经 bash 调,继承本进程 env)需要知道
+      // 自己是哪个 agent 才能读写正确的 MEMORY.md/USER.md/archival —— 否则非 main agent
+      // 跑在 codex(gpt-5.5)上会回落 'main'、污染 main 的记忆(memory CLI 化引入的缺口)。
+      // 用**非 OPENCLAUDE_ 前缀**的 OC_AGENT_ID 显式注入(不被 scrub):agent-id 不是密钥
+      // (模型本就从 persona/SOUL 知道自己是谁),暴露给 codex shell 零敏感。旧 MCP 是靠
+      // mcp_servers.X.env 显式注入 agent-id 才没这问题;CLI 走 ambient env 需本行补齐。
+      env: { ...buildCodexEnv(), OC_AGENT_ID: this.opts.agentId },
     }) as ChildProcessWithoutNullStreams
     this.proc = proc
     this.spawnedProviderSignature = providerSignature

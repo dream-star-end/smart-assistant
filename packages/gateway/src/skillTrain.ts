@@ -114,7 +114,7 @@ CRITICAL guards:
 
 Procedure:
 1. Call \`skill_list()\` to map current coverage and identify user-authored (writable) skills.
-2. Use \`session_search\` across the lookback window for reusable multi-step work
+2. Run \`oc-memory session-search "<query>"\` (shell CLI) across the lookback window for reusable multi-step work
    patterns: 3+ tool-call tasks, repeated corrections, failed-then-fixed attempts,
    explicit user satisfaction/dissatisfaction, deployment/debugging/review/test/UI work.
 3. Inspect up to ${opts.maxSessions} high-signal sessions.
