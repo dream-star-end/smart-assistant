@@ -251,6 +251,7 @@ BEGIN; <迁移 SQL>; INSERT INTO schema_migrations(version, applied_at) VALUES (
 - **org 技能 = marketplace 单机制**:listing.org_id 可见性(orgVisibleFrag 单一谓词)+ org_installs → sync UNION → hub 层;同 slug 个人优先;容器/storage 零改动。
 - **报表权威 = 写时打戳**(usage_records.org_id/credit_ledger.org_id),不按当前成员集推导。
 - 迁移 0111-0115 已 apply;成员管理授权矩阵权威在数据层事务内(updateMember/removeMember FOR UPDATE 后判),HTTP 层不重复判。
+- **三期(07-07)**:landing 企业区块(¥88/席起动态锚点,无折扣叙事)+ 低水位预警(sweeper 第三域,owner 站内信+邮件,notified_at 去重/充值清标记)+ billing 委派伪角色(minRole:'billing'=owner∥billing_delegate,权威收口 requireOrgRole)+ 成员月度限额(ORG_MONTH_SPEND_FILTER 单一口径,spend 钳制超限静默落个人桶)。**企业档与个人版同价**(0117,取消 9 折)。**smoke 已 leader 感知**(OC_CONTROL_PLANE_LEADER=1 → controlPlane true+shared 域白名单;v3 停服跳过零影响断言)。
 - **二期(07-07)**:席位订阅 org-pro/max/ultra(scope='org' 进 subscription_plans 单一权威,个人枚举必须 scope='user');四桶 org_period→org_wallet→user_period→user_wallet;自助开通=org_provision 订单 fulfill 原子建 org(冲突→paid+critical 告警人工处置);billing 写面 owner-only;席位闸只拦新进。**教训:preCheck/settle 任何新增 PG 查询,必须同步 userChatBridgeCodexBilling 等 fakePool 测试替身(unhandled SQL 直接 throw→帧超时),且集成门必须实跑该套件**(一期 5d194bb0 漏此,二期二分定位补修)。
 
 ---
