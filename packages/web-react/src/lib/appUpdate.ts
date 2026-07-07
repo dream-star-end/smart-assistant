@@ -124,11 +124,12 @@ export class AppUpdateGovernor {
     this.check();
   }
 
-  /** 横幅「立即刷新」:用户主动,绕过安全点。仍推进谱系计数(手动刷也计入封顶,防
-   *  "手动刷→回旧HTML→自动刷"乒乓);写失败也照刷一次(用户点一次=一次,非循环)。 */
+  /** 横幅「立即刷新」:用户主动,绕过安全点,**不动谱系计数**。手动刷是人工限频(点一次
+   *  =一次,非循环),不该消耗自动 reload 预算;URL 里已有的 #ocr 原样保留 → 若这次刷新
+   *  仍拿回旧 HTML,新页面延续既有谱系(到顶仍只横幅,不会因手动刷重开自动预算)。
+   *  也避免了"手动成功刷新后没收到握手帧 → #ocr 残留压低后续预算"(Codex 二轮 P2)。 */
   reloadNow(): void {
     if (this.reloaded) return;
-    this.deps.writeLineage(this.reloadsSoFar + 1);
     this.reloaded = true;
     this.stopTimer();
     this.deps.reload();
@@ -249,10 +250,11 @@ function clampCount(n: unknown): number {
 
 const LINEAGE_RE = /(?:^|[#&])ocr=(\d{1,3})(?:&|$)/;
 
-/** 读 reload 谱系计数:URL hash 的 #ocr=N。URL 是 reload 的固有部分,storage 被清也存活。 */
-function readLineageFromUrl(): number {
+/** 读 reload 谱系计数:URL hash 里的 ocr=N 段。URL 是 reload 的固有部分,storage 被清也存活。
+ *  导出仅供单测(锁定各种 hash 形态的解析);运行时经 deps 注入。 */
+export function readLineageFromUrl(hash: string): number {
   try {
-    const m = LINEAGE_RE.exec(window.location.hash);
+    const m = LINEAGE_RE.exec(hash);
     return m ? clampCount(parseInt(m[1], 10)) : 0;
   } catch {
     return 0;
@@ -260,16 +262,32 @@ function readLineageFromUrl(): number {
 }
 
 /**
- * 写 reload 谱系计数到 URL hash,返回是否写入并读回成功。
- * 独占 hash(经核实 web-react 用 pathname/search 路由,hash 无语义,仅被 useAppRoute 透传)。
- * n<=0 时清空 hash(地址栏干净)。history.replaceState 不压历史栈。
+ * 把 hash 里的 ocr=N 段设为 n(n<=0 则移除),**保留其余 hash 内容**(如 Landing 的
+ * `#demo`/`#agents` 锚点——它们不是 ocr 段,必须原样留存,否则会破坏深链)。返回新 hash
+ * (不含前导 #,空则空串)。纯函数,导出供单测直测。
+ */
+export function setLineageInHash(hash: string, n: number): string {
+  let h = hash.replace(/^#/, "");
+  // 去掉已有 ocr 段并清理多余 & 分隔符
+  h = h
+    .replace(/(?:^|&)ocr=\d+/g, "")
+    .replace(/&{2,}/g, "&")
+    .replace(/^&|&$/g, "");
+  if (n > 0) h = h ? `${h}&ocr=${clampCount(n)}` : `ocr=${clampCount(n)}`;
+  return h;
+}
+
+/**
+ * 写 reload 谱系计数到 URL hash,返回是否写入并读回成功。保留非 ocr 的 hash 锚点。
+ * history.replaceState 不压历史栈;抛错 → false(→ 永不自动刷)。
  */
 function writeLineageToUrl(n: number): boolean {
   try {
-    const base = window.location.pathname + window.location.search;
-    const url = n > 0 ? `${base}#ocr=${n}` : base;
+    const loc = window.location;
+    const newHash = setLineageInHash(loc.hash, n);
+    const url = loc.pathname + loc.search + (newHash ? `#${newHash}` : "");
     window.history.replaceState(window.history.state, "", url);
-    return readLineageFromUrl() === (n > 0 ? clampCount(n) : 0);
+    return readLineageFromUrl(window.location.hash) === (n > 0 ? clampCount(n) : 0);
   } catch {
     return false;
   }
@@ -302,7 +320,7 @@ export const appUpdate = new AppUpdateGovernor({
   reload: () => window.location.reload(),
   now: () => Date.now(),
   storage: typeof window === "undefined" ? null : probeLocalStorage(),
-  readLineage: readLineageFromUrl,
+  readLineage: () => (typeof window === "undefined" ? 0 : readLineageFromUrl(window.location.hash)),
   writeLineage: writeLineageToUrl,
 });
 

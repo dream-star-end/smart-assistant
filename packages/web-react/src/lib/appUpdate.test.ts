@@ -4,7 +4,12 @@
  * 即使 build 在多值间漂移,也永不无限循环。改任何守卫前先看这组测试。
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { AppUpdateGovernor, type AppUpdateDeps } from "./appUpdate";
+import {
+  AppUpdateGovernor,
+  readLineageFromUrl,
+  setLineageInHash,
+  type AppUpdateDeps,
+} from "./appUpdate";
 
 const CLIENT = "1111111111111111";
 const SERVER = "2222222222222222";
@@ -273,7 +278,7 @@ describe("S1 安全点", () => {
 });
 
 describe("横幅动作", () => {
-  it("reloadNow:绕过安全点立即刷,且推进谱系计数(防手动/自动乒乓)", () => {
+  it("reloadNow:绕过安全点立即刷,但不动谱系计数(手动刷人工限频,不消耗自动预算)", () => {
     const box = { n: 0 };
     const { gov, reload } = make({ lineage: box });
     gov.registerBusyProbe(() => true); // 哪怕忙
@@ -281,7 +286,17 @@ describe("横幅动作", () => {
     gov.onServerBuild(SERVER);
     gov.reloadNow();
     expect(reload).toHaveBeenCalledTimes(1);
-    expect(box.n).toBe(1);
+    expect(box.n).toBe(0); // 不写 #ocr:避免离线成功刷新后残留压低后续预算(Codex 二轮 P2)
+  });
+
+  it("reloadNow 保留 URL 里已有的谱系(到顶后手动刷不会重开自动预算)", () => {
+    const box = { n: 2 }; // 已到顶
+    const { gov, reload } = make({ lineage: box });
+    passIdle();
+    gov.onServerBuild(SERVER);
+    gov.reloadNow();
+    expect(reload).toHaveBeenCalledTimes(1);
+    expect(box.n).toBe(2); // 谱系原样保留 → 新页面读到 2 → 仍只横幅
   });
 
   it("reloadNow 后 reloaded 置位,重复调用不再刷(不循环)", () => {
@@ -302,6 +317,34 @@ describe("横幅动作", () => {
     passIdle();
     gov.onServerBuild(SERVER);
     expect(seen).toEqual([true]);
+  });
+});
+
+describe("URL hash 谱系读写(纯函数,锁 P1 锚点保留 + P3 解析形态)", () => {
+  it("readLineageFromUrl 各种 hash 形态", () => {
+    expect(readLineageFromUrl("")).toBe(0);
+    expect(readLineageFromUrl("#")).toBe(0);
+    expect(readLineageFromUrl("#demo")).toBe(0);
+    expect(readLineageFromUrl("#ocr=2")).toBe(2);
+    expect(readLineageFromUrl("#demo&ocr=2")).toBe(2);
+    expect(readLineageFromUrl("#ocr=2&bar")).toBe(2);
+    expect(readLineageFromUrl("#ocrx=9")).toBe(0); // 不误匹配相似 key
+    expect(readLineageFromUrl("#ocr=abc")).toBe(0);
+  });
+
+  it("setLineageInHash 保留非 ocr 锚点(修 Codex 二轮 P1:不吞 #demo/#agents)", () => {
+    // 清零:锚点原样留存
+    expect(setLineageInHash("#demo", 0)).toBe("demo");
+    expect(setLineageInHash("#agents", 0)).toBe("agents");
+    expect(setLineageInHash("", 0)).toBe("");
+    // 设值:锚点 + ocr 段共存
+    expect(setLineageInHash("#demo", 2)).toBe("demo&ocr=2");
+    expect(setLineageInHash("", 1)).toBe("ocr=1");
+    // 替换已有 ocr,不重复、不残留多余 &
+    expect(setLineageInHash("#ocr=1", 2)).toBe("ocr=2");
+    expect(setLineageInHash("#demo&ocr=1", 2)).toBe("demo&ocr=2");
+    expect(setLineageInHash("#demo&ocr=1", 0)).toBe("demo");
+    expect(setLineageInHash("#ocr=1&demo", 0)).toBe("demo");
   });
 });
 
