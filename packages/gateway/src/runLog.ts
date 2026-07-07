@@ -26,6 +26,10 @@ export interface RunLogEntry {
   toolCalls?: string[] // tool names used in this run
   // Error info
   error?: string
+  // ── 合成首帧 codex 降级透明化(MAJOR-2)──
+  /** 合成首帧(cron/webhook/task/inter-agent/openai-compat)因 codex 无计费主体而被降级到的
+   *  实际执行(非 codex)模型。undefined = 未降级 / 非合成路径。doctor 面据此显式披露降级,不静默换模型。 */
+  effectiveModel?: string
   // ── P2 债C — hidden reviewer 硬编排打标 ──
   /** true = 本 run 是 gateway 硬编排触发的隐藏审查员委派(非用户/队长自发委派)。
    *  仅 taskType='delegate' 且 target 为隐藏审查员的硬编排 run 打此标,便于 doctor
@@ -44,7 +48,7 @@ export class RunLog {
   /** Start a new run, returns the entry for later update. */
   start(
     init: Pick<RunLogEntry, 'agentId' | 'sessionKey' | 'taskType'> &
-      Partial<Pick<RunLogEntry, 'isReview'>>,
+      Partial<Pick<RunLogEntry, 'isReview' | 'effectiveModel'>>,
   ): RunLogEntry {
     const entry: RunLogEntry = {
       id: `run-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`,

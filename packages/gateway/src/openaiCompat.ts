@@ -16,6 +16,10 @@ import type { AgentsConfig, OpenClaudeConfig } from '@openclaude/storage'
 import { isHiddenSystemAgentId, userVisibleDefaultAgentId } from './agentVisibility.js'
 import type { RunLog } from './runLog.js'
 import type { SessionManager } from './sessionManager.js'
+// 合成首帧执行模型解析:openai-compat 首帧绕过 master bridge 计费编排,落 codex 会被
+// CODEX_BILLING_GUARD 拒 → 解析为非 codex 执行模型。server.ts 已 import 本文件,live
+// binding 在运行期调用安全(同 cron.ts 沿用的既有循环容忍模式)。
+import { resolveSyntheticTurnModel } from './server.js'
 
 export interface OpenAICompatDeps {
   config: OpenClaudeConfig
@@ -129,16 +133,29 @@ async function handleChatCompletions(
       : lastUser.content
 
   const sessionKey = `agent:${agentId}:openai:dm:${Date.now()}`
+  const _oaiRoute = resolveSyntheticTurnModel(agent, deps.config.defaults?.model)
+  const _oaiModel = _oaiRoute?.model
   const session = await deps.sessions.getOrCreate({
     sessionKey,
     agent,
+    ...(_oaiModel ? { model: _oaiModel } : {}),
     channel: 'openai-compat',
     peerId: 'openai-client',
     title: lastUser.content.slice(0, 40),
   })
 
+  // MAJOR-2 透明化(API 客户端面):合成首帧解析为 codex 时被降级到非 codex 执行模型。
+  // OpenAI `model` 字段是**客户端请求回显**(客户端发的是 agentId,非模型名),保持回显
+  // agentId 以不破坏按 model 名匹配的 OpenAI 客户端契约;降级信息改用扩展字段
+  // `x_openclaude_effective_model` 显式暴露(元数据级,不藏),并落 runLog(doctor 面)。
+  const _oaiEffective = _oaiRoute ? { x_openclaude_effective_model: _oaiRoute.model } : {}
   const requestId = `chatcmpl-${Date.now().toString(36)}`
-  const _oaiRun = deps.runLog.start({ agentId, sessionKey, taskType: 'openai-compat' })
+  const _oaiRun = deps.runLog.start({
+    agentId,
+    sessionKey,
+    taskType: 'openai-compat',
+    ...(_oaiRoute ? { effectiveModel: _oaiRoute.model } : {}),
+  })
 
   if (parsed.stream) {
     // ── SSE streaming ──
@@ -174,6 +191,7 @@ async function handleChatCompletions(
             object: 'chat.completion.chunk',
             created: Math.floor(Date.now() / 1000),
             model: agentId,
+            ..._oaiEffective,
             choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
           }
           res.write(`data: ${JSON.stringify(done)}\n\n`)
@@ -188,7 +206,7 @@ async function handleChatCompletions(
           res.write(`data: ${JSON.stringify(errChunk)}\n\n`)
           res.end()
         }
-      })
+      }, undefined, _oaiModel)
     } catch (err: any) {
       deps.runLog.complete(_oaiRun, { status: 'failed', error: String(err) })
       try {
@@ -203,10 +221,16 @@ async function handleChatCompletions(
     let output = ''
     let error = ''
     try {
-      await deps.sessions.submit(session, prompt, (e) => {
-        if (e.kind === 'block' && e.block.kind === 'text') output += (e.block as any).text
-        if (e.kind === 'error') error = e.error
-      })
+      await deps.sessions.submit(
+        session,
+        prompt,
+        (e) => {
+          if (e.kind === 'block' && e.block.kind === 'text') output += (e.block as any).text
+          if (e.kind === 'error') error = e.error
+        },
+        undefined,
+        _oaiModel,
+      )
     } catch (err: any) {
       error = error || String(err)
     }
@@ -221,6 +245,7 @@ async function handleChatCompletions(
           object: 'chat.completion',
           created: Math.floor(Date.now() / 1000),
           model: agentId,
+          ..._oaiEffective,
           choices: [
             {
               index: 0,
@@ -244,6 +269,7 @@ async function handleChatCompletions(
       object: 'chat.completion',
       created: Math.floor(Date.now() / 1000),
       model: agentId,
+      ..._oaiEffective,
       choices: [
         {
           index: 0,

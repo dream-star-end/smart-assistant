@@ -10,7 +10,7 @@ const ORIGINAL_SEED_DEFAULT_CRON = process.env.OC_SEED_DEFAULT_CRON
 const TEST_HOME = mkdtempSync(join(tmpdir(), 'oc-cron-test-'))
 process.env.OPENCLAUDE_HOME = TEST_HOME
 
-import { describe, it, before, after, beforeEach } from 'node:test'
+import { describe, it, before, after, beforeEach, afterEach } from 'node:test'
 import * as assert from 'node:assert/strict'
 import { parse as parseYaml } from 'yaml'
 
@@ -28,6 +28,7 @@ const {
   CronScheduler,
 } = await import('../cron.js')
 const { paths } = await import('@openclaude/storage')
+const { setHostStaticProviderKeys } = await import('../hostStaticProviders.js')
 
 describe('ensureCronFile — OC_SEED_DEFAULT_CRON gate', () => {
   before(() => {
@@ -349,5 +350,68 @@ describe('deriveCronIndexPayload — 唤醒索引只计用户任务', () => {
     const r = deriveCronIndexPayload({ jobs: withUser } as any, now)
     assert.equal(r.enabledCount, 1)
     assert.equal(r.nextFireAt, '2026-07-07T10:31:00.000Z')
+  })
+})
+
+describe('CronScheduler.runJob — 合成首帧非 codex 路由字段补齐', () => {
+  // codex 计费旁路封堵的对偶面:cron 进程内直接派发、绕过 master bridge 计费编排,
+  // host 平台 agent(main)又无 per-user 计费主体 → 落 codex 会被 CODEX_BILLING_GUARD
+  // 100% fail-closed 拒。runJob 必须把"解析为 codex 的 cron"改路由到显式非 codex 模型,
+  // 并把 model 路由字段同点传入 getOrCreate(决定 runner engine)+ submit(路由字段)。
+  //
+  // MAJOR-1 routable 自检:降级前 resolveSyntheticTurnModel 会自检兜底模型可路由性。测试进程
+  // 非容器,需注入 host 静态 provider seam(等价 commercial 已装配 deepseek key),否则 gate
+  // 判"不可路由"→ 不降级(见 hostStaticProviders.test.ts / syntheticTurnModel.test.ts)。
+  beforeEach(() => setHostStaticProviderKeys({ deepseek: 'sk-deep' }))
+  afterEach(() => setHostStaticProviderKeys(null))
+  type SubmitCall = { model: unknown }
+  function makeSchedulerWithSpies(defaultModel: string): {
+    sched: InstanceType<typeof CronScheduler>
+    getOrCreateOpts: any[]
+    submitCalls: SubmitCall[]
+  } {
+    const getOrCreateOpts: any[] = []
+    const submitCalls: SubmitCall[] = []
+    const sessions = {
+      getOrCreate: async (opts: any) => {
+        getOrCreateOpts.push(opts)
+        return { sessionKey: opts.sessionKey } as any
+      },
+      // submit 签名:(session, textOrBlocks, onEvent, effortLevel?, model?, ...)
+      submit: async (_s: any, _t: any, _cb: any, _effort?: any, model?: any) => {
+        submitCalls.push({ model })
+        // 不 emit 任何 block → output 为空 → runJob 跳过投递(不触 onDeliver)。
+      },
+      destroySession: async () => {},
+    }
+    const config = { defaults: { model: defaultModel } } as any
+    const sched = new CronScheduler(config, sessions as any, () => {})
+    return { sched, getOrCreateOpts, submitCalls }
+  }
+
+  const job = { id: 'heartbeat', schedule: '13 */4 * * *', prompt: 'ping', enabled: true, heartbeat: true } as any
+
+  it('codex 默认(agent 无 model + defaults=gpt-5.5)→ getOrCreate+submit 均带非 codex 兜底模型', async () => {
+    const { sched, getOrCreateOpts, submitCalls } = makeSchedulerWithSpies('gpt-5.5')
+    await (sched as any).runJob(job, { id: 'main' })
+    assert.equal(getOrCreateOpts.length, 1)
+    assert.equal(getOrCreateOpts[0].model, 'deepseek-v4-pro', 'getOrCreate 必须收到非 codex 模型(runner engine 决定点)')
+    assert.equal(submitCalls.length, 1)
+    assert.equal(submitCalls[0].model, 'deepseek-v4-pro', 'submit 必须带同源 model 路由字段')
+  })
+
+  it('agent 显式 gpt-5.5(codex)→ 同样替换为非 codex 兜底', async () => {
+    const { sched, getOrCreateOpts, submitCalls } = makeSchedulerWithSpies('glm-5.2')
+    await (sched as any).runJob(job, { id: 'main', model: 'gpt-5.5' })
+    assert.equal(getOrCreateOpts[0].model, 'deepseek-v4-pro')
+    assert.equal(submitCalls[0].model, 'deepseek-v4-pro')
+  })
+
+  it('非 codex agent(glm-5.2)→ 不覆盖(getOrCreate 不带 model,submit model=undefined)', async () => {
+    const { sched, getOrCreateOpts, submitCalls } = makeSchedulerWithSpies('gpt-5.5')
+    await (sched as any).runJob(job, { id: 'x', model: 'glm-5.2' })
+    // 尊重原配置:getOrCreate 不注入 model 键(沿用 agent 默认),submit model 为 undefined。
+    assert.equal('model' in getOrCreateOpts[0], false, '非 codex 不应注入 model override')
+    assert.equal(submitCalls[0].model, undefined)
   })
 })

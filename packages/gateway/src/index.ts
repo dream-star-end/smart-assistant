@@ -36,3 +36,7 @@ export { setModelHintProvider, type ModelHintProvider } from './promptSlots.js'
 // 注册"读 DB → 返渲染好的 SKILLS_LITERATURE slot"查询函数。Personal 不调即 noop。
 // 仅 export setter + 类型,不暴露内部 helper,避免外部误依赖 buildLiteratureSkillSlot()。
 export { setLiteratureSkillProvider, type LiteratureSkillProvider } from './promptSlots.js'
+// host 静态 provider 平台直连 key seam — commercial 启动时 setHostStaticProviderKeys(...)
+// 注入平台静态 key 表(供 host 平台 agent 合成首帧解析到静态模型后 CCB 子进程直连上游)。
+// Personal 不调即恒 null = 整块 no-op(settings.json 继续掌权,零行为变化)。见 hostStaticProviders。
+export { setHostStaticProviderKeys } from './hostStaticProviders.js'
