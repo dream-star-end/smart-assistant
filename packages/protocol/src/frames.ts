@@ -35,6 +35,17 @@ export const MediaRef = Type.Object({
 export type MediaRef = Static<typeof MediaRef>
 
 // ───────────────────────────────────────────────
+// Attachment count limit — 前后端单一权威源
+// ───────────────────────────────────────────────
+// 单条消息(inbound frame)最多携带的附件(MediaRef)个数。**前端(web-react
+// Composer)与后端(gateway dispatchInbound 帧准入)共用本常量**,消除历史上
+// 前端 8 / 后端 5 的漂移(用户挂 6-8 个上传成功却被后端拒"附件数量超过 5 个")。
+// 这是纯粹的"件数"护栏,与字节体积无关:单文件体积由 MAX_UPLOAD_SINGLE(100MB)、
+// 总体积由 MAX_UPLOAD_TOTAL(300MB)独立守护,故 8 件仍在总量预算内、无内存/帧
+// 大小硬约束需要压回 5。取 8 保用户体验(boss 铁律:优化不得降低体验)。
+export const MAX_ATTACHMENTS_PER_MESSAGE = 8
+
+// ───────────────────────────────────────────────
 // Inbound (channel → gateway)
 // ───────────────────────────────────────────────
 export const InboundMessage = Type.Object({

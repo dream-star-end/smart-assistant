@@ -39,6 +39,7 @@ import {
   newTraceId,
   parseTraceIdCandidate,
   STATIC_KEY_INBOUND_MODEL_IDS,
+  MAX_ATTACHMENTS_PER_MESSAGE,
 } from '@openclaude/protocol'
 import { classifyDelegateOutputError, classifyRunError } from './errorClassify.js'
 import {
@@ -261,6 +262,34 @@ export function resolveExecutionModel(
     if (typeof m === 'string' && ALLOWED_INBOUND_MODELS.has(m)) return m
   }
   return EXECUTION_MODEL_FALLBACK
+}
+
+/**
+ * /healthz 深度探活结果合并(纯函数,便于单测)。
+ *
+ * 输入:sessions.db 探活结果 + commercial 注入的其余依赖探活 map(pg/redis/...)。
+ * 输出:扁平化 `deps`(`<name>: 'ok'|'error'` + 失败时 `<name>Error: <msg>`,保留
+ * 既有 `sessionsDb`/`sessionsDbError` 形态供既有监控消费)与顶层 `ok`(任一 fail →
+ * false)。**HTTP 状态码由调用方恒写 200**,本函数只决定 ok 供告警面消费。
+ */
+export function _buildHealthzDeps(
+  sess: { ok: true } | { ok: false; error: string },
+  extra: Record<string, { ok: true } | { ok: false; error: string }>,
+): { deps: Record<string, string>; ok: boolean } {
+  const deps: Record<string, string> = {}
+  let ok = true
+  const put = (name: string, r: { ok: true } | { ok: false; error: string }) => {
+    if (r.ok) {
+      deps[name] = 'ok'
+    } else {
+      deps[name] = 'error'
+      deps[`${name}Error`] = r.error
+      ok = false
+    }
+  }
+  put('sessionsDb', sess)
+  for (const [name, r] of Object.entries(extra)) put(name, r)
+  return { deps, ok }
 }
 
 /** Mirror SubprocessRunner's MCP merge rules for prompt/upload hints.
@@ -657,6 +686,22 @@ export interface CommercialHook {
   ) => Promise<
     { ok: true } | { ok: false; retryAfterSec: number; reason: string }
   >
+  /**
+   * **P0 监控盲区收口 — 深度依赖探活**(2026-07-07)。
+   *
+   * gateway 对 PG/Redis 零编译期依赖(client 全在 commercial 侧),故由 commercial
+   * 注入本 hook:master 形态 `/healthz` 会在探完 sessions.db 后并发调用它,拿到
+   * 各强依赖(约定键:`pg` = `SELECT 1`、`redis` = `PING`,短超时如 2s 由**实现侧
+   * (commercial)**保证)的探活结果。任一 fail → healthz 顶层 `ok:false`(**HTTP 仍
+   * 200** —— 深度不健康 ≠ 完全不可服务,不给上游 LB 摘流信号,只翻 ok 供监控/deploy
+   * smoke 消费 ok 字段告警)。2026-07-06 sessions.db 事故(进程活着但全站 500 无告警)
+   * 的同构盲区,本波扩到 PG/Redis 维度。
+   *
+   * 返回 map:依赖名 → `{ok:true}` | `{ok:false, error}`。gateway 侧 generic 合并
+   * 不硬编码依赖清单(commercial 拥有"哪些依赖"的权威)。**未注入**(个人版/dev 无
+   * PG/Redis,或 commercial 尚未接线)= 该维度不探,healthz 行为退回仅 sessions.db。
+   */
+  probeDeps?: () => Promise<Record<string, { ok: true } | { ok: false; error: string }>>
 }
 
 export interface GatewayDeps {
@@ -2430,23 +2475,36 @@ export class Gateway {
       if (instanceId) body.instance = instanceId
       if (c?.runtimeStatus) body.runtime = c.runtimeStatus
       if (c) {
-        // master 形态深度探活:sessions.db open 失败 = 会话 list/save/落库全崩,
-        // ok 必须翻 false 让监控(断言 .ok==true)与 deploy smoke 抓到 —— 2026-07-06
-        // 存量库 schema 事故中进程活着但全站 500 两小时无告警的盲区收口。
+        // master 形态深度探活:sessions.db open 失败 = 会话 list/save/落库全崩;
+        // commercial 注入的强依赖(PG `SELECT 1` / Redis `PING`,见 probeDeps)挂了
+        // 同样致命。任一 fail → ok 翻 false 让监控(断言 .ok==true)与 deploy smoke
+        // 抓到 —— 2026-07-06 存量库 schema 事故中进程活着但全站 500 两小时无告警的
+        // 盲区收口,本波扩到 PG/Redis 维度(同构盲区:换权威源维度)。
         // 保持 HTTP 200:深度不健康 ≠ 完全不可服务(聊天引擎/静态资源仍在跑),
         // 不给上游 LB 摘流量的信号,只翻 ok 供告警面消费。
         // 容器内 gateway(c 为空)不探活:HOST probe 消费 capabilities 语义,不动。
-        void probeSessionsDb()
-          .then((p) => {
-            body.deps = p.ok
-              ? { sessionsDb: 'ok' }
-              : { sessionsDb: 'error', sessionsDbError: p.error }
-            if (!p.ok) body.ok = false
+        // commercial 未注入 probeDeps(旧接线/个人版)时退回仅探 sessions.db。
+        void Promise.all([
+          probeSessionsDb().catch(
+            (): { ok: false; error: string } => ({ ok: false, error: 'probe rejected' }),
+          ),
+          c.probeDeps
+            ? c.probeDeps().catch(
+                (): Record<string, { ok: false; error: string }> => ({
+                  commercialDeps: { ok: false, error: 'probe rejected' },
+                }),
+              )
+            : Promise.resolve<Record<string, { ok: true } | { ok: false; error: string }>>({}),
+        ])
+          .then(([sess, extra]) => {
+            const built = _buildHealthzDeps(sess, extra)
+            body.deps = built.deps
+            if (!built.ok) body.ok = false
             res.writeHead(200, { 'Content-Type': 'application/json' })
             res.end(JSON.stringify(body))
           })
           .catch(() => {
-            // probeSessionsDb 从不 reject;兜底防 healthz 挂起
+            // 兜底防 healthz 挂起(上面各探活分支已内部 catch,理论到不了这里)。
             body.ok = false
             body.deps = { sessionsDb: 'error', sessionsDbError: 'probe rejected' }
             res.writeHead(200, { 'Content-Type': 'application/json' })
@@ -9641,7 +9699,9 @@ export class Gateway {
     // Server-side upload validation. Constants live at module level
     // (UPLOAD_MIME_PREFIXES / MAX_UPLOAD_SINGLE / MAX_UPLOAD_TOTAL) so they
     // stay in sync with handleUpload (POST /api/uploads).
-    const MAX_FILES_PER_FRAME = 5
+    // 件数上限走 protocol 单一权威源 MAX_ATTACHMENTS_PER_MESSAGE(=前端 Composer
+    // 同源),消除历史"前端 8 / 后端 5"漂移导致的"上传成功却被拒"。
+    const MAX_FILES_PER_FRAME = MAX_ATTACHMENTS_PER_MESSAGE
     // text-kind attachments 在前端 buildMessageText() 阶段就拼进 content.text,
     // 绕过了下面基于 m.base64 的 per-file 校验。给 content.text 整体上限兜底,
     // 防止 (a) 绕前端构造巨 text 帧 (b) 大 text 附件 + 大正文叠加超 300 MB 契约。

@@ -29,6 +29,7 @@ import { fileURLToPath } from 'node:url'
 import { Server } from '@modelcontextprotocol/sdk/server/index.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js'
+import { findRouteProviderForModel } from '@openclaude/protocol'
 import { paths } from '@openclaude/storage'
 
 const TOOL_NAME = 'understand_image'
@@ -65,23 +66,41 @@ export const OPENCLAUDE_VISION_MCP_ID = 'openclaude-vision'
 export const OPENCLAUDE_VISION_TOOLS = [TOOL_NAME]
 
 /**
+ * 该 model 是否为**纯文本静态模型**(命中 protocol 静态 provider 注册表,且该 spec
+ * `supportsVision !== true` —— 即 false/undefined 都算纯文本)。
+ *
+ * **单一权威源 = protocol staticKeyProviders 的 supportsVision**(有 snapshot + 双侧
+ * 测试守护)。此前 gateway 侧另用字面量 allowlist(deepseek/glm-5.1/5.2/qwen/kimi)
+ * 决定给谁注入 understand_image,是第二权威源:新增纯文本静态模型时若忘同步这里,
+ * 就会"发图无识图工具"。现改为从 findRouteProviderForModel 派生 —— 与实际路由到静态
+ * 上游的判定同源,新增静态模型自动生效,漂移不可能再发生。
+ *
+ * 注意用 findRouteProviderForModel(而非 provider 字面量):它的 matchesRoute 就是
+ * "这个 model 是否真的路由到该静态上游"的权威。不命中(codex/claude/gpt 等非静态
+ * provider,或未注册模型)→ 返回 false,由调用方决定默认。
+ */
+export function isTextOnlyStaticVisionModel(model?: string): boolean {
+  const m = model?.trim()
+  if (!m) return false
+  const spec = findRouteProviderForModel(m)
+  return !!spec && spec.supportsVision !== true
+}
+
+/**
  * 是否给该 provider/model 注入 understand_image 工具。
  * **纯文本静态模型**(看不到图)启用;**原生多模态模型不启用**。
- *   - deepseek-* / glm-5.1 / glm-5.2(火山 ark,纯文本)/ qwen3.7-max/plus(OpenCode Go,
- *     纯文本 —— 2026-07-05 实测 image block 400)→ true
- *   - MiniMax-M3(原生多模态,supportsVision)→ **false**(它直接识图,不需要工具,也作为本工具 backend)
- * 显式 allowlist(不用 startsWith('glm-') 等宽匹配,避免误伤未来 glm 多模态模型;与 protocol
- * staticKeyProviders supportsVision 口径一致 —— 新增纯文本静态模型时两处同步)。
+ *   - 判定权威 = protocol staticKeyProviders(见 isTextOnlyStaticVisionModel):
+ *     deepseek-* / glm-5.1 / glm-5.2 / qwen3.7-max/plus / kimi-k2.7-code(纯文本)→ true;
+ *     MiniMax-M3(supportsVision=true,原生识图,也作为本工具 backend)→ false。
+ *   - 非静态 provider(codex/claude/gpt 原生多模态,或自定义 Anthropic 兼容层):
+ *     默认 false;仅 `OPENCLAUDE_VISION_MCP_PROVIDERS` 显式 opt-in 的 provider 走工具兜底。
  */
 export function shouldEnableOpenClaudeVision(provider?: string, model?: string): boolean {
   if (process.env.OPENCLAUDE_VISION_MCP_DISABLED === '1') return false
+  // 已注册静态模型:protocol supportsVision 是唯一权威(纯文本 → 注入)。
+  if (isTextOnlyStaticVisionModel(model)) return true
+  // 非静态 provider 的显式 opt-in(自定义 Anthropic 兼容纯文本上游)。
   const p = provider?.trim().toLowerCase()
-  const m = model?.trim().toLowerCase()
-  if (p === 'deepseek' || m?.startsWith('deepseek-')) return true
-  if (m === 'glm-5.1' || m === 'glm-5.2') return true
-  if (m === 'qwen3.7-max' || m === 'qwen3.7-plus') return true
-  if (m === 'kimi-k2.7-code') return true
-
   const optInProviders = (process.env.OPENCLAUDE_VISION_MCP_PROVIDERS ?? '')
     .split(',')
     .map((v) => v.trim().toLowerCase())

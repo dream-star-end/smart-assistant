@@ -27,6 +27,7 @@ import {
 import { request as undiciRequest } from 'undici'
 import type { RepoSnapshot } from './sessionRepoWorkspace.js'
 import { listCollaboratorAgents } from './collaboratorAgents.js'
+import { isTextOnlyStaticVisionModel } from './mcpVisionServer.js'
 
 export interface PromptSlotContext {
   agentId: string
@@ -207,18 +208,11 @@ export async function buildAgentsSlot(ctx: PromptSlotContext): Promise<PromptSlo
     // MiniMax-M3 原生支持图像识别(2026-06-17 放开 strip):用户上传的图片会直接进入对话,
     // **无需** understand_image 工具,直接读图回答即可。
   }
-  if (
-    hasUnderstandImageTool &&
-    (provider === 'deepseek' ||
-      ctx.model?.startsWith('deepseek-') ||
-      ctx.model === 'glm-5.1' ||
-      ctx.model === 'glm-5.2' ||
-      // qwen3.7-max/plus(OpenCode Go)纯文本接入,与 mcpVisionServer allowlist 同步(2026-07-05)。
-      ctx.model === 'qwen3.7-max' ||
-      ctx.model === 'qwen3.7-plus' ||
-      // kimi-k2.7-code(火山 Agent Plan)纯文本接入,同上同步(2026-07-06)。
-      ctx.model === 'kimi-k2.7-code')
-  ) {
+  // 纯文本静态模型(deepseek/glm/qwen/kimi 等)的识图提示。判定权威 = protocol
+  // staticKeyProviders 的 supportsVision(经 isTextOnlyStaticVisionModel 派生),与
+  // mcpVisionServer 注入侧同源 —— 消掉此前逐字面量硬编码的第二权威源(新增静态
+  // 模型忘同步就漏发提示的漂移)。
+  if (hasUnderstandImageTool && isTextOnlyStaticVisionModel(ctx.model)) {
     lines.push('')
     lines.push('## 图片理解提示')
     lines.push('')
