@@ -2165,32 +2165,22 @@ export async function registerCommercial(
   // eslint-disable-next-line no-console
   console.log("[commercial] sshMux remote deps wired");
 
-  // 2026-05-12:邮箱验证成功 → fire-and-forget 触发 v3 容器 pre-warm。
-  // 用"验证 → 首消息"的 p50=215s 间隔覆盖 docker run 冷启,首条消息无等待。
-  // v3Deps 未配 → undefined → handler 端 deps.prewarmContainer?.() 变 no-op。
-  // wrapper 由 makePrewarmContainer 保证同步 return void / 绝不抛(见 v3prewarm.ts)。
-  // 注:这里独立调一次 makeV3EnsureRunning(v3Deps),与下方 resolveContainerEndpoint
-  // 用的 ensureRunning 是各自闭包,无共享可变状态,语义上等价。
-  const prewarmContainer: ((uid: bigint) => void) | undefined = v3Deps
-    ? makePrewarmContainer(
-        makeV3EnsureRunning(v3Deps),
-        rootLogger.child({ subsys: "v3/prewarm" }),
-      )
-    : undefined;
-
   // v1.0.191 — /api/media-signed 冷启动护栏 + per-uid singleflight 合并。
   // 详见 handlers.ts ensureContainerReady JSDoc 与 ensureContainerSingleflight.ts。
   //
-  // **共享作用域**:WS bridge `resolveContainerEndpoint`(下方 line ~1818)与 HTTP
-  // `/api/media-signed` ensureContainerReady 共享同一 in-flight map。
-  // 原因:用户 reload 页面瞬间,WS connect 与 <img> burst 是同 process 内的并发拉,
-  // 若各自闭包 → makeV3EnsureRunning 的 DB INSERT race(只一个赢家做 provision,
-  // 输家被翻 ContainerUnreadyError("provisioning"))会让 HTTP 一路成为输家继续破图。
-  // 单 singleflight 把整个 uid 的 ensure call 合并掉这条 race。
+  // **单一 singleflight 权威**(2026-07-07 saga 根治,修 Codex MAJOR):本进程内**所有**
+  // provision 入口 —— WS bridge `resolveContainerEndpoint` / HTTP `/api/media-signed`
+  // ensureContainerReady / cronWake wakeContainer / prewarm(下方复用本闭包)—— 全部汇入
+  // 这**唯一一个** makeUidSingleflight in-flight map。于是同 uid 有在途 provision 时,任何
+  // 后来者都 **join 同一 promise**,绝不独立走 getV3ContainerStatus 观察到 saga 中段的
+  // active+cid=NULL 在途占位行去销毁它(singleflight 在 ensureRunning 完整 settle 才 unwrap,
+  // 那时 Tx2 已提交 cid)。
   //
-  // 注:prewarm(line 1633)有自己的闭包,因为它发生在邮箱验证那一刻,与"reload
-  // 同瞬间"不同步,且 makePrewarmContainer 自带 fire-and-forget 包装,共享反而
-  // 模糊语义,保留独立闭包。
+  // **关键推论**:getV3ContainerStatus 观察到 active+cid=NULL ⟺ 本进程无在途 provision ⟺
+  // 该行是崩溃/重启残留的**孤儿**(Tx1 提交后进程异常留下)。因此 15s grace 回归其原始
+  // "孤儿检测"用途(不需魔法 120s),provisioning 态是孤儿的**有界自愈等待**(≤15s 后转
+  // missing → stopAndRemove + 重建自愈,不引入慢愈退化)。见 v3supervisor
+  // getV3ContainerStatus / v3ensureRunning 2a-bis 的语义注释。
   const sharedEnsureRunning: ResolveContainerEndpoint | undefined =
     v3Deps ? makeUidSingleflight(makeV3EnsureRunning(v3Deps)) : undefined;
 
@@ -2198,6 +2188,17 @@ export async function registerCommercial(
     ? async (uid) => {
         await sharedEnsureRunning(uid);
       }
+    : undefined;
+
+  // 邮箱验证成功 → fire-and-forget 触发 v3 容器 pre-warm(p50=215s"验证 → 首消息"间隔
+  // 覆盖 docker run 冷启,首条消息命中 running)。
+  // **复用 sharedEnsureRunning 的同一 singleflight**(不再独立 makeV3EnsureRunning 闭包):
+  // 旧独立闭包让 prewarm 与 WS 走两个 in-flight map,都能独立观察并销毁同一 active+cid=NULL
+  // 在途行(Codex MAJOR)。统一后 prewarm 在途时 WS 请求 join 而非另起观察销毁。fire-and-forget
+  // 语义仍由 makePrewarmContainer 外层 .catch 吞掉保留(它只把返回 promise 吞掉,同步 return void)。
+  // v3Deps 未配 → sharedEnsureRunning undefined → prewarmContainer undefined → handler 端 no-op。
+  const prewarmContainer: ((uid: bigint) => void) | undefined = sharedEnsureRunning
+    ? makePrewarmContainer(sharedEnsureRunning, rootLogger.child({ subsys: "v3/prewarm" }))
     : undefined;
 
   // V3 multi-tenant media resolver(`c:<uid>` → user volume {uploads, generated})
@@ -3417,12 +3418,14 @@ export async function registerCommercial(
           horizonSec,
           scanLimit,
         }),
-      // active 判定复用 findUserDataHost(本 channel);active 容器无需唤醒。
-      // agent_containers 只反映在跑容器,故它只做「跳过 active」优化,不做发现源(发现源=cron_wake_index)。
-      isContainerActive: async (uid) => {
-        const h = await computeQueries.findUserDataHost(Number(uid));
-        return h?.containerState === "active";
-      },
+      // active 判定:**有在跑容器**(state='active' 且 cid 已落库)才跳过唤醒。
+      // 修 Codex MAJOR:不再用 findUserDataHost(纯按 state 派生、不看 cid)—— 否则 saga
+      // 孤儿(active+cid=NULL,master 在 Tx1/Tx2 间崩溃/重启留下)被当 active → skippedActive
+      // → 永不唤醒 → 永不进 sharedEnsureRunning 自愈 → cron 驱动用户 cron 永不 fire。
+      // userHasRunningContainer 用 cid IS NOT NULL 排除孤儿(返回 false),让 cronWake 照常
+      // 唤醒:在途→join singleflight;孤儿→getV3ContainerStatus provisioning/missing 自愈。
+      // (agent_containers 只做「跳过 active」优化,不做发现源;发现源=cron_wake_index。)
+      isContainerActive: async (uid) => computeQueries.userHasRunningContainer(Number(uid)),
       wakeContainer: (uid) => wakeFn(uid),
       runRescan: () => runCronWakeRescan({ runner: cronWakeRunner }),
       logger: rootLogger,

@@ -1587,3 +1587,32 @@ export async function findUserDataHost(userId: number): Promise<{
     containerState: row.state,
   };
 }
+
+/**
+ * "该 user 是否有**在跑**的容器" —— 语义严格 = `state='active' 且 container_internal_id
+ * 已落库(saga Tx2 完成)`,而非"有 active DB 行"。
+ *
+ * 为什么不复用 findUserDataHost/findUserStickyHost(Codex 终审 MAJOR):它们是
+ * **data-host sticky / 正在跑的容器在哪**语义,纯按 ac.state 派生,**不看 cid**。saga 化后
+ * `active + cid=NULL` 是真实持久态(Tx1 提交、Tx2 才设 cid;master 在两者间崩溃/重启即留下
+ * 这种孤儿)。cronWake 的唤醒前预检 isContainerActive 若把这种孤儿当 active,会 skippedActive
+ * 跳过唤醒 → 永不调 wakeContainer → 永不进 sharedEnsureRunning 自愈 → cron 驱动用户(heartbeat
+ * 等)cron 永不 fire。故本查询用 `cid IS NOT NULL` 把孤儿排除(返回 false),让 cronWake 照常
+ * 唤醒:若真有在途 provision → wakeContainer→sharedEnsureRunning join 同一 singleflight(不重复
+ * provision);若是孤儿 → getV3ContainerStatus 观察 cid=NULL 无在途 → provisioning(young)/
+ * missing(old)→ 自愈。别改 findUserDataHost 的 sticky 语义(别处调用方依赖它)。
+ */
+export async function userHasRunningContainer(userId: number): Promise<boolean> {
+  // SQL state filter 必须 5 行内显式 — 仓库 lint-agent-containers-sql.ts 强校验。
+  const r = await getPool().query(
+    `SELECT 1
+       FROM agent_containers
+      WHERE user_id = $1
+        AND state = 'active'
+        AND container_internal_id IS NOT NULL
+        AND runtime_channel = $2
+      LIMIT 1`,
+    [userId, getRuntimeChannel()],
+  );
+  return (r.rowCount ?? 0) > 0;
+}

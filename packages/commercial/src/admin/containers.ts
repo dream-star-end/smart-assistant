@@ -47,6 +47,7 @@ import {
   stopContainer as supStop,
 } from "../agent-sandbox/supervisor.js";
 import {
+  PROVISION_INFLIGHT_GRACE_MS,
   stopAndRemoveV3Container,
   type V3SupervisorDeps,
 } from "../agent-sandbox/v3supervisor.js";
@@ -99,6 +100,10 @@ export interface AdminContainerRowView {
   host_name: string | null;
 }
 
+// cid=NULL grace 的 SQL INTERVAL 片段(与 getV3ContainerStatus 同一常量派生;数值来自本仓
+// 常量非用户输入,插值安全)。用于 lifecycle CASE 与 running/provisioning 过滤保持同一阈值。
+const cidNullGraceInterval = `INTERVAL '${PROVISION_INFLIGHT_GRACE_MS} milliseconds'`;
+
 const CONTAINER_COLS = `
   c.id::text              AS id,
   c.user_id::text         AS user_id,
@@ -120,7 +125,13 @@ const CONTAINER_COLS = `
   -- 操作路径(v3 dispatcher 调用 stopAndRemoveV3Container 在 v2 行上)。
   -- v3 INSERT 不指定 subscription_id (NULL),v2 INSERT 必填 subscription_id;
   -- subscription_id IS NULL ⟹ v3 (强 invariant,迁移 0001+0012 保证)。
+  -- v3 active 但 container_internal_id IS NULL:saga 占位行(Tx1 提交、Tx2 未落 cid)。
+  -- grace 内 = 在途/孤儿自愈缓冲显示 'provisioning'(不再误显示 running,防运维手工 lifecycle
+  -- 误伤在途行);grace 外 = 异常孤儿显示 'missing'。grace 与 getV3ContainerStatus 同一常量。
   CASE
+    WHEN c.subscription_id IS NULL AND c.state = 'active' AND c.container_internal_id IS NULL
+         AND c.created_at > NOW() - ${cidNullGraceInterval} THEN 'provisioning'
+    WHEN c.subscription_id IS NULL AND c.state = 'active' AND c.container_internal_id IS NULL THEN 'missing'
     WHEN c.subscription_id IS NULL THEN c.state
     ELSE c.status
   END AS lifecycle,
@@ -146,9 +157,11 @@ export interface ListContainersInput {
    * status=NULL(0017 drop NOT NULL 后 v3 只写 state),过滤 "running" 时
    * v3 active 容器全被隐藏 → admin UI 看不到 v3 侧 running 行,影响排障。
    *
-   * 改成 lifecycle 语义,与 `row_kind`/`lifecycle` 列 + containersStats 对齐:
-   *   - running      = v2 status='running'       OR v3 state='active'
-   *   - provisioning = v2 status='provisioning'  (v3 无此态)
+   * 改成 lifecycle 语义,与 `row_kind`/`lifecycle` 列 + containersStats 对齐
+   * (v3 saga 化后 active+cid 三分,见 PROVISION_INFLIGHT_GRACE_MS):
+   *   - running      = v2 status='running'       OR v3 state='active' 且 cid 已落库(非 NULL)
+   *   - provisioning = v2 status='provisioning'  OR v3 state='active' 且 cid=NULL 且 grace 内(saga 中段在途)
+   *   - missing      = v3 state='active' 且 cid=NULL 且 grace 外(崩溃/重启孤儿,待自愈)
    *   - stopped      = v2 status='stopped'       (v3 无此态)
    *   - error        = v2 status='error'         (v3 CHECK 只有 active/vanished)
    *   - removed      = v2 status='removed'       OR v3 state='vanished'
@@ -160,21 +173,27 @@ export interface ListContainersInput {
   host_uuid?: string;
 }
 
-const CONTAINER_STATUSES = ["provisioning", "running", "stopped", "removed", "error"] as const;
+const CONTAINER_STATUSES = ["provisioning", "running", "stopped", "removed", "error", "missing"] as const;
 
 /** 把 lifecycle 过滤值翻成 SQL 条件(已防 SQL 注入 —— 白名单映射,无参数)。 */
 function lifecycleWhereSql(lifecycle: string): string {
   switch (lifecycle) {
     case "running":
-      return "((c.subscription_id IS NOT NULL AND c.status = 'running') OR (c.subscription_id IS NULL AND c.state = 'active'))";
+      // v3 running = active 且 cid 已落库(排除 saga 占位/孤儿 cid=NULL 行,后者归 provisioning/missing)。
+      return "((c.subscription_id IS NOT NULL AND c.status = 'running') OR (c.subscription_id IS NULL AND c.state = 'active' AND c.container_internal_id IS NOT NULL))";
     case "provisioning":
-      return "(c.subscription_id IS NOT NULL AND c.status = 'provisioning')";
+      // v2 status='provisioning' 或 v3 active+cid=NULL 且 grace 内(saga 在途/孤儿自愈缓冲)。
+      return `((c.subscription_id IS NOT NULL AND c.status = 'provisioning') OR (c.subscription_id IS NULL AND c.state = 'active' AND c.container_internal_id IS NULL AND c.created_at > NOW() - ${cidNullGraceInterval}))`;
     case "stopped":
       return "(c.subscription_id IS NOT NULL AND c.status = 'stopped')";
     case "error":
       return "(c.subscription_id IS NOT NULL AND c.status = 'error')";
     case "removed":
       return "((c.subscription_id IS NOT NULL AND c.status = 'removed') OR (c.subscription_id IS NULL AND c.state = 'vanished'))";
+    case "missing":
+      // v3 active+cid=NULL 且 grace 外(异常孤儿)。与 provisioning(grace 内)互补,同一 grace 常量。
+      // v2 无此态(status 机不含 missing)。
+      return `(c.subscription_id IS NULL AND c.state = 'active' AND c.container_internal_id IS NULL AND c.created_at <= NOW() - ${cidNullGraceInterval})`;
     default:
       throw new RangeError("invalid_status");
   }

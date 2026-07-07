@@ -155,6 +155,18 @@ export function gatewayIpFromV3Cidr(cidr: string): string {
  */
 export const V3_CONTAINER_PORT = 18789;
 
+/**
+ * active + container_internal_id IS NULL 的 grace 窗口(ms)—— young/old 二分**唯一权威**。
+ *
+ * 语义(saga + 单一 singleflight 统一后):本进程所有 provision 入口汇入唯一 makeUidSingleflight
+ * (index.ts sharedEnsureRunning),故有在途 provision 时并发观察者一律 join 同一 promise、
+ * 不会独立观察到 cid=NULL 在途行 —— 因此观察到 active+cid=NULL ⟺ 无在途 provision ⟺ 该行是
+ * 崩溃/重启残留的孤儿。grace 内(young)按 provisioning 有界等待(≤grace 后转 missing 自愈),
+ * grace 外(old)按 missing 走 stopAndRemove + 重建。getV3ContainerStatus 与 admin/containers.ts
+ * 列表渲染共用本常量,禁止再散魔数(Codex review 2026-07-07)。
+ */
+export const PROVISION_INFLIGHT_GRACE_MS = 15_000;
+
 /** CLAUDE_CONFIG_DIR tmpfs 挂载点(防 settings.json 残留) */
 export const V3_CONFIG_TMPFS_PATH = "/run/oc/claude-config";
 
@@ -910,8 +922,13 @@ export interface V3ContainerStatus {
   boundIp: string;
   port: number;
   dockerContainerId: string;
-  /** docker inspect 后的标准化态。docker missing 也归 stopped(由 caller 决定 vanish) */
-  state: "running" | "stopped" | "missing";
+  /**
+   * docker inspect 后的标准化态。docker missing 也归 stopped(由 caller 决定 vanish)。
+   * `provisioning`:active 行但 `container_internal_id IS NULL` 且 age<15s ——
+   * saga 中段合法在途态(并发 provision 正在建容器,cid 尚未由 Tx2 落库)。caller
+   * **绝不能**当 stopped/missing 去 stopAndRemove(会销毁在途容器),应短重试等待。
+   */
+  state: "running" | "provisioning" | "stopped" | "missing";
   /**
    * agent_containers.host_uuid。null = 单机 MVP 遗留行 / 本机;非 null 且 !==
    * deps.selfHostId = remote host(caller 的 readiness/stop 要走 node-tunnel)。
@@ -1622,11 +1639,14 @@ const NAME_CONFLICT_REMOVABLE_STATES: ReadonlySet<string> = new Set([
  *
  * 事故根因(2026-07-06):master 崩溃(PG idle-in-transaction 断连 → 未捕获
  * client 'error' → 紧急关停)恰好发生在某次 provision 的 `docker create` 之后、
- * catch 块 rollback+rm 清理之前 → 留下一个卡在 `created` 态、占住容器名的僵尸。
+ * 残骸清理之前 → 留下一个卡在 `created` 态、占住容器名的僵尸。
  * 此后每次 provision `docker create` 同名 → 409 → 用户前端死循环重连数分钟。
- * v5 上 orphanReconcile/idleSweep 因 controlPlaneEnabled=false + *_DISABLED 全部
- * 关闭(见 index.ts / commercial-v5.env.overrides)—— **v5 无后台孤儿回收网**,
- * 故此进程内自愈是 v5 该类僵尸的**唯一**自愈路径。
+ * v5 上 idleSweep/volumeGc 仍钉死关闭(活跃误杀 / 不可逆删卷风险);orphanReconcile
+ * 已放开 v5-owned(02878333,channel 双侧隔离,与本自愈错峰幂等)—— 它是**周期后台**
+ * 残骸对账网,不即时。故此进程内自愈仍是 provision 热路径撞名冲突的**首要即时**自愈,
+ * 与 orphanReconcile 幂等共存(rm 前 inspect + 404 吞掉)。
+ * (注:provision 已 saga 化 —— docker 副作用移出事务,不再有"docker create 后、
+ * 长事务 catch 前"的 idle-in-tx 断连窗口,崩溃产僵尸的概率已大幅收窄;自愈保留作纵深防御。)
  *
  * 自愈契约:
  *   1. `docker create` 抛非 409 → 直接 wrapDockerError 抛出(行为不变)。
@@ -1755,6 +1775,56 @@ async function retryCreateOnce(
   }
 }
 
+/**
+ * saga 补偿:Tx1 已提交占位行(state='active', cid=NULL)后,**中段 docker 副作用**
+ * 或 **Tx2 提交**失败时的收尾。两步 best-effort,各自独立:
+ *   1. 短事务(单条 UPDATE,pg 隐式 autocommit,不长持连接、不 BEGIN)把占位行翻
+ *      state='vanished' —— 释放 uniq_ac_user_id_active / bound_ip partial-unique slot,
+ *      让重试能复用;带 runtime_channel guard(绝不误翻对方 channel 行)。rowCount=0
+ *      (行已被并发路径翻走,正是 Tx2 rowCount=0 的成因)→ 幂等吞掉。
+ *   2. best-effort docker rm -f 掉中段已 create 的容器(createdDockerId 为空 = create
+ *      本身就失败,无实体可清)。本地 / 远端按 useRemote 分流;错误吞掉(残骸兜底交
+ *      orphanReconcile / 下次同名 provision 的 NameConflict 自愈)。
+ *
+ * 与旧单事务 catch 的差异:旧路径 ROLLBACK 直接抹掉未提交的 INSERT(行从未对外可见);
+ * saga 下占位行已在 Tx1 提交,只能翻 vanished 立墓碑(所有 active 行读者只认
+ * state='active',vanished 行天然被忽略;IP / user-slot 随 partial-unique 立即释放)。
+ */
+async function compensateProvisionFailure(
+  deps: V3SupervisorDeps,
+  rowId: number,
+  createdDockerId: string,
+  useRemote: boolean,
+  hostId: string | undefined,
+): Promise<void> {
+  // 1) 短事务翻 vanished(隐式单语句事务;不 connect() 长持,不 BEGIN)
+  try {
+    await deps.pool.query(
+      `UPDATE agent_containers
+          SET state = 'vanished', updated_at = NOW()
+        WHERE id = $1 AND runtime_channel = $2`,
+      [String(rowId), getRuntimeChannel()],
+    );
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.warn(
+      `[v3supervisor] compensate: mark row ${rowId} vanished failed: ${(err as Error)?.message ?? String(err)}`,
+    );
+  }
+  // 2) best-effort docker rm -f 中段残骸
+  if (createdDockerId) {
+    try {
+      if (useRemote) {
+        await deps.containerService!.remove(hostId!, createdDockerId, { force: true });
+      } else {
+        await deps.docker.getContainer(createdDockerId).remove({ force: true });
+      }
+    } catch {
+      /* swallow — orphanReconcile / NameConflict 自愈兜底 */
+    }
+  }
+}
+
 // ───────────────────────────────────────────────────────────────────────
 // 主接口:provision / stop+remove / status
 // ───────────────────────────────────────────────────────────────────────
@@ -1763,21 +1833,36 @@ async function retryCreateOnce(
  * Provision 一个 v3 容器并启动。同 uid 已有 active 行 → 抛 NameConflict
  * (caller 自己决定要不要先 stopAndRemove,本函数不替你做)。
  *
- * 流程:
- *   1. BEGIN
- *   2. acquire per-uid lifecycle advisory lock      ← 与 volumeGc 互斥
- *   3. 确定 effectiveHostUuid(fail-closed:hostId 或 selfHostId,缺一 InvalidArgument)
- *   4. acquire per-host admission advisory lock     ← per-host 串行,跨 host 并行
- *   5. per-host cap query → 同事务读 compute_hosts.max_containers + active count
- *      ≥ max → log.info + ROLLBACK + throw HostFull(锁随事务释放)
- *   6. 确保 named volume(幂等;label 守护)
- *   7. INSERT agent_containers 占 bound_ip(uniq 冲突重试换 IP,host_uuid = effectiveHostUuid)
- *   8. 用 row id + secret 拼 token,bound_ip 走 docker create --ip
- *      注入 4 个 anthropic env + cap-drop NET_RAW NET_ADMIN + tmpfs
- *      /run/oc/claude-config + 单 volume + label
- *   9. start 容器 → UPDATE agent_containers SET container_internal_id = <id>
- *  10. COMMIT(advisory lock 自动释放)
- *  11. 任何 docker 步骤失败 → ROLLBACK + best-effort docker rm -f;不 wrap 让 caller 看根因
+ * 流程 —— **saga 两段短事务**(2026-07-07 P1 收窄事务窗口):把 docker create/start +
+ * codex 绑定等慢 IO 从单条长事务里移出,消除 (a) 持锁者 idle-in-transaction >60s 被 PG
+ * 强断、(b) 等锁者 statement_timeout 57014 惊群(部署 recycle 时集中爆发)两类事故。
+ *
+ *   ┌─ Tx1(短事务,持 per-uid + per-host 双锁,亚毫秒)
+ *   │   1. BEGIN
+ *   │   2. acquireUserLifecycleLock(per-uid)             ← 与 volumeGc 互斥
+ *   │   3. dup 复查(active 行存在 → NameConflict)
+ *   │   4. acquireHostCapLock(per-host)                  ← per-host 串行,跨 host 并行
+ *   │   5. cap query(active count ≥ max_containers → HostFull;锁随事务释放)
+ *   │   6. ensureV3Volumes(**保留在 Tx1 内**:GC 互斥须在 per-uid 锁内;本地元数据 ~ms)
+ *   │   7. INSERT agent_containers 占位行(state='active', cid=NULL,占 bound_ip)
+ *   │   8. COMMIT(双锁释放)—— 此后不持任何 PG client / advisory lock
+ *   ├─ 中段(无事务、无 checked-out 连接、无锁)
+ *   │   9. codex 账号绑定(pick/snapshot/write 或 putRemote;codex_account_id 记账留 Tx2)
+ *   │  10. 组装 env / binds → docker create(NameConflict 409 三重校验自愈原样)→ start
+ *   ├─ Tx2(短事务)
+ *   │  11. UPDATE container_internal_id + codex_account_id WHERE id AND state='active'
+ *   │      AND runtime_channel(rowHost 一并落库)。rowCount=0(占位行被并发翻走)→ 补偿
+ *   └─ 补偿(catch,compensateProvisionFailure)
+ *      12. 中段 / Tx2 任一失败 → 短事务 UPDATE state='vanished' + best-effort docker rm -f
+ *
+ * 中段 cid=NULL 窗口的并发正确性(**单一 singleflight 权威**):本进程所有 provision 入口
+ * (WS / media-signed / cronWake / prewarm)汇入唯一 makeUidSingleflight(index.ts
+ * sharedEnsureRunning),同 uid 有在途 provision 时并发观察者一律 **join 同一 promise**,
+ * 不重入本窗口去观察/销毁在途 cid=NULL 行(singleflight 在 ensureRunning 完整 settle 才 unwrap,
+ * 那时 Tx2 已提交 cid)。故观察到 active+cid=NULL ⟺ 无在途 provision ⟺ 崩溃/重启孤儿(见
+ * getV3ContainerStatus 的 young/old 二分自愈)。其余读者天然兼容:orphanReconcile Dir-A 300s
+ * 安全窗 + Dir-B 排除 cid=NULL、stopAndRemove / idleSweep / 管理面 stop 对 cid=NULL 提前
+ * return、codex acquire 60s young-guard —— 均为本窗口设计。
  *
  * 为什么 ensureV3Volume 改在事务内:
  *   - GC 在持有 per-uid lock 期间删 volume;provision 也必须在持锁期间 ensureV3Volume,
@@ -1870,17 +1955,21 @@ export async function provisionV3Container(
   // 半事务和 docker 副作用。模式 OC_V3_IMAGE_GUARD ∈ enforce/warn/off,缺省 enforce。
   await assertImageHasV3Sink(deps, hostId, deps.image);
 
-  const client = await deps.pool.connect();
-  let row: { id: number; boundIp: string };
-  let secret: string;
-  let secretHash: Buffer;
-  let volumeNames: V3VolumeBundle;
-  let createdDockerId = "";
+  // ═══ Tx1:短事务,持 per-uid + per-host 双锁,亚毫秒完成 ═══
+  // BEGIN → acquireUserLifecycleLock(per-uid)→ dup 复查 → acquireHostCapLock(per-host)
+  // → cap 门控 → ensureV3Volumes(GC 互斥须在 per-uid 锁内)→ INSERT 占位行
+  // (state='active', cid=NULL)→ COMMIT(释放双锁)。docker create/start + codex 绑定
+  // 等慢 IO 全部移出本事务(见下方"中段"),消除 idle-in-transaction 断连与 per-host
+  // 等锁者 statement_timeout 惊群。row / secret / volumeNames 供中段使用。
+  const tx1Client = await deps.pool.connect();
+  let row!: { id: number; boundIp: string };
+  let secret!: string;
+  let volumeNames!: V3VolumeBundle;
   try {
-    await client.query("BEGIN");
+    await tx1Client.query("BEGIN");
 
     // 锁顺序不变量:per-uid lifecycle → per-host admission(详见 advisory lock 段落注释)。
-    await acquireUserLifecycleLock(client, uid);
+    await acquireUserLifecycleLock(tx1Client, uid);
 
     // 幂等复查(锁内):存在性检查在锁外(v3ensureRunning),并发双请求(双 tab 首连 /
     // WS+HTTP 各自 ensure)会双双走进 provision;此前第二个请求直到 INSERT 才撞
@@ -1888,7 +1977,7 @@ export async function provisionV3Container(
     // 误判成 IP 冲突。拿到 per-uid 锁后先复查 active 行,命中即抛 NameConflict
     // (语义=同 uid 并发 provision,v3ensureRunning 已把它翻成短重试 "provisioning"
     // → 客户端下一轮 ensure 走 warm 复用路径,自愈且无伪错误)。
-    const dupQ = await client.query<{ id: string }>(
+    const dupQ = await tx1Client.query<{ id: string }>(
       `SELECT id::text AS id FROM agent_containers
         WHERE user_id = $1::bigint AND state = 'active' AND runtime_channel = $2
         LIMIT 1`,
@@ -1901,7 +1990,7 @@ export async function provisionV3Container(
       );
     }
 
-    await acquireHostCapLock(client, effectiveHostUuid);
+    await acquireHostCapLock(tx1Client, effectiveHostUuid);
 
     // per-host admission gate(同事务读 active 计数 + max_containers,与 host-cap
     // lock 同寿命,关 COMMIT/ROLLBACK 自动释放)。
@@ -1914,7 +2003,7 @@ export async function provisionV3Container(
     // → admin 改 status='draining' → 进 gate" 这极短窗口,后果是新容器落到正在
     // draining 的 host,语义上仅延后 drain 完成,不破数据。R6.8 host live
     // migration 上线时再做。
-    const capQ = await client.query<{ active: string; max_containers: number | null }>(
+    const capQ = await tx1Client.query<{ active: string; max_containers: number | null }>(
       // P1a 隔离:host 容量计数按 channel(v3/v5 各算各的 active 数)。
       `SELECT
            (SELECT COUNT(*) FROM agent_containers
@@ -1987,12 +2076,34 @@ export async function provisionV3Container(
         "secret generator must return 64 lowercase hex chars (32 bytes)",
       );
     }
-    secretHash = hashSecretToBuffer(secret);
+    const secretHash = hashSecretToBuffer(secret);
 
-    row = await allocateBoundIpAndInsertRow(client, uid, secretHash, pickIp, effectiveHostUuid, deps.image, boundIp);
+    row = await allocateBoundIpAndInsertRow(tx1Client, uid, secretHash, pickIp, effectiveHostUuid, deps.image, boundIp);
 
+    await tx1Client.query("COMMIT");
+  } catch (err) {
+    // Tx1 内任何失败(dup / cap / volume / INSERT / COMMIT)→ ROLLBACK 抹掉未提交状态。
+    // 占位行未 COMMIT 前对外不可见,无残骸;docker 副作用尚未发生,无需清理。
+    try {
+      await tx1Client.query("ROLLBACK");
+    } catch {
+      /* swallow */
+    }
+    throw err;
+  } finally {
+    tx1Client.release();
+  }
+  // Tx1 已提交:占位行(state='active', cid=NULL)对外可见;此后不持任何 PG client /
+  // advisory lock。中段 cid=NULL 窗口的读者兼容性见函数 docstring。
+
+  // ═══ 中段:无事务、无 checked-out 连接、无锁 —— 慢 IO(docker create/start + codex 绑定)═══
+  // 失败走 catch → compensateProvisionFailure(翻 vanished + 清 docker 残骸)。
+  const token = `oc-v3.${row.id}.${secret}`;
+  let createdDockerId = "";
+  // codex 绑定成功则记账;Tx2 与 container_internal_id 一并写库(中段不再持事务 UPDATE)。
+  let boundCodexAccountId: bigint | null = null;
+  try {
     // 3) docker create with --ip + 4 个 anthropic env + cap-drop + tmpfs + 单 volume
-    const token = `oc-v3.${row.id}.${secret}`;
 
     // hostGatewayIp:容器所在 host 的 docker bridge gateway IP(.1 of bridge_cidr)。
     // self host = 172.30.0.1,远端 host 各自 172.30.X.1。**两件事必须用本变量,
@@ -2213,7 +2324,7 @@ export async function provisionV3Container(
       const codexContainerDir = useRemote
         ? DEFAULT_V3_CODEX_CONTAINER_DIR
         : readCodexContainerDirFromEnv();
-      let boundCodexAccountId: bigint | null = null;
+      // boundCodexAccountId 声明在中段顶层(Tx2 与 cid 一并写库),此处只赋值。
       try {
         const picked = await pickCodexAccountForBinding(String(row.id), {});
         if (picked) {
@@ -2245,14 +2356,11 @@ export async function provisionV3Container(
                   auth: { accessToken, lastRefreshIso },
                 });
               }
-              // UPDATE 在同一事务内,COMMIT 时一并落盘;若后续步骤失败 rollback
-              // 自动回滚到 NULL,但 host 文件(本地或远端)留在 per-container 子目录
-              // 是孤儿 —— 由 stopAndRemoveV3Container / volume gc / 重 provision
-              // 的同名 row.id 覆盖兜底(本 PR 接受这层不一致)。
-              await client.query(
-                `UPDATE agent_containers SET codex_account_id = $1, updated_at = NOW() WHERE id = $2`,
-                [String(picked.account_id), String(row.id)],
-              );
+              // 记账 codex_account_id,由 Tx2 与 container_internal_id 一并写库
+              // (saga 中段不再持事务 UPDATE)。若中段 / Tx2 失败 → 补偿翻 vanished,
+              // 行内 codex_account_id 始终为 NULL;host 文件(本地或远端)留在
+              // per-container 子目录成孤儿 —— 由 stopAndRemoveV3Container / volume gc /
+              // 重 provision 的同名 row.id 覆盖兜底(与旧路径同一层不一致,接受)。
               boundCodexAccountId = picked.account_id;
             }
           } finally {
@@ -2504,7 +2612,8 @@ export async function provisionV3Container(
       try {
         await container.start();
       } catch (startErr) {
-        // start 失败,回收 container 后让 PG 事务回滚
+        // start 失败,就近回收本 container(force);再抛给中段 catch → compensateProvisionFailure
+        // 翻 vanished(rm 幂等:此处已删 → 补偿再 rm 撞 404 吞掉)。
         try {
           await container.remove({ force: true });
         } catch {
@@ -2514,48 +2623,53 @@ export async function provisionV3Container(
       }
     }
 
-    // 4) UPDATE container_internal_id
-    await client.query(
+  } catch (err) {
+    // 中段(docker create/start / codex 绑定)失败 → 补偿:占位行翻 vanished + 清 docker 残骸。
+    await compensateProvisionFailure(deps, row.id, createdDockerId, useRemote, hostId);
+    throw err;
+  }
+
+  // ═══ Tx2:短事务(单条 guarded UPDATE,pg 隐式 autocommit,不长持连接)═══
+  // 把 docker id + codex 绑定一并落库。WHERE state='active' guard:占位行若在中段被并发
+  // 路径翻走(admin stop / codex stale recycle / prewarm-vs-WS sibling teardown),
+  // rowCount=0 → 绝不把 cid 写回已死行,走补偿清 docker 孤儿。
+  try {
+    const upd = await deps.pool.query(
       `UPDATE agent_containers
           SET container_internal_id = $2,
+              codex_account_id = $3,
               updated_at = NOW()
-        WHERE id = $1`,
-      [String(row.id), createdDockerId],
+        WHERE id = $1 AND state = 'active' AND runtime_channel = $4`,
+      [
+        String(row.id),
+        createdDockerId,
+        boundCodexAccountId === null ? null : String(boundCodexAccountId),
+        getRuntimeChannel(),
+      ],
     );
-
-    await client.query("COMMIT");
-
-    return {
-      containerId: row.id,
-      userId: uid,
-      boundIp: row.boundIp,
-      port: V3_CONTAINER_PORT,
-      dockerContainerId: createdDockerId,
-      token,
-      hostId: effectiveHostUuid,
-    };
+    if ((upd.rowCount ?? 0) === 0) {
+      // 占位行已被并发生命周期动作翻走。NameConflict → v3ensureRunning catch-all 翻
+      // "provisioning" 短重试(下轮 ensure 命中赢家 warm 容器或重新 provision),不告警、
+      // 不 cooldown / quarantine。错误形状与既有 dup 复查 NameConflict 一致。
+      throw new SupervisorError(
+        "NameConflict",
+        `provision row ${row.id} vanished before Tx2 commit (concurrent lifecycle action); retry`,
+      );
+    }
   } catch (err) {
-    // 回滚 PG;尽力清理 docker(若 createContainer 之后失败)
-    try {
-      await client.query("ROLLBACK");
-    } catch {
-      /* swallow */
-    }
-    if (createdDockerId) {
-      try {
-        if (useRemote) {
-          await deps.containerService!.remove(hostId!, createdDockerId, { force: true });
-        } else {
-          await deps.docker.getContainer(createdDockerId).remove({ force: true });
-        }
-      } catch {
-        /* swallow */
-      }
-    }
+    await compensateProvisionFailure(deps, row.id, createdDockerId, useRemote, hostId);
     throw err;
-  } finally {
-    client.release();
   }
+
+  return {
+    containerId: row.id,
+    userId: uid,
+    boundIp: row.boundIp,
+    port: V3_CONTAINER_PORT,
+    dockerContainerId: createdDockerId,
+    token,
+    hostId: effectiveHostUuid,
+  };
 }
 
 /**
@@ -2903,18 +3017,19 @@ export async function getV3ContainerStatus(
   if (r.rowCount === 0) return null;
   const row = r.rows[0]!;
   if (!row.container_internal_id) {
-    // 行被外部 SELECT 看到 = 事务已 COMMIT;但 container_internal_id IS NULL 是
-    // 异常态(provisionV3Container 正常 COMMIT 都会 UPDATE container_internal_id)。
-    // 成因:
-    //   1) 远端 createAndStart 返回空 containerInternalId(v1.0.8 已被 RemoteContractViolation 守门)
-    //   2) 进程异常崩溃留下的边缘状态 / migration 前的旧数据
+    // 行被外部 SELECT 看到 = Tx1 已 COMMIT;但 container_internal_id IS NULL。
     //
-    // 15s grace 仅遮蔽 commit 后极短窗口内并发 SELECT 的理论可能;真实跑这个分支
-    // 基本是孤儿。超 15s → 视作 missing,ensureRunning 自愈走 stopAndRemove +
-    // re-provision(stopAndRemoveV3Container 对 NULL container_internal_id 提前
-    // return,只翻 state='vanished',不动 docker)。
-    //
-    // 修复 v1.0.7 报告的死循环:row 1120 这种孤儿 row 让用户看到 "5秒后重连" 无穷循环。
+    // **前提(单一 singleflight 统一后,index.ts sharedEnsureRunning 汇聚全部 provision 入口)**:
+    // 本进程有在途 provision 时,并发观察者一律 join 同一 in-flight promise,不会走到这里独立
+    // 观察 cid=NULL 行。所以能观察到 active+cid=NULL ⟺ **本进程无在途 provision** ⟺ 该行是
+    // **崩溃/重启残留的孤儿**(Tx1 提交后进程异常 / migration 前旧数据 / 远端 createAndStart
+    // 返回空 cid[v1.0.8 已被 RemoteContractViolation 守门])。→ 按 grace 二分自愈:
+    //   · young(age<grace)→ 'provisioning':孤儿的**有界自愈等待**。ensureRunning 短重试
+    //     (不 stopAndRemove);重试几轮 age 过 grace → 转 'missing' → 走下方自愈。上界 = grace,
+    //     不引入慢愈退化。**同时**是纵深防御:万一未来出现 singleflight 覆盖不到的路径观察到
+    //     真·在途行,'provisioning' 等待也不会误销毁它。
+    //   · old(age>=grace)→ 'missing':真孤儿,ensureRunning stopAndRemove(对 NULL cid 提前
+    //     return,只翻 vanished 不动 docker)+ re-provision 自愈。
     const ageMs = Date.now() - new Date(row.created_at).getTime();
     return {
       containerId: Number.parseInt(row.id, 10),
@@ -2922,7 +3037,7 @@ export async function getV3ContainerStatus(
       boundIp: row.bound_ip,
       port: row.port ?? V3_CONTAINER_PORT,
       dockerContainerId: "",
-      state: ageMs < 15_000 ? "stopped" : "missing",
+      state: ageMs < PROVISION_INFLIGHT_GRACE_MS ? "provisioning" : "missing",
       hostId: row.host_uuid,
     };
   }

@@ -104,6 +104,10 @@ type DockerBehavior = {
   conflictInspectThrows?: Error;
   /** 自愈 rm 冲突容器时抛 404(别的 reaper / 并发 provision 已删)。 */
   conflictRemoveMissing?: boolean;
+  /** 结构性守卫测试:createContainer 被调用瞬间的回调(捕获此刻 PG 事务状态)。 */
+  onCreateContainer?: () => void;
+  /** 结构性守卫测试:container.start 被调用瞬间的回调。 */
+  onStartContainer?: () => void;
 };
 
 function httpError(code: number, msg: string): Error {
@@ -145,6 +149,7 @@ function makeDocker(behavior: DockerBehavior = {}): { docker: Docker; captured: 
   let createCalls = 0;
   const createContainer = async (opts: Parameters<Docker["createContainer"]>[0]) => {
     createCalls++;
+    behavior.onCreateContainer?.();
     if (behavior.imageMissing) throw httpError(404, "No such image: openclaude/openclaude-runtime:test");
     if (behavior.createConflictCount && createCalls <= behavior.createConflictCount) {
       throw httpError(409, 'Conflict. The container name "/oc-v3-u1" is already in use');
@@ -153,6 +158,7 @@ function makeDocker(behavior: DockerBehavior = {}): { docker: Docker; captured: 
     return {
       id: `dockerid-${captured.containersCreated.length}`,
       start: async () => {
+        behavior.onStartContainer?.();
         if (behavior.startFails) throw httpError(500, "start failed");
         captured.started++;
       },
@@ -241,6 +247,9 @@ type FakeRow = {
   // 否则 image 列断言假阴。
   image: string;
   container_internal_id: string | null;
+  // saga Tx2 与 cid 一并写(binding 成功记 account_id,否则保持 NULL)。
+  // 可选:既有直接构造 FakeRow 的 seed helper 不必填,provision INSERT 会写 null。
+  codex_account_id?: string | null;
   last_ws_activity: Date;
   created_at: Date;
   updated_at: Date;
@@ -333,6 +342,7 @@ class FakePool {
             port,
             image,
             container_internal_id: null,
+            codex_account_id: null,
             last_ws_activity: now,
             created_at: now,
             updated_at: now,
@@ -340,16 +350,24 @@ class FakePool {
           return { rowCount: 1, rows: [{ id: String(id) }] };
         }
         if (/UPDATE agent_containers/i.test(trimmed) && /SET container_internal_id/i.test(trimmed)) {
+          // saga Tx2:SET container_internal_id=$2, codex_account_id=$3
+          //   WHERE id=$1 AND state='active' AND runtime_channel=$4
+          // state='active' guard:占位行已被并发翻 vanished → rowCount=0(触发补偿)。
           const id = Number.parseInt(String(params![0]), 10);
           const cid = String(params![1]);
-          const r = self.rows.find((x) => x.id === id);
+          const codexAccountId = params![2] == null ? null : String(params![2]);
+          const guardsActive = /state\s*=\s*'active'/i.test(trimmed);
+          const r = self.rows.find(
+            (x) => x.id === id && (!guardsActive || x.state === "active"),
+          );
           if (r) {
             r.container_internal_id = cid;
+            r.codex_account_id = codexAccountId;
             r.updated_at = new Date();
           }
           return { rowCount: r ? 1 : 0, rows: [] };
         }
-        if (/UPDATE agent_containers/i.test(trimmed) && /SET state='vanished'/i.test(trimmed)) {
+        if (/UPDATE agent_containers/i.test(trimmed) && /SET state\s*=\s*'vanished'/i.test(trimmed)) {
           const id = Number.parseInt(String(params![0]), 10);
           const r = self.rows.find((x) => x.id === id);
           if (r) {
@@ -859,7 +877,7 @@ describe("provisionV3Container", () => {
     assert.equal(pool.rows.length, 1);
   });
 
-  test("docker createContainer 失败 → ROLLBACK + 不留 PG 行", async () => {
+  test("docker createContainer 失败 → Tx1 提交后中段失败,补偿翻 vanished(不留 active 行)", async () => {
     const { docker } = makeDocker({ imageMissing: true });
     await assert.rejects(
       provisionV3Container(
@@ -868,13 +886,15 @@ describe("provisionV3Container", () => {
       ),
       (err: Error) => err instanceof SupervisorError && err.code === "ImageNotFound",
     );
-    // ROLLBACK 跑过
-    assert.deepEqual(pool.clientLog, ["BEGIN", "ROLLBACK"]);
-    // FakePool 内仍然写了行(insert 已 commit 到内存),但实际 PG 会回滚 ——
-    // 这个 fake 的局限性,真 PG 不会有残留;断言 ROLLBACK 即可证明语义对
+    // saga:Tx1 短事务已提交占位行(BEGIN→COMMIT),docker create 在无事务中段失败 →
+    // compensateProvisionFailure 短事务翻 vanished;不再是旧的 BEGIN→ROLLBACK。
+    assert.deepEqual(pool.clientLog, ["BEGIN", "COMMIT"]);
+    assert.equal(pool.rows.length, 1, "Tx1 占位行已提交");
+    assert.equal(pool.rows[0]!.state, "vanished", "中段失败 → 补偿翻 vanished");
+    assert.equal(pool.rows[0]!.container_internal_id, null, "cid 从未写入(Tx2 未跑)");
   });
 
-  test("container.start 失败 → docker rm -f + ROLLBACK", async () => {
+  test("container.start 失败 → docker rm -f + 补偿翻 vanished(Tx1 已提交)", async () => {
     const { docker, captured } = makeDocker({ startFails: true });
     await assert.rejects(
       provisionV3Container(
@@ -883,10 +903,38 @@ describe("provisionV3Container", () => {
       ),
       (err: Error) => err instanceof SupervisorError,
     );
-    // start 之前 createContainer 成功 → start 失败时直接 container.remove
-    // 之后 catch 块再次 docker.getContainer().remove (best-effort) → removed >= 1
+    // start 之前 createContainer 成功 → start 失败时就近 container.remove,
+    // 再由 compensateProvisionFailure best-effort docker.getContainer().remove → removed >= 1
     assert.ok(captured.removed >= 1);
-    assert.deepEqual(pool.clientLog, ["BEGIN", "ROLLBACK"]);
+    // saga:Tx1 已提交(BEGIN→COMMIT),中段 start 失败 → 补偿翻 vanished。
+    assert.deepEqual(pool.clientLog, ["BEGIN", "COMMIT"]);
+    assert.equal(pool.rows[0]!.state, "vanished");
+  });
+
+  test("结构性守卫:docker.createContainer / start 被调时 provision client 上无悬挂 BEGIN(Tx1 已 COMMIT 释放)", async () => {
+    // saga 核心不变量:docker 慢 IO 绝不在开着的事务里跑。捕获 createContainer / start
+    // 触发瞬间的 clientLog —— 必须已是 ["BEGIN","COMMIT"](末尾 COMMIT,无悬挂 BEGIN),
+    // 证明 Tx1 短事务已提交并 release,中段无 checked-out client / 无 idle-in-tx 窗口。
+    // 防回归:若有人把 docker 副作用挪回单条长事务,这里会捕到悬挂的 ["BEGIN"]。
+    let logAtCreate: string[] | undefined;
+    let logAtStart: string[] | undefined;
+    const { docker } = makeDocker({
+      onCreateContainer: () => {
+        logAtCreate = [...pool.clientLog];
+      },
+      onStartContainer: () => {
+        logAtStart = [...pool.clientLog];
+      },
+    });
+    await provisionV3Container(
+      { docker, pool: pool as unknown as Pool, image: TEST_IMAGE, selfHostId: TEST_HOST, randomIp: () => "172.30.8.8", randomSecret: fixedSecret("f".repeat(64)) },
+      77,
+    );
+    assert.deepEqual(logAtCreate, ["BEGIN", "COMMIT"], "createContainer 时 Tx1 必须已 COMMIT(无悬挂 BEGIN)");
+    assert.deepEqual(logAtStart, ["BEGIN", "COMMIT"], "container.start 时 Tx1 必须已 COMMIT(无悬挂 BEGIN)");
+    // Tx2 走 pool.query(不 connect),不追加事务记录;成功后 clientLog 仍是 BEGIN→COMMIT。
+    assert.deepEqual(pool.clientLog, ["BEGIN", "COMMIT"]);
+    assert.equal(pool.rows[0]!.container_internal_id, "dockerid-1", "Tx2 已写 cid");
   });
 
   test("rejects bad image / uid", async () => {
@@ -1688,7 +1736,7 @@ describe("getV3ContainerStatus", () => {
     assert.equal(r!.state, "missing");
   });
 
-  test("active row 但 container_internal_id 为 NULL + age<15s → state='stopped'(commit 后极短窗口 grace)", async () => {
+  test("active row 但 container_internal_id 为 NULL + age<15s → state='provisioning'(saga 中段合法在途,ensureRunning 等待而非销毁)", async () => {
     const { docker } = makeDocker();
     const pool = new FakePool();
     pool.rows.push({
@@ -1710,7 +1758,8 @@ describe("getV3ContainerStatus", () => {
       5,
     );
     assert.ok(r);
-    assert.equal(r!.state, "stopped");
+    // saga 修复(Codex MAJOR):young cid=NULL 是并发 provision 在途态,不再是可销毁的 'stopped'。
+    assert.equal(r!.state, "provisioning");
     assert.equal(r!.dockerContainerId, "");
   });
 
@@ -3031,33 +3080,36 @@ describe("provisionV3Container — RemoteContractViolation 守门(v1.0.8)", () =
     return { pool, err: caught! };
   }
 
-  test("createAndStart 返回 {containerInternalId: ''} → RemoteContractViolation + ROLLBACK", async () => {
+  // saga:RemoteContractViolation 在无事务中段抛出(createAndStart 返回空 cid),
+  // 此时 Tx1 已提交占位行(BEGIN→COMMIT)→ 补偿翻 vanished,绝不留 active 孤儿 row。
+  // createdDockerId 从未被赋值(违约检查早于赋值)→ 补偿无 docker 实体可清。
+  function assertRemoteViolationCompensated(pool: FakePool, err: Error): void {
+    assert.ok(err instanceof SupervisorError);
+    assert.equal((err as SupervisorError).code, "RemoteContractViolation");
+    assert.deepEqual(pool.clientLog, ["BEGIN", "COMMIT"]);
+    assert.equal(pool.rows.length, 1, "Tx1 占位行已提交");
+    assert.equal(pool.rows[0]!.state, "vanished", "中段违约 → 补偿翻 vanished(无 active 孤儿)");
+    assert.equal(pool.rows[0]!.container_internal_id, null);
+  }
+
+  test("createAndStart 返回 {containerInternalId: ''} → RemoteContractViolation + 补偿翻 vanished", async () => {
     const { pool, err } = await runRemoteProvisionExpectViolation({ containerInternalId: "" });
-    assert.ok(err instanceof SupervisorError);
-    assert.equal((err as SupervisorError).code, "RemoteContractViolation");
-    // 关键断言:事务必须 ROLLBACK,不能 COMMIT(否则就是又一个孤儿 row)
-    assert.deepEqual(pool.clientLog, ["BEGIN", "ROLLBACK"]);
+    assertRemoteViolationCompensated(pool, err);
   });
 
-  test("createAndStart 返回 {containerInternalId: undefined} → RemoteContractViolation + ROLLBACK", async () => {
+  test("createAndStart 返回 {containerInternalId: undefined} → RemoteContractViolation + 补偿翻 vanished", async () => {
     const { pool, err } = await runRemoteProvisionExpectViolation({ containerInternalId: undefined });
-    assert.ok(err instanceof SupervisorError);
-    assert.equal((err as SupervisorError).code, "RemoteContractViolation");
-    assert.deepEqual(pool.clientLog, ["BEGIN", "ROLLBACK"]);
+    assertRemoteViolationCompensated(pool, err);
   });
 
-  test("createAndStart 返回 null(整个响应缺失)→ RemoteContractViolation + ROLLBACK", async () => {
+  test("createAndStart 返回 null(整个响应缺失)→ RemoteContractViolation + 补偿翻 vanished", async () => {
     const { pool, err } = await runRemoteProvisionExpectViolation(null);
-    assert.ok(err instanceof SupervisorError);
-    assert.equal((err as SupervisorError).code, "RemoteContractViolation");
-    assert.deepEqual(pool.clientLog, ["BEGIN", "ROLLBACK"]);
+    assertRemoteViolationCompensated(pool, err);
   });
 
-  test("createAndStart 返回 {containerInternalId: '   '} (纯空白) → RemoteContractViolation + ROLLBACK", async () => {
+  test("createAndStart 返回 {containerInternalId: '   '} (纯空白) → RemoteContractViolation + 补偿翻 vanished", async () => {
     const { pool, err } = await runRemoteProvisionExpectViolation({ containerInternalId: "   " });
-    assert.ok(err instanceof SupervisorError);
-    assert.equal((err as SupervisorError).code, "RemoteContractViolation");
-    assert.deepEqual(pool.clientLog, ["BEGIN", "ROLLBACK"]);
+    assertRemoteViolationCompensated(pool, err);
   });
 });
 
@@ -3265,8 +3317,10 @@ describe("provisionV3Container — per-host bridge gateway env injection", () =>
     assert.ok(caught, "expected fail-fast for remote without bridgeCidr");
     assert.ok(caught instanceof SupervisorError);
     assert.equal((caught as SupervisorError).code, "InvalidArgument");
-    // ROLLBACK — 不能因为 bridgeCidr 缺失就把 row 真留下来
-    assert.deepEqual(pool.clientLog, ["BEGIN", "ROLLBACK"]);
+    // saga:bridgeCidr 校验在无事务中段(hostGatewayIp 组装),Tx1 已提交(BEGIN→COMMIT)
+    // → 补偿翻 vanished,绝不留 active row。
+    assert.deepEqual(pool.clientLog, ["BEGIN", "COMMIT"]);
+    assert.equal(pool.rows[0]!.state, "vanished");
   });
 
   test("remote host + bridgeCidr 形状不符 → InvalidArgument(docker create 前拦截)", async () => {
@@ -3298,7 +3352,9 @@ describe("provisionV3Container — per-host bridge gateway env injection", () =>
     assert.equal((caught as SupervisorError).code, "InvalidArgument");
     // 不能进到 createAndStart
     assert.equal(captured.spec, undefined);
-    assert.deepEqual(pool.clientLog, ["BEGIN", "ROLLBACK"]);
+    // saga:形状校验在无事务中段,Tx1 已提交 → 补偿翻 vanished。
+    assert.deepEqual(pool.clientLog, ["BEGIN", "COMMIT"]);
+    assert.equal(pool.rows[0]!.state, "vanished");
   });
 });
 

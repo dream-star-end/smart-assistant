@@ -6,7 +6,9 @@
  *   - active+running+healthz timeout → ContainerUnreadyError("starting")
  *   - active+stopped → stopAndRemove + provision + waitHealthz → 成功(v1.0.117)
  *   - active+stopped + stopAndRemove 失败 → ContainerUnreadyError("supervisor_error")
- *   - active+stopped(orphan: container_internal_id=NULL, age<15s)→ vanished + reprovision 成功
+ *   - active + provisioning(cid=NULL, age<grace)→ ContainerUnreadyError("provisioning") 短重试等待
+ *     (不 stopAndRemove、不销毁在途/孤儿行;单一 singleflight 统一后 = 孤儿有界自愈缓冲)
+ *   - active + missing(cid=NULL, age>=grace)→ stopAndRemove 翻 vanished + reprovision 自愈
  *   - active+missing → stopAndRemove + provision + waitHealthz → 成功
  *   - 并发 ensureRunning 输家保护(uniq_ac_user_id_active)留 integ 覆盖(FakePool 当前只模拟 bound_ip uniq)
  *   - 无 active 行 → provision + waitHealthz → 成功
@@ -207,6 +209,9 @@ class FakePool {
           port: r.port,
           container_internal_id: r.container_internal_id,
           host_uuid: r.host_uuid,
+          // getV3ContainerStatus 的 cid=NULL 分支按 created_at 二分 provisioning/missing。
+          // 缺此列 → new Date(undefined) → NaN age → 恒 missing(旧测试的隐性 bug)。
+          created_at: r.created_at,
         }],
       };
     }
@@ -516,16 +521,15 @@ describe("makeV3EnsureRunning", () => {
   //     不会冒出来给 ensureRunning),要专测 user_id 并发冲突需扩 FakePool。
   //     这条留 integ 测试覆盖,本文件不加(Codex 提的"建议补",非阻塞)。
 
-  test("active + stopped(orphan: container_internal_id=NULL, age<15s)→ vanished + reprovision (v1.0.117)", async () => {
-    // 边界:provisionV3Container 中途崩了留下的 orphan row(container_internal_id IS NULL)。
-    // getV3ContainerStatus 在 age<15s 时返 state='stopped' + dockerContainerId=""。
-    // 旧行为:ContainerUnreadyError("stopped") 死循环(因为容器并不存在所以永远不会转 running)。
-    // 新行为:统一走 stopAndRemove(对 NULL container_internal_id 提前 return,只翻 row state='vanished')
-    //         然后 fall through provision 重建。uniq_ac_user_id_active 防止留两份 active row。
+  test("active + provisioning(young cid=NULL, age<15s)→ 等待短重试,不 stopAndRemove、不销毁在途行(Codex MAJOR 修复)", async () => {
+    // saga 中段:并发 provision(尤其 makeUidSingleflight 覆盖不到的跨闭包 —— prewarm 独立闭包
+    // vs WS 独立闭包)正在建容器,cid 尚未由 Tx2 落库。getV3ContainerStatus age<15s → 'provisioning'。
+    // ensureRunning **必须等待**(短重试),**绝不** stopAndRemove —— 否则销毁在途容器 → 在途者
+    // Tx2 rowCount=0 补偿 rm → 与同名 create 交错把前台打进 NameConflict。几秒后在途者 Tx2 落 cid
+    // → 下轮 ensure 命中 running,零 churn 零 vanish。
     const pool = new FakePool();
-    pool.preInsertActive(92, "172.30.1.32", null);  // container_internal_id=NULL
-    // age<15s:preInsertActive 默认 created_at=now,直接满足
-    const { docker, captured } = makeDocker({ inspectState: "running" });  // 不会被调到(getStatus 不走 inspect)
+    const row = pool.preInsertActive(92, "172.30.1.32", null); // cid=NULL,created_at=now → young
+    const { docker, captured } = makeDocker({ inspectState: "running" });
     const ensureRunning = makeV3EnsureRunning(makeDeps(docker, pool as unknown as Pool), {
       probeHealthz: async () => true,
       probeWsUpgrade: async () => true,
@@ -533,16 +537,37 @@ describe("makeV3EnsureRunning", () => {
       now: fixedNow,
     });
 
-    const ep = await ensureRunning(92n);
-    assert.strictEqual(ep.host, "172.30.5.42");
+    await assert.rejects(ensureRunning(92n), (err) => {
+      assert.ok(err instanceof ContainerUnreadyError);
+      assert.strictEqual(err.reason, "provisioning");
+      return true;
+    });
+    // 关键:在途行未被销毁、无新容器创建、无 stop/remove docker 副作用。
+    assert.strictEqual(row.state, "active", "在途 provisioning 行绝不能被翻 vanished");
+    assert.strictEqual(captured.containersCreated, 0, "不得 stopAndRemove + 重建");
+    assert.strictEqual(captured.stopped, 0);
+    assert.strictEqual(captured.removed, 0);
+  });
+
+  test("active + missing(orphan cid=NULL, age>=15s)→ stopAndRemove 翻 vanished + reprovision 自愈(既有路径不回归)", async () => {
+    // 真孤儿(进程崩溃留下,>15s):getV3ContainerStatus → 'missing'。既有自愈不回归:
+    // stopAndRemove(对 NULL cid 提前 return,只翻 vanished 不动 docker)+ fall through provision 重建。
+    const pool = new FakePool();
+    const row = pool.preInsertActive(93, "172.30.1.33", null);
+    row.created_at = new Date(Date.now() - 30_000); // age>=15s → missing
+    const { docker, captured } = makeDocker({ inspectState: "running" });
+    const ensureRunning = makeV3EnsureRunning(makeDeps(docker, pool as unknown as Pool), {
+      probeHealthz: async () => true,
+      probeWsUpgrade: async () => true,
+      sleep: noSleep,
+      now: fixedNow,
+    });
+
+    const ep = await ensureRunning(93n);
     assert.strictEqual(ep.coldStart, true);
-    // 老 orphan row 已 vanished
-    const oldRow = pool.rows.find((r) => r.id === 1);
-    assert.strictEqual(oldRow?.state, "vanished");
-    // 新 active row
-    const newRow = pool.rows.find((r) => r.user_id === 92 && r.state === "active");
+    assert.strictEqual(row.state, "vanished", "老孤儿 row 翻 vanished");
+    const newRow = pool.rows.find((r) => r.user_id === 93 && r.state === "active");
     assert.ok(newRow, "应有一条新 active row");
-    // docker create + start 各 1 次
     assert.strictEqual(captured.containersCreated, 1);
     assert.strictEqual(captured.started, 1);
   });

@@ -16,7 +16,10 @@
  * 成为输家被翻 ContainerUnreadyError("provisioning")。装配代码见 commercial/src/index.ts
  * `sharedEnsureRunning` 闭包。
  *
- * prewarm 路径保留独立闭包(发生在邮箱验证那一刻,与 reload 不同步)。
+ * prewarm 路径**已复用本 sharedEnsureRunning**(2026-07-07 修 Codex MAJOR):本进程所有
+ * provision 入口(WS / media-signed / cronWake / prewarm)汇入唯一 in-flight map,同 uid 有
+ * 在途 provision 时并发者一律 join 同一 promise,不重复 provision、不独立观察销毁 saga 中段
+ * 的 active+cid=NULL 在途行。装配见 index.ts sharedEnsureRunning + prewarmContainer。
  */
 export function makeUidSingleflight<R>(
   underlying: (uid: bigint) => Promise<R>,
