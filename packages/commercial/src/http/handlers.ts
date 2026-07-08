@@ -132,6 +132,8 @@ export interface CommercialHttpDeps {
     feedback: RateLimitConfig;
     // 2026-06-18:前端问题自动上报,匿名可提交,按 IP 限流(比 feedback 宽)
     clientErrors: RateLimitConfig;
+    // 2026-07-08:每条响应满意度评分(强制登录),按 user 维度限流
+    responseRating: RateLimitConfig;
   }>;
   /** T-12.1:开启后,login 强制要求 email_verified=true */
   requireEmailVerified?: boolean;
@@ -351,6 +353,10 @@ export const DEFAULT_RATE_LIMITS = {
   // 2026-06-18:前端问题自动上报。比 feedback 宽(30/min/IP)—— 一个坏页面会连发
   // 几条(JS 异常 + 接口失败 + 流式中断),但仍挡住脚本刷日志。前端侧另有签名节流。
   clientErrors: { scope: "client_errors", windowSeconds: 60, max: 30 } satisfies RateLimitConfig,
+  // 2026-07-08:每条响应满意度评分(👍/👎)。按 **user** 维度(端点强制登录),60/min ——
+  // 评分是逐条响应的高频信号,用户可能快速给多条打分或反复 toggle;宽到不误伤真实交互,
+  // 又挡住脚本刷分。identifier=`u:<uid>`(非 IP)。
+  responseRating: { scope: "response_rating", windowSeconds: 60, max: 60 } satisfies RateLimitConfig,
 };
 
 /**

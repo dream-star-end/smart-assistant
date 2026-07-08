@@ -44,6 +44,42 @@
   {
     "method": "GET",
     "pathKind": "path",
+    "pathValue": "/api/admin/orgs",
+    "handler": "handleAdminListOrgs"
+  },
+  {
+    "method": "POST",
+    "pathKind": "path",
+    "pathValue": "/api/admin/orgs",
+    "handler": "handleAdminCreateOrg"
+  },
+  {
+    "method": "PATCH",
+    "pathKind": "pathPrefix",
+    "pathValue": "/api/admin/orgs/",
+    "handler": "handleAdminPatchOrg"
+  },
+  {
+    "method": "POST",
+    "pathKind": "pathPrefix",
+    "pathValue": "/api/admin/orgs/",
+    "handler": "handleAdminAdjustOrgCredits"
+  },
+  {
+    "method": "GET",
+    "pathKind": "path",
+    "pathValue": "/api/admin/org-invoices",
+    "handler": "handleAdminListOrgInvoices"
+  },
+  {
+    "method": "PATCH",
+    "pathKind": "pathPrefix",
+    "pathValue": "/api/admin/org-invoices/",
+    "handler": "handleAdminPatchOrgInvoice"
+  },
+  {
+    "method": "GET",
+    "pathKind": "path",
     "pathValue": "/api/admin/audit",
     "handler": "handleAdminListAudit"
   },
@@ -58,6 +94,24 @@
     "pathKind": "pathPrefix",
     "pathValue": "/api/admin/pricing/",
     "handler": "handleAdminPatchPricing"
+  },
+  {
+    "method": "GET",
+    "pathKind": "path",
+    "pathValue": "/api/admin/model-ops",
+    "handler": "handleAdminModelOpsOverview"
+  },
+  {
+    "method": "GET",
+    "pathKind": "path",
+    "pathValue": "/api/admin/model-ops/stats",
+    "handler": "handleAdminModelOpsStats"
+  },
+  {
+    "method": "PUT",
+    "pathKind": "pathPrefix",
+    "pathValue": "/api/admin/providers/",
+    "handler": "handleAdminPutProviderOps"
   },
   {
     "method": "GET",
@@ -148,6 +202,60 @@
     "pathKind": "pathPrefix",
     "pathValue": "/api/admin/accounts/",
     "handler": "handleAdminDeleteAccount"
+  },
+  {
+    "method": "GET",
+    "pathKind": "path",
+    "pathValue": "/api/admin/account-groups",
+    "handler": "handleAdminListAccountGroups"
+  },
+  {
+    "method": "POST",
+    "pathKind": "path",
+    "pathValue": "/api/admin/account-groups",
+    "handler": "handleAdminCreateAccountGroup"
+  },
+  {
+    "method": "PATCH",
+    "pathKind": "pathPrefix",
+    "pathValue": "/api/admin/account-groups/relay-credentials/",
+    "handler": "handleAdminPatchRelayCredential"
+  },
+  {
+    "method": "DELETE",
+    "pathKind": "pathPrefix",
+    "pathValue": "/api/admin/account-groups/relay-credentials/",
+    "handler": "handleAdminDeleteRelayCredential"
+  },
+  {
+    "method": "PUT",
+    "pathKind": "pathPrefix",
+    "pathValue": "/api/admin/account-groups/",
+    "handler": "handleAdminPutAccountGroupModels"
+  },
+  {
+    "method": "POST",
+    "pathKind": "pathPrefix",
+    "pathValue": "/api/admin/account-groups/",
+    "handler": "handleAdminCreateRelayCredential"
+  },
+  {
+    "method": "GET",
+    "pathKind": "pathPrefix",
+    "pathValue": "/api/admin/account-groups/",
+    "handler": "handleAdminGetAccountGroup"
+  },
+  {
+    "method": "PATCH",
+    "pathKind": "pathPrefix",
+    "pathValue": "/api/admin/account-groups/",
+    "handler": "handleAdminPatchAccountGroup"
+  },
+  {
+    "method": "DELETE",
+    "pathKind": "pathPrefix",
+    "pathValue": "/api/admin/account-groups/",
+    "handler": "handleAdminDeleteAccountGroup"
   },
   {
     "method": "GET",
@@ -390,6 +498,18 @@
     "handler": "handleAdminAlertsCreateTelegramChannel"
   },
   {
+    "method": "POST",
+    "pathKind": "path",
+    "pathValue": "/api/admin/alerts/channels/wecom",
+    "handler": "handleAdminAlertsCreateWecomChannel"
+  },
+  {
+    "method": "POST",
+    "pathKind": "path",
+    "pathValue": "/api/admin/alerts/channels/wecom-aibot",
+    "handler": "handleAdminAlertsCreateWecomAibotChannel"
+  },
+  {
     "method": "PATCH",
     "pathKind": "pathPrefix",
     "pathValue": "/api/admin/alerts/channels/",
@@ -478,6 +598,12 @@
     "pathKind": "pathPrefix",
     "pathValue": "/api/admin/feedback/",
     "handler": "handleAdminAckFeedback"
+  },
+  {
+    "method": "GET",
+    "pathKind": "path",
+    "pathValue": "/api/admin/response-ratings",
+    "handler": "handleAdminResponseRatings"
   },
   {
     "method": "GET",

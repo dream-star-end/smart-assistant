@@ -92,6 +92,7 @@ import {
   handleAdminExportUsersCsv,
 } from './admin/export.js'
 import { handleAdminAckFeedback, handleAdminListFeedback } from './admin/feedback.js'
+import { handleAdminResponseRatings } from './admin/responseRatings.js'
 import {
   handleAdminCreateInbox,
   handleAdminDeleteInbox,
@@ -227,6 +228,10 @@ import {
   handleVerifyEmail,
 } from './handlers.js'
 import { handleGithubCallback, handleGithubStart } from './oauthGithub.js'
+import {
+  handleGetResponseRatings,
+  handlePostResponseRating,
+} from './responseRatings.js'
 import { handleLinuxdoCallback, handleLinuxdoStart } from './oauthLinuxdo.js'
 import { handleCreateHupi, handleGetOrder, handleHupiCallback, handleListPlans } from './payment.js'
 import {
@@ -1037,6 +1042,11 @@ export function createCommercialHandler(
     // 2026-06-18 前端问题自动上报(commercial 接管;结构化日志按 traceId 落 journald)
     //   匿名 / 已登录均可,IP 限流(handler 内 enforceRateLimit,比 feedback 宽)
     { method: 'POST', path: '/api/client-errors', handler: handleClientErrorReport },
+    // 2026-07-08 v5-only 每条响应满意度评分(👍/👎 + 可选标签/评论)
+    //   **强制登录**(requireAuth,未登录 401),按 user 维度限流;与 feedback(问题上报)语义不同
+    //   POST → upsert(UNIQUE(user_id, message_id));GET ?sessionId → 回读该会话已评状态
+    { method: 'POST', path: '/api/response-rating', handler: handlePostResponseRating },
+    { method: 'GET', path: '/api/response-rating', handler: handleGetResponseRatings },
     // P0-3 订单 admin —— exact path 在 prefix 之前(matchRoute exact-first)
     //   /api/admin/orders/kpi 必须排前,否则会被 /api/admin/orders/ prefix 吞成 ORDER_NOT_FOUND
     { method: 'GET', path: '/api/admin/orders', handler: handleAdminListOrders },
@@ -1045,6 +1055,8 @@ export function createCommercialHandler(
     // P1-2 反馈 admin —— GET 列表 / POST :id/ack
     { method: 'GET', path: '/api/admin/feedback', handler: handleAdminListFeedback },
     { method: 'POST', pathPrefix: '/api/admin/feedback/', handler: handleAdminAckFeedback },
+    // 2026-07-08 响应评分 admin —— 按模型好评率统计 + 差评明细(复合游标分页)
+    { method: 'GET', path: '/api/admin/response-ratings', handler: handleAdminResponseRatings },
     // 站内信(in-app messages)用户侧
     //   GET  /api/me/messages                    → 列表 + unread_count
     //   GET  /api/me/messages/unread_count       → 仅 unread_count(polling 用)
@@ -1124,6 +1136,9 @@ export function createCommercialHandler(
     '/api/feedback',
     // 2026-06-18:commercial 接管 /api/client-errors POST,阻止 fall through 到 gateway
     '/api/client-errors',
+    // 2026-07-08:v5-only 响应评分 POST/GET,commercial 独有(gateway 无此路由),
+    // 必须列入白名单使 isOurs()=true,否则 commercialHandler 返回 false 走 fall-through。
+    '/api/response-rating',
     // v3 signed media URL —— 同样商业化管,维护期闸门必须覆盖到,否则维护期
     // 用户仍能通过签好的 URL drain 容器文件
     '/api/media-sign',
