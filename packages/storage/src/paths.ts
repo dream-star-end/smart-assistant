@@ -83,6 +83,13 @@ export const paths = {
   uploadsDir: join(HOME, 'uploads'),
   // MCP-generated media (images, audio, video) — served via /api/media/
   generatedDir: join(HOME, 'generated'),
+  // Research working outputs (reports, figures, manifests) produced by the
+  // research CLIs (oc-report / scientific-figures / oc-figcheck). A trusted
+  // media root alongside uploads/generated so vision tools may review
+  // agent-produced figures (not only user uploads). Keeping it a first-class
+  // path constant means the vision SSRF allow-list has a single authority to
+  // reference instead of hard-coding the string in multiple call sites.
+  researchDir: join(HOME, 'research'),
   // Existing
   agentSessionsDir: (agentId: string) => join(HOME, 'agents', agentId, 'sessions'),
   sessionLog: (agentId: string, sessionKey: string) =>
