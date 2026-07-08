@@ -57,12 +57,44 @@ describe('openclaude-vision MCP input validation', () => {
     )
   })
 
-  it('rejects an uploads symlink that points outside uploadsDir', () => {
+  it('rejects an uploads symlink that points outside the trusted media roots', () => {
     const outside = join(home, 'outside.png')
     writeFileSync(outside, PNG)
     const link = join(uploads, 'link.png')
     symlinkSync(outside, link)
-    assert.throws(() => vision.resolveVisionInput({ image_file: link }), /uploads directory/)
+    assert.throws(
+      () => vision.resolveVisionInput({ image_file: link }),
+      /uploads, generated, or research/,
+    )
+  })
+
+  it('accepts a raster image under generatedDir (MCP-produced media)', () => {
+    const generated = join(home, 'generated')
+    mkdirSync(generated, { recursive: true })
+    const p = join(generated, 'chart.png')
+    writeFileSync(p, PNG)
+    const resolved = vision.resolveVisionInput({ image_file: p })
+    assert.equal(resolved.imagePath, p)
+  })
+
+  it('accepts an agent-produced figure under researchDir (oc-figcheck closed loop)', () => {
+    const figDir = join(home, 'research', 'job-1', 'figures')
+    mkdirSync(figDir, { recursive: true })
+    const p = join(figDir, 'fig1.png')
+    writeFileSync(p, PNG)
+    const resolved = vision.resolveVisionInput({ image_file: p, question: 'any overlap?' })
+    assert.equal(resolved.imagePath, p)
+  })
+
+  it('rejects an image under a sensitive dir (credentials) even if a valid png', () => {
+    const credDir = join(home, 'credentials')
+    mkdirSync(credDir, { recursive: true })
+    const p = join(credDir, 'leak.png')
+    writeFileSync(p, PNG)
+    assert.throws(
+      () => vision.resolveVisionInput({ image_file: p }),
+      /uploads, generated, or research/,
+    )
   })
 
   it('rejects text renamed as png', () => {

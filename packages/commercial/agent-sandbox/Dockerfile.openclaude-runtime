@@ -110,6 +110,24 @@ RUN python3 -m pip install --break-system-packages --no-cache-dir \
       scipy==1.17.1 seaborn==0.13.2 statsmodels==0.14.6 sympy==1.14.0 \
       scikit-learn==1.9.0 plotly==6.8.0
 
+# 复杂图确定性工具栈(scientific-figures skill "按图类型选对工具"):数据图之外的
+# 网络/热图/组合/示意图长期只能用 matplotlib 硬画(网络图糊成一团、示意图草图感),
+# 补齐后各类复杂图各有其确定性工具。全部 pin(2026-07 host-network build 实测可装)。
+#   - graphviz(dot/neato/sfdp 布局)+ librsvg2-bin(rsvg-convert:SVG→PNG 栅格化,
+#     让 Mermaid/Typst/矢量图能栅格化进位图报告);
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends graphviz librsvg2-bin \
+    && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/* \
+    && dot -V && rsvg-convert --version | head -1
+#   - networkx/pydot:网络/关系/通路/DAG(替代手摆节点);PyComplexHeatmap:带聚类树/
+#     注释条的复杂热图;plotnine:ggplot2 语法复杂分面;upsetplot/matplotlib-venn:集合
+#     组合;squarify:treemap;adjustText:防标签重叠;cairosvg:纯 Python SVG 栅格化兜底。
+RUN python3 -m pip install --break-system-packages --no-cache-dir \
+      networkx==3.6.1 pydot==4.0.1 adjustText==1.4.0 plotnine==0.15.7 \
+      upsetplot==0.9.0 matplotlib-venn==1.1.2 squarify==0.4.4 \
+      PyComplexHeatmap==1.8.5 cairosvg==2.9.0 \
+    && python3 -c "import networkx,pydot,adjustText,plotnine,upsetplot,matplotlib_venn,squarify,PyComplexHeatmap,cairosvg; print('scifig stack OK')"
+
 # 办公助手文档工具链(office-* baseline skills 文档化):
 #   - Excel:openpyxl(读改+样式+图表) / XlsxWriter(纯写快) —— oc-xlsx CLI + 直接写 Python;
 #   - PDF:reportlab(票据/表单精确排版) / pypdf(合并拆分水印) / pdfplumber(解析+页码溯源);
@@ -168,6 +186,23 @@ RUN set -eux; \
     quarto --version; \
     pandoc --version | head -2
 
+# Typst 矢量示意图包预置(scientific-figures skill:精密机制/装置/几何/通路示意图走
+# CeTZ,矢量、对齐严谨、天生可投稿,补 Mermaid 覆盖不了的精密图)。Quarto 自带 typst,
+# 但 @preview/cetz、fletcher 需从 packages.typst.org 拉 —— **runtime 容器无外网**,故
+# build 时(有网)触发下载并缓存到系统级 /opt/typst-cache;runtime 由 oc-diagram 设
+# TYPST_PACKAGE_CACHE_PATH 指向它离线读取(放 /opt 而非 /home/agent,避开 per-user
+# volume 覆盖)。版本 pin:CeTZ 0.4.2 / fletcher 0.5.8 配 quarto 内置 typst 0.14.x(实测)。
+ENV TYPST_PACKAGE_CACHE_PATH=/opt/typst-cache
+RUN set -eux; \
+    TYPST=/opt/quarto/bin/tools/x86_64/typst; \
+    mkdir -p /opt/typst-cache /tmp/typwarm; cd /tmp/typwarm; \
+    printf '#import "@preview/cetz:0.4.2"\n#cetz.canvas({ import cetz.draw: *; circle((0,0), radius: 1); line((0,0),(2,1)) })\n' > c.typ; \
+    "$TYPST" compile c.typ c.pdf; \
+    printf '#import "@preview/fletcher:0.5.8" as fletcher: diagram, node, edge\n#fletcher.diagram(node((0,0), [A]), edge("->"), node((1,0), [B]))\n' > fl.typ; \
+    "$TYPST" compile fl.typ fl.pdf; \
+    chmod -R a+rX /opt/typst-cache; rm -rf /tmp/typwarm; \
+    find /opt/typst-cache -maxdepth 4 -type d \( -name cetz -o -name fletcher \)
+
 COPY --chown=root:root ./runtime/oc-docx.sh /usr/local/bin/oc-docx
 COPY --chown=root:root ./runtime/create-docgen-reference.py /usr/local/lib/openclaude/create-docgen-reference.py
 COPY --chown=root:root ./runtime/oc-minimax.py /usr/local/bin/oc-minimax
@@ -202,12 +237,17 @@ COPY --chown=root:root ./runtime/oc-pdf.sh /usr/local/bin/oc-pdf
 # oc-vision: 识图 CLI(纯文本模型看图兜底,复用 mcpVisionServer 核心 / 默认 MiniMax-M3
 # 后端)。取代已退役的常驻 openclaude-vision MCP stdio server。文档见 oc-vision baseline skill。
 COPY --chown=root:root ./runtime/oc-vision.sh /usr/local/bin/oc-vision
+# oc-figcheck: 出图质量门 + vision 回看闭环(确定性检查 + MiniMax-M3 审图 → PASS/WARN/FAIL,
+# 让 agent 看到自己刚画的图并自纠,根治"开环盲画");oc-diagram: Typst+CeTZ 精密矢量
+# 示意图(机制/装置/几何/通路图)。均文档见 scientific-figures baseline skill。
+COPY --chown=root:root ./runtime/oc-figcheck.sh /usr/local/bin/oc-figcheck
+COPY --chown=root:root ./runtime/oc-diagram.sh /usr/local/bin/oc-diagram
 # oc-memory: 长期记忆 CLI(Core/Recall/Archival 三层,复用 mcp-memory memoryTools 核心)。
 # 取代常驻 openclaude_memory MCP 里的 memory/session_search/archival_* 工具(常驻 stdio
 # 传输脆弱 → codex 死等)。delegate/cron/skill 仍留 MCP。文档见 memory-management baseline skill。
 COPY --chown=root:root ./runtime/oc-memory.sh /usr/local/bin/oc-memory
 RUN set -eux; \
-    chmod 0755 /usr/local/bin/oc-docx /usr/local/bin/oc-minimax /usr/local/bin/oc-web-context /usr/local/bin/oc-web /usr/local/bin/oc-browser /usr/local/bin/oc-market /usr/local/bin/oc-lit /usr/local/bin/oc-cite /usr/local/bin/oc-ingest /usr/local/bin/oc-litrag /usr/local/bin/oc-report /usr/local/bin/oc-slides /usr/local/bin/oc-poster /usr/local/bin/oc-rank /usr/local/bin/oc-xlsx /usr/local/bin/oc-pdf /usr/local/bin/oc-vision /usr/local/bin/oc-memory /usr/local/lib/openclaude/create-docgen-reference.py; \
+    chmod 0755 /usr/local/bin/oc-docx /usr/local/bin/oc-minimax /usr/local/bin/oc-web-context /usr/local/bin/oc-web /usr/local/bin/oc-browser /usr/local/bin/oc-market /usr/local/bin/oc-lit /usr/local/bin/oc-cite /usr/local/bin/oc-ingest /usr/local/bin/oc-litrag /usr/local/bin/oc-report /usr/local/bin/oc-slides /usr/local/bin/oc-poster /usr/local/bin/oc-rank /usr/local/bin/oc-xlsx /usr/local/bin/oc-pdf /usr/local/bin/oc-vision /usr/local/bin/oc-figcheck /usr/local/bin/oc-diagram /usr/local/bin/oc-memory /usr/local/lib/openclaude/create-docgen-reference.py; \
     ln -sf /usr/local/bin/oc-minimax /usr/local/bin/mmx; \
     python3 /usr/local/lib/openclaude/create-docgen-reference.py /usr/local/share/openclaude-docgen/reference.docx; \
     printf '%s\n' '# DOCX smoke' 'Inline $a^2+b^2=c^2$.' '' '$$' 'E = mc^2' '$$' > /tmp/oc-docx-smoke.md; \

@@ -176,24 +176,39 @@ function safeRealpath(p: string): string {
   return realpathSync(p)
 }
 
-function assertInsideUploads(realPath: string): void {
-  let uploadsReal: string
-  try {
-    uploadsReal = safeRealpath(paths.uploadsDir)
-  } catch {
-    throw new Error('uploads directory is not available')
+// Vision 可读图片的可信根:agent 自己的媒体/产物区 —— uploads(用户上传)、
+// generated(MCP 产出媒体)、research(oc-report / scientific-figures / oc-figcheck
+// 出的图)。刻意**不含** credentials/agents 等敏感目录:vision 后端在 master 侧持
+// 平台凭证,只允许 agent 产物图进入该通道(SSRF / 越权读取的兜底)。原先仅 uploads
+// 一根,导致 agent 无法让 vision 回看自己刚生成的科研图(oc-figcheck 闭环的前提);
+// 这里泛化为多根,单一权威=paths,不在多处硬编码目录字符串。realpath 后再比对,
+// 防 uploads 内 symlink 逃逸到根外。
+const VISION_IMAGE_ROOTS: readonly string[] = [
+  paths.uploadsDir,
+  paths.generatedDir,
+  paths.researchDir,
+]
+
+function assertInsideVisionRoots(realPath: string): void {
+  for (const rootDir of VISION_IMAGE_ROOTS) {
+    let rootReal: string
+    try {
+      rootReal = safeRealpath(rootDir)
+    } catch {
+      // 该根尚未在磁盘创建(如从未产出 research 图)→ 跳过,不作为匹配项
+      continue
+    }
+    const root = rootReal.endsWith('/') ? rootReal : `${rootReal}/`
+    if (realPath === rootReal || realPath.startsWith(root)) return
   }
-  const root = uploadsReal.endsWith('/') ? uploadsReal : `${uploadsReal}/`
-  if (realPath !== uploadsReal && !realPath.startsWith(root)) {
-    throw new Error(
-      'image_file must point to an uploaded image under the OpenClaude uploads directory',
-    )
-  }
+  throw new Error(
+    'image_file must point to an image under the OpenClaude uploads, generated, or research directory',
+  )
 }
 
 function assertAllowedImageFile(imagePath: string, maxBytes: number): string {
   const real = safeRealpath(imagePath)
-  assertInsideUploads(real)
+  assertInsideVisionRoots(real)
   const st = statSync(real)
   if (!st.isFile()) throw new Error('image_file is not a regular file')
   if (st.size <= 0) throw new Error('image_file is empty')
