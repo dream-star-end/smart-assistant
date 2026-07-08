@@ -97,8 +97,18 @@ describe("oc-web 抽取卡(researchToolCard)", () => {
     expect(screen.getByText("已截断")).toBeInTheDocument();
   });
 
-  test("空输出 / 出错 → null(回落通用 Bash)", () => {
-    expect(researchToolCard("oc-web extract https://x.com", tool({ output: undefined }))).toBeNull();
-    expect(researchToolCard("oc-web extract https://x.com", tool({ output: "x", error: true }))).toBeNull();
+  test("空输出 / 出错 → 通用卡兜底(不回落裸终端泄漏 $ command)", () => {
+    // 兜底反转:oc-* 命令一律给干净卡(专属卡判空/出错 → GenericOcCard),绝不外露原始命令。
+    const empty = researchToolCard("oc-web extract https://x.com", tool({ output: undefined }));
+    expect(empty).not.toBeNull();
+    const { container } = render(<div>{empty}</div>);
+    expect(screen.getByText("网页/文档提取")).toBeInTheDocument();
+    expect(screen.getByText("已完成")).toBeInTheDocument();
+    expect(container.textContent).not.toContain("oc-web extract");
+    cleanup();
+    const errored = researchToolCard("oc-web extract https://x.com", tool({ output: "x", error: true }));
+    expect(errored).not.toBeNull();
+    render(<div>{errored}</div>);
+    expect(screen.getByText("执行失败")).toBeInTheDocument();
   });
 });

@@ -84,12 +84,17 @@ const CODEX_TYPE_META: Record<string, ToolMeta> = {
   userMessage: { icon: Bot, label: "Codex 消息", tone: "neutral" },
 };
 
-// ── 容器内 oc-* CLI(经 Bash 调用)→ 语义卡 ──
+// ── 容器内 oc-* CLI(经 Bash 调用)→ 语义卡:单一权威表 ──
+//
 // oc-web/oc-lit/… 是通过 `Bash` 执行的命令行(`oc-web extract <url>`),工具名恒为
-// "Bash",若不特判就全渲染成通用"终端"卡。这里按命令里的 oc-* 程序名给专属图标/标签,
-// 一次覆盖整类(会话 webmr1zp65b2x07pe 的 oc-web 抓取即因此没有专属卡)。
-const OC_CLI_META: Record<string, ToolMeta> = {
+// "Bash";若不特判就全渲染成通用"终端"卡并把原始命令外露。OC_TOOLS 是所有 oc-* CLI 的
+// **唯一权威定义源**:header 图标/标签/底色(resolveToolMeta)与 body 专属卡分派
+// (researchCards.OC_BODY_CARDS,以 OcCli 为键做编译期约束)都从这里派生 —— 加新 oc-*
+// 工具只需在此登记一处,header 立即生效、body 至少落通用 GenericOcCard(不会再出现
+// "加了 header 忘了 body"导致泄漏原始命令的半更新,即历史提交 a1707d54 的那类漂移)。
+export const OC_TOOLS = {
   "oc-web": { icon: Globe, label: "网页/文档提取", tone: "info" },
+  "oc-web-context": { icon: FileText, label: "网页/文档解析", tone: "info" },
   "oc-browser": { icon: AppWindow, label: "浏览器", tone: "info" },
   "oc-lit": { icon: Search, label: "文献检索", tone: "info" },
   "oc-cite": { icon: FileText, label: "引用铸造", tone: "info" },
@@ -103,40 +108,35 @@ const OC_CLI_META: Record<string, ToolMeta> = {
   "oc-docx": { icon: FileText, label: "Word 生成", tone: "success" },
   "oc-slides": { icon: AppWindow, label: "幻灯片生成", tone: "success" },
   "oc-poster": { icon: ImageIcon, label: "海报生成", tone: "success" },
-  "oc-minimax": { icon: Sparkles, label: "媒体生成", tone: "accent" },
-  // 识图/记忆从 MCP 工具迁到 CLI(2026-07-07)后经 Bash 调用,补专属卡沿用旧语义
+  // 识图/记忆从 MCP 工具迁到 CLI(2026-07-07)后经 Bash 调用,专属卡沿用旧语义
   //(understand_image → "图片理解"眼睛;memory/archival/session_search → "记忆")。
   "oc-vision": { icon: Eye, label: "图片理解", tone: "info" },
   "oc-memory": { icon: Brain, label: "记忆", tone: "accent" },
-};
+  "oc-minimax": { icon: Sparkles, label: "媒体生成", tone: "accent" },
+  // mmx = oc-minimax 的软链(Dockerfile `ln -sf oc-minimax mmx`);同图标/标签/卡。
+  mmx: { icon: Sparkles, label: "媒体生成", tone: "accent" },
+} satisfies Record<string, ToolMeta>;
 
-// oc-* 程序名只在【命令位置】才算调用:行首(可有前导空白),或 shell 分隔符
-// (`\n ; & | (`,涵盖 && / ||)之后。这样 `echo oc-web`、`printf oc-web` 这类把
-// oc-web 当参数/文本的命令不会误判成 CLI 调用;lookahead 保证 `oc-lit` 不吞 `oc-litrag`。
+/** oc-* CLI 名的联合类型(= OC_TOOLS 的键)。body 卡注册表以它为键,保证不会给未登记的
+ *  CLI 注册卡片 —— 单一权威的编译期约束。 */
+export type OcCli = keyof typeof OC_TOOLS;
+
+// oc-* 程序名只在【命令位置】才算调用:行首(可有前导空白)、shell 分隔符
+// (`\n ; & | (`,涵盖 && / ||)之后,允许前导环境变量赋值(`FOO=1 oc-lit`)与绝对/相对
+// 路径前缀(`/usr/local/bin/oc-lit`)。这样 `echo oc-web`、`cat oc-web.sh` 这类把 oc-web
+// 当参数/文本的命令不会误判成 CLI 调用;lookahead 保证 `oc-lit` 不吞 `oc-litrag`。
+// 这是 oc-* 检测的**唯一权威**(旧 researchCards.matchOcTool 已退役,消除双检测漂移:
+// 原 matchOcTool 认 env 前缀/路径但漏 `cd && oc-cite`,detectOcCli 认分隔符但漏 env/路径 ——
+// 合并两者的覆盖到一处)。
 const OC_CLI_RE = new RegExp(
-  `(?:^\\s*|[\\n;&|(]\\s*)(${Object.keys(OC_CLI_META).join("|")})(?=\\s|$)`,
+  `(?:^\\s*|[\\n;&|(]\\s*)(?:\\w+=\\S*\\s+)*(?:\\S*/)?(${Object.keys(OC_TOOLS).join("|")})(?=\\s|$)`,
 );
-
-/** 定位命令里首个命令位置的 oc-* CLI(返回名 + token 末尾偏移,无则 null)。 */
-function matchOcCli(command: string): { cli: string; end: number } | null {
-  const m = OC_CLI_RE.exec(command);
-  if (!m) return null;
-  // m.index + m[0].length 落在 CLI token 末尾(lookahead 零宽);用它切摘要,
-  // 避免 `which oc-web ... && oc-web --help` 里 indexOf 命中预检那处 oc-web。
-  return { cli: m[1], end: m.index + m[0].length };
-}
 
 /** 从一条 Bash 命令里识别命令位置调用的 oc-* CLI 名(无则 null)。 */
 export function detectOcCli(command: string | undefined | null): string | null {
   if (!command) return null;
-  return matchOcCli(command)?.cli ?? null;
-}
-
-/** oc-* 命令的紧凑摘要:CLI token 之后到首个 shell 操作符/重定向前的部分(子命令 + 首参)。 */
-function ocCliSummary(command: string, end: number): string {
-  const tail = command.slice(end).trim();
-  // 去掉从首个管道/重定向/连接符起的尾巴(`2>/dev/null | head` 等)。
-  return tail.replace(/\s+(?:\d*[<>]|\||&&|;).*$/, "").trim().slice(0, 70);
+  const m = OC_CLI_RE.exec(command);
+  return m ? (m[1] ?? null) : null;
 }
 
 // ── MCP server 前缀 → 友好 meta（图标 + 基础标签 + tone）──
@@ -255,7 +255,10 @@ export function resolveToolMeta(
     const command = asStr(input.command);
     if (detectShellFileWrites(command)) return TOOL_META.Write;
     const cli = detectOcCli(command);
-    if (cli && OC_CLI_META[cli]) return OC_CLI_META[cli];
+    if (cli) {
+      const ocMeta = OC_TOOLS[cli as OcCli];
+      if (ocMeta) return ocMeta;
+    }
   }
   if (TOOL_META[name]) return TOOL_META[name];
   const codexType = parseCodexTypeName(name);
@@ -295,8 +298,9 @@ export function toolSummary(name: string, input: Record<string, unknown> | null)
         const first = shortPath(fileWrite.paths[0]);
         return fileWrite.paths.length > 1 ? `${first} +${fileWrite.paths.length - 1}` : first;
       }
-      const oc = matchOcCli(cmd);
-      if (oc) return ocCliSummary(cmd, oc.end);
+      // oc-* CLI:语义已在 header 标签(OC_TOOLS),摘要留空——不外露子命令/路径/参数等
+      // 原始命令内容(boss:卡片内不显示原始命令执行内容)。
+      if (detectOcCli(cmd)) return "";
       return (asStr(input.description) || cmd.split("\n")[0]).slice(0, 60);
     }
     case "Edit":

@@ -9,28 +9,41 @@
  */
 import {
   AlertTriangle,
+  AppWindow,
+  Archive,
   BookOpen,
+  Camera,
   CheckCircle2,
   ChevronDown,
   ChevronRight,
+  Clock,
   Database,
   ExternalLink,
+  Eye,
   FileSpreadsheet,
   FileText,
   FileOutput,
   Globe,
+  Image as ImageIcon,
+  Keyboard,
+  Mic,
+  MousePointer2,
+  Music,
   Package,
   Quote,
   Search,
   Trophy,
+  Video,
   XCircle,
 } from "lucide-react";
 import { type ReactNode, useEffect, useState } from "react";
 import type { EvidenceManifest } from "@openclaude/protocol/research";
 import { cn } from "../../lib/utils";
-import { SignedFileCard, useSignedSrc } from "../chat/media";
+import { SignedAudio, SignedFileCard, SignedImg, SignedVideo, useSignedSrc } from "../chat/media";
 import { ClaimList, CoverageBadge, GatesRow, LiteratureLibraryPanel } from "../chat/researchEvidence";
-import { asArr, asStr, isSafeHttpUrl, type ToolLike } from "./format";
+import { asArr, asStr, detectShellFileWrites, isSafeHttpUrl, type ToolLike } from "./format";
+import { MemoryStatusCard, renderMemoryReadCards } from "./memoryReminderCards";
+import { detectOcCli, OC_TOOLS, type OcCli } from "./meta";
 
 // ── 解析助手 ────────────────────────────────────────────────────────────────
 
@@ -137,20 +150,6 @@ function parseToolData(text: string | null): { data: Record<string, unknown>; pa
   const rec = recoverArrayPrefix(text ?? "");
   if (rec) return { data: { [rec.key]: rec.items }, partial: true };
   return null;
-}
-
-/**
- * 命令的"可执行名"是否就是某个 oc-* 工具(而非只是命令里提到它)。
- * 命中 `oc-lit ...`、`FOO=bar oc-lit ...`、`/usr/local/bin/oc-lit ...`;
- * 不命中 `echo oc-lit`、`cat oc-lit.sh`(首词是 echo/cat)。
- */
-function matchOcTool(command: string, tool: string): boolean {
-  let c = command.trim();
-  // 去掉前导 env 赋值(VAR=val ...)。
-  while (/^\w+=\S*\s+/.test(c)) c = c.replace(/^\w+=\S*\s+/, "");
-  const first = c.split(/\s+/)[0] ?? "";
-  const base = first.split("/").pop() ?? first;
-  return base === tool;
 }
 
 // ── 共用 UI 原语(与 bodies.tsx 同审美) ──────────────────────────────────────
@@ -920,20 +919,329 @@ function OcWebExtractCard({ tool }: { tool: ToolLike }): ReactNode | null {
   );
 }
 
-// ── 注册表 + 分派入口 ────────────────────────────────────────────────────────
+// ── oc-* 通用工具原语 + 4 个新专属卡(oc-vision / oc-memory / oc-minimax / oc-browser)──
+// 复用 CardShell + tone + lucide + 媒体签名组件,不发明新视觉语言;一律**不渲染原始
+// `$ command` / stdout dump / 参数 dump**,只呈现语义结果(boss 硬需求)。
 
-interface CardEntry {
-  /** 命令命中判定(可执行名 == 工具名)。 */
-  match: (command: string) => boolean;
-  /**
-   * 渲染。**直接调用卡片函数**(而非 `<Card/>` JSX 实例化),使卡片返回的 null 能正确透传:
-   * 否则 `<Card/>` 元素恒为真值,即便卡片渲染 null,BashBody 也会 early-return 空卡、不回落通用。
-   */
-  render: (command: string, tool: ToolLike) => ReactNode | null;
+/** 从命令行解析某个 flag 的值(`--flag "v"` / `--flag=v` / `--flag v` / 短横 `-p v`);无则 ""。
+ *  只取值,绝不回显整条命令。多个候选名按序尝试(如 prompt / p / text)。 */
+function parseCommandFlag(command: string, ...flags: string[]): string {
+  for (const f of flags) {
+    const dashed = f.length === 1 ? `-${f}` : `--${f}`;
+    const re = new RegExp(`(?:^|\\s)${dashed}(?:=|\\s+)(?:"([^"]*)"|'([^']*)'|(\\S+))`);
+    const m = re.exec(command);
+    if (m) return m[1] ?? m[2] ?? m[3] ?? "";
+  }
+  return "";
 }
 
-/** 解析对象型输出,交给对象卡片函数(解析失败/卡片判空 → null 回落)。
- *  渐进披露:输出被截断时仍恢复已加载的完整条目,partial=true 让卡片提示"部分加载"。 */
+/** 命令里首个带引号的参数(≥2 字符),用于 mmx image 的位置型 prompt 兜底。 */
+function firstQuotedArg(command: string): string {
+  const m = /["']([^"']{2,})["']/.exec(command);
+  return m ? m[1] : "";
+}
+
+/** 防御:即便工具输出里混入了 `$ command` 回显行,也剥掉首行——卡片内绝不暴露命令本身。 */
+function stripCommandEcho(text: string): string {
+  return text.replace(/^\s*\$ .*(?:\r?\n|$)/, "").replace(/^\s+/, "");
+}
+
+/** 折叠的"详细输出/错误详情"(默认收起;展开也只显示 stdout 正文,已剥离命令回显)。 */
+function OutputDetails({ text, label }: { text: string | null; label: string }) {
+  const clean = text ? stripCommandEcho(text).trim() : "";
+  if (!clean) return null;
+  return (
+    <details className="mt-2">
+      <summary className="cursor-pointer text-[11.5px] text-accent hover:underline">{label}</summary>
+      <pre className="mt-1 max-h-64 overflow-auto whitespace-pre-wrap break-words rounded-md bg-code px-3 py-2 font-mono text-[11.5px] leading-relaxed text-fg">
+        {clean.slice(0, 4000)}
+      </pre>
+    </details>
+  );
+}
+
+/** 干净的语义结果正文(whitespace 保留、可换行),供识图/歌词/检索等纯文本 stdout 用。 */
+function ResultText({ text }: { text: string }) {
+  return (
+    <div className="whitespace-pre-wrap break-words text-[13px] leading-relaxed text-fg">{text.slice(0, 4000)}</div>
+  );
+}
+
+/** 提示/查询回显块(不是命令,是用户的问题/查询词)。 */
+function PromptChip({ text }: { text: string }) {
+  return <div className="rounded-md bg-hover px-3 py-2 text-[13px] leading-snug text-fg">{text}</div>;
+}
+
+/**
+ * 通用 oc-* 卡:任何 oc-* CLI 无专属卡 / 解析失败 / 出错时的**兜底**,保证永不回落裸终端块
+ * (不泄漏 `$ command`)。用该工具 OC_TOOLS 的图标/标签 + 干净状态行 + 可选折叠详细输出。
+ */
+function GenericOcCard({ cli, tool, error }: { cli: OcCli; tool: ToolLike; error?: boolean }) {
+  const meta = OC_TOOLS[cli];
+  const Icon = meta.icon;
+  const out = outputText(tool);
+  return (
+    <CardShell icon={<Icon className="size-4" />} title={meta.label}>
+      <div className={cn("text-xs", error ? "text-danger" : "text-success")}>{error ? "执行失败" : "已完成"}</div>
+      <OutputDetails text={out} label={error ? "错误详情" : "详细输出"} />
+    </CardShell>
+  );
+}
+
+/** 生成媒体预览:安全绝对/http 路径 → 缩略图/播放器;相对路径(签名不可用)→ 文件名提示。 */
+function MediaPreview({ path, kind }: { path: string; kind: "image" | "audio" | "video" }) {
+  const safe = safeArtifactSrc(path);
+  const name = path.split("/").pop() || path;
+  if (!safe) return <div className="mt-1 text-xs text-faint">已生成:{name}(可在文件区查看)</div>;
+  if (kind === "image")
+    return (
+      <div className="mt-2">
+        <SignedImg src={safe} alt={name} className="max-h-56 rounded-md border border-border" />
+      </div>
+    );
+  if (kind === "video")
+    return (
+      <div className="mt-2">
+        <SignedVideo src={safe} />
+      </div>
+    );
+  return (
+    <div className="mt-2">
+      <SignedAudio src={safe} />
+    </div>
+  );
+}
+
+// ── oc-vision(图片理解)──────────────────────────────────────────────────────
+
+/** oc-vision understand <image> [--prompt "问题"] → 缩略图 + 问题 + 识图结论(纯文本 stdout)。 */
+function VisionCliCard({ command, tool }: { command: string; tool: ToolLike }): ReactNode | null {
+  const prompt = parseCommandFlag(command, "prompt");
+  const result = outputText(tool);
+  // understand 之后的首个位置参数 = 被识别的图片路径。
+  const imgMatch = /understand\s+(?:"([^"]+)"|'([^']+)'|([^\s"'-][^\s]*))/.exec(command);
+  const imagePath = imgMatch ? (imgMatch[1] ?? imgMatch[2] ?? imgMatch[3] ?? "") : "";
+  const safeImg = imagePath ? safeArtifactSrc(imagePath) : null;
+  if (!prompt && !result && !safeImg) return null;
+  return (
+    <CardShell icon={<Eye className="size-4" />} title="图片理解">
+      {safeImg && (
+        <div className="mb-2">
+          <SignedImg src={safeImg} alt="识别的图片" className="max-h-40 rounded-md border border-border" />
+        </div>
+      )}
+      {prompt && <PromptChip text={prompt} />}
+      {result && (
+        <div className="mt-2">
+          <ResultText text={result} />
+        </div>
+      )}
+    </CardShell>
+  );
+}
+
+// ── oc-memory(记忆读写/检索)──────────────────────────────────────────────────
+
+/** oc-memory 的子命令(memory / session-search / archival-*):取 CLI token 之后第一个词。 */
+function memorySubcommand(command: string): string {
+  const m = /oc-memory\s+([a-z-]+)/i.exec(command);
+  return m ? m[1].toLowerCase() : "";
+}
+
+/** 子命令后的首个位置参数(session-search / archival-search 的查询词、archival-delete 的 id)。 */
+function memoryPositional(command: string, sub: string): string {
+  const re = new RegExp(`${sub}\\s+(?:"([^"]+)"|'([^']+)'|([^\\s"'-][^\\s]*))`);
+  const m = re.exec(command);
+  return m ? (m[1] ?? m[2] ?? m[3] ?? "") : "";
+}
+
+const MEMORY_SEARCH_SPEC: Record<string, { icon: ReactNode; title: string }> = {
+  "session-search": { icon: <Search className="size-4" />, title: "历史检索" },
+  "archival-search": { icon: <Archive className="size-4" />, title: "归档检索" },
+  "archival-add": { icon: <Archive className="size-4" />, title: "归档写入" },
+  "archival-delete": { icon: <Archive className="size-4" />, title: "归档删除" },
+};
+
+/** oc-memory CLI → 复用记忆卡(read/写状态)或干净检索结果卡;不裸露命令。 */
+function MemoryCliCard({ command, tool }: { command: string; tool: ToolLike }): ReactNode | null {
+  const sub = memorySubcommand(command);
+  const output = tool.output ?? null;
+  const error = !!tool.error;
+  if (sub === "memory") {
+    const action = parseCommandFlag(command, "action") || "read";
+    const target = parseCommandFlag(command, "target") || "memory";
+    if (action === "read") return renderMemoryReadCards(output, target);
+    if (action === "add" || action === "replace" || action === "remove")
+      return <MemoryStatusCard action={action} target={target} output={output} error={error} />;
+    return null;
+  }
+  const spec = MEMORY_SEARCH_SPEC[sub];
+  if (!spec) return null;
+  const query = sub === "archival-delete" ? "" : memoryPositional(command, sub);
+  const clean = output ? stripCommandEcho(output).trim() : "";
+  if (!clean && !query) return null;
+  return (
+    <CardShell icon={spec.icon} title={spec.title}>
+      {query && (
+        <div className="mb-1.5">
+          <PromptChip text={query} />
+        </div>
+      )}
+      {clean && <ResultText text={clean} />}
+    </CardShell>
+  );
+}
+
+// ── oc-minimax / mmx(媒体生成:图/视频/音频/歌词)──────────────────────────────
+
+interface MinimaxParsed {
+  paths: string[];
+  taskId: string | null;
+  text: string | null;
+}
+
+/** mmx 输出:媒体文件路径逐行 + 可选 `billing:`/`task_id:`/`status:` 行;lyrics 无 --out 时是歌词正文。 */
+function parseMinimaxOutput(raw: string | null): MinimaxParsed {
+  if (!raw) return { paths: [], taskId: null, text: null };
+  const paths: string[] = [];
+  let taskId: string | null = null;
+  const rest: string[] = [];
+  for (const line of raw.split(/\r?\n/)) {
+    const t = line.trim();
+    if (!t) continue;
+    if (/^billing:/i.test(t) || /^status:/i.test(t)) continue;
+    const tm = /^task_id:\s*(.+)$/i.exec(t);
+    if (tm) {
+      taskId = tm[1].trim();
+      continue;
+    }
+    if (/\.(png|jpe?g|webp|gif|mp3|wav|m4a|flac|mp4|mov|webm)$/i.test(t)) {
+      paths.push(t);
+      continue;
+    }
+    rest.push(t);
+  }
+  return { paths, taskId, text: rest.length ? rest.join("\n") : null };
+}
+
+const MINIMAX_KINDS: Record<
+  string,
+  { icon: ReactNode; title: string; media: "image" | "audio" | "video" | "text" }
+> = {
+  image: { icon: <ImageIcon className="size-4" />, title: "图片生成", media: "image" },
+  speech: { icon: <Mic className="size-4" />, title: "语音合成", media: "audio" },
+  music: { icon: <Music className="size-4" />, title: "音乐生成", media: "audio" },
+  lyrics: { icon: <FileText className="size-4" />, title: "歌词生成", media: "text" },
+  video: { icon: <Video className="size-4" />, title: "视频生成", media: "video" },
+};
+
+/** mmx / oc-minimax 子命令(image/speech/music/lyrics/video)。 */
+function minimaxSubcommand(command: string): string {
+  const m = /(?:oc-minimax|mmx)\s+([a-z]+)/i.exec(command);
+  const sub = m ? m[1].toLowerCase() : "";
+  return sub === "lyric" ? "lyrics" : sub;
+}
+
+function MinimaxCliCard({ command, tool }: { command: string; tool: ToolLike }): ReactNode | null {
+  const spec = MINIMAX_KINDS[minimaxSubcommand(command)];
+  if (!spec) return null;
+  const prompt = parseCommandFlag(command, "prompt", "p", "text", "lyrics") || firstQuotedArg(command);
+  const { paths, taskId, text } = parseMinimaxOutput(outputText(tool));
+  if (spec.media === "text") {
+    if (!text && !prompt) return null;
+    return (
+      <CardShell icon={spec.icon} title={spec.title}>
+        {prompt && (
+          <div className="mb-1.5">
+            <PromptChip text={prompt} />
+          </div>
+        )}
+        {text && <ResultText text={text} />}
+      </CardShell>
+    );
+  }
+  // text 已在上面早返回,余下必为可预览媒体(narrowing 在 .map 闭包内会丢失,显式收窄)。
+  const media = spec.media as "image" | "audio" | "video";
+  return (
+    <CardShell icon={spec.icon} title={spec.title}>
+      {prompt && (
+        <div className="mb-1">
+          <PromptChip text={prompt} />
+        </div>
+      )}
+      {paths.map((p) => (
+        <MediaPreview key={p} path={p} kind={media} />
+      ))}
+      {paths.length === 0 && taskId && (
+        <div className="mt-1 text-xs text-faint">生成任务已提交(任务号 {taskId}),完成后可在文件区查看。</div>
+      )}
+      {paths.length === 0 && !taskId && <div className="mt-1 text-xs text-success">已完成</div>}
+    </CardShell>
+  );
+}
+
+// ── oc-browser(浏览器操作)──────────────────────────────────────────────────────
+
+const BROWSER_ACTIONS: Record<string, { icon: ReactNode; title: string }> = {
+  navigate: { icon: <Globe className="size-4" />, title: "打开网页" },
+  snapshot: { icon: <AppWindow className="size-4" />, title: "页面快照" },
+  click: { icon: <MousePointer2 className="size-4" />, title: "点击" },
+  type: { icon: <Keyboard className="size-4" />, title: "输入文本" },
+  "press-key": { icon: <Keyboard className="size-4" />, title: "按键" },
+  screenshot: { icon: <Camera className="size-4" />, title: "截图" },
+  "wait-for": { icon: <Clock className="size-4" />, title: "等待" },
+};
+
+function browserSubcommand(command: string): string {
+  const m = /oc-browser\s+([a-z-]+)/i.exec(command);
+  return m ? m[1].toLowerCase() : "";
+}
+
+/** 从文本里找容器绝对图片路径(截图落盘路径),用于截图预览。 */
+function findImagePath(text: string | null): string | null {
+  if (!text) return null;
+  const m = /\/[^\s"'<>]+\.(?:png|jpe?g|webp)/i.exec(text);
+  return m ? m[0] : null;
+}
+
+/** oc-browser <verb> → 动作 + URL/元素/文本 + 结果状态;截图有产物则显示缩略图。隐藏原始 stdout。 */
+function BrowserCliCard({ command, tool }: { command: string; tool: ToolLike }): ReactNode | null {
+  const sub = browserSubcommand(command);
+  const spec = BROWSER_ACTIONS[sub];
+  if (!spec) return null;
+  const error = !!tool.error;
+  const url = parseCommandFlag(command, "url");
+  const element = parseCommandFlag(command, "element");
+  const text = parseCommandFlag(command, "text");
+  const key = parseCommandFlag(command, "key");
+  const out = outputText(tool);
+  const shot = sub === "screenshot" ? safeArtifactSrc(parseCommandFlag(command, "path")) || findImagePath(out) : null;
+  const domain = url ? domainOf(url) : undefined;
+  return (
+    <CardShell icon={spec.icon} title={spec.title}>
+      <div className={cn("text-xs", error ? "text-danger" : "text-success")}>{error ? "失败" : "已完成"}</div>
+      {url && (
+        <div className="mt-1.5">
+          <Chip href={url}>{domain ?? url}</Chip>
+        </div>
+      )}
+      {element && <div className="mt-1.5 text-[13px] leading-snug text-fg">{element}</div>}
+      {text && <div className="mt-1 text-[13px] leading-snug text-fg">输入:{text}</div>}
+      {key && <div className="mt-1 text-[13px] leading-snug text-fg">按键:{key}</div>}
+      {shot && (
+        <div className="mt-2">
+          <SignedImg src={shot} alt="页面截图" className="max-h-56 rounded-md border border-border" />
+        </div>
+      )}
+      {sub === "snapshot" && <OutputDetails text={out} label="查看页面快照" />}
+    </CardShell>
+  );
+}
+
+// ── 注册表 + 分派入口(单一权威:键 = OcCli,与 meta.OC_TOOLS 对齐)──────────────
+
+/** 解析对象型输出,交给对象卡片函数(解析失败/卡片判空 → null,由 researchToolCard 兜底为
+ *  GenericOcCard 而非回落裸终端)。渐进披露:输出截断时仍恢复已加载的完整条目。 */
 function obj(
   tool: ToolLike,
   card: (p: { data: Record<string, unknown>; partial: boolean }) => ReactNode | null,
@@ -942,65 +1250,76 @@ function obj(
   return parsed ? card({ data: parsed.data, partial: parsed.partial }) : null;
 }
 
-const TOOL_CARD_REGISTRY: CardEntry[] = [
+/**
+ * oc-* CLI → body 专属卡的分派表。**键受 OcCli 约束**(= meta.OC_TOOLS 的键):不可能给
+ * 未登记的 CLI 注册卡片,从类型层面消除"header 加了 body 忘了"的双注册表漂移。未登记 body
+ * 的 oc-*(如 oc-web-context)或本卡返回 null → researchToolCard 兜底 GenericOcCard,绝不泄漏命令。
+ */
+const OC_BODY_CARDS: Partial<Record<OcCli, (command: string, tool: ToolLike) => ReactNode | null>> = {
   // 研究工具(对象型 JSON 输出)。
-  { match: (c) => matchOcTool(c, "oc-lit"), render: (_c, t) => obj(t, LiteratureCard) },
-  { match: (c) => matchOcTool(c, "oc-cite"), render: (_c, t) => obj(t, CitationCard) },
-  { match: (c) => matchOcTool(c, "oc-ingest"), render: (_c, t) => obj(t, IngestCard) },
-  { match: (c) => matchOcTool(c, "oc-litrag"), render: (_c, t) => obj(t, LitragCard) },
-  { match: (c) => matchOcTool(c, "oc-report"), render: (_c, t) => obj(t, ArtifactCard) },
-  { match: (c) => matchOcTool(c, "oc-slides"), render: (_c, t) => obj(t, ArtifactCard) },
-  { match: (c) => matchOcTool(c, "oc-poster"), render: (_c, t) => obj(t, ArtifactCard) },
-  { match: (c) => matchOcTool(c, "oc-rank"), render: (_c, t) => obj(t, RankCard) },
+  "oc-lit": (_c, t) => obj(t, LiteratureCard),
+  "oc-cite": (_c, t) => obj(t, CitationCard),
+  "oc-ingest": (_c, t) => obj(t, IngestCard),
+  "oc-litrag": (_c, t) => obj(t, LitragCard),
+  "oc-report": (_c, t) => obj(t, ArtifactCard),
+  "oc-slides": (_c, t) => obj(t, ArtifactCard),
+  "oc-poster": (_c, t) => obj(t, ArtifactCard),
+  "oc-rank": (_c, t) => obj(t, RankCard),
   // 办公文档 CLI(输出是 pandoc/Quarto/Typst 日志而非 JSON,从命令行解析输出路径)。
-  {
-    match: (c) => matchOcTool(c, "oc-docx"),
-    render: (c) =>
-      OfficeArtifactCard({
-        command: c,
-        ext: "docx",
-        title: "Word 文档已生成",
-        icon: <FileText className="size-4" />,
-        note: "可在文件区下载;数学公式/排版已按高质量 Word 模板渲染。",
-      }),
-  },
-  {
-    match: (c) => matchOcTool(c, "oc-pdf"),
-    render: (c) =>
-      OfficeArtifactCard({
-        command: c,
-        ext: "pdf",
-        title: "PDF 文档已生成",
-        icon: <FileText className="size-4" />,
-        note: "可在文件区下载;已按 Quarto/Typst 模板高质量排版。",
-      }),
-  },
-  {
-    match: (c) => matchOcTool(c, "oc-xlsx"),
-    render: (c) =>
-      OfficeArtifactCard({
-        command: c,
-        ext: "xlsx",
-        title: "Excel 表格已生成",
-        icon: <FileSpreadsheet className="size-4" />,
-        note: "可在文件区下载;数据/图表已按模板写入工作簿。",
-      }),
-  },
+  "oc-docx": (c) =>
+    OfficeArtifactCard({
+      command: c,
+      ext: "docx",
+      title: "Word 文档已生成",
+      icon: <FileText className="size-4" />,
+      note: "可在文件区下载;数学公式/排版已按高质量 Word 模板渲染。",
+    }),
+  "oc-pdf": (c) =>
+    OfficeArtifactCard({
+      command: c,
+      ext: "pdf",
+      title: "PDF 文档已生成",
+      icon: <FileText className="size-4" />,
+      note: "可在文件区下载;已按 Quarto/Typst 模板高质量排版。",
+    }),
+  "oc-xlsx": (c) =>
+    OfficeArtifactCard({
+      command: c,
+      ext: "xlsx",
+      title: "Excel 表格已生成",
+      icon: <FileSpreadsheet className="size-4" />,
+      note: "可在文件区下载;数据/图表已按模板写入工作簿。",
+    }),
   // 网页/文档提取(输出是抽取的 markdown 正文,非 JSON)。
-  { match: (c) => matchOcTool(c, "oc-web"), render: (_c, t) => OcWebExtractCard({ tool: t }) },
-  // 其它通用工具。
-  { match: (c) => matchOcTool(c, "oc-market"), render: (_c, t) => MarketCard({ tool: t }) },
-];
+  "oc-web": (_c, t) => OcWebExtractCard({ tool: t }),
+  // 技能市场。
+  "oc-market": (_c, t) => MarketCard({ tool: t }),
+  // 本批新增的 4 个专属卡。
+  "oc-vision": (c, t) => VisionCliCard({ command: c, tool: t }),
+  "oc-memory": (c, t) => MemoryCliCard({ command: c, tool: t }),
+  "oc-minimax": (c, t) => MinimaxCliCard({ command: c, tool: t }),
+  mmx: (c, t) => MinimaxCliCard({ command: c, tool: t }),
+  "oc-browser": (c, t) => BrowserCliCard({ command: c, tool: t }),
+};
 
 /**
- * 若 Bash 命令是某个 oc-* 工具 → 返回其专门卡片;不认/出错/输出不可解析 → null(回落通用 BashBody)。
- * 由 BashBody 在渲染通用终端块前调用。
+ * Bash 命令若调用 oc-* CLI → 返回**保证非 null** 的专属/通用卡(绝不回落裸终端块泄漏
+ * `$ command`);非 oc-* → null(调用方回落通用 BashBody 终端块)。检测走 meta.detectOcCli(唯一权威)。
+ *
+ * 三条历史泄漏路径一次覆盖:①未注册 body → GenericOcCard;②有 body 但解析失败(返回 null)
+ * → GenericOcCard;③出错(tool.error)→ danger 版 GenericOcCard(折叠错误详情,不裸露命令)。
+ *
+ * 例外:纯 heredoc 写文件(`cat > f <<EOF ... oc-web ... EOF`)里 oc-* 是被写入的文件内容而非
+ * 被执行的命令 —— 返回 null 交回 BashBody 的写文件卡(与 resolveToolMeta 同一判定,避免不一致)。
  */
 export function researchToolCard(command: string, tool: ToolLike): ReactNode | null {
   if (!command) return null;
-  const entry = TOOL_CARD_REGISTRY.find((e) => e.match(command));
-  if (!entry) return null;
-  // 出错的调用回落通用(让用户看到错误输出)。
-  if (tool.error) return null;
-  return entry.render(command, tool);
+  const cli = detectOcCli(command);
+  if (!cli) return null;
+  if (detectShellFileWrites(command)) return null;
+  const key = cli as OcCli;
+  if (tool.error) return <GenericOcCard cli={key} tool={tool} error />;
+  const body = OC_BODY_CARDS[key];
+  const card = body ? body(command, tool) : null;
+  return card ?? <GenericOcCard cli={key} tool={tool} />;
 }

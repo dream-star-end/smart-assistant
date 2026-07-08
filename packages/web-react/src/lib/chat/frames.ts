@@ -119,6 +119,10 @@ export type ColdStartWire = { type: "sys.cold_start"; peer?: Peer };
  *  前端据此立即排空离线队列（冷启时 ws.onopen 早于 relay 就绪，期间消息排队等此信号）。*/
 export type RelayReadyWire = { type: "sys.relay_ready"; peer?: Peer };
 
+/** 前端版本握手：bridge 在 userWs accept 时下发（服务端权威=dist/index.html 的 oc-build meta）。
+ *  build=服务端当前 oc-build id 字符串；appUpdate governor 据此在安全点软刷新长驻旧 bundle。*/
+export type FrontendBuildWire = { type: "sys.frontend_build"; build?: string };
+
 /** server 已去重的 ack（drain 对账 + auto-continue 对账）。*/
 export type AckWire = {
   type: "outbound.ack";
@@ -168,6 +172,7 @@ export type OutboundWire =
   | CostWaivedWire
   | ColdStartWire
   | RelayReadyWire
+  | FrontendBuildWire
   | AckWire
   | PongWire
   | RepoStatusWire

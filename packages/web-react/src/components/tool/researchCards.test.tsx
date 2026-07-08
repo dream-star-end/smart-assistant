@@ -52,13 +52,28 @@ describe("researchToolCard 分派", () => {
     expect(researchToolCard("echo oc-lit", tool({ output: LIT_JSON }))).toBeNull();
   });
 
-  test("出错的调用 → null(让用户看到错误)", () => {
-    expect(researchToolCard('oc-lit search "x"', tool({ output: LIT_JSON, error: true }))).toBeNull();
+  test("出错的调用 → 通用失败卡(danger,折叠错误详情,绝不裸露 $ command)", () => {
+    const node = researchToolCard('oc-lit search "x"', tool({ output: "boom: quota exceeded", error: true }));
+    expect(node).not.toBeNull();
+    const { container } = render(<div>{node}</div>);
+    expect(screen.getByText("文献检索")).toBeInTheDocument();
+    expect(screen.getByText("执行失败")).toBeInTheDocument();
+    // 错误详情默认折叠;命令本身不出现在卡内。
+    expect(container.textContent).not.toContain("oc-lit search");
+    expect(container.textContent).not.toContain("$ ");
   });
 
-  test("输出非 JSON / 空 → null", () => {
-    expect(researchToolCard('oc-lit search "x"', tool({ output: "command not found" }))).toBeNull();
-    expect(researchToolCard('oc-lit search "x"', tool({ output: undefined }))).toBeNull();
+  test("输出非 JSON / 空 → 通用完成卡(不回落裸终端,不泄漏命令)", () => {
+    const n1 = researchToolCard('oc-lit search "x"', tool({ output: "command not found" }));
+    expect(n1).not.toBeNull();
+    const { container } = render(<div>{n1}</div>);
+    expect(screen.getByText("已完成")).toBeInTheDocument();
+    expect(container.textContent).not.toContain("oc-lit search");
+    cleanup();
+    const n2 = researchToolCard('oc-lit search "x"', tool({ output: undefined }));
+    expect(n2).not.toBeNull(); // 仍是通用卡(只有状态行,无详细输出)
+    render(<div>{n2}</div>);
+    expect(screen.getByText("已完成")).toBeInTheDocument();
   });
 
   test("前导日志 + 尾随 JSON 也能宽松解析", () => {
@@ -261,8 +276,13 @@ describe("其余 oc-* 卡片", () => {
     expect(screen.getByText("智能体")).toBeInTheDocument();
   });
 
-  test("oc-market install(非 list 输出)→ null 回落", () => {
-    expect(researchToolCard("oc-market install x", tool({ output: '{"ok":true}' }))).toBeNull();
+  test("oc-market install(非 list 输出)→ 通用完成卡(不泄漏命令)", () => {
+    const node = researchToolCard("oc-market install x", tool({ output: '{"ok":true}' }));
+    expect(node).not.toBeNull();
+    const { container } = render(<div>{node}</div>);
+    expect(screen.getByText("AI 市场")).toBeInTheDocument();
+    expect(screen.getByText("已完成")).toBeInTheDocument();
+    expect(container.textContent).not.toContain("oc-market install");
   });
 
   test("畸形数组([null]/基本类型项)不崩,被过滤", () => {
@@ -320,14 +340,156 @@ describe("渐进披露:截断输出仍渲染已加载条目", () => {
     expect(screen.getByText(/仅展示已加载的前 2 条/)).toBeInTheDocument();
   });
 
-  test("连第一条都没完整 → null 回落(让通用 Bash 显示原始)", () => {
+  test("连第一条都没完整 → 通用完成卡兜底(不回落裸终端泄漏命令)", () => {
     const truncated = '{"sources":[{"id":"s1","title":"only partial obj no close';
-    expect(researchToolCard('oc-lit search "x"', tool({ output: truncated }))).toBeNull();
+    const node = researchToolCard('oc-lit search "x"', tool({ output: truncated }));
+    expect(node).not.toBeNull();
+    render(<div>{node}</div>);
+    expect(screen.getByText("文献检索")).toBeInTheDocument();
+    expect(screen.getByText("已完成")).toBeInTheDocument();
   });
 
   test("未截断输出不显示部分加载提示", () => {
     render(<div>{researchToolCard('oc-lit search "x"', tool({ output: LIT_JSON }))}</div>);
     expect(screen.queryByText(/仅展示已加载的前/)).toBeNull();
     expect(screen.getByText("2 篇")).toBeInTheDocument();
+  });
+});
+
+describe("兜底反转:oc-* 绝不泄漏原始命令", () => {
+  test("未注册 body 的 oc-*(oc-web-context)→ 通用卡,不裸露命令", () => {
+    const node = researchToolCard("oc-web-context extract https://x.com", tool({ output: "some helper output" }));
+    expect(node).not.toBeNull();
+    const { container } = render(<div>{node}</div>);
+    expect(screen.getByText("网页/文档解析")).toBeInTheDocument();
+    expect(screen.getByText("已完成")).toBeInTheDocument();
+    expect(container.textContent).not.toContain("oc-web-context extract");
+  });
+
+  test("纯 heredoc 写文件里含 oc-* 内容 → null(交回 BashBody 写文件卡,不误判成 CLI)", () => {
+    const cmd = "cat > script.sh <<'EOF'\noc-web extract https://example.com\nEOF";
+    expect(researchToolCard(cmd, tool({ output: "" }))).toBeNull();
+  });
+
+  test("cd && oc-cite(分隔符后)也命中 → 非 null 卡", () => {
+    expect(researchToolCard("cd /tmp && oc-rank elo --matches m.json", tool({ output: '{"ranked":[]}' }))).not.toBeNull();
+  });
+});
+
+describe("4 个新专属卡", () => {
+  test("oc-vision → 图片理解卡(问题 + 识图结论,无 $ command)", () => {
+    const { container } = render(
+      <div>
+        {researchToolCard(
+          "oc-vision understand /home/agent/uploads/x.png --prompt '这是什么'",
+          tool({ output: "图中是一只橘猫,背景是沙发。" }),
+        )}
+      </div>,
+    );
+    expect(screen.getByText("图片理解")).toBeInTheDocument();
+    expect(screen.getByText("这是什么")).toBeInTheDocument();
+    expect(screen.getByText(/橘猫/)).toBeInTheDocument();
+    expect(container.textContent).not.toContain("oc-vision understand");
+  });
+
+  test("oc-memory memory read → 复用核心记忆卡", () => {
+    render(
+      <div>
+        {researchToolCard(
+          "oc-memory memory --action read --target memory",
+          tool({ output: "偏好:深色模式\n§\n项目:v5 Aurora" }),
+        )}
+      </div>,
+    );
+    expect(screen.getByText(/核心记忆/)).toBeInTheDocument();
+  });
+
+  test("oc-memory memory add → 记忆写入状态卡", () => {
+    render(
+      <div>
+        {researchToolCard(
+          "oc-memory memory --action add --target memory --content 'x'",
+          tool({ output: "已写入核心记忆。" }),
+        )}
+      </div>,
+    );
+    expect(screen.getByText(/已新增核心记忆/)).toBeInTheDocument();
+    expect(screen.getByText("完成")).toBeInTheDocument();
+  });
+
+  test("oc-memory session-search → 历史检索卡(查询 + 结果,不裸露命令)", () => {
+    const { container } = render(
+      <div>
+        {researchToolCard(
+          "oc-memory session-search '上次讨论的方案'",
+          tool({ output: "1. 2026-07-01 讨论了架构\n2. 2026-07-02 定了方案" }),
+        )}
+      </div>,
+    );
+    expect(screen.getByText("历史检索")).toBeInTheDocument();
+    expect(screen.getByText("上次讨论的方案")).toBeInTheDocument();
+    expect(container.textContent).not.toContain("oc-memory session-search");
+  });
+
+  test("oc-minimax image 绝对路径 → 图片生成卡 + 缩略图签名", async () => {
+    const sign = async (paths: string[]) =>
+      Object.fromEntries(paths.map((p) => [p, `/api/media?sig=x&path=${encodeURIComponent(p)}`]));
+    const { container } = render(
+      <MediaSignProvider sign={sign}>
+        {researchToolCard(
+          "mmx image generate '一只橘猫' -o /home/agent/out/cat.png",
+          tool({ output: "/home/agent/out/cat.png\nbilling: 12 credits-cents" }),
+        )}
+      </MediaSignProvider>,
+    );
+    expect(screen.getByText("图片生成")).toBeInTheDocument();
+    expect(screen.getByText("一只橘猫")).toBeInTheDocument();
+    await waitFor(() => expect(container.querySelector("img")).not.toBeNull());
+    // billing 行不外露。
+    expect(container.textContent).not.toContain("billing:");
+  });
+
+  test("oc-minimax video 未 wait → 任务号提示(无产物)", () => {
+    render(
+      <div>
+        {researchToolCard(
+          "mmx video generate -p '海浪'",
+          tool({ output: "task_id: abc123\nbilling: 30 credits-cents" }),
+        )}
+      </div>,
+    );
+    expect(screen.getByText("视频生成")).toBeInTheDocument();
+    expect(screen.getByText(/任务号 abc123/)).toBeInTheDocument();
+  });
+
+  test("oc-browser navigate → 打开网页卡(URL 链接 + 状态,无原始 stdout)", () => {
+    const { container } = render(
+      <div>
+        {researchToolCard(
+          "oc-browser navigate --url https://example.com",
+          tool({ output: "- Ran Playwright code\n- Page snapshot: huge a11y tree ..." }),
+        )}
+      </div>,
+    );
+    expect(screen.getByText("打开网页")).toBeInTheDocument();
+    expect(screen.getByText("已完成")).toBeInTheDocument();
+    expect(container.querySelector('a[href="https://example.com"]')).not.toBeNull();
+    // navigate 不展示原始 a11y dump。
+    expect(container.textContent).not.toContain("huge a11y tree");
+  });
+
+  test("oc-browser screenshot 绝对路径 → 截图缩略图", async () => {
+    const sign = async (paths: string[]) =>
+      Object.fromEntries(paths.map((p) => [p, `/api/media?sig=x&path=${encodeURIComponent(p)}`]));
+    const { container } = render(
+      <MediaSignProvider sign={sign}>
+        {researchToolCard(
+          "oc-browser screenshot --path /home/agent/shot.png",
+          tool({ output: "Saved screenshot" }),
+        )}
+      </MediaSignProvider>,
+    );
+    expect(screen.getByText("截图")).toBeInTheDocument();
+    await waitFor(() => expect(container.querySelector("img")).not.toBeNull());
   });
 });

@@ -120,6 +120,19 @@ describe("oc-* CLI 语义卡 (Bash 特判)", () => {
     expect(detectOcCli("oc-litrag ask 'q'")).toBe("oc-litrag");
     expect(detectOcCli("oc-lit search 'q'")).toBe("oc-lit");
   });
+  test("detectOcCli 认前导环境变量赋值与绝对/相对路径前缀(统一 matchOcTool 的覆盖)", () => {
+    expect(detectOcCli("FOO=1 oc-lit snowball 10.x")).toBe("oc-lit");
+    expect(detectOcCli("/usr/local/bin/oc-lit search x")).toBe("oc-lit");
+    expect(detectOcCli("FOO=1 /usr/bin/oc-cite verify doi:10.1/x")).toBe("oc-cite");
+    // env 前缀不误伤:cat 的路径参数不是命令位置。
+    expect(detectOcCli("cat /some/oc-web")).toBeNull();
+  });
+  test("detectOcCli 认 mmx 软链与 oc-web-context", () => {
+    expect(detectOcCli("mmx image generate 'a cat'")).toBe("mmx");
+    expect(detectOcCli("oc-web-context extract url")).toBe("oc-web-context");
+    // oc-web 不吞 oc-web-context(lookahead 保护)。
+    expect(detectOcCli("oc-web extract url")).toBe("oc-web");
+  });
   test("detectOcCli 只认命令位置,参数/文本里的 oc-web 不误报", () => {
     // 非命令位置(echo/printf 的参数)→ 不识别为 CLI 调用。
     expect(detectOcCli("echo oc-web")).toBeNull();
@@ -141,17 +154,16 @@ describe("oc-* CLI 语义卡 (Bash 特判)", () => {
     expect(resolveToolMeta("Bash", { command: "ls -la" }).label).toBe("终端");
     expect(resolveToolMeta("Bash").label).toBe("终端");
   });
-  test("toolSummary(Bash, oc-web) 取子命令+首参,去掉重定向/管道", () => {
+  test("toolSummary(Bash, oc-*) 留空:语义在 header 标签,不外露原始命令/路径/参数", () => {
+    // boss 硬需求:卡片内不显示原始命令执行内容 → header 摘要一律置空。
     expect(
       toolSummary("Bash", {
         command: 'oc-web extract "https://www.woshipm.com/x" --max-chars 8000 2>&1 | head -150',
       }),
-    ).toBe('extract "https://www.woshipm.com/x" --max-chars 8000');
-  });
-  test("toolSummary 从命令位置的 oc-web 切摘要,跳过 which 预检那处", () => {
-    expect(
-      toolSummary("Bash", { command: "which oc-web 2>/dev/null && oc-web --help" }),
-    ).toBe("--help");
+    ).toBe("");
+    expect(toolSummary("Bash", { command: "which oc-web 2>/dev/null && oc-web --help" })).toBe("");
+    expect(toolSummary("Bash", { command: "oc-vision understand /home/agent/img.png --prompt 'x'" })).toBe("");
+    expect(toolSummary("Bash", { command: "mmx image generate 'a cat' -o /out.png" })).toBe("");
   });
 });
 
