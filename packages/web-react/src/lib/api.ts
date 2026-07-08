@@ -164,6 +164,20 @@ function withReqId(msg: string, res: Response): string {
 /** 后端错误 issue（commercial HttpError.issues：path+message 键值对）。 */
 export type ApiIssue = { path: string; message: string };
 
+/** 逐条响应评价提交入参（camelCase body，照抄后端契约字段名）。 */
+export type ResponseRatingInput = {
+  messageId: string;
+  rating: "up" | "down";
+  sessionId?: string;
+  traceId?: string;
+  model?: string;
+  tags?: string[];
+  comment?: string;
+};
+
+/** 会话已评回读结果：messageId → {rating, tags}（不含 comment）。 */
+export type SessionRatingsMap = Record<string, { rating: "up" | "down"; tags: string[] }>;
+
 /**
  * 统一的网络错误类型 —— 唯一权威，承载 status / code / issues / requestId，
  * 让上层按 **状态码 + 机器码** 分支（402 余额不足 / 409 已订阅 / 409 conflict /
@@ -2248,6 +2262,43 @@ export const api = {
         }),
       ),
     ),
+
+  // ── 逐条响应评价反馈（commercial REST，需登录 401，限流 60/60s） ──────────────
+  //
+  // 提交/更新走同一 POST（(user,messageId) upsert，无 DELETE）；回读只用于标「已评」高亮。
+  // 维护期端点返 503 —— 调用方(App)静默吞错，不弹错、不打断对话。
+
+  /**
+   * 提交/更新一条响应评价（POST /api/response-rating，Bearer）。语义 upsert：重发覆盖
+   * rating/tags/comment/model/traceId/sessionId。成功 200 `{ok:true}`；失败经 ApiError 抛
+   * （VALIDATION / UNAUTHORIZED / RATE_LIMITED），调用方静默处理。
+   */
+  submitResponseRating: (a: AuthSession, input: ResponseRatingInput): Promise<void> =>
+    jsonOrThrow<{ ok: true }>(
+      callWithRefresh(a, (t) =>
+        fetch("/api/response-rating", {
+          method: "POST",
+          credentials: "include",
+          headers: bearerHeaders(t, true),
+          body: JSON.stringify(input),
+        }),
+      ),
+    ).then(() => undefined),
+
+  /**
+   * 回读某会话已评状态（GET /api/response-rating?sessionId=，Bearer）。返回
+   * `{ [messageId]: {rating, tags} }`（无则 `{}`，不含 comment）。仅用于重开会话时标
+   * 「已评」高亮、避免重复采集。失败/503 由调用方兜底为空。
+   */
+  getSessionRatings: (a: AuthSession, sessionId: string): Promise<SessionRatingsMap> =>
+    jsonOrThrow<{ ratings?: SessionRatingsMap }>(
+      callWithRefresh(a, (t) =>
+        fetch(`/api/response-rating?sessionId=${encodeURIComponent(sessionId)}`, {
+          credentials: "include",
+          headers: bearerHeaders(t),
+        }),
+      ),
+    ).then((b) => b.ratings || {}),
 
   // ── 对话传输（P4 已接入：WS user-chat-bridge） ────────────────────────
   //

@@ -37,6 +37,7 @@ import { Markdown } from "../Markdown";
 import { Alert, Avatar, Badge, Button, IconButton } from "../ui";
 import { ChildBlockView } from "./AgentGroupCard";
 import { Media } from "./media";
+import { ResponseRatingCard } from "./ResponseRating";
 import { TurnActivity, type TurnActivityInfo } from "./TurnActivity";
 
 /** 渲染上下文。turnActivity=当前活跃会话本轮活动快照（流式空正文分支的阶段反馈源）。*/
@@ -387,6 +388,11 @@ export function AssistantCard({
           <MessageActions msg={msg} cb={cb} showRegen={ctx.isLast && !hasError} />
         )}
         {!live && !(ctx.sending && ctx.inActiveTurn) && <MetaRow msg={msg} />}
+        {/* 逐条评价反馈行(极轻,常驻):仅对有正文、非 error 的 assistant 回复出现,门控与
+            MetaRow 一致(流式中 / 团队编排未终态时不出)。未登录/demo 由卡内 Context 兜底隐藏。 */}
+        {!live && !hasError && !!msg.text && !(ctx.sending && ctx.inActiveTurn) && (
+          <ResponseRatingCard messageId={msg.id} traceId={msg.usage?.traceId ?? null} />
+        )}
       </div>
     </div>
   );

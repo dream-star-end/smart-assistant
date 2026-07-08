@@ -20,6 +20,11 @@ import { AssistantMessage, UserMessage } from "./components/Message";
 import { MessageList } from "./components/MessageRenderer";
 import { MessageListSkeleton, shouldShowHistorySkeleton } from "./components/chat/HistorySkeleton";
 import type { CardCallbacks } from "./components/chat/cards";
+import {
+  type RatingEntry,
+  type ResponseRatingCtx,
+  ResponseRatingProvider,
+} from "./components/chat/ResponseRating";
 import { MediaSignProvider } from "./components/chat/media";
 import { ChatInteractionContext, ToolCardActionsContext } from "./components/tool/context";
 import { Sidebar } from "./components/Sidebar";
@@ -770,6 +775,44 @@ export function App() {
     },
     [activeId],
   );
+  // 逐条响应评价（👍/👎 + 可选标签/评论）。单一权威 = 本 Map（含乐观态），经 Context 下发给
+  // 每条 AssistantCard 底部的 ResponseRatingCard。切会话/加载后由 GET 回读已评态填充（见下方
+  // effect）；提交时乐观同步更新 + 静默 POST（维护期 503 / 限流 / 网络失败一律吞，不打断）。
+  const [sessionRatings, setSessionRatings] = useState<Map<string, RatingEntry>>(() => new Map());
+  const onRateResponse = useCallback(
+    (input: {
+      messageId: string;
+      rating: "up" | "down";
+      traceId?: string | null;
+      tags?: string[];
+      comment?: string;
+    }) => {
+      if (demo || !activeId || !user) return;
+      // 乐观更新:bare thumb(无 tags)时,同 thumb 沿用旧标签、切 thumb 清空;带 tags 直接覆盖。
+      setSessionRatings((prev) => {
+        const next = new Map(prev);
+        const prevEntry = next.get(input.messageId);
+        const tags = input.tags ?? (prevEntry?.rating === input.rating ? prevEntry.tags : []);
+        next.set(input.messageId, { rating: input.rating, tags });
+        return next;
+      });
+      void api
+        .submitResponseRating(authRef.current, {
+          messageId: input.messageId,
+          rating: input.rating,
+          sessionId: activeId,
+          traceId: input.traceId ?? undefined,
+          model: modelId,
+          tags: input.tags,
+          comment: input.comment,
+        })
+        .catch(() => {
+          /* 静默:503 维护 / 429 限流 / 网络失败——保留乐观态,刷新后由 GET 对账。*/
+        });
+    },
+    [demo, activeId, user, modelId],
+  );
+
   // 逐条反馈（P6 反馈弹窗的占位接线）：暂以复制诊断串兜底（请求ID + 关联键），
   // 让用户/运维能立即把可追溯上下文交出去；P6 落地后替换为带上下文的反馈弹窗。
   const onFeedback = useCallback(
@@ -832,6 +875,40 @@ export function App() {
       onRetrySend: demo ? undefined : retrySend,
     }),
     [regenerate, send, demo, openSettings, onFeedback, retrySend],
+  );
+
+  // 已评回读：切会话/登录后拉一次 GET，填充已评态（重开会话时高亮 👍/👎、避免重复采集）。
+  // 依赖用**派生布尔**（非 user 对象，refreshMe 换引用不误触发清空）+ activeId。切会话先清
+  // 旧 Map（防串态），再异步注水；cancelled 守卫防慢响应覆盖新会话。demo/未登录不拉。
+  const ratingsEnabled = !demo && !!user;
+  useEffect(() => {
+    setSessionRatings(new Map());
+    if (!ratingsEnabled || !activeId) return;
+    let cancelled = false;
+    api
+      .getSessionRatings(authRef.current, activeId)
+      .then((map) => {
+        if (cancelled) return;
+        const next = new Map<string, RatingEntry>();
+        for (const [mid, v] of Object.entries(map)) {
+          if (v && (v.rating === "up" || v.rating === "down")) {
+            next.set(mid, { rating: v.rating, tags: Array.isArray(v.tags) ? v.tags : [] });
+          }
+        }
+        setSessionRatings(next);
+      })
+      .catch(() => {
+        /* 静默:503 维护 / 网络失败——无已评高亮,不影响新评。*/
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [ratingsEnabled, activeId]);
+
+  // 评价 Context 载荷:demo/未登录 → null（ResponseRatingCard 自渲 null，天然隐藏）。
+  const ratingCtx: ResponseRatingCtx | null = useMemo(
+    () => (ratingsEnabled ? { ratings: sessionRatings, submit: onRateResponse } : null),
+    [ratingsEnabled, sessionRatings, onRateResponse],
   );
 
   // autoscroll 根治(两个对称 bug 一次收口):
@@ -1180,14 +1257,18 @@ export function App() {
           ) : (
             // 非 demo：真实 WS 消息流 → P5 九类 Aurora 富卡（MessageList 按 role 分派、
             // 签名 memo 防闪；tool 委托 ToolCardSlot；权限审批经 onRespondPermission）。
-            <MessageList
-              messages={wsMessages}
-              sending={wsSending}
-              turnActivity={turnActivity}
-              transientNotice={transientNotice}
-              cb={cardCallbacks}
-              onRespondPermission={onRespondPermission}
-            />
+            // ResponseRatingProvider 下发逐条评价态：AssistantCard 内的评价卡作为 Context
+            // 消费者，随 ratings 变更穿透 MessageRenderer 的 sig-memo 重渲（无需改渲染签名）。
+            <ResponseRatingProvider value={ratingCtx}>
+              <MessageList
+                messages={wsMessages}
+                sending={wsSending}
+                turnActivity={turnActivity}
+                transientNotice={transientNotice}
+                cb={cardCallbacks}
+                onRespondPermission={onRespondPermission}
+              />
+            </ResponseRatingProvider>
           )}
         </div>
 
