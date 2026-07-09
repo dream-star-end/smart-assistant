@@ -36,7 +36,7 @@ let repositionListener = null
  *  effortsForModel(),前端不写死):
  *    1. state.modelsList — 模型选择器的"可覆盖目标"池(config.models / 默认 seed)。
  *    2. state.agentsList — 某个 agent 自己的默认 model 带的 efforts。覆盖池里查不到时
- *       回退到这里,这样 codex 的 gpt-5.5(不是可覆盖目标、不在池里)也能正确显示思考深度。
+ *       回退到这里,这样 codex 的 gpt-5.6-sol/5.5(不是可覆盖目标、不在池里)也能正确显示思考深度。
  *  空/缺省 = 该 model 不暴露思考深度控件。新增模型只改后端能力推断,不动前端。 */
 function getSupportedEfforts(modelId) {
   if (!modelId || typeof modelId !== 'string') return []

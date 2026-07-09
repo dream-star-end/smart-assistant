@@ -8,7 +8,7 @@
 
 ### 🤖 多 Provider 支持
 - **Claude 订阅** (OAuth PKCE) — 使用 Pro/Team 套餐额度
-- **OpenAI Codex** (OAuth) — GPT-5.4 / GPT-5.3-Codex
+- **OpenAI Codex** (OAuth) — GPT-5.6 Sol/Terra/Luna / GPT-5.5
 - **MiniMax** — 图片生成、语音合成、视频生成
 - **DeepSeek / 自定义** — 任意 OpenAI 兼容 API
 

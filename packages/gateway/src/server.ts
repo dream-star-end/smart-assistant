@@ -2708,7 +2708,7 @@ export class Gateway {
           ...this.redactAgentForApi(a),
           // Thinking-depth capability of the agent's OWN default model. Carried
           // per-agent so the composer can gate the effort control even when that
-          // model is NOT in the override pool (e.g. codex/gpt-5.5, which isn't a
+          // model is NOT in the override pool (e.g. codex/gpt-5.6-sol, which isn't a
           // valid override target but still drives its own reasoning effort).
           // Single authority: effortsForModel().
           efforts: effortsForModel(a.model),

@@ -48,9 +48,7 @@ const MODELS = [
   { id: 'claude-haiku-4-5', label: 'Haiku 4.5' },
 ]
 
-function makeModelMode(
-  opts: { agentModel?: string; override?: string; provider?: string } = {},
-) {
+function makeModelMode(opts: { agentModel?: string; override?: string; provider?: string } = {}) {
   const ls = makeLocalStorage()
   if (opts.override !== undefined) ls._seed('openclaude_model_by_agent', { main: opts.override })
   const state = {
@@ -104,11 +102,11 @@ describe('modelMode: effective model + submit value', () => {
     // stored override must NOT leak into effective model (else effort gating
     // would key off the wrong model) and must NOT be sent.
     const m = makeModelMode({
-      agentModel: 'gpt-5.5',
+      agentModel: 'gpt-5.6-sol',
       provider: 'codex-native',
       override: 'claude-haiku-4-5',
     })
-    assert.equal(m.getEffectiveModel(), 'gpt-5.5')
+    assert.equal(m.getEffectiveModel(), 'gpt-5.6-sol')
     assert.equal(m.getModelForSubmit(), undefined)
   })
 })
@@ -150,17 +148,17 @@ describe('effortMode: capability-driven gating', () => {
     assert.deepEqual(e.getSupportedEfforts('unknown-model'), [])
   })
 
-  it('dual-source: model not in pool but is an agent default → uses agent.efforts (gpt-5.5)', () => {
-    // gpt-5.5 is the codex agent's default model; it is NOT a valid override
+  it('dual-source: model not in pool but is an agent default → uses agent.efforts (gpt-5.6-sol)', () => {
+    // gpt-5.6-sol is the codex agent's default model; it is NOT a valid override
     // target so it never appears in modelsList. Capability must still resolve
     // via the agent's own efforts (carried by /api/agents).
     const agents = [
       { id: 'main', model: 'claude-opus-4-7' },
-      { id: 'codex', model: 'gpt-5.5', efforts: ['low', 'medium', 'high', 'xhigh'] },
+      { id: 'codex', model: 'gpt-5.6-sol', efforts: ['low', 'medium', 'high', 'xhigh'] },
     ]
-    const e = makeEffortMode('gpt-5.5', undefined, agents)
-    assert.deepEqual(e.getSupportedEfforts('gpt-5.5'), ['low', 'medium', 'high', 'xhigh'])
-    assert.equal(e.modelSupportsExtraEffort('gpt-5.5'), true)
+    const e = makeEffortMode('gpt-5.6-sol', undefined, agents)
+    assert.deepEqual(e.getSupportedEfforts('gpt-5.6-sol'), ['low', 'medium', 'high', 'xhigh'])
+    assert.equal(e.modelSupportsExtraEffort('gpt-5.6-sol'), true)
     // pool still wins when present; unknown stays empty.
     assert.deepEqual(e.getSupportedEfforts('claude-opus-4-8'), [
       'low',

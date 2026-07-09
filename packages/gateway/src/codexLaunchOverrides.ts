@@ -240,9 +240,9 @@ export interface CodexLaunchOverridesContext {
    *  etc., so codex gets a no-op pass-through. */
   provider?: string
   model?: string
-  /** UI effort level passed through. For codex-backed agents, low/medium/high/xhigh
-   *  become codex's native `model_reasoning_effort`; max remains prompt-slot-only
-   *  because codex does not expose a `max` reasoning effort. */
+  /** UI effort level passed through. For codex-backed agents, OpenClaude only
+   *  forwards the stable common subset low/medium/high/xhigh as codex's native
+   *  `model_reasoning_effort`; other UI-only levels remain prompt-slot-only. */
   effortLevel?: string
   /** mkdtempSync'd directory the caller has prepared. We write the
    *  instructions file into this dir (no other side effects). */

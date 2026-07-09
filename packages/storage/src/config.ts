@@ -50,7 +50,7 @@ export interface ModelChoice {
 /** Single source of truth for which thinking-depth levels a model exposes in
  *  the UI. Capability is an INTRINSIC property of the model, derived from its id
  *  family — not a hand-maintained table that drifts out of sync with the agents
- *  actually in use (which is how gpt-5.5 lost its control once the frontend
+ *  actually in use (which is how the Codex GPT-5 family lost its control once the frontend
  *  stopped hardcoding it). Tolerates id variants (case, `anthropic/`/`openai/`
  *  prefixes). Used by both defaultModels() and /api/agents (per-agent + models
  *  backfill), so any model — pool member or an agent's own default — is gated
@@ -58,9 +58,13 @@ export interface ModelChoice {
 export function effortsForModel(modelId: string | undefined): EffortLevel[] {
   if (!modelId || typeof modelId !== 'string') return []
   const id = modelId.toLowerCase()
-  // Codex / GPT-5.5 reasoning depth. Maps to codex `model_reasoning_effort`
-  // (low/medium/high/xhigh — codex exposes no `max`); see codexLaunchOverrides.
-  if (/(^|[/_-])gpt[-_]?5\.5($|[/_-])/.test(id)) return ['low', 'medium', 'high', 'xhigh']
+  const modelName = id.split('/').pop() ?? id
+  // Codex GPT-5 reasoning depth. Maps to OpenAI Codex `model_reasoning_effort`.
+  // Expose the common stable subset across GPT-5.6 Sol/Terra/Luna and GPT-5.5;
+  // do not add bare `gpt-5.6`, which ChatGPT-auth Codex rejects.
+  if (/^gpt[-_]?5\.5$/.test(modelName) || /^gpt[-_]?5\.6[-_](sol|terra|luna)$/.test(modelName)) {
+    return ['low', 'medium', 'high', 'xhigh']
+  }
   // Claude Fable 5 — 旗舰,最强长程 agentic + 异步子代理编排。同 Opus 全档 + ultracode;
   // Fable 5 思考常驻(不接受 --thinking 关),深度全靠 --effort,ultracode 正对其多 agent 强项。
   if (/fable[-_]?5/.test(id)) return ['low', 'medium', 'high', 'xhigh', 'max', 'ultracode']

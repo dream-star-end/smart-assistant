@@ -246,7 +246,7 @@ describe('official Claude terminal lifecycle', () => {
     assert.match(SW, /\/modules\/officialTerminal\.js\?v=17/)
     assert.match(INDEX, /\/modules\/main\.js\?v=84/)
     assert.match(INDEX, /\/style\.css\?v=67/)
-    assert.match(INDEX, /sw-flush-v25/)
+    assert.match(INDEX, /sw-flush-v26/)
     assert.match(SW, /openclaude-v109/)
   })
 
