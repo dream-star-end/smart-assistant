@@ -197,7 +197,7 @@ import {
   applyTerminalTheme,
   initOfficialClaudeTerminal,
   openOfficialClaudeTerminal,
-} from './officialTerminal.js?v=17'
+} from './officialTerminal.js?v=18'
 import { getConversationModeForSubmit } from './planMode.js?v=4'
 import { initPlanPanel } from './planPanel.js?v=3'
 

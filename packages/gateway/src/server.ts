@@ -1639,6 +1639,10 @@ export class Gateway {
       this.handleClaudeTerminalSessions(req, res)
       return
     }
+    if (url.pathname === '/api/claude-terminal/transcript') {
+      this.handleClaudeTerminalTranscript(req, res, url)
+      return
+    }
     if (url.pathname === '/api/claude-terminal/list') {
       this.handleClaudeTerminalList(req, res, url)
       return
@@ -4340,6 +4344,54 @@ export class Gateway {
       this.sendJson(res, 200, { sessions })
     } catch (err) {
       this.sendError(res, 500, err instanceof Error ? err.message : String(err))
+    }
+  }
+
+  private handleClaudeTerminalTranscript(
+    req: IncomingMessage,
+    res: ServerResponse,
+    url: URL,
+  ): void {
+    if (req.method !== 'GET') {
+      this.sendError(res, 405, 'method not allowed')
+      return
+    }
+    const userId = this.getClaudeTerminalUserId(req)
+    if (!userId) {
+      this.sendError(res, 401, 'Claude terminal requires a user login')
+      return
+    }
+    const sessionId = url.searchParams.get('sessionId') ?? ''
+    if (!sessionId) {
+      this.sendError(res, 400, 'sessionId required')
+      return
+    }
+    const rawBefore = url.searchParams.get('before')
+    let before: number | undefined
+    if (rawBefore !== null) {
+      before = Number(rawBefore)
+      if (!/^\d+$/.test(rawBefore) || !Number.isSafeInteger(before)) {
+        this.sendError(res, 400, 'before must be a non-negative integer')
+        return
+      }
+    }
+    try {
+      const manager = this.claudeTerminal
+      if (!manager) {
+        this.sendError(res, 503, 'Claude terminal is unavailable')
+        return
+      }
+      this.sendJson(res, 200, manager.readTranscript(userId, sessionId, before))
+    } catch (err) {
+      if (err instanceof ClaudeTerminalForbiddenError) {
+        this.sendError(res, 403, 'forbidden')
+        return
+      }
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+        this.sendError(res, 404, 'transcript not found')
+        return
+      }
+      this.sendError(res, 400, err instanceof Error ? err.message : String(err))
     }
   }
 
@@ -7188,6 +7240,7 @@ const KNOWN_ROUTES = [
   '/api/claude-terminal/terminate',
   '/api/claude-terminal/upload',
   '/api/claude-terminal/sessions',
+  '/api/claude-terminal/transcript',
   '/api/claude-terminal/list',
   '/api/claude-terminal/download',
   '/api/claude-terminal/download-ticket',

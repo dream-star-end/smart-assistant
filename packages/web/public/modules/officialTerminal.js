@@ -13,10 +13,21 @@ const STATUS_ID = 'claude-terminal-status'
 const KILL_BTN_ID = 'claude-terminal-kill-btn'
 const RECONNECT_BTN_ID = 'claude-terminal-reconnect-btn'
 const NEW_OUTPUT_BTN_ID = 'claude-terminal-new-output-btn'
+const TERMINAL_WRAP_ID = 'claude-terminal-terminal-wrap'
+const MOBILE_DOCK_ID = 'claude-terminal-mobile-dock'
 const MOBILE_INPUT_ID = 'claude-terminal-mobile-input'
 const MOBILE_SEND_BTN_ID = 'claude-terminal-mobile-send-btn'
 const MOBILE_FOCUS_BTN_ID = 'claude-terminal-mobile-focus-btn'
 const COPY_BTN_ID = 'claude-terminal-copy-btn'
+const READER_ID = 'claude-terminal-reader'
+const READER_LIST_ID = 'claude-terminal-reader-list'
+const READER_STATE_ID = 'claude-terminal-reader-state'
+const READER_LIVE_ID = 'claude-terminal-reader-live'
+const READER_REFRESH_ID = 'claude-terminal-reader-refresh'
+const READER_OLDER_ID = 'claude-terminal-reader-older'
+const READER_COPY_LATEST_ID = 'claude-terminal-reader-copy-latest'
+const READER_COPY_ALL_ID = 'claude-terminal-reader-copy-all'
+const VIEW_SWITCH_SELECTOR = '[data-claude-terminal-view]'
 const SESSIONS_BTN_ID = 'claude-terminal-sessions-btn'
 const SESSIONS_MENU_ID = 'claude-terminal-sessions-menu'
 const SESSIONS_LIST_ID = 'claude-terminal-sessions-list'
@@ -93,6 +104,15 @@ let terminalHiddenAt = null
 let terminalReconnectTimer = null
 let terminalRecentFiles = []
 let terminalContextSelectionText = ''
+let terminalViewMode = 'terminal'
+let terminalTranscriptEntries = []
+let terminalTranscriptBefore = null
+let terminalTranscriptSessionId = null
+let terminalTranscriptLoading = false
+let terminalTranscriptLoaded = false
+let terminalTranscriptError = ''
+let terminalTranscriptRefreshTimer = null
+let terminalTranscriptRequestSeq = 0
 const terminalUploads = []
 let terminalBrowsePath = ''
 let terminalBrowseRequestSeq = 0
@@ -235,6 +255,281 @@ async function pasteClipboardToTerminal() {
   const normalized = text.replace(/\r?\n/g, '\r')
   sendTerminalInput(normalized)
   focusTerminalIfDesktop()
+}
+
+function isTerminalReaderMode() {
+  return terminalViewMode === 'reader'
+}
+
+function formatTranscriptTimestamp(timestamp) {
+  if (!timestamp) return ''
+  const date = new Date(timestamp)
+  if (!Number.isFinite(date.getTime())) return ''
+  return date.toLocaleString('zh-CN', {
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+  })
+}
+
+function groupedTerminalTranscriptEntries() {
+  const groups = []
+  for (const entry of terminalTranscriptEntries) {
+    const last = groups[groups.length - 1]
+    if (last?.role === entry.role) {
+      last.parts.push(entry.text)
+      if (entry.timestamp) last.timestamp = entry.timestamp
+      continue
+    }
+    groups.push({ role: entry.role, parts: [entry.text], timestamp: entry.timestamp })
+  }
+  return groups
+}
+
+function updateTerminalReaderLiveState() {
+  const badge = $(READER_LIVE_ID)
+  if (!badge) return
+  const running = terminalStatusState() === 'running'
+  badge.classList.toggle('is-offline', !running)
+  badge.textContent = running ? 'CC 仍在运行' : 'CC 当前未连接'
+}
+
+function renderTerminalTranscript() {
+  const list = $(READER_LIST_ID)
+  if (!list) return
+  list.textContent = ''
+  const groups = groupedTerminalTranscriptEntries()
+  if (!currentSessionId) {
+    const empty = document.createElement('div')
+    empty.className = 'claude-terminal-reader-empty'
+    empty.textContent = '正在等待 Claude Code 会话连接。交互终端仍是唯一执行入口。'
+    list.appendChild(empty)
+  } else if (!groups.length) {
+    const empty = document.createElement('div')
+    empty.className = 'claude-terminal-reader-empty'
+    empty.textContent = terminalTranscriptLoading
+      ? '正在整理当前 CC 会话记录…'
+      : terminalTranscriptError || '当前会话还没有可阅读的用户或 Claude 文本记录。'
+    list.appendChild(empty)
+  } else {
+    for (const group of groups) {
+      const article = document.createElement('article')
+      article.className = `claude-terminal-reader-message is-${group.role}`
+      const meta = document.createElement('div')
+      meta.className = 'claude-terminal-reader-message-meta'
+      const author = document.createElement('strong')
+      author.textContent = group.role === 'assistant' ? 'Claude' : '你'
+      const time = document.createElement('span')
+      time.textContent = formatTranscriptTimestamp(group.timestamp)
+      meta.append(author, time)
+      const body = document.createElement('div')
+      body.className = 'claude-terminal-reader-message-text'
+      body.textContent = group.parts.join('\n\n')
+      article.append(meta, body)
+      list.appendChild(article)
+    }
+  }
+
+  const older = $(READER_OLDER_ID)
+  if (older) {
+    older.disabled =
+      terminalTranscriptLoading || !currentSessionId || terminalTranscriptBefore === null
+    older.textContent =
+      terminalTranscriptBefore === null && terminalTranscriptLoaded
+        ? '已到最早记录'
+        : '加载更早记录'
+  }
+  const refresh = $(READER_REFRESH_ID)
+  if (refresh) refresh.disabled = terminalTranscriptLoading || !currentSessionId
+  const copyLatest = $(READER_COPY_LATEST_ID)
+  if (copyLatest)
+    copyLatest.disabled = !terminalTranscriptEntries.some((entry) => entry.role === 'assistant')
+  const copyAll = $(READER_COPY_ALL_ID)
+  if (copyAll) copyAll.disabled = terminalTranscriptEntries.length === 0
+  const stateEl = $(READER_STATE_ID)
+  if (stateEl) {
+    if (terminalTranscriptLoading) stateEl.textContent = '正在读取官方 CC 会话记录…'
+    else if (terminalTranscriptError) stateEl.textContent = terminalTranscriptError
+    else if (terminalTranscriptLoaded && groups.length === 0)
+      stateEl.textContent = '暂无可读记录 · 输入后会自动刷新'
+    else if (terminalTranscriptLoaded)
+      stateEl.textContent = `已加载 ${groups.length} 段对话 · 可长按选择文字`
+    else stateEl.textContent = '切换到阅读记录后加载当前会话'
+  }
+  updateTerminalReaderLiveState()
+}
+
+function resetTerminalTranscript(sessionId = currentSessionId) {
+  clearTerminalTranscriptRefreshTimer()
+  terminalTranscriptRequestSeq += 1
+  terminalTranscriptSessionId = sessionId || null
+  terminalTranscriptEntries = []
+  terminalTranscriptBefore = null
+  terminalTranscriptLoading = false
+  terminalTranscriptLoaded = false
+  terminalTranscriptError = ''
+  renderTerminalTranscript()
+}
+
+function normalizedTranscriptEntries(entries) {
+  if (!Array.isArray(entries)) return []
+  return entries
+    .filter(
+      (entry) =>
+        entry &&
+        (entry.role === 'user' || entry.role === 'assistant') &&
+        typeof entry.id === 'string' &&
+        typeof entry.text === 'string' &&
+        Number.isFinite(entry.position),
+    )
+    .map((entry) => ({
+      id: entry.id,
+      role: entry.role,
+      text: entry.text,
+      timestamp: typeof entry.timestamp === 'string' ? entry.timestamp : null,
+      position: entry.position,
+    }))
+}
+
+async function loadTerminalTranscript({ older = false, quiet = false } = {}) {
+  const sessionId = currentSessionId
+  if (!sessionId) {
+    renderTerminalTranscript()
+    return
+  }
+  if (terminalTranscriptLoading) {
+    if (!older) scheduleTerminalTranscriptRefresh()
+    return
+  }
+  if (terminalTranscriptSessionId !== sessionId) resetTerminalTranscript(sessionId)
+  if (older && terminalTranscriptBefore === null) return
+
+  const list = $(READER_LIST_ID)
+  const oldHeight = list?.scrollHeight || 0
+  const oldTop = list?.scrollTop || 0
+  const nearBottom = list ? list.scrollHeight - list.scrollTop - list.clientHeight < 80 : true
+  const firstLoad = !terminalTranscriptLoaded
+  const requestSeq = ++terminalTranscriptRequestSeq
+  terminalTranscriptLoading = true
+  terminalTranscriptError = ''
+  renderTerminalTranscript()
+  try {
+    const query = new URLSearchParams({ sessionId })
+    if (older && terminalTranscriptBefore !== null)
+      query.set('before', String(terminalTranscriptBefore))
+    const data = await apiJson(
+      'GET',
+      `/api/claude-terminal/transcript?${query.toString()}`,
+      undefined,
+      { timeout: 8000, suppressAuthRedirect: true },
+    )
+    if (requestSeq !== terminalTranscriptRequestSeq || sessionId !== currentSessionId) return
+    const incoming = normalizedTranscriptEntries(data?.entries)
+    const merged = new Map(terminalTranscriptEntries.map((entry) => [entry.id, entry]))
+    for (const entry of incoming) merged.set(entry.id, entry)
+    terminalTranscriptEntries = [...merged.values()].sort(
+      (a, b) => a.position - b.position || a.id.localeCompare(b.id),
+    )
+    const nextBefore = Number.isFinite(data?.before) ? data.before : null
+    if (older || firstLoad) terminalTranscriptBefore = nextBefore
+    else if (terminalTranscriptBefore !== null && nextBefore !== null)
+      terminalTranscriptBefore = Math.min(terminalTranscriptBefore, nextBefore)
+    terminalTranscriptLoaded = true
+  } catch (err) {
+    if (requestSeq !== terminalTranscriptRequestSeq || sessionId !== currentSessionId) return
+    terminalTranscriptError = err instanceof Error ? err.message : String(err)
+    if (!quiet) toast(terminalTranscriptError || '读取 CC 会话记录失败', 'error')
+  } finally {
+    if (requestSeq === terminalTranscriptRequestSeq && sessionId === currentSessionId) {
+      terminalTranscriptLoading = false
+      renderTerminalTranscript()
+      requestAnimationFrame(() => {
+        const currentList = $(READER_LIST_ID)
+        if (!currentList) return
+        if (older) currentList.scrollTop = oldTop + (currentList.scrollHeight - oldHeight)
+        else if (firstLoad || nearBottom) currentList.scrollTop = currentList.scrollHeight
+        else currentList.scrollTop = oldTop
+      })
+    }
+  }
+}
+
+function clearTerminalTranscriptRefreshTimer() {
+  if (!terminalTranscriptRefreshTimer) return
+  clearTimeout(terminalTranscriptRefreshTimer)
+  terminalTranscriptRefreshTimer = null
+}
+
+function scheduleTerminalTranscriptRefresh() {
+  if (!isModalOpen() || !isTerminalReaderMode() || !currentSessionId) return
+  clearTerminalTranscriptRefreshTimer()
+  terminalTranscriptRefreshTimer = setTimeout(() => {
+    terminalTranscriptRefreshTimer = null
+    void loadTerminalTranscript({ quiet: true })
+  }, 800)
+}
+
+function latestClaudeTranscriptText() {
+  let lastAssistant = -1
+  for (let i = terminalTranscriptEntries.length - 1; i >= 0; i -= 1) {
+    if (terminalTranscriptEntries[i].role === 'assistant') {
+      lastAssistant = i
+      break
+    }
+  }
+  if (lastAssistant < 0) return ''
+  let start = lastAssistant
+  while (start > 0 && terminalTranscriptEntries[start - 1].role !== 'user') start -= 1
+  return terminalTranscriptEntries
+    .slice(start, lastAssistant + 1)
+    .filter((entry) => entry.role === 'assistant')
+    .map((entry) => entry.text)
+    .join('\n\n')
+}
+
+function loadedTerminalTranscriptText() {
+  return groupedTerminalTranscriptEntries()
+    .map((group) => `${group.role === 'assistant' ? 'Claude' : '你'}\n${group.parts.join('\n\n')}`)
+    .join('\n\n──────────\n\n')
+}
+
+async function copyTerminalTranscript(text, successMessage) {
+  if (!text.trim()) return toast('没有可复制的会话内容', 'warning')
+  const ok = await copyTextToClipboard(text)
+  toast(ok ? successMessage : '复制失败，请检查浏览器剪贴板权限', ok ? 'success' : 'error')
+}
+
+function setTerminalViewMode(mode) {
+  if (mode !== 'terminal' && mode !== 'reader') return
+  terminalViewMode = mode
+  const reader = mode === 'reader'
+  const terminalWrap = $(TERMINAL_WRAP_ID)
+  const readerPanel = $(READER_ID)
+  const mobileDock = $(MOBILE_DOCK_ID)
+  const copyButton = $(COPY_BTN_ID)
+  if (terminalWrap) terminalWrap.hidden = reader
+  if (readerPanel) readerPanel.hidden = !reader
+  if (mobileDock) mobileDock.hidden = reader
+  if (copyButton) copyButton.hidden = reader
+  $(MODAL_ID)?.setAttribute('data-view-mode', mode)
+  document.querySelectorAll(VIEW_SWITCH_SELECTOR).forEach((button) => {
+    const selected = button.dataset.claudeTerminalView === mode
+    button.setAttribute('aria-selected', String(selected))
+    button.tabIndex = selected ? 0 : -1
+  })
+  hideTerminalContextMenu()
+  if (reader) {
+    if (terminalTranscriptSessionId !== currentSessionId) resetTerminalTranscript(currentSessionId)
+    renderTerminalTranscript()
+    void loadTerminalTranscript({ quiet: true })
+    return
+  }
+  clearTerminalTranscriptRefreshTimer()
+  requestAnimationFrame(() => {
+    fitTerminal()
+    focusTerminalIfDesktop()
+  })
 }
 
 function shellQuotePath(path) {
@@ -763,6 +1058,7 @@ function setStatus(stateName, message = '') {
   el.dataset.state = stateName || 'idle'
   el.textContent = message ? `${statusLabel(stateName)} · ${message}` : statusLabel(stateName)
   updateTerminalBusyButtons()
+  updateTerminalReaderLiveState()
 }
 
 function terminalStatusState() {
@@ -891,7 +1187,7 @@ function shouldFocusTerminal() {
 }
 
 function focusTerminalIfDesktop() {
-  if (shouldFocusTerminal()) terminal?.focus()
+  if (!isTerminalReaderMode() && shouldFocusTerminal()) terminal?.focus()
 }
 
 function attachTerminal() {
@@ -947,7 +1243,7 @@ function disposeTerminal() {
 
 function fitTerminal() {
   if (!terminal || !fitAddon) return
-  if (!isModalOpen()) return
+  if (!isModalOpen() || isTerminalReaderMode()) return
   try {
     fitAddon.fit()
   } catch {}
@@ -1454,6 +1750,7 @@ function connectTerminal(reason = '') {
     if (!payload || typeof payload !== 'object') return
     if (payload.type === 'output' && typeof payload.data === 'string') {
       writeTerminalOutput(payload.data)
+      scheduleTerminalTranscriptRefresh()
       return
     }
     if (payload.type === 'replay' && typeof payload.data === 'string') {
@@ -1461,14 +1758,19 @@ function connectTerminal(reason = '') {
       if (payload.data) terminal?.write(payload.data)
       hideNewOutputButton()
       fitVisibleTerminalSoon(true)
+      scheduleTerminalTranscriptRefresh()
       return
     }
     if (payload.type === 'status') {
       const message = typeof payload.message === 'string' ? payload.message : ''
       setStatus(payload.state || 'idle', message)
       if (payload.state === 'running' && typeof payload.sessionId === 'string') {
-        currentSessionId = payload.sessionId
+        if (currentSessionId !== payload.sessionId) {
+          currentSessionId = payload.sessionId
+          resetTerminalTranscript(currentSessionId)
+        }
         renderTerminalSessions()
+        scheduleTerminalTranscriptRefresh()
       }
       if (payload.state === 'error' || payload.state === 'disabled') {
         writeLine(message)
@@ -1505,10 +1807,12 @@ function connectTerminal(reason = '') {
 
 export async function openOfficialClaudeTerminal() {
   await ensureTerminalDeps()
+  if (!terminal && isTerminalReaderMode()) setTerminalViewMode('terminal')
   openModal(MODAL_ID)
   renderTerminalRecentFiles()
   renderTerminalUploads()
   void refreshTerminalSessions()
+  if (isTerminalReaderMode()) void loadTerminalTranscript({ quiet: true })
   if (terminal) {
     fitVisibleTerminalSoon(true)
     if (
@@ -1529,6 +1833,7 @@ export async function openOfficialClaudeTerminal() {
 }
 
 export function hideOfficialClaudeTerminal() {
+  clearTerminalTranscriptRefreshTimer()
   closeSessionsMenu()
   terminalFileDragDepth = 0
   setTerminalFileDropActive(false)
@@ -1573,6 +1878,7 @@ async function terminateOfficialClaudeTerminalAsync() {
     disposeTerminal()
     reconnectRequested = false
     currentSessionId = null
+    resetTerminalTranscript(null)
     setStatus('closed', '已终止，重新打开会新建终端')
     void refreshTerminalSessions()
   } catch (err) {
@@ -1615,6 +1921,8 @@ function startNewClaudeSession() {
     toast('请先登录 OpenClaude', 'error')
     return
   }
+  currentSessionId = null
+  resetTerminalTranscript(null)
   reconnectTerminal({ action: 'new' })
   toast('正在新建 Claude 会话', 'info')
 }
@@ -1627,6 +1935,8 @@ function attachClaudeSession(sessionId) {
     toast('请先登录 OpenClaude', 'error')
     return
   }
+  currentSessionId = sessionId
+  resetTerminalTranscript(sessionId)
   reconnectTerminal({ action: 'attach', sessionId })
   toast('正在打开会话', 'info')
 }
@@ -1646,6 +1956,7 @@ async function deleteClaudeSession(sessionId) {
     )
     if (sessionId === currentSessionId) {
       currentSessionId = null
+      resetTerminalTranscript(null)
       closeSocket(false)
       disposeTerminal()
       reconnectRequested = false
@@ -1987,7 +2298,7 @@ function isEditableTerminalUiTarget(target) {
 }
 
 function shouldHandleTerminalClipboardShortcut(event) {
-  if (!isModalOpen() || isTerminalFileModalOpen()) return false
+  if (!isModalOpen() || isTerminalFileModalOpen() || isTerminalReaderMode()) return false
   const modal = $(MODAL_ID)
   if (!modal) return false
   const target = event.target
@@ -2044,6 +2355,30 @@ export function initOfficialClaudeTerminal() {
   $(RECONNECT_BTN_ID)?.addEventListener('click', () => reconnectTerminal())
   $(NEW_OUTPUT_BTN_ID)?.addEventListener('click', () => scrollTerminalToBottom())
   bindTerminalCopyButton()
+  const viewButtons = [...document.querySelectorAll(VIEW_SWITCH_SELECTOR)]
+  viewButtons.forEach((button, index) => {
+    button.addEventListener('click', () => setTerminalViewMode(button.dataset.claudeTerminalView))
+    button.addEventListener('keydown', (event) => {
+      if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') return
+      event.preventDefault()
+      const direction = event.key === 'ArrowRight' ? 1 : -1
+      const next = viewButtons[(index + direction + viewButtons.length) % viewButtons.length]
+      setTerminalViewMode(next.dataset.claudeTerminalView)
+      next.focus()
+    })
+  })
+  $(READER_REFRESH_ID)?.addEventListener('click', () => {
+    void loadTerminalTranscript()
+  })
+  $(READER_OLDER_ID)?.addEventListener('click', () => {
+    void loadTerminalTranscript({ older: true })
+  })
+  $(READER_COPY_LATEST_ID)?.addEventListener('click', () => {
+    void copyTerminalTranscript(latestClaudeTranscriptText(), '已复制 Claude 最近回复')
+  })
+  $(READER_COPY_ALL_ID)?.addEventListener('click', () => {
+    void copyTerminalTranscript(loadedTerminalTranscriptText(), '已复制当前已加载记录')
+  })
   // Upload buttons are <label for=FILE_INPUT_ID>: tap/click natively opens the
   // picker (synthetic .click() on a hidden input is dropped on mobile ArkWeb).
   // Wire keyboard activation for these role=button labels.

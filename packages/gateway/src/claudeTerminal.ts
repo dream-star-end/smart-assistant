@@ -177,6 +177,22 @@ const CLAUDE_SESSION_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[
 const MAX_LISTED_CLAUDE_SESSIONS = 60
 const MAX_SESSION_TITLE_CHARS = 80
 const SESSION_TITLE_SCAN_BYTES = 128 * 1024
+const TRANSCRIPT_PAGE_BYTES = 512 * 1024
+const ANSI_ESCAPE_RE = new RegExp(`${String.fromCharCode(27)}\\[[0-?]*[ -/]*[@-~]`, 'g')
+
+export interface ClaudeTranscriptEntry {
+  id: string
+  role: 'user' | 'assistant'
+  text: string
+  timestamp: string | null
+  position: number
+}
+
+export interface ClaudeTranscriptPage {
+  entries: ClaudeTranscriptEntry[]
+  before: number | null
+  fileSize: number
+}
 
 export function isValidClaudeSessionId(id: unknown): id is string {
   return typeof id === 'string' && CLAUDE_SESSION_ID_RE.test(id.trim())
@@ -284,6 +300,109 @@ export function resolveClaudeSessionTranscriptPath(
 ): string {
   if (!isValidClaudeSessionId(sessionId)) throw new Error('invalid Claude session id')
   return join(resolveClaudeProjectDir(env), `${sessionId.trim()}.jsonl`)
+}
+
+function transcriptText(record: Record<string, unknown>): string {
+  const message = record.message
+  if (!message || typeof message !== 'object') return ''
+  const content = (message as { content?: unknown }).content
+  const parts: string[] = []
+  if (typeof content === 'string') parts.push(content)
+  else if (Array.isArray(content)) {
+    for (const block of content) {
+      if (!block || typeof block !== 'object') continue
+      const typed = block as { type?: unknown; text?: unknown }
+      if (typed.type === 'text' && typeof typed.text === 'string') parts.push(typed.text)
+    }
+  }
+  return parts.join('\n\n').replace(ANSI_ESCAPE_RE, '').replace(/\r\n?/g, '\n').trim()
+}
+
+function isSyntheticClaudeUserText(text: string): boolean {
+  return /^(?:<command-name>|<local-command-|<system-reminder>|<task-notification>)/.test(text)
+}
+
+export function parseClaudeTranscriptRecord(
+  raw: unknown,
+  position: number,
+): ClaudeTranscriptEntry | null {
+  if (!raw || typeof raw !== 'object') return null
+  const record = raw as Record<string, unknown>
+  if (record.type !== 'user' && record.type !== 'assistant') return null
+  if (record.isMeta === true) return null
+  const text = transcriptText(record)
+  if (!text || (record.type === 'user' && isSyntheticClaudeUserText(text))) return null
+  const message = record.message as { id?: unknown } | undefined
+  const idCandidate =
+    typeof record.uuid === 'string'
+      ? record.uuid
+      : typeof message?.id === 'string'
+        ? message.id
+        : `${record.type}:${position}`
+  return {
+    id: idCandidate,
+    role: record.type,
+    text,
+    timestamp: typeof record.timestamp === 'string' ? record.timestamp : null,
+    position,
+  }
+}
+
+export function readClaudeSessionTranscriptPage(
+  sessionId: string,
+  before: number | undefined,
+  env: NodeJS.ProcessEnv = process.env,
+): ClaudeTranscriptPage {
+  const filePath = resolveClaudeSessionTranscriptPath(sessionId, env)
+  const fileSize = statSync(filePath).size
+  const end = before === undefined ? fileSize : Math.min(fileSize, Math.max(0, before))
+  if (end === 0) return { entries: [], before: null, fileSize }
+
+  const rawStart = Math.max(0, end - TRANSCRIPT_PAGE_BYTES)
+  const length = end - rawStart
+  const buffer = Buffer.alloc(length)
+  let fd: number | null = null
+  let bytesRead = 0
+  try {
+    fd = openSync(filePath, 'r')
+    bytesRead = readSync(fd, buffer, 0, length, rawStart)
+  } finally {
+    if (fd !== null) closeSync(fd)
+  }
+  const page = buffer.subarray(0, bytesRead)
+  const firstNewline = rawStart > 0 ? page.indexOf(0x0a) : -1
+  if (rawStart > 0 && firstNewline < 0) {
+    return { entries: [], before: rawStart, fileSize }
+  }
+  const pageOffset = rawStart > 0 ? firstNewline + 1 : 0
+  const alignedStart = rawStart + pageOffset
+  const completeEnd = page.lastIndexOf(0x0a)
+  if (completeEnd < pageOffset) {
+    // The only newline can be the terminator of an oversized record that began
+    // before this bounded window. Skip that unrenderable record while still
+    // moving the backward cursor; returning alignedStart here could equal end.
+    return { entries: [], before: rawStart > 0 ? rawStart : null, fileSize }
+  }
+
+  const entries: ClaudeTranscriptEntry[] = []
+  let lineStart = pageOffset
+  while (lineStart <= completeEnd) {
+    const lineEnd = page.indexOf(0x0a, lineStart)
+    if (lineEnd < 0 || lineEnd > completeEnd) break
+    const line = page.subarray(lineStart, lineEnd).toString('utf8').trim()
+    if (line) {
+      try {
+        const entry = parseClaudeTranscriptRecord(JSON.parse(line), rawStart + lineStart)
+        if (entry) entries.push(entry)
+      } catch {}
+    }
+    lineStart = lineEnd + 1
+  }
+  return {
+    entries,
+    before: alignedStart > 0 ? alignedStart : null,
+    fileSize,
+  }
 }
 
 export interface ListClaudeSessionsParams {
@@ -632,6 +751,26 @@ export class ClaudeTerminalManager {
   workingDirectory(_userId: string): string {
     // All terminals share one cwd, so the result is the same for every user.
     return resolveOfficialClaudeCwd(this.env)
+  }
+
+  readTranscript(userId: string, sessionId: string, before?: number): ClaudeTranscriptPage {
+    if (!isValidClaudeSessionId(sessionId)) throw new Error('invalid Claude session id')
+    const id = sessionId.trim()
+    const live = this.sessions.get(id)
+    if (live && !live.closed) {
+      if (live.userId !== userId) throw new ClaudeTerminalForbiddenError()
+    } else if (!this.owners.isVisibleTo(id, userId)) {
+      throw new ClaudeTerminalForbiddenError()
+    }
+    try {
+      return readClaudeSessionTranscriptPage(id, before, this.env)
+    } catch (err) {
+      // A newly spawned official CLI does not create its JSONL until the first prompt.
+      if (live && !live.closed && (err as NodeJS.ErrnoException).code === 'ENOENT') {
+        return { entries: [], before: null, fileSize: 0 }
+      }
+      throw err
+    }
   }
 
   shutdown(reason = 'shutdown'): void {

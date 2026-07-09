@@ -16,7 +16,7 @@
 <link rel="apple-touch-icon" href="/icon.svg" />
 <link rel="stylesheet" href="/vendor/github-dark.min.css" />
 <link rel="stylesheet" href="/vendor/katex/katex.min.css" />
-<link rel="stylesheet" href="/style.css?v=67" />
+<link rel="stylesheet" href="/style.css?v=68" />
 <link rel="stylesheet" href="/vendor/xterm/xterm.css?v=1" />
 <style>/* Inline styles removed — see style.css */
 </style>
@@ -738,6 +738,10 @@
     <div class="modal-body claude-terminal-body">
       <div class="claude-terminal-toolbar">
         <span id="claude-terminal-status" class="claude-terminal-status" role="status" aria-live="polite" data-state="idle">未连接</span>
+        <div class="claude-terminal-view-switch" role="tablist" aria-label="终端显示模式">
+          <button type="button" role="tab" aria-selected="true" data-claude-terminal-view="terminal">交互终端</button>
+          <button type="button" role="tab" aria-selected="false" data-claude-terminal-view="reader">阅读记录</button>
+        </div>
         <div class="claude-terminal-toolbar-actions">
           <input id="claude-terminal-file-input" class="file-input-hidden" type="file" multiple tabindex="-1" />
           <div class="claude-terminal-sessions-wrap">
@@ -754,13 +758,34 @@
           <span class="claude-terminal-hint">关闭=隐藏会话；终止=结束 Claude。</span>
         </div>
       </div>
-      <div class="claude-terminal-terminal-wrap">
+      <div id="claude-terminal-terminal-wrap" class="claude-terminal-terminal-wrap">
         <div id="claude-terminal-container" class="claude-terminal-container" aria-label="Claude Code terminal"></div>
         <div id="claude-terminal-scroll-capture" class="claude-terminal-scroll-capture" aria-hidden="true"></div>
         <div id="claude-terminal-drop-hint" class="claude-terminal-drop-hint" hidden>松手上传到终端可读路径</div>
         <button id="claude-terminal-new-output-btn" class="claude-terminal-new-output" type="button" hidden aria-hidden="true">有新输出 · 到底部</button>
       </div>
-      <div class="claude-terminal-mobile-dock" aria-label="移动端终端输入">
+      <section id="claude-terminal-reader" class="claude-terminal-reader" aria-label="Claude Code 阅读记录" hidden>
+        <div class="claude-terminal-reader-head">
+          <div>
+            <div class="claude-terminal-reader-title-row">
+              <strong>干净会话记录</strong>
+              <span id="claude-terminal-reader-live" class="claude-terminal-reader-live">CC 仍在运行</span>
+            </div>
+            <p>直接读取当前官方 Claude Code 会话记录；不会替换、暂停或终止交互终端。</p>
+          </div>
+          <div class="claude-terminal-reader-actions">
+            <button id="claude-terminal-reader-refresh" class="btn btn-ghost" type="button">刷新</button>
+            <button id="claude-terminal-reader-copy-latest" class="btn btn-ghost" type="button">复制最近回复</button>
+            <button id="claude-terminal-reader-copy-all" class="btn btn-ghost" type="button">复制已加载</button>
+          </div>
+        </div>
+        <div id="claude-terminal-reader-list" class="claude-terminal-reader-list" aria-live="polite"></div>
+        <div class="claude-terminal-reader-foot">
+          <button id="claude-terminal-reader-older" class="btn btn-ghost" type="button">加载更早记录</button>
+          <span id="claude-terminal-reader-state" role="status">切换到阅读记录后加载当前会话</span>
+        </div>
+      </section>
+      <div id="claude-terminal-mobile-dock" class="claude-terminal-mobile-dock" aria-label="移动端终端输入">
         <div class="claude-terminal-mobile-input-row">
           <textarea id="claude-terminal-mobile-input" rows="1" placeholder="移动端输入命令，点发送会自动回车" autocomplete="off" autocapitalize="none" autocorrect="off" spellcheck="false"></textarea>
           <button id="claude-terminal-mobile-send-btn" class="btn btn-primary" type="button">发送</button>
@@ -873,7 +898,7 @@
 <!-- Force SW cache refresh (one-time, remove after all clients updated) -->
 <script>
 (function(){
-  var V='sw-flush-v26';
+  var V='sw-flush-v27';
   if(localStorage.getItem(V))return;
   if('serviceWorker' in navigator){
     navigator.serviceWorker.getRegistrations().then(function(regs){
@@ -895,6 +920,6 @@
 <script src="/vendor/katex/katex.min.js" defer></script>
 <script src="/vendor/qrcode.min.js"></script>
 <div id="toast" class="toast"></div>
-<script type="module" src="/modules/main.js?v=84"></script>
+<script type="module" src="/modules/main.js?v=85"></script>
 </body>
 </html>

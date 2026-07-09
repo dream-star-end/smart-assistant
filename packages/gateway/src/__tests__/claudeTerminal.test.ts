@@ -6,11 +6,12 @@ import {
   mkdtempSync,
   readFileSync,
   rmSync,
+  statSync,
   utimesSync,
   writeFileSync,
 } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
-import { join, resolve } from 'node:path'
+import { dirname, join, resolve } from 'node:path'
 import { describe, test } from 'node:test'
 import type { WebSocket } from 'ws'
 
@@ -26,6 +27,9 @@ import {
   isClaudeTerminalEnabled,
   isValidClaudeSessionId,
   listClaudeSessions,
+  parseClaudeTranscriptRecord,
+  readClaudeSessionTranscriptPage,
+  resolveClaudeSessionTranscriptPath,
   resolveClaudeTerminalUserIdForAuth,
   resolveDetachedTerminalTtlMs,
   resolveMaxSessionsPerUser,
@@ -271,6 +275,128 @@ describe('official Claude terminal helpers', () => {
       null,
     )
   })
+
+  test('parses only human/Claude text records for the clean transcript view', () => {
+    assert.deepEqual(
+      parseClaudeTranscriptRecord(
+        {
+          type: 'assistant',
+          uuid: 'assistant-1',
+          timestamp: '2026-07-10T00:00:00.000Z',
+          message: {
+            content: [
+              { type: 'thinking', thinking: 'hidden' },
+              { type: 'text', text: '可阅读回复\u001b[31m' },
+              { type: 'tool_use', name: 'Bash' },
+            ],
+          },
+        },
+        42,
+      ),
+      {
+        id: 'assistant-1',
+        role: 'assistant',
+        text: '可阅读回复',
+        timestamp: '2026-07-10T00:00:00.000Z',
+        position: 42,
+      },
+    )
+    assert.equal(
+      parseClaudeTranscriptRecord(
+        { type: 'user', message: { content: [{ type: 'tool_result', content: 'hidden' }] } },
+        0,
+      ),
+      null,
+    )
+    assert.equal(
+      parseClaudeTranscriptRecord(
+        { type: 'user', message: { content: '<command-name>/model</command-name>' } },
+        0,
+      ),
+      null,
+    )
+    assert.equal(
+      parseClaudeTranscriptRecord(
+        { type: 'user', isMeta: true, message: { content: 'system reminder' } },
+        0,
+      ),
+      null,
+    )
+  })
+
+  test('reads complete JSONL records from a bounded backward page', () => {
+    const root = mkdtempSync(join(tmpdir(), 'oc-cc-transcript-page-'))
+    const cwd = join(root, 'workspace')
+    const env = { HOME: root, OPENCLAUDE_OFFICIAL_CLAUDE_CWD: cwd }
+    const sessionId = '11111111-1111-4111-8111-111111111111'
+    mkdirSync(cwd, { recursive: true })
+    const transcriptPath = resolveClaudeSessionTranscriptPath(sessionId, env)
+    mkdirSync(dirname(transcriptPath), { recursive: true })
+    writeFileSync(
+      transcriptPath,
+      [
+        JSON.stringify({
+          type: 'user',
+          uuid: 'user-1',
+          message: { content: '第一条问题' },
+        }),
+        JSON.stringify({
+          type: 'assistant',
+          uuid: 'assistant-1',
+          message: { content: [{ type: 'text', text: '第一条回答' }] },
+        }),
+        '{"type":"assistant","message":{"content":',
+      ].join('\n'),
+    )
+    try {
+      const page = readClaudeSessionTranscriptPage(sessionId, undefined, env)
+      assert.deepEqual(
+        page.entries.map((entry) => [entry.role, entry.text]),
+        [
+          ['user', '第一条问题'],
+          ['assistant', '第一条回答'],
+        ],
+      )
+      assert.equal(page.before, null)
+      assert.equal(page.fileSize, statSync(transcriptPath).size)
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  test('backward paging makes progress past an oversized UTF-8 JSONL record', () => {
+    const root = mkdtempSync(join(tmpdir(), 'oc-cc-transcript-large-'))
+    const cwd = join(root, 'workspace')
+    const env = { HOME: root, OPENCLAUDE_OFFICIAL_CLAUDE_CWD: cwd }
+    const sessionId = '22222222-2222-4222-8222-222222222222'
+    mkdirSync(cwd, { recursive: true })
+    const transcriptPath = resolveClaudeSessionTranscriptPath(sessionId, env)
+    mkdirSync(dirname(transcriptPath), { recursive: true })
+    writeFileSync(
+      transcriptPath,
+      `${JSON.stringify({ type: 'user', uuid: 'early', message: { content: '更早问题' } })}\n${JSON.stringify({ type: 'system', payload: '界'.repeat(220_000) })}\n${JSON.stringify({ type: 'assistant', uuid: 'latest', message: { content: '最新回答' } })}\n`,
+    )
+    try {
+      const latest = readClaudeSessionTranscriptPage(sessionId, undefined, env)
+      assert.deepEqual(
+        latest.entries.map((entry) => entry.text),
+        ['最新回答'],
+      )
+      assert.notEqual(latest.before, null)
+      const oversized = readClaudeSessionTranscriptPage(sessionId, latest.before!, env)
+      assert.deepEqual(oversized.entries, [])
+      assert.notEqual(oversized.before, null)
+      assert.ok(oversized.before! < latest.before!)
+      const earlier = readClaudeSessionTranscriptPage(sessionId, oversized.before!, env)
+      assert.deepEqual(
+        earlier.entries.map((entry) => entry.text),
+        ['更早问题'],
+      )
+      assert.equal(earlier.before, null)
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
 })
 
 describe('ClaudeTerminalManager lifecycle', () => {
@@ -340,6 +466,54 @@ describe('ClaudeTerminalManager lifecycle', () => {
       SERVER_SRC,
       /handleClaudeTerminalConnection[\s\S]*const userId = this\.getClaudeTerminalUserId\(req\)[\s\S]*handleConnection\(ws, userId/,
     )
+  })
+
+  test('server exposes an authenticated ownership-checked transcript route', () => {
+    assert.match(SERVER_SRC, /url\.pathname === '\/api\/claude-terminal\/transcript'/)
+    assert.match(
+      SERVER_SRC,
+      /handleClaudeTerminalTranscript[\s\S]*req\.method !== 'GET'[\s\S]*getClaudeTerminalUserId\(req\)/,
+    )
+    assert.match(SERVER_SRC, /manager\.readTranscript\(userId, sessionId, before\)/)
+    assert.match(
+      SERVER_SRC,
+      /handleClaudeTerminalTranscript[\s\S]*ClaudeTerminalForbiddenError[\s\S]*sendError\(res, 403/,
+    )
+    assert.match(SERVER_SRC, /before must be a non-negative integer/)
+  })
+
+  test('transcript reads stay scoped to the live/owned Claude session', () => {
+    const root = mkdtempSync(join(tmpdir(), 'oc-cc-transcript-owner-'))
+    const cwd = join(root, 'workspace')
+    const env = {
+      HOME: root,
+      PATH: '/usr/bin',
+      OPENCLAUDE_OFFICIAL_CLAUDE_PATH: '/bin/echo',
+      OPENCLAUDE_OFFICIAL_CLAUDE_CWD: cwd,
+    }
+    mkdirSync(cwd, { recursive: true })
+    const manager = makeManager({ env, spawn: () => new FakePty() })
+    const ws = new FakeWs()
+    manager.handleConnection(asWs(ws), 'user-a')
+    const sessionId = runningSessionId(ws)
+    const transcriptPath = resolveClaudeSessionTranscriptPath(sessionId, env)
+    assert.deepEqual(manager.readTranscript('user-a', sessionId), {
+      entries: [],
+      before: null,
+      fileSize: 0,
+    })
+    mkdirSync(dirname(transcriptPath), { recursive: true })
+    writeFileSync(
+      transcriptPath,
+      `${JSON.stringify({ type: 'user', uuid: 'user-owned', message: { content: '私有会话' } })}\n`,
+    )
+    try {
+      assert.equal(manager.readTranscript('user-a', sessionId).entries[0]?.text, '私有会话')
+      assert.throws(() => manager.readTranscript('user-b', sessionId), ClaudeTerminalForbiddenError)
+    } finally {
+      manager.shutdown('test cleanup')
+      rmSync(root, { recursive: true, force: true })
+    }
   })
 
   test('spawns a session keyed by id, forwards output/input, clamps resize, detaches on close, terminates by id+owner', () => {
