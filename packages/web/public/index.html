@@ -16,7 +16,7 @@
 <link rel="apple-touch-icon" href="/icon.svg" />
 <link rel="stylesheet" href="/vendor/github-dark.min.css" />
 <link rel="stylesheet" href="/vendor/katex/katex.min.css" />
-<link rel="stylesheet" href="/style.css?v=68" />
+<link rel="stylesheet" href="/style.css?v=69" />
 <link rel="stylesheet" href="/vendor/xterm/xterm.css?v=1" />
 <style>/* Inline styles removed — see style.css */
 </style>
@@ -771,9 +771,10 @@
               <strong>干净会话记录</strong>
               <span id="claude-terminal-reader-live" class="claude-terminal-reader-live">CC 仍在运行</span>
             </div>
-            <p>直接读取当前官方 Claude Code 会话记录；不会替换、暂停或终止交互终端。</p>
+            <p>安全渲染 Markdown、数学公式与文件链接；不会替换、暂停或终止交互终端。</p>
           </div>
           <div class="claude-terminal-reader-actions">
+            <button id="claude-terminal-reader-render-toggle" class="btn btn-ghost" type="button" aria-pressed="true">查看原文</button>
             <button id="claude-terminal-reader-refresh" class="btn btn-ghost" type="button">刷新</button>
             <button id="claude-terminal-reader-copy-latest" class="btn btn-ghost" type="button">复制最近回复</button>
             <button id="claude-terminal-reader-copy-all" class="btn btn-ghost" type="button">复制已加载</button>
@@ -898,7 +899,7 @@
 <!-- Force SW cache refresh (one-time, remove after all clients updated) -->
 <script>
 (function(){
-  var V='sw-flush-v27';
+  var V='sw-flush-v28';
   if(localStorage.getItem(V))return;
   if('serviceWorker' in navigator){
     navigator.serviceWorker.getRegistrations().then(function(regs){
@@ -920,6 +921,6 @@
 <script src="/vendor/katex/katex.min.js" defer></script>
 <script src="/vendor/qrcode.min.js"></script>
 <div id="toast" class="toast"></div>
-<script type="module" src="/modules/main.js?v=85"></script>
+<script type="module" src="/modules/main.js?v=86"></script>
 </body>
 </html>

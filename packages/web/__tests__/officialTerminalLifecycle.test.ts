@@ -242,12 +242,12 @@ describe('official Claude terminal lifecycle', () => {
   })
 
   it('cache-busts terminal assets consistently across index/sw/main', () => {
-    assert.match(MAIN, /from '\.\/officialTerminal\.js\?v=18'/)
-    assert.match(SW, /\/modules\/officialTerminal\.js\?v=18/)
-    assert.match(INDEX, /\/modules\/main\.js\?v=85/)
-    assert.match(INDEX, /\/style\.css\?v=68/)
-    assert.match(INDEX, /sw-flush-v27/)
-    assert.match(SW, /openclaude-v110/)
+    assert.match(MAIN, /from '\.\/officialTerminal\.js\?v=19'/)
+    assert.match(SW, /\/modules\/officialTerminal\.js\?v=19/)
+    assert.match(INDEX, /\/modules\/main\.js\?v=86/)
+    assert.match(INDEX, /\/style\.css\?v=69/)
+    assert.match(INDEX, /sw-flush-v28/)
+    assert.match(SW, /openclaude-v111/)
   })
 
   it('caches xterm selection (TTL + consume + new-interaction bounded) so TUI redraws do not drop copy', () => {
@@ -403,7 +403,10 @@ describe('official Claude terminal lifecycle', () => {
     assert.match(loadSrc, /api\/claude-terminal\/transcript/)
     assert.match(loadSrc, /URLSearchParams\(\{ sessionId \}\)/)
     assert.match(loadSrc, /query\.set\('before'/)
-    assert.match(renderSrc, /textContent = group\.parts\.join/)
+    assert.match(renderSrc, /group\.role === 'assistant'/)
+    assert.match(renderSrc, /body\.innerHTML = renderMarkdown\(source\)/)
+    assert.match(renderSrc, /body\.textContent = source/)
+    assert.match(renderSrc, /processRichBlocks\(\)/)
     assert.match(INDEX, /id="claude-terminal-reader-copy-latest"/)
     assert.match(INDEX, /id="claude-terminal-reader-copy-all"/)
     assert.match(STYLE, /\.claude-terminal-reader-list\s*{[\s\S]*?overflow-y:\s*auto;/)
@@ -413,6 +416,38 @@ describe('official Claude terminal lifecycle', () => {
       STYLE,
       /@media \(max-width: 860px\) {[\s\S]*?\.claude-terminal-reader\s*{[\s\S]*?min-height:\s*0;/,
     )
+  })
+
+  it('reader rich mode safely renders Markdown/math while raw mode and copy keep source text', () => {
+    const renderSrc = extractFunction(SRC, 'renderTerminalTranscript')
+    const toggleSrc = extractFunction(SRC, 'toggleTerminalTranscriptRenderMode')
+    const copyLatestSrc = extractFunction(SRC, 'latestClaudeTranscriptText')
+    const copyAllSrc = extractFunction(SRC, 'loadedTerminalTranscriptText')
+    assert.match(SRC, /import \{ processRichBlocks, renderMarkdown \} from '\.\/markdown\.js'/)
+    assert.match(INDEX, /id="claude-terminal-reader-render-toggle"/)
+    assert.match(renderSrc, /terminalTranscriptRenderMode === 'rich'/)
+    assert.match(renderSrc, /classList\.add\('is-rich'\)/)
+    assert.match(toggleSrc, /terminalTranscriptRenderMode === 'rich' \? 'raw' : 'rich'/)
+    assert.match(copyLatestSrc, /entry\.text/)
+    assert.match(copyAllSrc, /group\.parts\.join/)
+    assert.doesNotMatch(copyLatestSrc + copyAllSrc, /innerHTML|textContent/)
+    assert.match(
+      STYLE,
+      /\.claude-terminal-reader-message-text\.is-rich table\s*{[\s\S]*?overflow-x:\s*auto;/,
+    )
+    assert.match(STYLE, /\.claude-terminal-reader-message-text\.is-rich \.math-block/)
+  })
+
+  it('reader file cards exchange local /api/file paths for scoped ticket URLs', () => {
+    const linkSrc = extractFunction(SRC, 'handleTerminalReaderFileLink')
+    const initSrc = extractFunction(SRC, 'initOfficialClaudeTerminal')
+    assert.match(linkSrc, /closest\?\.\('a\.doc-card'\)/)
+    assert.match(linkSrc, /isApiFileUrl\(href\)/)
+    assert.match(linkSrc, /hasAttribute\('download'\) \? 'attachment' : 'inline'/)
+    assert.match(linkSrc, /window\.open\('about:blank', '_blank'\)/)
+    assert.match(linkSrc, /ticketedFileUrl\(href, disposition\)/)
+    assert.match(linkSrc, /stopPropagation\(\)/)
+    assert.match(initSrc, /READER_ID[\s\S]*handleTerminalReaderFileLink/)
   })
 
   it('keeps writing live output to xterm while reader refresh stays auxiliary', () => {

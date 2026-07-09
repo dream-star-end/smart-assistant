@@ -5454,6 +5454,150 @@ body.voice-overlay-open {
   user-select: text;
   -webkit-user-select: text;
 }
+.claude-terminal-reader-message-text.is-rich {
+  white-space: normal;
+}
+.claude-terminal-reader-message-text.is-rich > :first-child {
+  margin-top: 0;
+}
+.claude-terminal-reader-message-text.is-rich > :last-child {
+  margin-bottom: 0;
+}
+.claude-terminal-reader-message-text.is-rich p {
+  margin: 0.7em 0;
+}
+.claude-terminal-reader-message-text.is-rich ul,
+.claude-terminal-reader-message-text.is-rich ol {
+  margin: 0.55em 0;
+  padding-left: 22px;
+}
+.claude-terminal-reader-message-text.is-rich li {
+  margin: 0.3em 0;
+}
+.claude-terminal-reader-message-text.is-rich h1,
+.claude-terminal-reader-message-text.is-rich h2,
+.claude-terminal-reader-message-text.is-rich h3,
+.claude-terminal-reader-message-text.is-rich h4 {
+  margin: 1.05em 0 0.4em;
+  color: var(--fg-strong);
+  font-weight: 650;
+  line-height: 1.3;
+  letter-spacing: -0.01em;
+}
+.claude-terminal-reader-message-text.is-rich h1 {
+  font-size: 1.4em;
+}
+.claude-terminal-reader-message-text.is-rich h2 {
+  font-size: 1.23em;
+}
+.claude-terminal-reader-message-text.is-rich h3 {
+  font-size: 1.1em;
+}
+.claude-terminal-reader-message-text.is-rich h4 {
+  font-size: 1em;
+}
+.claude-terminal-reader-message-text.is-rich a {
+  color: var(--accent);
+  text-decoration: underline;
+  text-decoration-color: var(--accent-border);
+  text-underline-offset: 2px;
+}
+.claude-terminal-reader-message-text.is-rich a:hover {
+  text-decoration-color: var(--accent);
+}
+.claude-terminal-reader-message-text.is-rich blockquote {
+  margin: 0.7em 0;
+  padding: 2px 0 2px 14px;
+  border-left: 3px solid var(--accent-border);
+  color: var(--fg-muted);
+}
+.claude-terminal-reader-message-text.is-rich hr {
+  margin: 1.1em 0;
+  border: 0;
+  border-top: 1px solid var(--border);
+}
+.claude-terminal-reader-message-text.is-rich code {
+  padding: 2px 6px;
+  border-radius: var(--radius-sm);
+  background: var(--inline-code-bg);
+  color: var(--fg);
+  font-family: var(--font-mono);
+  font-size: 0.9em;
+}
+.claude-terminal-reader-message-text.is-rich pre,
+.claude-terminal-reader-message-text.is-rich pre.code-block {
+  position: relative;
+  max-width: 100%;
+  margin: 0.8em 0;
+  padding: 36px 16px 14px;
+  overflow-x: auto;
+  overscroll-behavior-x: contain;
+  border: 1px solid var(--code-border);
+  border-radius: var(--radius-lg);
+  background: var(--code-bg);
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  line-height: 1.55;
+  -webkit-overflow-scrolling: touch;
+}
+.claude-terminal-reader-message-text.is-rich pre code {
+  padding: 0;
+  background: transparent;
+  font-size: var(--text-sm);
+  white-space: pre;
+}
+.claude-terminal-reader-message-text.is-rich .code-lang {
+  position: absolute;
+  top: 10px;
+  left: 14px;
+  color: var(--fg-dim);
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  user-select: none;
+}
+.claude-terminal-reader-message-text.is-rich .code-copy {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  padding: 4px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-raised);
+  color: var(--fg-muted);
+  font-size: 11px;
+}
+.claude-terminal-reader-message-text.is-rich table {
+  display: block;
+  max-width: 100%;
+  margin: 0.7em 0;
+  overflow-x: auto;
+  border-collapse: collapse;
+  font-size: 0.95em;
+  -webkit-overflow-scrolling: touch;
+}
+.claude-terminal-reader-message-text.is-rich th,
+.claude-terminal-reader-message-text.is-rich td {
+  padding: 6px 12px;
+  border: 1px solid var(--border);
+  white-space: nowrap;
+}
+.claude-terminal-reader-message-text.is-rich th {
+  background: var(--bg-raised);
+  font-weight: 600;
+}
+.claude-terminal-reader-message-text.is-rich .math-block,
+.claude-terminal-reader-message-text.is-rich .katex-display {
+  max-width: 100%;
+  overflow-x: auto;
+  overflow-y: hidden;
+  -webkit-overflow-scrolling: touch;
+}
+.claude-terminal-reader-message-text.is-rich .doc-card {
+  max-width: 100%;
+  text-decoration: none;
+}
 .claude-terminal-reader-empty {
   display: grid;
   flex: 1;
