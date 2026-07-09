@@ -5,6 +5,7 @@ import { createConnection, createServer } from 'node:net'
 import { tmpdir } from 'node:os'
 import { basename, dirname, isAbsolute, join } from 'node:path'
 import { promisify } from 'node:util'
+import { Agent, fetch as undiciFetch } from 'undici'
 
 const execFileAsync = promisify(execFile)
 
@@ -19,6 +20,17 @@ const DEFAULT_SING_BOX = '/usr/local/bin/sing-box'
 const DEFAULT_CURL = '/usr/bin/curl'
 const MAX_TEST_IDXS = 20
 const TEST_CONCURRENCY = 3
+const DIRECT_FETCH_DISPATCHER = new Agent()
+const PROXY_ENV_KEYS_TO_STRIP = [
+  'HTTPS_PROXY',
+  'HTTP_PROXY',
+  'https_proxy',
+  'http_proxy',
+  'ALL_PROXY',
+  'all_proxy',
+  'NO_PROXY',
+  'no_proxy',
+] as const
 
 interface EgressOptions {
   env?: NodeJS.ProcessEnv
@@ -151,6 +163,12 @@ function envBool(raw: string | undefined): boolean | undefined {
   if (['1', 'true', 'yes', 'on'].includes(v)) return true
   if (['0', 'false', 'no', 'off'].includes(v)) return false
   return false
+}
+
+function withoutProxyEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  const out = { ...env }
+  for (const key of PROXY_ENV_KEYS_TO_STRIP) delete out[key]
+  return out
 }
 
 function isValidServiceName(name: string): boolean {
@@ -443,8 +461,9 @@ async function fetchSubscription(settings: EgressSettings): Promise<string[]> {
   const ctrl = new AbortController()
   const timer = setTimeout(() => ctrl.abort(), 30_000)
   try {
-    const res = await fetch(settings.subscriptionUrl, {
+    const res = await undiciFetch(settings.subscriptionUrl, {
       headers: { 'User-Agent': 'Mozilla/5.0 OpenClaudeOps/1.0' },
+      dispatcher: DIRECT_FETCH_DISPATCHER,
       signal: ctrl.signal,
     })
     if (!res.ok) throw new EgressHttpError(502, `subscription fetch failed: HTTP ${res.status}`)
@@ -518,6 +537,7 @@ async function execLimited(
     const { stdout, stderr } = await execFileAsync(file, args, {
       timeout: timeoutMs,
       maxBuffer: 256 * 1024,
+      env: withoutProxyEnv(),
       windowsHide: true,
     })
     return { stdout: String(stdout || ''), stderr: String(stderr || '') }
@@ -629,6 +649,8 @@ async function curlProbe(
         String(timeoutSec),
         '-x',
         proxy,
+        '--noproxy',
+        '',
         '-o',
         '/dev/null',
         '-w',
@@ -653,7 +675,7 @@ async function ipinfo(settings: EgressSettings, proxy: string): Promise<Partial<
   try {
     const { stdout } = await execLimited(
       settings.curlPath,
-      ['-sS', '--max-time', '10', '-x', proxy, 'https://ipinfo.io/json'],
+      ['-sS', '--max-time', '10', '-x', proxy, '--noproxy', '', 'https://ipinfo.io/json'],
       13_000,
     )
     const data = JSON.parse(stdout)
@@ -727,6 +749,7 @@ async function testCandidate(
     })
     await execLimited(settings.singBoxPath, ['check', '-c', cfgPath], 10_000)
     proc = spawn(settings.singBoxPath, ['run', '-c', cfgPath], {
+      env: withoutProxyEnv(),
       stdio: 'ignore',
     })
     if (!(await waitPort(settings.testListen, port)))
