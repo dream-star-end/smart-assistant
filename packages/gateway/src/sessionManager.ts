@@ -35,7 +35,7 @@ export const LIVENESS_IDLE_TIMEOUT_DEFAULT_MS = 5 * 60_000
 export const LIVENESS_IDLE_TIMEOUT_COMPACTING_MS = 20 * 60_000
 // Codex app-server only: cold-start grace until a turn's first observable-output
 // block. codex liveness counts only visible progress (getLivenessIdleMs ignores
-// its raw stdout), and gpt-5.5 at high reasoning effort (esp. Goal mode) can
+// its raw stdout), and Codex GPT-5 at high reasoning effort (esp. Goal mode) can
 // reason server-side for >5min before emitting its first block. The 5min DEFAULT
 // tier is tuned for claude's dense streaming and falsely kills codex's cold
 // phase. Until the first block of a turn, codex measures idle from turnStartedAt

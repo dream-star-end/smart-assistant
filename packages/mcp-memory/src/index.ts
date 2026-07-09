@@ -378,7 +378,7 @@ const TOOLS = [
       '- 并行分发多个研究/分析任务',
       '- 需要隔离上下文的子任务',
       '',
-      '提示:需要让 GPT-5.5/Codex 参与时,传 `agentId="codex"`;也可直接用 `ask_gpt55_codex`。',
+      '提示:需要让 Codex / GPT-5.6 参与时,传 `agentId="codex"`;也可直接用兼容保留的 `ask_gpt55_codex`。',
       '',
       '限制: 最大递归深度 3 层,最大并发 5 个。',
     ].join('\n'),
@@ -397,16 +397,16 @@ const TOOLS = [
       required: ['goal'],
     },
   },
-  // ── Direct GPT-5.5 / Codex bridge ──
+  // ── Direct Codex bridge (legacy tool name retained for compatibility) ──
   {
     name: 'ask_gpt55_codex',
     description: [
-      '直接调用系统内置的 GPT-5.5 / Codex agent 并等待结果返回。',
+      '直接调用系统内置的 Codex / GPT-5.6 agent 并等待结果返回。',
       '',
       '适用场景:',
-      '- 当前主模型是 DeepSeek/Claude Code(CC),但需要 GPT-5.5/Codex 做代码审查、复杂推理或第二意见。',
-      '- 用户明确要求“让 codex / gpt-5.5 看一下”。',
-      '- 你需要同步拿到 GPT-5.5 的输出后再继续整合回答。',
+      '- 当前主模型是 DeepSeek/Claude Code(CC),但需要 Codex / GPT-5.6 做代码审查、复杂推理或第二意见。',
+      '- 用户明确要求“让 codex / gpt-5.6 / gpt-5.5 看一下”。',
+      '- 你需要同步拿到 Codex 的输出后再继续整合回答。',
       '',
       '等价于 `delegate_task(agentId="codex", ...)`,但无需记住 agentId。',
       '限制: 仍受委派最大递归深度 3 层、并发 5 个限制。',
@@ -414,7 +414,7 @@ const TOOLS = [
     inputSchema: {
       type: 'object',
       properties: {
-        goal: { type: 'string', description: '要交给 GPT-5.5/Codex 完成的问题或任务' },
+        goal: { type: 'string', description: '要交给 Codex / GPT-5.6 完成的问题或任务' },
         context: { type: 'string', description: '必要上下文,如代码片段、报错、你的初步判断等' },
         toolsets: {
           type: 'array',
@@ -817,7 +817,7 @@ async function handleAskGpt55Codex(args: { goal: string; context?: string; tools
     goal: args.goal,
     context: args.context,
     toolsets: args.toolsets,
-    label: 'codex / GPT-5.5',
+    label: 'codex / GPT-5.6',
   })
 }
 

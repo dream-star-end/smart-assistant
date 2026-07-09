@@ -272,7 +272,7 @@ describe('buildCodexLaunchOverrides', () => {
     const { buildCodexLaunchOverrides } = await import('../codexLaunchOverrides.js')
     const out = await buildCodexLaunchOverrides({
       agentId: 'test-agent',
-      model: 'gpt-5.5',
+      model: 'gpt-5.6-sol',
       effortLevel: 'high',
       sessionDir: dir,
       gatewayPort: 18789,
@@ -284,11 +284,11 @@ describe('buildCodexLaunchOverrides', () => {
     assert.equal(out.argvOverrides[3], 'model_reasoning_effort="high"')
   })
 
-  it('does not pass unsupported max as codex model_reasoning_effort', async () => {
+  it('does not pass non-common max as codex model_reasoning_effort', async () => {
     const { buildCodexLaunchOverrides } = await import('../codexLaunchOverrides.js')
     const out = await buildCodexLaunchOverrides({
       agentId: 'test-agent',
-      model: 'gpt-5.5',
+      model: 'gpt-5.6-sol',
       effortLevel: 'max',
       sessionDir: dir,
       gatewayPort: 18789,
