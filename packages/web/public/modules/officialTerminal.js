@@ -1,7 +1,8 @@
 // Official Claude Code terminal modal.
 // Runs the official `claude` CLI inside a gateway-owned PTY over /ws/claude-terminal.
-import { apiFetch, apiJson, authHeaders } from './api.js'
+import { apiFetch, apiJson, authHeaders, isApiFileUrl, ticketedFileUrl } from './api.js'
 import { $ } from './dom.js'
+import { processRichBlocks, renderMarkdown } from './markdown.js'
 import { state } from './state.js'
 import { closeModal, openModal, toast } from './ui.js'
 
@@ -24,6 +25,7 @@ const READER_LIST_ID = 'claude-terminal-reader-list'
 const READER_STATE_ID = 'claude-terminal-reader-state'
 const READER_LIVE_ID = 'claude-terminal-reader-live'
 const READER_REFRESH_ID = 'claude-terminal-reader-refresh'
+const READER_RENDER_TOGGLE_ID = 'claude-terminal-reader-render-toggle'
 const READER_OLDER_ID = 'claude-terminal-reader-older'
 const READER_COPY_LATEST_ID = 'claude-terminal-reader-copy-latest'
 const READER_COPY_ALL_ID = 'claude-terminal-reader-copy-all'
@@ -111,6 +113,7 @@ let terminalTranscriptSessionId = null
 let terminalTranscriptLoading = false
 let terminalTranscriptLoaded = false
 let terminalTranscriptError = ''
+let terminalTranscriptRenderMode = 'rich'
 let terminalTranscriptRefreshTimer = null
 let terminalTranscriptRequestSeq = 0
 const terminalUploads = []
@@ -313,6 +316,7 @@ function renderTerminalTranscript() {
       : terminalTranscriptError || '当前会话还没有可阅读的用户或 Claude 文本记录。'
     list.appendChild(empty)
   } else {
+    let renderedRichContent = false
     for (const group of groups) {
       const article = document.createElement('article')
       article.className = `claude-terminal-reader-message is-${group.role}`
@@ -325,10 +329,18 @@ function renderTerminalTranscript() {
       meta.append(author, time)
       const body = document.createElement('div')
       body.className = 'claude-terminal-reader-message-text'
-      body.textContent = group.parts.join('\n\n')
+      const source = group.parts.join('\n\n')
+      if (group.role === 'assistant' && terminalTranscriptRenderMode === 'rich') {
+        body.classList.add('is-rich')
+        body.innerHTML = renderMarkdown(source)
+        renderedRichContent = true
+      } else {
+        body.textContent = source
+      }
       article.append(meta, body)
       list.appendChild(article)
     }
+    if (renderedRichContent) void processRichBlocks()
   }
 
   const older = $(READER_OLDER_ID)
@@ -342,6 +354,13 @@ function renderTerminalTranscript() {
   }
   const refresh = $(READER_REFRESH_ID)
   if (refresh) refresh.disabled = terminalTranscriptLoading || !currentSessionId
+  const renderToggle = $(READER_RENDER_TOGGLE_ID)
+  if (renderToggle) {
+    const rich = terminalTranscriptRenderMode === 'rich'
+    renderToggle.textContent = rich ? '查看原文' : '渲染 Markdown'
+    renderToggle.setAttribute('aria-pressed', String(rich))
+    renderToggle.title = rich ? '切换为未经渲染的 Markdown 原文' : '安全渲染 Markdown 与数学公式'
+  }
   const copyLatest = $(READER_COPY_LATEST_ID)
   if (copyLatest)
     copyLatest.disabled = !terminalTranscriptEntries.some((entry) => entry.role === 'assistant')
@@ -498,6 +517,37 @@ async function copyTerminalTranscript(text, successMessage) {
   if (!text.trim()) return toast('没有可复制的会话内容', 'warning')
   const ok = await copyTextToClipboard(text)
   toast(ok ? successMessage : '复制失败，请检查浏览器剪贴板权限', ok ? 'success' : 'error')
+}
+
+function toggleTerminalTranscriptRenderMode() {
+  terminalTranscriptRenderMode = terminalTranscriptRenderMode === 'rich' ? 'raw' : 'rich'
+  renderTerminalTranscript()
+}
+
+function handleTerminalReaderFileLink(event) {
+  const card = event.target?.closest?.('a.doc-card')
+  const reader = $(READER_ID)
+  if (!card || !reader?.contains(card)) return
+  const href = card.getAttribute('href') || ''
+  if (!isApiFileUrl(href)) return
+  event.preventDefault()
+  event.stopPropagation()
+  const disposition = card.hasAttribute('download') ? 'attachment' : 'inline'
+  // 同步预开窗口保留移动浏览器的 user activation；ticket 获取后再导航。
+  const popup = window.open('about:blank', '_blank')
+  ;(async () => {
+    const url = await ticketedFileUrl(href, disposition)
+    if (popup && !popup.closed) {
+      popup.location.replace(url)
+      return
+    }
+    const anchor = document.createElement('a')
+    anchor.href = url
+    anchor.target = '_blank'
+    anchor.rel = 'noopener noreferrer'
+    if (disposition === 'attachment' && url === href) anchor.download = ''
+    anchor.click()
+  })()
 }
 
 function setTerminalViewMode(mode) {
@@ -2370,6 +2420,8 @@ export function initOfficialClaudeTerminal() {
   $(READER_REFRESH_ID)?.addEventListener('click', () => {
     void loadTerminalTranscript()
   })
+  $(READER_RENDER_TOGGLE_ID)?.addEventListener('click', toggleTerminalTranscriptRenderMode)
+  $(READER_ID)?.addEventListener('click', handleTerminalReaderFileLink)
   $(READER_OLDER_ID)?.addEventListener('click', () => {
     void loadTerminalTranscript({ older: true })
   })
