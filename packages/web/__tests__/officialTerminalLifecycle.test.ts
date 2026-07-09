@@ -242,12 +242,12 @@ describe('official Claude terminal lifecycle', () => {
   })
 
   it('cache-busts terminal assets consistently across index/sw/main', () => {
-    assert.match(MAIN, /from '\.\/officialTerminal\.js\?v=17'/)
-    assert.match(SW, /\/modules\/officialTerminal\.js\?v=17/)
-    assert.match(INDEX, /\/modules\/main\.js\?v=84/)
-    assert.match(INDEX, /\/style\.css\?v=67/)
-    assert.match(INDEX, /sw-flush-v26/)
-    assert.match(SW, /openclaude-v109/)
+    assert.match(MAIN, /from '\.\/officialTerminal\.js\?v=18'/)
+    assert.match(SW, /\/modules\/officialTerminal\.js\?v=18/)
+    assert.match(INDEX, /\/modules\/main\.js\?v=85/)
+    assert.match(INDEX, /\/style\.css\?v=68/)
+    assert.match(INDEX, /sw-flush-v27/)
+    assert.match(SW, /openclaude-v110/)
   })
 
   it('caches xterm selection (TTL + consume + new-interaction bounded) so TUI redraws do not drop copy', () => {
@@ -380,6 +380,49 @@ describe('official Claude terminal lifecycle', () => {
       /@media \(max-width: 860px\) and \(hover: hover\) and \(pointer: fine\) {[\s\S]*?\.claude-terminal-scroll-capture\s*{[\s\S]*?display:\s*none;/,
     )
     assert.match(STYLE, /\.claude-terminal-new-output\s*{[\s\S]*?z-index:\s*3;/)
+  })
+
+  it('adds a clean reader mode without replacing or restarting the interactive CC PTY', () => {
+    const setModeSrc = extractFunction(SRC, 'setTerminalViewMode')
+    assert.match(INDEX, /data-claude-terminal-view="terminal"[^>]*>交互终端</)
+    assert.match(INDEX, /data-claude-terminal-view="reader"[^>]*>阅读记录</)
+    assert.match(INDEX, /id="claude-terminal-reader"/)
+    assert.match(INDEX, /CC 仍在运行/)
+    assert.match(setModeSrc, /TERMINAL_WRAP_ID/)
+    assert.match(setModeSrc, /READER_ID/)
+    assert.match(setModeSrc, /loadTerminalTranscript/)
+    assert.doesNotMatch(
+      setModeSrc,
+      /connectTerminal|closeSocket|disposeTerminal|terminateOfficialClaudeTerminal|type:\s*'kill'|type:\s*'resize'/,
+    )
+  })
+
+  it('reader mode uses the authenticated transcript API and native selectable scrolling', () => {
+    const loadSrc = extractFunction(SRC, 'loadTerminalTranscript')
+    const renderSrc = extractFunction(SRC, 'renderTerminalTranscript')
+    assert.match(loadSrc, /api\/claude-terminal\/transcript/)
+    assert.match(loadSrc, /URLSearchParams\(\{ sessionId \}\)/)
+    assert.match(loadSrc, /query\.set\('before'/)
+    assert.match(renderSrc, /textContent = group\.parts\.join/)
+    assert.match(INDEX, /id="claude-terminal-reader-copy-latest"/)
+    assert.match(INDEX, /id="claude-terminal-reader-copy-all"/)
+    assert.match(STYLE, /\.claude-terminal-reader-list\s*{[\s\S]*?overflow-y:\s*auto;/)
+    assert.match(STYLE, /\.claude-terminal-reader-list\s*{[\s\S]*?touch-action:\s*pan-y;/)
+    assert.match(STYLE, /\.claude-terminal-reader-list\s*{[\s\S]*?user-select:\s*text;/)
+    assert.match(
+      STYLE,
+      /@media \(max-width: 860px\) {[\s\S]*?\.claude-terminal-reader\s*{[\s\S]*?min-height:\s*0;/,
+    )
+  })
+
+  it('keeps writing live output to xterm while reader refresh stays auxiliary', () => {
+    assert.match(
+      SRC,
+      /payload\.type === 'output'[\s\S]*?writeTerminalOutput\(payload\.data\)[\s\S]*?scheduleTerminalTranscriptRefresh\(\)/,
+    )
+    const scheduleSrc = extractFunction(SRC, 'scheduleTerminalTranscriptRefresh')
+    assert.match(scheduleSrc, /isTerminalReaderMode\(\)/)
+    assert.match(scheduleSrc, /loadTerminalTranscript\(\{ quiet: true \}\)/)
   })
 
   it('exposes a sessions popover with new + history controls in the toolbar', () => {
