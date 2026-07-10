@@ -1,7 +1,11 @@
 import { type DependencyList, useCallback, useEffect, useRef, useState } from "react";
 
 export type UseAdminPollOptions = {
-  /** 轮询间隔（ms）。默认 30s（对齐旧 vanilla admin dashboard）。 */
+  /**
+   * 轮询间隔（ms）。默认 30s（对齐旧 vanilla admin dashboard）。
+   * **传 0 = 不轮询**（只首载一次;保留 deps 重拉/切回补拉/手动 refresh）——
+   * 「首载+手动刷新」型页面(containers 等)用这一档,不要拿超大间隔逼近。
+   */
   intervalMs?: number;
   /** 是否启用（false 时不拉取、清 loading）。用于「有筛选参数才拉」等条件。 */
   enabled?: boolean;
@@ -75,10 +79,12 @@ export function useAdminPoll<T>(
 
     setLoading(true);
     void run(); // 立即拉一次
-    timer = setInterval(() => {
-      if (document.visibilityState === "visible") void run(); // 隐藏时跳过 = 暂停
-    }, intervalMs);
-    document.addEventListener("visibilitychange", onVisible);
+    if (intervalMs > 0) {
+      timer = setInterval(() => {
+        if (document.visibilityState === "visible") void run(); // 隐藏时跳过 = 暂停
+      }, intervalMs);
+      document.addEventListener("visibilitychange", onVisible);
+    }
 
     return () => {
       alive = false;

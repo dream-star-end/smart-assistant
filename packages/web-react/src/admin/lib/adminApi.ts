@@ -52,24 +52,42 @@ export function adminGet<T>(path: string, params?: AdminParams): Promise<T> {
   );
 }
 
-/** 写操作（POST/PATCH/PUT/DELETE）→ JSON。body 省略时不带 content-type/请求体。 */
-export function adminSend<T>(
+/**
+ * 写操作（POST/PATCH/PUT/DELETE）→ JSON。body 省略时不带 content-type/请求体。
+ *
+ * 204/空响应体容错:部分写端点(如 compute-hosts expires-at)成功返回 204 No Content,
+ * `jsonOrThrow` 无条件 res.json() 会把成功误报为 SyntaxError。这里先行短路:
+ * 2xx 且(204 或空体)→ 返回 undefined(调用方 T 自行声明为 void/可选)。
+ * 非 2xx 仍走 throwApi 统一 ApiError 信封。
+ */
+export async function adminSend<T>(
   method: "POST" | "PATCH" | "PUT" | "DELETE",
   path: string,
   body?: unknown,
 ): Promise<T> {
   const url = buildUrl(path);
   const hasBody = body !== undefined;
-  return jsonOrThrow<T>(
-    callWithRefresh(adminSession, (t) =>
-      fetch(url, {
-        method,
-        credentials: "include",
-        headers: bearerHeaders(t, hasBody),
-        body: hasBody ? JSON.stringify(body) : undefined,
-      }),
-    ),
+  const res = await callWithRefresh(adminSession, (t) =>
+    fetch(url, {
+      method,
+      credentials: "include",
+      headers: bearerHeaders(t, hasBody),
+      body: hasBody ? JSON.stringify(body) : undefined,
+    }),
   );
+  if (!res.ok) await throwApi(res);
+  if (res.status === 204) return undefined as T;
+  const text = await res.text();
+  if (text.trim() === "") return undefined as T;
+  try {
+    return JSON.parse(text) as T;
+  } catch {
+    throw new ApiError({
+      status: res.status,
+      message: `响应不是合法 JSON(${url})`,
+      requestId: res.headers.get("x-request-id") ?? undefined,
+    });
+  }
 }
 
 /** GET → 纯文本（CSV 导出等）。非 2xx 仍抛统一 ApiError。 */
