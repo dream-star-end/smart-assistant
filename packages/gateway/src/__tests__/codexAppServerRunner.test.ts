@@ -23,6 +23,7 @@ import {
   _classifyJsonRpcLine,
   _codexUsageToAnthropicShape,
   _stringifyItemBounded,
+  stripShellWrapper,
 } from '../engine/codexAppServerRunner.js'
 
 // ── helpers ─────────────────────────────────────────────────────────────────
@@ -3133,5 +3134,158 @@ describe('item/completed — 大 result 完成事件保持合法 JSON(_stringify
         assert.ok(!(code >= 0xdc00 && code <= 0xdfff), `lone low surrogate at ${i}`)
       }
     }
+  })
+})
+
+// ── V5 CG(2026-07-10): stripShellWrapper POSIX 引号解析(任务1) ─────────────
+
+describe('stripShellWrapper — POSIX shell 引号解包', () => {
+  it('单引号包裹整体 → 剥壳', () => {
+    assert.equal(stripShellWrapper("/bin/bash -lc 'echo hello world'"), 'echo hello world')
+  })
+
+  it("单引号内嵌单引号的标准转义 '\\'' 正确还原(it's)", () => {
+    // /bin/bash -lc 'echo it'\''s a test'  →  echo it's a test
+    // 旧实现靠 `'\\''`→`'` 二次替换;新解析器吞整个 word 天然还原。
+    assert.equal(stripShellWrapper("/bin/bash -lc 'echo it'\\''s a test'"), "echo it's a test")
+  })
+
+  it('双引号包裹(含 \\" 与字面 \\n)→ 剥壳并解转义', () => {
+    // /bin/bash -lc "printf 'cwd=%s\n' \"$PWD\" && git status --short | head -20"
+    // \" → 字面 " ;\n(反斜杠+n,非可转义符)→ 原样保留成 \n 。
+    const wrapped =
+      '/bin/bash -lc "printf \'cwd=%s\\n\' \\"$PWD\\" && git status --short | head -20"'
+    const expected = 'printf \'cwd=%s\\n\' "$PWD" && git status --short | head -20'
+    assert.equal(stripShellWrapper(wrapped), expected)
+  })
+
+  it('单引号段与双引号段相邻拼接(结尾非单引号)→ 拼成一个 word', () => {
+    // /bin/bash -lc 'rm -f /opt/x.png && echo '"'截图演示文件已清理'"
+    const wrapped = '/bin/bash -lc \'rm -f /opt/x.png && echo \'"\'截图演示文件已清理\'"'
+    const expected = "rm -f /opt/x.png && echo '截图演示文件已清理'"
+    assert.equal(stripShellWrapper(wrapped), expected)
+  })
+
+  it('允许 /bin/sh 与 -c 前缀', () => {
+    assert.equal(stripShellWrapper("/bin/sh -c 'pwd'"), 'pwd')
+  })
+
+  it('非包装命令原样透传', () => {
+    assert.equal(stripShellWrapper('ls -la /tmp'), 'ls -la /tmp')
+    assert.equal(stripShellWrapper('git status --short'), 'git status --short')
+  })
+
+  it('解析失败 / 多 word → 保守只剥前缀返回剩余原文', () => {
+    // 未闭合引号:剥前缀,返回剩余原文(比露完整包装体面)。
+    assert.equal(stripShellWrapper("/bin/bash -lc 'unterminated"), "'unterminated")
+    // 前缀后是多个裸 word(非单一 shell word):同样只剥前缀。
+    assert.equal(stripShellWrapper('/bin/bash -lc echo hello'), 'echo hello')
+  })
+})
+
+// ── V5 CG(2026-07-10): 孤儿 tool_result 自动配对(任务2) ─────────────────────
+
+describe('handleItemCompleted — 孤儿 tool_result 自动配对(subAgentActivity)', () => {
+  // 真实取证载荷:codex 的 subAgentActivity 只经 item/completed 到达,从不发
+  // item/started(item 内部的 kind 字段才是子 agent 生命周期),故前端过去只收到
+  // 孤儿 tool_result → toolName 兜底 'unknown'、inputJson=null。
+  const subAgentItem = {
+    type: 'subAgentActivity',
+    id: 'call_8xd930hU3Lw7Hrhn0Go32z1M',
+    kind: 'started',
+    agentThreadId: '019f4bd8-1111-2222-3333-444455556666',
+    agentPath: '/root/tool_card_probe',
+  }
+
+  it('只发 item/completed 的 subAgentActivity → 先补 tool_use 再发 tool_result,配对 id 正确', async () => {
+    const h = await makeHarness()
+    ;(h.runner as any).activeTurnId = 't-sub'
+    feed(h.runner, {
+      jsonrpc: '2.0',
+      method: 'item/completed',
+      params: { threadId: 'thr', turnId: 't-sub', item: subAgentItem },
+    })
+    await new Promise((r) => setImmediate(r)) // handleItemCompleted 异步
+
+    const toolUses = h.messages.filter((m) => m.type === 'assistant')
+    const toolResults = h.messages.filter((m) => m.type === 'user')
+    assert.equal(toolUses.length, 1, '应补发恰好一帧 tool_use')
+    assert.equal(toolResults.length, 1, '一帧 tool_result')
+
+    // 补发的 tool_use:name=codex:subAgentActivity,input=原始 item,id 配对。
+    const use = toolUses[0].message.content[0]
+    assert.equal(use.type, 'tool_use')
+    assert.equal(use.name, 'codex:subAgentActivity')
+    assert.equal(use.id, subAgentItem.id)
+    assert.deepEqual(use.input, subAgentItem)
+
+    // tool_result 指向同一 id。
+    const res = toolResults[0].message.content[0]
+    assert.equal(res.type, 'tool_result')
+    assert.equal(res.tool_use_id, subAgentItem.id)
+
+    // 顺序:tool_use 必须在 tool_result 之前(前端需先建卡再挂结果)。
+    const idxUse = h.messages.findIndex((m) => m.type === 'assistant')
+    const idxRes = h.messages.findIndex((m) => m.type === 'user')
+    assert.ok(idxUse < idxRes, 'tool_use 必须先于 tool_result')
+    await h.cleanup()
+  })
+
+  it('同一 id 的多个 item/completed(kind=started 后 kind=completed)只补一帧 tool_use', async () => {
+    const h = await makeHarness()
+    ;(h.runner as any).activeTurnId = 't-sub2'
+    feed(h.runner, {
+      jsonrpc: '2.0',
+      method: 'item/completed',
+      params: { threadId: 'thr', turnId: 't-sub2', item: { ...subAgentItem, kind: 'started' } },
+    })
+    feed(h.runner, {
+      jsonrpc: '2.0',
+      method: 'item/completed',
+      params: { threadId: 'thr', turnId: 't-sub2', item: { ...subAgentItem, kind: 'completed' } },
+    })
+    await new Promise((r) => setImmediate(r))
+
+    const toolUses = h.messages.filter((m) => m.type === 'assistant')
+    const toolResults = h.messages.filter((m) => m.type === 'user')
+    assert.equal(toolUses.length, 1, 'id 已配对 → 第二个 completed 不再补 tool_use')
+    assert.equal(toolResults.length, 2, '两帧结果都挂到同一张卡')
+    assert.equal(toolUses[0].message.content[0].id, subAgentItem.id)
+    for (const r of toolResults) {
+      assert.equal(r.message.content[0].tool_use_id, subAgentItem.id)
+    }
+    await h.cleanup()
+  })
+
+  it('已正常 item/started 的类型(webSearch)不重复补发 tool_use', async () => {
+    const h = await makeHarness()
+    ;(h.runner as any).activeTurnId = 't-ws-pair'
+    feed(h.runner, {
+      jsonrpc: '2.0',
+      method: 'item/started',
+      params: {
+        threadId: 'thr',
+        turnId: 't-ws-pair',
+        item: { id: 'ws-1', type: 'webSearch', query: 'foo' },
+      },
+    })
+    feed(h.runner, {
+      jsonrpc: '2.0',
+      method: 'item/completed',
+      params: {
+        threadId: 'thr',
+        turnId: 't-ws-pair',
+        item: { id: 'ws-1', type: 'webSearch', query: 'foo', results: [] },
+      },
+    })
+    await new Promise((r) => setImmediate(r))
+
+    const toolUses = h.messages.filter((m) => m.type === 'assistant')
+    const toolResults = h.messages.filter((m) => m.type === 'user')
+    assert.equal(toolUses.length, 1, 'started 已发一帧 → completed 不得重复补发')
+    assert.equal(toolUses[0].message.content[0].name, 'codex:webSearch')
+    assert.equal(toolResults.length, 1)
+    assert.equal(toolResults[0].message.content[0].tool_use_id, 'ws-1')
+    await h.cleanup()
   })
 })
