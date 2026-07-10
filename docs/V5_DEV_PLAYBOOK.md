@@ -87,7 +87,9 @@ git worktree add ../openclaude-v5-<slug> -b feat/v5-<slug> feat/v5-aurora-rewrit
 > **跨树互斥(硬机制,2026-07-10)**:`test:commercial:unit/integ` 已经由
 > `scripts/test-mutex.sh` 包裹 —— 共享 octest PG/端口的测试族在
 > `/var/lock/oc-test-commercial.lock` 上全机串行,另一 worktree 在跑时会打印持有者并
-> 等待(≤30min)。多会话并行开发**不需要**人为协调测试时序;若看到"锁被占"就是另一
+> 等待(≤30min)。运行本身还有**执行总超时看门狗**(默认 3600s,`OC_TEST_MUTEX_TIMEOUT`
+> 可调):命令挂死(如 §2.4 infra 债)到点整组清场放锁、统一 exit 124 —— 挂死不再无限期
+> 占用。多会话并行开发**不需要**人为协调测试时序;若看到"锁被占"就是另一
 > 会话在跑,等它即可。绕过 npm script 直接 `npx tsx --test` 跑 commercial 测试 = 违规
 > (会撞库,当天误诊 2 小时的教训)。
 ```bash
