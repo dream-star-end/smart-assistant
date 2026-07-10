@@ -2,6 +2,7 @@ import { ArrowLeft, ArrowRight, Check, MailCheck, Sparkles } from "lucide-react"
 import { useEffect, useRef, useState } from "react";
 import type { Theme } from "../hooks/useTheme";
 import { BRAND } from "../lib/brand";
+import { TERMS_VERSION } from "../lib/legal";
 import { ThemeToggle } from "./ThemeToggle";
 import { TurnstileWidget } from "./TurnstileWidget";
 import { Button, Input, Spinner } from "./ui";
@@ -42,6 +43,8 @@ export function AuthGate({
     password: string;
     displayName?: string;
     turnstileToken: string;
+    /** 用户勾选同意的协议版本（lib/legal TERMS_VERSION），后端落 users 留证。 */
+    termsVersion: string;
   }) => Promise<{ verifyEmailSent: boolean }>;
   /** 邮箱验证（6 位验证码）。 */
   onVerifyEmail?: (email: string, code: string) => Promise<void>;
@@ -85,6 +88,9 @@ export function AuthGate({
   const [notice, setNotice] = useState<string | null>(null);
   const [resetSent, setResetSent] = useState(false);
   const [cooldown, setCooldown] = useState(0); // 重发验证码冷却秒数
+  // 注册页协议勾选：默认不勾选（监管要求不得默认同意），未勾选提交时给出明确提示
+  // 而非禁用按钮——可发现性优于静默禁用。登录页走「登录即代表同意」文案式（业界 Web 端惯例）。
+  const [agreeTerms, setAgreeTerms] = useState(false);
 
   // ── Turnstile 三态 fail-closed（与历史一致）──────────────────────────────
   const bypassKnown = typeof turnstileBypass === "boolean";
@@ -158,6 +164,10 @@ export function AuthGate({
       setLocalErr("两次输入的密码不一致");
       return;
     }
+    if (!agreeTerms) {
+      setLocalErr("请先阅读并勾选同意《用户协议》与《隐私政策》");
+      return;
+    }
     if (!turnstileReady || !submitToken) return;
     const gen = ++opGen.current;
     setBusy(true);
@@ -167,6 +177,7 @@ export function AuthGate({
         password,
         displayName: displayName.trim() || undefined,
         turnstileToken: submitToken,
+        termsVersion: TERMS_VERSION,
       });
       if (!alive(gen)) return;
       if (requireEmailVerified || r.verifyEmailSent) {
@@ -420,6 +431,10 @@ export function AuthGate({
                 </button>
               </p>
             )}
+
+            <p className="mt-1 text-center text-[12px] leading-5 text-faint">
+              登录即代表你已阅读并同意<LegalLinks />
+            </p>
           </form>
         )}
 
@@ -475,6 +490,18 @@ export function AuthGate({
                 placeholder="再输一次密码"
                 className="rounded-xl bg-bg"
               />
+            </label>
+
+            <label className="flex items-start gap-2 text-[12.5px] leading-5 text-muted">
+              <input
+                type="checkbox"
+                checked={agreeTerms}
+                onChange={(e) => setAgreeTerms(e.target.checked)}
+                className="mt-0.5 accent-[var(--accent,#6d5efc)]"
+              />
+              <span>
+                我已阅读并同意<LegalLinks />
+              </span>
             </label>
 
             {errBox}
@@ -663,5 +690,25 @@ export function AuthGate({
       </div>
       </div>
     </div>
+  );
+}
+
+/**
+ * 《用户协议》《隐私政策》链接对，新标签打开。
+ * 用 <a> 而非 button：登录/注册按钮的可及名唯一性有测试红线（getByRole("button")），
+ * 且 <a href> 属交互内容，位于 <label> 内点击时按 HTML 规范不会触发 label 的
+ * checkbox 激活转发——链接可点、勾选不误触。
+ */
+function LegalLinks() {
+  return (
+    <>
+      <a href="/terms" target="_blank" rel="noreferrer" className="text-accent hover:underline">
+        《用户协议》
+      </a>
+      与
+      <a href="/privacy" target="_blank" rel="noreferrer" className="text-accent hover:underline">
+        《隐私政策》
+      </a>
+    </>
   );
 }

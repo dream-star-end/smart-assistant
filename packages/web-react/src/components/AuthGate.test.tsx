@@ -1,6 +1,7 @@
 import "@testing-library/jest-dom/vitest";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, test, vi } from "vitest";
+import { TERMS_VERSION } from "../lib/legal";
 import { AuthGate } from "./AuthGate";
 
 // ---------------------------------------------------------------------------
@@ -31,6 +32,9 @@ describe("AuthGate — Turnstile gating", () => {
     expect(btn).not.toBeDisabled();
     fireEvent.click(btn);
     expect(onLogin).toHaveBeenCalledWith("a@b.com", "password123", "bypass");
+    // 登录页文案式同意：协议以 <a> 链接呈现（不得做成 button——登录按钮可及名唯一性红线）
+    expect(screen.getByRole("link", { name: "《用户协议》" })).toHaveAttribute("href", "/terms");
+    expect(screen.getByRole("link", { name: "《隐私政策》" })).toHaveAttribute("href", "/privacy");
   });
 
   test("config 未就绪（bypass=undefined）：fail-closed，禁用登录，绝不发占位 token", () => {
@@ -63,7 +67,7 @@ describe("AuthGate — Turnstile gating", () => {
 // ---------------------------------------------------------------------------
 
 describe("AuthGate — 注册", () => {
-  test("login 模式提供注册入口；切换后填表提交带 bypass token，verifyEmailSent → 进入验证步", async () => {
+  test("login 模式提供注册入口；切换后填表勾选协议提交带 bypass token，verifyEmailSent → 进入验证步", async () => {
     const onRegister = vi.fn().mockResolvedValue({ verifyEmailSent: true });
     render(<AuthGate {...base} onLogin={vi.fn()} onRegister={onRegister} turnstileBypass={true} />);
 
@@ -73,6 +77,7 @@ describe("AuthGate — 注册", () => {
     fireEvent.change(screen.getByPlaceholderText("再输一次密码"), {
       target: { value: "password123" },
     });
+    fireEvent.click(screen.getByRole("checkbox"));
 
     const btn = screen.getByRole("button", { name: /创建账号/ });
     expect(btn).not.toBeDisabled();
@@ -80,11 +85,39 @@ describe("AuthGate — 注册", () => {
       fireEvent.click(btn);
     });
     expect(onRegister).toHaveBeenCalledWith(
-      expect.objectContaining({ email: "a@b.com", password: "password123", turnstileToken: "bypass" }),
+      expect.objectContaining({
+        email: "a@b.com",
+        password: "password123",
+        turnstileToken: "bypass",
+        termsVersion: TERMS_VERSION,
+      }),
     );
     await waitFor(() =>
       expect(screen.getByPlaceholderText(/6 位验证码/)).toBeInTheDocument(),
     );
+  });
+
+  test("未勾选协议 → 提交给出明确提示且不调用 onRegister", () => {
+    const onRegister = vi.fn();
+    render(<AuthGate {...base} onLogin={vi.fn()} onRegister={onRegister} turnstileBypass={true} />);
+    fireEvent.click(screen.getByRole("button", { name: "立即注册" }));
+    fireEvent.change(screen.getByPlaceholderText("邮箱"), { target: { value: "a@b.com" } });
+    fireEvent.change(screen.getByPlaceholderText("至少 8 位"), { target: { value: "password123" } });
+    fireEvent.change(screen.getByPlaceholderText("再输一次密码"), {
+      target: { value: "password123" },
+    });
+    // 协议勾选默认关（监管要求不得默认同意）
+    expect(screen.getByRole("checkbox")).not.toBeChecked();
+    fireEvent.click(screen.getByRole("button", { name: /创建账号/ }));
+    expect(screen.getByText(/勾选同意《用户协议》与《隐私政策》/)).toBeInTheDocument();
+    expect(onRegister).not.toHaveBeenCalled();
+  });
+
+  test("注册页提供《用户协议》《隐私政策》链接（<a> 非 button，不与登录按钮可及名冲突）", () => {
+    render(<AuthGate {...base} onLogin={vi.fn()} onRegister={vi.fn()} turnstileBypass={true} />);
+    fireEvent.click(screen.getByRole("button", { name: "立即注册" }));
+    expect(screen.getByRole("link", { name: "《用户协议》" })).toHaveAttribute("href", "/terms");
+    expect(screen.getByRole("link", { name: "《隐私政策》" })).toHaveAttribute("href", "/privacy");
   });
 
   test("两次密码不一致 → 报错且不调用 onRegister", () => {
