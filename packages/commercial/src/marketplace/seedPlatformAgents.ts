@@ -41,9 +41,15 @@ import {
 import { scanSkillArtifact } from './skillScanner.js'
 
 /** 平台官方 agent 的定义(slug + 原始 manifest body)。manifest body 走与发布路由
- *  完全相同的 validateAgentManifest 校验,确保字段白名单/模型/工具集都合法。 */
+ *  完全相同的 validateAgentManifest 校验,确保字段白名单/模型/工具集都合法。
+ *  category/useCases 是人向商品层元数据(storefront,不进 manifest、不影响 artifactHash),
+ *  故为 seed 输入加常量不触发重发版(存量行由运维回填脚本管)。 */
 interface PlatformAgentDef {
   slug: string
+  /** 人向分类 id(∈ marketplaceTaxonomy)。 */
+  category: string
+  /** 人向「适用场景」用例(常量;不参与 approvePlatformVersion 的 hash 校验)。 */
+  useCases: string[]
   body: Record<string, unknown>
 }
 
@@ -66,6 +72,8 @@ const DEPRECATED_RESEARCH_AGENT_SLUGS = ['research-analyst', 'research-writer'] 
 const PLATFORM_RESEARCH_AGENTS: PlatformAgentDef[] = [
   {
     slug: 'research-assistant',
+    category: 'research-academic',
+    useCases: ['做文献综述与研究报告', '多源检索并精读文献', '数据分析且引用可溯源'],
     body: {
       name: '科研助手',
       displayName: '科研助手',
@@ -124,6 +132,8 @@ const DEPRECATED_GENERAL_AGENT_SLUGS: readonly string[] = []
 const PLATFORM_GENERAL_AGENTS: PlatformAgentDef[] = [
   {
     slug: 'office-assistant',
+    category: 'office-docs',
+    useCases: ['写周报月报与公文', '做汇报 PPT 与会议纪要', '整理 Excel 与数据分析'],
     body: {
       name: '办公助手',
       displayName: '办公助手',
@@ -160,6 +170,8 @@ const PLATFORM_GENERAL_AGENTS: PlatformAgentDef[] = [
   },
   {
     slug: 'coding-assistant',
+    category: 'coding-dev',
+    useCases: ['读懂代码库并规划改动', '跑测试构建自我验证', '定位并根治 bug、写测试自审'],
     body: {
       name: '编程助手',
       displayName: '编程助手',
@@ -313,10 +325,15 @@ async function seedAgentDefs(
             name: manifest.name,
             description: manifest.description,
             tags: manifest.tags,
+            use_cases: def.useCases,
           }),
           riskFlags: scan.flags,
           policyVersion: scan.policyVersion,
           submittedBy: ownerUserId,
+          // 人向商品层元数据:category/useCases 常量(storefront,不进 manifest、不影响 artifactHash,
+          // 故不触发重发版;approvePlatformVersion 只校验 artifact_hash 一致)。存量行由运维回填。
+          category: def.category,
+          useCases: def.useCases,
           // platform seed 立即 approvePlatformVersion,绝不走 AI 审批(红线):不入 AI 队列
           // → ai_review_state 恒 NULL → worker 永不 claim,结构性隔离(非时序竞态)。
           queueAiReview: false,

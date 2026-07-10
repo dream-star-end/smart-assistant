@@ -38,6 +38,10 @@ function candidate(over: Partial<AiReviewCandidate> = {}): AiReviewCandidate {
     createdAt: new Date().toISOString(),
     rawBundle: null,
     benchmark: null,
+    category: 'daily-tools',
+    useCases: ['做一件具体的事'],
+    outcomeExamples: [],
+    humanMd: null,
     aiNote: null,
     aiAttempts: 1,
     ...over,
@@ -178,6 +182,29 @@ test('buildReviewUserPrompt:超大内容按上限截断', () => {
   const huge = 'A'.repeat(50_000)
   const p = buildReviewUserPrompt(candidate({ rawSkillMd: huge }))
   assert.match(p, /已截断/)
+})
+
+test('buildReviewUserPrompt:商品页元数据(分类 label+用例+效果)进不可信元信息', () => {
+  const p = buildReviewUserPrompt(
+    candidate({
+      category: 'office-docs',
+      useCases: ['写周报月报'],
+      outcomeExamples: ['给它要点→得到排版好的周报'],
+      humanMd: '## 亮点\n一键出周报',
+    }),
+  )
+  assert.match(p, /办公文档/) // 分类 label(marketplaceCategoryLabel)
+  assert.match(p, /office-docs/) // 分类 id
+  assert.match(p, /写周报月报/) // 用例
+  assert.match(p, /给它要点→得到排版好的周报/) // 效果示例
+  assert.match(p, /human_md/) // 富介绍进不可信围栏
+  assert.match(p, /一键出周报/)
+})
+
+test('system prompt:含商品页审核要点(名实相符/能力一致/不夸大)', () => {
+  assert.match(AI_REVIEW_SYSTEM_PROMPT, /名实相符/)
+  assert.match(AI_REVIEW_SYSTEM_PROMPT, /能力一致/)
+  assert.match(AI_REVIEW_SYSTEM_PROMPT, /不夸大不虚构|不夸大/)
 })
 
 // ── callReviewModel:重试 ────────────────────────────────────────────

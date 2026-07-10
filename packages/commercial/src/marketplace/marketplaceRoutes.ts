@@ -47,6 +47,7 @@ import {
   validateBenchmark,
   validateBundleFiles,
 } from './bundle.js'
+import { HumanMetaError, type HumanMeta, humanMetaScanBody, parseHumanMeta } from './marketplaceMeta.js'
 import { platformPresetAgentSlugs } from './platformPresets.js'
 import { scanSkillArtifact } from './skillScanner.js'
 
@@ -164,6 +165,32 @@ function mapMarketplaceError(e: unknown): HttpError {
   return e instanceof HttpError ? e : new HttpError(500, 'INTERNAL', 'marketplace error')
 }
 
+/** 人向元数据校验(单一权威 parseHumanMeta),HumanMetaError → 400(带 code)。 */
+function parseHumanMetaOr400(body: Record<string, unknown>): HumanMeta {
+  try {
+    return parseHumanMeta(body)
+  } catch (e) {
+    if (e instanceof HumanMetaError) throw new HttpError(400, e.code, e.message)
+    throw e
+  }
+}
+
+/**
+ * 人向元数据(用例/效果示例/富介绍)拼接文本过与正文同一套静态扫描;blocked → 422 SCAN_BLOCKED
+ * (riskFlags 带回),防密钥/注入进商品页。返回 true 表示已发送 422、调用方应 return。
+ */
+function humanMetaScanBlocked(res: ServerResponse, name: string, meta: HumanMeta): boolean {
+  const scan = scanSkillArtifact({ name, description: '', tags: [], body: humanMetaScanBody(meta) })
+  if (scan.blocked) {
+    sendJson(res, 422, {
+      error: { code: 'SCAN_BLOCKED', message: '商品页文案被静态安全扫描拦截,请修正后重试' },
+      riskFlags: scan.flags,
+    })
+    return true
+  }
+  return false
+}
+
 // ── POST /api/marketplace/publish ──────────────────────────────────────────
 // User publishes one of their own skills. Static scan gates it; high-severity
 // findings (secrets / internal infra / html / non-plain metadata) block.
@@ -182,6 +209,8 @@ export async function handleMarketplacePublish(
   const description = asStr(body.description, 'description', 1024)
   const skillBody = asStr(body.body, 'body', MAX_BODY)
   const tags = asTags(body.tags)
+  // 人向商品层元数据(必填 category/useCases;单一校验权威 parseHumanMeta)→ 校验失败 400。
+  const humanMeta = parseHumanMetaOr400(body)
 
   // 附属文件(references/assets/evals;scripts 暂拒)+ 发布者自报评测摘要。
   const bundleV = validateBundleFiles(
@@ -208,6 +237,8 @@ export async function handleMarketplacePublish(
     })
     return
   }
+  // 人向商品页文案(用例/效果/富介绍)与正文同规则扫描,防注入/密钥进商品页。
+  if (humanMetaScanBlocked(res, name, humanMeta)) return
   // 逐附属文件走同一静态扫描(密钥/注入/内网地址等对文本文件同样适用);
   // scripts/ 额外过危险模式扫描:毁灭性/远程管道执行直接拦,可疑模式作为
   // warning flag 随版本入库(审核页可见,人审判断)。
@@ -265,13 +296,17 @@ export async function handleMarketplacePublish(
       tags,
       rawSkillMd,
       artifactHash: marketplaceArtifactHash(rawSkillMd),
-      embeddingHash: skillContentHash({ name, description, tags }),
+      embeddingHash: skillContentHash({ name, description, tags, use_cases: humanMeta.useCases }),
       riskFlags: [...scan.flags, ...scriptFlags],
       policyVersion: scan.policyVersion,
       submittedBy: uid(user),
       rawBundle: bundleV.bundle,
       benchmark: benchV.benchmark,
       orgId,
+      category: humanMeta.category,
+      useCases: humanMeta.useCases,
+      outcomeExamples: humanMeta.outcomeExamples,
+      humanMd: humanMeta.humanMd,
     })
     sendJson(res, 200, {
       ok: true,
@@ -314,10 +349,16 @@ export async function handleMarketplaceAgentPublish(
   }
   const allowedModels = new Set(publicModels.map((m) => m.id))
 
+  // 人向商品层元数据(必填 category/useCases)先校验 → 400;它们是**发布级**元数据,
+  // 绝不进 agent manifest,故与 slug 一样在 validateAgentManifest 前从 manifestInput delete 掉,
+  // 否则严格 allowlist 会拒「未知字段」。
+  const humanMeta = parseHumanMetaOr400(body)
+
   const manifestInput: Record<string, unknown> = { ...body }
   // slug is the listing key, NOT a manifest field — remove the KEY (not just set
   // undefined) so the strict allowlist validator doesn't reject it as "未知字段".
-  delete manifestInput.slug
+  // category/useCases/outcomeExamples/humanMd 同理:发布级 storefront 元数据,不进 manifest。
+  for (const k of ['slug', 'category', 'useCases', 'outcomeExamples', 'humanMd']) delete manifestInput[k]
   const result = validateAgentManifest(manifestInput, {
     vettedToolsets: VETTED_AGENT_TOOLSETS,
     allowedModels,
@@ -345,6 +386,8 @@ export async function handleMarketplaceAgentPublish(
     })
     return
   }
+  // 人向商品页文案与 persona 同规则扫描,防注入/密钥进商品页。
+  if (humanMetaScanBlocked(res, manifest.name, humanMeta)) return
 
   const orgId = await resolvePublishOrgId(uid(user), body.visibility)
 
@@ -382,11 +425,16 @@ export async function handleMarketplaceAgentPublish(
         name: manifest.name,
         description: manifest.description,
         tags: manifest.tags,
+        use_cases: humanMeta.useCases,
       }),
       riskFlags: scan.flags,
       policyVersion: scan.policyVersion,
       submittedBy: uid(user),
       orgId,
+      category: humanMeta.category,
+      useCases: humanMeta.useCases,
+      outcomeExamples: humanMeta.outcomeExamples,
+      humanMd: humanMeta.humanMd,
     })
     sendJson(res, 200, {
       ok: true,

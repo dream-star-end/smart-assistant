@@ -282,6 +282,80 @@ describe('marketplaceDb (integ)', () => {
     })
   })
 
+  test('人向商品层元数据在 pending/search/detail 全链透出', async (t) => {
+    if (skipIfNoPg(t)) return
+    const owner = await createUser('human-owner@x.com')
+    const admin = await createUser('human-admin@x.com')
+    const p = await publishSkillVersion({
+      ...buildPublish('human-skill', owner),
+      category: 'office-docs',
+      useCases: ['写周报月报', '做汇报 PPT'],
+      outcomeExamples: ['给它要点→得到排版好的周报'],
+      humanMd: '## 亮点\n一键出周报',
+    })
+    // pending 行透出全部新字段。
+    const pending = (await listPendingVersions()).find((x) => x.slug === 'human-skill')
+    assert.equal(pending?.category, 'office-docs')
+    assert.deepEqual(pending?.useCases, ['写周报月报', '做汇报 PPT'])
+    assert.deepEqual(pending?.outcomeExamples, ['给它要点→得到排版好的周报'])
+    assert.equal(pending?.humanMd, '## 亮点\n一键出周报')
+
+    await reviewVersion({ versionId: p.versionId, reviewerUserId: admin, approve: true })
+    // 卡片(search)透出 category/useCases/featuredRank;不含 outcomeExamples/humanMd(卡片保持轻)。
+    const card = (await listApprovedForSearch()).find((c) => c.slug === 'human-skill')
+    assert.equal(card?.category, 'office-docs')
+    assert.deepEqual(card?.useCases, ['写周报月报', '做汇报 PPT'])
+    assert.equal(card?.featuredRank, null)
+    assert.equal('outcomeExamples' in (card as object), false)
+    assert.equal('humanMd' in (card as object), false)
+    // detail 透出全部新字段。
+    const detail = await getListingDetail('human-skill')
+    assert.equal(detail?.category, 'office-docs')
+    assert.deepEqual(detail?.useCases, ['写周报月报', '做汇报 PPT'])
+    assert.deepEqual(detail?.outcomeExamples, ['给它要点→得到排版好的周报'])
+    assert.equal(detail?.humanMd, '## 亮点\n一键出周报')
+    assert.equal(detail?.featuredRank, null)
+  })
+
+  test('缺省人向元数据:category=null / useCases=[] / outcomeExamples=[] / humanMd=null', async (t) => {
+    if (skipIfNoPg(t)) return
+    const owner = await createUser('plain-owner@x.com')
+    const admin = await createUser('plain-admin@x.com')
+    const p = await publishSkillVersion(buildPublish('plain-human', owner))
+    await reviewVersion({ versionId: p.versionId, reviewerUserId: admin, approve: true })
+    const card = (await listApprovedForSearch()).find((c) => c.slug === 'plain-human')
+    assert.equal(card?.category, null)
+    assert.deepEqual(card?.useCases, [])
+    const detail = await getListingDetail('plain-human')
+    assert.equal(detail?.category, null)
+    assert.deepEqual(detail?.useCases, [])
+    assert.deepEqual(detail?.outcomeExamples, [])
+    assert.equal(detail?.humanMd, null)
+  })
+
+  test('listApprovedForSearch 排序:平台精选(featured_rank)领衔 → 热度 → 新版本', async (t) => {
+    if (skipIfNoPg(t)) return
+    const owner = await createUser('order-owner@x.com')
+    const admin = await createUser('order-admin@x.com')
+    const installer = await createUser('order-inst@x.com')
+    // 依次发布 A/B/C(id 递增),全部批准。默认序(无精选/无安装)= v.id DESC = C,B,A。
+    const a = await publishSkillVersion(buildPublish('feat-a', owner))
+    await reviewVersion({ versionId: a.versionId, reviewerUserId: admin, approve: true })
+    const b = await publishSkillVersion(buildPublish('inst-b', owner))
+    await reviewVersion({ versionId: b.versionId, reviewerUserId: admin, approve: true })
+    const c = await publishSkillVersion(buildPublish('plain-c', owner))
+    await reviewVersion({ versionId: c.versionId, reviewerUserId: admin, approve: true })
+
+    // B 有 1 个活跃安装(热度高于 C);A 设为平台精选(featured_rank=1,只由运维脚本写)。
+    await installApprovedVersion({ userId: installer, versionId: b.versionId })
+    await query("UPDATE marketplace_skill_listings SET featured_rank = 1 WHERE slug = 'feat-a'")
+
+    const order = (await listApprovedForSearch()).map((c2) => c2.slug)
+    assert.deepEqual(order, ['feat-a', 'inst-b', 'plain-c'])
+    const featA = (await listApprovedForSearch()).find((c2) => c2.slug === 'feat-a')
+    assert.equal(featA?.featuredRank, 1)
+  })
+
   test('batch review approves multiple pending versions', async (t) => {
     if (skipIfNoPg(t)) return
     const owner = await createUser('batch-owner@x.com')

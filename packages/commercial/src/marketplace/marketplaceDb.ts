@@ -160,6 +160,14 @@ export interface PublishInput {
   /** 发布者自报评测摘要(展示须标注"发布者提供",非平台背书)。 */
   benchmark?: { withPassRate: number; withoutPassRate: number; cases: number } | null
   /**
+   * 人向商品层元数据(storefront,**不进工件、不影响 artifactHash**;校验权威 = marketplaceMeta.parseHumanMeta)。
+   * 用户面两条路由强制传;平台 seed 可只传 category/useCases(缺省 → null/[])。
+   */
+  category?: string | null
+  useCases?: string[]
+  outcomeExamples?: string[]
+  humanMd?: string | null
+  /**
    * 是否将本 pending 版本纳入 AI 自动审批队列(ai_review_state='queued')。默认 **true**:
    * 所有用户面发布路径(web 发布 / oc-market AI 自助发布)自动入列,未来新增发布路径也
    * 默认受审 —— fail toward review。唯一 opt-out 是 platform seed(seedPlatformAgents 直接
@@ -208,12 +216,16 @@ export async function publishSkillVersion(input: PublishInput): Promise<{ versio
       // → NULL → worker 永不 claim(见 PublishInput.queueAiReview 注释)。
       const aiReviewState = input.queueAiReview === false ? null : 'queued'
       const ins = await query<{ id: string }>(
+        // category/use_cases/outcome_examples/human_md 是 storefront 元数据(0127),与工件解耦:
+        // 缺省 → null/[](平台 seed 只填 category/use_cases,存量行由运维回填)。
         `INSERT INTO marketplace_skill_versions
            (slug, version, name, description, tags, raw_skill_md, raw_artifact, manifest,
             artifact_hash, embedding_hash, status, risk_flags, policy_version, submitted_by,
-            raw_bundle, benchmark, ai_review_state)
+            raw_bundle, benchmark, ai_review_state,
+            category, use_cases, outcome_examples, human_md)
          VALUES ($1,$2,$3,$4,$5::jsonb,$6,$7,$8::jsonb,$9,$10,'pending',$11::jsonb,$12,$13,
-                 $14::jsonb,$15::jsonb,$16)
+                 $14::jsonb,$15::jsonb,$16,
+                 $17,$18::jsonb,$19::jsonb,$20)
          RETURNING id::text`,
         [
           input.slug,
@@ -232,6 +244,10 @@ export async function publishSkillVersion(input: PublishInput): Promise<{ versio
           input.rawBundle == null ? null : JSON.stringify(input.rawBundle),
           input.benchmark == null ? null : JSON.stringify(input.benchmark),
           aiReviewState,
+          input.category ?? null,
+          JSON.stringify(input.useCases ?? []),
+          JSON.stringify(input.outcomeExamples ?? []),
+          input.humanMd ?? null,
         ],
         c,
       )
@@ -264,6 +280,11 @@ export interface PendingVersionRow {
   createdAt: string
   rawBundle: Record<string, string> | null
   benchmark: { withPassRate: number; withoutPassRate: number; cases: number } | null
+  /** 人向商品层元数据(storefront;存量/平台 seed 可能为 null/[])。 */
+  category: string | null
+  useCases: string[]
+  outcomeExamples: string[]
+  humanMd: string | null
   /** AI 审核意见(escalate/warn 降级/解析失败/skip 时的原因),供人审「供参考」展示;null=AI 未表态。 */
   aiNote: string | null
 }
@@ -290,12 +311,16 @@ export async function listPendingVersions(limit = 100): Promise<PendingVersionRo
     created_at: string
     raw_bundle: unknown
     benchmark: unknown
+    category: string | null
+    use_cases: unknown
+    outcome_examples: unknown
+    human_md: string | null
     ai_note: string | null
   }>(
     `SELECT v.id::text, v.slug, l.kind, v.version, v.name, v.description, v.tags,
             v.raw_artifact, v.raw_skill_md, v.manifest, v.raw_bundle, v.benchmark,
             v.risk_flags, v.submitted_by::text, l.owner_user_id::text, v.created_at::text,
-            v.ai_note
+            v.category, v.use_cases, v.outcome_examples, v.human_md, v.ai_note
        FROM marketplace_skill_versions v
        JOIN marketplace_skill_listings l ON l.slug = v.slug
       WHERE v.status = 'pending'
@@ -322,6 +347,10 @@ export async function listPendingVersions(limit = 100): Promise<PendingVersionRo
     benchmark:
       (x.benchmark as { withPassRate: number; withoutPassRate: number; cases: number } | null) ??
       null,
+    category: x.category ?? null,
+    useCases: (x.use_cases as string[]) ?? [],
+    outcomeExamples: (x.outcome_examples as string[]) ?? [],
+    humanMd: x.human_md ?? null,
     aiNote: x.ai_note ?? null,
   }))
 }
@@ -523,6 +552,10 @@ function mapAiCandidateRow(x: {
   created_at: string
   raw_bundle: unknown
   benchmark: unknown
+  category: string | null
+  use_cases: unknown
+  outcome_examples: unknown
+  human_md: string | null
   ai_note: string | null
   ai_attempts: number | string
 }): AiReviewCandidate {
@@ -545,6 +578,10 @@ function mapAiCandidateRow(x: {
     benchmark:
       (x.benchmark as { withPassRate: number; withoutPassRate: number; cases: number } | null) ??
       null,
+    category: x.category ?? null,
+    useCases: (x.use_cases as string[]) ?? [],
+    outcomeExamples: (x.outcome_examples as string[]) ?? [],
+    humanMd: x.human_md ?? null,
     aiNote: x.ai_note ?? null,
     aiAttempts: typeof x.ai_attempts === 'string' ? Number.parseInt(x.ai_attempts, 10) : x.ai_attempts,
   }
@@ -580,7 +617,7 @@ export async function claimNextAiReview(): Promise<AiReviewCandidate | null> {
       `SELECT v.id::text, v.slug, l.kind, v.version, v.name, v.description, v.tags,
               v.raw_artifact, v.raw_skill_md, v.manifest, v.raw_bundle, v.benchmark,
               v.risk_flags, v.submitted_by::text, l.owner_user_id::text, v.created_at::text,
-              v.ai_note, v.ai_attempts
+              v.category, v.use_cases, v.outcome_examples, v.human_md, v.ai_note, v.ai_attempts
          FROM marketplace_skill_versions v
          JOIN marketplace_skill_listings l ON l.slug = v.slug
         WHERE v.id = $1`,
@@ -720,6 +757,12 @@ export interface ApprovedSearchRow {
   installCount: number
   /** 发布者自报评测摘要(聚合值;展示须标注"发布者提供,未经平台验证")。null=未提供。 */
   benchmark: { withPassRate: number; withoutPassRate: number; cases: number } | null
+  /** 人向分类 id(卡片徽章;null=未分类)。outcomeExamples/humanMd 只在 detail,卡片保持轻。 */
+  category: string | null
+  /** 适用场景(卡片透出;参与 embed 检索文本)。 */
+  useCases: string[]
+  /** 平台精选权重(越小越靠前;null=非精选)。目录排序服务端权威,前端信任此序。 */
+  featuredRank: number | null
 }
 
 /** Current approved version of every active listing — the searchable catalog.
@@ -744,12 +787,18 @@ export async function listApprovedForSearch(
     embedding_hash: string
     benchmark: unknown
     install_count: string | null
+    category: string | null
+    use_cases: unknown
+    featured_rank: number | string | null
   }>(
     // install_count 走一次性聚合 JOIN(而非逐行 correlated 子查询):目录上限 500 行,
     // 逐行子查询会对共享的 v3 search 端点放大 500 次 installs 扫描。
     // org 可见性收口:org-private listing 仅本 org 成员可搜出(callerOrgId=null → 仅公开)。
+    // 目录排序服务端权威:平台精选(featured_rank ASC NULLS LAST)领衔 → 热度(安装数 DESC)
+    // → 新版本(v.id DESC)。前端不再自行 sortByPopularity,信任此序。
     `SELECT v.id::text, v.slug, l.kind, v.name, v.description, v.tags, v.embedding_hash,
-            v.benchmark, ic.n::text AS install_count
+            v.benchmark, ic.n::text AS install_count,
+            v.category, v.use_cases, l.featured_rank
        FROM marketplace_skill_listings l
        JOIN marketplace_skill_versions v ON v.id = l.current_approved_version_id
        LEFT JOIN (SELECT slug, count(*) AS n FROM marketplace_installs
@@ -757,7 +806,7 @@ export async function listApprovedForSearch(
       WHERE l.state = 'active' AND v.status = 'approved'
             AND ($1::text IS NULL OR l.kind = $1)
             AND ${orgVisibleFrag('l', 2)}
-      ORDER BY v.id DESC
+      ORDER BY l.featured_rank ASC NULLS LAST, ic.n DESC NULLS LAST, v.id DESC
       LIMIT ${SEARCH_CATALOG_CAP + 1}`,
     [kind ?? null, callerOrgId],
   )
@@ -780,6 +829,9 @@ export async function listApprovedForSearch(
     benchmark:
       (x.benchmark as { withPassRate: number; withoutPassRate: number; cases: number } | null) ??
       null,
+    category: x.category ?? null,
+    useCases: (x.use_cases as string[]) ?? [],
+    featuredRank: x.featured_rank == null ? null : Number(x.featured_rank),
   }))
 }
 
@@ -806,6 +858,13 @@ export interface ListingDetail {
   rawBundle: Record<string, string> | null
   /** 发布者自报评测摘要(展示须标注"发布者提供")。 */
   benchmark: { withPassRate: number; withoutPassRate: number; cases: number } | null
+  /** 人向商品层元数据(detail 透出全部;存量/平台 seed 可能为 null/[])。 */
+  category: string | null
+  useCases: string[]
+  outcomeExamples: string[]
+  humanMd: string | null
+  /** 平台精选权重(null=非精选)。 */
+  featuredRank: number | null
 }
 
 /**
@@ -837,10 +896,16 @@ export async function getListingDetail(
     raw_bundle: unknown
     benchmark: unknown
     install_count: string
+    category: string | null
+    use_cases: unknown
+    outcome_examples: unknown
+    human_md: string | null
+    featured_rank: number | string | null
   }>(
     `SELECT l.slug, l.kind, l.state, l.owner_user_id::text, v.version, v.id::text AS vid,
             v.name, v.description, v.tags, v.artifact_hash, v.raw_artifact, v.raw_skill_md,
             v.manifest, v.risk_flags, v.raw_bundle, v.benchmark,
+            v.category, v.use_cases, v.outcome_examples, v.human_md, l.featured_rank,
             (SELECT count(*) FROM marketplace_installs i
               WHERE i.slug = l.slug AND i.uninstalled_at IS NULL)::text AS install_count
        FROM marketplace_skill_listings l
@@ -871,6 +936,11 @@ export async function getListingDetail(
     benchmark:
       (x.benchmark as { withPassRate: number; withoutPassRate: number; cases: number } | null) ??
       null,
+    category: x.category ?? null,
+    useCases: (x.use_cases as string[]) ?? [],
+    outcomeExamples: (x.outcome_examples as string[]) ?? [],
+    humanMd: x.human_md ?? null,
+    featuredRank: x.featured_rank == null ? null : Number(x.featured_rank),
   }
 }
 
