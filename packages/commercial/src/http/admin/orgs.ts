@@ -33,7 +33,9 @@ function throwOrg(err: unknown): never {
   throw err;
 }
 
-function serializeOrg(o: OrgRow & { member_count?: number }): Record<string, unknown> {
+function serializeOrg(
+  o: OrgRow & { member_count?: number; subscription?: OrgWithStatsRow["subscription"] },
+): Record<string, unknown> {
   return {
     id: o.id,
     name: o.name,
@@ -44,6 +46,10 @@ function serializeOrg(o: OrgRow & { member_count?: number }): Record<string, unk
     created_at: o.created_at instanceof Date ? o.created_at.toISOString() : o.created_at,
     updated_at: o.updated_at instanceof Date ? o.updated_at.toISOString() : o.updated_at,
     ...(o.member_count !== undefined ? { member_count: o.member_count } : {}),
+    // listOrgsWithStats 一直计算 subscription(LEFT JOIN org_subscriptions)但此前被序列化
+    // 丢弃 → admin 组织卡「订阅」恒显示"无"。透传之;单查路径(create/patch)无此字段则不
+    // 输出,前端已防御渲染。
+    ...(o.subscription !== undefined ? { subscription: o.subscription } : {}),
   };
 }
 
