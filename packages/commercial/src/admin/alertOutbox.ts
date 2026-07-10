@@ -128,6 +128,61 @@ function channelSubscribes(channel: AlertChannelRow, event: AlertEventInput): bo
   return channel.event_types.includes(event.event_type);
 }
 
+// ─── inbox 兜底 / critical 镜像 ───────────────────────────────────────
+
+/**
+ * 系统告警 inbox 收件人 = users.id=1(boss admin,全库最早注册)。
+ * 与 scripts/v5-monitor.sh 的 BOSS_UID / inbox/onboarding.ts resolveSystemAdminId
+ * "取最小 admin id" 同一语义。写死 1 是**刻意保持系统 A(shell)/系统 B(TS)
+ * 单一收件人**:shell 无法 import TS resolveSystemAdminId,若两侧各算一次会分裂。
+ */
+const SYSTEM_INBOX_UID = "1";
+
+/** admin_alert 的 severity → inbox_messages.level(0046 CHECK: info|notice|promo|warning)。 */
+function severityToInboxLevel(sev: Severity): "info" | "warning" {
+  // inbox level 枚举无 'critical' → critical 落 'warning'(最高等级),与站内信 UI 一致。
+  return sev === "info" ? "info" : "warning";
+}
+
+/**
+ * 送达不变量兜底:直接往 inbox_messages 写一条系统站内信(uid=1)。
+ *
+ * **刻意用最小参数化 INSERT,而非复用 inbox/inbox.ts 的 createInboxMessage()**:
+ *   1. createInboxMessage 带 zod 校验 + 收件人 status='active' 门 + 可选邮件快照;
+ *      这些对"最后一道兜底"不合适 —— active 门在 boss 账号异常时会让告警**再次蒸发**
+ *      (正是本方案要根治的),邮件快照更是无关开销。兜底必须无条件落库。
+ *   2. 与 shell 侧(v5-monitor.sh send_inbox / v5-daily-check.sh)保持**同一最小
+ *      写入形状**(audience='user', user_id=1, created_by=1):系统 A/B 单一 inbox 规则。
+ *
+ * 失败绝不抛(与 safeEnqueueAlert 容错哲学一致):兜底本身失败只 warn,不能反噬调用方。
+ * title/body 预截断到 0046 的 CHECK 边界(title 1..200 / body 1..16384 字符)。
+ */
+async function writeSystemInbox(
+  event: AlertEventInput,
+  note: string,
+): Promise<boolean> {
+  try {
+    // char_length(CJK)按字符计,slice 按 UTF-16 code unit;对常见告警文案足够安全,
+    // 留足余量(190 / 16000)避免边界超限。note 拼进正文,标注兜底缘由。
+    const title = `${event.title}`.replace(/[\r\n]+/g, " ").slice(0, 190) || event.event_type;
+    const body = `${event.body}\n\n${note}`.slice(0, 16000) || note;
+    const level = severityToInboxLevel(event.severity);
+    await query(
+      `INSERT INTO inbox_messages (audience, user_id, title, body_md, level, created_by)
+       VALUES ('user', $1::bigint, $2, $3, $4, $1::bigint)`,
+      [SYSTEM_INBOX_UID, title, body, level],
+    );
+    return true;
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.warn(
+      `[admin/alerts] inbox fallback/mirror write failed event=${event.event_type}:`,
+      err instanceof Error ? err.message : err,
+    );
+    return false;
+  }
+}
+
 // ─── enqueue ─────────────────────────────────────────────────────────
 
 export interface EnqueueResult {
@@ -136,6 +191,17 @@ export interface EnqueueResult {
   deduped: number; // ON CONFLICT 跳过的行数
   skipped_no_channels: boolean; // 没任何可投递通道(也没建行)
   silenceReason: string | null;
+  /**
+   * 送达不变量兜底(方案 §2.3-1):零订阅通道时告警会"蒸发",此时写一条
+   * inbox_messages(uid=1)保证有落点。true = 本次触发了兜底 inbox 写入。
+   */
+  inbox_fallback: boolean;
+  /**
+   * critical 双落点:severity=critical 且本次真新建了 outbox 行时,额外写一条
+   * inbox 镜像,保证 critical 永远同时落在「通道 + 站内信」。true = 本次写了镜像。
+   * 与 inbox_fallback 互斥(零通道走 fallback,有通道走 mirror)。
+   */
+  inbox_mirror: boolean;
 }
 
 /**
@@ -151,7 +217,19 @@ export async function enqueueAlert(
   const channels = await listDispatchableChannels();
   const subscribed = channels.filter((c) => channelSubscribes(c, event));
   if (subscribed.length === 0) {
-    return { enqueued: 0, suppressed: 0, deduped: 0, skipped_no_channels: true, silenceReason: null };
+    // 送达不变量(方案 §2.3-1):零订阅通道 → 告警本会"蒸发"。写 inbox 兜底保证有
+    // 落点。**无条件写**(不看 silence):silence 抑的是"主动投递通道",inbox 是被动
+    // 留痕的最后一道 durability,与之正交(shell 侧 send_inbox 也不受 silence 影响)。
+    const wrote = await writeSystemInbox(event, "(未配置告警通道,站内信兜底)");
+    return {
+      enqueued: 0,
+      suppressed: 0,
+      deduped: 0,
+      skipped_no_channels: true,
+      silenceReason: null,
+      inbox_fallback: wrote,
+      inbox_mirror: false,
+    };
   }
 
   const silence = await findActiveSilence(event, rule_id);
@@ -207,12 +285,25 @@ export async function enqueueAlert(
     }
   }
 
+  // critical 双落点(方案 §2.3-1):severity=critical 时,除通道投递外**恒**写一条
+  // inbox 镜像,保证 critical 永远同时落「通道 + 站内信」。去重语义:每次 enqueue 最多
+  // 镜像一次(与 fan-out 行数无关),且仅当本次真新建了行(enqueued+suppressed>0)——
+  // 若全部 ON CONFLICT 去重(deduped),说明上一轮 enqueue 已镜像过,不再重复,避免
+  // 轮询规则每 tick 刷 inbox。"无论通道投递与否"含 suppressed:silence 抑主动投递,
+  // 不抑 critical 的被动 inbox 留痕。
+  let inbox_mirror = false;
+  if (event.severity === "critical" && enqueued + suppressed > 0) {
+    inbox_mirror = await writeSystemInbox(event, "(critical 告警,站内信镜像 · 双落点)");
+  }
+
   return {
     enqueued,
     suppressed,
     deduped,
     skipped_no_channels: false,
     silenceReason: silence?.reason ?? null,
+    inbox_fallback: false,
+    inbox_mirror,
   };
 }
 

@@ -45,6 +45,28 @@ log() { if [ "$DRY_RUN" = 1 ]; then echo "[dry-run] $*"; else echo "$(ts) $*" >>
 REPORT_DATE="$(TZ=Asia/Shanghai date -d yesterday +%F)"     # 日报覆盖的自然日(北京时间)
 DBURL="$(grep '^DATABASE_URL=' "$ENV_FILE" 2>/dev/null | head -1 | cut -d= -f2-)"
 
+# 统一告警管道(方案 §2.3-2):除站内信外,psql 直插 admin_alert_outbox,恢复后
+# dispatcher 补投企微。fan-out 判定复刻 enqueueAlert TS 语义,单一 SQL 权威见
+# scripts/v5-alert-fanout.sql(与 v5-monitor.sh 同一文件)。
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+FANOUT_SQL="${V5DAY_FANOUT_SQL:-$SCRIPT_DIR/v5-alert-fanout.sql}"
+HOSTFQDN="$(hostname -f 2>/dev/null || hostname 2>/dev/null || echo unknown)"
+
+# fan-out 一个事件到 admin_alert_outbox;失败只记日志,不阻断。--dry-run 只打印。
+fanout_alert() { # <event_type> <severity> <dedupe_key> <title> <body> <payload_json>
+  if [ "$DRY_RUN" = 1 ]; then log "FANOUT[dry] $1 sev=$2 dedupe=$3"; return 0; fi
+  if [ -z "$DBURL" ]; then log "FANOUT-SKIP 读不到 DATABASE_URL($ENV_FILE) event=$1"; return 0; fi
+  if [ ! -f "$FANOUT_SQL" ]; then log "FANOUT-SKIP 找不到 $FANOUT_SQL event=$1"; return 0; fi
+  if psql "$DBURL" -q -v ON_ERROR_STOP=1 \
+       -v event_type="$1" -v severity="$2" -v dedupe_key="$3" \
+       -v title="$4" -v body="$5" -v payload="$6" \
+       -f "$FANOUT_SQL" >/dev/null 2>&1; then
+    log "FANOUT-OK $1 sev=$2"
+  else
+    log "FANOUT-FAIL $1 sev=$2(outbox 未落,inbox/日志仍有留痕)"
+  fi
+}
+
 ALERTS=()   # 告警行(有则 level=warning)
 INFOS=()    # 日报正文行
 
@@ -172,6 +194,31 @@ BODY="$(echo "$BODY" | head -c 16000 | iconv -f UTF-8 -t UTF-8 -c)"
 log "DAILY $TITLE"
 for a in "${ALERTS[@]}"; do log "  ALERT $a"; done
 for i in "${INFOS[@]}"; do log "  INFO  $i"; done
+
+# ── 统一告警管道:outbox fan-out(方案 §2.3-2)──
+# 恒发 ops.daily_report(info,完整日报);有异常再发 ops.daily_anomaly(warning,仅
+# 异常明细)。分开两事件让 severity 路由正确:severity_min=warning 的通道只收异常,
+# =info 的通道两者都收。与既有站内信(一条聚合消息)正交,不改 inbox 行为。
+fanout_daily() {
+  fanout_alert "ops.daily_report" "info" \
+    "ops.daily_report:${REPORT_DATE}" \
+    "[v5日报] ${REPORT_DATE} 运行日报" \
+    "$BODY" \
+    "$(jq -nc --arg d "$REPORT_DATE" --arg n "${#ALERTS[@]}" --arg h "$HOSTFQDN" \
+         '{source:"v5-daily",report_date:$d,alerts_count:($n|tonumber),host:$h,kind:"report"}')"
+  if [ "${#ALERTS[@]}" -gt 0 ]; then
+    local anom="v5 日检异常(${REPORT_DATE},北京时间自然日):"$'\n'
+    for a in "${ALERTS[@]}"; do anom+="- ⚠️ $a"$'\n'; done
+    anom="$(echo "$anom" | head -c 16000 | iconv -f UTF-8 -t UTF-8 -c)"
+    fanout_alert "ops.daily_anomaly" "warning" \
+      "ops.daily_anomaly:${REPORT_DATE}" \
+      "[v5日报] ${REPORT_DATE} 有 ${#ALERTS[@]} 项异常" \
+      "$anom" \
+      "$(jq -nc --arg d "$REPORT_DATE" --arg n "${#ALERTS[@]}" --arg h "$HOSTFQDN" \
+           '{source:"v5-daily",report_date:$d,alerts_count:($n|tonumber),host:$h,kind:"anomaly"}')"
+  fi
+}
+fanout_daily
 
 if [ "$DRY_RUN" = 1 ]; then
   echo "── dry-run:将发送站内信 ─────────────"

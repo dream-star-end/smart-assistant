@@ -1,0 +1,21 @@
+# v5 监控自监(方案 §2.3-3)—— 模板单元。当 openclaude-v5-monitor.service /
+# openclaude-v5-daily.service 自身失败时,由其 `OnFailure=openclaude-v5-alert-fail@%n.service`
+# 触发一次:%i = 失败单元名(如 openclaude-v5-monitor.service)。
+# scripts/v5-alert-fail.sh 对该单元做 outbox fan-out(critical)+ inbox 双写告警。
+#
+# ⚠️ 部署纪律(与 openclaude-v5-monitor/daily 单元同):**不随 deploy-v5.sh 分发**。
+#   deploy-v5.sh 只 rsync 源码树(含 scripts/*.sh + scripts/v5-alert-fanout.sql),
+#   systemd 单元需在 kl-mirror 手动安装:
+#     cp deploy/v5/openclaude-v5-alert-fail@.service /etc/systemd/system/
+#     systemctl daemon-reload
+#   模板单元无需 enable(由 OnFailure 按需实例化拉起)。
+[Unit]
+Description=OpenClaude v5 monitor self-alert for failed unit %i
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/opt/openclaude/openclaude-v5
+Environment="PATH=/root/.bun/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+ExecStart=/usr/bin/bash scripts/v5-alert-fail.sh %i
+TimeoutStartSec=60
