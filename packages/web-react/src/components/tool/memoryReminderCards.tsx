@@ -1,4 +1,4 @@
-import { Bell, CalendarClock, CheckCircle2, Clock, Hash, ListChecks, Trash2 } from "lucide-react";
+import { Bell, CalendarClock, CheckCircle2, Clock, Hash, ListChecks, Settings, Trash2 } from "lucide-react";
 import type { ReactNode } from "react";
 import { cronHuman } from "../../lib/cron";
 import { cn } from "../../lib/utils";
@@ -17,19 +17,46 @@ type ReminderJob = {
   enabled?: boolean;
   deliver?: string;
   nextRunAt?: string;
+  /** 系统内置任务(daily-reflection/weekly-curation/skill-check 等):新格式在 bits 里带
+   *  `系统` 位;渲染时加「系统」徽标 + 齿轮图标,区别于用户自建提醒。 */
+  isSystem?: boolean;
 };
 
 type ReminderParseResult =
   | { kind: "empty" }
-  | { kind: "list"; declaredCount?: number; jobs: ReminderJob[] };
+  // leftovers:缝合后仍无法解析的原始行,以 muted 纯文本附在卡列表底部(不静默丢、不作废整卡)。
+  | { kind: "list"; declaredCount?: number; jobs: ReminderJob[]; leftovers: string[] };
 
 const EMPTY_REMINDER_RE = /当前没有任何定时提醒\/任务/;
 const REMINDER_LINE_RE = /^-\s+\*\*(.*?)\*\*\s+\(ID:\s*`([^`]+)`\)\s+—\s+(.+)$/u;
+// 条目的 ID 收尾标记:`(ID: \`...\`) — `。缝合多行标题时用它判断本条目是否已完整。
+const REMINDER_ID_TAIL_RE = /\(ID:\s*`[^`]+`\)\s*—/u;
 
 function stripBackticks(s: string): string {
   return s.trim().replace(/^`|`$/g, "");
 }
 
+function jobFromMatch(m: RegExpExecArray): ReminderJob {
+  const bits = m[3].split(" · ").map((b) => b.trim()).filter(Boolean);
+  const scheduleBit = bits.find((b) => /^`[^`]+`$/.test(b));
+  const next = bits.find((b) => b.startsWith("下次 "));
+  return {
+    // 标题空白压平(缝合处的换行/连续空格折成单空格),避免多行标题在卡里留断行/双空格。
+    title: m[1].trim().replace(/\s+/g, " ") || m[2],
+    id: m[2],
+    schedule: scheduleBit ? stripBackticks(scheduleBit) : "",
+    oneshot: bits.includes("一次性") ? true : bits.includes("重复") ? false : undefined,
+    enabled: bits.includes("已停用") ? false : bits.includes("启用中") ? true : undefined,
+    deliver: bits.includes("仅记录") ? "仅记录" : bits.includes("Telegram") ? "Telegram" : bits.includes("推送对话") ? "推送对话" : undefined,
+    nextRunAt: next ? next.slice(3).trim() : undefined,
+    isSystem: bits.includes("系统"),
+  };
+}
+
+// 系统任务的 prompt 内嵌真实换行(如 weekly-curation 标题里的 `\n\n`),旧逐行正则一遇断行
+// 就整卡作废回退文字墙(boss 现网 bug)。这里改多行缝合:遇到 `- **` 开头但当行没有 ID 收尾
+// 的条目,向后拼接(换行折空格)直到出现 `(ID: \`...\`) — ...` 再走行正则;仍失败的行不吞进
+// 相邻条目,以 leftover 纯文本附底。兼容后端新格式(标题单行 + `系统` bit)。
 export function parseReminderListOutput(output?: string | null): ReminderParseResult | null {
   const text = String(output || "").trim();
   if (!text) return null;
@@ -38,32 +65,33 @@ export function parseReminderListOutput(output?: string | null): ReminderParseRe
   const countMatch = /共\s+(\d+)\s+个定时提醒\/任务/.exec(text);
   const declaredCount = countMatch ? Number(countMatch[1]) : undefined;
   const jobs: ReminderJob[] = [];
-  let malformedTaskLine = false;
+  const leftovers: string[] = [];
+  let buf: string | null = null;
+  const finalizeBuf = () => {
+    if (buf == null) return;
+    const m = REMINDER_LINE_RE.exec(buf);
+    if (m) jobs.push(jobFromMatch(m));
+    else leftovers.push(buf);
+    buf = null;
+  };
+
   for (const line of text.split("\n")) {
     const trimmed = line.trim();
-    if (!trimmed || countMatch?.[0] === trimmed) continue;
-    if (!trimmed.startsWith("- ")) continue;
-    const m = REMINDER_LINE_RE.exec(trimmed);
-    if (!m) {
-      malformedTaskLine = true;
-      continue;
+    // 新条目开始而上一条目仍未闭合(始终没等到 ID 尾)→ 先把旧缓冲收束为 leftover,不吞进新条目。
+    if (buf != null && trimmed.startsWith("- ")) finalizeBuf();
+    if (buf == null) {
+      if (!trimmed || countMatch?.[0] === trimmed) continue;
+      if (!trimmed.startsWith("- ")) continue;
+      buf = trimmed;
+    } else {
+      buf = `${buf} ${trimmed}`.trim();
     }
-    const bits = m[3].split(" · ").map((b) => b.trim()).filter(Boolean);
-    const scheduleBit = bits.find((b) => /^`[^`]+`$/.test(b));
-    const next = bits.find((b) => b.startsWith("下次 "));
-    jobs.push({
-      title: m[1].trim() || m[2],
-      id: m[2],
-      schedule: scheduleBit ? stripBackticks(scheduleBit) : "",
-      oneshot: bits.includes("一次性") ? true : bits.includes("重复") ? false : undefined,
-      enabled: bits.includes("已停用") ? false : bits.includes("启用中") ? true : undefined,
-      deliver: bits.includes("仅记录") ? "仅记录" : bits.includes("Telegram") ? "Telegram" : bits.includes("推送对话") ? "推送对话" : undefined,
-      nextRunAt: next ? next.slice(3).trim() : undefined,
-    });
+    if (REMINDER_ID_TAIL_RE.test(buf)) finalizeBuf();
   }
+  finalizeBuf(); // 收尾未闭合缓冲
+
   if (jobs.length === 0) return null;
-  if (malformedTaskLine || (declaredCount !== undefined && jobs.length !== declaredCount)) return null;
-  return { kind: "list", declaredCount, jobs };
+  return { kind: "list", declaredCount, jobs, leftovers };
 }
 
 function fmtDateTime(value?: string): string {
@@ -84,15 +112,17 @@ function SmallMeta({ icon, children }: { icon?: ReactNode; children: ReactNode }
 
 function ReminderJobCard({ job }: { job: ReminderJob }) {
   const human = job.schedule ? cronHuman(job.schedule) : "自定义时间";
+  const Icon = job.isSystem ? Settings : Clock;
   return (
     <li className="rounded-xl border border-border bg-elevated px-3 py-2.5 shadow-soft">
       <div className="flex items-start gap-2.5">
         <span className="mt-0.5 flex size-7 shrink-0 items-center justify-center rounded-lg bg-accent-soft text-accent">
-          <Clock size={14} />
+          <Icon size={14} />
         </span>
         <div className="min-w-0 flex-1">
           <div className="flex min-w-0 flex-wrap items-center gap-1.5">
             <span className="min-w-0 max-w-full truncate text-[13px] font-semibold text-fg">{job.title}</span>
+            {job.isSystem && <Badge tone="neutral">系统</Badge>}
             {job.enabled === false ? <Badge tone="warning">已停用</Badge> : <Badge tone="success">启用中</Badge>}
           </div>
           <div className="mt-1 flex flex-wrap gap-1.5">
@@ -134,6 +164,15 @@ export function renderReminderListCard(output?: string | null): ReactNode | null
           <ReminderJobCard key={job.id} job={job} />
         ))}
       </ul>
+      {parsed.leftovers.length > 0 && (
+        <ul className="flex flex-col gap-1">
+          {parsed.leftovers.map((line, i) => (
+            <li key={`lo-${i}`} className="whitespace-pre-wrap break-words text-[12px] text-faint">
+              {line}
+            </li>
+          ))}
+        </ul>
+      )}
     </div>
   );
 }

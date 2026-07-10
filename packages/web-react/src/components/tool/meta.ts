@@ -11,6 +11,7 @@ import {
   Archive,
   BarChart3,
   Bot,
+  Boxes,
   Brain,
   Camera,
   Clock,
@@ -22,6 +23,7 @@ import {
   Globe,
   Image as ImageIcon,
   Keyboard,
+  Layers,
   ListChecks,
   Mic,
   MousePointer2,
@@ -30,6 +32,8 @@ import {
   Pencil,
   Search,
   Send,
+  Server,
+  ShieldCheck,
   Sparkles,
   Terminal,
   Users,
@@ -173,6 +177,8 @@ const MCP_SERVER_META: Record<string, ToolMeta> = {
   "scansci-pdf": { icon: FileText, label: "论文检索", tone: "info" },
   "web-context": { icon: Globe, label: "网页/文档提取", tone: "info" },
   "quant-system": { icon: BarChart3, label: "量化", tone: "info" },
+  // codex 引擎内建 MCP 桥(list_mcp_resources 等运维类 op)——归「系统」域,避免裸英文兜底。
+  codex: { icon: Server, label: "系统", tone: "neutral" },
 };
 
 // ── per-op 覆盖（server 作用域），给更贴切的图标 + 标签 ──
@@ -232,7 +238,12 @@ const MCP_OP_META: Record<string, ToolMeta> = {
   "openclaude-memory:skill_view": { icon: Sparkles, label: "查看技能" },
   "openclaude-memory:skill_save": { icon: Sparkles, label: "保存技能" },
   "openclaude-memory:skill_delete": { icon: Sparkles, label: "删除技能" },
+  "openclaude-memory:skill_propose": { icon: Sparkles, label: "提议技能" },
+  "openclaude-memory:request_review": { icon: ShieldCheck, label: "申请质量审查" },
   "openclaude-memory:ask_gpt55_codex": { icon: Bot, label: "Codex 审查" },
+  // codex 内建 MCP 资源清单(op 无摘要,空态即全部信息)。
+  "codex:list_mcp_resources": { icon: Boxes, label: "MCP 资源列表" },
+  "codex:list_mcp_resource_templates": { icon: Layers, label: "MCP 资源模板" },
   // web-context
   "web-context:web_context_extract_url": { icon: Globe, label: "网页提取" },
   "web-context:web_context_parse_file": { icon: FileText, label: "文档解析" },
