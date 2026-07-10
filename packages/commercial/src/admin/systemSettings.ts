@@ -22,6 +22,7 @@
  */
 
 import type { PoolClient } from "pg";
+import { PLATFORM_REASONING_EFFORTS } from "@openclaude/protocol";
 import { z } from "zod";
 import { query, tx } from "../db/queries.js";
 import { writeAdminAudit } from "./audit.js";
@@ -37,7 +38,7 @@ export const KEY_SCHEMAS = {
   /** 是否允许新用户注册。`false` → /api/auth/register 直接 403。 */
   allow_registration: z.boolean(),
   /** 注册新用户时的默认 effort(若用户未在 /api/me/preferences 显式设置)。 */
-  default_effort: z.enum(["low", "medium", "high", "xhigh"]),
+  default_effort: z.enum(PLATFORM_REASONING_EFFORTS),
   /** 单用户每分钟 chat 请求上限。整数,1..1000。 */
   rate_limit_chat_per_min: z.number().int().min(1).max(1000),
   /** 维护模式;true → 非 admin 用户的所有 /api/* 返 503 SERVICE_UNAVAILABLE。 */
@@ -210,7 +211,7 @@ export const KEY_META: Record<
   allow_registration: { kind: "boolean", description: "是否允许新用户注册" },
   default_effort: {
     kind: "enum",
-    enumValues: ["low", "medium", "high", "xhigh"],
+    enumValues: [...PLATFORM_REASONING_EFFORTS],
     description: "新用户默认 effort(用户未自定义时)",
   },
   rate_limit_chat_per_min: { kind: "number", min: 1, max: 1000, description: "单用户每分钟 chat 请求上限" },

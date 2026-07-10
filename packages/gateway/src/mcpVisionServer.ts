@@ -31,11 +31,11 @@ import { fileURLToPath } from 'node:url'
 import { Server } from '@modelcontextprotocol/sdk/server/index.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js'
-import { findRouteProviderForModel } from '@openclaude/protocol'
+import { DEFAULT_CODEX_ENGINE_MODEL, findRouteProviderForModel } from '@openclaude/protocol'
 import { paths } from '@openclaude/storage'
 
 const TOOL_NAME = 'understand_image'
-const DEFAULT_MODEL = 'gpt-5.5'
+const DEFAULT_MODEL = DEFAULT_CODEX_ENGINE_MODEL
 const DEFAULT_TIMEOUT_MS = 120_000
 const DEFAULT_MAX_IMAGE_BYTES = 20 * 1024 * 1024
 const MAX_CONFIGURED_IMAGE_BYTES = 50 * 1024 * 1024
@@ -52,7 +52,7 @@ const MAX_REFRESH_TIMEOUT_MS = 8_000
 // ── MiniMax vision backend(默认 backend）─────────────────────────────────────
 // understand_image 默认用 **MiniMax-M3**(订阅制,2026-06-17 实测其 Anthropic 端点准确识图),
 // 经容器 internal anthropic proxy(ANTHROPIC_BASE_URL + oc-v3 容器 bearer)调用 —— minimax key
-// 留 master,容器只用身份 bearer。codex(gpt-5.5)backend 仅 OPENCLAUDE_VISION_BACKEND=codex 显式启用。
+// 留 master,容器只用身份 bearer。codex(GPT-5.6)backend 仅 OPENCLAUDE_VISION_BACKEND=codex 显式启用。
 const MINIMAX_VISION_MODEL = 'MiniMax-M3'
 const MINIMAX_VISION_MAX_TOKENS = 1024
 const DEFAULT_MINIMAX_TIMEOUT_MS = 60_000

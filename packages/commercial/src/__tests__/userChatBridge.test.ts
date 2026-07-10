@@ -826,7 +826,7 @@ describe("userChatBridge — tunnel routing (regression)", () => {
 
 describe("userChatBridge — model authorization", () => {
   test("inbound.message 带 model 且未授权 → close(POLICY)", async () => {
-    const allowed = new Set<string>(["claude-opus-4-7"]); // gpt-5.5 不在
+    const allowed = new Set<string>(["claude-opus-4-7"]); // gpt-5.6-sol 不在
     const rig = await startRig({
       loadAllowedModelChecker: async () => (id: string) => allowed.has(id),
     });
@@ -837,7 +837,7 @@ describe("userChatBridge — model authorization", () => {
 
       const errFrameP = waitMessage(ws);
       const closeP = waitClose(ws);
-      ws.send(JSON.stringify({ type: "inbound.message", model: "gpt-5.5" }));
+      ws.send(JSON.stringify({ type: "inbound.message", model: "gpt-5.6-sol" }));
       const err = await errFrameP;
       assert.match(err.data.toString(), /UNAUTHORIZED_MODEL/);
       const closed = await closeP;
@@ -847,7 +847,7 @@ describe("userChatBridge — model authorization", () => {
     }
   });
 
-  // (v5 ccb-only:agentId='codex' 隐含 gpt-5.5 的 authz 用例已随 codex agent +
+  // (v5 ccb-only:agentId='codex' 隐含 gpt-5.6-sol 的 authz 用例已随 codex agent +
   //  AGENT_AUTHZ_IMPLIED_MODEL codex 条目一并移除。)
 
   test("inbound.message 带公开 model 且授权 → 透传到容器", async () => {
@@ -890,7 +890,7 @@ describe("userChatBridge — model authorization", () => {
   });
 
   test("inbound.message 会附带 master 权威历史给容器用于跨 provider 上下文", async () => {
-    const allowed = new Set<string>(["gpt-5.5"]);
+    const allowed = new Set<string>(["gpt-5.6-sol"]);
     const rig = await startRig({
       loadAllowedModelChecker: async () => (id: string) => allowed.has(id),
       loadMasterSessionMessages: async (uid, sessionId) => {
@@ -920,7 +920,7 @@ describe("userChatBridge — model authorization", () => {
         channel: "webchat",
         peer: { id: "sess-history", kind: "dm" },
         content: { text: "我刚才问了什么？" },
-        model: "gpt-5.5",
+        model: "gpt-5.6-sol",
       }));
       const got = await seenP;
       const forwarded = JSON.parse(
@@ -1016,8 +1016,8 @@ describe("userChatBridge — model authorization", () => {
     }
   });
 
-  test("第一帧带 gpt-5.5(授权)→ 第二帧不带 model 仍按 lastSeenModelId 校验(review v1 follow-up)", async () => {
-    // 场景:bridge lifetime 内 user 第一帧合法用了 gpt-5.5;之后流式增量帧仅带
+  test("第一帧带 gpt-5.6-sol(授权)→ 第二帧不带 model 仍按 lastSeenModelId 校验(review v1 follow-up)", async () => {
+    // 场景:bridge lifetime 内 user 第一帧合法用了 gpt-5.6-sol;之后流式增量帧仅带
     // delta/text 不带 model。如果中间 admin 撤销了 grant,后续的 delta 帧也必须
     // 被拦(lastSeenModelId 兜底)。这里通过 mock checker 在 mid-session 切语义
     // 来模拟"撤销"。
@@ -1025,7 +1025,7 @@ describe("userChatBridge — model authorization", () => {
     const rig = await startRig({
       loadAllowedModelChecker: async () => (id: string) => {
         if (id === "claude-opus-4-7") return true;
-        if (id === "gpt-5.5") return state.allowGpt;
+        if (id === "gpt-5.6-sol") return state.allowGpt;
         return false;
       },
     });
@@ -1036,21 +1036,21 @@ describe("userChatBridge — model authorization", () => {
       await new Promise<void>((r) => ws.once("open", () => r()));
       const containerWs = await containerOpenP;
 
-      // 1) 首帧带 gpt-5.5,被授权 → 透传
+      // 1) 首帧带 gpt-5.6-sol,被授权 → 透传
       const firstP = new Promise<Buffer | string>((r) => {
         containerWs.once("message", (d) => {
           r(typeof d === "string" ? d : Buffer.isBuffer(d) ? d : Buffer.concat(d as Buffer[]));
         });
       });
-      ws.send(JSON.stringify({ type: "inbound.message", model: "gpt-5.5", n: 1 }));
+      ws.send(JSON.stringify({ type: "inbound.message", model: "gpt-5.6-sol", n: 1 }));
       const first = await firstP;
       const firstText = typeof first === "string" ? first : first.toString("utf8");
-      assert.match(firstText, /"gpt-5\.5"/);
+      assert.match(firstText, /"gpt-5\.6-sol"/);
 
       // 2) admin 撤销
       state.allowGpt = false;
 
-      // 3) 第二帧不带 model,但 lastSeenModelId='gpt-5.5' → 应该被拦
+      // 3) 第二帧不带 model,但 lastSeenModelId='gpt-5.6-sol' → 应该被拦
       const errFrameP = waitMessage(ws);
       const closeP = waitClose(ws);
       ws.send(JSON.stringify({ type: "inbound.message", n: 2 }));

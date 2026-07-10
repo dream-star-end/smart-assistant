@@ -195,24 +195,26 @@ describe('CodexAppServerRunner turn/start params', () => {
     await h.cleanup()
   })
 
-  it('defaults GPT/Codex reasoning_effort to high and maps explicit effort levels', async () => {
-    const h = await makeHarness()
+  it('uses each GPT-5.6 model default and passes explicit max through', async () => {
+    const expectedDefaults = [
+      ['gpt-5.6-sol', 'low'],
+      ['gpt-5.6-terra', 'medium'],
+      ['gpt-5.6-luna', 'medium'],
+    ] as const
+    for (const [model, expected] of expectedDefaults) {
+      const h = await makeHarness({ model })
+      const params = (h.runner as any).buildTurnStartParams('hi')
+      assert.equal((params.collaborationMode as any).settings.reasoning_effort, expected)
+      await h.cleanup()
+    }
 
-    const defaultParams = (h.runner as any).buildTurnStartParams('hi')
-    assert.equal((defaultParams.collaborationMode as any).settings.reasoning_effort, 'high')
-
-    h.runner.setEffortLevel('low')
-    const lowParams = (h.runner as any).buildTurnStartParams('hi')
-    assert.equal((lowParams.collaborationMode as any).settings.reasoning_effort, 'low')
-
+    const h = await makeHarness({ model: 'gpt-5.6-sol' })
     h.runner.setEffortLevel('max')
     const maxParams = (h.runner as any).buildTurnStartParams('hi')
-    assert.equal((maxParams.collaborationMode as any).settings.reasoning_effort, 'xhigh')
-
+    assert.equal((maxParams.collaborationMode as any).settings.reasoning_effort, 'max')
     h.runner.setEffortLevel('turbo')
     const invalidParams = (h.runner as any).buildTurnStartParams('hi')
-    assert.equal((invalidParams.collaborationMode as any).settings.reasoning_effort, 'high')
-
+    assert.equal((invalidParams.collaborationMode as any).settings.reasoning_effort, 'low')
     await h.cleanup()
   })
 })
@@ -1695,8 +1697,8 @@ describe('SubprocessRunner interface parity', () => {
     // Regression: sessionManager.submit calls session.runner.setModel on every
     // InboundMessage with model field; missing method = TypeError → turn never
     // completes → user sees "思考中" forever (witnessed in v3 v1.0.61b prod).
-    const h = await makeHarness({ model: 'gpt-5.5' })
-    assert.equal(h.runner.model, 'gpt-5.5')
+    const h = await makeHarness({ model: 'gpt-5.6-sol' })
+    assert.equal(h.runner.model, 'gpt-5.6-sol')
     h.runner.setModel('gpt-5-codex')
     assert.equal(h.runner.model, 'gpt-5-codex')
     h.runner.setModel(undefined)
@@ -2039,7 +2041,7 @@ describe('handleNotification — collabAgentToolCall', () => {
         tool: 'spawnAgent',
         prompt: 'inspect gateway',
         receiverThreadIds: ['thread-child-1'],
-        model: 'gpt-5.5',
+        model: 'gpt-5.6-sol',
       }),
     )
     assert.equal(h.messages.length, 1)

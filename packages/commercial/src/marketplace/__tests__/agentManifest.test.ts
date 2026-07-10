@@ -12,7 +12,7 @@ import {
   validateAgentManifest,
 } from '../agentManifest.js'
 
-const allowedModels = new Set(['glm-5.2', 'deepseek-v4'])
+const allowedModels = new Set(['glm-5.2', 'deepseek-v4', 'gpt-5.6-sol'])
 const opts = { vettedToolsets: VETTED_AGENT_TOOLSETS, allowedModels }
 
 function base(): Record<string, unknown> {
@@ -69,8 +69,13 @@ describe('validateAgentManifest', () => {
   })
 
   it('rejects a model outside the allowed set', () => {
-    const r = validateAgentManifest({ ...base(), model: 'gpt-5.5' }, opts)
+    const r = validateAgentManifest({ ...base(), model: 'gpt-9-fictional' }, opts)
     assert.equal(r.ok, false)
+  })
+
+  it('accepts public GPT-5.6 models', () => {
+    const r = validateAgentManifest({ ...base(), model: 'gpt-5.6-sol' }, opts)
+    assert.equal(r.ok, true)
   })
 
   it('requires an inline persona', () => {

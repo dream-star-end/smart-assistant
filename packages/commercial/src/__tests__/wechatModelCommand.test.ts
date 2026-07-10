@@ -6,7 +6,7 @@ import {
   parseModelCommandSelection,
 } from "../wechat/modelCommand.js"
 
-const allowed = new Set(["claude-opus-4-7", "claude-sonnet-4-6", "gpt-5.5"])
+const allowed = new Set(["claude-opus-4-7", "claude-sonnet-4-6", "gpt-5.6-sol"])
 
 describe("parseModelCommandSelection", () => {
   test("extracts optional selection", () => {

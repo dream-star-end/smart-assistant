@@ -51,28 +51,28 @@ function agent(partial: Partial<AgentDef>): Pick<AgentDef, 'id' | 'model' | 'pro
 }
 
 describe('resolveSyntheticTurnModel', () => {
-  test('host main 复现:agent 无 model + defaults=gpt-5.5(codex)→ 降级到非 codex 兜底(带 originalModel)', () => {
-    // 线上 openclaude.json defaults.model=gpt-5.5;cron 的 main agent 无自带 model。
+  test('host main 复现:agent 无 model + defaults=gpt-5.6-sol(codex)→ 降级到非 codex 兜底(带 originalModel)', () => {
+    // 线上 openclaude.json defaults.model=gpt-5.6-sol;cron 的 main agent 无自带 model。
     delete process.env[ENV_KEY]
-    const r = resolveSyntheticTurnModel(agent({ model: undefined }), 'gpt-5.5')
+    const r = resolveSyntheticTurnModel(agent({ model: undefined }), 'gpt-5.6-sol')
     assert.deepEqual(r, {
       model: SYNTHETIC_TURN_NON_CODEX_MODEL_DEFAULT,
-      originalModel: 'gpt-5.5',
+      originalModel: 'gpt-5.6-sol',
       downgraded: true,
     })
   })
 
-  test('agent.model 显式 gpt-5.5(codex)→ 降级为非 codex 兜底', () => {
+  test('agent.model 显式 gpt-5.6-sol(codex)→ 降级为非 codex 兜底', () => {
     delete process.env[ENV_KEY]
-    const r = resolveSyntheticTurnModel(agent({ model: 'gpt-5.5' }), 'glm-5.2')
+    const r = resolveSyntheticTurnModel(agent({ model: 'gpt-5.6-sol' }), 'glm-5.2')
     assert.equal(r?.model, SYNTHETIC_TURN_NON_CODEX_MODEL_DEFAULT)
-    assert.equal(r?.originalModel, 'gpt-5.5')
+    assert.equal(r?.originalModel, 'gpt-5.6-sol')
     assert.equal(r?.downgraded, true)
   })
 
   test('agent.model 已是非 codex(glm-5.2)→ undefined(尊重原配置,行为不变)', () => {
     delete process.env[ENV_KEY]
-    assert.equal(resolveSyntheticTurnModel(agent({ model: 'glm-5.2' }), 'gpt-5.5'), undefined)
+    assert.equal(resolveSyntheticTurnModel(agent({ model: 'glm-5.2' }), 'gpt-5.6-sol'), undefined)
   })
 
   test('defaults 非 codex + agent 无 model → undefined(不覆盖)', () => {
@@ -85,36 +85,36 @@ describe('resolveSyntheticTurnModel', () => {
     // provider pin 下即便 defaults 是 codex,也返回 undefined —— 交由 guard fail-closed,
     // 不静默降级到 CCB(显式 codex 意图 + 无扣费主体 = 显式拒)。
     assert.equal(
-      resolveSyntheticTurnModel(agent({ provider: 'codex-native', model: undefined }), 'gpt-5.5'),
+      resolveSyntheticTurnModel(agent({ provider: 'codex-native', model: undefined }), 'gpt-5.6-sol'),
       undefined,
     )
   })
 
   test('下线/非法 agent.model 被 resolveExecutionModel 收敛到 codex 默认 → 仍降级', () => {
-    // agent.model 不在白名单(如残留下线模型)→ resolveExecutionModel 回落 defaults=gpt-5.5
+    // agent.model 不在白名单(如残留下线模型)→ resolveExecutionModel 回落 defaults=gpt-5.6-sol
     // → 实际会落 codex,必须同样降级(不能因 agent.model 字面非 codex 而漏判)。
     delete process.env[ENV_KEY]
-    const r = resolveSyntheticTurnModel(agent({ model: 'claude-3-7-sonnet-retired' }), 'gpt-5.5')
+    const r = resolveSyntheticTurnModel(agent({ model: 'claude-3-7-sonnet-retired' }), 'gpt-5.6-sol')
     assert.equal(r?.model, SYNTHETIC_TURN_NON_CODEX_MODEL_DEFAULT)
-    assert.equal(r?.originalModel, 'gpt-5.5')
+    assert.equal(r?.originalModel, 'gpt-5.6-sol')
   })
 
   test('env 覆盖为合法且可路由的非 codex 模型 → 采用', () => {
     process.env[ENV_KEY] = 'deepseek-v4-flash'
-    const r = resolveSyntheticTurnModel(agent({ model: 'gpt-5.5' }), 'glm-5.2')
+    const r = resolveSyntheticTurnModel(agent({ model: 'gpt-5.6-sol' }), 'glm-5.2')
     assert.equal(r?.model, 'deepseek-v4-flash')
-    assert.equal(r?.originalModel, 'gpt-5.5')
+    assert.equal(r?.originalModel, 'gpt-5.6-sol')
   })
 
-  test('env 覆盖为 codex 模型(gpt-5.5)→ 忽略,回默认(防把 bug 换个门再引入)', () => {
-    process.env[ENV_KEY] = 'gpt-5.5'
-    const r = resolveSyntheticTurnModel(agent({ model: 'gpt-5.5' }), 'glm-5.2')
+  test('env 覆盖为 codex 模型(gpt-5.6-sol)→ 忽略,回默认(防把 bug 换个门再引入)', () => {
+    process.env[ENV_KEY] = 'gpt-5.6-sol'
+    const r = resolveSyntheticTurnModel(agent({ model: 'gpt-5.6-sol' }), 'glm-5.2')
     assert.equal(r?.model, SYNTHETIC_TURN_NON_CODEX_MODEL_DEFAULT)
   })
 
   test('env 覆盖为白名单外模型 → 忽略,回默认(否则会被 resolveExecutionModel 收敛掉)', () => {
     process.env[ENV_KEY] = 'some-unlisted-model'
-    const r = resolveSyntheticTurnModel(agent({ model: 'gpt-5.5' }), 'gpt-5.5')
+    const r = resolveSyntheticTurnModel(agent({ model: 'gpt-5.6-sol' }), 'gpt-5.6-sol')
     assert.equal(r?.model, SYNTHETIC_TURN_NON_CODEX_MODEL_DEFAULT)
   })
 
@@ -133,19 +133,19 @@ describe('resolveSyntheticTurnModel', () => {
   test('routable gate:host + seam 未注入(兜底不可路由)→ undefined(保持 fail-closed,不换必 401 模型)', () => {
     delete process.env[ENV_KEY]
     setHostStaticProviderKeys(null)
-    assert.equal(resolveSyntheticTurnModel(agent({ model: 'gpt-5.5' }), 'glm-5.2'), undefined)
+    assert.equal(resolveSyntheticTurnModel(agent({ model: 'gpt-5.6-sol' }), 'glm-5.2'), undefined)
   })
 
   test('routable gate:兜底 deepseek-v4-pro 但 seam 只有 ark key → undefined(该 provider 不可路由)', () => {
     delete process.env[ENV_KEY]
     setHostStaticProviderKeys({ ark: 'ark-coding' })
-    assert.equal(resolveSyntheticTurnModel(agent({ model: 'gpt-5.5' }), 'glm-5.2'), undefined)
+    assert.equal(resolveSyntheticTurnModel(agent({ model: 'gpt-5.6-sol' }), 'glm-5.2'), undefined)
   })
 
   test('routable gate:env 覆盖到 MiniMax-M3 但 seam 缺 minimax key → undefined', () => {
     process.env[ENV_KEY] = 'MiniMax-M3'
     setHostStaticProviderKeys({ deepseek: 'sk-deep' })
-    assert.equal(resolveSyntheticTurnModel(agent({ model: 'gpt-5.5' }), 'glm-5.2'), undefined)
+    assert.equal(resolveSyntheticTurnModel(agent({ model: 'gpt-5.6-sol' }), 'glm-5.2'), undefined)
   })
 
   test('routable gate:容器身份下兜底恒可路由(经 internal proxy)→ 正常降级', () => {
@@ -156,9 +156,9 @@ describe('resolveSyntheticTurnModel', () => {
     const prevContainer = process.env.OC_CONTAINER_ID
     process.env.OC_CONTAINER_ID = 'c-test'
     try {
-      const r = resolveSyntheticTurnModel(agent({ model: 'gpt-5.5' }), 'glm-5.2')
+      const r = resolveSyntheticTurnModel(agent({ model: 'gpt-5.6-sol' }), 'glm-5.2')
       assert.equal(r?.model, SYNTHETIC_TURN_NON_CODEX_MODEL_DEFAULT)
-      assert.equal(r?.originalModel, 'gpt-5.5')
+      assert.equal(r?.originalModel, 'gpt-5.6-sol')
     } finally {
       if (prevContainer === undefined) delete process.env.OC_CONTAINER_ID
       else process.env.OC_CONTAINER_ID = prevContainer

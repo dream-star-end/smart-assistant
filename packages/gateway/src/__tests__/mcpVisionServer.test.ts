@@ -112,7 +112,7 @@ describe('openclaude-vision MCP input validation', () => {
   it('builds a no-shell codex exec argv with image input and output file', () => {
     const runDir = '/tmp/oc-vision-run'
     const args = vision.buildCodexVisionArgs(
-      { imagePath: '/tmp/a.png', prompt: 'describe', model: 'gpt-5.5' },
+      { imagePath: '/tmp/a.png', prompt: 'describe', model: 'gpt-5.6-sol' },
       '/tmp/out.txt',
       runDir,
     )
@@ -131,7 +131,7 @@ describe('openclaude-vision MCP input validation', () => {
     assert.ok(args.includes('/tmp/a.png'))
     assert.ok(args.includes('--output-last-message'))
     assert.ok(args.includes('/tmp/out.txt'))
-    assert.ok(args.includes('gpt-5.5'))
+    assert.ok(args.includes('gpt-5.6-sol'))
   })
 
   it('stages the image inside the one-shot run directory before Codex sees it', () => {

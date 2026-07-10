@@ -180,8 +180,8 @@ describe('internalCodexRelay handler', () => {
         assert.equal(args.containerId, 11)
         assert.equal(args.userId, 42n)
         return {
-          modelId: 'gpt-5.5',
-          group: { id: 9n, label: 'relay', kind: 'api_relay', provider: 'codex', enabled: true, priority: 1, models: ['gpt-5.5'], created_at: new Date(), updated_at: new Date() },
+          modelId: 'gpt-5.6-sol',
+          group: { id: 9n, label: 'relay', kind: 'api_relay', provider: 'codex', enabled: true, priority: 1, models: ['gpt-5.6-sol'], created_at: new Date(), updated_at: new Date() },
           credential: {
             id: 8n,
             group_id: 9n,
@@ -253,8 +253,8 @@ describe('internalCodexRelay handler', () => {
         identityRepo: makeRepo(),
         db: makeDb({ codexAccountId: null, provider: null, accountStatus: null }),
         resolveRouteContext: async () => ({
-          modelId: 'gpt-5.5',
-          group: { id: 9n, label: 'relay', kind: 'api_relay', provider: 'codex', enabled: true, priority: 1, models: ['gpt-5.5'], created_at: new Date(), updated_at: new Date() },
+          modelId: 'gpt-5.6-sol',
+          group: { id: 9n, label: 'relay', kind: 'api_relay', provider: 'codex', enabled: true, priority: 1, models: ['gpt-5.6-sol'], created_at: new Date(), updated_at: new Date() },
           credential: {
             id: 8n,
             group_id: 9n,

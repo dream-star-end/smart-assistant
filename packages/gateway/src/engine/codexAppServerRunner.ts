@@ -23,6 +23,7 @@ import {
   type CodexProviderConfigOverride,
   codexReasoningEffortConfig,
   copyImagePathsToPublicDir,
+  normalizeCodexReasoningEffort,
 } from './codexShared.js'
 import { V3_CODEX_RELAY_PREFIX } from '../v3CodexRelay.js'
 import { createLogger } from '../logger.js'
@@ -915,12 +916,13 @@ export class CodexAppServerRunner extends EventEmitter {
 
   setEffortLevel(level: string | undefined): void {
     // v1.0.200 起 effort 主通道改成 codex argv:`ensureSpawned` 调
-    // `codexReasoningEffortConfig(this.effortLevel)` 拼 `-c model_reasoning_effort=...`
-    // 透传给 `codex app-server` 进程,与 codexRunner.ts 同 helper、同 `max → xhigh` 归一。
+    // `codexReasoningEffortConfig(this.model,this.effortLevel)` 拼
+    // `-c model_reasoning_effort=...` 透传给 `codex app-server`。Codex 0.144
+    // 原生接受 max；缺省按具体 GPT-5.6 型号默认值,不再一律强制 high。
     //
     // RESEARCH slot 仍由 buildPromptContext 单独维护,仅在 effortLevel === 'max'
     // 时注入"科研模式"提示文本(主要服务 Opus/DeepSeek 异常 max payload);
-    // codex 前端不暴露 max,正常 gpt-5.5 effort 走 argv,不会同时进 RESEARCH slot。
+    // GPT-5.6 max effort 走 argv；RESEARCH slot 的 prompt 仅是跨引擎兼容补充。
     //
     // setEffortLevel 仍只 stash on this — 长寿 `codex app-server` 进程不接受
     // 运行时切档,值在下次 spawn 生效;sessionManager.submit 会在切档时显式
@@ -1318,14 +1320,11 @@ export class CodexAppServerRunner extends EventEmitter {
     // `codex app-server` accepts `-c key=value` overrides. They must precede
     // `--listen` so clap's positional/option parser sees the stdio:// last.
     //
-    // v1.0.200:effort 进 codex argv 主通道。v5 GPT/Codex 产品默认要求
-    // "high",所以本 runner 先把缺失/非法归一到 high,再交给共享 helper
-    // 生成 `-c model_reasoning_effort="<low|medium|high|xhigh>"`(max → xhigh)。
-    // 注意:codexReasoningEffortConfig(undefined) 的共享语义仍是不带 flag;
-    // default-high 只属于 app-server runner 的产品策略。
+    // effort 进 codex argv 主通道。共享 protocol 按型号给出合法档位与默认值:
+    // Sol 缺省 low、Terra/Luna 缺省 medium；用户显式 max 原样透传。
     const providerSignature = this.codexRouteSignature()
     const providerArgs = buildCodexProviderConfigArgs(process.env, this.codexRouteConfig)
-    const effortArgs = codexReasoningEffortConfig(this.codexReasoningEffort())
+    const effortArgs = codexReasoningEffortConfig(this.opts.model, this.effortLevel)
     // T3:reasoning summary 与 effort 是同一 provider 的推理配置,co-locate 在这里
     // 一起拼(仅 codex-native/gpt-5.5 官方 OAuth 路径生效,env 可秒关)。让队长思考
     // 阶段吐 summary → thinking 卡可见。
@@ -1764,22 +1763,13 @@ export class CodexAppServerRunner extends EventEmitter {
     } as unknown as RunnerMessage)
   }
 
-  private codexReasoningEffort(): 'low' | 'medium' | 'high' | 'xhigh' {
-    switch (this.effortLevel) {
-      case 'low':
-      case 'medium':
-      case 'high':
-      case 'xhigh':
-        return this.effortLevel
-      case 'max':
-        return 'xhigh'
-      default:
-        return 'high'
-    }
+  private codexReasoningEffort(): string | undefined {
+    return normalizeCodexReasoningEffort(this.opts.model, this.effortLevel) ?? undefined
   }
 
   private buildTurnStartParams(prompt: string): Record<string, unknown> {
     const mode = this.conversationMode
+    const reasoningEffort = this.codexReasoningEffort()
     const params: Record<string, unknown> = {
       threadId: this.threadId,
       input: [{ type: 'text', text: prompt }],
@@ -1787,7 +1777,7 @@ export class CodexAppServerRunner extends EventEmitter {
         mode,
         settings: {
           model: this.opts.model ?? '',
-          reasoning_effort: this.codexReasoningEffort(),
+          ...(reasoningEffort ? { reasoning_effort: reasoningEffort } : {}),
           developer_instructions: mode === 'default' ? CODEX_DEFAULT_MODE_INSTRUCTIONS : null,
         },
       },

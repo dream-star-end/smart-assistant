@@ -218,7 +218,7 @@ export interface SeedPlatformAgentsDeps {
   listPublicModels?: () => Array<{ id: string }>
   /** 平台 owner 用户 id;缺省自动取「最早的 active admin」。无 admin → 跳过。 */
   ownerUserId?: number
-  /** 运行渠道(v5 丢弃 gpt-* 模型);缺省读 OC_RUNTIME_CHANNEL。 */
+  /** 运行渠道;保留给调用方标记 seed 归属。 */
   channel?: string
 }
 
@@ -260,12 +260,8 @@ async function seedAgentDefs(
   }
   out.ownerUserId = ownerUserId
 
-  // allowedModels = v5 公开模型集(v5 渠道丢弃 gpt-*),与 handleMarketplaceAgentPublish 同逻辑。
-  const isV5 = (deps.channel ?? process.env.OC_RUNTIME_CHANNEL?.trim() ?? 'v3') === 'v5'
-  const allowedModels = new Set<string>()
-  for (const m of deps.listPublicModels()) {
-    if (!isV5 || !m.id.toLowerCase().startsWith('gpt-')) allowedModels.add(m.id)
-  }
+  // 与两条发布入口同源:公开目录中的 GPT-5.6 也是合法 agent 模型。
+  const allowedModels = new Set(deps.listPublicModels().map((m) => m.id))
 
   for (const def of defs) {
     try {

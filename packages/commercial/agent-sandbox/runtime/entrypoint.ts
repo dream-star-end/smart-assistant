@@ -43,6 +43,10 @@ import { isProviderManagedEnvVar } from "/opt/openclaude/claude-code-best/src/ut
 // node_modules),故用工作区根的绝对源码路径。本文件不进 commercial tsconfig 编译图,
 // 一致性由 runtimeEntrypointPolicy.test.ts 守护。
 import { isHiddenSystemAgentId as isHiddenSystemAgentIdShared } from "/opt/openclaude/packages/protocol/src/agentVisibility.ts";
+import {
+  DEFAULT_CODEX_ENGINE_MODEL,
+  DEFAULT_CODEX_ENGINE_MODEL_DISPLAY_NAME,
+} from "/opt/openclaude/packages/protocol/src/engineModels.ts";
 
 // entrypoint.ts 文件被 Dockerfile COPY 到 /usr/local/lib/openclaude/,而 yaml 模块装在
 // 容器内 /opt/openclaude/node_modules/yaml(npm workspaces 装到根)。Node ESM/require
@@ -121,13 +125,13 @@ const WEB_CONTEXT_TOOLSET_ID = "web_context";
 // 守护 —— 改这里必须同步改 platformDefaults.ts。
 const COMMERCIAL_DEFAULT_MODEL = "glm-5.2";
 const COMMERCIAL_DEFAULT_PROVIDER = "ark";
-// v5 纯市场模型:容器只 seed「全能助手」(main)+「GPT 5.5」(codex)+隐藏审查员
+// v5 纯市场模型:容器只 seed「全能助手」(main)+GPT-5.6 默认队长(codex)+隐藏审查员
 // (hidden-reviewer) → 其它用户可见 agent 一律走市场安装(见下方 desiredSeedAgents)。
 // 历史内置子 agent(researcher/scientist/coder/reviewer/scholar)已退役,其各角色专用
 // 的 model/provider 常量随之移除。
 // M1b codex 复活:codex seed agent 回归 —— provider:'codex-native' + runnerKind:
 // 'app-server' 是 gateway runner 路由依据,必须落 agents.yaml。
-const COMMERCIAL_CODEX_MODEL = "gpt-5.5";
+const COMMERCIAL_CODEX_MODEL = DEFAULT_CODEX_ENGINE_MODEL;
 const COMMERCIAL_HIDDEN_REVIEWER_MODEL = "glm-5.2";
 const COMMERCIAL_HIDDEN_REVIEWER_PROVIDER = "ark";
 
@@ -941,6 +945,7 @@ try {
     // merge 时被规范化回 ccb 默认(main 仍归 glm-5.2;codex agent 独立 seed)。
     "GPT 5.5 (default)",
     "GPT 5.5 队长",
+    "GPT-5.6-Sol 队长",
   ]);
 
   const LEGACY_RESEARCHER_TOOLSETS = [
@@ -1035,14 +1040,14 @@ try {
     return patched ? next : null;
   }
 
-  // 期望的 codex agent 配置 —— 固定 GPT 5.5 的唯一 seed 入口(M1b 复活)。
+  // 期望的 codex agent 配置 —— 型号由 protocol DEFAULT_CODEX_ENGINE_MODEL 统一。
   const desiredCodexAgent = {
     id: "codex",
     model: COMMERCIAL_CODEX_MODEL,
     permissionMode: "bypassPermissions",
     provider: "codex-native",
     runnerKind: "app-server",
-    displayName: "GPT 5.5 队长",
+    displayName: `${DEFAULT_CODEX_ENGINE_MODEL_DISPLAY_NAME} 队长`,
     avatarEmoji: "🤖",
   };
 

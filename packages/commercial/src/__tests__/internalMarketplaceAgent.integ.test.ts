@@ -77,7 +77,7 @@ function makeRes(): ServerResponse & { body: any } {
 async function handlerFor(userId: number, containerId: number) {
   return makeMarketplaceAgentHandler({
     identityRepo: repoFor(userId, containerId) as any,
-    listPublicModels: () => [{ id: 'glm-5.2' }],
+    listPublicModels: () => [{ id: 'glm-5.2' }, { id: 'gpt-5.6-sol' }],
   })
 }
 
@@ -237,6 +237,46 @@ describe('internalMarketplaceAgent (integ)', () => {
       CTX,
     )
     assert.equal(res.statusCode, 400)
+  })
+
+  test('publish agent accepts public GPT-5.6 model on v5', async (t) => {
+    if (skip(t)) return
+    const savedChannel = process.env.OC_RUNTIME_CHANNEL
+    process.env.OC_RUNTIME_CHANNEL = 'v5'
+    try {
+      const u = await createUser('gpt-agent@x.com')
+      const h = await handlerFor(u, 100)
+      const res = makeRes()
+      await h(
+        makeReq('POST', 'publish', {
+          token: tokenFor(100),
+          body: {
+            kind: 'agent',
+            slug: 'gpt-sol-agent',
+            name: 'GPT Sol 助手',
+            description: '使用 GPT-5.6-Sol 的助手',
+            version: '1.0.0',
+            model: 'gpt-5.6-sol',
+            toolsets: ['core'],
+            skillDeps: [],
+            persona: '你是一个严谨的通用助手。',
+          },
+        }),
+        res,
+        CTX,
+      )
+      assert.equal(res.statusCode, 200)
+      assert.equal(res.body.status, 'pending')
+      const row = await query<{ model: string }>(
+        `SELECT manifest->>'model' AS model
+           FROM marketplace_skill_versions
+          WHERE slug = 'gpt-sol-agent'`,
+      )
+      assert.equal(row.rows[0]?.model, 'gpt-5.6-sol')
+    } finally {
+      if (savedChannel === undefined) delete process.env.OC_RUNTIME_CHANNEL
+      else process.env.OC_RUNTIME_CHANNEL = savedChannel
+    }
   })
 
   test('unknown op → 404', async (t) => {

@@ -4,10 +4,11 @@ import { useCallback, useEffect, useState } from "react";
 import type { Theme } from "../hooks/useTheme";
 import { api } from "../lib/api";
 import { BRAND } from "../lib/brand";
+import { extractPrefs, type PrefsView } from "../lib/modelPreferences";
 import type { AuthSession, User } from "../lib/types";
 import { Avatar, Spinner, Tabs } from "./ui";
 import { AccountTab } from "./settings/AccountTab";
-import { PreferencesTab, type PrefsView } from "./settings/PreferencesTab";
+import { PreferencesTab } from "./settings/PreferencesTab";
 import { SubscriptionDialog } from "./settings/SubscriptionDialog";
 import { UsageTab } from "./settings/UsageTab";
 
@@ -38,6 +39,7 @@ export function SettingsCenter({
   onClose,
   onSetTheme,
   onRefreshMe,
+  onPreferencesChange,
 }: {
   open: boolean;
   auth: AuthSession | null;
@@ -49,6 +51,8 @@ export function SettingsCenter({
   onSetTheme: (t: Theme) => void;
   /** 充值到账后刷新顶栏 / 账户余额（App 重拉 /api/me）。 */
   onRefreshMe?: () => void;
+  /** 偏好首次加载/保存后的完整快照；让 App 的对话默认值立即同步。 */
+  onPreferencesChange?: (prefs: PrefsView, patch?: Record<string, unknown>) => void;
 }) {
   const [section, setSection] = useState<Section>("account");
   const [subOpen, setSubOpen] = useState(false);
@@ -81,7 +85,10 @@ export function SettingsCenter({
     api
       .getPreferences(auth)
       .then((snap) => {
-        if (alive) setPrefs(extractPrefs(snap));
+        if (!alive) return;
+        const next = extractPrefs(snap);
+        setPrefs(next);
+        onPreferencesChange?.(next);
       })
       .catch((e) => {
         if (alive) setPrefsErr((e as Error).message || "加载偏好失败");
@@ -92,15 +99,17 @@ export function SettingsCenter({
     return () => {
       alive = false;
     };
-  }, [open, demo, auth, section, prefs]);
+  }, [open, demo, auth, section, prefs, onPreferencesChange]);
 
   const patchPref = useCallback(
     async (patch: Record<string, unknown>) => {
       if (!auth) return;
       const snap = await api.patchPreferences(auth, patch);
-      setPrefs(extractPrefs(snap));
+      const next = extractPrefs(snap);
+      setPrefs(next);
+      onPreferencesChange?.(next, patch);
     },
-    [auth],
+    [auth, onPreferencesChange],
   );
 
   const onPaid = useCallback(() => {
@@ -192,17 +201,6 @@ export function SettingsCenter({
       )}
     </Dialog.Root>
   );
-}
-
-/** preferences 快照 → 内层 prefs（兼容 {prefs,updated_at} 包裹 / 平铺两种历史形态）。 */
-function extractPrefs(snap: unknown): PrefsView {
-  if (snap && typeof snap === "object") {
-    const obj = snap as Record<string, unknown>;
-    const inner = obj.prefs;
-    if (inner && typeof inner === "object") return inner as PrefsView;
-    return obj as PrefsView;
-  }
-  return {};
 }
 
 function AboutSection() {

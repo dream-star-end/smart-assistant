@@ -1708,6 +1708,109 @@ describe("ChatSocket safeWsSend backpressure (§2) + offline enqueue (§10)", ()
     expect(typeof stored._turnStartedAt).toBe("number");
   });
 
+  test("retry preserves the failed turn model, effort, and team routing snapshot", () => {
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const sock = makeSocket();
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    ws.open();
+    sock.sendMessage({
+      sessId: "s1",
+      agentId: "main",
+      text: "hi",
+      model: "gpt-5.6-terra",
+      effortLevel: "max",
+      teamMode: true,
+    });
+    const session = sock.sessions.get("s1")!;
+    const userMessage = session.messages.find((message) => message.role === "user")!;
+    userMessage.status = "error";
+    session._sendingInFlight = false;
+
+    // A later turn overwrites the session snapshot. Retrying the earlier failed row must
+    // still use that row's original routing, not the newest turn's selection.
+    sock.sendMessage({
+      sessId: "s1",
+      agentId: "main",
+      text: "later",
+      model: "gpt-5.6-sol",
+      effortLevel: "low",
+      teamMode: false,
+    });
+    session._sendingInFlight = false;
+
+    sock.retryMessage({ sessId: "s1", msgId: userMessage.id, agentId: "main" });
+
+    const retry = ws.sent
+      .map((raw) => JSON.parse(raw))
+      .find((payload) => typeof payload.idempotencyKey === "string" && payload.idempotencyKey.startsWith("web-retry-"));
+    expect(retry).toMatchObject({
+      model: "gpt-5.6-terra",
+      effortLevel: "max",
+      teamMode: true,
+    });
+    expect(session._lastRouting).toEqual({
+      model: "gpt-5.6-terra",
+      effortLevel: "max",
+      teamMode: true,
+    });
+  });
+
+  test("retry migrates a persisted GPT-5.5 routing snapshot to Sol", () => {
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const sock = makeSocket();
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    ws.open();
+    sock.sendMessage({ sessId: "s1", agentId: "main", text: "old turn" });
+    const session = sock.sessions.get("s1")!;
+    const userMessage = session.messages.find((message) => message.role === "user")!;
+    userMessage.status = "error";
+    userMessage._routing = undefined;
+    session._sendingInFlight = false;
+    session._lastRouting = { model: "gpt-5.5", effortLevel: "high", teamMode: true };
+
+    sock.retryMessage({ sessId: "s1", msgId: userMessage.id, agentId: "main" });
+
+    const retry = ws.sent
+      .map((raw) => JSON.parse(raw))
+      .find((payload) => typeof payload.idempotencyKey === "string" && payload.idempotencyKey.startsWith("web-retry-"));
+    expect(retry).toMatchObject({
+      model: "gpt-5.6-sol",
+      effortLevel: "high",
+      teamMode: true,
+    });
+    expect(session._lastRouting?.model).toBe("gpt-5.6-sol");
+    expect((userMessage as ChatMessage)._routing?.model).toBe("gpt-5.6-sol");
+  });
+
+  test("retry preserves explicit null effort so a warm runner returns to the model default", () => {
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const sock = makeSocket();
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    ws.open();
+    sock.sendMessage({
+      sessId: "s1",
+      agentId: "main",
+      text: "reset effort",
+      model: "gpt-5.6-sol",
+      effortLevel: null,
+    });
+    const session = sock.sessions.get("s1")!;
+    const userMessage = session.messages.find((message) => message.role === "user")!;
+    expect(userMessage._routing?.effortLevel).toBeNull();
+    userMessage.status = "error";
+    session._sendingInFlight = false;
+
+    sock.retryMessage({ sessId: "s1", msgId: userMessage.id, agentId: "main" });
+
+    const retry = ws.sent
+      .map((raw) => JSON.parse(raw))
+      .find((payload) => typeof payload.idempotencyKey === "string" && payload.idempotencyKey.startsWith("web-retry-"));
+    expect(retry).toMatchObject({ model: "gpt-5.6-sol", effortLevel: null });
+  });
+
   test("生成中(busy)再发 → 入队 queued 不并轨;turn 结束后 drain 自动发出", async () => {
     vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
     const sock = makeSocket();
@@ -1984,7 +2087,7 @@ describe("ChatSocket auto-continue deterministic idempotencyKey (#3)", () => {
     sock.setGateReady(true);
     const ws = FakeWS.instances.at(-1)!;
     ws.open();
-    sock.sendMessage({ sessId: "s1", agentId: "main", text: "hi", model: "gpt-5.5", teamMode: true, effortLevel: "high" });
+    sock.sendMessage({ sessId: "s1", agentId: "main", text: "hi", model: "gpt-5.6-sol", teamMode: true, effortLevel: "high" });
     // 空轮 end_turn → 自动续写
     ws.onmessage?.({
       data: JSON.stringify({
@@ -2004,7 +2107,7 @@ describe("ChatSocket auto-continue deterministic idempotencyKey (#3)", () => {
       .map((d) => JSON.parse(d))
       .find((p) => typeof p.idempotencyKey === "string" && p.idempotencyKey.startsWith("autocont-"));
     expect(autocont).toBeTruthy();
-    expect(autocont.model).toBe("gpt-5.5");
+    expect(autocont.model).toBe("gpt-5.6-sol");
     expect(autocont.teamMode).toBe(true);
     expect(autocont.effortLevel).toBe("high");
   });
@@ -2016,7 +2119,7 @@ describe("ChatSocket auto-continue deterministic idempotencyKey (#3)", () => {
     sock.setGateReady(true);
     const ws = FakeWS.instances.at(-1)!;
     ws.open();
-    sock.sendMessage({ sessId: "s1", agentId: "main", text: "跑团队任务", model: "gpt-5.5", teamMode: true });
+    sock.sendMessage({ sessId: "s1", agentId: "main", text: "跑团队任务", model: "gpt-5.6-sol", teamMode: true });
     // 有内容的助手行 + service_restart 中断 final → 触发重启续写。
     ws.onmessage?.({
       data: JSON.stringify({
@@ -2048,7 +2151,7 @@ describe("ChatSocket auto-continue deterministic idempotencyKey (#3)", () => {
       .map((d) => JSON.parse(d))
       .find((p) => typeof p.idempotencyKey === "string" && p.idempotencyKey.startsWith("autocont-restart-"));
     expect(cont).toBeTruthy();
-    expect(cont.model).toBe("gpt-5.5");
+    expect(cont.model).toBe("gpt-5.6-sol");
     expect(cont.teamMode).toBe(true);
   });
 });
@@ -2063,4 +2166,3 @@ describe("resume_failed 游标只进不退(master 重启空 ring 防御)", () =>
     expect(s._lastFrameSeqByKey?.["agent:main:webchat:dm:s1"]).toBe(42);
   });
 });
-

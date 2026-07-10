@@ -1,4 +1,5 @@
 import { type Static, Type } from '@sinclair/typebox'
+import { PLATFORM_REASONING_EFFORTS } from './engineModels.js'
 
 // ───────────────────────────────────────────────
 // V3 S12e — trace id schema fragment
@@ -69,11 +70,7 @@ export const InboundMessage = Type.Object({
   effortLevel: Type.Optional(
     Type.Union([
       Type.Null(),
-      Type.Literal('low'),
-      Type.Literal('medium'),
-      Type.Literal('high'),
-      Type.Literal('xhigh'),
-      Type.Literal('max'),
+      ...PLATFORM_REASONING_EFFORTS.map((effort) => Type.Literal(effort)),
     ]),
   ),
   // CCB --model override for this session(2026-04-26 v1.0.4 起加;一般来自

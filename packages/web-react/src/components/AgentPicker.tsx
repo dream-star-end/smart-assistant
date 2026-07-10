@@ -1,5 +1,6 @@
 import { Check, Loader2, Store, Users } from 'lucide-react'
 import { useEffect, useState } from 'react'
+import { DEFAULT_CODEX_ENGINE_MODEL_DISPLAY_NAME } from '@openclaude/protocol'
 import { type Agent, MAIN_AGENT, agentFromApiRow } from '../lib/agents'
 import { api } from '../lib/api'
 import type { AuthSession } from '../lib/types'
@@ -116,7 +117,7 @@ export function AgentPicker({
                 <Users size={13} className="text-accent" /> 团队模式
               </span>
               <span className="mt-0.5 text-[11.5px] leading-snug text-muted">
-                开启后队长引擎将切换为 GPT-5.5（计费高于默认模型），并按需委派已安装智能体组队协作。每次委派按对应智能体的模型计费。
+                开启后队长引擎将切换为 {DEFAULT_CODEX_ENGINE_MODEL_DISPLAY_NAME}（计费高于默认模型），并按需委派已安装智能体组队协作。每次委派按对应智能体的模型计费。
               </span>
             </span>
             <Switch checked={teamMode} onCheckedChange={onToggleTeamMode} aria-label="启用团队模式" />

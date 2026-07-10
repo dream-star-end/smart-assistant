@@ -14,7 +14,7 @@
  * 字段 allowlist(MVP,按 migration 0011 注释):
  *   theme           : 'light' | 'dark' | 'auto'
  *   default_model   : string (1..64 chars;不强校 model_id 是否在 model_pricing)
- *   default_effort  : 'low' | 'medium' | 'high' | 'xhigh'
+ *   default_effort  : 'low' | 'medium' | 'high' | 'xhigh' | 'max'
  *   notify_email    : boolean
  *   notify_telegram : boolean
  *   wechat_show_tool_calls : boolean
@@ -26,13 +26,14 @@
  *   - 不做合并冲突保护(冲突几率 ≈ 同一用户两个 tab 同时改;最坏后果 = 后写覆盖前写)
  */
 
+import { PLATFORM_REASONING_EFFORTS } from "@openclaude/protocol";
 import { z } from "zod";
 import { query } from "../db/queries.js";
 
 // ─── zod schema ───────────────────────────────────────────────────────────
 
 const themeSchema = z.enum(["light", "dark", "auto"]);
-const effortSchema = z.enum(["low", "medium", "high", "xhigh"]);
+const effortSchema = z.enum(PLATFORM_REASONING_EFFORTS);
 const modelSchema = z.string().min(1).max(64);
 const hotkeysSchema = z
   .record(z.string().min(1).max(64), z.string().min(1).max(64))

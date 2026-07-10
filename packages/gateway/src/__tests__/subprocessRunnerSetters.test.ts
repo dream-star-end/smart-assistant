@@ -71,8 +71,11 @@ describe('SubprocessRunner.model getter / setModel', () => {
   it('ALLOWED_INBOUND_MODELS contains the currently exposed model set', () => {
     // 新增其他模型时这个测试要同步更新。
     // 防止 server.ts WS handler 的静态白名单跟前端 modelPicker 期望的列表漂移。
-    // codex agent (gpt-5.5 走 codex JSON-RPC):
-    assert.ok(ALLOWED_INBOUND_MODELS.has('gpt-5.5'))
+    // Codex GPT-5.6 三型号都走 app-server JSON-RPC；旧 GPT-5.5 已退场。
+    for (const model of ['gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna']) {
+      assert.ok(ALLOWED_INBOUND_MODELS.has(model))
+    }
+    assert.equal(ALLOWED_INBOUND_MODELS.has('gpt-5.5'), false)
     // DeepSeek anthropic-compatible 上游(在 anthropicProxy
     // isDeepseekModel 命中后切 DEEPSEEK_UPSTREAM_ENDPOINT):
     assert.ok(ALLOWED_INBOUND_MODELS.has('deepseek-v4-flash'))
@@ -98,7 +101,7 @@ describe('SubprocessRunner.model getter / setModel', () => {
 
   it('resolveExecutionModel 收敛 agent 级已下线模型(spawn 收口点)', () => {
     // 白名单内的模型原样保留。
-    assert.equal(resolveExecutionModel('glm-5.2', 'gpt-5.5'), 'glm-5.2')
+    assert.equal(resolveExecutionModel('glm-5.2', 'gpt-5.6-sol'), 'glm-5.2')
     assert.equal(resolveExecutionModel('deepseek-v4-pro', undefined), 'deepseek-v4-pro')
     // 已下线的 Claude(marketplace manifest / seed / delegate 里 stale)→ 降级到平台默认,
     // 不会以不可路由的 --model spawn。

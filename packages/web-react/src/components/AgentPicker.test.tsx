@@ -42,9 +42,9 @@ function renderPicker(extra: Partial<Parameters<typeof AgentPicker>[0]> = {}) {
 }
 
 describe("AgentPicker 团队模式开关文案（知情同意）", () => {
-  it("描述明确告知：队长切换 GPT-5.5 引擎、计费高于默认模型、委派按对应模型计费", async () => {
+  it("描述明确告知：队长切换 GPT-5.6-Sol 引擎、计费高于默认模型、委派按对应模型计费", async () => {
     renderPicker();
-    const desc = await screen.findByText(/开启后队长引擎将切换为 GPT-5\.5/);
+    const desc = await screen.findByText(/开启后队长引擎将切换为 GPT-5\.6-Sol/);
     expect(desc.textContent).toContain("计费高于默认模型");
     expect(desc.textContent).toContain("每次委派按对应智能体的模型计费");
   });

@@ -56,6 +56,14 @@ import {
 } from "./lib/teamMode";
 import { DEFAULT_AGENT, agentFromApiRow, type Agent } from "./lib/agents";
 import { api } from "./lib/api";
+import {
+  effectiveEffortModelId,
+  effortForModel,
+  extractPrefs,
+  initialModelFromPreferences,
+  type PreferenceEffort,
+  type PrefsView,
+} from "./lib/modelPreferences";
 import { DEMO_MESSAGES, DEMO_MODELS, DEMO_SESSIONS, DEMO_USER, demoReply } from "./lib/demo";
 import type { Message, PublicConfig, PublicModel, Session, ToolCard } from "./lib/types";
 
@@ -161,10 +169,11 @@ export function App() {
   // 自行拉最新,两者互不依赖。目录**必须**参与会话归属解析的依赖(见下方 effect 注释)。
   const [myAgents, setMyAgents] = useState<Agent[]>([DEFAULT_AGENT]);
   const [pickerOpen, setPickerOpen] = useState(false);
-  // 对话模型：唯一权威源是后端 GET /api/public/models（v5 仅 claude/glm-5.2/deepseek/minimax）。
-  // demo 用本地 fixture 仅作离线视觉，不发请求。选中的 modelId 由 P4 的 WS inbound.message 顶层发送。
+  // 对话模型/默认思考深度:模型能力来自 GET /api/public/models；用户默认来自
+  // /api/me/preferences。两者同批 hydrate 后才决定初始值,避免迟到偏好覆盖人工选择。
   const [models, setModels] = useState<PublicModel[]>(demo ? DEMO_MODELS : []);
   const [modelId, setModelId] = useState<string | undefined>(demo ? DEMO_MODELS[0]?.id : undefined);
+  const [preferenceEffort, setPreferenceEffort] = useState<PreferenceEffort | undefined>();
   const [modelsLoading, setModelsLoading] = useState(false);
   const [chatError, setChatError] = useState<ChatError | null>(null);
   // 面板深链：boot 读到 ?panel= 即以打开态初始化（工作区渲染后即呈现；未登录深链则
@@ -374,16 +383,23 @@ export function App() {
         writeTeamMode(sessionId, teamMode);
       }
       sockRef.current?.ensureSession(sessionId, agent.id, text.slice(0, 24));
-      // model：选中的真实模型 id（顶层字段，非 content 内）。effortLevel 本期不接（P5/后续）。
+      // model / effortLevel 都是 inbound.message 顶层路由字段。用户未设置 effort 或
+      // 当前模型不支持时省略,让模型沿用自身默认。
       // media：已上传附件（图片/文件等），随 inbound.message.content.media 发送。
       // teamMode 只对 main 队长生效(其它 agent 无委派语义),故非 main 恒 false。
+      const teamLeaderTurn = agent.id === "main" && teamMode;
       sockRef.current?.send({
         sessId: sessionId,
         agentId: agent.id,
         text,
         model: modelId,
+        effortLevel: effortForModel(
+          models,
+          effectiveEffortModelId(modelId, teamLeaderTurn),
+          preferenceEffort,
+        ),
         media,
-        teamMode: agent.id === "main" ? teamMode : false,
+        teamMode: teamLeaderTurn,
       });
       // 侧栏：提到顶 + 更新标题/时间/计数（计数仅作排序提示，权威消息在 WS service）。
       setSessions((c) => {
@@ -404,7 +420,18 @@ export function App() {
     // teamMode 必须在依赖里:否则 memoized send 闭包捕获初始 false,用户开开关后仍发 false(Codex 审)。
     // setSessions/setActiveId 是 useSessionList 透传的 useState dispatcher(恒稳定),入 deps
     // 仅为满足 lint(跨 hook 返回值 biome 不再推断稳定性),不改变 send 的重建时机。
-    [activeId, demo, user, agent, modelId, teamMode, setSessions, setActiveId],
+    [
+      activeId,
+      demo,
+      user,
+      agent,
+      modelId,
+      models,
+      preferenceEffort,
+      teamMode,
+      setSessions,
+      setActiveId,
+    ],
   );
 
   // 上传单文件 → MediaRef（kind 以服务端 mimeType 为准，退回 file.type）。供 Composer 附件。
@@ -477,6 +504,19 @@ export function App() {
     void refreshMe();
     setSettingsOpen(true);
   }, [refreshMe]);
+
+  const applyConversationPreferences = useCallback(
+    (prefs: PrefsView, patch?: Record<string, unknown>) => {
+      setPreferenceEffort(prefs.default_effort);
+      if (
+        patch &&
+        Object.prototype.hasOwnProperty.call(patch, "default_model")
+      ) {
+        setModelId(initialModelFromPreferences(models, prefs));
+      }
+    },
+    [models],
+  );
 
   // 打开管理中心到指定分区（侧栏入口 + 工具卡「打开记忆/技能/定时」按钮统一走此）。
   const openManage = useCallback((tab: ManageTab) => {
@@ -592,13 +632,15 @@ export function App() {
     if (demo || !auth) return;
     let cancelled = false;
     setModelsLoading(true);
-    api
-      .getPublicModels(auth)
-      .then((ms) => {
+    Promise.all([
+      api.getPublicModels(auth),
+      api.getPreferences(auth).then(extractPrefs).catch(() => ({} as PrefsView)),
+    ])
+      .then(([ms, prefs]) => {
         if (cancelled) return;
         setModels(ms);
-        // 保留用户已选（若仍在列表内），否则落到列表首项。
-        setModelId((cur) => (cur && ms.some((m) => m.id === cur) ? cur : ms[0]?.id));
+        setModelId(initialModelFromPreferences(ms, prefs));
+        setPreferenceEffort(prefs.default_effort);
       })
       .catch(() => {
         /* 公开端点失败：保持空列表，选择器禁用，不弹错误打断前置流程 */
@@ -850,7 +892,7 @@ export function App() {
   );
 
   // 发送失败重试：复用原消息 payload（含附件引用）走 WS service 既有发送收口原地重发；
-  // model/teamMode 用当前上下文（与 send 同构：teamMode 只对 main 队长生效）。
+  // model/teamMode/effort 由 socket 复用失败首发的 routing 快照,不读取当前偏好。
   const retrySend = useCallback(
     (msg: ChatMessage) => {
       if (demo || !activeId) return;
@@ -858,11 +900,9 @@ export function App() {
         sessId: activeId,
         msgId: msg.id,
         agentId: agent.id,
-        model: modelId,
-        teamMode: agent.id === "main" ? teamMode : false,
       });
     },
-    [demo, activeId, agent.id, modelId, teamMode],
+    [demo, activeId, agent.id],
   );
 
   // 卡片回调集（稳定引用：作为 MessageRenderer memo 比较键之一，避免无谓重渲）。
@@ -1354,6 +1394,7 @@ export function App() {
             onClose={() => setSettingsOpen(false)}
             onSetTheme={setTheme}
             onRefreshMe={refreshMe}
+            onPreferencesChange={applyConversationPreferences}
           />
         </LazyBoundary>
       )}

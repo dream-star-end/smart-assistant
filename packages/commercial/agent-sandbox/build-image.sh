@@ -56,9 +56,26 @@ fi
 
 IMAGE_FULL="${IMAGE_REPO}:${TAG}"
 TAR_PATH="${IMAGE_OUT_DIR}/openclaude-runtime-${TAG}.tar.gz"
+CODEX_VERSION="0.144.0"
+
+# The image tag is a deployment handle and may be chosen before the final source commit.
+# Bind the image to the exact staged source independently so activation can reject a stale
+# image even when the configured tag already exists locally.
+SOURCE_COMMIT="${OC_RUNTIME_SOURCE_COMMIT:-}"
+if [ -z "$SOURCE_COMMIT" ] && [ -f "$PERSONAL_SRC/VERSION.json" ]; then
+  SOURCE_COMMIT="$(sed -n 's/.*"commit"[[:space:]]*:[[:space:]]*"\([0-9a-f]\{7,40\}\)".*/\1/p' "$PERSONAL_SRC/VERSION.json" | head -1)"
+fi
+if [ -z "$SOURCE_COMMIT" ]; then
+  SOURCE_COMMIT="$(git -C "$PERSONAL_SRC" rev-parse --short HEAD 2>/dev/null || true)"
+fi
+if [ -z "$SOURCE_COMMIT" ]; then
+  echo "[build-image] FATAL: 无法确定 runtime source commit" >&2
+  exit 1
+fi
 
 echo "[build-image] tag=$TAG"
 echo "[build-image] image=$IMAGE_FULL"
+echo "[build-image] source_commit=$SOURCE_COMMIT codex=$CODEX_VERSION"
 echo "[build-image] tar=$TAR_PATH"
 
 # ───────────────────────────────────────────────
@@ -229,6 +246,8 @@ docker build \
   ${OC_BUILD_NETWORK_HOST:+--network=host} \
   --label "oc.runtime.features=v3-sink" \
   --label "oc.runtime.git_sha=$TAG" \
+  --label "oc.runtime.source_commit=$SOURCE_COMMIT" \
+  --label "oc.runtime.codex_version=$CODEX_VERSION" \
   --label "oc.runtime.include_codex=${OC_INCLUDE_CODEX:-1}" \
   --build-arg "OC_INCLUDE_CODEX=${OC_INCLUDE_CODEX:-1}" \
   -f "$BUILD_CTX/Dockerfile.openclaude-runtime" \

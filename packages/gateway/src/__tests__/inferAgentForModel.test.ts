@@ -3,9 +3,9 @@ import * as assert from 'node:assert/strict'
  * Tests for inferAgentForModel — pure routing decision for model→agent
  * fan-out in v5 commercial.
  *
- * M1a(codex 复活):gpt-5.5 不再 fail-closed 拒绝,也不再路由到固定 id='codex'
+ * M1a(codex 复活):GPT-5.6 不路由到固定 id='codex'
  * 专属 agent —— engine 由 engine/registry.ts 按 model 判定(getOrCreate 收口),
- * 任意 agent 都能以 gpt-5.5 跑 codex 底座。本 helper 对 gpt-* 与 claude/deepseek
+ * 任意 agent 都能以 GPT-5.6 跑 codex 底座。本 helper 对 gpt-* 与 claude/deepseek
  * 等已知家族同规则:requested 存在则用之,否则回落 default。
  *
  * Run: npx tsx --test packages/gateway/src/__tests__/inferAgentForModel.test.ts
@@ -41,9 +41,9 @@ describe('inferAgentForModel — pass-through cases', () => {
 })
 
 describe('inferAgentForModel — gpt model routing (M1a engine registry)', () => {
-  it('keeps requested agent for gpt-5.5 (engine 由 registry 判定,不换 agent)', () => {
+  it('keeps requested agent for gpt-5.6-sol (engine 由 registry 判定,不换 agent)', () => {
     const r = inferAgentForModel({
-      model: 'gpt-5.5',
+      model: 'gpt-5.6-sol',
       requestedAgentId: 'main',
       defaultAgentId: 'main',
       agents: fullAgents,
@@ -63,7 +63,7 @@ describe('inferAgentForModel — gpt model routing (M1a engine registry)', () =>
 
   it('falls back to default agent for unknown requested agent + gpt-*', () => {
     const r = inferAgentForModel({
-      model: 'gpt-5.5',
+      model: 'gpt-5.6-terra',
       requestedAgentId: 'no-such-agent',
       defaultAgentId: 'main',
       agents: fullAgents,
@@ -73,7 +73,7 @@ describe('inferAgentForModel — gpt model routing (M1a engine registry)', () =>
 
   it('no_compatible_agent when gpt-* has no agent configured at all', () => {
     const r = inferAgentForModel({
-      model: 'gpt-5.5',
+      model: 'gpt-5.6-luna',
       requestedAgentId: 'main',
       defaultAgentId: 'main',
       agents: [],

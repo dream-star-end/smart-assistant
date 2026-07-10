@@ -777,7 +777,7 @@ describe("isDeepseekModel", () => {
   test("claude / gpt 系列绝不命中", () => {
     assert.equal(isDeepseekModel("claude-sonnet-4-6"), false);
     assert.equal(isDeepseekModel("claude-opus-4-6"), false);
-    assert.equal(isDeepseekModel("gpt-5.5"), false);
+    assert.equal(isDeepseekModel("gpt-5.6-sol"), false);
     assert.equal(isDeepseekModel("haiku-4-5"), false);
   });
 

@@ -50,10 +50,10 @@ describe('buildAgentsSlot 纯文本模型 vision hint(oc-vision CLI)', () => {
     assert.doesNotMatch(slot.content, /understand_image/)
   })
 
-  it('gpt-5.5(原生多模态,codex 底座)默认不发 oc-vision 提示(保持迁移前行为,不加噪音)', async () => {
+  it('gpt-5.6-sol(原生多模态,codex 底座)默认不发 oc-vision 提示(保持迁移前行为,不加噪音)', async () => {
     const slot = await buildAgentsSlot({
       agentId: 'main',
-      model: 'gpt-5.5',
+      model: 'gpt-5.6-sol',
       provider: 'codex-native',
     })
     assert.doesNotMatch(slot.content, /图片理解提示/)

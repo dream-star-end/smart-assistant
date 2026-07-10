@@ -56,8 +56,10 @@ const REFRESH_OK = okJson({ access_token: 'tok-r', access_exp: 1234, remember: t
 // ─── P3 对话前置 fixtures（后端 wire 形态，snake_case） ────────────────────────
 const MODELS = {
   models: [
-    { id: 'claude-opus-4-7', display_name: 'Claude Opus 4.7' },
-    { id: 'glm-5.2', display_name: 'GLM-5.2' },
+    { id: 'gpt-5.6-sol', display_name: 'GPT-5.6-Sol', supported_efforts: ['low', 'medium', 'high', 'xhigh', 'max'] },
+    { id: 'gpt-5.6-terra', display_name: 'GPT-5.6-Terra', supported_efforts: ['low', 'medium', 'high', 'xhigh', 'max'] },
+    { id: 'gpt-5.6-luna', display_name: 'GPT-5.6-Luna', supported_efforts: ['low', 'medium', 'high', 'xhigh', 'max'] },
+    { id: 'glm-5.2', display_name: 'GLM-5.2', supported_efforts: ['high', 'max'] },
     { id: 'deepseek', display_name: 'DeepSeek' },
     { id: 'MiniMax-M3', display_name: 'MiniMax M3' },
   ],
@@ -109,6 +111,7 @@ function routedFetch(over?: {
   statusAfterOpen?: unknown
   open?: unknown
   models?: unknown
+  preferences?: unknown
 }) {
   let opened = false
   return vi.fn(async (url: string) => {
@@ -117,6 +120,7 @@ function routedFetch(over?: {
     if (u.includes('/api/auth/login')) return LOGIN_OK
     if (u.includes('/api/public/config')) return PUBLIC_CONFIG
     if (u.includes('/api/public/models')) return okJson(over?.models ?? MODELS)
+    if (u.includes('/api/me/preferences')) return okJson(over?.preferences ?? { prefs: {} })
     if (u.includes('/api/agent/open')) {
       opened = true
       return over?.open ?? okJson(AGENT_OPEN_202, 202)
@@ -331,16 +335,31 @@ describe('Aurora v5 skeleton — theme', () => {
 // ---------------------------------------------------------------------------
 describe('Aurora v5 — P3 对话前置（模型选择器 + 订阅/容器门）', () => {
   test('model selector reflects GET /api/public/models (no hardcoded list)', async () => {
-    fetchMock = routedFetch() // ready + MODELS（首项 Claude Opus 4.7）
+    fetchMock = routedFetch() // ready + MODELS（首项 GPT-5.6-Sol）
     vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
 
     render(<App />)
     await loginViaUi()
 
     // 顶栏模型选择器与 Composer 底部均展示后端返回的首个模型名。
-    await waitFor(() => expect(screen.getAllByText('Claude Opus 4.7').length).toBeGreaterThan(0))
+    await waitFor(() => expect(screen.getAllByText('GPT-5.6-Sol').length).toBeGreaterThan(0))
     const modelsCall = fetchMock.mock.calls.find(([u]) => String(u).includes('/api/public/models'))
     expect(modelsCall).toBeTruthy()
+  })
+
+  test('default_model preference wins over the first public model during one-shot hydrate', async () => {
+    fetchMock = routedFetch({
+      preferences: { prefs: { default_model: 'gpt-5.6-terra', default_effort: 'max' } },
+    })
+    vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
+
+    render(<App />)
+    await loginViaUi()
+
+    await waitFor(() => {
+      const trigger = screen.getByRole('button', { name: '选择对话模型' })
+      expect(trigger.textContent).toContain('GPT-5.6-Terra')
+    })
   })
 
   test('unsubscribed → 开通智能体 calls /api/agent/open then provisions to ready', async () => {

@@ -2,12 +2,12 @@
  * Engine registry fail-closed 测试(M0 → M1a 更新)。
  *
  * 锁三层语义:
- *   1. resolveEngine 单一权威:MODEL_ENGINE_MAP('gpt-5.5' → 'codex',M1a 登记)
+ *   1. resolveEngine 单一权威:GPT-5.6 三型号 → 'codex'
  *      + codex-native provider 显式 pin(runnerKind 仅接受缺省/'app-server',
  *      'exec'/未知 fail-closed);其余 → 'ccb'。
  *   2. createEngine 对未注册 engine fail-closed 抛错(用假 engine id 锁语义 ——
  *      M1a 起 'codex' 已注册)。
- *   3. getOrCreate:codex-native / gpt-5.5 → 'codex' adapter;runnerKind 'exec'
+ *   3. getOrCreate:codex-native / GPT-5.6 → 'codex' adapter;runnerKind 'exec'
  *      仍 fail-closed。
  *
  * Run: npx tsx --test packages/gateway/src/__tests__/engineRegistry.test.ts
@@ -57,18 +57,17 @@ describe("resolveEngine", () => {
     );
   });
 
-  test("M1a:MODEL_ENGINE_MAP 'gpt-5.5' → 'codex'(任意 agent,无需 provider pin)", () => {
-    assert.equal(resolveEngine("gpt-5.5", { id: "main" }), "codex");
-    assert.equal(
-      resolveEngine("gpt-5.5", { id: "coder", provider: "claude-subscription" }),
-      "codex",
-    );
+  test("GPT-5.6 三型号 → 'codex'(任意 agent,无需 provider pin);GPT-5.5 已移除", () => {
+    for (const model of ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]) {
+      assert.equal(resolveEngine(model, { id: "main" }), "codex");
+    }
+    assert.equal(resolveEngine("gpt-5.5", { id: "main" }), "ccb");
   });
 
   test("codex-native provider 显式 pin → 'codex'(runnerKind 缺省/app-server)", () => {
-    assert.equal(resolveEngine("gpt-5.5", { id: "codex", provider: "codex-native" }), "codex");
+    assert.equal(resolveEngine("gpt-5.6-sol", { id: "codex", provider: "codex-native" }), "codex");
     assert.equal(
-      resolveEngine("gpt-5.5", {
+      resolveEngine("gpt-5.6-terra", {
         id: "codex",
         provider: "codex-native",
         runnerKind: "app-server",
@@ -80,7 +79,7 @@ describe("resolveEngine", () => {
   test("codex-native + runnerKind 'exec'/未知 → fail-closed 抛错", () => {
     assert.throws(
       () =>
-        resolveEngine("gpt-5.5", {
+        resolveEngine("gpt-5.6-sol", {
           id: "codex",
           provider: "codex-native",
           runnerKind: "exec",
@@ -89,7 +88,7 @@ describe("resolveEngine", () => {
     );
     assert.throws(
       () =>
-        resolveEngine("gpt-5.5", {
+        resolveEngine("gpt-5.6-sol", {
           id: "codex",
           provider: "codex-native",
           runnerKind: "weird" as AgentDef["runnerKind"],
@@ -127,7 +126,7 @@ describe("getOrCreate engine 路由(M1a)", () => {
     const sm = new SessionManager(makeConfigStub());
     const session = await sm.getOrCreate({
       sessionKey: "agent:codex:webchat:dm:gate-peer",
-      agent: { id: "codex", provider: "codex-native", model: "gpt-5.5" } as AgentDef,
+      agent: { id: "codex", provider: "codex-native", model: "gpt-5.6-sol" } as AgentDef,
       channel: "webchat",
       peerId: "gate-peer",
     });
@@ -135,18 +134,18 @@ describe("getOrCreate engine 路由(M1a)", () => {
     assert.equal(session.providerTag, "codex");
   });
 
-  test("普通 agent + inbound model gpt-5.5 → 'codex' adapter session", async () => {
+  test("普通 agent + inbound model gpt-5.6-terra → 'codex' adapter session", async () => {
     const sm = new SessionManager(makeConfigStub());
     const session = await sm.getOrCreate({
       sessionKey: "agent:main:webchat:dm:gate-peer-gpt",
       agent: { id: "main", model: "glm-5.2" } as AgentDef,
       channel: "webchat",
       peerId: "gate-peer-gpt",
-      model: "gpt-5.5",
+      model: "gpt-5.6-terra",
     });
     assert.equal(session.runner.engineId, "codex");
     assert.equal(session.providerTag, "codex");
-    assert.equal(session.model, "gpt-5.5");
+    assert.equal(session.model, "gpt-5.6-terra");
   });
 
   test("codex-native + runnerKind 'exec' → getOrCreate 仍 fail-closed 抛错", async () => {
@@ -157,7 +156,7 @@ describe("getOrCreate engine 路由(M1a)", () => {
         agent: {
           id: "codex",
           provider: "codex-native",
-          model: "gpt-5.5",
+          model: "gpt-5.6-sol",
           runnerKind: "exec",
         } as AgentDef,
         channel: "webchat",

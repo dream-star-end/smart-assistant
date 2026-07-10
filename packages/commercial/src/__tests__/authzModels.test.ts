@@ -37,9 +37,9 @@ const opusPublic: ModelPricing = {
   updated_at: new Date('2026-04-01T00:00:00Z'),
 }
 
-const gpt55Admin: ModelPricing = {
-  model_id: 'gpt-5.5',
-  display_name: 'GPT 5.5',
+const gpt56Admin: ModelPricing = {
+  model_id: 'gpt-5.6-sol',
+  display_name: 'GPT-5.6-Sol',
   input_per_mtok: 500n,
   output_per_mtok: 2500n,
   cache_read_per_mtok: 50n,
@@ -122,26 +122,26 @@ describe('canUseModel — visibility=public', () => {
 })
 
 describe('canUseModel — visibility=admin', () => {
-  const pricing = makeCache([gpt55Admin])
-  const grants = new Set(['gpt-5.5'])
+  const pricing = makeCache([gpt56Admin])
+  const grants = new Set(['gpt-5.6-sol'])
 
   test('admin 无 grant 允许(role 自动放行)', () => {
     assert.equal(
-      canUseModel({ pricing }, { role: 'admin', grantedModelIds: empty, modelId: 'gpt-5.5' }),
+      canUseModel({ pricing }, { role: 'admin', grantedModelIds: empty, modelId: 'gpt-5.6-sol' }),
       true,
     )
   })
 
   test('user 无 grant 拒绝', () => {
     assert.equal(
-      canUseModel({ pricing }, { role: 'user', grantedModelIds: empty, modelId: 'gpt-5.5' }),
+      canUseModel({ pricing }, { role: 'user', grantedModelIds: empty, modelId: 'gpt-5.6-sol' }),
       false,
     )
   })
 
   test('user 有 grant 允许', () => {
     assert.equal(
-      canUseModel({ pricing }, { role: 'user', grantedModelIds: grants, modelId: 'gpt-5.5' }),
+      canUseModel({ pricing }, { role: 'user', grantedModelIds: grants, modelId: 'gpt-5.6-sol' }),
       true,
     )
   })
@@ -150,7 +150,7 @@ describe('canUseModel — visibility=admin', () => {
     assert.equal(
       canUseModel(
         { pricing },
-        { role: 'user', grantedModelIds: new Set(['other-model']), modelId: 'gpt-5.5' },
+        { role: 'user', grantedModelIds: new Set(['other-model']), modelId: 'gpt-5.6-sol' },
       ),
       false,
     )

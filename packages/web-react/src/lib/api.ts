@@ -640,8 +640,8 @@ export const api = {
     })),
 
   /**
-   * 公开模型列表（GET /api/public/models）。v5 经后端 dropGptForV5Channel 仅
-   * claude/glm-5.2/deepseek/minimax。可选带 Bearer（登录用户走 grants 视图）。
+   * 公开模型列表（GET /api/public/models）。可选带 Bearer（登录用户走
+   * visibility/grants 视图）；每项含后端投影的 supported_efforts 能力。
    */
   async getPublicModels(a?: AuthSession): Promise<PublicModel[]> {
     const run = (t?: string) =>

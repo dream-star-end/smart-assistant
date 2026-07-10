@@ -453,18 +453,18 @@ describe("openclaude-runtime entrypoint env-scrub policy", () => {
     }
   });
 
-  test("entrypoint.ts seeds the codex/gpt-5.5 agent with app-server routing fields (M1b revival)", () => {
+  test("entrypoint.ts seeds the codex/GPT-5.6 default agent with app-server routing fields", () => {
     const src = readFileSync(ENTRYPOINT_TS_PATH, "utf-8");
     assert.match(
       src,
-      /const COMMERCIAL_CODEX_MODEL\s*=\s*"gpt-5\.5"/,
-      "codex seed model const must pin gpt-5.5",
+      /const COMMERCIAL_CODEX_MODEL\s*=\s*DEFAULT_CODEX_ENGINE_MODEL/,
+      "codex seed model must consume the protocol default",
     );
     const codexAgent = extractConstObjectFromSource(src, "desiredCodexAgent");
     assert.match(codexAgent, /id:\s*"codex"/, "codex agent id must be stable");
-    assert.match(codexAgent, /model:\s*COMMERCIAL_CODEX_MODEL/, "codex agent must use the pinned gpt-5.5 const");
+    assert.match(codexAgent, /model:\s*COMMERCIAL_CODEX_MODEL/, "codex agent must use the protocol-backed model const");
     // provider/runnerKind 是 gateway runner seam 的路由依据(codex-native → app-server
-    // 形态 CodexAppServerRunner),缺失会让 gpt-5.5 会话落错 runner。
+    // 形态 CodexAppServerRunner),缺失会让 GPT-5.6 会话落错 runner。
     assert.match(codexAgent, /provider:\s*"codex-native"/, "codex agent must declare codex-native provider");
     assert.match(codexAgent, /runnerKind:\s*"app-server"/, "codex agent must declare app-server runnerKind");
     assert.match(codexAgent, /permissionMode:\s*"bypassPermissions"/, "codex agent must bypass permissions in the sandbox");

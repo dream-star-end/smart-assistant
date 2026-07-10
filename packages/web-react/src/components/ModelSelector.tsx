@@ -1,4 +1,7 @@
-import { DEFAULT_CODEX_ENGINE_MODEL } from "@openclaude/protocol";
+import {
+  DEFAULT_CODEX_ENGINE_MODEL,
+  DEFAULT_CODEX_ENGINE_MODEL_DISPLAY_NAME,
+} from "@openclaude/protocol";
 import { AlertTriangle, Check, ChevronDown, Cpu, Users } from "lucide-react";
 import type { PublicModel } from "../lib/types";
 import { cn } from "../lib/utils";
@@ -36,7 +39,7 @@ export function modelLabel(m: PublicModel): string {
  */
 export function teamEngineLabel(models: PublicModel[]): string {
   const m = models.find((x) => x.id === DEFAULT_CODEX_ENGINE_MODEL);
-  return m ? modelLabel(m) : "GPT-5.5";
+  return m ? modelLabel(m) : DEFAULT_CODEX_ENGINE_MODEL_DISPLAY_NAME;
 }
 
 /**

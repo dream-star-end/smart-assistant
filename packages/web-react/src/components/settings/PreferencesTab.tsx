@@ -3,22 +3,15 @@ import { type ReactNode, useEffect, useState } from "react";
 import type { Theme } from "../../hooks/useTheme";
 import { api } from "../../lib/api";
 import type { AuthSession, PublicModel } from "../../lib/types";
+import {
+  initialModelFromPreferences,
+  type PreferenceEffort,
+  type PrefsView,
+} from "../../lib/modelPreferences";
 import { cn } from "../../lib/utils";
 import { Alert, Input, Switch } from "../ui";
 import { ApiKeysSection } from "./ApiKeysSection";
 import { EFFORT_OPTIONS } from "./labels";
-
-/** preferences 内层快照（后端 strict allowlist；theme enum 用 auto 而非 system）。 */
-export type PrefsView = {
-  theme?: "light" | "dark" | "auto";
-  default_model?: string;
-  default_effort?: "low" | "medium" | "high" | "xhigh";
-  notify_email?: boolean;
-  notify_telegram?: boolean;
-  wechat_show_tool_calls?: boolean;
-  wechat_proactive_push?: boolean;
-  hotkeys?: Record<string, string>;
-};
 
 const THEME_OPTIONS: { value: Theme; label: string; icon: typeof Sun }[] = [
   { value: "light", label: "浅色", icon: Sun },
@@ -96,6 +89,15 @@ export function PreferencesTab({
     void patch({ theme: uiToServerTheme(t) }); // 写穿后端（best-effort）
   }
 
+  const effortModelId = initialModelFromPreferences(models, prefs);
+  const effortModel = models.find((m) => m.id === effortModelId);
+  const supportedEfforts = effortModel?.supported_efforts ?? [];
+  const effortOptions = EFFORT_OPTIONS.filter((o) => supportedEfforts.includes(o.value));
+  const selectedEffort: PreferenceEffort | "" =
+    prefs.default_effort && supportedEfforts.includes(prefs.default_effort)
+      ? prefs.default_effort
+      : "";
+
   return (
     <div className="flex flex-col">
       {err && (
@@ -157,11 +159,14 @@ export function PreferencesTab({
         <label className="flex items-center justify-between gap-3 py-1.5">
           <span className="text-[13.5px] text-fg">思考深度</span>
           <Select
-            value={prefs.default_effort ?? ""}
+            value={selectedEffort}
             onChange={(v) => patch({ default_effort: v === "" ? null : v })}
+            disabled={models.length > 0 && effortOptions.length === 0}
           >
-            <option value="">跟随默认</option>
-            {EFFORT_OPTIONS.map((o) => (
+            <option value="">
+              {models.length > 0 && effortOptions.length === 0 ? "当前模型不支持" : "跟随模型默认"}
+            </option>
+            {effortOptions.map((o) => (
               <option key={o.value} value={o.value}>
                 {o.label}
               </option>
@@ -305,16 +310,19 @@ function Select({
   value,
   onChange,
   children,
+  disabled,
 }: {
   value: string;
   onChange: (v: string) => void;
   children: ReactNode;
+  disabled?: boolean;
 }) {
   return (
     <select
       value={value}
+      disabled={disabled}
       onChange={(e) => onChange(e.target.value)}
-      className="max-w-[55%] rounded-lg border border-border bg-bg px-2.5 py-1.5 text-[13px] text-fg outline-none transition-colors hover:border-border-strong focus-visible:ring-2 focus-visible:ring-ring"
+      className="max-w-[55%] rounded-lg border border-border bg-bg px-2.5 py-1.5 text-[13px] text-fg outline-none transition-colors hover:border-border-strong focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50"
     >
       {children}
     </select>

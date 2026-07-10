@@ -37,8 +37,8 @@ describe("effortMetaForModel — protocol 推导适用性", () => {
       allowed: EFFORT_ENUM,
     });
   });
-  it("非静态路由(gpt-5.5 / 未知)→ 全枚举", () => {
-    assert.deepEqual(effortMetaForModel("gpt-5.5"), { applicable: true, allowed: EFFORT_ENUM });
+  it("Codex GPT-5.6 / 未知透传模型 → 全枚举", () => {
+    assert.deepEqual(effortMetaForModel("gpt-5.6-sol"), { applicable: true, allowed: EFFORT_ENUM });
     assert.deepEqual(effortMetaForModel("some-future-model"), {
       applicable: true,
       allowed: EFFORT_ENUM,
@@ -50,7 +50,7 @@ describe("normalizeDefaultEffort", () => {
   it("null=清除;合法档位通过", () => {
     assert.equal(normalizeDefaultEffort("glm-5.2", null), null);
     assert.equal(normalizeDefaultEffort("glm-5.2", "high"), "high");
-    assert.equal(normalizeDefaultEffort("gpt-5.5", "xhigh"), "xhigh");
+    assert.equal(normalizeDefaultEffort("gpt-5.6-terra", "xhigh"), "xhigh");
     assert.equal(normalizeDefaultEffort("deepseek-v4-pro", "max"), "max");
   });
   it("ark 白名单外档位拒(medium 不在 glm-5.2 的 high/max)", () => {
@@ -61,8 +61,8 @@ describe("normalizeDefaultEffort", () => {
     assert.throws(() => normalizeDefaultEffort("MiniMax-M3", "low"), /effort_not_applicable_for_model/);
   });
   it("非法值域拒", () => {
-    assert.throws(() => normalizeDefaultEffort("gpt-5.5", "turbo"), /invalid_default_effort/);
-    assert.throws(() => normalizeDefaultEffort("gpt-5.5", 3 as unknown), /invalid_default_effort/);
+    assert.throws(() => normalizeDefaultEffort("gpt-5.6-sol", "ultra"), /invalid_default_effort/);
+    assert.throws(() => normalizeDefaultEffort("gpt-5.6-sol", 3 as unknown), /invalid_default_effort/);
   });
 });
 

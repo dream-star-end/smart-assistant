@@ -61,7 +61,7 @@ describe('WeChat channel operation skill prompt', () => {
       const result = await buildPromptContext({
         agentId: 'nonexistent-agent-for-test',
         provider: 'codex-native',
-        model: 'gpt-5.5',
+        model: 'gpt-5.6-sol',
       })
       assert.match(result.content, /微信通道操作技能/)
       assert.match(result.content, /最终回答/)

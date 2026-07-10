@@ -10,7 +10,7 @@ afterEach(cleanup);
 const MODELS: PublicModel[] = [
   { id: "glm-5.2", display_name: "GLM-5.2" },
   { id: "deepseek-v4", display_name: "DeepSeek-V4" },
-  { id: "gpt-5.5", display_name: "GPT-5.5" },
+  { id: "gpt-5.6-sol", display_name: "GPT-5.6-Sol" },
 ];
 
 /** radix DropdownMenu Trigger 在 pointerdown 开启(click 不够),jsdom 里直接发。 */
@@ -31,7 +31,7 @@ describe("ModelSelector 团队模式诚信显示", () => {
       <ModelSelector models={MODELS} selectedId="glm-5.2" onSelect={() => {}} teamEngineActive />,
     );
     const trigger = screen.getByRole("button", { name: "选择对话模型" });
-    expect(trigger.textContent).toContain("团队模式 · GPT-5.5");
+    expect(trigger.textContent).toContain("团队模式 · GPT-5.6-Sol");
     expect(trigger.textContent).not.toContain("GLM-5.2");
   });
 
@@ -43,7 +43,7 @@ describe("ModelSelector 团队模式诚信显示", () => {
 
     // 说明态存在且不可选（role=note,不在 menuitem 集合里）
     const note = await screen.findByRole("note");
-    expect(note.textContent).toContain("团队模式 · 队长引擎 GPT-5.5");
+    expect(note.textContent).toContain("团队模式 · 队长引擎 GPT-5.6-Sol");
     expect(note.textContent).toContain("团队模式关闭后生效");
     const items = screen.getAllByRole("menuitem");
     expect(items.some((i) => i.contains(note))).toBe(false);
@@ -78,10 +78,10 @@ describe("ModelSelector 团队模式诚信显示", () => {
     expect(onSelect).toHaveBeenCalledWith("deepseek-v4");
   });
 
-  it("teamEngineLabel：优先取 /api/public/models 里 gpt-5.5 的 display_name,缺失退回固定标签", () => {
-    expect(teamEngineLabel(MODELS)).toBe("GPT-5.5");
-    expect(teamEngineLabel([{ id: "gpt-5.5", display_name: "GPT 5.5 旗舰" }])).toBe("GPT 5.5 旗舰");
-    expect(teamEngineLabel([{ id: "glm-5.2" }])).toBe("GPT-5.5");
+  it("teamEngineLabel：优先取 /api/public/models 里 gpt-5.6-sol 的 display_name,缺失退回固定标签", () => {
+    expect(teamEngineLabel(MODELS)).toBe("GPT-5.6-Sol");
+    expect(teamEngineLabel([{ id: "gpt-5.6-sol", display_name: "GPT-5.6-Sol 旗舰" }])).toBe("GPT-5.6-Sol 旗舰");
+    expect(teamEngineLabel([{ id: "glm-5.2" }])).toBe("GPT-5.6-Sol");
     expect(modelLabel({ id: "x" })).toBe("x");
   });
 });
@@ -90,7 +90,7 @@ describe("ModelSelector provider 健康度降级(0108)", () => {
   const DEG_MODELS: PublicModel[] = [
     { id: "glm-5.2", display_name: "GLM-5.2", degraded: true },
     { id: "deepseek-v4", display_name: "DeepSeek-V4" },
-    { id: "gpt-5.5", display_name: "GPT-5.5" },
+    { id: "gpt-5.6-sol", display_name: "GPT-5.6-Sol" },
   ];
 
   it("degraded 模型显示「暂不可用」徽记且禁选(aria-disabled)", async () => {

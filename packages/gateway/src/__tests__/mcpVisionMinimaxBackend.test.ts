@@ -47,7 +47,7 @@ describe('shouldEnableOpenClaudeVision gating', () => {
       vision.shouldEnableOpenClaudeVision('claude-subscription', 'claude-opus-4-7'),
       false,
     )
-    assert.equal(vision.shouldEnableOpenClaudeVision('codex-native', 'gpt-5.5'), false)
+    assert.equal(vision.shouldEnableOpenClaudeVision('codex-native', 'gpt-5.6-sol'), false)
   })
   it('OPENCLAUDE_VISION_MCP_DISABLED=1 → 全 false', async () => {
     await withEnv({ OPENCLAUDE_VISION_MCP_DISABLED: '1' }, () => {
@@ -88,7 +88,7 @@ describe('vision gating 派生自 protocol supportsVision(反漂移)', () => {
   })
   it('非静态模型(claude/codex/未注册)→ isTextOnlyStaticVisionModel false', () => {
     assert.equal(vision.isTextOnlyStaticVisionModel('claude-opus-4-8'), false)
-    assert.equal(vision.isTextOnlyStaticVisionModel('gpt-5.5'), false)
+    assert.equal(vision.isTextOnlyStaticVisionModel('gpt-5.6-sol'), false)
     assert.equal(vision.isTextOnlyStaticVisionModel('totally-unknown-model'), false)
     assert.equal(vision.isTextOnlyStaticVisionModel(undefined), false)
   })

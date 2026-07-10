@@ -146,6 +146,30 @@ describe("persist — 历史合并纯函数", () => {
     expect(merged[0].text).toBe("L-a"); // 顺序保持
   });
 
+  test("user server echo preserves the original message-level retry routing", () => {
+    const local = [
+      {
+        id: "u1",
+        role: "user",
+        text: "local",
+        ts: 1,
+        _routing: { model: "gpt-5.6-terra", effortLevel: "max", teamMode: true },
+      } satisfies ChatMessage,
+    ];
+    const incoming = [
+      { id: "u1", role: "user", text: "server", ts: 1, _source: "server" } satisfies ChatMessage,
+    ];
+
+    const [merged] = applyServerIncremental(local, incoming);
+
+    expect(merged.text).toBe("server");
+    expect(merged._routing).toEqual({
+      model: "gpt-5.6-terra",
+      effortLevel: "max",
+      teamMode: true,
+    });
+  });
+
   test("applyServerIncremental: 空增量返回原数组引用", () => {
     const local = [msg("a")];
     expect(applyServerIncremental(local, [])).toBe(local);

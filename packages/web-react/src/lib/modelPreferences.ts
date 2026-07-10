@@ -1,0 +1,60 @@
+import { DEFAULT_CODEX_ENGINE_MODEL } from "@openclaude/protocol";
+import type { PublicModel } from "./types";
+
+export type PreferenceEffort = "low" | "medium" | "high" | "xhigh" | "max";
+
+/** preferences 内层快照（后端 strict allowlist；theme enum 用 auto 而非 system）。 */
+export type PrefsView = {
+  theme?: "light" | "dark" | "auto";
+  default_model?: string;
+  default_effort?: PreferenceEffort;
+  notify_email?: boolean;
+  notify_telegram?: boolean;
+  wechat_show_tool_calls?: boolean;
+  wechat_proactive_push?: boolean;
+  hotkeys?: Record<string, string>;
+};
+
+/** preferences 快照 → 内层 prefs（兼容 {prefs,updated_at} 包裹 / 平铺历史形态）。 */
+export function extractPrefs(snap: unknown): PrefsView {
+  if (!snap || typeof snap !== "object") return {};
+  const obj = snap as Record<string, unknown>;
+  const inner = obj.prefs;
+  if (inner && typeof inner === "object") return inner as PrefsView;
+  return obj as PrefsView;
+}
+
+/** 只接受当前用户模型列表中仍可见且健康的偏好；否则回落首个健康模型。 */
+export function initialModelFromPreferences(
+  models: PublicModel[],
+  prefs: PrefsView,
+): string | undefined {
+  const preferred = prefs.default_model
+    ? models.find((m) => m.id === prefs.default_model && m.degraded !== true)
+    : undefined;
+  return preferred?.id ?? models.find((m) => m.degraded !== true)?.id ?? models[0]?.id;
+}
+
+/**
+ * 用户全局 effort 仅在当前执行模型的 API capability 投影允许时发送。
+ * unsupported / 未设置均返回 undefined，让具体模型沿用自身默认。
+ */
+export function effortForModel(
+  models: PublicModel[],
+  modelId: string | undefined,
+  preferred: PreferenceEffort | undefined,
+): PreferenceEffort | null | undefined {
+  if (!modelId) return undefined;
+  const model = models.find((m) => m.id === modelId);
+  if (!model) return undefined;
+  if (!preferred) return null;
+  return model.supported_efforts?.includes(preferred) ? preferred : null;
+}
+
+/** Team mode replaces main's selected model at the bridge, so effort follows Sol's capability. */
+export function effectiveEffortModelId(
+  selectedModelId: string | undefined,
+  teamLeaderActive: boolean,
+): string | undefined {
+  return teamLeaderActive ? DEFAULT_CODEX_ENGINE_MODEL : selectedModelId;
+}

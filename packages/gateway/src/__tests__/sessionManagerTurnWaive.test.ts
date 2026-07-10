@@ -132,7 +132,7 @@ describe("_reportTurnWaive e2e(codex session → master turn-waive POST)", () =>
         agent: mainAgent,
         channel: "webchat",
         peerId: "waive-e2e",
-        model: "gpt-5.5", // resolveEngine → codex(engine-reported)
+        model: "gpt-5.6-sol", // resolveEngine → codex(engine-reported)
       });
       assert.equal(session.runner.capabilities.billingMode, "engine-reported");
 

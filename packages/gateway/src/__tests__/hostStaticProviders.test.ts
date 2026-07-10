@@ -58,8 +58,8 @@ describe('resolveHostStaticProviderEnv', () => {
     assert.equal(resolveHostStaticProviderEnv('deepseek-v4-pro', { keys: null, env: {} }), null)
   })
 
-  it('模型不属静态 provider(OAuth/codex gpt-5.5)→ null(不干预)', () => {
-    assert.equal(resolveHostStaticProviderEnv('gpt-5.5', { keys: { deepseek: 'k' }, env: {} }), null)
+  it('模型不属静态 provider(OAuth/codex gpt-5.6-sol)→ null(不干预)', () => {
+    assert.equal(resolveHostStaticProviderEnv('gpt-5.6-sol', { keys: { deepseek: 'k' }, env: {} }), null)
   })
 
   it('model undefined → null', () => {
@@ -92,7 +92,7 @@ describe('resolveHostStaticProviderEnv', () => {
   it('host-static 显式清空继承的 OAuth 凭据(x-api-key provider 防宿主残留 OAuth token 被误判 subscriber)', () => {
     const r = resolveHostStaticProviderEnv('qwen3.7-max', {
       keys: { opencodego: 'og-key' },
-      env: { CLAUDE_CODE_OAUTH_TOKEN: 'stale-oauth', ANTHROPIC_MODEL: 'gpt-5.5' },
+      env: { CLAUDE_CODE_OAUTH_TOKEN: 'stale-oauth', ANTHROPIC_MODEL: 'gpt-5.6-sol' },
     })
     assert.ok(r)
     assert.equal(r.env.CLAUDE_CODE_OAUTH_TOKEN, '') // 显式清空,不靠 AUTH_TOKEN 遮蔽(x-api-key 路径没有 AUTH_TOKEN)
@@ -140,7 +140,7 @@ describe('isHostRoutableStaticModel — routable 自检各分支', () => {
   })
   it('host + 模型不属任何静态 provider(codex)→ false', () => {
     setHostStaticProviderKeys({ deepseek: 'k' })
-    assert.equal(isHostRoutableStaticModel('gpt-5.5', {}), false)
+    assert.equal(isHostRoutableStaticModel('gpt-5.6-sol', {}), false)
   })
 })
 
