@@ -21,6 +21,7 @@ import {
   isSafeHttpUrl,
   parseCodexTypeName,
   shortPath,
+  stripShellWrapperForDisplay,
   type ToolLike,
 } from "./format";
 import { parseMcpName } from "./meta";
@@ -156,7 +157,9 @@ function DiffView({ oldStr, newStr }: { oldStr: string; newStr: string }) {
 }
 
 function BashBody({ input, tool }: BodyProps) {
-  const rawCommand = asStr(input?.command);
+  // 展示层剥壳兜底:历史消息的 command 落库时可能带 /bin/bash -lc 包装(新帧已由
+  // runner 剥好),先剥再进 oc 检测/写文件检测/展示。
+  const rawCommand = stripShellWrapperForDisplay(asStr(input?.command));
   const command = rawCommand.slice(0, 2000);
   // oc-* 工具(文献检索/引用核验/…):若命令命中且输出可解析 → 渲染专门卡片,
   // 而非原始"$ 命令 + JSON"终端块。不认/出错 → 回落下方通用渲染。
