@@ -12,14 +12,16 @@
  *   • `skill_delete`
  *   • reminder / delegate tools (see TOOLS below)
  *
- * NOTE (Phase 2): the memory-class tools (`memory`, `session_search`,
- * `archival_add`, `archival_search`, `archival_delete`) used to live here too.
- * They were moved OUT of this long-lived stdio server into the one-shot
- * `oc-memory` CLI (packages/mcp-memory/src/ocMemoryCli.ts, shared logic in
- * memoryTools.ts) — a persistent stdio transport is fragile (console pollution
- * or a crash kills the whole transport → codex hangs). skill / reminder /
- * delegate tools remain here (lower frequency, delegate needs the long-lived
- * gateway-callback socket).
+ * NOTE: the recall/archival tools (`session_search`, `archival_add`,
+ * `archival_search`, `archival_delete`) used to live here too. They were moved
+ * OUT of this long-lived stdio server into the one-shot `oc-memory` CLI
+ * (packages/mcp-memory/src/ocMemoryCli.ts, shared logic in memoryTools.ts) — a
+ * persistent stdio transport is fragile (console pollution or a crash kills the
+ * whole transport → codex hangs). The Core `memory` tool (add/replace/remove/read
+ * over MEMORY.md/USER.md) has since been RETIRED entirely (memdir refactor):
+ * Core memory is now direct file editing under agents/<id>/memory/ + a MEMORY.md
+ * index (see @openclaude/storage MemoryDir). skill / reminder / delegate tools
+ * remain here (lower frequency, delegate needs the long-lived gateway-callback socket).
  *
  * Configuration: the server is spawned per-session by the gateway with
  *   env OPENCLAUDE_AGENT_ID=<id>   (which agent this subprocess belongs to)
@@ -148,10 +150,11 @@ const drafts = new SkillDraftStore()
 // otherwise). Fire-and-forget + fail-soft so it never delays mcp readiness.
 void syncMarketplaceHub()
 
-// NOTE (Phase 2): memory / session_search / archival_* moved to the oc-memory
-// CLI. The MemoryStore instance, archival schema bootstrap and embedding-provider
-// init that used to live here now live in createMemoryToolsContext (memoryTools.ts),
-// constructed per CLI invocation. This server no longer touches memory state.
+// NOTE: session_search / archival_* moved to the oc-memory CLI; the Core `memory`
+// tool is retired (memdir — Core memory is direct file editing now). The archival
+// schema bootstrap and embedding-provider init that used to live here now live in
+// createMemoryToolsContext (memoryTools.ts), constructed per CLI invocation. This
+// server no longer touches memory state.
 
 const server = new Server(
   { name: 'openclaude-memory', version: '0.1.0' },
@@ -161,10 +164,11 @@ const server = new Server(
 // ─────────────────────────────────────────────────────────────
 // Tool definitions
 // ─────────────────────────────────────────────────────────────
-// NOTE (Phase 2): the memory-class tools (`memory`, `session_search`,
-// `archival_add`, `archival_search`, `archival_delete`) are intentionally NOT
-// in this list — they moved to the one-shot `oc-memory` CLI. Do not re-add them
-// here; keep them on the CLI so a persistent-transport crash can't hang codex.
+// NOTE: the recall/archival tools (`session_search`, `archival_add`,
+// `archival_search`, `archival_delete`) are intentionally NOT in this list — they
+// moved to the one-shot `oc-memory` CLI. Do not re-add them here; keep them on the
+// CLI so a persistent-transport crash can't hang codex. The Core `memory` tool is
+// retired outright (memdir — Core memory is direct file editing).
 const TOOLS = [
   {
     name: 'skill_list',

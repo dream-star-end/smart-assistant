@@ -18,6 +18,16 @@ export const paths = {
   // learning about the user reaches ALL agents. `agentUserMd` kept only as the legacy
   // per-agent path for migration / back-compat read.
   agentMemoryMd: (agentId: string) => join(HOME, 'agents', agentId, 'MEMORY.md'),
+  // memdir 范式(见 storage/src/memoryDir.ts):Core 记忆从单个 §-blob 改为
+  // 「每条记忆一个 frontmatter 文件 + MEMORY.md 纯索引」。
+  //  - agentMemoryMd(id)  = 索引路径(**不变**,跨组件契约:volumeContextReader /
+  //    Go usercontext / platformEnvelopeBuilder / UI 全读这个路径)。
+  //  - agentMemoryDir(id) = 记忆文件目录 agents/<id>/memory/。
+  //  - agentMemoryFile(id, base) = 目录下单条记忆文件(base 必须过 MEMORY_FILE_RE
+  //    校验;这里只做路径拼接,不做校验——校验在 MemoryDir 写/读侧)。
+  agentMemoryDir: (agentId: string) => join(HOME, 'agents', agentId, 'memory'),
+  agentMemoryFile: (agentId: string, base: string) =>
+    join(HOME, 'agents', agentId, 'memory', base),
   agentUserMd: (agentId: string) => join(HOME, 'agents', agentId, 'USER.md'),
   sharedUserMd: join(HOME, 'user.md'),
   sharedUserLock: join(HOME, 'user.md.lock'),

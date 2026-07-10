@@ -1,24 +1,27 @@
 /**
- * memoryTools — 长期记忆(Core / Recall / Archival)工具的可复用核心逻辑。
+ * memoryTools — 长期记忆(Recall / Archival)工具的可复用核心逻辑。
  *
- * 权威源:这 5 个记忆工具(memory / session_search / archival_add /
- * archival_search / archival_delete)的实现只此一份。历史上它们内联在
- * mcp-memory 的常驻 MCP server(index.ts)里;Phase 2 把它们从常驻 stdio
+ * 权威源:这 4 个记忆工具(session_search / archival_add / archival_search /
+ * archival_delete)的实现只此一份。历史上它们(连同已退役的 Core `memory` 子命令)
+ * 内联在 mcp-memory 的常驻 MCP server(index.ts)里;Phase 2 把它们从常驻 stdio
  * server 拆出改成一次性 `oc-memory` CLI(见 ocMemoryCli.ts)——常驻 stdio
  * 传输脆弱(被 console 污染 / 崩溃即死 → codex 死等 turn 被掐),一次性进程无
- * 传输可死。index.ts 不再暴露这 5 个工具;它们唯一的消费者是本模块 + CLI。
+ * 传输可死。index.ts 不再暴露这些工具;它们唯一的消费者是本模块 + CLI。
  *
- * 依赖:全部来自 @openclaude/storage(MemoryStore + archival* + session
- * search + 可选 embedding),与旧 MCP handler 完全同源。容器内 embedding 未配置
- * (EMBEDDING_* / OPENAI_API_KEY 均缺省)→ isEmbeddingAvailable() 为 false →
- * 走 BM25-only,与旧 MCP server 行为一致。
+ * memdir 重构:Core 记忆(旧 `memory` add/replace/remove/read 子命令)已退役——
+ * Core 记忆改为「引擎原生直接编辑文件」(agents/<id>/memory/<slug>.md + MEMORY.md
+ * 索引,见 storage/src/memoryDir.ts)。CLI 侧仍拦截 `oc-memory memory ...` 打印迁移
+ * 提示(见 ocMemoryCli.ts),但不再有 handleMemory / MemoryStore 依赖。
+ *
+ * 依赖:全部来自 @openclaude/storage(archival* + session search + 可选 embedding),
+ * 与旧 MCP handler 完全同源。容器内 embedding 未配置(EMBEDDING_* / OPENAI_API_KEY
+ * 均缺省)→ isEmbeddingAvailable() 为 false → 走 BM25-only,与旧 MCP server 行为一致。
  *
  * 返回结构刻意沿用旧 MCP handler 的 `{ content:[{type:'text',text}], isError? }`
  * ——CLI 直接取 content[0].text 打印,isError 决定退出码;单一返回形状不分叉。
  */
 import {
   type EmbeddingProvider,
-  MemoryStore,
   archivalAdd,
   archivalCount,
   archivalDelete,
@@ -48,14 +51,16 @@ export function toolError(msg: string): MemoryToolResult {
 }
 
 /**
- * Per-agent memory runtime: the MemoryStore instance + (optional) embedding
- * provider + in-flight embed tasks. Created once per process (MCP server startup
- * or a single CLI invocation) and threaded through every handler so there is no
- * hidden module-level singleton state.
+ * Per-agent memory runtime: (optional) embedding provider + in-flight embed
+ * tasks. Created once per process (MCP server startup or a single CLI
+ * invocation) and threaded through every handler so there is no hidden
+ * module-level singleton state.
+ *
+ * memdir 重构后不再持有 MemoryStore —— Core 记忆已改为引擎原生直接编辑文件,
+ * 本 context 只服务 session_search / archival_* 三类深层召回工具。
  */
 export interface MemoryToolsContext {
   agentId: string
-  memory: MemoryStore
   embeddingProvider: EmbeddingProvider | null
   /** Track in-flight embedding tasks so archival_delete can await before cleanup
    *  (add/delete race), and the CLI can drain before exit. */
@@ -63,18 +68,13 @@ export interface MemoryToolsContext {
 }
 
 /**
- * Build a MemoryToolsContext for `agentId`. Mirrors the exact startup sequence
- * the old mcp-memory index.ts ran at module load:
- *   1. MemoryStore(agentId).load()          — Core memory (MEMORY.md / USER.md)
- *   2. archivalCount(agentId)                — triggers ensureSchema() so the
+ * Build a MemoryToolsContext for `agentId`. Startup sequence:
+ *   1. archivalCount(agentId)                — triggers ensureSchema() so the
  *      archival + archival_fts tables exist BEFORE any hybridArchivalSearch
  *      (which queries archival_fts directly).
- *   3. embedding provider init (best-effort) — BM25-only when unavailable.
+ *   2. embedding provider init (best-effort) — BM25-only when unavailable.
  */
 export async function createMemoryToolsContext(agentId: string): Promise<MemoryToolsContext> {
-  const memory = new MemoryStore(agentId)
-  await memory.load()
-
   // archivalCount triggers ensureSchema() which creates archival + archival_fts
   // tables. Must run before hybridArchivalSearch which queries archival_fts.
   await archivalCount(agentId)
@@ -95,7 +95,7 @@ export async function createMemoryToolsContext(agentId: string): Promise<MemoryT
     }
   }
 
-  return { agentId, memory, embeddingProvider, pendingEmbeds: new Map() }
+  return { agentId, embeddingProvider, pendingEmbeds: new Map() }
 }
 
 /** Await any in-flight embedding tasks. CLI calls this before exit so a
@@ -106,54 +106,10 @@ export async function drainPendingEmbeds(ctx: MemoryToolsContext): Promise<void>
   if (pending.length > 0) await Promise.allSettled(pending)
 }
 
-// ── memory (Core: MEMORY.md / USER.md) ──
-export async function handleMemory(
-  ctx: MemoryToolsContext,
-  args: {
-    action: string
-    target: 'memory' | 'user'
-    content?: string
-    needle?: string
-  },
-): Promise<MemoryToolResult> {
-  await ctx.memory.load() // refresh from disk every call (in case user edited via UI)
-  const target = args.target
-  switch (args.action) {
-    case 'read': {
-      const text = ctx.memory.read(target)
-      return {
-        content: [
-          {
-            type: 'text',
-            text:
-              text ||
-              `(${target} is empty — use memory add ${target} to populate it with things worth remembering across sessions)`,
-          },
-        ],
-      }
-    }
-    case 'add': {
-      if (!args.content) return toolError('content required for add')
-      const r = await ctx.memory.add(target, args.content)
-      if (!r.ok) return toolError(r.error ?? 'add failed')
-      return toolOk(`Added to ${target}. Current size: ${ctx.memory.charCount(target)} chars.`)
-    }
-    case 'replace': {
-      if (!args.needle || !args.content) return toolError('needle and content required for replace')
-      const r = await ctx.memory.replace(target, args.needle, args.content)
-      if (!r.ok) return toolError(r.error ?? 'replace failed')
-      return toolOk(`Replaced in ${target}.`)
-    }
-    case 'remove': {
-      if (!args.needle) return toolError('needle required for remove')
-      const r = await ctx.memory.remove(target, args.needle)
-      if (!r.ok) return toolError(r.error ?? 'remove failed')
-      return toolOk(`Removed from ${target}.`)
-    }
-    default:
-      return toolError(`unknown action: ${args.action}`)
-  }
-}
+// ── memory (Core) 已退役 ──
+// memdir 重构:Core 记忆(旧 memory add/replace/remove/read)改为引擎原生直接编辑文件
+// (agents/<id>/memory/<slug>.md + MEMORY.md 索引)。此处不再有 handleMemory;
+// `oc-memory memory ...` 由 CLI 拦截打印迁移提示(见 ocMemoryCli.ts)。
 
 // ── session_search (Recall: hybrid BM25 + vector over past sessions) ──
 export async function handleSessionSearch(

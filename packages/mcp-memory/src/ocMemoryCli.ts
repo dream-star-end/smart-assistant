@@ -7,14 +7,17 @@
  * 协议可污染,进程退出即结束。delegate / cron / skill 工具仍留在 MCP server。
  *
  * 用法(memory-management baseline skill 文档化):
- *   oc-memory memory --action <add|replace|remove|read> --target <memory|user> [--content "..."] [--needle "..."]
  *   oc-memory session-search "<query>" [--limit N] [--agent-id ID] [--summarize]
  *   oc-memory archival-add "<text>" [--tags a,b,c]
  *   oc-memory archival-search "<query>" [--limit N]
  *   oc-memory archival-delete <id>
  *
- * 参数字段严格对齐旧 MCP 工具 inputSchema(content / needle / query / tags / id /
- * limit / agentId / summarize)。输出:handler 返回的 content[0].text 写 stdout;
+ * memdir 重构:Core 记忆(旧 `oc-memory memory --action ...`)已退役——Core 记忆改为
+ * 「引擎原生直接编辑文件」(agents/<id>/memory/<slug>.md + MEMORY.md 索引)。仍拦截
+ * `oc-memory memory ...` 打印中文迁移提示并 exit 2,防旧技能/旧习惯静默失败。
+ *
+ * 参数字段严格对齐旧 MCP 工具 inputSchema(query / tags / id / limit / agentId /
+ * summarize)。输出:handler 返回的 content[0].text 写 stdout;
  * handler 报错(isError)或参数错误 → stderr + exit 1。
  *
  * env:agent 身份 CCB 路径取 ambient OPENCLAUDE_AGENT_ID(与旧 MCP 同源);codex 路径
@@ -23,13 +26,13 @@
  * 由 OPENCLAUDE_HOME 决定(容器内 = /home/agent/.openclaude;未设时 paths.ts 回落
  * homedir()/.openclaude,容器内两者同路径)。
  */
+import { paths } from '@openclaude/storage'
 import {
   createMemoryToolsContext,
   drainPendingEmbeds,
   handleArchivalAdd,
   handleArchivalDelete,
   handleArchivalSearch,
-  handleMemory,
   handleSessionSearch,
   type MemoryToolResult,
 } from './memoryTools.js'
@@ -70,12 +73,30 @@ function parseLimit(raw: string | undefined): number | undefined {
 
 const USAGE = [
   'usage:',
-  '  oc-memory memory --action <add|replace|remove|read> --target <memory|user> [--content "..."] [--needle "..."]',
   '  oc-memory session-search "<query>" [--limit N] [--agent-id ID] [--summarize]',
   '  oc-memory archival-add "<text>" [--tags a,b,c]',
   '  oc-memory archival-search "<query>" [--limit N]',
   '  oc-memory archival-delete <id>',
 ].join('\n')
+
+/**
+ * `oc-memory memory ...` 退役后的中文迁移提示(memdir)。Core 记忆改为直接编辑文件,
+ * 这里给出本 agent 的记忆目录与索引绝对路径(容器内由 OPENCLAUDE_HOME 决定)。
+ */
+function coreMemoryMigrationNotice(agentId: string): string {
+  const dir = paths.agentMemoryDir(agentId)
+  const index = paths.agentMemoryMd(agentId)
+  return [
+    'Core 记忆已改为「直接编辑文件」范式,`oc-memory memory` 子命令已退役。',
+    '请改用文件操作:',
+    `  • 新增/更新一条记忆 → 直接写文件 ${dir}/<slug>.md`,
+    '      (frontmatter 三字段:name / description / type,正文写事实)',
+    `  • 查看已有记忆 → 先 Read 索引 ${index},再按需 Read 具体记忆文件`,
+    '  • 删除错误记忆 → 删除对应文件即可(索引会自动对账)',
+    '详见系统提示 # Memory 段。session-search / archival 子命令不受影响。',
+    '',
+  ].join('\n')
+}
 
 /** Print the handler's text to stdout and exit non-zero on isError. */
 function emit(res: MemoryToolResult): never {
@@ -98,29 +119,20 @@ async function main(): Promise<void> {
   // CCB: OPENCLAUDE_AGENT_ID(ambient);codex: 该 env 被 scrub → OC_AGENT_ID(spawn 注入)。
   const agentId =
     process.env.OPENCLAUDE_AGENT_ID?.trim() || process.env.OC_AGENT_ID?.trim() || 'main'
+
+  // memdir:Core 记忆改为引擎原生直接编辑文件,`memory` 子命令退役。在建 context(触发
+  // sessions.db / embedding 初始化)之前就短路,迁移提示不依赖任何后端。exit 2(非 0),
+  // 防旧技能/旧习惯静默失败——让调用方知道要改用文件编辑。
+  if (cmd === 'memory') {
+    process.stderr.write(coreMemoryMigrationNotice(agentId))
+    process.exit(2)
+  }
+
   const ctx = await createMemoryToolsContext(agentId)
 
   const { positional, flags } = parseFlags(rest)
 
   switch (cmd) {
-    case 'memory': {
-      const action = flags.action
-      const target = flags.target
-      if (!action || !['add', 'replace', 'remove', 'read'].includes(action)) {
-        fail('memory --action must be one of add|replace|remove|read')
-      }
-      if (target !== 'memory' && target !== 'user') {
-        fail('memory --target must be "memory" or "user"')
-      }
-      const res = await handleMemory(ctx, {
-        action,
-        target,
-        content: flags.content,
-        needle: flags.needle,
-      })
-      emit(res)
-      break
-    }
     case 'session-search': {
       const query = positional[0]
       if (!query) fail('session-search requires a "<query>" positional argument')

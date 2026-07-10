@@ -916,6 +916,12 @@ export class SubprocessRunner extends EventEmitter {
           // agent 侧读写走 openclaude-memory MCP 的 reminder 工具族(list/create/
           // update/delete,同一 /api/cron)。
           CLAUDE_CODE_DISABLE_CRON: '1',
+          // memdir 范式:平台记忆的唯一权威是 MEMORY.md 索引 + memory/<slug>.md 文件,
+          // 由模型用原生 Write/Edit 直写(指令常驻在 # Memory 段)。CCB 自带的
+          // 「自动记忆」写入器会另起一份私有 memory store,与平台记忆分裂 → 关掉它。
+          // gate = isV3ContainerRuntime()(与上方 restrictedMemorySources 同一权威),
+          // 个人版(宿主单进程)行为不动。
+          ...(isV3ContainerRuntime() ? { CLAUDE_CODE_DISABLE_AUTO_MEMORY: '1' } : {}),
           // 远程执行目标:kind='remote' 时让 CCB RemoteExecutor 启用 ssh mux 分支。
           // 空串 = 本地执行(默认);OC_REMOTE_* 其余变量仅在 remote 分支设。
           // 容器里 ctl.sock 的真实路径是宿主侧 /run/ccb-ssh/u<uid>/h<hid>/ctl.sock,

@@ -26,6 +26,24 @@ describe('bridge API allowlist', () => {
       matchCommercialContainerApiProxy('/api/agents/main/memory/user', 'GET')?.label,
       '/api/agents/:id/memory/:target',
     )
+    // memdir 单条记忆文件 CRUD — proxied into the user's container.
+    for (const m of ['GET', 'PUT', 'DELETE'] as const) {
+      assert.equal(
+        matchCommercialContainerApiProxy('/api/agents/main/memory/files/user-radio.md', m)?.label,
+        '/api/agents/:id/memory/files/:file',
+        `memory files ${m} must be proxied`,
+      )
+    }
+    // :file 段不得吞子路径(穿越防线由容器 handler 的 basename+MEMORY_FILE_RE 兜底,门这里也不放松)。
+    assert.equal(
+      matchCommercialContainerApiProxy('/api/agents/main/memory/files/a/b.md', 'GET'),
+      null,
+    )
+    // 旧索引 target 仍只 GET/PUT,PUT 到 files 子树不匹配 :target 规则。
+    assert.equal(
+      matchCommercialContainerApiProxy('/api/agents/main/memory/memory', 'GET')?.label,
+      '/api/agents/:id/memory/:target',
+    )
     assert.equal(
       matchCommercialContainerApiProxy('/api/agents/main/skills/foo', 'DELETE')?.label,
       '/api/agents/:id/skills/:name',
