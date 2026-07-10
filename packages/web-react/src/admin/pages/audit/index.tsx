@@ -1,22 +1,34 @@
-import { Construction } from "lucide-react";
-import { EmptyState } from "../../../components/ui";
+import { useState } from "react";
+import { type TabItem, Tabs } from "../../../components/ui";
 import { PageHeader } from "../../components";
 import { getAdminPage } from "../../registry";
+import { AdminAuditTab } from "./AdminAuditTab";
+import { AgentAuditTab } from "./AgentAuditTab";
+
+type AuditView = "admin" | "agent";
+const TABS: TabItem[] = [
+  { value: "admin", label: "管理审计" },
+  { value: "agent", label: "Agent 工具审计" },
+];
 
 /**
- * 占位 stub —— 由 audit 页面 agent 整体替换为真实实现（保持 default export 与本文件同名/同签名）。
- * 建设时用 PageHeader + StatCardRow + ChartCard + DataTable + FilterBar（见 src/admin/components）。
+ * 审计日志页 —— 两个只读子区(管理审计 / Agent 工具审计),各自持有筛选/数据状态。
+ * 切 tab 时按需挂载对应子区(懒拉数据),不做破坏性操作。
  */
 export default function AuditPage() {
   const meta = getAdminPage("audit");
+  const [tab, setTab] = useState<AuditView>("admin");
+
   return (
     <div className="flex flex-col gap-5">
       <PageHeader title={meta.title} desc={meta.desc} />
-      <EmptyState
-        icon={Construction}
-        title="页面建设中"
-        hint="该管理页正在迁移到新框架，稍后由对应页面 agent 填充。"
+      <Tabs
+        value={tab}
+        onValueChange={(v) => setTab(v as AuditView)}
+        items={TABS}
+        aria-label="审计日志分区"
       />
+      {tab === "admin" ? <AdminAuditTab /> : <AgentAuditTab />}
     </div>
   );
 }
