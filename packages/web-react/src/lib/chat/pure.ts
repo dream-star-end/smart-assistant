@@ -372,6 +372,21 @@ export function shouldAutoContinueEmptyTurn(p: {
   return true;
 }
 
+// ═══════════════ 归档 / 上下文重建文案（SESSION_ARCHIVE_DESIGN §5,统一权威）═══════════════
+
+/**
+ * 上下文重建 system 提示行文案(引擎无法原生续接、走兜底注入历史时)。`n` = 注入的对话条数。
+ * 文案严格取自设计合同 §5,四个 agent 共用同一源,勿各写各的。
+ */
+export function contextRebuiltNotice(n: number): string {
+  return `已重新加载会话上下文(最近 ${n} 条对话摘要)。更早的细节助手可能记不全,如需引用旧内容可直接粘贴。`;
+}
+
+/** "从云端加载更早的历史"按钮文案。`remaining` = 归档中尚未拉取的条数。设计合同 §5。 */
+export function loadOlderHistoryLabel(remaining: number): string {
+  return `从云端加载更早的历史(还有 ${remaining} 条)`;
+}
+
 // ═══════════════ 状态文案（onopen / typing）═══════════════
 
 /** onopen 初始 status pill：队列非空显 “补发离线消息…(N)”，不能直接显 “已连接”。*/

@@ -35,12 +35,14 @@ import {
 } from "./model";
 import {
   applyServerIncremental,
+  mergeArchivedHistory,
   mergeFullServerWins,
   type StoredSession,
 } from "../persist";
 import { appUpdate } from "../appUpdate";
 import {
   AUTO_CONTINUE_DISPLAY,
+  contextRebuiltNotice,
   RESTART_CONTINUE_DISPLAY,
   RESTART_CONTINUE_PROMPT,
   backoffDelay,
@@ -69,6 +71,7 @@ import {
   WS_CLOSE_CODE_STALLED,
 } from "./pure";
 import type {
+  ContextRebuiltWire,
   CostChargedWire,
   CostWaivedWire,
   InboundMessage,
@@ -583,6 +586,34 @@ export class ChatSocket {
     this.connect();
   }
 
+  // ═══════════════ 上下文重建提示（context_rebuilt，热尾巴/归档）═══════════════
+  /**
+   * 处理 sys.context_rebuilt 帧:插入一条 client-owned 的 system 提示行(durable,持久化走既有
+   * IndexedDB 通道),并设一条会话级 transient 软提示(live flash)。**幂等**:同一帧(reconnect
+   * replay / 同 turn 重复)只插一条 —— 用 frameSeq/ts 派生确定性 id,已存在即跳过(id 稳定,reload
+   * 后 loadStored 复原该行也能命中去重)。
+   */
+  private applyContextRebuilt(sess: ChatSession, frame: ContextRebuiltWire): void {
+    const count =
+      typeof frame.messageCount === "number" && Number.isFinite(frame.messageCount) && frame.messageCount > 0
+        ? Math.floor(frame.messageCount)
+        : sess.messages.length;
+    // 确定性去重 id:优先 frameSeq(per-sessionKey 单调),回退 server ts,再回退时钟(极端缺省)。
+    const identity =
+      typeof frame.frameSeq === "number" && Number.isFinite(frame.frameSeq)
+        ? `f${frame.frameSeq}`
+        : typeof frame.ts === "number" && Number.isFinite(frame.ts)
+          ? `t${frame.ts}`
+          : `x${Date.now()}`;
+    const dedupId = `sys-ctxrebuild-${sess.id}-${identity}`;
+    if (sess.messages.some((m) => m.id === dedupId)) return; // 幂等:同帧只插一条
+    const text = contextRebuiltNotice(count);
+    addMessage(sess, "system", text, { id: dedupId, _source: "local" });
+    this.setTransientNotice(sess.id, text); // 仅 turn 进行中显示的 live flash
+    this.deps.persistSession?.(sess.id); // durable:落 IndexedDB
+    this.scheduleNotify();
+  }
+
   // ═══════════════ transient 软提示（会话级、非持久，S3）═══════════════
   private setTransientNotice(sessId: string, text: string): void {
     const s = this.sessions.get(sessId);
@@ -1094,6 +1125,14 @@ export class ChatSocket {
         appUpdate.onServerBuild((f as { build?: unknown }).build);
         return;
       }
+      case "sys.context_rebuilt": {
+        // 引擎无法原生续接、走兜底注入历史(provider 切换 / 非原生 resume)时容器 emit。
+        // 插入一条 client-owned 的 system 提示行 + 会话内 transient 软提示(boss 硬指标 3)。
+        const frame = f as ContextRebuiltWire;
+        const sess = frame.peer?.id ? this.sessions.get(frame.peer.id) : null;
+        if (sess) this.applyContextRebuilt(sess, frame);
+        return;
+      }
       case "sys.relay_ready": {
         // bridge↔容器 relay 真建立的**单一权威信号**(冷暖都发,见 userChatBridge containerWs open)。
         // readiness 权威统一:冷启时 WS 握手(onopen)早于 relay 就绪,期间发的消息经 P7.8 在离线
@@ -1393,6 +1432,8 @@ export class ChatSocket {
       ...(typeof s._turnStartedAt === "number" ? { _turnStartedAt: s._turnStartedAt } : {}),
       ...(typeof s._lastFrameAt === "number" ? { _lastFrameAt: s._lastFrameAt } : {}),
       _maxSeq: s._maxSeq,
+      ...(typeof s._archivedThroughSeq === "number" ? { _archivedThroughSeq: s._archivedThroughSeq } : {}),
+      ...(typeof s._archivedCount === "number" ? { _archivedCount: s._archivedCount } : {}),
       _trackerResetAt: typeof s._trackerResetAt === "number" ? s._trackerResetAt : undefined,
       _trackerResetServerTs: typeof s._trackerResetServerTs === "number" ? s._trackerResetServerTs : undefined,
       _localTeardownAt: typeof s._localTeardownAt === "number" ? s._localTeardownAt : undefined,
@@ -1427,6 +1468,8 @@ export class ChatSocket {
     s._lastFrameSeqByKey = stored._lastFrameSeqByKey ? { ...stored._lastFrameSeqByKey } : {};
     s._lastFrameSeq = stored._lastFrameSeq;
     s._maxSeq = stored._maxSeq;
+    if (typeof stored._archivedThroughSeq === "number") s._archivedThroughSeq = stored._archivedThroughSeq;
+    if (typeof stored._archivedCount === "number") s._archivedCount = stored._archivedCount;
     s._streamingAssistant = null;
     s._streamingThinking = null;
     const inFlightReference =
@@ -1463,6 +1506,11 @@ export class ChatSocket {
    *  - full（!isPartial）：server 整带为权威在前，仅追加本地 server 不认识的乐观尾消息。
    *  - 增量（isPartial）：在本地基础上按 id 覆盖 + 追加新增。
    * maxSeq 单调推进作下次增量游标。会话不存在则按 agentId 惰性建。
+   *
+   * `archive`(热尾巴):server 现可能只回 `_seq > archivedThroughSeq` 的热尾巴,full 合并须把
+   * `archivedThroughSeq` 透传给 mergeFullServerWins —— 本地 `_seq ≤ 水位`的已归档行无条件保留,
+   * 绝不被"server 不认识 = 丢弃"误杀(主雷)。同时记录 archivedCount/archivedThroughSeq 到会话态,
+   * 供 UI 展示归档计数 + 归档分页游标兜底。
    */
   applyServerMessages(
     sessId: string,
@@ -1470,9 +1518,20 @@ export class ChatSocket {
     msgs: ChatMessage[],
     full: boolean,
     maxSeq?: number,
+    archive?: { archivedThroughSeq?: number; archivedCount?: number },
   ): void {
     const s = this.ensureSession(sessId, agentId || this.deps.defaultAgentId || "main");
-    s.messages = full ? mergeFullServerWins(msgs, s.messages) : applyServerIncremental(s.messages, msgs);
+    const archivedThroughSeq =
+      typeof archive?.archivedThroughSeq === "number" && Number.isFinite(archive.archivedThroughSeq)
+        ? archive.archivedThroughSeq
+        : 0;
+    s.messages = full
+      ? mergeFullServerWins(msgs, s.messages, archivedThroughSeq)
+      : applyServerIncremental(s.messages, msgs);
+    if (archivedThroughSeq > 0) s._archivedThroughSeq = archivedThroughSeq;
+    if (typeof archive?.archivedCount === "number" && Number.isFinite(archive.archivedCount)) {
+      s._archivedCount = archive.archivedCount;
+    }
     if (typeof maxSeq === "number" && (s._maxSeq === undefined || maxSeq > s._maxSeq)) {
       s._maxSeq = maxSeq;
     }
@@ -1483,6 +1542,42 @@ export class ChatSocket {
     rebuildIndexes(s);
     normalizeDelegateCards(s);
     this.scheduleNotify();
+  }
+
+  /**
+   * 归档分页并入(loadOlderHistory 拉回的更早历史)。**只前插 + 按 id 去重,绝不 server-wins 覆盖
+   * 本地富卡**(归档行全是 server-authored,srv-* id 与本地 m-* 天然不撞)。无新增(全已在本地)即
+   * 无副作用返回。合并后重建 block/agent 索引 + normalizeDelegateCards(与 applyServerMessages 同口径)。
+   */
+  prependArchivedMessages(sessId: string, msgs: ChatMessage[]): void {
+    const s = this.sessions.get(sessId);
+    if (!s || !Array.isArray(msgs) || msgs.length === 0) return;
+    const next = mergeArchivedHistory(s.messages, msgs);
+    if (next === s.messages) return; // 零新增:免无谓重渲
+    s.messages = next;
+    s._blockIdToMsgId = new Map();
+    s._agentGroups = new Map();
+    rebuildIndexes(s);
+    normalizeDelegateCards(s);
+    this.scheduleNotify();
+  }
+
+  /**
+   * 下一页归档 getSessionArchive 的 before 游标 = 当前已加载的最老 server `_seq`(server 返回
+   * `_seq < before` 的一页)。本地还没拉过归档时,最老 server 行即热尾巴首行(`_seq =
+   * archivedThroughSeq+1`)→ before 落在 archivedThroughSeq+1,取到最新归档页;每前插一页,最老
+   * `_seq` 下降 → 自然上翻。全无 `_seq`(纯乐观/未同步)→ 回退 archivedThroughSeq+1;都缺 → 0
+   * (server 按缺省取最新页)。
+   */
+  archiveBeforeSeq(sessId: string): number {
+    const s = this.sessions.get(sessId);
+    if (!s) return 0;
+    let min: number | null = null;
+    for (const m of s.messages) {
+      if (typeof m._seq === "number" && Number.isFinite(m._seq) && (min === null || m._seq < min)) min = m._seq;
+    }
+    if (min !== null) return min;
+    return typeof s._archivedThroughSeq === "number" && s._archivedThroughSeq > 0 ? s._archivedThroughSeq + 1 : 0;
   }
 
   /**

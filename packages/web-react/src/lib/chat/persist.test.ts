@@ -146,6 +146,23 @@ describe("socket — toStored 序列化", () => {
     expect(out._turnStartedAt).toBe(1_700_000_000_000);
   });
 
+  test("归档水位/计数随 toStored 落盘、loadStored 复原(reload 保住归档感知)", () => {
+    const s = socket();
+    const sess = s.ensureSession("s1", "main", "t");
+    addMessage(sess, "user", "hi");
+    sess._archivedThroughSeq = 42;
+    sess._archivedCount = 7;
+    const out = s.toStored("s1")!;
+    expect(out._archivedThroughSeq).toBe(42);
+    expect(out._archivedCount).toBe(7);
+    // 复原到一个新 socket 实例。
+    const s2 = socket();
+    s2.loadStored(out);
+    const restored = s2.sessions.get("s1")!;
+    expect(restored._archivedThroughSeq).toBe(42);
+    expect(restored._archivedCount).toBe(7);
+  });
+
   test("未知会话 toStored → null", () => {
     expect(socket().toStored("nope")).toBeNull();
   });
@@ -189,6 +206,59 @@ describe("socket — applyServerMessages 合并 server canonical", () => {
     s.applyServerMessages("s1", "main", [], false, 30);
     s.applyServerMessages("s1", "main", [], false, 10);
     expect(s.sessions.get("s1")!._maxSeq).toBe(30);
+  });
+
+  test("热尾巴：透传 archivedThroughSeq → 本地已归档旧行无条件保留 + 记录归档计数", () => {
+    const s = socket();
+    const sess = s.ensureSession("s1", "main");
+    const srv = (id: string, seq: number, text = ""): ChatMessage =>
+      ({ id, role: "assistant", text, ts: seq, _source: "server", _seq: seq }) as ChatMessage;
+    // 本地缓存全量 [1..4];server 归档 1、2,full 只回热尾巴 [3,4]。
+    sess.messages.push(srv("a1", 1), srv("a2", 2), srv("a3", 3), srv("a4", 4));
+    s.applyServerMessages("s1", "main", [srv("a3", 3, "S-3"), srv("a4", 4, "S-4")], true, 4, {
+      archivedThroughSeq: 2,
+      archivedCount: 2,
+    });
+    expect(sess.messages.map((m) => m.id)).toEqual(["a1", "a2", "a3", "a4"]); // 旧归档行不丢
+    expect(sess._archivedThroughSeq).toBe(2);
+    expect(sess._archivedCount).toBe(2);
+  });
+});
+
+describe("socket — 归档分页并入 / 游标", () => {
+  const srv = (id: string, seq: number, text = ""): ChatMessage =>
+    ({ id, role: "assistant", text, ts: seq, _source: "server", _seq: seq }) as ChatMessage;
+
+  test("prependArchivedMessages：前插 + 按 id 去重 + _seq 归位", () => {
+    const s = socket();
+    const sess = s.ensureSession("s1", "main");
+    sess.messages.push(srv("a5", 5), srv("a6", 6));
+    s.prependArchivedMessages("s1", [srv("a3", 3), srv("a4", 4), srv("a5", 5)]); // a5 重叠去重
+    expect(sess.messages.map((m) => m.id)).toEqual(["a3", "a4", "a5", "a6"]);
+  });
+
+  test("prependArchivedMessages：全部已存在 → 不改数组引用(零副作用)", () => {
+    const s = socket();
+    const sess = s.ensureSession("s1", "main");
+    sess.messages.push(srv("a5", 5));
+    const before = sess.messages;
+    s.prependArchivedMessages("s1", [srv("a5", 5)]);
+    expect(sess.messages).toBe(before);
+  });
+
+  test("archiveBeforeSeq：= 当前已加载的最老 server _seq(下一页 before 游标)", () => {
+    const s = socket();
+    const sess = s.ensureSession("s1", "main");
+    sess.messages.push(srv("a3", 3), srv("a4", 4));
+    expect(s.archiveBeforeSeq("s1")).toBe(3);
+  });
+
+  test("archiveBeforeSeq：无任何 server _seq 行 → 回退 archivedThroughSeq+1(取最新归档页)", () => {
+    const s = socket();
+    const sess = s.ensureSession("s1", "main");
+    addMessage(sess, "user", "乐观行无 _seq");
+    sess._archivedThroughSeq = 10;
+    expect(s.archiveBeforeSeq("s1")).toBe(11);
   });
 });
 

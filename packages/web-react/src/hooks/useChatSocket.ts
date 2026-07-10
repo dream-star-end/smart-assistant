@@ -83,16 +83,26 @@ export type UseChatSocket = {
     message?: string;
     updatedInput?: Record<string, unknown>;
   }) => void;
-  /** 历史加载：把 server canonical 消息合并进会话（server-wins / id 幂等）并落地。*/
+  /** 历史加载：把 server canonical 消息合并进会话（server-wins / id 幂等）并落地。
+   *  `archivedThroughSeq` 透传给 full 合并(热尾巴:本地 `_seq ≤ 水位`的旧行无条件保留)。*/
   mergeServerHistory: (p: {
     sessId: string;
     agentId: string;
     messages: ChatMessage[];
     full: boolean;
     maxSeq?: number;
+    archivedThroughSeq?: number;
+    archivedCount?: number;
   }) => void;
   /** server 增量游标（getSession 的 sinceSeq；无则 0=全量）。*/
   storedMaxSeq: (sessId: string | undefined) => number;
+  /**
+   * 归档滚动加载：从云端拉一页更早的归档历史(getSessionArchive)并前插进会话(只前插/按 id 去重,
+   * 不覆盖本地富卡)。返回本页结果供 UI 驱动"加载更多"按钮三态(loading/更多/无更多/失败可重试)。
+   */
+  loadOlderHistory: (
+    sessId: string | undefined,
+  ) => Promise<{ ok: boolean; loaded: number; hasMore: boolean; error?: boolean }>;
   /** 删除某会话的本地持久副本（与 removeSession 配套）。*/
   removePersisted: (sessId: string) => void;
   /** 清空当前 user 命名空间（登出隐私收尾）。*/
@@ -183,9 +193,13 @@ export function useChatSocket(opts: {
         try {
           const detail = await api.getSession(a, sessId);
           const serverMsgs = Array.isArray(detail.messages) ? (detail.messages as ChatMessage[]) : null;
-          // 只在 server 返回非空 tape 时合并——绝不用空结果抹掉活转录。
+          // 只在 server 返回非空 tape 时合并——绝不用空结果抹掉活转录。热尾巴:透传归档水位,
+          // 本地 `_seq ≤ archivedThroughSeq`的旧行才不会被"server 不认识 = 丢弃"误杀。
           if (serverMsgs && serverMsgs.length > 0) {
-            socket?.applyServerMessages(sessId, detail.agentId || sess.agentId, serverMsgs, true, detail.maxSeq);
+            socket?.applyServerMessages(sessId, detail.agentId || sess.agentId, serverMsgs, true, detail.maxSeq, {
+              archivedThroughSeq: detail.archivedThroughSeq,
+              archivedCount: detail.archivedCount,
+            });
           }
           sess._liveStreamBroken = false;
           persistRef.current(sessId); // server-wins 合并后落地新 tape + 游标
@@ -405,8 +419,36 @@ export function useChatSocket(opts: {
 
   const mergeServerHistory = useCallback<UseChatSocket["mergeServerHistory"]>(
     (p) => {
-      socket.applyServerMessages(p.sessId, p.agentId, p.messages, p.full, p.maxSeq);
-      persistRef.current(p.sessId); // 合并后落地（含推进的 _maxSeq 游标）
+      socket.applyServerMessages(p.sessId, p.agentId, p.messages, p.full, p.maxSeq, {
+        archivedThroughSeq: p.archivedThroughSeq,
+        archivedCount: p.archivedCount,
+      });
+      persistRef.current(p.sessId); // 合并后落地（含推进的 _maxSeq 游标 + 归档水位/计数）
+    },
+    [socket],
+  );
+  // 归档滚动加载并发闸(同会话在途不重入,防用户连点 / 组件重渲重复拉同一页)。
+  const olderHistoryFetchingRef = useRef<Set<string>>(new Set());
+  const loadOlderHistory = useCallback<UseChatSocket["loadOlderHistory"]>(
+    async (sessId) => {
+      const a = authRef.current;
+      if (!a || !sessId) return { ok: false, loaded: 0, hasMore: false };
+      if (olderHistoryFetchingRef.current.has(sessId)) return { ok: false, loaded: 0, hasMore: false };
+      olderHistoryFetchingRef.current.add(sessId);
+      try {
+        const before = socket.archiveBeforeSeq(sessId);
+        const page = await api.getSessionArchive(a, sessId, before);
+        const msgs = Array.isArray(page.messages) ? (page.messages as ChatMessage[]) : [];
+        if (msgs.length > 0) {
+          socket.prependArchivedMessages(sessId, msgs);
+          persistRef.current(sessId); // 前插后落地(下次 reload 直接展示已拉回的旧历史)
+        }
+        return { ok: true, loaded: msgs.length, hasMore: !!page.hasMore };
+      } catch {
+        return { ok: false, loaded: 0, hasMore: true, error: true }; // 失败:保留"可重试",hasMore 不封死
+      } finally {
+        olderHistoryFetchingRef.current.delete(sessId);
+      }
     },
     [socket],
   );
@@ -457,6 +499,7 @@ export function useChatSocket(opts: {
       respondPermission,
       mergeServerHistory,
       storedMaxSeq,
+      loadOlderHistory,
       removePersisted,
       wipePersistence,
       sendRepoBind,
@@ -479,6 +522,7 @@ export function useChatSocket(opts: {
       respondPermission,
       mergeServerHistory,
       storedMaxSeq,
+      loadOlderHistory,
       removePersisted,
       wipePersistence,
       sendRepoBind,

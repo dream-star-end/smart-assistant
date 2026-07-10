@@ -3,6 +3,7 @@ import type { ChatMessage } from "./chat/model";
 import {
   applyServerIncremental,
   dbNameForUser,
+  mergeArchivedHistory,
   mergeFullServerWins,
   SessionStore,
   type StoredSession,
@@ -502,6 +503,59 @@ describe("persist — 历史合并纯函数", () => {
     };
     const merged = applyServerIncremental([localRich], [incoming]);
     expect(merged.map((m) => m.id)).toEqual(["m-g", "srv-g2"]);
+  });
+});
+
+// ─── 热尾巴 / 归档合并（SESSION_ARCHIVE_DESIGN §3.2/§3.3） ────────────────────
+describe("persist — 热尾巴/归档合并", () => {
+  const srv = (id: string, seq: number, text = "", role: ChatMessage["role"] = "assistant"): ChatMessage => ({
+    id,
+    role,
+    text,
+    ts: seq, // ts=seq 便于断言排序稳定
+    _source: "server",
+    _seq: seq,
+  });
+
+  test("mergeFullServerWins(热尾巴): 本地 _seq ≤ 水位的已归档行无条件保留(server 只回热尾巴)", () => {
+    // 本地缓存有全量 [1..4];server 归档了 1、2(archivedThroughSeq=2),full 只回热尾巴 [3,4]。
+    const local = [srv("a1", 1), srv("a2", 2), srv("a3", 3), srv("a4", 4)];
+    const server = [srv("a3", 3, "S-3"), srv("a4", 4, "S-4")];
+    const merged = mergeFullServerWins(server, local, 2);
+    // 归档旧行(a1/a2)保留、不被"server 不认识 = 丢弃"误杀;热尾巴 server-wins。
+    expect(merged.map((m) => m.id)).toEqual(["a1", "a2", "a3", "a4"]);
+    expect(merged.find((m) => m.id === "a3")!.text).toBe("S-3");
+  });
+
+  test("mergeFullServerWins(热尾巴): 水位=0(未归档)时旧版行为不变——中段 server 不认识的助手仍丢弃", () => {
+    const local = [srv("a1", 1), srv("ghost", 2), srv("a3", 3)];
+    const server = [srv("a1", 1), srv("a3", 3)];
+    // archivedThroughSeq 缺省(0):ghost 不被"归档保留"覆盖,按旧规则中段陈旧助手丢弃。
+    const merged = mergeFullServerWins(server, local);
+    expect(merged.map((m) => m.id)).toEqual(["a1", "a3"]);
+  });
+
+  test("mergeFullServerWins: 保留中段 client-owned system 行(context_rebuilt 重建提示)", () => {
+    const sys: ChatMessage = { id: "sys-ctxrebuild-s1-f7", role: "system", text: "已重新加载会话上下文", ts: 2, _source: "local" };
+    const server = [srv("a1", 1, "S-1"), srv("a3", 3, "S-3")];
+    // 本地在两条 server 助手之间夹了一条 system 重建提示(无 _seq),server 从不产出 system 行。
+    const local = [srv("a1", 1), sys, srv("a3", 3)];
+    const merged = mergeFullServerWins(server, local);
+    expect(merged.map((m) => m.id)).toEqual(["a1", "sys-ctxrebuild-s1-f7", "a3"]); // system 行保留、按 ts 归位
+    expect(merged.find((m) => m.id === "sys-ctxrebuild-s1-f7")!.role).toBe("system");
+  });
+
+  test("mergeArchivedHistory: 前插 + 按 id 去重 + 按 _seq 归位", () => {
+    const local = [srv("a5", 5), srv("a6", 6)];
+    const archived = [srv("a3", 3), srv("a4", 4), srv("a5", 5)]; // a5 与本地重叠 → 去重
+    const merged = mergeArchivedHistory(local, archived);
+    expect(merged.map((m) => m.id)).toEqual(["a3", "a4", "a5", "a6"]); // 前插 + _seq 升序,不重复 a5
+  });
+
+  test("mergeArchivedHistory: 空归档 / 全部已存在 → 返回原引用(零拷贝)", () => {
+    const local = [srv("a5", 5), srv("a6", 6)];
+    expect(mergeArchivedHistory(local, [])).toBe(local);
+    expect(mergeArchivedHistory(local, [srv("a5", 5)])).toBe(local); // 全已在本地
   });
 });
 

@@ -181,6 +181,10 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
           messages: msgs,
           full: !detail.isPartial,
           maxSeq: detail.maxSeq,
+          // 热尾巴:server 可能只回 `_seq > archivedThroughSeq` 的一截;透传水位/计数,
+          // full 合并才不丢本地已归档旧行,并记录归档计数供 UI 展示。
+          archivedThroughSeq: detail.archivedThroughSeq,
+          archivedCount: detail.archivedCount,
         });
         historyFetchedAtRef.current.set(id, Date.now());
       } catch (e) {

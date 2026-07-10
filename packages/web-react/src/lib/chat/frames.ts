@@ -123,6 +123,20 @@ export type RelayReadyWire = { type: "sys.relay_ready"; peer?: Peer };
  *  build=服务端当前 oc-build id 字符串；appUpdate governor 据此在安全点软刷新长驻旧 bundle。*/
 export type FrontendBuildWire = { type: "sys.frontend_build"; build?: string };
 
+/**
+ * 上下文重建提示帧（容器 sessionManager 注入历史上下文成功后 emit,provider 切换 / 非原生续接场景）。
+ * 前端据此插入一条 client-owned 的 system 提示行(role:'system',文案 pure.contextRebuiltNotice),
+ * 告知用户"引擎已走兜底重建上下文,更早细节可能记不全"(boss 硬指标 3)。`messageCount` = 注入条数,
+ * `ts`/`frameSeq` 供 per-turn 幂等去重。**依赖 Agent B 在 protocol/frames.ts 补同名帧类型**;protocol
+ * 就绪前本地此 wire 定义即消费契约(同 FrontendBuildWire/RelayReadyWire 的本地补声明模式)。
+ */
+export type ContextRebuiltWire = {
+  type: "sys.context_rebuilt";
+  peer?: Peer;
+  agentId?: string;
+  messageCount?: number;
+} & WireRuntimeFields;
+
 /** server 已去重的 ack（drain 对账 + auto-continue 对账）。*/
 export type AckWire = {
   type: "outbound.ack";
@@ -173,6 +187,7 @@ export type OutboundWire =
   | ColdStartWire
   | RelayReadyWire
   | FrontendBuildWire
+  | ContextRebuiltWire
   | AckWire
   | PongWire
   | RepoStatusWire
