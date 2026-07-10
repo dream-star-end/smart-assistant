@@ -123,6 +123,14 @@ ssh kl-mirror 'curl -fsS http://127.0.0.1:18789/healthz'   # v3 应始终不受�
 ```
 **大量"bug"其实是"修复没上线/没进镜像/没进 dist"。先比对 /version 与 canonical tip,再看 §4 的生效面矩阵。**
 
+**用户报「请求ID」(响应底部 #xxxxxxxx)→ 一条 SQL 定位**(2026-07-10 起,0126 turn_traces,bridge 铸造点登记):
+```bash
+ssh kl-mirror 'psql "$DATABASE_URL" -c "select * from turn_traces where trace_id='"'"'<完整请求ID>'"'"'"'
+# → user_id / session_key / agent / model / 时间;再按 session_key 去容器 sessions.db(usage_log/event_log)
+#   或 codex rollout(~/.codex/sessions/<日期>/rollout-*.jsonl)drill down。
+# 注意 usage_records.request_id 是**上游请求 id**,与展示的 traceId 不同源,别拿去互查。
+```
+
 ### 3.1 前端问题(渲染/交互/移动端)
 1. 确认线上 dist 是否含改动:`ssh kl-mirror 'grep -rl "<特征串>" /opt/openclaude/openclaude-v5/packages/web-react/dist/assets/'`(SPA 有缓存,改 dist 必须重启 master)。
 2. 复现进单测:chat 帧问题构造帧序列打 `applyOutboundMessage`;持久化问题打 persist 纯函数。工具:`msgFrame()`/`sess()` in `lib/chat/chat.test.ts`。
