@@ -506,7 +506,7 @@ activate_staged() {
       exit 1
     fi
     local live_build
-    live_build="$(ssh "$KL_HOST" "curl -fsS http://127.0.0.1:${V5_PORT}/" | grep -o 'name=\"oc-build\" content=\"[0-9a-f]\\{8,32\\}\"' | grep -o '[0-9a-f]\\{8,32\\}' | head -1 || true)"
+    live_build="$(ssh "$KL_HOST" "curl -fsS http://127.0.0.1:${V5_PORT}/" | grep -o 'name=\"oc-build\" content=\"[0-9a-f]\{8,32\}\"' | grep -o '[0-9a-f]\{8,32\}' | head -1 || true)"
     [[ "$live_build" == "$expected_build" ]] || {
       echo "✗ live oc-build=$live_build,expected=$expected_build；重新停机" >&2
       ssh "$KL_HOST" "systemctl stop '$V5_UNIT'" || true
