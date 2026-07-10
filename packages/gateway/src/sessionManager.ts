@@ -473,6 +473,12 @@ export interface AgentSession {
   /** 本 turn 入站用户文本的服务端权威快照(≤8000 字,dispatchInbound 每 turn 刷新)。
    *  审查任务书(buildTeamReviewContext)的"用户原始需求"取此,不采信模型自报。 */
   _currentTurnUserText?: string
+  /** 本 turn 的 master canonical traceId(submit 每 turn 刷新,含 undefined 清除残留)。
+   *  市场使用信号(skillUsageReporter)在 tool.called(hub skill_view)派发时经
+   *  SessionManager.getByKey 同步读取,作为评分归因键。单一铸造权威在 master,此处只
+   *  中转 submit 已确定的 turnTraceId,不参与铸造。engine 中立(runner.traceId 是 CCB/
+   *  codex 私有、不在 EngineAdapter 契约上,故落到 session 提供统一读点)。 */
+  _currentTurnTraceId?: string
 }
 
 // Re-export from ccbMessageParser so existing imports keep working
@@ -1714,6 +1720,11 @@ export class SessionManager {
       // stdin JSON-RPC 扩展。Lock 保证 setTraceId 与并发 submit() 串行,不会
       // 跨 turn 互踩。
       if (traceId !== undefined) session.runner.setTraceId(traceId)
+      // 市场使用信号(skillUsageReporter)读点:本 turn 的 canonical traceId 落到 session,
+      // 供 tool.called(hub skill_view)上报方在 turn 执行期同步取到评分归因键。**无条件**
+      // 赋值(含 undefined):清除上一 turn 残留,避免把旧 traceId 误配到本 turn 的使用事件。
+      // 与上面的 runner.setTraceId 同点、同 lock 串行;单一权威仍是 master 注入的 turnTraceId。
+      session._currentTurnTraceId = traceId
       // v5 codex route(A1):与 effort/model 同点、同 lock 串行地在 turn 启动前
       // 应用。CodexAppServerRunner 在 runTurn 顶部比对 route 签名,变化时自行
       // shutdown + respawn(spawn 期 -c 参数),这里只 stash,不参与下方
