@@ -35,8 +35,8 @@ export type PlatformReasoningEffort = (typeof PLATFORM_REASONING_EFFORTS)[number
  * 顺序有产品语义:第一项同时是 codex seed / 团队模式队长默认型号。
  */
 export const CODEX_ENGINE_MODELS = [
-  { id: 'gpt-5.6-sol', displayName: 'GPT-5.6-Sol', defaultReasoningEffort: 'low' },
-  { id: 'gpt-5.6-terra', displayName: 'GPT-5.6-Terra', defaultReasoningEffort: 'medium' },
+  { id: 'gpt-5.6-sol', displayName: 'GPT-5.6-Sol', defaultReasoningEffort: 'xhigh' },
+  { id: 'gpt-5.6-terra', displayName: 'GPT-5.6-Terra', defaultReasoningEffort: 'xhigh' },
   { id: 'gpt-5.6-luna', displayName: 'GPT-5.6-Luna', defaultReasoningEffort: 'medium' },
 ] as const satisfies readonly {
   id: string

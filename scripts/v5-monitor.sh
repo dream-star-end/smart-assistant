@@ -2,10 +2,10 @@
 # v5 监控告警最小集 —— 高频探活(roadmap P0.3)
 #
 # 干啥(简单粗暴,ops 极简,不引外部监控系统):
-#   每 2 分钟(openclaude-v5-monitor.timer)跑一轮 10 项检查:
+#   每 2 分钟(openclaude-v5-monitor.timer)跑一轮检查:
 #     1. systemd:openclaude-v5 / openclaude-v5-egress 必须 active
 #     2. HTTP 探活:v5 healthz("ok":true + channel=v5)、egress("role":"egress")、
-#        v3 healthz(同机共库,v3 挂了同样要报)
+#        公网 Caddy route；v3 已退役，只有 V5MON_CHECK_V3=1 才探测
 #     3. 磁盘 / 与 /var 使用率 >85% 告警;内存 available <10% 告警
 #     4. 容器池:v5-ccb 容器数 >20 告警(异常暴涨);OC_RUNTIME_IMAGE 指向的镜像
 #        必须存在于 docker images(防 tag 漂移 → 起容器全挂)
@@ -41,6 +41,8 @@ MEMINFO="${V5MON_MEMINFO:-/proc/meminfo}"
 V5_HEALTH_URL="${V5MON_V5_URL:-http://127.0.0.1:18790/healthz}"
 EGRESS_HEALTH_URL="${V5MON_EGRESS_URL:-http://172.31.0.1:18892/internal/v5/egress-health}"
 V3_HEALTH_URL="${V5MON_V3_URL:-http://127.0.0.1:18789/healthz}"
+PUBLIC_HEALTH_URL="${V5MON_PUBLIC_URL:-http://127.0.0.1/healthz}"
+MAINTENANCE_FILE="${V5MON_MAINTENANCE_FILE:-/run/openclaude-v5/planned-maintenance.json}"
 
 DISK_MAX_PCT=85        # / 与 /var 使用率上限(%)
 MEM_MIN_AVAIL_PCT=10   # MemAvailable/MemTotal 下限(%)
@@ -80,6 +82,18 @@ check_http() { # <name> <url> <jq 断言> <人话>
   fi
   if echo "$body" | jq -e "$3" >/dev/null 2>&1; then record "$1" ok "$4 正常"
   else record "$1" bad "$4 响应形状不对:$(echo "$body" | head -c 120)"; fi
+}
+
+check_public_route() {
+  local body
+  if ! body="$(curl -fsS --max-time "$CURL_TIMEOUT" -H 'Host: claudeai.chat' "$PUBLIC_HEALTH_URL" 2>&1)"; then
+    record public_route bad "Caddy public route curl 失败:$(echo "$body" | head -c 120)"; return
+  fi
+  if echo "$body" | jq -e '.ok == true and .channel == "v5"' >/dev/null 2>&1; then
+    record public_route ok "Caddy public route → v5 正常"
+  else
+    record public_route bad "Caddy public route 响应不是 v5/ok:$(echo "$body" | head -c 120)"
+  fi
 }
 
 check_disk() { # <name> <mount>
@@ -123,7 +137,10 @@ check_service svc_v5     openclaude-v5
 check_service svc_egress openclaude-v5-egress
 check_http http_v5     "$V5_HEALTH_URL"     '.ok == true and .channel == "v5"'   "v5 healthz"
 check_http http_egress "$EGRESS_HEALTH_URL" '.ok == true and .role == "egress"'  "egress health"
-check_http http_v3     "$V3_HEALTH_URL"     '.ok == true'                        "v3 healthz(同机共库)"
+check_public_route
+if [[ "${V5MON_CHECK_V3:-0}" == 1 ]]; then
+  check_http http_v3 "$V3_HEALTH_URL" '.ok == true' "v3 healthz(显式启用)"
+fi
 check_disk disk_root /
 check_disk disk_var  /var
 check_mem
@@ -143,9 +160,36 @@ EVENTS=()          # 本轮要进告警正文的行
 HAS_BAD_EVENT=0    # 有新坏/持续坏提醒 → level=warning;纯恢复 → info
 BAD_LIST=()        # 当前所有坏项(进日志摘要)
 
+# Planned maintenance 只压住三项“预期随 master 停机”的检查。marker 必须
+# root:root 0600、绑定本机、nonce 合法且未过期；任何解析/权限/过期问题都
+# fail-open，即继续正常报警。egress/disk/mem/pool/image 永远不受影响。
+MAINTENANCE_ACTIVE=0
+if [[ -f "$MAINTENANCE_FILE" ]]; then
+  marker_owner="$(stat -c '%U:%G' "$MAINTENANCE_FILE" 2>/dev/null || true)"
+  marker_mode="$(stat -c '%a' "$MAINTENANCE_FILE" 2>/dev/null || true)"
+  marker_schema="$(jq -r '.schema // 0' "$MAINTENANCE_FILE" 2>/dev/null || echo 0)"
+  marker_host="$(jq -r '.host // empty' "$MAINTENANCE_FILE" 2>/dev/null || true)"
+  marker_nonce="$(jq -r '.nonce // empty' "$MAINTENANCE_FILE" 2>/dev/null || true)"
+  marker_deadline="$(jq -r '.deadline // 0' "$MAINTENANCE_FILE" 2>/dev/null || echo 0)"
+  if [[ "$marker_owner" == root:root && "$marker_mode" == 600 && "$marker_schema" == 1 &&
+        "$marker_host" == "$(hostname -f)" && "$marker_nonce" =~ ^[0-9a-f]{32}$ &&
+        "$marker_deadline" =~ ^[0-9]+$ && "$marker_deadline" -ge "$NOW" ]]; then
+    MAINTENANCE_ACTIVE=1
+    log "PLANNED maintenance nonce=$marker_nonce deadline=$marker_deadline"
+  else
+    log "WARN invalid/expired maintenance marker; fail-open to normal alerts"
+  fi
+fi
+
 for name in "${CHECK_NAMES[@]}"; do
   st="${CHECK_ST[$name]}"; detail="${CHECK_DETAIL[$name]}"
   case "$SKIP" in *",$name,"*) log "SKIP  $name(V5MON_SKIP)"; continue;; esac
+  if [[ "$MAINTENANCE_ACTIVE" == 1 && "$name" =~ ^(svc_v5|http_v5|public_route)$ ]]; then
+    log "PLANNED $name: $detail"
+    NEW_STATE="$(echo "$NEW_STATE" | jq --arg k "$name" \
+      '.checks[$k] = {status:"planned", since:0, last_alert:0}')"
+    continue
+  fi
   prev="$(echo "$OLD_STATE" | jq -r --arg k "$name" '.checks[$k].status // "ok"')"
   since="$(echo "$OLD_STATE" | jq -r --arg k "$name" '.checks[$k].since // 0')"
   last_alert="$(echo "$OLD_STATE" | jq -r --arg k "$name" '.checks[$k].last_alert // 0')"
@@ -178,7 +222,7 @@ if [ "${#BAD_LIST[@]}" -gt 0 ]; then
   log "RUN bad=${#BAD_LIST[@]} [${BAD_LIST[*]}]"
   for name in "${BAD_LIST[@]}"; do log "  BAD $name: ${CHECK_DETAIL[$name]}"; done
 else
-  log "RUN ok(10 项全过)"
+  log "RUN ok(${#CHECK_NAMES[@]} 项全过)"
 fi
 
 # ───────────────────────────────────────────────

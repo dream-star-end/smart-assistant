@@ -2,13 +2,13 @@
 
 > ops 极简哲学:两个 systemd timer + 两个 bash 脚本,不引外部监控系统。
 > 告警首选 v5 站内信(发给 boss),全量兜底落 `/var/log/openclaude-v5-monitor.log`。
-> 最后校准:2026-07-05。
+> 最后校准:2026-07-10。
 
 ## 组成
 
 | 文件 | 作用 |
 |---|---|
-| `scripts/v5-monitor.sh` | 高频探活(每 2 分钟):服务/healthz/磁盘/内存/容器池/镜像 tag,共 10 项 |
+| `scripts/v5-monitor.sh` | 高频探活(每 2 分钟):服务/internal+public healthz/磁盘/内存/容器池/镜像 tag；v3 默认关闭 |
 | `scripts/v5-daily-check.sh` | 日检(每天 09:00 北京时间):计费突增/免单率 + 日报(无告警也发) |
 | `deploy/v5/openclaude-v5-monitor.service/.timer` | 探活的 systemd 单元(`OnCalendar=*:0/2`) |
 | `deploy/v5/openclaude-v5-daily.service/.timer` | 日检的 systemd 单元(`OnCalendar=*-*-* 09:00:00 Asia/Shanghai`,Persistent 补跑) |
@@ -44,7 +44,8 @@ tail -f /var/log/openclaude-v5-monitor.log       # 2 分钟内应出现 "RUN ok(
 | `svc_egress` | `systemctl is-active openclaude-v5-egress` | ≠active | LLM 出站面死 = 所有生成挂 |
 | `http_v5` | `GET 127.0.0.1:18790/healthz` | 非 `"ok":true` + `channel:"v5"` | 进程活但端口不响应/串台(channel 断言防 v3/v5 错位)。`ok` 含 **sessions.db 深度探活**(`deps.sessionsDb`,master 形态 open+SELECT 1):DB open 失败 = list/save/落库全崩但进程活着,2026-07-06 事故正是此形态两小时无告警;探活失败 healthz 仍回 HTTP 200(不给 LB 摘流量信号),仅 `ok:false` 供本监控与 deploy smoke 消费 |
 | `http_egress` | `GET 172.31.0.1:18892/internal/v5/egress-health` | 非 `"ok":true` + `role:"egress"` | 容器出站面探活(容器网段视角) |
-| `http_v3` | `GET 127.0.0.1:18789/healthz` | 非 `"ok":true` | 同机共库,v3 挂了殃及池鱼,同样要报 |
+| `public_route` | `Host: claudeai.chat GET 127.0.0.1/healthz` | 非 `"ok":true` + `channel:"v5"` | 覆盖 Caddy→v5 的真实公网路由，能直接发现 Cloudflare 502 的源头 |
+| `http_v3` | `GET 127.0.0.1:18789/healthz` | 非 `"ok":true` | v3 已退役，默认不运行；仅显式 `V5MON_CHECK_V3=1` 时保留兼容检查 |
 | `disk_root` / `disk_var` | `df /` 与 `df /var` 使用率 | >85% | PG/docker/日志都在盘上;85% 留出扩容反应时间(线上当前 73%) |
 | `mem` | MemAvailable/MemTotal | <10% | OOM 前兆;容器池机器内存吃紧会连环 OOM kill |
 | `pool` | `docker ps` 中 v5-ccb 镜像容器数 | >20 | 灰度期稳态 ~1-5;>20 = 回收失灵或被刷。docker daemon 不响应也在此项报 |
@@ -87,17 +88,19 @@ scripts/v5-daily-check.sh:  SPIKE_ABS_MIN / SPIKE_MULT / WAIVE_PCT_MAX / WAIVE_M
 
 注意:脚本经 `deploy-v5.sh` rsync 分发,**线上直接改会被下次部署覆盖** —— 改阈值要改在仓里(worktree → canonical → 部署),和其他 v5 代码同纪律。
 
-## 如何静默
+## 计划维护与静默
+
+`deploy-v5.sh` 的受控离线状态机会原子写入 root:root 0600 的
+`/run/openclaude-v5/planned-maintenance.json`（host+nonce+deadline）。有效期内只把
+`svc_v5/http_v5/public_route` 标成 planned；`svc_egress/http_egress/disk/mem/pool/image`
+始终正常报警。marker 解析失败、权限不对、host 不匹配或过期一律 fail-open。激活或
+恢复后脚本自动删除 marker；不要为了普通部署手工创建它。
 
 ```bash
-# 整体停(维护窗口等)
-systemctl stop openclaude-v5-monitor.timer        # 恢复:start
-systemctl disable --now openclaude-v5-monitor.timer   # 长停
-
-# 单项静默(如 v3 计划内维护不想收 http_v3 告警)
+# 只有排障噪音时才人工单项 SKIP；不要停整个监控 timer。
 systemctl edit openclaude-v5-monitor.service
 # [Service]
-# Environment="V5MON_SKIP=http_v3"      ← 逗号分隔多项;删掉 drop-in 即恢复
+# Environment="V5MON_SKIP=pool"      ← 逗号分隔多项;删掉 drop-in 即恢复
 systemctl daemon-reload
 ```
 
