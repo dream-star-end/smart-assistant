@@ -567,3 +567,110 @@ export function formatValue(v: unknown): string {
 export function clampStr(s: string, max: number): string {
   return s.length > max ? s.slice(0, max) + "…" : s;
 }
+
+// ── legacy Bash 包装剥离(展示层兜底)─────────────────────────────────────────
+//
+// 权威剥壳在后端 runner 的发射时刻(gateway codexAppServerRunner.stripShellWrapper,
+// 2026-07-10 起新帧的 command 已剥好)。但历史消息落库时带着 `/bin/bash -lc '…'`
+// 包装,落库数据不可变,只能在展示层兜底 —— 与 normalizeToolForDisplay 的孤儿
+// 'unknown' 兜底同一定位:后端修发射,前端救历史。语义与后端保持同一份
+// (最小 POSIX 引号分词);改任何一边必须同步另一边。
+
+/** 识别 `/bin/(ba)?sh -l?c <arg>` 包装:恰好一个 shell word → 返回解包命令;
+ *  解析失败/多 word → 保守只剥前缀;非包装 → 原样。 */
+export function stripShellWrapperForDisplay(cmd: string): string {
+  const m = cmd.match(/^\/bin\/(?:ba)?sh\s+-l?c\s+([\s\S]*)$/);
+  if (!m) return cmd;
+  const rest = m[1];
+  const words = tokenizeShellWords(rest);
+  if (words && words.length === 1) return words[0];
+  return rest;
+}
+
+/** 最小 POSIX shell 单词分词器(与 gateway 同语义):单引号全字面;双引号内
+ *  反斜杠仅对 `\ " $ \``/续行生效;裸段反斜杠转义;相邻段拼接;未闭合引号返 null。 */
+function tokenizeShellWords(input: string): string[] | null {
+  const words: string[] = [];
+  let buf = "";
+  let inWord = false;
+  let i = 0;
+  const n = input.length;
+  while (i < n) {
+    const ch = input[i];
+    if (ch === " " || ch === "\t" || ch === "\n") {
+      if (inWord) {
+        words.push(buf);
+        buf = "";
+        inWord = false;
+      }
+      i++;
+      continue;
+    }
+    if (ch === "'") {
+      inWord = true;
+      i++;
+      let closed = false;
+      while (i < n) {
+        if (input[i] === "'") {
+          closed = true;
+          i++;
+          break;
+        }
+        buf += input[i];
+        i++;
+      }
+      if (!closed) return null;
+      continue;
+    }
+    if (ch === '"') {
+      inWord = true;
+      i++;
+      let closed = false;
+      while (i < n) {
+        const c = input[i];
+        if (c === '"') {
+          closed = true;
+          i++;
+          break;
+        }
+        if (c === "\\" && i + 1 < n) {
+          const nx = input[i + 1];
+          if (nx === "\\" || nx === '"' || nx === "$" || nx === "`") {
+            buf += nx;
+            i += 2;
+            continue;
+          }
+          if (nx === "\n") {
+            i += 2;
+            continue;
+          }
+        }
+        buf += c;
+        i++;
+      }
+      if (!closed) return null;
+      continue;
+    }
+    if (ch === "\\") {
+      inWord = true;
+      if (i + 1 < n) {
+        const nx = input[i + 1];
+        if (nx === "\n") {
+          i += 2;
+          continue;
+        }
+        buf += nx;
+        i += 2;
+        continue;
+      }
+      buf += ch;
+      i++;
+      continue;
+    }
+    inWord = true;
+    buf += ch;
+    i++;
+  }
+  if (inWord) words.push(buf);
+  return words;
+}

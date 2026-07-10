@@ -29,7 +29,7 @@ import { TurnActivity, type TurnActivityInfo } from "./chat/TurnActivity";
 import { currentTurnStartIndex } from "./chat/turnSegment";
 import { loadedArchivedCount, planLoadMore } from "./chat/archivePaging";
 import { MessageBoundary } from "./MessageBoundary";
-import { asStr, resolveToolInput } from "./tool/format";
+import { asStr, resolveToolInput, stripShellWrapperForDisplay } from "./tool/format";
 import { researchToolCard } from "./tool/researchCards";
 import { Alert, Avatar, Spinner } from "./ui";
 
@@ -73,7 +73,7 @@ export const MessageRenderer = memo(
         }
         // oc-* 研究工具:直接渲染干净的专属卡片,**去掉"终端 + 命令"外壳**(boss 反馈套壳没必要)。
         // 命令出错时 researchToolCard 返回 null → 回落 ToolCardSlot 终端卡,保证报错可见。
-        const ocCmd = asStr(resolveToolInput(message)?.command);
+        const ocCmd = stripShellWrapperForDisplay(asStr(resolveToolInput(message)?.command));
         if (ocCmd) {
           const ocCard = researchToolCard(ocCmd, message);
           if (ocCard) return <div className="px-0.5 py-1">{ocCard}</div>;

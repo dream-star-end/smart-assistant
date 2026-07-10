@@ -38,7 +38,7 @@ import {
   type LucideIcon,
 } from "lucide-react";
 import { agentDisplayName } from "../chat/agentNames";
-import { asArr, asStr, detectShellFileWrites, parseCodexTypeName, shortPath } from "./format";
+import { asArr, asStr, detectShellFileWrites, parseCodexTypeName, shortPath, stripShellWrapperForDisplay } from "./format";
 
 /** 工具卡图标底色语义(对齐设计稿 aurora-conversation-cards 的 .tic.tn-* 分色)。 */
 export type ToolTone = "accent" | "success" | "info" | "warning" | "neutral";
@@ -275,7 +275,8 @@ export function resolveToolMeta(
 ): ToolMeta {
   // Bash 命令若调用 oc-* CLI,给专属语义卡而非通用"终端"卡。
   if (name === "Bash" && input) {
-    const command = asStr(input.command);
+    // 展示层剥壳兜底(历史消息带 /bin/bash -lc 包装),否则 oc-*/写文件检测在包装内失配。
+    const command = stripShellWrapperForDisplay(asStr(input.command));
     const fileWrite = detectShellFileWrites(command);
     if (fileWrite) {
       // 写入记忆文件(heredoc 写 MEMORY.md/记忆目录等)→ 记忆更新;否则普通写入文件。
@@ -323,7 +324,7 @@ export function toolSummary(name: string, input: Record<string, unknown> | null)
   if (!input) return "";
   switch (name) {
     case "Bash": {
-      const cmd = asStr(input.command);
+      const cmd = stripShellWrapperForDisplay(asStr(input.command));
       const fileWrite = detectShellFileWrites(cmd);
       if (fileWrite) {
         const first = shortPath(fileWrite.paths[0]);
