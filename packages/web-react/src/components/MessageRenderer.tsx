@@ -54,7 +54,7 @@ type RendererProps = {
 };
 
 export const MessageRenderer = memo(
-  function MessageRenderer({ message, isLast, sending, inActiveTurn, turnActivity, delegateCost, cb, onRespondPermission }: RendererProps) {
+  function MessageRenderer({ message, sig, isLast, sending, inActiveTurn, turnActivity, delegateCost, cb, onRespondPermission }: RendererProps) {
     const ctx = { isLast, sending, turnActivity, inActiveTurn };
     switch (messageKind(message)) {
       case "user":
@@ -62,7 +62,9 @@ export const MessageRenderer = memo(
       case "assistant":
         return <AssistantCard msg={message} ctx={ctx} cb={cb} />;
       case "thinking":
-        return <ThinkingCard msg={message} ctx={ctx} />;
+        // 单条兜底路径(直接经 MessageRenderer,如测试/非列表场景)。列表内的连续 thinking
+        // 由 MessageList/coalesceTeam 合并成单张多段卡,不走这里。
+        return <ThinkingCard msgs={[message]} sig={sig} ctx={ctx} />;
       case "tool": {
         // 任务列表(TodoWrite):当前活跃段且本轮进行中 → 由钉在输入框上方的 PinnedTaskTracker
         // (HUD)接管,inline 卡抑制避免上下重复;历史段(或 turn 已结束、HUD 隐藏后)渲染
@@ -113,11 +115,13 @@ export const MessageRenderer = memo(
 
 const LOAD_MORE_STEP = 100;
 
-/** 渲染项:普通单条消息(idx 为全局下标,供活跃段归属判定),或"连续多个委派智能体聚成的团队"。
+/** 渲染项:普通单条消息(idx 为全局下标,供活跃段归属判定),或"连续多个委派智能体聚成的团队",
+ *  或"连续多个 role=thinking 行合并成的单张多段思考卡"。
  *  delegateCost / delegateCosts = 债D per-delegate 成本(见 coalesceTeam)。 */
 type RenderItem =
   | { kind: "single"; m: ChatMessage; isLast: boolean; idx: number; delegateCost?: string }
-  | { kind: "team"; members: ChatMessage[]; sig: string; delegateCosts?: Record<string, string> };
+  | { kind: "team"; members: ChatMessage[]; sig: string; delegateCosts?: Record<string, string> }
+  | { kind: "thinking"; members: ChatMessage[]; sig: string; isLast: boolean; idx: number };
 
 /**
  * 把「队长**同一并行批次**委派的多个 agent-group」聚成一个团队项(≥2 → TeamPanel;单个
@@ -194,9 +198,12 @@ function coalesceTeam(messages: ChatMessage[], start: number, sending: boolean):
   }
   const items: RenderItem[] = [];
   const emittedTeam = new Set<string>();
+  // 连续 thinking 行合并:被吸收进某组的 thinking 行(首条除外)记入此集,外层循环跳过它们。
+  const consumedThinking = new Set<number>();
   for (let i = 0; i < slice.length; i++) {
     const m = slice[i];
     const absIdx = start + i;
+    if (consumedThinking.has(absIdx)) continue; // 已并入上方某思考卡 → 吸收跳过
     if (isPanelMember(m)) {
       const batchKey = batchKeyOf(absIdx);
       if ((teamCount.get(batchKey) ?? 0) >= 2) {
@@ -232,6 +239,35 @@ function coalesceTeam(messages: ChatMessage[], start: number, sending: boolean):
     if (messageKind(m) === "agent-group") {
       // 面板外的 agent-group(隐藏审查员卡/独居成员):单卡按时序渲染,委派成本徽记照常。
       items.push({ kind: "single", m, isLast: absIdx === total - 1, idx: absIdx, delegateCost: costFor(absIdx, m) });
+      continue;
+    }
+    if (messageKind(m) === "thinking") {
+      // 连续 thinking 行合并成单张多段卡(codex 一轮产十几条空正文标题卡)。中间夹**被跳过/
+      // 不渲染的行**(messageKind==='unknown',渲染层本就静默)透明跳过不断组;任何会渲染的
+      // 非 thinking 行(assistant/tool/agent-group 等)断组。参考 render.ts unknown 跳过 + 上方
+      // coalesceTeam 混排不劈裂先例。
+      const members: ChatMessage[] = [];
+      let lastAbs = absIdx;
+      for (let j = i; j < slice.length; j++) {
+        const kj = messageKind(slice[j]);
+        if (kj === "thinking") {
+          members.push(slice[j]);
+          consumedThinking.add(start + j);
+          lastAbs = start + j;
+        } else if (kj === "unknown") {
+          continue; // 透明跳过(不打断连续性;该行仍会被外层循环按原位渲染成 null)
+        } else {
+          break;
+        }
+      }
+      // 组"live"取决于末条 thinking 是否为全列表末行且本轮在流(thinking isLive 语义)。
+      const groupIsLast = lastAbs === total - 1;
+      // 组 sig = 各成员签名拼接(仅末条按 groupIsLast 参与 isLast;文本 + 流式态都编进,
+      // 后到成员/流式完成时 memo 正常重渲防漏渲)。key 用首条成员 id → 流式追加成员时稳定不重挂。
+      const sig = members
+        .map((mm, k) => messageSignature(mm, { isLast: groupIsLast && k === members.length - 1, sending }))
+        .join("||");
+      items.push({ kind: "thinking", members, sig, isLast: groupIsLast, idx: absIdx });
       continue;
     }
     items.push({ kind: "single", m, isLast: absIdx === total - 1, idx: absIdx });
@@ -343,6 +379,15 @@ export function MessageList({
           return (
             <MessageBoundary key={it.members[0].id} messageId={it.members[0].id} sig={it.sig}>
               <TeamPanel members={it.members} sig={it.sig} delegateCosts={it.delegateCosts} />
+            </MessageBoundary>
+          );
+        }
+        if (it.kind === "thinking") {
+          // 合并思考卡:key 稳定在**组内首条**消息 id(流式追加成员时不重挂,防闪);
+          // memo 由 ThinkingCard 内层 sig 比较把关(与 TeamPanel 同款)。
+          return (
+            <MessageBoundary key={it.members[0].id} messageId={it.members[0].id} sig={it.sig}>
+              <ThinkingCard msgs={it.members} sig={it.sig} ctx={{ isLast: it.isLast, sending }} />
             </MessageBoundary>
           );
         }

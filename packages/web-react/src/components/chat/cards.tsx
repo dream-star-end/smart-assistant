@@ -22,7 +22,7 @@ import {
   Volume2,
   Wallet,
 } from "lucide-react";
-import { useEffect, useState } from "react";
+import { memo, useEffect, useState } from "react";
 import type { ChatMessage } from "../../lib/chat/model";
 import {
   CONTINUE_PROMPT,
@@ -32,7 +32,7 @@ import {
   isLive,
   stripMarkdown,
 } from "../../lib/chat/render";
-import { sanitizeThinkingText } from "../../lib/thinkingText";
+import { thinkingSegments, thinkingSummaryTitle } from "../../lib/thinkingText";
 import { cn, groupDigits } from "../../lib/utils";
 import { Markdown } from "../Markdown";
 import { Alert, Avatar, Badge, Button, IconButton } from "../ui";
@@ -410,43 +410,69 @@ function TypingDots() {
 }
 export { TypingDots };
 
-// ═══════════════ thinking（💭 折叠） ═══════════════
-export function ThinkingCard({
-  msg,
-  ctx,
-}: {
-  msg: ChatMessage;
-  ctx: RenderCtx;
-}) {
-  const live = isLive(msg, ctx);
-  const [userCollapsed, setUserCollapsed] = useState<boolean | null>(null);
-  const collapsed = userCollapsed ?? defaultCollapsed(msg, ctx);
-  const cleanText = msg.text ? sanitizeThinkingText(msg.text) : "";
-  return (
-    <div className="rounded-lg border border-border bg-surface/60 animate-in">
-      <button
-        type="button"
-        onClick={() => setUserCollapsed(!collapsed)}
-        className="flex w-full items-center gap-2 px-3.5 py-2 text-left text-[13px] text-muted hover:bg-hover"
-      >
-        <Brain size={14} className="text-faint" />
-        <span className="font-medium">{live ? "思考中…" : "已思考"}</span>
-        <ChevronRight
-          size={14}
-          className={cn("ml-auto text-faint transition-transform", !collapsed && "rotate-90")}
-        />
-      </button>
-      {!collapsed && cleanText && (
-        <div className="border-t border-border px-3.5 py-2.5 text-[13.5px] leading-relaxed whitespace-pre-wrap break-words text-muted">
-          {cleanText}
-          {live && (
-            <span className="caret-blink ml-0.5 inline-block h-[1em] w-[2px] translate-y-[2px] bg-muted" />
-          )}
-        </div>
-      )}
-    </div>
-  );
-}
+// ═══════════════ thinking（💭 折叠，多段合并） ═══════════════
+// **连续的 role=thinking 行由渲染层(MessageRenderer.coalesceTeam)合并成一组**传入 `msgs`：
+// 每条消息一段，逐段 sanitize（剥 `<!-- -->` 噪音）、丢空段，正文走仓内 Markdown（`**标题**`
+// 渲染为粗体而非裸星号，色/字号收敛到 muted）。折叠态标题取最新段首个粗体标题作摘要。
+// memo 比较键 = sig（组内各成员签名拼接，编入文本 + 流式态），reducer 就地 mutate 下防漏渲/防闪。
+export const ThinkingCard = memo(
+  function ThinkingCard({
+    msgs,
+    ctx,
+  }: {
+    msgs: ChatMessage[];
+    ctx: RenderCtx;
+    /** 分组渲染签名(memo 比较键)。所有调用方必须传，否则 memo 会误判为无变化。*/
+    sig?: string;
+  }) {
+    // 组内任一行流式中 → 整卡"思考中"。thinking 的 isLive 只看 isLast&&sending（末条 thinking
+    // 才可能在流；被后续内容挤下末位的 thinking 自动转完成态），故取组末条判定即代表整组。
+    const live = isLive(msgs[msgs.length - 1] ?? { role: "thinking" }, ctx);
+    const [userCollapsed, setUserCollapsed] = useState<boolean | null>(null);
+    // 默认折叠态权威仍走 render 层 defaultCollapsed（thinking：流式展开、完成折叠）；用户手动切换后本地锁定。
+    const collapsed = userCollapsed ?? defaultCollapsed({ role: "thinking" }, ctx);
+    const segments = thinkingSegments(msgs.map((m) => m.text));
+    // 折叠态摘要：完成后取最新段首个粗体标题；流式中保持"思考中…"（避免摘要随 delta 抖动）。
+    const summary = live ? null : thinkingSummaryTitle(segments);
+    const headline = live ? "思考中…" : summary ? `已思考 · ${summary}` : "已思考";
+    return (
+      <div className="rounded-lg border border-border bg-surface/60 animate-in">
+        <button
+          type="button"
+          onClick={() => setUserCollapsed(!collapsed)}
+          className="flex w-full items-center gap-2 px-3.5 py-2 text-left text-[13px] text-muted hover:bg-hover"
+        >
+          <Brain size={14} className="shrink-0 text-faint" />
+          <span className="min-w-0 truncate font-medium">{headline}</span>
+          <ChevronRight
+            size={14}
+            className={cn("ml-auto shrink-0 text-faint transition-transform", !collapsed && "rotate-90")}
+          />
+        </button>
+        {!collapsed && segments.length > 0 && (
+          <div className="border-t border-border px-3.5 py-2.5">
+            {segments.map((seg, i) => (
+              <div
+                key={i}
+                className={cn(
+                  // muted 色 + 13.5px 收敛 prose 到思考卡语境；段间轻分隔线。
+                  "text-[13.5px] leading-relaxed text-muted [&_.prose]:text-[13.5px] [&_.prose]:leading-relaxed [&_.prose]:text-inherit [&_.prose_p]:mb-1.5 [&_.prose_p:last-child]:mb-0",
+                  i > 0 && "mt-2.5 border-t border-border/60 pt-2.5",
+                )}
+              >
+                <Markdown>{seg}</Markdown>
+              </div>
+            ))}
+            {live && (
+              <span className="caret-blink ml-0.5 inline-block h-[1em] w-[2px] translate-y-[2px] bg-muted" />
+            )}
+          </div>
+        )}
+      </div>
+    );
+  },
+  (a, b) => a.sig === b.sig,
+);
 
 // ═══════════════ plan ═══════════════
 const STEP_DOT: Record<string, string> = {
