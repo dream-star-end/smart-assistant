@@ -22,6 +22,7 @@
  */
 
 import type { IncomingMessage, ServerResponse } from "node:http";
+import type Docker from "dockerode";
 import { HttpError, sendJson } from "../util.js";
 import { requireAdmin, requireAdminVerifyDb } from "../../admin/requireAdmin.js";
 import { writeAdminAudit } from "../../admin/audit.js";
@@ -73,6 +74,24 @@ export function serializeContainer(r: AdminContainerRowView): Record<string, unk
 }
 
 const HOST_UUID_RE = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
+
+/**
+ * admin 容器操作(logs/restart/stop/remove)的 docker 句柄解析 —— v5 收口(2026-07-10)。
+ *
+ * 历史 bug:handler 把 `deps.agentRuntime` 当硬门(只为拿 dockerode 句柄),v3 master 上
+ * 它恒存在所以从未暴露;v5 master 有意不装配 agentRuntime(healthz agentRuntime:disabled,
+ * 容器面走 v3Supervisor),导致 v5 管理后台 重启/停止/删除/日志 全部 503 AGENT_NOT_READY。
+ * 门槛设错了对象:v3/v5 行的实际执行路径只走 v3Supervisor dispatch,agent.docker 仅
+ * v2 老行使用,而两套运行时的 docker 指向同一个 dockerd。
+ *
+ * 解析序:agentRuntime.docker(v2 遗留,存在则优先,保持 v3 master 行为不变)??
+ * v3Supervisor.docker(v5 按需容器面)。两者皆缺 → null,调用方 503。
+ */
+export function resolveAdminDockerHandle(
+  deps: Pick<CommercialHttpDeps, "agentRuntime" | "v3Supervisor">,
+): Docker | null {
+  return deps.agentRuntime?.docker ?? deps.v3Supervisor?.docker ?? null;
+}
 
 export async function handleAdminListAgentContainers(
   req: IncomingMessage,
@@ -156,12 +175,12 @@ export async function handleAdminContainerLogs(
     }
     lines = n;
   }
-  const agent = deps.agentRuntime;
-  if (!agent) {
-    throw new HttpError(503, "AGENT_NOT_READY", "agent runtime is not configured");
+  const docker = resolveAdminDockerHandle(deps);
+  if (!docker) {
+    throw new HttpError(503, "AGENT_NOT_READY", "container runtime is not configured");
   }
   try {
-    const logs = await adminContainerLogs(id, agent.docker, lines, deps.v3Supervisor);
+    const logs = await adminContainerLogs(id, docker, lines, deps.v3Supervisor);
     // Codex MEDIUM#2 补:敏感读 best-effort audit(同 accounts/containers.ts 语义,
     // 写 admin_audit 失败不阻塞响应)
     try {
@@ -246,18 +265,18 @@ export async function handleAdminAgentContainerAction(
   const admin = await requireAdminVerifyDb(req, deps.jwtSecret);
   const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "x.invalid"}`);
   const { id, action } = parseContainerActionUrl(url);
-  const agent = deps.agentRuntime;
-  if (!agent) {
-    throw new HttpError(503, "AGENT_NOT_READY", "agent runtime is not configured");
+  const docker = resolveAdminDockerHandle(deps);
+  if (!docker) {
+    throw new HttpError(503, "AGENT_NOT_READY", "container runtime is not configured");
   }
   const auditCtx = { adminId: admin.id, ip: ctx.clientIp, userAgent: ctx.userAgent };
   // HIGH#6:v3 行(docker_name=NULL)经 v3Supervisor dispatch;v2 行走老路径。
   // v3Supervisor 未注入(OC_RUNTIME_IMAGE 没配)且行是 v3 → 抛 V3SupervisorMissingError → 503。
   const v3Supervisor = deps.v3Supervisor;
   try {
-    if (action === "restart") await adminRestartContainer(id, agent.docker, auditCtx, v3Supervisor);
-    else if (action === "stop") await adminStopContainer(id, agent.docker, auditCtx, v3Supervisor);
-    else await adminRemoveContainer(id, agent.docker, auditCtx, v3Supervisor);
+    if (action === "restart") await adminRestartContainer(id, docker, auditCtx, v3Supervisor);
+    else if (action === "stop") await adminStopContainer(id, docker, auditCtx, v3Supervisor);
+    else await adminRemoveContainer(id, docker, auditCtx, v3Supervisor);
   } catch (err) {
     if (err instanceof ContainerNotFoundError) throw new HttpError(404, "NOT_FOUND", err.message);
     // 0017 后 v2 admin 操作路径碰到 v3 行,但 gateway 没装配 v3 supervisor(OC_RUNTIME_IMAGE
