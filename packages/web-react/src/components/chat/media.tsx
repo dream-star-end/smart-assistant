@@ -15,6 +15,7 @@ import {
   downloadPercent,
   formatBytes,
   nativeDownload,
+  openInNewTab,
   pickDownloadStrategy,
   saveBlob,
 } from "../../lib/chat/download";
@@ -33,9 +34,11 @@ type MediaSignCtx = {
   resolve: (path: string) => Promise<string | null>;
   /** 主动失效(媒体元素 onerror 重签用):删缓存条目,下次 resolve 重签。 */
   invalidate: (path: string) => void;
+  /** 同步读缓存:有未过期条目回 URL,否则 null(不触发签名)。点击手势内的快路径用 —— 锚点原生导航前校正 href。 */
+  peek: (path: string) => string | null;
 };
 
-const noop: MediaSignCtx = { resolve: async () => null, invalidate: () => {} };
+const noop: MediaSignCtx = { resolve: async () => null, invalidate: () => {}, peek: () => null };
 const Ctx = createContext<MediaSignCtx>(noop);
 
 export function MediaSignProvider({
@@ -53,8 +56,15 @@ export function MediaSignProvider({
   const cacheRef = useRef<Map<string, CacheEntry>>(new Map());
   const inflightRef = useRef<Map<string, Promise<string | null>>>(new Map());
   const signRef = useRef<SignFn | null>(sign);
+  const mountedRef = useRef(false);
   useEffect(() => {
     signRef.current = sign;
+    // 只在 sign/authKey **变化**时重置,首挂载跳过 —— 子组件 effect 先于本 effect 跑,
+    // 首挂载也换 Map 会把首批 resolve 的缓存写进被丢弃的旧 Map(首批媒体点击时被迫重签)。
+    if (!mountedRef.current) {
+      mountedRef.current = true;
+      return;
+    }
     // P5 fix(Codex R2):换 Map 实例,**非** .clear()。resolve() 在 .then 里用调用时捕获的 cache
     // 引用 cache.set(url);若只 clear() 同一 Map,账号切换期间旧 inflight 晚返回会把旧账号
     // bearerless signed URL 重新写回当前 cache → 隐私泄漏。换实例后旧 inflight 只写进已弃用的旧
@@ -89,6 +99,10 @@ export function MediaSignProvider({
     },
     invalidate: (path: string) => {
       cacheRef.current.delete(path);
+    },
+    peek: (path: string) => {
+      const hit = cacheRef.current.get(path);
+      return hit && hit.expiresAt > Date.now() ? hit.url : null;
     },
   });
 
@@ -143,6 +157,41 @@ export function useSignedSrc(src: string | null | undefined): {
 }
 
 /**
+ * 点击时签名权威:交互(下载/开原图)发生的**那一刻**解析签名 URL,而不是复用组件
+ * 挂载时签的旧 URL。签名 URL 服务端 TTL 仅 5min,而"看完回复过几分钟再点下载"是
+ * 常态路径 —— 挂载时签名在这类交互上必然过期(2026-07-10 用户 175 "下载不了文件"
+ * 410 死循环根因)。所有"用户手势触发的取媒体"都必须经此 helper,禁止直接冻结
+ * useSignedSrc 的挂载态 URL。
+ *
+ * - get():provider 缓存未过期(≤4min,留 1min 服务端余量)直接命中,过期自动重签;
+ *   forceResign 先删缓存强制重签(fetch 已拿到 410/403 的场景 —— 本地钟认为没过期
+ *   但服务端裁决已死,以服务端为准)。
+ * - peek():同步读缓存,点击手势内校正锚点 href 用(异步 get 会脱离手势激活窗口,
+ *   Safari 弹窗拦截风险,能同步就同步)。
+ * - 非容器路径(http/data:)原样返回,无过期概念。
+ */
+function useFreshSignedUrl(src: string | null | undefined): {
+  get: (opts?: { forceResign?: boolean }) => Promise<string | null>;
+  peek: () => string | null;
+} {
+  const { resolve, invalidate, peek } = useContext(Ctx);
+  const get = useCallback(
+    async (opts?: { forceResign?: boolean }) => {
+      if (!src) return null;
+      if (!isContainerPath(src)) return src;
+      if (opts?.forceResign) invalidate(src);
+      return resolve(src);
+    },
+    [src, resolve, invalidate],
+  );
+  const peekFresh = useCallback(
+    () => (src ? (isContainerPath(src) ? peek(src) : src) : null),
+    [src, peek],
+  );
+  return { get, peek: peekFresh };
+}
+
+/**
  * 可放大图片(共享灯箱):点击开全屏预览(2026-07-07 boss 反馈"agent 响应的图表
  * 不支持放大")。覆盖 assistant 响应里图片的两条渲染路径 —— markdown 行内 <img>
  * (SignedImg)与媒体附件卡(MediaItem image)。灯箱内提供"新标签打开原图"
@@ -153,25 +202,41 @@ export function ZoomableImage({
   alt,
   imgClassName,
   onError,
+  signPath,
 }: {
   src: string;
   alt: string;
   /** 缩略态 <img> 的样式(灯箱内恒全尺寸 object-contain)。 */
   imgClassName?: string;
   onError?: React.ReactEventHandler<HTMLImageElement>;
+  /** 原始容器路径(src 是签名 URL 时传)。传了才有"开灯箱/开原图时点击时重签"能力。 */
+  signPath?: string | null;
 }) {
   const [open, setOpen] = useState(false);
+  const { get, peek } = useFreshSignedUrl(signPath ?? null);
+  // 灯箱内用的最新签名 URL:开灯箱那一刻刷新(挂载 >5min 后再看大图,旧 URL 已死;
+  // 缩略图有字节缓存看不出,但灯箱大图/新标签是新请求,必须现签)。
+  const [freshSrc, setFreshSrc] = useState<string | null>(null);
+  const display = freshSrc ?? src;
+  const handleOpenChange = (o: boolean) => {
+    setOpen(o);
+    if (o && signPath) {
+      void get().then((u) => {
+        if (u) setFreshSrc(u);
+      });
+    }
+  };
   return (
     <>
       <button
         type="button"
         aria-label={`放大查看${alt ? ` ${alt}` : "图片"}`}
-        onClick={() => setOpen(true)}
+        onClick={() => handleOpenChange(true)}
         className="block max-w-full cursor-zoom-in rounded-lg outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg"
       >
         <img src={src} alt={alt} loading="lazy" onError={onError} className={imgClassName} />
       </button>
-      <Dialog.Root open={open} onOpenChange={setOpen}>
+      <Dialog.Root open={open} onOpenChange={handleOpenChange}>
         <Dialog.Portal>
           <Dialog.Overlay className="fixed inset-0 z-50 bg-black/70 backdrop-blur-sm data-[state=open]:animate-fade" />
           <Dialog.Content
@@ -179,12 +244,29 @@ export function ZoomableImage({
             className="fixed left-1/2 top-1/2 z-50 max-h-[92vh] max-w-[94vw] -translate-x-1/2 -translate-y-1/2 focus:outline-none"
           >
             <Dialog.Title className="sr-only">{alt || "图片预览"}</Dialog.Title>
-            <img src={src} alt={alt} className="max-h-[88vh] max-w-[94vw] rounded-lg object-contain shadow-float" />
+            <img src={display} alt={alt} className="max-h-[88vh] max-w-[94vw] rounded-lg object-contain shadow-float" />
             <div className="mt-2 flex items-center justify-center gap-3">
               <a
-                href={src}
+                href={display}
                 target="_blank"
                 rel="noreferrer"
+                onClick={(e) => {
+                  if (!signPath) return;
+                  // 快路径:缓存未过期 → 同步校正 href 让原生导航直接用最新 URL(不动手势)。
+                  const cached = peek();
+                  if (cached) {
+                    if (cached !== display) e.currentTarget.href = cached;
+                    return;
+                  }
+                  // 慢路径:已过期 → 拦下本次,重签后程序化开新标签(仍在手势激活窗口内)。
+                  e.preventDefault();
+                  void get({ forceResign: true }).then((u) => {
+                    if (u) {
+                      setFreshSrc(u);
+                      openInNewTab(u);
+                    }
+                  });
+                }}
                 className="flex items-center gap-1 rounded-full bg-surface px-3 py-1 text-xs font-medium text-fg no-underline shadow-float transition-colors hover:bg-hover"
               >
                 <ExternalLink size={12} /> 新标签打开原图
@@ -222,6 +304,7 @@ export function SignedImg(props: React.ImgHTMLAttributes<HTMLImageElement>) {
       src={resolved}
       alt={typeof alt === "string" ? alt : ""}
       onError={onError}
+      signPath={typeof src === "string" && isContainerPath(src) ? src : null}
       imgClassName={typeof rest.className === "string" ? rest.className : undefined}
     />
   );
@@ -263,11 +346,14 @@ type DownloadState =
   | { phase: "error" };
 
 /**
- * 大文件下载接线：点击 idle 卡 → fetch 同一签名 URL → 按 Content-Length 决策
- * （见 pickDownloadStrategy）。仅 3MB~100MB 走 body.getReader() 流读 + Blob 存盘并渲染进度；
- * 小/超大/未知一律回落原生 `<a download>`（nativeDownload）。任何异常 → error 态（重试 + 直接下载兜底）。
+ * 大文件下载接线：点击 idle 卡 → **点击时**经 useFreshSignedUrl 解析签名 URL → fetch →
+ * 按 Content-Length 决策（见 pickDownloadStrategy）。仅 3MB~100MB 走 body.getReader()
+ * 流读 + Blob 存盘并渲染进度；小/超大/未知一律回落原生 `<a download>`（nativeDownload）。
+ * fetch 拿到 410(过期)/403(签名失效) → 强制重签一次再试(服务端裁决优先于本地缓存钟)。
+ * 其余异常 → error 态（重试 + 直接下载兜底,两者同样走点击时签名）。
  */
-function useSignedDownload(url: string | null, name: string) {
+function useSignedDownload(src: string | null, name: string) {
+  const { get } = useFreshSignedUrl(src);
   const [state, setState] = useState<DownloadState>({ phase: "idle" });
   const abortRef = useRef<AbortController | null>(null);
   const cancelledRef = useRef(false);
@@ -275,13 +361,22 @@ function useSignedDownload(url: string | null, name: string) {
   useEffect(() => () => abortRef.current?.abort(), []);
 
   const start = useCallback(async () => {
-    if (!url) return;
+    if (!src) return;
     cancelledRef.current = false;
     const controller = new AbortController();
     abortRef.current = controller;
     setState({ phase: "downloading", loaded: 0, total: null });
     try {
-      const res = await fetch(url, { signal: controller.signal });
+      let url = await get();
+      if (!url) throw new Error("sign failed");
+      let res = await fetch(url, { signal: controller.signal });
+      if (res.status === 410 || res.status === 403) {
+        const resigned = await get({ forceResign: true });
+        if (resigned) {
+          url = resigned;
+          res = await fetch(url, { signal: controller.signal });
+        }
+      }
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const total = Number(res.headers.get("content-length")) || null;
       // 尺寸决策：仅 3MB~100MB 走流式；其余(小/超大/未知/无流)交原生 <a download>。
@@ -312,23 +407,30 @@ function useSignedDownload(url: string | null, name: string) {
     } finally {
       abortRef.current = null;
     }
-  }, [url, name]);
+  }, [src, get, name]);
 
   const cancel = useCallback(() => {
     cancelledRef.current = true;
     abortRef.current?.abort();
   }, []);
 
-  return { state, start, cancel };
+  /** 「直接下载」逃生门(iOS blob 异常等不可检测场景):同样点击时签名后交原生下载。 */
+  const direct = useCallback(async () => {
+    const url = await get();
+    if (url) nativeDownload(url, name);
+  }, [get, name]);
+
+  return { state, start, cancel, direct };
 }
 
 /** markdown 行内/正文里的容器文件路径 → 可下载文件卡(doc-card)。非媒体文件(txt/docx/pdf/zip…)。
  * 经 /api/media-sign 把容器路径换成同源签名 URL；小文件原生 <a download>，大文件 fetch 流式带进度。 */
 export function SignedFileCard({ src, filename }: { src?: string; filename?: string }) {
-  // 文件卡无媒体加载事件可挂 onError；点击 403 由 TTL 缓存过期重签兜底。
+  // resolved 只做占位门(容器冷启签不出→不可点)与锚点 href 装饰;真正的下载 URL 由
+  // useSignedDownload 在**点击时**解析(挂载时 URL 5min 即过期,冻结它=410 死循环)。
   const { url: resolved } = useSignedSrc(typeof src === "string" ? src : null);
   const name = (filename || (typeof src === "string" ? src.split("/").pop() : "") || "文件").trim();
-  const { state, start, cancel } = useSignedDownload(resolved ?? null, name);
+  const { state, start, cancel, direct } = useSignedDownload(typeof src === "string" ? src : null, name);
 
   const fileIcon = (
     <span className="flex size-8 shrink-0 items-center justify-center rounded-md bg-accent-soft text-accent">
@@ -411,6 +513,11 @@ export function SignedFileCard({ src, filename }: { src?: string; filename?: str
             download={name}
             target="_blank"
             rel="noreferrer"
+            onClick={(e) => {
+              // 点击时重签后交原生下载;href 仅留给"右键/长按另存"语义。
+              e.preventDefault();
+              void direct();
+            }}
             className="flex h-6 items-center font-medium text-muted no-underline hover:text-fg hover:underline"
           >
             直接下载
@@ -455,6 +562,11 @@ function MediaItem({ item }: { item: ResolvedMedia }) {
       </span>
     );
   }
+  if (item.mode === "sign" && item.kind === "file") {
+    // 容器内非媒体文件:收口到 SignedFileCard(点击时签名 + 410/403 重签 + 流式进度)。
+    // 此前这里是一条冻结挂载时签名 URL 的裸 <a>,消息渲染 >5min 后点击即 410 死链。
+    return <SignedFileCard src={item.path} filename={item.filename} />;
+  }
   if (!url) {
     return (
       <div className="flex h-24 w-32 items-center justify-center rounded-lg border border-border bg-hover text-xs text-faint">
@@ -468,6 +580,7 @@ function MediaItem({ item }: { item: ResolvedMedia }) {
         src={url}
         alt={item.filename || "图片"}
         onError={onError}
+        signPath={path}
         imgClassName="max-h-72 max-w-full rounded-lg border border-border object-contain"
       />
     );
