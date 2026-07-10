@@ -96,7 +96,7 @@ describe('_stripClientPutMessage allow-list (T1, T2)', () => {
         id: 'programming_team',
         name: '编程协作团队',
         leaderAgentId: 'codex',
-        modelOverride: 'gpt-5.5',
+        modelOverride: 'gpt-5.6-sol',
       },
     })
     assert.deepEqual(cleaned?._media, [{ kind: 'image', url: 'blob:foo' }])
@@ -105,7 +105,7 @@ describe('_stripClientPutMessage allow-list (T1, T2)', () => {
       id: 'programming_team',
       name: '编程协作团队',
       leaderAgentId: 'codex',
-      modelOverride: 'gpt-5.5',
+      modelOverride: 'gpt-5.6-sol',
     })
   })
 

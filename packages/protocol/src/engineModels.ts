@@ -12,11 +12,88 @@
 // 设计边界:只回答「哪些 model id 由 codex engine 承接」。模型准入(白名单 /
 // 授权可见性)与 engine 构造(registry fail-closed)仍在各自消费方收口。
 
+import { findRouteProviderForModel } from './staticKeyProviders.js'
+
+/**
+ * v5 对外承诺的统一思考深度枚举。
+ *
+ * Codex 0.144 的 Sol/Terra 还声明了 `ultra`,但该档会触发 Codex 原生自动委派；
+ * v5 的委派权威是 OpenClaude `delegate_task`(含计费/并发/进度),因此平台不暴露
+ * `ultra`。Luna 本身也不支持该档。
+ */
+export const PLATFORM_REASONING_EFFORTS = [
+  'low',
+  'medium',
+  'high',
+  'xhigh',
+  'max',
+] as const
+export type PlatformReasoningEffort = (typeof PLATFORM_REASONING_EFFORTS)[number]
+
+/**
+ * Codex engine 模型号 + 模型自身默认思考深度的单一权威。
+ * 顺序有产品语义:第一项同时是 codex seed / 团队模式队长默认型号。
+ */
+export const CODEX_ENGINE_MODELS = [
+  { id: 'gpt-5.6-sol', displayName: 'GPT-5.6-Sol', defaultReasoningEffort: 'low' },
+  { id: 'gpt-5.6-terra', displayName: 'GPT-5.6-Terra', defaultReasoningEffort: 'medium' },
+  { id: 'gpt-5.6-luna', displayName: 'GPT-5.6-Luna', defaultReasoningEffort: 'medium' },
+] as const satisfies readonly {
+  id: string
+  displayName: string
+  defaultReasoningEffort: PlatformReasoningEffort
+}[]
+
 /** codex engine 承接的模型 id 全集(精确字面量,与 registry MODEL_ENGINE_MAP 同源)。 */
-export const CODEX_ENGINE_MODEL_IDS = ['gpt-5.5'] as const
+export const CODEX_ENGINE_MODEL_IDS = CODEX_ENGINE_MODELS.map((m) => m.id)
+
+export type CodexEngineModelId = (typeof CODEX_ENGINE_MODELS)[number]['id']
 
 /** codex seed agent(id='codex')的固定模型 —— entrypoint desiredCodexAgent 同值。 */
-export const DEFAULT_CODEX_ENGINE_MODEL: string = CODEX_ENGINE_MODEL_IDS[0]
+export const DEFAULT_CODEX_ENGINE_MODEL: CodexEngineModelId = CODEX_ENGINE_MODELS[0].id
+export const DEFAULT_CODEX_ENGINE_MODEL_DISPLAY_NAME: string =
+  CODEX_ENGINE_MODELS[0].displayName
+
+export interface ModelReasoningPolicy {
+  /** 该模型在 v5 可接受/展示的思考档位；空数组 = 本模型不支持该功能。 */
+  supported: readonly PlatformReasoningEffort[]
+  /** 仅 Codex 型号有值；用户未覆盖时 runner 必须沿用这个模型自身默认。 */
+  codexModelDefault: PlatformReasoningEffort | null
+}
+
+/**
+ * model → 思考能力的单一权威。
+ *
+ * - Codex:型号目录给出的默认值 + v5 平台公共五档；
+ * - 静态 provider:沿用其 allowedOutputConfigEfforts / stripBodyFields 声明；
+ * - 其它可透传模型:统一五档。
+ *
+ * API、admin 校验、gateway 与前端都必须消费本函数或其 API 投影,不得另抄清单。
+ */
+export function modelReasoningPolicy(modelId: string): ModelReasoningPolicy {
+  const codex = CODEX_ENGINE_MODELS.find((m) => m.id === modelId)
+  if (codex) {
+    return {
+      supported: PLATFORM_REASONING_EFFORTS,
+      codexModelDefault: codex.defaultReasoningEffort,
+    }
+  }
+
+  const provider = findRouteProviderForModel(modelId)
+  if (provider?.allowedOutputConfigEfforts) {
+    const platformSet = new Set<string>(PLATFORM_REASONING_EFFORTS)
+    return {
+      supported: provider.allowedOutputConfigEfforts.filter(
+        (effort): effort is PlatformReasoningEffort => platformSet.has(effort),
+      ),
+      codexModelDefault: null,
+    }
+  }
+  if (provider?.stripBodyFields.includes('output_config')) {
+    return { supported: [], codexModelDefault: null }
+  }
+  return { supported: PLATFORM_REASONING_EFFORTS, codexModelDefault: null }
+}
 
 /**
  * 该 model id 是否由 codex engine 承接(精确匹配,大小写敏感 —— 与

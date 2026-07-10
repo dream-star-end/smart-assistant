@@ -39,6 +39,8 @@ import {
   newTraceId,
   parseTraceIdCandidate,
   STATIC_KEY_INBOUND_MODEL_IDS,
+  CODEX_ENGINE_MODEL_IDS,
+  PLATFORM_REASONING_EFFORTS,
   MAX_ATTACHMENTS_PER_MESSAGE,
   isCodexEngineModel,
 } from '@openclaude/protocol'
@@ -243,9 +245,11 @@ function teamMemberCapabilityHint(agent: AgentDef): string {
  * @openclaude/protocol 注册表 STATIC_KEY_INBOUND_MODEL_IDS 注入,新增 provider 零改本处。
  */
 export const ALLOWED_INBOUND_MODELS = new Set<string>([
-  'gpt-5.5',
+  ...CODEX_ENGINE_MODEL_IDS,
   ...STATIC_KEY_INBOUND_MODEL_IDS,
 ])
+
+const ALLOWED_REASONING_EFFORTS = new Set<string>(PLATFORM_REASONING_EFFORTS)
 
 /** 平台执行模型兜底:v3/v5 两渠道都合法的静态 key 平台默认。 */
 export const EXECUTION_MODEL_FALLBACK = 'glm-5.2'
@@ -9623,12 +9627,14 @@ export class Gateway {
     //   - 合法 string → 透传
     //   - null      → 透传(显式清除已有 effort,让 runner 回到模型默认)
     //   - 其它(包括字段缺省) → 不传给 sessionManager,保持现有 runner 不动
-    const _effortAllow = new Set(['low', 'medium', 'high', 'xhigh', 'max'])
     const _frameEffort = (frame as any).effortLevel
     let safeEffortLevel: string | null | undefined
     if (_frameEffort === null) {
       safeEffortLevel = null
-    } else if (typeof _frameEffort === 'string' && _effortAllow.has(_frameEffort)) {
+    } else if (
+      typeof _frameEffort === 'string' &&
+      ALLOWED_REASONING_EFFORTS.has(_frameEffort)
+    ) {
       safeEffortLevel = _frameEffort
     } else {
       safeEffortLevel = undefined

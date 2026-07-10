@@ -300,7 +300,8 @@ export async function handleMarketplaceAgentPublish(
   const slug = asStr(body.slug, 'slug', 64)
   if (!SLUG_RE.test(slug)) throw new HttpError(400, 'BAD_SLUG', 'slug 须为小写字母数字连字符(2-64)')
 
-  // Allowed models = v5 public model set (gpt-* dropped on the v5 channel).
+  // Allowed models = current public model set. GPT-5.6 is a first-class v5
+  // runtime model, so marketplace agents may select it like any other public model.
   // Fail-closed: if pricing isn't available we cannot enforce model∈public, so we
   // refuse to publish rather than accept an unvalidated model (matches
   // handleListPublicModels' 503). Pricing is initialized at startup in production.
@@ -311,11 +312,7 @@ export async function handleMarketplaceAgentPublish(
   } catch {
     throw new HttpError(503, 'PRICING_UNAVAILABLE', '模型目录暂不可用,请稍后重试')
   }
-  const allowedModels = new Set<string>()
-  const isV5 = (process.env.OC_RUNTIME_CHANNEL?.trim() || 'v3') === 'v5'
-  for (const m of publicModels) {
-    if (!isV5 || !m.id.toLowerCase().startsWith('gpt-')) allowedModels.add(m.id)
-  }
+  const allowedModels = new Set(publicModels.map((m) => m.id))
 
   const manifestInput: Record<string, unknown> = { ...body }
   // slug is the listing key, NOT a manifest field — remove the KEY (not just set

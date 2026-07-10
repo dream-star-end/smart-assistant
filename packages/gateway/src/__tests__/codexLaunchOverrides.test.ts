@@ -454,7 +454,7 @@ describe('buildCodexLaunchOverrides', () => {
         const out = await buildCodexLaunchOverrides({
           agentId: 'test-agent',
           provider: 'codex-native',
-          model: 'gpt-5.5',
+          model: 'gpt-5.6-sol',
           sessionDir: dir,
           gatewayPort: 18789,
           gatewayToken: 'gateway-token',
@@ -471,7 +471,7 @@ describe('buildCodexLaunchOverrides', () => {
         for (const arg of out.argvOverrides) {
           assert.ok(!arg.includes(TOKEN), `argv leaked token in: ${arg}`)
         }
-        // gpt-5.5 原生多模态:不再发 GPT/Codex 识图提示(shouldEnableOpenClaudeVision=false)。
+        // gpt-5.6-sol 原生多模态:不再发 GPT/Codex 识图提示(shouldEnableOpenClaudeVision=false)。
         assert.doesNotMatch(out.instructionsContent, /GPT\/Codex 图片理解提示/)
       },
     )

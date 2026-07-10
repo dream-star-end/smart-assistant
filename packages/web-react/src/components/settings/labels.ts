@@ -23,12 +23,16 @@ export function ledgerReasonLabel(reason: string): string {
   return LEDGER_REASON_LABEL[reason] || reason;
 }
 
-/** 思考深度档位（preferences.default_effort 枚举：low|medium|high|xhigh）。 */
-export const EFFORT_OPTIONS: { value: "low" | "medium" | "high" | "xhigh"; label: string }[] = [
+/** 思考深度档位（preferences.default_effort 枚举；具体模型支持集由 API 决定）。 */
+export const EFFORT_OPTIONS: {
+  value: "low" | "medium" | "high" | "xhigh" | "max";
+  label: string;
+}[] = [
   { value: "low", label: "低" },
   { value: "medium", label: "中" },
   { value: "high", label: "高" },
-  { value: "xhigh", label: "最高" },
+  { value: "xhigh", label: "很高" },
+  { value: "max", label: "最高" },
 ];
 
 /** 订单状态 → 中文（虎皮椒：pending|paid|expired|canceled）。 */

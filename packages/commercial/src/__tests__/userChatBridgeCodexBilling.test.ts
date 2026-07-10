@@ -65,7 +65,7 @@ const JWT_SECRET = "x".repeat(32);
 const ENGINE_SID = deriveEngineSessionId("agent:codex:webchat:dm:test-peer");
 
 const PRICING: ModelPricing = {
-  model_id: "gpt-5.5",
+  model_id: "gpt-5.6-sol",
   display_name: "GPT 5.5",
   input_per_mtok: 1000n,
   output_per_mtok: 5000n,
@@ -514,7 +514,7 @@ describe("userChatBridge / codex billing — happy path(双钱包 settle)", () =
     const inbound = {
       type: "inbound.message",
       agentId: "codex",
-      model: "gpt-5.5",
+      model: "gpt-5.6-sol",
       requestId: "client-supplied-evil-id", // 应被覆写
       content: "hi",
     };
@@ -524,7 +524,7 @@ describe("userChatBridge / codex billing — happy path(双钱包 settle)", () =
     const frameToContainer = await waitContainerNextFrame(containerWs);
     const parsed = JSON.parse(frameToContainer.data) as Record<string, unknown>;
     assert.equal(parsed.type, "inbound.message");
-    assert.equal(parsed.model, "gpt-5.5");
+    assert.equal(parsed.model, "gpt-5.6-sol");
     // server-owned 32-hex requestId 覆盖 client 值
     const serverReqId = parsed.requestId as string;
     assert.match(serverReqId, /^[0-9a-f]{32}$/);
@@ -548,7 +548,7 @@ describe("userChatBridge / codex billing — happy path(双钱包 settle)", () =
     // 用户应收到 cost_charged
     const cost = await waitJsonFrameOfType(ws, "outbound.cost_charged");
     assert.equal(cost.requestId, serverReqId);
-    assert.equal(cost.model, "gpt-5.5");
+    assert.equal(cost.model, "gpt-5.6-sol");
     assert.equal(typeof cost.debitedCredits, "string");
     assert.ok(BigInt(cost.debitedCredits as string) > 0n);
     assert.equal(cost.clamped, false);
@@ -590,7 +590,7 @@ describe("userChatBridge / codex billing — duplicate frame", () => {
     ws.send(JSON.stringify({
       type: "inbound.message",
       agentId: "codex",
-      model: "gpt-5.5",
+      model: "gpt-5.6-sol",
       content: "x",
       __oc_codex_route: {
         baseUrl: `http://127.0.0.1:18789/internal/v3/codex-relay/route/${"a".repeat(64)}`,
@@ -649,7 +649,7 @@ describe("userChatBridge / codex billing — safeNum sanitizer", () => {
     const containerWs = await containerOpenP;
 
     ws.send(JSON.stringify({
-      type: "inbound.message", agentId: "codex", model: "gpt-5.5", content: "x",
+      type: "inbound.message", agentId: "codex", model: "gpt-5.6-sol", content: "x",
     }));
     const frameToContainer = await waitContainerNextFrame(containerWs);
     const parsed = JSON.parse(frameToContainer.data) as Record<string, unknown>;
@@ -701,7 +701,7 @@ describe("userChatBridge / codex billing — 零输出免单(M2 红线)", () => 
     const containerWs = await containerOpenP;
 
     ws.send(JSON.stringify({
-      type: "inbound.message", agentId: "codex", model: "gpt-5.5", content: "x",
+      type: "inbound.message", agentId: "codex", model: "gpt-5.6-sol", content: "x",
     }));
     const frameToContainer = await waitContainerNextFrame(containerWs);
     const serverReqId = (JSON.parse(frameToContainer.data) as { requestId: string }).requestId;
@@ -754,7 +754,7 @@ describe("userChatBridge / codex billing — balanceAfter 双桶(M2 红线)", ()
     const containerWs = await containerOpenP;
 
     ws.send(JSON.stringify({
-      type: "inbound.message", agentId: "codex", model: "gpt-5.5", content: "x",
+      type: "inbound.message", agentId: "codex", model: "gpt-5.6-sol", content: "x",
     }));
     const frameToContainer = await waitContainerNextFrame(containerWs);
     const serverReqId = (JSON.parse(frameToContainer.data) as { requestId: string }).requestId;
@@ -812,7 +812,7 @@ describe("userChatBridge / codex billing — engineSessionId fail-closed", () =>
     await waitOpen(ws);
     const containerWs = await containerOpenP;
     ws.send(JSON.stringify({
-      type: "inbound.message", agentId: "codex", model: "gpt-5.5", content: "x",
+      type: "inbound.message", agentId: "codex", model: "gpt-5.6-sol", content: "x",
     }));
     const frameToContainer = await waitContainerNextFrame(containerWs);
     const serverReqId = (JSON.parse(frameToContainer.data) as { requestId: string }).requestId;
@@ -865,7 +865,7 @@ describe("userChatBridge / codex billing — drain on user close(readyState 前�
     const containerWs = await containerOpenP;
 
     ws.send(JSON.stringify({
-      type: "inbound.message", agentId: "codex", model: "gpt-5.5", content: "x",
+      type: "inbound.message", agentId: "codex", model: "gpt-5.6-sol", content: "x",
     }));
     const frameToContainer = await waitContainerNextFrame(containerWs);
     const parsed = JSON.parse(frameToContainer.data) as Record<string, unknown>;
@@ -920,7 +920,7 @@ describe("userChatBridge / codex billing — drain timeout 不再 abort 存活 t
     const containerWs = await containerOpenP;
 
     ws.send(JSON.stringify({
-      type: "inbound.message", agentId: "codex", model: "gpt-5.5", content: "x",
+      type: "inbound.message", agentId: "codex", model: "gpt-5.6-sol", content: "x",
     }));
     const frameToContainer = await waitContainerNextFrame(containerWs);
     const serverReqId = (JSON.parse(frameToContainer.data) as { requestId: string }).requestId;
@@ -967,7 +967,7 @@ describe("userChatBridge / codex billing — P0 跨桥重连 settle(billing 帧�
     await waitOpen(ws1);
     const container1 = await container1P;
     ws1.send(JSON.stringify({
-      type: "inbound.message", agentId: "codex", model: "gpt-5.5", content: "x",
+      type: "inbound.message", agentId: "codex", model: "gpt-5.6-sol", content: "x",
     }));
     const f1 = JSON.parse((await waitContainerNextFrame(container1)).data) as Record<string, unknown>;
     const serverReqId = f1.requestId as string;
@@ -1003,7 +1003,7 @@ describe("userChatBridge / codex billing — P0 跨桥重连 settle(billing 帧�
     const cost = await waitJsonFrameOfType(ws2, "outbound.cost_charged");
     assert.equal(cost.requestId, serverReqId);
     assert.equal(cost.traceId, turnTraceId, "cost_charged.traceId must come from journal ctx");
-    assert.equal(cost.model, "gpt-5.5");
+    assert.equal(cost.model, "gpt-5.6-sol");
     assert.ok(BigInt(cost.debitedCredits as string) > 0n);
 
     // duplicate 帧不得二次广播 / 二次 settle
@@ -1041,7 +1041,7 @@ describe("userChatBridge / codex billing — P0 displacement(新连接顶掉旧�
     await waitOpen(ws1);
     const container1 = await container1P;
     ws1.send(JSON.stringify({
-      type: "inbound.message", agentId: "codex", model: "gpt-5.5", content: "x",
+      type: "inbound.message", agentId: "codex", model: "gpt-5.6-sol", content: "x",
     }));
     const serverReqId = (JSON.parse((await waitContainerNextFrame(container1)).data) as {
       requestId: string;
@@ -1113,7 +1113,7 @@ describe("userChatBridge / codex billing — P0 journal 回查裁决(aborted 撞
     rig.poolCtrl.journalRows.set(reqId, {
       state: "aborted",
       user_id: "43",
-      ctx: { model: "gpt-5.5", agentId: "codex", source: "codex_bridge" },
+      ctx: { model: "gpt-5.6-sol", agentId: "codex", source: "codex_bridge" },
       precheck_credits: "100",
       error_msg: "bridge_disconnect",
     });
@@ -1138,7 +1138,7 @@ describe("userChatBridge / codex billing — P0 journal 回查裁决(aborted 撞
     rig.poolCtrl.journalRows.set(reqId, {
       state: "committed",
       user_id: "44",
-      ctx: { model: "gpt-5.5", agentId: "codex", source: "codex_bridge" },
+      ctx: { model: "gpt-5.6-sol", agentId: "codex", source: "codex_bridge" },
       precheck_credits: "100",
       error_msg: null,
     });
@@ -1159,7 +1159,7 @@ describe("userChatBridge / codex billing — P0 journal 回查裁决(aborted 撞
     rig.poolCtrl.journalRows.set(reqId, {
       state: "inflight",
       user_id: "99999", // 非本桥 uid
-      ctx: { model: "gpt-5.5", agentId: "codex", source: "codex_bridge" },
+      ctx: { model: "gpt-5.6-sol", agentId: "codex", source: "codex_bridge" },
       precheck_credits: "100",
       error_msg: null,
     });
@@ -1198,7 +1198,7 @@ describe("userChatBridge / codex billing — legacy NULL container per-turn bill
 
     // turn 1
     ws.send(JSON.stringify({
-      type: "inbound.message", agentId: "codex", model: "gpt-5.5", content: "1",
+      type: "inbound.message", agentId: "codex", model: "gpt-5.6-sol", content: "1",
     }));
     const f1 = await waitContainerNextFrame(containerWs);
     const r1 = JSON.parse(f1.data).requestId as string;
@@ -1211,7 +1211,7 @@ describe("userChatBridge / codex billing — legacy NULL container per-turn bill
 
     // turn 2 — 关键:BLOCKER 修复前会被 codexLegacyContainer=true sticky 短路跳过 IIFE
     ws.send(JSON.stringify({
-      type: "inbound.message", agentId: "codex", model: "gpt-5.5", content: "2",
+      type: "inbound.message", agentId: "codex", model: "gpt-5.6-sol", content: "2",
     }));
     const f2 = await waitContainerNextFrame(containerWs);
     const r2 = JSON.parse(f2.data).requestId as string;
@@ -1243,7 +1243,7 @@ describe("userChatBridge / codex relay — fallback to legacy binding", () => {
       userBalance: 1_000_000n,
       createCodexRoute: async (args) => {
         routeCalls += 1;
-        assert.equal(args.modelId, "gpt-5.5");
+        assert.equal(args.modelId, "gpt-5.6-sol");
         return null;
       },
     });
@@ -1262,7 +1262,7 @@ describe("userChatBridge / codex relay — fallback to legacy binding", () => {
     const containerWs = await containerOpenP;
 
     ws.send(JSON.stringify({
-      type: "inbound.message", agentId: "codex", model: "gpt-5.5", content: "x",
+      type: "inbound.message", agentId: "codex", model: "gpt-5.6-sol", content: "x",
     }));
     const frameToContainer = await waitContainerNextFrame(containerWs);
     const parsed = JSON.parse(frameToContainer.data) as Record<string, unknown>;
@@ -1309,7 +1309,7 @@ describe("userChatBridge / codex relay — official OAuth group marker", () => {
     const containerWs = await containerOpenP;
 
     ws.send(JSON.stringify({
-      type: "inbound.message", agentId: "codex", model: "gpt-5.5", content: "x",
+      type: "inbound.message", agentId: "codex", model: "gpt-5.6-sol", content: "x",
     }));
     const frameToContainer = await waitContainerNextFrame(containerWs);
     const parsed = JSON.parse(frameToContainer.data) as Record<string, unknown>;
@@ -1360,7 +1360,7 @@ describe("userChatBridge / codex relay — enabled groups fail closed", () => {
     const containerWs = await containerOpenP;
 
     ws.send(JSON.stringify({
-      type: "inbound.message", agentId: "codex", model: "gpt-5.5", content: "x",
+      type: "inbound.message", agentId: "codex", model: "gpt-5.6-sol", content: "x",
     }));
     const errFrame = await waitJsonFrameOfType(ws, "error");
     assert.equal(errFrame.code, "CODEX_ROUTE_UNAVAILABLE");
@@ -1390,7 +1390,7 @@ describe("userChatBridge / codex relay — route expiry", () => {
     rig = await startRig({
       userBalance: 1_000_000n,
       createCodexRoute: async (args) => {
-        assert.equal(args.modelId, "gpt-5.5");
+        assert.equal(args.modelId, "gpt-5.6-sol");
         if (args.userId === 21n && delayedRoute !== null) {
           delayedRoute.started();
           await delayedRoute.gate;
@@ -1440,7 +1440,7 @@ describe("userChatBridge / codex relay — route expiry", () => {
     ws.send(JSON.stringify({
       type: "inbound.message",
       agentId: "codex",
-      model: "gpt-5.5",
+      model: "gpt-5.6-sol",
       content: "x",
     }));
     const frameToContainer = await waitContainerNextFrame(containerWs);
@@ -1480,7 +1480,7 @@ describe("userChatBridge / codex relay — route expiry", () => {
       ws.send(JSON.stringify({
         type: "inbound.message",
         agentId: "codex",
-        model: "gpt-5.5",
+        model: "gpt-5.6-sol",
         content: "x",
       }));
       await routeStartedP;
@@ -1523,7 +1523,7 @@ describe("userChatBridge / codex acquire — ContainerStaleBindingError recycle 
       closeReason = reason.toString("utf8");
     });
     ws.send(JSON.stringify({
-      type: "inbound.message", agentId: "codex", model: "gpt-5.5", content: "x",
+      type: "inbound.message", agentId: "codex", model: "gpt-5.6-sol", content: "x",
     }));
     const errFrame = await waitJsonFrameOfType(ws, "error");
     assert.equal(errFrame.code, "CODEX_CONTAINER_RECYCLED");
@@ -1587,7 +1587,7 @@ describe("userChatBridge / codex billing — CG2c outbound trace 贯穿", () => 
     ws.send(JSON.stringify({
       type: "inbound.message",
       agentId: "codex",
-      model: "gpt-5.5",
+      model: "gpt-5.6-sol",
       content: "trace me",
     }));
 
@@ -1643,7 +1643,7 @@ describe("userChatBridge / codex billing — CG2c outbound trace 贯穿", () => 
     ws.send(JSON.stringify({
       type: "inbound.message",
       agentId: "codex",
-      model: "gpt-5.5",
+      model: "gpt-5.6-sol",
       content: "trust source",
     }));
     const frameToContainer = await waitContainerNextFrame(containerWs);
@@ -1727,21 +1727,21 @@ describe("userChatBridge / codex billing — partial deps reject", () => {
 
 // ---------- P0 计费旁路封堵 — bridge 可信模型推导(agent 权威) ----------------
 //
-// 威胁:M1a 后任意 agent 的 agent.model='gpt-5.5' 都落 codex 底座;帧不带 model
+// 威胁:M1a 后任意 agent 的 agent.model='gpt-5.6-sol' 都落 codex 底座;帧不带 model
 // 时容器 gateway 回落 agent.model,而旧 bridge 只认 frame.model / agentId='codex'
 // / lastSeen → 该类 turn 不 preCheck、不注 server requestId → 免费 codex。
 // 修复:bridge 从 master agent 权威(fake resolver 注入)推导有效模型参与分类;
 // 推导不出且帧无 model → fail-closed 拒帧。
 
 describe("userChatBridge / codex billing — agent 权威模型推导(P0 封堵)", () => {
-  test("agent 默认 gpt-5.5 + 帧无 model → 经权威分类为 codex:preCheck + 注 server requestId", async () => {
+  test("agent 默认 gpt-5.6-sol + 帧无 model → 经权威分类为 codex:preCheck + 注 server requestId", async () => {
     const resolverLoads: bigint[] = [];
     const rig = await startRig({
       userBalance: 1_000_000n,
       loadAgentModelResolver: async (uid) => {
         resolverLoads.push(uid);
         return (agentId: string) =>
-          agentId === "gpt-helper" ? "gpt-5.5" : agentId === "main" ? "glm-5.2" : null;
+          agentId === "gpt-helper" ? "gpt-5.6-sol" : agentId === "main" ? "glm-5.2" : null;
       },
     });
     try {
@@ -1810,7 +1810,7 @@ describe("userChatBridge / codex billing — agent 权威模型推导(P0 封堵)
   test("teamMode main 强制 GPT 队长:即使客户端传 glm 也按 gpt 计费并转发 gpt model", async () => {
     const rig = await startRig({
       userBalance: 1_000_000n,
-      loadAllowedModelChecker: async () => (modelId: string) => modelId === "gpt-5.5",
+      loadAllowedModelChecker: async () => (modelId: string) => modelId === "gpt-5.6-sol",
       loadAgentModelResolver: async () => (agentId: string) =>
         agentId === "main" ? "glm-5.2" : null,
     });
@@ -1833,12 +1833,12 @@ describe("userChatBridge / codex billing — agent 权威模型推导(P0 封堵)
       assert.equal(parsed.type, "inbound.message");
       assert.equal(parsed.agentId, "main");
       assert.equal(parsed.teamMode, true);
-      assert.equal(parsed.model, "gpt-5.5", "teamMode main must be forwarded as GPT");
+      assert.equal(parsed.model, "gpt-5.6-sol", "teamMode main must be forwarded as GPT");
       assert.match(parsed.requestId as string, /^[0-9a-f]{32}$/);
       assert.equal(rig.binding.acquireCalls, 1, "forced GPT must acquire codex slot");
       const journal = rig.poolCtrl.journalRows.get(parsed.requestId as string);
       assert.ok(journal, "forced GPT must open inflight journal");
-      assert.equal(journal.ctx.model, "gpt-5.5", "journal model must match forced GPT");
+      assert.equal(journal.ctx.model, "gpt-5.6-sol", "journal model must match forced GPT");
       assert.equal(journal.ctx.agentId, "main", "team-mode GPT leader should charge main agent multiplier");
       ws.close();
     } finally {
@@ -1854,7 +1854,7 @@ describe("userChatBridge / codex billing — agent 权威模型推导(P0 封堵)
     for (const [idx, variant] of variants.entries()) {
       const rig = await startRig({
         userBalance: 1_000_000n,
-        loadAllowedModelChecker: async () => (modelId: string) => modelId === "gpt-5.5",
+        loadAllowedModelChecker: async () => (modelId: string) => modelId === "gpt-5.6-sol",
         loadAgentModelResolver: async () => (agentId: string) =>
           agentId === "main" ? "glm-5.2" : null,
       });
@@ -1876,12 +1876,12 @@ describe("userChatBridge / codex billing — agent 权威模型推导(P0 封堵)
         assert.equal(parsed.type, "inbound.message");
         assert.equal(parsed.agentId, "main", "missing agentId must be normalized to main");
         assert.equal(parsed.teamMode, true);
-        assert.equal(parsed.model, "gpt-5.5", "teamMode main must be forwarded as GPT");
+        assert.equal(parsed.model, "gpt-5.6-sol", "teamMode main must be forwarded as GPT");
         assert.match(parsed.requestId as string, /^[0-9a-f]{32}$/);
         assert.equal(rig.binding.acquireCalls, 1, "forced GPT must acquire codex slot");
         const journal = rig.poolCtrl.journalRows.get(parsed.requestId as string);
         assert.ok(journal, "forced GPT must open inflight journal");
-        assert.equal(journal.ctx.model, "gpt-5.5", "journal model must match forced GPT");
+        assert.equal(journal.ctx.model, "gpt-5.6-sol", "journal model must match forced GPT");
         assert.equal(journal.ctx.agentId, "main", "missing agentId team-mode turn should charge main");
         ws.close();
       } finally {
@@ -1894,7 +1894,7 @@ describe("userChatBridge / codex billing — agent 权威模型推导(P0 封堵)
     const rig = await startRig({
       userBalance: 1_000_000n,
       loadAllowedModelChecker: async () => (modelId: string) =>
-        modelId === "gpt-5.5" || modelId === "glm-5.2",
+        modelId === "gpt-5.6-sol" || modelId === "glm-5.2",
       loadAgentModelResolver: async () => (agentId: string) =>
         agentId === "main" ? "glm-5.2" : null,
     });
@@ -1917,12 +1917,12 @@ describe("userChatBridge / codex billing — agent 权威模型推导(P0 封堵)
       assert.equal(parsed.type, "inbound.message");
       assert.equal(parsed.agentId, "main", "unknown teamMode agentId must be normalized to main");
       assert.equal(parsed.teamMode, true);
-      assert.equal(parsed.model, "gpt-5.5", "unknown teamMode agentId must still force GPT leader");
+      assert.equal(parsed.model, "gpt-5.6-sol", "unknown teamMode agentId must still force GPT leader");
       assert.match(parsed.requestId as string, /^[0-9a-f]{32}$/);
       assert.equal(rig.binding.acquireCalls, 1, "forced GPT must acquire codex slot");
       const journal = rig.poolCtrl.journalRows.get(parsed.requestId as string);
       assert.ok(journal, "forced GPT must open inflight journal");
-      assert.equal(journal.ctx.model, "gpt-5.5", "journal model must match forced GPT");
+      assert.equal(journal.ctx.model, "gpt-5.6-sol", "journal model must match forced GPT");
       assert.equal(journal.ctx.agentId, "main", "unknown teamMode agent should charge main");
       ws.close();
     } finally {
@@ -1933,7 +1933,7 @@ describe("userChatBridge / codex billing — agent 权威模型推导(P0 封堵)
   test("teamMode 无 agent 权威快照时,显式 non-main agentId 也 fail-safe 按 main GPT 队长处理", async () => {
     const rig = await startRig({
       userBalance: 1_000_000n,
-      loadAllowedModelChecker: async () => (modelId: string) => modelId === "gpt-5.5",
+      loadAllowedModelChecker: async () => (modelId: string) => modelId === "gpt-5.6-sol",
     });
     try {
       const containerOpenP = waitNextContainerSocket(rig);
@@ -1953,12 +1953,12 @@ describe("userChatBridge / codex billing — agent 权威模型推导(P0 封堵)
       const parsed = JSON.parse(frameToContainer.data) as Record<string, unknown>;
       assert.equal(parsed.type, "inbound.message");
       assert.equal(parsed.agentId, "main", "teamMode without authority must normalize to main");
-      assert.equal(parsed.model, "gpt-5.5", "teamMode without authority must force GPT leader");
+      assert.equal(parsed.model, "gpt-5.6-sol", "teamMode without authority must force GPT leader");
       assert.match(parsed.requestId as string, /^[0-9a-f]{32}$/);
       assert.equal(rig.binding.acquireCalls, 1, "forced GPT must acquire codex slot");
       const journal = rig.poolCtrl.journalRows.get(parsed.requestId as string);
       assert.ok(journal, "forced GPT must open inflight journal");
-      assert.equal(journal.ctx.model, "gpt-5.5", "journal model must match forced GPT");
+      assert.equal(journal.ctx.model, "gpt-5.6-sol", "journal model must match forced GPT");
       assert.equal(journal.ctx.agentId, "main", "authority-less teamMode turn should charge main");
       ws.close();
     } finally {
@@ -1966,10 +1966,10 @@ describe("userChatBridge / codex billing — agent 权威模型推导(P0 封堵)
     }
   });
 
-  test("teamMode main 未授权 gpt-5.5 → 拒帧且不转发容器", async () => {
+  test("teamMode main 未授权 gpt-5.6-sol → 拒帧且不转发容器", async () => {
     const rig = await startRig({
       userBalance: 1_000_000n,
-      loadAllowedModelChecker: async () => (modelId: string) => modelId !== "gpt-5.5",
+      loadAllowedModelChecker: async () => (modelId: string) => modelId !== "gpt-5.6-sol",
       loadAgentModelResolver: async () => (agentId: string) =>
         agentId === "main" ? "glm-5.2" : null,
     });
@@ -2007,7 +2007,7 @@ describe("userChatBridge / codex billing — agent 权威模型推导(P0 封堵)
     const rig = await startRig({
       userBalance: 1_000_000n,
       loadAllowedModelChecker: async () => (modelId: string) =>
-        modelId === "gpt-5.5" || modelId === "glm-5.2",
+        modelId === "gpt-5.6-sol" || modelId === "glm-5.2",
       loadAgentModelResolver: async () => (agentId: string) =>
         agentId === "main" ? "glm-5.2"
           : agentId === "hidden-reviewer" ? "glm-5.2"
@@ -2107,7 +2107,7 @@ describe("userChatBridge / codex billing — agent 权威模型推导(P0 封堵)
     }
   });
 
-  test("帧显式带 model 时 frame.model 优先于权威(gpt-5.5 帧在非 gpt agent 上仍走 codex 计费)", async () => {
+  test("帧显式带 model 时 frame.model 优先于权威(gpt-5.6-sol 帧在非 gpt agent 上仍走 codex 计费)", async () => {
     const rig = await startRig({
       userBalance: 1_000_000n,
       loadAgentModelResolver: async () => (agentId: string) =>
@@ -2119,11 +2119,11 @@ describe("userChatBridge / codex billing — agent 权威模型推导(P0 封堵)
       await waitOpen(ws);
       const containerWs = await containerOpenP;
 
-      ws.send(JSON.stringify({ type: "inbound.message", agentId: "main", model: "gpt-5.5", content: "hi" }));
+      ws.send(JSON.stringify({ type: "inbound.message", agentId: "main", model: "gpt-5.6-sol", content: "hi" }));
 
       const frameToContainer = await waitContainerNextFrame(containerWs);
       const parsed = JSON.parse(frameToContainer.data) as Record<string, unknown>;
-      assert.match(parsed.requestId as string, /^[0-9a-f]{32}$/, "frame.model=gpt-5.5 → codex 计费路径");
+      assert.match(parsed.requestId as string, /^[0-9a-f]{32}$/, "frame.model=gpt-5.6-sol → codex 计费路径");
       assert.equal(rig.binding.acquireCalls, 1);
       ws.close();
     } finally {

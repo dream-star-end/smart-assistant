@@ -44,7 +44,7 @@ const VALID_API_RELAY_ROUTE = {
 function buildOfficial(overrides: Partial<{ model?: string; agent: typeof CODEX_AGENT; port: number; rawRoute: unknown }> = {}) {
   return _buildSafeCodexRouteOverride({
     agent: overrides.agent ?? CODEX_AGENT,
-    model: 'model' in overrides ? overrides.model : 'gpt-5.5',
+    model: 'model' in overrides ? overrides.model : 'gpt-5.6-sol',
     rawRoute: 'rawRoute' in overrides ? overrides.rawRoute : { kind: 'official_oauth' },
     officialRelayPort: overrides.port ?? PORT,
   })
@@ -262,7 +262,7 @@ class FakeRouteRunner extends EventEmitter {
   readonly capabilities = PROXY_CAPS
   lastActivityAt = Date.now()
   effortLevel: string | undefined = undefined
-  model: string | undefined = 'gpt-5.5'
+  model: string | undefined = 'gpt-5.6-sol'
   routeCalls: Array<CodexProviderConfigOverride | null> = []
 
   setTraceId(): void {}

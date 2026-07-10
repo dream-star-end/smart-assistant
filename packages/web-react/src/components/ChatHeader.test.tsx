@@ -10,7 +10,7 @@ afterEach(cleanup);
 
 const MODELS: PublicModel[] = [
   { id: "glm-5.2", display_name: "GLM-5.2" },
-  { id: "gpt-5.5", display_name: "GPT-5.5" },
+  { id: "gpt-5.6-sol", display_name: "GPT-5.6-Sol" },
 ];
 
 function renderHeader(extra: Partial<Parameters<typeof ChatHeader>[0]> = {}) {
@@ -47,7 +47,7 @@ describe("ChatHeader 团队模式指示 chip", () => {
     fireEvent.click(screen.getByRole("button", { name: "团队模式已开启" }));
 
     // 说明一句话:如实告知队长引擎与计费差异
-    const note = await screen.findByText(/队长引擎为 GPT-5\.5/);
+    const note = await screen.findByText(/队长引擎为 GPT-5\.6-Sol/);
     expect(note.textContent).toContain("计费高于默认模型");
 
     fireEvent.click(screen.getByRole("button", { name: "关闭团队模式" }));
@@ -57,7 +57,7 @@ describe("ChatHeader 团队模式指示 chip", () => {
   it("teamModeActive=true 时顶栏 ModelSelector 显示实际生效的队长引擎", () => {
     renderHeader({ teamModeActive: true, onDisableTeamMode: () => {} });
     const trigger = screen.getByRole("button", { name: "选择对话模型" });
-    expect(trigger.textContent).toContain("团队模式 · GPT-5.5");
+    expect(trigger.textContent).toContain("团队模式 · GPT-5.6-Sol");
     expect(trigger.textContent).not.toContain("GLM-5.2");
   });
 

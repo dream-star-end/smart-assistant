@@ -22,7 +22,7 @@ describe("PreferencesSchema (full)", () => {
   test("接受全部已知字段的合法值", () => {
     const r = PreferencesSchema.safeParse({
       theme: "dark",
-      default_model: "claude-opus-4-7",
+      default_model: "gpt-5.6-sol",
       default_effort: "high",
       notify_email: true,
       notify_telegram: false,
@@ -43,7 +43,7 @@ describe("PreferencesSchema (full)", () => {
   });
 
   test("default_effort 必须在枚举内", () => {
-    const ok = PreferencesSchema.safeParse({ default_effort: "xhigh" });
+    const ok = PreferencesSchema.safeParse({ default_effort: "max" });
     const bad = PreferencesSchema.safeParse({ default_effort: "ultra" });
     assert.equal(ok.success, true);
     assert.equal(bad.success, false);

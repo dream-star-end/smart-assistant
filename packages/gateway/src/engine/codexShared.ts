@@ -12,6 +12,10 @@
  */
 import { copyFile, mkdir } from 'node:fs/promises'
 import { basename, join } from 'node:path'
+import {
+  modelReasoningPolicy,
+  type PlatformReasoningEffort,
+} from '@openclaude/protocol'
 import { createLogger } from '../logger.js'
 
 const log = createLogger({ module: 'codexShared' })
@@ -81,23 +85,30 @@ export async function copyImagePathsToPublicDir(
 }
 
 /**
- * Codex CLI 接受 `-c model_reasoning_effort=<val>`,合法值实测:
- *   none, minimal, low, medium, high, xhigh
- * 协议 `InboundMessage.effortLevel` 允许 low/medium/high/xhigh/max(对齐
- * DeepSeek/GLM 的统一前端模型)。这里:
- *   - low/medium/high/xhigh → 透传
- *   - max → 显式映射 xhigh(用户意图"最高",不能静默退回 codex 默认 medium)
- *   - 其他/缺失 → 不带 effort flag,让 codex 用它的默认(medium)
- *
- * 公共归一逻辑必须一处定义,否则 `max → xhigh` 映射 / allowlist 任一改动都会
- * 在多个 spawn 路径间漂移(原 codexRunner.ts / codexAppServerRunner.ts 教训)。
+ * 把用户覆盖收敛到 protocol 的 per-model 思考权威。已知 Codex 型号在用户未覆盖
+ * 或传入非法档位时回到该型号自身默认(Sol=low,Terra/Luna=medium),而不是旧版
+ * 一律强制 high。`max` 在 Codex 0.144 已原生支持,直接透传,不再降成 xhigh。
  */
-const CODEX_EFFORT_DIRECT = new Set(['low', 'medium', 'high', 'xhigh'])
-export function codexReasoningEffortConfig(level: string | undefined | null): string[] {
-  if (typeof level !== 'string' || level.length === 0) return []
-  const normalized = level === 'max' ? 'xhigh' : level
-  if (!CODEX_EFFORT_DIRECT.has(normalized)) return []
-  return ['-c', `model_reasoning_effort="${normalized}"`]
+export function normalizeCodexReasoningEffort(
+  modelId: string | undefined,
+  level: string | undefined | null,
+): PlatformReasoningEffort | null {
+  const policy = modelReasoningPolicy(modelId ?? '')
+  if (
+    typeof level === 'string' &&
+    policy.supported.includes(level as PlatformReasoningEffort)
+  ) {
+    return level as PlatformReasoningEffort
+  }
+  return policy.codexModelDefault
+}
+
+export function codexReasoningEffortConfig(
+  modelId: string | undefined,
+  level: string | undefined | null,
+): string[] {
+  const normalized = normalizeCodexReasoningEffort(modelId, level)
+  return normalized ? ['-c', `model_reasoning_effort="${normalized}"`] : []
 }
 
 /** env 值是否为"显式打开"(on/1/true/yes)。默认关的开关用它。 */

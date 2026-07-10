@@ -15,6 +15,13 @@ import type { MediaRef } from "./frames";
 /** 用户消息状态机（派生展示，不持久化 'replied'，§9）。*/
 export type UserMsgStatus = "sending" | "sent" | "queued" | "read" | "replied" | "error";
 
+/** A user turn's immutable model/team/reasoning selection, reused by retry. */
+export type ChatRoutingSnapshot = {
+  model?: string;
+  teamMode?: boolean;
+  effortLevel?: string | null;
+};
+
 /** Plan 卡步骤（frames.ts plan.steps）。*/
 export type PlanStep = { step: string; status: "pending" | "inProgress" | "completed" };
 
@@ -116,6 +123,8 @@ export type ChatMessage = {
   _media?: MediaRef[];
   /** 含附件的完整模型可见文本（regen 用）。*/
   _modelText?: string;
+  /** 首发时的路由快照；重试旧消息时不能被后续 turn 的选择覆盖。*/
+  _routing?: ChatRoutingSnapshot;
   _isAutoRetry?: boolean;
   /** auto-continue 的确定性 idempotencyKey（dedup ack 对账）。*/
   _idem?: string;
@@ -227,7 +236,7 @@ export type ChatSession = {
    *  (服务重启自动续写/空轮续写)必须复用——否则桥按默认模型分类,不做 codex
    *  改写(无 server requestId/无 preCheck),暖 codex 会话续写被计费闸 fail-closed
    *  拒绝(2026-07-07 boss 团队模式"一直无响应"事故:CODEX_BILLING_GUARD)。 */
-  _lastRouting?: { model?: string; teamMode?: boolean; effortLevel?: string | null };
+  _lastRouting?: ChatRoutingSnapshot;
   // ── frameSeq 去重游标（§3）──
   _lastFrameSeqByKey?: Record<string, number>;
   _lastFrameSeq?: number;

@@ -391,8 +391,8 @@ describe('CronScheduler.runJob — 合成首帧非 codex 路由字段补齐', ()
 
   const job = { id: 'heartbeat', schedule: '13 */4 * * *', prompt: 'ping', enabled: true, heartbeat: true } as any
 
-  it('codex 默认(agent 无 model + defaults=gpt-5.5)→ getOrCreate+submit 均带非 codex 兜底模型', async () => {
-    const { sched, getOrCreateOpts, submitCalls } = makeSchedulerWithSpies('gpt-5.5')
+  it('codex 默认(agent 无 model + defaults=gpt-5.6-sol)→ getOrCreate+submit 均带非 codex 兜底模型', async () => {
+    const { sched, getOrCreateOpts, submitCalls } = makeSchedulerWithSpies('gpt-5.6-sol')
     await (sched as any).runJob(job, { id: 'main' })
     assert.equal(getOrCreateOpts.length, 1)
     assert.equal(getOrCreateOpts[0].model, 'deepseek-v4-pro', 'getOrCreate 必须收到非 codex 模型(runner engine 决定点)')
@@ -400,15 +400,15 @@ describe('CronScheduler.runJob — 合成首帧非 codex 路由字段补齐', ()
     assert.equal(submitCalls[0].model, 'deepseek-v4-pro', 'submit 必须带同源 model 路由字段')
   })
 
-  it('agent 显式 gpt-5.5(codex)→ 同样替换为非 codex 兜底', async () => {
+  it('agent 显式 gpt-5.6-sol(codex)→ 同样替换为非 codex 兜底', async () => {
     const { sched, getOrCreateOpts, submitCalls } = makeSchedulerWithSpies('glm-5.2')
-    await (sched as any).runJob(job, { id: 'main', model: 'gpt-5.5' })
+    await (sched as any).runJob(job, { id: 'main', model: 'gpt-5.6-sol' })
     assert.equal(getOrCreateOpts[0].model, 'deepseek-v4-pro')
     assert.equal(submitCalls[0].model, 'deepseek-v4-pro')
   })
 
   it('非 codex agent(glm-5.2)→ 不覆盖(getOrCreate 不带 model,submit model=undefined)', async () => {
-    const { sched, getOrCreateOpts, submitCalls } = makeSchedulerWithSpies('gpt-5.5')
+    const { sched, getOrCreateOpts, submitCalls } = makeSchedulerWithSpies('gpt-5.6-sol')
     await (sched as any).runJob(job, { id: 'x', model: 'glm-5.2' })
     // 尊重原配置:getOrCreate 不注入 model 键(沿用 agent 默认),submit model 为 undefined。
     assert.equal('model' in getOrCreateOpts[0], false, '非 codex 不应注入 model override')

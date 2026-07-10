@@ -119,11 +119,13 @@ export type PublicConfig = {
 };
 
 /**
- * 公开模型视图（GET /api/public/models）。v5 经后端 dropGptForV5Channel 过滤掉 gpt-*，
- * 仅 claude / glm-5.2 / deepseek / minimax。字段宽松透传：前端只做展示与选择，权威在后端。
+ * 公开模型视图（GET /api/public/models）。字段宽松透传：前端只做展示与选择，
+ * 模型准入、计费与思考能力权威均在后端/protocol。
  */
 export type PublicModel = {
   id: string;
+  /** protocol modelReasoningPolicy 的 API 投影；空数组 = 不支持思考深度。 */
+  supported_efforts?: Array<"low" | "medium" | "high" | "xhigh" | "max">;
   /**
    * 0108 provider 健康度:后端 /api/models 对归属 provider 生效降级的模型注解 true
    * (只注解不过滤)。ModelSelector 据此标「暂不可用」徽记 + 禁选。

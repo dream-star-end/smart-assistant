@@ -30,26 +30,34 @@ function pairsOf(args: string[]): string[] {
 }
 
 describe('codexReasoningEffortConfig', () => {
-  it('returns empty array for missing / empty / invalid input', () => {
-    assert.deepEqual(codexReasoningEffortConfig(undefined), [])
-    assert.deepEqual(codexReasoningEffortConfig(null), [])
-    assert.deepEqual(codexReasoningEffortConfig(''), [])
-    assert.deepEqual(codexReasoningEffortConfig('turbo'), [])
-    assert.deepEqual(codexReasoningEffortConfig('minimal'), [])
-  })
-
-  it('returns -c slot for direct levels', () => {
-    assert.deepEqual(codexReasoningEffortConfig('low'), ['-c', 'model_reasoning_effort="low"'])
-    assert.deepEqual(codexReasoningEffortConfig('medium'), [
+  it('known GPT-5.6 models use their own default for missing/invalid input', () => {
+    assert.deepEqual(codexReasoningEffortConfig('gpt-5.6-sol', undefined), [
+      '-c',
+      'model_reasoning_effort="low"',
+    ])
+    assert.deepEqual(codexReasoningEffortConfig('gpt-5.6-terra', 'turbo'), [
       '-c',
       'model_reasoning_effort="medium"',
     ])
-    assert.deepEqual(codexReasoningEffortConfig('high'), ['-c', 'model_reasoning_effort="high"'])
-    assert.deepEqual(codexReasoningEffortConfig('xhigh'), ['-c', 'model_reasoning_effort="xhigh"'])
+    assert.deepEqual(codexReasoningEffortConfig('gpt-5.6-luna', null), [
+      '-c',
+      'model_reasoning_effort="medium"',
+    ])
+    assert.deepEqual(codexReasoningEffortConfig('gpt-5.5', undefined), [])
   })
 
-  it('max → xhigh explicit map', () => {
-    assert.deepEqual(codexReasoningEffortConfig('max'), ['-c', 'model_reasoning_effort="xhigh"'])
+  it('returns -c slot for direct levels', () => {
+    assert.deepEqual(codexReasoningEffortConfig('gpt-5.6-sol', 'low'), ['-c', 'model_reasoning_effort="low"'])
+    assert.deepEqual(codexReasoningEffortConfig('gpt-5.6-terra', 'medium'), [
+      '-c',
+      'model_reasoning_effort="medium"',
+    ])
+    assert.deepEqual(codexReasoningEffortConfig('gpt-5.6-luna', 'high'), ['-c', 'model_reasoning_effort="high"'])
+    assert.deepEqual(codexReasoningEffortConfig('gpt-5.6-sol', 'xhigh'), ['-c', 'model_reasoning_effort="xhigh"'])
+  })
+
+  it('Codex 0.144 passes max through without downgrading to xhigh', () => {
+    assert.deepEqual(codexReasoningEffortConfig('gpt-5.6-sol', 'max'), ['-c', 'model_reasoning_effort="max"'])
   })
 })
 

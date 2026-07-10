@@ -26,6 +26,7 @@ import {
 import {
   addMessage,
   type ChatMessage,
+  type ChatRoutingSnapshot,
   type ChatSession,
   clearTurnTiming,
   createSession,
@@ -82,6 +83,7 @@ import type {
   RepoBindErrorWire,
   RepoStatusWire,
 } from "./frames";
+import { DEFAULT_CODEX_ENGINE_MODEL } from "@openclaude/protocol";
 
 export type { ChatStatusClass };
 
@@ -143,6 +145,14 @@ export type ChatSnapshot = {
 };
 
 const WS_PATH = "/ws/user-chat-bridge";
+
+/** Persisted pre-cutover turns must replay on the replacement Codex model. */
+function normalizeRetiredRouting(
+  routing: ChatRoutingSnapshot | undefined,
+): ChatRoutingSnapshot | undefined {
+  if (!routing || routing.model !== "gpt-5.5") return routing;
+  return { ...routing, model: DEFAULT_CODEX_ENGINE_MODEL };
+}
 
 /** rAF 合并渲染的隐藏-tab 兜底间隔:rAF 在隐藏 tab 被节流到几乎不触发,用此 setTimeout
  *  保证 snapshot 仍按时刷新 + listeners 触发(避免后台积压、切前台时一致);也封顶渲染延迟。*/
@@ -1406,7 +1416,12 @@ export class ChatSocket {
       title: stored.title,
       createdAt: stored.createdAt,
     });
-    s.messages = Array.isArray(stored.messages) ? stored.messages : [];
+    s.messages = Array.isArray(stored.messages)
+      ? stored.messages.map((message) => {
+          const routing = normalizeRetiredRouting(message._routing);
+          return routing !== message._routing ? { ...message, _routing: routing } : message;
+        })
+      : [];
     s.lastAt = typeof stored.lastAt === "number" ? stored.lastAt : s.lastAt;
     s.updatedAt = stored.updatedAt;
     s._lastFrameSeqByKey = stored._lastFrameSeqByKey ? { ...stored._lastFrameSeqByKey } : {};
@@ -1434,7 +1449,8 @@ export class ChatSocket {
       typeof stored._trackerResetServerTs === "number" ? stored._trackerResetServerTs : undefined;
     s._localTeardownAt = typeof stored._localTeardownAt === "number" ? stored._localTeardownAt : undefined;
     s._agentSwitchedAt = typeof stored._agentSwitchedAt === "number" ? stored._agentSwitchedAt : null;
-    s._lastRouting = stored._lastRouting ? { ...stored._lastRouting } : undefined;
+    const restoredRouting = normalizeRetiredRouting(stored._lastRouting);
+    s._lastRouting = restoredRouting ? { ...restoredRouting } : undefined;
     rebuildIndexes(s);
     normalizeDelegateCards(s);
     this.sessions.set(stored.id, s);
@@ -1568,7 +1584,8 @@ export class ChatSocket {
     const ensurePromise = this.ensureServerSessionOnce(sess, p.agentId);
     // 路由字段快照:合成续写(服务重启/空轮)复用同一路由,保证桥的 codex 分类
     // (server requestId 注入/preCheck)与被中断 turn 一致。
-    sess._lastRouting = { model: p.model, teamMode: !!p.teamMode, effortLevel: p.effortLevel ?? null };
+    const routing = { model: p.model, teamMode: !!p.teamMode, effortLevel: p.effortLevel ?? null };
+    sess._lastRouting = routing;
     const media = p.media && p.media.length > 0 ? p.media : undefined;
     const payload: InboundMessage = {
       type: "inbound.message",
@@ -1587,6 +1604,7 @@ export class ChatSocket {
       status: "sending",
       _media: media,
       _modelText: p.displayText && p.displayText !== p.text ? p.text : undefined,
+      _routing: { ...routing },
     });
     // 跨设备持久化用户消息:行确保存在后,带本地 client id POST 给 master(getSession 回带同
     // id → 合并天然去重,不与本地乐观 user 重复)。best-effort:失败不影响发送(本地 + IndexedDB
@@ -1704,35 +1722,44 @@ export class ChatSocket {
   /**
    * 重试一条发送失败(status==='error')的用户消息（用户报障：发送失败仅红字、无重试）。
    * 复用原消息 payload（含附件引用 _media / 保真文本 _modelText），走既有 dispatchPayload
-   * 单一发送收口**原地**重发（不新增气泡）；model/effort/teamMode 用当前上下文（App 传入）。
+   * 单一发送收口**原地**重发（不新增气泡）；model/effort/teamMode 必须复用该次首发
+   * 的 session routing 快照,不能被用户随后修改的偏好改变。
    */
   retryMessage(p: {
     sessId: string;
     msgId: string;
     agentId: string;
-    model?: string;
-    effortLevel?: InboundMessage["effortLevel"];
-    teamMode?: boolean;
   }): void {
     const sess = this.sessions.get(p.sessId);
     if (!sess) return;
     const userMsg = sess.messages.find((m) => m.id === p.msgId && m.role === "user");
     if (!userMsg || userMsg.status !== "error") return;
     // 主控建行可能在首发失败时未确保 → 幂等补一次(best-effort,不阻塞发送)。
-    void this.ensureServerSessionOnce(sess, p.agentId);
+    const agentId = sess.agentId || p.agentId;
+    void this.ensureServerSessionOnce(sess, agentId);
     const media = userMsg._media && userMsg._media.length > 0 ? userMsg._media : undefined;
     const text = userMsg._modelText ?? userMsg.text ?? "";
-    sess._lastRouting = { model: p.model, teamMode: !!p.teamMode, effortLevel: p.effortLevel ?? null };
+    // Historical rows written before message-level snapshots fall back to the session
+    // snapshot; all new rows bind retry routing to the original user turn.
+    const routing = normalizeRetiredRouting(userMsg._routing ?? sess._lastRouting);
+    if (routing) {
+      userMsg._routing = { ...routing };
+      // Continuations belong to the retried turn, not to a later turn that last
+      // overwrote the session snapshot before this retry was dispatched.
+      sess._lastRouting = { ...routing };
+    }
     const payload: InboundMessage = {
       type: "inbound.message",
       idempotencyKey: `web-retry-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
       channel: "webchat",
       peer: { id: sess.id, kind: "dm" },
-      agentId: p.agentId,
+      agentId,
       content: { text, ...(media ? { media } : {}) },
-      ...(p.effortLevel !== undefined ? { effortLevel: p.effortLevel } : {}),
-      ...(p.model ? { model: p.model } : {}),
-      ...(p.teamMode ? { teamMode: true } : {}),
+      ...(routing && Object.prototype.hasOwnProperty.call(routing, "effortLevel")
+        ? { effortLevel: routing.effortLevel as InboundMessage["effortLevel"] }
+        : {}),
+      ...(routing?.model ? { model: routing.model } : {}),
+      ...(routing?.teamMode ? { teamMode: true } : {}),
       ts: Date.now(),
     };
     userMsg.status = "sending"; // 立即回显；dispatchPayload 据结果改 sent/queued/error
@@ -1823,7 +1850,7 @@ export class ChatSocket {
       peer: { id: sess.id, kind: "dm" },
       agentId: sess.agentId || this.deps.defaultAgentId || "main",
       content: { text: RESTART_CONTINUE_PROMPT },
-      ...(routing?.effortLevel != null ? { effortLevel: routing.effortLevel as InboundMessage["effortLevel"] } : {}),
+      ...(routing && Object.prototype.hasOwnProperty.call(routing, "effortLevel") ? { effortLevel: routing.effortLevel as InboundMessage["effortLevel"] } : {}),
       ...(routing?.model ? { model: routing.model } : {}),
       ...(routing?.teamMode ? { teamMode: true } : {}),
       ts: Date.now(),
@@ -1887,7 +1914,7 @@ export class ChatSocket {
       peer: { id: sess.id, kind: "dm" },
       agentId: sess.agentId || this.deps.defaultAgentId || "main",
       content: { text: AUTO_CONTINUE_PROMPT },
-      ...(routing?.effortLevel != null ? { effortLevel: routing.effortLevel as InboundMessage["effortLevel"] } : {}),
+      ...(routing && Object.prototype.hasOwnProperty.call(routing, "effortLevel") ? { effortLevel: routing.effortLevel as InboundMessage["effortLevel"] } : {}),
       ...(routing?.model ? { model: routing.model } : {}),
       ...(routing?.teamMode ? { teamMode: true } : {}),
       ts: Date.now(),

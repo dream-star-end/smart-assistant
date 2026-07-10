@@ -1326,12 +1326,12 @@ describe("inboundDispatcher — wire correctness", () => {
     const d = makeInboundDispatcher(
       makeDeps({
         transport,
-        resolveModel: async () => "gpt-5.5",
+        resolveModel: async () => "gpt-5.6-sol",
         prepareCodexTurn: async (args) => {
           assert.equal(args.containerId, CONTAINER_ID)
           assert.equal(args.bindingUserId, BINDING_UID)
           assert.equal(args.userId, BigInt(BINDING_UID))
-          assert.equal(args.modelId, "gpt-5.5")
+          assert.equal(args.modelId, "gpt-5.6-sol")
           assert.equal(args.agentId, "main")
           return {
             kind: "ready",
@@ -1349,7 +1349,7 @@ describe("inboundDispatcher — wire correctness", () => {
       }),
     )
     await d.dispatch(makeEvent())
-    assert.equal(spy.posts[0]!.bodyParsed.model, "gpt-5.5")
+    assert.equal(spy.posts[0]!.bodyParsed.model, "gpt-5.6-sol")
     assert.equal(spy.posts[0]!.bodyParsed.requestId, "0123456789abcdef0123456789abcdef")
     assert.deepEqual(
       spy.posts[0]!.bodyParsed.__oc_codex_route,
@@ -1388,7 +1388,7 @@ describe("inboundDispatcher — wire correctness", () => {
     const d = makeInboundDispatcher(
       makeDeps({
         transport,
-        resolveModel: async () => "gpt-5.5",
+        resolveModel: async () => "gpt-5.6-sol",
         prepareCodexTurn: async () => ({ kind: "unavailable", reply: "GPT unavailable" }),
       }),
     )
@@ -1404,7 +1404,7 @@ describe("inboundDispatcher — wire correctness", () => {
     const d = makeInboundDispatcher(
       makeDeps({
         transport,
-        resolveModel: async () => "gpt-5.5",
+        resolveModel: async () => "gpt-5.6-sol",
         prepareCodexTurn: async () => ({
           kind: "ready",
           requestId: "0123456789abcdef0123456789abcdef",
@@ -1436,7 +1436,7 @@ describe("inboundDispatcher — wire correctness", () => {
     const d = makeInboundDispatcher(
       makeDeps({
         transport,
-        resolveModel: async () => "gpt-5.5",
+        resolveModel: async () => "gpt-5.6-sol",
         prepareCodexTurn: async () => ({
           kind: "ready",
           requestId: "0123456789abcdef0123456789abcdef",

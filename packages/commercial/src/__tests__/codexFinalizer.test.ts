@@ -42,7 +42,7 @@ import { InMemoryPreCheckRedis } from "../billing/preCheck.js";
 // ---------- fixtures --------------------------------------------------------
 
 const PRICING: ModelPricing = {
-  model_id: "gpt-5.5",
+  model_id: "gpt-5.6-sol",
   display_name: "GPT 5.5",
   input_per_mtok: 1000n,
   output_per_mtok: 5000n,
@@ -219,7 +219,7 @@ async function makeFixture(opts: {
     requestId,
     // v5 口径:session_id 必须是 deriveEngineSessionId 产物(oceng-<48hex>)。
     engineSessionId: deriveEngineSessionId(`test-session:${requestId}`),
-    model: "gpt-5.5",
+    model: "gpt-5.6-sol",
     derivedPricing: PRICING,
     reservation,
   };

@@ -180,6 +180,40 @@ bash scripts/deploy-v5.sh --smoke
 ```
 红线:只从部署树发;绝不手工 rsync+restart 绕过脚本;v3 的 service/env/Caddy 一律不碰。
 
+### 4.2b 跨 master/runtime/dist/迁移的原子切换
+模型目录、协议准入等同时触及 master、容器镜像、前端和破坏性数据迁移时，禁止依次热更；
+否则新 master 可能把请求发给旧 runtime，或旧 master 在迁移后继续写已退场型号。走停机切换 lane：
+
+```bash
+# 0) 本 lane 会退役共享库中的 GPT-5.5，因此先确认 v3 已永久退役停机；再开启
+#    维护模式并确认入口不再接新 turn，然后停 master（egress 不动）。stage / activate
+#    都会再次 fail-closed 断言 v3 inactive，且拒绝从脏 git 工作树发布。
+ssh kl-mirror 'test "$(systemctl is-active openclaude-v3 2>/dev/null || true)" = inactive'
+ssh kl-mirror 'systemctl stop openclaude-v5'
+
+# 1) master 已停后，将 v5 DB active 行置 vanished，删除所有带
+#    com.openclaude.runtime_channel=v5 标签的容器；脚本要求 Docker=0、DB active=0
+#    连续保持真实 5 秒（总等待上限 60 秒），防 supervisor 迟到重建。
+bash scripts/deploy-v5.sh --offline-recycle
+
+# 2) 在 master 保持停机时快照并 stage source + 新 dist；本模式绝不启动服务。
+bash scripts/deploy-v5.sh --stage
+
+# 3) 以已 stage 的远端源码构建新 runtime image；成功后受控 apply migration，
+#    再把 /etc/openclaude/commercial-v5.env 的 OC_RUNTIME_IMAGE 切到新 tag。
+#    迁移和 env 切换任一步失败都保持 master 停机，修复/回滚后再继续。
+
+# 4) 一次性激活。脚本先断言 migration 0123 数据形态、staged VERSION、oc-build、
+#    runtime image 源码提交标签及实际 Codex 0.144.0 二进制，再 start 一次并跑完整
+#    smoke + 前端版本握手。
+bash scripts/deploy-v5.sh --activate-staged
+
+# 5) 管理面/模型 API/真实 canary 通过后关闭维护模式。
+```
+
+三种模式都要求 `openclaude-v5.service` 已 inactive（dry-run 除外）；不要用普通
+`deploy-v5.sh` 或 `--dist` 拆开代替。离线回收保留 workspace/home volume，只删执行容器。
+
 ### 4.3 runtime image 重建
 ```bash
 # 在 kl-mirror 上、源=已部署树。⚠️ 非交互 ssh 必须带 bun 的 PATH,否则 FATAL 没 bun

@@ -101,7 +101,7 @@ function makeHarness(opts: Partial<EngineCreateOpts> = {}): Harness {
     sessionKey: SESSION_KEY,
     agentId: "main",
     agentBaseDir: tmpdir(),
-    model: "gpt-5.5",
+    model: "gpt-5.6-sol",
     ...opts,
   } as EngineCreateOpts);
   const events: EngineEvent[] = [];
@@ -175,8 +175,8 @@ describe("CodexAdapter — 握手 / thread lifecycle", () => {
     assert.deepEqual(h.spawnCalls[0].cmd, "codex");
     assert.equal(h.spawnCalls[0].args[0], "app-server");
     assert.ok(
-      h.spawnCalls[0].args.includes('model_reasoning_effort="high"'),
-      `spawn argv should default GPT/Codex effort to high: ${h.spawnCalls[0].args.join(" ")}`,
+      h.spawnCalls[0].args.includes('model_reasoning_effort="low"'),
+      `spawn argv should use GPT-5.6-Sol default effort low: ${h.spawnCalls[0].args.join(" ")}`,
     );
     assert.deepEqual(h.spawnCalls[0].args.slice(-2), ["--listen", "stdio://"]);
     const initParams = init.params as { clientInfo?: { name?: string }; capabilities?: { experimentalApi?: boolean } };
@@ -187,11 +187,11 @@ describe("CodexAdapter — 握手 / thread lifecycle", () => {
     const tsParams = threadStart.params as Record<string, unknown>;
     assert.equal(tsParams.approvalPolicy, "never");
     assert.equal(tsParams.sandbox, "danger-full-access");
-    assert.equal(tsParams.model, "gpt-5.5");
+    assert.equal(tsParams.model, "gpt-5.6-sol");
 
     const turnStart = await waitForRequest(h, "turn/start");
     const turnParams = turnStart.params as { collaborationMode?: { settings?: { reasoning_effort?: unknown } } };
-    assert.equal(turnParams.collaborationMode?.settings?.reasoning_effort, "high");
+    assert.equal(turnParams.collaborationMode?.settings?.reasoning_effort, "low");
     assert.deepEqual(h.sessionIds, ["thr-new-1"]);
     assert.equal(h.adapter.nativeSessionId, "thr-new-1");
 

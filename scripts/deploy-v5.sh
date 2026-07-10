@@ -19,6 +19,9 @@
 #   scripts/deploy-v5.sh               # 增量部署:快照 + rsync 源码 + restart v5 + smoke
 #   scripts/deploy-v5.sh --smoke       # 仅跑 v5 健康/隔离断言
 #   scripts/deploy-v5.sh --dist        # 前端生效面:vite build + 竞态安全 rsync + 资产GC + restart + 版本握手 smoke
+#   scripts/deploy-v5.sh --offline-recycle # master 停机后离线清空 v5 执行容器(DB vanished+Docker quiet barrier)
+#   scripts/deploy-v5.sh --stage       # master 停机时只 stage source+dist,不启动(原子迁移窗口)
+#   scripts/deploy-v5.sh --activate-staged # 校验 staged source+dist 后一次性启动 + smoke
 #   scripts/deploy-v5.sh --rollback    # 恢复 .prev.1 + restart
 #   scripts/deploy-v5.sh --rollback=N  # 恢复 .prev.N(N=1..5)+ restart
 #   scripts/deploy-v5.sh --dry-run     # 只打印将执行的动作
@@ -93,6 +96,9 @@ for arg in "$@"; do
     --bootstrap) MODE="bootstrap" ;;
     --smoke) MODE="smoke" ;;
     --dist) MODE="dist" ;;
+    --offline-recycle) MODE="offline-recycle" ;;
+    --stage) MODE="stage" ;;
+    --activate-staged) MODE="activate-staged" ;;
     --rollback) MODE="rollback"; ROLLBACK_N=1 ;;
     --rollback=*) MODE="rollback"; ROLLBACK_N="${arg#*=}" ;;
     # egress split(2026-07-02):openclaude-v5-egress 持有在飞 LLM 流,默认部署
@@ -123,6 +129,24 @@ assert_runtime_channel_column() {
   echo "  ✓ runtime_channel 列已存在(0088 已应用),部署顺序前置满足。"
 }
 
+assert_gpt56_migration_ready() {
+  if [[ "$DRY" == 1 ]]; then
+    echo "  [dry-run] 断言 migration 0123 + GPT-5.6 三型号已就绪、GPT-5.5 已退役"
+    return 0
+  fi
+  local ready
+  ready="$(ssh "$KL_HOST" "set -a; . '$V5_ENV' 2>/dev/null; psql \"\$DATABASE_URL\" -X -v ON_ERROR_STOP=1 -tAc \"SELECT (EXISTS (SELECT 1 FROM schema_migrations WHERE version='0123_gpt56_models') AND (SELECT count(*) FROM model_pricing WHERE model_id IN ('gpt-5.6-sol','gpt-5.6-terra','gpt-5.6-luna') AND enabled IS TRUE) = 3 AND EXISTS (SELECT 1 FROM model_pricing WHERE model_id='gpt-5.5' AND enabled IS FALSE AND visibility='hidden') AND NOT EXISTS (SELECT 1 FROM account_group_models WHERE model_id='gpt-5.5') AND NOT EXISTS (SELECT 1 FROM user_preferences WHERE prefs->>'default_model'='gpt-5.5'))::text\"" 2>/dev/null)" || {
+    echo "✗ 无法验证 0123 GPT-5.6 数据迁移状态" >&2
+    exit 1
+  }
+  ready="${ready//[[:space:]]/}"
+  [[ "$ready" == "true" ]] || {
+    echo "✗ 0123 GPT-5.6 数据迁移未完整就绪；保持 $V5_UNIT 停机" >&2
+    exit 1
+  }
+  echo "  ✓ migration 0123 + GPT-5.6 数据切换已就绪"
+}
+
 RSYNC_EXCLUDES=(--exclude '.git' --exclude 'node_modules' --exclude 'data'
   --exclude '*.log' --exclude 'dist' --exclude '.codex' --exclude 'packages/desktop'
   --exclude 'VERSION.json')
@@ -137,6 +161,72 @@ write_version() {
   if [[ "$DRY" == 1 ]]; then echo "  [dry-run] write VERSION.json: $json"; return; fi
   ssh "$KL_HOST" "cat > '$REMOTE_SRC/VERSION.json'" <<<"$json"
   echo "  ✓ VERSION.json: $json"
+}
+
+assert_v5_master_inactive() {
+  if [[ "$DRY" == 1 ]]; then
+    echo "  [dry-run] 断言 $V5_UNIT inactive"
+    return 0
+  fi
+  local state
+  state="$(ssh "$KL_HOST" "systemctl is-active '$V5_UNIT' 2>/dev/null || true")"
+  [[ "$state" == "inactive" || "$state" == "failed" ]] || {
+    echo "✗ 要求 $V5_UNIT 已停机,当前 state=${state:-unknown}" >&2
+    exit 1
+  }
+}
+
+assert_v3_inactive_for_gpt_cutover() {
+  if [[ "$DRY" == 1 ]]; then
+    echo "  [dry-run] 断言 openclaude-v3 inactive(GPT-5.5 共享库退役前置)"
+    return 0
+  fi
+  local state
+  state="$(ssh "$KL_HOST" "systemctl is-active openclaude-v3 2>/dev/null || true")"
+  [[ "$state" == "inactive" || "$state" == "failed" || "$state" == "unknown" ]] || {
+    echo "✗ GPT-5.5 共享库切换要求 openclaude-v3 已退役停机,当前 state=${state:-unknown}" >&2
+    exit 1
+  }
+  echo "  ✓ openclaude-v3 已停机(GPT-5.5 可安全退役)"
+}
+
+assert_clean_source_tree() {
+  if [[ "$DRY" == 1 ]]; then
+    echo "  [dry-run] 断言本地部署树无 staged/unstaged/untracked 改动"
+    return 0
+  fi
+  local dirty
+  dirty="$(git -C "$REPO_ROOT" status --porcelain --untracked-files=all)"
+  [[ -z "$dirty" ]] || {
+    echo "✗ 拒绝从脏工作树 stage/activate:VERSION 与 runtime image 无法证明对应 HEAD" >&2
+    printf '%s\n' "$dirty" >&2
+    exit 1
+  }
+}
+
+snapshot_and_sync_source() {
+  echo "── 快照 $REMOTE_SRC → .prev.1(轮转 1..5)──"
+  sshk "set -e; for n in 5 4 3 2 1; do m=\$((n+1)); if [ -d '$REMOTE_SRC.prev.'\$n ]; then if [ \$m -le 5 ]; then rm -rf '$REMOTE_SRC.prev.'\$m; mv '$REMOTE_SRC.prev.'\$n '$REMOTE_SRC.prev.'\$m; else rm -rf '$REMOTE_SRC.prev.'\$n; fi; fi; done; rm -rf '$REMOTE_SRC.prev.6'; rsync -a --delete ${RSYNC_EXCLUDES[*]} '$REMOTE_SRC/' '$REMOTE_SRC.prev.1/'"
+  echo "── rsync v5 源码 ──"
+  run "rsync -az --delete ${RSYNC_EXCLUDES[*]} '$REPO_ROOT/' '$KL_HOST:$REMOTE_SRC/'"
+  write_version
+}
+
+build_and_sync_dist() {
+  echo "── vite build ──"
+  run "(cd '$REPO_ROOT/packages/web-react' && npx vite build)"
+  local dist="$REPO_ROOT/packages/web-react/dist"
+  if [[ "$DRY" != 1 ]]; then
+    local build_id
+    build_id="$(grep -o 'name="oc-build" content="[0-9a-f]\{8,32\}"' "$dist/index.html" | grep -o '[0-9a-f]\{8,32\}' | head -1)"
+    [[ -n "$build_id" ]] || { echo "✗ dist/index.html 缺 oc-build meta" >&2; exit 1; }
+    echo "  本地构建 oc-build: $build_id"
+  fi
+  echo "── rsync assets(加法,必须先于根文件)──"
+  run "rsync -az '$dist/assets/' '$KL_HOST:$REMOTE_SRC/packages/web-react/dist/assets/'"
+  echo "── rsync 根文件(--delete,排除 assets)──"
+  run "rsync -az --delete --exclude assets '$dist/' '$KL_HOST:$REMOTE_SRC/packages/web-react/dist/'"
+  sshk "find '$REMOTE_SRC/packages/web-react/dist/assets' -type f -mtime +14 -delete"
 }
 
 # ───────────────────────── smoke:健康 + 隔离断言 ─────────────────────────
@@ -275,14 +365,7 @@ deploy() {
   echo "══ v5 deploy on $KL_HOST ══"
   echo "── 守卫:overrides 不得含 REMOVE_KEYS ──"
   assert_overrides_no_remove_keys
-  # 快照轮转 .prev.1..5
-  echo "── 快照 $REMOTE_SRC → .prev.1(轮转 1..5)──"
-  # 轮转用 if(非 && 链)——避免 set -e 下 `[ test ] && cmd` 在 test 失败时整体非零退出;
-  # 且 n=5(最旧)直接 rm 丢弃,不再 mv 到 .prev.6(旧逻辑那条 bug 会造出嵌套的 .prev.6)。
-  sshk "set -e; for n in 5 4 3 2 1; do m=\$((n+1)); if [ -d '$REMOTE_SRC.prev.'\$n ]; then if [ \$m -le 5 ]; then rm -rf '$REMOTE_SRC.prev.'\$m; mv '$REMOTE_SRC.prev.'\$n '$REMOTE_SRC.prev.'\$m; else rm -rf '$REMOTE_SRC.prev.'\$n; fi; fi; done; rm -rf '$REMOTE_SRC.prev.6'; rsync -a --delete ${RSYNC_EXCLUDES[*]} '$REMOTE_SRC/' '$REMOTE_SRC.prev.1/'"
-  echo "── rsync v5 源码 ──"
-  run "rsync -az --delete ${RSYNC_EXCLUDES[*]} '$REPO_ROOT/' '$KL_HOST:$REMOTE_SRC/'"
-  write_version
+  snapshot_and_sync_source
   echo "── 部署顺序守卫:校验 runtime_channel 列(0088)已应用 ──"
   assert_runtime_channel_column
   echo "── restart openclaude-v5(仅 v5,绝不碰 v3)──"
@@ -295,6 +378,142 @@ deploy() {
   fi
   [[ "$DRY" == 1 ]] || smoke
   echo "✓ deploy 完成。"
+}
+
+# ───────────────────────── offline recycle:原子切换前停机清场 ───────────────
+offline_recycle() {
+  echo "══ v5 offline recycle on $KL_HOST ══"
+  assert_v5_master_inactive
+  assert_v3_inactive_for_gpt_cutover
+  if [[ "$DRY" == 1 ]]; then
+    echo "  [dry-run] DB v5 active→vanished + Docker v5 label 清理 + 5s quiet barrier"
+    return 0
+  fi
+  ssh "$KL_HOST" bash -s -- "$V5_ENV" <<'REMOTE'
+set -euo pipefail
+env_file="$1"
+dburl="$(grep '^DATABASE_URL=' "$env_file" | tail -n 1 | cut -d= -f2-)"
+[[ -n "$dburl" ]] || { echo 'FATAL: DATABASE_URL missing' >&2; exit 1; }
+label='com.openclaude.runtime_channel=v5'
+quiet_since=''
+deadline=$(( $(date +%s) + 60 ))
+
+while :; do
+  psql "$dburl" -X -v ON_ERROR_STOP=1 -qAt -c \
+    "UPDATE agent_containers SET state='vanished', updated_at=NOW() WHERE runtime_channel='v5' AND state='active' RETURNING id" \
+    >/tmp/v5-offline-vanished.ids
+
+  ids="$(docker ps -aq --filter "label=$label")"
+  if [[ -n "$ids" ]]; then
+    docker rm -f $ids >/dev/null
+    quiet_since=''
+  fi
+
+  remain="$(docker ps -aq --filter "label=$label")"
+  active="$(psql "$dburl" -X -v ON_ERROR_STOP=1 -tAc \
+    "SELECT count(*) FROM agent_containers WHERE runtime_channel='v5' AND state='active'")"
+  active="${active//[[:space:]]/}"
+  now="$(date +%s)"
+
+  if [[ -z "$remain" && "$active" == "0" ]]; then
+    [[ -n "$quiet_since" ]] || quiet_since="$now"
+    if (( now - quiet_since >= 5 )); then break; fi
+  else
+    quiet_since=''
+  fi
+
+  (( now < deadline )) || {
+    echo 'FATAL: v5 Docker/DB failed to reach 5s quiet window within 60s' >&2
+    exit 1
+  }
+  sleep 1
+done
+
+[[ -z "$(docker ps -aq --filter "label=$label")" ]] || {
+  echo 'FATAL: v5 container appeared after quiet barrier' >&2
+  exit 1
+}
+[[ "$(psql "$dburl" -X -v ON_ERROR_STOP=1 -tAc \
+  "SELECT count(*) FROM agent_containers WHERE runtime_channel='v5' AND state='active'" | tr -d '[:space:]')" == "0" ]] || {
+  echo 'FATAL: active v5 DB row appeared after quiet barrier' >&2
+  exit 1
+}
+echo '  ✓ v5 offline recycle: Docker empty + DB active=0 + quiet>=5s'
+REMOTE
+}
+
+# ───────────────────────── stage/activate:停机原子迁移 lane ─────────────────
+stage() {
+  echo "══ v5 stage(source + dist, no start)on $KL_HOST ══"
+  assert_overrides_no_remove_keys
+  assert_clean_source_tree
+  assert_v5_master_inactive
+  assert_v3_inactive_for_gpt_cutover
+  snapshot_and_sync_source
+  assert_runtime_channel_column
+  build_and_sync_dist
+  assert_v5_master_inactive
+  echo "✓ stage 完成:$V5_UNIT 保持停机,等待 migration/runtime env 后 activate。"
+}
+
+activate_staged() {
+  echo "══ v5 activate staged on $KL_HOST ══"
+  assert_overrides_no_remove_keys
+  assert_clean_source_tree
+  assert_v5_master_inactive
+  assert_v3_inactive_for_gpt_cutover
+  assert_runtime_channel_column
+  assert_gpt56_migration_ready
+  local expected_commit expected_build remote_commit remote_build runtime_image
+  local image_commit image_codex_version actual_codex_version
+  expected_commit="$(git -C "$REPO_ROOT" rev-parse --short HEAD)"
+  expected_build=""
+  if [[ "$DRY" != 1 ]]; then
+    expected_build="$(grep -o 'name="oc-build" content="[0-9a-f]\{8,32\}"' "$REPO_ROOT/packages/web-react/dist/index.html" | grep -o '[0-9a-f]\{8,32\}' | head -1 || true)"
+    [[ -n "$expected_build" ]] || { echo "✗ 本地 dist 缺 oc-build meta" >&2; exit 1; }
+    remote_commit="$(ssh "$KL_HOST" "jq -r .commit '$REMOTE_SRC/VERSION.json'")"
+    remote_build="$(ssh "$KL_HOST" "grep -o 'name=\"oc-build\" content=\"[0-9a-f]\\{8,32\\}\"' '$REMOTE_SRC/packages/web-react/dist/index.html' | grep -o '[0-9a-f]\\{8,32\\}' | head -1")"
+    [[ "$remote_commit" == "$expected_commit" ]] || {
+      echo "✗ staged commit=$remote_commit,expected=$expected_commit" >&2; exit 1;
+    }
+    [[ -n "$expected_build" && "$remote_build" == "$expected_build" ]] || {
+      echo "✗ staged oc-build=$remote_build,expected=$expected_build" >&2; exit 1;
+    }
+    runtime_image="$(ssh "$KL_HOST" "grep '^OC_RUNTIME_IMAGE=' '$V5_ENV' | tail -n 1 | cut -d= -f2-")"
+    [[ -n "$runtime_image" ]] || { echo "✗ OC_RUNTIME_IMAGE missing" >&2; exit 1; }
+    ssh "$KL_HOST" "docker image inspect '$runtime_image' >/dev/null"
+    image_commit="$(ssh "$KL_HOST" "docker image inspect --format '{{ index .Config.Labels \"oc.runtime.source_commit\" }}' '$runtime_image'")"
+    image_codex_version="$(ssh "$KL_HOST" "docker image inspect --format '{{ index .Config.Labels \"oc.runtime.codex_version\" }}' '$runtime_image'")"
+    [[ "$image_commit" == "$expected_commit" ]] || {
+      echo "✗ runtime image source_commit=$image_commit,expected=$expected_commit" >&2; exit 1;
+    }
+    [[ "$image_codex_version" == "0.144.0" ]] || {
+      echo "✗ runtime image codex label=$image_codex_version,expected=0.144.0" >&2; exit 1;
+    }
+    actual_codex_version="$(ssh "$KL_HOST" "docker run --rm --entrypoint codex '$runtime_image' --version")"
+    [[ "$actual_codex_version" == "codex-cli 0.144.0" ]] || {
+      echo "✗ runtime image codex binary=$actual_codex_version,expected='codex-cli 0.144.0'" >&2; exit 1;
+    }
+    echo "  ✓ runtime image source=$image_commit,codex=$actual_codex_version"
+  fi
+  echo "── start openclaude-v5(同构状态一次性激活)──"
+  sshk "systemctl start $V5_UNIT"
+  run "sleep 4"
+  if [[ "$DRY" != 1 ]]; then
+    if ! smoke; then
+      echo "✗ staged activate smoke 失败，重新停机，避免半激活状态继续接流量" >&2
+      ssh "$KL_HOST" "systemctl stop '$V5_UNIT'" || true
+      exit 1
+    fi
+    local live_build
+    live_build="$(ssh "$KL_HOST" "curl -fsS http://127.0.0.1:${V5_PORT}/" | grep -o 'name=\"oc-build\" content=\"[0-9a-f]\\{8,32\\}\"' | grep -o '[0-9a-f]\\{8,32\\}' | head -1 || true)"
+    [[ "$live_build" == "$expected_build" ]] || {
+      echo "✗ live oc-build=$live_build,expected=$expected_build；重新停机" >&2
+      ssh "$KL_HOST" "systemctl stop '$V5_UNIT'" || true
+      exit 1
+    }
+  fi
+  echo "✓ staged v5 已激活。"
 }
 
 # ───────────────────────── dist:前端生效面(web-react)─────────────────────────
@@ -356,5 +575,8 @@ case "$MODE" in
   deploy)    deploy ;;
   smoke)     smoke ;;
   dist)      deploy_dist ;;
+  offline-recycle) offline_recycle ;;
+  stage)     stage ;;
+  activate-staged) activate_staged ;;
   rollback)  rollback ;;
 esac

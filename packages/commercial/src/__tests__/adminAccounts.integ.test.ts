@@ -909,7 +909,7 @@ describe("admin ledger — list + 过滤", () => {
          (user_id, mode, account_id, model,
           input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
           price_snapshot, cost_credits, session_id, request_id, status)
-       VALUES ($1, 'chat', NULL, 'gpt-5.5',
+       VALUES ($1, 'chat', NULL, 'gpt-5.6-sol',
           10, 20, 0, 0, '{}'::jsonb, 25, 'wsess-0123456789abcdef', 'req-ledger-meta-wechat', 'success')
        RETURNING id::text AS id`,
       [u.toString()],
@@ -928,7 +928,7 @@ describe("admin ledger — list + 过滤", () => {
 
     const rows = await listLedger({ userId: u.toString() });
     assert.equal(rows.rows.length, 1);
-    assert.equal(rows.rows[0].model, "gpt-5.5");
+    assert.equal(rows.rows[0].model, "gpt-5.6-sol");
     assert.equal(rows.rows[0].channel, "wechat");
   });
 

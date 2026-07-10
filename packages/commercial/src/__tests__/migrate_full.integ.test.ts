@@ -1,6 +1,7 @@
 import { describe, test, before, after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
+import { copyFile, mkdtemp, readFile, readdir, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { createPool, closePool, setPoolOverride, resetPool } from "../db/index.js";
@@ -214,6 +215,111 @@ describe("full migration suite", () => {
     );
     assert.equal(plan1000.rows[0].amount_cents, "100000");
     assert.equal(plan1000.rows[0].credits, "130000");
+  });
+
+  test("0123 atomically replaces GPT-5.5 with all GPT-5.6 models and migrates preferences", async (t) => {
+    if (skipIfNoPg(t)) return;
+    const here = path.dirname(fileURLToPath(import.meta.url));
+    const sourceDir = path.resolve(here, "../db/migrations");
+    const stagedDir = await mkdtemp(path.join(tmpdir(), "oc-gpt56-migrations-"));
+    try {
+      const files = (await readdir(sourceDir)).filter((file) => file.endsWith(".sql")).sort();
+      for (const file of files.filter((name) => name < "0123_gpt56_models.sql")) {
+        await copyFile(path.join(sourceDir, file), path.join(stagedDir, file));
+      }
+      await runMigrations({ dir: stagedDir });
+
+      const user = await query<{ id: string }>(
+        "INSERT INTO users(email, password_hash) VALUES ($1, $2) RETURNING id::text AS id",
+        ["gpt56-migration@example.com", "argon2$stub"],
+      );
+      const userId = user.rows[0].id;
+      await query(
+        `INSERT INTO user_preferences(user_id, prefs)
+         VALUES ($1, '{"default_model":"gpt-5.5","default_effort":"xhigh","theme":"dark"}'::jsonb)`,
+        [userId],
+      );
+      await query(
+        "INSERT INTO model_visibility_grants(user_id, model_id) VALUES ($1, 'gpt-5.5')",
+        [userId],
+      );
+      const oldGroupMappings = await query<{ cnt: string }>(
+        "SELECT COUNT(*)::text AS cnt FROM account_group_models WHERE model_id='gpt-5.5'",
+      );
+
+      await copyFile(
+        path.join(sourceDir, "0123_gpt56_models.sql"),
+        path.join(stagedDir, "0123_gpt56_models.sql"),
+      );
+      const applied = await runMigrations({ dir: stagedDir });
+      assert.deepEqual(applied.applied, ["0123_gpt56_models"]);
+
+      const models = await query<{
+        model_id: string;
+        enabled: boolean;
+        visibility: string;
+        input_per_mtok: string;
+        output_per_mtok: string;
+        multiplier: string;
+      }>(
+        `SELECT model_id, enabled, visibility,
+                input_per_mtok::text AS input_per_mtok,
+                output_per_mtok::text AS output_per_mtok,
+                multiplier::text AS multiplier
+           FROM model_pricing
+          WHERE model_id IN ('gpt-5.5','gpt-5.6-sol','gpt-5.6-terra','gpt-5.6-luna')
+          ORDER BY model_id`,
+      );
+      assert.deepEqual(models.rows.map((row) => row.model_id), [
+        "gpt-5.5",
+        "gpt-5.6-luna",
+        "gpt-5.6-sol",
+        "gpt-5.6-terra",
+      ]);
+      const old = models.rows.find((row) => row.model_id === "gpt-5.5")!;
+      assert.equal(old.enabled, false);
+      assert.equal(old.visibility, "hidden");
+      for (const model of models.rows.filter((row) => row.model_id !== "gpt-5.5")) {
+        assert.equal(model.enabled, true);
+        assert.equal(model.visibility, "public");
+        assert.equal(model.input_per_mtok, old.input_per_mtok);
+        assert.equal(model.output_per_mtok, old.output_per_mtok);
+        assert.equal(model.multiplier, old.multiplier);
+      }
+
+      const prefs = await query<{ prefs: Record<string, unknown> }>(
+        "SELECT prefs FROM user_preferences WHERE user_id=$1",
+        [userId],
+      );
+      assert.deepEqual(prefs.rows[0].prefs, {
+        theme: "dark",
+        default_model: "gpt-5.6-sol",
+        default_effort: "xhigh",
+      });
+      const mappings = await query<{ model_id: string; cnt: string }>(
+        `SELECT model_id, COUNT(*)::text AS cnt
+           FROM account_group_models
+          WHERE model_id IN ('gpt-5.5','gpt-5.6-sol','gpt-5.6-terra','gpt-5.6-luna')
+          GROUP BY model_id ORDER BY model_id`,
+      );
+      assert.deepEqual(mappings.rows, [
+        { model_id: "gpt-5.6-luna", cnt: oldGroupMappings.rows[0].cnt },
+        { model_id: "gpt-5.6-sol", cnt: oldGroupMappings.rows[0].cnt },
+        { model_id: "gpt-5.6-terra", cnt: oldGroupMappings.rows[0].cnt },
+      ]);
+      const grants = await query<{ model_id: string }>(
+        `SELECT model_id FROM model_visibility_grants
+          WHERE user_id=$1 ORDER BY model_id`,
+        [userId],
+      );
+      assert.deepEqual(grants.rows.map((row) => row.model_id), [
+        "gpt-5.6-luna",
+        "gpt-5.6-sol",
+        "gpt-5.6-terra",
+      ]);
+    } finally {
+      await rm(stagedDir, { recursive: true, force: true });
+    }
   });
 
   test("re-running migrations is still idempotent (applied=0 skipped=7)", async (t) => {

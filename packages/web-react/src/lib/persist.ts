@@ -14,7 +14,7 @@
  *    无需真实 IndexedDB 即可单测核心逻辑。
  */
 import { TEAM_CARD_CLIENT_DISPLAY_FIELDS } from "@openclaude/protocol/teamCards";
-import type { ChatMessage } from "./chat/model";
+import type { ChatMessage, ChatRoutingSnapshot } from "./chat/model";
 import { agentGroupRunId, isServerAuthoredRow } from "./chat/model";
 import { friendlyDelegateResultPreview } from "./chat/reducer";
 
@@ -54,7 +54,7 @@ export type StoredSession = {
   _agentSwitchedAt?: number | null;
   /** 最近一次发送的路由字段快照(model/teamMode/effort);reload 后合成续写复用,
    *  缺失会让暖 codex 会话的续写被计费闸拒(见 chat/model.ts 同名字段注释)。 */
-  _lastRouting?: { model?: string; teamMode?: boolean; effortLevel?: string | null };
+  _lastRouting?: ChatRoutingSnapshot;
 };
 
 /** 解析可用的 IDBFactory；不可用（SSR/jsdom/禁用）返回 null。*/
@@ -200,7 +200,7 @@ export function mergeFullServerWins(server: ChatMessage[], local: ChatMessage[])
   server = dropServerTeamSkeletonsOwnedLocally(server, local);
   const localById = new Map<string, ChatMessage>();
   for (const m of local) if (m?.id) localById.set(m.id, m);
-  const serverMerged = server.map((m) => mergeLocalTeamDisplayFields(m, m?.id ? localById.get(m.id) : undefined));
+  const serverMerged = server.map((m) => mergeLocalClientFields(m, m?.id ? localById.get(m.id) : undefined));
   const serverChanged = serverMerged.some((m, idx) => m !== server[idx]);
   const serverIds = new Set<string>();
   for (const m of server) if (m?.id) serverIds.add(m.id);
@@ -238,7 +238,7 @@ export function applyServerIncremental(
   if (!incoming.length) return local;
   const byId = new Map<string, ChatMessage>();
   for (const m of incoming) if (m?.id) byId.set(m.id, m);
-  const merged = local.map((m) => (m?.id && byId.has(m.id) ? mergeLocalTeamDisplayFields(byId.get(m.id)!, m) : m));
+  const merged = local.map((m) => (m?.id && byId.has(m.id) ? mergeLocalClientFields(byId.get(m.id)!, m) : m));
   const seen = new Set<string>();
   for (const m of local) if (m?.id) seen.add(m.id);
   for (const m of incoming) if (m?.id && !seen.has(m.id)) merged.push(m);
@@ -293,8 +293,18 @@ function hasOwn(obj: Record<string, unknown>, key: string): boolean {
  * turns look blank. Keep the server row as the base, but fill missing/poorer
  * display fields from the richer local IndexedDB row.
  */
-function mergeLocalTeamDisplayFields(serverMsg: ChatMessage, localMsg?: ChatMessage): ChatMessage {
+function mergeLocalClientFields(serverMsg: ChatMessage, localMsg?: ChatMessage): ChatMessage {
   if (!localMsg || serverMsg.id !== localMsg.id) return serverMsg;
+  // server echo owns the durable user row, but these client-only fields are required to
+  // faithfully retry that exact turn after a later turn changes the session routing.
+  if (serverMsg.role === "user" && localMsg.role === "user") {
+    const localFields = {
+      ...(localMsg._media !== undefined ? { _media: localMsg._media } : {}),
+      ...(localMsg._modelText !== undefined ? { _modelText: localMsg._modelText } : {}),
+      ...(localMsg._routing !== undefined ? { _routing: localMsg._routing } : {}),
+    };
+    return Object.keys(localFields).length > 0 ? { ...serverMsg, ...localFields } : serverMsg;
+  }
   // 本地已把 delegate 工具行**原位转换**成 agent-group 富卡（normalizeDelegateToolRow），
   // server 同 id 仍是转换前的 tool 行。直接 server-wins 会把富卡打回裸工具行、丢掉流式期
   // 积累的 childBlocks。此时以本地富卡为底,只从 server 行回填完成态/结果预览（server 可能

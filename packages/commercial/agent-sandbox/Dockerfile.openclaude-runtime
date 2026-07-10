@@ -288,19 +288,16 @@ RUN set -eux; \
 # Codex CLI(@openai/codex)— 跑 GPT 系模型用 app-server JSON-RPC runner
 # ------------------------------------------------------------
 # 个人版 commit 257674bf 已经把 codex app-server 流式 runner 做完(4 轮 Codex review PASS)。
-# v3 容器复用同一份 codex CLI 二进制,gateway 选到 gpt-5.5 时,sessionManager 通过
+# v3/v5 容器复用同一份 codex CLI 二进制,gateway 选到 GPT-5.6 时,sessionManager 通过
 # `runnerKind:'app-server'` 路由到 CodexAppServerRunner,长驻一个 codex app-server 子进程。
 #
-# 版本 pin 0.137.0(2026-06-07 升级,从 0.133 → 0.137):npm latest stable。
-# 升级原因:(1) 拉取 0.133 之后的 app-server / collaboration / tool protocol 修复;
-#          (2) 同批 ship goals + collabAgentToolCall 适配,让商业版跟个人版
-#              Codex goals / 多 Agent UI 行为对齐。
+# 版本 pin 0.144.0(2026-07-10):GPT-5.6 Sol/Terra/Luna 官方模型目录与 max effort 支持。
 # Protocol 兼容性: 前端 normalizer 继续兼容 `{type:'plan'}` 与 0.130+ `todo_list`;
 # 0.137 新增 goal / collaboration 通知由 gateway 显式降级成 OpenClaude
 # `goal` / `Agent` / `Codex:multiAgent` blocks。**真正 e2e 行为验证仍是发布门槛**:
-# 镜像 build 完后必须在 dev 环境跑一次 GPT 5.5 真 turn(包含 image_gen + plan/goal
+# 镜像 build 完后必须对 GPT-5.6 三型号各跑一次真 turn(包含 image_gen + plan/goal
 # + multi-agent 调用)再 ship 生产。出现协议
-# 漂移则把版本回滚到上一已验证 pin(0.133.0)并重 build。
+# 漂移则把版本回滚到上一已验证 pin(0.137.0)并重 build。
 #
 # 全局装到 /usr/local/lib/node_modules/@openai/codex,二进制 symlink 在 /usr/local/bin/codex。
 # 容器内 USER=agent 走默认 PATH 即可命中。
@@ -314,7 +311,7 @@ RUN set -eux; \
 # seam 永不走 codex、模型面无 gpt-*,故 codex 二进制对 v5 是纯死重)。v3 默认 1,行为不变。
 ARG OC_INCLUDE_CODEX=1
 RUN if [ "$OC_INCLUDE_CODEX" = "1" ]; then \
-      npm install -g @openai/codex@0.137.0 --no-audit --no-fund \
+      npm install -g @openai/codex@0.144.0 --no-audit --no-fund \
       && npm cache clean --force \
       && rm -rf /root/.npm; \
     else echo "[v5 ccb-only] skip codex CLI install (OC_INCLUDE_CODEX=0)"; fi

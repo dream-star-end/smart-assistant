@@ -26,6 +26,7 @@
  */
 import { execFileSync } from 'node:child_process'
 import { readFileSync } from 'node:fs'
+import { DEFAULT_CODEX_ENGINE_MODEL } from '@openclaude/protocol'
 import { resolveVisionInput, runVision } from './mcpVisionServer.js'
 import { fail, parseFlags } from './ocResearchClient.js'
 
@@ -226,7 +227,7 @@ async function main(): Promise<void> {
         image: resolved.imagePath,
         kind,
         deterministic: { checks: det, issues },
-        vision: { backend: process.env.OPENCLAUDE_VISION_BACKEND === 'codex' ? 'codex(gpt-5.5)' : 'minimax-m3', pass: visionPass, review: visionText },
+        vision: { backend: process.env.OPENCLAUDE_VISION_BACKEND === 'codex' ? `codex(${DEFAULT_CODEX_ENGINE_MODEL})` : 'minimax-m3', pass: visionPass, review: visionText },
         verdict,
         hint:
           verdict === 'PASS'

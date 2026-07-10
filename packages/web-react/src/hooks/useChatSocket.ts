@@ -71,9 +71,6 @@ export type UseChatSocket = {
     sessId: string;
     msgId: string;
     agentId: string;
-    model?: string;
-    effortLevel?: InboundMessage["effortLevel"];
-    teamMode?: boolean;
   }) => void;
   /** 告知当前选中会话（S1 对账无条件优先拉它）。*/
   setActiveSession: (sessId: string | undefined) => void;

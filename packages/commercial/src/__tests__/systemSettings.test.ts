@@ -76,8 +76,8 @@ describe("KEY_SCHEMAS — allow_registration / maintenance_mode", () => {
 
 describe("KEY_SCHEMAS — default_effort", () => {
   const s = KEY_SCHEMAS.default_effort;
-  test("accepts low/medium/high/xhigh", () => {
-    for (const v of ["low", "medium", "high", "xhigh"]) {
+  test("accepts low/medium/high/xhigh/max", () => {
+    for (const v of ["low", "medium", "high", "xhigh", "max"]) {
       assert.ok(s.safeParse(v).success);
     }
   });

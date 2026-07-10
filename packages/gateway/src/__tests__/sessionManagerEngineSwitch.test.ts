@@ -2,7 +2,7 @@
  * SessionManager 跨 engine 切模型 + stale-resume 时序回归(M1a)。
  *
  * 覆盖任务书两块:
- *   1. 跨 engine 切模型:同 sessionKey 上 glm-5.2 ↔ gpt-5.5,inbound model 经
+ *   1. 跨 engine 切模型:同 sessionKey 上 glm-5.2 ↔ gpt-5.6-sol,inbound model 经
  *      resolveEngine 判定 engine 变化 → 沿用 provider-switch teardown(旧 runner
  *      shutdown + 会话槽替换)+ resume-map 按 engine 隔离(codex thread_id 与
  *      CCB session_id 不互喂,cost 基线不跨底座继承);无模型调用不误踢 engine。
@@ -57,7 +57,7 @@ function makeSm(): { sm: SessionManager; ins: SmInternals } {
 const KEY = "agent:main:webchat:dm:switch-peer";
 const mainAgent = { id: "main", model: "glm-5.2" } as AgentDef;
 
-describe("跨 engine 切模型(glm-5.2 ↔ gpt-5.5 同 sessionKey)", () => {
+describe("跨 engine 切模型(glm-5.2 ↔ gpt-5.6-sol 同 sessionKey)", () => {
   test("ccb → codex:teardown 旧 runner,resume-map/cost 基线不串", async () => {
     const { sm, ins } = makeSm();
     const ccbSession = await sm.getOrCreate({
@@ -88,13 +88,13 @@ describe("跨 engine 切模型(glm-5.2 ↔ gpt-5.5 同 sessionKey)", () => {
       agent: mainAgent,
       channel: "webchat",
       peerId: "switch-peer",
-      model: "gpt-5.5",
+      model: "gpt-5.6-sol",
     });
     assert.equal(oldShutdown, true, "engine 切换必须 shutdown 旧 runner");
     assert.notEqual(codexSession, ccbSession, "会话槽必须替换为新 AgentSession");
     assert.equal(codexSession.runner.engineId, "codex");
     assert.equal(codexSession.providerTag, "codex");
-    assert.equal(codexSession.model, "gpt-5.5");
+    assert.equal(codexSession.model, "gpt-5.6-sol");
     // resume-map 隔离:ccb-tagged 条目不得喂给 codex
     assert.equal(ins._resumeIdFor(KEY, "codex"), undefined);
     assert.equal(codexSession.runner.nativeSessionId, null, "codex 不得继承 CCB session id");
@@ -112,7 +112,7 @@ describe("跨 engine 切模型(glm-5.2 ↔ gpt-5.5 同 sessionKey)", () => {
       agent: mainAgent,
       channel: "webchat",
       peerId: "switch-peer",
-      model: "gpt-5.5",
+      model: "gpt-5.6-sol",
     });
     assert.equal(codexSession.providerTag, "codex");
     // codex 学到 thread id → resume-map 以 engine tag('codex')落账
@@ -141,7 +141,7 @@ describe("跨 engine 切模型(glm-5.2 ↔ gpt-5.5 同 sessionKey)", () => {
       agent: mainAgent,
       channel: "webchat",
       peerId: "switch-peer",
-      model: "gpt-5.5",
+      model: "gpt-5.6-sol",
     });
     const again = await sm.getOrCreate({
       sessionKey: KEY,
@@ -184,7 +184,7 @@ describe("跨 engine 切模型(glm-5.2 ↔ gpt-5.5 同 sessionKey)", () => {
     assert.equal(ccbSession.providerTag, "ccb");
     const pinned = await sm.getOrCreate({
       sessionKey: KEY,
-      agent: { id: "main", model: "gpt-5.5", provider: "codex-native" } as AgentDef,
+      agent: { id: "main", model: "gpt-5.6-sol", provider: "codex-native" } as AgentDef,
       channel: "webchat",
       peerId: "switch-peer",
       // 无 opts.model —— provider pin 单独触发比较

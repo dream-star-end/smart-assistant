@@ -409,12 +409,10 @@ async function handlePublish(
   }
 
   // agent
-  const allowedModels = new Set<string>()
+  let allowedModels: Set<string>
   try {
     if (!deps.listPublicModels) throw new Error('no pricing')
-    const isV5 = (process.env.OC_RUNTIME_CHANNEL?.trim() || 'v3') === 'v5'
-    for (const m of deps.listPublicModels())
-      if (!isV5 || !m.id.toLowerCase().startsWith('gpt-')) allowedModels.add(m.id)
+    allowedModels = new Set(deps.listPublicModels().map((m) => m.id))
   } catch {
     return send(
       res,

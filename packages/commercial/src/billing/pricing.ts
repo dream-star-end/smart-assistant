@@ -19,7 +19,7 @@
  */
 
 import { Client } from "pg";
-import { STATIC_KEY_PROVIDERS } from "@openclaude/protocol";
+import { modelReasoningPolicy, STATIC_KEY_PROVIDERS } from "@openclaude/protocol";
 import { query } from "../db/queries.js";
 import { loadConfig } from "../config.js";
 
@@ -79,6 +79,8 @@ export interface PublicModel {
   cache_read_per_ktok_credits: string;
   cache_write_per_ktok_credits: string;
   multiplier: string;
+  /** protocol modelReasoningPolicy 的 API 投影；空数组 = 此模型不支持思考深度。 */
+  supported_efforts: string[];
   /**
    * 0108 provider 健康度:该模型归属 provider 生效降级时由 /api/models handler 注解 true
    * (**注解不过滤**,前端据此标「暂不可用」+ 禁选)。PricingCache 本身不产出此字段
@@ -318,6 +320,7 @@ export class PricingCache {
     cache_read_per_ktok_credits: perKtokCredits(p.cache_read_per_mtok, p.multiplier),
     cache_write_per_ktok_credits: perKtokCredits(p.cache_write_per_mtok, p.multiplier),
     multiplier: p.multiplier,
+    supported_efforts: [...modelReasoningPolicy(p.model_id).supported],
   });
 
   /**

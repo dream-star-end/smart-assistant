@@ -1,7 +1,7 @@
 /**
  * P0 计费旁路封堵 — gateway seam fail-closed guard 回归测试。
  *
- * 威胁模型:M1a 后任意 agent 的 agent.model='gpt-5.5' 都会落 codex 底座
+ * 威胁模型:M1a 后任意 agent 的 agent.model='gpt-5.6-sol' 都会落 codex 底座
  * (resolveEngine 按 model 判定),而 bridge 只对它分类出的 codex turn 注
  * server-owned requestId。绕过 bridge 分类的 codex turn(帧无 model + agent.model
  * 回落、cron、手改 agents.yaml 等)不带 requestId → CodexAdapter 不 emit billing
@@ -192,7 +192,7 @@ describe("isCommercialManagedRuntime(commercial 判定惯例)", () => {
 describe("submit() codex 计费 guard(fail-closed)", () => {
   test("commercial + needsServerRequestId + 无 requestId → 拒 turn(error 事件),不触 submitTurn", async () => {
     process.env.OC_RUNTIME_CHANNEL = "v5";
-    const runner = new FakeEngineAdapter("codex", CODEX_CAPS, "gpt-5.5");
+    const runner = new FakeEngineAdapter("codex", CODEX_CAPS, "gpt-5.6-sol");
     const session = makeSession(runner);
     const sm = makeSm();
     const events: SessionStreamEvent[] = [];
@@ -220,7 +220,7 @@ describe("submit() codex 计费 guard(fail-closed)", () => {
     // seam 合同校验形状:bridge 生成的 server-owned requestId 恒为 32 hex;
     // 空串/短串/大写/非 hex 都意味着没走 bridge preCheck/journal → fail-closed。
     for (const bad of ["", "abc", "A".repeat(32), "g".repeat(32), "a".repeat(31), "a".repeat(33)]) {
-      const runner = new FakeEngineAdapter("codex", CODEX_CAPS, "gpt-5.5");
+      const runner = new FakeEngineAdapter("codex", CODEX_CAPS, "gpt-5.6-sol");
       const session = makeSession(runner);
       const events: SessionStreamEvent[] = [];
       await sm.submit(session, "hello", (e) => events.push(e), undefined, undefined, bad);
@@ -234,7 +234,7 @@ describe("submit() codex 计费 guard(fail-closed)", () => {
 
   test("commercial + needsServerRequestId + 带 requestId → 放行,requestId 透传 submitTurn", async () => {
     process.env.OC_RUNTIME_CHANNEL = "v5";
-    const runner = new FakeEngineAdapter("codex", CODEX_CAPS, "gpt-5.5");
+    const runner = new FakeEngineAdapter("codex", CODEX_CAPS, "gpt-5.6-sol");
     const session = makeSession(runner);
     const sm = makeSm();
     const events: SessionStreamEvent[] = [];
@@ -274,7 +274,7 @@ describe("submit() codex 计费 guard(fail-closed)", () => {
 
   test("非 commercial(个人版 env)+ codex + 无 requestId → 放行(无 bridge 场景保留)", async () => {
     for (const k of ENV_KEYS) delete process.env[k];
-    const runner = new FakeEngineAdapter("codex", CODEX_CAPS, "gpt-5.5");
+    const runner = new FakeEngineAdapter("codex", CODEX_CAPS, "gpt-5.6-sol");
     const session = makeSession(runner);
     const sm = makeSm();
     const events: SessionStreamEvent[] = [];

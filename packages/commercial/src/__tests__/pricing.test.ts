@@ -83,10 +83,10 @@ const disabled: ModelPricing = {
   updated_at: new Date("2026-04-01T00:00:00Z"),
 };
 
-// GPT 5.5 — 0050 seed 引入,visibility='admin' 默认对普通用户隐藏。
-const gpt55: ModelPricing = {
-  model_id: "gpt-5.5",
-  display_name: "GPT 5.5 (Codex)",
+// GPT-5.6-Sol fixture:visibility='admin' 默认对普通用户隐藏。
+const gpt56: ModelPricing = {
+  model_id: "gpt-5.6-sol",
+  display_name: "GPT-5.6-Sol",
   input_per_mtok: 500n,
   output_per_mtok: 2500n,
   cache_read_per_mtok: 50n,
@@ -254,14 +254,14 @@ describe("PricingCache (unit, no DB)", () => {
 
   test("listPublic excludes visibility='admin' and 'hidden'", () => {
     const p = new PricingCache();
-    p._setForTests([opus, sonnet, haiku, gpt55, hiddenModel]);
+    p._setForTests([opus, sonnet, haiku, gpt56, hiddenModel]);
     const ids = p.listPublic().map((m) => m.id);
     assert.deepEqual(ids, ["claude-opus-4-7", "claude-sonnet-4-6"]);
   });
 });
 
 describe("PricingCache.listForUser (visibility OR grants)", () => {
-  const allModels = [opus, sonnet, haiku, gpt55, hiddenModel, disabled];
+  const allModels = [opus, sonnet, haiku, gpt56, hiddenModel, disabled];
 
   test("普通用户无 grants → 只看到 visibility='public' 模型", () => {
     const p = new PricingCache();
@@ -272,24 +272,38 @@ describe("PricingCache.listForUser (visibility OR grants)", () => {
     assert.deepEqual(ids, ["claude-opus-4-7", "claude-sonnet-4-6"]);
   });
 
-  test("admin 看到 public + admin (haiku/gpt-5.5),仍不含 hidden", () => {
+  test("admin 看到 public + admin (haiku/GPT-5.6),仍不含 hidden", () => {
     const p = new PricingCache();
     p._setForTests(allModels);
     const ids = p
       .listForUser({ role: "admin", grantedModelIds: new Set() })
       .map((m) => m.id);
-    // sort_order:opus 90, sonnet 100, haiku 110, gpt-5.5 110(并列时 stable)
-    assert.deepEqual(ids, ["claude-opus-4-7", "claude-sonnet-4-6", "claude-haiku-4-5", "gpt-5.5"]);
+    // sort_order:opus 90, sonnet 100, haiku 110, GPT-5.6 110(并列时 stable)
+    assert.deepEqual(ids, ["claude-opus-4-7", "claude-sonnet-4-6", "claude-haiku-4-5", "gpt-5.6-sol"]);
     assert.ok(!ids.includes("internal-tool"), "hidden 不应给默认 admin");
   });
 
-  test("普通用户被 grant gpt-5.5 → 看到 public + grant 模型", () => {
+  test("public model payload projects the protocol reasoning capabilities", () => {
+    const p = new PricingCache();
+    p._setForTests([gpt56, haiku]);
+    const visible = p.listForUser({ role: "admin", grantedModelIds: new Set() });
+    assert.deepEqual(
+      visible.find((model) => model.id === "gpt-5.6-sol")?.supported_efforts,
+      ["low", "medium", "high", "xhigh", "max"],
+    );
+    assert.deepEqual(
+      visible.find((model) => model.id === "claude-haiku-4-5")?.supported_efforts,
+      ["low", "medium", "high", "xhigh", "max"],
+    );
+  });
+
+  test("普通用户被 grant GPT-5.6 → 看到 public + grant 模型", () => {
     const p = new PricingCache();
     p._setForTests(allModels);
     const ids = p
-      .listForUser({ role: "user", grantedModelIds: new Set(["gpt-5.5"]) })
+      .listForUser({ role: "user", grantedModelIds: new Set(["gpt-5.6-sol"]) })
       .map((m) => m.id);
-    assert.deepEqual(ids, ["claude-opus-4-7", "claude-sonnet-4-6", "gpt-5.5"]);
+    assert.deepEqual(ids, ["claude-opus-4-7", "claude-sonnet-4-6", "gpt-5.6-sol"]);
   });
 
   test("普通用户被 grant hidden 模型 → 也能看到", () => {
@@ -310,7 +324,7 @@ describe("PricingCache.listForUser (visibility OR grants)", () => {
       .map((m) => m.id);
     assert.ok(ids.includes("internal-tool"));
     assert.ok(ids.includes("claude-haiku-4-5"));
-    assert.ok(ids.includes("gpt-5.5"));
+    assert.ok(ids.includes("gpt-5.6-sol"));
   });
 
   test("disabled 模型对任何身份都不出现", () => {

@@ -225,7 +225,7 @@ describe('agent team prompt builder', () => {
     assert.match(agentsSrc, /id: 'scientist'/)
     assert.match(agentsSrc, /id: 'coder'/)
     assert.match(agentsSrc, /id: 'reviewer'/)
-    // v5 ccb-only:fallback 不再含 codex/gpt-5.5 agent。
+    // v5 ccb-only:fallback 不再含 codex/gpt-5.6-sol agent。
     assert.doesNotMatch(agentsSrc, /id: 'codex'/)
     assert.doesNotMatch(agentsSrc, /provider: 'codex-native'/)
     assert.match(agentsSrc, /model: 'deepseek-v4-pro'/)

@@ -12,15 +12,16 @@
 
 import type { PoolClient } from "pg";
 import {
+  PLATFORM_REASONING_EFFORTS,
   STATIC_KEY_PROVIDERS,
-  findRouteProviderForModel,
+  modelReasoningPolicy,
 } from "@openclaude/protocol";
 import { STATIC_PROVIDER_META } from "../http/proxy/staticProviderMeta.js";
 import { query, tx } from "../db/queries.js";
 import { writeAdminAudit } from "./audit.js";
 import { effectiveHealth, type HealthMode } from "./providerHealth.js";
 
-export const EFFORT_ENUM = ["low", "medium", "high", "xhigh", "max"] as const;
+export const EFFORT_ENUM = PLATFORM_REASONING_EFFORTS;
 export type EffortLevel = (typeof EFFORT_ENUM)[number];
 
 /**
@@ -34,20 +35,13 @@ export function effortMetaForModel(modelId: string): {
   applicable: boolean;
   allowed: readonly string[];
 } {
-  const p = findRouteProviderForModel(modelId);
-  if (!p) return { applicable: true, allowed: EFFORT_ENUM };
-  if (p.allowedOutputConfigEfforts) {
-    return { applicable: true, allowed: [...p.allowedOutputConfigEfforts] };
-  }
-  if (p.stripBodyFields.includes("output_config")) {
-    return { applicable: false, allowed: [] };
-  }
-  return { applicable: true, allowed: EFFORT_ENUM };
+  const policy = modelReasoningPolicy(modelId);
+  return { applicable: policy.supported.length > 0, allowed: policy.supported };
 }
 
 // ─── provider 派生枚举 ───────────────────────────────────────────────
 
-/** codex 虚拟条目 id(gpt-5.5,OAuth 账号池 + 容器 loopback relay,不走静态 key)。 */
+/** codex 虚拟条目 id(GPT-5.6,OAuth 账号池 + 容器 loopback relay,不走静态 key)。 */
 export const CODEX_PROVIDER_ID = "codex";
 
 const PROVIDER_DEFAULT_DISPLAY: Record<string, string> = {
@@ -56,7 +50,7 @@ const PROVIDER_DEFAULT_DISPLAY: Record<string, string> = {
   ark: "火山方舟 Coding Plan(GLM)",
   opencodego: "OpenCode Go(Zen 网关)",
   kimi: "火山方舟 Agent Plan(Kimi)",
-  [CODEX_PROVIDER_ID]: "ChatGPT 订阅(Codex / gpt-5.5)",
+  [CODEX_PROVIDER_ID]: "ChatGPT 订阅(Codex / GPT-5.6)",
 };
 
 export function opsProviderIds(): string[] {
