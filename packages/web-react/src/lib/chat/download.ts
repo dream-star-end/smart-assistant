@@ -67,6 +67,22 @@ export function nativeDownload(url: string, filename: string): void {
 }
 
 /**
+ * 程序化新标签打开(签名 URL 点击时重签的慢路径用)：临时 `<a target=_blank>` click。
+ * 必须紧跟在用户手势的激活窗口内调用,否则可能被弹窗拦截 —— 调用方保证。
+ * 触碰 DOM,SSR/无 document 时安全 no-op。
+ */
+export function openInNewTab(url: string): void {
+  if (typeof document === "undefined") return;
+  const a = document.createElement("a");
+  a.href = url;
+  a.target = "_blank";
+  a.rel = "noreferrer";
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+}
+
+/**
  * 把已下载完成的 Blob 触发浏览器「另存为」：objectURL → 临时 `<a download>` click → revoke。
  * 触碰 DOM，非纯函数（放这里与下载逻辑同源）；SSR/无 document 时安全 no-op。
  */
