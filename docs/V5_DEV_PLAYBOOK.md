@@ -180,39 +180,44 @@ bash scripts/deploy-v5.sh --smoke
 ```
 红线:只从部署树发;绝不手工 rsync+restart 绕过脚本;v3 的 service/env/Caddy 一律不碰。
 
-### 4.2b 跨 master/runtime/dist/迁移的原子切换
-模型目录、协议准入等同时触及 master、容器镜像、前端和破坏性数据迁移时，禁止依次热更；
-否则新 master 可能把请求发给旧 runtime，或旧 master 在迁移后继续写已退场型号。走停机切换 lane：
+### 4.2b 极少数跨 master/runtime/dist 的离线切换
+默认走在线构建 + 普通 deploy + 存量容器自然/逐个回收。只有无法兼容运行的
+master/runtime/dist 组合才走本 lane。**数据库迁移必须可向后兼容，并在服务在线时
+独立完成；离线 lane 禁止任何 DDL/DML。** 不兼容数据库变更必须另做带数据库
+快照/恢复的专门维护方案，不能用 break-glass 绕过。
 
 ```bash
-# 0) 本 lane 会退役共享库中的 GPT-5.5，因此先确认 v3 已永久退役停机；再开启
-#    维护模式并确认入口不再接新 turn，然后停 master（egress 不动）。stage / activate
-#    都会再次 fail-closed 断言 v3 inactive，且拒绝从脏 git 工作树发布。
+# 0) 服务保持 active：先完成耗时构建、镜像 label/二进制验证和向后兼容 migration。
+#    构建绝不能发生在停机窗内。migration 后用旧版本再次跑 health/public smoke。
+ssh kl-mirror 'systemctl is-active --quiet openclaude-v5'
+# build runtime image ...（见 §4.3）
+# 在线 apply backward-compatible migration ...（见 §4.5）
+
+# 1) 仍在线时 prepare。脚本验证 internal/public health、目标镜像 immutable ID、
+#    required migration；生成 30 分钟一次性 nonce，并完整快照旧 source、VERSION、
+#    web dist/assets、env、unit 与旧 image identity。
+bash scripts/deploy-v5.sh --prepare-offline-cutover \
+  --target-image=openclaude/openclaude-runtime:v5-ccb-<sha>
+# 保存输出的 CUTOVER_NONCE=<32hex>
+
+# 2) prepare 成功后才允许停 master（egress 不动）。监控 maintenance marker 只静默
+#    svc_v5/http_v5/public_route；egress/磁盘/内存/容器池/镜像仍照常报警。
 ssh kl-mirror 'test "$(systemctl is-active openclaude-v3 2>/dev/null || true)" = inactive'
 ssh kl-mirror 'systemctl stop openclaude-v5'
 
-# 1) master 已停后，将 v5 DB active 行置 vanished，删除所有带
-#    com.openclaude.runtime_channel=v5 标签的容器；脚本要求 Docker=0、DB active=0
-#    连续保持真实 5 秒（总等待上限 60 秒），防 supervisor 迟到重建。
-bash scripts/deploy-v5.sh --offline-recycle
-
-# 2) 在 master 保持停机时快照并 stage source + 新 dist；本模式绝不启动服务。
-bash scripts/deploy-v5.sh --stage
-
-# 3) 以已 stage 的远端源码构建新 runtime image；成功后受控 apply migration，
-#    再把 /etc/openclaude/commercial-v5.env 的 OC_RUNTIME_IMAGE 切到新 tag。
-#    迁移和 env 切换任一步失败都保持 master 停机，修复/回滚后再继续。
-
-# 4) 一次性激活。脚本先断言 migration 0123 数据形态、staged VERSION、oc-build、
-#    runtime image 源码提交标签及实际 Codex 0.144.0 二进制，再 start 一次并跑完整
-#    smoke + 前端版本握手。
-bash scripts/deploy-v5.sh --activate-staged
-
-# 5) 管理面/模型 API/真实 canary 通过后关闭维护模式。
+# 3) 一次性状态机，顺序/重放/过期/host/commit/image ID 任一不符均拒绝。
+#    offline-recycle 只删 v5 Docker 容器，数据库零写入。
+bash scripts/deploy-v5.sh --offline-recycle --cutover-nonce="$CUTOVER_NONCE"
+bash scripts/deploy-v5.sh --stage --cutover-nonce="$CUTOVER_NONCE"
+# activate 在持锁状态下把 manifest 中已验证的 target image 原子写入 env；
+# 此处不再手改 env、不再构建、不再迁移。
+bash scripts/deploy-v5.sh --activate-staged --cutover-nonce="$CUTOVER_NONCE"
 ```
 
-三种模式都要求 `openclaude-v5.service` 已 inactive（dry-run 除外）；不要用普通
-`deploy-v5.sh` 或 `--dist` 拆开代替。离线回收保留 workspace/home volume，只删执行容器。
+任一步失败都会恢复 prepare 捕获的完整旧激活面并 `start` 旧服务；即使恢复 smoke
+超时也**不会再次 stop**，留给人工继续修复。普通 `deploy/smoke/dist/rollback` 不读取
+cutover manifest，也不要求新 migration。仅真正紧急人工维护可为显式危险子命令设置
+`OC_BREAK_GLASS_OFFLINE_RECYCLE=I_ACCEPT_V5_OUTAGE`；它不能绕过数据库兼容性禁令。
 
 ### 4.3 runtime image 重建
 ```bash

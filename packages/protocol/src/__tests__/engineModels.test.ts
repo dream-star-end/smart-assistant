@@ -29,8 +29,8 @@ describe('GPT-5.6 engine model authority', () => {
       'xhigh',
       'max',
     ])
-    assert.equal(modelReasoningPolicy('gpt-5.6-sol').codexModelDefault, 'low')
-    assert.equal(modelReasoningPolicy('gpt-5.6-terra').codexModelDefault, 'medium')
+    assert.equal(modelReasoningPolicy('gpt-5.6-sol').codexModelDefault, 'xhigh')
+    assert.equal(modelReasoningPolicy('gpt-5.6-terra').codexModelDefault, 'xhigh')
     assert.equal(modelReasoningPolicy('gpt-5.6-luna').codexModelDefault, 'medium')
     assert.equal(modelReasoningPolicy('gpt-5.6-sol').supported.includes('ultra' as never), false)
   })

@@ -19,9 +19,11 @@
 #   scripts/deploy-v5.sh               # 增量部署:快照 + rsync 源码 + restart v5 + smoke
 #   scripts/deploy-v5.sh --smoke       # 仅跑 v5 健康/隔离断言
 #   scripts/deploy-v5.sh --dist        # 前端生效面:vite build + 竞态安全 rsync + 资产GC + restart + 版本握手 smoke
-#   scripts/deploy-v5.sh --offline-recycle # master 停机后离线清空 v5 执行容器(DB vanished+Docker quiet barrier)
-#   scripts/deploy-v5.sh --stage       # master 停机时只 stage source+dist,不启动(原子迁移窗口)
-#   scripts/deploy-v5.sh --activate-staged # 校验 staged source+dist 后一次性启动 + smoke
+#   scripts/deploy-v5.sh --prepare-offline-cutover --target-image=TAG
+#                                  # 服务在线健康时生成一次性离线切换清单/完整恢复包
+#   scripts/deploy-v5.sh --offline-recycle --cutover-nonce=NONCE
+#   scripts/deploy-v5.sh --stage --cutover-nonce=NONCE
+#   scripts/deploy-v5.sh --activate-staged --cutover-nonce=NONCE
 #   scripts/deploy-v5.sh --rollback    # 恢复 .prev.1 + restart
 #   scripts/deploy-v5.sh --rollback=N  # 恢复 .prev.N(N=1..5)+ restart
 #   scripts/deploy-v5.sh --dry-run     # 只打印将执行的动作
@@ -39,10 +41,14 @@ V5_UNIT="openclaude-v5.service"
 # 无人监听,容器 LLM 流量全挂(新机 bootstrap 曾踩此雷)。
 V5_EGRESS_UNIT="openclaude-v5-egress.service"
 V5_PORT="18790"
+CUTOVER_ROOT="/var/lib/openclaude-v5/cutovers"
+CUTOVER_LOCK="/var/lib/openclaude-v5/cutover.lock"
+MAINTENANCE_MARKER="/run/openclaude-v5/planned-maintenance.json"
 
 # ── 定位 worktree 根 ──
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+RELEASE_METADATA="$REPO_ROOT/deploy/v5/release-metadata.json"
 cd "$REPO_ROOT"
 
 # Sanity:必须在 v5 worktree(分支 feat/v5-aurora-rewrite),不能在 v3/master 误跑。
@@ -90,17 +96,21 @@ assert_overrides_no_remove_keys() {
 }
 
 DRY=0; MODE="deploy"; ROLLBACK_N=1; RESTART_EGRESS=0
+CUTOVER_NONCE=""; CUTOVER_TARGET_IMAGE=""
 for arg in "$@"; do
   case "$arg" in
     --dry-run) DRY=1 ;;
     --bootstrap) MODE="bootstrap" ;;
     --smoke) MODE="smoke" ;;
     --dist) MODE="dist" ;;
+    --prepare-offline-cutover) MODE="prepare-offline-cutover" ;;
     --offline-recycle) MODE="offline-recycle" ;;
     --stage) MODE="stage" ;;
     --activate-staged) MODE="activate-staged" ;;
     --rollback) MODE="rollback"; ROLLBACK_N=1 ;;
     --rollback=*) MODE="rollback"; ROLLBACK_N="${arg#*=}" ;;
+    --cutover-nonce=*) CUTOVER_NONCE="${arg#*=}" ;;
+    --target-image=*) CUTOVER_TARGET_IMAGE="${arg#*=}" ;;
     # egress split(2026-07-02):openclaude-v5-egress 持有在飞 LLM 流,默认部署
     # 【不】重启它(这正是解耦目的);仅 egress 相关代码(anthropicProxy/账号池/
     # 计费 finalize/egress/*)变更时显式带本 flag。重启走 SIGTERM drain。
@@ -109,9 +119,341 @@ for arg in "$@"; do
   esac
 done
 [[ "$MODE" == "rollback" && ! "$ROLLBACK_N" =~ ^[1-5]$ ]] && { echo "✗ --rollback=N 需 N∈1..5" >&2; exit 2; }
+[[ -n "$CUTOVER_NONCE" && ! "$CUTOVER_NONCE" =~ ^[0-9a-f]{32}$ ]] && { echo "✗ cutover nonce 必须是 32 位小写 hex" >&2; exit 2; }
 
 run() { if [[ "$DRY" == 1 ]]; then echo "  [dry-run] $*"; else eval "$@"; fi; }
 sshk() { if [[ "$DRY" == 1 ]]; then echo "  [dry-run] ssh $KL_HOST '$*'"; else ssh "$KL_HOST" "$@"; fi; }
+
+# ───────────────────────── dangerous offline cutover guard ────────────────
+# 普通 deploy/smoke/dist/rollback 永远不会调用本段。只有显式离线三步需要一次性
+# nonce；prepare 必须在服务在线健康、目标镜像已构建后执行，确保构建时间不可能
+# 再落入停机窗口。离线三步严禁 migration/DDL/DML。
+cutover_break_glass() {
+  [[ "${OC_BREAK_GLASS_OFFLINE_RECYCLE:-}" == "I_ACCEPT_V5_OUTAGE" ]]
+}
+
+cutover_require_args() {
+  if cutover_break_glass; then
+    echo "⚠ BREAK-GLASS: I_ACCEPT_V5_OUTAGE（仅本次显式离线子命令）" >&2
+    return 0
+  fi
+  [[ -n "$CUTOVER_NONCE" ]] || {
+    echo "✗ 危险离线操作缺 --cutover-nonce；先在 v5 在线健康时运行 --prepare-offline-cutover" >&2
+    return 1
+  }
+}
+
+prepare_offline_cutover() {
+  echo "══ prepare v5 offline cutover（服务保持在线）══"
+  assert_clean_source_tree
+  [[ -n "$CUTOVER_TARGET_IMAGE" ]] || {
+    echo "✗ --prepare-offline-cutover 必须带 --target-image=不可变构建对应的TAG" >&2
+    return 2
+  }
+  [[ "$CUTOVER_TARGET_IMAGE" =~ ^[A-Za-z0-9._/:@-]+$ ]] || {
+    echo "✗ target image 格式非法" >&2; return 2;
+  }
+  [[ -r "$RELEASE_METADATA" ]] || { echo "✗ 缺 release metadata: $RELEASE_METADATA" >&2; return 1; }
+  [[ "$(jq -r '.databaseCompatibility' "$RELEASE_METADATA")" == "backward-compatible" ]] || {
+    echo "✗ 离线自动切换只接受 backward-compatible 数据库变更；不可用 break-glass 绕过" >&2
+    return 1
+  }
+
+  local target_commit required_csv migration_tree_hash expected_host nonce
+  target_commit="$(git -C "$REPO_ROOT" rev-parse HEAD)"
+  required_csv="$(jq -er '.requiredMigrations | join(",")' "$RELEASE_METADATA")"
+  migration_tree_hash="$(cd "$REPO_ROOT/packages/commercial/src/db/migrations" && find . -maxdepth 1 -type f -name '*.sql' -printf '%f\n' | sort | while read -r f; do sha256sum "$f"; done | sha256sum | awk '{print $1}')"
+  expected_host="$(ssh "$KL_HOST" 'hostname -f')"
+  nonce="${CUTOVER_NONCE:-$(openssl rand -hex 16)}"
+
+  if [[ "$DRY" == 1 ]]; then
+    echo "  [dry-run] validate active+internal/public health, target image immutable ID/labels/binary, required migrations"
+    echo "  [dry-run] create $CUTOVER_ROOT/$nonce complete rollback bundle + one-shot manifest"
+    echo "CUTOVER_NONCE=$nonce"
+    return 0
+  fi
+
+  ssh "$KL_HOST" bash -s -- \
+    "$CUTOVER_ROOT" "$CUTOVER_LOCK" "$nonce" "$expected_host" "$target_commit" \
+    "$CUTOVER_TARGET_IMAGE" "$required_csv" "$migration_tree_hash" "$REMOTE_SRC" \
+    "$V5_ENV" "$V5_UNIT" "$V5_PORT" <<'REMOTE'
+set -Eeuo pipefail
+root="$1"; lock="$2"; nonce="$3"; expected_host="$4"; target_commit="$5"
+target_image="$6"; required_csv="$7"; migration_tree_hash="$8"; remote_src="$9"
+env_file="${10}"; unit="${11}"; port="${12}"
+mkdir -p "$root"; chmod 700 "$root"; touch "$lock"; chmod 600 "$lock"
+exec 9>"$lock"; flock -x 9
+
+[[ "$(hostname -f)" == "$expected_host" ]] || { echo 'FATAL: host binding mismatch' >&2; exit 1; }
+systemctl is-active --quiet "$unit" || { echo 'FATAL: prepare requires v5 active' >&2; exit 1; }
+internal="$(curl -fsS --max-time 5 "http://127.0.0.1:${port}/healthz")"
+jq -e '.ok == true and .channel == "v5"' <<<"$internal" >/dev/null || { echo 'FATAL: internal health is not v5/ok' >&2; exit 1; }
+public="$(curl -fsS --max-time 5 -H 'Host: claudeai.chat' http://127.0.0.1/healthz)"
+jq -e '.ok == true and .channel == "v5"' <<<"$public" >/dev/null || { echo 'FATAL: public route health is not v5/ok' >&2; exit 1; }
+
+target_image_id="$(docker image inspect --format '{{.Id}}' "$target_image")"
+image_commit="$(docker image inspect --format '{{ index .Config.Labels "oc.runtime.source_commit" }}' "$target_image")"
+image_codex="$(docker image inspect --format '{{ index .Config.Labels "oc.runtime.codex_version" }}' "$target_image")"
+[[ "$image_commit" =~ ^[0-9a-f]{7,40}$ && "$target_commit" == "$image_commit"* ]] || { echo "FATAL: image source_commit is not a prefix of target commit" >&2; exit 1; }
+[[ -n "$image_codex" ]] || { echo 'FATAL: image missing codex version label' >&2; exit 1; }
+actual_codex="$(docker run --rm --entrypoint codex "$target_image" --version)"
+[[ "$actual_codex" == "codex-cli $image_codex" ]] || { echo 'FATAL: image codex label/binary mismatch' >&2; exit 1; }
+
+dburl="$(grep '^DATABASE_URL=' "$env_file" | tail -n 1 | cut -d= -f2-)"
+[[ -n "$dburl" ]] || { echo 'FATAL: DATABASE_URL missing' >&2; exit 1; }
+IFS=',' read -ra required <<<"$required_csv"
+for migration in "${required[@]}"; do
+  [[ "$migration" =~ ^[0-9]{4}_[a-z0-9_]+$ ]] || { echo 'FATAL: invalid migration id in metadata' >&2; exit 1; }
+  applied="$(psql "$dburl" -X -v ON_ERROR_STOP=1 -tAc "SELECT count(*) FROM schema_migrations WHERE version='${migration}'" | tr -d '[:space:]')"
+  [[ "$applied" == 1 ]] || { echo "FATAL: required migration not applied: $migration" >&2; exit 1; }
+done
+applied_set="$(psql "$dburl" -X -v ON_ERROR_STOP=1 -tAc "SELECT COALESCE(string_agg(version,',' ORDER BY version),'') FROM schema_migrations")"
+applied_hash="$(printf '%s' "$applied_set" | sha256sum | awk '{print $1}')"
+
+final="$root/$nonce"; tmp="$root/.tmp-$nonce"
+[[ ! -e "$final" && ! -e "$tmp" ]] || { echo 'FATAL: nonce already exists/replay' >&2; exit 1; }
+mkdir -m 700 "$tmp" "$tmp/source"
+rsync -a --delete \
+  --exclude '.git' --exclude 'node_modules' --exclude 'data' --exclude '*.log' \
+  --exclude '.codex' --exclude 'packages/desktop' \
+  "$remote_src/" "$tmp/source/"
+install -m 600 "$env_file" "$tmp/commercial-v5.env"
+for f in "/etc/systemd/system/$unit" "/etc/systemd/system/$unit.d/override.conf"; do
+  if [[ -f "$f" ]]; then mkdir -p "$tmp$(dirname "$f")"; install -m 600 "$f" "$tmp$f"; fi
+done
+old_image="$(grep '^OC_RUNTIME_IMAGE=' "$env_file" | tail -n 1 | cut -d= -f2-)"
+old_image_id="$(docker image inspect --format '{{.Id}}' "$old_image")"
+old_commit="$(jq -r '.commit // "unknown"' "$remote_src/VERSION.json" 2>/dev/null || echo unknown)"
+now="$(date +%s)"; expires="$((now + 1800))"
+jq -n \
+  --arg host "$expected_host" --arg nonce "$nonce" --arg target_commit "$target_commit" \
+  --arg target_image "$target_image" --arg target_image_id "$target_image_id" \
+  --arg old_commit "$old_commit" --arg old_image "$old_image" --arg old_image_id "$old_image_id" \
+  --arg migration_tree_hash "$migration_tree_hash" --arg applied_migrations_hash "$applied_hash" \
+  --argjson created_at "$now" --argjson expires_at "$expires" \
+  '{schema:1,host:$host,nonce:$nonce,target_commit:$target_commit,target_image:$target_image,
+    target_image_id:$target_image_id,old_commit:$old_commit,old_image:$old_image,
+    old_image_id:$old_image_id,database_compatibility:"backward-compatible",
+    migration_tree_hash:$migration_tree_hash,applied_migrations_hash:$applied_migrations_hash,
+    created_at:$created_at,expires_at:$expires_at,
+    operation_sequence:["offline-recycle","stage","activate-staged"]}' >"$tmp/manifest.json"
+jq -n --argjson at "$now" '{state:"prepared",updated_at:$at}' >"$tmp/state.json"
+chmod 600 "$tmp/manifest.json" "$tmp/state.json"
+sync -f "$tmp" || sync
+mv "$tmp" "$final"
+sync -f "$root" || sync
+echo "  ✓ prepared nonce=$nonce target_image_id=$target_image_id expires_at=$expires"
+REMOTE
+  echo "CUTOVER_NONCE=$nonce"
+  echo "✓ 目标镜像已在服务在线期间验证，完整旧激活面已快照；现在才允许进入离线窗口。"
+}
+
+recover_cutover() {
+  local reason="${1:-offline cutover failed}"
+  [[ "$DRY" == 1 ]] && { echo "  [dry-run] recover old activation and start $V5_UNIT ($reason)"; return 0; }
+  echo "⚠ 离线步骤失败，恢复旧激活面并启动旧服务：$reason" >&2
+  ssh "$KL_HOST" bash -s -- "$CUTOVER_ROOT" "$CUTOVER_LOCK" "$CUTOVER_NONCE" "$REMOTE_SRC" "$V5_ENV" "$V5_UNIT" "$V5_PORT" "$MAINTENANCE_MARKER" <<'REMOTE'
+set -Eeuo pipefail
+root="$1"; lock="$2"; nonce="$3"; remote_src="$4"; env_file="$5"; unit="$6"; port="$7"; marker="$8"
+mkdir -p "$(dirname "$lock")"; touch "$lock"; chmod 600 "$lock"; exec 9>"$lock"; flock -x 9
+bundle="$root/$nonce"
+secure=0
+if [[ "$nonce" =~ ^[0-9a-f]{32}$ && -d "$bundle" && -f "$bundle/manifest.json" &&
+      "$(stat -c '%U:%G' "$bundle")" == 'root:root' && "$(stat -c '%a' "$bundle")" == 700 &&
+      "$(stat -c '%a' "$bundle/manifest.json")" == 600 &&
+      "$(jq -r '.host // empty' "$bundle/manifest.json" 2>/dev/null)" == "$(hostname -f)" ]]; then
+  secure=1
+fi
+if [[ "$secure" != 1 ]]; then
+  rm -f "$marker" || true
+  echo 'FATAL: no trusted rollback bundle; refusing to start an unverified/mixed activation' >&2
+  exit 1
+fi
+if [[ "$secure" == 1 ]]; then
+  manifest="$bundle/manifest.json"
+  old_image="$(jq -r '.old_image' "$manifest")"; old_image_id="$(jq -r '.old_image_id' "$manifest")"
+  [[ -f "$bundle/commercial-v5.env" && -d "$bundle/source" ]] || { echo 'FATAL: rollback bundle incomplete' >&2; exit 1; }
+  [[ "$(docker image inspect --format '{{.Id}}' "$old_image")" == "$old_image_id" ]] || { echo 'FATAL: old runtime image identity missing/drifted' >&2; exit 1; }
+
+  txn="$root/.recovery-$nonce"; restore_dir="${remote_src}.restore-$nonce"; live_backup="${remote_src}.failed-$nonce"
+  rm -rf "$txn" "$restore_dir" "$live_backup"; mkdir -m 700 "$txn" "$restore_dir"
+  cp -a "$env_file" "$txn/current.env"
+  had_current_unit=0; had_current_override=0
+  [[ -f "/etc/systemd/system/$unit" ]] && { cp -a "/etc/systemd/system/$unit" "$txn/current.unit"; had_current_unit=1; }
+  [[ -f "/etc/systemd/system/$unit.d/override.conf" ]] && { cp -a "/etc/systemd/system/$unit.d/override.conf" "$txn/current.override"; had_current_override=1; }
+  source_moved=0; source_installed=0; env_installed=0
+  rollback_partial() {
+    local rc=$? restore_failed=0
+    trap - ERR
+    if [[ "$source_moved" == 1 ]]; then
+      if [[ "$source_installed" == 1 && -d "$remote_src" ]]; then
+        mv "$remote_src" "${restore_dir}.broken" || restore_failed=1
+      fi
+      if [[ -d "$live_backup" ]]; then
+        mv "$live_backup" "$remote_src" || restore_failed=1
+      else
+        restore_failed=1
+      fi
+    fi
+    if [[ "$env_installed" == 1 && -f "$txn/current.env" ]]; then
+      install -m 600 "$txn/current.env" "$env_file" || restore_failed=1
+    fi
+    if [[ "$had_current_unit" == 1 ]]; then
+      install -m 644 "$txn/current.unit" "/etc/systemd/system/$unit" || restore_failed=1
+    else
+      rm -f "/etc/systemd/system/$unit" || restore_failed=1
+    fi
+    if [[ "$had_current_override" == 1 ]]; then
+      mkdir -p "/etc/systemd/system/$unit.d" || restore_failed=1
+      install -m 644 "$txn/current.override" "/etc/systemd/system/$unit.d/override.conf" || restore_failed=1
+    else
+      rm -f "/etc/systemd/system/$unit.d/override.conf" || restore_failed=1
+    fi
+    if [[ "$restore_failed" == 0 ]]; then
+      systemctl daemon-reload || restore_failed=1
+    fi
+    if [[ "$restore_failed" == 0 ]]; then
+      systemctl start "$unit" || restore_failed=1
+    fi
+    rm -f "$marker" || true
+    if [[ "$restore_failed" == 0 ]]; then
+      echo 'FATAL: old activation restore failed before commit; verified pre-recovery activation restored and started' >&2
+      exit "$rc"
+    else
+      echo 'FATAL: rollback of pre-recovery activation also failed; service deliberately remains stopped' >&2
+      exit 70
+    fi
+  }
+  trap rollback_partial ERR
+
+  # Freeze the failed/new activation before cloning its preserved runtime-only
+  # paths (node_modules/data). The old tracked activation is overlaid in an
+  # isolated sibling directory; no live file changes until the directory swap.
+  systemctl stop "$unit"
+  cp -al "$remote_src/." "$restore_dir/"
+  rsync -a --delete \
+    --exclude '.git' --exclude 'node_modules' --exclude 'data' --exclude '*.log' \
+    --exclude '.codex' --exclude 'packages/desktop' \
+    "$bundle/source/" "$restore_dir/"
+  install -m 600 "$bundle/commercial-v5.env" "$txn/old.env"
+
+  mv "$remote_src" "$live_backup"; source_moved=1
+  mv "$restore_dir" "$remote_src"; source_installed=1
+  mv "$txn/old.env" "$env_file"; env_installed=1
+  for saved in "$bundle"/etc/systemd/system/* "$bundle"/etc/systemd/system/*.d/override.conf; do
+    [[ -f "$saved" ]] || continue
+    dest="/${saved#"$bundle"/}"
+    mkdir -p "$(dirname "$dest")"; install -m 644 "$saved" "$dest.tmp"; mv "$dest.tmp" "$dest"
+  done
+  systemctl daemon-reload
+  now="$(date +%s)"; jq -n --argjson at "$now" '{state:"recovered",updated_at:$at}' >"$bundle/state.json.tmp"
+  chmod 600 "$bundle/state.json.tmp"; mv "$bundle/state.json.tmp" "$bundle/state.json"
+  trap - ERR
+fi
+
+# Once the old activation is committed, never stop it again merely because
+# start/health is slow. Alerting is re-enabled and manual repair can continue.
+start_rc=0; systemctl start "$unit" || start_rc=$?
+rm -f "$marker"
+[[ "$start_rc" == 0 ]] || { echo 'FATAL: restored activation could not be started' >&2; exit "$start_rc"; }
+for _ in $(seq 1 10); do
+  body="$(curl -fsS --max-time 3 "http://127.0.0.1:${port}/healthz" 2>/dev/null)"
+  if jq -e '.ok == true and .channel == "v5"' <<<"$body" >/dev/null 2>&1; then
+    [[ "$secure" == 1 ]] && rm -rf "$live_backup" "$txn" "${restore_dir}.broken"
+    echo '  ✓ old v5 activation healthy'; exit 0
+  fi
+  sleep 2
+done
+echo 'FATAL: old service was started but recovery smoke timed out; service intentionally left running for manual repair' >&2
+exit 1
+REMOTE
+}
+
+set_cutover_maintenance() {
+  cutover_break_glass && return 0
+  [[ "$DRY" == 1 ]] && { echo "  [dry-run] set planned-maintenance marker for nonce=$CUTOVER_NONCE"; return 0; }
+  ssh "$KL_HOST" bash -s -- "$CUTOVER_ROOT" "$CUTOVER_NONCE" "$MAINTENANCE_MARKER" <<'REMOTE'
+set -Eeuo pipefail
+root="$1"; nonce="$2"; marker="$3"; manifest="$root/$nonce/manifest.json"
+[[ -f "$manifest" && "$(jq -r '.host' "$manifest")" == "$(hostname -f)" ]] || exit 1
+deadline="$(jq -r '.expires_at' "$manifest")"; mkdir -p -m 700 "$(dirname "$marker")"
+jq -n --arg host "$(hostname -f)" --arg nonce "$nonce" --argjson deadline "$deadline" \
+  '{schema:1,host:$host,nonce:$nonce,deadline:$deadline}' >"$marker.tmp"
+chmod 600 "$marker.tmp"; mv "$marker.tmp" "$marker"
+REMOTE
+}
+
+clear_cutover_maintenance() {
+  [[ "$DRY" == 1 ]] && { echo "  [dry-run] clear planned-maintenance marker"; return 0; }
+  ssh "$KL_HOST" "rm -f '$MAINTENANCE_MARKER'"
+}
+
+install_cutover_target_image_env() {
+  cutover_break_glass && return 0
+  [[ "$DRY" == 1 ]] && { echo "  [dry-run] atomically install manifest target image into $V5_ENV"; return 0; }
+  ssh "$KL_HOST" bash -s -- "$CUTOVER_ROOT" "$CUTOVER_LOCK" "$CUTOVER_NONCE" "$V5_ENV" <<'REMOTE'
+set -Eeuo pipefail
+root="$1"; lock="$2"; nonce="$3"; env_file="$4"; bundle="$root/$nonce"
+exec 9>"$lock"; flock -x 9
+[[ "$(jq -r '.state' "$bundle/state.json")" == activating ]] || { echo 'FATAL: target env install requires activating state' >&2; exit 1; }
+target_image="$(jq -r '.target_image' "$bundle/manifest.json")"
+target_id="$(jq -r '.target_image_id' "$bundle/manifest.json")"
+[[ "$(docker image inspect --format '{{.Id}}' "$target_image")" == "$target_id" ]] || { echo 'FATAL: target image identity drift before env install' >&2; exit 1; }
+[[ "$(grep -c '^OC_RUNTIME_IMAGE=' "$env_file")" == 1 ]] || { echo 'FATAL: env must contain exactly one OC_RUNTIME_IMAGE' >&2; exit 1; }
+awk -v image="$target_image" '/^OC_RUNTIME_IMAGE=/{print "OC_RUNTIME_IMAGE=" image; next} {print}' "$env_file" >"$env_file.tmp"
+chmod --reference="$env_file" "$env_file.tmp"; chown --reference="$env_file" "$env_file.tmp"
+mv "$env_file.tmp" "$env_file"
+[[ "$(grep '^OC_RUNTIME_IMAGE=' "$env_file" | cut -d= -f2-)" == "$target_image" ]] || { echo 'FATAL: target image env verification failed' >&2; exit 1; }
+[[ "$(docker image inspect --format '{{.Id}}' "$target_image")" == "$target_id" ]] || { echo 'FATAL: target image drift after env install' >&2; exit 1; }
+REMOTE
+}
+
+cutover_transition() {
+  local expected="$1" next="$2"
+  cutover_require_args || return 1
+  cutover_break_glass && return 0
+  local target_commit
+  target_commit="$(git -C "$REPO_ROOT" rev-parse HEAD)"
+  if [[ "$DRY" == 1 ]]; then echo "  [dry-run] cutover $expected → $next (nonce=$CUTOVER_NONCE)"; return 0; fi
+  ssh "$KL_HOST" bash -s -- "$CUTOVER_ROOT" "$CUTOVER_LOCK" "$CUTOVER_NONCE" "$target_commit" "$expected" "$next" "$V5_ENV" <<'REMOTE'
+set -Eeuo pipefail
+root="$1"; lock="$2"; nonce="$3"; target_commit="$4"; expected="$5"; next="$6"; env_file="$7"
+exec 9>"$lock"; flock -x 9
+bundle="$root/$nonce"; manifest="$bundle/manifest.json"; state_file="$bundle/state.json"
+[[ -d "$bundle" && -f "$manifest" && -f "$state_file" ]] || { echo 'FATAL: cutover manifest missing' >&2; exit 1; }
+[[ "$(stat -c '%U:%G' "$bundle")" == 'root:root' && "$(stat -c '%a' "$bundle")" == 700 ]] || { echo 'FATAL: insecure cutover directory' >&2; exit 1; }
+[[ "$(stat -c '%U:%G' "$manifest")" == 'root:root' && "$(stat -c '%a' "$manifest")" == 600 ]] || { echo 'FATAL: insecure manifest' >&2; exit 1; }
+[[ "$(jq -r '.host' "$manifest")" == "$(hostname -f)" ]] || { echo 'FATAL: host binding mismatch' >&2; exit 1; }
+[[ "$(jq -r '.nonce' "$manifest")" == "$nonce" ]] || { echo 'FATAL: nonce binding mismatch' >&2; exit 1; }
+[[ "$(jq -r '.target_commit' "$manifest")" == "$target_commit" ]] || { echo 'FATAL: target commit mismatch' >&2; exit 1; }
+[[ "$(jq -r '.database_compatibility' "$manifest")" == 'backward-compatible' ]] || { echo 'FATAL: DB compatibility is not safe' >&2; exit 1; }
+(( $(date +%s) <= $(jq -r '.expires_at' "$manifest") )) || { echo 'FATAL: cutover manifest expired' >&2; exit 1; }
+image="$(jq -r '.target_image' "$manifest")"; expected_id="$(jq -r '.target_image_id' "$manifest")"
+[[ "$(docker image inspect --format '{{.Id}}' "$image")" == "$expected_id" ]] || { echo 'FATAL: target image tag drift' >&2; exit 1; }
+dburl="$(grep '^DATABASE_URL=' "$env_file" | tail -n 1 | cut -d= -f2-)"
+applied_set="$(psql "$dburl" -X -v ON_ERROR_STOP=1 -tAc "SELECT COALESCE(string_agg(version,',' ORDER BY version),'') FROM schema_migrations")"
+applied_hash="$(printf '%s' "$applied_set" | sha256sum | awk '{print $1}')"
+[[ "$applied_hash" == "$(jq -r '.applied_migrations_hash' "$manifest")" ]] || { echo 'FATAL: applied migration set changed after prepare' >&2; exit 1; }
+[[ "$(jq -r '.state' "$state_file")" == "$expected" ]] || { echo 'FATAL: invalid/replayed cutover state' >&2; exit 1; }
+now="$(date +%s)"; jq -n --arg state "$next" --argjson at "$now" '{state:$state,updated_at:$at}' >"$state_file.tmp"
+chmod 600 "$state_file.tmp"; sync -f "$state_file.tmp" || sync; mv "$state_file.tmp" "$state_file"; sync -f "$bundle" || sync
+REMOTE
+}
+
+begin_cutover_step() {
+  local expected="$1" next="$2"
+  if cutover_transition "$expected" "$next"; then
+    if [[ "$next" == recycling ]] && ! set_cutover_maintenance; then
+      recover_cutover "failed to create planned-maintenance marker"
+      return 1
+    fi
+    return 0
+  fi
+  local state
+  state="$(ssh "$KL_HOST" "systemctl is-active '$V5_UNIT' 2>/dev/null || true")"
+  [[ "$state" == active ]] || recover_cutover "hard gate rejected ${expected}->${next}"
+  return 1
+}
 
 # 部署顺序守卫(Codex 铁律):引用 runtime_channel 的 P1a 代码上线前,共享库必须先 apply 0088
 # 加列(v5 AUTO_MIGRATE=0,须 v3 控制面/人工先迁)。否则 channel-aware 查询会报 "column
@@ -145,6 +487,21 @@ assert_gpt56_migration_ready() {
     exit 1
   }
   echo "  ✓ migration 0123 + GPT-5.6 数据切换已就绪"
+
+  # 仅 target checkout 自带 0124 时，离线 activate 才要求该 migration。普通
+  # deploy/smoke/dist/rollback 不调用本函数，因此旧 release 回滚不会被新迁移误杀。
+  if [[ -f "$REPO_ROOT/packages/commercial/src/db/migrations/0124_gpt56_xhigh_defaults.sql" ]]; then
+    local defaults_ready
+    defaults_ready="$(ssh "$KL_HOST" "set -a; . '$V5_ENV' 2>/dev/null; psql \"\$DATABASE_URL\" -X -v ON_ERROR_STOP=1 -tAc \"SELECT (EXISTS (SELECT 1 FROM schema_migrations WHERE version='0124_gpt56_xhigh_defaults') AND (SELECT count(*) FROM model_pricing WHERE model_id IN ('gpt-5.6-sol','gpt-5.6-terra') AND default_effort='xhigh') = 2)::text\"" 2>/dev/null)" || {
+      echo "✗ 无法验证 target release 的 0124 默认深度迁移" >&2; return 1;
+    }
+    defaults_ready="${defaults_ready//[[:space:]]/}"
+    [[ "$defaults_ready" == true ]] || {
+      echo "✗ target release 包含 0124，但数据库尚未在线完成 Sol/Terra=xhigh；拒绝激活" >&2
+      return 1
+    }
+    echo "  ✓ target release 所需 0124 已在线应用"
+  fi
 }
 
 RSYNC_EXCLUDES=(--exclude '.git' --exclude 'node_modules' --exclude 'data'
@@ -381,28 +738,21 @@ deploy() {
 }
 
 # ───────────────────────── offline recycle:原子切换前停机清场 ───────────────
-offline_recycle() {
+offline_recycle_inner() {
   echo "══ v5 offline recycle on $KL_HOST ══"
   assert_v5_master_inactive
   assert_v3_inactive_for_gpt_cutover
   if [[ "$DRY" == 1 ]]; then
-    echo "  [dry-run] DB v5 active→vanished + Docker v5 label 清理 + 5s quiet barrier"
+    echo "  [dry-run] Docker v5 label 清理 + 5s quiet barrier（禁止 DB mutation）"
     return 0
   fi
-  ssh "$KL_HOST" bash -s -- "$V5_ENV" <<'REMOTE'
+  ssh "$KL_HOST" bash -s <<'REMOTE'
 set -euo pipefail
-env_file="$1"
-dburl="$(grep '^DATABASE_URL=' "$env_file" | tail -n 1 | cut -d= -f2-)"
-[[ -n "$dburl" ]] || { echo 'FATAL: DATABASE_URL missing' >&2; exit 1; }
 label='com.openclaude.runtime_channel=v5'
 quiet_since=''
 deadline=$(( $(date +%s) + 60 ))
 
 while :; do
-  psql "$dburl" -X -v ON_ERROR_STOP=1 -qAt -c \
-    "UPDATE agent_containers SET state='vanished', updated_at=NOW() WHERE runtime_channel='v5' AND state='active' RETURNING id" \
-    >/tmp/v5-offline-vanished.ids
-
   ids="$(docker ps -aq --filter "label=$label")"
   if [[ -n "$ids" ]]; then
     docker rm -f $ids >/dev/null
@@ -410,12 +760,9 @@ while :; do
   fi
 
   remain="$(docker ps -aq --filter "label=$label")"
-  active="$(psql "$dburl" -X -v ON_ERROR_STOP=1 -tAc \
-    "SELECT count(*) FROM agent_containers WHERE runtime_channel='v5' AND state='active'")"
-  active="${active//[[:space:]]/}"
   now="$(date +%s)"
 
-  if [[ -z "$remain" && "$active" == "0" ]]; then
+  if [[ -z "$remain" ]]; then
     [[ -n "$quiet_since" ]] || quiet_since="$now"
     if (( now - quiet_since >= 5 )); then break; fi
   else
@@ -433,17 +780,21 @@ done
   echo 'FATAL: v5 container appeared after quiet barrier' >&2
   exit 1
 }
-[[ "$(psql "$dburl" -X -v ON_ERROR_STOP=1 -tAc \
-  "SELECT count(*) FROM agent_containers WHERE runtime_channel='v5' AND state='active'" | tr -d '[:space:]')" == "0" ]] || {
-  echo 'FATAL: active v5 DB row appeared after quiet barrier' >&2
-  exit 1
-}
-echo '  ✓ v5 offline recycle: Docker empty + DB active=0 + quiet>=5s'
+echo '  ✓ v5 offline recycle: Docker empty + quiet>=5s（数据库零写入）'
 REMOTE
 }
 
+offline_recycle() {
+  begin_cutover_step prepared recycling || return 1
+  if ( set -Eeuo pipefail; offline_recycle_inner ); then
+    cutover_transition recycling recycled || { recover_cutover "cannot commit recycled state"; return 1; }
+  else
+    local rc=$?; recover_cutover "offline recycle failed"; return "$rc"
+  fi
+}
+
 # ───────────────────────── stage/activate:停机原子迁移 lane ─────────────────
-stage() {
+stage_inner() {
   echo "══ v5 stage(source + dist, no start)on $KL_HOST ══"
   assert_overrides_no_remove_keys
   assert_clean_source_tree
@@ -456,7 +807,16 @@ stage() {
   echo "✓ stage 完成:$V5_UNIT 保持停机,等待 migration/runtime env 后 activate。"
 }
 
-activate_staged() {
+stage() {
+  begin_cutover_step recycled staging || return 1
+  if ( set -Eeuo pipefail; stage_inner ); then
+    cutover_transition staging staged || { recover_cutover "cannot commit staged state"; return 1; }
+  else
+    local rc=$?; recover_cutover "stage failed"; return "$rc"
+  fi
+}
+
+activate_staged_inner() {
   echo "══ v5 activate staged on $KL_HOST ══"
   assert_overrides_no_remove_keys
   assert_clean_source_tree
@@ -464,9 +824,11 @@ activate_staged() {
   assert_v3_inactive_for_gpt_cutover
   assert_runtime_channel_column
   assert_gpt56_migration_ready
-  local expected_commit expected_build remote_commit remote_build runtime_image
+  install_cutover_target_image_env
+  local expected_commit expected_full_commit expected_build remote_commit remote_build runtime_image
   local image_commit image_codex_version actual_codex_version
   expected_commit="$(git -C "$REPO_ROOT" rev-parse --short HEAD)"
+  expected_full_commit="$(git -C "$REPO_ROOT" rev-parse HEAD)"
   expected_build=""
   if [[ "$DRY" != 1 ]]; then
     expected_build="$(grep -o 'name="oc-build" content="[0-9a-f]\{8,32\}"' "$REPO_ROOT/packages/web-react/dist/index.html" | grep -o '[0-9a-f]\{8,32\}' | head -1 || true)"
@@ -484,8 +846,8 @@ activate_staged() {
     ssh "$KL_HOST" "docker image inspect '$runtime_image' >/dev/null"
     image_commit="$(ssh "$KL_HOST" "docker image inspect --format '{{ index .Config.Labels \"oc.runtime.source_commit\" }}' '$runtime_image'")"
     image_codex_version="$(ssh "$KL_HOST" "docker image inspect --format '{{ index .Config.Labels \"oc.runtime.codex_version\" }}' '$runtime_image'")"
-    [[ "$image_commit" == "$expected_commit" ]] || {
-      echo "✗ runtime image source_commit=$image_commit,expected=$expected_commit" >&2; exit 1;
+    [[ "$image_commit" =~ ^[0-9a-f]{7,40}$ && "$expected_full_commit" == "$image_commit"* ]] || {
+      echo "✗ runtime image source_commit=$image_commit is not target commit $expected_full_commit 的前缀" >&2; exit 1;
     }
     [[ "$image_codex_version" == "0.144.0" ]] || {
       echo "✗ runtime image codex label=$image_codex_version,expected=0.144.0" >&2; exit 1;
@@ -501,19 +863,27 @@ activate_staged() {
   run "sleep 4"
   if [[ "$DRY" != 1 ]]; then
     if ! smoke; then
-      echo "✗ staged activate smoke 失败，重新停机，避免半激活状态继续接流量" >&2
-      ssh "$KL_HOST" "systemctl stop '$V5_UNIT'" || true
-      exit 1
+      echo "✗ staged activate smoke 失败；交由统一恢复器恢复旧版本（不会再次停掉恢复中的服务）" >&2
+      return 1
     fi
     local live_build
     live_build="$(ssh "$KL_HOST" "curl -fsS http://127.0.0.1:${V5_PORT}/" | grep -o 'name=\"oc-build\" content=\"[0-9a-f]\{8,32\}\"' | grep -o '[0-9a-f]\{8,32\}' | head -1 || true)"
     [[ "$live_build" == "$expected_build" ]] || {
-      echo "✗ live oc-build=$live_build,expected=$expected_build；重新停机" >&2
-      ssh "$KL_HOST" "systemctl stop '$V5_UNIT'" || true
-      exit 1
+      echo "✗ live oc-build=$live_build,expected=$expected_build；交由统一恢复器" >&2
+      return 1
     }
   fi
   echo "✓ staged v5 已激活。"
+}
+
+activate_staged() {
+  begin_cutover_step staged activating || return 1
+  if ( set -Eeuo pipefail; activate_staged_inner ); then
+    cutover_transition activating activated || { recover_cutover "cannot commit activated state"; return 1; }
+    clear_cutover_maintenance || echo "⚠ 激活成功但 maintenance marker 清理失败；最迟在 deadline 自动失效" >&2
+  else
+    local rc=$?; recover_cutover "activate failed"; return "$rc"
+  fi
 }
 
 # ───────────────────────── dist:前端生效面(web-react)─────────────────────────
@@ -575,6 +945,7 @@ case "$MODE" in
   deploy)    deploy ;;
   smoke)     smoke ;;
   dist)      deploy_dist ;;
+  prepare-offline-cutover) prepare_offline_cutover ;;
   offline-recycle) offline_recycle ;;
   stage)     stage ;;
   activate-staged) activate_staged ;;

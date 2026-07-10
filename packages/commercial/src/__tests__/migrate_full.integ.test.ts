@@ -217,7 +217,7 @@ describe("full migration suite", () => {
     assert.equal(plan1000.rows[0].credits, "130000");
   });
 
-  test("0123 atomically replaces GPT-5.5 with all GPT-5.6 models and migrates preferences", async (t) => {
+  test("0123 replaces GPT-5.5 and 0124 changes only Sol/Terra defaults", async (t) => {
     if (skipIfNoPg(t)) return;
     const here = path.dirname(fileURLToPath(import.meta.url));
     const sourceDir = path.resolve(here, "../db/migrations");
@@ -317,6 +317,39 @@ describe("full migration suite", () => {
         "gpt-5.6-sol",
         "gpt-5.6-terra",
       ]);
+
+      const before0124 = await query<{ model_id: string; default_effort: string | null }>(
+        `SELECT model_id, default_effort
+           FROM model_pricing
+          WHERE model_id IN ('gpt-5.6-sol','gpt-5.6-terra','gpt-5.6-luna')
+          ORDER BY model_id`,
+      );
+      const lunaBefore = before0124.rows.find((row) => row.model_id === "gpt-5.6-luna")!.default_effort;
+
+      await copyFile(
+        path.join(sourceDir, "0124_gpt56_xhigh_defaults.sql"),
+        path.join(stagedDir, "0124_gpt56_xhigh_defaults.sql"),
+      );
+      const applied0124 = await runMigrations({ dir: stagedDir });
+      assert.deepEqual(applied0124.applied, ["0124_gpt56_xhigh_defaults"]);
+
+      const after0124 = await query<{ model_id: string; default_effort: string | null }>(
+        `SELECT model_id, default_effort
+           FROM model_pricing
+          WHERE model_id IN ('gpt-5.6-sol','gpt-5.6-terra','gpt-5.6-luna')
+          ORDER BY model_id`,
+      );
+      assert.deepEqual(after0124.rows, [
+        { model_id: "gpt-5.6-luna", default_effort: lunaBefore },
+        { model_id: "gpt-5.6-sol", default_effort: "xhigh" },
+        { model_id: "gpt-5.6-terra", default_effort: "xhigh" },
+      ]);
+
+      const prefsAfter0124 = await query<{ prefs: Record<string, unknown> }>(
+        "SELECT prefs FROM user_preferences WHERE user_id=$1",
+        [userId],
+      );
+      assert.deepEqual(prefsAfter0124.rows[0].prefs, prefs.rows[0].prefs);
     } finally {
       await rm(stagedDir, { recursive: true, force: true });
     }

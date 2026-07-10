@@ -1,0 +1,7 @@
+{
+  "databaseCompatibility": "backward-compatible",
+  "requiredMigrations": [
+    "0123_gpt56_models",
+    "0124_gpt56_xhigh_defaults"
+  ]
+}

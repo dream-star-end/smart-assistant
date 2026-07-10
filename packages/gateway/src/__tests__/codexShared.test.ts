@@ -33,11 +33,11 @@ describe('codexReasoningEffortConfig', () => {
   it('known GPT-5.6 models use their own default for missing/invalid input', () => {
     assert.deepEqual(codexReasoningEffortConfig('gpt-5.6-sol', undefined), [
       '-c',
-      'model_reasoning_effort="low"',
+      'model_reasoning_effort="xhigh"',
     ])
     assert.deepEqual(codexReasoningEffortConfig('gpt-5.6-terra', 'turbo'), [
       '-c',
-      'model_reasoning_effort="medium"',
+      'model_reasoning_effort="xhigh"',
     ])
     assert.deepEqual(codexReasoningEffortConfig('gpt-5.6-luna', null), [
       '-c',

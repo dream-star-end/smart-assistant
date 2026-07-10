@@ -175,8 +175,8 @@ describe("CodexAdapter — 握手 / thread lifecycle", () => {
     assert.deepEqual(h.spawnCalls[0].cmd, "codex");
     assert.equal(h.spawnCalls[0].args[0], "app-server");
     assert.ok(
-      h.spawnCalls[0].args.includes('model_reasoning_effort="low"'),
-      `spawn argv should use GPT-5.6-Sol default effort low: ${h.spawnCalls[0].args.join(" ")}`,
+      h.spawnCalls[0].args.includes('model_reasoning_effort="xhigh"'),
+      `spawn argv should use GPT-5.6-Sol default effort xhigh: ${h.spawnCalls[0].args.join(" ")}`,
     );
     assert.deepEqual(h.spawnCalls[0].args.slice(-2), ["--listen", "stdio://"]);
     const initParams = init.params as { clientInfo?: { name?: string }; capabilities?: { experimentalApi?: boolean } };
@@ -191,7 +191,7 @@ describe("CodexAdapter — 握手 / thread lifecycle", () => {
 
     const turnStart = await waitForRequest(h, "turn/start");
     const turnParams = turnStart.params as { collaborationMode?: { settings?: { reasoning_effort?: unknown } } };
-    assert.equal(turnParams.collaborationMode?.settings?.reasoning_effort, "low");
+    assert.equal(turnParams.collaborationMode?.settings?.reasoning_effort, "xhigh");
     assert.deepEqual(h.sessionIds, ["thr-new-1"]);
     assert.equal(h.adapter.nativeSessionId, "thr-new-1");
 

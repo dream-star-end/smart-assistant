@@ -197,8 +197,8 @@ describe('CodexAppServerRunner turn/start params', () => {
 
   it('uses each GPT-5.6 model default and passes explicit max through', async () => {
     const expectedDefaults = [
-      ['gpt-5.6-sol', 'low'],
-      ['gpt-5.6-terra', 'medium'],
+      ['gpt-5.6-sol', 'xhigh'],
+      ['gpt-5.6-terra', 'xhigh'],
       ['gpt-5.6-luna', 'medium'],
     ] as const
     for (const [model, expected] of expectedDefaults) {
@@ -214,7 +214,7 @@ describe('CodexAppServerRunner turn/start params', () => {
     assert.equal((maxParams.collaborationMode as any).settings.reasoning_effort, 'max')
     h.runner.setEffortLevel('turbo')
     const invalidParams = (h.runner as any).buildTurnStartParams('hi')
-    assert.equal((invalidParams.collaborationMode as any).settings.reasoning_effort, 'low')
+    assert.equal((invalidParams.collaborationMode as any).settings.reasoning_effort, 'xhigh')
     await h.cleanup()
   })
 })
