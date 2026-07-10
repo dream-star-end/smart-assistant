@@ -350,8 +350,13 @@ const BLOCKED_FOR_USER_RULES: readonly BlockedForUserRule[] = [
   { re: /^\/api\/agents\/[^/]+\/persona$/, label: '/api/agents/:id/persona' },
   // /api/agents/:id/message POST + /api/agents/:id/delegate POST —— host agent 执行 prompt = RCE
   { re: /^\/api\/agents\/[^/]+\/(message|delegate)$/, label: '/api/agents/:id/(message|delegate)' },
-  // 内存 / 技能(host singleton 存储)
-  { re: /^\/api\/agents\/[^/]+\/memory\/(memory|user)$/, label: '/api/agents/:id/memory/*' },
+  // 内存 / 技能(host singleton 存储)。memdir 范式后 memory 面多了 files/:file 子路由
+  // (单条记忆文件 CRUD),与 memory/user 同属 host singleton,必须一并拦死;文件名段
+  // 放宽到任意非斜杠段(拦截面宁宽勿漏,文件名合法性校验是容器 gateway 的事)。
+  {
+    re: /^\/api\/agents\/[^/]+\/memory\/(memory|user|files\/[^/]+)$/,
+    label: '/api/agents/:id/memory/*',
+  },
   { re: /^\/api\/agents\/[^/]+\/skills(\/[A-Za-z0-9_\-]+)?$/, label: '/api/agents/:id/skills' },
   // 用户级共享技能库(host singleton 存储);付费用户只能经 container proxy 操作自己容器
   { re: /^\/api\/skills(\/[A-Za-z0-9_\-]+)?$/, label: '/api/skills' },

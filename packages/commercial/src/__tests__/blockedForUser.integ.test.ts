@@ -197,6 +197,10 @@ describe("BLOCKED_FOR_USER_RULES — user role → 403", () => {
     { path: "/api/agents/main/memory/memory", method: "PUT" },
     { path: "/api/agents/main/memory/user", method: "GET" },
     { path: "/api/agents/main/memory/user", method: "PUT" },
+    // memdir 范式新增的单条记忆文件 CRUD 子路由:同属 host singleton 存储,必须拦死
+    { path: "/api/agents/main/memory/files/some-fact.md", method: "GET" },
+    { path: "/api/agents/main/memory/files/some-fact.md", method: "PUT" },
+    { path: "/api/agents/main/memory/files/some-fact.md", method: "DELETE" },
     { path: "/api/agents/main/skills", method: "GET" },
     { path: "/api/agents/main/skills", method: "POST" },
     { path: "/api/agents/main/skills/my-skill", method: "GET" },
