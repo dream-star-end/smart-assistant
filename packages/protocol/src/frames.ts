@@ -106,6 +106,13 @@ export const InboundMessage = Type.Object({
   // 非法值 strip 后只记 `clientTraceIdIssue` 枚举(防 log injection)。
   // 不参与 turn-level canonical:master 永远 `newTraceId()` 重新生成。
   clientTraceId: Type.Optional(TraceIdString),
+  // CG2a — master 铸造的 per-turn canonical traceId。商用版 master 在 inbound
+  // sanitize **之后**注入再转发容器(与 requestId 同点位改写),是 turn_traces
+  // 登记、billing 广播与 UI 底部"请求ID"的唯一权威。容器 gateway dispatchInbound
+  // 优先采用此值(过 parseTraceIdCandidate 校验),缺失/非法才自铸——此前该字段
+  // 只以 schema 外附加属性存在、gateway 无视它自铸,导致底部请求ID与 turn_traces
+  // 永远对不上(双权威源),这里显式入约。个人版直连不带此字段,走自铸分支。
+  traceId: Type.Optional(TraceIdString),
   ts: Type.Number(),
 })
 export type InboundMessage = Static<typeof InboundMessage>
