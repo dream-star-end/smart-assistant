@@ -113,7 +113,7 @@ find packages/commercial/src -name '*.test.ts' ! -name '*.integ.test.ts' | sort 
 # 两棵树各跑一次,comm -23 mine base 必须为空。禁 -P 并行(全局锁下无收益)。
 # 疑似已中毒(跑啥都挂)先清场:ps -eo pid,etime,args | grep 'node.*--test'(etime 分钟级=孤儿)→ kill -9 -- -<pgid>
 ```
-⚠️ **已知未解 infra 债(2026-07-10)**:`userChatBridge.test.ts` 在**新建 worktree** 里稳定挂死于「frontend build handshake」suite 前(部署树不挂;基底提交对照已证明与业务改动无关)。已收窄线索:挂死时 tsx 自身 IPC 管道(`/tmp/tsx-0/<pid>.pipe`)`close` 永不完成、测试子进程滞留两台 rig 服务器;已排除=tsx 编译缓存膨胀(清空无效)、.git 文件 vs 目录(两侧都是 worktree)。绕行=该文件在新 worktree 的挂死不计入失败集 diff(以基底提交同法复跑为对照组)。偿还触发:任何人再撞到或要动 tsx 版本时接着查。
+ℹ️ **userChatBridge 挂死已根治(46303b5b,2026-07-10 10:38)**:根因=握手测试丢帧竞态(once listener 背靠背双帧丢第二帧→await 永挂),frameCollector 收口,详见该提交与 §CI 挂死条目。**worktree 基于 46303b5b 之前提交的会跑必挂**——rebase canonical 即解,别再按环境问题排查(当天多个会话在此各误诊 1-2 小时;彼时观察到的 tsx IPC pipe close 不完成是下游症状:await 永挂→子进程不退→抱着 rig 服务器与 IPC 连接)。
 - 测试必须是**行为断言**(帧序列驱动 reducer/mock WS/真 DB),不是对源码文本的 regex(那只能防删行,防不了行为)。prompt 驱动的行为(团队模式规则等)本质不可单测——这是设计信号,应改为代码硬编排,而不是写 regex 测试。
 - lint 红线:**不跑 biome --write 全文件 reformat**;只手工修自己引入的违规。
 
