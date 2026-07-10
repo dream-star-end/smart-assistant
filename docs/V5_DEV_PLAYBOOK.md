@@ -137,6 +137,7 @@ ssh kl-mirror 'psql "$DATABASE_URL" -c "select * from turn_traces where trace_id
 3. 帧被吞时查守卫链(reducer.ts §3/§11 顺序):frameSeq 去重 → server域 stale 截止(`_trackerResetServerTs`,同域比较)→ teardown 3min 时间窗 → agent 切换守卫。跨时钟域比较(frame.ts=server钟 vs Date.now()=客户端钟)是历史坑,新代码禁止引入。
 4. 移动端:iOS 键盘/视口=visualViewport 写 CSS var(App.tsx realign + styles.css `#root position:fixed`);鸿蒙 ArkWeb FileList 必须在事件入口快照(live FileList 会被就地清空);排查靠 Caddy access log。
 5. 渲染崩溃已有 per-message ErrorBoundary(MessageBoundary.tsx)兜底,白屏=看它的 console.error 消息 id。
+6. **签名媒体 URL 点击时权威(2026-07-10 用户 175 "下载不了" 410 死循环教训)**:签名 URL 服务端 TTL 仅 5min,任何**用户手势触发的取媒体**(下载/开原图/新标签)必须在交互那一刻经 `media.tsx::useFreshSignedUrl` 解析,fetch 拿到 410/403 再 forceResign 重签一次;禁止把 `useSignedSrc` 的挂载态 URL 冻结进点击路径(挂载 >5min 后点击必死,且"重试"复用同一死 URL 永不自愈)。锚点原生导航场景优先同步 `peek()` 校正 href,异步重签后程序化开新标签有 Safari 弹窗拦截风险,只做慢路径兜底。
 
 ### 3.2 turn 执行/引擎问题
 1. **ground truth 是容器内 runner 进程 environ,不是 docker logs**:
