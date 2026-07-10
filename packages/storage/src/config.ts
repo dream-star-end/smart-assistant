@@ -236,6 +236,13 @@ export interface OpenClaudeConfig {
       viewport?: string
       /** PLAYWRIGHT_BROWSERS_PATH. Default /root/.cache/ms-playwright. */
       browsersPath?: string
+      /** Prefer direct WebRTC video/input transport; JPEG-over-WS remains fallback. Default true. */
+      webrtcEnabled?: boolean
+      /** STUN/TURN URLs for ICE. Default ["stun:stun.cloudflare.com:3478"]. */
+      webrtcIceServers?: string[]
+      /** Fixed server UDP ICE range. Defaults 19000..19100. */
+      webrtcPortMin?: number
+      webrtcPortMax?: number
     }
   }
   // 接入方式三选一(实际 token 由官方 claude 自己存,这里只记录类型)

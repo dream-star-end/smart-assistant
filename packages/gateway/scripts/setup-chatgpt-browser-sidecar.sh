@@ -28,11 +28,18 @@ if [[ ! -f package.json ]]; then
   echo "[setup] init node project at $HOME_DIR"
   npm init -y >/dev/null 2>&1
   # keep it ESM so the sidecar can `import`
-  node -e "const f='package.json';const p=require(f);p.type='module';p.private=true;require('fs').writeFileSync(f,JSON.stringify(p,null,2))"
+  node -e "const f='./package.json';const p=require(f);p.type='module';p.private=true;require('fs').writeFileSync(f,JSON.stringify(p,null,2))"
 fi
 
-echo "[setup] installing playwright + ws (reusing $PLAYWRIGHT_BROWSERS_PATH cache)"
+echo "[setup] installing core playwright + ws runtime (reusing $PLAYWRIGHT_BROWSERS_PATH cache)"
 npm install --no-audit --no-fund playwright ws >/dev/null 2>&1
+
+echo "[setup] installing optional WebRTC/HiDPI codecs"
+if npm install --no-audit --no-fund @roamhq/wrtc@0.10.0 sharp@0.34.5 >/dev/null 2>&1; then
+  node -e "Promise.all([import('@roamhq/wrtc'),import('sharp')]).then(()=>console.log('[setup] WebRTC/sharp OK'))"
+else
+  echo "[setup] WARNING: optional WebRTC dependencies failed; JPEG-over-WebSocket fallback remains available." >&2
+fi
 
 echo "[setup] ensuring a Chromium build is present"
 ./node_modules/.bin/playwright install chromium >/dev/null 2>&1

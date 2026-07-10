@@ -6286,6 +6286,32 @@ body.voice-overlay-open {
   gap: var(--space-2);
   margin-left: auto;
 }
+.chatgpt-browser-transport {
+  display: inline-flex;
+  align-items: center;
+  min-height: 28px;
+  padding: 0 var(--space-2);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  color: var(--fg-muted);
+  background: var(--bg-raised);
+  font-size: var(--text-xs);
+  white-space: nowrap;
+}
+.chatgpt-browser-transport.is-webrtc {
+  color: var(--success);
+  border-color: color-mix(in srgb, var(--success) 38%, var(--border-subtle));
+}
+.chatgpt-browser-quality {
+  min-height: 30px;
+  padding: 0 var(--space-2);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  color: var(--fg);
+  background: var(--bg-raised);
+  font: inherit;
+  font-size: var(--text-xs);
+}
 .chatgpt-web-warning {
   padding: var(--space-2) var(--space-4);
   color: var(--warning);
@@ -6321,7 +6347,8 @@ body.voice-overlay-open {
   -webkit-user-select: none;
   -webkit-touch-callout: none;
 }
-.chatgpt-browser-canvas {
+.chatgpt-browser-canvas,
+.chatgpt-browser-video {
   /* Fill the viewport area, letterboxing to preserve the remote aspect ratio —
      with a per-device viewport the remote already matches, so this is ~full. */
   width: 100%;
@@ -6329,6 +6356,10 @@ body.voice-overlay-open {
   object-fit: contain;
   display: block;
   image-rendering: auto;
+}
+.chatgpt-browser-canvas[hidden],
+.chatgpt-browser-video[hidden] {
+  display: none;
 }
 /* Invisible focusable textarea covering the canvas — captures keystrokes + IME
    composition (Chinese) so the canvas-only view still accepts real typing.
@@ -6382,5 +6413,8 @@ body.voice-overlay-open {
   .chatgpt-web-actions {
     flex-wrap: wrap;
     justify-content: flex-end;
+  }
+  .chatgpt-browser-transport {
+    display: none;
   }
 }

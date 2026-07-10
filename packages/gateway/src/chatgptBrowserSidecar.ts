@@ -27,6 +27,13 @@ export interface ChatGptBrowserSidecarOptions {
   stealthScript?: string
   viewport?: string // "1280x800"
   browsersPath?: string // PLAYWRIGHT_BROWSERS_PATH
+  /** Prefer direct WebRTC video/data transport; JPEG-over-WS stays as fallback. Default true. */
+  webrtcEnabled?: boolean
+  /** STUN/TURN URLs used for ICE gathering. Default Cloudflare STUN. */
+  webrtcIceServers?: string[]
+  /** Fixed UDP port range used by server ICE transports. */
+  webrtcPortMin?: number
+  webrtcPortMax?: number
 }
 
 export interface ChatGptBrowserSidecarDialInfo {
@@ -45,6 +52,9 @@ const DEFAULT_RUNTIME = '/opt/openclaude/chatgpt-browser'
 const DEFAULT_PROFILE = '/root/.openclaude/chatgpt-browser'
 const DEFAULT_VIEWPORT = '1280x800'
 const DEFAULT_BROWSERS_PATH = '/root/.cache/ms-playwright'
+const DEFAULT_WEBRTC_ICE_SERVERS = ['stun:stun.cloudflare.com:3478']
+const DEFAULT_WEBRTC_PORT_MIN = 19000
+const DEFAULT_WEBRTC_PORT_MAX = 19100
 const INITIAL_BACKOFF_MS = 1000
 const MAX_BACKOFF_MS = 30_000
 const STABLE_UPTIME_MS = 30_000
@@ -59,6 +69,10 @@ export class ChatGptBrowserSidecar {
   private readonly stealthScript: string
   private readonly viewport: string
   private readonly browsersPath: string
+  private readonly webrtcEnabled: boolean
+  private readonly webrtcIceServers: string[]
+  private readonly webrtcPortMin: number
+  private readonly webrtcPortMax: number
   private readonly token = randomBytes(24).toString('hex')
   private readonly srcScript = fileURLToPath(
     new URL('../scripts/chatgpt-browser-sidecar.mjs', import.meta.url),
@@ -80,6 +94,10 @@ export class ChatGptBrowserSidecar {
     this.stealthScript = opts.stealthScript ?? ''
     this.viewport = opts.viewport ?? DEFAULT_VIEWPORT
     this.browsersPath = opts.browsersPath ?? DEFAULT_BROWSERS_PATH
+    this.webrtcEnabled = opts.webrtcEnabled !== false
+    this.webrtcIceServers = opts.webrtcIceServers ?? DEFAULT_WEBRTC_ICE_SERVERS
+    this.webrtcPortMin = opts.webrtcPortMin ?? DEFAULT_WEBRTC_PORT_MIN
+    this.webrtcPortMax = opts.webrtcPortMax ?? DEFAULT_WEBRTC_PORT_MAX
     this.log = log
   }
 
@@ -131,6 +149,10 @@ export class ChatGptBrowserSidecar {
         OC_CGB_PROFILE_DIR: this.profileDir,
         OC_CGB_STEALTH_SCRIPT: this.stealthScript,
         OC_CGB_VIEWPORT: this.viewport,
+        OC_CGB_WEBRTC_ENABLED: this.webrtcEnabled ? '1' : '0',
+        OC_CGB_WEBRTC_ICE_SERVERS: JSON.stringify(this.webrtcIceServers),
+        OC_CGB_WEBRTC_PORT_MIN: String(this.webrtcPortMin),
+        OC_CGB_WEBRTC_PORT_MAX: String(this.webrtcPortMax),
         // Parent-death watchdog target: the sidecar exits if the gateway dies
         // without a clean stop (SIGKILL), so it never orphans Xvfb + Chromium.
         OC_CGB_PARENT_PID: String(process.pid),
