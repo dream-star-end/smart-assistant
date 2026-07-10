@@ -40,7 +40,13 @@ describe('normalizeFanoutTasks — 入参校验', () => {
 
   it('合法项规范化:effort 白名单外丢弃、toolsets 非字符串过滤、字段透传', () => {
     const r = normalizeFanoutTasks([
-      { agentId: 'coding-assistant', goal: ' 实现 A ', context: 'ctx', effort: 'high', toolsets: ['browser', 42] },
+      {
+        agentId: 'coding-assistant',
+        goal: ' 实现 A ',
+        context: 'ctx',
+        effort: 'high',
+        toolsets: ['browser', 42],
+      },
       { goal: 'B', effort: 'turbo' }, // 非法 effort → 丢弃
     ])
     assert.equal(r.ok, true)
@@ -102,5 +108,18 @@ describe('aggregateDelegateFanoutResults — 结果聚合 + 单项失败隔离',
     const out = aggregateDelegateFanoutResults([mk({ goal: longGoal, text: 'BODY' })])
     assert.match(out, /…/)
     assert.match(out, /BODY/)
+  })
+
+  it('前端解析契约:首行「并行委派 …成功/…失败」+ 每节 `### i. ✅/❌ label — goal`(DelegateFanoutCard 依赖)', () => {
+    // web-react 的 DelegateFanoutCard 逐行解析该聚合文本:首行取汇总计数,`### i.` 起每个
+    // 子任务小节取状态徽标/标签/目标。这里把两处结构钉死,防止措辞漂移击穿前端解析。
+    const out = aggregateDelegateFanoutResults([
+      mk({ label: 'coding-assistant', goal: '写脚本', text: 'ok' }),
+      mk({ label: 'office-assistant', isError: true, text: 'error: 委派失败' }),
+    ])
+    const lines = out.split('\n')
+    assert.match(lines[0], /^并行委派 2 个子任务已全部返回:1 成功 \/ 1 失败。$/)
+    assert.match(out, /### 1\. ✅ coding-assistant — 写脚本/)
+    assert.match(out, /### 2\. ❌ office-assistant — do something/)
   })
 })
