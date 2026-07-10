@@ -100,7 +100,7 @@ after(async () => {
 beforeEach(async () => {
   if (!pgAvailable) return
   await query(
-    'TRUNCATE TABLE marketplace_installs, marketplace_skill_versions, marketplace_skill_listings, admin_audit, users RESTART IDENTITY CASCADE',
+    'TRUNCATE TABLE marketplace_skill_usage_events, response_rating, marketplace_installs, marketplace_skill_versions, marketplace_skill_listings, admin_audit, users RESTART IDENTITY CASCADE',
   )
 })
 
@@ -179,6 +179,40 @@ async function expectMarketplaceError(fn: () => Promise<unknown>, code: string):
     assert.equal(e.code, code)
     return true
   })
+}
+
+let usageSeq = 0
+/** 直插一条使用事件(模拟容器 skillUsageReporter 落库);ageDays 控制事件年龄以测 30 天窗口。 */
+async function insertUsage(
+  userId: number,
+  slug: string,
+  opts: { traceId?: string | null; eventId?: string; ageDays?: number } = {},
+): Promise<void> {
+  const eventId = opts.eventId ?? `evt-${++usageSeq}`
+  await query(
+    `INSERT INTO marketplace_skill_usage_events
+       (user_id, slug, agent_id, session_key, trace_id, event_id, created_at)
+     VALUES ($1, $2, 'main', NULL, $3, $4, NOW() - make_interval(days => $5))`,
+    [userId, slug, opts.traceId ?? null, eventId, opts.ageDays ?? 0],
+  )
+}
+/** 直插一条响应评分(评分归因的另一端;按 trace_id 与使用事件关联)。 */
+async function insertRating(
+  userId: number,
+  messageId: string,
+  traceId: string,
+  rating: 'up' | 'down',
+): Promise<void> {
+  await query(
+    `INSERT INTO response_rating (user_id, session_id, message_id, trace_id, rating)
+     VALUES ($1, 's', $2, $3, $4)`,
+    [userId, messageId, traceId, rating],
+  )
+}
+/** 发布 + 批准一个技能,返回 slug(信号聚合测试的公共前置)。 */
+async function publishApproved(slug: string, owner: number, admin: number): Promise<void> {
+  const p = await publishSkillVersion(buildPublish(slug, owner))
+  await reviewVersion({ versionId: p.versionId, reviewerUserId: admin, approve: true })
 }
 
 describe('marketplaceDb (integ)', () => {
@@ -743,5 +777,90 @@ describe('marketplaceDb (integ)', () => {
     assert.equal((await listInstalled(installer)).length, 0)
     // idempotent: a second uninstall reports no active row
     assert.equal(await recordUninstall(installer, 'removable'), false)
+  })
+
+  test('usage30d/users30d:30 天窗口 + distinct 用户;无事件=0;detail 同口径', async (t) => {
+    if (skipIfNoPg(t)) return
+    const owner = await createUser('sig-owner@x.com')
+    const admin = await createUser('sig-admin@x.com')
+    const uA = await createUser('sig-a@x.com')
+    const uB = await createUser('sig-b@x.com')
+    await publishApproved('sig-skill', owner, admin)
+    await publishApproved('sig-empty', owner, admin)
+    // uA:近 30 天 2 次 + 40 天前 1 次(窗口外);uB:近 30 天 1 次。
+    await insertUsage(uA, 'sig-skill')
+    await insertUsage(uA, 'sig-skill')
+    await insertUsage(uA, 'sig-skill', { ageDays: 40 })
+    await insertUsage(uB, 'sig-skill')
+
+    const card = (await listApprovedForSearch()).find((c) => c.slug === 'sig-skill')
+    assert.equal(card?.usage30d, 3, '窗口内 3 次(40 天前那次剔除)')
+    assert.equal(card?.users30d, 2, 'distinct 用户 = uA,uB')
+    const empty = (await listApprovedForSearch()).find((c) => c.slug === 'sig-empty')
+    assert.equal(empty?.usage30d, 0)
+    assert.equal(empty?.users30d, 0)
+    // detail 与卡片同口径。
+    const detail = await getListingDetail('sig-skill')
+    assert.equal(detail?.usage30d, 3)
+    assert.equal(detail?.users30d, 2)
+    assert.equal((await getListingDetail('sig-empty'))?.usage30d, 0)
+  })
+
+  test('rating 归因:样本≥5 才透出 + 同 turn 同 slug 多次 view 去重', async (t) => {
+    if (skipIfNoPg(t)) return
+    const owner = await createUser('rate-owner@x.com')
+    const admin = await createUser('rate-admin@x.com')
+    const u = await createUser('rate-user@x.com')
+    await publishApproved('rate-skill', owner, admin)
+    // 5 个被评分的 turn:T1-T4 好评、T5 差评 → up=4/down=1(样本 5 ≥ 阈值)。
+    // T1 有两条同 slug 使用事件(同 trace)→ 聚合 DISTINCT 应只算一次,不会把 up 抬到 5。
+    for (let i = 1; i <= 5; i++) {
+      const trace = `${'0'.repeat(31)}${i}` // 32 hex
+      await insertUsage(u, 'rate-skill', { traceId: trace })
+      if (i === 1) await insertUsage(u, 'rate-skill', { traceId: trace }) // 同 turn 重复 view
+      await insertRating(u, `m${i}`, trace, i === 5 ? 'down' : 'up')
+    }
+    // 一条无评分的使用事件(不同 trace,无 response_rating)→ 不进 rating,但计入 usage。
+    await insertUsage(u, 'rate-skill', { traceId: 'a'.repeat(32) })
+
+    const card = (await listApprovedForSearch()).find((c) => c.slug === 'rate-skill')
+    assert.deepEqual(card?.rating, { up: 4, down: 1 }, '去重后 up=4(非 5),down=1')
+    assert.equal((await getListingDetail('rate-skill'))?.rating?.up, 4)
+    assert.deepEqual((await getListingDetail('rate-skill'))?.rating, { up: 4, down: 1 })
+  })
+
+  test('rating 样本 <5 → 服务端返回 null(卡片/detail 一致)', async (t) => {
+    if (skipIfNoPg(t)) return
+    const owner = await createUser('low-owner@x.com')
+    const admin = await createUser('low-admin@x.com')
+    const u = await createUser('low-user@x.com')
+    await publishApproved('rate-low', owner, admin)
+    // 只有 4 个被评分 turn(<5)→ null。
+    for (let i = 1; i <= 4; i++) {
+      const trace = `${'b'.repeat(31)}${i}`
+      await insertUsage(u, 'rate-low', { traceId: trace })
+      await insertRating(u, `lm${i}`, trace, 'up')
+    }
+    const card = (await listApprovedForSearch()).find((c) => c.slug === 'rate-low')
+    assert.equal(card?.rating, null, '样本不足阈值 → null')
+    assert.equal((await getListingDetail('rate-low'))?.rating, null)
+  })
+
+  test('排序:featured → 30 天使用人数 → 安装数(users30d 压过安装数)', async (t) => {
+    if (skipIfNoPg(t)) return
+    const owner = await createUser('pop-owner@x.com')
+    const admin = await createUser('pop-admin@x.com')
+    const u1 = await createUser('pop-1@x.com')
+    const u2 = await createUser('pop-2@x.com')
+    const inst = await createUser('pop-inst@x.com')
+    await publishApproved('pop-x', owner, admin) // 2 个 30 天使用人,0 安装
+    await publishApproved('pop-y', owner, admin) // 0 使用,1 安装
+    await insertUsage(u1, 'pop-x')
+    await insertUsage(u2, 'pop-x')
+    const yDetail = await getListingDetail('pop-y')
+    await installApprovedVersion({ userId: inst, versionId: yDetail!.versionId })
+
+    const order = (await listApprovedForSearch()).map((c) => c.slug)
+    assert.deepEqual(order, ['pop-x', 'pop-y'], 'users30d(2) 排在安装数(1)之前')
   })
 })

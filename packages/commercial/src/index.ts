@@ -218,6 +218,12 @@ import {
   type ToolFailureAuditHandler,
 } from "./http/internalToolFailureAudit.js";
 import {
+  SKILL_USAGE_PATH,
+  isSkillUsageEnabled,
+  makeSkillUsageHandler,
+  type SkillUsageHandler,
+} from "./http/internalSkillUsage.js";
+import {
   CRON_INDEX_PATH,
   makeCronIndexHandler,
   type CronIndexHandler,
@@ -1450,6 +1456,18 @@ export async function registerCommercial(
             queryRunner: getPool(),
           })
         : null;
+      // /internal/v3/marketplace/skill-usage — 容器 gateway skillUsageReporter 批量上报
+      // 「hub 技能被使用」的低敏信号(slug/agent/trace,不记内容)。user_id 由
+      // verifyContainerIdentity 推导,不信容器传入;写入 marketplace_skill_usage_events 供
+      // 目录聚合(usage30d/users30d + 评分归因)。与 tool-failure 相反 = **默认开**
+      // (OC_MARKET_SKILL_USAGE 显式 '0' 才关):关闭 → 不注册路由,path fall through 到
+      // internalProxyHandler 返 404,容器侧按 fatal drop —— 与"未部署"等价。
+      const skillUsageHandler: SkillUsageHandler | null = isSkillUsageEnabled()
+        ? makeSkillUsageHandler({
+            identityRepo,
+            queryRunner: getPool(),
+          })
+        : null;
       // 平台官方**科研** agent 的幂等 seed —— v5-native 露出(市场为 agent 露出单一权威,
       // 不走 v3 seed/team)。**仅当 research_config 已开启时 seed**(关闭时科研能力本就 503,
       // 避免装到只会报错的 agent;v3 不含本调用 → 不会 seed)。fire-and-forget,失败只 log
@@ -1562,6 +1580,9 @@ export async function registerCommercial(
         }
         if (toolFailureAuditHandler && path === TOOL_FAILURE_AUDIT_PATH) {
           return toolFailureAuditHandler(req, res, ctx);
+        }
+        if (skillUsageHandler && path === SKILL_USAGE_PATH) {
+          return skillUsageHandler(req, res, ctx);
         }
         if (path === CRON_INDEX_PATH) {
           return cronIndexHandler(req, res, ctx);

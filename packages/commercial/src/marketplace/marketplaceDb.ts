@@ -745,6 +745,21 @@ export async function listRecentAiReviews(limit = 50): Promise<AiReviewRecord[]>
   }))
 }
 
+/**
+ * 评分归因(好评率)透出的最小样本数:总样本(up+down)< 本阈值 → 服务端直接返回
+ * rating=null(前端零判断,权威在服务端)。评分本就是"诚实弱信号",样本太少时任何
+ * 好评率都是噪声,不透出好过误导。
+ */
+export const RATING_MIN_SAMPLE = 5
+
+/**
+ * 把聚合出的 up/down 计数按 RATING_MIN_SAMPLE 阈值收敛为对外 rating 形状:
+ * 样本不足 → null(catalog/detail 单一收口,两处调用不再各自判阈值)。
+ */
+function toRating(up: number, down: number): { up: number; down: number } | null {
+  return up + down >= RATING_MIN_SAMPLE ? { up, down } : null
+}
+
 export interface ApprovedSearchRow {
   versionId: string
   slug: string
@@ -763,6 +778,12 @@ export interface ApprovedSearchRow {
   useCases: string[]
   /** 平台精选权重(越小越靠前;null=非精选)。目录排序服务端权威,前端信任此序。 */
   featuredRank: number | null
+  /** 近 30 天使用事件数(真实使用信号;无事件=0)。 */
+  usage30d: number
+  /** 近 30 天 distinct 使用人数(≈"多少人在用";无事件=0)。 */
+  users30d: number
+  /** 评分归因(好评率原始计数;样本 <RATING_MIN_SAMPLE → null,前端不渲染)。 */
+  rating: { up: number; down: number } | null
 }
 
 /** Current approved version of every active listing — the searchable catalog.
@@ -790,23 +811,46 @@ export async function listApprovedForSearch(
     category: string | null
     use_cases: unknown
     featured_rank: number | string | null
+    usage30d: string | null
+    users30d: string | null
+    rating_up: string | null
+    rating_down: string | null
   }>(
-    // install_count 走一次性聚合 JOIN(而非逐行 correlated 子查询):目录上限 500 行,
-    // 逐行子查询会对共享的 v3 search 端点放大 500 次 installs 扫描。
+    // install_count / usage / rating 全部走一次性聚合 JOIN(而非逐行 correlated 子查询):
+    // 目录上限 500 行,逐行子查询会对共享 search 端点放大 500 次扫描。三个信号子查询各按 slug
+    // GROUP BY 一次算,与目录做 hash join:
+    //   ic = 当前活跃安装数;us = 近 30 天使用事件数 / distinct 用户数;
+    //   rt = 评分归因(response_rating.trace_id ⋈ usage.trace_id;先 DISTINCT 去重同 turn 同
+    //        slug 的多次 view —— 一个被评分的 turn 用过某 slug 只记一次 up/down)。
     // org 可见性收口:org-private listing 仅本 org 成员可搜出(callerOrgId=null → 仅公开)。
-    // 目录排序服务端权威:平台精选(featured_rank ASC NULLS LAST)领衔 → 热度(安装数 DESC)
-    // → 新版本(v.id DESC)。前端不再自行 sortByPopularity,信任此序。
+    // 目录排序服务端权威:平台精选(featured_rank ASC NULLS LAST)领衔 → 30 天使用人数(users30d
+    // DESC)→ 安装数(DESC)→ 新版本(v.id DESC)。前端不再自行排序,信任此序。
     `SELECT v.id::text, v.slug, l.kind, v.name, v.description, v.tags, v.embedding_hash,
             v.benchmark, ic.n::text AS install_count,
-            v.category, v.use_cases, l.featured_rank
+            v.category, v.use_cases, l.featured_rank,
+            us.usage_n::text AS usage30d, us.users_n::text AS users30d,
+            rt.up_n::text AS rating_up, rt.down_n::text AS rating_down
        FROM marketplace_skill_listings l
        JOIN marketplace_skill_versions v ON v.id = l.current_approved_version_id
        LEFT JOIN (SELECT slug, count(*) AS n FROM marketplace_installs
                    WHERE uninstalled_at IS NULL GROUP BY slug) ic ON ic.slug = l.slug
+       LEFT JOIN (SELECT slug, count(*) AS usage_n, count(DISTINCT user_id) AS users_n
+                    FROM marketplace_skill_usage_events
+                   WHERE created_at >= NOW() - INTERVAL '30 days'
+                   GROUP BY slug) us ON us.slug = l.slug
+       LEFT JOIN (SELECT slug,
+                         count(*) FILTER (WHERE rating = 'up')   AS up_n,
+                         count(*) FILTER (WHERE rating = 'down') AS down_n
+                    FROM (SELECT DISTINCT e.slug, r.user_id, r.message_id, r.rating
+                            FROM marketplace_skill_usage_events e
+                            JOIN response_rating r ON r.trace_id = e.trace_id
+                           WHERE e.trace_id IS NOT NULL) d
+                   GROUP BY slug) rt ON rt.slug = l.slug
       WHERE l.state = 'active' AND v.status = 'approved'
             AND ($1::text IS NULL OR l.kind = $1)
             AND ${orgVisibleFrag('l', 2)}
-      ORDER BY l.featured_rank ASC NULLS LAST, ic.n DESC NULLS LAST, v.id DESC
+      ORDER BY l.featured_rank ASC NULLS LAST, us.users_n DESC NULLS LAST,
+               ic.n DESC NULLS LAST, v.id DESC
       LIMIT ${SEARCH_CATALOG_CAP + 1}`,
     [kind ?? null, callerOrgId],
   )
@@ -832,6 +876,12 @@ export async function listApprovedForSearch(
     category: x.category ?? null,
     useCases: (x.use_cases as string[]) ?? [],
     featuredRank: x.featured_rank == null ? null : Number(x.featured_rank),
+    usage30d: Number.parseInt(x.usage30d ?? '0', 10) || 0,
+    users30d: Number.parseInt(x.users30d ?? '0', 10) || 0,
+    rating: toRating(
+      Number.parseInt(x.rating_up ?? '0', 10) || 0,
+      Number.parseInt(x.rating_down ?? '0', 10) || 0,
+    ),
   }))
 }
 
@@ -865,6 +915,12 @@ export interface ListingDetail {
   humanMd: string | null
   /** 平台精选权重(null=非精选)。 */
   featuredRank: number | null
+  /** 近 30 天使用事件数(与卡片同口径)。 */
+  usage30d: number
+  /** 近 30 天 distinct 使用人数(与卡片同口径)。 */
+  users30d: number
+  /** 评分归因(样本 <RATING_MIN_SAMPLE → null)。 */
+  rating: { up: number; down: number } | null
 }
 
 /**
@@ -901,15 +957,37 @@ export async function getListingDetail(
     outcome_examples: unknown
     human_md: string | null
     featured_rank: number | string | null
+    usage30d: string
+    users30d: string
+    rating_up: string
+    rating_down: string
   }>(
+    // detail 是单行读:usage/rating 用 LEFT JOIN LATERAL 按 l.slug 直取(命中 idx_mkt_usage_slug_time,
+    // 不做全表 GROUP BY),与 install_count 的单 slug 相关子查询同量级。rt 内先 DISTINCT 去重同
+    // turn 同 slug 的多次 view(与 catalog 同语义);LATERAL 聚合恒返一行,LEFT JOIN 不会放大结果。
     `SELECT l.slug, l.kind, l.state, l.owner_user_id::text, v.version, v.id::text AS vid,
             v.name, v.description, v.tags, v.artifact_hash, v.raw_artifact, v.raw_skill_md,
             v.manifest, v.risk_flags, v.raw_bundle, v.benchmark,
             v.category, v.use_cases, v.outcome_examples, v.human_md, l.featured_rank,
             (SELECT count(*) FROM marketplace_installs i
-              WHERE i.slug = l.slug AND i.uninstalled_at IS NULL)::text AS install_count
+              WHERE i.slug = l.slug AND i.uninstalled_at IS NULL)::text AS install_count,
+            us.usage_n::text AS usage30d, us.users_n::text AS users30d,
+            rt.up_n::text AS rating_up, rt.down_n::text AS rating_down
        FROM marketplace_skill_listings l
        JOIN marketplace_skill_versions v ON v.id = l.current_approved_version_id
+       LEFT JOIN LATERAL (
+              SELECT count(*) AS usage_n, count(DISTINCT u.user_id) AS users_n
+                FROM marketplace_skill_usage_events u
+               WHERE u.slug = l.slug AND u.created_at >= NOW() - INTERVAL '30 days'
+            ) us ON true
+       LEFT JOIN LATERAL (
+              SELECT count(*) FILTER (WHERE d.rating = 'up')   AS up_n,
+                     count(*) FILTER (WHERE d.rating = 'down') AS down_n
+                FROM (SELECT DISTINCT r.user_id, r.message_id, r.rating
+                        FROM marketplace_skill_usage_events e
+                        JOIN response_rating r ON r.trace_id = e.trace_id
+                       WHERE e.trace_id IS NOT NULL AND e.slug = l.slug) d
+            ) rt ON true
       WHERE l.slug = $1 AND l.state = 'active' AND v.status = 'approved'
             AND ${orgVisibleFrag('l', 2)}`,
     [slug, callerOrgId],
@@ -941,6 +1019,12 @@ export async function getListingDetail(
     outcomeExamples: (x.outcome_examples as string[]) ?? [],
     humanMd: x.human_md ?? null,
     featuredRank: x.featured_rank == null ? null : Number(x.featured_rank),
+    usage30d: Number.parseInt(x.usage30d ?? '0', 10) || 0,
+    users30d: Number.parseInt(x.users30d ?? '0', 10) || 0,
+    rating: toRating(
+      Number.parseInt(x.rating_up ?? '0', 10) || 0,
+      Number.parseInt(x.rating_down ?? '0', 10) || 0,
+    ),
   }
 }
 
