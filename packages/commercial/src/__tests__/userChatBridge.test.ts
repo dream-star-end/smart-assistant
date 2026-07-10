@@ -161,6 +161,34 @@ function waitMessage(ws: WebSocket): Promise<{ data: string | Buffer; isBinary: 
   });
 }
 
+/**
+ * 持久收帧器 —— 解决 waitMessage 的丢帧竞态:服务端背靠背连发两帧(如 pre-auth 的
+ * sys.frontend_build + UNAUTHORIZED)时,两帧在同一同步 emit 循环内到达;once 模式下
+ * 第一帧 resolve 后、下一个 waitMessage 挂上 listener 前,第二帧已 emit 完毕被丢弃,
+ * await 永久挂死(07-07 起 CI commercial-unit 30min 超时的根因)。
+ * 构造时立即挂常驻 listener 入队,next() 从队列取或等待,不存在无 listener 窗口。
+ */
+function frameCollector(ws: WebSocket): { next: () => Promise<string> } {
+  const queue: string[] = [];
+  const waiters: Array<(s: string) => void> = [];
+  ws.on("message", (data) => {
+    const out = typeof data === "string"
+      ? data
+      : Buffer.isBuffer(data) ? data.toString("utf8")
+        : Buffer.concat(data as Buffer[]).toString("utf8");
+    const w = waiters.shift();
+    if (w) w(out);
+    else queue.push(out);
+  });
+  return {
+    next(): Promise<string> {
+      const q = queue.shift();
+      if (q !== undefined) return Promise.resolve(q);
+      return new Promise((r) => waiters.push(r));
+    },
+  };
+}
+
 /** 等下一条容器侧 ws 连接(按时间顺序;不复用已有的)。 */
 function waitNextContainerSocket(rig: TestRig, timeoutMs = 1000): Promise<WebSocket> {
   return new Promise((resolve, reject) => {
@@ -1745,12 +1773,12 @@ describe("frontend build handshake", () => {
         `ws://127.0.0.1:${rig.gatewayPort}${BRIDGE_WS_PATH}`,
         ["bearer", "not-a-jwt"],
       );
-      const first = JSON.parse(String((await waitMessage(ws)).data)) as {
-        type: string; build?: string;
-      };
+      // 两帧背靠背同步到达,必须用持久收帧器;逐次 waitMessage 会丢第二帧挂死(见 frameCollector)。
+      const frames = frameCollector(ws);
+      const first = JSON.parse(await frames.next()) as { type: string; build?: string };
       assert.equal(first.type, "sys.frontend_build");
       assert.equal(first.build, "a1b2c3d4e5f60718");
-      const second = JSON.parse(String((await waitMessage(ws)).data)) as { type: string };
+      const second = JSON.parse(await frames.next()) as { type: string };
       assert.notEqual(second.type, "sys.frontend_build");
       await waitClose(ws);
     } finally {
