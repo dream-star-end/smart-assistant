@@ -83,6 +83,13 @@ git worktree add ../openclaude-v5-<slug> -b feat/v5-<slug> feat/v5-aurora-rewrit
 - 每个 agent 结束只报告不 commit;集成者逐个验收(看 diff+实跑其测试)后按主题分批提交。
 
 ### 2.4 测试(每层的实跑命令)
+
+> **跨树互斥(硬机制,2026-07-10)**:`test:commercial:unit/integ` 已经由
+> `scripts/test-mutex.sh` 包裹 —— 共享 octest PG/端口的测试族在
+> `/var/lock/oc-test-commercial.lock` 上全机串行,另一 worktree 在跑时会打印持有者并
+> 等待(≤30min)。多会话并行开发**不需要**人为协调测试时序;若看到"锁被占"就是另一
+> 会话在跑,等它即可。绕过 npm script 直接 `npx tsx --test` 跑 commercial 测试 = 违规
+> (会撞库,当天误诊 2 小时的教训)。
 ```bash
 npm run typecheck                                   # 全仓 tsc --build(必须干净)
 npm run test:gateway                                # node tsx --test(≈1255 个)
@@ -182,6 +189,13 @@ usage_records + journal 双查;零输出免单/turn 级 idle 免单已内建;cod
 | `packages/commercial/src/db/migrations/*.sql` | 共享 PG | AUTO_MIGRATE=0 → **人工受控 apply**(§4.5) |
 
 ### 4.2 标准部署
+
+> **部署互斥(硬机制,2026-07-10)**:deploy-v5.sh 所有写模式过
+> `/var/lock/oc-v5-deploy.lock` 全局串行(持有者在 `.holder`,等待 900s 超时 fail-loud);
+> 多会话同时部署自动排队,禁止再人工协调。
+> **代码+前端一起上 → 用 `--with-dist`**(单次重启双生效面);`deploy` 后紧跟 `--dist`
+> 的两段式成对重启会把"刚被第一次重启打断、自动续写刚跑起来"的 turn 第二次掐死
+> (2026-07-10 事故放大器),除非只改了单一生效面,否则不要拆开跑。
 ```bash
 cd /opt/openclaude/openclaude-v5-aurora     # 部署树;必须 clean(脏文件会被 rsync 上去)
 git status --porcelain                       # 必须为空
@@ -284,7 +298,7 @@ BEGIN; <迁移 SQL>; INSERT INTO schema_migrations(version, applied_at) VALUES (
 
 | 债 | 内容 | 偿还触发 |
 |---|---|---|
-| 会话归档孤儿清理 | deleteClientSession 软删只清 messages,不清该会话 archive_chunks/archived_ids(不可达也不可复活,仅体积残留) | 会话硬删/GC 机制落地时一并清两表 |
+| ~~会话归档孤儿清理~~ **已偿还**(2026-07-10,feat/v5-concurrency-guards) | deleteClientSession 软删同事务级联清 archive_chunks/archived_ids | — |
 | admin 归档 offset 深翻 O(skip/200) | admin sessions 视图 offset 分页越过尾巴走归档 cursor walk,深 offset 重走前缀页;单人低频诊断可接受 | admin 前端改用与用户面 /archive 一致的 cursor 翻页 |
 | ~~团队卡 server-authored 化~~ **已偿还**(4202986b+ac966d6f,P2 批次2) | 生成点=handleDelegateTask 收尾(parser Agent 排除保留);sink agentGroups[]→master role 'agent-group'(srv-*,_delegateStatus 三态)→storage/前端按 _delegateRunId **local-wins** 去重;server 行=骨架+终态(过程树有意不持久化,本设备 IndexedDB 承载)。**部署红线:master-first**(strict schema 新字段,新 gateway→旧 master 400 fatal-drop 整包)。TeamPanel 同批改按 turn 锚点归组 | — |
 | ~~hidden reviewer pipeline 硬编排~~ **已退役**(2026-07-07 boss 裁决,被队长自主送审取代) | 演化:preamble 软约束(漂移)→ gateway 硬编排(9c36c34a)→ **队长自主送审**:preamble 纪律"除明显简单任务外都送审"+`request_review` 工具(mcp-memory→delegate hidden-reviewer);平台保证收敛为三件=isReview 按目标身份派生 / hidden guard ≤3次/turn / 团队门(父 turn 非团队 409,权威快照 `session._teamModeTurn`+`_currentTurnUserText`)。final 不再扣住,状态机/continuation/修订标记帧全删(防复活断言在 teamModeHiddenReviewer.test.ts)。**取舍(boss 知情选择)**:低遵循度队长模型可能漏送审,质量门从强制变纪律引导 | 若实测漏审率不可接受 → 复活 gateway 兜底(turn 结束未送审则补审) |
