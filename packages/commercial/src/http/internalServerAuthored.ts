@@ -65,6 +65,8 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import { z } from "zod";
 
 import { rootLogger, type Logger } from "../logging/logger.js";
+import { enqueueAlert } from "../admin/alertOutbox.js";
+import { EVENTS } from "../admin/alertEvents.js";
 import {
   HttpError,
   REQUEST_ID_HEADER,
@@ -523,7 +525,29 @@ export function makeServerAuthoredHandler(
     subsys: "internalServerAuthored",
   });
   const now = deps.now ?? (() => Date.now());
-  const metric = deps.metric ?? incrV3SinkPersist;
+  // 单一权威拦截:所有 oversized 拒写(现在与未来任何站点)都经这一个 metric 口 →
+  // 附带触发 system.session_oversized 告警。热尾巴+归档上线后该结果理论不可达,
+  // 命中即 bug(spill 未生效/单条超大消息),必须有人被通知而不是等翻日志。
+  // dedupe 按小时桶防风暴;enqueue 失败只吞(告警不许拖垮持久化主路径)。
+  // sessionId 级细节在同点位的 error 日志里(postSpillUnexpected 标记)。
+  const baseMetric = deps.metric ?? incrV3SinkPersist;
+  const metric: typeof baseMetric = (outcome, kind) => {
+    if (outcome === "reject_oversized") {
+      const bucket = new Date(now()).toISOString().slice(0, 13);
+      void enqueueAlert({
+        event_type: EVENTS.SYSTEM_SESSION_OVERSIZED,
+        severity: "critical",
+        title: "会话行 oversized 拒写(spill 后理论不可达,命中即 bug)",
+        body:
+          `server-authored 持久化命中 MAX_SESSION_BYTES 硬闸(kind=${kind})。` +
+          `热尾巴+归档上线后此路径不应触达 —— 排查 spill 是否失效或单条超大消息:` +
+          "`grep -E 'postSpillUnexpected|_session_oversized' /var/log/openclaude-v5.log` 取 sessionId。",
+        payload: { kind, bucket },
+        dedupe_key: `${EVENTS.SYSTEM_SESSION_OVERSIZED}:${kind}:${bucket}`,
+      }).catch(() => {});
+    }
+    baseMetric(outcome, kind);
+  };
 
   return async function handle(req, res, ctx) {
     setSecurityHeaders(res);

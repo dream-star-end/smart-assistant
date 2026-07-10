@@ -2918,8 +2918,17 @@ export async function deleteClientSession(id: string, userId?: string): Promise<
     ? "UPDATE client_sessions SET deleted_at = ?, messages = '[]', message_count = 0 WHERE id = ? AND user_id = ? AND deleted_at IS NULL"
     : "UPDATE client_sessions SET deleted_at = ?, messages = '[]', message_count = 0 WHERE id = ? AND deleted_at IS NULL"
   const now = Date.now()
-  const result = userId ? db.prepare(sql).run(now, id, userId) : db.prepare(sql).run(now, id)
-  return result.changes > 0
+  const txn = db.transaction((): boolean => {
+    const result = userId ? db.prepare(sql).run(now, id, userId) : db.prepare(sql).run(now, id)
+    if (result.changes === 0) return false
+    // 归档级联清理:软删清 messages 却留归档 chunk/id 行会积累"不可达但占体积"的
+    // 孤儿(用户删会话=不再要这份历史,隐私语义应与 messages 清零一致)。同事务保证
+    // 不产生"主行已删、归档还在"的中间态;仅在主行真的被本次软删时才清,幂等。
+    db.prepare('DELETE FROM client_session_archive_chunks WHERE session_id = ?').run(id)
+    db.prepare('DELETE FROM client_session_archived_ids WHERE session_id = ?').run(id)
+    return true
+  })
+  return txn()
 }
 
 /**

@@ -67,9 +67,11 @@ export const EVENTS = {
   // ── 健康(1)────────────────────────────────────────────────
   HEALTH_SMOKE_FAILED: "health.smoke_failed",
 
-  // ── 系统(2)────────────────────────────────────────────────
+  // ── 系统(3)────────────────────────────────────────────────
   SYSTEM_MAINTENANCE_MODE_CHANGED: "system.maintenance_mode_changed",
   SYSTEM_PRICING_CHANGED: "system.pricing_changed",
+  /** 会话行 oversized 拒写。热尾巴+归档(2026-07-10)后理论不可达,命中即 bug。 */
+  SYSTEM_SESSION_OVERSIZED: "system.session_oversized",
   // ── 健康(新增 1)──────────────────────────────────────────
   COMPUTE_HOST_DISK_HIGH: "health.compute_host_disk_high",
   // ── 健康(P3.2 provider 健康度自动探测)────────────────────
@@ -142,6 +144,8 @@ export const EVENT_META: EventMeta[] = [
     description: "维护模式切换", trigger: "passive" },
   { event_type: EVENTS.SYSTEM_PRICING_CHANGED, severity: "warning", group: "system",
     description: "模型定价 / 套餐被修改", trigger: "passive" },
+  { event_type: EVENTS.SYSTEM_SESSION_OVERSIZED, severity: "critical", group: "system",
+    description: "会话行 oversized 拒写(热尾巴+归档后理论不可达,命中=spill 失效/单条超大消息,回答正在被丢弃)", trigger: "passive" },
   { event_type: EVENTS.COMPUTE_HOST_DISK_HIGH, severity: "warning", group: "health",
     description: "远端 compute_host 磁盘使用率超阈值(默认 warn>=85% / critical>=95%,5min 轮询)", trigger: "polled" },
   { event_type: EVENTS.PROVIDER_DEGRADED, severity: "critical", group: "health",
