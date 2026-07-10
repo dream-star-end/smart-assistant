@@ -1,6 +1,8 @@
 import { describe, expect, test } from "vitest";
 import { detectShellFileWrites, normalizeToolForDisplay } from "./format";
 import { detectOcCli, isMemoryFilePath, parseMcpName, resolveToolMeta, toolSummary } from "./meta";
+// 跨包取 openclaude-memory 工具名单一权威表(与 index.ts TOOLS 声明同源),做锁步断言。
+import { MEMORY_MCP_TOOL_NAMES, MEMORY_MCP_TRAIN_ONLY_TOOL_NAMES } from "../../../../mcp-memory/src/toolNames";
 
 describe("parseMcpName (P5)", () => {
   test("mcp__server__op → { server, op }", () => {
@@ -17,6 +19,32 @@ describe("parseMcpName (P5)", () => {
   });
   test("非 MCP 名 → null", () => {
     expect(parseMcpName("Bash")).toBeNull();
+  });
+});
+
+describe("MCP_OP_META 锁步 openclaude-memory 工具名单(漏登记 → 「记忆: <英文>」兜底)", () => {
+  // 每个注册工具都必须有 `openclaude-memory:<name>` 专属条目;否则 resolveToolMeta 回落
+  // server 兜底 `记忆: <humanizeOp>`(boss 现网看到的「记忆: request review」)。新增工具漏改
+  // 这里会直接红,逼两侧同步。
+  const names = [...MEMORY_MCP_TOOL_NAMES, ...MEMORY_MCP_TRAIN_ONLY_TOOL_NAMES];
+  test.each(names)("%s → 专属中文标签(非「记忆:」兜底)", (name) => {
+    const label = resolveToolMeta(`mcp__openclaude-memory__${name}`).label;
+    expect(label.length).toBeGreaterThan(0);
+    expect(label.startsWith("记忆:")).toBe(false);
+  });
+  test("request_review / skill_propose 补齐后有明确标签", () => {
+    expect(resolveToolMeta("mcp__openclaude-memory__request_review").label).toBe("申请质量审查");
+    expect(resolveToolMeta("mcp__openclaude-memory__skill_propose").label).toBe("提议技能");
+  });
+});
+
+describe("codex 系统 server meta(资源清单不再裸 JSON 名)", () => {
+  test("codex server 兜底标签 = 系统: <op>", () => {
+    expect(resolveToolMeta("mcp__codex__something_new").label).toBe("系统: something new");
+  });
+  test("list_mcp_resources / templates 专属标签", () => {
+    expect(resolveToolMeta("mcp__codex__list_mcp_resources").label).toBe("MCP 资源列表");
+    expect(resolveToolMeta("mcp__codex__list_mcp_resource_templates").label).toBe("MCP 资源模板");
   });
 });
 

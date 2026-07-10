@@ -228,8 +228,9 @@ describe("ToolCard 二级分派 + 状态 (P5)", () => {
     expect(screen.getByText("技能检索")).toBeInTheDocument();
     expect(screen.getByText("literature-search")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button"));
-    expect(screen.getByText("query")).toBeInTheDocument();
-    expect(screen.getByText(/Found 1 matching skill/)).toBeInTheDocument();
+    // skill_search 命中富卡:汇总行 + 技能卡(不再裸 query KV / 原始 Found 文本)。
+    expect(screen.getByText("找到 1 个相关技能")).toBeInTheDocument();
+    expect(screen.getAllByText("literature-search").length).toBeGreaterThanOrEqual(1);
     const text = document.body.textContent || "";
     expect(text).not.toContain("codex:mcpToolCall");
     expect(text).not.toContain("mcpToolCall");
@@ -593,7 +594,7 @@ describe("ToolCard 二级分派 + 状态 (P5)", () => {
     expect(document.querySelector("pre")?.textContent).toContain("bad legacy line");
   });
 
-  test("openclaude-memory list_reminders 部分解析失败时整段回退 raw，避免漏任务", () => {
+  test("openclaude-memory list_reminders 一坏行不作废整卡:有效任务出卡 + 坏行附底(不漏任务)", () => {
     render(
       <ToolCard
         message={{
@@ -609,10 +610,10 @@ describe("ToolCard 二级分派 + 状态 (P5)", () => {
       />,
     );
     fireEvent.click(screen.getByRole("button"));
-    expect(screen.queryByText(/当前共有/)).not.toBeInTheDocument();
-    const preText = document.querySelector("pre")?.textContent || "";
-    expect(preText).toContain("ok-job");
-    expect(preText).toContain("malformed reminder line");
+    // 韧性解析:有效任务照常出卡,坏行作 leftover 纯文本附底(不整段回退、不漏任务)。
+    expect(screen.getByText("当前共有 2 个定时任务")).toBeInTheDocument();
+    expect(screen.getByText("ok-job")).toBeInTheDocument();
+    expect(screen.getByText("- malformed reminder line")).toBeInTheDocument();
   });
 
   test.each([
@@ -843,7 +844,7 @@ describe("subAgentActivity 卡(含存量孤儿形状)", () => {
     );
     expect(screen.getByText("子代理活动")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button"));
-    expect(screen.getByText("子代理已启动")).toBeInTheDocument();
+    expect(screen.getByText("已启动")).toBeInTheDocument();
     expect(screen.getAllByText("/root/tool_card_probe").length).toBeGreaterThanOrEqual(1);
     const text = document.body.textContent || "";
     expect(text).not.toContain('"agentThreadId"');
@@ -852,7 +853,7 @@ describe("subAgentActivity 卡(含存量孤儿形状)", () => {
     expect(text).not.toContain("call_8xd930hU3Lw7Hrhn0Go32z1M");
   });
 
-  test("kind=completed(直接 codex: 名)→ 子代理已完成", () => {
+  test("kind=completed(直接 codex: 名)→ 已完成", () => {
     render(
       <ToolCard
         message={{
@@ -869,10 +870,10 @@ describe("subAgentActivity 卡(含存量孤儿形状)", () => {
       />,
     );
     fireEvent.click(screen.getByRole("button"));
-    expect(screen.getByText("子代理已完成")).toBeInTheDocument();
+    expect(screen.getByText("已完成")).toBeInTheDocument();
   });
 
-  test("未知 kind 原样显示", () => {
+  test("未知 kind → 「子代理活动」兜底,不外露英文原词", () => {
     render(
       <ToolCard
         message={{
@@ -883,7 +884,9 @@ describe("subAgentActivity 卡(含存量孤儿形状)", () => {
       />,
     );
     fireEvent.click(screen.getByRole("button"));
-    expect(screen.getByText("paused")).toBeInTheDocument();
+    // kind=paused 未映射 → 中文兜底「子代理活动」,不再直显英文 paused。
+    expect(screen.getAllByText("子代理活动").length).toBeGreaterThanOrEqual(1);
+    expect(document.body.textContent).not.toContain("paused");
   });
 });
 

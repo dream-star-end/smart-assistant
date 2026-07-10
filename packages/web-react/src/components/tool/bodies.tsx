@@ -11,6 +11,9 @@ import { cn } from "../../lib/utils";
 import { SignedImg } from "../chat/media";
 import { Badge, Button } from "../ui";
 import { ReminderStatusCard, renderReminderListCard } from "./memoryReminderCards";
+import { renderSkillListCard, renderSkillSearchCard, renderSkillViewCard } from "./skillCards";
+import { renderDelegateFanoutCard } from "./delegateFanoutCard";
+import { renderMcpResourcesCard } from "./mcpResourceCards";
 import { useToolCardActions } from "./context";
 import {
   asArr,
@@ -549,7 +552,12 @@ function CodexBody({ type, input, tool }: BodyProps & { type: string }) {
       <>
         {safeImg && (
           <div className="mt-1.5">
-            <SignedImg src={safeImg} alt="查看的图片" className="max-h-56 rounded-md border border-border" />
+            {/* 最小显示尺寸 + object-contain + 底色:1×1/极小像素图不再被渲染成隐形小点。 */}
+            <SignedImg
+              src={safeImg}
+              alt="查看的图片"
+              className="max-h-56 min-h-16 min-w-16 rounded-md border border-border bg-code object-contain"
+            />
           </div>
         )}
         {target && <FileMeta>{shortPath(target)}</FileMeta>}
@@ -559,18 +567,23 @@ function CodexBody({ type, input, tool }: BodyProps & { type: string }) {
   }
   if (type === "subAgentActivity") {
     // 子代理生命周期事件:语义状态行即全部信息。agentThreadId 是内部 id 无用户价值,
-    // 不显示;也绝不落 OutputBlock 裸 JSON。
+    // 不显示;也绝不落 OutputBlock 裸 JSON。kind 全映射中文(未知 kind 也不外露英文原词)。
     const kind = asStr(input?.kind);
     const status =
       kind === "started"
-        ? "子代理已启动"
-        : kind === "completed" || kind === "finished"
-          ? "子代理已完成"
-          : kind || "子代理活动";
+        ? "已启动"
+        : kind === "interacted"
+          ? "协作中"
+          : kind === "completed" || kind === "finished"
+            ? "已完成"
+            : kind === "failed"
+              ? "失败"
+              : "子代理活动";
     const agentPath = asStr(input?.agentPath);
     return (
       <>
-        <StatusLine text={status} />
+        <StatusLine text={status} error={kind === "failed"} />
+        <div className="mt-1 text-xs text-faint">模型开启的后台协作线程,用于并行处理子任务。</div>
         {agentPath && <FileMeta>{shortPath(agentPath)}</FileMeta>}
       </>
     );
@@ -578,14 +591,18 @@ function CodexBody({ type, input, tool }: BodyProps & { type: string }) {
   if (type === "imageGeneration") {
     const prompt = asStr(input?.prompt) || asStr(input?.revisedPrompt);
     const savedPath = extractImageGenerationPath(input, tool.output);
-    const running = !tool._completed && !tool.error;
+    // status==='failed'(或引擎标 error)是明确失败终态:显式「生成失败」danger 行,
+    // 绝不落到「图片已生成」歧义;原因文本(若有)由下方 OutputBlock 呈现。
+    const failed = /^(failed|error)$/i.test(asStr(input?.status)) || !!tool.error;
+    const running = !tool._completed && !tool.error && !failed;
     const output = stripDuplicateImageGenerationOutput(tool.output, savedPath);
     return (
       <>
         {prompt && <PromptBlock>{prompt}</PromptBlock>}
         {running && <StatusLine text="图片生成中，通常需要几十秒，请稍候…" />}
-        {!running && !tool.error && <StatusLine text="图片已生成" />}
-        {savedPath && <FileMeta>{shortPath(savedPath)}</FileMeta>}
+        {failed && <StatusLine text="生成失败" error />}
+        {!running && !failed && <StatusLine text="图片已生成" />}
+        {savedPath && !failed && <FileMeta>{shortPath(savedPath)}</FileMeta>}
         {input && (
           <KvList
             obj={input}
@@ -746,11 +763,32 @@ function MemoryBody({ op, input, tool }: BodyProps & { op: string }) {
     );
   }
 
+  // 富卡自带输出信息(列表/结果已结构化呈现)→ 命中时抑制默认 OutputBlock,避免卡片
+  // 下再挂一坨重复文本;富卡解析失败(card=null)时保留 OutputBlock 兜底(UX 铁律)。
   let body: ReactNode = null;
+  let suppressOutput = false;
   if (op === "list_reminders") {
     body = renderReminderListCard(tool.output) ?? <OutputBlock output={tool.output} />;
+    suppressOutput = true;
   } else if (["create_reminder", "update_reminder", "delete_reminder"].includes(op)) {
     body = <ReminderStatusCard op={op} input={input} output={tool.output} error={!!tool.error} />;
+    suppressOutput = true;
+  } else if (op === "skill_list") {
+    const card = renderSkillListCard(tool.output);
+    body = card ?? <KvList obj={input} />;
+    suppressOutput = !!card;
+  } else if (op === "skill_search") {
+    const card = renderSkillSearchCard(tool.output, asStr(input?.query));
+    body = card ?? <KvList obj={input} />;
+    suppressOutput = !!card;
+  } else if (op === "skill_view") {
+    const card = renderSkillViewCard(tool.output);
+    body = card ?? <KvList obj={input} />;
+    suppressOutput = !!card;
+  } else if (op === "delegate_tasks") {
+    const card = renderDelegateFanoutCard(tool.output);
+    body = card ?? <KvList obj={input} />;
+    suppressOutput = !!card;
   } else if (op === "delegate_task" || op === "send_to_agent") {
     body = (
       <KvList
@@ -770,9 +808,7 @@ function MemoryBody({ op, input, tool }: BodyProps & { op: string }) {
   return (
     <>
       {body}
-      {!["create_reminder", "list_reminders", "update_reminder", "delete_reminder"].includes(op) && (
-        <OutputBlock output={tool.output} />
-      )}
+      {!suppressOutput && <OutputBlock output={tool.output} />}
       {btns.length > 0 && <div className="mt-2 flex flex-wrap gap-2">{btns}</div>}
     </>
   );
@@ -1014,6 +1050,11 @@ export function ToolBody({ name, input, tool }: { name: string; input: Input; to
       return <VisionBody input={input} tool={tool} />;
     if (mcp.server === "openclaude-memory") return <MemoryBody op={mcp.op} input={input} tool={tool} />;
     if (mcp.server === "scansci-pdf") return <ScanSciBody op={mcp.op} input={input} tool={tool} />;
+    if (mcp.server === "codex") {
+      // codex 内建 MCP 资源清单;非资源类 op 或解析失败回落通用体。
+      const card = renderMcpResourcesCard(tool.output);
+      if (card) return card;
+    }
   }
   return <GenericBody input={input} tool={tool} />;
 }

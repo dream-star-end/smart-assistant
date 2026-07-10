@@ -20,12 +20,37 @@ function okField(s: string, lo: number, hi: number, allowList = false): boolean 
   return vals.every((x) => isPlainInt(x) && Number(x) >= lo && Number(x) <= hi);
 }
 
-/** 把 5 段式 cron 翻成中文人类可读；非 5 段、复杂（step/range）或越界时回退原串。 */
+// 步进（星号斜杠 N）解析：命中返回 1..max 内的步长 N；非步进或越界 → null（交由 cronHuman 回退原串）。
+// 上界护栏避免把步长超过字段上限（cron 实际只命中首值）的形态误读成「每 N 分/时」。
+function parseStep(s: string, max: number): number | null {
+  const m = /^\*\/(\d+)$/.exec(s);
+  if (!m) return null;
+  const n = Number(m[1]);
+  return n >= 1 && n <= max ? n : null;
+}
+
+/** 把 5 段式 cron 翻成中文人类可读；非 5 段、无法明确表达的复杂形态（range/多位 step 等）回退原串。 */
 export function cronHuman(cron?: string): string {
   const raw = (cron || "").trim();
   const p = raw.split(/\s+/);
   if (p.length !== 5) return raw;
   const [min, hr, dom, mon, dow] = p;
+
+  // ── 步进（*/N）形态：仅当日/月/周均为 * 时翻译，避免与固定日期/星期组合产生歧义；
+  //    dom/mon/dow 上的 step 不臆测，落到下方复杂字段回退。 ──
+  if (dom === "*" && mon === "*" && dow === "*") {
+    const hrStep = parseStep(hr, 23);
+    if (hrStep !== null) {
+      // 时位步进：分位 * → 「每 N 小时」；分位整数 → 「每 N 小时的第 M 分」；分位复杂 → 回退。
+      if (min === "*") return `每 ${hrStep} 小时`;
+      if (isPlainInt(min) && Number(min) <= 59) return `每 ${hrStep} 小时的第 ${Number(min)} 分`;
+      return raw;
+    }
+    const minStep = parseStep(min, 59);
+    // 分位步进且时位 * → 「每 N 分钟」（全天）；时位固定 → 歧义，回退不臆测。
+    if (minStep !== null) return hr === "*" ? `每 ${minStep} 分钟` : raw;
+  }
+
   if (
     !okField(min, 0, 59) ||
     !okField(hr, 0, 23) ||

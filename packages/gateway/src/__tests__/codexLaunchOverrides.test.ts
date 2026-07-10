@@ -77,10 +77,7 @@ describe('tomlValue', () => {
   })
 
   it('throws on record value of non-string type', () => {
-    assert.throws(
-      () => tomlValue({ k: 42 as unknown as string }),
-      /only string values/,
-    )
+    assert.throws(() => tomlValue({ k: 42 as unknown as string }), /only string values/)
   })
 
   it('throws on unsupported top-level type (number, boolean, null)', () => {
@@ -244,6 +241,32 @@ describe('buildCodexLaunchOverrides', () => {
     )
     // The file path inside the override must be under sessionDir we passed.
     assert.ok(out.instructionsFile.startsWith(dir))
+  })
+
+  it('注入 features.image_generation=false 关闭 codex 原生生图(平台生图唯一权威=minimax-media)', async () => {
+    // 键名经容器实证(codex-cli 0.144.0):权威 feature 名是 image_generation,不是 imagegen;
+    // `-c features.image_generation=false` 等价 `codex features --disable image_generation`。
+    const { buildCodexLaunchOverrides } = await import('../codexLaunchOverrides.js')
+    const out = await buildCodexLaunchOverrides({
+      agentId: 'test-agent',
+      sessionDir: dir,
+      gatewayPort: 18789,
+      gatewayToken: 'tok-xyz',
+    })
+    // 作为独立 `-c key=value` 对注入,值为裸 TOML 布尔 false(非字符串 "false")。
+    const idx = out.argvOverrides.indexOf('features.image_generation=false')
+    assert.ok(
+      idx > 0,
+      `argv must disable codex native image gen; got ${out.argvOverrides.join(' ')}`,
+    )
+    assert.equal(out.argvOverrides[idx - 1], '-c', 'features toggle must be a -c pair')
+    // 防手滑打回旧的无效裸键(会被 codex 静默忽略 → 生图工具仍在)。
+    assert.ok(
+      !out.argvOverrides.some((s) => s.includes('features.imagegen')),
+      'must use full feature name image_generation, not the no-op alias imagegen',
+    )
+    // 不得早于 model_instructions_file —— 后者必须稳居首对(顺序快照不变量)。
+    assert.ok(idx > 1, 'features toggle must come after model_instructions_file (arg[1])')
   })
 
   it('instructionsContent prepends CODEX_PREAMBLE before platform context', async () => {

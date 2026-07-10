@@ -6,6 +6,10 @@ import { messageSignature } from "../lib/chat/render";
 import { MessageList, MessageRenderer } from "./MessageRenderer";
 import type { CardCallbacks } from "./chat/cards";
 import type { PermissionRespond } from "./chat/PermissionCard";
+import {
+  THINKING_HEADLINES_ONLY,
+  THINKING_MULTI_SEGMENT,
+} from "./tool/__fixtures__/sessionToolTexts";
 
 afterEach(cleanup);
 
@@ -689,6 +693,106 @@ describe("MessageList 归档分页按钮三态(§4/§5)", () => {
       screen.getByRole("button", { name: /从云端加载更早的历史（还有 400 条）/ }),
     ).toBeInTheDocument();
     expect(screen.queryByText(/加载更多历史/)).toBeNull();
+  });
+});
+
+describe("连续 thinking 行渲染层合并(codex 空正文标题卡)", () => {
+  function renderList(messages: ChatMessage[], sending = false) {
+    return render(
+      <MessageList messages={messages} sending={sending} cb={{}} onRespondPermission={() => {}} />,
+    );
+  }
+  const think = (id: string, text: string): ChatMessage => mk("thinking", { id, text });
+
+  test("连续多条 thinking(真实 codex 摘要)→ 合并成单张卡(分组数量=1)", () => {
+    renderList([
+      mk("user", { id: "u1", text: "演示工具卡", status: "sent" }),
+      think("th1", THINKING_HEADLINES_ONLY),
+      think("th2", THINKING_MULTI_SEGMENT),
+    ]);
+    // 完成态折叠,单一"已思考 · 摘要"表头 → 恰好 1 张思考卡(合并生效,非两排空卡)。
+    expect(screen.getAllByText(/已思考/)).toHaveLength(1);
+    // 折叠态摘要取最新段(th2)首个粗体标题。
+    expect(screen.getByText(/已思考 · Creating generated tool-card-demo\.txt file/)).toBeInTheDocument();
+  });
+
+  test("组内末条流式(sending)→ 整卡「思考中…」,不显示「已思考」", () => {
+    renderList(
+      [
+        mk("user", { id: "u1", text: "q", status: "sent" }),
+        think("th1", "**Step one**"),
+        think("th2", "**Step two**"),
+      ],
+      true,
+    );
+    expect(screen.getByText("思考中…")).toBeInTheDocument();
+    expect(screen.queryByText(/已思考/)).toBeNull();
+  });
+
+  test("中间夹被跳过的 unknown(goal)行 → 不打断连续性,仍合并成 1 张卡", () => {
+    renderList([
+      mk("user", { id: "u1", text: "q", status: "sent" }),
+      think("th1", "**Alpha**"),
+      mk("goal", { id: "g1", text: "目标(v5 不渲染)" }), // messageKind unknown → 渲染 null,透明跳过
+      think("th2", "**Beta**"),
+    ]);
+    expect(screen.getAllByText(/已思考/)).toHaveLength(1);
+    // goal 行仍不产出可见内容(消息数量/顺序语义不变,只是被并入连续性判定)。
+    expect(screen.queryByText("目标(v5 不渲染)")).toBeNull();
+  });
+
+  test("被会渲染的 assistant 叙事行打断 → 分成两张思考卡", () => {
+    renderList([
+      mk("user", { id: "u1", text: "q", status: "sent" }),
+      think("th1", "**Alpha**"),
+      mk("assistant", { id: "a1", text: "中间答复" }),
+      think("th2", "**Beta**"),
+    ]);
+    expect(screen.getAllByText(/已思考/)).toHaveLength(2);
+  });
+
+  test("富化正文:`**标题**` 渲染为粗体,展开后 DOM 无裸星号", async () => {
+    const { container } = renderList([
+      mk("user", { id: "u1", text: "q", status: "sent" }),
+      think("th1", THINKING_HEADLINES_ONLY),
+    ]);
+    // 完成态默认折叠 → 点开表头展开正文。
+    fireEvent.click(screen.getByRole("button", { name: /已思考/ }));
+    // Markdown 经 React.lazy 异步加载:占位期是含 `**` 的纯文本,富文本解析完成后 `**标题**`→<strong>。
+    const strong = await screen.findByText("Planning tool usage strategy", {}, { timeout: 5000 });
+    expect(strong.tagName).toBe("STRONG");
+    // 富化后整卡 DOM 不得残留裸 `**`(现网星号裸露 bug 的回归钉)。
+    expect(container.textContent).not.toContain("**");
+  });
+
+  test("展开合并卡 → 两条 thinking 消息的段都在(多段渲染)", async () => {
+    renderList([
+      mk("user", { id: "u1", text: "q", status: "sent" }),
+      think("th1", THINKING_HEADLINES_ONLY),
+      think("th2", THINKING_MULTI_SEGMENT),
+    ]);
+    fireEvent.click(screen.getByRole("button", { name: /已思考/ }));
+    // 首条消息(th1)末标题 + 末条消息(th2)末标题都被富化为粗体 → 证明两段都进了同一张卡。
+    const s1 = await screen.findByText("Planning explicit collaboration spawn", {}, { timeout: 5000 });
+    expect(s1.tagName).toBe("STRONG");
+    const s2 = await screen.findByText("Debugging template literal parsing", {}, { timeout: 5000 });
+    expect(s2.tagName).toBe("STRONG");
+  });
+
+  test("MessageRenderer 单条兜底路径:仍渲染单段思考卡(流式态)", () => {
+    render(
+      <MessageRenderer
+        message={mk("thinking", { id: "solo", text: "推理中..." })}
+        sig={messageSignature(mk("thinking", { id: "solo", text: "推理中..." }), { isLast: true, sending: true })}
+        isLast={true}
+        sending={true}
+        inActiveTurn={true}
+        cb={{}}
+        onRespondPermission={() => {}}
+      />,
+    );
+    expect(screen.getByText("思考中…")).toBeInTheDocument();
+    expect(screen.getByText("推理中...")).toBeInTheDocument();
   });
 });
 
