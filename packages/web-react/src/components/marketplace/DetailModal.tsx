@@ -1,10 +1,66 @@
-import { ArrowUpCircle, Download, Loader2, ShieldCheck, Users } from 'lucide-react'
+import { isMarketplaceCategoryId, marketplaceCategoryLabel } from '@openclaude/protocol'
+import { ArrowUpCircle, Download, Layers, Loader2, ShieldCheck, Target, Users } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { ApiError, api } from '../../lib/api'
 import type { AuthSession, MarketplaceDetail, MarketplaceInstalled, MarketplaceMyAgent } from '../../lib/types'
 import { AgentScopePicker, normalizeAgentScope } from '../AgentScopePicker'
+import { Markdown } from '../Markdown'
 import { Alert, Badge, Button, Modal } from '../ui'
 import { friendlyRiskFlags } from './riskFlags'
+
+/** 人向商品信息块(适用场景 / 效果示例 / 详细介绍)——description 之后、徽章行之前。 */
+function StorefrontInfo({ detail }: { detail: MarketplaceDetail }) {
+  const useCases = Array.isArray(detail.useCases) ? detail.useCases.filter((s) => s.trim()) : []
+  const outcomes = Array.isArray(detail.outcomeExamples)
+    ? detail.outcomeExamples.filter((s) => s.trim())
+    : []
+  const humanMd = detail.humanMd?.trim()
+  if (useCases.length === 0 && outcomes.length === 0 && !humanMd) return null
+  return (
+    <div className="flex flex-col gap-3">
+      {useCases.length > 0 && (
+        <div>
+          <div className="mb-1.5 flex items-center gap-1.5 text-[12px] font-medium text-muted">
+            <Layers size={13} /> 适用场景
+          </div>
+          <ul className="flex flex-col gap-1">
+            {useCases.map((u, i) => (
+              <li key={i} className="flex gap-2 text-[13px] leading-relaxed text-fg">
+                <span className="mt-1.5 size-1 shrink-0 rounded-full bg-accent" aria-hidden="true" />
+                <span>{u}</span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+      {outcomes.length > 0 && (
+        <div>
+          <div className="mb-1.5 flex items-center gap-1.5 text-[12px] font-medium text-muted">
+            <Target size={13} /> 能达成什么效果
+          </div>
+          <ul className="flex flex-col gap-1.5">
+            {outcomes.map((o, i) => (
+              <li
+                key={i}
+                className="rounded-lg border border-border bg-surface px-2.5 py-1.5 text-[12.5px] leading-relaxed text-fg"
+              >
+                {o}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+      {humanMd && (
+        <div>
+          <div className="mb-1.5 text-[12px] font-medium text-muted">详细介绍</div>
+          <div className="text-[13.5px] leading-relaxed text-fg">
+            <Markdown>{humanMd}</Markdown>
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
 
 const TOOLSET_LABEL: Record<string, string> = {
   core: '核心',
@@ -277,7 +333,15 @@ export function DetailModal({
           )}
           <p className="text-[13.5px] leading-relaxed text-fg">{detail.description}</p>
 
+          {/* 人向商品信息:适用场景 / 效果示例 / 详细介绍(缺则整块不渲染) */}
+          <StorefrontInfo detail={detail} />
+
           <div className="flex flex-wrap items-center gap-1.5">
+            {isMarketplaceCategoryId(detail.category) && (
+              <Badge tone="info">
+                <Layers size={12} /> {marketplaceCategoryLabel(detail.category)}
+              </Badge>
+            )}
             {detail.tags.map((t) => (
               <Badge key={t} tone="accent">
                 {t}
@@ -329,14 +393,18 @@ export function DetailModal({
           )}
 
           {detail.kind === 'agent' ? (
+            // 智能体的 manifest 是「装的到底是什么」的核心,保持展开(不折叠)。
             <AgentManifestView manifest={detail.manifest} />
           ) : (
-            <div>
-              <div className="mb-1.5 text-[12px] font-medium text-muted">完整内容（SKILL.md）</div>
-              <pre className="max-h-72 overflow-auto whitespace-pre-wrap break-words rounded-lg border border-border bg-code px-3 py-2 font-mono text-[12px] leading-relaxed text-fg">
+            // 技能 SKILL.md 原文归模型、非人向 —— 默认折叠进「技术详情」,想看的人点开。
+            <details className="rounded-lg border border-border bg-surface">
+              <summary className="cursor-pointer select-none px-3 py-2 text-[12px] font-medium text-muted outline-none hover:text-fg">
+                技术详情（SKILL.md 原文）
+              </summary>
+              <pre className="max-h-72 overflow-auto whitespace-pre-wrap break-words border-t border-border bg-code px-3 py-2 font-mono text-[12px] leading-relaxed text-fg">
                 {detail.rawArtifact}
               </pre>
-            </div>
+            </details>
           )}
         </div>
       ) : null}

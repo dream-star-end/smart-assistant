@@ -1761,8 +1761,11 @@ export const api = {
     ),
 
   /**
-   * 发布（POST /api/marketplace/publish）。被静态扫描拦截时抛 ApiError
-   * (status 422, code SCAN_BLOCKED, body 含 riskFlags)，上层据此做友好提示。
+   * 发布（POST /api/marketplace/publish）。整个 input 原样序列化为请求体,
+   * 含 storefront 元数据 category/useCases/outcomeExamples/humanMd（后端在 SKILL.md
+   * 工件之外单独入库）。被静态扫描拦截时抛 ApiError(status 422, code SCAN_BLOCKED,
+   * body 含 riskFlags)，人向元数据校验失败时 400(code BAD_CATEGORY/BAD_USE_CASES 等)，
+   * 上层据此做友好提示。
    */
   publishMarketplace: (a: AuthSession, input: MarketplacePublishInput) =>
     jsonOrThrow<MarketplacePublishResult>(
@@ -1778,7 +1781,9 @@ export const api = {
 
   /**
    * 发布智能体（POST /api/marketplace/agent/publish）。manifest 走后端严格白名单
-   * 校验(模型∈公开目录/工具集∈vetted/skillDeps 须已上架),422 带 errors/riskFlags。
+   * 校验(模型∈公开目录/工具集∈vetted/skillDeps 须已上架),422 带 errors/riskFlags;
+   * storefront 元数据 category/useCases/outcomeExamples/humanMd 随 input 原样上传,
+   * 后端在 manifest 校验前剔除、单独入库(与 skill 发布同规则),校验失败 400。
    */
   publishMarketplaceAgent: (a: AuthSession, input: MarketplaceAgentPublishInput) =>
     jsonOrThrow<MarketplacePublishResult>(
