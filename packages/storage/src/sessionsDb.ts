@@ -220,6 +220,58 @@ export async function getSessionsDb(): Promise<Database.Database> {
     }
   } catch { /* table just created with column already */ }
 
+  // ── 长会话热尾巴 + 归档(spill/archive)──
+  //
+  // 单行 messages JSON 有 4MB 硬上限(MAX_SESSION_BYTES,防 2026-05-08 大行卡死
+  // 事件循环)。行到顶后所有追加被静默丢弃 = "扣费但看不到回答"(2026-07-10 uid4)。
+  // 解法:行体积超软阈值(SESSION_SOFT_TRIM_BYTES)时把最老的消息从行里"搬"进归档
+  // chunk 表,行只留最近的热尾巴,写路径永不再拒。归档消息 _seq 冻结不变(增量协议
+  // 依赖单调 _seq),用户回看走 readArchivedMessages 分页从 chunk 表拉。
+  //
+  //   client_session_archive_chunks — 归档 chunk(分页权威;messages 为冻结 JSON 数组)。
+  //     first_seq/last_seq = chunk 内 _seq 的 min/max(chunk 之间 _seq 池 disjoint,故
+  //     first_seq 唯一,可做 PK 的一半)。message_count = chunk 内消息条数。
+  //   client_session_archived_ids — 已归档消息 id 集。三用途:
+  //     ① PUT 防复活(客户端全量 PUT 带回已归档 id → 过滤掉,行不回涨);
+  //     ② append 幂等(server-authored 重放已归档 id → already_exists);
+  //     ③ cost-patch 定位(目标 msg 已归档 → noop,不再徒劳 re-pending)。
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS client_session_archive_chunks (
+      session_id TEXT NOT NULL,
+      user_id    TEXT NOT NULL,
+      first_seq  INTEGER NOT NULL,
+      last_seq   INTEGER NOT NULL,
+      message_count INTEGER NOT NULL,
+      messages   TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      PRIMARY KEY (session_id, first_seq)
+    );
+    CREATE TABLE IF NOT EXISTS client_session_archived_ids (
+      session_id TEXT NOT NULL,
+      msg_id     TEXT NOT NULL,
+      PRIMARY KEY (session_id, msg_id)
+    );
+  `)
+  // 归档水位列(存量库靠 ALTER 补;CREATE TABLE IF NOT EXISTS 对存量 client_sessions
+  // no-op,不会补新列)。archived_through_seq = max(已归档 _seq),归档页游标锚点;
+  // archived_count = 已归档消息累计条数(message_count = tail 数 + archived_count)。
+  try {
+    const cols = db.pragma('table_info(client_sessions)') as Array<{ name: string }>
+    if (!cols.some(c => c.name === 'archived_through_seq')) {
+      db.exec('ALTER TABLE client_sessions ADD COLUMN archived_through_seq INTEGER NOT NULL DEFAULT 0')
+    }
+    if (!cols.some(c => c.name === 'archived_count')) {
+      db.exec('ALTER TABLE client_sessions ADD COLUMN archived_count INTEGER NOT NULL DEFAULT 0')
+    }
+  } catch { /* table just created with columns already */ }
+  // 铁律(2026-07 sessionsdb-migration 事故):引用"后加列/新表"的 index 一律放在所有
+  // ALTER TABLE 之后单独建。本 index 只引用新表 client_session_archive_chunks 的列
+  // (last_seq),对存量库该表由上面 CREATE TABLE IF NOT EXISTS 现建(必带全列),
+  // 天然安全;仍统一置于 ALTER 之后,守住"index 永远在 ALTER 后"的位置纪律。
+  db.exec(
+    'CREATE INDEX IF NOT EXISTS idx_csa_chunks_last ON client_session_archive_chunks(session_id, last_seq)',
+  )
+
   // ── WeChat iLink per-user bindings (multi-tenant) ──
   //   Each OpenClaude user can bind exactly one WeChat bot account via
   //   ilinkai.weixin.qq.com. The row stores the bot_token + long-poll cursor
@@ -644,6 +696,11 @@ export interface ClientSession {
   lastAt: number
   messages: unknown[]
   updatedAt: number
+  // 归档水位(热尾巴 + 归档)。读侧透传给客户端:archivedCount 用于"还有 N 条"计数与
+  // "从云端加载更早历史"按钮是否出现;archivedThroughSeq 是客户端 mergeFullServerWins
+  // 判定"本地 _seq ≤ 水位的行是已归档 server 行,无条件保留"的边界。旧行/无归档 → 0。
+  archivedCount?: number
+  archivedThroughSeq?: number
 }
 
 export interface ClientSessionMeta {
@@ -684,6 +741,24 @@ export type MessageLike = {
  * contribute under 64KB per turn.
  */
 export const MAX_SESSION_BYTES = 4 * 1024 * 1024
+
+// ── 长会话热尾巴 + 归档:spill 常量 ──
+//
+// 写路径每次 normalize 后测量序列化字节:> SOFT_TRIM 触发 spill,从数组头(最老)向后
+// 搬进归档,直到剩余尾巴 ≤ TAIL_TARGET;但尾巴至少保留 TAIL_MIN_MSGS 条。
+//
+// 阈值关系(硬约束,勿乱调):SOFT_TRIM(2.5M) > TAIL_TARGET(2M) 且两者都 < MAX(4M)。
+// - TAIL_TARGET 留出 MAX 与它之间 2M 的余量:一次 spill 后尾巴 ≤ 2M,后续 append 有足够
+//   空间累积到下次 SOFT_TRIM 才再 spill,避免每 turn 都 spill(spill 有 chunk 写开销)。
+// - TAIL_MIN_MSGS = 64 > 兜底上下文注入窗口(bridge 48 条 / 容器 40 条):保证模型无法
+//   原生续接、走兜底注入重建上下文时,热尾巴始终 ≥ 该窗口 → spill 对模型侧零影响。
+export const SESSION_SOFT_TRIM_BYTES = Math.floor(2.5 * 1024 * 1024) // 2.5MB
+export const SESSION_TAIL_TARGET_BYTES = 2 * 1024 * 1024 // 2MB
+export const SESSION_TAIL_MIN_MSGS = 64
+// 单个归档 chunk 的上限:≤200 条且 ≤768KB。两者取先到者切分(单条 >768KB 的巨型消息
+// 仍单独成 chunk,不无限循环)。chunk 小 → readArchivedMessages 分页展开的 parse 成本有界。
+export const ARCHIVE_CHUNK_MAX_MSGS = 200
+export const ARCHIVE_CHUNK_MAX_BYTES = 768 * 1024 // 768KB
 
 /**
  * Outcome of `upsertClientSession`. Replaces the older boolean return so
@@ -1358,6 +1433,182 @@ export function normalizeAndAssignSeqs<T extends MessageLike>(
   return { messages: out, nextSeq, maxSeq }
 }
 
+// ── 长会话热尾巴 + 归档:spill 核心(唯一写侧收口)──
+
+/** {@link _spillOverflowCore} 的返回。 */
+export interface SpillOverflowResult {
+  /** 保留在 client_sessions.messages 行里的热尾巴(最近的消息;未触发 spill 时 === 入参 msgs)。 */
+  tail: MessageLike[]
+  /** 本次**新**归档的消息条数(幂等:重放同批已归档 chunk 时为 0,不重复计)。 */
+  archivedDelta: number
+  /** 归档水位 = max(既有水位, 本次归档消息 _seq 的最大值)。单调不降。 */
+  archivedThroughSeq: number
+}
+
+/**
+ * **spill 核心** —— 把行里最老的消息搬进归档 chunk 表,行只留热尾巴。四条写路径
+ * (upsert / server-authored append / cost-patch / delegate-drain)与迁移脚本
+ * **全部复用本函数**,是归档的唯一写侧收口。
+ *
+ * 必须在调用方的事务内(BEGIN IMMEDIATE)同步调用:本函数直接 INSERT 归档表,依赖调用方
+ * 事务的原子性(与主行 UPDATE 同提交 / 同回滚)。
+ *
+ * 前置契约:入参 msgs 必须已跑过 {@link normalizeAndAssignSeqs}(全员有数字 _seq)。若发现
+ * 任一消息缺 _seq → **不 spill,原样返回**(防御,勿抛):无 _seq 无法维护归档/增量游标。
+ *
+ * 语义要点:
+ *   - **软阈值触发**:序列化字节 ≤ SESSION_SOFT_TRIM_BYTES → 零副作用(tail === msgs)。
+ *   - **搬不删,_seq 冻结**:归档消息与保留尾巴的 _seq 一律不变不重排(增量协议依赖单调性;
+ *     与旧 sessions-fix-oversized 的"重排"策略不同 —— 旧脚本**删**内容故重排,我们**搬**内容)。
+ *   - **尾巴下限**:至少保留 SESSION_TAIL_MIN_MSGS 条(即便这样尾巴仍 > TAIL_TARGET,min 优先)。
+ *   - **chunk 切分**:spill 段按数组序切 chunk(每 chunk ≤200 条且 ≤768KB),写 chunk 表 + id 集。
+ *   - **幂等**:chunk PK (session_id, first_seq=min _seq) 冲突用 INSERT OR IGNORE;archivedDelta
+ *     只累计"真正新插入"的 chunk 的条数(cr.changes>0),重放不重复计。
+ */
+export function _spillOverflowCore(
+  db: Database.Database,
+  sessId: string,
+  userId: string,
+  msgs: MessageLike[],
+  opts: { currentArchivedThroughSeq: number; now?: number },
+): SpillOverflowResult {
+  const now = opts.now ?? Date.now()
+  const currentWatermark = opts.currentArchivedThroughSeq > 0 ? opts.currentArchivedThroughSeq : 0
+
+  // Fast path:行仍在软阈值内 → 什么都不搬。这里的 JSON.stringify 是精确字节度量;
+  // 只有真正 spill 的那一 turn,调用方才会对(通常更小的)tail 再 stringify 一次 ——
+  // 罕见路径上的一次多余编码,可接受。
+  if (Buffer.byteLength(JSON.stringify(msgs), 'utf8') <= SESSION_SOFT_TRIM_BYTES) {
+    return { tail: msgs, archivedDelta: 0, archivedThroughSeq: currentWatermark }
+  }
+
+  // 防御:spill 要求全员有数字 _seq(归档/增量游标)。缺 _seq → 拒绝 spill,原样返回
+  // (不是错误路径,是安全 no-op;调用方契约上应先跑 normalizeAndAssignSeqs)。
+  for (const m of msgs) {
+    if (!m || typeof m._seq !== 'number' || !Number.isFinite(m._seq)) {
+      return { tail: msgs, archivedDelta: 0, archivedThroughSeq: currentWatermark }
+    }
+  }
+
+  // 尾巴不能低于下限:即便超软阈值,若总条数 ≤ MIN_MSGS 也不搬(保住兜底注入窗口)。
+  if (msgs.length <= SESSION_TAIL_MIN_MSGS) {
+    return { tail: msgs, archivedDelta: 0, archivedThroughSeq: currentWatermark }
+  }
+
+  // 逐条序列化字节(数组序)+ 1 字节分隔符估算。近似即可:TAIL_TARGET 是软目标。
+  const SEP = 1
+  const perBytes = new Array<number>(msgs.length)
+  let totalBytes = 2 // 外层 [ ]
+  for (let i = 0; i < msgs.length; i++) {
+    const b = Buffer.byteLength(JSON.stringify(msgs[i]), 'utf8') + SEP
+    perBytes[i] = b
+    totalBytes += b
+  }
+
+  // 从数组头(最老)向后搬,直到剩余尾巴 ≤ TAIL_TARGET;但绝不搬到尾巴 < MIN_MSGS。
+  const maxSpill = msgs.length - SESSION_TAIL_MIN_MSGS
+  let spillCount = 0
+  let tailBytes = totalBytes
+  while (spillCount < maxSpill && tailBytes > SESSION_TAIL_TARGET_BYTES) {
+    tailBytes -= perBytes[spillCount]
+    spillCount++
+  }
+  if (spillCount <= 0) {
+    // 溢出全集中在最新的 MIN_MSGS 条里 → 搬无可搬(硬闸 MAX_SESSION_BYTES 兜底)。
+    return { tail: msgs, archivedDelta: 0, archivedThroughSeq: currentWatermark }
+  }
+
+  const spilled = msgs.slice(0, spillCount)
+  const tail = msgs.slice(spillCount)
+
+  const insertChunk = db.prepare(
+    `INSERT OR IGNORE INTO client_session_archive_chunks
+       (session_id, user_id, first_seq, last_seq, message_count, messages, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+  )
+  const insertId = db.prepare(
+    'INSERT OR IGNORE INTO client_session_archived_ids (session_id, msg_id) VALUES (?, ?)',
+  )
+
+  let archivedDelta = 0
+  let watermark = currentWatermark
+  let i = 0
+  while (i < spilled.length) {
+    // 贪心切 chunk:≤ARCHIVE_CHUNK_MAX_MSGS 条且 ≤ARCHIVE_CHUNK_MAX_BYTES,先到者为界。
+    let j = i
+    let bytes = 2 // chunk 自身的 [ ]
+    while (j < spilled.length && (j - i) < ARCHIVE_CHUNK_MAX_MSGS) {
+      const b = perBytes[j]
+      // 每 chunk 至少收 1 条:单条 >768KB 的巨型消息也独立成 chunk,不空转。
+      if (j > i && bytes + b > ARCHIVE_CHUNK_MAX_BYTES) break
+      bytes += b
+      j++
+    }
+    const chunkMsgs = spilled.slice(i, j)
+    // first_seq/last_seq = chunk 内 _seq 的 min/max。chunk 之间 _seq 池 disjoint
+    // (每条消息只 spill 一次),故 min 唯一 → 可安全做 PK 的一半。
+    let minSeq = Number.POSITIVE_INFINITY
+    let maxSeq = 0
+    for (const m of chunkMsgs) {
+      const s = m._seq as number
+      if (s < minSeq) minSeq = s
+      if (s > maxSeq) maxSeq = s
+    }
+    // 幂等:重放同批时 chunk PK (session_id, minSeq) 冲突 → INSERT OR IGNORE no-op,
+    // archivedDelta 不重复计(只累计真正新插入 chunk 的条数)。
+    const cr = insertChunk.run(
+      sessId, userId, minSeq, maxSeq, chunkMsgs.length, JSON.stringify(chunkMsgs), now,
+    )
+    if (cr.changes > 0) archivedDelta += chunkMsgs.length
+    // id 集 INSERT OR IGNORE:重放无害。仅对有 id 的消息(无 id 消息无从 PUT 复活 / append)。
+    for (const m of chunkMsgs) {
+      if (typeof m.id === 'string') insertId.run(sessId, m.id)
+    }
+    if (maxSeq > watermark) watermark = maxSeq
+    i = j
+  }
+
+  return { tail, archivedDelta, archivedThroughSeq: watermark }
+}
+
+/**
+ * **PUT 防复活** —— 从客户端 PUT 的 incoming 消息里剔除 id 已归档的消息。
+ *
+ * 客户端本地缓存持有完整历史(归档 + 尾巴),全量 PUT 会把已归档消息一并带回;若不剔除,
+ * mergePreservingServerAuthored 会把它们重新并入行 → 行体积回涨、又触发 spill,来回震荡。
+ *
+ * 用 incoming ids 做参数化 IN 查询(分批,避开 SQLite 999 变量上限),**绝不全表拉** archived_ids。
+ * 纯读,须在调用方事务内调用。
+ */
+function _filterOutArchivedIncoming(
+  db: Database.Database,
+  sessId: string,
+  msgs: MessageLike[],
+): MessageLike[] {
+  const ids: string[] = []
+  for (const m of msgs) if (typeof m?.id === 'string') ids.push(m.id)
+  if (ids.length === 0) return msgs
+
+  const archived = new Set<string>()
+  const CHUNK = 400 // 单查询变量数 = 1(session_id) + CHUNK,远低于 SQLite 999 上限
+  for (let off = 0; off < ids.length; off += CHUNK) {
+    const batch = ids.slice(off, off + CHUNK)
+    const placeholders = batch.map(() => '?').join(',')
+    const rows = db.prepare(
+      `SELECT msg_id FROM client_session_archived_ids WHERE session_id = ? AND msg_id IN (${placeholders})`,
+    ).all(sessId, ...batch) as Array<{ msg_id: string }>
+    for (const r of rows) archived.add(r.msg_id)
+  }
+  if (archived.size === 0) return msgs
+  return msgs.filter((m) => !(typeof m?.id === 'string' && archived.has(m.id)))
+}
+
+// 竞态回滚哨兵:upsertClientSession 在 DEFERRED 事务里 spill 之后才知道主行 ON CONFLICT
+// WHERE 是否因并发写被拒(result.changes===0)。被拒时必须把已做的 spill 归档 INSERT 一并
+// 回滚,否则会留下"归档表有 chunk 但主行没更新"的孤儿。抛此哨兵 → better-sqlite3 事务包装
+// 回滚并 rethrow → 外层 catch 映射为 rejected_stale。复用同一实例(重复抛无副作用)。
+const _STALE_WRITE_ROLLBACK = new Error('__stale_write_rollback__')
+
 /**
  * Returns true if the row was actually inserted/updated, false if rejected.
  * @param baseSyncedAt - client's last known server updated_at (optimistic concurrency).
@@ -1377,8 +1628,11 @@ export async function upsertClientSession(session: ClientSession, baseSyncedAt =
   const db = await getSessionsDb()
   const txn = db.transaction((): UpsertClientSessionResult => {
     const existing = db.prepare(
-      'SELECT messages, updated_at, next_seq FROM client_sessions WHERE id = ? AND user_id = ? AND deleted_at IS NULL'
-    ).get(session.id, session.userId) as { messages: string; updated_at: number; next_seq: number | null } | undefined
+      'SELECT messages, updated_at, next_seq, archived_through_seq, archived_count FROM client_sessions WHERE id = ? AND user_id = ? AND deleted_at IS NULL'
+    ).get(session.id, session.userId) as {
+      messages: string; updated_at: number; next_seq: number | null
+      archived_through_seq: number | null; archived_count: number | null
+    } | undefined
 
     // Reject stale writes (same optimistic concurrency check as the pre-transaction version)
     if (existing && existing.updated_at > baseSyncedAt) return 'rejected_stale'
@@ -1394,29 +1648,36 @@ export async function upsertClientSession(session: ClientSession, baseSyncedAt =
     // the single chokepoint for `_source/_seq/usage/_truncated/_errorCode/
     // _errorDetail/status='replied'/_rawMeta/...` rejection. See
     // _stripClientPutMessage above for the full deny/ephemeral matrix.
-    const clientMsgs = _stripClientPutMessages(session.messages as unknown[])
+    const clientMsgsRaw = _stripClientPutMessages(session.messages as unknown[])
+    // PUT 防复活:剔除 id 已归档的 incoming 消息(客户端全量 PUT 会带回完整历史,含已搬走
+    // 的归档行;不剔除则被重新并入 → 行回涨 → 又 spill,来回震荡)。见 _filterOutArchivedIncoming。
+    const clientMsgs = _filterOutArchivedIncoming(db, session.id, clientMsgsRaw)
     const merged = mergePreservingServerAuthored(oldMsgs, clientMsgs) as MessageLike[]
     const currentNextSeq = existing && typeof existing.next_seq === 'number' && existing.next_seq > 0
       ? existing.next_seq
       : 1
     const { messages: finalMessages, nextSeq } = normalizeAndAssignSeqs(oldMsgs, merged, currentNextSeq)
 
-    // Size guard — see MAX_SESSION_BYTES. Reject BEFORE the INSERT so an
-    // oversized incoming PUT can never grow the row, and so subsequent reads
-    // never have to JSON.parse a blob big enough to stall the event loop.
-    // The check uses Buffer.byteLength so multi-byte UTF-8 characters
-    // (Chinese text, emoji) count against the same budget the disk row will
-    // occupy. JSON.stringify is unavoidable here — it's the only way to
-    // know the post-merge blob size — but since we already had to compute
-    // it for the INSERT below, this adds no new serialization overhead.
-    const finalJson = JSON.stringify(finalMessages)
+    // 热尾巴 + 归档:normalize 后、写行前把最老的消息搬进归档,行只留热尾巴。归档表 INSERT
+    // 在本事务内;若下面的 ON CONFLICT WHERE 因并发写被拒(racing stale),抛哨兵一并回滚。
+    const now = Date.now()
+    const spill = _spillOverflowCore(db, session.id, session.userId, finalMessages, {
+      currentArchivedThroughSeq: existing?.archived_through_seq ?? 0,
+      now,
+    })
+    const newArchivedCount = (existing?.archived_count ?? 0) + spill.archivedDelta
+    const tail = spill.tail
+
+    // Size guard — see MAX_SESSION_BYTES(spill 后作用于 tail;tail ≤ TAIL_TARGET(2M) < 4M,
+    // 理论不可达,保留作最后防线)。Buffer.byteLength 让多字节 UTF-8(中文/emoji)按落盘字节计。
+    const finalJson = JSON.stringify(tail)
     if (Buffer.byteLength(finalJson, 'utf8') > MAX_SESSION_BYTES) {
       return 'oversized'
     }
 
     const result = db.prepare(`
-      INSERT INTO client_sessions (id, user_id, agent_id, title, pinned, created_at, last_at, messages, message_count, updated_at, next_seq)
-      VALUES (@id, @userId, @agentId, @title, @pinned, @createdAt, @lastAt, @messages, @messageCount, @updatedAt, @nextSeq)
+      INSERT INTO client_sessions (id, user_id, agent_id, title, pinned, created_at, last_at, messages, message_count, updated_at, next_seq, archived_through_seq, archived_count)
+      VALUES (@id, @userId, @agentId, @title, @pinned, @createdAt, @lastAt, @messages, @messageCount, @updatedAt, @nextSeq, @archivedThroughSeq, @archivedCount)
       ON CONFLICT(id) DO UPDATE SET
         agent_id = excluded.agent_id,
         title = excluded.title,
@@ -1425,7 +1686,9 @@ export async function upsertClientSession(session: ClientSession, baseSyncedAt =
         messages = excluded.messages,
         message_count = excluded.message_count,
         updated_at = excluded.updated_at,
-        next_seq = excluded.next_seq
+        next_seq = excluded.next_seq,
+        archived_through_seq = excluded.archived_through_seq,
+        archived_count = excluded.archived_count
       WHERE client_sessions.updated_at <= @baseSyncedAt
         AND client_sessions.user_id = @userId
     `).run({
@@ -1437,18 +1700,27 @@ export async function upsertClientSession(session: ClientSession, baseSyncedAt =
       createdAt: session.createdAt,
       lastAt: session.lastAt,
       messages: finalJson,
-      messageCount: finalMessages.length,
+      // message_count = 热尾巴条数 + 已归档累计条数(含本次 delta),给列表/计数用。
+      messageCount: tail.length + newArchivedCount,
       updatedAt: session.updatedAt,
       baseSyncedAt,
       nextSeq,
+      archivedThroughSeq: spill.archivedThroughSeq,
+      archivedCount: newArchivedCount,
     })
-    // result.changes === 0 happens when the ON CONFLICT WHERE filter rejected
-    // the UPDATE because client_sessions.updated_at > @baseSyncedAt — i.e. a
-    // racing concurrent write committed between our SELECT (above) and this
-    // INSERT. Surface as the same stale outcome so the gateway returns 409.
-    return result.changes > 0 ? 'applied' : 'rejected_stale'
+    if (result.changes > 0) return 'applied'
+    // result.changes === 0:ON CONFLICT WHERE 因 client_sessions.updated_at > @baseSyncedAt
+    // 拒绝 UPDATE —— 我们的 SELECT 与本 INSERT 之间有并发写抢先提交(DEFERRED 事务的竞态)。
+    // 此时上面的 spill 归档 INSERT 已发生但主行没更新,必须抛哨兵回滚整个事务,否则留下
+    // "归档表有 chunk / 主行未更新" 的孤儿。外层 catch 映射为 rejected_stale(gateway 409)。
+    throw _STALE_WRITE_ROLLBACK
   })
-  return txn()
+  try {
+    return txn()
+  } catch (err) {
+    if (err === _STALE_WRITE_ROLLBACK) return 'rejected_stale'
+    throw err
+  }
 }
 
 /**
@@ -1512,10 +1784,21 @@ function _appendServerAuthoredCore(
   // semantics (retry-under-TTL vs fatal-drop). Conflating them caused
   // 24h-TTL retry storms on soft-deleted sessions.
   const row = db.prepare(
-    'SELECT messages, next_seq, deleted_at FROM client_sessions WHERE id = ? AND user_id = ?'
-  ).get(sessId, userId) as { messages: string; next_seq: number | null; deleted_at: number | null } | undefined
+    'SELECT messages, next_seq, deleted_at, archived_through_seq, archived_count FROM client_sessions WHERE id = ? AND user_id = ?'
+  ).get(sessId, userId) as {
+    messages: string; next_seq: number | null; deleted_at: number | null
+    archived_through_seq: number | null; archived_count: number | null
+  } | undefined
   if (!row) return { applied: false, reason: 'session_not_found' }
   if (row.deleted_at !== null) return { applied: false, reason: 'session_deleted' }
+
+  // 幂等判定升级(热尾巴 + 归档):若这条 id 已归档(= 已持久化,只是搬出了热尾巴),
+  // 视为 already_exists —— 防 sink 重放把归档内容重新 append 回尾巴造成重复行/行回涨。
+  // 放在解析 msgs 前:命中即短路,省一次 JSON.parse。
+  const archivedHit = db.prepare(
+    'SELECT 1 FROM client_session_archived_ids WHERE session_id = ? AND msg_id = ?'
+  ).get(sessId, message.id)
+  if (archivedHit) return { applied: false, reason: 'already_exists' }
 
   let msgs: MessageLike[]
   try {
@@ -1563,18 +1846,22 @@ function _appendServerAuthoredCore(
   const currentNextSeq = typeof row.next_seq === 'number' && row.next_seq > 0 ? row.next_seq : 1
   const { messages: finalMessages, nextSeq } = normalizeAndAssignSeqs(msgs, dedupedMessages, currentNextSeq)
 
-  // Size guard — see MAX_SESSION_BYTES. Without this, a session that has
-  // already grown past the budget (e.g. via legacy oversized rows that
-  // pre-date this guard) would let the sink keep appending forever. We
-  // reject before the UPDATE so the row never gets larger; the caller's
-  // durable wrapper / replay treats `'oversized'` as terminal so the
-  // outbox doesn't loop forever on the same row.
-  const finalJson = JSON.stringify(finalMessages)
+  // 热尾巴 + 归档:normalize 后把最老的消息搬进归档,行只留热尾巴(与 upsert 路径同一收口)。
+  const now = Date.now()
+  const spill = _spillOverflowCore(db, sessId, userId, finalMessages, {
+    currentArchivedThroughSeq: row.archived_through_seq ?? 0,
+    now,
+  })
+  const newArchivedCount = (row.archived_count ?? 0) + spill.archivedDelta
+  const tail = spill.tail
+
+  // Size guard — see MAX_SESSION_BYTES(spill 后作用于 tail;理论不可达,保留作最后防线)。
+  // 命中时返回 'oversized',调用方 durable wrapper/replay 视其为终态,outbox 不再空转重放。
+  const finalJson = JSON.stringify(tail)
   if (Buffer.byteLength(finalJson, 'utf8') > MAX_SESSION_BYTES) {
     return { applied: false, reason: 'oversized' }
   }
 
-  const now = Date.now()
   // Belt-and-braces: the SELECT above already gated on `deleted_at !== null`
   // inside the same BEGIN IMMEDIATE transaction, so a concurrent soft-delete
   // can't race in. Keeping `deleted_at IS NULL` on the UPDATE is a storage
@@ -1583,8 +1870,8 @@ function _appendServerAuthoredCore(
   // SELECT/UPDATE invariant, `changes` will be 0 and we surface session_deleted
   // instead of silently writing into a tombstone.
   const update = db.prepare(
-    'UPDATE client_sessions SET messages = ?, message_count = ?, last_at = ?, updated_at = ?, next_seq = ? WHERE id = ? AND user_id = ? AND deleted_at IS NULL'
-  ).run(finalJson, finalMessages.length, now, now, nextSeq, sessId, userId)
+    'UPDATE client_sessions SET messages = ?, message_count = ?, last_at = ?, updated_at = ?, next_seq = ?, archived_through_seq = ?, archived_count = ? WHERE id = ? AND user_id = ? AND deleted_at IS NULL'
+  ).run(finalJson, tail.length + newArchivedCount, now, now, nextSeq, spill.archivedThroughSeq, newArchivedCount, sessId, userId)
   if (update.changes !== 1) {
     // Race: row was deleted between SELECT and UPDATE within the same txn.
     // Should be unreachable under BEGIN IMMEDIATE, but if SQLite's transaction
@@ -1843,8 +2130,11 @@ export async function appendCostCredits(
 
     if (mapRow) {
       const sess = db.prepare(
-        'SELECT messages, next_seq FROM client_sessions WHERE id = ? AND user_id = ? AND deleted_at IS NULL'
-      ).get(mapRow.session_id, userId) as { messages: string; next_seq: number | null } | undefined
+        'SELECT messages, next_seq, archived_through_seq, archived_count FROM client_sessions WHERE id = ? AND user_id = ? AND deleted_at IS NULL'
+      ).get(mapRow.session_id, userId) as {
+        messages: string; next_seq: number | null
+        archived_through_seq: number | null; archived_count: number | null
+      } | undefined
       if (sess) {
         let msgs: MessageLike[]
         try {
@@ -1880,38 +2170,47 @@ export async function appendCostCredits(
           }
           const next: MessageLike[] = [...msgs]
           next[idx] = patched
-          // Size guard — same MAX_SESSION_BYTES rule as upsert / append paths.
-          // costCredits patch is small (16 chars typical) so this almost
-          // never fires in practice, but a row that's already past the cap
-          // would still grow by the `_seq` bump and a new key in `usage`.
-          // Refusing the in-place UPDATE means the cost value is "lost" for
-          // this row, but the alternative — letting an already-oversized row
-          // grow further — is worse: it perpetuates the same JSON.parse
-          // stall this fix targets. We do NOT fall through to pending in
-          // this branch because the map row already pinpointed this
-          // session+message; pending is a "haven't found target yet"
-          // mechanism, not a "target full" one. Drop with a noop result
-          // and rely on observability (no metric here yet — the caller
-          // logs the unexpected outcome).
-          const nextJson = JSON.stringify(next)
+          // patch 会 bump _seq 并给 usage 加键,行可能微涨。热尾巴 + 归档:若因此越过
+          // 软阈值,同 upsert/append 口径 spill(把最老的消息搬进归档,行只留热尾巴)。
+          const nowMs = Date.now()
+          const spill = _spillOverflowCore(db, mapRow.session_id, userId, next, {
+            currentArchivedThroughSeq: sess.archived_through_seq ?? 0,
+            now: nowMs,
+          })
+          const newArchivedCount = (sess.archived_count ?? 0) + spill.archivedDelta
+          const tail = spill.tail
+          // Size guard — same MAX_SESSION_BYTES rule(spill 后作用于 tail;理论不可达)。
+          // 命中时返回 noop:成本这一处展示丢,但计费权威在 PG ledger,不影响钱。**不** fall
+          // through 到 pending —— map 已精确定位本 session+message,pending 是"还没找到目标"
+          // 机制,不是"目标满了"机制。调用方对 noop 记 observability。
+          const nextJson = JSON.stringify(tail)
           if (Buffer.byteLength(nextJson, 'utf8') > MAX_SESSION_BYTES) {
             return { applied: 'noop' }
           }
-          const nowMs = Date.now()
           db.prepare(
-            'UPDATE client_sessions SET messages = ?, last_at = ?, updated_at = ?, next_seq = next_seq + 1 WHERE id = ? AND user_id = ?'
+            'UPDATE client_sessions SET messages = ?, message_count = ?, last_at = ?, updated_at = ?, next_seq = next_seq + 1, archived_through_seq = ?, archived_count = ? WHERE id = ? AND user_id = ?'
           ).run(
             nextJson,
+            tail.length + newArchivedCount,
             nowMs,
             nowMs,
+            spill.archivedThroughSeq,
+            newArchivedCount,
             mapRow.session_id,
             userId,
           )
           return { applied: 'patched' }
         }
-        // map says the message exists but we can't find it — likely
-        // deleted/edited out-of-band. Fall through to pending so a
-        // potential resurrected row can still pick up the cost.
+        // 目标 msg 不在热尾巴。若它已归档(spill 搬出),成本永远无法再落回尾巴 —— 直接
+        // 放弃(noop),别再徒劳 re-pending(map 仍指向已归档 msgId,re-pending 会陷入
+        // "每次 drain 都找不到 → 再 pending" 的循环,直到 24h GC)。成本展示丢一处,计费
+        // 权威在 PG ledger,不影响钱;调用方对 noop 记 observability。
+        const archivedHit = db.prepare(
+          'SELECT 1 FROM client_session_archived_ids WHERE session_id = ? AND msg_id = ?'
+        ).get(mapRow.session_id, mapRow.msg_id)
+        if (archivedHit) return { applied: 'noop' }
+        // 未归档 = 真的被删/编辑 out-of-band → 维持现有语义,fall through 到 pending,
+        // 留给可能复活的行拾取(与归档前行为一致)。
       }
     }
 
@@ -2002,8 +2301,11 @@ export async function drainDelegateCostForClientSession(
     }
 
     const sess = db.prepare(
-      'SELECT messages, next_seq FROM client_sessions WHERE id = ? AND user_id = ? AND deleted_at IS NULL'
-    ).get(clientSessionId, userId) as { messages: string; next_seq: number | null } | undefined
+      'SELECT messages, next_seq, archived_through_seq, archived_count FROM client_sessions WHERE id = ? AND user_id = ? AND deleted_at IS NULL'
+    ).get(clientSessionId, userId) as {
+      messages: string; next_seq: number | null
+      archived_through_seq: number | null; archived_count: number | null
+    } | undefined
     // 目标会话缺位(尚未 sink / 已删)→ 保守:保留 pending,下一 turn 再试。
     if (!sess) return { merged: '0', drained: 0 }
 
@@ -2053,15 +2355,24 @@ export async function drainDelegateCostForClientSession(
     }
     const next: MessageLike[] = [...msgs]
     next[idx] = patched
-    const nextJson = JSON.stringify(next)
-    // 超限拒绝(同 appendCostCredits):保留 pending,不写库(下一轮/修 blob 后仍可归并)。
+    // 热尾巴 + 归档:patch bump _seq/加 usage 键后行可能微涨,越过软阈值则 spill(同
+    // appendCostCredits 口径,把最老的消息搬进归档,行只留热尾巴)。
+    const nowMs = Date.now()
+    const spill = _spillOverflowCore(db, clientSessionId, userId, next, {
+      currentArchivedThroughSeq: sess.archived_through_seq ?? 0,
+      now: nowMs,
+    })
+    const newArchivedCount = (sess.archived_count ?? 0) + spill.archivedDelta
+    const tail = spill.tail
+    const nextJson = JSON.stringify(tail)
+    // 超限拒绝(同 appendCostCredits;spill 后作用于 tail,理论不可达):保留 pending,
+    // 不写库(下一轮/修 blob 后仍可归并)。
     if (Buffer.byteLength(nextJson, 'utf8') > MAX_SESSION_BYTES) {
       return { merged: '0', drained: 0 }
     }
-    const nowMs = Date.now()
     db.prepare(
-      'UPDATE client_sessions SET messages = ?, last_at = ?, updated_at = ?, next_seq = next_seq + 1 WHERE id = ? AND user_id = ?'
-    ).run(nextJson, nowMs, nowMs, clientSessionId, userId)
+      'UPDATE client_sessions SET messages = ?, message_count = ?, last_at = ?, updated_at = ?, next_seq = next_seq + 1, archived_through_seq = ?, archived_count = ? WHERE id = ? AND user_id = ?'
+    ).run(nextJson, tail.length + newArchivedCount, nowMs, nowMs, spill.archivedThroughSeq, newArchivedCount, clientSessionId, userId)
 
     // 只删本次读到的行——并发新 park 不在列表里,留给下一轮。
     const del = db.prepare('DELETE FROM pending_usage_patches WHERE user_id = ? AND request_id = ?')
@@ -2414,11 +2725,12 @@ export async function listClientSessions(userId: string): Promise<ClientSessionM
 export async function getClientSession(id: string, userId?: string): Promise<ClientSession | null> {
   const db = await getSessionsDb()
   const sql = userId
-    ? "SELECT id, user_id, agent_id, title, pinned, created_at, last_at, messages, updated_at FROM client_sessions WHERE id = ? AND user_id = ? AND deleted_at IS NULL"
-    : "SELECT id, user_id, agent_id, title, pinned, created_at, last_at, messages, updated_at FROM client_sessions WHERE id = ? AND deleted_at IS NULL"
+    ? "SELECT id, user_id, agent_id, title, pinned, created_at, last_at, messages, updated_at, archived_through_seq, archived_count FROM client_sessions WHERE id = ? AND user_id = ? AND deleted_at IS NULL"
+    : "SELECT id, user_id, agent_id, title, pinned, created_at, last_at, messages, updated_at, archived_through_seq, archived_count FROM client_sessions WHERE id = ? AND deleted_at IS NULL"
   const row = (userId ? db.prepare(sql).get(id, userId) : db.prepare(sql).get(id)) as {
     id: string; user_id: string; agent_id: string; title: string; pinned: number;
     created_at: number; last_at: number; messages: string; updated_at: number
+    archived_through_seq: number | null; archived_count: number | null
   } | undefined
   if (!row) return null
   return {
@@ -2431,6 +2743,10 @@ export async function getClientSession(id: string, userId?: string): Promise<Cli
     lastAt: row.last_at,
     messages: JSON.parse(row.messages),
     updatedAt: row.updated_at,
+    // 归档水位透传(读新列,零额外 IO)。getClientSession 返回的 messages 是热尾巴;
+    // 客户端据 archivedThroughSeq 判定本地已归档行的保留,据 archivedCount 显示计数。
+    archivedCount: row.archived_count ?? 0,
+    archivedThroughSeq: row.archived_through_seq ?? 0,
   }
 }
 
@@ -2461,12 +2777,15 @@ export async function getClientSessionPartial(
 ): Promise<ClientSessionPartial | null> {
   const db = await getSessionsDb()
   const row = db.prepare(
-    "SELECT id, user_id, agent_id, title, pinned, created_at, last_at, messages, updated_at FROM client_sessions WHERE id = ? AND user_id = ? AND deleted_at IS NULL"
+    "SELECT id, user_id, agent_id, title, pinned, created_at, last_at, messages, updated_at, archived_through_seq, archived_count FROM client_sessions WHERE id = ? AND user_id = ? AND deleted_at IS NULL"
   ).get(id, userId) as {
     id: string; user_id: string; agent_id: string; title: string; pinned: number;
     created_at: number; last_at: number; messages: string; updated_at: number
+    archived_through_seq: number | null; archived_count: number | null
   } | undefined
   if (!row) return null
+  const archivedCount = row.archived_count ?? 0
+  const archivedThroughSeq = row.archived_through_seq ?? 0
 
   let allMsgs: MessageLike[] = []
   try {
@@ -2508,10 +2827,88 @@ export async function getClientSessionPartial(
     lastAt: row.last_at,
     messages,
     updatedAt: row.updated_at,
-    totalMessageCount: allMsgs.length,
+    // 总条数 = 热尾巴条数 + 已归档条数(row.messages 现在只存热尾巴,allMsgs 即热尾巴)。
+    totalMessageCount: allMsgs.length + archivedCount,
     maxSeq,
     isPartial,
+    archivedCount,
+    archivedThroughSeq,
   }
+}
+
+/** {@link readArchivedMessages} 的返回。 */
+export interface ReadArchivedMessagesResult {
+  /** 本页归档消息,**升序**(_seq 从小到大)返回。 */
+  messages: MessageLike[]
+  /** 是否还有更早(_seq 更小)的归档消息 —— 前端"从云端加载更早历史"是否继续可点。 */
+  hasMore: boolean
+  /** 本页最老一条的 _seq(= 下一页 beforeSeq 游标);空页 → null。 */
+  oldestSeq: number | null
+}
+
+/**
+ * **归档回看分页**(用户上滑加载更早历史;读侧,零写)。
+ *
+ * 语义:返回 `_seq < beforeSeq` 的**最近** `limit` 条(升序返回);hasMore = 更早还有。
+ *   - beforeSeq 传 0/缺省 = 从 archived_through_seq+1 开始(即最新归档页)。
+ *   - 分页游标单向后退:下一页传本页 oldestSeq,严格取更早,不重不漏。
+ *   - limit 默认 100、上限 200(下限 1)。
+ *
+ * 实现:按 chunk 从新到旧读(idx_csa_chunks_last:last_seq DESC),展开、过滤 `_seq < beforeSeq`,
+ * 攒够一页(>limit)即停 —— chunk 小(≤200 条/≤768KB),即便超长历史这段有界读也很轻。
+ * 归档 _seq 随 spill 冻结、且 spill 恒搬"当前尾巴里最老的一段"(其 _seq 恒 > 上次水位)→
+ * 归档区 _seq 与时间序单调,故"从新 chunk 起攒 limit 条"即全局最新 limit 条。
+ *
+ * 分租:先按 (id, user_id) 验会话归属(拿不到 → 空结果),chunk 查询再带 user_id 双保险。
+ */
+export async function readArchivedMessages(
+  sessId: string,
+  userId: string,
+  beforeSeq = 0,
+  limit = 100,
+): Promise<ReadArchivedMessagesResult> {
+  const db = await getSessionsDb()
+  const cappedLimit = Math.max(1, Math.min(200, Math.floor(Number.isFinite(limit) ? limit : 100)))
+
+  // 会话归属 + 取水位(缺省 beforeSeq 的锚点)。行不存在/非本人/已删 → 空结果。
+  const row = db.prepare(
+    'SELECT archived_through_seq FROM client_sessions WHERE id = ? AND user_id = ? AND deleted_at IS NULL',
+  ).get(sessId, userId) as { archived_through_seq: number | null } | undefined
+  if (!row) return { messages: [], hasMore: false, oldestSeq: null }
+  const watermark = typeof row.archived_through_seq === 'number' ? row.archived_through_seq : 0
+  const effectiveBefore = Number.isFinite(beforeSeq) && beforeSeq > 0 ? beforeSeq : watermark + 1
+  // effectiveBefore ≤ 1:没有 _seq < 1 的归档消息可返回(_seq 从 1 起)。
+  if (effectiveBefore <= 1) return { messages: [], hasMore: false, oldestSeq: null }
+
+  // 候选 chunk:first_seq(= chunk 内 _seq 最小值)< effectiveBefore 者才可能含合格消息。
+  // 从新到旧读(last_seq DESC),攒到多于一页即停。
+  const chunkRows = db.prepare(
+    `SELECT messages FROM client_session_archive_chunks
+       WHERE session_id = ? AND user_id = ? AND first_seq < ?
+       ORDER BY last_seq DESC`,
+  ).all(sessId, userId, effectiveBefore) as Array<{ messages: string }>
+
+  const pool: MessageLike[] = []
+  for (const cr of chunkRows) {
+    let arr: MessageLike[]
+    try {
+      const parsed = JSON.parse(cr.messages)
+      arr = Array.isArray(parsed) ? (parsed as MessageLike[]) : []
+    } catch { arr = [] }
+    for (const m of arr) {
+      const s = typeof m?._seq === 'number' ? m._seq : -1
+      if (s >= 0 && s < effectiveBefore) pool.push(m)
+    }
+    // 攒够一页 + 1(多出的那条用于判定 hasMore)即停:更老的 chunk _seq 更小,不影响本页。
+    if (pool.length > cappedLimit) break
+  }
+
+  // 取 _seq 最大的 limit 条(= 最新的一页),升序返回。
+  pool.sort((a, b) => ((a._seq as number) - (b._seq as number)))
+  const hasMore = pool.length > cappedLimit
+  const page = pool.slice(Math.max(0, pool.length - cappedLimit))
+  const oldestSeq = page.length > 0 ? (page[0]._seq as number) : null
+  return { messages: page, hasMore, oldestSeq }
 }
 
 /** Soft-delete: zero out messages and mark as deleted. Prevents stale PUTs from resurrecting. */
