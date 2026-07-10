@@ -297,6 +297,9 @@ BEGIN; <迁移 SQL>; INSERT INTO schema_migrations(version, applied_at) VALUES (
 | dispatchInbound 预处理窗口不计入 client turn | getOrCreate→首次 submit 之间(mkdir/parseDocument 等 ms 级)hello 重连仍可能误判 turn 未开始(Plan1 既有 follow-up,团队批次未扩) | 该窗口误判实际报障时 |
 | ~~reviewer 委派成本归并晚一轮~~ **已消失**(2026-07-07) | 随队长自主送审:审查委派在 engine turn 内完成,先于 engine persist → 正常当轮归因;迟到团队卡补 drain(persistLateTurnArtifacts)同步退役 | — |
 | master bridge ring 未接帧分级 | userChatBridge 的 storeStamped 恒 content 级(v5 回放权威在容器 ring,master 侧仅兜底),暂不影响 | master 侧 resume miss 成为主要报障源时 |
+| 营销邮件无退订机制 | 群发走 inbox 广播(scripts/v5-inbox-broadcast.ts→createInboxMessage 快照),正文只有"回复退订"人工口径;无 List-Unsubscribe 头、users 无邮件偏好列 | 第二次营销群发前:users 加 marketing_email_opt_out + 快照谓词排除 + 邮件带退订链接 |
+| 法律文本主体占位 | /terms /privacy(web-react lib/legal.ts 权威源,TERMS_VERSION=条款生效日,**改正文必 bump**)主体用"本平台运营方"、联系邮箱 auth@claudeai.chat 占位;条款未经法务复核 | 商业主体/ICP 定档时:回填 brand.ts + 法务过一遍全文 + bump TERMS_VERSION |
+| **邮件通道故障(2026-07-10 发现,待 boss 修)** | claudeai.chat 的 Resend 验证 DNS(resend._domainkey TXT / send 子域 SPF+MX)约 07-08 从 Cloudflare 消失(疑 v3 退役清理误删),所有外发邮件 400 domain-not-verified:验证码/重置/群发全断;RESEND_API_KEY 为 sending-only 无法自查后台 | boss:Resend 后台复制 3 条 DNS 记录→Cloudflare 加回(DNS only)→Verify;恢复后跑待命群发(见 broadcast 脚本头注释) |
 
 ### P3.1 企业版速记(2026-07-06)
 - **org 面三层前缀**:`/api/me`(自己)/`/api/org/*`(org-owner/admin 自助,dispatchOrgRoute 单一鉴权收口 + requireOrgRole 每请求 DB 复核)/`/api/admin/orgs*`(平台超管)。org 一律服务端从 membership 推导,不接受客户端 org_id。
