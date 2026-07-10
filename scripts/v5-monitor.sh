@@ -44,6 +44,15 @@ V3_HEALTH_URL="${V5MON_V3_URL:-http://127.0.0.1:18789/healthz}"
 PUBLIC_HEALTH_URL="${V5MON_PUBLIC_URL:-http://127.0.0.1/healthz}"
 MAINTENANCE_FILE="${V5MON_MAINTENANCE_FILE:-/run/openclaude-v5/planned-maintenance.json}"
 
+# 统一告警管道(方案 §2.3-2):除站内信外,发告警时 psql 直插 admin_alert_outbox,
+# master 挂掉也照落行,恢复后 dispatcher 补投企微。fan-out 判定复刻 enqueueAlert
+# 的 TS 语义,单一 SQL 权威见 scripts/v5-alert-fanout.sql。
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+FANOUT_SQL="${V5MON_FANOUT_SQL:-$SCRIPT_DIR/v5-alert-fanout.sql}"
+# fan-out 专用 DBURL(与 send_inbox 各自独立读,保持既有 inbox 路径行为不变)。
+DBURL="$(grep '^DATABASE_URL=' "$ENV_FILE" 2>/dev/null | head -1 | cut -d= -f2-)"
+HOSTFQDN="$(hostname -f 2>/dev/null || hostname 2>/dev/null || echo unknown)"
+
 DISK_MAX_PCT=85        # / 与 /var 使用率上限(%)
 MEM_MIN_AVAIL_PCT=10   # MemAvailable/MemTotal 下限(%)
 POOL_MAX=20            # v5-ccb 容器数上限(线上稳态 ~1-5,>20 = 回收失灵/被刷)
@@ -133,6 +142,32 @@ check_image() {
   fi
 }
 
+# 检查项 → 告警 severity(方案 §2.3-2):服务/HTTP/公网/池/镜像 = critical(聊天全挂),
+# 磁盘/内存 = warning(容量预警,尚未致命)。未知项保守按 warning。
+check_severity() {
+  case "$1" in
+    svc_v5|svc_egress|http_v5|http_egress|http_v3|public_route|pool|image) echo critical ;;
+    disk_root|disk_var|mem) echo warning ;;
+    *) echo warning ;;
+  esac
+}
+
+# fan-out 一个事件到 admin_alert_outbox(psql 直插共享 SQL 模板)。
+# 失败只记日志,绝不 return 非 0 阻断后续检查项。--dry-run 只打印。
+fanout_alert() { # <event_type> <severity> <dedupe_key> <title> <body> <payload_json>
+  if [ "$DRY_RUN" = 1 ]; then log "FANOUT[dry] $1 sev=$2 dedupe=$3"; return 0; fi
+  if [ -z "$DBURL" ]; then log "FANOUT-SKIP 读不到 DATABASE_URL($ENV_FILE) event=$1"; return 0; fi
+  if [ ! -f "$FANOUT_SQL" ]; then log "FANOUT-SKIP 找不到 $FANOUT_SQL event=$1"; return 0; fi
+  if psql "$DBURL" -q -v ON_ERROR_STOP=1 \
+       -v event_type="$1" -v severity="$2" -v dedupe_key="$3" \
+       -v title="$4" -v body="$5" -v payload="$6" \
+       -f "$FANOUT_SQL" >/dev/null 2>&1; then
+    log "FANOUT-OK $1 sev=$2"
+  else
+    log "FANOUT-FAIL $1 sev=$2(outbox 未落,inbox/日志仍有留痕)"
+  fi
+}
+
 check_service svc_v5     openclaude-v5
 check_service svc_egress openclaude-v5-egress
 check_http http_v5     "$V5_HEALTH_URL"     '.ok == true and .channel == "v5"'   "v5 healthz"
@@ -199,14 +234,34 @@ for name in "${CHECK_NAMES[@]}"; do
     if [ "$prev" != bad ]; then                       # 好 → 坏:立即告警
       since="$NOW"; last_alert="$NOW"
       EVENTS+=("❌ **$name** $detail"); HAS_BAD_EVENT=1
+      sev="$(check_severity "$name")"
+      fanout_alert "ops.monitor_check_failed" "$sev" \
+        "ops.monitor_check_failed:${name}:${NOW}" \
+        "[v5监控] ${name} 异常" \
+        "❌ **${name}** ${detail}"$'\n\n'"(kl-mirror v5 高频探活,$(ts) 北京时间)" \
+        "$(jq -nc --arg c "$name" --arg d "$detail" --arg s "$sev" --arg h "$HOSTFQDN" \
+             '{source:"v5-monitor",check:$c,detail:$d,severity:$s,host:$h,kind:"failed"}')"
     elif [ $((NOW - last_alert)) -ge "$REALERT_SECS" ]; then   # 坏持续 ≥6h:重复提醒
       last_alert="$NOW"
       EVENTS+=("⏰ **$name** 仍异常(自 $(TZ=Asia/Shanghai date -d "@$since" '+%m-%d %H:%M') 起):$detail")
       HAS_BAD_EVENT=1
+      sev="$(check_severity "$name")"
+      fanout_alert "ops.monitor_check_failed" "$sev" \
+        "ops.monitor_check_failed:${name}:${NOW}" \
+        "[v5监控] ${name} 仍异常" \
+        "⏰ **${name}** 仍异常(自 $(TZ=Asia/Shanghai date -d "@$since" '+%m-%d %H:%M') 起):${detail}" \
+        "$(jq -nc --arg c "$name" --arg d "$detail" --arg s "$sev" --arg h "$HOSTFQDN" \
+             '{source:"v5-monitor",check:$c,detail:$d,severity:$s,host:$h,kind:"realert"}')"
     fi
   else
     if [ "$prev" = bad ]; then                        # 坏 → 好:恢复告警
       EVENTS+=("✅ **$name** 已恢复(异常持续 $(( (NOW - since) / 60 )) 分钟):$detail")
+      fanout_alert "ops.monitor_recovered" "info" \
+        "ops.monitor_recovered:${name}:${NOW}" \
+        "[v5监控] ${name} 已恢复" \
+        "✅ **${name}** 已恢复(异常持续 $(( (NOW - since) / 60 )) 分钟):${detail}" \
+        "$(jq -nc --arg c "$name" --arg d "$detail" --arg h "$HOSTFQDN" \
+             '{source:"v5-monitor",check:$c,detail:$d,severity:"info",host:$h,kind:"recovered"}')"
     fi
     since=0; last_alert=0
   fi

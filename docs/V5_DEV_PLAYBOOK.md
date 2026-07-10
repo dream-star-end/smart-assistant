@@ -137,6 +137,7 @@ ssh kl-mirror 'psql "$DATABASE_URL" -c "select * from turn_traces where trace_id
 3. 帧被吞时查守卫链(reducer.ts §3/§11 顺序):frameSeq 去重 → server域 stale 截止(`_trackerResetServerTs`,同域比较)→ teardown 3min 时间窗 → agent 切换守卫。跨时钟域比较(frame.ts=server钟 vs Date.now()=客户端钟)是历史坑,新代码禁止引入。
 4. 移动端:iOS 键盘/视口=visualViewport 写 CSS var(App.tsx realign + styles.css `#root position:fixed`);鸿蒙 ArkWeb FileList 必须在事件入口快照(live FileList 会被就地清空);排查靠 Caddy access log。
 5. 渲染崩溃已有 per-message ErrorBoundary(MessageBoundary.tsx)兜底,白屏=看它的 console.error 消息 id。
+6. **签名媒体 URL 点击时权威(2026-07-10 用户 175 "下载不了" 410 死循环教训)**:签名 URL 服务端 TTL 仅 5min,任何**用户手势触发的取媒体**(下载/开原图/新标签)必须在交互那一刻经 `media.tsx::useFreshSignedUrl` 解析,fetch 拿到 410/403 再 forceResign 重签一次;禁止把 `useSignedSrc` 的挂载态 URL 冻结进点击路径(挂载 >5min 后点击必死,且"重试"复用同一死 URL 永不自愈)。锚点原生导航场景优先同步 `peek()` 校正 href,异步重签后程序化开新标签有 Safari 弹窗拦截风险,只做慢路径兜底。
 
 ### 3.2 turn 执行/引擎问题
 1. **ground truth 是容器内 runner 进程 environ,不是 docker logs**:
@@ -173,6 +174,8 @@ usage_records + journal 双查;零输出免单/turn 级 idle 免单已内建;cod
 |---|---|---|
 | master 侧代码(commercial/storage/cli 等) | master 进程 | `deploy-v5.sh`(rsync+restart+smoke) |
 | `packages/web-react` 前端 | dist 静态资源 | **`deploy-v5.sh --dist`**(vite build + 竞态安全 rsync + 资产 GC + restart + 版本握手 smoke);SPA 缓存必重启 |
+| **管理后台**(`packages/web-react/src/admin/**`,admin.html 第二 Vite 入口,2026-07-10 起) | dist 静态资源 | 同上 `--dist`;vanilla admin(web/public/admin.js)与 gateway legacy 透传已删,`?v=` 戳/bump-version 不再涉 v5 |
+| 告警脚本(`scripts/v5-monitor.sh`/`v5-daily-check.sh`/`v5-alert-fanout.sql`/`v5-alert-fail.sh`) | kl-mirror 脚本树 | 随 deploy rsync 即生效;**systemd 单元(deploy/v5/)仍手动 cp+daemon-reload**(alert-fail@ 模板免 enable) |
 | 容器内 gateway/CCB/baseline skill/entrypoint(packages/gateway、claude-code-best、agent-sandbox/runtime、ccb-baseline*) | **runtime image** | 重建镜像+切 tag(§4.3);纯 baseline skill 例外:bind-mount 源码树,rsync 即生效 |
 | `packages/commercial/src/egress/` | egress 进程 | `deploy-v5.sh --egress`(否则 egress 跑旧代码!) |
 | `deploy/v5/commercial-v5.env.overrides` | 线上 env | **手动同步** /etc/openclaude/commercial-v5.env(增量部署不重生成 env!)改后重启对应进程 |
@@ -311,6 +314,8 @@ BEGIN; <迁移 SQL>; INSERT INTO schema_migrations(version, applied_at) VALUES (
 | 营销邮件无退订机制 | 群发走 inbox 广播(scripts/v5-inbox-broadcast.ts→createInboxMessage 快照),正文只有"回复退订"人工口径;无 List-Unsubscribe 头、users 无邮件偏好列 | 第二次营销群发前:users 加 marketing_email_opt_out + 快照谓词排除 + 邮件带退订链接 |
 | 法律文本主体占位 | /terms /privacy(web-react lib/legal.ts 权威源,TERMS_VERSION=条款生效日,**改正文必 bump**)主体用"本平台运营方"、联系邮箱 auth@claudeai.chat 占位;条款未经法务复核 | 商业主体/ICP 定档时:回填 brand.ts + 法务过一遍全文 + bump TERMS_VERSION |
 | **邮件通道故障(2026-07-10 发现,待 boss 修)** | claudeai.chat 的 Resend 验证 DNS(resend._domainkey TXT / send 子域 SPF+MX)约 07-08 从 Cloudflare 消失(疑 v3 退役清理误删),所有外发邮件 400 domain-not-verified:验证码/重置/群发全断;RESEND_API_KEY 为 sending-only 无法自查后台 | boss:Resend 后台复制 3 条 DNS 记录→Cloudflare 加回(DNS only)→Verify;恢复后跑待命群发(见 broadcast 脚本头注释) |
+| CI 失败无告警 | v5-ci 挂/红没有任何推送(07-07 起 commercial-unit 门挂死 3 天无人知,2026-07-10 才根治);GitHub→告警 outbox 无桥 | 下次 CI 再次静默红超 1 天时:加 workflow 失败 webhook→admin_alert_outbox(events 已有 ops 组可挂) |
+| admin React 化残余小项 | ①Progress 原语无 tone/fill 定制(hosts 自建 Meter)②typedConfirm(打字确认)未平移,一律 useConfirm danger ③表单 Select 原语缺失(P2/P4/P6 各自局部实现)④fmtCents 字符串版 ¥ 格式化器 4 页内联重复⑤org 调余额后端仍 501 占位 | 下次 admin 批次顺手收敛①-④;⑤随 org 计费批次 |
 
 ### P3.1 企业版速记(2026-07-06)
 - **org 面三层前缀**:`/api/me`(自己)/`/api/org/*`(org-owner/admin 自助,dispatchOrgRoute 单一鉴权收口 + requireOrgRole 每请求 DB 复核)/`/api/admin/orgs*`(平台超管)。org 一律服务端从 membership 推导,不接受客户端 org_id。
@@ -326,6 +331,12 @@ BEGIN; <迁移 SQL>; INSERT INTO schema_migrations(version, applied_at) VALUES (
 ## 6. 本手册的维护
 
 每次踩到新坑/建立新机制,**当场更新本文对应小节**(部署类进 §4,定位类进 §3,债进 §5),并同步 bump 相关 skill(`~/.claude/skills/v5-*`)。文档腐烂比没有文档更危险。
+
+### 2026-07-10 管理后台同框架重构 + 告警统一送达速记
+- **admin = web-react 第二 Vite 入口**(`admin.html` + `src/admin/**`,21 页,hash 路由 `#tab=NAME&k=v` 兼容旧深链);URL 仍 `/admin.html`(+`/admin` 302);鉴权 refresh→me→role gate。地基组件权威在 `src/admin/components`(StatCard/ChartCard/DataTable/FilterBar/useAdminPoll/adminApi),页面禁手写内联样式原语。
+- **告警送达不变量**:enqueueAlert 零订阅通道→inbox(uid=1)兜底;critical 恒 inbox 镜像(每 enqueue 至多一次)。shell 侧(monitor/daily/alert-fail)psql 直插 outbox,**判定单一 SQL 权威 = scripts/v5-alert-fanout.sql——改订阅/静默判定必须 TS(alertOutbox.ts)与该 SQL 同改**。注意:企微通道 severity_min=warning 时 info 级(恢复通知/日报)不进企微是订阅语义,非 bug。
+- **坑:undici NO_PROXY 不支持 CIDR**。master 全局 EnvHttpProxyAgent 下,fetch 内网桥接 IP(172.31.0.1)必须 per-request `directEgressDispatcher()` 直连(modelOps 容量面曾因此静默降级 local_fallback);任何新的 master→内网 fetch 同此纪律。
+- **坑:CI commercial-unit 门曾挂死 3 天(07-07~07-10)**。根因=握手测试对"背靠背同步双帧"用逐次 once('message') 取帧,第二帧在无 listener 窗口被 EventEmitter 丢弃→await 永挂→30min 超时 cancelled。**WS 测试等多帧一律用 userChatBridge.test.ts 的 frameCollector 模式**(持久 listener+队列)。诊断法:TAP 停哪个套件之后+零改动探针 PR 定责基线。
 
 ### 0105 模型与服务商运维页(2026-07-06)速记
 - 服务商枚举权威 = protocol STATIC_KEY_PROVIDERS(+codex 虚拟条目);provider_ops 表**稀疏**只存运维字段,首次 PUT 建行 —— 新增 provider 本页零改动,严禁再造种子清单。

@@ -30,14 +30,16 @@ const PUBLIC_DIR = join(REPO_ROOT, "packages", "web", "public");
 // Files to rewrite.
 //
 // Static targets: top-level entry files that contain cache-bust tokens
-// (sw.js VERSION + index.html / admin.html ?v= query strings).
+// (sw.js VERSION + index.html ?v= query strings). The vanilla admin console
+// (admin.html) has been retired — the admin UI now ships as web-react's second
+// Vite entry (dist/admin.html, content-hashed by the bundler, no ?v= tokens).
 //
 // Dynamic targets: every modules/*.js — because (since v1.0.15) all inter-module
 // imports use `?v=auto` placeholders that bump-version rewrites to the current
 // commit hash on every deploy. Hardcoding a subset here was the v1.0.13/14
 // drift bug: a new module file (or a new import in an old module) would ship
 // to prod with stale ?v= tokens and users would 4h-cache the old code.
-const STATIC_TARGETS = ["sw.js", "index.html", "admin.html"];
+const STATIC_TARGETS = ["sw.js", "index.html"];
 
 function listModuleTargets(): string[] {
   const modulesDir = join(PUBLIC_DIR, "modules");

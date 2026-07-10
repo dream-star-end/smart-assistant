@@ -6,6 +6,11 @@ getV3ContainerStatus
 makeV3EnsureRunning
 preCheck — BINV-5: cost multiplier 不进 preCheck 路径
 provisionV3Container
+# 2026-07-10 登记:下行随 07-07 NameConflict 自愈修复(b9bcd348 时代)落地,但同日起
+# commercial-unit 门被握手测试丢帧竞态挂死(46303b5b 已修),该项从未被门检出过。
+# 零改动探针 PR #15(基底 ad954fcf+仅挂死修复)复现同一失败,证实为基底存量、
+# CI 环境依赖(docker mock 行为),非任何在途分支引入。修掉后删除本行。
+provisionV3Container — docker create NameConflict 自愈
 provisionV3Container — CCB baseline 挂载分支
 provisionV3Container — RemoteContractViolation 守门(v1.0.8)
 provisionV3Container — image label guard (v1.0.84 PR \#4)

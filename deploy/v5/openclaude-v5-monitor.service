@@ -2,9 +2,15 @@
 # 触发一次 scripts/v5-monitor.sh:服务/healthz/磁盘/内存/容器池/镜像 tag 十项检查,
 # 状态翻转才发站内信(去重),全量兜底落 /var/log/openclaude-v5-monitor.log。
 # 不挂 openclaude-v5 的依赖:v5 挂了正是它要报警的时刻,不能跟着一起不跑。
+#
+# 自监(方案 §2.3-3):脚本自身崩/超时/非 0 退出时,OnFailure 拉起 alert-fail 模板,
+# 对本单元做 outbox+inbox 双写告警(见 openclaude-v5-alert-fail@.service)。
+# 注意:该 OnFailure 依赖 openclaude-v5-alert-fail@.service 已在 kl-mirror 手动安装
+# (与本单元同一部署纪律,不随 deploy-v5.sh 分发)。
 [Unit]
 Description=OpenClaude v5 monitor (health probes, every 2min)
 After=network.target
+OnFailure=openclaude-v5-alert-fail@%n.service
 
 [Service]
 Type=oneshot

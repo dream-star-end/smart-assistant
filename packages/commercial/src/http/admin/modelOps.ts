@@ -25,6 +25,8 @@ import {
 } from "../../admin/modelOps.js";
 import { invalidateDegradedProvidersCache } from "../../admin/providerHealthGate.js";
 import { snapshotInflight, type InflightSnapshot } from "../proxy/inflightTracker.js";
+import type { Dispatcher } from "undici";
+import { directEgressDispatcher } from "../../account-pool/egressDispatcher.js";
 import {
   ocGatewayIpForChannel,
   ocInternalProxyPortForChannel,
@@ -76,7 +78,14 @@ async function fetchInflightStats(): Promise<StatsResult> {
   // 地址推导与 egress bind 用同一权威函数(内部按 OC_RUNTIME_CHANNEL 判定),不猜 env。
   const url = `http://${ocGatewayIpForChannel()}:${ocInternalProxyPortForChannel()}/internal/v5/egress-stats`;
   try {
-    const res = await fetch(url, { signal: AbortSignal.timeout(2000) });
+    // 内网桥接 IP 必须显式直连:master 全局 setGlobalDispatcher(EnvHttpProxyAgent) 会把
+    // fetch 全部送出海代理,而 undici 的 NO_PROXY **不支持 CIDR**(env 里 172.16.0.0/12
+    // 匹配不到 172.31.0.1)→ 内网拉取被代理吞掉恒 timeout,容量面静默降级 local_fallback
+    // (2026-07-10 线上实锤)。与 wecomAlertSender 同款 per-request dispatcher 覆盖。
+    const res = await fetch(url, {
+      signal: AbortSignal.timeout(2000),
+      dispatcher: directEgressDispatcher(),
+    } as RequestInit & { dispatcher?: Dispatcher });
     if (!res.ok) return local("local_fallback");
     const j = (await res.json()) as { inflight?: InflightSnapshot };
     if (!j?.inflight?.by_model) return local("local_fallback");
