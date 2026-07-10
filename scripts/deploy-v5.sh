@@ -17,8 +17,12 @@
 # 用法:
 #   scripts/deploy-v5.sh --bootstrap   # 首次:建源码树/HOME/openclaude.json/env/unit + 拷依赖 + 起服务
 #   scripts/deploy-v5.sh               # 增量部署:快照 + rsync 源码 + restart v5 + smoke
+#   scripts/deploy-v5.sh --with-dist   # 代码+前端两生效面、【单次】重启(首选;两段式成对重启会二次掐断在途 turn)
 #   scripts/deploy-v5.sh --smoke       # 仅跑 v5 健康/隔离断言
-#   scripts/deploy-v5.sh --dist        # 前端生效面:vite build + 竞态安全 rsync + 资产GC + restart + 版本握手 smoke
+#   scripts/deploy-v5.sh --dist        # 仅前端生效面:vite build + 竞态安全 rsync + 资产GC + restart + 版本握手 smoke
+#
+# 并发:所有写模式过 /var/lock/oc-v5-deploy.lock 全局互斥(多会话并行开发硬保证),
+#       持有者信息在 .holder;等待 900s 超时 fail-loud。
 #   scripts/deploy-v5.sh --prepare-offline-cutover --target-image=TAG
 #                                  # 服务在线健康时生成一次性离线切换清单/完整恢复包
 #   scripts/deploy-v5.sh --offline-recycle --cutover-nonce=NONCE
@@ -95,11 +99,13 @@ assert_overrides_no_remove_keys() {
   [ "$bad" = 0 ] || exit 1
 }
 
-DRY=0; MODE="deploy"; ROLLBACK_N=1; RESTART_EGRESS=0
+DRY=0; MODE="deploy"; ROLLBACK_N=1; RESTART_EGRESS=0; WITH_DIST=0
 CUTOVER_NONCE=""; CUTOVER_TARGET_IMAGE=""
 for arg in "$@"; do
   case "$arg" in
     --dry-run) DRY=1 ;;
+    # 代码+前端两生效面合并为一次重启(见 deploy() 内注释,2026-07-10 成对重启事故)
+    --with-dist) WITH_DIST=1 ;;
     --bootstrap) MODE="bootstrap" ;;
     --smoke) MODE="smoke" ;;
     --dist) MODE="dist" ;;
@@ -569,21 +575,34 @@ snapshot_and_sync_source() {
   write_version
 }
 
+# dist 生效面的**单一权威**构建+同步实现(stage / --dist / deploy --with-dist 三处共用,
+# 不许再复制)。副作用:设全局 DIST_BUILD_ID 供 dist_handshake_smoke 校验。不含 restart。
+DIST_BUILD_ID=""
 build_and_sync_dist() {
   echo "── vite build ──"
   run "(cd '$REPO_ROOT/packages/web-react' && npx vite build)"
   local dist="$REPO_ROOT/packages/web-react/dist"
   if [[ "$DRY" != 1 ]]; then
-    local build_id
-    build_id="$(grep -o 'name="oc-build" content="[0-9a-f]\{8,32\}"' "$dist/index.html" | grep -o '[0-9a-f]\{8,32\}' | head -1)"
-    [[ -n "$build_id" ]] || { echo "✗ dist/index.html 缺 oc-build meta" >&2; exit 1; }
-    echo "  本地构建 oc-build: $build_id"
+    DIST_BUILD_ID="$(grep -o 'name="oc-build" content="[0-9a-f]\{8,32\}"' "$dist/index.html" | grep -o '[0-9a-f]\{8,32\}' | head -1)"
+    [[ -n "$DIST_BUILD_ID" ]] || { echo "✗ dist/index.html 缺 oc-build meta(vite ocBuildMeta 插件失效?)" >&2; exit 1; }
+    echo "  本地构建 oc-build: $DIST_BUILD_ID"
   fi
   echo "── rsync assets(加法,必须先于根文件)──"
   run "rsync -az '$dist/assets/' '$KL_HOST:$REMOTE_SRC/packages/web-react/dist/assets/'"
   echo "── rsync 根文件(--delete,排除 assets)──"
   run "rsync -az --delete --exclude assets '$dist/' '$KL_HOST:$REMOTE_SRC/packages/web-react/dist/'"
+  echo "── GC:清 14 天未被任何构建 ship 的旧资产 ──"
   sshk "find '$REMOTE_SRC/packages/web-react/dist/assets' -type f -mtime +14 -delete"
+}
+
+# 版本握手 smoke:线上 oc-build 必须等于本地刚构建的 DIST_BUILD_ID(fail-closed)。
+dist_handshake_smoke() {
+  [[ "$DRY" == 1 ]] && return 0
+  echo "── 版本握手 smoke:线上 oc-build == 本地构建(fail-closed)──"
+  local live_id
+  live_id="$(ssh "$KL_HOST" "curl -fsS http://127.0.0.1:${V5_PORT}/" | grep -o 'name="oc-build" content="[0-9a-f]\{8,32\}"' | grep -o '[0-9a-f]\{8,32\}' | head -1)"
+  [[ "$live_id" == "$DIST_BUILD_ID" ]] || { echo "✗ 线上 oc-build=${live_id:-空} ≠ 本地 $DIST_BUILD_ID(rsync 目标/静态层缓存有诈)" >&2; exit 1; }
+  echo "  ✓ 线上 oc-build: $live_id"
 }
 
 # ───────────────────────── smoke:健康 + 隔离断言 ─────────────────────────
@@ -725,6 +744,12 @@ deploy() {
   snapshot_and_sync_source
   echo "── 部署顺序守卫:校验 runtime_channel 列(0088)已应用 ──"
   assert_runtime_channel_column
+  # --with-dist:dist 在 restart **之前**全部就位 → 代码+前端两生效面共享**一次**重启。
+  # 背景(2026-07-10 事故放大器):deploy 后紧跟 --dist 的成对重启(间隔 30-60s)会把
+  # 「刚被第一次重启打断、自动续写刚跑起来」的 turn 第二次掐死。禁止再回到两段式。
+  if [[ "$WITH_DIST" == 1 ]]; then
+    build_and_sync_dist
+  fi
   echo "── restart openclaude-v5(仅 v5,绝不碰 v3)──"
   sshk "systemctl restart $V5_UNIT"
   run "sleep 4"
@@ -734,6 +759,9 @@ deploy() {
     run "sleep 3"
   fi
   [[ "$DRY" == 1 ]] || smoke
+  if [[ "$WITH_DIST" == 1 ]]; then
+    dist_handshake_smoke
+  fi
   echo "✓ deploy 完成。"
 }
 
@@ -900,32 +928,12 @@ activate_staged() {
 # 回滚:index.html 回滚 = checkout 旧源码重跑 --dist;旧资产 14 天窗口内一直在线。
 deploy_dist() {
   echo "══ v5 dist deploy(前端生效面)on $KL_HOST ══"
-  echo "── vite build ──"
-  run "(cd '$REPO_ROOT/packages/web-react' && npx vite build)"
-  local dist="$REPO_ROOT/packages/web-react/dist"
-  local build_id=""
-  if [[ "$DRY" != 1 ]]; then
-    build_id="$(grep -o 'name="oc-build" content="[0-9a-f]\{8,32\}"' "$dist/index.html" | grep -o '[0-9a-f]\{8,32\}' | head -1)"
-    [[ -n "$build_id" ]] || { echo "✗ dist/index.html 缺 oc-build meta(vite ocBuildMeta 插件失效?)" >&2; exit 1; }
-    echo "  本地构建 oc-build: $build_id"
-  fi
-  echo "── rsync assets(加法,必须先于根文件)──"
-  run "rsync -az '$dist/assets/' '$KL_HOST:$REMOTE_SRC/packages/web-react/dist/assets/'"
-  echo "── rsync 根文件(--delete,排除 assets)──"
-  run "rsync -az --delete --exclude assets '$dist/' '$KL_HOST:$REMOTE_SRC/packages/web-react/dist/'"
-  echo "── GC:清 14 天未被任何构建 ship 的旧资产 ──"
-  sshk "find '$REMOTE_SRC/packages/web-react/dist/assets' -type f -mtime +14 -delete"
+  build_and_sync_dist
   echo "── restart openclaude-v5(dist 生效面必重启,版本握手依赖此纪律)──"
   sshk "systemctl restart $V5_UNIT"
   run "sleep 4"
-  if [[ "$DRY" != 1 ]]; then
-    smoke
-    echo "── 版本握手 smoke:线上 oc-build == 本地构建(fail-closed)──"
-    local live_id
-    live_id="$(ssh "$KL_HOST" "curl -fsS http://127.0.0.1:${V5_PORT}/" | grep -o 'name="oc-build" content="[0-9a-f]\{8,32\}"' | grep -o '[0-9a-f]\{8,32\}' | head -1)"
-    [[ "$live_id" == "$build_id" ]] || { echo "✗ 线上 oc-build=${live_id:-空} ≠ 本地 $build_id(rsync 目标/静态层缓存有诈)" >&2; exit 1; }
-    echo "  ✓ 线上 oc-build: $live_id"
-  fi
+  [[ "$DRY" == 1 ]] || smoke
+  dist_handshake_smoke
   echo "✓ dist deploy 完成。"
 }
 
@@ -939,6 +947,23 @@ rollback() {
   [[ "$DRY" == 1 ]] || smoke
   echo "✓ rollback 完成。"
 }
+
+# ── 全局部署互斥(硬机制,2026-07-10 boss 指令:多会话并发改 v5 不靠记忆自觉)──
+# 同机所有 deploy-v5.sh 写模式实例串行:并发 rsync/restart 交错会产生半新半旧源码树
+# 与连环重启。锁文件记录持有者(pid/mode/tree/时刻)供另一会话诊断;等待 ≤900s 后
+# fail-loud。只读模式(--dry-run / --smoke)不抢锁。cutover 自有的 CUTOVER_LOCK 是
+# 远端状态机锁,与本地这把互斥锁正交,两把都要。
+DEPLOY_LOCK="/var/lock/oc-v5-deploy.lock"
+if [[ "$DRY" != 1 && "$MODE" != "smoke" ]]; then
+  exec 8>"$DEPLOY_LOCK"
+  if ! flock -n 8; then
+    echo "⏳ 部署锁被占:$(cat "${DEPLOY_LOCK}.holder" 2>/dev/null || echo '持有者未知')"
+    echo "   等待释放(≤900s;另一会话部署完成后自动继续)..."
+    flock -w 900 8 || { echo "✗ 900s 未取得部署锁 —— 另一会话的部署可能挂死,人工核查 ${DEPLOY_LOCK}.holder 后处置" >&2; exit 3; }
+  fi
+  printf 'pid=%s mode=%s tree=%s started=%s\n' "$$" "$MODE" "$REPO_ROOT" "$(date -Is)" > "${DEPLOY_LOCK}.holder"
+  trap 'rm -f "${DEPLOY_LOCK}.holder"' EXIT
+fi
 
 case "$MODE" in
   bootstrap) bootstrap ;;
