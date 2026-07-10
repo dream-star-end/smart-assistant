@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto'
+import { fileURLToPath } from 'node:url'
 import { defineConfig, type Plugin } from 'vite'
 import react from '@vitejs/plugin-react'
 import tailwindcss from '@tailwindcss/vite'
@@ -10,6 +11,9 @@ import tailwindcss from '@tailwindcss/vite'
  *  - 仅 build 注入(apply:'build');dev 无此 meta → 客户端 reload governor 恒 inert。
  *  - 服务端(commercial frontendBuild probe)与客户端(lib/appUpdate)都只读这同一个
  *    meta,不允许出现第二套版本推导。
+ *  - 双入口后**仅** index.html 承载 oc-build:第二入口 admin.html 不注入,避免出现
+ *    第二个版本推导源、也不改变 index.html 自身的哈希(两份 html 独立 transform,
+ *    admin 注入与否都不影响 index 的 meta 值,这里显式 skip 是为语义清晰 + 零干扰)。
  */
 function ocBuildMeta(): Plugin {
   return {
@@ -17,7 +21,9 @@ function ocBuildMeta(): Plugin {
     apply: 'build',
     transformIndexHtml: {
       order: 'post',
-      handler(html) {
+      handler(html, ctx) {
+        // ctx.path 形如 '/index.html' | '/admin.html'。只对用户端 index.html 注入。
+        if (ctx.path !== '/index.html') return
         const id = createHash('sha256').update(html).digest('hex').slice(0, 16)
         if (!html.includes('</head>')) {
           throw new Error('oc-build-meta: index.html 缺 </head>,无法注入构建身份')
@@ -44,6 +50,11 @@ export default defineConfig({
     outDir: 'dist',
     sourcemap: true,
     manifest: true,
+    // 双 Vite 入口:用户端 SPA(index.html)+ 管理后台(admin.html)。两者共享
+    // 同一 assets 目录(内容哈希、可长缓存)与同一设计系统 chunk(react-vendor /
+    // radix-vendor),仅入口 html + admin 专属懒块不同。URL 仍是真实文件 /admin.html。
+    // 注意:rolldown-vite 下 build.rollupOptions 是 rolldownOptions 的 deprecated 别名,
+    // 故 input 与既有 output.codeSplitting 一起放进 rolldownOptions,避免两处配置互相覆盖。
     // 手动分 chunk（rolldown codeSplitting.groups）。目标：首屏 vendor 单独成块走内容哈希
     // 长缓存（vite 默认 assets/[name]-[hash].js），依赖不变时跨发版命中缓存。
     //  - react-vendor / radix-vendor：首屏同步加载。
@@ -53,6 +64,10 @@ export default defineConfig({
     //  is-plain-obj / extend）」一并圈进同一块、从而经该 util 在 entry 建立静态边、把整块
     //  markdown 拽回首屏的风险（已实测复现）。故让动态 import 自然成块，最稳。
     rolldownOptions: {
+      input: {
+        main: fileURLToPath(new URL('./index.html', import.meta.url)),
+        admin: fileURLToPath(new URL('./admin.html', import.meta.url)),
+      },
       output: {
         codeSplitting: {
           groups: [

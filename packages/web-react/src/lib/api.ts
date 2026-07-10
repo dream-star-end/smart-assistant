@@ -111,7 +111,9 @@ function refreshOnce(a: AuthSession): Promise<string | null> {
   return pending;
 }
 
-async function callWithRefresh(
+// export：admin 数据层（src/admin/lib/adminApi.ts）复用同一套透明刷新重放，
+// 不新建第二套鉴权/刷新机制。仅加导出，实现不动。
+export async function callWithRefresh(
   a: AuthSession,
   make: (token: string) => Promise<Response>,
 ): Promise<Response> {
@@ -149,7 +151,8 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
 }
 
 /** 拼鉴权头：身份完全由 access JWT(sub) 决定，只带 Bearer。 */
-function bearerHeaders(token: string, json = false): Record<string, string> {
+// export：admin 数据层复用（见 callWithRefresh 注释）。仅加导出。
+export function bearerHeaders(token: string, json = false): Record<string, string> {
   const h: Record<string, string> = { Accept: "application/json", Authorization: `Bearer ${token}` };
   if (json) h["content-type"] = "application/json";
   return h;
@@ -228,7 +231,8 @@ function parseRetryAfter(res: Response): number | undefined {
 }
 
 /** 读 !res.ok 的响应体，组装并抛出 ApiError（绝不返回）。 */
-async function throwApi(res: Response): Promise<never> {
+// export：admin 数据层（adminText CSV 导出等非 JSON 路径）复用统一错误信封解包。仅加导出。
+export async function throwApi(res: Response): Promise<never> {
   let message = `请求失败 (${res.status})`;
   let code: string | undefined;
   let issues: ApiIssue[] | undefined;
@@ -263,7 +267,8 @@ async function throwApi(res: Response): Promise<never> {
   });
 }
 
-async function jsonOrThrow<T>(p: Promise<Response> | Response): Promise<T> {
+// export：admin 数据层复用统一 JSON 解包 + 错误抛出。仅加导出。
+export async function jsonOrThrow<T>(p: Promise<Response> | Response): Promise<T> {
   const res = await p;
   if (!res.ok) await throwApi(res);
   return (await res.json()) as T;

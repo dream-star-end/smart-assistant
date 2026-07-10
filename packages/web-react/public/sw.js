@@ -87,6 +87,14 @@ self.addEventListener('fetch', (event) => {
   // 数据面 / 实时面永不拦截。
   if (url.pathname.startsWith('/api/') || url.pathname.startsWith('/ws')) return;
 
+  // 管理后台(第二 Vite 入口 /admin.html)一律放行走纯网络,SW 绝不介入。
+  //   为什么:networkFirstNav 成功时会把响应写进统一 OFFLINE_SHELL('/index.html')键、
+  //   离线时又用该键回落 —— 用户端 SPA 与管理后台是**两份不同的 app-shell**,若都走
+  //   这条路径,访问 /admin.html 会用 admin 壳覆盖用户端离线壳(交叉污染),离线回落也会
+  //   把用户端壳错发给 admin。admin 是运维工具、无离线诉求,直接走网络最简单且正确。
+  //   (在线态本就 network-first,不受影响;此处只是把 admin 从共享离线壳里彻底摘出。)
+  if (url.pathname === '/admin.html') return;
+
   // 导航：network-first。
   if (req.mode === 'navigate') {
     event.respondWith(networkFirstNav(req));
