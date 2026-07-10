@@ -36,6 +36,8 @@ master: openclaude-v5.service(kl-mirror,127.0.0.1:18790)
 
 **权威源速查**:模型可见性=DB(pricing/models);agent 数据=collaboratorAgents(source==='marketplace');平台预设=platformPresets;团队卡展示字段=`@openclaude/protocol/teamCards` 的 `TEAM_CARD_CLIENT_DISPLAY_FIELDS`(服务端 strip 白名单与前端回填清单同源);当前活跃段判定=`web-react components/chat/turnSegment.ts`;思考档位=protocol allowedOutputConfigEfforts。
 
+**记忆(memdir 范式,2026-07-10 起)**:Core 记忆=每条一个 frontmatter 文件(`agents/<id>/memory/<slug>.md`,type: user|feedback|project|reference)+ `agents/<id>/MEMORY.md` 纯索引(**路径不变=跨组件契约**,volumeContextReader/envelope/UI 均读它;首行 marker `<!-- oc-memdir-index v1 -->`)。写入=引擎原生 Write/Edit 直写(CCB/codex 对称,无专用命令);「# Memory」完整指令段由 gateway `buildMemorySlot` **常驻注入**(空记忆也注入;索引 cap 6000、user.md cap 4000)。权威=`storage/memoryDir.ts`:读侧双向对账自愈(补行/剔悬挂,索引可再生,两步写容错)+ 逐行注入扫描(模型直写绕过写侧校验,**读侧才是安全权威**)+ 懒迁移幂等(marker 任意位置判定;老 §-blob 首读自动拆,备份 `.pre-memdir.bak`)。user.md=共享用户画像纯 markdown(`storage/userProfile.ts`,锁+version)。oc-memory CLI 仅剩 session-search/archival(memory 子命令退役,误调打提示 exit 2)。CCB 原生 memdir 在容器内被 `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1` 禁用(subprocessRunner,gate=isV3ContainerRuntime)。**新增 memory 子路由必须同步三处**:容器 gateway server.ts 路由、bridgeApiAllowlist、master `BLOCKED_FOR_USER_RULES`(router.ts 403 兜底;漏第三处=多租户越权面)。
+
 ---
 
 ## 1. 角色分工体系(Codex × Claude Code)
@@ -93,6 +95,12 @@ npm run test:commercial:unit                        # 本机缺 PG/Redis 会有 
 # 在基线 commit 的树与你的树各跑一次,diff 失败名单;你的失败集必须 ⊆ 基线失败集
 npm run test:commercial:unit 2>&1 | grep '^not ok' | sed 's/^not ok [0-9]* - //' | sort > /tmp/fails-{base,mine}.txt
 diff /tmp/fails-base.txt /tmp/fails-mine.txt
+```
+⚠️ **全量跑法本地可能环境性挂死**(整套挤一个 node 进程,一个文件僵住堵死全部;症状=进程活着但 CPU 时间几乎不走,2026-07-10 实测 2h 只走 6s)。挂死就换**逐文件 sweep**(粒度降为失败文件集,gate 语义不变):
+```bash
+find packages/commercial/src -name '*.test.ts' ! -name '*.integ.test.ts' | sort | \
+  xargs -P4 -I{} bash -c 'timeout 90 npx tsx --test --test-force-exit "{}" >/dev/null 2>&1 || echo "{}"' | sort
+# 两棵树各跑一次,comm -23 mine base 必须为空
 ```
 - 测试必须是**行为断言**(帧序列驱动 reducer/mock WS/真 DB),不是对源码文本的 regex(那只能防删行,防不了行为)。prompt 驱动的行为(团队模式规则等)本质不可单测——这是设计信号,应改为代码硬编排,而不是写 regex 测试。
 - lint 红线:**不跑 biome --write 全文件 reformat**;只手工修自己引入的违规。
