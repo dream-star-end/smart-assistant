@@ -1,7 +1,8 @@
 import { isMarketplaceCategoryId, marketplaceCategoryLabel } from '@openclaude/protocol'
-import { ArrowUpCircle, Download, Layers, Loader2, ShieldCheck, Target, Users } from 'lucide-react'
+import { Activity, ArrowUpCircle, Download, Layers, Loader2, ShieldCheck, Target, Users } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { ApiError, api } from '../../lib/api'
+import { formatInstallCount } from '../../lib/marketplace'
 import type { AuthSession, MarketplaceDetail, MarketplaceInstalled, MarketplaceMyAgent } from '../../lib/types'
 import { AgentScopePicker, normalizeAgentScope } from '../AgentScopePicker'
 import { Markdown } from '../Markdown'
@@ -347,9 +348,36 @@ export function DetailModal({
                 {t}
               </Badge>
             ))}
+            {/* 真实使用信号(旧后端缺字段则整枚不渲染,优雅降级)。使用 > 安装,故
+                优先呈现「近30天真的在用」的强信号,安装数作为弱信号如实标注为「已安装」。 */}
+            {(detail.usage30d ?? 0) > 0 && (
+              <Badge tone="neutral">
+                <Activity size={12} /> 30天 {formatInstallCount(detail.usage30d)} 次使用
+              </Badge>
+            )}
+            {(detail.users30d ?? 0) > 0 && (
+              <Badge tone="neutral">
+                <Users size={12} /> 30天 {formatInstallCount(detail.users30d)} 人在用
+              </Badge>
+            )}
             <Badge tone="neutral">
-              <Users size={12} /> {detail.installCount} 人在用
+              <Download size={12} /> 已安装 {detail.installCount}
             </Badge>
+            {/* 评分:服务端已保证样本≥5 才非 null(前端不做二次阈值)。中性徽章 + 诚实
+                旁注「来自 N 次使用反馈」,不做背书式好评率大字。 */}
+            {detail.rating && (
+              <span className="inline-flex items-center gap-1">
+                <Badge
+                  tone="neutral"
+                  title={`来自 ${detail.rating.up + detail.rating.down} 次使用反馈`}
+                >
+                  👍 {detail.rating.up}/{detail.rating.up + detail.rating.down}
+                </Badge>
+                <span className="text-[11px] text-faint">
+                  来自 {detail.rating.up + detail.rating.down} 次使用反馈
+                </span>
+              </span>
+            )}
             {detail.benchmark && (
               <Badge tone="info">
                 实测 {Math.round(detail.benchmark.withoutPassRate * 100)}%→

@@ -90,3 +90,34 @@ test("缺人向字段的存量详情不白屏,只渲染已有内容(无适用场
   expect(await screen.findByText("一句话描述")).toBeInTheDocument();
   expect(screen.queryByText("适用场景")).not.toBeInTheDocument();
 });
+
+test("信号徽章:usage30d/users30d/安装数/rating 都渲染,rating 文案诚实(非背书百分比)", async () => {
+  getMarketplaceDetail.mockResolvedValue(
+    detail({ installCount: 20, usage30d: 42, users30d: 9, rating: { up: 8, down: 1 } }),
+  );
+  listMyAgents.mockResolvedValue([]);
+
+  render(<DetailModal slug="academic-translate" auth={auth} onClose={() => {}} onInstalled={() => {}} />);
+
+  expect(await screen.findByText("30天 42 次使用")).toBeInTheDocument();
+  expect(screen.getByText("30天 9 人在用")).toBeInTheDocument();
+  expect(screen.getByText("已安装 20")).toBeInTheDocument();
+  // 评分徽章 + 诚实旁注,不做「好评率 89%」式背书大字
+  const badge = screen.getByText("👍 8/9");
+  expect(badge).toHaveAttribute("title", "来自 9 次使用反馈");
+  expect(screen.getByText("来自 9 次使用反馈")).toBeInTheDocument();
+  expect(screen.queryByText(/好评率/)).not.toBeInTheDocument();
+});
+
+test("信号徽章:旧后端缺字段 → 不渲染 usage/rating,仅保留安装数(优雅降级)", async () => {
+  getMarketplaceDetail.mockResolvedValue(
+    detail({ installCount: 5, usage30d: undefined, users30d: undefined, rating: null }),
+  );
+  listMyAgents.mockResolvedValue([]);
+
+  render(<DetailModal slug="academic-translate" auth={auth} onClose={() => {}} onInstalled={() => {}} />);
+
+  expect(await screen.findByText("已安装 5")).toBeInTheDocument();
+  expect(screen.queryByText(/次使用/)).not.toBeInTheDocument();
+  expect(screen.queryByText(/👍/)).not.toBeInTheDocument();
+});
