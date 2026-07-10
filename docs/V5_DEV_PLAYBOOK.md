@@ -81,6 +81,9 @@ git worktree add ../openclaude-v5-<slug> -b feat/v5-<slug> feat/v5-aurora-rewrit
 按**包级文件所有权**切分,严禁交叉写:
 - gateway 后端(server.ts/engine)| commercial+deploy | web-react components | web-react lib(chat/persist/hooks)| storage/protocol
 - 每个 agent 结束只报告不 commit;集成者逐个验收(看 diff+实跑其测试)后按主题分批提交。
+- **并行期间禁全局 git 状态操作**(`git stash`/`reset`/`checkout -- .`):stash 内部是"整树 reset+恢复"
+  窗口,同 worktree 其他 agent 会在窗口内读到回退内容/空 status(2026-07-10 工具卡批实测竞态,靠
+  stash pop 自愈纯属侥幸)。要对比基线用 `git diff HEAD -- <自己的文件>` 或另开只读 worktree。
 
 ### 2.4 测试(每层的实跑命令)
 
@@ -159,6 +162,10 @@ ssh kl-mirror 'psql "$DATABASE_URL" -c "select * from turn_traces where trace_id
    `ssh kl-mirror 'docker ps --format "{{.Names}} {{.Image}}"'` 找到容器 → `docker exec <c> sh -c "cat /proc/<pid>/environ | tr '\0' '\n' | grep -E 'OPENCLAUDE_AGENT_ID|SESSION_KEY|ANTHROPIC_BASE_URL'"`。
 2. 会话/消息落库查 master:`sqlite3 /root/.openclaude-v5/sessions.db "select ... from client_sessions"`(键形如 `c:<uid>` 分租)。
 3. codex 引擎:官方 OAuth only,数据面必须走绑定账号的 egress 代理(拔代理应 503=fail-closed);账号池按 runtime_channel 圈定;遥测面已双层封堵。
+   - **`-c` 配置覆盖对未知裸键静默 no-op**(0.144 实证:`features.imagegen=false` 不报错也不生效,
+     权威名是 `features.image_generation`)。任何 feature 开关注入必须容器内 `codex features list`
+     对照 effective state 实证,不许按键名想当然;原生生图已平台关断(codexLaunchOverrides 注入,
+     平台生图唯一权威=minimax-media,relay 白名单对 /images/* 维持 fail-closed 为纵深防御)。
 4. 委派/团队:hidden-reviewer 有每父 turn ≤3 次硬熔断(server.ts HiddenDelegateGuard,429);delegate 有 idle 5min/hard 45min 超时,Stop 级联中断;一次性委派子会话收尾即 destroySession(2026-07-07,warm runner 不留存)。
 5. **"客户端转圈不止但服务端其实跑完了"**(团队模式高发,2026-07-07 事故):turn 是否真在飞看 session 双计数(`_activeTurnCount` engine 级 + `_activeClientTurnCount` 客户 turn 级,含 review 编排窗口),**别看 runner.isRunning(warm runner 恒 true)**。恢复链权威:hello 重连对账(`_shouldPushTurnInterruptedFinal`→completed 推 meta.reconcile 静默 final / errored 推 service_restart 文案)+ resume_failed→REST 全量对账 + review 迟到团队卡 persistLateTurnArtifacts 补 drain。ring 帧分级(delegate_progress/turn_status=progress 级先淘,contentLossSeq 水位线判回放),团队进度帧 >15帧/s 冲穿 ring 属预期,content 不应受累。取证三件套:容器 docker logs 的 `delegate`/`team_review`/`verification verdict` 行 + master /var/log/openclaude-v5.log 的 `userChatBridge closed(cause)`/`resume replay miss` + client_sessions.last_at 对时间线。
 
@@ -336,6 +343,9 @@ BEGIN; <迁移 SQL>; INSERT INTO schema_migrations(version, applied_at) VALUES (
 | 营销邮件无退订机制 | 群发走 inbox 广播(scripts/v5-inbox-broadcast.ts→createInboxMessage 快照),正文只有"回复退订"人工口径;无 List-Unsubscribe 头、users 无邮件偏好列 | 第二次营销群发前:users 加 marketing_email_opt_out + 快照谓词排除 + 邮件带退订链接 |
 | 法律文本主体占位 | /terms /privacy(web-react lib/legal.ts 权威源,TERMS_VERSION=条款生效日,**改正文必 bump**)主体用"本平台运营方"、联系邮箱 auth@claudeai.chat 占位;条款未经法务复核 | 商业主体/ICP 定档时:回填 brand.ts + 法务过一遍全文 + bump TERMS_VERSION |
 | **邮件通道故障(2026-07-10 发现,待 boss 修)** | claudeai.chat 的 Resend 验证 DNS(resend._domainkey TXT / send 子域 SPF+MX)约 07-08 从 Cloudflare 消失(疑 v3 退役清理误删),所有外发邮件 400 domain-not-verified:验证码/重置/群发全断;RESEND_API_KEY 为 sending-only 无法自查后台 | boss:Resend 后台复制 3 条 DNS 记录→Cloudflare 加回(DNS only)→Verify;恢复后跑待命群发(见 broadcast 脚本头注释) |
+| MCP 工具富卡靠解析文本 | 工具卡批(66e91003)裁决:富卡数据源=前端解析 mcp-memory 文本(格式契约两侧单测钉死,失败回退 OutputBlock)。structuredContent 非一等公民:codex 链路裹在 2000 字符截断 item 串里、CCB 链路根本不透传 | 卡片需要文本装不下的数据(分页/大列表)时:两引擎 runner 改造 structuredContent 透传 |
+| codex 原生生图关断 | features.image_generation=false 注入 + relay 白名单 fail-closed 双层;平台生图唯一权威=minimax-media(有计费口径) | boss 产品决策要 codex 原生生图:放行 relay /images/* + 补按张计费埋点 |
+| reminder 无独立 label 字段 | 列表标题=prompt 压平截断兜底(reminderFormat.ts);系统任务中文名是镜像常量(权威源 gateway cron.ts DEFAULT_JOBS,两处需同步) | 用户自定义任务名需求出现时:cron job 加 label 一等字段 |
 | CI 失败无告警 | v5-ci 挂/红没有任何推送(07-07 起 commercial-unit 门挂死 3 天无人知,2026-07-10 才根治);GitHub→告警 outbox 无桥 | 下次 CI 再次静默红超 1 天时:加 workflow 失败 webhook→admin_alert_outbox(events 已有 ops 组可挂) |
 | admin React 化残余小项 | ①Progress 原语无 tone/fill 定制(hosts 自建 Meter)②typedConfirm(打字确认)未平移,一律 useConfirm danger ③表单 Select 原语缺失(P2/P4/P6 各自局部实现)④fmtCents 字符串版 ¥ 格式化器 4 页内联重复⑤org 调余额后端仍 501 占位 | 下次 admin 批次顺手收敛①-④;⑤随 org 计费批次 |
 
