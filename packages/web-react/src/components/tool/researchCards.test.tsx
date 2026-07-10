@@ -484,3 +484,83 @@ describe("4 个新专属卡", () => {
     await waitFor(() => expect(container.querySelector("img")).not.toBeNull());
   });
 });
+
+describe("BrowserCliCard 复合命令 + 失败原因", () => {
+  // 真实 playwright-mcp 成功输出形状(navigate 后的 markdown)。
+  const PLAYWRIGHT_OK = [
+    "### Ran Playwright code",
+    "```js",
+    "await page.goto('https://example.com');",
+    "```",
+    "### Page",
+    "- Page URL: https://example.com/",
+    "- Page Title: Example Domain",
+    "### Snapshot",
+    "- generic [ref=e1]: huge a11y tree ...",
+  ].join("\n");
+
+  // 真实失败输出(取证自生产:文件在允许根之外)。
+  const BROWSER_ERR = [
+    "### Error",
+    "Error: File access denied: /home/agent/.openclaude/generated/tool-card-example.png is outside allowed roots. Allowed roots: /opt/openclaude/.playwright-mcp, /opt/openclaude",
+    "ls: cannot access '/home/agent/.openclaude/generated/tool-card-example.png': No such file or directory",
+  ].join("\n");
+
+  test("navigate && snapshot 复合命令 → 动作序列标题 + 快照折叠", () => {
+    const { container } = render(
+      <div>
+        {researchToolCard(
+          "oc-browser navigate --url https://example.com && oc-browser snapshot",
+          tool({ output: PLAYWRIGHT_OK }),
+        )}
+      </div>,
+    );
+    expect(screen.getByText("打开网页 · 页面快照")).toBeInTheDocument();
+    expect(screen.getByText("已完成")).toBeInTheDocument();
+    expect(container.querySelector('a[href="https://example.com"]')).not.toBeNull();
+    // 任一 verb 为 snapshot → 快照折叠区可见。
+    expect(screen.getByText("查看页面快照")).toBeInTheDocument();
+  });
+
+  test("navigate 成功 → 从输出提取 Page Title 一行标题,其余 markdown 照旧隐藏", () => {
+    render(
+      <div>{researchToolCard("oc-browser navigate --url https://example.com", tool({ output: PLAYWRIGHT_OK }))}</div>,
+    );
+    expect(screen.getByText("Example Domain")).toBeInTheDocument();
+    // 纯 navigate 无折叠详情 → 原始 markdown 不进 DOM。
+    expect(screen.queryByText(/Ran Playwright code/)).toBeNull();
+    expect(screen.queryByText(/huge a11y tree/)).toBeNull();
+  });
+
+  test("tool.error → 仍走浏览器专属卡:失败 + 首个 Error 行 danger + 完整输出折叠", () => {
+    render(
+      <div>
+        {researchToolCard(
+          "oc-browser screenshot --path /home/agent/.openclaude/generated/tool-card-example.png",
+          tool({ output: BROWSER_ERR, error: true }),
+        )}
+      </div>,
+    );
+    expect(screen.getByText("截图")).toBeInTheDocument();
+    expect(screen.getByText("失败")).toBeInTheDocument();
+    const reason = screen.getByText(/^Error: File access denied/);
+    expect(reason.className).toContain("text-danger");
+    expect(reason.textContent).not.toContain("### Error"); // 标头已剥
+    expect(screen.getByText("错误详情")).toBeInTheDocument(); // 完整输出进折叠区
+  });
+
+  test("输出含 ### Error(Bash exit 0 未标 error)也按失败渲染并给原因", () => {
+    render(
+      <div>{researchToolCard("oc-browser navigate --url https://bad.example", tool({ output: BROWSER_ERR }))}</div>,
+    );
+    expect(screen.getByText("失败")).toBeInTheDocument();
+    expect(screen.getByText(/^Error: File access denied/).className).toContain("text-danger");
+    expect(screen.queryByText("已完成")).toBeNull();
+  });
+
+  test("非 oc-browser 的失败仍走通用失败卡(不受 error-aware 白名单影响)", () => {
+    const node = researchToolCard('oc-lit search "x"', tool({ output: "boom", error: true }));
+    render(<div>{node}</div>);
+    expect(screen.getByText("执行失败")).toBeInTheDocument();
+  });
+});
