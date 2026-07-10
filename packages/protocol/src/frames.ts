@@ -614,6 +614,44 @@ export const OutboundTurnStatus = Type.Object({
 export type OutboundTurnStatus = Static<typeof OutboundTurnStatus>
 
 // ───────────────────────────────────────────────
+// SysContextRebuilt — 上下文重建提示帧(长会话热尾巴+归档,boss 硬指标 3)。
+//
+// 触发时机:引擎**无法原生续接**(切引擎 / 非原生 resume),gateway 走"最近 N
+// 条历史"兜底注入(sessionManager 注入点,现有 log 'injected historical context
+// for provider switch / non-native resume' 处)。注入成功后 gateway 发本帧,前端
+// 插一条 client-owned 的 system 提示行告知用户"更早细节助手可能记不全"。
+//
+// 协议边界:
+//   - **gateway-authored 观察帧**:不是底座上报的 engine event(与 turn_status
+//     不同,后者源自 CCB stdout);由 gateway 注入决策直接产生 → deliver()。
+//   - 走 deliver() 默认广播通道(WS + outboundRing),短暂断网靠 ring replay 兜底;
+//     前端按 frameSeq/ts 幂等去重(同一 turn 重复帧只插一条 system 行)。
+//   - sideband:无 .blocks,deliver() 跳过 adapter(与 turn_status 同,只走 WS);
+//     容器 → master 经 userChatBridge passthrough 透传给 user(不进 billing 拦截)。
+//   - `ts` 由 deliver() 落地时统一 stamp(与 turn_status/codex_billing 同 wire
+//     stamp 模式),schema 里声明为 Optional 让 gateway 构造时不必预填。
+//   - `traceId` 随 _inheritOutboundRouting 从主 out 继承(可选,观察用)。
+//
+// 前科提醒:sys.* 帧历史上漏补 TypeScript 类型(sys.frontend_build),故这里
+// 显式建 TypeBox schema + Static 类型 + 进 AnyFrame 联合,不留裸字面量。
+// ───────────────────────────────────────────────
+export const SysContextRebuilt = Type.Object({
+  type: Type.Literal('sys.context_rebuilt'),
+  sessionKey: Type.String(),
+  channel: Type.String(),
+  peer: Peer,
+  /** 本轮实际执行任务的 agent id(注入发生在哪个 agent 的 session)。 */
+  agentId: Type.String(),
+  /** 注入进 prompt 的历史消息条数(前端文案 "最近 {N} 条对话摘要")。 */
+  messageCount: Type.Number(),
+  /** deliver() 落地时 stamp 的服务端单调时间戳;construct 时可缺省。 */
+  ts: Type.Optional(Type.Number()),
+  // V3 S12e — 随 _inheritOutboundRouting 从主 out 继承的 turn trace(观察用)。
+  traceId: Type.Optional(TraceIdString),
+})
+export type SysContextRebuilt = Static<typeof SysContextRebuilt>
+
+// ───────────────────────────────────────────────
 // Control plane
 // ───────────────────────────────────────────────
 export const ControlListSessions = Type.Object({
@@ -640,6 +678,7 @@ export const AnyFrame = Type.Union([
   OutboundError,
   OutboundCodexBilling,
   OutboundTurnStatus,
+  SysContextRebuilt,
   ControlFrame,
 ])
 export type AnyFrame = Static<typeof AnyFrame>

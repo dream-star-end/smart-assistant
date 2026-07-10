@@ -44,7 +44,7 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import { HttpError, sendJson } from "../util.js";
 import { requireAdminVerifyDb } from "../../admin/requireAdmin.js";
 import type { CommercialHttpDeps, RequestContext } from "../handlers.js";
-import { getClientSession } from "@openclaude/storage";
+import { getClientSession, readArchivedMessages } from "@openclaude/storage";
 import { parseBigintIdParam } from "./_shared.js";
 import { getPool } from "../../db/index.js";
 import { writeAdminAudit } from "../../admin/audit.js";
@@ -108,11 +108,33 @@ export async function handleAdminGetSession(
   const { offset, limit } = parsePagingParams(url);
   const s = await getClientSession(sessionId, scopedUserId);
   if (!s) throw new HttpError(404, "NOT_FOUND", "session not found");
-  // Response-level slicing —— storage 层已全读,这里只控网络/前端体积。
-  const allMessages = Array.isArray(s.messages) ? s.messages : [];
-  const total = allMessages.length;
-  // offset >= total 时返回空数组 + has_more=false,不报错(前端"加载更多"竞争 + 临界 50 等场景需要友好兜底)
-  const slice = offset >= total ? [] : allMessages.slice(offset, offset + limit);
+  // 长会话热尾巴+归档:getClientSession 返回的 s.messages 只是**尾巴**(spill 后老消息
+  // 搬去归档表),完整会话 = 归档(更老)+ 尾巴。admin 诊断需要看到全部。
+  //   - 虚拟全量数组 = [尾巴(时序 old→new)] ++ [归档(newest-first)],offset 越过
+  //     尾巴范围就用 readArchivedMessages 补齐(§2.4,"不重构现有分页":尾巴切片逻辑不动,
+  //     仅在窗口越界时追加归档)。
+  //   - 归档用真实 owner(s.userId)分租读:admin override(scopedUserId=undefined)也能读,
+  //     且 scoped 时 getClientSession 已校验 s.userId===scopedUserId,一致。
+  const tail = Array.isArray(s.messages) ? s.messages : [];
+  const tailLen = tail.length;
+  const archivedCount = s.archivedCount ?? 0;
+  const total = tailLen + archivedCount;
+  // 尾巴切片(维持原有 offset/limit 语义):窗口落在 [0, tailLen) 的部分。
+  const tailSlice =
+    offset < tailLen ? tail.slice(offset, Math.min(offset + limit, tailLen)) : [];
+  // 归档切片:窗口越过尾巴的部分。虚拟索引 tailLen+j = 第 j 新的归档消息。
+  const aStart = Math.max(offset, tailLen);
+  const aEnd = Math.min(offset + limit, total);
+  let archivedSlice: unknown[] = [];
+  if (aStart < aEnd) {
+    archivedSlice = await readAdminArchivedWindow(
+      sessionId,
+      s.userId,
+      aStart - tailLen, // skip:跳过多少条最新归档
+      aEnd - aStart, // need:取多少条
+    );
+  }
+  const slice = [...tailSlice, ...archivedSlice];
   const has_more = offset + slice.length < total;
   await writeAdminAudit(getPool(), {
     adminId: admin.id,
@@ -144,9 +166,56 @@ export async function handleAdminGetSession(
       updated_at: s.updatedAt,
       messages: slice,
       total_messages: total,
+      // 热尾巴+归档诊断字段:归档条数 + 水位,便于 admin 知道尾巴之外还有多少历史。
+      archived_count: archivedCount,
+      archived_through_seq: s.archivedThroughSeq ?? 0,
       offset,
       limit,
       has_more,
     },
   });
+}
+
+/**
+ * admin 归档窗口读取(§2.4)。虚拟全量数组把归档区排在尾巴之后、以 newest-first 呈现;
+ * readArchivedMessages 游标只能 newest→older 翻页,故按需从最新归档页 walk:跳过
+ * `skip` 条最新归档,再取 `need` 条。admin 低频诊断,O(skip/pageSize) 次读可接受。
+ *
+ * 注:offset 分页与 storage 的 cursor 语义存在阻抗失配(offset 深翻会重走前缀页);
+ * 未来 admin 前端可改用与用户面 /api/sessions/:id/archive 一致的 cursor 翻页消除重走。
+ */
+async function readAdminArchivedWindow(
+  sessionId: string,
+  ownerUserId: string,
+  skip: number,
+  need: number,
+): Promise<unknown[]> {
+  const out: unknown[] = [];
+  let before = 0; // 0 = 最新归档页(archived_through_seq+1 起)
+  let toSkip = Math.max(0, skip);
+  let remaining = Math.max(0, need);
+  // 防御:归档条数有界,但仍加硬上限防 storage 返回异常时死循环。
+  for (let guard = 0; guard < 10_000 && remaining > 0; guard++) {
+    const page = await readArchivedMessages(sessionId, ownerUserId, before, 200);
+    const msgs = Array.isArray(page.messages) ? page.messages : [];
+    if (msgs.length === 0) break;
+    // 本页升序(old→new)→ reverse 成 newest→oldest 拼进虚拟顺序。
+    const newestFirst = msgs.slice().reverse();
+    if (toSkip >= newestFirst.length) {
+      toSkip -= newestFirst.length;
+    } else {
+      for (let i = toSkip; i < newestFirst.length && remaining > 0; i++) {
+        out.push(newestFirst[i]);
+        remaining--;
+      }
+      toSkip = 0;
+    }
+    if (!page.hasMore) break;
+    // 游标向更老翻:下一页读 _seq < 本页 oldestSeq。oldestSeq 应严格递减;
+    // 非正 / 未递减(before>0 且未变小)则停,防 storage 异常时死循环。
+    const next = page.oldestSeq ?? 0;
+    if (next <= 0 || (before > 0 && next >= before)) break;
+    before = next;
+  }
+  return out;
 }

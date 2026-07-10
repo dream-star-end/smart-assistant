@@ -1643,6 +1643,11 @@ export class SessionManager {
       codexRoute?: CodexProviderConfigOverride | null
       toolsets?: string[]
       collabAgentPolicy?: CollabAgentPolicy
+      /** 长会话热尾巴+归档 §2.3:历史上下文兜底注入**成功后**回调,让上层
+       *  (server.ts)发 sys.context_rebuilt 提示帧(boss 硬指标 3:引擎无法原生续接、
+       *  走兜底注入时主动提醒用户)。仅 webchat leader turn 传;delegate/cron/train
+       *  submit 不传 → 无用户可见提示。gateway-authored 决策,不进 engine event 流。 */
+      emitContextRebuilt?: (info: { messageCount: number }) => void
     },
   ): Promise<void> {
     // ── P0 计费旁路封堵(fail-closed 钱安全兜底,gateway seam 单一收口)────
@@ -1835,13 +1840,22 @@ export class SessionManager {
             runnerPayload = historicalPrompt
             session._historicalContextInjected = true
             session._historicalContextInjectedKey = injectionKey ?? 'local:no-provider-resume'
+            const injectedCount = Array.isArray(historyMessages) ? historyMessages.length : 0
             log.info('injected historical context for provider switch / non-native resume', {
               sessionKey: session.sessionKey,
               provider: session.providerTag,
               source: masterHistoricalMessages ? 'master-frame' : 'local-storage',
               injectionKey: session._historicalContextInjectedKey,
-              messageCount: Array.isArray(historyMessages) ? historyMessages.length : 0,
+              messageCount: injectedCount,
             })
+            // §2.3 boss 硬指标 3:兜底注入成功 = 引擎无法原生续接、上下文被重建 → 主动
+            // 提醒用户(仅当上层传了回调,即 webchat leader turn;内部子 turn 不提醒)。
+            // 回调抛错不能打断 turn —— 提示是尽力而为的 UX,吞掉即可。
+            try {
+              opts?.emitContextRebuilt?.({ messageCount: injectedCount })
+            } catch (emitErr) {
+              log.warn('emit sys.context_rebuilt failed', { sessionKey: session.sessionKey }, emitErr)
+            }
           }
         } catch (err) {
           log.warn('historical context injection failed', { sessionKey: session.sessionKey }, err)

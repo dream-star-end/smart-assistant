@@ -3158,6 +3158,12 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         cleanup("backpressure");
         return;
       }
+      // 容器 → user 默认**透传**:除上面显式拦下的 outbound.codex_billing(内部计费
+      // 侧信道,绝不给浏览器)外,其余帧一律照发。长会话热尾巴+归档的 sys.context_rebuilt
+      // 提示帧(容器 gateway deliver() 产生、带 sessionKey+frameSeq)就走这条路到达 user
+      // —— 上面 ring 写入已捕获它供重连重放,这里 live 透传。
+      // **契约红线**:未来若在此加"按 type 的转发白名单/丢弃表",必须放行 sys.* 命名空间
+      // (含 sys.context_rebuilt),否则用户上下文重建提示会被静默吞掉(帧被吞前科)。
       try {
         userWs.send(data, { binary: isBinary }, (err) => {
           if (err) {

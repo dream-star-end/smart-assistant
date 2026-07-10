@@ -31,6 +31,7 @@ import {
   type OutboundError,
   type OutboundMessage,
   type OutboundTurnStatus,
+  type SysContextRebuilt,
   type Peer,
   type AgentGroupStatus,
   type ReviewVerdict,
@@ -77,6 +78,7 @@ import {
   listClientSessions,
   getClientSession,
   getClientSessionPartial,
+  readArchivedMessages,
   upsertClientSession,
   appendServerAuthoredMessage,
   deleteClientSession,
@@ -2785,6 +2787,29 @@ export class Gateway {
       })().catch(() => this.sendJson(res, 500, { error: 'append failed' }))
       return
     }
+    // 归档分页端点(长会话热尾巴+归档 §2.1):GET /api/sessions/:id/archive?before=<seq>&limit=<n>
+    // 与下面 /api/sessions/:id 同款按 userId 分租(readArchivedMessages 内部 WHERE user_id=?
+    // → userA 永远拿不到 userB 的归档)。commercial 侧 router.ts 的 BLOCKED_FOR_USER_RULES
+    // 只拦 /api/sessions/(unclaimed|claim),本子路径不匹配 → 自动透传给本 handler。
+    const archiveMatch = url.pathname.match(/^\/api\/sessions\/([a-zA-Z0-9_-]{8,50})\/archive$/)
+    if (archiveMatch) {
+      const sessId = archiveMatch[1]
+      const userId = this.getUserId(req)
+      if (req.method !== 'GET') {
+        this.sendJson(res, 405, { error: 'method not allowed' })
+        return
+      }
+      const { beforeSeq, limit } = _parseArchiveQuery(
+        url.searchParams.get('before'),
+        url.searchParams.get('limit'),
+      )
+      // readArchivedMessages 直通:{ messages(升序), hasMore, oldestSeq }。storage 内部
+      // 再 clamp limit;缺省/0 = 最新归档页(archived_through_seq+1 起)。
+      readArchivedMessages(sessId, userId, beforeSeq, limit)
+        .then((r) => this.sendJson(res, 200, r))
+        .catch(() => this.sendJson(res, 500, { error: 'archive read failed' }))
+      return
+    }
     const clientSessMatch = url.pathname.match(/^\/api\/sessions\/([a-zA-Z0-9_-]{8,50})$/)
     if (clientSessMatch) {
       const sessId = clientSessMatch[1]
@@ -2817,11 +2842,18 @@ export class Gateway {
                 const v = (m as { _seq?: unknown })._seq
                 if (typeof v === 'number' && Number.isFinite(v) && v > maxSeq) maxSeq = v
               }
+              // 热尾巴+归档(§2.2):spill 后 s.messages 只是尾巴,老消息搬去归档表。
+              // 总数 = 尾巴条数 + 归档条数;显式回带归档水位/计数供前端渲染"从云端加载
+              // 更早历史"入口与"还有 N 条"计数、以及 mergeFullServerWins 的水位保留判定。
+              // 显式 stamp(不依赖 ...s 的 truthy/falsey,对齐 Codex review #6 语义)。
+              const archivedCount = s.archivedCount ?? 0
               this.sendJson(res, 200, {
                 ...s,
                 isPartial: false,
-                totalMessageCount: messages.length,
+                totalMessageCount: messages.length + archivedCount,
                 maxSeq,
+                archivedCount,
+                archivedThroughSeq: s.archivedThroughSeq ?? 0,
               })
             })
             .catch(() => this.sendJson(res, 500, { error: 'get failed' }))
@@ -10644,6 +10676,14 @@ export class Gateway {
         ? { collabAgentPolicy: 'team-mode-prefer-delegate' as const }
         : {}),
       ...(effectiveToolsets !== undefined ? { toolsets: effectiveToolsets } : {}),
+      // §2.3 boss 硬指标 3:sessionManager 走"最近 N 条历史"兜底注入成功后回调,
+      // gateway 发 sys.context_rebuilt 提示帧告知用户上下文被重建。仅 webchat leader
+      // turn 传本回调(delegate/cron/train submit 不传 → 无用户可见提示,正确:那些
+      // 内部子 turn 没有前台用户看)。gateway-authored 决策直接 deliver(),不绕 engine
+      // event 流(那是底座上报通道)。frame 路由继承主 out(_inheritOutboundRouting)。
+      emitContextRebuilt: (info: { messageCount: number }) => {
+        this.deliver(_buildContextRebuiltFrame(out, agent.id, info.messageCount), adapter)
+      },
     }
     // team-durability — 客户 turn 级 in-flight 计数(与 engine 级 _activeTurnCount 双计数,
     // hello 重连对账据此判 turn 是否在飞)。历史上审查硬编排在 submit 之后还要跑数分钟,
@@ -10701,7 +10741,12 @@ export class Gateway {
    * 四个成员上都有(交集字段),所以 narrowing 不需要,直接读即可。
    */
   private deliver(
-    out: OutboundMessage | OutboundError | OutboundCodexBilling | OutboundTurnStatus,
+    out:
+      | OutboundMessage
+      | OutboundError
+      | OutboundCodexBilling
+      | OutboundTurnStatus
+      | SysContextRebuilt,
     adapter?: ChannelAdapter,
   ): void {
     // V3 S12e CG6 — strip ALL private routing fields up-front (`_userId`,
@@ -10728,7 +10773,11 @@ export class Gateway {
     // 作独立 "non-message outbound vs adapter contract" 清理(届时 isSideband 白
     // 名单一并扩到 outbound.codex_billing / outbound.error,或重新设计 adapter
     // 协议让它能 dispatch 非 message 帧)。
-    const isSideband = wire.type === 'outbound.turn_status'
+    // sideband = 无 .blocks 的帧,强发给 adapter(Telegram/微信,假设 OutboundMessage
+    // 形状 for (b of out.blocks))会抛。sys.context_rebuilt 同 turn_status:webchat-only
+    // UX 提示帧,跳过 adapter 只走 WS(非 webchat channel 找不到 ws client → noop)。
+    const isSideband =
+      wire.type === 'outbound.turn_status' || wire.type === 'sys.context_rebuilt'
     if (adapter && !isSideband) {
       adapter.send(wire as OutboundMessage).catch((err) =>
         this.log.error('adapter send failed', { channel: adapter.name }, err),
@@ -10963,6 +11012,51 @@ export function _inheritOutboundRouting(
     peer: out.peer,
     ...(out._userId ? { _userId: out._userId } : {}),
     ...(out.traceId ? { traceId: out.traceId } : {}),
+  }
+}
+
+// ── 长会话热尾巴 + 归档 (Agent B §2) — pure helpers(`_` 前缀 test seam)──
+
+/**
+ * 归档分页端点(GET /api/sessions/:id/archive)的 query 解析 + 边界收敛。
+ *
+ * 契约(与 storage.readArchivedMessages 语义对齐):
+ *   - `before`:游标,返回 `_seq < before` 的最近一页;缺省 / 非法 / 负数 → 0
+ *     (0 = 从 archived_through_seq+1 开始,即最新归档页)。取整。
+ *   - `limit`:默认 100;非法 / ≤0 → 100;上限 200(storage 内部也 clamp,这里在
+ *     gateway 边界先兜一次防御坏输入)。
+ *
+ * 纯函数,不抛 —— 坏输入静默收敛到安全默认(端点是只读回看,不需要对畸形参数
+ * 硬 400;与 /api/sessions 的 `?since=` 解析同风格)。
+ */
+export function _parseArchiveQuery(
+  beforeRaw: string | null,
+  limitRaw: string | null,
+): { beforeSeq: number; limit: number } {
+  const b = beforeRaw !== null ? Number(beforeRaw) : 0
+  const beforeSeq = Number.isFinite(b) && b >= 0 ? Math.floor(b) : 0
+  const l = limitRaw !== null ? Number(limitRaw) : 100
+  const limit = Number.isFinite(l) && l > 0 ? Math.min(Math.floor(l), 200) : 100
+  return { beforeSeq, limit }
+}
+
+/**
+ * 构造 sys.context_rebuilt 提示帧(§2.3 boss 硬指标 3)。
+ *
+ * 路由三件套 + `_userId` + 可选 traceId 从主 `out` 继承(_inheritOutboundRouting,
+ * deliver() 会 strip 掉 `_userId`);`ts` 交给 deliver() 落地统一 stamp。返回带
+ * `_userId` 私有字段的帧,直接喂 `deliver()`。
+ */
+export function _buildContextRebuiltFrame(
+  out: OutboundMessage & { _userId?: string },
+  agentId: string,
+  messageCount: number,
+): SysContextRebuilt & { _userId?: string } {
+  return {
+    type: 'sys.context_rebuilt',
+    ..._inheritOutboundRouting(out),
+    agentId,
+    messageCount,
   }
 }
 
