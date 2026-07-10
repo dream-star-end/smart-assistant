@@ -771,6 +771,13 @@ export type MarketplaceCard = {
   useCases?: string[];
   /** 平台精选权重(越小越靠前;null/缺省=非精选)。只由平台运维脚本写入。 */
   featuredRank?: number | null;
+  // ── 真实使用信号（批2;全部可选,旧后端缺字段 → UI 优雅降级不渲染） ──
+  /** 近 30 天技能使用事件数（skill_view 计次;缺/0 时卡片沿用安装数徽章）。 */
+  usage30d?: number;
+  /** 近 30 天去重使用人数(>0 → 卡片以「30天 N 人在用」替代安装数徽章位)。 */
+  users30d?: number;
+  /** 使用后评分聚合;样本(up+down)<5 时**服务端直接返回 null**(前端零阈值判断,权威在服务端)。 */
+  rating?: { up: number; down: number } | null;
 };
 
 /** 市场检索响应。method=all 为空查询返全部目录。 */
@@ -819,6 +826,13 @@ export type MarketplaceDetail = {
   humanMd?: string | null;
   /** 平台精选权重(越小越靠前;null=非精选)。 */
   featuredRank?: number | null;
+  // ── 真实使用信号（批2;全部可选,旧后端缺字段 → UI 优雅降级不渲染） ──
+  /** 近 30 天技能使用事件数（skill_view 计次）。 */
+  usage30d?: number;
+  /** 近 30 天去重使用人数。 */
+  users30d?: number;
+  /** 使用后评分聚合;样本(up+down)<5 时**服务端直接返回 null**(前端零阈值判断,权威在服务端)。 */
+  rating?: { up: number; down: number } | null;
 };
 
 /** 已安装条目（GET /api/marketplace/installed 的 installed 项）。 */

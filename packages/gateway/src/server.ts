@@ -185,6 +185,7 @@ import {
   V3_MARKETPLACE_LOCAL_RELAY_PREFIX,
 } from './v3MarketplaceRelay.js'
 import { startToolFailureReporter } from './v3ToolFailureReporter.js'
+import { startSkillUsageReporter } from './skillUsageReporter.js'
 import { resolveEngine } from './engine/registry.js'
 import type { CodexProviderConfigOverride } from './engine/codexShared.js'
 import {
@@ -1762,6 +1763,13 @@ export class Gateway {
 
     // Commercial container telemetry: failed tool calls → master agent_audit.
     startToolFailureReporter()
+
+    // Commercial container product signal: hub skill_view → master marketplace usage.
+    // 默认开(OC_MARKET_SKILL_USAGE!='0');resolveTraceId 从活跃 session 读本 turn 的
+    // canonical traceId 作评分归因键(engine 中立、只透传不铸造)。
+    startSkillUsageReporter({
+      resolveTraceId: (sessionKey) => this.sessions.getByKey(sessionKey)?._currentTurnTraceId ?? null,
+    })
 
     // Start rate limiter cleanup
     this.rateLimiter.startCleanup()

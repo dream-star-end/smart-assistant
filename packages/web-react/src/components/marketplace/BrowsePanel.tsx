@@ -37,8 +37,19 @@ function CardTile({
 }) {
   const inst = card.preset ? undefined : installed.get(card.slug);
   const canUpdate = inst ? updateAvailable(inst) : false;
-  const users = formatInstallCount(card.installCount);
   const bench = benchmarkBadgeLabel(card.benchmark);
+  // 使用信号(真实使用 > 安装):近30天有去重使用人数则以「30天 N 人在用」替代原
+  // 安装数徽章位;否则沿用安装数「N 人在用」。缺字段(旧后端)两者皆无 → 不占位。
+  const users30d = card.users30d ?? 0;
+  const inUseLabel =
+    users30d > 0
+      ? `30天 ${formatInstallCount(users30d)} 人在用`
+      : formatInstallCount(card.installCount)
+        ? `${formatInstallCount(card.installCount)} 人在用`
+        : null;
+  // 评分:服务端已保证样本≥5 才非 null(前端不做二次阈值判断)。中性徽章,诚实文案。
+  const rating = card.rating ?? null;
+  const ratingTotal = rating ? rating.up + rating.down : 0;
   // 卡片只在「已知分类」时渲染分类徽章 —— 未分类不占位不噪音(分区视图里区头已足够)。
   const catLabel = isMarketplaceCategoryId(card.category)
     ? marketplaceCategoryLabel(card.category)
@@ -81,9 +92,18 @@ function CardTile({
               {t}
             </Badge>
           ))}
-          {users && (
-            <span className="ml-auto inline-flex items-center gap-1 text-[11px] text-faint">
-              <Users size={11} /> {users} 人在用
+          {(rating || inUseLabel) && (
+            <span className="ml-auto flex items-center gap-1.5">
+              {rating && (
+                <Badge tone="neutral" title={`来自 ${ratingTotal} 次真实使用的反馈`}>
+                  👍 {rating.up}/{ratingTotal}
+                </Badge>
+              )}
+              {inUseLabel && (
+                <span className="inline-flex items-center gap-1 text-[11px] text-faint">
+                  <Users size={11} /> {inUseLabel}
+                </span>
+              )}
             </span>
           )}
         </div>

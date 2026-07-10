@@ -2196,6 +2196,16 @@ export async function provisionV3Container(
       env.push("OC_TOOL_FAILURE_AUDIT=1");
     }
 
+    // 市场技能使用信号门控透传:与 tool-failure 相反 = **默认开**(低敏产品质量信号,
+    // 只记 slug/agent/trace 不记内容)。master 未显式设 → 恒注入 '1';仅当 master 显式
+    // OC_MARKET_SKILL_USAGE=0 时才透传 '0' 关停容器侧 skillUsageReporter。双端同名 env
+    // 一致门控,与 master 侧 internalSkillUsage 路由 isSkillUsageEnabled('!==0')对齐。
+    env.push(
+      process.env.OC_MARKET_SKILL_USAGE === "0"
+        ? "OC_MARKET_SKILL_USAGE=0"
+        : "OC_MARKET_SKILL_USAGE=1",
+    );
+
     // v3 file proxy:bridgeSecret 就位 → 注入 OC_CONTAINER_ID + OC_BRIDGE_NONCE。
     // 容器内 gateway 靠这两个 env 做 bridge bypass 校验 + /healthz capability 广播。
     // 缺失(deps.bridgeSecret 未注入)→ 容器不广播 file-proxy-v1,HOST 代理探测到

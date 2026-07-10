@@ -207,6 +207,11 @@ export function makeMarketplaceAgentHandler(deps: MarketplaceAgentDeps): Marketp
                 // 人向导购字段:容器 AI 据 category/useCases 解释「为什么适配你的需求」。
                 category: c.category,
                 useCases: c.useCases,
+                // 真实使用信号:容器 AI 据 30 天使用/评分反馈解释「为什么推荐(多少人在用/口碑)」。
+                // rating 样本不足时服务端已置 null,AI 不应据 null 编造好评率。
+                usage30d: c.usage30d,
+                users30d: c.users30d,
+                rating: c.rating,
               })),
           },
           requestId,

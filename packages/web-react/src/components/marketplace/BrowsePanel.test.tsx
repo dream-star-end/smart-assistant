@@ -89,3 +89,59 @@ test("空目录时给空态,不渲染分区/筛选片", async () => {
   expect(await screen.findByText("市场还没有上架的技能")).toBeInTheDocument();
   expect(screen.queryByRole("button", { name: "全部" })).not.toBeInTheDocument();
 });
+
+test("卡片:users30d>0 → 以「30天 N 人在用」替代安装数徽章位", async () => {
+  searchMarketplace.mockResolvedValue({
+    results: [
+      card("hot", { name: "热门技能", category: "office-docs", installCount: 50, users30d: 12 }),
+    ],
+    method: "all",
+  });
+  listMarketplaceInstalled.mockResolvedValue([]);
+
+  render(<BrowsePanel auth={auth} />);
+  expect(await screen.findByText("30天 12 人在用")).toBeInTheDocument();
+  // 有真实使用信号时不再单独展示安装数
+  expect(screen.queryByText("50 人在用")).not.toBeInTheDocument();
+});
+
+test("卡片:users30d=0/缺省 → 沿用安装数「N 人在用」", async () => {
+  searchMarketplace.mockResolvedValue({
+    results: [card("cold", { name: "冷门技能", category: "office-docs", installCount: 8 })],
+    method: "all",
+  });
+  listMarketplaceInstalled.mockResolvedValue([]);
+
+  render(<BrowsePanel auth={auth} />);
+  expect(await screen.findByText("8 人在用")).toBeInTheDocument();
+  expect(screen.queryByText(/30天/)).not.toBeInTheDocument();
+});
+
+test("卡片:rating 非 null → 中性「👍 M/N」徽章带真实反馈 title", async () => {
+  searchMarketplace.mockResolvedValue({
+    results: [
+      card("rated", { name: "被评技能", category: "office-docs", rating: { up: 7, down: 1 } }),
+    ],
+    method: "all",
+  });
+  listMarketplaceInstalled.mockResolvedValue([]);
+
+  render(<BrowsePanel auth={auth} />);
+  const badge = await screen.findByText("👍 7/8");
+  expect(badge).toBeInTheDocument();
+  expect(badge).toHaveAttribute("title", "来自 8 次真实使用的反馈");
+});
+
+test("卡片:rating=null/缺省(服务端已按样本阈值收口)→ 不渲染评分徽章", async () => {
+  searchMarketplace.mockResolvedValue({
+    results: [
+      card("norate", { name: "无评分", category: "office-docs", installCount: 3, rating: null }),
+    ],
+    method: "all",
+  });
+  listMarketplaceInstalled.mockResolvedValue([]);
+
+  render(<BrowsePanel auth={auth} />);
+  await screen.findByText("无评分");
+  expect(screen.queryByText(/👍/)).not.toBeInTheDocument();
+});

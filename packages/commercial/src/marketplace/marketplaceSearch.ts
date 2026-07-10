@@ -43,12 +43,16 @@ function toCard(c: ApprovedSearchRow): {
   category: string | null
   useCases: string[]
   featuredRank: number | null
+  usage30d: number
+  users30d: number
+  rating: { up: number; down: number } | null
 } {
-  // installCount 是加法字段(v3 vanilla UI 忽略);排序服务端权威(featured→热度→新),前端信任此序。
+  // installCount 是加法字段(v3 vanilla UI 忽略);排序服务端权威(featured→30天使用人数→热度→新),前端信任此序。
   // 平台预设 agent 已在 handleMarketplaceSearch 收口剔除,不会走到这里,故无 preset 字段。
   // benchmark 仅透出聚合值(withPassRate/withoutPassRate/cases),不暴露逐用例明细;
   // 前端徽记须标注"发布者提供·未经平台验证"(v3 vanilla UI 忽略该加法字段)。
   // 人向导购字段(category/useCases/featuredRank)卡片透出;outcomeExamples/humanMd 仅 detail(卡片保持轻)。
+  // 真实使用信号(usage30d/users30d/rating)卡片透出;rating 样本 <RATING_MIN_SAMPLE 时服务端已置 null。
   return {
     slug: c.slug,
     kind: c.kind,
@@ -60,6 +64,9 @@ function toCard(c: ApprovedSearchRow): {
     category: c.category,
     useCases: c.useCases,
     featuredRank: c.featuredRank,
+    usage30d: c.usage30d,
+    users30d: c.users30d,
+    rating: c.rating,
   }
 }
 
