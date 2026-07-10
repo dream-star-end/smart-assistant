@@ -52,10 +52,12 @@ const overridesLog = createLogger({ module: 'codexLaunchOverrides' })
 //     Codex must rely on its own tool/MCP list for what it can actually call.
 //   - Explicit instruction to NOT use codex's native memory subsystem: codex
 //     has its own `~/.codex/memories/` phase1/phase2 LLM-backed writer that
-//     would silently fork-out a parallel memory store; we route memory through
-//     the `oc-memory` CLI (Phase 2 — moved off the openclaude_memory MCP) and
-//     skills/scheduling/agents through the `openclaude_memory` MCP, keeping one
-//     source of truth.
+//     would silently fork-out a parallel memory store. memdir 范式下平台 Core
+//     记忆的唯一权威 = MEMORY.md 索引 + `memory/<slug>.md` 文件,由模型用原生
+//     文件工具直写(每 agent 的绝对路径 + 格式由平台的 `# Memory` slot 渲染进
+//     platform context)。session-search / archival(深层召回)仍走 `oc-memory`
+//     CLI;skills / scheduling / agents 走 `openclaude_memory` MCP —— 三条通道
+//     各一份权威,codex 私有 store 一律不碰。
 const CODEX_PREAMBLE = `# OpenClaude Platform Context (codex adapter)
 
 You are running inside the OpenClaude platform as a codex-backed agent. The
@@ -65,12 +67,21 @@ take precedence over any default codex personality.
 
 ## How the OpenClaude memory / skill / scheduling system reaches you
 
-Two access paths, split by tool:
+Three access paths:
 
-**Long-term memory → run the \`oc-memory\` CLI in your shell** (a one-shot
-command; there is no memory MCP tool):
+**Core memory → write the files directly with your file tools.** There is no
+\`oc-memory memory\` command and no memory MCP tool. Platform Core memory lives
+as a \`MEMORY.md\` index plus one \`memory/<slug>.md\` file per entry. The
+\`# Memory\` section further down in this platform context gives you the exact
+absolute paths for *this* agent, the frontmatter format, the four \`type\`
+categories (user / feedback / project / reference), and the two-step save
+(write the \`memory/<slug>.md\` file, then append one index line to
+\`MEMORY.md\`). Save a memory the same way you would create or edit any file;
+follow that section verbatim.
 
-- \`oc-memory memory --action <add|replace|remove|read> --target <memory|user> [--content "..."] [--needle "..."]\` — short Core memory (MEMORY.md / USER.md).
+**Long-form notes & session recall → run the \`oc-memory\` CLI in your shell**
+(one-shot commands; not MCP tools):
+
 - \`oc-memory session-search "<query>" [--limit N] [--summarize]\` — recall prior conversations.
 - \`oc-memory archival-add "<text>" [--tags a,b]\` / \`oc-memory archival-search "<query>"\` / \`oc-memory archival-delete <id>\` — long-form notes (unlimited, search-only).
 
@@ -85,11 +96,12 @@ See the \`memory-management\` skill for details.
 
 Do **not** read OR write codex's built-in \`~/.codex/memories/\` or
 \`~/.codex/skills/\` to manage platform state — those are codex-private and
-would fork the source of truth. Always go through the \`oc-memory\` CLI (memory)
-and the \`openclaude_memory\` MCP tools (skills / scheduling / agents) above.
-(The only exception is if the user *explicitly* asks you to inspect a
-codex-native rollout file — and even then, do not migrate that content into a
-parallel store.)
+would fork the source of truth. Route platform Core memory through the
+OpenClaude memory files (see \`# Memory\`), recall / archival through the
+\`oc-memory\` CLI, and skills / scheduling / agents through the
+\`openclaude_memory\` MCP tools above. (The only exception is if the user
+*explicitly* asks you to inspect a codex-native rollout file — and even then,
+do not migrate that content into a parallel store.)
 
 For reusable workflows, be proactive: after a complex multi-step task, call
 \`skill_search\` to check existing coverage, then \`skill_save\` to create or

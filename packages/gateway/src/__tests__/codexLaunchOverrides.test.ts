@@ -120,12 +120,23 @@ describe('CODEX_PREAMBLE', () => {
       CODEX_PREAMBLE.includes('openclaude_memory'),
       'preamble must name the MCP server (skills / scheduling / agents still live there)',
     )
-    // Phase 2: memory / session-search / archival moved OFF the MCP server onto
-    // the one-shot `oc-memory` CLI. The preamble must route memory ops there.
+    // memdir 范式:Core 记忆改为直接写文件(MEMORY.md 索引 + memory/<slug>.md),
+    // preamble 必须把 Core 指向 `# Memory` 段且**声明** oc-memory memory 命令已废除。
     assert.ok(
-      CODEX_PREAMBLE.includes('oc-memory memory --action'),
-      'preamble must document the oc-memory CLI for Core memory',
+      !CODEX_PREAMBLE.includes('oc-memory memory --action'),
+      'preamble must NOT advertise the retired `oc-memory memory --action` Core command',
     )
+    // 文案可能因 80 列折行(no\n`oc-memory memory`),用 whitespace-tolerant 正则。
+    assert.match(
+      CODEX_PREAMBLE,
+      /no\s+`oc-memory memory`\s+command/,
+      'preamble must state the oc-memory memory command is gone',
+    )
+    assert.ok(
+      CODEX_PREAMBLE.includes('# Memory'),
+      'preamble must route Core memory to the `# Memory` platform-context section',
+    )
+    // session-search / archival(深层召回)仍走 oc-memory CLI。
     assert.ok(
       CODEX_PREAMBLE.includes('oc-memory session-search'),
       'preamble must document the oc-memory CLI for session recall',

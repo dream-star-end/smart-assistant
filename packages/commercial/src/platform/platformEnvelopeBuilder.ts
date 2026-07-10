@@ -308,7 +308,11 @@ function isMetaUserMessage(msg: unknown): boolean {
 
 /**
  * 拼装 system[N+1] 注入块文本。
- * ctx === null 时用占位文本,保 H1 多机一致;有内容时 USER.md + MEMORY.md + skills 摘要。
+ * ctx === null 时用占位文本,保 H1 多机一致;有内容时 USER.md + MEMORY.md 索引 + skills 摘要。
+ *
+ * memdir 范式后 `ctx.memoryMd` 读到的 MEMORY.md 本身就是**纯索引**(首行 marker
+ * `<!-- oc-memdir-index v1 -->` + 每条一行 `- [标题](memory/x.md) — 钩子`),不再是旧 §-blob
+ * 全文,所以下方 `## Memory Index` 标签名实相符。这里直接原样注入索引文本,零结构改动。
  */
 function buildPlatformContextText(ctx: PlatformContext | null): string {
   if (ctx === null) {
@@ -322,6 +326,7 @@ function buildPlatformContextText(ctx: PlatformContext | null): string {
     parts.push("## User", ctx.userMd.trim());
   }
   if (ctx.memoryMd.trim().length > 0) {
+    // ctx.memoryMd 就是 MEMORY.md 索引文本(memdir 范式),标签名实相符,原样注入。
     parts.push("## Memory Index", ctx.memoryMd.trim());
   }
   if (ctx.skills.length > 0) {

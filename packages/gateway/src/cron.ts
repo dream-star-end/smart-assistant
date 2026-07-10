@@ -116,10 +116,10 @@ const DEFAULT_JOBS: CronJob[] = [
 1. Run \`oc-memory session-search "<query>"\` in the shell with query terms that cover yesterday's activity (e.g. the current date, common topics).
 2. Review the last 5-10 turns you find.
 3. Extract durable facts, user preferences, and patterns that should persist across sessions.
-4. Run \`oc-memory memory --action add --target <memory|user> --content "..."\` to add new entries — "memory" (your observations) or "user" (what you know about the user). Be selective — only things that will actually help next time.
+4. Save anything worth keeping as Core memory the memdir way (see the \`# Memory\` section of your system prompt): use Write to create a \`memory/<slug>.md\` file with frontmatter (name / description / type = user|feedback|project|reference), then use Edit to append one index line \`- [标题](memory/<slug>.md) — 钩子\` to \`MEMORY.md\`. Prefer updating an existing file over creating a near-duplicate. Be selective — only things that will actually help next time.
 5. If you notice a pattern of tasks that could be reused, use \`skill_save\` to distill it into a reusable skill.
 6. IMPORTANT: 重点检查今天是否有超过 3 次工具调用的复杂任务。如果有且没有对应 skill,立即用 skill_save 创建。
-7. 如果 MEMORY.md 中有冗长条目,考虑用 \`oc-memory archival-add "..."\` 迁移到归档记忆,然后 \`oc-memory memory --action remove --target memory --needle "..."\` 从 Core 删除。
+7. 如果某条 \`memory/<slug>.md\` 正文过于冗长,先用 \`oc-memory archival-add "..."\` 迁到归档记忆,再删掉该文件并同步移除 \`MEMORY.md\` 里对应那一行。
 8. Write a SHORT summary of what you learned today (max 200 words).
 9. If you learned nothing significant, reply with exactly "[SILENT]" and nothing else.`,
   },
@@ -131,12 +131,13 @@ const DEFAULT_JOBS: CronJob[] = [
     deliver: 'local',
     prompt: `You are doing a WEEKLY CURATION pass.
 
-1. Run \`oc-memory memory --action read --target memory\` and \`oc-memory memory --action read --target user\` to see everything currently stored.
+1. Read \`MEMORY.md\` (the Core memory index) and open the \`memory/<slug>.md\` files it points at with Read to see everything currently stored; also Read the shared \`user.md\` user profile.
 2. Call \`skill_list()\` to see accumulated skills.
 3. Run \`oc-memory archival-search "*"\` to review archival memory entries.
 4. Look for:
-   - Duplicate or contradictory entries → use \`oc-memory memory --action replace --target <t> --needle "old" --content "new"\` to consolidate.
-   - Obsolete facts (outdated preferences, stale technical details) → use \`oc-memory memory --action remove --target <t> --needle "..."\`.
+   - Duplicate or contradictory memory files → Edit one file to consolidate, delete the redundant \`memory/<slug>.md\`, and sync \`MEMORY.md\` (remove its index line).
+   - Obsolete facts (outdated preferences, stale technical details) → delete the stale \`memory/<slug>.md\` and remove its \`MEMORY.md\` index line.
+   - Index lines pointing at files that no longer exist, or files missing from the index → fix \`MEMORY.md\` so index and files agree.
    - Skills that are too narrow/specific → consider deleting with \`skill_delete\`.
    - Skills with updated_at 超过 30 天 → 检查是否需要刷新或删除。
    - Archival 中过时的知识 → \`oc-memory archival-delete <id>\`。
@@ -155,7 +156,7 @@ const DEFAULT_JOBS: CronJob[] = [
 2. If no results, try broader search terms (e.g. common topics the user discusses).
 3. For any multi-step task found (3+ tool calls), check \`skill_list()\` for existing coverage.
 4. If a useful new skill pattern is found, \`skill_save\` immediately with concrete steps and commands.
-5. Also \`oc-memory memory --action read --target memory\` — if any entry is stale or incorrect, update it.
+5. Also skim \`MEMORY.md\` and open any relevant \`memory/<slug>.md\` — if an entry is stale or incorrect, Edit the file (or delete it and remove its index line).
 6. If genuinely nothing new to extract or update, reply with exactly "[SILENT]".`,
   },
   {
@@ -167,7 +168,7 @@ const DEFAULT_JOBS: CronJob[] = [
     heartbeat: true, // UI hint only — execution is isolated like other cron jobs
     prompt: `Periodic heartbeat check (every 4 hours). You are proactively checking on the user's standing items.
 
-1. \`oc-memory memory --action read --target memory\` — scan for any time-sensitive items, deadlines, or follow-ups.
+1. Read \`MEMORY.md\` and open any \`memory/<slug>.md\` it points at — scan for time-sensitive items, deadlines, or follow-ups.
 2. \`oc-memory archival-search "pending OR reminder OR TODO OR deadline"\` — check for stored reminders/tasks.
 3. \`oc-memory session-search "<query>"\` with the current date or recent keywords — look for conversations where the user said "later", "tomorrow", or "remind me".
 4. If you find something actionable (missed deadline, pending follow-up, stale reminder), compose a SHORT proactive update for the user.

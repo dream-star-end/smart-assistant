@@ -42,7 +42,6 @@ import { cn } from "../../lib/utils";
 import { SignedAudio, SignedFileCard, SignedImg, SignedVideo, useSignedSrc } from "../chat/media";
 import { ClaimList, CoverageBadge, GatesRow, LiteratureLibraryPanel } from "../chat/researchEvidence";
 import { asArr, asStr, detectShellFileWrites, isSafeHttpUrl, type ToolLike } from "./format";
-import { MemoryStatusCard, renderMemoryReadCards } from "./memoryReminderCards";
 import { detectOcCli, OC_TOOLS, type OcCli } from "./meta";
 
 // ── 解析助手 ────────────────────────────────────────────────────────────────
@@ -1042,7 +1041,8 @@ function VisionCliCard({ command, tool }: { command: string; tool: ToolLike }): 
 
 // ── oc-memory(记忆读写/检索)──────────────────────────────────────────────────
 
-/** oc-memory 的子命令(memory / session-search / archival-*):取 CLI token 之后第一个词。 */
+/** oc-memory 的子命令(session-search / archival-*):取 CLI token 之后第一个词。
+ *  注:`memory` 子命令已退役(核心记忆改 memdir 文件范式,后端提示 + exit2),此处只认深层召回类。 */
 function memorySubcommand(command: string): string {
   const m = /oc-memory\s+([a-z-]+)/i.exec(command);
   return m ? m[1].toLowerCase() : "";
@@ -1062,19 +1062,11 @@ const MEMORY_SEARCH_SPEC: Record<string, { icon: ReactNode; title: string }> = {
   "archival-delete": { icon: <Archive className="size-4" />, title: "归档删除" },
 };
 
-/** oc-memory CLI → 复用记忆卡(read/写状态)或干净检索结果卡;不裸露命令。 */
+/** oc-memory CLI(深层召回:session-search / archival-*)→ 干净检索结果卡;不裸露命令。
+ *  `memory` 子命令已退役(→ null,由 researchToolCard 兜底 GenericOcCard,历史会话不泄漏命令)。 */
 function MemoryCliCard({ command, tool }: { command: string; tool: ToolLike }): ReactNode | null {
   const sub = memorySubcommand(command);
   const output = tool.output ?? null;
-  const error = !!tool.error;
-  if (sub === "memory") {
-    const action = parseCommandFlag(command, "action") || "read";
-    const target = parseCommandFlag(command, "target") || "memory";
-    if (action === "read") return renderMemoryReadCards(output, target);
-    if (action === "add" || action === "replace" || action === "remove")
-      return <MemoryStatusCard action={action} target={target} output={output} error={error} />;
-    return null;
-  }
   const spec = MEMORY_SEARCH_SPEC[sub];
   if (!spec) return null;
   const query = sub === "archival-delete" ? "" : memoryPositional(command, sub);

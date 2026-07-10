@@ -25,9 +25,14 @@ import { randomUUID } from 'node:crypto'
 import { type Dirent, existsSync, lstatSync } from 'node:fs'
 import { mkdir, readFile, readdir, realpath, rename, rm, writeFile } from 'node:fs/promises'
 import { join, sep } from 'node:path'
-import { DEFAULT_LIMITS, ENTRY_DELIMITER, acquireUserLock, scanMemoryContent } from '@openclaude/storage'
+import { acquireUserLock, scanMemoryContent } from '@openclaude/storage'
 
-const USER_BUDGET = DEFAULT_LIMITS.userChars // 2000
+// memdir 重构删除了 storage 的 DEFAULT_LIMITS / ENTRY_DELIMITER(§-blob 预算模型退役)。
+// 本脚本是 v3→v5 legacy §-格式 USER.md 的一次性迁移,读的是**存量** § 格式文件,仍需按
+// 旧 § 语义解析,故就地内联这两个历史常量(值与旧 DEFAULT_LIMITS.userChars /
+// ENTRY_DELIMITER 完全一致,行为不变)。锁 + scan 仍复用 storage 导出。
+const ENTRY_DELIMITER = '\n§\n'
+const USER_BUDGET = 2000
 
 function parseArgs(argv: string[]): { home: string; apply: boolean } {
   let home = ''

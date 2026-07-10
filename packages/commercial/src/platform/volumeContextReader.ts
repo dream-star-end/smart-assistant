@@ -207,8 +207,10 @@ export function makeLocalVolumeReader(
       const root = agentMainRoot(userId, baseDir);
       const vroot = volumeRoot(userId, baseDir);
       // USER.md → user-level shared (volume root `user.md`). MEMORY.md stays main's
-      // per-agent working notes. skills → user-level shared library (volume root
-      // `skills/`) post skill-sharing — both no longer under agents/main.
+      // per-agent memory *index* (memdir 范式:marker + `- [title](memory/x.md) — hook`
+      // lines,不再是旧 §-blob working notes;路径不变,故本 reader 零改动). skills →
+      // user-level shared library (volume root `skills/`) post skill-sharing — both no
+      // longer under agents/main.
       const userFile = await readCappedFile(join(vroot, "user.md"));
       const memoryFile = await readCappedFile(join(root, "MEMORY.md"));
       const { skills, maxMtime: skillMtime } = await readLocalSkills(join(vroot, "skills"));

@@ -392,29 +392,20 @@ describe("4 个新专属卡", () => {
     expect(container.textContent).not.toContain("oc-vision understand");
   });
 
-  test("oc-memory memory read → 复用核心记忆卡", () => {
-    render(
+  test("oc-memory memory 子命令已退役 → 干净的兜底记忆卡,不裸露命令", () => {
+    // 核心记忆改 memdir 文件写入,memory 子命令后端提示 + exit2;前端 MemoryCliCard 返回 null
+    // → researchToolCard 兜底 GenericOcCard(OC_TOOLS['oc-memory'] 标签「记忆」),绝不泄漏原始命令。
+    const { container } = render(
       <div>
         {researchToolCard(
           "oc-memory memory --action read --target memory",
-          tool({ output: "偏好:深色模式\n§\n项目:v5 Aurora" }),
+          tool({ output: "Core 记忆已改为直接编辑文件" }),
         )}
       </div>,
     );
-    expect(screen.getByText(/核心记忆/)).toBeInTheDocument();
-  });
-
-  test("oc-memory memory add → 记忆写入状态卡", () => {
-    render(
-      <div>
-        {researchToolCard(
-          "oc-memory memory --action add --target memory --content 'x'",
-          tool({ output: "已写入核心记忆。" }),
-        )}
-      </div>,
-    );
-    expect(screen.getByText(/已新增核心记忆/)).toBeInTheDocument();
-    expect(screen.getByText("完成")).toBeInTheDocument();
+    expect(screen.getByText("记忆")).toBeInTheDocument();
+    expect(container.textContent).not.toContain("oc-memory memory");
+    expect(container.textContent).not.toContain("--action");
   });
 
   test("oc-memory session-search → 历史检索卡(查询 + 结果,不裸露命令)", () => {

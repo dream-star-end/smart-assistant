@@ -18,11 +18,13 @@
  */
 import { existsSync, readFileSync } from 'node:fs'
 import {
-  MemoryStore,
+  MemoryDir,
   type SkillStore,
   buildAgentSkillStore,
   paths,
   readAgentsConfig,
+  readUserProfile,
+  scanMemoryContent,
 } from '@openclaude/storage'
 import { request as undiciRequest } from 'undici'
 import type { RepoSnapshot } from './sessionRepoWorkspace.js'
@@ -57,6 +59,19 @@ export interface PromptSlot {
   content: string
 }
 
+// ── 记忆注入预算(注入侧唯一权威,与存储写侧解耦)──
+//
+// memdir 范式下存储层不再有「Core 记忆字符硬预算」:每条记忆一个文件、MEMORY.md 只存
+// 索引。注入成本只由这两个 cap 在读侧控制,与磁盘上实际存了多少解耦。
+//   - 索引常驻注入,MemoryDir.renderForInjection 逐行 scan 后按此上限截断(超出附提示行)。
+//   - 用户画像整段注入,buildUserSlot 按此上限截断(超出附提示行)。
+// 存储层写多少都不拒,注入侧只取前 N 字符 —— 这是「触发少」问题的解:指令段常驻、
+// 索引常驻,不依赖存量规模。
+const MEMORY_INDEX_INJECT_MAX_CHARS = 6000
+// 导出:memory/user API 把它作为响应里的 `limit` 回报给 UI(memdir 下不再有写侧硬预算,
+// 此 cap = user.md 实际会被注入的上限,也是 UI 预算条唯一有意义的界)。单一权威。
+export const USER_PROFILE_INJECT_MAX_CHARS = 4000
+
 function buildPromptSkillStore(agentId: string): SkillStore {
   // Overlay (single wiring in @openclaude/storage): baseline(ro) > agent-seed(ro)
   // > shared(rw, all agents) > legacy(per-agent).
@@ -79,11 +94,28 @@ export function buildSoulSlot(ctx: PromptSlotContext): PromptSlot | null {
 }
 
 export async function buildUserSlot(ctx: PromptSlotContext): Promise<PromptSlot | null> {
-  const memStore = new MemoryStore(ctx.agentId)
-  await memStore.load()
-  const block = memStore.formatForSystemPrompt('user')
-  if (!block) return null
-  return { name: 'USER', content: block }
+  // 用户画像 = 用户级共享 user.md(去 § 化后的纯 markdown)。readUserProfile 负责懒去 §,
+  // 这里只做「注入侧兜底扫描 + cap 截断」。
+  let text: string
+  try {
+    ;({ text } = await readUserProfile())
+  } catch {
+    // user.md 读/去§失败不能拖垮系统提示构建,静默不注入即可。
+    return null
+  }
+  const trimmed = text.trim()
+  if (!trimmed) return null
+  // 读侧兜底扫描(注入唯一权威):模型可能用原生 Write 直接改 user.md,绕过 API 写侧 scan;
+  // 命中注入类/外泄类模式 → 整段不注入,不做局部剔除(用户画像是单文档,一处脏就不信任整篇)。
+  if (!scanMemoryContent(trimmed).ok) return null
+  let body = trimmed
+  if (body.length > USER_PROFILE_INJECT_MAX_CHARS) {
+    body = `${body.slice(0, USER_PROFILE_INJECT_MAX_CHARS)}\n\n…(用户画像超出注入上限,已截断;完整内容仍在 user.md)`
+  }
+  return {
+    name: 'USER',
+    content: `# USER IDENTITY (重要 — 回答任何关于用户的问题时必须参考此节)\n\n${body}`,
+  }
 }
 
 export async function buildAgentsSlot(ctx: PromptSlotContext): Promise<PromptSlot> {
@@ -287,12 +319,98 @@ export async function buildSkillsSlot(ctx: PromptSlotContext): Promise<PromptSlo
   return { name: 'SKILLS', content: lines.join('\n') }
 }
 
-export async function buildMemorySlot(ctx: PromptSlotContext): Promise<PromptSlot | null> {
-  const memStore = new MemoryStore(ctx.agentId)
-  await memStore.load()
-  const block = memStore.formatForSystemPrompt('memory')
-  if (!block) return null
-  return { name: 'MEMORY', content: block }
+/**
+ * 渲染 `# Memory` 段常驻指令 + 当前索引。
+ *
+ * 结构对标 Claude Code 的 `# Memory`:何时写 / 四类记忆各配示例 / 何时不写 /
+ * 两步保存(写文件 + 加索引行)/ 更新优先于新建 / 删错误记忆 / 按需 Read 正文 /
+ * 显式绝对路径。写入动作全部走引擎原生 Write/Edit —— memdir 范式下**不再有**
+ * `oc-memory memory` 子命令。
+ *
+ * `index` 为 null(仅 marker / 空)时,指令段照样常驻,索引段落降级为「(空)」。
+ * 这是「记忆触发少」问题的根治点:指令不依赖存量,永远在系统提示里。
+ */
+function renderMemoryInstructions(args: {
+  memoryDir: string
+  memoryMd: string
+  index: string | null
+}): string {
+  const { memoryDir, memoryMd, index } = args
+  const indexBlock = index && index.trim() ? index.trim() : '(空 —— 还没有任何记忆条目)'
+  return [
+    '# Memory',
+    '',
+    '你有一份跨会话持久的长期记忆:由「一个索引 + 若干记忆文件」组成。索引常驻在本段末尾,',
+    '每条一行;记忆正文按需自己去读,不会自动进上下文。',
+    '',
+    '## 何时写',
+    '',
+    '对话或任务收尾时,遇到「下次还用得上、且这次才知道」的信息就记下来:用户稳定的身份与偏好、',
+    '你收到的明确纠正或反馈、正在推进项目的关键事实、值得留存的参考资料。宁缺毋滥 —— 只记真正',
+    '能改变未来回答的东西。',
+    '',
+    '## 四类记忆(写文件时在 frontmatter 的 `type` 里标注,各配一例)',
+    '',
+    '- **user** — 用户是谁、长期偏好与风格。例:「用户是射电天文研究员,回答默认按同行水平、公式可保留」。',
+    '- **feedback** — 用户对你的明确纠正/评价,必须附「为什么」与「下次怎么做」。例:「用户指出系统误差不能套 √N —— Why: 只有热噪声主导才成立;How to apply: 先分随机/系统误差再做 RSS 合成」。',
+    '- **project** — 正在做的项目/任务的关键事实与决定。例:「X 项目部署在 kl-mirror,出站统一走 18991 订阅代理」。',
+    '- **reference** — 稳定可复用的知识/资料/清单。例:「常用论文检索入口与各自的检索语法」。',
+    '',
+    '## 何时不写',
+    '',
+    '一次性的临时细节、当场能算出或查到的东西、纯寒暄,以及**任何密钥 / token / 密码 / 隐私原文**,',
+    '都不要写进记忆。',
+    '',
+    '## 怎么保存(两步,直接用你的原生文件工具 —— 已经没有 `oc-memory memory` 命令了)',
+    '',
+    `1. **写记忆文件**:用 Write 在 \`${memoryDir}/\` 下新建 \`<slug>.md\`(slug 用小写中划线,如 \`user-radio-astronomer.md\`),文件顶部带 frontmatter:`,
+    '   ```markdown',
+    '   ---',
+    '   name: <kebab-slug>',
+    '   description: <一句话摘要,决定未来会话是否召回这条>',
+    '   type: user | feedback | project | reference',
+    '   ---',
+    '   <正文;feedback / project 记得写清 Why 与 How to apply>',
+    '   ```',
+    `2. **加索引行**:用 Edit 往 \`${memoryMd}\` 追加一行:\`- [标题](memory/<slug>.md) — 一句话钩子\`(整行 ≤150 字符;钩子写清「什么情况下该翻开这条」)。`,
+    '',
+    '## 维护',
+    '',
+    '- **更新优先于新建**:同一主题已有文件,直接 Edit 那个文件,不要另建近似条目。',
+    `- **发现错误 / 过时的记忆就删**:删掉 \`${memoryDir}/<slug>.md\`,并同步删掉 \`${memoryMd}\` 里对应那一行。`,
+    `- 想看某条正文时,用 Read 打开索引里对应的 \`${memoryDir}/<slug>.md\`(只有索引常驻,正文不会自动进上下文)。`,
+    '',
+    '## 当前索引',
+    '',
+    indexBlock,
+  ].join('\n')
+}
+
+/**
+ * MEMORY slot —— memdir 范式。**始终返回**(指令段常驻,索引为空也注入),故返回类型
+ * 不再是 `PromptSlot | null`。索引由 MemoryDir.renderForInjection 现算(内部含
+ * ensureMigrated + reconcileIndex + 逐行 scan + cap 截断)。
+ */
+export async function buildMemorySlot(ctx: PromptSlotContext): Promise<PromptSlot> {
+  const md = new MemoryDir(ctx.agentId)
+  let index: string | null = null
+  try {
+    index = await md.renderForInjection(MEMORY_INDEX_INJECT_MAX_CHARS)
+  } catch {
+    // 索引读/对账失败不能拖垮系统提示:指令段仍常驻,索引段落降级为「(空)」。
+    index = null
+  }
+  const memoryDir = paths.agentMemoryDir(ctx.agentId)
+  const memoryMd = paths.agentMemoryMd(ctx.agentId)
+  return { name: 'MEMORY', content: renderMemoryInstructions({ memoryDir, memoryMd, index }) }
+}
+
+/** 测试用内部导出(非稳定 API):暴露纯函数 renderMemoryInstructions 与两个注入 cap,
+ *  让 # Memory 指令段渲染无需 storage MemoryDir 即可被单测覆盖。 */
+export const _memoryInternals = {
+  renderMemoryInstructions,
+  MEMORY_INDEX_INJECT_MAX_CHARS,
+  USER_PROFILE_INJECT_MAX_CHARS,
 }
 
 export function buildToolsSlot(): PromptSlot {
@@ -308,14 +426,15 @@ export function buildToolsSlot(): PromptSlot {
       '',
       '## 三层记忆',
       '',
-      '| 层级 | 命令(在 Bash 里运行 `oc-memory` CLI) | 容量 | 何时用 |',
+      '| 层级 | 怎么用 | 容量 | 何时用 |',
       '|------|------|------|--------|',
-      '| Core | `oc-memory memory --action add/read --target user/memory --content "..."` | 2K+4K chars | 高频事实、用户身份,每次对话自动可见 |',
-      '| Recall | `oc-memory session-search "<query>"` | 无限 | 回忆过去对话内容 |',
-      '| Archival | `oc-memory archival-add/archival-search/archival-delete` | 无限 | 详细知识、文档、代码模式(需搜索才可见) |',
+      '| Core | 直接用 Write/Edit 写记忆文件(详见上面 `# Memory` 段) | 索引常驻 | 高频事实、用户身份、明确反馈,每次对话自动可见 |',
+      '| Recall | 在 Bash 里运行 `oc-memory session-search "<query>"` | 无限 | 回忆过去对话内容 |',
+      '| Archival | 在 Bash 里运行 `oc-memory archival-add/archival-search/archival-delete` | 无限 | 详细知识、文档、代码模式(需搜索才可见) |',
       '',
-      '记忆是 `oc-memory` 命令行工具(在 Bash 里运行),不是独立工具调用。详见 `skill_view("memory-management")`。',
-      '**原则**: 高频→Core, 详细→Archival, Core满了→迁移到Archival',
+      'Core 记忆**直接写文件**(见上面 `# Memory` 段),已经**没有** `oc-memory memory` 命令;',
+      'Recall / Archival 仍是 `oc-memory` 命令行工具(在 Bash 里运行),不是独立工具调用。详见 `skill_view("memory-management")`。',
+      '**原则**: 高频→Core(直接写文件), 详细→Archival, Core 里某条太长→迁到 Archival',
       '',
       '## 定时任务',
       '',
@@ -925,8 +1044,9 @@ export async function buildPromptContext(ctx: PromptSlotContext): Promise<Prompt
   }
 
   // Layer 3: Dynamic context
+  // MEMORY 段常驻(memdir 范式):指令段不依赖存量,索引为空也注入,故 buildMemorySlot 恒返 slot。
   const memory = await buildMemorySlot(ctx)
-  if (memory) slots.push(memory)
+  slots.push(memory)
 
   const tools = buildToolsSlot()
   slots.push(tools)

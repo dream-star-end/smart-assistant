@@ -16,10 +16,10 @@ related_skills: [skill-management, memory-management]
    - `session_search("*")` 查看今天的会话
    - 哪些任务完成得好?哪些遇到了困难?
 
-2. **更新记忆**
-   - `memory(action="read", target="memory")` 审视当前记忆
-   - 添加今天发现的重要信息
-   - 删除过时/不准确的条目
+2. **更新记忆**(memdir 范式,详见 `memory-management` skill)
+   - `Read ~/.openclaude/agents/<你的 agentId>/MEMORY.md` 审视记忆索引,需要细节再 `Read` 对应 `memory/*.md`
+   - 把今天发现的重要信息写成新的记忆文件 + 追加一行索引(`Write`/`Edit`)
+   - 删除过时/不准确的记忆文件,并 `Edit` 掉 MEMORY.md 里对应的索引行
 
 3. **检查 skill 机会**
    - 今天是否有可复用的工作模式?
@@ -27,8 +27,8 @@ related_skills: [skill-management, memory-management]
    - 如果没有,用 `skill_save()` 创建
 
 4. **更新用户画像**
-   - `memory(action="read", target="user")`
-   - 今天是否了解到用户新的偏好或背景?
+   - `Read ~/.openclaude/user.md`
+   - 今天是否了解到用户新的偏好或背景?有的话直接 `Edit` 写进 user.md
 
 ## 每周整理 (weekly-curation)
 
@@ -38,8 +38,8 @@ related_skills: [skill-management, memory-management]
    - 更新或删除不再准确的 skills
 
 2. **记忆精简**
-   - MEMORY.md 有字符预算,确保每条记忆都有价值
-   - 合并相似条目,删除琐碎信息
+   - 确保每条记忆文件都有价值:删掉过时/琐碎的记忆文件 + 对应索引行
+   - 同一主题散成多条时合并成一个文件;成篇的长知识迁到 archival(`oc-memory archival-add`)
 
 3. **模式识别**
    - 用户最常问什么类型的问题?

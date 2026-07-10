@@ -1,15 +1,13 @@
 import { Bell, CalendarClock, CheckCircle2, Clock, Hash, ListChecks, Trash2 } from "lucide-react";
 import type { ReactNode } from "react";
 import { cronHuman } from "../../lib/cron";
-import {
-  deriveMemoryTitle,
-  isMemoryEmptyHint,
-  memoryTargetLabel,
-  nonEmptyMemoryEntries,
-} from "../../lib/memoryText";
 import { cn } from "../../lib/utils";
 import { Badge } from "../ui";
 import { asStr } from "./format";
+
+// 注意:核心记忆已迁 memdir 文件范式,旧的 oc-memory `memory` 读/写状态卡(renderMemoryReadCards /
+// MemoryStatusCard,依赖已删除的 § 分隔 memoryText)随之退役;记忆读写现由记忆中心文件列表 +
+// 「记忆更新」Write/Edit 卡承载。本文件只保留定时提醒/任务(reminder)相关卡。
 
 type ReminderJob = {
   id: string;
@@ -216,55 +214,3 @@ export function ReminderStatusCard({ op, input, output, error }: { op: string; i
   );
 }
 
-export function renderMemoryReadCards(output?: string | null, target?: unknown): ReactNode | null {
-  const text = String(output || "").trim();
-  if (!text) return null;
-  if (isMemoryEmptyHint(text)) {
-    return (
-      <div className="rounded-xl border border-dashed border-border bg-elevated px-3 py-4 text-center">
-        <CheckCircle2 size={18} className="mx-auto text-faint" />
-        <div className="mt-1 text-[13px] font-medium text-fg">{memoryTargetLabel(target)}暂无内容</div>
-        <p className="mt-0.5 text-[12px] text-faint">新的记忆会在保存后出现在这里。</p>
-      </div>
-    );
-  }
-  const entries = nonEmptyMemoryEntries(text);
-  if (entries.length === 0) return null;
-  return (
-    <div className="flex flex-col gap-2">
-      <div className="text-[12.5px] font-medium text-fg">{memoryTargetLabel(target)} · {entries.length} 条</div>
-      <ul className="flex flex-col gap-2">
-        {entries.map((entry, i) => (
-          <li key={`${i}:${entry.slice(0, 20)}`} className="rounded-xl border border-border bg-elevated px-3 py-2.5 shadow-soft">
-            <div className="flex items-center gap-1.5">
-              <Badge tone="accent">{i + 1}</Badge>
-              <span className="min-w-0 truncate text-[13px] font-semibold text-fg">{deriveMemoryTitle(entry, `记忆 ${i + 1}`)}</span>
-            </div>
-            <p className="mt-1 whitespace-pre-wrap break-words text-[12.5px] leading-relaxed text-muted">{entry}</p>
-          </li>
-        ))}
-      </ul>
-    </div>
-  );
-}
-
-export function MemoryStatusCard({ action, target, output, error }: { action: string; target?: unknown; output?: string | null; error?: boolean }) {
-  const failed = !!error || /^error:/i.test(String(output || "").trim());
-  const verb = action === "add" ? "新增" : action === "replace" ? "替换" : action === "remove" ? "删除" : "更新";
-  return (
-    <div className={cn("rounded-xl border px-3 py-2.5", failed ? "border-danger-soft bg-danger-soft/40" : "border-border bg-elevated")}>
-      <div className="flex items-start gap-2.5">
-        <span className={cn("mt-0.5 flex size-7 shrink-0 items-center justify-center rounded-lg", failed ? "bg-danger-soft text-danger" : "bg-accent-soft text-accent")}>
-          <CheckCircle2 size={14} />
-        </span>
-        <div className="min-w-0 flex-1">
-          <div className="flex flex-wrap items-center gap-1.5">
-            <span className="text-[13px] font-semibold text-fg">{failed ? `${verb}记忆失败` : `已${verb}${memoryTargetLabel(target)}`}</span>
-            <Badge tone={failed ? "danger" : "success"}>{failed ? "失败" : "完成"}</Badge>
-          </div>
-          {output && <p className="mt-0.5 whitespace-pre-wrap break-words text-[12px] leading-snug text-muted">{output}</p>}
-        </div>
-      </div>
-    </div>
-  );
-}

@@ -242,9 +242,10 @@ COPY --chown=root:root ./runtime/oc-vision.sh /usr/local/bin/oc-vision
 # 示意图(机制/装置/几何/通路图)。均文档见 scientific-figures baseline skill。
 COPY --chown=root:root ./runtime/oc-figcheck.sh /usr/local/bin/oc-figcheck
 COPY --chown=root:root ./runtime/oc-diagram.sh /usr/local/bin/oc-diagram
-# oc-memory: 长期记忆 CLI(Core/Recall/Archival 三层,复用 mcp-memory memoryTools 核心)。
-# 取代常驻 openclaude_memory MCP 里的 memory/session_search/archival_* 工具(常驻 stdio
-# 传输脆弱 → codex 死等)。delegate/cron/skill 仍留 MCP。文档见 memory-management baseline skill。
+# oc-memory: 长期记忆 CLI(Recall + Archival),复用 mcp-memory memoryTools 核心。取代常驻
+# openclaude_memory MCP 里的 session_search/archival_* 工具(常驻 stdio 传输脆弱 → codex 死等)。
+# memdir 范式后 Core 记忆改为直接用 Write/Edit 写 MEMORY.md 索引 + memory/*.md 文件,`memory`
+# 子命令已退役(调用只打印迁移提示)。delegate/cron/skill 仍留 MCP。文档见 memory-management baseline skill。
 COPY --chown=root:root ./runtime/oc-memory.sh /usr/local/bin/oc-memory
 RUN set -eux; \
     chmod 0755 /usr/local/bin/oc-docx /usr/local/bin/oc-minimax /usr/local/bin/oc-web-context /usr/local/bin/oc-web /usr/local/bin/oc-browser /usr/local/bin/oc-market /usr/local/bin/oc-lit /usr/local/bin/oc-cite /usr/local/bin/oc-ingest /usr/local/bin/oc-litrag /usr/local/bin/oc-report /usr/local/bin/oc-slides /usr/local/bin/oc-poster /usr/local/bin/oc-rank /usr/local/bin/oc-xlsx /usr/local/bin/oc-pdf /usr/local/bin/oc-vision /usr/local/bin/oc-figcheck /usr/local/bin/oc-diagram /usr/local/bin/oc-memory /usr/local/lib/openclaude/create-docgen-reference.py; \

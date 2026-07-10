@@ -1,6 +1,6 @@
 import { describe, expect, test } from "vitest";
 import { detectShellFileWrites, normalizeToolForDisplay } from "./format";
-import { detectOcCli, parseMcpName, resolveToolMeta, toolSummary } from "./meta";
+import { detectOcCli, isMemoryFilePath, parseMcpName, resolveToolMeta, toolSummary } from "./meta";
 
 describe("parseMcpName (P5)", () => {
   test("mcp__server__op → { server, op }", () => {
@@ -195,6 +195,48 @@ describe("Bash heredoc 写文件语义卡", () => {
     const command = "cat > script.sh <<'EOF'\noc-web extract https://example.com\nEOF";
     expect(resolveToolMeta("Bash", { command }).label).toBe("写入文件");
     expect(toolSummary("Bash", { command })).toBe("script.sh");
+  });
+});
+
+describe("记忆更新重标(Write/Edit 命中记忆文件)", () => {
+  const memFile = "/home/agent/.openclaude/agents/main/memory/user-preferences.md";
+  const memIndex = "/home/agent/.openclaude/agents/main/MEMORY.md";
+  const userProfile = "/home/agent/.openclaude/user.md";
+
+  test("isMemoryFilePath 命中 memdir 记忆文件 / MEMORY.md 索引 / user.md 画像", () => {
+    expect(isMemoryFilePath(memFile)).toBe(true);
+    expect(isMemoryFilePath(memIndex)).toBe(true);
+    expect(isMemoryFilePath(userProfile)).toBe(true);
+    expect(isMemoryFilePath("/home/agent/.openclaude/USER.md")).toBe(true); // 大小写容错
+  });
+
+  test("isMemoryFilePath 放过普通文件与近似路径", () => {
+    expect(isMemoryFilePath("/home/agent/project/MEMORY.md")).toBe(false); // 不在 .openclaude/agents 下
+    expect(isMemoryFilePath("/home/agent/.openclaude/agents/main/skills/x.md")).toBe(false);
+    expect(isMemoryFilePath("/home/agent/notes/user.md")).toBe(false);
+    expect(isMemoryFilePath("")).toBe(false);
+    expect(isMemoryFilePath(undefined)).toBe(false);
+  });
+
+  test("原生 Write/Edit 写入记忆文件 → 记忆更新(标题+Brain 图标)", () => {
+    const w = resolveToolMeta("Write", { file_path: memFile });
+    expect(w.label).toBe("记忆更新");
+    expect(w.tone).toBe("accent");
+    expect(resolveToolMeta("Edit", { file_path: memIndex }).label).toBe("记忆更新");
+    expect(resolveToolMeta("Write", { file_path: userProfile }).label).toBe("记忆更新");
+  });
+
+  test("Write/Edit 写普通文件 → 仍是写入/编辑文件(不误标)", () => {
+    expect(resolveToolMeta("Write", { file_path: "/home/agent/app.ts" }).label).toBe("写入文件");
+    expect(resolveToolMeta("Edit", { file_path: "/home/agent/app.ts" }).label).toBe("编辑文件");
+  });
+
+  test("Bash heredoc 写入记忆文件也重标记忆更新", () => {
+    const command = `cat > ${memIndex} <<'EOF'\n<!-- oc-memdir-index v1 -->\nEOF`;
+    expect(resolveToolMeta("Bash", { command }).label).toBe("记忆更新");
+    // 非记忆路径的 heredoc 写文件不受影响。
+    const other = "cat > /home/agent/a.ts <<'EOF'\nx\nEOF";
+    expect(resolveToolMeta("Bash", { command: other }).label).toBe("写入文件");
   });
 });
 

@@ -54,7 +54,10 @@ import {
   type SkillEvalsFile,
   type AgentDef,
   type AgentsConfig,
-  MemoryStore,
+  MemoryDir,
+  MEMORY_FILE_RE,
+  readUserProfile,
+  writeUserProfile,
   type OpenClaudeConfig,
   SkillStore,
   SkillDraftStore,
@@ -149,6 +152,7 @@ import {
   outboundRingSizeBytes,
 } from './metrics.js'
 import { RateLimiter } from './rateLimit.js'
+import { USER_PROFILE_INJECT_MAX_CHARS } from './promptSlots.js'
 import { matchBridgeApiAllowlist } from './bridgeApiAllowlist.js'
 import { handleOpenAIRequest } from './openaiCompat.js'
 import { DEFAULT_RING_CONFIG, OutboundRingBuffer, type EvictionStats } from './outboundRing.js'
@@ -2969,6 +2973,16 @@ export class Gateway {
       )
       return
     }
+    // 单条记忆文件 CRUD(memdir)::file 用宽松 [^/]+ 捕获,handler 内 basename+MEMORY_FILE_RE 双保险。
+    const memoryFileMatch = url.pathname.match(
+      /^\/api\/agents\/([a-zA-Z0-9_-]+)\/memory\/files\/([^/]+)$/,
+    )
+    if (memoryFileMatch) {
+      this.handleMemoryFile(req, res, memoryFileMatch[1], memoryFileMatch[2]).catch((err) =>
+        this.sendInternalError(res, err),
+      )
+      return
+    }
     // User-level skill library (agentId-less; baseline + shared + aggregated legacy).
     if (url.pathname === '/api/skills') {
       this.handleUserSkillsList(req, res).catch((err) => this.sendInternalError(res, err))
@@ -5420,9 +5434,13 @@ export class Gateway {
     this.sendError(res, 405, 'method not allowed')
   }
 
-  // GET /api/agents/:id/memory/memory   → { text, charCount, limit }
-  // GET /api/agents/:id/memory/user     → { text, charCount, limit }
-  // PUT same paths with body { text }   → overwrite the target
+  // memdir 范式下的记忆读写面(单一权威在 storage 的 MemoryDir / userProfile):
+  //   - target='user'  : GET/PUT 共享用户画像 user.md(单文本编辑,语义与结构不变)。
+  //   - target='memory': GET 返回 MEMORY.md 索引 + 逐文件元信息(供 UI 渲染文件列表);
+  //                       PUT → 410 gone(索引不再手写,由 reconcileIndex 自愈;
+  //                       单条记忆改走 /memory/files/:file)。
+  //
+  // 单条记忆文件的 CRUD 在 handleMemoryFile(files/:file 子路由)。
   private async handleMemory(
     req: IncomingMessage,
     res: ServerResponse,
@@ -5430,36 +5448,123 @@ export class Gateway {
     target: 'memory' | 'user',
   ): Promise<void> {
     if (isHiddenSystemAgentId(agentId)) return this.sendError(res, 404, 'agent not found')
-    const store = new MemoryStore(agentId)
-    await store.load()
+
+    // ── 用户画像 user.md(共享单文本;底层换 userProfile,响应结构不变)──
+    if (target === 'user') {
+      if (req.method === 'GET') {
+        const { text, version } = await readUserProfile()
+        this.sendJson(res, 200, {
+          text,
+          charCount: text.length,
+          // memdir 下无写侧硬预算;limit = 注入侧 cap(user.md 实际会被注入的上限),
+          // 仍是 UI 预算条唯一有意义的界。单一权威 = promptSlots.USER_PROFILE_INJECT_MAX_CHARS。
+          limit: USER_PROFILE_INJECT_MAX_CHARS,
+          // 乐观并发指纹:UI 拿到后随 PUT 回传,后端锁内重读比对防覆盖并发写入。
+          version,
+          target,
+        })
+        return
+      }
+      if (req.method === 'PUT') {
+        const body = await this.readJsonBody<{ text?: string; version?: string }>(req)
+        const r = await writeUserProfile(body.text ?? '', body.version)
+        if (r.ok) {
+          const { text, version } = await readUserProfile()
+          this.sendJson(res, 200, {
+            ok: true,
+            charCount: text.length,
+            limit: USER_PROFILE_INJECT_MAX_CHARS,
+            version,
+          })
+          return
+        }
+        // 版本冲突(面板打开期间被别的进程写过)→ 409 + 当前盘上内容/版本,交由前端三方合并。
+        // conflict 结构对齐历史:{ text, version, charCount, limit }。三态 union 用 'conflict' in r 判别。
+        if ('conflict' in r) {
+          return this.sendJson(res, 409, {
+            error: 'memory conflict',
+            conflict: {
+              text: r.conflict.current,
+              version: r.conflict.version,
+              charCount: r.conflict.current.length,
+              limit: USER_PROFILE_INJECT_MAX_CHARS,
+            },
+          })
+        }
+        return this.sendError(res, 400, r.error ?? 'save failed')
+      }
+      return this.sendError(res, 405, 'method not allowed')
+    }
+
+    // ── 记忆索引 MEMORY.md(target='memory')──
+    const md = new MemoryDir(agentId)
     if (req.method === 'GET') {
+      // GET 前懒迁移:把旧 blob 版 MEMORY.md 拆成 memdir(幂等,锁内)。
+      await md.ensureMigrated()
+      // reconcileIndex 锁内双向对账后返回索引文本;list 逐文件解析 frontmatter。
+      const [text, files] = await Promise.all([md.reconcileIndex(), md.list()])
       this.sendJson(res, 200, {
-        text: store.read(target),
-        charCount: store.charCount(target),
-        limit: store.charLimit(target),
-        // 乐观并发指纹:UI 拿到后随 PUT 回传,后端锁内重读比对防覆盖并发写入。
-        version: store.version(target),
-        target,
+        kind: 'index',
+        // text 保留兼容:UI 可直接展示索引原文(只读折叠预览)。
+        text,
+        files,
+        // 索引不再手写,version 仅为响应结构完整性(索引文本内容指纹)。
+        version: createHash('sha256').update(text).digest('hex').slice(0, 16),
       })
       return
     }
     if (req.method === 'PUT') {
-      const body = await this.readJsonBody<{ text?: string; version?: string }>(req)
-      const r = await store.overwrite(target, body.text ?? '', body.version)
-      // 版本冲突(面板打开期间被别的进程写过)→ 409 + 当前盘上内容/版本,交由前端三方合并。
-      if (r.conflict) {
+      // memdir:索引由 reconcileIndex 自愈,不接受整段手写覆盖。单条改走 files/:file。
+      return this.sendError(res, 410, 'memory index is auto-managed; edit memory/<file> instead')
+    }
+    this.sendError(res, 405, 'method not allowed')
+  }
+
+  // GET    /api/agents/:id/memory/files/:file → { file, content, version } | 404
+  // PUT    /api/agents/:id/memory/files/:file  body { content, version? } → { ok, version } | 409 | 400
+  // DELETE /api/agents/:id/memory/files/:file → { ok } | 404
+  //
+  // 单条记忆文件的 CRUD。文件名双保险:路由已限 [^/],这里再过 MEMORY_FILE_RE(防 `..`
+  // 及非法字符穿越)——「API 层拒绝非法名」是读侧安全权威之一(见设计契约§安全)。
+  private async handleMemoryFile(
+    req: IncomingMessage,
+    res: ServerResponse,
+    agentId: string,
+    file: string,
+  ): Promise<void> {
+    if (isHiddenSystemAgentId(agentId)) return this.sendError(res, 404, 'agent not found')
+    const safe = basename(file)
+    if (safe !== file || !MEMORY_FILE_RE.test(safe)) {
+      return this.sendError(res, 400, 'invalid memory file name')
+    }
+    const md = new MemoryDir(agentId)
+    if (req.method === 'GET') {
+      await md.ensureMigrated()
+      const hit = await md.read(safe)
+      if (!hit) return this.sendError(res, 404, 'memory file not found')
+      this.sendJson(res, 200, { file: safe, content: hit.content, version: hit.version })
+      return
+    }
+    if (req.method === 'PUT') {
+      const body = await this.readJsonBody<{ content?: string; version?: string }>(req)
+      const r = await md.write(safe, body.content ?? '', body.version)
+      if (r.ok) {
+        this.sendJson(res, 200, { ok: true, file: safe, version: r.version })
+        return
+      }
+      // 版本冲突结构对齐 user 路由:{ error, conflict:{ text, version } }。三态 union 用 'conflict' in r 判别。
+      if ('conflict' in r) {
         return this.sendJson(res, 409, {
           error: 'memory conflict',
-          conflict: { ...r.conflict, limit: store.charLimit(target) },
+          conflict: { text: r.conflict.current, version: r.conflict.version },
         })
       }
-      if (!r.ok) return this.sendError(res, 400, r.error ?? 'save failed')
-      this.sendJson(res, 200, {
-        ok: true,
-        charCount: store.charCount(target),
-        limit: store.charLimit(target),
-        version: store.version(target),
-      })
+      return this.sendError(res, 400, r.error ?? 'save failed')
+    }
+    if (req.method === 'DELETE') {
+      const removed = await md.remove(safe)
+      if (!removed) return this.sendError(res, 404, 'memory file not found')
+      this.sendJson(res, 200, { ok: true, file: safe })
       return
     }
     this.sendError(res, 405, 'method not allowed')
