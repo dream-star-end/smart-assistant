@@ -41,6 +41,7 @@ import type { Pool } from "pg";
 import { verifyAccess, JwtError, type AccessClaims } from "../auth/jwt.js";
 import { ConnectionRegistry, type Conn } from "./connections.js";
 import type { Logger } from "../logging/logger.js";
+import { recordTurnTrace } from "./turnTraces.js";
 import { isInMaintenance } from "../middleware/maintenanceMode.js";
 import type { NodeAgentTarget } from "../compute-pool/nodeAgentClient.js";
 import {
@@ -2050,6 +2051,30 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             // CG2b — turnLog 派生:traceId 钉进 bindings,后续 turn 内 log 自动带上
             turnLogForFrame = bridgeLog?.child({ traceId: turnTraceIdForFrame }) ?? null;
             turnLogForFrame?.info("user-chat-bridge: inbound turn start", clientTraceFields);
+            // CG2d — traceId 唯一持久登记(fire-and-forget):UI 底部展示的请求ID就是
+            // 这个 traceId,不落库运维就无从定位(usage_records.request_id 是上游 id,
+            // 另一套 id 空间)。sessionKey 派生与 hello replay 路径同一约定
+            // (gateway server.ts sanitisation verbatim:agent:<aid>:webchat:dm:<safeId>)。
+            {
+              const peerObj = (parsed as { peer?: { id?: unknown } }).peer;
+              const peerIdRaw =
+                peerObj && typeof peerObj === "object" ? peerObj.id : undefined;
+              const traceSessionKey =
+                typeof peerIdRaw === "string" && peerIdRaw !== ""
+                  ? `agent:${effectiveFrameAgentId}:webchat:dm:${peerIdRaw.replace(/[^a-zA-Z0-9_-]/g, "_")}`
+                  : "(unknown-peer)";
+              recordTurnTrace(
+                deps.pgPool,
+                (msg, fields) => turnLogForFrame?.warn(msg, fields),
+                {
+                  traceId: turnTraceIdForFrame,
+                  userId: uid,
+                  sessionKey: traceSessionKey,
+                  agentId: effectiveFrameAgentId,
+                  model: effectiveModelForFrame,
+                },
+              );
+            }
             // turn 在飞起点:用户已发消息在等响应,心跳在 turn 期间不得 reap(见 MAX_TURN_GRACE_MS 硬上限)。
             turnActiveUntil = Date.now() + MAX_TURN_GRACE_MS;
           }
