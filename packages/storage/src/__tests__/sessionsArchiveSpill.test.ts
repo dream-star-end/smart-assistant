@@ -427,3 +427,44 @@ describe('增量协议兼容', () => {
     }
   })
 })
+
+describe('deleteClientSession — 归档级联清理', () => {
+  it('软删会话同事务清空 archive_chunks/archived_ids,不再留孤儿', async () => {
+    const { deleteClientSession } = await import('../sessionsDb.js')
+    const N = 300
+    const session = {
+      id: 'web-del-cascade', userId: USER, agentId: 'main', title: 't', pinned: false,
+      createdAt: 1, lastAt: 2, messages: makeMsgs(N, 11 * 1024), updatedAt: 1000,
+    }
+    assert.equal(await upsertClientSession(session, 0), 'applied')
+    const db = await getSessionsDb()
+    const countArchive = () => ({
+      chunks: (db.prepare('SELECT count(*) AS n FROM client_session_archive_chunks WHERE session_id = ?').get('web-del-cascade') as { n: number }).n,
+      ids: (db.prepare('SELECT count(*) AS n FROM client_session_archived_ids WHERE session_id = ?').get('web-del-cascade') as { n: number }).n,
+    })
+    const before = countArchive()
+    assert.ok(before.chunks > 0 && before.ids > 0, '前置:确实产生了归档')
+
+    assert.equal(await deleteClientSession('web-del-cascade', USER), true)
+    const after = countArchive()
+    assert.equal(after.chunks, 0, 'chunk 行级联清空')
+    assert.equal(after.ids, 0, 'id 行级联清空')
+
+    // 幂等:重复删除返回 false(主行已软删)且不抛
+    assert.equal(await deleteClientSession('web-del-cascade', USER), false)
+  })
+
+  it('删除不存在的会话:false 且不影响其它会话归档', async () => {
+    const { deleteClientSession } = await import('../sessionsDb.js')
+    const N = 300
+    const session = {
+      id: 'web-del-other', userId: USER, agentId: 'main', title: 't', pinned: false,
+      createdAt: 1, lastAt: 2, messages: makeMsgs(N, 11 * 1024), updatedAt: 1000,
+    }
+    assert.equal(await upsertClientSession(session, 0), 'applied')
+    assert.equal(await deleteClientSession('web-no-such-row', USER), false)
+    const db = await getSessionsDb()
+    const n = (db.prepare('SELECT count(*) AS n FROM client_session_archive_chunks WHERE session_id = ?').get('web-del-other') as { n: number }).n
+    assert.ok(n > 0, '旁会话归档不受影响')
+  })
+})
