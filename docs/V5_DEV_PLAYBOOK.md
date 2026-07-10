@@ -96,11 +96,13 @@ npm run test:commercial:unit                        # 本机缺 PG/Redis 会有 
 npm run test:commercial:unit 2>&1 | grep '^not ok' | sed 's/^not ok [0-9]* - //' | sort > /tmp/fails-{base,mine}.txt
 diff /tmp/fails-base.txt /tmp/fails-mine.txt
 ```
-⚠️ **全量跑法本地可能环境性挂死**(整套挤一个 node 进程,一个文件僵住堵死全部;症状=进程活着但 CPU 时间几乎不走,2026-07-10 实测 2h 只走 6s)。挂死就换**逐文件 sweep**(粒度降为失败文件集,gate 语义不变):
+⚠️ **本机挂死根因已定位并机制化收口(2026-07-10)**:全机所有 worktree 的 commercial 测试共享同一个 `*_test` PG 库(TRUNCATE...CASCADE 重置)——**多会话/多树并发跑必互相截断+锁等待,表现为测试挂死而非快速失败**;叠加 `timeout npx tsx` 只杀 npx 包装、node 子进程成孤儿抱着 PG 连接/端口不放,机器进入"中毒"状态,之后任何单跑也会挂。收口 = `scripts/with-test-lock.sh`(机器级 flock 互斥 + set -m 进程组退出全清),`test:commercial:unit|integ` 已内建——**并发时后来者自动排队(stderr 有持锁者提示),不再互相锁死**。
 ```bash
+# 若仍需逐文件 sweep(定位具体挂死文件),必须经 wrapper 跑,否则 timeout 会再造孤儿:
 find packages/commercial/src -name '*.test.ts' ! -name '*.integ.test.ts' | sort | \
-  xargs -P4 -I{} bash -c 'timeout 90 npx tsx --test --test-force-exit "{}" >/dev/null 2>&1 || echo "{}"' | sort
-# 两棵树各跑一次,comm -23 mine base 必须为空
+  xargs -I{} bash -c 'timeout 120 bash scripts/with-test-lock.sh npx tsx --test --test-force-exit "{}" >/dev/null 2>&1 || echo "{}"' | sort
+# 两棵树各跑一次,comm -23 mine base 必须为空。禁 -P 并行(全局锁下无收益)。
+# 疑似已中毒(跑啥都挂)先清场:ps -eo pid,etime,args | grep 'node.*--test'(etime 分钟级=孤儿)→ kill
 ```
 - 测试必须是**行为断言**(帧序列驱动 reducer/mock WS/真 DB),不是对源码文本的 regex(那只能防删行,防不了行为)。prompt 驱动的行为(团队模式规则等)本质不可单测——这是设计信号,应改为代码硬编排,而不是写 regex 测试。
 - lint 红线:**不跑 biome --write 全文件 reformat**;只手工修自己引入的违规。
