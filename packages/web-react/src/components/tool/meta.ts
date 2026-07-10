@@ -139,6 +139,25 @@ export function detectOcCli(command: string | undefined | null): string | null {
   return m ? (m[1] ?? null) : null;
 }
 
+// ── 记忆写入重标(单一权威)──
+//
+// memdir 范式下,CCB/codex 引擎用原生 Write/Edit 直接写记忆文件(容器内 CLAUDE_CODE_DISABLE_AUTO_MEMORY),
+// 不再走已退役的 oc-memory memory 子命令。凡写入命中「记忆目录 / MEMORY.md 索引 / 共享 user.md 画像」
+// → header 重标「记忆更新」(Brain 图标 + 语义标签),正文沿用 Write/Edit 的 diff 展示(body 分派仍按
+// 原 toolName)。此常量是该重标的**唯一 meta 权威**(定位同 OC_TOOLS 之于 oc-* CLI):不散落各处。
+export const MEMORY_UPDATE_META: ToolMeta = { icon: Brain, label: "记忆更新", tone: "accent" };
+
+/** 路径是否命中 agent 记忆(memdir 记忆文件 / MEMORY.md 索引 / 共享 user.md 画像)。记忆写入重标的唯一判定。 */
+export function isMemoryFilePath(filePath: string | undefined | null): boolean {
+  if (!filePath) return false;
+  const p = String(filePath);
+  return (
+    /(^|\/)\.openclaude\/agents\/[^/]+\/memory\//.test(p) || // memdir 记忆文件
+    /(^|\/)\.openclaude\/agents\/[^/]+\/MEMORY\.md$/.test(p) || // MEMORY.md 索引
+    /(^|\/)\.openclaude\/user\.md$/i.test(p) // 共享用户画像
+  );
+}
+
 // ── MCP server 前缀 → 友好 meta（图标 + 基础标签 + tone）──
 // 工具名形如 `mcp__<server>__<op>`，先按 server 分类，再按 op 细化。
 const MCP_SERVER_META: Record<string, ToolMeta> = {
@@ -253,12 +272,20 @@ export function resolveToolMeta(
   // Bash 命令若调用 oc-* CLI,给专属语义卡而非通用"终端"卡。
   if (name === "Bash" && input) {
     const command = asStr(input.command);
-    if (detectShellFileWrites(command)) return TOOL_META.Write;
+    const fileWrite = detectShellFileWrites(command);
+    if (fileWrite) {
+      // 写入记忆文件(heredoc 写 MEMORY.md/记忆目录等)→ 记忆更新;否则普通写入文件。
+      return fileWrite.paths.some(isMemoryFilePath) ? MEMORY_UPDATE_META : TOOL_META.Write;
+    }
     const cli = detectOcCli(command);
     if (cli) {
       const ocMeta = OC_TOOLS[cli as OcCli];
       if (ocMeta) return ocMeta;
     }
+  }
+  // 原生 Write/Edit 写入记忆文件 → 重标「记忆更新」(body 仍按 Write/Edit 走 diff 展示)。
+  if ((name === "Write" || name === "Edit") && isMemoryFilePath(asStr(input?.file_path))) {
+    return MEMORY_UPDATE_META;
   }
   if (TOOL_META[name]) return TOOL_META[name];
   const codexType = parseCodexTypeName(name);

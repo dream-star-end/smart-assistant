@@ -39,6 +39,9 @@ import type {
   MemoryDocResponse,
   MemoryConflict,
   PutMemoryResult,
+  MemoryIndexResponse,
+  MemoryFileContent,
+  PutMemoryFileResult,
   PaymentOrder,
   PaymentPlan,
   Preferences,
@@ -1209,10 +1212,10 @@ export const api = {
   // (127.0.0.1:18789，按 userId 隔离)。前端只需普通 Bearer fetch，无需特殊 header。
   // 容器未就绪时 router 会先 ensureContainerReady（可能冷启 ~40s），失败返 503/4503。
 
-  /** 取某 agent 的记忆文档（GET /api/agents/:id/memory/:target，target=memory|user）。
-   *  limit = 该 target 的字符预算（权威源在后端 DEFAULT_LIMITS，前端只做展示）；
-   *  version = 乐观锁令牌，PUT 时回传以检测并发写。 */
-  getMemory: (a: AuthSession, agentId: string, target: "memory" | "user") =>
+  /** 取用户画像文档（GET /api/agents/:id/memory/user）。
+   *  用户画像 = 共享的 user.md,单文档纯 markdown;limit = 字符预算(后端权威,前端展示)；
+   *  version = 乐观锁令牌,PUT 回传以检测并发写。核心记忆走 getMemoryIndex/文件子路由。 */
+  getMemory: (a: AuthSession, agentId: string, target: "user") =>
     jsonOrThrow<MemoryDocResponse>(
       callWithRefresh(a, (t) =>
         fetch(`/api/agents/${encodeURIComponent(agentId)}/memory/${target}`, {
@@ -1223,15 +1226,14 @@ export const api = {
     ),
 
   /**
-   * 写某 agent 的记忆文档（PUT /api/agents/:id/memory/:target）。
-   * 带乐观锁 version：后端在 version 落后时返 409 `{ conflict }`（智能体在用户
-   * 编辑期间改了记忆）。409 不当作错误抛，解析 conflict 交回上层做条目级并入；
-   * 其余非 2xx 仍走统一 ApiError。返回判别式结果，成功回传新 version。
+   * 写用户画像文档（PUT /api/agents/:id/memory/user）。核心记忆 PUT 已 410(改文件子路由)。
+   * 带乐观锁 version：后端在 version 落后时返 409 `{ conflict }`（智能体在用户编辑期间改了画像）。
+   * 409 不当作错误抛,解析 conflict 交回上层刷新基线；其余非 2xx 仍走统一 ApiError。
    */
   putMemory: async (
     a: AuthSession,
     agentId: string,
-    target: "memory" | "user",
+    target: "user",
     text: string,
     version?: string,
   ): Promise<PutMemoryResult> => {
@@ -1262,6 +1264,83 @@ export const api = {
     }
     const out = await jsonOrThrow<{ ok: boolean; version: string; charCount?: number; limit?: number }>(res);
     return { ok: true, version: out.version, charCount: out.charCount, limit: out.limit };
+  },
+
+  /** 取某 agent 的核心记忆索引 + 文件列表（GET /api/agents/:id/memory/memory）。
+   *  memdir 范式:返回只读索引文本 + 每条记忆文件的元数据(name/description/type/mtime)。
+   *  正文按需经 getMemoryFile 单取(渐进披露,不一次拉全部正文)。 */
+  getMemoryIndex: (a: AuthSession, agentId: string) =>
+    jsonOrThrow<MemoryIndexResponse>(
+      callWithRefresh(a, (t) =>
+        fetch(`/api/agents/${encodeURIComponent(agentId)}/memory/memory`, {
+          credentials: "include",
+          headers: bearerHeaders(t),
+        }),
+      ),
+    ),
+
+  /** 取单个记忆文件正文（GET /api/agents/:id/memory/files/:file）。version=乐观锁令牌。 */
+  getMemoryFile: (a: AuthSession, agentId: string, file: string) =>
+    jsonOrThrow<MemoryFileContent>(
+      callWithRefresh(a, (t) =>
+        fetch(
+          `/api/agents/${encodeURIComponent(agentId)}/memory/files/${encodeURIComponent(file)}`,
+          { credentials: "include", headers: bearerHeaders(t) },
+        ),
+      ),
+    ),
+
+  /**
+   * 写单个记忆文件（PUT /api/agents/:id/memory/files/:file，body `{ content, version? }`）。
+   * 新建传 version=undefined(不做版本校验)；编辑带 version 做乐观锁。version 落后 → 409
+   * `{ conflict:{ content|current|text, version } }`(文件已被别处修改):不当错误抛,交回上层
+   * 刷新基线并保留用户未保存文本。其余非 2xx 走统一 ApiError。
+   */
+  putMemoryFile: async (
+    a: AuthSession,
+    agentId: string,
+    file: string,
+    content: string,
+    version?: string,
+  ): Promise<PutMemoryFileResult> => {
+    const res = await callWithRefresh(a, (t) =>
+      fetch(
+        `/api/agents/${encodeURIComponent(agentId)}/memory/files/${encodeURIComponent(file)}`,
+        {
+          method: "PUT",
+          credentials: "include",
+          headers: bearerHeaders(t, true),
+          body: JSON.stringify(version !== undefined ? { content, version } : { content }),
+        },
+      ),
+    );
+    if (res.status === 409) {
+      const body = (await res.json().catch(() => null)) as {
+        conflict?: { content?: string; current?: string; text?: string; version?: unknown };
+      } | null;
+      const c = body?.conflict;
+      // 存储层 conflict 用 `current`,路由若对齐 user 用 `text`,一律兼容取正文。
+      const latest = c ? (c.content ?? c.current ?? c.text) : undefined;
+      if (c && typeof latest === "string") {
+        return { ok: false, conflict: { content: latest, version: String(c.version ?? "") } };
+      }
+      throw new ApiError({ status: 409, message: withReqId("记忆文件写入冲突", res), body });
+    }
+    const out = await jsonOrThrow<{ ok: boolean; version: string }>(res);
+    return { ok: true, version: out.version };
+  },
+
+  /** 删除单个记忆文件（DELETE /api/agents/:id/memory/files/:file）。返回是否删除成功。 */
+  deleteMemoryFile: async (a: AuthSession, agentId: string, file: string): Promise<boolean> => {
+    const out = await jsonOrThrow<{ ok?: boolean; deleted?: boolean }>(
+      callWithRefresh(a, (t) =>
+        fetch(
+          `/api/agents/${encodeURIComponent(agentId)}/memory/files/${encodeURIComponent(file)}`,
+          { method: "DELETE", credentials: "include", headers: bearerHeaders(t) },
+        ),
+      ),
+    );
+    return out.deleted ?? out.ok ?? true;
   },
 
   /** 定时任务列表（GET /api/cron）。 */

@@ -534,9 +534,12 @@ export type CronCreateInput = {
   agent?: string;
 };
 
-// ── 记忆文档（GET/PUT /api/agents/:id/memory/:target） ──────────────────────
+// ── 用户画像文档（GET/PUT /api/agents/:id/memory/user） ─────────────────────
+//
+// 用户画像 = 共享的 `~/.openclaude/user.md`(所有智能体通用),去 § 化后是单文档纯
+// markdown,单文本编辑 + 乐观锁 409。核心记忆已改为 memdir 文件列表(见下方 Memory* 类型)。
 
-/** 记忆文档读取响应（version 为乐观锁令牌，PUT 回传以检测并发写）。 */
+/** 用户画像读取响应（version 为乐观锁令牌，PUT 回传以检测并发写）。 */
 export type MemoryDocResponse = {
   target: string;
   text: string;
@@ -546,16 +549,59 @@ export type MemoryDocResponse = {
   limit?: number;
 };
 
-/** 记忆写入冲突（后端 409：智能体在用户编辑期间改动了记忆）。 */
+/** 用户画像写入冲突（后端 409：智能体在用户编辑期间改动了画像）。 */
 export type MemoryConflict = { text: string; version: string; charCount: number; limit: number };
 
 /**
- * PUT 记忆结果：成功带新 version（更新基线），或 409 冲突数据（触发条目级并入）。
+ * PUT 用户画像结果：成功带新 version（更新基线），或 409 冲突数据（刷新基线后以用户版本为准）。
  * 用判别式 `ok` 分流，让上层无需 catch 也能区分「写成功」与「版本冲突」。
  */
 export type PutMemoryResult =
   | { ok: true; version: string; charCount?: number; limit?: number }
   | { ok: false; conflict: MemoryConflict };
+
+// ── 核心记忆 memdir（GET/PUT/DELETE /api/agents/:id/memory/{memory,files/:file}） ──
+//
+// 核心记忆改为「每条一个 frontmatter 文件 + MEMORY.md 纯索引」(memdir 范式)。
+//  - GET .../memory/memory → 索引文本 + 文件元数据列表(kind='index')；
+//  - GET/PUT/DELETE .../memory/files/:file → 逐文件正文读写删,PUT 带乐观锁 version。
+
+/** memdir 单个记忆文件的元数据（来自后端逐文件解析 frontmatter；version 由 GET file 单取）。 */
+export type MemoryFileMeta = {
+  /** 磁盘文件名（如 `user-preferences.md`），路由 :file 段。 */
+  file: string;
+  /** frontmatter `name`（缺省回落文件名）。 */
+  name: string;
+  /** frontmatter `description`（一句话摘要，决定未来会话是否召回）。 */
+  description: string;
+  /** frontmatter `type`：user | feedback | project | reference。 */
+  type: string;
+  /** 最近修改时间（epoch ms），前端做相对时间展示。 */
+  mtimeMs: number;
+  /** 文件字节大小。 */
+  size: number;
+};
+
+/** GET .../memory/memory 响应：只读索引文本 + 文件列表（core 记忆改列表后不再是可编辑 blob）。 */
+export type MemoryIndexResponse = {
+  kind: "index";
+  /** MEMORY.md 索引正文（首行 marker + 每条一行钩子），只读折叠预览。 */
+  text: string;
+  files: MemoryFileMeta[];
+  /** 索引乐观锁版本（当前 UI 不写索引，保留兼容）。 */
+  version?: string;
+};
+
+/** GET .../memory/files/:file 响应：正文 + 乐观锁 version（sha256 前 16 位）。 */
+export type MemoryFileContent = { content: string; version: string };
+
+/** PUT 记忆文件 409 冲突：文件已被别处修改，携最新正文与 version 供刷新基线。 */
+export type MemoryFileConflict = { content: string; version: string };
+
+/** PUT 记忆文件结果：成功带新 version，或 409 冲突（刷新基线后重存）。 */
+export type PutMemoryFileResult =
+  | { ok: true; version: string }
+  | { ok: false; conflict: MemoryFileConflict };
 
 /** 技能列表项（GET /api/skills 的 skills 项）。 */
 export type SkillSummary = {

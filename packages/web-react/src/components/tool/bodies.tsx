@@ -9,12 +9,7 @@ import { Sparkles, FileText } from "lucide-react";
 import type { ReactNode } from "react";
 import { cn } from "../../lib/utils";
 import { Badge, Button } from "../ui";
-import {
-  MemoryStatusCard,
-  ReminderStatusCard,
-  renderMemoryReadCards,
-  renderReminderListCard,
-} from "./memoryReminderCards";
+import { ReminderStatusCard, renderReminderListCard } from "./memoryReminderCards";
 import { useToolCardActions } from "./context";
 import {
   asArr,
@@ -591,7 +586,8 @@ function MemoryBody({ op, input, tool }: BodyProps & { op: string }) {
   }
 
   const btns: ReactNode[] = [];
-  if (["memory", "archival_add", "archival_search", "session_search"].includes(op) && actions.onOpenMemory) {
+  // 注:核心记忆 `memory` op 已退役(改 memdir 文件写入);深层召回(archival/session_search)仍导向记忆中心。
+  if (["archival_add", "archival_search", "session_search"].includes(op) && actions.onOpenMemory) {
     btns.push(
       <Button key="mem" variant="ghost" size="sm" onClick={actions.onOpenMemory}>
         打开记忆中心
@@ -618,16 +614,6 @@ function MemoryBody({ op, input, tool }: BodyProps & { op: string }) {
     body = renderReminderListCard(tool.output) ?? <OutputBlock output={tool.output} />;
   } else if (["create_reminder", "update_reminder", "delete_reminder"].includes(op)) {
     body = <ReminderStatusCard op={op} input={input} output={tool.output} error={!!tool.error} />;
-  } else if (op === "memory") {
-    const action = asStr(input?.action) || asStr(input?.op) || "read";
-    const target = input?.target ?? input?.section;
-    if (action === "read") {
-      body = renderMemoryReadCards(tool.output, target) ?? <OutputBlock output={tool.output} />;
-    } else if (["add", "replace", "remove"].includes(action)) {
-      body = <MemoryStatusCard action={action} target={target} output={tool.output} error={!!tool.error} />;
-    } else {
-      body = <KvList obj={{ action, target, content: input?.content, needle: input?.needle }} />;
-    }
   } else if (op === "delegate_task" || op === "send_to_agent") {
     body = (
       <KvList
@@ -647,7 +633,7 @@ function MemoryBody({ op, input, tool }: BodyProps & { op: string }) {
   return (
     <>
       {body}
-      {!["memory", "create_reminder", "list_reminders", "update_reminder", "delete_reminder"].includes(op) && (
+      {!["create_reminder", "list_reminders", "update_reminder", "delete_reminder"].includes(op) && (
         <OutputBlock output={tool.output} />
       )}
       {btns.length > 0 && <div className="mt-2 flex flex-wrap gap-2">{btns}</div>}

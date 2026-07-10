@@ -654,49 +654,8 @@ describe("ToolCard 二级分派 + 状态 (P5)", () => {
     if (misleading) expect(document.body.textContent || "").not.toContain(misleading);
   });
 
-  test("openclaude-memory memory(add) 失败时读取 tool.error，不把裸错误输出显示成成功", () => {
-    render(
-      <ToolCard
-        message={{
-          toolName: "mcp__openclaude-memory__memory",
-          inputJson: { action: "add", target: "memory", content: "bad" },
-          output: "rejected: prompt injection pattern",
-          error: true,
-          _completed: true,
-        }}
-      />,
-    );
-    fireEvent.click(screen.getByRole("button"));
-    expect(screen.getByText("新增记忆失败")).toBeInTheDocument();
-    expect(document.body.textContent || "").toContain("rejected: prompt injection pattern");
-    expect(document.body.textContent || "").not.toContain("已新增核心记忆");
-  });
-
-  test("openclaude-memory memory(read) 输出显示为记忆卡片", () => {
-    const started = {
-      type: "mcpToolCall",
-      id: "call_memory_read",
-      server: "openclaude_memory",
-      tool: "memory",
-      status: "inProgress",
-      arguments: { action: "read", target: "user" },
-    };
-    const text = "用户称呼：dengxuan\n§\n项目访问信息：\n- URL: https://example.com";
-    render(
-      <ToolCard
-        message={{
-          toolName: "codex:mcpToolCall",
-          inputJson: started,
-          output: JSON.stringify({ ...started, status: "completed", result: { content: [{ type: "text", text }] } }),
-          _completed: true,
-        }}
-      />,
-    );
-    fireEvent.click(screen.getByRole("button"));
-    expect(screen.getByText("用户画像 · 2 条")).toBeInTheDocument();
-    expect(screen.getByText("用户称呼")).toBeInTheDocument();
-    expect(screen.getByText("项目访问信息")).toBeInTheDocument();
-    expect(document.body.textContent || "").not.toContain("§");
-  });
+  // 注:openclaude-memory `memory` 读/写状态卡已随核心记忆 memdir 化退役(后端 handleMemory
+  // 退役 + 前端 §-blob 记忆卡删除),记忆读写现由记忆中心文件列表 + Write/Edit「记忆更新」卡承载;
+  // 历史会话里的 memory op 退化为通用 KvList 展示,故此处不再有专属卡断言。
 
 });
