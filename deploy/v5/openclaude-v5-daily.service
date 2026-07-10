@@ -1,10 +1,13 @@
 # v5 日检 + 日报(roadmap P0.3 监控告警最小集)—— 每天 09:00 北京时间由
 # openclaude-v5-daily.timer 触发 scripts/v5-daily-check.sh:计费突增/免单率/
 # 活跃度/错误日志统计,无告警也发一条日报站内信给 boss。
+# 自监(方案 §2.3-3):脚本自身崩/超时/非 0 退出时,OnFailure 拉起 alert-fail 模板,
+# 对本单元做 outbox+inbox 双写告警。依赖 openclaude-v5-alert-fail@.service 已手动安装。
 [Unit]
 Description=OpenClaude v5 daily check (billing anomalies + daily report)
 After=network.target postgresql.service
 Wants=postgresql.service
+OnFailure=openclaude-v5-alert-fail@%n.service
 
 [Service]
 Type=oneshot

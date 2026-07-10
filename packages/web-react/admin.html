@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <meta name="theme-color" content="#ffffff" />
+    <meta name="description" content="OpenClaude 管理后台" />
+    <!-- 运维后台:不进搜索引擎索引。 -->
+    <meta name="robots" content="noindex, nofollow" />
+    <title>OpenClaude · 管理后台</title>
+    <link rel="icon" type="image/svg+xml" href="/icons/icon.svg" />
+    <!-- 首帧前主题预置:与用户端 index.html 同款,读同一 localStorage key(oc_theme),
+         避免暗色管理员首屏地址栏/画布闪白。不注册 Service Worker(admin/main.tsx 内也不注册)。 -->
+    <script>
+      try {
+        var t = localStorage.getItem("oc_theme") || "system";
+        var dark = t === "dark" || (t === "system" && matchMedia("(prefers-color-scheme: dark)").matches);
+        if (dark) {
+          document.documentElement.classList.add("dark");
+          var tc = document.querySelector('meta[name="theme-color"]');
+          if (tc) tc.setAttribute("content", "#0c0c11");
+        }
+      } catch (e) {}
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/admin/main.tsx"></script>
+  </body>
+</html>

@@ -27,6 +27,7 @@ const GROUPS = new Set([
   "health",
   "security",
   "system",
+  "ops",
 ]);
 const TRIGGERS = new Set(["polled", "passive", "both"]);
 const EVENT_TYPE_RE = /^[a-z][a-z0-9_]*\.[a-z0-9_]+$/;
@@ -99,5 +100,15 @@ describe("alertEvents — EVENT_META", () => {
       const prefix = m.event_type.split(".")[0];
       assert.equal(prefix, m.group, `${m.event_type} prefix mismatches group ${m.group}`);
     }
+  });
+
+  test("ops.* 运维事件已登记(shell 监控统一送达)", () => {
+    // 系统 A(v5-monitor.sh / v5-daily-check.sh)psql 直插 outbox 的 4 个事件
+    // 必须在目录里,否则 admin「事件目录/覆盖率」看不到、通道无法订阅它们。
+    assert.equal(eventMetaFor(EVENTS.OPS_MONITOR_CHECK_FAILED)?.group, "ops");
+    assert.equal(eventMetaFor(EVENTS.OPS_MONITOR_CHECK_FAILED)?.severity, "critical");
+    assert.equal(eventMetaFor(EVENTS.OPS_MONITOR_RECOVERED)?.severity, "info");
+    assert.equal(eventMetaFor(EVENTS.OPS_DAILY_ANOMALY)?.severity, "warning");
+    assert.equal(eventMetaFor(EVENTS.OPS_DAILY_REPORT)?.severity, "info");
   });
 });

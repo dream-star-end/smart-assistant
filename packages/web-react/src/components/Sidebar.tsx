@@ -1,4 +1,4 @@
-import { Building2, LayoutGrid, LogOut, PanelLeftClose, Pencil, Plus, Search, Sparkles, Store, Trash2 } from "lucide-react";
+import { Building2, LayoutGrid, LogOut, PanelLeftClose, Pencil, Plus, Search, ShieldCheck, Sparkles, Store, Trash2 } from "lucide-react";
 import { useMemo, useState } from "react";
 import { BRAND } from "../lib/brand";
 import type { Session, User } from "../lib/types";
@@ -20,6 +20,7 @@ export function Sidebar({
   onOpenManage,
   onOpenMarketplace,
   onOpenOrg,
+  showAdmin,
 }: {
   sessions: Session[];
   activeId?: string;
@@ -39,6 +40,8 @@ export function Sidebar({
   onOpenMarketplace?: () => void;
   /** 打开组织中心（企业版）。仅 org owner/admin 提供，省略则不渲染入口。 */
   onOpenOrg?: () => void;
+  /** 平台超管入口。仅 user.role === 'admin' 时为 true，false/省略则不渲染。 */
+  showAdmin?: boolean;
 }) {
   const [q, setQ] = useState("");
 
@@ -119,6 +122,17 @@ export function Sidebar({
             组织
             <span className="ml-auto text-[11px] text-faint">成员 · 报表 · 发票</span>
           </button>
+        )}
+
+        {showAdmin && (
+          <a
+            href="/admin.html"
+            className="flex items-center gap-2.5 rounded-lg px-3 py-2 text-left text-[13.5px] font-medium text-muted outline-none transition-colors hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
+          >
+            <ShieldCheck size={16} className="text-faint" />
+            管理后台
+            <span className="ml-auto text-[11px] text-faint">平台运维</span>
+          </a>
         )}
       </div>
 

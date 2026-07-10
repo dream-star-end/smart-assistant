@@ -18,7 +18,7 @@ export interface EventMeta {
   /** 事件默认严重度(enqueue 时一般用这个,个别场景可覆盖) */
   severity: Severity;
   /** 人类可读分组,前端按此排列 */
-  group: "account_pool" | "payment" | "container" | "risk" | "health" | "security" | "system";
+  group: "account_pool" | "payment" | "container" | "risk" | "health" | "security" | "system" | "ops";
   /** 简短描述,UI tooltip */
   description: string;
   /** 触发方式:polled=轮询 scheduler;passive=代码路径被动 enqueue;both=两者都有 */
@@ -75,6 +75,15 @@ export const EVENTS = {
   // ── 健康(P3.2 provider 健康度自动探测)────────────────────
   PROVIDER_DEGRADED: "health.provider_degraded",
   PROVIDER_RECOVERED: "health.provider_recovered",
+
+  // ── 运维(4;由 shell 监控 systemd timer 周期写入 outbox,统一送达)──
+  // 系统 A(v5-monitor.sh / v5-daily-check.sh / v5-alert-fail@.service)不经
+  // TS enqueueAlert,而是 psql 直插 outbox(见 scripts/v5-alert-fanout.sql)。
+  // 登记进目录让「事件目录/覆盖率」UI 能展示、能被通道订阅 / 静默匹配。
+  OPS_MONITOR_CHECK_FAILED: "ops.monitor_check_failed",
+  OPS_MONITOR_RECOVERED: "ops.monitor_recovered",
+  OPS_DAILY_ANOMALY: "ops.daily_anomaly",
+  OPS_DAILY_REPORT: "ops.daily_report",
 } as const;
 
 export const EVENT_META: EventMeta[] = [
@@ -139,6 +148,17 @@ export const EVENT_META: EventMeta[] = [
     description: "上游服务商自动判定为降级(近窗口失败率/连续失败达阈值,60s 轮询;默认影子模式仅标注,OC_PROVIDER_HEALTH_ENFORCE=1 才 503 拦截)", trigger: "polled" },
   { event_type: EVENTS.PROVIDER_RECOVERED, severity: "info", group: "health",
     description: "上游服务商健康恢复(恢复窗口失败率回落且有成功样本)", trigger: "polled" },
+
+  // ops(系统 A shell 监控周期写入;trigger=polled 表示"周期性外部监控",
+  // 非 TS scheduler。severity 为目录默认值,monitor 按检查项覆盖传入实际等级)
+  { event_type: EVENTS.OPS_MONITOR_CHECK_FAILED, severity: "critical", group: "ops",
+    description: "v5 高频探活(每 2min)某检查项失败(标题含检查项名);severity 由 v5-monitor.sh 按项传入(服务/HTTP/池/镜像=critical,磁盘/内存=warning)", trigger: "polled" },
+  { event_type: EVENTS.OPS_MONITOR_RECOVERED, severity: "info", group: "ops",
+    description: "v5 高频探活某检查项从异常恢复", trigger: "polled" },
+  { event_type: EVENTS.OPS_DAILY_ANOMALY, severity: "warning", group: "ops",
+    description: "v5 日检异常(计费突增 / 免单率超标 / 取数失败),每日北京时间 09:00", trigger: "polled" },
+  { event_type: EVENTS.OPS_DAILY_REPORT, severity: "info", group: "ops",
+    description: "v5 每日运行日报(活跃度 / 计费量 / 错误日志),无异常也发", trigger: "polled" },
 ];
 
 export const ALL_EVENT_TYPES: string[] = EVENT_META.map((e) => e.event_type);

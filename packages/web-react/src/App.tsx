@@ -1179,6 +1179,9 @@ export function App() {
     onLogout: demo ? undefined : logout,
     onOpenManage: demo ? undefined : () => openManage("memory"),
     onOpenMarketplace: demo ? undefined : () => openMarketplace("browse"),
+    // 管理后台入口:仅平台超管(user.role === 'admin')可见,导航到 React 管理后台
+    // (web-react 第二 Vite 入口 /admin.html)。非 admin / demo 一律不渲染。
+    showAdmin: !demo && user?.role === "admin",
     // 组织入口:仅 org owner/admin 可见(成员无管理面,只在设置·账户页只读展示归属)。
     onOpenOrg:
       demo || !(user?.org && (user.org.role === "owner" || user.org.role === "admin"))
