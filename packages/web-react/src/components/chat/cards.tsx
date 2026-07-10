@@ -32,6 +32,7 @@ import {
   isLive,
   stripMarkdown,
 } from "../../lib/chat/render";
+import { sanitizeThinkingText } from "../../lib/thinkingText";
 import { cn, groupDigits } from "../../lib/utils";
 import { Markdown } from "../Markdown";
 import { Alert, Avatar, Badge, Button, IconButton } from "../ui";
@@ -420,6 +421,7 @@ export function ThinkingCard({
   const live = isLive(msg, ctx);
   const [userCollapsed, setUserCollapsed] = useState<boolean | null>(null);
   const collapsed = userCollapsed ?? defaultCollapsed(msg, ctx);
+  const cleanText = msg.text ? sanitizeThinkingText(msg.text) : "";
   return (
     <div className="rounded-lg border border-border bg-surface/60 animate-in">
       <button
@@ -434,9 +436,9 @@ export function ThinkingCard({
           className={cn("ml-auto text-faint transition-transform", !collapsed && "rotate-90")}
         />
       </button>
-      {!collapsed && msg.text && (
+      {!collapsed && cleanText && (
         <div className="border-t border-border px-3.5 py-2.5 text-[13.5px] leading-relaxed whitespace-pre-wrap break-words text-muted">
-          {msg.text}
+          {cleanText}
           {live && (
             <span className="caret-blink ml-0.5 inline-block h-[1em] w-[2px] translate-y-[2px] bg-muted" />
           )}
