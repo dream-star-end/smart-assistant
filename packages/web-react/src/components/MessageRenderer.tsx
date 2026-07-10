@@ -27,10 +27,11 @@ import { PermissionCard, type PermissionRespond } from "./chat/PermissionCard";
 import { ToolCardSlot } from "./chat/toolCardSlot";
 import { TurnActivity, type TurnActivityInfo } from "./chat/TurnActivity";
 import { currentTurnStartIndex } from "./chat/turnSegment";
+import { loadedArchivedCount, planLoadMore } from "./chat/archivePaging";
 import { MessageBoundary } from "./MessageBoundary";
 import { asStr, resolveToolInput } from "./tool/format";
 import { researchToolCard } from "./tool/researchCards";
-import { Alert, Avatar } from "./ui";
+import { Alert, Avatar, Spinner } from "./ui";
 
 type RendererProps = {
   message: ChatMessage;
@@ -238,11 +239,29 @@ function coalesceTeam(messages: ChatMessage[], start: number, sending: boolean):
   return items;
 }
 
+/**
+ * 会话归档分页上下文(§4/§5)。App 从 chat.getSession 读会话归档水位/计数,并接线 Agent C 的
+ * loadOlderHistory + 视口保持。未传(如 demo / 老测试)时按「无归档、仅本地翻页」退化,行为不变。
+ */
+export type MessageListArchive = {
+  /** 会话归档总条数(client_sessions.archived_count 透传);0 = 无归档。 */
+  archivedCount: number;
+  /** 归档水位线 _seq(≤ 此值的行已 spill 到归档表);判定 messages 里哪些是已拉回的归档行。 */
+  archivedThroughSeq: number;
+  /** 云端加载进行中(按钮转 loading 态、禁用)。 */
+  loading: boolean;
+  /** 上次云端加载失败(按钮转「加载失败，点击重试」,点击即重试)。 */
+  error: boolean;
+  /** 拉更早一页归档(App 接线 loadOlderHistory + 前插后视口保持)。 */
+  onLoadOlder: () => void;
+};
+
 export function MessageList({
   messages,
   sending,
   turnActivity,
   transientNotice,
+  archive,
   cb,
   onRespondPermission,
 }: {
@@ -252,13 +271,24 @@ export function MessageList({
   turnActivity?: TurnActivityInfo | null;
   /** 会话级 transient 软提示（"较长时间未收到新内容…"，非消息卡片，末尾 info 条渲染）。*/
   transientNotice?: { text: string } | null;
+  /** 归档分页上下文；缺省=无归档(仅本地翻页)。*/
+  archive?: MessageListArchive | null;
   cb: CardCallbacks;
   onRespondPermission: PermissionRespond;
 }) {
   // 溢出：默认只挂最近 LOAD_MORE_STEP 条，"加载更多历史"递增（长会话首屏不卡）。
   const [visible, setVisible] = useState(LOAD_MORE_STEP);
   const total = messages.length;
-  const start = Math.max(0, total - visible);
+  // 归档分页:已拉回的归档行数(带 _seq 且 ≤ 水位)。据此把「本地翻页」与「云端加载」两态收口到
+  // planLoadMore 单一权威——归档行前插使 total、archivedLoaded 同增,窗口 start 不因拉归档回升。
+  const archivedThroughSeq = archive?.archivedThroughSeq ?? 0;
+  const archivedLoaded = archive ? loadedArchivedCount(messages, archivedThroughSeq) : 0;
+  const { sliceStart: start, button: loadMore } = planLoadMore({
+    total,
+    visible,
+    archivedLoaded,
+    archivedCount: archive?.archivedCount ?? 0,
+  });
   const last = messages[total - 1];
   // 当前活跃段起点(最后一条 user 消息之后)——TodoWrite/plan 的 HUD 抑制只作用于该段,
   // 与 PinnedTaskTracker 的任务源提取共用 turnSegment.ts 同一判定。
@@ -274,13 +304,36 @@ export function MessageList({
 
   return (
     <div className="mx-auto flex max-w-3xl flex-col gap-4 px-5 py-8">
-      {start > 0 && (
+      {/* 加载更多历史三态(§4/§5):
+          - local：本地内存还有未挂载的更早消息 → 翻内存(count 含归档未拉数)。
+          - cloud：本地翻尽且会话有未拉归档 → 从云端加载(loading/error 子态,失败点击重试)。
+          - null：无更早历史 → 不出按钮。 */}
+      {loadMore?.mode === "local" && (
         <button
           type="button"
           onClick={() => setVisible((v) => v + LOAD_MORE_STEP)}
           className="mx-auto rounded-full bg-hover px-3 py-1 text-xs text-muted hover:text-fg"
         >
-          加载更多历史（还有 {start} 条）
+          加载更多历史（还有 {loadMore.count} 条）
+        </button>
+      )}
+      {loadMore?.mode === "cloud" && archive && (
+        <button
+          type="button"
+          onClick={archive.onLoadOlder}
+          disabled={archive.loading}
+          aria-busy={archive.loading}
+          className="mx-auto inline-flex items-center gap-1.5 rounded-full bg-hover px-3 py-1 text-xs text-muted transition-colors hover:text-fg disabled:cursor-default disabled:opacity-60"
+        >
+          {archive.loading ? (
+            <>
+              <Spinner size={12} /> 加载中…
+            </>
+          ) : archive.error ? (
+            <span className="text-danger">加载失败，点击重试</span>
+          ) : (
+            `从云端加载更早的历史（还有 ${loadMore.remaining} 条）`
+          )}
         </button>
       )}
       {/* 每条消息(含团队面板)外包一层 MessageBoundary:单条渲染抛异常只降级该条,

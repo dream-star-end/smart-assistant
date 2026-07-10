@@ -51,6 +51,7 @@ import type {
   PutSessionResult,
   RefreshResult,
   RegisterResult,
+  SessionArchivePage,
   SessionDetail,
   SessionMeta,
   SubscriptionPlanWire,
@@ -855,6 +856,31 @@ export const api = {
     return jsonOrThrow<SessionDetail>(
       callWithRefresh(a, (t) =>
         fetch(`/api/sessions/${encodeURIComponent(id)}${suffix}`, {
+          credentials: "include",
+          headers: bearerHeaders(t),
+        }),
+      ),
+    );
+  },
+
+  /**
+   * 取归档分页（GET /api/sessions/:id/archive，Bearer）——滚动加载被搬进归档 chunk 的更早历史。
+   * `beforeSeq>0` → 只返 `_seq < beforeSeq` 的最近 `limit` 条（升序，上翻游标）；
+   * 缺省(0) → server 从 archivedThroughSeq+1 起（最新归档页）。`limit` 默认 100、后端上限 200。
+   */
+  getSessionArchive: (
+    a: AuthSession,
+    id: string,
+    beforeSeq = 0,
+    limit = 100,
+  ): Promise<SessionArchivePage> => {
+    const params = new URLSearchParams();
+    if (beforeSeq > 0) params.set("before", String(beforeSeq));
+    if (limit > 0) params.set("limit", String(limit));
+    const qs = params.toString();
+    return jsonOrThrow<SessionArchivePage>(
+      callWithRefresh(a, (t) =>
+        fetch(`/api/sessions/${encodeURIComponent(id)}/archive${qs ? `?${qs}` : ""}`, {
           credentials: "include",
           headers: bearerHeaders(t),
         }),

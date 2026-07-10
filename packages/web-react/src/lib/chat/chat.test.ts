@@ -4,11 +4,13 @@ import {
   backoffDelay,
   classifyClose,
   classifyEmptyTurn,
+  contextRebuiltNotice,
   countAnswerBlocks,
   deriveConnBanner,
   findOrCreateStreamingRow,
   friendlyBridgeErrorMessage,
   getFrameSeqCursor,
+  loadOlderHistoryLabel,
   nonAuthPolicyCloseInfo,
   normalizeBridgeErrorCode,
   onopenSetInitialStatus,
@@ -2164,5 +2166,97 @@ describe("resume_failed 游标只进不退(master 重启空 ring 防御)", () =>
     // 重启后的陈旧信号 to=0 → 游标不动
     applyResumeFailed(s, { type: "outbound.resume_failed", sessionKey: "agent:main:webchat:dm:s1", channel: "webchat", peer: { id: "s1", kind: "dm" }, from: 0, to: 0, reason: "no_buffer" } as never, {});
     expect(s._lastFrameSeqByKey?.["agent:main:webchat:dm:s1"]).toBe(42);
+  });
+});
+
+// ═══════════════ 归档 / 上下文重建文案（SESSION_ARCHIVE_DESIGN §5）═══════════════
+describe("归档 / 上下文重建文案（§5 统一权威）", () => {
+  test("contextRebuiltNotice：注入条数占位 + 合同原文", () => {
+    expect(contextRebuiltNotice(40)).toBe(
+      "已重新加载会话上下文(最近 40 条对话摘要)。更早的细节助手可能记不全,如需引用旧内容可直接粘贴。",
+    );
+  });
+  test("loadOlderHistoryLabel：剩余条数占位 + 合同原文", () => {
+    expect(loadOlderHistoryLabel(120)).toBe("从云端加载更早的历史(还有 120 条)");
+  });
+});
+
+// ═══════════════ sys.context_rebuilt 帧 → system 提示行（§3.3）═══════════════
+describe("sys.context_rebuilt 帧处理", () => {
+  afterEach(() => {
+    FakeWS.instances = [];
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+  });
+
+  function openWithTurn() {
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const sock = makeSocket();
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    ws.open();
+    sock.sendMessage({ sessId: "s1", agentId: "main", text: "hi" }); // _sendingInFlight=true
+    return { sock, ws };
+  }
+
+  test("插入一条 client-owned system 提示行(§5 文案) + 会话 transient 软提示", () => {
+    const { sock, ws } = openWithTurn();
+    ws.onmessage?.({
+      data: JSON.stringify({
+        type: "sys.context_rebuilt",
+        channel: "webchat",
+        peer: { id: "s1", kind: "dm" },
+        agentId: "main",
+        messageCount: 40,
+        frameSeq: 5,
+        ts: 9e12,
+      }),
+    });
+    const s = sock.sessions.get("s1")!;
+    const sysRows = s.messages.filter((m) => m.role === "system");
+    expect(sysRows).toHaveLength(1);
+    expect(sysRows[0].text).toBe(contextRebuiltNotice(40));
+    expect(isServerAuthoredRow(sysRows[0])).toBe(false); // client-owned
+    // 同文案的会话级 transient 软提示(live flash)。
+    expect(sock.getTransientNotice("s1")?.text).toBe(contextRebuiltNotice(40));
+    sock.stop();
+  });
+
+  test("幂等：同帧(同 frameSeq)重复到达只插一条", () => {
+    const { sock, ws } = openWithTurn();
+    const frame = JSON.stringify({
+      type: "sys.context_rebuilt",
+      channel: "webchat",
+      peer: { id: "s1", kind: "dm" },
+      messageCount: 40,
+      frameSeq: 5,
+      ts: 9e12,
+    });
+    ws.onmessage?.({ data: frame });
+    ws.onmessage?.({ data: frame }); // reconnect replay
+    const s = sock.sessions.get("s1")!;
+    expect(s.messages.filter((m) => m.role === "system")).toHaveLength(1);
+    sock.stop();
+  });
+
+  test("system 提示行经 full 对账合并不被抹掉(server 从不产出 system 行)", () => {
+    const { sock, ws } = openWithTurn();
+    ws.onmessage?.({
+      data: JSON.stringify({
+        type: "sys.context_rebuilt",
+        peer: { id: "s1", kind: "dm" },
+        messageCount: 12,
+        frameSeq: 3,
+        ts: 9e12,
+      }),
+    });
+    const s = sock.sessions.get("s1")!;
+    const sysId = s.messages.find((m) => m.role === "system")!.id;
+    // 随后 server full 对账(只带回 server-authored 助手行,绝不含 system 行)。
+    const srv = (id: string, seq: number): ChatMessage =>
+      ({ id, role: "assistant", text: "答", ts: seq, _source: "server", _seq: seq }) as ChatMessage;
+    sock.applyServerMessages("s1", "main", [srv("srv1", 1)], true, 1);
+    expect(sock.sessions.get("s1")!.messages.some((m) => m.id === sysId)).toBe(true); // 未被丢弃
+    sock.stop();
   });
 });

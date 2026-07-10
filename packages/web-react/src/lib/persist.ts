@@ -47,6 +47,10 @@ export type StoredSession = {
   _turnStartedAt?: number;
   _lastFrameAt?: number;
   _maxSeq?: number;
+  /** 归档水位(server 已把 `_seq ≤ 此值`的行搬进归档 chunk);full 合并时本地 ≤ 此值的行无条件保留。*/
+  _archivedThroughSeq?: number;
+  /** 已归档消息条数(会话总数 = tail + 此值;UI"还有 N 条"与"从云端加载"按钮据此)。*/
+  _archivedCount?: number;
   _trackerResetAt?: number;
   /** server 时钟域的 tracker reset 截止（见 chat/model.ts 字段注释）,随 reload 保留。*/
   _trackerResetServerTs?: number;
@@ -194,8 +198,23 @@ export function dbNameForUser(userId: string | null | undefined): string {
  *  - 本地缺席(跨设备/清缓存)→ 采用 server 骨架行,渲染成无 childBlocks 的骨架卡。
  * server 骨架行与本地行按 id 天然不同(srv-* vs m-*),故 id 维度的 server-wins 覆盖路径
  * 碰不到它们;唯一的去重维度是 runId,收口在这里 + normalizeDelegateCards(reducer)。
+ *
+ * **热尾巴适配(archivedThroughSeq)**:行体积到顶前 server 会把最老的一截消息搬进归档 chunk,
+ * full 同步返回的 `server` 可能**只含热尾巴**(`_seq > archivedThroughSeq` 的那截)。此时本地缓存
+ * 里 `_seq ≤ archivedThroughSeq` 的行是"已归档的 server 行"——server 不再带回不代表它们被取代,
+ * 只是被搬走了。故第三参 `archivedThroughSeq` 传入后,这些行**无条件保留**(④),绝不当"中段
+ * server 不认识的陈旧数据"丢弃(否则 reopen 长会话整段旧历史蒸发,本次改造的主雷)。默认 0 =
+ * 未归档,行为与旧版完全一致。
+ *
+ * **client-owned system 行(⑤)**:context_rebuilt 上下文重建提示是 role:'system' 的客户端行,
+ * v5 server-authored 通道只写 assistant|thinking|tool、从不产出 system 行,故中段 system 行同
+ * user/团队卡一样是"server 端根本没有的内容",一并保留(否则下次 sync 就把重建提示抹掉)。
  */
-export function mergeFullServerWins(server: ChatMessage[], local: ChatMessage[]): ChatMessage[] {
+export function mergeFullServerWins(
+  server: ChatMessage[],
+  local: ChatMessage[],
+  archivedThroughSeq = 0,
+): ChatMessage[] {
   // 债A：本地富卡拥有的 run → 丢弃 server 同 run 骨架行(local-wins,保住 childBlocks)。
   server = dropServerTeamSkeletonsOwnedLocally(server, local);
   const localById = new Map<string, ChatMessage>();
@@ -213,9 +232,14 @@ export function mergeFullServerWins(server: ChatMessage[], local: ChatMessage[])
       (m) =>
         m?.id &&
         !serverIds.has(m.id) &&
-        // user 行=客户端权威;团队卡=client-owned(见 docstring ③),被 adopt 吸收的
-        // standalone progress 行(_adoptedInto)已并入 group,不重复保留。
-        (m.role === "user" || (isTeamOwnedRole(m.role) && !m._adoptedInto)),
+        // ④ 已归档的 server 行(server 只回热尾巴时 _seq ≤ 水位的行不再带回):无条件保留。
+        (isArchivedServerRow(m, archivedThroughSeq) ||
+          // ① user 行=客户端权威;② 团队卡=client-owned(见 docstring ③),被 adopt 吸收的
+          // standalone progress 行(_adoptedInto)已并入 group,不重复保留。
+          m.role === "user" ||
+          (isTeamOwnedRole(m.role) && !m._adoptedInto) ||
+          // ⑤ client-owned system 行(context_rebuilt 重建提示):server-authored 通道从不产出。
+          (m.role === "system" && !isServerAuthoredRow(m))),
     );
   if (!tail.length && !preservedMid.length) return serverChanged ? serverMerged : server;
   // 稳定排序（现代 JS Array.sort 稳定）：等 ts 时维持 server→preservedMid→tail 的插入序。
@@ -243,6 +267,31 @@ export function applyServerIncremental(
   for (const m of local) if (m?.id) seen.add(m.id);
   for (const m of incoming) if (m?.id && !seen.has(m.id)) merged.push(m);
   return stableSortByTs(merged);
+}
+
+/**
+ * 归档分页并入:把云端 getSessionArchive 拉回的更早归档消息(server-authored、srv-* id、
+ * `_seq` 升序)前插进本地 messages。**只前插 + 按 id 去重,绝不触发 server-wins 覆盖本地富卡**
+ * (归档行 id 与本地 m-* 天然不撞;已在本地的归档 id 直接跳过,不重复插入)。合并后 stableSortByTs
+ * 按 `_seq` 归位(归档行 `_seq` 低 → 落到最前)。无新增时**返回原引用**(零拷贝,免无谓重渲)。
+ */
+export function mergeArchivedHistory(local: ChatMessage[], archived: ChatMessage[]): ChatMessage[] {
+  if (!archived.length) return local;
+  const existing = new Set<string>();
+  for (const m of local) if (m?.id) existing.add(m.id);
+  const add = archived.filter((m) => m?.id && !existing.has(m.id));
+  if (!add.length) return local;
+  return stableSortByTs([...add, ...local]);
+}
+
+/** `_seq ≤ 归档水位` = server 已把该行搬进归档 chunk,full 同步只回热尾巴时不再带回它。 */
+function isArchivedServerRow(m: ChatMessage, archivedThroughSeq: number): boolean {
+  return (
+    archivedThroughSeq > 0 &&
+    typeof m._seq === "number" &&
+    Number.isFinite(m._seq) &&
+    m._seq <= archivedThroughSeq
+  );
 }
 
 function isTeamOwnedRole(role: ChatMessage["role"] | undefined): boolean {

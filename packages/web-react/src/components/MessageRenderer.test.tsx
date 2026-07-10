@@ -603,6 +603,113 @@ describe("MetaRow turn 终态门控(积分/请求ID 不得先于 turn 结束出�
   });
 });
 
+describe("MessageList 归档分页按钮三态(§4/§5)", () => {
+  const noArchive = { archivedCount: 0, archivedThroughSeq: 0, loading: false, error: false };
+  function renderList(messages: ChatMessage[], archive?: Partial<typeof noArchive> & { onLoadOlder?: () => void }) {
+    const onLoadOlder = archive?.onLoadOlder ?? (() => {});
+    return render(
+      <MessageList
+        messages={messages}
+        sending={false}
+        cb={{}}
+        onRespondPermission={() => {}}
+        archive={archive ? { ...noArchive, ...archive, onLoadOlder } : undefined}
+      />,
+    );
+  }
+  // 轻量 user 行(无 _seq → archivedLoaded=0),批量造尾巴。
+  function users(n: number): ChatMessage[] {
+    return Array.from({ length: n }, (_, i) => mk("user", { id: `u${i}`, text: `m${i}` }));
+  }
+
+  test("本地未翻尽(>100 条)→ 本地翻页按钮;count 含归档未拉数(§4)", () => {
+    // 130 条尾巴,visible=100 → 30 本地未挂;归档 500 未拉 → 还有 530 条。
+    renderList(users(130), { archivedCount: 500, archivedThroughSeq: 5 });
+    expect(screen.getByRole("button", { name: /加载更多历史（还有 530 条）/ })).toBeInTheDocument();
+    expect(screen.queryByText(/从云端加载更早的历史/)).toBeNull();
+  });
+
+  test("无归档时本地翻页按钮 count 即本地未挂(退化行为不变)", () => {
+    renderList(users(130)); // 无 archive prop
+    expect(screen.getByRole("button", { name: /加载更多历史（还有 30 条）/ })).toBeInTheDocument();
+  });
+
+  test("本地翻尽 + 有归档未拉 → 云端加载按钮,还有 M 条(§5 文案)", () => {
+    renderList(users(3), { archivedCount: 500, archivedThroughSeq: 5 });
+    expect(
+      screen.getByRole("button", { name: /从云端加载更早的历史（还有 500 条）/ }),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/加载更多历史/)).toBeNull();
+  });
+
+  test("本地翻尽 + 无归档 → 无按钮", () => {
+    const { container } = renderList(users(3), { archivedCount: 0 });
+    expect(container.querySelector("button")).toBeNull();
+  });
+
+  test("云端加载中 → 按钮显示「加载中…」且禁用", () => {
+    renderList(users(3), { archivedCount: 500, archivedThroughSeq: 5, loading: true });
+    const btn = screen.getByRole("button");
+    expect(btn).toHaveTextContent(/加载中/);
+    expect(btn).toBeDisabled();
+    // loading 时不显示 §5 文案(避免与 spinner 并存的抖动)。
+    expect(screen.queryByText(/从云端加载更早的历史/)).toBeNull();
+  });
+
+  test("云端加载失败 → 按钮显示「加载失败，点击重试」且可点(重试)", () => {
+    const onLoadOlder = vi.fn();
+    renderList(users(3), { archivedCount: 500, archivedThroughSeq: 5, error: true, onLoadOlder });
+    const btn = screen.getByRole("button", { name: /加载失败，点击重试/ });
+    expect(btn).not.toBeDisabled();
+    fireEvent.click(btn);
+    expect(onLoadOlder).toHaveBeenCalledTimes(1);
+  });
+
+  test("点击云端按钮 → 触发 onLoadOlder", () => {
+    const onLoadOlder = vi.fn();
+    renderList(users(3), { archivedCount: 500, archivedThroughSeq: 5, onLoadOlder });
+    fireEvent.click(screen.getByRole("button", { name: /从云端加载更早的历史/ }));
+    expect(onLoadOlder).toHaveBeenCalledTimes(1);
+  });
+
+  test("拉回一页归档后不回退本地翻页:带 _seq≤水位 的前插行可见,仍是云端态", () => {
+    // 3 尾巴 + 100 已拉归档行(_seq 1..100 ≤ 水位 100);archivedCount 500。
+    const archived: ChatMessage[] = Array.from({ length: 100 }, (_, i) =>
+      mk("user", { id: `a${i}`, text: `arch${i}`, _seq: i + 1 }),
+    );
+    const tail: ChatMessage[] = Array.from({ length: 3 }, (_, i) =>
+      mk("user", { id: `t${i}`, text: `tail${i}`, _seq: 200 + i }),
+    );
+    renderList([...archived, ...tail], { archivedCount: 500, archivedThroughSeq: 100 });
+    // 刚拉回的归档行未被再次藏起 → arch0 / arch99 都在 DOM。
+    expect(screen.getByText("arch0")).toBeInTheDocument();
+    expect(screen.getByText("arch99")).toBeInTheDocument();
+    // 仍是云端态,剩余 = 500-100 = 400,无本地翻页按钮。
+    expect(
+      screen.getByRole("button", { name: /从云端加载更早的历史（还有 400 条）/ }),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/加载更多历史/)).toBeNull();
+  });
+});
+
+describe("context_rebuilt system 提示行(§3.3/§5,复用 SystemCard 灰字样式)", () => {
+  test("role:'system' 上下文重建行 → 居中灰字提示渲染(不新造样式)", () => {
+    const text = "已重新加载会话上下文（最近 40 条对话摘要）。更早的细节助手可能记不全，如需引用旧内容可直接粘贴。";
+    render(
+      <MessageList
+        messages={[
+          mk("user", { id: "u1", text: "继续" }),
+          mk("system", { id: "sys-ctx", text }),
+        ]}
+        sending={false}
+        cb={{}}
+        onRespondPermission={() => {}}
+      />,
+    );
+    expect(screen.getByText(text)).toBeInTheDocument();
+  });
+});
+
 describe("MessageList 活跃段归属(turnSegment 收口)", () => {
   const todoTool = (id: string): ChatMessage =>
     mk("tool", {

@@ -242,6 +242,11 @@ export type ChatSession = {
   _lastFrameSeq?: number;
   /** server canonical 增量游标（历史加载 getSession 的 sinceSeq；随 StoredSession 落地）。*/
   _maxSeq?: number;
+  /** 归档水位(server 已把 `_seq ≤ 此值`的行搬进归档 chunk)。full 合并时本地 ≤ 此值的行无条件
+   *  保留(热尾巴不丢旧历史);归档分页 loadOlderHistory 的 before 游标兜底也用它。*/
+  _archivedThroughSeq?: number;
+  /** 已归档消息条数(会话总数 = tail + 此值)。UI"还有 N 条"与"从云端加载更早历史"按钮据此。*/
+  _archivedCount?: number;
 
   // ── turn 流式指针（就地 mutation 目标）──
   _streamingAssistant?: ChatMessage | null;

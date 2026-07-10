@@ -1,4 +1,4 @@
-import { lazy, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { lazy, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { AgentGate } from "./components/AgentGate";
 import { LazyBoundary } from "./components/ChunkErrorBoundary";
 import { AgentPicker } from "./components/AgentPicker";
@@ -17,8 +17,9 @@ import { CHAT_CREATE_TEMPLATES } from "./lib/chatCreateTemplates";
 import type { ManageTab } from "./components/ManageCenter";
 import type { MarketplaceKind, MarketplaceTab } from "./components/MarketplaceCenter";
 import { AssistantMessage, UserMessage } from "./components/Message";
-import { MessageList } from "./components/MessageRenderer";
+import { MessageList, type MessageListArchive } from "./components/MessageRenderer";
 import { MessageListSkeleton, shouldShowHistorySkeleton } from "./components/chat/HistorySkeleton";
+import { correctedScrollTop } from "./components/chat/archivePaging";
 import type { CardCallbacks } from "./components/chat/cards";
 import {
   type RatingEntry,
@@ -121,6 +122,7 @@ function DialogFallback() {
 }
 
 const EMPTY_WS_MESSAGES: ChatMessage[] = [];
+
 // 冷会话骨架屏窗口（见 HistorySkeleton.shouldShowHistorySkeleton）：
 //  - GRACE：meta 未知（深链/列表未落定）时的兜底窗，过后放行 EmptyState。
 //  - CAP：确知有历史但迟迟不到（getSession 慢/失败）的安全封顶，防骨架永停。
@@ -189,7 +191,12 @@ export function App() {
   const [marketplaceBrowseKind, setMarketplaceBrowseKind] = useState<MarketplaceKind>("skill");
   // 「在对话中创建」技能/智能体:关市场 → 新会话 → Composer 预填引导模板(用户改后发送)。
   const [composerPrefill, setComposerPrefill] = useState<{ text: string; nonce: number } | null>(null);
+  // 归档「从云端加载更早历史」按钮子态(§4:加载中 / 失败可重试)。切会话时重置(见下)。
+  const [archiveLoading, setArchiveLoading] = useState(false);
+  const [archiveError, setArchiveError] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
+  // 归档前插视口锚点:点击加载前记录 scrollHeight/scrollTop,前插渲染后按高度差校正 scrollTop(见下)。
+  const archiveScrollAnchorRef = useRef<{ prevHeight: number; prevTop: number } | null>(null);
   const stopRef = useRef(false);
   // 稳定句柄：让早于 useChatSocket 声明的 send/regenerate 回调引用 WS 引擎，避免
   // “块级变量在声明前使用” 的 TDZ（hook 在下方调用后回填 sockRef.current）。
@@ -967,10 +974,13 @@ export function App() {
     if (!el) return;
     stickToBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
   }, []);
-  // 切会话:重置粘滞并瞬时跳底(历史回看从底部开始)。
+  // 切会话:重置粘滞并瞬时跳底(历史回看从底部开始);同时清归档按钮子态与视口锚点。
   useEffect(() => {
     stickToBottomRef.current = true;
     scrollToChatBottom();
+    setArchiveLoading(false);
+    setArchiveError(false);
+    archiveScrollAnchorRef.current = null;
   }, [activeId, scrollToChatBottom]);
   // 内容变更跟随:demo 走 messages/streamText,真实路径走 version/wsSending。
   // 流式期间高频触发,用瞬时赋值而非 smooth(60fps 下排队的平滑动画反而卡顿)。
@@ -978,6 +988,45 @@ export function App() {
     if (!stickToBottomRef.current) return;
     scrollToChatBottom();
   }, [messages, streamText, chat.version, wsSending, scrollToChatBottom]);
+
+  // 归档「从云端加载更早历史」:前插旧消息会顶开视口,记录插入前 scrollHeight/scrollTop,
+  // 前插渲染后按高度差把 scrollTop 顶回去 → 用户视口锚定在原来那条消息,不跳。
+  const onLoadOlderHistory = useCallback(async () => {
+    if (demo || !activeId) return;
+    const el = scrollRef.current;
+    if (el) archiveScrollAnchorRef.current = { prevHeight: el.scrollHeight, prevTop: el.scrollTop };
+    setArchiveError(false);
+    setArchiveLoading(true);
+    try {
+      // loadOlderHistory 是非抛出式契约:失败以 {ok:false} 返回(hasMore 不封死,可重试)。
+      const res = await chat.loadOlderHistory(activeId);
+      if (!res.ok) {
+        setArchiveError(true);
+        archiveScrollAnchorRef.current = null;
+      }
+    } catch {
+      setArchiveError(true);
+      archiveScrollAnchorRef.current = null;
+    } finally {
+      setArchiveLoading(false);
+    }
+  }, [demo, activeId, chat]);
+  // 前插行渲染后(paint 前)校正 scrollTop;仅当内容真正变高才应用,避免其它 version bump
+  // (流式等)误触发。useLayoutEffect 先于 stick-to-bottom 的 useEffect,且此刻用户在顶部
+  // (stick=false)故不会被拽回底部。
+  useLayoutEffect(() => {
+    const anchor = archiveScrollAnchorRef.current;
+    if (!anchor) return;
+    const el = scrollRef.current;
+    if (!el) {
+      archiveScrollAnchorRef.current = null;
+      return;
+    }
+    if (el.scrollHeight > anchor.prevHeight) {
+      el.scrollTop = correctedScrollTop(anchor.prevHeight, el.scrollHeight, anchor.prevTop);
+      archiveScrollAnchorRef.current = null;
+    }
+  }, [chat.version]);
 
   // iOS Safari 的地址栏/底栏/截图/输入键盘会触发 visualViewport 高度与 offset 抖动。
   // CSS dvh 仍可能短暂大于真实可视区；键盘弹起时 Safari 还会 pan visual viewport,
@@ -1165,6 +1214,19 @@ export function App() {
       capExpired: historyCapExpired,
     });
 
+  // 归档分页上下文(§4):归档水位/计数从会话读(ChatSession._archived*),loading/error 与加载动作在本层。
+  // demo / 无选中会话时不下发(MessageList 退化为纯本地翻页)。
+  const messageListArchive: MessageListArchive | undefined =
+    !demo && activeId
+      ? {
+          archivedCount: activeSess?._archivedCount ?? 0,
+          archivedThroughSeq: activeSess?._archivedThroughSeq ?? 0,
+          loading: archiveLoading,
+          error: archiveError,
+          onLoadOlder: onLoadOlderHistory,
+        }
+      : undefined;
+
   // 侧栏公共 props：桌面内联与移动抽屉两处复用。余额（balanceCents）本期不展示（P3.5 计费中心）。
   // rename/delete 的数据收口（三持有方）在 useSessionList。
   const sidebarProps = {
@@ -1308,6 +1370,7 @@ export function App() {
                 sending={wsSending}
                 turnActivity={turnActivity}
                 transientNotice={transientNotice}
+                archive={messageListArchive}
                 cb={cardCallbacks}
                 onRespondPermission={onRespondPermission}
               />

@@ -1041,14 +1041,18 @@ export function makeServerAuthoredHandler(
         }
         if (r.reason === "oversized") {
           // Master row is already past MAX_SESSION_BYTES; appending this
-          // thinking row would push it further. Terminal — admin must run
-          // the strip-attachments script before this turn can be persisted.
-          // 413 (vs 500) so the container's anthropicProxy treats it as a
-          // give-up-don't-retry signal and drops the entry from its sink
-          // queue rather than spinning on a row it can never write.
-          userLog.warn("thinking_session_oversized", {
+          // thinking row would push it further. 413 (vs 500) so the container's
+          // anthropicProxy treats it as a give-up-don't-retry signal and drops
+          // the entry from its sink queue rather than spinning on a row it can
+          // never write.
+          // 长会话热尾巴+归档上线后:写路径每次 merge 前都 spill,行体积恒有界,
+          // MAX_SESSION_BYTES 4MB 只是最后防线 —— **理论不可达,命中即 bug**(spill
+          // 没生效 / 单条超大消息)。故日志升 error 级 + postSpillUnexpected 标记便于
+          // 告警定位(取代旧的"admin 跑 strip 脚本"人工兜底)。
+          userLog.error("thinking_session_oversized", {
             sessionId: body.sessionId,
             turnIndex: body.turnIndex,
+            postSpillUnexpected: true,
           });
           metric("reject_oversized", "thinking");
           emitToolsMetric();
@@ -1136,9 +1140,11 @@ export function makeServerAuthoredHandler(
         return;
       }
       if (r0.reason === "oversized") {
-        userLog.warn("tools_only_session_oversized", {
+        // 热尾巴+归档后理论不可达,命中即 bug(见 thinking 分支注释)→ error + 标记。
+        userLog.error("tools_only_session_oversized", {
           sessionId: body.sessionId,
           turnIndex: body.turnIndex,
+          postSpillUnexpected: true,
         });
         emitToolsMetric();
         sendJsonError(
@@ -1212,9 +1218,11 @@ export function makeServerAuthoredHandler(
           return;
         }
         if (ag0.reason === "oversized") {
-          userLog.warn("agent_group_only_session_oversized", {
+          // 热尾巴+归档后理论不可达,命中即 bug(见 thinking 分支注释)→ error + 标记。
+          userLog.error("agent_group_only_session_oversized", {
             sessionId: body.sessionId,
             turnIndex: body.turnIndex,
+            postSpillUnexpected: true,
           });
           sendJsonError(
             res,
@@ -1472,9 +1480,11 @@ export function makeServerAuthoredHandler(
       return;
     }
     if (assistantResult.reason === "oversized") {
-      userLog.warn("session_oversized", {
+      // 热尾巴+归档后理论不可达,命中即 bug(见 thinking 分支注释)→ error + 标记。
+      userLog.error("session_oversized", {
         sessionId: body.sessionId,
         turnIndex: body.turnIndex,
+        postSpillUnexpected: true,
       });
       emitThinkingMetric();
       emitToolsMetric();
