@@ -136,6 +136,9 @@ ssh kl-mirror 'psql "$DATABASE_URL" -c "select * from turn_traces where trace_id
 # → user_id / session_key / agent / model / 时间;再按 session_key 去容器 sessions.db(usage_log/event_log)
 #   或 codex rollout(~/.codex/sessions/<日期>/rollout-*.jsonl)drill down。
 # 注意 usage_records.request_id 是**上游请求 id**,与展示的 traceId 不同源,别拿去互查。
+# 查不到?236e3834(2026-07-10)之前容器 gateway 无条件自铸 usage.traceId、无视 master 注入,
+# 底部请求ID与 turn_traces 是两个 id(双权威源,已收口:dispatchInbound 优先 frame.traceId,
+# InboundMessage schema 显式登记该字段)。旧 turn 兜底:按 user + 时间窗在 turn_traces 圈。
 ```
 
 ### 3.1 前端问题(渲染/交互/移动端)
