@@ -373,6 +373,23 @@ export async function buildCodexLaunchOverrides(
 
   const argvOverrides: string[] = ['-c', `model_instructions_file=${tomlValue(instructionsFile)}`]
 
+  // 关闭 codex 原生生图工具(features.image_generation)。每次 spawn 无条件注入,与
+  // codexShared.ts 关闭 features.multi_agent_v2 同一思路(codex 服务端会默认推该能力,
+  // 平台侧显式关断)。
+  //
+  // 为什么关:平台生图的唯一权威 = minimax-media 的 text_to_image(有富卡 + 计费口径)。
+  // codex 原生生图会调 `POST {base}/images/generations`,而 egress relay 白名单里没有这条
+  // 路径 → 被 internalCodexRelay 有意 fail-closed 404(PATH_NOT_ALLOWED)。它既是"必然失败
+  // 的工具"(用户看到"生成图片失败"),又是绕开计费的第二套并行生图机制,故直接从工具面消除。
+  //
+  // 键名经容器实证(codex-cli 0.144.0 @ oc-v5-u1,2026-07-10):`codex features list` 的权威
+  // feature 名是 `image_generation`(不是 imagegen);`-c features.image_generation=false` 使其
+  // effective state 由 stable/true → false,等价于官方 `codex features --disable image_generation`。
+  // 反例:`-c features.imagegen=false` 是 codex 不识别的裸 TOML 键 → 静默 no-op(features list
+  // 仍 true),`--disable imagegen` 则直接报 "Unknown feature flag: imagegen"。故必须用全名。
+  // 值 `false` 为裸 TOML 布尔字面量(非字符串),与 multi_agent_v2 关断写法一致,不走 tomlValue。
+  argvOverrides.push('-c', 'features.image_generation=false')
+
   // mcp-memory injection — best-effort. If the bundled entry can't be
   // resolved (corrupted install, hand-edited path), we still ship the
   // instructions file so the agent has identity/persona/skills metadata
