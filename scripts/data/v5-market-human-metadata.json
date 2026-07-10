@@ -1,0 +1,281 @@
+{
+  "$comment": "v5 市场存量条目人向元数据回填内容(2026-07-10,配合 0127 迁移)。由 scripts/v5-market-backfill-metadata.ts 消费。category ∈ @openclaude/protocol MARKETPLACE_CATEGORIES;featuredRank 越小越靠前,缺省=非精选。内容基于各条目 SKILL.md/manifest 人工撰写,不夸大、不虚构能力。",
+  "items": {
+    "coding-assistant": {
+      "category": "coding-dev",
+      "useCases": [
+        "有需求或报错,想直接拿到验证通过的可用代码",
+        "让 AI 先读懂现有项目再动手改,而不是凭空生成",
+        "修 bug 要求定位根因,不接受表面补丁",
+        "希望 AI 自己跑测试/构建来验证改动"
+      ],
+      "outcomeExamples": [
+        "丢给它一段报错栈 → 定位根因、修复并附上测试通过的输出",
+        "给一个功能需求 → 在你的代码库里探索、精确改动、跑通测试后交付"
+      ]
+    },
+    "office-assistant": {
+      "category": "office-docs",
+      "useCases": [
+        "写周报/月报/方案/公文,要可下载的成品文件",
+        "把杂乱数据整理成规范 Excel 或分析报表",
+        "按提纲生成汇报 PPT",
+        "读长 PDF/文档,出会议纪要或要点总结"
+      ],
+      "outcomeExamples": [
+        "给一段工作要点 → 排版好的周报 Word 文档",
+        "给原始数据表 → 带公式、透视和图表的 Excel",
+        "给汇报提纲 → 可编辑的 PPT 文件"
+      ]
+    },
+    "research-assistant": {
+      "category": "research-academic",
+      "useCases": [
+        "从选题、检索、精读到综述/论文,一个对话做完",
+        "要求每条结论都能溯源到文献原文,不臆造引用",
+        "多源文献检索加方法学审视"
+      ],
+      "outcomeExamples": [
+        "给一个研究主题 → 引用可溯源的文献综述稿",
+        "给几篇 PDF → 入库精读后的结构化分析,每条结论带原文出处"
+      ]
+    },
+    "aipoch-medical-research-skills": {
+      "category": "skill-pack",
+      "useCases": [
+        "医学科研:循证分析、研究方案设计、临床数据分析",
+        "写医学论文、摘要、投稿与审稿回复",
+        "不确定该用哪类医学研究能力时,按模块快速选型"
+      ],
+      "outcomeExamples": [
+        "描述研究问题 → 定位到对应医学研究模块,产出标注数据来源、偏倚风险与局限性的规范结果"
+      ]
+    },
+    "anthropic-canvas-design": {
+      "category": "design-creative",
+      "useCases": [
+        "要海报、封面、静态视觉作品(PNG/PDF)",
+        "想要有设计理念的原创视觉,不要模板感"
+      ],
+      "outcomeExamples": [
+        "给主题和场合 → 先形成一份视觉哲学,再按它创作出海报成品(PNG/PDF)"
+      ]
+    },
+    "anthropic-frontend-design": {
+      "category": "design-creative",
+      "featuredRank": 40,
+      "useCases": [
+        "做网页/UI 时想要有辨识度的视觉方向,避免「AI 模板脸」",
+        "为产品页选配色、字体、布局,并且每个选择都有理由"
+      ],
+      "outcomeExamples": [
+        "给产品简介 → 一套明确的视觉方向(调色/字体/布局/签名元素)和落地的页面实现"
+      ],
+      "humanMd": "## 为什么装它\n\nAI 生成的网页常有一股「模板味」:渐变紫、圆角卡片、千篇一律的 hero 区。这个技能让 AI 以「小型设计工作室主创」的标准工作:先把产品是什么、给谁用、页面唯一目标钉死,再从产品自身的语境里长出配色、字体与版式,并要求至少承担一次有依据的美学冒险。\n\n**适合**:着陆页、产品页、活动页等需要视觉辨识度的前端工作。\n**不适合**:后台表格类界面的纯功能开发(那不需要视觉个性)。"
+    },
+    "anthropic-mcp-builder": {
+      "category": "coding-dev",
+      "useCases": [
+        "把外部 API/服务接成 MCP 服务器给 AI 使用",
+        "设计 agent 工具接口,想遵循高质量工具设计规范"
+      ],
+      "outcomeExamples": [
+        "给一份 API 文档 → 工具划分合理、带错误处理与评估思路的 MCP 服务器实现(Python/TypeScript)"
+      ]
+    },
+    "anthropic-webapp-testing": {
+      "category": "coding-dev",
+      "useCases": [
+        "本地 Web 应用要做自动化功能验证或 UI 调试",
+        "需要截图、浏览器日志来排查前端问题"
+      ],
+      "outcomeExamples": [
+        "给本地应用和要验证的场景 → Playwright 脚本 + 截图/日志佐证的验证结论"
+      ]
+    },
+    "anysearch": {
+      "category": "daily-tools",
+      "featuredRank": 50,
+      "useCases": [
+        "查实时信息、新闻、文档资料",
+        "一次并行搜索多个问题,或抽取网页正文",
+        "核查某个说法有没有可靠来源"
+      ],
+      "outcomeExamples": [
+        "提一个时效性问题 → 带来源链接的检索结论",
+        "给一批网址 → 抽取好的正文内容"
+      ],
+      "humanMd": "## 为什么装它\n\n给 AI 一个实时搜索引擎:通用网页搜索、垂直领域搜索、并行批量搜索、网页正文抽取,一个入口全覆盖。查资料、核实事实、追新闻时,AI 会自动用它检索并给出带来源的结论,而不是凭记忆回答。\n\n**适合**:任何需要「当下最新信息」或「多来源交叉核实」的对话。"
+    },
+    "awesome-agent-skills-index": {
+      "category": "skill-pack",
+      "useCases": [
+        "不知道该装哪个技能时,先按目录发现、对比、选型",
+        "了解官方与社区 Agent 技能生态全景"
+      ],
+      "outcomeExamples": [
+        "描述你的任务 → 该领域可用的技能清单与下一步建议"
+      ]
+    },
+    "harvard-tooluniverse-science-tools": {
+      "category": "skill-pack",
+      "useCases": [
+        "科学计算、生物医药研究要找专业工具、数据库、模型 API",
+        "按研究 workflow 在 ToolUniverse 的工具集里选型"
+      ],
+      "outcomeExamples": [
+        "描述科研任务 → 定位到对应科学工具与调用方式"
+      ]
+    },
+    "kd-experimental-design": {
+      "category": "research-academic",
+      "useCases": [
+        "收数据之前设计实验:随机化、分组、因子设计、响应面",
+        "避免伪重复、混杂这类分析救不回来的设计级错误"
+      ],
+      "outcomeExamples": [
+        "描述研究问题与资源约束 → 一份可执行的实验设计方案(分组结构/随机化/重复水平)"
+      ]
+    },
+    "kd-hypothesis-generation": {
+      "category": "research-academic",
+      "useCases": [
+        "从观察或初步数据提炼可检验的科学假设",
+        "为假设补机制解释、可证伪预测和验证实验"
+      ],
+      "outcomeExamples": [
+        "给一组观察现象 → 若干可检验假设 + 机制解释 + 验证实验建议"
+      ]
+    },
+    "kd-peer-review": {
+      "category": "research-academic",
+      "useCases": [
+        "审稿:方法学、统计有效性、报告规范逐项评估",
+        "投稿前用审稿人视角自查稿件"
+      ],
+      "outcomeExamples": [
+        "给一篇稿件 → 按 CONSORT/STROBE/PRISMA 等清单的结构化评审意见"
+      ]
+    },
+    "kd-research-grants": {
+      "category": "research-academic",
+      "useCases": [
+        "写 NSF/NIH/DOE/DARPA 等机构的基金申请书",
+        "按目标机构的评审标准打磨立项依据、影响陈述与预算"
+      ],
+      "outcomeExamples": [
+        "给研究计划要点 → 符合目标机构格式与评审重点的申请书稿"
+      ]
+    },
+    "kd-scientific-brainstorming": {
+      "category": "research-academic",
+      "useCases": [
+        "开放式研究选题、思路头脑风暴",
+        "跨学科联想、挑战既有假设、寻找研究空白"
+      ],
+      "outcomeExamples": [
+        "给研究领域和背景 → 一组有依据的新研究方向与切入点"
+      ]
+    },
+    "kd-statistical-analysis": {
+      "category": "data-analysis",
+      "featuredRank": 20,
+      "useCases": [
+        "不确定该用哪个统计检验,想选对并核查前提假设",
+        "报告里要效应量、置信区间,或做贝叶斯替代分析",
+        "按 APA 规范写统计结果"
+      ],
+      "outcomeExamples": [
+        "给数据和研究问题 → 合理的检验选择 + 假设核查 + 效应量 + 规范化结果报告"
+      ],
+      "humanMd": "## 为什么装它\n\n统计分析最容易翻车的不是算,而是**选错检验、漏查假设、只报 p 值**。这个技能让 AI 按完整流程走:选择合适的检验(t 检验/ANOVA/卡方/非参数/回归/贝叶斯)→ 逐项核查前提假设 → 报告效应量与不确定性 → 按 APA 格式成文,目标是「审稿人挑不出毛病的分析」。\n\n**适合**:论文数据分析、实验结果检验、业务 A/B 数据解读。"
+    },
+    "kd-statistical-power": {
+      "category": "data-analysis",
+      "useCases": [
+        "开题/立项前算需要多大样本量",
+        "评估手头样本能可靠检测多大的效应(MDE)"
+      ],
+      "outcomeExamples": [
+        "给效应量/显著性水平/功效中的已知量 → 样本量计算与功效曲线(含模拟法)"
+      ]
+    },
+    "kd-what-if-oracle": {
+      "category": "finance-business",
+      "useCases": [
+        "重大决策前做多分支情景推演(最好/最可能/最坏/黑天鹅/反共识)",
+        "给一个计划做压力测试,找出脆弱点和应对预案"
+      ],
+      "outcomeExamples": [
+        "描述一个抉择 → 4-6 条带概率与后果的情景分支及应对建议"
+      ]
+    },
+    "kdense-scientific-skills": {
+      "category": "skill-pack",
+      "useCases": [
+        "通用科研合集:149 个子技能覆盖选题、文献、统计、生信、化学、医学等",
+        "不确定用什么科研工具链时,先加载它做选型入口"
+      ],
+      "outcomeExamples": [
+        "描述科研任务 → 推荐模块 + 典型子技能 + 可复现的做法"
+      ]
+    },
+    "literature-search": {
+      "category": "research-academic",
+      "featuredRank": 10,
+      "useCases": [
+        "按 DOI/arXiv 号下载论文全文 PDF",
+        "批量下载文献并导出 BibTeX/RIS 引文",
+        "通过 WebVPN/CARSI/EZProxy 机构通道获取付费论文全文"
+      ],
+      "outcomeExamples": [
+        "给一串 DOI → 批量下载好的 PDF + 引文文件",
+        "给研究关键词 → 检索结果与可直接引用的文献条目"
+      ],
+      "humanMd": "## 为什么装它\n\n查文献最耗时的是「找得到摘要、拿不到全文」。这个技能给 AI 一套完整的学术论文获取链路:按 DOI/arXiv 号单篇或批量下载、OpenAlex 关键词检索、BibTeX/RIS/EndNote 引文导出,支持通过高校 WebVPN/CARSI/机构 SSO 获取付费出版社全文。\n\n**适合**:写综述/论文前的批量取全文、按参考文献清单补 PDF。\n**注意**:机构通道需要你自己的合法账号授权。"
+    },
+    "macro-investment-framework": {
+      "category": "finance-business",
+      "featuredRank": 60,
+      "useCases": [
+        "宏观研判与持仓复盘,要求账目自洽、数据分级核验",
+        "调仓决策前过六道硬闸门:资金适配、因子暴露、压力测试等"
+      ],
+      "outcomeExamples": [
+        "给持仓明细和目标 → 账目核对 + 因子暴露 + 情景压力测试的复盘报告(研究流程,非荐股)"
+      ],
+      "humanMd": "## 为什么装它\n\n把「聊行情」变成「有纪律的投研流程」。它给 AI 一套硬性闸门:先验资金性质与承受力、核对账目自洽、给数据来源分级,再穿透计算因子暴露、做情景压力测试,最后才谈行动——宏观叙事、名人观点、单日价格都不能单独触发交易建议。\n\n**适合**:持仓复盘、调仓决策辅助、宏观逻辑压力测试。\n**定位**:研究与风险管理流程,不是收益承诺或荐股服务。"
+    },
+    "orchestra-ai-research-skills": {
+      "category": "skill-pack",
+      "useCases": [
+        "AI/ML 研究:模型架构、微调、后训练、评测、RAG、MLOps 按模块选用",
+        "写 AI 方向论文时寻找对应工具链"
+      ],
+      "outcomeExamples": [
+        "描述机器学习任务 → 定位到对应研究模块与工具链建议"
+      ]
+    },
+    "python-pptx-redesign-validation": {
+      "category": "office-docs",
+      "featuredRank": 30,
+      "useCases": [
+        "上传已有 PPT,要美化、统一风格或重排",
+        "在没有 PowerPoint/LibreOffice 的环境里要可靠的 PPTX 交付"
+      ],
+      "outcomeExamples": [
+        "给一份旧 PPT → 重排后的新 PPTX + 完整性验证(页数一致/原文零缺失/无元素越界)"
+      ],
+      "humanMd": "## 为什么装它\n\n让 AI 改 PPT 最怕的是「改完打不开、文字丢了、元素飞出画布」。这个技能强制一套验证流程:保留原画布/页数/顺序/原文,重排后重新打开校验、逐项核对文本完整性和元素边界、检查文件结构,做不到像素级验证时会如实披露。\n\n**适合**:美化统一既有 PPT 的风格、重排布局。\n**注意**:python-pptx 重建会丢动画/切换效果,交付时会说明。"
+    },
+    "sciagent-life-science-skills": {
+      "category": "skill-pack",
+      "useCases": [
+        "生命科学研究:RNA-seq、单细胞、基因组学、蛋白组学、药物发现按模块选用"
+      ],
+      "outcomeExamples": [
+        "描述生信分析任务 → 推荐子技能与分析管线"
+      ]
+    }
+  }
+}
