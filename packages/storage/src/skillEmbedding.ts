@@ -28,6 +28,12 @@ export interface SkillEmbedMeta {
   description: string
   tags?: string[]
   related_skills?: string[]
+  /**
+   * 人向「适用场景」用例(marketplace storefront 元数据)。参与检索语义(排在 tags 前),
+   * 但**仅当非空才影响哈希**:为空/不传时 canonical JSON 与旧实现逐字节一致,避免整库
+   * 向量缓存失效(见 skillCanonicalInput 的条件性加键)。
+   */
+  use_cases?: string[]
 }
 
 export interface RankedSkill {
@@ -107,12 +113,17 @@ function sortedTrimmed(xs: string[] | undefined): string[] {
  * embedded text — keep the two aligned so a content change always re-embeds.
  */
 export function skillCanonicalInput(m: SkillEmbedMeta): string {
-  return JSON.stringify({
+  const useCases = sortedTrimmed(m.use_cases)
+  const obj: Record<string, unknown> = {
     name: m.name.trim(),
     description: (m.description ?? '').trim(),
     tags: sortedTrimmed(m.tags),
     related: sortedTrimmed(m.related_skills),
-  })
+  }
+  // use_cases 条件性加键:非空时才写入 → 为空/不传时 JSON 与旧实现完全一致(哈希不变,
+  // 存量向量缓存不失效)。加了内容才变更哈希(触发该技能重新 embed),符合缓存语义。
+  if (useCases.length) obj.use_cases = useCases
+  return JSON.stringify(obj)
 }
 
 /** sha256 of the canonical input — cache invalidation key (per content). */
@@ -140,8 +151,11 @@ export function marketplaceArtifactHash(rawSkillMd: string): string {
 /** Natural-language text actually sent to the embedding model. */
 export function skillEmbedText(m: SkillEmbedMeta): string {
   const parts = [`${m.name} — ${(m.description ?? '').trim()}`]
+  const useCases = sortedTrimmed(m.use_cases)
   const tags = sortedTrimmed(m.tags)
   const related = sortedTrimmed(m.related_skills)
+  // use cases 排在 tags 前:它是用户对「拿它做什么」最直接的表达,检索相关度权重高于 tags。
+  if (useCases.length) parts.push(`use cases: ${useCases.join('; ')}`)
   if (tags.length) parts.push(`tags: ${tags.join(', ')}`)
   if (related.length) parts.push(`related: ${related.join(', ')}`)
   return parts.join(' | ')

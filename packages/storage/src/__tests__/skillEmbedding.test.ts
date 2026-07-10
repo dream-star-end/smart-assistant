@@ -51,6 +51,39 @@ describe('skillCanonicalInput / skillContentHash', () => {
     const c = JSON.parse(skillCanonicalInput({ name: 'n', description: 'd', tags: ['b', 'a'] }))
     assert.deepEqual(c.tags, ['a', 'b'])
   })
+
+  it('use_cases 为空/不传:哈希与旧实现完全一致(向量缓存不失效)', () => {
+    // 权威兼容性断言:三种「空」形态必须与「无 use_cases 字段」产生逐字节相同的 canonical
+    // JSON,即同一哈希 —— 否则市场加人向元数据会让整库向量缓存作废。
+    const base = skillContentHash({ name: 'foo', description: 'bar', tags: ['x'] })
+    assert.equal(skillContentHash({ name: 'foo', description: 'bar', tags: ['x'], use_cases: [] }), base)
+    assert.equal(
+      skillContentHash({ name: 'foo', description: 'bar', tags: ['x'], use_cases: ['  ', ''] }),
+      base,
+    )
+    // canonical JSON 里也不应出现 use_cases 键。
+    const canon = skillCanonicalInput({ name: 'foo', description: 'bar', tags: ['x'], use_cases: [] })
+    assert.equal(JSON.parse(canon).use_cases, undefined)
+  })
+
+  it('use_cases 非空:改变哈希且稳定于重排/空白', () => {
+    const base = skillContentHash({ name: 'foo', description: 'bar', tags: ['x'] })
+    const withUc = skillContentHash({
+      name: 'foo',
+      description: 'bar',
+      tags: ['x'],
+      use_cases: ['做周报', '做 PPT'],
+    })
+    assert.notEqual(withUc, base)
+    // 用例顺序/空白不影响哈希(与 tags 同一 sortedTrimmed 归一)。
+    const reordered = skillContentHash({
+      name: 'foo',
+      description: 'bar',
+      tags: ['x'],
+      use_cases: [' 做 PPT ', '做周报'],
+    })
+    assert.equal(reordered, withUc)
+  })
 })
 
 describe('skillEmbedText', () => {
@@ -65,6 +98,21 @@ describe('skillEmbedText', () => {
     assert.ok(t.includes('生成图片'))
     assert.ok(t.includes('tags: image'))
     assert.ok(t.includes('related: video'))
+  })
+
+  it('use cases 非空时排在 tags 之前;为空时不出现', () => {
+    const t = skillEmbedText({
+      name: 'media-gen',
+      description: '生成图片',
+      tags: ['image'],
+      use_cases: ['做海报', '做头图'],
+    })
+    assert.ok(t.includes('use cases:'))
+    assert.ok(t.includes('做海报'))
+    assert.ok(t.indexOf('use cases:') < t.indexOf('tags:'), 'use cases 应排在 tags 之前')
+
+    const empty = skillEmbedText({ name: 'media-gen', description: '生成图片', tags: ['image'] })
+    assert.ok(!empty.includes('use cases:'))
   })
 })
 
