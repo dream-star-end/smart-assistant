@@ -1559,8 +1559,32 @@ let _cgbCloseObserver = null
 let _cgbLastMove = 0
 let _cgbDecoding = false
 let _cgbPendingBlob = null
+let _cgbDecodeGen = 0
 let _cgbIsTouch = false
 let _cgbLastSentW = 0
+let _cgbPc = null
+let _cgbFastDc = null
+let _cgbControlDc = null
+let _cgbRtcActive = false
+let _cgbRtcOfferSeq = 0
+let _cgbRtcAnswerSent = false
+let _cgbRtcPendingCandidates = []
+let _cgbRtcRemoteSet = false
+let _cgbRtcRemoteCandidates = []
+let _cgbRtcTimer = null
+let _cgbRtcDisconnectedTimer = null
+let _cgbRtcRetryTimer = null
+let _cgbRtcAttempts = 0
+let _cgbCodec = ''
+let _cgbWebRtcAvailable = false
+let _cgbQualityMode = (() => {
+  try {
+    const value = localStorage.getItem('openclaude_cgb_quality')
+    return ['auto', 'fluent', 'clear'].includes(value) ? value : 'auto'
+  } catch {
+    return 'auto'
+  }
+})()
 const _cgbPressedKeys = new Set()
 
 function _cgbStatus(text) {
@@ -1576,22 +1600,44 @@ function _cgbOverlay(text) {
     o.textContent = text
   }
 }
-function _cgbSend(obj) {
+function _cgbSetTransport(kind, detail = '') {
+  const el = $('chatgpt-browser-transport')
+  if (!el) return
+  el.classList.toggle('is-webrtc', kind === 'webrtc')
+  el.textContent = kind === 'webrtc' ? `WebRTC${detail ? ` · ${detail}` : ''}` : 'JPEG 兼容'
+}
+function _cgbSendWs(obj) {
   if (_cgbWs && _cgbWs.readyState === 1) {
     try {
       _cgbWs.send(JSON.stringify(obj))
     } catch {}
   }
 }
+function _cgbSend(obj) {
+  const json = JSON.stringify(obj)
+  const fast = obj?.t === 'mouse' && (obj.kind === 'move' || obj.kind === 'wheel')
+  const channel = fast ? _cgbFastDc : _cgbControlDc
+  if (channel?.readyState === 'open') {
+    try {
+      channel.send(json)
+      return
+    } catch {}
+  }
+  _cgbSendWs(obj)
+}
+function _cgbActiveMedia() {
+  const video = $('chatgpt-browser-video')
+  return _cgbRtcActive && video && !video.hidden ? video : $('chatgpt-browser-canvas')
+}
 function _cgbScaleXY(e) {
-  const cv = $('chatgpt-browser-canvas')
-  const r = cv.getBoundingClientRect()
-  // The canvas uses object-fit:contain, so the painted image is letterboxed
+  const media = _cgbActiveMedia()
+  const r = media.getBoundingClientRect()
+  // The media uses object-fit:contain, so the painted image is letterboxed
   // inside the element box when aspect ratios differ (e.g. the soft keyboard
   // shrinks the container height). Map against the actual content rect, not the
   // full box, or edge taps land off-target.
-  const iw = cv.width || _cgbVW
-  const ih = cv.height || _cgbVH
+  const iw = media.videoWidth || media.width || _cgbVW
+  const ih = media.videoHeight || media.height || _cgbVH
   if (!r.width || !r.height || !iw || !ih) return { x: 0, y: 0 }
   const scale = Math.min(r.width / iw, r.height / ih)
   const dispW = iw * scale
@@ -1611,12 +1657,19 @@ function _cgbSendResize() {
   const h = Math.round(vp.clientHeight)
   if (w > 0 && h > 0) {
     _cgbLastSentW = w
-    _cgbSend({ t: 'resize', w, h })
+    _cgbSend({
+      t: 'resize',
+      w,
+      h,
+      dpr: Math.max(1, Math.min(3, window.devicePixelRatio || 1)),
+      mode: _cgbQualityMode,
+    })
   }
 }
 function _cgbDrawFrame(blob) {
   const cv = $('chatgpt-browser-canvas')
   if (!cv) return
+  const decodeGen = _cgbDecodeGen
   // Keep only one decode in-flight; on a slow device newest frame wins so
   // stale frames never queue up or paint out of order.
   if (_cgbDecoding) {
@@ -1624,12 +1677,8 @@ function _cgbDrawFrame(blob) {
     return
   }
   _cgbDecoding = true
-  // Decode via <img>+objectURL (works on every browser incl. iOS Safari, where
-  // createImageBitmap(Blob) can blank the canvas) instead of createImageBitmap.
-  const url = URL.createObjectURL(blob)
-  const img = new Image()
   const done = () => {
-    URL.revokeObjectURL(url)
+    if (decodeGen !== _cgbDecodeGen) return
     _cgbDecoding = false
     if (_cgbPendingBlob) {
       const b = _cgbPendingBlob
@@ -1637,17 +1686,269 @@ function _cgbDrawFrame(blob) {
       _cgbDrawFrame(b)
     }
   }
-  img.onload = () => {
-    if (cv.width !== img.naturalWidth || cv.height !== img.naturalHeight) {
-      cv.width = img.naturalWidth
-      cv.height = img.naturalHeight
+  const paint = (image, width, height) => {
+    if (decodeGen !== _cgbDecodeGen) return
+    if (cv.width !== width || cv.height !== height) {
+      cv.width = width
+      cv.height = height
     }
-    cv.getContext('2d').drawImage(img, 0, 0)
+    cv.getContext('2d').drawImage(image, 0, 0)
     _cgbOverlay(null)
-    done()
   }
-  img.onerror = done
-  img.src = url
+  const isAppleMobile = /iP(?:ad|hone|od)|Macintosh.*Mobile/i.test(navigator.userAgent || '')
+  if (typeof createImageBitmap === 'function' && !isAppleMobile) {
+    createImageBitmap(blob)
+      .then((bitmap) => {
+        paint(bitmap, bitmap.width, bitmap.height)
+        bitmap.close?.()
+      })
+      .catch(() => (decodeGen === _cgbDecodeGen ? _cgbDrawFrameWithImage(blob, paint) : undefined))
+      .finally(done)
+    return
+  }
+  _cgbDrawFrameWithImage(blob, paint).finally(done)
+}
+function _cgbDrawFrameWithImage(blob, paint) {
+  return new Promise((resolve) => {
+    const url = URL.createObjectURL(blob)
+    const img = new Image()
+    const finish = () => {
+      URL.revokeObjectURL(url)
+      resolve()
+    }
+    img.onload = () => {
+      paint(img, img.naturalWidth, img.naturalHeight)
+      finish()
+    }
+    img.onerror = finish
+    img.src = url
+  })
+}
+function _cgbModalOpen() {
+  return $('chatgpt-web-modal')?.classList.contains('open') === true
+}
+function _cgbClearRtcTimers() {
+  clearTimeout(_cgbRtcTimer)
+  clearTimeout(_cgbRtcDisconnectedTimer)
+  clearTimeout(_cgbRtcRetryTimer)
+  _cgbRtcTimer = null
+  _cgbRtcDisconnectedTimer = null
+  _cgbRtcRetryTimer = null
+}
+function _cgbResetRtc() {
+  const pc = _cgbPc
+  _cgbPc = null
+  if (pc) pc._cgbClosing = true
+  _cgbClearRtcTimers()
+  try {
+    _cgbFastDc?.close()
+  } catch {}
+  try {
+    _cgbControlDc?.close()
+  } catch {}
+  try {
+    pc?.close()
+  } catch {}
+  _cgbFastDc = null
+  _cgbControlDc = null
+  _cgbRtcAnswerSent = false
+  _cgbRtcPendingCandidates = []
+  _cgbRtcRemoteSet = false
+  _cgbRtcRemoteCandidates = []
+  _cgbRtcActive = false
+  _cgbCodec = ''
+  const video = $('chatgpt-browser-video')
+  const canvas = $('chatgpt-browser-canvas')
+  if (video) {
+    video.onloadeddata = null
+    try {
+      video.pause()
+    } catch {}
+    video.srcObject = null
+    video.hidden = true
+  }
+  if (canvas) canvas.hidden = false
+  _cgbSetTransport('jpeg')
+}
+function _cgbScheduleRtcRetry() {
+  if (!_cgbWebRtcAvailable || _cgbRtcRetryTimer || !_cgbModalOpen() || _cgbWs?.readyState !== 1) {
+    return
+  }
+  const delay = Math.min(30_000, 1500 * 2 ** Math.min(_cgbRtcAttempts++, 4))
+  _cgbRtcRetryTimer = setTimeout(() => {
+    _cgbRtcRetryTimer = null
+    if (_cgbModalOpen() && _cgbWs?.readyState === 1 && !_cgbRtcActive) {
+      _cgbSendWs({ t: 'webrtc-retry' })
+    }
+  }, delay)
+}
+function _cgbFallbackRtc(reason = 'fallback', retry = true) {
+  const hadRtc = !!_cgbPc || _cgbRtcActive
+  if (hadRtc) _cgbSendWs({ t: 'webrtc-fallback', reason })
+  _cgbResetRtc()
+  if (_cgbWs?.readyState === 1) _cgbStatus('已连接 · JPEG 兼容模式')
+  if (retry) _cgbScheduleRtcRetry()
+}
+function _cgbPreferVideoCodecs(pc) {
+  const capabilities = globalThis.RTCRtpReceiver?.getCapabilities?.('video')?.codecs || []
+  const priority = ['video/vp9', 'video/h264', 'video/vp8', 'video/av1']
+  const ordered = []
+  for (const mime of priority) {
+    ordered.push(...capabilities.filter((codec) => codec.mimeType?.toLowerCase() === mime))
+  }
+  ordered.push(...capabilities.filter((codec) => !priority.includes(codec.mimeType?.toLowerCase())))
+  for (const transceiver of pc.getTransceivers()) {
+    if (transceiver.receiver?.track?.kind !== 'video' || !transceiver.setCodecPreferences) continue
+    try {
+      transceiver.setCodecPreferences(ordered)
+    } catch {}
+  }
+}
+async function _cgbUpdateRtcCodec(pc) {
+  try {
+    const stats = await pc.getStats()
+    let codecId = ''
+    for (const stat of stats.values()) {
+      if (
+        stat.type === 'inbound-rtp' &&
+        !stat.isRemote &&
+        (stat.kind === 'video' || stat.mediaType === 'video')
+      ) {
+        codecId = stat.codecId || ''
+        break
+      }
+    }
+    const codec = codecId ? stats.get(codecId)?.mimeType?.replace(/^video\//i, '') : ''
+    if (_cgbPc === pc && codec) {
+      _cgbCodec = codec.toUpperCase()
+      _cgbSetTransport('webrtc', _cgbCodec)
+      _cgbStatus(
+        `已连接 · WebRTC ${_cgbCodec} · ${_cgbQualityMode === 'clear' ? '清晰' : _cgbQualityMode === 'fluent' ? '流畅' : '自动'}画质`,
+      )
+    }
+  } catch {}
+}
+function _cgbActivateRtc(pc) {
+  if (_cgbPc !== pc || _cgbRtcActive) return
+  const video = $('chatgpt-browser-video')
+  const canvas = $('chatgpt-browser-canvas')
+  if (!video?.videoWidth || !video?.videoHeight) return
+  _cgbRtcActive = true
+  _cgbRtcAttempts = 0
+  clearTimeout(_cgbRtcTimer)
+  _cgbRtcTimer = null
+  video.hidden = false
+  if (canvas) canvas.hidden = true
+  _cgbOverlay(null)
+  _cgbSetTransport('webrtc', '连接成功')
+  _cgbStatus('已连接 · WebRTC 低延迟 · 自动高清')
+  _cgbSendWs({ t: 'webrtc-active' })
+  _cgbSendResize()
+  setTimeout(() => _cgbUpdateRtcCodec(pc), 400)
+}
+function _cgbHandleRtcTrack(pc, event) {
+  if (_cgbPc !== pc || event.track?.kind !== 'video') return
+  const video = $('chatgpt-browser-video')
+  if (!video) return
+  const stream = event.streams?.[0] || new MediaStream([event.track])
+  video.srcObject = stream
+  video.onloadeddata = () => {
+    if (_cgbPc !== pc) return
+    if (typeof video.requestVideoFrameCallback === 'function') {
+      video.requestVideoFrameCallback(() => _cgbActivateRtc(pc))
+    } else {
+      _cgbActivateRtc(pc)
+    }
+  }
+  video.play().catch(() => {})
+}
+function _cgbHandleRtcConnectionState(pc) {
+  if (_cgbPc !== pc || pc._cgbClosing) return
+  const state = pc.connectionState
+  if (state === 'connected') {
+    clearTimeout(_cgbRtcDisconnectedTimer)
+    _cgbRtcDisconnectedTimer = null
+    _cgbSetTransport('webrtc', '视频连接中')
+  } else if (state === 'disconnected') {
+    if (!_cgbRtcDisconnectedTimer) {
+      _cgbRtcDisconnectedTimer = setTimeout(() => {
+        if (_cgbPc === pc && pc.connectionState !== 'connected') {
+          _cgbFallbackRtc('disconnected')
+        }
+      }, 5000)
+    }
+  } else if (state === 'failed' || state === 'closed') {
+    _cgbFallbackRtc(state)
+  }
+}
+async function _cgbAcceptRtcOffer(message) {
+  if (typeof RTCPeerConnection !== 'function' || !message?.sdp?.sdp) {
+    _cgbSendWs({ t: 'webrtc-fallback', reason: 'unsupported' })
+    _cgbResetRtc()
+    _cgbStatus('已连接 · JPEG 兼容模式')
+    return
+  }
+  const offerSeq = ++_cgbRtcOfferSeq
+  _cgbResetRtc()
+  const iceServers = Array.isArray(message.iceServers) ? message.iceServers : []
+  const pc = new RTCPeerConnection({ iceServers })
+  _cgbPc = pc
+  _cgbSetTransport('webrtc', '协商中')
+  pc.onicecandidate = (event) => {
+    if (_cgbPc !== pc || !event.candidate) return
+    const candidate = event.candidate.toJSON?.() || event.candidate
+    if (_cgbRtcAnswerSent) _cgbSendWs({ t: 'webrtc-candidate', candidate })
+    else _cgbRtcPendingCandidates.push(candidate)
+  }
+  pc.ondatachannel = (event) => {
+    if (_cgbPc !== pc) return
+    if (event.channel.label === 'cgb-fast') _cgbFastDc = event.channel
+    else if (event.channel.label === 'cgb-control') _cgbControlDc = event.channel
+  }
+  pc.ontrack = (event) => _cgbHandleRtcTrack(pc, event)
+  pc.onconnectionstatechange = () => _cgbHandleRtcConnectionState(pc)
+  _cgbRtcTimer = setTimeout(() => {
+    if (_cgbPc === pc && !_cgbRtcActive) _cgbFallbackRtc('client-timeout')
+  }, 12_000)
+  try {
+    await pc.setRemoteDescription({ type: 'offer', sdp: message.sdp.sdp })
+    if (_cgbPc !== pc || offerSeq !== _cgbRtcOfferSeq) return
+    _cgbRtcRemoteSet = true
+    for (const candidate of _cgbRtcRemoteCandidates.splice(0)) {
+      await pc.addIceCandidate(candidate).catch(() => {})
+    }
+    _cgbPreferVideoCodecs(pc)
+    const answer = await pc.createAnswer()
+    await pc.setLocalDescription(answer)
+    if (_cgbPc !== pc || offerSeq !== _cgbRtcOfferSeq) return
+    _cgbSendWs({
+      t: 'webrtc-answer',
+      sdp: { type: pc.localDescription.type, sdp: pc.localDescription.sdp },
+    })
+    _cgbRtcAnswerSent = true
+    for (const candidate of _cgbRtcPendingCandidates.splice(0)) {
+      _cgbSendWs({ t: 'webrtc-candidate', candidate })
+    }
+  } catch {
+    if (_cgbPc === pc) _cgbFallbackRtc('bad-offer')
+  }
+}
+async function _cgbHandleRtcCandidate(candidate) {
+  if (!_cgbPc || !candidate?.candidate) return
+  if (!_cgbRtcRemoteSet) {
+    _cgbRtcRemoteCandidates.push(candidate)
+    return
+  }
+  try {
+    await _cgbPc.addIceCandidate(candidate)
+  } catch {}
+}
+function _cgbHandleRtcState(message) {
+  if (message.state === 'fallback' || message.state === 'failed' || message.state === 'closed') {
+    _cgbFallbackRtc(message.reason || message.state, message.retry !== false)
+  } else if (message.state === 'connected' && !_cgbRtcActive) {
+    _cgbSetTransport('webrtc', '视频连接中')
+  }
 }
 function _cgbMapKey(e) {
   if (e.key === ' ') return 'Space'
@@ -1805,6 +2106,7 @@ function _cgbBindInput() {
   ime.addEventListener('blur', _cgbReleaseKeys)
   document.addEventListener('visibilitychange', () => {
     if (document.hidden) _cgbReleaseKeys()
+    else if (_cgbModalOpen() && !_cgbRtcActive && _cgbWs?.readyState === 1) _cgbScheduleRtcRetry()
   })
   // Re-fit the remote viewport on rotation / real width change (debounced).
   // A pure height change (soft keyboard showing/hiding) keeps the same width and
@@ -1822,9 +2124,18 @@ function _cgbBindInput() {
 }
 function stopChatgptBrowser() {
   _cgbReleaseKeys()
+  _cgbDecodeGen++
+  _cgbDecoding = false
+  _cgbPendingBlob = null
+  _cgbRtcOfferSeq++
+  _cgbWebRtcAvailable = false
+  _cgbRtcAttempts = 0
+  _cgbResetRtc()
   if (_cgbWs) {
     try {
       _cgbWs.onmessage = null
+      _cgbWs.onclose = null
+      _cgbWs.onerror = null
       _cgbWs.close()
     } catch {}
     _cgbWs = null
@@ -1832,6 +2143,8 @@ function stopChatgptBrowser() {
 }
 async function startChatgptBrowser() {
   stopChatgptBrowser()
+  const quality = $('chatgpt-browser-quality')
+  if (quality) quality.value = _cgbQualityMode
   _cgbOverlay('正在启动服务器浏览器…(首次较慢)')
   _cgbStatus('连接中…')
   let sess
@@ -1867,12 +2180,21 @@ async function startChatgptBrowser() {
     if (m.t === 'size') {
       _cgbVW = m.w
       _cgbVH = m.h
+    } else if (m.t === 'webrtc-offer') {
+      void _cgbAcceptRtcOffer(m)
+    } else if (m.t === 'webrtc-candidate') {
+      void _cgbHandleRtcCandidate(m.candidate)
+    } else if (m.t === 'webrtc-state') {
+      _cgbHandleRtcState(m)
     } else if (m.t === 'status') {
       if (m.state === 'launching') {
         _cgbOverlay('正在启动服务器浏览器…(首次较慢)')
         _cgbStatus('启动中…')
       } else if (m.state === 'ready') {
-        _cgbStatus('已连接 · 真实浏览器(点击画面开始操作)')
+        _cgbWebRtcAvailable = m.webrtc === true
+        _cgbStatus(
+          _cgbWebRtcAvailable ? '已连接 · 正在建立 WebRTC 低延迟画面…' : '已连接 · JPEG 兼容模式',
+        )
         _cgbSendResize() // fit the remote viewport to this device
       } else if (m.state === 'closed' || m.state === 'error') {
         _cgbOverlay(`浏览器已关闭:${m.message || ''} · 点「刷新」重连`)
@@ -1880,8 +2202,15 @@ async function startChatgptBrowser() {
       }
     }
   }
-  ws.onclose = () => _cgbStatus('已断开 · 点「刷新」重连')
-  ws.onerror = () => _cgbStatus('连接错误 · 点「刷新」重试')
+  ws.onclose = () => {
+    if (_cgbWs !== ws) return
+    _cgbWebRtcAvailable = false
+    _cgbResetRtc()
+    _cgbStatus('已断开 · 点「刷新」重连')
+  }
+  ws.onerror = () => {
+    if (_cgbWs === ws) _cgbStatus('连接错误 · 点「刷新」重试')
+  }
   _cgbBindInput()
 }
 function refreshChatGptWebFrame() {
@@ -2161,6 +2490,18 @@ async function init() {
   })
   initProxyUi()
   $('chatgpt-web-refresh-btn').onclick = refreshChatGptWebFrame
+  $('chatgpt-browser-quality').value = _cgbQualityMode
+  $('chatgpt-browser-quality').onchange = (e) => {
+    const mode = e.target.value
+    if (!['auto', 'fluent', 'clear'].includes(mode)) return
+    _cgbQualityMode = mode
+    try {
+      localStorage.setItem('openclaude_cgb_quality', mode)
+    } catch {}
+    _cgbSendResize()
+    const label = mode === 'clear' ? '清晰' : mode === 'fluent' ? '流畅' : '自动'
+    _cgbStatus(`已切换为${label}画质`)
+  }
   $('chatgpt-browser-back-btn').onclick = () => _cgbSend({ t: 'nav', action: 'back' })
   $('chatgpt-browser-home-btn').onclick = () => _cgbSend({ t: 'nav', action: 'home' })
   // Mobile: focus the hidden textarea from a real user gesture so iOS shows the

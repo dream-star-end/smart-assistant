@@ -16,7 +16,7 @@
 <link rel="apple-touch-icon" href="/icon.svg" />
 <link rel="stylesheet" href="/vendor/github-dark.min.css" />
 <link rel="stylesheet" href="/vendor/katex/katex.min.css" />
-<link rel="stylesheet" href="/style.css?v=69" />
+<link rel="stylesheet" href="/style.css?v=70" />
 <link rel="stylesheet" href="/vendor/xterm/xterm.css?v=1" />
 <style>/* Inline styles removed — see style.css */
 </style>
@@ -461,6 +461,12 @@
         <p id="chatgpt-web-proxy-status" class="chatgpt-web-status">准备就绪</p>
       </div>
       <div class="chatgpt-web-actions">
+        <span id="chatgpt-browser-transport" class="chatgpt-browser-transport">JPEG 兼容</span>
+        <select id="chatgpt-browser-quality" class="chatgpt-browser-quality" title="远程画面质量" aria-label="远程画面质量">
+          <option value="auto">自动画质</option>
+          <option value="fluent">流畅</option>
+          <option value="clear">清晰</option>
+        </select>
         <button id="chatgpt-browser-back-btn" class="btn btn-ghost btn-sm" type="button" title="后退">←</button>
         <button id="chatgpt-browser-home-btn" class="btn btn-ghost btn-sm" type="button" title="ChatGPT 主页">⌂</button>
         <button id="chatgpt-browser-keyboard-btn" class="btn btn-ghost btn-sm" type="button" title="呼出键盘">⌨</button>
@@ -471,6 +477,7 @@
       </div>
     </div>
     <div id="chatgpt-browser-viewport" class="chatgpt-browser-viewport" tabindex="0">
+      <video id="chatgpt-browser-video" class="chatgpt-browser-video" autoplay playsinline muted hidden></video>
       <canvas id="chatgpt-browser-canvas" class="chatgpt-browser-canvas" width="1280" height="800"></canvas>
       <textarea id="chatgpt-browser-ime" class="chatgpt-browser-ime" autocapitalize="off" autocomplete="off" autocorrect="off" spellcheck="false" aria-hidden="true"></textarea>
       <div id="chatgpt-browser-overlay" class="chatgpt-browser-overlay">正在启动服务器浏览器…</div>
@@ -899,7 +906,7 @@
 <!-- Force SW cache refresh (one-time, remove after all clients updated) -->
 <script>
 (function(){
-  var V='sw-flush-v28';
+  var V='sw-flush-v29';
   if(localStorage.getItem(V))return;
   if('serviceWorker' in navigator){
     navigator.serviceWorker.getRegistrations().then(function(regs){
@@ -921,6 +928,6 @@
 <script src="/vendor/katex/katex.min.js" defer></script>
 <script src="/vendor/qrcode.min.js"></script>
 <div id="toast" class="toast"></div>
-<script type="module" src="/modules/main.js?v=86"></script>
+<script type="module" src="/modules/main.js?v=87"></script>
 </body>
 </html>
