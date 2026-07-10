@@ -50,6 +50,21 @@ export function ocBrowserUserDataDir(agentId: string): string {
   return `/tmp/openclaude-browser-${safe}`
 }
 
+// oc-browser 文件类工具(screenshot/pdf)的可写根 —— 即 @playwright/mcp 子进程的
+// cwd。@playwright/mcp 把这些工具的 allowed roots hardcode 成 `[outputDir, cwd]`,
+// outputDir 无 `--output-dir` 时默认 = `<cwd>/.playwright-mcp`;把 cwd 设成 agent 卷根
+// 后,截图落 `<root>/generated/` 就合法(推导链详见 ocBrowserDaemon.ts 的
+// buildPlaywrightMcpTransportParams docblock)。
+//
+// 权威源 = OPENCLAUDE_HOME:entrypoint.ts 显式注入 `/home/agent/.openclaude`(agent
+// per-user volume 挂载点,也是 generated/uploads/memory 的父目录),subprocessRunner
+// spawn 子 MCP 时同样以它为 agent .openclaude 目录的权威。这里复用同一权威源、避免
+// 再硬编码出第二份真值;env 缺失(极端)时兜底回同一个容器内绝对路径。纯路径推导,
+// 不做存在性检查(存在性由调用方按需判定,见 daemon 的回落逻辑)。
+export function ocBrowserOutputRoot(): string {
+  return process.env.OPENCLAUDE_HOME?.trim() || '/home/agent/.openclaude'
+}
+
 // The 7 browser tools the daemon must expose (kept in sync with @playwright/mcp).
 // The daemon validates these exist via tools/list at startup so a pinned-version
 // bump that renames a tool fails loudly instead of at call time.

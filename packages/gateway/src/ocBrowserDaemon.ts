@@ -19,13 +19,20 @@
 
 import { existsSync, mkdirSync, unlinkSync } from 'node:fs'
 import { type Server, type Socket, connect as netConnect, createServer } from 'node:net'
+import { resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
-import { StdioClientTransport, getDefaultEnvironment } from '@modelcontextprotocol/sdk/client/stdio.js'
+import {
+  StdioClientTransport,
+  type StdioServerParameters,
+  getDefaultEnvironment,
+} from '@modelcontextprotocol/sdk/client/stdio.js'
 import {
   OC_BROWSER_TOOLS,
   type OcBrowserRequest,
   type OcBrowserResponse,
   ocBrowserAgentDir,
+  ocBrowserOutputRoot,
   ocBrowserSocketPath,
   ocBrowserUserDataDir,
 } from './ocBrowserShared.js'
@@ -35,6 +42,72 @@ const PLAYWRIGHT_MCP_PKG = process.env.OPENCLAUDE_PLAYWRIGHT_MCP_PKG?.trim() || 
 
 function log(msg: string): void {
   process.stderr.write(`[oc-browser-daemon] ${msg}\n`)
+}
+
+/**
+ * 组装 @playwright/mcp 子进程的 StdioClientTransport 参数。抽成纯函数,便于单测断言
+ * spawn 的 command/args/env/cwd(daemon `main()` 会 bind socket + 起子进程,有副作用,
+ * 不适合在测试里直接 import 跑;所以模块底部用 isDirectExecution 守卫 main())。
+ *
+ * ── cwd 推导链:为什么把子进程 cwd 设成 agent 卷根,而不是传 `--output-dir` ──
+ *   @playwright/mcp(0.0.76,镜像全局装)把 screenshot/pdf 等文件工具的可写根
+ *   hardcode 成 `[outputDir, cwd]` 两个槽;outputDir 无 `--output-dir` 时默认 =
+ *   `<cwd>/.playwright-mcp`。因此:
+ *     cwd = OPENCLAUDE_HOME(= /home/agent/.openclaude,agent per-user volume 根)
+ *     → allowed roots = [/home/agent/.openclaude/.playwright-mcp, /home/agent/.openclaude]
+ *       ① 截图 `--path /home/agent/.openclaude/generated/x.png` 在第二个根下 → 合法
+ *          (前端文件卡/下载的权威目录就是 generated/)。
+ *       ② page snapshot 等 playwright 内部产物仍落隐藏的 `<cwd>/.playwright-mcp/`,
+ *          不污染用户可见的 generated/ —— 这正是不选 `--output-dir generated` 的原因。
+ *   旧行为:未传 cwd → 子进程继承 daemon 的 cwd = /opt/openclaude(oc-browser.sh
+ *   `cd /opt/openclaude` + ocBrowserCli.spawnDaemon 的 cwd),roots 只含
+ *   `/opt/openclaude*`,generated/ 不在其中 → 现网实测 "File access denied ...
+ *   is outside allowed roots"。
+ *
+ * ── 只换这一个子进程的 cwd,不动 daemon 自身语义 ──
+ *   daemon 进程与 tsx 模块解析仍需在 /opt/openclaude 跑(oc-browser.sh 的 cd 不动)。
+ *   @playwright/mcp 走全局二进制(`npx --no-install @playwright/mcp`,非本地
+ *   node_modules 依赖 —— 已取证 gateway 未把它列为依赖),换 cwd 不影响 npx 包解析。
+ *
+ * ── 健壮性 ──
+ *   outputRoot 不存在(极端)时省略 cwd → 回落"继承 daemon cwd"的旧行为,不至于
+ *   起不来。正常路径由 entrypoint.ts(mkdir /home/agent/.openclaude,:456-460)保证存在。
+ */
+export function buildPlaywrightMcpTransportParams(agentId: string): StdioServerParameters {
+  const outputRoot = ocBrowserOutputRoot()
+  return {
+    command: 'npx',
+    args: [
+      '--no-install',
+      PLAYWRIGHT_MCP_PKG,
+      // @playwright/mcp 默认走 Chrome 品牌通道(/opt/google/chrome),镜像里装的
+      // 是 playwright chromium(PLAYWRIGHT_BROWSERS_PATH 缓存)—— 不显式指定会报
+      // "Chromium distribution 'chrome' is not found"(v3/v5 现网实测同病)。
+      '--browser',
+      'chromium',
+      '--headless',
+      '--no-sandbox',
+      '--user-data-dir',
+      ocBrowserUserDataDir(agentId),
+    ],
+    // StdioClientTransport's default env is a minimal allowlist that does NOT
+    // forward PLAYWRIGHT_BROWSERS_PATH, so the child would look for Chromium in
+    // the wrong cache and fail. Pass it through (the image installs it there).
+    env: {
+      ...getDefaultEnvironment(),
+      PLAYWRIGHT_BROWSERS_PATH:
+        process.env.PLAYWRIGHT_BROWSERS_PATH ?? '/usr/local/share/ms-playwright',
+    },
+    // cwd 见本函数 docblock 的推导链;目录缺失时省略以回落旧行为。
+    ...(existsSync(outputRoot) ? { cwd: outputRoot } : {}),
+    stderr: 'ignore',
+  }
+}
+
+function isDirectExecution(): boolean {
+  const argv1 = process.argv[1]
+  if (!argv1) return false
+  return resolve(argv1) === fileURLToPath(import.meta.url)
 }
 
 function socketLive(socketPath: string): Promise<boolean> {
@@ -196,31 +269,9 @@ async function main(): Promise<void> {
 
   // ── Start @playwright/mcp via the official MCP client ──
   try {
-    transport = new StdioClientTransport({
-      command: 'npx',
-      args: [
-        '--no-install',
-        PLAYWRIGHT_MCP_PKG,
-        // @playwright/mcp 默认走 Chrome 品牌通道(/opt/google/chrome),镜像里装的
-        // 是 playwright chromium(PLAYWRIGHT_BROWSERS_PATH 缓存)—— 不显式指定会报
-        // "Chromium distribution 'chrome' is not found"(v3/v5 现网实测同病)。
-        '--browser',
-        'chromium',
-        '--headless',
-        '--no-sandbox',
-        '--user-data-dir',
-        ocBrowserUserDataDir(agentId),
-      ],
-      // StdioClientTransport's default env is a minimal allowlist that does NOT
-      // forward PLAYWRIGHT_BROWSERS_PATH, so the child would look for Chromium in
-      // the wrong cache and fail. Pass it through (the image installs it there).
-      env: {
-        ...getDefaultEnvironment(),
-        PLAYWRIGHT_BROWSERS_PATH:
-          process.env.PLAYWRIGHT_BROWSERS_PATH ?? '/usr/local/share/ms-playwright',
-      },
-      stderr: 'ignore',
-    })
+    // 子进程 cwd = agent 卷根(见 buildPlaywrightMcpTransportParams docblock),让
+    // 截图能落 generated/;env/args 亦在此收口以便单测。
+    transport = new StdioClientTransport(buildPlaywrightMcpTransportParams(agentId))
     const client = new Client({ name: 'oc-browser-daemon', version: '1.0.0' }, { capabilities: {} })
     await client.connect(transport)
     // If the @playwright/mcp child dies later, the socket would stay live but
@@ -253,7 +304,12 @@ async function main(): Promise<void> {
   }
 }
 
-main().catch((err) => {
-  log(`fatal: ${err?.message ?? String(err)}`)
-  process.exit(1)
-})
+// 仅在被当作脚本直接执行时启动 daemon(npx tsx ocBrowserDaemon.ts <agentId>)。
+// import(单测)时不跑 main() —— 避免 bind socket / 起子进程的副作用。与
+// ocBrowserCli.ts 的同款守卫一致。
+if (isDirectExecution()) {
+  main().catch((err) => {
+    log(`fatal: ${err?.message ?? String(err)}`)
+    process.exit(1)
+  })
+}

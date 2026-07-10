@@ -1,11 +1,12 @@
 import { ArrowLeft, ArrowRight, Check, MailCheck, Sparkles } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
+import { type MouseEvent as ReactMouseEvent, useEffect, useRef, useState } from "react";
 import type { Theme } from "../hooks/useTheme";
 import { BRAND } from "../lib/brand";
-import { TERMS_VERSION } from "../lib/legal";
+import { LEGAL_DOCS, TERMS_VERSION, type LegalKind } from "../lib/legal";
+import { LegalDocBody } from "./LegalPage";
 import { ThemeToggle } from "./ThemeToggle";
 import { TurnstileWidget } from "./TurnstileWidget";
-import { Button, Input, Spinner } from "./ui";
+import { Button, Input, Modal, Spinner } from "./ui";
 
 /** 占位 token：canary 开启 TURNSTILE_TEST_BYPASS 时发它即可过（服务端 bypass 接受任意串）。*/
 const BYPASS_TOKEN = "bypass";
@@ -694,21 +695,55 @@ export function AuthGate({
 }
 
 /**
- * 《用户协议》《隐私政策》链接对，新标签打开。
+ * 《用户协议》《隐私政策》链接对：普通点击就地弹窗展示正文（Modal 正文区自带
+ * overflow-y-auto 滚动条），带修饰键/中键仍按 <a href> 原生行为新标签打开 /terms /privacy。
  * 用 <a> 而非 button：登录/注册按钮的可及名唯一性有测试红线（getByRole("button")），
  * 且 <a href> 属交互内容，位于 <label> 内点击时按 HTML 规范不会触发 label 的
- * checkbox 激活转发——链接可点、勾选不误触。
+ * checkbox 激活转发——链接可点、勾选不误触。弹窗经 Radix Portal 渲染在 body 下,
+ * 不落在 <label> DOM 内,同样不会误触勾选。
  */
 function LegalLinks() {
+  const [openDoc, setOpenDoc] = useState<LegalKind | null>(null);
+
+  const openInModal = (kind: LegalKind) => (e: ReactMouseEvent<HTMLAnchorElement>) => {
+    // 修饰键/非主键点击保留浏览器原生"新标签打开"语义,只有普通左键点击走弹窗。
+    if (e.defaultPrevented || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey || e.button !== 0) return;
+    e.preventDefault();
+    setOpenDoc(kind);
+  };
+
   return (
     <>
-      <a href="/terms" target="_blank" rel="noreferrer" className="text-accent hover:underline">
+      <a
+        href="/terms"
+        target="_blank"
+        rel="noreferrer"
+        onClick={openInModal("terms")}
+        className="text-accent hover:underline"
+      >
         《用户协议》
       </a>
       与
-      <a href="/privacy" target="_blank" rel="noreferrer" className="text-accent hover:underline">
+      <a
+        href="/privacy"
+        target="_blank"
+        rel="noreferrer"
+        onClick={openInModal("privacy")}
+        className="text-accent hover:underline"
+      >
         《隐私政策》
       </a>
+      <Modal
+        open={openDoc !== null}
+        onOpenChange={(open) => {
+          if (!open) setOpenDoc(null);
+        }}
+        title={openDoc ? LEGAL_DOCS[openDoc].title : ""}
+        description={openDoc ? `更新日期:${LEGAL_DOCS[openDoc].updated} · 生效日期:${LEGAL_DOCS[openDoc].updated}` : ""}
+        className="max-w-2xl"
+      >
+        {openDoc && <LegalDocBody kind={openDoc} />}
+      </Modal>
     </>
   );
 }

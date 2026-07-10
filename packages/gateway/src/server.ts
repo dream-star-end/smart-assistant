@@ -9516,13 +9516,18 @@ export class Gateway {
       ? ((frame as any)._masterHistoricalMessages as unknown[])
       : undefined
 
-    // ── V3 S12e CG7 — mint per-turn trace id ──
+    // ── V3 S12e CG7 — 采用本 turn 的 trace id(traceId 双权威源收口)──
     // Placed AFTER duplicate idempotency return(dup doesn't open a new turn → no
     // turnTraceId concept)but BEFORE rate-limit so that the rate-limit early-
-    // return outbound also carries this turn's trace id. The helper also returns
-    // a parsed `clientTraceId`(observation-only echo)but CG7 scope does not yet
-    // wire it into any log/frame — left for follow-up CG.
+    // return outbound also carries this turn's trace id.
+    //
+    // 权威 = master 注入的 frame.traceId(commercial userChatBridge CG2a 在 inbound
+    // 入口 rewrite 注入,且是登记 PG turn_traces 的唯一持久落点)。此处**优先采用**
+    // frame.traceId(经 parseTraceIdCandidate 校验合法),不存在/非法才回落自铸 ——
+    // 保证前端底部展示的请求ID 与运维 turn_traces 登记一致。clientTraceId 仍是纯
+    // observation echo,永不参与 turnTraceId 选取。详见 _buildTurnTraceContext docblock。
     const { traceId: turnTraceId } = _buildTurnTraceContext(
+      (frame as any).traceId,
       (frame as any).clientTraceId,
       this.log,
     )
@@ -10911,31 +10916,63 @@ export function _stripPrivateRoutingFields<
 /**
  * Compute the per-turn trace context at dispatchInbound entry.
  *
- * Contract B(control plane / turn level):
- *   - The **master** is the canonical authority — it always mints a fresh
- *     `traceId` via `newTraceId()` for every turn that survives the duplicate
- *     idempotency check. This is the trace id stamped on every outbound frame
- *     of the turn.
- *   - The client MAY provide a `clientTraceId` for observation only. If it
- *     parses cleanly it is echoed in the returned `clientTraceId` field so
- *     submit-layer logs can correlate; otherwise we warn with the issue enum
- *     and proceed with master's fresh trace id.
+ * ── CG7 traceId 双权威源收口(2026-07-10)──
  *
- * Anti-log-injection: warn ctx carries only the `issue` enum, never the raw
- * candidate value.
+ * turnTraceId 是本 turn 钉在**每一个 outbound 帧**、并折进 messages[i].usage.traceId
+ * 成为前端底部"请求ID"展示、也作为 submit 传参传给 runner 的 canonical。它的**唯一
+ * 权威源是 master**,不是容器 gateway 自铸。三级优先:
+ *
+ *   1. master 注入 frame.traceId(权威)—— v5 商业版容器 gateway 只从 master 桥
+ *      (commercial userChatBridge CG2a)经 secret 闸收帧。master 在 inbound.message
+ *      入口 `newTraceId()` 铸造 canonical,rewrite 注入到转发帧的 `traceId` 字段,并
+ *      **同步登记 PG turn_traces 表(CG2d)** —— 那是运维"请求ID一键定位"的唯一持久
+ *      落点。容器必须原样采用 master 注入值作为 turnTraceId,前端底部展示的请求ID 才
+ *      能与 turn_traces 对上。历史 bug:此函数曾无条件 `newTraceId()` 自铸、无视 master
+ *      注入,导致底部请求ID(自造)查 turn_traces(master 登记)查不到(实锤会话
+ *      webmrevafa0pvo3qm:底部 cc395cf5… vs turn_traces 5e08cfbc…)。
+ *   2. 自铸(fallback)—— 个人版直连场景 master 不注入 frame.traceId(缺省),或注入
+ *      值畸形/伪造时,回落 `newTraceId()` 自铸,保证 turn 一定有合法 canonical。
+ *   3. clientTraceId 永远只是 observation echo,**绝不**参与 turnTraceId 选取。若 client
+ *      提供且合法则原样回显供 submit 层日志关联;非法只记 issue 枚举。
+ *
+ * 信任边界:容器 gateway 信任 frame.traceId 的前提是 secret 闸保证"只有 master 能送帧"
+ * (v5 商业版)。个人版直连场景客户端理论上能在 inbound JSON 里塞 traceId —— 但
+ * turnTraceId 只是观测/关联 id(个人版无 master turn_traces 可被冒充),且
+ * `parseTraceIdCandidate` 兜底畸形/伪造值(格式合法性 + anti-log-injection),故"信任 +
+ * 格式校验"的组合在两种部署形态下都安全。
+ *
+ * Anti-log-injection:所有 warn ctx 只带 `issue` 枚举,绝不带 raw candidate 值。
  */
 export function _buildTurnTraceContext(
+  masterRaw: unknown,
   clientRaw: unknown,
   log: Logger,
 ): { traceId: string; clientTraceId?: string } {
+  // ── 权威:master 注入 frame.traceId(合法则直接采用,不再自铸)──
+  let turnTraceId: string | undefined
+  if (masterRaw !== undefined) {
+    const parsedMaster = parseTraceIdCandidate(masterRaw)
+    if (parsedMaster.ok) {
+      turnTraceId = parsedMaster.traceId
+    } else {
+      // master 注入值畸形/伪造:回落自铸,只记 issue 枚举(anti-log-injection)。
+      log.warn('inbound.master_trace_invalid', { issue: parsedMaster.issue })
+    }
+  }
+  // ── fallback:无 master 注入 / master 注入非法 → 自铸 ──
+  if (turnTraceId === undefined) {
+    turnTraceId = newTraceId()
+  }
+
+  // ── clientTraceId:observation-only echo,与 turnTraceId 选取完全解耦 ──
   if (clientRaw !== undefined) {
     const parsed = parseTraceIdCandidate(clientRaw)
     if (parsed.ok) {
-      return { traceId: newTraceId(), clientTraceId: parsed.traceId }
+      return { traceId: turnTraceId, clientTraceId: parsed.traceId }
     }
     log.warn('inbound.client_trace_invalid', { issue: parsed.issue })
   }
-  return { traceId: newTraceId() }
+  return { traceId: turnTraceId }
 }
 
 /**

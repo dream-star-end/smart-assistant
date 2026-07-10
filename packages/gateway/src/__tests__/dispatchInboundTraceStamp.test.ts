@@ -5,12 +5,19 @@
  * Tests are split into three groups:
  *
  *   ── Helper unit tests ─────────────────────────────────────────────
- *     `_buildTurnTraceContext`:
- *       - master mints fresh traceId regardless of clientTraceId presence
- *       - valid client trace → echoed as clientTraceId
- *       - invalid client trace → warn ctx carries ONLY `issue` enum
- *         (anti-log-injection); fallback newTraceId still returned
- *       - missing / undefined client trace → no warn, just newTraceId
+ *     `_buildTurnTraceContext` (traceId 双权威源收口, 2026-07-10):
+ *       Authority = master-injected `frame.traceId`; gateway self-mints ONLY
+ *       when master didn't inject (personal direct-connect) or injected a
+ *       malformed value. Three-tier priority:
+ *       - valid master frame.traceId → adopted verbatim as turnTraceId
+ *         (NO self-mint), regardless of clientTraceId presence
+ *       - malformed master frame.traceId (bad-charset / too-long / wrong-type)
+ *         → warn `inbound.master_trace_invalid` (issue enum only) + self-mint
+ *       - absent master frame.traceId → self-mint, no master warn
+ *       - clientTraceId is observation-only echo, NEVER selects turnTraceId:
+ *         valid client → echoed as clientTraceId; invalid client → warn
+ *         `inbound.client_trace_invalid` with ONLY `issue` enum
+ *         (anti-log-injection)
  *     `_inheritOutboundRouting`:
  *       - copies sessionKey/channel/peer from main `out`
  *       - conditionally copies _userId (omit key when absent)
@@ -71,30 +78,40 @@ function makeLog() {
   }
 }
 
-test('buildTurnTraceContext: clientRaw === undefined → no warn, fresh traceId, no clientTraceId', () => {
+// A syntactically valid 32hex trace id (matches TRACE_ID_REGEX). Used both as a
+// master-injected canonical and, in the legacy group below, as a client echo.
+const VALID_TRACE = '0123456789abcdef0123456789abcdef'
+
+// ── Group 1: no master injection → self-mint + clientTraceId echo ──
+// These pin the fallback tier (personal direct-connect / master omitted
+// frame.traceId). masterRaw is always `undefined` here; the assertions on the
+// self-minted traceId + clientTraceId echo semantics are unchanged from the
+// pre-收口 helper — only the call arity changed (masterRaw arg prepended).
+
+test('buildTurnTraceContext: no master + no client → no warn, fresh traceId, no clientTraceId', () => {
   const { log, logs } = makeLog()
-  const r = _buildTurnTraceContext(undefined, log)
+  const r = _buildTurnTraceContext(undefined, undefined, log)
   assert.match(r.traceId, /^[A-Za-z0-9_-]{16,64}$/)
   assert.equal(r.clientTraceId, undefined)
   assert.equal(logs.length, 0)
 })
 
-test('buildTurnTraceContext: valid client trace → newTraceId master + clientTraceId echoed', () => {
+test('buildTurnTraceContext: no master + valid client → self-mint + clientTraceId echoed', () => {
   const { log, logs } = makeLog()
-  const client = '0123456789abcdef0123456789abcdef'
-  const r = _buildTurnTraceContext(client, log)
-  // master mints fresh, NOT identical to client
+  const client = VALID_TRACE
+  const r = _buildTurnTraceContext(undefined, client, log)
+  // no master injection → self-mint, NOT identical to client (client never selects turnTraceId)
   assert.match(r.traceId, /^[A-Za-z0-9_-]{16,64}$/)
-  assert.notEqual(r.traceId, client, 'master traceId must be freshly minted, not echoed from client')
+  assert.notEqual(r.traceId, client, 'self-minted traceId must not be echoed from clientTraceId')
   // client value preserved as observation echo
   assert.equal(r.clientTraceId, client)
   assert.equal(logs.length, 0)
 })
 
-test('buildTurnTraceContext: bad-charset client trace → warn issue=bad-charset, raw NOT in log', () => {
+test('buildTurnTraceContext: no master + bad-charset client → warn issue=bad-charset, raw NOT in log', () => {
   const { log, logs } = makeLog()
   const poison = 'INJECTED_TRACE$$$$\r\nLog: pwned'
-  const r = _buildTurnTraceContext(poison, log)
+  const r = _buildTurnTraceContext(undefined, poison, log)
   // fallback fresh
   assert.match(r.traceId, /^[A-Za-z0-9_-]{16,64}$/)
   assert.equal(r.clientTraceId, undefined)
@@ -109,28 +126,109 @@ test('buildTurnTraceContext: bad-charset client trace → warn issue=bad-charset
   assert.equal(serialised.includes('pwned'), false)
 })
 
-test('buildTurnTraceContext: too-short client trace → warn issue=too-short, fallback fresh id', () => {
+test('buildTurnTraceContext: no master + too-short client → warn issue=too-short, fallback fresh id', () => {
   const { log, logs } = makeLog()
-  const r = _buildTurnTraceContext('short', log)
+  const r = _buildTurnTraceContext(undefined, 'short', log)
   assert.match(r.traceId, /^[A-Za-z0-9_-]{16,64}$/)
   assert.equal(r.clientTraceId, undefined)
   assert.equal(logs[0].ctx.issue, 'too-short')
 })
 
-test('buildTurnTraceContext: wrong-type (non-string) → warn issue=wrong-type, fallback fresh', () => {
+test('buildTurnTraceContext: no master + wrong-type client (non-string) → warn issue=wrong-type, fallback fresh', () => {
   const { log, logs } = makeLog()
-  const r = _buildTurnTraceContext({ malicious: 'object' }, log)
+  const r = _buildTurnTraceContext(undefined, { malicious: 'object' }, log)
   assert.match(r.traceId, /^[A-Za-z0-9_-]{16,64}$/)
   assert.equal(r.clientTraceId, undefined)
   assert.equal(logs[0].ctx.issue, 'wrong-type')
 })
 
-test('buildTurnTraceContext: empty string client trace → warn issue=empty, fallback fresh', () => {
+test('buildTurnTraceContext: no master + empty-string client → warn issue=empty, fallback fresh', () => {
   const { log, logs } = makeLog()
-  const r = _buildTurnTraceContext('', log)
+  const r = _buildTurnTraceContext(undefined, '', log)
   assert.match(r.traceId, /^[A-Za-z0-9_-]{16,64}$/)
   assert.equal(r.clientTraceId, undefined)
   assert.equal(logs[0].ctx.issue, 'empty')
+})
+
+// ── Group 2: master-injected frame.traceId authority (traceId 双权威源收口) ──
+// These are the behavioral core of the fix: when master injects a valid
+// frame.traceId the gateway MUST adopt it verbatim (no self-mint), so the
+// front-end "请求ID" == master's PG turn_traces registration. Malformed /
+// forged injections fall back to self-mint + warn.
+
+test('buildTurnTraceContext: valid master frame.traceId → adopted verbatim, NO self-mint, no warn', () => {
+  const { log, logs } = makeLog()
+  const master = 'cc395cf5e883c7b54fcdbd6c45f8902e' // 32hex, the shape master injects
+  const r = _buildTurnTraceContext(master, undefined, log)
+  // authority: turnTraceId IS the master-injected value, not a fresh mint
+  assert.equal(r.traceId, master, 'master-injected frame.traceId must be adopted verbatim')
+  assert.equal(r.clientTraceId, undefined)
+  assert.equal(logs.length, 0)
+})
+
+test('buildTurnTraceContext: valid master + valid client → master wins traceId, client only echoed', () => {
+  const { log, logs } = makeLog()
+  const master = 'cc395cf5e883c7b54fcdbd6c45f8902e'
+  const client = VALID_TRACE
+  const r = _buildTurnTraceContext(master, client, log)
+  // master selects turnTraceId; client NEVER competes for it
+  assert.equal(r.traceId, master)
+  assert.notEqual(r.traceId, client)
+  assert.equal(r.clientTraceId, client, 'client value still echoed as observation-only')
+  assert.equal(logs.length, 0)
+})
+
+test('buildTurnTraceContext: bad-charset master frame.traceId → self-mint + warn inbound.master_trace_invalid, raw NOT in log', () => {
+  const { log, logs } = makeLog()
+  const poison = 'FORGED\r\nturn_traces spoof $$$'
+  const r = _buildTurnTraceContext(poison, undefined, log)
+  // malformed master injection → fall back to self-mint (never adopt the forged value)
+  assert.match(r.traceId, /^[A-Za-z0-9_-]{16,64}$/)
+  assert.notEqual(r.traceId, poison)
+  assert.equal(r.clientTraceId, undefined)
+  assert.equal(logs.length, 1)
+  assert.equal(logs[0].msg, 'inbound.master_trace_invalid')
+  assert.equal(logs[0].ctx.issue, 'bad-charset')
+  // anti-log-injection: warn ctx keys must be ONLY `issue`
+  assert.deepEqual(Object.keys(logs[0].ctx), ['issue'])
+  const serialised = JSON.stringify(logs[0])
+  assert.equal(serialised.includes('FORGED'), false)
+  assert.equal(serialised.includes('spoof'), false)
+})
+
+test('buildTurnTraceContext: too-long master frame.traceId (>64) → self-mint + warn issue=too-long', () => {
+  const { log, logs } = makeLog()
+  const tooLong = 'a'.repeat(65) // valid charset but exceeds max length
+  const r = _buildTurnTraceContext(tooLong, undefined, log)
+  assert.match(r.traceId, /^[A-Za-z0-9_-]{16,64}$/)
+  assert.notEqual(r.traceId, tooLong)
+  assert.equal(logs.length, 1)
+  assert.equal(logs[0].msg, 'inbound.master_trace_invalid')
+  assert.equal(logs[0].ctx.issue, 'too-long')
+})
+
+test('buildTurnTraceContext: wrong-type master frame.traceId (object) → self-mint + warn issue=wrong-type', () => {
+  const { log, logs } = makeLog()
+  const r = _buildTurnTraceContext({ forged: 'object' }, undefined, log)
+  assert.match(r.traceId, /^[A-Za-z0-9_-]{16,64}$/)
+  assert.equal(logs.length, 1)
+  assert.equal(logs[0].msg, 'inbound.master_trace_invalid')
+  assert.equal(logs[0].ctx.issue, 'wrong-type')
+})
+
+test('buildTurnTraceContext: malformed master + valid client → self-mint traceId, master warn, client echoed', () => {
+  // master injection is malformed (fall back to self-mint) but a valid client
+  // observation is still echoed independently — proves the two tiers are decoupled.
+  const { log, logs } = makeLog()
+  const client = VALID_TRACE
+  const r = _buildTurnTraceContext('short', client, log)
+  assert.match(r.traceId, /^[A-Za-z0-9_-]{16,64}$/)
+  assert.notEqual(r.traceId, client, 'client must not be promoted to turnTraceId even when master is invalid')
+  assert.equal(r.clientTraceId, client)
+  // exactly one master warn, no client warn (client was valid)
+  assert.equal(logs.length, 1)
+  assert.equal(logs[0].msg, 'inbound.master_trace_invalid')
+  assert.equal(logs[0].ctx.issue, 'too-short')
 })
 
 // ── Helper unit tests: _inheritOutboundRouting ──
@@ -369,14 +467,32 @@ test('structural: every outbound frame literal in dispatchInbound is trace-stamp
   )
 })
 
-test('structural: dispatchInbound mints turnTraceId via _buildTurnTraceContext exactly once', () => {
-  // Guards against accidental double-mint (would cause derived frames in
-  // separate branches to disagree) or removal of the mint entirely.
+test('structural: dispatchInbound derives turnTraceId via _buildTurnTraceContext exactly once, feeding master frame.traceId first', () => {
+  // traceId 双权威源收口 — the single authority for turnTraceId is ONE
+  // _buildTurnTraceContext call whose FIRST arg is the master-injected
+  // `frame.traceId`, SECOND is `frame.clientTraceId` (observation echo).
+  //
+  // Guards against: (a) accidental double-derive (would let derived frames in
+  // separate branches disagree), (b) removal of the derive entirely, and
+  // (c) — the regression this fix targets — reverting to the pre-收口 wiring
+  // that ignored frame.traceId and passed only clientTraceId, which self-mints
+  // a fresh id and reintroduces the "底部请求ID 查 turn_traces 查不到" bug.
   const mints = dispatchBodyNoComments.match(/_buildTurnTraceContext\(/g) ?? []
   assert.equal(
     mints.length,
     1,
     `expected exactly 1 _buildTurnTraceContext call in dispatchInbound, got ${mints.length}`,
+  )
+  // Pin the argument order structurally (whitespace/newlines between args are
+  // tolerated). First arg = master authority, second = client echo.
+  const callArgs = dispatchBodyNoComments.match(
+    /_buildTurnTraceContext\(\s*\(frame as any\)\.traceId\s*,\s*\(frame as any\)\.clientTraceId\s*,/,
+  )
+  assert.ok(
+    callArgs,
+    'dispatchInbound must call _buildTurnTraceContext((frame as any).traceId, (frame as any).clientTraceId, ...) — ' +
+      'master frame.traceId FIRST (authority, == PG turn_traces registration), clientTraceId SECOND (echo). ' +
+      'Regressing to a clientTraceId-only call reintroduces the traceId 双权威源 mismatch bug.',
   )
 })
 

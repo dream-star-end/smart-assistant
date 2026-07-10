@@ -1,6 +1,7 @@
 import "@testing-library/jest-dom/vitest";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, test } from "vitest";
+import { MediaSignProvider } from "./chat/media";
 import { ToolCard } from "./ToolCard";
 
 afterEach(cleanup);
@@ -658,4 +659,258 @@ describe("ToolCard 二级分派 + 状态 (P5)", () => {
   // 退役 + 前端 §-blob 记忆卡删除),记忆读写现由记忆中心文件列表 + Write/Edit「记忆更新」卡承载;
   // 历史会话里的 memory op 退化为通用 KvList 展示,故此处不再有专属卡断言。
 
+});
+
+describe("codex fileChange(apply_patch)的 Write/Edit 卡", () => {
+  const demoPath = "/home/agent/.openclaude/generated/tool-card-demo.txt";
+
+  test("Write(add)→ 显示新文件内容,不再空壳/裸 changes JSON", () => {
+    render(
+      <ToolCard
+        message={{
+          toolName: "Write",
+          inputJson: {
+            file_path: demoPath,
+            kind: "add",
+            changes: [
+              {
+                path: demoPath,
+                kind: { type: "add" },
+                diff: "OpenClaude 工具卡片演示文件\n状态：由受控 apply_patch 调用创建，可安全删除。\n",
+              },
+            ],
+          },
+          output: `add: ${demoPath}`,
+          _completed: true,
+        }}
+      />,
+    );
+    expect(screen.getByText("写入文件")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button"));
+    const pre = document.querySelector("pre");
+    expect(pre?.textContent).toContain("OpenClaude 工具卡片演示文件");
+    expect(pre?.textContent).toContain("可安全删除");
+    // header 摘要 + 展开体 FileMeta 都显示短路径。
+    expect(screen.getAllByText("…/.openclaude/generated/tool-card-demo.txt").length).toBeGreaterThanOrEqual(1);
+    const text = document.body.textContent || "";
+    expect(text).not.toContain('"changes"');
+    expect(text).not.toContain('{"type":"add"}');
+  });
+
+  test("Edit(update)→ unified diff 按行着色(+绿/-红)", () => {
+    render(
+      <ToolCard
+        message={{
+          toolName: "Edit",
+          inputJson: {
+            file_path: "/home/agent/demo.txt",
+            kind: "update",
+            changes: [
+              {
+                path: "/home/agent/demo.txt",
+                kind: { type: "update" },
+                diff: "@@ -1,2 +1,2 @@\n-旧的一行\n+新的一行\n 上下文行",
+              },
+            ],
+          },
+          output: "update: /home/agent/demo.txt",
+          _completed: true,
+        }}
+      />,
+    );
+    expect(screen.getByText("编辑文件")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button"));
+    expect(screen.getByText("-旧的一行").className).toContain("text-danger");
+    expect(screen.getByText("+新的一行").className).toContain("text-success");
+    expect(screen.getByText("上下文行")).toBeInTheDocument();
+  });
+
+  test("Edit(delete)→ 明确「删除文件」状态行(danger,非绿色成功)", () => {
+    render(
+      <ToolCard
+        message={{
+          toolName: "Edit",
+          inputJson: {
+            file_path: demoPath,
+            kind: "delete",
+            changes: [{ path: demoPath, kind: { type: "delete" }, diff: "" }],
+          },
+          output: `delete: ${demoPath}`,
+          _completed: true,
+        }}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button"));
+    const del = screen.getByText("删除文件");
+    expect(del.className).toContain("text-danger");
+    expect(del.className).not.toContain("text-success");
+    // 原始 "delete: /path" output 不再当绿色成功状态行渲染。
+    expect(document.body.textContent || "").not.toContain(`delete: ${demoPath}`);
+  });
+
+  test("多 changes 逐个显示 path", () => {
+    render(
+      <ToolCard
+        message={{
+          toolName: "Edit",
+          inputJson: {
+            file_path: "/a/1.txt",
+            kind: "update",
+            changes: [
+              { path: "/a/1.txt", kind: { type: "update" }, diff: "-x\n+y" },
+              { path: "/a/2.txt", kind: { type: "delete" }, diff: "" },
+            ],
+          },
+          _completed: true,
+        }}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button"));
+    expect(screen.getAllByText("/a/1.txt").length).toBeGreaterThanOrEqual(1);
+    expect(screen.getByText("/a/2.txt")).toBeInTheDocument();
+    expect(screen.getByText("删除文件")).toBeInTheDocument();
+    expect(screen.getByText("+y")).toBeInTheDocument();
+  });
+
+  test("claude 原生 Write(content)行为不变,不误入 codex 分支", () => {
+    render(
+      <ToolCard
+        message={{
+          toolName: "Write",
+          inputJson: { file_path: "/a/b.ts", content: "export const x = 1;" },
+          output: "File created successfully",
+          _completed: true,
+        }}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button"));
+    expect(document.querySelector("pre")?.textContent).toContain("export const x = 1;");
+    expect(screen.getByText("File created successfully")).toBeInTheDocument();
+  });
+});
+
+describe("codex imageView 缩略图", () => {
+  const sign = async (paths: string[]) =>
+    Object.fromEntries(paths.map((p) => [p, `/api/media?sig=x&path=${encodeURIComponent(p)}`]));
+
+  test("path 型 imageView → 签名缩略图 + 路径 FileMeta,不裸 JSON", async () => {
+    const { container } = render(
+      <MediaSignProvider sign={sign}>
+        <ToolCard
+          message={{
+            toolName: "codex:imageView",
+            inputJson: { type: "imageView", id: "exec-8f2a", path: "/opt/openclaude/tool-card-example.png" },
+            _completed: true,
+          }}
+        />
+      </MediaSignProvider>,
+    );
+    fireEvent.click(screen.getByRole("button"));
+    await waitFor(() => expect(container.querySelector("img")).not.toBeNull());
+    expect(container.querySelector("img")?.getAttribute("src")).toContain("/api/media?sig=x");
+    expect(screen.getAllByText("…/opt/openclaude/tool-card-example.png").length).toBeGreaterThanOrEqual(1);
+    const text = document.body.textContent || "";
+    expect(text).not.toContain("exec-8f2a");
+    expect(text).not.toContain('"path"');
+  });
+
+  test("非法/相对路径不产 img,仍保留路径文本", () => {
+    const { container } = render(
+      <ToolCard
+        message={{
+          toolName: "codex:imageView",
+          inputJson: { type: "imageView", id: "exec-1", path: "javascript:alert(1)//x.png" },
+          _completed: true,
+        }}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button"));
+    expect(container.querySelector("img")).toBeNull();
+  });
+});
+
+describe("subAgentActivity 卡(含存量孤儿形状)", () => {
+  test("存量孤儿(toolName unknown + item 在 output)→ 子代理活动语义卡,不裸 JSON", () => {
+    const payload = {
+      type: "subAgentActivity",
+      id: "call_8xd930hU3Lw7Hrhn0Go32z1M",
+      kind: "started",
+      agentThreadId: "019f4bd8-c3b8-7112-a7fb-af393bb6fadb",
+      agentPath: "/root/tool_card_probe",
+    };
+    render(
+      <ToolCard message={{ toolName: "unknown", inputJson: {}, output: JSON.stringify(payload), _completed: true }} />,
+    );
+    expect(screen.getByText("子代理活动")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button"));
+    expect(screen.getByText("子代理已启动")).toBeInTheDocument();
+    expect(screen.getAllByText("/root/tool_card_probe").length).toBeGreaterThanOrEqual(1);
+    const text = document.body.textContent || "";
+    expect(text).not.toContain('"agentThreadId"');
+    expect(text).not.toContain("019f4bd8");
+    expect(text).not.toContain('{"type":"subAgentActivity"');
+    expect(text).not.toContain("call_8xd930hU3Lw7Hrhn0Go32z1M");
+  });
+
+  test("kind=completed(直接 codex: 名)→ 子代理已完成", () => {
+    render(
+      <ToolCard
+        message={{
+          toolName: "codex:subAgentActivity",
+          inputJson: {
+            type: "subAgentActivity",
+            id: "call_x",
+            kind: "completed",
+            agentThreadId: "th",
+            agentPath: "/root/tool_card_probe",
+          },
+          _completed: true,
+        }}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button"));
+    expect(screen.getByText("子代理已完成")).toBeInTheDocument();
+  });
+
+  test("未知 kind 原样显示", () => {
+    render(
+      <ToolCard
+        message={{
+          toolName: "codex:subAgentActivity",
+          inputJson: { type: "subAgentActivity", kind: "paused", agentPath: "/root/x" },
+          _completed: true,
+        }}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button"));
+    expect(screen.getByText("paused")).toBeInTheDocument();
+  });
+});
+
+describe("codex 通用卡 KvList 噪音字段", () => {
+  test("appContext/error/null durationMs 不进 KvList,业务字段保留", () => {
+    render(
+      <ToolCard
+        message={{
+          toolName: "codex:customEvent",
+          inputJson: {
+            type: "customEvent",
+            id: "evt1",
+            status: "completed",
+            appContext: { foo: "bar" },
+            error: null,
+            durationMs: null,
+            note: "自定义说明",
+          },
+          _completed: true,
+        }}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button"));
+    expect(screen.getByText("自定义说明")).toBeInTheDocument();
+    const text = document.body.textContent || "";
+    expect(text).not.toContain("appContext");
+    expect(text).not.toContain("evt1");
+    expect(text).not.toContain("durationMs");
+  });
 });

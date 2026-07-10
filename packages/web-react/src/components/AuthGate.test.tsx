@@ -1,7 +1,7 @@
 import "@testing-library/jest-dom/vitest";
-import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, test, vi } from "vitest";
-import { TERMS_VERSION } from "../lib/legal";
+import { LEGAL_DOCS, TERMS_VERSION } from "../lib/legal";
 import { AuthGate } from "./AuthGate";
 
 // ---------------------------------------------------------------------------
@@ -161,6 +161,48 @@ describe("AuthGate — 注册", () => {
     );
     expect(screen.queryByRole("button", { name: /创建账号/ })).not.toBeInTheDocument();
     expect(screen.getByText(/暂未开放注册/)).toBeInTheDocument();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 协议弹窗：普通点击就地弹窗展示正文（正文区 overflow-y-auto 滚动），
+// 修饰键点击保留 <a href> 原生"新标签打开"。链接语义(role=link + href)是既有红线,不得回退。
+// ---------------------------------------------------------------------------
+
+describe("AuthGate — 协议弹窗", () => {
+  test("登录页普通点击《用户协议》→ 弹窗展示正文(标题+引言+分节),正文区带滚动样式,可关闭", () => {
+    render(<AuthGate {...base} onLogin={vi.fn()} turnstileBypass={true} />);
+    fireEvent.click(screen.getByRole("link", { name: "《用户协议》" }));
+
+    const dialog = screen.getByRole("dialog");
+    expect(within(dialog).getByText(LEGAL_DOCS.terms.title)).toBeInTheDocument();
+    expect(within(dialog).getByText(LEGAL_DOCS.terms.intro)).toBeInTheDocument();
+    expect(within(dialog).getByText(LEGAL_DOCS.terms.sections[0].h)).toBeInTheDocument();
+    // 正文区必须可滚动(长协议在 88vh 弹窗内出滚动条)
+    const scrollArea = within(dialog).getByText(LEGAL_DOCS.terms.intro).closest(".overflow-y-auto");
+    expect(scrollArea).not.toBeNull();
+
+    fireEvent.click(within(dialog).getByRole("button", { name: "关闭" }));
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  });
+
+  test("修饰键点击(ctrl/cmd)不拦截 → 不开弹窗,保留原生新标签行为", () => {
+    render(<AuthGate {...base} onLogin={vi.fn()} turnstileBypass={true} />);
+    fireEvent.click(screen.getByRole("link", { name: "《隐私政策》" }), { ctrlKey: true });
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  });
+
+  test("注册页 label 内点击《隐私政策》→ 开弹窗且不误触协议勾选", () => {
+    render(<AuthGate {...base} onLogin={vi.fn()} onRegister={vi.fn()} turnstileBypass={true} />);
+    fireEvent.click(screen.getByRole("button", { name: "立即注册" }));
+    expect(screen.getByRole("checkbox")).not.toBeChecked();
+
+    fireEvent.click(screen.getByRole("link", { name: "《隐私政策》" }));
+    const dialog = screen.getByRole("dialog");
+    expect(within(dialog).getByText(LEGAL_DOCS.privacy.title)).toBeInTheDocument();
+    // 弹窗打开期间背景被 Radix 标记 aria-hidden,关闭后再断言勾选未被误触
+    fireEvent.click(within(dialog).getByRole("button", { name: "关闭" }));
+    expect(screen.getByRole("checkbox")).not.toBeChecked();
   });
 });
 

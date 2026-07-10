@@ -8,6 +8,7 @@
 import { Sparkles, FileText } from "lucide-react";
 import type { ReactNode } from "react";
 import { cn } from "../../lib/utils";
+import { SignedImg } from "../chat/media";
 import { Badge, Button } from "../ui";
 import { ReminderStatusCard, renderReminderListCard } from "./memoryReminderCards";
 import { useToolCardActions } from "./context";
@@ -23,7 +24,7 @@ import {
   type ToolLike,
 } from "./format";
 import { parseMcpName } from "./meta";
-import { researchToolCard, WebSearchResultsCard } from "./researchCards";
+import { researchToolCard, safeArtifactSrc, WebSearchResultsCard } from "./researchCards";
 
 type Input = Record<string, unknown> | null;
 type BodyProps = { input: Input; tool: ToolLike };
@@ -236,9 +237,98 @@ function BashBody({ input, tool }: BodyProps) {
   );
 }
 
+// ── codex apply_patch(fileChange)形状 ──────────────────────────────────────
+//
+// codex 引擎的 Write/Edit 走 apply_patch,input 形如
+// `{file_path, kind, changes:[{path, kind:{type:"add|update|delete"}, diff}]}`,
+// **没有** claude 原生的 content/old_string/new_string —— 不特判就渲染成只剩一行
+// output 文本的空壳卡。claude 原生形状不走这里,行为不变。
+
+type CodexFileChange = { path: string; kind: string; diff: string };
+
+/** 识别 codex fileChange 的 changes 数组;不是该形状 → null(调用方走原生渲染)。 */
+function parseCodexFileChanges(input: Input): CodexFileChange[] | null {
+  const rows = asArr(input?.changes).filter(
+    (c): c is Record<string, unknown> => !!c && typeof c === "object" && !Array.isArray(c),
+  );
+  if (rows.length === 0) return null;
+  const fallbackKind = asStr(input?.kind);
+  return rows.map((c) => {
+    // change 级 kind 是 {type:"add"} 对象;顶层 kind 是字符串,作兜底。
+    const kindRaw =
+      c.kind && typeof c.kind === "object" && !Array.isArray(c.kind)
+        ? asStr((c.kind as Record<string, unknown>).type)
+        : asStr(c.kind);
+    return {
+      path: asStr(c.path) || asStr(input?.file_path),
+      kind: (kindRaw || fallbackKind).toLowerCase(),
+      diff: asStr(c.diff),
+    };
+  });
+}
+
+/** codex update 的 unified diff 按行着色(+绿 / -红 / 其余弱化),行视觉同 DiffView。 */
+function UnifiedDiffView({ diff }: { diff: string }) {
+  const lines = diff.replace(/\n$/, "").split("\n");
+  const truncated = lines.length > MAX_DIFF_LINES;
+  return (
+    <div className="mt-1.5 overflow-x-auto rounded-md border border-border font-mono text-xs leading-relaxed">
+      {lines.slice(0, MAX_DIFF_LINES).map((line, i) => (
+        <div
+          key={`${i}-${line.slice(0, 24)}`}
+          className={cn(
+            "whitespace-pre-wrap break-words px-3 py-px",
+            line.startsWith("+")
+              ? "bg-success-soft text-success"
+              : line.startsWith("-")
+                ? "bg-danger-soft text-danger"
+                : "text-muted",
+          )}
+        >
+          {line || " "}
+        </div>
+      ))}
+      {truncated && <div className="px-3 py-1 text-faint">… (diff 过长，已截断)</div>}
+    </div>
+  );
+}
+
+/** codex fileChange 渲染:add → 新文件内容;update → unified diff;delete → 删除状态行。
+ *  多 changes 逐个显示 path。语义已结构化呈现,output("add: /path")只在失败时作错误说明。 */
+function CodexFileChangesView({ changes, tool }: { changes: CodexFileChange[]; tool: ToolLike }) {
+  return (
+    <>
+      {changes.map((c, i) => (
+        <div key={`${i}-${c.path}`}>
+          {c.path && <FileMeta>{shortPath(c.path)}</FileMeta>}
+          {c.kind === "delete" ? (
+            // 删除是成功执行的破坏性动作:danger 色明示,不能像编辑成功一样绿。
+            <div className="mt-1.5 text-xs text-danger">删除文件</div>
+          ) : c.kind === "update" ? (
+            c.diff && <UnifiedDiffView diff={c.diff} />
+          ) : (
+            c.diff && (
+              <Pre>
+                {c.diff.slice(0, 1500)}
+                {c.diff.length > 1500 ? "\n…" : ""}
+              </Pre>
+            )
+          )}
+        </div>
+      ))}
+      {tool.error && tool.output && <StatusLine text={tool.output.slice(0, 300)} error />}
+    </>
+  );
+}
+
 function EditBody({ input, tool }: BodyProps) {
   const oldStr = asStr(input?.old_string).slice(0, 3000);
   const newStr = asStr(input?.new_string).slice(0, 3000);
+  // codex apply_patch 形状(无 old/new_string,changes 数组)→ 结构化渲染;claude 原生不变。
+  if (!oldStr && !newStr) {
+    const changes = parseCodexFileChanges(input);
+    if (changes) return <CodexFileChangesView changes={changes} tool={tool} />;
+  }
   const out = tool.output;
   return (
     <>
@@ -268,6 +358,11 @@ function ReadBody({ input, tool }: BodyProps) {
 
 function WriteBody({ input, tool }: BodyProps) {
   const content = asStr(input?.content);
+  // codex apply_patch 形状(无 content,changes 数组)→ 结构化渲染;claude 原生不变。
+  if (!content) {
+    const changes = parseCodexFileChanges(input);
+    if (changes) return <CodexFileChangesView changes={changes} tool={tool} />;
+  }
   const out = tool.output;
   return (
     <>
@@ -444,10 +539,36 @@ function VisionBody({ input, tool }: BodyProps) {
 function CodexBody({ type, input, tool }: BodyProps & { type: string }) {
   if (type === "imageView") {
     const target = asStr(input?.path) || asStr(input?.url);
+    // 缩略图(样式对齐 BrowserCliCard 截图);safeArtifactSrc 白名单防恶意 scheme,
+    // 加载失败/文件已删走 SignedImg 既有占位 chip(alt 文本),不出现裂图。
+    const safeImg = safeArtifactSrc(target);
     return (
       <>
+        {safeImg && (
+          <div className="mt-1.5">
+            <SignedImg src={safeImg} alt="查看的图片" className="max-h-56 rounded-md border border-border" />
+          </div>
+        )}
         {target && <FileMeta>{shortPath(target)}</FileMeta>}
         <OutputBlock output={tool.output} />
+      </>
+    );
+  }
+  if (type === "subAgentActivity") {
+    // 子代理生命周期事件:语义状态行即全部信息。agentThreadId 是内部 id 无用户价值,
+    // 不显示;也绝不落 OutputBlock 裸 JSON。
+    const kind = asStr(input?.kind);
+    const status =
+      kind === "started"
+        ? "子代理已启动"
+        : kind === "completed" || kind === "finished"
+          ? "子代理已完成"
+          : kind || "子代理活动";
+    const agentPath = asStr(input?.agentPath);
+    return (
+      <>
+        <StatusLine text={status} />
+        {agentPath && <FileMeta>{shortPath(agentPath)}</FileMeta>}
       </>
     );
   }
@@ -513,7 +634,20 @@ function CodexBody({ type, input, tool }: BodyProps & { type: string }) {
       {input && (
         <KvList
           obj={input}
-          skip={["id", "type", "pluginId", "result", "structuredContent", "_meta", "status", "durationMs"]}
+          // codex 事件的传输噪音字段全 skip(appContext/error 也是:error 文本已由
+          // extractCodexOutput 提进 output,KvList 再显示一遍只会是 JSON 噪音)。
+          skip={[
+            "id",
+            "type",
+            "pluginId",
+            "result",
+            "structuredContent",
+            "_meta",
+            "status",
+            "durationMs",
+            "appContext",
+            "error",
+          ]}
         />
       )}
       <OutputBlock output={tool.output} />

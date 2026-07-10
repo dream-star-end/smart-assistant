@@ -82,6 +82,10 @@ const CODEX_TYPE_META: Record<string, ToolMeta> = {
   dynamicToolCall: { icon: Wrench, label: "工具调用", tone: "neutral" },
   mcpToolCall: { icon: Wrench, label: "MCP 工具", tone: "neutral" },
   userMessage: { icon: Bot, label: "Codex 消息", tone: "neutral" },
+  // 子代理生命周期事件(started/completed);存量孤儿消息(toolName 'unknown' + item 在
+  // output)也会经 format 层兜底归一化到这里。注:webSearch 恒被归一化为内置 WebSearch
+  // (normalizeCodexTool 无失败分支),不需要 codex 级 meta 条目。
+  subAgentActivity: { icon: Bot, label: "子代理活动", tone: "accent" },
 };
 
 // ── 容器内 oc-* CLI(经 Bash 调用)→ 语义卡:单一权威表 ──
@@ -454,5 +458,7 @@ function codexSummary(codexType: string, input: Record<string, unknown>): string
   if (codexType === "dynamicToolCall" || codexType === "mcpToolCall") {
     return asStr(input.tool) || asStr(input.toolName) || asStr(input.name);
   }
+  // agentThreadId 是内部 id 无用户价值,摘要只给路径尾段。
+  if (codexType === "subAgentActivity") return shortPath(input.agentPath);
   return "";
 }

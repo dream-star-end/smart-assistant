@@ -282,17 +282,28 @@ function normalizeCodexTool(message: ToolLike, codexType: string): DisplayTool |
   }
 
   const compactInput = mergedItem ? { ...mergedItem } : resolveToolInput(message);
+  // 保留原始 codex:/Codex: 前缀名;孤儿兜底(toolName 'unknown'/空)则以推断出的 type 重命名,
+  // 否则 meta/body 分派拿到的还是 'unknown',归一化等于白做。
+  const name = parseCodexTypeName(message.toolName) ? (message.toolName as string) : `codex:${codexType}`;
   return {
-    name: message.toolName || `codex:${codexType}`,
+    name,
     input: compactInput,
-    tool: { ...baseTool, inputJson: compactInput },
+    tool: { ...baseTool, toolName: name, inputJson: compactInput },
   };
 }
 
 /** Normalize Codex/v3 wrapper tools into the same display contract as native v5 tools. */
 export function normalizeToolForDisplay(message: ToolLike): DisplayTool {
   const originalName = message.toolName || "unknown";
-  const codexType = parseCodexTypeName(originalName);
+  let codexType = parseCodexTypeName(originalName);
+  // 存量孤儿兜底:后端配对失败的历史消息 toolName 丢成 'unknown'(inputJson 空),codex item
+  // JSON 整段留在 output/text 里({type:"subAgentActivity",…})。从中解析出 type → 按
+  // codex:<type> 归一化,让存量丑消息也有语义卡(后端另修配对,但历史消息永远是孤儿形状)。
+  if (!codexType && originalName === "unknown") {
+    const { inputItem, finalItem } = pickCodexItem(message);
+    const orphanType = asStr(finalItem?.type) || asStr(inputItem?.type);
+    if (/^[A-Za-z][\w-]*$/.test(orphanType)) codexType = orphanType;
+  }
   if (codexType) {
     const normalized = normalizeCodexTool(message, codexType);
     if (normalized) return normalized;

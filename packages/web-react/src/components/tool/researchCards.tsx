@@ -474,8 +474,9 @@ function LitragCard({ data, partial }: { data: Record<string, unknown>; partial?
 const PREVIEWABLE_EXT = new Set(["html", "htm", "pdf", "png", "jpg", "jpeg", "gif", "webp", "svg"]);
 
 /** 产物 src 安全白名单:只允许**容器绝对路径**(/… 非 //,useSignedSrc 会签名)或 **http(s)**。
- *  拒绝 javascript:/data:/blob:/协议相对/相对路径 —— 防工具输出里的恶意串拼成可点 href(XSS)。 */
-function safeArtifactSrc(s: unknown): string | null {
+ *  拒绝 javascript:/data:/blob:/协议相对/相对路径 —— 防工具输出里的恶意串拼成可点 href(XSS)。
+ *  导出供 bodies.tsx 复用(codex imageView 缩略图);依赖方向 bodies → researchCards,无环。 */
+export function safeArtifactSrc(s: unknown): string | null {
   const v = asStr(s).trim();
   if (!v) return null;
   // 内联 http(s) 判定:不用 isSafeHttpUrl 类型守卫,避免它把 string 在 else 分支窄成 never。
@@ -1184,9 +1185,15 @@ const BROWSER_ACTIONS: Record<string, { icon: ReactNode; title: string }> = {
   "wait-for": { icon: <Clock className="size-4" />, title: "等待" },
 };
 
-function browserSubcommand(command: string): string {
-  const m = /oc-browser\s+([a-z-]+)/i.exec(command);
-  return m ? m[1].toLowerCase() : "";
+/** 命令里全部 oc-browser <verb>(复合命令 `navigate … && oc-browser snapshot` 按出现顺序全识别;
+ *  只收已登记动作,一个都不认 → 空数组,调用方回落)。 */
+function browserSubcommands(command: string): string[] {
+  const verbs: string[] = [];
+  for (const m of command.matchAll(/oc-browser\s+([a-z-]+)/gi)) {
+    const verb = (m[1] ?? "").toLowerCase();
+    if (BROWSER_ACTIONS[verb]) verbs.push(verb);
+  }
+  return verbs;
 }
 
 /** 从文本里找容器绝对图片路径(截图落盘路径),用于截图预览。 */
@@ -1196,22 +1203,49 @@ function findImagePath(text: string | null): string | null {
   return m ? m[0] : null;
 }
 
-/** oc-browser <verb> → 动作 + URL/元素/文本 + 结果状态;截图有产物则显示缩略图。隐藏原始 stdout。 */
+/** playwright-mcp 成功输出里的页面标题(`- Page Title: …` 行);无 → ""。 */
+function pageTitleOf(text: string | null): string {
+  if (!text) return "";
+  const m = /^\s*-?\s*Page Title:\s*(.+)$/im.exec(text);
+  return m ? m[1].trim() : "";
+}
+
+/** 失败输出的首个 Error 行(剥掉 "### Error" 这类 markdown 标头);全无 → 首个非空非标头行。 */
+function firstErrorLine(text: string | null): string {
+  if (!text) return "";
+  const lines = text.split(/\r?\n/).map((l) => l.trim());
+  const hit = lines.find((l) => l && !/^#{1,6}\s/.test(l) && /\berror\b/i.test(l));
+  return hit ?? lines.find((l) => l && !/^#{1,6}\s/.test(l)) ?? "";
+}
+
+/** oc-browser <verb…> → 动作序列 + URL/元素/文本 + 结果状态;截图产物缩略图;失败给出首个
+ *  Error 行(danger)+ 完整输出折叠。成功的 navigate 从输出提取 Page Title 作一行标题。隐藏原始 stdout。 */
 function BrowserCliCard({ command, tool }: { command: string; tool: ToolLike }): ReactNode | null {
-  const sub = browserSubcommand(command);
-  const spec = BROWSER_ACTIONS[sub];
-  if (!spec) return null;
-  const error = !!tool.error;
+  const subs = browserSubcommands(command);
+  if (subs.length === 0) return null;
+  const out = outputText(tool);
+  // playwright-mcp 的失败是 markdown "### Error" 段(Bash 本身可能 exit 0 → tool.error 为假),
+  // 与 tool.error 同视为失败,否则错误卡显示"已完成"误导用户。
+  const error = !!tool.error || /^#{1,6}\s*Error\b/m.test(out ?? "");
+  const reason = error ? firstErrorLine(out) : "";
   const url = parseCommandFlag(command, "url");
   const element = parseCommandFlag(command, "element");
   const text = parseCommandFlag(command, "text");
   const key = parseCommandFlag(command, "key");
-  const out = outputText(tool);
-  const shot = sub === "screenshot" ? safeArtifactSrc(parseCommandFlag(command, "path")) || findImagePath(out) : null;
+  const shot =
+    !error && subs.includes("screenshot")
+      ? safeArtifactSrc(parseCommandFlag(command, "path")) || findImagePath(out)
+      : null;
+  const pageTitle = !error && subs.includes("navigate") ? pageTitleOf(out) : "";
   const domain = url ? domainOf(url) : undefined;
   return (
-    <CardShell icon={spec.icon} title={spec.title}>
+    <CardShell
+      icon={BROWSER_ACTIONS[subs[0]].icon}
+      title={subs.map((s) => BROWSER_ACTIONS[s].title).join(" · ")}
+    >
       <div className={cn("text-xs", error ? "text-danger" : "text-success")}>{error ? "失败" : "已完成"}</div>
+      {reason && <div className="mt-1 break-words text-xs text-danger">{reason.slice(0, 200)}</div>}
+      {pageTitle && <div className="mt-1.5 text-[13px] leading-snug text-fg">{pageTitle}</div>}
       {url && (
         <div className="mt-1.5">
           <Chip href={url}>{domain ?? url}</Chip>
@@ -1225,7 +1259,11 @@ function BrowserCliCard({ command, tool }: { command: string; tool: ToolLike }):
           <SignedImg src={shot} alt="页面截图" className="max-h-56 rounded-md border border-border" />
         </div>
       )}
-      {sub === "snapshot" && <OutputDetails text={out} label="查看页面快照" />}
+      {error ? (
+        <OutputDetails text={out} label="错误详情" />
+      ) : (
+        subs.includes("snapshot") && <OutputDetails text={out} label="查看页面快照" />
+      )}
     </CardShell>
   );
 }
@@ -1304,14 +1342,18 @@ const OC_BODY_CARDS: Partial<Record<OcCli, (command: string, tool: ToolLike) => 
  * 例外:纯 heredoc 写文件(`cat > f <<EOF ... oc-web ... EOF`)里 oc-* 是被写入的文件内容而非
  * 被执行的命令 —— 返回 null 交回 BashBody 的写文件卡(与 resolveToolMeta 同一判定,避免不一致)。
  */
+/** 失败时仍走专属卡的 CLI(卡内自渲染失败状态 + 原因,如 oc-browser 提取首个 Error 行);
+ *  其余 CLI 的专属卡不感知 error,失败一律 GenericOcCard 兜底,避免错误输出被当正常结果解析。 */
+const ERROR_AWARE_OC_CARDS: ReadonlySet<OcCli> = new Set<OcCli>(["oc-browser"]);
+
 export function researchToolCard(command: string, tool: ToolLike): ReactNode | null {
   if (!command) return null;
   const cli = detectOcCli(command);
   if (!cli) return null;
   if (detectShellFileWrites(command)) return null;
   const key = cli as OcCli;
-  if (tool.error) return <GenericOcCard cli={key} tool={tool} error />;
+  if (tool.error && !ERROR_AWARE_OC_CARDS.has(key)) return <GenericOcCard cli={key} tool={tool} error />;
   const body = OC_BODY_CARDS[key];
   const card = body ? body(command, tool) : null;
-  return card ?? <GenericOcCard cli={key} tool={tool} />;
+  return card ?? <GenericOcCard cli={key} tool={tool} error={!!tool.error} />;
 }

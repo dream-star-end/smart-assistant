@@ -312,3 +312,63 @@ describe("Codex 工具归一化:cancelled 态与 plan 字段对齐 (fix C)", () 
     expect(d.input?.todos).toEqual([{ content: "旧字段", status: "pending" }]);
   });
 });
+
+describe("subAgentActivity meta + 存量孤儿归一化", () => {
+  test("codex:subAgentActivity → 子代理活动标签 + agentPath 尾段摘要", () => {
+    expect(resolveToolMeta("codex:subAgentActivity").label).toBe("子代理活动");
+    expect(toolSummary("codex:subAgentActivity", { agentPath: "/root/tool_card_probe" })).toBe(
+      "/root/tool_card_probe",
+    );
+  });
+
+  test("toolName unknown + output 是 codex item JSON → 归一化为 codex:<type>", () => {
+    // 真实孤儿载荷(生产 sessions.db):toolName='unknown'、inputJson={}、item 整段在 output。
+    const d = normalizeToolForDisplay({
+      toolName: "unknown",
+      inputJson: {},
+      output: JSON.stringify({
+        type: "subAgentActivity",
+        id: "call_8xd930hU3Lw7Hrhn0Go32z1M",
+        kind: "started",
+        agentThreadId: "019f4bd8-c3b8-7112-a7fb-af393bb6fadb",
+        agentPath: "/root/tool_card_probe",
+      }),
+      _completed: true,
+    });
+    expect(d.name).toBe("codex:subAgentActivity");
+    expect(d.input?.kind).toBe("started");
+    expect(d.input?.agentPath).toBe("/root/tool_card_probe");
+    // codex item JSON 不再被当输出文本裸 dump。
+    expect(d.tool.output).toBeNull();
+  });
+
+  test("toolName 缺失也走孤儿兜底", () => {
+    const d = normalizeToolForDisplay({
+      output: JSON.stringify({ type: "subAgentActivity", kind: "completed" }),
+    });
+    expect(d.name).toBe("codex:subAgentActivity");
+  });
+
+  test("unknown + 非 codex item 输出 → 保持 unknown 不误归一", () => {
+    expect(normalizeToolForDisplay({ toolName: "unknown", inputJson: {}, output: "plain text" }).name).toBe(
+      "unknown",
+    );
+    expect(normalizeToolForDisplay({ toolName: "unknown", inputJson: {}, output: '{"ok":true}' }).name).toBe(
+      "unknown",
+    );
+    // 畸形 type(非标识符)不归一。
+    expect(
+      normalizeToolForDisplay({ toolName: "unknown", inputJson: {}, output: '{"type":"<script>"}' }).name,
+    ).toBe("unknown");
+  });
+
+  test("已具名工具不受孤儿兜底影响(output 恰为 JSON 也不改名)", () => {
+    const d = normalizeToolForDisplay({
+      toolName: "Bash",
+      inputJson: { command: "ls" },
+      output: '{"type":"subAgentActivity"}',
+      _completed: true,
+    });
+    expect(d.name).toBe("Bash");
+  });
+});

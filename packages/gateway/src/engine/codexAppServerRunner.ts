@@ -836,6 +836,27 @@ export class CodexAppServerRunner extends EventEmitter {
    *  Drained in `runTurn` (both happy and catch paths) before emitResult. */
   private inflightItemHandlers: Set<Promise<void>> = new Set()
 
+  /** V5 CG(2026-07-10)— 本 turn 内已发过 `tool_use` 帧的 codex item id 集合,
+   *  用于维护「tool_use / tool_result 成对」这个前端渲染不变量。
+   *
+   *  取证根因:codex 的 `subAgentActivity` item 只经 `item/completed` 到达
+   *  (handleItemCompleted 尾部通用兜底 → emitToolResult),**从不发 `item/started`**
+   *  —— handleItemStarted 对未知类型本会走通用 `emitAssistantToolUse('codex:<type>')`,
+   *  既然实测前端拿到孤儿 result 而无配对 use,说明 codex 根本没为它触发 started
+   *  (它把子 agent 的 started/completed 建模成 item 内部的 `kind` 字段,协议层只发
+   *  一次/多次 item/completed)。孤儿 tool_result 到前端后 toolName 兜底成 'unknown'、
+   *  inputJson=null,渲染成裸 JSON 卡。
+   *
+   *  收口(消一整类而非单个 subAgentActivity):emitAssistantToolUse 处登记 id,
+   *  emitToolResult 发现 id 未配对时先补发一帧 tool_use 再发 result —— 任何 codex
+   *  item 类型(现有 + 未来新增)都保证成对到达前端。同一 id 的后续 result(如
+   *  subAgentActivity 的 kind=started 后跟 kind=completed)因 id 已在集合中,不再
+   *  重复补发 tool_use,只追加 result 到同一张卡。
+   *
+   *  生命周期:per-turn。runTurn 顶部清空,shutdown 清空——codex 每 turn 重排 item
+   *  id,跨 turn 保留会既泄漏又可能与新 turn 的 id 撞车漏发 tool_use。 */
+  private emittedToolUseIds = new Set<string>()
+
   /** Per-reasoning-item state for `item/reasoning/*` notifications. Keyed
    *  by codex itemId so concurrent reasoning items (rare, but legal under
    *  the protocol) don't cross-contaminate.
@@ -1226,6 +1247,8 @@ export class CodexAppServerRunner extends EventEmitter {
     this.proc = null
     this.spawnedProviderSignature = null
     this.stdoutBuf = ''
+    // Per-turn 配对台账随进程一起丢弃(下一 turn 会在 runTurn 顶部重新清空)。
+    this.emittedToolUseIds.clear()
     // Clear in-flight token state. priorTurnTotal is INTENTIONALLY preserved
     // across shutdown — codex's thread token totals are server-side and
     // monotonic, so when the same instance respawns and resumes the thread,
@@ -2376,9 +2399,19 @@ export class CodexAppServerRunner extends EventEmitter {
       return
     }
     // Generic completion for unknown item types (mcpToolCall / webSearch /
-    // dynamicToolCall / plan / error / …):内层截断 + 完整 stringify,
-    // 保证前端 pickCodexItem 永远拿到可 parse 的 JSON。
-    this.emitToolResult(itemId, _stringifyItemBounded(item), false)
+    // dynamicToolCall / plan / error / subAgentActivity / …):内层截断 + 完整
+    // stringify,保证前端 pickCodexItem 永远拿到可 parse 的 JSON。
+    //
+    // V5 CG(2026-07-10)— 传 orphanPairing:这些类型里有的(尤其 subAgentActivity)
+    // codex 只发 item/completed 不发 item/started(见 emittedToolUseIds 注释),
+    // emitToolResult 会据此先补一帧 `codex:<type>` tool_use 再发 result,消掉前端
+    // 的孤儿 'unknown' 裸 JSON 卡。itemType 为 null(item.type 非字符串)时退回
+    // codex:unknown。
+    const pairName = itemType ? `codex:${itemType}` : 'codex:unknown'
+    this.emitToolResult(itemId, _stringifyItemBounded(item), false, {
+      name: pairName,
+      input: visibleItem,
+    })
   }
 
   /** Spawn a brand-new codex thread and wire its id into runner state +
@@ -2442,6 +2475,9 @@ export class CodexAppServerRunner extends EventEmitter {
     // turn) — clear at turn-start so the summary/mode lock and first-part
     // skip flag don't bleed across turns.
     this.reasoningItemState.clear()
+    // Per-turn tool_use/tool_result 配对台账:codex 每 turn 重排 item id,turn 起点
+    // 清空,避免跨 turn 泄漏 / 与新 turn 复用的 id 撞车漏发补配的 tool_use。
+    this.emittedToolUseIds.clear()
     // Collaboration receiver ids are scoped to the current Codex turn's
     // spawn/wait control items. Clear them up front so a recycled runner does
     // not close a stale Agent card from a previous turn when receiver thread
@@ -2700,6 +2736,8 @@ export class CodexAppServerRunner extends EventEmitter {
   }
 
   private emitAssistantToolUse(id: string, name: string, input: unknown): void {
+    // 登记本 turn 已发 tool_use 的 item id —— emitToolResult 据此判断是否孤儿。
+    this.emittedToolUseIds.add(id)
     this.emit('message', {
       type: 'assistant',
       session_id: this.threadId,
@@ -2710,7 +2748,26 @@ export class CodexAppServerRunner extends EventEmitter {
     } satisfies RunnerMessage)
   }
 
-  private emitToolResult(toolUseId: string, content: string, isError: boolean): void {
+  /** V5 CG(2026-07-10)— tool_use/tool_result 成对不变量的唯一守卫点(见
+   *  {@link emittedToolUseIds} 注释)。`orphanPairing` 由「本会兜底出孤儿 result」
+   *  的调用点(handleItemCompleted 通用兜底)传入,给补发的 tool_use 一个像样的
+   *  `codex:<type>` 名字与原始 item 载荷;不传时退化为 `codex:unknown`/`{}`,仍
+   *  保证成对(防御任何未预料的孤儿路径,总比裸 result 体面)。 */
+  private emitToolResult(
+    toolUseId: string,
+    content: string,
+    isError: boolean,
+    orphanPairing?: { name: string; input: unknown },
+  ): void {
+    if (!this.emittedToolUseIds.has(toolUseId)) {
+      // 孤儿 result:先补一帧配对 tool_use(emitAssistantToolUse 内部会登记 id,
+      // 故同 id 的后续 result 不再重复补发)。
+      this.emitAssistantToolUse(
+        toolUseId,
+        orphanPairing?.name ?? 'codex:unknown',
+        orphanPairing?.input ?? {},
+      )
+    }
     this.emit('message', {
       type: 'user',
       session_id: this.threadId,
@@ -2813,15 +2870,134 @@ export function summarizeCommandForDescription(cmd: string): string {
 }
 
 /**
- * Codex wraps every shell command in `/bin/bash -lc '...'`. Strip that wrapper
- * for a cleaner display — the ccb Bash tool card shows the raw user command.
+ * V5 CG(2026-07-10)— Codex 把每条 shell 命令包成 `/bin/bash -lc <arg>` 再执行,
+ * 剥掉包装让前端 Bash 卡显示用户原始命令。历史实现只有一条正则,只认「单引号
+ * 整体包裹」一种形状(`-lc '...'`),生产实测漏掉两类真实包装,原样透传进前端卡
+ * (露出 `/bin/bash -lc` 包装体 + 转义符,非常丑):
+ *   ① 双引号包裹:`/bin/bash -lc "printf 'cwd=%s\n' \"$PWD\" && …"`(内含 \" 转义)
+ *   ② 单/双引号段相邻拼接:`/bin/bash -lc 'rm -f x && echo '"'已清理'"`(结尾非单引号)
+ *
+ * 根因在「用正则抠一种引号形状」这个思路本身 —— shell 引号是可任意拼接/嵌套的
+ * 词法,不是单一正则能覆盖的一类。因此把剥包装升级成一个最小 POSIX shell 单词
+ * 解析器:识别 `/bin/(ba)?sh -lc`(或 `-c`)前缀后,对剩余部分做真正的引号解析
+ * (单引号原文 / 双引号内仅 \\ \" \$ \` 转义 / 裸段反斜杠转义 / 相邻段拼接),
+ * **当整体恰好构成一个 shell word 时**返回解包后的命令;解析失败(未闭合引号)
+ * 或不止一个 word 时,保守只剥前缀返回剩余原文——比露出完整包装体面。
+ *
+ * `'\''`(单引号内嵌单引号的标准转义,如 `it's`→`'it'\''s'`)天然被覆盖:解析器
+ * 吞整个 word(含外层引号),`'it'` 收 SQ 段 "it" → 裸 `\'` 转义出一个 `'` → `'s'`
+ * 收 SQ 段 "s",拼成 `it's`,无需旧实现那样对 `'\''` 做二次字符串替换。
  */
 function stripShellWrapper(cmd: string): string {
-  const m = cmd.match(/^\/bin\/bash\s+-lc\s+'([\s\S]*)'$/)
-  if (m) return m[1].replace(/'\\''/g, "'")
-  return cmd
+  // 前缀:/bin/bash 或 /bin/sh,-lc 或 -c(允许 l 可选、多空白)。宽松匹配容忍漂移。
+  const m = cmd.match(/^\/bin\/(?:ba)?sh\s+-l?c\s+([\s\S]*)$/)
+  if (!m) return cmd
+  const rest = m[1]
+  const words = tokenizeShellWords(rest)
+  // 恰好一个 word → 解包成功返回;解析失败(null)/ 多 word / 空 → 只剥前缀返回原文。
+  if (words && words.length === 1) return words[0]
+  return rest
+}
+
+/**
+ * 最小 POSIX shell 单词分词器,服务于 {@link stripShellWrapper}。返回 word 数组;
+ * 遇未闭合引号返回 null(解析失败,让调用方走保守路径)。规则:
+ *   - 引号外空白(空格 / Tab / 换行)分词,连续空白折叠,不产生空 word。
+ *   - 单引号内全字面(含反斜杠),直到下一个单引号。
+ *   - 双引号内反斜杠仅对 `\ " $ \`` 及换行(续行)生效,其余反斜杠字面保留
+ *     (故 `\n` 原样保留成 `\n`,不误解析成换行)。
+ *   - 裸段反斜杠转义下一字符;反斜杠+换行=续行(整体删除);末尾孤立反斜杠字面。
+ *   - 相邻的不同引号 / 裸段拼进同一个 word(shell 词法)。
+ */
+function tokenizeShellWords(input: string): string[] | null {
+  const words: string[] = []
+  let buf = ''
+  let inWord = false
+  let i = 0
+  const n = input.length
+  while (i < n) {
+    const ch = input[i]
+    if (ch === ' ' || ch === '\t' || ch === '\n') {
+      if (inWord) {
+        words.push(buf)
+        buf = ''
+        inWord = false
+      }
+      i++
+      continue
+    }
+    if (ch === "'") {
+      inWord = true
+      i++
+      let closed = false
+      while (i < n) {
+        if (input[i] === "'") {
+          closed = true
+          i++
+          break
+        }
+        buf += input[i]
+        i++
+      }
+      if (!closed) return null // 未闭合单引号
+      continue
+    }
+    if (ch === '"') {
+      inWord = true
+      i++
+      let closed = false
+      while (i < n) {
+        const c = input[i]
+        if (c === '"') {
+          closed = true
+          i++
+          break
+        }
+        if (c === '\\' && i + 1 < n) {
+          const nx = input[i + 1]
+          if (nx === '\\' || nx === '"' || nx === '$' || nx === '`') {
+            buf += nx
+            i += 2
+            continue
+          }
+          if (nx === '\n') {
+            i += 2 // 续行:反斜杠+换行整体删除
+            continue
+          }
+          buf += c // 其余:反斜杠字面保留(如 \n)
+          i++
+          continue
+        }
+        buf += c
+        i++
+      }
+      if (!closed) return null // 未闭合双引号
+      continue
+    }
+    if (ch === '\\') {
+      inWord = true
+      if (i + 1 < n) {
+        const nx = input[i + 1]
+        if (nx === '\n') {
+          i += 2 // 续行
+          continue
+        }
+        buf += nx
+        i += 2
+        continue
+      }
+      buf += ch // 末尾孤立反斜杠字面
+      i++
+      continue
+    }
+    inWord = true
+    buf += ch
+    i++
+  }
+  if (inWord) words.push(buf)
+  return words
 }
 
 // Re-export internal helpers for the test harness — the test patches
 // `_classifyJsonRpcLine` to feed synthetic JSON-RPC frames.
-export { _sanitizeThreadId }
+export { _sanitizeThreadId, stripShellWrapper }
