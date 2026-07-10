@@ -152,6 +152,7 @@ ssh kl-mirror 'psql "$DATABASE_URL" -c "select * from turn_traces where trace_id
 - 同 id"server tool 行 vs 本地已转 agent-group 富卡"→ 富卡为底回填完成态;
 - `syncSession`(resume_failed reconcile)走 applyServerMessages 同一收口,**禁止整段替换**。
 - ~~跨设备/清缓存团队历史必丢~~ **已根治**(P2 批次2):handleDelegateTask 收尾产出 server-authored agent-group 骨架行(runId 去重 local-wins),跨设备可见团队结构+终态+成本;过程 childBlocks 树仍仅本设备 IndexedDB(有意取舍)。
+- **长会话热尾巴+归档**(2026-07-10 根治 4MB 拒写「扣费零送达」事故):client_sessions 行超软阈值 2.5MB → `_spillOverflowCore`(storage 唯一写侧收口)同事务把最老消息搬 `client_session_archive_chunks`,行内只留 ≤2MB 热尾巴(下限 64 条 > 兜底注入窗口 48);`_seq` 冻结不重排。回看走 `GET /api/sessions/:id/archive?before=&limit=`(前端"从云端加载更早的历史")。**full 合并必须带 archivedThroughSeq 水位**:本地 `_seq ≤ 水位`行无条件保留(否则热尾巴响应会误删本地已归档行)。PUT 防复活/append 幂等/cost-patch 短路都查 `client_session_archived_ids`。引擎无法原生续接、走 40 条兜底注入时 gateway 发 `sys.context_rebuilt` → 前端插 system 提示行(client-owned)。存量超限行迁移:`scripts/v5-sessions-spill-archive.ts`(dry-run 先行)。**模型上下文与本机制无关**(同引擎续接=容器卷原生 resume;上下文快满=引擎自动 compact)。
 
 ### 3.4 计费问题
 usage_records + journal 双查;零输出免单/turn 级 idle 免单已内建;codex 跨桥重连计费走 journal 权威。造数验证用 psql 必须显式 COMMIT。
@@ -280,6 +281,8 @@ BEGIN; <迁移 SQL>; INSERT INTO schema_migrations(version, applied_at) VALUES (
 
 | 债 | 内容 | 偿还触发 |
 |---|---|---|
+| 会话归档孤儿清理 | deleteClientSession 软删只清 messages,不清该会话 archive_chunks/archived_ids(不可达也不可复活,仅体积残留) | 会话硬删/GC 机制落地时一并清两表 |
+| admin 归档 offset 深翻 O(skip/200) | admin sessions 视图 offset 分页越过尾巴走归档 cursor walk,深 offset 重走前缀页;单人低频诊断可接受 | admin 前端改用与用户面 /archive 一致的 cursor 翻页 |
 | ~~团队卡 server-authored 化~~ **已偿还**(4202986b+ac966d6f,P2 批次2) | 生成点=handleDelegateTask 收尾(parser Agent 排除保留);sink agentGroups[]→master role 'agent-group'(srv-*,_delegateStatus 三态)→storage/前端按 _delegateRunId **local-wins** 去重;server 行=骨架+终态(过程树有意不持久化,本设备 IndexedDB 承载)。**部署红线:master-first**(strict schema 新字段,新 gateway→旧 master 400 fatal-drop 整包)。TeamPanel 同批改按 turn 锚点归组 | — |
 | ~~hidden reviewer pipeline 硬编排~~ **已退役**(2026-07-07 boss 裁决,被队长自主送审取代) | 演化:preamble 软约束(漂移)→ gateway 硬编排(9c36c34a)→ **队长自主送审**:preamble 纪律"除明显简单任务外都送审"+`request_review` 工具(mcp-memory→delegate hidden-reviewer);平台保证收敛为三件=isReview 按目标身份派生 / hidden guard ≤3次/turn / 团队门(父 turn 非团队 409,权威快照 `session._teamModeTurn`+`_currentTurnUserText`)。final 不再扣住,状态机/continuation/修订标记帧全删(防复活断言在 teamModeHiddenReviewer.test.ts)。**取舍(boss 知情选择)**:低遵循度队长模型可能漏送审,质量门从强制变纪律引导 | 若实测漏审率不可接受 → 复活 gateway 兜底(turn 结束未送审则补审) |
 | ~~审查成本用户披露~~ **已偿还**(9c36c34a+167f1628) | drain 时按 agent 分组附队长行 usage.delegates[](纯展示,不碰扣费收口);前端裁决徽记+积分明细;粒度=同 agentId 多轮合计 | — |
