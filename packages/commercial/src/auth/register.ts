@@ -46,6 +46,11 @@ export const registerInputSchema = z.object({
   email: emailSchema,
   password: passwordSchema,
   turnstile_token: z.string().min(1).max(2048),
+  // 协议同意留证(0125):注册页勾选同意后前端上报 TERMS_VERSION(web-react
+  // lib/legal.ts 权威源)。optional 而非 required:留证语义是"展示并勾选才算数",
+  // 强收该字段既不能证明直连调用方"同意过",还会把灰度期旧 bundle 的注册打崩;
+  // 有值才落库。
+  terms_version: z.string().min(1).max(64).optional(),
 });
 
 export type RegisterInput = z.infer<typeof registerInputSchema>;
@@ -250,11 +255,15 @@ export async function register(
       // v3 退役:新号直接 v5 原生(v5_migrated_at=NOW()+status=migrated,满足 0099
       // consistency CHECK)。新号无 v3 数据,迁移是 no-op,故在建号时就置权威源,
       // routeChannelForUser 恒返回 v5、v3MayServe 恒 false → 永不 provisioning v3 容器。
+      // 协议同意留证(0125):terms_version 有值 = 注册页勾选过,accepted_at 同刻落
+      // NOW();无值两列 NULL(旧 bundle / 直连 API),语义见迁移头注释。
       const ins = await client.query<{ id: string }>(
-        `INSERT INTO users(email, password_hash, v5_migrated_at, v5_migration_status)
-         VALUES ($1, $2, NOW(), 'migrated')
+        `INSERT INTO users(email, password_hash, v5_migrated_at, v5_migration_status,
+                           terms_version, terms_accepted_at)
+         VALUES ($1, $2, NOW(), 'migrated',
+                 $3, CASE WHEN $3::text IS NULL THEN NULL ELSE NOW() END)
          RETURNING id::text AS id`,
-        [input.email, passwordHash],
+        [input.email, passwordHash, input.terms_version ?? null],
       );
       const uid = ins.rows[0].id;
       await client.query(
