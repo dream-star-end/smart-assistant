@@ -502,7 +502,8 @@ export function Landing({
                 <span className="font-medium text-fg">关于</span>
                 <span className="text-muted">{BRAND.companyShort}</span>
                 <span className="text-muted">联系合作</span>
-                <span className="text-muted">用户协议</span>
+                <a href="/terms" className="text-muted hover:text-fg">用户协议</a>
+                <a href="/privacy" className="text-muted hover:text-fg">隐私政策</a>
               </div>
             </div>
           </div>

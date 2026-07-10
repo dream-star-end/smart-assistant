@@ -221,6 +221,41 @@ describe("auth.register (integ)", () => {
     assert.notEqual(code, hashRow.rows[0].token_hash, "raw code must not equal stored hash");
   });
 
+  test("terms consent(0125): terms_version 有值 → 两列同落;缺省 → 两列 NULL", async (t) => {
+    if (skipIfNoPg(t)) return;
+    const mailer = new CapturingMailer();
+    const withTerms = await register(
+      {
+        email: "consent@example.com",
+        password: "correct horse battery staple",
+        turnstile_token: "ignored-because-bypass",
+        terms_version: "2026-07-10",
+      },
+      { mailer, turnstileBypass: true, verifyEmailUrlBase: "https://claudeai.chat" },
+    );
+    const withoutTerms = await register(
+      {
+        email: "legacy-bundle@example.com",
+        password: "correct horse battery staple",
+        turnstile_token: "ignored-because-bypass",
+      },
+      { mailer, turnstileBypass: true, verifyEmailUrlBase: "https://claudeai.chat" },
+    );
+
+    const rows = await query<{ id: string; tv: string | null; ta: string | null }>(
+      `SELECT id::text AS id, terms_version AS tv, terms_accepted_at::text AS ta
+         FROM users WHERE id = ANY($1::bigint[]) ORDER BY id`,
+      [[withTerms.user_id, withoutTerms.user_id]],
+    );
+    const byId = new Map(rows.rows.map((r) => [r.id, r]));
+    const a = byId.get(withTerms.user_id)!;
+    assert.equal(a.tv, "2026-07-10");
+    assert.notEqual(a.ta, null, "带 terms_version 注册必须落 terms_accepted_at");
+    const b = byId.get(withoutTerms.user_id)!;
+    assert.equal(b.tv, null, "缺省 terms_version 不得伪造留证");
+    assert.equal(b.ta, null);
+  });
+
   test("email is normalized: trim + toLowerCase before insert", async (t) => {
     if (skipIfNoPg(t)) return;
     const mailer = new CapturingMailer();

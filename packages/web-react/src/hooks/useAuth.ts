@@ -51,6 +51,8 @@ export type UseAuth = {
     password: string;
     displayName?: string;
     turnstileToken: string;
+    /** 勾选同意的协议版本（lib/legal TERMS_VERSION），后端落 users 留证。 */
+    termsVersion: string;
   }) => Promise<{ verifyEmailSent: boolean }>;
   verifyEmail: (email: string, code: string) => Promise<void>;
   resendVerification: (email: string) => Promise<void>;
@@ -159,13 +161,20 @@ export function useAuth(opts: UseAuthOptions): UseAuth {
 
   // 注册 / 邮箱验证 / 找回密码：透传到 api（错误为带友好中文 message 的 ApiError，AuthGate 自捕展示）。
   const register = useCallback(
-    (input: { email: string; password: string; displayName?: string; turnstileToken: string }) =>
+    (input: {
+      email: string;
+      password: string;
+      displayName?: string;
+      turnstileToken: string;
+      termsVersion: string;
+    }) =>
       api
         .register({
           email: input.email,
           password: input.password,
           displayName: input.displayName,
           turnstileToken: input.turnstileToken,
+          termsVersion: input.termsVersion,
         })
         .then((r) => ({ verifyEmailSent: r.verifyEmailSent })),
     [],

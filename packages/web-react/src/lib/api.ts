@@ -419,6 +419,8 @@ export const api = {
     password: string;
     turnstileToken?: string;
     displayName?: string;
+    /** 勾选同意的协议版本（lib/legal TERMS_VERSION），后端落 users.terms_version 留证。 */
+    termsVersion?: string;
   }): Promise<RegisterResult> {
     return jsonOrThrow<{ user_id: string; verify_email_sent: boolean }>(
       fetch("/api/auth/register", {
@@ -430,6 +432,7 @@ export const api = {
           password: input.password,
           ...(input.turnstileToken ? { turnstile_token: input.turnstileToken } : {}),
           ...(input.displayName ? { display_name: input.displayName } : {}),
+          ...(input.termsVersion ? { terms_version: input.termsVersion } : {}),
         }),
       }),
     ).then((b) => ({ userId: b.user_id, verifyEmailSent: b.verify_email_sent }));
