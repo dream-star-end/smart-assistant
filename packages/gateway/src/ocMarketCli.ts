@@ -11,8 +11,17 @@
  *   oc-market installed
  *   oc-market install <slug>
  *   oc-market uninstall <slug>
- *   oc-market publish-skill --slug <s> --name <n> --version <v> --description <d> --body-file <f> [--tags a,b]
- *   oc-market publish-agent --slug <s> --name <n> --version <v> --description <d> --model <m> --toolsets a,b --persona-file <f> [--skill-deps a,b] [--tags a,b]
+ *   oc-market publish-skill --slug <s> --name <n> --version <v> --description <d> --body-file <f>
+ *     --category <id> --use-cases "a;b" [--outcomes "a;b"] [--intro-file <f>] [--tags a,b]
+ *   oc-market publish-agent --slug <s> --name <n> --version <v> --description <d> --model <m>
+ *     --toolsets a,b --persona-file <f> --category <id> --use-cases "a;b"
+ *     [--outcomes "a;b"] [--intro-file <f>] [--skill-deps a,b] [--tags a,b]
+ *
+ * Storefront ("人向商品层") metadata carried on publish (validated server-side):
+ *   --category <id>       one of the marketplace taxonomy ids (required)
+ *   --use-cases "a;b"     1-4 "what the user wants to do" sentences, ';'-separated (required)
+ *   --outcomes "a;b"      0-4 concrete "give X → get Y" effect examples, ';'-separated (optional)
+ *   --intro-file <f>      Markdown rich intro rendered on the storefront page (optional) → humanMd
  */
 import { readFileSync } from 'node:fs'
 import { homedir } from 'node:os'
@@ -96,6 +105,97 @@ function parseFlags(args: string[]): { positional: string[]; flags: Record<strin
     }
   }
   return { positional, flags }
+}
+
+/** Split a delimited flag value into a trimmed, empty-filtered string[]. */
+export function splitList(raw: string | undefined, sep: ',' | ';'): string[] {
+  return raw
+    ? raw
+        .split(sep)
+        .map((t) => t.trim())
+        .filter(Boolean)
+    : []
+}
+
+export interface PublishSkillRequest {
+  kind: 'skill'
+  slug?: string
+  name?: string
+  version?: string
+  description?: string
+  category?: string
+  tags: string[]
+  useCases: string[]
+  outcomeExamples: string[]
+  humanMd?: string
+  body: string
+}
+
+export interface PublishAgentRequest {
+  kind: 'agent'
+  slug?: string
+  name?: string
+  version?: string
+  description?: string
+  category?: string
+  model?: string
+  toolsets: string[]
+  skillDeps: string[]
+  tags: string[]
+  useCases: string[]
+  outcomeExamples: string[]
+  humanMd?: string
+  persona: string
+}
+
+/**
+ * Assemble the publish-skill request body from parsed flags + already-read files.
+ * Pure (no IO): storefront metadata (category/useCases/outcomeExamples/humanMd) is
+ * validated by the server, not here. `--use-cases`/`--outcomes` are ';'-separated
+ * because each entry is a full sentence that may itself contain commas.
+ */
+export function buildPublishSkillRequest(
+  flags: Record<string, string>,
+  body: string,
+  humanMd?: string,
+): PublishSkillRequest {
+  return {
+    kind: 'skill',
+    slug: flags.slug,
+    name: flags.name,
+    version: flags.version,
+    description: flags.description,
+    category: flags.category,
+    tags: splitList(flags.tags, ','),
+    useCases: splitList(flags['use-cases'], ';'),
+    outcomeExamples: splitList(flags.outcomes, ';'),
+    ...(humanMd != null ? { humanMd } : {}),
+    body,
+  }
+}
+
+/** Assemble the publish-agent request body (same storefront metadata as skills). */
+export function buildPublishAgentRequest(
+  flags: Record<string, string>,
+  persona: string,
+  humanMd?: string,
+): PublishAgentRequest {
+  return {
+    kind: 'agent',
+    slug: flags.slug,
+    name: flags.name,
+    version: flags.version,
+    description: flags.description,
+    category: flags.category,
+    model: flags.model,
+    toolsets: splitList(flags.toolsets, ','),
+    skillDeps: splitList(flags['skill-deps'], ','),
+    tags: splitList(flags.tags, ','),
+    useCases: splitList(flags['use-cases'], ';'),
+    outcomeExamples: splitList(flags.outcomes, ';'),
+    ...(humanMd != null ? { humanMd } : {}),
+    persona,
+  }
 }
 
 async function call(
@@ -187,20 +287,12 @@ async function main(): Promise<void> {
       const body = fileArg(flags, 'body-file') ?? flags.body
       if (!body) fail('publish-skill needs --body-file <f>')
       out(
-        await call('POST', 'publish', undefined, {
-          kind: 'skill',
-          slug: flags.slug,
-          name: flags.name,
-          version: flags.version,
-          description: flags.description,
-          tags: flags.tags
-            ? flags.tags
-                .split(',')
-                .map((t) => t.trim())
-                .filter(Boolean)
-            : [],
-          body,
-        }),
+        await call(
+          'POST',
+          'publish',
+          undefined,
+          buildPublishSkillRequest(flags, body, fileArg(flags, 'intro-file')),
+        ),
       )
       return
     }
@@ -208,33 +300,12 @@ async function main(): Promise<void> {
       const persona = fileArg(flags, 'persona-file') ?? flags.persona
       if (!persona) fail('publish-agent needs --persona-file <f>')
       out(
-        await call('POST', 'publish', undefined, {
-          kind: 'agent',
-          slug: flags.slug,
-          name: flags.name,
-          version: flags.version,
-          description: flags.description,
-          model: flags.model,
-          toolsets: flags.toolsets
-            ? flags.toolsets
-                .split(',')
-                .map((t) => t.trim())
-                .filter(Boolean)
-            : [],
-          skillDeps: flags['skill-deps']
-            ? flags['skill-deps']
-                .split(',')
-                .map((t) => t.trim())
-                .filter(Boolean)
-            : [],
-          tags: flags.tags
-            ? flags.tags
-                .split(',')
-                .map((t) => t.trim())
-                .filter(Boolean)
-            : [],
-          persona,
-        }),
+        await call(
+          'POST',
+          'publish',
+          undefined,
+          buildPublishAgentRequest(flags, persona, fileArg(flags, 'intro-file')),
+        ),
       )
       return
     }

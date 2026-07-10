@@ -45,6 +45,11 @@ import {
   recordUninstall,
   resolveCallerOrgId,
 } from '../marketplace/marketplaceDb.js'
+import {
+  HumanMetaError,
+  humanMetaScanBody,
+  parseHumanMeta,
+} from '../marketplace/marketplaceMeta.js'
 import { listMarketBrowseCatalog } from '../marketplace/platformPresets.js'
 import { scanSkillArtifact } from '../marketplace/skillScanner.js'
 import { REQUEST_ID_HEADER, ensureRequestId, setSecurityHeaders } from './util.js'
@@ -199,6 +204,9 @@ export function makeMarketplaceAgentHandler(deps: MarketplaceAgentDeps): Marketp
                 name: c.name,
                 description: c.description,
                 tags: c.tags,
+                // 人向导购字段:容器 AI 据 category/useCases 解释「为什么适配你的需求」。
+                category: c.category,
+                useCases: c.useCases,
               })),
           },
           requestId,
@@ -309,6 +317,11 @@ export function makeMarketplaceAgentHandler(deps: MarketplaceAgentDeps): Marketp
         )
         return
       }
+      // 人向元数据校验失败(缺 category/useCases 等)→ 400,与浏览器路由同规则。
+      if (err instanceof HumanMetaError) {
+        send(res, 400, { error: { code: err.code, message: err.message } }, requestId)
+        return
+      }
       const msg = err instanceof Error ? err.message : 'error'
       if (msg === 'invalid JSON' || msg === 'body too large') {
         send(res, 400, { error: { code: 'BAD_REQUEST', message: msg } }, requestId)
@@ -360,6 +373,22 @@ async function handlePublish(
       requestId,
     )
   const tags = asTags(body.tags)
+  // 人向商品层元数据(必填 category/useCases;单一校验权威)→ HumanMetaError 由外层 catch 映射 400。
+  const humanMeta = parseHumanMeta(body)
+  // 商品页文案与正文同规则扫描,防注入/密钥进商品页。
+  const metaScan = scanSkillArtifact({
+    name,
+    description: '',
+    tags: [],
+    body: humanMetaScanBody(humanMeta),
+  })
+  if (metaScan.blocked)
+    return send(
+      res,
+      422,
+      { error: { code: 'SCAN_BLOCKED', message: '商品页文案被静态扫描拦截' }, riskFlags: metaScan.flags },
+      requestId,
+    )
 
   if (kind === 'skill') {
     const skillBody = asStr(body.body, MAX_BODY)
@@ -392,12 +421,16 @@ async function handlePublish(
       tags,
       rawSkillMd,
       artifactHash: marketplaceArtifactHash(rawSkillMd),
-      embeddingHash: skillContentHash({ name, description, tags }),
+      embeddingHash: skillContentHash({ name, description, tags, use_cases: humanMeta.useCases }),
       riskFlags: scan.flags,
       policyVersion: scan.policyVersion,
       submittedBy: userId,
       kind: 'skill',
       orgId,
+      category: humanMeta.category,
+      useCases: humanMeta.useCases,
+      outcomeExamples: humanMeta.outcomeExamples,
+      humanMd: humanMeta.humanMd,
     })
     send(
       res,
@@ -422,7 +455,10 @@ async function handlePublish(
     )
   }
   const manifestInput: Record<string, unknown> = { ...body }
-  for (const k of ['kind', 'slug']) delete manifestInput[k]
+  // category/useCases/outcomeExamples/humanMd 是发布级 storefront 元数据,不进 manifest —— 与
+  // kind/slug 一样在严格 allowlist 校验前 delete,否则会被拒为「未知字段」。
+  for (const k of ['kind', 'slug', 'category', 'useCases', 'outcomeExamples', 'humanMd'])
+    delete manifestInput[k]
   const result = validateAgentManifest(manifestInput, {
     vettedToolsets: VETTED_AGENT_TOOLSETS,
     allowedModels,
@@ -476,11 +512,16 @@ async function handlePublish(
       name: manifest.name,
       description: manifest.description,
       tags: manifest.tags,
+      use_cases: humanMeta.useCases,
     }),
     riskFlags: scan.flags,
     policyVersion: scan.policyVersion,
     submittedBy: userId,
     orgId,
+    category: humanMeta.category,
+    useCases: humanMeta.useCases,
+    outcomeExamples: humanMeta.outcomeExamples,
+    humanMd: humanMeta.humanMd,
   })
   send(
     res,

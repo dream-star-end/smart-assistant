@@ -763,6 +763,14 @@ export type MarketplaceCard = {
   preset?: boolean;
   /** 发布者自报评测摘要(仅有数据时渲染徽记;展示须标注"发布者提供·未经平台验证")。 */
   benchmark?: { withPassRate: number; withoutPassRate: number; cases: number } | null;
+  // ── 人向商品层（storefront 元数据；权威枚举见 @openclaude/protocol taxonomy） ──
+  // 全部可选:旧后端/存量 NULL 数据缺字段时 UI 优雅降级(显示未分类/不渲染该区块)。
+  /** 分类 id(∈ MARKETPLACE_CATEGORIES;缺/未知 → 未分类)。 */
+  category?: string | null;
+  /** 适用场景(1-4 条),卡片透出用于分类导航与「为什么适配你」的解释。 */
+  useCases?: string[];
+  /** 平台精选权重(越小越靠前;null/缺省=非精选)。只由平台运维脚本写入。 */
+  featuredRank?: number | null;
 };
 
 /** 市场检索响应。method=all 为空查询返全部目录。 */
@@ -800,6 +808,17 @@ export type MarketplaceDetail = {
   rawBundle?: Record<string, string> | null;
   /** 发布者自报评测摘要(展示须标注"发布者提供")。 */
   benchmark?: { withPassRate: number; withoutPassRate: number; cases: number } | null;
+  // ── 人向商品层（detail 透出全部 storefront 字段；全部可选,缺则优雅降级） ──
+  /** 分类 id(∈ MARKETPLACE_CATEGORIES;缺/未知 → 未分类)。 */
+  category?: string | null;
+  /** 适用场景(1-4 条)。 */
+  useCases?: string[];
+  /** 效果示例(0-4 条):「给它什么→得到什么」的具体产出示例。 */
+  outcomeExamples?: string[];
+  /** 人向富介绍(Markdown 渲染;≤16384 字)。 */
+  humanMd?: string | null;
+  /** 平台精选权重(越小越靠前;null=非精选)。 */
+  featuredRank?: number | null;
 };
 
 /** 已安装条目（GET /api/marketplace/installed 的 installed 项）。 */
@@ -866,6 +885,12 @@ export type MarketplacePending = {
   benchmark?: { withPassRate: number; withoutPassRate: number; cases: number } | null;
   /** AI 审核意见（escalate/warn 降级/解析失败时的原因）；人审展开区「供参考」展示。 */
   aiNote?: string | null;
+  // ── 人向商品层（审核队列透出全部 storefront 字段;缺 category/useCases 打「缺失」徽章） ──
+  /** 分类 id(∈ MARKETPLACE_CATEGORIES;缺/未知 → 未分类)。 */
+  category?: string | null;
+  useCases?: string[];
+  outcomeExamples?: string[];
+  humanMd?: string | null;
 };
 
 /** AI 自动审批记录项（GET /api/admin/marketplace/ai-reviews；review_source='ai'）。 */
@@ -896,8 +921,24 @@ export type MarketplaceMyAgent = {
   preset?: boolean;
 };
 
-/** 智能体发布入参（POST /api/marketplace/agent/publish；manifest 白名单字段）。 */
-export type MarketplaceAgentPublishInput = {
+/**
+ * 人向商品层发布字段（两条发布路径对称）。这些是发布级 storefront 元数据,
+ * **不进 SKILL.md 工件 / agent manifest** —— 后端在 validateAgentManifest 前从
+ * manifestInput 剔除,前端只负责按契约传上去。
+ */
+export type MarketplaceHumanMetaInput = {
+  /** 分类 id(必填,须 ∈ MARKETPLACE_CATEGORIES)。 */
+  category?: string;
+  /** 适用场景(必填 1-4 条,每条 trim 后 4-120 字)。 */
+  useCases?: string[];
+  /** 效果示例(选填 0-4 条,每条 trim 后 ≤200 字)。 */
+  outcomeExamples?: string[];
+  /** 人向富介绍(选填,≤16384 字,Markdown)。 */
+  humanMd?: string;
+};
+
+/** 智能体发布入参（POST /api/marketplace/agent/publish；manifest 白名单字段 + storefront 元数据）。 */
+export type MarketplaceAgentPublishInput = MarketplaceHumanMetaInput & {
   slug: string;
   version: string;
   name: string;
@@ -912,8 +953,8 @@ export type MarketplaceAgentPublishInput = {
   greeting?: string;
 };
 
-/** 发布入参（POST /api/marketplace/publish）。 */
-export type MarketplacePublishInput = {
+/** 发布入参（POST /api/marketplace/publish；含 storefront 元数据）。 */
+export type MarketplacePublishInput = MarketplaceHumanMetaInput & {
   slug: string;
   version: string;
   name: string;

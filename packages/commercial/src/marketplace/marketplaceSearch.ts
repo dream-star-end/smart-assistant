@@ -40,11 +40,15 @@ function toCard(c: ApprovedSearchRow): {
   tags: string[]
   installCount: number
   benchmark: { withPassRate: number; withoutPassRate: number; cases: number } | null
+  category: string | null
+  useCases: string[]
+  featuredRank: number | null
 } {
-  // installCount 是加法字段(v3 vanilla UI 忽略);排序不动,热度排序收在 v5 前端。
+  // installCount 是加法字段(v3 vanilla UI 忽略);排序服务端权威(featured→热度→新),前端信任此序。
   // 平台预设 agent 已在 handleMarketplaceSearch 收口剔除,不会走到这里,故无 preset 字段。
   // benchmark 仅透出聚合值(withPassRate/withoutPassRate/cases),不暴露逐用例明细;
   // 前端徽记须标注"发布者提供·未经平台验证"(v3 vanilla UI 忽略该加法字段)。
+  // 人向导购字段(category/useCases/featuredRank)卡片透出;outcomeExamples/humanMd 仅 detail(卡片保持轻)。
   return {
     slug: c.slug,
     kind: c.kind,
@@ -53,6 +57,9 @@ function toCard(c: ApprovedSearchRow): {
     tags: c.tags,
     installCount: c.installCount,
     benchmark: c.benchmark,
+    category: c.category,
+    useCases: c.useCases,
+    featuredRank: c.featuredRank,
   }
 }
 
@@ -137,7 +144,13 @@ export async function handleMarketplaceSearch(
         if (!textByHash.has(c.embeddingHash))
           textByHash.set(
             c.embeddingHash,
-            skillEmbedText({ name: c.name, description: c.description, tags: c.tags }),
+            // use_cases 参与 embed 文本(与 embeddingHash 一致):同 hash 的行 useCases 亦同,去重安全。
+            skillEmbedText({
+              name: c.name,
+              description: c.description,
+              tags: c.tags,
+              use_cases: c.useCases,
+            }),
           )
       const missHashes = [...textByHash.keys()]
       const vecs = await provider.embed(

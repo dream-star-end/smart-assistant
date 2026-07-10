@@ -33,6 +33,21 @@ if ! flock -n 9; then
   }
 fi
 printf 'pid=%s tree=%s started=%s cmd=%s\n' "$$" "$PWD" "$(date -Is)" "$cmd" > "${lock}.holder"
-trap 'rm -f "${lock}.holder"' EXIT
 
-bash -c "$cmd"
+# 进程组清理(2026-07-10 第二根因):`timeout npx tsx` 只杀 npx 包装,tsx 派生的 node
+# 子进程成孤儿抱着 PG 连接/端口不放 → 机器"中毒"、锁被一直占。set -m 让整条命令跑在
+# 独立进程组(pgid == $!,确定性;不用 setsid——非组长场景它会 fork,$! 不是真实组长,
+# 组杀落空),wrapper 退出/被杀时整组 TERM→KILL,实测含孙进程零残留、退出码透传。
+set -m
+bash -c "$cmd" &
+child=$!
+cleanup() {
+  # 组已消亡(正常退出的常态)→ 立即返回:不空等 1s,也不让失败的 kill 在 set -e 下
+  # 中断 trap(那会把真实退出码吃成 1)。
+  kill -TERM -- "-$child" 2>/dev/null || return 0
+  sleep 1
+  kill -KILL -- "-$child" 2>/dev/null || true
+}
+trap 'cleanup; rm -f "${lock}.holder"' EXIT INT TERM
+wait "$child" && rc=0 || rc=$?
+exit "$rc"

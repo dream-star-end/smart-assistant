@@ -103,12 +103,15 @@ npm run test:commercial:unit                        # 本机缺 PG/Redis 会有 
 npm run test:commercial:unit 2>&1 | grep '^not ok' | sed 's/^not ok [0-9]* - //' | sort > /tmp/fails-{base,mine}.txt
 diff /tmp/fails-base.txt /tmp/fails-mine.txt
 ```
-⚠️ **全量跑法本地可能环境性挂死**(整套挤一个 node 进程,一个文件僵住堵死全部;症状=进程活着但 CPU 时间几乎不走,2026-07-10 实测 2h 只走 6s)。挂死就换**逐文件 sweep**(粒度降为失败文件集,gate 语义不变):
+⚠️ **孤儿进程中毒(与上面互斥锁同日定位的第二根因)**:`timeout npx tsx` 只杀 npx 包装,tsx 派生的 node 子进程成孤儿,继续抱着 PG 连接/端口不放 → 机器进入"中毒"状态,之后任何单跑也会挂、且会把互斥锁一直占住。`test-mutex.sh` 已内建 set -m 进程组清理(wrapper 退出/被杀时整组 TERM→KILL,实测含孙进程零残留);**手工/逐文件跑必须也经它包裹**,否则 timeout 再造孤儿:
 ```bash
-find packages/commercial/src -name '*.test.ts' ! -name '*.integ.test.ts' | sort | \
-  xargs -P4 -I{} bash -c 'timeout 90 npx tsx --test --test-force-exit "{}" >/dev/null 2>&1 || echo "{}"' | sort
-# 两棵树各跑一次,comm -23 mine base 必须为空
+# 逐文件 sweep(定位具体挂死文件)的正确姿势:
+find packages/commercial/src -name '*.test.ts' ! -name '*.integ.test.ts' | sort | xargs -I{} \
+  bash -c 'timeout 120 bash scripts/test-mutex.sh commercial "npx tsx --test --test-force-exit {}" >/dev/null 2>&1 || echo "{}"' | sort
+# 两棵树各跑一次,comm -23 mine base 必须为空。禁 -P 并行(全局锁下无收益)。
+# 疑似已中毒(跑啥都挂)先清场:ps -eo pid,etime,args | grep 'node.*--test'(etime 分钟级=孤儿)→ kill -9 -- -<pgid>
 ```
+⚠️ **已知未解 infra 债(2026-07-10)**:`userChatBridge.test.ts` 在**新建 worktree** 里稳定挂死于「frontend build handshake」suite 前(部署树不挂;基底提交对照已证明与业务改动无关)。已收窄线索:挂死时 tsx 自身 IPC 管道(`/tmp/tsx-0/<pid>.pipe`)`close` 永不完成、测试子进程滞留两台 rig 服务器;已排除=tsx 编译缓存膨胀(清空无效)、.git 文件 vs 目录(两侧都是 worktree)。绕行=该文件在新 worktree 的挂死不计入失败集 diff(以基底提交同法复跑为对照组)。偿还触发:任何人再撞到或要动 tsx 版本时接着查。
 - 测试必须是**行为断言**(帧序列驱动 reducer/mock WS/真 DB),不是对源码文本的 regex(那只能防删行,防不了行为)。prompt 驱动的行为(团队模式规则等)本质不可单测——这是设计信号,应改为代码硬编排,而不是写 regex 测试。
 - lint 红线:**不跑 biome --write 全文件 reformat**;只手工修自己引入的违规。
 

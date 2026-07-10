@@ -1,7 +1,14 @@
-import { CheckCircle2, ChevronRight, Loader2, Sparkles, Upload } from "lucide-react";
+import { MARKETPLACE_CATEGORIES } from "@openclaude/protocol";
+import { CheckCircle2, ChevronRight, Loader2, Plus, Sparkles, Upload, X } from "lucide-react";
 import { type ReactNode, useEffect, useState } from "react";
 import { api, ApiError } from "../../lib/api";
-import { suggestSlug } from "../../lib/marketplace";
+import {
+  type HumanMetaDraft,
+  suggestSlug,
+  USE_CASES_MAX,
+  OUTCOMES_MAX,
+  validateHumanMeta,
+} from "../../lib/marketplace";
 import type {
   AuthSession,
   MarketplaceMyPublish,
@@ -20,6 +27,142 @@ function Field({ label, children }: { label: string; children: ReactNode }) {
       <span className="text-[12px] font-medium text-muted">{label}</span>
       {children}
     </label>
+  );
+}
+
+/** 人向元数据草稿的初始值(useCases 至少 1 行输入框;其余空)。 */
+function emptyHumanMeta(): HumanMetaDraft {
+  return { category: "", useCases: [""], outcomeExamples: [], humanMd: "" };
+}
+
+/**
+ * 人向商品元数据字段(分类 / 适用场景 / 效果示例 / 详细介绍)——技能与智能体两条
+ * 发布路径**对称复用**同一套控件,保证语义与校验一致。受控组件,状态由各表单持有。
+ */
+function HumanMetaFields({
+  meta,
+  onChange,
+}: {
+  meta: HumanMetaDraft;
+  onChange: (next: HumanMetaDraft) => void;
+}) {
+  const selected = MARKETPLACE_CATEGORIES.find((c) => c.id === meta.category);
+  const setUseCase = (i: number, v: string) =>
+    onChange({ ...meta, useCases: meta.useCases.map((x, j) => (j === i ? v : x)) });
+  const setOutcome = (i: number, v: string) =>
+    onChange({ ...meta, outcomeExamples: meta.outcomeExamples.map((x, j) => (j === i ? v : x)) });
+
+  return (
+    <div className="flex flex-col gap-3.5 rounded-xl border border-border bg-surface p-3.5">
+      <div className="text-[12.5px] font-medium text-fg">
+        商品信息
+        <span className="ml-1.5 text-[11px] font-normal text-faint">
+          帮用户判断「适不适合我、能达成什么」
+        </span>
+      </div>
+
+      <Field label="分类（必填）">
+        <select
+          value={meta.category}
+          onChange={(e) => onChange({ ...meta, category: e.target.value })}
+          className="h-10 w-full rounded-lg border border-border bg-surface px-3 text-sm text-fg outline-none transition-colors focus:border-accent focus:ring-2 focus:ring-ring"
+        >
+          <option value="">请选择分类…</option>
+          {MARKETPLACE_CATEGORIES.map((c) => (
+            <option key={c.id} value={c.id}>
+              {c.label}
+            </option>
+          ))}
+        </select>
+      </Field>
+      {selected && <p className="-mt-2 text-[11.5px] leading-snug text-faint">{selected.blurb}</p>}
+
+      <div>
+        <div className="mb-1.5 flex items-center justify-between">
+          <span className="text-[12px] font-medium text-muted">适用场景（必填，1–4 条）</span>
+          <Button
+            variant="ghost"
+            size="sm"
+            disabled={meta.useCases.length >= USE_CASES_MAX}
+            onClick={() => onChange({ ...meta, useCases: [...meta.useCases, ""] })}
+          >
+            <Plus size={13} /> 添加场景
+          </Button>
+        </div>
+        <ul className="flex flex-col gap-2">
+          {meta.useCases.map((u, i) => (
+            <li key={i} className="flex items-center gap-2">
+              <Input
+                value={u}
+                onChange={(e) => setUseCase(i, e.target.value)}
+                placeholder="例：把中文论文摘要翻译成地道英文并保留术语"
+              />
+              {meta.useCases.length > 1 && (
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  aria-label="删除该场景"
+                  onClick={() =>
+                    onChange({ ...meta, useCases: meta.useCases.filter((_, j) => j !== i) })
+                  }
+                >
+                  <X size={14} />
+                </Button>
+              )}
+            </li>
+          ))}
+        </ul>
+      </div>
+
+      <div>
+        <div className="mb-1.5 flex items-center justify-between">
+          <span className="text-[12px] font-medium text-muted">能达成什么效果（选填，0–4 条）</span>
+          <Button
+            variant="ghost"
+            size="sm"
+            disabled={meta.outcomeExamples.length >= OUTCOMES_MAX}
+            onClick={() => onChange({ ...meta, outcomeExamples: [...meta.outcomeExamples, ""] })}
+          >
+            <Plus size={13} /> 添加效果示例
+          </Button>
+        </div>
+        {meta.outcomeExamples.length > 0 && (
+          <ul className="flex flex-col gap-2">
+            {meta.outcomeExamples.map((o, i) => (
+              <li key={i} className="flex items-center gap-2">
+                <Input
+                  value={o}
+                  onChange={(e) => setOutcome(i, e.target.value)}
+                  placeholder="给它 X → 得到 Y，例：给一段乱码日志 → 得到定位到根因的排查结论"
+                />
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  aria-label="删除该效果示例"
+                  onClick={() =>
+                    onChange({
+                      ...meta,
+                      outcomeExamples: meta.outcomeExamples.filter((_, j) => j !== i),
+                    })
+                  }
+                >
+                  <X size={14} />
+                </Button>
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
+
+      <Field label="详细介绍（选填，支持 Markdown）">
+        <Textarea
+          value={meta.humanMd}
+          onChange={(e) => onChange({ ...meta, humanMd: e.target.value })}
+          rows={6}
+          placeholder="向用户介绍它的亮点、适合的人群、使用建议、注意事项……"
+        />
+      </Field>
+    </div>
   );
 }
 
@@ -130,6 +273,8 @@ function SkillPublishForm({ auth, onPublished }: { auth: AuthSession; onPublishe
   const [description, setDescription] = useState("");
   const [tags, setTags] = useState("");
   const [body, setBody] = useState("");
+  // 人向商品元数据(分类/适用场景/效果示例/详细介绍)——与智能体发布对称。
+  const [meta, setMeta] = useState<HumanMetaDraft>(emptyHumanMeta());
   // 附属文件(references/assets/evals;scripts 暂不支持)。导入技能时自动带上其
   // 评测用例与上次实测结果(可删),让「实测有效」成为市场卖点而不是口说无凭。
   const [files, setFiles] = useState<Array<{ path: string; content: string }>>([]);
@@ -220,7 +365,7 @@ function SkillPublishForm({ auth, onPublished }: { auth: AuthSession; onPublishe
     if (!name.trim()) return "请填写显示名称";
     if (!description.trim()) return "请填写一句话描述";
     if (!body.trim()) return "请填写技能正文";
-    return null;
+    return validateHumanMeta(meta);
   };
 
   const submit = async () => {
@@ -232,6 +377,9 @@ function SkillPublishForm({ auth, onPublished }: { auth: AuthSession; onPublishe
     setSubmitting(true);
     setErr(null);
     setFlags([]);
+    const useCases = meta.useCases.map((s) => s.trim()).filter(Boolean);
+    const outcomeExamples = meta.outcomeExamples.map((s) => s.trim()).filter(Boolean);
+    const humanMd = meta.humanMd.trim();
     try {
       await api.publishMarketplace(auth, {
         slug,
@@ -243,6 +391,10 @@ function SkillPublishForm({ auth, onPublished }: { auth: AuthSession; onPublishe
           .split(",")
           .map((t) => t.trim())
           .filter(Boolean),
+        category: meta.category,
+        useCases,
+        ...(outcomeExamples.length > 0 ? { outcomeExamples } : {}),
+        ...(humanMd ? { humanMd } : {}),
         ...(files.length > 0 ? { files } : {}),
         ...(benchmark ? { benchmark } : {}),
       });
@@ -280,6 +432,7 @@ function SkillPublishForm({ auth, onPublished }: { auth: AuthSession; onPublishe
           setTags("");
           setBody("");
           setVersion("1.0.0");
+          setMeta(emptyHumanMeta());
         }}
       />
     );
@@ -359,6 +512,8 @@ function SkillPublishForm({ auth, onPublished }: { auth: AuthSession; onPublishe
           placeholder="把中文学术论文翻译成地道英文，保留术语。"
         />
       </Field>
+
+      <HumanMetaFields meta={meta} onChange={setMeta} />
 
       <Field label="技能正文（SKILL.md 内容）">
         <Textarea
@@ -467,6 +622,8 @@ function AgentPublishForm({ auth, onPublished }: { auth: AuthSession; onPublishe
   const [installedSkills, setInstalledSkills] = useState<Array<{ slug: string; name: string }>>([]);
   const [skillDeps, setSkillDeps] = useState<string[]>([]);
   const [persona, setPersona] = useState("");
+  // 人向商品元数据(与技能发布对称)——是发布级 storefront 字段,不进 manifest。
+  const [meta, setMeta] = useState<HumanMetaDraft>(emptyHumanMeta());
 
   const [submitting, setSubmitting] = useState(false);
   const [err, setErr] = useState<string | null>(null);
@@ -511,7 +668,7 @@ function AgentPublishForm({ auth, onPublished }: { auth: AuthSession; onPublishe
     if (!model) return "请选择模型";
     if (toolsets.length === 0) return "请至少选择一个能力工具集";
     if (!persona.trim()) return "请填写人设(它决定智能体的行为方式)";
-    return null;
+    return validateHumanMeta(meta);
   };
 
   const submit = async () => {
@@ -524,6 +681,9 @@ function AgentPublishForm({ auth, onPublished }: { auth: AuthSession; onPublishe
     setErr(null);
     setManifestErrors([]);
     setFlags([]);
+    const useCases = meta.useCases.map((s) => s.trim()).filter(Boolean);
+    const outcomeExamples = meta.outcomeExamples.map((s) => s.trim()).filter(Boolean);
+    const humanMd = meta.humanMd.trim();
     try {
       await api.publishMarketplaceAgent(auth, {
         slug,
@@ -538,6 +698,10 @@ function AgentPublishForm({ auth, onPublished }: { auth: AuthSession; onPublishe
         toolsets,
         skillDeps,
         persona,
+        category: meta.category,
+        useCases,
+        ...(outcomeExamples.length > 0 ? { outcomeExamples } : {}),
+        ...(humanMd ? { humanMd } : {}),
         ...(avatarEmoji.trim() ? { avatarEmoji: avatarEmoji.trim() } : {}),
       });
       setOk(true);
@@ -577,6 +741,7 @@ function AgentPublishForm({ auth, onPublished }: { auth: AuthSession; onPublishe
           setDescription("");
           setPersona("");
           setSkillDeps([]);
+          setMeta(emptyHumanMeta());
         }}
       />
     );
@@ -666,6 +831,8 @@ function AgentPublishForm({ auth, onPublished }: { auth: AuthSession; onPublishe
           placeholder="面向合同审阅与合规问答的法律顾问。"
         />
       </Field>
+
+      <HumanMetaFields meta={meta} onChange={setMeta} />
 
       <div>
         <div className="mb-1.5 text-[12px] font-medium text-muted">能力（工具集）</div>

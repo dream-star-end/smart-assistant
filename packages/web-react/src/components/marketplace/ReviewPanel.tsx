@@ -1,3 +1,4 @@
+import { isMarketplaceCategoryId, marketplaceCategoryLabel } from "@openclaude/protocol";
 import { Check, ChevronRight, Inbox, Loader2, ShieldX, Sparkles, X } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
 import { api } from "../../lib/api";
@@ -8,8 +9,59 @@ import type {
   MarketplaceCard,
   MarketplacePending,
 } from "../../lib/types";
+import { Markdown } from "../Markdown";
 import { Alert, Badge, Button, EmptyState, Input, Spinner, useConfirm, usePrompt } from "../ui";
 import { friendlyRiskFlags } from "./riskFlags";
+
+/** 人向元数据是否缺失(存量/平台 seed 行没有 category 或 useCases)。 */
+function humanMetaMissing(r: MarketplacePending): boolean {
+  return !isMarketplaceCategoryId(r.category) || !(r.useCases && r.useCases.length > 0);
+}
+
+/** 审核展开区:人向商品元数据(分类/适用场景/效果示例/详细介绍)只读展示。 */
+function PendingHumanMeta({ r }: { r: MarketplacePending }) {
+  const useCases = Array.isArray(r.useCases) ? r.useCases.filter((s) => s.trim()) : [];
+  const outcomes = Array.isArray(r.outcomeExamples) ? r.outcomeExamples.filter((s) => s.trim()) : [];
+  const humanMd = r.humanMd?.trim();
+  return (
+    <div className="mb-2 flex flex-col gap-1.5 rounded-lg border border-border bg-surface px-2.5 py-2 text-[12px] leading-relaxed">
+      <div>
+        <span className="font-medium text-muted">分类：</span>
+        <span className="text-fg">{marketplaceCategoryLabel(r.category)}</span>
+      </div>
+      <div>
+        <span className="font-medium text-muted">适用场景：</span>
+        {useCases.length > 0 ? (
+          <ul className="mt-0.5 list-disc pl-5 text-fg">
+            {useCases.map((u, i) => (
+              <li key={i}>{u}</li>
+            ))}
+          </ul>
+        ) : (
+          <span className="text-faint">未提供</span>
+        )}
+      </div>
+      {outcomes.length > 0 && (
+        <div>
+          <span className="font-medium text-muted">效果示例：</span>
+          <ul className="mt-0.5 list-disc pl-5 text-fg">
+            {outcomes.map((o, i) => (
+              <li key={i}>{o}</li>
+            ))}
+          </ul>
+        </div>
+      )}
+      {humanMd && (
+        <div>
+          <span className="font-medium text-muted">详细介绍：</span>
+          <div className="mt-0.5 text-fg">
+            <Markdown>{humanMd}</Markdown>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
 
 /**
  * 管理员审核：待审队列(批准 / 拒绝须附理由——理由回显给发布者的「我的发布」)
@@ -197,6 +249,8 @@ export function ReviewPanel({ auth }: { auth: AuthSession }) {
                           <span className="truncate text-[13.5px] font-medium text-fg">{r.name}</span>
                           {r.kind === "agent" && <Badge tone="accent">智能体</Badge>}
                           <Badge tone="neutral">v{r.version}</Badge>
+                          {/* 存量/平台 seed 行缺人向元数据 → 中性提示徽章(非阻断,仅提示补齐)。 */}
+                          {humanMetaMissing(r) && <Badge tone="neutral">人向元数据缺失</Badge>}
                           {flags.length > 0 && <Badge tone="warning">{flags.length} 项提示</Badge>}
                           {/* 自报评测黄牌:增益≤0 或通过率<50% 时提示人审留意;数据为发布者
                               自报、未经平台验证,仅提示不阻断。无 benchmark 不渲染。 */}
@@ -241,6 +295,8 @@ export function ReviewPanel({ auth }: { auth: AuthSession }) {
                 {isOpen && (
                   <div className="border-t border-border px-3.5 py-3">
                     <p className="mb-2 text-[12.5px] text-fg">{r.description}</p>
+                    {/* 人向商品元数据:审核要点=分类名实相符、用例与正文一致、效果不夸大。 */}
+                    <PendingHumanMeta r={r} />
                     {/* AI 意见(供参考):escalate/warn 降级/解析失败时 AI 给出的转人工原因。
                         仅在待审队列里出现的项 = AI 未直接放行,人审据此复核。 */}
                     {r.aiNote && (

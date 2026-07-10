@@ -30,18 +30,49 @@ oc-market uninstall <slug>
 
 ## 发布
 
+发布时除了技术工件(SKILL.md / 人设),还要填**给人看的商品信息**:所属分类、用户拿它能做什么、能达成什么效果。SKILL.md 归模型看,商品信息归用户看,别混。
+
+**必填**:`--category`(∈ 下方 8 个分类 id)、`--use-cases`(1-4 条,分号 `;` 分隔)。
+**选填**:`--outcomes`(0-4 条效果示例,分号分隔)、`--intro-file`(富介绍 Markdown 文件)、`--tags`(逗号分隔)。
+
+### 分类 id 清单(category 必须取其一)
+
+| id | 分类 | 覆盖 |
+|---|---|---|
+| `office-docs` | 办公文档 | PPT、Word、PDF、周报公文、会议纪要等文档产出 |
+| `data-analysis` | 数据分析 | Excel 处理、统计分析、数据可视化与报表 |
+| `coding-dev` | 编程开发 | 写代码、调试测试、技术选型与开发者工具 |
+| `research-academic` | 科研学术 | 文献检索、论文写作、实验设计、学术评审 |
+| `design-creative` | 设计创意 | 海报、网页视觉、图形创作等设计产出 |
+| `finance-business` | 金融商业 | 投资研判、商业分析、行业与市场研究 |
+| `daily-tools` | 实用工具 | 搜索、地图、格式转换等日常效率工具 |
+| `skill-pack` | 技能包合集 | 一次安装、打包一整套子能力的大型合集 |
+
 发布**技能**(正文写到文件再传):
 ```bash
 oc-market publish-skill --slug my-skill --name "学术翻译" --version 1.0.0 \
-  --description "把中文论文译成地道英文,保留术语" --tags 翻译,学术 --body-file /tmp/skill.md
+  --description "把中文论文译成地道英文,保留术语" \
+  --category research-academic \
+  --use-cases "把中文论文摘要译成地道英文;润色已有英文稿的术语一致性" \
+  --outcomes "给它一段中文摘要,得到可直接投稿的英文;给它术语表,保证全文专有名词统一" \
+  --tags 翻译,学术 --intro-file /tmp/intro.md --body-file /tmp/skill.md
 ```
 
-发布**智能体**(人设写到文件;toolsets 只能取平台白名单 core/browser/research/web_context;model 取当前可用模型;skillDeps 必须是已上架技能的 slug):
+发布**智能体**(人设写到文件;toolsets 只能取平台白名单 core/browser/research/web_context;model 取当前可用模型;skillDeps 必须是已上架技能的 slug;**category/use-cases 同样必填**):
 ```bash
 oc-market publish-agent --slug my-agent --name "写作助手" --version 1.0.0 \
   --description "中文写作润色专家" --model glm-5.2 --toolsets core \
+  --category office-docs \
+  --use-cases "把口语要点扩写成成文;给中文稿件做润色和降 AI 味" \
   --skill-deps academic-translate --persona-file /tmp/persona.md
 ```
+
+## 商品信息纪律(发布 / 推荐都要遵守)
+
+- **发布必带 `--category` 且取上表某个 id**;拿不准就按用户这个技能/智能体"主要帮人做什么需求域"选,不要瞎填。分类给人导航用,填错等于放错货架。
+- **`--use-cases` 必填 1-4 条,每条写成"用户想做什么"的句子**(如"把中文论文摘要译成地道英文"),不是能力清单、不是关键词堆砌。让别的用户一眼看出"这正是我要的"。
+- `--outcomes` 写"给它 X → 得到 Y"的具体效果,别夸大、别虚构没有的能力;审核会核对分类/用例/效果与正文是否名实相符,对不上会被打回。
+- **向用户推荐搜索结果时**,用返回 JSON 里的 `category`、`useCases`(必要时 `outcomeExamples`)解释**"为什么这个适配你的需求"**——例如"它属于科研学术类,用例里正好有'把中文摘要译成英文',跟你要做的事对得上",而不是只报个名字。
 
 ## 关键事实(务必告知用户)
 

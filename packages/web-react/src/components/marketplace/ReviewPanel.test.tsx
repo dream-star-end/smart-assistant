@@ -14,6 +14,10 @@ vi.mock("../../lib/api", () => ({
     searchMarketplace: (...a: unknown[]) => searchMarketplace(...a),
   },
 }));
+// 富介绍走既有 <Markdown>(懒加载)。测试里用轻量桩直出文本,避免异步 chunk flake。
+vi.mock("../Markdown", () => ({
+  Markdown: ({ children }: { children: string }) => <div data-testid="md">{children}</div>,
+}));
 
 import { ReviewPanel } from "./ReviewPanel";
 
@@ -81,6 +85,41 @@ test("无 aiNote 的待审项不显示 AI 意见区", async () => {
   fireEvent.click(row);
   await waitFor(() => expect(screen.getByText("一个技能")).toBeInTheDocument());
   expect(screen.queryByText(/AI 意见（供参考）/)).not.toBeInTheDocument();
+});
+
+test("展开区展示人向元数据(分类/适用场景/效果示例/详细介绍)", async () => {
+  adminMarketplacePending.mockResolvedValue([
+    pending({
+      category: "office-docs",
+      useCases: ["把周报要点整理成 PPT"],
+      outcomeExamples: ["给一段要点 → 得到成稿 PPT"],
+      humanMd: "这是给人看的详细介绍",
+    }),
+  ]);
+  adminMarketplaceAiReviews.mockResolvedValue([]);
+  searchMarketplace.mockResolvedValue({ results: [] });
+
+  render(<ReviewPanel auth={auth} />);
+  fireEvent.click(await screen.findByText("示例技能"));
+
+  expect(await screen.findByText("办公文档")).toBeInTheDocument();
+  expect(screen.getByText("把周报要点整理成 PPT")).toBeInTheDocument();
+  expect(screen.getByText("给一段要点 → 得到成稿 PPT")).toBeInTheDocument();
+  expect(screen.getByText("这是给人看的详细介绍")).toBeInTheDocument();
+});
+
+test("缺 category/useCases 的存量行打「人向元数据缺失」徽章;补齐的不打", async () => {
+  adminMarketplacePending.mockResolvedValue([
+    pending({ versionId: "1", name: "存量技能", category: null, useCases: undefined }),
+    pending({ versionId: "2", name: "补齐技能", category: "office-docs", useCases: ["场景一" ] }),
+  ]);
+  adminMarketplaceAiReviews.mockResolvedValue([]);
+  searchMarketplace.mockResolvedValue({ results: [] });
+
+  render(<ReviewPanel auth={auth} />);
+  await screen.findByText("存量技能");
+  // 缺失徽章恰出现一次(仅存量行)
+  expect(screen.getAllByText("人向元数据缺失")).toHaveLength(1);
 });
 
 test("AI 审批记录折叠区:展开后拉取并展示 approved/rejected 记录", async () => {

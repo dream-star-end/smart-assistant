@@ -220,14 +220,19 @@ describe('internalMarketplaceAgent (integ)', () => {
     const h = await handlerFor(u, 100)
     let res = makeRes()
     await h(
-      makeReq('POST', 'publish', { token: tokenFor(100), body: { kind: 'skill', slug: 'agent-pub', name: 'X', version: '1.0.0', description: 'd', body: '当用户说测试时回复 OK', tags: ['ok'] } }),
+      makeReq('POST', 'publish', { token: tokenFor(100), body: { kind: 'skill', slug: 'agent-pub', name: 'X', version: '1.0.0', description: 'd', body: '当用户说测试时回复 OK', tags: ['ok'], category: 'daily-tools', useCases: ['测试用途的技能示例'] } }),
       res,
       CTX,
     )
     assert.equal(res.statusCode, 200)
     assert.equal(res.body.status, 'pending')
-    const st = await query<{ status: string }>("SELECT status FROM marketplace_skill_versions WHERE slug='agent-pub'")
+    // 人向元数据入库(category + use_cases)。
+    const st = await query<{ status: string; category: string; use_cases: string[] }>(
+      "SELECT status, category, use_cases FROM marketplace_skill_versions WHERE slug='agent-pub'",
+    )
     assert.equal(st.rows[0].status, 'pending')
+    assert.equal(st.rows[0].category, 'daily-tools')
+    assert.deepEqual(st.rows[0].use_cases, ['测试用途的技能示例'])
 
     // malformed tag (YAML-unsafe) must be rejected like the browser route
     res = makeRes()
@@ -237,6 +242,41 @@ describe('internalMarketplaceAgent (integ)', () => {
       CTX,
     )
     assert.equal(res.statusCode, 400)
+  })
+
+  test('publish 缺 category → 400 BAD_CATEGORY;缺 useCases → 400 BAD_USE_CASES', async (t) => {
+    if (skip(t)) return
+    const u = await createUser('meta400@x.com')
+    const h = await handlerFor(u, 100)
+    // 缺 category
+    let res = makeRes()
+    await h(
+      makeReq('POST', 'publish', {
+        token: tokenFor(100),
+        body: { kind: 'skill', slug: 'no-cat', name: 'X', version: '1.0.0', description: 'd', body: '正文内容示例', tags: ['ok'], useCases: ['一个正当的用例'] },
+      }),
+      res,
+      CTX,
+    )
+    assert.equal(res.statusCode, 400)
+    assert.equal(res.body.error.code, 'BAD_CATEGORY')
+    // 缺 useCases
+    res = makeRes()
+    await h(
+      makeReq('POST', 'publish', {
+        token: tokenFor(100),
+        body: { kind: 'skill', slug: 'no-uc', name: 'X', version: '1.0.0', description: 'd', body: '正文内容示例', tags: ['ok'], category: 'daily-tools' },
+      }),
+      res,
+      CTX,
+    )
+    assert.equal(res.statusCode, 400)
+    assert.equal(res.body.error.code, 'BAD_USE_CASES')
+    // 两次都未入库(校验先于插入)。
+    const n = await query<{ c: string }>(
+      "SELECT count(*)::text AS c FROM marketplace_skill_versions WHERE slug IN ('no-cat','no-uc')",
+    )
+    assert.equal(n.rows[0].c, '0')
   })
 
   test('publish agent accepts public GPT-5.6 model on v5', async (t) => {
@@ -260,6 +300,9 @@ describe('internalMarketplaceAgent (integ)', () => {
             toolsets: ['core'],
             skillDeps: [],
             persona: '你是一个严谨的通用助手。',
+            // 人向元数据必填(agent 发布同样强制);它们不进 manifest(publish 前 delete)。
+            category: 'daily-tools',
+            useCases: ['做一些通用的日常任务'],
           },
         }),
         res,
@@ -267,12 +310,17 @@ describe('internalMarketplaceAgent (integ)', () => {
       )
       assert.equal(res.statusCode, 200)
       assert.equal(res.body.status, 'pending')
-      const row = await query<{ model: string }>(
-        `SELECT manifest->>'model' AS model
+      const row = await query<{ model: string; category: string; cat_in_manifest: string | null; use_cases: string[] }>(
+        `SELECT manifest->>'model' AS model, category,
+                manifest->>'category' AS cat_in_manifest, use_cases
            FROM marketplace_skill_versions
           WHERE slug = 'gpt-sol-agent'`,
       )
       assert.equal(row.rows[0]?.model, 'gpt-5.6-sol')
+      // 人向元数据落版本列,不落 manifest(publish 前 delete,否则严格 allowlist 会拒)。
+      assert.equal(row.rows[0]?.category, 'daily-tools')
+      assert.equal(row.rows[0]?.cat_in_manifest, null)
+      assert.deepEqual(row.rows[0]?.use_cases, ['做一些通用的日常任务'])
     } finally {
       if (savedChannel === undefined) delete process.env.OC_RUNTIME_CHANNEL
       else process.env.OC_RUNTIME_CHANNEL = savedChannel
