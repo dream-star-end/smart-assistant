@@ -781,12 +781,6 @@ export interface GatewayDeps {
   agentsConfig: AgentsConfig
   webRoot?: string // 静态 web UI 目录
   /**
-   * v5/spa 专用:React 主站服务 packages/web-react/dist,但超管后台仍是 legacy
-   * packages/web/public/admin.html + modules/vendor。只对白名单 admin 资产 fallback,
-   * 不把整个 legacy web 重新暴露给 v5。
-   */
-  legacyWebRoot?: string
-  /**
    * 静态托管语义模式(单一权威在 cli launcher 按 runtime channel 选定,与 webRoot 同源决定):
    *   - 'vanilla'(默认,v3/personal): 服务 packages/web/public,沿用 ?v=hash cache-bust
    *     约定 → 资产 `public, max-age=3600`、sw.js 不缓存。**未设即 vanilla,v3 行为零变化**。
@@ -3326,51 +3320,19 @@ export class Gateway {
 
     // 静态 web UI (with in-memory cache)
     if (this.deps.webRoot) {
+      // /admin → /admin.html:React 管理后台是 web-react 的第二 Vite 入口,产物是 dist 里
+      // 真实存在的 /admin.html。提供一个无扩展名的 /admin 便捷入口,302 到真实文件后由下方
+      // 通用静态服务命中(no-cache,同 index.html);否则 /admin 会落到 SPA fallback 拿到用户端
+      // index.html。仅 spa(v5 Aurora)模式:vanilla(v3/personal)产物不含 admin.html。
+      if (this.deps.staticMode === 'spa' && url.pathname === '/admin') {
+        res.writeHead(302, { Location: '/admin.html' })
+        res.end()
+        return
+      }
       const safePath = url.pathname === '/' ? '/index.html' : url.pathname
       // Cache-Control 按托管模式分流(规则单一权威 = staticCacheControl)。两模式共用下方的
       // ETag/304、路径白名单与 SPA 回退;仅本头不同 → vanilla 分支与历史完全一致(v3 零变化)。
       const cacheHeader = staticCacheControl(safePath, this.deps.staticMode)
-      if (
-        this.deps.staticMode === 'spa' &&
-        this.deps.legacyWebRoot &&
-        legacyAdminStaticPath(safePath)
-      ) {
-        const legacyFilePath = resolve(this.deps.legacyWebRoot, `.${safePath}`)
-        if (legacyFilePath.startsWith(resolve(this.deps.legacyWebRoot))) {
-          const cached = this._staticFileCache.get(legacyFilePath)
-          if (cached) {
-            if (req.headers['if-none-match'] === cached.etag) {
-              res.writeHead(304)
-              res.end()
-              return
-            }
-            res.writeHead(200, { 'Content-Type': cached.mime, 'ETag': cached.etag, 'Cache-Control': cacheHeader })
-            res.end(cached.content)
-            return
-          }
-          try {
-            const s = statSync(legacyFilePath)
-            if (s.isFile()) {
-              const content = readFileSync(legacyFilePath)
-              const mime = mimeFor(legacyFilePath)
-              const etag = `"${createHash('md5').update(content).digest('hex').slice(0, 16)}"`
-              if (this._staticFileCache.size >= 200) {
-                const firstKey = this._staticFileCache.keys().next().value
-                if (firstKey !== undefined) this._staticFileCache.delete(firstKey)
-              }
-              this._staticFileCache.set(legacyFilePath, { content, mime, etag })
-              if (req.headers['if-none-match'] === etag) {
-                res.writeHead(304)
-                res.end()
-                return
-              }
-              res.writeHead(200, { 'Content-Type': mime, 'ETag': etag, 'Cache-Control': cacheHeader })
-              res.end(content)
-              return
-            }
-          } catch {}
-        }
-      }
       const filePath = resolve(this.deps.webRoot, `.${safePath}`)
       if (filePath.startsWith(resolve(this.deps.webRoot))) {
         const cached = this._staticFileCache.get(filePath)
@@ -11556,31 +11518,6 @@ export function staticCacheControl(safePath: string, mode: 'vanilla' | 'spa' | u
       : 'no-cache'
   }
   return safePath === '/sw.js' ? 'no-cache, no-store, must-revalidate' : 'public, max-age=3600'
-}
-
-const LEGACY_ADMIN_MODULE_PATHS = new Set([
-  '/modules/admin.js',
-  '/modules/api.js',
-  '/modules/auth.js',
-  '/modules/broadcast.js',
-  '/modules/charts.js',
-  '/modules/dom.js',
-  '/modules/state.js',
-])
-const LEGACY_ADMIN_VENDOR_PATHS = new Set([
-  '/vendor/chart.umd.min.js',
-  '/vendor/qrcode.min.js',
-])
-
-/**
- * v5/spa 下允许从 legacy web/public 透传的超管后台静态资产。
- * 主站 React/Vite 资产仍只走 /assets/*；这里不要扩大到 style.css / index.html。
- */
-export function legacyAdminStaticPath(safePath: string): boolean {
-  return safePath === '/admin.html' ||
-    safePath === '/icon.svg' ||
-    LEGACY_ADMIN_MODULE_PATHS.has(safePath) ||
-    LEGACY_ADMIN_VENDOR_PATHS.has(safePath)
 }
 
 /** MIME types that can execute scripts in the browser and must be force-downloaded. */
