@@ -2,6 +2,30 @@
   {
     "method": "GET",
     "pathKind": "path",
+    "pathValue": "/api/admin/marketplace/pending",
+    "handler": "handleAdminMarketplacePending"
+  },
+  {
+    "method": "GET",
+    "pathKind": "path",
+    "pathValue": "/api/admin/marketplace/ai-reviews",
+    "handler": "handleAdminMarketplaceAiReviews"
+  },
+  {
+    "method": "POST",
+    "pathKind": "path",
+    "pathValue": "/api/admin/marketplace/review-batch",
+    "handler": "handleAdminMarketplaceReviewBatch"
+  },
+  {
+    "method": "POST",
+    "pathKind": "pathPrefix",
+    "pathValue": "/api/admin/marketplace/",
+    "handler": "handleAdminMarketplaceFeatured|handleAdminMarketplaceRevoke|handleAdminMarketplaceReview"
+  },
+  {
+    "method": "GET",
+    "pathKind": "path",
     "pathValue": "/api/admin/agent-audit",
     "handler": "handleAdminAgentAudit"
   },

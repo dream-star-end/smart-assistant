@@ -30,6 +30,7 @@ import { getPool } from '../db/index.js'
 import { type Logger, rootLogger } from '../logging/logger.js'
 import {
   handleAdminMarketplaceAiReviews,
+  handleAdminMarketplaceFeatured,
   handleAdminMarketplacePending,
   handleAdminMarketplaceReview,
   handleAdminMarketplaceReviewBatch,
@@ -728,9 +729,11 @@ export function createCommercialHandler(
       method: 'POST',
       pathPrefix: '/api/admin/marketplace/',
       handler: (req, res) =>
-        (req.url ?? '').includes('/revoke')
-          ? handleAdminMarketplaceRevoke(req, res, deps)
-          : handleAdminMarketplaceReview(req, res, deps),
+        (req.url ?? '').includes('/featured')
+          ? handleAdminMarketplaceFeatured(req, res, deps)
+          : (req.url ?? '').includes('/revoke')
+            ? handleAdminMarketplaceRevoke(req, res, deps)
+            : handleAdminMarketplaceReview(req, res, deps),
     },
     // FEATURE_REMOTE_SSH —— 用户远程执行机 CRUD + test + reset-fingerprint。
     //   列表 / 创建走 exact path;读/改/删/action 走 prefix(handler 自抽 :id)。

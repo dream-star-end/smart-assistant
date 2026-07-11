@@ -1597,3 +1597,47 @@ export async function revokeListing(slug: string, reason: string): Promise<numbe
     return affected.rows.map((x) => Number.parseInt(x.user_id, 10))
   })
 }
+
+/** 平台精选权重上下界:1 最靠前、9999 最靠后、null=取消精选(数据不变量的单一权威)。 */
+export const FEATURED_RANK_MIN = 1
+export const FEATURED_RANK_MAX = 9999
+
+/**
+ * 平台精选权重写入(运维/超管面)。目录排序服务端权威(featured_rank ASC NULLS LAST →
+ * 热度 → 新旧),写此值即调整卡片排序;storefront 元数据,不进 artifact、不影响安装快照。
+ *
+ *  - listing 必须存在且 state='active':非上架(revoked/unlisted/pending)条目不参与精选。
+ *  - rank ∈ [FEATURED_RANK_MIN, FEATURED_RANK_MAX] 的整数,或 null(取消)。范围校验在此收口
+ *    (DB 层是数据不变量的权威;路由层另做 400 校验只为给 HTTP 一个干净状态码)。
+ *
+ * 错误语义复用既有 MarketplaceError code(与 ownerUnlist/revoke 家族一致):
+ *   - listing 不存在        → VERSION_NOT_FOUND(路由映射 404)
+ *   - listing 非 active     → LISTING_REVOKED  (路由映射 409)
+ *   - rank 越界(契约违背)  → 普通 Error(路由已前置校验,此为内部脚本兜底,映射 500)
+ */
+export async function setListingFeaturedRank(slug: string, rank: number | null): Promise<void> {
+  if (
+    rank !== null &&
+    (!Number.isInteger(rank) || rank < FEATURED_RANK_MIN || rank > FEATURED_RANK_MAX)
+  ) {
+    throw new Error(`featured_rank 越界:须为 ${FEATURED_RANK_MIN}..${FEATURED_RANK_MAX} 的整数或 null`)
+  }
+  await tx(async (c) => {
+    const listing = await query<{ state: string }>(
+      `SELECT state FROM marketplace_skill_listings WHERE slug = $1 FOR UPDATE`,
+      [slug],
+      c,
+    )
+    const row = listing.rows[0]
+    if (!row) throw new MarketplaceError('VERSION_NOT_FOUND', `slug "${slug}" 不存在`)
+    if (row.state !== 'active')
+      throw new MarketplaceError('LISTING_REVOKED', `slug "${slug}" 未上架(state=${row.state}),不可设为精选`)
+    await query(
+      `UPDATE marketplace_skill_listings
+          SET featured_rank = $2, updated_at = NOW()
+        WHERE slug = $1`,
+      [slug, rank],
+      c,
+    )
+  })
+}
