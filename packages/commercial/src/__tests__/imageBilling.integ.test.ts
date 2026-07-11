@@ -278,7 +278,9 @@ describe('Image 2 relay orchestration', () => {
       await addContainer(userId)
       const tracker = redisTracker()
       const generated = await sharp({ create: { width: 1024, height: 1024, channels: 3, background: '#2288cc' } }).png().toBuffer()
-      let captured: { contentType: string | null; body: string; isFormData: boolean } | null = null
+      // ref 对象而非裸 let:TS CFA 不追踪闭包内对局部变量的赋值(microsoft/TypeScript#9998),
+      // 裸 let 在下方 assert.ok 处会被窄化成 null,`captured!` 变 never → 属性访问全线报错。
+      const captured: { current: { contentType: string | null; body: string; isFormData: boolean } | null } = { current: null }
       const handler = makeCodexRelayHandler({
         identityRepo: repo(userId),
         db: { async readContainerBinding() { return { codexAccountId: 53n, userId, state: 'active', provider: 'codex', accountStatus: 'active' } } },
@@ -288,7 +290,7 @@ describe('Image 2 relay orchestration', () => {
           // Realize the request exactly as undici would (content-type gets derived
           // from a FormData body; an explicit header survives for a string body).
           const realized = new Request(String(input), { method: 'POST', headers: init?.headers, body: init?.body as BodyInit })
-          captured = {
+          captured.current = {
             contentType: realized.headers.get('content-type'),
             body: await realized.text(),
             isFormData: init?.body instanceof FormData,
@@ -309,8 +311,8 @@ describe('Image 2 relay orchestration', () => {
           body: shape === 'annotated' ? await annotatedInput(jobId) : await outpaintInput(jobId),
         })
         assert.equal(res.status, 200)
-        assert.ok(captured, 'upstream must have been called')
-        const cap = captured!
+        assert.ok(captured.current, 'upstream must have been called')
+        const cap = captured.current
         assert.equal(cap.isFormData, false, 'upstream body must not be multipart FormData')
         assert.equal(cap.contentType, 'application/json', 'upstream content-type must be application/json (multipart is rejected by codex backend)')
         const parsed = JSON.parse(cap.body) as { model?: string; prompt?: string; n?: number; size?: string; images?: Array<{ image_url?: string }>; mask?: unknown }
