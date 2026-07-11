@@ -1,11 +1,34 @@
 import { Building2, Crown, Plus, Wallet } from "lucide-react";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { ChartCard, barConfig, chartNum, donutConfig, useChart } from "../charts";
 import { api, apiErrorMessage } from "../../lib/api";
-import type { AuthSession, MySubscription, UsageLedgerRow, User } from "../../lib/types";
+import type {
+  AuthSession,
+  MySubscription,
+  UsageLedgerRow,
+  UsageReport,
+  UsageReportWindow,
+  User,
+} from "../../lib/types";
 import { cn, formatCredits } from "../../lib/utils";
-import { Alert, Button, Spinner } from "../ui";
+import { Alert, Button, Progress, Skeleton, Spinner, Tabs } from "../ui";
 import { CreateOrgDialog } from "../org/CreateOrgWizard";
-import { ledgerReasonLabel, shortTime } from "./labels";
+import { formatReportBucket, ledgerReasonLabel, REPORT_WINDOW_NOUN, shortTime } from "./labels";
+
+/** 账单收支卡窗口（默认 30d，独立于用量 Tab 的窗口）。 */
+const ACCT_WINDOWS: { value: UsageReportWindow; label: string }[] = [
+  { value: "7d", label: "7 天" },
+  { value: "30d", label: "30 天" },
+];
+
+/** 大数字符串 → BigInt（非整数/非法按 0，用于套餐进度精确计算）。 */
+function bigOr0(s: string): bigint {
+  try {
+    return /^-?\d+$/.test(s) ? BigInt(s) : 0n;
+  } catch {
+    return 0n;
+  }
+}
 
 function fmtDate(iso: string): string {
   const d = new Date(iso);
@@ -44,6 +67,13 @@ export function AccountTab({
   const [err, setErr] = useState<string | null>(null);
   const [sub, setSub] = useState<MySubscription | null>(null);
 
+  // 积分收支卡（窗口口径，独立于用量 Tab）。
+  const [acctWindow, setAcctWindow] = useState<UsageReportWindow>("30d");
+  const [report, setReport] = useState<UsageReport | null>(null);
+  const [reportLoading, setReportLoading] = useState(true);
+  const [reportErr, setReportErr] = useState<string | null>(null);
+  const [reportReloadTick, setReportReloadTick] = useState(0);
+
   // 当前订阅（含双钱包余额明细）；reloadKey 变更（到账）后重拉。
   useEffect(() => {
     let alive = true;
@@ -59,6 +89,28 @@ export function AccountTab({
       alive = false;
     };
   }, [auth, reloadKey]);
+
+  // 收支报表：窗口切换 / 到账（reloadKey）/ 重试即重拉。切窗口先清 report 显 Skeleton。
+  useEffect(() => {
+    let alive = true;
+    setReportLoading(true);
+    setReportErr(null);
+    setReport(null);
+    api
+      .getMyUsageReport(auth, acctWindow)
+      .then((r) => {
+        if (alive) setReport(r);
+      })
+      .catch((e) => {
+        if (alive) setReportErr(apiErrorMessage(e, "加载收支图表失败"));
+      })
+      .finally(() => {
+        if (alive) setReportLoading(false);
+      });
+    return () => {
+      alive = false;
+    };
+  }, [auth, acctWindow, reloadKey, reportReloadTick]);
 
   const credits = user?.credits ?? null;
   const isZero = credits != null && /^-?0+$/.test(credits.trim());
@@ -110,6 +162,49 @@ export function AccountTab({
         ? "管理员"
         : "成员"
     : "";
+
+  // 本期套餐进度（仅订阅有月度额度时显示）。已用 = 月度额度 − 期内剩余(balance.period)。
+  const monthlyBig = sub ? bigOr0(sub.monthlyCredits) : 0n;
+  const periodRemainBig = sub ? bigOr0(sub.balance.period) : 0n;
+  const showQuota = monthlyBig > 0n;
+  const usedPct = showQuota
+    ? Math.min(100, Math.max(0, Number(((monthlyBig - periodRemainBig) * 10000n) / monthlyBig) / 100))
+    : 0;
+
+  // 收支图表数据（report 存在时才有值；null 时 canvas 不挂载，useChart 自 no-op）。
+  const ledgerTrend = report?.ledger.trend ?? [];
+  const byReason = report?.ledger.by_reason ?? [];
+  const trendLabels = ledgerTrend.map((p) => formatReportBucket(p.bucket, acctWindow));
+  const reasonHasData = byReason.some((r) => chartNum(r.debited) > 0);
+  const trendHasData = ledgerTrend.some(
+    (p) => chartNum(p.credited) > 0 || chartNum(p.debited) > 0,
+  );
+
+  const flowRef = useRef<HTMLCanvasElement>(null);
+  const reasonRef = useRef<HTMLCanvasElement>(null);
+
+  useChart(
+    flowRef,
+    (theme) =>
+      barConfig(theme, {
+        labels: trendLabels,
+        series: [
+          { label: "收入", data: ledgerTrend.map((p) => chartNum(p.credited)), colorToken: "success" },
+          { label: "支出", data: ledgerTrend.map((p) => chartNum(p.debited)), colorToken: "danger" },
+        ],
+      }),
+    [report, acctWindow],
+  );
+  useChart(
+    reasonRef,
+    (theme) =>
+      donutConfig(theme, {
+        labels: byReason.map((r) => ledgerReasonLabel(r.reason)),
+        data: byReason.map((r) => chartNum(r.debited)),
+        legend: "bottom",
+      }),
+    [report, acctWindow],
+  );
 
   return (
     <div className="flex flex-col">
@@ -205,6 +300,18 @@ export function AccountTab({
             套餐期内 {formatCredits(sub.balance.period)} + 钱包 {formatCredits(sub.balance.wallet)}
           </div>
         )}
+        {/* 本期套餐积分进度（仅订阅有月度额度时显示） */}
+        {sub && showQuota && (
+          <div className="mt-3">
+            <div className="flex items-center justify-between pb-1.5 text-[12px]">
+              <span className="text-muted">本期套餐积分</span>
+              <span className="tabular-nums text-fg">
+                本期剩余 {formatCredits(sub.balance.period)} / {formatCredits(sub.monthlyCredits)}
+              </span>
+            </div>
+            <Progress value={usedPct} aria-label="本期套餐积分已用" />
+          </div>
+        )}
         {low && (
           <Alert tone="danger" className="mt-2 text-[12.5px]">
             余额不足，已暂停对话计费。充值或升级套餐后即可继续。
@@ -222,6 +329,63 @@ export function AccountTab({
           按实际用量计量扣费，扣费优先消耗套餐期内积分。加量包仅在当前套餐有效期内可用；
           存量钱包余额永久有效、扣完期内桶后继续使用。
         </p>
+      </div>
+
+      {/* 积分收支（窗口口径图表，独立于用量 Tab） */}
+      <div className="border-t border-border px-5 py-4">
+        <div className="flex items-center justify-between gap-3 pb-3">
+          <div className="text-[11px] font-medium uppercase tracking-wide text-faint">
+            积分收支 · 近 {REPORT_WINDOW_NOUN[acctWindow]}
+          </div>
+          <div className="overflow-x-auto">
+            <Tabs
+              aria-label="收支统计窗口"
+              value={acctWindow}
+              onValueChange={(v) => setAcctWindow(v as UsageReportWindow)}
+              items={ACCT_WINDOWS}
+            />
+          </div>
+        </div>
+        {reportLoading ? (
+          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+            <Skeleton className="h-[200px] rounded-xl" />
+            <Skeleton className="h-[200px] rounded-xl" />
+          </div>
+        ) : reportErr ? (
+          <>
+            <Alert tone="danger" className="text-[12.5px]">
+              {reportErr}
+            </Alert>
+            <button
+              type="button"
+              onClick={() => setReportReloadTick((t) => t + 1)}
+              className="mt-2 text-[13px] text-muted outline-none hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
+            >
+              重试
+            </button>
+          </>
+        ) : (
+          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+            <ChartCard title="收支趋势" hint="收入 / 支出" height={200}>
+              {trendHasData ? (
+                <canvas ref={flowRef} />
+              ) : (
+                <div className="flex h-full items-center justify-center text-[12.5px] text-faint">
+                  该时段暂无收支记录。
+                </div>
+              )}
+            </ChartCard>
+            <ChartCard title="支出构成" hint="按类型" height={200}>
+              {reasonHasData ? (
+                <canvas ref={reasonRef} />
+              ) : (
+                <div className="flex h-full items-center justify-center text-[12.5px] text-faint">
+                  该时段暂无支出。
+                </div>
+              )}
+            </ChartCard>
+          </div>
+        )}
       </div>
 
       <div className="border-t border-border px-5 py-3">

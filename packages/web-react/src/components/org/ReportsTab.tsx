@@ -1,4 +1,5 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
+import { ChartCard, chartNum, lineConfig, useChart } from "../charts";
 import { api } from "../../lib/api";
 import type {
   AuthSession,
@@ -133,6 +134,27 @@ export function ReportsTab({ auth }: { auth: AuthSession }) {
   const trendMetric: "credits" | "requests" =
     trendMax(trend, "credits") !== "0" ? "credits" : "requests";
   const trendPeak = trendMax(trend, trendMetric);
+  const trendHasData = trend.length > 0 && trendPeak !== "0";
+
+  // 趋势面积图（与个人版「积分消耗趋势」同视觉：单 series 折线填充）。
+  const trendRef = useRef<HTMLCanvasElement>(null);
+  useChart(
+    trendRef,
+    (theme) =>
+      lineConfig(theme, {
+        labels: trend.map((p) => fmtBucket(p.bucket, window)),
+        series: [
+          {
+            label: trendMetric === "credits" ? "扣费" : "请求",
+            data: trend.map((p) => chartNum(p[trendMetric])),
+            colorToken: "accent",
+            fill: true,
+          },
+        ],
+      }),
+    // data 为稳定 state 引用（trend/trendMetric 均由 data 派生），避免每渲染重建。
+    [data, window],
+  );
 
   return (
     <div className="flex flex-col">
@@ -205,46 +227,21 @@ export function ReportsTab({ auth }: { auth: AuthSession }) {
             )}
           </div>
 
-          {/* 趋势竖条 */}
+          {/* 趋势面积图（共享 charts，替代原手写 CSS 竖条） */}
           <div className="border-t border-border px-5 py-4">
-            <div className="pb-2 text-[11px] font-medium uppercase tracking-wide text-faint">
-              趋势 · 按{trendMetric === "credits" ? "扣费" : "请求"}
-            </div>
-            {trend.length === 0 || trendPeak === "0" ? (
-              <p className="py-2 text-[12.5px] text-faint">该时段暂无趋势数据。</p>
-            ) : (
-              <div className="overflow-x-auto pb-1">
-                <div className="flex items-end gap-1.5" style={{ height: 120 }}>
-                  {trend.map((p) => {
-                    const val = p[trendMetric];
-                    const pct = ratioPct(val, trendPeak);
-                    const h = /[1-9]/.test(val) ? Math.max(pct, 4) : 0;
-                    return (
-                      <div
-                        key={p.bucket}
-                        className="flex h-full min-w-[22px] flex-col justify-end"
-                        title={`${fmtBucket(p.bucket, window)} · ${groupDigits(p.requests)} 次 · ${formatCredits(p.credits)} 积分`}
-                      >
-                        <div
-                          className="w-full rounded-t bg-accent"
-                          style={{ height: `${h}%` }}
-                        />
-                      </div>
-                    );
-                  })}
+            <ChartCard
+              title={`趋势 · 按${trendMetric === "credits" ? "扣费" : "请求"}`}
+              hint={`近 ${WINDOWS.find((w) => w.value === window)?.label ?? window}`}
+              height={200}
+            >
+              {trendHasData ? (
+                <canvas ref={trendRef} />
+              ) : (
+                <div className="flex h-full items-center justify-center text-[12.5px] text-faint">
+                  该时段暂无趋势数据。
                 </div>
-                <div className="mt-1 flex gap-1.5">
-                  {trend.map((p) => (
-                    <div
-                      key={p.bucket}
-                      className="min-w-[22px] text-center text-[10px] text-faint"
-                    >
-                      {fmtBucket(p.bucket, window)}
-                    </div>
-                  ))}
-                </div>
-              </div>
-            )}
+              )}
+            </ChartCard>
           </div>
 
           {/* 按成员 */}

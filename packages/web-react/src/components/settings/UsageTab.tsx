@@ -1,12 +1,27 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { ChartCard, barConfig, chartNum, donutConfig, lineConfig, useChart } from "../charts";
 import { api, apiErrorMessage } from "../../lib/api";
-import type { AuthSession, UsageResponse, UsageSessionRow } from "../../lib/types";
-import { cn, formatCompactCount, formatCredits, groupDigits, ratioPct } from "../../lib/utils";
+import type {
+  AuthSession,
+  UsageReport,
+  UsageReportModel,
+  UsageReportWindow,
+  UsageResponse,
+  UsageSessionRow,
+} from "../../lib/types";
+import { cn, formatCompactCount, formatCredits, groupDigits } from "../../lib/utils";
 import { agentDisplayName } from "../chat/agentNames";
-import { Alert, Progress, Spinner } from "../ui";
-import { shortTime } from "./labels";
+import { Alert, Progress, Skeleton, Spinner, Tabs } from "../ui";
+import { formatReportBucket, REPORT_WINDOW_NOUN, shortTime } from "./labels";
 
 const SESSIONS_PAGE = 20;
+
+/** 图表区窗口口径（默认 7d，作用于 stat 卡 + 全部图表）。 */
+const WINDOWS: { value: UsageReportWindow; label: string }[] = [
+  { value: "24h", label: "24 小时" },
+  { value: "7d", label: "7 天" },
+  { value: "30d", label: "30 天" },
+];
 
 /** 安全求和字符串大数（BigInt 精确，非法项跳过）。 */
 function sumBig(...vals: string[]): string {
@@ -23,19 +38,36 @@ function sumBig(...vals: string[]): string {
   return acc.toString();
 }
 
-const TOKEN_PARTS: { key: keyof UsageResponse["summary"]; label: string; color: string }[] = [
-  { key: "input_tokens", label: "输入", color: "bg-accent" },
-  { key: "output_tokens", label: "输出", color: "bg-info" },
-  { key: "cache_read_tokens", label: "缓存命中", color: "bg-success" },
-  { key: "cache_write_tokens", label: "缓存写入", color: "bg-warning" },
-];
+/**
+ * 按模型积分降序取前 5，其余合并为「其他」。**绘图数值化在此收口**（chartNum，非计费
+ * 权威）。导出供单测覆盖 top5 + 合并逻辑。返回空数组时调用方显示空态、不画空图。
+ */
+export function topModelsWithOther(
+  models: readonly UsageReportModel[],
+  topN = 5,
+): { label: string; credits: number }[] {
+  const sorted = [...models]
+    .map((m) => ({ label: m.model, credits: chartNum(m.credits) }))
+    .sort((a, b) => b.credits - a.credits);
+  if (sorted.length <= topN) return sorted.filter((s) => s.credits > 0);
+  const head = sorted.slice(0, topN);
+  const otherSum = sorted.slice(topN).reduce((acc, m) => acc + m.credits, 0);
+  const out = head.filter((s) => s.credits > 0);
+  if (otherSum > 0) out.push({ label: "其他", credits: otherSum });
+  return out;
+}
 
 /**
- * 用量统计 Tab：summary + token 构成（轻量 CSS 堆叠条，无图表依赖）+ 缓存命中率 +
- * 节省 + 会话维度明细（offset 分页）。所有大数字段全程字符串（formatCompactCount /
- * formatCredits / groupDigits / ratioPct，绝不 Number 化大数本身）。
+ * 用量统计 Tab：
+ *  - 顶部窗口切换 pill（24h/7d/30d，默认 7d）作用于下面整个图表区（来自 getMyUsageReport）；
+ *  - 4 张窗口口径 Stat 卡 + 图表 grid（积分趋势面积图 / 请求柱状 / 按模型环图 / Token 构成环图）；
+ *  - 缓存命中率 + 节省 + 累计口径小 stat 保留（全生命周期，来自 getUsage）；
+ *  - 会话维度明细（含组队归组）原样保留。
+ * 所有大数字段全程字符串（formatCompactCount / formatCredits / groupDigits）；
+ * 唯图表 dataset 经 chartNum 收口数值化。
  */
 export function UsageTab({ auth }: { auth: AuthSession }) {
+  // 全生命周期口径（缓存 / 节省 / 会话明细 / 累计）。
   const [data, setData] = useState<UsageResponse | null>(null);
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState<string | null>(null);
@@ -48,6 +80,14 @@ export function UsageTab({ auth }: { auth: AuthSession }) {
     () => new Set<string>(),
   );
 
+  // 窗口口径图表（默认 7d）。
+  const [window, setWindow] = useState<UsageReportWindow>("7d");
+  const [report, setReport] = useState<UsageReport | null>(null);
+  const [reportLoading, setReportLoading] = useState(true);
+  const [reportErr, setReportErr] = useState<string | null>(null);
+  /** 重试计数：+1 触发窗口口径重拉（不改 window 也能重试）。 */
+  const [reportReloadTick, setReportReloadTick] = useState(0);
+
   const toggleDelegates = useCallback((sessionId: string) => {
     setExpandedDelegates((prev) => {
       const next = new Set(prev);
@@ -57,6 +97,7 @@ export function UsageTab({ auth }: { auth: AuthSession }) {
     });
   }, []);
 
+  // 全生命周期：首屏拉一次（会话首页 + 摘要 + 缓存 + 节省）。
   useEffect(() => {
     let alive = true;
     setLoading(true);
@@ -81,6 +122,28 @@ export function UsageTab({ auth }: { auth: AuthSession }) {
     };
   }, [auth]);
 
+  // 窗口口径：window 切换或重试即重拉。切窗口先清 report 显 Skeleton。
+  useEffect(() => {
+    let alive = true;
+    setReportLoading(true);
+    setReportErr(null);
+    setReport(null);
+    api
+      .getMyUsageReport(auth, window)
+      .then((r) => {
+        if (alive) setReport(r);
+      })
+      .catch((e) => {
+        if (alive) setReportErr(apiErrorMessage(e, "加载图表数据失败"));
+      })
+      .finally(() => {
+        if (alive) setReportLoading(false);
+      });
+    return () => {
+      alive = false;
+    };
+  }, [auth, window, reportReloadTick]);
+
   const loadMore = useCallback(async () => {
     if (!hasMore || loadingMore) return;
     setLoadingMore(true);
@@ -95,6 +158,68 @@ export function UsageTab({ auth }: { auth: AuthSession }) {
       setLoadingMore(false);
     }
   }, [auth, hasMore, loadingMore, offset]);
+
+  // ── 图表数据（report 存在时才有值；null 时 canvas 不挂载，useChart 自 no-op） ──
+  const rs = report?.summary ?? null;
+  const trendLabels = report ? report.trend.map((p) => formatReportBucket(p.bucket, window)) : [];
+  const creditTrend = report ? report.trend.map((p) => chartNum(p.credits)) : [];
+  const requestTrend = report ? report.trend.map((p) => chartNum(p.requests)) : [];
+  const modelSlices = report ? topModelsWithOther(report.models) : [];
+  const windowTokenTotal = rs
+    ? sumBig(rs.input_tokens, rs.output_tokens, rs.cache_read_tokens, rs.cache_write_tokens)
+    : "0";
+
+  const creditRef = useRef<HTMLCanvasElement>(null);
+  const requestRef = useRef<HTMLCanvasElement>(null);
+  const modelRef = useRef<HTMLCanvasElement>(null);
+  const tokenRef = useRef<HTMLCanvasElement>(null);
+
+  useChart(
+    creditRef,
+    (theme) =>
+      lineConfig(theme, {
+        labels: trendLabels,
+        series: [{ label: "积分消耗", data: creditTrend, colorToken: "accent", fill: true }],
+      }),
+    [report, window],
+  );
+  useChart(
+    requestRef,
+    (theme) =>
+      barConfig(theme, {
+        labels: trendLabels,
+        series: [{ label: "请求次数", data: requestTrend, colorToken: "info" }],
+      }),
+    [report, window],
+  );
+  useChart(
+    modelRef,
+    (theme) =>
+      donutConfig(theme, {
+        labels: modelSlices.map((m) => m.label),
+        data: modelSlices.map((m) => m.credits),
+        legend: "bottom",
+      }),
+    [report, window],
+  );
+  useChart(
+    tokenRef,
+    (theme) =>
+      donutConfig(theme, {
+        labels: ["输入", "输出", "缓存命中", "缓存写入"],
+        data: rs
+          ? [
+              chartNum(rs.input_tokens),
+              chartNum(rs.output_tokens),
+              chartNum(rs.cache_read_tokens),
+              chartNum(rs.cache_write_tokens),
+            ]
+          : [],
+        colorTokens: ["accent", "info", "success", "warning"],
+        legend: "bottom",
+      }),
+    [report, window],
+  );
 
   if (loading) {
     return (
@@ -115,63 +240,100 @@ export function UsageTab({ auth }: { auth: AuthSession }) {
   if (!data) return null;
 
   const s = data.summary;
-  const tokenTotal = sumBig(
-    s.input_tokens,
-    s.output_tokens,
-    s.cache_read_tokens,
-    s.cache_write_tokens,
-  );
   const hitPct = data.cache.hit_rate != null ? Math.round(data.cache.hit_rate * 1000) / 10 : null;
+  const modelHasData = modelSlices.length > 0;
+  const tokenHasData = windowTokenTotal !== "0";
 
   return (
     <div className="flex flex-col">
-      {/* 摘要卡片 */}
-      <div className="grid grid-cols-2 gap-2 px-5 py-4">
-        <Stat label="总请求数" value={groupDigits(s.requests_total)} />
-        <Stat label="实际扣费" value={`${formatCredits(s.debited_credits)} 积分`} accent />
-        <Stat label="输入 token" value={formatCompactCount(s.input_tokens)} />
-        <Stat label="输出 token" value={formatCompactCount(s.output_tokens)} />
+      {/* 窗口切换 pill（作用于下面整个图表区） */}
+      <div className="flex items-center justify-between gap-3 px-5 pt-4">
+        <div className="text-[11px] font-medium uppercase tracking-wide text-faint">
+          用量总览 · 近 {REPORT_WINDOW_NOUN[window]}
+        </div>
+        <div className="overflow-x-auto">
+          <Tabs
+            aria-label="统计窗口"
+            value={window}
+            onValueChange={(v) => setWindow(v as UsageReportWindow)}
+            items={WINDOWS}
+          />
+        </div>
       </div>
 
-      {/* token 构成堆叠条 */}
-      <div className="border-t border-border px-5 py-4">
-        <div className="pb-2 text-[11px] font-medium uppercase tracking-wide text-faint">
-          Token 构成
+      {reportLoading ? (
+        <div className="px-5 py-4">
+          <div className="grid grid-cols-2 gap-2">
+            {[0, 1, 2, 3].map((i) => (
+              <Skeleton key={i} className="h-[58px] rounded-xl" />
+            ))}
+          </div>
+          <div className="mt-3 grid grid-cols-1 gap-3 sm:grid-cols-2">
+            {[0, 1, 2, 3].map((i) => (
+              <Skeleton key={i} className="h-[220px] rounded-xl" />
+            ))}
+          </div>
         </div>
-        {tokenTotal === "0" ? (
-          <p className="py-2 text-[12.5px] text-faint">暂无用量数据。</p>
-        ) : (
+      ) : reportErr ? (
+        <div className="px-5 py-4">
+          <Alert tone="danger" className="text-[12.5px]">
+            {reportErr}
+          </Alert>
+          <button
+            type="button"
+            onClick={() => setReportReloadTick((t) => t + 1)}
+            className="mt-2 text-[13px] text-muted outline-none hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
+          >
+            重试
+          </button>
+        </div>
+      ) : (
+        rs && (
           <>
-            <div className="flex h-2.5 w-full overflow-hidden rounded-full bg-hover">
-              {TOKEN_PARTS.map((p) => {
-                const pct = ratioPct(s[p.key], tokenTotal);
-                if (pct <= 0) return null;
-                return (
-                  <div
-                    key={p.key}
-                    className={p.color}
-                    style={{ width: `${pct}%` }}
-                    title={`${p.label} ${formatCompactCount(s[p.key])}`}
-                  />
-                );
-              })}
+            {/* 窗口口径 4 张 Stat 卡 */}
+            <div className="grid grid-cols-2 gap-2 px-5 py-4">
+              <Stat label={`请求数 · 近${REPORT_WINDOW_NOUN[window]}`} value={groupDigits(rs.requests)} />
+              <Stat
+                label={`消耗积分 · 近${REPORT_WINDOW_NOUN[window]}`}
+                value={`${formatCredits(rs.credits)} 积分`}
+                accent
+              />
+              <Stat label={`输入 token · 近${REPORT_WINDOW_NOUN[window]}`} value={formatCompactCount(rs.input_tokens)} />
+              <Stat label={`输出 token · 近${REPORT_WINDOW_NOUN[window]}`} value={formatCompactCount(rs.output_tokens)} />
             </div>
-            <div className="mt-2 grid grid-cols-2 gap-x-4 gap-y-1">
-              {TOKEN_PARTS.map((p) => (
-                <div key={p.key} className="flex items-center gap-1.5 text-[12px]">
-                  <span className={cn("size-2 rounded-full", p.color)} />
-                  <span className="text-muted">{p.label}</span>
-                  <span className="ml-auto tabular-nums text-fg">
-                    {formatCompactCount(s[p.key])}
-                  </span>
-                </div>
-              ))}
+
+            {/* 图表区 grid（桌面 2 列，移动堆叠） */}
+            <div className="grid grid-cols-1 gap-3 px-5 pb-4 sm:grid-cols-2">
+              <ChartCard title="积分消耗趋势" hint={`近 ${REPORT_WINDOW_NOUN[window]}`} height={200}>
+                <canvas ref={creditRef} />
+              </ChartCard>
+              <ChartCard title="请求次数" hint={`近 ${REPORT_WINDOW_NOUN[window]}`} height={200}>
+                <canvas ref={requestRef} />
+              </ChartCard>
+              <ChartCard title="按模型积分构成" hint="扣费前 5 · 余并「其他」" height={220}>
+                {modelHasData ? (
+                  <canvas ref={modelRef} />
+                ) : (
+                  <div className="flex h-full items-center justify-center text-[12.5px] text-faint">
+                    该时段暂无模型用量。
+                  </div>
+                )}
+              </ChartCard>
+              <ChartCard title="Token 构成" hint={`近 ${REPORT_WINDOW_NOUN[window]}`} height={220}>
+                {tokenHasData ? (
+                  <canvas ref={tokenRef} />
+                ) : (
+                  <div className="flex h-full items-center justify-center text-[12.5px] text-faint">
+                    该时段暂无用量数据。
+                  </div>
+                )}
+              </ChartCard>
             </div>
           </>
-        )}
-      </div>
+        )
+      )}
 
-      {/* 缓存命中率 + 节省 */}
+      {/* 缓存命中率 + 节省（全生命周期口径） */}
       <div className="border-t border-border px-5 py-4">
         <div className="flex items-center justify-between pb-1.5">
           <span className="text-[12.5px] text-muted">缓存命中率</span>
@@ -194,6 +356,17 @@ export function UsageTab({ auth }: { auth: AuthSession }) {
         {data.savings.savings_unavailable && (
           <p className="mt-1 text-[11.5px] text-faint">数据量较大，暂不展示节省精算值。</p>
         )}
+        {/* 累计口径不回退：全生命周期请求 + 实际扣费 */}
+        <div className="mt-3 grid grid-cols-2 gap-x-4 gap-y-1 border-t border-border pt-3 text-[12px]">
+          <div className="flex items-center justify-between">
+            <span className="text-muted">累计请求</span>
+            <span className="tabular-nums text-fg">{groupDigits(s.requests_total)}</span>
+          </div>
+          <div className="flex items-center justify-between">
+            <span className="text-muted">累计实际扣费</span>
+            <span className="tabular-nums text-fg">{formatCredits(s.debited_credits)}</span>
+          </div>
+        </div>
       </div>
 
       {/* 会话维度明细 */}

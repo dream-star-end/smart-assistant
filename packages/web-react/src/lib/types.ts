@@ -407,6 +407,62 @@ export type UsageQuery = {
   ledgerBefore?: string;
 };
 
+// ─── 用量报表（GET /api/me/usage/report，图表化窗口口径） ────────────────────
+// 与 /api/me/usage 同信封风格；**所有数字字段全程字符串大数，绝不数值化当权威**。
+// trend 已由后端补零升序（24h=24 个 hour 桶，7d/30d=day 桶）。
+
+export type UsageReportWindow = "24h" | "7d" | "30d";
+
+/** 窗口口径 summary（对应 4 张 Stat 卡 + Token 构成环图）。 */
+export type UsageReportSummary = {
+  requests: string;
+  input_tokens: string;
+  output_tokens: string;
+  cache_read_tokens: string;
+  cache_write_tokens: string;
+  credits: string;
+};
+
+/** 用量趋势单桶。bucket 形如「YYYY-MM-DD」或「MM-DD HH:00」。 */
+export type UsageReportTrendPoint = {
+  bucket: string;
+  requests: string;
+  credits: string;
+};
+
+/** 按模型积分构成单项。 */
+export type UsageReportModel = {
+  model: string;
+  requests: string;
+  credits: string;
+};
+
+/** 账本收支趋势单桶（credited=入账 / debited=支出，字符串大数）。 */
+export type UsageReportLedgerTrendPoint = {
+  bucket: string;
+  credited: string;
+  debited: string;
+};
+
+/** 支出构成单项（按 credit_ledger.reason 归组）。 */
+export type UsageReportLedgerReason = {
+  reason: string;
+  debited: string;
+};
+
+export type UsageReportLedger = {
+  trend: UsageReportLedgerTrendPoint[];
+  by_reason: UsageReportLedgerReason[];
+};
+
+export type UsageReport = {
+  window: UsageReportWindow;
+  summary: UsageReportSummary;
+  trend: UsageReportTrendPoint[];
+  models: UsageReportModel[];
+  ledger: UsageReportLedger;
+};
+
 // ─── API Keys（GET/POST/DELETE /api/me/api-keys，commercial REST） ───────────
 // 注意：当前后端 admin-only rollout —— 普通用户调用返 403（requireAdmin）。
 

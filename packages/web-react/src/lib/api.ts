@@ -59,6 +59,8 @@ import type {
   SubscriptionPlanWire,
   MySubscription,
   UsageQuery,
+  UsageReport,
+  UsageReportWindow,
   UsageResponse,
   User,
   VerifyEmailResult,
@@ -712,6 +714,21 @@ export const api = {
       ),
     );
   },
+
+  /**
+   * 用量报表（GET /api/me/usage/report，Bearer，图表化窗口口径）。summary + 趋势 +
+   * 按模型 + 账本（收支趋势 / 支出构成），window 默认由后端取 7d。trend 已补零升序。
+   * **所有数字字段为字符串大数，勿数值化后当权威。** 抛 ApiError 由调用方兜底。
+   */
+  getMyUsageReport: (a: AuthSession, window: UsageReportWindow): Promise<UsageReport> =>
+    jsonOrThrow<UsageReport>(
+      callWithRefresh(a, (t) =>
+        fetch(`/api/me/usage/report?window=${encodeURIComponent(window)}`, {
+          credentials: "include",
+          headers: bearerHeaders(t),
+        }),
+      ),
+    ),
 
   // ── API Keys（注意：当前后端 admin-only rollout，普通用户调用返 403） ─────────
 

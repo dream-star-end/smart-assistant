@@ -1,9 +1,9 @@
 import type { ChartConfiguration } from "chart.js";
 import { type DependencyList, type ReactNode, type RefObject, useEffect } from "react";
-import { Card, PanelHeader } from "../../components/ui";
+import { Card, PanelHeader } from "./ui";
 
 /**
- * 管理后台图表栈（唯一封装）—— 与用户端 RichBlocks.ChartBlock 同款：
+ * 图表栈（全站唯一封装，管理后台与用户端设置/计费共用）—— 与用户端 RichBlocks.ChartBlock 同款：
  *  - 动态 `import('chart.js/auto')`（首屏零 chart.js，出现图表页才下载该 chunk）；
  *  - 颜色**全部**从 CSS token 读（getComputedStyle），不手抄 hex 副本 → token 改版不漂移；
  *  - 主题切换（<html>.dark class 变化）经 MutationObserver 重渲染，已画的图不留旧配色；
@@ -49,6 +49,16 @@ function readChartTheme(): ChartTheme {
     fg: color("fg"),
     isDark,
   };
+}
+
+/**
+ * 字符串大数 → chart.js 绘图数值（**仅供绘图几何，非计费权威**；非法/非有限按 0）。
+ * 计费口径展示始终走 formatCredits/formatCompactCount（全程字符串，绝不 Number 化）；
+ * 唯有喂给 chart.js 的 dataset 才在此收口做一次数值化。
+ */
+export function chartNum(s: string): number {
+  const n = Number(s);
+  return Number.isFinite(n) ? n : 0;
 }
 
 /** hex(#rgb/#rrggbb/#rrggbbaa) → rgba(…,alpha)。非 hex 原样返回。 */
