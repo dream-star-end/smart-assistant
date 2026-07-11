@@ -16,6 +16,10 @@ import { describe, it } from 'node:test'
 
 const home = mkdtempSync(join(tmpdir(), 'oc-vision-home-'))
 process.env.OPENCLAUDE_HOME = home
+// 锁域按测试进程隔离:node --test 按文件并行,共享宿主 /tmp 时 slot 锁会与
+// mcpVisionMinimaxBackend.test.ts 跨进程互踩(CI 实证偶发 "already running")。
+const lockBase = mkdtempSync(join(tmpdir(), 'oc-vision-lock-'))
+process.env.OPENCLAUDE_VISION_LOCK_DIR = lockBase
 
 const vision = await import('../mcpVisionServer.js')
 
@@ -424,7 +428,7 @@ printf '%s\\n' 'session id: fake'
   })
 
   it('reaps stale malformed vision lock directories', () => {
-    const lockDir = join(tmpdir(), 'openclaude-vision-codex.99.lock')
+    const lockDir = join(lockBase, 'openclaude-vision-codex.99.lock')
     rmSync(lockDir, { recursive: true, force: true })
     mkdirSync(lockDir, { recursive: true })
     writeFileSync(join(lockDir, 'owner.json'), '{not-json')
