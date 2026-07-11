@@ -189,6 +189,25 @@ function frameCollector(ws: WebSocket): { next: () => Promise<string> } {
   };
 }
 
+/**
+ * frameCollector 之上再过滤:跳过 sys.*(relay_ready / frontend_build 等**连接性帧**)与
+ * 非 JSON 帧,返回下一条业务帧的解析对象。业务断言一律经它取帧——bridge 在容器 relay
+ * 建立时会主动推 sys.relay_ready,once 式 waitMessage 抢到的第一帧可能是它而不是业务帧
+ * (本文件 4 个套件曾因此长期躺在基线失败债里)。
+ */
+async function nextBusinessFrame(fc: { next: () => Promise<string> }): Promise<Record<string, unknown>> {
+  for (;;) {
+    const s = await fc.next();
+    try {
+      const parsed = JSON.parse(s) as Record<string, unknown>;
+      if (typeof parsed?.type === "string" && (parsed.type as string).startsWith("sys.")) continue;
+      return parsed;
+    } catch {
+      /* 非 JSON(binary 透传等)不属于业务 JSON 断言目标,跳过 */
+    }
+  }
+}
+
 /** 等下一条容器侧 ws 连接(按时间顺序;不复用已有的)。 */
 function waitNextContainerSocket(rig: TestRig, timeoutMs = 1000): Promise<WebSocket> {
   return new Promise((resolve, reject) => {
@@ -374,11 +393,10 @@ describe("userChatBridge — happy path", () => {
     await new Promise<void>((r) => ws.once("open", () => r()));
     const containerWs = await containerOpenP;
 
-    const recv = waitMessage(ws);
+    // relay 建立时 bridge 会先推 sys.relay_ready,业务断言经 nextBusinessFrame 取帧。
+    const fc = frameCollector(ws);
     containerWs.send(JSON.stringify({ type: "delta", text: "hello" }));
-    const got = await recv;
-    const txt = typeof got.data === "string" ? got.data : got.data.toString("utf8");
-    assert.deepEqual(JSON.parse(txt), { type: "delta", text: "hello" });
+    assert.deepEqual(await nextBusinessFrame(fc), { type: "delta", text: "hello" });
 
     ws.close();
     await waitClose(ws);
@@ -452,7 +470,7 @@ describe("userChatBridge — container frame too big", () => {
   before(async () => { rig = await startRig({ maxFrameBytes: 1024 }); });
   after(async () => { await stopRig(rig); });
 
-  test("容器返一个 > maxFrameBytes 的帧 → bridge close(1009)", async () => {
+  test("容器返一个 > maxFrameBytes 的帧 → 容器侧 maxPayload 护栏 → close(1011)", async () => {
     const token = await makeJwt("210");
     const cP = waitNextContainerSocket(rig);
     const ws = openClient(rig.gatewayPort, token);
@@ -460,10 +478,13 @@ describe("userChatBridge — container frame too big", () => {
     const containerWs = await cP;
 
     const closeP = waitClose(ws);
-    // 让 container 主动发一个超大帧 → bridge 的 onContainerMessage 检查命中 1009
+    // 现行语义:容器→bridge 的超大帧由 ws lib maxPayload(createContainerSocket 传入
+    // maxFrameBytes)在协议层拦截 → containerWs 'error' → 容器侧异常路径,user 收
+    // ERR_CONTAINER + close(INTERNAL 1011)。旧的 onContainerMessage 显式 1009 预检
+    // 已被 maxPayload 护栏取代(1009 仅保留在 user→container 入站帧检查)。
     containerWs.send(Buffer.alloc(2048, 0x42), { binary: true });
     const close = await closeP;
-    assert.equal(close.code, CLOSE_BRIDGE.TOO_BIG);
+    assert.equal(close.code, CLOSE_BRIDGE.INTERNAL);
   });
 });
 
@@ -876,7 +897,7 @@ describe("userChatBridge — tunnel routing (regression)", () => {
 // ------- 0049 模型授权(plan v3 review v1/v2 follow-up)----------------------
 
 describe("userChatBridge — model authorization", () => {
-  test("inbound.message 带 model 且未授权 → close(POLICY)", async () => {
+  test("inbound.message 带 model 且未授权 → close(PRODUCT_POLICY 4507)", async () => {
     const allowed = new Set<string>(["claude-opus-4-7"]); // gpt-5.6-sol 不在
     const rig = await startRig({
       loadAllowedModelChecker: async () => (id: string) => allowed.has(id),
@@ -886,13 +907,14 @@ describe("userChatBridge — model authorization", () => {
       const ws = openClient(rig.gatewayPort, token);
       await new Promise<void>((r) => ws.once("open", () => r()));
 
-      const errFrameP = waitMessage(ws);
+      const fc = frameCollector(ws);
       const closeP = waitClose(ws);
       ws.send(JSON.stringify({ type: "inbound.message", model: "gpt-5.6-sol" }));
-      const err = await errFrameP;
-      assert.match(err.data.toString(), /UNAUTHORIZED_MODEL/);
+      const err = await nextBusinessFrame(fc);
+      assert.equal(err.code, "UNAUTHORIZED_MODEL");
       const closed = await closeP;
-      assert.equal(closed.code, CLOSE_BRIDGE.POLICY);
+      // 模型未授权=用户可调整的产品策略 → 4507(1008 会被前端误判为登录过期,见 CLOSE_BRIDGE 注释)
+      assert.equal(closed.code, CLOSE_BRIDGE.PRODUCT_POLICY);
     } finally {
       await stopRig(rig);
     }
@@ -1102,13 +1124,14 @@ describe("userChatBridge — model authorization", () => {
       state.allowGpt = false;
 
       // 3) 第二帧不带 model,但 lastSeenModelId='gpt-5.6-sol' → 应该被拦
-      const errFrameP = waitMessage(ws);
+      const fc = frameCollector(ws);
       const closeP = waitClose(ws);
       ws.send(JSON.stringify({ type: "inbound.message", n: 2 }));
-      const err = await errFrameP;
-      assert.match(err.data.toString(), /UNAUTHORIZED_MODEL/);
+      const err = await nextBusinessFrame(fc);
+      assert.equal(err.code, "UNAUTHORIZED_MODEL");
       const closed = await closeP;
-      assert.equal(closed.code, CLOSE_BRIDGE.POLICY);
+      // 同上:模型授权撤销=产品策略 close(4507),非登录态 1008
+      assert.equal(closed.code, CLOSE_BRIDGE.PRODUCT_POLICY);
     } finally {
       await stopRig(rig);
     }
@@ -1133,10 +1156,11 @@ describe("userChatBridge — model authorization", () => {
 // 发 inbound.hello.lastFrameSeq 时 bridge 直接回放 ring 内的尾部帧,miss 则发
 // outbound.resume_failed 让客户端 REST force-sync。
 //
-// 测试焦点:
+// 测试焦点(1b488863 重启断流根治后的现行契约:bridge ring = 「hit 时的近端加速」,
+// **miss 不越权发 resume_failed,replay 失败的唯一裁决者是容器**):
 //   1. 命中:bridge 在 hello 后立即推 ring 里 seq>cursor 的帧
-//   2. miss:cursor>0 + ring 空 → resume_failed reason="no_buffer"
-//   3. 容器重启(cid 变更)→ 新 namespace,旧 cid 的帧不漏给新 cid
+//   2. miss:cursor>0 + ring 空 → bridge 静默(hello 仍转发容器,由容器裁决)
+//   3. 容器重启(cid 变更)→ 新 namespace,旧 cid 的帧不漏给新 cid,且 bridge 不抢发
 //   4. binary 帧不进 ring(只解析 JSON 文本帧)
 //   5. 没 sessionKey / frameSeq 的 outbound 帧不进 ring(向后兼容旧帧)
 //   6. hello 转发到容器(byte-transparent),不被吞
@@ -1157,7 +1181,7 @@ describe("userChatBridge — Phase 0.4 ring replay", () => {
       const ws1 = openClient(rig.gatewayPort, token);
       await new Promise<void>((r) => ws1.once("open", () => r()));
       const containerWs1 = await containerOpen1;
-      const recvP1 = waitMessage(ws1);
+      const fc1 = frameCollector(ws1);
       const stamped = JSON.stringify({
         type: "outbound.message",
         sessionKey: "agent:main:webchat:dm:peerX",
@@ -1165,8 +1189,7 @@ describe("userChatBridge — Phase 0.4 ring replay", () => {
         blocks: [],
       });
       containerWs1.send(stamped);
-      const recv1 = await recvP1;
-      assert.equal(JSON.parse(recv1.data.toString()).frameSeq, 5);
+      assert.equal((await nextBusinessFrame(fc1)).frameSeq, 5);
       ws1.close();
       await waitClose(ws1);
 
@@ -1175,13 +1198,12 @@ describe("userChatBridge — Phase 0.4 ring replay", () => {
       const ws2 = openClient(rig.gatewayPort, token);
       await new Promise<void>((r) => ws2.once("open", () => r()));
       await containerOpen2;
-      const recvP2 = waitMessage(ws2);
+      const fc2 = frameCollector(ws2);
       ws2.send(JSON.stringify({
         type: "inbound.hello",
         peers: [{ peerId: "peerX", agentId: "main", lastFrameSeq: 4 }],
       }));
-      const recv2 = await recvP2;
-      const replayed = JSON.parse(recv2.data.toString());
+      const replayed = await nextBusinessFrame(fc2);
       assert.equal(replayed.frameSeq, 5, "ring replay 必须把 seq=5 推下来");
       assert.equal(replayed.sessionKey, "agent:main:webchat:dm:peerX");
 
@@ -1192,7 +1214,7 @@ describe("userChatBridge — Phase 0.4 ring replay", () => {
     }
   });
 
-  test("hello with cursor>0 + empty ring → resume_failed reason=no_buffer", async () => {
+  test("hello with cursor>0 + empty ring → bridge 静默不越权(hello 仍转发容器裁决)", async () => {
     const portRef = { p: 0 };
     const rig = await startRig({
       resolve: async () => ({
@@ -1207,20 +1229,34 @@ describe("userChatBridge — Phase 0.4 ring replay", () => {
       const ws = openClient(rig.gatewayPort, token);
       await new Promise<void>((r) => ws.once("open", () => r()));
       await containerOpen;
-      const recvP = waitMessage(ws);
+      const fc = frameCollector(ws);
       ws.send(JSON.stringify({
         type: "inbound.hello",
         peers: [{ peerId: "peerY", agentId: "main", lastFrameSeq: 100 }],
       }));
-      const recv = await recvP;
-      const frame = JSON.parse(recv.data.toString());
-      assert.equal(frame.type, "outbound.resume_failed");
-      assert.equal(frame.reason, "no_buffer");
-      assert.equal(frame.peer.id, "peerY");
-      assert.equal(frame.peer.kind, "dm");
-      assert.equal(frame.channel, "webchat");
-      assert.equal(frame.from, 100, "from 必须是 client 报的 cursor");
-      assert.equal(frame.to, 0, "to 必须是 ring currentLast (=0 因 ring 空)");
+
+      // 现行契约(1b488863):miss 时 bridge 刻意不发 resume_failed——master 重启后
+      // bridge ring 恒空,抢发会用 REST 快照覆盖容器随后完好的重放(boss 实测丢内容)。
+      // ① hello 必须原样到达容器(裁决权移交);② 客户端在窗口内收不到任何业务帧。
+      await new Promise<void>((resolve, reject) => {
+        const t0 = Date.now();
+        const poll = () => {
+          const seen = rig.containerSeen.some((m) => {
+            try { return JSON.parse(m.data.toString()).type === "inbound.hello"; }
+            catch { return false; }
+          });
+          if (seen) return resolve();
+          if (Date.now() - t0 > 1000) return reject(new Error("hello 未转发到容器"));
+          setTimeout(poll, 20);
+        };
+        poll();
+      });
+      const got = await Promise.race([
+        nextBusinessFrame(fc),
+        new Promise<null>((r) => setTimeout(() => r(null), 250)),
+      ]);
+      assert.equal(got, null,
+        `miss 时 bridge 不得越权发任何业务帧(收到 ${JSON.stringify(got)}),裁决权在容器`);
 
       ws.close();
       await waitClose(ws);
@@ -1246,13 +1282,13 @@ describe("userChatBridge — Phase 0.4 ring replay", () => {
       const ws1 = openClient(rig.gatewayPort, token);
       await new Promise<void>((r) => ws1.once("open", () => r()));
       const containerWs1 = await containerOpen1;
-      const recvP1 = waitMessage(ws1);
+      const fc1 = frameCollector(ws1);
       containerWs1.send(JSON.stringify({
         type: "outbound.message",
         sessionKey: "agent:main:webchat:dm:peerZ",
         frameSeq: 3,
       }));
-      await recvP1;
+      await nextBusinessFrame(fc1);
       ws1.close();
       await waitClose(ws1);
 
@@ -1262,16 +1298,19 @@ describe("userChatBridge — Phase 0.4 ring replay", () => {
       const ws2 = openClient(rig.gatewayPort, token);
       await new Promise<void>((r) => ws2.once("open", () => r()));
       await containerOpen2;
-      const recvP2 = waitMessage(ws2);
+      const fc2 = frameCollector(ws2);
       ws2.send(JSON.stringify({
         type: "inbound.hello",
         peers: [{ peerId: "peerZ", agentId: "main", lastFrameSeq: 2 }],
       }));
-      const recv = await recvP2;
-      const frame = JSON.parse(recv.data.toString());
-      assert.equal(frame.type, "outbound.resume_failed",
-        "新 cid namespace 空 + cursor>0 → resume_failed,绝不能漏 seq=3 给新生命周期");
-      assert.equal(frame.reason, "no_buffer");
+      // 核心不变量:旧 cid 的 seq=3 绝不能漏给新生命周期;且现行契约下 bridge 对
+      // miss 保持静默(不越权 resume_failed,裁决在容器)→ 窗口内应零业务帧。
+      const got = await Promise.race([
+        nextBusinessFrame(fc2),
+        new Promise<null>((r) => setTimeout(() => r(null), 250)),
+      ]);
+      assert.equal(got, null,
+        `新 cid namespace 必须为空且 bridge 不抢发(收到 ${JSON.stringify(got)})`);
 
       ws2.close();
       await waitClose(ws2);
@@ -1312,16 +1351,21 @@ describe("userChatBridge — Phase 0.4 ring replay", () => {
       const ws2 = openClient(rig.gatewayPort, token);
       await new Promise<void>((r) => ws2.once("open", () => r()));
       await containerOpen2;
-      let firstMsg: string | null = null;
-      const t = setTimeout(() => { /* timeout — 期望无消息 */ }, 200);
-      ws2.once("message", (data) => { firstMsg = data.toString(); });
+      // 负断言只看业务帧:sys.*(relay_ready 等连接性帧)何时到达取决于 relay 建立时序,
+      // 不属于本断言语义(曾用 once 抓首帧,撞上 relay_ready 即假失败)。
+      const businessMsgs: string[] = [];
+      ws2.on("message", (data) => {
+        const s = data.toString();
+        try {
+          if (!String(JSON.parse(s)?.type ?? "").startsWith("sys.")) businessMsgs.push(s);
+        } catch { businessMsgs.push(s); }
+      });
       ws2.send(JSON.stringify({
         type: "inbound.hello",
         peers: [{ peerId: "peerW", agentId: "main", lastFrameSeq: 0 }],
       }));
       await new Promise<void>((r) => setTimeout(r, 250));
-      clearTimeout(t);
-      assert.equal(firstMsg, null,
+      assert.deepEqual(businessMsgs, [],
         "无 stamped 的 outbound 不进 ring + cursor=0 + currentLast=0 → 不发 replay 也不发 resume_failed");
 
       ws2.close();
@@ -1383,29 +1427,40 @@ describe("userChatBridge — Phase 0.4 ring replay", () => {
       const ws1 = openClient(rig.gatewayPort, token);
       await new Promise<void>((r) => ws1.once("open", () => r()));
       const containerWs1 = await containerOpen1;
-      const recvP1 = waitMessage(ws1);
+      // 等第一条 **binary** 帧(text 侧可能先来 sys.relay_ready,once 抓任意首帧会误配)
+      const recvBinaryP = new Promise<{ isBinary: boolean }>((resolve) => {
+        const onMsg = (_d: unknown, isBinary: boolean) => {
+          if (!isBinary) return;
+          ws1.off("message", onMsg);
+          resolve({ isBinary });
+        };
+        ws1.on("message", onMsg);
+      });
       // binary 帧 — 即便里面 ASCII 看起来像 JSON 也不该被当 JSON 解析
       const bin = Buffer.from('{"sessionKey":"x","frameSeq":99}');
       containerWs1.send(bin, { binary: true });
-      const recv1 = await recvP1;
+      const recv1 = await recvBinaryP;
       assert.equal(recv1.isBinary, true, "binary 帧透传保 isBinary 标志");
       ws1.close();
       await waitClose(ws1);
 
-      // Tab2: cursor=98 — 期望 no_buffer(binary 不进 ring)
+      // Tab2: cursor=98 — binary 不进 ring → miss;现行契约下 bridge 对 miss 静默
+      // (不越权 resume_failed,裁决在容器),窗口内应零业务帧。
       const containerOpen2 = waitNextContainerSocket(rig);
       const ws2 = openClient(rig.gatewayPort, token);
       await new Promise<void>((r) => ws2.once("open", () => r()));
       await containerOpen2;
-      const recvP2 = waitMessage(ws2);
+      const fc2 = frameCollector(ws2);
       ws2.send(JSON.stringify({
         type: "inbound.hello",
         peers: [{ peerId: "x", agentId: "main", lastFrameSeq: 98 }],
       }));
-      const recv2 = await recvP2;
-      const f = JSON.parse(recv2.data.toString());
-      assert.equal(f.type, "outbound.resume_failed",
-        "binary 帧不能进 ring,所以 cursor>0 时必须 miss");
+      const got2 = await Promise.race([
+        nextBusinessFrame(fc2),
+        new Promise<null>((r) => setTimeout(() => r(null), 250)),
+      ]);
+      assert.equal(got2, null,
+        `binary 帧不能进 ring(cursor>0 必 miss),且 miss 时 bridge 静默(收到 ${JSON.stringify(got2)})`);
 
       ws2.close();
       await waitClose(ws2);
