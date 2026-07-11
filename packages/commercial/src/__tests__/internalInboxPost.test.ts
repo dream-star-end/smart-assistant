@@ -173,14 +173,16 @@ describe("inbox-post handler", () => {
       return res;
     };
 
-    // 事故形态:同一段 "API Error: 402…" 每 5 分钟一条 → 首条落库,后续全部 duplicate。
-    const errBody = 'API Error: 402 {"error":{"code":"INSUFFICIENT_CREDITS"}}';
-    let r = await send("Run the watchdog", errBody);
+    // 事故形态:同一段 "API Error: 402…" 每 5 分钟一条,且每条携带**不同的 request_id**
+    // (线上 msg 622/623 实证)→ 归一化后仍判同内容:首条落库,后续全部 duplicate。
+    const errBody = (rid: string) =>
+      `API Error: 402 {"error":{"code":"INSUFFICIENT_CREDITS","message":"insufficient credits: balance=0 required=69"},"request_id":"${rid}"}`;
+    let r = await send("Run the watchdog", errBody("60ea16950bd43c0e7d920bedb367a6e3"));
     assert.equal(r.body.ok, true);
     for (let i = 0; i < 5; i++) {
       clock += 5 * 60_000;
-      r = await send("Run the watchdog", errBody);
-      assert.equal(r.body.ok, false, `第 ${i + 2} 条应被去重`);
+      r = await send("Run the watchdog", errBody(`5e755205c3cafc6b4f84a6b48aa33fb${i}`));
+      assert.equal(r.body.ok, false, `第 ${i + 2} 条应被去重(request_id 不同不该穿透)`);
       assert.equal(r.body.reason, "duplicate");
     }
     assert.equal(p.posts.length, 1);
@@ -192,7 +194,7 @@ describe("inbox-post handler", () => {
 
     // 窗口过期后同内容放行(第二天的失败该再提醒一次)。
     clock += 6 * 3600_000 + 1;
-    r = await send("Run the watchdog", errBody);
+    r = await send("Run the watchdog", errBody("aaaabbbbccccdddd0000111122223333"));
     assert.equal(r.body.ok, true);
     assert.equal(p.posts.length, 3);
   });
