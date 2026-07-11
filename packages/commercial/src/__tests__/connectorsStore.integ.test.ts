@@ -992,16 +992,23 @@ describe('P0#2 执行按账本行 provider/action 绑定(越权面)', () => {
     assert.equal(begun.kind, 'ok')
   })
 
-  test('RPC 端到端:confirmId 换 action 执行 → {kind:error, BAD_REQUEST};正确 action → result', async (t) => {
+  test('RPC 端到端:confirmId 执行忽略 body.action —— 执行账本已批准的 action(不被换成 send_message)', async (t) => {
     if (skipIfNoDb(t)) return
+    // Codex R2 P0#2:执行权威源=账本行。模型即便重传 body.action='send_message',也只会
+    // 执行账本里已被用户批准的 create_calendar_event(打到 /events,绝不打 /messages)。
     const uid = await mkUser()
     const conn = await mkFeishuConnection(uid, 'union-rpc-swap', Date.now() + 3_600_000)
     const redis = makeFakeRedis()
+    const hitUrls: string[] = []
+    const recordingFetch = (u: string, i: Record<string, unknown>) => {
+      hitUrls.push(u)
+      return feishuOkFetch()(u, i)
+    }
     const handler = makeConnectorsRpcHandler({
       identityRepo: okIdentityRepo(uid),
       pool: getPool(),
       redis,
-      fetchImpl: feishuOkFetch(),
+      fetchImpl: recordingFetch,
       log: () => {},
     })
     const prop = await callRpc(handler, {
@@ -1017,22 +1024,30 @@ describe('P0#2 执行按账本行 provider/action 绑定(越权面)', () => {
     assert.equal(prop.env.kind, 'confirmation_required')
     const id = prop.env.id as string
     await approveConfirmation(id, uid)
-    // 换成 send_message 执行 → 拒
+    // 模型试图用同一 confirmId 换成 send_message 执行 → body.action 被忽略,执行账本 action
     const swapped = await callRpc(handler, {
       connectionId: conn.id,
       action: 'send_message',
       confirmId: id,
     })
-    assert.equal(swapped.env.kind, 'error')
-    assert.equal(swapped.env.code, 'BAD_REQUEST')
-    // 正确 action → 执行成功
-    const good = await callRpc(handler, {
+    assert.equal(swapped.env.kind, 'result')
+    assert.equal((await getLedgerRow(id, uid))!.status, 'succeeded')
+    // 关键安全断言:实际打的是日历端点(/events),从未打消息端点(/messages)
+    assert.ok(
+      hitUrls.some((u) => u.includes('/events')),
+      '应执行账本批准的建日程 action',
+    )
+    assert.ok(
+      !hitUrls.some((u) => u.includes('/messages')),
+      'body.action=send_message 必须被忽略,绝不打消息端点',
+    )
+    // 同 confirmId 再执行(正确 action)→ replay(不重复执行)
+    const replay = await callRpc(handler, {
       connectionId: conn.id,
       action: 'create_calendar_event',
       confirmId: id,
     })
-    assert.equal(good.env.kind, 'result')
-    assert.equal((await getLedgerRow(id, uid))!.status, 'succeeded')
+    assert.equal(replay.env.kind, 'replay')
   })
 })
 

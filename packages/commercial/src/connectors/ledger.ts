@@ -364,8 +364,11 @@ export async function beginExecute(
     connectionId: string
     /** 期望的 connection provider(来自 getActiveConnection 的权威行)。 */
     expectedProvider: string
-    /** 期望的 action(来自请求体;必须与账本行 action 一致,否则拒)。 */
-    expectedAction: string
+    /**
+     * 期望的 action:**可选**。执行权威源是账本行 action(rpc 执行路径不传,彻底不让
+     * 模型输入参与授权/执行,Codex R2 P0#2)。仅当调用方显式提供时才作防御性强制一致。
+     */
+    expectedAction?: string
   },
   pool: Pool = getPool(),
 ): Promise<BeginExecuteOutcome> {
@@ -391,7 +394,10 @@ export async function beginExecute(
     // P0#2 绑定校验:账本行 provider/action 是执行权威。请求体若企图用同一 confirmId
     // 换执行另一个 action(如飞书 create_calendar_event 的确认换成 send_message),
     // 或 provider 不匹配 → 直接拒(不改状态,账本行仍可被正确 action 执行)。
-    if (row.provider !== opts.expectedProvider || row.action !== opts.expectedAction) {
+    if (
+      row.provider !== opts.expectedProvider ||
+      (opts.expectedAction !== undefined && row.action !== opts.expectedAction)
+    ) {
       throw new ConnectorError('BAD_REQUEST', 'confirmId provider/action mismatch')
     }
     const cls = classifyForExecute(row)

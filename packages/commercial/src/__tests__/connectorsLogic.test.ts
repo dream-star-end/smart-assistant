@@ -28,6 +28,8 @@ import {
   isMaybeDelivered,
   mapFetchFailure,
   mapUpstreamStatus,
+  readBoundedBody,
+  readBoundedJson,
   truncateText,
 } from '../connectors/providers/shared.js'
 import {
@@ -327,6 +329,37 @@ describe('mapUpstreamStatus / mapFetchFailure 的 maybeDelivered 标记(P1#4)', 
   })
 })
 
+describe('body 读取阶段断连(P1#4 Codex R2:2xx headers 后 body stream 断开)', () => {
+  test('响应头已到、body stream 中途 error → maybeDelivered(写路径→unknown)', async () => {
+    const stream = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        controller.error(Object.assign(new Error('reset'), { code: 'ECONNRESET' }))
+      },
+    })
+    const res = new Response(stream, { status: 200 })
+    await assert.rejects(
+      readBoundedBody(res, 4096, 'notion'),
+      (e: unknown) =>
+        e instanceof ConnectorError && e.code === 'UPSTREAM_ERROR' && isMaybeDelivered(e),
+    )
+  })
+  test('2xx 后响应体非 JSON/截断 → maybeDelivered(写路径→unknown,不误判 failed)', async () => {
+    const res = new Response('<html>not json</html>', {
+      status: 200,
+      headers: { 'content-type': 'text/html' },
+    })
+    await assert.rejects(
+      readBoundedJson(res, 4096, 'feishu'),
+      (e: unknown) =>
+        e instanceof ConnectorError && e.code === 'UPSTREAM_ERROR' && isMaybeDelivered(e),
+    )
+  })
+  test('正常 2xx JSON body 不受影响', async () => {
+    const res = new Response(JSON.stringify({ ok: 1 }), { status: 200 })
+    assert.deepEqual(await readBoundedJson(res, 4096, 'notion'), { ok: 1 })
+  })
+})
+
 describe('writeFinalizeStatus(P1#4:Notion/飞书/WebDAV 服务端已收包后断连)', () => {
   test('post-dispatch 断连 / 5xx / 已建连超时 → unknown(不盲重试防重复写)', () => {
     assert.equal(
@@ -387,10 +420,12 @@ describe('checkFeishuScopes / normalizeScopes(P2#12)', () => {
     assert.equal(r.verified, true)
     assert.deepEqual(r.missing, [])
   })
-  test('飞书未回报 scope(空串)→ 不误拒:verified=false 但 missing 空(放行+审计标记)', () => {
+  test('飞书未回报 scope(空串)→ fail-closed:missing=全部必需集,verified=false(拒绝绑定)', () => {
+    // Codex R2 P2#12:空 granted 不再放行(旧行为 missing=[] 会激活全写能力=fail-open),
+    // 现视为"全部必需 scope 都缺"→ 调用方(handler)据 missing 非空拒绝绑定。
     const r = checkFeishuScopes('')
     assert.equal(r.verified, false)
-    assert.deepEqual(r.missing, [])
+    assert.deepEqual(r.missing.sort(), [...REQUIRED].sort())
     assert.deepEqual(r.granted, [])
   })
 })

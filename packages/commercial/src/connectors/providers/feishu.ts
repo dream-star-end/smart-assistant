@@ -80,20 +80,16 @@ export interface FeishuScopeCheck {
 }
 
 /**
- * 校验飞书 token 响应回报的 granted scopes 是否覆盖 v1 必需集(P2#12)。
- * - 有回报且缺必需 → missing 非空 → 调用方拒绝绑定(fail-closed)。
- * - 有回报且齐全 → verified=true。
- * - **完全未回报(空串)** → 无法核验:不误拒(避免因飞书省略 scope 字段而断掉整个
- *   provider),返回 verified=false + missing 为空,调用方放行但在 meta 标注 scopesVerified。
+ * 校验飞书 token 响应回报的 granted scopes 是否覆盖 v1 必需集(P2#12,Codex R2 收紧)。
+ * **fail-closed**:无论缺部分还是完全未回报(空串),missing 都非空 → 调用方拒绝绑定。
+ * 空 granted → grantedSet 为空 → missing = 全部必需集 → 拒绝(不再放行"未核验即激活全写能力")。
+ * 只有回报齐全(missing 为空)才 verified=true。
  */
 export function checkFeishuScopes(grantedRaw: string): FeishuScopeCheck {
   const granted = normalizeScopes(grantedRaw)
-  if (granted.length === 0) {
-    return { granted, missing: [], verified: false }
-  }
   const grantedSet = new Set(granted)
   const missing = FEISHU_SCOPES.filter((s) => !grantedSet.has(s))
-  return { granted, missing, verified: missing.length === 0 }
+  return { granted, missing, verified: granted.length > 0 && missing.length === 0 }
 }
 
 export interface FeishuDeps {

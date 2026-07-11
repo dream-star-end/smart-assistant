@@ -116,6 +116,28 @@ export function mapFetchFailure(err: unknown, providerTag: string): ConnectorErr
   )
 }
 
+/**
+ * 响应 **body 读取阶段**失败映射(P1#4 Codex R2)。此刻响应头已到(调用方已过 res.ok
+ * 检查)→ 定义上是 post-dispatch:对写操作 = 服务端可能已落地写入 → 一律标 maybeDelivered
+ * (读操作会忽略该标记,只是读失败)。已是 ConnectorError(如自身 RESULT_TOO_LARGE)原样透出。
+ */
+function mapBodyReadFailure(err: unknown, providerTag: string): ConnectorError {
+  if (err instanceof ConnectorError) return err
+  const name = fetchErrName(err)
+  const code = fetchErrCode(err)
+  const isTimeout =
+    name === 'TimeoutError' ||
+    name === 'AbortError' ||
+    code === 'UND_ERR_BODY_TIMEOUT' ||
+    code === 'UND_ERR_HEADERS_TIMEOUT'
+  return markMaybeDelivered(
+    new ConnectorError(
+      isTimeout ? 'UPSTREAM_TIMEOUT' : 'UPSTREAM_ERROR',
+      `${providerTag} upstream body read failed`,
+    ),
+  )
+}
+
 // ─── 上游响应读取(有界) ─────────────────────────────────────────────────
 
 /** 上游 JSON 响应上限(结构化路径)。 */
@@ -136,7 +158,15 @@ export async function readBoundedBody(
   let total = 0
   try {
     while (true) {
-      const { done, value } = await reader.read()
+      let chunk: ReadableStreamReadResult<Uint8Array>
+      try {
+        chunk = await reader.read()
+      } catch (err) {
+        // body 读取中途 socket 断裂/超时:响应头已到 → post-dispatch,写路径判 maybeDelivered。
+        await reader.cancel().catch(() => {})
+        throw mapBodyReadFailure(err, providerTag)
+      }
+      const { done, value } = chunk
       if (done) break
       if (value === undefined) continue
       total += value.byteLength
@@ -166,7 +196,10 @@ export async function readBoundedJson(
   try {
     return JSON.parse(buf.toString('utf8'))
   } catch {
-    throw new ConnectorError('UPSTREAM_ERROR', `${providerTag} upstream returned non-JSON`)
+    // 2xx 后响应体截断/非 JSON:写操作服务端可能已落地 → maybeDelivered(读操作忽略)。
+    throw markMaybeDelivered(
+      new ConnectorError('UPSTREAM_ERROR', `${providerTag} upstream returned non-JSON`),
+    )
   }
 }
 

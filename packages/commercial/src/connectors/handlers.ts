@@ -594,8 +594,9 @@ async function handleOauthCallback(
         meta: {
           account_hint: who.name || '飞书',
           tokenExpiresAt: tokens.expiresAt,
-          // verify granted scopes 存 meta(§2);scopesVerified=false 表示飞书未回报 scope
-          // 字段(无法核验,已放行但留审计标记)。
+          // granted scopes 存 meta(§2)。P2#12 fail-closed 后:能走到这里必已过
+          // missing 校验(缺任一必需 scope、含空 granted 全部,都已在上面 SCOPE_INSUFFICIENT
+          // 拒绝),故此处 scopesVerified 恒 true;保留字段供审计与将来降级 capability 用。
           grantedScopes: scopeCheck.granted.join(' '),
           scopesVerified: scopeCheck.verified,
         },

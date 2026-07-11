@@ -476,9 +476,90 @@ async function handleCall(
     }
     throw new ConnectorError('CONNECTION_NOT_FOUND', 'no such connection')
   }
-  const decl = requireAction(row.provider, body.action)
-
   await assertNotRevoking(rt.deps.redis, row.id)
+
+  // ── 写操作,带 confirmId:执行 ──
+  // P0#2(Codex R2):执行权威源**只有账本行**。彻底不读 body.action —— confirmId 已在
+  // beginExecute 里按 (id,userId,connectionId) 锁定权威行,handler/参数 schema 全部由账本行
+  // provider/action 派生。这样模型无法用 confirmId 换执行另一 action,replay 也不因 registry
+  // 改名/漏传 action 被阻断。
+  if (body.confirmId) {
+    const begun = await beginExecute(
+      {
+        id: body.confirmId,
+        userId: who.userId,
+        connectionId: row.id,
+        expectedProvider: row.provider,
+      },
+      pool,
+    )
+    if (begun.kind === 'in_progress') {
+      sendEnvelope(res, { kind: 'in_progress', id: body.confirmId })
+      return
+    }
+    if (begun.kind === 'replay') {
+      sendEnvelope(res, {
+        kind: 'replay',
+        status: begun.status,
+        ...(begun.errorCode ? { errorCode: begun.errorCode } : {}),
+        ...(begun.resultDigest ? { resultDigest: begun.resultDigest } : {}),
+      })
+      return
+    }
+
+    // executing:按**账本行** provider/action 解析 handler + 按账本 action schema 重校验
+    // 解密参数。**确定性失败(registry 改名/schema 不兼容/账本参数损坏)必须就地 finalize
+    // 为 failed** —— 此刻尚未 dispatch,若让错误逸出会把账本卡在 executing、被 sweeper 误判
+    // unknown(Codex R2 回归修复:解析/校验放在 try 内,不再逸出)。
+    let ledgerDecl: ReturnType<typeof requireAction>
+    let ledgerParams: ReturnType<typeof validateActionParams>
+    try {
+      ledgerDecl = requireAction(begun.row.provider, begun.row.action)
+      ledgerParams = validateActionParams(ledgerDecl.params, begun.params)
+    } catch (err) {
+      const ce = toConnectorError(err)
+      await finalizeExecute(
+        { id: body.confirmId, status: 'failed', errorCode: ce.code },
+        pool,
+      ).catch(() => {})
+      throw ce
+    }
+
+    try {
+      // P1#5:send 类日上限在实发 dispatch 前原子扣减(按**账本 action** 的 sendClass)。
+      if (ledgerDecl.sendClass) {
+        await checkRedisWindow(rt.deps.redis, 'send', who.userId, rt.now(), rt.log)
+      }
+      const result = await withConnectionSlot(`c:${row.id}`, () =>
+        executeConnectionAction({
+          connectionId: row.id,
+          userId: who.userId,
+          action: ledgerDecl,
+          params: ledgerParams, // 账本参数(hash 已复核 + 按账本 action schema 重校验)
+          expectedRevision: begun.row.connection_revision,
+          idempotencyKey: begun.row.idempotency_key,
+          deps: execDeps,
+        }),
+      )
+      const digest = canonicalDigestHex(result)
+      await finalizeExecute({ id: body.confirmId, status: 'succeeded', resultDigest: digest }, pool)
+      await touchConnectionVerified(row.id, pool).catch(() => {})
+      sendEnvelope(res, { kind: 'result', result })
+    } catch (err) {
+      const ce = toConnectorError(err)
+      // P1#4:已送达不确定(post-dispatch 断连/超时/5xx)→ unknown 不盲重试;
+      // 确定未送达(校验错/4xx/门限拒绝/pre-dispatch 连接失败)→ failed。
+      await finalizeExecute(
+        { id: body.confirmId, status: writeFinalizeStatus(err), errorCode: ce.code },
+        pool,
+      ).catch(() => {})
+      throw ce
+    }
+    return
+  }
+
+  // ── 读 / 写-propose:需按 registry 校验请求体 action ──
+  const decl = requireAction(row.provider, body.action)
 
   // ── 读操作:直接执行(不过确认门,§3) ──
   if (decl.readOnly) {
@@ -503,93 +584,28 @@ async function handleCall(
   }
 
   // ── 写操作,无 confirmId:propose → 确认卡 ──
-  if (!body.confirmId) {
-    // P1#5:propose 只计 10/min 频率闸;send 类日上限**移到 execute 前**原子扣减,
-    // 避免被拒/过期的 proposal 耗额度、以及跨 UTC 日预造 proposal 绕过日上限。
-    await checkRedisWindow(rt.deps.redis, 'propose', who.userId, rt.now(), rt.log)
-    const params = validateActionParams(decl.params, body.params)
-    const proposed = await proposeWrite(
-      {
-        userId: who.userId,
-        connectionId: row.id,
-        connectionRevision: row.revision,
-        provider: row.provider,
-        action: decl.id,
-        params,
-        summary: buildWriteSummary(row.provider, decl.id, params, accountHintOf(row.meta)),
-      },
-      pool,
-    )
-    sendEnvelope(res, {
-      kind: 'confirmation_required',
-      id: proposed.id,
-      provider: row.provider,
-      action: decl.id,
-      summary: proposed.summary,
-      expiresAt: proposed.expiresAt.toISOString(),
-    })
-    return
-  }
-
-  // ── 写操作,带 confirmId:执行 ──
-  // P0#2:beginExecute 强制账本行 provider/action 与本请求一致(权威源=账本行,忽略
-  // 模型可能重传的 action;不一致直接拒,防同一 connection 内换 action 越权)。
-  const begun = await beginExecute(
+  // P1#5:propose 只计 10/min 频率闸;send 类日上限**移到 execute 前**原子扣减,
+  // 避免被拒/过期的 proposal 耗额度、以及跨 UTC 日预造 proposal 绕过日上限。
+  await checkRedisWindow(rt.deps.redis, 'propose', who.userId, rt.now(), rt.log)
+  const params = validateActionParams(decl.params, body.params)
+  const proposed = await proposeWrite(
     {
-      id: body.confirmId,
       userId: who.userId,
       connectionId: row.id,
-      expectedProvider: row.provider,
-      expectedAction: body.action,
+      connectionRevision: row.revision,
+      provider: row.provider,
+      action: decl.id,
+      params,
+      summary: buildWriteSummary(row.provider, decl.id, params, accountHintOf(row.meta)),
     },
     pool,
   )
-  if (begun.kind === 'in_progress') {
-    sendEnvelope(res, { kind: 'in_progress', id: body.confirmId })
-    return
-  }
-  if (begun.kind === 'replay') {
-    sendEnvelope(res, {
-      kind: 'replay',
-      status: begun.status,
-      ...(begun.errorCode ? { errorCode: begun.errorCode } : {}),
-      ...(begun.resultDigest ? { resultDigest: begun.resultDigest } : {}),
-    })
-    return
-  }
-
-  // executing:handler 按**账本行** provider/action 解析(权威源),解密参数按账本 action
-  // 的 schema 重新校验后再执行(P0#2 ①③)。
-  const ledgerDecl = requireAction(begun.row.provider, begun.row.action)
-  const ledgerParams = validateActionParams(ledgerDecl.params, begun.params)
-  try {
-    // P1#5:send 类日上限在实发 dispatch 前原子扣减(按**账本 action** 的 sendClass)。
-    if (ledgerDecl.sendClass) {
-      await checkRedisWindow(rt.deps.redis, 'send', who.userId, rt.now(), rt.log)
-    }
-    const result = await withConnectionSlot(`c:${row.id}`, () =>
-      executeConnectionAction({
-        connectionId: row.id,
-        userId: who.userId,
-        action: ledgerDecl,
-        params: ledgerParams, // 账本参数(hash 已复核 + 按账本 action schema 重校验)
-        expectedRevision: begun.row.connection_revision,
-        idempotencyKey: begun.row.idempotency_key,
-        deps: execDeps,
-      }),
-    )
-    const digest = canonicalDigestHex(result)
-    await finalizeExecute({ id: body.confirmId, status: 'succeeded', resultDigest: digest }, pool)
-    await touchConnectionVerified(row.id, pool).catch(() => {})
-    sendEnvelope(res, { kind: 'result', result })
-  } catch (err) {
-    const ce = toConnectorError(err)
-    // P1#4:已送达不确定(post-dispatch 断连/超时/5xx)→ unknown 不盲重试;
-    // 确定未送达(校验错/4xx/门限拒绝/pre-dispatch 连接失败)→ failed。
-    await finalizeExecute(
-      { id: body.confirmId, status: writeFinalizeStatus(err), errorCode: ce.code },
-      pool,
-    ).catch(() => {})
-    throw ce
-  }
+  sendEnvelope(res, {
+    kind: 'confirmation_required',
+    id: proposed.id,
+    provider: row.provider,
+    action: decl.id,
+    summary: proposed.summary,
+    expiresAt: proposed.expiresAt.toISOString(),
+  })
 }
