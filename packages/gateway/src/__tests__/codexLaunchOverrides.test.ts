@@ -243,9 +243,7 @@ describe('buildCodexLaunchOverrides', () => {
     assert.ok(out.instructionsFile.startsWith(dir))
   })
 
-  it('注入 features.image_generation=false 关闭 codex 原生生图(平台生图唯一权威=minimax-media)', async () => {
-    // 键名经容器实证(codex-cli 0.144.0):权威 feature 名是 image_generation,不是 imagegen;
-    // `-c features.image_generation=false` 等价 `codex features --disable image_generation`。
+  it('不再关断 codex 原生生图(boss 07-11 裁决启用,gpt-image-2 为平台生图首选)', async () => {
     const { buildCodexLaunchOverrides } = await import('../codexLaunchOverrides.js')
     const out = await buildCodexLaunchOverrides({
       agentId: 'test-agent',
@@ -253,20 +251,32 @@ describe('buildCodexLaunchOverrides', () => {
       gatewayPort: 18789,
       gatewayToken: 'tok-xyz',
     })
-    // 作为独立 `-c key=value` 对注入,值为裸 TOML 布尔 false(非字符串 "false")。
-    const idx = out.argvOverrides.indexOf('features.image_generation=false')
+    // 防回归:features.image_generation 关断已撤销(egress relay 已放行 /images/*);
+    // 也不许打回旧的无效裸键 imagegen。feature 默认即开,无需显式 true。
     assert.ok(
-      idx > 0,
-      `argv must disable codex native image gen; got ${out.argvOverrides.join(' ')}`,
+      !out.argvOverrides.some((s) => s.includes('features.image_generation')),
+      `image_generation toggle must be gone; got ${out.argvOverrides.join(' ')}`,
     )
-    assert.equal(out.argvOverrides[idx - 1], '-c', 'features toggle must be a -c pair')
-    // 防手滑打回旧的无效裸键(会被 codex 静默忽略 → 生图工具仍在)。
-    assert.ok(
-      !out.argvOverrides.some((s) => s.includes('features.imagegen')),
-      'must use full feature name image_generation, not the no-op alias imagegen',
-    )
-    // 不得早于 model_instructions_file —— 后者必须稳居首对(顺序快照不变量)。
-    assert.ok(idx > 1, 'features toggle must come after model_instructions_file (arg[1])')
+    assert.ok(!out.argvOverrides.some((s) => s.includes('features.imagegen')))
+  })
+
+  it('任何情况下不注入 shell_environment_policy(env 值经 -c 会泄进 argv/日志;mmx 走文件通道)', async () => {
+    const { buildCodexLaunchOverrides } = await import('../codexLaunchOverrides.js')
+    process.env.OPENCLAUDE_V3_MASTER_BASE_URL = 'http://172.31.0.1:18892'
+    process.env.OPENCLAUDE_V3_CONTAINER_TOKEN = 'tok-must-not-appear'
+    try {
+      const out = await buildCodexLaunchOverrides({
+        agentId: 'test-agent',
+        sessionDir: dir,
+        gatewayPort: 18789,
+        gatewayToken: 'tok-xyz',
+      })
+      assert.ok(!out.argvOverrides.some((s) => s.includes('shell_environment_policy')))
+      assert.ok(!out.argvOverrides.some((s) => s.includes('tok-must-not-appear')))
+    } finally {
+      delete process.env.OPENCLAUDE_V3_MASTER_BASE_URL
+      delete process.env.OPENCLAUDE_V3_CONTAINER_TOKEN
+    }
   })
 
   it('instructionsContent prepends CODEX_PREAMBLE before platform context', async () => {
