@@ -107,6 +107,7 @@ for arg in "$@"; do
     # 代码+前端两生效面合并为一次重启(见 deploy() 内注释,2026-07-10 成对重启事故)
     --with-dist) WITH_DIST=1 ;;
     --bootstrap) MODE="bootstrap" ;;
+    --migrate-bluegreen) MODE="migrate-bluegreen" ;;
     --smoke) MODE="smoke" ;;
     --dist) MODE="dist" ;;
     --prepare-offline-cutover) MODE="prepare-offline-cutover" ;;
@@ -516,15 +517,208 @@ RSYNC_EXCLUDES=(--exclude '.git' --exclude 'node_modules' --exclude 'data'
 
 # 写 VERSION.json(gateway /version 读 cwd/VERSION.json)—— 灰度归属:channel + commit + builtAt。
 write_version() {
+  local target="${1:-$REMOTE_SRC}"   # 蓝绿:可写入 release 目录;默认 $REMOTE_SRC(向后兼容)
   local commit builtAt tag
-  commit="$(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+  # P0#2(Codex):commit 由调用方**显式钉死**(蓝绿传 build_release 捕获的 sha),不再重读 HEAD
+  # —— 否则并发会话移动 HEAD 时 VERSION 与 archive 源码会不同 sha。缺省才回退读 HEAD。
+  commit="${2:-$(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)}"
   builtAt="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   tag="v5-$commit"
   local json="{\"tag\":\"$tag\",\"commit\":\"$commit\",\"channel\":\"v5\",\"builtAt\":\"$builtAt\"}"
-  if [[ "$DRY" == 1 ]]; then echo "  [dry-run] write VERSION.json: $json"; return; fi
+  if [[ "$DRY" == 1 ]]; then echo "  [dry-run] write VERSION.json → $target: $json"; return; fi
   # 原子写(temp + mv):裸 `cat > VERSION.json` 传输期可能短暂为空/半写,master /version 读到空。
-  ssh "$KL_HOST" "cat > '$REMOTE_SRC/VERSION.json.tmp' && mv -f '$REMOTE_SRC/VERSION.json.tmp' '$REMOTE_SRC/VERSION.json'" <<<"$json"
-  echo "  ✓ VERSION.json: $json"
+  ssh "$KL_HOST" "cat > '$target/VERSION.json.tmp' && mv -f '$target/VERSION.json.tmp' '$target/VERSION.json'" <<<"$json"
+  echo "  ✓ VERSION.json ($target): $json"
+}
+
+# ═══════════════════════ 蓝绿部署(release 目录 + 原子 symlink)═══════════════════════
+# 根治并发部署崩溃循环 + 部署树 HEAD 被并发会话移走(2026-07-11 事故)。原理:
+#   - REMOTE_SRC=/opt/openclaude/openclaude-v5 是 **symlink** → RELEASES_ROOT/rel-<sha>-<ts>
+#   - 部署 = 从**锁定 sha** 的 `git archive`(不读共用工作树活状态)建**不可变** release 目录
+#     (硬链 node_modules,package-lock 变才 npm ci;dist 构建进 reldir 或硬链继承)→ **原子
+#     symlink 翻转**(mv -T)→ restart。master 永远只从完整不可变 release 启动 → 无半同步树、
+#     无崩溃循环;VERSION/源码/dist 永远同 sha 自洽;并发部署=串行原子翻转,各发布 canonical 超集。
+#   - sessions.db 早已外置 /root/.openclaude-v5/,data/ 空 → 无"运行中 master 数据在树内"问题。
+RELEASES_ROOT="/opt/openclaude/openclaude-v5-releases"
+RELEASES_KEEP="${RELEASES_KEEP:-6}"
+
+# 当前 release 目录(REMOTE_SRC symlink 的 target);未迁移(实目录)或无 symlink → 空。
+bg_current_release() {
+  ssh "$KL_HOST" "test -L '$REMOTE_SRC' && readlink -f '$REMOTE_SRC' || true" 2>/dev/null || true
+}
+
+# 蓝绿前置:REMOTE_SRC 必须已是 symlink 布局且指向 RELEASES_ROOT 下的完整 release(否则先迁移)。
+assert_bluegreen_layout() {
+  [[ "$DRY" == 1 ]] && { echo "  [dry-run] 断言蓝绿 symlink 布局"; return 0; }
+  ssh "$KL_HOST" "set -e
+    test -L '$REMOTE_SRC'
+    t=\$(readlink -f '$REMOTE_SRC')
+    case \"\$t\" in '$RELEASES_ROOT'/rel-*) : ;; *) echo '✗ $REMOTE_SRC symlink 未指向 RELEASES_ROOT/rel-*: '\"\$t\" >&2; exit 1 ;; esac
+    test -f \"\$t/.complete\" || { echo '✗ current release 无 .complete 标记' >&2; exit 1; }" || {
+    echo "✗ 蓝绿布局校验失败:$REMOTE_SRC 需为指向 RELEASES_ROOT/rel-* 完整 release 的 symlink。先在受控窗口跑:deploy-v5.sh --migrate-bluegreen" >&2
+    exit 1
+  }
+}
+
+# P0#4(Codex):offline cutover lane(stage/activate-staged/offline-recycle/prepare-offline-cutover)
+# 仍按**实目录 in-place + mv 语义**操作 REMOTE_SRC,在 symlink 布局下会把 symlink 搬走/装回实目录、
+# 破坏蓝绿不变量。该 lane 尚未适配蓝绿 → symlink 布局下 **fail-closed 拒绝**(不静默破坏)。
+assert_not_bluegreen_for_cutover() {
+  [[ "$DRY" == 1 ]] && return 0
+  if ssh "$KL_HOST" "test -L '$REMOTE_SRC'"; then
+    echo "✗ 蓝绿 symlink 布局下 offline cutover lane 尚未适配(会破坏布局)。该 lane 需单独迁移蓝绿(登记 playbook 债);当前 fail-closed 拒绝。" >&2
+    exit 1
+  fi
+}
+
+# 建不可变 release:**当前 shell 执行**(不走 command-substitution 子 shell,否则 errexit 被清、
+# 失败被吞、DIST_BUILD_ID 丢,Codex P0#1),成功后**设全局 BUILT_RELEASE**,失败 return 1。
+# 建到唯一 .staging-* → 完整性校验 → 写 .complete → **原子 mv -T 改名**为 rel-*(半成品永不落
+# rel-* 命名空间,activate/rollback/GC 只认带 .complete 的目录,Codex P0#3)。sha 全程钉死一次
+# 贯穿 archive/VERSION/dist(工作树必须干净=即该 sha,Codex P0#2)。
+BUILT_RELEASE=""
+build_release() {
+  BUILT_RELEASE=""; DIST_BUILD_ID=""
+  local full_sha short_sha ts staging reldir cur
+  full_sha="$(git -C "$REPO_ROOT" rev-parse HEAD)"
+  short_sha="$(git -C "$REPO_ROOT" rev-parse --short "$full_sha")"   # 从 full_sha 派生,不二次读 HEAD(R2#2:消两读竞态)
+  ts="$(date -u +%Y%m%d-%H%M%S)"
+  cur="$(bg_current_release)"
+  staging="$RELEASES_ROOT/.staging-$short_sha-$$-$ts"
+  reldir="$RELEASES_ROOT/rel-$short_sha-$ts"
+  echo "── 建 release(staging→原子改名):$reldir(pinned $short_sha)──" >&2
+  if [[ "$DRY" == 1 ]]; then
+    echo "  [dry-run] build→$staging(archive+node_modules+dist 从 staging pinned 源构建+VERSION+.complete)→ mv -T→$reldir" >&2
+    BUILT_RELEASE="$reldir"; return 0
+  fi
+  # 工作树非干净只是提示(archive 用 full_sha 已 pin,uncommitted 被忽略;避免"以为部署了未提交改动")
+  assert_clean_source_tree
+  # 远端建到 staging;任一步失败 → 清 staging + return 1(半成品不落 rel-*)
+  ssh "$KL_HOST" "mkdir -p '$staging'" || { echo "✗ mkdir staging 失败" >&2; return 1; }
+  if ! git -C "$REPO_ROOT" archive --format=tar "$full_sha" | ssh "$KL_HOST" "tar -x -C '$staging'"; then
+    echo "✗ git archive/解包失败" >&2; ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null; return 1; fi
+  # node_modules:lock 未变且当前有 → 硬链复用;否则空目录 npm ci(不碰旧 release 硬链)
+  if ! ssh "$KL_HOST" "set -e
+      if [ -n '$cur' ] && [ -d '$cur/node_modules' ] && cmp -s '$staging/package-lock.json' '$cur/package-lock.json' 2>/dev/null; then
+        cp -al '$cur/node_modules' '$staging/node_modules'; echo '  lock 未变 → 硬链复用 node_modules' >&2
+      else
+        echo '  lock 变化/无基线 → npm ci' >&2; cd '$staging' && npm ci --no-audit --no-fund >/dev/null 2>&1
+      fi"; then echo "✗ node_modules 准备失败" >&2; ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null; return 1; fi
+  # dist:--with-dist 时**在 staging(archive pinned 源)上 vite build**(R2#2:不从共用工作树构建,
+  # 彻底消 dist 与 archive 不同源);否则硬链继承当前 release 的 dist(前端未变)。两路 DIST_BUILD_ID
+  # 都从 staging 读。
+  if [[ "$WITH_DIST" == 1 ]]; then
+    echo "── vite build @ staging(pinned $short_sha,不读共用工作树)──" >&2
+    if ! ssh "$KL_HOST" "set -e; cd '$staging/packages/web-react' && npx vite build >/dev/null 2>&1"; then
+      echo "✗ staging vite build 失败" >&2; ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null; return 1; fi
+  else
+    if ! ssh "$KL_HOST" "set -e
+        [ -n '$cur' ] && [ -d '$cur/packages/web-react/dist' ] || { echo '✗ 当前 release 无 dist 可继承' >&2; exit 1; }
+        mkdir -p '$staging/packages/web-react'; rm -rf '$staging/packages/web-react/dist'; cp -al '$cur/packages/web-react/dist' '$staging/packages/web-react/dist'"; then
+      echo "✗ dist 继承失败" >&2; ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null; return 1; fi
+  fi
+  DIST_BUILD_ID="$(ssh "$KL_HOST" "grep -o 'name=\"oc-build\" content=\"[0-9a-f]\\{8,32\\}\"' '$staging/packages/web-react/dist/index.html' 2>/dev/null | grep -o '[0-9a-f]\\{8,32\\}' | head -1" 2>/dev/null || true)"
+  [[ -n "$DIST_BUILD_ID" ]] || { echo "✗ staging dist 缺 oc-build meta" >&2; ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null; return 1; }
+  # VERSION(钉死 short_sha)+ 完整性校验 + .complete + 原子改名 staging→rel-*
+  if ! write_version "$staging" "$short_sha" >&2; then ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null; return 1; fi
+  if ! ssh "$KL_HOST" "set -e
+      test -f '$staging/package.json' && test -d '$staging/node_modules' && test -f '$staging/VERSION.json' && test -f '$staging/packages/web-react/dist/index.html'
+      printf '{\"sha\":\"$short_sha\",\"builtAt\":\"$ts\"}\n' > '$staging/.complete'
+      mv -T '$staging' '$reldir'"; then
+    echo "✗ 完整性校验/原子改名失败" >&2; ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null; return 1; fi
+  BUILT_RELEASE="$reldir"
+  echo "  ✓ release 就绪(带 .complete):$reldir" >&2
+}
+
+# 原子激活 release:只认带 .complete 的目录;翻转**前**先原子写 prev(rollback 元数据与翻转
+# 不脱域,Codex P1#7);唯一临时 symlink(防前次残留 .newlink 阻断);mv -T 原子翻转 → restart。
+activate_release() {
+  local reldir="$1" prev tmplink
+  if [[ "$DRY" == 1 ]]; then
+    echo "  [dry-run] 校验 $reldir/.complete;写 .prev-release;ln -s + mv -T 原子翻转 $REMOTE_SRC;systemctl restart $V5_UNIT"
+    return 0
+  fi
+  ssh "$KL_HOST" "test -f '$reldir/.complete'" || { echo "✗ 目标 release 无 .complete 标记,拒绝激活: $reldir" >&2; exit 1; }
+  prev="$(bg_current_release)"
+  tmplink="$REMOTE_SRC.newlink.$$"
+  # 翻转前先落 prev(原子);再翻转(ln -sfn 非原子,故临时链+mv -T)
+  ssh "$KL_HOST" "set -Eeuo pipefail
+    printf '%s\n' '$prev' > '$RELEASES_ROOT/.prev-release.tmp' && mv -f '$RELEASES_ROOT/.prev-release.tmp' '$RELEASES_ROOT/.prev-release'
+    rm -f '$tmplink'
+    ln -s '$reldir' '$tmplink'
+    mv -T '$tmplink' '$REMOTE_SRC'" || { echo "✗ symlink 翻转失败(live 未改)" >&2; exit 1; }
+  echo "  ✓ 原子翻转:$REMOTE_SRC → $reldir(旧=$prev)"
+  echo "── restart openclaude-v5(仅 v5,绝不碰 v3)──"
+  ssh "$KL_HOST" "systemctl restart '$V5_UNIT'" || { echo "✗ restart 失败——symlink 已指新 release,须人工 restart/回切" >&2; exit 1; }
+  run "sleep 4"
+}
+
+# GC:保留最近 RELEASES_KEEP 个 release,删更老;**绝不删** current / .prev-release / master 与
+# egress 进程 cwd 指向的(egress 默认不随 deploy 重启,cwd 可能停在更老 release,Codex P1#5)。
+# 只删带 .complete 的正式 rel-*;顺带清超 1 天的孤儿 .staging-*。
+gc_releases() {
+  [[ "$DRY" == 1 ]] && { echo "  [dry-run] GC:保留最近 $RELEASES_KEEP 个,护 current/prev/master+egress cwd"; return 0; }
+  ssh "$KL_HOST" "set -e
+    cur=\$(readlink -f '$REMOTE_SRC' 2>/dev/null || true)
+    prev=\$(readlink -f \"\$(cat '$RELEASES_ROOT/.prev-release' 2>/dev/null || true)\" 2>/dev/null || true)
+    mpid=\$(systemctl show -p MainPID --value '$V5_UNIT' 2>/dev/null || echo 0)
+    epid=\$(systemctl show -p MainPID --value openclaude-v5-egress 2>/dev/null || echo 0)
+    mcwd=\$([ \"\${mpid:-0}\" -gt 0 ] && readlink -f /proc/\$mpid/cwd 2>/dev/null || true)
+    ecwd=\$([ \"\${epid:-0}\" -gt 0 ] && readlink -f /proc/\$epid/cwd 2>/dev/null || true)
+    ls -1dt '$RELEASES_ROOT'/rel-* 2>/dev/null | tail -n +$((RELEASES_KEEP+1)) | while read -r d; do
+      rd=\$(readlink -f \"\$d\" 2>/dev/null || echo \"\$d\")
+      case \"\$rd\" in \"\$cur\"|\"\$prev\"|\"\$mcwd\"|\"\$ecwd\") continue ;; esac
+      [ -f \"\$d/.complete\" ] || continue
+      rm -rf \"\$d\"
+    done
+    find '$RELEASES_ROOT' -maxdepth 1 -name '.staging-*' -type d -mtime +1 -exec rm -rf {} + 2>/dev/null || true" 2>&1 | sed 's/^/  /' || true
+}
+
+# 一次性迁移:实目录 $REMOTE_SRC → symlink 布局(须在无并发部署的受控窗口跑)。
+migrate_to_bluegreen() {
+  echo "══ v5 迁移蓝绿 symlink 布局 on $KL_HOST ══"
+  if [[ "$DRY" == 1 ]]; then
+    echo "  [dry-run] 已 symlink 则跳过;否则 stop→mv 实目录→唯一 rel-<sha>-<ts>-migrated(写 .complete)→ln -s→start→smoke(带 ERR 恢复 trap)"
+    return 0
+  fi
+  # R2#3:幂等跳过必须是**合法**蓝绿布局(指向 rel-* 且带 .complete),不能见 symlink 就当已迁移
+  if ssh "$KL_HOST" "test -L '$REMOTE_SRC'"; then
+    if ssh "$KL_HOST" "set -e; t=\$(readlink -f '$REMOTE_SRC'); case \"\$t\" in '$RELEASES_ROOT'/rel-*) test -f \"\$t/.complete\" ;; *) exit 1 ;; esac"; then
+      echo "  ✓ 已是合法蓝绿布局,幂等跳过"; return 0
+    fi
+    echo "✗ $REMOTE_SRC 是 symlink 但非合法蓝绿布局(悬垂/非 rel-*/缺 .complete),拒绝自动迁移,人工处置" >&2; return 1
+  fi
+  local sha ts reldir
+  sha="$(ssh "$KL_HOST" "jq -r .commit '$REMOTE_SRC/VERSION.json' 2>/dev/null || echo unknown")"
+  ts="$(date -u +%Y%m%d-%H%M%S)"
+  reldir="$RELEASES_ROOT/rel-$sha-$ts-migrated"
+  echo "── 停机 → 实目录搬入 $reldir → 写 .complete → symlink → 启动(一次性,几秒停机;ERR 自动恢复贯穿 start)──"
+  # ERR trap 覆盖到 start 成功之后才 `trap - ERR`(R2#3:start 失败也回滚);restore 处理已建 symlink 状态
+  ssh "$KL_HOST" "set -Eeuo pipefail
+    mkdir -p '$RELEASES_ROOT'
+    test ! -e '$reldir'                    # 唯一目标必须不存在(防 mv 进已存在目录内部)
+    systemctl stop '$V5_UNIT'
+    moved=0; linked=0
+    restore() {
+      [ \"\$linked\" = 1 ] && rm -f '$REMOTE_SRC'
+      if [ \"\$moved\" = 1 ] && [ ! -e '$REMOTE_SRC' ] && [ -d '$reldir' ]; then mv '$reldir' '$REMOTE_SRC' || true; fi
+      systemctl start '$V5_UNIT' || true; echo 'FATAL: 迁移失败,已尽力恢复实目录并启动旧服务' >&2; }
+    trap restore ERR
+    mv '$REMOTE_SRC' '$reldir'; moved=1
+    printf '{\"sha\":\"$sha\",\"builtAt\":\"$ts\",\"migrated\":true}\n' > '$reldir/.complete'
+    ln -s '$reldir' '$REMOTE_SRC'; linked=1
+    systemctl start '$V5_UNIT'
+    trap - ERR" || { echo "✗ 迁移执行失败(见上 FATAL 恢复日志)" >&2; return 1; }
+  run "sleep 4"
+  if ! smoke; then
+    echo "✗ 迁移后 smoke 失败,自动回切实目录布局并重启旧服务" >&2
+    ssh "$KL_HOST" "set -e; systemctl stop '$V5_UNIT' || true
+      [ -L '$REMOTE_SRC' ] && rm -f '$REMOTE_SRC'
+      if [ ! -e '$REMOTE_SRC' ] && [ -d '$reldir' ]; then mv '$reldir' '$REMOTE_SRC'; fi
+      systemctl start '$V5_UNIT'" || echo "✗ 自动回切也失败,人工核查 $reldir 与 $REMOTE_SRC" >&2
+    return 1
+  fi
+  echo "✓ 蓝绿布局迁移完成:$REMOTE_SRC → $reldir"
 }
 
 assert_v5_master_inactive() {
@@ -755,21 +949,18 @@ bootstrap() {
 
 # ───────────────────────── deploy:增量 ─────────────────────────
 deploy() {
-  echo "══ v5 deploy on $KL_HOST ══"
+  echo "══ v5 deploy on $KL_HOST(蓝绿:release 目录 + 原子 symlink)══"
   echo "── 守卫:overrides 不得含 REMOVE_KEYS ──"
   assert_overrides_no_remove_keys
-  snapshot_and_sync_source
+  assert_bluegreen_layout
   echo "── 部署顺序守卫:校验 runtime_channel 列(0088)已应用 ──"
   assert_runtime_channel_column
-  # --with-dist:dist 在 restart **之前**全部就位 → 代码+前端两生效面共享**一次**重启。
-  # 背景(2026-07-10 事故放大器):deploy 后紧跟 --dist 的成对重启(间隔 30-60s)会把
-  # 「刚被第一次重启打断、自动续写刚跑起来」的 turn 第二次掐死。禁止再回到两段式。
-  if [[ "$WITH_DIST" == 1 ]]; then
-    build_and_sync_dist
-  fi
-  echo "── restart openclaude-v5(仅 v5,绝不碰 v3)──"
-  sshk "systemctl restart $V5_UNIT"
-  run "sleep 4"
+  # build_release:从锁定 sha 的 git archive 建不可变 release(--with-dist 时 vite build 进
+  # reldir,代码+前端同一 release 共享一次翻转+重启;无 --with-dist 则硬链继承当前 dist)。
+  # 背景(2026-07-10 事故):deploy 后紧跟 --dist 的成对重启会把刚续写的 turn 二次掐死 →
+  # 蓝绿下天然一次翻转一次重启,不会再成对重启。
+  build_release || { echo "✗ build_release 失败,未激活任何 release(live 未改)" >&2; exit 1; }
+  activate_release "$BUILT_RELEASE"   # 原子 symlink 翻转 + restart(master 只从完整不可变 release 启动)
   if [[ "$RESTART_EGRESS" == 1 ]]; then
     echo "── restart openclaude-v5-egress(显式 --egress;SIGTERM drain 在飞流)──"
     sshk "systemctl restart openclaude-v5-egress"
@@ -779,7 +970,8 @@ deploy() {
   if [[ "$WITH_DIST" == 1 ]]; then
     dist_handshake_smoke
   fi
-  echo "✓ deploy 完成。"
+  gc_releases
+  echo "✓ deploy 完成(release=$BUILT_RELEASE)。"
 }
 
 # ───────────────────────── offline recycle:原子切换前停机清场 ───────────────
@@ -944,25 +1136,34 @@ activate_staged() {
 #      oc-build meta 必须等于本地构建值,fail-closed。
 # 回滚:index.html 回滚 = checkout 旧源码重跑 --dist;旧资产 14 天窗口内一直在线。
 deploy_dist() {
-  echo "══ v5 dist deploy(前端生效面)on $KL_HOST ══"
-  build_and_sync_dist
-  echo "── restart openclaude-v5(dist 生效面必重启,版本握手依赖此纪律)──"
-  sshk "systemctl restart $V5_UNIT"
-  run "sleep 4"
+  echo "══ v5 dist deploy(前端生效面,蓝绿)on $KL_HOST ══"
+  assert_bluegreen_layout
+  WITH_DIST=1   # 蓝绿:前端变更=建含新 dist 的完整 release + 原子翻转(同 deploy,一次重启)
+  build_release || { echo "✗ build_release 失败,未激活(live 未改)" >&2; exit 1; }
+  activate_release "$BUILT_RELEASE"
   [[ "$DRY" == 1 ]] || smoke
   dist_handshake_smoke
-  echo "✓ dist deploy 完成。"
+  gc_releases
+  echo "✓ dist deploy 完成(release=$BUILT_RELEASE)。"
 }
 
 # ───────────────────────── rollback ─────────────────────────
 rollback() {
-  echo "══ v5 rollback ← .prev.$ROLLBACK_N ══"
-  sshk "test -d '$REMOTE_SRC.prev.$ROLLBACK_N' || { echo '✗ 快照 .prev.$ROLLBACK_N 不存在' >&2; exit 1; }"
-  sshk "rsync -a --delete ${RSYNC_EXCLUDES[*]} '$REMOTE_SRC.prev.$ROLLBACK_N/' '$REMOTE_SRC/'"
-  sshk "systemctl restart $V5_UNIT"
-  run "sleep 4"
-  [[ "$DRY" == 1 ]] || smoke
-  echo "✓ rollback 完成。"
+  echo "══ v5 rollback(蓝绿:symlink 回切,秒级)══"
+  assert_bluegreen_layout
+  # N=1 → .prev-release 记录的上一个;N>1 → 按 mtime 第 N 个更老的 release
+  local target
+  if [[ "$ROLLBACK_N" == 1 ]]; then
+    target="$(ssh "$KL_HOST" "cat '$RELEASES_ROOT/.prev-release' 2>/dev/null || true")"
+  else
+    target="$(ssh "$KL_HOST" "ls -1dt '$RELEASES_ROOT'/rel-* 2>/dev/null | sed -n '$((ROLLBACK_N+1))p'")"
+  fi
+  if [[ "$DRY" == 1 ]]; then echo "  [dry-run] rollback → ${target:-<第$ROLLBACK_N个更老release>}"; activate_release "${target:-<dry>}"; return 0; fi
+  [[ -n "$target" ]] || { echo "✗ 找不到回滚目标(N=$ROLLBACK_N;.prev-release 或第 N 个更老 release 不存在)" >&2; exit 1; }
+  ssh "$KL_HOST" "test -d '$target'" || { echo "✗ 回滚目标目录不存在: $target" >&2; exit 1; }
+  activate_release "$target"
+  smoke
+  echo "✓ rollback 完成 → $target。"
 }
 
 # ── 全局部署互斥(硬机制,2026-07-10 boss 指令:多会话并发改 v5 不靠记忆自觉)──
@@ -984,12 +1185,13 @@ fi
 
 case "$MODE" in
   bootstrap) bootstrap ;;
-  deploy)    deploy ;;
+  migrate-bluegreen) migrate_to_bluegreen ;;
   smoke)     smoke ;;
+  deploy)    deploy ;;
   dist)      deploy_dist ;;
-  prepare-offline-cutover) prepare_offline_cutover ;;
-  offline-recycle) offline_recycle ;;
-  stage)     stage ;;
-  activate-staged) activate_staged ;;
+  prepare-offline-cutover) assert_not_bluegreen_for_cutover; prepare_offline_cutover ;;
+  offline-recycle) assert_not_bluegreen_for_cutover; offline_recycle ;;
+  stage)     assert_not_bluegreen_for_cutover; stage ;;
+  activate-staged) assert_not_bluegreen_for_cutover; activate_staged ;;
   rollback)  rollback ;;
 esac
