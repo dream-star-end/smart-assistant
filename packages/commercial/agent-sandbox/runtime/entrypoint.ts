@@ -23,6 +23,7 @@
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import {
+  chownSync,
   copyFileSync,
   cpSync,
   existsSync,
@@ -30,6 +31,7 @@ import {
   mkdirSync,
   readFileSync,
   readdirSync,
+  statSync,
   symlinkSync,
   unlinkSync,
   writeFileSync,
@@ -455,6 +457,30 @@ try {
 // 商用 v3 gateway 通过 docker bridge 直连容器 18789 走 WS,不依赖此 token。
 const ocConfigDir = "/home/agent/.openclaude";
 const ocConfigPath = join(ocConfigDir, "openclaude.json");
+
+// mmx 等"容器→master 内桥"平台 CLI 的凭据文件。为什么不用 env:codex 引擎路径上这两个值
+// 会被双重清洗剥掉 —— gateway buildCodexEnv 剥全部 OPENCLAUDE_* 前缀(遥测封堵,不可破),
+// codex shell_environment_policy 默认又剥 *TOKEN* 形名字;经 argv `-c` 回注则违反
+// 「容器 token 不进 argv/日志」不变量(codexLaunchOverrides.test 有防回归断言)。
+// 文件通道三个不变量全保:scrub 不变、argv 无秘密、CCB ambient env 路径原样(文件只是回退)。
+// token 随容器生命周期轮换 → 每次 boot 无条件覆写;同容器 trust domain(模型本就持有本容器
+// bearer,与 CCB env 等价),0600 + 对齐 volume 属主仅防误读。消费方:oc-minimax.py(mmx)。
+const containerAuthPath = join(ocConfigDir, "container-auth.json");
+try {
+  const mmxMasterBase = (process.env.OPENCLAUDE_V3_MASTER_BASE_URL || "").trim();
+  const mmxContainerToken = (process.env.OPENCLAUDE_V3_CONTAINER_TOKEN || "").trim();
+  if (mmxMasterBase && mmxContainerToken) {
+    writeFileSync(
+      containerAuthPath,
+      `${JSON.stringify({ masterBaseUrl: mmxMasterBase, containerToken: mmxContainerToken })}\n`,
+      { mode: 0o600 },
+    );
+    const dirStat = statSync(ocConfigDir);
+    chownSync(containerAuthPath, dirStat.uid, dirStat.gid);
+  }
+} catch (err) {
+  console.warn("[entrypoint] container-auth.json write failed(mmx 将回退 env,codex 路径可能不可用):", err);
+}
 
 try {
   mkdirSync(ocConfigDir, { recursive: true });
