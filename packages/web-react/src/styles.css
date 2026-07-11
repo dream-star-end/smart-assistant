@@ -207,6 +207,20 @@ body {
 @keyframes spin { to { transform: rotate(360deg); } }
 .spin { animation: spin 0.9s linear infinite; }
 
+/* ── 图片加载骨架:深色底(bg=hover token,禁纯白)+ 轻扫光 shimmer。主题自适应
+   (--hover 已随明暗切换;扫光用低透明白,明暗都读得出)。防加载前白屏 + 白闪。
+   prefers-reduced-motion 下由上面的全局规则把动画时长压到 0.01ms(静止深色底)。 ── */
+.oc-img-skeleton { position: relative; overflow: hidden; background: var(--hover); }
+.oc-img-skeleton::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  transform: translateX(-100%);
+  background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.08), transparent);
+  animation: oc-shimmer 1.4s ease-in-out infinite;
+}
+@keyframes oc-shimmer { 100% { transform: translateX(100%); } }
+
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; }
 }

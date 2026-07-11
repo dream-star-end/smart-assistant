@@ -6,7 +6,7 @@
  *   ③ prompt = 编号指令文本
  * 走现有 imageEdit(annotated)帧 → 计费不动(50 积分/张)。
  */
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { ArrowUp, Check, Trash2, X } from 'lucide-react'
 import { cn } from '../lib/utils'
 import { normalizeImageSourceForGateway } from './ImageAnnotationEditor'
@@ -68,6 +68,10 @@ export function ImageCommentMode({
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [loadError, setLoadError] = useState(false)
+  // 展示态 src:重试时重签后更新它,让 <img> 真正换新 URL 重载(此前重试只重签 provider
+  // 缓存却不换 img src,过期裂图点重试无效)。
+  const [displaySrc, setDisplaySrc] = useState(src)
+  useEffect(() => setDisplaySrc(src), [src])
 
   const editing = draft != null || editingId != null
 
@@ -128,7 +132,7 @@ export function ImageCommentMode({
     let revoke: (() => void) | null = null
     try {
       const url = (await resolveSrc()) ?? src
-      const loaded = await loadImageBytes(url)
+      const loaded = await loadImageBytes(url, resolveSrc)
       revoke = loaded.revoke
       const { blob, image, naturalWidth, naturalHeight } = loaded
       const { canvas: guideCanvas, width, height } = drawDisplayCanvas(image, naturalWidth, naturalHeight)
@@ -214,7 +218,7 @@ export function ImageCommentMode({
               type="button"
               onClick={() => {
                 setLoadError(false)
-                void resolveSrc({ forceResign: true })
+                void resolveSrc({ forceResign: true }).then((u) => u && setDisplaySrc(u))
               }}
               className="min-h-10 rounded-full bg-white/10 px-4 text-sm text-white hover:bg-white/20"
             >
@@ -224,7 +228,7 @@ export function ImageCommentMode({
         ) : (
           <div className="relative inline-block max-h-full max-w-full">
             <img
-              src={src}
+              src={displaySrc}
               alt={alt}
               onError={() => setLoadError(true)}
               draggable={false}

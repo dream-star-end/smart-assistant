@@ -1500,6 +1500,17 @@ export function createCommercialHandler(
           // 时为 undefined,containerFileProxy 自动走本地分支);tunnelDial / getHostById /
           // capabilityProbe.tunnelFetchHealthz 三件套用 compute-pool 默认实现。
           const selfHostIdForProxy = deps.v3Supervisor!.selfHostId
+          // `/api/media/<digest>.<ext>` 是**内容寻址**(文件名即内容哈希)→ 字节不可变,
+          // 可长缓存,消除聊天回滚/重渲反复全尺寸重拉(需求 §2「图片加载慢」根因之一)。
+          // private:每浏览器各缓存(内容跨用户可去重但缓存不共享,守隐私)。仅 200/206 覆盖,
+          // 4xx/5xx 维持 no-store(不缓存错误响应)。`/api/file`(路径寻址、可变)不覆盖 → no-store。
+          const isImmutableMedia = /^\/api\/media\/.+$/.test(path)
+          const responseCacheControlOverride = isImmutableMedia
+            ? (upstreamStatus: number): string | null =>
+                upstreamStatus === 200 || upstreamStatus === 206
+                  ? 'private, max-age=300, immutable'
+                  : null
+            : undefined
           await containerFileProxy(
             req,
             res,
@@ -1510,6 +1521,7 @@ export function createCommercialHandler(
               selfHostId: selfHostIdForProxy,
               getHostById: computePoolGetHostById,
               tunnelDial: defaultTunnelDial,
+              responseCacheControlOverride,
               capabilityProbe: {
                 selfHostId: selfHostIdForProxy,
                 tunnelFetchHealthz: (hostId, cid, timeoutMs) =>

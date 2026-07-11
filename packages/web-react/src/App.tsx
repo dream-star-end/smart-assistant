@@ -518,55 +518,23 @@ export function App() {
     [send, toast, uploadMedia],
   );
 
-  // 生成图移除（需求 A/§10「移除」动作）：client 侧按签名路径隐藏该图，本地持久化
-  // （localStorage per-user，隐私隔离）、**不上服务端**。ImageViewer（Agent-V）通过
-  // ImageEditActions.isMediaHidden 消费此集合隐藏渲染；换账号/登出天然隔离（key 含 userId）。
-  const hiddenMediaKey = user ? `oc_v5_hidden_media:${user.id}` : null;
-  const [hiddenMedia, setHiddenMedia] = useState<Set<string>>(() => new Set());
-  useEffect(() => {
-    // 函数式 setState + 空↔空 bail-out（返回 prev → React 跳过重渲）：boot（key=null）与
-    // 无隐藏记录（绝大多数用户）两条路径都不产生额外全树重渲——此前无条件 set 新 Set 实例,
-    // boot 期多出的渲染轮曾把 App.test 深链/URL 镜像等时序敏感用例推过 findByRole 超时。
-    const bailIfStillEmpty = (prev: Set<string>) => (prev.size === 0 ? prev : new Set<string>());
-    if (!hiddenMediaKey) {
-      setHiddenMedia(bailIfStillEmpty);
-      return;
-    }
-    try {
-      const raw = localStorage.getItem(hiddenMediaKey);
-      const arr = raw ? JSON.parse(raw) : [];
-      const parsed: string[] = Array.isArray(arr) ? arr.filter((x): x is string => typeof x === "string") : [];
-      setHiddenMedia((prev) => (prev.size === 0 && parsed.length === 0 ? prev : new Set(parsed)));
-    } catch {
-      setHiddenMedia(bailIfStillEmpty);
-    }
-  }, [hiddenMediaKey]);
-  const onRemoveImage = useCallback(
-    (signPath: string) => {
-      if (!signPath) return;
-      setHiddenMedia((prev) => {
-        if (prev.has(signPath)) return prev;
-        const next = new Set(prev);
-        next.add(signPath);
-        if (hiddenMediaKey) {
-          try {
-            localStorage.setItem(hiddenMediaKey, JSON.stringify([...next]));
-          } catch {
-            /* 隐私模式/禁存储：仅内存隐藏，best-effort */
-          }
-        }
-        return next;
-      });
-    },
-    [hiddenMediaKey],
-  );
+  // 图片编辑可用性(image2 门控):image2 特性开放 + 当前模型是 GPT 引擎时才可编辑。
+  // **单一权威**:注入 submitImageEdit / annotate 与否即"可否编辑"的唯一判定,聊天缩略图
+  // 「编辑」浮钮、全屏查看器动作、composer 附件编辑按钮全部据此显隐/禁用。
+  const image2Available =
+    !demo && publicCfg?.featureImage2 === true && isCodexEngineModel(modelId ?? "");
+  const image2UnavailableReason = image2Available
+    ? undefined
+    : publicCfg?.featureImage2 !== true
+      ? "Image 2 暂未开放或正在维护"
+      : "当前模型不支持 Image 2 圈选修改，请切换到 GPT 模型";
   const imageEditActions = useMemo<ImageEditActions>(
     () => ({
-      submitImageEdit,
-      onRemoveImage,
-      isMediaHidden: (p: string) => hiddenMedia.has(p),
+      submitImageEdit: image2Available ? submitImageEdit : undefined,
+      annotate: image2Available ? setImageAnnotationSource : undefined,
+      annotateUnavailableReason: image2UnavailableReason,
     }),
-    [submitImageEdit, onRemoveImage, hiddenMedia],
+    [image2Available, submitImageEdit, image2UnavailableReason],
   );
 
   // 会话物化:GitHub 绑定是 per-session,新会话未发首条消息前 activeId 为空 → 绑定确定钮
@@ -1382,14 +1350,10 @@ export function App() {
         ? undefined
         : openOrg,
   };
-  const image2Available =
-    !demo && publicCfg?.featureImage2 === true && isCodexEngineModel(modelId ?? "");
-
   return (
     <MediaSignProvider
       sign={demo ? null : signMedia}
       authKey={user?.id ?? "anon"}
-      onAnnotate={image2Available ? setImageAnnotationSource : undefined}
     >
     <ToolCardActionsContext.Provider value={toolActions}>
     <ChatInteractionContext.Provider value={chatInteraction}>
@@ -1557,14 +1521,6 @@ export function App() {
             prefill={composerPrefill}
             repoSelection={demo ? null : repo.selection}
             onOpenRepo={demo ? undefined : openRepo}
-            onAnnotateImage={image2Available ? setImageAnnotationSource : undefined}
-            image2UnavailableReason={
-              image2Available
-                ? undefined
-                : publicCfg?.featureImage2 !== true
-                  ? "Image 2 暂未开放或正在维护"
-                  : "当前模型不支持 Image 2 圈选修改，请切换到 GPT 模型"
-            }
           />
         </div>
       </main>

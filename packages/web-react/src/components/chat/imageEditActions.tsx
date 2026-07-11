@@ -1,14 +1,19 @@
 /**
- * 图片编辑动作 context（需求 B/§5 的「进主对话」+「移除」下传通道）。
+ * 图片编辑动作 context —— **图片编辑入口的单一权威**。
  *
  * 注入哲学同 ToolCardActions / ChatInteraction：**有 provider 才可用，无则降级**。
- * 由 App（provider 侧，Agent-P 所有）注入 `submitImageEdit` + `onRemoveImage`；由
- * ImageViewer / 全屏编辑器（consumer 侧，Agent-V 所有）消费：编辑/评论/调整大小三态
- * 提交都走 `submitImageEdit`（App 统一 handler 泛化 → send() → 乐观 user 行 + 生成占位卡），
- * 「移除」走 `onRemoveImage`（client 侧隐藏该图，本地持久化、不上服务端）。
+ * 由 App（provider 侧）注入；consumer 侧统一从这里取：
+ *   - `submitImageEdit`：编辑/评论/调整大小三态提交 → App 统一 handler 泛化 → send() →
+ *     乐观 user 行 + 生成占位卡。**其存在与否 = 「当前是否可编辑图片」的唯一判定**
+ *     (image2 开放 + 当前模型是 GPT 引擎时才注入)，聊天缩略图「编辑」浮钮、全屏查看器
+ *     底部编辑/评论/调整大小动作都据此显隐/禁用,不再各自平行判定。
+ *   - `annotate`：为一张**本地/对话框附件图**打开精确圈选编辑器(composer 用)。与
+ *     submitImageEdit 同源(同一 image2 门控),消除此前 composer `onAnnotateImage` prop
+ *     与聊天图 MediaSignProvider.onAnnotate 两套平行机制。
+ *   - `annotateUnavailableReason`：不可编辑时给禁用 UI 的人类可读原因(模型门控文案)。
  *
- * `ImageEditSubmit` 契约的单一权威在本文件（image-ux 实施计划 §4 定死）；Agent-V 的
- * ImageViewer 从这里 re-export 给 comment/resize 模式复用。
+ * `ImageEditSubmit` 契约的单一权威在本文件（image-ux 实施计划 §4 定死）；ImageViewer
+ * 从这里 re-export 给 comment/resize 模式复用。
  */
 import { createContext, useContext } from "react";
 import type { InboundMessage } from "../../lib/chat/frames";
@@ -49,12 +54,15 @@ export type ImageEditSubmit =
     };
 
 export type ImageEditActions = {
-  /** 编辑/评论/调整大小提交 → 进主对话生成（乐观 user 行 + 生成占位卡）。 */
+  /**
+   * 编辑/评论/调整大小提交 → 进主对话生成（乐观 user 行 + 生成占位卡）。
+   * 存在与否即「当前可否编辑图片」的单一判定（image2 门控），消费方据此显隐/禁用编辑入口。
+   */
   submitImageEdit?: (value: ImageEditSubmit) => void | Promise<void>;
-  /** 移除生成图（client 侧隐藏，需确认由调用方 UI 负责）。 */
-  onRemoveImage?: (signPath: string) => void;
-  /** 该图是否已被本地移除（隐藏渲染的单一判定；set 变化时 provider value 换新触发重渲）。 */
-  isMediaHidden?: (signPath: string) => boolean;
+  /** 为一张本地/对话框附件图打开精确圈选编辑器（composer 用；与 submitImageEdit 同门控）。 */
+  annotate?: (source: { url: string; name?: string }) => void;
+  /** 不可编辑时的人类可读原因（模型门控文案），供禁用入口的 title/tooltip 使用。 */
+  annotateUnavailableReason?: string;
 };
 
 export const ImageEditActionsContext = createContext<ImageEditActions>({});

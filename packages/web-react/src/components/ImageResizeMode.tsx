@@ -3,7 +3,7 @@
  * (需求 B),帧标 mode:'resize' + targetAspect —— P 侧映射为 gateway outpaint 分支重构图。
  * 计费同 50 积分/张(仍走既有 reserve/settle,不新开口径)。
  */
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { X } from 'lucide-react'
 import { cn } from '../lib/utils'
 import { normalizeImageSourceForGateway } from './ImageAnnotationEditor'
@@ -67,6 +67,9 @@ export function ImageResizeMode({
   const [busy, setBusy] = useState<ImageAspectRatio | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [loadError, setLoadError] = useState(false)
+  // 展示态 src:重试时重签后更新它,让 <img> 真正换新 URL 重载(见 ImageCommentMode 同款说明)。
+  const [displaySrc, setDisplaySrc] = useState(src)
+  useEffect(() => setDisplaySrc(src), [src])
 
   const choose = async (ratio: RatioOption) => {
     if (!canSubmit || busy) return
@@ -75,7 +78,7 @@ export function ImageResizeMode({
     let revoke: (() => void) | null = null
     try {
       const url = (await resolveSrc()) ?? src
-      const loaded = await loadImageBytes(url)
+      const loaded = await loadImageBytes(url, resolveSrc)
       revoke = loaded.revoke
       const { blob, image, naturalWidth, naturalHeight } = loaded
       const { canvas } = drawDisplayCanvas(image, naturalWidth, naturalHeight)
@@ -127,7 +130,7 @@ export function ImageResizeMode({
               type="button"
               onClick={() => {
                 setLoadError(false)
-                void resolveSrc({ forceResign: true })
+                void resolveSrc({ forceResign: true }).then((u) => u && setDisplaySrc(u))
               }}
               className="min-h-10 rounded-full bg-white/10 px-4 text-sm text-white hover:bg-white/20"
             >
@@ -136,7 +139,7 @@ export function ImageResizeMode({
           </div>
         ) : (
           <img
-            src={src}
+            src={displaySrc}
             alt={alt}
             onError={() => setLoadError(true)}
             draggable={false}
