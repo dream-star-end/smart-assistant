@@ -58,6 +58,23 @@ oc-market publish-skill --slug my-skill --name "学术翻译" --version 1.0.0 \
   --tags 翻译,学术 --intro-file /tmp/intro.md --body-file /tmp/skill.md
 ```
 
+发布**多文件技能**(正文之外还有渐进加载文件/评测用例/脚本时,加 `--bundle-dir`):
+```bash
+# 目录布局(只认这四个子目录,其他一律忽略):
+#   /tmp/my-skill/references/…   正文按需引用的深度资料(SKILL.md 里写相对路径,如 references/a.md)
+#   /tmp/my-skill/assets/…       模板等文本资产
+#   /tmp/my-skill/evals/…        评测用例(evals/evals.json 须过格式校验)
+#   /tmp/my-skill/scripts/…      脚本(会过危险模式扫描,毁灭性/远程管道执行直接拒)
+oc-market publish-skill --slug my-skill --name "学术翻译" --version 1.8.0 \
+  --description "…" --category research-academic --use-cases "…" \
+  --body-file /tmp/my-skill/SKILL-body.md \
+  --bundle-dir /tmp/my-skill \
+  --benchmark-file /tmp/bench.json   # 选填,自报评测:{"withPassRate":0.9,"withoutPassRate":0.4,"cases":5}
+```
+- **限额**:附属文件 ≤20 个、单文件 ≤64KB、总量 ≤256KB;超限本地预检会直接列出问题。
+- 安装侧会按原路径落盘,所以正文里的 `references/xxx.md` 相对引用装好后依然有效——多文件技能**不需要**为了发布压成单文件。
+- `--visibility org` 可发"仅本组织可见"(要求用户是组织成员;默认公开)。
+
 发布**智能体**(人设写到文件;toolsets 只能取平台白名单 core/browser/research/web_context;model 取当前可用模型;skillDeps 必须是已上架技能的 slug;**category/use-cases 同样必填**):
 ```bash
 oc-market publish-agent --slug my-agent --name "写作助手" --version 1.0.0 \
