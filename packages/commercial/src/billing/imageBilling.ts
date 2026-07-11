@@ -61,8 +61,13 @@ export async function reserveImageUsage(pool: Pool, args: {
   containerId: number | null
   requestId: string
   jobId?: string | null
-  operation: 'generation' | 'edit' | 'annotated_edit'
+  operation: 'generation' | 'edit' | 'annotated_edit' | 'native_image'
+  /** Number of output images (native_image data plane bills 50×n). Default 1;
+   * clamp [1,4] is the caller's responsibility (relay). Fixed 50/image. */
+  imageCount?: number
 }): Promise<{ alreadyCharged: boolean }> {
+  const imageCount = args.imageCount ?? 1
+  const costCredits = IMAGE2_UNIT_COST * BigInt(imageCount)
   const client = await pool.connect()
   try {
     await client.query('BEGIN')
@@ -100,23 +105,25 @@ export async function reserveImageUsage(pool: Pool, args: {
     if (BigInt(daily.rows[0]?.count ?? '0') >= 10n) throw new ImageDailyLimitError()
     const inserted = await client.query<{ already_charged: boolean }>(
       `INSERT INTO image_generation_usage_records
-         (user_id,container_id,request_id,job_id,operation,status)
-       VALUES ($1,$2,$3,$4,$5,'reserved')
+         (user_id,container_id,request_id,job_id,operation,status,image_count,cost_credits)
+       VALUES ($1,$2,$3,$4,$5,'reserved',$6,$7)
        ON CONFLICT (user_id,request_id) DO UPDATE SET
          container_id=EXCLUDED.container_id,
          job_id=EXCLUDED.job_id,
          operation=EXCLUDED.operation,
+         image_count=EXCLUDED.image_count,
+         cost_credits=EXCLUDED.cost_credits,
          status='reserved',
          error_code=NULL,
          updated_at=NOW()
        WHERE image_generation_usage_records.status='failed'
           OR (
             image_generation_usage_records.status='success'
-            AND image_generation_usage_records.operation='annotated_edit'
+            AND image_generation_usage_records.operation IN ('annotated_edit','native_image')
             AND image_generation_usage_records.response_expires_at <= NOW()
           )
        RETURNING ledger_id IS NOT NULL AS already_charged`,
-      [args.userId.toString(), args.containerId, args.requestId, args.jobId ?? null, args.operation],
+      [args.userId.toString(), args.containerId, args.requestId, args.jobId ?? null, args.operation, imageCount, costCredits.toString()],
     )
     if (inserted.rowCount !== 1) {
       const conflict = new Error('image request already exists') as Error & { code: string }
@@ -140,12 +147,15 @@ export async function settleImageCharge(
     containerId: number | null
     requestId: string
     jobId?: string | null
-    operation: 'generation' | 'edit' | 'annotated_edit'
+    operation: 'generation' | 'edit' | 'annotated_edit' | 'native_image'
+    /** Output image count (native_image bills 50×n). Must match reserve. Default 1. */
+    imageCount?: number
     responseBody: Buffer
     responseContentType?: string
   },
 ): Promise<{ ledgerId: bigint | null; balanceAfter: bigint | null; duplicate: boolean }> {
   const client = await pool.connect()
+  const chargeAmount = IMAGE2_UNIT_COST * BigInt(args.imageCount ?? 1)
   try {
     if (args.responseBody.byteLength > IMAGE_RESPONSE_CACHE_MAX_BYTES) {
       throw new Error('image response exceeds cache limit')
@@ -191,15 +201,15 @@ export async function settleImageCharge(
     const usageId = BigInt(row.rows[0]!.id)
     const spend = await spendTwoBucket(client, {
       userId: args.userId,
-      amount: IMAGE2_UNIT_COST,
+      amount: chargeAmount,
       reason: 'image_generation',
       ref: { type: 'image_generation', id: usageId.toString() },
-      memo: `gpt-image-2 ${args.operation}`,
+      memo: `gpt-image-2 ${args.operation}${(args.imageCount ?? 1) > 1 ? ` x${args.imageCount}` : ''}`,
       orgId: orgCtx?.billingEnabled ? orgCtx.orgId : undefined,
       monthlyOrgBudget: orgCtx?.billingEnabled ? orgCtx.monthlyOrgBudget : undefined,
     })
-    if (spend.clamped || spend.debited !== IMAGE2_UNIT_COST) {
-      throw new InsufficientCreditsError(spend.debited, IMAGE2_UNIT_COST)
+    if (spend.clamped || spend.debited !== chargeAmount) {
+      throw new InsufficientCreditsError(spend.debited, chargeAmount)
     }
     await client.query(
       `UPDATE image_generation_usage_records
@@ -232,7 +242,7 @@ export async function markImageUsage(
     containerId: number | null
     requestId: string
     jobId?: string | null
-    operation: 'generation' | 'edit' | 'annotated_edit'
+    operation: 'generation' | 'edit' | 'annotated_edit' | 'native_image'
     status: 'reserved' | 'failed'
     errorCode?: string
   },
