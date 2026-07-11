@@ -456,7 +456,10 @@ export const ThinkingCard = memo(
                 key={i}
                 className={cn(
                   // muted 色 + 13.5px 收敛 prose 到思考卡语境；段间轻分隔线。
-                  "text-[13.5px] leading-relaxed text-muted [&_.prose]:text-[13.5px] [&_.prose]:leading-relaxed [&_.prose]:text-inherit [&_.prose_p]:mb-1.5 [&_.prose_p:last-child]:mb-0",
+                  // strong 压平(boss 07-11:黑粗体与思考卡低调气质不搭):codex 摘要通篇是
+                  // `**标题**`,prose 默认 strong 近黑加粗喧宾夺主 → 收敛为 font-medium + 继承
+                  // muted 色,只留轻微强调;标题信息已由折叠态摘要承载,正文不需要重锤。
+                  "text-[13.5px] leading-relaxed text-muted [&_.prose]:text-[13.5px] [&_.prose]:leading-relaxed [&_.prose]:text-inherit [&_.prose_p]:mb-1.5 [&_.prose_p:last-child]:mb-0 [&_.prose_strong]:font-medium [&_.prose_strong]:text-inherit [&_.prose_h1]:text-[13.5px] [&_.prose_h2]:text-[13.5px] [&_.prose_h3]:text-[13.5px] [&_.prose_h1]:font-medium [&_.prose_h2]:font-medium [&_.prose_h3]:font-medium [&_.prose_h1]:text-inherit [&_.prose_h2]:text-inherit [&_.prose_h3]:text-inherit",
                   i > 0 && "mt-2.5 border-t border-border/60 pt-2.5",
                 )}
               >
