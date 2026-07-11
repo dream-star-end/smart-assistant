@@ -628,6 +628,9 @@ describe('Aurora v5 — P7 最小路由', () => {
     vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
 
     render(<App />)
+    // 先等 boot 自动选中最近会话乙落定(与兄弟用例同套路):否则点击与自动选中赛跑,
+    // 起点不确定(CI 实证曾停在 /s/webother02 断言超时),push/replace 分支也随之漂移。
+    await waitFor(() => expect(window.location.pathname).toBe('/s/webother02'))
     await waitFor(() => expect(screen.getByText('历史会话甲')).toBeInTheDocument())
     // 点侧栏选中甲 → URL 镜像。
     await act(async () => {
