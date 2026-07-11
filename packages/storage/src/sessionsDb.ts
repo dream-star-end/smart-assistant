@@ -15,7 +15,25 @@ import { mkdir } from 'node:fs/promises'
 import { dirname } from 'node:path'
 import { TEAM_CARD_CLIENT_DISPLAY_FIELDS, type MessageUsageDelegate } from '@openclaude/protocol/teamCards'
 import Database from 'better-sqlite3'
+// 引擎中立的写路径决策层(RFC D6b);与本文件构成运行时环(见 clientSessionsPlan.ts 顶注)。
+import {
+  planAppendServerAuthored,
+  planSpillOverflow,
+  type SpillChunkPlan,
+} from './clientSessionsPlan.js'
 import { paths } from './paths.js'
+// wechat_bindings 是 master 六表之一,其 SQLite 实现在 wechatBindings.ts(靠近 wechat 专用
+// helper),这里 import 进来组合成完整的 sqliteBackend。函数声明,循环 import 下实例化即就绪。
+import {
+  _sqliteDeleteWechatBinding,
+  _sqliteGetWechatBindingByAccountId,
+  _sqliteGetWechatBindingByUserId,
+  _sqliteListActiveWechatBindings,
+  _sqliteListAllWechatBindings,
+  _sqliteUpdateWechatBindingCursor,
+  _sqliteUpdateWechatBindingStatus,
+  _sqliteUpsertWechatBinding,
+} from './wechatBindings.js'
 
 let _db: Database.Database | null = null
 let _walTimer: ReturnType<typeof setInterval> | null = null
@@ -394,7 +412,7 @@ export async function getSessionsDb(): Promise<Database.Database> {
  * 探测无压力;失败路径每次重试 open,与业务 API 的失败行为一致(持续暴露 bad,
  * 修复后自动转好)。从不 throw。
  */
-export async function probeSessionsDb(): Promise<{ ok: true } | { ok: false; error: string }> {
+async function _sqliteProbeSessionsDb(): Promise<{ ok: true } | { ok: false; error: string }> {
   try {
     const db = await getSessionsDb()
     db.prepare('SELECT 1').get()
@@ -1446,24 +1464,21 @@ export interface SpillOverflowResult {
 }
 
 /**
- * **spill 核心** —— 把行里最老的消息搬进归档 chunk 表,行只留热尾巴。四条写路径
+ * **spill 执行收口** —— 把行里最老的消息搬进归档 chunk 表,行只留热尾巴。四条写路径
  * (upsert / server-authored append / cost-patch / delegate-drain)与迁移脚本
- * **全部复用本函数**,是归档的唯一写侧收口。
+ * **全部复用本函数**,是 SQLite backend 归档的唯一写侧收口。
+ *
+ * 决策(搬哪些 / 切几个 chunk / 水位)已抽到引擎中立的 {@link planSpillOverflow}(RFC D6b,
+ * 防双 backend 漂移);本函数只做 SQLite 执行:调 plan → 按变更集 INSERT OR IGNORE。
  *
  * 必须在调用方的事务内(BEGIN IMMEDIATE)同步调用:本函数直接 INSERT 归档表,依赖调用方
  * 事务的原子性(与主行 UPDATE 同提交 / 同回滚)。
  *
- * 前置契约:入参 msgs 必须已跑过 {@link normalizeAndAssignSeqs}(全员有数字 _seq)。若发现
- * 任一消息缺 _seq → **不 spill,原样返回**(防御,勿抛):无 _seq 无法维护归档/增量游标。
+ * 前置契约:入参 msgs 必须已跑过 {@link normalizeAndAssignSeqs}(全员有数字 _seq);缺 _seq 时
+ * plan 返回安全 no-op(不 spill 原样返回)。
  *
- * 语义要点:
- *   - **软阈值触发**:序列化字节 ≤ SESSION_SOFT_TRIM_BYTES → 零副作用(tail === msgs)。
- *   - **搬不删,_seq 冻结**:归档消息与保留尾巴的 _seq 一律不变不重排(增量协议依赖单调性;
- *     与旧 sessions-fix-oversized 的"重排"策略不同 —— 旧脚本**删**内容故重排,我们**搬**内容)。
- *   - **尾巴下限**:至少保留 SESSION_TAIL_MIN_MSGS 条(即便这样尾巴仍 > TAIL_TARGET,min 优先)。
- *   - **chunk 切分**:spill 段按数组序切 chunk(每 chunk ≤200 条且 ≤768KB),写 chunk 表 + id 集。
- *   - **幂等**:chunk PK (session_id, first_seq=min _seq) 冲突用 INSERT OR IGNORE;archivedDelta
- *     只累计"真正新插入"的 chunk 的条数(cr.changes>0),重放不重复计。
+ * 幂等:chunk PK (session_id, first_seq=min _seq) 冲突用 INSERT OR IGNORE;archivedDelta
+ * **只累计真正新插入 chunk 的条数**(cr.changes>0)—— 这依赖执行结果,不进纯 plan。
  */
 export function _spillOverflowCore(
   db: Database.Database,
@@ -1473,54 +1488,25 @@ export function _spillOverflowCore(
   opts: { currentArchivedThroughSeq: number; now?: number },
 ): SpillOverflowResult {
   const now = opts.now ?? Date.now()
-  const currentWatermark = opts.currentArchivedThroughSeq > 0 ? opts.currentArchivedThroughSeq : 0
+  const plan = planSpillOverflow(msgs, opts.currentArchivedThroughSeq)
+  const archivedDelta = _executeSpillPlan(db, sessId, userId, plan.chunksToInsert, plan.idsToInsert, now)
+  return { tail: plan.tail, archivedDelta, archivedThroughSeq: plan.archivedThroughSeq }
+}
 
-  // Fast path:行仍在软阈值内 → 什么都不搬。这里的 JSON.stringify 是精确字节度量;
-  // 只有真正 spill 的那一 turn,调用方才会对(通常更小的)tail 再 stringify 一次 ——
-  // 罕见路径上的一次多余编码,可接受。
-  if (Buffer.byteLength(JSON.stringify(msgs), 'utf8') <= SESSION_SOFT_TRIM_BYTES) {
-    return { tail: msgs, archivedDelta: 0, archivedThroughSeq: currentWatermark }
-  }
-
-  // 防御:spill 要求全员有数字 _seq(归档/增量游标)。缺 _seq → 拒绝 spill,原样返回
-  // (不是错误路径,是安全 no-op;调用方契约上应先跑 normalizeAndAssignSeqs)。
-  for (const m of msgs) {
-    if (!m || typeof m._seq !== 'number' || !Number.isFinite(m._seq)) {
-      return { tail: msgs, archivedDelta: 0, archivedThroughSeq: currentWatermark }
-    }
-  }
-
-  // 尾巴不能低于下限:即便超软阈值,若总条数 ≤ MIN_MSGS 也不搬(保住兜底注入窗口)。
-  if (msgs.length <= SESSION_TAIL_MIN_MSGS) {
-    return { tail: msgs, archivedDelta: 0, archivedThroughSeq: currentWatermark }
-  }
-
-  // 逐条序列化字节(数组序)+ 1 字节分隔符估算。近似即可:TAIL_TARGET 是软目标。
-  const SEP = 1
-  const perBytes = new Array<number>(msgs.length)
-  let totalBytes = 2 // 外层 [ ]
-  for (let i = 0; i < msgs.length; i++) {
-    const b = Buffer.byteLength(JSON.stringify(msgs[i]), 'utf8') + SEP
-    perBytes[i] = b
-    totalBytes += b
-  }
-
-  // 从数组头(最老)向后搬,直到剩余尾巴 ≤ TAIL_TARGET;但绝不搬到尾巴 < MIN_MSGS。
-  const maxSpill = msgs.length - SESSION_TAIL_MIN_MSGS
-  let spillCount = 0
-  let tailBytes = totalBytes
-  while (spillCount < maxSpill && tailBytes > SESSION_TAIL_TARGET_BYTES) {
-    tailBytes -= perBytes[spillCount]
-    spillCount++
-  }
-  if (spillCount <= 0) {
-    // 溢出全集中在最新的 MIN_MSGS 条里 → 搬无可搬(硬闸 MAX_SESSION_BYTES 兜底)。
-    return { tail: msgs, archivedDelta: 0, archivedThroughSeq: currentWatermark }
-  }
-
-  const spilled = msgs.slice(0, spillCount)
-  const tail = msgs.slice(spillCount)
-
+/**
+ * spill 变更集的 SQLite 执行:落 chunk + archived_ids,返回真正新归档的条数(archivedDelta)。
+ * 无 chunk → 零副作用(不 prepare、不写),archivedDelta=0。与 {@link _spillOverflowCore} 和
+ * {@link _appendServerAuthoredCore} 共享,单一执行路径。
+ */
+function _executeSpillPlan(
+  db: Database.Database,
+  sessId: string,
+  userId: string,
+  chunksToInsert: SpillChunkPlan[],
+  idsToInsert: string[],
+  now: number,
+): number {
+  if (chunksToInsert.length === 0) return 0
   const insertChunk = db.prepare(
     `INSERT OR IGNORE INTO client_session_archive_chunks
        (session_id, user_id, first_seq, last_seq, message_count, messages, created_at)
@@ -1529,46 +1515,17 @@ export function _spillOverflowCore(
   const insertId = db.prepare(
     'INSERT OR IGNORE INTO client_session_archived_ids (session_id, msg_id) VALUES (?, ?)',
   )
-
   let archivedDelta = 0
-  let watermark = currentWatermark
-  let i = 0
-  while (i < spilled.length) {
-    // 贪心切 chunk:≤ARCHIVE_CHUNK_MAX_MSGS 条且 ≤ARCHIVE_CHUNK_MAX_BYTES,先到者为界。
-    let j = i
-    let bytes = 2 // chunk 自身的 [ ]
-    while (j < spilled.length && (j - i) < ARCHIVE_CHUNK_MAX_MSGS) {
-      const b = perBytes[j]
-      // 每 chunk 至少收 1 条:单条 >768KB 的巨型消息也独立成 chunk,不空转。
-      if (j > i && bytes + b > ARCHIVE_CHUNK_MAX_BYTES) break
-      bytes += b
-      j++
-    }
-    const chunkMsgs = spilled.slice(i, j)
-    // first_seq/last_seq = chunk 内 _seq 的 min/max。chunk 之间 _seq 池 disjoint
-    // (每条消息只 spill 一次),故 min 唯一 → 可安全做 PK 的一半。
-    let minSeq = Number.POSITIVE_INFINITY
-    let maxSeq = 0
-    for (const m of chunkMsgs) {
-      const s = m._seq as number
-      if (s < minSeq) minSeq = s
-      if (s > maxSeq) maxSeq = s
-    }
-    // 幂等:重放同批时 chunk PK (session_id, minSeq) 冲突 → INSERT OR IGNORE no-op,
-    // archivedDelta 不重复计(只累计真正新插入 chunk 的条数)。
+  for (const chunk of chunksToInsert) {
+    // 幂等:重放同批时 chunk PK 冲突 → OR IGNORE no-op,archivedDelta 不重复计。
     const cr = insertChunk.run(
-      sessId, userId, minSeq, maxSeq, chunkMsgs.length, JSON.stringify(chunkMsgs), now,
+      sessId, userId, chunk.firstSeq, chunk.lastSeq, chunk.messageCount, JSON.stringify(chunk.messages), now,
     )
-    if (cr.changes > 0) archivedDelta += chunkMsgs.length
-    // id 集 INSERT OR IGNORE:重放无害。仅对有 id 的消息(无 id 消息无从 PUT 复活 / append)。
-    for (const m of chunkMsgs) {
-      if (typeof m.id === 'string') insertId.run(sessId, m.id)
-    }
-    if (maxSeq > watermark) watermark = maxSeq
-    i = j
+    if (cr.changes > 0) archivedDelta += chunk.messageCount
   }
-
-  return { tail, archivedDelta, archivedThroughSeq: watermark }
+  // id 集 INSERT OR IGNORE:重放无害(整批在 chunk 之后落,与 chunk 同表 disjoint,顺序不影响终态)。
+  for (const id of idsToInsert) insertId.run(sessId, id)
+  return archivedDelta
 }
 
 /**
@@ -1624,7 +1581,7 @@ const _STALE_WRITE_ROLLBACK = new Error('__stale_write_rollback__')
  * delegate merging to {@link mergePreservingServerAuthored} so the policy is
  * testable in isolation.
  */
-export async function upsertClientSession(session: ClientSession, baseSyncedAt = 0): Promise<UpsertClientSessionResult> {
+async function _sqliteUpsertClientSession(session: ClientSession, baseSyncedAt = 0): Promise<UpsertClientSessionResult> {
   const db = await getSessionsDb()
   const txn = db.transaction((): UpsertClientSessionResult => {
     const existing = db.prepare(
@@ -1685,7 +1642,10 @@ export async function upsertClientSession(session: ClientSession, baseSyncedAt =
         last_at = excluded.last_at,
         messages = excluded.messages,
         message_count = excluded.message_count,
-        updated_at = excluded.updated_at,
+        -- updated_at 逻辑版本(RFC D3b):冲突更新走 DB 计算 MAX(既有+1, now, 客户端回传值)
+        -- 严格单调推进;新插入(无冲突)仍用客户端 @updatedAt(保持首建=客户端值语义,
+        -- 乐观并发 baseSyncedAt 链不断)。双 master 下同毫秒双写/时钟偏差被 cur+1 兜底。
+        updated_at = MAX(client_sessions.updated_at + 1, @updatedAtFloor, excluded.updated_at),
         next_seq = excluded.next_seq,
         archived_through_seq = excluded.archived_through_seq,
         archived_count = excluded.archived_count
@@ -1703,6 +1663,8 @@ export async function upsertClientSession(session: ClientSession, baseSyncedAt =
       // message_count = 热尾巴条数 + 已归档累计条数(含本次 delta),给列表/计数用。
       messageCount: tail.length + newArchivedCount,
       updatedAt: session.updatedAt,
+      // D3b 逻辑版本的墙钟下限(= PG 侧 floor(epoch_ms(clock_timestamp())) 的 SQLite 对应)。
+      updatedAtFloor: now,
       baseSyncedAt,
       nextSeq,
       archivedThroughSeq: spill.archivedThroughSeq,
@@ -1809,58 +1771,21 @@ function _appendServerAuthoredCore(
     return { applied: false, reason: 'malformed' }
   }
 
-  const result = appendServerAuthoredPure(msgs, message)
-  if (!result.applied) return { applied: false, reason: result.reason }
-
-  // Phantom-dedupe symmetric with the client-PUT path (upsertClientSession
-  // line 1093). Without this, server-authored tool/assistant/thinking rows
-  // arriving at turn-end coexist with their client-authored streaming
-  // counterparts (matching blockId / turn group, but different ids — server
-  // uses `srv-${sessId}-t${turnIndex}-tool-${blockId}` while client uses
-  // `m-${ts}-${rand}`). The cleanup would only happen on the NEXT client
-  // PUT — meaning an F5 in the gap between server-authored append and
-  // next PUT shows duplicate tool cards (one stripped legacy + one rich).
-  //
-  // Calling `mergePreservingServerAuthored(arr, arr)` reuses the same
-  // dedupe logic as the PUT path. After `appendServerAuthoredPure` stamped
-  // `_source: 'server'`, the server-authored set in the merge is non-empty,
-  // so dedupe runs (early-return on size===0 is unreachable here).
-  // Same-array passing is safe: every id is in clientIds, so the loop at
-  // line 779 adds no duplicates; the merged array equals result.messages
-  // pre-phantom-dedupe, then the phantom-dedupe pass at lines 814-890
-  // drops orphan client rows.
-  const dedupedMessages = mergePreservingServerAuthored(
-    result.messages,
-    result.messages,
-  ) as MessageLike[]
-
-  // Run the resulting messages through normalizeAndAssignSeqs so the new
-  // server-authored entry receives a fresh `_seq` AND any legacy rows on
-  // this row get backfilled in the same transaction. Without this, a
-  // legacy session (next_seq=1, messages without _seq) would silently get
-  // _seq=1 assigned only to the new message — colliding with the eventual
-  // _seq=1 a later upsert would assign during legacy backfill.
-  // Note: phantom-dedupe may drop rows that had `_seq` assigned previously;
-  // the dropped seqs simply disappear. _seq invariants only require
-  // uniqueness and monotonic allocation among RETAINED messages.
+  // 决策(append 叠加 → 幻影去重自合并 → _seq 规范化 → spill 决策 → 超限判定)抽到引擎中立的
+  // {@link planAppendServerAuthored}(RFC D6b):PG backend 复用同一决策,双 backend 不各养一份
+  // 业务逻辑(幻影去重的 mergePreservingServerAuthored(arr,arr)、legacy 回填、size guard 全在 plan)。
   const currentNextSeq = typeof row.next_seq === 'number' && row.next_seq > 0 ? row.next_seq : 1
-  const { messages: finalMessages, nextSeq } = normalizeAndAssignSeqs(msgs, dedupedMessages, currentNextSeq)
+  const plan = planAppendServerAuthored(msgs, message, currentNextSeq, row.archived_through_seq ?? 0)
+  if (plan.kind === 'already_exists') return { applied: false, reason: 'already_exists' }
+  // 'oversized':spill 后 tail 仍超 MAX_SESSION_BYTES(理论不可达)。调用方 durable wrapper/replay
+  // 视其为终态,outbox 不再空转重放。
+  if (plan.kind === 'oversized') return { applied: false, reason: 'oversized' }
 
-  // 热尾巴 + 归档:normalize 后把最老的消息搬进归档,行只留热尾巴(与 upsert 路径同一收口)。
+  // 执行(SQLite):归档 spill 变更集(archivedDelta 据实际新插入计)+ 主行 UPDATE。同一事务、同一 now。
   const now = Date.now()
-  const spill = _spillOverflowCore(db, sessId, userId, finalMessages, {
-    currentArchivedThroughSeq: row.archived_through_seq ?? 0,
-    now,
-  })
-  const newArchivedCount = (row.archived_count ?? 0) + spill.archivedDelta
-  const tail = spill.tail
-
-  // Size guard — see MAX_SESSION_BYTES(spill 后作用于 tail;理论不可达,保留作最后防线)。
-  // 命中时返回 'oversized',调用方 durable wrapper/replay 视其为终态,outbox 不再空转重放。
-  const finalJson = JSON.stringify(tail)
-  if (Buffer.byteLength(finalJson, 'utf8') > MAX_SESSION_BYTES) {
-    return { applied: false, reason: 'oversized' }
-  }
+  const archivedDelta = _executeSpillPlan(db, sessId, userId, plan.chunksToInsert, plan.idsToInsert, now)
+  const newArchivedCount = (row.archived_count ?? 0) + archivedDelta
+  const tail = plan.tail
 
   // Belt-and-braces: the SELECT above already gated on `deleted_at !== null`
   // inside the same BEGIN IMMEDIATE transaction, so a concurrent soft-delete
@@ -1869,9 +1794,12 @@ function _appendServerAuthoredCore(
   // moves the SELECT/UPDATE into separate transactions). If it fails the
   // SELECT/UPDATE invariant, `changes` will be 0 and we surface session_deleted
   // instead of silently writing into a tombstone.
+  //
+  // updated_at 逻辑版本(RFC D3b):由 DB 计算 MAX(updated_at + 1, now) 严格单调推进
+  // (双 master 下同毫秒双写 / 时钟偏差被 cur+1 兜底,消除 stale-write 静默覆盖)。
   const update = db.prepare(
-    'UPDATE client_sessions SET messages = ?, message_count = ?, last_at = ?, updated_at = ?, next_seq = ?, archived_through_seq = ?, archived_count = ? WHERE id = ? AND user_id = ? AND deleted_at IS NULL'
-  ).run(finalJson, tail.length + newArchivedCount, now, now, nextSeq, spill.archivedThroughSeq, newArchivedCount, sessId, userId)
+    'UPDATE client_sessions SET messages = ?, message_count = ?, last_at = ?, updated_at = MAX(updated_at + 1, ?), next_seq = ?, archived_through_seq = ?, archived_count = ? WHERE id = ? AND user_id = ? AND deleted_at IS NULL'
+  ).run(plan.finalJson, tail.length + newArchivedCount, now, now, plan.nextSeq, plan.archivedThroughSeq, newArchivedCount, sessId, userId)
   if (update.changes !== 1) {
     // Race: row was deleted between SELECT and UPDATE within the same txn.
     // Should be unreachable under BEGIN IMMEDIATE, but if SQLite's transaction
@@ -1882,7 +1810,7 @@ function _appendServerAuthoredCore(
   return { applied: true }
 }
 
-export async function appendServerAuthoredMessage(
+async function _sqliteAppendServerAuthoredMessage(
   sessId: string,
   userId: string,
   message: {
@@ -1954,7 +1882,7 @@ export type AppendForRequestResult =
  * pending drain is a no-op. Caller-visible result is identical for first
  * and subsequent calls (with `applied: false, reason: 'already_exists'`).
  */
-export async function appendServerAuthoredMessageForRequest(
+async function _sqliteAppendServerAuthoredMessageForRequest(
   requestId: string,
   sessId: string,
   userId: string,
@@ -2033,7 +1961,7 @@ export async function appendServerAuthoredMessageForRequest(
  * 真正 per-turn 精确需 ccb 端回流 requestId 走 {@link appendServerAuthoredMessageForRequest},
  * 属已知技术债)。requestId 路径(codex/anthropicProxy-with-requestId)不走本函数、行为不变。
  */
-export async function appendServerAuthoredMessageDrainByUser<T extends MessageLike & { id: string }>(
+async function _sqliteAppendServerAuthoredMessageDrainByUser<T extends MessageLike & { id: string }>(
   sessId: string,
   userId: string,
   message: T,
@@ -2102,7 +2030,7 @@ export type AppendCostCreditsResult =
  * Returns `'noop'` on idempotent retry so callers can observe the
  * different paths in metrics if useful.
  */
-export async function appendCostCredits(
+async function _sqliteAppendCostCredits(
   requestId: string,
   userId: string,
   costCredits: string,
@@ -2188,7 +2116,7 @@ export async function appendCostCredits(
             return { applied: 'noop' }
           }
           db.prepare(
-            'UPDATE client_sessions SET messages = ?, message_count = ?, last_at = ?, updated_at = ?, next_seq = next_seq + 1, archived_through_seq = ?, archived_count = ? WHERE id = ? AND user_id = ?'
+            'UPDATE client_sessions SET messages = ?, message_count = ?, last_at = ?, updated_at = MAX(updated_at + 1, ?), next_seq = next_seq + 1, archived_through_seq = ?, archived_count = ? WHERE id = ? AND user_id = ?'
           ).run(
             nextJson,
             tail.length + newArchivedCount,
@@ -2265,7 +2193,7 @@ export interface DrainDelegateCostResult {
  * 幂等:pending 行排空即删,sink POST 重放(already_exists)时二次调用只会命中"新到的"
  * 委派 pending(若有),已排空的不会重复累加。
  */
-export async function drainDelegateCostForClientSession(
+async function _sqliteDrainDelegateCostForClientSession(
   clientSessionId: string,
   userId: string,
   msgId: string,
@@ -2371,7 +2299,7 @@ export async function drainDelegateCostForClientSession(
       return { merged: '0', drained: 0 }
     }
     db.prepare(
-      'UPDATE client_sessions SET messages = ?, message_count = ?, last_at = ?, updated_at = ?, next_seq = next_seq + 1, archived_through_seq = ?, archived_count = ? WHERE id = ? AND user_id = ?'
+      'UPDATE client_sessions SET messages = ?, message_count = ?, last_at = ?, updated_at = MAX(updated_at + 1, ?), next_seq = next_seq + 1, archived_through_seq = ?, archived_count = ? WHERE id = ? AND user_id = ?'
     ).run(nextJson, tail.length + newArchivedCount, nowMs, nowMs, spill.archivedThroughSeq, newArchivedCount, clientSessionId, userId)
 
     // 只删本次读到的行——并发新 park 不在列表里,留给下一轮。
@@ -2410,7 +2338,7 @@ const PENDING_AGING_MS = 60 * 60_000           // 1h alarm
 const PENDING_HARD_DELETE_MS = 24 * 60 * 60_000  // 24h GC
 const MAP_HARD_DELETE_MS = 7 * 24 * 60 * 60_000  // 7d GC
 
-export async function sweepUsageAggregationGc(
+async function _sqliteSweepUsageAggregationGc(
   now: number = Date.now(),
 ): Promise<UsageAggregationGcStats> {
   const db = await getSessionsDb()
@@ -2700,7 +2628,7 @@ export async function replayMsgOutbox(): Promise<{
   return { processed, applied, dropped, requeued, malformed }
 }
 
-export async function listClientSessions(userId: string): Promise<ClientSessionMeta[]> {
+async function _sqliteListClientSessions(userId: string): Promise<ClientSessionMeta[]> {
   const db = await getSessionsDb()
   const rows = db.prepare(`
     SELECT id, agent_id, title, pinned, created_at, last_at, updated_at,
@@ -2722,7 +2650,7 @@ export async function listClientSessions(userId: string): Promise<ClientSessionM
   }))
 }
 
-export async function getClientSession(id: string, userId?: string): Promise<ClientSession | null> {
+async function _sqliteGetClientSession(id: string, userId?: string): Promise<ClientSession | null> {
   const db = await getSessionsDb()
   const sql = userId
     ? "SELECT id, user_id, agent_id, title, pinned, created_at, last_at, messages, updated_at, archived_through_seq, archived_count FROM client_sessions WHERE id = ? AND user_id = ? AND deleted_at IS NULL"
@@ -2770,7 +2698,7 @@ export interface ClientSessionPartial extends ClientSession {
  * `maxSeq` is computed from the actual messages array (NOT `next_seq`); per
  * Codex review #5, `next_seq - 1` may drift in the rare schema-mismatch case.
  */
-export async function getClientSessionPartial(
+async function _sqliteGetClientSessionPartial(
   id: string,
   userId: string,
   sinceSeq: number,
@@ -2861,7 +2789,7 @@ export interface ReadArchivedMessagesResult {
  *
  * 分租:先按 (id, user_id) 验会话归属(拿不到 → 空结果),chunk 查询再带 user_id 双保险。
  */
-export async function readArchivedMessages(
+async function _sqliteReadArchivedMessages(
   sessId: string,
   userId: string,
   beforeSeq = 0,
@@ -2912,14 +2840,17 @@ export async function readArchivedMessages(
 }
 
 /** Soft-delete: zero out messages and mark as deleted. Prevents stale PUTs from resurrecting. */
-export async function deleteClientSession(id: string, userId?: string): Promise<boolean> {
+async function _sqliteDeleteClientSession(id: string, userId?: string): Promise<boolean> {
   const db = await getSessionsDb()
+  // updated_at 逻辑版本(RFC D3b):软删也严格单调推进 updated_at = MAX(既有+1, now),
+  // 让并发 stale PUT(旧 baseSyncedAt)对 tombstone 的 ON CONFLICT 因版本落后被拒(409),
+  // 与其它写路径口径一致。deleted_at 仍是删除权威,updated_at 只作乐观并发版本。
   const sql = userId
-    ? "UPDATE client_sessions SET deleted_at = ?, messages = '[]', message_count = 0 WHERE id = ? AND user_id = ? AND deleted_at IS NULL"
-    : "UPDATE client_sessions SET deleted_at = ?, messages = '[]', message_count = 0 WHERE id = ? AND deleted_at IS NULL"
+    ? "UPDATE client_sessions SET deleted_at = ?, updated_at = MAX(updated_at + 1, ?), messages = '[]', message_count = 0 WHERE id = ? AND user_id = ? AND deleted_at IS NULL"
+    : "UPDATE client_sessions SET deleted_at = ?, updated_at = MAX(updated_at + 1, ?), messages = '[]', message_count = 0 WHERE id = ? AND deleted_at IS NULL"
   const now = Date.now()
   const txn = db.transaction((): boolean => {
-    const result = userId ? db.prepare(sql).run(now, id, userId) : db.prepare(sql).run(now, id)
+    const result = userId ? db.prepare(sql).run(now, now, id, userId) : db.prepare(sql).run(now, now, id)
     if (result.changes === 0) return false
     // 归档级联清理:软删清 messages 却留归档 chunk/id 行会积累"不可达但占体积"的
     // 孤儿(用户删会话=不再要这份历史,隐私语义应与 messages 清零一致)。同事务保证
@@ -2940,17 +2871,19 @@ export async function deleteClientSession(id: string, userId?: string): Promise<
  * updated_at 照常推进(它同时是 PUT 乐观并发 token;v5 React 客户端消息走 WS 不走全量
  * PUT,推进无副作用,还能让其它设备的 listSessions server-wins 拿到新标题)。
  */
-export async function renameClientSession(id: string, userId: string, title: string): Promise<{ ok: boolean; updatedAt: number }> {
+async function _sqliteRenameClientSession(id: string, userId: string, title: string): Promise<{ ok: boolean; updatedAt: number }> {
   const db = await getSessionsDb()
   const now = Date.now()
-  const result = db.prepare(
-    'UPDATE client_sessions SET title = ?, updated_at = ? WHERE id = ? AND user_id = ? AND deleted_at IS NULL'
-  ).run(title, now, id, userId)
-  return { ok: result.changes > 0, updatedAt: now }
+  // updated_at 逻辑版本(RFC D3b):MAX(既有+1, now) 严格单调推进;RETURNING 回读真实写入值
+  // 作为客户端新同步 token(避免返回 now 而实际写入 cur+1 时 token 落后 → 下次 PUT 被误拒)。
+  const row = db.prepare(
+    'UPDATE client_sessions SET title = ?, updated_at = MAX(updated_at + 1, ?) WHERE id = ? AND user_id = ? AND deleted_at IS NULL RETURNING updated_at'
+  ).get(title, now, id, userId) as { updated_at: number } | undefined
+  return { ok: !!row, updatedAt: row ? row.updated_at : now }
 }
 
 /** List unclaimed sessions (user_id='default') with summary for migration UI. */
-export async function listUnclaimedSessions(): Promise<Array<{
+async function _sqliteListUnclaimedSessions(): Promise<Array<{
   id: string; agentId: string; title: string; createdAt: number;
   lastAt: number; messageCount: number; summary: string
 }>> {
@@ -3003,7 +2936,7 @@ export async function listUnclaimedSessions(): Promise<Array<{
  * GLOB is namespace-correct, but `origin_channel` makes the dispatcher contract
  * real, keeps storage aligned with design.md §3, and avoids dead params.
  */
-export async function allMasterWsessRows(): Promise<Array<{
+async function _sqliteAllMasterWsessRows(): Promise<Array<{
   id: string
   userId: string
   createdAt: number
@@ -3036,7 +2969,7 @@ export async function allMasterWsessRows(): Promise<Array<{
  * column DEFAULTs ('[]' / 0 / 1 / NULL). `pinned` is also omitted (default 0).
  * Downstream PUT path goes through `upsertClientSession` like any other row.
  */
-export async function upsertMasterClientSession(input: {
+async function _sqliteUpsertMasterClientSession(input: {
   sessionId: string
   userId: string
   agentId: string
@@ -3067,23 +3000,180 @@ export async function upsertMasterClientSession(input: {
  * same semantics as `deleteClientSession(id, userId)` so wechat reconcile
  * never crosses tenants when removing an orphan row.
  */
-export async function softDeleteMasterSession(
+async function _sqliteSoftDeleteMasterSession(
   sessionId: string,
   userId: string,
 ): Promise<boolean> {
-  return deleteClientSession(sessionId, userId)
+  // 走 SQLite backend 自身的 delete(自洽);PG backend 的 softDelete 同样委托其自身 delete。
+  return _sqliteDeleteClientSession(sessionId, userId)
 }
 
 /** Claim an unclaimed session: atomically change user_id from 'default' to the target userId.
  *  Returns true if claimed, false if already claimed by someone else. */
-export async function claimSession(sessionId: string, userId: string): Promise<boolean> {
+async function _sqliteClaimSession(sessionId: string, userId: string): Promise<boolean> {
   const db = await getSessionsDb()
+  // updated_at 逻辑版本(RFC D3b):MAX(既有+1, now) 严格单调推进(认领改归属也 bump 版本)。
   const result = db.prepare(`
-    UPDATE client_sessions SET user_id = ?, updated_at = ?
+    UPDATE client_sessions SET user_id = ?, updated_at = MAX(updated_at + 1, ?)
     WHERE id = ? AND user_id = 'default' AND deleted_at IS NULL
   `).run(userId, Date.now(), sessionId)
   return result.changes > 0
 }
+
+// ════════════════════════════════════════════════════════════════════════════
+// master 会话权威 backend —— 委托层(RFC D1)
+// ════════════════════════════════════════════════════════════════════════════
+//
+// 单一权威、零双轨、调用点零改动:master 六表(client_sessions / archive_chunks /
+// archived_ids / server_authored_request_map / pending_usage_patches / wechat_bindings)的
+// 每个导出函数保持签名不变,内部改为委托 `getActiveBackend().xxx(...)`。
+//
+// 默认 backend = 本文件内的 SQLite 实现(sqliteBackend,由上面 _sqlite* 组合)。master 形态
+// (channel=v5 且非容器)在 composition root 一次性 setClientSessionsBackend(pgBackend) 注入
+// PG 实现;容器内 gateway / 个人版不加载 commercial → 天然 SQLite,行为零变化。
+//
+// **非 master 表函数(sessions_meta / fts / event_log / usage_log / outbox:upsertSessionMeta /
+// indexTurn / searchSessions / insertEvent / queryEvents / insertUsageLog / getUsageSummary /
+// queueMessageToOutbox / appendServerAuthoredMessageDurable / replayMsgOutbox 等)不进 backend**,
+// 永远直连本地 SQLite(master 上是审计/召回旁路,权威在容器侧,fire-and-forget)。
+
+/**
+ * SQLite backend —— master 六表全部操作的本地实现(由上方 _sqlite* / wechatBindings 的
+ * _sqlite* 组合)。既是默认 backend,又是 {@link ClientSessionsBackend} 契约的**派生源**:
+ * PG backend 必须结构化覆盖本对象的每个方法(漏一个 = 编译错)。
+ */
+const sqliteBackend = {
+  // ── client_sessions 读写 + 归档 + usage 聚合 ──
+  probeSessionsDb: _sqliteProbeSessionsDb,
+  upsertClientSession: _sqliteUpsertClientSession,
+  appendServerAuthoredMessage: _sqliteAppendServerAuthoredMessage,
+  appendServerAuthoredMessageForRequest: _sqliteAppendServerAuthoredMessageForRequest,
+  appendServerAuthoredMessageDrainByUser: _sqliteAppendServerAuthoredMessageDrainByUser,
+  appendCostCredits: _sqliteAppendCostCredits,
+  drainDelegateCostForClientSession: _sqliteDrainDelegateCostForClientSession,
+  sweepUsageAggregationGc: _sqliteSweepUsageAggregationGc,
+  listClientSessions: _sqliteListClientSessions,
+  getClientSession: _sqliteGetClientSession,
+  getClientSessionPartial: _sqliteGetClientSessionPartial,
+  readArchivedMessages: _sqliteReadArchivedMessages,
+  deleteClientSession: _sqliteDeleteClientSession,
+  renameClientSession: _sqliteRenameClientSession,
+  listUnclaimedSessions: _sqliteListUnclaimedSessions,
+  allMasterWsessRows: _sqliteAllMasterWsessRows,
+  upsertMasterClientSession: _sqliteUpsertMasterClientSession,
+  softDeleteMasterSession: _sqliteSoftDeleteMasterSession,
+  claimSession: _sqliteClaimSession,
+  // ── wechat_bindings(master 六表之一;SQLite 实现在 wechatBindings.ts)──
+  listActiveWechatBindings: _sqliteListActiveWechatBindings,
+  listAllWechatBindings: _sqliteListAllWechatBindings,
+  getWechatBindingByUserId: _sqliteGetWechatBindingByUserId,
+  getWechatBindingByAccountId: _sqliteGetWechatBindingByAccountId,
+  upsertWechatBinding: _sqliteUpsertWechatBinding,
+  updateWechatBindingCursor: _sqliteUpdateWechatBindingCursor,
+  updateWechatBindingStatus: _sqliteUpdateWechatBindingStatus,
+  deleteWechatBinding: _sqliteDeleteWechatBinding,
+}
+
+/**
+ * master 会话权威 backend 契约。**从 sqliteBackend 派生**(不手写接口):PG backend 在
+ * packages/commercial 里 `const pg: ClientSessionsBackend = {...}`,TypeScript 强制它完整覆盖
+ * 上面每个方法与签名 —— 漏一个方法 / 签名不符 = 编译期报错,杜绝 PG 侧漏实现。
+ */
+export type ClientSessionsBackend = typeof sqliteBackend
+
+let _activeBackend: ClientSessionsBackend = sqliteBackend
+let _backendInjected = false
+
+/**
+ * 一次性注入 master 会话权威 backend(composition root 唯一入口)。重复注入 throw ——
+ * 防两处 registerCommercial / 双跑把权威源改成两套。正常代码回滚**不能**通过不注入退回
+ * SQLite(那会在割接后重造双权威,RFC D1 fail-closed);SQLite 默认仅用于容器/个人版形态。
+ */
+export function setClientSessionsBackend(b: ClientSessionsBackend): void {
+  if (_backendInjected) {
+    throw new Error('client sessions backend already injected — 一次性注入,禁止双跑')
+  }
+  _activeBackend = b
+  _backendInjected = true
+}
+
+/**
+ * 当前活跃 backend。master 表的公有函数(本文件 + wechatBindings.ts)全部经此委托。
+ * 未注入 → 默认 sqliteBackend(容器/个人版形态,行为零变化)。
+ */
+export function getActiveBackend(): ClientSessionsBackend {
+  return _activeBackend
+}
+
+// ── 公有 API:薄委托 active backend ──────────────────────────────────────────
+//
+// 签名从 sqliteBackend 派生(ClientSessionsBackend['xxx'] = 对应 _sqlite* 的类型),与旧导出
+// 逐字节等价,调用点(gateway/server.ts、commercial)按函数名 import,零改动。
+
+export const probeSessionsDb: ClientSessionsBackend['probeSessionsDb'] =
+  () => getActiveBackend().probeSessionsDb()
+
+export const upsertClientSession: ClientSessionsBackend['upsertClientSession'] =
+  (...args) => getActiveBackend().upsertClientSession(...args)
+
+export const appendServerAuthoredMessage: ClientSessionsBackend['appendServerAuthoredMessage'] =
+  (...args) => getActiveBackend().appendServerAuthoredMessage(...args)
+
+export const appendServerAuthoredMessageForRequest: ClientSessionsBackend['appendServerAuthoredMessageForRequest'] =
+  (...args) => getActiveBackend().appendServerAuthoredMessageForRequest(...args)
+
+// 泛型 message 需显式泛型 wrapper 才能保住类型推断(indexed-access 的泛型调用签名无法用
+// rest-arrow 完美转发)。
+export async function appendServerAuthoredMessageDrainByUser<T extends MessageLike & { id: string }>(
+  sessId: string,
+  userId: string,
+  message: T,
+  agentSessionId?: string | null,
+): Promise<AppendForRequestResult> {
+  return getActiveBackend().appendServerAuthoredMessageDrainByUser(sessId, userId, message, agentSessionId)
+}
+
+export const appendCostCredits: ClientSessionsBackend['appendCostCredits'] =
+  (...args) => getActiveBackend().appendCostCredits(...args)
+
+export const drainDelegateCostForClientSession: ClientSessionsBackend['drainDelegateCostForClientSession'] =
+  (...args) => getActiveBackend().drainDelegateCostForClientSession(...args)
+
+export const sweepUsageAggregationGc: ClientSessionsBackend['sweepUsageAggregationGc'] =
+  (...args) => getActiveBackend().sweepUsageAggregationGc(...args)
+
+export const listClientSessions: ClientSessionsBackend['listClientSessions'] =
+  (...args) => getActiveBackend().listClientSessions(...args)
+
+export const getClientSession: ClientSessionsBackend['getClientSession'] =
+  (...args) => getActiveBackend().getClientSession(...args)
+
+export const getClientSessionPartial: ClientSessionsBackend['getClientSessionPartial'] =
+  (...args) => getActiveBackend().getClientSessionPartial(...args)
+
+export const readArchivedMessages: ClientSessionsBackend['readArchivedMessages'] =
+  (...args) => getActiveBackend().readArchivedMessages(...args)
+
+export const deleteClientSession: ClientSessionsBackend['deleteClientSession'] =
+  (...args) => getActiveBackend().deleteClientSession(...args)
+
+export const renameClientSession: ClientSessionsBackend['renameClientSession'] =
+  (...args) => getActiveBackend().renameClientSession(...args)
+
+export const listUnclaimedSessions: ClientSessionsBackend['listUnclaimedSessions'] =
+  () => getActiveBackend().listUnclaimedSessions()
+
+export const allMasterWsessRows: ClientSessionsBackend['allMasterWsessRows'] =
+  () => getActiveBackend().allMasterWsessRows()
+
+export const upsertMasterClientSession: ClientSessionsBackend['upsertMasterClientSession'] =
+  (...args) => getActiveBackend().upsertMasterClientSession(...args)
+
+export const softDeleteMasterSession: ClientSessionsBackend['softDeleteMasterSession'] =
+  (...args) => getActiveBackend().softDeleteMasterSession(...args)
+
+export const claimSession: ClientSessionsBackend['claimSession'] =
+  (...args) => getActiveBackend().claimSession(...args)
 
 export async function closeSessionsDb(): Promise<void> {
   if (_walTimer !== null) { clearInterval(_walTimer); _walTimer = null }

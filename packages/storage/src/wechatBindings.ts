@@ -6,7 +6,12 @@
 //
 // Table is declared in sessionsDb.ts (see CREATE TABLE wechat_bindings).
 
-import { getSessionsDb } from './sessionsDb.js'
+// getActiveBackend:master 会话权威 backend 注入口(RFC D1)。wechat_bindings 是 master 六表
+// 之一,其读写同样经 active backend(master 形态=PG,容器/个人版=SQLite)。下面 _sqlite* 是
+// SQLite 实现(被 sessionsDb 的 sqliteBackend 组合),公有函数是薄委托。
+// 与 sessionsDb 构成运行时环:此处两向引用(_sqlite* 被 sessionsDb 组合、公有函数调
+// getActiveBackend)都在函数体/被组合的 function 声明层面 —— 函数声明实例化即就绪,环安全。
+import { getActiveBackend, getSessionsDb } from './sessionsDb.js'
 
 export interface WechatBinding {
   userId: string
@@ -104,25 +109,25 @@ function rowToBinding(r: Row): WechatBinding {
   }
 }
 
-export async function listActiveWechatBindings(): Promise<WechatBinding[]> {
+export async function _sqliteListActiveWechatBindings(): Promise<WechatBinding[]> {
   const db = await getSessionsDb()
   const rows = db.prepare('SELECT * FROM wechat_bindings WHERE status = ?').all('active') as Row[]
   return rows.map(rowToBinding)
 }
 
-export async function listAllWechatBindings(): Promise<WechatBinding[]> {
+export async function _sqliteListAllWechatBindings(): Promise<WechatBinding[]> {
   const db = await getSessionsDb()
   const rows = db.prepare('SELECT * FROM wechat_bindings').all() as Row[]
   return rows.map(rowToBinding)
 }
 
-export async function getWechatBindingByUserId(userId: string): Promise<WechatBinding | null> {
+export async function _sqliteGetWechatBindingByUserId(userId: string): Promise<WechatBinding | null> {
   const db = await getSessionsDb()
   const row = db.prepare('SELECT * FROM wechat_bindings WHERE user_id = ?').get(userId) as Row | undefined
   return row ? rowToBinding(row) : null
 }
 
-export async function getWechatBindingByAccountId(accountId: string): Promise<WechatBinding | null> {
+export async function _sqliteGetWechatBindingByAccountId(accountId: string): Promise<WechatBinding | null> {
   const db = await getSessionsDb()
   const row = db.prepare('SELECT * FROM wechat_bindings WHERE account_id = ?').get(accountId) as Row | undefined
   return row ? rowToBinding(row) : null
@@ -141,7 +146,7 @@ export interface UpsertWechatBindingInput {
   lastEventAt?: number | null
 }
 
-export async function upsertWechatBinding(input: UpsertWechatBindingInput): Promise<void> {
+export async function _sqliteUpsertWechatBinding(input: UpsertWechatBindingInput): Promise<void> {
   const db = await getSessionsDb()
   const now = Date.now()
   const accountOwner = db
@@ -209,7 +214,7 @@ export async function upsertWechatBinding(input: UpsertWechatBindingInput): Prom
   }
 }
 
-export async function updateWechatBindingCursor(
+export async function _sqliteUpdateWechatBindingCursor(
   userId: string,
   getUpdatesBuf: string,
   contextTokens?: Record<string, string>,
@@ -227,7 +232,7 @@ export async function updateWechatBindingCursor(
   }
 }
 
-export async function updateWechatBindingStatus(
+export async function _sqliteUpdateWechatBindingStatus(
   userId: string,
   status: WechatBinding['status'],
 ): Promise<void> {
@@ -240,7 +245,51 @@ export async function updateWechatBindingStatus(
   )
 }
 
-export async function deleteWechatBinding(userId: string): Promise<void> {
+export async function _sqliteDeleteWechatBinding(userId: string): Promise<void> {
   const db = await getSessionsDb()
   db.prepare('DELETE FROM wechat_bindings WHERE user_id = ?').run(userId)
+}
+
+// ── 公有 API:薄委托 active backend(RFC D1)──────────────────────────────────
+//
+// 调用点(WechatManager / 绑定路由)按函数名 import 这些,签名不变、零改动。master 形态注入
+// PG backend 后自动走 PG;容器/个人版无注入 → getActiveBackend() 返回默认 sqliteBackend。
+
+export async function listActiveWechatBindings(): Promise<WechatBinding[]> {
+  return getActiveBackend().listActiveWechatBindings()
+}
+
+export async function listAllWechatBindings(): Promise<WechatBinding[]> {
+  return getActiveBackend().listAllWechatBindings()
+}
+
+export async function getWechatBindingByUserId(userId: string): Promise<WechatBinding | null> {
+  return getActiveBackend().getWechatBindingByUserId(userId)
+}
+
+export async function getWechatBindingByAccountId(accountId: string): Promise<WechatBinding | null> {
+  return getActiveBackend().getWechatBindingByAccountId(accountId)
+}
+
+export async function upsertWechatBinding(input: UpsertWechatBindingInput): Promise<void> {
+  return getActiveBackend().upsertWechatBinding(input)
+}
+
+export async function updateWechatBindingCursor(
+  userId: string,
+  getUpdatesBuf: string,
+  contextTokens?: Record<string, string>,
+): Promise<void> {
+  return getActiveBackend().updateWechatBindingCursor(userId, getUpdatesBuf, contextTokens)
+}
+
+export async function updateWechatBindingStatus(
+  userId: string,
+  status: WechatBinding['status'],
+): Promise<void> {
+  return getActiveBackend().updateWechatBindingStatus(userId, status)
+}
+
+export async function deleteWechatBinding(userId: string): Promise<void> {
+  return getActiveBackend().deleteWechatBinding(userId)
 }
