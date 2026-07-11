@@ -112,8 +112,22 @@ export function makeInboxPostHandler(deps: InboxPostHandlerDeps): InboxPostHandl
   /** `${uid}:${sha256(title\n bodyMd)}` → 最近一次落库时刻(ms)。 */
   const recentContent = new Map<string, number>();
 
+  /**
+   * 去重键归一化:剥掉每次尝试都会变的机读 id(request_id 32hex、trace id、UUID),
+   * 否则"同一失败反复重放"的正文因携带唯一 request_id 而永远不相等 —— 线上实证
+   * (msg 622/623):402 错误体只差 request_id,原样哈希被穿透。只影响键,不改展示内容。
+   */
+  function normalizeForKey(s: string): string {
+    return s
+      .replace(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi, "<uuid>")
+      .replace(/[0-9a-f]{16,}/gi, "<hexid>");
+  }
+
   function contentKey(uid: number, title: string, bodyMd: string): string {
-    return `${uid}:${createHash("sha256").update(`${title}\n${bodyMd}`).digest("hex")}`;
+    const h = createHash("sha256")
+      .update(`${normalizeForKey(title)}\n${normalizeForKey(bodyMd)}`)
+      .digest("hex");
+    return `${uid}:${h}`;
   }
 
   /** 内容维度去重检查(纯读)。**落库成功后才 markContent**,失败不占键,合法重试不被误杀。 */
