@@ -14,6 +14,7 @@
  *                             90d 覆盖"host 出事回看历史"场景
  *   - turn_traces        90d  请求ID→用户/会话反查,计费争议窗口内必须在
  *   - rate_limit_events  30d  限流命中信号,只喂告警聚合
+ *   - connector_write_ledger 90d  写确认账本**终态**行(带 status 谓词;活跃态不删)
  *   - admin_audit        永久  合规审计,显式登记在 PERMANENT_AUDIT_TABLES,
  *                             不允许出现在删除政策里(sweeper 有 fail-fast 断言)
  *   - account_refresh_events / provider_health / wechat_audit 已有各自 sweeper,
@@ -32,6 +33,12 @@ export interface RetentionPolicy {
   /** 时间列名(同上,常量) */
   column: string;
   days: number;
+  /**
+   * 可选附加 WHERE 谓词(**常量,来自本注册表,永不来自用户输入**——SQL 直接拼接的前提)。
+   * 用于只清"终态"行的表(如 connector_write_ledger:活跃态行仍持 params 密文,
+   * 由 connectorSweeper 转终态后才可删)。
+   */
+  predicate?: string;
 }
 
 export const AUDIT_RETENTION_POLICIES: readonly RetentionPolicy[] = [
@@ -40,6 +47,15 @@ export const AUDIT_RETENTION_POLICIES: readonly RetentionPolicy[] = [
   { table: "compute_host_audit", column: "ts", days: 90 },
   { table: "turn_traces", column: "created_at", days: 90 },
   { table: "rate_limit_events", column: "created_at", days: 30 },
+  // P1#11:连接器写账本 90 天终态 retention 统一收口到这里(connectorSweeper 只做
+  // 活跃→终态转换,不再自删)。谓词保证只删终态行——活跃态(pending/approved/executing)
+  // 仍持 params 密文,绝不在此删除。
+  {
+    table: "connector_write_ledger",
+    column: "created_at",
+    days: 90,
+    predicate: "status IN ('succeeded','failed','unknown','expired','denied')",
+  },
 ] as const;
 
 /** 显式声明永久保留的审计表——出现在删除政策里=编程错误。 */
@@ -96,9 +112,11 @@ export function resolveRetentionPolicies(overrides?: string): RetentionPolicy[] 
 }
 
 async function purgeTable(p: RetentionPolicy): Promise<number> {
-  // 标识符来自常量注册表(resolveRetentionPolicies 已过滤 env 注入),可安全拼接。
+  // 标识符与谓词均来自常量注册表(resolveRetentionPolicies 已过滤 env 注入,
+  // env 只能改 days、不能改 table/column/predicate),可安全拼接。
+  const extra = p.predicate ? ` AND (${p.predicate})` : "";
   const r = await query(
-    `DELETE FROM ${p.table} WHERE ${p.column} < NOW() - ($1 || ' days')::interval`,
+    `DELETE FROM ${p.table} WHERE ${p.column} < NOW() - ($1 || ' days')::interval${extra}`,
     [String(p.days)],
   );
   return r.rowCount ?? 0;

@@ -278,6 +278,15 @@ import {
   type LiteratureProxyHandler,
 } from "./literatureProxy.js";
 import {
+  CONNECTORS_RPC_PREFIX,
+  makeConnectorsRpcHandler,
+  type ConnectorsRpcHandler,
+} from "./connectors/rpc.js";
+import {
+  startConnectorSweeper,
+  type ConnectorSweeperHandle,
+} from "./connectors/sweeper.js";
+import {
   RESEARCH_PREFIX,
   makeResearchProxyHandler,
   type ResearchProxyHandler,
@@ -1388,6 +1397,14 @@ export async function registerCommercial(
         identityRepo,
         redis,
       });
+      // /v3/connectors/{list|call} — 应用连接器容器 RPC(oc-connect CLI 回源)。
+      // 同款 verifyContainerIdentity 双因子;第三方凭据只在 master(connections 表
+      // AES-256-GCM),容器只带自身身份 bearer。写操作过确认门(connector_write_ledger),
+      // 出站过 outboundPolicy(自由域 DNS 钉死 / 固定域静态白名单)。
+      const connectorsRpcHandler: ConnectorsRpcHandler = makeConnectorsRpcHandler({
+        identityRepo,
+        redis,
+      });
       // /v3/research/* — 科研 agent 能力 proxy(oc-lit 多源检索 + oc-cite 引用门禁)。
       // 同款 verifyContainerIdentity 双因子;平台 secret(S2/Unpaywall 等)留 master;
       // enabled 由 research_config 控制(off → 503)。免费源(OpenAlex/Crossref/arXiv)无 key。
@@ -1578,6 +1595,9 @@ export async function registerCommercial(
         }
         if (path === LITERATURE_SEARCH_PATH) {
           return literatureProxyHandler(req, res, ctx);
+        }
+        if (path.startsWith(CONNECTORS_RPC_PREFIX)) {
+          return connectorsRpcHandler(req, res, ctx);
         }
         if (path.startsWith(RESEARCH_PREFIX)) {
           return researchProxyHandler(req, res, ctx);
@@ -3566,6 +3586,23 @@ export async function registerCommercial(
     providerHealthScheduler = trackScheduler("providerHealth", "v5-owned", startProviderHealthScheduler({ intervalMs }));
   }
 
+  // 应用连接器 sweeper(设计终稿 §3 护栏):独立定时器,**不挂**被钉死的 idleSweep。
+  // 三职责(活跃态转换)=stale executing→unknown / pending|approved 过期→expired+销毁
+  // params / OAuth 过期行 DELETE;全部 DB CAS+SKIP LOCKED 幂等。P1#11:connector_write_ledger
+  // 90 天终态 retention 已迁至统一 auditRetention 注册表(带终态谓词),此处不再删。
+  // 【域归属 v5-owned】connectors 三表是 0130 v5 引入,v3 无代码 → 不写共享现网;
+  // 但 gate 在 controlPlaneEnabled(OC_CONTROL_PLANE_LEADER)防多 v5 实例双跑
+  // (设计 §3:v5 leader 门控)。关停:OC_CONNECTOR_SWEEPER_DISABLED=1。
+  let connectorSweeper: ConnectorSweeperHandle | undefined;
+  if (
+    controlPlaneEnabled &&
+    process.env.OC_CONNECTOR_SWEEPER_DISABLED !== "1"
+  ) {
+    const raw = Number(process.env.OC_CONNECTOR_SWEEPER_INTERVAL_MS);
+    const intervalMs = Number.isFinite(raw) && raw >= 5_000 ? raw : 60_000;
+    connectorSweeper = trackScheduler("connectorSweeper", "v5-owned", startConnectorSweeper({ intervalMs }));
+  }
+
   // 企业微信群机器人告警投递(v5-owned)。偿「v5 告警只入库不推送」债(playbook 债表
   // af1b054f):iLink/Telegram 投递 worker 寄生 shared 域 startAlertScheduler,v5
   // controlPlaneEnabled=false 把整个 shared scheduler 关掉 → 告警只 enqueue 不推送。
@@ -3720,6 +3757,9 @@ export async function registerCommercial(
       }
       if (providerHealthScheduler) {
         try { providerHealthScheduler.stop(); } catch { /* ignore */ }
+      }
+      if (connectorSweeper) {
+        try { connectorSweeper.stop(); } catch { /* ignore */ }
       }
       if (wecomAlertDispatcher) {
         try { await wecomAlertDispatcher.stop(); } catch { /* ignore */ }

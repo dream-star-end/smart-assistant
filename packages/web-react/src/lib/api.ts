@@ -79,6 +79,13 @@ import type {
   OrgSubscriptionInfo,
   OrgPayResult,
 } from "./types";
+import type {
+  ConnectorBindResult,
+  ConnectorConfirmationDetail,
+  ConnectorDecisionResult,
+  ConnectorOAuthStartResult,
+  ConnectorsResponse,
+} from "./connectors";
 import { normalizeOrgPlan, normalizeOrgSubscription } from "./orgBilling";
 
 /**
@@ -2156,6 +2163,109 @@ export const api = {
         }),
       ),
     ),
+
+  // ── 应用连接器（App Connectors） ─────────────────────────────────────
+  // 契约与后端钉死（类型权威在 lib/connectors.ts）；错误码经 ApiError.code 上抛，
+  // 由调用方走 connectorErrorText 映射中文，本层不做文案。
+
+  /** 目录 + 已绑合并视图（GET /api/connectors，Bearer）。 */
+  getConnectors: (a: AuthSession): Promise<ConnectorsResponse> =>
+    jsonOrThrow<ConnectorsResponse>(
+      callWithRefresh(a, (t) =>
+        fetch("/api/connectors", { credentials: "include", headers: bearerHeaders(t) }),
+      ),
+    ),
+
+  /** 表单绑定（token/basic_form；POST /api/connectors/:provider，Bearer）。 */
+  bindConnector: (
+    a: AuthSession,
+    provider: string,
+    body: { fields: Record<string, string>; displayName?: string },
+  ): Promise<ConnectorBindResult> =>
+    jsonOrThrow<ConnectorBindResult>(
+      callWithRefresh(a, (t) =>
+        fetch(`/api/connectors/${encodeURIComponent(provider)}`, {
+          method: "POST",
+          credentials: "include",
+          headers: bearerHeaders(t, true),
+          body: JSON.stringify(body),
+        }),
+      ),
+    ),
+
+  /**
+   * BYOA OAuth 发起（POST /api/connectors/:provider/oauth/start，Bearer）。
+   * 返回 authorizeUrl，调用方整页跳转（window.location.href）；授权后后端 302 回
+   * `/?connector_linked=<provider>` 或 `/?connector_error=<code>`（照 GitHub 范式）。
+   */
+  startConnectorOAuth: (
+    a: AuthSession,
+    provider: string,
+    body: { clientId: string; clientSecret: string; displayName?: string },
+  ): Promise<ConnectorOAuthStartResult> =>
+    jsonOrThrow<ConnectorOAuthStartResult>(
+      callWithRefresh(a, (t) =>
+        fetch(`/api/connectors/${encodeURIComponent(provider)}/oauth/start`, {
+          method: "POST",
+          credentials: "include",
+          headers: bearerHeaders(t, true),
+          body: JSON.stringify(body),
+        }),
+      ),
+    ),
+
+  /** 写操作确认完整详情（GET /api/connectors/confirmations/:id，服务端解密渲染）。 */
+  getConnectorConfirmation: (a: AuthSession, id: string): Promise<ConnectorConfirmationDetail> =>
+    jsonOrThrow<ConnectorConfirmationDetail>(
+      callWithRefresh(a, (t) =>
+        fetch(`/api/connectors/confirmations/${encodeURIComponent(id)}`, {
+          credentials: "include",
+          headers: bearerHeaders(t),
+        }),
+      ),
+    ),
+
+  /** 批准 / 拒绝写操作（POST /api/connectors/confirmations/:id/approve|deny）。 */
+  decideConnectorConfirmation: (
+    a: AuthSession,
+    id: string,
+    decision: "approve" | "deny",
+  ): Promise<ConnectorDecisionResult> =>
+    jsonOrThrow<ConnectorDecisionResult>(
+      callWithRefresh(a, (t) =>
+        fetch(`/api/connectors/confirmations/${encodeURIComponent(id)}/${decision}`, {
+          method: "POST",
+          credentials: "include",
+          headers: bearerHeaders(t, true),
+          body: "{}",
+        }),
+      ),
+    ),
+
+  /** 重命名连接（PATCH /api/connectors/:id）。 */
+  renameConnector: (a: AuthSession, id: string, displayName: string): Promise<void> =>
+    jsonOrThrow<unknown>(
+      callWithRefresh(a, (t) =>
+        fetch(`/api/connectors/${encodeURIComponent(id)}`, {
+          method: "PATCH",
+          credentials: "include",
+          headers: bearerHeaders(t, true),
+          body: JSON.stringify({ displayName }),
+        }),
+      ),
+    ).then(() => undefined),
+
+  /** 解绑连接（DELETE /api/connectors/:id，解绑 saga 由后端执行）。 */
+  deleteConnector: (a: AuthSession, id: string): Promise<void> =>
+    jsonOrThrow<unknown>(
+      callWithRefresh(a, (t) =>
+        fetch(`/api/connectors/${encodeURIComponent(id)}`, {
+          method: "DELETE",
+          credentials: "include",
+          headers: bearerHeaders(t),
+        }),
+      ),
+    ).then(() => undefined),
 
   // ── 企业版(P3.1)org 自助后台 ─────────────────────────────────────────
   // org 由服务端从 caller membership 推导,前端**不带** org_id。批次 D 端点(usage/

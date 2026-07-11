@@ -9,6 +9,7 @@
  * 由上层 App/MessageRenderer 注入，不污染 props，也不引入第二套传参机制。
  */
 import { createContext, useContext } from "react";
+import type { ConnectorConfirmationDetail, ConnectorDecisionResult } from "../../lib/connectors";
 
 export type ToolCardActions = {
   /** 打开记忆中心（memory / archival / session_search 类）。 */
@@ -19,6 +20,15 @@ export type ToolCardActions = {
   onOpenTasks?: () => void;
   /** 论文卡动作（scansci 下载 PDF / 生成引用）。 */
   onPaperAction?: (action: "download" | "citation", identifier: string) => void;
+  /**
+   * 连接器写操作确认卡（oc-connect，human-in-the-loop）：详情拉取 + 批准/拒绝。
+   * 需登录鉴权（Bearer），由 App 绑定 authRef 注入；无 provider（demo/未登录）时
+   * 卡片降级为纯展示（同本 context 其余动作的哲学）。
+   */
+  connectorConfirm?: {
+    getDetail: (id: string) => Promise<ConnectorConfirmationDetail>;
+    decide: (id: string, decision: "approve" | "deny") => Promise<ConnectorDecisionResult>;
+  };
 };
 
 export const ToolCardActionsContext = createContext<ToolCardActions>({});
