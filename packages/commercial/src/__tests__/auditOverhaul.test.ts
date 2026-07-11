@@ -54,6 +54,11 @@ describe("auditRedact — 中央脱敏钩子", () => {
     assert.deepEqual(out.access_token, { __redacted: true, len: 17, last4: "here" });
     // Codex R1 MAJOR#3:复数凭据集合绝不能被 lookahead 放过
     assert.deepEqual(out.access_tokens, { __redacted: true });
+    // Codex R2:数值放行只限计数形状——数值型口令/密钥照脱
+    const out3 = redactSensitive({ password: 123456, api_key: 987654321, tokens_per_credit: 250 }) as Record<string, unknown>;
+    assert.deepEqual(out3.password, { __redacted: true });
+    assert.deepEqual(out3.api_key, { __redacted: true });
+    assert.equal(out3.tokens_per_credit, 250);
   });
 
   test("嵌套对象与数组内的敏感 key 也被脱敏;敏感 key 下的对象整体替换", () => {
@@ -81,6 +86,12 @@ describe("auditRedact — 中央脱敏钩子", () => {
     assert.deepEqual(out2.token, { __redacted: true });
     assert.deepEqual(out2.secret, { __redacted: true });
     assert.deepEqual(out2.api_key, { __redacted: true });
+    // Codex R2:__redacted:true 夹带未知字段 → 不信任,整体照脱(明文 raw 不得存活)
+    const out3 = redactSensitive({
+      token: { __redacted: true, raw: "sk-live-secret" },
+    }) as Record<string, unknown>;
+    assert.deepEqual(out3.token, { __redacted: true });
+    assert.ok(!JSON.stringify(out3).includes("sk-live-secret"));
   });
 
   test("null/undefined 值原样;标量原样;深度帽生效不炸栈", () => {

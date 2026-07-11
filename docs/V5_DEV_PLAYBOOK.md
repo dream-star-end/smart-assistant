@@ -356,7 +356,7 @@ BEGIN; <迁移 SQL>; INSERT INTO schema_migrations(version, applied_at) VALUES (
 ### 审计体系速记(2026-07-11 整改批)
 - **语义三分层**:`admin_audit`=人类管理员操作留痕(**永久保留**,append-only RULE)/`security_events`(0129)=系统安全事件(route_bypass 等,180d)/运维遥测**不进审计表**(health 快照态=compute_hosts 列,审计只记 health.transition、image.promote.apply 等真实迁移;整改前 84% 是心跳,存量 14 万行已清)。
 - **写入单一权威**:`writeAdminAudit`(admin/audit.ts)。action 必须先在 `admin/auditActions.ts` 注册(编译期字面量类型+运行时 fail-fast,野字符串直接抛);每个 action 声明 `mode`:`tx`=fail-closed(资金/权限/封禁/计费配置,以及 sessions.read 敏感读——记不下就不给看),`best-effort`=业务成功后经 `writeAdminAuditBestEffort` 补写(**禁止调用点自 catch**,中央函数带 critical 告警+Prometheus 计数;对 tx 档 action 会抛)。
-- **中央脱敏**:writeAdminAudit 入口 `redactSensitive`(auditRedact.ts,SENSITIVE_KEY_RE;`token(?!s)` 防误伤 max_tokens 类计数字段);setting key 整值敏感在 systemSettings.set 调用点判。**新调用点不需要也不应该再自行脱敏大对象,但凭据类字段永远别放进 before/after**。
+- **中央脱敏**:writeAdminAudit 入口 `redactSensitive`(auditRedact.ts,SENSITIVE_KEY_RE 命中 key 后按值放行:boolean 恒放行/number 仅 TOKEN_COUNT_KEY_RE 计数形状放行(数值型口令照脱)/string·对象·数组一律脱;已脱敏形状逐字段验类型,`{__redacted:true,raw:…}` 夹带不信任);setting key 整值敏感在 systemSettings.set 调用点判。**新调用点不需要也不应该再自行脱敏大对象,但凭据类字段永远别放进 before/after**。
 - **retention 单一权威**:`admin/auditRetention.ts` 注册表 + `auditRetentionSweep` 调度器(leader shared 域,24h tick;关停 `COMMERCIAL_AUDIT_RETENTION_SWEEP_DISABLED=1`,覆盖 `COMMERCIAL_AUDIT_RETENTION_OVERRIDES=table=days,…` 只认注册表内表名)。**新增事件表的清理必须登记进该注册表,禁止再造独立 sweeper**;admin_audit 在 PERMANENT_AUDIT_TABLES,配删除政策会 fail-fast。
 - 展示面:admin「审计日志」页 4 Tab(管理操作/安全事件/Agent 工具/主机审计)+请求ID反查(`GET /api/admin/trace/:traceId`→turn_traces)。新增 admin 路由记得 `UPDATE_BASELINE=1` 钉路由清单基线。
 
