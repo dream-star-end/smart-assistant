@@ -7,8 +7,8 @@
  * <Media> 主动 effect 签名，替代"占位永停"。
  */
 import * as Dialog from "@radix-ui/react-dialog";
-import { createContext, useCallback, useContext, useEffect, useRef, useState } from "react";
-import { AlertCircle, Download, ExternalLink, FileText, RotateCcw, X } from "lucide-react";
+import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
+import { AlertCircle, Download, ExternalLink, FileText, RotateCcw, WandSparkles, X } from "lucide-react";
 import type { MediaRef } from "../../lib/chat/frames";
 import { classifyMediaRef, isContainerPath, type ResolvedMedia } from "../../lib/chat/media";
 import {
@@ -36,20 +36,23 @@ type MediaSignCtx = {
   invalidate: (path: string) => void;
   /** 同步读缓存:有未过期条目回 URL,否则 null(不触发签名)。点击手势内的快路径用 —— 锚点原生导航前校正 href。 */
   peek: (path: string) => string | null;
+  annotate: ((source: { url: string; name?: string }) => void) | null;
 };
 
-const noop: MediaSignCtx = { resolve: async () => null, invalidate: () => {}, peek: () => null };
+const noop: MediaSignCtx = { resolve: async () => null, invalidate: () => {}, peek: () => null, annotate: null };
 const Ctx = createContext<MediaSignCtx>(noop);
 
 export function MediaSignProvider({
   sign,
   authKey,
+  onAnnotate,
   children,
 }: {
   sign: SignFn | null;
   // P5 fix(Codex):商业签名 URL 是 5min bearerless、token 内含 user/path。同浏览器换账号后
   // 旧账号 signed URL 不能命中(隐私)。authKey 随登录用户变化(登出→null),变即清缓存。
   authKey?: string | number | null;
+  onAnnotate?: (source: { url: string; name?: string }) => void;
   children: React.ReactNode;
 }) {
   // 缓存与 inflight 跨重渲存活；sign 或 authKey 变化（登录态/账号切换）时重置。
@@ -104,9 +107,15 @@ export function MediaSignProvider({
       const hit = cacheRef.current.get(path);
       return hit && hit.expiresAt > Date.now() ? hit.url : null;
     },
+    annotate: null,
   });
 
-  return <Ctx.Provider value={ctxRef.current}>{children}</Ctx.Provider>;
+  const contextValue = useMemo(
+    () => ({ ...ctxRef.current, annotate: onAnnotate ?? null }),
+    [onAnnotate],
+  );
+
+  return <Ctx.Provider value={contextValue}>{children}</Ctx.Provider>;
 }
 
 /**
@@ -213,6 +222,7 @@ export function ZoomableImage({
   signPath?: string | null;
 }) {
   const [open, setOpen] = useState(false);
+  const { annotate } = useContext(Ctx);
   const { get, peek } = useFreshSignedUrl(signPath ?? null);
   // 灯箱内用的最新签名 URL:开灯箱那一刻刷新(挂载 >5min 后再看大图,旧 URL 已死;
   // 缩略图有字节缓存看不出,但灯箱大图/新标签是新请求,必须现签)。
@@ -228,14 +238,30 @@ export function ZoomableImage({
   };
   return (
     <>
-      <button
-        type="button"
-        aria-label={`放大查看${alt ? ` ${alt}` : "图片"}`}
-        onClick={() => handleOpenChange(true)}
-        className="block max-w-full cursor-zoom-in rounded-lg outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg"
-      >
-        <img src={src} alt={alt} loading="lazy" onError={onError} className={imgClassName} />
-      </button>
+      <span className="group relative inline-block max-w-full">
+        <button
+          type="button"
+          aria-label={`放大查看${alt ? ` ${alt}` : "图片"}`}
+          onClick={() => handleOpenChange(true)}
+          className="block max-w-full cursor-zoom-in rounded-lg outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg"
+        >
+          <img src={src} alt={alt} loading="lazy" onError={onError} className={imgClassName} />
+        </button>
+        {annotate && (
+          <button
+            type="button"
+            aria-label="圈选区域修改图片"
+            title="圈选修改 · Image 2"
+            onClick={() => {
+              const start = async () => annotate({ url: signPath ? (await get()) ?? src : src, name: alt || "图片" });
+              void start();
+            }}
+            className="absolute bottom-2 right-2 flex min-h-11 items-center gap-1.5 rounded-full bg-black/70 px-3 text-xs font-medium text-white shadow-float backdrop-blur transition-opacity hover:bg-black/85 sm:min-h-9 sm:opacity-0 sm:group-hover:opacity-100 sm:focus:opacity-100"
+          >
+            <WandSparkles size={15} />圈选修改
+          </button>
+        )}
+      </span>
       <Dialog.Root open={open} onOpenChange={handleOpenChange}>
         <Dialog.Portal>
           <Dialog.Overlay className="fixed inset-0 z-50 bg-black/70 backdrop-blur-sm data-[state=open]:animate-fade" />

@@ -164,8 +164,8 @@ ssh kl-mirror 'psql "$DATABASE_URL" -c "select * from turn_traces where trace_id
 3. codex 引擎:官方 OAuth only,数据面必须走绑定账号的 egress 代理(拔代理应 503=fail-closed);账号池按 runtime_channel 圈定;遥测面已双层封堵。
    - **`-c` 配置覆盖对未知裸键静默 no-op**(0.144 实证:`features.imagegen=false` 不报错也不生效,
      权威名是 `features.image_generation`)。任何 feature 开关注入必须容器内 `codex features list`
-     对照 effective state 实证,不许按键名想当然;原生生图已平台关断(codexLaunchOverrides 注入,
-     平台生图唯一权威=minimax-media,relay 白名单对 /images/* 维持 fail-closed 为纵深防御)。
+     对照 effective state 实证,不许按键名想当然。原生生图现已启用;所有 gpt-image-2
+     generations/edits 必须经 commercial relay 的固定 50 积分预留与成功结算,不得直连旁路。
 4. 委派/团队:hidden-reviewer 有每父 turn ≤3 次硬熔断(server.ts HiddenDelegateGuard,429);delegate 有 idle 5min/hard 45min 超时,Stop 级联中断;一次性委派子会话收尾即 destroySession(2026-07-07,warm runner 不留存)。
 5. **"客户端转圈不止但服务端其实跑完了"**(团队模式高发,2026-07-07 事故):turn 是否真在飞看 session 双计数(`_activeTurnCount` engine 级 + `_activeClientTurnCount` 客户 turn 级,含 review 编排窗口),**别看 runner.isRunning(warm runner 恒 true)**。恢复链权威:hello 重连对账(`_shouldPushTurnInterruptedFinal`→completed 推 meta.reconcile 静默 final / errored 推 service_restart 文案)+ resume_failed→REST 全量对账 + review 迟到团队卡 persistLateTurnArtifacts 补 drain。ring 帧分级(delegate_progress/turn_status=progress 级先淘,contentLossSeq 水位线判回放),团队进度帧 >15帧/s 冲穿 ring 属预期,content 不应受累。取证三件套:容器 docker logs 的 `delegate`/`team_review`/`verification verdict` 行 + master /var/log/openclaude-v5.log 的 `userChatBridge closed(cause)`/`resume replay miss` + client_sessions.last_at 对时间线。
 
@@ -345,7 +345,7 @@ BEGIN; <迁移 SQL>; INSERT INTO schema_migrations(version, applied_at) VALUES (
 | **邮件通道故障(2026-07-10 发现,待 boss 修)** | claudeai.chat 的 Resend 验证 DNS(resend._domainkey TXT / send 子域 SPF+MX)约 07-08 从 Cloudflare 消失(疑 v3 退役清理误删),所有外发邮件 400 domain-not-verified:验证码/重置/群发全断;RESEND_API_KEY 为 sending-only 无法自查后台 | boss:Resend 后台复制 3 条 DNS 记录→Cloudflare 加回(DNS only)→Verify;恢复后跑待命群发(见 broadcast 脚本头注释) |
 | MCP 工具富卡靠解析文本 | 工具卡批(66e91003)裁决:富卡数据源=前端解析 mcp-memory 文本(格式契约两侧单测钉死,失败回退 OutputBlock)。structuredContent 非一等公民:codex 链路裹在 2000 字符截断 item 串里、CCB 链路根本不透传 | 卡片需要文本装不下的数据(分页/大列表)时:两引擎 runner 改造 structuredContent 透传 |
 | ~~codex 原生生图关断~~ **已反转**(boss 07-11 拍板启用,merge 18943fa1) | relay 放行 POST /images/generations\|edits + 撤 features 关断 + AGENTS.md 引导优先 imagegen(gpt-image-2);minimax-media 退居备选/非 codex 引擎 | — |
-| codex 生图按张计费未接 | 生图消耗平台 codex 账号订阅配额,用户侧零扣费;relay 有 binding.userId 可归因,扣费收口应复用 egress anthropicProxy 的 appendCostCredits 范式;**单价需 boss 定** | boss 给出按张定价后接入;或生图用量失控时先临时限频 |
+| ~~codex 生图按张计费未接~~ **已完成** | gpt-image-2 generations/edits 统一成功后每张 50 积分;精确标注编辑在遮罩合成原子落盘后结算;余额不足硬拒、单用户并发 1、UTC 每日成功 10 张、失败不扣费、request/job 幂等 | 运维查 `image_generation_usage_records` + `credit_ledger(reason='image_generation')`;改 relay/结算必须 `deploy-v5.sh --egress` |
 | mmx 凭据文件通道(镜像常量对) | codex 路径 env 被双重清洗(buildCodexEnv 剥 OPENCLAUDE_* + codex shell 策略剥 *TOKEN*),mmx 凭据走 entrypoint 每 boot 覆写的 container-auth.json;**新增依赖容器 env 的平台 CLI 必须同样走文件或 OC_ 前缀非凭据名**,argv `-c` 回注 = 违反 token 不进日志不变量(有防回归断言) | — |
 | reminder 无独立 label 字段 | 列表标题=prompt 压平截断兜底(reminderFormat.ts);系统任务中文名是镜像常量(权威源 gateway cron.ts DEFAULT_JOBS,两处需同步) | 用户自定义任务名需求出现时:cron job 加 label 一等字段 |
 | CI 失败无告警 | v5-ci 挂/红没有任何推送(07-07 起 commercial-unit 门挂死 3 天无人知,2026-07-10 才根治);GitHub→告警 outbox 无桥 | 下次 CI 再次静默红超 1 天时:加 workflow 失败 webhook→admin_alert_outbox(events 已有 ops 组可挂) |

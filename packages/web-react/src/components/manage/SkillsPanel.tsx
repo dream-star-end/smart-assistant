@@ -168,11 +168,16 @@ function SkillRow({
   const [err, setErr] = useState<string | null>(null);
   const [section, setSection] = useState<"body" | "evals" | "train">("body");
   const [editorOpen, setEditorOpen] = useState(false);
+  // P3「未配评测」提示点:自建可写技能有无评测用例(null=未探测;只读/市场技能不探测)。
+  // 列表数据不含 evals 信息,故在技能行展开时按需轻量探一次(非列表级批量请求)。
+  const [hasEvals, setHasEvals] = useState<boolean | null>(null);
+  const showEvalHint = skill.writable === true && skill.layer !== "hub";
 
   const toggle = useCallback(() => {
     const next = !open;
     setOpen(next);
-    if (next && !detail && !loading) {
+    if (!next) return;
+    if (!detail && !loading) {
       setLoading(true);
       setErr(null);
       api
@@ -181,7 +186,15 @@ function SkillRow({
         .catch((e) => setErr((e as Error).message || "加载技能正文失败"))
         .finally(() => setLoading(false));
     }
-  }, [open, detail, loading, auth, skill.name]);
+    // 自建可写技能:展开时探一次「有无评测用例」,决定是否给「未配评测」提示点。
+    // 保留旧值不闪烁;拉取失败静默(hasEvals 维持原状 → 不误报徽章)。
+    if (showEvalHint) {
+      api
+        .getSkillEvals(auth, skill.name)
+        .then((r) => setHasEvals((r.evals?.cases?.length ?? 0) > 0))
+        .catch(() => {});
+    }
+  }, [open, detail, loading, auth, skill.name, showEvalHint]);
 
   return (
     <li className="overflow-hidden rounded-xl border border-border bg-surface">
@@ -265,6 +278,19 @@ function SkillRow({
                 {t.label}
               </button>
             ))}
+            {/* 自建可写技能无评测用例 → 克制的「未配评测」提示点(faint 色,点击跳评测页签)。
+                只读/市场技能不显示;已配评测(hasEvals=true)或未探测(null)时不显示。 */}
+            {showEvalHint && hasEvals === false && section !== "evals" && (
+              <button
+                type="button"
+                onClick={() => setSection("evals")}
+                title="这个技能还没有评测用例,点击去「评测」配置"
+                className="ml-auto inline-flex items-center gap-1 self-center rounded-full px-2 py-0.5 text-[11px] text-faint outline-none transition-colors hover:bg-hover hover:text-muted focus-visible:ring-2 focus-visible:ring-ring"
+              >
+                <span className="size-1.5 rounded-full bg-current" aria-hidden />
+                未配评测
+              </button>
+            )}
           </div>
           {section === "evals" ? (
             <SkillEvalSection auth={auth} skillName={skill.name} rates={rates} />

@@ -311,6 +311,38 @@ export async function preCheckWithCost(
   };
 }
 
+/** Fixed-price products must never inherit chat's cap-to-balance semantics.
+ * Reserve the full amount or reject before any upstream work starts. */
+export async function preCheckExactCost(
+  redis: PreCheckRedis,
+  input: PreCheckWithCostInput,
+): Promise<PreCheckResult> {
+  assertRequestId(input.requestId)
+  assertSafeBigInt('maxCost', input.maxCost)
+  const [personal, orgSpendable] = await Promise.all([
+    getSpendableBalance(input.userId),
+    getOrgSpendableForUser(input.userId).catch(() => 0n),
+  ])
+  const balance = personal + orgSpendable
+  if (balance < input.maxCost) throw new InsufficientCreditsError(balance, input.maxCost)
+  assertSafeBigInt('balance', balance)
+  const result = await redis.atomicReserve({
+    userId: input.userId,
+    requestId: input.requestId,
+    balance,
+    maxCost: input.maxCost,
+    ttlSeconds: input.ttlSeconds ?? DEFAULT_RESERVATION_TTL_SEC,
+  })
+  if (!result.ok) throw new InsufficientCreditsError(balance, result.needed)
+  return {
+    maxCost: input.maxCost,
+    balance,
+    reservation: { userId: uidToStr(input.userId), requestId: input.requestId },
+    capped: false,
+    originalMaxCost: input.maxCost,
+  }
+}
+
 /** 释放预扣(按 handle)。成功返回 true / 不存在(过期或已释放)返回 false。 */
 export async function releasePreCheck(
   redis: PreCheckRedis,

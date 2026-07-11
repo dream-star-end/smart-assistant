@@ -25,6 +25,8 @@ import { getRuntimeChannel } from "../runtimeChannel.js";
 import type { ContainerIdentityRepo } from "../auth/containerIdentity.js";
 import type { AccountHealthTracker } from "../account-pool/health.js";
 import type { RateLimitRedis } from "../middleware/rateLimit.js";
+import type { PreCheckRedis } from "../billing/preCheck.js";
+import type { Pool } from "pg";
 import { writeCodexContainerAuthFile } from "../codex-auth/codexAuthFile.js";
 import {
   putRemoteCodexContainerAuth,
@@ -199,9 +201,15 @@ export function buildCodexTokenRefreshHandler(
 /** `/internal/v3/codex-relay` handler 装配(路由态全在 PG,master/egress 等价)。 */
 export function buildCodexRelayHandler(deps: {
   identityRepo: ContainerIdentityRepo;
+  preCheckRedis: PreCheckRedis;
+  pgPool: Pool;
+  onImageCharge?: (userId: bigint, payload: { costCredits: string; balanceAfter: string | null }) => void;
 }): CodexRelayHandler {
   return makeCodexRelayHandler({
     identityRepo: deps.identityRepo,
     db: makeDefaultCodexRelayDb(),
+    preCheckRedis: deps.preCheckRedis,
+    pgPool: deps.pgPool,
+    onImageCharge: deps.onImageCharge,
   });
 }

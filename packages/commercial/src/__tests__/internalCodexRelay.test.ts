@@ -114,6 +114,7 @@ describe('internalCodexRelay path mapping', () => {
       assert.equal(isRelayCredentialFailureStatus(status), false, `${status} should not count as credential failure`)
     }
   })
+
 })
 
 describe('internalCodexRelay handler', () => {
@@ -394,7 +395,7 @@ describe('internalCodexRelay official chatgpt upstream(B5)', () => {
     if ('error' in sub) assert.equal(sub.error.code, 'PATH_NOT_ALLOWED')
   })
 
-  test('handler:official 路径按绑定账号 dispatcher 转发 chatgpt.com,容器 Authorization + chatgpt-account-id 透传', async () => {
+  test('handler:official 路径仅透传安全的 Codex 路由头,并返回上游 turn state', async () => {
     const captured: { url?: string; headers?: Headers; dispatcher?: unknown } = {}
     const handler = makeCodexRelayHandler({
       identityRepo: makeRepo(),
@@ -405,7 +406,10 @@ describe('internalCodexRelay official chatgpt upstream(B5)', () => {
         captured.url = String(input)
         captured.headers = new Headers(init?.headers)
         captured.dispatcher = (init as { dispatcher?: unknown }).dispatcher
-        return new Response('ok', { status: 200 })
+        return new Response('ok', {
+          status: 200,
+          headers: { 'x-codex-turn-state': 'returned-turn-state' },
+        })
       }) as typeof fetch,
     })
     const server = createServer((req, res) => { void handler(req, res, CTX) })
@@ -418,6 +422,11 @@ describe('internalCodexRelay official chatgpt upstream(B5)', () => {
           [CODEX_UPSTREAM_AUTH_HEADER]: 'Bearer chatgpt-access-token',
           'chatgpt-account-id': 'acc-uuid-1',
           originator: 'codex_cli_rs',
+          'x-codex-turn-state': 'request-turn-state',
+          'x-openai-internal-codex-responses-lite': 'true',
+          'x-codex-installation-id': 'must-not-leave-relay',
+          'x-unknown-client-header': 'must-not-leave-relay',
+          'x-openclaude-private-test': 'must-not-leave-relay',
           'content-type': 'application/json',
         },
         body: '{"input":"hi"}',
@@ -428,6 +437,12 @@ describe('internalCodexRelay official chatgpt upstream(B5)', () => {
       assert.equal(captured.headers?.get('authorization'), 'Bearer chatgpt-access-token')
       assert.equal(captured.headers?.get('chatgpt-account-id'), 'acc-uuid-1')
       assert.equal(captured.headers?.get('originator'), 'codex_cli_rs')
+      assert.equal(captured.headers?.get('x-codex-turn-state'), 'request-turn-state')
+      assert.equal(captured.headers?.get('x-openai-internal-codex-responses-lite'), 'true')
+      assert.equal(captured.headers?.has('x-codex-installation-id'), false)
+      assert.equal(captured.headers?.has('x-unknown-client-header'), false)
+      assert.equal(captured.headers?.has('x-openclaude-private-test'), false)
+      assert.equal(res.headers.get('x-codex-turn-state'), 'returned-turn-state')
     } finally {
       await close(server)
     }

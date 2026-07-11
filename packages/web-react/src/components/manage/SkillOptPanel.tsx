@@ -632,6 +632,8 @@ export function SkillTrainSection({
   const [runId, setRunId] = useState<string | null>(null);
   // 刷新/服务重启后找回未处理草稿时的提示条（info，非报错）。
   const [resumeNotice, setResumeNotice] = useState<string | null>(null);
+  // P3:启动响应带 feedbackRefs>0 → 提示本次训练命中了用户差评过的真实失败案例。
+  const [feedbackNotice, setFeedbackNotice] = useState<string | null>(null);
   const [confirmDialog, confirmDialogEl] = useConfirm();
 
   const trainFetcher = useCallback(
@@ -698,9 +700,16 @@ export function SkillTrainSection({
     if (!ok) return;
     setErr(null);
     setResumeNotice(null);
+    setFeedbackNotice(null);
     try {
       const r = await api.startSkillTrain(auth, skillName, { autoEval: true });
       setRunId(r.runId);
+      // 旧后端不返回 feedbackRefs → undefined,不渲染提示(容错)。
+      if (typeof r.feedbackRefs === "number" && r.feedbackRefs > 0) {
+        setFeedbackNotice(
+          `已找到 ${r.feedbackRefs} 条你差评过的真实使用记录,本次训练将优先分析这些失败案例`,
+        );
+      }
     } catch (e) {
       setErr((e as Error).message || "启动训练失败");
     }
@@ -714,6 +723,7 @@ export function SkillTrainSection({
     setRunId(null);
     setRun(null);
     setResumeNotice(null);
+    setFeedbackNotice(null);
   };
 
   const PHASE_LABEL: Record<string, string> = {
@@ -731,6 +741,7 @@ export function SkillTrainSection({
       {confirmDialogEl}
       {err && <Alert tone="danger">{err}</Alert>}
       {resumeNotice && <Alert tone="info">{resumeNotice}</Alert>}
+      {feedbackNotice && <Alert tone="info">{feedbackNotice}</Alert>}
 
       {!run && (
         <div className="flex items-start justify-between gap-3">
@@ -779,6 +790,7 @@ export function SkillTrainSection({
                 setRunId(null);
                 setRun(null);
                 setResumeNotice(null);
+                setFeedbackNotice(null);
               }}
               confirmDialog={confirmDialog}
             />

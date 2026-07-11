@@ -12,12 +12,15 @@ import { afterEach, describe, test } from 'node:test'
 import type { ToolCalledEvent } from '@openclaude/protocol'
 
 import {
+  SKILL_FEEDBACK_PATH,
   SKILL_USAGE_PATH,
   SKILL_VIEW_TOOL,
   SkillUsageReportError,
+  fetchUserSkillFeedbackRefs,
   isSkillUsageEnabled,
   makeSkillUsageReporter,
   normalizeTraceId,
+  parseSkillFeedbackResponse,
   parseSkillSlug,
   readSkillUsageReportConfig,
   sendSkillUsageReport,
@@ -43,6 +46,18 @@ async function makeHub(slugs: string[]): Promise<string> {
   const hub = await tmp('oc-hub-')
   for (const s of slugs) await mkdir(join(hub, s), { recursive: true })
   return hub
+}
+
+/** 用户自建技能目录(= shared library),带若干技能子目录。 */
+async function makeUserSkills(slugs: string[]): Promise<string> {
+  const dir = await tmp('oc-userskills-')
+  for (const s of slugs) await mkdir(join(dir, s), { recursive: true })
+  return dir
+}
+
+/** 轮询直到 fn() 为真或超时(避免 flaky 固定 sleep)。 */
+async function waitUntil(fn: () => boolean, tries = 60, gapMs = 20): Promise<void> {
+  for (let i = 0; i < tries && !fn(); i += 1) await new Promise((r) => setTimeout(r, gapMs))
 }
 
 function skillViewEvent(overrides: Partial<ToolCalledEvent> = {}): ToolCalledEvent {
@@ -133,7 +148,7 @@ describe('skillUsageReporter', () => {
     let seenAuth = ''
     let seenBody: any = null
     await sendSkillUsageReport(
-      [{ eventId: 'e1', slug: 'browser', agentId: 'main', sessionKey: 's', traceId: TRACE, at: '2026-07-10T00:00:00Z' }],
+      [{ eventId: 'e1', slug: 'browser', agentId: 'main', sessionKey: 's', traceId: TRACE, layer: 'hub', at: '2026-07-10T00:00:00Z' }],
       { masterBaseUrl: 'http://master', containerToken: 'tok' },
       {
         fetchImpl: async (input, init) => {
@@ -168,12 +183,14 @@ describe('skillUsageReporter', () => {
   test('reports only successful hub skill_view; filters errors, non-skill_view, non-hub; carries traceId', async () => {
     const queueDir = await tmp('oc-usage-')
     const hubDir = await makeHub(['browser']) // 'browser' 在 hub;'platform-capabilities' 不在
+    const userDir = await makeUserSkills([]) // 空用户层,判定隔离于宿主机真实 ~/.openclaude/skills
     const { bus, emit } = fakeBus()
     const posts: any[] = []
     const reporter = makeSkillUsageReporter({
       config: { masterBaseUrl: 'http://master', containerToken: 'tok' },
       queueDir,
       hubSkillsDir: hubDir,
+      userSkillsDir: userDir,
       eventBus: bus as any,
       drainIntervalMs: 60_000,
       resolveTraceId: () => TRACE,
@@ -207,15 +224,57 @@ describe('skillUsageReporter', () => {
     reporter.stop()
   })
 
-  test('non-32hex resolved traceId is coerced to null (best-effort, never mints)', async () => {
+  test('layer: user-authored → user; hub → hub; user shadows hub; neither → dropped', async () => {
     const queueDir = await tmp('oc-usage-')
-    const hubDir = await makeHub(['browser'])
+    // 'shared-name' 同时在 user 与 hub:用户版遮蔽 hub → 应判为 'user'(不污染市场信号)。
+    const hubDir = await makeHub(['browser', 'shared-name'])
+    const userDir = await makeUserSkills(['my-skill', 'shared-name'])
     const { bus, emit } = fakeBus()
     const posts: any[] = []
     const reporter = makeSkillUsageReporter({
       config: { masterBaseUrl: 'http://master', containerToken: 'tok' },
       queueDir,
       hubSkillsDir: hubDir,
+      userSkillsDir: userDir,
+      eventBus: bus as any,
+      drainIntervalMs: 60_000,
+      resolveTraceId: () => TRACE,
+      fetchImpl: async (_i, init) => {
+        posts.push(JSON.parse(String(init.body)))
+        return new Response('{"ok":true,"accepted":1,"duplicate":0}', { status: 200 })
+      },
+    })
+    reporter.start()
+
+    emit(skillViewEvent({ inputPreview: '{"name":"my-skill"}' })) // 用户自建 → user
+    emit(skillViewEvent({ inputPreview: '{"name":"browser"}' })) // 仅 hub → hub
+    emit(skillViewEvent({ inputPreview: '{"name":"shared-name"}' })) // 两层都有 → user(遮蔽)
+    emit(skillViewEvent({ inputPreview: '{"name":"platform-cap"}' })) // 两层都不中 → 丢弃
+
+    await waitUntil(() => posts.flatMap((p) => p.events).length >= 3)
+    await new Promise((r) => setTimeout(r, 60)) // 让被丢弃的事件也走完串行链
+
+    const events = posts.flatMap((p) => p.events)
+    assert.equal(events.length, 3) // platform-cap 被丢弃
+    const layerBySlug = Object.fromEntries(events.map((e: any) => [e.slug, e.layer]))
+    assert.equal(layerBySlug['my-skill'], 'user')
+    assert.equal(layerBySlug['browser'], 'hub')
+    assert.equal(layerBySlug['shared-name'], 'user')
+    assert.ok(!('platform-cap' in layerBySlug))
+    reporter.stop()
+  })
+
+  test('non-32hex resolved traceId is coerced to null (best-effort, never mints)', async () => {
+    const queueDir = await tmp('oc-usage-')
+    const hubDir = await makeHub(['browser'])
+    const userDir = await makeUserSkills([]) // 空用户层,判定隔离于宿主机真实目录
+    const { bus, emit } = fakeBus()
+    const posts: any[] = []
+    const reporter = makeSkillUsageReporter({
+      config: { masterBaseUrl: 'http://master', containerToken: 'tok' },
+      queueDir,
+      hubSkillsDir: hubDir,
+      userSkillsDir: userDir,
       eventBus: bus as any,
       drainIntervalMs: 60_000,
       resolveTraceId: () => 'not-a-valid-trace', // 非法 → null
@@ -294,5 +353,106 @@ describe('skillUsageReporter', () => {
         else process.env[k] = v
       }
     }
+  })
+})
+
+describe('skill-feedback refs (training material fetch, fail-open)', () => {
+  test('parseSkillFeedbackResponse: keeps valid refs + total, drops malformed', () => {
+    const parsed = parseSkillFeedbackResponse({
+      refs: [
+        { sessionKey: 's1', traceId: TRACE, at: '2026-07-10T00:00:00Z' },
+        { sessionKey: '  s2  ', traceId: 'not-hex', at: 123 }, // traceId 非法→null;at 非串→null;sessionKey 去空白
+        { traceId: TRACE }, // 缺 sessionKey → 丢弃
+        'x', // 非对象 → 丢弃
+        null,
+      ],
+      total: 5,
+    })
+    assert.equal(parsed.total, 5)
+    assert.equal(parsed.refs.length, 2)
+    assert.deepEqual(parsed.refs[0], { sessionKey: 's1', traceId: TRACE, at: '2026-07-10T00:00:00Z' })
+    assert.deepEqual(parsed.refs[1], { sessionKey: 's2', traceId: null, at: null })
+  })
+
+  test('parseSkillFeedbackResponse: structural garbage → empty result', () => {
+    assert.deepEqual(parseSkillFeedbackResponse(null), { refs: [], total: 0 })
+    assert.deepEqual(parseSkillFeedbackResponse('nope'), { refs: [], total: 0 })
+    assert.deepEqual(parseSkillFeedbackResponse({ refs: 'not-array' }), { refs: [], total: 0 })
+    // total 缺省/非数 → 回落为 refs 条数。
+    assert.deepEqual(parseSkillFeedbackResponse({ refs: [{ sessionKey: 's1' }] }), {
+      refs: [{ sessionKey: 's1', traceId: null, at: null }],
+      total: 1,
+    })
+  })
+
+  test('fetch: success sends container bearer + slug/layer query, returns refs', async () => {
+    let seenUrl = ''
+    let seenAuth = ''
+    let seenMethod = ''
+    const env = {
+      OPENCLAUDE_V3_MASTER_BASE_URL: 'http://master//', // 尾斜杠应被裁掉
+      OPENCLAUDE_V3_CONTAINER_TOKEN: 'tok',
+    }
+    const out = await fetchUserSkillFeedbackRefs('web-context', {
+      env,
+      fetchImpl: async (input, init) => {
+        seenUrl = String(input)
+        seenAuth = new Headers(init.headers).get('authorization') ?? ''
+        seenMethod = String(init.method)
+        return new Response(
+          JSON.stringify({ refs: [{ sessionKey: 's1', traceId: TRACE, at: 'x' }], total: 1 }),
+          { status: 200 },
+        )
+      },
+    })
+    assert.equal(
+      seenUrl,
+      `http://master${SKILL_FEEDBACK_PATH}?slug=web-context&layer=user`,
+    )
+    assert.equal(seenAuth, 'Bearer tok')
+    assert.equal(seenMethod, 'GET')
+    assert.equal(out.total, 1)
+    assert.equal(out.refs.length, 1)
+    assert.equal(out.refs[0].sessionKey, 's1')
+  })
+
+  test('fetch fail-open: missing env / non-ok / thrown fetch all yield empty', async () => {
+    const env = {
+      OPENCLAUDE_V3_MASTER_BASE_URL: 'http://master',
+      OPENCLAUDE_V3_CONTAINER_TOKEN: 'tok',
+    }
+    // 缺 env(非 commercial 容器)→ 空,且根本不发请求。
+    let called = false
+    assert.deepEqual(
+      await fetchUserSkillFeedbackRefs('browser', {
+        env: {},
+        fetchImpl: async () => {
+          called = true
+          return new Response('{}', { status: 200 })
+        },
+      }),
+      { refs: [], total: 0 },
+    )
+    assert.equal(called, false)
+    // 空 slug → 空。
+    assert.deepEqual(await fetchUserSkillFeedbackRefs('   ', { env }), { refs: [], total: 0 })
+    // 端点未上线 / 404 → 空(fail-open)。
+    assert.deepEqual(
+      await fetchUserSkillFeedbackRefs('browser', {
+        env,
+        fetchImpl: async () => new Response('not found', { status: 404 }),
+      }),
+      { refs: [], total: 0 },
+    )
+    // fetch 抛(网络/超时)→ 空(fail-open,绝不上抛)。
+    assert.deepEqual(
+      await fetchUserSkillFeedbackRefs('browser', {
+        env,
+        fetchImpl: async () => {
+          throw new Error('ECONNREFUSED')
+        },
+      }),
+      { refs: [], total: 0 },
+    )
   })
 })

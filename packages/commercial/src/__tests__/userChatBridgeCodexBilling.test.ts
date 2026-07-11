@@ -498,6 +498,58 @@ function journalAborts(rig: BillingRig) {
 
 // ---------- tests -----------------------------------------------------------
 
+describe("userChatBridge / annotated Image 2 — forward only", () => {
+  let rig: BillingRig;
+  before(async () => { rig = await startRig({ userBalance: 50n }); });
+  after(async () => { await stopRig(rig); });
+
+  test("valid imageEdit gets canonical ids without Codex slot/precheck/journal", async () => {
+    const containerOpenP = waitNextContainerSocket(rig);
+    const ws = openClient(rig.gatewayPort, await makeJwt("11"));
+    await waitOpen(ws);
+    const containerWs = await containerOpenP;
+    ws.send(JSON.stringify({
+      type: "inbound.message",
+      idempotencyKey: "image-edit-test",
+      channel: "webchat",
+      peer: { id: "image-peer", kind: "dm" },
+      agentId: "codex",
+      model: "gpt-5.6-sol",
+      content: {
+        text: "把圈选区域改成晚霞",
+        media: [0, 1, 2].map((n) => ({
+          kind: "image", url: `/api/media/image-${n}.png`, mimeType: "image/png", hidden: n > 0,
+        })),
+        imageEdit: {
+          clientJobId: "1234567890abcdef1234567890abcdef",
+          sourceIndex: 0,
+          maskIndex: 1,
+          guideIndex: 2,
+          width: 1024,
+          height: 768,
+        },
+      },
+      ts: Date.now(),
+    }));
+
+    const forwarded = JSON.parse((await waitContainerNextFrame(containerWs)).data) as Record<string, unknown>;
+    assert.match(String(forwarded.requestId), /^[0-9a-f]{32}$/);
+    assert.match(String(forwarded.traceId), /^[A-Za-z0-9_-]{16,64}$/);
+    assert.equal(rig.binding.acquireCalls, 0, "Image 2 must not consume a Codex chat slot");
+    assert.equal(
+      rig.poolCtrl.queries.some((q) => /request_finalize_journal/.test(q.sql)),
+      false,
+      "Image 2 must not open a Codex inflight journal",
+    );
+    assert.equal(
+      rig.poolCtrl.queries.some((q) => /SELECT\s+u\.credits/i.test(q.sql)),
+      false,
+      "Image 2 must not run ordinary chat preCheck",
+    );
+    ws.close();
+  });
+});
+
 describe("userChatBridge / codex billing — happy path(双钱包 settle)", () => {
   let rig: BillingRig;
   before(async () => { rig = await startRig({ userBalance: 1_000_000n }); });

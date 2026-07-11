@@ -61,6 +61,7 @@ export type UseChatSocket = {
     text: string;
     displayText?: string;
     media?: InboundMessage["content"]["media"];
+    imageEdit?: InboundMessage["content"]["imageEdit"];
     model?: string;
     effortLevel?: InboundMessage["effortLevel"];
     teamMode?: boolean;

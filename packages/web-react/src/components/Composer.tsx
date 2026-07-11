@@ -1,6 +1,6 @@
 import * as Dialog from "@radix-ui/react-dialog";
 import { MAX_ATTACHMENTS_PER_MESSAGE } from "@openclaude/protocol";
-import { ArrowUp, FileText, Loader2, Mic, Plus, RotateCcw, Square, X } from "lucide-react";
+import { ArrowUp, FileText, Loader2, Mic, Plus, RotateCcw, Square, WandSparkles, X } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useVoiceInput } from "../hooks/useVoiceInput";
 import { appUpdate } from "../lib/appUpdate";
@@ -46,6 +46,8 @@ export function Composer({
   prefill,
   repoSelection,
   onOpenRepo,
+  onAnnotateImage,
+  image2UnavailableReason,
 }: {
   /** 发送：text + 可选已上传媒体（图片/文件等）。 */
   onSend: (text: string, media?: MediaRef[]) => void;
@@ -63,6 +65,9 @@ export function Composer({
   repoSelection?: RepoSelection | null;
   /** 打开 GitHub 仓库绑定 modal（入口在底部左侧）。 */
   onOpenRepo?: () => void;
+  /** Open the precise Image 2 editor for a locally selected attachment. */
+  onAnnotateImage?: (source: { url: string; name?: string }) => void;
+  image2UnavailableReason?: string;
 }) {
   const [value, setValue] = useState("");
   // 指针类型:粗指针(触屏/移动)下 Enter=换行(否则打不出多段消息),发送交给按钮;
@@ -251,6 +256,12 @@ export function Composer({
                 onRetry={
                   a.status === "error" && a.file ? () => void uploadOne(a.id, a.file as File) : undefined
                 }
+                onAnnotate={
+                  a.kind === "image" && a.previewUrl && a.status === "done" && onAnnotateImage
+                    ? () => onAnnotateImage({ url: a.previewUrl as string, name: a.name })
+                    : undefined
+                }
+                annotateDisabledReason={a.kind === "image" && a.status === "done" ? image2UnavailableReason : undefined}
               />
             ))}
           </div>
@@ -375,6 +386,8 @@ export function AttachChip({
   onRemove,
   onPreview,
   onRetry,
+  onAnnotate,
+  annotateDisabledReason,
 }: {
   a: Attach;
   onRemove: () => void;
@@ -382,6 +395,8 @@ export function AttachChip({
   onPreview?: () => void;
   /** 上传失败重试（复用原 File 原地重传；非 error 态 / 无持有 File 时省略）。 */
   onRetry?: () => void;
+  onAnnotate?: () => void;
+  annotateDisabledReason?: string;
 }) {
   const isImage = a.kind === "image" && !!a.previewUrl;
   return (
@@ -426,6 +441,18 @@ export function AttachChip({
         >
           <RotateCcw size={12} />
           重试
+        </button>
+      )}
+      {(onAnnotate || annotateDisabledReason) && (
+        <button
+          type="button"
+          onClick={onAnnotate}
+          disabled={!onAnnotate}
+          aria-label={`圈选修改 ${a.name}`}
+          title={annotateDisabledReason ?? "圈选修改 · Image 2"}
+          className="flex size-8 shrink-0 items-center justify-center rounded-md text-accent hover:bg-accent/10 disabled:cursor-not-allowed disabled:opacity-35"
+        >
+          <WandSparkles size={15} />
         </button>
       )}
       <button

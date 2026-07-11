@@ -41,13 +41,17 @@ const SLUG_RE = /^[a-z0-9][a-z0-9-]{1,63}$/
 /** traceId = 32 hex(与 bridge 铸造的 canonical traceId 空间一致)。 */
 const TRACE_RE = /^[0-9a-f]{32}$/
 
-/** 落库形状(已过校验;agentId/sessionKey/traceId 归一为 string|null)。 */
+/** 技能层:hub=市场上架技能(进目录聚合);user=用户自建技能(用户私有,只喂技能训练)。 */
+export type SkillUsageLayer = 'hub' | 'user'
+
+/** 落库形状(已过校验;agentId/sessionKey/traceId 归一为 string|null;layer 缺省 'hub')。 */
 export interface SkillUsageEvent {
   eventId: string
   slug: string
   agentId: string | null
   sessionKey: string | null
   traceId: string | null
+  layer: SkillUsageLayer
 }
 
 export interface SkillUsageCtx {
@@ -131,8 +135,15 @@ function validateEvent(raw: unknown): SkillUsageEvent | null {
   if (o.traceId === undefined || o.traceId === null) traceId = null
   else if (typeof o.traceId === 'string' && TRACE_RE.test(o.traceId)) traceId = o.traceId
   else return null
+  // layer:缺省/null → 'hub'(向后兼容旧容器,与 0128 单层语义一致);是串则必须 'hub'|'user',
+  // 越界值整批违约(与 traceId 同风格:非法值 loud-fail sender bug,不静默降级 —— 若把非法 layer
+  // 静默当 'hub',user 层数据可能被错误计入市场聚合,污染信号)。
+  let layer: SkillUsageLayer
+  if (o.layer === undefined || o.layer === null) layer = 'hub'
+  else if (o.layer === 'hub' || o.layer === 'user') layer = o.layer
+  else return null
   // at 仅作参考,不入库(created_at 以 master NOW() 为准);此处不强校验其格式。
-  return { eventId, slug, agentId, sessionKey, traceId }
+  return { eventId, slug, agentId, sessionKey, traceId, layer }
 }
 
 /** 校验整个 body,返回事件数组或 null(结构违约)/'TOO_MANY'(超批)。 */
@@ -169,17 +180,19 @@ export async function insertSkillUsageEvents(
   }
   if (unique.length === 0) return { accepted: 0, duplicate: events.length }
 
-  const cols = 6
+  const cols = 7
   const placeholders: string[] = []
   const params: unknown[] = []
   unique.forEach((e, i) => {
     const b = i * cols
-    placeholders.push(`($${b + 1},$${b + 2},$${b + 3},$${b + 4},$${b + 5},$${b + 6})`)
-    params.push(userId, e.slug, e.agentId, e.sessionKey, e.traceId, e.eventId)
+    placeholders.push(
+      `($${b + 1},$${b + 2},$${b + 3},$${b + 4},$${b + 5},$${b + 6},$${b + 7})`,
+    )
+    params.push(userId, e.slug, e.agentId, e.sessionKey, e.traceId, e.eventId, e.layer)
   })
   const r = await runner.query(
     `INSERT INTO marketplace_skill_usage_events
-       (user_id, slug, agent_id, session_key, trace_id, event_id)
+       (user_id, slug, agent_id, session_key, trace_id, event_id, layer)
      VALUES ${placeholders.join(',')}
      ON CONFLICT (user_id, event_id) DO NOTHING`,
     params,

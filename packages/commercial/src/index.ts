@@ -228,6 +228,11 @@ import {
   type SkillUsageHandler,
 } from "./http/internalSkillUsage.js";
 import {
+  SKILL_FEEDBACK_PATH,
+  makeSkillFeedbackHandler,
+  type SkillFeedbackHandler,
+} from "./http/internalSkillFeedback.js";
+import {
   CRON_INDEX_PATH,
   makeCronIndexHandler,
   type CronIndexHandler,
@@ -1436,7 +1441,18 @@ export async function registerCommercial(
       // /internal/v3/codex-relay — 平台管控的 codex api_relay 流式转发。
       // egress split(M1b 架构决策):同一 handler 同时在 egress 进程本地挂载,
       // 生产在飞 codex 流走 egress 不经 master;master 挂载留作非 split 拓扑兜底。
-      const codexRelayHandler: CodexRelayHandler = buildCodexRelayHandler({ identityRepo });
+      const codexRelayHandler: CodexRelayHandler = buildCodexRelayHandler({
+        identityRepo,
+        preCheckRedis,
+        pgPool: getPool(),
+        onImageCharge: (uid, charge) => {
+          bridgeBroadcastRef.current(uid, {
+            type: 'outbound.cost_charged',
+            costCredits: charge.costCredits,
+            balanceAfter: charge.balanceAfter,
+          })
+        },
+      });
       // /internal/v3/skill-embed — 容器内 mcp-memory 语义 skill_search 回源 master。
       // master 持 SKILL_EMBEDDING_API_KEY/DASHSCOPE_API_KEY(只在 master env,不注入容器),
       // 同款 verifyContainerIdentity 双因子鉴权;向量跨租户 PG 缓存,fail-closed 回落关键词。
@@ -1489,6 +1505,14 @@ export async function registerCommercial(
             queryRunner: getPool(),
           })
         : null;
+      // /internal/v3/marketplace/skill-feedback — 容器 gateway 起技能训练前拉「该用户对该技能
+      // 差评过的真实场景引用」(只回 sessionKey/traceId/at,内容主权不出容器)。user_id 由
+      // verifyContainerIdentity 推导。**无条件注册**:纯只读端点,无数据时返 {refs:[],total:0};
+      // 即便 skill-usage 上报关闭(无事件写入)本端点也只是恒返空,gateway 侧 fail-open 照常训练。
+      const skillFeedbackHandler: SkillFeedbackHandler = makeSkillFeedbackHandler({
+        identityRepo,
+        queryRunner: getPool(),
+      });
       // 平台官方**科研** agent 的幂等 seed —— v5-native 露出(市场为 agent 露出单一权威,
       // 不走 v3 seed/team)。**仅当 research_config 已开启时 seed**(关闭时科研能力本就 503,
       // 避免装到只会报错的 agent;v3 不含本调用 → 不会 seed)。fire-and-forget,失败只 log
@@ -1607,6 +1631,9 @@ export async function registerCommercial(
         }
         if (skillUsageHandler && path === SKILL_USAGE_PATH) {
           return skillUsageHandler(req, res, ctx);
+        }
+        if (path === SKILL_FEEDBACK_PATH) {
+          return skillFeedbackHandler(req, res, ctx);
         }
         if (path === CRON_INDEX_PATH) {
           return cronIndexHandler(req, res, ctx);

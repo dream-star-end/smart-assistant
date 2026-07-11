@@ -19,10 +19,12 @@ import {
   unlink,
   unlinkSync,
 } from 'node:fs'
-import { mkdir, readFile, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
 import { type IncomingHttpHeaders, type IncomingMessage, type ServerResponse, createServer } from 'node:http'
 import { isIPv4 } from 'node:net'
 import { basename, dirname, extname, join, relative, resolve } from 'node:path'
+import sharp from 'sharp'
+import { normalizeImageEditMask, orientedImageDimensions } from './imageEdit.js'
 import type { ChannelAdapter, ChannelContext } from '@openclaude/plugin-sdk'
 import {
   type InboundFrame,
@@ -128,10 +130,13 @@ import {
   type GenSessionExcerpt,
 } from './skillEvalGen.js'
 import {
+  MAX_FEEDBACK_SCENARIOS,
   SKILL_TRAIN_DEFAULT_MODEL,
   SKILL_TRAIN_EFFORT,
+  buildFeedbackScenariosSection,
   buildSkillTrainPrompt,
   normalizeSkillTrainArgs,
+  type FeedbackScenario,
 } from './skillTrain.js'
 import { type WebSocket, WebSocketServer } from 'ws'
 import { checkToken, verifyPassword, signJwt, verifyJwt, type JwtPayload } from './auth.js'
@@ -198,8 +203,17 @@ import {
   readV3MarketplaceRelayConfig,
   V3_MARKETPLACE_LOCAL_RELAY_PREFIX,
 } from './v3MarketplaceRelay.js'
+import {
+  buildSkillTrainCompleteNotice,
+  decideSkillLocalRelay,
+  SKILL_LOCAL_RELAY_PREFIX,
+} from './ocSkillLocalRelay.js'
 import { startToolFailureReporter } from './v3ToolFailureReporter.js'
-import { startSkillUsageReporter } from './skillUsageReporter.js'
+import {
+  fetchUserSkillFeedbackRefs,
+  startSkillUsageReporter,
+  type SkillFeedbackRef,
+} from './skillUsageReporter.js'
 import { resolveEngine } from './engine/registry.js'
 import type { CodexProviderConfigOverride } from './engine/codexShared.js'
 import {
@@ -2320,6 +2334,40 @@ export class Gateway {
           try { res.end() } catch {}
         }
       })
+      return
+    }
+
+    // oc-skill 对话内训练/评测生成:容器内 CLI(回环)打本 gateway 自己的 train/eval-gen
+    // API。Codex 子进程 env 被擦拿不到 accessToken,故走这条 loopback-only 路径映射到既有
+    // /api 处理器。身份仍走 getUserId(回环无 JWT → 'default',与 master 代理剥掉
+    // auth/cookie 后的前端请求同一分区 → CLI 起的训练在管理中心可见)。relay 只做「回环 +
+    // 路径匹配」,可写性门/生成-评测互斥/owner/method 一律由被派发的处理器权威执行。
+    if (url.pathname === SKILL_LOCAL_RELAY_PREFIX || url.pathname.startsWith(`${SKILL_LOCAL_RELAY_PREFIX}/`)) {
+      const decision = decideSkillLocalRelay(url.pathname, req.socket.remoteAddress)
+      if (decision.action === 'forbidden') {
+        this.sendJson(res, 403, { error: { code: 'FORBIDDEN', message: 'skill relay is loopback-only' } })
+        return
+      }
+      if (decision.action === 'not-found') {
+        this.sendJson(res, 404, { error: { code: 'NOT_FOUND', message: 'unknown skill relay path' } })
+        return
+      }
+      const p = decision.param
+      const guarded = (pr: Promise<void>) => pr.catch((err) => this.sendInternalError(res, err))
+      switch (decision.route) {
+        case 'train-start':
+          guarded(this._handleSkillTrainStart(req, res, p))
+          return
+        case 'train-status':
+          guarded(this._handleSkillTrainRun(req, res, p))
+          return
+        case 'evalgen-start':
+          guarded(this._handleSkillEvalGenStart(req, res, p))
+          return
+        case 'evalgen-status':
+          guarded(this._handleSkillEvalGenStatus(req, res, p))
+          return
+      }
       return
     }
 
@@ -6456,6 +6504,14 @@ export class Gateway {
         .listDrafts(runId)
         .then(async (d) => {
           await this.skillTrainJobs.finalize(runId, d.length, Date.now())
+          // 训练完成 → 写一条站内信(对话内发起训练的用户多半已离开管理中心;前端发起的
+          // 也可能已切走)。draft>0 报草稿数并引导看 diff,draft=0 明确「未产生草稿」。
+          // fail-open:postInboxMessage 本就永不抛(缺 master env → no-op),这里再挂一层
+          // warn,通知失败绝不影响 finalize / autoEval。
+          const doneRun = this.skillTrainJobs.get(runId)
+          void postInboxMessage(
+            buildSkillTrainCompleteNotice(doneRun?.skillName ?? null, d.length),
+          ).catch((err) => this.log.warn('skill train complete inbox notify failed', undefined, err))
           // 评测门(P1):产出草稿且用户启动时同意 autoEval → 自动对目标技能草稿跑
           // draft vs 现版评测。成本已在训练确认对话框中披露(autoEval 开关 + 估算)。
           if (d.length > 0) void this._maybeAutoEvalTrainRun(runId)
@@ -6503,6 +6559,44 @@ export class Gateway {
 
   // POST /api/skills/:name/train — start an async DeepSeek training run for ONE
   // user-authored skill. Returns a runId immediately; progress via GET status.
+  /**
+   * 采集「用户对该技能差评过的真实场景」摘录(供技能训练注入失败案例小节):
+   *  1) GET master skill-feedback?slug=&layer=user(容器 token 通道,已内建 fail-open);
+   *  2) 有 refs → 按 sessionKey 从**本地** sessions.db 取 turns(复用 P1 buildSessionExcerpt
+   *     裁成 ≤1500 字符摘录),至多 MAX_FEEDBACK_SCENARIOS 段。
+   * 返回 `{scenarios, total}`:scenarios=实际注入的摘录;total=master 未截断的差评总数
+   * (DISTINCT session_key,供前端"已找到 N 条"提示)。任何环节失败/无数据 → `{[], 0}`
+   * (训练照常,不注入失败案例小节)。内容主权不出容器:master 只回引用,摘录本体由本地 DB 组装。
+   */
+  private async _collectSkillFeedbackScenarios(
+    skillName: string,
+  ): Promise<{ scenarios: FeedbackScenario[]; total: number }> {
+    let feedback: { refs: SkillFeedbackRef[]; total: number }
+    try {
+      // 拉取有界超时(fail-open):不让 master 慢响应拖住训练启动。
+      feedback = await fetchUserSkillFeedbackRefs(skillName, { timeoutMs: 5_000 })
+    } catch {
+      return { scenarios: [], total: 0 } // 已 fail-open,这里再兜底一层绝不上抛
+    }
+    if (feedback.refs.length === 0) return { scenarios: [], total: 0 }
+    const scenarios: FeedbackScenario[] = []
+    for (const ref of feedback.refs) {
+      if (scenarios.length >= MAX_FEEDBACK_SCENARIOS) break
+      let turns: Awaited<ReturnType<typeof loadSessionTurns>>
+      try {
+        // sessions_meta.id / sessions_fts.session_id == sessionKey(sessionManager
+        // indexTurn 用 session.sessionKey 作 FTS 主键),故 loadSessionTurns 直接吃 sessionKey。
+        turns = await loadSessionTurns(ref.sessionKey)
+      } catch {
+        continue
+      }
+      const text = buildSessionExcerpt(turns, SESSION_EXCERPT_MAX_CHARS)
+      if (!text) continue // 会话已归档/清理 → 跳过该 ref
+      scenarios.push({ text })
+    }
+    return { scenarios, total: feedback.total }
+  }
+
   private async _handleSkillTrainStart(
     req: IncomingMessage,
     res: ServerResponse,
@@ -6544,6 +6638,16 @@ export class Gateway {
       now: Date.now(),
     })
 
+    // 差评驱动:起训前拉「用户对该技能差评过的真实使用记录」→ 按 sessionKey 从本地
+    // sessions.db 取摘录,注入训练 prompt 的失败案例小节。整链 fail-open:任一步失败/无
+    // 数据都返回空 → 照常训练(feedbackRefs=0),绝不影响训练启动。
+    const { scenarios: feedbackScenarios, total: feedbackTotal } =
+      await this._collectSkillFeedbackScenarios(skillName)
+    const feedbackSection = buildFeedbackScenariosSection(feedbackScenarios)
+    // feedbackRefs:仅当确有素材注入训练时才回传 master 的未截断差评总数(前端"已找到 N 条")。
+    // 差评存在但摘录全部拉不到(会话已清理)→ 无注入 → 0(不误报"将优先分析")。
+    const feedbackRefs = feedbackScenarios.length > 0 ? feedbackTotal : 0
+
     // Background session bound to this run (skillTrainRunId exposes skill_propose).
     const session = await this.sessions.getOrCreate({
       sessionKey: `skilltrain:${runId}`,
@@ -6558,7 +6662,7 @@ export class Gateway {
     void this.sessions
       .submit(
         session,
-        buildSkillTrainPrompt(opts),
+        buildSkillTrainPrompt(opts, new Date(), feedbackSection),
         (e) => this._onTrainEvent(runId, e),
         SKILL_TRAIN_EFFORT,
         SKILL_TRAIN_DEFAULT_MODEL,
@@ -6567,7 +6671,7 @@ export class Gateway {
       .catch((err) => {
         void this.skillTrainJobs.setStatus(runId, 'failed', Date.now(), String(err))
       })
-    this.sendJson(res, 202, { ok: true, runId })
+    this.sendJson(res, 202, { ok: true, runId, feedbackRefs })
   }
 
   // GET /api/skill-training — 当前用户的训练 run 列表(startedAt 降序)。归属权威与
@@ -10105,6 +10209,10 @@ export class Gateway {
     // so the agent knows how to access them via MCP tools or Read.
     const text = frame.content.text ?? ''
     const media = frame.content.media ?? []
+    const rawImageEdit = frame.content.imageEdit
+    const externalTurnGuard = rawImageEdit ? await this.sessions.beginExternalTurn(session) : null
+    let externalTurnCompleted = false
+    try {
 
     // Server-side upload validation. Constants live at module level
     // (UPLOAD_MIME_PREFIXES / MAX_UPLOAD_SINGLE / MAX_UPLOAD_TOTAL) so they
@@ -10179,6 +10287,7 @@ export class Gateway {
     }
 
     type SavedMedia = {
+      mediaIndex: number
       kind: string
       path: string
       name: string
@@ -10199,7 +10308,7 @@ export class Gateway {
       return
     }
 
-    for (const m of media) {
+    for (const [mediaIndex, m] of media.entries()) {
       // ── New url-only path (Plan B) ──
       if (!m.base64 && m.url) {
         const match = m.url.match(/^\/api\/media\/(.+)$/)
@@ -10256,6 +10365,7 @@ export class Gateway {
         }
         const mimeType = m.mimeType || mimeFor(realPath) || 'application/octet-stream'
         savedMedia.push({
+          mediaIndex,
           kind: m.kind,
           path: realPath,
           name: m.filename ?? basename(realPath),
@@ -10286,6 +10396,7 @@ export class Gateway {
         await writeFile(fpath, Buffer.from(base64, 'base64'))
         const sizeKb = (Buffer.byteLength(base64, 'base64') / 1024).toFixed(1)
         savedMedia.push({
+          mediaIndex,
           kind: m.kind,
           path: fpath,
           name: m.filename ?? fname,
@@ -10295,6 +10406,201 @@ export class Gateway {
       } catch (err) {
         this.log.warn('dispatchInbound failed to save upload', { kind: m.kind }, err)
       }
+    }
+
+    let imageEditJobId: string | null = null
+    let imageEditOutputPath: string | null = null
+    if (rawImageEdit !== undefined) {
+      const rejectEdit = (reason: string) => {
+        rejectFrame(`图片标注无效: ${reason}`)
+      }
+      if (
+        rawImageEdit === null || typeof rawImageEdit !== 'object'
+        || typeof rawImageEdit.clientJobId !== 'string'
+        || !/^[0-9a-f]{32}$/.test(rawImageEdit.clientJobId)
+      ) {
+        rejectEdit('任务标识无效')
+        return
+      }
+      const effectiveModel = safeModel ?? effectiveAgent.model ?? ''
+      if (!isCodexEngineModel(effectiveModel)) {
+        rejectEdit('当前模型不支持 Image 2 精确修改')
+        return
+      }
+      const indices = [rawImageEdit.sourceIndex, rawImageEdit.maskIndex, rawImageEdit.guideIndex]
+      if (!indices.every((n) => Number.isInteger(n) && n >= 0 && n < media.length) || new Set(indices).size !== 3) {
+        rejectEdit('媒体索引错误')
+        return
+      }
+      const [source, mask, guide] = indices.map((mediaIndex) => savedMedia.find((m) => m.mediaIndex === mediaIndex))
+      if (!source || !mask || !guide || [source, mask, guide].some((m) => m.kind !== 'image')) {
+        rejectEdit('源图、遮罩或标注图缺失')
+        return
+      }
+      let imageRuntimeStarted = false
+      try {
+        const [sourceMeta, orientedSource, maskMeta, guideMeta, sourceBytes, maskBytes] = await Promise.all([
+          sharp(source.path).metadata(),
+          orientedImageDimensions(source.path),
+          sharp(mask.path).metadata(),
+          sharp(guide.path).metadata(),
+          readFile(source.path),
+          readFile(mask.path),
+        ])
+        if (!['png', 'jpeg', 'webp'].includes(sourceMeta.format ?? '')) throw new Error('源图格式不受支持')
+        if (maskMeta.format !== 'png') throw new Error('遮罩必须为 PNG')
+        if (!['png', 'jpeg', 'webp'].includes(guideMeta.format ?? '')) throw new Error('标注预览格式不受支持')
+        if (orientedSource.width !== rawImageEdit.width || orientedSource.height !== rawImageEdit.height) {
+          throw new Error('源图尺寸不一致')
+        }
+        if (rawImageEdit.width * rawImageEdit.height > 16_777_216) throw new Error('图片像素过大')
+        const normalizedMaskBytes = await normalizeImageEditMask(maskBytes, orientedSource)
+        imageEditJobId = rawImageEdit.clientJobId
+        const outputPath = resolve(paths.generatedDir, `image2-edit-${imageEditJobId}.png`)
+        if (dirname(outputPath) !== resolve(paths.generatedDir)) throw new Error('输出路径越界')
+        if (existsSync(outputPath)) {
+          try {
+            const existingMeta = await sharp(outputPath, { failOn: 'error' }).metadata()
+            if (
+              existingMeta.format === 'png'
+              && existingMeta.width === rawImageEdit.width
+              && existingMeta.height === rawImageEdit.height
+            ) imageEditOutputPath = outputPath
+          } catch {
+            // A partial/corrupt local artifact is not a successful recovery;
+            // the trusted relay cache below remains the source of truth.
+          }
+        }
+        if (!imageEditOutputPath) {
+        const relayCfg = readV3CodexRelayConfig(process.env)
+        if (!relayCfg) throw new Error('商业版图片计费通道未配置')
+        const relayUrl = `${relayCfg.masterBaseUrl}${V3_CODEX_RELAY_PREFIX}/backend-api/codex/images/annotated-edits`
+        const body = JSON.stringify({
+          jobId: imageEditJobId,
+          prompt: text,
+          width: rawImageEdit.width,
+          height: rawImageEdit.height,
+          sourceBase64: sourceBytes.toString('base64'),
+          maskBase64: normalizedMaskBytes.toString('base64'),
+        })
+        let lastDeliveryError: unknown = null
+        imageRuntimeStarted = true
+        for (let attempt = 0; attempt < 2; attempt++) {
+          try {
+            const generated = await fetch(relayUrl, {
+              method: 'POST',
+              headers: {
+                authorization: `Bearer ${relayCfg.containerToken}`,
+                'content-type': 'application/json',
+                'x-openclaude-image-job': imageEditJobId,
+              },
+              body,
+              signal: externalTurnGuard?.signal,
+            })
+            const generatedBody = await generated.json() as {
+              data?: Array<{ b64_json?: string }>
+              error?: { code?: string; message?: string }
+            }
+            const encoded = generatedBody.data?.[0]?.b64_json
+            if (!generated.ok || generatedBody.data?.length !== 1 || typeof encoded !== 'string') {
+              throw Object.assign(
+                new Error(generatedBody.error?.message ?? `Image 2 生成失败 (${generated.status})`),
+                {
+                  imageCode: generatedBody.error?.code,
+                  imageStatus: generated.status,
+                  noRetry: generated.status !== 409 && generated.status < 500,
+                },
+              )
+            }
+            const finalImage = Buffer.from(encoded, 'base64')
+            const finalMeta = await sharp(finalImage, { failOn: 'error' }).metadata()
+            if (finalMeta.format !== 'png' || finalMeta.width !== rawImageEdit.width || finalMeta.height !== rawImageEdit.height) {
+              throw new Error('Image 2 返回图片尺寸异常')
+            }
+            const tmpOutputPath = `${outputPath}.${process.pid}.tmp`
+            try {
+              await writeFile(tmpOutputPath, finalImage, { mode: 0o600 })
+              await rename(tmpOutputPath, outputPath)
+            } catch (err) {
+              try { unlinkSync(tmpOutputPath) } catch {}
+              throw err
+            }
+            imageEditOutputPath = outputPath
+            break
+          } catch (err) {
+            if (externalTurnGuard?.signal.aborted) throw err
+            if ((err as { noRetry?: boolean }).noRetry) throw err
+            lastDeliveryError = err
+          }
+        }
+        if (!imageEditOutputPath) throw lastDeliveryError ?? new Error('Image 2 服务连接失败')
+        }
+      } catch (err) {
+        if (externalTurnGuard?.signal.aborted) return
+        const imageCode = (err as { imageCode?: string }).imageCode
+        if (imageRuntimeStarted) {
+          const rateLimited = (err as { imageStatus?: number }).imageStatus === 429
+            || imageCode === 'IMAGE_DAILY_LIMIT'
+            || imageCode === 'IMAGE_ATTEMPT_LIMIT'
+            || imageCode === 'IMAGE_SERVER_BUSY'
+          const insufficient = imageCode === 'ERR_INSUFFICIENT_CREDITS'
+          const message = insufficient
+            ? '积分不足，Image 2 每张需要 50 积分。'
+            : rateLimited
+              ? 'Image 2 当前繁忙或已达使用上限，请稍后重试。'
+              : 'Image 2 服务暂时不可用，请稍后重试。'
+          const errorFrame: OutboundError & { _userId?: string } = {
+            type: 'outbound.error',
+            sessionKey,
+            channel: frame.channel,
+            peer: frame.peer,
+            code: insufficient ? 'insufficient_credits' : rateLimited ? 'rate_limited' : 'upstream_failed',
+            message,
+            detail: err instanceof Error ? err.message : String(err),
+            isFinal: false,
+            traceId: turnTraceId,
+            _userId: activeUserId,
+          }
+          this.deliver(errorFrame, adapter)
+          this.deliver({
+            type: 'outbound.message', sessionKey, channel: frame.channel, peer: frame.peer,
+            blocks: [{ kind: 'text', text: `[error] ${message}` }],
+            isFinal: true, traceId: turnTraceId, _userId: activeUserId,
+          } as OutboundMessage, adapter)
+        } else {
+          rejectEdit(err instanceof Error ? err.message : '图片校验失败')
+        }
+        return
+      }
+    }
+
+    // Paid image edits are delivered deterministically by the gateway. Do not
+    // start a second Codex turn: model failure could hide an already-charged
+    // image, and model non-compliance could invoke imagegen a second time.
+    if (imageEditOutputPath && imageEditJobId) {
+      const responseText = `已完成圈选区域的精确修改（Image 2 · 50 积分）。\n\n${imageEditOutputPath}`
+      const externalTurn = await this.sessions.recordExternalTurn(session, {
+        userText: text,
+        assistantText: responseText,
+        requestId: typeof frame.requestId === 'string' && /^[0-9a-f]{32}$/.test(frame.requestId)
+          ? frame.requestId
+          : imageEditJobId,
+        traceId: turnTraceId,
+        model: 'gpt-image-2',
+      })
+      const delivered = {
+        type: 'outbound.message' as const,
+        sessionKey,
+        channel: frame.channel,
+        peer: frame.peer,
+        blocks: [{ kind: 'text' as const, text: responseText, messageId: externalTurn.messageId }],
+        isFinal: true,
+        traceId: turnTraceId,
+        _userId: activeUserId,
+      }
+      externalTurnCompleted = true
+      this.deliver(delivered as OutboundMessage, adapter)
+      return
     }
 
     let finalText = text
@@ -10876,6 +11182,9 @@ export class Gateway {
     }
     if (liveWechatAdapter) {
       await liveWechatSendQueue
+    }
+    } finally {
+      externalTurnGuard?.finish(externalTurnCompleted ? 'completed' : 'errored')
     }
   }
 

@@ -27,6 +27,7 @@ import type {
   SkillEvalsFile,
   SkillRunUsage,
   SkillTrainRun,
+  SkillTrainStartResult,
   MarketplaceAiReview,
   MarketplaceMyPublish,
   MarketplacePending,
@@ -650,12 +651,14 @@ export const api = {
       turnstile_bypass: boolean;
       require_email_verified: boolean;
       feature_remote_ssh: boolean;
+      feature_image2: boolean;
       allow_registration: boolean;
     }>(fetch("/api/public/config", { headers: { Accept: "application/json" } })).then((b) => ({
       turnstileSiteKey: b.turnstile_site_key,
       turnstileBypass: b.turnstile_bypass,
       requireEmailVerified: b.require_email_verified,
       featureRemoteSsh: b.feature_remote_ssh,
+      featureImage2: b.feature_image2,
       allowRegistration: b.allow_registration,
     })),
 
@@ -1656,9 +1659,10 @@ export const api = {
       ),
     ),
 
-  /** 启动训练 run（POST /api/skills/:name/train;消耗积分,调用前必须已过成本确认）。 */
+  /** 启动训练 run（POST /api/skills/:name/train;消耗积分,调用前必须已过成本确认）。
+   *  响应可带 feedbackRefs(命中的差评真实使用记录条数;旧后端缺省)。 */
   startSkillTrain: (a: AuthSession, name: string, body?: { focus?: string; autoEval?: boolean }) =>
-    jsonOrThrow<{ ok: boolean; runId: string }>(
+    jsonOrThrow<SkillTrainStartResult>(
       callWithRefresh(a, (t) =>
         fetch(`/api/skills/${encodeURIComponent(name)}/train`, {
           method: "POST",

@@ -1668,6 +1668,7 @@ export class ChatSocket {
     text: string;
     displayText?: string;
     media?: InboundMessage["content"]["media"];
+    imageEdit?: NonNullable<InboundMessage["content"]>["imageEdit"];
     model?: string;
     effortLevel?: InboundMessage["effortLevel"];
     teamMode?: boolean;
@@ -1688,7 +1689,7 @@ export class ChatSocket {
       channel: "webchat",
       peer: { id: sess.id, kind: "dm" },
       agentId: p.agentId,
-      content: { text: p.text, ...(media ? { media } : {}) },
+      content: { text: p.text, ...(media ? { media } : {}), ...(p.imageEdit ? { imageEdit: p.imageEdit } : {}) },
       ...(p.effortLevel !== undefined ? { effortLevel: p.effortLevel } : {}),
       ...(p.model ? { model: p.model } : {}),
       // 团队模式(v5 轻量组队):只在开启时带上顶层 teamMode flag;后端仅 main 队长消费。
@@ -1697,7 +1698,9 @@ export class ChatSocket {
     };
     const userMsg = addMessage(sess, "user", p.displayText ?? p.text, {
       status: "sending",
-      _media: media,
+      _media: media?.filter((m) => m.hidden !== true),
+      _retryMedia: p.imageEdit ? media : undefined,
+      _imageEdit: p.imageEdit,
       _modelText: p.displayText && p.displayText !== p.text ? p.text : undefined,
       _routing: { ...routing },
     });
@@ -1706,7 +1709,7 @@ export class ChatSocket {
     // 仍在);容器回传的 server-authored 助手消息走另一条链。
     {
       const sid = sess.id;
-      const um = { id: userMsg.id, text: userMsg.text, ts: userMsg.ts, media };
+      const um = { id: userMsg.id, text: userMsg.text, ts: userMsg.ts, media: media?.filter((m) => m.hidden !== true) };
       void ensurePromise
         .then((ok) => {
           if ((ok || this.serverSessionEnsured.has(sid)) && this.sessions.has(sid)) {
@@ -1832,7 +1835,8 @@ export class ChatSocket {
     // 主控建行可能在首发失败时未确保 → 幂等补一次(best-effort,不阻塞发送)。
     const agentId = sess.agentId || p.agentId;
     void this.ensureServerSessionOnce(sess, agentId);
-    const media = userMsg._media && userMsg._media.length > 0 ? userMsg._media : undefined;
+    const retryMedia = userMsg._retryMedia ?? userMsg._media;
+    const media = retryMedia && retryMedia.length > 0 ? retryMedia : undefined;
     const text = userMsg._modelText ?? userMsg.text ?? "";
     // Historical rows written before message-level snapshots fall back to the session
     // snapshot; all new rows bind retry routing to the original user turn.
@@ -1849,7 +1853,7 @@ export class ChatSocket {
       channel: "webchat",
       peer: { id: sess.id, kind: "dm" },
       agentId,
-      content: { text, ...(media ? { media } : {}) },
+      content: { text, ...(media ? { media } : {}), ...(userMsg._imageEdit ? { imageEdit: userMsg._imageEdit } : {}) },
       ...(routing && Object.prototype.hasOwnProperty.call(routing, "effortLevel")
         ? { effortLevel: routing.effortLevel as InboundMessage["effortLevel"] }
         : {}),

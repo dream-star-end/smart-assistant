@@ -115,6 +115,7 @@ export type PublicConfig = {
   turnstileBypass: boolean;
   requireEmailVerified: boolean;
   featureRemoteSsh: boolean;
+  featureImage2: boolean;
   allowRegistration: boolean;
 };
 
@@ -720,6 +721,18 @@ export type SkillTrainRun = {
   summary: string | null;
   startedAt: number;
   finishedAt: number | null;
+};
+
+/**
+ * 启动训练 run 响应(POST /api/skills/:name/train)。
+ * P3:`feedbackRefs` = 本次训练命中的「用户差评过的真实使用记录」引用条数,前端据此
+ * 提示「优先分析这些失败案例」。**旧后端不返回该字段 → undefined,前端不渲染提示**(容错)。
+ */
+export type SkillTrainStartResult = {
+  ok: boolean;
+  runId: string;
+  /** 命中的差评真实使用记录条数(>0 时前端提示;缺省=旧后端,不提示)。 */
+  feedbackRefs?: number;
 };
 
 /** 训练草稿摘要/详情。 */

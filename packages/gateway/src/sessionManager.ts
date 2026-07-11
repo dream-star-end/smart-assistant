@@ -83,11 +83,17 @@ function sameToolsetsForCompare(a: unknown, b: unknown): boolean {
 }
 
 type ChatHistoryMessage = {
+  id?: unknown
   role?: unknown
   text?: unknown
   content?: unknown
   status?: unknown
   system?: unknown
+}
+
+type PendingExternalExchange = {
+  user: { id: string; role: 'user'; text: string; status: 'completed'; ts: number }
+  assistant: { id: string; role: 'assistant'; text: string; status: 'completed'; ts: number }
 }
 
 function extractHistoryText(msg: ChatHistoryMessage): string {
@@ -405,6 +411,11 @@ export interface AgentSession {
    *  user switches away and later returns to GPT, while avoiding a repeated
    *  full transcript on ordinary same-provider follow-ups. */
   _historicalContextInjectedKey?: string
+  /** Platform-executed exchanges not yet observed in master history. A
+   * transient master-sink failure can durably queue the assistant row while
+   * the very next user turn arrives first; this session-local tail keeps that
+   * paid result in the rebuilt provider context until master acknowledges it. */
+  _pendingExternalExchanges?: PendingExternalExchange[]
   /**
    * 当前 turn 的 backend-side 非流式阶段状态。
    *
@@ -458,6 +469,8 @@ export interface AgentSession {
    * (`_shouldPushTurnInterruptedFinal`)。语义细节同 `_activeTurnCount`:counter
    * 而非 boolean、不持久化、重启后 undefined 读 ?? 0。 */
   _activeClientTurnCount?: number
+  /** Abort controller for a platform-executed external turn (Image 2). */
+  _externalTurnAbort?: AbortController
 
   /** team-durability — 最近一次客户 turn 的收尾方式(dispatchInbound finally 记录)。
    * hello 重连对账用:客户端报 inFlight 而两个 turn 计数均为 0 时,'completed' →
@@ -1041,6 +1054,116 @@ export class SessionManager {
   async awaitPendingPersistence(): Promise<void> {
     if (this._pendingPersistence.size === 0) return
     await Promise.allSettled([...this._pendingPersistence])
+  }
+
+  /** Record a platform-executed turn (for example a trusted Image 2 edit)
+   * without asking the language-model runner to execute it. The turn shares
+   * the same lock/counter/persistence contract as model turns, then clears
+   * the native resume id so the next submit rebuilds from master history and
+   * sees this external exchange. */
+  async recordExternalTurn(
+    session: AgentSession,
+    args: { userText: string; assistantText: string; requestId: string; traceId?: string; model?: string },
+  ): Promise<{ turnIndex: number; messageId: string }> {
+    // Caller owns session.lock through beginExternalTurn().
+    {
+      if (session.turns === 0) {
+        const legacyId = this._resumeMap.get(session.sessionKey)
+        session.turns = await getMaxTurnIdx(
+          legacyId && legacyId !== session.sessionKey
+            ? [session.sessionKey, legacyId]
+            : [session.sessionKey],
+        )
+      }
+      const turnIndex = session.turns + 1
+      session.turns = turnIndex
+      session.currentUserText = args.userText
+      session.currentAssistantBuf = args.assistantText
+      session.lastUsedAt = Date.now()
+      void indexTurn(session.sessionKey, turnIndex, args.userText, args.assistantText)
+        .catch((err) => log.warn('external turn index failed', { sessionKey: session.sessionKey, turnIndex }, err))
+      const persistence = persistServerAuthoredTurn({
+        sessionKey: session.sessionKey,
+        peerId: session.peerId,
+        agentId: session.agentId,
+        userId: session.userId,
+        turnIndex,
+        text: args.assistantText,
+        status: 'completed',
+        requestId: args.requestId,
+        usage: {
+          turn: turnIndex,
+          ...(args.model ? { model: args.model } : {}),
+          ...(args.traceId ? { traceId: args.traceId } : {}),
+        },
+      })
+      this._trackPersistence(persistence)
+      await persistence
+
+      const messageId = `srv-${session.peerId}-${session.agentId}-t${turnIndex}`
+      const createdAt = Date.now()
+      ;(session._pendingExternalExchanges ??= []).push({
+        user: {
+          id: `external-${args.requestId}-user`,
+          role: 'user',
+          text: args.userText,
+          status: 'completed',
+          ts: createdAt - 1,
+        },
+        assistant: {
+          id: messageId,
+          role: 'assistant',
+          text: args.assistantText,
+          status: 'completed',
+          ts: createdAt,
+        },
+      })
+
+      // The native provider thread did not execute this turn. Force a clean
+      // resume so the next user message receives master history (including
+      // the external assistant row) instead of continuing a stale thread.
+      this._resumeMap.delete(session.sessionKey)
+      this._resumeMapTimestamps.delete(session.sessionKey)
+      this._resumeMapProvider.delete(session.sessionKey)
+      this._resumeMapLastCost.delete(session.sessionKey)
+      session.ccbSessionId = null
+      session.runner.clearSessionId?.()
+      this._saveResumeMap()
+      if (session.runner.isRunning) await session.runner.shutdown()
+      session._historicalContextInjected = false
+      session._historicalContextInjectedKey = undefined
+      return {
+        turnIndex,
+        messageId,
+      }
+    }
+  }
+
+  /** Acquire the per-session turn lock for platform work that runs outside
+   * the model runner. Stop requests abort its signal, and the returned finish
+   * callback releases both the lock and reconnect-visible activity count. */
+  async beginExternalTurn(session: AgentSession): Promise<{
+    signal: AbortSignal
+    finish: (outcome: 'completed' | 'errored') => void
+  }> {
+    const prev = session.lock
+    let release!: () => void
+    session.lock = new Promise<void>((resolve) => { release = resolve })
+    const controller = new AbortController()
+    this.beginClientTurn(session)
+    await prev
+    session._externalTurnAbort = controller
+    let finished = false
+    return {
+      signal: controller.signal,
+      finish: (outcome) => {
+        if (finished) return
+        finished = true
+        if (session._externalTurnAbort === controller) session._externalTurnAbort = undefined
+        this.endClientTurn(session, outcome)
+        release()
+      },
+    }
   }
 
   // Resume map: sessionKey → ccbSessionId (survives gateway restart)
@@ -1822,9 +1945,39 @@ export class SessionManager {
       const masterHistoricalMessages = Array.isArray(opts?.historicalMessages)
         ? opts.historicalMessages
         : null
+      const mergePendingExternalHistory = (messages: unknown[]): unknown[] => {
+        const pending = session._pendingExternalExchanges
+        if (!pending?.length) return messages
+        const ids = new Set(
+          messages
+            .filter((raw): raw is { id: string } =>
+              !!raw && typeof raw === 'object' && typeof (raw as { id?: unknown }).id === 'string')
+            .map((raw) => raw.id),
+        )
+        const remaining: PendingExternalExchange[] = []
+        const merged = [...messages]
+        for (const exchange of pending) {
+          if (ids.has(exchange.assistant.id)) continue
+          remaining.push(exchange)
+          const hasEquivalentUser = merged.some((raw) => {
+            if (!raw || typeof raw !== 'object') return false
+            const msg = raw as ChatHistoryMessage
+            return msg.role === 'user'
+              && normForCompare(extractHistoryText(msg)) === normForCompare(exchange.user.text)
+          })
+          if (!hasEquivalentUser && !ids.has(exchange.user.id)) merged.push(exchange.user)
+          merged.push(exchange.assistant)
+          ids.add(exchange.assistant.id)
+        }
+        session._pendingExternalExchanges = remaining.length > 0 ? remaining : undefined
+        return merged
+      }
+      const effectiveMasterHistoricalMessages = masterHistoricalMessages
+        ? mergePendingExternalHistory(masterHistoricalMessages)
+        : null
       const providerResumeId = this._resumeIdFor(session.sessionKey, session.providerTag)
       const injectionKey = historicalContextInjectionKey({
-        messages: masterHistoricalMessages,
+        messages: effectiveMasterHistoricalMessages,
         peerId: session.peerId,
         agentId: session.agentId,
         hasProviderResumeId: !!providerResumeId,
@@ -1841,9 +1994,10 @@ export class SessionManager {
       ) {
         try {
           const historyMessages =
-            masterHistoricalMessages ??
-            (await getClientSession(session.peerId, session.userId))?.messages ??
-            null
+            effectiveMasterHistoricalMessages ??
+            mergePendingExternalHistory(
+              (await getClientSession(session.peerId, session.userId))?.messages ?? [],
+            )
           const historicalPrompt = historyMessages && typeof userTextOrBlocks === 'string'
             ? buildHistoricalContextPrompt(historyMessages, userTextOrBlocks)
             : null
@@ -2849,7 +3003,10 @@ export class SessionManager {
   interrupt(sessionKey: string): boolean {
     const s = this.sessions.get(sessionKey)
     if (!s) return false
-    return s.runner.interrupt()
+    const external = s._externalTurnAbort
+    if (external && !external.signal.aborted) external.abort()
+    const runnerInterrupted = s.runner.interrupt()
+    return !!external || runnerInterrupted
   }
 
   getByKey(sessionKey: string): AgentSession | undefined {

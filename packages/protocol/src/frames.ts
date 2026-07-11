@@ -32,6 +32,10 @@ export const MediaRef = Type.Object({
   base64: Type.Optional(Type.String()),
   mimeType: Type.Optional(Type.String()),
   filename: Type.Optional(Type.String()),
+  /** UI-only visibility hint. Hidden media is transported to the gateway for
+   * controlled tools (for example an image-edit mask) but must not appear in
+   * the optimistic user bubble or persisted chat history. */
+  hidden: Type.Optional(Type.Boolean()),
 })
 export type MediaRef = Static<typeof MediaRef>
 
@@ -59,6 +63,19 @@ export const InboundMessage = Type.Object({
   content: Type.Object({
     text: Type.Optional(Type.String()),
     media: Type.Optional(Type.Array(MediaRef)),
+    /** A user-authored, visual selection for a precise image edit. Indices
+     * address content.media; the gateway resolves and validates every file,
+     * then replaces this client descriptor with a server-owned job id. */
+    imageEdit: Type.Optional(
+      Type.Object({
+        clientJobId: Type.String({ pattern: '^[0-9a-f]{32}$' }),
+        sourceIndex: Type.Integer({ minimum: 0 }),
+        maskIndex: Type.Integer({ minimum: 0 }),
+        guideIndex: Type.Integer({ minimum: 0 }),
+        width: Type.Integer({ minimum: 1, maximum: 8192 }),
+        height: Type.Integer({ minimum: 1, maximum: 8192 }),
+      }),
+    ),
   }),
   replyToId: Type.Optional(Type.String()),
   // Effort/reasoning-depth override for this session (一般来自 Web 前端的"编码模式/科研模式/GPT思考深度" pill)。

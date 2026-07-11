@@ -44,6 +44,7 @@ const PUBLIC_CONFIG = okJson({
   turnstile_bypass: true,
   require_email_verified: false,
   feature_remote_ssh: false,
+  feature_image2: false,
   allow_registration: true,
 })
 

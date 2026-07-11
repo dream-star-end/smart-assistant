@@ -2,14 +2,14 @@
 
 > ops 极简哲学:两个 systemd timer + 两个 bash 脚本,不引外部监控系统。
 > 告警首选 v5 站内信(发给 boss),全量兜底落 `/var/log/openclaude-v5-monitor.log`。
-> 最后校准:2026-07-10。
+> 最后校准:2026-07-11。
 
 ## 组成
 
 | 文件 | 作用 |
 |---|---|
 | `scripts/v5-monitor.sh` | 高频探活(每 2 分钟):服务/internal+public healthz/磁盘/内存/容器池/镜像 tag；v3 默认关闭 |
-| `scripts/v5-daily-check.sh` | 日检(每天 09:00 北京时间):计费突增/免单率 + 日报(无告警也发) |
+| `scripts/v5-daily-check.sh` | 日检(每天 09:00 北京时间):计费突增/免单率/GPT-5.6 按模型缓存命中率 + 日报(无告警也发) |
 | `deploy/v5/openclaude-v5-monitor.service/.timer` | 探活的 systemd 单元(`OnCalendar=*:0/2`) |
 | `deploy/v5/openclaude-v5-daily.service/.timer` | 日检的 systemd 单元(`OnCalendar=*-*-* 09:00:00 Asia/Shanghai`,Persistent 补跑) |
 | `/var/lib/openclaude-v5/monitor-state.json` | 探活去重状态(每项 status/since/last_alert) |
@@ -59,6 +59,7 @@ tail -f /var/log/openclaude-v5-monitor.log       # 2 分钟内应出现 "RUN ok(
 |---|---|---|---|
 | 计费突增 | 昨日(北京时间自然日)单用户 `usage_records`(status='success')credits 合计 | > 前 7 日日均 ×3 **且** >2000 | 双条件防误报:倍数抓突变,绝对值滤掉小额用户(10→40 credits 无意义);新用户无历史 → 日均按 0,>2000 即报(首日暴刷值得看一眼) |
 | 免单率 | (零输出免单 + 冲正退款笔数) / 昨日成功计费笔数 | >20%(样本 <10 笔不判) | 免单面扩大 = 上游 hang/超时恶化或计费口径 bug;线上基线 ~7%(2026-07-05:19/276),20% 为基线 ~3 倍 |
+| GPT-5.6 缓存命中 | 昨日成功 `usage_records`,按 `model` 分组;`cache_read_tokens / (input_tokens + cache_read_tokens)` 加权计算(`cache_write_tokens` 不计入),COUNT 是 usage records 数而非 turn 数 | 单模型总输入 ≥1,000,000 tokens **且**命中率 <85% | 按模型避免 Terra 高命中掩盖 Sol;大输入门槛过滤低流量抖动 |
 | 日报正文 | v5 近 24h 活跃用户数/会话数(sessions.db `client_sessions`,`deleted_at IS NULL`)、错误日志行数(`"level":"error"`)、昨日计费笔数/总消耗 | 无(纯日报) | 即使无告警也发一条 info,兼作"监控还活着"的心跳 |
 
 免单两种形态的落库形状(与代码对齐):
@@ -83,7 +84,7 @@ tail -f /var/log/openclaude-v5-monitor.log       # 2 分钟内应出现 "RUN ok(
 
 ```
 scripts/v5-monitor.sh:      DISK_MAX_PCT / MEM_MIN_AVAIL_PCT / POOL_MAX / REALERT_SECS
-scripts/v5-daily-check.sh:  SPIKE_ABS_MIN / SPIKE_MULT / WAIVE_PCT_MAX / WAIVE_MIN_SAMPLES
+scripts/v5-daily-check.sh:  SPIKE_ABS_MIN / SPIKE_MULT / WAIVE_PCT_MAX / WAIVE_MIN_SAMPLES / CACHE_HIT_PCT_MIN / CACHE_MIN_INPUT_TOKENS
 ```
 
 注意:脚本经 `deploy-v5.sh` rsync 分发,**线上直接改会被下次部署覆盖** —— 改阈值要改在仓里(worktree → canonical → 部署),和其他 v5 代码同纪律。
@@ -116,3 +117,4 @@ systemctl daemon-reload
 4. **站内信非实时推送**:boss 要打开 v5 才看到。硬故障(master 挂)监控 2 分钟内能写库,但触达延迟取决于人;需要强触达时启用上面的微信可选增强。
 5. **v5 master 与监控同机**:机器整个宕机(非进程级故障)时监控自身也死,无告警。异机哨兵不在 P0.3 范围,登记为后续增强。
 6. **`http_egress` 从宿主机探测** 172.31.0.1:18892,验证的是 egress 进程活着且形状对;不等价于容器内视角的连通性(iptables/网段问题理论上探测不到,历史上未发生过)。
+7. **缓存命中日检是 usage record/模型级汇总**:`usage_records` 保存每次成功结算的聚合 usage,无法还原一个 turn 内每次上游调用是否全 miss。该指标适合发现模型级持续退化,定位单次 miss 仍需结合 relay 日志(只记录关键头是否存在,不记录头值)。

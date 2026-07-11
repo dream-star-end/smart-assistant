@@ -1,10 +1,16 @@
 import { lazy, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { isCodexEngineModel } from "@openclaude/protocol";
 import { AgentGate } from "./components/AgentGate";
 import { LazyBoundary } from "./components/ChunkErrorBoundary";
 import { AgentPicker } from "./components/AgentPicker";
 import { AuthGate, type AuthMode } from "./components/AuthGate";
 import { ChatHeader } from "./components/ChatHeader";
 import { Composer } from "./components/Composer";
+import {
+  ImageAnnotationEditor,
+  type ImageAnnotationExport,
+  type ImageAnnotationSource,
+} from "./components/ImageAnnotationEditor";
 import { extractLatestTodos, PinnedTaskTracker } from "./components/chat/PinnedTaskTracker";
 import { deriveActivePlanStep, type TurnActivityInfo } from "./components/chat/TurnActivity";
 import { EmptyState } from "./components/EmptyState";
@@ -47,7 +53,7 @@ import { useToast } from "./components/ui";
 import { githubErrorText } from "./lib/github";
 import { connectorErrorText } from "./lib/connectors";
 import type { RepoBindErrorWire, RepoStatusWire } from "./lib/chat/frames";
-import type { MediaRef } from "./lib/chat/frames";
+import type { InboundMessage, MediaRef } from "./lib/chat/frames";
 import type { ChatMessage } from "./lib/chat/model";
 import { CONTINUE_PROMPT } from "./lib/chat/render";
 import { deriveConnBanner } from "./lib/chat/pure";
@@ -179,6 +185,7 @@ export function App() {
   const [preferenceEffort, setPreferenceEffort] = useState<PreferenceEffort | undefined>();
   const [modelsLoading, setModelsLoading] = useState(false);
   const [chatError, setChatError] = useState<ChatError | null>(null);
+  const [imageAnnotationSource, setImageAnnotationSource] = useState<ImageAnnotationSource | null>(null);
   // 面板深链：boot 读到 ?panel= 即以打开态初始化（工作区渲染后即呈现；未登录深链则
   // 登录后呈现）。打开/关闭经 useAppRoute 同步回 query。
   const [settingsOpen, setSettingsOpen] = useState(bootPanel === "settings");
@@ -342,7 +349,7 @@ export function App() {
   }, [activeId]);
 
   const send = useCallback(
-    async (text: string, media?: MediaRef[]) => {
+    async (text: string, media?: MediaRef[], imageEdit?: InboundMessage["content"]["imageEdit"]) => {
       setChatError(null);
 
       // demo：本地流式回放（无网络），仅用于离线预览设计。
@@ -407,6 +414,7 @@ export function App() {
           preferenceEffort,
         ),
         media,
+        imageEdit,
         teamMode: teamLeaderTurn,
       });
       // 侧栏：提到顶 + 更新标题/时间/计数（计数仅作排序提示，权威消息在 WS service）。
@@ -455,6 +463,31 @@ export function App() {
           : "file";
     return { kind, url: r.url, mimeType: mime || undefined, filename: file.name };
   }, []);
+
+  const submitImageAnnotation = useCallback(
+    async (value: ImageAnnotationExport) => {
+      const [sourceMedia, maskMedia, guideMedia] = await Promise.all([
+        uploadMedia(value.source),
+        uploadMedia(value.mask),
+        uploadMedia(value.guide),
+      ]);
+      const media: MediaRef[] = [
+        { ...sourceMedia, hidden: true },
+        { ...maskMedia, hidden: true },
+        guideMedia,
+      ];
+      await send(value.prompt, media, {
+        clientJobId: value.clientJobId,
+        sourceIndex: 0,
+        maskIndex: 1,
+        guideIndex: 2,
+        width: value.width,
+        height: value.height,
+      });
+      toast("已提交精确修改，成功生成后扣 50 积分", "success");
+    },
+    [send, toast, uploadMedia],
+  );
 
   // 会话物化:GitHub 绑定是 per-session,新会话未发首条消息前 activeId 为空 → 绑定确定钮
   // 恒禁用(!sessionId)。需要绑定时先物化一个会话占位(与「+新对话」同款:仅生成 peer.id +
@@ -1269,9 +1302,15 @@ export function App() {
         ? undefined
         : openOrg,
   };
+  const image2Available =
+    !demo && publicCfg?.featureImage2 === true && isCodexEngineModel(modelId ?? "");
 
   return (
-    <MediaSignProvider sign={demo ? null : signMedia} authKey={user?.id ?? "anon"}>
+    <MediaSignProvider
+      sign={demo ? null : signMedia}
+      authKey={user?.id ?? "anon"}
+      onAnnotate={image2Available ? setImageAnnotationSource : undefined}
+    >
     <ToolCardActionsContext.Provider value={toolActions}>
     <ChatInteractionContext.Provider value={chatInteraction}>
     {/* safe-px:横屏侧刘海安全区(竖屏为 0) */}
@@ -1437,6 +1476,14 @@ export function App() {
             prefill={composerPrefill}
             repoSelection={demo ? null : repo.selection}
             onOpenRepo={demo ? undefined : openRepo}
+            onAnnotateImage={image2Available ? setImageAnnotationSource : undefined}
+            image2UnavailableReason={
+              image2Available
+                ? undefined
+                : publicCfg?.featureImage2 !== true
+                  ? "Image 2 暂未开放或正在维护"
+                  : "当前模型不支持 Image 2 圈选修改，请切换到 GPT 模型"
+            }
           />
         </div>
       </main>
@@ -1572,6 +1619,12 @@ export function App() {
       )}
       {confirmDialogEl}
       {promptTextEl}
+      <ImageAnnotationEditor
+        source={imageAnnotationSource}
+        open={!!imageAnnotationSource}
+        onOpenChange={(next) => !next && setImageAnnotationSource(null)}
+        onSubmit={submitImageAnnotation}
+      />
     </div>
     </ChatInteractionContext.Provider>
     </ToolCardActionsContext.Provider>
