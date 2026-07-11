@@ -332,6 +332,36 @@ const Oauth1aAuth = Type.Object(
 const ImapSmtpAuth = Type.Object({}, strict)
 const WebdavBasicAuth = Type.Object({}, strict)
 
+/**
+ * §5 token 获取执行配置(签进 ExecContract):token-exchange / oauth2 refresh 用。作者声明的
+ * exchangeRequest/tokenResponse 是网络配置(非凭据),编译器从 spec.auth 提取搬进契约,引擎据此
+ * 向 **token 受众** origin 换取 access_token(凭据在 body/basic-auth 里,绝不进声明模板)。
+ * credentialFieldNames:交换请求字段名 → 凭据 source 名(如 grant_type/refresh_token→refresh_token)。
+ */
+export const TokenAcquisition = Type.Object(
+  {
+    exchangeRequest: Type.Object(
+      {
+        method: HttpMethod,
+        encoding: Encoding,
+        credentialFieldNames: Type.Record(QueryName, Type.String({ minLength: 1, maxLength: 64 })),
+        staticFields: Type.Optional(Type.Record(QueryName, Type.String({ maxLength: 512 }))),
+        grantValue: Type.Optional(Type.String({ maxLength: 128 })),
+      },
+      strict,
+    ),
+    tokenResponse: Type.Object(
+      {
+        successPredicate: Type.Optional(ResponsePointer),
+        providerErrorCodePointer: Type.Optional(ResponsePointer),
+      },
+      strict,
+    ),
+  },
+  strict,
+)
+export type TokenAcquisitionT = Static<typeof TokenAcquisition>
+
 /** authMode → 该模式权威 auth schema(编译器逐字段校验用)。 */
 export const AUTH_SCHEMAS: Record<AuthModeValue, TObject> = {
   'static-token': StaticTokenAuth,
@@ -455,6 +485,7 @@ export const ExecContract = Type.Object(
     originMode: OriginMode,
     credentialAudiencePolicy: CredentialAudiencePolicy,
     tokenOutputs: Type.Optional(TokenOutputs),
+    tokenAcquisition: Type.Optional(TokenAcquisition),
     credentialPipeline: CredentialPipeline,
     actions: Type.Array(ExecAction, { minItems: 1 }),
     identity: Type.Optional(ConnectorIdentity),

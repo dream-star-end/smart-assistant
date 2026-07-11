@@ -384,6 +384,89 @@ describe('compileSpec', () => {
     assert.throws(() => compileSpec(spec, baseDecision()), isCode('IDENTITY_INVALID'))
   })
 
+  // ─── token-exchange 契约携带(slice⑤ 基础) ──────────────────────────────────
+  function tokenExchangeSpec(): Record<string, unknown> {
+    return {
+      id: 'feishu-like',
+      label: 'Feishu-like',
+      description: 'tenant token exchange',
+      authMode: 'token-exchange',
+      auth: {
+        exchangeRequest: {
+          method: 'POST',
+          encoding: 'json',
+          credentialFieldNames: { app_id: 'client_id', app_secret: 'client_secret' },
+          staticFields: {},
+          grantValue: 'client_credentials',
+        },
+        tokenResponse: { successPredicate: '/code', providerErrorCodePointer: '/code' },
+        tokenOutputs: { accessToken: '/tenant_access_token', expiresIn: '/expire' },
+        apiCredentialPlacements: [{ source: 'access_token', placement: 'authorization-bearer' }],
+      },
+      originMode: 'fixed-reviewed',
+      credentialPipeline: {
+        nodes: [
+          { id: 'tenant-token', authMode: 'token-exchange', subject: 'app', audience: 'token' },
+          {
+            id: 'api-cred',
+            authMode: 'token-exchange',
+            subject: 'app',
+            audience: 'api',
+            dependsOn: ['tenant-token'],
+          },
+        ],
+      },
+      actions: [
+        {
+          id: 'send_message',
+          description: 'send a message',
+          request: { method: 'GET', pathTemplate: '/open-apis/im/v1/messages' },
+          params: { type: 'object', additionalProperties: false },
+          result: { type: 'object', additionalProperties: false },
+          usesSlot: 'api-cred',
+        },
+      ],
+    }
+  }
+  const tokenExchangeDecision = {
+    audience: {
+      authorizationOrigins: [],
+      tokenOrigins: ['https://open.feishu.test:443'],
+      apiOrigins: ['https://open.feishu.test:443'],
+      unauthenticatedUploadOrigins: [],
+    },
+    actions: {},
+  }
+
+  test('token-exchange:exchangeRequest/tokenResponse 搬进 contract + tokenOutputs 携带', () => {
+    const { execContract } = compileSpec(tokenExchangeSpec(), tokenExchangeDecision)
+    const c = execContract as Record<string, unknown>
+    assert.ok(c.tokenAcquisition, 'tokenAcquisition carried')
+    assert.deepEqual((c.tokenAcquisition as Record<string, unknown>).exchangeRequest, {
+      method: 'POST',
+      encoding: 'json',
+      credentialFieldNames: { app_id: 'client_id', app_secret: 'client_secret' },
+      staticFields: {},
+      grantValue: 'client_credentials',
+    })
+    assert.deepEqual(c.tokenOutputs, { accessToken: '/tenant_access_token', expiresIn: '/expire' })
+  })
+
+  test('token-exchange:缺 tokenOrigins → AUDIENCE_MISSING', () => {
+    const decision = {
+      audience: { ...tokenExchangeDecision.audience, tokenOrigins: [] },
+      actions: {},
+    }
+    assert.throws(() => compileSpec(tokenExchangeSpec(), decision), isCode('AUDIENCE_MISSING'))
+  })
+
+  test('token-exchange:credentialFieldNames 引用不可注入 source → AUTH_SCHEMA_INVALID', () => {
+    const spec = tokenExchangeSpec()
+    ;(spec.auth as Record<string, Record<string, Record<string, string>>>).exchangeRequest
+      .credentialFieldNames = { grant: 'access_token' } // access_token 非交换输入 source
+    assert.throws(() => compileSpec(spec, tokenExchangeDecision), isCode('AUTH_SCHEMA_INVALID'))
+  })
+
   test('credentialPipeline:cacheKey 字段被 schema strict 拒', () => {
     const spec = baseSpec()
     ;(spec.credentialPipeline as Record<string, unknown>).nodes = [
@@ -476,7 +559,7 @@ describe('compileSpec', () => {
       exchangeRequest: {
         method: 'POST',
         encoding: 'json',
-        credentialFieldNames: { appid: 'clientId', secret: 'clientSecret' },
+        credentialFieldNames: { appid: 'client_id', secret: 'client_secret' },
       },
       // token/expires 指针唯一权威 = tokenOutputs(P1-5②);tokenResponse 只留可选字段。
       tokenResponse: {},
@@ -488,6 +571,7 @@ describe('compileSpec', () => {
       { id: 'api-token', authMode: 'token-exchange', subject: 'app', audience: 'api' },
     ]
     const decision = baseDecision()
+    ;(decision.audience as Record<string, unknown>).tokenOrigins = ['https://api.notion.com:443']
     ;(decision.actions as Record<string, unknown>) = { search: { safeReadNonGet: true } }
     const { execContract } = compileSpec(spec, decision)
     assert.deepEqual(execContract.tokenOutputs, {
@@ -541,7 +625,7 @@ describe('compileSpec', () => {
       exchangeRequest: {
         method: 'POST',
         encoding: 'json',
-        credentialFieldNames: { appid: 'clientId' },
+        credentialFieldNames: { appid: 'client_id' },
       },
       tokenResponse: {},
       tokenOutputs: { accessToken: '/access_token' }, // 无 auxiliary
@@ -552,7 +636,9 @@ describe('compileSpec', () => {
     ;(spec.credentialPipeline as Record<string, unknown>).nodes = [
       { id: 'api-token', authMode: 'token-exchange', subject: 'app', audience: 'api' },
     ]
-    assert.throws(() => compileSpec(spec, baseDecision()), isCode('UNKNOWN_AUXILIARY'))
+    const decision = baseDecision()
+    ;(decision.audience as Record<string, unknown>).tokenOrigins = ['https://api.notion.com:443']
+    assert.throws(() => compileSpec(spec, decision), isCode('UNKNOWN_AUXILIARY'))
   })
 
   test('P1-5④:api slot 的 authMode 与 connector authMode 不一致 → SLOT_MODE_MISMATCH', () => {

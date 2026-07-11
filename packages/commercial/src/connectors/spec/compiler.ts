@@ -31,8 +31,16 @@ import {
   PROTOCOL_AUTH_MODES,
   SecurityDecision,
   type SecurityDecisionT,
+  type TokenAcquisitionT,
   type TokenOutputsT,
 } from './types.js'
+
+/** token-exchange 交换请求可引用的**规范凭据 source 名**(引擎注入进交换体/basic-auth)。 */
+const TOKEN_EXCHANGE_SOURCES: ReadonlySet<string> = new Set([
+  'refresh_token',
+  'client_id',
+  'client_secret',
+])
 
 /** 编译器语义版本(改任何编译规则/输出结构必须 bump → 新 exec_contract_hash)。 */
 export const COMPILER_VERSION = 1
@@ -402,6 +410,29 @@ export function compileSpec(rawSpec: unknown, securityDecision: unknown): Compil
     }
   }
 
+  // token-exchange:token 获取配置从 auth 提取搬进契约(引擎据此换 token);需 reviewer 给
+  // tokenOrigins(交换端点受众);credentialFieldNames 值必须是引擎可注入的规范凭据 source。
+  let tokenAcquisition: TokenAcquisitionT | undefined
+  if (spec.authMode === 'token-exchange') {
+    const auth = spec.auth as unknown as {
+      exchangeRequest: TokenAcquisitionT['exchangeRequest']
+      tokenResponse: TokenAcquisitionT['tokenResponse']
+    }
+    if (audience.tokenOrigins.length === 0)
+      throw new ConnectorSpecError('AUDIENCE_MISSING', 'token-exchange requires >=1 tokenOrigin')
+    for (const src of Object.values(auth.exchangeRequest.credentialFieldNames)) {
+      if (!TOKEN_EXCHANGE_SOURCES.has(src))
+        throw new ConnectorSpecError(
+          'AUTH_SCHEMA_INVALID',
+          `exchange credential source '${src}' not injectable`,
+        )
+    }
+    tokenAcquisition = {
+      exchangeRequest: auth.exchangeRequest,
+      tokenResponse: auth.tokenResponse,
+    }
+  }
+
   // pipeline
   validatePipeline(spec.credentialPipeline)
   const slotById = new Map(spec.credentialPipeline.nodes.map((n) => [n.id, n]))
@@ -498,6 +529,7 @@ export function compileSpec(rawSpec: unknown, securityDecision: unknown): Compil
           tokenOutputs: (spec.auth as { tokenOutputs: ExecContractT['tokenOutputs'] }).tokenOutputs,
         }
       : {}),
+    ...(tokenAcquisition !== undefined ? { tokenAcquisition } : {}),
     credentialPipeline: spec.credentialPipeline,
     actions: execActions,
     ...(spec.identity !== undefined ? { identity: spec.identity } : {}),
