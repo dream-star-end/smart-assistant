@@ -111,6 +111,8 @@ export const OC_TOOLS = {
   "oc-report": { icon: NotebookPen, label: "研究报告", tone: "accent" },
   "oc-rank": { icon: BarChart3, label: "排序打分", tone: "info" },
   "oc-market": { icon: Sparkles, label: "AI 市场", tone: "accent" },
+  // 对话内发起技能训练优化/生成评测用例(P2,回环 relay 到容器 gateway 自身 train/gen API)。
+  "oc-skill": { icon: Sparkles, label: "技能训练", tone: "accent" },
   "oc-xlsx": { icon: BarChart3, label: "表格生成", tone: "success" },
   "oc-pdf": { icon: FileText, label: "PDF 生成", tone: "success" },
   "oc-docx": { icon: FileText, label: "Word 生成", tone: "success" },
