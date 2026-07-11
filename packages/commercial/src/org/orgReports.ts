@@ -16,8 +16,9 @@ import { query } from "../db/queries.js";
 
 export type UsageWindow = "24h" | "7d" | "30d";
 
-/** window → { 回看小时数(参数化 WHERE 用),趋势桶单位 + 桶数 }。白名单,非客户端注入。 */
-const WINDOW_SPEC: Record<UsageWindow, { hours: number; trendUnit: "hour" | "day"; points: number }> = {
+/** window → { 回看小时数(参数化 WHERE 用),趋势桶单位 + 桶数 }。白名单,非客户端注入。
+ *  **单一权威**:org / 个人版(billing/usageReport.ts)共用同一张表,严禁复制第二份窗口语义。 */
+export const WINDOW_SPEC: Record<UsageWindow, { hours: number; trendUnit: "hour" | "day"; points: number }> = {
   "24h": { hours: 24, trendUnit: "hour", points: 24 },
   "7d": { hours: 7 * 24, trendUnit: "day", points: 7 },
   "30d": { hours: 30 * 24, trendUnit: "day", points: 30 },
@@ -129,17 +130,74 @@ export async function getOrgUsageReport(orgId: string, window: UsageWindow): Pro
 }
 
 /**
- * 趋势查询:generate_series 造出恰好 `points` 个桶(含当前桶 + 前 points-1 个),
- * LEFT JOIN 聚合 → 空桶补 0。day 桶按 Asia/Shanghai 自然日(与 stats.ts 对齐);
- * hour 桶按服务器 NOW() 小时(与 stats.ts 小时线一致,不 tz 平移)。
+ * org 趋势:委派给 `trendBuckets` 共享脚手架(见其注释)。org 特化 = 源表 usage_records、
+ * scope 谓词 org_id、聚合 (requests, credits)。个人版用量/流水趋势同样复用该脚手架,
+ * 桶语义(沪时自然日 / NOW() 小时 / 补零)由此**单一权威**保证不漂移。
  */
 async function orgUsageTrend(
   orgId: string,
-  unit: "hour" | "day",
+  unit: TrendUnit,
   points: number,
 ): Promise<OrgUsageTrendPoint[]> {
+  return trendBuckets<OrgUsageTrendPoint>({
+    unit,
+    points,
+    from: "usage_records",
+    scopeWhere: "org_id = $1::bigint",
+    scopeValue: orgId,
+    metrics: [
+      { name: "requests", expr: "COUNT(*)" },
+      { name: "credits", expr: "COALESCE(SUM(cost_credits), 0)" },
+    ],
+  });
+}
+
+export type TrendUnit = "hour" | "day";
+
+/**
+ * 趋势聚合列描述:输出列名 + inner agg CTE 的聚合表达式。
+ * **name / expr 均为调用方源码里的白名单常量**(如 'COUNT(*)' / "SUM(delta) FILTER (WHERE delta > 0)"),
+ * 绝不含客户端输入 —— 故可安全内插进 SQL 标识/表达式位。
+ */
+export interface TrendMetric {
+  name: string;
+  expr: string;
+}
+
+/**
+ * 趋势桶脚手架 —— org 用量 / 个人用量 / 个人流水三处**唯一**权威(消除三份 generate_series
+ * 桶语义漂移这一整类风险)。generate_series 造出恰好 `points` 个桶(含当前桶 + 前 points-1 个),
+ * LEFT JOIN 聚合 → 空桶补 0:
+ *   - day 桶:边界按 Asia/Shanghai 自然日,agg 侧也按沪时 date_trunc;下界再
+ *     `AT TIME ZONE 'Asia/Shanghai'` 转回 timestamptz 做 `created_at >=`(与 stats.ts 对齐)。
+ *   - hour 桶:按服务器 NOW() 小时,不做 tz 平移(与 stats.ts 小时线一致)。
+ * 输出每桶 `{ bucket, ...metrics }`,metrics 全部 `COALESCE(...,0)::text` 大数字符串。
+ *
+ * **注入面**:from / scopeWhere / extraWhere / metrics 全部是调用方源码常量(scope 列名来自
+ * 内部枚举,绝非客户端注入);唯一外部值 = scopeValue($1)、points($2),均已参数化。
+ * 切勿把任何客户端串接进这些片段。
+ */
+export async function trendBuckets<T extends { bucket: string }>(opts: {
+  unit: TrendUnit;
+  points: number;
+  /** 源表(白名单常量),如 'usage_records' / 'credit_ledger'。 */
+  from: string;
+  /** scope 谓词(白名单常量,含 $1),如 "org_id = $1::bigint" / "user_id = $1::bigint"。 */
+  scopeWhere: string;
+  /** 附加谓词(白名单常量,无参数),如 "status = 'success'";可省。 */
+  extraWhere?: string;
+  /** $1 值:org_id / user_id(bigint-safe 字符串)。 */
+  scopeValue: string | number;
+  /** 输出聚合列(inner agg 表达式 + outer 别名)。 */
+  metrics: TrendMetric[];
+}): Promise<T[]> {
+  const { unit, points, from, scopeWhere, extraWhere, scopeValue, metrics } = opts;
+  const where = extraWhere ? `${scopeWhere} AND ${extraWhere}` : scopeWhere;
+  const innerAgg = metrics.map((m) => `${m.expr} AS ${m.name}`).join(",\n                ");
+  const outerAgg = metrics.map((m) => `COALESCE(agg.${m.name}, 0)::text AS ${m.name}`).join(",\n              ");
+
   if (unit === "day") {
-    const r = await query<OrgUsageTrendPoint>(
+    const r = await query<T>(
       `WITH days AS (
          SELECT generate_series(
            date_trunc('day', NOW() AT TIME ZONE 'Asia/Shanghai') - ($2::int - 1) * INTERVAL '1 day',
@@ -149,24 +207,22 @@ async function orgUsageTrend(
        ),
        agg AS (
          SELECT date_trunc('day', created_at AT TIME ZONE 'Asia/Shanghai') AS day,
-                COUNT(*) AS requests,
-                COALESCE(SUM(cost_credits), 0) AS credits
-           FROM usage_records
-          WHERE org_id = $1::bigint
+                ${innerAgg}
+           FROM ${from}
+          WHERE ${where}
             AND created_at >= ((date_trunc('day', NOW() AT TIME ZONE 'Asia/Shanghai') - ($2::int - 1) * INTERVAL '1 day') AT TIME ZONE 'Asia/Shanghai')
           GROUP BY 1
        )
        SELECT to_char(days.day, 'YYYY-MM-DD') AS bucket,
-              COALESCE(agg.requests, 0)::text AS requests,
-              COALESCE(agg.credits, 0)::text  AS credits
+              ${outerAgg}
          FROM days
          LEFT JOIN agg ON agg.day = days.day
         ORDER BY days.day ASC`,
-      [orgId, points],
+      [scopeValue, points],
     );
     return r.rows;
   }
-  const r = await query<OrgUsageTrendPoint>(
+  const r = await query<T>(
     `WITH hours AS (
        SELECT generate_series(
          date_trunc('hour', NOW()) - ($2::int - 1) * INTERVAL '1 hour',
@@ -176,20 +232,18 @@ async function orgUsageTrend(
      ),
      agg AS (
        SELECT date_trunc('hour', created_at) AS hour,
-              COUNT(*) AS requests,
-              COALESCE(SUM(cost_credits), 0) AS credits
-         FROM usage_records
-        WHERE org_id = $1::bigint
+              ${innerAgg}
+         FROM ${from}
+        WHERE ${where}
           AND created_at >= date_trunc('hour', NOW()) - ($2::int - 1) * INTERVAL '1 hour'
         GROUP BY 1
      )
      SELECT to_char(hours.hour, 'MM-DD HH24:00') AS bucket,
-            COALESCE(agg.requests, 0)::text AS requests,
-            COALESCE(agg.credits, 0)::text  AS credits
+            ${outerAgg}
        FROM hours
        LEFT JOIN agg ON agg.hour = hours.hour
       ORDER BY hours.hour ASC`,
-    [orgId, points],
+    [scopeValue, points],
   );
   return r.rows;
 }

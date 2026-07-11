@@ -30,6 +30,7 @@ import { login, refresh, logout, LoginError, RefreshError } from "../auth/login.
 import { requireAuth } from "./auth.js";
 import { query } from "../db/queries.js";
 import { insertFeedback } from "../admin/feedback.js";
+import { getUserUsageReport, isUsageWindow, type UsageWindow } from "../billing/usageReport.js";
 import {
   verifyCommercialJwtSync,
   verifyCommercialJwtSyncDetailed,
@@ -1520,6 +1521,36 @@ export async function handleGetMyUsage(
     ledger,
     cutoff_started_at: cutoff ? cutoff.toISOString() : null,
   });
+}
+
+/**
+ * GET /api/me/usage/report?window=24h|7d|30d —— 个人版用量报表(前端画图表用)。
+ *
+ * 与 GET /api/me/usage 同鉴权(requireAuth,JWT sub → user_id,无 IDOR)。响应形态对齐
+ * 企业版 GET /api/org/usage(summary + 趋势 + 按模型 + 流水),数据层见 billing/usageReport.ts;
+ * 窗口/桶语义复用 org/orgReports.ts 的 WINDOW_SPEC / trendBuckets(单一权威)。
+ *
+ * window 缺省 7d;显式传值必须命中白名单,否则 400(不静默兜底,避免前端窗口切换失灵被吞)。
+ * 错误码沿用同族个人端点的 INVALID_USAGE_QUERY。
+ */
+export async function handleGetMyUsageReport(
+  req: IncomingMessage,
+  res: ServerResponse,
+  _ctx: RequestContext,
+  deps: CommercialHttpDeps,
+): Promise<void> {
+  const user = await requireAuth(req, deps.jwtSecret);
+  const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "x.invalid"}`);
+  const raw = url.searchParams.get("window");
+  let window: UsageWindow = "7d";
+  if (raw !== null && raw !== "") {
+    if (!isUsageWindow(raw)) {
+      throw new HttpError(400, "INVALID_USAGE_QUERY", "window must be 24h, 7d or 30d");
+    }
+    window = raw;
+  }
+  const report = await getUserUsageReport(user.id, window);
+  sendJson(res, 200, report);
 }
 
 // ─── v3 file proxy: session cookie endpoints ────────────────────────
