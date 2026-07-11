@@ -352,6 +352,7 @@ BEGIN; <迁移 SQL>; INSERT INTO schema_migrations(version, applied_at) VALUES (
 | admin React 化残余小项 | ①Progress 原语无 tone/fill 定制(hosts 自建 Meter)②typedConfirm(打字确认)未平移,一律 useConfirm danger ③表单 Select 原语缺失(P2/P4/P6 各自局部实现)④fmtCents 字符串版 ¥ 格式化器 4 页内联重复⑤org 调余额后端仍 501 占位 | 下次 admin 批次顺手收敛①-④;⑤随 org 计费批次 |
 | 既有三 sweeper 未并入统一 retention 注册表 | account_refresh_events(28d)/provider_health(30min)/wechat_audit(7d,daemon 侧)各自清理,与 auditRetention 注册表并存=双清理权威 | 下次触碰任一 sweeper 时顺手迁入注册表(daemon 侧 wechat_audit 需评估进程归属) |
 | 市场审核审计是 handler 层 best-effort | marketplace.skill.review/revoke 的业务 tx 在 marketplaceDb 内部,审计在 handler 层补写(失败有 critical 告警,非静默,但非同事务原子) | 若出现"审过了但无痕"实证:reviewVersion/revokeListing 事务内接 writeAdminAudit(需把审计上下文穿透 storage 层,评估耦合代价) |
+| deploy 源码同步非原子(半同步窗口仅缓解) | systemd ExecStart 直接 tsx 跑 live 源码树($REMOTE_SRC)+Restart=on-failure/5s;deploy 源码 rsync 现为 `--delete-after --delay-updates`(26522660)只把不一致窗口从整段传输缩到末尾 rename 突发/亚秒级,**非 100% 消除**:systemd 若恰在突发窗口启动仍可能失败一次(下次 5s 重启已同步完,不再 60s 崩溃循环)。2026-07-11 并发部署实测 6 次崩溃重启事故 | 出现残余崩溃/要求零混合源码启动:改 `systemctl stop→rsync→start`(几秒计划停机,须加 deploy 失败 restart-on-exit trap 防 master 停在 stopped)或长期"外置持久 data+不可变 release 目录+原子 current 符号指针+restart"蓝绿架构(工程量大,顺带解决 running-master cwd/data split-brain) |
 
 ### 审计体系速记(2026-07-11 整改批)
 - **语义三分层**:`admin_audit`=人类管理员操作留痕(**永久保留**,append-only RULE)/`security_events`(0129)=系统安全事件(route_bypass 等,180d)/运维遥测**不进审计表**(health 快照态=compute_hosts 列,审计只记 health.transition、image.promote.apply 等真实迁移;整改前 84% 是心跳,存量 14 万行已清)。
