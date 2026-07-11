@@ -1,11 +1,18 @@
 /**
  * Container → master marketplace skill-usage reporter.
  *
- * 市场质量信号闭环(批2)的容器上报器。gateway 既有的 `tool.called` 事件流里,
- * hub 技能被 `skill_view` 调用即视为一次「真实使用」。本模块把这类事件低敏上报给
- * master(只记 slug / agentId / sessionKey / traceId 这类**元数据**,绝不带技能内容
- * 或用户输入),master 侧 verifyContainerIdentity 推导 userId 后落库
+ * 市场质量信号闭环(批2/批3)的容器上报器。gateway 既有的 `tool.called` 事件流里,
+ * 技能被 `skill_view` 调用即视为一次「真实使用」。本模块把这类事件低敏上报给
+ * master(只记 slug / agentId / sessionKey / traceId / layer 这类**元数据**,绝不带
+ * 技能内容或用户输入),master 侧 verifyContainerIdentity 推导 userId 后落库
  * `marketplace_skill_usage_events`,聚合出目录的 usage30d / users30d + 评分归因。
+ *
+ * **两个技能层(批3)**:
+ *  - `hub`:市场上架技能(reconcile 进只读 hub overlay,~/.openclaude/hub/skills),进目录聚合;
+ *  - `user`:用户自建技能(shared 写源,~/.openclaude/skills),**用户私有命名空间**,只喂技能训练,
+ *    绝不进市场聚合(user 层 slug 与 hub slug 撞名也不污染市场信号 —— master 侧按 layer 过滤)。
+ * 判层与 SkillStore 读优先级一致:用户 shared 层 > hub 层(同名用户技能遮蔽 hub,skill_view 实际
+ * 读到的是用户版 → 归 `user`)。平台 baseline / agent-seed 技能永不上报(非用户资产,不参与信号)。
  *
  * 范式 clone 自 v3ToolFailureReporter:落盘队列 + 定时 drain POST + TTL/退避/队列上限 +
  * 幂等 event_id。与 tool-failure 的**唯一语义差异**见 SKILL_USAGE_ENV / 门控注释。
@@ -30,6 +37,12 @@ const log = createLogger({ module: 'skillUsageReporter' })
 
 export const SKILL_USAGE_PATH = '/internal/v3/marketplace/skill-usage'
 
+/** 差评引用拉取端点(GET;供技能训练注入用户差评过的真实场景,见 fetchUserSkillFeedbackRefs)。 */
+export const SKILL_FEEDBACK_PATH = '/internal/v3/marketplace/skill-feedback'
+
+/** 技能层:hub=市场上架;user=用户自建(私有,只喂训练)。与 master internalSkillUsage 契约一致。 */
+export type SkillUsageLayer = 'hub' | 'user'
+
 /** hub 技能被此工具查看即计一次使用(与 openclaude-memory MCP 的 skill_view 对齐)。 */
 export const SKILL_VIEW_TOOL = 'mcp__openclaude-memory__skill_view'
 
@@ -48,8 +61,9 @@ const ATTEMPT_TIMEOUT_MS = 10_000
 const MAX_QUEUE_ENTRIES = 500
 /** 队列超限丢弃的 warn 限频窗口:突发上报下防日志刷屏。 */
 const QUEUE_OVERFLOW_WARN_INTERVAL_MS = 60_000
-/** hub slug 集缓存 TTL:60s。skill_view 事件不密集,60s 内的新装技能漏计属可接受弱信号。 */
-const HUB_SLUGS_TTL_MS = 60_000
+/** 技能目录名集缓存 TTL:60s(hub 与 user 各一份)。skill_view 事件不密集,60s 内的
+ *  新装/新建技能漏计属可接受弱信号。 */
+const SKILL_DIR_SLUGS_TTL_MS = 60_000
 /** master-owned per-turn canonical traceId 的形状(32 hex)。只透传合法值,防止把
  *  畸形/自造值当归因键(单一铸造权威在 master,reporter 绝不铸造)。 */
 const TRACE_ID_RE = /^[0-9a-f]{32}$/
@@ -84,6 +98,8 @@ export interface SkillUsageReportPayload {
   sessionKey: string | null
   /** master per-turn canonical traceId(32hex)或 null;评分归因键,拿不到即 null。 */
   traceId: string | null
+  /** 技能层:'hub'(市场)|'user'(用户自建)。判定见 makeSkillUsageReporter.onToolCalled。 */
+  layer: SkillUsageLayer
   /** ISO8601 事件时间(仅供 master 参考,落库以 master NOW() 为准)。 */
   at: string
 }
@@ -144,6 +160,15 @@ export function defaultSkillUsageQueueDir(): string {
 /** hub 技能目录:~/.openclaude/hub/skills/,子目录名 = slug(与 storage/paths 同解析)。 */
 export function defaultHubSkillsDir(): string {
   return join(ocHome(), 'hub', 'skills')
+}
+
+/**
+ * 用户自建技能目录:~/.openclaude/skills/,子目录名 = slug。这是 SkillStore 的**用户层
+ * 唯一写源**(shared library,`paths.sharedSkillsDir`,对所有 agent 可见);与 defaultHubSkillsDir
+ * 同解析法(ocHome + 'skills'),不引入 storage 依赖。agent-seed / baseline 是平台层,不在此。
+ */
+export function defaultUserSkillsDir(): string {
+  return join(ocHome(), 'skills')
 }
 
 function cap(value: string, max: number): string {
@@ -217,6 +242,92 @@ export async function sendSkillUsageReport(
   }
 }
 
+/** 差评引用(master 只回引用不回内容;摘录本体在容器 sessions.db,主权不出容器)。 */
+export interface SkillFeedbackRef {
+  sessionKey: string
+  /** 该次差评 turn 的 canonical traceId(32hex)或 null。 */
+  traceId: string | null
+  /** 差评时间(ISO8601)或 null;仅供参考。 */
+  at: string | null
+}
+
+export interface SkillFeedbackResult {
+  refs: SkillFeedbackRef[]
+  total: number
+}
+
+const EMPTY_FEEDBACK: SkillFeedbackResult = { refs: [], total: 0 }
+
+/**
+ * 解析 master skill-feedback 响应 `{refs:[{sessionKey,traceId,at}], total}`(宽容):
+ * 丢弃缺 sessionKey / 非对象的项;traceId 只放行合法 32hex(否则 null,绝不自造);
+ * at 非串 → null。任何结构异常 → 空结果(fail-open 的纯逻辑层,便于单测)。
+ */
+export function parseSkillFeedbackResponse(data: unknown): SkillFeedbackResult {
+  if (!data || typeof data !== 'object') return { refs: [], total: 0 }
+  const o = data as { refs?: unknown; total?: unknown }
+  if (!Array.isArray(o.refs)) return { refs: [], total: 0 }
+  const refs: SkillFeedbackRef[] = []
+  for (const r of o.refs) {
+    if (!r || typeof r !== 'object') continue
+    const rr = r as { sessionKey?: unknown; traceId?: unknown; at?: unknown }
+    const sessionKey = typeof rr.sessionKey === 'string' ? rr.sessionKey.trim() : ''
+    if (!sessionKey) continue
+    refs.push({
+      sessionKey,
+      traceId: normalizeTraceId(typeof rr.traceId === 'string' ? rr.traceId : null),
+      at: typeof rr.at === 'string' ? rr.at : null,
+    })
+  }
+  const total = typeof o.total === 'number' && Number.isFinite(o.total) ? o.total : refs.length
+  return { refs, total }
+}
+
+/**
+ * 拉取「该用户对某技能差评过的真实使用引用」,供技能训练注入失败案例场景。
+ *
+ * 复用**容器 token HTTP 模式**(同 storage/marketplaceSync 的 GET master):Bearer 容器
+ * token,master 侧 verifyContainerIdentity 推 userId,只回本用户该 layer 的差评引用。
+ *
+ * **fail-open 红线**:任何失败(env 缺失 / slug 空 / master 不可达 / 非 2xx / 解析失败)
+ * 一律返回空引用,绝不 throw —— 差评素材是训练增强项,拉不到照常训练。**不受
+ * OC_MARKET_SKILL_USAGE 门控**(那只关"上报使用信号",与"训练读差评"是两件独立的事)。
+ */
+export async function fetchUserSkillFeedbackRefs(
+  slug: string,
+  opts: {
+    env?: NodeJS.ProcessEnv
+    fetchImpl?: FetchLike
+    timeoutMs?: number
+    layer?: SkillUsageLayer
+  } = {},
+): Promise<SkillFeedbackResult> {
+  const env = opts.env ?? process.env
+  const base = env.OPENCLAUDE_V3_MASTER_BASE_URL?.trim().replace(/\/+$/, '')
+  const token = env.OPENCLAUDE_V3_CONTAINER_TOKEN?.trim()
+  if (!base || !token) return EMPTY_FEEDBACK // 非 commercial 容器 → 无差评源
+  const s = typeof slug === 'string' ? slug.trim() : ''
+  if (!s) return EMPTY_FEEDBACK
+  const layer: SkillUsageLayer = opts.layer ?? 'user'
+  const fetchImpl = opts.fetchImpl ?? fetch
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), opts.timeoutMs ?? ATTEMPT_TIMEOUT_MS)
+  try {
+    const url = `${base}${SKILL_FEEDBACK_PATH}?slug=${encodeURIComponent(s)}&layer=${encodeURIComponent(layer)}`
+    const res = await fetchImpl(url, {
+      method: 'GET',
+      headers: { authorization: `Bearer ${token}` },
+      signal: controller.signal,
+    })
+    if (!res.ok) return EMPTY_FEEDBACK // 端点未上线 / 鉴权失败 / 5xx → fail-open
+    return parseSkillFeedbackResponse((await res.json()) as unknown)
+  } catch {
+    return EMPTY_FEEDBACK // 网络 / 超时 / JSON 解析 → fail-open
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
 export interface SkillUsageReporter {
   start(): void
   stop(): void
@@ -228,6 +339,7 @@ export function makeSkillUsageReporter(deps: {
   config: SkillUsageReportConfig
   queueDir?: string
   hubSkillsDir?: string
+  userSkillsDir?: string
   eventBus?: EventBusLike
   fetchImpl?: FetchLike
   resolveTraceId?: TraceIdResolver
@@ -237,6 +349,7 @@ export function makeSkillUsageReporter(deps: {
 }): SkillUsageReporter {
   const dir = deps.queueDir ?? defaultSkillUsageQueueDir()
   const hubDir = deps.hubSkillsDir ?? defaultHubSkillsDir()
+  const userDir = deps.userSkillsDir ?? defaultUserSkillsDir()
   const now = deps.now ?? (() => Date.now())
   const bus = deps.eventBus ?? eventBus
   const drainIntervalMs = deps.drainIntervalMs ?? DRAIN_INTERVAL_MS
@@ -248,23 +361,38 @@ export function makeSkillUsageReporter(deps: {
   // enqueue 串行链:事件突发时并发 readdir 会各自看到旧计数,上限被击穿;串行化保证准确。
   let enqueueChain: Promise<void> = Promise.resolve()
   let lastOverflowWarnAt = 0
-  // hub slug 集 TTL 缓存(60s)。缓存命中避免每个事件都 readdir。
+  // slug 集 TTL 缓存(60s):hub 与 user 各一份,命中避免每个事件都 readdir。
   let hubCache: { at: number; slugs: Set<string> } | null = null
+  let userCache: { at: number; slugs: Set<string> } | null = null
+
+  /** readdir 出目录名集(仅目录、跳隐藏项);目录不存在/不可读 → null(调用方不缓存失败)。 */
+  async function readSkillDirSlugs(dirPath: string): Promise<Set<string> | null> {
+    try {
+      const entries = await readdir(dirPath, { withFileTypes: true })
+      const slugs = new Set<string>()
+      for (const e of entries) if (e.isDirectory() && !e.name.startsWith('.')) slugs.add(e.name)
+      return slugs
+    } catch {
+      // 目录不存在/不可读:**不缓存失败**——一旦目录被创建,下个事件即刻重读
+      // (skill_view 事件稀疏,无 readdir 风暴风险)。
+      return null
+    }
+  }
 
   async function loadHubSlugs(): Promise<Set<string>> {
     const t = now()
-    if (hubCache && t - hubCache.at < HUB_SLUGS_TTL_MS) return hubCache.slugs
-    try {
-      const entries = await readdir(hubDir, { withFileTypes: true })
-      const slugs = new Set<string>()
-      for (const e of entries) if (e.isDirectory()) slugs.add(e.name)
-      hubCache = { at: t, slugs }
-      return slugs
-    } catch {
-      // hub 目录不存在/不可读:返回空集但**不缓存失败**——一旦目录被创建,下个事件即刻
-      // 重读(skill_view 事件稀疏,无 readdir 风暴风险)。fail-open:本轮全部丢弃。
-      return new Set()
-    }
+    if (hubCache && t - hubCache.at < SKILL_DIR_SLUGS_TTL_MS) return hubCache.slugs
+    const slugs = await readSkillDirSlugs(hubDir)
+    if (slugs) hubCache = { at: t, slugs }
+    return slugs ?? new Set() // 读失败:本轮空集(fail-open),不进缓存
+  }
+
+  async function loadUserSlugs(): Promise<Set<string>> {
+    const t = now()
+    if (userCache && t - userCache.at < SKILL_DIR_SLUGS_TTL_MS) return userCache.slugs
+    const slugs = await readSkillDirSlugs(userDir)
+    if (slugs) userCache = { at: t, slugs }
+    return slugs ?? new Set()
   }
 
   async function ensureDir(): Promise<void> {
@@ -346,17 +474,23 @@ export function makeSkillUsageReporter(deps: {
     const traceId = normalizeTraceId(deps.resolveTraceId?.(ev.sessionKey))
     const agentId = typeof ev.agentId === 'string' && ev.agentId.trim().length > 0 ? cap(ev.agentId.trim(), MAX_AGENT_ID_CHARS) : null
     const sessionKey = typeof ev.sessionKey === 'string' && ev.sessionKey.trim().length > 0 ? cap(ev.sessionKey.trim(), MAX_SESSION_KEY_CHARS) : null
-    // hub 成员判定 + 落盘走异步串行链(readdir 是异步)。非 hub → 静默丢弃(fail-open)。
+    // 层判定 + 落盘走异步串行链(readdir 是异步)。判层与 SkillStore 读优先级一致:
+    // **先判 user(shared 用户层)再判 hub** —— 同名用户技能遮蔽 hub,skill_view 实际读到
+    // 用户版,归 'user'(绝不让遮蔽 hub 的用户技能污染市场聚合)。两层都不中(平台
+    // baseline/agent-seed 或未知 slug)→ 静默丢弃(fail-open)。
     enqueueChain = enqueueChain
       .then(async () => {
-        const slugs = await loadHubSlugs()
-        if (!slugs.has(slug)) return // 平台/baseline 技能不在 hub → 不产生事件
+        let layer: SkillUsageLayer
+        if ((await loadUserSlugs()).has(slug)) layer = 'user'
+        else if ((await loadHubSlugs()).has(slug)) layer = 'hub'
+        else return // 两层不中 → 不产生事件
         await enqueue({
           eventId: randomUUID(),
           slug,
           agentId,
           sessionKey,
           traceId,
+          layer,
           at: new Date(now()).toISOString(),
         })
       })

@@ -79,9 +79,41 @@ export function normalizeSkillTrainArgs(
   }
 }
 
+/** 训练素材:用户差评过的真实场景摘录。text 由调用方用 P1 buildSessionExcerpt 裁到 ≤1500 字符。 */
+export interface FeedbackScenario {
+  /** 会话标题(可选;仅作可读锚点)。 */
+  title?: string
+  text: string
+}
+
+/** 差评场景注入上限:≤3 段(prompt 体积/成本约束),每段 ≤1500 字符。 */
+export const MAX_FEEDBACK_SCENARIOS = 3
+export const FEEDBACK_SCENARIO_MAX_CHARS = 1500
+
+/**
+ * 把「用户差评过的真实场景」摘录渲染成训练 prompt 的独立小节(纯函数,便于单测)。
+ * 空数组 → 返回空串(调用方据此决定不注入)。至多 MAX_FEEDBACK_SCENARIOS 段;每段文本
+ * 假定调用方已裁到 ≤FEEDBACK_SCENARIO_MAX_CHARS,这里再兜底截断防越界。
+ */
+export function buildFeedbackScenariosSection(scenarios: readonly FeedbackScenario[]): string {
+  const picked = scenarios.filter((s) => s.text?.trim()).slice(0, MAX_FEEDBACK_SCENARIOS)
+  if (picked.length === 0) return ''
+  const blocks = picked.map((s, i) => {
+    const title = s.title?.trim() ? `(${truncate(s.title.trim(), 60)})` : ''
+    return `### 差评场景 ${i + 1}${title}\n${truncate(s.text.trim(), FEEDBACK_SCENARIO_MAX_CHARS)}`
+  })
+  return `## 用户差评过的真实场景(优先分析这些失败案例)
+以下是用户对本技能标记「差评」的真实使用会话摘录 —— 这些正是该技能当前最该改进之处。
+起草改动时**优先**针对这些失败模式:补齐缺失的步骤/前置校验/边界处理,或修正会导致此类
+结果的指令。不要泛泛复盘;把这些具体失败当作首要证据。
+
+${blocks.join('\n\n')}`
+}
+
 export function buildSkillTrainPrompt(
   opts: NormalizedSkillTrainArgs,
   now: Date = new Date(),
+  feedbackSection?: string,
 ): string {
   const end = now.toISOString()
   const start = new Date(now.getTime() - opts.lookbackHours * HOUR_MS).toISOString()
@@ -89,6 +121,8 @@ export function buildSkillTrainPrompt(
   const target = opts.targetSkill
     ? `Skill under training: \`${opts.targetSkill}\` (focus proposals on this one skill).`
     : "Skill selection: auto-select among the USER'S OWN skills that recent work would most improve."
+  // 差评场景小节(有则注入,置于意图段与 CRITICAL guards 之间,作为首要证据)。
+  const feedback = feedbackSection?.trim() ? `\n${feedbackSection.trim()}\n` : ''
 
   return `# SkillOpt skill-training run (DeepSeek, draft mode)
 
@@ -103,7 +137,7 @@ Proposal budget: stage at most ${opts.maxProposals} draft change(s) this run.${f
 You are improving the USER'S OWN skills from their recent real work. You produce
 DRAFTS only — you never modify the live skill library. The user reviews each draft
 as a diff and confirms the merge afterward.
-
+${feedback}
 CRITICAL guards:
 - Stage every change with \`skill_propose\` (runId="${opts.runId}"). Do NOT call
   \`skill_save\`, \`skill_delete\`, or \`skill_train_auto\` — the platform blocks them here.
@@ -184,4 +218,9 @@ function cleanString(value: unknown): string | undefined {
   if (typeof value !== 'string') return undefined
   const trimmed = value.trim()
   return trimmed || undefined
+}
+
+/** 硬截断到 ≤n 字符(超长补省略号,总长仍 ≤n)。 */
+function truncate(s: string, n: number): string {
+  return s.length > n ? `${s.slice(0, Math.max(0, n - 1))}…` : s
 }

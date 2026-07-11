@@ -199,3 +199,66 @@ describe("SkillEvalSection AI 生成用例", () => {
     expect(screen.getByRole("button", { name: /补充生成/ })).toBeDisabled();
   });
 });
+
+// ── 训练启动:差评真实使用记录提示条(SkillTrainSection) ─────────────────────
+
+describe("SkillTrainSection 差评引用提示条", () => {
+  const QUEUED_RUN: SkillTrainRun = {
+    runId: "r1",
+    skillName: "coding-suite",
+    status: "queued",
+    phase: "queued",
+    proposalCount: 0,
+    toolCalls: 0,
+    error: null,
+    summary: null,
+    startedAt: 1000,
+    finishedAt: null,
+    evalRunId: null,
+  };
+
+  /** 渲染 → 点「训练优化」→ 过成本确认,进入训练启动。 */
+  async function launchTraining() {
+    render(<SkillTrainSection auth={auth} skillName="coding-suite" rates={null} />);
+    fireEvent.click(await screen.findByRole("button", { name: /训练优化/ }));
+    fireEvent.click(await screen.findByRole("button", { name: /接受消耗/ }));
+  }
+
+  test("启动响应 feedbackRefs>0 → 渲染差评引用提示条(含条数)", async () => {
+    vi.spyOn(api, "listSkillTrainRuns").mockResolvedValue([]);
+    vi.spyOn(api, "getSkillTrainRun").mockResolvedValue(QUEUED_RUN);
+    const start = vi
+      .spyOn(api, "startSkillTrain")
+      .mockResolvedValue({ ok: true, runId: "r1", feedbackRefs: 3 });
+
+    await launchTraining();
+
+    await waitFor(() => expect(start).toHaveBeenCalledWith(auth, "coding-suite", { autoEval: true }));
+    expect(
+      await screen.findByText(/已找到 3 条你差评过的真实使用记录/),
+    ).toBeInTheDocument();
+  });
+
+  test("启动响应不含 feedbackRefs(旧后端) → 不渲染提示条(容错)", async () => {
+    vi.spyOn(api, "listSkillTrainRuns").mockResolvedValue([]);
+    vi.spyOn(api, "getSkillTrainRun").mockResolvedValue(QUEUED_RUN);
+    vi.spyOn(api, "startSkillTrain").mockResolvedValue({ ok: true, runId: "r1" });
+
+    await launchTraining();
+
+    // 训练已启动(进入 run 面板,出现阶段标签),但差评提示条不存在。
+    expect(await screen.findByText(/排队中/)).toBeInTheDocument();
+    expect(screen.queryByText(/差评过的真实使用记录/)).not.toBeInTheDocument();
+  });
+
+  test("启动响应 feedbackRefs=0 → 不渲染提示条", async () => {
+    vi.spyOn(api, "listSkillTrainRuns").mockResolvedValue([]);
+    vi.spyOn(api, "getSkillTrainRun").mockResolvedValue(QUEUED_RUN);
+    vi.spyOn(api, "startSkillTrain").mockResolvedValue({ ok: true, runId: "r1", feedbackRefs: 0 });
+
+    await launchTraining();
+
+    expect(await screen.findByText(/排队中/)).toBeInTheDocument();
+    expect(screen.queryByText(/差评过的真实使用记录/)).not.toBeInTheDocument();
+  });
+});

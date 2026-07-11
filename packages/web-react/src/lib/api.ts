@@ -27,6 +27,7 @@ import type {
   SkillEvalsFile,
   SkillRunUsage,
   SkillTrainRun,
+  SkillTrainStartResult,
   MarketplaceAiReview,
   MarketplaceMyPublish,
   MarketplacePending,
@@ -1649,9 +1650,10 @@ export const api = {
       ),
     ),
 
-  /** 启动训练 run（POST /api/skills/:name/train;消耗积分,调用前必须已过成本确认）。 */
+  /** 启动训练 run（POST /api/skills/:name/train;消耗积分,调用前必须已过成本确认）。
+   *  响应可带 feedbackRefs(命中的差评真实使用记录条数;旧后端缺省)。 */
   startSkillTrain: (a: AuthSession, name: string, body?: { focus?: string; autoEval?: boolean }) =>
-    jsonOrThrow<{ ok: boolean; runId: string }>(
+    jsonOrThrow<SkillTrainStartResult>(
       callWithRefresh(a, (t) =>
         fetch(`/api/skills/${encodeURIComponent(name)}/train`, {
           method: "POST",

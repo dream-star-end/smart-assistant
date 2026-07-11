@@ -822,6 +822,8 @@ export async function listApprovedForSearch(
     //   ic = 当前活跃安装数;us = 近 30 天使用事件数 / distinct 用户数;
     //   rt = 评分归因(response_rating.trace_id ⋈ usage.trace_id;先 DISTINCT 去重同 turn 同
     //        slug 的多次 view —— 一个被评分的 turn 用过某 slug 只记一次 up/down)。
+    // 【正确性红线】us / rt 两个 usage 子查询都必须 layer='hub':user 层 slug 是用户私有命名空间
+    //   (自建技能目录名),不过滤会让同名 user 技能的使用/评分污染市场信号。行为测试锁死。
     // org 可见性收口:org-private listing 仅本 org 成员可搜出(callerOrgId=null → 仅公开)。
     // 目录排序服务端权威:平台精选(featured_rank ASC NULLS LAST)领衔 → 30 天使用人数(users30d
     // DESC)→ 安装数(DESC)→ 新版本(v.id DESC)。前端不再自行排序,信任此序。
@@ -837,6 +839,7 @@ export async function listApprovedForSearch(
        LEFT JOIN (SELECT slug, count(*) AS usage_n, count(DISTINCT user_id) AS users_n
                     FROM marketplace_skill_usage_events
                    WHERE created_at >= NOW() - INTERVAL '30 days'
+                     AND layer = 'hub'
                    GROUP BY slug) us ON us.slug = l.slug
        LEFT JOIN (SELECT slug,
                          count(*) FILTER (WHERE rating = 'up')   AS up_n,
@@ -844,7 +847,7 @@ export async function listApprovedForSearch(
                     FROM (SELECT DISTINCT e.slug, r.user_id, r.message_id, r.rating
                             FROM marketplace_skill_usage_events e
                             JOIN response_rating r ON r.trace_id = e.trace_id
-                           WHERE e.trace_id IS NOT NULL) d
+                           WHERE e.trace_id IS NOT NULL AND e.layer = 'hub') d
                    GROUP BY slug) rt ON rt.slug = l.slug
       WHERE l.state = 'active' AND v.status = 'approved'
             AND ($1::text IS NULL OR l.kind = $1)
@@ -979,6 +982,7 @@ export async function getListingDetail(
               SELECT count(*) AS usage_n, count(DISTINCT u.user_id) AS users_n
                 FROM marketplace_skill_usage_events u
                WHERE u.slug = l.slug AND u.created_at >= NOW() - INTERVAL '30 days'
+                 AND u.layer = 'hub'
             ) us ON true
        LEFT JOIN LATERAL (
               SELECT count(*) FILTER (WHERE d.rating = 'up')   AS up_n,
@@ -986,7 +990,8 @@ export async function getListingDetail(
                 FROM (SELECT DISTINCT r.user_id, r.message_id, r.rating
                         FROM marketplace_skill_usage_events e
                         JOIN response_rating r ON r.trace_id = e.trace_id
-                       WHERE e.trace_id IS NOT NULL AND e.slug = l.slug) d
+                       WHERE e.trace_id IS NOT NULL AND e.slug = l.slug
+                         AND e.layer = 'hub') d
             ) rt ON true
       WHERE l.slug = $1 AND l.state = 'active' AND v.status = 'approved'
             AND ${orgVisibleFrag('l', 2)}`,

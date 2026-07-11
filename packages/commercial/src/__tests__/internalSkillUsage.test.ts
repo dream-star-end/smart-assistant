@@ -100,31 +100,35 @@ describe('insertSkillUsageEvents', () => {
       },
     }
     const events: SkillUsageEvent[] = [
-      { eventId: 'e1', slug: 'a', agentId: 'main', sessionKey: null, traceId: TRACE },
-      { eventId: 'e2', slug: 'b', agentId: null, sessionKey: null, traceId: null },
-      { eventId: 'e3', slug: 'c', agentId: null, sessionKey: null, traceId: null },
+      { eventId: 'e1', slug: 'a', agentId: 'main', sessionKey: null, traceId: TRACE, layer: 'hub' },
+      { eventId: 'e2', slug: 'b', agentId: null, sessionKey: null, traceId: null, layer: 'user' },
+      { eventId: 'e3', slug: 'c', agentId: null, sessionKey: null, traceId: null, layer: 'hub' },
     ]
     const r = await insertSkillUsageEvents(runner, 42, events)
     assert.deepEqual(r, { accepted: 2, duplicate: 1 })
     assert.equal(calls.length, 1)
     assert.match(calls[0].sql, /INSERT INTO marketplace_skill_usage_events/)
     assert.match(calls[0].sql, /ON CONFLICT \(user_id, event_id\) DO NOTHING/)
-    // 6 列 × 3 行 = 18 参数;第一列恒为服务端推导 userId(不信容器 uid)。
-    assert.equal(calls[0].params?.length, 18)
+    // INSERT 列含 layer;第 2 行事件走 user 层。
+    assert.match(calls[0].sql, /, layer\)/)
+    // 7 列 × 3 行 = 21 参数;第一列恒为服务端推导 userId(不信容器 uid);末列为 layer。
+    assert.equal(calls[0].params?.length, 21)
     assert.equal(calls[0].params?.[0], 42)
+    assert.equal(calls[0].params?.[6], 'hub') // 首行 layer
+    assert.equal(calls[0].params?.[13], 'user') // 次行 layer
   })
 
   test('intra-batch duplicate eventId is collapsed before insert', async () => {
     let insertedRows = 0
     const runner: QueryRunner = {
       async query(_sql, params) {
-        insertedRows = (params?.length ?? 0) / 6
+        insertedRows = (params?.length ?? 0) / 7
         return fakeResult(insertedRows)
       },
     }
     const events: SkillUsageEvent[] = [
-      { eventId: 'dup', slug: 'a', agentId: null, sessionKey: null, traceId: null },
-      { eventId: 'dup', slug: 'a', agentId: null, sessionKey: null, traceId: null },
+      { eventId: 'dup', slug: 'a', agentId: null, sessionKey: null, traceId: null, layer: 'hub' },
+      { eventId: 'dup', slug: 'a', agentId: null, sessionKey: null, traceId: null, layer: 'hub' },
     ]
     const r = await insertSkillUsageEvents(runner, 42, events)
     // 批内去重后只 INSERT 1 行;另一条算 duplicate。
@@ -174,6 +178,9 @@ describe('skill usage handler', () => {
       { events: [ev({ slug: 'Bad Slug!' })] },
       { events: [ev({ eventId: '' })] },
       { events: [ev({ traceId: 'not-hex' })] },
+      // 非法 layer(越界串 / 非串)→ 整批 400,不静默降级为 hub。
+      { events: [ev({ layer: 'platform' })] },
+      { events: [ev({ layer: 123 })] },
       { nope: 1 },
     ]) {
       const res = makeRes()
@@ -193,5 +200,31 @@ describe('skill usage handler', () => {
     )
     assert.equal(res.statusCode, 200)
     assert.equal(res.body.accepted, 1)
+  })
+
+  test('layer:缺省→hub、显式 user 都被接受并流入 INSERT 参数', async () => {
+    const captured: Array<readonly unknown[] | undefined> = []
+    const runner: QueryRunner = {
+      async query(_sql, params) {
+        captured.push(params)
+        return fakeResult(2)
+      },
+    }
+    const h = makeSkillUsageHandler({ identityRepo: repoFor(), queryRunner: runner })
+    const res = makeRes()
+    await h(
+      makeReq({
+        auth: `Bearer ${TOKEN}`,
+        // 第一条不带 layer(应默认 hub),第二条显式 user。
+        body: { events: [ev({ eventId: 'e1', layer: undefined }), ev({ eventId: 'e2', layer: 'user' })] },
+      }),
+      res,
+      CTX,
+    )
+    assert.equal(res.statusCode, 200)
+    // 7 列 × 2 行:layer 是每行第 7 个参数(索引 6、13)。
+    assert.equal(captured[0]?.length, 14)
+    assert.equal(captured[0]?.[6], 'hub')
+    assert.equal(captured[0]?.[13], 'user')
   })
 })

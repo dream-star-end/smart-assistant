@@ -38,3 +38,7 @@ v3migrationLedger — markPhase 入参 guard(Codex Phase 2.A review v2 BLOCKER)
 v3migrationLedger — terminal guard(Codex Phase 2.A review BLOCKER 1/2)
 # 下一条为负载敏感 flaky(同日更早一轮本机跑观测到,近两轮未复现;若长期不再出现可删):
 assertPlatformDefaultModelConfigured
+# 2026-07-11 登记:本机补长驻 octest-redis(56379)后首次暴露——该 metrics 测试在 redis
+# 可达时走到新分支稳定失败;基线树(aurora@1f4bef5c)同法复现 11/12 同一子测,非在途
+# 分支引入。修掉后删除本行。
+V3 2I-2 — anthropicProxy + bridge histograms/counters
