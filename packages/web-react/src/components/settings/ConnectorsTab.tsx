@@ -1,6 +1,6 @@
 import { Check, ExternalLink, Pencil, Trash2, X } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { api, ApiError } from "../../lib/api";
+import { api, ApiError, apiErrorMessage } from "../../lib/api";
 import {
   connectorCapabilityLabel,
   connectorErrorText,
@@ -14,10 +14,11 @@ import {
 import type { AuthSession } from "../../lib/types";
 import { Alert, Button, IconButton, Input, Modal, Spinner, useConfirm } from "../ui";
 
-/** 把 ApiError 的机器码映射为中文（无码/未知码回退通用文案，绝不裸露码）。 */
+/** 把 ApiError 的机器码映射为中文（无码/未知码走 apiErrorMessage 收口：后端中文直显、
+ *  英文/技术串回退 fallback + 追踪号，绝不裸露码或英文原文）。 */
 function errText(e: unknown, fallback: string): string {
   if (e instanceof ApiError && e.code) return connectorErrorText(e.code);
-  return (e as Error)?.message || fallback;
+  return apiErrorMessage(e, fallback);
 }
 
 /** oauth2_byoa provider 未下发 formFields 时的兜底字段（契约 body 键 clientId/clientSecret）。 */

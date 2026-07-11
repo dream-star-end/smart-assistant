@@ -1,6 +1,6 @@
 import { ChevronRight, FileText, Loader2, Pencil, Search, Sparkles, Trash2 } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
-import { api } from "../../lib/api";
+import { api, apiErrorMessage } from "../../lib/api";
 import type { AuthSession, MarketplaceMyAgent, SkillDetail, SkillSummary } from "../../lib/types";
 import { cn } from "../../lib/utils";
 import { AgentScopeSummary } from "../AgentScopePicker";
@@ -49,7 +49,7 @@ export function SkillsPanel({ auth }: { auth: AuthSession }) {
         }
       })
       .catch((e) => {
-        if (alive) setErr((e as Error).message || "加载技能失败");
+        if (alive) setErr(apiErrorMessage(e, "加载技能失败"));
       })
       .finally(() => {
         if (alive) setLoading(false);
@@ -66,7 +66,7 @@ export function SkillsPanel({ auth }: { auth: AuthSession }) {
         await api.deleteSkill(auth, name);
         setReload((n) => n + 1);
       } catch (e) {
-        setErr((e as Error).message || "删除失败");
+        setErr(apiErrorMessage(e, "删除失败"));
       }
     },
     [auth, confirmDialog],
@@ -183,7 +183,7 @@ function SkillRow({
       api
         .getSkill(auth, skill.name)
         .then(setDetail)
-        .catch((e) => setErr((e as Error).message || "加载技能正文失败"))
+        .catch((e) => setErr(apiErrorMessage(e, "加载技能正文失败")))
         .finally(() => setLoading(false));
     }
     // 自建可写技能:展开时探一次「有无评测用例」,决定是否给「未配评测」提示点。

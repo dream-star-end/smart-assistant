@@ -2,7 +2,7 @@ import { Inbox, Search, ShieldCheck } from "lucide-react";
 import { useRef, useState } from "react";
 import { Badge, Button, EmptyState, Input, Spinner, useToast } from "../../../components/ui";
 import { type Column, DataTable, FilterBar, PageHeader } from "../../components";
-import { adminGet, adminSend } from "../../lib/adminApi";
+import { adminGet, adminSend, apiErrorMessage } from "../../lib/adminApi";
 import { getAdminPage } from "../../registry";
 
 type PricingRow = {
@@ -45,7 +45,7 @@ export default function ModelGrantsPage() {
         (pricingCache.current ?? []).filter((p) => (p.visibility || "public") !== "public"),
       );
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(apiErrorMessage(e, "加载失败"));
     } finally {
       setLoadingGrants(false);
     }
@@ -85,7 +85,7 @@ export default function ModelGrantsPage() {
       setSelected({ uid, email });
       await loadGrants(uid);
     } catch (e) {
-      toast(`查询失败：${e instanceof Error ? e.message : String(e)}`, "error");
+      toast(`查询失败：${apiErrorMessage(e, "请求失败")}`, "error");
     } finally {
       setSearching(false);
     }
@@ -109,7 +109,7 @@ export default function ModelGrantsPage() {
       }
       await loadGrants(selected.uid);
     } catch (e) {
-      toast(`失败：${e instanceof Error ? e.message : String(e)}`, "error");
+      toast(`失败：${apiErrorMessage(e, "请求失败")}`, "error");
     } finally {
       setTogglingModel(null);
     }

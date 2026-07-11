@@ -1,7 +1,7 @@
 import { isMarketplaceCategoryId, marketplaceCategoryLabel } from '@openclaude/protocol'
 import { Activity, ArrowUpCircle, Download, Layers, Loader2, ShieldCheck, Target, Users } from 'lucide-react'
 import { useEffect, useState } from 'react'
-import { ApiError, api } from '../../lib/api'
+import { api, apiErrorMessage } from '../../lib/api'
 import { formatInstallCount, marketTrySkillPrefill } from '../../lib/marketplace'
 import type { AuthSession, MarketplaceDetail, MarketplaceInstalled, MarketplaceMyAgent } from '../../lib/types'
 import { AgentScopePicker, normalizeAgentScope } from '../AgentScopePicker'
@@ -204,7 +204,7 @@ export function DetailModal({
         setAgents(a.length ? a : [{ id: 'main', slug: 'main', name: '全能助手', description: '', installed: true, isDefault: true }])
         setScopeIds(normalizeAgentScope(installed?.agentIds))
       })
-      .catch((e) => alive && setErr((e as Error).message || '加载详情失败'))
+      .catch((e) => alive && setErr(apiErrorMessage(e, '加载详情失败')))
       .finally(() => alive && setLoading(false))
     return () => {
       alive = false
@@ -224,7 +224,7 @@ export function DetailModal({
       setDone(true)
       onInstalled()
     } catch (e) {
-      setErr(e instanceof ApiError ? e.message : (e as Error).message || '安装失败')
+      setErr(apiErrorMessage(e, '安装失败'))
     } finally {
       setInstalling(false)
     }
@@ -239,7 +239,7 @@ export function DetailModal({
       onInstalled()
       setDone(true)
     } catch (e) {
-      setErr(e instanceof ApiError ? e.message : (e as Error).message || '保存归属失败')
+      setErr(apiErrorMessage(e, '保存归属失败'))
     } finally {
       setScopeSaving(false)
     }

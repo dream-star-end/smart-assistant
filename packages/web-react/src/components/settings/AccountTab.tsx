@@ -1,6 +1,6 @@
 import { Building2, Crown, Plus, Wallet } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
-import { api } from "../../lib/api";
+import { api, apiErrorMessage } from "../../lib/api";
 import type { AuthSession, MySubscription, UsageLedgerRow, User } from "../../lib/types";
 import { cn, formatCredits } from "../../lib/utils";
 import { Alert, Button, Spinner } from "../ui";
@@ -78,7 +78,7 @@ export function AccountTab({
         setNextBefore(u.ledger.next_before);
       })
       .catch((e) => {
-        if (alive) setErr((e as Error).message || "加载账单流水失败");
+        if (alive) setErr(apiErrorMessage(e, "加载账单流水失败"));
       })
       .finally(() => {
         if (alive) setLoading(false);
@@ -96,7 +96,7 @@ export function AccountTab({
       setRows((prev) => [...prev, ...u.ledger.rows]);
       setNextBefore(u.ledger.next_before);
     } catch (e) {
-      setErr((e as Error).message || "加载更多失败");
+      setErr(apiErrorMessage(e, "加载更多失败"));
     } finally {
       setLoadingMore(false);
     }

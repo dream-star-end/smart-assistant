@@ -1,6 +1,6 @@
 import { ArrowUpCircle, Check, Loader2, RefreshCw } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { ApiError, api } from "../../lib/api";
+import { api, apiErrorMessage } from "../../lib/api";
 import type { AuthSession, HupiCreateResult, MySubscription, SubscriptionPlanWire } from "../../lib/types";
 import { cn, formatCentsYuan, formatCredits } from "../../lib/utils";
 import { Alert, Button, Modal, Spinner } from "../ui";
@@ -87,7 +87,7 @@ export function SubscriptionDialog({
         setSub(s);
       })
       .catch((e) => {
-        if (alive) setErr((e as Error).message || "加载套餐失败");
+        if (alive) setErr(apiErrorMessage(e, "加载套餐失败"));
       })
       .finally(() => {
         if (alive) setLoading(false);
@@ -115,8 +115,7 @@ export function SubscriptionDialog({
       setStage({ kind: "qr", order, note });
     } catch (e) {
       if (!openRef.current || gen !== genRef.current) return;
-      if (e instanceof ApiError) setErr(e.message || "创建订单失败");
-      else setErr((e as Error).message || "创建订单失败");
+      setErr(apiErrorMessage(e, "创建订单失败"));
     } finally {
       if (openRef.current && gen === genRef.current) setBusyCode(null);
     }
@@ -133,8 +132,7 @@ export function SubscriptionDialog({
       setStage({ kind: "qr", order, note: "积分加量包" });
     } catch (e) {
       if (!openRef.current || gen !== genRef.current) return;
-      if (e instanceof ApiError) setErr(e.message || "创建订单失败");
-      else setErr((e as Error).message || "创建订单失败");
+      setErr(apiErrorMessage(e, "创建订单失败"));
     } finally {
       if (openRef.current && gen === genRef.current) setBusyCode(null);
     }

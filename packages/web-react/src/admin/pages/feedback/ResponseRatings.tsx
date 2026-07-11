@@ -13,7 +13,7 @@ import {
   donutConfig,
   useChart,
 } from "../../components";
-import { adminGet } from "../../lib/adminApi";
+import { adminGet, apiErrorMessage } from "../../lib/adminApi";
 import type {
   DownRatingRow,
   ModelRatingStat,
@@ -186,7 +186,7 @@ export function ResponseRatings() {
   ];
 
   if (error) {
-    return <Alert tone="danger">加载评分统计失败：{error.message}</Alert>;
+    return <Alert tone="danger">加载评分统计失败：{apiErrorMessage(error, "加载失败")}</Alert>;
   }
 
   return (

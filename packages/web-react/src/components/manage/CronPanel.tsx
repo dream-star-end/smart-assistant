@@ -1,6 +1,6 @@
 import { Clock, Loader2, Pencil, Plus, Trash2, X } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
-import { api } from "../../lib/api";
+import { api, apiErrorMessage } from "../../lib/api";
 import {
   buildSchedule,
   cronHuman,
@@ -43,7 +43,7 @@ export function CronPanel({ auth }: { auth: AuthSession }) {
         if (alive) setJobs(j);
       })
       .catch((e) => {
-        if (alive) setErr((e as Error).message || "加载定时任务失败");
+        if (alive) setErr(apiErrorMessage(e, "加载定时任务失败"));
       })
       .finally(() => {
         if (alive) setLoading(false);
@@ -61,7 +61,7 @@ export function CronPanel({ auth }: { auth: AuthSession }) {
         await api.updateCron(auth, job.id, { enabled: !job.enabled });
         refresh();
       } catch (e) {
-        setErr((e as Error).message || "操作失败");
+        setErr(apiErrorMessage(e, "操作失败"));
       }
     },
     [auth, refresh],
@@ -79,7 +79,7 @@ export function CronPanel({ auth }: { auth: AuthSession }) {
         await api.deleteCron(auth, job.id);
         refresh();
       } catch (e) {
-        setErr((e as Error).message || "删除失败");
+        setErr(apiErrorMessage(e, "删除失败"));
       }
     },
     [auth, refresh, confirmDialog],
@@ -280,7 +280,7 @@ function CronForm({
       }
       onDone();
     } catch (e) {
-      onError((e as Error).message || (editing ? "保存失败" : "创建失败"));
+      onError(apiErrorMessage(e, editing ? "保存失败" : "创建失败"));
     } finally {
       setBusy(false);
     }

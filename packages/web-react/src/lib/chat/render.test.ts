@@ -64,6 +64,17 @@ describe("messageSignature 流式防闪签名", () => {
     );
   });
 
+  test("turnFinalAssistant 翻转 → 签名变化(轮末条评价行 sig-memo 关键:后续追加使原末条→非末条须重渲)", () => {
+    const m = mk("assistant", { text: "答复" });
+    expect(messageSignature(m, { isLast: false, sending: false, turnFinalAssistant: true })).not.toBe(
+      messageSignature(m, { isLast: false, sending: false, turnFinalAssistant: false }),
+    );
+    // 缺省(undefined)与显式 false 等价 —— 老调用点不传该字段时行为不变。
+    expect(messageSignature(m, { isLast: false, sending: false })).toBe(
+      messageSignature(m, { isLast: false, sending: false, turnFinalAssistant: false }),
+    );
+  });
+
   test("tool 完成翻转 → 签名变化", () => {
     const a = mk("tool", { toolName: "Bash", _completed: false });
     const b = mk("tool", { toolName: "Bash", _completed: true, output: "done" });

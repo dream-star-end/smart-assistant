@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { ApiError, adminSend } from "../../lib/adminApi";
+import { adminSend, apiErrorMessage } from "../../lib/adminApi";
 import { TimeAgo } from "../../components";
 import { Badge, Button, Input, Switch, Textarea, useToast } from "../../../components/ui";
 import type { SettingRow as Row } from "./types";
@@ -102,7 +102,7 @@ export function SettingRow({ row, onSaved }: { row: Row; onSaved: () => Promise<
       toast(`${row.key} 已保存`, "success");
       await onSaved();
     } catch (e) {
-      toast(e instanceof ApiError ? e.message : String((e as Error)?.message ?? e), "error");
+      toast(apiErrorMessage(e, "保存失败"), "error");
     } finally {
       setSaving(false);
     }

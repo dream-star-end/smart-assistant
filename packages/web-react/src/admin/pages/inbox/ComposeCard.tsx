@@ -10,7 +10,7 @@ import {
   useToast,
 } from "../../../components/ui";
 import { SectionCard, SelectFilter } from "../../components";
-import { ApiError, adminGet, adminSend } from "../../lib/adminApi";
+import { adminGet, adminSend, apiErrorMessage } from "../../lib/adminApi";
 import {
   type CreateMessagePayload,
   type EmailConfig,
@@ -64,7 +64,7 @@ export function ComposeCard({ onSent }: { onSent: () => void }) {
       .catch((e) => {
         if (!alive) return;
         setEmailCfg({ enabled: false, provider: "stub" });
-        setEmailHint(`探测邮件配置失败：${e instanceof ApiError ? e.message : String(e)}`);
+        setEmailHint(`探测邮件配置失败：${apiErrorMessage(e, "请求失败")}`);
       });
     return () => {
       alive = false;
@@ -131,7 +131,7 @@ export function ComposeCard({ onSent }: { onSent: () => void }) {
       setExpires("");
       onSent();
     } catch (e) {
-      toast(e instanceof ApiError ? e.message : "发送失败", "error");
+      toast(apiErrorMessage(e, "发送失败"), "error");
     } finally {
       setBusy(false);
     }

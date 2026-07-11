@@ -1,6 +1,6 @@
 import { BookOpen, Loader2, Trash2, Upload } from 'lucide-react'
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { api } from '../../lib/api'
+import { api, apiErrorMessage } from '../../lib/api'
 import type { AuthSession, ResearchLibraryDoc } from '../../lib/types'
 import { Alert, Button, EmptyState, PanelHeader, Spinner, useConfirm } from '../ui'
 
@@ -43,7 +43,7 @@ export function LibraryPanel({ auth }: { auth: AuthSession }) {
         if (alive) setDocs(d)
       })
       .catch((e) => {
-        if (alive) setErr((e as Error).message || '加载文献库失败')
+        if (alive) setErr(apiErrorMessage(e, '加载文献库失败'))
       })
       .finally(() => {
         if (alive) setLoading(false)
@@ -71,7 +71,7 @@ export function LibraryPanel({ auth }: { auth: AuthSession }) {
           refresh()
         }
       } catch (e) {
-        setErr((e as Error).message || '上传入库失败')
+        setErr(apiErrorMessage(e, '上传入库失败'))
       } finally {
         setUploading(false)
         if (fileRef.current) fileRef.current.value = ''
@@ -93,7 +93,7 @@ export function LibraryPanel({ auth }: { auth: AuthSession }) {
         await api.deleteResearchDoc(auth, doc.docId)
         refresh()
       } catch (e) {
-        setErr((e as Error).message || '删除失败')
+        setErr(apiErrorMessage(e, '删除失败'))
       }
     },
     [auth, confirmDialog, refresh],

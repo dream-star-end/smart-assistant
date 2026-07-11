@@ -1,7 +1,7 @@
 import { isMarketplaceCategoryId, marketplaceCategoryLabel } from "@openclaude/protocol";
 import { Check, ChevronRight, Inbox, Loader2, ShieldX, Sparkles, X } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
-import { api } from "../../lib/api";
+import { api, apiErrorMessage } from "../../lib/api";
 import { benchmarkSuspect, bundleHasEvals } from "../../lib/marketplace";
 import type {
   AuthSession,
@@ -84,7 +84,7 @@ export function ReviewPanel({ auth }: { auth: AuthSession }) {
     api
       .adminMarketplacePending(auth)
       .then((r) => alive && setRows(r))
-      .catch((e) => alive && setErr((e as Error).message || "加载待审失败"))
+      .catch((e) => alive && setErr(apiErrorMessage(e, "加载待审失败")))
       .finally(() => alive && setLoading(false));
     return () => {
       alive = false;
@@ -112,7 +112,7 @@ export function ReviewPanel({ auth }: { auth: AuthSession }) {
         await api.adminMarketplaceReview(auth, versionId, decision, note);
         setReload((n) => n + 1);
       } catch (e) {
-        setErr((e as Error).message || "审核失败");
+        setErr(apiErrorMessage(e, "审核失败"));
       } finally {
         setBusy(null);
       }
@@ -146,7 +146,7 @@ export function ReviewPanel({ auth }: { auth: AuthSession }) {
         setReload((n) => n + 1);
         if (r.failed > 0) setErr(`批量处理完成：${r.reviewed} 成功，${r.failed} 失败。`);
       } catch (e) {
-        setErr((e as Error).message || "批量审核失败");
+        setErr(apiErrorMessage(e, "批量审核失败"));
       } finally {
         setBusy(null);
       }
@@ -383,7 +383,7 @@ function AiReviewLog({ auth, reloadKey }: { auth: AuthSession; reloadKey: number
     api
       .adminMarketplaceAiReviews(auth)
       .then((r) => alive && setRows(r))
-      .catch((e) => alive && setErr((e as Error).message || "加载 AI 审批记录失败"))
+      .catch((e) => alive && setErr(apiErrorMessage(e, "加载 AI 审批记录失败")))
       .finally(() => alive && setLoading(false));
     return () => {
       alive = false;
@@ -513,7 +513,7 @@ function RevokeBox({ auth }: { auth: AuthSession }) {
       setSlug("");
       setReason("");
     } catch (e) {
-      setMsg({ tone: "danger", text: (e as Error).message || "下架失败" });
+      setMsg({ tone: "danger", text: apiErrorMessage(e, "下架失败") });
     } finally {
       setBusy(false);
     }

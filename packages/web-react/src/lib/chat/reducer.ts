@@ -820,10 +820,28 @@ export function applyOutboundMessage(
   // refresh 后从 messages 重建 blockId/agentGroup 索引（§7）。
   if (!sess._blockIdToMsgId) rebuildIndexes(sess);
 
-  // ── §11 service_restart 合成 final + 已有 queued user：当带外清理消费，不绑新轮 ──
+  // ── §11 service_restart 合成 final：重连清扫信号，绝不凭空落一条持久 ⚠️ 气泡 ──
+  // gateway 重启后对「客户端上报 inFlight」的会话补推 meta.interrupted='service_restart'
+  // 的 isFinal（server.ts autoResumeFromHello）。它本质是**清扫在途发送态**的信号，权威
+  // 只在 client：唯有本地确有「在途流式内容」（assistant 正文已流 / thinking 已流）才说明
+  // 真有一轮被上游断流掐断（1b488863 场景）——此时落到下方通用 final：⚠️ 文本（若服务端仍
+  // 带）追加到既有流式行、并 scheduleRestartContinue 自动续写，语义不回归。
+  //
+  // 其余全部走**带外清扫**：有 queued user（按原语义不绑新轮）；或本地**无在途流**（tool-only
+  // 在途 / 卡死残留发送态 / 已完成轮的 stale inFlight）。后者正是 bug 形态：peerInFlight 上报
+  // 为真但根本没有正文在途，旧代码让 ⚠️ text 走进 §7 block 循环，findOrCreateStreamingRow
+  // 在 `!_streamingAssistant` 时**新建一条 assistant 气泡**（reducer §7:967），phantom 中断卡
+  // 就此凭空生成、随 onFinal→persistSession 永久落库（生产实证 10/24 条为此形态）。带外清扫
+  // 直接 return，绝不进 block 循环、也不 scheduleRestartContinue（无正文可续），一并根治「落库
+  // 放大」。清流式指针与 reconcile('turn_completed') 分支对称，避免 stale 指针渗入下一轮。
   if (frame.isFinal && frame.meta?.interrupted === "service_restart") {
     const hasQueuedUser = sess.messages.some((m) => m.role === "user" && m.status === "queued");
-    if (hasQueuedUser) {
+    const hasLiveStream =
+      (!!sess._streamingAssistant && (sess._streamingAssistant.text ?? "").trim().length > 0) ||
+      !!sess._streamingThinking;
+    if (!(hasLiveStream && !hasQueuedUser)) {
+      sess._streamingAssistant = null;
+      sess._streamingThinking = null;
       sess._sendingInFlight = false;
       clearTurnTiming(sess);
       resetReplyTracker(sess);

@@ -86,9 +86,14 @@ export function childSignature(ch: ChildBlock): string {
  */
 export function messageSignature(
   m: ChatMessage,
-  ctx: { isLast: boolean; sending: boolean },
+  ctx: { isLast: boolean; sending: boolean; turnFinalAssistant?: boolean },
 ): string {
-  const head = `${m.role}|${m.id}|${ctx.isLast ? 1 : 0}|${ctx.sending ? 1 : 0}|${m.completedAt ?? 0}`;
+  // turnFinalAssistant：该行是否为「所在轮末条 assistant 正文」(评价反馈行唯一可见位)。它是
+  // **随列表增长而翻转**的外部渲染上下文——后续追加(工具卡/新一段文本/新一轮)会把原末条挤成
+  // 非末条,而该行自身字段未变(reducer 就地 mutate 同引用)。必须与 isLast 同放 sig head,否则
+  // memo 浅比较判「无变化」漏渲、旧行评价残留。非 assistant 行恒 false(与 isLast 一样对全 role
+  // 落进 head,不影响非消费方——只 AssistantCard 读它)。
+  const head = `${m.role}|${m.id}|${ctx.isLast ? 1 : 0}|${ctx.sending ? 1 : 0}|${m.completedAt ?? 0}|${ctx.turnFinalAssistant ? 1 : 0}`;
   switch (m.role) {
     case "assistant":
       return [

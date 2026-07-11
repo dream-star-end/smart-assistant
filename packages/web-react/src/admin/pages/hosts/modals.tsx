@@ -1,7 +1,7 @@
 import { type ChangeEvent, type ReactNode, useEffect, useRef, useState } from 'react'
 import { Badge, Button, Input, Modal, Spinner } from '../../../components/ui'
 import { KeyValue, SelectFilter } from '../../components'
-import { ApiError, adminGet, adminSend } from '../../lib/adminApi'
+import { adminGet, adminSend, apiErrorMessage } from '../../lib/adminApi'
 import {
   distributeOutcomeTone,
   hostStatusTone,
@@ -11,7 +11,7 @@ import {
 import type { BootstrapLogView, DistributeResult, HostDiagnostic, HostRow } from './types'
 
 function errMsg(e: unknown): string {
-  return e instanceof ApiError ? e.message : String(e)
+  return apiErrorMessage(e, '请求失败')
 }
 
 /**

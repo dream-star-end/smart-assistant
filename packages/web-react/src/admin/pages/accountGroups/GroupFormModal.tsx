@@ -1,11 +1,11 @@
 import { useEffect, useState } from "react";
 import { Button, Input, Modal, Spinner, Switch, useToast } from "../../../components/ui";
-import { ApiError, adminSend } from "../../lib/adminApi";
+import { adminSend, apiErrorMessage } from "../../lib/adminApi";
 import { Field, Select } from "./form";
 import { type AccountGroup, GROUP_KINDS } from "./types";
 
 function errMsg(e: unknown): string {
-  return e instanceof ApiError ? e.message : e instanceof Error ? e.message : String(e);
+  return apiErrorMessage(e, "请求失败");
 }
 
 const parseModels = (s: string) =>

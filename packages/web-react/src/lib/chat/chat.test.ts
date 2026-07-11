@@ -1584,6 +1584,114 @@ describe("applyCostCharged (§3 NOT deduped; 归因严格)", () => {
   });
 });
 
+describe("service_restart 合成 final：无在途流 → 不生成 phantom 中断气泡（§11）", () => {
+  // Bug 形态：idle 会话（agent 未在响应）在 master 重启后凭空出现「服务重启中断」持久卡。
+  // 根因：gateway 对上报 inFlight 的 warm session 补推 service_restart final；旧代码让其
+  // ⚠️ text 块走进 §7 block 循环 → findOrCreateStreamingRow 新建 assistant 气泡 → 持久落库。
+  // 修复：仅「本地确有在途流式内容」才当真被掐断（续写）；否则带外静默收口、绝不建气泡。
+  test("无 streamingAssistant + ⚠️ text 块（旧服务端形态）→ 不新建气泡、清发送态、不续写", () => {
+    const s = sess();
+    addMessage(s, "user", "问题", { status: "read", ts: 1 });
+    const done = addMessage(s, "assistant", "上一轮答案", { ts: 2, completedAt: 3 });
+    s._sendingInFlight = true; // stale：turn 早已结束但 flag 卡住（dropped final / tool-only 卡死）
+    const before = s.messages.length;
+    const scheduleRestartContinue = vi.fn();
+    const onFinal = vi.fn();
+    applyOutboundMessage(
+      s,
+      msgFrame({
+        frameSeq: 1,
+        isFinal: true,
+        ts: 9e12,
+        blocks: [{ kind: "text", text: "\n\n⚠️ 上一轮对话被服务重启中断，请重新发送消息继续。" }],
+        meta: { interrupted: "service_restart" },
+      }),
+      { scheduleRestartContinue, onFinal },
+    );
+    expect(s.messages.length).toBe(before); // phantom 气泡不产生
+    expect(s.messages.some((m) => (m.text ?? "").includes("上一轮对话被服务重启中断"))).toBe(false);
+    expect(s._sendingInFlight).toBe(false);
+    expect(scheduleRestartContinue).not.toHaveBeenCalled();
+    expect(onFinal).toHaveBeenCalledTimes(1);
+    expect(done.text).toBe("上一轮答案"); // 已完成答案不受影响
+  });
+
+  test("空 blocks（新服务端对称形态）+ 无在途流 → 同样静默收口、不续写、不建气泡", () => {
+    const s = sess();
+    s._sendingInFlight = true;
+    const before = s.messages.length;
+    const scheduleRestartContinue = vi.fn();
+    applyOutboundMessage(
+      s,
+      msgFrame({ frameSeq: 1, isFinal: true, ts: 9e12, blocks: [], meta: { interrupted: "service_restart" } }),
+      { scheduleRestartContinue },
+    );
+    expect(s.messages.length).toBe(before);
+    expect(s._sendingInFlight).toBe(false);
+    expect(scheduleRestartContinue).not.toHaveBeenCalled();
+  });
+
+  test("双发（12ms 内两帧，双 tab/双 reconnect）→ 都被拦，仍不建任何气泡", () => {
+    const s = sess();
+    s._sendingInFlight = true;
+    const scheduleRestartContinue = vi.fn();
+    const restartFinal = (seq: number) =>
+      msgFrame({
+        frameSeq: seq,
+        isFinal: true,
+        ts: 9e12 + seq,
+        blocks: [{ kind: "text", text: "\n\n⚠️ 上一轮对话被服务重启中断，请重新发送消息继续。" }],
+        meta: { interrupted: "service_restart" },
+      });
+    applyOutboundMessage(s, restartFinal(1), { scheduleRestartContinue });
+    applyOutboundMessage(s, restartFinal(2), { scheduleRestartContinue });
+    expect(s.messages.some((m) => (m.text ?? "").includes("上一轮对话被服务重启中断"))).toBe(false);
+    expect(scheduleRestartContinue).not.toHaveBeenCalled();
+  });
+
+  test("有在途流式正文（真·被上游断流掐断）→ 落通用 final：调度自动续写、清发送态、正文保留", () => {
+    const s = sess();
+    addMessage(s, "user", "写篇长文", { status: "read", ts: 1 });
+    const streaming = addMessage(s, "assistant", "已经写了一半…", { ts: 2 });
+    s._streamingAssistant = streaming;
+    s._sendingInFlight = true;
+    const scheduleRestartContinue = vi.fn();
+    applyOutboundMessage(
+      s,
+      msgFrame({ frameSeq: 1, isFinal: true, ts: 9e12, blocks: [], meta: { interrupted: "service_restart" } }),
+      { scheduleRestartContinue },
+    );
+    expect(scheduleRestartContinue).toHaveBeenCalledWith(s.id); // 1b488863 语义不回归
+    expect(s._sendingInFlight).toBe(false);
+    expect(streaming.text).toContain("已经写了一半"); // 在途正文保留
+  });
+
+  test("有 queued user → 带外清扫不绑新轮、不续写、不建气泡（原语义保留）", () => {
+    const s = sess();
+    addMessage(s, "user", "已发", { status: "read", ts: 1 });
+    const streaming = addMessage(s, "assistant", "半句", { ts: 2 });
+    s._streamingAssistant = streaming;
+    addMessage(s, "user", "排队中的下一条", { status: "queued", ts: 3 });
+    s._sendingInFlight = true;
+    const scheduleRestartContinue = vi.fn();
+    applyOutboundMessage(
+      s,
+      msgFrame({
+        frameSeq: 1,
+        isFinal: true,
+        ts: 9e12,
+        blocks: [{ kind: "text", text: "\n\n⚠️ 上一轮对话被服务重启中断，请重新发送消息继续。" }],
+        meta: { interrupted: "service_restart" },
+      }),
+      { scheduleRestartContinue },
+    );
+    expect(s._sendingInFlight).toBe(false);
+    expect(scheduleRestartContinue).not.toHaveBeenCalled(); // queued-user 分支不续写
+    expect(s.messages.some((m) => m.role === "user" && m.status === "queued")).toBe(true); // 排队消息仍在
+    expect(s.messages.some((m) => (m.text ?? "").includes("上一轮对话被服务重启中断"))).toBe(false);
+  });
+});
+
 describe("applyResumeFailed (§4 layer 3)", () => {
   test("advances cursor to server currentLast, flags broken, forces sync", () => {
     const s = sess();

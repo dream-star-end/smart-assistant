@@ -1,6 +1,7 @@
 import "@testing-library/jest-dom/vitest";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, test, vi } from "vitest";
+import { ApiError } from "../lib/api";
 import { LEGAL_DOCS, TERMS_VERSION } from "../lib/legal";
 import { AuthGate } from "./AuthGate";
 
@@ -203,6 +204,53 @@ describe("AuthGate — 协议弹窗", () => {
     // 弹窗打开期间背景被 Radix 标记 aria-hidden,关闭后再断言勾选未被误触
     fireEvent.click(within(dialog).getByRole("button", { name: "关闭" }));
     expect(screen.getByRole("checkbox")).not.toBeChecked();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Bug1：auth 错误族 code→友好中文（单一权威表，AuthGate 是各表单展示的统一入口）。
+// register 路径的 ApiError.code 会完整传到 AuthGate 自己的 catch（useAuth 只 .then 透传），
+// 故用它验证「红条渲染友好中文、不裸露后端英文 message / 追踪号」；未知 code 仍原样。
+// ---------------------------------------------------------------------------
+describe("AuthGate — 错误文案本地化", () => {
+  function fillRegister() {
+    fireEvent.click(screen.getByRole("button", { name: "立即注册" }));
+    fireEvent.change(screen.getByPlaceholderText("邮箱"), { target: { value: "a@b.com" } });
+    fireEvent.change(screen.getByPlaceholderText("至少 8 位"), { target: { value: "password123" } });
+    fireEvent.change(screen.getByPlaceholderText("再输一次密码"), { target: { value: "password123" } });
+    fireEvent.click(screen.getByRole("checkbox"));
+  }
+
+  test("已知 code（CONFLICT）→ 红条渲染友好中文，不裸露后端英文 message / 追踪号", async () => {
+    const onRegister = vi
+      .fn()
+      .mockRejectedValue(
+        new ApiError({ status: 409, code: "CONFLICT", message: "email already registered（追踪号 z9x）" }),
+      );
+    render(<AuthGate {...base} onLogin={vi.fn()} onRegister={onRegister} turnstileBypass={true} />);
+    fillRegister();
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /创建账号/ }));
+    });
+    await waitFor(() =>
+      expect(screen.getByText("该邮箱已注册，可直接登录")).toBeInTheDocument(),
+    );
+    expect(screen.queryByText(/email already registered/)).toBeNull();
+    expect(screen.queryByText(/追踪号/)).toBeNull();
+  });
+
+  test("未知 code → 保持原样（原 message + 追踪号），供排障", async () => {
+    const onRegister = vi
+      .fn()
+      .mockRejectedValue(
+        new ApiError({ status: 500, code: "SOME_UNKNOWN", message: "weird failure（追踪号 q7）" }),
+      );
+    render(<AuthGate {...base} onLogin={vi.fn()} onRegister={onRegister} turnstileBypass={true} />);
+    fillRegister();
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /创建账号/ }));
+    });
+    await waitFor(() => expect(screen.getByText("weird failure（追踪号 q7）")).toBeInTheDocument());
   });
 });
 

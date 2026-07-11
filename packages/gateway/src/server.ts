@@ -9716,39 +9716,31 @@ export class Gateway {
           //     (断连窗口 + ring 冲穿)。推**静默 reconcile final**(空 blocks +
           //     meta.reconcile),前端清发送态并 force-sync 拉回 REST 权威内容。
           //     绝不能用"被中断请重发"文案 —— turn 已计费,诱导重发=重复付费。
-          //   - 'errored'/undefined(重启后 warm session 丢字段等):维持原
+          //   - 'errored'/undefined(重启后 warm session 丢字段等):维持
           //     service_restart 中断语义。
+          //
+          // 【对称性根治 2026-07-11】两支**统一为空 blocks + 纯 meta 标记**,只差 meta 键。
+          // 旧实现的不对称(completed→空 blocks 静默 / interrupted→带 ⚠️ **text 块**)是
+          // phantom 中断卡的服务端根因:重启后 warm session 的 turn 计数恒为 0,只要客户端
+          // 上报 inFlight(含 tool-only 在途 / 卡死残留 / 已完成轮的 stale flag)就补推这帧,
+          // 而 text 块会在前端 §7 block 循环里被 findOrCreateStreamingRow 落成一条**新 assistant
+          // 气泡**并持久化(生产实证)。合成 final 是**清扫在途发送态**的带外信号,绝不该注入
+          // 持久正文 —— 「是否真被掐断/要不要提示续写」的权威在 client(它才知道本地有没有在途
+          // 流式内容),故此处只发标记,由 reducer §11 按本地在途流决定续写 vs 静默收口。
           const completedNormally = session._lastClientTurnOutcome === 'completed'
-          const reconcileFrame = JSON.stringify(
-            completedNormally
-              ? {
-                  type: 'outbound.message',
-                  sessionKey,
-                  channel: 'webchat',
-                  peer: { id: peerId, kind: 'dm' },
-                  agentId: aid,
-                  blocks: [],
-                  meta: { reconcile: 'turn_completed' } as any,
-                  isFinal: true,
-                  ts: Date.now(),
-                }
-              : {
-                  type: 'outbound.message',
-                  sessionKey,
-                  channel: 'webchat',
-                  peer: { id: peerId, kind: 'dm' },
-                  agentId: aid,
-                  blocks: [
-                    {
-                      kind: 'text',
-                      text: '\n\n⚠️ 上一轮对话被服务重启中断，请重新发送消息继续。',
-                    },
-                  ],
-                  meta: { interrupted: 'service_restart' } as any,
-                  isFinal: true,
-                  ts: Date.now(),
-                },
-          )
+          const reconcileFrame = JSON.stringify({
+            type: 'outbound.message',
+            sessionKey,
+            channel: 'webchat',
+            peer: { id: peerId, kind: 'dm' },
+            agentId: aid,
+            blocks: [],
+            meta: (completedNormally
+              ? { reconcile: 'turn_completed' }
+              : { interrupted: 'service_restart' }) as any,
+            isFinal: true,
+            ts: Date.now(),
+          })
           ws.send(reconcileFrame)
           this.log.info(
             completedNormally

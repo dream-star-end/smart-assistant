@@ -71,6 +71,20 @@ function renderCard(opts: {
   );
 }
 
+/**
+ * 点击操作按钮前**先等它 enabled**。确认卡挂载时 loading=true → 立即渲染操作按钮但置
+ * disabled（给「正在核验，暂不可点」的确定信号）；拉到服务端 pending 详情后才 enable。
+ * findByRole 默认也会匹配 disabled 按钮，若在这个「挂载→拉取完成」的窗口内直接 fireEvent.click，
+ * jsdom 会静默吞掉 disabled 按钮的点击（无激活行为）→ onClick 不触发 → decide 永不被调用，
+ * 后续断言随即超时。这不是加 sleep 掩盖，而是消除时序竞态本身：只在按钮真正可用时才点。
+ */
+async function clickWhenEnabled(name: string): Promise<HTMLElement> {
+  const btn = await screen.findByRole("button", { name });
+  await waitFor(() => expect(btn).toBeEnabled());
+  fireEvent.click(btn);
+  return btn;
+}
+
 describe("parseOcConnectConfirmation", () => {
   test("混杂前后日志时仍能提取 id（结果只有 type + id）", () => {
     const out = `INFO 正在调用 send_email…\n${TRIGGER_JSON}\n(等待用户确认)`;
@@ -196,7 +210,7 @@ describe("ConnectorConfirmCard —— 服务端权威 + 交互", () => {
     const sendUserText = vi.fn();
     renderCard({ actions: { connectorConfirm: { getDetail, decide } }, sendUserText });
 
-    fireEvent.click(await screen.findByRole("button", { name: "确认执行" }));
+    await clickWhenEnabled("确认执行");
     await waitFor(() => expect(decide).toHaveBeenCalledWith(CONFIRM_ID, "approve"));
     await waitFor(() => expect(sendUserText).toHaveBeenCalledWith("已确认执行（abcd1234）"));
     expect(await screen.findByText("已确认")).toBeInTheDocument();
@@ -210,7 +224,7 @@ describe("ConnectorConfirmCard —— 服务端权威 + 交互", () => {
     const sendUserText = vi.fn();
     renderCard({ actions: { connectorConfirm: { getDetail, decide } }, sendUserText });
 
-    fireEvent.click(await screen.findByRole("button", { name: "拒绝" }));
+    await clickWhenEnabled("拒绝");
     await waitFor(() => expect(sendUserText).toHaveBeenCalledWith("已拒绝（abcd1234）"));
     expect(await screen.findByText("已拒绝")).toBeInTheDocument();
   });
@@ -227,7 +241,7 @@ describe("ConnectorConfirmCard —— 服务端权威 + 交互", () => {
     const sendUserText = vi.fn();
     renderCard({ actions: { connectorConfirm: { getDetail, decide } }, sendUserText });
 
-    fireEvent.click(await screen.findByRole("button", { name: "确认执行" }));
+    await clickWhenEnabled("确认执行");
     expect(await screen.findByText("操作过于频繁，请稍后再试")).toBeInTheDocument();
     // 服务端权威状态回写 → 已过期
     expect(await screen.findByText("已过期")).toBeInTheDocument();
@@ -258,7 +272,7 @@ describe("ConnectorConfirmCard —— 服务端权威 + 交互", () => {
     const decide = vi.fn().mockResolvedValue({ ok: true, status: "approved" });
     renderCard({ actions: { connectorConfirm: { getDetail, decide } } });
 
-    fireEvent.click(await screen.findByRole("button", { name: "确认执行" }));
+    await clickWhenEnabled("确认执行");
     expect(await screen.findByText("已确认，请回复助手继续。")).toBeInTheDocument();
   });
 

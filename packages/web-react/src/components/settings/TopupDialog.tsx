@@ -1,6 +1,6 @@
 import { Check, Loader2, RefreshCw } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { ApiError, api } from "../../lib/api";
+import { ApiError, api, apiErrorMessage } from "../../lib/api";
 import type { AuthSession, HupiCreateResult, PaymentPlan } from "../../lib/types";
 import { cn, formatCentsYuan, formatCredits } from "../../lib/utils";
 import { Alert, Button, Modal, Spinner } from "../ui";
@@ -70,7 +70,7 @@ export function TopupDialog({
         if (alive) setPlans(p);
       })
       .catch((e) => {
-        if (alive) setErr((e as Error).message || "加载充值套餐失败");
+        if (alive) setErr(apiErrorMessage(e, "加载充值套餐失败"));
       })
       .finally(() => {
         if (alive) setLoadingPlans(false);
@@ -99,10 +99,10 @@ export function TopupDialog({
           setErr("该充值方案已下架，请刷新后重试。");
           setPlans(null);
         } else {
-          setErr(e.message || "创建订单失败");
+          setErr(apiErrorMessage(e, "创建订单失败"));
         }
       } else {
-        setErr((e as Error).message || "创建订单失败");
+        setErr(apiErrorMessage(e, "创建订单失败"));
       }
     } finally {
       setCreating(null);

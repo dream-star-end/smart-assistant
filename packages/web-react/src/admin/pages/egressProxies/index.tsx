@@ -14,7 +14,7 @@ import {
   donutConfig,
   useChart,
 } from "../../components";
-import { ApiError, adminGet, adminSend } from "../../lib/adminApi";
+import { ApiError, adminGet, adminSend, apiErrorMessage } from "../../lib/adminApi";
 import { getAdminPage } from "../../registry";
 import { EgressProxyFormModal } from "./EgressProxyFormModal";
 import { type EgressProxyRow, EGRESS_STATUSES } from "./types";
@@ -22,7 +22,7 @@ import { type EgressProxyRow, EGRESS_STATUSES } from "./types";
 const STATUS_KEY = "admin_ep_status";
 
 function errMsg(e: unknown): string {
-  return e instanceof ApiError ? e.message : e instanceof Error ? e.message : String(e);
+  return apiErrorMessage(e, "请求失败");
 }
 
 export default function EgressProxiesPage() {

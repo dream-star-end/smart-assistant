@@ -1,10 +1,8 @@
-import { ApiError } from "../../lib/adminApi";
+import { apiErrorMessage } from "../../lib/adminApi";
 
-/** 统一取错误文案:ApiError 用其 message(已解包 commercial 信封),否则回退 String。 */
+/** 统一取错误文案:收口到 apiErrorMessage(网络/英文技术串不外露,后端中文文案直显)。 */
 export function errText(e: unknown): string {
-  if (e instanceof ApiError) return e.message;
-  if (e instanceof Error) return e.message;
-  return String(e);
+  return apiErrorMessage(e, "请求失败");
 }
 
 /** datetime-local 需要的本地时区 ISO(不带秒/时区):YYYY-MM-DDTHH:mm。 */

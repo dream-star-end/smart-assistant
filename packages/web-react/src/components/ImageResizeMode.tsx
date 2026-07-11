@@ -5,6 +5,7 @@
  */
 import { useEffect, useState } from 'react'
 import { X } from 'lucide-react'
+import { apiErrorMessage } from '../lib/api'
 import { cn } from '../lib/utils'
 import { normalizeImageSourceForGateway } from './ImageAnnotationEditor'
 import {
@@ -98,7 +99,7 @@ export function ImageResizeMode({
         targetAspect: ratio.value,
       })
     } catch (err) {
-      setError((err as Error).message || '提交失败，请重试')
+      setError(apiErrorMessage(err, '提交失败，请重试'))
     } finally {
       revoke?.()
       setBusy(null)

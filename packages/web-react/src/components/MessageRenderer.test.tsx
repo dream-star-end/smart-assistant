@@ -6,6 +6,7 @@ import { messageSignature } from "../lib/chat/render";
 import { MessageList, MessageRenderer } from "./MessageRenderer";
 import type { CardCallbacks } from "./chat/cards";
 import type { PermissionRespond } from "./chat/PermissionCard";
+import { ResponseRatingProvider } from "./chat/ResponseRating";
 import {
   THINKING_HEADLINES_ONLY,
   THINKING_MULTI_SEGMENT,
@@ -914,5 +915,67 @@ describe("生成占位卡渲染", () => {
       mk("tool", { toolName: "codex:imageGeneration", inputJson: { prompt: "x", status: "failed" } }),
     );
     expect(screen.queryByTestId("generating-placeholder")).toBeNull();
+  });
+});
+
+// ═══════════════ 评价反馈行只挂每轮末条 assistant 正文（boss 07-11） ═══════════════
+describe("ResponseRating 只挂轮末条 assistant 正文(中间回复不出)", () => {
+  const RATING_PROMPT = "这条回复怎么样?";
+  // 经 ResponseRatingProvider(非 null value)才会真正挂 ResponseRatingCard;App 侧同款包裹。
+  function renderRatable(messages: ChatMessage[], sending = false) {
+    return render(
+      <ResponseRatingProvider value={{ ratings: new Map(), submit: () => {} }}>
+        <MessageList messages={messages} sending={sending} cb={{}} onRespondPermission={() => {}} />
+      </ResponseRatingProvider>,
+    );
+  }
+
+  test("一轮含 文本A→工具卡→文本B(终态):A 底部无评价行、B 有", () => {
+    const { container } = renderRatable([
+      mk("user", { id: "u1", text: "提问" }),
+      mk("assistant", { id: "aA", text: "第一段回复内容" }),
+      mk("tool", { id: "t1", toolName: "Bash", _completed: true, output: "ok" }),
+      mk("assistant", { id: "aB", text: "第二段回复内容", _completed: true }),
+    ]);
+    // 全轮只出 1 行评价(轮末条 B),中间段 A 不出。
+    expect(screen.getAllByText(RATING_PROMPT)).toHaveLength(1);
+    // 且这唯一的评价行位于末条 B 之后(DOM 顺序诚实:非误挂在中间段 A 上)。
+    const html = container.innerHTML;
+    expect(html.indexOf(RATING_PROMPT)).toBeGreaterThan(html.indexOf("第二段回复内容"));
+  });
+
+  test("两个历史轮 → 各自末条都有评价(不是仅全会话末条)", () => {
+    renderRatable([
+      mk("user", { id: "u1", text: "轮1" }),
+      mk("assistant", { id: "a1m", text: "轮1中间段" }),
+      mk("tool", { id: "t1", toolName: "Bash", _completed: true }),
+      mk("assistant", { id: "a1e", text: "轮1末尾段" }),
+      mk("user", { id: "u2", text: "轮2" }),
+      mk("assistant", { id: "a2e", text: "轮2末尾段" }),
+    ]);
+    // 轮1末尾 + 轮2末尾 各一行 = 2;轮1中间段不出。
+    expect(screen.getAllByText(RATING_PROMPT)).toHaveLength(2);
+  });
+
+  test("流式中(sending)末条不出评价行(终态门控保留)", () => {
+    // 末条即流式 assistant → isLive 抑制。
+    renderRatable(
+      [mk("user", { id: "u1", text: "问" }), mk("assistant", { id: "a1", text: "流式回复中" })],
+      true,
+    );
+    expect(screen.queryByText(RATING_PROMPT)).toBeNull();
+  });
+
+  test("流式中:已完成的轮末条 assistant 亦不出(活跃段 sending 门控优先于 flag)", () => {
+    // A 已完成(非 live)且是本轮末条正文,但本轮仍在流(后面挂着运行中的工具)→ 活跃段门控抑制。
+    renderRatable(
+      [
+        mk("user", { id: "u1", text: "问" }),
+        mk("assistant", { id: "aA", text: "已完成的一段", _completed: true }),
+        mk("tool", { id: "t1", toolName: "Bash", _completed: false }),
+      ],
+      true,
+    );
+    expect(screen.queryByText(RATING_PROMPT)).toBeNull();
   });
 });

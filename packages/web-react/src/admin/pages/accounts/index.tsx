@@ -22,7 +22,7 @@ import {
   donutConfig,
   useChart,
 } from "../../components";
-import { ApiError, adminGet, adminSend } from "../../lib/adminApi";
+import { adminGet, adminSend, apiErrorMessage } from "../../lib/adminApi";
 import { useAdminPoll } from "../../lib/useAdminPoll";
 import { getAdminPage } from "../../registry";
 import { AccountFormModal } from "./AccountFormModal";
@@ -48,7 +48,7 @@ import {
 const STATUS_KEY = "admin_acc_status";
 
 function errMsg(e: unknown): string {
-  return e instanceof ApiError ? e.message : e instanceof Error ? e.message : String(e);
+  return apiErrorMessage(e, "请求失败");
 }
 
 type AccountsData = {

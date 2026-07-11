@@ -243,6 +243,138 @@ function parseRetryAfter(res: Response): number | undefined {
   return Number.isFinite(n) && n >= 0 ? n : undefined;
 }
 
+/**
+ * auth 错误族 code→中文文案的**单一权威表**（登录 / 注册 / 邮箱验证 / 找回·重置密码共用）。
+ * 后端 message 是给开发者/日志看的英文（如 "invalid credentials"），面向用户的本地化在**前端层**
+ * 做：命中已知 code → 展示友好中文、**不带追踪号**；未知 code → 保持原样（原 message + 追踪号），
+ * 追踪号只服务未知错误的排障。code 全集与后端 packages/commercial/src/auth 的
+ * LoginError / RegisterError / VerifyError + handlers 的 429 RATE_LIMITED 对齐（新增 auth code
+ * 时在此补一行即可，勿在组件里散落第二套映射）。
+ */
+export const AUTH_ERROR_MESSAGES: Record<string, string> = {
+  INVALID_CREDENTIALS: "邮箱或密码错误",
+  EMAIL_NOT_VERIFIED: "邮箱尚未验证，请查收邮件完成验证后再登录",
+  RATE_LIMITED: "尝试次数过多，请稍后再试",
+  TURNSTILE_FAILED: "人机验证未通过，请刷新后重试",
+  VALIDATION: "输入格式有误，请检查邮箱与密码",
+  CONFLICT: "该邮箱已注册，可直接登录",
+  EMAIL_DOMAIN_BLOCKED: "该邮箱域名不支持注册，请更换邮箱",
+  WEAK_PASSWORD: "密码需为 8-72 位，请重新设置",
+  INVALID_TOKEN: "验证码或重置链接无效或已过期，请重新获取",
+};
+
+/**
+ * 把 auth 端点抛出的 ApiError 按 code 换成友好中文（未知 code / 无 code 原样返回，保留追踪号）。
+ * **只在 auth 端点边界用**：CONFLICT / VALIDATION 等通用 code 在会话/计费等非 auth 场景另有语义，
+ * 全局映射会串味，故绝不下沉进通用 throwApi。
+ */
+function localizeAuthError(err: unknown): unknown {
+  if (err instanceof ApiError && err.code) {
+    const friendly = AUTH_ERROR_MESSAGES[err.code];
+    if (friendly) {
+      return new ApiError({
+        status: err.status,
+        message: friendly,
+        code: err.code,
+        requestId: err.requestId,
+        issues: err.issues,
+        retryAfterSec: err.retryAfterSec,
+        body: err.body,
+      });
+    }
+  }
+  return err;
+}
+
+/**
+ * auth 表单展示用：把任意错误解析成一句面向用户的 message。已知 auth code → 友好中文；
+ * 未知 code / 其他 Error → 原 message（含追踪号，服务排障）。AuthGate 各表单（注册/验证/找回/
+ * 重置）的错误展示统一走此入口；登录路径的 code 在 useAuth.login 里被拍平成 message，故在
+ * api.login 边界先行 localize（见 login()）—— 二者共用同一张 AUTH_ERROR_MESSAGES，不搞第二套。
+ */
+export function authErrorMessage(err: unknown): string {
+  const mapped = localizeAuthError(err);
+  if (mapped instanceof Error && mapped.message) return mapped.message;
+  if (typeof err === "string" && err) return err;
+  return "操作失败，请稍后再试。";
+}
+
+// ─── 业务/管理面板展示层错误文案（apiErrorMessage）─────────────────────────
+//
+// authErrorMessage 只管 auth 端点（按 code 走 AUTH_ERROR_MESSAGES）。全站其余面板的
+// catch 分支历史上直接 `(e as Error).message` / `ApiError.message` 怼给用户，凡后端返
+// 英文/技术 message（"invalid credentials" / "sync failed" / "not found"）的路径都会把
+// 内部实现细节裸露给终端用户。apiErrorMessage 是这一类问题的**单一收口**：把任意错误
+// 解析成一句面向用户的中文，与 authErrorMessage 并列、职责互补，不搞第二套散落映射。
+//
+// 判据来自后端 packages/commercial 的真实 message 分布——**混用**两种 message：
+//   · 面向用户的中文文案（校验/内容安全/业务语义，如 "未上架或不存在"、"智能体配置不合法,
+//     请按提示修正"、"商品页文案被静态安全扫描拦截,请修正后重试"）——这些是后端有意写给用户看的。
+//   · 面向开发者/日志的英文技术串（"invalid credentials"、"sync failed"、"POST required"…）。
+// 故以「message 是否含中文」区分：含中文=后端面向用户文案→直接用；英文/技术=不外露→用
+// 调用方语义化中文 fallback（+ 追踪号排障）。
+
+/**
+ * 跨域**通用**机器码 → 标准中文。只放各业务域同义的 code：RATE_LIMITED（任何域都=太频繁）。
+ * ⚠️ CONFLICT / VALIDATION / NOT_FOUND 等在 auth/订阅/会话/市场各有不同语义，严禁进此表
+ * （会串味），由各调用点自带的 fallback 承担。
+ */
+const CROSS_DOMAIN_ERROR_MESSAGES: Record<string, string> = {
+  RATE_LIMITED: "操作过于频繁，请稍后再试",
+};
+
+/** throwApi→withReqId 烙进 message 尾部的「（追踪号 …）」后缀（withReqId 的确定格式）。 */
+const REQ_ID_SUFFIX_RE = /（追踪号\s+[^）]+）\s*$/;
+
+/** throwApi 在后端无 message 时写入的通用兜底「请求失败 (NNN)」——视作“无有效后端文案”。 */
+const GENERIC_HTTP_MESSAGE_RE = /^请求失败 \(\d+\)$/;
+
+/** 含常见中日韩汉字（判断某条 message 是否为后端面向用户的中文文案）。 */
+function hasCjk(s: string): boolean {
+  return /[一-鿿]/.test(s);
+}
+
+/**
+ * fetch 网络层失败（断网/DNS/CORS/被拦截）：浏览器/undici 抛 TypeError
+ * （"Failed to fetch" / "NetworkError…" / "fetch failed" / "Load failed"），非 ApiError。
+ */
+function isNetworkError(err: unknown): boolean {
+  return (
+    err instanceof TypeError &&
+    /failed to fetch|fetch failed|networkerror|load failed|network request failed/i.test(err.message)
+  );
+}
+
+/**
+ * 展示层错误文案的**单一权威**（面向所有业务/管理面板的 catch）。判据（见上方注释）：
+ *   1. 网络失败（TypeError: Failed to fetch 等）        → 标准中文「网络不可用」，绝不外露英文。
+ *   2. ApiError 且命中跨域通用 code（RATE_LIMITED）      → 标准中文（各域同义）。
+ *   3. ApiError 且 message 含中文（先剥掉「（追踪号 …）」后缀再判，避免被后缀里的“追踪号”
+ *      三字误判）且非通用兜底「请求失败 (NNN)」        → 后端已写好面向用户文案，**直接用**。
+ *   4. 其余 ApiError（英文/技术 message，或仅通用兜底） → **不外露**，用调用方中文 fallback；
+ *      有 requestId 时尾部补「（追踪号 …）」便于用户反馈、运维排障。
+ *   5. 非 ApiError 的其它 Error：message 恰为中文 → 直接用；否则（英文/技术）→ fallback。
+ *   6. 其它（字符串 / undefined / 未知）              → fallback。
+ *
+ * @param fallback 贴合该操作语义的中文（如「加载订阅信息失败」「创建定时任务失败」），
+ *                 不要千篇一律「操作失败」。
+ */
+export function apiErrorMessage(err: unknown, fallback: string): string {
+  if (isNetworkError(err)) return "网络连接不可用，请检查网络后重试";
+
+  if (err instanceof ApiError) {
+    if (err.code && CROSS_DOMAIN_ERROR_MESSAGES[err.code]) {
+      return CROSS_DOMAIN_ERROR_MESSAGES[err.code];
+    }
+    const base = err.message.replace(REQ_ID_SUFFIX_RE, "").trim();
+    if (base && hasCjk(base) && !GENERIC_HTTP_MESSAGE_RE.test(base)) return base;
+    return err.requestId ? `${fallback}（追踪号 ${err.requestId}）` : fallback;
+  }
+
+  if (err instanceof Error && hasCjk(err.message)) return err.message;
+  return fallback;
+}
+
 /** 读 !res.ok 的响应体，组装并抛出 ApiError（绝不返回）。 */
 // export：admin 数据层（adminText CSV 导出等非 JSON 路径）复用统一错误信封解包。仅加导出。
 export async function throwApi(res: Response): Promise<never> {
@@ -377,7 +509,15 @@ export const api = {
         ...(turnstileToken ? { turnstile_token: turnstileToken } : {}),
       }),
     });
-    if (!res.ok) await throwApi(res);
+    if (!res.ok) {
+      // 登录错误的 code 会在 useAuth.login 的 catch 里被拍平成 message，故在此 auth 边界
+      // 先按 code 换友好中文（单一权威表 AUTH_ERROR_MESSAGES）；未知 code 原样（带追踪号）。
+      try {
+        await throwApi(res);
+      } catch (e) {
+        throw localizeAuthError(e);
+      }
+    }
     const b = (await res.json()) as {
       user: WireUser;
       access_token: string;

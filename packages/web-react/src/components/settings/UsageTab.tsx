@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
-import { api } from "../../lib/api";
+import { api, apiErrorMessage } from "../../lib/api";
 import type { AuthSession, UsageResponse, UsageSessionRow } from "../../lib/types";
 import { cn, formatCompactCount, formatCredits, groupDigits, ratioPct } from "../../lib/utils";
 import { agentDisplayName } from "../chat/agentNames";
@@ -71,7 +71,7 @@ export function UsageTab({ auth }: { auth: AuthSession }) {
         setHasMore(u.sessions.has_more);
       })
       .catch((e) => {
-        if (alive) setErr((e as Error).message || "加载用量统计失败");
+        if (alive) setErr(apiErrorMessage(e, "加载用量统计失败"));
       })
       .finally(() => {
         if (alive) setLoading(false);
@@ -90,7 +90,7 @@ export function UsageTab({ auth }: { auth: AuthSession }) {
       setOffset((o) => o + u.sessions.rows.length);
       setHasMore(u.sessions.has_more);
     } catch (e) {
-      setErr((e as Error).message || "加载更多失败");
+      setErr(apiErrorMessage(e, "加载更多失败"));
     } finally {
       setLoadingMore(false);
     }

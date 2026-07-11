@@ -13,7 +13,7 @@ import {
   donutConfig,
   useChart,
 } from "../../components";
-import { adminGet, adminText } from "../../lib/adminApi";
+import { adminGet, adminText, apiErrorMessage } from "../../lib/adminApi";
 import { getAdminPage } from "../../registry";
 import { useAdminRoute } from "../../router";
 
@@ -182,7 +182,7 @@ export default function LedgerPage() {
       setCursor(data.next_before ?? null);
       setDone(!data.next_before);
     } catch (e) {
-      toast(`加载失败：${e instanceof Error ? e.message : String(e)}`, "error");
+      toast(`加载失败：${apiErrorMessage(e, "请求失败")}`, "error");
     } finally {
       setLoadingMore(false);
     }
@@ -214,8 +214,7 @@ export default function LedgerPage() {
       triggerCsvDownload(csv, `ledger-${stamp}.csv`);
       toast("CSV 已开始下载", "success");
     } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      toast(`导出失败：${msg}`, "error");
+      toast(`导出失败：${apiErrorMessage(e, "请求失败")}`, "error");
     } finally {
       setExporting(false);
     }
@@ -403,7 +402,7 @@ export default function LedgerPage() {
           <EmptyState
             icon={Inbox}
             title="加载失败"
-            hint={error.message}
+            hint={apiErrorMessage(error, "加载失败")}
             action={
               <Button variant="secondary" size="sm" onClick={() => setReloadTick((t) => t + 1)}>
                 重试

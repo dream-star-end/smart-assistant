@@ -29,7 +29,7 @@ import {
   donutConfig,
   useChart,
 } from "../../components";
-import { adminGet, adminText } from "../../lib/adminApi";
+import { adminGet, adminText, apiErrorMessage } from "../../lib/adminApi";
 import { useAdminPoll } from "../../lib/useAdminPoll";
 import {
   type AcctRow,
@@ -101,7 +101,7 @@ export default function HealthPage() {
       window.open(url, "_blank", "noopener,noreferrer");
       setTimeout(() => URL.revokeObjectURL(url), 60_000);
     } catch (e) {
-      toast(e instanceof Error ? e.message : "拉取 metrics 失败", "error");
+      toast(apiErrorMessage(e, "拉取 metrics 失败"), "error");
     }
   }, [toast]);
 
@@ -133,7 +133,7 @@ export default function HealthPage() {
         <Card className="flex flex-col items-center gap-2 px-6 py-12 text-center">
           <AlertTriangle size={28} className="text-danger" />
           <p className="text-[14px] font-medium text-fg">拉取 /api/admin/metrics 失败</p>
-          <p className="max-w-md text-[12.5px] text-faint">{poll.error?.message || "未知错误"}</p>
+          <p className="max-w-md text-[12.5px] text-faint">{apiErrorMessage(poll.error, "未知错误")}</p>
           <Button variant="secondary" size="sm" onClick={() => poll.refresh()} className="mt-2 gap-1.5">
             <RefreshCw size={14} />
             重试

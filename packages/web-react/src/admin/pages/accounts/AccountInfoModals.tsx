@@ -1,12 +1,12 @@
 import { useEffect, useState } from "react";
 import { Badge, Modal, Spinner } from "../../../components/ui";
 import { DataTable, type Column } from "../../components";
-import { ApiError, adminGet } from "../../lib/adminApi";
+import { adminGet, apiErrorMessage } from "../../lib/adminApi";
 import { fmtDateTime } from "./cells";
 import type { RecentUser, RefreshEvent } from "./types";
 
 function errMsg(e: unknown): string {
-  return e instanceof ApiError ? e.message : e instanceof Error ? e.message : String(e);
+  return apiErrorMessage(e, "请求失败");
 }
 
 /** 通用只读模态数据加载封装。 */
