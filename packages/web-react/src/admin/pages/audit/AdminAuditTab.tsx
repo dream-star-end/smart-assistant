@@ -33,6 +33,18 @@ interface AuditResp {
 interface Filter {
   adminId: string;
   action: string;
+  /** 精确匹配，格式 `类型:id`。 */
+  target: string;
+  /** ISO 8601（含时区）。datetime-local 草稿在提交时归一化为 ISO。 */
+  createdFrom: string;
+  createdTo: string;
+}
+
+/** datetime-local 值（本地时间，无时区）→ ISO 8601；空/非法 → 空串（不下发）。 */
+function toIso(local: string): string {
+  if (!local) return "";
+  const d = new Date(local);
+  return Number.isNaN(d.getTime()) ? "" : d.toISOString();
 }
 
 /** before/after 顶层对比表 + 变更行高亮。 */
@@ -111,9 +123,18 @@ function DiffBody({ row }: { row: AdminAuditRow }) {
 
 export function AdminAuditTab() {
   const toast = useToast();
-  const [filter, setFilter] = useState<Filter>({ adminId: "", action: "" });
+  const [filter, setFilter] = useState<Filter>({
+    adminId: "",
+    action: "",
+    target: "",
+    createdFrom: "",
+    createdTo: "",
+  });
   const [dAdmin, setDAdmin] = useState("");
   const [dAction, setDAction] = useState("");
+  const [dTarget, setDTarget] = useState("");
+  const [dFrom, setDFrom] = useState("");
+  const [dTo, setDTo] = useState("");
 
   const [rows, setRows] = useState<AdminAuditRow[]>([]);
   const [cursor, setCursor] = useState<string | null>(null);
@@ -136,6 +157,9 @@ export function AdminAuditTab() {
           limit: PAGE_SIZE,
           admin_id: filter.adminId,
           action: filter.action,
+          target: filter.target,
+          created_from: filter.createdFrom,
+          created_to: filter.createdTo,
         });
         if (!alive) return;
         setRows(data.rows ?? []);
@@ -160,6 +184,9 @@ export function AdminAuditTab() {
         limit: PAGE_SIZE,
         admin_id: filter.adminId,
         action: filter.action,
+        target: filter.target,
+        created_from: filter.createdFrom,
+        created_to: filter.createdTo,
         before: cursor,
       });
       setRows((prev) => [...prev, ...(data.rows ?? [])]);
@@ -171,11 +198,21 @@ export function AdminAuditTab() {
     }
   };
 
-  const apply = () => setFilter({ adminId: dAdmin.trim(), action: dAction.trim() });
+  const apply = () =>
+    setFilter({
+      adminId: dAdmin.trim(),
+      action: dAction.trim(),
+      target: dTarget.trim(),
+      createdFrom: toIso(dFrom),
+      createdTo: toIso(dTo),
+    });
   const clear = () => {
     setDAdmin("");
     setDAction("");
-    setFilter({ adminId: "", action: "" });
+    setDTarget("");
+    setDFrom("");
+    setDTo("");
+    setFilter({ adminId: "", action: "", target: "", createdFrom: "", createdTo: "" });
   };
   const onKey = (e: React.KeyboardEvent) => {
     if (e.key === "Enter") apply();
@@ -245,6 +282,36 @@ export function AdminAuditTab() {
           placeholder="动作前缀(如 user.)"
           className="h-9 w-full sm:w-52"
         />
+        <Input
+          value={dTarget}
+          onChange={(e) => setDTarget(e.target.value)}
+          onKeyDown={onKey}
+          placeholder="对象(类型:id)"
+          className="h-9 w-full sm:w-48"
+          aria-label="对象精确匹配"
+        />
+        <label className="flex items-center gap-1.5 text-[12px] text-faint">
+          从
+          <Input
+            type="datetime-local"
+            value={dFrom}
+            onChange={(e) => setDFrom(e.target.value)}
+            onKeyDown={onKey}
+            className="h-9 w-[13.5rem]"
+            aria-label="起始时间"
+          />
+        </label>
+        <label className="flex items-center gap-1.5 text-[12px] text-faint">
+          到
+          <Input
+            type="datetime-local"
+            value={dTo}
+            onChange={(e) => setDTo(e.target.value)}
+            onKeyDown={onKey}
+            className="h-9 w-[13.5rem]"
+            aria-label="结束时间"
+          />
+        </label>
         <Button variant="primary" size="sm" onClick={apply}>
           查询
         </Button>
