@@ -9,7 +9,6 @@ import {
   Plus,
   Redo2,
   RotateCcw,
-  SlidersHorizontal,
   Square,
   Undo2,
   X,
@@ -96,27 +95,101 @@ function hasSelection(canvas: HTMLCanvasElement): boolean {
   return false
 }
 
-/** 左侧竖直锥形笔刷滑杆(粗上细下,圆头拖点)。纯 UI —— 只读写外部 brushSize,
- * 无自身逻辑状态。竖直方向用 writing-mode(现代浏览器原生竖向 range),direction:rtl
- * 让「顶部=最粗」。锥形轨道为装饰层(clip-path 梯形),真正的可拖点是覆盖其上的 range。 */
-function BrushSlider({ value, onChange }: { value: number; onChange: (n: number) => void }) {
+export const BRUSH_MIN = 12
+export const BRUSH_MAX = 180
+
+/** 左侧竖直锥形笔刷滑杆(粗上细下)。**完整拖动交互**(需求 §3):pointerdown+move 连续跟手,
+ * 鼠标/触摸同一路径(pointer 事件统一),拖动时右侧气泡显示当前粗细;命中区 44px 宽(w-11)。
+ * 键盘 ↑/↓/←/→ 微调、Home/End 到端点(role=slider)。此前是原生竖向 <input type=range>
+ * (writing-mode:vertical-lr),桌面拖点命中区极窄、拖动不跟手(用户反馈"只能点")—— 换成
+ * 自绘可拖滑杆根治。纯 UI:只读写外部 value,拖动态气泡是本地视觉。 */
+export function BrushSlider({ value, onChange }: { value: number; onChange: (n: number) => void }) {
+  const trackRef = useRef<HTMLDivElement>(null)
+  const draggingRef = useRef(false)
+  const [dragging, setDragging] = useState(false)
+  // 顶部=最粗(frac=1),底部=最细(frac=0)。
+  const frac = Math.min(1, Math.max(0, (value - BRUSH_MIN) / (BRUSH_MAX - BRUSH_MIN)))
+
+  const setFromClientY = (clientY: number) => {
+    const el = trackRef.current
+    if (!el) return
+    const rect = el.getBoundingClientRect()
+    if (rect.height <= 0) return
+    const fromTop = (clientY - rect.top) / rect.height // 0 顶 → 1 底
+    const f = Math.min(1, Math.max(0, 1 - fromTop)) // 1 顶(最粗)→ 0 底(最细)
+    onChange(Math.round(BRUSH_MIN + f * (BRUSH_MAX - BRUSH_MIN)))
+  }
+
+  const onPointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (e.pointerType === 'mouse' && e.button !== 0) return
+    e.preventDefault()
+    draggingRef.current = true
+    setDragging(true)
+    try {
+      e.currentTarget.setPointerCapture(e.pointerId)
+    } catch {}
+    setFromClientY(e.clientY)
+  }
+  const onPointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (!draggingRef.current) return
+    setFromClientY(e.clientY)
+  }
+  const endDrag = (e: React.PointerEvent<HTMLDivElement>) => {
+    draggingRef.current = false
+    setDragging(false)
+    try {
+      e.currentTarget.releasePointerCapture(e.pointerId)
+    } catch {}
+  }
+  const onKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
+    let next = value
+    if (e.key === 'ArrowUp' || e.key === 'ArrowRight') next = value + 6
+    else if (e.key === 'ArrowDown' || e.key === 'ArrowLeft') next = value - 6
+    else if (e.key === 'Home') next = BRUSH_MAX
+    else if (e.key === 'End') next = BRUSH_MIN
+    else return
+    e.preventDefault()
+    onChange(Math.min(BRUSH_MAX, Math.max(BRUSH_MIN, next)))
+  }
+
   return (
-    <div className="relative flex h-48 w-12 items-center justify-center">
+    <div
+      ref={trackRef}
+      role="slider"
+      aria-label="画笔粗细"
+      aria-valuemin={BRUSH_MIN}
+      aria-valuemax={BRUSH_MAX}
+      aria-valuenow={value}
+      tabIndex={0}
+      title={`画笔粗细 ${value}`}
+      onPointerDown={onPointerDown}
+      onPointerMove={onPointerMove}
+      onPointerUp={endDrag}
+      onPointerCancel={endDrag}
+      onKeyDown={onKeyDown}
+      className="relative flex h-48 w-11 cursor-ns-resize touch-none select-none items-stretch justify-center rounded-full outline-none focus-visible:ring-2 focus-visible:ring-white/70"
+    >
+      {/* 锥形装饰轨道(粗上细下) */}
       <span
         aria-hidden
-        className="absolute inset-y-3 left-1/2 -translate-x-1/2 bg-white/20"
+        className="pointer-events-none absolute inset-y-2 left-1/2 -translate-x-1/2 bg-white/25"
         style={{ width: '26px', clipPath: 'polygon(0 0, 100% 0, 66% 100%, 34% 100%)' }}
       />
-      <input
-        type="range"
-        min={12}
-        max={180}
-        value={value}
-        onChange={(e) => onChange(Number(e.target.value))}
-        aria-label="画笔粗细"
-        className="relative z-10 cursor-pointer accent-white"
-        style={{ writingMode: 'vertical-lr', direction: 'rtl', height: '160px' }}
+      {/* 拖点圆头(跟手) */}
+      <span
+        aria-hidden
+        className="pointer-events-none absolute left-1/2 size-5 -translate-x-1/2 -translate-y-1/2 rounded-full border-2 border-black/25 bg-white shadow-float"
+        style={{ top: `${(1 - frac) * 100}%` }}
       />
+      {/* 拖动态数值气泡 */}
+      {dragging && (
+        <span
+          className="pointer-events-none absolute left-full ml-2 -translate-y-1/2 rounded-md bg-white px-2 py-0.5 text-xs font-semibold tabular-nums text-black shadow-float"
+          style={{ top: `${(1 - frac) * 100}%` }}
+        >
+          {value}
+        </span>
+      )}
     </div>
   )
 }
@@ -165,6 +238,11 @@ export function ImageAnnotationEditor({
   const [tool, setTool] = useState<Tool>('brush')
   const [brushSize, setBrushSize] = useState(48)
   const [prompt, setPrompt] = useState('')
+  // 「更多工具」下拉:受控开合(需求 §4)——选完工具/点外部/ESC 都要自动收起,原生 <details>
+  // 做不到(选后不收、点外部不收),改受控状态。
+  const [toolsOpen, setToolsOpen] = useState(false)
+  // 误触保护(需求 §5):有未提交笔画/描述时关闭 → 先弹确认层,空白直接退。
+  const [confirmClose, setConfirmClose] = useState(false)
   const [loading, setLoading] = useState(false)
   const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -212,6 +290,8 @@ export function ImageAnnotationEditor({
     setError(null)
     setLoadError(null)
     setPrompt('')
+    setToolsOpen(false)
+    setConfirmClose(false)
     setView({ scale: 1, x: 0, y: 0 })
     historyRef.current = []
     redoRef.current = []
@@ -488,6 +568,44 @@ export function ImageAnnotationEditor({
   }, [revision])
   const canSubmit = selectionPresent && prompt.trim().length > 0 && !submitting && !historyPending
 
+  // 脏状态 = 有圈选或有描述。关闭时据此决定「确认弹层 or 直接退」(需求 §5 误触保护)。
+  const dirty = selectionPresent || prompt.trim().length > 0
+  const requestClose = useCallback(() => {
+    if (submitting) return
+    if (dirty) setConfirmClose(true)
+    else onOpenChange(false)
+  }, [submitting, dirty, onOpenChange])
+
+  // Radix onEscapeKeyDown 绑定挂载时闭包(不随 state 重渲刷新),直接读 state 会拿到陈旧的
+  // dirty/toolsOpen(如挂载时 dirty=false,画了几笔后 ESC 仍会不弹确认直接退)。用 ref 存最新
+  // 快照,ESC 处理读 ref.current(ref 跨渲染稳定)。同 ImageViewer 的做法。
+  const escStateRef = useRef({ submitting, toolsOpen, confirmClose, dirty })
+  escStateRef.current = { submitting, toolsOpen, confirmClose, dirty }
+
+  // 桌面键盘(需求 §5):Ctrl/Cmd+Z 撤销、Shift+Z 或 Ctrl+Y 重做。输入框内放行给浏览器文本
+  // 撤销,不劫持。ESC 由 Radix onEscapeKeyDown 统一处理(尊重弹层层级)。
+  useEffect(() => {
+    if (!open) return
+    const onKey = (e: KeyboardEvent) => {
+      if (!(e.metaKey || e.ctrlKey)) return
+      const t = e.target as HTMLElement | null
+      if (t && (t.tagName === 'TEXTAREA' || t.tagName === 'INPUT')) return
+      const k = e.key.toLowerCase()
+      if (k === 'z') {
+        e.preventDefault()
+        if (e.shiftKey) void redo()
+        else void undo()
+      } else if (k === 'y') {
+        e.preventDefault()
+        void redo()
+      }
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+    // undo/redo 读 ref + setState,捕获首帧闭包即可(与本文件既有 effect 同风格)。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open])
+
   const submit = async () => {
     const canvas = visibleRef.current
     const mask = maskRef.current
@@ -531,6 +649,15 @@ export function ImageAnnotationEditor({
     }
   }
 
+  // 工具元数据(触发钮回显当前工具图标 + 菜单列表共用单一权威)。
+  const TOOLS: { value: Tool; label: string; icon: React.ReactNode }[] = [
+    { value: 'brush', label: '画笔', icon: <Brush size={18} /> },
+    { value: 'rect', label: '矩形', icon: <Square size={18} /> },
+    { value: 'lasso', label: '套索', icon: <LassoSelect size={18} /> },
+    { value: 'erase', label: '橡皮', icon: <Eraser size={18} /> },
+  ]
+  const activeTool = TOOLS.find((t) => t.value === tool) ?? TOOLS[0]!
+
   const ToolButton = ({
     value,
     label,
@@ -538,7 +665,11 @@ export function ImageAnnotationEditor({
   }: { value: Tool; label: string; icon: React.ReactNode }) => (
     <button
       type="button"
-      onClick={() => setTool(value)}
+      // 选完自动收起菜单(需求 §4)。
+      onClick={() => {
+        setTool(value)
+        setToolsOpen(false)
+      }}
       aria-pressed={tool === value}
       className={cn(
         'flex min-h-11 items-center gap-2 rounded-xl px-3 text-sm font-medium',
@@ -577,18 +708,31 @@ export function ImageAnnotationEditor({
         <Dialog.Content
           aria-describedby="image-edit-help"
           className="fixed inset-x-0 top-[var(--oc-visual-offset-top,0px)] z-[71] flex h-[var(--oc-visual-height,100dvh)] min-h-0 select-none flex-col bg-black text-white outline-none"
+          // ESC 逐层退出 + 误触保护(需求 §5):菜单 → 确认层 → 脏则弹确认 → 干净才退。
+          // 全程接管,不放行 Radix 直接关(否则脏状态会被直接丢弃)。
+          onEscapeKeyDown={(e) => {
+            e.preventDefault()
+            const s = escStateRef.current // 读 ref:非闭包 state(Radix 绑定挂载时闭包会陈旧)。
+            if (s.submitting) return
+            if (s.toolsOpen) setToolsOpen(false)
+            else if (s.confirmClose) setConfirmClose(false)
+            else if (s.dirty) setConfirmClose(true)
+            else onOpenChange(false)
+          }}
+          onPointerDownOutside={(e) => e.preventDefault()}
         >
           {/* 顶栏:X | 已选中区域/圈选要修改的区域(居中) | 发送 */}
           <header className="relative flex min-h-14 shrink-0 items-center justify-between gap-3 px-3 pt-[env(safe-area-inset-top)]">
-            <Dialog.Close asChild>
-              <button
-                type="button"
-                aria-label="关闭图片编辑器"
-                className="flex size-10 items-center justify-center rounded-full bg-white/10 text-white backdrop-blur transition-colors hover:bg-white/20"
-              >
-                <X size={20} />
-              </button>
-            </Dialog.Close>
+            <button
+              type="button"
+              aria-label="关闭图片编辑器"
+              title="关闭 (Esc)"
+              // 走 requestClose:脏状态先弹确认,空白直接退(需求 §5)。
+              onClick={requestClose}
+              className="flex size-10 items-center justify-center rounded-full bg-white/10 text-white backdrop-blur transition-colors hover:bg-white/20"
+            >
+              <X size={20} />
+            </button>
             <div className="pointer-events-none absolute left-1/2 top-1/2 flex -translate-x-1/2 -translate-y-1/2 flex-col items-center pt-[env(safe-area-inset-top)]">
               <Dialog.Title className="text-sm font-semibold">
                 {selectionPresent ? '已选中区域' : '圈选要修改的区域'}
@@ -667,6 +811,13 @@ export function ImageAnnotationEditor({
                 aria-label="希望怎样修改"
                 value={prompt}
                 onChange={(e) => setPrompt(e.target.value)}
+                // 桌面 Enter 提交、Shift+Enter 换行(需求 §5)。
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' && !e.shiftKey) {
+                    e.preventDefault()
+                    if (canSubmit) void submit()
+                  }
+                }}
                 rows={1}
                 maxLength={1200}
                 placeholder="描述想要的修改，例如：把杯子改成透明玻璃材质"
@@ -677,27 +828,51 @@ export function ImageAnnotationEditor({
               只重绘圈选的区域；未圈选部分按原图像素保留。手机可双指缩放、移动画布。每张 50 积分。
             </p>
             <div className="mx-auto flex w-full max-w-2xl items-center justify-center gap-2">
-              {/* 次级:矩形/套索/橡皮/清空收进「更多工具」 */}
-              <details className="relative">
-                <summary className="flex size-11 cursor-pointer list-none items-center justify-center rounded-full bg-white/10 text-white backdrop-blur transition-colors hover:bg-white/20 [&::-webkit-details-marker]:hidden">
-                  <SlidersHorizontal size={18} />
-                  <span className="sr-only">更多工具</span>
-                </summary>
-                <div className="absolute bottom-14 left-0 z-30 flex w-40 flex-col gap-1 rounded-2xl bg-neutral-900/95 p-2 text-white shadow-float backdrop-blur">
-                  <ToolButton value="brush" label="画笔" icon={<Brush size={18} />} />
-                  <ToolButton value="rect" label="矩形" icon={<Square size={18} />} />
-                  <ToolButton value="lasso" label="套索" icon={<LassoSelect size={18} />} />
-                  <ToolButton value="erase" label="橡皮" icon={<Eraser size={18} />} />
-                  <button
-                    type="button"
-                    disabled={historyPending}
-                    onClick={() => void clear()}
-                    className="flex min-h-11 items-center gap-2 rounded-xl px-3 text-sm text-white hover:bg-white/10 disabled:opacity-35"
-                  >
-                    <RotateCcw size={17} /> 清空
-                  </button>
-                </div>
-              </details>
+              {/* 次级:矩形/套索/橡皮/清空收进「更多工具」——受控开合(需求 §4):选完/点外部/ESC
+                  都自动收起(原生 <details> 做不到);触发钮回显当前工具图标,收起后仍看得出选了谁。 */}
+              <div className="relative">
+                <button
+                  type="button"
+                  aria-label={`更多工具，当前：${activeTool.label}`}
+                  aria-expanded={toolsOpen}
+                  title={`更多工具 · 当前：${activeTool.label}`}
+                  onClick={() => setToolsOpen((v) => !v)}
+                  className={cn(
+                    'flex size-11 items-center justify-center rounded-full backdrop-blur transition-colors',
+                    toolsOpen ? 'bg-white text-black' : 'bg-white/10 text-white hover:bg-white/20',
+                  )}
+                >
+                  {activeTool.icon}
+                </button>
+                {toolsOpen && (
+                  <>
+                    {/* 点外部关闭(需求 §4/§5 统一点外关) */}
+                    <button
+                      type="button"
+                      aria-hidden
+                      tabIndex={-1}
+                      className="fixed inset-0 z-20 cursor-default"
+                      onClick={() => setToolsOpen(false)}
+                    />
+                    <div className="absolute bottom-14 left-0 z-30 flex w-40 flex-col gap-1 rounded-2xl bg-neutral-900/95 p-2 text-white shadow-float backdrop-blur">
+                      {TOOLS.map((t) => (
+                        <ToolButton key={t.value} value={t.value} label={t.label} icon={t.icon} />
+                      ))}
+                      <button
+                        type="button"
+                        disabled={historyPending}
+                        onClick={() => {
+                          setToolsOpen(false)
+                          void clear()
+                        }}
+                        className="flex min-h-11 items-center gap-2 rounded-xl px-3 text-sm text-white hover:bg-white/10 disabled:opacity-35"
+                      >
+                        <RotateCcw size={17} /> 清空
+                      </button>
+                    </div>
+                  </>
+                )}
+              </div>
               {/* 主级:撤销/重做居中 */}
               <RoundBtn
                 label="撤销"
@@ -726,6 +901,38 @@ export function ImageAnnotationEditor({
               )}
             </div>
           </div>
+
+          {/* 误触保护确认层(需求 §5):有未提交圈选/描述时点 X 或按 ESC → 此层;空白则直接退。 */}
+          {confirmClose && (
+            <div
+              role="alertdialog"
+              aria-label="放弃编辑确认"
+              className="absolute inset-0 z-40 flex items-center justify-center bg-black/70 px-6 backdrop-blur-sm"
+            >
+              <div className="w-full max-w-xs rounded-2xl bg-neutral-900 p-5 text-center shadow-float">
+                <p className="text-sm text-white">放弃当前编辑？已圈选的区域和描述都不会保存。</p>
+                <div className="mt-4 flex gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setConfirmClose(false)}
+                    className="min-h-10 flex-1 rounded-full bg-white/10 text-sm font-medium text-white transition-colors hover:bg-white/20"
+                  >
+                    继续编辑
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setConfirmClose(false)
+                      onOpenChange(false)
+                    }}
+                    className="min-h-10 flex-1 rounded-full bg-danger text-sm font-semibold text-white transition-opacity hover:opacity-90"
+                  >
+                    放弃
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
         </Dialog.Content>
       </Dialog.Portal>
     </Dialog.Root>

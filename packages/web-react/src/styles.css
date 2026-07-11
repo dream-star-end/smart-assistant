@@ -221,6 +221,17 @@ body {
 }
 @keyframes oc-shimmer { 100% { transform: translateX(100%); } }
 
+/* ── 桌面光标:Tailwind v4 preflight 删除了 v3 的 `button,[role=button]{cursor:pointer}`
+   默认(v4 breaking change),导致全站桌面按钮/可点元素显示的是箭头光标(非手型),鼠标用户
+   会觉得"点不动"。这里用单条权威规则恢复 v3 行为。放进 @layer base 且用 :where() 归零特异性
+   → 任何显式 cursor-* 工具类(cursor-zoom-in / cursor-crosshair / cursor-ns-resize 等)都能
+   正常覆盖它;禁用态(:disabled / aria-disabled)不加手型,交给各自的 disabled:cursor-* 决定。 ── */
+@layer base {
+  :where(button:not(:disabled), [role="button"]:not([aria-disabled="true"]), summary, label[for]) {
+    cursor: pointer;
+  }
+}
+
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; }
 }
