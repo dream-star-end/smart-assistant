@@ -31,6 +31,11 @@ import { ConnectorError } from '../connectors/errors.js'
 import { bindDeclarativeConnector } from '../connectors/engine/bind.js'
 import type { EngineHttpDeps } from '../connectors/engine/driver.js'
 import { executeDeclarativeAction } from '../connectors/engine/execute.js'
+import {
+  executeDeclarativeWrite,
+  proposeDeclarativeWrite,
+} from '../connectors/engine/write.js'
+import { approveConfirmation } from '../connectors/ledger.js'
 import { canonicalSha256Hex } from '../connectors/spec/canonical.js'
 import { compileSpec } from '../connectors/spec/compiler.js'
 import { revokeExecVersion, securityApprove } from '../connectors/spec/review.js'
@@ -539,6 +544,130 @@ describe('声明式首垂直 static-token+Notion', () => {
         [user],
       )
       assert.equal(active.rows[0]!.n, '1')
+    } finally {
+      await server.close()
+    }
+  })
+})
+
+// ─── 写门:propose → approve → ledger-pinned execute(slice④) ───────────────────
+
+/** 绑一条连接并返回 connectionId(内部消化 bind 的 probe 请求)。 */
+async function boundConnection(
+  server: TestServer,
+  deps: EngineHttpDeps,
+): Promise<{ connectionId: string; userId: number; versionId: number }> {
+  const conn = await approvedConnector()
+  const userId = await mkUser()
+  server.setHandler(identityHandler())
+  const bind = await bindDeclarativeConnector(
+    { userId, connectorVersionId: conn.versionId, token: TOKEN, deps },
+    getPool(),
+  )
+  server.reset()
+  return { connectionId: bind.connectionId, userId, versionId: conn.versionId }
+}
+
+describe('声明式写门 propose→approve→execute', () => {
+  test('happy path:propose 不 dispatch;approve 后 execute 发写 + allowlist + 幂等 replay', async (t) => {
+    if (skipIfNoDb(t)) return
+    const server = await startServer()
+    try {
+      const deps: EngineHttpDeps = { resolver: okResolver(), fetchImpl: localFetch(server.port) }
+      const { connectionId, userId } = await boundConnection(server, deps)
+
+      // ── propose:确定性 plan-diff,绝不 dispatch ──────────────────────────────
+      const prop = await proposeDeclarativeWrite(
+        { connectionId, userId, actionId: 'create_page', params: {} },
+        getPool(),
+      )
+      assert.equal(prop.effect, 'write')
+      assert.equal(prop.plan.method, 'POST')
+      assert.equal(prop.plan.path, '/v1/pages')
+      assert.equal(server.requests.length, 0) // propose 不打上游
+
+      // ── 未 approve 直接 execute → CONFIRMATION_NOT_APPROVED ────────────────────
+      await assert.rejects(
+        executeDeclarativeWrite({ connectionId, userId, confirmId: prop.confirmId, deps }, getPool()),
+        isConnErr('CONFIRMATION_NOT_APPROVED'),
+      )
+
+      // ── approve → execute:发 POST /v1/pages + Bearer;结果 allowlist ─────────
+      await approveConfirmation(prop.confirmId, userId, getPool())
+      server.setHandler((p) =>
+        p === '/v1/pages'
+          ? { status: 200, body: JSON.stringify({ id: 'new-page', secret_field: 'LEAK-Y' }) }
+          : { status: 404, body: '{}' },
+      )
+      const exec = await executeDeclarativeWrite(
+        { connectionId, userId, confirmId: prop.confirmId, deps },
+        getPool(),
+      )
+      assert.equal(exec.kind, 'ok')
+      assert.deepEqual((exec as { result: unknown }).result, { id: 'new-page' }) // secret_field 剥掉
+      assert.equal(server.requests.length, 1)
+      assert.equal(server.requests[0]!.method, 'POST')
+      assert.equal(server.requests[0]!.path, '/v1/pages')
+      assert.equal(server.requests[0]!.authorization, `Bearer ${TOKEN}`)
+
+      // ── 幂等 replay:同 confirmId 再 execute → replay,不二次 dispatch ─────────
+      const replay = await executeDeclarativeWrite(
+        { connectionId, userId, confirmId: prop.confirmId, deps },
+        getPool(),
+      )
+      assert.equal(replay.kind, 'replay')
+      assert.equal((replay as { status: string }).status, 'succeeded')
+      assert.equal(server.requests.length, 1) // 仍是 1,未重发
+    } finally {
+      await server.close()
+    }
+  })
+
+  test('read action 走 propose → BAD_REQUEST(读无需确认)', async (t) => {
+    if (skipIfNoDb(t)) return
+    const server = await startServer()
+    try {
+      const deps: EngineHttpDeps = { resolver: okResolver(), fetchImpl: localFetch(server.port) }
+      const { connectionId, userId } = await boundConnection(server, deps)
+      await assert.rejects(
+        proposeDeclarativeWrite(
+          { connectionId, userId, actionId: 'get_page', params: { pageId: 'p' } },
+          getPool(),
+        ),
+        isConnErr('BAD_REQUEST'),
+      )
+    } finally {
+      await server.close()
+    }
+  })
+
+  test('confirmId 张冠李戴到别的连接 execute → BAD_REQUEST(账本绑定校验)', async (t) => {
+    if (skipIfNoDb(t)) return
+    const server = await startServer()
+    try {
+      const deps: EngineHttpDeps = { resolver: okResolver(), fetchImpl: localFetch(server.port) }
+      const a = await boundConnection(server, deps)
+      // 第二条连接(同一 user 便于对照,不同 connectionId)。
+      server.setHandler(identityHandler())
+      const conn2 = await approvedConnector()
+      const bind2 = await bindDeclarativeConnector(
+        { userId: a.userId, connectorVersionId: conn2.versionId, token: `${TOKEN}-2`, deps },
+        getPool(),
+      )
+      server.reset()
+      const prop = await proposeDeclarativeWrite(
+        { connectionId: a.connectionId, userId: a.userId, actionId: 'create_page', params: {} },
+        getPool(),
+      )
+      await approveConfirmation(prop.confirmId, a.userId, getPool())
+      // 用 conn2 的 connectionId 执行 conn1 的 confirmId → 账本行 connection_id 不匹配。
+      await assert.rejects(
+        executeDeclarativeWrite(
+          { connectionId: bind2.connectionId, userId: a.userId, confirmId: prop.confirmId, deps },
+          getPool(),
+        ),
+        isConnErr('BAD_REQUEST'),
+      )
     } finally {
       await server.close()
     }

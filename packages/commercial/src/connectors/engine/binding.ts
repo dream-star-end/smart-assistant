@@ -39,6 +39,8 @@ export interface DeclarativeConnectionRow {
   /** listing slug。 */
   provider: string
   display_name: string
+  /** 凭据代数(账本 pin + beginExecute 复核)。 */
+  revision: number
   aad_seed: string
   secret_enc: Buffer | null
   secret_nonce: Buffer | null
@@ -50,7 +52,7 @@ export interface DeclarativeConnectionRow {
   meta: Record<string, unknown>
 }
 
-const DECL_COLS = `id::text AS id, user_id::int AS user_id, provider, display_name,
+const DECL_COLS = `id::text AS id, user_id::int AS user_id, provider, display_name, revision,
   aad_seed::text AS aad_seed, secret_enc, secret_nonce,
   connector_version_id::text AS connector_version_id, spec_hash, exec_contract_hash,
   auth_contract_version, status, meta`

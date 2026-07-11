@@ -36,8 +36,8 @@ export interface ExecuteDeclarativeInput {
   deps?: EngineHttpDeps
 }
 
-/** 已存在绑定加载 contract 失败 → 一律 RELINK_REQUIRED(连接不可信,须重绑)。 */
-async function loadContractForConnection(
+/** 已存在绑定加载 contract 失败 → 一律 RELINK_REQUIRED(连接不可信,须重绑)。bind/execute/write 共用。 */
+export async function loadContractForConnection(
   row: DeclarativeConnectionRow,
   pool: Pool,
 ): Promise<{ contract: ExecContractT; execContractHash: string }> {
@@ -54,10 +54,11 @@ async function loadContractForConnection(
   }
 }
 
-function soleApiOrigin(contract: ExecContractT): string {
+/** 契约受众里唯一 API origin(单 origin 连接器;多 origin 按 action 绑定是后续切片)。 */
+export function soleApiOrigin(contract: ExecContractT): string {
   const origins = contract.credentialAudiencePolicy.apiOrigins
   if (origins.length !== 1)
-    throw new ConnectorError('BAD_REQUEST', 'slice③ requires exactly one api origin')
+    throw new ConnectorError('BAD_REQUEST', 'connector requires exactly one api origin')
   return origins[0]!
 }
 
@@ -78,9 +79,13 @@ export async function executeDeclarativeAction(
   const action: ExecActionT | undefined = contract.actions.find((a) => a.id === input.actionId)
   if (action === undefined) throw new ConnectorError('ACTION_UNKNOWN', `unknown action ${input.actionId}`)
 
-  // ④ effect 门:slice③ 只读。写/发送在 slice④ 走确认门 + 账本。
+  // ④ effect 门:read 直执行;write/send 必须走确认门(proposeDeclarativeWrite → approve →
+  //    executeDeclarativeWrite),不能从这里直接发。
   if (action.effect !== 'read')
-    throw new ConnectorError('BAD_REQUEST', `action effect ${action.effect} not enabled (read-only slice)`)
+    throw new ConnectorError(
+      'BAD_REQUEST',
+      `action effect ${action.effect} requires confirmation (use proposeDeclarativeWrite)`,
+    )
 
   // params 结构轻校验:必须是普通对象(driver 的 cloneNullProto 再深拒污染键/非 JSON 值)。
   // 按签进 contract 的 action.params schema 做**类型级**入参校验属于 API 边界职责(P2 统一校验器

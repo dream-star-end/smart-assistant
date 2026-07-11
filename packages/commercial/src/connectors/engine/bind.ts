@@ -22,6 +22,7 @@ import { computeAccountKey } from '../store.js'
 import { insertDeclarativeConnection } from './binding.js'
 import { bagToResolvedCredentials, requiredBindSources, validateSecretBag } from './credentialBag.js'
 import { type EngineHttpDeps, engineHttpRequest } from './driver.js'
+import { soleApiOrigin } from './execute.js'
 
 const POLLUTION_KEYS: ReadonlySet<string> = new Set(['__proto__', 'prototype', 'constructor'])
 
@@ -55,14 +56,6 @@ function pointerScalar(root: unknown, pointer: string, what: string): string {
   if (typeof v === 'string' && v.length > 0) return v
   if (typeof v === 'number' && Number.isFinite(v)) return String(v)
   throw new ConnectorError('UPSTREAM_ERROR', `identity ${what} missing in probe result`)
-}
-
-/** 契约受众里唯一 API origin(slice③ 单 origin;多 origin 按 action 绑定是后续切片)。 */
-function soleApiOrigin(contract: ExecContractT): string {
-  const origins = contract.credentialAudiencePolicy.apiOrigins
-  if (origins.length !== 1)
-    throw new ConnectorError('BAD_REQUEST', 'slice③ requires exactly one api origin')
-  return origins[0]!
 }
 
 export interface BindDeclarativeInput {
