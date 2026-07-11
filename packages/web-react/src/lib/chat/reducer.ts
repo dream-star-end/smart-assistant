@@ -38,6 +38,7 @@ import {
   resetReplyTracker,
   trackServerTs,
 } from "./model";
+import { errorLabel } from "./render";
 
 /** teardown 后非 final 帧的压制时间窗(客户端同域):覆盖 stop 后 server 收尾期,不无界压制多端新 turn。*/
 const TEARDOWN_DROP_WINDOW_MS = 3 * 60_000;
@@ -735,6 +736,51 @@ function findPlanInRange(messages: ChatMessage[], blockId: string, start: number
   return null;
 }
 
+// ═══════════════ 生成占位卡（需求 C）消解/失败 ═══════════════
+
+/**
+ * 交付终帧回带的图片编辑 jobId。契约（protocol OutboundMessage 顶层 `imageEditJobId`，Agent B）：
+ * gateway「免模型直投」交付终帧携带 imageEditJobId（= inbound imageEdit.clientJobId =
+ * 占位行 _genPlaceholder.jobId），容器→master→user 全程 raw 透传；普通 turn 终帧不带。
+ * 运行期防御性校验（wire 帧不可尽信），类型上该字段已入约。
+ */
+function extractImageEditJobId(frame: OutboundMessageWire): string | undefined {
+  const j = frame.imageEditJobId;
+  return typeof j === "string" && j.length > 0 ? j : undefined;
+}
+
+/**
+ * 消解本会话的生成占位行（imageEdit 结果图已作为 assistant 消息落地）。
+ *  - `jobId` 存在（image-edit 直投终帧回带顶层 imageEditJobId）→ **精确匹配该 job 的占位、
+ *    无论状态**删除：既清运行中,也清「上次失败后重试成功」残留的失败占位（重试复用同
+ *    clientJobId，见 socket.retryMessage）。
+ *  - `jobId` 缺省（普通 turn 终帧 / 旧 gateway 不带该字段）→ 按「本会话 turn 串行、同一时刻
+ *    至多一条运行中占位」语义,只删运行中（不误删其它轮的失败卡）。
+ * 倒序 splice，就地维持 messages 数组（与 reducer 就地 mutation 语义一致）。
+ */
+export function resolveGenPlaceholders(sess: ChatSession, jobId?: string): void {
+  for (let i = sess.messages.length - 1; i >= 0; i--) {
+    const gp = sess.messages[i]._genPlaceholder;
+    if (!gp) continue;
+    if (jobId) {
+      if (gp.jobId === jobId) sess.messages.splice(i, 1);
+    } else if (gp.status === "running") {
+      sess.messages.splice(i, 1);
+    }
+  }
+}
+
+/** 把本会话「运行中」的生成占位行转失败态（turn error 收尾用）。就地改字段（sig 含 status → 重渲）。 */
+export function failGenPlaceholders(sess: ChatSession, reason?: string): void {
+  for (const m of sess.messages) {
+    const gp = m._genPlaceholder;
+    if (gp && gp.status === "running") {
+      gp.status = "failed";
+      if (reason && !gp.reason) gp.reason = reason;
+    }
+  }
+}
+
 // ═══════════════ handleOutbound 主线（websocket.js:2559-3540）═══════════════
 
 /**
@@ -795,6 +841,8 @@ export function applyOutboundMessage(
     sess._sendingInFlight = false;
     clearTurnTiming(sess);
     resetReplyTracker(sess);
+    // 该轮已在服务端正常收尾（含 imageEdit 结果图）：消解运行中占位，结果随 forceSync 回带。
+    resolveGenPlaceholders(sess, extractImageEditJobId(frame));
     effects.onFinal?.(sess, frame, false);
     effects.forceSync?.(sess.id);
     return;
@@ -1321,6 +1369,9 @@ export function applyOutboundMessage(
     sess._streamingThinking = null;
     sess._sendingInFlight = false;
     clearTurnTiming(sess);
+    // 生成占位卡（需求 C）消解：本 turn 收尾 → imageEdit 结果图已作为 assistant 消息原位落地，
+    // 删占位行。直投终帧回带顶层 imageEditJobId 时精确匹配；缺省按串行语义消解运行中占位（见函数注释）。
+    resolveGenPlaceholders(sess, extractImageEditJobId(frame));
     effects.onFinal?.(sess, frame, isCronOrHeartbeat);
     // 服务重启掐断上游生成流的合成 final:有截断内容则自动续写(守卫在 socket 侧)。
     if (frame.meta?.interrupted === "service_restart") effects.scheduleRestartContinue?.(sess.id);
@@ -1359,6 +1410,8 @@ export function applyOutboundError(sess: ChatSession, frame: OutboundErrorWire, 
   clearTurnTiming(sess);
   resetReplyTracker(sess);
   sess._localTeardownAt = sess._trackerResetAt;
+  // 生成占位卡（需求 C）：本轮出错 → 运行中占位转失败态（danger 边 + 原因）。
+  failGenPlaceholders(sess, errorLabel(normalized));
   for (let i = sess.messages.length - 1; i >= 0; i--) {
     const m = sess.messages[i];
     if (m?.role === "user" && (m.status === "sending" || m.status === "sent" || m.status === "queued")) {
@@ -1396,6 +1449,8 @@ export function applyLegacyBridgeError(sess: ChatSession, frame: LegacyBridgeErr
   clearTurnTiming(sess);
   resetReplyTracker(sess);
   sess._localTeardownAt = sess._trackerResetAt;
+  // 生成占位卡（需求 C）：本轮出错 → 运行中占位转失败态。
+  failGenPlaceholders(sess, errorLabel(normalized));
   for (let i = sess.messages.length - 1; i >= 0; i--) {
     const m = sess.messages[i];
     if (m?.role === "user" && (m.status === "sending" || m.status === "sent" || m.status === "queued")) {

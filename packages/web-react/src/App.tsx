@@ -8,9 +8,13 @@ import { ChatHeader } from "./components/ChatHeader";
 import { Composer } from "./components/Composer";
 import {
   ImageAnnotationEditor,
-  type ImageAnnotationExport,
   type ImageAnnotationSource,
 } from "./components/ImageAnnotationEditor";
+import {
+  type ImageEditActions,
+  ImageEditActionsContext,
+  type ImageEditSubmit,
+} from "./components/chat/imageEditActions";
 import { extractLatestTodos, PinnedTaskTracker } from "./components/chat/PinnedTaskTracker";
 import { deriveActivePlanStep, type TurnActivityInfo } from "./components/chat/TurnActivity";
 import { EmptyState } from "./components/EmptyState";
@@ -463,8 +467,32 @@ export function App() {
     return { kind, url: r.url, mimeType: mime || undefined, filename: file.name };
   }, []);
 
-  const submitImageAnnotation = useCallback(
-    async (value: ImageAnnotationExport) => {
+  // 统一图片编辑提交 handler（需求 B/§5）：编辑/评论/调整大小三态联合 → 进主对话生成。
+  // 复用 send()→乐观 user 行 + 生成占位卡（socket 注入）。持久化天然满足（guide 非 hidden、
+  // 结果走 recordExternalTurn）。ImageAnnotationEditor.onSubmit（无 mode 的 ImageAnnotationExport）
+  // 天然落 annotated 分支，向后兼容。
+  const submitImageEdit = useCallback(
+    async (value: ImageEditSubmit) => {
+      if (value.mode === "resize") {
+        // 调整大小（outpaint）：源图（hidden）+ guide（可见），无 mask；带目标比例 targetAspect。
+        const [sourceMedia, guideMedia] = await Promise.all([
+          uploadMedia(value.source),
+          uploadMedia(value.guide),
+        ]);
+        const media: MediaRef[] = [{ ...sourceMedia, hidden: true }, guideMedia];
+        await send(value.prompt, media, {
+          mode: "outpaint",
+          targetAspect: value.targetAspect,
+          clientJobId: value.clientJobId,
+          sourceIndex: 0,
+          guideIndex: 1,
+          width: value.width,
+          height: value.height,
+        });
+        toast("已提交调整大小，成功生成后扣 50 积分", "success");
+        return;
+      }
+      // 编辑/评论（annotated）：源图 + mask（均 hidden）+ guide 三件套（既有链路，逐字保留）。
       const [sourceMedia, maskMedia, guideMedia] = await Promise.all([
         uploadMedia(value.source),
         uploadMedia(value.mask),
@@ -476,6 +504,7 @@ export function App() {
         guideMedia,
       ];
       await send(value.prompt, media, {
+        mode: "annotated",
         clientJobId: value.clientJobId,
         sourceIndex: 0,
         maskIndex: 1,
@@ -486,6 +515,57 @@ export function App() {
       toast("已提交精确修改，成功生成后扣 50 积分", "success");
     },
     [send, toast, uploadMedia],
+  );
+
+  // 生成图移除（需求 A/§10「移除」动作）：client 侧按签名路径隐藏该图，本地持久化
+  // （localStorage per-user，隐私隔离）、**不上服务端**。ImageViewer（Agent-V）通过
+  // ImageEditActions.isMediaHidden 消费此集合隐藏渲染；换账号/登出天然隔离（key 含 userId）。
+  const hiddenMediaKey = user ? `oc_v5_hidden_media:${user.id}` : null;
+  const [hiddenMedia, setHiddenMedia] = useState<Set<string>>(() => new Set());
+  useEffect(() => {
+    // 函数式 setState + 空↔空 bail-out（返回 prev → React 跳过重渲）：boot（key=null）与
+    // 无隐藏记录（绝大多数用户）两条路径都不产生额外全树重渲——此前无条件 set 新 Set 实例,
+    // boot 期多出的渲染轮曾把 App.test 深链/URL 镜像等时序敏感用例推过 findByRole 超时。
+    const bailIfStillEmpty = (prev: Set<string>) => (prev.size === 0 ? prev : new Set<string>());
+    if (!hiddenMediaKey) {
+      setHiddenMedia(bailIfStillEmpty);
+      return;
+    }
+    try {
+      const raw = localStorage.getItem(hiddenMediaKey);
+      const arr = raw ? JSON.parse(raw) : [];
+      const parsed: string[] = Array.isArray(arr) ? arr.filter((x): x is string => typeof x === "string") : [];
+      setHiddenMedia((prev) => (prev.size === 0 && parsed.length === 0 ? prev : new Set(parsed)));
+    } catch {
+      setHiddenMedia(bailIfStillEmpty);
+    }
+  }, [hiddenMediaKey]);
+  const onRemoveImage = useCallback(
+    (signPath: string) => {
+      if (!signPath) return;
+      setHiddenMedia((prev) => {
+        if (prev.has(signPath)) return prev;
+        const next = new Set(prev);
+        next.add(signPath);
+        if (hiddenMediaKey) {
+          try {
+            localStorage.setItem(hiddenMediaKey, JSON.stringify([...next]));
+          } catch {
+            /* 隐私模式/禁存储：仅内存隐藏，best-effort */
+          }
+        }
+        return next;
+      });
+    },
+    [hiddenMediaKey],
+  );
+  const imageEditActions = useMemo<ImageEditActions>(
+    () => ({
+      submitImageEdit,
+      onRemoveImage,
+      isMediaHidden: (p: string) => hiddenMedia.has(p),
+    }),
+    [submitImageEdit, onRemoveImage, hiddenMedia],
   );
 
   // 会话物化:GitHub 绑定是 per-session,新会话未发首条消息前 activeId 为空 → 绑定确定钮
@@ -1294,6 +1374,7 @@ export function App() {
     >
     <ToolCardActionsContext.Provider value={toolActions}>
     <ChatInteractionContext.Provider value={chatInteraction}>
+    <ImageEditActionsContext.Provider value={imageEditActions}>
     {/* safe-px:横屏侧刘海安全区(竖屏为 0) */}
     <div className="flex h-full min-h-0 overflow-hidden bg-bg text-fg safe-px">
       {/* 桌面：内联侧栏（可折叠）。窄屏隐藏，改用抽屉。 */}
@@ -1604,9 +1685,10 @@ export function App() {
         source={imageAnnotationSource}
         open={!!imageAnnotationSource}
         onOpenChange={(next) => !next && setImageAnnotationSource(null)}
-        onSubmit={submitImageAnnotation}
+        onSubmit={submitImageEdit}
       />
     </div>
+    </ImageEditActionsContext.Provider>
     </ChatInteractionContext.Provider>
     </ToolCardActionsContext.Provider>
     </MediaSignProvider>

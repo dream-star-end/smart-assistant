@@ -845,3 +845,74 @@ describe("MessageList 活跃段归属(turnSegment 收口)", () => {
     expect(screen.getByText("任务列表")).toBeInTheDocument();
   });
 });
+
+// ═══════════════ 生成占位卡（需求 C）触发面 ═══════════════
+describe("生成占位卡渲染", () => {
+  const JOB = "a".repeat(32);
+
+  test("本地占位行（imageEdit 提交）→ MessageList 拦截渲染占位卡", () => {
+    render(
+      <MessageList
+        messages={[
+          mk("user", { id: "u1", text: "把杯子改成玻璃杯" }),
+          mk("system", {
+            id: "ph1",
+            _genPlaceholder: { jobId: JOB, aspect: "9:16", status: "running", startedAt: Date.now() },
+          }),
+        ]}
+        sending={true}
+        cb={{}}
+        onRespondPermission={() => {}}
+      />,
+    );
+    expect(screen.getByTestId("generating-placeholder")).toBeInTheDocument();
+    expect(screen.getByText("正在生成 · 约几十秒")).toBeInTheDocument();
+  });
+
+  test("本地占位行 failed → 渲染失败态", () => {
+    render(
+      <MessageList
+        messages={[
+          mk("system", {
+            id: "ph1",
+            _genPlaceholder: {
+              jobId: JOB,
+              aspect: 1,
+              status: "failed",
+              startedAt: Date.now(),
+              reason: "模型服务暂时不可用",
+            },
+          }),
+        ]}
+        sending={false}
+        cb={{}}
+        onRespondPermission={() => {}}
+      />,
+    );
+    expect(screen.getByText("图片生成失败")).toBeInTheDocument();
+    expect(screen.getByText("模型服务暂时不可用")).toBeInTheDocument();
+  });
+
+  test("模型原生 imagegen（codex:imageGeneration）running → 占位卡", () => {
+    renderMsg(mk("tool", { toolName: "codex:imageGeneration", inputJson: { prompt: "a cat" } }));
+    expect(screen.getByTestId("generating-placeholder")).toBeInTheDocument();
+  });
+
+  test("模型原生 imagegen 完成 → 回落 ToolCardSlot（不再出占位卡）", () => {
+    renderMsg(
+      mk("tool", {
+        toolName: "codex:imageGeneration",
+        _completed: true,
+        inputJson: { prompt: "a cat", status: "completed", savedPath: "/gen/cat.png" },
+      }),
+    );
+    expect(screen.queryByTestId("generating-placeholder")).toBeNull();
+  });
+
+  test("模型原生 imagegen 失败态（input.status=failed）→ 不出占位卡，回落工具卡", () => {
+    renderMsg(
+      mk("tool", { toolName: "codex:imageGeneration", inputJson: { prompt: "x", status: "failed" } }),
+    );
+    expect(screen.queryByTestId("generating-placeholder")).toBeNull();
+  });
+});

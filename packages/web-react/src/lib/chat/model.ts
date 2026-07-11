@@ -62,6 +62,24 @@ export type MsgUsage = {
 export type BashTail = { tail: string; totalBytes: number; truncatedHead: boolean };
 
 /**
+ * 生成占位卡的本地状态（需求 C）。imageEdit（编辑/评论/调整大小）提交时由
+ * socket.sendMessage 注入一条**本地专属**行承载它：turn 生成期间在对话流内占位
+ * （粒子特效框），结果图作为 assistant 消息自然渲染后由 reducer 按 `jobId` 消解，
+ * turn error 时转 `failed`。**绝不持久化**（toStored 显式剥离），故重开会话不留孤儿卡。
+ *  - `jobId` === 提交帧 imageEdit.clientJobId（消解/失败的关联键，单一权威）。
+ *  - `aspect` = 目标宽高比：数字比值（编辑/评论用源图 width/height）或比例枚举字符串
+ *    （调整大小用 targetAspect，如 "16:9"）；渲染据此定占位框比例。
+ *  - `reason` = 失败友好文案（可选，契约外附加项，供 danger 卡展示原因）。
+ */
+export type GenPlaceholder = {
+  jobId: string;
+  aspect: number | string;
+  status: "running" | "failed";
+  startedAt: number;
+  reason?: string;
+};
+
+/**
  * 子 agent 块（agent-group 卡 childBlocks 项）。扁平化最多两层展示。
  * 形态对齐现网 _appendSubagentBlock 写入。
  */
@@ -148,6 +166,14 @@ export type ChatMessage = {
   /** cron/task 推送标记。*/
   cronPush?: boolean;
   cronLabel?: string;
+
+  // ── 生成占位卡（需求 C，本地专属行；toStored 剥离、不进 server 历史）──
+  /**
+   * imageEdit 提交后的生成占位状态。携带此字段的行由 socket.sendMessage 注入（role
+   * 取 'system' 客户端域），MessageList 拦截渲染 GeneratingPlaceholderCard；reducer 在
+   * 该会话 turn final 时按 jobId 消解、turn error 时转 failed。见 GenPlaceholder。
+   */
+  _genPlaceholder?: GenPlaceholder;
 
   // ── tool / agent-group 共用 ──
   blockId?: string;

@@ -1418,11 +1418,16 @@ export class ChatSocket {
   toStored(sessId: string): StoredSession | null {
     const s = this.sessions.get(sessId);
     if (!s) return null;
+    // 生成占位卡（需求 C）是**本地专属瞬态行**：绝不持久化（重开会话不留孤儿卡，
+    // 进行中态靠 resume/回放重建，见规格 §6）。仅当存在占位行时才建新数组，否则保持原引用。
+    const messages = s.messages.some((m) => m._genPlaceholder)
+      ? s.messages.filter((m) => !m._genPlaceholder)
+      : s.messages;
     return {
       id: s.id,
       agentId: s.agentId,
       title: s.title,
-      messages: s.messages,
+      messages,
       createdAt: s.createdAt,
       lastAt: s.lastAt,
       updatedAt: s.updatedAt,
@@ -1704,6 +1709,12 @@ export class ChatSocket {
       _modelText: p.displayText && p.displayText !== p.text ? p.text : undefined,
       _routing: { ...routing },
     });
+    // 生成占位卡（需求 C）：imageEdit 提交紧随乐观 user 行注入一条**本地专属**占位行
+    // （role 'system' 客户端域，空文本），jobId = clientJobId。生成期间 MessageList 拦截
+    // 渲染 GeneratingPlaceholderCard；本会话 turn final 由 reducer 按 jobId 消解（结果图作为
+    // assistant 消息原位渲染），turn error 转 failed。**不持久化**（toStored 显式剥离）、不进
+    // server 历史 → 重开会话不留孤儿卡（reducer 回放路径无此行）。
+    this.ensureGenPlaceholder(sess, p.imageEdit, false);
     // 跨设备持久化用户消息:行确保存在后,带本地 client id POST 给 master(getSession 回带同
     // id → 合并天然去重,不与本地乐观 user 重复)。best-effort:失败不影响发送(本地 + IndexedDB
     // 仍在);容器回传的 server-authored 助手消息走另一条链。
@@ -1774,6 +1785,35 @@ export class ChatSocket {
    * sendMessage / retryMessage 共用的**单一发送收口**：据 ws 就绪与队列情况选路，回填 userMsg
    * 状态（sent/queued/error），成功则起新 turn（计时 + 计费归因复位 + arm thinking-safety）。
    */
+  /**
+   * 生成占位卡（需求 C）注入/重置。imageEdit 提交/重试按 clientJobId 承载一条**本地专属**
+   * 占位行（role 'system'、空文本、toStored 剥离不持久化）。
+   *  - `reuse=false`（首发）：恒新注入一条运行中占位（紧随乐观 user 行）。
+   *  - `reuse=true`（重试，复用同 clientJobId）：把上次失败的同 job 占位**原地重置**回 running
+   *    （无则新注入，如重开后占位已被剥离）——避免重试成功后残留旧失败卡、且重试期正常显示生成中。
+   * aspect = targetAspect（outpaint）或源图 width/height 比值（annotated），无则 1:1。
+   */
+  private ensureGenPlaceholder(
+    sess: ChatSession,
+    imageEdit: NonNullable<InboundMessage["content"]>["imageEdit"] | undefined,
+    reuse: boolean,
+  ): void {
+    if (!imageEdit) return;
+    // aspect 优先 targetAspect（outpaint 五枚举）,否则源图 width/height 比值（annotated）。
+    const aspect: number | string =
+      imageEdit.targetAspect ??
+      (imageEdit.width > 0 && imageEdit.height > 0 ? imageEdit.width / imageEdit.height : 1);
+    const gp = { jobId: imageEdit.clientJobId, aspect, status: "running" as const, startedAt: Date.now() };
+    if (reuse) {
+      const existing = sess.messages.find((m) => m._genPlaceholder?.jobId === imageEdit.clientJobId);
+      if (existing) {
+        existing._genPlaceholder = gp;
+        return;
+      }
+    }
+    addMessage(sess, "system", "", { _genPlaceholder: gp });
+  }
+
   private dispatchPayload(sess: ChatSession, userMsg: ChatMessage, payload: InboundMessage): void {
     this.clearTransientNotice(sess.id); // 新一轮发送：清上一轮遗留的 transient 软提示
     sess._streamingAssistant = null;
@@ -1862,6 +1902,8 @@ export class ChatSocket {
       ts: Date.now(),
     };
     userMsg.status = "sending"; // 立即回显；dispatchPayload 据结果改 sent/queued/error
+    // 生成占位卡（需求 C）：imageEdit 重试复用同 clientJobId → 重置上次失败的占位回 running。
+    this.ensureGenPlaceholder(sess, userMsg._imageEdit, true);
     this.dispatchPayload(sess, userMsg, payload);
   }
 
