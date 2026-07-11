@@ -173,6 +173,19 @@ function normalizeAudience(a: CredentialAudiencePolicyT): CredentialAudiencePoli
 
 // ─── request 校验(transform 前;pathTemplate 深层安全) ──────────────────────
 
+/** 静态请求头:名字禁保留头(authorization/host/content-type)+ 名/值禁 CRLF/控制符。 */
+const STATIC_HEADER_RESERVED: ReadonlySet<string> = new Set(['authorization', 'host', 'content-type'])
+function validateStaticHeaders(headers: Record<string, string> | undefined): void {
+  if (headers === undefined) return
+  for (const [name, value] of Object.entries(headers)) {
+    if (STATIC_HEADER_RESERVED.has(name.toLowerCase()))
+      throw new ConnectorSpecError('RESERVED_HEADER', `static header '${name}' is reserved`)
+    // biome-ignore lint/suspicious/noControlCharactersInRegex: block CRLF/control in header value
+    if (/[\x00-\x1f\x7f]/.test(value))
+      throw new ConnectorSpecError('BAD_PLACEMENT', `static header '${name}' value has control char`)
+  }
+}
+
 /** identity 的 JSON pointer(指向 probe 结果):以 / 开头、无控制符、段不得为污染键。 */
 function assertResultPointer(ptr: string): void {
   if (!ptr.startsWith('/'))
@@ -470,6 +483,7 @@ export function compileSpec(rawSpec: unknown, securityDecision: unknown): Compil
         throw new ConnectorSpecError('BUILTIN_NOT_ALLOWED', `builtin '${b}' not in allowlist`)
     }
     validatePath(a.request.pathTemplate, a.params)
+    validateStaticHeaders(a.request.staticHeaders)
     // usesSlot 必须存在 + api audience + 该 slot 的 authMode 与 connector authMode 一致(§3.4,P1-5④)。
     if (a.usesSlot !== undefined) {
       const node = slotById.get(a.usesSlot)

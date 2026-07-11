@@ -347,6 +347,30 @@ describe('compileSpec', () => {
     }
   })
 
+  test('staticHeaders:合法头搬进 ExecAction.request;保留头 → RESERVED_HEADER', () => {
+    const spec = baseSpec()
+    ;(spec.actions as Record<string, unknown>[])[0].request = {
+      method: 'GET',
+      pathTemplate: '/v1/pages',
+      staticHeaders: { 'Notion-Version': '2022-06-28', Accept: 'application/json' },
+    }
+    const { execContract } = compileSpec(spec, baseDecision())
+    assert.deepEqual(execContract.actions[0]!.request.staticHeaders, {
+      'Notion-Version': '2022-06-28',
+      Accept: 'application/json',
+    })
+
+    for (const reserved of ['Authorization', 'Host', 'Content-Type']) {
+      const bad = baseSpec()
+      ;(bad.actions as Record<string, unknown>[])[0].request = {
+        method: 'GET',
+        pathTemplate: '/v1/pages',
+        staticHeaders: { [reserved]: 'x' },
+      }
+      assert.throws(() => compileSpec(bad, baseDecision()), isCode('RESERVED_HEADER'), reserved)
+    }
+  })
+
   test('identity:probeActionId=已声明 read action + pointer 合法 → 通过并签进 contract', () => {
     const spec = baseSpec()
     spec.identity = { probeActionId: 'get_page', accountKeyPointer: '/id', accountHintPointer: '/name' }

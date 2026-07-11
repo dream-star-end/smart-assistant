@@ -121,6 +121,9 @@ export const RequestSpec = Type.Object(
     pathTemplate: PathTemplate,
     query: Type.Optional(Type.Record(QueryName, ParamPointer)),
     bodyTemplate: Type.Optional(TemplateValue),
+    // 静态请求头(非凭据):如 Notion-Version / Accept / X-GitHub-Api-Version。值为可打印 ASCII、
+    // 无 CRLF;名字禁 Authorization/Host/Content-Type(编译器强制,凭据/SSRF/编码保留头不可被覆盖)。
+    staticHeaders: Type.Optional(Type.Record(HeaderName, Type.String({ maxLength: 512 }))),
   },
   strict,
 )

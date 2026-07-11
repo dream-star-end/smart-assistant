@@ -238,6 +238,16 @@ export function buildRequestPlan(
   const targetUrl = composeUrl(origin, path, query)
 
   const headers: Record<string, string> = {}
+  // 静态请求头(非凭据):编译期已禁保留头,运行期再复核保留/CRLF(双保险)。
+  if (req.staticHeaders) {
+    for (const [name, value] of Object.entries(req.staticHeaders)) {
+      const lower = name.toLowerCase()
+      if (lower === 'authorization' || lower === 'host' || lower === 'content-type') continue
+      if (CONTROL_CHARS.test(name) || CONTROL_CHARS.test(value))
+        throw new ConnectorError('BAD_REQUEST', 'control char in static header')
+      headers[name] = value
+    }
+  }
   let body: string | undefined
   const allowsBody = req.method !== 'GET' && req.method !== 'HEAD'
   if (allowsBody && req.bodyTemplate !== undefined) {
