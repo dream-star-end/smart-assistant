@@ -9,6 +9,7 @@ import { describe, test } from 'node:test'
 import {
   buildPublishAgentRequest,
   buildPublishSkillRequest,
+  collectBundleDir,
   resolveLocalGatewayBase,
   resolveMarketplaceEndpoint,
   splitList,
@@ -111,6 +112,106 @@ describe('buildPublishSkillRequest — storefront metadata mapping', () => {
     assert.ok(!('humanMd' in req), 'humanMd should be absent, not undefined')
     assert.deepEqual(req.useCases, ['做一份周报 PPT'])
     assert.deepEqual(req.outcomeExamples, [])
+  })
+})
+
+describe('buildPublishSkillRequest — bundle / benchmark / visibility 透传', () => {
+  const flags = { category: 'daily-tools', 'use-cases': '演示' }
+
+  test('extras 齐备时进请求体;空 files 不进', () => {
+    const req = buildPublishSkillRequest(flags, 'BODY', undefined, {
+      files: [{ path: 'references/a.md', content: 'A' }],
+      benchmark: { withPassRate: 0.9, withoutPassRate: 0.4, cases: 5 },
+      visibility: 'org',
+    })
+    assert.deepEqual(req.files, [{ path: 'references/a.md', content: 'A' }])
+    assert.deepEqual(req.benchmark, { withPassRate: 0.9, withoutPassRate: 0.4, cases: 5 })
+    assert.equal(req.visibility, 'org')
+    const empty = buildPublishSkillRequest(flags, 'BODY', undefined, { files: [] })
+    assert.ok(!('files' in empty), 'files=[] 不应出现在请求体里')
+  })
+
+  test('无 extras → 三个键都缺席(老单文件请求形状不变)', () => {
+    const req = buildPublishSkillRequest(flags, 'BODY', undefined)
+    assert.ok(!('files' in req) && !('benchmark' in req) && !('visibility' in req))
+  })
+})
+
+describe('collectBundleDir — 白名单收集与本地预检', () => {
+  type Ent = { name: string; isDirectory(): boolean; isFile(): boolean }
+  const d = (name: string): Ent => ({ name, isDirectory: () => true, isFile: () => false })
+  const f = (name: string): Ent => ({ name, isDirectory: () => false, isFile: () => true })
+  /** tree: 目录绝对路径 → 目录项;files: 文件绝对路径 → 内容。 */
+  function fakeFs(tree: Record<string, Ent[]>, files: Record<string, string>) {
+    const readDir = (p: string): Ent[] => {
+      const v = tree[p]
+      if (!v) throw new Error(`ENOENT ${p}`)
+      return v
+    }
+    const readFile = ((p: string) => {
+      const v = files[p]
+      if (v === undefined) throw new Error(`ENOENT ${p}`)
+      return v
+    }) as any
+    return { readDir, readFile }
+  }
+
+  test('只收白名单子目录,按路径排序,支持一层子目录', () => {
+    const { readDir, readFile } = fakeFs(
+      {
+        '/skill/references': [f('b.md'), d('sub'), f('a.md')],
+        '/skill/references/sub': [f('c.md')],
+        '/skill/evals': [f('evals.json')],
+      },
+      {
+        '/skill/references/a.md': 'A',
+        '/skill/references/b.md': 'B',
+        '/skill/references/sub/c.md': 'C',
+        '/skill/evals/evals.json': '{}',
+      },
+    )
+    const r = collectBundleDir('/skill', readDir, readFile)
+    assert.deepEqual(r.errors, [])
+    assert.deepEqual(
+      r.files.map((x) => x.path),
+      ['evals/evals.json', 'references/a.md', 'references/b.md', 'references/sub/c.md'],
+    )
+  })
+
+  test('空目录 / 超限逐条报错,一次说清', () => {
+    const empty = collectBundleDir('/nothing', () => {
+      throw new Error('ENOENT')
+    })
+    assert.equal(empty.files.length, 0)
+    assert.equal(empty.errors.length, 1)
+    assert.match(empty.errors[0], /没有可发布的附属文件/)
+
+    const { readDir, readFile } = fakeFs(
+      { '/skill/assets': [f('big.txt'), d('x')], '/skill/assets/x': [f('deep.md')] },
+      { '/skill/assets/big.txt': 'x'.repeat(64 * 1024 + 1), '/skill/assets/x/deep.md': 'ok' },
+    )
+    const r = collectBundleDir('/skill', readDir, readFile)
+    assert.equal(r.errors.length, 1)
+    assert.match(r.errors[0], /超过单文件上限 64KB/)
+    // 超限文件被剔除,合法文件保留 —— 报错后不发请求,由调用方 fail
+    assert.deepEqual(
+      r.files.map((x) => x.path),
+      ['assets/x/deep.md'],
+    )
+  })
+
+  test('三层以上嵌套按路径规则报错(与服务端同一条规则)', () => {
+    const { readDir, readFile } = fakeFs(
+      {
+        '/skill/references': [d('a')],
+        '/skill/references/a': [d('b')],
+        '/skill/references/a/b': [f('c.md')],
+      },
+      { '/skill/references/a/b/c.md': 'C' },
+    )
+    const r = collectBundleDir('/skill', readDir, readFile)
+    assert.equal(r.errors.length, 1)
+    assert.match(r.errors[0], /目录深度/)
   })
 })
 
