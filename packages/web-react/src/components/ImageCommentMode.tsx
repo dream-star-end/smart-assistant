@@ -150,7 +150,9 @@ export function ImageCommentMode({
       mctx.fillStyle = '#000000'
       mctx.fillRect(0, 0, width, height)
       mctx.fillStyle = '#ffffff'
-      const radius = Math.max(20, Math.round(Math.min(width, height) * 0.07))
+      // 锚点掩膜圆半径 = 短边 8%(floor 28px):语义「这个位置附近」的一片可编辑区,
+      // 与 master 侧 enforceMinSelectionBox(短边 8% 下限)同口径,双侧收口防上游 400。
+      const radius = Math.max(28, Math.round(Math.min(width, height) * 0.08))
       for (const a of anchors) {
         mctx.beginPath()
         mctx.arc(a.x * width, a.y * height, radius, 0, Math.PI * 2)

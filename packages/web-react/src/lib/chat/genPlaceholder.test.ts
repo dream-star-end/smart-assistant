@@ -69,6 +69,55 @@ describe("生成占位卡注入（socket.sendMessage）", () => {
     expect(s.messages[phIdx]._genPlaceholder).toMatchObject({ jobId: JOB, status: "running", aspect: 100 / 80 });
   });
 
+  test("占位卡宽高比=源图宽高比,横图横卡不颠倒（§4 回归：评论/编辑/调整大小）", () => {
+    const sock = makeSocket();
+    // 评论/编辑（annotated）：横图源 1536×1024 → aspect=1.5>1（横卡），绝不颠倒成竖长条。
+    sock.sendMessage({
+      sessId: "s1",
+      agentId: "main",
+      text: "评论修改",
+      media: [
+        { kind: "image", url: "/api/media/source.png", hidden: true },
+        { kind: "image", url: "/api/media/mask.png", hidden: true },
+        { kind: "image", url: "/api/media/guide.png" },
+      ],
+      imageEdit: {
+        clientJobId: JOB,
+        mode: "annotated",
+        sourceIndex: 0,
+        maskIndex: 1,
+        guideIndex: 2,
+        width: 1536,
+        height: 1024,
+      },
+    });
+    const gp = sock.sessions.get("s1")!.messages.find((m) => m._genPlaceholder)!._genPlaceholder!;
+    expect(gp.aspect).toBe(1536 / 1024);
+    expect(gp.aspect as number).toBeGreaterThan(1);
+
+    // 调整大小（outpaint）：aspect=目标比例枚举字符串（不取源图 w/h）。
+    sock.sendMessage({
+      sessId: "s2",
+      agentId: "main",
+      text: "调整大小",
+      media: [
+        { kind: "image", url: "/api/media/source.png", hidden: true },
+        { kind: "image", url: "/api/media/guide.png" },
+      ],
+      imageEdit: {
+        clientJobId: JOB2,
+        mode: "outpaint",
+        targetAspect: "16:9",
+        sourceIndex: 0,
+        guideIndex: 1,
+        width: 1024,
+        height: 1536,
+      },
+    });
+    const gp2 = sock.sessions.get("s2")!.messages.find((m) => m._genPlaceholder)!._genPlaceholder!;
+    expect(gp2.aspect).toBe("16:9");
+  });
+
   test("普通文本消息不注入占位行", () => {
     const sock = makeSocket();
     sock.sendMessage({ sessId: "s1", agentId: "main", text: "hi" });

@@ -113,6 +113,32 @@ function targetSize(box: Box): { width: number; height: number; api: string } {
   return targetSizeForRatio(box.width / box.height)
 }
 
+/** 选区最小尺寸防线(v5 图片体验 r4)。一个短边低于图像短边 `minFraction` 的选区 box
+ * 会以其中心为锚扩到该下限(clamp 回图像内)。数字锚点评论合成的小圆掩膜、或任何未来
+ * 调用方送来的过小/退化选区,经裁剪后可能在 gpt-image-2 `/images/edits` 侧被拒(400);
+ * 本防线保证喂给上游的选区几何恒为「良构」——**任何调用方都无法再复现该 400**。
+ * 只放大、只加保留(opaque)边距,不改动用户真正选中的像素 → 合成仍字节保真。 */
+export function enforceMinSelectionBox(
+  box: Box,
+  imageWidth: number,
+  imageHeight: number,
+  minFraction = 0.08,
+): Box {
+  const floor = Math.max(1, Math.round(Math.min(imageWidth, imageHeight) * minFraction))
+  let { left, top, width, height } = box
+  if (width < floor) {
+    const cx = left + width / 2
+    width = Math.min(floor, imageWidth)
+    left = Math.round(Math.min(Math.max(0, cx - width / 2), imageWidth - width))
+  }
+  if (height < floor) {
+    const cy = top + height / 2
+    height = Math.min(floor, imageHeight)
+    top = Math.round(Math.min(Math.max(0, cy - height / 2), imageHeight - height))
+  }
+  return { left, top, width, height }
+}
+
 // ───────────────────────────────────────────────
 // Outpaint(调整画面比例)— v5 图片体验
 // ───────────────────────────────────────────────
@@ -296,18 +322,20 @@ export async function prepareImageEdit(job: ImageEditJob): Promise<{
     throw new Error('source and mask dimensions differ')
   if (meta.width !== job.width || meta.height !== job.height)
     throw new Error('image edit dimensions were tampered with')
-  const target = targetSize(selected.box)
-  const scale = Math.min(target.width / selected.box.width, target.height / selected.box.height)
+  // 选区最小尺寸防线:退化/过小选区扩到图像短边 8% 下限,防上游 400(见 enforceMinSelectionBox)。
+  const box = enforceMinSelectionBox(selected.box, selected.width, selected.height)
+  const target = targetSize(box)
+  const scale = Math.min(target.width / box.width, target.height / box.height)
   const inner = {
-    width: Math.max(1, Math.round(selected.box.width * scale)),
-    height: Math.max(1, Math.round(selected.box.height * scale)),
+    width: Math.max(1, Math.round(box.width * scale)),
+    height: Math.max(1, Math.round(box.height * scale)),
     left: 0,
     top: 0,
   }
   inner.left = Math.floor((target.width - inner.width) / 2)
   inner.top = Math.floor((target.height - inner.height) / 2)
   const image = await sharp(job.sourcePath)
-    .extract(selected.box)
+    .extract(box)
     .resize(target.width, target.height, {
       fit: 'contain',
       background: { r: 255, g: 255, b: 255, alpha: 1 },
@@ -315,7 +343,7 @@ export async function prepareImageEdit(job: ImageEditJob): Promise<{
     .png()
     .toBuffer()
   const selectedRaw = await sharp(job.maskPath)
-    .extract(selected.box)
+    .extract(box)
     .removeAlpha()
     .greyscale()
     .resize(inner.width, inner.height, { fit: 'fill' })
@@ -337,7 +365,7 @@ export async function prepareImageEdit(job: ImageEditJob): Promise<{
   })
     .png()
     .toBuffer()
-  return { image, mask, box: selected.box, target, inner }
+  return { image, mask, box, target, inner }
 }
 
 /** Deterministically place the model output back under the user's mask. The
