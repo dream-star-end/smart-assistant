@@ -172,7 +172,11 @@ export async function readBoundedBody(
       total += value.byteLength
       if (total > maxBytes) {
         await reader.cancel().catch(() => {})
-        throw new ConnectorError('RESULT_TOO_LARGE', `${providerTag} upstream body exceeds cap`)
+        // 2xx 后 body 超限:响应头已到 → post-dispatch,写操作服务端可能已落地 →
+        // maybeDelivered(写路径→unknown 防重复;读/文件下载会忽略该标记,P1#4 Codex R3)。
+        throw markMaybeDelivered(
+          new ConnectorError('RESULT_TOO_LARGE', `${providerTag} upstream body exceeds cap`),
+        )
       }
       chunks.push(value)
     }

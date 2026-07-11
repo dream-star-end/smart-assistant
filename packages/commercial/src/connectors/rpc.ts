@@ -384,9 +384,16 @@ async function handleList(res: ServerResponse, userId: number, pool: Pool): Prom
 
 interface CallBody {
   connectionId: string
-  action: string
+  /** confirm 执行路径不需要(权威=账本行,P0#2 Codex R3);read/propose 必需。 */
+  action?: string
   params?: Record<string, unknown>
   confirmId?: string
+}
+
+/** confirm 执行路径的兜底:确实需要 action 名的路径(read/propose/github)才调此收窄。 */
+function requireBodyAction(action: string | undefined): string {
+  if (action === undefined) throw new ConnectorError('BAD_REQUEST', 'action required')
+  return action
 }
 
 function parseCallBody(raw: unknown): CallBody {
@@ -401,7 +408,14 @@ function parseCallBody(raw: unknown): CallBody {
   ) {
     throw new ConnectorError('BAD_REQUEST', 'connectionId required')
   }
-  if (typeof b.action !== 'string' || !/^[a-z0-9_]{1,64}$/.test(b.action)) {
+  // P0#2(Codex R3):带 confirmId 的执行路径**彻底不依赖 body.action**(权威=账本行),
+  // 故 action 此时可选、漏传/改名不阻断 replay;仅 read/propose(无 confirmId)必须带合法 action。
+  // 若提供了 action 则始终校验格式(防脏输入),但不作为授权依据。
+  if (b.action !== undefined) {
+    if (typeof b.action !== 'string' || !/^[a-z0-9_]{1,64}$/.test(b.action)) {
+      throw new ConnectorError('BAD_REQUEST', 'action invalid')
+    }
+  } else if (b.confirmId === undefined) {
     throw new ConnectorError('BAD_REQUEST', 'action required')
   }
   if (
@@ -418,7 +432,7 @@ function parseCallBody(raw: unknown): CallBody {
   }
   return {
     connectionId: b.connectionId,
-    action: b.action,
+    action: b.action as string | undefined,
     params: b.params as Record<string, unknown> | undefined,
     confirmId: b.confirmId as string | undefined,
   }
@@ -446,7 +460,7 @@ async function handleCall(
 
   // ── github 虚拟连接(只读) ──
   if (body.connectionId === GITHUB_VIRTUAL_CONNECTION_ID) {
-    const decl = requireAction('github', body.action)
+    const decl = requireAction('github', requireBodyAction(body.action))
     if (!decl.readOnly) throw new ConnectorError('ACTION_UNKNOWN', 'github adapter is read-only')
     if (!rt.limiter.check(who.containerId, rt.now())) {
       throw new ConnectorError('RATE_LIMITED', 'per-container window exceeded')
@@ -558,8 +572,8 @@ async function handleCall(
     return
   }
 
-  // ── 读 / 写-propose:需按 registry 校验请求体 action ──
-  const decl = requireAction(row.provider, body.action)
+  // ── 读 / 写-propose:需按 registry 校验请求体 action(此路径无 confirmId,action 必在) ──
+  const decl = requireAction(row.provider, requireBodyAction(body.action))
 
   // ── 读操作:直接执行(不过确认门,§3) ──
   if (decl.readOnly) {

@@ -358,6 +358,14 @@ describe('body 读取阶段断连(P1#4 Codex R2:2xx headers 后 body stream 断�
     const res = new Response(JSON.stringify({ ok: 1 }), { status: 200 })
     assert.deepEqual(await readBoundedJson(res, 4096, 'notion'), { ok: 1 })
   })
+  test('2xx body 超上限 → RESULT_TOO_LARGE + maybeDelivered(写路径→unknown,Codex R3)', async () => {
+    const res = new Response('x'.repeat(5000), { status: 200 })
+    await assert.rejects(
+      readBoundedBody(res, 1024, 'notion'),
+      (e: unknown) =>
+        e instanceof ConnectorError && e.code === 'RESULT_TOO_LARGE' && isMaybeDelivered(e),
+    )
+  })
 })
 
 describe('writeFinalizeStatus(P1#4:Notion/飞书/WebDAV 服务端已收包后断连)', () => {

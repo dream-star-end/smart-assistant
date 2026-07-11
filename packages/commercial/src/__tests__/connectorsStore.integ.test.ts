@@ -1049,6 +1049,39 @@ describe('P0#2 执行按账本行 provider/action 绑定(越权面)', () => {
     })
     assert.equal(replay.env.kind, 'replay')
   })
+
+  test('confirmId 执行**不带 action**也成立(Codex R3:action 漏传不阻断 replay/执行)', async (t) => {
+    if (skipIfNoDb(t)) return
+    const uid = await mkUser()
+    const conn = await mkFeishuConnection(uid, 'union-noaction', Date.now() + 3_600_000)
+    const redis = makeFakeRedis()
+    const handler = makeConnectorsRpcHandler({
+      identityRepo: okIdentityRepo(uid),
+      pool: getPool(),
+      redis,
+      fetchImpl: feishuOkFetch(),
+      log: () => {},
+    })
+    const prop = await callRpc(handler, {
+      connectionId: conn.id,
+      action: 'create_calendar_event',
+      params: {
+        calendarId: 'cal-1',
+        summary: '会',
+        startTime: '2026-07-12T10:00:00Z',
+        endTime: '2026-07-12T11:00:00Z',
+      },
+    })
+    const id = prop.env.id as string
+    await approveConfirmation(id, uid)
+    // 执行只带 confirmId,不带 action → 账本权威,正常执行
+    const exec = await callRpc(handler, { connectionId: conn.id, confirmId: id })
+    assert.equal(exec.env.kind, 'result')
+    assert.equal((await getLedgerRow(id, uid))!.status, 'succeeded')
+    // 再次不带 action → replay(不因缺 action 报 BAD_REQUEST)
+    const replay = await callRpc(handler, { connectionId: conn.id, confirmId: id })
+    assert.equal(replay.env.kind, 'replay')
+  })
 })
 
 describe('P1#5 send 日上限扣在 execute 而非 propose', () => {
