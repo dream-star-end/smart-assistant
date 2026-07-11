@@ -40,15 +40,20 @@ describe("auditRedact — 中央脱敏钩子", () => {
     assert.deepEqual(out.password, { __redacted: true, len: 5 });
   });
 
-  test("复数 tokens(max_tokens/input_tokens)是计数字段,不脱敏", () => {
+  test("计数字段防误伤按值类型:number/boolean 不脱;复数凭据名(access_tokens 数组)照脱", () => {
     const out = redactSensitive({
       max_tokens: 4096,
       input_tokens: 123,
+      token_stream: true,
       access_token: "secret-value-here",
+      access_tokens: ["secret-a", "secret-b"],
     }) as Record<string, unknown>;
     assert.equal(out.max_tokens, 4096);
     assert.equal(out.input_tokens, 123);
+    assert.equal(out.token_stream, true);
     assert.deepEqual(out.access_token, { __redacted: true, len: 17, last4: "here" });
+    // Codex R1 MAJOR#3:复数凭据集合绝不能被 lookahead 放过
+    assert.deepEqual(out.access_tokens, { __redacted: true });
   });
 
   test("嵌套对象与数组内的敏感 key 也被脱敏;敏感 key 下的对象整体替换", () => {
@@ -63,10 +68,19 @@ describe("auditRedact — 中央脱敏钩子", () => {
     assert.deepEqual(out.credentials, { __redacted: true });
   });
 
-  test("调用点已自行脱敏的形状({set,len,last4})不二次包裹", () => {
+  test("调用点已自行脱敏的形状({set,len,last4})不二次包裹;冒充形状(字段类型不符)不予信任", () => {
     const already = { set: true, len: 40, last4: "ab12" };
     const out = redactSensitive({ token: already }) as Record<string, unknown>;
     assert.deepEqual(out.token, already);
+    // Codex R1 MAJOR#3:{masked:"<raw>"} / {last4:"<raw>"} 带明文冒充 → 整体照脱
+    const out2 = redactSensitive({
+      token: { masked: "raw-secret-here" },
+      secret: { last4: "raw-secret-here" },
+      api_key: { __redacted: true },
+    }) as Record<string, unknown>;
+    assert.deepEqual(out2.token, { __redacted: true });
+    assert.deepEqual(out2.secret, { __redacted: true });
+    assert.deepEqual(out2.api_key, { __redacted: true });
   });
 
   test("null/undefined 值原样;标量原样;深度帽生效不炸栈", () => {
@@ -81,9 +95,9 @@ describe("auditRedact — 中央脱敏钩子", () => {
     assert.ok(JSON.stringify(capped).includes("depth-capped"));
   });
 
-  test("SENSITIVE_KEY_RE 语料回归:该中的中,不该中的不中", () => {
-    const hit = ["bot_token", "access_token", "API_KEY", "clientSecret", "authorization", "cookie", "signing-key", "passwd"];
-    const miss = ["max_tokens", "output_tokens", "tokens_per_credit", "label", "key_metrics", "monkey"];
+  test("SENSITIVE_KEY_RE 语料回归(RE 只管 key 候选,计数字段由值类型层放行)", () => {
+    const hit = ["bot_token", "access_token", "access_tokens", "refresh_tokens", "API_KEY", "clientSecret", "authorization", "cookie", "signing-key", "passwd", "max_tokens"];
+    const miss = ["label", "key_metrics", "monkey", "delta", "memo"];
     for (const k of hit) assert.ok(SENSITIVE_KEY_RE.test(k), `expect hit: ${k}`);
     for (const k of miss) assert.ok(!SENSITIVE_KEY_RE.test(k), `expect miss: ${k}`);
   });
@@ -159,7 +173,7 @@ describe("writeAdminAudit — 写入口校验与脱敏(stub runner,无 DB)", () 
     const [, , , beforeJson, afterJson] = r.calls[0].params as [unknown, unknown, unknown, string, string];
     assert.ok(!beforeJson.includes("0123456789abcdef"), "before 明文泄露");
     assert.ok(!afterJson.includes("fedcba9876543210"), "after 明文泄露");
-    assert.ok(afterJson.includes('"max_tokens":100'), "非敏感字段不得误伤");
+    assert.ok(afterJson.includes('"max_tokens":100'), "计数字段不得误伤(值类型放行)");
     assert.ok(beforeJson.includes('"__redacted":true'));
   });
 });

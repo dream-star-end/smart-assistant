@@ -13,6 +13,9 @@
 --   runner 自带 BEGIN/COMMIT + schema_migrations 记账,本文件不写事务控制。
 --   本迁移会 DELETE compute_host_audit 存量心跳行(≈14 万行)——一次性,数据无审计
 --   价值(纯周期遥测,快照态已在 compute_hosts 列上),回收 ≈120MB。
+--   ⚠ 在线切换尾扫(Codex R1 MAJOR#1):apply 到 master 重启换新 binary 之间的窗口,
+--   旧代码仍会写 blocked_route_bypass / credits.adjust 旧格式行;部署完成后必须跑一次
+--   scripts/v5-audit-backfill-sweep.sql(同语义幂等尾扫)收残行。
 
 -- ── 1. security_events:系统安全事件流 ─────────────────────────────────
 -- actor_user_id 不加 FK:安全事件的触发者可能是已删除用户/未认证请求,事件作为

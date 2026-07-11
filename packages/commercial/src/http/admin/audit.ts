@@ -152,7 +152,14 @@ export async function handleAdminTraceLookup(
 ): Promise<void> {
   await requireAdmin(req, deps.jwtSecret);
   const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "x.invalid"}`);
-  const traceId = decodeURIComponent(url.pathname.slice("/api/admin/trace/".length));
+  let traceId: string;
+  try {
+    // Codex R1 MINOR#1:畸形编码(如 /trace/%)会让 decodeURIComponent 抛 URIError
+    // → 500;收敛为输入校验 400。
+    traceId = decodeURIComponent(url.pathname.slice("/api/admin/trace/".length));
+  } catch {
+    throw new HttpError(400, "VALIDATION", "invalid trace id");
+  }
   if (!TRACE_ID_RE.test(traceId)) {
     throw new HttpError(400, "VALIDATION", "invalid trace id");
   }

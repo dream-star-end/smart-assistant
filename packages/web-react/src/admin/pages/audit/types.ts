@@ -29,7 +29,8 @@ export const SECURITY_EVENT_TYPE_LABELS: Record<string, string> = {
 // ─── 主机审计（GET /api/admin/host-audit） ──────────────────────────
 // 注意：驼峰字段（与 compute-pool/audit.ts 直传对齐），ts 是 ISO 字符串。
 export interface HostAuditRow {
-  id: number;
+  /** BIGSERIAL 主键,后端保持 string(Number 超 2^53 丢精度,Codex R1 MINOR#2)。 */
+  id: string;
   hostId: string | null;
   operation: string;
   operationId: string | null;

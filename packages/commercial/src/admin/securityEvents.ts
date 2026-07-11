@@ -13,11 +13,15 @@
  *     理由之一:系统事件量大但时效有限,人类操作少而必须永久可追溯。
  *
  * 写入为 best-effort(fire-and-forget at caller):安全事件记录失败不该拖垮
- * 业务请求路径;失败走 stderr + Prometheus(复用 admin_audit 写失败计数器语义,
- * 独立 label)。
+ * 业务请求路径;但失败必须响亮(Codex R1 MAJOR#2):critical 告警(与改造前
+ * blocked_route_bypass 走 writeAdminAudit 失败的告警等级一致)+ Prometheus
+ * security_event_write_failures_total{type} + stderr 三路上报。
  */
 
 import { query } from "../db/queries.js";
+import { safeEnqueueAlert } from "./alertOutbox.js";
+import { EVENTS } from "./alertEvents.js";
+import { incrSecurityEventWriteFailure } from "./metrics.js";
 
 /** 事件类型注册:新增安全事件先在这里登记(与 auditActions 同一治理思路)。 */
 export const SECURITY_EVENT_TYPES = {
@@ -39,8 +43,8 @@ export interface WriteSecurityEventInput {
 }
 
 /**
- * 写一条安全事件。**不抛错**(内部 catch → stderr):调用点一律视为 fire-and-forget,
- * 不需要再 .catch()。
+ * 写一条安全事件。**不抛错**(内部 catch → 告警+计数+stderr 三路上报):
+ * 调用点一律视为 fire-and-forget,不需要再 .catch()。
  */
 export async function writeSecurityEvent(input: WriteSecurityEventInput): Promise<void> {
   if (!Object.prototype.hasOwnProperty.call(SECURITY_EVENT_TYPES, input.type)) {
@@ -64,10 +68,19 @@ export async function writeSecurityEvent(input: WriteSecurityEventInput): Promis
       ],
     );
   } catch (err) {
-    console.error(
-      `[securityEvents] write failed type=${input.type}:`,
-      err instanceof Error ? err.message : err,
-    );
+    // Codex R1 MAJOR#2:失败必须响亮——改造前该事件走 writeAdminAudit,失败有
+    // critical 告警;迁到本表后保持同等级。三路上报:告警+Prometheus+stderr。
+    const msg = err instanceof Error ? err.message : String(err);
+    incrSecurityEventWriteFailure(input.type);
+    safeEnqueueAlert({
+      event_type: EVENTS.SECURITY_EVENT_WRITE_FAILED,
+      severity: "critical",
+      title: "security_events 写入失败",
+      body: `type=\`${input.type}\` target=\`${input.target ?? "-"}\` 安全事件写入抛错(fire-and-forget,业务未受影响,但安全留痕丢失)。\n\nerror: ${msg.slice(0, 300)}`,
+      payload: { type: input.type, target: input.target ?? null, error: msg.slice(0, 500) },
+      dedupe_key: `security.security_event_write_failed:${input.type}:${new Date().toISOString().slice(0, 16)}`,
+    });
+    console.error(`[securityEvents] write failed type=${input.type}:`, msg);
   }
 }
 

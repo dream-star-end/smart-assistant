@@ -275,6 +275,16 @@ export const adminAuditWriteFailures = new Counter({
 });
 
 /**
+ * 安全事件(security_events,0129)写失败计数。writeSecurityEvent 是 fire-and-forget,
+ * 失败不冒泡——这条 counter + critical 告警是它唯一的可观测面,运维 alert 必挂。
+ */
+export const securityEventWriteFailures = new Counter({
+  name: "security_event_write_failures_total",
+  help: "Failed security_events writes (fire-and-forget path)",
+  labelNames: ["type"],
+});
+
+/**
  * preCheck reservation 被 cap 到余额的次数(per model)。
  *
  * 2026-04-26 v1.0.3:preCheck 改为允许 drain-to-zero 后,余额 < 估算 cost
@@ -306,6 +316,10 @@ export function incrClaudeApi(accountId: bigint | number | string | null, status
 
 export function incrAdminAuditWriteFailure(action: string): void {
   adminAuditWriteFailures.inc({ action });
+}
+
+export function incrSecurityEventWriteFailure(type: string): void {
+  securityEventWriteFailures.inc({ type });
 }
 
 /**
@@ -672,6 +686,7 @@ export async function renderPrometheus(deps: CollectDeps = {}): Promise<string> 
   billingDebits.render(out);
   claudeApiRequests.render(out);
   adminAuditWriteFailures.render(out);
+  securityEventWriteFailures.render(out);
   precheckCappedTotal.render(out);
   // V3 2I-2 新增系列
   anthropicProxyTtft.render(out);

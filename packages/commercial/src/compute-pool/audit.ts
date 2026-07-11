@@ -78,6 +78,11 @@ export interface AuditEvent {
   ts: string;
 }
 
+/** 全量浏览面的行视图:id 保持 string(BIGSERIAL 超 2^53 后 Number 丢精度)。 */
+export interface AuditEventView extends Omit<AuditEvent, "id"> {
+  id: string;
+}
+
 /**
  * 全量 list(admin 审计页「主机审计」Tab,整改批新增):可选按 host 过滤,
  * keyset(id < before)分页。此前 compute_host_audit 只在 host 详情弹窗露 20 条,
@@ -88,7 +93,7 @@ export async function listAuditEvents(
     query: (sql: string, params: unknown[]) => Promise<{ rows: unknown[] }>;
   },
   opts: { hostId?: string; before?: string; limit?: number } = {},
-): Promise<{ rows: AuditEvent[]; next_before: string | null }> {
+): Promise<{ rows: AuditEventView[]; next_before: string | null }> {
   let limit = opts.limit ?? 50;
   if (!Number.isInteger(limit) || limit <= 0) limit = 50;
   if (limit > 200) limit = 200;
@@ -122,8 +127,10 @@ export async function listAuditEvents(
     actor: string;
     ts: Date;
   }>; };
+  // Codex R1 MINOR#2:BIGSERIAL 主键保持 string(Number 超 2^53 丢精度会错 key/游标;
+  // 与相邻 admin_audit/security_events 列表口径一致)。
   const rows = r.rows.map((row) => ({
-    id: Number(row.id),
+    id: String(row.id),
     hostId: row.host_id,
     operation: row.operation,
     operationId: row.operation_id,
@@ -134,7 +141,7 @@ export async function listAuditEvents(
   }));
   return {
     rows,
-    next_before: rows.length === limit ? String(rows[rows.length - 1].id) : null,
+    next_before: rows.length === limit ? rows[rows.length - 1].id : null,
   };
 }
 
