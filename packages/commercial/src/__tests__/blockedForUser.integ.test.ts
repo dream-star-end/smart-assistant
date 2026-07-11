@@ -23,6 +23,7 @@ import { AddressInfo } from "node:net";
 import { createPool, closePool, setPoolOverride, resetPool } from "../db/index.js";
 import { query } from "../db/queries.js";
 import { runMigrations } from "../db/migrate.js";
+import { resetTestSchemaForTest } from "./helpers/db.js";
 import { signAccess } from "../auth/jwt.js";
 import { createCommercialHandler } from "../http/router.js";
 import type { Mailer, MailMessage } from "../auth/mail.js";
@@ -90,7 +91,8 @@ before(async () => {
   await resetPool();
   const pool = createPool({ connectionString: TEST_DB_URL, max: 10 });
   setPoolOverride(pool);
-  await query(`DROP TABLE IF EXISTS ${COMMERCIAL_TABLES.join(", ")} CASCADE`);
+  // schema 级重置替代手工表清单 DROP(清单漂移=新迁移表撞 already exists,见 helpers/db.ts)。
+  await resetTestSchemaForTest();
   await runMigrations();
 
   redis = await probeRedis();
@@ -383,43 +385,49 @@ describe("BLOCKED_FOR_USER_RULES — admin double-check", () => {
     assert.match(String(parsed.error?.message ?? ""), /not found/);
   });
 
-  test("admin bypass 成功 → admin_audit 写一条 blocked_route_bypass", async (t) => {
+  test("admin bypass 成功 → security_events 写一条 route_bypass(整改批:语义三分层)", async (t) => {
     if (skipIfNoHttp(t)) return;
     const uid = await createUser(`audit${Date.now()}@x.com`, "admin", "active");
     const tok = await tokenFor(uid, "admin");
-    // 拿不同的 endpoint label 做断言 —— 覆盖几个新增规则,审计 target 里能看到具体路径+方法
+    // 拿不同的 endpoint label 做断言 —— 覆盖几个新增规则,事件 target 里能看到具体路径+方法
     const r = await fetchWith("/api/sessions/unclaimed", "GET", tok);
     assert.equal(r.status, 404); // admin bypass → gateway mock 返 FALLTHROUGH 404
     assert.equal(r.text, FALLTHROUGH_MARKER);
 
-    // writeAdminAudit 是 best-effort 异步(不 await),给它一点时间刷盘
+    // writeSecurityEvent 是 fire-and-forget 异步(不 await),给它一点时间刷盘
     await new Promise((r) => setTimeout(r, 120));
 
-    const audit = await query<{
-      admin_id: string;
-      action: string;
+    const ev = await query<{
+      actor_user_id: string;
+      type: string;
       target: string;
-      after: { path: string } | null;
+      detail: { path: string } | null;
     }>(
-      "SELECT admin_id::text AS admin_id, action, target, after FROM admin_audit WHERE admin_id=$1 AND action=$2 ORDER BY id DESC LIMIT 1",
-      [uid.toString(), "blocked_route_bypass"],
+      "SELECT actor_user_id::text AS actor_user_id, type, target, detail FROM security_events WHERE actor_user_id=$1 AND type=$2 ORDER BY id DESC LIMIT 1",
+      [uid.toString(), "route_bypass"],
     );
-    assert.equal(audit.rows.length, 1, "must have written exactly one audit row");
-    const row = audit.rows[0];
-    assert.equal(row.action, "blocked_route_bypass");
+    assert.equal(ev.rows.length, 1, "must have written exactly one security event row");
+    const row = ev.rows[0];
+    assert.equal(row.type, "route_bypass");
     assert.equal(row.target, "GET /api/sessions/(unclaimed|claim)");
-    assert.deepStrictEqual(row.after, { path: "/api/sessions/unclaimed" });
+    assert.deepStrictEqual(row.detail, { path: "/api/sessions/unclaimed" });
+
+    // 反断言:不再污染 admin_audit(整改前 blocked_route_bypass 占全表 79%)
+    const audit = await query<{ n: string }>(
+      "SELECT COUNT(*)::text AS n FROM admin_audit WHERE admin_id=$1",
+      [uid.toString()],
+    );
+    assert.equal(audit.rows[0].n, "0");
   });
 
   test("admin bypass 审计写失败 → fall through 仍然发生(best-effort 不阻塞)", async (t) => {
     if (skipIfNoHttp(t)) return;
     const uid = await createUser(`auditfail${Date.now()}@x.com`, "admin", "active");
     const tok = await tokenFor(uid, "admin");
-    // 触发 writeAdminAudit 抛错:DROP admin_audit 表让 INSERT 抛 undefined_table。
-    // writeAdminAudit 是 fire-and-forget + .catch(warn),handler 不 await,fall through 不受影响。
-    // finally 直接用 0006 migration 里的 DDL 手工复建(不动 schema_migrations,避免和 runMigrations
-    // 里 rate_limit_events 表已存在冲突)。
-    await query("DROP TABLE IF EXISTS admin_audit CASCADE");
+    // 触发 writeSecurityEvent 抛错:DROP security_events 表让 INSERT 抛 undefined_table。
+    // writeSecurityEvent 内部 catch(stderr),handler 不 await,fall through 不受影响。
+    // finally 直接用 0129 migration 里的 DDL 手工复建(不动 schema_migrations)。
+    await query("DROP TABLE IF EXISTS security_events CASCADE");
     try {
       const r = await fetchWith("/v1/chat/completions", "POST", tok, { messages: [] });
       // admin bypass 照常 fall through,测试 mock server 回 404 + marker
@@ -429,22 +437,19 @@ describe("BLOCKED_FOR_USER_RULES — admin double-check", () => {
       await new Promise((r) => setTimeout(r, 100));
     } finally {
       await query(
-        `CREATE TABLE admin_audit (
-           id         BIGSERIAL PRIMARY KEY,
-           admin_id   BIGINT NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
-           action     TEXT NOT NULL,
-           target     TEXT,
-           before     JSONB,
-           after      JSONB,
-           ip         INET,
-           user_agent TEXT,
-           created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        `CREATE TABLE security_events (
+           id            BIGSERIAL PRIMARY KEY,
+           type          TEXT NOT NULL,
+           actor_user_id BIGINT,
+           target        TEXT,
+           detail        JSONB NOT NULL DEFAULT '{}'::jsonb,
+           ip            INET,
+           user_agent    TEXT,
+           created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
          )`,
       );
-      await query("CREATE INDEX idx_aa_admin_admin_time ON admin_audit(admin_id, created_at DESC)");
-      await query("CREATE INDEX idx_aa_admin_action_time ON admin_audit(action, created_at DESC)");
-      await query("CREATE RULE aa_admin_no_update AS ON UPDATE TO admin_audit DO INSTEAD NOTHING");
-      await query("CREATE RULE aa_admin_no_delete AS ON DELETE TO admin_audit DO INSTEAD NOTHING");
+      await query("CREATE INDEX idx_se_type_id ON security_events(type, id DESC)");
+      await query("CREATE INDEX idx_se_created ON security_events(created_at)");
     }
   });
 });

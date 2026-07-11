@@ -18,8 +18,7 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { HttpError, sendJson, readJsonBody } from "../util.js";
 import { requireAdmin, requireAdminVerifyDb } from "../../admin/requireAdmin.js";
-import { writeAdminAudit } from "../../admin/audit.js";
-import { getPool } from "../../db/index.js";
+import { writeAdminAuditBestEffort } from "../../admin/audit.js";
 import type { CommercialHttpDeps, RequestContext } from "../handlers.js";
 import {
   parsePositiveInt,
@@ -102,25 +101,22 @@ export async function handleAdminCreateInbox(
     }
     throw err;
   }
-  // best-effort audit —— after 不带 body_md / 不带 email_summary 明细(jobs 表本身就是审计源)
-  try {
-    await writeAdminAudit(getPool(), {
-      adminId: admin.id,
-      action: "inbox.create",
-      target: `message:${created.id}`,
-      before: null,
-      after: {
-        ...inboxAuditSnapshot(created),
-        notify_email: created.notify_email,
-        // Plan C:写 audit 时只记 total + 初始 status,后续 worker drain 状态变化不补审计
-        // (按需求"3 不留痕"语义,jobs 表已是完整审计源,不重复)
-        email_initial_total: created.email_summary?.total ?? 0,
-        email_initial_status: created.email_send_status,
-      },
-      ip: ctx.clientIp ?? null,
-      userAgent: ctx.userAgent ?? null,
-    });
-  } catch { /* best-effort */ }
+  // best-effort audit —— after 不带 body_md / 不带 email_summary 明细(jobs 表本身就是审计源)。
+  // 整改批:本地 try/catch{} 吞会漏 Prometheus 计数,收口中央 writeAdminAuditBestEffort。
+  await writeAdminAuditBestEffort(
+    { adminId: admin.id, ip: ctx.clientIp, userAgent: ctx.userAgent },
+    "inbox.create",
+    `message:${created.id}`,
+    null,
+    {
+      ...inboxAuditSnapshot(created),
+      notify_email: created.notify_email,
+      // Plan C:写 audit 时只记 total + 初始 status,后续 worker drain 状态变化不补审计
+      // (按需求"3 不留痕"语义,jobs 表已是完整审计源,不重复)
+      email_initial_total: created.email_summary?.total ?? 0,
+      email_initial_status: created.email_send_status,
+    },
+  );
   sendJson(res, 201, {
     message: {
       ...serializeAdminInboxMessage(created),
@@ -193,16 +189,12 @@ export async function handleAdminDeleteInbox(
     }
     throw err;
   }
-  try {
-    await writeAdminAudit(getPool(), {
-      adminId: admin.id,
-      action: "inbox.delete",
-      target: `message:${deleted.id}`,
-      before: inboxAuditSnapshot(deleted),
-      after: null,
-      ip: ctx.clientIp ?? null,
-      userAgent: ctx.userAgent ?? null,
-    });
-  } catch { /* best-effort */ }
+  await writeAdminAuditBestEffort(
+    { adminId: admin.id, ip: ctx.clientIp, userAgent: ctx.userAgent },
+    "inbox.delete",
+    `message:${deleted.id}`,
+    inboxAuditSnapshot(deleted),
+    null,
+  );
   sendJson(res, 200, { deleted: true });
 }

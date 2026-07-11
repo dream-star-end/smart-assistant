@@ -1530,6 +1530,13 @@ export function App() {
               newSession();
               setComposerPrefill({ text: CHAT_CREATE_TEMPLATES[kind], nonce: Date.now() });
             }}
+            onAskAiInChat={(text) => {
+              // AI 导购入口(批3):与 onCreateInChat 同构——关市场 → 新会话 → 预填输入框。
+              // text 已由 lib/marketplace 纯函数拼好(找并装好 / 在对话中试用);不 autoSend。
+              setMarketplaceOpen(false);
+              newSession();
+              setComposerPrefill({ text, nonce: Date.now() });
+            }}
             onTabChange={setMarketplaceTab}
             onClose={() => {
               setMarketplaceOpen(false);

@@ -1,19 +1,21 @@
 import "@testing-library/jest-dom/vitest";
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { ToastProvider, TooltipProvider } from "../../../../components/ui";
 
-// ReviewPanel（被复用组件）依赖用户端 api 网络层 —— 全 mock，只验证 admin 页把
-// adminSession 作为 AuthSession 传入后能干净挂载出审核台 + 下架框。
+// ReviewPanel / FeaturedPanel（被复用组件）依赖用户端 api 网络层 —— 全 mock，只验证
+// admin 页把 adminSession 作为 AuthSession 传入后能干净挂载出两 tab(审核 + 精选管理)。
 const adminMarketplacePending = vi.fn();
 const adminMarketplaceAiReviews = vi.fn();
 const searchMarketplace = vi.fn();
+const setMarketplaceFeatured = vi.fn();
 vi.mock("../../../../lib/api", () => ({
   api: {
     adminMarketplacePending: (...a: unknown[]) => adminMarketplacePending(...a),
     adminMarketplaceAiReviews: (...a: unknown[]) => adminMarketplaceAiReviews(...a),
     searchMarketplace: (...a: unknown[]) => searchMarketplace(...a),
+    setMarketplaceFeatured: (...a: unknown[]) => setMarketplaceFeatured(...a),
   },
 }));
 
@@ -31,11 +33,12 @@ beforeEach(() => {
   adminMarketplacePending.mockReset().mockResolvedValue([]);
   adminMarketplaceAiReviews.mockReset().mockResolvedValue([]);
   searchMarketplace.mockReset().mockResolvedValue({ results: [] });
+  setMarketplaceFeatured.mockReset().mockResolvedValue({ ok: true });
 });
 afterEach(cleanup);
 
 describe("MarketplacePage", () => {
-  test("PageHeader + 复用 ReviewPanel（空待审 + 下架框）", async () => {
+  test("默认「审核」tab:PageHeader + 复用 ReviewPanel（空待审 + 下架框）", async () => {
     renderPage(<MarketplacePage />);
 
     expect(screen.getByText("技能市场")).toBeInTheDocument();
@@ -43,6 +46,14 @@ describe("MarketplacePage", () => {
     // ReviewPanel 内的 AI 审批记录折叠区 + 下架 kill-switch
     expect(screen.getByText("AI 审批记录")).toBeInTheDocument();
     expect(screen.getByText(/下架已上架条目/)).toBeInTheDocument();
+  });
+
+  test("切到「精选管理」tab → 挂载 FeaturedPanel(空目录空态)", async () => {
+    renderPage(<MarketplacePage />);
+    await screen.findByText("暂无待审版本");
+
+    fireEvent.click(screen.getByRole("tab", { name: "精选管理" }));
+    expect(await screen.findByText("市场还没有可精选的条目")).toBeInTheDocument();
   });
 
   test("挂载即用 admin 会话拉取待审队列", async () => {

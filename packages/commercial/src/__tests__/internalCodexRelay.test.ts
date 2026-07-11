@@ -379,6 +379,21 @@ describe('internalCodexRelay official chatgpt upstream(B5)', () => {
     if ('error' in miss) assert.equal(miss.error.code, 'NOT_FOUND')
   })
 
+  test('生图端点放行:POST /images/generations|edits 过白名单,GET 仍拒(boss 07-11 启用原生生图)', () => {
+    for (const suffix of ['/images/generations', '/images/edits']) {
+      const ok = mapCodexRelayUrl(`${CODEX_RELAY_PREFIX}/v1${suffix}`, 'POST', 'https://api.openai.com/v1')
+      assert.ok(!('error' in ok), `POST ${suffix} must be allowed`)
+      if (!('error' in ok)) assert.equal(ok.url, `https://api.openai.com/v1${suffix}`)
+      const get = mapCodexRelayUrl(`${CODEX_RELAY_PREFIX}/v1${suffix}`, 'GET', 'https://api.openai.com/v1')
+      assert.ok('error' in get, `GET ${suffix} must stay blocked`)
+      if ('error' in get) assert.equal(get.error.code, 'PATH_NOT_ALLOWED')
+    }
+    // 变体/子路径不放行(白名单精确匹配,防路径漂移扩大面)。
+    const sub = mapCodexRelayUrl(`${CODEX_RELAY_PREFIX}/v1/images/generations/extra`, 'POST', 'https://api.openai.com/v1')
+    assert.ok('error' in sub)
+    if ('error' in sub) assert.equal(sub.error.code, 'PATH_NOT_ALLOWED')
+  })
+
   test('handler:official 路径按绑定账号 dispatcher 转发 chatgpt.com,容器 Authorization + chatgpt-account-id 透传', async () => {
     const captured: { url?: string; headers?: Headers; dispatcher?: unknown } = {}
     const handler = makeCodexRelayHandler({

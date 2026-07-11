@@ -142,3 +142,52 @@ export function suggestSlug(name: string): string {
     .replace(/^-+|-+$/g, '')
     .slice(0, 64)
 }
+
+// ── AI 导购入口预填（批3） ─────────────────────────────────────────────
+// 不建第二套导购机制:执行体=既有对话 + oc-market,市场页只把用户意图预填进输入框。
+// 纯函数放这里(可单测),关模态/新会话/预填的编排在 App.tsx onAskAiInChat。
+
+/**
+ * 「让 AI 帮我找并装好」的对话预填:把用户在市场里的查询词交给 AI,由 oc-market
+ * 现场对比适配度并在用户确认后安装。**不 autoSend**——预填后发送权仍在用户。
+ */
+export function marketAskAiPrefill(q: string): string {
+  return `我想要:${q}\n请用 oc-market 在技能市场帮我找最适配的技能或智能体,对比它们的分类、适用场景和近期使用情况,给出推荐理由;经我确认后再安装。`
+}
+
+/**
+ * 详情页「在对话中试用」的对话预填:让 AI 安装指定市场技能并给出上手示例。
+ * name 供人读、slug 是安装权威标识,两者都给 AI 以免同名歧义。
+ */
+export function marketTrySkillPrefill(name: string, slug: string): string {
+  return `请帮我安装市场技能「${name}」(slug: ${slug}),装好后告诉我它能帮我做什么、给一个上手示例。`
+}
+
+/**
+ * bundle 是否附带 evals/ 评测用例(审核面「带 evals」中性徽章的判定)。
+ * 供给信号:鼓励发布者随技能附评测;非阻断、不做质量背书(复跑管道是后续债)。
+ */
+export function bundleHasEvals(bundle?: Record<string, string> | null): boolean {
+  if (!bundle) return false
+  return Object.keys(bundle).some((p) => p === 'evals' || p.startsWith('evals/'))
+}
+
+/**
+ * 精选管理列表排序(单一权威):精选项(featuredRank 非空)按 rank 升序在前,
+ * 非精选项按近30天使用人数(users30d)降序在后;同权时以 slug 稳定兜底,保证
+ * 渲染顺序确定(便于测试与用户预期一致)。**不修改入参**(返回新数组)。
+ */
+export function sortFeaturedListings<
+  T extends { slug: string; featuredRank?: number | null; users30d?: number },
+>(cards: T[]): T[] {
+  return [...cards].sort((a, b) => {
+    const ra = a.featuredRank ?? null
+    const rb = b.featuredRank ?? null
+    if (ra != null && rb != null) return ra - rb || a.slug.localeCompare(b.slug)
+    if (ra != null) return -1
+    if (rb != null) return 1
+    const ua = a.users30d ?? 0
+    const ub = b.users30d ?? 0
+    return ub - ua || a.slug.localeCompare(b.slug)
+  })
+}

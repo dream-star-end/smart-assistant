@@ -60,9 +60,10 @@ export const EVENTS = {
   RISK_LOGIN_FAILURE_SPIKE: "risk.login_failure_spike",
   RISK_SILENT_NEW_USER_COHORT: "risk.silent_new_user_cohort",
 
-  // ── 安全(2)────────────────────────────────────────────────
+  // ── 安全(3)────────────────────────────────────────────────
   SECURITY_ADMIN_ROLE_CHANGED: "security.admin_role_changed",
   SECURITY_ADMIN_AUDIT_WRITE_FAILED: "security.admin_audit_write_failed",
+  SECURITY_EVENT_WRITE_FAILED: "security.security_event_write_failed",
 
   // ── 健康(1)────────────────────────────────────────────────
   HEALTH_SMOKE_FAILED: "health.smoke_failed",
@@ -134,6 +135,8 @@ export const EVENT_META: EventMeta[] = [
     description: "admin 角色被提权或降权", trigger: "passive" },
   { event_type: EVENTS.SECURITY_ADMIN_AUDIT_WRITE_FAILED, severity: "critical", group: "security",
     description: "admin_audit 写入失败(可能审计缺漏)", trigger: "passive" },
+  { event_type: EVENTS.SECURITY_EVENT_WRITE_FAILED, severity: "critical", group: "security",
+    description: "security_events 写入失败(安全事件可能丢失,0129 整改批)", trigger: "passive" },
 
   // health
   { event_type: EVENTS.HEALTH_SMOKE_FAILED, severity: "critical", group: "health",

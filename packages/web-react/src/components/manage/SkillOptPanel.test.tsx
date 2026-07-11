@@ -1,9 +1,15 @@
 import "@testing-library/jest-dom/vitest";
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, test, vi } from "vitest";
-import { api } from "../../lib/api";
-import type { AuthSession, SkillDraftDetail, SkillTrainRun } from "../../lib/types";
-import { SkillTrainSection } from "./SkillOptPanel";
+import { ApiError, api } from "../../lib/api";
+import type {
+  AuthSession,
+  SkillDraftDetail,
+  SkillEvalCase,
+  SkillEvalGenJob,
+  SkillTrainRun,
+} from "../../lib/types";
+import { SkillEvalSection, SkillTrainSection } from "./SkillOptPanel";
 
 const auth = {
   getToken: () => "tok",
@@ -86,5 +92,110 @@ describe("SkillTrainSection 训练 run 重入", () => {
     expect(screen.queryByText(/发现一个未处理的训练草稿/)).not.toBeInTheDocument();
     // 未选中 run → 不应触发单 run 轮询。
     expect(getRun).not.toHaveBeenCalled();
+  });
+});
+
+// ── AI 生成评测用例(SkillEvalSection) ───────────────────────────────────────
+
+/** getSkillEvals 响应桩(带精确类型,保证 version:1 字面量校验)。 */
+function evalsResp(cases: SkillEvalCase[]): Awaited<ReturnType<typeof api.getSkillEvals>> {
+  return {
+    writable: true,
+    evals: cases.length ? { version: 1, cases } : null,
+    lastRun: null,
+  };
+}
+
+describe("SkillEvalSection AI 生成用例", () => {
+  test("空用例态:主按钮 → 确认 → 轮询 done → 草稿灌入编辑器(dirty)+ 提示条", async () => {
+    vi.spyOn(api, "getSkillEvals").mockResolvedValue(evalsResp([]));
+    const gen = vi.spyOn(api, "generateSkillEvals").mockResolvedValue({ ok: true, runId: "g1" });
+    vi.spyOn(api, "getSkillEvalGen").mockResolvedValue({
+      status: "done",
+      cases: [{ id: "gen-1", prompt: "把中文摘要翻译成英文", assertions: ["输出为英文"] }],
+    } satisfies SkillEvalGenJob);
+
+    render(<SkillEvalSection auth={auth} skillName="academic-translate" rates={null} />);
+
+    // 空态显眼主按钮存在,点击弹成本确认,确认后调 POST。
+    fireEvent.click(await screen.findByRole("button", { name: /AI 生成用例/ }));
+    fireEvent.click(await screen.findByRole("button", { name: /接受消耗/ }));
+    await waitFor(() => expect(gen).toHaveBeenCalledWith(auth, "academic-translate"));
+
+    // 草稿灌进现有编辑器 → prompt 出现在文本域;提示条出现;保存用例可用(dirty)。
+    expect(await screen.findByDisplayValue("把中文摘要翻译成英文")).toBeInTheDocument();
+    expect(screen.getByText("AI 草稿已生成,请审阅修改后保存")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /保存用例/ })).toBeEnabled();
+  });
+
+  test("已有用例态:次级「补充生成」→ 追加到现有用例;不显示空态主按钮", async () => {
+    vi.spyOn(api, "getSkillEvals").mockResolvedValue(
+      evalsResp([{ id: "case-1", prompt: "已有任务", assertions: ["断言"] }]),
+    );
+    const gen = vi.spyOn(api, "generateSkillEvals").mockResolvedValue({ ok: true, runId: "g2" });
+    vi.spyOn(api, "getSkillEvalGen").mockResolvedValue({
+      status: "done",
+      cases: [{ id: "gen-1", prompt: "补充任务", assertions: ["新断言"] }],
+    } satisfies SkillEvalGenJob);
+
+    render(<SkillEvalSection auth={auth} skillName="s" rates={null} />);
+
+    // 有用例态:出现「补充生成」次级按钮,且没有空态主按钮(精确名不命中)。
+    fireEvent.click(await screen.findByRole("button", { name: /补充生成/ }));
+    expect(screen.queryByRole("button", { name: "AI 生成用例" })).not.toBeInTheDocument();
+    fireEvent.click(await screen.findByRole("button", { name: /接受消耗/ }));
+    await waitFor(() => expect(gen).toHaveBeenCalled());
+
+    // 追加:原有 + 新草稿都在编辑器里。
+    expect(await screen.findByDisplayValue("补充任务")).toBeInTheDocument();
+    expect(screen.getByDisplayValue("已有任务")).toBeInTheDocument();
+    expect(screen.getByText("AI 草稿已生成,请审阅修改后保存")).toBeInTheDocument();
+  });
+
+  test("生成失败:显示带 note 的错误提示", async () => {
+    vi.spyOn(api, "getSkillEvals").mockResolvedValue(evalsResp([]));
+    vi.spyOn(api, "generateSkillEvals").mockResolvedValue({ ok: true, runId: "g3" });
+    vi.spyOn(api, "getSkillEvalGen").mockResolvedValue({
+      status: "failed",
+      note: "模型输出不是合法 JSON",
+    } satisfies SkillEvalGenJob);
+
+    render(<SkillEvalSection auth={auth} skillName="s" rates={null} />);
+    fireEvent.click(await screen.findByRole("button", { name: /AI 生成用例/ }));
+    fireEvent.click(await screen.findByRole("button", { name: /接受消耗/ }));
+
+    expect(await screen.findByText(/AI 生成用例失败:模型输出不是合法 JSON/)).toBeInTheDocument();
+  });
+
+  test("POST 409 → 友好中文提示(有任务在进行中)", async () => {
+    vi.spyOn(api, "getSkillEvals").mockResolvedValue(evalsResp([]));
+    vi.spyOn(api, "generateSkillEvals").mockRejectedValue(
+      new ApiError({ status: 409, message: "conflict" }),
+    );
+
+    render(<SkillEvalSection auth={auth} skillName="s" rates={null} />);
+    fireEvent.click(await screen.findByRole("button", { name: /AI 生成用例/ }));
+    fireEvent.click(await screen.findByRole("button", { name: /接受消耗/ }));
+
+    expect(
+      await screen.findByText("该技能有评测或生成任务在进行中,请稍后再试"),
+    ).toBeInTheDocument();
+  });
+
+  test("生成中:禁用「运行评测」与「补充生成」,显示进度", async () => {
+    vi.spyOn(api, "getSkillEvals").mockResolvedValue(
+      evalsResp([{ id: "case-1", prompt: "t", assertions: ["a"] }]),
+    );
+    vi.spyOn(api, "generateSkillEvals").mockResolvedValue({ ok: true, runId: "g4" });
+    // 一直 running → generating 持续为真。
+    vi.spyOn(api, "getSkillEvalGen").mockResolvedValue({ status: "running" } satisfies SkillEvalGenJob);
+
+    render(<SkillEvalSection auth={auth} skillName="s" rates={null} />);
+    fireEvent.click(await screen.findByRole("button", { name: /补充生成/ }));
+    fireEvent.click(await screen.findByRole("button", { name: /接受消耗/ }));
+
+    expect(await screen.findByText(/AI 正在起草评测用例/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /运行评测/ })).toBeDisabled();
+    expect(screen.getByRole("button", { name: /补充生成/ })).toBeDisabled();
   });
 });

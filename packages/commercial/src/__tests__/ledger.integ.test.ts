@@ -177,7 +177,7 @@ describe("ledger.adminAdjust (integ)", () => {
       [adminId.toString()],
     );
     assert.equal(audit.rows.length, 1);
-    assert.equal(audit.rows[0].action, "credits.adjust");
+    assert.equal(audit.rows[0].action, "user.credits.adjust");
     assert.equal(audit.rows[0].target, `user:${uid}`);
     assert.equal(audit.rows[0].before.credits, "100");
     assert.equal(audit.rows[0].after.credits, "150");

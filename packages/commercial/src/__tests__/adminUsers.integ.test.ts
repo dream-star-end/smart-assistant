@@ -508,7 +508,7 @@ describe("admin HTTP: /api/admin/users", () => {
 
     const audits = await listAdminAudit({});
     assert.equal(audits.rows.length, 1);
-    assert.equal(audits.rows[0].action, "credits.adjust");
+    assert.equal(audits.rows[0].action, "user.credits.adjust");
     assert.equal(audits.rows[0].target, `user:${uid}`);
   });
 
@@ -592,7 +592,7 @@ describe("admin HTTP: /api/admin/users", () => {
     const admin = await createUser("a@x.com", "admin");
     const uid = await createUser("u@x.com");
     const atk = await tokenFor(admin, "admin");
-    // 触发一条 user.patch + 一条 credits.adjust
+    // 触发一条 user.patch + 一条 user.credits.adjust
     await fetch(`${baseUrl}/api/admin/users/${uid}`, {
       method: "PATCH",
       headers: { Authorization: `Bearer ${atk}`, "Content-Type": "application/json" },

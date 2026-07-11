@@ -2,6 +2,30 @@
   {
     "method": "GET",
     "pathKind": "path",
+    "pathValue": "/api/admin/marketplace/pending",
+    "handler": "handleAdminMarketplacePending"
+  },
+  {
+    "method": "GET",
+    "pathKind": "path",
+    "pathValue": "/api/admin/marketplace/ai-reviews",
+    "handler": "handleAdminMarketplaceAiReviews"
+  },
+  {
+    "method": "POST",
+    "pathKind": "path",
+    "pathValue": "/api/admin/marketplace/review-batch",
+    "handler": "handleAdminMarketplaceReviewBatch"
+  },
+  {
+    "method": "POST",
+    "pathKind": "pathPrefix",
+    "pathValue": "/api/admin/marketplace/",
+    "handler": "handleAdminMarketplaceFeatured|handleAdminMarketplaceRevoke|handleAdminMarketplaceReview"
+  },
+  {
+    "method": "GET",
+    "pathKind": "path",
     "pathValue": "/api/admin/agent-audit",
     "handler": "handleAdminAgentAudit"
   },
@@ -82,6 +106,24 @@
     "pathKind": "path",
     "pathValue": "/api/admin/audit",
     "handler": "handleAdminListAudit"
+  },
+  {
+    "method": "GET",
+    "pathKind": "path",
+    "pathValue": "/api/admin/security-events",
+    "handler": "handleAdminListSecurityEvents"
+  },
+  {
+    "method": "GET",
+    "pathKind": "path",
+    "pathValue": "/api/admin/host-audit",
+    "handler": "handleAdminListHostAudit"
+  },
+  {
+    "method": "GET",
+    "pathKind": "pathPrefix",
+    "pathValue": "/api/admin/trace/",
+    "handler": "handleAdminTraceLookup"
   },
   {
     "method": "GET",

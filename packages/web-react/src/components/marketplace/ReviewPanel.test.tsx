@@ -122,6 +122,24 @@ test("缺 category/useCases 的存量行打「人向元数据缺失」徽章;补
   expect(screen.getAllByText("人向元数据缺失")).toHaveLength(1);
 });
 
+test("rawBundle 含 evals/ → 待审行头打「带 evals」徽章;不含则不打", async () => {
+  adminMarketplacePending.mockResolvedValue([
+    pending({
+      versionId: "1",
+      name: "带评测技能",
+      rawBundle: { "evals/evals.json": '{"version":1,"cases":[]}' },
+    }),
+    pending({ versionId: "2", name: "无评测技能", rawBundle: { "references/a.md": "x" } }),
+  ]);
+  adminMarketplaceAiReviews.mockResolvedValue([]);
+  searchMarketplace.mockResolvedValue({ results: [] });
+
+  render(<ReviewPanel auth={auth} />);
+  await screen.findByText("带评测技能");
+  // 徽章恰出现一次(仅带 evals 的行)
+  expect(screen.getAllByText("带 evals")).toHaveLength(1);
+});
+
 test("AI 审批记录折叠区:展开后拉取并展示 approved/rejected 记录", async () => {
   adminMarketplacePending.mockResolvedValue([]);
   searchMarketplace.mockResolvedValue({ results: [] });

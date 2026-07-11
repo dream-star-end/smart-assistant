@@ -35,14 +35,43 @@ interface AdminRoute {
   handler: string;
 }
 
+/**
+ * 从 handler 表达式解析出"这条路由实际执行谁"的权威函数名。
+ *
+ * 两种形态都必须入清单,否则新增 admin 路由改内联形式即可绕过快照门(盲区):
+ *  1) 裸标识符:      `handleX`                              → "handleX"
+ *  2) 内联箭头:      `(req, res) => handleX(req, res, deps)` → "handleX"
+ *     含条件派发:    `(req,res) => c ? handleA(...) : handleB(...)` → "handleA|handleB"
+ *
+ * 内联箭头体是纯表达式(三元/调用,不含语句块 `{}`),故目标函数名 = 所有被调用为
+ * `identifier(req, ...)` 的标识符(按源码顺序去重;多目标用 '|' 连接)。
+ */
+function normalizeHandler(expr: string): string {
+  const trimmed = expr.trim();
+  // 裸标识符:原样(与历史 baseline 兼容)。
+  if (/^\w+$/.test(trimmed)) return trimmed;
+  // 内联箭头:抽出所有 `handleX(req` 形态的被调目标函数名。
+  const targets: string[] = [];
+  for (const c of trimmed.matchAll(/(\w+)\s*\(\s*req\b/g)) targets.push(c[1]!);
+  const uniq = [...new Set(targets)];
+  if (uniq.length === 0) {
+    // 箭头体里没有 `handleX(req,...)` 目标 —— 抛错让维护者显式处理,绝不静默塞空
+    // 字符串(那会重新制造盲区,正是本次要根治的一类问题)。
+    throw new Error(`admin route 内联 handler 无法解析目标函数: ${expr}`);
+  }
+  return uniq.join("|");
+}
+
 function extractAdminRoutes(src: string): AdminRoute[] {
-  // 跨行匹配 { method: 'X', (path|pathPrefix): '/api/admin/...', handler: identifier }
+  // 跨行匹配 { method: 'X', (path|pathPrefix): '/api/admin/...', handler: <expr> }
   // 注意:
-  // - admin handler 都是 identifier,不会是 inline 箭头函数(已 grep 验证)
-  // - 属性顺序 method → path|pathPrefix → handler 在 router.ts 内一致
+  // - handler <expr> 可为裸标识符,也可为内联箭头(marketplace admin 全族 + 未来新增)。
+  //   内联箭头体不含 '}'(纯表达式),故用 [^}] 非贪婪收尾到路由对象的闭合花括号,
+  //   再交给 normalizeHandler 抽出目标函数名 —— 消除"内联形式逃逸 baseline"盲区。
+  // - 属性顺序 method → path|pathPrefix → handler 在 router.ts 内一致,handler 恒为末字段。
   // - \s* 匹配跨行空白
   const re =
-    /\{\s*method:\s*'([A-Z]+)'\s*,\s*(path|pathPrefix):\s*'(\/api\/admin[^']*)'\s*,\s*handler:\s*(\w+)\s*,?\s*\}/g;
+    /\{\s*method:\s*'([A-Z]+)'\s*,\s*(path|pathPrefix):\s*'(\/api\/admin[^']*)'\s*,\s*handler:\s*([^}]*?)\s*,?\s*\}/g;
 
   const out: AdminRoute[] = [];
   for (const m of src.matchAll(re)) {
@@ -50,7 +79,7 @@ function extractAdminRoutes(src: string): AdminRoute[] {
       method: m[1]!,
       pathKind: m[2]! as "path" | "pathPrefix",
       pathValue: m[3]!,
-      handler: m[4]!,
+      handler: normalizeHandler(m[4]!),
     });
   }
   return out;
@@ -125,6 +154,46 @@ describe("admin-route-inventory (S3 PoC hard gate #1)", () => {
       pathKind: "pathPrefix",
       pathValue: "/api/admin/accounts/",
       handler: "handleAdminDeleteAccount",
+    });
+  });
+
+  test("extractAdminRoutes 覆盖内联箭头 handler (根治盲区 smoke)", () => {
+    // 单目标内联箭头:目标函数名进清单(旧正则会整条漏抓)。
+    const single = extractAdminRoutes(
+      `{
+        method: 'GET',
+        path: '/api/admin/marketplace/pending',
+        handler: (req, res) => handleAdminMarketplacePending(req, res, deps),
+      },`,
+    );
+    assert.equal(single.length, 1);
+    assert.deepEqual(single[0], {
+      method: "GET",
+      pathKind: "path",
+      pathValue: "/api/admin/marketplace/pending",
+      handler: "handleAdminMarketplacePending",
+    });
+
+    // 条件派发内联箭头:多目标按源码顺序去重并 '|' 连接。
+    const dispatch = extractAdminRoutes(
+      `{
+        method: 'POST',
+        pathPrefix: '/api/admin/marketplace/',
+        handler: (req, res) =>
+          (req.url ?? '').includes('/featured')
+            ? handleAdminMarketplaceFeatured(req, res, deps)
+            : (req.url ?? '').includes('/revoke')
+              ? handleAdminMarketplaceRevoke(req, res, deps)
+              : handleAdminMarketplaceReview(req, res, deps),
+      },`,
+    );
+    assert.equal(dispatch.length, 1);
+    assert.deepEqual(dispatch[0], {
+      method: "POST",
+      pathKind: "pathPrefix",
+      pathValue: "/api/admin/marketplace/",
+      handler:
+        "handleAdminMarketplaceFeatured|handleAdminMarketplaceRevoke|handleAdminMarketplaceReview",
     });
   });
 });

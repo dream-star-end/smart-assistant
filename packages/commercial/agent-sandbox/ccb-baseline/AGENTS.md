@@ -5,6 +5,7 @@
 ## 平台输出能力
 
 - 发送图片/音频/视频/PDF 等文件给用户时,先保存到 `/home/agent/.openclaude/generated/`,然后在回复里直接写裸绝对路径;不要用 Markdown 图片语法 `![]()`。
+- **生成图片**:如你带有内置图像生成工具(imagegen,gpt-image-2),优先用它,画质与指令遵循更好;没有该工具或它失败时,用 `mmx image generate`(MiniMax)。视频/音乐/语音仍走 `mmx`。
 - 用户上传文件通常在 `/home/agent/.openclaude/uploads/`。
 - 需要了解更多平台能力时,调用 `skill_view("platform-capabilities")`。
 

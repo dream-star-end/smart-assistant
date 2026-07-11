@@ -183,6 +183,12 @@ function validateRelaySuffix(method: string, suffixRaw: string): { ok: true } | 
   }
   if (method === 'POST' && decoded === '/chat/completions') return { ok: true }
   if (method === 'GET' && /^\/models(?:\/[A-Za-z0-9_.:-]+)?$/.test(decoded)) return { ok: true }
+  // codex 原生生图(imagegen 工具,gpt-image-2):平台生图首选(boss 裁决 2026-07-11)。
+  // 仍走绑定账号 egress 代理 + 上游鉴权,与 /responses 同一 fail-closed 面;
+  // 按张计费未接(playbook §5 债),当前计入平台账号订阅配额。
+  if (method === 'POST' && (decoded === '/images/generations' || decoded === '/images/edits')) {
+    return { ok: true }
+  }
 
   return { ok: false, status: 404, code: 'PATH_NOT_ALLOWED', message: 'codex relay path not allowed' }
 }

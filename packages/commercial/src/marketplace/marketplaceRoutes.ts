@@ -10,9 +10,10 @@ import type { IncomingMessage, ServerResponse } from 'node:http'
 
 import { marketplaceArtifactHash, skillContentHash } from '@openclaude/storage'
 
+import { writeAdminAuditBestEffort } from '../admin/audit.js'
 import { requireAdminVerifyDb } from '../admin/requireAdmin.js'
 import { requireAuth } from '../http/auth.js'
-import { HttpError, readJsonBody, sendJson } from '../http/util.js'
+import { HttpError, clientIpOf, readJsonBody, sendJson, userAgentOf } from '../http/util.js'
 import {
   MarketplaceError,
   getApprovedSkillVersions,
@@ -33,8 +34,11 @@ import {
   reviewVersion,
   reviewVersions,
   revokeListing,
+  setListingFeaturedRank,
   updateInstalledAgentScope,
   withdrawPublishVersion,
+  FEATURED_RANK_MIN,
+  FEATURED_RANK_MAX,
 } from './marketplaceDb.js'
 import {
   VETTED_AGENT_TOOLSETS,
@@ -773,6 +777,13 @@ export async function handleAdminMarketplaceReview(
       // skills can be published without a second admin account.
       allowSelfReview: true,
     })
+    await writeAdminAuditBestEffort(
+      { adminId: admin.id, ip: clientIpOf(req), userAgent: userAgentOf(req) },
+      'marketplace.skill.review',
+      `marketplace_version:${id}`,
+      undefined,
+      { decision, note: note ? note.slice(0, 200) : undefined, version_id: id },
+    )
     sendJson(res, 200, { ok: true })
   } catch (e) {
     throw mapMarketplaceError(e)
@@ -830,9 +841,18 @@ export async function handleAdminMarketplaceReviewBatch(
     allowSelfReview: true,
   })
   const failed = results.filter((r) => !r.ok).length
+  const reviewed = results.length - failed
+  // 一批一行:审计整批决定(decision + 提交的 version_ids + 成/败计数),不逐 version 展开。
+  await writeAdminAuditBestEffort(
+    { adminId: admin.id, ip: clientIpOf(req), userAgent: userAgentOf(req) },
+    'marketplace.skill.review_batch',
+    'marketplace_version:batch',
+    undefined,
+    { decision, version_ids: versionIds, reviewed, failed },
+  )
   sendJson(res, 200, {
     ok: failed === 0,
-    reviewed: results.length - failed,
+    reviewed,
     failed,
     results,
   })
@@ -845,12 +865,66 @@ export async function handleAdminMarketplaceRevoke(
   res: ServerResponse,
   deps: { jwtSecret: string | Uint8Array },
 ): Promise<void> {
-  await requireAdminVerifyDb(req, deps.jwtSecret)
+  const admin = await requireAdminVerifyDb(req, deps.jwtSecret)
   const m = (req.url ?? '').match(/\/api\/admin\/marketplace\/([a-z0-9][a-z0-9-]{1,63})\/revoke/)
   const slug = m?.[1]
   if (!slug) throw new HttpError(400, 'BAD_SLUG', 'invalid slug')
   const body = (await readJsonBody(req).catch(() => ({}))) as Record<string, unknown>
   const reason = typeof body.reason === 'string' ? body.reason.slice(0, 500) : 'revoked by admin'
   const affectedUserIds = await revokeListing(slug, reason)
+  await writeAdminAuditBestEffort(
+    { adminId: admin.id, ip: clientIpOf(req), userAgent: userAgentOf(req) },
+    'marketplace.skill.revoke',
+    `marketplace_listing:${slug}`,
+    undefined,
+    { reason, affected_installs: affectedUserIds.length },
+  )
   sendJson(res, 200, { ok: true, affectedInstalls: affectedUserIds.length, affectedUserIds })
+}
+
+// ── POST /api/admin/marketplace/:slug/featured ─────────────────────────────
+// 平台精选权重设置/取消(运维面)。body.featuredRank ∈ [1,9999] 的整数(越小越靠前)
+// 或 null(取消精选)。目录排序服务端权威,写此值即调整市场卡片排序。
+export async function handleAdminMarketplaceFeatured(
+  req: IncomingMessage,
+  res: ServerResponse,
+  deps: { jwtSecret: string | Uint8Array },
+): Promise<void> {
+  const admin = await requireAdminVerifyDb(req, deps.jwtSecret)
+  const m = (req.url ?? '').match(/\/api\/admin\/marketplace\/([a-z0-9][a-z0-9-]{1,63})\/featured/)
+  const slug = m?.[1]
+  if (!slug) throw new HttpError(400, 'BAD_SLUG', 'invalid slug')
+  const body = (await readJsonBody(req)) as Record<string, unknown>
+  const raw = body.featuredRank
+  // null=取消精选;否则须为 [MIN,MAX] 的整数。校验失败给干净 400(DB 层另有兜底不变量)。
+  let rank: number | null
+  if (raw === null) {
+    rank = null
+  } else if (
+    typeof raw === 'number' &&
+    Number.isInteger(raw) &&
+    raw >= FEATURED_RANK_MIN &&
+    raw <= FEATURED_RANK_MAX
+  ) {
+    rank = raw
+  } else {
+    throw new HttpError(
+      400,
+      'BAD_REQUEST',
+      `featuredRank 须为 ${FEATURED_RANK_MIN}..${FEATURED_RANK_MAX} 的整数或 null`,
+    )
+  }
+  try {
+    await setListingFeaturedRank(slug, rank)
+    await writeAdminAuditBestEffort(
+      { adminId: admin.id, ip: clientIpOf(req), userAgent: userAgentOf(req) },
+      'marketplace.skill.featured',
+      `marketplace_listing:${slug}`,
+      undefined,
+      { featured_rank: rank },
+    )
+    sendJson(res, 200, { ok: true, slug, featuredRank: rank })
+  } catch (e) {
+    throw mapMarketplaceError(e)
+  }
 }
