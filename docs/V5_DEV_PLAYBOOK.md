@@ -353,6 +353,8 @@ BEGIN; <迁移 SQL>; INSERT INTO schema_migrations(version, applied_at) VALUES (
 | ~~codex 原生生图关断~~ **已反转**(boss 07-11 拍板启用,merge 18943fa1) | relay 放行 POST /images/generations\|edits + 撤 features 关断 + AGENTS.md 引导优先 imagegen(gpt-image-2);minimax-media 退居备选/非 codex 引擎 | — |
 | ~~codex 生图按张计费未接~~ **已完成** | gpt-image-2 generations/edits 统一成功后每张 50 积分;精确标注编辑在遮罩合成原子落盘后结算;余额不足硬拒、单用户并发 1、UTC 每日成功 10 张、失败不扣费、request/job 幂等 | 运维查 `image_generation_usage_records` + `credit_ledger(reason='image_generation')`;改 relay/结算必须 `deploy-v5.sh --egress` |
 | mmx 凭据文件通道(镜像常量对) | codex 路径 env 被双重清洗(buildCodexEnv 剥 OPENCLAUDE_* + codex shell 策略剥 *TOKEN*),mmx 凭据走 entrypoint 每 boot 覆写的 container-auth.json;**新增依赖容器 env 的平台 CLI 必须同样走文件或 OC_ 前缀非凭据名**,argv `-c` 回注 = 违反 token 不进日志不变量(有防回归断言) | — |
+| 容器 outboundRing.lastSeq 不跨重启 | 容器回收后帧序从零,依赖客户端游标仲裁(resume_failed no_buffer+to:0 归零+cold_start 清游标,7994ac76)闭环;服务端 seq 持久化(seed 自 durable 源)是对称根治 | 再现"冷容器后 live 帧丢失"类报障时 gateway 域根治 |
+| 图片缩略磁盘缓存无运行期逐出 | media-thumb-cache 仅启动清(重启节奏封顶增长) | 磁盘告警时加 LRU 逐出 |
 | reminder 无独立 label 字段 | 列表标题=prompt 压平截断兜底(reminderFormat.ts);系统任务中文名是镜像常量(权威源 gateway cron.ts DEFAULT_JOBS,两处需同步) | 用户自定义任务名需求出现时:cron job 加 label 一等字段 |
 | CI 失败无告警 | v5-ci 挂/红没有任何推送(07-07 起 commercial-unit 门挂死 3 天无人知,2026-07-10 才根治);GitHub→告警 outbox 无桥 | 下次 CI 再次静默红超 1 天时:加 workflow 失败 webhook→admin_alert_outbox(events 已有 ops 组可挂) |
 | admin React 化残余小项 | ①Progress 原语无 tone/fill 定制(hosts 自建 Meter)②typedConfirm(打字确认)未平移,一律 useConfirm danger ③表单 Select 原语缺失(P2/P4/P6 各自局部实现)④fmtCents 字符串版 ¥ 格式化器 4 页内联重复⑤org 调余额后端仍 501 占位 | 下次 admin 批次顺手收敛①-④;⑤随 org 计费批次 |
