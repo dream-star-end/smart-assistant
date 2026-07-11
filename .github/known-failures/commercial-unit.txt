@@ -42,3 +42,7 @@ assertPlatformDefaultModelConfigured
 # 可达时走到新分支稳定失败;基线树(aurora@1f4bef5c)同法复现 11/12 同一子测,非在途
 # 分支引入。修掉后删除本行。
 V3 2I-2 — anthropicProxy + bridge histograms/counters
+# 2026-07-11 登记:ledger LEDGER_REASONS schema sync 子测,基线树(aurora)同法复现 6/7
+# 同一子测,非在途分支引入(疑似他批 ledger 变更后 reasons 枚举与 schema 期望漂移)。
+# 修掉后删除本行。
+LEDGER_REASONS (schema sync check)
